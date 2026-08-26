@@ -145,6 +145,7 @@ const (
 	PhaseInvalid Phase = iota
 	PhasePlanning
 	PhaseSealed
+	PhasePrepared
 	PhaseTerminal
 	PhaseAcked
 )
@@ -159,7 +160,9 @@ func (phase Phase) CanTransitionTo(next Phase) bool {
 	case PhasePlanning:
 		return next == PhasePlanning || next == PhaseSealed
 	case PhaseSealed:
-		return next == PhaseSealed || next == PhaseTerminal
+		return next == PhaseSealed || next == PhasePrepared
+	case PhasePrepared:
+		return next == PhasePrepared || next == PhaseTerminal
 	case PhaseTerminal:
 		return next == PhaseTerminal || next == PhaseAcked
 	case PhaseAcked:
@@ -191,6 +194,11 @@ type Usage struct {
 	PendingBytes      uint64
 	ContinuationBytes uint64
 	PayloadBytes      uint64
+	RoutePinBytes     uint64
+	PreparedBytes     uint64
+	SchemaPinBytes    uint64
+	ReadyBytes        uint64
+	ExpiryBytes       uint64
 	TerminalBytes     uint64
 	AckBytes          uint64
 }
@@ -199,7 +207,9 @@ func (usage Usage) DurableBytes() (uint64, error) {
 	total := uint64(0)
 	for _, value := range [...]uint64{
 		usage.HeadBytes, usage.PlanPageBytes, usage.PendingBytes,
-		usage.ContinuationBytes, usage.PayloadBytes, usage.TerminalBytes, usage.AckBytes,
+		usage.ContinuationBytes, usage.PayloadBytes, usage.RoutePinBytes,
+		usage.PreparedBytes, usage.SchemaPinBytes, usage.ReadyBytes, usage.ExpiryBytes,
+		usage.TerminalBytes, usage.AckBytes,
 	} {
 		if total > ^uint64(0)-value {
 			return 0, ErrTooLarge
@@ -225,6 +235,13 @@ func (usage *Usage) AddContinuation(encoded []byte) error {
 	return addUsage(&usage.ContinuationBytes, encoded)
 }
 func (usage *Usage) AddPayload(encoded []byte) error  { return addUsage(&usage.PayloadBytes, encoded) }
+func (usage *Usage) AddRoutePin(encoded []byte) error { return addUsage(&usage.RoutePinBytes, encoded) }
+func (usage *Usage) AddPrepared(encoded []byte) error { return addUsage(&usage.PreparedBytes, encoded) }
+func (usage *Usage) AddSchemaPin(encoded []byte) error {
+	return addUsage(&usage.SchemaPinBytes, encoded)
+}
+func (usage *Usage) AddReady(encoded []byte) error    { return addUsage(&usage.ReadyBytes, encoded) }
+func (usage *Usage) AddExpiry(encoded []byte) error   { return addUsage(&usage.ExpiryBytes, encoded) }
 func (usage *Usage) AddTerminal(encoded []byte) error { return addUsage(&usage.TerminalBytes, encoded) }
 func (usage *Usage) AddAck(encoded []byte) error      { return addUsage(&usage.AckBytes, encoded) }
 

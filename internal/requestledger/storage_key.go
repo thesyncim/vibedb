@@ -18,6 +18,8 @@ const (
 	StoragePayloadChunk byte = 7
 	StoragePayloadBuild byte = 8
 	StorageRoutePin     byte = 9
+	StoragePrepared     byte = 10
+	StorageSchemaPin    byte = 11
 
 	FixedStorageKeyBytes   = 2 + 32 + 32
 	PageStorageKeyBytes    = FixedStorageKeyBytes + 8
@@ -56,6 +58,12 @@ func AppendPayloadBuildKey(dst []byte, home LedgerHome, key Digest) []byte {
 }
 func AppendRoutePinKey(dst []byte, home LedgerHome, key Digest) []byte {
 	return appendFixedStorageKey(dst, StorageRoutePin, home, key)
+}
+func AppendPreparedTerminalKey(dst []byte, home LedgerHome, key Digest) []byte {
+	return appendFixedStorageKey(dst, StoragePrepared, home, key)
+}
+func AppendSchemaPinReleaseKey(dst []byte, home LedgerHome, key Digest) []byte {
+	return appendFixedStorageKey(dst, StorageSchemaPin, home, key)
 }
 
 func AppendPlanPageKey(dst []byte, home LedgerHome, key Digest, ordinal uint64) []byte {
@@ -108,7 +116,8 @@ func OpenStorageKey(raw []byte) (StorageKeyView, error) {
 			return StorageKeyView{}, ErrCorrupt
 		}
 		view.Ordinal = binary.BigEndian.Uint64(raw[98:106])
-	case StorageHead, StoragePending, StorageTerminal, StorageAck, StorageContinuation, StoragePayloadBuild, StorageRoutePin:
+	case StorageHead, StoragePending, StorageTerminal, StorageAck, StorageContinuation,
+		StoragePayloadBuild, StorageRoutePin, StoragePrepared, StorageSchemaPin:
 		if len(raw) != FixedStorageKeyBytes {
 			return StorageKeyView{}, ErrCorrupt
 		}

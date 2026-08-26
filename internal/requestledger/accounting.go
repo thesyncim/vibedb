@@ -1,6 +1,13 @@
 package requestledger
 
-const CleanupReserveBytes = FixedStorageKeyBytes + AckRecordBytes
+const (
+	CleanupReserveBytes              = FixedStorageKeyBytes + AckRecordBytes
+	RoutePinReservationBytes         = FixedStorageKeyBytes + MaxRoutePinRecordBytes
+	PreparedTerminalReservationBytes = FixedStorageKeyBytes + MaxPreparedTerminalRecordBytes
+	SchemaPinReleaseReservationBytes = FixedStorageKeyBytes + MaxSchemaPinReleaseRecordBytes
+	ReadyReservationBytes            = ReadyStorageKeyBytes + ReadyRecordBytes
+	PlanningExpiryReservationBytes   = PlanningExpiryKeyBytes + PlanningExpiryRecordBytes
+)
 
 // Reservation returns exact resident bytes derivable from Head plus the future
 // byte reservation required before admitting Create. Storage-engine page and
@@ -38,11 +45,21 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 	if head.MaxActivePayloadBytes != 0 {
 		payloadBuildFuture = FixedStorageKeyBytes + payloadBuildBytes
 	}
+	if head.Phase == PhasePlanning {
+		residentNow, err = checkedSum(residentNow, PlanningExpiryReservationBytes)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
 	future, err = checkedSum(
 		remainingBytes,
 		pageFuture,
 		FixedStorageKeyBytes, head.MaxPendingWaveBytes,
 		FixedStorageKeyBytes, head.MaxContinuationBytes,
+		RoutePinReservationBytes,
+		FixedStorageKeyBytes, head.MaxTerminalBytes,
+		SchemaPinReleaseReservationBytes,
+		ReadyReservationBytes,
 		FixedStorageKeyBytes, head.MaxTerminalBytes,
 		payloadBuildFuture,
 		head.MaxActivePayloadBytes, payloadChunkFuture,

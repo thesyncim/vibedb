@@ -1,12 +1,13 @@
 package requestledger
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 )
 
 const (
-	terminalHeaderBytes    = 496
+	terminalHeaderBytes    = 560
 	MaxTerminalResultBytes = MaxLifecyclePayloadBytes - terminalHeaderBytes - checksumBytes
 )
 
@@ -17,64 +18,69 @@ var (
 )
 
 type TerminalRecord struct {
-	KeyDigest                    Digest
-	RequestDigest                Digest
-	PlanRoot                     Digest
-	TerminalContractDigest       Digest
-	ResultDigest                 Digest
-	TerminalStateDigest          Digest
-	TerminalSummaryDigest        Digest
-	RetirementWitnessDigest      Digest
-	FinalContinuationDigest      Digest
-	AckTokenDigest               Digest
-	AckToken                     AckToken
-	CatalogGeneration            uint64
-	PinID                        PinID
-	PinDigest                    Digest
-	RouteSchemaCertificateDigest Digest
-	Revision                     uint64
-	FinalWaveCount               uint64
-	TerminalTransitionTag        uint32
-	Outcome                      Outcome
-	AffectedRows                 int64
-	AffectedRowsValid            bool
-	Result                       []byte
+	KeyDigest                         Digest
+	RequestDigest                     Digest
+	PlanRoot                          Digest
+	TerminalContractDigest            Digest
+	ResultDigest                      Digest
+	TerminalStateDigest               Digest
+	TerminalSummaryDigest             Digest
+	RetirementWitnessDigest           Digest
+	FinalContinuationDigest           Digest
+	PreparedTerminalDigest            Digest
+	SchemaPinReleaseCertificateDigest Digest
+	AckTokenDigest                    Digest
+	AckToken                          AckToken
+	CatalogGeneration                 uint64
+	PinID                             PinID
+	PinDigest                         Digest
+	RouteSchemaCertificateDigest      Digest
+	Revision                          uint64
+	FinalWaveCount                    uint64
+	TerminalTransitionTag             uint32
+	Outcome                           Outcome
+	AffectedRows                      int64
+	AffectedRowsValid                 bool
+	Result                            []byte
 }
 
 func NewTerminal(
 	head HeadRecord,
-	continuation ContinuationRecord,
+	prepared PreparedTerminalRecord,
+	release SchemaPinReleaseRecord,
 	revision uint64,
-	outcome Outcome,
-	affectedRows int64,
-	affectedRowsValid bool,
-	result []byte,
-	retirementWitnessDigest Digest,
-	ackToken AckToken,
 ) (TerminalRecord, error) {
-	if err := ValidateTerminalContinuation(head, continuation, outcome, retirementWitnessDigest); err != nil ||
-		!nextRevision(head.Revision, revision) || !outcome.Valid() {
+	if err := validateHead(head); err != nil || errOrNil(validatePreparedTerminal(prepared)) != nil ||
+		errOrNil(validateSchemaPinRelease(release)) != nil || head.Phase != PhasePrepared ||
+		release.Phase != SchemaPinReleased || prepared.PreparedDigest != head.PreparedTerminalDigest ||
+		release.CertificateDigest != head.SchemaPinReleaseCertificateDigest ||
+		release.PreparedTerminalDigest != prepared.PreparedDigest ||
+		prepared.KeyDigest != head.KeyDigest || prepared.RequestDigest != head.RequestDigest ||
+		prepared.PlanRoot != head.PlanRoot || release.KeyDigest != head.KeyDigest ||
+		!nextRevision(head.Revision, revision) {
 		return TerminalRecord{}, ErrInvalidState
 	}
-	transitionTag, finalWaveCount, stateDigest := terminalTuple(head, outcome)
 	record := TerminalRecord{
 		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
 		TerminalContractDigest: head.TerminalContractDigest,
-		ResultDigest:           ResultDigest(result), TerminalStateDigest: stateDigest,
-		RetirementWitnessDigest: retirementWitnessDigest,
-		FinalContinuationDigest: continuation.ContinuationDigest,
-		CatalogGeneration:       head.CatalogGeneration,
-		PinID:                   head.PinID, PinDigest: head.PinDigest,
+		ResultDigest:           prepared.ResultDigest, TerminalStateDigest: prepared.TerminalStateDigest,
+		RetirementWitnessDigest:           prepared.RetirementWitnessDigest,
+		FinalContinuationDigest:           prepared.FinalContinuationDigest,
+		PreparedTerminalDigest:            prepared.PreparedDigest,
+		SchemaPinReleaseCertificateDigest: release.CertificateDigest,
+		CatalogGeneration:                 prepared.CatalogGeneration,
+		PinID:                             prepared.PinID, PinDigest: prepared.PinDigest,
 		RouteSchemaCertificateDigest: head.RouteSchemaCertificateDigest,
-		Revision:                     revision, FinalWaveCount: finalWaveCount,
-		TerminalTransitionTag: transitionTag,
-		Outcome:               outcome, AffectedRows: affectedRows, AffectedRowsValid: affectedRowsValid,
-		Result: result, AckToken: ackToken,
+		Revision:                     revision, FinalWaveCount: prepared.FinalWaveCount,
+		TerminalTransitionTag: prepared.TerminalTransitionTag,
+		Outcome:               prepared.Outcome, AffectedRows: prepared.AffectedRows,
+		AffectedRowsValid: prepared.AffectedRowsValid,
+		Result:            prepared.Result, AckToken: prepared.AckToken,
 	}
-	record.AckTokenDigest = AckTokenDigest(ackToken)
+	record.AckTokenDigest = prepared.AckTokenDigest
 	record.TerminalSummaryDigest = terminalSummaryDigest(record)
-	if err := validateTerminal(record); err != nil ||
-		uint64(terminalHeaderBytes+len(result)+checksumBytes) > head.MaxTerminalBytes {
+	if err := validateTerminal(record); err != nil || !terminalMatchesPrepared(record, prepared) ||
+		uint64(terminalHeaderBytes+len(prepared.Result)+checksumBytes) > head.MaxTerminalBytes {
 		return TerminalRecord{}, ErrTooLarge
 	}
 	return record, nil
@@ -145,6 +151,8 @@ func AppendTerminal(dst []byte, record TerminalRecord) ([]byte, error) {
 	putDigest(out[400:432], record.FinalContinuationDigest)
 	putDigest(out[432:464], record.AckTokenDigest)
 	copy(out[464:496], record.AckToken[:])
+	putDigest(out[496:528], record.PreparedTerminalDigest)
+	putDigest(out[528:560], record.SchemaPinReleaseCertificateDigest)
 	dst = append(dst, record.Result...)
 	dst = appendChecksum(dst, start)
 	return dst, nil
@@ -171,10 +179,12 @@ func OpenTerminal(raw []byte) (TerminalRecord, error) {
 		TerminalContractDigest: readDigest(raw[160:192]), ResultDigest: readDigest(raw[192:224]),
 		TerminalStateDigest: readDigest(raw[224:256]), TerminalSummaryDigest: readDigest(raw[256:288]),
 		PinDigest: readDigest(raw[304:336]), RouteSchemaCertificateDigest: readDigest(raw[336:368]),
-		RetirementWitnessDigest: readDigest(raw[368:400]),
-		FinalContinuationDigest: readDigest(raw[400:432]),
-		AckTokenDigest:          readDigest(raw[432:464]),
-		Result:                  raw[terminalHeaderBytes : len(raw)-checksumBytes : len(raw)-checksumBytes],
+		RetirementWitnessDigest:           readDigest(raw[368:400]),
+		FinalContinuationDigest:           readDigest(raw[400:432]),
+		AckTokenDigest:                    readDigest(raw[432:464]),
+		PreparedTerminalDigest:            readDigest(raw[496:528]),
+		SchemaPinReleaseCertificateDigest: readDigest(raw[528:560]),
+		Result:                            raw[terminalHeaderBytes : len(raw)-checksumBytes : len(raw)-checksumBytes],
 	}
 	copy(record.PinID[:], raw[288:304])
 	copy(record.AckToken[:], raw[464:496])
@@ -189,6 +199,8 @@ func validateTerminal(record TerminalRecord) error {
 		!nonzeroDigest(record.TerminalContractDigest) || !nonzeroDigest(record.TerminalStateDigest) ||
 		!nonzeroDigest(record.TerminalSummaryDigest) || !nonzeroDigest(record.RetirementWitnessDigest) ||
 		!nonzeroDigest(record.FinalContinuationDigest) || record.CatalogGeneration == 0 || record.PinID == (PinID{}) ||
+		!nonzeroDigest(record.PreparedTerminalDigest) ||
+		!nonzeroDigest(record.SchemaPinReleaseCertificateDigest) ||
 		!nonzeroDigest(record.AckTokenDigest) || record.AckToken == (AckToken{}) ||
 		!nonzeroDigest(record.PinDigest) || !nonzeroDigest(record.RouteSchemaCertificateDigest) ||
 		record.Revision == 0 || record.FinalWaveCount == 0 || record.TerminalTransitionTag == 0 ||
@@ -213,18 +225,42 @@ func AckTokenDigest(token AckToken) Digest {
 	return Digest(sha256.Sum256(framed[:]))
 }
 
-func MarkTerminal(head HeadRecord, continuation ContinuationRecord, terminal TerminalRecord) (HeadRecord, error) {
-	if err := ValidateTerminalContinuation(head, continuation, terminal.Outcome, terminal.RetirementWitnessDigest); err != nil ||
-		errOrNil(validateTerminal(terminal)) != nil || terminal.KeyDigest != head.KeyDigest ||
+func MarkTerminal(head HeadRecord, prepared PreparedTerminalRecord, release SchemaPinReleaseRecord, terminal TerminalRecord) (HeadRecord, error) {
+	if err := validateHead(head); err != nil || errOrNil(validatePreparedTerminal(prepared)) != nil ||
+		errOrNil(validateSchemaPinRelease(release)) != nil || errOrNil(validateTerminal(terminal)) != nil ||
+		head.Phase != PhasePrepared || release.Phase != SchemaPinReleased ||
+		terminal.KeyDigest != head.KeyDigest ||
 		terminal.RequestDigest != head.RequestDigest || terminal.PlanRoot != head.PlanRoot ||
 		terminal.TerminalContractDigest != head.TerminalContractDigest ||
-		terminal.TerminalStateDigest != continuation.NextStateDigest ||
-		terminal.FinalContinuationDigest != continuation.ContinuationDigest ||
+		terminal.PreparedTerminalDigest != prepared.PreparedDigest ||
+		terminal.SchemaPinReleaseCertificateDigest != release.CertificateDigest ||
+		prepared.PreparedDigest != head.PreparedTerminalDigest ||
+		release.CertificateDigest != head.SchemaPinReleaseCertificateDigest ||
+		!terminalMatchesPrepared(terminal, prepared) ||
 		!nextRevision(head.Revision, terminal.Revision) {
 		return HeadRecord{}, ErrInvalidState
 	}
 	head.Phase, head.Revision = PhaseTerminal, terminal.Revision
-	return head, nil
+	return head, validateHead(head)
+}
+
+func terminalMatchesPrepared(terminal TerminalRecord, prepared PreparedTerminalRecord) bool {
+	return terminal.KeyDigest == prepared.KeyDigest && terminal.RequestDigest == prepared.RequestDigest &&
+		terminal.PlanRoot == prepared.PlanRoot &&
+		terminal.TerminalContractDigest == prepared.TerminalContractDigest &&
+		terminal.ResultDigest == prepared.ResultDigest &&
+		terminal.TerminalStateDigest == prepared.TerminalStateDigest &&
+		terminal.RetirementWitnessDigest == prepared.RetirementWitnessDigest &&
+		terminal.FinalContinuationDigest == prepared.FinalContinuationDigest &&
+		terminal.PreparedTerminalDigest == prepared.PreparedDigest &&
+		terminal.AckTokenDigest == prepared.AckTokenDigest && terminal.AckToken == prepared.AckToken &&
+		terminal.CatalogGeneration == prepared.CatalogGeneration && terminal.PinID == prepared.PinID &&
+		terminal.PinDigest == prepared.PinDigest &&
+		terminal.RouteSchemaCertificateDigest == prepared.RouteSchemaCertificateDigest &&
+		terminal.FinalWaveCount == prepared.FinalWaveCount &&
+		terminal.TerminalTransitionTag == prepared.TerminalTransitionTag &&
+		terminal.Outcome == prepared.Outcome && terminal.AffectedRows == prepared.AffectedRows &&
+		terminal.AffectedRowsValid == prepared.AffectedRowsValid && bytes.Equal(terminal.Result, prepared.Result)
 }
 
 // terminalSummaryDigest is the served-outcome witness. The sealed head fixes
@@ -233,7 +269,7 @@ func MarkTerminal(head HeadRecord, continuation ContinuationRecord, terminal Ter
 // result bytes, or any retained pin binding therefore changes this digest.
 func terminalSummaryDigest(record TerminalRecord) Digest {
 	const domain = "vibedb/request-ledger/terminal-summary\x00"
-	var framed [len(domain) + 32*12 + 16 + 32]byte
+	var framed [len(domain) + 32*13 + 16 + 32]byte
 	at := copy(framed[:], terminalSummaryDomain)
 	for _, digest := range [...]Digest{
 		record.KeyDigest, record.RequestDigest, record.PlanRoot,
@@ -241,6 +277,7 @@ func terminalSummaryDigest(record TerminalRecord) Digest {
 		record.TerminalStateDigest, record.ResultDigest,
 		record.PinDigest, record.RouteSchemaCertificateDigest,
 		record.RetirementWitnessDigest, record.AckTokenDigest,
+		record.PreparedTerminalDigest, record.SchemaPinReleaseCertificateDigest,
 	} {
 		at += copy(framed[at:], digest[:])
 	}

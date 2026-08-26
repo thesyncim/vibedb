@@ -16,7 +16,6 @@ type AckGCPhase uint8
 
 const (
 	AckGCInvalid AckGCPhase = iota
-	AckGCAwaitPinRelease
 	AckGCCollecting
 	AckGCComplete
 )
@@ -59,26 +58,11 @@ func NewAck(head HeadRecord, terminal TerminalRecord, revision, priorEncodedByte
 		CatalogGeneration: head.CatalogGeneration, PinID: head.PinID,
 		PinDigest: head.PinDigest, RouteSchemaCertificateDigest: head.RouteSchemaCertificateDigest,
 		ResultDigest: terminal.ResultDigest, AckTokenDigest: terminal.AckTokenDigest,
-		Revision: revision, TerminalRevision: terminal.Revision,
+		ReleaseCertificateDigest: terminal.SchemaPinReleaseCertificateDigest,
+		Revision:                 revision, TerminalRevision: terminal.Revision,
 		PriorEncodedBytes: priorEncodedBytes, TerminalResultBytes: uint64(len(terminal.Result)),
-		GCPhase: AckGCAwaitPinRelease,
+		GCPhase: AckGCCollecting,
 	}
-	record.AckDigest = ackDigest(record)
-	return record, validateAck(record)
-}
-
-// MarkAckPinReleased records the digest of an exact routegate release command
-// and settled completion pair. The replicated-state caller must authenticate
-// and semantically verify that pair before invoking this transition; the
-// kernel intentionally does not pretend an unkeyed binding hash is authority.
-func MarkAckPinReleased(record AckRecord, revision uint64, certificateDigest Digest) (AckRecord, error) {
-	if err := validateAck(record); err != nil || record.GCPhase != AckGCAwaitPinRelease ||
-		!nextRevision(record.Revision, revision) || !nonzeroDigest(certificateDigest) {
-		return AckRecord{}, ErrInvalidState
-	}
-	record.Revision = revision
-	record.GCPhase = AckGCCollecting
-	record.ReleaseCertificateDigest = certificateDigest
 	record.AckDigest = ackDigest(record)
 	return record, validateAck(record)
 }
@@ -178,10 +162,10 @@ func validateAck(record AckRecord) error {
 		!nonzeroDigest(record.RouteSchemaCertificateDigest) ||
 		record.TerminalRevision == 0 || record.Revision <= record.TerminalRevision || record.PriorEncodedBytes == 0 ||
 		record.TerminalResultBytes > record.PriorEncodedBytes || record.ReclaimedBytes > record.PriorEncodedBytes ||
-		record.GCPhase < AckGCAwaitPinRelease || record.GCPhase > AckGCComplete ||
-		(record.GCPhase == AckGCAwaitPinRelease && (record.Revision != record.TerminalRevision+1 ||
-			record.GCCursor != 0 || record.ReclaimedBytes != 0 || nonzeroDigest(record.ReleaseCertificateDigest))) ||
-		(record.GCPhase != AckGCAwaitPinRelease && !nonzeroDigest(record.ReleaseCertificateDigest)) ||
+		record.GCPhase < AckGCCollecting || record.GCPhase > AckGCComplete ||
+		!nonzeroDigest(record.ReleaseCertificateDigest) ||
+		(record.GCPhase == AckGCCollecting && record.ReclaimedBytes == 0 &&
+			(record.Revision != record.TerminalRevision+1 || record.GCCursor != 0)) ||
 		(record.GCPhase == AckGCComplete && record.ReclaimedBytes != record.PriorEncodedBytes) ||
 		record.AckDigest != ackDigest(record) {
 		return ErrCorrupt

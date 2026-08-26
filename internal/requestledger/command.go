@@ -35,6 +35,9 @@ const (
 	OperationBeginRoutePinRelease
 	OperationRecordRoutePinReleased
 	OperationCleanupPayload
+	OperationPrepareTerminal
+	OperationBeginSchemaPinRelease
+	OperationRecordSchemaPinReleased
 )
 
 type Command struct {
@@ -110,6 +113,8 @@ type CommandView struct {
 	expiry       PlanningExpiryRequest
 	routePin     RoutePinRecord
 	cleanup      PayloadCleanupRequest
+	prepared     PreparedTerminalRecord
+	schemaPin    SchemaPinReleaseRecord
 }
 
 func (view CommandView) Bytes() []byte { return view.raw[:len(view.raw):len(view.raw)] }
@@ -147,6 +152,13 @@ func (view CommandView) RoutePin() (RoutePinRecord, bool) {
 }
 func (view CommandView) PayloadCleanup() (PayloadCleanupRequest, bool) {
 	return view.cleanup, view.Operation == OperationCleanupPayload
+}
+func (view CommandView) PreparedTerminal() (PreparedTerminalRecord, bool) {
+	return view.prepared, view.Operation == OperationPrepareTerminal
+}
+func (view CommandView) SchemaPinRelease() (SchemaPinReleaseRecord, bool) {
+	return view.schemaPin, view.Operation == OperationBeginSchemaPinRelease ||
+		view.Operation == OperationRecordSchemaPinReleased
 }
 
 func AppendCommand(dst []byte, command Command) ([]byte, error) {
@@ -268,7 +280,8 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 		}
 	case OperationGC:
 		view.gc, err = OpenGCRequest(payload)
-		if err == nil && (view.gc.ExpectedAckDigest != command.SubjectDigest) {
+		if err == nil && (view.gc.ExpectedAckDigest != command.SubjectDigest ||
+			view.gc.Action != GCActionCollect) {
 			err = ErrCorrupt
 		}
 	case OperationStagePayloadChunk:
@@ -319,6 +332,28 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 		if err == nil && view.cleanup.BuildDigest != command.SubjectDigest {
 			err = ErrCorrupt
 		}
+	case OperationPrepareTerminal:
+		view.prepared, err = OpenPreparedTerminal(payload)
+		if err == nil && (view.prepared.KeyDigest != command.KeyDigest ||
+			view.prepared.RequestDigest != command.RequestDigest ||
+			view.prepared.PlanRoot != command.PlanRoot ||
+			view.prepared.PreparedDigest != command.SubjectDigest ||
+			view.prepared.Revision != command.Revision) {
+			err = ErrCorrupt
+		}
+	case OperationBeginSchemaPinRelease, OperationRecordSchemaPinReleased:
+		view.schemaPin, err = OpenSchemaPinRelease(payload)
+		wantPhase := SchemaPinReleasing
+		if command.Operation == OperationRecordSchemaPinReleased {
+			wantPhase = SchemaPinReleased
+		}
+		if err == nil && (view.schemaPin.KeyDigest != command.KeyDigest ||
+			view.schemaPin.RequestDigest != command.RequestDigest ||
+			view.schemaPin.PlanRoot != command.PlanRoot ||
+			view.schemaPin.RecordDigest != command.SubjectDigest ||
+			view.schemaPin.Revision != command.Revision || view.schemaPin.Phase != wantPhase) {
+			err = ErrCorrupt
+		}
 	default:
 		err = ErrCorrupt
 	}
@@ -337,7 +372,7 @@ func ValidateCommand(raw []byte) error {
 }
 
 func validateCommandShape(command Command) error {
-	if command.Operation < OperationCreate || command.Operation > OperationCleanupPayload ||
+	if command.Operation < OperationCreate || command.Operation > OperationRecordSchemaPinReleased ||
 		!nonzeroDigest(command.KeyDigest) || !nonzeroDigest(command.RequestDigest) ||
 		!nonzeroDigest(command.PlanRoot) || !nonzeroDigest(command.SubjectDigest) ||
 		!nonzeroDigest(command.ExpectedRangeIdentity) || command.Home == (LedgerHome{}) {
@@ -369,7 +404,7 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		commandMagic, headMagic, pageMagic, planMagic, pageBatchMagic,
 		pendingWaveMagic, continuationMagic, terminalMagic, ackMagic,
 		gcRequestMagic, payloadBuildMagic, payloadChunkMagic,
-		routePinMagic, payloadCleanupMagic,
+		routePinMagic, payloadCleanupMagic, preparedTerminalMagic, schemaPinReleaseMagic,
 	} {
 		_, _ = hash.Write(magic[:])
 	}
@@ -384,20 +419,26 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		MaxGCRequestBytes, MaxAckGCDeleteRows,
 		MaxRouteGatePinCommandBytes, MaxRouteGatePinCompletionBytes,
 		MaxRoutePinRecordBytes, PayloadCleanupRequestBytes,
+		MaxPreparedTerminalResultBytes, MaxPreparedTerminalRecordBytes,
+		MaxSchemaPinReleaseRecordBytes,
+		RoutePinReservationBytes, PreparedTerminalReservationBytes,
+		SchemaPinReleaseReservationBytes, ReadyReservationBytes,
 		commandHeaderBytes, headHeaderBytes, pageHeaderBytes, planHeaderBytes,
 		pageBatchHeaderBytes, pendingWaveHeaderBytes, stepRefBytes,
 		continuationHeaderBytes, terminalHeaderBytes, payloadBuildBytes,
 		payloadChunkHeaderBytes, gcRequestHeaderBytes, routePinHeaderBytes,
+		preparedTerminalHeaderBytes, schemaPinReleaseHeaderBytes,
 		uint64(StoragePrefix), uint64(StorageHead), uint64(StoragePlanPage), uint64(StoragePending), uint64(StorageTerminal),
 		uint64(StorageAck), uint64(StorageContinuation), uint64(StoragePayloadChunk), uint64(StoragePayloadBuild),
 		uint64(StorageRoutePin),
+		uint64(StoragePrepared), uint64(StorageSchemaPin),
 		FixedStorageKeyBytes, PageStorageKeyBytes, PayloadStorageKeyBytes,
 		uint64(ScopeAuthenticated), uint64(ScopeLocalInstall),
-		uint64(PhasePlanning), uint64(PhaseSealed), uint64(PhaseTerminal), uint64(PhaseAcked),
+		uint64(PhasePlanning), uint64(PhaseSealed), uint64(PhasePrepared), uint64(PhaseTerminal), uint64(PhaseAcked),
 		uint64(OutcomeCommitted), uint64(OutcomeAborted),
 		uint64(PayloadSourcePlan), uint64(PayloadSourceDynamic),
 		uint64(PayloadBuildStaging), uint64(PayloadBuildSealed),
-		uint64(AckGCAwaitPinRelease), uint64(AckGCCollecting), uint64(AckGCComplete),
+		uint64(AckGCCollecting), uint64(AckGCComplete),
 		uint64(GCActionReleasePin), uint64(GCActionCollect),
 		uint64(OperationCreate), uint64(OperationAppendPages), uint64(OperationSeal),
 		uint64(OperationPutPending), uint64(OperationAdvance), uint64(OperationComplete),
@@ -407,8 +448,11 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		uint64(OperationBeginRoutePinAcquire), uint64(OperationRecordRoutePinAcquired),
 		uint64(OperationBeginRoutePinRelease), uint64(OperationRecordRoutePinReleased),
 		uint64(OperationCleanupPayload),
+		uint64(OperationPrepareTerminal), uint64(OperationBeginSchemaPinRelease),
+		uint64(OperationRecordSchemaPinReleased),
 		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
 		uint64(RoutePinReleasing), uint64(RoutePinReleased),
+		uint64(SchemaPinReleasing), uint64(SchemaPinReleased),
 	}
 	var fixed [8]byte
 	for index, value := range values {

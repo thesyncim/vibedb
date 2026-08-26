@@ -117,6 +117,7 @@ func TestSequencedKeyHomeAndStorageKeys(t *testing.T) {
 		AppendTerminalKey(nil, fh, fd), AppendAckKey(nil, fh, fd),
 		AppendPayloadBuildKey(nil, fh, fd), AppendPayloadChunkKey(nil, fh, fd, testDigest("build"), 3),
 		AppendRoutePinKey(nil, fh, fd),
+		AppendPreparedTerminalKey(nil, fh, fd), AppendSchemaPinReleaseKey(nil, fh, fd),
 	}
 	for _, raw := range keys {
 		view, err := OpenStorageKey(raw)
@@ -400,7 +401,7 @@ func TestRoutePinAndPayloadCleanupCommandCanonical(t *testing.T) {
 	}
 }
 
-func terminalFixture(t *testing.T, sequenced bool) (HeadRecord, ContinuationRecord, TerminalRecord) {
+func terminalFixture(t *testing.T, sequenced bool) (HeadRecord, PreparedTerminalRecord, SchemaPinReleaseRecord, TerminalRecord) {
 	t.Helper()
 	head, plan, cursor := testHead(t, sequenced)
 	steps := []StepRef{{TargetSource: PayloadSourcePlan, CommandSource: PayloadSourcePlan, TargetOffset: 0, TargetLength: 8, CommandOffset: 8, CommandLength: 16, TargetDigest: testDigest("target"), CommandDigest: testDigest("command")}}
@@ -431,15 +432,41 @@ func terminalFixture(t *testing.T, sequenced bool) (HeadRecord, ContinuationReco
 	}
 	var token AckToken
 	copy(token[:], []byte("random-capability-token-000000001"))
-	terminal, err := NewTerminal(head, continuation, 5, OutcomeCommitted, 12, true, []byte("result"), head.TerminalSummaryDigest, token)
+	prepared, err := NewPreparedTerminal(head, continuation, 5, OutcomeCommitted, 12, true,
+		[]byte("result"), head.TerminalSummaryDigest, token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return head, continuation, terminal
+	head, err = MarkTerminalPrepared(head, continuation, prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := NewSchemaPinRelease(head, prepared, 6, []byte("exact-schema-release-command"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err = InstallSchemaPinRelease(head, prepared, release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := release
+	release, err = RecordVerifiedSchemaPinReleased(release, 7, []byte("exact-schema-release-completion"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err = MarkSchemaPinReleased(head, prepared, intent, release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := NewTerminal(head, prepared, release, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return head, prepared, release, terminal
 }
 
 func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
-	head, continuation, terminal := terminalFixture(t, true)
+	head, prepared, release, terminal := terminalFixture(t, true)
 	raw, err := AppendTerminal(nil, terminal)
 	if err != nil {
 		t.Fatal(err)
@@ -454,11 +481,11 @@ func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
 	if _, err = OpenTerminal(forged); err == nil {
 		t.Fatal("forged token accepted")
 	}
-	terminalHead, err := MarkTerminal(head, continuation, terminal)
+	terminalHead, err := MarkTerminal(head, prepared, release, terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err := NewAck(terminalHead, terminal, 6, 10000)
+	ack, err := NewAck(terminalHead, terminal, 9, 10000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,17 +506,172 @@ func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
 	if AckRequestDigest(request) == AckRequestDigest(AckRequest{TerminalRevision: terminal.Revision, ResultDigest: terminal.ResultDigest, AckToken: terminal.AckToken}) {
 		t.Fatal("ack token not bound")
 	}
-	gcReq, _ := NewReleasePinRequest(ack.AckDigest, []byte{1}, []byte{2})
-	ack, err = MarkAckPinReleased(ack, 7, gcReq.ReleaseCertificateDigest())
+	if ack.GCPhase != AckGCCollecting || ack.ReleaseCertificateDigest != terminal.SchemaPinReleaseCertificateDigest {
+		t.Fatal("ACK retained a schema pin instead of its completed release witness")
+	}
+	if _, err = AdvanceAckGC(ack, 10, 1, math.MaxUint64-24, false); err == nil {
+		t.Fatal("reclaimed byte overflow accepted")
+	}
+	ack, err = AdvanceAckGC(ack, 10, 1, 10000, true)
+	if err != nil || ack.GCPhase != AckGCComplete {
+		t.Fatal("final GC")
+	}
+}
+
+func TestPreparedTerminalSchemaReleaseAndCompleteCanonical(t *testing.T) {
+	head, prepared, released, terminal := terminalFixture(t, false)
+	preparedRaw, err := AppendPreparedTerminal(nil, prepared)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = AdvanceAckGC(ack, 8, 1, math.MaxUint64-24, false); err == nil {
-		t.Fatal("reclaimed byte overflow accepted")
+	openedPrepared, err := OpenPreparedTerminal(preparedRaw)
+	if err != nil || openedPrepared.PreparedDigest != prepared.PreparedDigest ||
+		openedPrepared.AckToken != prepared.AckToken || !bytes.Equal(openedPrepared.Result, prepared.Result) {
+		t.Fatalf("prepared roundtrip: digest=%x err=%v", openedPrepared.PreparedDigest, err)
 	}
-	ack, err = AdvanceAckGC(ack, 8, 1, 10000, true)
-	if err != nil || ack.GCPhase != AckGCComplete {
-		t.Fatal("final GC")
+	forgedPrepared := append([]byte(nil), preparedRaw...)
+	forgedPrepared[preparedTerminalHeaderBytes] ^= 1
+	binary.LittleEndian.PutUint32(forgedPrepared[len(forgedPrepared)-4:],
+		crc32.Checksum(forgedPrepared[:len(forgedPrepared)-4], castagnoli))
+	if _, err = OpenPreparedTerminal(forgedPrepared); err == nil {
+		t.Fatal("prepared result changed under a recomputed checksum")
+	}
+
+	releasedRaw, err := AppendSchemaPinRelease(nil, released)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedRelease, err := OpenSchemaPinRelease(releasedRaw)
+	if err != nil || openedRelease.CertificateDigest != released.CertificateDigest ||
+		!bytes.Equal(openedRelease.Command, released.Command) ||
+		!bytes.Equal(openedRelease.Completion, released.Completion) {
+		t.Fatalf("schema release roundtrip: phase=%d err=%v", openedRelease.Phase, err)
+	}
+	forgedRelease := append([]byte(nil), releasedRaw...)
+	forgedRelease[len(forgedRelease)-checksumBytes-1] ^= 1
+	binary.LittleEndian.PutUint32(forgedRelease[len(forgedRelease)-4:],
+		crc32.Checksum(forgedRelease[:len(forgedRelease)-4], castagnoli))
+	if _, err = OpenSchemaPinRelease(forgedRelease); err == nil {
+		t.Fatal("schema release evidence changed under a recomputed checksum")
+	}
+
+	preparedHead := head
+	preparedHead.Revision = prepared.Revision
+	preparedHead.SchemaPinReleaseCertificateDigest = Digest{}
+	if err = validateHead(preparedHead); err != nil {
+		t.Fatal(err)
+	}
+	preparedHeadRaw, err := AppendHead(nil, preparedHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedPreparedHead, err := OpenHead(preparedHeadRaw)
+	if err != nil || openedPreparedHead.Phase != PhasePrepared ||
+		openedPreparedHead.PreparedTerminalDigest != prepared.PreparedDigest {
+		t.Fatalf("prepared head roundtrip: phase=%d err=%v", openedPreparedHead.Phase, err)
+	}
+	intent, err := NewSchemaPinRelease(preparedHead, prepared, 6, []byte("exact-schema-release-command"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = NewTerminal(preparedHead, prepared, intent, 7); err == nil {
+		t.Fatal("terminal published before authenticated schema release completion")
+	}
+
+	home, _ := Home(preparedHead.Key)
+	rangeIdentity := testDigest("range")
+	intentRaw, _ := AppendSchemaPinRelease(nil, intent)
+	terminalRaw, _ := AppendTerminal(nil, terminal)
+	tests := []struct {
+		op       Operation
+		expected uint64
+		revision uint64
+		subject  Digest
+		payload  []byte
+	}{
+		{OperationPrepareTerminal, 4, 5, prepared.PreparedDigest, preparedRaw},
+		{OperationBeginSchemaPinRelease, 5, 6, intent.RecordDigest, intentRaw},
+		{OperationRecordSchemaPinReleased, 6, 7, released.RecordDigest, releasedRaw},
+		{OperationComplete, 7, 8, terminal.ResultDigest, terminalRaw},
+	}
+	for _, test := range tests {
+		command := Command{Operation: test.op, ExpectedRevision: test.expected, Revision: test.revision,
+			KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+			SubjectDigest: test.subject, ExpectedRangeIdentity: rangeIdentity, Home: home, Payload: test.payload}
+		raw, appendErr := AppendCommand(nil, command)
+		if appendErr != nil {
+			t.Fatalf("op %d append: %v", test.op, appendErr)
+		}
+		opened, openErr := OpenCommandInto(raw, nil)
+		if openErr != nil || !bytes.Equal(opened.Bytes(), raw) {
+			t.Fatalf("op %d open: %v", test.op, openErr)
+		}
+		reencoded, reencodeErr := AppendCommand(nil, opened.Command)
+		if reencodeErr != nil || !bytes.Equal(reencoded, raw) {
+			t.Fatalf("op %d is not byte-canonical: %v", test.op, reencodeErr)
+		}
+		if allocations := testing.AllocsPerRun(100, func() {
+			if _, openErr = OpenCommandInto(raw, nil); openErr != nil {
+				panic(openErr)
+			}
+		}); allocations != 0 {
+			t.Fatalf("op %d OpenCommandInto allocs=%v", test.op, allocations)
+		}
+		switch test.op {
+		case OperationPrepareTerminal:
+			value, ok := opened.PreparedTerminal()
+			if !ok || value.PreparedDigest != prepared.PreparedDigest {
+				t.Fatal("prepared accessor")
+			}
+		case OperationBeginSchemaPinRelease, OperationRecordSchemaPinReleased:
+			value, ok := opened.SchemaPinRelease()
+			if !ok || value.RecordDigest != test.subject {
+				t.Fatal("schema release accessor")
+			}
+		}
+	}
+
+	wrongPhase, _ := AppendCommand(nil, Command{
+		Operation: OperationBeginSchemaPinRelease, ExpectedRevision: 6, Revision: 7,
+		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+		SubjectDigest: released.RecordDigest, ExpectedRangeIdentity: rangeIdentity, Home: home,
+		Payload: releasedRaw,
+	})
+	if _, err = OpenCommandInto(wrongPhase, nil); err == nil {
+		t.Fatal("schema release operation accepted the wrong phase")
+	}
+	installedHead, err := InstallSchemaPinRelease(preparedHead, prepared, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIntent, err := NewSchemaPinRelease(preparedHead, prepared, 6, []byte("different-release-command"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = MarkSchemaPinReleased(installedHead, prepared, otherIntent, released); err == nil {
+		t.Fatal("released certificate accepted a different durable intent")
+	}
+	forgedTerminal := terminal
+	forgedTerminal.Result = []byte("different-result")
+	forgedTerminal.ResultDigest = ResultDigest(forgedTerminal.Result)
+	forgedTerminal.TerminalSummaryDigest = terminalSummaryDigest(forgedTerminal)
+	if err = validateTerminal(forgedTerminal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = MarkTerminal(head, prepared, released, forgedTerminal); err == nil {
+		t.Fatal("Complete accepted a result different from the prepared candidate")
+	}
+	if OperationPrepareTerminal != 18 || OperationBeginSchemaPinRelease != 19 ||
+		OperationRecordSchemaPinReleased != 20 {
+		t.Fatal("prepared-terminal operation codes changed")
+	}
+
+	tooLarge := prepared
+	tooLarge.Result = make([]byte, MaxPreparedTerminalResultBytes+1)
+	tooLarge.ResultDigest = ResultDigest(tooLarge.Result)
+	tooLarge.PreparedDigest = preparedTerminalDigest(tooLarge)
+	if _, err = AppendPreparedTerminal(nil, tooLarge); err == nil {
+		t.Fatal("prepared result larger than publishable terminal accepted")
 	}
 }
 
@@ -497,7 +679,7 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 	head, _, _ := testHead(t, false)
 	home, _ := Home(head.Key)
 	base := Command{KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot, SubjectDigest: testDigest("subject"), ExpectedRangeIdentity: testDigest("range"), Home: home, Payload: []byte{1}}
-	for op := OperationCreate; op <= OperationCleanupPayload; op++ {
+	for op := OperationCreate; op <= OperationRecordSchemaPinReleased; op++ {
 		c := base
 		c.Operation = op
 		if op == OperationCreate || op == OperationBeginPayloadBuild {
@@ -533,7 +715,9 @@ func TestUsageAndReservationOverflow(t *testing.T) {
 	}
 	head, _, _ := testHead(t, false)
 	resident, future, err := Reservation(head)
-	if err != nil || resident == 0 || future < uint64(AckRecordBytes) {
+	minimumLifecycle := uint64(RoutePinReservationBytes + SchemaPinReleaseReservationBytes +
+		ReadyReservationBytes + FixedStorageKeyBytes + AckRecordBytes)
+	if err != nil || resident == 0 || future < minimumLifecycle {
 		t.Fatalf("reservation %d %d %v", resident, future, err)
 	}
 }

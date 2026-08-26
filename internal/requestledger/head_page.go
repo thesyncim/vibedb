@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	headHeaderBytes             = 800
+	headHeaderBytes             = 864
 	pageHeaderBytes             = 208
 	PlanPageRecordOverheadBytes = pageHeaderBytes + checksumBytes
 	MaxHeadRecordBytes          = headHeaderBytes + MaxInlinePlanBytes + checksumBytes
@@ -24,50 +24,52 @@ var (
 // A sealed head therefore validates completeness in O(1), without rereading
 // immutable pages.
 type HeadRecord struct {
-	Key                          RequestKey
-	KeyDigest                    Digest
-	RequestDigest                Digest
-	TerminalContractDigest       Digest
-	PlanRoot                     Digest
-	Revision                     uint64
-	Phase                        Phase
-	TotalPlanBytes               uint64
-	PlanPageCount                uint64
-	AppendedPlanBytes            uint64
-	AppendedPageCount            uint64
-	PageChain                    Digest
-	NextStepOrdinal              uint64
-	ContinuationRevision         uint64
-	ContinuationDigest           Digest
-	CatalogGeneration            uint64
-	PinID                        PinID
-	PinDigest                    Digest
-	RouteSchemaCertificateDigest Digest
-	MaxPendingWaveBytes          uint64
-	MaxContinuationBytes         uint64
-	MaxTerminalBytes             uint64
-	MaxActivePayloadBytes        uint64
-	MaxActivePayloadChunks       uint64
-	PlanBuildID                  Digest
-	PlanningLeaseExpiryIndex     uint64
-	PlanningLeaseGeneration      uint64
-	PlanCRC32C                   uint32
-	PlanCRCBytes                 uint64
-	PlanFramingValid             bool
-	TerminalTransitionTag        uint32
-	FinalWaveCount               uint64
-	TerminalStateDigest          Digest
-	TerminalSummaryDigest        Digest
-	AbortTerminalTransitionTag   uint32
-	AbortFinalWaveCount          uint64
-	AbortTerminalStateDigest     Digest
-	CleanupBuildDigest           Digest
-	CleanupNextChunk             uint64
-	CleanupChunkCount            uint64
-	CleanupPayloadBytes          uint64
-	CleanupTotalDataBytes        uint64
-	OutstandingRoutePinDigest    Digest
-	InlinePlan                   []byte
+	Key                               RequestKey
+	KeyDigest                         Digest
+	RequestDigest                     Digest
+	TerminalContractDigest            Digest
+	PlanRoot                          Digest
+	Revision                          uint64
+	Phase                             Phase
+	TotalPlanBytes                    uint64
+	PlanPageCount                     uint64
+	AppendedPlanBytes                 uint64
+	AppendedPageCount                 uint64
+	PageChain                         Digest
+	NextStepOrdinal                   uint64
+	ContinuationRevision              uint64
+	ContinuationDigest                Digest
+	CatalogGeneration                 uint64
+	PinID                             PinID
+	PinDigest                         Digest
+	RouteSchemaCertificateDigest      Digest
+	MaxPendingWaveBytes               uint64
+	MaxContinuationBytes              uint64
+	MaxTerminalBytes                  uint64
+	MaxActivePayloadBytes             uint64
+	MaxActivePayloadChunks            uint64
+	PlanBuildID                       Digest
+	PlanningLeaseExpiryIndex          uint64
+	PlanningLeaseGeneration           uint64
+	PlanCRC32C                        uint32
+	PlanCRCBytes                      uint64
+	PlanFramingValid                  bool
+	TerminalTransitionTag             uint32
+	FinalWaveCount                    uint64
+	TerminalStateDigest               Digest
+	TerminalSummaryDigest             Digest
+	AbortTerminalTransitionTag        uint32
+	AbortFinalWaveCount               uint64
+	AbortTerminalStateDigest          Digest
+	CleanupBuildDigest                Digest
+	CleanupNextChunk                  uint64
+	CleanupChunkCount                 uint64
+	CleanupPayloadBytes               uint64
+	CleanupTotalDataBytes             uint64
+	OutstandingRoutePinDigest         Digest
+	PreparedTerminalDigest            Digest
+	SchemaPinReleaseCertificateDigest Digest
+	InlinePlan                        []byte
 }
 
 type ExecutionContract struct {
@@ -331,6 +333,8 @@ func AppendHead(dst []byte, head HeadRecord) ([]byte, error) {
 	binary.LittleEndian.PutUint64(out[752:760], head.CleanupPayloadBytes)
 	binary.LittleEndian.PutUint64(out[760:768], head.CleanupTotalDataBytes)
 	putDigest(out[768:800], head.OutstandingRoutePinDigest)
+	putDigest(out[800:832], head.PreparedTerminalDigest)
+	putDigest(out[832:864], head.SchemaPinReleaseCertificateDigest)
 	dst = append(dst, head.InlinePlan...)
 	dst = appendChecksum(dst, start)
 	return dst, nil
@@ -371,29 +375,31 @@ func OpenHead(raw []byte) (HeadRecord, error) {
 		KeyDigest:            readDigest(raw[192:224]), RequestDigest: readDigest(raw[224:256]),
 		TerminalContractDigest: readDigest(raw[256:288]), PlanRoot: readDigest(raw[288:320]),
 		PageChain: readDigest(raw[320:352]), ContinuationDigest: readDigest(raw[352:384]),
-		PinDigest:                    readDigest(raw[416:448]),
-		RouteSchemaCertificateDigest: readDigest(raw[448:480]),
-		PlanCRC32C:                   binary.LittleEndian.Uint32(raw[488:492]),
-		PlanCRCBytes:                 binary.LittleEndian.Uint64(raw[496:504]),
-		PlanFramingValid:             raw[504] == 1,
-		TerminalTransitionTag:        binary.LittleEndian.Uint32(raw[512:516]),
-		FinalWaveCount:               binary.LittleEndian.Uint64(raw[520:528]),
-		TerminalStateDigest:          readDigest(raw[528:560]),
-		TerminalSummaryDigest:        readDigest(raw[560:592]),
-		MaxActivePayloadBytes:        binary.LittleEndian.Uint64(raw[592:600]),
-		MaxActivePayloadChunks:       binary.LittleEndian.Uint64(raw[600:608]),
-		PlanBuildID:                  readDigest(raw[608:640]),
-		PlanningLeaseExpiryIndex:     binary.LittleEndian.Uint64(raw[640:648]),
-		PlanningLeaseGeneration:      binary.LittleEndian.Uint64(raw[648:656]),
-		AbortTerminalTransitionTag:   binary.LittleEndian.Uint32(raw[656:660]),
-		AbortFinalWaveCount:          binary.LittleEndian.Uint64(raw[664:672]),
-		AbortTerminalStateDigest:     readDigest(raw[672:704]),
-		CleanupBuildDigest:           readDigest(raw[704:736]),
-		CleanupNextChunk:             binary.LittleEndian.Uint64(raw[736:744]),
-		CleanupChunkCount:            binary.LittleEndian.Uint64(raw[744:752]),
-		CleanupPayloadBytes:          binary.LittleEndian.Uint64(raw[752:760]),
-		CleanupTotalDataBytes:        binary.LittleEndian.Uint64(raw[760:768]),
-		OutstandingRoutePinDigest:    readDigest(raw[768:800]),
+		PinDigest:                         readDigest(raw[416:448]),
+		RouteSchemaCertificateDigest:      readDigest(raw[448:480]),
+		PlanCRC32C:                        binary.LittleEndian.Uint32(raw[488:492]),
+		PlanCRCBytes:                      binary.LittleEndian.Uint64(raw[496:504]),
+		PlanFramingValid:                  raw[504] == 1,
+		TerminalTransitionTag:             binary.LittleEndian.Uint32(raw[512:516]),
+		FinalWaveCount:                    binary.LittleEndian.Uint64(raw[520:528]),
+		TerminalStateDigest:               readDigest(raw[528:560]),
+		TerminalSummaryDigest:             readDigest(raw[560:592]),
+		MaxActivePayloadBytes:             binary.LittleEndian.Uint64(raw[592:600]),
+		MaxActivePayloadChunks:            binary.LittleEndian.Uint64(raw[600:608]),
+		PlanBuildID:                       readDigest(raw[608:640]),
+		PlanningLeaseExpiryIndex:          binary.LittleEndian.Uint64(raw[640:648]),
+		PlanningLeaseGeneration:           binary.LittleEndian.Uint64(raw[648:656]),
+		AbortTerminalTransitionTag:        binary.LittleEndian.Uint32(raw[656:660]),
+		AbortFinalWaveCount:               binary.LittleEndian.Uint64(raw[664:672]),
+		AbortTerminalStateDigest:          readDigest(raw[672:704]),
+		CleanupBuildDigest:                readDigest(raw[704:736]),
+		CleanupNextChunk:                  binary.LittleEndian.Uint64(raw[736:744]),
+		CleanupChunkCount:                 binary.LittleEndian.Uint64(raw[744:752]),
+		CleanupPayloadBytes:               binary.LittleEndian.Uint64(raw[752:760]),
+		CleanupTotalDataBytes:             binary.LittleEndian.Uint64(raw[760:768]),
+		OutstandingRoutePinDigest:         readDigest(raw[768:800]),
+		PreparedTerminalDigest:            readDigest(raw[800:832]),
+		SchemaPinReleaseCertificateDigest: readDigest(raw[832:864]),
 	}
 	copy(head.Key.Principal[:], raw[128:144])
 	copy(head.Key.Request[:], raw[144:160])
@@ -452,6 +458,10 @@ func validateHead(head HeadRecord) error {
 		head.CleanupPayloadBytes != 0 || head.CleanupTotalDataBytes != 0 {
 		return ErrCorrupt
 	}
+	if (head.Phase == PhasePrepared || head.Phase == PhaseTerminal) &&
+		nonzeroDigest(head.OutstandingRoutePinDigest) {
+		return ErrCorrupt
+	}
 	inline := uint64(len(head.InlinePlan))
 	if head.TotalPlanBytes <= MaxInlinePlanBytes {
 		if inline != head.TotalPlanBytes || head.PlanPageCount != 0 ||
@@ -481,21 +491,31 @@ func validateHead(head HeadRecord) error {
 	switch head.Phase {
 	case PhasePlanning:
 		if head.NextStepOrdinal != 0 || head.ContinuationRevision != 0 ||
-			nonzeroDigest(head.ContinuationDigest) {
+			nonzeroDigest(head.ContinuationDigest) || nonzeroDigest(head.PreparedTerminalDigest) ||
+			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) {
 			return ErrCorrupt
 		}
 	case PhaseSealed:
 		if !complete || head.NextStepOrdinal == 0 &&
 			(head.ContinuationRevision != 0 || nonzeroDigest(head.ContinuationDigest)) ||
 			head.NextStepOrdinal != 0 &&
-				(head.ContinuationRevision == 0 || !nonzeroDigest(head.ContinuationDigest)) {
+				(head.ContinuationRevision == 0 || !nonzeroDigest(head.ContinuationDigest)) ||
+			nonzeroDigest(head.PreparedTerminalDigest) ||
+			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) {
+			return ErrIncomplete
+		}
+	case PhasePrepared:
+		if !complete || head.NextStepOrdinal == 0 || head.ContinuationRevision == 0 ||
+			!nonzeroDigest(head.ContinuationDigest) || !nonzeroDigest(head.PreparedTerminalDigest) {
 			return ErrIncomplete
 		}
 	case PhaseTerminal:
 		if !complete || head.NextStepOrdinal == 0 &&
 			(head.ContinuationRevision != 0 || nonzeroDigest(head.ContinuationDigest)) ||
 			head.NextStepOrdinal != 0 &&
-				(head.ContinuationRevision == 0 || !nonzeroDigest(head.ContinuationDigest)) {
+				(head.ContinuationRevision == 0 || !nonzeroDigest(head.ContinuationDigest)) ||
+			!nonzeroDigest(head.PreparedTerminalDigest) ||
+			!nonzeroDigest(head.SchemaPinReleaseCertificateDigest) {
 			return ErrIncomplete
 		}
 	default:
