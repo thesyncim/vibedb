@@ -31,18 +31,33 @@ type requestLedgerImageScanner struct {
 	continuation                                              requestledger.ContinuationRecord
 	terminal                                                  requestledger.TerminalRecord
 	payloadBuild                                              requestledger.PayloadBuildRecord
+	routePin                                                  requestledger.RoutePinRecord
+	prepared                                                  requestledger.PreparedTerminalRecord
+	schemaPin                                                 requestledger.SchemaPinReleaseRecord
 	headFound                                                 bool
 	ackFound                                                  bool
 	pendingFound                                              bool
 	continuationFound                                         bool
 	terminalFound                                             bool
 	payloadBuildFound                                         bool
+	routePinFound, preparedFound, schemaPinFound              bool
 	pendingBytes, continuationBytes                           int
+	routePinBytes, preparedBytes, schemaPinBytes              int
 	payloadResident                                           uint64
 	pageCount, pageBytes, pageFirstOrdinal                    uint64
 	pageChain, pageRoot                                       requestledger.Digest
 	payloadChunkCount, payloadChunkBytes, payloadFirstOrdinal uint64
+	payloadChunkDataBytes                                     uint64
 	payloadChunkContent, payloadChunkBuild, payloadChunkChain requestledger.Digest
+
+	issuerHighwaters                                         map[requestLedgerIssuerScanKey]requestledger.IssuerHighwaterRecord
+	expectedIssuerSequences, actualIssuerSequences           uint64
+	expectedIssuerSequenceDigest, actualIssuerSequenceDigest requestledger.Digest
+}
+
+type requestLedgerIssuerScanKey struct {
+	home   requestledger.LedgerHome
+	issuer requestledger.Digest
 }
 
 func newRequestLedgerImageScanner(capacity, cleanup uint64, authority RequestLedgerRange) requestLedgerImageScanner {
@@ -173,7 +188,8 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 				chunk.PreviousChain != scan.payloadChunkChain)) ||
 			(scan.payloadChunkCount != 0 && (chunk.ContentRoot != scan.payloadChunkContent ||
 				chunk.BuildDigest != scan.payloadChunkBuild)) ||
-			scan.payloadChunkBytes > math.MaxUint64-rowBytes {
+			scan.payloadChunkBytes > math.MaxUint64-rowBytes ||
+			scan.payloadChunkDataBytes > math.MaxUint64-uint64(len(chunk.Data)) {
 			err = errors.Join(openErr, ErrStateCorrupt)
 			break
 		}
@@ -183,6 +199,7 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 		}
 		scan.payloadChunkCount++
 		scan.payloadChunkBytes += rowBytes
+		scan.payloadChunkDataBytes += uint64(len(chunk.Data))
 		scan.payloadResident += rowBytes
 		scan.payloadChunkChain = chunk.Chain
 	case requestledger.StoragePayloadBuild:
@@ -200,6 +217,33 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 			}
 			scan.payloadResident += rowBytes
 		}
+	case requestledger.StorageRoutePin:
+		if scan.routePinFound {
+			return ErrStateCorrupt
+		}
+		scan.routePin, err = requestledger.OpenRoutePin(value)
+		if err == nil && scan.routePin.KeyDigest != view.Key {
+			err = ErrStateCorrupt
+		}
+		scan.routePinBytes, scan.routePinFound = len(value), err == nil
+	case requestledger.StoragePrepared:
+		if scan.preparedFound {
+			return ErrStateCorrupt
+		}
+		scan.prepared, err = requestledger.OpenPreparedTerminal(value)
+		if err == nil && scan.prepared.KeyDigest != view.Key {
+			err = ErrStateCorrupt
+		}
+		scan.preparedBytes, scan.preparedFound = len(value), err == nil
+	case requestledger.StorageSchemaPin:
+		if scan.schemaPinFound {
+			return ErrStateCorrupt
+		}
+		scan.schemaPin, err = requestledger.OpenSchemaPinRelease(value)
+		if err == nil && scan.schemaPin.KeyDigest != view.Key {
+			err = ErrStateCorrupt
+		}
+		scan.schemaPinBytes, scan.schemaPinFound = len(value), err == nil
 	default:
 		err = ErrStateCorrupt
 	}
@@ -230,10 +274,17 @@ func (scan *requestLedgerImageScanner) finishRequest() error {
 				scan.terminal.RequestDigest != scan.ack.RequestDigest || scan.terminal.PlanRoot != scan.ack.PlanRoot ||
 				scan.terminal.ResultDigest != scan.ack.ResultDigest) ||
 			scan.payloadBuildFound && (scan.payloadBuild.KeyDigest != scan.ack.KeyDigest ||
-				scan.payloadBuild.RequestDigest != scan.ack.RequestDigest || scan.payloadBuild.PlanRoot != scan.ack.PlanRoot) {
+				scan.payloadBuild.RequestDigest != scan.ack.RequestDigest || scan.payloadBuild.PlanRoot != scan.ack.PlanRoot) ||
+			scan.routePinFound && (scan.routePin.KeyDigest != scan.ack.KeyDigest ||
+				scan.routePin.RequestDigest != scan.ack.RequestDigest || scan.routePin.PlanRoot != scan.ack.PlanRoot) ||
+			scan.preparedFound && (scan.prepared.KeyDigest != scan.ack.KeyDigest ||
+				scan.prepared.RequestDigest != scan.ack.RequestDigest || scan.prepared.PlanRoot != scan.ack.PlanRoot ||
+				scan.prepared.ResultDigest != scan.ack.ResultDigest) ||
+			scan.schemaPinFound && (scan.schemaPin.KeyDigest != scan.ack.KeyDigest ||
+				scan.schemaPin.RequestDigest != scan.ack.RequestDigest || scan.schemaPin.PlanRoot != scan.ack.PlanRoot) {
 			return fmt.Errorf("%w: request ledger ACK child identity", ErrStateCorrupt)
 		}
-		return nil
+		return scan.expectIssuerSequence(scan.ack.Key, scan.ack.RequestDigest, &scan.ack)
 	}
 	if !scan.headFound || scan.head.KeyDigest != scan.key || scan.pageFirstOrdinal != 0 ||
 		scan.pageCount != scan.head.AppendedPageCount || scan.pageBytes != scan.head.AppendedPlanBytes ||
@@ -266,7 +317,8 @@ func (scan *requestLedgerImageScanner) finishRequest() error {
 		return fmt.Errorf("%w: request ledger terminal", ErrStateCorrupt)
 	}
 	if scan.head.Phase == requestledger.PhasePlanning &&
-		(scan.pendingFound || scan.continuationFound || scan.terminalFound || scan.payloadBuildFound || scan.payloadChunkCount != 0) {
+		(scan.pendingFound || scan.continuationFound || scan.terminalFound || scan.payloadBuildFound ||
+			scan.routePinFound || scan.preparedFound || scan.schemaPinFound || scan.payloadChunkCount != 0) {
 		return fmt.Errorf("%w: request ledger planning children", ErrStateCorrupt)
 	}
 	if scan.payloadBuildFound {
@@ -291,28 +343,205 @@ func (scan *requestLedgerImageScanner) finishRequest() error {
 			}
 		} else if build.WaveOrdinal != scan.head.NextStepOrdinal ||
 			build.PriorContinuationDigest != scan.head.ContinuationDigest ||
-			scan.payloadFirstOrdinal != 0 || build.NextChunkOrdinal != scan.payloadChunkCount {
+			scan.payloadFirstOrdinal != 0 || build.NextChunkOrdinal != scan.payloadChunkCount ||
+			build.StagedBytes != scan.payloadChunkDataBytes {
 			return fmt.Errorf("%w: request ledger payload staging", ErrStateCorrupt)
 		}
 	} else if scan.payloadChunkCount != 0 {
 		return fmt.Errorf("%w: request ledger orphan payload chunks", ErrStateCorrupt)
 	}
+	if scan.routePinFound {
+		pin := scan.routePin
+		if scan.head.Phase != requestledger.PhaseSealed || pin.KeyDigest != scan.head.KeyDigest ||
+			pin.RequestDigest != scan.head.RequestDigest || pin.PlanRoot != scan.head.PlanRoot {
+			return fmt.Errorf("%w: request ledger route pin", ErrStateCorrupt)
+		}
+		switch pin.Phase {
+		case requestledger.RoutePinAcquiring:
+			if scan.pendingFound || pin.WaveOrdinal != scan.head.NextStepOrdinal ||
+				pin.PriorContinuationDigest != scan.head.ContinuationDigest ||
+				scan.head.OutstandingRoutePinDigest != (requestledger.Digest{}) {
+				return fmt.Errorf("%w: request ledger acquiring route pin", ErrStateCorrupt)
+			}
+		case requestledger.RoutePinAcquired:
+			beforeDispatch := pin.WaveOrdinal == scan.head.NextStepOrdinal &&
+				pin.PriorContinuationDigest == scan.head.ContinuationDigest &&
+				scan.head.OutstandingRoutePinDigest == (requestledger.Digest{})
+			afterDispatch := pin.WaveOrdinal != ^uint64(0) && pin.WaveOrdinal+1 == scan.head.NextStepOrdinal &&
+				scan.head.OutstandingRoutePinDigest == pin.AcquiredEvidenceDigest
+			if !beforeDispatch && !afterDispatch || scan.pendingFound && !beforeDispatch ||
+				scan.pendingFound && scan.pending.RoutePinDigest != pin.AcquiredEvidenceDigest {
+				return fmt.Errorf("%w: request ledger acquired route pin", ErrStateCorrupt)
+			}
+		case requestledger.RoutePinReleasing:
+			if scan.pendingFound || pin.WaveOrdinal == ^uint64(0) ||
+				pin.WaveOrdinal+1 != scan.head.NextStepOrdinal ||
+				scan.head.OutstandingRoutePinDigest != pin.AcquiredEvidenceDigest {
+				return fmt.Errorf("%w: request ledger releasing route pin", ErrStateCorrupt)
+			}
+		case requestledger.RoutePinReleased:
+			if scan.pendingFound || pin.WaveOrdinal == ^uint64(0) ||
+				pin.WaveOrdinal+1 != scan.head.NextStepOrdinal ||
+				scan.head.OutstandingRoutePinDigest != (requestledger.Digest{}) {
+				return fmt.Errorf("%w: request ledger released route pin", ErrStateCorrupt)
+			}
+		default:
+			return fmt.Errorf("%w: request ledger route pin phase", ErrStateCorrupt)
+		}
+	}
+	if scan.preparedFound != (scan.head.Phase == requestledger.PhasePrepared) ||
+		scan.preparedFound && (scan.prepared.KeyDigest != scan.head.KeyDigest ||
+			scan.prepared.RequestDigest != scan.head.RequestDigest || scan.prepared.PlanRoot != scan.head.PlanRoot ||
+			scan.prepared.TerminalContractDigest != scan.head.TerminalContractDigest ||
+			scan.prepared.FinalContinuationDigest != scan.head.ContinuationDigest ||
+			scan.prepared.CatalogGeneration != scan.head.CatalogGeneration ||
+			scan.prepared.PinID != scan.head.PinID || scan.prepared.PinDigest != scan.head.PinDigest ||
+			scan.prepared.RouteSchemaCertificateDigest != scan.head.RouteSchemaCertificateDigest ||
+			scan.prepared.PreparedDigest != scan.head.PreparedTerminalDigest) {
+		return fmt.Errorf("%w: request ledger prepared terminal", ErrStateCorrupt)
+	}
+	if scan.schemaPinFound && (!scan.preparedFound ||
+		scan.schemaPin.KeyDigest != scan.head.KeyDigest ||
+		scan.schemaPin.RequestDigest != scan.head.RequestDigest ||
+		scan.schemaPin.PlanRoot != scan.head.PlanRoot ||
+		scan.schemaPin.PreparedTerminalDigest != scan.prepared.PreparedDigest ||
+		scan.schemaPin.CatalogGeneration != scan.head.CatalogGeneration ||
+		scan.schemaPin.PinID != scan.head.PinID || scan.schemaPin.PinDigest != scan.head.PinDigest ||
+		scan.schemaPin.RouteSchemaCertificateDigest != scan.head.RouteSchemaCertificateDigest ||
+		scan.schemaPin.Revision != scan.head.Revision ||
+		scan.schemaPin.Phase == requestledger.SchemaPinReleasing &&
+			scan.head.SchemaPinReleaseCertificateDigest != (requestledger.Digest{}) ||
+		scan.schemaPin.Phase == requestledger.SchemaPinReleased &&
+			scan.head.SchemaPinReleaseCertificateDigest != scan.schemaPin.CertificateDigest) {
+		return fmt.Errorf("%w: request ledger schema pin", ErrStateCorrupt)
+	}
+	if scan.preparedFound && !scan.schemaPinFound &&
+		(scan.prepared.Revision != scan.head.Revision ||
+			scan.head.SchemaPinReleaseCertificateDigest != (requestledger.Digest{})) {
+		return fmt.Errorf("%w: request ledger prepared revision", ErrStateCorrupt)
+	}
 	reserved, ok := requestLedgerReservedBytes(
-		scan.head, scan.pendingBytes, scan.continuationBytes, scan.payloadResident,
+		scan.head, requestLedgerMaterialized{
+			pendingBytes: scan.pendingBytes, continuationBytes: scan.continuationBytes,
+			routePinBytes: scan.routePinBytes, preparedBytes: scan.preparedBytes,
+			schemaPinBytes: scan.schemaPinBytes, payloadResident: scan.payloadResident,
+		},
 	)
 	if !ok || scan.reserved > math.MaxUint64-reserved {
 		return fmt.Errorf("%w: request ledger reservation", ErrStateCorrupt)
 	}
 	scan.reserved += reserved
+	return scan.expectIssuerSequence(scan.head.Key, scan.head.RequestDigest, nil)
+}
+
+func (scan *requestLedgerImageScanner) expectIssuerSequence(
+	key requestledger.RequestKey,
+	requestDigest requestledger.Digest,
+	ack *requestledger.AckRecord,
+) error {
+	if key.IssuerEpoch == 0 {
+		return nil
+	}
+	sequence, err := requestledger.NewIssuerSequence(key, requestDigest)
+	if err != nil {
+		return errors.Join(err, ErrStateCorrupt)
+	}
+	if ack != nil && ack.GCPhase == requestledger.AckGCComplete {
+		sequence, err = requestledger.MarkIssuerSequenceGCComplete(sequence, *ack, sequence.Revision+1)
+		if err != nil {
+			return errors.Join(err, ErrStateCorrupt)
+		}
+	}
+	if scan.expectedIssuerSequences == math.MaxUint64 {
+		return ErrStateCorrupt
+	}
+	scan.expectedIssuerSequences++
+	xorRequestLedgerDigest(&scan.expectedIssuerSequenceDigest, sequence.RecordDigest)
 	return nil
+}
+
+func (scan *requestLedgerImageScanner) observeIssuerHighwater(key, value []byte) error {
+	if scan == nil || !scan.authority.enabled() {
+		return ErrStateCorrupt
+	}
+	if scan.current {
+		if err := scan.finishRequest(); err != nil {
+			return err
+		}
+		scan.resetRequest()
+	}
+	home, issuer, err := requestledger.OpenIssuerHighwaterKey(key)
+	record, openErr := requestledger.OpenIssuerHighwater(value)
+	if err != nil || openErr != nil || !scan.authority.contains(home) ||
+		record.Home != home || record.IssuerDigest != issuer {
+		return errors.Join(err, openErr, ErrStateCorrupt)
+	}
+	identity := requestLedgerIssuerScanKey{home: home, issuer: issuer}
+	if scan.issuerHighwaters == nil {
+		scan.issuerHighwaters = make(map[requestLedgerIssuerScanKey]requestledger.IssuerHighwaterRecord)
+	}
+	if _, duplicate := scan.issuerHighwaters[identity]; duplicate {
+		return ErrStateCorrupt
+	}
+	scan.issuerHighwaters[identity] = record
+	return scan.addIssuerRowBytes(key, value)
+}
+
+func (scan *requestLedgerImageScanner) observeIssuerSequence(key, value []byte) error {
+	if scan == nil || !scan.authority.enabled() {
+		return ErrStateCorrupt
+	}
+	if scan.current {
+		if err := scan.finishRequest(); err != nil {
+			return err
+		}
+		scan.resetRequest()
+	}
+	home, issuer, ordinal, err := requestledger.OpenIssuerSequenceKey(key)
+	record, openErr := requestledger.OpenIssuerSequence(value)
+	highwater, highwaterFound := scan.issuerHighwaters[requestLedgerIssuerScanKey{home: home, issuer: issuer}]
+	if err != nil || openErr != nil || !scan.authority.contains(home) || !highwaterFound ||
+		record.Home != home || record.IssuerDigest != issuer || record.Sequence != ordinal ||
+		record.Identity != highwater.Identity || record.Sequence <= highwater.HighwaterSequence {
+		return errors.Join(err, openErr, ErrStateCorrupt)
+	}
+	if scan.actualIssuerSequences == math.MaxUint64 {
+		return ErrStateCorrupt
+	}
+	scan.actualIssuerSequences++
+	xorRequestLedgerDigest(&scan.actualIssuerSequenceDigest, record.RecordDigest)
+	return scan.addIssuerRowBytes(key, value)
+}
+
+func (scan *requestLedgerImageScanner) addIssuerRowBytes(key, value []byte) error {
+	rowBytes := uint64(len(key) + len(value))
+	if scan.rows == math.MaxUint64 || scan.resident > math.MaxUint64-rowBytes {
+		return ErrStateCorrupt
+	}
+	scan.rows++
+	scan.resident += rowBytes
+	return nil
+}
+
+func xorRequestLedgerDigest(dst *requestledger.Digest, value requestledger.Digest) {
+	for at := range dst {
+		dst[at] ^= value[at]
+	}
 }
 
 func (scan *requestLedgerImageScanner) resetRequest() {
 	capacity, cleanup, authority := scan.capacity, scan.cleanup, scan.authority
 	rows, resident, reserved := scan.rows, scan.resident, scan.reserved
 	ackRows, ackBytes := scan.ackRows, scan.ackBytes
+	issuerHighwaters := scan.issuerHighwaters
+	expectedIssuerSequences, actualIssuerSequences := scan.expectedIssuerSequences, scan.actualIssuerSequences
+	expectedIssuerSequenceDigest, actualIssuerSequenceDigest := scan.expectedIssuerSequenceDigest, scan.actualIssuerSequenceDigest
 	*scan = requestLedgerImageScanner{capacity: capacity, cleanup: cleanup, authority: authority,
-		rows: rows, resident: resident, reserved: reserved, ackRows: ackRows, ackBytes: ackBytes}
+		rows: rows, resident: resident, reserved: reserved, ackRows: ackRows, ackBytes: ackBytes,
+		issuerHighwaters:        issuerHighwaters,
+		expectedIssuerSequences: expectedIssuerSequences, actualIssuerSequences: actualIssuerSequences,
+		expectedIssuerSequenceDigest: expectedIssuerSequenceDigest,
+		actualIssuerSequenceDigest:   actualIssuerSequenceDigest}
 }
 
 func (scan *requestLedgerImageScanner) finish(state State) error {
@@ -322,10 +551,18 @@ func (scan *requestLedgerImageScanner) finish(state State) error {
 	if err := scan.finishRequest(); err != nil {
 		return err
 	}
+	if scan.expectedIssuerSequences != scan.actualIssuerSequences ||
+		scan.expectedIssuerSequenceDigest != scan.actualIssuerSequenceDigest {
+		return fmt.Errorf("%w: request ledger issuer sequence image", ErrStateCorrupt)
+	}
 	if scan.rows != state.RequestLedgerRows || scan.resident != state.RequestLedgerResidentBytes ||
 		scan.reserved != state.RequestLedgerReservedBytes || scan.ackRows != state.RequestLedgerAckRows ||
 		scan.ackBytes != state.RequestLedgerAckBytes {
-		return fmt.Errorf("%w: request ledger image accounting", ErrStateCorrupt)
+		return fmt.Errorf("%w: request ledger image accounting rows=%d/%d resident=%d/%d reserved=%d/%d ack=%d/%d bytes=%d/%d",
+			ErrStateCorrupt, scan.rows, state.RequestLedgerRows,
+			scan.resident, state.RequestLedgerResidentBytes,
+			scan.reserved, state.RequestLedgerReservedBytes,
+			scan.ackRows, state.RequestLedgerAckRows, scan.ackBytes, state.RequestLedgerAckBytes)
 	}
 	if !scan.authority.enabled() {
 		if scan.rows != 0 || scan.resident != 0 || scan.reserved != 0 || scan.ackRows != 0 || scan.ackBytes != 0 {

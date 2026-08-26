@@ -190,6 +190,36 @@ func TestRequestLedgerCreateSettlesWithoutSessionAndReopens(t *testing.T) {
 	}
 }
 
+func TestRequestLedgerSequencedCreateReopensExactUsage(t *testing.T) {
+	fixture := newRequestLedgerMachineFixture(t, 64<<20)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest{0x12}, Principal: requestledger.PrincipalID{0x22},
+		Request: requestledger.RequestID{0x32}, IssuerEpoch: 1, IssuerSequence: 1,
+		IssuerLane: requestledger.IssuerLane{0x42}}
+	create, _ := requestLedgerCreateCommand(t, fixture, key)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), create); err != nil {
+		t.Fatalf("sequenced create: %v", err)
+	}
+	usage, err := fixture.machine.RequestLedgerUsage()
+	if err != nil || usage.Rows != 3 || usage.ResidentBytes == 0 || usage.ReservedBytes == 0 {
+		t.Fatalf("sequenced usage = %+v, %v", usage, err)
+	}
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatalf("reopen sequenced ledger: %v", err)
+	}
+	reopenedUsage, err := reopened.RequestLedgerUsage()
+	if err != nil || reopenedUsage != usage {
+		t.Fatalf("reopened sequenced usage = %+v, %v; want %+v", reopenedUsage, err, usage)
+	}
+}
+
 func TestRequestLedgerRangeAdmissionPrecedesSnapshotReads(t *testing.T) {
 	fixture := newRequestLedgerMachineFixture(t, 64<<20)
 	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,

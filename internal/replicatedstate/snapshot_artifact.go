@@ -1643,6 +1643,21 @@ func consumeSnapshotArtifactRows(
 				if err := validateSnapshotRequestLedgerRow(key, value); err != nil {
 					return false, fmt.Errorf("%w: request ledger row: %v", ErrSnapshotArtifact, err)
 				}
+			case len(key) == requestledger.IssuerHighwaterKeyBytes && key[0] == requestledger.IssuerHighwaterStoragePrefix:
+				home, issuer, keyErr := requestledger.OpenIssuerHighwaterKey(key)
+				record, recordErr := requestledger.OpenIssuerHighwater(value)
+				if keyErr != nil || recordErr != nil || record.Home != home || record.IssuerDigest != issuer {
+					return false, errors.Join(keyErr, recordErr,
+						fmt.Errorf("%w: request ledger issuer high-water", ErrSnapshotArtifact))
+				}
+			case len(key) == requestledger.IssuerSequenceKeyBytes && key[0] == requestledger.IssuerSequenceStoragePrefix:
+				home, issuer, ordinal, keyErr := requestledger.OpenIssuerSequenceKey(key)
+				record, recordErr := requestledger.OpenIssuerSequence(value)
+				if keyErr != nil || recordErr != nil || record.Home != home ||
+					record.IssuerDigest != issuer || record.Sequence != ordinal {
+					return false, errors.Join(keyErr, recordErr,
+						fmt.Errorf("%w: request ledger issuer sequence", ErrSnapshotArtifact))
+				}
 			default:
 				return false, fmt.Errorf("%w: hidden system key", ErrSnapshotArtifact)
 			}

@@ -50,7 +50,7 @@ func TestRequestLedgerCompletionResultRoundTripStrict(t *testing.T) {
 }
 
 func TestRequestLedgerCompletionAcceptsEveryCanonicalOperation(t *testing.T) {
-	for operation := requestledger.OperationCreate; operation <= requestledger.OperationCleanupPayload; operation++ {
+	for operation := requestledger.OperationCreate; operation <= requestledger.LastOperation; operation++ {
 		result := RequestLedgerCompletionResult{
 			Operation: operation, Phase: requestledger.PhaseSealed,
 			ResultCode: ResultApplied, Revision: 1,

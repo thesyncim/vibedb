@@ -1154,6 +1154,18 @@ func scanSessionSystemSnapshot(
 			}
 			return ledgerScan.observe(key, value)
 
+		case len(key) == requestledger.IssuerHighwaterKeyBytes && key[0] == requestledger.IssuerHighwaterStoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger issuer high-water before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observeIssuerHighwater(key, value)
+
+		case len(key) == requestledger.IssuerSequenceKeyBytes && key[0] == requestledger.IssuerSequenceStoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger issuer sequence before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observeIssuerSequence(key, value)
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}

@@ -20,6 +20,9 @@ const (
 	RequestLedgerReadContinuation RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageContinuation)
 	RequestLedgerReadPayloadChunk RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StoragePayloadChunk)
 	RequestLedgerReadPayloadBuild RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StoragePayloadBuild)
+	RequestLedgerReadRoutePin     RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageRoutePin)
+	RequestLedgerReadPrepared     RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StoragePrepared)
+	RequestLedgerReadSchemaPin    RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageSchemaPin)
 )
 
 var ErrRequestLedgerRead = errors.New("replicatedstate: invalid request-ledger recovery read")
@@ -62,6 +65,12 @@ func RequestLedgerReadMaxBytes(kind RequestLedgerReadKind) int {
 		return requestledger.MaxPayloadChunkRecordBytes
 	case RequestLedgerReadPayloadBuild:
 		return requestledger.PayloadBuildRecordBytes
+	case RequestLedgerReadRoutePin:
+		return requestledger.MaxRoutePinRecordBytes
+	case RequestLedgerReadPrepared:
+		return requestledger.MaxPreparedTerminalRecordBytes
+	case RequestLedgerReadSchemaPin:
+		return requestledger.MaxSchemaPinReleaseRecordBytes
 	default:
 		return 0
 	}
@@ -202,6 +211,12 @@ func requestLedgerReadStorageKey(
 		return requestledger.AppendPayloadChunkKey(nil, home, key, request.ContentRoot, request.Ordinal)
 	case RequestLedgerReadPayloadBuild:
 		return requestledger.AppendPayloadBuildKey(nil, home, key)
+	case RequestLedgerReadRoutePin:
+		return requestledger.AppendRoutePinKey(nil, home, key)
+	case RequestLedgerReadPrepared:
+		return requestledger.AppendPreparedTerminalKey(nil, home, key)
+	case RequestLedgerReadSchemaPin:
+		return requestledger.AppendSchemaPinReleaseKey(nil, home, key)
 	default:
 		return nil
 	}

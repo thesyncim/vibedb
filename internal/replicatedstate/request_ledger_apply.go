@@ -13,6 +13,11 @@ import (
 var requestLedgerStateDigestDomain = []byte("vibedb/replicated-state/request-ledger-state\x00")
 var errStopRequestLedgerGCScan = errors.New("replicatedstate: stop request-ledger GC scan")
 
+// requestLedgerMaxPlanningLeaseEntries bounds a caller-selected planning
+// lease in the replicated applied-index domain. It is part of the apply
+// contract below; wall clocks never participate in expiry decisions.
+const requestLedgerMaxPlanningLeaseEntries uint64 = 1 << 20
+
 type requestLedgerStateDelta struct {
 	rows          int64
 	residentBytes int64
@@ -36,6 +41,8 @@ type requestLedgerRows struct {
 	ackRaw            []byte
 	payloadBuildRaw   []byte
 	routePinRaw       []byte
+	preparedRaw       []byte
+	schemaPinRaw      []byte
 	head              requestledger.HeadRecord
 	pending           requestledger.PendingWaveRecord
 	continuation      requestledger.ContinuationRecord
@@ -43,6 +50,8 @@ type requestLedgerRows struct {
 	ack               requestledger.AckRecord
 	payloadBuild      requestledger.PayloadBuildRecord
 	routePin          requestledger.RoutePinRecord
+	prepared          requestledger.PreparedTerminalRecord
+	schemaPin         requestledger.SchemaPinReleaseRecord
 	headFound         bool
 	pendingFound      bool
 	continuationFound bool
@@ -50,6 +59,8 @@ type requestLedgerRows struct {
 	ackFound          bool
 	payloadBuildFound bool
 	routePinFound     bool
+	preparedFound     bool
+	schemaPinFound    bool
 }
 
 func (m *Machine) planRequestLedgerCommand(
@@ -80,6 +91,9 @@ func (m *Machine) planRequestLedgerCommand(
 		!m.options.RequestLedgerRange.contains(command.Home) {
 		plan.completion.ResultCode = ResultRequestLedgerWrongRange
 		return plan, nil
+	}
+	if command.Operation == requestledger.OperationAdvanceIssuerHighwater {
+		return planRequestLedgerIssuerAdvance(plan, command, snapshot)
 	}
 	storedPendingScratch := m.requestLedgerSteps[:]
 	if command.Operation == requestledger.OperationPutPending {
@@ -136,7 +150,7 @@ func (m *Machine) planRequestLedgerCommand(
 		return witnessedRequestLedgerConflict(plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw), nil
 	}
 	if command.Operation == requestledger.OperationCreate {
-		return m.planRequestLedgerCreate(plan, command, state, rows)
+		return m.planRequestLedgerCreate(plan, command, state, rows, snapshot)
 	}
 	if !rows.headFound || rows.head.KeyDigest != command.KeyDigest ||
 		rows.head.RequestDigest != command.RequestDigest || rows.head.PlanRoot != command.PlanRoot {
@@ -169,19 +183,253 @@ func (m *Machine) planRequestLedgerCommand(
 		return planRequestLedgerSealPayload(plan, command, rows)
 	case requestledger.OperationCleanupPayload:
 		return planRequestLedgerCleanupPayload(plan, command, rows, snapshot)
-	case requestledger.OperationExpirePlanning,
-		requestledger.OperationBeginRoutePinAcquire,
+	case requestledger.OperationPrepareTerminal:
+		return planRequestLedgerPrepareTerminal(plan, command, rows)
+	case requestledger.OperationBeginSchemaPinRelease:
+		return planRequestLedgerBeginSchemaPinRelease(plan, command, rows)
+	case requestledger.OperationRecordSchemaPinReleased:
+		return planRequestLedgerRecordSchemaPinReleased(plan, command, rows)
+	case requestledger.OperationBeginRoutePinAcquire,
 		requestledger.OperationRecordRoutePinAcquired,
 		requestledger.OperationBeginRoutePinRelease,
 		requestledger.OperationRecordRoutePinReleased:
-		// These durable predecessors have canonical kernel grammars but are not
-		// yet integrated into this state-machine checkpoint. Refuse them as a
-		// witnessed CAS conflict; never poison the replica or accept partial
-		// evidence.
+		return planRequestLedgerRoutePin(plan, command, rows)
+	case requestledger.OperationExpirePlanning:
+		return planRequestLedgerExpirePlanning(plan, command, rows, state)
+	case requestledger.OperationRestartPlanning:
+		return m.planRequestLedgerRestartPlanning(plan, command, rows, state)
+	case requestledger.OperationCleanupPlanning:
+		return planRequestLedgerCleanupPlanning(plan, command, rows, snapshot)
+	default:
+		// The inner decoder has already accepted the canonical operation. A
+		// newer-but-not-yet-integrated lifecycle operation must fail closed as
+		// a durable CAS conflict; it must never poison every replica merely by
+		// reaching the apply switch.
+		return witnessedRequestLedgerConflict(
+			plan, rows.head.Revision, rows.head.Phase, rows.headRaw,
+		), nil
+	}
+}
+
+func planRequestLedgerExpirePlanning(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+	state State,
+) (requestLedgerCommandPlan, error) {
+	request, _ := command.PlanningExpiry()
+	if rows.head.Revision == command.Revision && rows.head.Phase == requestledger.PhaseExpired &&
+		rows.head.PlanBuildID == request.PlanBuildID &&
+		rows.head.PlanBuildGeneration == request.BuildGeneration {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhasePlanning ||
+		state.Applied == math.MaxUint64 || request.ObservedAppliedIndex > state.Applied+1 ||
+		state.Applied+1 < rows.head.PlanningLeaseExpiryIndex {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.MarkPlanningExpired(rows.head, request, command.Revision)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func (m *Machine) planRequestLedgerRestartPlanning(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+	state State,
+) (requestLedgerCommandPlan, error) {
+	request, _ := command.PlanningRestart()
+	if rows.head.Revision == command.Revision && rows.head.Phase == requestledger.PhasePlanning &&
+		rows.head.PlanBuildGeneration == request.NextGeneration &&
+		rows.head.PlanBuildID == request.NextPlanBuildID &&
+		rows.head.PlanningLeaseExpiryIndex == request.NextLeaseExpiryIndex {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhaseExpired ||
+		state.Applied >= math.MaxUint64-requestLedgerMaxPlanningLeaseEntries-1 ||
+		request.ObservedAppliedIndex > state.Applied+1 ||
+		request.NextLeaseExpiryIndex != state.Applied+1+requestLedgerMaxPlanningLeaseEntries {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.RestartPlanning(rows.head, request, command.Revision)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok || afterReserved < beforeReserved {
+		return plan, ErrStateCorrupt
+	}
+	additional := afterReserved - beforeReserved
+	consumed, ok := checkedRequestLedgerConsumption(
+		state.RequestLedgerResidentBytes, state.RequestLedgerReservedBytes, additional,
+	)
+	ordinaryCapacity := m.options.RequestLedgerCapacityBytes - m.options.RequestLedgerCleanupReserveBytes
+	if !ok || consumed > ordinaryCapacity {
+		// Restart is a durable-state CAS, not a stateless Create. Leave the
+		// compact expired fence intact and let the controller retry after
+		// capacity is reclaimed.
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	plan.delta.reservedBytes += int64(additional)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func planRequestLedgerCleanupPlanning(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+	snapshot pointSnapshot,
+) (requestLedgerCommandPlan, error) {
+	request, _ := command.PlanningCleanup()
+	if rows.head.Revision == command.Revision && rows.head.Phase == requestledger.PhaseExpired &&
+		rows.head.PlanBuildGeneration == request.BuildGeneration && rows.head.PlanBuildID == request.PlanBuildID {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhaseExpired {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	chunk, err := requestledger.PlanPlanningCleanup(rows.head, request)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	var reclaimed uint64
+	for offset := uint64(0); offset < chunk.PageCount; offset++ {
+		ordinal := chunk.FirstOrdinal + offset
+		key := requestledger.AppendPlanPageKey(nil, command.Home, command.KeyDigest, ordinal)
+		raw, found, readErr := snapshot.appendRaw(nil, key)
+		if readErr != nil {
+			return plan, readErr
+		}
+		page, openErr := requestledger.OpenPlanPage(raw)
+		if !found || openErr != nil || page.KeyDigest != command.KeyDigest ||
+			page.PlanRoot != rows.head.PlanRoot || page.Ordinal != ordinal ||
+			page.Count != rows.head.PlanPageCount {
+			return plan, errors.Join(openErr, ErrStateCorrupt)
+		}
+		rowBytes := uint64(len(key) + len(raw))
+		if reclaimed > math.MaxUint64-rowBytes {
+			return plan, ErrStateCorrupt
+		}
+		reclaimed += rowBytes
+		plan.rows = append(plan.rows, newTransactionDelete(key))
+		plan.delta.rows--
+	}
+	if reclaimed != chunk.ReclaimedBytes {
+		return plan, ErrStateCorrupt
+	}
+	next, err := requestledger.AdvancePlanningCleanup(rows.head, request, chunk, command.Revision)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	plan.delta.residentBytes -= int64(reclaimed)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func planRequestLedgerRoutePin(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+) (requestLedgerCommandPlan, error) {
+	desired, _ := command.RoutePin()
+	if rows.head.Revision == command.Revision && rows.routePinFound &&
+		bytes.Equal(rows.routePinRaw, command.Payload) {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.routePinRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhaseSealed ||
+		rows.pendingFound || rows.preparedFound || rows.schemaPinFound {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	var next requestledger.HeadRecord
+	var transitionErr error
+	switch command.Operation {
+	case requestledger.OperationBeginRoutePinAcquire:
+		if rows.head.OutstandingRoutePinDigest != (requestledger.Digest{}) ||
+			rows.routePinFound && (rows.routePin.Phase != requestledger.RoutePinReleased ||
+				rows.routePin.WaveOrdinal == ^uint64(0) || rows.routePin.WaveOrdinal+1 != rows.head.NextStepOrdinal) ||
+			!requestLedgerRouteCommandEvidenceAvailable(desired) {
+			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+		}
+		next, transitionErr = requestledger.AdvanceHeadRoutePin(
+			rows.head, requestledger.RoutePinRecord{}, desired, command.Revision,
+		)
+	case requestledger.OperationRecordRoutePinAcquired:
+		if !rows.routePinFound || rows.routePin.Phase != requestledger.RoutePinAcquiring ||
+			!requestLedgerRouteCompletionEvidenceAvailable(rows.routePin, desired) {
+			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+		}
+		next, transitionErr = requestledger.AdvanceHeadRoutePin(
+			rows.head, rows.routePin, desired, command.Revision,
+		)
+	case requestledger.OperationBeginRoutePinRelease:
+		if !rows.routePinFound || rows.routePin.Phase != requestledger.RoutePinAcquired ||
+			rows.head.OutstandingRoutePinDigest != rows.routePin.AcquiredEvidenceDigest ||
+			!requestLedgerRouteCommandEvidenceAvailable(desired) {
+			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+		}
+		next, transitionErr = requestledger.AdvanceHeadRoutePin(
+			rows.head, rows.routePin, desired, command.Revision,
+		)
+	case requestledger.OperationRecordRoutePinReleased:
+		if !rows.routePinFound || rows.routePin.Phase != requestledger.RoutePinReleasing ||
+			!requestLedgerRouteCompletionEvidenceAvailable(rows.routePin, desired) {
+			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+		}
+		next, transitionErr = requestledger.MarkRoutePinReleased(rows.head, desired, command.Revision)
 	default:
 		return plan, ErrStateCorrupt
 	}
+	if transitionErr != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	materialized.routePinBytes = len(command.Payload)
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	key := requestledger.AppendRoutePinKey(nil, command.Home, command.KeyDigest)
+	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload))
+	if rows.routePinFound {
+		plan.delta.residentBytes += int64(len(command.Payload) - len(rows.routePinRaw))
+	} else {
+		plan.delta.rows++
+		plan.delta.residentBytes += int64(len(key) + len(command.Payload))
+	}
+	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func requestLedgerRouteCommandEvidenceAvailable(requestledger.RoutePinRecord) bool {
+	return false
+}
+
+func requestLedgerRouteCompletionEvidenceAvailable(
+	requestledger.RoutePinRecord,
+	requestledger.RoutePinRecord,
+) bool {
+	return false
 }
 
 func (m *Machine) planRequestLedgerCreate(
@@ -189,6 +437,7 @@ func (m *Machine) planRequestLedgerCreate(
 	command requestledger.CommandView,
 	state State,
 	rows requestLedgerRows,
+	snapshot pointSnapshot,
 ) (requestLedgerCommandPlan, error) {
 	head, _ := command.Head()
 	if rows.headFound {
@@ -199,6 +448,15 @@ func (m *Machine) planRequestLedgerCreate(
 	}
 	if rows.pendingFound || rows.continuationFound || rows.terminalFound {
 		return plan, ErrStateCorrupt
+	}
+	if head.Phase == requestledger.PhasePlanning {
+		if state.Applied >= math.MaxUint64-requestLedgerMaxPlanningLeaseEntries-1 ||
+			head.PlanningLeaseExpiryIndex != state.Applied+1+requestLedgerMaxPlanningLeaseEntries ||
+			head.PlanningLeaseGeneration != head.PlanBuildGeneration {
+			plan.completion.ResultCode = ResultRequestLedgerCapacity
+			plan.completion.Phase = requestledger.PhaseInvalid
+			return plan, nil
+		}
 	}
 	encoded, err := requestledger.AppendHead(nil, head)
 	if err != nil {
@@ -220,7 +478,8 @@ func (m *Machine) planRequestLedgerCreate(
 	}
 	plan.rows = append(plan.rows, newTransactionPut(key, encoded))
 	plan.delta = requestLedgerStateDelta{rows: 1, residentBytes: int64(resident), reservedBytes: int64(reserved)}
-	return witnessedRequestLedgerApplied(plan, head.Revision, head.Phase, encoded, false), nil
+	plan = witnessedRequestLedgerApplied(plan, head.Revision, head.Phase, encoded, false)
+	return m.planRequestLedgerSequencedCreate(plan, command, head, state, snapshot)
 }
 
 func planRequestLedgerAppendPages(
@@ -265,11 +524,11 @@ func planRequestLedgerAppendPages(
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	beforeReserved, ok := requestLedgerReservedBytes(rows.head, 0, 0, 0)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, requestLedgerMaterialized{})
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
-	afterReserved, ok := requestLedgerReservedBytes(next, 0, 0, 0)
+	afterReserved, ok := requestLedgerReservedBytes(next, requestLedgerMaterialized{})
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
@@ -346,11 +605,15 @@ func planRequestLedgerPutPending(plan requestLedgerCommandPlan, command requestl
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	beforeReserved, ok := requestLedgerReservedBytes(rows.head, 0, len(rows.continuationRaw), 0)
+	materialized := requestLedgerMaterialized{
+		continuationBytes: len(rows.continuationRaw), routePinBytes: len(rows.routePinRaw),
+	}
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
-	afterReserved, ok := requestLedgerReservedBytes(next, len(pendingView.Bytes()), len(rows.continuationRaw), 0)
+	materialized.pendingBytes = len(pendingView.Bytes())
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
@@ -496,13 +759,17 @@ func planRequestLedgerAdvance(plan requestLedgerCommandPlan, command requestledg
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
 	payloadResident := next.CleanupPayloadBytes
-	beforeReserved, ok := requestLedgerReservedBytes(
-		rows.head, len(rows.pendingRaw), len(rows.continuationRaw), payloadResident,
-	)
+	materialized := requestLedgerMaterialized{
+		pendingBytes: len(rows.pendingRaw), continuationBytes: len(rows.continuationRaw),
+		routePinBytes: len(rows.routePinRaw), payloadResident: payloadResident,
+	}
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
-	afterReserved, ok := requestLedgerReservedBytes(next, 0, len(command.Payload), payloadResident)
+	materialized.pendingBytes = 0
+	materialized.continuationBytes = len(command.Payload)
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
@@ -582,15 +849,16 @@ func planRequestLedgerCleanupPayload(
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	beforeReserved, ok := requestLedgerReservedBytes(
-		rows.head, 0, len(rows.continuationRaw), rows.head.CleanupPayloadBytes,
-	)
+	materialized := requestLedgerMaterialized{
+		continuationBytes: len(rows.continuationRaw), routePinBytes: len(rows.routePinRaw),
+		payloadResident: rows.head.CleanupPayloadBytes,
+	}
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
-	afterReserved, ok := requestLedgerReservedBytes(
-		next, 0, len(rows.continuationRaw), next.CleanupPayloadBytes,
-	)
+	materialized.payloadResident = next.CleanupPayloadBytes
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
@@ -606,33 +874,182 @@ func planRequestLedgerComplete(plan requestLedgerCommandPlan, command requestled
 		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.terminalRaw, true), nil
 	}
 	if rows.head.Revision != command.ExpectedRevision || rows.pendingFound || !rows.continuationFound ||
-		rows.terminalFound || rows.payloadBuildFound {
+		rows.terminalFound || rows.payloadBuildFound || !rows.preparedFound || !rows.schemaPinFound ||
+		rows.schemaPin.Phase != requestledger.SchemaPinReleased || rows.routePinFound {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	// Prepared-terminal and authenticated schema-pin release are mandatory
-	// predecessors. Their command family is still being frozen in the kernel;
-	// empty records keep direct Complete fail-closed in the interim.
-	next, err := requestledger.MarkTerminal(
-		rows.head, requestledger.PreparedTerminalRecord{},
-		requestledger.SchemaPinReleaseRecord{}, terminal,
+	expected, err := requestledger.NewTerminal(
+		rows.head, rows.prepared, rows.schemaPin, command.Revision,
 	)
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	beforeReserved, ok := requestLedgerReservedBytes(rows.head, 0, len(rows.continuationRaw), 0)
+	expectedRaw, err := requestledger.AppendTerminal(nil, expected)
+	if err != nil || !bytes.Equal(expectedRaw, command.Payload) {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.MarkTerminal(rows.head, rows.prepared, rows.schemaPin, terminal)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
-	afterReserved, ok := requestLedgerReservedBytes(next, 0, len(rows.continuationRaw), 0)
+	materialized.preparedBytes, materialized.schemaPinBytes = 0, 0
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
 	key := requestledger.AppendTerminalKey(nil, command.Home, command.KeyDigest)
+	preparedKey := requestledger.AppendPreparedTerminalKey(nil, command.Home, command.KeyDigest)
+	schemaKey := requestledger.AppendSchemaPinReleaseKey(nil, command.Home, command.KeyDigest)
+	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload),
+		newTransactionDelete(preparedKey), newTransactionDelete(schemaKey))
+	plan.delta.rows--
+	plan.delta.residentBytes += int64(len(key)+len(command.Payload)) -
+		int64(len(preparedKey)+len(rows.preparedRaw)+len(schemaKey)+len(rows.schemaPinRaw))
+	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func planRequestLedgerPrepareTerminal(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+) (requestLedgerCommandPlan, error) {
+	prepared, _ := command.PreparedTerminal()
+	if rows.head.Revision == command.Revision && rows.preparedFound &&
+		bytes.Equal(rows.preparedRaw, command.Payload) {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.preparedRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhaseSealed ||
+		rows.pendingFound || !rows.continuationFound || rows.payloadBuildFound ||
+		rows.preparedFound || rows.schemaPinFound || rows.head.CleanupBuildDigest != (requestledger.Digest{}) ||
+		rows.head.OutstandingRoutePinDigest != (requestledger.Digest{}) ||
+		!rows.routePinFound || rows.routePin.Phase != requestledger.RoutePinReleased {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.MarkTerminalPrepared(rows.head, rows.continuation, prepared)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	materialized.routePinBytes = 0
+	materialized.preparedBytes = len(command.Payload)
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	preparedKey := requestledger.AppendPreparedTerminalKey(nil, command.Home, command.KeyDigest)
+	routeKey := requestledger.AppendRoutePinKey(nil, command.Home, command.KeyDigest)
+	plan.rows = append(plan.rows, newTransactionPut(preparedKey, command.Payload), newTransactionDelete(routeKey))
+	plan.delta.residentBytes += int64(len(preparedKey)+len(command.Payload)) -
+		int64(len(routeKey)+len(rows.routePinRaw))
+	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func planRequestLedgerBeginSchemaPinRelease(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+) (requestLedgerCommandPlan, error) {
+	release, _ := command.SchemaPinRelease()
+	if rows.head.Revision == command.Revision && rows.schemaPinFound &&
+		bytes.Equal(rows.schemaPinRaw, command.Payload) {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.schemaPinRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhasePrepared ||
+		!rows.preparedFound || rows.schemaPinFound || rows.routePinFound {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	expected, err := requestledger.NewSchemaPinRelease(
+		rows.head, rows.prepared, command.Revision, release.Command,
+	)
+	if err != nil || expected.RecordDigest != release.RecordDigest {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.InstallSchemaPinRelease(rows.head, rows.prepared, release)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	materialized.schemaPinBytes = len(command.Payload)
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	key := requestledger.AppendSchemaPinReleaseKey(nil, command.Home, command.KeyDigest)
 	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload))
 	plan.delta.rows++
 	plan.delta.residentBytes += int64(len(key) + len(command.Payload))
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
 	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func planRequestLedgerRecordSchemaPinReleased(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+) (requestLedgerCommandPlan, error) {
+	release, _ := command.SchemaPinRelease()
+	if rows.head.Revision == command.Revision && rows.schemaPinFound &&
+		bytes.Equal(rows.schemaPinRaw, command.Payload) {
+		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.schemaPinRaw, true), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhasePrepared ||
+		!rows.preparedFound || !rows.schemaPinFound ||
+		rows.schemaPin.Phase != requestledger.SchemaPinReleasing {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	expected, err := requestledger.RecordVerifiedSchemaPinReleased(
+		rows.schemaPin, release.Revision, release.Completion,
+	)
+	if err != nil || expected.RecordDigest != release.RecordDigest {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	// Exact execution-pin release command/completion semantics are verified at
+	// this hook once the dependency-clean executionpin parser is integrated.
+	if !requestLedgerSchemaReleaseEvidenceAvailable(release) {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.MarkSchemaPinReleased(
+		rows.head, rows.prepared, rows.schemaPin, release,
+	)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := materializedRequestLedgerRows(rows)
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	materialized.schemaPinBytes = len(command.Payload)
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	key := requestledger.AppendSchemaPinReleaseKey(nil, command.Home, command.KeyDigest)
+	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload))
+	plan.delta.residentBytes += int64(len(command.Payload) - len(rows.schemaPinRaw))
+	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func requestLedgerSchemaReleaseEvidenceAvailable(requestledger.SchemaPinReleaseRecord) bool {
+	// Fail closed until internal/executionpin lands in the shared integration
+	// branch. This is deliberately one narrow hook, not a generic digest check.
+	return false
 }
 
 func planRequestLedgerAck(plan requestLedgerCommandPlan, command requestledger.CommandView, rows requestLedgerRows, snapshot pointSnapshot) (requestLedgerCommandPlan, error) {
@@ -669,7 +1086,15 @@ func planRequestLedgerGC(plan requestLedgerCommandPlan, command requestledger.Co
 		return plan, nil
 	}
 	request, ok := command.GCRequest()
-	if !ok || request.ExpectedAckDigest != rows.ack.AckDigest {
+	if !ok {
+		return witnessedRequestLedgerConflict(plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw), nil
+	}
+	if command.Revision == rows.ack.Revision && requestledger.SameAckGCTransition(rows.ack, request) {
+		return witnessedRequestLedgerApplied(
+			plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw, true,
+		), nil
+	}
+	if request.ExpectedAckDigest != rows.ack.AckDigest {
 		return witnessedRequestLedgerConflict(plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw), nil
 	}
 	if request.Action != requestledger.GCActionCollect || rows.ack.GCPhase != requestledger.AckGCCollecting ||
@@ -710,10 +1135,14 @@ func planRequestLedgerGC(plan requestLedgerCommandPlan, command requestledger.Co
 	}
 	final := !more && reclaimed == rows.ack.PriorEncodedBytes-rows.ack.ReclaimedBytes
 	next, err := requestledger.AdvanceAckGC(
-		rows.ack, command.Revision, rows.ack.GCCursor+uint64(selected), reclaimed, final,
+		rows.ack, request, command.Revision, rows.ack.GCCursor+uint64(selected), reclaimed, final,
 	)
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw), nil
+	}
+	plan, err = planRequestLedgerSequencedAckGCComplete(plan, rows, next, snapshot)
+	if err != nil {
+		return plan, err
 	}
 	nextRaw, err := requestledger.AppendAck(nil, next)
 	if err != nil {
@@ -845,10 +1274,45 @@ func readRequestLedgerRows(snapshot pointSnapshot, home requestledger.LedgerHome
 			return rows, errors.Join(err, ErrStateCorrupt)
 		}
 	}
+	rows.preparedRaw, rows.preparedFound, err = snapshot.appendRaw(nil, requestledger.AppendPreparedTerminalKey(nil, home, key))
+	if err != nil {
+		return rows, err
+	}
+	if rows.preparedFound {
+		rows.prepared, err = requestledger.OpenPreparedTerminal(rows.preparedRaw)
+		if err != nil || rows.prepared.KeyDigest != key {
+			return rows, errors.Join(err, ErrStateCorrupt)
+		}
+	}
+	rows.schemaPinRaw, rows.schemaPinFound, err = snapshot.appendRaw(nil, requestledger.AppendSchemaPinReleaseKey(nil, home, key))
+	if err != nil {
+		return rows, err
+	}
+	if rows.schemaPinFound {
+		rows.schemaPin, err = requestledger.OpenSchemaPinRelease(rows.schemaPinRaw)
+		if err != nil || rows.schemaPin.KeyDigest != key {
+			return rows, errors.Join(err, ErrStateCorrupt)
+		}
+	}
 	return rows, nil
 }
 
-func requestLedgerReservedBytes(head requestledger.HeadRecord, pendingBytes, continuationBytes int, payloadResident uint64) (uint64, bool) {
+type requestLedgerMaterialized struct {
+	pendingBytes, continuationBytes int
+	routePinBytes, preparedBytes    int
+	schemaPinBytes                  int
+	payloadResident                 uint64
+}
+
+func materializedRequestLedgerRows(rows requestLedgerRows) requestLedgerMaterialized {
+	return requestLedgerMaterialized{
+		pendingBytes: len(rows.pendingRaw), continuationBytes: len(rows.continuationRaw),
+		routePinBytes: len(rows.routePinRaw), preparedBytes: len(rows.preparedRaw),
+		schemaPinBytes: len(rows.schemaPinRaw),
+	}
+}
+
+func requestLedgerReservedBytes(head requestledger.HeadRecord, rows requestLedgerMaterialized) (uint64, bool) {
 	// Every admitted request prepays its permanent ACK tombstone. Cleanup
 	// reserve is never needed to make terminal requests acknowledgeable.
 	reserved := uint64(requestledger.FixedStorageKeyBytes + requestledger.AckRecordBytes)
@@ -868,26 +1332,18 @@ func requestLedgerReservedBytes(head requestledger.HeadRecord, pendingBytes, con
 	if head.Phase == requestledger.PhaseTerminal {
 		return reserved, true
 	}
-	for _, fixed := range [...]uint64{
-		requestledger.FixedStorageKeyBytes + requestledger.MaxRoutePinRecordBytes,
-		requestledger.FixedStorageKeyBytes + requestledger.MaxSchemaPinReleaseRecordBytes,
-		requestledger.ReadyStorageKeyBytes + requestledger.ReadyRecordBytes,
-		// PreparedTerminal owns the result before pin release; Terminal then
-		// copies it after the authenticated release certificate.
-		requestledger.FixedStorageKeyBytes + head.MaxTerminalBytes,
-	} {
-		if reserved > math.MaxUint64-fixed {
-			return 0, false
-		}
-		reserved += fixed
-	}
 	for _, pair := range []struct {
 		maximum  uint64
 		resident int
 	}{
-		{head.MaxPendingWaveBytes, pendingBytes},
-		{head.MaxContinuationBytes, continuationBytes},
+		{head.MaxPendingWaveBytes, rows.pendingBytes},
+		{head.MaxContinuationBytes, rows.continuationBytes},
+		{requestledger.MaxRoutePinRecordBytes, rows.routePinBytes},
 		{head.MaxTerminalBytes, 0},
+		{requestledger.MaxSchemaPinReleaseRecordBytes, rows.schemaPinBytes},
+		// PreparedTerminal owns the result before pin release; Terminal then
+		// copies it after the authenticated release certificate.
+		{head.MaxTerminalBytes, rows.preparedBytes},
 	} {
 		if pair.resident < 0 || uint64(pair.resident) > pair.maximum {
 			return 0, false
@@ -901,6 +1357,11 @@ func requestLedgerReservedBytes(head requestledger.HeadRecord, pendingBytes, con
 		}
 		reserved += remaining
 	}
+	ready := uint64(requestledger.ReadyStorageKeyBytes + requestledger.ReadyRecordBytes)
+	if reserved > math.MaxUint64-ready {
+		return 0, false
+	}
+	reserved += ready
 	if head.MaxActivePayloadBytes != 0 {
 		_, initial, err := requestledger.Reservation(head)
 		if err != nil {
@@ -915,10 +1376,10 @@ func requestLedgerReservedBytes(head requestledger.HeadRecord, pendingBytes, con
 			return 0, false
 		}
 		payloadMaximum := initial - base
-		if payloadResident > payloadMaximum || withoutPayload > math.MaxUint64-(payloadMaximum-payloadResident) {
+		if rows.payloadResident > payloadMaximum || withoutPayload > math.MaxUint64-(payloadMaximum-rows.payloadResident) {
 			return 0, false
 		}
-		reserved = withoutPayload + payloadMaximum - payloadResident
+		reserved = withoutPayload + payloadMaximum - rows.payloadResident
 	}
 	return reserved, true
 }
