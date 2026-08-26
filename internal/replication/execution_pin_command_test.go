@@ -22,8 +22,9 @@ func testExecutionPinNested(t testing.TB) []byte {
 	binding := executionpin.Binding{
 		RequestKeyDigest: digest(1), RequestDigest: digest(2),
 		CatalogGeneration: 3, SchemaGeneration: 4,
-		SchemaManifestDigest: digest(5), SchemaCertificateDigest: digest(6),
-		LogicalGroup: id(7), LogicalRange: id(8), MutationDigest: digest(9),
+		SchemaManifestDigest: digest(5), TransactionManifestDigest: digest(6),
+		ParticipantAuthorityRoot: digest(7), ParticipantCount: 8,
+		ExecutionContractDigest: digest(9), LedgerHomeGroup: id(10),
 	}
 	pin, err := executionpin.DerivePinID(binding)
 	if err != nil {

@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 )
 
-const RecordBytes = 576
+const RecordBytes = 600
 
 var (
 	recordMagic          = [8]byte{'V', 'E', 'L', 'R', 'E', 'C', 0, 0}
@@ -115,57 +115,57 @@ func AppendRecord(dst []byte, record Record) ([]byte, error) {
 	if len(encodedBinding) != bindingBytes {
 		panic("executionpin: impossible binding geometry")
 	}
-	copy(frame[256:288], record.AcquireAuthorityDigest[:])
-	copy(frame[288:320], record.CurrentAuthorityDigest[:])
-	binary.LittleEndian.PutUint64(frame[320:328], record.AcquireApplied)
-	copy(frame[328:344], record.AcquireController[:])
-	binary.LittleEndian.PutUint64(frame[344:352], record.AcquireControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[352:360], record.AcquireLeaseAppliedThrough)
-	copy(frame[360:376], record.Controller[:])
-	binary.LittleEndian.PutUint64(frame[376:384], record.ControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[384:392], record.LeaseAppliedThrough)
-	binary.LittleEndian.PutUint64(frame[392:400], record.LeaseRevision)
-	binary.LittleEndian.PutUint64(frame[400:408], record.LeaseApplied)
-	binary.LittleEndian.PutUint64(frame[408:416], record.TerminalApplied)
-	copy(frame[416:448], record.PrepareTerminalDigest[:])
-	copy(frame[456:488], record.LastCommandDigest[:])
-	binary.LittleEndian.PutUint64(frame[488:496], record.LastApplied)
-	copy(frame[496:528], record.TerminalAuthorityDigest[:])
+	copy(frame[280:312], record.AcquireAuthorityDigest[:])
+	copy(frame[312:344], record.CurrentAuthorityDigest[:])
+	binary.LittleEndian.PutUint64(frame[344:352], record.AcquireApplied)
+	copy(frame[352:368], record.AcquireController[:])
+	binary.LittleEndian.PutUint64(frame[368:376], record.AcquireControllerEpoch)
+	binary.LittleEndian.PutUint64(frame[376:384], record.AcquireLeaseAppliedThrough)
+	copy(frame[384:400], record.Controller[:])
+	binary.LittleEndian.PutUint64(frame[400:408], record.ControllerEpoch)
+	binary.LittleEndian.PutUint64(frame[408:416], record.LeaseAppliedThrough)
+	binary.LittleEndian.PutUint64(frame[416:424], record.LeaseRevision)
+	binary.LittleEndian.PutUint64(frame[424:432], record.LeaseApplied)
+	binary.LittleEndian.PutUint64(frame[432:440], record.TerminalApplied)
+	copy(frame[440:472], record.PrepareTerminalDigest[:])
+	copy(frame[480:512], record.LastCommandDigest[:])
+	binary.LittleEndian.PutUint64(frame[512:520], record.LastApplied)
+	copy(frame[520:552], record.TerminalAuthorityDigest[:])
 	sealSHA(frame, recordChecksumDomain)
 	return dst, nil
 }
 
 func OpenRecord(raw []byte) (Record, error) {
 	if len(raw) != RecordBytes || !bytes.Equal(raw[0:8], recordMagic[:]) ||
-		!allZero(raw[10:16]) || !allZero(raw[528:544]) ||
+		!allZero(raw[10:16]) || !allZero(raw[552:568]) ||
 		!verifySHA(raw, recordChecksumDomain) {
 		return Record{}, ErrCorrupt
 	}
-	binding, ok := openBinding(raw[48:256])
+	binding, ok := openBinding(raw[48:280])
 	if !ok {
 		return Record{}, ErrCorrupt
 	}
 	record := Record{Status: Status(raw[8]), LastOperation: Operation(raw[9]), Binding: binding}
 	copy(record.PinID[:], raw[16:48])
-	copy(record.AcquireAuthorityDigest[:], raw[256:288])
-	copy(record.CurrentAuthorityDigest[:], raw[288:320])
-	record.AcquireApplied = binary.LittleEndian.Uint64(raw[320:328])
-	copy(record.AcquireController[:], raw[328:344])
-	record.AcquireControllerEpoch = binary.LittleEndian.Uint64(raw[344:352])
-	record.AcquireLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[352:360])
-	copy(record.Controller[:], raw[360:376])
-	record.ControllerEpoch = binary.LittleEndian.Uint64(raw[376:384])
-	record.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[384:392])
-	record.LeaseRevision = binary.LittleEndian.Uint64(raw[392:400])
-	record.LeaseApplied = binary.LittleEndian.Uint64(raw[400:408])
-	record.TerminalApplied = binary.LittleEndian.Uint64(raw[408:416])
-	copy(record.PrepareTerminalDigest[:], raw[416:448])
-	if !allZero(raw[448:456]) {
+	copy(record.AcquireAuthorityDigest[:], raw[280:312])
+	copy(record.CurrentAuthorityDigest[:], raw[312:344])
+	record.AcquireApplied = binary.LittleEndian.Uint64(raw[344:352])
+	copy(record.AcquireController[:], raw[352:368])
+	record.AcquireControllerEpoch = binary.LittleEndian.Uint64(raw[368:376])
+	record.AcquireLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[376:384])
+	copy(record.Controller[:], raw[384:400])
+	record.ControllerEpoch = binary.LittleEndian.Uint64(raw[400:408])
+	record.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[408:416])
+	record.LeaseRevision = binary.LittleEndian.Uint64(raw[416:424])
+	record.LeaseApplied = binary.LittleEndian.Uint64(raw[424:432])
+	record.TerminalApplied = binary.LittleEndian.Uint64(raw[432:440])
+	copy(record.PrepareTerminalDigest[:], raw[440:472])
+	if !allZero(raw[472:480]) {
 		return Record{}, ErrCorrupt
 	}
-	copy(record.LastCommandDigest[:], raw[456:488])
-	record.LastApplied = binary.LittleEndian.Uint64(raw[488:496])
-	copy(record.TerminalAuthorityDigest[:], raw[496:528])
+	copy(record.LastCommandDigest[:], raw[480:512])
+	record.LastApplied = binary.LittleEndian.Uint64(raw[512:520])
+	copy(record.TerminalAuthorityDigest[:], raw[520:552])
 	if !record.Valid() {
 		return Record{}, ErrCorrupt
 	}

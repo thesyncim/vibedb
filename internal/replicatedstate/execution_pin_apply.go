@@ -15,7 +15,7 @@ const (
 	executionPinRecordPrefix          = systemkey.ExecutionPinFirst
 	executionPinActivePrefix          = systemkey.ExecutionPinFirst + 1
 	executionPinRecordStorageKeyBytes = 1 + sha256.Size
-	executionPinActiveStorageKeyBytes = 1 + 16 + 16 + sha256.Size
+	executionPinActiveStorageKeyBytes = 1 + 16 + sha256.Size
 	executionPinActiveValueBytes      = sha256.Size
 )
 
@@ -37,9 +37,8 @@ func executionPinRecordStorageKey(pin executionpin.PinID) [executionPinRecordSto
 func executionPinActiveStorageKey(record executionpin.Record) [executionPinActiveStorageKeyBytes]byte {
 	var key [executionPinActiveStorageKeyBytes]byte
 	key[0] = executionPinActivePrefix
-	copy(key[1:17], record.Binding.LogicalGroup[:])
-	copy(key[17:33], record.Binding.LogicalRange[:])
-	copy(key[33:], record.PinID[:])
+	copy(key[1:17], record.Binding.LedgerHomeGroup[:])
+	copy(key[17:], record.PinID[:])
 	return key
 }
 

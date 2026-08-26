@@ -35,11 +35,12 @@ func requestLedgerPreparedForExecutionPin(t testing.TB) (
 		RequestKeyDigest:  executionpin.Digest(keyDigest),
 		RequestDigest:     executionpin.Digest(requestDigest),
 		CatalogGeneration: 7, SchemaGeneration: 10,
-		SchemaManifestDigest:    executionpin.Digest(requestLedgerStateTestDigest("schema manifest")),
-		SchemaCertificateDigest: executionpin.Digest(routeCertificate),
-		LogicalGroup:            executionpin.ID{0x41},
-		LogicalRange:            executionpin.ID{0x42},
-		MutationDigest:          executionpin.Digest(requestLedgerStateTestDigest("mutation bundle")),
+		SchemaManifestDigest:      executionpin.Digest(routeCertificate),
+		TransactionManifestDigest: executionpin.Digest(requestLedgerStateTestDigest("transaction manifest")),
+		ParticipantAuthorityRoot:  executionpin.Digest(requestLedgerStateTestDigest("participant authority")),
+		ParticipantCount:          2,
+		ExecutionContractDigest:   executionpin.Digest(requestLedgerStateTestDigest("execution contract")),
+		LedgerHomeGroup:           executionpin.ID{0x41},
 	}
 	pinDigest, err := executionpin.BindingDigest(binding)
 	if err != nil {

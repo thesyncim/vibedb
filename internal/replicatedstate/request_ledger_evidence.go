@@ -190,7 +190,7 @@ func requestLedgerSchemaReleaseCommandMatches(
 		command.Binding.RequestKeyDigest == executionpin.Digest(record.KeyDigest) &&
 		command.Binding.RequestDigest == executionpin.Digest(record.RequestDigest) &&
 		command.Binding.CatalogGeneration == record.CatalogGeneration &&
-		command.Binding.SchemaCertificateDigest == executionpin.Digest(record.RouteSchemaCertificateDigest) &&
+		command.Binding.SchemaManifestDigest == executionpin.Digest(record.RouteSchemaCertificateDigest) &&
 		bindingDigest == executionpin.Digest(record.PinDigest) &&
 		command.PrepareTerminalDigest == executionpin.Digest(record.PreparedTerminalDigest)
 }

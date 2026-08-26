@@ -155,14 +155,22 @@ func terminalAuthorityRelease(
 		SchemaManifestDigest: executionpin.Digest(
 			execution.Recipe.Contract.SchemaManifestDigest,
 		),
-		SchemaCertificateDigest: executionpin.Digest(
-			execution.Recipe.Contract.RouteSchemaCertificateDigest,
-		),
-		LogicalGroup:   executionpin.ID(logical.Group.GroupID),
-		LogicalRange:   executionpin.ID(logical.Group.ShardIncarnation),
-		MutationDigest: executionpin.Digest(logical.MutationDigest),
+		TransactionManifestDigest: executionpin.Digest(logical.MutationDigest),
+		ParticipantAuthorityRoot:  executionpin.Digest(logical.MutationDigest),
+		ParticipantCount:          1,
+		ExecutionContractDigest:   executionpin.Digest(execution.Recipe.Contract.PinDigest),
+		LedgerHomeGroup:           executionpin.ID(logical.Group.GroupID),
 	}
 	pin, err := executionpin.DerivePinID(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquire := executionpin.AcquireCertificate{
+		PinID: pin, Binding: binding, AuthorityDigest: executionpin.Digest{4},
+		Applied: 1, Controller: executionpin.ID{2}, ControllerEpoch: 1,
+		LeaseAppliedThrough: 2,
+	}
+	acquireDigest, err := executionpin.AcquireCertificateDigest(acquire)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,8 +179,35 @@ func terminalAuthorityRelease(
 		AuthorityNode: executionpin.ID{1}, AuthorityGeneration: 1,
 		ExpectedController: executionpin.ID{2}, ExpectedControllerEpoch: 1,
 		ExpectedLeaseAppliedThrough: 2, ExpectedLeaseRevision: 1,
-		AcquireCertificateDigest: executionpin.Digest{3},
+		AcquireCertificateDigest: acquireDigest,
 	}
+}
+
+func bindTypedExecutionPin(
+	t testing.TB,
+	execution DurableRequestTypedExecutionContext,
+	route ReplicatedRoute,
+) (DurableRequestTypedExecutionContext, executionpin.Command) {
+	t.Helper()
+	release := terminalAuthorityRelease(t, execution)
+	acquire := executionpin.AcquireCertificate{
+		PinID: release.PinID, Binding: release.Binding, AuthorityDigest: executionpin.Digest{4},
+		Applied: 1, Controller: release.ExpectedController,
+		ControllerEpoch:     release.ExpectedControllerEpoch,
+		LeaseAppliedThrough: release.ExpectedLeaseAppliedThrough,
+	}
+	lease := executionpin.LeaseCertificate{
+		PinID: release.PinID, AcquireCertificateDigest: release.AcquireCertificateDigest,
+		AuthorityDigest: executionpin.Digest{4}, Controller: release.ExpectedController,
+		ControllerEpoch:     release.ExpectedControllerEpoch,
+		LeaseAppliedThrough: release.ExpectedLeaseAppliedThrough,
+		Revision:            release.ExpectedLeaseRevision, Applied: 1,
+	}
+	bound, err := BindDurableRequestExecutionPin(execution, route, acquire, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bound, release
 }
 
 func TestDurableRequestTypedExecutionContextRejectsIdentityDrift(t *testing.T) {

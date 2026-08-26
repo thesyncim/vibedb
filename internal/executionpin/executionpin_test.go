@@ -26,8 +26,9 @@ func testBinding() Binding {
 	return Binding{
 		RequestKeyDigest: testDigest(1), RequestDigest: testDigest(2),
 		CatalogGeneration: 3, SchemaGeneration: 4,
-		SchemaManifestDigest: testDigest(5), SchemaCertificateDigest: testDigest(6),
-		LogicalGroup: testID(7), LogicalRange: testID(8), MutationDigest: testDigest(9),
+		SchemaManifestDigest: testDigest(5), TransactionManifestDigest: testDigest(6),
+		ParticipantAuthorityRoot: testDigest(7), ParticipantCount: 8,
+		ExecutionContractDigest: testDigest(9), LedgerHomeGroup: testID(10),
 	}
 }
 
@@ -96,10 +97,11 @@ func TestPinIDBindsEveryLogicalFieldButNotControllerLease(t *testing.T) {
 		func(value *Binding) { value.CatalogGeneration++ },
 		func(value *Binding) { value.SchemaGeneration++ },
 		func(value *Binding) { value.SchemaManifestDigest[0]++ },
-		func(value *Binding) { value.SchemaCertificateDigest[0]++ },
-		func(value *Binding) { value.LogicalGroup[0]++ },
-		func(value *Binding) { value.LogicalRange[0]++ },
-		func(value *Binding) { value.MutationDigest[0]++ },
+		func(value *Binding) { value.TransactionManifestDigest[0]++ },
+		func(value *Binding) { value.ParticipantAuthorityRoot[0]++ },
+		func(value *Binding) { value.ParticipantCount++ },
+		func(value *Binding) { value.ExecutionContractDigest[0]++ },
+		func(value *Binding) { value.LedgerHomeGroup[0]++ },
 	}
 	for index, mutate := range mutations {
 		changed := binding

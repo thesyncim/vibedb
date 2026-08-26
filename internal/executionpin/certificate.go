@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	AcquireCertificateBytes  = 352
+	AcquireCertificateBytes  = 376
 	LeaseCertificateBytes    = 184
 	TerminalCertificateBytes = 288
 )
@@ -110,11 +110,11 @@ func AppendAcquireCertificate(dst []byte, certificate AcquireCertificate) ([]byt
 	if len(encodedBinding) != bindingBytes {
 		panic("executionpin: impossible acquire binding geometry")
 	}
-	copy(frame[248:280], certificate.AuthorityDigest[:])
-	binary.LittleEndian.PutUint64(frame[280:288], certificate.Applied)
-	copy(frame[288:304], certificate.Controller[:])
-	binary.LittleEndian.PutUint64(frame[304:312], certificate.ControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[312:320], certificate.LeaseAppliedThrough)
+	copy(frame[272:304], certificate.AuthorityDigest[:])
+	binary.LittleEndian.PutUint64(frame[304:312], certificate.Applied)
+	copy(frame[312:328], certificate.Controller[:])
+	binary.LittleEndian.PutUint64(frame[328:336], certificate.ControllerEpoch)
+	binary.LittleEndian.PutUint64(frame[336:344], certificate.LeaseAppliedThrough)
 	sealSHA(frame, acquireCertificateDomain)
 	return dst, nil
 }
@@ -124,17 +124,17 @@ func OpenAcquireCertificate(raw []byte) (AcquireCertificate, error) {
 		!verifySHA(raw, acquireCertificateDomain) {
 		return AcquireCertificate{}, ErrCorrupt
 	}
-	binding, ok := openBinding(raw[40:248])
+	binding, ok := openBinding(raw[40:272])
 	if !ok {
 		return AcquireCertificate{}, ErrCorrupt
 	}
 	certificate := AcquireCertificate{Binding: binding}
 	copy(certificate.PinID[:], raw[8:40])
-	copy(certificate.AuthorityDigest[:], raw[248:280])
-	certificate.Applied = binary.LittleEndian.Uint64(raw[280:288])
-	copy(certificate.Controller[:], raw[288:304])
-	certificate.ControllerEpoch = binary.LittleEndian.Uint64(raw[304:312])
-	certificate.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[312:320])
+	copy(certificate.AuthorityDigest[:], raw[272:304])
+	certificate.Applied = binary.LittleEndian.Uint64(raw[304:312])
+	copy(certificate.Controller[:], raw[312:328])
+	certificate.ControllerEpoch = binary.LittleEndian.Uint64(raw[328:336])
+	certificate.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[336:344])
 	if !certificate.Valid() {
 		return AcquireCertificate{}, ErrCorrupt
 	}

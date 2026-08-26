@@ -22,8 +22,9 @@ func executionPinTestBinding() executionpin.Binding {
 	return executionpin.Binding{
 		RequestKeyDigest: digest(1), RequestDigest: digest(2),
 		CatalogGeneration: 3, SchemaGeneration: 4,
-		SchemaManifestDigest: digest(5), SchemaCertificateDigest: digest(6),
-		LogicalGroup: id(7), LogicalRange: id(8), MutationDigest: digest(9),
+		SchemaManifestDigest: digest(5), TransactionManifestDigest: digest(6),
+		ParticipantAuthorityRoot: digest(7), ParticipantCount: 8,
+		ExecutionContractDigest: digest(9), LedgerHomeGroup: id(10),
 	}
 }
 
@@ -133,7 +134,7 @@ func TestExecutionPinAcquirePrepareTerminalReleaseRetryAndReopen(t *testing.T) {
 		t.Fatalf("active scope index = found %v err %v", found, readErr)
 	}
 	active, err := fixture.machine.ScanActiveExecutionPins(
-		binding.LogicalGroup, binding.LogicalRange, executionpin.PinID{}, 1,
+		binding.LedgerHomeGroup, executionpin.PinID{}, 1,
 	)
 	if err != nil || len(active) != 1 || active[0].PinID != pin {
 		t.Fatalf("active recovery scan = %+v, %v", active, err)
@@ -163,7 +164,7 @@ func TestExecutionPinAcquirePrepareTerminalReleaseRetryAndReopen(t *testing.T) {
 		t.Fatalf("terminal active scope index = found %v err %v", found, readErr)
 	}
 	active, err = fixture.machine.ScanActiveExecutionPins(
-		binding.LogicalGroup, binding.LogicalRange, executionpin.PinID{}, 1,
+		binding.LedgerHomeGroup, executionpin.PinID{}, 1,
 	)
 	if err != nil || len(active) != 0 {
 		t.Fatalf("terminal recovery scan = %+v, %v", active, err)

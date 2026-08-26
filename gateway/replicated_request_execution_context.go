@@ -16,10 +16,41 @@ import (
 // Home nor RequestKey and therefore cannot safely drive typed lifecycle CASes.
 // New in-process orchestration uses this context directly.
 type DurableRequestTypedExecutionContext struct {
-	Home         DurableRequestLedgerHome
-	Key          DurableRequestLedgerKey
-	Recipe       DurableRequestRecipe
-	Participants DurableRequestReplayableParticipantStream
+	Home              DurableRequestLedgerHome
+	Key               DurableRequestLedgerKey
+	Recipe            DurableRequestRecipe
+	Participants      DurableRequestReplayableParticipantStream
+	ExecutionPinRoute ReplicatedRoute
+	ExecutionPinLease executionpin.LeaseCertificate
+}
+
+// BindDurableRequestExecutionPin installs the exact acquired certificate pair
+// and its catalog-group route. The binding digest is checked against the
+// sealed recipe once; waves then carry the immutable lease certificate.
+func BindDurableRequestExecutionPin(
+	execution DurableRequestTypedExecutionContext,
+	route ReplicatedRoute,
+	acquire executionpin.AcquireCertificate,
+	lease executionpin.LeaseCertificate,
+) (DurableRequestTypedExecutionContext, error) {
+	if !validReplicatedRoute(route) || !acquire.Valid() || !lease.Valid() ||
+		acquire.PinID != lease.PinID {
+		return DurableRequestTypedExecutionContext{}, ErrDurableRequestConflict
+	}
+	acquireDigest, err := executionpin.AcquireCertificateDigest(acquire)
+	bindingDigest, bindingErr := executionpin.BindingDigest(acquire.Binding)
+	if err != nil || bindingErr != nil || acquireDigest != lease.AcquireCertificateDigest ||
+		replication.Digest(bindingDigest) != execution.Recipe.Contract.PinDigest ||
+		acquire.Binding.RequestKeyDigest != executionpin.Digest(execution.Recipe.KeyDigest) ||
+		acquire.Binding.RequestDigest != executionpin.Digest(execution.Recipe.RequestDigest) ||
+		acquire.Binding.CatalogGeneration != execution.Recipe.CatalogGeneration ||
+		acquire.Binding.SchemaManifestDigest !=
+			executionpin.Digest(execution.Recipe.Contract.SchemaManifestDigest) {
+		return DurableRequestTypedExecutionContext{}, errors.Join(err, bindingErr, ErrDurableRequestConflict)
+	}
+	execution.ExecutionPinRoute = route
+	execution.ExecutionPinLease = lease
+	return execution, nil
 }
 
 // DurableRequestTypedRunner is the production runner boundary for the typed
@@ -65,8 +96,7 @@ func NewDurableRequestTerminalAuthority(
 		release.Binding.RequestKeyDigest != executionpin.Digest(execution.Recipe.KeyDigest) ||
 		release.Binding.RequestDigest != executionpin.Digest(execution.Recipe.RequestDigest) ||
 		release.Binding.CatalogGeneration != execution.Recipe.CatalogGeneration ||
-		release.Binding.SchemaManifestDigest != executionpin.Digest(contract.SchemaManifestDigest) ||
-		release.Binding.SchemaCertificateDigest != executionpin.Digest(contract.RouteSchemaCertificateDigest) {
+		release.Binding.SchemaManifestDigest != executionpin.Digest(contract.SchemaManifestDigest) {
 		return DurableRequestTerminalAuthority{}, ErrDurableRequestConflict
 	}
 	bindingDigest, err := executionpin.BindingDigest(release.Binding)

@@ -99,16 +99,29 @@ func (ledger *terminalCoordinatorLedger) ReadRow(
 }
 
 type terminalCoordinatorPin struct {
-	t         testing.TB
-	route     ReplicatedRoute
-	tenant    []byte
-	retryHome replication.RetryHome
-	clientID  replication.ID128
-	epoch     uint64
-	sequence  uint64
-	record    executionpin.Record
-	fault     bool
-	attempts  [][]byte
+	t            testing.TB
+	route        ReplicatedRoute
+	tenant       []byte
+	retryHome    replication.RetryHome
+	clientID     replication.ID128
+	epoch        uint64
+	sequence     uint64
+	record       executionpin.Record
+	fault        bool
+	attempts     [][]byte
+	fenceCalls   int
+	fenceFaultAt int
+}
+
+func (pin *terminalCoordinatorPin) ValidateFence(
+	_ context.Context,
+	lease executionpin.LeaseCertificate,
+) error {
+	pin.fenceCalls++
+	if pin.fenceFaultAt == pin.fenceCalls {
+		return ErrDurableRequestConflict
+	}
+	return executionpin.ValidateSideEffectFence(lease, pin.record, pin.record.LastApplied)
 }
 
 func (pin *terminalCoordinatorPin) BuildRelease(
@@ -225,10 +238,11 @@ func terminalCoordinatorFixture(t testing.TB) (
 		RequestKeyDigest:  executionpin.Digest(keyDigest),
 		RequestDigest:     executionpin.Digest(lifecycleDigest("terminal-request")),
 		CatalogGeneration: 7, SchemaGeneration: route.Command.SchemaGeneration,
-		SchemaManifestDigest:    executionpin.Digest(route.Command.RelationManifestDigest),
-		SchemaCertificateDigest: executionpin.Digest(lifecycleDigest("schema-certificate")),
-		LogicalGroup:            executionpin.ID(route.Group.GroupID),
-		LogicalRange:            executionpin.ID{8}, MutationDigest: executionpin.Digest{9},
+		SchemaManifestDigest:      executionpin.Digest(lifecycleDigest("schema-certificate")),
+		TransactionManifestDigest: executionpin.Digest{6},
+		ParticipantAuthorityRoot:  executionpin.Digest{7}, ParticipantCount: 1,
+		ExecutionContractDigest: executionpin.Digest{9},
+		LedgerHomeGroup:         executionpin.ID(route.Group.GroupID),
 	}
 	executionPinID, err := executionpin.DerivePinID(binding)
 	if err != nil {
@@ -276,7 +290,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 	contract := requestledger.ExecutionContract{
 		CatalogGeneration: 7, PinID: requestledger.PinID{1},
 		PinDigest:                    requestledger.Digest(bindingDigest),
-		RouteSchemaCertificateDigest: requestledger.Digest(binding.SchemaCertificateDigest),
+		RouteSchemaCertificateDigest: requestledger.Digest(binding.SchemaManifestDigest),
 		MaxPendingWaveBytes:          requestledger.MaxPendingWaveRecordBytes,
 		MaxContinuationBytes:         requestledger.MaxContinuationRecordBytes,
 		MaxTerminalBytes:             requestledger.MaxLifecyclePayloadBytes,
@@ -356,6 +370,10 @@ func terminalCoordinatorFixture(t testing.TB) (
 		t: t, route: route, tenant: wave.Tenant, retryHome: wave.Identity.RetryHome,
 		clientID: replication.ID128{3}, epoch: 2, sequence: 2, record: acquired.Record,
 	}
+	lease, ok := acquired.Record.LeaseCertificate()
+	if !ok {
+		t.Fatal("missing acquired lease certificate")
+	}
 	return DurableRequestTerminalPlan{
 		Home: DurableRequestLedgerHome{
 			Identity: replication.Digest(lifecycleDigest("terminal-home")), Point: homePoint,
@@ -363,6 +381,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 		Key: key, Outcome: requestledger.OutcomeCommitted,
 		AffectedRows: 12, AffectedRowsValid: true, Result: []byte("committed-result"),
 		RetirementWitness: head.TerminalSummaryDigest, AckToken: ack, Release: release,
+		Lease: lease,
 	}, head, continuation, pin
 }
 
@@ -410,6 +429,22 @@ func TestDurableRequestTerminalCoordinatorResumesEveryBoundary(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDurableRequestTerminalCoordinatorFencesPreparedAndReleaseSideEffects(t *testing.T) {
+	plan, head, continuation, pin := terminalCoordinatorFixture(t)
+	pin.fenceFaultAt = 1
+	ledger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	coordinator, err := newDurableRequestTerminalCoordinator(ledger, pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = coordinator.Complete(t.Context(), plan); !errors.Is(err, ErrDurableRequestConflict) {
+		t.Fatalf("changed/released pin at terminal admission = %v", err)
+	}
+	if pin.fenceCalls != 1 || len(pin.attempts) != 0 {
+		t.Fatalf("fences=%d release proposals=%d, want 1/0", pin.fenceCalls, len(pin.attempts))
 	}
 }
 

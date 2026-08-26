@@ -30,24 +30,25 @@ type PinID [32]byte
 // Binding is the immutable logical program authority. It intentionally omits
 // physical placement: short-lived route gates bind those attempts separately.
 type Binding struct {
-	RequestKeyDigest        Digest
-	RequestDigest           Digest
-	CatalogGeneration       uint64
-	SchemaGeneration        uint64
-	SchemaManifestDigest    Digest
-	SchemaCertificateDigest Digest
-	LogicalGroup            ID
-	LogicalRange            ID
-	MutationDigest          Digest
+	RequestKeyDigest          Digest
+	RequestDigest             Digest
+	CatalogGeneration         uint64
+	SchemaGeneration          uint64
+	SchemaManifestDigest      Digest
+	TransactionManifestDigest Digest
+	ParticipantAuthorityRoot  Digest
+	ParticipantCount          uint64
+	ExecutionContractDigest   Digest
+	LedgerHomeGroup           ID
 }
 
 func (binding Binding) Valid() bool {
 	return binding.RequestKeyDigest != (Digest{}) && binding.RequestDigest != (Digest{}) &&
 		binding.CatalogGeneration != 0 && binding.SchemaGeneration != 0 &&
 		binding.SchemaManifestDigest != (Digest{}) &&
-		binding.SchemaCertificateDigest != (Digest{}) &&
-		binding.LogicalGroup != (ID{}) && binding.LogicalRange != (ID{}) &&
-		binding.MutationDigest != (Digest{})
+		binding.TransactionManifestDigest != (Digest{}) &&
+		binding.ParticipantAuthorityRoot != (Digest{}) && binding.ParticipantCount != 0 &&
+		binding.ExecutionContractDigest != (Digest{}) && binding.LedgerHomeGroup != (ID{})
 }
 
 // DerivePinID returns the sole deterministic PinID grammar. Controller and
@@ -75,7 +76,7 @@ func BindingDigest(binding Binding) (Digest, error) {
 	return Digest(sha256.Sum256(material[:])), nil
 }
 
-const bindingBytes = 208
+const bindingBytes = 232
 
 func appendBinding(dst []byte, binding Binding) []byte {
 	dst = append(dst, binding.RequestKeyDigest[:]...)
@@ -83,10 +84,11 @@ func appendBinding(dst []byte, binding Binding) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, binding.CatalogGeneration)
 	dst = binary.LittleEndian.AppendUint64(dst, binding.SchemaGeneration)
 	dst = append(dst, binding.SchemaManifestDigest[:]...)
-	dst = append(dst, binding.SchemaCertificateDigest[:]...)
-	dst = append(dst, binding.LogicalGroup[:]...)
-	dst = append(dst, binding.LogicalRange[:]...)
-	return append(dst, binding.MutationDigest[:]...)
+	dst = append(dst, binding.TransactionManifestDigest[:]...)
+	dst = append(dst, binding.ParticipantAuthorityRoot[:]...)
+	dst = binary.LittleEndian.AppendUint64(dst, binding.ParticipantCount)
+	dst = append(dst, binding.ExecutionContractDigest[:]...)
+	return append(dst, binding.LedgerHomeGroup[:]...)
 }
 
 func openBinding(raw []byte) (Binding, bool) {
@@ -99,10 +101,11 @@ func openBinding(raw []byte) (Binding, bool) {
 	binding.CatalogGeneration = binary.LittleEndian.Uint64(raw[64:72])
 	binding.SchemaGeneration = binary.LittleEndian.Uint64(raw[72:80])
 	copy(binding.SchemaManifestDigest[:], raw[80:112])
-	copy(binding.SchemaCertificateDigest[:], raw[112:144])
-	copy(binding.LogicalGroup[:], raw[144:160])
-	copy(binding.LogicalRange[:], raw[160:176])
-	copy(binding.MutationDigest[:], raw[176:208])
+	copy(binding.TransactionManifestDigest[:], raw[112:144])
+	copy(binding.ParticipantAuthorityRoot[:], raw[144:176])
+	binding.ParticipantCount = binary.LittleEndian.Uint64(raw[176:184])
+	copy(binding.ExecutionContractDigest[:], raw[184:216])
+	copy(binding.LedgerHomeGroup[:], raw[216:232])
 	return binding, binding.Valid()
 }
 
