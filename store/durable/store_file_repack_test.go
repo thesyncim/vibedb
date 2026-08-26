@@ -2,9 +2,11 @@ package durable
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/store"
@@ -167,6 +169,137 @@ func TestFilePrimaryRepackRoundTrip(t *testing.T) {
 			"repack did not restore locality: adjacency %.2fx, want <= 1.01x",
 			repackedAdjacency,
 		)
+	}
+}
+
+func TestFilePrimaryRepackPreservesSchemaIndexesAndOverflow(t *testing.T) {
+	dir := t.TempDir()
+	options := testFileCatalogOptions(t)
+	options.Durability = DurabilityBufferedVisible
+	options.InlineValueBytes = 256
+	options.MaxDocumentBytes = 16 << 10
+	sourcePath := filepath.Join(dir, "advanced-source.vibe")
+	sourceFile, err := os.OpenFile(
+		sourcePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := Create(sourceFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]byte{
+		"a": []byte(`{"id":1}`),
+		"b": fmt.Appendf(nil, `{"id":2,"pad":%q}`, strings.Repeat("x", 6<<10)),
+		"c": []byte(`{"id":3}`),
+	}
+	for key, value := range want {
+		if _, err := source.Put([]byte(key), value); err != nil {
+			t.Fatalf("source Put(%q): %v", key, err)
+		}
+	}
+	if err := source.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sourceFile, err = os.OpenFile(sourcePath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceFile.Close()
+	outPath := filepath.Join(dir, "advanced-repacked.vibe")
+	outFile, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+	report, err := Repack(sourceFile, outFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Documents != len(want) {
+		t.Fatalf("repacked documents = %d, want %d", report.Documents, len(want))
+	}
+	reopened, err := Open(outFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if stats, state := reopened.Stats(), reopened.state.Load(); stats.DocumentCount != uint64(len(want)) || state == nil ||
+		state.root.IndexCount != 1 {
+		t.Fatalf("repacked advanced stats/state = %+v/%+v", stats, state)
+	}
+	for key, value := range want {
+		got, found, readErr := reopened.AppendRaw(nil, []byte(key))
+		if readErr != nil || !found || !bytes.Equal(got, value) {
+			t.Fatalf("repacked %q = %q,%v,%v, want %q", key, got, found, readErr, value)
+		}
+	}
+}
+
+func TestFilePrimaryRepackPreservesOpaqueOverflow(t *testing.T) {
+	dir := t.TempDir()
+	options := testFileStoreOptions()
+	options.Durability = DurabilityBufferedVisible
+	options.OpaqueValues = true
+	options.InlineValueBytes = 128
+	options.MaxDocumentBytes = 8 << 10
+	options.Indexes = nil
+	options.Collection = store.Options{}
+	sourcePath := filepath.Join(dir, "opaque-source.vibe")
+	sourceFile, err := os.OpenFile(
+		sourcePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := Create(sourceFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte{0x00, 0xff, 0x81, 0x7f}, 1024)
+	if _, err := source.Put([]byte("binary"), want); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sourceFile, err = os.OpenFile(sourcePath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceFile.Close()
+	outFile, err := os.OpenFile(
+		filepath.Join(dir, "opaque-repacked.vibe"),
+		os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+	if _, err := Repack(sourceFile, outFile, options); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(outFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, found, err := reopened.AppendRaw(nil, []byte("binary"))
+	if err != nil || !found || !bytes.Equal(got, want) {
+		t.Fatalf("opaque repack = %x,%v,%v", got, found, err)
 	}
 }
 

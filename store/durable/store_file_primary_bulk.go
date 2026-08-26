@@ -27,6 +27,14 @@ type PrimaryBulkRecord struct {
 	Value []byte
 }
 
+// PrimaryBulkBytesRecord is the byte-native form of PrimaryBulkRecord. Both
+// fields are borrowed for CreateFromByteRecords; no string conversion or key
+// copy is required while the immutable graph is planned and staged.
+type PrimaryBulkBytesRecord struct {
+	Key   []byte
+	Value []byte
+}
+
 // CreateFromRecords writes borrowed rows directly into the ordered durable
 // primary graph. It is the native bulk-load entry point for callers that
 // already own a complete batch. Inputs may be reused after the call returns.
@@ -34,6 +42,37 @@ func CreateFromRecords(
 	input []PrimaryBulkRecord,
 	file *os.File,
 	options Options,
+) (fileEnd int64, err error) {
+	return createFromBorrowedRecords(
+		len(input), input, file, options,
+		func(at int) (string, []byte) {
+			return input[at].Key, input[at].Value
+		},
+	)
+}
+
+// CreateFromByteRecords is CreateFromRecords without a string-shaped key
+// boundary. Input bytes remain borrowed through the call and may be reused as
+// soon as it returns.
+func CreateFromByteRecords(
+	input []PrimaryBulkBytesRecord,
+	file *os.File,
+	options Options,
+) (fileEnd int64, err error) {
+	return createFromBorrowedRecords(
+		len(input), input, file, options,
+		func(at int) (string, []byte) {
+			return byteview.String(input[at].Key), input[at].Value
+		},
+	)
+}
+
+func createFromBorrowedRecords(
+	count int,
+	source any,
+	file *os.File,
+	options Options,
+	recordAt func(int) (string, []byte),
 ) (fileEnd int64, err error) {
 	if file == nil {
 		return 0, fmt.Errorf("vibedb: CreateFromRecords requires a non-nil file")
@@ -82,35 +121,34 @@ func CreateFromRecords(
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
-	if len(input) == 0 {
+	if count == 0 {
 		return 0, fmt.Errorf(
 			"%w: CreateFromRecords requires at least one document",
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
-	records := make([]storeio.PrimaryGraphRecord, len(input))
-	for i := range input {
-		if len(input[i].Key) == 0 ||
-			len(input[i].Key) > normalized.MaxKeyBytes ||
-			len(input[i].Key) > storeio.CommonPrimaryLeafMaxKeyBytes {
+	records := make([]storeio.PrimaryGraphRecord, count)
+	for i := range count {
+		key, value := recordAt(i)
+		if len(key) == 0 || len(key) > normalized.MaxKeyBytes ||
+			len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
 			return 0, ErrKeyTooLarge
 		}
-		if len(input[i].Value) == 0 ||
-			len(input[i].Value) > normalized.MaxDocumentBytes {
+		if len(value) == 0 || len(value) > normalized.MaxDocumentBytes {
 			return 0, ErrDocumentTooLarge
 		}
-		if len(input[i].Value) > normalized.InlineValueBytes {
+		if len(value) > normalized.InlineValueBytes {
 			return 0, ErrPrimaryCutoverUnsupported
 		}
 		records[i] = storeio.PrimaryGraphRecord{
-			Key: input[i].Key, Value: byteview.String(input[i].Value),
+			Key: key, Value: byteview.String(value),
 		}
 	}
 	if err := sortPrimaryBulkRecords(records); err != nil {
 		return 0, err
 	}
 	return createFromPrimaryGraphRecords(
-		records, input, file, normalized, requestedBuffers,
+		records, source, file, normalized, requestedBuffers,
 	)
 }
 
