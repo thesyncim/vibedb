@@ -338,6 +338,7 @@ type structuralLeafStager func(tx *storeio.WriteTransaction) (
 )
 
 type primaryLocalizedLeafSplit struct {
+	remove       bool
 	resident     storeio.ResidentPrimaryRoute
 	route        storeio.SegmentedTabletRouterRoute
 	leftRef      storeio.PageRef
@@ -443,10 +444,10 @@ func (c *Collection) commitPrimaryStructural(
 	if err != nil {
 		return err
 	}
-	// Whole-tablet rebuilds remain the fallback for empty reclamation and batch
-	// topology. A single-leaf split takes the localized path below: exactly the
-	// selected anchor (plus one new anchor only when it was full), locator, and
-	// segmented root are rewritten.
+	// Whole-tablet rebuilds remain the fallback for batch topology and removing
+	// the only row in an anchor. Localized edits rewrite exactly the selected
+	// anchor (plus one new anchor only for a split of a full anchor), locator,
+	// and segmented root.
 	var oldAnchorRefs []storeio.PageRef
 	var rawRoot []byte
 	var nextRouter *storeio.ResidentPrimaryRouter
@@ -468,7 +469,8 @@ func (c *Collection) commitPrimaryStructural(
 			return allocErr
 		}
 		var rightAnchor storeio.TransactionPage
-		if path.anchor.Count() == storeio.SegmentedTabletRouterRowsPerPage {
+		if !localized.remove &&
+			path.anchor.Count() == storeio.SegmentedTabletRouterRowsPerPage {
 			newPageID := uint8(path.tablet.AnchorCount())
 			rightLogical, rightOK := storeio.GlobalTabletCatalogAnchorLogicalID(
 				tabletID, newPageID,
@@ -502,20 +504,30 @@ func (c *Collection) commitPrimaryStructural(
 			return openErr
 		}
 		rawRoot = make([]byte, storeio.SegmentedTabletRouterRootBytes)
-		localizedResult, splitErr := path.tablet.InsertSplitLeaf(
-			rawRoot, locatorPage.Bytes(), leftAnchor.Bytes(), rightAnchor.Bytes(),
-			generation, localized.route, localized.leftRef,
-			localized.rightLocalID, localized.rightFence, localized.rightRef,
-			leftAnchor.Ref(), rightAnchor.Ref(), &locatorView, &path.anchor,
-		)
+		var rightPage []byte
+		if localized.remove {
+			_, err = path.tablet.RemoveLeaf(
+				rawRoot, locatorPage.Bytes(), leftAnchor.Bytes(), generation,
+				localized.route, leftAnchor.Ref(), &locatorView, &path.anchor,
+			)
+		} else {
+			var localizedResult storeio.SegmentedTabletRouterLeafSplitResult
+			localizedResult, err = path.tablet.InsertSplitLeaf(
+				rawRoot, locatorPage.Bytes(), leftAnchor.Bytes(), rightAnchor.Bytes(),
+				generation, localized.route, localized.leftRef,
+				localized.rightLocalID, localized.rightFence, localized.rightRef,
+				leftAnchor.Ref(), rightAnchor.Ref(), &locatorView, &path.anchor,
+			)
+			rightPage = localizedResult.RightPage
+		}
 		locatorLease.Release()
-		if splitErr != nil {
-			return splitErr
+		if err != nil {
+			return err
 		}
 		if err := leftAnchor.Stage(); err != nil {
 			return err
 		}
-		if len(localizedResult.RightPage) != 0 {
+		if len(rightPage) != 0 {
 			if err := rightAnchor.Stage(); err != nil {
 				return err
 			}
@@ -525,7 +537,7 @@ func (c *Collection) commitPrimaryStructural(
 				storeio.GlobalTabletCatalogTabletBytes +
 				storeio.SegmentedTabletRouterAnchorPageBytes,
 		)
-		if len(localizedResult.RightPage) != 0 {
+		if len(rightPage) != 0 {
 			structuralRoutingStaged += storeio.SegmentedTabletRouterAnchorPageBytes
 		}
 		structuralRoutingRetired = uint64(
@@ -534,11 +546,17 @@ func (c *Collection) commitPrimaryStructural(
 		if err := locatorPage.Stage(); err != nil {
 			return err
 		}
-		nextRouter, err = c.primaryRouter.Load().SplitLeaf(
-			localized.resident, localized.leftRef,
-			localized.rightBucket, localized.rightFence,
-			localized.rightRef, generation,
-		)
+		if localized.remove {
+			nextRouter, err = c.primaryRouter.Load().RemoveLeaf(
+				localized.resident, generation,
+			)
+		} else {
+			nextRouter, err = c.primaryRouter.Load().SplitLeaf(
+				localized.resident, localized.leftRef,
+				localized.rightBucket, localized.rightFence,
+				localized.rightRef, generation,
+			)
+		}
 		if err != nil {
 			return err
 		}
@@ -1009,7 +1027,7 @@ func (c *Collection) structuralRemoveEmptyPrimaryLeaf(keyBytes []byte) error {
 		return nil
 	}
 	if err := c.commitRemoveEmptyLeaf(
-		state, &path, current, sourceIndex,
+		state, &path, route, current, sourceIndex,
 	); err != nil {
 		return fmt.Errorf("remove empty primary leaf: %w", err)
 	}
@@ -1054,6 +1072,7 @@ func (c *Collection) primaryLeafEmpty(keyBytes []byte) (bool, error) {
 func (c *Collection) commitRemoveEmptyLeaf(
 	state *fileStoreState,
 	path *filePrimaryMutationPath,
+	resident storeio.ResidentPrimaryRoute,
 	current []structuralLeaf,
 	sourceIndex int,
 ) error {
@@ -1067,6 +1086,12 @@ func (c *Collection) commitRemoveEmptyLeaf(
 			c.structuralRepairPostingsHook(
 				[]storeio.BucketID{current[sourceIndex].bucket},
 			)
+			if path.anchor.Count() > 1 {
+				return nil, []storeio.PageRef{current[sourceIndex].ref},
+					&primaryLocalizedLeafSplit{
+						remove: true, resident: resident, route: path.leafRoute,
+					}, nil
+			}
 			final := make(
 				[]storeio.SegmentedTabletRouterLeaf, 0, len(current)-1,
 			)
