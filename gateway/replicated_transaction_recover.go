@@ -73,7 +73,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 		}
 		// Before any durable coordinator cut, the sole safe network action is the
 		// byte-identical begin whose admission outcome is unknown.
-		if err := orchestrator.retryPendingMatching(ctx, handle,
+		if err := orchestrator.retryRecoveryPendingMatching(ctx, handle,
 			func(control distributedtxn.ReplicatedCommand) bool {
 				return control.Operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 					control.Operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator
@@ -125,7 +125,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 		handle.DecisionRevision = record.Revision
 		orchestrator.discardPendingExcept(handle,
 			distributedtxn.ReplicatedAbortCoordinator)
-		if err = orchestrator.retryPendingMatching(ctx, handle,
+		if err = orchestrator.retryRecoveryPendingMatching(ctx, handle,
 			func(control distributedtxn.ReplicatedCommand) bool {
 				return control.Operation == distributedtxn.ReplicatedAbortCoordinator
 			}); err != nil {
@@ -138,7 +138,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 				ID:        handle.ID, ExpectedRevision: record.Revision,
 				PayloadKind: distributedtxn.ReplicatedPayloadNone,
 			}
-			proposal := orchestrator.propose(
+			proposal := orchestrator.proposeRecovery(
 				ctx, coordinator.Route, abort, nil, handle.CoordinatorOrdinal,
 				replicatedTransactionWorkerScratch{},
 			)
@@ -172,7 +172,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 		// canonical witnesses directly, so a near-limit handle needs no second
 		// O(P) plan and funds forward progress from the bytes it just released.
 		orchestrator.discardPendingAfterDecision(handle, committed)
-		if err = orchestrator.retryPendingMatching(ctx, handle,
+		if err = orchestrator.retryRecoveryPendingMatching(ctx, handle,
 			func(control distributedtxn.ReplicatedCommand) bool {
 				if committed {
 					return control.Operation == distributedtxn.ReplicatedCommitCoordinator ||
@@ -187,9 +187,9 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 	}
 	if state != distributedtxn.CoordinatorRetired {
 		if committed {
-			_, err = orchestrator.finish(ctx, handle, true)
+			_, err = orchestrator.finishRecovery(ctx, handle, true)
 		} else {
-			err = orchestrator.abortFenceAndRelease(ctx, handle)
+			err = orchestrator.abortFenceAndReleaseRecovery(ctx, handle)
 		}
 		if err != nil {
 			return ReplicatedTransactionResult{ID: handle.ID, Committed: committed, Recovery: handle},
@@ -203,7 +203,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 	}
 	if state != distributedtxn.CoordinatorRetired {
 		retirementMatches := true
-		if err = orchestrator.retryPendingMatchingObserved(ctx, handle,
+		if err = orchestrator.retryRecoveryPendingMatchingObserved(ctx, handle,
 			func(control distributedtxn.ReplicatedCommand) bool {
 				if control.Operation != distributedtxn.ReplicatedRetireCoordinator {
 					return false
@@ -232,7 +232,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 			AffectedRows: affected, AffectedRowsValid: committed,
 		}
 		if !retirementProvedThisCall {
-			err = orchestrator.retire(ctx, handle, coordinator.Route, summary)
+			err = orchestrator.retireRecovery(ctx, handle, coordinator.Route, summary)
 		}
 		if err != nil {
 			return ReplicatedTransactionResult{

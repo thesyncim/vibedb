@@ -277,8 +277,10 @@ The catalog, public RF3 point reads, mutation proposals, and transaction
 recovery share one bounded authenticated native connection pool. The pool keys
 a physical connection by authenticated node and address. Globally idle
 connections are evicted oldest-first under endpoint churn, while topology,
-membership, schema, and transaction-recovery traffic retain reserved connection
-and handshake capacity under data saturation. The RF3 executor also keeps
+membership, schema, and transaction-recovery traffic retain reserved connection,
+handshake, and waiter capacity under data saturation. Recovery proposals are
+accepted under that capability only for authenticated transaction commands; it
+cannot be used to submit ordinary data mutations. The RF3 executor also keeps
 bounded four-way exact leader hints. It validates the complete route and serving
 fence, follows `NotLeader` responses, and retries within
 `-catalog-attempts` and `-catalog-attempt-timeout`. A

@@ -736,7 +736,7 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 		}
 		command, err := replication.OpenCommand(request.Command)
 		return err == nil && replicatedCommandCapabilityMatches(
-			request.Capability, command.AuthorityClass,
+			request.Capability, command.Kind(), command.AuthorityClass,
 		) && command.ClusterID == request.Fence.Group.ClusterID &&
 			command.ClusterIncarnation == request.Fence.Group.ClusterIncarnation &&
 			command.TopologyRecoveryEpoch == request.Fence.Group.TopologyRecoveryEpoch &&
@@ -779,9 +779,14 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 }
 
 func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
+	kind replication.CommandKind,
 	class replication.CommandAuthorityClass) bool {
 	if capability == serviceauthz.CapabilityTopology {
 		return class == replication.CommandAuthorityTopology
+	}
+	if capability == serviceauthz.CapabilityTransactionRecovery {
+		return kind == replication.CommandTransaction &&
+			class == replication.CommandAuthorityData
 	}
 	return (capability == 0 || capability == serviceauthz.CapabilityDataWrite) &&
 		class == replication.CommandAuthorityData
@@ -797,7 +802,8 @@ func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
 
 func validReplicatedProposalCapability(capability serviceauthz.Capability) bool {
 	return capability == 0 || capability == serviceauthz.CapabilityDataWrite ||
-		capability == serviceauthz.CapabilityTopology
+		capability == serviceauthz.CapabilityTopology ||
+		capability == serviceauthz.CapabilityTransactionRecovery
 }
 
 func validReplicatedReadCapability(capability serviceauthz.Capability) bool {

@@ -33,6 +33,7 @@ type transactionOrchestratorClient struct {
 	manifestPages       map[raftmember.GroupKey]map[uint32][]byte
 	commands            [][]byte
 	authorities         []serviceauthz.Authority
+	capabilities        []serviceauthz.Capability
 	completions         map[[sha256.Size]byte]transactionOrchestratorCachedCompletion
 	loseOperation       distributedtxn.ReplicatedOperation
 	loseShard           string
@@ -58,6 +59,7 @@ func (client *transactionOrchestratorClient) DoReplicated(
 	defer client.mu.Unlock()
 	client.calls++
 	client.authorities = append(client.authorities, request.Authority)
+	client.capabilities = append(client.capabilities, request.Capability)
 	state := client.states[endpoint.Address]
 	if request.Operation == shardservice.ReplicatedProbe {
 		return &shardservice.ReplicatedResponse{
@@ -618,6 +620,13 @@ func TestReplicatedTransactionRecoveryUsesConfiguredServiceAuthority(t *testing.
 			t.Fatalf("execute authority[%d]=%+v want caller %+v", index, authority, caller)
 		}
 	}
+	for index, capability := range client.capabilities {
+		if capability != serviceauthz.CapabilityDataWrite {
+			client.mu.Unlock()
+			t.Fatalf("execute capability[%d]=%x want data-write %x", index,
+				capability, serviceauthz.CapabilityDataWrite)
+		}
+	}
 	client.mu.Unlock()
 
 	result, recoverErr := orchestrator.Recover(ctx, transactionErr.Recovery)
@@ -632,6 +641,12 @@ func TestReplicatedTransactionRecoveryUsesConfiguredServiceAuthority(t *testing.
 	for index, authority := range client.authorities[executeCalls:] {
 		if authority != recovery {
 			t.Fatalf("recovery authority[%d]=%+v want service %+v", index, authority, recovery)
+		}
+	}
+	for index, capability := range client.capabilities[executeCalls:] {
+		if capability != serviceauthz.CapabilityTransactionRecovery {
+			t.Fatalf("recovery capability[%d]=%x want transaction-recovery %x", index,
+				capability, serviceauthz.CapabilityTransactionRecovery)
 		}
 	}
 }
