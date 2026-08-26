@@ -62,6 +62,39 @@ func replicatedSchemaActivationMatchesCatalog(catalogPath string) (bool, error) 
 	return record.targetDigest == image.Digest, nil
 }
 
+// PublishedReplicatedSchemaActivationIdentity returns the exact SQL and apply
+// identities authenticated by a catalog whose digest matches the durable
+// activation record. It is the crash-atomic restart authority; external
+// identity files may still describe the drained source generation.
+func PublishedReplicatedSchemaActivationIdentity(
+	path string,
+) (ReplicatedShardStoreIdentity, ReplicatedApplyIdentity, bool, error) {
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
+	}
+	raw, found, err := readCatalogFile(absolute)
+	if err != nil || !found {
+		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
+	}
+	catalog, image, err := openReplicatedSchemaCatalogImage(raw)
+	if err != nil {
+		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
+	}
+	record, activationFound, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !activationFound || record.targetDigest != image.Digest {
+		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(record.command)
+	if err != nil || transition.ToSchemaGeneration != image.SchemaGeneration ||
+		transition.ToManifest != image.RelationManifestDigest ||
+		catalog.ReplicatedShardStore == nil || catalog.ReplicatedApply == nil {
+		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false,
+			errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return catalog.ReplicatedShardStore.Clone(), catalog.ReplicatedApply.identity(), true, nil
+}
+
 func encodeReplicatedSchemaActivation(record replicatedSchemaActivation) ([]byte, error) {
 	if record.targetDigest == ([sha256.Size]byte{}) || len(record.command) == 0 ||
 		len(record.command) > replicatedstate.MaxSchemaTransitionBytes {

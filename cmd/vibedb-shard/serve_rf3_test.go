@@ -75,6 +75,32 @@ func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
 	}
 }
 
+func TestRF3PublishedSchemaIdentityAdvancesOnlySchemaContract(t *testing.T) {
+	retained := sqldriver.ReplicatedShardStoreIdentity{
+		LogID: [16]byte{1}, UserTable: "docs",
+		Binding: sqldriver.ReplicatedShardStoreBinding{
+			Authority: sqldriver.ReplicatedAuthorityProfile{SchemaGeneration: 7},
+		},
+	}
+	retainedApply := sqldriver.ReplicatedApplyIdentity{ValidationDigest: [32]byte{2}}
+	published := retained.Clone()
+	published.Binding.Authority.SchemaGeneration++
+	publishedApply := retainedApply
+	publishedApply.ValidationDigest = [32]byte{3}
+	if !rf3SchemaSuccessorMatchesRetained(retained, retainedApply, published, publishedApply) {
+		t.Fatal("exact schema successor rejected")
+	}
+	diverged := published.Clone()
+	diverged.LogID[0]++
+	if rf3SchemaSuccessorMatchesRetained(retained, retainedApply, diverged, publishedApply) {
+		t.Fatal("schema activation replaced immutable log identity")
+	}
+	publishedApply.MaxSessions++
+	if rf3SchemaSuccessorMatchesRetained(retained, retainedApply, published, publishedApply) {
+		t.Fatal("schema activation replaced apply capacity contract")
+	}
+}
+
 func TestRF3ExecutionLaneCountIsExplicitPowerOfTwo(t *testing.T) {
 	if rf3DefaultExecutionLanes != 8 || !validRF3ExecutionLanes(rf3DefaultExecutionLanes) {
 		t.Fatalf("default execution lanes = %d", rf3DefaultExecutionLanes)

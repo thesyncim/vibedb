@@ -845,7 +845,40 @@ func loadRF3RetainedIdentities(manifest rf3Manifest) (
 	if err := loadRF3IdentityFile(manifest.SQL.ApplyIdentityPath, &apply); err != nil {
 		return base, apply, fmt.Errorf("%w: apply identity: %v", errRF3Serving, err)
 	}
+	publishedBase, publishedApply, published, err :=
+		sqldriver.PublishedReplicatedSchemaActivationIdentity(manifest.SQL.Path)
+	if err != nil {
+		return base, apply, fmt.Errorf("%w: published schema identity: %v", errRF3Serving, err)
+	}
+	if published {
+		if !rf3SchemaSuccessorMatchesRetained(base, apply, publishedBase, publishedApply) {
+			return base, apply, fmt.Errorf("%w: published schema identity diverges from retained source", errRF3Serving)
+		}
+		base, apply = publishedBase, publishedApply
+	}
 	return base, apply, nil
+}
+
+func rf3SchemaSuccessorMatchesRetained(
+	retained sqldriver.ReplicatedShardStoreIdentity,
+	retainedApply sqldriver.ReplicatedApplyIdentity,
+	published sqldriver.ReplicatedShardStoreIdentity,
+	publishedApply sqldriver.ReplicatedApplyIdentity,
+) bool {
+	if retained.Equal(published) && retainedApply == publishedApply {
+		return true
+	}
+	if retained.Binding.Authority.SchemaGeneration == ^uint64(0) ||
+		published.Binding.Authority.SchemaGeneration !=
+			retained.Binding.Authority.SchemaGeneration+1 {
+		return false
+	}
+	wantBinding := retained.Binding
+	wantBinding.Authority.SchemaGeneration++
+	wantApply := retainedApply
+	wantApply.ValidationDigest = publishedApply.ValidationDigest
+	return published.Binding == wantBinding && published.LogID == retained.LogID &&
+		published.UserTable == retained.UserTable && publishedApply == wantApply
 }
 
 type rf3IdentityDecoder interface{ UnmarshalJSON([]byte) error }
