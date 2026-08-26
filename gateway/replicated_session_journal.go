@@ -118,6 +118,39 @@ func (journal *NativeSessionJournal) slotPath(slot int) string {
 	return journal.base + ".1"
 }
 
+// destroyReleased removes a fully retired session journal only after its
+// replicated release settled. Directory fsync makes the absence durable; an
+// outcome-unknown or active session can never enter this path.
+func (journal *NativeSessionJournal) destroyReleased() error {
+	if journal == nil {
+		return ErrNativeSessionJournal
+	}
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	if journal.state.phase != nativeSessionReleased || journal.state.pending {
+		return ErrNativeSessionJournal
+	}
+	var joined error
+	for slot := 0; slot < 2; slot++ {
+		if err := os.Remove(journal.slotPath(slot)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			joined = errors.Join(joined, err)
+		}
+	}
+	directory, err := os.Open(filepath.Dir(journal.base))
+	if err == nil {
+		err = directory.Sync()
+		joined = errors.Join(joined, err, directory.Close())
+	} else {
+		joined = errors.Join(joined, err)
+	}
+	if joined == nil {
+		journal.active = -1
+		journal.generation = 0
+		journal.state = durableNativeSessionState{}
+	}
+	return joined
+}
+
 func (journal *NativeSessionJournal) load() (durableNativeSessionState, error) {
 	if journal == nil {
 		return durableNativeSessionState{}, ErrNativeSessionJournal

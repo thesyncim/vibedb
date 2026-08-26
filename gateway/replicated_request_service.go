@@ -22,6 +22,10 @@ type DurableRequestExecutionPinAuthority interface {
 	) (ReplicatedRoute, executionpin.AcquireCertificate, executionpin.LeaseCertificate, error)
 }
 
+type DurableRequestExecutionPinRetirer interface {
+	RetireTerminal(context.Context, DurableRequestTypedExecutionContext) error
+}
+
 // DurableRequestService is the shipped typed request boundary. It admits the
 // immutable recipe through RF3 lifecycle CAS, reopens it from authenticated
 // pages, binds the logical execution-pin lease, and runs the distributed
@@ -187,6 +191,16 @@ func (service *DurableRequestService) Acknowledge(
 	if terminal.Revision != terminalRevision ||
 		terminal.ResultDigest != requestledger.Digest(resultDigest) {
 		return DurableRequestAckResult{}, ErrDurableRequestConflict
+	}
+	retirer, ok := service.pins.(DurableRequestExecutionPinRetirer)
+	if ok {
+		execution, executionErr := service.openTerminalExecution(ctx, home, key, head, applied)
+		if executionErr != nil {
+			return DurableRequestAckResult{}, errors.Join(executionErr, ErrDurableRequestUnresolved)
+		}
+		if retireErr := retirer.RetireTerminal(ctx, execution); retireErr != nil {
+			return DurableRequestAckResult{}, errors.Join(retireErr, ErrDurableRequestUnresolved)
+		}
 	}
 	return service.acks.AcknowledgeAndCollect(ctx, DurableRequestAckPlan{
 		Home: home, Key: key.RequestKey, TerminalRevision: terminalRevision,
@@ -395,6 +409,19 @@ func (service *DurableRequestService) drive(
 		if !durableRequestTerminalMatchesKey(terminal, key, head.PlanRoot) {
 			return DurableRequestOutcome{}, ErrDurableRequestConflict
 		}
+		retirer, ok := service.pins.(DurableRequestExecutionPinRetirer)
+		if ok {
+			if head.SchemaPinReleaseCertificateDigest == (requestledger.Digest{}) {
+				return DurableRequestOutcome{}, ErrDurableRequestUnresolved
+			}
+			execution, executionErr := service.openTerminalExecution(ctx, home, key, head, applied)
+			if executionErr != nil {
+				return DurableRequestOutcome{}, errors.Join(executionErr, ErrDurableRequestUnresolved)
+			}
+			if retireErr := retirer.RetireTerminal(ctx, execution); retireErr != nil {
+				return DurableRequestOutcome{}, errors.Join(retireErr, ErrDurableRequestUnresolved)
+			}
+		}
 		return durableRequestTypedOutcome(terminal)
 	}
 	if head.Phase != requestledger.PhaseSealed && head.Phase != requestledger.PhasePrepared {
@@ -448,6 +475,13 @@ func (service *DurableRequestService) drive(
 		if !durableRequestTerminalMatchesKey(terminal.Terminal, key, head.PlanRoot) {
 			return DurableRequestOutcome{}, ErrDurableRequestConflict
 		}
+		retirer, ok := service.pins.(DurableRequestExecutionPinRetirer)
+		if !ok {
+			return DurableRequestOutcome{}, ErrDurableRequestUnresolved
+		}
+		if retireErr := retirer.RetireTerminal(ctx, execution); retireErr != nil {
+			return DurableRequestOutcome{}, errors.Join(retireErr, ErrDurableRequestUnresolved)
+		}
 		return durableRequestTypedOutcome(terminal.Terminal)
 	}
 	after, ack, nextApplied, readErr := service.openHead(ctx, home, key.RequestKey, applied)
@@ -455,16 +489,49 @@ func (service *DurableRequestService) drive(
 		return DurableRequestOutcome{Acknowledged: true}, ErrDurableRequestAcknowledged
 	}
 	if readErr == nil && after.Phase == requestledger.PhaseTerminal {
-		settled, _, terminalErr := service.readTerminal(ctx, home, key.RequestKey, nextApplied)
-		if terminalErr == nil && durableRequestTerminalMatchesKey(settled, key, after.PlanRoot) {
-			return durableRequestTypedOutcome(settled)
-		}
-		if terminalErr == nil {
-			terminalErr = ErrDurableRequestConflict
-		}
-		readErr = terminalErr
+		return service.drive(ctx, home, key, after, nextApplied)
 	}
 	return DurableRequestOutcome{}, errors.Join(runErr, readErr, ErrDurableRequestUnresolved)
+}
+
+func (service *DurableRequestService) openTerminalExecution(
+	ctx context.Context,
+	home DurableRequestLedgerHome,
+	key DurableRequestLedgerKey,
+	head requestledger.HeadRecord,
+	applied uint64,
+) (DurableRequestTypedExecutionContext, error) {
+	descriptor := DurableRequestPlanDescriptor{
+		TotalBytes: head.TotalPlanBytes, Root: replication.Digest(head.PlanRoot),
+	}
+	if len(head.InlinePlan) != 0 {
+		descriptor.Inline = bytes.Clone(head.InlinePlan)
+	} else if head.PlanPageCount > math.MaxUint32 {
+		return DurableRequestTypedExecutionContext{}, ErrDurableRequestBound
+	} else {
+		descriptor.PageCount = uint32(head.PlanPageCount)
+	}
+	source := durableRequestPlanPageSourceFunc(func(ordinal uint32) ([]byte, error) {
+		row, err := service.ledger.ReadRow(ctx, home, DurableRequestLifecycleRead{
+			Key: key.RequestKey, Kind: replicatedstate.RequestLedgerReadPlanPage,
+			Ordinal: uint64(ordinal), MinimumApplied: max(uint64(1), applied),
+		})
+		if err != nil || !row.Found || row.Kind != replicatedstate.RequestLedgerReadPlanPage {
+			return nil, errors.Join(err, ErrDurableRequestUnresolved)
+		}
+		return bytes.Clone(row.PlanPage.Data), nil
+	})
+	reader, err := openDurableRequestRecipeStream(key, descriptor, source)
+	if err != nil {
+		return DurableRequestTypedExecutionContext{}, err
+	}
+	return NewDurableRequestTypedExecutionContext(home, key, DurableRequestRecipe{
+		CatalogGeneration: reader.CatalogGeneration, Identity: reader.Identity,
+		Contract: reader.Contract, Tenant: bytes.Clone(reader.Tenant),
+		KeyDigest: reader.KeyDigest, RequestID: reader.RequestID,
+		RequestDigest: reader.RequestDigest, ParticipantCount: reader.ParticipantCount,
+		ParticipantStream: reader, ResumeRevision: head.Revision,
+	})
 }
 
 func (service *DurableRequestService) readTerminal(

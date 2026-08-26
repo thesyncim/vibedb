@@ -1,12 +1,16 @@
 package gateway
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -27,6 +31,53 @@ func TestDurableExecutionPinSessionIdentityBindsPinAndPrincipalGeneration(t *tes
 		durableExecutionPinSessionIdentity(pin, changedPrincipal) == want ||
 		durableExecutionPinSessionIdentity(pin, changedNode) == want {
 		t.Fatal("session identity aliases pin or principal authority")
+	}
+}
+
+func TestReleasedExecutionPinJournalChurnLeavesNoFilesAndActiveSurvivesRestart(t *testing.T) {
+	directory := t.TempDir()
+	for ordinal := 1; ordinal <= 256; ordinal++ {
+		options := NativeSessionJournalOptions{
+			Path:            filepath.Join(directory, fmt.Sprintf("pin-%04d", ordinal)),
+			ClientID:        replication.ID128{byte(ordinal), byte(ordinal >> 8)},
+			RetryHome:       replication.RetryHome{byte(ordinal), 1},
+			MaxCommandBytes: replication.MaxCommandBytes,
+			Binding:         replication.Digest{byte(ordinal), byte(ordinal >> 8), 1},
+		}
+		journal, err := OpenNativeSessionJournal(options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ordinal == 1 {
+			if err = journal.destroyReleased(); err == nil {
+				t.Fatal("active/recoverable journal was deleted")
+			}
+			if _, err = OpenNativeSessionJournal(options); err != nil {
+				t.Fatalf("recoverable journal did not survive reopen: %v", err)
+			}
+			continue
+		}
+		state, err := journal.load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.phase, state.epoch = nativeSessionReleased, 1
+		state.ackThrough, state.nextSequence = 1, 2
+		state.terminalSequence = 1
+		state.terminalFingerprint = replication.Digest{1}
+		if err = journal.store(state); err != nil {
+			t.Fatal(err)
+		}
+		if err = journal.destroyReleased(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) > 2 {
+		t.Fatalf("journal churn retained %d files, want only one recoverable two-slot journal", len(entries))
 	}
 }
 

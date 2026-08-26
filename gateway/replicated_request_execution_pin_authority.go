@@ -21,6 +21,26 @@ type DurableRequestExecutionPinSessionFactory interface {
 		DurableRequestTypedExecutionContext,
 		ReplicatedRoute,
 	) (*NativeSession, serviceauthz.Authority, func(), error)
+	RetireTerminalExecutionPinSession(
+		context.Context,
+		DurableRequestTypedExecutionContext,
+		ReplicatedRoute,
+	) error
+}
+
+// RetireTerminal is idempotent and only removes session files after the
+// caller has proved the ledger terminal and execution-pin release witnesses.
+func (authority *NativeDurableRequestExecutionPinAuthority) RetireTerminal(
+	ctx context.Context,
+	execution DurableRequestTypedExecutionContext,
+) error {
+	if authority == nil || authority.sessions == nil || ctx == nil ||
+		!validReplicatedRoute(execution.Home.borrowedRoute()) {
+		return ErrDurableRequest
+	}
+	return authority.sessions.RetireTerminalExecutionPinSession(
+		ctx, execution, execution.Home.borrowedRoute(),
+	)
 }
 
 // NativeDurableRequestExecutionPinAuthority turns the clockless execution-pin

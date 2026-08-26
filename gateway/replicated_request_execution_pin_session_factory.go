@@ -138,6 +138,67 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 	return session, factory.principal, release, nil
 }
 
+func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireTerminalExecutionPinSession(
+	ctx context.Context,
+	execution DurableRequestTypedExecutionContext,
+	route ReplicatedRoute,
+) error {
+	if factory == nil || ctx == nil {
+		return ErrDurableRequest
+	}
+	binding, err := BuildDurableRequestExecutionPinBinding(execution)
+	pin, pinErr := executionpin.DerivePinID(binding)
+	if err != nil || pinErr != nil {
+		return errors.Join(err, pinErr, ErrDurableRequestConflict)
+	}
+	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
+	base := filepath.Join(factory.directory, hex.EncodeToString(identity[:]))
+	found := false
+	for slot := 0; slot < 2; slot++ {
+		_, statErr := os.Stat(base + "." + string(rune('0'+slot)))
+		if statErr == nil {
+			found = true
+			break
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+	}
+	if !found {
+		return nil
+	}
+	session, principal, release, err := factory.OpenExecutionPinSession(ctx, execution, route)
+	if release != nil {
+		defer release()
+	}
+	if err != nil {
+		return err
+	}
+	authorized, err := serviceauthz.WithAuthority(ctx, principal)
+	if err != nil {
+		return err
+	}
+	if session.pending {
+		if _, err = session.RetryPending(authorized); err != nil {
+			return err
+		}
+	}
+	if session.phase == nativeSessionActive {
+		if _, err = session.Retire(authorized); err != nil {
+			return err
+		}
+	}
+	if session.phase == nativeSessionRetired {
+		if _, err = session.Release(authorized); err != nil {
+			return err
+		}
+	}
+	if session.phase != nativeSessionReleased || session.pending || session.journal == nil {
+		return ErrDurableRequestUnresolved
+	}
+	return session.journal.destroyReleased()
+}
+
 func durableExecutionPinSessionStripe(identity replication.ID128) uint16 {
 	return binary.LittleEndian.Uint16(identity[:2]) & (durableExecutionPinSessionStripes - 1)
 }
