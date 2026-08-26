@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -378,7 +379,13 @@ type ChildObservation struct {
 	WALBinding sqldriver.ReplicatedShardStoreBinding
 
 	RuntimeIdentity raftmember.RuntimeIdentity
-	RuntimeStatus   raftmember.RuntimeStatus
+
+	// ReadyReplicas is a cold control-plane proof assembled from independent
+	// raftservice.Owner probes. Publication requires a majority of the exact
+	// manifest replica count to report the same live term and leader after
+	// applying the certified cut. A leader's progress tracker alone is not an
+	// apply proof for followers, so every slot is one member-local ServingState.
+	ReadyReplicas []raftservice.ServingState
 }
 
 // Observation is one detached control-loop cut. Pointers distinguish absent
@@ -773,7 +780,7 @@ func (p *Plan) childAction(
 		if status.Phase == ChildPhaseActivated {
 			if status.WALBinding != (sqldriver.ReplicatedShardStoreBinding{}) ||
 				status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
-				status.RuntimeStatus != (raftmember.RuntimeStatus{}) ||
+				len(status.ReadyReplicas) != 0 ||
 				status.ApplyProfile.Applied != certificate.SourceCut().Applied ||
 				status.ApplyProfile.SessionCount != 0 ||
 				status.ApplyProfile.SessionSlotCount != 0 {
@@ -786,7 +793,7 @@ func (p *Plan) childAction(
 		}
 		if status.Phase == ChildPhaseWALCreated {
 			if status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
-				status.RuntimeStatus != (raftmember.RuntimeStatus{}) {
+				len(status.ReadyReplicas) != 0 {
 				return Action{}, false, ErrTopologyConflict
 			}
 			return Action{Kind: ActionAdoptChildRuntime, Child: uint8(child)}, true, nil
@@ -794,17 +801,89 @@ func (p *Plan) childAction(
 		if !runtimeIdentityMatches(target, status.RuntimeIdentity) {
 			return Action{}, false, ErrTopologyConflict
 		}
-		runtime := status.RuntimeStatus
-		if runtime.MemberID != target.WAL.MemberID || runtime.Term == 0 ||
-			runtime.Applied > runtime.Commit {
+		ready, valid := childQuorumReady(
+			target, status.ApplyProfile, status.ReadyReplicas,
+			int(p.leaderCounts[child]), certificate.SourceCut().Applied,
+		)
+		if !valid {
 			return Action{}, false, ErrTopologyConflict
 		}
-		if runtime.LeaderID != runtime.MemberID || runtime.RaftState != raft.StateLeader ||
-			runtime.Applied < certificate.SourceCut().Applied {
+		if !ready {
 			return Action{Kind: ActionAwaitChildReady, Child: uint8(child)}, true, nil
 		}
 	}
 	return Action{}, false, nil
+}
+
+func childQuorumReady(
+	target ChildTarget,
+	profile sqldriver.ReplicatedApplyCapacityProfile,
+	replicas []raftservice.ServingState,
+	replicaCount int,
+	minimumApplied uint64,
+) (ready bool, valid bool) {
+	if replicaCount <= 0 || len(replicas) > replicaCount {
+		return false, false
+	}
+	quorum := replicaCount/2 + 1
+	var leader, term, replicaSet uint64
+	for index := range replicas {
+		candidate := replicas[index]
+		identity, status, command := candidate.Identity, candidate.Status, candidate.Command
+		if !runtimeGroupMatches(target, identity) || status.MemberID != identity.MemberID ||
+			status.MemberID == 0 || status.LeaderID == 0 || status.Term == 0 ||
+			status.Applied > status.Commit || !command.Valid() ||
+			command.ActivePolicyGeneration != target.Authority.ActivePolicyGeneration ||
+			command.ProtectionEpoch != target.Authority.ProtectionEpoch ||
+			command.OwnershipEpoch != target.Authority.OwnershipEpoch ||
+			command.SchemaGeneration != target.Authority.SchemaGeneration ||
+			command.RoutingVersion != target.Authority.RoutingVersion ||
+			command.RouteGeneration != target.Authority.RouteGeneration ||
+			command.RelationManifestDigest != profile.RelationManifestDigest {
+			return false, false
+		}
+		if index == 0 {
+			leader, term, replicaSet = status.LeaderID, status.Term, command.ReplicaSetVersion
+		} else if status.LeaderID != leader || status.Term != term ||
+			command.ReplicaSetVersion != replicaSet {
+			return false, true
+		}
+		for prior := 0; prior < index; prior++ {
+			other := replicas[prior].Identity
+			if identity.MemberID == other.MemberID || identity.StoreID == other.StoreID {
+				return false, false
+			}
+		}
+		if status.Applied < minimumApplied {
+			return false, true
+		}
+	}
+	if len(replicas) < quorum {
+		return false, true
+	}
+	if leader != target.WAL.MemberID {
+		return false, true
+	}
+	for index := range replicas {
+		status := replicas[index].Status
+		if status.MemberID == leader {
+			return status.RaftState == raft.StateLeader, true
+		}
+	}
+	return false, true
+}
+
+func runtimeGroupMatches(target ChildTarget, identity raftmember.RuntimeIdentity) bool {
+	return identity.Group.ClusterID == target.WAL.ClusterID &&
+		identity.Group.ClusterIncarnation == target.WAL.ClusterIncarnation &&
+		identity.Group.TopologyRecoveryEpoch == target.TopologyRecoveryEpoch &&
+		identity.Group.ShardIncarnation == target.WAL.ShardIncarnation &&
+		identity.Group.GroupID == target.WAL.GroupID &&
+		identity.Distribution == target.WAL.Distribution &&
+		identity.Shard == target.WAL.Shard &&
+		identity.AllocationGeneration == target.WAL.AllocationGeneration &&
+		identity.MemberID != 0 && identity.StoreID != ([16]byte{}) &&
+		identity.NodeIncarnation != 0
 }
 
 func (p *Plan) validatePublishedPreparation(observed Observation) error {

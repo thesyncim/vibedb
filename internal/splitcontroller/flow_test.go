@@ -10,14 +10,12 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
-	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
-	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -193,9 +191,10 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 		},
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true,
-			Applied:               certificate.SourceCut().Applied,
-			SessionEpochHighWater: certificate.SourceCut().Applied,
-			MaxSessions:           8, RetryWindow: 8,
+			RelationManifestDigest: target.SQL.RelationManifestDigest,
+			Applied:                certificate.SourceCut().Applied,
+			SessionEpochHighWater:  certificate.SourceCut().Applied,
+			MaxSessions:            8, RetryWindow: 8,
 		},
 	}
 	observed.Children[1] = child
@@ -216,7 +215,9 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	assertCrashRecovery(observed, ActionAdoptChildRuntime)
 	child.Phase = ChildPhaseRuntimeAdopted
 	child.RuntimeIdentity = testRuntimeIdentity(target)
-	child.RuntimeStatus = raftmemberReadyStatus(target, certificate.SourceCut().Applied)
+	child.ReadyReplicas = testReadyServingStates(
+		target, child.ApplyProfile, int(plan.leaderCounts[1]), certificate.SourceCut().Applied,
+	)
 	sessionState = observed.SourceState
 	sessionState.SessionCount = 1
 	sessionState.SessionSlotCount = 1
@@ -554,13 +555,6 @@ func assertFlowAction(
 		t.Fatalf("action = %+v, want %v, err = %v", action, want, err)
 	}
 	return action
-}
-
-func raftmemberReadyStatus(target ChildTarget, applied uint64) raftmember.RuntimeStatus {
-	return raftmember.RuntimeStatus{
-		MemberID: target.WAL.MemberID, LeaderID: target.WAL.MemberID,
-		Term: 1, Commit: applied, Applied: applied, RaftState: raft.StateLeader,
-	}
 }
 
 func flowTargetBinding(

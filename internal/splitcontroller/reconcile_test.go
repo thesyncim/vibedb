@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -324,7 +325,9 @@ func TestReconcileBuildsThenStagesOnePassArtifacts(t *testing.T) {
 }
 
 func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
-	plan, _, target, _ := testPlan(t)
+	plan, _, target, _ := testPlanWithChildLeaders(t, []distribution.EndpointID{
+		"node-b", "node-c", "node-d",
+	})
 	certificate := rangesplit.CutoverCertificate{}
 	observed := Observation{}
 	action, ok, err := plan.childAction(observed, certificate)
@@ -339,7 +342,9 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 	child := &ChildObservation{
 		Child: 1, Phase: ChildPhaseActivated, ApplyIdentity: identity,
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
-			Binding: target.SQL.Binding, Initialized: true, MaxSessions: 8, RetryWindow: 8,
+			Binding: target.SQL.Binding, Initialized: true,
+			RelationManifestDigest: target.SQL.RelationManifestDigest,
+			MaxSessions:            8, RetryWindow: 8,
 		},
 	}
 	observed.Children[1] = child
@@ -357,18 +362,34 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 
 	child.Phase = ChildPhaseRuntimeAdopted
 	child.RuntimeIdentity = testRuntimeIdentity(target)
-	child.RuntimeStatus = raftmember.RuntimeStatus{
-		MemberID: target.WAL.MemberID, LeaderID: target.WAL.MemberID + 1,
-		Term: 1, Commit: 1, Applied: 0, RaftState: raft.StateFollower,
+	child.ReadyReplicas = testReadyServingStates(target, child.ApplyProfile, 1, 1)
+	action, ok, err = plan.childAction(observed, certificate)
+	if err != nil || !ok || action.Kind != ActionAwaitChildReady {
+		t.Fatalf("minority ready action = %+v, %v, %v", action, ok, err)
+	}
+	child.ReadyReplicas = testReadyServingStates(target, child.ApplyProfile, 3, 1)
+	for index := range child.ReadyReplicas {
+		child.ReadyReplicas[index].Status.LeaderID = target.WAL.MemberID + 1
+		if child.ReadyReplicas[index].Identity.MemberID == target.WAL.MemberID {
+			child.ReadyReplicas[index].Status.RaftState = raft.StateFollower
+		}
+		if child.ReadyReplicas[index].Identity.MemberID == target.WAL.MemberID+1 {
+			child.ReadyReplicas[index].Status.RaftState = raft.StateLeader
+		}
 	}
 	action, ok, err = plan.childAction(observed, certificate)
 	if err != nil || !ok || action.Kind != ActionAwaitChildReady {
 		t.Fatalf("ready action = %+v, %v, %v", action, ok, err)
 	}
-	child.RuntimeStatus.LeaderID = target.WAL.MemberID
-	child.RuntimeStatus.RaftState = raft.StateLeader
+	child.ReadyReplicas = testReadyServingStates(target, child.ApplyProfile, 2, 1)
 	if action, ok, err = plan.childAction(observed, certificate); err != nil || ok {
-		t.Fatalf("ready child action = %+v, %v, %v", action, ok, err)
+		t.Fatalf("quorum-ready child action = %+v, %v, %v", action, ok, err)
+	}
+
+	child.ReadyReplicas = testReadyServingStates(target, child.ApplyProfile, 2, 1)
+	child.ReadyReplicas[1].Identity.MemberID = child.ReadyReplicas[0].Identity.MemberID
+	if _, _, err = plan.childAction(observed, certificate); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("duplicate quorum member error = %v", err)
 	}
 
 	child.WALBinding.Authority.RouteGeneration++
@@ -412,6 +433,13 @@ func TestChildActionsRejectSkippedPhaseAndPrematureEvidence(t *testing.T) {
 }
 
 func testPlan(t testing.TB) (*Plan, *gateway.Snapshot, ChildTarget, *autosplit.SplitPlan) {
+	return testPlanWithChildLeaders(t, []distribution.EndpointID{"node-b"})
+}
+
+func testPlanWithChildLeaders(
+	t testing.TB,
+	childLeaders []distribution.EndpointID,
+) (*Plan, *gateway.Snapshot, ChildTarget, *autosplit.SplitPlan) {
 	t.Helper()
 	manifest, err := distribution.NewManifest("orders", 11, []distribution.Shard{{
 		ID: "source", AllocationGeneration: 7,
@@ -434,6 +462,7 @@ func testPlan(t testing.TB) (*Plan, *gateway.Snapshot, ChildTarget, *autosplit.S
 		config,
 		map[distribution.EndpointID]string{
 			"node-a": "127.0.0.1:1", "node-b": "127.0.0.1:2",
+			"node-c": "127.0.0.1:3", "node-d": "127.0.0.1:4",
 		},
 		19,
 	)
@@ -457,7 +486,7 @@ func testPlan(t testing.TB) (*Plan, *gateway.Snapshot, ChildTarget, *autosplit.S
 		RetainChild: 0, NextRoutingVersion: 12, AllocationHighWater: 7,
 		Destinations: []autosplit.Destination{{
 			Shard: "right", AllocationGeneration: 8,
-			Leaders: []distribution.EndpointID{"node-b"}, OwnershipEpoch: 1,
+			Leaders: childLeaders, OwnershipEpoch: 1,
 		}},
 	})
 	if err != nil {
@@ -504,6 +533,7 @@ func testChildTarget(
 		TopologyRecoveryEpoch: 1, Authority: authority,
 		SQL: sqldriver.ReplicatedShardStoreIdentity{
 			Binding: binding, LogID: testID(6), UserTable: partitioner.CollectionName(),
+			RelationManifestDigest: sha256.Sum256([]byte("child-relations")),
 		},
 	}
 }
@@ -546,6 +576,42 @@ func testRuntimeIdentity(target ChildTarget) raftmember.RuntimeIdentity {
 		AllocationGeneration: target.WAL.AllocationGeneration,
 		MemberID:             target.WAL.MemberID, StoreID: target.WAL.StoreID, NodeIncarnation: 1,
 	}
+}
+
+func testReadyServingStates(
+	target ChildTarget,
+	profile sqldriver.ReplicatedApplyCapacityProfile,
+	count int,
+	applied uint64,
+) []raftservice.ServingState {
+	states := make([]raftservice.ServingState, count)
+	for index := range states {
+		identity := testRuntimeIdentity(target)
+		identity.MemberID = uint64(index + 1)
+		identity.StoreID[0] = byte(index + 1)
+		identity.NodeIncarnation = uint64(index + 1)
+		state := raftservice.ServingState{
+			Identity: identity,
+			Command: raftservice.CommandFence{
+				ReplicaSetVersion: 1, ActivePolicyGeneration: target.Authority.ActivePolicyGeneration,
+				ProtectionEpoch:        target.Authority.ProtectionEpoch,
+				OwnershipEpoch:         target.Authority.OwnershipEpoch,
+				SchemaGeneration:       target.Authority.SchemaGeneration,
+				RelationManifestDigest: profile.RelationManifestDigest,
+				RoutingVersion:         target.Authority.RoutingVersion,
+				RouteGeneration:        target.Authority.RouteGeneration,
+			},
+			Status: raftmember.RuntimeStatus{
+				MemberID: identity.MemberID, LeaderID: target.WAL.MemberID,
+				Term: 1, Commit: applied, Applied: applied, RaftState: raft.StateFollower,
+			},
+		}
+		if identity.MemberID == target.WAL.MemberID {
+			state.Status.RaftState = raft.StateLeader
+		}
+		states[index] = state
+	}
+	return states
 }
 
 func testArtifactSet(
