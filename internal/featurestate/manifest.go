@@ -181,11 +181,26 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "Authenticated peer runtime, replicated shard service, and native gateway executor form a complete internal RF3 path.", []Reference{
 			ref("internal/raftservice/peer.go", "AuthenticatedPeerRuntime"), ref("gateway/replicated_native.go", "ReplicatedExecutor"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-shard prepare-rf3 atomically creates one stable three-voter member root. serve-rf3 opens that retained group, routes it through one of 1..64 deterministic execution lanes, shares one authenticated per-peer transport across all lanes, and serves the authenticated native endpoint. The current manifest still loads one group per process.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb-shard prepare-rf3 atomically creates one stable three-voter member root. serve-rf3 opens either that singleton manifest or 1..64 retained group bundles, routes each group through one of 1..64 deterministic execution lanes, shares one authenticated per-peer transport across all lanes, and serves the authenticated native endpoint. Multi-group enrolled replacement targets remain rejected until snapshot listeners are group-scoped.", []Reference{
 			ref("cmd/vibedb-shard/prepare_rf3.go", "runPrepareRF3"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "A preparation gate proves complete restartable artifact publication and overwrite refusal. A shipped-composition three-process gate proves retained-state opening, mutual TLS, natural election, authenticated reads, and clean process shutdown. Internal fault gates additionally prove follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. Exhaustive external quorum/apply cuts remain absent.", []Reference{
-			ref("cmd/vibedb-shard/prepare_rf3_test.go", "TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite"), ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"), ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
+		Qualification: Stage{StatusPartial, "Preparation and manifest gates prove restartable artifact publication, overwrite refusal, canonical multi-group parsing, and group-scaled serving bounds. A shipped-composition three-process gate proves retained-state opening, mutual TLS, natural election, authenticated reads, and clean process shutdown. Internal fault gates additionally prove follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. A multi-group process fault and scaling gate and exhaustive external quorum/apply cuts remain absent.", []Reference{
+			ref("cmd/vibedb-shard/prepare_rf3_test.go", "TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite"), ref("cmd/vibedb-shard/rf3_manifest_test.go", "TestParseRF3ManifestCanonicalMultiGroupBundles"), ref("cmd/vibedb-shard/serve_rf3_test.go", "TestRF3MultiGroupServingLimitsCoverManifestBound"), ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"), ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
+		}},
+	},
+	{
+		Name: "Development cluster and Kubernetes test tooling",
+		Primitive: Stage{StatusYes, "A local RF3 process orchestrator and deterministic Helm-free Kubernetes manifest renderer exist.", []Reference{
+			ref("cmd/vibedb/cluster_dev.go", "runClusterDev"), ref("internal/kubeoperator/render.go", "Render"),
+		}},
+		Integrated: Stage{StatusYes, "The local command generates credentials, policy, WAL material, retained member roots, and catalog before supervising three shards plus a gateway. The Kubernetes lane composes stable DNS, PVCs, disruption budgets, shard and gateway StatefulSets, and a scale-zero learner bootstrap template.", []Reference{
+			ref("cmd/vibedb/cluster_dev.go", "ensureDevCluster"), ref("internal/kubeoperator/render.go", "Render"),
+		}},
+		Shipped: Stage{StatusYes, "vibedb cluster dev starts or resumes an exact three-member loopback RF3 cluster. vibedb-operator render and prepare provide deterministic Kubernetes test manifests and idempotent ordinal preparation. The renderer is not a reconciliation watch-loop, and Kubernetes DNS is discovery rather than leader or topology authority.", []Reference{
+			ref("cmd/vibedb/main.go", "run"), ref("cmd/vibedb-operator/main.go", "render"), ref("cmd/vibedb-operator/main.go", "prepare"),
+		}},
+		Qualification: Stage{StatusPartial, "Tests prove canonical local-cluster resume, production-policy compatibility, child reaping, distinct loopback endpoints, deterministic Kubernetes output, and injection rejection. There is no end-to-end Kubernetes fault, storage, DNS, or rolling-restart gate.", []Reference{
+			ref("cmd/vibedb/cluster_dev_test.go", "TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision"), ref("cmd/vibedb/cluster_dev_test.go", "TestDevChildShutdownDoesNotLeakProcess"), ref("internal/kubeoperator/render_test.go", "TestRenderRF3GoldenAndSafetyContract"), ref("internal/kubeoperator/render_test.go", "TestRenderRejectsInvalidIdentityAndInjection"),
 		}},
 	},
 	{
@@ -244,8 +259,8 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusYes, "serve-rf3 exposes an authenticated bounded source-control and snapshot-data listener. bootstrap-rf3 receives, verifies, installs, and resumes one cold learner before reopening it through the ordinary serving command.", []Reference{
 			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-shard/bootstrap_rf3.go", "bootstrapPreparedRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, activation-seam fault settlement, post-Host-add rejection reopen, exact-incarnation retry, and chunk benchmarks exist. Target artifacts use a crash-safe authenticated publish-to-delete transition after the learner identity is durably certified. Source-export cleanup and abandoned staged-artifact collection remain incomplete.", []Reference{
-			ref("internal/snapshottransfer/source_provider_test.go", "TestRetainedSourceProviderExportsAndObservesAfterReopen"), ref("internal/snapshottransfer/learner_install_test.go", "TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary"), ref("internal/snapshottransfer/release_test.go", "TestRepositoryRecoversEveryReleaseNamespacePhase"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
+		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, activation-seam fault settlement, post-Host-add rejection reopen, exact-incarnation retry, and chunk benchmarks exist. Target artifacts use a crash-safe authenticated publish-to-delete transition after learner certification. Completed source exports are released only after the durable target-install witness, and replay settles deletion-before-journal outcomes. Abandoned staged-artifact collection remains incomplete.", []Reference{
+			ref("internal/snapshottransfer/source_provider_test.go", "TestRetainedSourceProviderExportsAndObservesAfterReopen"), ref("internal/snapshottransfer/source_control_test.go", "TestSourceControlReleaseRequiresCompleteAndRecoversAcrossJournalReopen"), ref("internal/snapshottransfer/learner_install_test.go", "TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary"), ref("internal/snapshottransfer/release_test.go", "TestRepositoryRecoversEveryReleaseNamespacePhase"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
 		}},
 	},
 	{

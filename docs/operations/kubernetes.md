@@ -1,10 +1,10 @@
 # Run an RF3 test cluster on Kubernetes
 
 VibeDB includes a small, Helm-free manifest renderer for repeatable Kubernetes
-fault and lifecycle tests. The distributed runtime is unreleased and
-experimental. The renderer is not a topology controller: Kubernetes manages
-processes and volumes, while Raft and the replicated catalog remain the only
-leader, membership, ownership, and routing authorities.
+fault and lifecycle tests. The renderer is not a reconciliation watch-loop or
+topology controller: Kubernetes manages processes and volumes, while Raft and
+the replicated catalog remain the only leader, membership, ownership, and
+routing authorities.
 
 ## Build the image contract
 

@@ -1,16 +1,52 @@
-# Start a three-node replicated shard
+# Start a local three-node replicated cluster
 
-This guide prepares and starts one three-voter Raft shard and one gateway on a
-single host. Use it for development and fault testing. The distributed runtime
-is unreleased and experimental. Do not infer a production-readiness claim from
-this procedure.
+The shortest path prepares and starts one three-voter Raft group and one
+gateway on a single host. Use it for development and fault testing. The manual
+path later in this guide exposes the retained identities and manifests that an
+operator must own.
 
 VibeDB calls this topology **RF3**: one shard has three voting replicas. A
 write is acknowledged after Raft commits it to a quorum and the replicated
 state machine settles its durable result. RF3 is a replication factor, not a
 version number.
 
-## Before you begin
+## One-command development cluster
+
+Build the local orchestrator and the two serving commands beside it:
+
+```bash
+mkdir -p ./bin
+go build -o ./bin/vibedb ./cmd/vibedb
+go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
+go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+```
+
+Choose an empty absolute directory and start the cluster:
+
+```bash
+./bin/vibedb cluster dev --nodes 3 --root /tmp/vibedb-dev
+```
+
+The command generates a local CA and node certificates, a canonical
+authorization policy, a WAL key, three prepared member roots, a bootstrap
+catalog, and a durable gateway session journal. It reserves loopback ports,
+starts all three members, waits for them, starts the gateway, and prints the
+client endpoint only after every child reports ready. `SIGINT` or `SIGTERM`
+drains and reaps the child processes.
+
+Run the same command with the same root to reopen the retained cluster. It
+validates the canonical `cluster.vibejson` and completes a previously
+interrupted preparation without replacing existing member roots or identities.
+The generated credentials and `local-development-only` key reference are for
+one-host tests, not an operator credential lifecycle.
+
+`--nodes` is explicit but currently accepts exactly `3`. There is no RF1
+shortcut: a one-process mode would not exercise quorum commit, leader loss, or
+follower catch-up. To run processes separately, use the manual path below.
+
+## Manual preparation
+
+### Before you begin
 
 You need:
 
@@ -35,14 +71,25 @@ administration command. Test credential fixtures are not an operator API. The
 certificate extension, catalog identities, and preparation manifest must agree
 exactly.
 
-`serve-rf3` hosts one group per process. A gateway-backed data test therefore
-needs this three-process data group plus three separate `serve-rf3` processes
-for the catalog group. Repeat the preparation procedure with distinct group,
-shard, store, node, listener, and root identities for that group. Trusted code
-must then publish its initial catalog document. This guide does not invent a
-catalog creation command that the repository does not provide.
+The singleton manifest emitted by `prepare-rf3` opens one group. `serve-rf3`
+also accepts a strict common envelope with `groups` containing 1 through 64
+retained group bundles. Those groups share the process TLS identity, policy,
+listeners, bounded execution lanes, and one authenticated transport per peer;
+each group retains distinct WAL, SQL, apply, membership, and Raft identities.
+Duplicate retained paths, inconsistent node addresses, and duplicate group
+identities fail before any listener opens. A multi-group process cannot carry
+an enrolled replacement target yet because snapshot listeners and source
+control are still process-scoped rather than group-scoped.
 
-## 1. Build the commands
+A manually configured gateway-backed data test needs this data group plus a
+separately serving catalog group. The catalog replicas may be colocated with
+data replicas through a multi-group manifest or run as three separate
+`serve-rf3` processes. Repeat the preparation procedure with distinct group,
+shard, store, and retained-path identities for that group. Trusted code must
+then publish its initial catalog document. This guide does not invent a catalog
+creation command that the repository does not provide.
+
+### 1. Build the commands
 
 From the repository root:
 
@@ -52,7 +99,7 @@ go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
 go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
 ```
 
-## 2. Create the authorization policy
+### 2. Create the authorization policy
 
 Use the canonical capability order shown below. Principal entries must be
 ordered by binary node ID. This example grants the gateway the data and control
@@ -69,7 +116,7 @@ Save the bytes exactly as `/srv/vibedb/authorization-policy.vibejson`, without
 a trailing newline. Unknown, duplicate, escaped, or reordered security fields
 fail closed. Only the canonical `vibejson` spelling is security authority.
 
-## 3. Prepare three members
+### 3. Prepare three members
 
 `prepare-rf3` creates one complete member root atomically. It refuses an
 existing root. The input is exact output from `vibejson.Marshal`, with no
@@ -116,7 +163,7 @@ Protect both the source and retained copies.
 The WAL bounds become authenticated reopen parameters. They are not live
 tuning knobs after preparation.
 
-## 4. Start the three members
+### 4. Start the three members
 
 Open one terminal for each process:
 
@@ -136,7 +183,7 @@ Each process validates all retained identities before it listens. A ready
 member logs its member ID, replica-set version, and peer, native, snapshot, and
 control listener addresses. No RF3 plaintext mode exists.
 
-## 5. Validate and inspect the catalog bootstrap
+### 5. Validate and inspect the catalog bootstrap
 
 ```bash
 ./bin/vibedb-gateway validate -catalog ./cluster.vibejson
@@ -150,7 +197,7 @@ replicated catalog group is authoritative after startup.
 `-dev-static-catalog` is a separate loopback-only development mode and does not
 provide the RF3 operating contract described here.
 
-## 6. Start the gateway after the catalog group is ready
+### 6. Start the gateway after the catalog group is ready
 
 List every native or SQL shard address the catalog can resolve. Each
 `-shard-peer` binds an address to the expected TLS node identity.
@@ -181,7 +228,7 @@ mappings must agree exactly. Add the catalog-group native endpoints to
 operator-assigned addresses and identities are not derivable from the data
 group.
 
-## 7. Check a linearizable read
+### 7. Check a linearizable read
 
 The gateway protocol is newline-delimited canonical `vibejson`. Use a client
 certificate whose node identity has `data_read` authority.
@@ -200,7 +247,7 @@ That vector is not a global MVCC timestamp or a single wall-clock snapshot.
 The batch is all-or-nothing and has no participant-count policy cap. Request,
 result, worker, and in-flight byte bounds provide admission control.
 
-## 8. Stop and restart a member
+### 8. Stop and restart a member
 
 Send `SIGTERM` for an orderly stop or `SIGKILL` for a fault test. Restart with
 the generated manifest:
@@ -219,4 +266,5 @@ failure exercises.
 
 - [Operate the distributed runtime](distributed.md)
 - [Operate replica lifecycle](replica-lifecycle.md)
+- [Run the Kubernetes RF3 test lane](kubernetes.md)
 - [Check distributed feature state](../distributed-feature-state.md)
