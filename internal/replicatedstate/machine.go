@@ -1702,6 +1702,25 @@ func (m *Machine) RelationManifestDigest() ([sha256.Size]byte, error) {
 	return m.manifestDigest, nil
 }
 
+// ApplyContractDigest returns the immutable command/result semantics opened
+// with the current relation bundle. Schema rollout preparation uses it to bind
+// the exact old contract before proposing the ordered transition; a machine
+// already fenced by a committed transition fails closed.
+func (m *Machine) ApplyContractDigest() ([sha256.Size]byte, error) {
+	if m == nil {
+		return [sha256.Size]byte{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	if m.applyContract == ([sha256.Size]byte{}) {
+		return [sha256.Size]byte{}, ErrStateCorrupt
+	}
+	return m.applyContract, nil
+}
+
 // SessionCapacityState returns a read-only, constant-size view of the machine
 // state needed by Raft integration checks. A poisoned
 // machine fails closed instead of advertising its last publication as usable.

@@ -1648,6 +1648,21 @@ func (a *ReplicatedApply) RangeSplitRelationManifestDigest() ([sha256.Size]byte,
 	return a.machine.RelationManifestDigest()
 }
 
+// SchemaApplyContractDigest returns the exact replicated command/result
+// contract for schema rollout fencing. It never exposes the underlying state
+// machine and fails once an ordered schema transition has fenced this bundle.
+func (a *ReplicatedApply) SchemaApplyContractDigest() ([sha256.Size]byte, error) {
+	if a == nil || a.database == nil {
+		return [sha256.Size]byte{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return a.machine.ApplyContractDigest()
+}
+
 // RangeSplitCaptureCount is an O(1) recovery guard for a persisted capture
 // descriptor. Zero proves that no matching capture participant exists locally.
 func (a *ReplicatedApply) RangeSplitCaptureCount() (uint64, error) {

@@ -74,6 +74,10 @@ func TestMachineSchemaTransitionFencesOldBundleAndReopensExactTarget(t *testing.
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	if contract, err := fixture.machine.ApplyContractDigest(); err != nil ||
+		contract != fixture.machine.applyContract {
+		t.Fatalf("old apply contract = %x, %v", contract, err)
+	}
 	toBinding := fixture.binding
 	toBinding.SchemaGeneration++
 	relationSpecs := []RelationCollection{{
@@ -117,6 +121,9 @@ func TestMachineSchemaTransitionFencesOldBundleAndReopensExactTarget(t *testing.
 	}
 	if _, err := fixture.machine.RelationManifestDigest(); !errors.Is(err, ErrSchemaTransitionPending) {
 		t.Fatalf("old bundle remained usable: %v", err)
+	}
+	if _, err := fixture.machine.ApplyContractDigest(); !errors.Is(err, ErrSchemaTransitionPending) {
+		t.Fatalf("old apply contract remained observable: %v", err)
 	}
 	if replay, err := fixture.machine.ApplyNormal(meta, encoded); err != nil || replay.Applied != 2 {
 		t.Fatalf("exact replay = %+v, %v", replay, err)
