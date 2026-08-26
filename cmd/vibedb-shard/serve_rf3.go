@@ -146,7 +146,7 @@ func servePreparedRF3WithListen(
 	if err := rejectRF3UnappliedMembership(wal, publication.Applied); err != nil {
 		return closePrepared(err)
 	}
-	members, remoteNodes, dial, err := buildRF3Roster(
+	members, remoteNodes, dial, nativeAuthorized, err := buildRF3Roster(
 		manifest, group, base.Binding.MemberID, publication,
 	)
 	if err != nil {
@@ -172,14 +172,17 @@ func servePreparedRF3WithListen(
 		return closePrepared(fmt.Errorf("listen RF3 peer %q: %w", manifest.Listeners.Peer, err))
 	}
 	defer peerListener.Close()
-	nativeListener, err := listen("tcp", manifest.Listeners.Native)
-	if err != nil {
-		return errors.Join(
-			closePrepared(fmt.Errorf("listen RF3 native %q: %w", manifest.Listeners.Native, err)),
-			peerListener.Close(),
-		)
+	var nativeListener net.Listener
+	if nativeAuthorized {
+		nativeListener, err = listen("tcp", manifest.Listeners.Native)
+		if err != nil {
+			return errors.Join(
+				closePrepared(fmt.Errorf("listen RF3 native %q: %w", manifest.Listeners.Native, err)),
+				peerListener.Close(),
+			)
+		}
+		defer nativeListener.Close()
 	}
-	defer nativeListener.Close()
 	if cause := context.Cause(parent); cause != nil {
 		return closePrepared(componentShutdownError(cause))
 	}
@@ -239,15 +242,18 @@ func servePreparedRF3WithListen(
 	if err != nil {
 		return errors.Join(err, host.Close(), servingRegistry.Close())
 	}
-	server, err := shardservice.NewReplicatedServer(peer.Owner(), 64<<20, rf3RequestTimeout)
-	if err == nil {
-		err = server.BindAuthorization(gate, nil)
-	}
-	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	var server *shardservice.ReplicatedServer
+	if nativeAuthorized {
+		server, err = shardservice.NewReplicatedServer(peer.Owner(), 64<<20, rf3RequestTimeout)
+		if err == nil {
+			err = server.BindAuthorization(gate, nil)
+		}
+		if err != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		}
 	}
 
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
@@ -273,16 +279,21 @@ func servePreparedRF3WithListen(
 
 	pulseDone := make(chan struct{})
 	go runRF3Pulse(peerCtx, pulse, pulseDone)
-	nativeDone := make(chan error, 1)
-	go func() {
-		nativeDone <- server.ServeAuthenticated(
-			nativeCtx, nativeListener, nativeTLS, deadline, 64, 16,
-		)
-	}()
+	var nativeDone chan error
+	nativeAddress := "fenced"
+	if nativeAuthorized {
+		nativeDone = make(chan error, 1)
+		nativeAddress = nativeListener.Addr().String()
+		go func() {
+			nativeDone <- server.ServeAuthenticated(
+				nativeCtx, nativeListener, nativeTLS, deadline, 64, 16,
+			)
+		}()
+	}
 	fmt.Fprintf(os.Stderr,
 		"vibedb-shard RF3 ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s\n",
 		base.Binding.Distribution, base.Binding.Shard, base.Binding.MemberID,
-		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeListener.Addr(),
+		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress,
 	)
 
 	var primary error
@@ -298,9 +309,11 @@ func servePreparedRF3WithListen(
 	}
 
 	// Fence and join client ingress before retiring Owner/Host/runtime.
-	stopNative(context.Canceled)
-	if !nativeFinished {
-		primary = errors.Join(primary, componentShutdownError(<-nativeDone))
+	if nativeAuthorized {
+		stopNative(context.Canceled)
+		if !nativeFinished {
+			primary = errors.Join(primary, componentShutdownError(<-nativeDone))
+		}
 	}
 	stopPeer(context.Canceled)
 	if !peerFinished {
@@ -467,37 +480,55 @@ func buildRF3Roster(
 	group raftmember.GroupKey,
 	localMember uint64,
 	publication raftmodel.Publication,
-) ([]rafttransport.Member, []rafttransport.NodeID, rafttransport.RawPeerDialFunc, error) {
+) ([]rafttransport.Member, []rafttransport.NodeID, rafttransport.RawPeerDialFunc, bool, error) {
 	conf := publication.ConfState
-	if publication.ReplicaSetVersion == 0 || conf == nil ||
-		len(conf.GetVoters()) != rf3ManifestMembers || len(conf.GetLearners()) != 0 ||
+	if publication.ReplicaSetVersion == 0 ||
+		raftmodel.ValidateConfState(conf, publication.ReplicaSetVersion) != nil ||
 		len(conf.GetVotersOutgoing()) != 0 || len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() {
-		return nil, nil, nil, fmt.Errorf("%w: durable membership is not stable RF3", errRF3Serving)
+		return nil, nil, nil, false, fmt.Errorf("%w: unsupported durable membership cut", errRF3Serving)
 	}
-	voters := conf.GetVoters()
-	members := make([]rafttransport.Member, rf3ManifestMembers)
-	remote := make([]rafttransport.NodeID, 0, rf3ManifestMembers-1)
+	voters, learners := conf.GetVoters(), conf.GetLearners()
+	configured := make([]rf3ManifestMember, 0, rf3ManifestMembers+1)
+	configured = append(configured, manifest.Members[:]...)
+	if target := manifest.EnrolledTarget; target != nil {
+		configured = append(configured, rf3ManifestMember{
+			MemberID: target.MemberID, NodeID: target.NodeID, PeerAddress: target.PeerAddress,
+		})
+	}
+	if !supportedRF3MembershipCut(manifest, voters, learners) {
+		return nil, nil, nil, false, fmt.Errorf("%w: durable membership differs from enrolled roster", errRF3Serving)
+	}
+	members := make([]rafttransport.Member, len(configured))
+	remote := make([]rafttransport.NodeID, 0, len(configured)-1)
 	localFound := false
-	var nodes [rf3ManifestMembers]rafttransport.NodeID
-	var addresses [rf3ManifestMembers]string
-	for index, configured := range manifest.Members {
-		if configured.MemberID != voters[index] {
-			return nil, nil, nil, fmt.Errorf("%w: manifest roster differs from durable voters", errRF3Serving)
+	localNativeAuthorized := false
+	nodes := make([]rafttransport.NodeID, len(configured))
+	addresses := make([]string, len(configured))
+	for index, configured := range configured {
+		role := rafttransport.MemberEnrolled
+		if slices.Contains(voters, configured.MemberID) {
+			role = rafttransport.MemberVoter
+		} else if slices.Contains(learners, configured.MemberID) {
+			role = rafttransport.MemberLearner
 		}
 		members[index] = rafttransport.Member{
 			Group: group, ReplicaSetVersion: publication.ReplicaSetVersion,
 			MemberID: configured.MemberID, Node: configured.NodeID,
-			Role: rafttransport.MemberVoter,
+			Role: role,
 		}
 		nodes[index], addresses[index] = configured.NodeID, configured.PeerAddress
 		if configured.MemberID == localMember {
 			localFound = true
+			localNativeAuthorized = role == rafttransport.MemberVoter &&
+				(manifest.EnrolledTarget == nil ||
+					configured.MemberID != manifest.EnrolledTarget.MemberID ||
+					len(voters) == rf3ManifestMembers)
 		} else {
 			remote = append(remote, configured.NodeID)
 		}
 	}
-	if !localFound || !slices.IsSorted(voters) {
-		return nil, nil, nil, fmt.Errorf("%w: retained member is absent from durable voters", errRF3Serving)
+	if !localFound {
+		return nil, nil, nil, false, fmt.Errorf("%w: retained member is absent from enrolled roster", errRF3Serving)
 	}
 	dialer := net.Dialer{Timeout: rf3NetworkTimeout}
 	dial := func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
@@ -508,7 +539,41 @@ func buildRF3Roster(
 		}
 		return nil, rafttransport.ErrNodeNotFound
 	}
-	return members, remote, dial, nil
+	return members, remote, dial, localNativeAuthorized, nil
+}
+
+func supportedRF3MembershipCut(
+	manifest rf3Manifest,
+	voters, learners []uint64,
+) bool {
+	base := []uint64{
+		manifest.Members[0].MemberID,
+		manifest.Members[1].MemberID,
+		manifest.Members[2].MemberID,
+	}
+	if target := manifest.EnrolledTarget; target != nil {
+		if len(learners) == 1 && learners[0] == target.MemberID && slices.Equal(voters, base) {
+			return true
+		}
+		if len(learners) != 0 {
+			return false
+		}
+		all := append(slices.Clone(base), target.MemberID)
+		slices.Sort(all)
+		if slices.Equal(voters, base) || slices.Equal(voters, all) {
+			return true
+		}
+		if len(voters) != rf3ManifestMembers || !slices.Contains(voters, target.MemberID) {
+			return false
+		}
+		for _, voter := range voters {
+			if voter != target.MemberID && !slices.Contains(base, voter) {
+				return false
+			}
+		}
+		return true
+	}
+	return len(learners) == 0 && slices.Equal(voters, base)
 }
 
 func commandFenceFromPublication(
