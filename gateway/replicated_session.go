@@ -244,6 +244,87 @@ type NativeSessionStatus struct {
 	Released      bool
 }
 
+// NativeSessionMatchesControlBinding reports whether session is the dedicated
+// durable controller session for one exact live serving fence. It deliberately
+// checks the member/store incarnation against the route's authenticated replica
+// set as well as every apply-visible command generation. A controller can use
+// this before handing destructive work to NativeSession without exposing or
+// copying the session's private route and journal state.
+func NativeSessionMatchesControlBinding(
+	session *NativeSession,
+	fence raftservice.ServingFence,
+	tenant []byte,
+	clientID replication.ID128,
+	relation replication.RelationID,
+	capability serviceauthz.Capability,
+) bool {
+	if session == nil || session.journal == nil || clientID == (replication.ID128{}) ||
+		relation == 0 || !fence.Command.Valid() || fence.MemberID == 0 ||
+		fence.StoreID == ([16]byte{}) || fence.NodeIncarnation == 0 || fence.Term == 0 ||
+		session.clientID != clientID || !bytes.Equal(session.tenant, tenant) ||
+		session.proposalCapability != capability ||
+		nativeSessionBaseRelation(session) != relation ||
+		session.route.Group != fence.Group ||
+		session.route.AllocationGeneration != fence.AllocationGeneration ||
+		session.route.Command != fence.Command {
+		return false
+	}
+	for index := range session.route.Replicas {
+		replica := session.route.Replicas[index]
+		if replica.Member == fence.MemberID && replica.StoreID == fence.StoreID &&
+			replica.NodeIncarnation == fence.NodeIncarnation {
+			return true
+		}
+	}
+	return false
+}
+
+// NativeSessionSupportsMutationBound proves that every single-relation delete
+// batch inside the supplied independent key-count/key-byte ceilings fits the
+// session's configured relation, mutation, and exact canonical command bounds.
+// It is a cold controller-construction check; the serving hot path remains
+// allocation-free apart from its preallocated command workspace.
+func NativeSessionSupportsMutationBound(
+	session *NativeSession,
+	relation replication.RelationID,
+	maxKeys, maxKeyBytes int,
+) bool {
+	if session == nil || relation == 0 || relation > replication.MaxRelationID ||
+		maxKeys <= 0 || maxKeys > session.bundle.maxMutations ||
+		maxKeyBytes <= 0 || maxKeyBytes > replication.MaxCommandBytes ||
+		nativeSessionBaseRelation(session) != relation {
+		return false
+	}
+	count := maxKeys
+	if count > maxKeyBytes {
+		count = maxKeyBytes
+	}
+	if count <= 0 || maxKeyBytes > count*replication.MaxMutationKeyBytes {
+		return false
+	}
+	largest := (maxKeyBytes + count - 1) / count
+	dummy := make([]byte, largest)
+	mutations := make([]replication.Mutation, count)
+	remaining := maxKeyBytes
+	for index := range mutations {
+		left := count - index
+		size := (remaining + left - 1) / left
+		mutations[index] = replication.Mutation{
+			Kind: replication.MutationDelete, Key: dummy[:size],
+		}
+		remaining -= size
+	}
+	command := session.commandHeader(
+		replication.CommandMutationBatch, session.epoch, session.nextSequence, session.ackThrough,
+	)
+	command.Fingerprint = replication.Digest{1}
+	command.Batches = []replication.RelationMutationBatch{{
+		Relation: relation, Mutations: mutations,
+	}}
+	size, err := replication.CommandSize(command)
+	return err == nil && size <= session.maxCommand-replication.RetainedPruneProofBytes
+}
+
 // NativeResult carries a canonical completion. Release is the one lifecycle
 // operation whose durable postcondition is reported as a typed no-completion
 // result; Released distinguishes that successful path.
@@ -423,6 +504,31 @@ func (session *NativeSession) MutateBatch(
 	ctx context.Context,
 	mutations []NativeMutation,
 ) (NativeResult, error) {
+	return session.mutateBatch(ctx, mutations, replication.Digest{}, false)
+}
+
+// RetainedPruneBatch proposes the dedicated topology-only physical cleanup
+// command. Ordinary data and topology mutations cannot opt into its sealed-away
+// ownership semantics.
+func (session *NativeSession) RetainedPruneBatch(
+	ctx context.Context,
+	mutations []NativeMutation,
+	proof replication.RetainedPruneProof,
+) (NativeResult, error) {
+	if session == nil || session.proposalCapability != serviceauthz.CapabilityTopology ||
+		!proof.Valid() {
+		return NativeResult{}, sessionStateError(session)
+	}
+	return session.mutateBatch(ctx, mutations, proof.BatchDigest, true, &proof)
+}
+
+func (session *NativeSession) mutateBatch(
+	ctx context.Context,
+	mutations []NativeMutation,
+	fingerprint replication.Digest,
+	preserveFingerprint bool,
+	prune ...*replication.RetainedPruneProof,
+) (NativeResult, error) {
 	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
 		session.proposalCapability == serviceauthz.CapabilityExecutionPin ||
 		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
@@ -449,8 +555,16 @@ func (session *NativeSession) MutateBatch(
 	command := session.commandHeader(
 		replication.CommandMutationBatch, session.epoch, session.nextSequence, session.ackThrough,
 	)
+	if len(prune) == 1 && prune[0] != nil {
+		command.Kind = replication.CommandRetainedPrune
+		command.RetainedPrune = *prune[0]
+	} else if len(prune) != 0 {
+		session.bundle.reset()
+		return NativeResult{}, ErrNativeSession
+	}
+	command.Fingerprint = fingerprint
 	command.Batches = session.bundle.batches
-	result, err := session.prepareAndExecute(ctx, command, false)
+	result, err := session.prepareAndExecute(ctx, command, preserveFingerprint)
 	session.bundle.reset()
 	return result, err
 }
@@ -881,7 +995,7 @@ func nativeCompletionMatches(
 
 func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) bool {
 	switch kind {
-	case replication.CommandMutationBatch:
+	case replication.CommandMutationBatch, replication.CommandRetainedPrune:
 		switch result {
 		case replicatedstate.ResultApplied,
 			replicatedstate.ResultStaleFence,

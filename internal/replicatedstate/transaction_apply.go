@@ -136,6 +136,10 @@ func (m *Machine) planTransactionCommand(
 			plan, control, existing.TransactionControl, applied, commandDigest,
 			storageKey, systemSnapshot,
 		)
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return m.planCoordinatorRecoveryPulse(
+			plan, control, existing.TransactionControl, applied, commandDigest, storageKey,
+		)
 	case distributedtxn.ReplicatedStageParticipant:
 		return m.planParticipantStage(
 			plan, command, control, applied, commandDigest, storageKey, systemSnapshot,
@@ -167,6 +171,30 @@ func (m *Machine) planTransactionCommand(
 	default:
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
+}
+
+func (m *Machine) planCoordinatorRecoveryPulse(
+	plan transactionCommandPlan,
+	control distributedtxn.ReplicatedCommand,
+	existing TransactionControl,
+	applied uint64,
+	commandDigest replication.Digest,
+	controlKey [transactionControlStorageKeyBytes]byte,
+) (transactionCommandPlan, error) {
+	if distributedtxn.CoordinatorState(existing.State) != distributedtxn.CoordinatorStaging ||
+		existing.RecoveryPulse == math.MaxUint8 ||
+		control.RecoveryPulse != existing.RecoveryPulse+1 {
+		return transactionConflict(plan), nil
+	}
+	existing.RecoveryPulse = control.RecoveryPulse
+	stampTransactionWitness(&existing, control, commandDigest, applied, ResultApplied)
+	encoded, err := AppendTransactionControl(nil, existing)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	plan.rows = append(plan.rows, newTransactionPut(controlKey[:], encoded))
+	plan.command.resultCode = ResultApplied
+	return plan, nil
 }
 
 func (m *Machine) planParticipantAbortFence(
@@ -1290,7 +1318,7 @@ func (m *Machine) planStoredTransactionMutations(
 			return nil, nil, dataChain, 0, ResultUnknownRelation, nil
 		}
 		changes, batchAffectedRows, code, err := m.planMutations(
-			&m.relations[ordinal], batch, snapshots.values[ordinal], nil,
+			&m.relations[ordinal], batch, snapshots.values[ordinal], nil, false,
 		)
 		if err != nil {
 			return nil, nil, dataChain, 0, 0, err

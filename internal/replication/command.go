@@ -35,6 +35,7 @@ var executionPinAuthorityDigestDomain = []byte("vibedb/execution-pin/catalog-aut
 const (
 	transactionCoordinatorEpoch       = uint64(1)
 	transactionParticipantEpoch       = uint64(2)
+	transactionCoordinatorPulseTag    = uint64(1) << 62
 	transactionCoordinatorDecisionTag = uint64(2) << 62
 	transactionCoordinatorRetireTag   = uint64(3) << 62
 	transactionCoordinatorRevisionMax = uint64(1) << 62
@@ -108,6 +109,8 @@ type Command struct {
 	// Batches retains the shared multi-relation mutation payload used by data
 	// and transaction commands; control commands require it to be empty.
 	Batches []RelationMutationBatch
+	// RetainedPrune is present only for CommandRetainedPrune.
+	RetainedPrune RetainedPruneProof
 }
 
 // CommandView is a checksum- and semantics-validated borrowed command. Its
@@ -150,6 +153,7 @@ type CommandView struct {
 	requestLedgerBytes []byte
 	routeGateBytes     []byte
 	executionPinBytes  []byte
+	retainedPrune      RetainedPruneProof
 	relationBytes      []byte
 	mutationCount      uint32
 	relationCount      uint16
@@ -279,6 +283,12 @@ func (v CommandView) OpenExecutionPin() (executionpin.Command, error) {
 		return executionpin.Command{}, ErrEnvelopeSemantic
 	}
 	return executionpin.OpenCommand(v.executionPinBytes)
+}
+
+// RetainedPruneProof returns the validated fixed proof carried by a retained
+// prune command. Other command kinds return ok=false.
+func (v CommandView) RetainedPruneProof() (RetainedPruneProof, bool) {
+	return v.retainedPrune, v.kind == CommandRetainedPrune && v.retainedPrune.Valid()
 }
 
 // ExecutionPinAuthorityDigest returns the portable authority witness sealed in
@@ -584,6 +594,10 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	if command.Kind == CommandExecutionPin {
 		cursor += copy(frame[cursor:], command.ExecutionPin)
 	}
+	if command.Kind == CommandRetainedPrune {
+		putRetainedPruneProof(frame[cursor:cursor+retainedPruneProofBytes], command.RetainedPrune)
+		cursor += retainedPruneProofBytes
+	}
 	for batchIndex := range command.Batches {
 		batch := &command.Batches[batchIndex]
 		headerAt := -1
@@ -711,6 +725,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireRouteGate
 	case CommandExecutionPin:
 		return commandWireExecutionPin
+	case CommandRetainedPrune:
+		return commandWireRetainedPrune
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -772,6 +788,13 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 			return 0, ErrEnvelopeTooLarge
 		}
 	}
+	if command.Kind == CommandRetainedPrune {
+		var ok bool
+		total, ok = checkedAdd(total, retainedPruneProofBytes, MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
 	if len(command.Batches) > 1 {
 		var ok bool
 		total, ok = checkedAdd(
@@ -808,6 +831,9 @@ func validateCommandHeader(command Command) error {
 	if !validCommandAuthorityClass(command.AuthorityClass) {
 		return semantic("command authority class")
 	}
+	if command.Kind != CommandRetainedPrune && command.RetainedPrune != (RetainedPruneProof{}) {
+		return semantic("unrelated retained prune proof")
+	}
 	if (command.Kind == CommandRequestLedger) !=
 		(command.AuthorityClass == CommandAuthorityRequestLedger) {
 		return semantic("request ledger authority class")
@@ -820,13 +846,27 @@ func validateCommandHeader(command Command) error {
 		return semantic("execution-pin authority class")
 	}
 	switch command.Kind {
-	case CommandMutationBatch:
+	case CommandMutationBatch, CommandRetainedPrune:
 		if len(command.Transaction) != 0 || len(command.RequestLedger) != 0 ||
 			len(command.RouteGate) != 0 || len(command.ExecutionPin) != 0 {
 			return semantic("ordinary command carries transaction control")
 		}
 		if err := validateRelationBatches(command.Batches); err != nil {
 			return err
+		}
+		if command.Kind == CommandRetainedPrune {
+			if command.AuthorityClass != CommandAuthorityTopology ||
+				!command.RetainedPrune.Valid() ||
+				command.RetainedPrune.BatchDigest != command.Fingerprint {
+				return semantic("retained prune proof")
+			}
+			for batchIndex := range command.Batches {
+				for mutationIndex := range command.Batches[batchIndex].Mutations {
+					if command.Batches[batchIndex].Mutations[mutationIndex].Kind != MutationDelete {
+						return semantic("retained prune carries non-delete mutation")
+					}
+				}
+			}
 		}
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
@@ -1193,6 +1233,7 @@ type transactionControlMetadata struct {
 	expectedRevision uint64
 	mutationDigest   distributedtxn.Digest
 	manifestIndex    uint32
+	recoveryPulse    uint8
 }
 
 func validatedTransactionControl(raw []byte) (transactionControlMetadata, error) {
@@ -1203,6 +1244,7 @@ func validatedTransactionControl(raw []byte) (transactionControlMetadata, error)
 		role:             distributedtxn.ReplicatedRole(raw[5]),
 		operation:        distributedtxn.ReplicatedOperation(raw[6]),
 		expectedRevision: binary.LittleEndian.Uint64(raw[24:32]),
+		recoveryPulse:    raw[121],
 	}
 	copy(control.id[:], raw[32:48])
 	copy(control.mutationDigest[:], raw[88:120])
@@ -1255,6 +1297,8 @@ func transactionClientSequence(control transactionControlMetadata) (uint64, erro
 			return 0, semantic("transaction coordinator revision")
 		}
 		return transactionCoordinatorDecisionTag | control.expectedRevision, nil
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return transactionCoordinatorPulseTag | uint64(control.recoveryPulse), nil
 	case distributedtxn.ReplicatedRetireCoordinator:
 		if control.expectedRevision >= transactionCoordinatorRevisionMax {
 			return 0, semantic("transaction coordinator revision")
@@ -1408,7 +1452,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 	relationCount := binary.LittleEndian.Uint16(src[28:30])
 	inlineRelationID := RelationID(binary.LittleEndian.Uint16(src[30:32]))
 	switch kind {
-	case CommandMutationBatch:
+	case CommandMutationBatch, CommandRetainedPrune:
 		if count == 0 || uint64(count) > MaxMutations || relationCount == 0 ||
 			relationCount > MaxRelationBatches ||
 			(relationCount == 1) != (inlineRelationID != 0) ||
@@ -1496,13 +1540,38 @@ func OpenCommand(src []byte) (CommandView, error) {
 	}
 	payload := src[cursor:bodyEnd:bodyEnd]
 	switch kind {
-	case CommandMutationBatch:
+	case CommandMutationBatch, CommandRetainedPrune:
+		if kind == CommandRetainedPrune {
+			if authorityClass != CommandAuthorityTopology || len(payload) < retainedPruneProofBytes {
+				return CommandView{}, semantic("retained prune proof body")
+			}
+			proof, proofOK := openRetainedPruneProof(payload[:retainedPruneProofBytes])
+			if !proofOK || proof.BatchDigest != view.Fingerprint {
+				return CommandView{}, semantic("retained prune proof")
+			}
+			view.retainedPrune = proof
+			payload = payload[retainedPruneProofBytes:]
+		}
 		if err := validateRelationBytes(
 			payload, count, relationCount, inlineRelationID,
 		); err != nil {
 			return CommandView{}, err
 		}
 		view.relationBytes = payload
+		if kind == CommandRetainedPrune {
+			view.mutationCount = count
+			view.relationCount = relationCount
+			view.inlineRelationID = inlineRelationID
+			batches := view.RelationBatches()
+			for batches.Next() {
+				mutations := batches.Batch().Mutations()
+				for mutations.Next() {
+					if mutations.Mutation().Kind != MutationDelete {
+						return CommandView{}, semantic("retained prune carries non-delete mutation")
+					}
+				}
+			}
+		}
 	case CommandSessionOpen, CommandSessionRenew, CommandSessionRevoke:
 		if len(payload) != sessionLeaseBodyBytes {
 			return CommandView{}, semantic("session lease body length")
@@ -1625,6 +1694,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandRouteGate, true
 	case commandWireExecutionPin:
 		return CommandExecutionPin, true
+	case commandWireRetainedPrune:
+		return CommandRetainedPrune, true
 	default:
 		return 0, false
 	}

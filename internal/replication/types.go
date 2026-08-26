@@ -73,6 +73,7 @@ const (
 	commandWireRouteGate     = uint8(8)
 	commandWireRequestLedger = uint8(9)
 	commandWireExecutionPin  = uint8(10)
+	commandWireRetainedPrune = uint8(11)
 	sessionLeaseBodyBytes    = 16
 	transactionLengthBytes   = 4
 )
@@ -207,6 +208,10 @@ const (
 	// CommandExecutionPin orders one long-lived logical catalog/schema pin in
 	// the dedicated catalog RF3 group. It never carries user relation writes.
 	CommandExecutionPin CommandKind = 10
+	// CommandRetainedPrune deletes only rows proven to be outside the source's
+	// already-narrowed owned range. It is topology-only and carries one exact
+	// split/cut/batch proof plus ordinary relation delete frames.
+	CommandRetainedPrune CommandKind = 11
 )
 
 // MutationKind selects one logical relation mutation.

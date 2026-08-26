@@ -1262,6 +1262,19 @@ func (m *Machine) planBundleCommand(
 			plan.resultCode = ResultStaleFence
 			break
 		}
+		retainedPrune := false
+		if command.Kind() == replication.CommandRetainedPrune {
+			proof, ok := command.RetainedPruneProof()
+			binding := state.Binding
+			if !ok || proof.RetainedRange != binding.OwnedRange ||
+				proof.OwnershipEpoch != binding.OwnershipEpoch ||
+				proof.RoutingVersion != binding.RoutingVersion ||
+				proof.RouteGeneration != binding.RouteGeneration {
+				plan.resultCode = ResultStaleFence
+				break
+			}
+			retainedPrune = true
+		}
 		if command.Kind() == replication.CommandExecutionPin {
 			var executionErr error
 			plan, executionErr = m.planExecutionPinCommand(
@@ -1298,7 +1311,7 @@ func (m *Machine) planBundleCommand(
 			}
 			relation := &m.relations[ordinal]
 			changes, affectedRows, code, planErr := m.planMutations(
-				relation, batch, relationSnapshots.values[ordinal], scratch,
+				relation, batch, relationSnapshots.values[ordinal], scratch, retainedPrune,
 			)
 			if planErr != nil {
 				return commandPlan{}, planErr
@@ -1708,6 +1721,7 @@ func (m *Machine) planMutations(
 	batch replication.RelationBatchView,
 	snapshot pointSnapshot,
 	scratch *commandPlanScratch,
+	retainedPrune bool,
 ) ([]finalMutation, int64, uint32, error) {
 	if relation == nil || relation.target.Collection == nil {
 		return nil, 0, 0, ErrInvalidCollection
@@ -1827,9 +1841,23 @@ func (m *Machine) planMutations(
 				validation = target.Validator.ValidatePut(mutation.key, mutation.value)
 			}
 			if validation == MutationValidationAccept {
-				validation = validateRelationMutationOwnership(
+				ownership := validateRelationMutationOwnership(
 					target.Validator, mutation, current, found, m.state.Binding.OwnedRange,
 				)
+				if retainedPrune {
+					switch {
+					case !mutation.delete:
+						validation = MutationValidationInvalid
+					case !found, ownership == MutationValidationWrongShard:
+						validation = MutationValidationAccept
+					case ownership == MutationValidationAccept:
+						validation = MutationValidationWrongShard
+					default:
+						validation = ownership
+					}
+				} else {
+					validation = ownership
+				}
 			}
 			switch validation {
 			case MutationValidationAccept:

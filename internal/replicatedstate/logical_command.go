@@ -66,6 +66,33 @@ func LogicalCommandDigest(command replication.CommandView) [32]byte {
 		_, _ = h.Write(length[:])
 		_, _ = h.Write(executionPin)
 	}
+	if command.Kind() == replication.CommandRetainedPrune {
+		proof, ok := command.RetainedPruneProof()
+		if !ok {
+			panic("replicatedstate: validated retained prune lost proof")
+		}
+		for _, digest := range [...]replication.Digest{
+			proof.OperationDigest, proof.CertificateDigest, proof.BatchDigest,
+			proof.DataChainDigest, proof.EntryDigest, proof.BaseDigest,
+		} {
+			_, _ = h.Write(digest[:])
+		}
+		for _, value := range [...]uint64{
+			proof.CutApplied, proof.CutTerm, proof.OwnershipEpoch,
+			proof.RoutingVersion, proof.RouteGeneration,
+		} {
+			binary.LittleEndian.PutUint64(scalar[:], value)
+			_, _ = h.Write(scalar[:])
+		}
+		_, _ = h.Write(proof.RetainedRange.Start[:])
+		_, _ = h.Write(proof.RetainedRange.End.Point[:])
+		if proof.RetainedRange.End.Max {
+			marker[0] = 1
+		} else {
+			marker[0] = 0
+		}
+		_, _ = h.Write(marker[:])
+	}
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = h.Write(scalar[:])
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.MutationCount()))
