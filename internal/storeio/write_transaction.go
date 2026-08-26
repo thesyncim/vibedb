@@ -252,6 +252,16 @@ func (t *WriteTransaction) Reset(
 	return nil
 }
 
+// SetPublicationDescriptor attaches the canonical logical mutation batch that
+// produced this transaction. The committer borrows descriptor until Publish or
+// Abort; no copy or string conversion occurs on the publication hot path.
+func (t *WriteTransaction) SetPublicationDescriptor(descriptor []byte) error {
+	if t == nil || !t.active || t.batch == nil || len(descriptor) == 0 {
+		return ErrBatchState
+	}
+	return t.batch.SetPublicationDescriptor(descriptor)
+}
+
 // BeginHybridWriteTransaction acquires one copy-on-write transaction whose
 // immutable pages share a crash-safe publication with patchWriteCount
 // journal-covered canonical writes. The caller prepares and seals the journal

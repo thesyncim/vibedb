@@ -68,6 +68,10 @@ type CommitterOptions struct {
 	// because that caller's acknowledgement is what the delay would be charged
 	// to and it cannot produce the neighbour being waited for.
 	CoalesceDelay time.Duration
+	// PublicationObserver runs synchronously at the single successful root-
+	// publication boundary, after admission/capacity checks and before the
+	// generation becomes visible. Descriptor is borrowed for the callback.
+	PublicationObserver func(generation uint64, descriptor []byte) error
 	// MaterializationDamageGranule explicitly qualifies the largest complete
 	// sector a power loss may damage. Zero disables canonical in-place
 	// materialization. A non-zero value must be supported by the journal codec;
@@ -185,6 +189,17 @@ type Batch struct {
 	generation                    uint64
 	index                         uint32
 	state                         atomic.Uint32
+	publicationDescriptor         []byte
+}
+
+// SetPublicationDescriptor attaches a canonical logical mutation batch to the
+// next publication. The slice is borrowed until Publish or Abort.
+func (b *Batch) SetPublicationDescriptor(descriptor []byte) error {
+	if b == nil || b.state.Load() != batchOwned || len(descriptor) == 0 {
+		return ErrBatchState
+	}
+	b.publicationDescriptor = descriptor
+	return nil
 }
 
 // ResizePages returns unused trailing page buffers before publication. It is
@@ -711,6 +726,11 @@ func (c *Committer) publishRetiring(
 			return superseded, ErrCheckpointRequired
 		}
 		return superseded, ErrQueueFull
+	}
+	if observer := c.options.PublicationObserver; observer != nil {
+		if err := observer(generation, batch.publicationDescriptor); err != nil {
+			return superseded, err
+		}
 	}
 	if batch.materialized {
 		batch.journalSlot = c.materializationNextSlot.Load()
