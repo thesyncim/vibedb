@@ -105,6 +105,8 @@ const (
 	requestReadTransaction
 	requestReadRequestLedger
 	requestReplicaObservation
+	requestOwnershipTransition
+	requestReplicaRetirement
 )
 
 const (
@@ -132,6 +134,9 @@ type ownerRequest struct {
 	membership   MembershipRequest
 	read         readRequest
 	targetMember uint64
+	operation    [32]byte
+	step         [32]byte
+	sourceMember uint64
 }
 
 type ownerReply struct {
@@ -520,6 +525,20 @@ type ownerMember struct {
 	command  CommandFence
 	read     ReadSource
 	recovery TransactionRecoverySource
+	retiring bool
+}
+
+// ReplicaRetirementRequest is the exact final local-source fence for one
+// replicated replica move. Operation and Step bind the call to its durable
+// controller journal; the Owner independently proves that SourceMember is no
+// longer a voter and TargetMember is the current leader before closing the
+// Runtime. No caller receives raw Host access.
+type ReplicaRetirementRequest struct {
+	Operation    [32]byte
+	Step         [32]byte
+	Fence        ServingFence
+	SourceMember uint64
+	TargetMember uint64
 }
 
 type MembershipKind uint8
@@ -852,6 +871,13 @@ func (owner *Owner) handle(request ownerRequest) error {
 		if reply.err == nil {
 			reply.observation.State, reply.err = owner.host.SnapshotState(request.group)
 		}
+		if reply.err == nil {
+			reply.err = owner.syncCommandFenceFromState(request.group, reply.observation)
+		}
+	case requestOwnershipTransition:
+		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
+	case requestReplicaRetirement:
+		reply.err = owner.retireReplica(request)
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger:
 		member, found := owner.members[request.group]
 		if !found ||
@@ -927,6 +953,37 @@ func (owner *Owner) handle(request ownerRequest) error {
 	return reply.err
 }
 
+func (owner *Owner) syncCommandFenceFromState(
+	group raftmember.GroupKey,
+	observation ReplicaObservation,
+) error {
+	member, found := owner.members[group]
+	if !found {
+		return multiraft.ErrGroupNotFound
+	}
+	binding := observation.State.Binding
+	if binding.ClusterID != group.ClusterID || binding.ClusterIncarnation != group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != group.ShardIncarnation || binding.GroupID != group.GroupID ||
+		binding.AllocationGeneration != member.identity.AllocationGeneration ||
+		observation.Publication.ReplicaSetVersion == 0 ||
+		observation.State.ReplicaSetVersion != observation.Publication.ReplicaSetVersion ||
+		binding.ActivePolicyGeneration == 0 || binding.ProtectionEpoch == 0 ||
+		binding.OwnershipEpoch == 0 || binding.SchemaGeneration == 0 ||
+		binding.RoutingVersion == 0 || binding.RouteGeneration == 0 {
+		return ErrServingFence
+	}
+	member.command.ReplicaSetVersion = observation.Publication.ReplicaSetVersion
+	member.command.ActivePolicyGeneration = binding.ActivePolicyGeneration
+	member.command.ProtectionEpoch = binding.ProtectionEpoch
+	member.command.OwnershipEpoch = binding.OwnershipEpoch
+	member.command.SchemaGeneration = binding.SchemaGeneration
+	member.command.RoutingVersion = binding.RoutingVersion
+	member.command.RouteGeneration = binding.RouteGeneration
+	owner.members[group] = member
+	return nil
+}
+
 func (owner *Owner) nextReadContext(incarnation uint64) ([16]byte, error) {
 	if owner.readSequence == ^uint64(0) || len(owner.pendingReads) >= owner.limits.MaxPendingReadItems {
 		return [16]byte{}, ErrIngressFull
@@ -988,11 +1045,130 @@ func servingFenceMatchesIdentity(
 	member ownerMember,
 ) bool {
 	identity := member.identity
-	return fence.Group == identity.Group &&
+	return !member.retiring && fence.Group == identity.Group &&
 		fence.AllocationGeneration == identity.AllocationGeneration &&
 		fence.Command == member.command &&
 		fence.MemberID == identity.MemberID && fence.StoreID == identity.StoreID &&
 		fence.NodeIncarnation == identity.NodeIncarnation && fence.Term != 0
+}
+
+func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte) error {
+	member, found := owner.members[fence.Group]
+	if !found || !servingFenceMatchesIdentity(fence, member) {
+		return ErrServingFence
+	}
+	transition, err := replicatedstate.OpenOwnershipTransition(command)
+	if err != nil || !ownershipTransitionMatchesFence(transition, fence) {
+		return errors.Join(err, ErrServingFence)
+	}
+	publication, err := owner.host.Publication(fence.Group)
+	if err != nil || publication.ReplicaSetVersion != transition.ExpectedReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	status, err := owner.host.Status(fence.Group)
+	if err != nil {
+		return err
+	}
+	if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+		status.Term != fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	return owner.host.EnqueueProposal(fence.Group, command)
+}
+
+func ownershipTransitionMatchesFence(
+	transition replicatedstate.OwnershipTransitionView,
+	fence ServingFence,
+) bool {
+	return transition.ClusterID == fence.Group.ClusterID &&
+		transition.ClusterIncarnation == fence.Group.ClusterIncarnation &&
+		transition.TopologyRecoveryEpoch == fence.Group.TopologyRecoveryEpoch &&
+		transition.ShardIncarnation == fence.Group.ShardIncarnation &&
+		transition.GroupID == fence.Group.GroupID &&
+		transition.AllocationGeneration == fence.AllocationGeneration &&
+		transition.ExpectedReplicaSetVersion == fence.Command.ReplicaSetVersion &&
+		transition.ActivePolicyGeneration == fence.Command.ActivePolicyGeneration &&
+		transition.ProtectionEpoch == fence.Command.ProtectionEpoch &&
+		transition.OwnershipEpoch == fence.Command.OwnershipEpoch &&
+		transition.SchemaGeneration == fence.Command.SchemaGeneration &&
+		transition.RoutingVersion == fence.Command.RoutingVersion &&
+		transition.RouteGeneration == fence.Command.RouteGeneration
+}
+
+func (owner *Owner) retireReplica(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found {
+		return multiraft.ErrGroupNotFound
+	}
+	// A retry after ErrGroupBusy remains authorized by the exact latched member
+	// identity, but the retiring bit permanently fences data serving.
+	wasRetiring := member.retiring
+	member.retiring = false
+	validFence := servingFenceMatchesIdentity(request.fence, member)
+	member.retiring = wasRetiring
+	if !validFence || request.operation == ([32]byte{}) || request.step == ([32]byte{}) ||
+		request.sourceMember != member.identity.MemberID || request.targetMember == 0 ||
+		request.targetMember == request.sourceMember {
+		return ErrServingFence
+	}
+	publication, err := owner.host.Publication(request.group)
+	if err != nil || publication.ReplicaSetVersion != request.fence.Command.ReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	state, err := owner.host.SnapshotState(request.group)
+	if err != nil || !retirementStateMatches(state, request.fence, request.sourceMember,
+		request.targetMember) {
+		return errors.Join(err, ErrServingFence)
+	}
+	status, err := owner.host.Status(request.group)
+	if err != nil {
+		return err
+	}
+	if status.LeaderID != request.targetMember || status.Term != request.fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	member.retiring = true
+	owner.members[request.group] = member
+	if err = owner.host.Remove(request.group); err != nil {
+		return err
+	}
+	delete(owner.members, request.group)
+	for index, group := range owner.groups {
+		if group != request.group {
+			continue
+		}
+		copy(owner.groups[index:], owner.groups[index+1:])
+		owner.groups = owner.groups[:len(owner.groups)-1]
+		break
+	}
+	return nil
+}
+
+func retirementStateMatches(
+	state replicatedstate.State,
+	fence ServingFence,
+	sourceMember, targetMember uint64,
+) bool {
+	binding := state.Binding
+	if binding.ClusterID != fence.Group.ClusterID ||
+		binding.ClusterIncarnation != fence.Group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != fence.Group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != fence.Group.ShardIncarnation ||
+		binding.GroupID != fence.Group.GroupID ||
+		binding.AllocationGeneration != fence.AllocationGeneration ||
+		binding.ActivePolicyGeneration != fence.Command.ActivePolicyGeneration ||
+		binding.ProtectionEpoch != fence.Command.ProtectionEpoch ||
+		binding.OwnershipEpoch != fence.Command.OwnershipEpoch ||
+		binding.SchemaGeneration != fence.Command.SchemaGeneration ||
+		binding.RoutingVersion != fence.Command.RoutingVersion ||
+		binding.RouteGeneration != fence.Command.RouteGeneration ||
+		state.ReplicaSetVersion != fence.Command.ReplicaSetVersion ||
+		len(state.ConfState.GetVotersOutgoing()) != 0 ||
+		len(state.ConfState.GetLearnersNext()) != 0 || state.ConfState.GetAutoLeave() {
+		return false
+	}
+	voters := state.ConfState.GetVoters()
+	return !containsSorted(voters, sourceMember) && containsSorted(voters, targetMember)
 }
 
 func commandMatchesFence(command replication.CommandView, fence ServingFence) bool {
@@ -1769,6 +1945,60 @@ func (owner *Owner) ApplyMembership(ctx context.Context, request MembershipReque
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestMembership, group: request.Fence.Group,
 		membership: request, reply: make(chan ownerReply, 1),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	return err
+}
+
+// ProposeOwnershipTransition admits one canonical ownership transition through
+// the serialized Owner lane. A nil result means the exact bytes entered the
+// bounded Host queue, not that they applied. Callers settle the outcome from
+// ObserveReplica and must replay the same operation/step on uncertainty.
+func (owner *Owner) ProposeOwnershipTransition(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) error {
+	if owner == nil || ctx == nil || len(command) == 0 ||
+		len(command) > replicatedstate.MaxOwnershipTransitionBytes {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	reply := make(chan ownerReply, 1)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestOwnershipTransition, group: fence.Group, fence: fence,
+		data: command, reply: reply, bytes: int64(len(command)),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	return err
+}
+
+// RetireReplicaSource permanently fences the local member before removing its
+// quiescent Runtime through the sole Host owner. ErrGroupBusy is retryable; the
+// serving fence remains latched while the lane drains. ErrGroupNotFound is
+// settled only by a caller that already durably journaled this exact request.
+func (owner *Owner) RetireReplicaSource(
+	ctx context.Context,
+	request ReplicaRetirementRequest,
+) error {
+	if owner == nil || ctx == nil || request.Operation == ([32]byte{}) ||
+		request.Step == ([32]byte{}) || request.SourceMember == 0 ||
+		request.TargetMember == 0 || request.SourceMember == request.TargetMember {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestReplicaRetirement, group: request.Fence.Group, fence: request.Fence,
+		operation: request.Operation, step: request.Step, sourceMember: request.SourceMember,
+		targetMember: request.TargetMember, reply: make(chan ownerReply, 1),
 	})
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
