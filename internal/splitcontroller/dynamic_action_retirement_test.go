@@ -52,7 +52,11 @@ func TestTerminalSplitOperationRetirementRevokesAllLiveStateAndIsIdempotent(t *t
 		t.Fatal(err)
 	}
 	_, manifest := runtimeStoreIdentity()
-	registry, err := OpenRuntimeStoreRegistry(preparedRuntimeRoot(t), manifest, 1, nil)
+	runtimeAuthority := &runtimeTerminalAuthorityStub{
+		operation: operation, manifest: manifest,
+		proof: sha256.Sum256([]byte("manifest terminal proof")), terminal: true,
+	}
+	registry, err := OpenRuntimeStoreRegistry(preparedRuntimeRoot(t), manifest, 1, runtimeAuthority)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +67,7 @@ func TestTerminalSplitOperationRetirementRevokesAllLiveStateAndIsIdempotent(t *t
 	}
 	binder.limit = 1
 	binder.active = map[OperationID]boundPlanAdmission{
-		operation: {digest: admission.PlanDigest, leases: []*RuntimeStoreLease{lease}},
+		operation: {digest: admission.PlanDigest, leases: []*RuntimeStoreLease{lease}, registries: []*RuntimeStoreRegistry{registry}},
 	}
 	grantKey := shardActionGrantKey{
 		operation: operation, digest: admission.PlanDigest,
@@ -108,6 +112,12 @@ func TestTerminalSplitOperationRetirementRevokesAllLiveStateAndIsIdempotent(t *t
 	}
 	if _, err = lease.PinnedStore(); !errors.Is(err, ErrRuntimeStore) {
 		t.Fatalf("retained lease remained usable: %v", err)
+	}
+	if _, err = registry.Acquire(operation); !errors.Is(err, ErrRuntimeTerminal) {
+		t.Fatalf("terminal runtime directory remained acquirable: %v", err)
+	}
+	if runtimeAuthority.calls != 1 {
+		t.Fatalf("runtime terminal certifications=%d", runtimeAuthority.calls)
 	}
 	if err = retirer.RetireTerminalOperation(t.Context(), operation, admission.PlanDigest); err != nil {
 		t.Fatalf("idempotent retirement: %v", err)

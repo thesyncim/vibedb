@@ -109,7 +109,7 @@ func (retirer *TerminalSplitOperationRetirer) RetireTerminalOperation(
 		}
 	}
 	if retirer.binder != nil {
-		if err = retirer.binder.retire(operation, digest); err != nil {
+		if err = retirer.binder.retire(ctx, operation, digest); err != nil {
 			return errors.Join(ErrSplitOperationRetirement, err)
 		}
 	}

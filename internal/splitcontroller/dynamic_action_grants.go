@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -155,6 +156,7 @@ type boundPlanAdmission struct {
 	catalogGeneration uint64
 	catalogDigest     [32]byte
 	leases            []*RuntimeStoreLease
+	registries        []*RuntimeStoreRegistry
 }
 
 func NewBoundPlanAdmissionBinder(
@@ -221,6 +223,7 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 			digest: admission.PlanDigest, catalogGeneration: admission.CatalogGeneration,
 			catalogDigest: admission.CatalogDigest,
 			leases:        append(append([]*RuntimeStoreLease(nil), current.leases...), leases...),
+			registries:    mergeAdmissionRegistries(current.registries, leases),
 		}
 		return nil
 	}
@@ -245,6 +248,7 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 		digest: admission.PlanDigest, catalogGeneration: admission.CatalogGeneration,
 		catalogDigest: admission.CatalogDigest,
 		leases:        append([]*RuntimeStoreLease(nil), leases...),
+		registries:    mergeAdmissionRegistries(nil, leases),
 	}
 	return nil
 }
@@ -254,9 +258,9 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 // is idempotent. The admission stays indexed when any release reports an error,
 // allowing the terminal cleanup call to settle an outcome-unknown close.
 func (binder *BoundPlanAdmissionBinder) retire(
-	operation OperationID, digest [32]byte,
+	ctx context.Context, operation OperationID, digest [32]byte,
 ) error {
-	if binder == nil || operation == (OperationID{}) || digest == ([32]byte{}) {
+	if binder == nil || ctx == nil || operation == (OperationID{}) || digest == ([32]byte{}) {
 		return ErrRemoteExecution
 	}
 	binder.mu.Lock()
@@ -277,9 +281,33 @@ func (binder *BoundPlanAdmissionBinder) retire(
 		releaseErr = errors.Join(releaseErr, lease.Release())
 	}
 	if releaseErr == nil {
-		delete(binder.active, operation)
+		for _, registry := range current.registries {
+			if registry == nil || registry.authority == nil {
+				continue
+			}
+			_, releaseErr = registry.CollectTerminal(ctx, operation)
+			if releaseErr != nil {
+				break
+			}
+		}
+		if releaseErr == nil {
+			delete(binder.active, operation)
+		}
 	}
 	return releaseErr
+}
+
+func mergeAdmissionRegistries(
+	current []*RuntimeStoreRegistry, leases []*RuntimeStoreLease,
+) []*RuntimeStoreRegistry {
+	result := append([]*RuntimeStoreRegistry(nil), current...)
+	for _, lease := range leases {
+		if lease == nil || lease.registry == nil || slices.Contains(result, lease.registry) {
+			continue
+		}
+		result = append(result, lease.registry)
+	}
+	return result
 }
 
 func validShardActionGrant(grant ShardActionGrant) bool {
