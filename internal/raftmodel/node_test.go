@@ -333,6 +333,27 @@ func TestRecoveryReconcilesDurableSnapshotBeforeRawNode(t *testing.T) {
 	}
 }
 
+func TestReplaceStateMachineRequiresExactQuiescentPublication(t *testing.T) {
+	node, _, source := newTestNode(t, 1, []uint64{1})
+	target := *source
+	target.pub = clonePublication(source.pub)
+	if err := node.ReplaceStateMachine(&target); err != nil {
+		t.Fatal(err)
+	}
+	if node.machine != &target {
+		t.Fatal("replacement machine was not published")
+	}
+	mismatch := target
+	mismatch.pub.DataChainDigest[0]++
+	if err := node.ReplaceStateMachine(&mismatch); !errors.Is(err, ErrPublicationMismatch) {
+		t.Fatalf("mismatched replacement error=%v", err)
+	}
+	node.pendingInputCalls = 1
+	if err := node.ReplaceStateMachine(source); !errors.Is(err, ErrReadyPending) {
+		t.Fatalf("non-quiescent replacement error=%v", err)
+	}
+}
+
 func TestRecoveryBootstrapsEmptyMachineFromDurableSnapshot(t *testing.T) {
 	_, stable, _ := newTestNode(t, 1, []uint64{1})
 	machine := &fakeStateMachine{pub: Publication{ConfState: new(pb.ConfState)}}

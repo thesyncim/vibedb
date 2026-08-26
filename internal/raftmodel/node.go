@@ -245,6 +245,27 @@ func newRawNodeChecked(config *raft.Config) (raw *raft.RawNode, err error) {
 // Phase returns the current synchronous Ready lifecycle phase.
 func (n *Node) Phase() Phase { return n.phase }
 
+// ReplaceStateMachine atomically changes only the local apply handle at one
+// completely quiescent publication cut. Raft identity, log, term, progress,
+// and read contexts remain untouched. The replacement must expose the exact
+// publication already owned by Node; a merely equal applied index is
+// insufficient.
+func (n *Node) ReplaceStateMachine(machine StateMachine) error {
+	if n == nil || machine == nil || n.failure != nil || n.phase != PhaseIdle ||
+		n.pendingInputCalls != 0 || n.settlementCount != 0 ||
+		len(n.issuedReads) != 0 || len(n.pendingReads) != 0 || n.raw == nil ||
+		n.raw.HasReady() {
+		return ErrReadyPending
+	}
+	publication := machine.Published()
+	if machine.Applied() != publication.Applied ||
+		!equalPublication(publication, n.published) {
+		return ErrPublicationMismatch
+	}
+	n.machine = machine
+	return nil
+}
+
 // BindMembershipTransitionContext enables the one fixed-width membership
 // authorization digest before any proposal or Ready replay. Raw Nodes remain
 // context-free unless their owner explicitly binds this contract.
