@@ -101,9 +101,41 @@ type ReplicaHealthRevisionSink interface {
 	PublishReplicaHealthRevision(context.Context, ReplicaHealthRevision) error
 }
 
+// ReplicaHealthRevisionAuthority adds the restart-safe sequence source needed
+// by a health collector. A process never invents a revision from wall-clock
+// time or process-local memory: it reopens the last catalog-Raft value and the
+// existing publish CAS admits exactly the next value.
+type ReplicaHealthRevisionAuthority interface {
+	ReplicaHealthRevisionSink
+	ReadReplicaHealthRevision(context.Context, raftmember.GroupKey, uint64) (uint64, error)
+}
+
 type ReplicaFailureCertificateSource interface {
 	VisitReplicaFailureCertificates(context.Context, *Snapshot,
 		func(ReplicatedFailureCertificate) error) error
+}
+
+// ReadReplicaHealthRevision returns the last committed revision for an exact
+// group/member identity. Zero means no revision has been committed. Stale
+// catalog generations intentionally retain their sequence so a new process
+// cannot resurrect an old revision number after restart.
+func (authority *ReplicatedCatalogAuthority) ReadReplicaHealthRevision(
+	ctx context.Context, group raftmember.GroupKey, suspect uint64,
+) (uint64, error) {
+	if authority == nil || ctx == nil || !validMembershipGrantGroup(group) || suspect == 0 {
+		return 0, ErrReplicatedFailureAuthority
+	}
+	key, _ := replicatedFailureKeys(group, suspect)
+	result, err := authority.readRaw(ctx, key[:], maxReplicatedFailureRecordBytes)
+	if err != nil || !result.Found {
+		return 0, err
+	}
+	record, err := openReplicatedFailureRecord(result.Value)
+	if err != nil || openPersistedMembershipGrantGroup(record.Group) != group ||
+		record.SuspectMember != suspect {
+		return 0, errors.Join(err, ErrReplicatedFailureAuthority)
+	}
+	return record.Revision, nil
 }
 
 type replicatedFailureRecord struct {
@@ -371,7 +403,7 @@ func validReplicaHealthRevision(catalog *Snapshot, revision ReplicaHealthRevisio
 	leader := false
 	for _, attestation := range revision.Attestations {
 		endpoint, found := endpointByMember(route.Replicas, attestation.Member)
-		if !found || attestation.Member == revision.SuspectMember || attestation.Member <= previous ||
+		if !found || (failed && attestation.Member == revision.SuspectMember) || attestation.Member <= previous ||
 			attestation.Failed != failed || endpoint.Node != attestation.Node || endpoint.NodeIncarnation != attestation.NodeIncarnation ||
 			attestation.CatalogGeneration != revision.CatalogGeneration ||
 			attestation.ReplicaSetVersion != revision.ReplicaSetVersion ||

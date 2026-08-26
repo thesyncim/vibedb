@@ -161,3 +161,46 @@ func synchronizeReplicaHealthAttestations(revision *ReplicaHealthRevision) {
 		revision.Attestations[index].CommitIndex = revision.CommitIndex
 	}
 }
+
+func TestReplicatedFailureAuthorityReopensMonotonicRevision(t *testing.T) {
+	authority, _, catalog := newCatalogAuthorityFixture(t)
+	descriptor := catalog.ReplicatedShardDescriptors()[0]
+	if revision, err := authority.ReadReplicaHealthRevision(
+		context.Background(), descriptor.Group, descriptor.Replicas[0].Member,
+	); err != nil || revision != 0 {
+		t.Fatalf("initial revision=%d err=%v", revision, err)
+	}
+	health := testReplicaHealthRevision(descriptor, catalog.Generation())
+	health.Revision = 1
+	if err := authority.PublishReplicaHealthRevision(context.Background(), health); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(catalog), 0x97)
+	if revision, err := restarted.ReadReplicaHealthRevision(
+		context.Background(), health.Group, health.SuspectMember,
+	); err != nil || revision != 1 {
+		t.Fatalf("reopened revision=%d err=%v", revision, err)
+	}
+}
+
+func TestReplicatedFailureAuthorityAcceptsFullAgreementLeaderClear(t *testing.T) {
+	authority, _, catalog := newCatalogAuthorityFixture(t)
+	descriptor := catalog.ReplicatedShardDescriptors()[0]
+	leader := descriptor.Replicas[0]
+	revision := ReplicaHealthRevision{
+		Distribution: descriptor.Distribution, Shard: descriptor.Shard, Group: descriptor.Group,
+		CatalogGeneration: catalog.Generation(), ReplicaSetVersion: descriptor.Command.ReplicaSetVersion,
+		Revision: 1, LeaderMember: leader.Member, LeaderTerm: 7, CommitIndex: 40,
+		SuspectMember: leader.Member, SuspectNode: leader.Node,
+		SuspectIncarnation: leader.NodeIncarnation,
+	}
+	for _, replica := range descriptor.Replicas {
+		revision.Attestations = append(revision.Attestations, ReplicaHealthAttestation{
+			Member: replica.Member, Node: replica.Node, NodeIncarnation: replica.NodeIncarnation,
+		})
+	}
+	synchronizeReplicaHealthAttestations(&revision)
+	if err := authority.PublishReplicaHealthRevision(context.Background(), revision); err != nil {
+		t.Fatal(err)
+	}
+}
