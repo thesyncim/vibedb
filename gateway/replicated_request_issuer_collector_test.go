@@ -8,11 +8,13 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
 
 type issuerCollectorLedger struct {
 	highwater      requestledger.IssuerHighwaterRecord
+	rangeIdentity  requestledger.Digest
 	sequence       requestledger.IssuerSequenceRecord
 	ack            requestledger.AckRecord
 	applied        uint64
@@ -42,7 +44,7 @@ func (ledger *issuerCollectorLedger) ReadRow(
 			ack = &ledger.ack
 		}
 	}
-	status, err := requestledger.NewIssuerLaneStatus(ledger.highwater, sequence, ack)
+	status, err := requestledger.NewIssuerLaneStatus(ledger.rangeIdentity, ledger.highwater, sequence, ack)
 	if err != nil {
 		return DurableRequestLifecycleRow{}, err
 	}
@@ -105,7 +107,7 @@ func issuerCollectorFixture(t *testing.T) (
 		t.Fatal(err)
 	}
 	homePoint, _ := requestledger.Home(key)
-	return DurableRequestLedgerHome{Identity: lifecycleDigest("issuer-range"), Point: homePoint},
+	return DurableRequestLedgerHome{Identity: replication.Digest(lifecycleDigest("issuer-range")), Point: homePoint},
 		key, highwater, sequence, ack
 }
 
@@ -254,7 +256,8 @@ func issuerCollectorGCComplete(
 func TestDurableIssuerHighwaterCollectorResolvesOutcomeUnknownAndRestart(t *testing.T) {
 	home, key, highwater, sequence, ack := issuerCollectorFixture(t)
 	ledger := &issuerCollectorLedger{
-		highwater: highwater, sequence: sequence, ack: ack, applied: 100, applyFault: true,
+		highwater: highwater, rangeIdentity: requestledger.Digest(home.Identity),
+		sequence: sequence, ack: ack, applied: 100, applyFault: true,
 	}
 	collector, err := NewDurableIssuerHighwaterCollector(ledger)
 	if err != nil {
@@ -286,7 +289,10 @@ func TestDurableIssuerHighwaterCollectorStopsAtNonGCCompleteAndBoundsWork(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	ledger := &issuerCollectorLedger{highwater: highwater, sequence: active, applied: 50}
+	ledger := &issuerCollectorLedger{
+		highwater: highwater, rangeIdentity: requestledger.Digest(home.Identity),
+		sequence: active, applied: 50,
+	}
 	collector, _ := NewDurableIssuerHighwaterCollector(ledger)
 	result, err := collector.Collect(t.Context(), DurableIssuerHighwaterCollectPlan{
 		Home: home, Key: key, MaxAdvances: 1,

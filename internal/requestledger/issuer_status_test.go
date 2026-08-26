@@ -24,7 +24,7 @@ func issuerStatusFixture(t *testing.T) (IssuerHighwaterRecord, IssuerSequenceRec
 
 func TestIssuerLaneStatusCanonicalWitness(t *testing.T) {
 	highwater, sequence, ack := issuerStatusFixture(t)
-	status, err := NewIssuerLaneStatus(highwater, &sequence, &ack)
+	status, err := NewIssuerLaneStatus(testDigest("range"), highwater, &sequence, &ack)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +62,11 @@ func TestIssuerLaneStatusStopsAtActiveAndGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, err := NewIssuerLaneStatus(highwater, &active, nil)
+	status, err := NewIssuerLaneStatus(testDigest("range"), highwater, &active, nil)
 	if err != nil || !status.NextFound || status.AdvanceReady {
 		t.Fatalf("active status=%+v err=%v", status, err)
 	}
-	if _, err := NewIssuerLaneStatus(highwater, &complete, nil); err == nil {
+	if _, err := NewIssuerLaneStatus(testDigest("range"), highwater, &complete, nil); err == nil {
 		t.Fatal("GC-complete sequence without its ACK witness accepted")
 	}
 
@@ -76,7 +76,7 @@ func TestIssuerLaneStatusStopsAtActiveAndGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gap, err := NewIssuerLaneStatus(empty, nil, nil)
+	gap, err := NewIssuerLaneStatus(testDigest("range"), empty, nil, nil)
 	if err != nil || gap.NextFound || gap.AdvanceReady {
 		t.Fatalf("gap status=%+v err=%v", gap, err)
 	}

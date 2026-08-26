@@ -83,6 +83,7 @@ func (collector *DurableIssuerHighwaterCollector) Collect(
 		}
 		status := row.IssuerStatus
 		if row.Kind != replicatedstate.RequestLedgerReadIssuerStatus ||
+			status.RangeIdentity != requestledger.Digest(plan.Home.Identity) ||
 			status.Highwater.Identity != identity || status.Highwater.Home != plan.Home.Point {
 			return DurableIssuerHighwaterCollectResult{}, ErrDurableRequestConflict
 		}
@@ -139,6 +140,7 @@ func (collector *DurableIssuerHighwaterCollector) Collect(
 			return result, errors.Join(applyErr, nextErr)
 		}
 		if !next.Found || next.Kind != replicatedstate.RequestLedgerReadIssuerStatus ||
+			next.IssuerStatus.RangeIdentity != requestledger.Digest(plan.Home.Identity) ||
 			next.IssuerStatus.Highwater.Identity != identity ||
 			next.IssuerStatus.Highwater.Home != plan.Home.Point {
 			return result, errors.Join(applyErr, ErrDurableRequestConflict)

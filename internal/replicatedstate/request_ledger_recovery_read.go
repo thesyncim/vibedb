@@ -258,7 +258,7 @@ func requestLedgerIssuerStatusRead(
 			ack = &ackValue
 		}
 	}
-	status, err := requestledger.NewIssuerLaneStatus(highwater, sequence, ack)
+	status, err := requestledger.NewIssuerLaneStatus(request.ExpectedRangeIdentity, highwater, sequence, ack)
 	if err != nil {
 		return RequestLedgerReadResult{}, errors.Join(err, ErrStateCorrupt)
 	}
