@@ -686,6 +686,7 @@ type transferReplicatedClient struct {
 	moved         bool
 	failAfterMove bool
 	membershipAt  uint64
+	membership    shardservice.ReplicatedMembershipRequest
 }
 
 func (client *transferReplicatedClient) DoReplicated(
@@ -703,6 +704,7 @@ func (client *transferReplicatedClient) DoReplicated(
 		return nil, errors.New("unexpected operation")
 	}
 	client.membershipAt = endpoint.Member
+	client.membership = request.Membership
 	if request.Membership.Kind == raftservice.MembershipRemoveVoter {
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedMembershipAccepted,
 			HasState: true, State: state}, nil
@@ -718,6 +720,93 @@ func (client *transferReplicatedClient) DoReplicated(
 	}
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedMembershipAccepted,
 		HasState: true, State: state}, nil
+}
+
+func TestReplicatedExecutorRemovesUnroutedSourceAfterCertifiedCutover(t *testing.T) {
+	serving, _, states := testReplicatedRouteCommand(t)
+	membershipRoute, states := testReplicatedMembershipRoute(serving, states)
+	target := membershipRoute.EnrolledTarget
+	serving.Replicas[1] = target
+	serving.Command.ReplicaSetVersion++
+	delete(states, "m2")
+	transferTerm := uint64(12)
+	for address, state := range states {
+		if address != "m1" && address != "m3" && address != target.Address {
+			delete(states, address)
+			continue
+		}
+		state.LeaderID = target.Member
+		state.Fence.Term = transferTerm
+		state.Fence.Command = serving.Command
+		states[address] = state
+	}
+	cutover := ReplicatedMembershipRoute{Serving: serving}
+	request := shardservice.ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipRemoveVoter, TransitionID: [16]byte{10},
+		MetadataEpoch: 11, CatalogGeneration: 12,
+		ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
+		SourceMember:              2, TargetMember: target.Member, TransferTerm: transferTerm,
+	}
+	client := &transferReplicatedClient{states: states}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ApplyMembership(context.Background(), cutover, request)
+	if err != nil || result.State.Fence.MemberID != target.Member ||
+		client.membershipAt != target.Member || client.membership != request ||
+		client.membership.TransferTerm != transferTerm {
+		t.Fatalf("result=%+v endpoint=%d sent=%+v err=%v",
+			result, client.membershipAt, client.membership, err)
+	}
+}
+
+func TestReplicatedExecutorPostCutoverRouteDoesNotAdmitEarlierMembershipSteps(t *testing.T) {
+	serving, _, _ := testReplicatedRouteCommand(t)
+	target := ReplicatedEndpoint{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{4}, NodeIncarnation: 14,
+		NativeEndpoint: "n4", Address: "m4",
+	}
+	serving.Replicas[1] = target
+	cutover := ReplicatedMembershipRoute{Serving: serving}
+	for _, kind := range []raftservice.MembershipKind{
+		raftservice.MembershipAddLearner,
+		raftservice.MembershipPromoteVoter,
+		raftservice.MembershipTransferLeader,
+	} {
+		client := new(countingMembershipClient)
+		executor, err := NewReplicatedExecutor(client, 1, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := shardservice.ReplicatedMembershipRequest{
+			Kind: kind, TransitionID: [16]byte{11}, MetadataEpoch: 12,
+			CatalogGeneration:         13,
+			ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
+			SourceMember:              2, TargetMember: target.Member,
+		}
+		if _, err := executor.ApplyMembership(
+			context.Background(), cutover, request,
+		); !errors.Is(err, ErrReplicatedRoute) || client.calls != 0 {
+			t.Fatalf("kind=%d err=%v calls=%d", kind, err, client.calls)
+		}
+	}
+	client := new(countingMembershipClient)
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncutSource := shardservice.ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipRemoveVoter, TransitionID: [16]byte{12},
+		MetadataEpoch: 13, CatalogGeneration: 14,
+		ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
+		SourceMember:              1, TargetMember: target.Member, TransferTerm: 15,
+	}
+	if _, err := executor.ApplyMembership(
+		context.Background(), cutover, uncutSource,
+	); !errors.Is(err, ErrReplicatedRoute) || client.calls != 0 {
+		t.Fatalf("serving source removal err=%v calls=%d", err, client.calls)
+	}
 }
 
 func TestReplicatedExecutorTransferReturnsConsumableLeaderTermWitness(t *testing.T) {
