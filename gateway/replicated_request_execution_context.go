@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
@@ -28,6 +30,71 @@ type DurableRequestTypedRunner interface {
 		context.Context,
 		DurableRequestTypedExecutionContext,
 	) (DurableRequestTerminalResult, error)
+}
+
+// DurableRequestTerminalAuthority is the deterministic, restart-reconstructible
+// authority needed after the distributed transaction is retired. Cursor bytes
+// are authenticated by the sealed recipe. AckToken is derived with a stable
+// deployment key instead of generated at the outcome-unknown boundary.
+type DurableRequestTerminalAuthority struct {
+	CommitCursor []byte
+	AbortCursor  []byte
+	AckToken     requestledger.AckToken
+	Release      executionpin.Command
+}
+
+type DurableRequestAckDerivationKey [sha256.Size]byte
+
+func NewDurableRequestTerminalAuthority(
+	execution DurableRequestTypedExecutionContext,
+	ackKey DurableRequestAckDerivationKey,
+	commitCursor []byte,
+	abortCursor []byte,
+	release executionpin.Command,
+) (DurableRequestTerminalAuthority, error) {
+	contract := execution.Recipe.Contract
+	if ackKey == (DurableRequestAckDerivationKey{}) || len(commitCursor) == 0 ||
+		len(commitCursor) > requestledger.MaxContinuationCursorBytes || len(abortCursor) == 0 ||
+		len(abortCursor) > requestledger.MaxContinuationCursorBytes ||
+		requestledger.NextStateDigest(contract.CommitTransitionTag, commitCursor) !=
+			requestledger.Digest(contract.CommitTerminalStateDigest) ||
+		requestledger.NextStateDigest(contract.AbortTransitionTag, abortCursor) !=
+			requestledger.Digest(contract.AbortTerminalStateDigest) ||
+		release.Operation != executionpin.OperationRelease ||
+		release.PrepareTerminalDigest != (executionpin.Digest{}) ||
+		release.Binding.RequestKeyDigest != executionpin.Digest(execution.Recipe.KeyDigest) ||
+		release.Binding.RequestDigest != executionpin.Digest(execution.Recipe.RequestDigest) ||
+		release.Binding.CatalogGeneration != execution.Recipe.CatalogGeneration ||
+		release.Binding.SchemaManifestDigest != executionpin.Digest(contract.SchemaManifestDigest) ||
+		release.Binding.SchemaCertificateDigest != executionpin.Digest(contract.RouteSchemaCertificateDigest) {
+		return DurableRequestTerminalAuthority{}, ErrDurableRequestConflict
+	}
+	bindingDigest, err := executionpin.BindingDigest(release.Binding)
+	if err != nil || bindingDigest != executionpin.Digest(contract.PinDigest) {
+		return DurableRequestTerminalAuthority{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	check := release
+	check.PrepareTerminalDigest = executionpin.Digest{1}
+	if !check.Valid() {
+		return DurableRequestTerminalAuthority{}, ErrDurableRequestConflict
+	}
+	mac := hmac.New(sha256.New, ackKey[:])
+	_, _ = mac.Write([]byte("vibedb/durable-request/ack-token/typed-1\x00"))
+	_, _ = mac.Write(execution.Key.RequestKey.TenantDigest[:])
+	_, _ = mac.Write(execution.Recipe.KeyDigest[:])
+	_, _ = mac.Write(execution.Recipe.RequestDigest[:])
+	_, _ = mac.Write(execution.Recipe.Contract.TerminalContractDigest[:])
+	var token requestledger.AckToken
+	_ = mac.Sum(token[:0])
+	if token == (requestledger.AckToken{}) {
+		return DurableRequestTerminalAuthority{}, ErrDurableRequest
+	}
+	return DurableRequestTerminalAuthority{
+		CommitCursor: append([]byte(nil), commitCursor...),
+		AbortCursor:  append([]byte(nil), abortCursor...),
+		AckToken:     token,
+		Release:      release,
+	}, nil
 }
 
 func NewDurableRequestTypedExecutionContext(
