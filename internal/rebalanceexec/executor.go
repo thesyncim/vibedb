@@ -462,14 +462,26 @@ func (executor *Executor) executeRetirement(
 		cut.Target.Member != plan.TargetMember() || execution.LeaderTerm == 0 {
 		return errors.Join(err, ErrExecutionFence)
 	}
-	err = executor.options.Retirer.RetireReplicaSource(ctx, SourceRetirementRequest{
-		Operation: [32]byte(operation), Step: execution.Proof, Group: plan.Group(),
-		AllocationGeneration: cut.Membership.Serving.AllocationGeneration,
-		Command:              cut.Command,
-		Source:               cut.Retiring, Target: cut.Target, Term: execution.LeaderTerm,
-	})
-	if err != nil || !found {
-		return err
+	// A scheduler-authorized failed-replica replacement cannot require an RPC
+	// acknowledgement from the replica whose quorum-certified absence caused
+	// the operation. By this action the source is already absent from Raft,
+	// both catalog generations have drained, and the target publication is
+	// applied; the retirement RPC only accelerates local cleanup. Proactive
+	// moves retain the stricter graceful-retirement acknowledgement.
+	_, _, failedReplacement := plan.FailedReplicaAuthorizationDigests()
+	if !failedReplacement {
+		err = executor.options.Retirer.RetireReplicaSource(ctx, SourceRetirementRequest{
+			Operation: [32]byte(operation), Step: execution.Proof, Group: plan.Group(),
+			AllocationGeneration: cut.Membership.Serving.AllocationGeneration,
+			Command:              cut.Command,
+			Source:               cut.Retiring, Target: cut.Target, Term: execution.LeaderTerm,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if !found {
+		return nil
 	}
 	err = executor.options.Catalog.FinalizeReplicaReplacement(ctx, grant)
 	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {

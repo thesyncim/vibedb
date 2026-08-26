@@ -39,6 +39,7 @@ type executorFixture struct {
 	bootstrapErr        error
 	bootstrapState      snapshottransfer.BootstrapState
 	releaseErr          error
+	retirementErr       error
 	membershipHook      func()
 	drainRequests       []gateway.ClusterCatalogDrainRequest
 	drainCertificate    func(gateway.ClusterCatalogDrainRequest) gateway.ClusterCatalogDrainCertificate
@@ -180,7 +181,7 @@ func (fixture *executorFixture) RetireReplicaSource(
 	_ context.Context, request SourceRetirementRequest,
 ) error {
 	fixture.retirements = append(fixture.retirements, request)
-	return nil
+	return fixture.retirementErr
 }
 
 func TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions(t *testing.T) {
@@ -394,6 +395,64 @@ func TestExecutorRetiresBeforeExactGrantFinalizationAndSettlesUnknown(t *testing
 	}
 }
 
+func TestExecutorCertifiedFailedReplacementDoesNotWaitForDeadSource(t *testing.T) {
+	plan, fixture := newFailedExecutorFixture(t)
+	deadSource := errors.New("certified source is unreachable")
+	retirementAttempts := 0
+	executor, err := New(Options{
+		Routes: fixture, Grants: fixture, Membership: fixture, Snapshots: fixture,
+		Bootstrap: fixture, Awaiter: fixture, Ownership: fixture, Catalog: fixture,
+		Drainer: fixture, Retirer: sourceRetirerFunc(func(
+			context.Context, SourceRetirementRequest,
+		) error {
+			retirementAttempts++
+			return deadSource
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := testExecution(rebalance.ActionRetireSource)
+	execution.Action.Member = plan.RetiringMember()
+	if err = executor.ExecuteReplicaMove(
+		context.Background(), plan.OperationID(), plan, execution,
+	); err != nil {
+		t.Fatalf("certified failed-source retirement: %v", err)
+	}
+	if retirementAttempts != 0 || fixture.finalizes != 1 || fixture.grantFound {
+		t.Fatalf("retirement attempts=%d finalizes=%d grant found=%v",
+			retirementAttempts, fixture.finalizes, fixture.grantFound)
+	}
+}
+
+func TestExecutorProactiveMoveRequiresSourceRetirement(t *testing.T) {
+	plan, fixture := newExecutorFixture(t)
+	fixture.retirementErr = errors.New("source retirement unavailable")
+	executor, err := New(Options{
+		Routes: fixture, Grants: fixture, Membership: fixture, Snapshots: fixture,
+		Bootstrap: fixture, Awaiter: fixture, Ownership: fixture, Catalog: fixture,
+		Drainer: fixture, Retirer: fixture,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = executor.ExecuteReplicaMove(context.Background(), plan.OperationID(), plan,
+		testExecution(rebalance.ActionRetireSource))
+	if !errors.Is(err, fixture.retirementErr) || len(fixture.retirements) != 1 ||
+		fixture.finalizes != 0 || !fixture.grantFound {
+		t.Fatalf("retirements=%d finalizes=%d grant found=%v err=%v",
+			len(fixture.retirements), fixture.finalizes, fixture.grantFound, err)
+	}
+}
+
+type sourceRetirerFunc func(context.Context, SourceRetirementRequest) error
+
+func (function sourceRetirerFunc) RetireReplicaSource(
+	ctx context.Context, request SourceRetirementRequest,
+) error {
+	return function(ctx, request)
+}
+
 func TestExecutorFailsClosedBeforeMembershipWhenGrantIsMissing(t *testing.T) {
 	plan, fixture := newExecutorFixture(t)
 	fixture.grantFound = false
@@ -600,6 +659,106 @@ func newExecutorFixture(t testing.TB) (*rebalance.Plan, *executorFixture) {
 			},
 		},
 	}
+}
+
+func newFailedExecutorFixture(t testing.TB) (*rebalance.Plan, *executorFixture) {
+	t.Helper()
+	group := raftmember.GroupKey{
+		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5},
+	}
+	manifest, err := distribution.NewManifest("data", 7, []distribution.Shard{{
+		ID: "all", AllocationGeneration: 11,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"source", "donor", "other"}, Epoch: 13,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := map[distribution.EndpointID]string{
+		"source": "127.0.0.1:7001", "source-native": "127.0.0.1:7101", "source-control": "127.0.0.1:7201",
+		"donor": "127.0.0.1:7002", "donor-native": "127.0.0.1:7102", "donor-control": "127.0.0.1:7202",
+		"other": "127.0.0.1:7003", "other-native": "127.0.0.1:7103", "other-control": "127.0.0.1:7203",
+		"target": "127.0.0.1:7004", "target-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7204",
+	}
+	command := raftservice.CommandFence{
+		ReplicaSetVersion: 7, ActivePolicyGeneration: 2, ProtectionEpoch: 3,
+		OwnershipEpoch: 13, SchemaGeneration: 4, RelationManifestDigest: [32]byte{5},
+		RoutingVersion: 7, RouteGeneration: 9,
+	}
+	descriptor := gateway.ReplicatedShardDescriptor{
+		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
+		Command: command,
+		Replicas: []gateway.ReplicatedReplicaDescriptor{
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21, Endpoint: "source", NativeEndpoint: "source-native", ControlEndpoint: "source-control"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22, Endpoint: "donor", NativeEndpoint: "donor-native", ControlEndpoint: "donor-control"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23, Endpoint: "other", NativeEndpoint: "other-native", ControlEndpoint: "other-control"},
+		},
+	}
+	catalog, err := gateway.NewSnapshotWithReplicatedMetadata(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
+		Placements:    []distribution.TablePlacement{{Table: "docs", Distribution: "data", Columns: []string{"/id"}}},
+		Manifests:     []*distribution.Manifest{manifest},
+	}, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := rebalance.FailureQuorumCertificate{
+		Distribution: "data", Shard: "all", Group: group,
+		CatalogGeneration: 9, ReplicaSetVersion: 7, LeaderTerm: 4, CommitIndex: 25,
+		FirstFailureEpoch: 10, ConfirmedEpoch: 12, SuspectMember: 1,
+		Confirmations: []rebalance.FailureConfirmation{
+			{Member: 2, FirstFailureEpoch: 10, ConfirmedEpoch: 12, LeaderTerm: 4, ReplicaSetVersion: 7, CommitIndex: 25},
+			{Member: 3, FirstFailureEpoch: 10, ConfirmedEpoch: 12, LeaderTerm: 4, ReplicaSetVersion: 7, CommitIndex: 25},
+		},
+	}
+	candidate := rebalance.ReplacementCandidate{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+		Endpoint: "target", TopologyRecoveryEpoch: 3, HealthEpoch: 12,
+	}
+	planned, err := rebalance.PlanFailedReplicaReplacement(rebalance.FailedReplicaPlanningCut{
+		Catalog: catalog,
+		Publication: raftmodel.Publication{Applied: 30, ReplicaSetVersion: 7,
+			ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}},
+		Leader: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4,
+			Commit: 30, Applied: 30, RaftState: raft.StateLeader},
+		Certificate: certificate,
+		Healthy: []rebalance.HealthyReplica{
+			{Member: 2, LeaderTerm: 4, ReplicaSetVersion: 7, HealthyThrough: 12, Applied: 30, RecentActive: true},
+			{Member: 3, LeaderTerm: 4, ReplicaSetVersion: 7, HealthyThrough: 12, Applied: 29, RecentActive: true},
+		},
+		Candidates: []rebalance.ReplacementCandidate{candidate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := catalog.ResolveReplicatedMembershipRoute("data", "all", workspace[:0])
+	if !ok {
+		t.Fatal("missing replicated membership route")
+	}
+	target := gateway.ReplicatedEndpoint{Member: candidate.Member, Node: candidate.Node,
+		StoreID: candidate.StoreID, NodeIncarnation: candidate.NodeIncarnation,
+		Endpoint: "target", NativeEndpoint: "target-native", ControlEndpoint: "target-control",
+		Address: endpoints["target"], ControlAddress: endpoints["target-control"]}
+	fixture := &executorFixture{grantFound: true, cut: MoveRoute{Catalog: catalog,
+		Membership: route, Command: command, Target: target}}
+	fixture.cut.Membership.EnrolledTarget = target
+	fixture.cut.Membership.HasEnrolledTarget = true
+	for _, replica := range route.Serving.Replicas {
+		switch replica.Member {
+		case planned.Plan.RetiringMember():
+			fixture.cut.Retiring = replica
+		case planned.Plan.SnapshotSourceMember():
+			fixture.cut.SnapshotSource = replica
+		}
+	}
+	fixture.grant = membershipgrant.Grant{Group: group, TransitionID: [16]byte{9},
+		MetadataEpoch: 10, CatalogGeneration: 9, InitialReplicaSetVersion: 7,
+		InitialVoters: [3]uint64{1, 2, 3}, InitialRosterDigest: [32]byte{10},
+		InitialDescriptorDigest: [32]byte{11}, SourceMember: 1, TargetMember: 4,
+		TargetNode: [16]byte(candidate.Node)}
+	return planned.Plan, fixture
 }
 
 func TestExactRetiringReplicaRejectsReusedControlIdentity(t *testing.T) {
