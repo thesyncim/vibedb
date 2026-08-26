@@ -142,6 +142,22 @@ func lifecycleTarget(label, mode string) CoverageTarget {
 		"open-ns", "peak-rss-bytes", "physical-write-known", "physical-write-bytes")
 }
 
+func qualifiedChurnTarget(label string) CoverageTarget {
+	return withOutputTokens(commandTarget(
+		label, "bench/competitive/cmd/churndisk",
+		"-engine=vibedb", "-corpus=100000", "-mutations=200000",
+		"-checkpoint-mutations=64", "-sample-mutations=5000",
+		"-durability=buffered-visible", "-exact-indexes=0",
+		"-cardinality=low", "-document-shape=inline", "-storage-profile=intrinsic",
+		"-require-physical-write=true", "-max-rss-bytes=2147483648",
+		"-max-allocated-bytes=8589934592", "-max-physical-write-bytes=17179869184",
+	), "printHeader", "durability", "exact-indexes", "document-shape",
+		"mutation-index", "publishable", "peak-rss-bytes", "max-rss-bytes",
+		"allocated-bytes", "max-allocated-bytes", "logical-write-bytes",
+		"physical-write-known", "physical-write-source", "physical-write-bytes",
+		"max-physical-write-bytes", "physical-write/logical")
+}
+
 // BenchmarkCoverageManifest returns a fresh copy of the complete required
 // matrix so generators and tests cannot mutate the contract accidentally.
 func BenchmarkCoverageManifest() []CoverageLane {
@@ -264,9 +280,20 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{mixedTarget("thirty-two-client mixed workload", "-clients=32")},
 		},
 		{
-			Dimension: "concurrency", Case: "saturation", Status: CoverageDiagnostic,
-			Boundary: "Arbitrary client counts can be swept, but there is no machine-defined stopping rule that identifies the saturation point.",
-			Targets:  []CoverageTarget{mixedTarget("manual high-client probe", "-clients=64")},
+			Dimension: "concurrency", Case: "saturation", Status: CoverageImplemented,
+			Boundary: "A dedicated isolated-process sweep records seven cyclic-order repetitions at 1, 2, 4, 8, 16, 32, and 64 clients. The machine rule reports the first of two consecutive median-throughput gains at or below 5%; no decision is emitted as passing when the fixed sweep does not plateau. Durability, checkpoint cadence, exact indexes, corpus, and document shape are identical at every level. The result is host-specific saturation evidence, not a universal capacity claim.",
+			Targets: []CoverageTarget{withOutputTokens(commandTarget(
+				"fixed-rule isolated client saturation sweep", "bench/competitive/cmd/saturation",
+				"-output=/tmp/vibedb-saturation.tsv", "-engine=vibedb",
+				"-clients=1,2,4,8,16,32,64", "-repetitions=7", "-conditioning=true",
+				"-minimum-gain-bps=500", "-plateau-windows=2", "-workload=churn",
+				"-corpus=10000", "-operations=20000", "-warmup=2000",
+				"-durability=buffered-visible", "-checkpoint-mutations=64",
+				"-exact-indexes=0", "-document-shape=inline", "-cardinality=low",
+			), "writeEvidence", "saturation-evidence", "client-levels", "minimum-gain-bps",
+				"raw_header", "throughput_ops_s", "maximum_operation_p999_milli_us",
+				"maximum_operation_latency_milli_us", "summary_header", "saturation-observed",
+				"saturation-clients")},
 		},
 
 		{
@@ -387,23 +414,18 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			), "printHeader", "disk", "diskalloc", "disk-bytes", "allocated-bytes", "logical-bytes", "disk/logical", "allocated/logical")},
 		},
 		{
-			Dimension: "storage", Case: "write amplification", Status: CoverageDiagnostic,
-			Boundary: "On VibeDB's journal-backed durable acknowledgement lanes, mixed reports exact submitted mutation bytes, engine-issued durability payload bytes, and their normalized ratio. This is not OS, filesystem-metadata, or physical-media accounting. Counter regression, buffered-visible, and adapters without an equally strong native counter report durability-payload-known=false.",
-			Targets: []CoverageTarget{mixedTarget(
-				"normalized VibeDB durability-payload diagnostic",
-				"-durability=ordinary-sync", "-checkpoint-mutations=0",
-			)},
+			Dimension: "storage", Case: "write amplification", Status: CoverageImplemented,
+			Boundary: "The qualified churn lane records exact submitted key-plus-document mutation bytes and the measured Linux /proc/self/io write_bytes delta over the mutation/checkpoint interval, then reports their ratio under explicit matched durability and index flags. It fails closed if the counter is absent or regresses and enforces a hard byte ceiling. This is process-attributed storage-layer traffic, not filesystem-metadata, device, or physical-media accounting.",
+			Targets: []CoverageTarget{
+				qualifiedChurnTarget("bounded Linux process-write amplification"),
+				mixedTarget("engine-issued durability payload companion", "-durability=ordinary-sync", "-checkpoint-mutations=0"),
+			},
 		},
 
 		{
-			Dimension: "stability", Case: "long churn", Status: CoverageDiagnostic,
-			Boundary: "The deterministic 200,000-mutation disk lane is sustained and sampled, but it is a bounded run rather than a time-based soak with health thresholds.",
-			Targets: []CoverageTarget{withOutputTokens(commandTarget(
-				"bounded sustained-churn run", "bench/competitive/cmd/churndisk",
-				"-engine=vibedb", "-corpus=100000", "-mutations=200000",
-				"-checkpoint-mutations=64", "-sample-mutations=5000",
-				"-cardinality=low", "-storage-profile=intrinsic",
-			), "printHeader", "mutation-index", "apparent-bytes", "allocated-bytes", "elapsed-seconds", "publishable")},
+			Dimension: "stability", Case: "long churn", Status: CoverageImplemented,
+			Boundary: "Long is defined here as exactly 200,000 acknowledged state changes over a fixed 100,000-document live set, sampled every 5,000 mutations. The command verifies every final byte, rejects forced checkpoints, and enforces hard peak-RSS, live allocated-byte, and Linux process-write ceilings before marking rows publishable. This is bounded long-churn qualification, not a time-based soak or lifetime guarantee.",
+			Targets:  []CoverageTarget{qualifiedChurnTarget("bounded long-churn health qualification")},
 		},
 		{
 			Dimension: "stability", Case: "periodic crashes", Status: CoverageImplemented,

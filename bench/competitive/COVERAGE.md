@@ -10,7 +10,7 @@ This table is the executable benchmark-coverage contract. Status describes the h
 
 `implemented` establishes an executable measurement shape, not a comparison. An evidence command selecting `-engine=vibedb` is VibeDB-only; a cross-engine claim additionally requires the repeated isolated `mixedsuite` publication protocol and recorded results.
 
-Current coverage: **29 implemented**, **9 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
+Current coverage: **32 implemented**, **6 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
 
 Evidence commands are rendered to run from the repository root.
 
@@ -33,7 +33,7 @@ Evidence commands are rendered to run from the repository root.
 | concurrency | 1 | **implemented** | [E02](#e02): single-client mixed workload | One worker owns the full deterministic trace. |
 | concurrency | 8 | **implemented** | [E18](#e18): eight-client mixed workload | Eight sessions share one engine handle and own disjoint mutation shards. |
 | concurrency | 32 | **implemented** | [E19](#e19): thirty-two-client mixed workload | Thirty-two sessions share one engine handle and own disjoint mutation shards. |
-| concurrency | saturation | **diagnostic** | [E20](#e20): manual high-client probe | Arbitrary client counts can be swept, but there is no machine-defined stopping rule that identifies the saturation point. |
+| concurrency | saturation | **implemented** | [E20](#e20): fixed-rule isolated client saturation sweep | A dedicated isolated-process sweep records seven cyclic-order repetitions at 1, 2, 4, 8, 16, 32, and 64 clients. The machine rule reports the first of two consecutive median-throughput gains at or below 5%; no decision is emitted as passing when the fixed sweep does not plateau. Durability, checkpoint cadence, exact indexes, corpus, and document shape are identical at every level. The result is host-specific saturation evidence, not a universal capacity claim. |
 | snapshot pressure | none | **implemented** | [E02](#e02): unpressured snapshot lane | The mixed harness releases cached read state before final fencing and holds no long-lived snapshot during mutation. |
 | snapshot pressure | long pinned | **diagnostic** | [E21](#e21): held-snapshot backpressure correctness | Durable correctness tests prove bounded backpressure under a held snapshot, but no competitive latency or storage lane holds one. |
 | interfaces | native | **implemented** | [E02](#e02): VibeDB native-adapter workload | This command drives VibeDB through the native Engine/EngineSession adapter. Other adapters implement the same harness interface, but this evidence target does not execute them. |
@@ -51,9 +51,9 @@ Evidence commands are rendered to run from the repository root.
 | latency | max | **implemented** | [E02](#e02): maximum latency | Mixed output reports the exact maximum per-operation and checkpoint sample for every engine. |
 | storage | logical | **implemented** | [E29](#e29): logical corpus bytes | The footprint tool reports key bytes, JSON bytes, and their key-inclusive logical sum separately. JSON gzip is an entropy control and explicitly excludes keys. |
 | storage | allocated | **implemented** | [E30](#e30): allocated and apparent bytes | The VibeDB footprint command reports apparent bytes, allocated filesystem blocks, and both ratios to the key-inclusive logical payload after a durability fence. |
-| storage | write amplification | **diagnostic** | [E31](#e31): normalized VibeDB durability-payload diagnostic | On VibeDB's journal-backed durable acknowledgement lanes, mixed reports exact submitted mutation bytes, engine-issued durability payload bytes, and their normalized ratio. This is not OS, filesystem-metadata, or physical-media accounting. Counter regression, buffered-visible, and adapters without an equally strong native counter report durability-payload-known=false. |
-| stability | long churn | **diagnostic** | [E28](#e28): bounded sustained-churn run | The deterministic 200,000-mutation disk lane is sustained and sampled, but it is a bounded run rather than a time-based soak with health thresholds. |
-| stability | periodic crashes | **implemented** | [E32](#e32): bounded external RF3 durability qualification<br>[E33](#e33): exhaustive commit crash sweep | The external RF3 qualification runs bounded kill/response cuts, two asymmetric directional partition/restart/heal loops, four 64-caller result-waiter waves, rolling restarts, and hard WAL/RSS growth bounds. It emits exact canonical TSV counters and fails closed without Linux physical-allocation, /proc RSS, signal, proxy, or synced-result controls. This is bounded qualification, not a time-based soak or failover-latency claim. |
+| storage | write amplification | **implemented** | [E31](#e31): bounded Linux process-write amplification<br>[E32](#e32): engine-issued durability payload companion | The qualified churn lane records exact submitted key-plus-document mutation bytes and the measured Linux /proc/self/io write_bytes delta over the mutation/checkpoint interval, then reports their ratio under explicit matched durability and index flags. It fails closed if the counter is absent or regresses and enforces a hard byte ceiling. This is process-attributed storage-layer traffic, not filesystem-metadata, device, or physical-media accounting. |
+| stability | long churn | **implemented** | [E31](#e31): bounded long-churn health qualification | Long is defined here as exactly 200,000 acknowledged state changes over a fixed 100,000-document live set, sampled every 5,000 mutations. The command verifies every final byte, rejects forced checkpoints, and enforces hard peak-RSS, live allocated-byte, and Linux process-write ceilings before marking rows publishable. This is bounded long-churn qualification, not a time-based soak or lifetime guarantee. |
+| stability | periodic crashes | **implemented** | [E33](#e33): bounded external RF3 durability qualification<br>[E34](#e34): exhaustive commit crash sweep | The external RF3 qualification runs bounded kill/response cuts, two asymmetric directional partition/restart/heal loops, four 64-caller result-waiter waves, rolling restarts, and hard WAL/RSS growth bounds. It emits exact canonical TSV counters and fails closed without Linux physical-allocation, /proc RSS, signal, proxy, or synced-result controls. This is bounded qualification, not a time-based soak or failover-latency claim. |
 
 ## Executable evidence catalog
 
@@ -174,7 +174,7 @@ Evidence commands are rendered to run from the repository root.
 ### E20
 
 ```sh
-(cd bench/competitive && go run ./cmd/mixed -engine=vibedb -workload=churn -corpus=10000 -operations=20000 -warmup=2000 -durability=buffered-visible -checkpoint-mutations=64 -clients=64 -cardinality=low -header=true)
+(cd bench/competitive && go run ./cmd/saturation -output=/tmp/vibedb-saturation.tsv -engine=vibedb -clients=1,2,4,8,16,32,64 -repetitions=7 -conditioning=true -minimum-gain-bps=500 -plateau-windows=2 -workload=churn -corpus=10000 -operations=20000 -warmup=2000 -durability=buffered-visible -checkpoint-mutations=64 -exact-indexes=0 -document-shape=inline -cardinality=low)
 ```
 
 ### E21
@@ -240,16 +240,22 @@ go test ./store/durable -run '^TestVerifyCleanPrimaryStoreVerifiesClean$' -count
 ### E31
 
 ```sh
-(cd bench/competitive && go run ./cmd/mixed -engine=vibedb -workload=churn -corpus=10000 -operations=20000 -warmup=2000 -durability=ordinary-sync -checkpoint-mutations=0 -clients=1 -cardinality=low -header=true)
+(cd bench/competitive && go run ./cmd/churndisk -engine=vibedb -corpus=100000 -mutations=200000 -checkpoint-mutations=64 -sample-mutations=5000 -durability=buffered-visible -exact-indexes=0 -cardinality=low -document-shape=inline -storage-profile=intrinsic -require-physical-write=true -max-rss-bytes=2147483648 -max-allocated-bytes=8589934592 -max-physical-write-bytes=17179869184)
 ```
 
 ### E32
 
 ```sh
-(cd bench/competitive && go run ./bench/rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
+(cd bench/competitive && go run ./cmd/mixed -engine=vibedb -workload=churn -corpus=10000 -operations=20000 -warmup=2000 -durability=ordinary-sync -checkpoint-mutations=0 -clients=1 -cardinality=low -header=true)
 ```
 
 ### E33
+
+```sh
+(cd bench/competitive && go run ./bench/rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
+```
+
+### E34
 
 ```sh
 go test ./store/durable -run '^TestFileStoreExhaustiveCommitCrashSweep$' -count=1

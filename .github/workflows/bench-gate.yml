@@ -30,6 +30,13 @@ jobs:
         # real global cache drop. GitHub-hosted Linux runners provide sudo;
         # Darwin is documented unsupported rather than approximated.
         run: sudo /tmp/vibedb-lifecycle -engine=bbolt -mode=cold -corpus=64 -durability=ordinary-sync -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
+      - name: Linux bounded churn and process-write smoke
+        working-directory: bench/competitive
+        run: |
+          go run ./cmd/churndisk -engine=vibedb -corpus=1000 -mutations=2000 -sample-mutations=500 -checkpoint-mutations=64 -durability=buffered-visible -exact-indexes=0 -document-shape=inline -cardinality=low -storage-profile=intrinsic -require-physical-write=true -max-rss-bytes=1073741824 -max-allocated-bytes=1073741824 -max-physical-write-bytes=1073741824 -allow-diagnostic > "${RUNNER_TEMP}/churn-smoke.tsv"
+          test -s "${RUNNER_TEMP}/churn-smoke.tsv"
+          grep -F $'physical-write-known\tphysical-write-source\tphysical-write-bytes' "${RUNNER_TEMP}/churn-smoke.tsv"
+          grep -F $'linux-proc-self-io-write_bytes' "${RUNNER_TEMP}/churn-smoke.tsv"
   allocation-gate:
     name: allocation gate
     runs-on: ubuntu-latest

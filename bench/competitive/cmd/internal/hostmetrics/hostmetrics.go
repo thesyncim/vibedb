@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -14,6 +15,9 @@ import (
 // by /proc/self/io. It excludes writes satisfied without reaching the block
 // layer and is therefore never labelled as device or media bytes.
 func LinuxPhysicalWriteBytes() (int64, bool, error) {
+	if runtime.GOOS != "linux" {
+		return 0, false, nil
+	}
 	f, err := os.Open("/proc/self/io")
 	if os.IsNotExist(err) {
 		return 0, false, nil

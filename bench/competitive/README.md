@@ -36,6 +36,7 @@ The module includes these command harnesses:
 - `cmd/mixedsuite` runs isolated child processes in a Latin-square order.
 - `cmd/footprint` measures apparent disk, allocated blocks, Go heap, and RSS.
 - `cmd/churndisk` samples storage during a bounded fixed-live-set mutation run.
+- `cmd/saturation` runs a matched, isolated client sweep and applies one fixed throughput-plateau rule.
 - `cmd/lifecycle` measures clean, hot, cold, and crash-recovery opens in isolated children.
 - `cmd/outofram` streams, stores, and scans a logical dataset larger than host RAM under hard memory and write bounds.
 - `cmd/speedprobe` records a focused speed diagnostic.
@@ -75,6 +76,37 @@ resolved compression policy and its provenance.
 
 Record the selected durability mode. Do not compare a volatile acknowledgement
 with a power-safe acknowledgement as if they were equal.
+
+## Saturation
+
+`cmd/saturation` conditions and then records one isolated `cmd/mixed` child per
+client level. The publication shape uses seven cyclic-order repetitions at 1,
+2, 4, 8, 16, 32, and 64 clients. It reports saturation only after two
+consecutive median-throughput gains are at or below 500 basis points. If the
+fixed sweep never meets that rule, the command preserves its canonical TSV and
+returns an error. The decision is specific to the recorded host and workload;
+it is not an engine-wide or environment-independent capacity number.
+
+Every child receives the same durability, checkpoint cadence, exact-index
+count, corpus, cardinality, and document shape. Run one engine per saturation
+command and repeat the exact flags for another engine before making a
+comparison.
+
+## Bounded long churn and process writes
+
+The publishable `cmd/churndisk` shape is exactly 200,000 acknowledged state
+changes over a fixed 100,000-document live set, sampled every 5,000 mutations.
+It verifies all final key/value bytes and rejects automatic checkpoints. Hard
+limits cover peak RSS, live allocated filesystem bytes, and Linux process
+`write_bytes`. Logical write bytes count every submitted key and document byte,
+including both key submissions in delete-plus-restore churn, so
+`physical-write/logical` has an exact denominator.
+
+Linux `/proc/self/io` `write_bytes` is process-attributed storage-layer traffic,
+not filesystem metadata, device, or media accounting. Publishable churn fails
+closed when that counter is unavailable or regresses. Darwin can run an
+explicitly diagnostic churn shape with `-allow-diagnostic`, but cannot produce
+this process-write qualification.
 
 ## Reopen and recovery control
 
