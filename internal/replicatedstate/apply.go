@@ -11,6 +11,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
@@ -25,33 +26,101 @@ var (
 )
 
 type commandPlan struct {
-	command         replication.CommandView
-	authorityDigest [32]byte
-	authorityKey    [33]byte
-	authorityRecord []byte
-	sessionDigest   [32]byte
-	sessionKey      [33]byte
-	slotKey         [35]byte
-	sessionRecord   []byte
-	slotRecord      []byte
-	changes         []finalMutation
-	relations       []plannedRelationChanges
-	dataChainDigest [32]byte
-	resultCode      uint32
-	affectedRows    int64
-	refusal         error
-	writeSession    bool
-	writeAuthority  bool
-	writeSlot       bool
-	newSession      bool
-	newAuthority    bool
-	newPhysicalSlot bool
-	advanceEpoch    uint64
-	deleteSession   bool
-	deleteSlots     uint16
-	release         bool
-	exactDuplicate  bool
-	conflict        bool
+	command            replication.CommandView
+	authorityDigest    [32]byte
+	authorityKey       [33]byte
+	authorityRecord    []byte
+	sessionDigest      [32]byte
+	sessionKey         [33]byte
+	slotKey            [35]byte
+	sessionRecord      []byte
+	slotRecord         []byte
+	routeGateResultKey [routeGateResultKeyBytes]byte
+	routeGateResult    []byte
+	routeGateCommand   routegate.Command
+	routeGateApply     bool
+	routeGateRows      []routeGateRowMutation
+	routeGateOutcome   routegate.Outcome
+	changes            []finalMutation
+	relations          []plannedRelationChanges
+	dataChainDigest    [32]byte
+	resultCode         uint32
+	affectedRows       int64
+	refusal            error
+	writeSession       bool
+	writeAuthority     bool
+	writeSlot          bool
+	newSession         bool
+	newAuthority       bool
+	newPhysicalSlot    bool
+	advanceEpoch       uint64
+	deleteSession      bool
+	deleteSlots        uint16
+	release            bool
+	exactDuplicate     bool
+	conflict           bool
+}
+
+type routeGateRowMutation struct {
+	key    []byte
+	value  []byte
+	delete bool
+}
+
+func planRouteGateRows(
+	current *routegate.Machine,
+	command routegate.Command,
+	outcome routegate.Outcome,
+) ([]routeGateRowMutation, error) {
+	if current == nil || !outcome.Mutated {
+		return nil, ErrStateCorrupt
+	}
+	head, err := routegate.AppendHead(make([]byte, 0, routegate.HeadBytes), outcome.Status)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]routeGateRowMutation, 0, 2)
+	rows = append(rows, routeGateRowMutation{key: routeGateHeadKey, value: head})
+	switch command.Operation {
+	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
+		state := routegate.PinHeld
+		if command.Operation == routegate.OperationReleaseShared {
+			state = routegate.PinReleased
+		}
+		record := routegate.PinRecord{
+			Identity: command.Identity, Binding: command.Binding,
+			Epoch: command.Epoch, State: state,
+		}
+		key, keyErr := routeGatePinStorageKey(command.Identity)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		value, valueErr := routegate.AppendStoredPin(
+			make([]byte, 0, routegate.StoredPinBytes), record,
+		)
+		if valueErr != nil {
+			return nil, valueErr
+		}
+		rows = append(rows, routeGateRowMutation{
+			key: append([]byte(nil), key[:]...), value: value,
+		})
+	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive:
+	case routegate.OperationCompactReleased:
+		identity, found := current.CompactCandidate()
+		if !found {
+			break
+		}
+		key, keyErr := routeGatePinStorageKey(identity)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		rows = append(rows, routeGateRowMutation{
+			key: append([]byte(nil), key[:]...), delete: true,
+		})
+	default:
+		return nil, ErrStateCorrupt
+	}
+	return rows, nil
 }
 
 type plannedRelationChanges struct {
@@ -709,6 +778,8 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultIntentBusy:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.resultCode == ResultRouteGate:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode != ResultApplied:
 		return ErrAdmissionBound
 	default:
@@ -1149,6 +1220,29 @@ func (m *Machine) planBundleCommand(
 			plan.resultCode = ResultSessionRevoked
 			next.LeaseDeadlineUnixNano = 0
 		}
+	case replication.CommandRouteGate:
+		if !m.mutableBindingMatchesState(command, state) {
+			plan.resultCode = ResultStaleFence
+			break
+		}
+		gateCommand, openErr := command.OpenRouteGate()
+		if openErr != nil || m.routeGate == nil {
+			return commandPlan{}, errors.Join(openErr, ErrStateCorrupt)
+		}
+		outcome := m.routeGate.Preview(gateCommand)
+		if outcome.Reason == routegate.ReasonInvalid {
+			return commandPlan{}, ErrStateCorrupt
+		}
+		plan.resultCode = ResultRouteGate
+		plan.routeGateCommand = gateCommand
+		plan.routeGateApply = true
+		plan.routeGateOutcome = outcome
+		if outcome.Mutated {
+			plan.routeGateRows, err = planRouteGateRows(m.routeGate, gateCommand, outcome)
+			if err != nil {
+				return commandPlan{}, err
+			}
+		}
 	default:
 		if !m.mutableBindingMatchesState(command, state) {
 			plan.resultCode = ResultStaleFence
@@ -1242,6 +1336,20 @@ func (m *Machine) planBundleCommand(
 		}
 		next.PhysicalSlotCount++
 		plan.newPhysicalSlot = true
+	}
+	if command.Kind() == replication.CommandRouteGate {
+		plan.routeGateResultKey, err = routeGateResultStorageKey(plan.sessionDigest, slot)
+		if err != nil {
+			return commandPlan{}, err
+		}
+		plan.routeGateResult, err = appendRouteGateResult(plan.routeGateResult[:0], routeGateResultRecord{
+			SessionDigest: plan.sessionDigest, Slot: slot,
+			ClientEpoch: command.ClientEpoch, ClientSequence: command.ClientSequence,
+			Outcome: plan.routeGateOutcome,
+		})
+		if err != nil {
+			return commandPlan{}, err
+		}
 	}
 	next.HighSequence = command.ClientSequence
 	next.AckThrough = command.AckThrough
@@ -2203,6 +2311,10 @@ func (m *Machine) persistTransitionRows(
 		systemDocuments += 1 + int(plan.deleteSlots)
 	}
 	systemDocuments += len(transactionRows)
+	systemDocuments += len(plan.routeGateRows)
+	if len(plan.routeGateResult) != 0 {
+		systemDocuments++
+	}
 	m.transitionMembers = m.transitionMembers[:0]
 	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
@@ -2270,6 +2382,22 @@ func (m *Machine) persistTransitionRows(
 				return err
 			}
 		}
+		for i := range plan.routeGateRows {
+			row := &plan.routeGateRows[i]
+			if row.delete {
+				err = systemBatch.Delete(row.key)
+			} else {
+				err = systemBatch.Put(row.key, row.value)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if len(plan.routeGateResult) != 0 {
+			if err = systemBatch.Put(plan.routeGateResultKey[:], plan.routeGateResult); err != nil {
+				return err
+			}
+		}
 		if len(captureRecord) != 0 {
 			captureBatch, captureErr := batch.CollectionHandle(m.captureTarget.Collection)
 			if captureErr != nil {
@@ -2321,6 +2449,11 @@ func (m *Machine) persistTransitionRows(
 	}
 	if err != nil {
 		return err
+	}
+	if plan.routeGateApply {
+		if outcome := m.routeGate.Apply(plan.routeGateCommand); outcome != plan.routeGateOutcome {
+			return ErrStateCorrupt
+		}
 	}
 	if len(changes) == 0 && m.openedBundleImageCurrent() {
 		m.openedImageApplied = next.Applied
@@ -2464,6 +2597,25 @@ func (m *Machine) checkTransitionCapacityWithCaptureRows(
 			return ErrAdmissionBound
 		}
 		stateBytes += len(row.key) + len(row.value)
+		systemDocs++
+	}
+	for i := range plan.routeGateRows {
+		row := &plan.routeGateRows[i]
+		if len(row.key) == 0 || (!row.delete && (len(row.value) == 0 ||
+			len(row.value) > m.system.Limits.MaxDocumentBytes)) ||
+			stateBytes > math.MaxInt-len(row.key)-len(row.value) {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(row.key) + len(row.value)
+		systemDocs++
+	}
+	if len(plan.routeGateResult) != 0 {
+		if plan.resultCode != ResultRouteGate ||
+			len(plan.routeGateResult) != routeGateResultBytes ||
+			stateBytes > math.MaxInt-len(plan.routeGateResultKey)-len(plan.routeGateResult) {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(plan.routeGateResultKey) + len(plan.routeGateResult)
 		systemDocs++
 	}
 	if len(stateEnvelope) > m.system.Limits.MaxDocumentBytes ||

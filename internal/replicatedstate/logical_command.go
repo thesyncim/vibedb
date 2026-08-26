@@ -54,6 +54,12 @@ func LogicalCommandDigest(command replication.CommandView) [32]byte {
 		_, _ = h.Write(length[:])
 		_, _ = h.Write(ledger)
 	}
+	if command.Kind() == replication.CommandRouteGate {
+		routeGate := command.RouteGateBytes()
+		binary.LittleEndian.PutUint64(length[:], uint64(len(routeGate)))
+		_, _ = h.Write(length[:])
+		_, _ = h.Write(routeGate)
+	}
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = h.Write(scalar[:])
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.MutationCount()))

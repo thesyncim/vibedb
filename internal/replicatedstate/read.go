@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -22,6 +23,41 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	return m.lookupCompletion(data, nil)
 }
 
+// RouteGateStatus returns the durable shard-local request-pin/topology-drain
+// cut installed by committed apply. Linearizable callers fence it with this
+// data group's ReadIndex.
+func (m *Machine) RouteGateStatus() (routegate.Status, error) {
+	if m == nil {
+		return routegate.Status{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return routegate.Status{}, err
+	}
+	if !m.initialized || m.routeGate == nil {
+		return routegate.Status{}, ErrWrongBinding
+	}
+	return m.routeGate.Status(), nil
+}
+
+// RouteGatePin returns one durable retained pin from the committed state cut.
+func (m *Machine) RouteGatePin(identity routegate.Identity) (routegate.PinRecord, bool, error) {
+	if m == nil || identity == (routegate.Identity{}) {
+		return routegate.PinRecord{}, false, ErrSessionCorrupt
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return routegate.PinRecord{}, false, err
+	}
+	if !m.initialized || m.routeGate == nil {
+		return routegate.PinRecord{}, false, ErrWrongBinding
+	}
+	record, found := m.routeGate.Pin(identity)
+	return record, found, nil
+}
+
 // LookupCompletionInto is LookupCompletion with caller-owned result storage.
 // dst is reused from length zero. It must have capacity for the largest
 // ordinary mutation/session completion so lookup never allocates result bytes.
@@ -29,7 +65,20 @@ func (m *Machine) LookupCompletionInto(
 	data []byte,
 	dst []byte,
 ) (CompletionLookup, error) {
-	if cap(dst) < MaxMutationCompletionEnvelopeBytes {
+	command, err := replication.OpenCommand(data)
+	if err != nil {
+		return CompletionLookup{}, err
+	}
+	required := MaxMutationCompletionEnvelopeBytes
+	switch command.Kind() {
+	case replication.CommandRouteGate:
+		required = MaxRouteGateCompletionEnvelopeBytes
+	case replication.CommandTransaction:
+		required = MaxTransactionCompletionEnvelopeBytes
+	case replication.CommandRequestLedger:
+		required = MaxCompletionEnvelopeBytes
+	}
+	if cap(dst) < required {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
 	result, err := m.lookupCompletion(
@@ -168,18 +217,26 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 		return CompletionLookup{}, ErrWrongBinding
 	}
 	if command.Kind() == replication.CommandTransaction &&
-		cap(dst) < MaxCompletionEnvelopeBytes {
+		cap(dst) < MaxTransactionCompletionEnvelopeBytes {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
 	if command.Kind() == replication.CommandRequestLedger &&
 		cap(dst) < MaxCompletionEnvelopeBytes {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
+	if command.Kind() == replication.CommandRouteGate &&
+		cap(dst) < MaxRouteGateCompletionEnvelopeBytes {
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
 	if command.Kind() != replication.CommandTransaction &&
 		command.Kind() != replication.CommandRequestLedger {
+		limit := MaxMutationCompletionEnvelopeBytes
+		if command.Kind() == replication.CommandRouteGate {
+			limit = MaxRouteGateCompletionEnvelopeBytes
+		}
 		result, err := m.lookupCompletionAtSnapshot(
 			command,
-			dst[:0:MaxMutationCompletionEnvelopeBytes],
+			dst[:0:limit],
 			workspace,
 		)
 		if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
@@ -187,9 +244,13 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 		}
 		return result, err
 	}
+	limit := MaxCompletionEnvelopeBytes
+	if command.Kind() == replication.CommandTransaction {
+		limit = MaxTransactionCompletionEnvelopeBytes
+	}
 	result, err := m.lookupCompletionAtSnapshot(
 		command,
-		dst[:0:MaxCompletionEnvelopeBytes],
+		dst[:0:limit],
 		workspace,
 	)
 	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
@@ -261,8 +322,16 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	if (command.Kind() == replication.CommandTransaction ||
-		command.Kind() == replication.CommandRequestLedger) && completionScratch != nil &&
+	if command.Kind() == replication.CommandTransaction && completionScratch != nil &&
+		cap(completionScratch) < MaxTransactionCompletionEnvelopeBytes {
+		endErr := m.EndCompletionLookupBatch(&workspace)
+		_ = workspace.Release()
+		if endErr != nil {
+			return CompletionLookup{}, endErr
+		}
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
+	if command.Kind() == replication.CommandRequestLedger && completionScratch != nil &&
 		cap(completionScratch) < MaxCompletionEnvelopeBytes {
 		endErr := m.EndCompletionLookupBatch(&workspace)
 		_ = workspace.Release()
@@ -271,9 +340,20 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
-	if (command.Kind() == replication.CommandTransaction ||
-		command.Kind() == replication.CommandRequestLedger) && completionScratch != nil {
+	if command.Kind() == replication.CommandTransaction && completionScratch != nil {
+		completionScratch = completionScratch[:0:MaxTransactionCompletionEnvelopeBytes]
+	} else if command.Kind() == replication.CommandRequestLedger && completionScratch != nil {
 		completionScratch = completionScratch[:0:MaxCompletionEnvelopeBytes]
+	} else if command.Kind() == replication.CommandRouteGate && completionScratch != nil {
+		if cap(completionScratch) < MaxRouteGateCompletionEnvelopeBytes {
+			endErr := m.EndCompletionLookupBatch(&workspace)
+			_ = workspace.Release()
+			if endErr != nil {
+				return CompletionLookup{}, endErr
+			}
+			return CompletionLookup{}, ErrCompletionBufferSmall
+		}
+		completionScratch = completionScratch[:0:MaxRouteGateCompletionEnvelopeBytes]
 	} else if completionScratch != nil {
 		completionScratch = completionScratch[:0:MaxMutationCompletionEnvelopeBytes]
 	}
@@ -489,14 +569,28 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	}
 	var completionBytes []byte
 	if slotErr == nil {
-		completionBytes, slotErr = m.appendSessionCompletion(
-			completionScratch[:0], session, record,
-		)
+		if record.ResultCode == ResultRouteGate {
+			if completionScratch != nil && cap(completionScratch) < MaxRouteGateCompletionEnvelopeBytes {
+				slotErr = ErrCompletionBufferSmall
+			} else {
+				completionBytes, slotErr = m.appendRouteGateCompletionAt(
+					pointSnapshot{value: snapshot}, completionScratch[:0], session, record,
+					workspace.decodeRead[:0],
+				)
+			}
+		} else {
+			completionBytes, slotErr = m.appendSessionCompletion(
+				completionScratch[:0], session, record,
+			)
+		}
 		if slotErr != nil {
 			slotErr = fmt.Errorf("%w: reconstruct completion: %v", ErrSessionCorrupt, slotErr)
 		}
 	}
 	if slotErr != nil {
+		if errors.Is(slotErr, ErrCompletionBufferSmall) {
+			return CompletionLookup{}, slotErr
+		}
 		return CompletionLookup{}, m.fail(slotErr)
 	}
 	result := CompletionLookup{
@@ -509,6 +603,60 @@ func (m *Machine) lookupCompletionAtSnapshot(
 		return result, &RequestConflictError{Key: digest}
 	}
 	return result, nil
+}
+
+func (m *Machine) appendRouteGateCompletionAt(
+	snapshot pointSnapshot,
+	dst []byte,
+	session SessionView,
+	slot SessionSlotView,
+	readScratch []byte,
+) ([]byte, error) {
+	if slot.ResultCode != ResultRouteGate || session.Digest != slot.SessionDigest ||
+		session.ClientEpoch != slot.ClientEpoch {
+		return dst, ErrSessionCorrupt
+	}
+	key, err := routeGateResultStorageKey(slot.SessionDigest, slot.Slot)
+	if err != nil {
+		return dst, err
+	}
+	raw, found, err := snapshot.appendRaw(readScratch[:0], key[:])
+	if err != nil || !found {
+		if err == nil {
+			err = ErrSessionCorrupt
+		}
+		return dst, err
+	}
+	record, err := openRouteGateResult(raw)
+	if err != nil || record.SessionDigest != slot.SessionDigest || record.Slot != slot.Slot ||
+		record.ClientEpoch != slot.ClientEpoch || record.ClientSequence != slot.ClientSequence {
+		return dst, errors.Join(err, ErrSessionCorrupt)
+	}
+	var result [routegate.OutcomeBytes]byte
+	resultBytes, err := routegate.AppendOutcome(result[:0], record.Outcome)
+	if err != nil {
+		return dst, ErrSessionCorrupt
+	}
+	resultDigest := replication.CompletionResultDigest(
+		ResultRouteGate, ResultFormatRouteGate, resultBytes,
+	)
+	return replication.AppendCompletionBytes(dst, replication.CompletionBytes{
+		ClusterID: m.binding.ClusterID, ClusterIncarnation: m.binding.ClusterIncarnation,
+		TopologyRecoveryEpoch: m.binding.TopologyRecoveryEpoch,
+		Distribution:          m.distribution, Shard: m.shard,
+		AllocationGeneration: m.binding.AllocationGeneration,
+		ShardIncarnation:     m.binding.ShardIncarnation, GroupID: m.binding.GroupID,
+		ReplicaSetVersion:      slot.ReplicaSetVersion,
+		ActivePolicyGeneration: slot.ActivePolicyGeneration,
+		ProtectionEpoch:        slot.ProtectionEpoch, RoutingVersion: slot.RoutingVersion,
+		RouteGeneration: slot.RouteGeneration, Tenant: session.Tenant,
+		ClientID: session.ClientID, ClientEpoch: slot.ClientEpoch,
+		ClientSequence: slot.ClientSequence, Fingerprint: slot.Fingerprint,
+		RetryHome: session.RetryHome, AppliedSequence: slot.AppliedSequence,
+		ResultCode: ResultRouteGate, ResultFormat: ResultFormatRouteGate,
+		Storage: replication.CompletionInline, ResultLength: uint64(len(resultBytes)),
+		ResultDigest: resultDigest, InlineResult: resultBytes,
+	})
 }
 
 // LookupSessionLease returns the exact retained lease and sequence fence for
@@ -862,10 +1010,10 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	if err != nil {
 		return nil, m.fail(err)
 	}
-	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
+	state, present, sessionCount, slotCount, authorityCount, _, err := scanSessionSystemSnapshot(
 		systemSnapshot, m.options.MaxSessions, m.options.RetryWindow,
 		m.options.RequestLedgerCapacityBytes, m.options.RequestLedgerCleanupReserveBytes,
-		m.options.RequestLedgerRange,
+		m.options.RequestLedgerRange, m.routeGateMaxRecords,
 	)
 	if err != nil || present != m.initialized {
 		closeErr := cut.Close()

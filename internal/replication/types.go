@@ -70,6 +70,7 @@ const (
 	commandWireTransaction     = uint8(7)
 	// Wire kind 8 is owned by the route-gate command family. Request-ledger is
 	// fixed at 9 in the cross-package command registry.
+	commandWireRouteGate     = uint8(8)
 	commandWireRequestLedger = uint8(9)
 	sessionLeaseBodyBytes    = 16
 	transactionLengthBytes   = 4
@@ -188,6 +189,11 @@ const (
 	// lifecycle transition. Its byte-native body is interpreted by the request
 	// ledger state machine and never carries user relation mutations.
 	CommandRequestLedger
+	// CommandRouteGate orders one durable request pin or topology drain on this
+	// data shard's own Raft log. It carries exactly one canonical routegate
+	// command. Shared pin operations require data authority; exclusive drains
+	// and compaction require topology authority.
+	CommandRouteGate
 )
 
 // MutationKind selects one logical relation mutation.

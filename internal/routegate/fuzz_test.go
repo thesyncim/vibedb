@@ -108,6 +108,7 @@ func FuzzMachineTransitions(f *testing.F) {
 func assertMachineInvariant(t testing.TB, machine *Machine) {
 	t.Helper()
 	if machine == nil || machine.epoch == 0 || uint64(len(machine.pins)) > machine.maxRecords ||
+		machine.retainedPins != uint64(len(machine.pins)) ||
 		machine.activePins > uint64(len(machine.pins)) ||
 		machine.releasedPins != uint64(len(machine.pins))-machine.activePins ||
 		!validDrainSnapshot(machine.drain, machine.epoch, machine.activePins) {

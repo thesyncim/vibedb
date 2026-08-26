@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -792,6 +793,15 @@ func validateCompletionLookup(
 			completion.ResultLength != uint64(len(completion.InlineResult)) ||
 			result.Role != identity.transactionRole ||
 			result.Operation != identity.transactionOperation {
+			return ErrSettlementResult
+		}
+	} else if identity.kind == replication.CommandRouteGate {
+		if completion.ResultFormat != replicatedstate.ResultFormatRouteGate ||
+			completion.ResultCode != replicatedstate.ResultRouteGate ||
+			completion.ResultLength != uint64(len(completion.InlineResult)) {
+			return ErrSettlementResult
+		}
+		if _, resultErr := routegate.OpenOutcome(completion.InlineResult); resultErr != nil {
 			return ErrSettlementResult
 		}
 	} else {

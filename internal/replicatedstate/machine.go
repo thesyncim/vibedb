@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -64,6 +65,8 @@ type Machine struct {
 	options               Options
 	transactionIntents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
 	transactionIntentKeys []byte
+	routeGate             *routegate.Machine
+	routeGateMaxRecords   uint64
 	applyCut              durable.DatabaseSnapshot
 	capture               TransitionCapture
 	captureTarget         TransitionCaptureTarget
@@ -162,6 +165,7 @@ func OpenBundle(
 		manifest, relations, options.MaxSessions, options.RetryWindow,
 		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
 		options.RequestLedgerRange,
+		routeGateRecordLimit(),
 	)
 	if err != nil {
 		return nil, err
@@ -245,10 +249,10 @@ func OpenBundle(
 		return nil, fmt.Errorf("%w: missing system snapshot", ErrInconsistentSnapshot)
 	}
 	var openedTransactions scannedTransactions
-	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
+	state, present, sessionCount, slotCount, authorityCount, openedRouteGate, err := scanSessionSystemSnapshot(
 		systemSnapshot, options.MaxSessions, options.RetryWindow,
 		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
-		options.RequestLedgerRange, &openedTransactions,
+		options.RequestLedgerRange, m.routeGateMaxRecords, &openedTransactions,
 	)
 	if err != nil {
 		return nil, err
@@ -282,6 +286,7 @@ func OpenBundle(
 		for i := range m.relations {
 			m.relations[i].openedApplied = 0
 		}
+		m.routeGate = openedRouteGate
 		return m, nil
 	}
 	if m.checkpointGroup != nil && m.checkpointGroup.SeedStateAuthoritative() {
@@ -346,6 +351,7 @@ func OpenBundle(
 	m.publication = publicationFromState(state)
 	m.transactionIntents = openedTransactions.intents
 	m.transactionIntentKeys = openedTransactions.intentKeys
+	m.routeGate = openedRouteGate
 	if options.TransitionCapture != nil {
 		if err := m.beginTransitionCapture(options.TransitionCapture); err != nil {
 			return nil, err
@@ -356,6 +362,8 @@ func OpenBundle(
 
 func newMachineFromOpenInputs(prepared openInputs) *Machine {
 	binding := prepared.binding
+	routeGateMax := routeGateRecordLimit()
+	gate, _ := routegate.NewMachine(1, routeGateMax)
 	return &Machine{
 		binding: binding, bootstrap: prepared.bootstrap,
 		bootstrapDigest: prepared.bootstrapDigest, system: prepared.system,
@@ -366,10 +374,18 @@ func newMachineFromOpenInputs(prepared openInputs) *Machine {
 		applyContract: prepared.applyContract,
 		dataChainHash: newDataChainHasher(),
 		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
-		options:               prepared.options,
+		options:   prepared.options,
+		routeGate: gate, routeGateMaxRecords: routeGateMax,
 		reservedCaptureTarget: prepared.options.TransitionCaptureTarget,
 		transitionMembers:     make([]durable.NamedCollection, 0, len(prepared.relations)+2),
 	}
+}
+
+func routeGateRecordLimit() uint64 {
+	// Every command mutates at most one pin row, so physical transaction
+	// geometry does not constrain concurrent participants. The only retained
+	// bound is the exact 64 MiB canonical gate-image ceiling.
+	return routegate.MaxRetainedRecords
 }
 
 func prepareOpenInputs(
@@ -435,7 +451,8 @@ func prepareOpenInputs(
 	}
 	maxSystemDocument := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
-		MaxAuthorityBindingBytes,
+		MaxAuthorityBindingBytes, routegate.HeadBytes, routegate.StoredPinBytes,
+		routeGateResultBytes,
 	)
 	hotSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxAuthorityBindingBytes +
@@ -456,6 +473,14 @@ func prepareOpenInputs(
 			requestledger.MaxCommandBytes+MaxStateEnvelopeBytes+
 				MaxDistinctMutations*requestledger.PageStorageKeyBytes)
 	}
+	routeGateHotBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxSessionRecordBytes +
+		sha256.Size + 3 + MaxSessionSlotRecordBytes +
+		len(routeGateHeadKey) + routegate.HeadBytes +
+		routeGatePinKeyBytes + routegate.StoredPinBytes +
+		routeGateResultKeyBytes + routeGateResultBytes
+	maxSystemBatchBytes = max(maxSystemBatchBytes, routeGateHotBatchBytes)
+	maxSystemDocuments = max(maxSystemDocuments, 6)
 	if system.Limits.MaxKeyBytes < sha256.Size+3 ||
 		system.Limits.MaxDocumentBytes < maxSystemDocument ||
 		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
@@ -505,6 +530,7 @@ func prepareOpenInputs(
 			manifest, relations, options.MaxSessions, options.RetryWindow,
 			options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
 			options.RequestLedgerRange,
+			routeGateRecordLimit(),
 		)
 		if relationErr != nil {
 			return openInputs{}, relationErr
@@ -715,13 +741,19 @@ func scanSessionSystemSnapshot(
 	requestLedgerCapacity uint64,
 	requestLedgerCleanup uint64,
 	requestLedgerRange RequestLedgerRange,
+	routeGateMaxRecords uint64,
 	transactionResult ...*scannedTransactions,
-) (State, bool, uint64, uint64, uint64, error) {
+) (State, bool, uint64, uint64, uint64, *routegate.Machine, error) {
 	var state State
 	var statePresent bool
 	var sessionCount, slotCount, authorityCount uint64
 	var sessions map[[sha256.Size]byte]scannedSession
 	var authorities map[[sha256.Size]byte]replication.CommandAuthorityClass
+	var knownSessionDigests map[[sha256.Size]byte]struct{}
+	var routeGateStatus routegate.Status
+	var routeGateHeadPresent bool
+	var routeGateRecords []routegate.PinRecord
+	var routeGateResultCount uint64
 	var activeIdentities map[[sha256.Size]byte][sha256.Size]byte
 	var tenantArena []byte
 	var sessionEpochs []uint64
@@ -790,6 +822,8 @@ func scanSessionSystemSnapshot(
 			}
 			sessions = make(map[[sha256.Size]byte]scannedSession, int(state.SessionCount))
 			authorities = make(map[[sha256.Size]byte]replication.CommandAuthorityClass,
+				int(state.AuthorityBindingCount))
+			knownSessionDigests = make(map[[sha256.Size]byte]struct{},
 				int(state.AuthorityBindingCount))
 			activeIdentities = make(map[[sha256.Size]byte][sha256.Size]byte, int(state.SessionCount))
 			if state.SessionCount > math.MaxInt32/16 {
@@ -924,7 +958,52 @@ func scanSessionSystemSnapshot(
 				}
 			}
 			authorities[view.Digest] = view.AuthorityClass
+			knownSessionDigests[SessionKey(view.AuthorityClass, view.Tenant, view.ClientID)] = struct{}{}
 			authorityCount++
+			return nil
+
+		case bytes.Equal(key, routeGateHeadKey):
+			if !statePresent || routeGateHeadPresent || routeGateMaxRecords == 0 {
+				return fmt.Errorf("%w: route-gate head", ErrStateCorrupt)
+			}
+			var headErr error
+			routeGateStatus, headErr = routegate.OpenHead(value)
+			if headErr != nil || routeGateStatus.RetainedRecords > routeGateMaxRecords ||
+				routeGateStatus.RetainedRecords > math.MaxInt32 {
+				return errors.Join(headErr, fmt.Errorf("%w: route-gate head", ErrStateCorrupt))
+			}
+			routeGateRecords = make([]routegate.PinRecord, 0, int(routeGateStatus.RetainedRecords))
+			routeGateHeadPresent = true
+			return nil
+
+		case len(key) == routeGatePinKeyBytes && key[0] == routeGatePinPrefix:
+			if !statePresent || !routeGateHeadPresent ||
+				uint64(len(routeGateRecords)) >= routeGateStatus.RetainedRecords {
+				return fmt.Errorf("%w: route-gate pin", ErrStateCorrupt)
+			}
+			var identity routegate.Identity
+			copy(identity[:], key[1:])
+			record, pinErr := routegate.OpenStoredPin(identity, value)
+			want, keyErr := routeGatePinStorageKey(identity)
+			if pinErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+				return errors.Join(pinErr, keyErr, fmt.Errorf("%w: route-gate pin", ErrStateCorrupt))
+			}
+			routeGateRecords = append(routeGateRecords, record)
+			return nil
+
+		case len(key) == routeGateResultKeyBytes && key[0] == routeGateResultPrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: route-gate result", ErrStateCorrupt)
+			}
+			record, resultErr := openRouteGateResult(value)
+			want, keyErr := routeGateResultStorageKey(record.SessionDigest, record.Slot)
+			if resultErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+				return errors.Join(resultErr, keyErr, fmt.Errorf("%w: route-gate result", ErrStateCorrupt))
+			}
+			if _, known := knownSessionDigests[record.SessionDigest]; !known {
+				return fmt.Errorf("%w: unbound route-gate result", ErrStateCorrupt)
+			}
+			routeGateResultCount++
 			return nil
 
 		case len(key) == transactionControlStorageKeyBytes && key[0] == transactionControlPrefix:
@@ -1171,23 +1250,47 @@ func scanSessionSystemSnapshot(
 		}
 	})
 	if err != nil {
-		return State{}, false, 0, 0, 0, err
+		return State{}, false, 0, 0, 0, nil, err
 	}
 	if err := finishMutationScan(); err != nil {
-		return State{}, false, 0, 0, 0, err
+		return State{}, false, 0, 0, 0, nil, err
 	}
 	if err := ledgerScan.finish(state); err != nil {
-		return State{}, false, 0, 0, 0, err
+		return State{}, false, 0, 0, 0, nil, err
 	}
 	if !statePresent {
-		if sessionCount != 0 || slotCount != 0 || authorityCount != 0 {
-			return State{}, false, 0, 0, 0, fmt.Errorf("%w: rows without state", ErrStateCorrupt)
+		if sessionCount != 0 || slotCount != 0 || authorityCount != 0 || routeGateHeadPresent ||
+			len(routeGateRecords) != 0 || routeGateResultCount != 0 {
+			return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: rows without state", ErrStateCorrupt)
 		}
-		return State{}, false, 0, 0, 0, nil
+		gate, gateOK := routegate.NewMachine(1, routeGateMaxRecords)
+		if !gateOK {
+			return State{}, false, 0, 0, 0, nil, ErrInvalidOptions
+		}
+		return State{}, false, 0, 0, 0, gate, nil
 	}
 	if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount ||
 		authorityCount != state.AuthorityBindingCount {
-		return State{}, false, 0, 0, 0, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
+		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
+	}
+	if routeGateResultCount > authorityCount*uint64(retryWindow) {
+		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: route-gate result bound", ErrStateCorrupt)
+	}
+	var openedRouteGate *routegate.Machine
+	if routeGateHeadPresent {
+		var restoreErr error
+		openedRouteGate, restoreErr = routegate.RestoreMachine(
+			routeGateStatus, routeGateMaxRecords, routeGateRecords,
+		)
+		if restoreErr != nil {
+			return State{}, false, 0, 0, 0, nil, errors.Join(restoreErr, ErrStateCorrupt)
+		}
+	} else {
+		var ok bool
+		openedRouteGate, ok = routegate.NewMachine(1, routeGateMaxRecords)
+		if !ok || len(routeGateRecords) != 0 || routeGateResultCount != 0 {
+			return State{}, false, 0, 0, 0, nil, ErrStateCorrupt
+		}
 	}
 	// Session tokens are Raft apply indices and therefore shard-wide unique. A
 	// compact sorted vector costs eight bytes per active session—materially less
@@ -1196,13 +1299,13 @@ func scanSessionSystemSnapshot(
 	slices.Sort(sessionEpochs)
 	for i := 1; i < len(sessionEpochs); i++ {
 		if sessionEpochs[i-1] == sessionEpochs[i] {
-			return State{}, false, 0, 0, 0, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
+			return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
 		}
 	}
 	for authorityDigest, sessionDigest := range activeIdentities {
 		summary := sessions[sessionDigest]
 		if class, ok := authorities[authorityDigest]; !ok || class != summary.authorityClass {
-			return State{}, false, 0, 0, 0,
+			return State{}, false, 0, 0, 0, nil,
 				fmt.Errorf("%w: session authority binding digest=%x class=%d",
 					ErrSessionCorrupt, authorityDigest, summary.authorityClass)
 		}
@@ -1224,7 +1327,7 @@ func scanSessionSystemSnapshot(
 			summary.status == SessionActive && isSessionTerminalResult(summary.latestResult) ||
 			summary.latestResult == ResultSessionRevoked && summary.leaseDeadline != 0 ||
 			summary.latestResult == ResultSessionRetired && summary.leaseDeadline == 0 {
-			return State{}, false, 0, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
+			return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
 		}
 	}
 	if transactionControlCount != state.TransactionControlCount ||
@@ -1233,7 +1336,7 @@ func scanSessionSystemSnapshot(
 		transactionIntentRows != state.TransactionIntentRows ||
 		transactionResidentBytes != state.TransactionResidentBytes ||
 		uint64(len(activeTransactionIntents)) != state.TransactionIntentRows {
-		return State{}, false, 0, 0, 0,
+		return State{}, false, 0, 0, 0, nil,
 			fmt.Errorf("%w: transaction image accounting", ErrTransactionStateCorrupt)
 	}
 	for _, summary := range transactionControls {
@@ -1243,12 +1346,12 @@ func scanSessionSystemSnapshot(
 			summary.residentManifest != control.ResidentManifestBytes ||
 			summary.residentMutation != control.ResidentMutationBytes ||
 			summary.residentIntent != control.ResidentIntentBytes {
-			return State{}, false, 0, 0, 0,
+			return State{}, false, 0, 0, 0, nil,
 				fmt.Errorf("%w: transaction resident counters", ErrTransactionStateCorrupt)
 		}
 		if control.Role == distributedtxn.ReplicatedRoleCoordinator {
 			if !summary.payloadSeen || summary.residentPayload == 0 || summary.payloadRows == 0 {
-				return State{}, false, 0, 0, 0,
+				return State{}, false, 0, 0, 0, nil,
 					fmt.Errorf("%w: coordinator creation payload", ErrTransactionStateCorrupt)
 			}
 			if control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator {
@@ -1258,7 +1361,7 @@ func scanSessionSystemSnapshot(
 					summary.manifestNextParticipant != control.ManifestNextParticipant ||
 					summary.manifestEncodedBytes != control.ManifestEncodedBytes ||
 					summary.manifestChain != control.ManifestChainDigest {
-					return State{}, false, 0, 0, 0,
+					return State{}, false, 0, 0, 0, nil,
 						fmt.Errorf("%w: manifest progress witness", ErrTransactionStateCorrupt)
 				}
 				descriptor := summary.manifestDescriptor
@@ -1269,12 +1372,12 @@ func scanSessionSystemSnapshot(
 					summary.manifestChain, descriptor.ParticipantCount,
 					descriptor.EncodedBytes, descriptor.SegmentCount,
 				) != descriptor.Root {
-					return State{}, false, 0, 0, 0,
+					return State{}, false, 0, 0, 0, nil,
 						fmt.Errorf("%w: manifest root", ErrTransactionStateCorrupt)
 				}
 				if distributedtxn.CoordinatorState(control.State) == distributedtxn.CoordinatorCommitted &&
 					!complete {
-					return State{}, false, 0, 0, 0,
+					return State{}, false, 0, 0, 0, nil,
 						fmt.Errorf("%w: committed incomplete manifest", ErrTransactionStateCorrupt)
 				}
 			}
@@ -1283,12 +1386,12 @@ func scanSessionSystemSnapshot(
 		if summary.mutationRows != control.PayloadCount ||
 			uint64(len(summary.mutationKeys)) != summary.intentRows ||
 			summary.intentRows == 0 {
-			return State{}, false, 0, 0, 0,
+			return State{}, false, 0, 0, 0, nil,
 				fmt.Errorf("%w: participant child row counts", ErrTransactionStateCorrupt)
 		}
 		for _, mutationKey := range summary.mutationKeys {
 			if !mutationKey.intentSeen {
-				return State{}, false, 0, 0, 0,
+				return State{}, false, 0, 0, 0, nil,
 					fmt.Errorf("%w: participant mutation lacks intent", ErrTransactionStateCorrupt)
 			}
 		}
@@ -1297,7 +1400,7 @@ func scanSessionSystemSnapshot(
 		transactionResult[0].intents = activeTransactionIntents
 		transactionResult[0].intentKeys = transactionIntentKeys
 	}
-	return state, true, sessionCount, slotCount, authorityCount, nil
+	return state, true, sessionCount, slotCount, authorityCount, openedRouteGate, nil
 }
 
 func transactionControlActive(control TransactionControl) bool {
@@ -1419,14 +1522,24 @@ func (o sessionAppliedOrder) finish(high uint64, window uint16) error {
 }
 
 func (m *Machine) validateCompletionResult(completion replication.CompletionView) error {
-	if completion.ResultFormat != ResultFormatMutation ||
-		!isSessionResultCode(completion.ResultCode) {
+	switch completion.ResultFormat {
+	case ResultFormatMutation:
+		if !isMutationResultCode(completion.ResultCode) {
+			return fmt.Errorf("%w: unsupported mutation result grammar", ErrCompletionCorrupt)
+		}
+		_, err := OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult)
+		return err
+	case ResultFormatRouteGate:
+		if completion.ResultCode != ResultRouteGate {
+			return fmt.Errorf("%w: unsupported route-gate result grammar", ErrCompletionCorrupt)
+		}
+		if _, err := routegate.OpenOutcome(completion.InlineResult); err != nil {
+			return fmt.Errorf("%w: route-gate outcome", ErrCompletionCorrupt)
+		}
+		return nil
+	default:
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
-	if _, err := OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult); err != nil {
-		return err
-	}
-	return nil
 }
 
 func publicationFromState(state State) raftmodel.Publication {

@@ -20,11 +20,16 @@ const (
 	// mutation precondition failure.
 	ResultTransactionConflict uint32 = 13
 
-	transactionCompletionResultBytes = 24
-	// MaxCompletionEnvelopeBytes is the sole shipped completion-envelope bound.
-	// A transaction carries the largest fixed result (24 bytes); ordinary
-	// mutation/session completions use the smaller mutation envelope bound.
-	MaxCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + RequestLedgerCompletionResultBytes
+	transactionCompletionResultBytes      = 24
+	MaxTransactionCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes +
+		transactionCompletionResultBytes
+	// MaxCompletionEnvelopeBytes is the largest fixed result across the frozen
+	// transaction, route-gate, and request-ledger grammars.
+	MaxCompletionEnvelopeBytes = max(
+		MaxTransactionCompletionEnvelopeBytes,
+		MaxRouteGateCompletionEnvelopeBytes,
+		replication.MaxEmptyResultCompletionEnvelopeBytes+RequestLedgerCompletionResultBytes,
+	)
 )
 
 const (

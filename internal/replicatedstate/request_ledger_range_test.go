@@ -41,7 +41,9 @@ func TestRequestLedgerRangeAndSemanticsBindApplyContract(t *testing.T) {
 	relations := []relationCollection{{id: 1}}
 	base := RequestLedgerRange{Start: requestledger.LedgerHome{0x20},
 		End: requestledger.LedgerHome{0x40}, Identity: requestledger.Digest{1}}
-	digest, err := bundleApplyContractDigest(manifest, relations, 8, 4, 1<<20, 4096, base)
+	digest, err := bundleApplyContractDigest(
+		manifest, relations, 8, 4, 1<<20, 4096, base, routeGateRecordLimit(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +55,7 @@ func TestRequestLedgerRangeAndSemanticsBindApplyContract(t *testing.T) {
 		candidate := base
 		mutate(&candidate)
 		other, otherErr := bundleApplyContractDigest(
-			manifest, relations, 8, 4, 1<<20, 4096, candidate,
+			manifest, relations, 8, 4, 1<<20, 4096, candidate, routeGateRecordLimit(),
 		)
 		if otherErr != nil {
 			t.Fatal(otherErr)
@@ -63,7 +65,7 @@ func TestRequestLedgerRangeAndSemanticsBindApplyContract(t *testing.T) {
 		}
 	}
 	disabled, err := bundleApplyContractDigest(
-		manifest, relations, 8, 4, 0, 0, RequestLedgerRange{},
+		manifest, relations, 8, 4, 0, 0, RequestLedgerRange{}, routeGateRecordLimit(),
 	)
 	if err != nil || disabled == digest {
 		t.Fatalf("disabled contract = %x, %v", disabled, err)

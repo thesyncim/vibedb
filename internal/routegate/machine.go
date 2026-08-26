@@ -113,6 +113,7 @@ type Machine struct {
 	epoch        uint64
 	activePins   uint64
 	releasedPins uint64
+	retainedPins uint64
 	maxRecords   uint64
 	pins         map[Identity]storedPin
 	drain        DrainRecord
@@ -138,7 +139,7 @@ func (machine *Machine) Status() Status {
 	return Status{
 		Revision: machine.revision, Epoch: machine.epoch,
 		ActivePins: machine.activePins, ReleasedPins: machine.releasedPins,
-		RetainedRecords: uint64(len(machine.pins)), Drain: machine.drain,
+		RetainedRecords: machine.retainedPins, Drain: machine.drain,
 	}
 }
 
@@ -158,6 +159,22 @@ func (machine *Machine) Pin(identity Identity) (PinRecord, bool) {
 
 // Apply performs one deterministic replicated transition.
 func (machine *Machine) Apply(command Command) Outcome {
+	return machine.apply(command, true)
+}
+
+// Preview returns the exact next outcome without mutating the gate. It reads
+// at most the addressed pin plus the fixed head and allocates no memory. A
+// state-machine adapter can therefore persist the derived rows atomically and
+// invoke Apply only after durable commit, without cloning the retained map.
+func (machine *Machine) Preview(command Command) Outcome {
+	if machine == nil {
+		return Outcome{Reason: ReasonInvalid}
+	}
+	preview := *machine
+	return preview.apply(command, false)
+}
+
+func (machine *Machine) apply(command Command, writePins bool) Outcome {
 	if machine == nil || !validCommand(command) {
 		return Outcome{Reason: ReasonInvalid}
 	}
@@ -165,22 +182,22 @@ func (machine *Machine) Apply(command Command) Outcome {
 	var mutated bool
 	switch command.Operation {
 	case OperationAcquireShared:
-		reason, mutated = machine.acquire(command)
+		reason, mutated = machine.acquire(command, writePins)
 	case OperationReleaseShared:
-		reason, mutated = machine.release(command)
+		reason, mutated = machine.release(command, writePins)
 	case OperationBeginExclusive:
 		reason, mutated = machine.beginDrain(command)
 	case OperationReleaseExclusive:
 		reason, mutated = machine.releaseDrain(command)
 	case OperationCompactReleased:
-		reason, mutated = machine.compact(command)
+		reason, mutated = machine.compact(command, writePins)
 	default:
 		reason = ReasonInvalid
 	}
 	return Outcome{Reason: reason, Mutated: mutated, Status: machine.Status()}
 }
 
-func (machine *Machine) acquire(command Command) (Reason, bool) {
+func (machine *Machine) acquire(command Command, writePin bool) (Reason, bool) {
 	if command.Epoch != machine.epoch {
 		return ReasonStaleEpoch, false
 	}
@@ -196,21 +213,24 @@ func (machine *Machine) acquire(command Command) (Reason, bool) {
 	if machine.drain.State == DrainPending || machine.drain.State == DrainActive {
 		return ReasonBlockedByDrain, false
 	}
-	if uint64(len(machine.pins)) == machine.maxRecords {
+	if machine.retainedPins == machine.maxRecords {
 		return ReasonCapacity, false
 	}
 	if !machine.canMutate() {
 		return ReasonExhausted, false
 	}
-	machine.pins[command.Identity] = storedPin{
-		Binding: command.Binding, Epoch: command.Epoch, State: PinHeld,
+	if writePin {
+		machine.pins[command.Identity] = storedPin{
+			Binding: command.Binding, Epoch: command.Epoch, State: PinHeld,
+		}
 	}
 	machine.activePins++
+	machine.retainedPins++
 	machine.revision++
 	return ReasonAcquired, true
 }
 
-func (machine *Machine) release(command Command) (Reason, bool) {
+func (machine *Machine) release(command Command, writePin bool) (Reason, bool) {
 	if record, ok := machine.pins[command.Identity]; ok {
 		if record.Binding != command.Binding || record.Epoch != command.Epoch {
 			return ReasonIdentityConflict, false
@@ -221,8 +241,10 @@ func (machine *Machine) release(command Command) (Reason, bool) {
 		if !machine.canMutate() {
 			return ReasonExhausted, false
 		}
-		record.State = PinReleased
-		machine.pins[command.Identity] = record
+		if writePin {
+			record.State = PinReleased
+			machine.pins[command.Identity] = record
+		}
 		machine.activePins--
 		machine.releasedPins++
 		machine.revision++
@@ -234,7 +256,7 @@ func (machine *Machine) release(command Command) (Reason, bool) {
 	if command.Epoch != machine.epoch {
 		return ReasonStaleEpoch, false
 	}
-	if uint64(len(machine.pins)) == machine.maxRecords {
+	if machine.retainedPins == machine.maxRecords {
 		return ReasonCapacity, false
 	}
 	if !machine.canMutate() {
@@ -242,10 +264,13 @@ func (machine *Machine) release(command Command) (Reason, bool) {
 	}
 	// Release-before-acquire is a valid terminal ordering: retain a tombstone
 	// so a delayed acquire cannot recreate the shared pin.
-	machine.pins[command.Identity] = storedPin{
-		Binding: command.Binding, Epoch: command.Epoch, State: PinReleased,
+	if writePin {
+		machine.pins[command.Identity] = storedPin{
+			Binding: command.Binding, Epoch: command.Epoch, State: PinReleased,
+		}
 	}
 	machine.releasedPins++
+	machine.retainedPins++
 	machine.revision++
 	return ReasonReleased, true
 }
@@ -301,14 +326,13 @@ func (machine *Machine) releaseDrain(command Command) (Reason, bool) {
 	machine.drain.State = DrainReleased
 	machine.epoch++
 	machine.revision++
-	// An active drain proves every old shared pin is released. The epoch bump
-	// rejects every delayed old acquire, so all pin tombstones are reclaimable.
-	clear(machine.pins)
-	machine.releasedPins = 0
+	// An active drain proves every old shared pin is released. Keep tombstones
+	// until bounded incremental compaction: releasing a topology drain must stay
+	// constant-write regardless of shard concurrency.
 	return ReasonDrainReleased, true
 }
 
-func (machine *Machine) compact(command Command) (Reason, bool) {
+func (machine *Machine) compact(command Command, writePin bool) (Reason, bool) {
 	if command.Epoch != machine.epoch {
 		return ReasonStaleEpoch, false
 	}
@@ -318,18 +342,47 @@ func (machine *Machine) compact(command Command) (Reason, bool) {
 	if !machine.canAdvanceEpoch() {
 		return ReasonExhausted, false
 	}
-	for identity, record := range machine.pins {
-		if record.State == PinReleased {
+	identity, found := machine.CompactCandidate()
+	if found {
+		if writePin {
 			delete(machine.pins, identity)
 		}
+		machine.releasedPins--
+		machine.retainedPins--
 	}
-	machine.releasedPins = 0
 	if machine.drain.State == DrainReleased {
 		machine.drain = DrainRecord{}
 	}
 	machine.epoch++
 	machine.revision++
 	return ReasonCompacted, true
+}
+
+// CompactCandidate returns the deterministic single tombstone reclaimed by
+// the next successful compaction. One-record compaction keeps every replicated
+// transition constant-write without imposing a participant-count ceiling.
+func (machine *Machine) CompactCandidate() (Identity, bool) {
+	if machine == nil {
+		return Identity{}, false
+	}
+	var candidate Identity
+	found := false
+	for identity, record := range machine.pins {
+		if record.State != PinReleased || found && !identityLess(identity, candidate) {
+			continue
+		}
+		candidate, found = identity, true
+	}
+	return candidate, found
+}
+
+func identityLess(left, right Identity) bool {
+	for index := range left {
+		if left[index] != right[index] {
+			return left[index] < right[index]
+		}
+	}
+	return false
 }
 
 func (machine *Machine) canMutate() bool { return machine.revision != math.MaxUint64 }

@@ -65,13 +65,38 @@ func TestExclusiveDrainWaitsBlocksAndAdvancesEpoch(t *testing.T) {
 	requireReason(t, machine.Apply(finish), ReasonDrainReleased, true)
 	requireReason(t, machine.Apply(finish), ReasonIdempotent, false)
 	status := machine.Status()
-	if status.Epoch != 6 || status.ActivePins != 0 || status.ReleasedPins != 0 ||
-		status.RetainedRecords != 0 || status.Drain.State != DrainReleased {
+	if status.Epoch != 6 || status.ActivePins != 0 || status.ReleasedPins != 2 ||
+		status.RetainedRecords != 2 || status.Drain.State != DrainReleased {
 		t.Fatalf("released drain status = %+v", status)
 	}
-	// The drain's epoch bump makes removal of every old tombstone safe.
+	// The drain's epoch bump makes bounded incremental removal of old
+	// tombstones safe without making drain release proportional to concurrency.
 	requireReason(t, machine.Apply(first), ReasonStaleEpoch, false)
 	requireReason(t, machine.Apply(testCommand(OperationAcquireShared, 6, 3)), ReasonAcquired, true)
+}
+
+func TestCompactionReclaimsOneDeterministicTombstonePerTransition(t *testing.T) {
+	machine := mustMachine(t, 1, 8)
+	commands := []Command{
+		testCommand(OperationReleaseShared, 1, 3),
+		testCommand(OperationReleaseShared, 1, 1),
+		testCommand(OperationReleaseShared, 1, 2),
+	}
+	for i := range commands {
+		requireReason(t, machine.Apply(commands[i]), ReasonReleased, true)
+	}
+	candidate, found := machine.CompactCandidate()
+	if !found || candidate != commands[1].Identity {
+		t.Fatalf("candidate = %x, %v", candidate, found)
+	}
+	requireReason(t, machine.Apply(Command{Operation: OperationCompactReleased, Epoch: 1}), ReasonCompacted, true)
+	status := machine.Status()
+	if status.Epoch != 2 || status.ReleasedPins != 2 || status.RetainedRecords != 2 {
+		t.Fatalf("one compact = %+v", status)
+	}
+	if _, retained := machine.Pin(candidate); retained {
+		t.Fatal("deterministic candidate survived compact")
+	}
 }
 
 func TestEpochCompactionReclaimsOnlyReleasedPins(t *testing.T) {
@@ -154,6 +179,51 @@ func TestCommandsStreamBeyondSmallBatchWidths(t *testing.T) {
 	}
 }
 
+func TestPreviewIsAllocationFreeNonMutatingAndMatchesApply(t *testing.T) {
+	machine := mustMachine(t, 1, 8)
+	acquire := testCommand(OperationAcquireShared, 1, 1)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		outcome := machine.Preview(acquire)
+		if outcome.Reason != ReasonAcquired || !outcome.Mutated {
+			panic(outcome)
+		}
+	}); allocs != 0 {
+		t.Fatalf("Preview allocations = %v, want 0", allocs)
+	}
+	if machine.Status() != (Status{Epoch: 1}) || len(machine.pins) != 0 {
+		t.Fatalf("preview mutated empty gate: %+v, pins=%d", machine.Status(), len(machine.pins))
+	}
+
+	commands := []Command{
+		acquire,
+		testCommand(OperationReleaseShared, 1, 2),
+		testCommand(OperationBeginExclusive, 1, 9),
+		testCommand(OperationReleaseShared, 1, 1),
+		testCommand(OperationReleaseExclusive, 1, 9),
+		{Operation: OperationCompactReleased, Epoch: 2},
+	}
+	for index, command := range commands {
+		beforeStatus := machine.Status()
+		before := machine.Clone()
+		preview := machine.Preview(command)
+		if machine.Status() != beforeStatus {
+			t.Fatalf("preview %d changed status: before=%+v after=%+v",
+				index, beforeStatus, machine.Status())
+		}
+		if len(machine.pins) != len(before.pins) {
+			t.Fatalf("preview %d changed record count", index)
+		}
+		for identity, record := range before.pins {
+			if after, found := machine.pins[identity]; !found || after != record {
+				t.Fatalf("preview %d changed record %x", index, identity)
+			}
+		}
+		if applied := machine.Apply(command); applied != preview {
+			t.Fatalf("preview %d = %+v, apply = %+v", index, preview, applied)
+		}
+	}
+}
+
 func TestMachineRejectsInvalidGeometryAndExhaustion(t *testing.T) {
 	for _, limits := range [][2]uint64{{0, 1}, {1, 0}, {1, MaxRetainedRecords + 1}} {
 		if machine, ok := NewMachine(limits[0], limits[1]); ok || machine != nil {
@@ -221,6 +291,7 @@ func BenchmarkMachineApplyAcquireShared(b *testing.B) {
 	}
 	clear(machine.pins)
 	machine.activePins = 0
+	machine.retainedPins = 0
 	b.ReportAllocs()
 	b.ResetTimer()
 	for completed := 0; completed < b.N; {
@@ -235,6 +306,7 @@ func BenchmarkMachineApplyAcquireShared(b *testing.B) {
 		b.StopTimer()
 		clear(machine.pins)
 		machine.activePins = 0
+		machine.retainedPins = 0
 		b.StartTimer()
 	}
 }

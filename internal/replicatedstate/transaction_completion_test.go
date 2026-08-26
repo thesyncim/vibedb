@@ -503,6 +503,11 @@ func TestTransactionCompletionWorkspaceIsAllocationFreeAndBounded(t *testing.T) 
 		t.Fatalf("completion envelope bound = %d, want empty bound + %d",
 			MaxCompletionEnvelopeBytes, RequestLedgerCompletionResultBytes)
 	}
+	if MaxTransactionCompletionEnvelopeBytes != replication.MaxEmptyResultCompletionEnvelopeBytes+
+		transactionCompletionResultBytes {
+		t.Fatalf("completion envelope bound = %d, want empty bound + %d",
+			MaxTransactionCompletionEnvelopeBytes, transactionCompletionResultBytes)
+	}
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -530,13 +535,13 @@ func TestTransactionCompletionWorkspaceIsAllocationFreeAndBounded(t *testing.T) 
 			t.Fatal(err)
 		}
 	}()
-	scratch := make([]byte, 0, MaxCompletionEnvelopeBytes)
+	scratch := make([]byte, 0, MaxTransactionCompletionEnvelopeBytes)
 	lookup, err := fixture.machine.LookupCompletionIntoWorkspace(&workspace, command, scratch[:0])
 	opened, openErr := replication.OpenCompletion(lookup.Bytes)
-	if err != nil || openErr != nil || len(lookup.Bytes) > MaxCompletionEnvelopeBytes ||
+	if err != nil || openErr != nil || len(lookup.Bytes) > MaxTransactionCompletionEnvelopeBytes ||
 		len(opened.InlineResult) != transactionCompletionResultBytes {
 		t.Fatalf("transaction completion envelope = %dB, bound=%d err=%v",
-			len(lookup.Bytes), MaxCompletionEnvelopeBytes, errors.Join(err, openErr))
+			len(lookup.Bytes), MaxTransactionCompletionEnvelopeBytes, errors.Join(err, openErr))
 	}
 	if allocations := testing.AllocsPerRun(100, func() {
 		lookup, err := fixture.machine.LookupCompletionIntoWorkspace(&workspace, command, scratch[:0])

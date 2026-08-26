@@ -12,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -21,6 +22,9 @@ const (
 	// low-level mutation adapter. ResultApplied carries one canonical eight-byte
 	// nonnegative count; every refusal and session-lifecycle result is empty.
 	ResultFormatMutation uint16 = 1
+	// ResultFormatRouteGate carries exactly one canonical fixed routegate
+	// Outcome in the completion envelope.
+	ResultFormatRouteGate uint16 = 3
 
 	// Zero and unknown result codes are invalid.
 	ResultApplied         uint32 = 1
@@ -50,6 +54,10 @@ const (
 	// ResultRequestLedgerWrongRange is a stateless stale-route/range-authority
 	// refusal. No ledger row was mutated on that group.
 	ResultRequestLedgerWrongRange uint32 = 16
+	// ResultRouteGate identifies the fixed route-gate outcome grammar.
+	ResultRouteGate uint32 = 13
+
+	MaxRouteGateCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + routegate.OutcomeBytes
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its compact
 	// 376-byte header (416 bytes when transaction accounting is present), two
@@ -408,5 +416,9 @@ func isSessionTerminalResult(code uint32) bool {
 }
 
 func isSessionResultCode(code uint32) bool {
+	return code >= ResultApplied && code <= ResultRouteGate
+}
+
+func isMutationResultCode(code uint32) bool {
 	return code >= ResultApplied && code <= ResultIntentBusy
 }

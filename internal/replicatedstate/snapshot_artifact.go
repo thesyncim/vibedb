@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -237,6 +238,7 @@ type SnapshotArtifactCursor struct {
 	currentCollection     SnapshotArtifactCollection
 	nextRelation          replication.RelationID
 	stateRowSeen          bool
+	routeGateRows         uint64
 	captureImageDigest    [sha256.Size]byte
 }
 
@@ -1068,7 +1070,8 @@ func ContinueSnapshotArtifact(
 			}
 			seenState, err := consumeSnapshotArtifactRows(
 				chunk, payload, visit, candidate.previousKey[:], &previousKeyBytes,
-				candidate.expectedStateDocument, candidate.stateRowSeen, &transactionScratch,
+				candidate.expectedStateDocument, candidate.stateRowSeen,
+				&candidate.routeGateRows, &transactionScratch,
 			)
 			if err != nil {
 				return SnapshotArtifactManifest{}, &current, err
@@ -1081,6 +1084,14 @@ func ContinueSnapshotArtifact(
 			var priorRelationRows uint64
 			if chunk.Collection == SnapshotArtifactSystem {
 				candidate.manifest.SystemRows += chunk.Rows
+				if candidate.routeGateRows != 0 {
+					baseRows, ok := stateSystemRowCount(candidate.manifest.State)
+					if !ok || baseRows > math.MaxUint64-candidate.routeGateRows ||
+						candidate.manifest.SystemRows != baseRows+candidate.routeGateRows {
+						return SnapshotArtifactManifest{}, &current,
+							fmt.Errorf("%w: route-gate row accounting", ErrSnapshotArtifact)
+					}
+				}
 			} else if chunk.Collection == SnapshotArtifactUser {
 				candidate.manifest.UserRows += chunk.Rows
 				if candidate.manifest.Bundle {
@@ -1153,7 +1164,7 @@ func ContinueSnapshotArtifact(
 			}
 			if err := validateSnapshotArtifactFooter(
 				footer[:], current.manifest, current.previousDigest,
-				current.encodedBytes, current.stateRowSeen,
+				current.encodedBytes, current.stateRowSeen, current.routeGateRows,
 			); err != nil {
 				return SnapshotArtifactManifest{}, &current, err
 			}
@@ -1280,6 +1291,11 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		uint64(completedRelations), false,
 	)
 	wantSystemRows, systemRowsOK := stateSystemRowCount(cursor.manifest.State)
+	if wantSystemRows > math.MaxUint64-cursor.routeGateRows {
+		systemRowsOK = false
+	} else {
+		wantSystemRows += cursor.routeGateRows
+	}
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
 		!encodedBytesOK || cursor.encodedBytes != wantEncodedBytes ||
 		!systemRowsOK || cursor.manifest.SystemRows > wantSystemRows {
@@ -1291,6 +1307,7 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 			cursor.manifest.CaptureRows != 0 ||
 			cursor.manifest.PayloadBytes != 0 || cursor.previousKeyBytes != 0 ||
 			cursor.currentCollection != SnapshotArtifactSystem || cursor.stateRowSeen ||
+			cursor.routeGateRows != 0 ||
 			cursor.previousDigest != cursor.manifest.HeaderDigest ||
 			cursor.captureImageDigest != snapshotArtifactEmptyCaptureImageDigest() {
 			return fmt.Errorf("%w: empty resume prefix", ErrSnapshotArtifact)
@@ -1545,6 +1562,7 @@ func consumeSnapshotArtifactRows(
 	previousKeyBytes *int,
 	expectedStateDocument []byte,
 	stateRowAlreadySeen bool,
+	routeGateRows *uint64,
 	transactionScratch *snapshotArtifactTransactionScratch,
 ) (bool, error) {
 	cursor := 0
@@ -1586,6 +1604,39 @@ func consumeSnapshotArtifactRows(
 					return false, fmt.Errorf("%w: hidden authority binding: %v",
 						ErrSnapshotArtifact, err)
 				}
+			case bytes.Equal(key, routeGateHeadKey):
+				if _, err := routegate.OpenHead(value); err != nil {
+					return false, errors.Join(err,
+						fmt.Errorf("%w: route-gate head", ErrSnapshotArtifact))
+				}
+				if routeGateRows == nil || *routeGateRows == math.MaxUint64 {
+					return false, fmt.Errorf("%w: route-gate row count", ErrSnapshotArtifactBound)
+				}
+				*routeGateRows++
+			case len(key) == routeGatePinKeyBytes && key[0] == routeGatePinPrefix:
+				var identity routegate.Identity
+				copy(identity[:], key[1:])
+				_, err := routegate.OpenStoredPin(identity, value)
+				want, keyErr := routeGatePinStorageKey(identity)
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: route-gate pin", ErrSnapshotArtifact))
+				}
+				if routeGateRows == nil || *routeGateRows == math.MaxUint64 {
+					return false, fmt.Errorf("%w: route-gate row count", ErrSnapshotArtifactBound)
+				}
+				*routeGateRows++
+			case len(key) == routeGateResultKeyBytes && key[0] == routeGateResultPrefix:
+				view, err := openRouteGateResult(value)
+				want, keyErr := routeGateResultStorageKey(view.SessionDigest, view.Slot)
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: route-gate result", ErrSnapshotArtifact))
+				}
+				if routeGateRows == nil || *routeGateRows == math.MaxUint64 {
+					return false, fmt.Errorf("%w: route-gate row count", ErrSnapshotArtifactBound)
+				}
+				*routeGateRows++
 			case len(key) == transactionControlStorageKeyBytes && key[0] == transactionControlPrefix:
 				view, err := OpenTransactionControl(value)
 				want, keyErr := view.StorageKey()
@@ -1772,6 +1823,7 @@ func validateSnapshotArtifactFooter(
 	previousDigest [sha256.Size]byte,
 	encodedBeforeFooter uint64,
 	stateRowSeen bool,
+	routeGateRows uint64,
 ) error {
 	if len(footer) != snapshotArtifactFooterBytes ||
 		!bytes.Equal(footer[0:8], snapshotArtifactFooterMagic[:]) ||
@@ -1807,6 +1859,11 @@ func validateSnapshotArtifactFooter(
 		return fmt.Errorf("%w: footer totals or digest", ErrSnapshotArtifact)
 	}
 	wantSystemRows, systemRowsOK := stateSystemRowCount(manifest.State)
+	if wantSystemRows > math.MaxUint64-routeGateRows {
+		systemRowsOK = false
+	} else {
+		wantSystemRows += routeGateRows
+	}
 	if !stateRowSeen || !systemRowsOK || manifest.SystemRows != wantSystemRows {
 		return fmt.Errorf("%w: hidden state image", ErrSnapshotArtifact)
 	}

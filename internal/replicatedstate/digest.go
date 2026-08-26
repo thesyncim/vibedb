@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
@@ -24,6 +25,8 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"fixed-retry-ring;explicit-session-open;raft-index-session-epoch;" +
 	"shard-epoch-high-water;explicit-session-retirement;terminal-retire-only;" +
 	"exact-retired-session-release;terminal-stale-retire-unstored;" +
+	"data-shard-raft-ordered-route-gate;shared-data-authority;exclusive-topology-authority;" +
+	"fixed-route-gate-command-outcome;epoch-fenced-release-tombstones;" +
 	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
 	"stable-logical-command-digest;data-chain-value-descriptor-sha256"
 
@@ -351,9 +354,10 @@ func bundleApplyContractDigest(
 	requestLedgerCapacity uint64,
 	requestLedgerCleanupReserve uint64,
 	requestLedgerRange RequestLedgerRange,
+	routeGateMaxRecords uint64,
 ) ([sha256.Size]byte, error) {
 	if manifest == ([sha256.Size]byte{}) || len(relations) == 0 ||
-		maxSessions == 0 || retryWindow == 0 {
+		maxSessions == 0 || retryWindow == 0 || routeGateMaxRecords == 0 {
 		return [sha256.Size]byte{}, ErrInvalidCollection
 	}
 	h := sha256.New()
@@ -361,8 +365,9 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [2 + 21*4]byte
+	var grammar [4 + 35*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
+	binary.LittleEndian.PutUint16(grammar[2:4], ResultFormatRouteGate)
 	for index, code := range [...]uint32{
 		ResultApplied,
 		ResultStaleFence,
@@ -385,14 +390,29 @@ func bundleApplyContractDigest(
 		uint32(replication.MutationPutAbsent),
 		uint32(replication.MutationPutPresent),
 		replication.MutationDigestCompareBytes,
+		ResultRouteGate,
+		uint32(replication.CommandRouteGate),
+		routegate.CommandBytes,
+		routegate.OutcomeBytes,
+		routegate.HeadBytes,
+		routegate.StoredPinBytes,
+		uint32(routegate.OperationAcquireShared),
+		uint32(routegate.OperationReleaseShared),
+		uint32(routegate.OperationBeginExclusive),
+		uint32(routegate.OperationReleaseExclusive),
+		uint32(routegate.OperationCompactReleased),
+		uint32(routegate.ReasonExhausted),
+		uint32(routegate.PinReleased),
+		uint32(routegate.DrainReleased),
 	} {
-		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)
+		binary.LittleEndian.PutUint32(grammar[4+index*4:4+(index+1)*4], code)
 	}
 	_, _ = h.Write(grammar[:])
-	var fixed [18]byte
+	var fixed [26]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], maxSessions)
 	binary.LittleEndian.PutUint16(fixed[8:10], retryWindow)
 	binary.LittleEndian.PutUint64(fixed[10:18], MaxSessionRetryWindow)
+	binary.LittleEndian.PutUint64(fixed[18:26], routeGateMaxRecords)
 	_, _ = h.Write(fixed[:])
 	if requestLedgerCapacity != 0 || requestLedgerCleanupReserve != 0 {
 		if !requestLedgerRange.valid() {

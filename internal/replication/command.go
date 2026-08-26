@@ -9,7 +9,13 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 )
+
+// MaxRouteGateCommandBytes is the exact largest outer replicated route-gate
+// command, including three maximum-width identities and envelope checksum.
+const MaxRouteGateCommandBytes = commandHeaderBytes + envelopeChecksumBytes +
+	routegate.CommandBytes + 3*MaxIdentityBytes
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 
@@ -84,7 +90,12 @@ type Command struct {
 	// present only for CommandRequestLedger and is carried without another
 	// redundant outer length because it consumes the complete command payload.
 	RequestLedger []byte
-	Batches       []RelationMutationBatch
+	// RouteGate is one exact fixed routegate command. It is present only for
+	// CommandRouteGate and is ordered by this data shard's existing Raft log.
+	RouteGate []byte
+	// Batches retains the shared multi-relation mutation payload used by data
+	// and transaction commands; control commands require it to be empty.
+	Batches []RelationMutationBatch
 }
 
 // CommandView is a checksum- and semantics-validated borrowed command. Its
@@ -125,6 +136,7 @@ type CommandView struct {
 	raw                []byte
 	transactionBytes   []byte
 	requestLedgerBytes []byte
+	routeGateBytes     []byte
 	relationBytes      []byte
 	mutationCount      uint32
 	relationCount      uint16
@@ -163,6 +175,20 @@ func (v CommandView) OpenRequestLedgerInto(
 		return requestledger.CommandView{}, ErrEnvelopeSemantic
 	}
 	return requestledger.OpenCommandInto(v.requestLedgerBytes, steps)
+}
+
+// RouteGateBytes returns the exact validated route-gate command, borrowing the
+// outer envelope. Non-route-gate commands return nil.
+func (v CommandView) RouteGateBytes() []byte {
+	return v.routeGateBytes[:len(v.routeGateBytes):len(v.routeGateBytes)]
+}
+
+// OpenRouteGate reopens the already outer-validated fixed command.
+func (v CommandView) OpenRouteGate() (routegate.Command, error) {
+	if v.kind != CommandRouteGate || len(v.routeGateBytes) != routegate.CommandBytes {
+		return routegate.Command{}, ErrEnvelopeSemantic
+	}
+	return routegate.OpenCommand(v.routeGateBytes)
 }
 
 // TransactionIdentity reports the role and operation from the already
@@ -443,6 +469,9 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	if command.Kind == CommandRequestLedger {
 		cursor += copy(frame[cursor:], command.RequestLedger)
 	}
+	if command.Kind == CommandRouteGate {
+		cursor += copy(frame[cursor:], command.RouteGate)
+	}
 	for batchIndex := range command.Batches {
 		batch := &command.Batches[batchIndex]
 		headerAt := -1
@@ -528,6 +557,7 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 		byteSliceStringOverlap(region, command.Shard) ||
 		byteSlicesOverlap(region, command.Transaction) ||
 		byteSlicesOverlap(region, command.RequestLedger) ||
+		byteSlicesOverlap(region, command.RouteGate) ||
 		typedSliceOverlapsBytes(region, command.Batches) {
 		return true
 	}
@@ -564,6 +594,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireTransaction
 	case CommandRequestLedger:
 		return commandWireRequestLedger
+	case CommandRouteGate:
+		return commandWireRouteGate
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -611,6 +643,13 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 			return 0, ErrEnvelopeTooLarge
 		}
 	}
+	if command.Kind == CommandRouteGate {
+		var ok bool
+		total, ok = checkedAdd(total, routegate.CommandBytes, MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
 	if len(command.Batches) > 1 {
 		var ok bool
 		total, ok = checkedAdd(
@@ -653,7 +692,8 @@ func validateCommandHeader(command Command) error {
 	}
 	switch command.Kind {
 	case CommandMutationBatch:
-		if len(command.Transaction) != 0 || len(command.RequestLedger) != 0 {
+		if len(command.Transaction) != 0 || len(command.RequestLedger) != 0 ||
+			len(command.RouteGate) != 0 {
 			return semantic("ordinary command carries transaction control")
 		}
 		if err := validateRelationBatches(command.Batches); err != nil {
@@ -662,12 +702,12 @@ func validateCommandHeader(command Command) error {
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
 		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
-			len(command.RequestLedger) != 0 {
+			len(command.RequestLedger) != 0 || len(command.RouteGate) != 0 {
 			return semantic("session lifecycle command carries payload")
 		}
 	case CommandTransaction:
-		if len(command.RequestLedger) != 0 {
-			return semantic("transaction command carries request ledger control")
+		if len(command.RequestLedger) != 0 || len(command.RouteGate) != 0 {
+			return semantic("transaction command carries unrelated control")
 		}
 		control, err := validatedTransactionControl(command.Transaction)
 		if err != nil {
@@ -693,11 +733,19 @@ func validateCommandHeader(command Command) error {
 		}
 	case CommandRequestLedger:
 		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
-			len(command.RequestLedger) == 0 {
+			len(command.RequestLedger) == 0 || len(command.RouteGate) != 0 {
 			return semantic("request ledger command body")
 		}
 		if err := requestledger.ValidateCommand(command.RequestLedger); err != nil {
 			return semantic("request ledger command body")
+		}
+	case CommandRouteGate:
+		gate, gateErr := routegate.OpenCommand(command.RouteGate)
+		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
+			len(command.RequestLedger) != 0 ||
+			len(command.RouteGate) != routegate.CommandBytes || gateErr != nil ||
+			!routeGateAuthorityMatches(command.AuthorityClass, gate.Operation) {
+			return semantic("route-gate command")
 		}
 	default:
 		return semantic("unknown command kind")
@@ -1228,6 +1276,11 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count != 0 || relationCount != 0 || inlineRelationID != 0 {
 			return CommandView{}, semantic("request ledger command carries relation batches")
 		}
+	case CommandRouteGate:
+		if count != 0 || relationCount != 0 ||
+			inlineRelationID != 0 {
+			return CommandView{}, semantic("route-gate command header")
+		}
 	}
 
 	view := CommandView{kind: kind, AuthorityClass: authorityClass}
@@ -1352,12 +1405,31 @@ func OpenCommand(src []byte) (CommandView, error) {
 			return CommandView{}, corrupt("request ledger command")
 		}
 		view.requestLedgerBytes = payload
+	case CommandRouteGate:
+		gate, gateErr := routegate.OpenCommand(payload)
+		if len(payload) != routegate.CommandBytes || gateErr != nil ||
+			!routeGateAuthorityMatches(authorityClass, gate.Operation) {
+			return CommandView{}, semantic("route-gate command body")
+		}
+		view.routeGateBytes = payload
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count
 	view.relationCount = relationCount
 	view.inlineRelationID = inlineRelationID
 	return view, nil
+}
+
+func routeGateAuthorityMatches(class CommandAuthorityClass, operation routegate.Operation) bool {
+	switch operation {
+	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
+		return class == CommandAuthorityData
+	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive,
+		routegate.OperationCompactReleased:
+		return class == CommandAuthorityTopology
+	default:
+		return false
+	}
 }
 
 func openCommandKind(wire uint8) (CommandKind, bool) {
@@ -1378,6 +1450,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandTransaction, true
 	case commandWireRequestLedger:
 		return CommandRequestLedger, true
+	case commandWireRouteGate:
+		return CommandRouteGate, true
 	default:
 		return 0, false
 	}

@@ -238,10 +238,10 @@ func (m *Machine) BuildBundleSnapshotBase() (
 	if !ok || system == nil {
 		return nil, SnapshotArtifactManifest{}, m.fail(ErrInconsistentSnapshot)
 	}
-	state, present, sessions, slots, authorities, err := scanSessionSystemSnapshot(
+	state, present, sessions, slots, authorities, _, err := scanSessionSystemSnapshot(
 		system, m.options.MaxSessions, m.options.RetryWindow,
 		m.options.RequestLedgerCapacityBytes, m.options.RequestLedgerCleanupReserveBytes,
-		m.options.RequestLedgerRange,
+		m.options.RequestLedgerRange, m.routeGateMaxRecords,
 	)
 	if err != nil || !present || sessions != state.SessionCount ||
 		slots != state.SessionSlotCount || authorities != state.AuthorityBindingCount ||

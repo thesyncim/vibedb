@@ -36,8 +36,8 @@ func newSessionReleaseFixture(
 	}
 
 	systemDocuments := int(retryWindow) + 3
-	if systemDocuments < 4 {
-		systemDocuments = 4
+	if systemDocuments < 6 {
+		systemDocuments = 6
 	}
 	system := openCollection("system", durable.Options{
 		OpaqueValues:      true,

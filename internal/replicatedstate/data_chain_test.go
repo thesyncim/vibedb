@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 )
 
 var (
@@ -190,12 +191,13 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		id: 1, kind: RelationJSON, name: "docs", target: target,
 	}}
 	contract, err := bundleApplyContractDigest(
-		relationManifestDigest(1, relations), relations, 1024, 8, 0, 0, RequestLedgerRange{},
+		relationManifestDigest(1, relations), relations, 1024, 8,
+		0, 0, RequestLedgerRange{}, 59,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	derived := deriveBundleContractForTest(relationManifestDigest(1, relations), 1024, 8)
+	derived := deriveBundleContractForTest(relationManifestDigest(1, relations), 1024, 8, 59)
 	if derived != contract {
 		t.Fatalf("contract implementation diverged from independent semantic frame: got=%x derived=%x",
 			contract, derived)
@@ -216,15 +218,15 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"6e31379980c16b7a9bb4446acba8d5d191067e54fefe76234dc3f1c8deac6ff5")
+		"1237ece3a34589052a52f2d6b6dabca26812e8c26f1fb5d4827818e539767c86")
 	assertDigestHex(t, "data-chain seed", seed,
-		"1f4d9501d7ea8d22db01cb9afd0ad4b38516407a63530d649f09b9a2a4ba06f5")
+		"6dc153af4378d88a69363f7ad11e070e1a2c85280081014ac4d6717783e97b49")
 	assertDigestHex(t, "data-chain transition", transition,
-		"70dccd33638a0bf56eaf7f9546ed30cd8f1c33dcbbe7493822474c4f301c17b6")
+		"f046c630c128422f32fb0545ff57f24e916b720a53a30de0cac539bc230d661c")
 }
 
 func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
-	retryWindow uint16) [sha256.Size]byte {
+	retryWindow uint16, routeGateMaxRecords uint64) [sha256.Size]byte {
 	h := sha256.New()
 	_, _ = h.Write([]byte("vibedb/replicated-state/apply-contract\x00"))
 	_, _ = h.Write(manifest[:])
@@ -232,8 +234,9 @@ func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
 	bundle := sha256.Sum256([]byte(deterministicBundleApplySemantics))
 	_, _ = h.Write(base[:])
 	_, _ = h.Write(bundle[:])
-	var grammar [2 + 21*4]byte
+	var grammar [4 + 35*4]byte
 	binary.LittleEndian.PutUint16(grammar[:2], ResultFormatMutation)
+	binary.LittleEndian.PutUint16(grammar[2:4], ResultFormatRouteGate)
 	for index, code := range [...]uint32{
 		ResultApplied, ResultStaleFence, ResultUnknownRelation, ResultInvalidDocument,
 		ResultTargetBound, ResultWrongShard, ResultSessionRetired, ResultSessionOpened,
@@ -244,14 +247,22 @@ func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
 		uint32(replication.MutationDeleteDigestEqual),
 		uint32(replication.MutationPutDigestEqual), uint32(replication.MutationPutAbsent),
 		uint32(replication.MutationPutPresent), replication.MutationDigestCompareBytes,
+		ResultRouteGate, uint32(replication.CommandRouteGate),
+		routegate.CommandBytes, routegate.OutcomeBytes,
+		routegate.HeadBytes, routegate.StoredPinBytes,
+		uint32(routegate.OperationAcquireShared), uint32(routegate.OperationReleaseShared),
+		uint32(routegate.OperationBeginExclusive), uint32(routegate.OperationReleaseExclusive),
+		uint32(routegate.OperationCompactReleased), uint32(routegate.ReasonExhausted),
+		uint32(routegate.PinReleased), uint32(routegate.DrainReleased),
 	} {
-		binary.LittleEndian.PutUint32(grammar[2+index*4:], code)
+		binary.LittleEndian.PutUint32(grammar[4+index*4:], code)
 	}
 	_, _ = h.Write(grammar[:])
-	var limits [18]byte
+	var limits [26]byte
 	binary.LittleEndian.PutUint64(limits[:8], maxSessions)
 	binary.LittleEndian.PutUint16(limits[8:10], retryWindow)
 	binary.LittleEndian.PutUint64(limits[10:], MaxSessionRetryWindow)
+	binary.LittleEndian.PutUint64(limits[18:], routeGateMaxRecords)
 	_, _ = h.Write(limits[:])
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])

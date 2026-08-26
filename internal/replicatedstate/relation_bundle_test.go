@@ -394,7 +394,8 @@ func TestSingletonApplyContractAuthenticatesNativeExactIndexes(t *testing.T) {
 			localIndexes: indexes,
 		}}
 		contract, digestErr := bundleApplyContractDigest(
-			relationManifestDigest(7, relations), relations, 128, 8, 0, 0, RequestLedgerRange{},
+			relationManifestDigest(7, relations), relations, 128, 8,
+			0, 0, RequestLedgerRange{}, 59,
 		)
 		if digestErr != nil || contract == ([sha256.Size]byte{}) {
 			t.Fatalf("singleton contract indexes=%v = %x, %v", indexes, contract, digestErr)

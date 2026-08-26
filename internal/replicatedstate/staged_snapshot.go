@@ -151,10 +151,11 @@ func PrepareStagedSnapshot(
 			fmt.Errorf("%w: %v", ErrStagedSnapshot, err), cutSnapshot.Close(),
 		)
 	}
-	current, present, sessions, slots, authorities, scanErr := scanSessionSystemSnapshot(
+	current, present, sessions, slots, authorities, _, scanErr := scanSessionSystemSnapshot(
 		systemSnapshot, options.MaxSessions, options.RetryWindow,
 		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
 		options.RequestLedgerRange,
+		routeGateRecordLimit(),
 	)
 	closeErr := cutSnapshot.Close()
 	if scanErr != nil || closeErr != nil || sessions != 0 || slots != 0 || authorities != 0 ||
@@ -321,11 +322,12 @@ func (p *StagedSnapshotPreparation) Finish(
 	if err != nil {
 		return nil, nil, SnapshotArtifactManifest{}, err
 	}
-	current, present, sessions, slots, authorities, scanErr := scanSessionSystemSnapshot(
+	current, present, sessions, slots, authorities, _, scanErr := scanSessionSystemSnapshot(
 		systemSnapshot, p.prepared.options.MaxSessions, p.prepared.options.RetryWindow,
 		p.prepared.options.RequestLedgerCapacityBytes,
 		p.prepared.options.RequestLedgerCleanupReserveBytes,
 		p.prepared.options.RequestLedgerRange,
+		routeGateRecordLimit(),
 	)
 	closeErr := systemSnapshot.Close()
 	if scanErr != nil || closeErr != nil || !present || sessions != 0 || slots != 0 ||

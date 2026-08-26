@@ -28,12 +28,16 @@ var (
 	castagnoli   = crc32.MakeTable(crc32.Castagnoli)
 )
 
-// Identity is the stable digest of a request-ledger record or topology
-// operation. Zero is never a valid identity.
+// Identity is the stable digest of one physical participant wave/attempt or
+// topology operation. A long-lived logical request contract does not hold a
+// route pin: it may refresh physical placement between waves. Zero is never a
+// valid identity.
 type Identity [32]byte
 
-// Binding authenticates the sealed participant recipe or topology plan bound
-// to an identity. Reusing an identity with a different binding fails closed.
+// Binding authenticates the exact physical group, member/endpoint fence, and
+// command fingerprint for a participant wave, or the topology plan bound to
+// an exclusive identity. Reusing an identity with another binding fails
+// closed, so outcome-unknown retries cannot silently change their route.
 type Binding [32]byte
 
 // Operation identifies one deterministic state transition.

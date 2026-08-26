@@ -63,7 +63,7 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
 	// The artifact authenticates the apply contract; changing conditional
 	// mutations or JSON-relation affected-row semantics changes this vector.
-	const golden = "5bbec6ae1e4f67e74efe4448bc396b25f1f679539aaf4d8d2247d1b459f3639a"
+	const golden = "6e1334fa6fd45e2bddc4ac2b1edf4d6e563c020664dc8cb01470795cdf338e36"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -596,7 +596,7 @@ func TestSnapshotArtifactHiddenSystemKeyGrammar(t *testing.T) {
 		previousKeyBytes := 0
 		_, err := consumeSnapshotArtifactRows(
 			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
-			payload(key), nil, previousKey, &previousKeyBytes, nil, true, nil,
+			payload(key), nil, previousKey, &previousKeyBytes, nil, true, nil, nil,
 		)
 		return err
 	}
@@ -639,7 +639,7 @@ func TestSnapshotArtifactValidatesExactTransactionRows(t *testing.T) {
 		previousKeyBytes := 0
 		_, err := consumeSnapshotArtifactRows(
 			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
-			rowPayload(key, value), nil, previousKey, &previousKeyBytes, nil, true, scratch,
+			rowPayload(key, value), nil, previousKey, &previousKeyBytes, nil, true, nil, scratch,
 		)
 		return err
 	}

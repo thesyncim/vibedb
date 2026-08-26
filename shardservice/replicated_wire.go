@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -1098,6 +1099,12 @@ func validReplicatedCompletionResult(completion replication.CompletionView) bool
 		_, err := replicatedstate.OpenRequestLedgerCompletionResult(
 			completion.ResultCode, completion.InlineResult,
 		)
+		return err == nil
+	case replicatedstate.ResultFormatRouteGate:
+		if completion.ResultCode != replicatedstate.ResultRouteGate {
+			return false
+		}
+		_, err := routegate.OpenOutcome(completion.InlineResult)
 		return err == nil
 	default:
 		return false

@@ -21,10 +21,10 @@ func SnapshotBytes(count uint64) (uint64, bool) {
 // for every retained record; it is caller-owned so repeated snapshots can be
 // allocation-free. Records are sorted by identity to make the image unique.
 func AppendSnapshot(dst []byte, machine *Machine, scratch []PinRecord) ([]byte, error) {
-	if machine == nil {
+	if machine == nil || machine.retainedPins != uint64(len(machine.pins)) {
 		return dst, ErrCorrupt
 	}
-	count := uint64(len(machine.pins))
+	count := machine.retainedPins
 	total, ok := SnapshotBytes(count)
 	if !ok {
 		return dst, ErrTooLarge
@@ -105,6 +105,7 @@ func OpenSnapshot(raw []byte, maxRecords uint64) (*Machine, error) {
 		epoch:        binary.LittleEndian.Uint64(body[16:24]),
 		activePins:   binary.LittleEndian.Uint64(body[32:40]),
 		releasedPins: binary.LittleEndian.Uint64(body[40:48]),
+		retainedPins: count,
 		maxRecords:   maxRecords, pins: make(map[Identity]storedPin, int(count)),
 	}
 	machine.drain.State = DrainState(body[48])

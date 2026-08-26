@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -682,6 +683,26 @@ func TestReplicatedCompletionWireValidatesFixedResultGrammar(t *testing.T) {
 	}); allocations != 0 {
 		t.Fatalf("canonical completion validation allocations = %.1f, want 0", allocations)
 	}
+	gate, ok := routegate.NewMachine(1, routegate.MaxRetainedRecords)
+	if !ok {
+		t.Fatal("construct route gate")
+	}
+	gateCommand := routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1,
+		Identity: routegate.Identity{1}, Binding: routegate.Binding{2},
+	}
+	var gateResult [routegate.OutcomeBytes]byte
+	gateBytes, err := routegate.AppendOutcome(gateResult[:0], gate.Apply(gateCommand))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validGate := responseFor(testReplicatedCompletionWithResult(
+		t, fence, 9, replicatedstate.ResultRouteGate,
+		replicatedstate.ResultFormatRouteGate, gateBytes,
+	))
+	if !validReplicatedResponse(validGate) {
+		t.Fatal("canonical route-gate result was rejected")
+	}
 
 	invalid := [][]byte{
 		testReplicatedCompletionWithResult(
@@ -698,6 +719,10 @@ func TestReplicatedCompletionWireValidatesFixedResultGrammar(t *testing.T) {
 		),
 		testReplicatedCompletionWithResult(
 			t, fence, 9, replicatedstate.ResultApplied, 77, nil,
+		),
+		testReplicatedCompletionWithResult(
+			t, fence, 9, replicatedstate.ResultApplied,
+			replicatedstate.ResultFormatRouteGate, gateBytes,
 		),
 	}
 	for index, completion := range invalid {

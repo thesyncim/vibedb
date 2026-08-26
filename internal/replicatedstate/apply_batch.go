@@ -323,7 +323,8 @@ func (m *Machine) ApplyNormalBatch(
 				break
 			}
 			if command.Kind() == replication.CommandTransaction ||
-				command.Kind() == replication.CommandRequestLedger {
+				command.Kind() == replication.CommandRequestLedger ||
+				command.Kind() == replication.CommandRouteGate {
 				break
 			}
 			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)

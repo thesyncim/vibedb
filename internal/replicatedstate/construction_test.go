@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -20,7 +21,13 @@ func constructionSystemBatchBytes(retryWindow uint16) int {
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	release := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3)
-	return max(hot, release)
+	routeGateHot := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxSessionRecordBytes +
+		sha256.Size + 3 + MaxSessionSlotRecordBytes +
+		len(routeGateHeadKey) + routegate.HeadBytes +
+		routeGatePinKeyBytes + routegate.StoredPinBytes +
+		routeGateResultKeyBytes + routeGateResultBytes
+	return max(hot, release, routeGateHot)
 }
 
 func constructionSystemOptions(options durable.Options) durable.Options {
@@ -28,13 +35,14 @@ func constructionSystemOptions(options durable.Options) durable.Options {
 	options.MaxKeyBytes = sha256.Size + 3
 	options.MaxDocumentBytes = max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
-		MaxAuthorityBindingBytes,
+		MaxAuthorityBindingBytes, routegate.HeadBytes, routegate.StoredPinBytes,
+		routeGateResultBytes,
 	)
-	options.MaxBatchDocuments = max(4, int(constructionRetryWindow)+2)
+	options.MaxBatchDocuments = max(6, int(constructionRetryWindow)+2)
 	// Durable collection profiles reserve room for every key at the collection
 	// maximum, even though the state key itself is only one byte.
 	collectionBound := MaxStateEnvelopeBytes +
-		(int(constructionRetryWindow)+2)*(sha256.Size+3)
+		max(6, int(constructionRetryWindow)+2)*(sha256.Size+3)
 	options.MaxBatchBytes = max(
 		constructionSystemBatchBytes(constructionRetryWindow), collectionBound,
 	)
