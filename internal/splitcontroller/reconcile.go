@@ -512,7 +512,8 @@ type Observation struct {
 	Children    [autosplit.MaxSplitChildren]*ChildObservation
 	Prune       *rangesplit.RetainedPruneCursor
 
-	OlderCatalogDrained bool
+	OlderCatalogDrained     bool
+	CatalogDrainCertificate gateway.ClusterCatalogDrainCertificate
 }
 
 func observationCaptureHead(observed Observation) (uint64, bool) {

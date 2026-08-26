@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/shardcontrol"
 	vibejson "github.com/thesyncim/vibejson"
@@ -25,13 +26,14 @@ type ShardControlRouter interface {
 }
 
 type remoteStepPayload struct {
-	Action          uint8             `json:"action"`
-	Child           uint8             `json:"child"`
-	Catalog         uint64            `json:"catalog"`
-	Target          ShardActionTarget `json:"target"`
-	StateDigest     [32]byte          `json:"state_digest"`
-	DataChainDigest [32]byte          `json:"data_chain_digest"`
-	EntryDigest     [32]byte          `json:"entry_digest"`
+	Action          uint8                                   `json:"action"`
+	Child           uint8                                   `json:"child"`
+	Catalog         uint64                                  `json:"catalog"`
+	Target          ShardActionTarget                       `json:"target"`
+	StateDigest     [32]byte                                `json:"state_digest"`
+	DataChainDigest [32]byte                                `json:"data_chain_digest"`
+	EntryDigest     [32]byte                                `json:"entry_digest"`
+	CatalogDrain    *gateway.ClusterCatalogDrainCertificate `json:"catalog_drain,omitempty"`
 }
 
 // ExecuteRemoteReplicatedStep is the serving controller composition: intent
@@ -84,6 +86,14 @@ func appendRemoteStepRequest(
 		StateDigest:     remoteObservationStateDigest(observed.SourceState),
 		DataChainDigest: observed.SourceState.DataChainDigest,
 		EntryDigest:     observed.SourceState.LastEntryDigest,
+	}
+	if action.Kind == ActionPruneRetained {
+		if !observed.OlderCatalogDrained ||
+			!validCatalogDrainCertificate(plan, observed.Catalog, observed.CatalogDrainCertificate) {
+			return shardcontrol.Request{}, ErrRemoteExecution
+		}
+		certificate := observed.CatalogDrainCertificate
+		payload.CatalogDrain = &certificate
 	}
 	raw, err := vibejson.Marshal(&payload)
 	if err != nil {

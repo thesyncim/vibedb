@@ -46,6 +46,16 @@ func (service *RemoteActionService) ExecuteAction(
 	if err != nil || plan == nil || plan.OperationID() != operation {
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
+	if request.Action == shardcontrol.Action(ActionPruneRetained) {
+		if payload.CatalogDrain == nil ||
+			!validCatalogDrainCertificate(plan, observed.Catalog, *payload.CatalogDrain) {
+			return shardcontrol.Response{}, ErrRemoteExecution
+		}
+		observed.OlderCatalogDrained = true
+		observed.CatalogDrainCertificate = *payload.CatalogDrain
+	} else if payload.CatalogDrain != nil {
+		return shardcontrol.Response{}, ErrRemoteExecution
+	}
 	action, err := Reconcile(plan, observed)
 	if err != nil || shardcontrol.Action(action.Kind) != request.Action || action.Child != request.Child ||
 		action.CatalogGeneration != payload.Catalog {

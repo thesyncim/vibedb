@@ -81,7 +81,7 @@ type PlanCatalogDrainRequest struct {
 
 type PlanCatalogDrainProof struct {
 	RequestDigest [sha256.Size]byte
-	Proof         [sha256.Size]byte
+	Certificate   gateway.ClusterCatalogDrainCertificate
 }
 
 // PlanCatalogDrainAuthority must collect every configured gateway's
@@ -250,7 +250,12 @@ func (observer *CoherentPlanObserver) observeAttempt(
 		if proof.RequestDigest != drainRequest.RequestDigest {
 			return Observation{}, false, ErrPlanObservation
 		}
-		observed.OlderCatalogDrained = proof.Proof != ([sha256.Size]byte{})
+		request := clusterPlanCatalogDrainRequest(drainRequest)
+		if !proof.Certificate.ValidFor(request) {
+			return Observation{}, false, ErrPlanObservation
+		}
+		observed.OlderCatalogDrained = true
+		observed.CatalogDrainCertificate = proof.Certificate
 	}
 	if _, err = Reconcile(plan, observed); err != nil {
 		return Observation{}, false, err
@@ -422,4 +427,11 @@ func planCatalogDrainRequest(
 	_, _ = hash.Write(raw[:])
 	hash.Sum(request.RequestDigest[:0])
 	return request
+}
+
+func clusterPlanCatalogDrainRequest(request PlanCatalogDrainRequest) gateway.ClusterCatalogDrainRequest {
+	return gateway.ClusterCatalogDrainRequest{
+		Operation: [sha256.Size]byte(request.Operation), Step: request.RequestDigest,
+		Generation: request.CurrentGeneration, CatalogDigest: request.CatalogDigest,
+	}
 }
