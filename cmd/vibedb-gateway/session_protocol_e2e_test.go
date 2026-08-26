@@ -439,13 +439,23 @@ func TestDurableSessionProtocolRejectsMalformedAndUnauthorizedBeforeService(t *t
 		bytes.Replace(bytes.Clone(valid), []byte(`"issuer_sequence":1`), []byte(`"issuer_sequence":0`), 1),
 		bytes.Replace(bytes.Clone(valid), grantField, []byte(`"grant_digest":"00"`), 1),
 		[]byte(`{"op":"exec_batch","request_id":"09000000000000000000000000000000","statements":[{"sql":"DELETE FROM docs WHERE id = 9"}]}`),
+		[]byte(`{"op":"exec_batch","lane_ordinal":0,"statements":[{"sql":"DELETE FROM docs WHERE id = 9"}]}`),
+		[]byte(`{"op":"exec_batch","installation_id":"","issuer_epoch":0,"lane_ordinal":0,"grant_digest":"","issuer_sequence":0,"statements":[{"sql":"DELETE FROM docs WHERE id = 9"}]}`),
 	}
+	shared.mu.Lock()
+	execCallsBefore := shared.execCalls
+	shared.mu.Unlock()
 	for index := range malformed {
 		response := sessionProtocolRoundTrip(t, service, authority, malformed[index], true)
 		if !bytes.Contains(response, []byte(errInvalidDurableExecBatch.Error())) {
 			t.Fatalf("malformed case %d accepted: request=%s response=%s", index, malformed[index], response)
 		}
 	}
+	shared.mu.Lock()
+	if shared.execCalls != execCallsBefore {
+		t.Fatalf("malformed durable identity reached service: before=%d after=%d", execCallsBefore, shared.execCalls)
+	}
+	shared.mu.Unlock()
 
 	validIssuer := sessionProtocolIssuerOpenRequest(t, shared.open)
 	invalidIssuer := bytes.Replace(bytes.Clone(validIssuer), []byte(`"lane_ordinal":7`),

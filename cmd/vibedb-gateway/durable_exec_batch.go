@@ -33,12 +33,6 @@ func structuredExecBatchIdentity(request *serveRequest) (durableExecBatchIdentit
 	return identity, true
 }
 
-func hasAnyStructuredExecBatchIdentity(request *serveRequest) bool {
-	return request != nil && (request.RequestID != "" || request.IssuerEpoch != 0 ||
-		request.InstallationID != "" || request.GrantDigest != "" || request.LaneOrdinal != 0 ||
-		request.IssuerLane != "" || request.IssuerSequence != 0 || request.IssuerAuthenticator != "")
-}
-
 func decodeLowerFixedHex(encoded string, destination []byte) error {
 	if len(encoded) != hex.EncodedLen(len(destination)) {
 		return errDurableExecBatchUnavailable

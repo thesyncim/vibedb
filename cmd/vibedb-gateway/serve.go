@@ -73,8 +73,8 @@ type serveRequest struct {
 	LaneOrdinal    uint16 `json:"lane_ordinal,omitempty"`
 	GrantDigest    string `json:"grant_digest,omitempty"`
 	IssuerSequence uint64 `json:"issuer_sequence,omitempty"`
-	// Legacy fields remain decode-only so old process-local capabilities fail
-	// closed through hasAnyStructuredExecBatchIdentity.
+	// Legacy fields remain decode-only; the strict raw exec_batch decoder rejects
+	// them and public dispatch has no unsequenced fallback.
 	IssuerLane          string `json:"issuer_lane,omitempty"`
 	IssuerAuthenticator string `json:"issuer_authenticator,omitempty"`
 	SQL                 string `json:"sql"`
@@ -1160,8 +1160,12 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			}
 			continue
 		}
-		if req.Op == "exec_batch" && hasAnyStructuredExecBatchIdentity(&req) {
-			if !structuredExecValid {
+		if req.Op == "exec_batch" {
+			// The public RF3 batch endpoint is durable-only. Raw identity-field
+			// presence must never be inferred from decoded nonzero values: an
+			// explicit zero/empty field is malformed structured input, not a
+			// downgrade to the legacy unsequenced executor.
+			if !structuredExecCandidate || !structuredExecValid {
 				if writeServeResponse(writer, &serveResponse{Error: errInvalidDurableExecBatch.Error()}) != nil {
 					return
 				}
@@ -1451,14 +1455,10 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 	var err error
 	switch req.Op {
 	case "exec_batch":
-		if hasAnyStructuredExecBatchIdentity(&req) {
-			return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
-		}
-		queries, buildErr := buildBatchQueries(req)
-		if buildErr != nil {
-			return &serveResponse{Error: buildErr.Error()}
-		}
-		res, err = exec.ExecBatchRequest(ctx, replication.ID128{}, queries)
+		// Public exec_batch is admitted only by handleConnPolicyDurable after
+		// strict raw GrantReference validation. No decoded request can enter an
+		// unsequenced fallback through this helper.
+		return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
 	case "exec":
 		// The write path routes the statement to its single owning shard and
 		// refuses every scatter before any dispatch.
