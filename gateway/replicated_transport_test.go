@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -71,6 +72,28 @@ func TestAuthenticatedReplicatedClientDefaultsAndBoundsControlReserve(t *testing
 	options.ReservedControlHandshakes = options.MaxHandshakes
 	if _, err = NewAuthenticatedReplicatedClient(options); !errors.Is(err, ErrReplicatedTLSProfile) {
 		t.Fatalf("handshake reserve bound = %v", err)
+	}
+}
+
+func TestReplicatedCapabilityControlReserveClassification(t *testing.T) {
+	for _, capability := range []serviceauthz.Capability{
+		serviceauthz.CapabilitySchema,
+		serviceauthz.CapabilityMembership,
+		serviceauthz.CapabilityTopology,
+		serviceauthz.CapabilityTransactionRecovery,
+		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityTransactionRecovery,
+	} {
+		if !replicatedCapabilityUsesControlReserve(capability) {
+			t.Fatalf("capability %d did not use the control reserve", capability)
+		}
+	}
+	for _, capability := range []serviceauthz.Capability{
+		0, serviceauthz.CapabilityDataRead, serviceauthz.CapabilityDataWrite,
+		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite,
+	} {
+		if replicatedCapabilityUsesControlReserve(capability) {
+			t.Fatalf("data capability %d consumed the control reserve", capability)
+		}
 	}
 }
 

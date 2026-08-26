@@ -213,8 +213,9 @@ func runServe(args []string) int {
 		}
 		if policy.Check(internalAuthority.Node,
 			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
-				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, and topology recovery authority")
+				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology|
+				serviceauthz.CapabilityTransactionRecovery) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, and transaction_recovery authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -547,11 +548,12 @@ func newReplicatedCatalogGateway(
 	transactions, err := gateway.NewReplicatedTransactionOrchestrator(
 		gateway.ReplicatedTransactionOrchestratorOptions{
 			Executor: replicated, Tenant: transactionTenant, RetryHome: transactionRetryHome,
-			MaxConcurrency:   defaultRF3TransactionConcurrency,
-			MaxInFlightBytes: defaultRF3TransactionInFlight,
-			MaxMutations:     defaultRF3TransactionMutations,
-			MaxMutationBytes: defaultRF3TransactionBytes,
-			RecoveryTimeout:  defaultRF3TransactionRecovery,
+			MaxConcurrency:    defaultRF3TransactionConcurrency,
+			MaxInFlightBytes:  defaultRF3TransactionInFlight,
+			MaxMutations:      defaultRF3TransactionMutations,
+			MaxMutationBytes:  defaultRF3TransactionBytes,
+			RecoveryTimeout:   defaultRF3TransactionRecovery,
+			RecoveryAuthority: internalAuthority,
 		},
 	)
 	if err != nil {

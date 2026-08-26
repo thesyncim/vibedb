@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -24,6 +25,13 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 ) (ReplicatedTransactionResult, error) {
 	if orchestrator == nil || orchestrator.executor == nil || ctx == nil {
 		return ReplicatedTransactionResult{}, ErrReplicatedTransaction
+	}
+	if orchestrator.recoveryAuthority.Valid() {
+		var err error
+		ctx, err = serviceauthz.WithAuthority(ctx, orchestrator.recoveryAuthority)
+		if err != nil {
+			return ReplicatedTransactionResult{}, ErrReplicatedTransaction
+		}
 	}
 	validationBytes := replicatedTransactionRecoveryValidationBytes
 	adopted, adoptionErr := orchestrator.adoptExternalRecoveryHandle(handle)

@@ -474,7 +474,7 @@ func (client *AuthenticatedReplicatedClient) release(connection *pooledReplicate
 }
 
 func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
-	control := request != nil && request.Capability&(serviceauthz.CapabilitySchema|serviceauthz.CapabilityMembership|serviceauthz.CapabilityTopology) != 0
+	control := request != nil && replicatedCapabilityUsesControlReserve(request.Capability)
 	connection, err := client.acquireClass(ctx, endpoint, control)
 	if err != nil {
 		return nil, err
@@ -489,6 +489,11 @@ func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, e
 		return nil, ErrReplicatedRoute
 	}
 	return response, err
+}
+
+func replicatedCapabilityUsesControlReserve(capability serviceauthz.Capability) bool {
+	return capability&(serviceauthz.CapabilitySchema|serviceauthz.CapabilityMembership|
+		serviceauthz.CapabilityTopology|serviceauthz.CapabilityTransactionRecovery) != 0
 }
 
 // RotateTLS atomically publishes a new profile and drains every idle stream.

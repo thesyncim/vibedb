@@ -22,6 +22,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -91,7 +92,13 @@ type ReplicatedTransactionOrchestratorOptions struct {
 	MaxMutations     uint64
 	MaxMutationBytes uint64
 	RecoveryTimeout  time.Duration
-	IDSource         io.Reader
+	// RecoveryAuthority is the gateway service identity used only while
+	// recovering an already admitted transaction. It prevents a client retry
+	// from forwarding the client's narrower data authority to hidden
+	// transaction-control reads. A zero value preserves the caller authority for
+	// in-process and development embeddings.
+	RecoveryAuthority serviceauthz.Authority
+	IDSource          io.Reader
 }
 
 type ReplicatedTransactionOrchestrator struct {
@@ -107,6 +114,7 @@ type ReplicatedTransactionOrchestrator struct {
 	maxMutations           uint64
 	maxMutationBytes       uint64
 	recoveryTimeout        time.Duration
+	recoveryAuthority      serviceauthz.Authority
 	idSource               io.Reader
 	byteBudget             replicatedTransactionByteBudget
 	activeByteBudget       replicatedTransactionByteBudget
@@ -229,7 +237,9 @@ func NewReplicatedTransactionOrchestrator(
 		options.MaxMutationBytes == 0 ||
 		options.MaxMutationBytes > maxReplicatedTransactionMutationBytes ||
 		options.RecoveryTimeout <= 0 ||
-		options.RecoveryTimeout > AbsoluteMaxReplicatedTransactionRecoveryTimeout {
+		options.RecoveryTimeout > AbsoluteMaxReplicatedTransactionRecoveryTimeout ||
+		(options.RecoveryAuthority != (serviceauthz.Authority{}) &&
+			!options.RecoveryAuthority.Valid()) {
 		return nil, ErrReplicatedTransaction
 	}
 	source := options.IDSource
@@ -241,7 +251,8 @@ func NewReplicatedTransactionOrchestrator(
 		retryHome: options.RetryHome, maxConcurrency: options.MaxConcurrency,
 		maxInFlightBytes: options.MaxInFlightBytes,
 		maxMutations:     options.MaxMutations, maxMutationBytes: options.MaxMutationBytes,
-		recoveryTimeout: options.RecoveryTimeout, idSource: source,
+		recoveryTimeout:   options.RecoveryTimeout,
+		recoveryAuthority: options.RecoveryAuthority, idSource: source,
 	}
 	activeBytes := uint64(replication.MaxCommandBytes) +
 		uint64(distributedtxn.MaxReplicatedCommandBytes) +

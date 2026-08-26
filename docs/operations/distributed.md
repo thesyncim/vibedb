@@ -101,7 +101,7 @@ split controller. A client receives only the operations listed for that
 principal.
 
 ```json
-{"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate","topology"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}
+{"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate","topology","transaction_recovery"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}
 ```
 
 Save that exact document as `./authorization-policy.vibejson`. Unknown,
