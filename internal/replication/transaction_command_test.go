@@ -423,6 +423,43 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 	}
 }
 
+func TestFusedFinishCommandsDoNotAliasSplitFinishCommands(t *testing.T) {
+	id := transactionControlID(0xc9)
+	for _, test := range []struct {
+		name  string
+		split distributedtxn.ReplicatedOperation
+		fused distributedtxn.ReplicatedOperation
+	}{
+		{name: "apply", split: distributedtxn.ReplicatedApplyParticipant,
+			fused: distributedtxn.ReplicatedApplyReleaseParticipant},
+		{name: "abort", split: distributedtxn.ReplicatedAbortParticipant,
+			fused: distributedtxn.ReplicatedAbortReleaseParticipant},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			split := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
+				Role: distributedtxn.ReplicatedRoleParticipant, Operation: test.split,
+				ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+			})
+			fused := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
+				Role: distributedtxn.ReplicatedRoleParticipant, Operation: test.fused,
+				ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+			})
+			if split.ClientSequence != fused.ClientSequence {
+				t.Fatalf("competing retry sequence=%d/%d", split.ClientSequence, fused.ClientSequence)
+			}
+			if bytes.Equal(split.Transaction, fused.Transaction) {
+				t.Fatal("split and fused control bytes aliased")
+			}
+			splitEnvelope := encodeCommand(t, split)
+			fusedEnvelope := encodeCommand(t, fused)
+			if bytes.Equal(splitEnvelope, fusedEnvelope) ||
+				sha256.Sum256(splitEnvelope) == sha256.Sum256(fusedEnvelope) {
+				t.Fatal("split and fused finish envelopes aliased")
+			}
+		})
+	}
+}
+
 func TestPackedManifestClientSequenceBindsFirstPageOrdinal(t *testing.T) {
 	digest := distributedtxn.Digest{1}
 	refs := transactionPerformanceParticipants(2048, digest)

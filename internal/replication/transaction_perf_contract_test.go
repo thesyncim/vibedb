@@ -2,6 +2,7 @@ package replication
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"testing"
 	"unsafe"
@@ -206,11 +207,13 @@ func TestFusedTransactionBodyCopyBudget(t *testing.T) {
 	}
 }
 
-// TestReplicatedTransactionProtocolPerformanceTargets builds and validates
-// every real fused CommandTransaction in the success schedule. This is an
-// executable envelope/schedule contract, not arithmetic disconnected from the
-// replicated grammar.
-func TestReplicatedTransactionProtocolPerformanceTargets(t *testing.T) {
+// TestReplicatedTransactionEncodedSchedulePerformanceTargets builds and opens
+// every route-bound fused CommandTransaction in the success schedule. It proves
+// the canonical envelope count, identities, route diversity, manifest packing,
+// and revision CAS values. State-machine execution and two-real-RF3-group fault
+// coverage belong in the cross-layer replicatedstate/shard-service suites; this
+// package cannot import those layers without an import cycle.
+func TestReplicatedTransactionEncodedSchedulePerformanceTargets(t *testing.T) {
 	tests := []struct {
 		participants  int
 		critical      int
@@ -239,6 +242,21 @@ func TestReplicatedTransactionProtocolPerformanceTargets(t *testing.T) {
 				test.participants, got.maxCommandBytes)
 		}
 		if test.participants > 1 {
+			if got.uniquePrepares != test.participants || got.uniqueFinishes != test.participants {
+				t.Fatalf("participants=%d unique prepares/finishes=%d/%d, want %d/%d",
+					test.participants, got.uniquePrepares, got.uniqueFinishes,
+					test.participants, test.participants)
+			}
+			wantDecisionRevision := uint64(1)
+			if test.manifestPages != 0 {
+				wantDecisionRevision = uint64(test.manifestPages)
+			}
+			if got.decisionRevision != wantDecisionRevision ||
+				got.retireRevision != wantDecisionRevision+1 {
+				t.Fatalf("participants=%d coordinator revisions=%d/%d, want %d/%d",
+					test.participants, got.decisionRevision, got.retireRevision,
+					wantDecisionRevision, wantDecisionRevision+1)
+			}
 			legacyProposals := 4*test.participants + 3
 			if got.total >= legacyProposals {
 				t.Fatalf("participants=%d target proposals=%d do not improve legacy=%d",
@@ -375,11 +393,15 @@ func transactionPerfFusedCommand(t testing.TB, payloadBytes int) (Command, []byt
 }
 
 type transactionPerformanceSchedule struct {
-	critical        int
-	total           int
-	barriers        int
-	manifestPages   int
-	maxCommandBytes int
+	critical         int
+	total            int
+	barriers         int
+	manifestPages    int
+	maxCommandBytes  int
+	uniquePrepares   int
+	uniqueFinishes   int
+	decisionRevision uint64
+	retireRevision   uint64
 }
 
 func buildReplicatedTransactionPerformanceSchedule(
@@ -408,13 +430,21 @@ func buildReplicatedTransactionPerformanceSchedule(
 	participant := distributedtxn.ParticipantStage{
 		CoordinatorGroup:            distributedtxn.ID(base.GroupID),
 		CoordinatorShardIncarnation: distributedtxn.ID(base.ShardIncarnation),
-		CoordinatorAllocation:       base.AllocationGeneration,
+		CoordinatorAllocation:       refs[0].AllocationGeneration,
 		BucketBits:                  8,
 		IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
 		MutationDigest:              digest,
 	}
 	metrics := transactionPerformanceSchedule{}
-	appendCommand := func(control distributedtxn.ReplicatedCommand, batches []RelationMutationBatch, critical bool) {
+	prepareEnvelopes := make(map[[32]byte]struct{}, participants)
+	finishEnvelopes := make(map[[32]byte]struct{}, participants)
+	appendCommand := func(
+		control distributedtxn.ReplicatedCommand,
+		batches []RelationMutationBatch,
+		route distributedtxn.ParticipantRef,
+		critical bool,
+		identitySet map[[32]byte]struct{},
+	) {
 		controlBytes, appendErr := distributedtxn.AppendReplicatedCommand(nil, control)
 		if appendErr != nil {
 			t.Fatalf("append operation %d: %v", control.Operation, appendErr)
@@ -434,12 +464,31 @@ func buildReplicatedTransactionPerformanceSchedule(
 		}
 		command.AckThrough = 0
 		command.Batches = batches
+		command.Distribution = string(route.Distribution)
+		command.Shard = string(route.Shard)
+		command.RoutingVersion = route.RoutingVersion
+		command.AllocationGeneration = route.AllocationGeneration
+		command.OwnershipEpoch = route.OwnershipEpoch
 		encoded := encodeCommand(t, command)
 		view, openErr := OpenCommand(encoded)
 		if openErr != nil || !bytes.Equal(view.TransactionBytes(), controlBytes) {
 			t.Fatalf("open operation %d: %v", control.Operation, openErr)
 		}
+		if !bytes.Equal(view.Distribution, route.Distribution) ||
+			!bytes.Equal(view.Shard, route.Shard) ||
+			view.RoutingVersion != route.RoutingVersion ||
+			view.AllocationGeneration != route.AllocationGeneration ||
+			view.OwnershipEpoch != route.OwnershipEpoch {
+			t.Fatalf("operation %d route does not match participant", control.Operation)
+		}
 		metrics.maxCommandBytes = max(metrics.maxCommandBytes, len(encoded))
+		if identitySet != nil {
+			identity := sha256.Sum256(encoded)
+			if _, exists := identitySet[identity]; exists {
+				t.Fatalf("operation %d emitted a duplicate route-bound envelope", control.Operation)
+			}
+			identitySet[identity] = struct{}{}
+		}
 		metrics.total++
 		if critical {
 			metrics.critical++
@@ -461,7 +510,7 @@ func buildReplicatedTransactionPerformanceSchedule(
 			Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
 			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator,
 			Payload: record, Participant: participant,
-		}, base.Batches, true)
+		}, base.Batches, refs[0], true, prepareEnvelopes)
 	} else {
 		pageScratch := make([]byte, distributedtxn.ManifestSegmentBytes)
 		packed := make([]byte, 0, distributedtxn.MaxManifestSegmentSequenceBytes)
@@ -504,9 +553,10 @@ func buildReplicatedTransactionPerformanceSchedule(
 			Operation: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
 			Payload: payload, Participant: participant,
-		}, base.Batches, true)
+		}, base.Batches, refs[0], true, prepareEnvelopes)
 	}
 	metrics.barriers++ // coordinator begin plus its local prepare
+	metrics.decisionRevision = uint64(max(1, metrics.manifestPages))
 
 	for ordinal := 1; ordinal < participants; ordinal++ {
 		participant.ParticipantOrdinal = uint32(ordinal)
@@ -515,31 +565,36 @@ func buildReplicatedTransactionPerformanceSchedule(
 			Operation: distributedtxn.ReplicatedStagePrepareParticipant,
 			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
 			Participant: participant,
-		}, base.Batches, true)
+		}, base.Batches, refs[ordinal], true, prepareEnvelopes)
 	}
+	metrics.uniquePrepares = len(prepareEnvelopes)
 	metrics.barriers++ // parallel remote prepare wave
 
 	appendCommand(distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedCommitCoordinator,
-		ID:        id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
-	}, nil, true)
+		ID:        id, ExpectedRevision: metrics.decisionRevision,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	}, nil, refs[0], true, nil)
 	metrics.barriers++
 
-	for range participants {
+	for ordinal := range participants {
 		appendCommand(distributedtxn.ReplicatedCommand{
 			Role:      distributedtxn.ReplicatedRoleParticipant,
 			Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
 			ID:        id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
-		}, nil, true)
+		}, nil, refs[ordinal], true, finishEnvelopes)
 	}
+	metrics.uniqueFinishes = len(finishEnvelopes)
 	metrics.barriers++ // parallel apply plus release wave
 
+	metrics.retireRevision = metrics.decisionRevision + 1
 	appendCommand(distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedRetireCoordinator,
-		ID:        id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
-	}, nil, false)
+		ID:        id, ExpectedRevision: metrics.retireRevision,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	}, nil, refs[0], false, nil)
 	return metrics
 }
 
