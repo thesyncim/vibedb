@@ -107,6 +107,8 @@ const (
 	requestReplicaObservation
 	requestOwnershipTransition
 	requestReplicaRetirement
+	requestInstallExecutionGroup
+	requestRemoveExecutionGroup
 )
 
 const (
@@ -137,6 +139,8 @@ type ownerRequest struct {
 	operation    [32]byte
 	step         [32]byte
 	sourceMember uint64
+	install      ExecutionGroup
+	publish      func()
 }
 
 type ownerReply struct {
@@ -531,6 +535,7 @@ type ownerHost interface {
 	DurablePromotion(raftmember.GroupKey, uint64) (raftmember.DurablePromotionProof, bool, error)
 	SnapshotState(raftmember.GroupKey) (replicatedstate.State, error)
 	SnapshotBaseCertificate(raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error)
+	Add(*raftmember.Runtime) error
 	Remove(raftmember.GroupKey) error
 	RunOne() (multiraft.Progress, bool, error)
 	PopOutbound() (raftmember.OutboundMessage, bool)
@@ -919,6 +924,12 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
 	case requestReplicaRetirement:
 		reply.err = owner.retireReplica(request)
+	case requestInstallExecutionGroup:
+		reply.err = owner.installExecutionGroupNow(request.install, request.publish)
+	case requestRemoveExecutionGroup:
+		reply.err = owner.removeExecutionGroupNow(
+			request.group, request.install.Identity, request.publish,
+		)
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger:
 		member, found := owner.members[request.group]
 		if !found ||
@@ -992,6 +1003,103 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.reply <- reply
 	}
 	return reply.err
+}
+
+func validExecutionGroup(group ExecutionGroup) bool {
+	identity := group.Identity
+	return group.Runtime != nil && identity == group.Runtime.Identity() &&
+		identity.Group != (raftmember.GroupKey{}) && identity.AllocationGeneration != 0 &&
+		identity.MemberID != 0 && identity.StoreID != ([16]byte{}) &&
+		identity.NodeIncarnation != 0 && identity.RelationManifestDigest != ([32]byte{}) &&
+		group.Command.Valid() &&
+		group.Command.RelationManifestDigest == identity.RelationManifestDigest
+}
+
+// installExecutionGroup is a definite-outcome cold control operation. Once
+// enqueued it waits for the serialized owner even if a caller would otherwise
+// abandon its context; returning outcome-unknown here could leak an adopted
+// Runtime whose ownership the caller still believes it retains.
+func (owner *Owner) installExecutionGroup(group ExecutionGroup, publish func()) error {
+	if owner == nil || publish == nil || !validExecutionGroup(group) {
+		return ErrInvalidOwner
+	}
+	reply := make(chan ownerReply, 1)
+	if err := owner.publish(ownerRequest{
+		kind: requestInstallExecutionGroup, group: group.Identity.Group,
+		install: group, publish: publish, reply: reply,
+	}); err != nil {
+		return err
+	}
+	result := <-reply
+	return result.err
+}
+
+func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func()) error {
+	if !validExecutionGroup(group) || publish == nil || len(owner.groups) >= multiraft.AbsoluteMaxGroups {
+		return ErrInvalidOwner
+	}
+	key := group.Identity.Group
+	if _, exists := owner.members[key]; exists {
+		return multiraft.ErrGroupExists
+	}
+	if err := owner.host.Add(group.Runtime); err != nil {
+		return err
+	}
+	// All following operations are in-memory no-fail publications. Publish the
+	// owner metadata before transport enrollment so an authenticated frame can
+	// never resolve a group without a serving owner.
+	owner.members[key] = ownerMember{identity: group.Identity, command: group.Command,
+		read: group.Read, recovery: group.Recovery}
+	owner.groups = append(owner.groups, key)
+	publish()
+	return nil
+}
+
+func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, withdraw func()) error {
+	group := identity.Group
+	if owner == nil || group == (raftmember.GroupKey{}) || withdraw == nil {
+		return ErrInvalidOwner
+	}
+	reply := make(chan ownerReply, 1)
+	if err := owner.publish(ownerRequest{
+		kind: requestRemoveExecutionGroup, group: group,
+		install: ExecutionGroup{Identity: identity}, publish: withdraw, reply: reply,
+	}); err != nil {
+		return err
+	}
+	result := <-reply
+	return result.err
+}
+
+func (owner *Owner) removeExecutionGroupNow(
+	group raftmember.GroupKey, expected raftmember.RuntimeIdentity, withdraw func(),
+) error {
+	if withdraw == nil {
+		return ErrInvalidOwner
+	}
+	member, exists := owner.members[group]
+	if !exists {
+		return multiraft.ErrGroupNotFound
+	}
+	if member.identity != expected {
+		return ErrServingFence
+	}
+	if err := owner.host.Remove(group); err != nil {
+		return err
+	}
+	// Host has closed the Runtime and released its applied-source ownership.
+	// Withdraw transport admission before deleting serving metadata.
+	withdraw()
+	delete(owner.members, group)
+	for index, key := range owner.groups {
+		if key == group {
+			copy(owner.groups[index:], owner.groups[index+1:])
+			owner.groups[len(owner.groups)-1] = raftmember.GroupKey{}
+			owner.groups = owner.groups[:len(owner.groups)-1]
+			break
+		}
+	}
+	return nil
 }
 
 func (owner *Owner) syncCommandFenceFromState(

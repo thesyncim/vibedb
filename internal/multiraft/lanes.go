@@ -182,6 +182,20 @@ func (lane *ExecutionLane) Remove(key raftmember.GroupKey) error {
 	}
 	return lane.set.Remove(key)
 }
+
+// Add transfers a Runtime to this exact deterministic lane. It exists for
+// serialized live group adoption; callers cannot use a lane handle to place a
+// group on a different owner.
+func (lane *ExecutionLane) Add(runtime *raftmember.Runtime) error {
+	if lane == nil || lane.set == nil || runtime == nil {
+		return ErrGroupNotFound
+	}
+	index, err := lane.set.Lane(runtime.Identity().Group)
+	if err != nil || index != lane.index {
+		return errors.Join(ErrGroupNotFound, err)
+	}
+	return lane.set.Add(runtime)
+}
 func (lane *ExecutionLane) RunOne() (Progress, bool, error) {
 	if lane == nil || lane.set == nil {
 		return Progress{}, false, ErrExecutionLane

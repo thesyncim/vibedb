@@ -41,13 +41,33 @@ type ExecutionOptions struct {
 type ExecutionOwners struct {
 	lanes   *multiraft.ExecutionLanes
 	owners  []*Owner
-	byGroup map[raftmember.GroupKey]*Owner
+	byGroup atomic.Pointer[executionOwnerGroups]
 	pulse   <-chan struct{}
 	ticks   []chan struct{}
 
 	state   atomic.Uint32
 	started chan struct{}
 	done    chan struct{}
+}
+
+type executionOwnerGroups struct {
+	values map[raftmember.GroupKey]executionOwnerRoute
+}
+
+type executionOwnerRoute struct {
+	owner *Owner
+	ready *atomic.Bool
+}
+
+// ExecutionGroup is the complete serving metadata installed with one adopted
+// Runtime. Runtime ownership transfers only when the serialized lane owner
+// has published every field and invoked the supplied transport commit.
+type ExecutionGroup struct {
+	Runtime  *raftmember.Runtime
+	Identity raftmember.RuntimeIdentity
+	Command  CommandFence
+	Read     ReadSource
+	Recovery TransactionRecoverySource
 }
 
 func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
@@ -87,10 +107,10 @@ func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 	}
 	result := &ExecutionOwners{
 		lanes: options.Lanes, owners: make([]*Owner, count),
-		byGroup: make(map[raftmember.GroupKey]*Owner, len(options.Members)),
-		pulse:   options.Pulse, ticks: make([]chan struct{}, count),
+		pulse: options.Pulse, ticks: make([]chan struct{}, count),
 		started: make(chan struct{}), done: make(chan struct{}),
 	}
+	groups := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(options.Members))}
 	for lane := 0; lane < count; lane++ {
 		view, err := options.Lanes.OwnerLane(lane)
 		if err != nil {
@@ -109,9 +129,10 @@ func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 		}
 		result.owners[lane] = owner
 		for _, member := range item.members {
-			result.byGroup[member.Group] = owner
+			groups.values[member.Group] = executionOwnerRoute{owner: owner}
 		}
 	}
+	result.byGroup.Store(groups)
 	return result, nil
 }
 
@@ -119,11 +140,72 @@ func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) 
 	if owners == nil || group == (raftmember.GroupKey{}) {
 		return nil, ErrExecutionGroup
 	}
-	owner := owners.byGroup[group]
-	if owner == nil {
+	groups := owners.byGroup.Load()
+	if groups == nil {
 		return nil, ErrExecutionGroup
 	}
-	return owner, nil
+	route, found := groups.values[group]
+	if !found || route.owner == nil || route.ready != nil && !route.ready.Load() {
+		return nil, ErrExecutionGroup
+	}
+	return route.owner, nil
+}
+
+// installGroup runs the final transport publication on the owning lane. The
+// callback must not fail: it is invoked only after Host ownership and serving
+// metadata have been installed, before that lane may execute the Runtime.
+func (owners *ExecutionOwners) installGroup(group ExecutionGroup, publish func()) error {
+	if owners == nil || publish == nil || group.Runtime == nil ||
+		group.Identity != group.Runtime.Identity() || owners.state.Load() != executionOwnersRunning {
+		return ErrInvalidOwner
+	}
+	laneIndex, err := owners.lanes.Lane(group.Identity.Group)
+	if err != nil || laneIndex < 0 || laneIndex >= len(owners.owners) {
+		return errors.Join(ErrExecutionGroup, err)
+	}
+	owner := owners.owners[laneIndex]
+	ready := new(atomic.Bool)
+	return owner.installExecutionGroup(group, func() {
+		current := owners.byGroup.Load()
+		next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)+1)}
+		for key, value := range current.values {
+			next.values[key] = value
+		}
+		next.values[group.Identity.Group] = executionOwnerRoute{owner: owner, ready: ready}
+		owners.byGroup.Store(next)
+		publish()
+		ready.Store(true)
+	})
+}
+
+func (owners *ExecutionOwners) removeGroup(
+	identity raftmember.RuntimeIdentity,
+	withdraw func(),
+) error {
+	group := identity.Group
+	if owners == nil || group == (raftmember.GroupKey{}) || withdraw == nil ||
+		owners.state.Load() != executionOwnersRunning {
+		return ErrInvalidOwner
+	}
+	owner, err := owners.owner(group)
+	if err != nil {
+		return err
+	}
+	route := owners.byGroup.Load().values[group]
+	return owner.removeExecutionGroup(identity, func() {
+		if route.ready != nil {
+			route.ready.Store(false)
+		}
+		withdraw()
+		current := owners.byGroup.Load()
+		next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)-1)}
+		for key, value := range current.values {
+			if key != group {
+				next.values[key] = value
+			}
+		}
+		owners.byGroup.Store(next)
+	})
 }
 
 // Run starts every lane owner before publishing readiness. The first lane

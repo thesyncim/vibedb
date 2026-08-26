@@ -262,6 +262,124 @@ func TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer(t *test
 	}
 }
 
+func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
+	initialRuntime, initialBase, initialRead := newRF3RuntimeForTestGroup(t, 1, 0, false)
+	dynamicRuntime, dynamicBase, dynamicRead := newRF3RuntimeForTestGroup(t, 1, 1, false)
+	initialIdentity := initialRuntime.Identity()
+	dynamicIdentity := dynamicRuntime.Identity()
+
+	serving, err := raftserve.NewRegistry(raftserve.Limits{
+		MaxGroups: 2, MaxOutstandingIdentities: 16, MaxOutstandingAttempts: 16,
+		MaxWaiters: 16, MaxAttemptsPerIdentity: 2,
+		MaxRetainedCompletionBytes: 16 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serving.Close()
+	lanes, err := serving.NewExecutionLanes(2, multiraft.Limits{
+		MaxGroups: 2, MaxQueueItems: 64, MaxQueueBytes: 16 << 20,
+		MaxGroupItems: 32, MaxGroupBytes: 8 << 20,
+		MaxOutboxItems: 64, MaxOutboxBytes: 16 << 20, MaxPendingTicks: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = lanes.Add(initialRuntime); err != nil {
+		t.Fatal(err)
+	}
+	local := rafttransport.NodeID{1}
+	initialRoster := executionTestRoster(initialIdentity.Group, local)
+	transportRegistry, err := rafttransport.NewStaticRegistry(local, initialRoster,
+		rafttransport.Limits{MaxGroups: 2, MaxMembers: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners, err := NewExecutionOwners(ExecutionOptions{
+		Registry: serving, Lanes: lanes,
+		Members:                    []raftmember.RuntimeIdentity{initialIdentity},
+		CommandFences:              []CommandFence{rf3CommandFence(initialIdentity, initialBase)},
+		ReadSources:                []ReadSource{initialRead},
+		TransactionRecoverySources: []TransactionRecoverySource{initialRead},
+		MembershipAuthority:        transportRegistry, Outbound: executionTestOutbound{},
+		Limits: Limits{MaxIngressItems: 64, MaxIngressBytes: 16 << 20,
+			MaxPendingProposalItems: 16, MaxPendingProposalBytes: 8 << 20,
+			MaxPendingReadItems: 16, MaxPendingReadBytes: 8 << 20,
+			MaxPendingOutboundBytes: 8 << 20},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- owners.Run(ctx) }()
+	<-owners.Started()
+
+	dynamicGroup := ExecutionGroup{Runtime: dynamicRuntime, Identity: dynamicIdentity,
+		Command: rf3CommandFence(dynamicIdentity, dynamicBase), Read: dynamicRead,
+		Recovery: dynamicRead}
+	if err = transportRegistry.InstallGroup(
+		executionTestRoster(dynamicIdentity.Group, local),
+		func(publish func()) error {
+			return owners.installGroup(dynamicGroup, func() {
+				if _, routeErr := owners.owner(dynamicIdentity.Group); !errors.Is(routeErr, ErrExecutionGroup) {
+					t.Fatalf("owner visible before atomic transport commit: %v", routeErr)
+				}
+				publish()
+				if _, ok := transportRegistry.ReplicaSetVersion(dynamicIdentity.Group); !ok {
+					t.Fatal("transport absent during commit")
+				}
+				if _, routeErr := owners.owner(dynamicIdentity.Group); !errors.Is(routeErr, ErrExecutionGroup) {
+					t.Fatalf("owner gate opened before commit returned: %v", routeErr)
+				}
+			})
+		},
+	); err != nil {
+		t.Fatalf("install dynamic group: %v", err)
+	}
+	if _, err = owners.Probe(context.Background(), dynamicIdentity.Group); err != nil {
+		t.Fatalf("dynamic owner route: %v", err)
+	}
+	if member, lookupErr := transportRegistry.LocalMember(dynamicIdentity.Group); lookupErr != nil || member != dynamicIdentity.MemberID {
+		t.Fatalf("dynamic transport member=%d err=%v", member, lookupErr)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err = transportRegistry.RemoveGroup(dynamicIdentity.Group, func(withdraw func()) error {
+			return owners.removeGroup(dynamicIdentity, withdraw)
+		})
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		if !errors.Is(err, multiraft.ErrGroupBusy) {
+			t.Fatalf("remove dynamic group: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("remove dynamic group did not quiesce: %v", err)
+	}
+	if _, err = owners.Probe(context.Background(), dynamicIdentity.Group); !errors.Is(err, ErrExecutionGroup) {
+		t.Fatalf("removed owner route: %v", err)
+	}
+	if _, err = transportRegistry.LocalMember(dynamicIdentity.Group); !errors.Is(err, rafttransport.ErrGroupNotFound) {
+		t.Fatalf("removed transport route: %v", err)
+	}
+	cancel()
+	if err = <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+func executionTestRoster(group raftmember.GroupKey, local rafttransport.NodeID) []rafttransport.Member {
+	return []rafttransport.Member{
+		{Group: group, ReplicaSetVersion: 1, MemberID: 1, Node: local, Role: rafttransport.MemberVoter},
+		{Group: group, ReplicaSetVersion: 1, MemberID: 2, Node: rafttransport.NodeID{2}, Role: rafttransport.MemberVoter},
+		{Group: group, ReplicaSetVersion: 1, MemberID: 3, Node: rafttransport.NodeID{3}, Role: rafttransport.MemberVoter},
+	}
+}
+
 func waitExecutionGroupLeader(t testing.TB, ctx context.Context, owners []*ExecutionOwners, group raftmember.GroupKey) {
 	t.Helper()
 	for ctx.Err() == nil {

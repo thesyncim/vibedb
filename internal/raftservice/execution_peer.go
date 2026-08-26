@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
@@ -26,6 +27,7 @@ type AuthenticatedExecutionPeerOptions struct {
 
 type AuthenticatedExecutionPeerRuntime struct {
 	owners    *ExecutionOwners
+	registry  *rafttransport.StaticRegistry
 	transport *rafttransport.OrdinaryTransport
 	server    *PeerServer
 	state     atomic.Uint32
@@ -80,9 +82,59 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 		return nil, err
 	}
 	return &AuthenticatedExecutionPeerRuntime{
-		owners: owners, transport: transport, server: server,
+		owners: owners, registry: options.Registry, transport: transport, server: server,
 		started: make(chan struct{}), done: make(chan struct{}),
 	}, nil
+}
+
+// RegisterExecutionGroup atomically makes one adopted Runtime visible to the
+// deterministic execution lane and ordinary transport. The transport roster
+// is published from inside the serialized lane after Host ownership and
+// serving metadata are installed, so no authenticated request can observe a
+// transport-only or owner-only group. Failure leaves Runtime with the caller.
+func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
+	roster []rafttransport.Member,
+	group ExecutionGroup,
+) error {
+	if runtime == nil || runtime.registry == nil || runtime.owners == nil ||
+		!validExecutionGroup(group) || len(roster) == 0 {
+		return ErrInvalidOwner
+	}
+	local := runtime.registry.LocalNode()
+	found := false
+	for index := range roster {
+		member := roster[index]
+		if member.Group != group.Identity.Group {
+			return ErrInvalidOwner
+		}
+		if member.Node == local {
+			if found || member.MemberID != group.Identity.MemberID {
+				return ErrInvalidOwner
+			}
+			found = true
+		}
+	}
+	if !found {
+		return ErrInvalidOwner
+	}
+	return runtime.registry.InstallGroup(roster, func(publish func()) error {
+		return runtime.owners.installGroup(group, publish)
+	})
+}
+
+// UnregisterExecutionGroup closes one quiescent dynamically adopted Runtime
+// and withdraws its transport identity in the same serialized owner step.
+// The full RuntimeIdentity fences stale child-lifecycle retries.
+func (runtime *AuthenticatedExecutionPeerRuntime) UnregisterExecutionGroup(
+	identity raftmember.RuntimeIdentity,
+) error {
+	if runtime == nil || runtime.registry == nil || runtime.owners == nil ||
+		identity.Group == (raftmember.GroupKey{}) {
+		return ErrInvalidOwner
+	}
+	return runtime.registry.RemoveGroup(identity.Group, func(withdraw func()) error {
+		return runtime.owners.removeGroup(identity, withdraw)
+	})
 }
 
 // Run starts the one shared transport before every owner loop and the shared
