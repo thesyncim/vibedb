@@ -198,6 +198,46 @@ func TestReplicatedCatalogSeparatesEnrolledTargetFromServingRF3(t *testing.T) {
 	}
 }
 
+func TestBuildReplicaReplacementMembershipGrantBindsCompleteEnrolledIdentity(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	testReplicatedCatalogEnrollTarget(&descriptor)
+	snapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := BuildReplicaReplacementMembershipGrant(
+		snapshot, descriptor.Group, [16]byte{0x91}, 7,
+		descriptor.Replicas[0].Member, descriptor.EnrolledTarget.Member,
+	)
+	if err != nil || !grant.Valid() || grant.CatalogGeneration != snapshot.Generation() ||
+		grant.InitialReplicaSetVersion != descriptor.Command.ReplicaSetVersion ||
+		grant.TargetNode != [16]byte(descriptor.EnrolledTarget.Node) ||
+		!replicatedCatalogCertifiesInitialGrant(snapshot, grant) {
+		t.Fatalf("grant=%+v err=%v", grant, err)
+	}
+	changed := descriptor
+	target := *descriptor.EnrolledTarget
+	target.StoreID[0]++
+	changed.EnrolledTarget = &target
+	changedSnapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{changed},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedGrant, err := BuildReplicaReplacementMembershipGrant(
+		changedSnapshot, changed.Group, grant.TransitionID, grant.MetadataEpoch,
+		grant.SourceMember, grant.TargetMember,
+	)
+	if err != nil || changedGrant.InitialDescriptorDigest == grant.InitialDescriptorDigest ||
+		replicatedCatalogCertifiesInitialGrant(changedSnapshot, grant) {
+		t.Fatalf("target identity was not bound: original=%x changed=%x err=%v",
+			grant.InitialDescriptorDigest, changedGrant.InitialDescriptorDigest, err)
+	}
+}
+
 func TestReplicatedCatalogRejectsGroupChangeWithinAllocation(t *testing.T) {
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
 	current, err := NewSnapshotWithReplicatedMetadata(
@@ -544,6 +584,16 @@ func testReplicatedCatalogInput(
 		},
 	}
 	return config, endpoints, descriptor
+}
+
+func testReplicatedCatalogEnrollTarget(descriptor *ReplicatedShardDescriptor) {
+	if descriptor == nil {
+		return
+	}
+	descriptor.EnrolledTarget = &ReplicatedReplicaDescriptor{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+		Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control",
+	}
 }
 
 func TestDecodeFixed16HexRejectsNonCanonicalWidth(t *testing.T) {

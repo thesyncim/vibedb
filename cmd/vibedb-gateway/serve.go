@@ -448,6 +448,7 @@ func runServe(args []string) int {
 			catalogAuthority,
 			rebalance.ReplicatedFailureAuthority{Source: catalogAuthority},
 			controls.HealthObservations, manifest, moveController,
+			catalogAuthority, controls.GrantInstaller,
 		)
 		healthRevisions, revisionErr := newGatewayReplicaHealthRevisionController(
 			catalogAuthority, controls.HealthObservations, catalogAuthority,

@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	vibejson "github.com/thesyncim/vibejson"
@@ -279,6 +280,12 @@ func replicatedCatalogCertifiesInitialGrant(snapshot *Snapshot, grant membership
 			int(entry.replicaBase)+int(entry.replicaCount) > len(snapshot.replicatedReplicas) {
 			continue
 		}
+		if entry.hasEnrolledTarget {
+			target := snapshot.replicatedReplicas[int(entry.replicaBase)+int(entry.replicaCount)]
+			if target.Member != grant.TargetMember || [16]byte(target.Node) != grant.TargetNode {
+				continue
+			}
+		}
 		var voters [3]uint64
 		for replica := range int(entry.replicaCount) {
 			voters[replica] = snapshot.replicatedReplicas[int(entry.replicaBase)+replica].Member
@@ -289,6 +296,67 @@ func replicatedCatalogCertifiesInitialGrant(snapshot *Snapshot, grant membership
 			replicatedCatalogInitialDescriptorDigest(snapshot, index) == grant.InitialDescriptorDigest
 	}
 	return false
+}
+
+// BuildReplicaReplacementMembershipGrant derives the sole catalog-certified
+// pre-change membership authority for one enrolled replacement. The initial
+// descriptor digest commits to the serving RF3 and the complete cold target
+// identity; callers supply only the transition/metadata witnesses and member
+// choice, so an inventory record cannot substitute routing or store identity.
+func BuildReplicaReplacementMembershipGrant(
+	snapshot *Snapshot,
+	group raftmember.GroupKey,
+	transition [16]byte,
+	metadataEpoch uint64,
+	sourceMember, targetMember uint64,
+) (membershipgrant.Grant, error) {
+	if snapshot == nil || transition == ([16]byte{}) || metadataEpoch == 0 ||
+		sourceMember == 0 || targetMember == 0 || sourceMember == targetMember {
+		return membershipgrant.Grant{}, ErrReplicatedCatalogConflict
+	}
+	matched := -1
+	for index := range snapshot.replicatedShards {
+		entry := snapshot.replicatedShards[index]
+		if entry.group != group {
+			continue
+		}
+		if matched >= 0 || int(entry.replicaCount) != ServingReplicaCount ||
+			!entry.hasEnrolledTarget ||
+			int(entry.replicaBase)+ServingReplicaCount >= len(snapshot.replicatedReplicas) {
+			return membershipgrant.Grant{}, ErrReplicatedCatalogConflict
+		}
+		matched = index
+	}
+	if matched < 0 {
+		return membershipgrant.Grant{}, ErrReplicatedCatalogConflict
+	}
+	entry := snapshot.replicatedShards[matched]
+	target := snapshot.replicatedReplicas[int(entry.replicaBase)+ServingReplicaCount]
+	if target.Member != targetMember || target.Node == (rafttransport.NodeID{}) {
+		return membershipgrant.Grant{}, ErrReplicatedCatalogConflict
+	}
+	var voters [ServingReplicaCount]uint64
+	sourceFound := false
+	for index := range voters {
+		replica := snapshot.replicatedReplicas[int(entry.replicaBase)+index]
+		voters[index] = replica.Member
+		sourceFound = sourceFound || replica.Member == sourceMember
+	}
+	sort.Slice(voters[:], func(left, right int) bool { return voters[left] < voters[right] })
+	if !sourceFound {
+		return membershipgrant.Grant{}, ErrReplicatedCatalogConflict
+	}
+	grant := membershipgrant.Grant{
+		Group: group, TransitionID: transition, MetadataEpoch: metadataEpoch,
+		CatalogGeneration: snapshot.Generation(), InitialReplicaSetVersion: entry.command.ReplicaSetVersion,
+		InitialVoters: voters, InitialRosterDigest: replicatedCatalogInitialRosterDigest(snapshot, matched),
+		InitialDescriptorDigest: replicatedCatalogInitialDescriptorDigest(snapshot, matched),
+		SourceMember:            sourceMember, TargetMember: targetMember, TargetNode: [16]byte(target.Node),
+	}
+	if !grant.Valid() || !replicatedCatalogCertifiesInitialGrant(snapshot, grant) {
+		return membershipgrant.Grant{}, ErrReplicatedCatalogConflict
+	}
+	return grant, nil
 }
 
 func replicatedCatalogInitialRosterDigest(snapshot *Snapshot, shardIndex int) [sha256.Size]byte {
@@ -367,6 +435,22 @@ func replicatedCatalogInitialDescriptorDigest(snapshot *Snapshot, shardIndex int
 		writeString(replica.Address)
 		writeString(replica.ControlEndpoint)
 		writeString(replica.ControlAddress)
+	}
+	if entry.hasEnrolledTarget {
+		if int(entry.replicaBase)+int(entry.replicaCount) >= len(snapshot.replicatedReplicas) {
+			return [sha256.Size]byte{}
+		}
+		target := snapshot.replicatedReplicas[int(entry.replicaBase)+int(entry.replicaCount)]
+		writeUint64(target.Member)
+		_, _ = hash.Write(target.Node[:])
+		_, _ = hash.Write(target.StoreID[:])
+		writeUint64(target.NodeIncarnation)
+		writeString(target.Endpoint)
+		writeString(target.DataAddress)
+		writeString(target.NativeEndpoint)
+		writeString(target.Address)
+		writeString(target.ControlEndpoint)
+		writeString(target.ControlAddress)
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))

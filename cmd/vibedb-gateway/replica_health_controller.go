@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -61,17 +64,29 @@ type gatewayFailedReplicaMoveSubmitter interface {
 	Submit(context.Context, *rebalance.Plan) (rebalance.Action, error)
 }
 
-// gatewayFailedReplicaMoveSink hands the authorized plan to the existing RF3
-// move controller. Controller.Submit writes the canonical intent through the
-// ReplicatedCatalogAuthority before executing its first idempotent action.
+type gatewayFailedReplicaGrantAuthority interface {
+	Read(context.Context) (*gateway.Snapshot, error)
+	PublishMembershipGrant(context.Context, membershipgrant.Grant) error
+	ReadMembershipGrant(context.Context, raftmember.GroupKey) (membershipgrant.Grant, bool, error)
+	RetryPending(context.Context) error
+}
+
+// gatewayFailedReplicaMoveSink prepares the exact pre-change membership grant
+// before handing the authorized plan to the existing RF3 move controller. A
+// crash anywhere in this sequence is replay-safe: grant publication and
+// installation are exact/idempotent, while Controller.Submit owns the durable
+// move journal and its idempotent action execution.
 type gatewayFailedReplicaMoveSink struct {
 	controller gatewayFailedReplicaMoveSubmitter
+	grants     gatewayFailedReplicaGrantAuthority
+	installer  gatewayMembershipGrantInstaller
 }
 
 func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 	ctx context.Context, intent rebalance.FailedReplicaMoveIntent,
 ) error {
-	if ctx == nil || sink.controller == nil || intent.Plan == nil ||
+	if ctx == nil || sink.controller == nil || sink.grants == nil || sink.installer == nil ||
+		intent.Plan == nil ||
 		intent.Operation == (rebalance.OperationID{}) ||
 		intent.Plan.OperationID() != intent.Operation || len(intent.Intent) == 0 {
 		return errGatewayReplicaHealth
@@ -84,8 +99,63 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 	if err != nil || identity.Operation != intent.Operation {
 		return errors.Join(err, errGatewayReplicaHealth)
 	}
+	catalog, err := sink.grants.Read(ctx)
+	if err != nil || catalog == nil || catalog.Generation() != intent.Plan.CatalogGeneration() {
+		return errors.Join(err, errGatewayReplicaHealth)
+	}
+	transition, epoch := gatewayFailedReplicaGrantIdentity(intent)
+	grant, err := gateway.BuildReplicaReplacementMembershipGrant(
+		catalog, intent.Plan.Group(), transition, epoch,
+		intent.Plan.RetiringMember(), intent.Plan.TargetMember(),
+	)
+	if err != nil {
+		return errors.Join(err, errGatewayReplicaHealth)
+	}
+	err = sink.grants.PublishMembershipGrant(ctx, grant)
+	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		if retryErr := sink.grants.RetryPending(ctx); retryErr != nil {
+			return errors.Join(err, retryErr)
+		}
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	stored, found, err := sink.grants.ReadMembershipGrant(ctx, grant.Group)
+	if err != nil || !found || stored != grant {
+		return errors.Join(err, errGatewayReplicaHealth)
+	}
+	var workspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, found := catalog.ResolveReplicatedMembershipRoute(
+		identity.Request.Distribution, identity.Request.Shard, workspace[:0],
+	)
+	if !found || route.Serving.Group != grant.Group {
+		return errGatewayReplicaHealth
+	}
+	if err = installGatewayMembershipGrant(ctx, route, grant, sink.installer); err != nil {
+		return err
+	}
 	_, err = sink.controller.Submit(ctx, intent.Plan)
 	return err
+}
+
+func gatewayFailedReplicaGrantIdentity(
+	intent rebalance.FailedReplicaMoveIntent,
+) ([16]byte, uint64) {
+	hash := sha256.New()
+	hash.Write([]byte("vibedb/gateway/failed-replica-membership-grant\x00"))
+	hash.Write(intent.Operation[:])
+	hash.Write(intent.Evidence[:])
+	hash.Write(intent.Placement[:])
+	var digest [sha256.Size]byte
+	hash.Sum(digest[:0])
+	var transition [16]byte
+	copy(transition[:], digest[:16])
+	epoch := binary.LittleEndian.Uint64(digest[16:24])
+	if epoch == 0 {
+		epoch = 1
+	}
+	return transition, epoch
 }
 
 // gatewayReplicaHealthController converts only quorum-certified, multi-epoch
@@ -127,13 +197,15 @@ func newGatewayReplicaHealthRuntime(
 	observations gatewayReplicaObservationClient,
 	inventory gatewayReplicaCandidateInventory,
 	moves gatewayFailedReplicaMoveSubmitter,
+	grants gatewayFailedReplicaGrantAuthority,
+	installer gatewayMembershipGrantInstaller,
 ) (*gatewayReplicaHealthController, error) {
-	if observations == nil || moves == nil {
+	if observations == nil || moves == nil || grants == nil || installer == nil {
 		return nil, errGatewayReplicaHealth
 	}
 	return newGatewayReplicaHealthController(
 		catalog, failures, gatewayAuthenticatedHealthObserver{client: observations}, inventory,
-		gatewayFailedReplicaMoveSink{controller: moves},
+		gatewayFailedReplicaMoveSink{controller: moves, grants: grants, installer: installer},
 	)
 }
 

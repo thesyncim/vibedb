@@ -293,7 +293,8 @@ func newGatewayReplicaRemoteClients(
 	remote := &gatewayReplicaRemoteActions{observer: observations, actions: actions,
 		routes: options.Routes}
 	return gatewayReplicaMoveControls{
-		Observer: options.Observer, HealthObservations: observations, Routes: options.Routes,
+		Observer: options.Observer, HealthObservations: observations,
+		GrantInstaller: grantInstaller, Routes: options.Routes,
 		Membership: gatewayGrantedMembershipClient{grants: options.Authority,
 			installer: grantInstaller, applier: options.Replicated},
 		Snapshots: source, Bootstrap: bootstrap, Awaiter: remote, Ownership: remote,
@@ -525,47 +526,49 @@ func (client gatewayGrantedMembershipClient) ApplyMembership(
 		grant.SourceMember != request.SourceMember || grant.TargetMember != request.TargetMember {
 		return gateway.ReplicatedMembershipResult{}, errors.Join(err, errGatewayReplicaControl)
 	}
-	targetPresent := false
-	for _, endpoint := range route.Serving.Replicas {
-		if endpoint.Member == grant.TargetMember && [16]byte(endpoint.Node) == grant.TargetNode {
-			targetPresent = true
-		}
+	if err = installGatewayMembershipGrant(ctx, route, grant, client.installer); err != nil {
+		return gateway.ReplicatedMembershipResult{}, err
 	}
-	if route.HasEnrolledTarget {
-		if route.EnrolledTarget.Member == grant.TargetMember &&
-			[16]byte(route.EnrolledTarget.Node) == grant.TargetNode {
-			targetPresent = true
-		}
-	}
-	if !targetPresent {
-		return gateway.ReplicatedMembershipResult{}, errGatewayReplicaControl
+	return client.applier.ApplyMembership(ctx, route, request)
+}
+
+// installGatewayMembershipGrant makes a pre-change grant available to the
+// reachable voter quorum and the exact enrolled target. It always attempts
+// every current voter so a certified failed-replica replacement can tolerate
+// the absent source without silently reducing the quorum requirement.
+func installGatewayMembershipGrant(
+	ctx context.Context,
+	route gateway.ReplicatedMembershipRoute,
+	grant membershipgrant.Grant,
+	installer gatewayMembershipGrantInstaller,
+) error {
+	if ctx == nil || installer == nil || route.Serving.Group != grant.Group ||
+		len(route.Serving.Replicas) != gateway.ServingReplicaCount ||
+		!route.HasEnrolledTarget || route.EnrolledTarget.Member != grant.TargetMember ||
+		[16]byte(route.EnrolledTarget.Node) != grant.TargetNode {
+		return errGatewayReplicaControl
 	}
 	installedVoters := 0
 	targetInstalled := false
 	var installErrors error
 	for _, endpoint := range route.Serving.Replicas {
-		installErr := client.installer.InstallMembershipGrant(ctx, endpoint.Node, grant)
+		installErr := installer.InstallMembershipGrant(ctx, endpoint.Node, grant)
 		if installErr == nil {
 			installedVoters++
-			if endpoint.Member == grant.TargetMember && [16]byte(endpoint.Node) == grant.TargetNode {
-				targetInstalled = true
-			}
 		} else {
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}
-	if route.HasEnrolledTarget {
-		installErr := client.installer.InstallMembershipGrant(ctx, route.EnrolledTarget.Node, grant)
-		if installErr == nil {
-			targetInstalled = true
-		} else {
-			installErrors = errors.Join(installErrors, installErr)
-		}
+	installErr := installer.InstallMembershipGrant(ctx, route.EnrolledTarget.Node, grant)
+	if installErr == nil {
+		targetInstalled = true
+	} else {
+		installErrors = errors.Join(installErrors, installErr)
 	}
 	if installedVoters < gateway.ServingReplicaCount/2+1 || !targetInstalled {
-		return gateway.ReplicatedMembershipResult{}, errors.Join(installErrors, errGatewayReplicaControl)
+		return errors.Join(installErrors, errGatewayReplicaControl)
 	}
-	return client.applier.ApplyMembership(ctx, route, request)
+	return nil
 }
 
 type gatewayReplicaObservationClient interface {

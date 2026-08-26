@@ -435,6 +435,22 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		}); err != nil {
 		t.Fatalf("bootstrap target: %v", err)
 	}
+	// BootstrapComplete is the only authority for source reclamation. Exercise
+	// the shipped release protocol twice so both physical cleanup and the
+	// durable idempotent terminal observation are covered by the process test.
+	if err = sourceClient.ReleaseReplicaMoveSnapshot(
+		t.Context(), snapshotRequest, descriptor,
+	); err != nil {
+		t.Fatalf("release source snapshot: %v", err)
+	}
+	if err = sourceClient.ReleaseReplicaMoveSnapshot(
+		t.Context(), snapshotRequest, descriptor,
+	); err != nil {
+		t.Fatalf("retry released source snapshot: %v", err)
+	}
+	rf3CommandAssertArtifactRepositoryEmpty(
+		t, filepath.Join(root, "member-1", "source-artifacts"),
+	)
 	targetProcess.WaitServingReady(t)
 	targetProcess.Restart(t)
 	targetProcess.WaitServingReady(t)
@@ -444,6 +460,39 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		authority.ActivePolicyGeneration,
 	); err == nil {
 		t.Fatal("learner target served native traffic")
+	}
+	observationClient, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
+		Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observationRequest := replicacontrol.Request{
+		Operation: [32]byte{0x61}, Step: [32]byte{0x62}, Group: group,
+		TargetMember: 4, ExpectedReplicaSetVersion: learnerState.Fence.Command.ReplicaSetVersion,
+	}
+	learnerLeader, learnerLeaderState := rf3CommandFindLeader(
+		t, servingAddresses, servingNodes, targetProfile, targetNode, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration,
+		authority.ActivePolicyGeneration,
+	)
+	leaderObservation, err := observationClient.Observe(
+		t.Context(), servingNodes[learnerLeader], observationRequest,
+	)
+	if err != nil {
+		t.Fatalf("observe learner progress: %v", err)
+	}
+	targetObservation, err := observationClient.Observe(
+		t.Context(), targetNode, observationRequest,
+	)
+	if err != nil || !leaderObservation.ProgressFound ||
+		!leaderObservation.Progress.Learner || !leaderObservation.Progress.RecentActive ||
+		leaderObservation.Progress.PendingSnapshot != 0 ||
+		leaderObservation.Progress.Match < learnerLeaderState.Commit ||
+		targetObservation.Status.Applied < learnerLeaderState.Commit ||
+		targetObservation.State.SnapshotBaseDigest == ([sha256.Size]byte{}) {
+		t.Fatalf("learner did not expose a caught-up installed cut: leader=%+v target=%+v err=%v",
+			leaderObservation, targetObservation, err)
 	}
 	promotedState := rf3CommandApplyMembership(
 		t, servingAddresses, servingNodes, targetProfile, authorityIdentity, group,
@@ -461,17 +510,8 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	); err == nil {
 		t.Fatal("RF4 target served native traffic")
 	}
-	observationClient, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
-		Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	observationRequest := replicacontrol.Request{
-		Operation: [32]byte{0x61}, Step: [32]byte{0x62}, Group: group,
-		TargetMember: 4, ExpectedReplicaSetVersion: promotedState.Fence.Command.ReplicaSetVersion,
-	}
-	targetObservation, err := observationClient.Observe(t.Context(), targetNode, observationRequest)
+	observationRequest.ExpectedReplicaSetVersion = promotedState.Fence.Command.ReplicaSetVersion
+	targetObservation, err = observationClient.Observe(t.Context(), targetNode, observationRequest)
 	if err != nil {
 		t.Fatalf("observe promoted target: %v", err)
 	}
@@ -569,6 +609,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if finalState.Fence.Command.ReplicaSetVersion <= promotedState.Fence.Command.ReplicaSetVersion {
 		t.Fatalf("final RF3 did not advance membership: %+v", finalState)
 	}
+	finalReplicaSetVersion := finalState.Fence.Command.ReplicaSetVersion
 	rf3CommandExecuteAction(t, actionClient, nodes[0], replicaaction.Request{
 		Operation: [32]byte{0x65}, Step: [32]byte{0x66}, Kind: replicaaction.SourceRetirement,
 		Fence: raftservice.ServingFence{Group: group,
@@ -583,6 +624,34 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		group, rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
 	); err == nil {
 		t.Fatal("retired source continued serving")
+	}
+
+	// Reopen the final RF3 one member at a time. Each stop leaves an actual
+	// two-voter quorum, and each restarted process must reopen the dynamically
+	// changed ConfState before the next member is stopped. This catches the
+	// fixed-roster/restart regression that a single target restart cannot.
+	for _, index := range []int{1, 2} {
+		rf3CommandRestartChild(t, children[index], executable, manifestPaths[index], [4]string{
+			peerAddresses[index], controlAddresses[index],
+			nativeAddresses[index], snapshotAddresses[index],
+		})
+		_, finalState = rf3CommandFindLeader(
+			t, finalAddresses, finalNodes, targetProfile, authorityIdentity.Node, group,
+			rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		)
+		if finalState.Fence.Command.ReplicaSetVersion != finalReplicaSetVersion {
+			t.Fatalf("member %d reopened wrong final replica-set cut: %+v",
+				index+1, finalState.Fence.Command)
+		}
+	}
+	targetProcess.Restart(t)
+	targetProcess.WaitServingReady(t)
+	_, finalState = rf3CommandFindLeader(
+		t, finalAddresses, finalNodes, targetProfile, authorityIdentity.Node, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+	)
+	if finalState.Fence.Command.ReplicaSetVersion != finalReplicaSetVersion {
+		t.Fatalf("target reopened wrong final replica-set cut: %+v", finalState.Fence.Command)
 	}
 
 	for _, child := range children {
@@ -668,6 +737,115 @@ type rf3CommandDiagnostic struct {
 	mu      sync.Mutex
 	data    []byte
 	maximum int
+}
+
+func rf3CommandAssertArtifactRepositoryEmpty(t testing.TB, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) > 2 && name[1] == '-' && strings.Contains("scptd", name[:1]) {
+			t.Fatalf("released source repository retained %q", name)
+		}
+	}
+}
+
+func rf3CommandRestartChild(
+	t testing.TB,
+	child *rf3CommandChild,
+	executable, manifest string,
+	addresses [4]string,
+) {
+	t.Helper()
+	if child == nil || child.command == nil || executable == "" || manifest == "" {
+		t.Fatal("invalid RF3 command child restart")
+	}
+	select {
+	case <-child.exited:
+	default:
+		if err := child.command.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("signal member %d for rolling restart: %v", child.member, err)
+		}
+		select {
+		case <-child.exited:
+		case <-time.After(10 * time.Second):
+			_ = child.command.Process.Kill()
+			<-child.exited
+			t.Fatalf("member %d required forced rolling-restart cleanup", child.member)
+		}
+	}
+	child.mu.Lock()
+	waitErr := child.waitErr
+	child.mu.Unlock()
+	if waitErr != nil {
+		t.Fatalf("member %d rolling-restart exit: %v\n%s",
+			child.member, waitErr, child.diagnostic.String())
+	}
+
+	// The child helper consumes inherited descriptors in peer, control,
+	// native, snapshot order. Preserve that contract when rebinding the exact
+	// addresses during a rolling restart.
+	listeners := make([]*net.TCPListener, len(addresses))
+	files := make([]*os.File, len(addresses))
+	defer func() {
+		for _, listener := range listeners {
+			if listener != nil {
+				_ = listener.Close()
+			}
+		}
+		for _, file := range files {
+			if file != nil {
+				_ = file.Close()
+			}
+		}
+	}()
+	for index, address := range addresses {
+		resolved, err := net.ResolveTCPAddr("tcp", address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[index], err = net.ListenTCP("tcp", resolved)
+		if err != nil {
+			t.Fatalf("reserve member %d rolling listener %q: %v", child.member, address, err)
+		}
+		files[index], err = listeners[index].File()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	diagnostic := &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
+	command := exec.Command(
+		executable, "-test.run=^TestServeRF3CommandProcessHelper$", "-test.v",
+	)
+	command.Env = append(os.Environ(),
+		rf3CommandHelperEnvironment+"=1", rf3CommandManifestEnvironment+"="+manifest,
+	)
+	command.ExtraFiles = files
+	command.Stdout, command.Stderr = diagnostic, diagnostic
+	if err := command.Start(); err != nil {
+		t.Fatalf("restart member %d: %v", child.member, err)
+	}
+	for index := range files {
+		_ = files[index].Close()
+		files[index] = nil
+		_ = listeners[index].Close()
+		listeners[index] = nil
+	}
+	child.mu.Lock()
+	child.command, child.exited, child.diagnostic = command, make(chan struct{}), diagnostic
+	child.waitErr = nil
+	child.mu.Unlock()
+	go func() {
+		err := command.Wait()
+		child.mu.Lock()
+		child.waitErr = err
+		child.mu.Unlock()
+		close(child.exited)
+	}()
+	waitRF3CommandReady(t, child, 30*time.Second)
 }
 
 type rf3CommandControlOpener struct {

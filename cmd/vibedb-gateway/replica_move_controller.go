@@ -20,6 +20,7 @@ type gatewayReplicaMoveControls struct {
 	// HealthObservations is the authenticated shard-control client shared with
 	// the failure scheduler. It only supplies current liveness/donor cuts.
 	HealthObservations gatewayReplicaObservationClient
+	GrantInstaller     gatewayMembershipGrantInstaller
 	Routes             rebalanceexec.MoveRouteResolver
 	Membership         rebalanceexec.MembershipClient
 	Snapshots          rebalanceexec.SnapshotSource

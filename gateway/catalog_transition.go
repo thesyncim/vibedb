@@ -98,6 +98,10 @@ func BuildReplicaReplacementTransition(
 				continue
 			}
 			descriptor.Replicas[replicaIndex] = target
+			// The cold enrollment is consumed by this certified cut. Keeping it
+			// alongside the now-serving target would duplicate the same immutable
+			// member/node/store identity and make the successor catalog invalid.
+			descriptor.EnrolledTarget = nil
 			descriptor.Command = nextCommand
 			changed = true
 			break

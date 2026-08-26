@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -65,6 +67,75 @@ func (testFailedReplicaSink) SubmitFailedReplicaMove(context.Context, rebalance.
 
 type captureFailedReplicaSink struct {
 	intents []rebalance.FailedReplicaMoveIntent
+}
+
+type orderedFailedGrantAuthority struct {
+	snapshot *gateway.Snapshot
+	grant    membershipgrant.Grant
+	events   []string
+	pending  bool
+}
+
+func (authority *orderedFailedGrantAuthority) Read(context.Context) (*gateway.Snapshot, error) {
+	return authority.snapshot, nil
+}
+
+func (authority *orderedFailedGrantAuthority) PublishMembershipGrant(
+	_ context.Context, grant membershipgrant.Grant,
+) error {
+	authority.events = append(authority.events, "publish-grant")
+	if authority.grant.Valid() && authority.grant != grant {
+		return gateway.ErrReplicatedCatalogConflict
+	}
+	authority.grant = grant
+	if authority.pending {
+		authority.pending = false
+		return gateway.ErrReplicatedCatalogPending
+	}
+	return nil
+}
+
+func (authority *orderedFailedGrantAuthority) ReadMembershipGrant(
+	context.Context, raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	authority.events = append(authority.events, "read-grant")
+	return authority.grant, authority.grant.Valid(), nil
+}
+
+func (authority *orderedFailedGrantAuthority) RetryPending(context.Context) error {
+	authority.events = append(authority.events, "settle-grant")
+	return nil
+}
+
+type orderedFailedGrantInstaller struct {
+	authority *orderedFailedGrantAuthority
+	nodes     []rafttransport.NodeID
+}
+
+func (installer *orderedFailedGrantInstaller) InstallMembershipGrant(
+	_ context.Context, node rafttransport.NodeID, grant membershipgrant.Grant,
+) error {
+	if installer.authority.grant != grant {
+		return errors.New("grant was not durable before fanout")
+	}
+	installer.authority.events = append(installer.authority.events, "install-grant")
+	installer.nodes = append(installer.nodes, node)
+	if node == (rafttransport.NodeID{1}) {
+		return errors.New("certified failed source unavailable")
+	}
+	return nil
+}
+
+type orderedFailedMoveSubmitter struct{ authority *orderedFailedGrantAuthority }
+
+func (submitter orderedFailedMoveSubmitter) Submit(
+	_ context.Context, _ *rebalance.Plan,
+) (rebalance.Action, error) {
+	if !submitter.authority.grant.Valid() {
+		return rebalance.Action{}, errors.New("move submitted before grant")
+	}
+	submitter.authority.events = append(submitter.authority.events, "submit-move")
+	return rebalance.Action{Kind: rebalance.ActionAddLearner}, nil
 }
 
 func (sink *captureFailedReplicaSink) SubmitFailedReplicaMove(
@@ -157,6 +228,33 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 		intent.Plan.RetiringMember() != 1 || intent.Plan.TargetMember() != 9 {
 		t.Fatalf("intent is not bound to exact authority: %+v", intent)
 	}
+	grantAuthority := &orderedFailedGrantAuthority{snapshot: snapshot, pending: true}
+	installer := &orderedFailedGrantInstaller{authority: grantAuthority}
+	durableSink := gatewayFailedReplicaMoveSink{
+		controller: orderedFailedMoveSubmitter{authority: grantAuthority},
+		grants:     grantAuthority, installer: installer,
+	}
+	if err = durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil {
+		t.Fatalf("durable failed-replica submission: %v", err)
+	}
+	wantEvents := []string{"publish-grant", "settle-grant", "read-grant",
+		"install-grant", "install-grant", "install-grant", "install-grant", "submit-move"}
+	if !slices.Equal(grantAuthority.events, wantEvents) || len(installer.nodes) != 4 {
+		t.Fatalf("events=%v nodes=%x", grantAuthority.events, installer.nodes)
+	}
+	firstGrant := grantAuthority.grant
+	grantAuthority.events = nil
+	installer.nodes = nil
+	if err = durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil {
+		t.Fatalf("restart replay of durable failed-replica submission: %v", err)
+	}
+	wantReplayEvents := []string{"publish-grant", "read-grant",
+		"install-grant", "install-grant", "install-grant", "install-grant", "submit-move"}
+	if grantAuthority.grant != firstGrant ||
+		!slices.Equal(grantAuthority.events, wantReplayEvents) || len(installer.nodes) != 4 {
+		t.Fatalf("replay grant=%+v events=%v nodes=%x",
+			grantAuthority.grant, grantAuthority.events, installer.nodes)
+	}
 }
 
 func TestReplicaHealthControllerStreamsIndependentCertifiedFailures(t *testing.T) {
@@ -244,7 +342,7 @@ func (runner *oneReplicaHealthRevisionPass) RunPass(
 func TestReplicaHealthRuntimeFailsClosedWithoutAuthorityOrTransport(t *testing.T) {
 	if controller, err := newGatewayReplicaHealthRuntime(
 		testReplicaHealthCatalog{testReplicaHealthSnapshot(t)}, nil, nil,
-		testCandidateInventory{}, nil,
+		testCandidateInventory{}, nil, nil, nil,
 	); controller != nil || !errors.Is(err, errGatewayReplicaHealth) {
 		t.Fatalf("controller=%v err=%v", controller, err)
 	}
@@ -315,7 +413,7 @@ func testReplicatedHealthSnapshot(t testing.TB) (*gateway.Snapshot, rebalance.Fa
 		"one": "127.0.0.1:1", "one-native": "127.0.0.1:11", "one-control": "127.0.0.1:21",
 		"two": "127.0.0.1:2", "two-native": "127.0.0.1:12", "two-control": "127.0.0.1:22",
 		"three": "127.0.0.1:3", "three-native": "127.0.0.1:13", "three-control": "127.0.0.1:23",
-		"target": "127.0.0.1:9",
+		"target": "127.0.0.1:9", "target-native": "127.0.0.1:19", "target-control": "127.0.0.1:29",
 	}
 	replicas := make([]gateway.ReplicatedReplicaDescriptor, 3)
 	for index, name := range []string{"one", "two", "three"} {
@@ -331,10 +429,16 @@ func testReplicatedHealthSnapshot(t testing.TB) (*gateway.Snapshot, rebalance.Fa
 		Manifests:     []*distribution.Manifest{manifest},
 	}, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{{
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
+		RangeIdentity: [32]byte{2}, LineageDigest: [32]byte{3},
+		ForwardingRuleDigest: [32]byte{4},
 		Command: raftservice.CommandFence{ReplicaSetVersion: 7, OwnershipEpoch: 13,
 			RoutingVersion: 7, RouteGeneration: 9, ActivePolicyGeneration: 1,
 			ProtectionEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}},
 		Replicas: replicas,
+		EnrolledTarget: &gateway.ReplicatedReplicaDescriptor{
+			Member: 9, Node: [16]byte{9}, StoreID: [16]byte{19}, NodeIncarnation: 29,
+			Endpoint: "target", NativeEndpoint: "target-native", ControlEndpoint: "target-control",
+		},
 	}})
 	if err != nil {
 		t.Fatal(err)

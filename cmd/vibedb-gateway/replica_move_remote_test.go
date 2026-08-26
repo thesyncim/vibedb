@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/asn1"
 	"errors"
+	"net"
 	"slices"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -17,6 +21,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/rf3testfixture"
+	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -189,5 +195,91 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 	if actions.node != source.Node || actions.request.Kind != replicaaction.SourceRetirement ||
 		actions.request.Fence.Command != commandFence || actions.request.Fence.Term != 22 {
 		t.Fatalf("retirement request=%+v node=%x", actions.request, actions.node)
+	}
+}
+
+func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testing.T) {
+	domain := rafttransport.TrustDomain{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}}
+	clientNode := rafttransport.NodeID{1}
+	serverNode := rafttransport.NodeID{2}
+	oid := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1}
+	credentials, roots, err := rf3testfixture.WriteCredentials(
+		t.TempDir(), oid, domain, []rafttransport.NodeID{clientNode, serverNode},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTLS, err := servicetls.LoadProfile(
+		credentials[0].Certificate, credentials[0].Key, roots, oid.String(), time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLS, err := servicetls.LoadProfile(
+		credentials[1].Certificate, credentials[1].Key, roots, oid.String(), time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	serverConnections := make(chan rafttransport.PeerConnection, 2)
+	serverErrors := make(chan error, 2)
+	var dials atomic.Int32
+	dial := func(ctx context.Context, address string) (net.Conn, error) {
+		if address != "authenticated-control" {
+			return nil, errors.New("wrong control address")
+		}
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			connection, serveErr := serverTLS.Server(
+				ctx, server, rafttransport.TrafficShardControl, deadline,
+			)
+			if serveErr != nil {
+				serverErrors <- serveErr
+				return
+			}
+			serverConnections <- connection
+		}()
+		return client, nil
+	}
+	opener, err := newGatewayShardControlOpener(
+		clientTLS, deadline, dial, []gateway.ReplicatedEndpoint{{
+			Node: serverNode, ControlAddress: "authenticated-control",
+		}}, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := opener.OpenShardControl(t.Context(), serverNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServer := <-serverConnections
+
+	blockedCtx, cancelBlocked := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancelBlocked()
+	blocked, err := opener.OpenShardControl(blockedCtx, serverNode)
+	if blocked != nil || !errors.Is(err, context.DeadlineExceeded) || dials.Load() != 1 {
+		t.Fatalf("saturated open connection=%v dials=%d err=%v", blocked, dials.Load(), err)
+	}
+	_ = firstServer.SetWriteDeadline(time.Now())
+	_ = firstServer.Close()
+	_ = first.Close()
+	// Close is deliberately idempotent for capacity accounting: a duplicate
+	// cleanup call must not release a second semaphore slot.
+	_ = first.Close()
+	second, err := opener.OpenShardControl(t.Context(), serverNode)
+	if err != nil || dials.Load() != 2 {
+		t.Fatalf("open after release connection=%v dials=%d err=%v", second, dials.Load(), err)
+	}
+	secondServer := <-serverConnections
+	_ = secondServer.SetWriteDeadline(time.Now())
+	_ = secondServer.Close()
+	_ = second.Close()
+	select {
+	case serveErr := <-serverErrors:
+		t.Fatalf("authenticated server handshake: %v", serveErr)
+	default:
 	}
 }
