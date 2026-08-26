@@ -88,6 +88,8 @@ type Plan struct {
 	current        uint64
 	next           uint64
 	targets        [autosplit.MaxSplitChildren]ChildTarget
+	indexRelations []sqldriver.ReplicatedShardRelationIdentity
+	relationDigest [sha256.Size]byte
 	operation      OperationID
 }
 
@@ -196,6 +198,7 @@ func newPlan(
 		plan.leaderCounts[child] = uint16(len(descriptor.Leaders))
 	}
 	var seen [autosplit.MaxSplitChildren]bool
+	var relationTemplate []sqldriver.ReplicatedShardRelationIdentity
 	for index := range targets {
 		target := cloneChildTarget(targets[index])
 		child := int(target.Child)
@@ -219,6 +222,15 @@ func newPlan(
 			target.Authority.RouteGeneration != plan.next {
 			return nil, errors.Join(ErrInvalidPlan, bindingErr)
 		}
+		if len(target.SQL.Relations) != 0 {
+			if relationTemplate == nil {
+				relationTemplate = cloneSplitRelations(target.SQL.Relations)
+			} else if !sameSplitRelationPlacement(relationTemplate, target.SQL.Relations) {
+				return nil, ErrInvalidPlan
+			}
+		} else if relationTemplate != nil {
+			return nil, ErrInvalidPlan
+		}
 		seen[child] = true
 		plan.targets[child] = target
 	}
@@ -228,8 +240,79 @@ func newPlan(
 			return nil, ErrInvalidPlan
 		}
 	}
+	hasGlobalIndex := false
+	for index := range relationTemplate {
+		hasGlobalIndex = hasGlobalIndex ||
+			relationTemplate[index].Kind == sqldriver.ReplicatedShardRelationGlobalIndex
+	}
+	if hasGlobalIndex {
+		var relationDigest [sha256.Size]byte
+		for child := 0; child < int(split.ChildCount); child++ {
+			if child == int(split.RetainedChild) {
+				continue
+			}
+			target := &plan.targets[child]
+			if !sameSplitRelationPlacement(relationTemplate, target.SQL.Relations) ||
+				target.SQL.RelationManifestDigest == ([sha256.Size]byte{}) ||
+				relationDigest != ([sha256.Size]byte{}) &&
+					target.SQL.RelationManifestDigest != relationDigest {
+				return nil, ErrInvalidPlan
+			}
+			relationDigest = target.SQL.RelationManifestDigest
+		}
+		for index := range relationTemplate {
+			relation := relationTemplate[index]
+			if relation.Relation != uint16(index+1) || relation.Table != partitioner.CollectionName() {
+				return nil, ErrInvalidPlan
+			}
+			if index == 0 && relation.Kind != sqldriver.ReplicatedShardRelationJSON ||
+				index != 0 && relation.Kind != sqldriver.ReplicatedShardRelationGlobalIndex {
+				return nil, ErrInvalidPlan
+			}
+			if relation.Kind == sqldriver.ReplicatedShardRelationGlobalIndex {
+				if relation.IndexID == 0 || relation.Incarnation == 0 ||
+					relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
+					relation.KeyEncoding != sqldriver.ReplicatedRelationKeyCanonicalTuple ||
+					relation.KeyArity == 0 || relation.KeyArity > distribution.KeyspaceWidth ||
+					relation.TupleVersion != distribution.CurrentTupleVersion ||
+					relation.MapperVersion != distribution.NativeMapperVersion ||
+					relation.BucketBits != split.Source.BucketBits ||
+					!distribution.ValidVirtualBucketBits(relation.BucketBits) {
+					return nil, ErrInvalidPlan
+				}
+				plan.indexRelations = append(plan.indexRelations, relation)
+			}
+		}
+		plan.relationDigest = relationDigest
+	}
 	plan.operation = splitOperationID(plan)
 	return plan, nil
+}
+
+func cloneSplitRelations(
+	input []sqldriver.ReplicatedShardRelationIdentity,
+) []sqldriver.ReplicatedShardRelationIdentity {
+	return append([]sqldriver.ReplicatedShardRelationIdentity(nil), input...)
+}
+
+func sameSplitRelationPlacement(
+	left, right []sqldriver.ReplicatedShardRelationIdentity,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		a, b := left[index], right[index]
+		if a.Relation != b.Relation || a.Kind != b.Kind || a.Table != b.Table ||
+			a.IndexID != b.IndexID || a.Incarnation != b.Incarnation ||
+			a.LocatorCount != b.LocatorCount || a.Unique != b.Unique ||
+			a.KeyEncoding != b.KeyEncoding || a.KeyArity != b.KeyArity ||
+			a.TupleVersion != b.TupleVersion || a.MapperVersion != b.MapperVersion ||
+			a.BucketBits != b.BucketBits {
+			return false
+		}
+	}
+	return true
 }
 
 // OperationID returns the exact stable identity reconstructed on controller
@@ -264,6 +347,7 @@ func splitOperationID(plan *Plan) OperationID {
 		} {
 			at += copy(raw[at:], id[:])
 		}
+		at += copy(raw[at:], target.SQL.RelationManifestDigest[:])
 		values := [...]uint64{
 			target.WAL.AllocationGeneration, target.WAL.MemberID,
 			target.TopologyRecoveryEpoch,

@@ -2,6 +2,7 @@ package splitcontroller
 
 import (
 	"context"
+	"errors"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
@@ -36,9 +37,19 @@ func (a *LocalSourceActions) ExecuteSealSource(
 	}
 	a.mu.Lock()
 	manifest, err := a.machine.RelationManifestDigest()
+	cut, snapshotErr := a.machine.Snapshot()
 	a.mu.Unlock()
-	if err != nil {
-		return err
+	if err != nil || snapshotErr != nil {
+		return errors.Join(err, snapshotErr)
+	}
+	cutState := cut.State()
+	placementErr := plan.validateGlobalIndexCut(cut)
+	closeErr := cut.Close()
+	if placementErr != nil || closeErr != nil {
+		return errors.Join(placementErr, closeErr)
+	}
+	if !sameSplitCut(state, cutState) {
+		return ErrTopologyConflict
 	}
 	if !sourceServingStateMatches(state, serving, manifest) {
 		return ErrTopologyConflict

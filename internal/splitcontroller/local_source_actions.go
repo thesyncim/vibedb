@@ -47,6 +47,15 @@ func (a *LocalSourceActions) ExecuteStartCapture(plan *Plan) (*rangesplit.Source
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	cut, err := a.machine.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	placementErr := plan.validateGlobalIndexCut(cut)
+	closeErr := cut.Close()
+	if placementErr != nil || closeErr != nil {
+		return nil, errors.Join(placementErr, closeErr)
+	}
 
 	stored, revision, hasStored, err := a.store.LoadSourceCaptureDescriptor(plan.partitioner)
 	if err != nil {
@@ -131,6 +140,10 @@ func (a *LocalSourceActions) ExecuteBuildArtifacts(
 	if capture.Head() != cut.State().Applied {
 		_ = cut.Close()
 		return rangesplit.ChildArtifactSet{}, ErrTopologyConflict
+	}
+	if err = plan.validateGlobalIndexCut(cut); err != nil {
+		_ = cut.Close()
+		return rangesplit.ChildArtifactSet{}, err
 	}
 
 	var files [autosplit.MaxSplitChildren]*os.File
