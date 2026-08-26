@@ -1008,7 +1008,7 @@ func (l *TxnLog) commitMulti(
 	participants := make([]storeio.TxnParticipant, len(order))
 	for i, c := range order {
 		if prepErr := c.preparePrimaryBatchConditionalLocked(
-			&staged[i], header.MarkerID, header.Epoch, txnID, true,
+			&staged[i], header.MarkerID, header.Epoch, txnID, false,
 		); prepErr != nil {
 			return prepErr
 		}
@@ -1016,6 +1016,30 @@ func (l *TxnLog) commitMulti(
 			StoreID:            c.storeID,
 			JournalID:          c.journalID,
 			PreparedGeneration: staged[i].generation,
+		}
+	}
+	// All participants are on the same proven filesystem, but each recovery
+	// journal still needs its own durability acknowledgement before the decision
+	// can become durable. Issue those independent drains together: on devices
+	// where a full-cache drain is expensive this lets the kernel/device coalesce
+	// the barriers, while retaining an acknowledgement from every file. The
+	// decision append remains strictly after every successful return, so a crash
+	// in this window can expose only uncommitted prepared records.
+	prepareSyncErrors := make([]error, len(order))
+	var prepareSyncs sync.WaitGroup
+	prepareSyncs.Add(len(order))
+	for i, c := range order {
+		go func(index int, collection *Collection) {
+			defer prepareSyncs.Done()
+			if syncErr := collection.journal.Sync(collection.journalPowerSafe); syncErr != nil {
+				prepareSyncErrors[index] = collection.poisonJournalCommitOutcomeUnknown(syncErr)
+			}
+		}(i, c)
+	}
+	prepareSyncs.Wait()
+	for _, syncErr := range prepareSyncErrors {
+		if syncErr != nil {
+			return syncErr
 		}
 	}
 
