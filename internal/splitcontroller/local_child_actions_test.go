@@ -1,15 +1,134 @@
 package splitcontroller
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
+	"github.com/thesyncim/vibedb/internal/splitartifact"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+type splitArtifactPeerConnection struct {
+	net.Conn
+	identity rafttransport.PeerIdentity
+}
+
+func (connection *splitArtifactPeerConnection) PeerIdentity() rafttransport.PeerIdentity {
+	return connection.identity
+}
+func (*splitArtifactPeerConnection) TrafficClass() rafttransport.TrafficClass {
+	return rafttransport.TrafficSnapshot
+}
+
+type splitArtifactTestOpener struct {
+	service        *splitartifact.Service
+	source, target rafttransport.PeerIdentity
+}
+
+func (opener splitArtifactTestOpener) OpenSnapshot(
+	ctx context.Context,
+	node rafttransport.NodeID,
+) (rafttransport.PeerConnection, error) {
+	if node != opener.source.Node {
+		return nil, rafttransport.ErrNodeNotFound
+	}
+	client, server := net.Pipe()
+	go func() {
+		_ = opener.service.Serve(ctx, &splitArtifactPeerConnection{
+			Conn: server, identity: opener.target,
+		})
+	}()
+	return &splitArtifactPeerConnection{Conn: client, identity: opener.source}, nil
+}
+
+func TestLocalChildActionsStageAuthenticatedRemoteArtifact(t *testing.T) {
+	plan, _, _, _ := testPlan(t)
+	source := newFlowSource(t, plan)
+	if _, err := source.machine.InstallSnapshot(source.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	sourceStore, err := OpenDurableRuntimeStore(
+		t.TempDir(), plan.OperationID(), testManifestDigest("remote-source-runtime"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceStore.Close()
+	sourceActions, err := NewLocalSourceActions(sourceStore, source.machine, source.capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture, err := sourceActions.ExecuteStartCapture(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := sourceActions.ExecuteBuildArtifacts(
+		plan, capture, rangesplit.MinChildArtifactChunkBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	childDatabase, err := durable.OpenDatabase(t.TempDir(), durable.DatabaseOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childDatabase.Close()
+	childCollection, err := childDatabase.CreateCollection("child", durable.Options{MaxBatchDocuments: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childStore, err := OpenDurableRuntimeStore(
+		t.TempDir(), plan.OperationID(), testManifestDigest("remote-child-runtime"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childStore.Close()
+	childActions, err := NewLocalChildActions(
+		childStore, childCollection, rangesplit.MaxChildArtifactChunkBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	identity, err := splitartifact.NewIdentity([32]byte(plan.OperationID()), artifacts.Children[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePeer := rafttransport.PeerIdentity{Node: rafttransport.NodeID{31}}
+	targetPeer := rafttransport.PeerIdentity{Node: rafttransport.NodeID{41}}
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	service, err := splitartifact.NewService(splitartifact.ServiceOptions{
+		Source: SplitArtifactSource{Actions: sourceActions, Plan: plan, Set: artifacts},
+		Authorize: func(peer rafttransport.PeerIdentity, got splitartifact.Identity) bool {
+			return peer == targetPeer && got == identity
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConnections: 1,
+		MaxChunkBytes:    rangesplit.MinChildArtifactChunkBytes,
+		MaxInflightBytes: rangesplit.MinChildArtifactChunkBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := childActions.ExecuteStageChildRemote(
+		context.Background(), plan, artifacts, 1,
+		splitArtifactTestOpener{service: service, source: sourcePeer, target: targetPeer},
+		sourcePeer.Node, deadline, deadline, rangesplit.MinChildArtifactChunkBytes, 1,
+		make([]byte, rangesplit.MinChildArtifactChunkBytes),
+	)
+	if err != nil || cursor.Phase() != rangesplit.ChildStageTail {
+		t.Fatalf("remote stage cursor=%+v err=%v", cursor, err)
+	}
+}
 
 func TestLocalChildActionsStageRecoverAndRetryTailBeforeGlobalCursor(t *testing.T) {
 	plan, _, _, _ := testPlan(t)
