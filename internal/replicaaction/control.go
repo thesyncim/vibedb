@@ -39,6 +39,10 @@ const (
 var requestMagic = [8]byte{'V', 'B', 'R', 'A', 'C', 'T', 0, 0}
 var responseMagic = [8]byte{'V', 'B', 'R', 'D', 'O', 'N', 'E', 0}
 
+// RequestDiscriminator identifies this fixed grammar on the shared
+// authenticated shard-control listener.
+func RequestDiscriminator() [8]byte { return requestMagic }
+
 type Kind uint8
 
 const (
@@ -287,7 +291,7 @@ func validRequest(request Request) bool {
 	if request.Operation == ([32]byte{}) || request.Step == ([32]byte{}) ||
 		request.SourceMember == 0 || request.TargetMember == 0 ||
 		request.SourceMember == request.TargetMember || !request.Fence.Command.Valid() ||
-		request.Fence.Group == (raftmember.GroupKey{}) || request.Fence.AllocationGeneration == 0 ||
+		!validGroup(request.Fence.Group) || request.Fence.AllocationGeneration == 0 ||
 		request.Fence.MemberID == 0 || request.Fence.StoreID == ([16]byte{}) ||
 		request.Fence.NodeIncarnation == 0 || request.Fence.Term == 0 {
 		return false
@@ -304,6 +308,12 @@ func validRequest(request Request) bool {
 	default:
 		return false
 	}
+}
+
+func validGroup(group raftmember.GroupKey) bool {
+	return group.ClusterID != ([16]byte{}) && group.ClusterIncarnation != ([16]byte{}) &&
+		group.TopologyRecoveryEpoch != 0 && group.ShardIncarnation != ([16]byte{}) &&
+		group.GroupID != ([16]byte{})
 }
 
 func transitionMatchesFence(

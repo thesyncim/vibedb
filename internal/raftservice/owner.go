@@ -1968,10 +1968,12 @@ func (owner *Owner) ProposeOwnershipTransition(
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
+	owned := make([]byte, len(command))
+	copy(owned, command)
 	reply := make(chan ownerReply, 1)
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestOwnershipTransition, group: fence.Group, fence: fence,
-		data: command, reply: reply, bytes: int64(len(command)),
+		data: owned, reply: reply, bytes: int64(len(owned)),
 	})
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
