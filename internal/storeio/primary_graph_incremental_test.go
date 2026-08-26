@@ -8,6 +8,46 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
+type incrementalPrimaryTestSink struct {
+	pages [][]byte
+	next  uint64
+}
+
+type incrementalPrimaryTestPage struct {
+	owner *incrementalPrimaryTestSink
+	ref   PageRef
+	image []byte
+}
+
+func (p *incrementalPrimaryTestPage) Bytes() []byte { return p.image }
+func (p *incrementalPrimaryTestPage) Ref() PageRef  { return p.ref }
+func (p *incrementalPrimaryTestPage) Stage() error {
+	p.owner.pages = append(p.owner.pages, p.image)
+	return nil
+}
+
+func (s *incrementalPrimaryTestSink) AllocatePage(
+	kind PageKind, length uint32, logicalID uint64,
+) (PrimaryGraphBuildPage, error) {
+	ref := PageRef{
+		Offset: s.next, LogicalID: logicalID, Generation: 7,
+		Length: length, Kind: kind,
+	}
+	s.next += uint64(length)
+	return &incrementalPrimaryTestPage{
+		owner: s, ref: ref, image: make([]byte, length),
+	}, nil
+}
+func (*incrementalPrimaryTestSink) StoreIdentity() [16]byte { return testStoreID }
+func (*incrementalPrimaryTestSink) BuildGeneration() uint64 { return 7 }
+func (s *incrementalPrimaryTestSink) BuildFileEnd() uint64  { return s.next }
+func (*incrementalPrimaryTestSink) BuildNextLogicalID() uint64 {
+	return PrimaryFirstDynamicLogicalID
+}
+func (*incrementalPrimaryTestSink) MaxBuildPageBytes() int {
+	return CommonPrimaryLeafMaxExtentBytes
+}
+
 func TestPrimaryGraphLeafWindowPlannerMatchesBulkBoundary(t *testing.T) {
 	pointer, err := vibejson.CompilePointer("/score")
 	if err != nil {
@@ -104,4 +144,61 @@ func TestPrimaryGraphLeafWindowPlannerWarmAllocationBound(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("warm planner allocs/run = %.2f, want 0", allocs)
 	}
+}
+
+func TestPrimaryGraphLeafWindowPlannerStagesDirectly(t *testing.T) {
+	records := make([]PrimaryGraphRecord, CommonPrimaryLeafWideSlots)
+	for row := range records {
+		records[row] = BorrowPrimaryGraphRecord(
+			[]byte(fmt.Sprintf("key-%08d", row)),
+			[]byte(fmt.Sprintf(`{"rank":%d,"payload":"%s"}`,
+				row, bytes.Repeat([]byte{'z'}, row%31))),
+		)
+	}
+	planner, err := NewPrimaryGraphLeafWindowPlanner(true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &incrementalPrimaryTestSink{next: 64 << 10}
+	placements := make([]PrimaryGraphPlacement, len(records))
+	emission, err := planner.Stage(
+		sink, 3, 17, records, 16<<10, placements,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.pages) != 1 || emission.Count == 0 ||
+		emission.Count > len(records) {
+		t.Fatalf("bad emission: %#v pages=%d", emission, len(sink.pages))
+	}
+	wantBucket, _ := MakeTabletLocalIdentityBucket(3, 17)
+	if emission.Bucket != BucketID(wantBucket) ||
+		!bytes.Equal(emission.FirstKey, records[0].keyBytes()) ||
+		!bytes.Equal(emission.LastKey, records[emission.Count-1].keyBytes()) {
+		t.Fatalf("bad routing witness: %#v", emission)
+	}
+	for row := range emission.Count {
+		if placements[row].Bucket != emission.Bucket ||
+			placements[row].Slot != uint8(row) {
+			t.Fatalf("placement %d = %#v", row, placements[row])
+		}
+	}
+	view, err := OpenCompactPrimaryStripe(
+		sink.pages[0], testStoreID, emission.Bucket, emission.Ref, 7,
+		CommonPrimaryLeafBounds{
+			FileEnd:           incrementalPrimaryFileEnd(sink),
+			NextLogicalID:     PrimaryFirstDynamicLogicalID,
+			AllocationQuantum: format0PageSize,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Len() != emission.Count {
+		t.Fatalf("decoded rows=%d, want %d", view.Len(), emission.Count)
+	}
+}
+
+func incrementalPrimaryFileEnd(s *incrementalPrimaryTestSink) uint64 {
+	return max(s.next, uint64(GlobalTabletCatalogRootBytes))
 }

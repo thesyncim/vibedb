@@ -14,6 +14,17 @@ type PrimaryGraphLeafWindowPlanner struct {
 	placed  bool
 }
 
+// PrimaryGraphLeafEmission is the bounded routing witness returned after one
+// planned window has been encoded and staged. Key views borrow the input
+// window; the caller must copy only the fences it retains across source reads.
+type PrimaryGraphLeafEmission struct {
+	Bucket   BucketID
+	Ref      PageRef
+	Count    int
+	FirstKey []byte
+	LastKey  []byte
+}
+
 func NewPrimaryGraphLeafWindowPlanner(
 	placed bool,
 	summaries []vibejson.CompiledPointer,
@@ -76,4 +87,74 @@ func (p *PrimaryGraphLeafWindowPlanner) Plan(
 	// backing. Rebuild the selected prefix so the returned borrowed view is exact.
 	payload, err = buildPreparedCompactPrimaryGraphStripePayload(records[:count], p.builder)
 	return
+}
+
+// Stage plans and emits the largest prefix of records as one immutable leaf.
+// It never builds a dataset-sized plan or record copy: the planner scratch and
+// one sink page are the only mutable memory on this path.
+func (p *PrimaryGraphLeafWindowPlanner) Stage(
+	sink PrimaryGraphBuildSink,
+	tabletID uint32,
+	localID uint16,
+	records []PrimaryGraphRecord,
+	maxExtent int,
+	placements []PrimaryGraphPlacement,
+) (PrimaryGraphLeafEmission, error) {
+	if sink == nil || tabletID >= TabletLocalIdentityTabletCount ||
+		uint32(localID) >= TabletLocalIdentityLocalCount ||
+		(placements != nil && len(placements) < len(records)) {
+		return PrimaryGraphLeafEmission{}, fmt.Errorf(
+			"%w: incremental primary stage", ErrInvalidWrite,
+		)
+	}
+	count, extent, payload, err := p.Plan(records, maxExtent)
+	if err != nil {
+		return PrimaryGraphLeafEmission{}, err
+	}
+	bucketValue, ok := MakeTabletLocalIdentityBucket(tabletID, uint32(localID))
+	if !ok {
+		return PrimaryGraphLeafEmission{}, fmt.Errorf(
+			"%w: incremental primary identity", ErrInvalidWrite,
+		)
+	}
+	bucket := BucketID(bucketValue)
+	logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
+	if !ok {
+		return PrimaryGraphLeafEmission{}, fmt.Errorf(
+			"%w: incremental primary logical ID", ErrInvalidWrite,
+		)
+	}
+	page, err := sink.AllocatePage(PagePrimaryLeaf, uint32(extent), logicalID)
+	if err != nil {
+		return PrimaryGraphLeafEmission{}, err
+	}
+	if _, err := encodeCompactPrimaryStripePayload(
+		page.Bytes(),
+		CommonPrimaryLeafHeader{
+			StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
+			Bucket: bucket, PageSize: uint32(extent),
+		},
+		payload,
+	); err != nil {
+		return PrimaryGraphLeafEmission{}, err
+	}
+	if placements != nil {
+		if !p.placed || count > CommonPrimaryLeafWideSlots {
+			return PrimaryGraphLeafEmission{}, fmt.Errorf(
+				"%w: incremental primary placements", ErrInvalidWrite,
+			)
+		}
+		for row := range count {
+			placements[row] = PrimaryGraphPlacement{
+				Bucket: bucket, Slot: uint8(row),
+			}
+		}
+	}
+	if err := page.Stage(); err != nil {
+		return PrimaryGraphLeafEmission{}, err
+	}
+	return PrimaryGraphLeafEmission{
+		Bucket: bucket, Ref: page.Ref(), Count: count,
+		FirstKey: records[0].keyBytes(), LastKey: records[count-1].keyBytes(),
+	}, nil
 }
