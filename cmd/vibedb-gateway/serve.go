@@ -26,7 +26,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
-	"github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -395,6 +394,8 @@ func runServe(args []string) int {
 	}
 	var replicaControlDone <-chan error
 	var replicaControllersDone <-chan struct{}
+	var splitControllerDone <-chan struct{}
+	var splitRuntime *gatewayServingSplitRuntime
 	if replicaControlManifest != nil {
 		manifest := *replicaControlManifest
 		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
@@ -413,6 +414,20 @@ func runServe(args []string) int {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 			}, manifest.Gateways, int(manifest.Bounds.MaxConcurrentDrains),
 		)
+		splitRuntime, splitErr := newGatewayServingSplitRuntime(gatewayServingSplitOptions{
+			catalog: catalogAuthority, drain: drainer, opener: shardOpener, tls: tlsProfile,
+			shards: manifest.Shards,
+			dial: func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			},
+			handshake: handshakeDeadline, read: readDeadline, write: writeDeadline,
+			protocol: max(
+				time.Duration(manifest.Bounds.ReadTimeout)*time.Millisecond,
+				time.Duration(manifest.Bounds.WriteTimeout)*time.Millisecond,
+			),
+			connections: int(manifest.Bounds.MaxConnections),
+			handshakes:  int(manifest.Bounds.MaxHandshakes),
+		})
 		controls, controlsErr := newGatewayReplicaRemoteClients(gatewayReplicaRemoteClientOptions{
 			Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
 			Authority: catalogAuthority, Replicated: replicated, Drainer: drainer,
@@ -450,8 +465,11 @@ func runServe(args []string) int {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, drainErr, controlsErr, controllerErr, healthErr, revisionErr,
+		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, controllerErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
+			if splitRuntime != nil {
+				_ = splitRuntime.Close()
+			}
 			if controlListener != nil {
 				_ = controlListener.Close()
 			}
@@ -486,12 +504,16 @@ func runServe(args []string) int {
 			stop()
 		}()
 	}
-	if catalogAuthority != nil {
-		trigger := &gatewayControllerTriggerClient{
-			tls: tlsProfile, plaintext: *devPlaintext, handshake: *tlsHandshakeTimeout,
-			maxConnections: *maxShardConnections, maxHandshakes: *maxShardHandshakes,
-		}
-		go runSplitController(ctx, catalogAuthority, trigger, *controllerInterval, logf)
+	if splitRuntime != nil {
+		defer splitRuntime.Close()
+		done := make(chan struct{})
+		splitControllerDone = done
+		go func() {
+			defer close(done)
+			runServingSplitController(
+				ctx, catalogAuthority, splitRuntime.controller, *controllerInterval, logf,
+			)
+		}()
 	}
 	if clientTLS != nil {
 		err = serveAuthenticatedGatewayData(ctx, listener, exec, dataReader, clientTLS, gateway.ClientTLSLimits{
@@ -520,6 +542,10 @@ func runServe(args []string) int {
 	if replicaControllersDone != nil {
 		stop()
 		<-replicaControllersDone
+	}
+	if splitControllerDone != nil {
+		stop()
+		<-splitControllerDone
 	}
 	if hotShardDone != nil {
 		stop()
@@ -806,85 +832,6 @@ func decodeFixedHex(encoded string, destination []byte) error {
 		return gateway.ErrReplicatedCatalog
 	}
 	return nil
-}
-
-type gatewayControllerTriggerClient struct {
-	tls            *rafttransport.PeerTLS
-	plaintext      bool
-	handshake      time.Duration
-	maxConnections int
-	maxHandshakes  int
-}
-
-func (client *gatewayControllerTriggerClient) TriggerSplitController(
-	ctx context.Context, route gateway.ReplicatedRoute, request shardcontrol.Request,
-) (shardcontrol.Response, error) {
-	if client == nil || ctx == nil {
-		return shardcontrol.Response{}, splitcontroller.ErrControllerTrigger
-	}
-	var last error
-	for _, replica := range route.Replicas {
-		var dial shardcontrol.Dial
-		var secure *servicetls.Client
-		if client.plaintext {
-			dial = func(ctx context.Context, address string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-			}
-		} else {
-			var err error
-			secure, err = servicetls.NewClient(servicetls.ClientOptions{
-				TLS: client.tls, Class: rafttransport.TrafficShardControl,
-				Endpoints: []servicetls.Endpoint{{Address: replica.ControlAddress, Node: replica.Node}},
-				Dial: func(ctx context.Context, address string) (net.Conn, error) {
-					return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-				},
-				HandshakeDeadline: servicetls.FixedDeadline(client.handshake),
-				MaxConnections:    min(client.maxConnections, 8),
-				MaxHandshakes:     min(client.maxHandshakes, 8),
-			})
-			if err != nil {
-				return shardcontrol.Response{}, err
-			}
-			dial = secure.Dial
-		}
-		protocol, err := shardcontrol.NewClient(dial, replica.ControlAddress, client.handshake)
-		if err == nil {
-			var response shardcontrol.Response
-			response, err = protocol.Execute(ctx, request)
-			if secure != nil {
-				_ = secure.Close()
-			}
-			if err == nil {
-				return response, nil
-			}
-		} else if secure != nil {
-			_ = secure.Close()
-		}
-		last = errors.Join(last, err)
-	}
-	return shardcontrol.Response{}, errors.Join(last, splitcontroller.ErrControllerTrigger)
-}
-
-func runSplitController(
-	ctx context.Context, directory splitcontroller.ControllerDirectory,
-	client splitcontroller.ControllerTriggerClient, interval time.Duration,
-	logf func(string, ...any),
-) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		pass, err := splitcontroller.RunControllerPass(ctx, directory, client)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logf("gateway: split controller: %v", err)
-		} else if pass.Triggered != 0 {
-			logf("gateway: split controller triggered %d/%d operation(s)", pass.Triggered, pass.Discovered)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
 }
 
 // serveGateway accepts connections until ctx is canceled, then closes the
