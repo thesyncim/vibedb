@@ -396,8 +396,8 @@ func TestDurableRequestLogicalContractGolden(t *testing.T) {
 		want string
 	}{
 		{"transaction_manifest", program.Contract.TransactionManifestDigest, "51e7388c9e85977a405006ea2d4b44fe374a9f8336f534d63bb2fdfd33082eb3"},
-		{"protocol_program", program.Contract.ProtocolProgramDigest, "2a6c1570ddfb6eae8442ad03f04eda2943094cc1a41abe47e210f11c7bf17824"},
-		{"terminal_contract", program.Contract.TerminalContractDigest, "f44efc29d5f283729d674285483cb7c980c8a2759f39bafd169e234b376dcfd6"},
+		{"protocol_program", program.Contract.ProtocolProgramDigest, "eb55f88e21584451b8f4b4acc994b05bea9bf148e61da133eefe4c1ea0f73f95"},
+		{"terminal_contract", program.Contract.TerminalContractDigest, "a7fae65f0ad8a8b60a7e6aec51c39b02f1c68712a77e005915f0a7a116937e10"},
 		{"retry_home", program.Contract.RetryHomeDerivationDigest, "f8d18eb29f23cf552f4f74ab86fdf1717bcb18c8599c08692941e2dd2163f7a3"},
 		{"plan_build", program.Contract.PlanBuildID, "cd61dffcc1b2288c743473b7fac0ac8fcbdf2bffb64d214ef6a58cf857a24325"},
 	} {
