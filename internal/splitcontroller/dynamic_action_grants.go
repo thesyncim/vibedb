@@ -106,6 +106,38 @@ func (grants *DynamicShardActionGrants) replace(
 	return nil
 }
 
+// rebindCatalog advances only the authenticated catalog witness for an exact
+// live admission. Data-plane executors and their pinned stores remain the same
+// objects: rebuilding them after publication could attempt to reclaim an SQL
+// stage that has already transferred ownership to a serving child runtime.
+func (grants *DynamicShardActionGrants) rebindCatalog(
+	operation OperationID, digest [32]byte, catalog *gateway.Snapshot, admission PlanAdmission,
+) error {
+	if grants == nil || operation == (OperationID{}) || digest == ([32]byte{}) || catalog == nil ||
+		admission.Operation != operation || admission.PlanDigest != digest ||
+		catalog.Generation() != admission.CatalogGeneration {
+		return ErrRemoteExecution
+	}
+	grants.mu.Lock()
+	defer grants.mu.Unlock()
+	found := false
+	for key, grant := range grants.grants {
+		if key.operation != operation || key.digest != digest {
+			continue
+		}
+		grant.Admission, grant.Catalog = admission, catalog
+		if !validShardActionGrant(grant) {
+			return ErrRemoteExecution
+		}
+		grants.grants[key] = grant
+		found = true
+	}
+	if !found {
+		return ErrRemoteExecution
+	}
+	return nil
+}
+
 func (grants *DynamicShardActionGrants) resolve(
 	operation OperationID, digest [32]byte, target ShardActionTarget,
 ) (ShardActionGrant, bool) {
@@ -200,24 +232,10 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 			}
 			return nil
 		}
-		created, err := binder.factory.BuildAdmittedShardActionGrants(
-			ctx, catalog, plan, admission, leases,
-		)
-		if err != nil || len(created) == 0 {
-			return ErrRemoteExecution
-		}
-		for index := range created {
-			grant := created[index]
-			if grant.Operation != admission.Operation || grant.PlanDigest != admission.PlanDigest ||
-				grant.Plan != plan {
-				return ErrRemoteExecution
-			}
-		}
-		if err = binder.grants.replace(admission.Operation, admission.PlanDigest, created); err != nil {
+		if err := binder.grants.rebindCatalog(
+			admission.Operation, admission.PlanDigest, catalog, admission,
+		); err != nil {
 			return err
-		}
-		for _, lease := range current.leases {
-			_ = lease.Release()
 		}
 		binder.active[admission.Operation] = boundPlanAdmission{
 			digest: admission.PlanDigest, catalogGeneration: admission.CatalogGeneration,

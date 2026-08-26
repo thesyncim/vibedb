@@ -84,7 +84,7 @@ func TestBoundPlanAdmissionRebindsOnePublishedCatalogGeneration(t *testing.T) {
 	resolved, _, err := newShardActionRuntimeDispatcherForTest(t, dynamic).ObserveSplit(
 		t.Context(), plan.OperationID(), second.PlanDigest, target,
 	)
-	if err != nil || resolved != recovered || factory.calls != 2 {
+	if err != nil || resolved != plan || factory.calls != 1 {
 		t.Fatalf("resolved=%p recovered=%p calls=%d err=%v", resolved, recovered, factory.calls, err)
 	}
 }
