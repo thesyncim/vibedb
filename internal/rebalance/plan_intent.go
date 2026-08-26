@@ -30,17 +30,18 @@ type persistedPlanIntent struct {
 }
 
 type persistedMoveRequest struct {
-	Distribution distribution.DistributionName `json:"distribution"`
-	Shard        distribution.ShardID          `json:"shard"`
-	ClusterID    [16]byte                      `json:"cluster_id"`
-	Incarnation  [16]byte                      `json:"cluster_incarnation"`
-	Recovery     uint64                        `json:"topology_recovery_epoch"`
-	ShardID      [16]byte                      `json:"shard_incarnation"`
-	GroupID      [16]byte                      `json:"group_id"`
-	SourceMember uint64                        `json:"source_member"`
-	TargetMember uint64                        `json:"target_member"`
-	Source       distribution.EndpointID       `json:"source"`
-	Target       distribution.EndpointID       `json:"target"`
+	Distribution         distribution.DistributionName `json:"distribution"`
+	Shard                distribution.ShardID          `json:"shard"`
+	ClusterID            [16]byte                      `json:"cluster_id"`
+	Incarnation          [16]byte                      `json:"cluster_incarnation"`
+	Recovery             uint64                        `json:"topology_recovery_epoch"`
+	ShardID              [16]byte                      `json:"shard_incarnation"`
+	GroupID              [16]byte                      `json:"group_id"`
+	RetiringMember       uint64                        `json:"retiring_member"`
+	SnapshotSourceMember uint64                        `json:"snapshot_source_member"`
+	TargetMember         uint64                        `json:"target_member"`
+	Source               distribution.EndpointID       `json:"source"`
+	Target               distribution.EndpointID       `json:"target"`
 }
 
 // AppendPlanIntent appends the unique canonical restart image for a replica
@@ -49,7 +50,8 @@ type persistedMoveRequest struct {
 func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte, error) {
 	if catalog == nil || plan == nil || plan.operation == (OperationID{}) ||
 		(catalog.Generation() != plan.catalogGeneration &&
-			catalog.Generation() != plan.nextCatalogGeneration) {
+			catalog.Generation() != plan.nextCatalogGeneration &&
+			catalog.Generation() != plan.postRemoveGeneration) {
 		return dst, ErrPlanIntent
 	}
 	if _, err := plan.catalogStage(catalog); err != nil {
@@ -140,8 +142,9 @@ func persistMoveRequest(request MoveRequest) persistedMoveRequest {
 		Distribution: request.Distribution, Shard: request.Shard,
 		ClusterID: request.Group.ClusterID, Incarnation: request.Group.ClusterIncarnation,
 		Recovery: request.Group.TopologyRecoveryEpoch, ShardID: request.Group.ShardIncarnation,
-		GroupID: request.Group.GroupID, SourceMember: request.SourceMember,
-		TargetMember: request.TargetMember, Source: request.Source, Target: request.Target,
+		GroupID: request.Group.GroupID, RetiringMember: request.RetiringMember,
+		SnapshotSourceMember: request.SnapshotSourceMember,
+		TargetMember:         request.TargetMember, Source: request.Source, Target: request.Target,
 	}
 }
 
@@ -153,7 +156,9 @@ func openMoveRequest(request persistedMoveRequest) MoveRequest {
 			TopologyRecoveryEpoch: request.Recovery, ShardIncarnation: request.ShardID,
 			GroupID: request.GroupID,
 		},
-		SourceMember: request.SourceMember, TargetMember: request.TargetMember,
-		Source: request.Source, Target: request.Target,
+		RetiringMember:       request.RetiringMember,
+		SnapshotSourceMember: request.SnapshotSourceMember,
+		TargetMember:         request.TargetMember,
+		Source:               request.Source, Target: request.Target,
 	}
 }

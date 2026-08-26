@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -39,7 +40,7 @@ func moveTestSnapshot(t testing.TB) *gateway.Snapshot {
 		{
 			ID: "all", AllocationGeneration: 11,
 			Range:   distribution.KeyRange{Start: moveTestPoint(0), End: distribution.KeyspaceEnd{Max: true}},
-			Leaders: []distribution.EndpointID{"source"}, Epoch: 13,
+			Leaders: []distribution.EndpointID{"source", "donor", "other"}, Epoch: 13,
 		},
 	})
 	if err != nil {
@@ -51,6 +52,10 @@ func moveTestSnapshot(t testing.TB) *gateway.Snapshot {
 		Manifests:     []*distribution.Manifest{manifest},
 	}, map[distribution.EndpointID]string{
 		"source": "127.0.0.1:7001", "target": "127.0.0.1:7002",
+		"donor": "127.0.0.1:7003", "other": "127.0.0.1:7004",
+		"target-native": "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
+		"other-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7202",
+		"donor-control": "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
 	}, 9)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +68,7 @@ func moveTestPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 	snapshot := moveTestSnapshot(t)
 	plan, err := PlanReplicaMove(snapshot, raftmodel.Publication{
 		Applied: 5, ReplicaSetVersion: 4,
-		ConfState: &pb.ConfState{Voters: []uint64{1, 3}},
+		ConfState: &pb.ConfState{Voters: []uint64{1, 3, 4}},
 	}, moveTestRequest())
 	if err != nil {
 		t.Fatalf("PlanReplicaMove: %v", err)
@@ -74,7 +79,8 @@ func moveTestPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 func moveTestRequest() MoveRequest {
 	return MoveRequest{
 		Distribution: "data", Shard: "all", Group: moveTestGroup(),
-		SourceMember: 1, TargetMember: 2, Source: "source", Target: "target",
+		RetiringMember: 1, SnapshotSourceMember: 3, TargetMember: 2,
+		Source: "source", Target: "target",
 	}
 }
 
@@ -98,6 +104,49 @@ func bindMoveTestPlan(plan *Plan) *Plan {
 	return &next
 }
 
+func moveTestPostRemoveCatalog(t testing.TB, plan *Plan, replicaSetVersion uint64) *gateway.Snapshot {
+	t.Helper()
+	config := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
+		Placements: []distribution.TablePlacement{{
+			Table: "docs", Distribution: "data", Columns: []string{"/id"},
+		}},
+		Manifests: []*distribution.Manifest{plan.targetManifest},
+	}
+	endpoints := map[distribution.EndpointID]string{
+		"source": "127.0.0.1:7001", "target": "127.0.0.1:7002",
+		"donor": "127.0.0.1:7003", "other": "127.0.0.1:7004",
+		"target-native": "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
+		"other-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7202",
+		"donor-control": "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
+	}
+	descriptor := gateway.ReplicatedShardDescriptor{
+		Distribution: "data", Shard: "all", Group: plan.request.Group,
+		AllocationGeneration: 11,
+		Command: raftservice.CommandFence{
+			ReplicaSetVersion: replicaSetVersion, ActivePolicyGeneration: 2,
+			ProtectionEpoch: 3, OwnershipEpoch: 14, SchemaGeneration: 4,
+			RelationManifestDigest: [32]byte{1}, RoutingVersion: 8, RouteGeneration: 10,
+		},
+		Replicas: []gateway.ReplicatedReplicaDescriptor{
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22,
+				Endpoint: "target", NativeEndpoint: "target-native", ControlEndpoint: "target-control"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23,
+				Endpoint: "donor", NativeEndpoint: "donor-native", ControlEndpoint: "donor-control"},
+			{Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+				Endpoint: "other", NativeEndpoint: "other-native", ControlEndpoint: "other-control"},
+		},
+	}
+	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
+		config, endpoints, plan.postRemoveGeneration, nil, nil,
+		[]gateway.ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
 func leaderStatus(member, commit uint64) raftmember.RuntimeStatus {
 	return raftmember.RuntimeStatus{
 		MemberID: member, LeaderID: member, Term: 3, Commit: commit, Applied: commit,
@@ -111,7 +160,7 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 		Catalog: catalog, Publication: raftmodel.Publication{
 			Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf,
 		},
-		LeaderStatus: leaderStatus(1, 8),
+		LeaderStatus: leaderStatus(3, 8),
 	}
 	action, err := Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionAddLearner || action.Member != 2 ||
@@ -123,7 +172,7 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 		Applied: 6, ReplicaSetVersion: 6, ConfState: plan.learnerConf,
 	}
 	action, err = Reconcile(plan, observed)
-	if err != nil || action.Kind != ActionCreateSnapshotBase {
+	if err != nil || action.Kind != ActionCreateSnapshotBase || action.Member != 3 {
 		t.Fatalf("learner action = %+v, %v", action, err)
 	}
 
@@ -172,6 +221,7 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	}
 	transition, err := replicatedstate.OpenOwnershipTransition(command)
 	if err != nil || transition.ExpectedReplicaSetVersion != 9 ||
+		transition.SourceMember != 3 || transition.TargetMember != 2 ||
 		transition.ToRouteGeneration != 10 {
 		t.Fatalf("ownership command = %+v, %v", transition, err)
 	}
@@ -204,7 +254,7 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	}
 	observed.LeaderStatus = leaderStatus(2, 10)
 	observed.TargetStatus = observed.LeaderStatus
-	observed.OlderCatalogDrained = true
+	observed.DrainedCatalogGeneration = 10
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionRemoveSource ||
 		action.ConfChange().AsV2().GetChanges()[0].GetType() != pb.ConfChangeRemoveNode {
@@ -217,10 +267,21 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	observed.TargetState.ReplicaSetVersion = 11
 	observed.TargetState.ConfState = plan.removedConf
 	action, err = Reconcile(plan, observed)
-	if err != nil || action.Kind != ActionRetireSource {
+	if err != nil || action.Kind != ActionRefreshCatalogFence ||
+		action.CatalogGeneration != 11 || action.ReplicaSetVersion != 11 {
 		t.Fatalf("removed action = %+v, %v", action, err)
 	}
-	observed.SourceRetired = true
+	observed.Catalog = moveTestPostRemoveCatalog(t, plan, 11)
+	action, err = Reconcile(plan, observed)
+	if err != nil || action.Kind != ActionAwaitCatalogDrain || action.CatalogGeneration != 11 {
+		t.Fatalf("post-remove publication action = %+v, %v", action, err)
+	}
+	observed.DrainedCatalogGeneration = 11
+	action, err = Reconcile(plan, observed)
+	if err != nil || action.Kind != ActionRetireSource || action.Member != 1 {
+		t.Fatalf("post-remove drain action = %+v, %v", action, err)
+	}
+	observed.RetiringReplicaRetired = true
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionComplete {
 		t.Fatalf("complete action = %+v, %v", action, err)
@@ -232,9 +293,9 @@ func TestReplicaMoveFailsClosedOnConcurrentTopology(t *testing.T) {
 	observed := Observation{
 		Catalog: catalog, Publication: raftmodel.Publication{
 			Applied: 5, ReplicaSetVersion: 4,
-			ConfState: &pb.ConfState{Voters: []uint64{1, 3, 4}},
+			ConfState: &pb.ConfState{Voters: []uint64{1, 3, 4, 5}},
 		},
-		LeaderStatus: leaderStatus(1, 5),
+		LeaderStatus: leaderStatus(3, 5),
 	}
 	if _, err := Reconcile(plan, observed); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("unrelated membership err=%v, want ErrTopologyConflict", err)
@@ -247,6 +308,32 @@ func TestReplicaMoveFailsClosedOnConcurrentTopology(t *testing.T) {
 	observed.Publication.ConfState = plan.initialConf
 	if _, err := Reconcile(plan, observed); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("skipped catalog generation err=%v, want ErrTopologyConflict", err)
+	}
+}
+
+func TestReplicaMoveRequiresDistinctHealthySnapshotDonor(t *testing.T) {
+	catalog := moveTestSnapshot(t)
+	publication := raftmodel.Publication{
+		Applied: 5, ReplicaSetVersion: 4,
+		ConfState: &pb.ConfState{Voters: []uint64{1, 3, 4}},
+	}
+	for name, mutate := range map[string]func(*MoveRequest){
+		"retiring is not a voter": func(request *MoveRequest) { request.RetiringMember = 5 },
+		"donor is not a voter":    func(request *MoveRequest) { request.SnapshotSourceMember = 5 },
+		"retiring is donor": func(request *MoveRequest) {
+			request.SnapshotSourceMember = request.RetiringMember
+		},
+		"donor is target": func(request *MoveRequest) {
+			request.SnapshotSourceMember = request.TargetMember
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := moveTestRequest()
+			mutate(&request)
+			if _, err := PlanReplicaMove(catalog, publication, request); !errors.Is(err, ErrInvalidPlan) {
+				t.Fatalf("PlanReplicaMove error = %v", err)
+			}
+		})
 	}
 }
 
@@ -278,9 +365,9 @@ func TestReplicaMovePlanRecoversUnboundLearner(t *testing.T) {
 		Publication: raftmodel.Publication{
 			Applied: 6, ReplicaSetVersion: 6, ConfState: recovered.learnerConf,
 		},
-		LeaderStatus: leaderStatus(1, 6),
+		LeaderStatus: leaderStatus(3, 6),
 	})
-	if err != nil || action.Kind != ActionCreateSnapshotBase {
+	if err != nil || action.Kind != ActionCreateSnapshotBase || action.Member != 3 {
 		t.Fatalf("recovered learner action = %+v, %v", action, err)
 	}
 }
@@ -311,11 +398,41 @@ func TestReplicaMoveRecoversCertifiedPlanAcrossCutover(t *testing.T) {
 		!recovered.targetManifest.Equal(initial.targetManifest) {
 		t.Fatalf("recover target catalog = %+v, %v", recovered, err)
 	}
+	postRemoveCatalog := moveTestPostRemoveCatalog(t, initial, 11)
+	recovered, err = recoverReplicaMoveCertificate(postRemoveCatalog, raftmodel.Publication{
+		Applied: 11, ReplicaSetVersion: 11, ConfState: initial.removedConf,
+	}, moveTestRequest(), certificate)
+	if err != nil || recovered.PostRemoveCatalogGeneration() != postRemoveCatalog.Generation() ||
+		recovered.OperationID() != initial.OperationID() {
+		t.Fatalf("recover post-remove catalog = %+v, %v", recovered, err)
+	}
 
 	if _, err := recoverReplicaMoveCertificate(sourceCatalog, raftmodel.Publication{
 		Applied: 11, ReplicaSetVersion: 11, ConfState: initial.removedConf,
 	}, moveTestRequest(), certificate); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("removed source catalog error = %v", err)
+	}
+}
+
+func TestReplicaMoveRejectsWrongPostRemoveCatalogFence(t *testing.T) {
+	plan, _ := moveTestPlan(t)
+	plan = bindMoveTestPlan(plan)
+	observed := Observation{
+		Catalog: moveTestPostRemoveCatalog(t, plan, 12),
+		Publication: raftmodel.Publication{
+			Applied: 11, ReplicaSetVersion: 11, ConfState: plan.removedConf,
+		},
+		LeaderStatus: leaderStatus(2, 11), TargetStatus: leaderStatus(2, 11),
+		TargetState: plan.baseState, DrainedCatalogGeneration: plan.postRemoveGeneration,
+	}
+	observed.TargetState.Binding.OwnershipEpoch++
+	observed.TargetState.Binding.RoutingVersion++
+	observed.TargetState.Binding.RouteGeneration++
+	observed.TargetState.Applied = 11
+	observed.TargetState.ReplicaSetVersion = 11
+	observed.TargetState.ConfState = plan.removedConf
+	if _, err := Reconcile(plan, observed); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("wrong post-remove catalog fence error = %v", err)
 	}
 }
 

@@ -13,7 +13,7 @@ func TestPlanIntentCanonicalRestartRoundTripAndBounds(t *testing.T) {
 	plan, catalog := moveTestPlan(t)
 	publication := raftmodel.Publication{
 		Applied: 5, ReplicaSetVersion: 4,
-		ConfState: &pb.ConfState{Voters: []uint64{1, 3}},
+		ConfState: &pb.ConfState{Voters: []uint64{1, 3, 4}},
 	}
 	prefix := []byte("prefix")
 	raw, err := AppendPlanIntent(append([]byte(nil), prefix...), catalog, plan)
@@ -23,6 +23,11 @@ func TestPlanIntentCanonicalRestartRoundTripAndBounds(t *testing.T) {
 	intent := raw[len(prefix):]
 	if len(intent) == 0 || len(intent) > MaxPlanIntentBytes {
 		t.Fatalf("intent bytes = %d", len(intent))
+	}
+	if bytes.Contains(intent, []byte(`"source_member":`)) ||
+		!bytes.Contains(intent, []byte(`"retiring_member":`)) ||
+		!bytes.Contains(intent, []byte(`"snapshot_source_member":`)) {
+		t.Fatalf("intent retained ambiguous member grammar: %s", intent)
 	}
 	recovered, err := OpenPlanIntent(intent, catalog, publication)
 	if err != nil || recovered.OperationID() != plan.OperationID() {
@@ -70,6 +75,12 @@ func TestReplicaMoveOperationIdentityStableAndExact(t *testing.T) {
 	changed.operation = replicaMoveOperationID(&changed)
 	if changed.OperationID() == plan.OperationID() || changed.OperationID() == (OperationID{}) {
 		t.Fatalf("request change did not produce an exact identity: %x", changed.OperationID())
+	}
+	donorChanged := *plan
+	donorChanged.request.SnapshotSourceMember = 4
+	donorChanged.operation = replicaMoveOperationID(&donorChanged)
+	if donorChanged.OperationID() == plan.OperationID() {
+		t.Fatal("snapshot donor was omitted from operation identity")
 	}
 
 	// Identity hashing is length-delimited and streams the entire participant
