@@ -14,6 +14,11 @@ var installationDomain = [...]byte{
 	'A', 'T', 'I', 'O', 'N', '-', 'R', 'E', 'C', 'E', 'I', 'P', 'T', 0, 1, 0,
 }
 
+var materializedArtifactDomain = [...]byte{
+	'V', 'B', 'S', 'C', 'H', 'E', 'M', 'A', '-', 'M', 'A', 'T', 'E', 'R', 'I', 'A',
+	'L', 'I', 'Z', 'E', 'D', '-', 'A', 'R', 'T', 'I', 'F', 'A', 'C', 'T', 0, 0,
+}
+
 // Backend owns the physical generation. Prepare must leave an immutable,
 // reopenable artifact but must not change serving state. Activate must make the
 // exact prepared generation visible atomically. Every mutation is idempotent;
@@ -263,6 +268,22 @@ func InstallationDigest(request Request, artifactDigest [32]byte) [32]byte {
 	var digest [32]byte
 	hasher.Sum(digest[:0])
 	return digest
+}
+
+// MaterializedArtifactDigest joins the immutable uploaded bundle with the
+// activator's durable target-image/checkpoint-membership witness. A receipt
+// built from this digest proves cold preparation completed off the serving path.
+func MaterializedArtifactDigest(bundleDigest, witness [32]byte) [32]byte {
+	if bundleDigest == ([32]byte{}) || witness == ([32]byte{}) {
+		return [32]byte{}
+	}
+	h := sha256.New()
+	_, _ = h.Write(materializedArtifactDomain[:])
+	_, _ = h.Write(bundleDigest[:])
+	_, _ = h.Write(witness[:])
+	var result [32]byte
+	h.Sum(result[:0])
+	return result
 }
 
 func writeRequestHash(hasher hash.Hash, request Request) {

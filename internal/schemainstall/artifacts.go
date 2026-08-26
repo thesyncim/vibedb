@@ -20,6 +20,11 @@ import (
 // readers until DrainOld; this narrow boundary keeps artifact IO off the Raft
 // owner lane without weakening activation semantics.
 type Activator interface {
+	// Stage must materialize the exact target relation/checkpoint images off the
+	// serving path. Its witness is folded into the prepared receipt, so a shard
+	// cannot claim readiness from the opaque bundle file alone.
+	ObserveStaged(context.Context, Request, [32]byte, string) (witness [32]byte, found bool, err error)
+	Stage(context.Context, Request, [32]byte, string) (witness [32]byte, err error)
 	ObserveActive(context.Context, Request, Authorization, [32]byte, string) (bool, error)
 	Activate(context.Context, Request, Authorization, [32]byte, string) error
 	ObserveDrained(context.Context, Request, Authorization, DrainProof, [32]byte) (bool, error)
@@ -99,18 +104,34 @@ func (backend *DirectoryBackend) ObservePrepared(
 		return [32]byte{}, false, cause
 	}
 	backend.mu.Lock()
-	defer backend.mu.Unlock()
 	if backend.closed {
+		backend.mu.Unlock()
 		return [32]byte{}, false, ErrClosed
 	}
 	meta, found := backend.artifacts[request.Operation]
 	if !found {
+		backend.mu.Unlock()
 		return [32]byte{}, false, nil
 	}
 	if meta.bytes != request.BundleBytes || meta.digest != request.BundleDigest {
+		backend.mu.Unlock()
 		return [32]byte{}, false, ErrConflict
 	}
-	return meta.digest, true, nil
+	name := artifactName(request.Operation)
+	digest, err := backend.digestLocked(request.Operation, request.BundleBytes)
+	backend.mu.Unlock()
+	if err != nil || digest != meta.digest {
+		return [32]byte{}, false, errors.Join(ErrConflict, err)
+	}
+	witness, staged, err := backend.activator.ObserveStaged(ctx, request, meta.digest, name)
+	if err != nil || !staged {
+		return [32]byte{}, staged, err
+	}
+	materialized := MaterializedArtifactDigest(meta.digest, witness)
+	if materialized == ([32]byte{}) {
+		return [32]byte{}, false, ErrInvalid
+	}
+	return materialized, true, nil
 }
 
 func (backend *DirectoryBackend) Prepare(
@@ -123,32 +144,66 @@ func (backend *DirectoryBackend) Prepare(
 	if cause := context.Cause(ctx); cause != nil {
 		return [32]byte{}, cause
 	}
+	digest, name, err := backend.prepareArtifact(ctx, request, bundle)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	witness, found, err := backend.activator.ObserveStaged(ctx, request, digest, name)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	if !found {
+		witness, err = backend.activator.Stage(ctx, request, digest, name)
+		if err != nil {
+			observed, observedFound, observeErr := backend.activator.ObserveStaged(
+				ctx, request, digest, name,
+			)
+			if observeErr != nil || !observedFound {
+				return [32]byte{}, errors.Join(ErrOutcomeUnknown, err, observeErr)
+			}
+			witness = observed
+		}
+	}
+	materialized := MaterializedArtifactDigest(digest, witness)
+	if materialized == ([32]byte{}) {
+		return [32]byte{}, ErrInvalid
+	}
+	return materialized, nil
+}
+
+func (backend *DirectoryBackend) prepareArtifact(
+	ctx context.Context, request Request, bundle []byte,
+) ([32]byte, string, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	if backend.closed {
-		return [32]byte{}, ErrClosed
+		return [32]byte{}, "", ErrClosed
 	}
 	if meta, found := backend.artifacts[request.Operation]; found {
 		if meta.bytes != request.BundleBytes || meta.digest != request.BundleDigest {
-			return [32]byte{}, ErrConflict
+			return [32]byte{}, "", ErrConflict
 		}
-		return meta.digest, nil
+		digest, err := backend.digestLocked(request.Operation, request.BundleBytes)
+		if err != nil || digest != meta.digest {
+			return [32]byte{}, "", errors.Join(ErrConflict, err)
+		}
+		return meta.digest, artifactName(request.Operation), nil
 	}
 	if len(backend.artifacts) == backend.maxArtifacts {
-		return [32]byte{}, ErrBound
+		return [32]byte{}, "", ErrBound
 	}
 	var live uint64
 	for _, meta := range backend.artifacts {
 		live += meta.bytes
 	}
 	if request.BundleBytes > backend.maxDiskBytes-live {
-		return [32]byte{}, ErrBound
+		return [32]byte{}, "", ErrBound
 	}
 	name := artifactName(request.Operation)
 	temporary := "." + name + ".tmp"
 	file, err := openRegular(backend.root, temporary, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, "", err
 	}
 	landed := false
 	defer func() {
@@ -170,11 +225,11 @@ func (backend *DirectoryBackend) Prepare(
 		err = syncRoot(backend.root)
 	}
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, "", err
 	}
 	landed = true
 	backend.artifacts[request.Operation] = artifactMeta{bytes: request.BundleBytes, digest: request.BundleDigest}
-	return request.BundleDigest, nil
+	return request.BundleDigest, name, nil
 }
 
 func (backend *DirectoryBackend) ObserveActive(ctx context.Context, request Request, authorization Authorization, installation [32]byte) (bool, error) {

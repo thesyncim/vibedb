@@ -14,15 +14,43 @@ import (
 
 type testActivator struct {
 	mu                  sync.Mutex
+	staged              map[[32]byte][32]byte
 	active, drained     map[[32]byte]bool
+	stageCalls          int
 	activateCalls       int
 	drainCalls          int
 	failAfterActivation bool
 	failAfterDrain      bool
+	failAfterStage      bool
 }
 
 func newTestActivator() *testActivator {
-	return &testActivator{active: make(map[[32]byte]bool), drained: make(map[[32]byte]bool)}
+	return &testActivator{staged: make(map[[32]byte][32]byte),
+		active: make(map[[32]byte]bool), drained: make(map[[32]byte]bool)}
+}
+
+func (a *testActivator) ObserveStaged(_ context.Context, r Request, artifact [32]byte, _ string) ([32]byte, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	witness, found := a.staged[r.Operation]
+	if found && artifact != r.BundleDigest {
+		return [32]byte{}, false, ErrConflict
+	}
+	return witness, found, nil
+}
+func (a *testActivator) Stage(_ context.Context, r Request, artifact [32]byte, _ string) ([32]byte, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if artifact != r.BundleDigest {
+		return [32]byte{}, ErrConflict
+	}
+	a.stageCalls++
+	witness := sha256.Sum256(append([]byte("materialized:"), r.Operation[:]...))
+	a.staged[r.Operation] = witness
+	if a.failAfterStage {
+		return [32]byte{}, errors.New("stage response lost")
+	}
+	return witness, nil
 }
 
 func (a *testActivator) ObserveActive(_ context.Context, r Request, _ Authorization, _ [32]byte, _ string) (bool, error) {
@@ -115,6 +143,16 @@ func TestInstallerCrashReopenAuthorizationActivationAndDrain(t *testing.T) {
 	if err != nil || receipt.ContractDigest != ContractDigest() || receipt.InstallationDigest == ([32]byte{}) {
 		t.Fatalf("prepare = %#v, %v", receipt, err)
 	}
+	activator.mu.Lock()
+	stageWitness := activator.staged[request.Operation]
+	activator.mu.Unlock()
+	wantInstallation := InstallationDigest(
+		request, MaterializedArtifactDigest(request.BundleDigest, stageWitness),
+	)
+	if receipt.InstallationDigest != wantInstallation ||
+		receipt.InstallationDigest == InstallationDigest(request, request.BundleDigest) {
+		t.Fatal("prepared receipt does not bind materialized target witness")
+	}
 	if err = errors.Join(journal.Close(), backend.Close()); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +179,9 @@ func TestInstallerCrashReopenAuthorizationActivationAndDrain(t *testing.T) {
 	if activator.activateCalls != 1 || activator.drainCalls != 1 {
 		t.Fatalf("side effects = activate %d drain %d", activator.activateCalls, activator.drainCalls)
 	}
+	if activator.stageCalls != 1 {
+		t.Fatalf("materialization calls = %d, want 1", activator.stageCalls)
+	}
 	if _, err = installer.Activate(context.Background(), authorization); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +193,22 @@ func TestInstallerCrashReopenAuthorizationActivationAndDrain(t *testing.T) {
 	}
 	if err = errors.Join(journal.Close(), backend.Close()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInstallerSettlesOutcomeUnknownMaterialization(t *testing.T) {
+	activator := newTestActivator()
+	activator.failAfterStage = true
+	installer, journal, backend := openTestInstaller(t, t.TempDir(), activator, 2)
+	defer journal.Close()
+	defer backend.Close()
+	request, _, _, bundle := schemaFixture(8)
+	receipt, err := installer.Prepare(context.Background(), request, bundle)
+	if err != nil || receipt.InstallationDigest == ([32]byte{}) {
+		t.Fatalf("outcome-unknown stage did not settle: %#v, %v", receipt, err)
+	}
+	if activator.stageCalls != 1 {
+		t.Fatalf("stage calls = %d", activator.stageCalls)
 	}
 }
 
