@@ -26,6 +26,42 @@ type ControllerPass struct {
 	Completed  uint16
 }
 
+// RunDirectControllerPass is the production authority composition. The
+// gateway reads the bounded operation directory and executes each operation
+// locally; it never asks a shard to host catalog/controller authority.
+func RunDirectControllerPass(
+	ctx context.Context,
+	directory ControllerDirectory,
+	controller *ControllerService,
+) (ControllerPass, error) {
+	if ctx == nil || directory == nil || controller == nil {
+		return ControllerPass{}, ErrControllerTrigger
+	}
+	ids, err := directory.ReadOperationIDs(ctx)
+	if err != nil || len(ids) > maxControllerPassOperations {
+		return ControllerPass{}, errors.Join(err, ErrControllerTrigger)
+	}
+	pass := ControllerPass{Discovered: uint16(len(ids))}
+	for _, id := range ids {
+		record, readErr := directory.ReadOperation(ctx, id)
+		if errors.Is(readErr, gateway.ErrReplicatedOperationMissing) {
+			continue
+		}
+		if readErr != nil || record.ID != id || record.Kind != gateway.ReplicatedOperationSplit {
+			return pass, errors.Join(readErr, ErrControllerTrigger)
+		}
+		action, executeErr := controller.ExecuteReplicatedOperation(ctx, id)
+		if executeErr != nil {
+			return pass, executeErr
+		}
+		pass.Triggered++
+		if action.Kind == ActionComplete {
+			pass.Completed++
+		}
+	}
+	return pass, nil
+}
+
 // RunControllerPass reads the bounded RF3 directory and triggers at most one
 // exact step per operation. It stores no local queue: a crash before, during,
 // or after a trigger resumes from the directory, operation revision, and the

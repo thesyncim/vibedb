@@ -18,10 +18,55 @@ func (catalog *testControllerCatalog) Read(context.Context) (*gateway.Snapshot, 
 	return catalog.catalog, nil
 }
 
+func (catalog *testControllerCatalog) ReadOperationIDs(context.Context) ([][32]byte, error) {
+	if catalog == nil || catalog.memoryReplicatedOperationJournal == nil ||
+		!catalog.memoryReplicatedOperationJournal.present {
+		return nil, nil
+	}
+	return [][32]byte{catalog.memoryReplicatedOperationJournal.record.ID}, nil
+}
+
 type testPlanObserver struct {
 	operation OperationID
 	observed  Observation
 	calls     int
+}
+
+func TestDirectControllerPassKeepsCatalogAuthorityInGateway(t *testing.T) {
+	plan, snapshot, _, _ := testPlan(t)
+	state := testSourceState(plan)
+	state.ReplicaSetVersion = 1
+	observed := Observation{Catalog: snapshot, SourceState: state}
+	action, err := Reconcile(plan, observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := AppendPlanIntent(nil, snapshot, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := [32]byte(plan.OperationID())
+	cursor := replicatedActionCursor(action)
+	record := gateway.ReplicatedOperationRecord{
+		ID: id, Kind: gateway.ReplicatedOperationSplit,
+		State: gateway.ReplicatedOperationPlanned, Revision: 1,
+		CatalogGeneration: snapshot.Generation(), Cursor: cursor,
+		Proof: replicatedActionProof(id, cursor), IntentDigest: sha256.Sum256(intent), Intent: intent,
+	}
+	journal := &memoryReplicatedOperationJournal{record: record, present: true}
+	catalog := &testControllerCatalog{memoryReplicatedOperationJournal: journal, catalog: snapshot}
+	observer := &testPlanObserver{operation: plan.OperationID(), observed: observed}
+	router := new(testShardControlRouter)
+	controller, err := NewControllerService(catalog, observer, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pass, err := RunDirectControllerPass(t.Context(), catalog, controller)
+	if err != nil || pass.Discovered != 1 || pass.Triggered != 1 || pass.Completed != 0 ||
+		observer.calls != 1 || router.calls != 1 || journal.record.State != gateway.ReplicatedOperationRunning {
+		t.Fatalf("pass=%+v observer=%d router=%d record=%+v err=%v",
+			pass, observer.calls, router.calls, journal.record, err)
+	}
 }
 
 func (observer *testPlanObserver) ObservePlan(

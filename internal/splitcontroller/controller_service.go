@@ -67,13 +67,44 @@ func AppendReconcileTrigger(
 	}, nil
 }
 
-// ControllerService reconstructs and executes one safe step. Wrap it in a
-// shardcontrol.JournalExecutor so the trigger response itself is replay-safe
-// across source-host crashes and lost responses.
+// ControllerService is the gateway-local replicated split controller. Catalog
+// reads/publication remain in the catalog RF3 authority; shard processes expose
+// only observation, artifact/tail data, and idempotent fenced actions.
 type ControllerService struct {
 	catalog  ControllerCatalog
 	observer PlanObserver
 	router   ShardControlRouter
+}
+
+// ExecuteReplicatedOperation reconstructs and advances one operation directly
+// from catalog RF3. It owns no local progress record: ExecuteRemoteReplicatedStep
+// persists Running before the shard RPC and the next pass resumes after a
+// gateway crash or an outcome-unknown response.
+func (service *ControllerService) ExecuteReplicatedOperation(
+	ctx context.Context,
+	operation [32]byte,
+) (Action, error) {
+	if service == nil || ctx == nil || operation == ([32]byte{}) {
+		return Action{}, ErrControllerTrigger
+	}
+	record, err := service.catalog.ReadOperation(ctx, operation)
+	if err != nil {
+		return Action{}, errors.Join(err, ErrControllerTrigger)
+	}
+	catalog, err := service.catalog.Read(ctx)
+	if err != nil {
+		return Action{}, err
+	}
+	plan, err := OpenPlanIntent(record.Intent, catalog)
+	if err != nil || [32]byte(plan.OperationID()) != operation ||
+		record.IntentDigest != sha256.Sum256(record.Intent) {
+		return Action{}, errors.Join(err, ErrControllerTrigger)
+	}
+	observed, err := service.observer.ObservePlan(ctx, plan)
+	if err != nil {
+		return Action{}, err
+	}
+	return ExecuteRemoteReplicatedStep(ctx, service.catalog, plan, observed, service.router)
 }
 
 func NewControllerService(
@@ -111,21 +142,7 @@ func (service *ControllerService) ExecuteAction(
 		record.IntentDigest != payload.IntentDigest {
 		return shardcontrol.Response{}, errors.Join(err, ErrControllerTrigger)
 	}
-	catalog, err := service.catalog.Read(ctx)
-	if err != nil {
-		return shardcontrol.Response{}, err
-	}
-	plan, err := OpenPlanIntent(record.Intent, catalog)
-	if err != nil || [32]byte(plan.OperationID()) != request.Operation {
-		return shardcontrol.Response{}, errors.Join(err, ErrControllerTrigger)
-	}
-	observed, err := service.observer.ObservePlan(ctx, plan)
-	if err != nil {
-		return shardcontrol.Response{}, err
-	}
-	action, err := ExecuteRemoteReplicatedStep(
-		ctx, service.catalog, plan, observed, service.router,
-	)
+	action, err := service.ExecuteReplicatedOperation(ctx, request.Operation)
 	if err != nil {
 		return shardcontrol.Response{}, err
 	}
