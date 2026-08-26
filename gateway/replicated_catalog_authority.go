@@ -65,6 +65,7 @@ type ReplicatedCatalogAuthority struct {
 	pendingExpected                    uint64
 	pendingGrant                       membershipgrant.Grant
 	pendingPostRemoveReplicaSetVersion uint64
+	issuerGrants                       *replicatedIssuerGrantCache
 }
 
 type ReplicatedCatalogAuthorityOptions struct {
@@ -103,8 +104,9 @@ func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*
 	return &ReplicatedCatalogAuthority{
 		executor: options.Executor, route: route, relation: options.Relation,
 		holder: options.Holder, session: options.Session,
-		authority: options.Authority,
-		scratch:   make([]byte, 0, 4<<10),
+		authority:    options.Authority,
+		scratch:      make([]byte, 0, 4<<10),
+		issuerGrants: newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants),
 	}, nil
 }
 
