@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -67,10 +68,24 @@ type Action struct {
 type ChildTarget struct {
 	Child                 uint8
 	Endpoint              distribution.EndpointID
+	Replicas              []ChildReplicaTarget
 	WAL                   raftstore.Identity
 	TopologyRecoveryEpoch uint64
 	Authority             sqldriver.ReplicatedAuthorityProfile
 	SQL                   sqldriver.ReplicatedShardStoreIdentity
+}
+
+// ChildReplicaTarget is one exact pre-published RF3 member route. A split plan
+// carries the complete voter set because DNS and an uncommitted catalog cannot
+// establish member, node, store, or certificate identity.
+type ChildReplicaTarget struct {
+	Member          uint64
+	Node            rafttransport.NodeID
+	StoreID         [16]byte
+	NodeIncarnation uint64
+	Endpoint        distribution.EndpointID
+	NativeEndpoint  distribution.EndpointID
+	ControlEndpoint distribution.EndpointID
 }
 
 // Plan binds one source catalog generation, exact split geometry, and every
@@ -206,6 +221,7 @@ func newPlan(
 		leader, leaderOK := split.ChildLeader(child, 0)
 		if !childOK || descriptor.Retained || seen[child] ||
 			!leaderOK || target.Endpoint != leader ||
+			!validChildReplicaTargets(split, child, target) ||
 			target.WAL.Distribution != string(split.Source.Distribution) ||
 			target.WAL.Shard != string(descriptor.Shard) ||
 			target.WAL.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
@@ -1027,10 +1043,48 @@ func runtimeIdentityMatches(target ChildTarget, identity raftmember.RuntimeIdent
 
 func cloneChildTarget(target ChildTarget) ChildTarget {
 	target.Endpoint = distribution.EndpointID(strings.Clone(string(target.Endpoint)))
+	target.Replicas = append([]ChildReplicaTarget(nil), target.Replicas...)
+	for index := range target.Replicas {
+		replica := &target.Replicas[index]
+		replica.Endpoint = distribution.EndpointID(strings.Clone(string(replica.Endpoint)))
+		replica.NativeEndpoint = distribution.EndpointID(strings.Clone(string(replica.NativeEndpoint)))
+		replica.ControlEndpoint = distribution.EndpointID(strings.Clone(string(replica.ControlEndpoint)))
+	}
 	target.WAL.Distribution = strings.Clone(target.WAL.Distribution)
 	target.WAL.Shard = strings.Clone(target.WAL.Shard)
 	target.SQL = target.SQL.Clone()
 	return target
+}
+
+func validChildReplicaTargets(split *autosplit.SplitPlan, child int, target ChildTarget) bool {
+	if split == nil || child < 0 || len(target.Replicas) == 0 {
+		return false
+	}
+	descriptor, ok := split.Child(child)
+	if !ok || len(target.Replicas) != len(descriptor.Leaders) {
+		return false
+	}
+	for index, replica := range target.Replicas {
+		if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
+			replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
+			replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
+			replica.Endpoint == replica.NativeEndpoint || replica.Endpoint == replica.ControlEndpoint ||
+			replica.NativeEndpoint == replica.ControlEndpoint ||
+			replica.NativeEndpoint != descriptor.Leaders[index] {
+			return false
+		}
+		for prior := 0; prior < index; prior++ {
+			other := target.Replicas[prior]
+			if other.Member == replica.Member || other.Node == replica.Node ||
+				other.StoreID == replica.StoreID || other.Endpoint == replica.Endpoint ||
+				other.NativeEndpoint == replica.NativeEndpoint || other.ControlEndpoint == replica.ControlEndpoint {
+				return false
+			}
+		}
+	}
+	first := target.Replicas[0]
+	return target.Endpoint == first.NativeEndpoint && target.WAL.MemberID == first.Member &&
+		target.WAL.StoreID == first.StoreID
 }
 
 func cloneSourceIdentity(source autosplit.SourceIdentity) autosplit.SourceIdentity {

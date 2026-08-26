@@ -132,6 +132,16 @@ func validateChildExecutionRoster(
 			}
 			foundLocal = true
 		}
+		matchedTarget := false
+		for _, replica := range target.Replicas {
+			if replica.Member == member.MemberID && replica.Node == member.Node {
+				matchedTarget = true
+				break
+			}
+		}
+		if !matchedTarget {
+			return raftservice.CommandFence{}, ErrRuntimeStore
+		}
 		for prior := 0; prior < index; prior++ {
 			if roster[prior].MemberID == member.MemberID || roster[prior].Node == member.Node {
 				return raftservice.CommandFence{}, ErrRuntimeStore
@@ -148,7 +158,7 @@ func validateChildExecutionRoster(
 		RoutingVersion:         target.Authority.RoutingVersion,
 		RouteGeneration:        target.Authority.RouteGeneration,
 	}
-	if !foundLocal || !command.Valid() {
+	if !foundLocal || len(target.Replicas) != len(roster) || !command.Valid() {
 		return raftservice.CommandFence{}, ErrRuntimeStore
 	}
 	return command, nil

@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
@@ -56,10 +57,21 @@ type persistedSQLIdentity struct {
 type persistedChildTarget struct {
 	Child                 uint8                                `json:"child"`
 	Endpoint              distribution.EndpointID              `json:"endpoint"`
+	Replicas              []persistedChildReplica              `json:"replicas"`
 	WAL                   raftstore.Identity                   `json:"wal"`
 	TopologyRecoveryEpoch uint64                               `json:"topology_recovery_epoch"`
 	Authority             sqldriver.ReplicatedAuthorityProfile `json:"authority"`
 	SQL                   persistedSQLIdentity                 `json:"sql"`
+}
+
+type persistedChildReplica struct {
+	Member          uint64                  `json:"member"`
+	Node            [16]byte                `json:"node"`
+	StoreID         [16]byte                `json:"store_id"`
+	NodeIncarnation uint64                  `json:"node_incarnation"`
+	Endpoint        distribution.EndpointID `json:"endpoint"`
+	NativeEndpoint  distribution.EndpointID `json:"native_endpoint"`
+	ControlEndpoint distribution.EndpointID `json:"control_endpoint"`
 }
 
 // AppendPlanIntent appends the one canonical byte image used as replicated
@@ -104,6 +116,7 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 		if target, targetOK := plan.Target(uint8(child)); targetOK {
 			intent.Targets = append(intent.Targets, persistedChildTarget{
 				Child: target.Child, Endpoint: target.Endpoint, WAL: target.WAL,
+				Replicas:              persistChildReplicas(target.Replicas),
 				TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
 				Authority:             target.Authority, SQL: persistSQLIdentity(target.SQL),
 			})
@@ -177,6 +190,7 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 		target := &intent.Targets[index]
 		targets[index] = ChildTarget{
 			Child: target.Child, Endpoint: target.Endpoint, WAL: target.WAL,
+			Replicas:              openPersistedChildReplicas(target.Replicas),
 			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
 			Authority:             target.Authority,
 			SQL:                   openPersistedSQLIdentity(target.SQL),
@@ -189,6 +203,30 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
 	return plan, nil
+}
+
+func persistChildReplicas(input []ChildReplicaTarget) []persistedChildReplica {
+	result := make([]persistedChildReplica, len(input))
+	for index, replica := range input {
+		result[index] = persistedChildReplica{
+			Member: replica.Member, Node: [16]byte(replica.Node), StoreID: replica.StoreID,
+			NodeIncarnation: replica.NodeIncarnation, Endpoint: replica.Endpoint,
+			NativeEndpoint: replica.NativeEndpoint, ControlEndpoint: replica.ControlEndpoint,
+		}
+	}
+	return result
+}
+
+func openPersistedChildReplicas(input []persistedChildReplica) []ChildReplicaTarget {
+	result := make([]ChildReplicaTarget, len(input))
+	for index, replica := range input {
+		result[index] = ChildReplicaTarget{
+			Member: replica.Member, Node: rafttransport.NodeID(replica.Node), StoreID: replica.StoreID,
+			NodeIncarnation: replica.NodeIncarnation, Endpoint: replica.Endpoint,
+			NativeEndpoint: replica.NativeEndpoint, ControlEndpoint: replica.ControlEndpoint,
+		}
+	}
+	return result
 }
 
 func persistSQLIdentity(identity sqldriver.ReplicatedShardStoreIdentity) persistedSQLIdentity {

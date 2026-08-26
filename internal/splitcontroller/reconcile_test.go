@@ -528,8 +528,23 @@ func testChildTarget(
 	if err != nil {
 		t.Fatal(err)
 	}
+	replicas := make([]ChildReplicaTarget, len(child.Leaders))
+	for index, leader := range child.Leaders {
+		store := testID(byte(30 + index))
+		if index == 0 {
+			store = identity.StoreID
+		}
+		replicas[index] = ChildReplicaTarget{
+			Member: uint64(index + 1), Node: testID(byte(20 + index)), StoreID: store,
+			NodeIncarnation: uint64(index + 1),
+			Endpoint:        distribution.EndpointID(string(leader) + "-peer"),
+			NativeEndpoint:  leader,
+			ControlEndpoint: distribution.EndpointID(string(leader) + "-control"),
+		}
+	}
 	return ChildTarget{
 		Child: 1, Endpoint: child.Leaders[0], WAL: identity,
+		Replicas:              replicas,
 		TopologyRecoveryEpoch: 1, Authority: authority,
 		SQL: sqldriver.ReplicatedShardStoreIdentity{
 			Binding: binding, LogID: testID(6), UserTable: partitioner.CollectionName(),

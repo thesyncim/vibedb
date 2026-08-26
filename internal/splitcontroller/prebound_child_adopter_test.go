@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -28,7 +29,7 @@ func (registrar *recordingExecutionGroupRegistrar) RegisterExecutionGroup(
 }
 
 func TestPreboundChildRuntimeAdopterFreezesRF3Authority(t *testing.T) {
-	plan, _, _, _ := testPlan(t)
+	plan, _, _, _ := testPlanWithChildLeaders(t, rf3ChildLeaders())
 	target, ok := plan.Target(1)
 	if !ok {
 		t.Fatal("missing child target")
@@ -68,7 +69,7 @@ func TestPreboundChildRuntimeAdopterFreezesRF3Authority(t *testing.T) {
 }
 
 func TestPreboundChildRuntimeAdopterRejectsMixedOrIncompleteRoster(t *testing.T) {
-	plan, _, _, _ := testPlan(t)
+	plan, _, _, _ := testPlanWithChildLeaders(t, rf3ChildLeaders())
 	target, _ := plan.Target(1)
 	valid := testChildExecutionRoster(target)
 	tests := []struct {
@@ -117,7 +118,7 @@ func TestPreboundChildRuntimeAdopterRejectsMixedOrIncompleteRoster(t *testing.T)
 }
 
 func TestChildPublicationMustMatchPreboundRF3Roster(t *testing.T) {
-	plan, _, _, _ := testPlan(t)
+	plan, _, _, _ := testPlanWithChildLeaders(t, rf3ChildLeaders())
 	target, _ := plan.Target(1)
 	roster := testChildExecutionRoster(target)
 	conf := &pb.ConfState{Voters: []uint64{
@@ -141,17 +142,23 @@ func TestChildPublicationMustMatchPreboundRF3Roster(t *testing.T) {
 	}
 }
 
+func rf3ChildLeaders() []distribution.EndpointID {
+	return []distribution.EndpointID{"node-b", "node-c", "node-d"}
+}
+
 func testChildExecutionRoster(target ChildTarget) []rafttransport.Member {
 	group := raftmember.GroupKey{
 		ClusterID: target.WAL.ClusterID, ClusterIncarnation: target.WAL.ClusterIncarnation,
 		TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
 		ShardIncarnation:      target.WAL.ShardIncarnation, GroupID: target.WAL.GroupID,
 	}
-	local := target.WAL.MemberID
-	second, third := local+1, local+2
-	return []rafttransport.Member{
-		{Group: group, ReplicaSetVersion: 1, MemberID: third, Node: rafttransport.NodeID{3}, Role: rafttransport.MemberVoter},
-		{Group: group, ReplicaSetVersion: 1, MemberID: local, Node: rafttransport.NodeID{1}, Role: rafttransport.MemberVoter},
-		{Group: group, ReplicaSetVersion: 1, MemberID: second, Node: rafttransport.NodeID{2}, Role: rafttransport.MemberVoter},
+	result := make([]rafttransport.Member, len(target.Replicas))
+	for index, replica := range target.Replicas {
+		result[index] = rafttransport.Member{Group: group, ReplicaSetVersion: 1,
+			MemberID: replica.Member, Node: replica.Node, Role: rafttransport.MemberVoter}
 	}
+	if len(result) == 3 {
+		result[0], result[2] = result[2], result[0]
+	}
+	return result
 }
