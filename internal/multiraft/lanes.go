@@ -56,6 +56,131 @@ type ExecutionLanes struct {
 	lanes   []executionLane
 }
 
+// Count returns the immutable number of execution lanes.
+func (set *ExecutionLanes) Count() int {
+	if set == nil {
+		return 0
+	}
+	return len(set.lanes)
+}
+
+// ExecutionLane is a narrow single-owner view of one lane. Group-addressed
+// methods reject keys assigned to another lane, so ingress cannot accidentally
+// cross owner loops. Close retires only this lane; ExecutionLanes.Close remains
+// the aggregate shutdown and settlement boundary.
+type ExecutionLane struct {
+	set   *ExecutionLanes
+	index int
+}
+
+// OwnerLane returns the single-owner capability for index.
+func (set *ExecutionLanes) OwnerLane(index int) (*ExecutionLane, error) {
+	if set == nil || index < 0 || index >= len(set.lanes) {
+		return nil, ErrExecutionLane
+	}
+	return &ExecutionLane{set: set, index: index}, nil
+}
+
+func (lane *ExecutionLane) accepts(key raftmember.GroupKey) error {
+	if lane == nil || lane.set == nil {
+		return ErrExecutionLane
+	}
+	index, err := lane.set.Lane(key)
+	if err != nil || index != lane.index {
+		return ErrExecutionLane
+	}
+	return nil
+}
+
+func (lane *ExecutionLane) AdoptMessage(key raftmember.GroupKey, message *pb.Message) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.AdoptMessage(key, message)
+}
+func (lane *ExecutionLane) EnqueueTrackedProposal(key raftmember.GroupKey, data []byte, token ProposalToken) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.EnqueueTrackedProposal(key, data, token)
+}
+func (lane *ExecutionLane) ProposeConfChange(key raftmember.GroupKey, change pb.ConfChangeI) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.ProposeConfChange(key, change)
+}
+func (lane *ExecutionLane) ReadIndex(key raftmember.GroupKey, context []byte) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.ReadIndex(key, context)
+}
+func (lane *ExecutionLane) TransferLeader(key raftmember.GroupKey, transferee uint64) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.TransferLeader(key, transferee)
+}
+func (lane *ExecutionLane) RequestTick(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.RequestTick(key)
+}
+func (lane *ExecutionLane) RequestCampaign(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.RequestCampaign(key)
+}
+func (lane *ExecutionLane) Publication(key raftmember.GroupKey) (raftmodel.Publication, error) {
+	if err := lane.accepts(key); err != nil {
+		return raftmodel.Publication{}, err
+	}
+	return lane.set.Publication(key)
+}
+func (lane *ExecutionLane) Status(key raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	if err := lane.accepts(key); err != nil {
+		return raftmember.RuntimeStatus{}, err
+	}
+	return lane.set.Status(key)
+}
+func (lane *ExecutionLane) Progress(key raftmember.GroupKey, memberID uint64) (raftmodel.MemberProgress, bool, error) {
+	if err := lane.accepts(key); err != nil {
+		return raftmodel.MemberProgress{}, false, err
+	}
+	return lane.set.Progress(key, memberID)
+}
+func (lane *ExecutionLane) DurablePromotion(key raftmember.GroupKey, memberID uint64) (raftmember.DurablePromotionProof, bool, error) {
+	if err := lane.accepts(key); err != nil {
+		return raftmember.DurablePromotionProof{}, false, err
+	}
+	return lane.set.DurablePromotion(key, memberID)
+}
+func (lane *ExecutionLane) RunOne() (Progress, bool, error) {
+	if lane == nil || lane.set == nil {
+		return Progress{}, false, ErrExecutionLane
+	}
+	return lane.set.RunOne(lane.index)
+}
+func (lane *ExecutionLane) PopOutbound() (raftmember.OutboundMessage, bool) {
+	if lane == nil || lane.set == nil {
+		return raftmember.OutboundMessage{}, false
+	}
+	message, ok, _ := lane.set.PopOutbound(lane.index)
+	return message, ok
+}
+func (lane *ExecutionLane) Close() error {
+	if lane == nil || lane.set == nil {
+		return nil
+	}
+	l := &lane.set.lanes[lane.index]
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.host.Close()
+}
+
 // ExecutionLaneStats is an allocation-free snapshot when supplied through
 // StatsInto with sufficient destination capacity. Queue and outbox bytes are
 // exact retained payload charges; structural Host/runtime memory is excluded.
@@ -340,6 +465,28 @@ func (set *ExecutionLanes) Progress(
 		return raftmodel.MemberProgress{}, false, ErrHostClosed
 	}
 	result, found, err := lane.host.Progress(key, memberID)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return result, found, err
+}
+
+func (set *ExecutionLanes) DurablePromotion(
+	key raftmember.GroupKey,
+	memberID uint64,
+) (raftmember.DurablePromotionProof, bool, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return raftmember.DurablePromotionProof{}, false, err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return raftmember.DurablePromotionProof{}, false, ErrHostClosed
+	}
+	result, found, err := lane.host.DurablePromotion(key, memberID)
 	if err != nil {
 		lane.counters.rejected++
 	}

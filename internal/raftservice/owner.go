@@ -387,7 +387,7 @@ func (e *UnknownOutcomeError) Unwrap() []error {
 // another Host message until the retained one is accepted.
 type Owner struct {
 	registry  *raftserve.Registry
-	host      *multiraft.Host
+	host      ownerHost
 	groups    []raftmember.GroupKey
 	members   map[raftmember.GroupKey]ownerMember
 	outbound  OutboundSink
@@ -411,6 +411,25 @@ type Owner struct {
 	started              bool
 	closed               bool
 	failure              error
+}
+
+// ownerHost is the complete narrow capability used by one serialized owner.
+// Both a standalone Host and a lane-scoped ExecutionLanes view satisfy it.
+type ownerHost interface {
+	AdoptMessage(raftmember.GroupKey, *pb.Message) error
+	EnqueueTrackedProposal(raftmember.GroupKey, []byte, multiraft.ProposalToken) error
+	ProposeConfChange(raftmember.GroupKey, pb.ConfChangeI) error
+	ReadIndex(raftmember.GroupKey, []byte) error
+	TransferLeader(raftmember.GroupKey, uint64) error
+	RequestTick(raftmember.GroupKey) error
+	RequestCampaign(raftmember.GroupKey) error
+	Publication(raftmember.GroupKey) (raftmodel.Publication, error)
+	Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error)
+	Progress(raftmember.GroupKey, uint64) (raftmodel.MemberProgress, bool, error)
+	DurablePromotion(raftmember.GroupKey, uint64) (raftmember.DurablePromotionProof, bool, error)
+	RunOne() (multiraft.Progress, bool, error)
+	PopOutbound() (raftmember.OutboundMessage, bool)
+	Close() error
 }
 
 type MembershipAuthoritySink interface {
@@ -490,8 +509,12 @@ func ValidateMembershipFields(
 // NewOwner validates and detaches one lane configuration. Runtime adoption and
 // Host group addition must be complete before construction.
 func NewOwner(options Options) (*Owner, error) {
+	return newOwner(options, options.Host, false)
+}
+
+func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) {
 	limits := options.Limits
-	if options.Registry == nil || options.Host == nil || len(options.Members) == 0 ||
+	if options.Registry == nil || host == nil || (!allowEmpty && len(options.Members) == 0) ||
 		len(options.CommandFences) != len(options.Members) ||
 		(len(options.MembershipAuthorizations) != 0 &&
 			len(options.MembershipAuthorizations) != len(options.Members)) ||
@@ -556,7 +579,7 @@ func NewOwner(options Options) (*Owner, error) {
 			authority: authority, read: source, recovery: recovery}
 	}
 	return &Owner{
-		registry: options.Registry, host: options.Host, groups: groups, members: members,
+		registry: options.Registry, host: host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
 		authority:    options.MembershipAuthority,
 		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
