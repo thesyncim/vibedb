@@ -24,6 +24,8 @@
 //
 //	vibedb-shard serve-rf3 -manifest <path>
 //
+//	vibedb-shard bootstrap-rf3 -manifest <path>
+//
 // It serves until interrupted, then closes the listener, drains in-flight
 // connections, and releases the catalog.
 package main
@@ -64,6 +66,8 @@ func run(args []string) int {
 		return runServe(args[2:])
 	case "serve-rf3":
 		return runServeRF3(args[2:])
+	case "bootstrap-rf3":
+		return runBootstrapRF3(args[2:])
 	default:
 		usage()
 		return 2
@@ -89,6 +93,7 @@ func usage() {
 		"-distribution <name> -shard <id> -allocation-generation <n> "+
 		"-epoch <n> -routing-version <n>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard serve-rf3 -manifest <path>")
+	fmt.Fprintln(os.Stderr, "  vibedb-shard bootstrap-rf3 -manifest <path>")
 }
 
 func runInit(args []string) int {

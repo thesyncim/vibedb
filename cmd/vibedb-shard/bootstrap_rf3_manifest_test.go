@@ -1,0 +1,76 @@
+package main
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+const canonicalBootstrapRF3Manifest = `{
+  "member_manifest": "/srv/vibedb/member.vibejson",
+  "control_listener": "127.0.0.1:17700",
+  "source_node": "0102030405060708090a0b0c0d0e0f10",
+  "source_snapshot_address": "member-1.internal:17600",
+  "repository_path": "/srv/vibedb/bootstrap-artifacts",
+  "cursor_path": "/srv/vibedb/bootstrap.cursor",
+  "journal_path": "/srv/vibedb/bootstrap-journal",
+  "static_bootstrap_path": "/srv/vibedb/static-bootstrap.pb",
+  "max_artifact_bytes": 1073741824
+}`
+
+func TestParseBootstrapRF3ManifestCanonical(t *testing.T) {
+	manifest, err := parseBootstrapRF3Manifest([]byte(canonicalBootstrapRF3Manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.MemberManifest != "/srv/vibedb/member.vibejson" ||
+		manifest.ControlListener != "127.0.0.1:17700" ||
+		manifest.SourceSnapshotAddress != "member-1.internal:17600" ||
+		manifest.RepositoryPath != "/srv/vibedb/bootstrap-artifacts" ||
+		manifest.CursorPath != "/srv/vibedb/bootstrap.cursor" ||
+		manifest.JournalPath != "/srv/vibedb/bootstrap-journal" ||
+		manifest.StaticBootstrapPath != "/srv/vibedb/static-bootstrap.pb" ||
+		manifest.MaxArtifactBytes != 1<<30 || manifest.SourceNode[0] != 1 ||
+		manifest.SourceNode[15] != 0x10 {
+		t.Fatalf("manifest=%+v", manifest)
+	}
+	if _, err = parseBootstrapRF3Manifest([]byte(canonicalBootstrapRF3Manifest + " trailing")); !errors.Is(err, errInvalidBootstrapRF3Manifest) {
+		t.Fatalf("trailing error=%v", err)
+	}
+}
+
+func TestParseBootstrapRF3ManifestRejectsNoncanonicalInputs(t *testing.T) {
+	tests := map[string]string{
+		"reordered": strings.Replace(canonicalBootstrapRF3Manifest,
+			`"member_manifest": "/srv/vibedb/member.vibejson",`,
+			`"max_artifact_bytes": 1073741824,`, 1),
+		"zero artifact": strings.Replace(canonicalBootstrapRF3Manifest,
+			`"max_artifact_bytes": 1073741824`, `"max_artifact_bytes": 0`, 1),
+		"uppercase node": strings.Replace(canonicalBootstrapRF3Manifest, "0a0b", "0A0B", 1),
+		"extra": strings.Replace(canonicalBootstrapRF3Manifest,
+			`"max_artifact_bytes": 1073741824`,
+			`"max_artifact_bytes": 1073741824, "extra": 1`, 1),
+		"escaped key": strings.Replace(canonicalBootstrapRF3Manifest,
+			`"member_manifest"`, `"member_manif\u0065st"`, 1),
+	}
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseBootstrapRF3Manifest([]byte(raw)); !errors.Is(err, errInvalidBootstrapRF3Manifest) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestRunBootstrapRF3ArgumentExitClasses(t *testing.T) {
+	tests := [][]string{
+		{"vibedb-shard", "bootstrap-rf3"},
+		{"vibedb-shard", "bootstrap-rf3", "-manifest"},
+		{"vibedb-shard", "bootstrap-rf3", "-manifest", "missing", "extra"},
+	}
+	for _, args := range tests {
+		if got := run(args); got != 2 {
+			t.Fatalf("run(%q)=%d", args, got)
+		}
+	}
+}
