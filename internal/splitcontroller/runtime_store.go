@@ -36,6 +36,10 @@ const (
 	MaxTailControlBytes     = 64 << 10
 	MaxCertificateBytes     = 4 << 10
 	MaxPruneControlBytes    = 16 << 20
+	// Plan admission retains only the compact canonical PlanIntent plus fixed
+	// catalog/digest authority. The transient catalog image used to authenticate
+	// installation is deliberately not copied into every shard runtime.
+	MaxPlanAdmissionControlBytes = MaxPlanIntentBytes + 160
 )
 
 var (
@@ -54,6 +58,7 @@ const (
 	RuntimeStateTail
 	RuntimeStateCertificate
 	RuntimeStatePrune
+	RuntimeStatePlanAdmission
 )
 
 // RuntimeState is a detached recovered control record. Payload never aliases
@@ -77,7 +82,7 @@ type DurableRuntimeStore struct {
 	lockFile      *os.File
 	operation     OperationID
 	manifest      [sha256.Size]byte
-	states        [5 + autosplit.MaxSplitChildren]runtimeStoredState
+	states        [6 + autosplit.MaxSplitChildren]runtimeStoredState
 	ownsRuntime   bool
 	closed        bool
 }
@@ -350,11 +355,13 @@ func runtimeStateSlot(kind RuntimeStateKind, child uint8) (int, string, int, err
 		return 3, "certificate.state", MaxCertificateBytes, nil
 	case RuntimeStatePrune:
 		return 4, "prune.state", MaxPruneControlBytes, nil
+	case RuntimeStatePlanAdmission:
+		return 5, "plan-admission.state", MaxPlanAdmissionControlBytes, nil
 	case RuntimeStateStage:
 		if child >= autosplit.MaxSplitChildren {
 			return 0, "", 0, ErrRuntimeStore
 		}
-		return 5 + int(child), fmt.Sprintf("stage-%d.state", child), MaxTailControlBytes, nil
+		return 6 + int(child), fmt.Sprintf("stage-%d.state", child), MaxTailControlBytes, nil
 	default:
 		return 0, "", 0, ErrRuntimeStore
 	}
@@ -372,8 +379,10 @@ func runtimeStateIdentity(index int) (RuntimeStateKind, uint8) {
 		return RuntimeStateCertificate, 0
 	case 4:
 		return RuntimeStatePrune, 0
+	case 5:
+		return RuntimeStatePlanAdmission, 0
 	default:
-		return RuntimeStateStage, uint8(index - 5)
+		return RuntimeStateStage, uint8(index - 6)
 	}
 }
 
