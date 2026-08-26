@@ -4,7 +4,7 @@ VibeDB changes must preserve correctness, isolation, durability, bounded
 resource use, and format validation. Do not trade one of these contracts for a
 benchmark result.
 
-The repository targets Go 1.26 and has no tagged release.
+The repository targets Go 1.26. Contracts can change between tested commits.
 
 ## Start with a focused test
 

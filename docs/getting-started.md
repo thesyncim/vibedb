@@ -12,8 +12,7 @@ go mod init example.com/vibedb-example
 go get github.com/thesyncim/vibedb@2ebcdff1047d
 ```
 
-VibeDB currently requires Go 1.26. The repository has no tagged release. Pin a
-commit that you have tested.
+VibeDB requires Go 1.26. Use the tested revision shown above.
 
 ## 2. Add the program
 

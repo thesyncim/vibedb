@@ -118,7 +118,7 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Fresh replicated operations atomically combine coordinator begin with its local prepare, remote stage with prepare, and participant apply or abort with release. Inline and greedily packed manifests remain byte-bounded without a participant-count contract.", []Reference{
 			ref("internal/distributedtxn/replicated_codec.go", "ReplicatedOperation"), ref("internal/replicatedstate/transaction_apply.go", "planCoordinatorBeginPrepare"),
 		}},
-		Integrated: Stage{StatusYes, "The public RF3 gateway orchestrator drives fused commands through the leader-aware executor, retains exact outcome-unknown bytes, and recovers from replicated ReadIndex witnesses without consulting the legacy journal. Request replay runs before catalog pinning and reuses the first execution's generation and shard metadata instead of replanning against changed topology.", []Reference{
+		Integrated: Stage{StatusYes, "The public RF3 gateway orchestrator drives fused commands through the leader-aware executor, retains exact outcome-unknown bytes, and recovers from replicated ReadIndex witnesses without consulting the static shard transaction journal. Request replay runs before catalog pinning and reuses the first execution's generation and shard metadata instead of replanning against changed topology.", []Reference{
 			ref("gateway/replicated_transaction.go", "NewReplicatedTransactionOrchestrator"), ref("gateway/replicated_transaction_recover.go", "Recover"), ref("gateway/replicated_request_registry.go", "Replay"),
 		}},
 		Shipped: Stage{StatusYes, "vibedb-gateway lowers one exec_batch over one or more RF3 groups into strict whole-document INSERT, exact-primary-key whole-document UPDATE, and exact-primary-key DELETE relation mutations. Same-group multi-statement and multi-relation batches remain atomic. The registry key is stable authenticated node scope plus caller request ID, excluding policy generation; its digest covers exact ordered SQL, class, and typed parameter bytes without routes or catalog generation. Typed responses return transaction identity, committed, and outcome-unknown fields.", []Reference{
@@ -255,7 +255,7 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusPartial, "vibedb-gateway consumes the replicated catalog and refuses arbitrary catalog placement coordinates, while serve-rf3 can open an externally prepared fixed catalog group. No command bootstraps that group, and distributed DDL remains refused.", []Reference{
 			ref("cmd/vibedb-gateway/serve.go", "newReplicatedCatalogGateway"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Rolling schema compatibility and DDL rollback gates are absent.", []Reference{
+		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Mixed-schema rollout and DDL rollback gates are absent.", []Reference{
 			ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
 		}},
 	},
