@@ -74,6 +74,9 @@ func remoteActionTarget(plan *Plan, observed Observation, action Action) (ShardA
 		}
 		return result, nil
 	}
+	if action.Child != 0 {
+		return ShardActionTarget{}, ErrRemoteExecution
+	}
 	binding := observed.SourceState.Binding
 	result := ShardActionTarget{
 		Group: raftmember.GroupKey{
@@ -168,7 +171,8 @@ func NewStaticShardActionGrants(grants []ShardActionGrant) (*StaticShardActionGr
 		grant := &owned[index]
 		if grant.Operation == (OperationID{}) || grant.PlanDigest == ([32]byte{}) ||
 			!grant.Target.valid() || grant.Plan == nil || grant.Observer == nil || grant.Executor == nil ||
-			grant.Actions == 0 || grant.Plan.OperationID() != grant.Operation {
+			grant.Actions == 0 || grant.Actions&^uint16((1<<uint(ActionComplete))-1) != 0 ||
+			grant.Plan.OperationID() != grant.Operation {
 			return nil, ErrRemoteExecution
 		}
 	}
