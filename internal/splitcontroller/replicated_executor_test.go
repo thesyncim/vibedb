@@ -105,6 +105,57 @@ func TestExecuteReplicatedStepCrashResumeAndAdvance(t *testing.T) {
 	}
 }
 
+func TestAdmitReplicatedPlanBindsFirstObservedActionAfterRestart(t *testing.T) {
+	plan, catalog, _, _ := testPlan(t)
+	journal := &memoryReplicatedOperationJournal{unknownNext: true}
+	record, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
+	if err != nil || !record.Equal(journal.record) || journal.retries != 1 ||
+		record.Cursor != ([8]uint64{}) || record.Proof != ([32]byte{}) {
+		t.Fatalf("admit record=%+v journal=%+v err=%v", record, journal, err)
+	}
+	// A controller restart has no remembered first action. The source binds it
+	// from the coherent observation before the action is made Running.
+	observed := Observation{Catalog: catalog, SourceState: testSourceState(plan)}
+	calls := 0
+	action, err := ExecuteReplicatedStep(
+		context.Background(), journal, plan, observed,
+		func(_ context.Context, id OperationID, action Action) error {
+			calls++
+			if id != plan.OperationID() || action.Kind != ActionAwaitSourceLeader {
+				t.Fatalf("execution id=%x action=%+v", id, action)
+			}
+			return nil
+		},
+	)
+	if err != nil || calls != 1 || action.Kind != ActionAwaitSourceLeader ||
+		journal.record.State != gateway.ReplicatedOperationRunning ||
+		journal.record.Revision != 3 || journal.record.Cursor == ([8]uint64{}) ||
+		journal.record.Proof == ([32]byte{}) {
+		t.Fatalf("bound action=%+v calls=%d record=%+v err=%v", action, calls, journal.record, err)
+	}
+	resumed, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
+	if err != nil || !resumed.Equal(journal.record) {
+		t.Fatalf("resume admission record=%+v journal=%+v err=%v", resumed, journal.record, err)
+	}
+}
+
+func TestAdmitReplicatedPlanIsExactAndIdempotent(t *testing.T) {
+	plan, catalog, _, _ := testPlan(t)
+	journal := &memoryReplicatedOperationJournal{}
+	first, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
+	if err != nil || !second.Equal(first) || journal.record.Revision != 1 {
+		t.Fatalf("repeat record=%+v first=%+v err=%v", second, first, err)
+	}
+	journal.record.IntentDigest[0]++
+	if _, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan); !errors.Is(err, ErrReplicatedExecution) {
+		t.Fatalf("conflicting admission err=%v", err)
+	}
+}
+
 func TestReplicatedTerminalGCSettlesUnknownDelete(t *testing.T) {
 	record := gateway.ReplicatedOperationRecord{
 		ID: [32]byte{8}, Kind: gateway.ReplicatedOperationSplit,

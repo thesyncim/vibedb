@@ -28,6 +28,53 @@ type ReplicatedOperationJournal interface {
 // stable split OperationID and fixed action tuple are its complete retry key.
 type ReplicatedActionExecutor func(context.Context, OperationID, Action) error
 
+// AdmitReplicatedPlan publishes the immutable split intent into catalog RF3
+// without guessing its first data-plane action. The source that owns the
+// range binds Cursor and Proof from one coherent observation before execution.
+// Repeating admission for the same exact plan is idempotent; any conflicting
+// record for the operation identity fails closed.
+func AdmitReplicatedPlan(
+	ctx context.Context,
+	journal ReplicatedOperationJournal,
+	catalog *gateway.Snapshot,
+	plan *Plan,
+) (gateway.ReplicatedOperationRecord, error) {
+	if ctx == nil || journal == nil || catalog == nil || plan == nil ||
+		catalog.Generation() != plan.current {
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedExecution
+	}
+	intent, err := AppendPlanIntent(nil, catalog, plan)
+	if err != nil {
+		return gateway.ReplicatedOperationRecord{}, errors.Join(ErrReplicatedExecution, err)
+	}
+	record := gateway.ReplicatedOperationRecord{
+		ID: [32]byte(plan.OperationID()), Kind: gateway.ReplicatedOperationSplit,
+		State: gateway.ReplicatedOperationPlanned, Revision: 1,
+		CatalogGeneration: catalog.Generation(), IntentDigest: sha256.Sum256(intent),
+		Intent: intent,
+	}
+	existing, readErr := journal.ReadOperation(ctx, record.ID)
+	switch {
+	case errors.Is(readErr, gateway.ErrReplicatedOperationMissing):
+		if err := settleReplicatedOperationSubmit(ctx, journal, record); err != nil {
+			return gateway.ReplicatedOperationRecord{}, err
+		}
+		return record, nil
+	case readErr != nil:
+		return gateway.ReplicatedOperationRecord{}, readErr
+	case existing.ID == record.ID && existing.Kind == record.Kind &&
+		existing.Revision >= record.Revision &&
+		existing.CatalogGeneration >= record.CatalogGeneration &&
+		existing.CatalogGeneration <= record.CatalogGeneration+1 &&
+		existing.IntentDigest == record.IntentDigest && bytes.Equal(existing.Intent, record.Intent) &&
+		existing.State >= gateway.ReplicatedOperationPlanned &&
+		existing.State <= gateway.ReplicatedOperationComplete:
+		return existing, nil
+	default:
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedExecution
+	}
+}
+
 // ExecuteReplicatedStep records intent in the catalog RF3 group before invoking
 // one reconciled action. On restart, a Running record is re-executed only when
 // observation still requests the same action; when durable observation has
@@ -78,7 +125,9 @@ func ExecuteReplicatedStep(
 		record.State > gateway.ReplicatedOperationComplete:
 		return Action{}, ErrReplicatedExecution
 	case record.Cursor != wantCursor || record.Proof != wantProof:
-		if record.State != gateway.ReplicatedOperationRunning {
+		unbound := record.Cursor == ([8]uint64{}) && record.Proof == ([32]byte{})
+		if record.State != gateway.ReplicatedOperationRunning &&
+			!(record.State == gateway.ReplicatedOperationPlanned && unbound) {
 			return Action{}, ErrReplicatedExecution
 		}
 		next := record
