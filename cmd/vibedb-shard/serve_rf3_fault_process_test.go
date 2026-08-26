@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -211,6 +210,7 @@ type rf3FaultFixture struct {
 	nodes                [rf3CommandMembers]rafttransport.NodeID
 	peerAddresses        [rf3CommandMembers]string
 	nativeAddresses      [rf3CommandMembers]string
+	snapshotAddresses    [rf3CommandMembers]string
 	controlAddresses     [rf3CommandMembers]string
 	credentials          []rf3testfixture.Credential
 	roots                string
@@ -219,7 +219,7 @@ type rf3FaultFixture struct {
 	manifestPaths        [rf3CommandMembers]string
 	walPaths             [rf3CommandMembers]string
 	children             [rf3CommandMembers]*rf3CommandChild
-	listeners            [rf3CommandMembers][3]*net.TCPListener
+	listeners            [rf3CommandMembers][4]*net.TCPListener
 	walAllocatedBaseline int64
 }
 
@@ -227,7 +227,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 	t.Helper()
 	fixture := &rf3FaultFixture{root: t.TempDir(), group: rf3CommandGroup(), nodes: rf3CommandNodes(), authority: rf3CommandAuthority()}
 	for member := 0; member < rf3CommandMembers; member++ {
-		for lane := 0; lane < 3; lane++ {
+		for lane := 0; lane < 4; lane++ {
 			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
 			if err != nil {
 				t.Fatal(err)
@@ -237,6 +237,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		fixture.peerAddresses[member] = fixture.listeners[member][0].Addr().String()
 		fixture.controlAddresses[member] = fixture.listeners[member][1].Addr().String()
 		fixture.nativeAddresses[member] = fixture.listeners[member][2].Addr().String()
+		fixture.snapshotAddresses[member] = fixture.listeners[member][3].Addr().String()
 	}
 	credentials, roots, err := rf3testfixture.WriteCredentials(fixture.root, rf3CommandIdentityOID,
 		rafttransport.TrustDomain{ClusterID: fixture.group.ClusterID, ClusterIncarnation: fixture.group.ClusterIncarnation}, fixture.nodes[:])
@@ -290,7 +291,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		fixture.manifestPaths[member] = filepath.Join(memberRoot, "serve-rf3.json")
 		document := rf3CommandManifestDocument(prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
 			fixture.peerAddresses[member], fixture.nativeAddresses[member],
-			"127.0.0.1:"+strconv.Itoa(18601+member), fixture.controlAddresses[member], credentials[member], roots,
+			fixture.snapshotAddresses[member], fixture.controlAddresses[member], credentials[member], roots,
 			policyPath, walOptions, fixture.nodes, fixture.peerAddresses)
 		if err = os.WriteFile(fixture.manifestPaths[member], document, 0o600); err != nil {
 			t.Fatal(err)
@@ -326,7 +327,7 @@ func (fixture *rf3FaultFixture) start(t testing.TB, member int) {
 	diagnostic := &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
 	command := exec.Command(executable, "-test.run=^TestServeRF3CommandProcessHelper$", "-test.v")
 	command.Env = append(os.Environ(), rf3CommandHelperEnvironment+"=1", rf3CommandManifestEnvironment+"="+fixture.manifestPaths[member])
-	files := make([]*os.File, 3)
+	files := make([]*os.File, 4)
 	for lane := range files {
 		files[lane], err = fixture.listeners[member][lane].File()
 		if err != nil {
@@ -368,7 +369,10 @@ func (fixture *rf3FaultFixture) kill(t testing.TB, member int) {
 
 func (fixture *rf3FaultFixture) restart(t testing.TB, member int) {
 	t.Helper()
-	addresses := [3]string{fixture.peerAddresses[member], fixture.controlAddresses[member], fixture.nativeAddresses[member]}
+	addresses := [4]string{
+		fixture.peerAddresses[member], fixture.controlAddresses[member],
+		fixture.nativeAddresses[member], fixture.snapshotAddresses[member],
+	}
 	for lane, address := range addresses {
 		listener, err := net.ListenTCP("tcp", mustRF3FaultTCPAddress(t, address))
 		if err != nil {

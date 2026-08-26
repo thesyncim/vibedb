@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/asn1"
 	"errors"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,6 +28,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -40,6 +41,7 @@ const (
 	rf3CommandPeerListenerFD      = 3
 	rf3CommandControlListenerFD   = 4
 	rf3CommandNativeListenerFD    = 5
+	rf3CommandSnapshotListenerFD  = 6
 	rf3CommandMembers             = 3
 	rf3CommandDiagnosticBytes     = 64 << 10
 )
@@ -92,8 +94,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	root := t.TempDir()
 	peerListeners := make([]*net.TCPListener, rf3CommandMembers)
 	nativeListeners := make([]*net.TCPListener, rf3CommandMembers)
+	snapshotListeners := make([]*net.TCPListener, rf3CommandMembers)
 	controlListeners := make([]*net.TCPListener, rf3CommandMembers)
-	var peerAddresses, nativeAddresses, controlAddresses [rf3CommandMembers]string
+	var peerAddresses, nativeAddresses, snapshotAddresses, controlAddresses [rf3CommandMembers]string
 	for index := 0; index < rf3CommandMembers; index++ {
 		var err error
 		peerListeners[index], err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -104,12 +107,17 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		snapshotListeners[index], err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+		if err != nil {
+			t.Fatal(err)
+		}
 		controlListeners[index], err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
 		if err != nil {
 			t.Fatal(err)
 		}
 		peerAddresses[index] = peerListeners[index].Addr().String()
 		nativeAddresses[index] = nativeListeners[index].Addr().String()
+		snapshotAddresses[index] = snapshotListeners[index].Addr().String()
 		controlAddresses[index] = controlListeners[index].Addr().String()
 	}
 	defer func() {
@@ -120,6 +128,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			if nativeListeners[index] != nil {
 				_ = nativeListeners[index].Close()
 			}
+			if snapshotListeners[index] != nil {
+				_ = snapshotListeners[index].Close()
+			}
 			if controlListeners[index] != nil {
 				_ = controlListeners[index].Close()
 			}
@@ -128,18 +139,21 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 
 	nodes := rf3CommandNodes()
 	group := rf3CommandGroup()
+	targetNode := rafttransport.NodeID{0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+		0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80}
+	credentialNodes := append(append([]rafttransport.NodeID(nil), nodes[:]...), targetNode)
 	credentials, roots, err := rf3testfixture.WriteCredentials(
 		root, rf3CommandIdentityOID,
 		rafttransport.TrustDomain{
 			ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
 		},
-		nodes[:],
+		credentialNodes,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	policyPath := filepath.Join(root, "authorization-policy.vibejson")
-	if err := os.WriteFile(policyPath, rf3CommandPolicy(nodes), 0o600); err != nil {
+	if err := os.WriteFile(policyPath, rf3CommandPolicyWithTarget(nodes, targetNode), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	keyMaterial := make([]byte, 32)
@@ -151,6 +165,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
 	}
 	authority := rf3CommandAuthority()
+	targetStore := [16]byte{0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
+		0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90}
+	const targetIncarnation = uint64(9)
 	manifestPaths := make([]string, rf3CommandMembers)
 	for index := 0; index < rf3CommandMembers; index++ {
 		memberRoot := filepath.Join(root, fmt.Sprintf("member-%d", index+1))
@@ -202,13 +219,45 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		manifestPaths[index] = filepath.Join(memberRoot, "serve-rf3.json")
 		document := rf3CommandManifestDocument(
 			prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
-			peerAddresses[index], nativeAddresses[index], "127.0.0.1:"+strconv.Itoa(17601+index),
+			peerAddresses[index], nativeAddresses[index], snapshotAddresses[index],
 			controlAddresses[index], credentials[index], roots,
 			policyPath, walOptions, nodes, peerAddresses,
+		)
+		document = rf3CommandEnrollTarget(
+			document, targetNode, targetStore, targetIncarnation,
+			"127.0.0.1:27400", "127.0.0.1:27500",
+			"127.0.0.1:27600", "127.0.0.1:27700",
 		)
 		if err := os.WriteFile(manifestPaths[index], document, 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	payload := bytes.Repeat([]byte("shipped-snapshot-source"), 257)
+	descriptor := snapshottransfer.Descriptor{
+		Group: group, SourceMember: 1, TargetMember: 4,
+		TargetStore: targetStore, TargetIncarnation: targetIncarnation,
+		SchemaGeneration: authority.SchemaGeneration, ReplicaSetVersion: 1,
+		SnapshotIndex: 1, SnapshotTerm: 1,
+		Lineage: [32]byte{1}, ArtifactHash: sha256.Sum256(payload),
+		ArtifactBytes: uint64(len(payload)), ChunkBytes: snapshottransfer.MinChunkBytes,
+	}
+	sourceRepository, err := snapshottransfer.OpenRepository(
+		filepath.Join(root, "member-1", "source-artifacts"),
+		snapshottransfer.Limits{MaxArtifacts: 8, MaxArtifactBytes: 1 << 30, MaxDiskBytes: 4 << 30},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for offset := 0; offset < len(payload); {
+		end := min(offset+int(descriptor.ChunkBytes), len(payload))
+		chunk := payload[offset:end]
+		if _, _, err = sourceRepository.Append(descriptor, uint64(offset), chunk, sha256.Sum256(chunk)); err != nil {
+			t.Fatal(err)
+		}
+		offset = end
+	}
+	if err = sourceRepository.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	executable, err := os.Executable()
@@ -233,6 +282,13 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			_ = nativeFile.Close()
 			t.Fatal(err)
 		}
+		snapshotFile, err := snapshotListeners[index].File()
+		if err != nil {
+			_ = peerFile.Close()
+			_ = nativeFile.Close()
+			_ = controlFile.Close()
+			t.Fatal(err)
+		}
 		diagnostic := &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
 		command := exec.Command(
 			executable, "-test.run=^TestServeRF3CommandProcessHelper$", "-test.v",
@@ -241,21 +297,24 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			rf3CommandHelperEnvironment+"=1",
 			rf3CommandManifestEnvironment+"="+manifestPaths[index],
 		)
-		command.ExtraFiles = []*os.File{peerFile, controlFile, nativeFile}
+		command.ExtraFiles = []*os.File{peerFile, controlFile, nativeFile, snapshotFile}
 		command.Stdout, command.Stderr = diagnostic, diagnostic
 		if err := command.Start(); err != nil {
 			_ = peerFile.Close()
 			_ = nativeFile.Close()
 			_ = controlFile.Close()
+			_ = snapshotFile.Close()
 			t.Fatal(err)
 		}
 		_ = peerFile.Close()
 		_ = nativeFile.Close()
 		_ = controlFile.Close()
+		_ = snapshotFile.Close()
 		_ = peerListeners[index].Close()
 		_ = nativeListeners[index].Close()
 		_ = controlListeners[index].Close()
-		peerListeners[index], nativeListeners[index], controlListeners[index] = nil, nil, nil
+		_ = snapshotListeners[index].Close()
+		peerListeners[index], nativeListeners[index], snapshotListeners[index], controlListeners[index] = nil, nil, nil, nil
 		child := &rf3CommandChild{
 			member: uint64(index + 1), command: command, exited: make(chan struct{}),
 			diagnostic: diagnostic,
@@ -287,6 +346,45 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		t, nativeAddresses, nodes, clientProfiles, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authority.ActivePolicyGeneration,
 	)
+	targetProfile, err := servicetls.LoadProfile(
+		credentials[3].Certificate, credentials[3].Key, roots,
+		"1.3.6.1.4.1.32473.1.1", time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRepository, err := snapshottransfer.OpenRepository(
+		filepath.Join(root, "target-transfer"),
+		snapshottransfer.Limits{MaxArtifacts: 1, MaxArtifactBytes: 1 << 30, MaxDiskBytes: 2 << 30},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetRepository.Close()
+	networkDeadline := func() time.Time { return time.Now().Add(10 * time.Second) }
+	receiver := snapshottransfer.Receiver{
+		Repository: targetRepository,
+		Opener: rafttransport.TLSSnapshotStreamOpener{
+			TLS: targetProfile,
+			Open: func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
+				if node != nodes[0] {
+					return nil, rafttransport.ErrNodeNotFound
+				}
+				return (&net.Dialer{}).DialContext(ctx, "tcp", snapshotAddresses[0])
+			},
+			HandshakeDeadline: networkDeadline,
+		},
+		ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+		Workspace: make([]byte, descriptor.ChunkBytes),
+	}
+	transferCtx, cancelTransfer := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelTransfer()
+	if err = receiver.Receive(transferCtx, nodes[0], descriptor); err != nil {
+		t.Fatalf("shipped source snapshot transfer: %v", err)
+	}
+	if _, err = targetRepository.Manifest(descriptor); err != nil {
+		t.Fatalf("target did not publish transferred artifact: %v", err)
+	}
 
 	for _, child := range children {
 		if err := child.command.Process.Signal(syscall.SIGTERM); err != nil {
@@ -331,14 +429,24 @@ func TestServeRF3CommandProcessHelper(t *testing.T) {
 		_ = control.Close()
 		t.Fatal(err)
 	}
-	listeners := []net.Listener{peer, control, native}
-	next := 0
+	snapshot, err := inheritedRF3CommandListener(rf3CommandSnapshotListenerFD, "rf3-command-snapshot")
+	if err != nil {
+		_ = peer.Close()
+		_ = control.Close()
+		_ = native.Close()
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	listeners := map[string]net.Listener{
+		peer.Addr().String(): peer, control.Addr().String(): control,
+		native.Addr().String(): native, snapshot.Addr().String(): snapshot,
+	}
 	listen := func(network, address string) (net.Listener, error) {
-		if network != "tcp" || next >= len(listeners) || listeners[next].Addr().String() != address {
+		listener, ok := listeners[address]
+		if network != "tcp" || !ok {
 			return nil, fmt.Errorf("unexpected inherited listener %s %s", network, address)
 		}
-		listener := listeners[next]
-		next++
+		delete(listeners, address)
 		return listener, nil
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -553,6 +661,33 @@ func rf3CommandPolicy(nodes [rf3CommandMembers]rafttransport.NodeID) []byte {
 		`{"generation":5,"principals":[{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]}]}`,
 		nodes[0], nodes[1], nodes[2],
 	))
+}
+
+func rf3CommandPolicyWithTarget(
+	nodes [rf3CommandMembers]rafttransport.NodeID,
+	target rafttransport.NodeID,
+) []byte {
+	return []byte(fmt.Sprintf(
+		`{"generation":5,"principals":[{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]}]}`,
+		nodes[0], nodes[1], nodes[2], target,
+	))
+}
+
+func rf3CommandEnrollTarget(
+	document []byte,
+	node rafttransport.NodeID,
+	store [16]byte,
+	incarnation uint64,
+	peer, native, snapshot, control string,
+) []byte {
+	if len(document) == 0 || document[len(document)-1] != '}' {
+		panic("invalid RF3 command document")
+	}
+	document = document[:len(document)-1]
+	return fmt.Appendf(document,
+		`,"enrolled_target":{"member_id":4,"node_id":"%x","store_id":"%x","node_incarnation":%d,"peer_address":%q,"native_address":%q,"snapshot_address":%q,"control_address":%q}}`,
+		node, store, incarnation, peer, native, snapshot, control,
+	)
 }
 
 func rf3CommandNodes() (nodes [rf3CommandMembers]rafttransport.NodeID) {
