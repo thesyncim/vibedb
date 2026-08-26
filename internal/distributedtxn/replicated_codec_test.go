@@ -117,11 +117,11 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 			t.Fatalf("case %d did not borrow exact bytes", i)
 		}
 		if command.Operation == ReplicatedStageManifestCoordinator {
-			coordinator, pageZero, splitErr := OpenReplicatedManifestStart(view.Payload)
+			coordinator, sequence, splitErr := OpenReplicatedManifestStart(view.Payload)
 			if splitErr != nil || !bytes.Equal(coordinator, manifestCoordinator) ||
-				!bytes.Equal(pageZero, pages[0]) ||
+				sequence.Count() != 1 || !bytes.Equal(sequence.Bytes(), pages[0]) ||
 				&coordinator[0] != &view.Payload[0] ||
-				&pageZero[0] != &view.Payload[ReplicatedManifestCoordinatorRecordBytes] {
+				&sequence.Bytes()[0] != &view.Payload[ReplicatedManifestCoordinatorRecordBytes] {
 				t.Fatalf("manifest-start borrowed split: %v", splitErr)
 			}
 		}
@@ -334,5 +334,240 @@ func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 				t.Fatalf("validation allocs = %v", got)
 			}
 		})
+	}
+}
+
+func fusedParticipantStage(operation ReplicatedOperation, ordinal uint32, mutation Digest) ParticipantStage {
+	group, incarnation := testID(), testID()
+	group[0], incarnation[0] = 31, 47
+	return ParticipantStage{
+		CoordinatorGroup: group, CoordinatorShardIncarnation: incarnation,
+		CoordinatorAllocation: 19, BucketBits: 8,
+		IntentScopes:   []IntentScope{{Start: 1, End: 4}, {Start: 8, End: 11}},
+		MutationDigest: mutation, ParticipantOrdinal: ordinal,
+	}
+}
+
+func appendManifestPages(dst []byte, pages [][]byte) []byte {
+	for i := range pages {
+		dst = append(dst, pages[i]...)
+	}
+	return dst
+}
+
+func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
+	if ReplicatedBeginPrepareCoordinator <= ReplicatedReleaseParticipant ||
+		ReplicatedBeginPrepareManifestCoordinator <= ReplicatedReleaseParticipant ||
+		ReplicatedAppendManifestSegments <= ReplicatedReleaseParticipant ||
+		ReplicatedStagePrepareParticipant <= ReplicatedReleaseParticipant ||
+		ReplicatedApplyReleaseParticipant <= ReplicatedReleaseParticipant ||
+		ReplicatedAbortReleaseParticipant <= ReplicatedReleaseParticipant {
+		t.Fatal("fused operation aliases an old split operation")
+	}
+	participant := ReplicatedCommand{
+		Role: ReplicatedRoleParticipant, Operation: ReplicatedStagePrepareParticipant,
+		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		Participant: fusedParticipantStage(
+			ReplicatedStagePrepareParticipant, 4096, digest("fused-participant"),
+		),
+	}
+	encoded, err := AppendReplicatedCommand(nil, participant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenReplicatedCommand(encoded)
+	if err != nil || view.Operation != ReplicatedStagePrepareParticipant ||
+		view.Participant.ParticipantOrdinal != 4096 {
+		t.Fatalf("fused participant = %+v err=%v", view.ReplicatedCommand, err)
+	}
+	for _, operation := range []ReplicatedOperation{
+		ReplicatedApplyReleaseParticipant, ReplicatedAbortReleaseParticipant,
+	} {
+		command := ReplicatedCommand{
+			Role: ReplicatedRoleParticipant, Operation: operation, ID: testID(),
+			ExpectedRevision: 2, PayloadKind: ReplicatedPayloadNone,
+		}
+		if _, err := AppendReplicatedCommand(nil, command); err != nil {
+			t.Fatalf("operation %d: %v", operation, err)
+		}
+	}
+	old := participant
+	old.Operation = ReplicatedStageParticipant
+	if _, err := AppendReplicatedCommand(nil, old); err == nil {
+		t.Fatal("old stage accepted fused participant ordinal")
+	}
+}
+
+func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
+	payload := replicatedTestCoordinator(t)
+	stage := fusedParticipantStage(
+		ReplicatedBeginPrepareCoordinator, 0, digest("mutation"),
+	)
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedBeginPrepareCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
+		Payload: payload, Participant: stage,
+	}
+	encoded, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateReplicatedCommand(encoded); err != nil {
+		t.Fatal(err)
+	}
+	want := ParticipantRef{
+		Distribution: []byte("docs"), Shard: []byte("-80"),
+		RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
+		MutationDigest: digest("mutation"), State: ParticipantStaged,
+	}
+	present, matches, err := ReplicatedCoordinatorBindsParticipant(payload, 0, want)
+	if err != nil || !present || !matches {
+		t.Fatalf("inline bind = %t/%t err=%v", present, matches, err)
+	}
+	command.Participant.MutationDigest[0] ^= 1
+	if _, err := AppendReplicatedCommand(nil, command); err == nil {
+		t.Fatal("inline begin accepted mismatched participant digest")
+	}
+}
+
+func TestManifestSegmentSequenceFusedPackingAndOrdinalBinding(t *testing.T) {
+	descriptor, pages := buildManifest(t, 17_000)
+	if len(pages) <= MaxManifestSegmentsPerCommand {
+		t.Fatalf("manifest pages=%d, want >%d", len(pages), MaxManifestSegmentsPerCommand)
+	}
+	initialBytes := appendManifestPages(nil, pages[:MaxManifestSegmentsPerCommand])
+	initial, err := OpenManifestSegmentSequence(initialBytes)
+	if err != nil || initial.Count() != MaxManifestSegmentsPerCommand ||
+		initial.FirstIndex() != 0 || initial.FirstParticipant() != 0 ||
+		initial.EncodedBytes() != uint64(len(initialBytes)) {
+		t.Fatalf("initial sequence = %+v err=%v", initial, err)
+	}
+	var iterated int
+	iterator := initial.Iterator()
+	for iterator.Next() {
+		segment := iterator.Segment()
+		if segment.Index != uint32(iterated) || !bytes.Equal(segment.Raw, pages[iterated]) ||
+			cap(segment.Raw) != len(segment.Raw) {
+			t.Fatalf("segment %d = %+v", iterated, segment)
+		}
+		iterated++
+	}
+	if iterated != MaxManifestSegmentsPerCommand {
+		t.Fatalf("iterated=%d", iterated)
+	}
+
+	coordinator, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 100, Manifest: descriptor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinal := uint32(initial.ParticipantCount() - 1)
+	want := manifestParticipant(uint64(ordinal))
+	command := ReplicatedCommand{
+		Role:      ReplicatedRoleCoordinator,
+		Operation: ReplicatedBeginPrepareManifestCoordinator,
+		ID:        testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
+		Payload: appendManifestPages(coordinator, pages[:MaxManifestSegmentsPerCommand]),
+		Participant: fusedParticipantStage(
+			ReplicatedBeginPrepareManifestCoordinator, ordinal, want.MutationDigest,
+		),
+	}
+	encoded, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateReplicatedCommand(encoded); err != nil {
+		t.Fatal(err)
+	}
+	present, matches, err := ReplicatedCoordinatorBindsParticipant(
+		command.Payload, uint64(ordinal), want,
+	)
+	if err != nil || !present || !matches {
+		t.Fatalf("manifest bind = %t/%t err=%v", present, matches, err)
+	}
+	present, matches, err = ReplicatedCoordinatorBindsParticipant(
+		command.Payload, initial.ParticipantCount(), manifestParticipant(initial.ParticipantCount()),
+	)
+	if err != nil || present || matches {
+		t.Fatalf("deferred bind = %t/%t err=%v", present, matches, err)
+	}
+
+	laterBytes := appendManifestPages(nil, pages[MaxManifestSegmentsPerCommand:])
+	later := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedAppendManifestSegments,
+		ID: testID(), ExpectedRevision: 1,
+		PayloadKind: ReplicatedPayloadManifestSegments, Payload: laterBytes,
+	}
+	if _, err := AppendReplicatedCommand(nil, later); err != nil {
+		t.Fatal(err)
+	}
+	tooMany := appendManifestPages(nil, pages[:MaxManifestSegmentsPerCommand+1])
+	if _, err := OpenManifestSegmentSequence(tooMany); err == nil {
+		t.Fatal("accepted sixteen manifest pages")
+	}
+	nonMaximal := command
+	nonMaximal.Payload = appendManifestPages(bytes.Clone(coordinator), pages[:1])
+	if _, err := AppendReplicatedCommand(nil, nonMaximal); err == nil {
+		t.Fatal("fused begin accepted non-maximal initial pack")
+	}
+}
+
+func TestManifestSegmentSequenceStrictCorruptionAndZeroAllocation(t *testing.T) {
+	_, pages := buildManifest(t, 4097)
+	raw := appendManifestPages(nil, pages)
+	sequence, err := OpenManifestSegmentSequence(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		opened, openErr := OpenManifestSegmentSequence(raw)
+		if openErr != nil || opened.Count() != len(pages) {
+			panic(openErr)
+		}
+	}); got != 0 {
+		t.Fatalf("sequence open allocations=%v", got)
+	}
+	first := sequence.Iterator()
+	if !first.Next() {
+		t.Fatal("missing first page")
+	}
+	page := first.Segment()
+	want := manifestParticipant(page.FirstParticipant)
+	present, matches, err := ManifestSegmentMatchesParticipant(
+		page.Raw, page.FirstParticipant, want,
+	)
+	if err != nil || !present || !matches {
+		t.Fatalf("page match=%t/%t err=%v", present, matches, err)
+	}
+	present, matches, err = ManifestSegmentMatchesParticipant(
+		page.Raw, page.FirstParticipant+uint64(page.ParticipantCount), want,
+	)
+	if err != nil || present || matches {
+		t.Fatalf("outside match=%t/%t err=%v", present, matches, err)
+	}
+
+	bad := bytes.Clone(raw)
+	bad[len(pages[0])+8] ^= 1
+	binary.LittleEndian.PutUint32(
+		bad[len(pages[0])+len(pages[1])-4:len(pages[0])+len(pages[1])],
+		crc32.Checksum(bad[len(pages[0]):len(pages[0])+len(pages[1])-4], castagnoli),
+	)
+	if _, err := OpenManifestSegmentSequence(bad); err == nil {
+		t.Fatal("accepted discontinuous page index")
+	}
+	if _, err := OpenManifestSegmentSequence(raw[:len(raw)-1]); err == nil {
+		t.Fatal("accepted truncated page sequence")
+	}
+	if _, err := OpenManifestSegmentSequence(append(bytes.Clone(raw), 0)); err == nil {
+		t.Fatal("accepted trailing sequence byte")
+	}
+}
+
+func TestFusedReplicatedCommandExactMaximum(t *testing.T) {
+	const want = 985336
+	if MaxReplicatedCommandBytes != want {
+		t.Fatalf("max replicated command=%d want=%d", MaxReplicatedCommandBytes, want)
 	}
 }
