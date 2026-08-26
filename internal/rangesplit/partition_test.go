@@ -268,6 +268,7 @@ func testSourceState(plan *autosplit.SplitPlan) replicatedstate.State {
 			AllocationGeneration: uint64(plan.Source.AllocationGeneration),
 			OwnershipEpoch:       uint64(plan.Source.OwnershipEpoch),
 			RoutingVersion:       uint64(plan.Source.RoutingVersion), RouteGeneration: 19,
+			OwnedRange: plan.Source.Range,
 		},
 		Applied: 41, LastTerm: 7, LastEntryDigest: [32]byte{3},
 		DataChainDigest: [32]byte{1}, SnapshotBaseDigest: [32]byte{2},

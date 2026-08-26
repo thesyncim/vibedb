@@ -32,6 +32,7 @@ type ReplicatedChildStage struct {
 	base     ReplicatedShardStoreIdentity
 	options  ReplicatedApplyOptions
 	stage    *rangesplit.ChildStage
+	owned    distribution.KeyRange
 	closed   bool
 }
 
@@ -143,7 +144,7 @@ func (d *Database) OpenReplicatedChildStage(
 	}
 	claim := &ReplicatedChildStage{
 		owner: connector, database: core, table: t, base: expected,
-		options: applyOptions, stage: stage,
+		options: applyOptions, stage: stage, owned: artifact.Descriptor.Range,
 	}
 	core.replicatedChildStageClaim = claim
 	connector.exclusive = true
@@ -272,7 +273,7 @@ func (s *ReplicatedChildStage) activate(
 		return ReplicatedChildActivation{}, ErrReplicatedChildStageClosed
 	}
 	if err := s.stage.CheckActivationCoordinates(
-		certificate, replicatedStateBinding(s.base),
+		certificate, replicatedStateBindingAt(s.base, s.owned),
 	); err != nil {
 		return ReplicatedChildActivation{}, errors.Join(
 			ErrReplicatedChildStageProof, err,
@@ -343,7 +344,7 @@ func (s *ReplicatedChildStage) activate(
 	prepared, err := s.stage.PrepareReplicatedChild(
 		certificate,
 		rangesplit.ChildActivationTarget{
-			Binding: replicatedStateBinding(s.base), StaticBootstrap: staticBootstrap,
+			Binding: replicatedStateBindingAt(s.base, s.owned), StaticBootstrap: staticBootstrap,
 			System: replicatedstate.CollectionTarget{
 				Collection: core.replicatedApplyCollection,
 				Validation: replicatedstate.ValidationOpaqueBinary,

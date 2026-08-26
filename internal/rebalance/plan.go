@@ -544,6 +544,7 @@ func (p *Plan) OwnershipCommand(replicaSetVersion uint64) ([]byte, error) {
 		ToOwnershipEpoch:  p.baseState.Binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  p.baseState.Binding.RoutingVersion + 1,
 		ToRouteGeneration: p.baseState.Binding.RouteGeneration + 1,
+		ToOwnedRange:      p.baseState.Binding.OwnedRange,
 	})
 }
 

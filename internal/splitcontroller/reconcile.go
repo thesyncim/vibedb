@@ -614,7 +614,7 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 func (p *Plan) sourceBindingInitial(binding replicatedstate.Binding) bool {
 	return p != nil && binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
 		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
-		binding.RouteGeneration == p.current
+		binding.RouteGeneration == p.current && binding.OwnedRange == p.source.Range
 }
 
 func (p *Plan) sourceBindingSealed(binding replicatedstate.Binding) bool {
@@ -624,7 +624,7 @@ func (p *Plan) sourceBindingSealed(binding replicatedstate.Binding) bool {
 	retained := p.children[p.retained]
 	return binding.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
 		binding.RoutingVersion == uint64(p.targetManifest.Version()) &&
-		binding.RouteGeneration == p.next
+		binding.RouteGeneration == p.next && binding.OwnedRange == retained.Range
 }
 
 func (p *Plan) sourceStateMatchesCut(state replicatedstate.State, tail rangesplit.TailCursor) bool {
@@ -647,6 +647,7 @@ func (p *Plan) sourceStateAfterCutover(
 	if state.Binding.OwnershipEpoch != coordinates.OwnershipEpoch ||
 		state.Binding.RoutingVersion != coordinates.RoutingVersion ||
 		state.Binding.RouteGeneration != coordinates.RouteGeneration ||
+		state.Binding.OwnedRange != p.children[p.retained].Range ||
 		state.SnapshotBaseDigest != cut.BaseDigest || state.Applied < cut.Applied {
 		return false
 	}
@@ -664,6 +665,7 @@ func (p *Plan) sourceStateAfterPublication(
 	if state.Binding.OwnershipEpoch != coordinates.OwnershipEpoch ||
 		state.Binding.RoutingVersion != coordinates.RoutingVersion ||
 		state.Binding.RouteGeneration != coordinates.RouteGeneration ||
+		state.Binding.OwnedRange != p.children[p.retained].Range ||
 		state.SnapshotBaseDigest != cut.BaseDigest || state.Applied < cut.Applied {
 		return false
 	}

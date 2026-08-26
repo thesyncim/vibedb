@@ -137,7 +137,8 @@ func (s *ChildStage) activationBindingMatches(
 		binding.AllocationGeneration == uint64(child.AllocationGeneration) &&
 		binding.OwnershipEpoch == uint64(child.OwnershipEpoch) &&
 		binding.RoutingVersion == uint64(s.partitioner.target) &&
-		binding.RouteGeneration == certificate.coordinates.RouteGeneration
+		binding.RouteGeneration == certificate.coordinates.RouteGeneration &&
+		binding.OwnedRange == child.Range
 }
 
 func childActivationEntryDigest(
@@ -164,7 +165,7 @@ func writeActivationBinding(h hash.Hash, binding replicatedstate.Binding, child 
 	_, _ = h.Write(binding.GroupID[:])
 	writeBytes(h, []byte(binding.Distribution))
 	writeBytes(h, []byte(binding.Shard))
-	var fixed [81]byte
+	var fixed [82]byte
 	fixed[0] = child
 	values := [...]uint64{
 		binding.TopologyRecoveryEpoch, binding.AllocationGeneration,
@@ -175,5 +176,10 @@ func writeActivationBinding(h hash.Hash, binding replicatedstate.Binding, child 
 	for index, value := range values {
 		binary.LittleEndian.PutUint64(fixed[1+index*8:9+index*8], value)
 	}
-	_, _ = h.Write(fixed[:65])
+	copy(fixed[65:73], binding.OwnedRange.Start[:])
+	copy(fixed[73:81], binding.OwnedRange.End.Point[:])
+	if binding.OwnedRange.End.Max {
+		fixed[81] = 1
+	}
+	_, _ = h.Write(fixed[:])
 }

@@ -2,9 +2,11 @@ package replicatedstate
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -17,6 +19,7 @@ func testOwnershipTransition(binding Binding, replicaSetVersion uint64) Ownershi
 		ToOwnershipEpoch:  binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  binding.RoutingVersion + 1,
 		ToRouteGeneration: binding.RouteGeneration + 1,
+		ToOwnedRange:      binding.OwnedRange,
 	}
 }
 
@@ -38,6 +41,10 @@ func TestOwnershipTransitionCodecRoundTripAndStrictness(t *testing.T) {
 		!bytes.Equal(view.Shard, []byte(transition.From.Shard)) ||
 		view.ExpectedReplicaSetVersion != 7 || view.SourceMember != 1 || view.TargetMember != 2 ||
 		view.ToOwnershipEpoch != transition.ToOwnershipEpoch ||
+		view.ToRoutingVersion != transition.ToRoutingVersion ||
+		view.ToRouteGeneration != transition.ToRouteGeneration ||
+		view.FromOwnedRange != transition.From.OwnedRange ||
+		view.ToOwnedRange != transition.ToOwnedRange ||
 		!bytes.Equal(view.Bytes(), encoded) {
 		t.Fatalf("decoded ownership transition = %+v", view)
 	}
@@ -45,6 +52,20 @@ func TestOwnershipTransitionCodecRoundTripAndStrictness(t *testing.T) {
 	corrupt[120] ^= 1
 	if _, err := OpenOwnershipTransition(corrupt); !errors.Is(err, ErrOwnershipTransition) {
 		t.Fatalf("corrupt transition err=%v, want ErrOwnershipTransition", err)
+	}
+	legacy := bytes.Clone(encoded)
+	binary.LittleEndian.PutUint16(legacy[8:10], 1)
+	sealRecord(legacy, ownershipTransitionChecksumDomain)
+	if _, err := OpenOwnershipTransition(legacy); !errors.Is(err, ErrOwnershipTransition) {
+		t.Fatalf("legacy range-less transition err=%v, want ErrOwnershipTransition", err)
+	}
+	expanded := transition
+	expanded.From.OwnedRange.End = distribution.KeyspaceEnd{
+		Point: distribution.KeyspacePoint{0x80},
+	}
+	expanded.ToOwnedRange = distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
+	if _, err := AppendOwnershipTransition(nil, expanded); !errors.Is(err, ErrOwnershipTransition) {
+		t.Fatalf("expanding ownership transition err=%v, want ErrOwnershipTransition", err)
 	}
 	stale := transition
 	stale.ToRoutingVersion = stale.From.RoutingVersion
@@ -75,13 +96,13 @@ func FuzzOpenOwnershipTransition(f *testing.F) {
 			ActivePolicyGeneration: view.ActivePolicyGeneration,
 			ProtectionEpoch:        view.ProtectionEpoch, OwnershipEpoch: view.OwnershipEpoch,
 			SchemaGeneration: view.SchemaGeneration, RoutingVersion: view.RoutingVersion,
-			RouteGeneration: view.RouteGeneration,
+			RouteGeneration: view.RouteGeneration, OwnedRange: view.FromOwnedRange,
 		}
 		rebuilt, rebuildErr := AppendOwnershipTransition(nil, OwnershipTransition{
 			From: binding, ExpectedReplicaSetVersion: view.ExpectedReplicaSetVersion,
 			SourceMember: view.SourceMember, TargetMember: view.TargetMember,
 			ToOwnershipEpoch: view.ToOwnershipEpoch, ToRoutingVersion: view.ToRoutingVersion,
-			ToRouteGeneration: view.ToRouteGeneration,
+			ToRouteGeneration: view.ToRouteGeneration, ToOwnedRange: view.ToOwnedRange,
 		})
 		if rebuildErr != nil || !bytes.Equal(rebuilt, data) {
 			t.Fatalf("accepted ownership record did not round-trip: %v", rebuildErr)

@@ -53,7 +53,7 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDigest = "e22900bf3ca9ec3cd4757596692469c9bda513704a89874400317851b6a866d2"
+	const wantDigest = "8f73fd7a66c088cc502b9e4177c79da13020b2017147a91ae1ef065843a2f35f"
 	gotDigest := sha256.Sum256(encoded)
 	if hex.EncodeToString(gotDigest[:]) != wantDigest {
 		t.Fatalf("state golden digest = %x, want %s", gotDigest, wantDigest)
@@ -61,6 +61,12 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	decoded, err := OpenState(encoded)
 	if err != nil || !equalState(decoded, state) {
 		t.Fatalf("OpenState = %+v,%v", decoded, err)
+	}
+	legacy := bytes.Clone(encoded)
+	binary.LittleEndian.PutUint16(legacy[8:10], 1)
+	sealRecord(legacy, stateChecksumDomain)
+	if _, err := OpenState(legacy); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("legacy range-less state err=%v, want ErrStateCorrupt", err)
 	}
 	corrupt := bytes.Clone(encoded)
 	corrupt[216] ^= 1

@@ -3,6 +3,7 @@ package raftservice
 import (
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -18,6 +19,7 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 		MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4, Term: 12}
 	binding := replicatedstate.Binding{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
 		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, Distribution: "d", Shard: "s",
+		OwnedRange:           distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		AllocationGeneration: fence.AllocationGeneration, ShardIncarnation: group.ShardIncarnation,
 		GroupID: group.GroupID, ActivePolicyGeneration: fence.Command.ActivePolicyGeneration,
 		ProtectionEpoch: fence.Command.ProtectionEpoch, OwnershipEpoch: fence.Command.OwnershipEpoch,
@@ -26,7 +28,7 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	command, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
 		From: binding, ExpectedReplicaSetVersion: fence.Command.ReplicaSetVersion,
 		SourceMember: 1, TargetMember: 2, ToOwnershipEpoch: 9,
-		ToRoutingVersion: 11, ToRouteGeneration: 12})
+		ToRoutingVersion: 11, ToRouteGeneration: 12, ToOwnedRange: binding.OwnedRange})
 	if err != nil {
 		t.Fatal(err)
 	}

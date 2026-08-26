@@ -83,7 +83,8 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	}
 	if core.catalog.ReplicatedShardStore == nil ||
 		!core.catalog.ReplicatedShardStore.Equal(expected) ||
-		core.catalog.ReplicatedApply == nil || manifest.State.Binding != replicatedStateBinding(expected) ||
+		core.catalog.ReplicatedApply == nil ||
+		manifest.State.Binding != replicatedStateBindingAt(expected, applyOptions.Placement.Range) ||
 		!equalWALBaseManifestShape(manifest, expected) {
 		return activation, false, fmt.Errorf("%w: durable activation identity", ErrReplicatedSnapshotStageProof)
 	}
@@ -118,7 +119,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
 	machine, err := replicatedstate.OpenBundle(
-		replicatedStateBinding(expected), staticBootstrap,
+		replicatedStateBindingAt(expected, applyOptions.Placement.Range), staticBootstrap,
 		replicatedstate.CollectionTarget{Collection: core.replicatedApplyCollection,
 			Validation: replicatedstate.ValidationOpaqueBinary,
 			Limits:     replicatedStateCollectionLimits(identity.SystemLimits)},
@@ -212,7 +213,7 @@ func (d *Database) OpenReplicatedSnapshotStage(
 		return nil, ReplicatedApplyIdentity{}, err
 	}
 	if !equalWALBaseManifestShape(manifest, expected) ||
-		manifest.State.Binding != replicatedStateBinding(expected) {
+		manifest.State.Binding != replicatedStateBindingAt(expected, applyOptions.Placement.Range) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedSnapshotStageProof
 	}
 	expected = ownedReplicatedShardStoreIdentity(expected)
@@ -498,7 +499,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, relationErr)
 		}
 		s.machine, err = replicatedstate.OpenBundle(
-			replicatedStateBinding(s.base), staticBootstrap,
+			replicatedStateBindingAt(s.base, s.identity.Placement.Range), staticBootstrap,
 			replicatedstate.CollectionTarget{
 				Collection: core.replicatedApplyCollection,
 				Validation: replicatedstate.ValidationOpaqueBinary,

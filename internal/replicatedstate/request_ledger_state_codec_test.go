@@ -35,19 +35,19 @@ func TestStateRequestLedgerAccountingRoundTripAndCompactGeometry(t *testing.T) {
 	if got := binary.LittleEndian.Uint16(encoded[12:14]); got != stateRequestLedgerHeaderBytes {
 		t.Fatalf("ledger header = %d, want %d", got, stateRequestLedgerHeaderBytes)
 	}
-	if got := binary.LittleEndian.Uint64(encoded[416:424]); got != state.RequestLedgerRows {
+	if got := binary.LittleEndian.Uint64(encoded[440:448]); got != state.RequestLedgerRows {
 		t.Fatalf("ledger rows = %d, want %d", got, state.RequestLedgerRows)
 	}
-	if got := binary.LittleEndian.Uint64(encoded[424:432]); got != state.RequestLedgerResidentBytes {
+	if got := binary.LittleEndian.Uint64(encoded[448:456]); got != state.RequestLedgerResidentBytes {
 		t.Fatalf("ledger bytes = %d, want %d", got, state.RequestLedgerResidentBytes)
 	}
-	if got := binary.LittleEndian.Uint64(encoded[432:440]); got != state.RequestLedgerReservedBytes {
+	if got := binary.LittleEndian.Uint64(encoded[456:464]); got != state.RequestLedgerReservedBytes {
 		t.Fatalf("ledger reserved bytes = %d, want %d", got, state.RequestLedgerReservedBytes)
 	}
-	if got := binary.LittleEndian.Uint64(encoded[440:448]); got != state.RequestLedgerAckRows {
+	if got := binary.LittleEndian.Uint64(encoded[464:472]); got != state.RequestLedgerAckRows {
 		t.Fatalf("ledger ack rows = %d, want %d", got, state.RequestLedgerAckRows)
 	}
-	if got := binary.LittleEndian.Uint64(encoded[448:456]); got != state.RequestLedgerAckBytes {
+	if got := binary.LittleEndian.Uint64(encoded[472:480]); got != state.RequestLedgerAckBytes {
 		t.Fatalf("ledger ack bytes = %d, want %d", got, state.RequestLedgerAckBytes)
 	}
 	decoded, err := OpenState(encoded)

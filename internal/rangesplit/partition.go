@@ -248,7 +248,8 @@ func (p *Partitioner) matchesSource(state replicatedstate.State) bool {
 		binding.Shard == string(p.source.Shard) &&
 		binding.AllocationGeneration == uint64(p.source.AllocationGeneration) &&
 		binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
-		binding.RoutingVersion == uint64(p.source.RoutingVersion)
+		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
+		binding.OwnedRange == p.source.Range
 }
 
 func (p *Partitioner) childFor(point distribution.KeyspacePoint) int {
