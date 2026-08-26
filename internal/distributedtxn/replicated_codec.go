@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	replicatedCommandHeaderBytes   = 128
+	replicatedCommandHeaderBytes   = 168
 	replicatedCommandChecksumBytes = 4
 	// ReplicatedManifestCoordinatorRecordBytes is the exact VTCM prefix length
 	// in a manifest-start payload. A canonical sequence of one through
@@ -136,6 +136,11 @@ type ReplicatedCommand struct {
 	// exact next durable pulse value. It occupies a previously reserved header
 	// byte, so the bounded command size is unchanged.
 	RecoveryPulse uint8
+	// ControllerEpoch is the monotonic logical execution-pin lease epoch. Every
+	// transaction transition carries it together with the immutable aggregate
+	// pin digest so participant apply can reject a stale controller locally.
+	ControllerEpoch    uint64
+	ExecutionPinDigest Digest
 }
 
 // ReplicatedCommandView is checksum- and semantics-validated. Payload aliases
@@ -454,6 +459,8 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	out[121] = command.RecoveryPulse
 	binary.LittleEndian.PutUint16(out[122:124], uint16(len(command.Participant.IntentScopes)))
 	binary.LittleEndian.PutUint32(out[124:128], command.Participant.ParticipantOrdinal)
+	binary.LittleEndian.PutUint64(out[128:136], command.ControllerEpoch)
+	copy(out[136:168], command.ExecutionPinDigest[:])
 	cursor := replicatedCommandHeaderBytes
 	for i := range command.Participant.IntentScopes {
 		binary.LittleEndian.PutUint32(out[cursor:cursor+4], command.Participant.IntentScopes[i].Start)
@@ -536,6 +543,9 @@ func ValidateReplicatedCommand(src []byte) error {
 	payloadKind := ReplicatedPayloadKind(src[7])
 	expectedRevision := binary.LittleEndian.Uint64(src[24:32])
 	recoveryPulse := src[121]
+	controllerEpoch := binary.LittleEndian.Uint64(src[128:136])
+	var executionPinDigest Digest
+	copy(executionPinDigest[:], src[136:168])
 	var id ID
 	copy(id[:], src[32:48])
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(operation)
@@ -543,7 +553,8 @@ func ValidateReplicatedCommand(src []byte) error {
 	if abortFence {
 		wantPayload, creation = ReplicatedPayloadParticipantStage, true
 	}
-	if id.IsZero() || !ok || role != wantRole || payloadKind != wantPayload ||
+	if id.IsZero() || controllerEpoch == 0 || executionPinDigest == (Digest{}) ||
+		!ok || role != wantRole || payloadKind != wantPayload ||
 		(creation && expectedRevision != 0) || (!creation && expectedRevision == 0) {
 		return ErrCorrupt
 	}
@@ -621,6 +632,8 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 	view.Participant.BucketBits = src[120]
 	view.RecoveryPulse = src[121]
 	view.Participant.ParticipantOrdinal = binary.LittleEndian.Uint32(src[124:128])
+	view.ControllerEpoch = binary.LittleEndian.Uint64(src[128:136])
+	copy(view.ExecutionPinDigest[:], src[136:168])
 	cursor := replicatedCommandHeaderBytes
 	if scopeCount != 0 {
 		view.Participant.IntentScopes = scopes[:scopeCount]
@@ -644,7 +657,8 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 }
 
 func validateReplicatedCommand(command ReplicatedCommand) error {
-	if command.ID.IsZero() {
+	if command.ID.IsZero() || command.ControllerEpoch == 0 ||
+		command.ExecutionPinDigest == (Digest{}) {
 		return ErrCorrupt
 	}
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(command.Operation)

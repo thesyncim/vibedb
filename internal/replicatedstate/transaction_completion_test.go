@@ -19,6 +19,12 @@ func transactionCompletionCommand(
 	batches []replication.RelationMutationBatch,
 ) []byte {
 	t.Helper()
+	if control.ControllerEpoch == 0 {
+		control.ControllerEpoch = 7
+	}
+	if control.ExecutionPinDigest == (distributedtxn.Digest{}) {
+		control.ExecutionPinDigest = transactionCodecDigest(19)
+	}
 	transaction, err := distributedtxn.AppendReplicatedCommand(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +58,7 @@ func putTransactionCompletionControl(
 	control TransactionControl,
 ) {
 	t.Helper()
+	control = fencedTransactionTestControl(control)
 	key, err := TransactionControlStorageKey(control.Role, control.ID)
 	if err != nil {
 		t.Fatal(err)

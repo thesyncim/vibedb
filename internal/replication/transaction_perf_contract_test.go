@@ -496,6 +496,12 @@ func buildReplicatedTransactionPerformanceSchedule(
 		critical bool,
 		identitySet map[[32]byte]struct{},
 	) {
+		if control.ControllerEpoch == 0 {
+			control.ControllerEpoch = 7
+		}
+		if control.ExecutionPinDigest == (distributedtxn.Digest{}) {
+			control.ExecutionPinDigest = distributedtxn.Digest(sha256.Sum256([]byte("test-execution-pin")))
+		}
 		controlBytes, appendErr := distributedtxn.AppendReplicatedCommand(nil, control)
 		if appendErr != nil {
 			t.Fatalf("append operation %d: %v", control.Operation, appendErr)

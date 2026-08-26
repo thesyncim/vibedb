@@ -11,11 +11,11 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(participant)
-	inline, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+	inline, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
 		Payload: replicatedTestCoordinator(f),
-	})
+	}))
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -28,11 +28,11 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	manifestStart, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+	manifestStart, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
 		Payload: append(manifestCoordinator, pages[0]...),
-	})
+	}))
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 	widePayload := appendManifestPages(wideCoordinator, widePages[:wideCount])
 	wideOrdinal := uint32(64)
 	wideMutation := manifestParticipant(uint64(wideOrdinal)).MutationDigest
-	fused, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+	fused, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role:      ReplicatedRoleCoordinator,
 		Operation: ReplicatedBeginPrepareManifestCoordinator,
 		ID:        testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
@@ -57,7 +57,7 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 		Participant: fusedParticipantStage(
 			ReplicatedBeginPrepareManifestCoordinator, wideOrdinal, wideMutation,
 		),
-	})
+	}))
 	if err != nil {
 		f.Fatal(err)
 	}

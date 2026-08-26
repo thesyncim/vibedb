@@ -71,6 +71,15 @@ func (m *Machine) planTransactionCommand(
 	if err != nil {
 		return transactionCommandPlan{}, err
 	}
+	if found && (control.ExecutionPinDigest != existing.ExecutionPinDigest ||
+		control.ControllerEpoch < existing.ControllerEpoch) {
+		plan.command.resultCode = ResultTransactionConflict
+		plan.command.conflict = true
+		return plan, nil
+	}
+	if found && control.ControllerEpoch > existing.ControllerEpoch {
+		existing.ControllerEpoch = control.ControllerEpoch
+	}
 	if found && existing.LastOperation == control.Operation &&
 		existing.LastExpectedRevision == control.ExpectedRevision &&
 		existing.LastCommandDigest == commandDigest {
@@ -211,6 +220,7 @@ func (m *Machine) planParticipantAbortFence(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: distributedtxn.ReplicatedRoleParticipant,
 		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadKind:      control.PayloadKind,
 		PayloadDigest:    control.Participant.MutationDigest,
 		CoordinatorGroup: replication.ID128(control.Participant.CoordinatorGroup),
@@ -338,11 +348,13 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	}
 
 	participantControl := distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedStagePrepareParticipant,
-		ID:          control.ID,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: control.Participant,
+		Role:               distributedtxn.ReplicatedRoleParticipant,
+		Operation:          distributedtxn.ReplicatedStagePrepareParticipant,
+		ID:                 control.ID,
+		PayloadKind:        distributedtxn.ReplicatedPayloadParticipantStage,
+		Participant:        control.Participant,
+		ControllerEpoch:    control.ControllerEpoch,
+		ExecutionPinDigest: control.ExecutionPinDigest,
 	}
 	participantControl.Participant.ParticipantOrdinal = 0
 	participantPlan, err := m.planParticipantStagePrepared(
@@ -426,6 +438,7 @@ func (m *Machine) planInlineCoordinatorStage(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role, State: uint8(distributedtxn.CoordinatorStaging),
 		Revision: 1, PayloadKind: control.PayloadKind,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: payloadDigest, PayloadBytes: uint64(len(control.Payload)),
 		PayloadCount:     uint64(len(record.Participants)),
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
@@ -509,6 +522,7 @@ func (m *Machine) planManifestCoordinatorStage(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role, State: uint8(distributedtxn.CoordinatorStaging),
 		Revision: uint64(pages.Count()), PayloadKind: control.PayloadKind,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: payloadDigest, PayloadBytes: record.Manifest.EncodedBytes,
 		PayloadCount:     record.Manifest.ParticipantCount,
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
@@ -1072,6 +1086,7 @@ func (m *Machine) planParticipantStageWithVote(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role, State: uint8(state),
 		Revision: revision, PayloadKind: control.PayloadKind,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: control.Participant.MutationDigest,
 		PayloadBytes:  transactionCanonicalRelationBytes(command), PayloadCount: uint64(command.MutationCount()),
 		PayloadRelationCount:        uint16(command.RelationCount()),

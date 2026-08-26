@@ -1249,15 +1249,14 @@ func validatedTransactionControl(raw []byte) (transactionControlMetadata, error)
 	}
 	copy(control.id[:], raw[32:48])
 	copy(control.mutationDigest[:], raw[88:120])
+	headerBytes := int(binary.LittleEndian.Uint16(raw[8:10]))
 	if control.operation == distributedtxn.ReplicatedStageManifestSegment {
 		// Validated VTRC metadata guarantees this operation has no scopes and a
-		// canonical VTM1 payload beginning at the fixed control header boundary.
-		control.manifestIndex = binary.LittleEndian.Uint32(raw[128+8 : 128+12])
+		// canonical VTM1 payload beginning at the authenticated header boundary.
+		control.manifestIndex = binary.LittleEndian.Uint32(raw[headerBytes+8 : headerBytes+12])
 	} else if control.operation == distributedtxn.ReplicatedAppendManifestSegments {
-		// Validation guarantees this operation has no scopes and carries one
-		// direct canonical VTM1 sequence at the fixed payload boundary.
 		segments, openErr := distributedtxn.OpenManifestSegmentSequence(
-			raw[128 : len(raw)-4],
+			raw[headerBytes : len(raw)-4],
 		)
 		if openErr != nil {
 			return transactionControlMetadata{}, openErr

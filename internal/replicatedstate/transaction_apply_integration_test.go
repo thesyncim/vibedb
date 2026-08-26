@@ -20,6 +20,12 @@ func transactionCommandWithFingerprint(
 	fingerprint replication.Digest,
 ) []byte {
 	t.Helper()
+	if control.ControllerEpoch == 0 {
+		control.ControllerEpoch = 7
+	}
+	if control.ExecutionPinDigest == (distributedtxn.Digest{}) {
+		control.ExecutionPinDigest = transactionCodecDigest(19)
+	}
 	transaction, err := distributedtxn.AppendReplicatedCommand(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -240,6 +246,107 @@ func TestTransactionParticipantIntentBarrierPrepareApplyAndRelease(t *testing.T)
 		fixture.machine.state.TransactionPayloadRows != 0 ||
 		fixture.machine.state.TransactionIntentRows != 0 {
 		t.Fatalf("released transaction state = %+v", fixture.machine.state)
+	}
+}
+
+func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) {
+	type stagedParticipant struct {
+		fixture   relationBundleFixture
+		id        distributedtxn.ID
+		pinDigest distributedtxn.Digest
+	}
+	stage := func(suffix byte, key string) stagedParticipant {
+		fixture := newRelationBundleFixture(t, true)
+		id := transactionCodecID(suffix)
+		batches := []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsentOrEqual,
+				Key:  []byte(key), Value: []byte(`{"n":1}`),
+			}},
+		}}
+		mutationDigest, err := replication.TransactionMutationDigest(batches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pinDigest := transactionCodecDigest(201)
+		command := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+			Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStageParticipant,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+			ControllerEpoch: 7, ExecutionPinDigest: pinDigest,
+			Participant: distributedtxn.ParticipantStage{
+				CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
+				CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
+				CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+				BucketBits:                  8,
+				IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
+				MutationDigest:              mutationDigest,
+			},
+		}, batches)
+		applyTransactionCommand(t, fixture.machine, 3, command)
+		return stagedParticipant{fixture: fixture, id: id, pinDigest: pinDigest}
+	}
+	applyAndResult := func(staged stagedParticipant, index uint64, control distributedtxn.ReplicatedCommand) uint32 {
+		t.Helper()
+		command := transactionCompletionCommand(t, staged.fixture.binding, control, nil)
+		if err := staged.fixture.machine.AdmitCommand(command); err != nil {
+			t.Fatalf("admit at %d: %v", index, err)
+		}
+		if _, err := staged.fixture.machine.ApplyNormal(normalMeta(index), command); err != nil {
+			t.Fatalf("apply at %d: %v", index, err)
+		}
+		completion, _ := openTransactionCompletion(t, staged.fixture.machine, command)
+		return completion.ResultCode
+	}
+	applyOnly := func(staged stagedParticipant, index uint64, control distributedtxn.ReplicatedCommand) {
+		t.Helper()
+		command := transactionCompletionCommand(t, staged.fixture.binding, control, nil)
+		if err := staged.fixture.machine.AdmitCommand(command); err != nil {
+			t.Fatalf("admit at %d: %v", index, err)
+		}
+		if _, err := staged.fixture.machine.ApplyNormal(normalMeta(index), command); err != nil {
+			t.Fatalf("apply at %d: %v", index, err)
+		}
+	}
+	readControl := func(staged stagedParticipant) TransactionControlView {
+		t.Helper()
+		key, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleParticipant, staged.id)
+		raw, found, err := staged.fixture.system.Collection.AppendRaw(nil, key[:])
+		if err != nil || !found {
+			t.Fatalf("read durable participant: found=%v err=%v", found, err)
+		}
+		control, err := OpenTransactionControl(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return control
+	}
+	transition := func(staged stagedParticipant, epoch uint64, digest distributedtxn.Digest, operation distributedtxn.ReplicatedOperation, revision uint64) distributedtxn.ReplicatedCommand {
+		return distributedtxn.ReplicatedCommand{
+			Role: distributedtxn.ReplicatedRoleParticipant, Operation: operation,
+			ID: staged.id, ExpectedRevision: revision, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+			ControllerEpoch: epoch, ExecutionPinDigest: digest,
+		}
+	}
+	mismatch := stage(246, "pin-mismatch")
+	applyOnly(mismatch, 4, transition(mismatch, 8, transactionCodecDigest(202), distributedtxn.ReplicatedPrepareParticipant, 1))
+	if got := readControl(mismatch); got.ControllerEpoch != 7 || got.Revision != 1 {
+		t.Fatalf("mismatched pin digest mutated control=%+v", got.TransactionControl)
+	}
+	lower := stage(245, "lower-epoch")
+	applyOnly(lower, 4, transition(lower, 6, lower.pinDigest, distributedtxn.ReplicatedPrepareParticipant, 1))
+	if got := readControl(lower); got.ControllerEpoch != 7 || got.Revision != 1 {
+		t.Fatalf("lower controller epoch mutated control=%+v", got.TransactionControl)
+	}
+	takeover := stage(244, "certified-takeover")
+	if got := applyAndResult(takeover, 4, transition(takeover, 8, takeover.pinDigest, distributedtxn.ReplicatedPrepareParticipant, 1)); got != ResultApplied {
+		t.Fatalf("certified takeover result=%d", got)
+	}
+	applyOnly(takeover, 5, transition(takeover, 7, takeover.pinDigest, distributedtxn.ReplicatedApplyParticipant, 2))
+	control := readControl(takeover)
+	if control.ControllerEpoch != 8 || control.ExecutionPinDigest != takeover.pinDigest ||
+		control.State != uint8(distributedtxn.ParticipantPrepared) || control.Revision != 2 {
+		t.Fatalf("durable takeover fence=%+v", control.TransactionControl)
 	}
 }
 

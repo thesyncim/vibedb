@@ -16,7 +16,7 @@ import (
 const (
 	transactionCodecSentinel = uint16(0)
 
-	transactionControlHeaderBytes     = 320
+	transactionControlHeaderBytes     = 360
 	transactionPayloadHeaderBytes     = 96
 	transactionManifestHeaderBytes    = 112
 	transactionMutationHeaderBytes    = 160
@@ -93,11 +93,13 @@ type TransactionControl struct {
 	Role  distributedtxn.ReplicatedRole
 	State uint8
 
-	Revision      uint64
-	PayloadKind   distributedtxn.ReplicatedPayloadKind
-	PayloadDigest distributedtxn.Digest
-	PayloadBytes  uint64
-	PayloadCount  uint64
+	Revision           uint64
+	ControllerEpoch    uint64
+	ExecutionPinDigest distributedtxn.Digest
+	PayloadKind        distributedtxn.ReplicatedPayloadKind
+	PayloadDigest      distributedtxn.Digest
+	PayloadBytes       uint64
+	PayloadCount       uint64
 	// PayloadRelationCount is zero for coordinators and the exact number of
 	// packed native relation rows for a participant stage.
 	PayloadRelationCount uint16
@@ -381,6 +383,8 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	} else {
 		copy(frame[288:320], control.PrepareCommandDigest[:])
 	}
+	binary.LittleEndian.PutUint64(frame[320:328], control.ControllerEpoch)
+	copy(frame[328:360], control.ExecutionPinDigest[:])
 	cursor := transactionControlHeaderBytes
 	for _, scope := range control.IntentScopes {
 		binary.LittleEndian.PutUint32(frame[cursor:cursor+4], scope.Start)
@@ -478,6 +482,8 @@ func OpenTransactionControlInto(
 	view.ManifestNextPage = binary.LittleEndian.Uint32(src[268:272])
 	view.ManifestNextParticipant = binary.LittleEndian.Uint64(src[272:280])
 	view.ManifestEncodedBytes = binary.LittleEndian.Uint64(src[280:288])
+	view.ControllerEpoch = binary.LittleEndian.Uint64(src[320:328])
+	copy(view.ExecutionPinDigest[:], src[328:360])
 	if view.Role == distributedtxn.ReplicatedRoleCoordinator {
 		copy(view.ManifestChainDigest[:], src[288:320])
 	} else {
@@ -900,6 +906,7 @@ func OpenTransactionIntentForKey(
 func transactionControlValid(control TransactionControl) bool {
 	cancellation := transactionCancellationWitnessValid(control)
 	if control.ID.IsZero() || !transactionRoleValid(control.Role) || control.Revision == 0 ||
+		control.ControllerEpoch == 0 || control.ExecutionPinDigest == (distributedtxn.Digest{}) ||
 		control.Role == distributedtxn.ReplicatedRoleParticipant && control.RecoveryPulse != 0 ||
 		control.PayloadDigest == (distributedtxn.Digest{}) ||
 		(!cancellation && (control.PayloadBytes == 0 || control.PayloadCount == 0)) ||
