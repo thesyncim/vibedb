@@ -354,6 +354,11 @@ func openDatabaseWithShardStorePolicy(
 			}
 		}
 	case shardStoreOpenInitialize:
+		if shardPolicy.expectedIdentity != (ShardStoreIdentity{}) &&
+			(shardPolicy.expectedIdentity.Binding() != shardPolicy.expected ||
+				validateShardStoreIdentity(shardPolicy.expectedIdentity) != nil) {
+			return nil, ErrShardStoreIdentityMismatch
+		}
 		if d.catalog.ReplicatedShardStore != nil {
 			return nil, fmt.Errorf(
 				"vibedb: initialize local shard store %s: %w",
@@ -361,7 +366,9 @@ func openDatabaseWithShardStorePolicy(
 			)
 		}
 		if d.catalog.ShardStore != nil &&
-			d.catalog.ShardStore.Binding() != shardPolicy.expected {
+			(d.catalog.ShardStore.Binding() != shardPolicy.expected ||
+				shardPolicy.expectedIdentity != (ShardStoreIdentity{}) &&
+					*d.catalog.ShardStore != shardPolicy.expectedIdentity) {
 			return nil, &ShardStoreError{
 				Op: "initialize", Path: absolute, Expected: shardPolicy.expected,
 				Actual: *d.catalog.ShardStore,
@@ -385,9 +392,13 @@ func openDatabaseWithShardStorePolicy(
 			} else if !os.IsNotExist(statErr) {
 				return nil, statErr
 			}
-			identity, identityErr := randomShardStoreIdentity(shardPolicy.expected)
-			if identityErr != nil {
-				return nil, identityErr
+			identity := shardPolicy.expectedIdentity
+			if identity == (ShardStoreIdentity{}) {
+				var identityErr error
+				identity, identityErr = randomShardStoreIdentity(shardPolicy.expected)
+				if identityErr != nil {
+					return nil, identityErr
+				}
 			}
 			initializeIdentity = &identity
 		}

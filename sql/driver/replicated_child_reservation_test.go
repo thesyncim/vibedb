@@ -16,9 +16,35 @@ func TestReplicatedChildApplyReservationPersistsExactIdentity(t *testing.T) {
 	binding := testReplicatedBinding(181)
 	binding.Distribution, binding.Shard = "orders", "right"
 	binding.AllocationGeneration = 9
-	database, err := InitializeShardStore(path, ShardStoreBinding{
+	database, err := InitializeShardStoreIdentity(path, ShardStoreIdentity{
 		Distribution: "orders", Shard: "right", AllocationGeneration: 9,
+		LogID: [16]byte{0xa1},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	localIdentity := ShardStoreIdentity{
+		Distribution: "orders", Shard: "right", AllocationGeneration: 9, LogID: [16]byte{0xa1},
+	}
+	database, err = InitializeShardStoreIdentity(path, localIdentity)
+	if err != nil {
+		t.Fatalf("exact identity retry: %v", err)
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrongIdentity := localIdentity
+	wrongIdentity.LogID[0]++
+	if wrong, openErr := InitializeShardStoreIdentity(path, wrongIdentity); wrong != nil || !errors.Is(openErr, ErrShardStoreIdentityMismatch) {
+		if wrong != nil {
+			_ = wrong.Close()
+		}
+		t.Fatalf("substituted log identity err=%v", openErr)
+	}
+	database, err = InitializeShardStoreIdentity(path, localIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}

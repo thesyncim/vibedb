@@ -217,6 +217,7 @@ const (
 type shardStoreOpenPolicy struct {
 	mode                        shardStoreOpenMode
 	expected                    ShardStoreBinding
+	expectedIdentity            ShardStoreIdentity
 	expectedReplicated          ReplicatedShardStoreIdentity
 	expectedReplicatedLogID     [16]byte
 	expectedReplicatedUserTable string
@@ -247,6 +248,24 @@ func InitializeShardStore(path string, binding ShardStoreBinding) (*Database, er
 	binding = ownedShardStoreBinding(binding)
 	database, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode: shardStoreOpenInitialize, expected: binding,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Database{connector: &dbConnector{db: database}}, nil
+}
+
+// InitializeShardStoreIdentity publishes an allocator-issued complete local
+// identity, including LogID. It is reserved for topology preparation where an
+// immutable child plan must authenticate the SQL root before artifact staging.
+func InitializeShardStoreIdentity(path string, identity ShardStoreIdentity) (*Database, error) {
+	if err := validateShardStoreIdentity(identity); err != nil {
+		return nil, err
+	}
+	identity.Distribution = distribution.DistributionName(strings.Clone(string(identity.Distribution)))
+	identity.Shard = distribution.ShardID(strings.Clone(string(identity.Shard)))
+	database, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
+		mode: shardStoreOpenInitialize, expected: identity.Binding(), expectedIdentity: identity,
 	})
 	if err != nil {
 		return nil, err
