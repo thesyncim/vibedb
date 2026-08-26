@@ -1159,7 +1159,7 @@ func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence) []by
 	nested, err := executionpin.AppendCommand(nil, executionpin.Command{
 		Operation: executionpin.OperationAcquire, Binding: binding, PinID: pin,
 		AuthorityNode: executionpin.ID(rafttransport.NodeID{12}), AuthorityGeneration: 1,
-		NextController: id(10), NextControllerEpoch: 1, NextLeaseDeadline: 100,
+		NextController: id(10), NextControllerEpoch: 1, NextLeaseSpan: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
