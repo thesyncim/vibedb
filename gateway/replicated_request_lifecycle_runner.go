@@ -33,7 +33,13 @@ type DurableRequestWave struct {
 	Command     []byte
 	Transition  uint32
 	Cursor      []byte
+	// Settle derives result-dependent protocol state only after Command has an
+	// authenticated completion. Exactly one of Settle or the fixed
+	// Transition/Cursor pair is accepted.
+	Settle DurableRequestWaveSettlement
 }
+
+type DurableRequestWaveSettlement func(observation []byte) (transition uint32, cursor []byte, err error)
 
 // DurableRequestWaveResult is the exact authenticated shard observation and
 // the final ledger revision after the route release proof was installed.
@@ -234,9 +240,17 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 			return DurableRequestWaveResult{}, ErrDurableRequestConflict
 		}
 		observation = bytes.Clone(settled.Completion)
+		transition, cursor := wave.Transition, wave.Cursor
+		if wave.Settle != nil {
+			transition, cursor, err = wave.Settle(observation)
+			if err != nil || transition == 0 || len(cursor) == 0 ||
+				len(cursor) > requestledger.MaxContinuationCursorBytes {
+				return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
+			}
+		}
 		continuation, continuationErr := requestledger.NewContinuation(
-			head, pending, routePin, head.Revision+1, wave.Transition,
-			wave.Cursor, observation,
+			head, pending, routePin, head.Revision+1, transition,
+			cursor, observation,
 		)
 		if continuationErr != nil {
 			return DurableRequestWaveResult{}, errors.Join(continuationErr, ErrDurableRequestConflict)
@@ -462,7 +476,9 @@ func validateDurableRequestWave(wave DurableRequestWave) (requestledger.Digest, 
 		wave.Identity.ID == ([16]byte{}) ||
 		wave.Identity.RetryHome == (replication.RetryHome{}) || len(wave.Tenant) == 0 ||
 		len(wave.Tenant) > replication.MaxIdentityBytes || wave.PinID == (requestledger.PinID{}) ||
-		wave.GateEpoch == 0 || wave.Binding == (requestledger.Digest{}) || wave.Transition == 0 ||
+		wave.GateEpoch == 0 || wave.Binding == (requestledger.Digest{}) ||
+		(wave.Settle == nil && (wave.Transition == 0 || len(wave.Cursor) == 0)) ||
+		(wave.Settle != nil && (wave.Transition != 0 || len(wave.Cursor) != 0)) ||
 		len(wave.Target) == 0 || len(wave.Command) == 0 ||
 		len(wave.Command) > replication.MaxCommandBytes ||
 		uint64(len(wave.Target)) != wave.Step.TargetLength ||

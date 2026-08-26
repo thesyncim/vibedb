@@ -404,6 +404,35 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 	}
 }
 
+func TestDurableRequestLifecycleRunnerDerivesCursorFromAuthenticatedSettlement(t *testing.T) {
+	wave, initial, route := lifecycleRunnerFixture(t)
+	wave.Transition, wave.Cursor = 0, nil
+	wave.Settle = func(observation []byte) (uint32, []byte, error) {
+		if len(observation) == 0 {
+			return 0, nil, ErrDurableRequestConflict
+		}
+		return 77, []byte("settled-cursor"), nil
+	}
+	events := &lifecycleRunnerEvents{}
+	ledger := &lifecycleRunnerLedger{head: initial, events: events}
+	resolver := &lifecycleRunnerResolver{route: route, events: events}
+	proposer := &lifecycleRunnerProposer{
+		t: t, events: events, faultKind: -1,
+		attempts: make(map[replication.CommandKind][][]byte),
+	}
+	runner, err := newDurableRequestLifecycleRunner(ledger, resolver, proposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runner.RunWave(context.Background(), wave); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.continuation.TransitionTag != 77 ||
+		!bytes.Equal(ledger.continuation.Cursor, []byte("settled-cursor")) {
+		t.Fatal("settlement-derived cursor was not persisted")
+	}
+}
+
 func TestDurableRequestLifecycleRunnerRejectsCommandAfterRouteRefresh(t *testing.T) {
 	wave, head, route := lifecycleRunnerFixture(t)
 	events := new(lifecycleRunnerEvents)
