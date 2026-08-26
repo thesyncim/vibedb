@@ -5,7 +5,7 @@ import (
 	"hash/crc32"
 )
 
-const CommandBytes = 444
+const CommandBytes = 436
 
 var (
 	commandMagic = [4]byte{'V', 'E', 'L', 'P'}
@@ -96,52 +96,52 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	copy(frame[0:4], commandMagic[:])
 	frame[4] = byte(command.Operation)
 	encodedBinding := appendBinding(frame[8:8], command.Binding)
-	copy(frame[240:272], command.PinID[:])
-	copy(frame[272:288], command.AuthorityNode[:])
-	binary.LittleEndian.PutUint64(frame[288:296], command.AuthorityGeneration)
-	copy(frame[296:312], command.ExpectedController[:])
-	binary.LittleEndian.PutUint64(frame[312:320], command.ExpectedControllerEpoch)
-	copy(frame[320:336], command.NextController[:])
-	binary.LittleEndian.PutUint64(frame[336:344], command.NextControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[344:352], command.ExpectedLeaseAppliedThrough)
-	binary.LittleEndian.PutUint64(frame[352:360], command.NextLeaseSpan)
-	copy(frame[368:400], command.PrepareTerminalDigest[:])
-	copy(frame[400:432], command.AcquireCertificateDigest[:])
-	binary.LittleEndian.PutUint64(frame[432:440], command.ExpectedLeaseRevision)
+	copy(frame[232:264], command.PinID[:])
+	copy(frame[264:280], command.AuthorityNode[:])
+	binary.LittleEndian.PutUint64(frame[280:288], command.AuthorityGeneration)
+	copy(frame[288:304], command.ExpectedController[:])
+	binary.LittleEndian.PutUint64(frame[304:312], command.ExpectedControllerEpoch)
+	copy(frame[312:328], command.NextController[:])
+	binary.LittleEndian.PutUint64(frame[328:336], command.NextControllerEpoch)
+	binary.LittleEndian.PutUint64(frame[336:344], command.ExpectedLeaseAppliedThrough)
+	binary.LittleEndian.PutUint64(frame[344:352], command.NextLeaseSpan)
+	copy(frame[360:392], command.PrepareTerminalDigest[:])
+	copy(frame[392:424], command.AcquireCertificateDigest[:])
+	binary.LittleEndian.PutUint64(frame[424:432], command.ExpectedLeaseRevision)
 	if len(encodedBinding) != bindingBytes {
 		panic("executionpin: impossible binding geometry")
 	}
-	binary.LittleEndian.PutUint32(frame[440:444], crc32.Checksum(frame[:440], castagnoli))
+	binary.LittleEndian.PutUint32(frame[432:436], crc32.Checksum(frame[:432], castagnoli))
 	return dst, nil
 }
 
 func OpenCommand(raw []byte) (Command, error) {
 	if len(raw) != CommandBytes || raw[0] != commandMagic[0] || raw[1] != commandMagic[1] ||
 		raw[2] != commandMagic[2] || raw[3] != commandMagic[3] || !allZero(raw[5:8]) ||
-		binary.LittleEndian.Uint32(raw[440:444]) !=
-			crc32.Checksum(raw[:440], castagnoli) {
+		binary.LittleEndian.Uint32(raw[432:436]) !=
+			crc32.Checksum(raw[:432], castagnoli) {
 		return Command{}, ErrCorrupt
 	}
-	binding, ok := openBinding(raw[8:240])
+	binding, ok := openBinding(raw[8:232])
 	if !ok {
 		return Command{}, ErrCorrupt
 	}
 	command := Command{Operation: Operation(raw[4]), Binding: binding}
-	copy(command.PinID[:], raw[240:272])
-	copy(command.AuthorityNode[:], raw[272:288])
-	command.AuthorityGeneration = binary.LittleEndian.Uint64(raw[288:296])
-	copy(command.ExpectedController[:], raw[296:312])
-	command.ExpectedControllerEpoch = binary.LittleEndian.Uint64(raw[312:320])
-	copy(command.NextController[:], raw[320:336])
-	command.NextControllerEpoch = binary.LittleEndian.Uint64(raw[336:344])
-	command.ExpectedLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[344:352])
-	command.NextLeaseSpan = binary.LittleEndian.Uint64(raw[352:360])
-	if !allZero(raw[360:368]) {
+	copy(command.PinID[:], raw[232:264])
+	copy(command.AuthorityNode[:], raw[264:280])
+	command.AuthorityGeneration = binary.LittleEndian.Uint64(raw[280:288])
+	copy(command.ExpectedController[:], raw[288:304])
+	command.ExpectedControllerEpoch = binary.LittleEndian.Uint64(raw[304:312])
+	copy(command.NextController[:], raw[312:328])
+	command.NextControllerEpoch = binary.LittleEndian.Uint64(raw[328:336])
+	command.ExpectedLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[336:344])
+	command.NextLeaseSpan = binary.LittleEndian.Uint64(raw[344:352])
+	if !allZero(raw[352:360]) {
 		return Command{}, ErrCorrupt
 	}
-	copy(command.PrepareTerminalDigest[:], raw[368:400])
-	copy(command.AcquireCertificateDigest[:], raw[400:432])
-	command.ExpectedLeaseRevision = binary.LittleEndian.Uint64(raw[432:440])
+	copy(command.PrepareTerminalDigest[:], raw[360:392])
+	copy(command.AcquireCertificateDigest[:], raw[392:424])
+	command.ExpectedLeaseRevision = binary.LittleEndian.Uint64(raw[424:432])
 	if !command.Valid() {
 		return Command{}, ErrCorrupt
 	}

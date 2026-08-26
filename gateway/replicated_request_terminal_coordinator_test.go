@@ -235,9 +235,9 @@ func terminalCoordinatorFixture(t testing.TB) (
 	key := lifecycleKey()
 	keyDigest, _ := requestledger.KeyDigest(key)
 	binding := executionpin.Binding{
-		RequestKeyDigest:  executionpin.Digest(keyDigest),
-		RequestDigest:     executionpin.Digest(lifecycleDigest("terminal-request")),
-		CatalogGeneration: 7, SchemaGeneration: route.Command.SchemaGeneration,
+		RequestKeyDigest:          executionpin.Digest(keyDigest),
+		RequestDigest:             executionpin.Digest(lifecycleDigest("terminal-request")),
+		CatalogGeneration:         7,
 		SchemaManifestDigest:      executionpin.Digest(lifecycleDigest("schema-certificate")),
 		TransactionManifestDigest: executionpin.Digest{6},
 		ParticipantAuthorityRoot:  executionpin.Digest{7}, ParticipantCount: 1,

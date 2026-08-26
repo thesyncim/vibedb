@@ -2,7 +2,7 @@ package executionpin
 
 import "bytes"
 
-const CompletionBytes = 896
+const CompletionBytes = 888
 
 var (
 	completionMagic          = [8]byte{'V', 'E', 'L', 'C', 'P', 'L', 0, 0}

@@ -24,6 +24,36 @@ type DurableRequestTypedExecutionContext struct {
 	ExecutionPinLease executionpin.LeaseCertificate
 }
 
+// BuildDurableRequestExecutionPinBinding derives the one aggregate authority
+// for a sealed request. It deliberately names the ledger-home Raft group, not
+// a participant: a tenant may span any number of shards and tables while one
+// clockless controller epoch fences the complete ordered program.
+func BuildDurableRequestExecutionPinBinding(
+	execution DurableRequestTypedExecutionContext,
+) (executionpin.Binding, error) {
+	contract := execution.Recipe.Contract
+	homeRoute := execution.Home.borrowedRoute()
+	binding := executionpin.Binding{
+		RequestKeyDigest:          executionpin.Digest(execution.Recipe.KeyDigest),
+		RequestDigest:             executionpin.Digest(execution.Recipe.RequestDigest),
+		CatalogGeneration:         execution.Recipe.CatalogGeneration,
+		SchemaManifestDigest:      executionpin.Digest(contract.SchemaManifestDigest),
+		TransactionManifestDigest: executionpin.Digest(contract.TransactionManifestDigest),
+		ParticipantAuthorityRoot:  executionpin.Digest(contract.LineageForwardingDigest),
+		ParticipantCount:          execution.Recipe.ParticipantCount,
+		ExecutionContractDigest:   executionpin.Digest(contract.ProtocolProgramDigest),
+		LedgerHomeGroup:           executionpin.ID(homeRoute.Group.GroupID),
+	}
+	if !validReplicatedRoute(homeRoute) || !binding.Valid() ||
+		contract.CatalogGeneration != execution.Recipe.CatalogGeneration ||
+		contract.ParticipantCount != execution.Recipe.ParticipantCount ||
+		contract.KeyDigest != execution.Recipe.KeyDigest ||
+		contract.RequestDigest != execution.Recipe.RequestDigest {
+		return executionpin.Binding{}, ErrDurableRequestConflict
+	}
+	return binding, nil
+}
+
 // BindDurableRequestExecutionPin installs the exact acquired certificate pair
 // and its catalog-group route. The binding digest is checked against the
 // sealed recipe once; waves then carry the immutable lease certificate.
@@ -39,14 +69,12 @@ func BindDurableRequestExecutionPin(
 	}
 	acquireDigest, err := executionpin.AcquireCertificateDigest(acquire)
 	bindingDigest, bindingErr := executionpin.BindingDigest(acquire.Binding)
+	wantBinding, wantErr := BuildDurableRequestExecutionPinBinding(execution)
 	if err != nil || bindingErr != nil || acquireDigest != lease.AcquireCertificateDigest ||
+		wantErr != nil || acquire.Binding != wantBinding ||
 		replication.Digest(bindingDigest) != execution.Recipe.Contract.PinDigest ||
-		acquire.Binding.RequestKeyDigest != executionpin.Digest(execution.Recipe.KeyDigest) ||
-		acquire.Binding.RequestDigest != executionpin.Digest(execution.Recipe.RequestDigest) ||
-		acquire.Binding.CatalogGeneration != execution.Recipe.CatalogGeneration ||
-		acquire.Binding.SchemaManifestDigest !=
-			executionpin.Digest(execution.Recipe.Contract.SchemaManifestDigest) {
-		return DurableRequestTypedExecutionContext{}, errors.Join(err, bindingErr, ErrDurableRequestConflict)
+		acquire.Binding.RequestKeyDigest != executionpin.Digest(execution.Recipe.KeyDigest) {
+		return DurableRequestTypedExecutionContext{}, errors.Join(err, bindingErr, wantErr, ErrDurableRequestConflict)
 	}
 	execution.ExecutionPinRoute = route
 	execution.ExecutionPinLease = lease
@@ -84,6 +112,7 @@ func NewDurableRequestTerminalAuthority(
 	release executionpin.Command,
 ) (DurableRequestTerminalAuthority, error) {
 	contract := execution.Recipe.Contract
+	wantBinding, bindingErr := BuildDurableRequestExecutionPinBinding(execution)
 	if ackKey == (DurableRequestAckDerivationKey{}) || len(commitCursor) == 0 ||
 		len(commitCursor) > requestledger.MaxContinuationCursorBytes || len(abortCursor) == 0 ||
 		len(abortCursor) > requestledger.MaxContinuationCursorBytes ||
@@ -93,11 +122,8 @@ func NewDurableRequestTerminalAuthority(
 			requestledger.Digest(contract.AbortTerminalStateDigest) ||
 		release.Operation != executionpin.OperationRelease ||
 		release.PrepareTerminalDigest != (executionpin.Digest{}) ||
-		release.Binding.RequestKeyDigest != executionpin.Digest(execution.Recipe.KeyDigest) ||
-		release.Binding.RequestDigest != executionpin.Digest(execution.Recipe.RequestDigest) ||
-		release.Binding.CatalogGeneration != execution.Recipe.CatalogGeneration ||
-		release.Binding.SchemaManifestDigest != executionpin.Digest(contract.SchemaManifestDigest) {
-		return DurableRequestTerminalAuthority{}, ErrDurableRequestConflict
+		bindingErr != nil || release.Binding != wantBinding {
+		return DurableRequestTerminalAuthority{}, errors.Join(bindingErr, ErrDurableRequestConflict)
 	}
 	bindingDigest, err := executionpin.BindingDigest(release.Binding)
 	if err != nil || bindingDigest != executionpin.Digest(contract.PinDigest) {

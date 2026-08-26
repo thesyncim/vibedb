@@ -33,7 +33,6 @@ type Binding struct {
 	RequestKeyDigest          Digest
 	RequestDigest             Digest
 	CatalogGeneration         uint64
-	SchemaGeneration          uint64
 	SchemaManifestDigest      Digest
 	TransactionManifestDigest Digest
 	ParticipantAuthorityRoot  Digest
@@ -44,7 +43,7 @@ type Binding struct {
 
 func (binding Binding) Valid() bool {
 	return binding.RequestKeyDigest != (Digest{}) && binding.RequestDigest != (Digest{}) &&
-		binding.CatalogGeneration != 0 && binding.SchemaGeneration != 0 &&
+		binding.CatalogGeneration != 0 &&
 		binding.SchemaManifestDigest != (Digest{}) &&
 		binding.TransactionManifestDigest != (Digest{}) &&
 		binding.ParticipantAuthorityRoot != (Digest{}) && binding.ParticipantCount != 0 &&
@@ -76,13 +75,12 @@ func BindingDigest(binding Binding) (Digest, error) {
 	return Digest(sha256.Sum256(material[:])), nil
 }
 
-const bindingBytes = 232
+const bindingBytes = 224
 
 func appendBinding(dst []byte, binding Binding) []byte {
 	dst = append(dst, binding.RequestKeyDigest[:]...)
 	dst = append(dst, binding.RequestDigest[:]...)
 	dst = binary.LittleEndian.AppendUint64(dst, binding.CatalogGeneration)
-	dst = binary.LittleEndian.AppendUint64(dst, binding.SchemaGeneration)
 	dst = append(dst, binding.SchemaManifestDigest[:]...)
 	dst = append(dst, binding.TransactionManifestDigest[:]...)
 	dst = append(dst, binding.ParticipantAuthorityRoot[:]...)
@@ -99,13 +97,12 @@ func openBinding(raw []byte) (Binding, bool) {
 	copy(binding.RequestKeyDigest[:], raw[0:32])
 	copy(binding.RequestDigest[:], raw[32:64])
 	binding.CatalogGeneration = binary.LittleEndian.Uint64(raw[64:72])
-	binding.SchemaGeneration = binary.LittleEndian.Uint64(raw[72:80])
-	copy(binding.SchemaManifestDigest[:], raw[80:112])
-	copy(binding.TransactionManifestDigest[:], raw[112:144])
-	copy(binding.ParticipantAuthorityRoot[:], raw[144:176])
-	binding.ParticipantCount = binary.LittleEndian.Uint64(raw[176:184])
-	copy(binding.ExecutionContractDigest[:], raw[184:216])
-	copy(binding.LedgerHomeGroup[:], raw[216:232])
+	copy(binding.SchemaManifestDigest[:], raw[72:104])
+	copy(binding.TransactionManifestDigest[:], raw[104:136])
+	copy(binding.ParticipantAuthorityRoot[:], raw[136:168])
+	binding.ParticipantCount = binary.LittleEndian.Uint64(raw[168:176])
+	copy(binding.ExecutionContractDigest[:], raw[176:208])
+	copy(binding.LedgerHomeGroup[:], raw[208:224])
 	return binding, binding.Valid()
 }
 

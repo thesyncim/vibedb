@@ -32,9 +32,9 @@ func requestLedgerPreparedForExecutionPin(t testing.TB) (
 	requestDigest := requestLedgerStateTestDigest("execution-pin request")
 	routeCertificate := requestLedgerStateTestDigest("execution-pin route schema certificate")
 	binding := executionpin.Binding{
-		RequestKeyDigest:  executionpin.Digest(keyDigest),
-		RequestDigest:     executionpin.Digest(requestDigest),
-		CatalogGeneration: 7, SchemaGeneration: 10,
+		RequestKeyDigest:          executionpin.Digest(keyDigest),
+		RequestDigest:             executionpin.Digest(requestDigest),
+		CatalogGeneration:         7,
 		SchemaManifestDigest:      executionpin.Digest(routeCertificate),
 		TransactionManifestDigest: executionpin.Digest(requestLedgerStateTestDigest("transaction manifest")),
 		ParticipantAuthorityRoot:  executionpin.Digest(requestLedgerStateTestDigest("participant authority")),

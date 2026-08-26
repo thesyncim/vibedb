@@ -139,27 +139,9 @@ func terminalAuthorityRelease(
 	execution DurableRequestTypedExecutionContext,
 ) executionpin.Command {
 	t.Helper()
-	participant := execution.Participants
-	if !participant.Next() {
-		t.Fatalf("participant: %v", participant.Err())
-	}
-	logical := participant.Current()
-	if err := participant.Reset(); err != nil {
+	binding, err := BuildDurableRequestExecutionPinBinding(execution)
+	if err != nil {
 		t.Fatal(err)
-	}
-	binding := executionpin.Binding{
-		RequestKeyDigest:  executionpin.Digest(execution.Recipe.KeyDigest),
-		RequestDigest:     executionpin.Digest(execution.Recipe.RequestDigest),
-		CatalogGeneration: execution.Recipe.CatalogGeneration,
-		SchemaGeneration:  logical.SchemaGeneration,
-		SchemaManifestDigest: executionpin.Digest(
-			execution.Recipe.Contract.SchemaManifestDigest,
-		),
-		TransactionManifestDigest: executionpin.Digest(logical.MutationDigest),
-		ParticipantAuthorityRoot:  executionpin.Digest(logical.MutationDigest),
-		ParticipantCount:          1,
-		ExecutionContractDigest:   executionpin.Digest(execution.Recipe.Contract.PinDigest),
-		LedgerHomeGroup:           executionpin.ID(logical.Group.GroupID),
 	}
 	pin, err := executionpin.DerivePinID(binding)
 	if err != nil {
