@@ -16,15 +16,18 @@ import (
 // is an authenticated fanout capability and must be supplied explicitly; a
 // local CatalogHolder is never sufficient move-completion authority.
 type gatewayReplicaMoveControls struct {
-	Observer   rebalance.ReplicatedMoveObserver
-	Routes     rebalanceexec.MoveRouteResolver
-	Membership rebalanceexec.MembershipClient
-	Snapshots  rebalanceexec.SnapshotSource
-	Bootstrap  rebalanceexec.SnapshotBootstrapClient
-	Awaiter    rebalanceexec.MoveAwaiter
-	Ownership  rebalanceexec.OwnershipProposer
-	Drainer    rebalanceexec.CatalogDrainCertifier
-	Retirement rebalanceexec.SourceRetirer
+	Observer rebalance.ReplicatedMoveObserver
+	// HealthObservations is the authenticated shard-control client shared with
+	// the failure scheduler. It only supplies current liveness/donor cuts.
+	HealthObservations gatewayReplicaObservationClient
+	Routes             rebalanceexec.MoveRouteResolver
+	Membership         rebalanceexec.MembershipClient
+	Snapshots          rebalanceexec.SnapshotSource
+	Bootstrap          rebalanceexec.SnapshotBootstrapClient
+	Awaiter            rebalanceexec.MoveAwaiter
+	Ownership          rebalanceexec.OwnershipProposer
+	Drainer            rebalanceexec.CatalogDrainCertifier
+	Retirement         rebalanceexec.SourceRetirer
 }
 
 func newGatewayReplicaMoveController(

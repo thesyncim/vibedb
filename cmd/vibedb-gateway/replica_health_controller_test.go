@@ -110,6 +110,35 @@ func TestRunReplicaHealthControllerStartsImmediately(t *testing.T) {
 	}
 }
 
+func TestReplicaControllerLifecycleJoinsBothLoops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	moves := &oneReplicaMovePass{cancel: cancel}
+	health := &oneReplicaHealthPass{cancel: cancel}
+	done, err := startGatewayReplicaControllers(
+		ctx, moves, health, time.Hour, func(string, ...any) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replica controllers did not join after cancellation")
+	}
+	if moves.calls != 1 || health.calls != 1 {
+		t.Fatalf("move calls=%d health calls=%d", moves.calls, health.calls)
+	}
+}
+
+func TestReplicaHealthRuntimeFailsClosedWithoutAuthorityOrTransport(t *testing.T) {
+	if controller, err := newGatewayReplicaHealthRuntime(
+		testReplicaHealthCatalog{testReplicaHealthSnapshot(t)}, nil, nil,
+		testCandidateInventory{}, nil,
+	); controller != nil || !errors.Is(err, errGatewayReplicaHealth) {
+		t.Fatalf("controller=%v err=%v", controller, err)
+	}
+}
+
 type testAuthenticatedHealthClient struct{}
 
 func (testAuthenticatedHealthClient) Observe(

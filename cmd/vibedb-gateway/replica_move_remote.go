@@ -293,7 +293,7 @@ func newGatewayReplicaRemoteClients(
 	remote := &gatewayReplicaRemoteActions{observer: observations, actions: actions,
 		routes: options.Routes}
 	return gatewayReplicaMoveControls{
-		Observer: options.Observer, Routes: options.Routes,
+		Observer: options.Observer, HealthObservations: observations, Routes: options.Routes,
 		Membership: gatewayGrantedMembershipClient{grants: options.Authority,
 			installer: grantInstaller, applier: options.Replicated},
 		Snapshots: source, Bootstrap: bootstrap, Awaiter: remote, Ownership: remote,

@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
@@ -364,6 +365,7 @@ func runServe(args []string) int {
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	var replicaControlDone <-chan error
+	var replicaControllersDone <-chan struct{}
 	if replicaControlManifest != nil {
 		manifest := *replicaControlManifest
 		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
@@ -389,6 +391,11 @@ func runServe(args []string) int {
 		moveController, controllerErr := newGatewayReplicaMoveController(
 			catalogAuthority, replicated, controls,
 		)
+		healthController, healthErr := newGatewayReplicaHealthRuntime(
+			catalogAuthority,
+			rebalance.ReplicatedFailureAuthority{Source: catalogAuthority},
+			controls.HealthObservations, manifest, moveController,
+		)
 		gatewayNodes := make([]rafttransport.NodeID, len(manifest.Gateways))
 		gatewayRoster := make(map[rafttransport.NodeID]uint64, len(manifest.Gateways))
 		for index, endpoint := range manifest.Gateways {
@@ -411,13 +418,23 @@ func runServe(args []string) int {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, drainErr, controlsErr, controllerErr,
+		if joined := errors.Join(openErr, drainErr, controlsErr, controllerErr, healthErr,
 			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
 			if controlListener != nil {
 				_ = controlListener.Close()
 			}
 			_ = listener.Close()
 			fmt.Fprintf(os.Stderr, "gateway: initialize replica control: %v\n", joined)
+			return 1
+		}
+		replicaControllersDone, err = startGatewayReplicaControllers(
+			ctx, moveController, healthController,
+			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, logf,
+		)
+		if err != nil {
+			_ = controlListener.Close()
+			_ = listener.Close()
+			fmt.Fprintf(os.Stderr, "gateway: start replica controllers: %v\n", err)
 			return 1
 		}
 		controlDone := make(chan error, 1)
@@ -436,8 +453,6 @@ func runServe(args []string) int {
 			controlDone <- serveErr
 			stop()
 		}()
-		go runReplicaMoveController(ctx, moveController,
-			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, logf)
 	}
 	if catalogAuthority != nil {
 		trigger := &gatewayControllerTriggerClient{
@@ -469,6 +484,10 @@ func runServe(args []string) int {
 			!errors.Is(controlErr, context.Canceled) {
 			replicaControlErr = controlErr
 		}
+	}
+	if replicaControllersDone != nil {
+		stop()
+		<-replicaControllersDone
 	}
 	if serveErr := errors.Join(replicaControlErr, nonCanceledError(err)); serveErr != nil {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", serveErr)
