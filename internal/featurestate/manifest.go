@@ -114,6 +114,21 @@ var Distributed = []Feature{
 		}},
 	},
 	{
+		Name: "Fused RF3 transaction execution",
+		Primitive: Stage{StatusYes, "Fresh replicated operations atomically combine coordinator begin with its local prepare, remote stage with prepare, and participant apply or abort with release. Inline and greedily packed manifests remain byte-bounded without a participant-count contract.", []Reference{
+			ref("internal/distributedtxn/replicated_codec.go", "ReplicatedOperation"), ref("internal/replicatedstate/transaction_apply.go", "planCoordinatorBeginPrepare"),
+		}},
+		Integrated: Stage{StatusYes, "The replicated command envelope binds native relation batches, exact participant routes, immutable prepare votes, lineage, retries, manifest boundaries, and base-plus-index apply into the same deterministic state transition.", []Reference{
+			ref("internal/replication/command.go", "TransactionClientSequence"), ref("internal/replicatedstate/transaction_completion.go", "transactionHistoricalRetryExact"),
+		}},
+		Shipped: Stage{StatusNo, "The shipped gateway still uses the static transaction orchestrator. The fused operations are intentionally not selected until the RF3 writer and recovery controller can switch authority together without a legacy-journal fallback.", []Reference{
+			ref("gateway/transaction.go", "executeTransaction"), ref("gateway/recovery.go", "RecoverAll"),
+		}},
+		Qualification: Stage{StatusPartial, "State-machine tests prove atomic begin/prepare, vote-no, deferred manifest binding, base-plus-global-index finish, reclamation, and historical retries. Encoded schedules prove 2P+1 response-critical proposals for 2, 65, and 4097 participants. A real two-group RF3 fault gate is the next safe point.", []Reference{
+			ref("internal/replicatedstate/transaction_apply_integration_test.go", "TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire"), ref("internal/replication/transaction_perf_contract_test.go", "TestReplicatedTransactionEncodedSchedulePerformanceTargets"),
+		}},
+	},
+	{
 		Name: "RF3 transaction recovery reads",
 		Primitive: Stage{StatusYes, "A closed hidden-state reader provides exact coordinator and participant lookup, paged manifest access, and bounded resumable active-coordinator scans without a participant-count contract.", []Reference{
 			ref("internal/replicatedstate/transaction_recovery_read.go", "TransactionRecoveryReadInto"), ref("internal/replicatedstate/transaction_recovery_read.go", "TransactionRecoveryReadRequest"),

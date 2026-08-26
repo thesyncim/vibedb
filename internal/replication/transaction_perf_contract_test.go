@@ -1,8 +1,13 @@
 package replication
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
 	"testing"
 	"unsafe"
+
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 )
 
 var (
@@ -115,38 +120,148 @@ func TestTransactionBodyOrdinaryCommandCopyBudget(t *testing.T) {
 	}
 }
 
-// TestReplicatedTransactionProtocolPerformanceTargets is intentionally a
-// target contract, not a claim about an integrated transaction runner. It
-// keeps the desired proposal and ordered-barrier geometry executable while the
-// transaction command grammar is developed independently.
-func TestReplicatedTransactionProtocolPerformanceTargets(t *testing.T) {
+// TestFusedTransactionBodyCopyBudget exercises the real CommandTransaction
+// envelope used by the response-critical participant prepare wave. Native
+// relation bytes are owned once by the output buffer and borrowed through
+// both nested decoders; payload size does not introduce another full copy.
+func TestFusedTransactionBodyCopyBudget(t *testing.T) {
 	tests := []struct {
-		participants int
-		critical     int
-		total        int
-		barriers     int
+		name         string
+		payloadBytes int
+		runs         int
+	}{
+		{name: "1KiB", payloadBytes: 1 << 10, runs: 100},
+		{name: "64KiB", payloadBytes: 64 << 10, runs: 50},
+		{name: "1MiB", payloadBytes: 1 << 20, runs: 10},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command, payload := transactionPerfFusedCommand(t, test.payloadBytes)
+			encoded := encodeCommand(t, command)
+			if len(encoded) <= len(payload) || len(encoded)-len(payload) > 1024 {
+				t.Fatalf("fused command bytes=%d payload=%d", len(encoded), len(payload))
+			}
+			scratch := make([]byte, 0, len(encoded))
+			var err error
+			transactionPerfBytesSink, err = AppendCommand(scratch[:0], command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transactionPerfBytesSink, err = AppendCommand(nil, command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if allocations := testing.AllocsPerRun(test.runs, func() {
+				transactionPerfBytesSink, err = AppendCommand(scratch[:0], command)
+				if err != nil {
+					panic(err)
+				}
+			}); allocations != 0 {
+				t.Fatalf("pre-sized fused append allocations=%v, want 0", allocations)
+			}
+			if allocations := testing.AllocsPerRun(test.runs, func() {
+				transactionPerfBytesSink, err = AppendCommand(nil, command)
+				if err != nil {
+					panic(err)
+				}
+			}); allocations < 1 || allocations > 2 {
+				t.Fatalf("owned fused append allocations=%v, want in [1,2]", allocations)
+			}
+			if allocations := testing.AllocsPerRun(test.runs, func() {
+				view, openErr := OpenCommand(encoded)
+				if openErr != nil {
+					panic(openErr)
+				}
+				transactionPerfIntSink += len(view.TransactionBytes())
+				relations := view.RelationBatches()
+				for relations.Next() {
+					mutations := relations.Batch().Mutations()
+					for mutations.Next() {
+						mutation := mutations.Mutation()
+						transactionPerfIntSink += len(mutation.Key) + len(mutation.Value)
+					}
+				}
+			}); allocations != 0 {
+				t.Fatalf("borrowed fused open allocations=%v, want 0", allocations)
+			}
+
+			view, err := OpenCommand(encoded)
+			if err != nil || !sliceInside(view.TransactionBytes(), encoded) ||
+				cap(view.TransactionBytes()) != len(view.TransactionBytes()) {
+				t.Fatalf("fused transaction body was copied or retained capacity: %v", err)
+			}
+			relations := view.RelationBatches()
+			if !relations.Next() {
+				t.Fatal("fused transaction has no relation batch")
+			}
+			mutations := relations.Batch().Mutations()
+			if !mutations.Next() {
+				t.Fatal("fused transaction has no mutation")
+			}
+			mutation := mutations.Mutation()
+			if len(mutation.Value) != len(payload) || !sliceInside(mutation.Value, encoded) ||
+				cap(mutation.Value) != len(mutation.Value) {
+				t.Fatal("fused mutation payload was copied or retained capacity")
+			}
+		})
+	}
+}
+
+// TestReplicatedTransactionEncodedSchedulePerformanceTargets builds and opens
+// the native one-shard fast path or every route-bound fused CommandTransaction
+// for a distributed success schedule. It proves the canonical envelope count,
+// identities, route diversity, manifest packing, and revision CAS values.
+// State-machine execution and two-real-RF3-group fault coverage belong in the
+// cross-layer replicatedstate/shard-service suites; this package cannot import
+// those layers without an import cycle.
+func TestReplicatedTransactionEncodedSchedulePerformanceTargets(t *testing.T) {
+	tests := []struct {
+		participants  int
+		critical      int
+		total         int
+		barriers      int
+		manifestPages int
 	}{
 		{participants: 1, critical: 1, total: 1, barriers: 1},
 		{participants: 2, critical: 5, total: 6, barriers: 4},
-		{participants: 8, critical: 17, total: 18, barriers: 4},
-		{participants: 64, critical: 129, total: 130, barriers: 4},
-		// The arithmetic is byte-bounded, not restricted to 64 participants.
-		{participants: 4096, critical: 8193, total: 8194, barriers: 4},
+		{participants: 65, critical: 131, total: 132, barriers: 4, manifestPages: 1},
+		// 4097 deliberately crosses both the inline threshold and one page.
+		{participants: 4097, critical: 8195, total: 8196, barriers: 4, manifestPages: 5},
 	}
 	for _, test := range tests {
-		critical, total, barriers := replicatedTransactionPerformanceTarget(test.participants)
-		if critical != test.critical || total != test.total || barriers != test.barriers {
+		got := buildReplicatedTransactionPerformanceSchedule(t, test.participants)
+		if got.critical != test.critical || got.total != test.total ||
+			got.barriers != test.barriers || got.manifestPages != test.manifestPages {
 			t.Fatalf(
-				"participants=%d target = critical:%d total:%d barriers:%d, want %d/%d/%d",
-				test.participants, critical, total, barriers,
-				test.critical, test.total, test.barriers,
+				"participants=%d schedule=critical:%d total:%d barriers:%d pages:%d, want %d/%d/%d/%d",
+				test.participants, got.critical, got.total, got.barriers, got.manifestPages,
+				test.critical, test.total, test.barriers, test.manifestPages,
 			)
 		}
+		if got.maxCommandBytes > 1<<20 {
+			t.Fatalf("participants=%d max command=%dB, want <=1MiB",
+				test.participants, got.maxCommandBytes)
+		}
 		if test.participants > 1 {
+			if got.uniquePrepares != test.participants || got.uniqueFinishes != test.participants {
+				t.Fatalf("participants=%d unique prepares/finishes=%d/%d, want %d/%d",
+					test.participants, got.uniquePrepares, got.uniqueFinishes,
+					test.participants, test.participants)
+			}
+			wantDecisionRevision := uint64(1)
+			if test.manifestPages != 0 {
+				wantDecisionRevision = uint64(test.manifestPages)
+			}
+			if got.decisionRevision != wantDecisionRevision ||
+				got.retireRevision != wantDecisionRevision+1 {
+				t.Fatalf("participants=%d coordinator revisions=%d/%d, want %d/%d",
+					test.participants, got.decisionRevision, got.retireRevision,
+					wantDecisionRevision, wantDecisionRevision+1)
+			}
 			legacyProposals := 4*test.participants + 3
-			if total >= legacyProposals {
+			if got.total >= legacyProposals {
 				t.Fatalf("participants=%d target proposals=%d do not improve legacy=%d",
-					test.participants, total, legacyProposals)
+					test.participants, got.total, legacyProposals)
 			}
 		}
 	}
@@ -238,6 +353,55 @@ func BenchmarkTransactionBodyOrdinaryCommandEnvelope(b *testing.B) {
 	}
 }
 
+func BenchmarkFusedTransactionEnvelope(b *testing.B) {
+	tests := []struct {
+		name         string
+		payloadBytes int
+	}{
+		{name: "1KiB", payloadBytes: 1 << 10},
+		{name: "64KiB", payloadBytes: 64 << 10},
+		{name: "1MiB", payloadBytes: 1 << 20},
+		{name: "4MiB", payloadBytes: MaxMutationValueBytes},
+	}
+	for _, test := range tests {
+		command, payload := transactionPerfFusedCommand(b, test.payloadBytes)
+		encoded := encodeCommand(b, command)
+		b.Run(test.name+"/append-presized", func(b *testing.B) {
+			scratch := make([]byte, 0, len(encoded))
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				var err error
+				transactionPerfBytesSink, err = AppendCommand(scratch[:0], command)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(encoded)-len(payload)), "framing-B/op")
+		})
+		b.Run(test.name+"/open-borrowed", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				view, err := OpenCommand(encoded)
+				if err != nil {
+					b.Fatal(err)
+				}
+				transactionPerfIntSink += len(view.TransactionBytes())
+				relations := view.RelationBatches()
+				for relations.Next() {
+					mutations := relations.Batch().Mutations()
+					for mutations.Next() {
+						mutation := mutations.Mutation()
+						transactionPerfIntSink += len(mutation.Key) + len(mutation.Value)
+					}
+				}
+			}
+			b.ReportMetric(float64(len(encoded)-len(payload)), "framing-B/op")
+		})
+	}
+}
+
 func transactionPerfCommand(payloadBytes int) (Command, []byte) {
 	command := testCommand()
 	payload := make([]byte, payloadBytes)
@@ -248,6 +412,257 @@ func transactionPerfCommand(payloadBytes int) (Command, []byte) {
 		Kind: MutationPut, Key: []byte{'k'}, Value: payload,
 	}}
 	return command, payload
+}
+
+func transactionPerfFusedCommand(t testing.TB, payloadBytes int) (Command, []byte) {
+	t.Helper()
+	command := testFusedParticipantStageCommand(t)
+	payload := make([]byte, payloadBytes)
+	for index := range payload {
+		payload[index] = byte(index*131 + 17)
+	}
+	command.Batches = []RelationMutationBatch{{
+		Relation:  1,
+		Mutations: []Mutation{{Kind: MutationPut, Key: []byte{'k'}, Value: payload}},
+	}}
+	digest, err := TransactionMutationDigest(command.Batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := distributedtxn.OpenReplicatedCommand(command.Transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	construction := control.Command()
+	construction.Participant.MutationDigest = digest
+	command.Transaction, err = distributedtxn.AppendReplicatedCommand(nil, construction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return command, payload
+}
+
+type transactionPerformanceSchedule struct {
+	critical         int
+	total            int
+	barriers         int
+	manifestPages    int
+	maxCommandBytes  int
+	uniquePrepares   int
+	uniqueFinishes   int
+	decisionRevision uint64
+	retireRevision   uint64
+}
+
+func buildReplicatedTransactionPerformanceSchedule(
+	t testing.TB,
+	participants int,
+) transactionPerformanceSchedule {
+	t.Helper()
+	if participants <= 0 {
+		return transactionPerformanceSchedule{}
+	}
+	if participants == 1 {
+		command := testMultiRelationCommand()
+		encoded := encodeCommand(t, command)
+		return transactionPerformanceSchedule{
+			critical: 1, total: 1, barriers: 1, maxCommandBytes: len(encoded),
+		}
+	}
+
+	base := testMultiRelationCommand()
+	digest, err := TransactionMutationDigest(base.Batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := distributedtxn.ID(transactionControlID(0xb7))
+	refs := transactionPerformanceParticipants(participants, digest)
+	participant := distributedtxn.ParticipantStage{
+		CoordinatorGroup:            distributedtxn.ID(base.GroupID),
+		CoordinatorShardIncarnation: distributedtxn.ID(base.ShardIncarnation),
+		CoordinatorAllocation:       refs[0].AllocationGeneration,
+		BucketBits:                  8,
+		IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
+		MutationDigest:              digest,
+	}
+	metrics := transactionPerformanceSchedule{}
+	prepareEnvelopes := make(map[[32]byte]struct{}, participants)
+	finishEnvelopes := make(map[[32]byte]struct{}, participants)
+	appendCommand := func(
+		control distributedtxn.ReplicatedCommand,
+		batches []RelationMutationBatch,
+		route distributedtxn.ParticipantRef,
+		critical bool,
+		identitySet map[[32]byte]struct{},
+	) {
+		controlBytes, appendErr := distributedtxn.AppendReplicatedCommand(nil, control)
+		if appendErr != nil {
+			t.Fatalf("append operation %d: %v", control.Operation, appendErr)
+		}
+		command := base
+		command.Kind = CommandTransaction
+		command.Transaction = controlBytes
+		command.ClientID = ID128(id)
+		if control.Role == distributedtxn.ReplicatedRoleParticipant {
+			command.ClientEpoch = transactionParticipantEpoch
+		} else {
+			command.ClientEpoch = transactionCoordinatorEpoch
+		}
+		command.ClientSequence, appendErr = TransactionClientSequence(controlBytes)
+		if appendErr != nil {
+			t.Fatalf("operation %d sequence: %v", control.Operation, appendErr)
+		}
+		command.AckThrough = 0
+		command.Batches = batches
+		command.Distribution = string(route.Distribution)
+		command.Shard = string(route.Shard)
+		command.RoutingVersion = route.RoutingVersion
+		command.AllocationGeneration = route.AllocationGeneration
+		command.OwnershipEpoch = route.OwnershipEpoch
+		encoded := encodeCommand(t, command)
+		view, openErr := OpenCommand(encoded)
+		if openErr != nil || !bytes.Equal(view.TransactionBytes(), controlBytes) {
+			t.Fatalf("open operation %d: %v", control.Operation, openErr)
+		}
+		if !bytes.Equal(view.Distribution, route.Distribution) ||
+			!bytes.Equal(view.Shard, route.Shard) ||
+			view.RoutingVersion != route.RoutingVersion ||
+			view.AllocationGeneration != route.AllocationGeneration ||
+			view.OwnershipEpoch != route.OwnershipEpoch {
+			t.Fatalf("operation %d route does not match participant", control.Operation)
+		}
+		metrics.maxCommandBytes = max(metrics.maxCommandBytes, len(encoded))
+		if identitySet != nil {
+			identity := sha256.Sum256(encoded)
+			if _, exists := identitySet[identity]; exists {
+				t.Fatalf("operation %d emitted a duplicate route-bound envelope", control.Operation)
+			}
+			identitySet[identity] = struct{}{}
+		}
+		metrics.total++
+		if critical {
+			metrics.critical++
+		}
+	}
+
+	coordinator := distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 1, RecoveryDeadline: 1, Participants: refs,
+	}
+	participant.ParticipantOrdinal = 0
+	if participants <= distributedtxn.MaxInlineParticipants {
+		record, appendErr := distributedtxn.AppendCoordinator(nil, coordinator)
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+		appendCommand(distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleCoordinator,
+			Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
+			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator,
+			Payload: record, Participant: participant,
+		}, base.Batches, refs[0], true, prepareEnvelopes)
+	} else {
+		pageScratch := make([]byte, distributedtxn.ManifestSegmentBytes)
+		packed := make([]byte, 0, distributedtxn.MaxManifestSegmentSequenceBytes)
+		builder, buildErr := distributedtxn.NewManifestBuilder(
+			pageScratch,
+			func(segment distributedtxn.ManifestSegment) error {
+				metrics.manifestPages++
+				packed = append(packed, segment.Raw...)
+				return nil
+			},
+		)
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		for index := range refs {
+			if buildErr = builder.Append(refs[index]); buildErr != nil {
+				t.Fatalf("manifest participant %d: %v", index, buildErr)
+			}
+		}
+		descriptor, buildErr := builder.Seal()
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		if metrics.manifestPages > distributedtxn.MaxManifestSegmentsPerCommand {
+			t.Fatalf("participants=%d require %d initial pages, packing gate supports %d",
+				participants, metrics.manifestPages, distributedtxn.MaxManifestSegmentsPerCommand)
+		}
+		manifest, appendErr := distributedtxn.AppendManifestCoordinator(
+			nil, distributedtxn.ManifestCoordinatorRecord{
+				ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+				CatalogGeneration: 1, RecoveryDeadline: 1, Manifest: descriptor,
+			},
+		)
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+		payload := append(manifest, packed...)
+		appendCommand(distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleCoordinator,
+			Operation: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
+			Payload: payload, Participant: participant,
+		}, base.Batches, refs[0], true, prepareEnvelopes)
+	}
+	metrics.barriers++ // coordinator begin plus its local prepare
+	metrics.decisionRevision = uint64(max(1, metrics.manifestPages))
+
+	for ordinal := 1; ordinal < participants; ordinal++ {
+		participant.ParticipantOrdinal = uint32(ordinal)
+		appendCommand(distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleParticipant,
+			Operation: distributedtxn.ReplicatedStagePrepareParticipant,
+			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+			Participant: participant,
+		}, base.Batches, refs[ordinal], true, prepareEnvelopes)
+	}
+	metrics.uniquePrepares = len(prepareEnvelopes)
+	metrics.barriers++ // parallel remote prepare wave
+
+	appendCommand(distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedCommitCoordinator,
+		ID:        id, ExpectedRevision: metrics.decisionRevision,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	}, nil, refs[0], true, nil)
+	metrics.barriers++
+
+	for ordinal := range participants {
+		appendCommand(distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleParticipant,
+			Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
+			ID:        id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		}, nil, refs[ordinal], true, finishEnvelopes)
+	}
+	metrics.uniqueFinishes = len(finishEnvelopes)
+	metrics.barriers++ // parallel apply plus release wave
+
+	metrics.retireRevision = metrics.decisionRevision + 1
+	appendCommand(distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedRetireCoordinator,
+		ID:        id, ExpectedRevision: metrics.retireRevision,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	}, nil, refs[0], false, nil)
+	return metrics
+}
+
+func transactionPerformanceParticipants(
+	count int,
+	digest distributedtxn.Digest,
+) []distributedtxn.ParticipantRef {
+	participants := make([]distributedtxn.ParticipantRef, count)
+	for index := range participants {
+		participants[index] = distributedtxn.ParticipantRef{
+			Distribution:   []byte("data"),
+			Shard:          []byte(fmt.Sprintf("s%08d", index)),
+			RoutingVersion: 1, AllocationGeneration: uint64(index + 1),
+			OwnershipEpoch: uint64(index + 1), MutationDigest: digest,
+			State: distributedtxn.ParticipantStaged,
+		}
+	}
+	return participants
 }
 
 func transactionPerfCommandBytes(command Command) int {
@@ -274,25 +689,6 @@ func sliceInside(inner, outer []byte) bool {
 	outerStart := uintptr(unsafe.Pointer(unsafe.SliceData(outer)))
 	outerEnd := outerStart + uintptr(len(outer))
 	return innerStart >= outerStart && innerEnd <= outerEnd
-}
-
-func replicatedTransactionPerformanceTarget(participants int) (
-	criticalProposals int,
-	totalProposals int,
-	orderedBarriers int,
-) {
-	if participants <= 0 {
-		return 0, 0, 0
-	}
-	if participants == 1 {
-		// Same-shard, multi-relation mutations are one atomic command.
-		return 1, 1, 1
-	}
-	// Begin+prepare the coordinator, prepare every remote participant, commit,
-	// and apply+release every participant are response-critical. Coordinator
-	// retirement is one non-critical cleanup proposal after all apply acks.
-	criticalProposals = 2*participants + 1
-	return criticalProposals, criticalProposals + 1, 4
 }
 
 func ceilPositive(value, unit int) int {

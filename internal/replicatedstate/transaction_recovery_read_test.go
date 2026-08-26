@@ -2,7 +2,9 @@ package replicatedstate
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -209,6 +211,141 @@ func TestTransactionRecoveryReadManifestBeyondInlineParticipantLimit(t *testing.
 		result.Records[0].PayloadCount != distributedtxn.MaxInlineParticipants+1 ||
 		!bytes.Equal(result.Records[0].Payload, pageZero) {
 		t.Fatalf("manifest page recovery=%+v err=%v", result, err)
+	}
+}
+
+func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
+	for _, pageCount := range []int{2, distributedtxn.MaxManifestSegmentsPerCommand} {
+		t.Run("pages_"+strconv.Itoa(pageCount), func(t *testing.T) {
+			fixture := newMachineFixture(t)
+			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+				t.Fatal(err)
+			}
+			applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+			id := transactionCodecID(byte(214 + pageCount))
+			mutation := replication.Mutation{
+				Kind: replication.MutationPut, Key: []byte{byte(pageCount), 0x91},
+				Value: []byte(`{"packed":true}`),
+			}
+			batches := []replication.RelationMutationBatch{{
+				Relation: 1, Mutations: []replication.Mutation{mutation},
+			}}
+			mutationDigest, err := replication.TransactionMutationDigest(batches)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			pageArena := make([]byte, distributedtxn.ManifestSegmentBytes)
+			pages := make([][]byte, 0, pageCount)
+			builder, err := distributedtxn.NewManifestBuilder(
+				pageArena,
+				func(segment distributedtxn.ManifestSegment) error {
+					pages = append(pages, bytes.Clone(segment.Raw))
+					return nil
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			participantOrdinal := uint64(0)
+			for len(pages) < pageCount-1 {
+				var shard [16]byte
+				for index := range shard {
+					shard[index] = '0'
+				}
+				value := participantOrdinal
+				const hex = "0123456789abcdef"
+				for index := len(shard) - 1; index >= 0; index-- {
+					shard[index] = hex[value&15]
+					value >>= 4
+				}
+				var digest distributedtxn.Digest
+				binary.LittleEndian.PutUint64(digest[:8], participantOrdinal+1)
+				if err := builder.Append(distributedtxn.ParticipantRef{
+					Distribution: []byte(fixture.binding.Distribution), Shard: shard[:],
+					RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
+					MutationDigest: digest, State: distributedtxn.ParticipantStaged,
+				}); err != nil {
+					t.Fatalf("append filler participant %d: %v", participantOrdinal, err)
+				}
+				participantOrdinal++
+			}
+			if participantOrdinal > uint64(^uint32(0)) {
+				t.Fatal("test manifest ordinal exceeded wire bound")
+			}
+			if err := builder.Append(distributedtxn.ParticipantRef{
+				Distribution:         []byte(fixture.binding.Distribution),
+				Shard:                []byte(fixture.binding.Shard),
+				RoutingVersion:       fixture.binding.RoutingVersion,
+				AllocationGeneration: fixture.binding.AllocationGeneration,
+				OwnershipEpoch:       fixture.binding.OwnershipEpoch,
+				MutationDigest:       mutationDigest, State: distributedtxn.ParticipantStaged,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			descriptor, err := builder.Seal()
+			if err != nil || len(pages) != pageCount ||
+				descriptor.SegmentCount != uint32(pageCount) {
+				t.Fatalf("seal pages=%d descriptor=%+v err=%v", len(pages), descriptor, err)
+			}
+			coordinator, err := distributedtxn.AppendManifestCoordinator(
+				nil,
+				distributedtxn.ManifestCoordinatorRecord{
+					ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+					CatalogGeneration: fixture.binding.SchemaGeneration,
+					RecoveryDeadline:  1, Manifest: descriptor,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := bytes.Clone(coordinator)
+			for _, page := range pages {
+				start = append(start, page...)
+			}
+			command := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+				Role:      distributedtxn.ReplicatedRoleCoordinator,
+				Operation: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+				ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
+				Payload: start,
+				Participant: distributedtxn.ParticipantStage{
+					CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
+					CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
+					CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+					BucketBits:                  8, IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+					MutationDigest: mutationDigest, ParticipantOrdinal: uint32(participantOrdinal),
+				},
+			}, batches)
+			applyTransactionCommand(t, fixture.machine, 3, command)
+
+			records := make([]TransactionRecoveryRecord, 0, 1)
+			payload := make([]byte, 0, MaxTransactionRecoveryPayloadArenaBytes)
+			lookup, err := fixture.machine.TransactionRecoveryReadInto(
+				TransactionRecoveryReadRequest{
+					Kind: TransactionRecoveryLookupCoordinator, ID: id, MinimumApplied: 3,
+					MaxRows: 1, MaxBytes: uint32(TransactionRecoverySummaryBytes + len(coordinator)),
+				},
+				records, payload,
+			)
+			if err != nil || len(lookup.Records) != 1 ||
+				!bytes.Equal(lookup.Records[0].Payload, coordinator) {
+				t.Fatalf("coordinator recovery=%+v err=%v", lookup, err)
+			}
+			for pageIndex, want := range pages {
+				result, readErr := fixture.machine.TransactionRecoveryReadInto(
+					TransactionRecoveryReadRequest{
+						Kind: TransactionRecoveryReadManifestPage, ID: id,
+						ManifestPage: uint32(pageIndex), MinimumApplied: 3,
+						MaxRows: 1, MaxBytes: MaxTransactionRecoveryReadBytes,
+					},
+					records, payload,
+				)
+				if readErr != nil || len(result.Records) != 1 ||
+					!bytes.Equal(result.Records[0].Payload, want) {
+					t.Fatalf("page %d recovery=%+v err=%v", pageIndex, result, readErr)
+				}
+			}
+		})
 	}
 }
 

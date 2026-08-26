@@ -5,22 +5,31 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"unicode/utf8"
+	"unsafe"
 )
 
 const (
 	replicatedCommandHeaderBytes   = 128
 	replicatedCommandChecksumBytes = 4
 	// ReplicatedManifestCoordinatorRecordBytes is the exact VTCM prefix length
-	// in a manifest-start payload. The canonical VTM1 page zero follows it
-	// immediately in the same replicated command.
+	// in a manifest-start payload. A canonical sequence of one through
+	// MaxManifestSegmentsPerCommand VTM1 pages follows it immediately.
 	ReplicatedManifestCoordinatorRecordBytes = manifestCoordinatorHeaderBytes + 4
+	// MaxManifestSegmentsPerCommand is a byte-packing bound, not a transaction
+	// participant bound. Fifteen worst-case 64 KiB pages keep the manifest page
+	// pack below 1 MiB. The outer proposal's native relation mutations are not
+	// manifest bytes and may legitimately raise the complete proposal above it.
+	MaxManifestSegmentsPerCommand   = 15
+	MaxManifestSegmentSequenceBytes = MaxManifestSegmentsPerCommand * ManifestSegmentBytes
 
-	// MaxReplicatedCommandBytes is an encoded-byte admission bound. Relation
-	// mutation bytes are carried once by the outer replication command and are
-	// deliberately not part of this transaction control body.
+	// MaxReplicatedCommandBytes bounds this transaction control body, not the
+	// complete outer proposal. Relation mutation bytes are carried once by the
+	// outer replication command and may legitimately make that proposal larger.
+	// The maximum control shape is a fused manifest coordinator begin: fixed
+	// header, caller-owned intent scopes, VTCM, fifteen VTM1 pages, and checksum.
 	MaxReplicatedCommandBytes = replicatedCommandHeaderBytes +
 		MaxIntentScopes*8 + ReplicatedManifestCoordinatorRecordBytes +
-		ManifestSegmentBytes + replicatedCommandChecksumBytes
+		MaxManifestSegmentSequenceBytes + replicatedCommandChecksumBytes
 )
 
 var replicatedCommandMagic = [4]byte{'V', 'T', 'R', 'C'}
@@ -50,6 +59,15 @@ const (
 	ReplicatedApplyParticipant
 	ReplicatedAbortParticipant
 	ReplicatedReleaseParticipant
+	// Fused success-path operations use fresh codes. Existing split operations
+	// remain readable only while the unreleased legacy gateway is switched as one
+	// unit; no old command can acquire stronger fused semantics by aliasing a code.
+	ReplicatedBeginPrepareCoordinator
+	ReplicatedBeginPrepareManifestCoordinator
+	ReplicatedAppendManifestSegments
+	ReplicatedStagePrepareParticipant
+	ReplicatedApplyReleaseParticipant
+	ReplicatedAbortReleaseParticipant
 )
 
 // ReplicatedPayloadKind binds the control body to one existing canonical
@@ -63,6 +81,7 @@ const (
 	ReplicatedPayloadManifestCoordinator
 	ReplicatedPayloadManifestSegment
 	ReplicatedPayloadParticipantStage
+	ReplicatedPayloadManifestSegments
 )
 
 // ParticipantStage is the compact durable intent metadata paired with native
@@ -75,12 +94,15 @@ type ParticipantStage struct {
 	BucketBits                  uint8
 	IntentScopes                []IntentScope
 	MutationDigest              Digest
+	// ParticipantOrdinal is the participant's exact position in the canonical
+	// coordinator manifest. Zero is a valid ordinal.
+	ParticipantOrdinal uint32
 }
 
 // ReplicatedCommand is the construction form of one self-delimiting
 // transaction control body. A manifest start contains VTCM immediately
-// followed by VTM1 page zero; later VTM1 pages are separate operations.
-// Payload is empty for participant staging and transitions.
+// followed by a direct canonical VTM1 page sequence; later pages use the same
+// zero-overhead sequence representation.
 type ReplicatedCommand struct {
 	Role             ReplicatedRole
 	Operation        ReplicatedOperation
@@ -106,46 +128,239 @@ func (v ReplicatedCommandView) Bytes() []byte { return v.raw[:len(v.raw):len(v.r
 // capacity-clamped alias; participant scopes use the decoder scratch.
 func (v ReplicatedCommandView) Command() ReplicatedCommand { return v.ReplicatedCommand }
 
-// OpenReplicatedManifestStart splits and validates the atomic VTCM plus VTM1
-// page-zero payload. Both returned slices are borrowed and capacity-clamped.
+// ManifestSegmentSequence is a validated, borrowed, zero-overhead concatenation
+// of canonical VTM1 pages. Its byte slice and every iterator page are capacity
+// clamped aliases of the input.
+type ManifestSegmentSequence struct {
+	raw              []byte
+	count            uint8
+	firstIndex       uint32
+	firstParticipant uint64
+	participantCount uint64
+	chain            Digest
+}
+
+func (s ManifestSegmentSequence) Bytes() []byte {
+	return s.raw[:len(s.raw):len(s.raw)]
+}
+func (s ManifestSegmentSequence) Count() int               { return int(s.count) }
+func (s ManifestSegmentSequence) FirstIndex() uint32       { return s.firstIndex }
+func (s ManifestSegmentSequence) FirstParticipant() uint64 { return s.firstParticipant }
+func (s ManifestSegmentSequence) ParticipantCount() uint64 { return s.participantCount }
+func (s ManifestSegmentSequence) EncodedBytes() uint64     { return uint64(len(s.raw)) }
+
+// ManifestSegmentIterator walks an already validated sequence without
+// revalidating or allocating.
+type ManifestSegmentIterator struct {
+	raw     []byte
+	cursor  int
+	current ManifestSegment
+}
+
+func (s ManifestSegmentSequence) Iterator() ManifestSegmentIterator {
+	return ManifestSegmentIterator{raw: s.raw}
+}
+
+func (i *ManifestSegmentIterator) Next() bool {
+	if i.cursor == len(i.raw) {
+		i.current = ManifestSegment{}
+		return false
+	}
+	raw := i.raw[i.cursor:]
+	total := manifestSegmentHeaderBytes + int(binary.LittleEndian.Uint32(raw[24:28])) + 4
+	page := raw[:total:total]
+	i.current = ManifestSegment{
+		Index:            binary.LittleEndian.Uint32(page[8:12]),
+		FirstParticipant: binary.LittleEndian.Uint64(page[16:24]),
+		ParticipantCount: binary.LittleEndian.Uint32(page[12:16]),
+		Digest:           sha256.Sum256(page), Raw: page,
+	}
+	i.cursor += total
+	return true
+}
+
+func (i *ManifestSegmentIterator) Segment() ManifestSegment { return i.current }
+
+// OpenManifestSegmentSequence validates one direct sequence of one through
+// fifteen self-delimiting VTM1 pages. Page ordinals, participant ordinals, and
+// identities are strictly increasing across page boundaries.
+func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
+	if len(raw) == 0 || len(raw) > MaxManifestSegmentSequenceBytes {
+		if len(raw) > MaxManifestSegmentSequenceBytes {
+			return ManifestSegmentSequence{}, ErrTooLarge
+		}
+		return ManifestSegmentSequence{}, ErrCorrupt
+	}
+	sequence := ManifestSegmentSequence{raw: raw[:len(raw):len(raw)]}
+	cursor := 0
+	var nextIndex uint32
+	var nextParticipant uint64
+	var prior manifestSegmentSummary
+	for cursor < len(raw) {
+		if sequence.count == MaxManifestSegmentsPerCommand ||
+			len(raw)-cursor < manifestSegmentHeaderBytes+manifestEntryFixedBytes+4 {
+			return ManifestSegmentSequence{}, ErrCorrupt
+		}
+		payloadBytes := uint64(binary.LittleEndian.Uint32(raw[cursor+24 : cursor+28]))
+		total := uint64(manifestSegmentHeaderBytes+4) + payloadBytes
+		if total > ManifestSegmentBytes || total > uint64(len(raw)-cursor) {
+			return ManifestSegmentSequence{}, ErrCorrupt
+		}
+		page := raw[cursor : cursor+int(total) : cursor+int(total)]
+		summary, ok := openCanonicalManifestSegment(page)
+		if !ok {
+			return ManifestSegmentSequence{}, ErrCorrupt
+		}
+		if sequence.count == 0 {
+			sequence.firstIndex = summary.index
+			sequence.firstParticipant = summary.firstParticipant
+			nextIndex, nextParticipant = summary.index, summary.firstParticipant
+		} else if compareIdentityBytes(
+			prior.lastDistribution[:prior.lastDistributionLength],
+			prior.lastShard[:prior.lastShardLength],
+			summary.firstDistribution[:summary.firstDistributionLength],
+			summary.firstShard[:summary.firstShardLength],
+		) >= 0 {
+			return ManifestSegmentSequence{}, ErrCorrupt
+		}
+		if summary.index != nextIndex || summary.index == ^uint32(0) ||
+			summary.firstParticipant != nextParticipant ||
+			uint64(summary.participantCount) > ^uint64(0)-nextParticipant {
+			return ManifestSegmentSequence{}, ErrCorrupt
+		}
+		nextIndex++
+		nextParticipant += uint64(summary.participantCount)
+		sequence.participantCount += uint64(summary.participantCount)
+		sequence.chain = appendManifestChain(sequence.chain, summary.index, summary.digest)
+		sequence.count++
+		prior = summary
+		cursor += int(total)
+	}
+	if cursor != len(raw) || sequence.count == 0 {
+		return ManifestSegmentSequence{}, ErrCorrupt
+	}
+	return sequence, nil
+}
+
+// ManifestSegmentSequenceFollows validates previous as one complete canonical
+// VTM1 page and requires its final participant identity to sort strictly before
+// the first identity in next. The already-opened sequence remains borrowed and
+// is inspected without decoding an identity arena or allocating.
+func ManifestSegmentSequenceFollows(previous []byte, next ManifestSegmentSequence) error {
+	prior, ok := openCanonicalManifestSegment(previous)
+	if !ok || len(next.raw) < manifestSegmentHeaderBytes+manifestEntryFixedBytes+4 ||
+		next.count == 0 {
+		return ErrCorrupt
+	}
+	payloadBytes := uint64(binary.LittleEndian.Uint32(next.raw[24:28]))
+	total := uint64(manifestSegmentHeaderBytes+4) + payloadBytes
+	if total > ManifestSegmentBytes || total > uint64(len(next.raw)) {
+		return ErrCorrupt
+	}
+	first, ok := openCanonicalManifestSegment(next.raw[:int(total):int(total)])
+	if !ok || compareIdentityBytes(
+		prior.lastDistribution[:prior.lastDistributionLength],
+		prior.lastShard[:prior.lastShardLength],
+		first.firstDistribution[:first.firstDistributionLength],
+		first.firstShard[:first.firstShardLength],
+	) >= 0 {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+// OpenReplicatedManifestStart splits and validates the atomic VTCM plus its
+// maximally packed initial VTM1 sequence. Both views borrow the payload.
 func OpenReplicatedManifestStart(payload []byte) (
 	coordinator []byte,
-	pageZero []byte,
+	segments ManifestSegmentSequence,
 	err error,
 ) {
 	if len(payload) <= ReplicatedManifestCoordinatorRecordBytes {
-		return nil, nil, ErrCorrupt
+		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
 	coordinatorEnd := ReplicatedManifestCoordinatorRecordBytes
 	coordinator = payload[:coordinatorEnd:coordinatorEnd]
-	pageZero = payload[coordinatorEnd:len(payload):len(payload)]
+	segmentBytes := payload[coordinatorEnd:len(payload):len(payload)]
 	record, openErr := OpenManifestCoordinator(coordinator)
-	if openErr != nil || !canonicalManifestSegment(pageZero) ||
-		binary.LittleEndian.Uint32(pageZero[8:12]) != 0 ||
-		binary.LittleEndian.Uint64(pageZero[16:24]) != 0 {
-		return nil, nil, ErrCorrupt
+	if openErr != nil {
+		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
-	pageCount := uint64(binary.LittleEndian.Uint32(pageZero[12:16]))
-	pageBytes := uint64(len(pageZero))
+	segments, openErr = OpenManifestSegmentSequence(segmentBytes)
+	if openErr != nil || segments.FirstIndex() != 0 || segments.FirstParticipant() != 0 {
+		return nil, ManifestSegmentSequence{}, ErrCorrupt
+	}
 	descriptor := record.Manifest
-	if pageCount > descriptor.ParticipantCount || pageBytes > descriptor.EncodedBytes {
-		return nil, nil, ErrCorrupt
+	if segments.ParticipantCount() > descriptor.ParticipantCount ||
+		segments.EncodedBytes() > descriptor.EncodedBytes {
+		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
-	if descriptor.SegmentCount == 1 {
-		segmentDigest := Digest(sha256.Sum256(pageZero))
-		chain := appendManifestChain(Digest{}, 0, segmentDigest)
-		if pageCount != descriptor.ParticipantCount || pageBytes != descriptor.EncodedBytes ||
-			finishManifestRoot(chain, ManifestDescriptor{
-				ParticipantCount: pageCount, EncodedBytes: pageBytes, SegmentCount: 1,
-			}) != descriptor.Root {
-			return nil, nil, ErrCorrupt
+	if uint32(segments.Count()) == descriptor.SegmentCount {
+		got := ManifestDescriptor{
+			ParticipantCount: segments.ParticipantCount(),
+			EncodedBytes:     segments.EncodedBytes(), SegmentCount: uint32(segments.Count()),
 		}
-	} else if pageCount >= descriptor.ParticipantCount || pageBytes >= descriptor.EncodedBytes {
-		return nil, nil, ErrCorrupt
+		got.Root = finishManifestRoot(segments.chain, got)
+		if got != descriptor {
+			return nil, ManifestSegmentSequence{}, ErrCorrupt
+		}
+	} else if segments.ParticipantCount() >= descriptor.ParticipantCount ||
+		segments.EncodedBytes() >= descriptor.EncodedBytes {
+		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
-	return coordinator, pageZero, nil
+	return coordinator, segments, nil
 }
 
+// ReplicatedCoordinatorBindsParticipant validates an inline or segmented
+// coordinator creation payload and exact-matches one participant ordinal
+// without allocating. For a segmented coordinator, present is false when the
+// requested ordinal is valid for the descriptor but lies after the initial
+// packed pages and must be checked when its durable page arrives.
+func ReplicatedCoordinatorBindsParticipant(
+	payload []byte,
+	ordinal uint64,
+	want ParticipantRef,
+) (present bool, matches bool, err error) {
+	if len(payload) < 4 {
+		return false, false, ErrCorrupt
+	}
+	if equal4(payload[:4], coordinatorMagic) {
+		var scratch [MaxInlineParticipants]ParticipantRef
+		record, openErr := OpenCoordinatorInto(payload, scratch[:])
+		if openErr != nil || !canonicalCoordinatorBytes(payload) {
+			return false, false, ErrCorrupt
+		}
+		if ordinal >= uint64(len(record.Participants)) {
+			return false, false, ErrCorrupt
+		}
+		return true, equalParticipantRef(record.Participants[ordinal], want), nil
+	}
+	if !equal4(payload[:4], manifestCoordinatorMagic) {
+		return false, false, ErrCorrupt
+	}
+	coordinator, segments, openErr := OpenReplicatedManifestStart(payload)
+	if openErr != nil {
+		return false, false, openErr
+	}
+	record, openErr := OpenManifestCoordinator(coordinator)
+	if openErr != nil || ordinal >= record.Manifest.ParticipantCount {
+		return false, false, ErrCorrupt
+	}
+	iterator := segments.Iterator()
+	for iterator.Next() {
+		page := iterator.Segment()
+		if ordinal < page.FirstParticipant ||
+			ordinal >= page.FirstParticipant+uint64(page.ParticipantCount) {
+			continue
+		}
+		return ManifestSegmentMatchesParticipant(page.Raw, ordinal, want)
+	}
+	return false, false, nil
+}
+
+// AppendReplicatedCommand appends one canonical transaction control body.
+// Payload must not overlap the writable append region in dst's current backing
+// array; aliases are rejected before any destination byte is changed.
 func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, error) {
 	if err := validateReplicatedCommand(command); err != nil {
 		return dst, err
@@ -155,8 +370,16 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	if total > MaxReplicatedCommandBytes {
 		return dst, ErrTooLarge
 	}
+	if replicatedPayloadOverlapsAppendRegion(dst, total, command.Payload) {
+		return dst, ErrCorrupt
+	}
 	start := len(dst)
-	dst = append(dst, make([]byte, total)...)
+	if total <= cap(dst)-start {
+		dst = dst[:start+total]
+		clear(dst[start:])
+	} else {
+		dst = append(dst, make([]byte, total)...)
+	}
 	out := dst[start:]
 	copy(out[:4], replicatedCommandMagic[:])
 	out[4] = FormatVersion
@@ -174,6 +397,7 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	copy(out[88:120], command.Participant.MutationDigest[:])
 	out[120] = command.Participant.BucketBits
 	binary.LittleEndian.PutUint16(out[122:124], uint16(len(command.Participant.IntentScopes)))
+	binary.LittleEndian.PutUint32(out[124:128], command.Participant.ParticipantOrdinal)
 	cursor := replicatedCommandHeaderBytes
 	for i := range command.Participant.IntentScopes {
 		binary.LittleEndian.PutUint32(out[cursor:cursor+4], command.Participant.IntentScopes[i].Start)
@@ -183,6 +407,19 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	copy(out[cursor:], command.Payload)
 	binary.LittleEndian.PutUint32(out[total-4:], crc32.Checksum(out[:total-4], castagnoli))
 	return dst, nil
+}
+
+func replicatedPayloadOverlapsAppendRegion(dst []byte, total int, payload []byte) bool {
+	if len(payload) == 0 || total <= 0 || total > cap(dst)-len(dst) {
+		return false
+	}
+	region := dst[len(dst) : len(dst)+total : len(dst)+total]
+	left := uintptr(unsafe.Pointer(unsafe.SliceData(region)))
+	right := uintptr(unsafe.Pointer(unsafe.SliceData(payload)))
+	if left <= right {
+		return right-left < uintptr(len(region))
+	}
+	return left-right < uintptr(len(payload))
 }
 
 // OpenReplicatedCommand returns a borrowed command view. It allocates only the
@@ -213,8 +450,7 @@ func ValidateReplicatedCommand(src []byte) error {
 	}
 	if binary.LittleEndian.Uint16(src[8:10]) != replicatedCommandHeaderBytes ||
 		src[10] != 0 || src[11] != 0 || binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 ||
-		binary.LittleEndian.Uint32(src[124:128]) != 0 {
+		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 {
 		return ErrCorrupt
 	}
 	payloadLength := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -237,7 +473,7 @@ func ValidateReplicatedCommand(src []byte) error {
 	scopeEnd := replicatedCommandHeaderBytes + int(scopeCount)*8
 	payloadEnd := scopeEnd + int(payloadLength)
 	payload := src[scopeEnd:payloadEnd:payloadEnd]
-	if wantPayload == ReplicatedPayloadParticipantStage {
+	if replicatedOperationCarriesParticipant(operation) {
 		var coordinatorGroup, coordinatorShardIncarnation ID
 		var mutationDigest Digest
 		copy(coordinatorGroup[:], src[48:64])
@@ -245,17 +481,25 @@ func ValidateReplicatedCommand(src []byte) error {
 		copy(mutationDigest[:], src[88:120])
 		if coordinatorGroup.IsZero() || coordinatorShardIncarnation.IsZero() ||
 			binary.LittleEndian.Uint64(src[80:88]) == 0 || mutationDigest == (Digest{}) ||
-			len(payload) != 0 || !validateIntentScopeBytes(
-			src[replicatedCommandHeaderBytes:scopeEnd], src[120], int(scopeCount),
-		) {
+			!validateIntentScopeBytes(
+				src[replicatedCommandHeaderBytes:scopeEnd], src[120], int(scopeCount),
+			) {
 			return ErrCorrupt
 		}
-		return nil
+		if operation == ReplicatedStageParticipant &&
+			binary.LittleEndian.Uint32(src[124:128]) != 0 {
+			return ErrCorrupt
+		}
+		return validateReplicatedPayload(
+			operation, wantPayload, id, payload,
+			binary.LittleEndian.Uint32(src[124:128]), mutationDigest,
+		)
 	}
-	if !allZero(src[48:122]) || scopeCount != 0 {
+	if !allZero(src[48:122]) || scopeCount != 0 ||
+		binary.LittleEndian.Uint32(src[124:128]) != 0 {
 		return ErrCorrupt
 	}
-	return validateReplicatedPayload(wantPayload, id, payload)
+	return validateReplicatedPayload(operation, wantPayload, id, payload, 0, Digest{})
 }
 
 // OpenReplicatedCommandInto decodes with caller-owned scope storage. A
@@ -271,8 +515,7 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 	}
 	if binary.LittleEndian.Uint16(src[8:10]) != replicatedCommandHeaderBytes ||
 		src[10] != 0 || src[11] != 0 || binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 ||
-		binary.LittleEndian.Uint32(src[124:128]) != 0 {
+		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 {
 		return ReplicatedCommandView{}, ErrCorrupt
 	}
 	payloadLength := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -292,6 +535,7 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 	view.Participant.CoordinatorAllocation = binary.LittleEndian.Uint64(src[80:88])
 	copy(view.Participant.MutationDigest[:], src[88:120])
 	view.Participant.BucketBits = src[120]
+	view.Participant.ParticipantOrdinal = binary.LittleEndian.Uint32(src[124:128])
 	cursor := replicatedCommandHeaderBytes
 	if scopeCount != 0 {
 		view.Participant.IntentScopes = scopes[:scopeCount]
@@ -323,80 +567,93 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		(creation && command.ExpectedRevision != 0) || (!creation && command.ExpectedRevision == 0) {
 		return ErrCorrupt
 	}
-	if wantPayload != ReplicatedPayloadParticipantStage && !participantStageZero(command.Participant) {
+	carriesParticipant := replicatedOperationCarriesParticipant(command.Operation)
+	if !carriesParticipant && !participantStageZero(command.Participant) {
 		return ErrCorrupt
 	}
-	switch wantPayload {
-	case ReplicatedPayloadNone:
-		if len(command.Payload) != 0 {
-			return ErrCorrupt
-		}
-	case ReplicatedPayloadCoordinator:
-		if len(command.Payload) > MaxCoordinatorRecordBytes {
-			return ErrTooLarge
-		}
-		var participantScratch [MaxInlineParticipants]ParticipantRef
-		record, err := OpenCoordinatorInto(command.Payload, participantScratch[:])
-		if err != nil || !canonicalCoordinatorBytes(command.Payload) || record.ID != command.ID ||
-			record.State != CoordinatorStaging || record.Revision != 1 {
-			return ErrCorrupt
-		}
-	case ReplicatedPayloadManifestCoordinator:
-		coordinator, _, err := OpenReplicatedManifestStart(command.Payload)
-		if err != nil {
-			return ErrCorrupt
-		}
-		record, err := OpenManifestCoordinator(coordinator)
-		if err != nil || record.ID != command.ID || record.State != CoordinatorStaging || record.Revision != 1 {
-			return ErrCorrupt
-		}
-	case ReplicatedPayloadManifestSegment:
-		if len(command.Payload) > ManifestSegmentBytes {
-			return ErrTooLarge
-		}
-		if !canonicalManifestSegment(command.Payload) ||
-			binary.LittleEndian.Uint32(command.Payload[8:12]) == 0 ||
-			binary.LittleEndian.Uint64(command.Payload[16:24]) == 0 {
-			return ErrCorrupt
-		}
-	case ReplicatedPayloadParticipantStage:
-		if len(command.Payload) != 0 || command.Participant.CoordinatorGroup.IsZero() ||
+	if carriesParticipant {
+		if command.Participant.CoordinatorGroup.IsZero() ||
 			command.Participant.CoordinatorShardIncarnation.IsZero() ||
 			command.Participant.CoordinatorAllocation == 0 ||
 			command.Participant.MutationDigest == (Digest{}) ||
 			!ValidateIntentScopes(command.Participant.IntentScopes, command.Participant.BucketBits) {
 			return ErrCorrupt
 		}
-	default:
-		return ErrCorrupt
+		if command.Operation == ReplicatedStageParticipant && command.Participant.ParticipantOrdinal != 0 {
+			return ErrCorrupt
+		}
+	}
+	if err := validateReplicatedPayload(
+		command.Operation, wantPayload, command.ID, command.Payload,
+		command.Participant.ParticipantOrdinal, command.Participant.MutationDigest,
+	); err != nil {
+		return err
+	}
+	total := replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
+		len(command.Payload) + replicatedCommandChecksumBytes
+	if total > MaxReplicatedCommandBytes || !replicatedCommandShapeWithinBound(command) {
+		return ErrTooLarge
 	}
 	return nil
 }
 
-func validateReplicatedPayload(kind ReplicatedPayloadKind, id ID, payload []byte) error {
+func validateReplicatedPayload(
+	operation ReplicatedOperation,
+	kind ReplicatedPayloadKind,
+	id ID,
+	payload []byte,
+	participantOrdinal uint32,
+	mutationDigest Digest,
+) error {
 	switch kind {
 	case ReplicatedPayloadNone:
 		if len(payload) != 0 {
 			return ErrCorrupt
 		}
 	case ReplicatedPayloadCoordinator:
-		if len(payload) > MaxCoordinatorRecordBytes {
-			return ErrTooLarge
-		}
-		var participantScratch [MaxInlineParticipants]ParticipantRef
-		record, err := OpenCoordinatorInto(payload, participantScratch[:])
-		if err != nil || !canonicalCoordinatorBytes(payload) || record.ID != id ||
-			record.State != CoordinatorStaging || record.Revision != 1 {
-			return ErrCorrupt
-		}
+		return validateReplicatedCoordinatorPayload(
+			operation, id, payload, participantOrdinal, mutationDigest,
+		)
 	case ReplicatedPayloadManifestCoordinator:
-		coordinator, _, err := OpenReplicatedManifestStart(payload)
+		coordinator, segments, err := OpenReplicatedManifestStart(payload)
 		if err != nil {
 			return ErrCorrupt
 		}
 		record, err := OpenManifestCoordinator(coordinator)
 		if err != nil || record.ID != id || record.State != CoordinatorStaging || record.Revision != 1 {
 			return ErrCorrupt
+		}
+		if operation == ReplicatedStageManifestCoordinator {
+			if segments.Count() != 1 {
+				return ErrCorrupt
+			}
+		} else {
+			want := int(record.Manifest.SegmentCount)
+			if want > MaxManifestSegmentsPerCommand {
+				want = MaxManifestSegmentsPerCommand
+			}
+			if operation != ReplicatedBeginPrepareManifestCoordinator || segments.Count() != want {
+				return ErrCorrupt
+			}
+			ordinal := uint64(participantOrdinal)
+			if ordinal >= record.Manifest.ParticipantCount {
+				return ErrCorrupt
+			}
+			iterator := segments.Iterator()
+			for iterator.Next() {
+				page := iterator.Segment()
+				if ordinal < page.FirstParticipant ||
+					ordinal >= page.FirstParticipant+uint64(page.ParticipantCount) {
+					continue
+				}
+				matched, matchErr := manifestSegmentMatchesParticipantFields(
+					page.Raw, ordinal, ParticipantRef{MutationDigest: mutationDigest}, false,
+				)
+				if matchErr != nil || !matched {
+					return ErrCorrupt
+				}
+				break
+			}
 		}
 	case ReplicatedPayloadManifestSegment:
 		if len(payload) > ManifestSegmentBytes {
@@ -407,10 +664,65 @@ func validateReplicatedPayload(kind ReplicatedPayloadKind, id ID, payload []byte
 			binary.LittleEndian.Uint64(payload[16:24]) == 0 {
 			return ErrCorrupt
 		}
+	case ReplicatedPayloadManifestSegments:
+		segments, err := OpenManifestSegmentSequence(payload)
+		if err != nil {
+			return err
+		}
+		if operation != ReplicatedAppendManifestSegments || segments.FirstIndex() == 0 ||
+			segments.FirstParticipant() == 0 {
+			return ErrCorrupt
+		}
+	case ReplicatedPayloadParticipantStage:
+		if len(payload) != 0 {
+			return ErrCorrupt
+		}
 	default:
 		return ErrCorrupt
 	}
 	return nil
+}
+
+func validateReplicatedCoordinatorPayload(
+	operation ReplicatedOperation,
+	id ID,
+	payload []byte,
+	participantOrdinal uint32,
+	mutationDigest Digest,
+) error {
+	if len(payload) > MaxCoordinatorRecordBytes {
+		return ErrTooLarge
+	}
+	var participantScratch [MaxInlineParticipants]ParticipantRef
+	record, err := OpenCoordinatorInto(payload, participantScratch[:])
+	if err != nil || !canonicalCoordinatorBytes(payload) || record.ID != id ||
+		record.State != CoordinatorStaging || record.Revision != 1 {
+		return ErrCorrupt
+	}
+	if operation == ReplicatedBeginPrepareCoordinator {
+		ordinal := uint64(participantOrdinal)
+		if ordinal >= uint64(len(record.Participants)) ||
+			record.Participants[ordinal].MutationDigest != mutationDigest {
+			return ErrCorrupt
+		}
+	}
+	return nil
+}
+
+func replicatedCommandShapeWithinBound(command ReplicatedCommand) bool {
+	scopeBytes := len(command.Participant.IntentScopes) * 8
+	switch command.Operation {
+	case ReplicatedBeginPrepareManifestCoordinator:
+		return len(command.Payload) <= ReplicatedManifestCoordinatorRecordBytes+
+			MaxManifestSegmentSequenceBytes && scopeBytes <= MaxIntentScopes*8
+	case ReplicatedAppendManifestSegments:
+		return scopeBytes == 0 && len(command.Payload) <= MaxManifestSegmentSequenceBytes
+	case ReplicatedBeginPrepareCoordinator, ReplicatedStagePrepareParticipant,
+		ReplicatedStageParticipant:
+		return scopeBytes <= MaxIntentScopes*8
+	default:
+		return scopeBytes == 0
+	}
 }
 
 func validateIntentScopeBytes(raw []byte, bucketBits uint8, count int) bool {
@@ -461,15 +773,36 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 	case ReplicatedPrepareParticipant, ReplicatedApplyParticipant,
 		ReplicatedAbortParticipant, ReplicatedReleaseParticipant:
 		return ReplicatedRoleParticipant, ReplicatedPayloadNone, false, true
+	case ReplicatedBeginPrepareCoordinator:
+		return ReplicatedRoleCoordinator, ReplicatedPayloadCoordinator, true, true
+	case ReplicatedBeginPrepareManifestCoordinator:
+		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestCoordinator, true, true
+	case ReplicatedAppendManifestSegments:
+		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestSegments, false, true
+	case ReplicatedStagePrepareParticipant:
+		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, true, true
+	case ReplicatedApplyReleaseParticipant, ReplicatedAbortReleaseParticipant:
+		return ReplicatedRoleParticipant, ReplicatedPayloadNone, false, true
 	default:
 		return ReplicatedRoleInvalid, ReplicatedPayloadNone, false, false
+	}
+}
+
+func replicatedOperationCarriesParticipant(operation ReplicatedOperation) bool {
+	switch operation {
+	case ReplicatedStageParticipant, ReplicatedBeginPrepareCoordinator,
+		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareParticipant:
+		return true
+	default:
+		return false
 	}
 }
 
 func participantStageZero(stage ParticipantStage) bool {
 	return stage.CoordinatorGroup.IsZero() && stage.CoordinatorShardIncarnation.IsZero() &&
 		stage.CoordinatorAllocation == 0 && stage.BucketBits == 0 &&
-		len(stage.IntentScopes) == 0 && stage.MutationDigest == (Digest{})
+		len(stage.IntentScopes) == 0 && stage.MutationDigest == (Digest{}) &&
+		stage.ParticipantOrdinal == 0
 }
 
 func canonicalCoordinatorBytes(raw []byte) bool {
@@ -490,26 +823,95 @@ func canonicalCoordinatorBytes(raw []byte) bool {
 	return cursor == end
 }
 
+type manifestSegmentSummary struct {
+	index            uint32
+	firstParticipant uint64
+	participantCount uint32
+	digest           Digest
+
+	firstDistribution       [MaxShardIdentityBytes]byte
+	firstShard              [MaxShardIdentityBytes]byte
+	firstDistributionLength int
+	firstShardLength        int
+	lastDistribution        [MaxShardIdentityBytes]byte
+	lastShard               [MaxShardIdentityBytes]byte
+	lastDistributionLength  int
+	lastShardLength         int
+}
+
+type manifestParticipantMatch struct {
+	ordinal uint64
+	want    ParticipantRef
+	exact   bool
+	found   bool
+	matched bool
+}
+
 func canonicalManifestSegment(raw []byte) bool {
+	_, ok := inspectCanonicalManifestSegment(raw, nil)
+	return ok
+}
+
+func openCanonicalManifestSegment(raw []byte) (manifestSegmentSummary, bool) {
+	return inspectCanonicalManifestSegment(raw, nil)
+}
+
+// ManifestSegmentMatchesParticipant validates a complete VTM1 page and exact-
+// matches one absolute participant ordinal without a decoded-page arena.
+// present distinguishes an ordinal outside the page from a mismatch.
+func ManifestSegmentMatchesParticipant(
+	raw []byte,
+	ordinal uint64,
+	want ParticipantRef,
+) (present bool, matches bool, err error) {
+	match := manifestParticipantMatch{ordinal: ordinal, want: want, exact: true}
+	if _, ok := inspectCanonicalManifestSegment(raw, &match); !ok {
+		return false, false, ErrCorrupt
+	}
+	return match.found, match.matched, nil
+}
+
+func manifestSegmentMatchesParticipantFields(
+	raw []byte,
+	ordinal uint64,
+	want ParticipantRef,
+	exact bool,
+) (bool, error) {
+	match := manifestParticipantMatch{ordinal: ordinal, want: want, exact: exact}
+	if _, ok := inspectCanonicalManifestSegment(raw, &match); !ok {
+		return false, ErrCorrupt
+	}
+	return match.found && match.matched, nil
+}
+
+func inspectCanonicalManifestSegment(
+	raw []byte,
+	match *manifestParticipantMatch,
+) (manifestSegmentSummary, bool) {
+	var summary manifestSegmentSummary
 	if len(raw) < manifestSegmentHeaderBytes+manifestEntryFixedBytes+4 ||
 		len(raw) > ManifestSegmentBytes || !equal4(raw[:4], manifestSegmentMagic) ||
 		raw[4] != FormatVersion || raw[5] != 0 || raw[6] != 0 || raw[7] != 0 ||
 		!checksumOK(raw) {
-		return false
+		return manifestSegmentSummary{}, false
 	}
+	summary.index = binary.LittleEndian.Uint32(raw[8:12])
+	summary.firstParticipant = binary.LittleEndian.Uint64(raw[16:24])
 	count := int(binary.LittleEndian.Uint32(raw[12:16]))
+	summary.participantCount = uint32(count)
 	payloadBytes := int(binary.LittleEndian.Uint32(raw[24:28]))
 	if count <= 0 || count > MaxManifestPageParticipants ||
+		uint64(count) > ^uint64(0)-summary.firstParticipant ||
 		binary.LittleEndian.Uint32(raw[28:32]) != 0 ||
 		manifestSegmentHeaderBytes+payloadBytes+4 != len(raw) {
-		return false
+		return manifestSegmentSummary{}, false
 	}
 	cursor, end := manifestSegmentHeaderBytes, len(raw)-4
 	var priorDistribution, priorShard [MaxShardIdentityBytes]byte
 	priorDistributionLength, priorShardLength := 0, 0
 	for i := 0; i < count; i++ {
 		if end-cursor < manifestEntryFixedBytes {
-			return false
+			return manifestSegmentSummary{}, false
 		}
 		entry := raw[cursor:]
 		distributionPrefix, distributionSuffix := int(entry[0]), int(entry[1])
@@ -526,12 +928,12 @@ func canonicalManifestSegment(raw []byte) bool {
 			binary.LittleEndian.Uint64(entry[8:16]) == 0 ||
 			binary.LittleEndian.Uint64(entry[16:24]) == 0 ||
 			binary.LittleEndian.Uint64(entry[24:32]) == 0 {
-			return false
+			return manifestSegmentSummary{}, false
 		}
 		var mutationDigest Digest
 		copy(mutationDigest[:], entry[32:64])
 		if mutationDigest == (Digest{}) {
-			return false
+			return manifestSegmentSummary{}, false
 		}
 		cursor += manifestEntryFixedBytes
 		var distribution, shard [MaxShardIdentityBytes]byte
@@ -550,10 +952,41 @@ func canonicalManifestSegment(raw []byte) bool {
 				currentDistribution, currentShard) >= 0 ||
 				distributionPrefix != commonPrefix(priorDistributionView, currentDistribution) ||
 				shardPrefix != commonPrefix(priorShardView, currentShard))) {
-			return false
+			return manifestSegmentSummary{}, false
+		}
+		if i == 0 {
+			copy(summary.firstDistribution[:], currentDistribution)
+			copy(summary.firstShard[:], currentShard)
+			summary.firstDistributionLength = distributionLength
+			summary.firstShardLength = shardLength
+		}
+		absoluteOrdinal := summary.firstParticipant + uint64(i)
+		if match != nil && absoluteOrdinal == match.ordinal {
+			match.found = true
+			current := ParticipantRef{
+				Distribution: currentDistribution, Shard: currentShard,
+				State:                ParticipantState(entry[4]),
+				RoutingVersion:       binary.LittleEndian.Uint64(entry[8:16]),
+				AllocationGeneration: binary.LittleEndian.Uint64(entry[16:24]),
+				OwnershipEpoch:       binary.LittleEndian.Uint64(entry[24:32]),
+				MutationDigest:       mutationDigest,
+			}
+			if match.exact {
+				match.matched = equalParticipantRef(current, match.want)
+			} else {
+				match.matched = current.MutationDigest == match.want.MutationDigest
+			}
 		}
 		priorDistribution, priorShard = distribution, shard
 		priorDistributionLength, priorShardLength = distributionLength, shardLength
 	}
-	return cursor == end
+	if cursor != end {
+		return manifestSegmentSummary{}, false
+	}
+	copy(summary.lastDistribution[:], priorDistribution[:priorDistributionLength])
+	copy(summary.lastShard[:], priorShard[:priorShardLength])
+	summary.lastDistributionLength = priorDistributionLength
+	summary.lastShardLength = priorShardLength
+	summary.digest = sha256.Sum256(raw)
+	return summary, true
 }

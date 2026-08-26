@@ -74,8 +74,9 @@ type Command struct {
 	NextDeadlineUnixNano int64
 
 	// Transaction is one exact canonical distributed transaction control body.
-	// It is present only for CommandTransaction. Participant-stage mutations
-	// remain in Batches so the native relation codec is never duplicated.
+	// It is present only for CommandTransaction. Fused participant preparation
+	// mutations remain in Batches so the native relation codec is never
+	// duplicated.
 	Transaction []byte
 	Batches     []RelationMutationBatch
 }
@@ -597,7 +598,7 @@ func validateCommandHeader(command Command) error {
 		); err != nil {
 			return err
 		}
-		if control.operation != distributedtxn.ReplicatedStageParticipant {
+		if !transactionOperationCarriesRelationBatches(control.operation) {
 			if len(command.Batches) != 0 {
 				return semantic("transaction operation carries relation batches")
 			}
@@ -648,6 +649,20 @@ func validateCommandHeader(command Command) error {
 		return err
 	}
 	return nil
+}
+
+func transactionOperationCarriesRelationBatches(
+	operation distributedtxn.ReplicatedOperation,
+) bool {
+	switch operation {
+	case distributedtxn.ReplicatedStageParticipant,
+		distributedtxn.ReplicatedBeginPrepareCoordinator,
+		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+		distributedtxn.ReplicatedStagePrepareParticipant:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateRelationBatches(batches []RelationMutationBatch) error {
@@ -804,6 +819,16 @@ func validatedTransactionControl(raw []byte) (transactionControlMetadata, error)
 		// Validated VTRC metadata guarantees this operation has no scopes and a
 		// canonical VTM1 payload beginning at the fixed control header boundary.
 		control.manifestIndex = binary.LittleEndian.Uint32(raw[128+8 : 128+12])
+	} else if control.operation == distributedtxn.ReplicatedAppendManifestSegments {
+		// Validation guarantees this operation has no scopes and carries one
+		// direct canonical VTM1 sequence at the fixed payload boundary.
+		segments, openErr := distributedtxn.OpenManifestSegmentSequence(
+			raw[128 : len(raw)-4],
+		)
+		if openErr != nil {
+			return transactionControlMetadata{}, openErr
+		}
+		control.manifestIndex = segments.FirstIndex()
 	}
 	return control, nil
 }
@@ -824,9 +849,13 @@ func transactionClientSequence(control transactionControlMetadata) (uint64, erro
 	switch control.operation {
 	case distributedtxn.ReplicatedStageCoordinator,
 		distributedtxn.ReplicatedStageManifestCoordinator,
-		distributedtxn.ReplicatedStageParticipant:
+		distributedtxn.ReplicatedStageParticipant,
+		distributedtxn.ReplicatedBeginPrepareCoordinator,
+		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+		distributedtxn.ReplicatedStagePrepareParticipant:
 		return 1, nil
-	case distributedtxn.ReplicatedStageManifestSegment:
+	case distributedtxn.ReplicatedStageManifestSegment,
+		distributedtxn.ReplicatedAppendManifestSegments:
 		// Page zero follows the atomic coordinator begin at sequence two.
 		return 2 + uint64(control.manifestIndex), nil
 	case distributedtxn.ReplicatedCommitCoordinator,
@@ -843,7 +872,9 @@ func transactionClientSequence(control transactionControlMetadata) (uint64, erro
 	case distributedtxn.ReplicatedPrepareParticipant,
 		distributedtxn.ReplicatedApplyParticipant,
 		distributedtxn.ReplicatedAbortParticipant,
-		distributedtxn.ReplicatedReleaseParticipant:
+		distributedtxn.ReplicatedReleaseParticipant,
+		distributedtxn.ReplicatedApplyReleaseParticipant,
+		distributedtxn.ReplicatedAbortReleaseParticipant:
 		if control.expectedRevision == ^uint64(0) {
 			return 0, semantic("transaction participant revision")
 		}
@@ -1092,9 +1123,9 @@ func OpenCommand(src []byte) (CommandView, error) {
 			return CommandView{}, err
 		}
 		relationBytes := payload[controlEnd:len(payload):len(payload)]
-		if control.operation == distributedtxn.ReplicatedStageParticipant {
+		if transactionOperationCarriesRelationBatches(control.operation) {
 			if count == 0 || relationCount == 0 {
-				return CommandView{}, semantic("participant stage has no relation batches")
+				return CommandView{}, semantic("transaction prepare has no relation batches")
 			}
 			if err := validateRelationBytes(
 				relationBytes, count, relationCount, inlineRelationID,
