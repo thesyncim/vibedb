@@ -103,6 +103,29 @@ func TestResidentPrimaryRouterAdvanceGenerationLeavesRoutesUnchanged(
 	}
 }
 
+func TestResidentPrimaryRouterNextTabletIDFromAuthenticatedRoutes(t *testing.T) {
+	router := residentPrimaryRouterGenerationTestFixture(t)
+	for rank, tabletID := range []uint32{2, 0, 1} {
+		bucket, ok := MakeTabletLocalIdentityBucket(tabletID, uint32(100+rank))
+		if !ok {
+			t.Fatal("make routed tablet bucket")
+		}
+		at := rank * residentPrimaryRouterWords
+		router.rows[at+3] = uint64(uint32(router.rows[at+3])) |
+			uint64(bucket)<<32
+	}
+	if got, ok := router.NextTabletID(); !ok || got != 3 {
+		t.Fatalf("next tablet ID = %d,%v, want 3,true", got, ok)
+	}
+	last, _ := MakeTabletLocalIdentityBucket(
+		TabletLocalIdentityTabletCount-1, 7,
+	)
+	router.rows[3] = uint64(uint32(router.rows[3])) | uint64(last)<<32
+	if got, ok := router.NextTabletID(); ok || got != 0 {
+		t.Fatalf("exhausted next tablet ID = %d,%v, want 0,false", got, ok)
+	}
+}
+
 func TestResidentPrimaryRouterSplitLeafSplicesWithoutGraphWalk(t *testing.T) {
 	router := residentPrimaryRouterGenerationTestFixture(t)
 	route, ok := router.Route([]byte("mango"))

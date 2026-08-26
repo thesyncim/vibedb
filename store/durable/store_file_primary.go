@@ -707,6 +707,11 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		return fmt.Errorf("vibedb: build resident primary router: %w", err)
 	}
 	c.primaryRouter.Store(builtRouter)
+	nextTabletID, ok := builtRouter.NextTabletID()
+	if !ok {
+		nextTabletID = storeio.TabletLocalIdentityTabletCount
+	}
+	c.primaryNextTabletID = nextTabletID
 	// Both buffered-visible and the journal-backed synchronous lane apply through
 	// the deferred canonical-frame path, so both need the pending parent and
 	// volatile-retire scratch. Async-visible on a primary graph uses the committer

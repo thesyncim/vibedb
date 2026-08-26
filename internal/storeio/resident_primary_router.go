@@ -657,6 +657,35 @@ func (r *ResidentPrimaryRouter) RemoveLeaf(
 	return next, nil
 }
 
+// NextTabletID returns the first never-issued monotonic tablet identity above
+// every tablet represented by this immutable router. Durable reopen rebuilds
+// the same high-water directly from the authenticated graph, so a separate
+// mutable allocator record is unnecessary and crashed structural attempts do
+// not make an identity reusable.
+func (r *ResidentPrimaryRouter) NextTabletID() (uint32, bool) {
+	if r == nil || r.Len() == 0 {
+		return 0, false
+	}
+	var high uint32
+	for rank := 0; rank < r.Len(); rank++ {
+		route, ok := r.RouteAtRank(rank)
+		if !ok {
+			return 0, false
+		}
+		tabletID, _, ok := SplitTabletLocalIdentityBucket(uint32(route.Bucket))
+		if !ok {
+			return 0, false
+		}
+		if rank == 0 || tabletID > high {
+			high = tabletID
+		}
+	}
+	if high+1 >= TabletLocalIdentityTabletCount {
+		return 0, false
+	}
+	return high + 1, true
+}
+
 // AdvanceGeneration records a canonical-frame mutation whose stable leaf
 // handle did not change.
 func (r *ResidentPrimaryRouter) AdvanceGeneration(generation uint64) {

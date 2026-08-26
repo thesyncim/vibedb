@@ -349,6 +349,10 @@ type Collection struct {
 	primaryEmptyReclaimMaxNS        atomic.Uint64
 	primaryStructuralRoutingStaged  atomic.Uint64
 	primaryStructuralRoutingRetired atomic.Uint64
+	// primaryNextTabletID is the writer-owned monotonic identity high-water.
+	// Open reconstructs it from the authenticated resident graph; structural
+	// publication advances it only after the sibling tablet is durable.
+	primaryNextTabletID uint32
 	// Hole punching is a foreground, post-durability space optimization. The
 	// source cursors, physical-generation guard, and disabled flag are
 	// writer-owned; atomic counters keep the optional filesystem results
