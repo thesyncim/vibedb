@@ -1658,9 +1658,18 @@ func multiGroupRF3SQLSnapshot(
 			nativeEndpoint := distribution.EndpointID(replica.NativeEndpoint)
 			controlEndpoint := distribution.EndpointID("control-" + replica.Address)
 			leaders = append(leaders, sqlEndpoint)
-			endpoints[sqlEndpoint] = replica.Address
+			// The catalog intentionally requires the SQL, native, and control
+			// planes to resolve to distinct addresses. This in-process transport
+			// dispatches by endpoint identity, so plane-qualified addresses keep
+			// the fixture faithful without opening three additional listeners.
+			endpoints[sqlEndpoint] = string(sqlEndpoint)
 			endpoints[nativeEndpoint] = replica.NativeEndpoint
-			endpoints[controlEndpoint] = replica.Address
+			endpoints[controlEndpoint] = string(controlEndpoint)
+			if endpoints[sqlEndpoint] == endpoints[nativeEndpoint] ||
+				endpoints[sqlEndpoint] == endpoints[controlEndpoint] ||
+				endpoints[nativeEndpoint] == endpoints[controlEndpoint] {
+				t.Fatalf("replica %d test endpoint planes share an address", member)
+			}
 			replicas = append(replicas, gateway.ReplicatedReplicaDescriptor{
 				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
 				NodeIncarnation: replica.NodeIncarnation, Endpoint: sqlEndpoint,
