@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 )
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
@@ -78,7 +79,11 @@ type Command struct {
 	// mutations remain in Batches so the native relation codec is never
 	// duplicated.
 	Transaction []byte
-	Batches     []RelationMutationBatch
+	// RequestLedger is one canonical internal/requestledger command body. It is
+	// present only for CommandRequestLedger and is carried without another
+	// redundant outer length because it consumes the complete command payload.
+	RequestLedger []byte
+	Batches       []RelationMutationBatch
 }
 
 // CommandView is a checksum- and semantics-validated borrowed command. Its
@@ -116,14 +121,15 @@ type CommandView struct {
 	ExpectedDeadlineUnixNano int64
 	NextDeadlineUnixNano     int64
 
-	raw              []byte
-	transactionBytes []byte
-	relationBytes    []byte
-	mutationCount    uint32
-	relationCount    uint16
-	inlineRelationID RelationID
-	transactionRole  distributedtxn.ReplicatedRole
-	transactionOp    distributedtxn.ReplicatedOperation
+	raw                []byte
+	transactionBytes   []byte
+	requestLedgerBytes []byte
+	relationBytes      []byte
+	mutationCount      uint32
+	relationCount      uint16
+	inlineRelationID   RelationID
+	transactionRole    distributedtxn.ReplicatedRole
+	transactionOp      distributedtxn.ReplicatedOperation
 }
 
 // Bytes returns the exact validated envelope. The result aliases the decoder
@@ -137,6 +143,25 @@ func (v CommandView) Bytes() []byte {
 // Non-transaction commands return nil.
 func (v CommandView) TransactionBytes() []byte {
 	return v.transactionBytes[:len(v.transactionBytes):len(v.transactionBytes)]
+}
+
+// RequestLedgerBytes returns the exact validated request-ledger control body.
+// The result aliases the command envelope. Non-ledger commands return nil.
+func (v CommandView) RequestLedgerBytes() []byte {
+	return v.requestLedgerBytes[:len(v.requestLedgerBytes):len(v.requestLedgerBytes)]
+}
+
+// OpenRequestLedgerInto reopens the already outer-validated request-ledger
+// command into caller-owned pending-wave scratch. The returned payload aliases
+// the outer command envelope. Supplying MaxPendingWaveSteps entries keeps the
+// operation allocation-free.
+func (v CommandView) OpenRequestLedgerInto(
+	steps []requestledger.StepRef,
+) (requestledger.CommandView, error) {
+	if v.kind != CommandRequestLedger || len(v.requestLedgerBytes) == 0 {
+		return requestledger.CommandView{}, ErrEnvelopeSemantic
+	}
+	return requestledger.OpenCommandInto(v.requestLedgerBytes, steps)
 }
 
 // TransactionIdentity reports the role and operation from the already
@@ -414,6 +439,9 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 		cursor += transactionLengthBytes
 		cursor += copy(frame[cursor:], command.Transaction)
 	}
+	if command.Kind == CommandRequestLedger {
+		cursor += copy(frame[cursor:], command.RequestLedger)
+	}
 	for batchIndex := range command.Batches {
 		batch := &command.Batches[batchIndex]
 		headerAt := -1
@@ -498,6 +526,7 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 		byteSliceStringOverlap(region, command.Distribution) ||
 		byteSliceStringOverlap(region, command.Shard) ||
 		byteSlicesOverlap(region, command.Transaction) ||
+		byteSlicesOverlap(region, command.RequestLedger) ||
 		typedSliceOverlapsBytes(region, command.Batches) {
 		return true
 	}
@@ -532,6 +561,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireSessionRevoke
 	case CommandTransaction:
 		return commandWireTransaction
+	case CommandRequestLedger:
+		return commandWireRequestLedger
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -572,6 +603,13 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 			return 0, ErrEnvelopeTooLarge
 		}
 	}
+	if command.Kind == CommandRequestLedger {
+		var ok bool
+		total, ok = checkedAdd(total, uint64(len(command.RequestLedger)), MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
 	if len(command.Batches) > 1 {
 		var ok bool
 		total, ok = checkedAdd(
@@ -605,12 +643,16 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 }
 
 func validateCommandHeader(command Command) error {
-	if command.AuthorityClass > CommandAuthorityTopology {
+	if command.AuthorityClass > CommandAuthorityRequestLedger {
 		return semantic("command authority class")
+	}
+	if (command.Kind == CommandRequestLedger) !=
+		(command.AuthorityClass == CommandAuthorityRequestLedger) {
+		return semantic("request ledger authority class")
 	}
 	switch command.Kind {
 	case CommandMutationBatch:
-		if len(command.Transaction) != 0 {
+		if len(command.Transaction) != 0 || len(command.RequestLedger) != 0 {
 			return semantic("ordinary command carries transaction control")
 		}
 		if err := validateRelationBatches(command.Batches); err != nil {
@@ -618,10 +660,14 @@ func validateCommandHeader(command Command) error {
 		}
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
-		if len(command.Batches) != 0 || len(command.Transaction) != 0 {
+		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
+			len(command.RequestLedger) != 0 {
 			return semantic("session lifecycle command carries payload")
 		}
 	case CommandTransaction:
+		if len(command.RequestLedger) != 0 {
+			return semantic("transaction command carries request ledger control")
+		}
 		control, err := validatedTransactionControl(command.Transaction)
 		if err != nil {
 			return semantic("transaction control")
@@ -643,6 +689,14 @@ func validateCommandHeader(command Command) error {
 			if err != nil || digest != control.mutationDigest {
 				return semantic("transaction mutation digest")
 			}
+		}
+	case CommandRequestLedger:
+		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
+			len(command.RequestLedger) == 0 {
+			return semantic("request ledger command body")
+		}
+		if err := requestledger.ValidateCommand(command.RequestLedger); err != nil {
+			return semantic("request ledger command body")
 		}
 	default:
 		return semantic("unknown command kind")
@@ -1036,10 +1090,14 @@ func OpenCommand(src []byte) (CommandView, error) {
 	}
 	kind, ok := openCommandKind(src[10])
 	authorityClass := CommandAuthorityClass(src[11])
-	if !ok || authorityClass > CommandAuthorityTopology ||
+	if !ok || authorityClass > CommandAuthorityRequestLedger ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
 		binary.LittleEndian.Uint16(src[246:248]) != 0 {
 		return CommandView{}, semantic("command kind, flags, or reserved bytes")
+	}
+	if (kind == CommandRequestLedger) !=
+		(authorityClass == CommandAuthorityRequestLedger) {
+		return CommandView{}, semantic("request ledger authority class")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
 	relationCount := binary.LittleEndian.Uint16(src[28:30])
@@ -1061,9 +1119,15 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count == 0 && relationCount == 0 && inlineRelationID == 0 {
 			break
 		}
-		if count == 0 || relationCount == 0 || uint64(count) > MaxMutations || relationCount > MaxRelationBatches ||
-			(relationCount == 1) != (inlineRelationID != 0) || inlineRelationID > MaxRelationID {
+		if count == 0 || relationCount == 0 || uint64(count) > MaxMutations ||
+			relationCount > MaxRelationBatches ||
+			(relationCount == 1) != (inlineRelationID != 0) ||
+			inlineRelationID > MaxRelationID {
 			return CommandView{}, semantic("transaction mutation or relation batch count")
+		}
+	case CommandRequestLedger:
+		if count != 0 || relationCount != 0 || inlineRelationID != 0 {
+			return CommandView{}, semantic("request ledger command carries relation batches")
 		}
 	}
 
@@ -1181,6 +1245,14 @@ func OpenCommand(src []byte) (CommandView, error) {
 		view.transactionBytes = controlBytes
 		view.transactionRole = control.role
 		view.transactionOp = control.operation
+	case CommandRequestLedger:
+		if len(payload) == 0 {
+			return CommandView{}, semantic("request ledger body length")
+		}
+		if err := requestledger.ValidateCommand(payload); err != nil {
+			return CommandView{}, corrupt("request ledger command")
+		}
+		view.requestLedgerBytes = payload
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count
@@ -1205,6 +1277,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandSessionRevoke, true
 	case commandWireTransaction:
 		return CommandTransaction, true
+	case commandWireRequestLedger:
+		return CommandRequestLedger, true
 	default:
 		return 0, false
 	}

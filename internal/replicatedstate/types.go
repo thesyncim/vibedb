@@ -4,12 +4,14 @@
 package replicatedstate
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -37,6 +39,17 @@ const (
 	// Result codes are local to their ResultFormat: transaction format code 12
 	// independently denotes a transaction-control CAS loss.
 	ResultIntentBusy uint32 = 12
+	// ResultRequestLedgerConflict is a deterministic request identity,
+	// revision, or byte-CAS conflict. The retained state remains authoritative.
+	ResultRequestLedgerConflict uint32 = 13
+	// ResultRequestLedgerCapacity is a deterministic upfront reservation
+	// refusal; no partial builder state is published.
+	ResultRequestLedgerCapacity uint32 = 14
+	// ResultRequestLedgerNotFound is a stateless non-creation CAS refusal.
+	ResultRequestLedgerNotFound uint32 = 15
+	// ResultRequestLedgerWrongRange is a stateless stale-route/range-authority
+	// refusal. No ledger row was mutated on that group.
+	ResultRequestLedgerWrongRange uint32 = 16
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its compact
 	// 376-byte header (416 bytes when transaction accounting is present), two
@@ -265,10 +278,23 @@ func (t CollectionTarget) validate() error {
 // Options fixes the cross-collection and bounded-session admission profile.
 // Zero values fail closed.
 type Options struct {
-	TxnLimits         durable.TxnLimits
-	MaxSessions       uint64
-	RetryWindow       uint16
-	TransitionCapture TransitionCapture
+	TxnLimits   durable.TxnLimits
+	MaxSessions uint64
+	RetryWindow uint16
+	// RequestLedgerCapacityBytes is the exact replicated resident+future-byte
+	// budget for this dedicated ledger group. Zero, together with a zero cleanup
+	// reserve, disables request-ledger commands on ordinary data groups.
+	RequestLedgerCapacityBytes uint64
+	// RequestLedgerCleanupReserveBytes is carved out from capacity so Create
+	// cannot starve ACK, recovery, or bounded tombstone-authorized GC.
+	RequestLedgerCleanupReserveBytes uint64
+	// RequestLedgerRange is immutable authority for one dedicated ledger Raft
+	// group. End is exclusive; an all-zero End denotes the 2^256 upper bound so
+	// the last range can cover the complete digest space without a sentinel key.
+	// Identity is carried by every ledger command and prevents a stale router
+	// from treating a different group/range generation as authoritative.
+	RequestLedgerRange RequestLedgerRange
+	TransitionCapture  TransitionCapture
 	// TransitionCaptureTarget reserves an authenticated participant in the
 	// fixed checkpoint membership before capture begins. A non-nil capture must
 	// name this exact target. It may be installed later under the Machine lock.
@@ -280,11 +306,51 @@ type Options struct {
 	CheckpointGroup *durable.CheckpointGroup
 }
 
+// RequestLedgerRange is the immutable, apply-contract-bound authority interval
+// for a dedicated request-ledger group. It is deliberately not topology state:
+// this safe point refuses online range changes and requires a fresh certified
+// group for a different interval.
+type RequestLedgerRange struct {
+	Start    requestledger.LedgerHome
+	End      requestledger.LedgerHome
+	Identity requestledger.Digest
+}
+
+func (r RequestLedgerRange) enabled() bool {
+	return r.Start != (requestledger.LedgerHome{}) ||
+		r.End != (requestledger.LedgerHome{}) || r.Identity != (requestledger.Digest{})
+}
+
+func (r RequestLedgerRange) valid() bool {
+	if r.Identity == (requestledger.Digest{}) {
+		return false
+	}
+	// Zero End is the canonical unbounded upper endpoint. A bounded interval
+	// must be nonempty under bytewise digest order.
+	return r.End == (requestledger.LedgerHome{}) || bytes.Compare(r.Start[:], r.End[:]) < 0
+}
+
+func (r RequestLedgerRange) contains(home requestledger.LedgerHome) bool {
+	if !r.valid() || bytes.Compare(home[:], r.Start[:]) < 0 {
+		return false
+	}
+	return r.End == (requestledger.LedgerHome{}) || bytes.Compare(home[:], r.End[:]) < 0
+}
+
 func (o Options) validate() error {
 	if o.MaxSessions == 0 || o.MaxSessions > MaxRetainedSessions ||
 		o.RetryWindow == 0 || o.RetryWindow > MaxSessionRetryWindow ||
 		o.TxnLimits.MaxCollections < 2 ||
 		o.TxnLimits.MaxDocuments < 4 || o.TxnLimits.MaxBytes <= 0 {
+		return ErrInvalidOptions
+	}
+	ledgerEnabled := o.RequestLedgerCapacityBytes != 0 ||
+		o.RequestLedgerCleanupReserveBytes != 0 || o.RequestLedgerRange.enabled()
+	if ledgerEnabled && (o.RequestLedgerCapacityBytes == 0 ||
+		o.RequestLedgerCleanupReserveBytes == 0 ||
+		o.RequestLedgerCleanupReserveBytes >= o.RequestLedgerCapacityBytes ||
+		o.RequestLedgerCapacityBytes > uint64(^uint64(0)>>1) ||
+		!o.RequestLedgerRange.valid()) {
 		return ErrInvalidOptions
 	}
 	return nil
@@ -307,6 +373,22 @@ type CompletionLookup struct {
 	Key             [32]byte
 	Bytes           []byte
 	AppliedSequence uint64
+}
+
+// RequestLedgerUsage is the constant-size, replicated admission/accounting
+// witness for one dedicated ledger group. Resident and Reserved are disjoint;
+// their checked sum is the exact capacity consumption. ACK tombstones are a
+// permanent subset of Rows/ResidentBytes and are never hidden by compaction.
+type RequestLedgerUsage struct {
+	Enabled             bool
+	Rows                uint64
+	ResidentBytes       uint64
+	ReservedBytes       uint64
+	AckRows             uint64
+	AckBytes            uint64
+	CapacityBytes       uint64
+	CleanupReserveBytes uint64
+	Range               RequestLedgerRange
 }
 
 // SessionLeaseLookup is the exact retained lease state for one issued client

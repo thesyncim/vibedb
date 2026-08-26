@@ -68,8 +68,11 @@ const (
 	commandWireSessionRenew    = uint8(5)
 	commandWireSessionRevoke   = uint8(6)
 	commandWireTransaction     = uint8(7)
-	sessionLeaseBodyBytes      = 16
-	transactionLengthBytes     = 4
+	// Wire kind 8 is owned by the route-gate command family. Request-ledger is
+	// fixed at 9 in the cross-package command registry.
+	commandWireRequestLedger = uint8(9)
+	sessionLeaseBodyBytes    = 16
+	transactionLengthBytes   = 4
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -140,12 +143,16 @@ type RelationID uint16
 
 // CommandAuthorityClass is authenticated command identity, not a transport
 // hint. Data is the zero value so the sole unreleased grammar keeps ordinary
-// command bytes compact; topology commands carry the one nonzero class bit.
+// command bytes compact; control surfaces use distinct nonzero classes.
 type CommandAuthorityClass uint8
 
 const (
 	CommandAuthorityData CommandAuthorityClass = iota
 	CommandAuthorityTopology
+	// CommandAuthorityRequestLedger is the narrow internal gateway-service
+	// authority for durable request lifecycle commands. It grants neither data
+	// writes nor topology mutation.
+	CommandAuthorityRequestLedger
 )
 
 // CommandKind selects the command's state-machine operation. The zero value is
@@ -177,6 +184,10 @@ const (
 	// CommandTransaction applies one canonical distributed transaction control
 	// transition. Only participant staging carries native relation batches.
 	CommandTransaction
+	// CommandRequestLedger applies one hidden, durable cross-shard request
+	// lifecycle transition. Its byte-native body is interpreted by the request
+	// ledger state machine and never carries user relation mutations.
+	CommandRequestLedger
 )
 
 // MutationKind selects one logical relation mutation.

@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
@@ -347,6 +348,9 @@ func bundleApplyContractDigest(
 	relations []relationCollection,
 	maxSessions uint64,
 	retryWindow uint16,
+	requestLedgerCapacity uint64,
+	requestLedgerCleanupReserve uint64,
+	requestLedgerRange RequestLedgerRange,
 ) ([sha256.Size]byte, error) {
 	if manifest == ([sha256.Size]byte{}) || len(relations) == 0 ||
 		maxSessions == 0 || retryWindow == 0 {
@@ -390,6 +394,30 @@ func bundleApplyContractDigest(
 	binary.LittleEndian.PutUint16(fixed[8:10], retryWindow)
 	binary.LittleEndian.PutUint64(fixed[10:18], MaxSessionRetryWindow)
 	_, _ = h.Write(fixed[:])
+	if requestLedgerCapacity != 0 || requestLedgerCleanupReserve != 0 {
+		if !requestLedgerRange.valid() {
+			return [sha256.Size]byte{}, ErrInvalidCollection
+		}
+		var ledger [16]byte
+		binary.LittleEndian.PutUint64(ledger[0:8], requestLedgerCapacity)
+		binary.LittleEndian.PutUint64(ledger[8:16], requestLedgerCleanupReserve)
+		_, _ = h.Write(ledger[:])
+		_, _ = h.Write(requestLedgerRange.Start[:])
+		_, _ = h.Write(requestLedgerRange.End[:])
+		_, _ = h.Write(requestLedgerRange.Identity[:])
+		semantics := requestledger.SemanticsDigest()
+		_, _ = h.Write(semantics[:])
+		var resultGrammar [22]byte
+		binary.LittleEndian.PutUint16(resultGrammar[0:2], ResultFormatRequestLedger)
+		binary.LittleEndian.PutUint32(resultGrammar[2:6], ResultRequestLedgerConflict)
+		binary.LittleEndian.PutUint32(resultGrammar[6:10], ResultRequestLedgerCapacity)
+		binary.LittleEndian.PutUint32(resultGrammar[10:14], ResultRequestLedgerNotFound)
+		binary.LittleEndian.PutUint32(resultGrammar[14:18], ResultRequestLedgerWrongRange)
+		binary.LittleEndian.PutUint32(resultGrammar[18:22], RequestLedgerCompletionResultBytes)
+		_, _ = h.Write(resultGrammar[:])
+	} else if requestLedgerRange.enabled() {
+		return [sha256.Size]byte{}, ErrInvalidCollection
+	}
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result, nil

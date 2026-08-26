@@ -499,9 +499,9 @@ func TestTransactionCompletionManifestPageWitnessAndCorruption(t *testing.T) {
 
 func TestTransactionCompletionWorkspaceIsAllocationFreeAndBounded(t *testing.T) {
 	if MaxCompletionEnvelopeBytes != replication.MaxEmptyResultCompletionEnvelopeBytes+
-		transactionCompletionResultBytes {
+		RequestLedgerCompletionResultBytes {
 		t.Fatalf("completion envelope bound = %d, want empty bound + %d",
-			MaxCompletionEnvelopeBytes, transactionCompletionResultBytes)
+			MaxCompletionEnvelopeBytes, RequestLedgerCompletionResultBytes)
 	}
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {

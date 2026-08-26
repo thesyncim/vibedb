@@ -48,6 +48,12 @@ func LogicalCommandDigest(command replication.CommandView) [32]byte {
 		_, _ = h.Write(length[:])
 		_, _ = h.Write(transaction)
 	}
+	if command.Kind() == replication.CommandRequestLedger {
+		ledger := command.RequestLedgerBytes()
+		binary.LittleEndian.PutUint64(length[:], uint64(len(ledger)))
+		_, _ = h.Write(length[:])
+		_, _ = h.Write(ledger)
+	}
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = h.Write(scalar[:])
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.MutationCount()))

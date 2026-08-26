@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -70,6 +71,7 @@ type Machine struct {
 	captureBuffer         []byte
 	captureChanges        []finalMutation
 	captureKey            [8]byte
+	requestLedgerSteps    [requestledger.MaxPendingWaveSteps]requestledger.StepRef
 
 	state                 State
 	publication           raftmodel.Publication
@@ -158,6 +160,8 @@ func OpenBundle(
 	}
 	contract, err := bundleApplyContractDigest(
 		manifest, relations, options.MaxSessions, options.RetryWindow,
+		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+		options.RequestLedgerRange,
 	)
 	if err != nil {
 		return nil, err
@@ -242,7 +246,9 @@ func OpenBundle(
 	}
 	var openedTransactions scannedTransactions
 	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
-		systemSnapshot, options.MaxSessions, options.RetryWindow, &openedTransactions,
+		systemSnapshot, options.MaxSessions, options.RetryWindow,
+		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+		options.RequestLedgerRange, &openedTransactions,
 	)
 	if err != nil {
 		return nil, err
@@ -439,6 +445,17 @@ func prepareOpenInputs(
 		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
 	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes)
 	maxSystemDocuments := max(4, int(options.RetryWindow)+2)
+	if options.RequestLedgerRange.enabled() {
+		// One bounded ledger command can replace the head and publish up to 32
+		// exact 512 KiB plan pages. The hidden collection must admit that whole
+		// atomic transition; accepting a narrower live handle would make the
+		// apply contract depend on replica-local storage limits.
+		maxSystemDocument = max(maxSystemDocument, requestledger.MaxCommandBytes)
+		maxSystemDocuments = max(maxSystemDocuments, MaxDistinctMutations+1)
+		maxSystemBatchBytes = max(maxSystemBatchBytes,
+			requestledger.MaxCommandBytes+MaxStateEnvelopeBytes+
+				MaxDistinctMutations*requestledger.PageStorageKeyBytes)
+	}
 	if system.Limits.MaxKeyBytes < sha256.Size+3 ||
 		system.Limits.MaxDocumentBytes < maxSystemDocument ||
 		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
@@ -486,6 +503,8 @@ func prepareOpenInputs(
 		prepared.manifestDigest = manifest
 		prepared.applyContract, relationErr = bundleApplyContractDigest(
 			manifest, relations, options.MaxSessions, options.RetryWindow,
+			options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+			options.RequestLedgerRange,
 		)
 		if relationErr != nil {
 			return openInputs{}, relationErr
@@ -693,6 +712,9 @@ func scanSessionSystemSnapshot(
 	snapshot *durable.Snapshot,
 	maxSessions uint64,
 	retryWindow uint16,
+	requestLedgerCapacity uint64,
+	requestLedgerCleanup uint64,
+	requestLedgerRange RequestLedgerRange,
 	transactionResult ...*scannedTransactions,
 ) (State, bool, uint64, uint64, uint64, error) {
 	var state State
@@ -717,6 +739,9 @@ func scanSessionSystemSnapshot(
 	var mutationScanRelations uint16
 	var mutationScanMutations uint64
 	var mutationScanLastRelation replication.RelationID
+	ledgerScan := newRequestLedgerImageScanner(
+		requestLedgerCapacity, requestLedgerCleanup, requestLedgerRange,
+	)
 	finishMutationScan := func() error {
 		if mutationScanControl == nil {
 			return nil
@@ -1123,6 +1148,12 @@ func scanSessionSystemSnapshot(
 			transactionIntentRows++
 			return addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value))
 
+		case len(key) >= requestledger.FixedStorageKeyBytes && key[0] == requestledger.StoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger row before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observe(key, value)
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}
@@ -1131,6 +1162,9 @@ func scanSessionSystemSnapshot(
 		return State{}, false, 0, 0, 0, err
 	}
 	if err := finishMutationScan(); err != nil {
+		return State{}, false, 0, 0, 0, err
+	}
+	if err := ledgerScan.finish(state); err != nil {
 		return State{}, false, 0, 0, 0, err
 	}
 	if !statePresent {
@@ -1458,6 +1492,31 @@ func (m *Machine) SessionCapacityState() (SessionCapacityState, error) {
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
 		SessionEpochHighWater: m.state.SessionEpochHighWater,
 		AuthorityBindingCount: m.state.AuthorityBindingCount,
+	}, nil
+}
+
+// RequestLedgerUsage returns the exact replicated ledger counters and the
+// immutable range authority used by this machine. It performs no row scan and
+// therefore remains constant-time under large retained ledgers.
+func (m *Machine) RequestLedgerUsage() (RequestLedgerUsage, error) {
+	if m == nil {
+		return RequestLedgerUsage{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return RequestLedgerUsage{}, err
+	}
+	return RequestLedgerUsage{
+		Enabled:             m.options.RequestLedgerRange.enabled(),
+		Rows:                m.state.RequestLedgerRows,
+		ResidentBytes:       m.state.RequestLedgerResidentBytes,
+		ReservedBytes:       m.state.RequestLedgerReservedBytes,
+		AckRows:             m.state.RequestLedgerAckRows,
+		AckBytes:            m.state.RequestLedgerAckBytes,
+		CapacityBytes:       m.options.RequestLedgerCapacityBytes,
+		CleanupReserveBytes: m.options.RequestLedgerCleanupReserveBytes,
+		Range:               m.options.RequestLedgerRange,
 	}, nil
 }
 

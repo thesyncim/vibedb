@@ -322,7 +322,8 @@ func (m *Machine) ApplyNormalBatch(
 				deferredErr = ErrWrongBinding
 				break
 			}
-			if command.Kind() == replication.CommandTransaction {
+			if command.Kind() == replication.CommandTransaction ||
+				command.Kind() == replication.CommandRequestLedger {
 				break
 			}
 			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
@@ -512,19 +513,24 @@ func (m *Machine) nextBatchState(
 		Binding: current.Binding, Applied: meta.Index, LastTerm: meta.Term,
 		LastKind: RecordNormal, LastEntryType: meta.Type, LastEntryDigest: digest,
 		DataChainDigest: current.DataChainDigest, ConfState: current.ConfState,
-		ApplyContractDigest:      current.ApplyContractDigest,
-		ReplicaSetVersion:        current.ReplicaSetVersion,
-		BootstrapDigest:          current.BootstrapDigest,
-		SnapshotBaseDigest:       current.SnapshotBaseDigest,
-		SessionCount:             current.SessionCount,
-		SessionSlotCount:         current.SessionSlotCount,
-		SessionEpochHighWater:    current.SessionEpochHighWater,
-		AuthorityBindingCount:    current.AuthorityBindingCount,
-		TransactionControlCount:  current.TransactionControlCount,
-		ActiveTransactionCount:   current.ActiveTransactionCount,
-		TransactionPayloadRows:   current.TransactionPayloadRows,
-		TransactionIntentRows:    current.TransactionIntentRows,
-		TransactionResidentBytes: current.TransactionResidentBytes,
+		ApplyContractDigest:        current.ApplyContractDigest,
+		ReplicaSetVersion:          current.ReplicaSetVersion,
+		BootstrapDigest:            current.BootstrapDigest,
+		SnapshotBaseDigest:         current.SnapshotBaseDigest,
+		SessionCount:               current.SessionCount,
+		SessionSlotCount:           current.SessionSlotCount,
+		SessionEpochHighWater:      current.SessionEpochHighWater,
+		AuthorityBindingCount:      current.AuthorityBindingCount,
+		TransactionControlCount:    current.TransactionControlCount,
+		ActiveTransactionCount:     current.ActiveTransactionCount,
+		TransactionPayloadRows:     current.TransactionPayloadRows,
+		TransactionIntentRows:      current.TransactionIntentRows,
+		TransactionResidentBytes:   current.TransactionResidentBytes,
+		RequestLedgerRows:          current.RequestLedgerRows,
+		RequestLedgerResidentBytes: current.RequestLedgerResidentBytes,
+		RequestLedgerReservedBytes: current.RequestLedgerReservedBytes,
+		RequestLedgerAckRows:       current.RequestLedgerAckRows,
+		RequestLedgerAckBytes:      current.RequestLedgerAckBytes,
 	}
 }
 

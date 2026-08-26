@@ -12,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -1638,6 +1639,10 @@ func consumeSnapshotArtifactRows(
 					return false, errors.Join(err, keyErr,
 						fmt.Errorf("%w: transaction intent", ErrSnapshotArtifact))
 				}
+			case len(key) >= requestledger.FixedStorageKeyBytes && key[0] == requestledger.StoragePrefix:
+				if err := validateSnapshotRequestLedgerRow(key, value); err != nil {
+					return false, fmt.Errorf("%w: request ledger row: %v", ErrSnapshotArtifact, err)
+				}
 			default:
 				return false, fmt.Errorf("%w: hidden system key", ErrSnapshotArtifact)
 			}
@@ -1663,9 +1668,72 @@ func snapshotArtifactMaxValueBytes(collection SnapshotArtifactCollection) uint64
 	}
 	if collection == SnapshotArtifactSystem {
 		return max(uint64(replication.MaxMutationValueBytes),
-			uint64(MaxTransactionRelationPayloadRecordBytes))
+			uint64(MaxTransactionRelationPayloadRecordBytes),
+			uint64(requestledger.MaxCommandBytes))
 	}
 	return replication.MaxMutationValueBytes
+}
+
+func validateSnapshotRequestLedgerRow(key, value []byte) error {
+	view, err := requestledger.OpenStorageKey(key)
+	if err != nil {
+		return err
+	}
+	switch view.Kind {
+	case requestledger.StorageHead:
+		record, openErr := requestledger.OpenHead(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+		home, homeErr := requestledger.Home(record.Key)
+		if homeErr != nil || home != view.Home {
+			return errors.Join(homeErr, ErrStateCorrupt)
+		}
+	case requestledger.StoragePlanPage:
+		record, openErr := requestledger.OpenPlanPage(value)
+		if openErr != nil || record.KeyDigest != view.Key || record.Ordinal != view.Ordinal {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StoragePending:
+		var scratch [requestledger.MaxPendingWaveSteps]requestledger.StepRef
+		record, openErr := requestledger.OpenPendingWaveInto(value, scratch[:])
+		if openErr != nil || record.Key() != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StorageContinuation:
+		record, openErr := requestledger.OpenContinuation(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StorageTerminal:
+		record, openErr := requestledger.OpenTerminal(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StorageAck:
+		record, openErr := requestledger.OpenAck(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+		home, homeErr := requestledger.Home(record.Key)
+		if homeErr != nil || home != view.Home {
+			return errors.Join(homeErr, ErrStateCorrupt)
+		}
+	case requestledger.StoragePayloadChunk:
+		record, openErr := requestledger.OpenPayloadChunk(value)
+		if openErr != nil || record.KeyDigest != view.Key || record.ContentRoot != view.Content ||
+			record.Ordinal != view.Ordinal {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StoragePayloadBuild:
+		record, openErr := requestledger.OpenPayloadBuild(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	default:
+		return ErrStateCorrupt
+	}
+	return nil
 }
 
 func validateSnapshotArtifactFooter(

@@ -190,7 +190,7 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		id: 1, kind: RelationJSON, name: "docs", target: target,
 	}}
 	contract, err := bundleApplyContractDigest(
-		relationManifestDigest(1, relations), relations, 1024, 8,
+		relationManifestDigest(1, relations), relations, 1024, 8, 0, 0, RequestLedgerRange{},
 	)
 	if err != nil {
 		t.Fatal(err)

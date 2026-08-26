@@ -240,6 +240,8 @@ func (m *Machine) BuildBundleSnapshotBase() (
 	}
 	state, present, sessions, slots, authorities, err := scanSessionSystemSnapshot(
 		system, m.options.MaxSessions, m.options.RetryWindow,
+		m.options.RequestLedgerCapacityBytes, m.options.RequestLedgerCleanupReserveBytes,
+		m.options.RequestLedgerRange,
 	)
 	if err != nil || !present || sessions != state.SessionCount ||
 		slots != state.SessionSlotCount || authorities != state.AuthorityBindingCount ||

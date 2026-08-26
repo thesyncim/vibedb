@@ -171,7 +171,12 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 		cap(dst) < MaxCompletionEnvelopeBytes {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
-	if command.Kind() != replication.CommandTransaction {
+	if command.Kind() == replication.CommandRequestLedger &&
+		cap(dst) < MaxCompletionEnvelopeBytes {
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
+	if command.Kind() != replication.CommandTransaction &&
+		command.Kind() != replication.CommandRequestLedger {
 		result, err := m.lookupCompletionAtSnapshot(
 			command,
 			dst[:0:MaxMutationCompletionEnvelopeBytes],
@@ -256,7 +261,8 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	if command.Kind() == replication.CommandTransaction && completionScratch != nil &&
+	if (command.Kind() == replication.CommandTransaction ||
+		command.Kind() == replication.CommandRequestLedger) && completionScratch != nil &&
 		cap(completionScratch) < MaxCompletionEnvelopeBytes {
 		endErr := m.EndCompletionLookupBatch(&workspace)
 		_ = workspace.Release()
@@ -265,7 +271,8 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
-	if command.Kind() == replication.CommandTransaction && completionScratch != nil {
+	if (command.Kind() == replication.CommandTransaction ||
+		command.Kind() == replication.CommandRequestLedger) && completionScratch != nil {
 		completionScratch = completionScratch[:0:MaxCompletionEnvelopeBytes]
 	} else if completionScratch != nil {
 		completionScratch = completionScratch[:0:MaxMutationCompletionEnvelopeBytes]
@@ -287,6 +294,11 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	workspace *CompletionLookupWorkspace,
 ) (CompletionLookup, error) {
 	snapshot := workspace.snapshot
+	if command.Kind() == replication.CommandRequestLedger {
+		return m.lookupRequestLedgerCompletionAtSnapshot(
+			command, completionScratch, workspace,
+		)
+	}
 	if command.Kind() == replication.CommandTransaction {
 		return m.lookupTransactionCompletionAtSnapshot(
 			command, completionScratch, workspace,
@@ -852,6 +864,8 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	}
 	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
 		systemSnapshot, m.options.MaxSessions, m.options.RetryWindow,
+		m.options.RequestLedgerCapacityBytes, m.options.RequestLedgerCleanupReserveBytes,
+		m.options.RequestLedgerRange,
 	)
 	if err != nil || present != m.initialized {
 		closeErr := cut.Close()

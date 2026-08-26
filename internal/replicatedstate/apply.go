@@ -264,6 +264,25 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
+	if command.Kind() == replication.CommandRequestLedger {
+		ledgerPlan, planErr := m.planRequestLedgerCommand(
+			command, m.state, pointSnapshot{value: systemSnapshot},
+		)
+		err = errors.Join(planErr, m.applyCut.Close())
+		if err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		next := m.nextState(meta, RecordNormal, digest)
+		if err := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		if err := m.persistTransitionRows(
+			next, nil, commandPlan{dataChainDigest: next.DataChainDigest}, ledgerPlan.rows,
+		); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		return clonePublication(m.publication), nil
+	}
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
 			command, meta.Index, m.state,
@@ -597,6 +616,32 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if err != nil {
 		return m.fail(err)
 	}
+	if command.Kind() == replication.CommandRequestLedger {
+		ledgerPlan, planErr := m.planRequestLedgerCommand(
+			command, m.state, pointSnapshot{value: systemSnapshot},
+		)
+		closeErr := m.applyCut.Close()
+		if planErr != nil || closeErr != nil {
+			joined := errors.Join(planErr, closeErr)
+			if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
+				return planErr
+			}
+			return m.fail(joined)
+		}
+		next := m.nextState(
+			raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal},
+			RecordNormal, normalEntryDigest(
+				raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal},
+				command.Bytes(),
+			),
+		)
+		if stateErr := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); stateErr != nil {
+			return m.fail(stateErr)
+		}
+		return m.checkTransitionCapacityWithCaptureRows(
+			next, nil, commandPlan{dataChainDigest: next.DataChainDigest}, 0, ledgerPlan.rows,
+		)
+	}
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
 			command, m.state.Applied+1, m.state,
@@ -749,13 +794,18 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ReplicaSetVersion:   m.state.ReplicaSetVersion,
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
-		SessionEpochHighWater:    m.state.SessionEpochHighWater,
-		AuthorityBindingCount:    m.state.AuthorityBindingCount,
-		TransactionControlCount:  m.state.TransactionControlCount,
-		ActiveTransactionCount:   m.state.ActiveTransactionCount,
-		TransactionPayloadRows:   m.state.TransactionPayloadRows,
-		TransactionIntentRows:    m.state.TransactionIntentRows,
-		TransactionResidentBytes: m.state.TransactionResidentBytes,
+		SessionEpochHighWater:      m.state.SessionEpochHighWater,
+		AuthorityBindingCount:      m.state.AuthorityBindingCount,
+		TransactionControlCount:    m.state.TransactionControlCount,
+		ActiveTransactionCount:     m.state.ActiveTransactionCount,
+		TransactionPayloadRows:     m.state.TransactionPayloadRows,
+		TransactionIntentRows:      m.state.TransactionIntentRows,
+		TransactionResidentBytes:   m.state.TransactionResidentBytes,
+		RequestLedgerRows:          m.state.RequestLedgerRows,
+		RequestLedgerResidentBytes: m.state.RequestLedgerResidentBytes,
+		RequestLedgerReservedBytes: m.state.RequestLedgerReservedBytes,
+		RequestLedgerAckRows:       m.state.RequestLedgerAckRows,
+		RequestLedgerAckBytes:      m.state.RequestLedgerAckBytes,
 	}
 }
 
