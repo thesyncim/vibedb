@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -36,12 +35,6 @@ import (
 const (
 	maxServeRequestBytes              = 1 << 20
 	defaultNativeResponseWriteTimeout = 5 * time.Second
-	defaultRF3TransactionConcurrency  = 64
-	defaultRF3TransactionInFlight     = uint64(64 << 20)
-	defaultRF3TransactionRequests     = 65_536
-	defaultRF3TransactionRecovery     = 24 * time.Hour
-	defaultRF3TransactionMutations    = uint64(10_000_000)
-	defaultRF3TransactionBytes        = uint64(1 << 30)
 )
 
 // The serve subcommand is a routing front-end. It loads an immutable
@@ -154,6 +147,7 @@ func runServe(args []string) int {
 	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
 	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
 	catalogSessionJournal := fs.String("catalog-session-journal", "", "durable native controller session journal base path")
+	durableAckKeyPath := fs.String("durable-ack-key", "", "cluster-shared 64-character lowercase hexadecimal durable ACK key file")
 	catalogClientID := fs.String("catalog-client-id", "", "stable 32-hex-character controller client identity")
 	catalogRetryHome := fs.String("catalog-retry-home", "", "stable 16-hex-character controller retry-home identity")
 	catalogSessionLease := fs.Duration("catalog-session-lease", 24*time.Hour, "monotonic controller session renewal interval")
@@ -186,12 +180,12 @@ func runServe(args []string) int {
 		return 2
 	}
 	if *devStaticCatalog {
-		if !*devPlaintext || *catalogRelation != 0 || *hotShardCapacity != "" {
+		if !*devPlaintext || *catalogRelation != 0 || *hotShardCapacity != "" || *durableAckKeyPath != "" {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
 		}
 	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
-		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *controllerInterval <= 0 ||
+		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *durableAckKeyPath == "" || *controllerInterval <= 0 ||
 		*catalogSessionLease <= 0 || *hotShardInterval <= 0 ||
 		len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
 		fmt.Fprintln(os.Stderr, "gateway: replicated catalog relation, identities, journal, and positive bounds are required")
@@ -237,8 +231,8 @@ func runServe(args []string) int {
 			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
 				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology|
 				serviceauthz.CapabilityTransactionRecovery|
-				serviceauthz.CapabilityRequestLedger) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, transaction_recovery, and request_ledger authority")
+				serviceauthz.CapabilityRequestLedger|serviceauthz.CapabilityExecutionPin) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, transaction_recovery, request_ledger, and execution_pin authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -340,6 +334,7 @@ func runServe(args []string) int {
 		return 1
 	}
 	var dataReader *gateway.ReplicatedDataReader
+	var durable durableRequestService
 	if replicated != nil {
 		dataReader, err = gateway.NewReplicatedDataReaderWithOptions(
 			gateway.ReplicatedDataReaderOptions{
@@ -351,6 +346,20 @@ func runServe(args []string) int {
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gateway: initialize replicated data reader: %v\n", err)
+			return 1
+		}
+		ackKey, keyErr := loadDurableAckKey(*durableAckKeyPath)
+		if keyErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: load durable ACK key: %v\n", keyErr)
+			return 1
+		}
+		durable, err = newReplicatedDurableRuntime(replicatedDurableRuntimeOptions{
+			Planner: exec, Catalog: holder, CatalogControl: catalogAuthority,
+			Replicated: replicated, Authority: internalAuthority,
+			AckKey: ackKey, JournalBase: *catalogSessionJournal,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: initialize durable RF3 request service: %v\n", err)
 			return 1
 		}
 	}
@@ -531,12 +540,12 @@ func runServe(args []string) int {
 		}()
 	}
 	if clientTLS != nil {
-		err = serveAuthenticatedGatewayData(ctx, listener, exec, dataReader, clientTLS, gateway.ClientTLSLimits{
+		err = serveAuthenticatedGatewayDurableData(ctx, listener, exec, dataReader, durable, clientTLS, gateway.ClientTLSLimits{
 			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,
 			HandshakeDeadline: servicetls.FixedDeadline(*tlsHandshakeTimeout),
 		}, logf)
 	} else {
-		serveContext := gateway.WithLocalReplicatedTransactionRequestScope(ctx)
+		serveContext := ctx
 		if dataReader != nil {
 			serveContext, err = serviceauthz.WithAuthority(serveContext, internalAuthority)
 			if err != nil {
@@ -544,7 +553,7 @@ func runServe(args []string) int {
 				return 1
 			}
 		}
-		err = serveGatewayData(serveContext, listener, exec, dataReader, logf)
+		err = serveGatewayDurableData(serveContext, listener, exec, dataReader, durable, logf)
 	}
 	var replicaControlErr error
 	if replicaControlDone != nil {
@@ -777,66 +786,15 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	transactionTenant, transactionRetryHome := replicatedDataTransactionIdentity(
-		clientID, retryHome,
-	)
-	transactions, err := gateway.NewReplicatedTransactionOrchestrator(
-		gateway.ReplicatedTransactionOrchestratorOptions{
-			Executor: replicated, Tenant: transactionTenant, RetryHome: transactionRetryHome,
-			MaxConcurrency:    defaultRF3TransactionConcurrency,
-			MaxInFlightBytes:  defaultRF3TransactionInFlight,
-			MaxMutations:      defaultRF3TransactionMutations,
-			MaxMutationBytes:  defaultRF3TransactionBytes,
-			RecoveryTimeout:   defaultRF3TransactionRecovery,
-			RecoveryAuthority: internalAuthority,
-		},
-	)
-	if err != nil {
-		if replicatedPool != nil {
-			_ = replicatedPool.Close()
-		}
-		return nil, nil, nil, nil, nil, err
-	}
-	transactionRequests, err := gateway.NewReplicatedTransactionRequestRegistry(
-		gateway.ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: transactions, MaxEntries: defaultRF3TransactionRequests,
-		},
-	)
-	if err != nil {
-		if replicatedPool != nil {
-			_ = replicatedPool.Close()
-		}
-		return nil, nil, nil, nil, nil, err
-	}
 	executor := gateway.NewExecutor(
 		gateway.NewClient(shardDial), holder, gateway.Options{
 			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
-			ReplicatedTransactions:        transactions,
-			ReplicatedTransactionRequests: transactionRequests,
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil
 }
 
 const replicatedCatalogControllerTenant = byte(1)
-
-func replicatedDataTransactionIdentity(
-	clientID replication.ID128,
-	retryHome replication.RetryHome,
-) ([]byte, replication.RetryHome) {
-	var material [1 + len(clientID) + len(retryHome)]byte
-	material[0] = 2
-	copy(material[1:1+len(clientID)], clientID[:])
-	copy(material[1+len(clientID):], retryHome[:])
-	tenantDigest := sha256.Sum256(material[:])
-	material[0] = 3
-	retryDigest := sha256.Sum256(material[:])
-	tenant := make([]byte, len(clientID))
-	copy(tenant, tenantDigest[:len(tenant)])
-	var dataRetryHome replication.RetryHome
-	copy(dataRetryHome[:], retryDigest[:len(dataRetryHome)])
-	return tenant, dataRetryHome
-}
 
 func decodeFixedHex(encoded string, destination []byte) error {
 	if len(encoded) != hex.EncodedLen(len(destination)) {
@@ -863,6 +821,17 @@ func serveGatewayData(
 	data nativeDataReader,
 	logf func(string, ...any),
 ) error {
+	return serveGatewayDurableData(ctx, listener, exec, data, nil, logf)
+}
+
+func serveGatewayDurableData(
+	ctx context.Context,
+	listener net.Listener,
+	exec *gateway.Executor,
+	data nativeDataReader,
+	durable durableRequestService,
+	logf func(string, ...any),
+) error {
 	startGatewayRecovery(ctx, exec, logf)
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
@@ -884,7 +853,7 @@ func serveGatewayData(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConnData(ctx, conn, exec, data, logf)
+			handleConnPolicyDurable(ctx, conn, exec, data, durable, logf, nil)
 		}()
 	}
 }
@@ -898,24 +867,6 @@ func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func
 			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
 		}
 	})
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			resolved, err := exec.RecoverReplicatedTransactionRequests(ctx)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				logf("gateway: RF3 transaction recovery: %v", err)
-			}
-			if resolved != 0 {
-				logf("gateway: RF3 transaction recovery attempted %d request(s)", resolved)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
 }
 
 func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
@@ -932,10 +883,26 @@ func serveAuthenticatedGatewayData(
 	limits gateway.ClientTLSLimits,
 	logf func(string, ...any),
 ) error {
+	return serveAuthenticatedGatewayDurableData(ctx, listener, exec, data, nil, capability, limits, logf)
+}
+
+func serveAuthenticatedGatewayDurableData(
+	ctx context.Context,
+	listener net.Listener,
+	exec *gateway.Executor,
+	data nativeDataReader,
+	durable durableRequestService,
+	capability *gateway.ClientTLS,
+	limits gateway.ClientTLSLimits,
+	logf func(string, ...any),
+) error {
 	startGatewayRecovery(ctx, exec, logf)
 	return capability.ServeAuthorizedClients(ctx, listener, limits,
 		func(ctx context.Context, connection net.Conn) {
-			handleConnAuthorizedData(ctx, connection, exec, data, capability, logf)
+			handleConnPolicyDurable(ctx, connection, exec, data, durable, logf,
+				func(required serviceauthz.Capability) bool {
+					return capability.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
+				})
 		})
 }
 
