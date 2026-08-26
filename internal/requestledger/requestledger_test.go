@@ -784,6 +784,22 @@ func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	highwater, err = AdmitIssuerSequence(highwater, key1, ack1.RequestDigest, highwater.Revision+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gap := key2
+	gap.IssuerSequence = 3
+	if _, err = AdmitIssuerSequence(highwater, gap, ack2.RequestDigest, highwater.Revision+1); err == nil {
+		t.Fatal("issuer admission accepted a sequence gap")
+	}
+	if _, err = AdmitIssuerSequence(highwater, key1, ack1.RequestDigest, highwater.Revision+1); err == nil {
+		t.Fatal("issuer admission reused a sequence")
+	}
+	highwater, err = AdmitIssuerSequence(highwater, key2, ack2.RequestDigest, highwater.Revision+1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request1, err := NewIssuerAdvanceRequest(highwater, sequence1, ack1)
 	if err != nil {
 		t.Fatal(err)
@@ -912,6 +928,12 @@ func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
 	binary.LittleEndian.PutUint32(forged[len(forged)-4:], crc32.Checksum(forged[:len(forged)-4], castagnoli))
 	if _, err = OpenIssuerHighwater(forged); err == nil {
 		t.Fatal("forged highwater accepted under recomputed checksum")
+	}
+	forged = append(forged[:0], highwaterRaw...)
+	forged[320] ^= 1
+	binary.LittleEndian.PutUint32(forged[len(forged)-4:], crc32.Checksum(forged[:len(forged)-4], castagnoli))
+	if _, err = OpenIssuerHighwater(forged); err == nil {
+		t.Fatal("forged admission frontier accepted under recomputed checksum")
 	}
 	if _, err = NewIssuerHighwater(testKey(false)); err == nil {
 		t.Fatal("arbitrary-ID request installed an issuer highwater")

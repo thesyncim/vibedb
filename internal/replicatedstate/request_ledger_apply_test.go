@@ -242,7 +242,7 @@ func TestRequestLedgerSequencedHomeNotKeyDigestOwnsRange(t *testing.T) {
 	fixture := newRequestLedgerMachineFixture(t, 64<<20)
 	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,
 		TenantDigest: requestledger.Digest{0x81}, Principal: requestledger.PrincipalID{0x91},
-		Request: requestledger.RequestID{0xa1}, IssuerEpoch: 9, IssuerSequence: 44,
+		Request: requestledger.RequestID{0xa1}, IssuerEpoch: 9, IssuerSequence: 1,
 		IssuerLane: [8]byte{0xb1}}
 	create, head := requestLedgerCreateCommand(t, fixture, key)
 	outer, err := replication.OpenCommand(create)

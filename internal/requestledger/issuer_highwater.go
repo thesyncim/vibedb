@@ -12,7 +12,7 @@ const (
 	IssuerSequenceStoragePrefix  byte = systemkey.RequestLedgerFirst + 5
 	IssuerHighwaterKeyBytes           = 1 + 32 + 32
 	IssuerSequenceKeyBytes            = 1 + 32 + 32 + 8
-	IssuerHighwaterRecordBytes        = 352
+	IssuerHighwaterRecordBytes        = 480
 	IssuerSequenceRecordBytes         = 320
 	IssuerAdvanceRequestBytes         = 160
 
@@ -97,7 +97,15 @@ type IssuerHighwaterRecord struct {
 	PriorHighwaterDigest     Digest
 	LastAdvanceRequestDigest Digest
 	HighwaterDigest          Digest
-	Revision                 uint64
+	// AdmittedSequence is the strictly monotone admission frontier for this
+	// issuer lane. It is intentionally independent from HighwaterSequence:
+	// requests may execute concurrently after admission, while reclamation may
+	// advance only across the contiguous GC-complete prefix.
+	AdmittedSequence           uint64
+	LastAdmissionKeyDigest     Digest
+	LastAdmissionRequestDigest Digest
+	LastAdmissionDigest        Digest
+	Revision                   uint64
 }
 
 func NewIssuerHighwater(key RequestKey) (IssuerHighwaterRecord, error) {
@@ -158,13 +166,17 @@ func AppendIssuerHighwater(dst []byte, record IssuerHighwaterRecord) ([]byte, er
 	putDigest(out[224:256], record.PriorHighwaterDigest)
 	putDigest(out[256:288], record.LastAdvanceRequestDigest)
 	putDigest(out[288:320], record.HighwaterDigest)
+	binary.LittleEndian.PutUint64(out[320:328], record.AdmittedSequence)
+	putDigest(out[328:360], record.LastAdmissionKeyDigest)
+	putDigest(out[360:392], record.LastAdmissionRequestDigest)
+	putDigest(out[392:424], record.LastAdmissionDigest)
 	dst = appendChecksum(dst, start)
 	return dst, nil
 }
 
 func OpenIssuerHighwater(raw []byte) (IssuerHighwaterRecord, error) {
 	if len(raw) != IssuerHighwaterRecordBytes || !magicOK(raw, issuerHighwaterMagic) ||
-		!zeroBytes(raw[4:8]) || !zeroBytes(raw[9:16]) || !zeroBytes(raw[320:348]) || !checksumOK(raw) {
+		!zeroBytes(raw[4:8]) || !zeroBytes(raw[9:16]) || !zeroBytes(raw[424:476]) || !checksumOK(raw) {
 		return IssuerHighwaterRecord{}, ErrCorrupt
 	}
 	record := IssuerHighwaterRecord{
@@ -174,6 +186,10 @@ func OpenIssuerHighwater(raw []byte) (IssuerHighwaterRecord, error) {
 		IssuerDigest: readDigest(raw[128:160]), LastKeyDigest: readDigest(raw[160:192]),
 		LastAckDigest: readDigest(raw[192:224]), PriorHighwaterDigest: readDigest(raw[224:256]),
 		LastAdvanceRequestDigest: readDigest(raw[256:288]), HighwaterDigest: readDigest(raw[288:320]),
+		AdmittedSequence:           binary.LittleEndian.Uint64(raw[320:328]),
+		LastAdmissionKeyDigest:     readDigest(raw[328:360]),
+		LastAdmissionRequestDigest: readDigest(raw[360:392]),
+		LastAdmissionDigest:        readDigest(raw[392:424]),
 	}
 	copy(record.Home[:], raw[40:72])
 	copy(record.Identity.Principal[:], raw[104:120])
@@ -188,13 +204,22 @@ func validateIssuerHighwater(record IssuerHighwaterRecord) error {
 	issuer, issuerErr := IssuerDigest(record.Identity)
 	home, homeErr := issuerHome(record.Identity)
 	if issuerErr != nil || homeErr != nil || issuer != record.IssuerDigest || home != record.Home ||
-		record.Revision == 0 || record.HighwaterSequence != record.Revision-1 ||
+		record.Revision == 0 || record.HighwaterSequence > record.AdmittedSequence ||
 		(record.HighwaterSequence == 0) !=
 			(!nonzeroDigest(record.LastKeyDigest) && !nonzeroDigest(record.LastAckDigest) &&
 				!nonzeroDigest(record.PriorHighwaterDigest) && !nonzeroDigest(record.LastAdvanceRequestDigest)) ||
 		record.HighwaterSequence != 0 &&
 			(!nonzeroDigest(record.LastKeyDigest) || !nonzeroDigest(record.LastAckDigest) ||
 				!nonzeroDigest(record.PriorHighwaterDigest) || !nonzeroDigest(record.LastAdvanceRequestDigest)) ||
+		(record.AdmittedSequence == 0) !=
+			(!nonzeroDigest(record.LastAdmissionKeyDigest) &&
+				!nonzeroDigest(record.LastAdmissionRequestDigest) &&
+				!nonzeroDigest(record.LastAdmissionDigest)) ||
+		record.AdmittedSequence != 0 &&
+			(!nonzeroDigest(record.LastAdmissionKeyDigest) ||
+				!nonzeroDigest(record.LastAdmissionRequestDigest) ||
+				!nonzeroDigest(record.LastAdmissionDigest) ||
+				record.LastAdmissionDigest != issuerAdmissionDigest(record)) ||
 		record.HighwaterDigest != issuerHighwaterDigest(record) {
 		return ErrCorrupt
 	}
@@ -203,19 +228,69 @@ func validateIssuerHighwater(record IssuerHighwaterRecord) error {
 
 func issuerHighwaterDigest(record IssuerHighwaterRecord) Digest {
 	const domain = "vibedb/request-ledger/issuer-highwater\x00"
-	var framed [len(domain) + 8*3 + 6*sha256.Size + 16 + 16]byte
+	var framed [len(domain) + 8*4 + 9*sha256.Size + 16 + 16]byte
 	at := copy(framed[:], issuerHighwaterDigestDomain)
 	framed[at] = byte(record.Identity.Scope)
 	binary.LittleEndian.PutUint64(framed[at+8:at+16], record.Revision)
 	binary.LittleEndian.PutUint64(framed[at+16:at+24], record.HighwaterSequence)
-	at += 24
+	binary.LittleEndian.PutUint64(framed[at+24:at+32], record.AdmittedSequence)
+	at += 32
 	for _, digest := range [...]Digest{record.Identity.TenantDigest, record.IssuerDigest,
-		record.LastKeyDigest, record.LastAckDigest, record.PriorHighwaterDigest, record.LastAdvanceRequestDigest} {
+		record.LastKeyDigest, record.LastAckDigest, record.PriorHighwaterDigest, record.LastAdvanceRequestDigest,
+		record.LastAdmissionKeyDigest, record.LastAdmissionRequestDigest, record.LastAdmissionDigest} {
 		at += copy(framed[at:], digest[:])
 	}
 	at += copy(framed[at:], record.Identity.Principal[:])
 	binary.LittleEndian.PutUint64(framed[at:at+8], record.Identity.IssuerEpoch)
 	at += 8
+	copy(framed[at:], record.Identity.IssuerLane[:])
+	return Digest(sha256.Sum256(framed[:]))
+}
+
+// AdmitIssuerSequence advances the independent admission frontier exactly one
+// sequence. The transition is applied in the same replicated storage
+// transaction as the new request Head and sequence row; a gap, replay under a
+// different digest, or sequence reuse therefore cannot cross proposal
+// admission even when multiple gateways race.
+func AdmitIssuerSequence(
+	record IssuerHighwaterRecord,
+	key RequestKey,
+	requestDigest Digest,
+	revision uint64,
+) (IssuerHighwaterRecord, error) {
+	identity, identityErr := IssuerIdentityFor(key)
+	if validateIssuerHighwater(record) != nil || identityErr != nil ||
+		identity != record.Identity || !nonzeroDigest(requestDigest) ||
+		record.AdmittedSequence == ^uint64(0) || key.IssuerSequence != record.AdmittedSequence+1 ||
+		!nextRevision(record.Revision, revision) {
+		return IssuerHighwaterRecord{}, ErrInvalidState
+	}
+	keyDigest, err := KeyDigest(key)
+	if err != nil {
+		return IssuerHighwaterRecord{}, err
+	}
+	record.Revision = revision
+	record.AdmittedSequence = key.IssuerSequence
+	record.LastAdmissionKeyDigest = keyDigest
+	record.LastAdmissionRequestDigest = requestDigest
+	record.LastAdmissionDigest = issuerAdmissionDigest(record)
+	record.HighwaterDigest = issuerHighwaterDigest(record)
+	return record, validateIssuerHighwater(record)
+}
+
+func issuerAdmissionDigest(record IssuerHighwaterRecord) Digest {
+	const domain = "vibedb/request-ledger/issuer-admission\x00"
+	var framed [len(domain) + 8*3 + 4*sha256.Size + 16 + 8]byte
+	at := copy(framed[:], domain)
+	framed[at] = byte(record.Identity.Scope)
+	binary.LittleEndian.PutUint64(framed[at+8:at+16], record.Identity.IssuerEpoch)
+	binary.LittleEndian.PutUint64(framed[at+16:at+24], record.AdmittedSequence)
+	at += 24
+	for _, digest := range [...]Digest{record.Identity.TenantDigest, record.IssuerDigest,
+		record.LastAdmissionKeyDigest, record.LastAdmissionRequestDigest} {
+		at += copy(framed[at:], digest[:])
+	}
+	at += copy(framed[at:], record.Identity.Principal[:])
 	copy(framed[at:], record.Identity.IssuerLane[:])
 	return Digest(sha256.Sum256(framed[:]))
 }

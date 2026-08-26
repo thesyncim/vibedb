@@ -1,6 +1,7 @@
 package replicatedstate
 
 import (
+	"bytes"
 	"math"
 	"testing"
 
@@ -232,12 +233,40 @@ func TestRequestLedgerSequencedCreateConvertsReservation(t *testing.T) {
 	if plan.delta.residentBytes != wantResident {
 		t.Fatalf("resident=%d want=%d", plan.delta.residentBytes, wantResident)
 	}
+	issuer, err := requestledger.IssuerDigest(requestledger.IssuerIdentity{
+		Scope: key.Scope, TenantDigest: key.TenantDigest, Principal: key.Principal,
+		IssuerEpoch: key.IssuerEpoch, IssuerLane: key.IssuerLane,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	highwaterKey := requestledger.AppendIssuerHighwaterKey(nil, home, issuer)
+	var highwater requestledger.IssuerHighwaterRecord
+	found := false
+	for _, row := range plan.rows {
+		if !bytes.Equal(row.key, highwaterKey) {
+			continue
+		}
+		highwater, err = requestledger.OpenIssuerHighwater(row.value)
+		found = true
+	}
+	if err != nil || !found || highwater.AdmittedSequence != 1 || highwater.HighwaterSequence != 0 ||
+		highwater.LastAdmissionKeyDigest != head.KeyDigest ||
+		highwater.LastAdmissionRequestDigest != head.RequestDigest {
+		t.Fatalf("admission highwater=%+v found=%v: %v", highwater, found, err)
+	}
 }
 
 func TestRequestLedgerIssuerAdvanceDeletesOnlyAfterHighwater(t *testing.T) {
 	key := issuerPlannerKey(1, 0x81)
 	ack, sequence := issuerPlannerGCComplete(t, key)
 	highwater, err := requestledger.NewIssuerHighwater(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	highwater, err = requestledger.AdmitIssuerSequence(
+		highwater, key, ack.RequestDigest, highwater.Revision+1,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,6 +329,12 @@ func TestRequestLedgerFinalAckGCMarksIssuerSequence(t *testing.T) {
 	key := issuerPlannerKey(1, 0x91)
 	ack, _ := issuerPlannerGCComplete(t, key)
 	highwater, err := requestledger.NewIssuerHighwater(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	highwater, err = requestledger.AdmitIssuerSequence(
+		highwater, key, ack.RequestDigest, highwater.Revision+1,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

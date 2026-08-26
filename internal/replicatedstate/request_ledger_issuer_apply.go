@@ -57,6 +57,14 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 			return plan, err
 		}
 	}
+	if highwater.AdmittedSequence == math.MaxUint64 ||
+		head.Key.IssuerSequence != highwater.AdmittedSequence+1 {
+		plan.rows = nil
+		plan.delta = requestLedgerStateDelta{}
+		return witnessedRequestLedgerConflict(
+			plan, highwater.Revision, requestledger.PhaseAcked, highwaterRaw,
+		), nil
+	}
 
 	sequenceKey := requestledger.AppendIssuerSequenceKey(
 		nil, command.Home, issuer, head.Key.IssuerSequence,
@@ -95,6 +103,20 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 	if err != nil {
 		return plan, err
 	}
+	highwater, err = requestledger.AdmitIssuerSequence(
+		highwater, head.Key, head.RequestDigest, highwater.Revision+1,
+	)
+	if err != nil {
+		return plan, errors.Join(err, ErrStateCorrupt)
+	}
+	nextHighwaterRaw, err := requestledger.AppendIssuerHighwater(nil, highwater)
+	if err != nil {
+		return plan, err
+	}
+	if highwaterFound && len(nextHighwaterRaw) != len(highwaterRaw) {
+		return plan, ErrStateCorrupt
+	}
+	highwaterRaw = nextHighwaterRaw
 	highwaterKey := requestledger.AppendIssuerHighwaterKey(nil, command.Home, issuer)
 	sharedBytes := uint64(0)
 	if !highwaterFound {
@@ -123,8 +145,8 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 		return plan, nil
 	}
 
+	plan.rows = append(plan.rows, newTransactionPut(highwaterKey, highwaterRaw))
 	if !highwaterFound {
-		plan.rows = append(plan.rows, newTransactionPut(highwaterKey, highwaterRaw))
 		plan.delta.rows++
 		plan.delta.residentBytes += int64(sharedBytes)
 	}
