@@ -360,6 +360,15 @@ type DurableRequestParticipantStream interface {
 	BufferedBytes() int
 }
 
+// DurableRequestReplayableParticipantStream is an authenticated sealed-plan
+// stream which can begin another bounded pass over the same immutable bytes.
+// Streaming transaction protocols use multiple passes for manifest, prepare,
+// decision, and finish without retaining an unbounded participant slice.
+type DurableRequestReplayableParticipantStream interface {
+	DurableRequestParticipantStream
+	Reset() error
+}
+
 type DurableRequest struct {
 	// Program is the trusted, already-sealed logical transaction contract. It
 	// contains no physical endpoint/fence strings and never embeds ordinary

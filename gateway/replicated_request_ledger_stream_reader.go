@@ -219,6 +219,18 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 	return nil
 }
 
+// Reset authenticates and reopens the same sealed plan from its first
+// participant. Page reloads retain the original page-chain witnesses, so a
+// mutable source cannot substitute bytes between protocol passes.
+func (reader *durableRequestRecipeStreamReader) Reset() error {
+	if reader == nil {
+		return ErrDurableRequest
+	}
+	return reader.resetAndReadHeader()
+}
+
+var _ DurableRequestReplayableParticipantStream = (*durableRequestRecipeStreamReader)(nil)
+
 func validDurableRequestStreamFixedContract(reader durableRequestRecipeStreamReader) bool {
 	identity, contract := reader.Identity, reader.Contract
 	if identity.ID == (distributedtxn.ID{}) ||

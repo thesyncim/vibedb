@@ -183,6 +183,46 @@ func TestDurableRequestLogicalPlanStreamRoundTripWide(t *testing.T) {
 	}
 }
 
+func TestDurableRequestLogicalPlanStreamReplayWideBounded(t *testing.T) {
+	key, program := durableLogicalStreamFixture(t, 4097, 3)
+	measurement, pages := durableLogicalStreamBuild(t, key, program)
+	reader, err := openDurableRequestRecipeStream(
+		key, measurement.descriptor(), durableRequestPlanPageSource(pages),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want [sha256.Size]byte
+	for pass := 0; pass < 3; pass++ {
+		if pass != 0 {
+			if err = reader.Reset(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		hash := sha256.New()
+		var count uint64
+		for reader.Next() {
+			participant := reader.Current()
+			_, _ = hash.Write([]byte(participant.Distribution))
+			_, _ = hash.Write([]byte(participant.Shard))
+			count++
+			if reader.BufferedBytes() > durableRequestReaderMaxLiveBytes {
+				t.Fatalf("live bytes=%d exceed fixed bound=%d", reader.BufferedBytes(), durableRequestReaderMaxLiveBytes)
+			}
+		}
+		if err = reader.Err(); err != nil || !reader.Complete() || count != 4097 {
+			t.Fatalf("pass=%d count=%d complete=%v err=%v", pass, count, reader.Complete(), err)
+		}
+		var got [sha256.Size]byte
+		copy(got[:], hash.Sum(nil))
+		if pass == 0 {
+			want = got
+		} else if got != want {
+			t.Fatalf("pass %d changed authenticated participant sequence", pass)
+		}
+	}
+}
+
 func TestDurableRequestLogicalPlanFragmentationAndMaxScopes(t *testing.T) {
 	t.Parallel()
 	key, program := durableLogicalStreamFixture(t, 2, requestledger.MaxPlanPageBytes)
