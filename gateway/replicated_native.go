@@ -485,7 +485,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 		return ReplicatedMembershipResult{}, err
 	}
 	if membership.ExpectedReplicaSetVersion != route.Serving.Command.ReplicaSetVersion ||
-		!route.HasEnrolledTarget || membership.TargetMember != route.EnrolledTarget.Member {
+		!membershipRequestMatchesRoute(route, membership) {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
 	preferred := route.Serving.Replicas[0].Member
@@ -577,6 +577,23 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 		}
 	}
 	return ReplicatedMembershipResult{}, ErrReplicatedLeader
+}
+
+func membershipRequestMatchesRoute(
+	route ReplicatedMembershipRoute,
+	membership shardservice.ReplicatedMembershipRequest,
+) bool {
+	if membership.Kind != raftservice.MembershipRemoveVoter {
+		return route.HasEnrolledTarget && membership.TargetMember == route.EnrolledTarget.Member
+	}
+	// Before cutover, the promoted target remains the separately enrolled
+	// endpoint. After the certified final catalog cut, it is one of the active
+	// serving RF3 and the removed source is intentionally no longer routable.
+	if route.HasEnrolledTarget {
+		return membership.TargetMember == route.EnrolledTarget.Member
+	}
+	return replicatedRouteContainsMember(route.Serving, membership.TargetMember) &&
+		!replicatedRouteContainsMember(route.Serving, membership.SourceMember)
 }
 
 func (executor *ReplicatedExecutor) observeMembershipTransfer(
@@ -1378,6 +1395,11 @@ func replicatedEndpoint(
 		}
 	}
 	return ReplicatedEndpoint{}, 0, false
+}
+
+func replicatedRouteContainsMember(route ReplicatedRoute, member uint64) bool {
+	_, _, found := replicatedEndpoint(route, member)
+	return found
 }
 
 func replicatedMembershipEndpoint(
