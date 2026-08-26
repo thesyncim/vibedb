@@ -305,4 +305,15 @@ func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
 		result.AffectedRowsValid {
 		t.Fatalf("reopened abort fence completion=%+v result=%+v", completion, result)
 	}
+	records := make([]TransactionRecoveryRecord, 0, 1)
+	recovery, err := reopened.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
+		Kind: TransactionRecoveryLookupParticipant, ID: id, MinimumApplied: 2,
+		MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
+	}, records, nil)
+	if err != nil || len(recovery.Records) != 1 ||
+		!recovery.Records[0].CancellationWitness ||
+		recovery.Records[0].ParticipantOrdinal != 4096 ||
+		recovery.Records[0].PayloadCount != 0 {
+		t.Fatalf("reopened abort fence recovery=%+v err=%v", recovery, err)
+	}
 }
