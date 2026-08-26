@@ -56,6 +56,9 @@ func TestReplicatedParticipantStageRoundTripCanonicalAndCompact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := ValidateReplicatedCommand(encoded); err != nil {
+		t.Fatalf("allocation-free validation: %v", err)
+	}
 	if !bytes.Equal(view.Bytes(), encoded) || view.ID != command.ID ||
 		view.Participant.MutationDigest != command.Participant.MutationDigest ||
 		!slices.Equal(view.Participant.IntentScopes, command.Participant.IntentScopes) ||
@@ -102,6 +105,9 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 		if appendErr != nil {
 			t.Fatalf("case %d append: %v", i, appendErr)
 		}
+		if validateErr := ValidateReplicatedCommand(encoded); validateErr != nil {
+			t.Fatalf("case %d validate: %v", i, validateErr)
+		}
 		view, openErr := OpenReplicatedCommand(encoded)
 		if openErr != nil {
 			t.Fatalf("case %d open: %v", i, openErr)
@@ -135,6 +141,9 @@ func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
 	} {
 		if _, openErr := OpenReplicatedCommand(bad); openErr == nil {
 			t.Fatal("accepted trailing, reserved, role, or payload-kind corruption")
+		}
+		if validateErr := ValidateReplicatedCommand(bad); validateErr == nil {
+			t.Fatal("validator accepted trailing, reserved, role, or payload-kind corruption")
 		}
 	}
 
@@ -210,5 +219,42 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 		}
 	}); got != 0 {
 		t.Fatalf("manifest-segment append allocs = %v", got)
+	}
+}
+
+func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
+	participant, err := AppendReplicatedCommand(nil, replicatedTestParticipant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inline, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
+		Payload: replicatedTestCoordinator(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pages := buildManifest(t, 4)
+	segment, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestSegment,
+		ID: testID(), ExpectedRevision: 1,
+		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[0],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, raw := range map[string][]byte{
+		"participant": participant, "inline": inline, "segment": segment,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := testing.AllocsPerRun(1000, func() {
+				if validateErr := ValidateReplicatedCommand(raw); validateErr != nil {
+					panic(validateErr)
+				}
+			}); got != 0 {
+				t.Fatalf("validation allocs = %v", got)
+			}
+		})
 	}
 }

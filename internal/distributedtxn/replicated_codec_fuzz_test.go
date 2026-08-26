@@ -22,6 +22,10 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 	f.Add(inline)
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		view, openErr := OpenReplicatedCommand(raw)
+		validateErr := ValidateReplicatedCommand(raw)
+		if (openErr == nil) != (validateErr == nil) {
+			t.Fatalf("validator/open disagreement: validate=%v open=%v", validateErr, openErr)
+		}
 		if openErr != nil {
 			return
 		}

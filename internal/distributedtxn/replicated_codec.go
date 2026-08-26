@@ -151,6 +151,66 @@ func OpenReplicatedCommand(src []byte) (ReplicatedCommandView, error) {
 	return OpenReplicatedCommandInto(src, make([]IntentScope, count))
 }
 
+// ValidateReplicatedCommand validates one complete canonical transaction
+// control body without retaining a view or materializing participant scopes.
+// Replication admission uses this before retaining the immutable raw control
+// bytes, keeping the hot path allocation-free.
+func ValidateReplicatedCommand(src []byte) error {
+	if len(src) < replicatedCommandHeaderBytes+replicatedCommandChecksumBytes ||
+		len(src) > MaxReplicatedCommandBytes || !equal4(src[:4], replicatedCommandMagic) ||
+		!checksumOK(src) {
+		return ErrCorrupt
+	}
+	if src[4] != FormatVersion {
+		return ErrUnsupported
+	}
+	if binary.LittleEndian.Uint16(src[8:10]) != replicatedCommandHeaderBytes ||
+		src[10] != 0 || src[11] != 0 || binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
+		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 ||
+		binary.LittleEndian.Uint32(src[124:128]) != 0 {
+		return ErrCorrupt
+	}
+	payloadLength := uint64(binary.LittleEndian.Uint32(src[16:20]))
+	scopeCount := uint64(binary.LittleEndian.Uint16(src[122:124]))
+	if scopeCount > MaxIntentScopes ||
+		uint64(replicatedCommandHeaderBytes+replicatedCommandChecksumBytes)+scopeCount*8+payloadLength != uint64(len(src)) {
+		return ErrCorrupt
+	}
+	role := ReplicatedRole(src[5])
+	operation := ReplicatedOperation(src[6])
+	payloadKind := ReplicatedPayloadKind(src[7])
+	expectedRevision := binary.LittleEndian.Uint64(src[24:32])
+	var id ID
+	copy(id[:], src[32:48])
+	wantRole, wantPayload, creation, ok := replicatedOperationShape(operation)
+	if id.IsZero() || !ok || role != wantRole || payloadKind != wantPayload ||
+		(creation && expectedRevision != 0) || (!creation && expectedRevision == 0) {
+		return ErrCorrupt
+	}
+	scopeEnd := replicatedCommandHeaderBytes + int(scopeCount)*8
+	payloadEnd := scopeEnd + int(payloadLength)
+	payload := src[scopeEnd:payloadEnd:payloadEnd]
+	if wantPayload == ReplicatedPayloadParticipantStage {
+		var coordinatorGroup, coordinatorShardIncarnation ID
+		var mutationDigest Digest
+		copy(coordinatorGroup[:], src[48:64])
+		copy(coordinatorShardIncarnation[:], src[64:80])
+		copy(mutationDigest[:], src[88:120])
+		if coordinatorGroup.IsZero() || coordinatorShardIncarnation.IsZero() ||
+			binary.LittleEndian.Uint64(src[80:88]) == 0 || mutationDigest == (Digest{}) ||
+			len(payload) != 0 || !validateIntentScopeBytes(
+			src[replicatedCommandHeaderBytes:scopeEnd], src[120], int(scopeCount),
+		) {
+			return ErrCorrupt
+		}
+		return nil
+	}
+	if !allZero(src[48:122]) || scopeCount != 0 {
+		return ErrCorrupt
+	}
+	return validateReplicatedPayload(wantPayload, id, payload)
+}
+
 // OpenReplicatedCommandInto decodes with caller-owned scope storage. A
 // sufficiently sized slice makes participant-stage decode allocation-free.
 func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedCommandView, error) {
@@ -258,6 +318,68 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		return ErrCorrupt
 	}
 	return nil
+}
+
+func validateReplicatedPayload(kind ReplicatedPayloadKind, id ID, payload []byte) error {
+	switch kind {
+	case ReplicatedPayloadNone:
+		if len(payload) != 0 {
+			return ErrCorrupt
+		}
+	case ReplicatedPayloadCoordinator:
+		if len(payload) > MaxCoordinatorRecordBytes {
+			return ErrTooLarge
+		}
+		var participantScratch [MaxInlineParticipants]ParticipantRef
+		record, err := OpenCoordinatorInto(payload, participantScratch[:])
+		if err != nil || !canonicalCoordinatorBytes(payload) || record.ID != id ||
+			record.State != CoordinatorStaging || record.Revision != 1 {
+			return ErrCorrupt
+		}
+	case ReplicatedPayloadManifestCoordinator:
+		record, err := OpenManifestCoordinator(payload)
+		if err != nil || record.ID != id || record.State != CoordinatorStaging || record.Revision != 1 {
+			return ErrCorrupt
+		}
+	case ReplicatedPayloadManifestSegment:
+		if len(payload) > ManifestSegmentBytes {
+			return ErrTooLarge
+		}
+		if !canonicalManifestSegment(payload) {
+			return ErrCorrupt
+		}
+	default:
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func validateIntentScopeBytes(raw []byte, bucketBits uint8, count int) bool {
+	if count == 0 {
+		return bucketBits == 0 && len(raw) == 0
+	}
+	if count > MaxIntentScopes || bucketBits < 8 || bucketBits > 24 || len(raw) != count*8 {
+		return false
+	}
+	limit := uint32(1) << bucketBits
+	var priorEnd uint32
+	for i := 0; i < count; i++ {
+		start := binary.LittleEndian.Uint32(raw[i*8 : i*8+4])
+		end := binary.LittleEndian.Uint32(raw[i*8+4 : i*8+8])
+		if start >= end || end > limit || (i != 0 && priorEnd >= start) {
+			return false
+		}
+		priorEnd = end
+	}
+	return true
+}
+
+func allZero(raw []byte) bool {
+	var combined byte
+	for i := range raw {
+		combined |= raw[i]
+	}
+	return combined == 0
 }
 
 func replicatedOperationShape(operation ReplicatedOperation) (
