@@ -1269,12 +1269,13 @@ func (runtime *Runtime) Close() error {
 		return ErrResultSettlementPending
 	}
 	runtime.stopping = true
-	runtime.node = nil
 	if runtime.walGeneration != nil {
+		runtime.walGeneration.stopAndWait()
 		clear(runtime.walGeneration.key.Material[:])
 		clear(runtime.walGeneration.key.Wrapped)
 		runtime.walGeneration = nil
 	}
+	runtime.node = nil
 	if runtime.apply != nil {
 		if err := runtime.apply.Close(); err != nil {
 			return err

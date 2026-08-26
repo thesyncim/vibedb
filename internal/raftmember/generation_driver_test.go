@@ -3,7 +3,10 @@ package raftmember
 import (
 	"errors"
 	"os"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -38,8 +41,7 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		drainRuntime(t, fixture.runtime, nil)
-		fixture.runtime.tickWALGeneration()
-		info, err := fixture.wal.GenerationInfo()
+		info, err := awaitWALGeneration(t, fixture.runtime, fixture.wal, sequence-1)
 		if err != nil || info.Generation != sequence-1 {
 			t.Fatalf("generation after sequence %d = %+v, %v", sequence, info, err)
 		}
@@ -85,6 +87,98 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 	}
 	if err := reopenedWAL.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func awaitWALGeneration(
+	t testing.TB, runtimeOwner *Runtime, wal *raftstore.Store, generation uint64,
+) (raftstore.GenerationInfo, error) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		runtimeOwner.tickWALGeneration()
+		info, err := wal.GenerationInfo()
+		if err == nil && info.Generation == generation {
+			return info, nil
+		}
+		runtime.Gosched()
+	}
+	return wal.GenerationInfo()
+}
+
+func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
+	fixture := newRuntimeFixture(t, 249, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.ConfigureWALGeneration(WALGenerationDriverOptions{
+		IntervalTicks: 1, Key: fixture.walKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
+	firstKey, _ := orderedkey.AppendJSONString(nil, []byte(`"first"`), orderedkey.Ascending)
+	first := testApplyCommand(fixture.base, epoch, 2, firstKey, []byte(`{"id":"first"}`))
+	if err := fixture.runtime.Propose(first); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	previousBuild := walGenerationBuild
+	var releaseOnce sync.Once
+	walGenerationBuild = func(builder *raftstore.GenerationBuilder) error {
+		close(started)
+		<-release
+		err := previousBuild(builder)
+		close(finished)
+		return err
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		fixture.runtime.walGeneration.stopAndWait()
+		walGenerationBuild = previousBuild
+	})
+	fixture.runtime.tickWALGeneration()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background generation build did not start")
+	}
+	if err := fixture.runtime.Tick(); err != nil {
+		t.Fatalf("Tick blocked or failed during generation build: %v", err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	secondKey, _ := orderedkey.AppendJSONString(nil, []byte(`"second"`), orderedkey.Ascending)
+	second := testApplyCommand(fixture.base, epoch, 3, secondKey, []byte(`{"id":"second"}`))
+	if err := fixture.runtime.Propose(second); err != nil {
+		t.Fatalf("proposal blocked by generation build: %v", err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	if publication := fixture.apply.Published(); publication.Applied < 5 {
+		t.Fatalf("apply did not progress while build blocked: %+v", publication)
+	}
+	select {
+	case <-finished:
+		t.Fatal("generation build was not held by the test barrier")
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("background generation build did not finish")
+	}
+	// The intervening apply stales the candidate. Owner-lane revalidation must
+	// discard it without selecting or deleting the serving source.
+	fixture.runtime.tickWALGeneration()
+	if _, err := fixture.wal.GenerationInfo(); !errors.Is(err, raftstore.ErrGenerationSource) {
+		t.Fatalf("stale off-lane build was published: %v", err)
 	}
 }
 
