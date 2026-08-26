@@ -56,10 +56,10 @@ func TestDurableSQLRequestExecutorFusesLoweringCreateAndTypedExecution(t *testin
 	if _, err = executor.Execute(t.Context(), requestKey, tenant, queries); !errors.Is(err, errTypedServicePin) {
 		t.Fatalf("execute error=%v", err)
 	}
-	if ledger.applies != 1 || pins.called != 1 || ledger.head.PlanningLeaseSpan != 64 ||
+	if ledger.applies != 1 || ledger.reads != 0 || pins.called != 1 || ledger.head.PlanningLeaseSpan != 64 ||
 		ledger.head.PlanningLeaseExpiryIndex != 66 ||
 		ledger.head.RequestDigest != requestledger.Digest(key.Digest) {
-		t.Fatalf("applies=%d pins=%d head=%+v", ledger.applies, pins.called, ledger.head)
+		t.Fatalf("applies=%d reads=%d pins=%d head=%+v", ledger.applies, ledger.reads, pins.called, ledger.head)
 	}
 }
 
