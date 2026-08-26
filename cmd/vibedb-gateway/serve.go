@@ -148,6 +148,7 @@ func runServe(args []string) int {
 	catalogRetryHome := fs.String("catalog-retry-home", "", "stable 16-hex-character controller retry-home identity")
 	catalogSessionLease := fs.Duration("catalog-session-lease", 24*time.Hour, "monotonic controller session renewal interval")
 	controllerInterval := fs.Duration("controller-interval", time.Second, "bounded replicated split reconciliation interval")
+	replicaControlManifestPath := fs.String("replica-control-manifest", "", "strict canonical vibejson replica-control topology and bounds")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
@@ -187,6 +188,8 @@ func runServe(args []string) int {
 	var shardTLS *servicetls.Client
 	var tlsProfile *rafttransport.PeerTLS
 	var internalAuthority serviceauthz.Authority
+	var authorization *serviceauthz.Policy
+	var replicaControlManifest *gatewayReplicaControlManifest
 	if *devPlaintext {
 		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
 			*authorizationPolicy != "" || len(shardPeers) != 0 {
@@ -216,6 +219,7 @@ func runServe(args []string) int {
 		internalAuthority = serviceauthz.Authority{
 			Node: profile.LocalIdentity().Node, Generation: policy.Generation(),
 		}
+		authorization = policy
 		if policy.Check(internalAuthority.Node,
 			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
 				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology|
@@ -258,6 +262,33 @@ func runServe(args []string) int {
 			return 2
 		}
 		defer shardTLS.Close()
+		if *replicaControlManifestPath != "" {
+			manifest, manifestErr := loadGatewayReplicaControlManifest(
+				*replicaControlManifestPath, profile.LocalIdentity().Node,
+			)
+			if manifestErr != nil || manifest.TLS != (gatewayReplicaTLSReferences{
+				Certificate: *tlsCertificate, Key: *tlsKey, Roots: *tlsRoots,
+				IdentityOID: *tlsIdentityOID, AuthorizationPolicy: *authorizationPolicy,
+			}) {
+				fmt.Fprintf(os.Stderr, "gateway: load replica control manifest: %v\n",
+					errors.Join(manifestErr, errGatewayReplicaControlManifest))
+				return 2
+			}
+			if policy.Check(profile.LocalIdentity().Node,
+				serviceauthz.CapabilityTopology|serviceauthz.CapabilityMembership,
+			) != serviceauthz.DecisionAllow {
+				fmt.Fprintln(os.Stderr, "gateway: replica controller identity lacks topology and membership authority")
+				return 2
+			}
+			for _, endpoint := range manifest.Gateways {
+				if policy.Check(endpoint.Member.Node, serviceauthz.CapabilityTopology) !=
+					serviceauthz.DecisionAllow {
+					fmt.Fprintln(os.Stderr, "gateway: replica control roster contains a gateway without topology authority")
+					return 2
+				}
+			}
+			replicaControlManifest = &manifest
+		}
 	}
 
 	var shardDial gateway.DialFunc
@@ -310,6 +341,16 @@ func runServe(args []string) int {
 			return 1
 		}
 	}
+	if *replicaControlManifestPath != "" && (*devPlaintext || replicaControlManifest == nil) {
+		fmt.Fprintln(os.Stderr, "gateway: replica control requires a complete authenticated manifest")
+		return 2
+	}
+	if replicaControlManifest != nil {
+		if err = replicaControlManifest.ValidateCatalog(holder.Current()); err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: replica control catalog endpoints: %v\n", err)
+			return 2
+		}
+	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: listen %q: %v\n", *listen, err)
@@ -322,6 +363,82 @@ func runServe(args []string) int {
 	defer stop()
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
+	var replicaControlDone <-chan error
+	if replicaControlManifest != nil {
+		manifest := *replicaControlManifest
+		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
+		writeDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.WriteTimeout) * time.Millisecond)
+		handshakeDeadline := servicetls.FixedDeadline(*tlsHandshakeTimeout)
+		shardOpener, openErr := newGatewayShardControlOpener(
+			tlsProfile, handshakeDeadline,
+			func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			}, manifest.Shards, int(manifest.Bounds.MaxConnections),
+		)
+		trust := tlsProfile.LocalIdentity().TrustDomain
+		drainer, drainErr := newGatewayClusterDrainCertifier(
+			trust, tlsProfile, handshakeDeadline, readDeadline, writeDeadline,
+			func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			}, manifest.Gateways, int(manifest.Bounds.MaxConcurrentDrains),
+		)
+		controls, controlsErr := newGatewayReplicaRemoteClients(gatewayReplicaRemoteClientOptions{
+			Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
+			Authority: catalogAuthority, Replicated: replicated, Drainer: drainer,
+		})
+		moveController, controllerErr := newGatewayReplicaMoveController(
+			catalogAuthority, replicated, controls,
+		)
+		gatewayNodes := make([]rafttransport.NodeID, len(manifest.Gateways))
+		gatewayRoster := make(map[rafttransport.NodeID]uint64, len(manifest.Gateways))
+		for index, endpoint := range manifest.Gateways {
+			gatewayNodes[index] = endpoint.Member.Node
+			gatewayRoster[endpoint.Member.Node] = endpoint.Member.Incarnation
+		}
+		authorizer, authorizeErr := servicetls.NewNodeAuthorizer(gatewayNodes)
+		controlTLS, tlsErr := servicetls.NewServer(
+			tlsProfile, rafttransport.TrafficGatewayControl, authorizer,
+		)
+		controlService, serviceErr := gateway.NewClusterCatalogDrainControlService(
+			gateway.ClusterCatalogDrainControlOptions{Holder: holder,
+				Catalog: gatewayCatalogDigestVerifier{catalog: catalogAuthority},
+				Member:  manifest.Local.Member,
+				Authorize: func(identity rafttransport.PeerIdentity, _ gateway.ClusterCatalogDrainRequest) bool {
+					incarnation, found := gatewayRoster[identity.Node]
+					return found && incarnation != 0 && authorization.Check(
+						identity.Node, serviceauthz.CapabilityTopology,
+					) == serviceauthz.DecisionAllow
+				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
+		)
+		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
+		if joined := errors.Join(openErr, drainErr, controlsErr, controllerErr,
+			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
+			if controlListener != nil {
+				_ = controlListener.Close()
+			}
+			_ = listener.Close()
+			fmt.Fprintf(os.Stderr, "gateway: initialize replica control: %v\n", joined)
+			return 1
+		}
+		controlDone := make(chan error, 1)
+		replicaControlDone = controlDone
+		go func() {
+			serveErr := controlTLS.Serve(ctx, controlListener, servicetls.Limits{
+				MaxConnections:    int(manifest.Bounds.MaxConnections),
+				MaxHandshakes:     int(manifest.Bounds.MaxHandshakes),
+				HandshakeDeadline: handshakeDeadline,
+			}, func(connectionContext context.Context, connection rafttransport.PeerConnection) {
+				if serveErr := controlService.Serve(connectionContext, connection); serveErr != nil &&
+					!errors.Is(serveErr, context.Canceled) {
+					logf("gateway: catalog drain control: %v", serveErr)
+				}
+			})
+			controlDone <- serveErr
+			stop()
+		}()
+		go runReplicaMoveController(ctx, moveController,
+			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, logf)
+	}
 	if catalogAuthority != nil {
 		trigger := &gatewayControllerTriggerClient{
 			tls: tlsProfile, plaintext: *devPlaintext, handshake: *tlsHandshakeTimeout,
@@ -348,6 +465,13 @@ func runServe(args []string) int {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", err)
 		return 1
+	}
+	if replicaControlDone != nil {
+		stop()
+		if controlErr := <-replicaControlDone; controlErr != nil && !errors.Is(controlErr, context.Canceled) {
+			fmt.Fprintf(os.Stderr, "gateway: replica control: %v\n", controlErr)
+			return 1
+		}
 	}
 	return 0
 }

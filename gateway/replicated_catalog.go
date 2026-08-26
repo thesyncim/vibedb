@@ -449,6 +449,15 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 	return descriptors
 }
 
+// ReplicatedShardDescriptors returns a detached cold control-plane directory.
+// It is intended for startup/configuration certification, never hot routing.
+func (snapshot *Snapshot) ReplicatedShardDescriptors() []ReplicatedShardDescriptor {
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.replicatedDescriptors()
+}
+
 func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 	if err := validateReplicatedTableTransition(current, next); err != nil {
 		return err

@@ -49,6 +49,25 @@ type gatewayReplicaMoveObserver struct {
 	drainer   rebalanceexec.CatalogDrainCertifier
 }
 
+type gatewayCatalogDigestVerifier struct{ catalog gatewayReplicaCatalogReader }
+
+func (verifier gatewayCatalogDigestVerifier) VerifyClusterCatalogDigest(
+	ctx context.Context, generation uint64, digest [32]byte,
+) error {
+	if ctx == nil || verifier.catalog == nil || generation == 0 || digest == ([32]byte{}) {
+		return gateway.ErrClusterCatalogDrainUnknown
+	}
+	snapshot, err := verifier.catalog.Read(ctx)
+	if err != nil || snapshot == nil || snapshot.Generation() != generation {
+		return errors.Join(err, gateway.ErrClusterCatalogDrainUnknown)
+	}
+	actual, err := gateway.CatalogSnapshotDigest(snapshot)
+	if err != nil || actual != digest {
+		return errors.Join(err, gateway.ErrClusterCatalogDrainUnknown)
+	}
+	return nil
+}
+
 func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	ctx context.Context,
 	operation rebalance.OperationID,
