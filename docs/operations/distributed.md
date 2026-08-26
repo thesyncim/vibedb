@@ -1,6 +1,6 @@
 # Operate the distributed runtime
 
-The shipped distributed runtime is experimental and unreleased. It combines a
+The distributed runtime is experimental. It combines a
 routing gateway, static shard services, and prepared RF3 shard
 groups. The generated [distributed feature state](../distributed-feature-state.md)
 separates primitives, internal integration, command integration, and test
@@ -15,7 +15,7 @@ For a task-oriented setup, start with:
 
 | Path | Command | Contract |
 | --- | --- | --- |
-| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 is explicitly no-HA and starts no gateway; replica count 3 starts one RF3 group and gateway. |
+| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 is explicitly no-HA and starts no gateway. Replica count 3 starts an RF3 development topology and gateway, including its dedicated request-ledger group. |
 | Static shard | `vibedb-shard serve` | One local store and a local ownership fence. No Raft election or copied-store revocation. |
 | RF3 preparation | `vibedb-shard prepare-rf3 -manifest <path>` | Atomic, fail-if-present creation of one member's WAL, SQL root, retained identities, key copy, and serving manifest. |
 | Replicated shard | `vibedb-shard serve-rf3 -manifest <path>` | One prepared Raft member with quorum writes, leader `ReadIndex`, authenticated peer, native, snapshot, and control traffic, and replica-move services. |
@@ -39,10 +39,11 @@ and policy flags. RF3 has no plaintext mode. Do not expose a development
 listener through an untrusted proxy or port forward.
 
 The gateway identity needs the capabilities consumed by its configured paths:
-`data_read`, `data_write`, `delegate`, `topology`, `transaction_recovery`,
-`request_ledger`, and `execution_pin`. Replica control additionally requires
-`membership`. An application principal should receive only the data or schema
-operations it needs.
+`data_read`, `data_write`, `delegate`, `topology`, `transaction_recovery`, and
+`request_ledger`. Replica control additionally requires `membership`. The
+internal durable request service also needs `execution_pin`, but `runServe` does
+not yet construct that service. An application principal should receive only
+the data or schema operations it needs.
 
 ## Catalog authority
 
@@ -65,6 +66,14 @@ Use the command validators before startup:
 
 `inspect` reads the file supplied on the command line. It is not a live
 inspection of a newer replicated catalog head.
+
+The repository has exact schema rollout primitives. A shard installer can
+prepare an immutable relation bundle, persist its authorization, activate it,
+drain the old generation, and recover after restart. Catalog authority can bind
+the exact prepared receipts, activate one target catalog generation, or abort
+before activation. These are internal contracts. `serve-rf3` passes no schema
+handler to its control mux, and no gateway command gathers receipts or drives a
+rollout.
 
 ## Gateway startup contract
 
@@ -96,6 +105,12 @@ Add `-replica-control-manifest <path>` to run the authenticated, resumable
 replica-move controller and cluster catalog-drain service. The control manifest
 is not accepted in plaintext mode. See [Operate replica lifecycle](replica-lifecycle.md).
 
+Add `-hot-shard-capacity <path>` to record routed request pressure and publish a
+bounded canonical pressure cut through catalog RF3. `-hot-shard-interval`
+controls when publication is attempted. It is not correctness authority. The
+command does not run the internal pressure controller or its operation sink, so
+this option does not automatically split or move a shard.
+
 ## Range-split status
 
 The repository has durable split intent and runtime records, source capture,
@@ -107,12 +122,13 @@ scan, while sealing and activation do not rescan or rewrite the child image.
 Before publication, the reconciler requires a coherent voting quorum for each
 child at or beyond the sealed source applied position.
 
-This is not yet an operable online-split command. There is no public split
-intake, and `serve-rf3` deliberately leaves its split-control route disabled
-because it does not yet reconstruct the complete durable observation and
-source/child action runtime. The gateway's replicated-operation scanner cannot
-complete a split until that route exists. External split-under-load kill,
-partition, and foreground-latency gates are also absent.
+The internal composition now includes durable source and child observation,
+plan admission, exact action grants, and dispatch across the source and child
+lifecycle. This is not yet an operable online-split command. There is no public
+split intake, and `serve-rf3` still passes nil split and plan-admission handlers
+to its control mux. The gateway's replicated-operation scanner cannot complete
+a split until the command constructs those handlers. External split-under-load
+kill, partition, and foreground-latency gates are also absent.
 
 ## Send requests
 
@@ -194,6 +210,11 @@ mutations form one participant and apply atomically. The coordinator manifest
 can span more than 64 groups. There is no participant-count contract. Mutation,
 byte, deadline, journal, and concurrency limits provide the bounds.
 
+Ready unique and non-unique global indexes are supported on this lane. The
+gateway lowers index maintenance into independently routed relation
+participants. Update and delete use an exact prior-value digest so a stale
+index removal cannot apply to a changed base row.
+
 ```vibejson
 {"op":"exec_batch","request_id":"0123456789abcdef0123456789abcdef","class":"interactive","statements":[{"sql":"INSERT INTO orders VALUES (?)","params":[{"kind":"document","text":"{\"id\":\"order-1\"}"}]},{"sql":"DELETE FROM ledger WHERE id = ?","params":[{"kind":"string","text":"ledger-1"}]}]}
 ```
@@ -208,11 +229,22 @@ error. A committed cleanup failure carries `committed:true` and an error. The
 gateway recovery path uses the original group identities instead of replanning
 an admitted request against a newer catalog.
 
-The current shipped command still retains RF3 request coalescing and terminal
+The ordinary request-ID form still retains RF3 request coalescing and terminal
 results in a bounded process-local registry. A gateway restart therefore loses
-that registry. The durable replicated request-ledger machinery is not yet the
-public command entrypoint, and no client acknowledgement/expiry operation is
-shipped. Treat this as a material availability and exact-retry limitation.
+that registry. Treat this as a material availability and exact-retry
+limitation.
+
+The durable request-ledger implementation is more complete than that legacy
+path. Catalog metadata stores exact ledger-home ranges. Replicated state stores
+streamed plans, pending waves, terminal results, ACK state, issuer lanes, and
+contiguous issuer high-water. A logical execution pin fences the complete
+transaction across gateway replacement. Internal tests drive concurrent
+gateways, recovery, ACK, collection, and high-water restart.
+
+The public command does not yet connect that implementation. The wire decoder
+recognizes issuer-open, structured `exec_batch`, and `exec_batch_ack`, but
+`runServe` passes a nil durable request service. Those operations return
+unavailable. No command-level gateway-replacement test covers the wire path.
 
 ## Operation classes
 
@@ -253,16 +285,15 @@ Current operating gaps include:
 
 - Public range-split intake and complete shard-side split action routing
 - External split-under-load kill, partition, and latency qualification
-- Automated pressure collection and hot-shard plan execution
+- Pressure-to-operation controller command composition
 - One global MVCC snapshot across RF3 groups
-- RF3 global-index mutation lowering
 - Durable request-ledger use by the public gateway command
-- Client acknowledgement and terminal-result expiry
-- Distributed DDL and schema rollout
+- Durable request-ledger expiry policy after explicit ACK
+- Schema rollout command composition and public DDL
 - A public move, live-status, or leader-transfer CLI
 - Live RF3 backup/restore procedures
 - A rolling disk- and wire-format upgrade policy
-- A released or production-supported distributed contract
+- Production support and a complete qualification matrix
 
 Routing, catalog validation, authorization, membership grants, and shard
 admission fail closed. A distributed read never returns partial documents.
@@ -273,7 +304,13 @@ admission fail closed. A distributed read never returns partial documents.
   `replica_move_remote.go`
 - `cmd/vibedb-shard/serve_rf3.go`, `bootstrap_rf3.go`, and `rf3_manifest.go`
 - `gateway/replicated_data_read.go`, `replicated_sql_read.go`,
-  `replicated_sql_transaction.go`, and `replicated_transaction.go`
+  `replicated_sql_transaction.go`, `replicated_transaction.go`,
+  `replicated_request_service.go`, `replicated_request_ledger_catalog.go`, and
+  `replicated_request_issuer_collector.go`
+- `gateway/schema_rollout.go` and `internal/schemainstall`
+- `internal/hotshard`
+- `internal/splitcontroller/local_observation_provider.go` and
+  `composite_shard_executor.go`
 - `internal/rebalance`, `internal/rebalanceexec`, `internal/replicacontrol`,
   `internal/replicaaction`, and `internal/snapshottransfer`
 - `internal/raftservice`, `internal/multiraft`, and `internal/rafttransport`

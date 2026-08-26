@@ -1,12 +1,12 @@
 # Distributed clock contract
 
-Status: **Unreleased qualification contract**
+Status: **Internal qualification contract**
 
 This page records the clock assumptions that must be tested before the
 distributed runtime can claim resilience to clock skew or process suspension.
 It is not a claim that those gates currently pass. The generated
 [distributed feature state](../distributed-feature-state.md) remains the
-release ledger.
+evidence ledger.
 
 VibeDB does not currently expose a globally ordered transaction timestamp or a
 single-time cross-group MVCC snapshot. Within one RF3 group, Raft term, log
@@ -30,7 +30,7 @@ collapsed into one cluster-skew number.
 | Raft term, log index, and applied index | Replicated ordering, durable cuts, route observations, and index-based planning leases | These are protocol counters, not wall time. They are safety-critical and advance only through their owning replicated protocol. |
 | Raft logical ticks | Election and heartbeat progress | Tick rate and delivery affect leader detection and availability. Raft safety does not depend on voters sampling equal wall times. A paused or slow member can delay elections or lose leadership. |
 | Go monotonic time attached to local `time.Time` values | In-process timers, context and socket deadlines, retry backoff, idle eviction, and static read-fence leases | These are normally liveness and resource bounds. Process suspension can delay expiry and recovery. Static read fences are a separate correctness-sensitive lease contract and require their own suspend/overrun gate. |
-| UTC wall time | TLS certificate validity, static transaction recovery deadlines, replicated session deadline construction, and proposed execution-pin recovery or expiry observations | TLS time is security-admission-critical. Recovery deadlines can change when recovery is attempted. Session and execution-pin timestamps are replicated values, but a producer that asserts elapsed time still needs a trustworthy authority contract. |
+| UTC wall time | TLS certificate validity and replicated session deadline construction | TLS time is security-admission-critical. Session timestamps are replicated values, but a producer that asserts elapsed time still needs a trustworthy authority contract. Transaction recovery, execution pins, and pressure cooldown do not use UTC authority. |
 | Catalog generations, ownership epochs, route generations, request identities, and transaction identities | Topology fencing, replay, and exact retry | These are explicit identities or monotonic protocol values. They must never be synthesized from wall time. |
 
 “Liveness-only” means that changing the clock can change when work retries,
@@ -56,12 +56,17 @@ instant.
 
 Transaction IDs, request IDs, catalog generations, route generations,
 ownership epochs, Raft terms, indexes, and commit decisions do not derive
-their ordering from UTC. Static transaction recovery does compare UTC with a
-persisted recovery deadline before resolving an incomplete staging state, but
-the replicated coordinator and participant grammar still determines which
-terminal transitions are legal. Clock skew may move that recovery attempt
-earlier or later; qualification must prove that it cannot produce mixed commit
-and abort outcomes.
+their ordering from UTC. Static and RF3 transaction recovery append a fixed
+number of ordered durable pulses before an incomplete staging state can abort.
+The legacy field name `RecoveryDeadline` encodes that pulse bound. Wall time can
+schedule a pulse attempt. It cannot satisfy, skip, or widen the bound.
+
+Execution-pin acquire, renew, recover, release, and expire transitions use a
+controller epoch, expected lease revision, and `LeaseAppliedThrough` fence. A
+recovery or expiry command is too early unless its own catalog-group apply index
+crosses the prior fence. The grammar admits no wall-clock observation. Hot-shard
+qualification similarly uses catalog generations, replicated authority
+revisions, and logical cooldown state.
 
 ## Security and lease caveats
 
@@ -82,25 +87,17 @@ clock-fault claims.
 
 Replicated session apply compares exact deadline scalars and never samples a
 replica-local clock. The current gateway constructs those UTC deadline values.
-Likewise, the execution-pin state machine receives `ObservedUnixNano` inside a
-replicated recover or expire command; replicas validate and order that value
-but do not attest that real time passed. The durable-request contract also
-binds its chosen recovery deadline into `ClockContractDigest`, preventing a
-retry from silently changing the deadline. Digest binding is not a trusted
-clock.
+The durable-request contract binds its fixed logical recovery-pulse count into
+`ClockContractDigest`, preventing a retry from silently changing that bound.
+The public gateway command does not yet construct the durable request service,
+so this internal contract is not command-composition evidence.
 
-Execution-pin recovery and expiry are not a shipped clock-resilience claim.
-Before they may release catalog or schema authority based on elapsed time, the
-serving design must either:
-
-1. authenticate a time authority with a stated uncertainty/skew bound and
-   wait out that uncertainty before recovery or expiry; or
-2. replace elapsed-time authority with a replicated progress fence whose
-   safety does not depend on UTC.
-
-Merely having a majority agree on a command containing a timestamp is
-insufficient: consensus proves agreement on the value, not that the value is
-truthful.
+An applied-index lease is deliberately a progress lease, not a duration. A quiet
+catalog group does not grant takeover merely because real time passed. A
+controller must advance the group log beyond the certified fence. This removes
+trusted elapsed time from the authority decision, but it still needs operational
+qualification for write amplification, stalled progress, controller churn, and
+index exhaustion boundaries.
 
 ## Comparison contract
 
@@ -111,14 +108,14 @@ claim.
 | --- | --- | --- |
 | Google Spanner | Globally meaningful commit timestamps and external consistency, implemented with TrueTime uncertainty and commit wait | Correctness uses a bounded time-uncertainty service backed by redundant time sources. This is more specific than “atomic NTP.” |
 | CockroachDB | Hybrid logical timestamps and distributed MVCC reads, with uncertainty handling and a configured maximum clock offset | Physical-clock offset is part of the timestamp/uncertainty and node-admission contract. |
-| Current VibeDB RF3 lane | Per-group Raft order, quorum-confirmed `ReadIndex`, explicit applied-index follower fences, replicated transaction decisions, and cross-group vector cuts | Synchronized UTC is not an input to RF3 log order or the vector-cut read proof. The system does not offer Spanner- or CockroachDB-equivalent global timestamp semantics. TLS and unreleased elapsed-time lease authority remain separate clock obligations. |
+| Current VibeDB RF3 lane | Per-group Raft order, quorum-confirmed `ReadIndex`, explicit applied-index follower fences, replicated transaction decisions, logical recovery pulses, execution-pin progress leases, and cross-group vector cuts | Synchronized UTC is not an input to RF3 log order, transaction recovery authority, execution-pin takeover, or the vector-cut read proof. The system does not offer Spanner- or CockroachDB-equivalent global timestamp semantics. TLS and session deadline construction remain separate clock obligations. |
 
 An application that requires “read the entire database as of timestamp T,”
 globally ordered commit timestamps, bounded-staleness reads stated in seconds,
 or external consistency across groups cannot infer those properties from the
 current vector-cut API.
 
-## Required release gates
+## Required qualification gates
 
 Clock resilience remains unqualified until automated gates cover the shipped
 process composition and assert both safety and bounded degradation:
@@ -132,22 +129,20 @@ process composition and assert both safety and bounded degradation:
    `ReadOnlySafe` reads never succeed on the minority and that progress resumes
    without manual state repair.
 3. Suspend and resume gateways and RF3 members across socket deadlines,
-   election windows, static read-fence leases, transaction-recovery deadlines,
+   election windows, static read-fence leases, logical recovery pulses,
    and slow-client response retention. Prove no partial read, mixed decision,
    or leaked unbounded admission ownership.
 4. Exercise certificates that are valid, not-yet-valid, expired, and near both
    validity boundaries under skew. Prove the exact configured X.509 policy,
    trust domain, node identity, and traffic class remain fail closed; document
    the operator alarm and renewal margin.
-5. Crash and restart at every static and RF3 recovery phase while recovery
-   clocks disagree. Prove that an early clock can reduce availability but
-   cannot convert a durable commit to abort or expose a partially applied
-   transaction.
-6. Before shipping execution-pin expiry or takeover, inject false early and
-   late `ObservedUnixNano` values. The gate must prove premature authority
-   release is impossible under the selected trusted-time or replicated-progress
-   design; testing only deterministic replay of the supplied scalar is not
-   enough.
+5. Crash and restart at every static and RF3 recovery phase while wall clocks
+   disagree and pulse scheduling stalls or bursts. Prove that no schedule can
+   convert a durable commit to abort or expose a partially applied transaction.
+6. Drive execution-pin acquire, renew, takeover, expiry, and release across
+   controller replacement and catalog-group restart. Prove that no transition
+   crosses its applied-index fence early and measure the progress cost required
+   to cross a quiet lease.
 7. Audit encoded identities and replicated state so UTC cannot enter Raft
    ordering, transaction or request identity, ownership epochs, route
    generations, catalog generations, GC floors, or snapshot/split cut

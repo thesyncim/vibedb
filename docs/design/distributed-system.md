@@ -3,10 +3,11 @@
 VibeDB has a runnable static-shard command layer and a fixed-RF3 serving
 composition. `vibedb-shard serve-rf3` constructs the latter for externally
 prepared exact member artifacts. The public gateway connects canonical point
-`get` requests and strict exact-key `exec_batch` mutations to the native RF3
-endpoint when its catalog authority is RF3. General SQL, scatter reads, and
-multi-table reads remain on the static path. No command initializes or changes
-the RF3 topology.
+`get`, exact-key `read_batch`, and strict exact-key `exec_batch` requests to the
+native RF3 endpoint when its catalog authority is RF3. General SQL and
+non-exact scatter reads remain on the static path. Preparation and development
+commands initialize fixed topologies. The replica-control path can replace a
+failed member, but there is no general topology administration command.
 
 ## Runnable static layer
 
@@ -82,11 +83,13 @@ definite serving fence coalesces one authenticated catalog refresh and one
 re-resolved retry; an ambiguous transport outcome never enters that replay
 path.
 
-The point-read lane never falls back to the static SQL service. The strict RF3
-mutation classifier fails closed to the static path when a statement is not in
-its supported exact-key vocabulary. RF3 scatter reads, multi-table reads,
-global-index mutation lowering, and a common distributed read timestamp are
-not implemented.
+The point-read and `read_batch` lanes never fall back to the static SQL service.
+The strict RF3 mutation classifier fails closed to the static path when a
+statement is not in its supported exact-key vocabulary. `read_batch` supports
+ordered multi-table and multi-group exact-primary-key reads with one ReadIndex
+cut per group. Ready global indexes are lowered into independent RF3 relation
+participants. Non-exact RF3 scatter reads and a common distributed read
+timestamp are not implemented.
 
 The merge layer supports global limits, ordered results, aggregates, and
 grouped partial aggregates. It cancels remaining calls after a hard error or a
@@ -126,8 +129,8 @@ establishes a scoped vector cut. It does not assign a distributed MVCC
 timestamp or prove one wall-clock snapshot instant.
 
 The RF3 ordering path and the remaining wall-time obligations are separated in
-[Distributed clock contract](distributed-clock-model.md). That page is an
-unreleased skew and suspend qualification contract, not evidence that those
+[Distributed clock contract](distributed-clock-model.md). That page specifies
+the skew and suspend qualification contract. It is not evidence that those
 fault gates currently pass.
 
 ## Global indexes
@@ -541,11 +544,12 @@ The batch accepts distinct source allocations within one distribution as well
 as independent distributions.
 The gateway scans replicated split operation records and can trigger their
 source hosts. The durable controller and local source/child action runtimes can
-execute capture, stage, tail, seal, activation, publication, and prune steps,
-but `serve-rf3` deliberately does not register that route yet: the command does
-not reconstruct the complete local split observation and action runtime. There
-is also no public split-intake command. Replica movement is shipped through its
-separate resumable controller; a merge planner remains absent.
+reconstruct observations, admit exact plans, bind action grants, and execute
+capture, stage, tail, seal, activation, publication, and prune steps. The
+`serve-rf3` command still passes nil split and plan-admission handlers to the
+control mux. There is also no public split-intake command. Replica movement is
+command-composed through its separate resumable controller. A merge planner
+remains absent.
 
 ## Replication kernel
 
@@ -601,10 +605,13 @@ separate authenticated snapshot-artifact service. `serve-rf3` constructs the
 peer and replicated shard services from one fixed manifest. The public gateway
 uses the executor for catalog-bound point reads, exact-key mutation proposals,
 and transaction recovery through a shared authenticated pool and an exact
-leader-hint cache. It does not expose RF3 scatter/multi-table query execution or
-RF3 global-index mutation lowering. `serve-rf3` does not construct the snapshot
-service and does not provide certificate enrollment, dynamic address discovery,
-member changes, or empty-learner snapshot activation.
+leader-hint cache. It also exposes multi-table exact-key `read_batch` and RF3
+global-index mutation lowering. `serve-rf3` constructs snapshot-source,
+membership, observation, ownership, and retirement control when the retained
+manifest provides the required state. Cold learner bootstrap and the gateway
+replica controller compose member replacement. Certificate enrollment, dynamic
+address discovery, public topology administration, and complete split-control
+composition remain absent.
 
 Do not describe this kernel as a turnkey replicated deployment.
 

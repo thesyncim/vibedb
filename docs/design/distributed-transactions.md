@@ -51,8 +51,8 @@ byte-native meaning:
 
 The update document must preserve the placement key. Returning clauses,
 multi-row inserts, column-list inserts, conflict clauses, residual predicates,
-ordering, limits, repeated relation keys, ready global-index write programs,
-and mixed static/RF3 tables are refused before execution. Multiple statements
+ordering, limits, repeated relation keys, and mixed static/RF3 tables are
+refused before execution. Multiple statements
 and tables in one group become sorted numeric relation batches on the same
 participant and commit atomically. Ordered keys and document bytes enter Raft;
 SQL and table-name strings do not.
@@ -89,8 +89,9 @@ the registry's scoped `Forget` API. An embedding may call `Forget` only after
 it has an application-level acknowledgement that the terminal result no longer
 needs retry protection. At 65,536 retained entries, new RF3 writes backpressure
 instead of dropping idempotency evidence. A durable replicated ledger or safe
-explicit client ACK is required before terminal reclamation can become shipped
-behavior.
+explicit client ACK is required before this legacy registry can reclaim a
+terminal result. The separate durable request-ledger path has replicated ACK
+and collection primitives, but the gateway command does not yet construct it.
 
 ## State machines
 
@@ -138,11 +139,10 @@ the retry's SQL mutation. A different revision or malformed marker reports a
 distributed transaction conflict, so neither retry path republishes user
 data.
 
-The hidden collection uses raw opaque values. Its compact binary codec is part
-of the repository's unreleased format 0, not JSON and not a released protocol
-version. The sole codec sentinel admits only the current grammar. Stale
-development text fails closed without an alternate compatibility decoder or
-migration ladder. `docs/format.md` records the exact envelope and storage bounds.
+The hidden collection uses raw opaque values. Its compact binary codec is not
+JSON. The sole codec sentinel admits only the current grammar. Stale development
+text fails closed without an alternate compatibility decoder or migration
+ladder. `docs/format.md` records the exact envelope and storage bounds.
 
 Participant staging acquires scoped durable barriers. An overlapping
 participant fails fast. This behavior prevents a cross-shard deadlock.
@@ -171,7 +171,9 @@ same batch with the same request ID, not invent a new request.
 coordinator. It replays committed work idempotently. Segmented recovery reads
 and root-verifies one page at a time against one pinned catalog route index. It
 can abort an incomplete coordinator or participant set after the recovery
-deadline without allocating in proportion to the aggregate manifest.
+pulse sequence reaches its fixed bound without allocating in proportion to the
+aggregate manifest. Wall time can schedule a recovery pass. It cannot satisfy
+the recovery authority.
 
 `RecoverAll` scans non-retired coordinators on all current shards. The shipped
 gateway calls it every five seconds.
@@ -193,11 +195,17 @@ commit proof, or recovery ownership. A plain pre-admission or transient error
 is delivered to the waiters on that attempt and then removed from the registry;
 a later retry can pin the then-current catalog.
 
-That ownership is process-local. There is no durable request/result ledger
-that another gateway can load, and a gateway restart loses pending handles and
-terminal request-ID mappings. Replicated coordinator and participant records
-remain durable, but the shipped command cannot rediscover them by the caller's
-request ID after that loss.
+That legacy ownership is process-local. A gateway restart loses pending handles
+and terminal request-ID mappings. Replicated coordinator and participant records
+remain durable, but the ordinary request-ID form cannot rediscover them by the
+caller request ID after that loss.
+
+The separate durable request service stores the request identity, streamed
+logical plan, pending waves, terminal result, ACK, issuer lane, and contiguous
+issuer high-water in RF3 state. It can recover from another gateway and fences
+each transaction wave with one logical execution-pin epoch. Its catalog range
+topology and service are internally composed and tested. `runServe` still passes
+a nil durable service, so the structured wire operations return unavailable.
 
 Recovery matches the routing version, allocation generation, and ownership
 epoch that the transaction recorded. The implementation does not prove
@@ -208,11 +216,14 @@ recovery across arbitrary later resharding or retired topology history.
 The static transaction path expands base-table and global-index mutations into
 the same protocol. The replicated state machine can also atomically apply base
 and global-index relation batches, and a digest check guards old-document
-capture during update and delete. The public RF3 SQL lowering does not yet
-construct those global-index mutations and therefore rejects such tables.
+capture during update and delete. The public RF3 SQL lowering routes ready
+unique and non-unique indexes as independent relation participants. Same-key
+replacement and index removal use exact prior-value checks.
 
-The RF3 read side also remains narrower than the static path: there is no
-cross-group RF3 `SELECT` snapshot or multi-table RF3 query contract.
+The RF3 read side supports multi-table and multi-group exact-primary-key
+`SELECT *` through `read_batch`. It returns one route and applied-index
+observation per group. It does not provide one global MVCC timestamp, range
+scan, join, aggregate, or historical read contract.
 
 ## Implementation references
 
@@ -221,6 +232,9 @@ cross-group RF3 `SELECT` snapshot or multi-table RF3 query contract.
 - `gateway/transaction_manifest.go`
 - `gateway/replicated_sql_transaction.go`
 - `gateway/replicated_request_registry.go`
+- `gateway/replicated_request_service.go`
+- `gateway/replicated_request_ledger_catalog.go`
+- `gateway/replicated_request_issuer_collector.go`
 - `gateway/replicated_transaction.go`
 - `gateway/replicated_transaction_recover.go`
 - `gateway/writer.go`

@@ -100,17 +100,17 @@ var Distributed = []Feature{
 	},
 	{
 		Name: "Distributed clock model and skew resilience",
-		Primitive: Stage{StatusPartial, "RF3 replicated order uses Raft term and index, leader reads use ReadOnlySafe, and cross-group reads expose vector cuts instead of a wall-clock timestamp. UTC still participates in TLS validity, recovery timing, session deadline construction, and the unreleased execution-pin recovery and expiry grammar.", []Reference{
-			ref("internal/raftmodel/config.go", "NewConfig"), ref("internal/executionpin/command.go", "Command"), ref("shardservice/read_fence.go", "readFenceSet"),
+		Primitive: Stage{StatusYes, "RF3 order and reads use Raft term, index, applied index, and ReadOnlySafe. Transaction recovery advances bounded replicated pulses. Execution-pin leases and hot-shard cooldown use replicated progress fences instead of elapsed time.", []Reference{
+			ref("internal/raftmodel/config.go", "NewConfig"), ref("internal/executionpin/command.go", "Command"), ref("internal/distributedtxn/journal.go", "Journal"),
 		}},
-		Integrated: Stage{StatusPartial, "Raft authority, applied-index fences, catalog generations, ownership epochs, transaction decisions, and exact retries do not derive their order from UTC. Local timers remain availability and resource controls; TLS time is security-admission-critical, and consensus over an execution-pin observed timestamp does not attest that elapsed time is truthful.", []Reference{
-			ref("gateway/replicated_sql_read.go", "ReadSQLBatch"), ref("gateway/recovery.go", "recoverCoordinator"), ref("gateway/replicated_request_ledger_contract.go", "durableRequestClockContractDigest"),
+		Integrated: Stage{StatusYes, "Static and RF3 transaction recovery require an ordered pulse sequence before abort. The durable request lifecycle binds one clockless controller epoch and applied-index lease to the complete program. Pressure evidence uses catalog generations and authority revisions.", []Reference{
+			ref("gateway/recovery.go", "recoverCoordinator"), ref("gateway/replicated_request_execution_context.go", "BuildDurableRequestExecutionPinBinding"), ref("internal/hotshard/controller.go", "Controller"),
 		}},
-		Shipped: Stage{StatusPartial, "The shipped RF3 lane provides per-group linearizable or explicit applied-index reads and multi-group vector cuts, not globally timestamped MVCC or external consistency. Its authenticated transports, deadlines, retries, and static read fences still depend on local time behavior. Execution-pin elapsed-time takeover is not a shipped clock-resilience claim.", []Reference{
+		Shipped: Stage{StatusPartial, "The RF3 command path uses quorum order, applied-index reads, vector cuts, and logical transaction recovery pulses. Local time still controls TLS validity, network and context deadlines, retry scheduling, catalog-session deadline construction, and static read-fence leases. The public command does not yet compose the durable request service that consumes execution pins.", []Reference{
 			ref("cmd/vibedb-gateway/serve.go", "execRequest"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("internal/rafttransport/identity.go", "PeerTLS"),
 		}},
-		Qualification: Stage{StatusPartial, "Configuration tests pin ReadOnlySafe, injected-time tests cover certificate boundaries, and logical-tick tests stagger voters. No shipped-process gate combines independent UTC steps, suspend/resume, TLS boundaries, leader isolation, recovery, static fence overrun, or execution-pin false-time injection. The required matrix is specified in docs/design/distributed-clock-model.md and remains an exit gate.", []Reference{
-			ref("internal/raftmodel/config_test.go", "TestNewConfigPinsEveryField"), ref("internal/multiraft/host_leader_transfer_real_test.go", "driveUntilWithStaggeredVoterClocks"), ref("internal/rafttransport/identity_test.go", "TestPeerTLSRechecksCertificateTimeAtHandshake"),
+		Qualification: Stage{StatusPartial, "Tests reject wall-clock execution-pin authority, prove logical recovery pulses across restart, stagger voter ticks, and cover certificate-time boundaries. No command-level matrix combines independent UTC steps, suspend and resume, TLS boundaries, leader isolation, recovery, static fence overrun, and foreground latency.", []Reference{
+			ref("internal/executionpin/fence_test.go", "TestCommandGrammarRejectsWallClockAuthorityEvenWithValidChecksum"), ref("gateway/recovery_test.go", "TestRecoveryManifestMissingPageRequiresLogicalPulsesAcrossRestart"), ref("internal/rafttransport/identity_test.go", "TestPeerTLSRechecksCertificateTimeAtHandshake"),
 		}},
 	},
 	{
@@ -136,7 +136,7 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The public RF3 gateway orchestrator drives fused commands through the leader-aware executor, retains exact outcome-unknown bytes, and recovers from replicated ReadIndex witnesses without consulting the static shard transaction journal. Request replay runs before catalog pinning and reuses the first execution's generation and shard metadata instead of replanning against changed topology.", []Reference{
 			ref("gateway/replicated_transaction.go", "NewReplicatedTransactionOrchestrator"), ref("gateway/replicated_transaction_recover.go", "Recover"), ref("gateway/replicated_request_registry.go", "Replay"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-gateway lowers one exec_batch over one or more RF3 groups into strict whole-document INSERT, exact-primary-key whole-document UPDATE, and exact-primary-key DELETE relation mutations. Same-group multi-statement and multi-relation batches remain atomic. The registry key is stable authenticated node scope plus caller request ID, excluding policy generation; its digest covers exact ordered SQL, class, and typed parameter bytes without routes or catalog generation. Typed responses return transaction identity, committed, and outcome-unknown fields.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb-gateway lowers one exec_batch over one or more RF3 groups into strict whole-document INSERT, exact-primary-key whole-document UPDATE, and exact-primary-key DELETE relation mutations. Ready global indexes become independent RF3 relation participants with conditional old-value checks. Same-group multi-statement and multi-relation batches remain atomic. The legacy registry key is stable authenticated node scope plus caller request ID. Typed responses return transaction identity, committed, and outcome-unknown fields.", []Reference{
 			ref("gateway/transaction.go", "ExecBatchRequest"), ref("cmd/vibedb-gateway/serve.go", "execRequest"),
 		}},
 		Qualification: Stage{StatusPartial, "State-machine and schedule gates cover atomic transitions, reclamation, exact retries, and a 2P+1 decision/apply proposal schedule without a participant-count contract. The normal success path adds one retirement proposal and trusts the P route-fenced applied completions instead of issuing a redundant P-wide ReadIndex wave; recovery and ambiguous cleanup still prove terminal state with leader ReadIndex. One real RF3 gate drives the shipped executor across two independently led groups and a same-group multi-statement batch. It proves SQL lowering, hidden-commit recovery after source isolation, terminal retry caching, replica convergence, correct group routing, former-leader refusal, and single-participant atomic execution. Registry tests prove that unproved pre-admission failures are shared with current waiters and then removed rather than retained terminally. Command-envelope tests prove the typed response. External-process, exhaustive crash-cut, and sustained performance gates remain absent.", []Reference{
@@ -151,7 +151,7 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The dedicated transaction-recovery capability, leader-only ReadIndex path, native shard protocol, and leader-aware gateway executor share exact byte, row, applied-index, and serving-fence bounds. The RF3 transaction orchestrator consumes those reads for coordinator, manifest, participant, and terminal proofs.", []Reference{
 			ref("gateway/replicated_transaction_recovery.go", "ReadTransactionRecovery"), ref("gateway/replicated_transaction_recover.go", "Recover"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 installs the authenticated recovery reader. vibedb-gateway constructs the RF3 orchestrator plus a bounded same-process request registry and redrives retained outcome-unknown handles every five seconds. Executing, pending, and terminal retries replay before catalog pinning under stable authenticated-node scope, so catalog generation, split, or move does not replan an admitted request. The command performs no automatic terminal expiry, exposes no client ACK or expiry, and never calls the registry's scoped Forget API: 65,536 retained entries backpressure new RF3 writes. An embedding may call Forget only after it has an application-level acknowledgement that the terminal result no longer needs retry protection. A durable replicated ledger or safe explicit client ACK is required before shipped reclamation.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 installs the authenticated recovery reader. The ordinary vibedb-gateway exec_batch lane constructs the RF3 orchestrator plus a bounded same-process request registry and redrives retained outcome-unknown handles every five seconds. Executing, pending, and terminal retries replay before catalog pinning, so topology changes do not replan an admitted request. This legacy lane performs no automatic terminal expiry, exposes no client ACK, and never calls Forget. At 65,536 retained entries it backpressures new writes. The separate durable ledger has ACK and collection primitives but is not connected to runServe.", []Reference{
 			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/serve.go", "startGatewayRecovery"),
 		}},
 		Qualification: Stage{StatusPartial, "Real RF3 tests prove leader-only recovery, replacement-leader continuity, isolated-former-leader refusal, and the shipped executor recovering a hidden committed result across two groups. Registry tests prove bounded capacity, duplicate coalescing, exact-handle ownership, terminal retention, and no lock held across I/O. Gateway-process restart, abort recovery, and the shipped periodic sweep remain unqualified.", []Reference{
@@ -159,18 +159,33 @@ var Distributed = []Feature{
 		}},
 	},
 	{
+		Name: "Durable RF3 request ledger",
+		Primitive: Stage{StatusYes, "A replicated request grammar owns paged plans, pending waves, terminal results, acknowledgements, bounded collection, issuer lanes, contiguous issuer high-water, and logical execution pins. Catalog metadata stores adjacent immutable ledger-home ranges with exact RF3 route authority.", []Reference{
+			ref("internal/requestledger/command.go", "Command"), ref("gateway/replicated_request_ledger.go", "DurableRequestLedgerTopology"), ref("internal/executionpin/command.go", "Command"),
+		}},
+		Integrated: Stage{StatusYes, "The typed service selects the catalog-persisted ledger home, seals and streams a logical transaction recipe, recovers lifecycle CAS operations from RF3 state, fences every transaction wave with one execution-pin epoch, derives stable ACK authority, and collects only contiguous GC-complete issuer sequences.", []Reference{
+			ref("gateway/replicated_request_service.go", "NewDurableRequestService"), ref("gateway/replicated_request_lifecycle_runner.go", "NewDurableRequestLifecycleRunner"), ref("gateway/replicated_request_issuer_collector.go", "NewDurableIssuerHighwaterCollector"),
+		}},
+		Shipped: Stage{StatusPartial, "vibedb cluster dev provisions a dedicated request-ledger group, and the gateway command has strict issuer-open, structured exec_batch, and ACK wire handling. runServe does not construct or pass a DurableRequestService, so those operations currently fail as unavailable. Ordinary exec_batch still uses the bounded process-local registry.", []Reference{
+			ref("cmd/vibedb/cluster_dev.go", "ensureDevCluster"), ref("cmd/vibedb-gateway/serve.go", "handleConnPolicyDurable"),
+		}},
+		Qualification: Stage{StatusPartial, "Internal tests prove catalog topology round trips, bounded wide-plan replay, logical-pin fencing, concurrent-gateway convergence, ACK and GC recovery, and issuer high-water restart. No external gateway-replacement process gate proves the public wire path because command composition remains incomplete.", []Reference{
+			ref("gateway/replicated_request_ledger_catalog_test.go", "TestRequestLedgerTopologyCatalogRoundTripAndExactRouteBinding"), ref("gateway/replicated_request_ledger_fault_test.go", "TestDurableRequestConcurrentGatewaysConvergeOnOneOutcome"), ref("gateway/replicated_request_issuer_collector_test.go", "TestDurableIssuerHighwaterCollectorResolvesOutcomeUnknownAndRestart"),
+		}},
+	},
+	{
 		Name: "Global exact index routing and maintenance",
 		Primitive: Stage{StatusYes, "Catalog metadata, independent index placement, exact lookup, lifecycle fencing, and write expansion exist.", []Reference{
 			ref("gateway/index_metadata.go", "IndexMetadata"), ref("gateway/global_index.go", "GlobalIndexProgram"),
 		}},
-		Integrated: Stage{StatusYes, "Static planning can select a global index and static writes add index participants without forcing the base row onto that shard. RF3 exec_batch lowering does not yet emit global-index relation mutations.", []Reference{
-			ref("gateway/global_index_test.go", "TestGlobalIndexRoutesIndexAndBaseIndependently"), ref("gateway/writer.go", "prepareGlobalIndexWrites"),
+		Integrated: Stage{StatusYes, "Static planning can select a global index. Static and RF3 writes add independently placed index participants without forcing the base row onto the index shard. RF3 update and delete bind index removal to the exact prior base value.", []Reference{
+			ref("gateway/global_index_test.go", "TestGlobalIndexRoutesIndexAndBaseIndependently"), ref("gateway/replicated_sql_transaction.go", "planReplicatedSQLTransaction"),
 		}},
-		Shipped: Stage{StatusYes, "The static gateway consumes ready global-index metadata from its catalog and the shard service exposes raw exact lookup.", []Reference{
-			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("shardservice/server_test.go", "TestServerGlobalIndexLookupUsesRawBoundedLane"),
+		Shipped: Stage{StatusYes, "The static gateway consumes ready global-index metadata and exposes exact lookup. The RF3 exec_batch lane lowers ready unique and non-unique global-index maintenance into relation-aware transaction participants.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("gateway/replicated_sql_transaction.go", "planReplicatedSQLTransaction"),
 		}},
-		Qualification: Stage{StatusPartial, "Routing, lifecycle, byte preservation, rollback, and allocation tests exist. There is no horizontally scaled index churn or failure benchmark gate.", []Reference{
-			ref("gateway/global_index_test.go", "TestGlobalIndexBuildAndDrainLifecyclesStayWriteMaintained"), ref("gateway/global_index_vibejson_test.go", "TestGlobalIndexFlatScalarRouteWarmAllocationFree"),
+		Qualification: Stage{StatusPartial, "Tests cover routing, lifecycle, byte preservation, rollback, stale split fences, exact old-value checks, same-key replacement, and a real multi-group RF3 transaction. There is no external index-churn, leader-failure, or performance gate.", []Reference{
+			ref("gateway/replicated_sql_transaction_test.go", "TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Participant"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups"),
 		}},
 	},
 	{
@@ -184,8 +199,8 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusYes, "vibedb-shard prepare-rf3 creates and serve-rf3 opens an exact replicated SQL/apply bundle. vibedb-gateway can lower exact-key mutations for multiple RF3 base-table relations into the same participant without table or SQL strings entering Raft.", []Reference{
 			ref("cmd/vibedb-shard/prepare_rf3.go", "runPrepareRF3"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("gateway/replicated_sql_transaction.go", "planReplicatedSQLTransaction"),
 		}},
-		Qualification: Stage{StatusPartial, "Deterministic apply, replay, malformed-command, failure-atomic, and multi-table SQL lowering tests exist. No shipped RF3 global-index mutation fault gate exists.", []Reference{
-			ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleCheckpointCrashPhasesNeverRecoverSkew"), ref("gateway/replicated_sql_transaction_test.go", "TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelation"),
+		Qualification: Stage{StatusPartial, "Deterministic apply, replay, malformed-command, failure-atomic, multi-table lowering, and RF3 global-index lowering tests exist. No external multi-relation fault or sustained-load gate exists.", []Reference{
+			ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleCheckpointCrashPhasesNeverRecoverSkew"), ref("gateway/replicated_sql_transaction_test.go", "TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Participant"),
 		}},
 	},
 	{
@@ -200,7 +215,7 @@ var Distributed = []Feature{
 			ref("cmd/vibedb-shard/prepare_rf3.go", "runPrepareRF3"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
 		Qualification: Stage{StatusPartial, "Preparation and manifest gates prove restartable artifact publication, overwrite refusal, canonical multi-group parsing, and group-scaled serving bounds. A shipped-composition three-process gate proves retained-state opening, mutual TLS, natural election, authenticated reads, and clean process shutdown. Internal fault gates additionally prove follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. A multi-group process fault and scaling gate and exhaustive external quorum/apply cuts remain absent.", []Reference{
-			ref("cmd/vibedb-shard/prepare_rf3_test.go", "TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite"), ref("cmd/vibedb-shard/rf3_manifest_test.go", "TestParseRF3ManifestCanonicalMultiGroupBundles"), ref("cmd/vibedb-shard/serve_rf3_test.go", "TestRF3MultiGroupServingLimitsCoverManifestBound"), ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"), ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
+			ref("cmd/vibedb-shard/prepare_rf3_test.go", "TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly"), ref("cmd/vibedb-shard/rf3_manifest_test.go", "TestParseRF3ManifestCanonicalMultiGroupBundles"), ref("cmd/vibedb-shard/serve_rf3_test.go", "TestRF3MultiGroupServingLimitsCoverManifestBound"), ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"), ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
 		}},
 	},
 	{
@@ -208,10 +223,10 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "A local RF1 development/no-HA or RF3 process orchestrator and deterministic Helm-free Kubernetes manifest renderer exist.", []Reference{
 			ref("cmd/vibedb/cluster_dev.go", "runClusterDev"), ref("internal/kubeoperator/render.go", "Render"),
 		}},
-		Integrated: Stage{StatusYes, "The local command generates credentials, policy, WAL material, and retained member roots before supervising either one direct RF1 shard or three RF3 shards plus a gateway. The Kubernetes lane composes stable DNS, PVCs, disruption budgets, shard and gateway StatefulSets, and a scale-zero learner bootstrap template.", []Reference{
+		Integrated: Stage{StatusYes, "The local command generates credentials, policy, WAL material, and retained member roots before supervising either one direct RF1 shard or RF3 catalog and request-ledger groups plus a gateway. The Kubernetes lane composes stable DNS, PVCs, disruption budgets, shard and gateway StatefulSets, and a scale-zero learner bootstrap template.", []Reference{
 			ref("cmd/vibedb/cluster_dev.go", "ensureDevCluster"), ref("internal/kubeoperator/render.go", "Render"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb cluster dev --replicas 1|3 starts or resumes an explicitly no-HA RF1 member or an exact three-member loopback RF3 cluster. vibedb-operator render and prepare provide deterministic Kubernetes test manifests and idempotent ordinal preparation. The renderer is not a reconciliation watch-loop, and Kubernetes DNS is discovery rather than leader or topology authority.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb cluster dev --replicas 1|3 starts or resumes an explicitly no-HA RF1 member or a loopback RF3 development topology with separate catalog and request-ledger groups. vibedb-operator render and prepare provide deterministic Kubernetes test manifests and idempotent ordinal preparation. The renderer is not a reconciliation watch-loop, and Kubernetes DNS is discovery rather than leader or topology authority.", []Reference{
 			ref("cmd/vibedb/main.go", "run"), ref("cmd/vibedb-operator/main.go", "render"), ref("cmd/vibedb-operator/main.go", "prepare"),
 		}},
 		Qualification: Stage{StatusPartial, "Tests prove canonical local-cluster resume, explicit RF1/RF3 validation, production-policy compatibility, child reaping, distinct loopback endpoints, deterministic Kubernetes output, and injection rejection. There is no end-to-end Kubernetes fault, storage, DNS, or rolling-restart gate.", []Reference{
@@ -283,11 +298,11 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Durable split intent, source capture, immutable artifact construction, tail translation, ownership seal, child staging, RF3 readiness, catalog publication, retained pruning, move plans, failure authorization, and replica-move execution exist. Child image and global-index placement accumulators provide constant-size cut proofs without rescanning relations at cutover.", []Reference{
 			ref("internal/splitcontroller/replicated_executor.go", "AdmitReplicatedPlan"), ref("internal/splitcontroller/local_source_actions.go", "LocalSourceActions"), ref("internal/splitcontroller/local_child_actions.go", "LocalChildActions"), ref("internal/rangesplit/stage_image.go", "childStageImageAccumulator"), ref("internal/replicatedstate/relation_placement_accumulator.go", "GlobalIndexPlacementProof"), ref("internal/rebalanceexec/executor.go", "ExecuteReplicaMove"),
 		}},
-		Integrated: Stage{StatusPartial, "The catalog RF3 journal drives resumable operation records. The split runtime reconstructs typed source and child authority after restart, executes capture, artifact, stage, tail, seal, activation, publication, and prune actions, and requires a coherent RF3 child apply quorum at the sealed source cut before publication. The replica-move path composes certified failure evidence, bounded candidate selection, membership grants, snapshot bootstrap, catch-up, promotion, catalog drains, removal, and cleanup. The shipped shard command does not yet construct or route the complete split runtime.", []Reference{
-			ref("internal/splitcontroller/runtime_typed.go", "RecoverSourceCapture"), ref("internal/splitcontroller/controller_service.go", "ControllerService"), ref("internal/splitcontroller/reconcile.go", "childQuorumReady"), ref("internal/rebalanceexec/controller.go", "Controller"),
+		Integrated: Stage{StatusYes, "The catalog RF3 journal and shard-local durable runtime reconstruct source and child observations, exact action grants, plan admission, capture, artifact, stage, tail, seal, activation, publication, and retained pruning. The replica-move path composes failure evidence, candidate selection, membership grants, snapshot bootstrap, catch-up, promotion, catalog drains, removal, and cleanup.", []Reference{
+			ref("internal/splitcontroller/local_observation_provider.go", "LocalPlanObservationProvider"), ref("internal/splitcontroller/composite_shard_executor.go", "CompositeShardActionExecutor"), ref("internal/splitcontroller/controller_service.go", "NewServingControllerService"), ref("internal/rebalanceexec/controller.go", "Controller"),
 		}},
-		Shipped: Stage{StatusPartial, "vibedb-gateway scans replicated split operation records and sends controller triggers. With a strict replica-control manifest it also publishes quorum health revisions, schedules certified failed-replica replacements, and resumes durable replica moves. Replica movement is shipped. No public operator intake creates split operations, and serve-rf3 deliberately leaves the split-control mux route disabled because it cannot yet reconstruct the complete local action runtime. Retained sources durably reject base and global-index relation mutations and point reads outside their narrowed post-cutover range.", []Reference{
-			ref("cmd/vibedb-gateway/serve.go", "runSplitController"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/replica_health_controller.go", "startGatewayReplicaControllers"), ref("internal/replicatedstate/relation_bundle.go", "GlobalIndexProfile"),
+		Shipped: Stage{StatusPartial, "vibedb-gateway scans replicated split operation records and sends controller triggers. With a strict replica-control manifest it also publishes quorum health revisions, schedules certified failed-replica replacements, and resumes durable replica moves. Replica movement is command-composed. No public operator intake creates split operations, and serve-rf3 still passes nil split and plan-admission handlers to its control mux. Retained sources reject base and global-index mutations and point reads outside their post-cutover range.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/replica_health_controller.go", "startGatewayReplicaControllers"), ref("internal/replicatedstate/relation_bundle.go", "GlobalIndexProfile"),
 		}},
 		Qualification: Stage{StatusPartial, "Internal crash matrices cover replicated-journal recovery, durable source capture and seal, child stage and tail retry, publication-before-prune, and post-cutover ownership fencing. Tests prove quorum readiness across distinct replicas, O(1) child seal and activation handoff, and constant-size global-index ownership proof. The initial source partition remains one bounded scan, and crash recovery may explicitly audit the sealed physical image. No shipped route/action/publication composition gate, external split-under-load kill or partition gate, or range-scan routing proof exists.", []Reference{
 			ref("internal/splitcontroller/local_source_actions_test.go", "TestLocalSourceActionsRecoverCaptureAndPublishImmutableArtifacts"), ref("internal/splitcontroller/local_source_seal_test.go", "TestLocalSourceSealAndCutoverCertificateSurviveRestart"), ref("internal/splitcontroller/reconcile_test.go", "TestChildActionsRequireMonotonicExactEvidence"), ref("internal/rangesplit/stage_image_incremental_test.go", "TestChildStageSealDoesNotScanRows"), ref("internal/splitcontroller/global_index_cut_test.go", "TestGlobalIndexCutUsesCanonicalUniqueAndNonUniquePlacementAtBoundary"), ref("internal/splitcontroller/execute_test.go", "TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows"),
@@ -295,17 +310,17 @@ var Distributed = []Feature{
 	},
 	{
 		Name: "Replicated catalog and distributed DDL",
-		Primitive: Stage{StatusPartial, "A dedicated RF3 catalog authority provides linearizable catalog heads and bounded resumable operation records. A distributed DDL rollout protocol is absent.", []Reference{
-			ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"), ref("internal/replicatedstate/relation_bundle.go", "RelationCollection"),
+		Primitive: Stage{StatusYes, "A dedicated RF3 catalog authority provides linearizable catalog heads and bounded resumable operation records. Exact schema rollout primitives prepare immutable shard bundles, bind per-group receipts, authorize one catalog cut, activate it, drain the prior generation, and support pre-activation abort.", []Reference{
+			ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"), ref("gateway/schema_rollout.go", "PrepareSchemaRollout"), ref("internal/schemainstall/installer.go", "Installer"),
 		}},
-		Integrated: Stage{StatusPartial, "Catalog publication, split and replica-move journals, membership grants, health revisions, and failure certificates share one dedicated topology-authorized RF3 relation with exact placement and schema-generation fences. Schema rollout remains absent.", []Reference{
-			ref("gateway/replicated_catalog_document.go", "ReplicatedCatalogDistribution"), ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"), ref("gateway/replicated_failure_authority.go", "PublishReplicaHealthRevision"),
+		Integrated: Stage{StatusPartial, "Catalog publication, topology journals, health authority, schema rollout records, and shard installers share exact catalog, group, relation-manifest, and contract digests. The repository has no gateway controller or network composition that gathers install receipts and drives the complete rollout across shards.", []Reference{
+			ref("gateway/schema_rollout.go", "ActivateSchemaRollout"), ref("internal/schemainstall/control.go", "NewControlService"), ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"),
 		}},
-		Shipped: Stage{StatusPartial, "vibedb-shard prepare-rf3 provisions catalog-group member roots and serve-rf3 opens them. vibedb-gateway consumes the replicated catalog and uses it for split, move, membership, health, and failure authority. There is no catalog administration command, and distributed DDL remains refused.", []Reference{
+		Shipped: Stage{StatusPartial, "vibedb-shard prepare-rf3 provisions catalog-group member roots and serve-rf3 opens them. vibedb-gateway consumes the replicated catalog for data and topology authority. serve-rf3 reserves a schema-control mux route but passes no handler, and there is no public catalog or DDL command.", []Reference{
 			ref("cmd/vibedb-shard/prepare_rf3.go", "runPrepareRF3"), ref("cmd/vibedb-gateway/serve.go", "newReplicatedCatalogGateway"),
 		}},
-		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Mixed-schema rollout and DDL rollback gates are absent.", []Reference{
-			ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
+		Qualification: Stage{StatusPartial, "Catalog tests cover quorum publication and leader loss. Schema tests cover exact catalog activation, restart, pre-activation abort, mixed-old/new refusal, authenticated control, and crash-safe installer reopen. No multi-process schema rollout, rolling mixed-schema, or DDL rollback gate exists.", []Reference{
+			ref("gateway/schema_rollout_test.go", "TestSchemaRolloutPrepareActivateExactCatalog"), ref("internal/schemainstall/installer_test.go", "TestInstallerCrashReopenAuthorizationActivationAndDrain"), ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
 		}},
 	},
 	{
@@ -313,12 +328,14 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Bounded pressure selection, failure-domain placement, split planning, and replica-move selection exist.", []Reference{
 			ref("internal/topologyscheduler/admission.go", "SelectSplits"), ref("internal/topologyscheduler/replica_move.go", "SelectReplicaMoves"),
 		}},
-		Integrated: Stage{StatusPartial, "Schedulers produce fenced plans and reconcilers validate them, but no live controller consumes runtime metrics and executes the result.", []Reference{
-			ref("internal/topologyscheduler/capacity_placement.go", "PlaceSplitDestinations"), ref("internal/rebalance/reconcile.go", "Reconcile"),
+		Integrated: Stage{StatusYes, "Routed requests feed bounded per-allocation recorders. A collector publishes canonical pressure cuts through catalog RF3. A clockless controller qualifies sustained pressure, selects either a split or replica move, and hands one idempotent admission to the existing operation journals.", []Reference{
+			ref("internal/hotshard/collector.go", "Collector"), ref("internal/hotshard/controller.go", "Controller"), ref("internal/hotshard/operation_sink.go", "OperationSink"),
 		}},
-		Shipped: Stage{StatusNo, "The commands neither collect a cluster pressure view nor rebalance shards.", nil},
-		Qualification: Stage{StatusPartial, "Determinism, failure-domain, capacity, and zero-allocation planner tests exist. No sustained hot-shard or foreground-latency benchmark gate exists.", []Reference{
-			ref("internal/topologyscheduler/capacity_placement_test.go", "TestPlaceSplitDestinationsIsFixedSpaceAndWarmAllocationFree"), ref("internal/topologyscheduler/replica_move_test.go", "TestSelectReplicaMovesIsFixedSpaceAndWarmAllocationFree"),
+		Shipped: Stage{StatusPartial, "With -hot-shard-capacity, vibedb-gateway collects routed request pressure and periodically publishes bounded cuts. vibedb cluster dev provisions that capacity file. The command does not run RunReplicatedPass or OperationSink, so pressure does not yet trigger automatic split or replica-move admission.", []Reference{
+			ref("cmd/vibedb-gateway/hot_shard_runtime.go", "gatewayHotShardRuntime"), ref("cmd/vibedb/cluster_dev.go", "ensureDevCluster"),
+		}},
+		Qualification: Stage{StatusPartial, "Tests cover deterministic sustained-hotness qualification, logical cooldown, skew refusal, failure domains, capacity bounds, fixed-memory planning, and command configuration. No command-composed pressure-to-operation gate or sustained foreground-latency benchmark exists.", []Reference{
+			ref("internal/hotshard/controller_test.go", "TestControllerQualifiesHotShardAndRetriesByteIdenticalAdmission"), ref("internal/hotshard/controller_test.go", "TestControllerClockSkewCannotAdvanceReplicatedEvidence"), ref("cmd/vibedb-gateway/hot_shard_runtime_test.go", "TestGatewayHotShardCapacityRequiresCanonicalBoundedFile"),
 		}},
 	},
 }
