@@ -82,8 +82,10 @@ type DurableRequestLedgerTopology struct {
 // Selection is a logarithmic point lookup over the complete request home and
 // never routes every tenant through one catalog row.
 type DurableRequestLedgerTopologyHolder struct {
-	mu      sync.Mutex
-	current atomic.Pointer[DurableRequestLedgerTopology]
+	mu              sync.Mutex
+	current         atomic.Pointer[DurableRequestLedgerTopology]
+	catalog         *CatalogHolder
+	catalogSnapshot atomic.Pointer[Snapshot]
 }
 
 func NewDurableRequestLedgerTopologyHolder(
@@ -184,6 +186,9 @@ func (holder *DurableRequestLedgerTopologyHolder) Lookup(
 	point requestledger.LedgerHome,
 ) (DurableRequestLedgerHome, uint64, bool) {
 	if holder == nil {
+		return DurableRequestLedgerHome{}, 0, false
+	}
+	if holder.catalog != nil && holder.RefreshFromCatalog() != nil {
 		return DurableRequestLedgerHome{}, 0, false
 	}
 	current := holder.current.Load()
