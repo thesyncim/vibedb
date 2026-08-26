@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -129,10 +130,12 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 		TopologyRecoveryEpoch: 3, Distribution: "data", Shard: "all",
 		AllocationGeneration: 5, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{6},
 		ActivePolicyGeneration: 7, ProtectionEpoch: 8, OwnershipEpoch: 9,
-		SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12}
+		SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
 	command, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
 		From: binding, ExpectedReplicaSetVersion: 13, SourceMember: 1, TargetMember: 4,
-		ToOwnershipEpoch: 10, ToRoutingVersion: 12, ToRouteGeneration: 13})
+		ToOwnershipEpoch: 10, ToRoutingVersion: 12, ToRouteGeneration: 13,
+		ToOwnedRange: binding.OwnedRange})
 	if err != nil {
 		t.Fatal(err)
 	}
