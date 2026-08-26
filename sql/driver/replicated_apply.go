@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -70,6 +71,20 @@ type ReplicatedApplyOptions struct {
 	RetryWindow uint16
 	TxnLimits   durable.TxnLimits
 	Placement   ReplicatedPlacementProfile
+	// RequestLedgerCapacityBytes is the exact resident-plus-future byte budget
+	// for a dedicated request-ledger group. All request-ledger fields must be
+	// zero to keep the ordinary data-group path disabled.
+	RequestLedgerCapacityBytes uint64
+	// RequestLedgerCleanupReserveBytes prevents new requests from consuming the
+	// bytes required for ACK, recovery, and bounded garbage collection.
+	RequestLedgerCleanupReserveBytes uint64
+	// RequestLedgerRangeStart and RequestLedgerRangeEnd are a half-open SHA-256
+	// key interval. An all-zero end is the canonical unbounded upper endpoint.
+	RequestLedgerRangeStart [sha256.Size]byte
+	RequestLedgerRangeEnd   [sha256.Size]byte
+	// RequestLedgerRangeIdentity fences stale routing against a different
+	// immutable ledger-range generation.
+	RequestLedgerRangeIdentity [sha256.Size]byte
 }
 
 // ReplicatedApplyIdentity is the complete retained identity of the private
@@ -77,18 +92,23 @@ type ReplicatedApplyOptions struct {
 // remaining fields freeze the portable validation and bounded apply profile.
 // Exact restart must retain this value separately from the base SQL/WAL binding.
 type ReplicatedApplyIdentity struct {
-	Format            uint16
-	Storage           string
-	CaptureStorage    string
-	ValidationProfile uint8
-	ValidationDigest  [32]byte
-	SystemLimits      ReplicatedShardStoreLimits
-	CaptureLimits     ReplicatedShardStoreLimits
-	MaxSessions       uint64
-	RetryWindow       uint16
-	TxnLimits         durable.TxnLimits
-	Placement         ReplicatedPlacementProfile
-	Sidecars          ReplicatedApplySidecarProfile
+	Format                           uint16
+	Storage                          string
+	CaptureStorage                   string
+	ValidationProfile                uint8
+	ValidationDigest                 [32]byte
+	SystemLimits                     ReplicatedShardStoreLimits
+	CaptureLimits                    ReplicatedShardStoreLimits
+	MaxSessions                      uint64
+	RetryWindow                      uint16
+	TxnLimits                        durable.TxnLimits
+	Placement                        ReplicatedPlacementProfile
+	RequestLedgerCapacityBytes       uint64
+	RequestLedgerCleanupReserveBytes uint64
+	RequestLedgerRangeStart          [sha256.Size]byte
+	RequestLedgerRangeEnd            [sha256.Size]byte
+	RequestLedgerRangeIdentity       [sha256.Size]byte
+	Sidecars                         ReplicatedApplySidecarProfile
 }
 
 // ReplicatedApplyCapacityProfile is the detached, constant-size apply cut used
@@ -166,20 +186,25 @@ var _ raftmodel.StateMachine = (*ReplicatedApply)(nil)
 var _ raftmodel.NormalBatchStateMachine = (*ReplicatedApply)(nil)
 
 type replicatedApplyMeta struct {
-	Format            uint16
-	Storage           string
-	CaptureStorage    string
-	ValidationProfile uint8
-	ValidationDigest  [32]byte
-	SystemLimits      ReplicatedShardStoreLimits
-	CaptureLimits     ReplicatedShardStoreLimits
-	MaxSessions       uint64
-	RetryWindow       uint16
-	TxnMaxCollections int
-	TxnMaxDocuments   int
-	TxnMaxBytes       int64
-	Placement         ReplicatedPlacementProfile
-	Sidecars          ReplicatedApplySidecarProfile
+	Format                           uint16
+	Storage                          string
+	CaptureStorage                   string
+	ValidationProfile                uint8
+	ValidationDigest                 [32]byte
+	SystemLimits                     ReplicatedShardStoreLimits
+	CaptureLimits                    ReplicatedShardStoreLimits
+	MaxSessions                      uint64
+	RetryWindow                      uint16
+	TxnMaxCollections                int
+	TxnMaxDocuments                  int
+	TxnMaxBytes                      int64
+	Placement                        ReplicatedPlacementProfile
+	RequestLedgerCapacityBytes       uint64
+	RequestLedgerCleanupReserveBytes uint64
+	RequestLedgerRangeStart          [sha256.Size]byte
+	RequestLedgerRangeEnd            [sha256.Size]byte
+	RequestLedgerRangeIdentity       [sha256.Size]byte
+	Sidecars                         ReplicatedApplySidecarProfile
 }
 
 // OpenReplicatedShardStoreWithApply opens an activated root only when both the
@@ -579,6 +604,13 @@ func (d *Database) openReplicatedApply(
 		replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+			RequestLedgerCapacityBytes:       identity.RequestLedgerCapacityBytes,
+			RequestLedgerCleanupReserveBytes: identity.RequestLedgerCleanupReserveBytes,
+			RequestLedgerRange: replicatedstate.RequestLedgerRange{
+				Start:    requestledger.LedgerHome(identity.RequestLedgerRangeStart),
+				End:      requestledger.LedgerHome(identity.RequestLedgerRangeEnd),
+				Identity: requestledger.Digest(identity.RequestLedgerRangeIdentity),
+			},
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
@@ -1840,20 +1872,25 @@ func newReplicatedApplyMeta(
 ) replicatedApplyMeta {
 	captureLimits, _ := replicatedCaptureLimits(identity)
 	return replicatedApplyMeta{
-		Format:            ReplicatedApplyFormat,
-		Storage:           strings.Clone(storage),
-		CaptureStorage:    strings.Clone(captureStorage),
-		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
-		ValidationDigest:  replicatedApplyProfileDigest(identity, options.Placement),
-		SystemLimits:      replicatedApplySystemLimits(options.RetryWindow),
-		CaptureLimits:     captureLimits,
-		MaxSessions:       options.MaxSessions,
-		RetryWindow:       options.RetryWindow,
-		TxnMaxCollections: options.TxnLimits.MaxCollections,
-		TxnMaxDocuments:   options.TxnLimits.MaxDocuments,
-		TxnMaxBytes:       options.TxnLimits.MaxBytes,
-		Placement:         ownedReplicatedPlacementProfile(options.Placement),
-		Sidecars:          canonicalReplicatedApplySidecars(),
+		Format:                           ReplicatedApplyFormat,
+		Storage:                          strings.Clone(storage),
+		CaptureStorage:                   strings.Clone(captureStorage),
+		ValidationProfile:                uint8(replicatedstate.ValidationDeterministicMutation),
+		ValidationDigest:                 replicatedApplyProfileDigest(identity, options.Placement),
+		SystemLimits:                     replicatedApplySystemLimits(options.RetryWindow),
+		CaptureLimits:                    captureLimits,
+		MaxSessions:                      options.MaxSessions,
+		RetryWindow:                      options.RetryWindow,
+		TxnMaxCollections:                options.TxnLimits.MaxCollections,
+		TxnMaxDocuments:                  options.TxnLimits.MaxDocuments,
+		TxnMaxBytes:                      options.TxnLimits.MaxBytes,
+		Placement:                        ownedReplicatedPlacementProfile(options.Placement),
+		RequestLedgerCapacityBytes:       options.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: options.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          options.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            options.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       options.RequestLedgerRangeIdentity,
+		Sidecars:                         canonicalReplicatedApplySidecars(),
 	}
 }
 
@@ -1897,6 +1934,30 @@ func validateReplicatedApplyOptions(
 	}
 	if err := validateReplicatedPlacementProfile(options.Placement, identity); err != nil {
 		return err
+	}
+	if err := validateReplicatedRequestLedgerOptions(options); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateReplicatedRequestLedgerOptions(options ReplicatedApplyOptions) error {
+	enabled := options.RequestLedgerCapacityBytes != 0 ||
+		options.RequestLedgerCleanupReserveBytes != 0 ||
+		options.RequestLedgerRangeStart != ([sha256.Size]byte{}) ||
+		options.RequestLedgerRangeEnd != ([sha256.Size]byte{}) ||
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{})
+	if !enabled {
+		return nil
+	}
+	if options.RequestLedgerCapacityBytes == 0 ||
+		options.RequestLedgerCapacityBytes > math.MaxInt64 ||
+		options.RequestLedgerCleanupReserveBytes == 0 ||
+		options.RequestLedgerCleanupReserveBytes >= options.RequestLedgerCapacityBytes ||
+		options.RequestLedgerRangeIdentity == ([sha256.Size]byte{}) ||
+		(options.RequestLedgerRangeEnd != ([sha256.Size]byte{}) &&
+			bytes.Compare(options.RequestLedgerRangeStart[:], options.RequestLedgerRangeEnd[:]) >= 0) {
+		return fmt.Errorf("%w: invalid request-ledger capacity or range", ErrReplicatedApplyMismatch)
 	}
 	return nil
 }
@@ -1956,7 +2017,12 @@ func (m replicatedApplyMeta) options() ReplicatedApplyOptions {
 			MaxDocuments:   m.TxnMaxDocuments,
 			MaxBytes:       m.TxnMaxBytes,
 		},
-		Placement: ownedReplicatedPlacementProfile(m.Placement),
+		Placement:                        ownedReplicatedPlacementProfile(m.Placement),
+		RequestLedgerCapacityBytes:       m.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: m.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          m.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            m.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       m.RequestLedgerRangeIdentity,
 	}
 }
 
@@ -1967,7 +2033,12 @@ func (m replicatedApplyMeta) identity() ReplicatedApplyIdentity {
 		SystemLimits: m.SystemLimits, CaptureLimits: m.CaptureLimits, MaxSessions: m.MaxSessions,
 		RetryWindow: m.RetryWindow,
 		TxnLimits:   m.options().TxnLimits, Placement: ownedReplicatedPlacementProfile(m.Placement),
-		Sidecars: m.Sidecars,
+		RequestLedgerCapacityBytes:       m.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: m.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          m.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            m.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       m.RequestLedgerRangeIdentity,
+		Sidecars:                         m.Sidecars,
 	}
 }
 
@@ -1976,14 +2047,19 @@ func replicatedApplyMetaFromIdentity(identity ReplicatedApplyIdentity) replicate
 		Format: identity.Format, Storage: strings.Clone(identity.Storage), CaptureStorage: strings.Clone(identity.CaptureStorage),
 		ValidationProfile: identity.ValidationProfile,
 		ValidationDigest:  identity.ValidationDigest, SystemLimits: identity.SystemLimits,
-		CaptureLimits:     identity.CaptureLimits,
-		MaxSessions:       identity.MaxSessions,
-		RetryWindow:       identity.RetryWindow,
-		TxnMaxCollections: identity.TxnLimits.MaxCollections,
-		TxnMaxDocuments:   identity.TxnLimits.MaxDocuments,
-		TxnMaxBytes:       identity.TxnLimits.MaxBytes,
-		Placement:         ownedReplicatedPlacementProfile(identity.Placement),
-		Sidecars:          identity.Sidecars,
+		CaptureLimits:                    identity.CaptureLimits,
+		MaxSessions:                      identity.MaxSessions,
+		RetryWindow:                      identity.RetryWindow,
+		TxnMaxCollections:                identity.TxnLimits.MaxCollections,
+		TxnMaxDocuments:                  identity.TxnLimits.MaxDocuments,
+		TxnMaxBytes:                      identity.TxnLimits.MaxBytes,
+		Placement:                        ownedReplicatedPlacementProfile(identity.Placement),
+		RequestLedgerCapacityBytes:       identity.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: identity.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          identity.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            identity.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       identity.RequestLedgerRangeIdentity,
+		Sidecars:                         identity.Sidecars,
 	}
 }
 

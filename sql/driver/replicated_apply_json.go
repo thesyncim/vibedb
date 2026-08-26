@@ -23,7 +23,9 @@ var (
 	replicatedApplyMetaFields = vibejson.MakeFieldSet(
 		"format", "storage", "capture_storage", "validation_profile", "validation_digest",
 		"system_limits", "capture_limits", "max_sessions", "retry_window", "txn_max_collections",
-		"txn_max_documents", "txn_max_bytes", "placement", "sidecars",
+		"txn_max_documents", "txn_max_bytes", "request_ledger_capacity_bytes",
+		"request_ledger_cleanup_reserve_bytes", "request_ledger_range_start",
+		"request_ledger_range_end", "request_ledger_range_identity", "placement", "sidecars",
 	)
 	replicatedPlacementFields = vibejson.MakeFieldSet(
 		"format", "shard_key", "tuple_version", "mapper_version",
@@ -41,7 +43,9 @@ var (
 	replicatedApplyMetaFieldNames = [...]string{
 		"format", "storage", "capture_storage", "validation_profile", "validation_digest",
 		"system_limits", "capture_limits", "max_sessions", "retry_window", "txn_max_collections",
-		"txn_max_documents", "txn_max_bytes", "placement", "sidecars",
+		"txn_max_documents", "txn_max_bytes", "request_ledger_capacity_bytes",
+		"request_ledger_cleanup_reserve_bytes", "request_ledger_range_start",
+		"request_ledger_range_end", "request_ledger_range_identity", "placement", "sidecars",
 	}
 	replicatedPlacementFieldNames = [...]string{
 		"format", "shard_key", "tuple_version", "mapper_version",
@@ -60,6 +64,9 @@ func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	if err := validateReplicatedApplySidecarGrammar(m.Sidecars); err != nil {
+		return nil, err
+	}
+	if err := validateReplicatedRequestLedgerOptions(m.options()); err != nil {
 		return nil, err
 	}
 	encoded := replicatedApplyMetaVibe(m)
@@ -97,6 +104,18 @@ func (m *replicatedApplyMetaVibe) MarshalVibeJSON(w vibejson.TrustedAppender) vi
 	w = w.RawUnchecked(`,"txn_max_collections":`).Int(int64(meta.TxnMaxCollections))
 	w = w.RawUnchecked(`,"txn_max_documents":`).Int(int64(meta.TxnMaxDocuments))
 	w = w.RawUnchecked(`,"txn_max_bytes":`).Int(meta.TxnMaxBytes)
+	w = w.RawUnchecked(`,"request_ledger_capacity_bytes":`).Uint(
+		meta.RequestLedgerCapacityBytes,
+	)
+	w = w.RawUnchecked(`,"request_ledger_cleanup_reserve_bytes":`).Uint(
+		meta.RequestLedgerCleanupReserveBytes,
+	)
+	w = w.RawUnchecked(`,"request_ledger_range_start":`)
+	w = appendReplicatedHexString(w, meta.RequestLedgerRangeStart[:])
+	w = w.RawUnchecked(`,"request_ledger_range_end":`)
+	w = appendReplicatedHexString(w, meta.RequestLedgerRangeEnd[:])
+	w = w.RawUnchecked(`,"request_ledger_range_identity":`)
+	w = appendReplicatedHexString(w, meta.RequestLedgerRangeIdentity[:])
 	w = w.RawUnchecked(`,"placement":`)
 	w = appendReplicatedPlacement(w, meta.Placement)
 	w = w.RawUnchecked(`,"sidecars":`)
@@ -286,10 +305,42 @@ func decodeReplicatedApplyMetaVibe(
 				return err
 			}
 		case 12:
-			if err := decodeReplicatedPlacementVibe(c, &decoded.Placement); err != nil {
+			if err := c.Uint64(&decoded.RequestLedgerCapacityBytes); err != nil {
 				return err
 			}
 		case 13:
+			if err := c.Uint64(&decoded.RequestLedgerCleanupReserveBytes); err != nil {
+				return err
+			}
+		case 14:
+			if err := decodeReplicatedLowerHex(
+				c, decoded.RequestLedgerRangeStart[:],
+				"vibedb: replicated apply request-ledger range start must be lowercase SHA-256 hexadecimal",
+				"vibedb: replicated apply request-ledger range start",
+			); err != nil {
+				return err
+			}
+		case 15:
+			if err := decodeReplicatedLowerHex(
+				c, decoded.RequestLedgerRangeEnd[:],
+				"vibedb: replicated apply request-ledger range end must be lowercase SHA-256 hexadecimal",
+				"vibedb: replicated apply request-ledger range end",
+			); err != nil {
+				return err
+			}
+		case 16:
+			if err := decodeReplicatedLowerHex(
+				c, decoded.RequestLedgerRangeIdentity[:],
+				"vibedb: replicated apply request-ledger range identity must be lowercase SHA-256 hexadecimal",
+				"vibedb: replicated apply request-ledger range identity",
+			); err != nil {
+				return err
+			}
+		case 17:
+			if err := decodeReplicatedPlacementVibe(c, &decoded.Placement); err != nil {
+				return err
+			}
+		case 18:
 			if err := decodeReplicatedApplySidecarsVibe(c, &decoded.Sidecars); err != nil {
 				return err
 			}
@@ -312,6 +363,9 @@ func decodeReplicatedApplyMetaVibe(
 	}
 	if decoded.SystemLimits != replicatedApplySystemLimits(decoded.RetryWindow) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
+	}
+	if err := validateReplicatedRequestLedgerOptions(decoded.options()); err != nil {
+		return err
 	}
 	*dst = decoded
 	return nil
