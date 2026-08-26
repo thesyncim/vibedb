@@ -25,6 +25,11 @@ type MemberOptions struct {
 	Bootstrap   raftstore.Bootstrap
 	Authority   sqldriver.ReplicatedAuthorityProfile
 	Apply       sqldriver.ReplicatedApplyOptions
+	// SeedDocuments are inserted before the store is bound to replicated apply.
+	// They let an external control-plane process start from an authenticated
+	// catalog head without issuing an unsafe direct write after Raft ownership
+	// has been installed.
+	SeedDocuments [][]byte
 }
 
 // PreparedMember owns one open WAL/SQL/apply triple. Tests may either close it
@@ -82,6 +87,32 @@ func PrepareMember(options MemberOptions) (*PreparedMember, error) {
 	err = errors.Join(err, session.Close())
 	if err != nil {
 		return closeBoth(err)
+	}
+	if len(options.SeedDocuments) != 0 {
+		session, err = database.NewSession(context.Background())
+		if err != nil {
+			return closeBoth(err)
+		}
+		statement, prepareErr := session.Prepare(context.Background(),
+			"INSERT INTO "+options.Table+" VALUES (?)")
+		if prepareErr == nil {
+			for _, document := range options.SeedDocuments {
+				if len(document) == 0 {
+					prepareErr = errors.New("rf3 test fixture: empty seed document")
+					break
+				}
+				if _, prepareErr = statement.Exec(context.Background(), []any{document}); prepareErr != nil {
+					break
+				}
+			}
+		}
+		if statement != nil {
+			prepareErr = errors.Join(prepareErr, statement.Close())
+		}
+		prepareErr = errors.Join(prepareErr, session.Close())
+		if prepareErr != nil {
+			return closeBoth(prepareErr)
+		}
 	}
 	base, err := raftmember.BindPreparedSQL(
 		wal, database, options.Authority, options.Table,

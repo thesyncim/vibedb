@@ -41,6 +41,7 @@ type ProcessMemberOptions struct {
 	Nodes                      [3]rafttransport.NodeID
 	PeerAddresses              [3]string
 	Target                     *ProcessTarget
+	SeedDocuments              [][]byte
 }
 
 type PreparedProcessMember struct {
@@ -136,7 +137,8 @@ func prepareProcessMember(
 	}
 	prepared, err := PrepareMember(MemberOptions{Root: options.Root, Table: options.Table,
 		CreateTable: options.CreateTable, Identity: options.Identity, Key: options.Key,
-		WAL: options.WAL, Bootstrap: bootstrap, Authority: options.Authority, Apply: options.Apply})
+		WAL: options.WAL, Bootstrap: bootstrap, Authority: options.Authority, Apply: options.Apply,
+		SeedDocuments: options.SeedDocuments})
 	if err != nil {
 		return PreparedProcessMember{}, err
 	}
