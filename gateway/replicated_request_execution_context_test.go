@@ -65,6 +65,8 @@ func TestDurableRequestTypedExecutionContextBindsWideReplay(t *testing.T) {
 
 func TestDurableRequestTerminalAuthorityIsStableAndContractBound(t *testing.T) {
 	execution := typedExecutionFixture(t)
+	_, _, route := lifecycleRunnerFixture(t)
+	execution.Home.route = cloneDurableRequestRoute(route)
 	commit := []byte("commit-cursor")
 	abort := []byte("abort-cursor")
 	execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(

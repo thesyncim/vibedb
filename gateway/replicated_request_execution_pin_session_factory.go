@@ -16,7 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
-const durableExecutionPinSessionStripes = 64
+const durableExecutionPinSessionStripes = 4096
 
 // JournaledDurableRequestExecutionPinSessionFactory opens one compact exact-
 // retry journal per request/controller principal. A fixed striped latch keeps
@@ -60,7 +60,7 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 		return nil, serviceauthz.Authority{}, nil, errors.Join(err, pinErr, ErrDurableRequestConflict)
 	}
 	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
-	stripe := &factory.stripes[identity[0]%durableExecutionPinSessionStripes]
+	stripe := &factory.stripes[durableExecutionPinSessionStripe(identity)]
 	stripe.Lock()
 	released := false
 	release := func() {
@@ -136,6 +136,10 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 		return nil, serviceauthz.Authority{}, nil, ErrDurableRequestConflict
 	}
 	return session, factory.principal, release, nil
+}
+
+func durableExecutionPinSessionStripe(identity replication.ID128) uint16 {
+	return binary.LittleEndian.Uint16(identity[:2]) & (durableExecutionPinSessionStripes - 1)
 }
 
 func durableExecutionPinSessionIdentity(
