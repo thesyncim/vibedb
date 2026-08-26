@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -216,6 +217,7 @@ func controlFixture() (Request, raftservice.ReplicaObservation) {
 		AllocationGeneration: 6, ShardIncarnation: replication.ID128(group.ShardIncarnation),
 		GroupID: replication.ID128(group.GroupID), ActivePolicyGeneration: 7, ProtectionEpoch: 8,
 		OwnershipEpoch: 9, SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 	}, Applied: 19, LastTerm: 4, LastKind: replicatedstate.RecordNormal,
 		LastEntryType: pb.EntryNormal, LastEntryDigest: digest, DataChainDigest: digest,
 		ApplyContractDigest: digest, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},

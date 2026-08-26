@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -63,6 +64,7 @@ func (owner *fakeOwner) ProposeOwnershipTransition(_ context.Context, _ raftserv
 		owner.state.Binding.OwnershipEpoch = view.ToOwnershipEpoch
 		owner.state.Binding.RoutingVersion = view.ToRoutingVersion
 		owner.state.Binding.RouteGeneration = view.ToRouteGeneration
+		owner.state.Binding.OwnedRange = view.ToOwnedRange
 	}
 	return nil
 }
@@ -82,7 +84,8 @@ func actionFixture(t *testing.T, kind Kind) Request {
 	t.Helper()
 	binding := replicatedstate.Binding{Distribution: "accounts", Shard: "s-7", TopologyRecoveryEpoch: 3,
 		AllocationGeneration: 5, ActivePolicyGeneration: 7, ProtectionEpoch: 11,
-		OwnershipEpoch: 13, SchemaGeneration: 17, RoutingVersion: 19, RouteGeneration: 23}
+		OwnershipEpoch: 13, SchemaGeneration: 17, RoutingVersion: 19, RouteGeneration: 23,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
 	binding.ClusterID[0] = 1
 	binding.ClusterIncarnation[0] = 2
 	binding.ShardIncarnation[0] = 4
@@ -106,7 +109,8 @@ func actionFixture(t *testing.T, kind Kind) Request {
 		request.Command, err = replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
 			From: binding, ExpectedReplicaSetVersion: request.Fence.Command.ReplicaSetVersion,
 			SourceMember: request.SourceMember, TargetMember: request.TargetMember,
-			ToOwnershipEpoch: 14, ToRoutingVersion: 20, ToRouteGeneration: 24})
+			ToOwnershipEpoch: 14, ToRoutingVersion: 20, ToRouteGeneration: 24,
+			ToOwnedRange: binding.OwnedRange})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +129,8 @@ func ownerFor(request Request) *fakeOwner {
 		ShardIncarnation: view.ShardIncarnation, GroupID: view.GroupID,
 		ActivePolicyGeneration: view.ActivePolicyGeneration, ProtectionEpoch: view.ProtectionEpoch,
 		OwnershipEpoch: view.OwnershipEpoch, SchemaGeneration: view.SchemaGeneration,
-		RoutingVersion: view.RoutingVersion, RouteGeneration: view.RouteGeneration},
+		RoutingVersion: view.RoutingVersion, RouteGeneration: view.RouteGeneration,
+		OwnedRange: view.FromOwnedRange},
 		ReplicaSetVersion: view.ExpectedReplicaSetVersion}}
 }
 
@@ -174,6 +179,7 @@ func TestOwnershipUnknownOutcomeSettlesOnExactReplay(t *testing.T) {
 	owner.state.Binding.OwnershipEpoch = view.ToOwnershipEpoch
 	owner.state.Binding.RoutingVersion = view.ToRoutingVersion
 	owner.state.Binding.RouteGeneration = view.ToRouteGeneration
+	owner.state.Binding.OwnedRange = view.ToOwnedRange
 	owner.mu.Unlock()
 	record, err := service.Execute(context.Background(), request)
 	if err != nil || record.State != Complete || record.Revision != 2 {
