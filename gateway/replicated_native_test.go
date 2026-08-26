@@ -835,6 +835,39 @@ func TestReplicatedExecutorExhaustedUnknownOwnsExactRetryCommand(t *testing.T) {
 	}
 }
 
+func TestReplicatedExecutorInternalUnknownOwnershipModesDoNotClone(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+
+	owned := make([]byte, len(command), len(command)+4096)
+	copy(owned, command)
+	ownedClient := &failingReplicatedClient{state: states["m2"]}
+	ownedExecutor, err := NewReplicatedExecutor(ownedClient, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ownedExecutor.proposeOwned(context.Background(), route, owned)
+	var transferred *raftservice.UnknownOutcomeError
+	if !errors.As(err, &transferred) || len(transferred.Command) != len(owned) ||
+		&transferred.Command[0] != &owned[0] || cap(transferred.Command) != len(owned) {
+		t.Fatalf("owned outcome=%T %+v", err, transferred)
+	}
+
+	borrowedClient := &failingReplicatedClient{state: states["m2"]}
+	borrowedExecutor, err := NewReplicatedExecutor(borrowedClient, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = borrowedExecutor.retryUnknownBorrowed(
+		context.Background(), route, transferred.Command,
+	)
+	var borrowed *raftservice.UnknownOutcomeError
+	if !errors.As(err, &borrowed) || borrowed.Command != nil ||
+		!errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("borrowed outcome=%T %+v", err, borrowed)
+	}
+}
+
 type staleFenceReplicatedClient struct {
 	oldState  shardservice.ReplicatedMemberState
 	newState  shardservice.ReplicatedMemberState

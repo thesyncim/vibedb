@@ -21,6 +21,10 @@ const (
 	// manifest bytes and may legitimately raise the complete proposal above it.
 	MaxManifestSegmentsPerCommand   = 15
 	MaxManifestSegmentSequenceBytes = MaxManifestSegmentsPerCommand * ManifestSegmentBytes
+	// ReplicatedRetirementSummaryBytes is the sole fixed retirement witness:
+	// one canonical validity byte followed by one little-endian nonnegative
+	// affected-row count. The enclosing VTRC checksum authenticates these bytes.
+	ReplicatedRetirementSummaryBytes = 9
 
 	// MaxReplicatedCommandBytes bounds this transaction control body, not the
 	// complete outer proposal. Relation mutation bytes are carried once by the
@@ -82,7 +86,16 @@ const (
 	ReplicatedPayloadManifestSegment
 	ReplicatedPayloadParticipantStage
 	ReplicatedPayloadManifestSegments
+	ReplicatedPayloadRetirement
 )
+
+// ReplicatedRetirementSummary is the authoritative aggregate retained by a
+// retired coordinator. Committed retirement requires a valid nonnegative row
+// count; aborted retirement uses the canonical invalid-zero form.
+type ReplicatedRetirementSummary struct {
+	AffectedRows      int64
+	AffectedRowsValid bool
+}
 
 // ParticipantStage is the compact durable intent metadata paired with native
 // relation batches in the outer replication command. MutationDigest binds
@@ -127,6 +140,40 @@ func (v ReplicatedCommandView) Bytes() []byte { return v.raw[:len(v.raw):len(v.r
 // Command returns a construction form. Payload remains a borrowed,
 // capacity-clamped alias; participant scopes use the decoder scratch.
 func (v ReplicatedCommandView) Command() ReplicatedCommand { return v.ReplicatedCommand }
+
+// AppendReplicatedRetirementSummary appends the sole fixed retirement-summary
+// grammar. It has no inner checksum because it exists only as a VTRC payload.
+func AppendReplicatedRetirementSummary(
+	dst []byte,
+	summary ReplicatedRetirementSummary,
+) ([]byte, error) {
+	if summary.AffectedRows < 0 || !summary.AffectedRowsValid && summary.AffectedRows != 0 {
+		return dst, ErrCorrupt
+	}
+	start := len(dst)
+	dst = append(dst, make([]byte, ReplicatedRetirementSummaryBytes)...)
+	if summary.AffectedRowsValid {
+		dst[start] = 1
+	}
+	binary.LittleEndian.PutUint64(dst[start+1:start+9], uint64(summary.AffectedRows))
+	return dst, nil
+}
+
+// OpenReplicatedRetirementSummary validates and opens one exact fixed
+// retirement summary.
+func OpenReplicatedRetirementSummary(raw []byte) (ReplicatedRetirementSummary, error) {
+	if len(raw) != ReplicatedRetirementSummaryBytes || raw[0] > 1 {
+		return ReplicatedRetirementSummary{}, ErrCorrupt
+	}
+	rows := int64(binary.LittleEndian.Uint64(raw[1:9]))
+	valid := raw[0] == 1
+	if rows < 0 || !valid && rows != 0 {
+		return ReplicatedRetirementSummary{}, ErrCorrupt
+	}
+	return ReplicatedRetirementSummary{
+		AffectedRows: rows, AffectedRowsValid: valid,
+	}, nil
+}
 
 // ManifestSegmentSequence is a validated, borrowed, zero-overhead concatenation
 // of canonical VTM1 pages. Its byte slice and every iterator page are capacity
@@ -362,13 +409,9 @@ func ReplicatedCoordinatorBindsParticipant(
 // Payload must not overlap the writable append region in dst's current backing
 // array; aliases are rejected before any destination byte is changed.
 func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, error) {
-	if err := validateReplicatedCommand(command); err != nil {
+	total, err := ReplicatedCommandSize(command)
+	if err != nil {
 		return dst, err
-	}
-	total := replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
-		len(command.Payload) + replicatedCommandChecksumBytes
-	if total > MaxReplicatedCommandBytes {
-		return dst, ErrTooLarge
 	}
 	if replicatedPayloadOverlapsAppendRegion(dst, total, command.Payload) {
 		return dst, ErrCorrupt
@@ -407,6 +450,22 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	copy(out[cursor:], command.Payload)
 	binary.LittleEndian.PutUint32(out[total-4:], crc32.Checksum(out[:total-4], castagnoli))
 	return dst, nil
+}
+
+// ReplicatedCommandSize returns the exact canonical control-body size without
+// allocating or encoding. It performs the same semantic and byte-bound
+// validation as AppendReplicatedCommand, allowing callers to reserve the
+// complete proposal budget before either control or outer-command encoding.
+func ReplicatedCommandSize(command ReplicatedCommand) (int, error) {
+	if err := validateReplicatedCommand(command); err != nil {
+		return 0, err
+	}
+	return replicatedCommandEncodedSize(command), nil
+}
+
+func replicatedCommandEncodedSize(command ReplicatedCommand) int {
+	return replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
+		len(command.Payload) + replicatedCommandChecksumBytes
 }
 
 func replicatedPayloadOverlapsAppendRegion(dst []byte, total int, payload []byte) bool {
@@ -466,6 +525,10 @@ func ValidateReplicatedCommand(src []byte) error {
 	var id ID
 	copy(id[:], src[32:48])
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(operation)
+	abortFence := operation == ReplicatedAbortReleaseParticipant && expectedRevision == 0
+	if abortFence {
+		wantPayload, creation = ReplicatedPayloadParticipantStage, true
+	}
 	if id.IsZero() || !ok || role != wantRole || payloadKind != wantPayload ||
 		(creation && expectedRevision != 0) || (!creation && expectedRevision == 0) {
 		return ErrCorrupt
@@ -473,7 +536,7 @@ func ValidateReplicatedCommand(src []byte) error {
 	scopeEnd := replicatedCommandHeaderBytes + int(scopeCount)*8
 	payloadEnd := scopeEnd + int(payloadLength)
 	payload := src[scopeEnd:payloadEnd:payloadEnd]
-	if replicatedOperationCarriesParticipant(operation) {
+	if replicatedCommandCarriesParticipant(operation, expectedRevision) {
 		var coordinatorGroup, coordinatorShardIncarnation ID
 		var mutationDigest Digest
 		copy(coordinatorGroup[:], src[48:64])
@@ -488,6 +551,9 @@ func ValidateReplicatedCommand(src []byte) error {
 		}
 		if operation == ReplicatedStageParticipant &&
 			binary.LittleEndian.Uint32(src[124:128]) != 0 {
+			return ErrCorrupt
+		}
+		if abortFence && (src[120] != 0 || scopeCount != 0) {
 			return ErrCorrupt
 		}
 		return validateReplicatedPayload(
@@ -563,11 +629,18 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		return ErrCorrupt
 	}
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(command.Operation)
+	abortFence := command.Operation == ReplicatedAbortReleaseParticipant &&
+		command.ExpectedRevision == 0
+	if abortFence {
+		wantPayload, creation = ReplicatedPayloadParticipantStage, true
+	}
 	if !ok || command.Role != wantRole || command.PayloadKind != wantPayload ||
 		(creation && command.ExpectedRevision != 0) || (!creation && command.ExpectedRevision == 0) {
 		return ErrCorrupt
 	}
-	carriesParticipant := replicatedOperationCarriesParticipant(command.Operation)
+	carriesParticipant := replicatedCommandCarriesParticipant(
+		command.Operation, command.ExpectedRevision,
+	)
 	if !carriesParticipant && !participantStageZero(command.Participant) {
 		return ErrCorrupt
 	}
@@ -579,7 +652,12 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 			!ValidateIntentScopes(command.Participant.IntentScopes, command.Participant.BucketBits) {
 			return ErrCorrupt
 		}
-		if command.Operation == ReplicatedStageParticipant && command.Participant.ParticipantOrdinal != 0 {
+		if command.Operation == ReplicatedStageParticipant &&
+			command.Participant.ParticipantOrdinal != 0 {
+			return ErrCorrupt
+		}
+		if abortFence && (command.Participant.BucketBits != 0 ||
+			len(command.Participant.IntentScopes) != 0) {
 			return ErrCorrupt
 		}
 	}
@@ -589,8 +667,7 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 	); err != nil {
 		return err
 	}
-	total := replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
-		len(command.Payload) + replicatedCommandChecksumBytes
+	total := replicatedCommandEncodedSize(command)
 	if total > MaxReplicatedCommandBytes || !replicatedCommandShapeWithinBound(command) {
 		return ErrTooLarge
 	}
@@ -611,9 +688,15 @@ func validateReplicatedPayload(
 			return ErrCorrupt
 		}
 	case ReplicatedPayloadCoordinator:
-		return validateReplicatedCoordinatorPayload(
+		if err := validateReplicatedCoordinatorPayload(
 			operation, id, payload, participantOrdinal, mutationDigest,
-		)
+		); err != nil {
+			return err
+		}
+		if operation == ReplicatedBeginPrepareCoordinator {
+			return ValidateReplicatedCoordinatorAuthorityWitnesses(payload)
+		}
+		return nil
 	case ReplicatedPayloadManifestCoordinator:
 		coordinator, segments, err := OpenReplicatedManifestStart(payload)
 		if err != nil {
@@ -654,6 +737,9 @@ func validateReplicatedPayload(
 				}
 				break
 			}
+			if err = segments.ValidateAuthorityWitnesses(); err != nil {
+				return err
+			}
 		}
 	case ReplicatedPayloadManifestSegment:
 		if len(payload) > ManifestSegmentBytes {
@@ -673,9 +759,19 @@ func validateReplicatedPayload(
 			segments.FirstParticipant() == 0 {
 			return ErrCorrupt
 		}
+		if err = segments.ValidateAuthorityWitnesses(); err != nil {
+			return err
+		}
 	case ReplicatedPayloadParticipantStage:
 		if len(payload) != 0 {
 			return ErrCorrupt
+		}
+	case ReplicatedPayloadRetirement:
+		if operation != ReplicatedRetireCoordinator {
+			return ErrCorrupt
+		}
+		if _, err := OpenReplicatedRetirementSummary(payload); err != nil {
+			return err
 		}
 	default:
 		return ErrCorrupt
@@ -766,8 +862,10 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestCoordinator, true, true
 	case ReplicatedStageManifestSegment:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestSegment, false, true
-	case ReplicatedCommitCoordinator, ReplicatedAbortCoordinator, ReplicatedRetireCoordinator:
+	case ReplicatedCommitCoordinator, ReplicatedAbortCoordinator:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadNone, false, true
+	case ReplicatedRetireCoordinator:
+		return ReplicatedRoleCoordinator, ReplicatedPayloadRetirement, false, true
 	case ReplicatedStageParticipant:
 		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, true, true
 	case ReplicatedPrepareParticipant, ReplicatedApplyParticipant,
@@ -788,11 +886,16 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 	}
 }
 
-func replicatedOperationCarriesParticipant(operation ReplicatedOperation) bool {
+func replicatedCommandCarriesParticipant(
+	operation ReplicatedOperation,
+	expectedRevision uint64,
+) bool {
 	switch operation {
 	case ReplicatedStageParticipant, ReplicatedBeginPrepareCoordinator,
 		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareParticipant:
 		return true
+	case ReplicatedAbortReleaseParticipant:
+		return expectedRevision == 0
 	default:
 		return false
 	}
@@ -812,10 +915,10 @@ func canonicalCoordinatorBytes(raw []byte) bool {
 	count := int(binary.LittleEndian.Uint16(raw[6:8]))
 	cursor, end := coordinatorHeaderBytes, len(raw)-4
 	for i := 0; i < count; i++ {
-		if end-cursor < 60 || raw[cursor+3] != 0 {
+		if end-cursor < coordinatorEntryBytes || raw[cursor+3] != 0 {
 			return false
 		}
-		cursor += 60 + int(raw[cursor]) + int(raw[cursor+1])
+		cursor += coordinatorEntryBytes + int(raw[cursor]) + int(raw[cursor+1])
 		if cursor > end {
 			return false
 		}
@@ -932,6 +1035,8 @@ func inspectCanonicalManifestSegment(
 		}
 		var mutationDigest Digest
 		copy(mutationDigest[:], entry[32:64])
+		var authorityWitness AuthorityWitness
+		copy(authorityWitness[:], entry[64:80])
 		if mutationDigest == (Digest{}) {
 			return manifestSegmentSummary{}, false
 		}
@@ -969,6 +1074,7 @@ func inspectCanonicalManifestSegment(
 				RoutingVersion:       binary.LittleEndian.Uint64(entry[8:16]),
 				AllocationGeneration: binary.LittleEndian.Uint64(entry[16:24]),
 				OwnershipEpoch:       binary.LittleEndian.Uint64(entry[24:32]),
+				AuthorityWitness:     authorityWitness,
 				MutationDigest:       mutationDigest,
 			}
 			if match.exact {

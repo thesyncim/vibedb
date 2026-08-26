@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -78,6 +79,54 @@ type ID128 [16]byte
 // Digest is a SHA-256 request fingerprint or result digest, depending on the
 // field carrying it. The all-zero value is never a valid persisted digest.
 type Digest [32]byte
+
+// RouteAuthority is the complete portable catalog authority for one logical
+// shard allocation. It deliberately excludes replica-local member, store, and
+// endpoint identities: every replica in the group must derive the same digest.
+// RelationManifestDigest binds SchemaGeneration to the exact dense relation
+// grammar interpreted by the state machine.
+type RouteAuthority struct {
+	ClusterID              ID128
+	ClusterIncarnation     ID128
+	TopologyRecoveryEpoch  uint64
+	ShardIncarnation       ID128
+	GroupID                ID128
+	AllocationGeneration   uint64
+	ReplicaSetVersion      uint64
+	ActivePolicyGeneration uint64
+	ProtectionEpoch        uint64
+	OwnershipEpoch         uint64
+	SchemaGeneration       uint64
+	RelationManifestDigest Digest
+	RoutingVersion         uint64
+	RouteGeneration        uint64
+}
+
+var routeAuthorityDigestDomain = []byte("vibedb/gateway/replicated-route-id\x00")
+
+// RouteAuthorityDigest returns the canonical allocation-free identity used to
+// bind distributed-transaction participant references to one exact route
+// authority. Field order and domain are intentionally stable and match the
+// sole unreleased gateway route identity grammar.
+func RouteAuthorityDigest(authority RouteAuthority) Digest {
+	var storage [256]byte
+	value := append(storage[:0], routeAuthorityDigestDomain...)
+	value = append(value, authority.ClusterID[:]...)
+	value = append(value, authority.ClusterIncarnation[:]...)
+	value = binary.LittleEndian.AppendUint64(value, authority.TopologyRecoveryEpoch)
+	value = append(value, authority.ShardIncarnation[:]...)
+	value = append(value, authority.GroupID[:]...)
+	value = binary.LittleEndian.AppendUint64(value, authority.AllocationGeneration)
+	value = binary.LittleEndian.AppendUint64(value, authority.ReplicaSetVersion)
+	value = binary.LittleEndian.AppendUint64(value, authority.ActivePolicyGeneration)
+	value = binary.LittleEndian.AppendUint64(value, authority.ProtectionEpoch)
+	value = binary.LittleEndian.AppendUint64(value, authority.OwnershipEpoch)
+	value = binary.LittleEndian.AppendUint64(value, authority.SchemaGeneration)
+	value = append(value, authority.RelationManifestDigest[:]...)
+	value = binary.LittleEndian.AppendUint64(value, authority.RoutingVersion)
+	value = binary.LittleEndian.AppendUint64(value, authority.RouteGeneration)
+	return Digest(sha256.Sum256(value))
+}
 
 // RetryHome is the stable, fixed-width keyspace point that owns completion
 // state across route changes and range movement. Zero is a valid keyspace point.

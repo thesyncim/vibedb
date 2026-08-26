@@ -28,6 +28,37 @@ func testDigest(seed byte) Digest {
 	return digest
 }
 
+func testRouteAuthority() RouteAuthority {
+	return RouteAuthority{
+		ClusterID: testID(0x01), ClusterIncarnation: testID(0x21),
+		TopologyRecoveryEpoch: 3, ShardIncarnation: testID(0x41), GroupID: testID(0x61),
+		AllocationGeneration: 5, ReplicaSetVersion: 7, ActivePolicyGeneration: 11,
+		ProtectionEpoch: 13, OwnershipEpoch: 17, SchemaGeneration: 19,
+		RelationManifestDigest: testDigest(0x71), RoutingVersion: 23, RouteGeneration: 29,
+	}
+}
+
+func TestRouteAuthorityDigestCanonicalGoldenAndAllocationFree(t *testing.T) {
+	authority := testRouteAuthority()
+	const want = "56d55ef04dae566535a2329a83dbf6e8415c2e455516a22612215b51ee81f5d6"
+	got := RouteAuthorityDigest(authority)
+	if hex.EncodeToString(got[:]) != want {
+		t.Fatalf("digest=%x, want %s", got, want)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if RouteAuthorityDigest(authority) != got {
+			panic("nondeterministic route authority digest")
+		}
+	}); allocations != 0 {
+		t.Fatalf("allocations=%v, want 0", allocations)
+	}
+	changed := authority
+	changed.RelationManifestDigest[0] ^= 1
+	if RouteAuthorityDigest(changed) == got {
+		t.Fatal("relation manifest digest was not bound")
+	}
+}
+
 func testRetryHome() RetryHome {
 	return RetryHome{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
 }

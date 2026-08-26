@@ -3,6 +3,7 @@ package shardservice
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -106,7 +107,9 @@ func OpenReplicatedTransactionReadValueInto(
 	records = records[:count]
 	for index := range records {
 		offset := index * replicatedstate.TransactionRecoverySummaryBytes
-		if summaries[offset+115] > 1 {
+		if !validReplicatedTransactionRecoverySummary(
+			summaries[offset : offset+replicatedstate.TransactionRecoverySummaryBytes],
+		) {
 			return ReplicatedTransactionReadValue{}, ErrReplicatedWire
 		}
 		records[index] = openReplicatedTransactionRecoveryRecord(
@@ -167,7 +170,9 @@ func validReplicatedTransactionReadValue(src []byte) bool {
 	var prior distributedtxn.ID
 	for index := 0; index < count; index++ {
 		offset := index * replicatedstate.TransactionRecoverySummaryBytes
-		if summaries[offset+115] > 1 {
+		if !validReplicatedTransactionRecoverySummary(
+			summaries[offset : offset+replicatedstate.TransactionRecoverySummaryBytes],
+		) {
 			return false
 		}
 		record := openReplicatedTransactionRecoveryRecord(
@@ -204,9 +209,16 @@ func appendReplicatedTransactionRecoveryRecord(
 	copy(dst[51:67], record.CoordinatorShardIncarnation[:])
 	binary.BigEndian.PutUint64(dst[67:75], record.CoordinatorAllocation)
 	copy(dst[75:107], record.MutationDigest[:])
-	binary.BigEndian.PutUint64(dst[107:115], uint64(record.AffectedRows))
+	if record.CancellationWitness {
+		binary.BigEndian.PutUint64(dst[107:115], uint64(record.ParticipantOrdinal))
+	} else {
+		binary.BigEndian.PutUint64(dst[107:115], uint64(record.AffectedRows))
+	}
 	if record.AffectedRowsValid {
 		dst[115] = 1
+	}
+	if record.CancellationWitness {
+		dst[115] |= 1 << 1
 	}
 	dst[116] = byte(record.CoordinatorDecision)
 	binary.BigEndian.PutUint32(dst[117:121], record.ManifestPage)
@@ -226,11 +238,25 @@ func openReplicatedTransactionRecoveryRecord(
 	copy(record.CoordinatorShardIncarnation[:], src[51:67])
 	record.CoordinatorAllocation = binary.BigEndian.Uint64(src[67:75])
 	copy(record.MutationDigest[:], src[75:107])
-	record.AffectedRows = int64(binary.BigEndian.Uint64(src[107:115]))
-	record.AffectedRowsValid = src[115] == 1
+	record.AffectedRowsValid = src[115]&1 != 0
+	record.CancellationWitness = src[115]&(1<<1) != 0
+	if record.CancellationWitness {
+		record.ParticipantOrdinal = uint32(binary.BigEndian.Uint64(src[107:115]))
+	} else {
+		record.AffectedRows = int64(binary.BigEndian.Uint64(src[107:115]))
+	}
 	record.CoordinatorDecision = distributedtxn.CoordinatorState(src[116])
 	record.ManifestPage = binary.BigEndian.Uint32(src[117:121])
 	return record
+}
+
+func validReplicatedTransactionRecoverySummary(src []byte) bool {
+	if len(src) != replicatedstate.TransactionRecoverySummaryBytes || src[115]&^byte(3) != 0 {
+		return false
+	}
+	cancellation := src[115]&(1<<1) != 0
+	return !cancellation || src[115]&1 == 0 &&
+		binary.BigEndian.Uint64(src[107:115]) <= math.MaxUint32
 }
 
 func validReplicatedTransactionReadRecords(
@@ -273,7 +299,7 @@ func validReplicatedTransactionRecoveryRecord(
 	record replicatedstate.TransactionRecoveryRecord,
 	payload []byte,
 ) bool {
-	if record.ID.IsZero() || record.Revision == 0 || record.PayloadCount == 0 ||
+	if record.ID.IsZero() || record.Revision == 0 ||
 		record.CoordinatorGroup == (replication.ID128{}) ||
 		record.CoordinatorShardIncarnation == (replication.ID128{}) ||
 		record.CoordinatorAllocation == 0 || record.MutationDigest == (distributedtxn.Digest{}) ||
@@ -289,7 +315,8 @@ func validReplicatedTransactionRecoveryRecord(
 	}
 	if wantRole == distributedtxn.ReplicatedRoleCoordinator {
 		state := distributedtxn.CoordinatorState(record.State)
-		if !state.CanTransitionTo(state) || record.AffectedRowsValid || record.AffectedRows != 0 ||
+		if record.PayloadCount == 0 || record.CancellationWitness || record.ParticipantOrdinal != 0 ||
+			!state.CanTransitionTo(state) || !validReplicatedCoordinatorAffectedRows(state, record) ||
 			(record.PayloadKind != distributedtxn.ReplicatedPayloadCoordinator &&
 				record.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator) ||
 			!validReplicatedCoordinatorDecision(state, record.CoordinatorDecision) {
@@ -297,6 +324,14 @@ func validReplicatedTransactionRecoveryRecord(
 		}
 	} else {
 		state := distributedtxn.ParticipantState(record.State)
+		if record.CancellationWitness {
+			if state != distributedtxn.ParticipantReleased || record.Revision != 1 ||
+				record.PayloadCount != 0 || record.AffectedRowsValid || record.AffectedRows != 0 {
+				return false
+			}
+		} else if record.PayloadCount == 0 || record.ParticipantOrdinal != 0 {
+			return false
+		}
 		if !state.CanTransitionTo(state) ||
 			record.PayloadKind != distributedtxn.ReplicatedPayloadParticipantStage ||
 			record.CoordinatorDecision != distributedtxn.CoordinatorInvalid ||
@@ -324,6 +359,20 @@ func validReplicatedTransactionRecoveryRecord(
 	default:
 		return false
 	}
+}
+
+func validReplicatedCoordinatorAffectedRows(
+	state distributedtxn.CoordinatorState,
+	record replicatedstate.TransactionRecoveryRecord,
+) bool {
+	if state != distributedtxn.CoordinatorRetired {
+		return !record.AffectedRowsValid && record.AffectedRows == 0
+	}
+	if record.CoordinatorDecision == distributedtxn.CoordinatorCommitted {
+		return record.AffectedRowsValid
+	}
+	return record.CoordinatorDecision == distributedtxn.CoordinatorAborted &&
+		!record.AffectedRowsValid && record.AffectedRows == 0
 }
 
 func validReplicatedCoordinatorDecision(

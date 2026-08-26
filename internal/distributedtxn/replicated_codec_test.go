@@ -16,7 +16,8 @@ func replicatedTestCoordinator(t testing.TB) []byte {
 		Participants: []ParticipantRef{{
 			Distribution: []byte("docs"), Shard: []byte("-80"),
 			RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
-			MutationDigest: digest("mutation"), State: ParticipantStaged,
+			AuthorityWitness: authorityWitness("docs/-80"),
+			MutationDigest:   digest("mutation"), State: ParticipantStaged,
 		}},
 	})
 	if err != nil {
@@ -284,6 +285,32 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 	}
 }
 
+func TestReplicatedCommandSizeExactParityAndAllocatesZero(t *testing.T) {
+	participant := replicatedTestParticipant()
+	size, err := ReplicatedCommandSize(participant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := AppendReplicatedCommand(make([]byte, 0, size), participant)
+	if err != nil || len(encoded) != size {
+		t.Fatalf("participant size=%d encoded=%d err=%v", size, len(encoded), err)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		measured, sizeErr := ReplicatedCommandSize(participant)
+		if sizeErr != nil || measured != size {
+			panic("replicated command size diverged")
+		}
+	}); got != 0 {
+		t.Fatalf("replicated command size allocs = %v", got)
+	}
+
+	invalid := participant
+	invalid.ID = ID{}
+	if measured, sizeErr := ReplicatedCommandSize(invalid); sizeErr == nil || measured != 0 {
+		t.Fatalf("invalid size=%d err=%v", measured, sizeErr)
+	}
+}
+
 func TestAppendReplicatedCommandRejectsPayloadAppendRegionOverlapWithoutMutation(t *testing.T) {
 	payload := replicatedTestCoordinator(t)
 	base := ReplicatedCommand{
@@ -445,6 +472,85 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 	}
 }
 
+func TestReplicatedParticipantAbortFenceIsCanonicalAndCompact(t *testing.T) {
+	stage := fusedParticipantStage(
+		ReplicatedAbortReleaseParticipant, 4096, digest("abort-fence"),
+	)
+	stage.BucketBits = 0
+	stage.IntentScopes = nil
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleParticipant, Operation: ReplicatedAbortReleaseParticipant,
+		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		Participant: stage,
+	}
+	encoded, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != replicatedCommandHeaderBytes+replicatedCommandChecksumBytes {
+		t.Fatalf("abort fence bytes=%d", len(encoded))
+	}
+	var scopes [MaxIntentScopes]IntentScope
+	view, err := OpenReplicatedCommandInto(encoded, scopes[:])
+	if err != nil || view.ExpectedRevision != 0 ||
+		view.PayloadKind != ReplicatedPayloadParticipantStage ||
+		view.Participant.MutationDigest != stage.MutationDigest ||
+		view.Participant.ParticipantOrdinal != 4096 {
+		t.Fatalf("abort fence=%+v err=%v", view.ReplicatedCommand, err)
+	}
+	reencoded, err := AppendReplicatedCommand(nil, view.Command())
+	if err != nil || !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("abort fence canonical re-encode err=%v", err)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		if validateErr := ValidateReplicatedCommand(encoded); validateErr != nil {
+			panic(validateErr)
+		}
+	}); got != 0 {
+		t.Fatalf("abort fence validation allocations=%v", got)
+	}
+}
+
+func TestReplicatedParticipantAbortFenceRejectsAmbiguousShapes(t *testing.T) {
+	stage := fusedParticipantStage(
+		ReplicatedAbortReleaseParticipant, 4096, digest("abort-fence"),
+	)
+	stage.BucketBits = 0
+	stage.IntentScopes = nil
+	valid := ReplicatedCommand{
+		Role: ReplicatedRoleParticipant, Operation: ReplicatedAbortReleaseParticipant,
+		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		Participant: stage,
+	}
+	tests := []func(*ReplicatedCommand){
+		func(c *ReplicatedCommand) { c.PayloadKind = ReplicatedPayloadNone },
+		func(c *ReplicatedCommand) { c.ExpectedRevision = 2 },
+		func(c *ReplicatedCommand) { c.Payload = []byte{1} },
+		func(c *ReplicatedCommand) {
+			c.Participant.BucketBits = 8
+			c.Participant.IntentScopes = []IntentScope{{Start: 1, End: 2}}
+		},
+		func(c *ReplicatedCommand) { c.Participant.CoordinatorGroup = ID{} },
+		func(c *ReplicatedCommand) { c.Participant.CoordinatorShardIncarnation = ID{} },
+		func(c *ReplicatedCommand) { c.Participant.CoordinatorAllocation = 0 },
+		func(c *ReplicatedCommand) { c.Participant.MutationDigest = Digest{} },
+	}
+	for index, mutate := range tests {
+		candidate := valid
+		mutate(&candidate)
+		if _, err := AppendReplicatedCommand(nil, candidate); err == nil {
+			t.Fatalf("accepted malformed abort fence %d", index)
+		}
+	}
+	transition := valid
+	transition.ExpectedRevision = 2
+	transition.PayloadKind = ReplicatedPayloadNone
+	transition.Participant = ParticipantStage{}
+	if _, err := AppendReplicatedCommand(nil, transition); err != nil {
+		t.Fatalf("ordinary abort-release rejected: %v", err)
+	}
+}
+
 func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
 	payload := replicatedTestCoordinator(t)
 	stage := fusedParticipantStage(
@@ -465,7 +571,8 @@ func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
 	want := ParticipantRef{
 		Distribution: []byte("docs"), Shard: []byte("-80"),
 		RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
-		MutationDigest: digest("mutation"), State: ParticipantStaged,
+		AuthorityWitness: authorityWitness("docs/-80"),
+		MutationDigest:   digest("mutation"), State: ParticipantStaged,
 	}
 	present, matches, err := ReplicatedCoordinatorBindsParticipant(payload, 0, want)
 	if err != nil || !present || !matches {
@@ -675,5 +782,81 @@ func TestFusedReplicatedCommandExactMaximum(t *testing.T) {
 	const want = 985336
 	if MaxReplicatedCommandBytes != want {
 		t.Fatalf("max replicated command=%d want=%d", MaxReplicatedCommandBytes, want)
+	}
+}
+
+func TestReplicatedRetirementSummaryCanonicalFixedAndAllocationFree(t *testing.T) {
+	for _, summary := range []ReplicatedRetirementSummary{
+		{},
+		{AffectedRows: 4096, AffectedRowsValid: true},
+	} {
+		var storage [ReplicatedRetirementSummaryBytes]byte
+		encoded, err := AppendReplicatedRetirementSummary(storage[:0], summary)
+		if err != nil || len(encoded) != ReplicatedRetirementSummaryBytes {
+			t.Fatalf("append summary=%+v bytes=%d err=%v", summary, len(encoded), err)
+		}
+		opened, err := OpenReplicatedRetirementSummary(encoded)
+		if err != nil || opened != summary {
+			t.Fatalf("open summary=%+v err=%v want=%+v", opened, err, summary)
+		}
+		if got := testing.AllocsPerRun(1000, func() {
+			encoded, appendErr := AppendReplicatedRetirementSummary(storage[:0], summary)
+			if appendErr != nil {
+				panic(appendErr)
+			}
+			if _, openErr := OpenReplicatedRetirementSummary(encoded); openErr != nil {
+				panic(openErr)
+			}
+		}); got != 0 {
+			t.Fatalf("summary=%+v allocations=%v", summary, got)
+		}
+	}
+	for name, raw := range map[string][]byte{
+		"truncated":       make([]byte, ReplicatedRetirementSummaryBytes-1),
+		"trailing":        make([]byte, ReplicatedRetirementSummaryBytes+1),
+		"unknown-flag":    {2, 0, 0, 0, 0, 0, 0, 0, 0},
+		"invalid-nonzero": {0, 1, 0, 0, 0, 0, 0, 0, 0},
+		"negative":        {1, 0, 0, 0, 0, 0, 0, 0, 0x80},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := OpenReplicatedRetirementSummary(raw); err == nil {
+				t.Fatal("malformed retirement summary accepted")
+			}
+		})
+	}
+	for _, summary := range []ReplicatedRetirementSummary{
+		{AffectedRows: -1, AffectedRowsValid: true},
+		{AffectedRows: 1},
+	} {
+		if _, err := AppendReplicatedRetirementSummary(nil, summary); err == nil {
+			t.Fatalf("invalid summary %+v appended", summary)
+		}
+	}
+}
+
+func TestReplicatedRetireCoordinatorRequiresRetirementSummary(t *testing.T) {
+	payload, err := AppendReplicatedRetirementSummary(nil, ReplicatedRetirementSummary{
+		AffectedRows: 7, AffectedRowsValid: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedRetireCoordinator,
+		ID: testID(), ExpectedRevision: 2,
+		PayloadKind: ReplicatedPayloadRetirement, Payload: payload,
+	}
+	encoded, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenReplicatedCommand(encoded)
+	if err != nil || view.PayloadKind != ReplicatedPayloadRetirement ||
+		!bytes.Equal(view.Payload, payload) {
+		t.Fatalf("retire=%+v err=%v", view.ReplicatedCommand, err)
+	}
+	command.PayloadKind, command.Payload = ReplicatedPayloadNone, nil
+	if _, err := AppendReplicatedCommand(nil, command); err == nil {
+		t.Fatal("retire without retirement summary accepted")
 	}
 }

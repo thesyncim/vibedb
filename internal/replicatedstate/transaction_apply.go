@@ -87,7 +87,9 @@ func (m *Machine) planTransactionCommand(
 	creation := control.Operation == distributedtxn.ReplicatedStageCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageManifestCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageParticipant ||
-		control.Operation == distributedtxn.ReplicatedStagePrepareParticipant
+		control.Operation == distributedtxn.ReplicatedStagePrepareParticipant ||
+		control.Operation == distributedtxn.ReplicatedAbortReleaseParticipant &&
+			control.ExpectedRevision == 0
 	if creation != !found {
 		plan.command.resultCode = ResultTransactionConflict
 		plan.command.conflict = true
@@ -143,12 +145,21 @@ func (m *Machine) planTransactionCommand(
 			plan, command, control, applied, commandDigest, storageKey,
 			systemSnapshot, relationSnapshots,
 		)
+	case distributedtxn.ReplicatedAbortReleaseParticipant:
+		if control.ExpectedRevision == 0 {
+			return m.planParticipantAbortFence(
+				plan, control, applied, commandDigest, storageKey,
+			)
+		}
+		return m.planParticipantTransition(
+			plan, command, control, existing.TransactionControl, applied,
+			commandDigest, storageKey, systemSnapshot, relationSnapshots,
+		)
 	case distributedtxn.ReplicatedPrepareParticipant,
 		distributedtxn.ReplicatedApplyParticipant,
 		distributedtxn.ReplicatedAbortParticipant,
 		distributedtxn.ReplicatedReleaseParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant:
+		distributedtxn.ReplicatedApplyReleaseParticipant:
 		return m.planParticipantTransition(
 			plan, command, control, existing.TransactionControl, applied,
 			commandDigest, storageKey, systemSnapshot, relationSnapshots,
@@ -156,6 +167,47 @@ func (m *Machine) planTransactionCommand(
 	default:
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
+}
+
+func (m *Machine) planParticipantAbortFence(
+	plan transactionCommandPlan,
+	control distributedtxn.ReplicatedCommand,
+	applied uint64,
+	commandDigest replication.Digest,
+	controlKey [transactionControlStorageKeyBytes]byte,
+) (transactionCommandPlan, error) {
+	controlBytes, err := TransactionControlResidentBytes(0)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	durableControl := TransactionControl{
+		ID: control.ID, Role: distributedtxn.ReplicatedRoleParticipant,
+		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		PayloadKind:      control.PayloadKind,
+		PayloadDigest:    control.Participant.MutationDigest,
+		CoordinatorGroup: replication.ID128(control.Participant.CoordinatorGroup),
+		CoordinatorShardIncarnation: replication.ID128(
+			control.Participant.CoordinatorShardIncarnation,
+		),
+		CoordinatorAllocation: control.Participant.CoordinatorAllocation,
+		MutationDigest:        control.Participant.MutationDigest,
+		ParticipantOrdinal:    control.Participant.ParticipantOrdinal,
+		FusedPath:             true, CancellationWitness: true,
+		ResidentControlBytes: controlBytes,
+		LastOperation:        control.Operation,
+		LastExpectedRevision: 0,
+		LastCommandDigest:    commandDigest,
+		LastResultCode:       ResultApplied,
+		LastAppliedIndex:     applied,
+	}
+	encoded, err := AppendTransactionControl(nil, durableControl)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	plan.rows = append(plan.rows, newTransactionPut(controlKey[:], encoded))
+	plan.delta = transactionStateDelta{controls: 1, residentByte: int64(controlBytes)}
+	plan.command.resultCode = ResultApplied
+	return plan, nil
 }
 
 func transactionControlAt(
@@ -192,6 +244,16 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		control.Participant.CoordinatorAllocation != command.AllocationGeneration {
 		plan.command.resultCode = ResultStaleFence
 		return plan, nil
+	}
+	if err := distributedtxn.ValidateReplicatedCoordinatorAuthorityWitnesses(
+		control.Payload,
+	); err != nil {
+		plan.command.refusal = ErrAdmissionBound
+		return plan, nil
+	}
+	authorityWitness := m.transactionRouteAuthorityWitness(command)
+	if authorityWitness == (distributedtxn.AuthorityWitness{}) {
+		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
 	coordinatorKey, _ := TransactionControlStorageKey(
 		distributedtxn.ReplicatedRoleCoordinator, control.ID,
@@ -232,6 +294,7 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		RoutingVersion:       command.RoutingVersion,
 		AllocationGeneration: command.AllocationGeneration,
 		OwnershipEpoch:       command.OwnershipEpoch,
+		AuthorityWitness:     authorityWitness,
 		MutationDigest:       control.Participant.MutationDigest,
 		State:                distributedtxn.ParticipantStaged,
 	}
@@ -498,6 +561,7 @@ func (m *Machine) planManifestPageStage(
 			RoutingVersion:       command.RoutingVersion,
 			AllocationGeneration: command.AllocationGeneration,
 			OwnershipEpoch:       command.OwnershipEpoch,
+			AuthorityWitness:     m.transactionRouteAuthorityWitness(command),
 			MutationDigest:       participant.MutationDigest,
 			State:                distributedtxn.ParticipantStaged,
 		}
@@ -568,6 +632,10 @@ func (m *Machine) planManifestSegmentsStage(
 		segments.EncodedBytes() > existing.PayloadBytes-existing.ManifestEncodedBytes {
 		return transactionConflict(plan), nil
 	}
+	if err = segments.ValidateAuthorityWitnesses(); err != nil {
+		plan.command.refusal = ErrAdmissionBound
+		return plan, nil
+	}
 	descriptor, descriptorErr := transactionManifestDescriptorAt(snapshot, control.ID)
 	if descriptorErr != nil {
 		return transactionCommandPlan{}, descriptorErr
@@ -616,6 +684,7 @@ func (m *Machine) planManifestSegmentsStage(
 				RoutingVersion:       command.RoutingVersion,
 				AllocationGeneration: command.AllocationGeneration,
 				OwnershipEpoch:       command.OwnershipEpoch,
+				AuthorityWitness:     m.transactionRouteAuthorityWitness(command),
 				MutationDigest:       participant.MutationDigest,
 				State:                distributedtxn.ParticipantStaged,
 			}
@@ -658,6 +727,26 @@ func (m *Machine) planManifestSegmentsStage(
 	plan.delta.residentByte = int64(resident)
 	plan.command.resultCode = ResultApplied
 	return plan, nil
+}
+
+func (m *Machine) transactionRouteAuthorityWitness(
+	command replication.CommandView,
+) distributedtxn.AuthorityWitness {
+	digest := replication.RouteAuthorityDigest(replication.RouteAuthority{
+		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
+		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
+		ShardIncarnation:      command.ShardIncarnation, GroupID: command.GroupID,
+		AllocationGeneration:   command.AllocationGeneration,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch, OwnershipEpoch: command.OwnershipEpoch,
+		SchemaGeneration:       command.SchemaGeneration,
+		RelationManifestDigest: replication.Digest(m.manifestDigest),
+		RoutingVersion:         command.RoutingVersion, RouteGeneration: command.RouteGeneration,
+	})
+	var witness distributedtxn.AuthorityWitness
+	copy(witness[:], digest[:len(witness)])
+	return witness
 }
 
 func transactionManifestDescriptorAt(
@@ -766,6 +855,17 @@ func (m *Machine) planCoordinatorTransition(
 		existing.CoordinatorDecision = next
 	}
 	if next == distributedtxn.CoordinatorRetired {
+		summary, err := distributedtxn.OpenReplicatedRetirementSummary(control.Payload)
+		if err != nil {
+			return transactionCommandPlan{}, errors.Join(err, ErrTransactionStateCorrupt)
+		}
+		committed := state == distributedtxn.CoordinatorCommitted
+		if summary.AffectedRowsValid != committed ||
+			!committed && summary.AffectedRows != 0 {
+			return transactionConflict(plan), nil
+		}
+		existing.AffectedRows = summary.AffectedRows
+		existing.AffectedRowsValid = summary.AffectedRowsValid
 		payloadKey, _ := TransactionCoordinatorPayloadStorageKey(control.ID)
 		plan.rows = append(
 			plan.rows, newTransactionDelete(payloadKey[:]),

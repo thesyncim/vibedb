@@ -74,8 +74,13 @@ type TransactionRecoveryRecord struct {
 	CoordinatorAllocation       uint64
 	MutationDigest              distributedtxn.Digest
 
-	AffectedRows        int64
-	AffectedRowsValid   bool
+	AffectedRows      int64
+	AffectedRowsValid bool
+	// CancellationWitness and ParticipantOrdinal expose the exact compact
+	// abort fence. The ordinal is meaningful only when CancellationWitness is
+	// true; ordinary participant summaries retain affected-row semantics.
+	CancellationWitness bool
+	ParticipantOrdinal  uint32
 	CoordinatorDecision distributedtxn.CoordinatorState
 	ManifestPage        uint32
 	Payload             []byte
@@ -549,6 +554,8 @@ func transactionRecoveryRecord(control TransactionControl) TransactionRecoveryRe
 		CoordinatorAllocation:       control.CoordinatorAllocation,
 		MutationDigest:              control.MutationDigest,
 		AffectedRows:                control.AffectedRows, AffectedRowsValid: control.AffectedRowsValid,
+		CancellationWitness: control.CancellationWitness,
+		ParticipantOrdinal:  control.ParticipantOrdinal,
 		CoordinatorDecision: control.CoordinatorDecision,
 	}
 }

@@ -18,12 +18,12 @@ const (
 	ManifestSegmentBytes = 64 << 10
 
 	// MaxManifestBytes is a resource-byte admission bound, not a participant
-	// count bound. At the minimum canonical entry size it admits more than one
-	// million participants.
+	// count bound. Capacity is derived solely from exact encoded bytes and can
+	// be raised independently without changing the participant grammar.
 	MaxManifestBytes = 64 << 20
 
 	manifestSegmentHeaderBytes     = 32
-	manifestEntryFixedBytes        = 64
+	manifestEntryFixedBytes        = 80
 	manifestCoordinatorHeaderBytes = 112
 	manifestDescriptorBytes        = 56
 
@@ -221,6 +221,7 @@ func (b *ManifestBuilder) appendEntry(participant ParticipantRef, entryBytes int
 	binary.LittleEndian.PutUint64(out[16:24], participant.AllocationGeneration)
 	binary.LittleEndian.PutUint64(out[24:32], participant.OwnershipEpoch)
 	copy(out[32:64], participant.MutationDigest[:])
+	copy(out[64:80], participant.AuthorityWitness[:])
 	cursor := manifestEntryFixedBytes
 	copy(out[cursor:], distSuffix)
 	cursor += len(distSuffix)
@@ -427,6 +428,7 @@ func openManifestSegment(
 		p.AllocationGeneration = binary.LittleEndian.Uint64(entry[16:24])
 		p.OwnershipEpoch = binary.LittleEndian.Uint64(entry[24:32])
 		copy(p.MutationDigest[:], entry[32:64])
+		copy(p.AuthorityWitness[:], entry[64:80])
 		distLen := distPrefix + distSuffix
 		shardLen := shardPrefix + shardSuffix
 		if len(identities)-identityCursor < distLen+shardLen {
@@ -569,6 +571,7 @@ func equalParticipantRef(a, b ParticipantRef) bool {
 		a.RoutingVersion == b.RoutingVersion &&
 		a.AllocationGeneration == b.AllocationGeneration &&
 		a.OwnershipEpoch == b.OwnershipEpoch &&
+		a.AuthorityWitness == b.AuthorityWitness &&
 		a.MutationDigest == b.MutationDigest && a.State == b.State
 }
 

@@ -37,6 +37,14 @@ var (
 type ID [16]byte
 type Digest [32]byte
 
+// AuthorityWitness is the compact 128-bit prefix of the full canonical route
+// authority digest. It provides 128-bit preimage strength, matching VibeDB's
+// shard, group, and transaction identifiers, while avoiding a second full
+// digest in every wide-manifest participant.
+// Zero is reserved for the static non-RF3 path, whose complete authority is
+// already present in the participant record itself.
+type AuthorityWitness [16]byte
+
 // IntentScope is one half-open virtual-bucket interval [Start, End). Scopes in
 // a participant are sorted, disjoint, and coalesced before encoding.
 type IntentScope struct {
@@ -174,6 +182,7 @@ type ParticipantRef struct {
 	RoutingVersion       uint64
 	AllocationGeneration uint64
 	OwnershipEpoch       uint64
+	AuthorityWitness     AuthorityWitness
 	MutationDigest       Digest
 	State                ParticipantState
 }
@@ -188,8 +197,11 @@ type CoordinatorRecord struct {
 }
 
 // Coordinator record layout: 48-byte fixed header, packed participant entries,
-// and a CRC32C. Each entry costs 50 bytes plus the shard identity.
-const coordinatorHeaderBytes = 48
+// and a CRC32C. Each participant has a 76-byte fixed identity and digest frame.
+const (
+	coordinatorHeaderBytes = 48
+	coordinatorEntryBytes  = 76
+)
 
 func AppendCoordinator(dst []byte, record CoordinatorRecord) ([]byte, error) {
 	if err := validateCoordinator(record); err != nil {
@@ -197,7 +209,7 @@ func AppendCoordinator(dst []byte, record CoordinatorRecord) ([]byte, error) {
 	}
 	total := coordinatorHeaderBytes + 4
 	for i := range record.Participants {
-		total += 60 + len(record.Participants[i].Distribution) + len(record.Participants[i].Shard)
+		total += coordinatorEntryBytes + len(record.Participants[i].Distribution) + len(record.Participants[i].Shard)
 	}
 	if total > MaxCoordinatorRecordBytes {
 		return dst, ErrTooLarge
@@ -223,7 +235,8 @@ func AppendCoordinator(dst []byte, record CoordinatorRecord) ([]byte, error) {
 		binary.LittleEndian.PutUint64(out[cursor+12:cursor+20], p.OwnershipEpoch)
 		binary.LittleEndian.PutUint64(out[cursor+20:cursor+28], p.RoutingVersion)
 		copy(out[cursor+28:cursor+60], p.MutationDigest[:])
-		cursor += 60
+		copy(out[cursor+60:cursor+76], p.AuthorityWitness[:])
+		cursor += coordinatorEntryBytes
 		copy(out[cursor:cursor+len(p.Distribution)], p.Distribution)
 		cursor += len(p.Distribution)
 		copy(out[cursor:cursor+len(p.Shard)], p.Shard)
@@ -269,7 +282,7 @@ func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (Coordinator
 	copy(record.ID[:], src[32:48])
 	cursor, end := coordinatorHeaderBytes, len(src)-4
 	for i := 0; i < count; i++ {
-		if end-cursor < 60 {
+		if end-cursor < coordinatorEntryBytes {
 			return CoordinatorRecord{}, ErrCorrupt
 		}
 		distributionLength := int(src[cursor])
@@ -280,7 +293,8 @@ func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (Coordinator
 		p.OwnershipEpoch = binary.LittleEndian.Uint64(src[cursor+12 : cursor+20])
 		p.RoutingVersion = binary.LittleEndian.Uint64(src[cursor+20 : cursor+28])
 		copy(p.MutationDigest[:], src[cursor+28:cursor+60])
-		cursor += 60
+		copy(p.AuthorityWitness[:], src[cursor+60:cursor+76])
+		cursor += coordinatorEntryBytes
 		if distributionLength == 0 || shardLength == 0 ||
 			end-cursor < distributionLength+shardLength {
 			return CoordinatorRecord{}, ErrCorrupt

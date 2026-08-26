@@ -460,6 +460,35 @@ func CommandSize(command Command) (int, error) {
 	return measureCommand(command)
 }
 
+// TransactionCommandSize returns the exact final outer envelope size before
+// the canonical transaction control body has been encoded. command.Transaction
+// must be empty and transactionBytes is the exact future control-body length.
+//
+// This is a size-only admission preflight: it validates every outer identity,
+// generation, client tuple, lease field, relation batch, and mutation, but it
+// cannot parse or cross-bind the absent control body. Fingerprint may therefore
+// be zero because the native fingerprint binds those future bytes. CommandSize
+// and AppendCommand remain the final strict semantic authority after control
+// encoding and fingerprint construction.
+func TransactionCommandSize(command Command, transactionBytes int) (int, error) {
+	if command.Kind != CommandTransaction || len(command.Transaction) != 0 ||
+		transactionBytes <= 0 {
+		return 0, semantic("transaction command size preflight")
+	}
+	if transactionBytes > distributedtxn.MaxReplicatedCommandBytes {
+		return 0, ErrEnvelopeTooLarge
+	}
+	if len(command.Batches) != 0 {
+		if err := validateRelationBatches(command.Batches); err != nil {
+			return 0, err
+		}
+	}
+	if err := validateCommandEnvelopeMetadata(command, false); err != nil {
+		return 0, err
+	}
+	return measureValidatedCommand(command, transactionBytes)
+}
+
 func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 	region := writableAppendRegion(dst, total)
 	if len(region) == 0 {
@@ -512,6 +541,10 @@ func measureCommand(command Command) (int, error) {
 	if err := validateCommandHeader(command); err != nil {
 		return 0, err
 	}
+	return measureValidatedCommand(command, len(command.Transaction))
+}
+
+func measureValidatedCommand(command Command, transactionBytes int) (int, error) {
 	total := uint64(commandHeaderBytes + envelopeChecksumBytes)
 	for _, size := range [...]int{
 		len(command.Tenant), len(command.Distribution),
@@ -533,7 +566,7 @@ func measureCommand(command Command) (int, error) {
 	if command.Kind == CommandTransaction {
 		var ok bool
 		total, ok = checkedAdd(
-			total, uint64(transactionLengthBytes+len(command.Transaction)), MaxCommandBytes,
+			total, uint64(transactionLengthBytes+transactionBytes), MaxCommandBytes,
 		)
 		if !ok {
 			return 0, ErrEnvelopeTooLarge
@@ -614,6 +647,10 @@ func validateCommandHeader(command Command) error {
 	default:
 		return semantic("unknown command kind")
 	}
+	return validateCommandEnvelopeMetadata(command, true)
+}
+
+func validateCommandEnvelopeMetadata(command Command, requireFingerprint bool) error {
 	if !nonzero128(command.ClusterID) || !nonzero128(command.ClusterIncarnation) ||
 		!nonzero128(command.ShardIncarnation) || !nonzero128(command.GroupID) ||
 		!nonzero128(command.ClientID) {
@@ -636,7 +673,7 @@ func validateCommandHeader(command Command) error {
 	); err != nil {
 		return err
 	}
-	if !nonzeroDigest(command.Fingerprint) {
+	if requireFingerprint && !nonzeroDigest(command.Fingerprint) {
 		return semantic("command contains a zero request fingerprint")
 	}
 	if len(command.Tenant) == 0 || len(command.Tenant) > MaxIdentityBytes {

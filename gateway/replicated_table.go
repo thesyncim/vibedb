@@ -2,8 +2,6 @@ package gateway
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"slices"
@@ -313,26 +311,8 @@ func (snapshot *Snapshot) ResolveReplicatedTableKey(
 	}, true
 }
 
-var replicatedRouteIDDomain = []byte("vibedb/gateway/replicated-route-id\x00")
-
 func replicatedRouteID(route ReplicatedRoute) replication.Digest {
-	var storage [256]byte
-	value := append(storage[:0], replicatedRouteIDDomain...)
-	value = append(value, route.Group.ClusterID[:]...)
-	value = append(value, route.Group.ClusterIncarnation[:]...)
-	value = binary.LittleEndian.AppendUint64(value, route.Group.TopologyRecoveryEpoch)
-	value = append(value, route.Group.ShardIncarnation[:]...)
-	value = append(value, route.Group.GroupID[:]...)
-	value = binary.LittleEndian.AppendUint64(value, route.AllocationGeneration)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.ReplicaSetVersion)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.ActivePolicyGeneration)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.ProtectionEpoch)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.OwnershipEpoch)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.SchemaGeneration)
-	value = append(value, route.Command.RelationManifestDigest[:]...)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.RoutingVersion)
-	value = binary.LittleEndian.AppendUint64(value, route.Command.RouteGeneration)
-	return replication.Digest(sha256.Sum256(value))
+	return replicatedRouteAuthorityDigest(route)
 }
 
 // ReplicatedTableMetadataBytes reports only the compact table directory. Table

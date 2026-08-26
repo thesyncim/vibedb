@@ -114,18 +114,18 @@ var Distributed = []Feature{
 		}},
 	},
 	{
-		Name: "Fused RF3 transaction execution",
+		Name: "Fused multi-shard RF3 transaction orchestration",
 		Primitive: Stage{StatusYes, "Fresh replicated operations atomically combine coordinator begin with its local prepare, remote stage with prepare, and participant apply or abort with release. Inline and greedily packed manifests remain byte-bounded without a participant-count contract.", []Reference{
 			ref("internal/distributedtxn/replicated_codec.go", "ReplicatedOperation"), ref("internal/replicatedstate/transaction_apply.go", "planCoordinatorBeginPrepare"),
 		}},
-		Integrated: Stage{StatusYes, "The replicated command envelope binds native relation batches, exact participant routes, immutable prepare votes, lineage, retries, manifest boundaries, and base-plus-index apply into the same deterministic state transition.", []Reference{
-			ref("internal/replication/command.go", "TransactionClientSequence"), ref("internal/replicatedstate/transaction_completion.go", "transactionHistoricalRetryExact"),
+		Integrated: Stage{StatusYes, "The public RF3 gateway orchestrator now drives fused commands across independently led groups through the leader-aware executor, retains exact outcome-unknown bytes, and recovers from replicated ReadIndex witnesses without consulting the legacy journal.", []Reference{
+			ref("gateway/replicated_transaction.go", "NewReplicatedTransactionOrchestrator"), ref("gateway/replicated_transaction_recover.go", "Recover"),
 		}},
-		Shipped: Stage{StatusNo, "The shipped gateway still uses the static transaction orchestrator. The fused operations are intentionally not selected until the RF3 writer and recovery controller can switch authority together without a legacy-journal fallback.", []Reference{
+		Shipped: Stage{StatusNo, "No shipped SQL, native-client, or CLI command constructs the RF3 transaction orchestrator. The shipped gateway still uses the static transaction authority; serve-rf3 supplies prepared groups and recovery reads but does not expose multi-shard transaction execution.", []Reference{
 			ref("gateway/transaction.go", "executeTransaction"), ref("gateway/recovery.go", "RecoverAll"),
 		}},
-		Qualification: Stage{StatusPartial, "State-machine tests prove atomic begin/prepare, vote-no, deferred manifest binding, base-plus-global-index finish, reclamation, and historical retries. Encoded schedules prove 2P+1 response-critical proposals for 2, 65, and 4097 participants. A real two-group RF3 fault gate is the next safe point.", []Reference{
-			ref("internal/replicatedstate/transaction_apply_integration_test.go", "TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire"), ref("internal/replication/transaction_perf_contract_test.go", "TestReplicatedTransactionEncodedSchedulePerformanceTargets"),
+		Qualification: Stage{StatusPartial, "State-machine and schedule gates cover atomic transitions, reclamation, exact retries, and a 2P+1 decision/apply proposal schedule without a participant-count contract. The normal success path adds one retirement proposal and trusts the P route-fenced applied completions instead of issuing a redundant P-wide ReadIndex wave; recovery and ambiguous cleanup still prove terminal state with leader ReadIndex. A real two-group RF3 gate drives the public orchestrator across different leaders and proves hidden-commit recovery after source isolation, byte-identical retry, replica convergence, correct group routing, and former-leader refusal. Shipped-command, external-process, exhaustive crash-cut, and sustained performance gates remain absent.", []Reference{
+			ref("internal/replication/transaction_perf_contract_test.go", "TestReplicatedTransactionEncodedSchedulePerformanceTargets"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolation"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwoGroups"),
 		}},
 	},
 	{
@@ -133,14 +133,14 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "A closed hidden-state reader provides exact coordinator and participant lookup, paged manifest access, and bounded resumable active-coordinator scans without a participant-count contract.", []Reference{
 			ref("internal/replicatedstate/transaction_recovery_read.go", "TransactionRecoveryReadInto"), ref("internal/replicatedstate/transaction_recovery_read.go", "TransactionRecoveryReadRequest"),
 		}},
-		Integrated: Stage{StatusYes, "The dedicated transaction-recovery capability, leader-only ReadIndex path, native shard protocol, and leader-aware gateway executor share exact byte, row, applied-index, and serving-fence bounds.", []Reference{
-			ref("internal/raftservice/owner.go", "ReadTransaction"), ref("gateway/replicated_transaction_recovery.go", "ReadTransactionRecovery"),
+		Integrated: Stage{StatusYes, "The dedicated transaction-recovery capability, leader-only ReadIndex path, native shard protocol, and leader-aware gateway executor share exact byte, row, applied-index, and serving-fence bounds. The RF3 transaction orchestrator consumes those reads for coordinator, manifest, participant, and terminal proofs.", []Reference{
+			ref("gateway/replicated_transaction_recovery.go", "ReadTransactionRecovery"), ref("gateway/replicated_transaction_recover.go", "Recover"),
 		}},
-		Shipped: Stage{StatusPartial, "vibedb-shard serve-rf3 installs and serves the authenticated recovery reader. The gateway executor can consume it, but the periodic gateway recovery controller still uses the static transaction authority and is not redirected piecemeal.", []Reference{
+		Shipped: Stage{StatusPartial, "vibedb-shard serve-rf3 installs and serves the authenticated recovery reader. The shipped gateway command does not construct the RF3 transaction orchestrator or redirect its periodic static recovery controller.", []Reference{
 			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("gateway/recovery.go", "RecoverAll"),
 		}},
-		Qualification: Stage{StatusPartial, "Real RF3 tests prove leader-only recovery, replacement-leader continuity, and isolated-former-leader refusal. The complete RF3 transaction writer and recovery controller are not yet qualified end to end.", []Reference{
-			ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement"), ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3IsolatedLeaderCannotCompleteTransactionRecoveryRead"),
+		Qualification: Stage{StatusPartial, "Real RF3 tests prove leader-only recovery, replacement-leader continuity, and isolated-former-leader refusal. A two-group gate additionally proves the public orchestrator recovering a hidden committed result through exact retry and recovery reads on both groups. External process restarts, abort recovery, and the shipped periodic controller remain unqualified.", []Reference{
+			ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwoGroups"),
 		}},
 	},
 	{
