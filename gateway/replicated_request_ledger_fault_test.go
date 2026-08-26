@@ -1240,7 +1240,7 @@ func durableFaultTopology(
 func newDurableFaultExecutor(
 	t *testing.T,
 	topology *DurableRequestLedgerTopologyHolder,
-	ledger DurableRequestLedger,
+	ledger durableRequestCoarseLedger,
 	runner DurableRequestRunner,
 ) *DurableRequestExecutor {
 	t.Helper()

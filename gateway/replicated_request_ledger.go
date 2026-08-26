@@ -291,10 +291,11 @@ type DurableRequestLedgerEntry struct {
 	Generation                uint64
 }
 
-// DurableRequestLedger is an injectable replicated lifecycle boundary. Every
-// mutator is a revision CAS and must return the resulting durable state. A
-// caller may safely repeat byte-identical requests after response loss.
-type DurableRequestLedger interface {
+// durableRequestCoarseLedger is the pre-fence executor seam retained only
+// while DurableRequestExecutor is migrated to the exact lifecycle below. It
+// cannot represent physical route-pin or logical execution-pin cuts and must
+// not be used by new shipped integrations.
+type durableRequestCoarseLedger interface {
 	Lookup(context.Context, DurableRequestLedgerHome, DurableRequestLedgerKey) (DurableRequestLedgerEntry, error)
 	// CreatePlanning begins a paged recipe. CreateSealed is the one-proposal
 	// inline fast path. A successful response from either is an authenticated
@@ -478,14 +479,14 @@ func durableRequestAckTokenDigest(token DurableRequestAckToken) replication.Dige
 
 type DurableRequestExecutorOptions struct {
 	Topology       *DurableRequestLedgerTopologyHolder
-	Ledger         DurableRequestLedger
+	Ledger         durableRequestCoarseLedger
 	Runner         DurableRequestRunner
 	LocalPrincipal rafttransport.NodeID
 }
 
 type DurableRequestExecutor struct {
 	topology       *DurableRequestLedgerTopologyHolder
-	ledger         DurableRequestLedger
+	ledger         durableRequestCoarseLedger
 	runner         DurableRequestRunner
 	localPrincipal rafttransport.NodeID
 }
