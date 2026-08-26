@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/schemainstall"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -44,7 +45,7 @@ var (
 // by this binary. A mixed rolling fleet fails prepare instead of guessing that
 // two builds interpret a relation bundle the same way.
 func SchemaRolloutContractDigest() [32]byte {
-	return sha256.Sum256(schemaRolloutContractDomain[:])
+	return schemainstall.ContractDigest()
 }
 
 // SchemaRolloutPreparedGroup is the install receipt supplied by one RF3 shard
