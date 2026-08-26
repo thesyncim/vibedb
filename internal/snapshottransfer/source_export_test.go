@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -181,6 +182,7 @@ func sourceExportFixture(t testing.TB, limits Limits) (
 		ShardIncarnation: id(5), GroupID: id(6), ActivePolicyGeneration: 7,
 		ProtectionEpoch: 8, OwnershipEpoch: 9, SchemaGeneration: 10,
 		RoutingVersion: 11, RouteGeneration: 12,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 	}
 	index, term := uint64(1), uint64(1)
 	conf := &pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -56,7 +57,7 @@ func TestRepositoryAuthenticatesRealReplicatedStateArtifact(t *testing.T) {
 		}
 		return
 	}
-	binding := replicatedstate.Binding{ClusterID: id(1), ClusterIncarnation: id(2), TopologyRecoveryEpoch: 3, Distribution: "d", Shard: "s", AllocationGeneration: 4, ShardIncarnation: id(5), GroupID: id(6), ActivePolicyGeneration: 7, ProtectionEpoch: 8, OwnershipEpoch: 9, SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12}
+	binding := replicatedstate.Binding{ClusterID: id(1), ClusterIncarnation: id(2), TopologyRecoveryEpoch: 3, Distribution: "d", Shard: "s", AllocationGeneration: 4, ShardIncarnation: id(5), GroupID: id(6), ActivePolicyGeneration: 7, ProtectionEpoch: 8, OwnershipEpoch: 9, SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12, OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
 	index, term := uint64(1), uint64(1)
 	bootstrap := &pb.Snapshot{Data: []byte("bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}
 	machine, err := replicatedstate.Open(binding, bootstrap, system, replicatedstate.UserCollection{Name: "docs", Target: user}, log, replicatedstate.Options{TxnLimits: durable.TxnLimits{MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 4, MaxBytes: 64 << 20}, MaxSessions: 8, RetryWindow: 4})
