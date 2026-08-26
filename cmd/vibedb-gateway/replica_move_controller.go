@@ -1,0 +1,83 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/rebalance"
+	"github.com/thesyncim/vibedb/internal/rebalanceexec"
+)
+
+// gatewayReplicaMoveControls names only shard-control capabilities which do
+// not yet have shipped clients. The catalog journal, membership proposal path,
+// catalog publication, and local catalog drain are concrete gateway services
+// and are deliberately not replaceable here.
+type gatewayReplicaMoveControls struct {
+	Observer   rebalance.ReplicatedMoveObserver
+	Routes     rebalanceexec.MoveRouteResolver
+	Snapshots  rebalanceexec.SnapshotSource
+	Bootstrap  rebalanceexec.SnapshotBootstrapClient
+	Awaiter    rebalanceexec.MoveAwaiter
+	Ownership  rebalanceexec.OwnershipProposer
+	Retirement rebalanceexec.SourceRetirer
+}
+
+func newGatewayReplicaMoveController(
+	authority *gateway.ReplicatedCatalogAuthority,
+	holder *gateway.CatalogHolder,
+	replicated *gateway.ReplicatedExecutor,
+	controls gatewayReplicaMoveControls,
+) (*rebalanceexec.Controller, error) {
+	if authority == nil || holder == nil || replicated == nil ||
+		controls.Observer == nil {
+		return nil, rebalanceexec.ErrControllerConfig
+	}
+	executor, err := rebalanceexec.New(rebalanceexec.Options{
+		Routes: controls.Routes, Grants: authority, Membership: replicated,
+		Snapshots: controls.Snapshots, Bootstrap: controls.Bootstrap,
+		Awaiter: controls.Awaiter, Ownership: controls.Ownership,
+		Catalog: authority, Drainer: holder, Retirer: controls.Retirement,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rebalanceexec.NewController(authority, authority, controls.Observer, executor)
+}
+
+type replicaMovePassRunner interface {
+	RunPass(context.Context) (rebalanceexec.ControllerPass, error)
+}
+
+// runReplicaMoveController is the shipped gateway scheduling loop. It owns no
+// queue and performs no speculative retries: each pass reopens the RF3 catalog
+// directory, then advances each move through one journaled evidence boundary.
+func runReplicaMoveController(
+	ctx context.Context,
+	controller replicaMovePassRunner,
+	interval time.Duration,
+	logf func(string, ...any),
+) {
+	if ctx == nil || controller == nil || interval <= 0 || logf == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		pass, err := controller.RunPass(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logf("gateway: replica move controller: %v", err)
+		} else if pass.Advanced != 0 || pass.Completed != 0 {
+			logf(
+				"gateway: replica move controller advanced %d/%d move(s), completed %d",
+				pass.Advanced, pass.Moves, pass.Completed,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
