@@ -21,6 +21,10 @@ var (
 	ErrSourceOutcomeUnknown = errors.New("snapshottransfer: source export outcome is unknown")
 )
 
+// SourceControlRequestDiscriminator identifies this fixed grammar on the
+// shared authenticated shard-control listener.
+func SourceControlRequestDiscriminator() [8]byte { return sourceRequestMagic }
+
 const (
 	SourceControlRequestBytes    = 216
 	SourceControlResponseBytes   = 336

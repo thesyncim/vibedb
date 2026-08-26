@@ -18,6 +18,10 @@ var (
 	ErrMembershipGrantOutcomeUnknown = errors.New("shardservice: membership grant outcome is unknown")
 )
 
+// MembershipGrantRequestDiscriminator identifies this fixed grammar on the
+// shared authenticated shard-control listener.
+func MembershipGrantRequestDiscriminator() [8]byte { return membershipGrantRequestMagic }
+
 const (
 	MembershipGrantRequestBytes  = 8 + membershipgrant.CanonicalGrantBytes
 	MembershipGrantResponseBytes = 8 + 32

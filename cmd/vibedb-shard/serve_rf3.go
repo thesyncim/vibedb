@@ -21,9 +21,13 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
+	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/shardcontrol"
+	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -172,7 +176,7 @@ func servePreparedRF3WithListen(
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
 	}
 	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
-	controlService, err := shardservice.NewMembershipGrantControlService(
+	membershipControl, err := shardservice.NewMembershipGrantControlService(
 		transportRegistry, policy, deadline, deadline,
 	)
 	if err != nil {
@@ -268,6 +272,27 @@ func servePreparedRF3WithListen(
 	if err != nil {
 		return errors.Join(err, host.Close(), servingRegistry.Close())
 	}
+	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
+		Observer: peer.Owner(),
+		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
+			return request.Group == group &&
+				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
+	})
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	controlMux, err := newRF3ControlMux(membershipControl, observationControl, nil, nil)
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
 	var server *shardservice.ReplicatedServer
 	if nativeAuthorized {
 		server, err = shardservice.NewReplicatedServer(peer.Owner(), 64<<20, rf3RequestTimeout)
@@ -312,7 +337,7 @@ func servePreparedRF3WithListen(
 		controlDone <- controlTLS.Serve(controlCtx, controlListener, servicetls.Limits{
 			MaxConnections: 32, MaxHandshakes: 8, HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			_ = controlService.Serve(ctx, connection)
+			_ = controlMux.Serve(ctx, connection)
 		})
 	}()
 	var nativeDone chan error
@@ -363,6 +388,39 @@ func servePreparedRF3WithListen(
 	}
 	<-pulseDone
 	return finishRF3Serving(primary, host, servingRegistry)
+}
+
+// newRF3ControlMux is the stable composition boundary for all authenticated
+// shard-control operations. Snapshot source export and mutating replica
+// actions remain optional until their durable local journals are opened; when
+// supplied they share the same TLS listener and connection concurrency bound.
+func newRF3ControlMux(
+	membership, observation, source, action shardcontrol.Handler,
+) (*shardcontrol.Mux, error) {
+	routes := make([]shardcontrol.Route, 0, 4)
+	routes = append(routes,
+		shardcontrol.Route{
+			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
+			Handler:       membership,
+		},
+		shardcontrol.Route{
+			Discriminator: replicacontrol.RequestDiscriminator(),
+			Handler:       observation,
+		},
+	)
+	if source != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: snapshottransfer.SourceControlRequestDiscriminator(),
+			Handler:       source,
+		})
+	}
+	if action != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: replicaaction.RequestDiscriminator(),
+			Handler:       action,
+		})
+	}
+	return shardcontrol.New(routes...)
 }
 
 func loadRF3RetainedIdentities(manifest rf3Manifest) (

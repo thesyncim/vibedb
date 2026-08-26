@@ -29,6 +29,10 @@ var (
 	ErrBound        = errors.New("replicacontrol: observation bound exceeded")
 )
 
+// RequestDiscriminator identifies this fixed grammar on the shared
+// authenticated shard-control listener.
+func RequestDiscriminator() [8]byte { return requestMagic }
+
 const (
 	RequestBytes                   = 184
 	responseHeaderBytes            = 272

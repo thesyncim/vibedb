@@ -55,6 +55,20 @@ func TestRunServeRF3ArgumentExitClasses(t *testing.T) {
 	}
 }
 
+type rf3ControlTestHandler struct{}
+
+func (rf3ControlTestHandler) Serve(context.Context, rafttransport.PeerConnection) error { return nil }
+
+func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
+	handler := rf3ControlTestHandler{}
+	if mux, err := newRF3ControlMux(handler, handler, handler, handler); err != nil || mux == nil {
+		t.Fatalf("all-service mux = %v, %v", mux, err)
+	}
+	if _, err := newRF3ControlMux(nil, handler, nil, nil); err == nil {
+		t.Fatal("missing mandatory membership service accepted")
+	}
+}
+
 func TestValidateRF3Addresses(t *testing.T) {
 	valid := serveRF3TestManifest()
 	if err := validateRF3Addresses(valid); err != nil {
