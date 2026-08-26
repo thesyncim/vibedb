@@ -271,16 +271,18 @@ func (coordinator *ClusterCatalogDrainCoordinator) CertifyClusterCatalogDrain(
 	}
 	var accepting atomic.Bool
 	accepting.Store(true)
-	err = coordinator.collector.CollectClusterCatalogDrain(
-		ctx, fence,
-		func(peer rafttransport.PeerIdentity, ack ClusterCatalogDrainAck) error {
-			if !accepting.Load() {
-				return ErrClusterCatalogDrainAck
-			}
-			_, applyErr := machine.ApplyAuthenticated(peer, ack)
-			return applyErr
-		},
-	)
+	accept := func(peer rafttransport.PeerIdentity, ack ClusterCatalogDrainAck) error {
+		if !accepting.Load() {
+			return ErrClusterCatalogDrainAck
+		}
+		_, applyErr := machine.ApplyAuthenticated(peer, ack)
+		return applyErr
+	}
+	if requestCollector, ok := coordinator.collector.(ClusterCatalogDrainRequestCollector); ok {
+		err = requestCollector.CollectClusterCatalogDrainRequest(ctx, request, fence, accept)
+	} else {
+		err = coordinator.collector.CollectClusterCatalogDrain(ctx, fence, accept)
+	}
 	accepting.Store(false)
 	if err != nil {
 		return ClusterCatalogDrainCertificate{}, err
@@ -443,13 +445,9 @@ func (machine *ClusterCatalogDrainMachine) Certificate() ([sha256.Size]byte, boo
 	if machine.ackCount != uint32(len(machine.fence.members)) {
 		return [sha256.Size]byte{}, false
 	}
-	hash := sha256.New()
-	hash.Write([]byte("vibedb/catalog-drain/certificate\x00"))
-	hash.Write(machine.fence.digest[:])
-	hash.Write(machine.fence.rosterDigest[:])
-	var digest [sha256.Size]byte
-	hash.Sum(digest[:0])
-	return digest, true
+	return clusterCatalogDrainCertificateProof(
+		machine.fence.digest, machine.fence.rosterDigest,
+	), true
 }
 
 // AppendClusterCatalogDrainState serializes a crash-replay checkpoint. The

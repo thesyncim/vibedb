@@ -80,15 +80,21 @@ const (
 	// isolated from data, native proposal, and Raft streams so a certificate
 	// capability cannot be replayed across protocol boundaries.
 	TrafficShardControl TrafficClass = 6
+	// TrafficGatewayControl authenticates gateway-to-gateway topology fences.
+	// It is separate from public client and shard-control capabilities so a
+	// certificate admitted on either plane cannot manufacture catalog-drain
+	// evidence for a gateway incarnation.
+	TrafficGatewayControl TrafficClass = 7
 )
 
 const (
-	ordinaryALPN      = "vibedb-raft-ordinary"
-	snapshotALPN      = "vibedb-raft-snapshot"
-	shardNativeALPN   = "vibedb-shard-native"
-	gatewayClientALPN = "vibedb-gateway-client"
-	shardSQLALPN      = "vibedb-shard-sql"
-	shardControlALPN  = "vibedb-shard-control"
+	ordinaryALPN       = "vibedb-raft-ordinary"
+	snapshotALPN       = "vibedb-raft-snapshot"
+	shardNativeALPN    = "vibedb-shard-native"
+	gatewayClientALPN  = "vibedb-gateway-client"
+	shardSQLALPN       = "vibedb-shard-sql"
+	shardControlALPN   = "vibedb-shard-control"
+	gatewayControlALPN = "vibedb-gateway-control"
 )
 
 func (class TrafficClass) alpn() (string, error) {
@@ -105,6 +111,8 @@ func (class TrafficClass) alpn() (string, error) {
 		return shardSQLALPN, nil
 	case TrafficShardControl:
 		return shardControlALPN, nil
+	case TrafficGatewayControl:
+		return gatewayControlALPN, nil
 	default:
 		return "", ErrWrongTrafficClass
 	}
@@ -655,7 +663,7 @@ func (peerTLS *PeerTLS) handshake(
 func internalBuildPrefaceRequired(class TrafficClass) bool {
 	switch class {
 	case TrafficOrdinary, TrafficSnapshot,
-		TrafficShardNative, TrafficShardSQL, TrafficShardControl:
+		TrafficShardNative, TrafficShardSQL, TrafficShardControl, TrafficGatewayControl:
 		return true
 	default:
 		return false
