@@ -3,14 +3,17 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
 	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -58,6 +61,8 @@ type Machine struct {
 	txnLog                *durable.TxnLog
 	checkpointGroup       *durable.CheckpointGroup
 	options               Options
+	transactionIntents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
+	transactionIntentKeys []byte
 	applyCut              durable.DatabaseSnapshot
 	capture               TransitionCapture
 	captureTarget         TransitionCaptureTarget
@@ -235,8 +240,9 @@ func OpenBundle(
 	if !ok || systemSnapshot == nil {
 		return nil, fmt.Errorf("%w: missing system snapshot", ErrInconsistentSnapshot)
 	}
+	var openedTransactions scannedTransactions
 	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
-		systemSnapshot, options.MaxSessions, options.RetryWindow,
+		systemSnapshot, options.MaxSessions, options.RetryWindow, &openedTransactions,
 	)
 	if err != nil {
 		return nil, err
@@ -332,6 +338,8 @@ func OpenBundle(
 	m.shard = []byte(state.Binding.Shard)
 	m.initialized = true
 	m.publication = publicationFromState(state)
+	m.transactionIntents = openedTransactions.intents
+	m.transactionIntentKeys = openedTransactions.intentKeys
 	if options.TransitionCapture != nil {
 		if err := m.beginTransitionCapture(options.TransitionCapture); err != nil {
 			return nil, err
@@ -627,6 +635,56 @@ type scannedSession struct {
 	wrappedLastApplied  uint64
 }
 
+type scannedTransactionKey struct {
+	role distributedtxn.ReplicatedRole
+	id   distributedtxn.ID
+}
+
+type transactionIntentIdentity struct {
+	relation replication.RelationID
+	digest   [sha256.Size]byte
+}
+
+type reopenedTransactionIntentOwner struct {
+	id        distributedtxn.ID
+	keyOffset uint32
+	keyBytes  uint32
+}
+
+type scannedMutationKey struct {
+	keyOffset  uint32
+	keyBytes   uint32
+	intentSeen bool
+}
+
+type scannedTransactionControl struct {
+	control TransactionControl
+
+	residentControl  uint64
+	residentPayload  uint64
+	residentManifest uint64
+	residentMutation uint64
+	residentIntent   uint64
+	payloadRows      uint64
+	intentRows       uint64
+	payloadSeen      bool
+
+	manifestDescriptor      distributedtxn.ManifestDescriptor
+	manifestDescriptorSeen  bool
+	manifestNextPage        uint32
+	manifestNextParticipant uint64
+	manifestEncodedBytes    uint64
+	manifestChain           distributedtxn.Digest
+
+	mutationRows uint64
+	mutationKeys map[transactionIntentIdentity]scannedMutationKey
+}
+
+type scannedTransactions struct {
+	intents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
+	intentKeys []byte
+}
+
 // scanSessionSystemSnapshot performs one ordered, bounded pass over the hidden
 // image. It validates state, collision-verifiable session headers, and every
 // compact physical ring slot before returning counts.
@@ -635,6 +693,7 @@ func scanSessionSystemSnapshot(
 	snapshot *durable.Snapshot,
 	maxSessions uint64,
 	retryWindow uint16,
+	transactionResult ...*scannedTransactions,
 ) (State, bool, uint64, uint64, uint64, error) {
 	var state State
 	var statePresent bool
@@ -644,6 +703,46 @@ func scanSessionSystemSnapshot(
 	var activeIdentities map[[sha256.Size]byte][sha256.Size]byte
 	var tenantArena []byte
 	var sessionEpochs []uint64
+	var transactionControls map[scannedTransactionKey]*scannedTransactionControl
+	var transactionControlCount, activeTransactionCount uint64
+	var transactionPayloadRows, transactionIntentRows, transactionResidentBytes uint64
+	var activeTransactionIntents map[transactionIntentIdentity]reopenedTransactionIntentOwner
+	var transactionIntentKeys []byte
+	var transactionScopeScratch []distributedtxn.IntentScope
+	var manifestParticipantScratch []distributedtxn.ParticipantRef
+	var manifestIdentityScratch []byte
+	var mutationScanID distributedtxn.ID
+	var mutationScanControl *scannedTransactionControl
+	var mutationScanHash hash.Hash
+	var mutationScanRelations uint16
+	var mutationScanMutations uint64
+	var mutationScanLastRelation replication.RelationID
+	finishMutationScan := func() error {
+		if mutationScanControl == nil {
+			return nil
+		}
+		control := mutationScanControl.control
+		if mutationScanRelations != control.PayloadRelationCount ||
+			mutationScanMutations != control.PayloadCount {
+			return fmt.Errorf("%w: packed relation row counts", ErrTransactionStateCorrupt)
+		}
+		var canonicalDigest [sha256.Size]byte
+		_ = mutationScanHash.Sum(canonicalDigest[:0])
+		var framing [8]byte
+		binary.LittleEndian.PutUint16(framing[0:2], mutationScanRelations)
+		if mutationScanRelations == 1 {
+			binary.LittleEndian.PutUint16(framing[2:4], uint16(mutationScanLastRelation))
+		}
+		binary.LittleEndian.PutUint32(framing[4:8], uint32(mutationScanMutations))
+		var material [len(scannedTransactionMutationDigestDomain) + 8 + sha256.Size]byte
+		cursor := copy(material[:], scannedTransactionMutationDigestDomain[:])
+		cursor += copy(material[cursor:], framing[:])
+		copy(material[cursor:], canonicalDigest[:])
+		if distributedtxn.Digest(sha256.Sum256(material[:])) != control.MutationDigest {
+			return fmt.Errorf("%w: packed relation mutation digest", ErrTransactionStateCorrupt)
+		}
+		return nil
+	}
 	err := snapshot.RangeRaw(func(key, value []byte) error {
 		switch {
 		case bytes.Equal(key, stateKey):
@@ -661,6 +760,9 @@ func scanSessionSystemSnapshot(
 				return fmt.Errorf("%w: bounded session counts", ErrStateCorrupt)
 			}
 			statePresent = true
+			if state.TransactionControlCount > MaxRetainedTransactions {
+				return fmt.Errorf("%w: bounded transaction count", ErrStateCorrupt)
+			}
 			sessions = make(map[[sha256.Size]byte]scannedSession, int(state.SessionCount))
 			authorities = make(map[[sha256.Size]byte]replication.CommandAuthorityClass,
 				int(state.AuthorityBindingCount))
@@ -671,6 +773,14 @@ func scanSessionSystemSnapshot(
 			initialTenantBytes := state.SessionCount * 16
 			tenantArena = make([]byte, 0, int(initialTenantBytes))
 			sessionEpochs = make([]uint64, 0, int(state.SessionCount))
+			transactionControls = make(map[scannedTransactionKey]*scannedTransactionControl,
+				int(state.ActiveTransactionCount))
+			activeTransactionIntents = make(map[transactionIntentIdentity]reopenedTransactionIntentOwner,
+				int(state.TransactionIntentRows))
+			if state.TransactionResidentBytes > math.MaxInt32 {
+				return fmt.Errorf("%w: transaction resident reopen arena", ErrTransactionStateCorrupt)
+			}
+			transactionIntentKeys = make([]byte, 0, min(int(state.TransactionResidentBytes), 1<<20))
 			return nil
 
 		case len(key) == 1+sha256.Size && key[0] == 1:
@@ -792,11 +902,235 @@ func scanSessionSystemSnapshot(
 			authorityCount++
 			return nil
 
+		case len(key) == transactionControlStorageKeyBytes && key[0] == transactionControlPrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: transaction control before state", ErrTransactionStateCorrupt)
+			}
+			if transactionScopeScratch == nil {
+				transactionScopeScratch = make([]distributedtxn.IntentScope, distributedtxn.MaxIntentScopes)
+			}
+			view, openErr := OpenTransactionControlInto(value, transactionScopeScratch)
+			want, keyErr := view.StorageKey()
+			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) ||
+				view.LastAppliedIndex > state.Applied {
+				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			if transactionControlCount >= state.TransactionControlCount {
+				return fmt.Errorf("%w: excessive transaction control", ErrTransactionStateCorrupt)
+			}
+			control := view.TransactionControl
+			control.IntentScopes = nil
+			active := transactionControlActive(control)
+			transactionControlCount++
+			if active {
+				identity := scannedTransactionKey{role: view.Role, id: view.ID}
+				if _, duplicate := transactionControls[identity]; duplicate {
+					return fmt.Errorf("%w: duplicate active transaction control", ErrTransactionStateCorrupt)
+				}
+				transactionControls[identity] = &scannedTransactionControl{
+					control:         control,
+					residentControl: uint64(len(key) + len(value)),
+				}
+				activeTransactionCount++
+			} else if uint64(len(key)+len(value)) != control.ResidentControlBytes {
+				return fmt.Errorf("%w: terminal transaction control bytes", ErrTransactionStateCorrupt)
+			}
+			return addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value))
+
+		case len(key) == transactionPayloadStorageKeyBytes && key[0] == transactionPayloadPrefix:
+			if !statePresent {
+				return ErrTransactionStateCorrupt
+			}
+			view, openErr := OpenTransactionCoordinatorPayload(value)
+			want, keyErr := view.StorageKey()
+			summary := transactionControls[scannedTransactionKey{
+				role: distributedtxn.ReplicatedRoleCoordinator, id: view.ID,
+			}]
+			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
+				summary.payloadSeen || view.Kind != summary.control.PayloadKind ||
+				view.Digest != summary.control.PayloadDigest {
+				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			summary.payloadSeen = true
+			summary.payloadRows++
+			summary.residentPayload += uint64(len(key) + len(value))
+			if view.Kind == distributedtxn.ReplicatedPayloadCoordinator {
+				var participantScratch [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
+				record, recordErr := distributedtxn.OpenCoordinatorInto(view.Payload, participantScratch[:])
+				if recordErr != nil || uint64(len(view.Payload)) != summary.control.PayloadBytes ||
+					uint64(len(record.Participants)) != summary.control.PayloadCount {
+					return errors.Join(recordErr, ErrTransactionStateCorrupt)
+				}
+			} else {
+				record, recordErr := distributedtxn.OpenManifestCoordinator(view.Payload)
+				if recordErr != nil || record.Manifest.EncodedBytes != summary.control.PayloadBytes ||
+					record.Manifest.ParticipantCount != summary.control.PayloadCount {
+					return errors.Join(recordErr, ErrTransactionStateCorrupt)
+				}
+				summary.manifestDescriptor = record.Manifest
+				summary.manifestDescriptorSeen = true
+			}
+			transactionPayloadRows++
+			if residentErr := addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value)); residentErr != nil {
+				return residentErr
+			}
+			return nil
+
+		case len(key) == transactionManifestKeyBytes && key[0] == transactionManifestPrefix:
+			if !statePresent {
+				return ErrTransactionStateCorrupt
+			}
+			if manifestParticipantScratch == nil {
+				manifestParticipantScratch = make([]distributedtxn.ParticipantRef,
+					distributedtxn.MaxManifestPageParticipants)
+				manifestIdentityScratch = make([]byte,
+					distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+			}
+			view, openErr := OpenTransactionManifestPageInto(
+				value, manifestParticipantScratch, manifestIdentityScratch,
+			)
+			want, keyErr := view.StorageKey()
+			summary := transactionControls[scannedTransactionKey{
+				role: distributedtxn.ReplicatedRoleCoordinator, id: view.ID,
+			}]
+			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
+				summary.control.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
+				view.Index != summary.manifestNextPage ||
+				view.FirstParticipant != summary.manifestNextParticipant {
+				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			summary.manifestNextPage++
+			summary.manifestNextParticipant += uint64(view.ParticipantCount)
+			if summary.manifestEncodedBytes > math.MaxUint64-uint64(len(view.Raw)) {
+				return ErrTransactionStateCorrupt
+			}
+			summary.manifestEncodedBytes += uint64(len(view.Raw))
+			summary.manifestChain = advanceTransactionManifestChain(
+				summary.manifestChain, view.Index, view.Digest,
+			)
+			summary.payloadRows++
+			summary.residentManifest += uint64(len(key) + len(value))
+			transactionPayloadRows++
+			return addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value))
+
+		case len(key) == transactionRelationPayloadKeyBytes && key[0] == transactionMutationPrefix:
+			if !statePresent {
+				return ErrTransactionStateCorrupt
+			}
+			view, openErr := OpenTransactionRelationPayload(value)
+			want, keyErr := view.StorageKey()
+			summary := transactionControls[scannedTransactionKey{
+				role: distributedtxn.ReplicatedRoleParticipant, id: view.ID,
+			}]
+			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil {
+				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			if mutationScanControl == nil || mutationScanID != view.ID {
+				if finishErr := finishMutationScan(); finishErr != nil {
+					return finishErr
+				}
+				mutationScanID = view.ID
+				mutationScanControl = summary
+				if mutationScanHash == nil {
+					mutationScanHash = sha256.New()
+				} else {
+					mutationScanHash.Reset()
+				}
+				mutationScanRelations = 0
+				mutationScanMutations = 0
+				mutationScanLastRelation = 0
+			}
+			if summary != mutationScanControl || view.Relation <= mutationScanLastRelation ||
+				mutationScanRelations == math.MaxUint16 ||
+				mutationScanMutations > math.MaxUint32-uint64(view.Count) {
+				return ErrTransactionStateCorrupt
+			}
+			if summary.control.PayloadRelationCount > 1 {
+				var header [8]byte
+				binary.LittleEndian.PutUint16(header[0:2], uint16(view.Relation))
+				binary.LittleEndian.PutUint16(header[2:4], uint16(view.Count))
+				binary.LittleEndian.PutUint32(header[4:8], uint32(len(view.MutationBytes())))
+				_, _ = mutationScanHash.Write(header[:])
+			}
+			_, _ = mutationScanHash.Write(view.MutationBytes())
+			mutationScanRelations++
+			mutationScanMutations += uint64(view.Count)
+			mutationScanLastRelation = view.Relation
+			if summary.mutationKeys == nil {
+				summary.mutationKeys = make(map[transactionIntentIdentity]scannedMutationKey)
+			}
+			mutations := view.Batch.Mutations()
+			for mutations.Next() {
+				mutation := mutations.Mutation()
+				mutationIdentity := transactionIntentIdentity{
+					relation: view.Relation, digest: sha256.Sum256(mutation.Key),
+				}
+				if prior, exists := summary.mutationKeys[mutationIdentity]; exists {
+					start, end := uint64(prior.keyOffset), uint64(prior.keyOffset)+uint64(prior.keyBytes)
+					if end > uint64(len(transactionIntentKeys)) ||
+						!bytes.Equal(transactionIntentKeys[start:end], mutation.Key) {
+						return fmt.Errorf("%w: mutation key hash collision", ErrTransactionStateCorrupt)
+					}
+					continue
+				}
+				if uint64(len(transactionIntentKeys))+uint64(len(mutation.Key)) > math.MaxUint32 {
+					return fmt.Errorf("%w: transaction intent key arena", ErrTransactionStateCorrupt)
+				}
+				offset := len(transactionIntentKeys)
+				transactionIntentKeys = append(transactionIntentKeys, mutation.Key...)
+				summary.mutationKeys[mutationIdentity] = scannedMutationKey{
+					keyOffset: uint32(offset), keyBytes: uint32(len(mutation.Key)),
+				}
+			}
+			summary.mutationRows += uint64(view.Count)
+			summary.payloadRows++
+			summary.residentMutation += uint64(len(key) + len(value))
+			transactionPayloadRows++
+			return addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value))
+
+		case len(key) == transactionIntentKeyBytes && key[0] == transactionIntentPrefix:
+			if !statePresent {
+				return ErrTransactionStateCorrupt
+			}
+			view, openErr := OpenTransactionIntent(value)
+			want, keyErr := view.StorageKey()
+			summary := transactionControls[scannedTransactionKey{
+				role: distributedtxn.ReplicatedRoleParticipant, id: view.ID,
+			}]
+			identity := transactionIntentIdentity{relation: view.Relation, digest: view.KeyHash}
+			mutationKey, mutationFound := scannedMutationKey{}, false
+			if summary != nil {
+				mutationKey, mutationFound = summary.mutationKeys[identity]
+			}
+			mutationKeyStart := uint64(mutationKey.keyOffset)
+			mutationKeyEnd := mutationKeyStart + uint64(mutationKey.keyBytes)
+			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
+				!mutationFound || mutationKey.intentSeen ||
+				mutationKeyEnd > uint64(len(transactionIntentKeys)) ||
+				!bytes.Equal(transactionIntentKeys[mutationKeyStart:mutationKeyEnd], view.RawKey) {
+				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			if _, collision := activeTransactionIntents[identity]; collision {
+				return fmt.Errorf("%w: duplicate intent ownership", ErrTransactionStateCorrupt)
+			}
+			activeTransactionIntents[identity] = reopenedTransactionIntentOwner{
+				id: view.ID, keyOffset: mutationKey.keyOffset, keyBytes: mutationKey.keyBytes,
+			}
+			mutationKey.intentSeen = true
+			summary.mutationKeys[identity] = mutationKey
+			summary.intentRows++
+			summary.residentIntent += uint64(len(key) + len(value))
+			transactionIntentRows++
+			return addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value))
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}
 	})
 	if err != nil {
+		return State{}, false, 0, 0, 0, err
+	}
+	if err := finishMutationScan(); err != nil {
 		return State{}, false, 0, 0, 0, err
 	}
 	if !statePresent {
@@ -847,7 +1181,98 @@ func scanSessionSystemSnapshot(
 			return State{}, false, 0, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
 		}
 	}
+	if transactionControlCount != state.TransactionControlCount ||
+		activeTransactionCount != state.ActiveTransactionCount ||
+		transactionPayloadRows != state.TransactionPayloadRows ||
+		transactionIntentRows != state.TransactionIntentRows ||
+		transactionResidentBytes != state.TransactionResidentBytes ||
+		uint64(len(activeTransactionIntents)) != state.TransactionIntentRows {
+		return State{}, false, 0, 0, 0,
+			fmt.Errorf("%w: transaction image accounting", ErrTransactionStateCorrupt)
+	}
+	for _, summary := range transactionControls {
+		control := summary.control
+		if summary.residentControl != control.ResidentControlBytes ||
+			summary.residentPayload != control.ResidentPayloadBytes ||
+			summary.residentManifest != control.ResidentManifestBytes ||
+			summary.residentMutation != control.ResidentMutationBytes ||
+			summary.residentIntent != control.ResidentIntentBytes {
+			return State{}, false, 0, 0, 0,
+				fmt.Errorf("%w: transaction resident counters", ErrTransactionStateCorrupt)
+		}
+		if control.Role == distributedtxn.ReplicatedRoleCoordinator {
+			if !summary.payloadSeen || summary.residentPayload == 0 || summary.payloadRows == 0 {
+				return State{}, false, 0, 0, 0,
+					fmt.Errorf("%w: coordinator creation payload", ErrTransactionStateCorrupt)
+			}
+			if control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator {
+				if !summary.manifestDescriptorSeen || summary.manifestNextPage == 0 ||
+					summary.manifestNextParticipant == 0 || summary.manifestEncodedBytes == 0 ||
+					summary.manifestNextPage != control.ManifestNextPage ||
+					summary.manifestNextParticipant != control.ManifestNextParticipant ||
+					summary.manifestEncodedBytes != control.ManifestEncodedBytes ||
+					summary.manifestChain != control.ManifestChainDigest {
+					return State{}, false, 0, 0, 0,
+						fmt.Errorf("%w: manifest progress witness", ErrTransactionStateCorrupt)
+				}
+				descriptor := summary.manifestDescriptor
+				complete := summary.manifestNextPage == descriptor.SegmentCount &&
+					summary.manifestNextParticipant == descriptor.ParticipantCount &&
+					summary.manifestEncodedBytes == descriptor.EncodedBytes
+				if complete && finishTransactionManifestRoot(
+					summary.manifestChain, descriptor.ParticipantCount,
+					descriptor.EncodedBytes, descriptor.SegmentCount,
+				) != descriptor.Root {
+					return State{}, false, 0, 0, 0,
+						fmt.Errorf("%w: manifest root", ErrTransactionStateCorrupt)
+				}
+				if distributedtxn.CoordinatorState(control.State) == distributedtxn.CoordinatorCommitted &&
+					!complete {
+					return State{}, false, 0, 0, 0,
+						fmt.Errorf("%w: committed incomplete manifest", ErrTransactionStateCorrupt)
+				}
+			}
+			continue
+		}
+		if summary.mutationRows != control.PayloadCount ||
+			uint64(len(summary.mutationKeys)) != summary.intentRows ||
+			summary.intentRows == 0 {
+			return State{}, false, 0, 0, 0,
+				fmt.Errorf("%w: participant child row counts", ErrTransactionStateCorrupt)
+		}
+		for _, mutationKey := range summary.mutationKeys {
+			if !mutationKey.intentSeen {
+				return State{}, false, 0, 0, 0,
+					fmt.Errorf("%w: participant mutation lacks intent", ErrTransactionStateCorrupt)
+			}
+		}
+	}
+	if len(transactionResult) != 0 && transactionResult[0] != nil {
+		transactionResult[0].intents = activeTransactionIntents
+		transactionResult[0].intentKeys = transactionIntentKeys
+	}
 	return state, true, sessionCount, slotCount, authorityCount, nil
+}
+
+func transactionControlActive(control TransactionControl) bool {
+	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
+		return distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired
+	}
+	return distributedtxn.ParticipantState(control.State) != distributedtxn.ParticipantReleased
+}
+
+func addTransactionResidentBytes(total *uint64, keyBytes, valueBytes int) error {
+	if total == nil || keyBytes < 0 || valueBytes < 0 ||
+		uint64(keyBytes) > math.MaxUint64-uint64(valueBytes) ||
+		*total > math.MaxUint64-uint64(keyBytes)-uint64(valueBytes) {
+		return fmt.Errorf("%w: transaction resident byte overflow", ErrTransactionStateCorrupt)
+	}
+	*total += uint64(keyBytes + valueBytes)
+	return nil
+}
+
+var scannedTransactionMutationDigestDomain = [...]byte{
+	'V', 'i', 'b', 'e', 'D', 'B', '/', 't', 'x', 'n', '/', 'r', 'e', 'l', '/', '1', 0,
 }
 
 func validateStoredSessionSlot(state State, slot SessionSlotView) error {

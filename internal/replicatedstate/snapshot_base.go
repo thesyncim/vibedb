@@ -496,6 +496,7 @@ func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
 }
 
 func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
+	wantSystemRows, systemRowsOK := stateSystemRowCount(manifest.State)
 	if manifest.Seeded || len(manifest.Relations) < 1 ||
 		len(manifest.Relations) > replication.MaxRelationsPerBundle ||
 		manifest.RelationManifestDigest == ([sha256.Size]byte{}) ||
@@ -505,8 +506,7 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
-		manifest.SystemRows != manifest.State.SessionCount+manifest.State.SessionSlotCount+
-			manifest.State.AuthorityBindingCount+1 ||
+		!systemRowsOK || manifest.SystemRows != wantSystemRows ||
 		len(manifest.UserCollection) == 0 ||
 		len(manifest.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(manifest.UserCollection) ||

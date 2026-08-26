@@ -10,6 +10,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
@@ -60,9 +61,9 @@ func writeSnapshotArtifactFixture(t testing.TB, snapshot *ReadSnapshot) ([]byte,
 func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
-	// The artifact authenticates the apply contract; adding canonical
-	// conditional relation mutations intentionally changes this derived vector.
-	const golden = "011d562f93aa5a4765d574c2563b7b723a35138da32bf0064df3c48cff58b404"
+	// The artifact authenticates the apply contract; adding the distinct
+	// retryable intent-busy result intentionally changes this derived vector.
+	const golden = "4de424a92744e0eebb5b4893b96480517cf0618f7d86ed3c9b5e8cc3148b389f"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -169,9 +170,9 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 			t.Fatalf("unknown collection %d", row.collection)
 		}
 	}
+	wantSystemRows, systemRowsOK := stateSystemRowCount(verified.State)
 	if systemRows != verified.SystemRows || userRows != verified.UserRows ||
-		systemRows != verified.State.SessionCount+verified.State.SessionSlotCount+
-			verified.State.AuthorityBindingCount+1 ||
+		!systemRowsOK || systemRows != wantSystemRows ||
 		userRows != 7 {
 		t.Fatalf("row totals system=%d user=%d manifest=%+v", systemRows, userRows, verified)
 	}
@@ -595,7 +596,7 @@ func TestSnapshotArtifactHiddenSystemKeyGrammar(t *testing.T) {
 		previousKeyBytes := 0
 		_, err := consumeSnapshotArtifactRows(
 			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
-			payload(key), nil, previousKey, &previousKeyBytes, nil, true,
+			payload(key), nil, previousKey, &previousKeyBytes, nil, true, nil,
 		)
 		return err
 	}
@@ -621,6 +622,100 @@ func TestSnapshotArtifactHiddenSystemKeyGrammar(t *testing.T) {
 		if err := consume(invalid); !errors.Is(err, ErrSnapshotArtifact) {
 			t.Fatalf("invalid hidden system key %x error = %v", invalid, err)
 		}
+	}
+}
+
+func TestSnapshotArtifactValidatesExactTransactionRows(t *testing.T) {
+	rowPayload := func(key, value []byte) []byte {
+		result := make([]byte, snapshotArtifactRowHeaderBytes+len(key)+len(value))
+		binary.LittleEndian.PutUint32(result[0:4], uint32(len(key)))
+		binary.LittleEndian.PutUint32(result[4:8], uint32(len(value)))
+		copy(result[snapshotArtifactRowHeaderBytes:], key)
+		copy(result[snapshotArtifactRowHeaderBytes+len(key):], value)
+		return result
+	}
+	consume := func(key, value []byte, scratch *snapshotArtifactTransactionScratch) error {
+		previousKey := make([]byte, replication.MaxMutationKeyBytes)
+		previousKeyBytes := 0
+		_, err := consumeSnapshotArtifactRows(
+			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
+			rowPayload(key, value), nil, previousKey, &previousKeyBytes, nil, true, scratch,
+		)
+		return err
+	}
+	control := transactionCodecControl(t)
+	controlValue, err := AppendTransactionControl(nil, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlKey, _ := TransactionControlStorageKey(control.Role, control.ID)
+	id, coordinator := transactionCodecCoordinatorPayload(t)
+	payloadValue, err := AppendTransactionCoordinatorPayload(
+		nil, id, distributedtxn.ReplicatedPayloadCoordinator, coordinator,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadKey, _ := TransactionCoordinatorPayloadStorageKey(id)
+	manifestID, segment, _ := transactionCodecManifestSegment(t)
+	manifestValue, err := AppendTransactionManifestPage(nil, manifestID, segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestKey, _ := TransactionManifestPageStorageKey(manifestID, segment.Index)
+	mutation := transactionCodecMutation()
+	command, err := replication.OpenCommand(testCommand(testBinding(), 1, mutation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relations := command.RelationBatches()
+	if !relations.Next() || relations.Batch().Relation != 1 {
+		t.Fatal("transaction relation fixture did not expose relation 1")
+	}
+	relationValue, err := AppendTransactionRelationPayload(nil, control.ID, relations.Batch())
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationKey, _ := TransactionRelationPayloadStorageKey(control.ID, 1)
+	intentValue, err := AppendTransactionIntent(nil, control.ID, 1, []byte("intent-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentKey, _ := TransactionIntentStorageKey(1, []byte("intent-key"))
+	scratch := new(snapshotArtifactTransactionScratch)
+	for name, row := range map[string]struct{ key, value []byte }{
+		"control":  {controlKey[:], controlValue},
+		"payload":  {payloadKey[:], payloadValue},
+		"manifest": {manifestKey[:], manifestValue},
+		"relation": {relationKey[:], relationValue},
+		"intent":   {intentKey[:], intentValue},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := consume(row.key, row.value, scratch); err != nil {
+				t.Fatal(err)
+			}
+			corrupt := bytes.Clone(row.value)
+			corrupt[len(corrupt)-1] ^= 1
+			if err := consume(row.key, corrupt, scratch); !errors.Is(err, ErrSnapshotArtifact) {
+				t.Fatalf("corrupt row error=%v", err)
+			}
+			wrongKey := bytes.Clone(row.key)
+			wrongKey[len(wrongKey)-1] ^= 1
+			if err := consume(wrongKey, row.value, scratch); !errors.Is(err, ErrSnapshotArtifact) {
+				t.Fatalf("mismatched key error=%v", err)
+			}
+		})
+	}
+	if cap(scratch.participants) != distributedtxn.MaxManifestPageParticipants ||
+		cap(scratch.identities) != distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2 {
+		t.Fatal("manifest scratch was not retained at the fixed max-page bound")
+	}
+	largeSystemValue := make([]byte, replication.MaxMutationValueBytes+1)
+	if _, ok := snapshotArtifactRowBytes(SnapshotArtifactSystem, relationKey[:], largeSystemValue); !ok {
+		t.Fatal("system row sizing rejected a valid packed-transaction value class")
+	}
+	if _, ok := snapshotArtifactRowBytes(SnapshotArtifactUser, relationKey[:], largeSystemValue); ok {
+		t.Fatal("user row sizing inherited the wider hidden-transaction bound")
 	}
 }
 

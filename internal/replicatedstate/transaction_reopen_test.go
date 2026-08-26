@@ -1,0 +1,136 @@
+package replicatedstate
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"errors"
+	"testing"
+
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store/durable"
+)
+
+func TestTransactionImageReopenAccountingIntentOwnershipAndTopologyFence(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	id := transactionCodecID(41)
+	mutation := transactionCodecMutation()
+	batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{mutation}}}
+	mutationDigest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := replication.OpenCommand(testCommand(fixture.binding, 1, mutation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relations := command.RelationBatches()
+	if !relations.Next() || relations.Batch().Relation != 1 {
+		t.Fatal("transaction relation fixture did not expose relation 1")
+	}
+	relationBatch := relations.Batch()
+	controlBytes, _ := TransactionControlResidentBytes(1)
+	mutationBytes, _ := TransactionRelationPayloadResidentBytes(len(relationBatch.MutationBytes()))
+	intentBytes, _ := TransactionIntentResidentBytes(len(mutation.Key))
+	control := TransactionControl{
+		ID: id, Role: distributedtxn.ReplicatedRoleParticipant,
+		State: uint8(distributedtxn.ParticipantPrepared), Revision: 2,
+		PayloadKind:   distributedtxn.ReplicatedPayloadParticipantStage,
+		PayloadDigest: transactionCodecDigest(20), PayloadBytes: 4096, PayloadCount: 1,
+		PayloadRelationCount:        1,
+		CoordinatorGroup:            transactionCodecReplicationID(30),
+		CoordinatorShardIncarnation: transactionCodecReplicationID(50),
+		CoordinatorAllocation:       71, MutationDigest: mutationDigest,
+		BucketBits: 8, IntentScopes: []distributedtxn.IntentScope{{Start: 1, End: 3}},
+		ResidentControlBytes: controlBytes, ResidentMutationBytes: mutationBytes,
+		ResidentIntentBytes:  intentBytes,
+		LastOperation:        distributedtxn.ReplicatedPrepareParticipant,
+		LastExpectedRevision: 1, LastCommandDigest: transactionCodecCommandDigest(110),
+		LastResultCode: ResultApplied, LastAppliedIndex: 2,
+	}
+	controlValue, err := AppendTransactionControl(nil, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlKey, _ := TransactionControlStorageKey(control.Role, id)
+	mutationValue, err := AppendTransactionRelationPayload(nil, id, relationBatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutationKey, _ := TransactionRelationPayloadStorageKey(id, 1)
+	intentValue, err := AppendTransactionIntent(nil, id, 1, mutation.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentKey, _ := TransactionIntentStorageKey(1, mutation.Key)
+	state := cloneState(fixture.machine.state)
+	state.Applied = 2
+	state.LastTerm = 1
+	state.LastKind = RecordNormal
+	state.LastEntryDigest = sha256.Sum256([]byte("transaction-image"))
+	state.TransactionControlCount = 1
+	state.ActiveTransactionCount = 1
+	state.TransactionPayloadRows = 1
+	state.TransactionIntentRows = 1
+	state.TransactionResidentBytes = controlBytes + mutationBytes + intentBytes
+	stateValue, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		for _, row := range []struct{ key, value []byte }{
+			{stateKey, stateValue}, {controlKey[:], controlValue},
+			{mutationKey[:], mutationValue}, {intentKey[:], intentValue},
+		} {
+			if putErr := batch.Put(row.key, row.value); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reopen := func() (*Machine, error) {
+		return Open(
+			fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log,
+			Options{TxnLimits: durable.TxnLimits{
+				MaxCollections: 2, MaxDocuments: fixture.user.Limits.MaxDistinctMutations + 4,
+				MaxBytes: 64 << 20,
+			}, MaxSessions: 128, RetryWindow: 8},
+		)
+	}
+	reopened, err := reopen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := transactionIntentIdentity{relation: 1, digest: sha256.Sum256(mutation.Key)}
+	owner, ok := reopened.transactionIntents[identity]
+	start, end := int(owner.keyOffset), int(owner.keyOffset+owner.keyBytes)
+	if !ok || owner.id != id || end > len(reopened.transactionIntentKeys) ||
+		!bytes.Equal(reopened.transactionIntentKeys[start:end], mutation.Key) {
+		t.Fatalf("rebuilt intent owner=%+v found=%v", owner, ok)
+	}
+	ownership, err := AppendOwnershipTransition(nil, testOwnershipTransition(fixture.binding, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.AdmitCommand(ownership); !errors.Is(err, ErrOwnershipTransition) {
+		t.Fatalf("active transaction ownership fence error=%v", err)
+	}
+
+	foreignID := transactionCodecID(99)
+	foreignIntent, err := AppendTransactionIntent(nil, foreignID, 1, mutation.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.system.Collection.Put(intentKey[:], foreignIntent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopen(); !errors.Is(err, ErrTransactionStateCorrupt) {
+		t.Fatalf("orphan intent reopen error=%v", err)
+	}
+}

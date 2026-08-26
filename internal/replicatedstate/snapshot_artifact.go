@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -322,6 +324,11 @@ type snapshotArtifactWriter struct {
 	captureImage   [sha256.Size]byte
 }
 
+type snapshotArtifactTransactionScratch struct {
+	participants []distributedtxn.ParticipantRef
+	identities   []byte
+}
+
 // WriteSnapshotArtifact writes a deterministic, bounded-memory artifact for
 // snapshot. It does not close snapshot or w. Once w reports an error, the
 // caller must discard or truncate the partial artifact.
@@ -489,12 +496,9 @@ func (w *snapshotArtifactWriter) writeCollection(
 }
 
 func snapshotArtifactRowBytes(collection SnapshotArtifactCollection, key, value []byte) (int, bool) {
-	maxValueBytes := replication.MaxMutationValueBytes
-	if collection == SnapshotArtifactCapture {
-		maxValueBytes = MaxTransitionCaptureRecordBytes
-	}
+	maxValueBytes := snapshotArtifactMaxValueBytes(collection)
 	if len(key) == 0 || len(key) > replication.MaxMutationKeyBytes ||
-		len(value) == 0 || len(value) > maxValueBytes {
+		len(value) == 0 || uint64(len(value)) > maxValueBytes {
 		return 0, false
 	}
 	rowBytes := snapshotArtifactRowHeaderBytes + len(key) + len(value)
@@ -770,6 +774,7 @@ func ContinueSnapshotArtifact(
 	if payload == nil {
 		payload = make([]byte, 0, min(int(current.manifest.TargetChunkBytes), 64<<10))
 	}
+	var transactionScratch snapshotArtifactTransactionScratch
 	for {
 		var magic [8]byte
 		if err := readSnapshotArtifactBytes(r, magic[:], "record magic"); err != nil {
@@ -862,7 +867,7 @@ func ContinueSnapshotArtifact(
 			}
 			seenState, err := consumeSnapshotArtifactRows(
 				chunk, payload, visit, candidate.previousKey[:], &previousKeyBytes,
-				candidate.expectedStateDocument, candidate.stateRowSeen,
+				candidate.expectedStateDocument, candidate.stateRowSeen, &transactionScratch,
 			)
 			if err != nil {
 				return SnapshotArtifactManifest{}, &current, err
@@ -972,10 +977,10 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
 		uint64(len(header)), cursor.manifest.Chunks, cursor.manifest.PayloadBytes, false,
 	)
+	wantSystemRows, systemRowsOK := stateSystemRowCount(cursor.manifest.State)
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
 		!encodedBytesOK || cursor.encodedBytes != wantEncodedBytes ||
-		cursor.manifest.SystemRows > cursor.manifest.State.SessionCount+
-			cursor.manifest.State.SessionSlotCount+cursor.manifest.State.AuthorityBindingCount+1 {
+		!systemRowsOK || cursor.manifest.SystemRows > wantSystemRows {
 		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
 	}
 	if cursor.manifest.Chunks == 0 {
@@ -995,12 +1000,10 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		cursor.currentCollection == SnapshotArtifactSystem &&
 			(cursor.manifest.UserRows != 0 || cursor.manifest.CaptureRows != 0) ||
 		cursor.currentCollection == SnapshotArtifactUser &&
-			(cursor.manifest.SystemRows != cursor.manifest.State.SessionCount+
-				cursor.manifest.State.SessionSlotCount+cursor.manifest.State.AuthorityBindingCount+1 ||
+			(cursor.manifest.SystemRows != wantSystemRows ||
 				cursor.manifest.CaptureRows != 0) ||
 		cursor.currentCollection == SnapshotArtifactCapture &&
-			(cursor.manifest.SystemRows != cursor.manifest.State.SessionCount+
-				cursor.manifest.State.SessionSlotCount+cursor.manifest.State.AuthorityBindingCount+1) ||
+			(cursor.manifest.SystemRows != wantSystemRows) ||
 		(cursor.manifest.CaptureRows == 0) !=
 			(cursor.captureImageDigest == snapshotArtifactEmptyCaptureImageDigest()) {
 		return fmt.Errorf("%w: resume prefix state", ErrSnapshotArtifact)
@@ -1123,6 +1126,7 @@ func consumeSnapshotArtifactRows(
 	previousKeyBytes *int,
 	expectedStateDocument []byte,
 	stateRowAlreadySeen bool,
+	transactionScratch *snapshotArtifactTransactionScratch,
 ) (bool, error) {
 	cursor := 0
 	stateRowSeen := false
@@ -1163,6 +1167,59 @@ func consumeSnapshotArtifactRows(
 					return false, fmt.Errorf("%w: hidden authority binding: %v",
 						ErrSnapshotArtifact, err)
 				}
+			case len(key) == transactionControlStorageKeyBytes && key[0] == transactionControlPrefix:
+				view, err := OpenTransactionControl(value)
+				want, keyErr := view.StorageKey()
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: transaction control", ErrSnapshotArtifact))
+				}
+			case len(key) == transactionPayloadStorageKeyBytes && key[0] == transactionPayloadPrefix:
+				view, err := OpenTransactionCoordinatorPayload(value)
+				want, keyErr := view.StorageKey()
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: transaction payload", ErrSnapshotArtifact))
+				}
+			case len(key) == transactionManifestKeyBytes && key[0] == transactionManifestPrefix:
+				if len(value) < transactionManifestHeaderBytes+recordChecksumLen {
+					return false, fmt.Errorf("%w: transaction manifest", ErrSnapshotArtifact)
+				}
+				count := int(binary.LittleEndian.Uint32(value[32:36]))
+				if count <= 0 || count > distributedtxn.MaxManifestPageParticipants {
+					return false, fmt.Errorf("%w: transaction manifest count", ErrSnapshotArtifact)
+				}
+				if transactionScratch == nil {
+					return false, fmt.Errorf("%w: missing transaction scratch", ErrSnapshotArtifact)
+				}
+				if transactionScratch.participants == nil {
+					transactionScratch.participants = make([]distributedtxn.ParticipantRef,
+						distributedtxn.MaxManifestPageParticipants)
+					transactionScratch.identities = make([]byte,
+						distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+				}
+				view, err := OpenTransactionManifestPageInto(
+					value, transactionScratch.participants, transactionScratch.identities,
+				)
+				want, keyErr := view.StorageKey()
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: transaction manifest", ErrSnapshotArtifact))
+				}
+			case len(key) == transactionRelationPayloadKeyBytes && key[0] == transactionMutationPrefix:
+				view, err := OpenTransactionRelationPayload(value)
+				want, keyErr := view.StorageKey()
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: transaction mutation", ErrSnapshotArtifact))
+				}
+			case len(key) == transactionIntentKeyBytes && key[0] == transactionIntentPrefix:
+				view, err := OpenTransactionIntent(value)
+				want, keyErr := view.StorageKey()
+				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err, keyErr,
+						fmt.Errorf("%w: transaction intent", ErrSnapshotArtifact))
+				}
 			default:
 				return false, fmt.Errorf("%w: hidden system key", ErrSnapshotArtifact)
 			}
@@ -1185,6 +1242,10 @@ func consumeSnapshotArtifactRows(
 func snapshotArtifactMaxValueBytes(collection SnapshotArtifactCollection) uint64 {
 	if collection == SnapshotArtifactCapture {
 		return MaxTransitionCaptureRecordBytes
+	}
+	if collection == SnapshotArtifactSystem {
+		return max(uint64(replication.MaxMutationValueBytes),
+			uint64(MaxTransactionRelationPayloadRecordBytes))
 	}
 	return replication.MaxMutationValueBytes
 }
@@ -1229,8 +1290,8 @@ func validateSnapshotArtifactFooter(
 		storedPrevious != previousDigest || storedHeader != manifest.HeaderDigest {
 		return fmt.Errorf("%w: footer totals or digest", ErrSnapshotArtifact)
 	}
-	if !stateRowSeen || manifest.SystemRows != manifest.State.SessionCount+
-		manifest.State.SessionSlotCount+manifest.State.AuthorityBindingCount+1 {
+	wantSystemRows, systemRowsOK := stateSystemRowCount(manifest.State)
+	if !stateRowSeen || !systemRowsOK || manifest.SystemRows != wantSystemRows {
 		return fmt.Errorf("%w: hidden state image", ErrSnapshotArtifact)
 	}
 	return nil

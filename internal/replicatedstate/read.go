@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -33,7 +34,7 @@ func (m *Machine) LookupCompletionInto(
 	}
 	result, err := m.lookupCompletion(
 		data,
-		dst[:0:replication.MaxEmptyResultCompletionEnvelopeBytes],
+		dst[:0:cap(dst)],
 	)
 	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
 		return CompletionLookup{}, ErrCompletionCorrupt
@@ -58,7 +59,10 @@ type CompletionLookupWorkspace struct {
 	// row's front-compression restart value before shrinking to the requested
 	// session or slot record. Every value the private system collection writes
 	// is bounded by maxCompletionLookupDecodeBytes.
-	decodeRead [maxCompletionLookupDecodeBytes]byte
+	decodeRead               [maxCompletionLookupDecodeBytes]byte
+	transactionRead          [MaxTransactionControlRecordBytes]byte
+	transactionCommandScopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
+	transactionControlScopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
 }
 
 const maxCompletionLookupDecodeBytes = max(
@@ -163,9 +167,24 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 	if !m.immutableBindingMatches(command) {
 		return CompletionLookup{}, ErrWrongBinding
 	}
+	if command.Kind() == replication.CommandTransaction &&
+		cap(dst) < MaxTransactionCompletionEnvelopeBytes {
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
+	if command.Kind() != replication.CommandTransaction {
+		result, err := m.lookupCompletionAtSnapshot(
+			command,
+			dst[:0:replication.MaxEmptyResultCompletionEnvelopeBytes],
+			workspace,
+		)
+		if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
+			return CompletionLookup{}, ErrCompletionCorrupt
+		}
+		return result, err
+	}
 	result, err := m.lookupCompletionAtSnapshot(
 		command,
-		dst[:0:replication.MaxEmptyResultCompletionEnvelopeBytes],
+		dst[:0:cap(dst)],
 		workspace,
 	)
 	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
@@ -237,6 +256,18 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrWrongBinding
 	}
+	if command.Kind() == replication.CommandTransaction && completionScratch != nil &&
+		cap(completionScratch) < MaxTransactionCompletionEnvelopeBytes {
+		endErr := m.EndCompletionLookupBatch(&workspace)
+		_ = workspace.Release()
+		if endErr != nil {
+			return CompletionLookup{}, endErr
+		}
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
+	if command.Kind() != replication.CommandTransaction && completionScratch != nil {
+		completionScratch = completionScratch[:0:replication.MaxEmptyResultCompletionEnvelopeBytes]
+	}
 	result, lookupErr := m.lookupCompletionAtSnapshot(
 		command, completionScratch, &workspace,
 	)
@@ -254,6 +285,11 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	workspace *CompletionLookupWorkspace,
 ) (CompletionLookup, error) {
 	snapshot := workspace.snapshot
+	if command.Kind() == replication.CommandTransaction {
+		return m.lookupTransactionCompletionAtSnapshot(
+			command, completionScratch, workspace,
+		)
+	}
 	scratch := &workspace.scratch
 	authorityDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
 	authorityKey := AuthorityBindingStorageKey(authorityDigest)

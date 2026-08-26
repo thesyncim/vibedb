@@ -410,6 +410,7 @@ func (s *SnapshotArtifactStage) AppendRecoveredSeed(
 }
 
 func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
+	wantSystemRows, systemRowsOK := stateSystemRowCount(expected.State)
 	if err := validateState(expected.State); err != nil ||
 		expected.Seeded || expected.Bundle || len(expected.Relations) != 0 ||
 		expected.RelationManifestDigest != ([32]byte{}) ||
@@ -419,8 +420,7 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		bytes.Equal(expected.UserCollection, []byte(systemCollectionName)) ||
 		expected.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
 		expected.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
-		expected.Chunks == 0 || expected.SystemRows != expected.State.SessionCount+
-		expected.State.SessionSlotCount+expected.State.AuthorityBindingCount+1 ||
+		expected.Chunks == 0 || !systemRowsOK || expected.SystemRows != wantSystemRows ||
 		expected.PayloadBytes == 0 || expected.EncodedBytes == 0 ||
 		expected.HeaderDigest == ([32]byte{}) ||
 		expected.LastChunkDigest == ([32]byte{}) || expected.ImageDigest == ([32]byte{}) ||
