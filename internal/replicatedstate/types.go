@@ -5,6 +5,7 @@ package replicatedstate
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -120,6 +121,8 @@ var (
 	ErrSnapshotBase                = errors.New("replicatedstate: invalid snapshot base certificate")
 	ErrStagedSnapshot              = errors.New("replicatedstate: invalid staged snapshot initialization")
 	ErrOwnershipTransition         = errors.New("replicatedstate: invalid ownership transition")
+	ErrSchemaTransition            = errors.New("replicatedstate: invalid schema transition")
+	ErrSchemaTransitionPending     = errors.New("replicatedstate: schema transition requires target activation")
 )
 
 // Binding is the exact shard and recovery lineage owned by one Machine.
@@ -348,6 +351,14 @@ type Options struct {
 	// Open. Ordinary callers leave it nil and retain per-transition synchronous
 	// UpdateCollections semantics.
 	CheckpointGroup *durable.CheckpointGroup
+	// SchemaTransition is required only when the durable state's last record is
+	// RecordSchema. It lets first target-generation reopen authenticate the full
+	// Raft entry commitment against the independently selected checkpoint
+	// membership and catalog CAS. Later ordinary entries no longer need it.
+	SchemaTransition          []byte
+	SchemaMembershipWitness   durable.CheckpointMembershipWitness
+	SchemaAuthorizationDigest [sha256.Size]byte
+	SchemaCatalogCASDigest    [sha256.Size]byte
 }
 
 // RequestLedgerRange is the immutable, apply-contract-bound authority interval

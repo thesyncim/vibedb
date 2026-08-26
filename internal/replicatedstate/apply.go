@@ -273,6 +273,26 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer m.releaseMutationPlan()
+	schema := IsSchemaTransition(data)
+	if m.schemaTransitioned {
+		if !schema || meta.Type != pb.EntryNormal || meta.Term == 0 || meta.Term == math.MaxUint64 {
+			return raftmodel.Publication{}, ErrSchemaTransitionPending
+		}
+		if len(data) > replication.MaxCommandBytes {
+			return raftmodel.Publication{}, ErrAdmissionBound
+		}
+		digest := normalEntryDigest(meta, data)
+		replay, err := m.checkTransition(meta, RecordSchema, digest)
+		if err != nil || !replay {
+			return raftmodel.Publication{}, errors.Join(ErrSchemaTransitionPending, err)
+		}
+		transition, err := OpenSchemaTransition(data)
+		if err != nil || m.state.Binding != schemaTransitionBinding(transition) ||
+			m.state.ApplyContractDigest != transition.ToApplyContract {
+			return raftmodel.Publication{}, errors.Join(ErrSchemaTransition, err)
+		}
+		return clonePublication(m.publication), nil
+	}
 	if err := m.checkUsable(); err != nil {
 		return raftmodel.Publication{}, err
 	}
@@ -285,6 +305,8 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	kind := RecordNormal
 	if IsOwnershipTransition(data) {
 		kind = RecordOwnership
+	} else if schema {
+		kind = RecordSchema
 	}
 	digest := normalEntryDigest(meta, data)
 	replay, err := m.checkTransition(meta, kind, digest)
@@ -299,6 +321,12 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 				m.state.Binding.RouteGeneration != transition.ToRouteGeneration ||
 				m.state.Binding.OwnedRange != transition.ToOwnedRange {
 				return raftmodel.Publication{}, m.fail(ErrOwnershipTransition)
+			}
+		} else if kind == RecordSchema {
+			transition, openErr := OpenSchemaTransition(data)
+			if openErr != nil || m.state.Binding != schemaTransitionBinding(transition) ||
+				m.state.ApplyContractDigest != transition.ToApplyContract {
+				return raftmodel.Publication{}, m.fail(ErrSchemaTransition)
 			}
 		}
 		return clonePublication(m.publication), nil
@@ -317,6 +345,28 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
+		return clonePublication(m.publication), nil
+	}
+	if kind == RecordSchema {
+		transition, openErr := OpenSchemaTransition(data)
+		if openErr != nil {
+			return raftmodel.Publication{}, m.fail(openErr)
+		}
+		if transition.From != m.binding ||
+			transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion ||
+			transition.FromManifest != m.manifestDigest ||
+			transition.FromApplyContract != m.applyContract {
+			return raftmodel.Publication{}, m.fail(ErrSchemaTransition)
+		}
+		next := m.nextState(meta, RecordSchema, digest)
+		next.Binding = schemaTransitionBinding(transition)
+		next.ApplyContractDigest = transition.ToApplyContract
+		next.DataChainDigest = schemaTransitionDataChain(m.state.DataChainDigest, transition)
+		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		m.applyContract = transition.ToApplyContract
+		m.schemaTransitioned = true
 		return clonePublication(m.publication), nil
 	}
 	if len(data) == 0 {
@@ -649,6 +699,31 @@ func (m *Machine) bundleSnapshotManifestMatches(manifest SnapshotArtifactManifes
 // Serving remains forbidden because a successful return does not reserve the
 // proved storage for the future committed entry.
 func (m *Machine) AdmitCommand(data []byte) error {
+	if IsSchemaTransition(data) {
+		transition, err := OpenSchemaTransition(data)
+		if err != nil {
+			return err
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		defer m.releaseMutationPlan()
+		if err := m.checkUsable(); err != nil {
+			return err
+		}
+		if !m.initialized || m.state.Applied == math.MaxUint64-1 ||
+			transition.From != m.binding ||
+			transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion ||
+			transition.FromManifest != m.manifestDigest ||
+			transition.FromApplyContract != m.applyContract {
+			return ErrSchemaTransition
+		}
+		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
+		next := m.nextState(meta, RecordSchema, normalEntryDigest(meta, transition.Bytes()))
+		next.Binding = schemaTransitionBinding(transition)
+		next.ApplyContractDigest = transition.ToApplyContract
+		next.DataChainDigest = schemaTransitionDataChain(m.state.DataChainDigest, transition)
+		return m.checkTransitionCapacity(next, nil, commandPlan{})
+	}
 	if IsOwnershipTransition(data) {
 		transition, err := OpenOwnershipTransition(data)
 		if err != nil {

@@ -221,7 +221,8 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, nil
 	}
 	first := entries[0]
-	if first.Meta.Type != pb.EntryNormal || IsOwnershipTransition(first.Data) {
+	if first.Meta.Type != pb.EntryNormal || IsOwnershipTransition(first.Data) ||
+		IsSchemaTransition(first.Data) {
 		return 0, raftmodel.Publication{}, nil
 	}
 	if !m.initialized {
@@ -290,7 +291,8 @@ func (m *Machine) ApplyNormalBatch(
 	for index := range entries {
 		entry := entries[index]
 		meta, data := entry.Meta, entry.Data
-		if meta.Type != pb.EntryNormal || IsOwnershipTransition(data) {
+		if meta.Type != pb.EntryNormal || IsOwnershipTransition(data) ||
+			IsSchemaTransition(data) {
 			break
 		}
 		if meta.Term == 0 || meta.Term == math.MaxUint64 {

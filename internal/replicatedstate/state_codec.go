@@ -40,6 +40,9 @@ const (
 	// certified staged image. Its synthetic entry digest becomes the prefix for
 	// every later local Raft apply.
 	RecordImportedSnapshot RecordKind = 5
+	// RecordSchema retires one live relation bundle after durably binding the
+	// exact prepared replacement and catalog authorization.
+	RecordSchema RecordKind = 6
 )
 
 // State is the exact durable publication stored at the fixed state key.
@@ -387,6 +390,11 @@ func validateState(state State) error {
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
 			state.ReplicaSetVersion >= state.Applied {
 			return fmt.Errorf("%w: ownership entry type", ErrStateCorrupt)
+		}
+	case RecordSchema:
+		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
+			state.ReplicaSetVersion >= state.Applied {
+			return fmt.Errorf("%w: schema entry type", ErrStateCorrupt)
 		}
 	case RecordImportedSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||

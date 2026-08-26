@@ -83,6 +83,7 @@ type Machine struct {
 	openedImageApplied    uint64
 	openedImageGeneration uint64
 	initialized           bool
+	schemaTransitioned    bool
 	poison                error
 }
 
@@ -349,6 +350,13 @@ func OpenBundle(
 		state.SessionCount > options.MaxSessions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
 	}
+	if state.LastKind == RecordSchema {
+		if err := validateOpenedSchemaTransition(
+			state, binding, prepared.manifestDigest, prepared.applyContract, options,
+		); err != nil {
+			return nil, err
+		}
+	}
 	if state.LastKind == RecordStaticSnapshot && state.DataChainDigest != seedDigest {
 		return nil, fmt.Errorf("%w: persisted base data-chain seed", ErrStateCorrupt)
 	}
@@ -389,6 +397,30 @@ func OpenBundle(
 		}
 	}
 	return m, nil
+}
+
+func validateOpenedSchemaTransition(
+	state State,
+	binding Binding,
+	manifest, contract [sha256.Size]byte,
+	options Options,
+) error {
+	transition, err := OpenSchemaTransition(options.SchemaTransition)
+	witness := options.SchemaMembershipWitness
+	meta := raftmodel.ApplyMeta{
+		Index: state.Applied, Term: state.LastTerm, Type: state.LastEntryType,
+	}
+	if err != nil || normalEntryDigest(meta, options.SchemaTransition) != state.LastEntryDigest ||
+		schemaTransitionBinding(transition) != binding ||
+		transition.ToManifest != manifest || transition.ToApplyContract != contract ||
+		transition.MembershipSequence != witness.Sequence ||
+		transition.MembershipSource != witness.Source ||
+		transition.MembershipTarget != witness.Target ||
+		transition.AuthorizationDigest != options.SchemaAuthorizationDigest ||
+		transition.CatalogCASDigest != options.SchemaCatalogCASDigest {
+		return errors.Join(ErrSchemaTransition, err)
+	}
+	return nil
 }
 
 func newMachineFromOpenInputs(prepared openInputs) *Machine {
@@ -1735,6 +1767,9 @@ func (m *Machine) fail(err error) error {
 func (m *Machine) checkUsable() error {
 	if m.poison != nil {
 		return fmt.Errorf("%w: %v", ErrApplyPoisoned, m.poison)
+	}
+	if m.schemaTransitioned {
+		return ErrSchemaTransitionPending
 	}
 	return nil
 }
