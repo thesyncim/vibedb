@@ -462,18 +462,26 @@ func runServe(args []string) int {
 		}
 		err = serveGatewayData(serveContext, listener, exec, dataReader, logf)
 	}
-	if err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", err)
-		return 1
-	}
+	var replicaControlErr error
 	if replicaControlDone != nil {
 		stop()
-		if controlErr := <-replicaControlDone; controlErr != nil && !errors.Is(controlErr, context.Canceled) {
-			fmt.Fprintf(os.Stderr, "gateway: replica control: %v\n", controlErr)
-			return 1
+		if controlErr := <-replicaControlDone; controlErr != nil &&
+			!errors.Is(controlErr, context.Canceled) {
+			replicaControlErr = controlErr
 		}
 	}
+	if serveErr := errors.Join(replicaControlErr, nonCanceledError(err)); serveErr != nil {
+		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", serveErr)
+		return 1
+	}
 	return 0
+}
+
+func nonCanceledError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 // requireLoopbackListen keeps the explicitly selected unauthenticated
