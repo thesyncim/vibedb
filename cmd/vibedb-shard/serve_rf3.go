@@ -35,11 +35,12 @@ import (
 )
 
 const (
-	rf3IdentityFileBytes     = 256 << 10
-	rf3TickInterval          = 50 * time.Millisecond
-	rf3NetworkTimeout        = 10 * time.Second
-	rf3RequestTimeout        = 15 * time.Second
-	rf3DefaultExecutionLanes = 8
+	rf3IdentityFileBytes          = 256 << 10
+	rf3TickInterval               = 50 * time.Millisecond
+	rf3WALGenerationIntervalTicks = uint64((10 * time.Minute) / rf3TickInterval)
+	rf3NetworkTimeout             = 10 * time.Second
+	rf3RequestTimeout             = 15 * time.Second
+	rf3DefaultExecutionLanes      = 8
 )
 
 var errRF3Serving = errors.New("vibedb-shard: invalid RF3 serving configuration")
@@ -155,15 +156,15 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return err
 	}
+	defer clear(key.Material[:])
 	wal, err := raftstore.Open(
 		manifest.WAL.Path, walIdentityFromBinding(base.Binding),
 		base.Binding.TopologyRecoveryEpoch, key, manifest.WAL.Options,
 	)
-	clear(key.Material[:])
 	if err != nil {
 		return fmt.Errorf("open RF3 WAL: %w", err)
 	}
-	database, apply, err := raftmember.OpenBoundSQLWithApply(
+	database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(
 		manifest.SQL.Path, wal, base.Binding.Authority, base, applyIdentity,
 	)
 	if err != nil {
@@ -259,6 +260,16 @@ func servePreparedRF3WithExecutionLanes(
 		}
 		return closePrepared(err)
 	}
+	if err := runtime.ConfigureWALGeneration(raftmember.WALGenerationDriverOptions{
+		IntervalTicks: rf3WALGenerationIntervalTicks,
+		Key:           key,
+		OnError: func(err error) {
+			fmt.Fprintf(os.Stderr, "vibedb-shard RF3 WAL generation deferred: %v\n", err)
+		},
+	}); err != nil {
+		return errors.Join(err, runtime.Close())
+	}
+	clear(key.Material[:])
 	runtimePublication, err := runtime.Publication()
 	if err != nil || runtimePublication.ReplicaSetVersion != publication.ReplicaSetVersion ||
 		!proto.Equal(runtimePublication.ConfState, publication.ConfState) {
