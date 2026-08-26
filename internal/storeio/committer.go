@@ -37,7 +37,8 @@ var (
 	// ErrCheckpointRequired reports bounded buffered-visible staging pressure.
 	// The caller must checkpoint the generations it has already published
 	// before retrying. No rejected batch has been accepted or made visible.
-	ErrCheckpointRequired = errors.New("vibedb: Store buffered checkpoint required")
+	ErrCheckpointRequired  = errors.New("vibedb: Store buffered checkpoint required")
+	ErrPublicationConflict = errors.New("vibedb: Store conditional publication conflict")
 )
 
 // CommitterOptions fixes automatic persistence queue memory. Descriptor
@@ -190,6 +191,8 @@ type Batch struct {
 	index                         uint32
 	state                         atomic.Uint32
 	publicationDescriptor         []byte
+	expectedPreviousGeneration    uint64
+	conditionalPublication        bool
 }
 
 // SetPublicationDescriptor attaches a canonical logical mutation batch to the
@@ -199,6 +202,15 @@ func (b *Batch) SetPublicationDescriptor(descriptor []byte) error {
 		return ErrBatchState
 	}
 	b.publicationDescriptor = descriptor
+	return nil
+}
+
+func (b *Batch) SetExpectedPreviousGeneration(generation uint64) error {
+	if b == nil || b.state.Load() != batchOwned || generation == 0 {
+		return ErrBatchState
+	}
+	b.expectedPreviousGeneration = generation
+	b.conditionalPublication = true
 	return nil
 }
 
@@ -702,6 +714,9 @@ func (c *Committer) publishRetiring(
 	}
 	if generation == 0 || generation <= c.published.Load() {
 		return superseded, ErrGenerationOrder
+	}
+	if batch.conditionalPublication && c.published.Load() != batch.expectedPreviousGeneration {
+		return superseded, ErrPublicationConflict
 	}
 	if batch.rootGeneration != 0 && batch.rootGeneration != generation {
 		return superseded, ErrGenerationOrder

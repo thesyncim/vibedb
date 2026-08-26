@@ -81,3 +81,58 @@ func TestCommitterPublicationObserverPrecedesVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCommitterConditionalPublicationCAS(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "conditional-publish")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	pageSize := os.Getpagesize()
+	if err = f.Truncate(int64(testMutableStoreDataStart(uint32(pageSize)))); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewCommitter(f, DeviceOptions{Backend: BackendPortable, BufferCount: 4, BufferSize: pageSize}, CommitterOptions{QueueSlots: 2, MaxPagesPerBatch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish := func(generation, expected uint64) error {
+		b, err := c.Begin(0)
+		if err != nil {
+			return err
+		}
+		root := testInlineSuperblock(generation)
+		root.PageSize = uint32(pageSize)
+		root.State.PageSize = uint32(pageSize)
+		root.State.MaxPageSize = uint32(pageSize)
+		root.FileEnd = testMutableStoreDataStart(uint32(pageSize))
+		if err = b.SetInlineSuperblock(root); err != nil {
+			return err
+		}
+		if expected != 0 {
+			if err = b.SetExpectedPreviousGeneration(expected); err != nil {
+				return err
+			}
+		}
+		err = b.Publish(generation)
+		if err != nil {
+			_ = b.Abort()
+		}
+		return err
+	}
+	if err = publish(1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = publish(2, 9); !errors.Is(err, ErrPublicationConflict) {
+		t.Fatalf("stale CAS = %v", err)
+	}
+	if c.PublishedGeneration() != 1 {
+		t.Fatalf("stale CAS published %d", c.PublishedGeneration())
+	}
+	if err = publish(2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

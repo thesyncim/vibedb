@@ -39,6 +39,19 @@ func (t *WriteTransaction) PublishInline(state StateRoot, free InlineFreeDelta) 
 	return err
 }
 
+// PublishInlineConditional atomically selects state only when expected is
+// still the committer's newest published generation.
+func (t *WriteTransaction) PublishInlineConditional(state StateRoot, free InlineFreeDelta, expected uint64) error {
+	if t == nil || !t.active || t.batch == nil {
+		return ErrBatchState
+	}
+	if err := t.batch.SetExpectedPreviousGeneration(expected); err != nil {
+		return err
+	}
+	_, err := t.publishInline(state, free, nil, nil, nil)
+	return err
+}
+
 // PublishInlineRetiring is PublishInline with a conservative buffered-
 // checkpoint optimization. retired must be the exact physical extents the
 // state being published makes unreachable. A manual committer may recycle an
