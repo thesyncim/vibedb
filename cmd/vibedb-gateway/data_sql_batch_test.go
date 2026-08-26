@@ -141,6 +141,9 @@ func newSQLBatchWireFixture(
 		group.GroupID[14], group.GroupID[15] = byte(groupIndex>>8), byte(groupIndex+1)
 		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
 			Distribution: distributionName, Shard: "all", Group: group, AllocationGeneration: 1,
+			RangeIdentity:        replication.Digest{byte(groupIndex + 1), 0x51},
+			LineageDigest:        replication.Digest{byte(groupIndex + 1), 0x52},
+			ForwardingRuleDigest: replication.Digest{byte(groupIndex + 1), 0x53},
 			Command: raftservice.CommandFence{
 				ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
 				OwnershipEpoch: 7, SchemaGeneration: 8,
