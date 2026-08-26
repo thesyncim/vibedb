@@ -19,7 +19,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -119,6 +121,21 @@ func bootstrapPreparedRF3(
 	if target == nil || profile.LocalIdentity().Node != target.NodeID ||
 		profile.LocalIdentity().TrustDomain != wantDomain {
 		return errInvalidBootstrapRF3Manifest
+	}
+	grantInstaller, err := openDurableRF3GrantInstaller(
+		rf3MembershipGrantPath(member), coldRF3GrantAuthority{
+			group: groupFromBinding(base.Binding), members: member.Members, target: *target,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	deadline := func() time.Time { return time.Now().Add(bootstrapRF3NetworkTimeout) }
+	membershipControl, err := shardservice.NewMembershipGrantControlService(
+		grantInstaller, policy, deadline, deadline,
+	)
+	if err != nil {
+		return err
 	}
 	database, err := sqldriver.Open(member.SQL.Path)
 	if err != nil {
@@ -225,22 +242,32 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
+	complete := make(chan struct{}, 1)
+	controlMux, err := shardcontrol.New(
+		shardcontrol.Route{
+			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
+			Handler:       membershipControl,
+		},
+		shardcontrol.Route{
+			Discriminator: snapshottransfer.BootstrapRequestDiscriminator(),
+			Handler: rf3BootstrapCompletionHandler{
+				Handler: service, Complete: complete,
+			},
+		},
+	)
+	if err != nil {
+		return err
+	}
 
 	controlCtx, stopControl := context.WithCancelCause(parent)
 	defer stopControl(context.Canceled)
-	complete := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
 		done <- controlTLS.Serve(controlCtx, listener, servicetls.Limits{
 			MaxConnections: 8, MaxHandshakes: 4,
 			HandshakeDeadline: func() time.Time { return time.Now().Add(bootstrapRF3NetworkTimeout) },
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			if service.Serve(ctx, connection) == nil {
-				select {
-				case complete <- struct{}{}:
-				default:
-				}
-			}
+			_ = controlMux.Serve(ctx, connection)
 		})
 	}()
 	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 cold bootstrap ready member=%d control=%s\n",
@@ -264,6 +291,24 @@ func bootstrapPreparedRF3(
 		return err
 	}
 	return servePreparedRF3(parent, member)
+}
+
+type rf3BootstrapCompletionHandler struct {
+	shardcontrol.Handler
+	Complete chan<- struct{}
+}
+
+func (handler rf3BootstrapCompletionHandler) Serve(
+	ctx context.Context, connection rafttransport.PeerConnection,
+) error {
+	err := handler.Handler.Serve(ctx, connection)
+	if err == nil {
+		select {
+		case handler.Complete <- struct{}{}:
+		default:
+		}
+	}
+	return err
 }
 
 func validateBootstrapRF3Topology(bootstrap bootstrapRF3Manifest, member rf3Manifest) error {

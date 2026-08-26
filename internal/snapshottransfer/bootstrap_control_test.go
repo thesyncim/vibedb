@@ -21,6 +21,18 @@ type memoryBootstrapJournal struct {
 	faultOnce  bool
 }
 
+func TestBootstrapRequestDiscriminatorMatchesCanonicalWire(t *testing.T) {
+	request, _, _ := bootstrapControlFixture()
+	raw, err := AppendBootstrapRequest(nil, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discriminator := BootstrapRequestDiscriminator()
+	if !bytes.Equal(raw[:len(discriminator)], discriminator[:]) {
+		t.Fatalf("discriminator=%x wire=%x", discriminator, raw[:len(discriminator)])
+	}
+}
+
 func (journal *memoryBootstrapJournal) ReadBootstrap(
 	_ context.Context,
 	operation [32]byte,

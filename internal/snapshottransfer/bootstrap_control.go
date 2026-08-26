@@ -36,6 +36,10 @@ var (
 	bootstrapResponseMagic = [8]byte{'V', 'B', 'B', 'R', 'E', 'S', 0, 0}
 )
 
+// BootstrapRequestDiscriminator identifies this fixed grammar when the cold
+// learner shares its authenticated control listener with grant installation.
+func BootstrapRequestDiscriminator() [8]byte { return bootstrapRequestMagic }
+
 type BootstrapState uint8
 
 const (

@@ -175,9 +175,15 @@ func servePreparedRF3WithListen(
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
 	}
+	grantInstaller, err := openDurableRF3GrantInstaller(
+		rf3MembershipGrantPath(manifest), transportRegistry,
+	)
+	if err != nil {
+		return closePrepared(fmt.Errorf("%w: restore membership grant: %v", errRF3Serving, err))
+	}
 	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
 	membershipControl, err := shardservice.NewMembershipGrantControlService(
-		transportRegistry, policy, deadline, deadline,
+		grantInstaller, policy, deadline, deadline,
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: membership grant control: %v", errRF3Serving, err))
