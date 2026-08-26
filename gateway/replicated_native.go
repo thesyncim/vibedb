@@ -14,7 +14,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -178,6 +180,118 @@ type ReplicatedPointResult struct {
 	Value   []byte
 	State   shardservice.ReplicatedMemberState
 	Retries int
+}
+
+type ReplicatedRequestLedgerRead struct {
+	Key                   requestledger.RequestKey
+	ExpectedRangeIdentity requestledger.Digest
+	Kind                  replicatedstate.RequestLedgerReadKind
+	Ordinal               uint64
+	ContentRoot           requestledger.Digest
+	MinimumApplied        uint64
+	MaxBytes              uint32
+}
+
+type ReplicatedRequestLedgerReadResult struct {
+	Applied           uint64
+	Found             bool
+	AuthoritativeKind replicatedstate.RequestLedgerReadKind
+	Value             []byte
+	State             shardservice.ReplicatedMemberState
+	Retries           int
+}
+
+// ReadRequestLedger performs one leader ReadIndex-fenced, full-key hidden
+// ledger read under the dedicated gateway-service capability. The wire cannot
+// name the private system relation and an ACK tombstone may authoritatively
+// override the requested auxiliary row kind.
+func (executor *ReplicatedExecutor) ReadRequestLedger(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedRequestLedgerRead,
+) (ReplicatedRequestLedgerReadResult, error) {
+	stateRead := replicatedstate.RequestLedgerReadRequest{
+		Key: read.Key, ExpectedRangeIdentity: read.ExpectedRangeIdentity,
+		Kind: read.Kind, Ordinal: read.Ordinal, ContentRoot: read.ContentRoot,
+		MinimumApplied: read.MinimumApplied, MaxBytes: read.MaxBytes,
+	}
+	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) ||
+		replicatedstate.ValidateRequestLedgerReadRequest(stateRead) != nil {
+		return ReplicatedRequestLedgerReadResult{}, ErrReplicatedRoute
+	}
+	preferred := route.Replicas[0].Member
+	var joined error
+	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
+		endpoint, state, err := executor.discoverLeader(ctx, route, preferred,
+			serviceauthz.CapabilityRequestLedger)
+		if err != nil {
+			joined = errors.Join(joined, err)
+			preferred = 0
+			continue
+		}
+		wireRead := shardservice.ReplicatedRequestLedgerReadRequest{
+			Key: read.Key, ExpectedRangeIdentity: read.ExpectedRangeIdentity,
+			Kind: read.Kind, Ordinal: read.Ordinal, ContentRoot: read.ContentRoot,
+			MinimumApplied: read.MinimumApplied, MaxBytes: read.MaxBytes,
+		}
+		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
+			Operation:  shardservice.ReplicatedRequestLedgerRead,
+			Capability: serviceauthz.CapabilityRequestLedger,
+			Fence:      state.Fence, RequestLedgerRead: wireRead,
+		})
+		if err != nil {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, err)
+			preferred = 0
+			continue
+		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedRequestLedgerReadResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+		}
+		if !validReplicatedResponseState(response) || response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.MemberID != endpoint.Member ||
+			response.State.Fence.Command != route.Command {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+			continue
+		}
+		switch response.Kind {
+		case shardservice.ReplicatedRequestLedgerReadResult:
+			opened, openErr := shardservice.OpenReplicatedRequestLedgerReadValue(response.Value)
+			if openErr != nil || response.ReadApplied < read.MinimumApplied ||
+				response.State.Applied < response.ReadApplied || len(opened.Value) > int(read.MaxBytes) ||
+				(opened.Found && opened.AuthoritativeKind != read.Kind &&
+					opened.AuthoritativeKind != replicatedstate.RequestLedgerReadAck) {
+				joined = errors.Join(joined, openErr, ErrReplicatedRoute)
+				continue
+			}
+			executor.leaderHints.publish(route, endpoint, response.State)
+			return ReplicatedRequestLedgerReadResult{
+				Applied: response.ReadApplied, Found: opened.Found,
+				AuthoritativeKind: opened.AuthoritativeKind, Value: opened.Value,
+				State: response.State, Retries: attempt,
+			}, nil
+		case shardservice.ReplicatedNotLeader:
+			executor.leaderHints.invalidate(route, endpoint, state)
+			preferred = response.State.LeaderID
+			joined = errors.Join(joined, raftmodel.ErrNotLeader)
+		case shardservice.ReplicatedRefusal:
+			if response.Refusal == shardservice.ReplicatedRefusalStaleFence ||
+				response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
+				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound ||
+				response.Refusal == shardservice.ReplicatedRefusalRequestLedgerReadMalformed {
+				return ReplicatedRequestLedgerReadResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			preferred = 0
+		default:
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+		}
+	}
+	return ReplicatedRequestLedgerReadResult{}, errors.Join(ErrReplicatedLeader, joined)
 }
 
 func (executor *ReplicatedExecutor) ReadPoint(
@@ -607,6 +721,18 @@ func (executor *ReplicatedExecutor) ProposeTopology(
 		serviceauthz.CapabilityTopology, replicatedUnknownCommandClone)
 }
 
+// ProposeRequestLedger submits one exact internal durable-request lifecycle
+// command under the narrow delegated ledger capability. It cannot borrow data,
+// topology, or transaction-recovery authority.
+func (executor *ReplicatedExecutor) ProposeRequestLedger(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, false,
+		serviceauthz.CapabilityRequestLedger, replicatedUnknownCommandClone)
+}
+
 // RetryUnknown retries exact bytes retained from an earlier UnknownOutcomeError.
 // Pre-admission refusals cannot resolve that earlier attempt; only a validated
 // completion or an applied deterministic refusal may settle the command.
@@ -628,6 +754,18 @@ func (executor *ReplicatedExecutor) RetryTopologyUnknown(
 ) (ReplicatedResult, error) {
 	return executor.propose(ctx, route, command, nil, true,
 		serviceauthz.CapabilityTopology, replicatedUnknownCommandClone)
+}
+
+// RetryRequestLedgerUnknown resends the byte-identical lifecycle proposal
+// after outcome-unknown. The caller must still validate the fixed completion
+// tuple against the original inner command.
+func (executor *ReplicatedExecutor) RetryRequestLedgerUnknown(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, true,
+		serviceauthz.CapabilityRequestLedger, replicatedUnknownCommandClone)
 }
 
 type replicatedUnknownCommandMode uint8

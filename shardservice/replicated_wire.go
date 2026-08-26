@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -22,6 +23,7 @@ const (
 	tagReplicatedRequest           = 'P'
 	tagReplicatedMembershipRequest = 'M'
 	tagReplicatedTransactionRead   = 'T'
+	tagReplicatedRequestLedgerRead = 'L'
 	tagReplicatedResponse          = 'A'
 	// A response with state has a 297-byte body before a completion. The fixed
 	// request digest is zero for nonterminal responses and binds terminal
@@ -44,6 +46,11 @@ const replicatedMembershipRequestBodyBytes = 311
 // tag lets the decoder reject a hostile frame length before allocating its body.
 const replicatedTransactionReadRequestBodyBytes = 277
 
+// Request-ledger recovery reads carry the common 242-byte authenticated RF3
+// prefix plus one complete fixed-width RequestKey and exact hidden-row
+// selector. Digest-only lookups are deliberately not representable.
+const replicatedRequestLedgerReadRequestBodyBytes = 416
+
 const (
 	MaxReplicatedTransactionReadBytes = replicatedstate.MaxTransactionRecoveryReadBytes
 	MaxReplicatedTransactionScanItems = replicatedstate.MaxTransactionRecoveryScanRows
@@ -63,6 +70,7 @@ const (
 	ReplicatedReadLeader
 	ReplicatedReadFollower
 	ReplicatedTransactionRead
+	ReplicatedRequestLedgerRead
 )
 
 // ReplicatedTransactionReadKind is the complete RF3 recovery-read surface.
@@ -90,6 +98,16 @@ type ReplicatedTransactionReadRequest struct {
 	MaxBytes       uint32
 }
 
+type ReplicatedRequestLedgerReadRequest struct {
+	Key                   requestledger.RequestKey
+	ExpectedRangeIdentity requestledger.Digest
+	Kind                  replicatedstate.RequestLedgerReadKind
+	Ordinal               uint64
+	ContentRoot           requestledger.Digest
+	MinimumApplied        uint64
+	MaxBytes              uint32
+}
+
 // ReplicatedFence identifies one exact live Runtime and leadership term. Probe
 // requires only Group and AllocationGeneration; Propose requires every field.
 type ReplicatedFence struct {
@@ -105,17 +123,18 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation       ReplicatedOperation
-	Authority       serviceauthz.Authority
-	Capability      serviceauthz.Capability
-	Fence           ReplicatedFence
-	Command         []byte
-	Membership      ReplicatedMembershipRequest
-	Relation        replication.RelationID
-	Key             []byte
-	MinimumApplied  uint64
-	MaxValueBytes   uint32
-	TransactionRead ReplicatedTransactionReadRequest
+	Operation         ReplicatedOperation
+	Authority         serviceauthz.Authority
+	Capability        serviceauthz.Capability
+	Fence             ReplicatedFence
+	Command           []byte
+	Membership        ReplicatedMembershipRequest
+	Relation          replication.RelationID
+	Key               []byte
+	MinimumApplied    uint64
+	MaxValueBytes     uint32
+	TransactionRead   ReplicatedTransactionReadRequest
+	RequestLedgerRead ReplicatedRequestLedgerReadRequest
 }
 
 // ReplicatedMembershipRequest is a fixed-width control envelope. It contains
@@ -145,6 +164,7 @@ const (
 	ReplicatedReadFound
 	ReplicatedReadMissing
 	ReplicatedTransactionReadResult
+	ReplicatedRequestLedgerReadResult
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -166,6 +186,7 @@ const (
 	ReplicatedRefusalReadBufferBound
 	ReplicatedRefusalUnauthorized
 	ReplicatedRefusalTransactionReadMalformed
+	ReplicatedRefusalRequestLedgerReadMalformed
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -225,6 +246,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		e.bytes(request.Key)
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
+	case ReplicatedRequestLedgerRead:
+		encodeReplicatedRequestLedgerRead(&e, request.RequestLedgerRead)
 	}
 	if e.err != nil {
 		return e.err
@@ -234,6 +257,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		tag = tagReplicatedMembershipRequest
 	} else if request.Operation == ReplicatedTransactionRead {
 		tag = tagReplicatedTransactionRead
+	} else if request.Operation == ReplicatedRequestLedgerRead {
+		tag = tagReplicatedRequestLedgerRead
 	}
 	return writeEncodedFrame(w, tag, e.b)
 }
@@ -277,6 +302,9 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
 		tag = tagReplicatedTransactionRead
+	case ReplicatedRequestLedgerRead:
+		encodeReplicatedRequestLedgerRead(&e, request.RequestLedgerRead)
+		tag = tagReplicatedRequestLedgerRead
 	}
 	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
 		return errFrameTooLarge
@@ -339,6 +367,8 @@ func decodeReplicatedRequest(
 		request.Key = d.slice()
 	case ReplicatedTransactionRead:
 		request.TransactionRead = decodeReplicatedTransactionRead(&d)
+	case ReplicatedRequestLedgerRead:
+		request.RequestLedgerRead = decodeReplicatedRequestLedgerRead(&d)
 	}
 	if err := d.end(); err != nil {
 		if budget != nil {
@@ -424,6 +454,31 @@ func readReplicatedRequestFrame(
 			return nil, 0, tag, err
 		}
 		return body, charged, tag, nil
+	case tagReplicatedRequestLedgerRead:
+		if size != replicatedRequestLedgerReadRequestBodyBytes {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		var prefix [2]byte
+		if _, err := io.ReadFull(r, prefix[:]); err != nil {
+			return nil, 0, tag, err
+		}
+		if prefix[0] != replicatedWireVersion ||
+			ReplicatedOperation(prefix[1]) != ReplicatedRequestLedgerRead {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		charged = int64(size)
+		if budget != nil && !budget.reserve(charged) {
+			return nil, 0, tag, errFrameBudget
+		}
+		body = make([]byte, size)
+		copy(body[:2], prefix[:])
+		if _, err := io.ReadFull(r, body[2:]); err != nil {
+			if budget != nil {
+				budget.release(charged)
+			}
+			return nil, 0, tag, err
+		}
+		return body, charged, tag, nil
 	case tagReplicatedRequest:
 		if size > maxFrameBody {
 			return nil, 0, tag, errFrameTooLarge
@@ -455,7 +510,8 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	}
 	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
-		response.Kind == ReplicatedTransactionReadResult {
+		response.Kind == ReplicatedTransactionReadResult ||
+		response.Kind == ReplicatedRequestLedgerReadResult {
 		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
 	}
 	e := encbuf{b: make([]byte, 5, 5+bodyHint)}
@@ -474,7 +530,8 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	encodeReplicatedDigest(&e, response.RequestDigest)
 	e.bytes(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
-		response.Kind == ReplicatedTransactionReadResult {
+		response.Kind == ReplicatedTransactionReadResult ||
+		response.Kind == ReplicatedRequestLedgerReadResult {
 		e.u64(response.ReadApplied)
 		e.bytes(response.Value)
 	}
@@ -518,7 +575,8 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
-		response.Kind == ReplicatedTransactionReadResult {
+		response.Kind == ReplicatedTransactionReadResult ||
+		response.Kind == ReplicatedRequestLedgerReadResult {
 		response.ReadApplied = d.u64()
 		response.Value = d.slice()
 		response.Value = response.Value[:len(response.Value):len(response.Value)]
@@ -549,6 +607,9 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 	case ReplicatedTransactionRead:
 		return replicatedReadResponseFixedBodyBytes +
 			replicatedTransactionReadValueHeaderBytes + int(request.TransactionRead.MaxBytes), nil
+	case ReplicatedRequestLedgerRead:
+		return replicatedReadResponseFixedBodyBytes +
+			replicatedRequestLedgerReadValueHeaderBytes + int(request.RequestLedgerRead.MaxBytes), nil
 	default:
 		return 0, ErrReplicatedWire
 	}
@@ -560,6 +621,8 @@ func replicatedRequestTagMatches(operation ReplicatedOperation, tag byte) bool {
 		return tag == tagReplicatedMembershipRequest
 	case ReplicatedTransactionRead:
 		return tag == tagReplicatedTransactionRead
+	case ReplicatedRequestLedgerRead:
+		return tag == tagReplicatedRequestLedgerRead
 	default:
 		return tag == tagReplicatedRequest
 	}
@@ -588,6 +651,43 @@ func decodeReplicatedTransactionRead(d *deccur) ReplicatedTransactionReadRequest
 		request.MaxRows = binary.BigEndian.Uint16(d.b[:2])
 		d.b = d.b[2:]
 	}
+	request.MaxBytes = d.u32()
+	return request
+}
+
+func encodeReplicatedRequestLedgerRead(
+	e *encbuf,
+	request ReplicatedRequestLedgerReadRequest,
+) {
+	e.u8(uint8(request.Key.Scope))
+	e.b = append(e.b, request.Key.Principal[:]...)
+	e.b = append(e.b, request.Key.Request[:]...)
+	e.b = append(e.b, request.Key.TenantDigest[:]...)
+	e.u64(request.Key.IssuerEpoch)
+	e.u64(request.Key.IssuerSequence)
+	e.b = append(e.b, request.Key.IssuerLane[:]...)
+	e.b = append(e.b, request.ExpectedRangeIdentity[:]...)
+	e.u8(uint8(request.Kind))
+	e.u64(request.Ordinal)
+	e.b = append(e.b, request.ContentRoot[:]...)
+	e.u64(request.MinimumApplied)
+	e.u32(request.MaxBytes)
+}
+
+func decodeReplicatedRequestLedgerRead(d *deccur) ReplicatedRequestLedgerReadRequest {
+	request := ReplicatedRequestLedgerReadRequest{}
+	request.Key.Scope = requestledger.ScopeKind(d.u8())
+	request.Key.Principal = requestledger.PrincipalID(d.fixed16())
+	request.Key.Request = requestledger.RequestID(d.fixed16())
+	request.Key.TenantDigest = requestledger.Digest(d.fixed32())
+	request.Key.IssuerEpoch = d.u64()
+	request.Key.IssuerSequence = d.u64()
+	request.Key.IssuerLane = requestledger.IssuerLane(d.fixed8())
+	request.ExpectedRangeIdentity = requestledger.Digest(d.fixed32())
+	request.Kind = replicatedstate.RequestLedgerReadKind(d.u8())
+	request.Ordinal = d.u64()
+	request.ContentRoot = requestledger.Digest(d.fixed32())
+	request.MinimumApplied = d.u64()
 	request.MaxBytes = d.u32()
 	return request
 }
@@ -722,12 +822,14 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
 			request.MaxValueBytes == 0 &&
-			request.TransactionRead == (ReplicatedTransactionReadRequest{})
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
 	case ReplicatedPropose:
 		if !validReplicatedProposalCapability(request.Capability) ||
 			request.Membership != (ReplicatedMembershipRequest{}) || request.Relation != 0 ||
 			len(request.Key) != 0 || request.MinimumApplied != 0 || request.MaxValueBytes != 0 ||
-			request.TransactionRead != (ReplicatedTransactionReadRequest{}) {
+			request.TransactionRead != (ReplicatedTransactionReadRequest{}) ||
+			request.RequestLedgerRead != (ReplicatedRequestLedgerReadRequest{}) {
 			return false
 		}
 		if !validReplicatedFence(request.Fence, true) || len(request.Command) == 0 ||
@@ -737,7 +839,8 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 		command, err := replication.OpenCommand(request.Command)
 		return err == nil && replicatedCommandCapabilityMatches(
 			request.Capability, command.Kind(), command.AuthorityClass,
-		) && command.ClusterID == request.Fence.Group.ClusterID &&
+		) && validReplicatedRequestLedgerPrincipal(request, command) &&
+			command.ClusterID == request.Fence.Group.ClusterID &&
 			command.ClusterIncarnation == request.Fence.Group.ClusterIncarnation &&
 			command.TopologyRecoveryEpoch == request.Fence.Group.TopologyRecoveryEpoch &&
 			command.ShardIncarnation == request.Fence.Group.ShardIncarnation &&
@@ -757,7 +860,8 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
 			request.MaxValueBytes == 0 &&
-			request.TransactionRead == (ReplicatedTransactionReadRequest{})
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		return validReplicatedReadCapability(request.Capability) &&
 			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
@@ -766,16 +870,57 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			len(request.Key) != 0 && len(request.Key) <= replication.MaxMutationKeyBytes &&
 			request.MinimumApplied != 0 && request.MaxValueBytes != 0 &&
 			request.MaxValueBytes <= replication.MaxMutationValueBytes &&
-			request.TransactionRead == (ReplicatedTransactionReadRequest{})
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
 	case ReplicatedTransactionRead:
 		return request.Capability == serviceauthz.CapabilityTransactionRecovery &&
 			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
 			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
-			request.MaxValueBytes == 0 && validReplicatedTransactionRead(request.TransactionRead)
+			request.MaxValueBytes == 0 && validReplicatedTransactionRead(request.TransactionRead) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
+	case ReplicatedRequestLedgerRead:
+		return request.Capability == serviceauthz.CapabilityRequestLedger &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) && request.Relation == 0 &&
+			len(request.Key) == 0 && request.MinimumApplied == 0 && request.MaxValueBytes == 0 &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			validReplicatedRequestLedgerRead(request.RequestLedgerRead)
 	default:
 		return false
 	}
+}
+
+// validReplicatedRequestLedgerPrincipal keeps local-install identities off the
+// authenticated RF3 wire. The outer authority is the trusted gateway service
+// (Delegate+RequestLedger); the immutable end-user issuer stays inside Head
+// and is not required to equal that service. Later operations carry only the
+// key digest, which the state machine binds to retained state.
+func validReplicatedRequestLedgerPrincipal(
+	request *ReplicatedRequest,
+	command replication.CommandView,
+) bool {
+	if request.Capability != serviceauthz.CapabilityRequestLedger {
+		return true
+	}
+	if request.Authority.Node == (rafttransport.NodeID{}) {
+		return false
+	}
+	if command.ClientID != replication.ID128(request.Authority.Node) {
+		return false
+	}
+	// Admission inspects only Create's authenticated subject. Nil scratch
+	// fully validates pending bytes without putting a 256-entry StepRef array
+	// on every shard-wire request stack.
+	inner, err := command.OpenRequestLedgerInto(nil)
+	if err != nil {
+		return false
+	}
+	head, creates := inner.Head()
+	if !creates {
+		return true
+	}
+	return head.Key.Scope == requestledger.ScopeAuthenticated
 }
 
 func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
@@ -788,6 +933,10 @@ func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
 		return kind == replication.CommandTransaction &&
 			class == replication.CommandAuthorityData
 	}
+	if capability == serviceauthz.CapabilityRequestLedger {
+		return kind == replication.CommandRequestLedger &&
+			class == replication.CommandAuthorityRequestLedger
+	}
 	return (capability == 0 || capability == serviceauthz.CapabilityDataWrite) &&
 		class == replication.CommandAuthorityData
 }
@@ -797,13 +946,15 @@ func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
 		capability == serviceauthz.CapabilityDataWrite ||
 		capability == serviceauthz.CapabilityMembership ||
 		capability == serviceauthz.CapabilityTopology ||
-		capability == serviceauthz.CapabilityTransactionRecovery
+		capability == serviceauthz.CapabilityTransactionRecovery ||
+		capability == serviceauthz.CapabilityRequestLedger
 }
 
 func validReplicatedProposalCapability(capability serviceauthz.Capability) bool {
 	return capability == 0 || capability == serviceauthz.CapabilityDataWrite ||
 		capability == serviceauthz.CapabilityTopology ||
-		capability == serviceauthz.CapabilityTransactionRecovery
+		capability == serviceauthz.CapabilityTransactionRecovery ||
+		capability == serviceauthz.CapabilityRequestLedger
 }
 
 func validReplicatedReadCapability(capability serviceauthz.Capability) bool {
@@ -816,6 +967,14 @@ func validReplicatedTransactionRead(request ReplicatedTransactionReadRequest) bo
 	return ok
 }
 
+func validReplicatedRequestLedgerRead(request ReplicatedRequestLedgerReadRequest) bool {
+	return replicatedstate.ValidateRequestLedgerReadRequest(replicatedstate.RequestLedgerReadRequest{
+		Key: request.Key, ExpectedRangeIdentity: request.ExpectedRangeIdentity,
+		Kind: request.Kind, Ordinal: request.Ordinal, ContentRoot: request.ContentRoot,
+		MinimumApplied: request.MinimumApplied, MaxBytes: request.MaxBytes,
+	}) == nil
+}
+
 func validReplicatedMemberState(state ReplicatedMemberState) bool {
 	return validReplicatedFence(state.Fence, true) &&
 		state.Commit >= state.Applied && state.Applied >= state.CheckpointApplied
@@ -826,7 +985,8 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		(response.HasState && !validReplicatedMemberState(response.State)) ||
 		len(response.Completion) > replicatedstate.MaxCompletionEnvelopeBytes ||
 		response.Outcome.CompletionBytes != len(response.Completion) ||
-		len(response.Value) > replication.MaxMutationValueBytes {
+		len(response.Value) > max(replication.MaxMutationValueBytes,
+			requestledger.MaxCommandBytes+replicatedRequestLedgerReadValueHeaderBytes) {
 		return false
 	}
 	switch response.Kind {
@@ -883,7 +1043,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) &&
 			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable ||
 				response.Refusal == ReplicatedRefusalUnauthorized) &&
-			response.Refusal <= ReplicatedRefusalTransactionReadMalformed
+			response.Refusal <= ReplicatedRefusalRequestLedgerReadMalformed
 	case ReplicatedReadFound:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&
@@ -901,12 +1061,18 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			validReplicatedTransactionReadValue(response.Value)
+	case ReplicatedRequestLedgerReadResult:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+			validReplicatedRequestLedgerReadValue(response.Value)
 	default:
 		return false
 	}
 }
 
-// validReplicatedCompletionResult closes the wire result grammar over the two
+// validReplicatedCompletionResult closes the wire result grammar over the
 // shipped state-machine formats. The generic completion envelope authenticates
 // arbitrary result metadata, so opening it alone is insufficient: accepting a
 // malformed fixed result here would turn a committed invariant failure into a
@@ -925,6 +1091,11 @@ func validReplicatedCompletionResult(completion replication.CompletionView) bool
 		return err == nil
 	case replicatedstate.ResultFormatTransaction:
 		_, err := replicatedstate.OpenTransactionCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		return err == nil
+	case replicatedstate.ResultFormatRequestLedger:
+		_, err := replicatedstate.OpenRequestLedgerCompletionResult(
 			completion.ResultCode, completion.InlineResult,
 		)
 		return err == nil

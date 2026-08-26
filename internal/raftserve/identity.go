@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 )
 
 const attemptDigestDomain = "vibedb/raft-serving/attempt/format-0\x00"
@@ -22,6 +23,7 @@ const (
 	requestNamespaceSequenced requestNamespace = iota + 1
 	requestNamespaceOpen
 	requestNamespaceRelease
+	requestNamespaceLedger
 )
 
 type requestPosition struct {
@@ -35,12 +37,19 @@ type requestPosition struct {
 
 type commandIdentity struct {
 	position             requestPosition
+	completionKey        [32]byte
 	fingerprint          replication.Digest
 	logical              [32]byte
 	attempt              [32]byte
 	tenant               []byte
+	kind                 replication.CommandKind
 	transactionRole      distributedtxn.ReplicatedRole
 	transactionOperation distributedtxn.ReplicatedOperation
+	ledgerOperation      requestledger.Operation
+	ledgerKeyDigest      requestledger.Digest
+	ledgerRequestDigest  requestledger.Digest
+	ledgerPlanRoot       requestledger.Digest
+	ledgerRangeIdentity  requestledger.Digest
 }
 
 func openCommandIdentity(
@@ -55,22 +64,50 @@ func openCommandIdentity(
 		return commandIdentity{}, ErrCommandGroupMismatch
 	}
 	transactionRole, transactionOperation, _ := command.TransactionIdentity()
+	completionKey := replicatedstate.SessionKey(
+		command.AuthorityClass, command.Tenant, command.ClientID,
+	)
+	sessionDigest := completionKey
+	var ledgerOperation requestledger.Operation
+	var ledgerKeyDigest, ledgerRequestDigest, ledgerPlanRoot, ledgerRangeIdentity requestledger.Digest
+	if command.Kind() == replication.CommandRequestLedger {
+		// Identity needs only the fixed command header. The nil-scratch path
+		// still validates a pending wave's complete byte grammar without
+		// materializing 256 StepRefs on every proposal stack.
+		ledger, ledgerErr := command.OpenRequestLedgerInto(nil)
+		if ledgerErr != nil {
+			return commandIdentity{}, ledgerErr
+		}
+		sessionDigest = [32]byte(ledger.KeyDigest)
+		ledgerOperation = ledger.Operation
+		ledgerKeyDigest = ledger.KeyDigest
+		ledgerRequestDigest = ledger.RequestDigest
+		ledgerPlanRoot = ledger.PlanRoot
+		ledgerRangeIdentity = ledger.ExpectedRangeIdentity
+	}
 	logical := replicatedstate.LogicalCommandDigest(command)
 	return commandIdentity{
 		position: requestPosition{
 			group:         group,
-			sessionDigest: replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
+			sessionDigest: sessionDigest,
 			clientID:      command.ClientID,
 			epoch:         command.ClientEpoch,
 			sequence:      command.ClientSequence,
 			namespace:     namespaceForCommand(command.Kind()),
 		},
+		completionKey:        completionKey,
 		fingerprint:          command.Fingerprint,
 		logical:              logical,
 		attempt:              attemptDigest(command, logical),
 		tenant:               command.Tenant,
+		kind:                 command.Kind(),
 		transactionRole:      transactionRole,
 		transactionOperation: transactionOperation,
+		ledgerOperation:      ledgerOperation,
+		ledgerKeyDigest:      ledgerKeyDigest,
+		ledgerRequestDigest:  ledgerRequestDigest,
+		ledgerPlanRoot:       ledgerPlanRoot,
+		ledgerRangeIdentity:  ledgerRangeIdentity,
 	}, nil
 }
 
@@ -80,6 +117,8 @@ func namespaceForCommand(kind replication.CommandKind) requestNamespace {
 		return requestNamespaceOpen
 	case replication.CommandSessionRelease:
 		return requestNamespaceRelease
+	case replication.CommandRequestLedger:
+		return requestNamespaceLedger
 	default:
 		return requestNamespaceSequenced
 	}

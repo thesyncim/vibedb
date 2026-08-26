@@ -51,6 +51,9 @@ var (
 	ErrTransactionRecoveryUnauthorized = errors.New(
 		"raftservice: transaction recovery is not authorized",
 	)
+	ErrRequestLedgerUnauthorized = errors.New(
+		"raftservice: request ledger recovery is not authorized",
+	)
 )
 
 // Limits bounds every object retained outside Host and rafttransport. Host and
@@ -100,6 +103,7 @@ const (
 	requestReadLinear
 	requestReadFollower
 	requestReadTransaction
+	requestReadRequestLedger
 )
 
 const (
@@ -144,6 +148,7 @@ type readRequest struct {
 type readAuthorization struct {
 	source         ReadSource
 	recovery       TransactionRecoverySource
+	requestLedger  RequestLedgerSource
 	minimumApplied uint64
 }
 
@@ -152,6 +157,7 @@ type readDelivery struct {
 	reply          chan ownerReply
 	source         ReadSource
 	recovery       TransactionRecoverySource
+	requestLedger  RequestLedgerSource
 	minimumApplied uint64
 }
 
@@ -176,6 +182,16 @@ type TransactionRecoverySource interface {
 		[]replicatedstate.TransactionRecoveryRecord,
 		[]byte,
 	) (replicatedstate.TransactionRecoveryReadResult, error)
+}
+
+// RequestLedgerSource exposes one exact full-key hidden-ledger row read. It is
+// intentionally a separate narrow interface so transaction recovery or data
+// read authority cannot name the private request-ledger collection.
+type RequestLedgerSource interface {
+	RequestLedgerReadInto(
+		replicatedstate.RequestLedgerReadRequest,
+		[]byte,
+	) (replicatedstate.RequestLedgerReadResult, error)
 }
 
 // Result is one terminal deterministic apply result. Completion is the exact
@@ -234,6 +250,26 @@ type TransactionReadLease interface {
 	Release()
 }
 
+// RequestLedgerReadRequest wraps the full-key replicated-state read with the
+// exact live RF3 serving fence. Only the dedicated service capability may use
+// this path.
+type RequestLedgerReadRequest struct {
+	Fence      ServingFence
+	Capability serviceauthz.Capability
+	Read       replicatedstate.RequestLedgerReadRequest
+}
+
+type RequestLedgerReadResult struct {
+	Applied           uint64
+	Found             bool
+	AuthoritativeKind replicatedstate.RequestLedgerReadKind
+	Value             []byte
+}
+
+type RequestLedgerReadLease interface {
+	Release()
+}
+
 const (
 	// Native read responses retain a five-byte frame header and a 309-byte
 	// fixed body in addition to the detached store value. Charge each of the
@@ -257,6 +293,28 @@ func pointReadResponseCharge(maximum int) (int64, bool) {
 }
 
 const transactionRecoveryRecordRetainedBytes int64 = 256
+
+const (
+	requestLedgerReadEncodedFrameFixedBytes int64 = 5 + 309 + 12
+	requestLedgerReadAllocatorSlopBytes     int64 = 3 * ((8 << 10) - 1)
+)
+
+// requestLedgerReadResponseCharge covers all three simultaneously live
+// payload-sized buffers: state-machine row arena, typed native value, and the
+// final encoded response frame. The lease is released only after the serving
+// boundary writes the frame.
+func requestLedgerReadResponseCharge(maximum int) (int64, bool) {
+	if maximum <= 0 {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	fixed := requestLedgerReadEncodedFrameFixedBytes + requestLedgerReadAllocatorSlopBytes
+	payload := int64(maximum)
+	if payload > (maxInt64-fixed)/3 {
+		return 0, false
+	}
+	return payload*3 + fixed, true
+}
 
 func transactionReadResponseCharge(
 	request replicatedstate.TransactionRecoveryReadRequest,
@@ -761,7 +819,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 	case requestMembership:
 		reply.err = owner.applyMembership(request.membership)
-	case requestReadLinear, requestReadFollower, requestReadTransaction:
+	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger:
 		member, found := owner.members[request.group]
 		if !found ||
 			!servingFenceMatchesIdentity(request.read.fence, member) {
@@ -770,6 +828,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 		if request.kind == requestReadTransaction {
 			if member.recovery == nil {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadRequestLedger {
+			if _, ok := member.recovery.(RequestLedgerSource); !ok {
 				reply.err = ErrServingFence
 				break
 			}
@@ -813,6 +876,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 		request.read.delivery.source = member.read
 		request.read.delivery.recovery = member.recovery
+		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
@@ -820,7 +884,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 	default:
 		reply.err = ErrInvalidOwner
 	}
-	if (request.kind == requestReadLinear || request.kind == requestReadTransaction) &&
+	if (request.kind == requestReadLinear || request.kind == requestReadTransaction ||
+		request.kind == requestReadRequestLedger) &&
 		request.read.delivery != nil {
 		owner.settleReadDelivery(request.read.delivery, reply)
 	} else {
@@ -860,6 +925,7 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			// immutable owner member for this allocation.
 			reply.read.source = delivery.source
 			reply.read.recovery = delivery.recovery
+			reply.read.requestLedger = delivery.requestLedger
 		}
 		owner.settleReadDelivery(delivery, reply)
 	}
@@ -1229,6 +1295,65 @@ func (owner *Owner) ReadTransaction(
 	releaseReservation = false
 	return TransactionReadResult{
 		Applied: value.Fence.Applied, Complete: value.Complete, Records: value.Records,
+	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadRequestLedger serves one bounded hidden-ledger row after the same
+// leader-only quorum ReadIndex barrier used by transaction recovery. The full
+// RequestKey and immutable range identity are revalidated inside the state
+// machine after the barrier; digest-only reads are impossible.
+func (owner *Owner) ReadRequestLedger(
+	ctx context.Context,
+	request RequestLedgerReadRequest,
+) (RequestLedgerReadResult, RequestLedgerReadLease, error) {
+	if owner == nil || ctx == nil {
+		return RequestLedgerReadResult{}, nil, ErrInvalidOwner
+	}
+	if request.Capability != serviceauthz.CapabilityRequestLedger {
+		return RequestLedgerReadResult{}, nil, ErrRequestLedgerUnauthorized
+	}
+	if replicatedstate.ValidateRequestLedgerReadRequest(request.Read) != nil {
+		return RequestLedgerReadResult{}, nil, ErrInvalidOwner
+	}
+	responseCharge, ok := requestLedgerReadResponseCharge(int(request.Read.MaxBytes))
+	if !ok {
+		return RequestLedgerReadResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return RequestLedgerReadResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadRequestLedger, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{
+			fence: request.Fence, minimumApplied: request.Read.MinimumApplied,
+			delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return RequestLedgerReadResult{}, nil, err
+	}
+	dst := make([]byte, 0, request.Read.MaxBytes)
+	value, err := reply.read.requestLedger.RequestLedgerReadInto(request.Read, dst)
+	if err != nil {
+		return RequestLedgerReadResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		len(value.Value) > int(request.Read.MaxBytes) {
+		return RequestLedgerReadResult{}, nil, ErrServingFence
+	}
+	value.Value = value.Value[:len(value.Value):len(value.Value)]
+	releaseReservation = false
+	return RequestLedgerReadResult{
+		Applied: value.Fence.Applied, Found: value.Found,
+		AuthoritativeKind: value.AuthoritativeKind, Value: value.Value,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 

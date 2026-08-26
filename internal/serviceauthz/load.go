@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math/bits"
 	"os"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -82,7 +83,7 @@ func parsePrincipal(node vibejson.Node) (Entry, error) {
 		return Entry{}, ErrInvalidPolicy
 	}
 	count, ok := capabilitiesNode.ArrayLen()
-	if !ok || count == 0 || count > 7 {
+	if !ok || count == 0 || count > bits.OnesCount64(uint64(AllCapabilities)) {
 		return Entry{}, ErrInvalidPolicy
 	}
 	values, _ := capabilitiesNode.ArrayIter()
@@ -133,6 +134,8 @@ func parseCapabilityRaw(raw []byte) Capability {
 		return CapabilityTopology
 	case bytes.Equal(raw, []byte(`"transaction_recovery"`)):
 		return CapabilityTransactionRecovery
+	case bytes.Equal(raw, []byte(`"request_ledger"`)):
+		return CapabilityRequestLedger
 	default:
 		return 0
 	}

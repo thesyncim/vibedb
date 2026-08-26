@@ -267,6 +267,28 @@ func (d *deccur) fixed16() [16]byte {
 	return v
 }
 
+func (d *deccur) fixed8() [8]byte {
+	var v [8]byte
+	if len(d.b) < len(v) {
+		d.fail(errTruncated)
+		return v
+	}
+	copy(v[:], d.b[:len(v)])
+	d.b = d.b[len(v):]
+	return v
+}
+
+func (d *deccur) fixed32() [32]byte {
+	var v [32]byte
+	if len(d.b) < len(v) {
+		d.fail(errTruncated)
+		return v
+	}
+	copy(v[:], d.b[:len(v)])
+	d.b = d.b[len(v):]
+	return v
+}
+
 // slice consumes a uint32-length-prefixed byte run, refusing a length the
 // remaining body cannot satisfy.
 func (d *deccur) slice() []byte {

@@ -109,6 +109,36 @@ func TestTransactionRecoveryCapabilityIsIndependent(t *testing.T) {
 	}
 }
 
+func TestRequestLedgerCapabilityIsIndependent(t *testing.T) {
+	ledger, writer, topology, recovery := authzNode(30), authzNode(31),
+		authzNode(32), authzNode(33)
+	policy, err := NewPolicy(12, []Entry{
+		{Node: ledger, Capabilities: CapabilityRequestLedger},
+		{Node: writer, Capabilities: CapabilityDataWrite},
+		{Node: topology, Capabilities: CapabilityTopology},
+		{Node: recovery, Capabilities: CapabilityTransactionRecovery},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Check(ledger, CapabilityRequestLedger); got != DecisionAllow {
+		t.Fatalf("request ledger denied: %d", got)
+	}
+	for _, node := range []rafttransport.NodeID{writer, topology, recovery} {
+		if got := policy.Check(node, CapabilityRequestLedger); got != DecisionDenyCapability {
+			t.Fatalf("ordinary capability %x implied request ledger: %d", node, got)
+		}
+	}
+	for _, capability := range []Capability{
+		CapabilityDataRead, CapabilityDataWrite, CapabilitySchema,
+		CapabilityMembership, CapabilityTopology, CapabilityTransactionRecovery,
+	} {
+		if got := policy.Check(ledger, capability); got != DecisionDenyCapability {
+			t.Fatalf("request ledger implied capability %x: %d", capability, got)
+		}
+	}
+}
+
 func TestAuthorityContextIsExactAndAllocationFreeOnRead(t *testing.T) {
 	authority := Authority{Node: authzNode(11), Generation: 19}
 	ctx, err := WithAuthority(context.Background(), authority)

@@ -44,11 +44,16 @@ const (
 	// separate from ordinary data reads, writes, and topology authority: none of
 	// those capabilities can discover transaction participants or decisions.
 	CapabilityTransactionRecovery
+	// CapabilityRequestLedger permits only the internal durable request-result
+	// ledger grammar. It is separate from data, topology, and transaction
+	// recovery so an ordinary writer cannot forge or acknowledge idempotency
+	// state and a ledger principal cannot mutate user relations.
+	CapabilityRequestLedger
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
 	CapabilityDelegate | CapabilityMembership | CapabilityTopology |
-	CapabilityTransactionRecovery
+	CapabilityTransactionRecovery | CapabilityRequestLedger
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

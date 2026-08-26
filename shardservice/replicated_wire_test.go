@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -441,6 +442,53 @@ func TestReplicatedProposalRecoveryCapabilityRequiresDataTransactionCommand(t *t
 	}
 }
 
+func TestReplicatedProposalRequestLedgerCapabilityIsNarrow(t *testing.T) {
+	fence := testReplicatedFence()
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 1}
+	ledger := testReplicatedRequestLedgerCommand(t, fence)
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose, Authority: authority,
+		Capability: serviceauthz.CapabilityRequestLedger, Fence: fence, Command: ledger,
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatalf("request-ledger proposal: %v", err)
+	}
+	for _, capability := range []serviceauthz.Capability{
+		0, serviceauthz.CapabilityDataWrite, serviceauthz.CapabilityTopology,
+		serviceauthz.CapabilityTransactionRecovery,
+	} {
+		candidate := *request
+		candidate.Capability = capability
+		if capability == 0 {
+			candidate.Authority = serviceauthz.Authority{}
+		}
+		encoded.Reset()
+		if err := EncodeReplicatedRequest(&encoded, &candidate); !errors.Is(err, ErrReplicatedWire) {
+			t.Fatalf("capability %d admitted ledger command: %v", capability, err)
+		}
+	}
+	request.Command = testReplicatedCommand(t, fence)
+	encoded.Reset()
+	if err := EncodeReplicatedRequest(&encoded, request); !errors.Is(err, ErrReplicatedWire) {
+		t.Fatalf("request-ledger capability admitted data command: %v", err)
+	}
+
+	request.Command = testReplicatedRequestLedgerCommandForPrincipal(
+		t, fence, rafttransport.NodeID{8},
+	)
+	encoded.Reset()
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatalf("gateway service could not carry a distinct inner subject: %v", err)
+	}
+	wrongService := *request
+	wrongService.Authority.Node = rafttransport.NodeID{8}
+	encoded.Reset()
+	if err := EncodeReplicatedRequest(&encoded, &wrongService); !errors.Is(err, ErrReplicatedWire) {
+		t.Fatalf("mismatched outer service client identity admitted: %v", err)
+	}
+}
+
 func TestReplicatedPointReadWirePreservesFoundEmptyAndMiss(t *testing.T) {
 	fence := testReplicatedFence()
 	request := &ReplicatedRequest{
@@ -829,6 +877,70 @@ func testReplicatedCommandValue(t testing.TB, fence ReplicatedFence, value []byt
 func testReplicatedTopologyCommand(t testing.TB, fence ReplicatedFence) []byte {
 	return testReplicatedCommandClass(t, fence, []byte(`{"id":1}`),
 		replication.CommandAuthorityTopology)
+}
+
+func testReplicatedRequestLedgerCommand(t testing.TB, fence ReplicatedFence) []byte {
+	return testReplicatedRequestLedgerCommandForPrincipal(t, fence, rafttransport.NodeID{9})
+}
+
+func testReplicatedRequestLedgerCommandForPrincipal(
+	t testing.TB,
+	fence ReplicatedFence,
+	principal rafttransport.NodeID,
+) []byte {
+	t.Helper()
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID(principal),
+		Request: requestledger.RequestID{1}, TenantDigest: requestledger.Digest{1},
+	}
+	plan, err := requestledger.AppendPlan(nil, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDigest := requestledger.Digest(sha256.Sum256([]byte("request-ledger-wire")))
+	head, err := requestledger.NewHeadWithContract(key, requestDigest, requestDigest, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headBytes, err := requestledger.AppendHead(nil, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := requestledger.Home(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation: requestledger.OperationCreate, Revision: head.Revision,
+		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest,
+		PlanRoot: head.PlanRoot, SubjectDigest: head.TerminalContractDigest,
+		Home: home, ExpectedRangeIdentity: requestledger.Digest{2}, Payload: headBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := replication.Command{
+		Kind:           replication.CommandRequestLedger,
+		AuthorityClass: replication.CommandAuthorityRequestLedger,
+		ClusterID:      fence.Group.ClusterID, ClusterIncarnation: fence.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,
+		Distribution:          "request-ledger", Shard: "0000-ffff",
+		AllocationGeneration: fence.AllocationGeneration,
+		ShardIncarnation:     fence.Group.ShardIncarnation, GroupID: fence.Group.GroupID,
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+		OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		// Proposal retry identity belongs to the internal gateway service and is
+		// intentionally distinct from the forwarded end-user subject in key.
+		Tenant: []byte("request-ledger"), ClientID: replication.ID128{9},
+		ClientEpoch: 1, ClientSequence: 1,
+		Fingerprint:   sha256.Sum256([]byte("request-ledger-wire")),
+		RequestLedger: inner,
+	}
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func testReplicatedTransactionCommandClass(

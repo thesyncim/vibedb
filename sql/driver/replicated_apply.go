@@ -1491,6 +1491,27 @@ func (a *ReplicatedApply) TransactionRecoveryReadInto(
 	return a.machine.TransactionRecoveryReadInto(request, records, payload)
 }
 
+// RequestLedgerReadInto forwards one full-key hidden request-ledger read under
+// the same live apply/activation fence as transaction recovery. The result
+// aliases dst and never exposes the private system collection or relation ID.
+func (a *ReplicatedApply) RequestLedgerReadInto(
+	request replicatedstate.RequestLedgerReadRequest,
+	dst []byte,
+) (replicatedstate.RequestLedgerReadResult, error) {
+	if a == nil || a.database == nil {
+		return replicatedstate.RequestLedgerReadResult{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedstate.RequestLedgerReadResult{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return replicatedstate.RequestLedgerReadResult{}, err
+	}
+	return a.machine.RequestLedgerReadInto(request, dst)
+}
+
 // SnapshotArtifactCut captures one coherent, read-only system/relation/capture
 // cut for streaming snapshot export. The returned handle owns every durable
 // collection snapshot until Close; it carries no SQL session or serving authority.

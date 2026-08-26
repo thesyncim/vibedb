@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"hash"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -859,6 +860,104 @@ func TransactionMutationDigest(
 	var canonicalDigest [sha256.Size]byte
 	h.Sum(canonicalDigest[:0])
 	return finishTransactionMutationDigest(framing, canonicalDigest), nil
+}
+
+// TransactionMutationDigester reuses one SHA-256 state across an ordered
+// participant stream. It is not safe for concurrent calls. Reset is implicit
+// in Digest, and the result is byte-identical to TransactionMutationDigest.
+type TransactionMutationDigester struct {
+	hash            hash.Hash
+	framing         [8]byte
+	relationHeader  [relationBatchHeaderBytes]byte
+	mutationHeader  [mutationHeaderBytes]byte
+	compare         [mutationDigestCompareBytes]byte
+	canonicalDigest [sha256.Size]byte
+}
+
+// Digest returns the canonical native relation-batch identity while retaining
+// only reusable fixed hash state between calls.
+func (digester *TransactionMutationDigester) Digest(
+	batches []RelationMutationBatch,
+) (distributedtxn.Digest, error) {
+	if err := validateRelationBatches(batches); err != nil {
+		return distributedtxn.Digest{}, err
+	}
+	clear(digester.framing[:])
+	binary.LittleEndian.PutUint16(digester.framing[0:2], uint16(len(batches)))
+	if len(batches) == 1 {
+		binary.LittleEndian.PutUint16(digester.framing[2:4], uint16(batches[0].Relation))
+	}
+	binary.LittleEndian.PutUint32(digester.framing[4:8], uint32(commandMutationCount(Command{Batches: batches})))
+	if digester == nil {
+		return distributedtxn.Digest{}, ErrEnvelopeSemantic
+	}
+	if digester.hash == nil {
+		digester.hash = sha256.New()
+	} else {
+		digester.hash.Reset()
+	}
+	h := digester.hash
+	canonicalBytes := uint64(0)
+	for batchIndex := range batches {
+		batch := &batches[batchIndex]
+		if len(batches) > 1 {
+			clear(digester.relationHeader[:])
+			binary.LittleEndian.PutUint16(digester.relationHeader[0:2], uint16(batch.Relation))
+			binary.LittleEndian.PutUint16(digester.relationHeader[2:4], uint16(len(batch.Mutations)))
+			payloadBytes := uint64(0)
+			for mutationIndex := range batch.Mutations {
+				mutation := batch.Mutations[mutationIndex]
+				if err := validateMutation(mutation); err != nil {
+					return distributedtxn.Digest{}, err
+				}
+				mutationBytes := uint64(mutationHeaderBytes + len(mutation.Key) + mutationWireValueBytes(mutation))
+				var ok bool
+				payloadBytes, ok = checkedAdd(payloadBytes, mutationBytes, MaxCommandBytes)
+				if !ok {
+					return distributedtxn.Digest{}, ErrEnvelopeTooLarge
+				}
+			}
+			var ok bool
+			canonicalBytes, ok = checkedAdd(
+				canonicalBytes, uint64(relationBatchHeaderBytes)+payloadBytes, MaxCommandBytes,
+			)
+			if !ok {
+				return distributedtxn.Digest{}, ErrEnvelopeTooLarge
+			}
+			binary.LittleEndian.PutUint32(digester.relationHeader[4:8], uint32(payloadBytes))
+			_, _ = h.Write(digester.relationHeader[:])
+		}
+		for mutationIndex := range batch.Mutations {
+			mutation := batch.Mutations[mutationIndex]
+			if len(batches) == 1 {
+				if err := validateMutation(mutation); err != nil {
+					return distributedtxn.Digest{}, err
+				}
+				mutationBytes := uint64(mutationHeaderBytes + len(mutation.Key) + mutationWireValueBytes(mutation))
+				var ok bool
+				canonicalBytes, ok = checkedAdd(canonicalBytes, mutationBytes, MaxCommandBytes)
+				if !ok {
+					return distributedtxn.Digest{}, ErrEnvelopeTooLarge
+				}
+			}
+			clear(digester.mutationHeader[:])
+			digester.mutationHeader[0] = byte(mutation.Kind)
+			binary.LittleEndian.PutUint16(digester.mutationHeader[2:4], uint16(len(mutation.Key)))
+			binary.LittleEndian.PutUint32(digester.mutationHeader[4:8], uint32(mutationWireValueBytes(mutation)))
+			_, _ = h.Write(digester.mutationHeader[:])
+			_, _ = h.Write(mutation.Key)
+			if mutation.Kind == MutationDeleteDigestEqual || mutation.Kind == MutationPutDigestEqual {
+				binary.LittleEndian.PutUint64(digester.compare[:8], mutation.ExpectedValueLength)
+				copy(digester.compare[8:], mutation.ExpectedValueDigest[:])
+				_, _ = h.Write(digester.compare[:])
+			}
+			if mutation.Kind != MutationDeleteDigestEqual {
+				_, _ = h.Write(mutation.Value)
+			}
+		}
+	}
+	h.Sum(digester.canonicalDigest[:0])
+	return finishTransactionMutationDigest(digester.framing, digester.canonicalDigest), nil
 }
 
 func transactionMutationDigestFromBytes(

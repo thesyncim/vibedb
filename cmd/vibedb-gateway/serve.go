@@ -214,8 +214,9 @@ func runServe(args []string) int {
 		if policy.Check(internalAuthority.Node,
 			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
 				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology|
-				serviceauthz.CapabilityTransactionRecovery) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, and transaction_recovery authority")
+				serviceauthz.CapabilityTransactionRecovery|
+				serviceauthz.CapabilityRequestLedger) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, transaction_recovery, and request_ledger authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)

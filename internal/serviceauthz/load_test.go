@@ -9,14 +9,14 @@ import (
 func TestLoadVibeJSONBoundsAndCanonicalPolicy(t *testing.T) {
 	node := strings.Repeat("01", 16)
 	policy, err := Load([]byte(`{"generation":5,"principals":[{"node":"` + node +
-		`","capabilities":["data_read","schema","delegate","membership","topology","transaction_recovery"]}]}`))
+		`","capabilities":["data_read","schema","delegate","membership","topology","transaction_recovery","request_ledger"]}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if policy.Generation() != 5 || len(policy.Nodes()) != 1 ||
 		policy.Check(policy.Nodes()[0], CapabilityDataRead|CapabilitySchema|
 			CapabilityDelegate|CapabilityMembership|CapabilityTopology|
-			CapabilityTransactionRecovery) != DecisionAllow {
+			CapabilityTransactionRecovery|CapabilityRequestLedger) != DecisionAllow {
 		t.Fatalf("loaded policy mismatch")
 	}
 	for _, raw := range [][]byte{
@@ -30,6 +30,7 @@ func TestLoadVibeJSONBoundsAndCanonicalPolicy(t *testing.T) {
 		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","node":"` + node + `","capabilities":["data_read"]}]}`),
 		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","capabilities":["delegate","data_read"]}]}`),
 		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","capabilities":["transaction_recovery","topology"]}]}`),
+		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","capabilities":["request_ledger","topology"]}]}`),
 		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","capabilities":["data_read"],"unknown":1}]}`),
 	} {
 		if _, err := Load(raw); !errors.Is(err, ErrInvalidPolicy) {

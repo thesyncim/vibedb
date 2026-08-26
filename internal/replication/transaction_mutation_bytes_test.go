@@ -95,3 +95,60 @@ func TestDetachedTransactionMutationBytesBoundsAndCanonicalRefusal(t *testing.T)
 		t.Fatal("wrong detached byte count accepted")
 	}
 }
+
+func BenchmarkTransactionMutationDigesterReuse(b *testing.B) {
+	batches := []RelationMutationBatch{{Relation: 1, Mutations: []Mutation{{
+		Kind: MutationPut, Key: []byte("key"), Value: []byte("value"),
+	}}}}
+	var digester TransactionMutationDigester
+	if _, err := digester.Digest(batches); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := digester.Digest(batches); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestTransactionMutationDigesterReuseAllocatesZero(t *testing.T) {
+	batches := []RelationMutationBatch{{Relation: 1, Mutations: []Mutation{{
+		Kind: MutationPut, Key: []byte("key"), Value: []byte("value"),
+	}}}}
+	var digester TransactionMutationDigester
+	want, err := TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, digestErr := digester.Digest(batches); digestErr != nil || got != want {
+		t.Fatalf("reusable digest=%x err=%v want=%x", got, digestErr, want)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		digest, digestErr := digester.Digest(batches)
+		if digestErr != nil || digest != want {
+			panic("reused transaction mutation digest changed")
+		}
+	}); got != 0 {
+		t.Fatalf("reused transaction mutation digest allocations=%v, want 0", got)
+	}
+}
+
+func BenchmarkAppendTransactionMutationBytesReuse(b *testing.B) {
+	batches := []RelationMutationBatch{{Relation: 1, Mutations: []Mutation{{
+		Kind: MutationPut, Key: []byte("key"), Value: []byte("value"),
+	}}}}
+	layout, err := MeasureTransactionMutationBytes(batches)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := make([]byte, 0, layout.Bytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, _, err := AppendTransactionMutationBytes(dst[:0], batches); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

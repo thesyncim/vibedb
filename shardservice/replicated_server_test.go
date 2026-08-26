@@ -18,22 +18,26 @@ import (
 )
 
 type fakeReplicatedOwner struct {
-	state              raftservice.ServingState
-	result             raftservice.Result
-	err                error
-	blockSubmit        bool
-	membershipErr      error
-	membership         raftservice.MembershipRequest
-	readResult         raftservice.PointReadResult
-	readErr            error
-	readLease          raftservice.PointReadLease
-	readCalled         chan struct{}
-	transactionResult  raftservice.TransactionReadResult
-	transactionErr     error
-	transactionLease   raftservice.TransactionReadLease
-	transactionRequest raftservice.TransactionReadRequest
-	transactionCalled  chan struct{}
-	probeCalls         atomic.Uint64
+	state                raftservice.ServingState
+	result               raftservice.Result
+	err                  error
+	blockSubmit          bool
+	membershipErr        error
+	membership           raftservice.MembershipRequest
+	readResult           raftservice.PointReadResult
+	readErr              error
+	readLease            raftservice.PointReadLease
+	readCalled           chan struct{}
+	transactionResult    raftservice.TransactionReadResult
+	transactionErr       error
+	transactionLease     raftservice.TransactionReadLease
+	transactionRequest   raftservice.TransactionReadRequest
+	transactionCalled    chan struct{}
+	requestLedgerResult  raftservice.RequestLedgerReadResult
+	requestLedgerErr     error
+	requestLedgerLease   raftservice.RequestLedgerReadLease
+	requestLedgerRequest raftservice.RequestLedgerReadRequest
+	probeCalls           atomic.Uint64
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -91,6 +95,14 @@ func (owner *fakeReplicatedOwner) ReadTransaction(
 		}
 	}
 	return owner.transactionResult, owner.transactionLease, owner.transactionErr
+}
+
+func (owner *fakeReplicatedOwner) ReadRequestLedger(
+	_ context.Context,
+	request raftservice.RequestLedgerReadRequest,
+) (raftservice.RequestLedgerReadResult, raftservice.RequestLedgerReadLease, error) {
+	owner.requestLedgerRequest = request
+	return owner.requestLedgerResult, owner.requestLedgerLease, owner.requestLedgerErr
 }
 
 type testPointReadLease struct{ released atomic.Bool }

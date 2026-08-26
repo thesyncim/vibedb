@@ -164,6 +164,39 @@ func TestReplicatedAuthorizationRotationAndRetryGeneration(t *testing.T) {
 	}
 }
 
+func TestReplicatedRequestLedgerRequiresServiceControlAndDataWriterSubject(t *testing.T) {
+	firstGateway := authorizationNode(31)
+	replacementGateway := authorizationNode(32)
+	delegateOnly := authorizationNode(33)
+	client := authorizationNode(34)
+	gate := authorizationGate(t, 6,
+		serviceauthz.Entry{Node: firstGateway, Capabilities: serviceauthz.CapabilityDelegate | serviceauthz.CapabilityRequestLedger},
+		serviceauthz.Entry{Node: replacementGateway, Capabilities: serviceauthz.CapabilityDelegate | serviceauthz.CapabilityRequestLedger},
+		serviceauthz.Entry{Node: delegateOnly, Capabilities: serviceauthz.CapabilityDelegate},
+		serviceauthz.Entry{Node: client, Capabilities: serviceauthz.CapabilityDataWrite},
+	)
+	server := &ReplicatedServer{authorization: gate}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose,
+		Authority: serviceauthz.Authority{Node: firstGateway, Generation: 6},
+		Capability: serviceauthz.CapabilityRequestLedger,
+	}
+	if !server.authorizeReplicated(firstGateway, request) {
+		t.Fatal("delegated ledger service denied its control authority")
+	}
+	request.Authority.Node = replacementGateway
+	if !server.authorizeReplicated(replacementGateway, request) {
+		t.Fatal("replacement gateway could not resume the immutable inner subject")
+	}
+	request.Authority.Node = firstGateway
+	if server.authorizeReplicated(delegateOnly, request) {
+		t.Fatal("delegate-only service gained request-ledger control")
+	}
+	if server.authorizeReplicated(client, request) {
+		t.Fatal("data writer sent raw request-ledger control directly")
+	}
+}
+
 func TestSealedRequestCapabilityIgnoresCallerExecutionMode(t *testing.T) {
 	checks := []struct {
 		request ShardRequest

@@ -746,7 +746,7 @@ func validateCompletionLookup(
 	identity commandIdentity,
 	lookup replicatedstate.CompletionLookup,
 ) error {
-	if lookup.Key != identity.position.sessionDigest || len(lookup.Bytes) == 0 ||
+	if lookup.Key != identity.completionKey || len(lookup.Bytes) == 0 ||
 		lookup.AppliedSequence == 0 {
 		return ErrSettlementResult
 	}
@@ -768,7 +768,22 @@ func validateCompletionLookup(
 		completion.Storage != replication.CompletionInline {
 		return ErrSettlementResult
 	}
-	if identity.transactionRole != 0 {
+	if identity.kind == replication.CommandRequestLedger {
+		if completion.ResultFormat != replicatedstate.ResultFormatRequestLedger ||
+			completion.ResultLength != uint64(len(completion.InlineResult)) {
+			return ErrSettlementResult
+		}
+		result, resultErr := replicatedstate.OpenRequestLedgerCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		if resultErr != nil || result.Operation != identity.ledgerOperation ||
+			result.KeyDigest != identity.ledgerKeyDigest ||
+			result.RequestDigest != identity.ledgerRequestDigest ||
+			result.PlanRoot != identity.ledgerPlanRoot ||
+			result.RangeIdentity != identity.ledgerRangeIdentity {
+			return ErrSettlementResult
+		}
+	} else if identity.transactionRole != 0 {
 		result, resultErr := replicatedstate.OpenTransactionCompletionResult(
 			completion.ResultCode, completion.InlineResult,
 		)
