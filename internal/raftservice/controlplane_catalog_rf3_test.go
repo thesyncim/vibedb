@@ -14,9 +14,39 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/rebalance"
+	"github.com/thesyncim/vibedb/internal/rebalanceexec"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+type processReplicaMoveObserver struct{ cut rebalance.ReplicatedMoveCut }
+
+func (observer *processReplicaMoveObserver) ObserveReplicaMove(
+	context.Context,
+	rebalance.OperationID,
+	gateway.ReplicatedOperationRecord,
+	*rebalance.Plan,
+) (rebalance.ReplicatedMoveCut, error) {
+	return observer.cut, nil
+}
+
+type processReplicaMoveExecutor struct {
+	actions []rebalance.ReplicatedMoveExecution
+}
+
+func (executor *processReplicaMoveExecutor) ExecuteReplicaMove(
+	_ context.Context,
+	_ rebalance.OperationID,
+	_ *rebalance.Plan,
+	execution rebalance.ReplicatedMoveExecution,
+) error {
+	executor.actions = append(executor.actions, execution)
+	return nil
+}
 
 // TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart proves the
 // control-plane relation through a dedicated three-process RF3 catalog group.
@@ -175,6 +205,63 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 		t.Fatalf("catalog after controller restart = %v, err=%v", read, err)
 	}
 
+	// Submit a real replica-move record through the shipped controller, then
+	// discard all controller-local state. The replacement controller discovers
+	// the operation from the process RF3 directory and advances the next action
+	// from a new detached shard observation; no in-memory journal or work
+	// queue participates in recovery.
+	movePublication := raftmodel.Publication{
+		Applied: 10, ReplicaSetVersion: dataRoute.Command.ReplicaSetVersion,
+		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
+	}
+	movePlan, err := rebalance.PlanReplicaMove(read, movePublication, rebalance.MoveRequest{
+		Distribution: dataRoute.Distribution, Shard: dataRoute.Shard, Group: dataRoute.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+		Source: distribution.EndpointID(dataRoute.Replicas[0].Endpoint), Target: "rf3-target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moveObserver := &processReplicaMoveObserver{cut: rebalance.ReplicatedMoveCut{
+		Observation: rebalance.Observation{
+			Catalog: read, Publication: movePublication,
+			LeaderStatus: raftmember.RuntimeStatus{
+				MemberID: 2, LeaderID: 2, Term: 3, Commit: 10, Applied: 10,
+			},
+		},
+	}}
+	moveExecutor := new(processReplicaMoveExecutor)
+	moveController, err := rebalanceexec.NewController(
+		restarted, restarted, moveObserver, moveExecutor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := moveController.Submit(ctx, movePlan)
+	if err != nil || action.Kind != rebalance.ActionAddLearner || len(moveExecutor.actions) != 1 {
+		t.Fatalf("initial move action=%+v executed=%d err=%v",
+			action, len(moveExecutor.actions), err)
+	}
+	moveObserver.cut.Publication = raftmodel.Publication{
+		Applied: 11, ReplicaSetVersion: dataRoute.Command.ReplicaSetVersion + 1,
+		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}},
+	}
+	moveObserver.cut.LeaderStatus.Commit = 11
+	moveObserver.cut.LeaderStatus.Applied = 11
+	restartedMoveController, err := rebalanceexec.NewController(
+		restarted, restarted, moveObserver, moveExecutor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movePass, err := restartedMoveController.RunPass(ctx)
+	if err != nil || movePass.Moves != 1 || movePass.Advanced != 1 ||
+		len(moveExecutor.actions) != 2 ||
+		moveExecutor.actions[1].Action.Kind != rebalance.ActionCreateSnapshotBase {
+		t.Fatalf("restarted move pass=%+v executed=%+v err=%v",
+			movePass, moveExecutor.actions, err)
+	}
+
 	// The same authority is the split controller's replicated journal. Its
 	// operation survives reconstruction through a linearizable relation read.
 	var journal splitcontroller.ReplicatedOperationJournal = restarted
@@ -301,7 +388,8 @@ func processControlPlaneSnapshot(
 		}},
 		Manifests: []*distribution.Manifest{manifest},
 	}
-	endpoints := make(map[distribution.EndpointID]string, processVoters)
+	endpoints := make(map[distribution.EndpointID]string, processVoters+1)
+	endpoints["rf3-target"] = "127.0.0.1:4"
 	controlEndpointIDs := [processVoters]distribution.EndpointID{"rf3-control-1", "rf3-control-2", "rf3-control-3"}
 	replicas := make([]gateway.ReplicatedReplicaDescriptor, processVoters)
 	for index := 0; index < processVoters; index++ {
