@@ -26,7 +26,7 @@ var (
 // MinimumFailureConfirmationEpochs prevents a single reachability sample from
 // authorizing removal. Epochs are durable health-authority revisions, not wall
 // clock ticks; the authority must advance them through its replicated quorum.
-const MinimumFailureConfirmationEpochs uint64 = 3
+const MinimumFailureConfirmationEpochs uint64 = gateway.FailureConfirmationRevisions
 
 // FailureConfirmation is one current voter's acknowledgement of the exact
 // replicated failure record. Entries must be strictly member ordered so the
