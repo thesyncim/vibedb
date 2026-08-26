@@ -352,6 +352,55 @@ func BenchmarkTransactionBodyOrdinaryCommandEnvelope(b *testing.B) {
 	}
 }
 
+func BenchmarkFusedTransactionEnvelope(b *testing.B) {
+	tests := []struct {
+		name         string
+		payloadBytes int
+	}{
+		{name: "1KiB", payloadBytes: 1 << 10},
+		{name: "64KiB", payloadBytes: 64 << 10},
+		{name: "1MiB", payloadBytes: 1 << 20},
+		{name: "4MiB", payloadBytes: MaxMutationValueBytes},
+	}
+	for _, test := range tests {
+		command, payload := transactionPerfFusedCommand(b, test.payloadBytes)
+		encoded := encodeCommand(b, command)
+		b.Run(test.name+"/append-presized", func(b *testing.B) {
+			scratch := make([]byte, 0, len(encoded))
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				var err error
+				transactionPerfBytesSink, err = AppendCommand(scratch[:0], command)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(encoded)-len(payload)), "framing-B/op")
+		})
+		b.Run(test.name+"/open-borrowed", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				view, err := OpenCommand(encoded)
+				if err != nil {
+					b.Fatal(err)
+				}
+				transactionPerfIntSink += len(view.TransactionBytes())
+				relations := view.RelationBatches()
+				for relations.Next() {
+					mutations := relations.Batch().Mutations()
+					for mutations.Next() {
+						mutation := mutations.Mutation()
+						transactionPerfIntSink += len(mutation.Key) + len(mutation.Value)
+					}
+				}
+			}
+			b.ReportMetric(float64(len(encoded)-len(payload)), "framing-B/op")
+		})
+	}
+}
+
 func transactionPerfCommand(payloadBytes int) (Command, []byte) {
 	command := testCommand()
 	payload := make([]byte, payloadBytes)
