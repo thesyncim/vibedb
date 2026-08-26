@@ -257,6 +257,51 @@ func TestRequestLedgerSequencedCreateConvertsReservation(t *testing.T) {
 	}
 }
 
+func TestRequestLedgerIssuerOpenIsPersistedIdempotentCAS(t *testing.T) {
+	key := issuerPlannerKey(1, 0x61)
+	highwater, err := requestledger.NewIssuerHighwater(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := requestledger.AppendIssuerHighwater(nil, highwater)
+	command := issuerPlannerCommandView(t, requestledger.Command{
+		Operation: requestledger.OperationOpenIssuerLane, Revision: 1,
+		KeyDigest: highwater.IssuerDigest, RequestDigest: highwater.HighwaterDigest,
+		PlanRoot: highwater.HighwaterDigest, SubjectDigest: highwater.HighwaterDigest,
+		ExpectedRangeIdentity: issuerPlannerDigest(0x62), Home: highwater.Home, Payload: payload,
+	})
+	machine := &Machine{options: Options{
+		RequestLedgerCapacityBytes: 64 << 20, RequestLedgerCleanupReserveBytes: 1 << 20,
+	}}
+	overlay := logicalOverlay{}
+	plan := requestLedgerCommandPlan{completion: RequestLedgerCompletionResult{
+		Operation: command.Operation, ResultCode: ResultRequestLedgerConflict,
+		KeyDigest: command.KeyDigest, RequestDigest: command.RequestDigest,
+		PlanRoot: command.PlanRoot, RangeIdentity: command.ExpectedRangeIdentity,
+	}}
+	plan, err = machine.planRequestLedgerIssuerOpen(
+		plan, command, State{}, pointSnapshot{overlay: &overlay},
+	)
+	if err != nil || len(plan.rows) != 1 || plan.rows[0].delete || plan.delta.rows != 1 ||
+		plan.delta.residentBytes != int64(requestledger.IssuerHighwaterResidentBytes) ||
+		plan.completion.ResultCode != ResultApplied || plan.completion.ExactDuplicate {
+		t.Fatalf("open plan=%+v rows=%d delta=%+v err=%v", plan.completion, len(plan.rows), plan.delta, err)
+	}
+	if err = overlay.record(plan.rows[0].key, plan.rows[0].value, false); err != nil {
+		t.Fatal(err)
+	}
+	retry := requestLedgerCommandPlan{completion: plan.completion}
+	retry.completion.ExactDuplicate = false
+	retry, err = machine.planRequestLedgerIssuerOpen(
+		retry, command, State{RequestLedgerResidentBytes: uint64(requestledger.IssuerHighwaterResidentBytes)},
+		pointSnapshot{overlay: &overlay},
+	)
+	if err != nil || len(retry.rows) != 0 || !retry.completion.ExactDuplicate ||
+		retry.completion.StateDigest != plan.completion.StateDigest {
+		t.Fatalf("retry=%+v rows=%d err=%v", retry.completion, len(retry.rows), err)
+	}
+}
+
 func TestRequestLedgerIssuerAdvanceDeletesOnlyAfterHighwater(t *testing.T) {
 	key := issuerPlannerKey(1, 0x81)
 	ack, sequence := issuerPlannerGCComplete(t, key)

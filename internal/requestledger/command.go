@@ -41,11 +41,12 @@ const (
 	OperationRestartPlanning
 	OperationCleanupPlanning
 	OperationAdvanceIssuerHighwater
+	OperationOpenIssuerLane
 
 	// LastOperation is the sole inclusive admission bound for the current
 	// request-ledger command grammar. Integrations must not duplicate a numeric
 	// operation ceiling in completion or apply validation.
-	LastOperation = OperationAdvanceIssuerHighwater
+	LastOperation = OperationOpenIssuerLane
 )
 
 type Command struct {
@@ -126,6 +127,7 @@ type CommandView struct {
 	restart         PlanningRestartRequest
 	planningCleanup PlanningCleanupRequest
 	issuerAdvance   IssuerAdvanceRequest
+	issuerOpen      IssuerHighwaterRecord
 }
 
 func (view CommandView) Bytes() []byte { return view.raw[:len(view.raw):len(view.raw)] }
@@ -179,6 +181,9 @@ func (view CommandView) PlanningCleanup() (PlanningCleanupRequest, bool) {
 }
 func (view CommandView) IssuerAdvance() (IssuerAdvanceRequest, bool) {
 	return view.issuerAdvance, view.Operation == OperationAdvanceIssuerHighwater
+}
+func (view CommandView) IssuerOpen() (IssuerHighwaterRecord, bool) {
+	return view.issuerOpen, view.Operation == OperationOpenIssuerLane
 }
 
 func AppendCommand(dst []byte, command Command) ([]byte, error) {
@@ -390,6 +395,16 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 		if err == nil && view.issuerAdvance.ExpectedHighwaterDigest != command.SubjectDigest {
 			err = ErrCorrupt
 		}
+	case OperationOpenIssuerLane:
+		view.issuerOpen, err = OpenIssuerHighwater(payload)
+		if err == nil && (view.issuerOpen.HighwaterDigest != command.SubjectDigest ||
+			view.issuerOpen.IssuerDigest != command.KeyDigest ||
+			view.issuerOpen.HighwaterDigest != command.RequestDigest ||
+			view.issuerOpen.HighwaterDigest != command.PlanRoot ||
+			view.issuerOpen.Home != command.Home || view.issuerOpen.Revision != command.Revision ||
+			view.issuerOpen.HighwaterSequence != 0 || view.issuerOpen.AdmittedSequence != 0) {
+			err = ErrCorrupt
+		}
 	default:
 		err = ErrCorrupt
 	}
@@ -414,7 +429,8 @@ func validateCommandShape(command Command) error {
 		!nonzeroDigest(command.ExpectedRangeIdentity) || command.Home == (LedgerHome{}) {
 		return ErrCorrupt
 	}
-	if command.Operation == OperationCreate || command.Operation == OperationBeginPayloadBuild {
+	if command.Operation == OperationCreate || command.Operation == OperationBeginPayloadBuild ||
+		command.Operation == OperationOpenIssuerLane {
 		if command.ExpectedRevision != 0 || command.Revision != 1 {
 			return ErrRevision
 		}
@@ -503,6 +519,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		uint64(OperationRecordSchemaPinReleased),
 		uint64(OperationRestartPlanning), uint64(OperationCleanupPlanning),
 		uint64(OperationAdvanceIssuerHighwater),
+		uint64(OperationOpenIssuerLane),
 		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
 		uint64(RoutePinReleasing), uint64(RoutePinReleased),
 		uint64(SchemaPinReleasing), uint64(SchemaPinReleased),

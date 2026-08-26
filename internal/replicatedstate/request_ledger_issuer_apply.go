@@ -1,11 +1,70 @@
 package replicatedstate
 
 import (
+	"bytes"
 	"errors"
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
+
+// planRequestLedgerIssuerOpen persists the lane identity before any request
+// sequence can be admitted. It is a one-row, idempotent CAS; another gateway
+// recovers the same grant from RF3 and never needs the issuer's local secret.
+func (m *Machine) planRequestLedgerIssuerOpen(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	state State,
+	snapshot pointSnapshot,
+) (requestLedgerCommandPlan, error) {
+	want, ok := command.IssuerOpen()
+	if !ok || want.Home != command.Home || want.IssuerDigest != command.KeyDigest ||
+		want.HighwaterDigest != command.SubjectDigest {
+		return plan, ErrStateCorrupt
+	}
+	current, raw, found, err := readRequestLedgerIssuerHighwater(
+		snapshot, command.Home, want.IssuerDigest,
+	)
+	if err != nil {
+		return plan, err
+	}
+	if found {
+		wantRaw, encodeErr := requestledger.AppendIssuerHighwater(nil, want)
+		if encodeErr != nil {
+			return plan, errors.Join(encodeErr, ErrStateCorrupt)
+		}
+		if current.Identity == want.Identity && current.Home == want.Home &&
+			current.IssuerDigest == want.IssuerDigest && bytes.Equal(raw, wantRaw) {
+			return witnessedRequestLedgerApplied(
+				plan, current.Revision, requestledger.PhaseAcked, raw, true,
+			), nil
+		}
+		return witnessedRequestLedgerConflict(
+			plan, current.Revision, requestledger.PhaseAcked, raw,
+		), nil
+	}
+	raw, err = requestledger.AppendIssuerHighwater(nil, want)
+	if err != nil {
+		return plan, errors.Join(err, ErrStateCorrupt)
+	}
+	key := requestledger.AppendIssuerHighwaterKey(nil, want.Home, want.IssuerDigest)
+	added := uint64(len(key) + len(raw))
+	consumed, capacityOK := checkedRequestLedgerConsumption(
+		state.RequestLedgerResidentBytes, state.RequestLedgerReservedBytes, added,
+	)
+	ordinary := m.options.RequestLedgerCapacityBytes - m.options.RequestLedgerCleanupReserveBytes
+	if !capacityOK || consumed > ordinary {
+		plan.completion.ResultCode = ResultRequestLedgerCapacity
+		plan.completion.Phase = requestledger.PhaseInvalid
+		return plan, nil
+	}
+	plan.rows = append(plan.rows, newTransactionPut(key, raw))
+	plan.delta.rows++
+	plan.delta.residentBytes += int64(added)
+	return witnessedRequestLedgerApplied(
+		plan, want.Revision, requestledger.PhaseAcked, raw, false,
+	), nil
+}
 
 // planRequestLedgerSequencedCreate installs the per-lane high-water witness
 // and the per-sequence active row in the same transaction as Create. The

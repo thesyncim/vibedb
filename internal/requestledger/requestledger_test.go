@@ -871,7 +871,8 @@ func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
 	if !ok || openedAdvance != request1 {
 		t.Fatal("issuer advance command accessor")
 	}
-	if OperationAdvanceIssuerHighwater != 23 || LastOperation != OperationAdvanceIssuerHighwater {
+	if OperationAdvanceIssuerHighwater != 23 || OperationOpenIssuerLane != 24 ||
+		LastOperation != OperationOpenIssuerLane {
 		t.Fatal("issuer highwater operation code changed")
 	}
 	wrongSubject := command
@@ -1104,7 +1105,7 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 	for op := OperationCreate; op <= LastOperation; op++ {
 		c := base
 		c.Operation = op
-		if op == OperationCreate || op == OperationBeginPayloadBuild {
+		if op == OperationCreate || op == OperationBeginPayloadBuild || op == OperationOpenIssuerLane {
 			c.ExpectedRevision, c.Revision = 0, 1
 		} else {
 			c.ExpectedRevision, c.Revision = 8, 9

@@ -95,6 +95,9 @@ func (m *Machine) planRequestLedgerCommand(
 	if command.Operation == requestledger.OperationAdvanceIssuerHighwater {
 		return planRequestLedgerIssuerAdvance(plan, command, snapshot)
 	}
+	if command.Operation == requestledger.OperationOpenIssuerLane {
+		return m.planRequestLedgerIssuerOpen(plan, command, state, snapshot)
+	}
 	storedPendingScratch := m.requestLedgerSteps[:]
 	if command.Operation == requestledger.OperationPutPending {
 		storedPendingScratch = nil
