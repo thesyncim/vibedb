@@ -389,6 +389,22 @@ Every successful RF3 point read returns a new `route_id` and `applied` pair.
 Retain the pair together. An applied index has no meaning outside its exact
 route lineage.
 
+The shipped native `read_batch` operation extends that contract to ordered
+exact-primary-key SQL reads across tables and RF3 groups. The gateway lowers
+every statement against one immutable catalog generation, groups points by
+exact `RouteID`, and performs one leader `ReadIndex` read per group. Points for
+multiple relations in the same group therefore share one coherent applied cut.
+Cross-group results carry a sorted observation vector containing the exact
+group, route lineage, and applied index for every contributing cut. This vector
+is the consistency contract; it is not presented as a global timestamp or an
+MVCC snapshot.
+
+`read_batch` returns no partial documents. Unsupported projections, joins,
+ranges, aggregates, mixed RF3/static authority, stale route replay failure,
+active transaction intents, admission failure, or any shard failure reject the
+whole batch. Group count has no policy cap: packed request/result bounds and
+the gateway's bounded worker and byte budgets control admission.
+
 The SQL path has a different contract. It accepts only the `ReadStrong` policy
 and serves a statement-level snapshot from its statically configured leader
 endpoint. Because the SQL shard service has no Raft election or replication,
@@ -523,7 +539,6 @@ coordinator commit can succeed before apply, release, or retirement finishes.
 The shipped runtime does not provide these features:
 
 - RF3 initialization, artifact provisioning, or repair
-- RF3 scatter reads or multi-table reads
 - A common cross-group RF3 read snapshot
 - RF3 global-index mutation lowering
 - A durable cross-gateway request/result ledger
