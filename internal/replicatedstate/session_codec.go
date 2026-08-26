@@ -80,8 +80,7 @@ func AuthorityBindingStorageKey(digest [sha256.Size]byte) [1 + sha256.Size]byte 
 func AppendAuthorityBinding(dst []byte, tenant []byte, clientID replication.ID128,
 	authorityClass replication.CommandAuthorityClass) ([]byte, error) {
 	if len(tenant) == 0 || len(tenant) > replication.MaxIdentityBytes ||
-		clientID == (replication.ID128{}) || (authorityClass != replication.CommandAuthorityData &&
-		authorityClass != replication.CommandAuthorityTopology) {
+		clientID == (replication.ID128{}) || !validSessionAuthorityClass(authorityClass) {
 		return dst, fmt.Errorf("%w: authority binding", ErrSessionCorrupt)
 	}
 	start := len(dst)
@@ -118,7 +117,7 @@ func OpenAuthorityBinding(src []byte) (AuthorityBindingView, error) {
 		return AuthorityBindingView{}, fmt.Errorf("%w: authority binding", ErrSessionCorrupt)
 	}
 	class := replication.CommandAuthorityClass(src[10])
-	if class != replication.CommandAuthorityData && class != replication.CommandAuthorityTopology {
+	if !validSessionAuthorityClass(class) {
 		return AuthorityBindingView{}, fmt.Errorf("%w: authority class", ErrSessionCorrupt)
 	}
 	tenantLen := int(src[12])
@@ -356,8 +355,7 @@ func validateSessionView(view SessionView) error {
 		view.PhysicalSlotCount == 0 || view.PhysicalSlotCount > view.RetryWindow ||
 		uint64(view.PhysicalSlotCount) != minimumSlots ||
 		(view.Status != SessionActive && view.Status != SessionRetired) ||
-		(view.AuthorityClass != replication.CommandAuthorityData &&
-			view.AuthorityClass != replication.CommandAuthorityTopology) {
+		!validSessionAuthorityClass(view.AuthorityClass) {
 		return fmt.Errorf("%w: invalid session semantics", ErrSessionCorrupt)
 	}
 	if view.LeaseDeadlineUnixNano < 0 ||
@@ -526,14 +524,19 @@ func validateSessionSlotView(view SessionSlotView) error {
 		view.RouteGeneration == 0 ||
 		view.AffectedRows < 0 || view.AffectedRows > MaxMutationAffectedRows ||
 		view.ResultCode != ResultApplied && view.AffectedRows != 0 ||
-		(view.AuthorityClass != replication.CommandAuthorityData &&
-			view.AuthorityClass != replication.CommandAuthorityTopology) ||
+		!validSessionAuthorityClass(view.AuthorityClass) ||
 		(view.ClientSequence == 1) != (view.ResultCode == ResultSessionOpened) ||
 		view.ResultCode == ResultSessionOpened && view.AppliedSequence != view.ClientEpoch ||
 		view.ResultCode != ResultSessionOpened && view.AppliedSequence <= view.ClientEpoch {
 		return fmt.Errorf("%w: invalid session slot semantics", ErrSessionCorrupt)
 	}
 	return nil
+}
+
+func validSessionAuthorityClass(class replication.CommandAuthorityClass) bool {
+	return class == replication.CommandAuthorityData ||
+		class == replication.CommandAuthorityTopology ||
+		class == replication.CommandAuthorityExecutionPin
 }
 
 // verifySessionChecksum is verifyRecord's allocation-free borrowed-decode

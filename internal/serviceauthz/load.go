@@ -136,6 +136,8 @@ func parseCapabilityRaw(raw []byte) Capability {
 		return CapabilityTransactionRecovery
 	case bytes.Equal(raw, []byte(`"request_ledger"`)):
 		return CapabilityRequestLedger
+	case bytes.Equal(raw, []byte(`"execution_pin"`)):
+		return CapabilityExecutionPin
 	default:
 		return 0
 	}

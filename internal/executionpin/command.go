@@ -1,0 +1,150 @@
+package executionpin
+
+import (
+	"encoding/binary"
+	"hash/crc32"
+)
+
+const CommandBytes = 420
+
+var (
+	commandMagic = [4]byte{'V', 'E', 'P', 'N'}
+	castagnoli   = crc32.MakeTable(crc32.Castagnoli)
+)
+
+type Operation uint8
+
+const (
+	OperationAcquire Operation = iota + 1
+	OperationRenew
+	OperationRecover
+	OperationRelease
+	OperationExpire
+)
+
+// Command is one fixed logical pin transition. Time is always an explicit
+// replicated scalar; this package never samples a local clock.
+type Command struct {
+	Operation Operation
+	Binding   Binding
+	PinID     PinID
+	// AuthorityNode and AuthorityGeneration are the exact authenticated
+	// service principal copied into the command at admission. The shard wire
+	// rejects a mismatch before Raft proposal, so replicated certificates attest
+	// the admitted principal rather than a caller-declared hint.
+	AuthorityNode       ID
+	AuthorityGeneration uint64
+
+	ExpectedController      ID
+	ExpectedControllerEpoch uint64
+	NextController          ID
+	NextControllerEpoch     uint64
+	ExpectedLeaseDeadline   int64
+	ExpectedLeaseRevision   uint64
+	NextLeaseDeadline       int64
+	ObservedUnixNano        int64
+
+	PrepareTerminalDigest    Digest
+	AcquireCertificateDigest Digest
+}
+
+func (command Command) Valid() bool {
+	derived, err := DerivePinID(command.Binding)
+	if err != nil || command.PinID != derived || command.AuthorityNode == (ID{}) ||
+		command.AuthorityGeneration == 0 {
+		return false
+	}
+	expected := command.ExpectedController != (ID{}) &&
+		command.ExpectedControllerEpoch != 0 && command.ExpectedLeaseDeadline > 0
+	next := command.NextController != (ID{}) &&
+		command.NextControllerEpoch != 0 && command.NextLeaseDeadline > 0
+	switch command.Operation {
+	case OperationAcquire:
+		return !expected && command.ExpectedLeaseRevision == 0 && next && command.ObservedUnixNano == 0 &&
+			command.PrepareTerminalDigest == (Digest{}) &&
+			command.AcquireCertificateDigest == (Digest{})
+	case OperationRenew:
+		return expected && command.ExpectedLeaseRevision != 0 && next && command.ExpectedController == command.NextController &&
+			command.ExpectedControllerEpoch == command.NextControllerEpoch &&
+			command.NextLeaseDeadline > command.ExpectedLeaseDeadline &&
+			command.ObservedUnixNano == 0 && command.PrepareTerminalDigest == (Digest{}) &&
+			command.AcquireCertificateDigest != (Digest{})
+	case OperationRecover:
+		return expected && command.ExpectedLeaseRevision != 0 && next && command.NextControllerEpoch > command.ExpectedControllerEpoch &&
+			command.ObservedUnixNano >= command.ExpectedLeaseDeadline &&
+			command.NextLeaseDeadline > command.ObservedUnixNano &&
+			command.PrepareTerminalDigest == (Digest{}) &&
+			command.AcquireCertificateDigest != (Digest{})
+	case OperationRelease:
+		return expected && command.ExpectedLeaseRevision != 0 && !next && command.ObservedUnixNano == 0 &&
+			command.PrepareTerminalDigest != (Digest{}) &&
+			command.AcquireCertificateDigest != (Digest{})
+	case OperationExpire:
+		return expected && command.ExpectedLeaseRevision != 0 && !next && command.ObservedUnixNano >= command.ExpectedLeaseDeadline &&
+			command.PrepareTerminalDigest == (Digest{}) &&
+			command.AcquireCertificateDigest == (Digest{})
+	default:
+		return false
+	}
+}
+
+func AppendCommand(dst []byte, command Command) ([]byte, error) {
+	if !command.Valid() {
+		return dst, ErrCorrupt
+	}
+	start := len(dst)
+	dst = append(dst, make([]byte, CommandBytes)...)
+	frame := dst[start:]
+	copy(frame[0:4], commandMagic[:])
+	frame[4] = byte(command.Operation)
+	encodedBinding := appendBinding(frame[8:8], command.Binding)
+	copy(frame[216:248], command.PinID[:])
+	copy(frame[248:264], command.AuthorityNode[:])
+	binary.LittleEndian.PutUint64(frame[264:272], command.AuthorityGeneration)
+	copy(frame[272:288], command.ExpectedController[:])
+	binary.LittleEndian.PutUint64(frame[288:296], command.ExpectedControllerEpoch)
+	copy(frame[296:312], command.NextController[:])
+	binary.LittleEndian.PutUint64(frame[312:320], command.NextControllerEpoch)
+	binary.LittleEndian.PutUint64(frame[320:328], uint64(command.ExpectedLeaseDeadline))
+	binary.LittleEndian.PutUint64(frame[328:336], uint64(command.NextLeaseDeadline))
+	binary.LittleEndian.PutUint64(frame[336:344], uint64(command.ObservedUnixNano))
+	copy(frame[344:376], command.PrepareTerminalDigest[:])
+	copy(frame[376:408], command.AcquireCertificateDigest[:])
+	binary.LittleEndian.PutUint64(frame[408:416], command.ExpectedLeaseRevision)
+	if len(encodedBinding) != bindingBytes {
+		panic("executionpin: impossible binding geometry")
+	}
+	binary.LittleEndian.PutUint32(frame[416:420], crc32.Checksum(frame[:416], castagnoli))
+	return dst, nil
+}
+
+func OpenCommand(raw []byte) (Command, error) {
+	if len(raw) != CommandBytes || raw[0] != commandMagic[0] || raw[1] != commandMagic[1] ||
+		raw[2] != commandMagic[2] || raw[3] != commandMagic[3] || !allZero(raw[5:8]) ||
+		binary.LittleEndian.Uint32(raw[416:420]) !=
+			crc32.Checksum(raw[:416], castagnoli) {
+		return Command{}, ErrCorrupt
+	}
+	binding, ok := openBinding(raw[8:216])
+	if !ok {
+		return Command{}, ErrCorrupt
+	}
+	command := Command{Operation: Operation(raw[4]), Binding: binding}
+	copy(command.PinID[:], raw[216:248])
+	copy(command.AuthorityNode[:], raw[248:264])
+	command.AuthorityGeneration = binary.LittleEndian.Uint64(raw[264:272])
+	copy(command.ExpectedController[:], raw[272:288])
+	command.ExpectedControllerEpoch = binary.LittleEndian.Uint64(raw[288:296])
+	copy(command.NextController[:], raw[296:312])
+	command.NextControllerEpoch = binary.LittleEndian.Uint64(raw[312:320])
+	command.ExpectedLeaseDeadline = int64(binary.LittleEndian.Uint64(raw[320:328]))
+	command.NextLeaseDeadline = int64(binary.LittleEndian.Uint64(raw[328:336]))
+	command.ObservedUnixNano = int64(binary.LittleEndian.Uint64(raw[336:344]))
+	copy(command.PrepareTerminalDigest[:], raw[344:376])
+	copy(command.AcquireCertificateDigest[:], raw[376:408])
+	command.ExpectedLeaseRevision = binary.LittleEndian.Uint64(raw[408:416])
+	if !command.Valid() {
+		return Command{}, ErrCorrupt
+	}
+	return command, nil
+}

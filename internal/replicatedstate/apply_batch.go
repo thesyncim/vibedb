@@ -324,7 +324,8 @@ func (m *Machine) ApplyNormalBatch(
 			}
 			if command.Kind() == replication.CommandTransaction ||
 				command.Kind() == replication.CommandRequestLedger ||
-				command.Kind() == replication.CommandRouteGate {
+				command.Kind() == replication.CommandRouteGate ||
+				command.Kind() == replication.CommandExecutionPin {
 				break
 			}
 			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
@@ -532,6 +533,9 @@ func (m *Machine) nextBatchState(
 		RequestLedgerReservedBytes: current.RequestLedgerReservedBytes,
 		RequestLedgerAckRows:       current.RequestLedgerAckRows,
 		RequestLedgerAckBytes:      current.RequestLedgerAckBytes,
+		ExecutionPinRecordCount:    current.ExecutionPinRecordCount,
+		ActiveExecutionPinCount:    current.ActiveExecutionPinCount,
+		ExecutionPinResidentBytes:  current.ExecutionPinResidentBytes,
 	}
 }
 

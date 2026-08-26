@@ -49,11 +49,15 @@ const (
 	// recovery so an ordinary writer cannot forge or acknowledge idempotency
 	// state and a ledger principal cannot mutate user relations.
 	CapabilityRequestLedger
+	// CapabilityExecutionPin owns only the closed logical pin lifecycle in the
+	// catalog RF3 group. It grants no catalog publication or physical route-gate
+	// authority.
+	CapabilityExecutionPin
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
 	CapabilityDelegate | CapabilityMembership | CapabilityTopology |
-	CapabilityTransactionRecovery | CapabilityRequestLedger
+	CapabilityTransactionRecovery | CapabilityRequestLedger | CapabilityExecutionPin
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

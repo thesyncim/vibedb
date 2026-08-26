@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 )
@@ -22,6 +23,8 @@ var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 var transactionMutationDigestDomain = [...]byte{
 	'V', 'i', 'b', 'e', 'D', 'B', '/', 't', 'x', 'n', '/', 'r', 'e', 'l', '/', '1', 0,
 }
+
+var executionPinAuthorityDigestDomain = []byte("vibedb/execution-pin/catalog-authority\x00")
 
 const (
 	transactionCoordinatorEpoch       = uint64(1)
@@ -93,6 +96,9 @@ type Command struct {
 	// RouteGate is one exact fixed routegate command. It is present only for
 	// CommandRouteGate and is ordered by this data shard's existing Raft log.
 	RouteGate []byte
+	// ExecutionPin is one fixed canonical logical-pin command. It is present
+	// only for CommandExecutionPin and carries no relation mutations.
+	ExecutionPin []byte
 	// Batches retains the shared multi-relation mutation payload used by data
 	// and transaction commands; control commands require it to be empty.
 	Batches []RelationMutationBatch
@@ -137,6 +143,7 @@ type CommandView struct {
 	transactionBytes   []byte
 	requestLedgerBytes []byte
 	routeGateBytes     []byte
+	executionPinBytes  []byte
 	relationBytes      []byte
 	mutationCount      uint32
 	relationCount      uint16
@@ -218,6 +225,67 @@ func (v CommandView) OpenTransactionInto(
 		return distributedtxn.ReplicatedCommandView{}, ErrEnvelopeSemantic
 	}
 	return distributedtxn.OpenReplicatedCommandInto(v.transactionBytes, scopes)
+}
+
+// ExecutionPinBytes returns the exact validated nested command, borrowing the
+// outer envelope. Non-execution-pin commands return nil.
+func (v CommandView) ExecutionPinBytes() []byte {
+	return v.executionPinBytes[:len(v.executionPinBytes):len(v.executionPinBytes)]
+}
+
+func (v CommandView) OpenExecutionPin() (executionpin.Command, error) {
+	if v.kind != CommandExecutionPin || len(v.executionPinBytes) != executionpin.CommandBytes {
+		return executionpin.Command{}, ErrEnvelopeSemantic
+	}
+	return executionpin.OpenCommand(v.executionPinBytes)
+}
+
+// ExecutionPinAuthorityDigest returns the portable authority witness sealed in
+// execution-pin certificates. The shard wire first proves that the nested
+// principal equals the authenticated transport Authority and that the class is
+// the dedicated execution-pin capability; this digest then binds that
+// principal to the exact catalog route fences observed by replicated apply.
+func ExecutionPinAuthorityDigest(command CommandView) (Digest, bool) {
+	if command.Kind() != CommandExecutionPin ||
+		command.AuthorityClass != CommandAuthorityExecutionPin {
+		return Digest{}, false
+	}
+	nested, err := command.OpenExecutionPin()
+	if err != nil {
+		return Digest{}, false
+	}
+	h := sha256.New()
+	_, _ = h.Write(executionPinAuthorityDigestDomain)
+	_, _ = h.Write(command.ClusterID[:])
+	_, _ = h.Write(command.ClusterIncarnation[:])
+	_, _ = h.Write(command.ShardIncarnation[:])
+	_, _ = h.Write(command.GroupID[:])
+	_, _ = h.Write([]byte{byte(command.AuthorityClass)})
+	_, _ = h.Write(nested.AuthorityNode[:])
+	var scalar [8]byte
+	writeScalar := func(value uint64) {
+		binary.LittleEndian.PutUint64(scalar[:], value)
+		_, _ = h.Write(scalar[:])
+	}
+	writeBytes := func(value []byte) {
+		writeScalar(uint64(len(value)))
+		_, _ = h.Write(value)
+	}
+	writeScalar(nested.AuthorityGeneration)
+	for _, value := range [...]uint64{
+		command.TopologyRecoveryEpoch, command.AllocationGeneration,
+		command.ReplicaSetVersion, command.ActivePolicyGeneration,
+		command.ProtectionEpoch, command.OwnershipEpoch, command.SchemaGeneration,
+		command.RoutingVersion, command.RouteGeneration,
+	} {
+		writeScalar(value)
+	}
+	writeBytes(command.Distribution)
+	writeBytes(command.Shard)
+	writeBytes(command.Tenant)
+	var digest Digest
+	_ = h.Sum(digest[:0])
+	return digest, digest != (Digest{})
 }
 
 // Kind reports the relation-bundle or session-lifecycle operation.
@@ -472,6 +540,9 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	if command.Kind == CommandRouteGate {
 		cursor += copy(frame[cursor:], command.RouteGate)
 	}
+	if command.Kind == CommandExecutionPin {
+		cursor += copy(frame[cursor:], command.ExecutionPin)
+	}
 	for batchIndex := range command.Batches {
 		batch := &command.Batches[batchIndex]
 		headerAt := -1
@@ -558,6 +629,7 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 		byteSlicesOverlap(region, command.Transaction) ||
 		byteSlicesOverlap(region, command.RequestLedger) ||
 		byteSlicesOverlap(region, command.RouteGate) ||
+		byteSlicesOverlap(region, command.ExecutionPin) ||
 		typedSliceOverlapsBytes(region, command.Batches) {
 		return true
 	}
@@ -596,6 +668,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireRequestLedger
 	case CommandRouteGate:
 		return commandWireRouteGate
+	case CommandExecutionPin:
+		return commandWireExecutionPin
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -650,6 +724,13 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 			return 0, ErrEnvelopeTooLarge
 		}
 	}
+	if command.Kind == CommandExecutionPin {
+		var ok bool
+		total, ok = checkedAdd(total, executionpin.CommandBytes, MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
 	if len(command.Batches) > 1 {
 		var ok bool
 		total, ok = checkedAdd(
@@ -683,17 +764,24 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 }
 
 func validateCommandHeader(command Command) error {
-	if command.AuthorityClass > CommandAuthorityRequestLedger {
+	if !validCommandAuthorityClass(command.AuthorityClass) {
 		return semantic("command authority class")
 	}
 	if (command.Kind == CommandRequestLedger) !=
 		(command.AuthorityClass == CommandAuthorityRequestLedger) {
 		return semantic("request ledger authority class")
 	}
+	if (command.Kind == CommandExecutionPin &&
+		command.AuthorityClass != CommandAuthorityExecutionPin) ||
+		(command.Kind != CommandExecutionPin &&
+			command.AuthorityClass == CommandAuthorityExecutionPin &&
+			!commandKindIsSessionLifecycle(command.Kind)) {
+		return semantic("execution-pin authority class")
+	}
 	switch command.Kind {
 	case CommandMutationBatch:
 		if len(command.Transaction) != 0 || len(command.RequestLedger) != 0 ||
-			len(command.RouteGate) != 0 {
+			len(command.RouteGate) != 0 || len(command.ExecutionPin) != 0 {
 			return semantic("ordinary command carries transaction control")
 		}
 		if err := validateRelationBatches(command.Batches); err != nil {
@@ -702,11 +790,13 @@ func validateCommandHeader(command Command) error {
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
 		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
-			len(command.RequestLedger) != 0 || len(command.RouteGate) != 0 {
+			len(command.RequestLedger) != 0 || len(command.RouteGate) != 0 ||
+			len(command.ExecutionPin) != 0 {
 			return semantic("session lifecycle command carries payload")
 		}
 	case CommandTransaction:
-		if len(command.RequestLedger) != 0 || len(command.RouteGate) != 0 {
+		if len(command.RequestLedger) != 0 || len(command.RouteGate) != 0 ||
+			len(command.ExecutionPin) != 0 {
 			return semantic("transaction command carries unrelated control")
 		}
 		control, err := validatedTransactionControl(command.Transaction)
@@ -733,7 +823,8 @@ func validateCommandHeader(command Command) error {
 		}
 	case CommandRequestLedger:
 		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
-			len(command.RequestLedger) == 0 || len(command.RouteGate) != 0 {
+			len(command.RequestLedger) == 0 || len(command.RouteGate) != 0 ||
+			len(command.ExecutionPin) != 0 {
 			return semantic("request ledger command body")
 		}
 		if err := requestledger.ValidateCommand(command.RequestLedger); err != nil {
@@ -743,14 +834,35 @@ func validateCommandHeader(command Command) error {
 		gate, gateErr := routegate.OpenCommand(command.RouteGate)
 		if len(command.Batches) != 0 || len(command.Transaction) != 0 ||
 			len(command.RequestLedger) != 0 ||
+			len(command.ExecutionPin) != 0 ||
 			len(command.RouteGate) != routegate.CommandBytes || gateErr != nil ||
 			!routeGateAuthorityMatches(command.AuthorityClass, gate.Operation) {
 			return semantic("route-gate command")
+		}
+	case CommandExecutionPin:
+		if command.AuthorityClass != CommandAuthorityExecutionPin || len(command.Batches) != 0 ||
+			len(command.Transaction) != 0 || len(command.RequestLedger) != 0 ||
+			len(command.RouteGate) != 0 ||
+			len(command.ExecutionPin) != executionpin.CommandBytes {
+			return semantic("execution-pin command payload or authority")
+		}
+		if _, err := executionpin.OpenCommand(command.ExecutionPin); err != nil {
+			return semantic("execution-pin command")
 		}
 	default:
 		return semantic("unknown command kind")
 	}
 	return validateCommandEnvelopeMetadata(command, true)
+}
+
+func commandKindIsSessionLifecycle(kind CommandKind) bool {
+	switch kind {
+	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
+		CommandSessionRenew, CommandSessionRevoke:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateCommandEnvelopeMetadata(command Command, requireFingerprint bool) error {
@@ -1237,7 +1349,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 	}
 	kind, ok := openCommandKind(src[10])
 	authorityClass := CommandAuthorityClass(src[11])
-	if !ok || authorityClass > CommandAuthorityRequestLedger ||
+	if !ok || !validCommandAuthorityClass(authorityClass) ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
 		binary.LittleEndian.Uint16(src[246:248]) != 0 {
 		return CommandView{}, semantic("command kind, flags, or reserved bytes")
@@ -1245,6 +1357,11 @@ func OpenCommand(src []byte) (CommandView, error) {
 	if (kind == CommandRequestLedger) !=
 		(authorityClass == CommandAuthorityRequestLedger) {
 		return CommandView{}, semantic("request ledger authority class")
+	}
+	if (kind == CommandExecutionPin && authorityClass != CommandAuthorityExecutionPin) ||
+		(kind != CommandExecutionPin && authorityClass == CommandAuthorityExecutionPin &&
+			!commandKindIsSessionLifecycle(kind)) {
+		return CommandView{}, semantic("execution-pin authority class")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
 	relationCount := binary.LittleEndian.Uint16(src[28:30])
@@ -1280,6 +1397,11 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count != 0 || relationCount != 0 ||
 			inlineRelationID != 0 {
 			return CommandView{}, semantic("route-gate command header")
+		}
+	case CommandExecutionPin:
+		if authorityClass != CommandAuthorityExecutionPin || count != 0 || relationCount != 0 ||
+			inlineRelationID != 0 {
+			return CommandView{}, semantic("execution-pin command header")
 		}
 	}
 
@@ -1412,6 +1534,14 @@ func OpenCommand(src []byte) (CommandView, error) {
 			return CommandView{}, semantic("route-gate command body")
 		}
 		view.routeGateBytes = payload
+	case CommandExecutionPin:
+		if len(payload) != executionpin.CommandBytes {
+			return CommandView{}, semantic("execution-pin body length")
+		}
+		if _, err := executionpin.OpenCommand(payload); err != nil {
+			return CommandView{}, semantic("execution-pin command")
+		}
+		view.executionPinBytes = payload
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count
@@ -1452,6 +1582,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandRequestLedger, true
 	case commandWireRouteGate:
 		return CommandRouteGate, true
+	case commandWireExecutionPin:
+		return CommandExecutionPin, true
 	default:
 		return 0, false
 	}

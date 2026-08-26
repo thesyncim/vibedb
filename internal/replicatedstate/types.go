@@ -12,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/resultformat"
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -21,10 +22,13 @@ const (
 	// ResultFormatMutation is the fixed affected-row result grammar used by this
 	// low-level mutation adapter. ResultApplied carries one canonical eight-byte
 	// nonnegative count; every refusal and session-lifecycle result is empty.
-	ResultFormatMutation uint16 = 1
+	ResultFormatMutation uint16 = resultformat.Mutation
 	// ResultFormatRouteGate carries exactly one canonical fixed routegate
 	// Outcome in the completion envelope.
-	ResultFormatRouteGate uint16 = 3
+	ResultFormatRouteGate uint16 = resultformat.RouteGate
+	// ResultFormatExecutionPin is the fixed transferable logical-pin proof
+	// grammar. Values 3 and 4 are frozen for route-gate and request-ledger.
+	ResultFormatExecutionPin uint16 = resultformat.ExecutionPin
 
 	// Zero and unknown result codes are invalid.
 	ResultApplied         uint32 = 1
@@ -71,6 +75,7 @@ const (
 	MaxStateEnvelopeBytes           = 2 << 10
 	MaxRetainedSessions             = 1 << 20
 	MaxRetainedTransactions         = 1 << 20
+	MaxRetainedExecutionPins        = 1 << 20
 	MaxSessionRetryWindow           = 256
 	MaxStaticBootstrapBytes         = 1 << 20
 	MaxStaticBootstrapEnvelopeBytes = MaxStaticBootstrapBytes + MaxStateEnvelopeBytes

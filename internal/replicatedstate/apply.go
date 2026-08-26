@@ -42,6 +42,8 @@ type commandPlan struct {
 	routeGateRows      []routeGateRowMutation
 	routeGateOutcome   routegate.Outcome
 	changes            []finalMutation
+	systemRows         []transactionRowMutation
+	executionPinDelta  executionPinStateDelta
 	relations          []plannedRelationChanges
 	dataChainDigest    [32]byte
 	resultCode         uint32
@@ -388,7 +390,10 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err := applyCommandPlanToState(&next, plan); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
-	if err := m.persistTransition(next, plan.changes, plan); err != nil {
+	if err := applyExecutionPinStateDelta(&next, plan.executionPinDelta); err != nil {
+		return raftmodel.Publication{}, m.fail(err)
+	}
+	if err := m.persistTransitionRows(next, plan.changes, plan, plan.systemRows); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	return clonePublication(m.publication), nil
@@ -808,6 +813,9 @@ func (m *Machine) hypotheticalState(command replication.CommandView, plan comman
 	if err := applyCommandPlanToState(&next, plan); err != nil {
 		return State{}
 	}
+	if err := applyExecutionPinStateDelta(&next, plan.executionPinDelta); err != nil {
+		return State{}
+	}
 	return next
 }
 
@@ -877,6 +885,9 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		RequestLedgerReservedBytes: m.state.RequestLedgerReservedBytes,
 		RequestLedgerAckRows:       m.state.RequestLedgerAckRows,
 		RequestLedgerAckBytes:      m.state.RequestLedgerAckBytes,
+		ExecutionPinRecordCount:    m.state.ExecutionPinRecordCount,
+		ActiveExecutionPinCount:    m.state.ActiveExecutionPinCount,
+		ExecutionPinResidentBytes:  m.state.ExecutionPinResidentBytes,
 	}
 }
 
@@ -1246,6 +1257,16 @@ func (m *Machine) planBundleCommand(
 	default:
 		if !m.mutableBindingMatchesState(command, state) {
 			plan.resultCode = ResultStaleFence
+			break
+		}
+		if command.Kind() == replication.CommandExecutionPin {
+			var executionErr error
+			plan, executionErr = m.planExecutionPinCommand(
+				plan, command, applied, state, systemSnapshot,
+			)
+			if executionErr != nil {
+				return commandPlan{}, executionErr
+			}
 			break
 		}
 		if relationSnapshots.count != uint16(len(m.relations)) {
@@ -2117,6 +2138,7 @@ func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
 	clientID replication.ID128, retryWindow uint16) error {
 	for _, class := range [...]replication.CommandAuthorityClass{
 		replication.CommandAuthorityData, replication.CommandAuthorityTopology,
+		replication.CommandAuthorityExecutionPin,
 	} {
 		digest := SessionKey(class, tenant, clientID)
 		key := SessionStorageKey(digest)
@@ -2507,8 +2529,8 @@ func (m *Machine) checkTransitionCapacity(
 			return errors.Join(ErrTransitionCapture, err)
 		}
 	}
-	return m.checkTransitionCapacityWithCapture(
-		next, changes, plan, captureBytes,
+	return m.checkTransitionCapacityWithCaptureRows(
+		next, changes, plan, captureBytes, plan.systemRows,
 	)
 }
 

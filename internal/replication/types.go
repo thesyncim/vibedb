@@ -69,9 +69,10 @@ const (
 	commandWireSessionRevoke   = uint8(6)
 	commandWireTransaction     = uint8(7)
 	// Wire kind 8 is owned by the route-gate command family. Request-ledger is
-	// fixed at 9 in the cross-package command registry.
+	// fixed at 9 and execution-pin at 10 in the cross-package command registry.
 	commandWireRouteGate     = uint8(8)
 	commandWireRequestLedger = uint8(9)
+	commandWireExecutionPin  = uint8(10)
 	sessionLeaseBodyBytes    = 16
 	transactionLengthBytes   = 4
 )
@@ -154,7 +155,16 @@ const (
 	// authority for durable request lifecycle commands. It grants neither data
 	// writes nor topology mutation.
 	CommandAuthorityRequestLedger
+	// CommandAuthorityExecutionPin is isolated from topology mutation. A pin
+	// controller may retain/release one logical execution contract but cannot
+	// publish a catalog or operate physical route drains.
+	CommandAuthorityExecutionPin
 )
+
+func validCommandAuthorityClass(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityData || class == CommandAuthorityTopology ||
+		class == CommandAuthorityRequestLedger || class == CommandAuthorityExecutionPin
+}
 
 // CommandKind selects the command's state-machine operation. The zero value is
 // the ordinary mutation batch so command producers remain explicit for session
@@ -194,6 +204,9 @@ const (
 	// command. Shared pin operations require data authority; exclusive drains
 	// and compaction require topology authority.
 	CommandRouteGate
+	// CommandExecutionPin orders one long-lived logical catalog/schema pin in
+	// the dedicated catalog RF3 group. It never carries user relation writes.
+	CommandExecutionPin CommandKind = 10
 )
 
 // MutationKind selects one logical relation mutation.

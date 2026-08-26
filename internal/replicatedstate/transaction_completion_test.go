@@ -498,10 +498,9 @@ func TestTransactionCompletionManifestPageWitnessAndCorruption(t *testing.T) {
 }
 
 func TestTransactionCompletionWorkspaceIsAllocationFreeAndBounded(t *testing.T) {
-	if MaxCompletionEnvelopeBytes != replication.MaxEmptyResultCompletionEnvelopeBytes+
-		RequestLedgerCompletionResultBytes {
-		t.Fatalf("completion envelope bound = %d, want empty bound + %d",
-			MaxCompletionEnvelopeBytes, RequestLedgerCompletionResultBytes)
+	if MaxCompletionEnvelopeBytes != MaxExecutionPinCompletionEnvelopeBytes {
+		t.Fatalf("completion envelope bound = %d, want execution-pin bound",
+			MaxCompletionEnvelopeBytes)
 	}
 	if MaxTransactionCompletionEnvelopeBytes != replication.MaxEmptyResultCompletionEnvelopeBytes+
 		transactionCompletionResultBytes {

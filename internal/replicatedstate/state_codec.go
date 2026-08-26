@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -17,6 +18,7 @@ const (
 	stateHeaderBytes              = 376
 	stateTransactionHeaderBytes   = 416
 	stateRequestLedgerHeaderBytes = 456
+	stateExecutionPinHeaderBytes  = 480
 	recordChecksumLen             = sha256.Size
 )
 
@@ -83,6 +85,12 @@ type State struct {
 	RequestLedgerReservedBytes uint64
 	RequestLedgerAckRows       uint64
 	RequestLedgerAckBytes      uint64
+	// Execution-pin counters authenticate both the durable lifecycle rows and
+	// the active logical-scope index. Terminal tombstones remain retained to
+	// fence delayed acquire commands; only the active index is reclaimed.
+	ExecutionPinRecordCount   uint64
+	ActiveExecutionPinCount   uint64
+	ExecutionPinResidentBytes uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -98,7 +106,9 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
 	headerBytes := stateHeaderBytes
-	if stateHasRequestLedger(state) {
+	if stateHasExecutionPins(state) {
+		headerBytes = stateExecutionPinHeaderBytes
+	} else if stateHasRequestLedger(state) {
 		headerBytes = stateRequestLedgerHeaderBytes
 	} else if stateHasTransactions(state) {
 		headerBytes = stateTransactionHeaderBytes
@@ -150,24 +160,24 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[352:360], state.SessionSlotCount)
 	binary.LittleEndian.PutUint64(frame[360:368], state.SessionEpochHighWater)
 	binary.LittleEndian.PutUint64(frame[368:376], state.AuthorityBindingCount)
-	if headerBytes == stateTransactionHeaderBytes {
+	if headerBytes >= stateTransactionHeaderBytes {
 		binary.LittleEndian.PutUint64(frame[376:384], state.TransactionControlCount)
 		binary.LittleEndian.PutUint64(frame[384:392], state.ActiveTransactionCount)
 		binary.LittleEndian.PutUint64(frame[392:400], state.TransactionPayloadRows)
 		binary.LittleEndian.PutUint64(frame[400:408], state.TransactionIntentRows)
 		binary.LittleEndian.PutUint64(frame[408:416], state.TransactionResidentBytes)
 	}
-	if headerBytes == stateRequestLedgerHeaderBytes {
-		binary.LittleEndian.PutUint64(frame[376:384], state.TransactionControlCount)
-		binary.LittleEndian.PutUint64(frame[384:392], state.ActiveTransactionCount)
-		binary.LittleEndian.PutUint64(frame[392:400], state.TransactionPayloadRows)
-		binary.LittleEndian.PutUint64(frame[400:408], state.TransactionIntentRows)
-		binary.LittleEndian.PutUint64(frame[408:416], state.TransactionResidentBytes)
+	if headerBytes >= stateRequestLedgerHeaderBytes {
 		binary.LittleEndian.PutUint64(frame[416:424], state.RequestLedgerRows)
 		binary.LittleEndian.PutUint64(frame[424:432], state.RequestLedgerResidentBytes)
 		binary.LittleEndian.PutUint64(frame[432:440], state.RequestLedgerReservedBytes)
 		binary.LittleEndian.PutUint64(frame[440:448], state.RequestLedgerAckRows)
 		binary.LittleEndian.PutUint64(frame[448:456], state.RequestLedgerAckBytes)
+	}
+	if headerBytes == stateExecutionPinHeaderBytes {
+		binary.LittleEndian.PutUint64(frame[456:464], state.ExecutionPinRecordCount)
+		binary.LittleEndian.PutUint64(frame[464:472], state.ActiveExecutionPinCount)
+		binary.LittleEndian.PutUint64(frame[472:480], state.ExecutionPinResidentBytes)
 	}
 	cursor := headerBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
@@ -186,7 +196,8 @@ func OpenState(src []byte) (State, error) {
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
 		(headerBytes != stateHeaderBytes && headerBytes != stateTransactionHeaderBytes &&
-			headerBytes != stateRequestLedgerHeaderBytes) ||
+			headerBytes != stateRequestLedgerHeaderBytes &&
+			headerBytes != stateExecutionPinHeaderBytes) ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
@@ -233,29 +244,32 @@ func OpenState(src []byte) (State, error) {
 	state.SessionSlotCount = binary.LittleEndian.Uint64(src[352:360])
 	state.SessionEpochHighWater = binary.LittleEndian.Uint64(src[360:368])
 	state.AuthorityBindingCount = binary.LittleEndian.Uint64(src[368:376])
-	if headerBytes == stateTransactionHeaderBytes {
+	if headerBytes >= stateTransactionHeaderBytes {
 		state.TransactionControlCount = binary.LittleEndian.Uint64(src[376:384])
 		state.ActiveTransactionCount = binary.LittleEndian.Uint64(src[384:392])
 		state.TransactionPayloadRows = binary.LittleEndian.Uint64(src[392:400])
 		state.TransactionIntentRows = binary.LittleEndian.Uint64(src[400:408])
 		state.TransactionResidentBytes = binary.LittleEndian.Uint64(src[408:416])
-		if !stateHasTransactions(state) {
+		if headerBytes == stateTransactionHeaderBytes && !stateHasTransactions(state) {
 			return State{}, fmt.Errorf("%w: noncanonical empty transaction extension", ErrStateCorrupt)
 		}
 	}
-	if headerBytes == stateRequestLedgerHeaderBytes {
-		state.TransactionControlCount = binary.LittleEndian.Uint64(src[376:384])
-		state.ActiveTransactionCount = binary.LittleEndian.Uint64(src[384:392])
-		state.TransactionPayloadRows = binary.LittleEndian.Uint64(src[392:400])
-		state.TransactionIntentRows = binary.LittleEndian.Uint64(src[400:408])
-		state.TransactionResidentBytes = binary.LittleEndian.Uint64(src[408:416])
+	if headerBytes >= stateRequestLedgerHeaderBytes {
 		state.RequestLedgerRows = binary.LittleEndian.Uint64(src[416:424])
 		state.RequestLedgerResidentBytes = binary.LittleEndian.Uint64(src[424:432])
 		state.RequestLedgerReservedBytes = binary.LittleEndian.Uint64(src[432:440])
 		state.RequestLedgerAckRows = binary.LittleEndian.Uint64(src[440:448])
 		state.RequestLedgerAckBytes = binary.LittleEndian.Uint64(src[448:456])
-		if !stateHasRequestLedger(state) {
+		if headerBytes == stateRequestLedgerHeaderBytes && !stateHasRequestLedger(state) {
 			return State{}, fmt.Errorf("%w: noncanonical empty request-ledger extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes == stateExecutionPinHeaderBytes {
+		state.ExecutionPinRecordCount = binary.LittleEndian.Uint64(src[456:464])
+		state.ActiveExecutionPinCount = binary.LittleEndian.Uint64(src[464:472])
+		state.ExecutionPinResidentBytes = binary.LittleEndian.Uint64(src[472:480])
+		if !stateHasExecutionPins(state) {
+			return State{}, fmt.Errorf("%w: noncanonical empty execution-pin extension", ErrStateCorrupt)
 		}
 	}
 	cursor := headerBytes
@@ -304,6 +318,9 @@ func validateState(state State) error {
 	if !validStateRequestLedgerCounters(state) {
 		return fmt.Errorf("%w: invalid request-ledger counters", ErrStateCorrupt)
 	}
+	if !validStateExecutionPinCounters(state) {
+		return fmt.Errorf("%w: invalid execution-pin counters", ErrStateCorrupt)
+	}
 	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
 		return fmt.Errorf("%w: unknown ConfState fields", ErrStateCorrupt)
 	}
@@ -317,6 +334,7 @@ func validateState(state State) error {
 			state.SessionSlotCount != 0 || state.SessionEpochHighWater != 0 ||
 			state.AuthorityBindingCount != 0 || stateHasTransactions(state) ||
 			stateHasRequestLedger(state) ||
+			stateHasExecutionPins(state) ||
 			state.LastEntryDigest != state.BootstrapDigest {
 			return fmt.Errorf("%w: invalid static snapshot state", ErrStateCorrupt)
 		}
@@ -425,6 +443,9 @@ func equalState(left, right State) bool {
 		left.RequestLedgerReservedBytes == right.RequestLedgerReservedBytes &&
 		left.RequestLedgerAckRows == right.RequestLedgerAckRows &&
 		left.RequestLedgerAckBytes == right.RequestLedgerAckBytes &&
+		left.ExecutionPinRecordCount == right.ExecutionPinRecordCount &&
+		left.ActiveExecutionPinCount == right.ActiveExecutionPinCount &&
+		left.ExecutionPinResidentBytes == right.ExecutionPinResidentBytes &&
 		proto.Equal(left.ConfState, right.ConfState)
 }
 
@@ -486,11 +507,39 @@ func validStateTransactionCounters(state State) bool {
 		state.TransactionResidentBytes <= state.TransactionControlCount*MaxTransactionResidentBytes
 }
 
+func stateHasExecutionPins(state State) bool {
+	return state.ExecutionPinRecordCount != 0 || state.ActiveExecutionPinCount != 0 ||
+		state.ExecutionPinResidentBytes != 0
+}
+
+func validStateExecutionPinCounters(state State) bool {
+	if !stateHasExecutionPins(state) {
+		return true
+	}
+	if state.ExecutionPinRecordCount == 0 ||
+		state.ExecutionPinRecordCount > state.Applied-1 ||
+		state.ExecutionPinRecordCount > MaxRetainedExecutionPins ||
+		state.ActiveExecutionPinCount > state.ExecutionPinRecordCount {
+		return false
+	}
+	const recordResident = uint64(executionPinRecordStorageKeyBytes + executionpin.RecordBytes)
+	const activeResident = uint64(executionPinActiveStorageKeyBytes + executionPinActiveValueBytes)
+	if state.ExecutionPinRecordCount > math.MaxUint64/recordResident ||
+		state.ActiveExecutionPinCount > math.MaxUint64/activeResident {
+		return false
+	}
+	recordBytes := state.ExecutionPinRecordCount * recordResident
+	activeBytes := state.ActiveExecutionPinCount * activeResident
+	return recordBytes <= math.MaxUint64-activeBytes &&
+		state.ExecutionPinResidentBytes == recordBytes+activeBytes
+}
+
 func stateSystemRowCount(state State) (uint64, bool) {
 	values := [...]uint64{
 		1, state.SessionCount, state.SessionSlotCount, state.AuthorityBindingCount,
 		state.TransactionControlCount, state.TransactionPayloadRows, state.TransactionIntentRows,
 		state.RequestLedgerRows,
+		state.ExecutionPinRecordCount, state.ActiveExecutionPinCount,
 	}
 	var total uint64
 	for _, value := range values {

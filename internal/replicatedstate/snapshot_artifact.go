@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
@@ -1708,6 +1709,17 @@ func consumeSnapshotArtifactRows(
 					record.IssuerDigest != issuer || record.Sequence != ordinal {
 					return false, errors.Join(keyErr, recordErr,
 						fmt.Errorf("%w: request ledger issuer sequence", ErrSnapshotArtifact))
+				}
+			case len(key) == executionPinRecordStorageKeyBytes && key[0] == executionPinRecordPrefix:
+				record, err := executionpin.OpenRecord(value)
+				want := executionPinRecordStorageKey(record.PinID)
+				if err != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err,
+						fmt.Errorf("%w: execution-pin record", ErrSnapshotArtifact))
+				}
+			case len(key) == executionPinActiveStorageKeyBytes && key[0] == executionPinActivePrefix:
+				if len(value) != executionPinActiveValueBytes {
+					return false, fmt.Errorf("%w: execution-pin active index", ErrSnapshotArtifact)
 				}
 			default:
 				return false, fmt.Errorf("%w: hidden system key", ErrSnapshotArtifact)

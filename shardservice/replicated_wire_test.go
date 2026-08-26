@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -487,6 +488,49 @@ func TestReplicatedProposalRequestLedgerCapabilityIsNarrow(t *testing.T) {
 	encoded.Reset()
 	if err := EncodeReplicatedRequest(&encoded, &wrongService); !errors.Is(err, ErrReplicatedWire) {
 		t.Fatalf("mismatched outer service client identity admitted: %v", err)
+	}
+}
+
+func TestReplicatedProposalExecutionPinCapabilityIsClosedAndIndependent(t *testing.T) {
+	fence := testReplicatedFence()
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{12}, Generation: 1}
+	execution := testReplicatedExecutionPinCommand(t, fence)
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose, Authority: authority,
+		Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution,
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := replication.OpenCommand(decoded.Command)
+	if err != nil || command.Kind() != replication.CommandExecutionPin ||
+		command.AuthorityClass != replication.CommandAuthorityExecutionPin {
+		t.Fatalf("decoded execution pin = %+v, %v", command, err)
+	}
+	for _, rejected := range []*ReplicatedRequest{
+		{Operation: ReplicatedPropose,
+			Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{13}, Generation: 1},
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose,
+			Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{12}, Generation: 2},
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityTopology, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityDataWrite, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: fence,
+			Command: testReplicatedTopologyCommand(t, fence)},
+	} {
+		encoded.Reset()
+		if err := EncodeReplicatedRequest(&encoded, rejected); !errors.Is(err, ErrReplicatedWire) {
+			t.Fatalf("cross-authority command encoded: %v", err)
+		}
 	}
 }
 
@@ -1014,6 +1058,57 @@ func testReplicatedTransactionCommandClass(
 		Transaction:            control,
 	}
 	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence) []byte {
+	t.Helper()
+	digest := func(seed byte) executionpin.Digest {
+		var value executionpin.Digest
+		value[0], value[31] = seed, seed^0xff
+		return value
+	}
+	id := func(seed byte) executionpin.ID {
+		var value executionpin.ID
+		value[0], value[15] = seed, seed^0xff
+		return value
+	}
+	binding := executionpin.Binding{
+		RequestKeyDigest: digest(1), RequestDigest: digest(2),
+		CatalogGeneration: 3, SchemaGeneration: 4,
+		SchemaManifestDigest: digest(5), SchemaCertificateDigest: digest(6),
+		LogicalGroup: id(7), LogicalRange: id(8), MutationDigest: digest(9),
+	}
+	pin, err := executionpin.DerivePinID(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested, err := executionpin.AppendCommand(nil, executionpin.Command{
+		Operation: executionpin.OperationAcquire, Binding: binding, PinID: pin,
+		AuthorityNode: executionpin.ID(rafttransport.NodeID{12}), AuthorityGeneration: 1,
+		NextController: id(10), NextControllerEpoch: 1, NextLeaseDeadline: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := replication.AppendCommand(nil, replication.Command{
+		Kind:           replication.CommandExecutionPin,
+		AuthorityClass: replication.CommandAuthorityExecutionPin,
+		ClusterID:      fence.Group.ClusterID, ClusterIncarnation: fence.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,
+		Distribution:          "orders", Shard: "catalog",
+		AllocationGeneration: fence.AllocationGeneration,
+		ShardIncarnation:     fence.Group.ShardIncarnation, GroupID: fence.Group.GroupID,
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+		OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		Tenant: []byte("pin-controller"), ClientID: replication.ID128{3},
+		ClientEpoch: 2, ClientSequence: 2,
+		Fingerprint:  sha256.Sum256([]byte("native-wire-execution-pin")),
+		ExecutionPin: nested,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

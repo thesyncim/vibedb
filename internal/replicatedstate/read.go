@@ -196,6 +196,21 @@ func equalCompletionConfState(left, right *pb.ConfState) bool {
 		slices.Equal(left.ProtoReflect().GetUnknown(), right.ProtoReflect().GetUnknown())
 }
 
+func completionEnvelopeLimit(kind replication.CommandKind) int {
+	switch kind {
+	case replication.CommandTransaction:
+		return MaxTransactionCompletionEnvelopeBytes
+	case replication.CommandRequestLedger:
+		return replication.MaxEmptyResultCompletionEnvelopeBytes + RequestLedgerCompletionResultBytes
+	case replication.CommandRouteGate:
+		return MaxRouteGateCompletionEnvelopeBytes
+	case replication.CommandExecutionPin:
+		return MaxExecutionPinCompletionEnvelopeBytes
+	default:
+		return MaxMutationCompletionEnvelopeBytes
+	}
+}
+
 // LookupCompletionIntoWorkspace resolves one command through the exact cut
 // held by BeginCompletionLookupBatch. Result bytes are detached into dst.
 func (m *Machine) LookupCompletionIntoWorkspace(
@@ -216,37 +231,9 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 	if !m.immutableBindingMatches(command) {
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	if command.Kind() == replication.CommandTransaction &&
-		cap(dst) < MaxTransactionCompletionEnvelopeBytes {
+	limit := completionEnvelopeLimit(command.Kind())
+	if cap(dst) < limit {
 		return CompletionLookup{}, ErrCompletionBufferSmall
-	}
-	if command.Kind() == replication.CommandRequestLedger &&
-		cap(dst) < MaxCompletionEnvelopeBytes {
-		return CompletionLookup{}, ErrCompletionBufferSmall
-	}
-	if command.Kind() == replication.CommandRouteGate &&
-		cap(dst) < MaxRouteGateCompletionEnvelopeBytes {
-		return CompletionLookup{}, ErrCompletionBufferSmall
-	}
-	if command.Kind() != replication.CommandTransaction &&
-		command.Kind() != replication.CommandRequestLedger {
-		limit := MaxMutationCompletionEnvelopeBytes
-		if command.Kind() == replication.CommandRouteGate {
-			limit = MaxRouteGateCompletionEnvelopeBytes
-		}
-		result, err := m.lookupCompletionAtSnapshot(
-			command,
-			dst[:0:limit],
-			workspace,
-		)
-		if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
-			return CompletionLookup{}, ErrCompletionCorrupt
-		}
-		return result, err
-	}
-	limit := MaxCompletionEnvelopeBytes
-	if command.Kind() == replication.CommandTransaction {
-		limit = MaxTransactionCompletionEnvelopeBytes
 	}
 	result, err := m.lookupCompletionAtSnapshot(
 		command,
@@ -322,8 +309,8 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	if command.Kind() == replication.CommandTransaction && completionScratch != nil &&
-		cap(completionScratch) < MaxTransactionCompletionEnvelopeBytes {
+	limit := completionEnvelopeLimit(command.Kind())
+	if completionScratch != nil && cap(completionScratch) < limit {
 		endErr := m.EndCompletionLookupBatch(&workspace)
 		_ = workspace.Release()
 		if endErr != nil {
@@ -331,31 +318,8 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
-	if command.Kind() == replication.CommandRequestLedger && completionScratch != nil &&
-		cap(completionScratch) < MaxCompletionEnvelopeBytes {
-		endErr := m.EndCompletionLookupBatch(&workspace)
-		_ = workspace.Release()
-		if endErr != nil {
-			return CompletionLookup{}, endErr
-		}
-		return CompletionLookup{}, ErrCompletionBufferSmall
-	}
-	if command.Kind() == replication.CommandTransaction && completionScratch != nil {
-		completionScratch = completionScratch[:0:MaxTransactionCompletionEnvelopeBytes]
-	} else if command.Kind() == replication.CommandRequestLedger && completionScratch != nil {
-		completionScratch = completionScratch[:0:MaxCompletionEnvelopeBytes]
-	} else if command.Kind() == replication.CommandRouteGate && completionScratch != nil {
-		if cap(completionScratch) < MaxRouteGateCompletionEnvelopeBytes {
-			endErr := m.EndCompletionLookupBatch(&workspace)
-			_ = workspace.Release()
-			if endErr != nil {
-				return CompletionLookup{}, endErr
-			}
-			return CompletionLookup{}, ErrCompletionBufferSmall
-		}
-		completionScratch = completionScratch[:0:MaxRouteGateCompletionEnvelopeBytes]
-	} else if completionScratch != nil {
-		completionScratch = completionScratch[:0:MaxMutationCompletionEnvelopeBytes]
+	if completionScratch != nil {
+		completionScratch = completionScratch[:0:limit]
 	}
 	result, lookupErr := m.lookupCompletionAtSnapshot(
 		command, completionScratch, &workspace,
@@ -567,6 +531,9 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	if slotErr == nil {
 		slotErr = validateSessionSlotAgainstHeader(session, record)
 	}
+	matches := session.RetryHome == command.RetryHome &&
+		record.Fingerprint == command.Fingerprint &&
+		record.LogicalCommandDigest == LogicalCommandDigest(command)
 	var completionBytes []byte
 	if slotErr == nil {
 		if record.ResultCode == ResultRouteGate {
@@ -578,10 +545,18 @@ func (m *Machine) lookupCompletionAtSnapshot(
 					workspace.decodeRead[:0],
 				)
 			}
-		} else {
+		} else if command.Kind() == replication.CommandExecutionPin && matches {
+			completionBytes, slotErr = m.appendExecutionPinCompletion(
+				completionScratch[:0], command, record, pointSnapshot{value: snapshot},
+			)
+		} else if command.Kind() != replication.CommandExecutionPin {
 			completionBytes, slotErr = m.appendSessionCompletion(
 				completionScratch[:0], session, record,
 			)
+		}
+		if command.Kind() == replication.CommandExecutionPin && !matches {
+			// A conflicting command cannot reconstruct a transferable pin proof.
+			completionBytes = nil
 		}
 		if slotErr != nil {
 			slotErr = fmt.Errorf("%w: reconstruct completion: %v", ErrSessionCorrupt, slotErr)
@@ -597,9 +572,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 		Key: digest, Bytes: completionBytes,
 		AppliedSequence: record.AppliedSequence,
 	}
-	if session.RetryHome != command.RetryHome ||
-		record.Fingerprint != command.Fingerprint ||
-		record.LogicalCommandDigest != LogicalCommandDigest(command) {
+	if !matches {
 		return result, &RequestConflictError{Key: digest}
 	}
 	return result, nil
@@ -669,8 +642,7 @@ func (m *Machine) LookupSessionLease(
 	clientID replication.ID128,
 	clientEpoch uint64,
 ) (SessionLeaseLookup, error) {
-	if (authorityClass != replication.CommandAuthorityData &&
-		authorityClass != replication.CommandAuthorityTopology) ||
+	if !validSessionAuthorityClass(authorityClass) ||
 		len(tenant) == 0 || len(tenant) > replication.MaxIdentityBytes ||
 		clientID == (replication.ID128{}) || clientEpoch == 0 {
 		return SessionLeaseLookup{}, ErrSessionEpoch

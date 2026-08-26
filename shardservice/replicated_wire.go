@@ -8,6 +8,7 @@ import (
 	"net"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -841,6 +842,7 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 		return err == nil && replicatedCommandCapabilityMatches(
 			request.Capability, command.Kind(), command.AuthorityClass,
 		) && validReplicatedRequestLedgerPrincipal(request, command) &&
+			replicatedExecutionPinAuthorityMatches(request, command) &&
 			command.ClusterID == request.Fence.Group.ClusterID &&
 			command.ClusterIncarnation == request.Fence.Group.ClusterIncarnation &&
 			command.TopologyRecoveryEpoch == request.Fence.Group.TopologyRecoveryEpoch &&
@@ -924,11 +926,32 @@ func validReplicatedRequestLedgerPrincipal(
 	return head.Key.Scope == requestledger.ScopeAuthenticated
 }
 
+func replicatedExecutionPinAuthorityMatches(
+	request *ReplicatedRequest,
+	command replication.CommandView,
+) bool {
+	if command.Kind() != replication.CommandExecutionPin {
+		return true
+	}
+	if request == nil || request.Capability != serviceauthz.CapabilityExecutionPin {
+		return false
+	}
+	nested, err := command.OpenExecutionPin()
+	return err == nil && nested.AuthorityNode == executionpin.ID(request.Authority.Node) &&
+		nested.AuthorityGeneration == request.Authority.Generation
+}
+
 func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
 	kind replication.CommandKind,
 	class replication.CommandAuthorityClass) bool {
 	if capability == serviceauthz.CapabilityTopology {
 		return class == replication.CommandAuthorityTopology
+	}
+	if capability == serviceauthz.CapabilityExecutionPin {
+		return class == replication.CommandAuthorityExecutionPin &&
+			(kind == replication.CommandExecutionPin || kind == replication.CommandSessionOpen ||
+				kind == replication.CommandSessionRenew || kind == replication.CommandSessionRevoke ||
+				kind == replication.CommandSessionRetire || kind == replication.CommandSessionRelease)
 	}
 	if capability == serviceauthz.CapabilityTransactionRecovery {
 		return kind == replication.CommandTransaction &&
@@ -948,14 +971,16 @@ func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
 		capability == serviceauthz.CapabilityMembership ||
 		capability == serviceauthz.CapabilityTopology ||
 		capability == serviceauthz.CapabilityTransactionRecovery ||
-		capability == serviceauthz.CapabilityRequestLedger
+		capability == serviceauthz.CapabilityRequestLedger ||
+		capability == serviceauthz.CapabilityExecutionPin
 }
 
 func validReplicatedProposalCapability(capability serviceauthz.Capability) bool {
 	return capability == 0 || capability == serviceauthz.CapabilityDataWrite ||
 		capability == serviceauthz.CapabilityTopology ||
 		capability == serviceauthz.CapabilityTransactionRecovery ||
-		capability == serviceauthz.CapabilityRequestLedger
+		capability == serviceauthz.CapabilityRequestLedger ||
+		capability == serviceauthz.CapabilityExecutionPin
 }
 
 func validReplicatedReadCapability(capability serviceauthz.Capability) bool {

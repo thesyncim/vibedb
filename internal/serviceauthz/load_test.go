@@ -9,14 +9,15 @@ import (
 func TestLoadVibeJSONBoundsAndCanonicalPolicy(t *testing.T) {
 	node := strings.Repeat("01", 16)
 	policy, err := Load([]byte(`{"generation":5,"principals":[{"node":"` + node +
-		`","capabilities":["data_read","schema","delegate","membership","topology","transaction_recovery","request_ledger"]}]}`))
+		`","capabilities":["data_read","schema","delegate","membership","topology","transaction_recovery","request_ledger","execution_pin"]}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if policy.Generation() != 5 || len(policy.Nodes()) != 1 ||
 		policy.Check(policy.Nodes()[0], CapabilityDataRead|CapabilitySchema|
 			CapabilityDelegate|CapabilityMembership|CapabilityTopology|
-			CapabilityTransactionRecovery|CapabilityRequestLedger) != DecisionAllow {
+			CapabilityTransactionRecovery|CapabilityRequestLedger|
+			CapabilityExecutionPin) != DecisionAllow {
 		t.Fatalf("loaded policy mismatch")
 	}
 	for _, raw := range [][]byte{

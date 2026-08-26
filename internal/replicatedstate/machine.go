@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -452,7 +453,7 @@ func prepareOpenInputs(
 	maxSystemDocument := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
 		MaxAuthorityBindingBytes, routegate.HeadBytes, routegate.StoredPinBytes,
-		routeGateResultBytes,
+		routeGateResultBytes, executionpin.RecordBytes,
 	)
 	hotSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxAuthorityBindingBytes +
@@ -460,8 +461,14 @@ func prepareOpenInputs(
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	releaseSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
-	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes)
-	maxSystemDocuments := max(4, int(options.RetryWindow)+2)
+	executionPinSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxSessionRecordBytes +
+		sha256.Size + 3 + MaxSessionSlotRecordBytes +
+		executionPinRecordStorageKeyBytes + executionpin.RecordBytes +
+		executionPinActiveStorageKeyBytes + executionPinActiveValueBytes
+	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes,
+		executionPinSystemBatchBytes)
+	maxSystemDocuments := max(5, int(options.RetryWindow)+2)
 	if options.RequestLedgerRange.enabled() {
 		// One bounded ledger command can replace the head and publish up to 32
 		// exact 512 KiB plan pages. The hidden collection must admit that whole
@@ -481,7 +488,7 @@ func prepareOpenInputs(
 		routeGateResultKeyBytes + routeGateResultBytes
 	maxSystemBatchBytes = max(maxSystemBatchBytes, routeGateHotBatchBytes)
 	maxSystemDocuments = max(maxSystemDocuments, 6)
-	if system.Limits.MaxKeyBytes < sha256.Size+3 ||
+	if system.Limits.MaxKeyBytes < executionPinActiveStorageKeyBytes ||
 		system.Limits.MaxDocumentBytes < maxSystemDocument ||
 		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
 		system.Limits.MaxBatchBytes < maxSystemBatchBytes {
@@ -730,6 +737,12 @@ type scannedTransactions struct {
 	intentKeys []byte
 }
 
+type scannedExecutionPin struct {
+	record     executionpin.Record
+	digest     [sha256.Size]byte
+	activeSeen bool
+}
+
 // scanSessionSystemSnapshot performs one ordered, bounded pass over the hidden
 // image. It validates state, collision-verifiable session headers, and every
 // compact physical ring slot before returning counts.
@@ -774,6 +787,8 @@ func scanSessionSystemSnapshot(
 	ledgerScan := newRequestLedgerImageScanner(
 		requestLedgerCapacity, requestLedgerCleanup, requestLedgerRange,
 	)
+	var executionPinRecordCount, activeExecutionPinCount, executionPinResidentBytes uint64
+	var activeExecutionPins map[executionpin.PinID]*scannedExecutionPin
 	finishMutationScan := func() error {
 		if mutationScanControl == nil {
 			return nil
@@ -836,6 +851,8 @@ func scanSessionSystemSnapshot(
 				int(state.ActiveTransactionCount))
 			activeTransactionIntents = make(map[transactionIntentIdentity]reopenedTransactionIntentOwner,
 				int(state.TransactionIntentRows))
+			activeExecutionPins = make(map[executionpin.PinID]*scannedExecutionPin,
+				int(state.ActiveExecutionPinCount))
 			if state.TransactionResidentBytes > math.MaxInt32 {
 				return fmt.Errorf("%w: transaction resident reopen arena", ErrTransactionStateCorrupt)
 			}
@@ -1245,6 +1262,49 @@ func scanSessionSystemSnapshot(
 			}
 			return ledgerScan.observeIssuerSequence(key, value)
 
+		case len(key) == executionPinRecordStorageKeyBytes && key[0] == executionPinRecordPrefix:
+			if !statePresent {
+				return ErrExecutionPinStateCorrupt
+			}
+			record, openErr := executionpin.OpenRecord(value)
+			want := executionPinRecordStorageKey(record.PinID)
+			if openErr != nil || !bytes.Equal(key, want[:]) ||
+				record.LastApplied > state.Applied || record.AcquireApplied > state.Applied ||
+				record.LeaseApplied > state.Applied || record.TerminalApplied > state.Applied ||
+				executionPinRecordCount >= state.ExecutionPinRecordCount {
+				return errors.Join(openErr, ErrExecutionPinStateCorrupt)
+			}
+			executionPinRecordCount++
+			executionPinResidentBytes += uint64(len(key) + len(value))
+			if record.Status == executionpin.StatusActive {
+				if _, duplicate := activeExecutionPins[record.PinID]; duplicate {
+					return ErrExecutionPinStateCorrupt
+				}
+				activeExecutionPins[record.PinID] = &scannedExecutionPin{
+					record: record, digest: sha256.Sum256(value),
+				}
+			}
+			return nil
+
+		case len(key) == executionPinActiveStorageKeyBytes && key[0] == executionPinActivePrefix:
+			if !statePresent || len(value) != executionPinActiveValueBytes {
+				return ErrExecutionPinStateCorrupt
+			}
+			var pin executionpin.PinID
+			copy(pin[:], key[33:])
+			summary := activeExecutionPins[pin]
+			if summary == nil || summary.activeSeen {
+				return ErrExecutionPinStateCorrupt
+			}
+			want := executionPinActiveStorageKey(summary.record)
+			if !bytes.Equal(key, want[:]) || !bytes.Equal(value, summary.digest[:]) {
+				return ErrExecutionPinStateCorrupt
+			}
+			summary.activeSeen = true
+			activeExecutionPinCount++
+			executionPinResidentBytes += uint64(len(key) + len(value))
+			return nil
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}
@@ -1338,6 +1398,19 @@ func scanSessionSystemSnapshot(
 		uint64(len(activeTransactionIntents)) != state.TransactionIntentRows {
 		return State{}, false, 0, 0, 0, nil,
 			fmt.Errorf("%w: transaction image accounting", ErrTransactionStateCorrupt)
+	}
+	if executionPinRecordCount != state.ExecutionPinRecordCount ||
+		activeExecutionPinCount != state.ActiveExecutionPinCount ||
+		executionPinResidentBytes != state.ExecutionPinResidentBytes ||
+		uint64(len(activeExecutionPins)) != state.ActiveExecutionPinCount {
+		return State{}, false, 0, 0, 0, nil,
+			fmt.Errorf("%w: execution-pin image accounting", ErrExecutionPinStateCorrupt)
+	}
+	for _, summary := range activeExecutionPins {
+		if !summary.activeSeen {
+			return State{}, false, 0, 0, 0, nil,
+				fmt.Errorf("%w: missing active-scope row", ErrExecutionPinStateCorrupt)
+		}
 	}
 	for _, summary := range transactionControls {
 		control := summary.control

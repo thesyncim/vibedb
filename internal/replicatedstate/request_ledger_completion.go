@@ -4,13 +4,14 @@ import (
 	"encoding/binary"
 
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/resultformat"
 )
 
 const (
 	// ResultFormatRequestLedger is the fixed result grammar for one internal
 	// durable request-ledger CAS. It lets the successful Raft settlement be the
 	// serving proof; a second ReadIndex is needed only after outcome-unknown.
-	ResultFormatRequestLedger uint16 = 4
+	ResultFormatRequestLedger uint16 = resultformat.RequestLedger
 
 	RequestLedgerCompletionResultBytes    = 176
 	requestLedgerCompletionExactDuplicate = byte(1)

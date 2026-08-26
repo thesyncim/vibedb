@@ -9,12 +9,13 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/resultformat"
 )
 
 const (
 	// ResultFormatTransaction is the sole fixed transaction result grammar. It
 	// is a grammar selector, not a version ladder.
-	ResultFormatTransaction uint16 = 2
+	ResultFormatTransaction uint16 = resultformat.Transaction
 	// ResultTransactionConflict is a transaction-control CAS loss. It is
 	// intentionally distinct from ResultIndexConflict, which is a user-data
 	// mutation precondition failure.
@@ -23,12 +24,13 @@ const (
 	transactionCompletionResultBytes      = 24
 	MaxTransactionCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes +
 		transactionCompletionResultBytes
-	// MaxCompletionEnvelopeBytes is the largest fixed result across the frozen
-	// transaction, route-gate, and request-ledger grammars.
+	// MaxCompletionEnvelopeBytes is the largest fixed result across every frozen
+	// completion grammar.
 	MaxCompletionEnvelopeBytes = max(
 		MaxTransactionCompletionEnvelopeBytes,
 		MaxRouteGateCompletionEnvelopeBytes,
 		replication.MaxEmptyResultCompletionEnvelopeBytes+RequestLedgerCompletionResultBytes,
+		MaxExecutionPinCompletionEnvelopeBytes,
 	)
 )
 

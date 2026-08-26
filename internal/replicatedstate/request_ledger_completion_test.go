@@ -100,7 +100,7 @@ func TestRequestLedgerCapacityCompletionIsExplicitlyStateless(t *testing.T) {
 
 func TestRequestLedgerCompletionResultBoundsMaxEnvelope(t *testing.T) {
 	want := replication.MaxEmptyResultCompletionEnvelopeBytes + RequestLedgerCompletionResultBytes
-	if MaxCompletionEnvelopeBytes != want ||
+	if MaxCompletionEnvelopeBytes < want ||
 		RequestLedgerCompletionResultBytes <= transactionCompletionResultBytes {
 		t.Fatalf("completion geometry max=%d result=%d", MaxCompletionEnvelopeBytes, RequestLedgerCompletionResultBytes)
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -129,7 +130,7 @@ type NativeSessionOptions struct {
 	Resolver     BundleResolver
 	Journal      *NativeSessionJournal
 	// ProposalCapability is the exact authorization class placed on every
-	// probe and proposal. Only DataWrite and Topology are admitted.
+	// probe and proposal. DataWrite, Topology, and ExecutionPin are admitted.
 	ProposalCapability serviceauthz.Capability
 
 	MaxRelationBatches  int
@@ -154,7 +155,8 @@ func NativeSessionJournalBinding(
 		!validNativeSessionIdentity(distribution, shard, tenant) ||
 		relation == 0 || relation > replication.MaxRelationID ||
 		(capability != serviceauthz.CapabilityDataWrite &&
-			capability != serviceauthz.CapabilityTopology) {
+			capability != serviceauthz.CapabilityTopology &&
+			capability != serviceauthz.CapabilityExecutionPin) {
 		return replication.Digest{}, ErrNativeSession
 	}
 	hash := sha256.New()
@@ -276,7 +278,8 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		return nil, ErrNativeSession
 	}
 	if options.ProposalCapability != serviceauthz.CapabilityDataWrite &&
-		options.ProposalCapability != serviceauthz.CapabilityTopology {
+		options.ProposalCapability != serviceauthz.CapabilityTopology &&
+		options.ProposalCapability != serviceauthz.CapabilityExecutionPin {
 		return nil, ErrNativeSession
 	}
 	route := options.Route
@@ -421,6 +424,7 @@ func (session *NativeSession) MutateBatch(
 	mutations []NativeMutation,
 ) (NativeResult, error) {
 	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.proposalCapability == serviceauthz.CapabilityExecutionPin ||
 		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
 		return NativeResult{}, sessionStateError(session)
 	}
@@ -449,6 +453,30 @@ func (session *NativeSession) MutateBatch(
 	result, err := session.prepareAndExecute(ctx, command, false)
 	session.bundle.reset()
 	return result, err
+}
+
+// ExecutionPin proposes one canonical logical catalog/schema pin transition.
+// The typed fixed-width kernel is encoded inside the session's exact durable
+// retry command; callers cannot inject raw replicated command bytes.
+func (session *NativeSession) ExecutionPin(
+	ctx context.Context,
+	transition executionpin.Command,
+) (NativeResult, error) {
+	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.proposalCapability != serviceauthz.CapabilityExecutionPin ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
+		return NativeResult{}, sessionStateError(session)
+	}
+	var storage [executionpin.CommandBytes]byte
+	nested, err := executionpin.AppendCommand(storage[:0], transition)
+	if err != nil {
+		return NativeResult{}, ErrNativeSession
+	}
+	command := session.commandHeader(
+		replication.CommandExecutionPin, session.epoch, session.nextSequence, session.ackThrough,
+	)
+	command.ExecutionPin = nested
+	return session.prepareAndExecute(ctx, command, false)
 }
 
 func (session *NativeSession) validateNativeMutation(mutation NativeMutation) error {
@@ -566,6 +594,8 @@ func (session *NativeSession) commandHeader(
 	authorityClass := replication.CommandAuthorityData
 	if session.proposalCapability == serviceauthz.CapabilityTopology {
 		authorityClass = replication.CommandAuthorityTopology
+	} else if session.proposalCapability == serviceauthz.CapabilityExecutionPin {
+		authorityClass = replication.CommandAuthorityExecutionPin
 	}
 	return replication.Command{
 		Kind:                  kind,
@@ -793,6 +823,18 @@ func nativeCompletionMatches(
 			result.Role != role || result.Operation != operation {
 			return false
 		}
+	} else if command.Kind() == replication.CommandExecutionPin {
+		if completion.ResultFormat != replicatedstate.ResultFormatExecutionPin ||
+			completion.ResultLength != executionpin.CompletionBytes ||
+			len(completion.InlineResult) != executionpin.CompletionBytes {
+			return false
+		}
+		proof, err := executionpin.OpenCompletion(completion.InlineResult)
+		nested, nestedErr := command.OpenExecutionPin()
+		if err != nil || nestedErr != nil || proof.Operation != nested.Operation ||
+			!nativeExecutionPinResultCode(completion.ResultCode) {
+			return false
+		}
 	} else {
 		if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
 			completion.ResultLength != uint64(len(completion.InlineResult)) ||
@@ -864,8 +906,21 @@ func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) 
 			result == replicatedstate.ResultStaleFence
 	case replication.CommandSessionRelease:
 		return false
+	case replication.CommandExecutionPin:
+		return nativeExecutionPinResultCode(result)
 	}
 	return false
+}
+
+func nativeExecutionPinResultCode(result uint32) bool {
+	switch result {
+	case replicatedstate.ResultApplied, replicatedstate.ResultStaleFence,
+		replicatedstate.ResultIndexConflict, replicatedstate.ResultIntentBusy,
+		replicatedstate.ResultTargetBound:
+		return true
+	default:
+		return false
+	}
 }
 
 func validNativeSessionIdentity(distribution, shard string, tenant []byte) bool {
@@ -879,8 +934,9 @@ func validNativeTextIdentity(value string) bool {
 }
 
 var (
-	nativeFingerprintDomain       = []byte("vibedb/gateway/native-command\x00")
-	nativeTopologyAuthorityMarker = []byte{byte(replication.CommandAuthorityTopology)}
+	nativeFingerprintDomain           = []byte("vibedb/gateway/native-command\x00")
+	nativeTopologyAuthorityMarker     = []byte{byte(replication.CommandAuthorityTopology)}
+	nativeExecutionPinAuthorityMarker = []byte{byte(replication.CommandAuthorityExecutionPin)}
 )
 
 func nativeCommandFingerprint(command replication.Command) replication.Digest {
@@ -891,6 +947,8 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	_, _ = hasher.Write(scalar[:])
 	if command.AuthorityClass == replication.CommandAuthorityTopology {
 		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	} else if command.AuthorityClass == replication.CommandAuthorityExecutionPin {
+		_, _ = hasher.Write(nativeExecutionPinAuthorityMarker)
 	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
@@ -938,6 +996,9 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Transaction)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(command.Transaction)
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.ExecutionPin)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.ExecutionPin)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Batches)))
 	_, _ = hasher.Write(scalar[:])
 	for _, batch := range command.Batches {
@@ -975,6 +1036,8 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 	_, _ = hasher.Write(scalar[:])
 	if command.AuthorityClass == replication.CommandAuthorityTopology {
 		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	} else if command.AuthorityClass == replication.CommandAuthorityExecutionPin {
+		_, _ = hasher.Write(nativeExecutionPinAuthorityMarker)
 	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
@@ -1023,6 +1086,10 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(transaction)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(transaction)
+	executionPin := command.ExecutionPinBytes()
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(executionPin)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(executionPin)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = hasher.Write(scalar[:])
 	relations := command.RelationBatches()

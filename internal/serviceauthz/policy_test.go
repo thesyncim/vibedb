@@ -139,6 +139,34 @@ func TestRequestLedgerCapabilityIsIndependent(t *testing.T) {
 	}
 }
 
+func TestExecutionPinCapabilityIsIndependentFromTopology(t *testing.T) {
+	pin, topology, writer := authzNode(40), authzNode(41), authzNode(42)
+	policy, err := NewPolicy(12, []Entry{
+		{Node: pin, Capabilities: CapabilityExecutionPin},
+		{Node: topology, Capabilities: CapabilityTopology},
+		{Node: writer, Capabilities: CapabilityDataWrite},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Check(pin, CapabilityExecutionPin); got != DecisionAllow {
+		t.Fatalf("execution-pin operator denied: %d", got)
+	}
+	for _, capability := range []Capability{
+		CapabilityTopology, CapabilityDataRead, CapabilityDataWrite,
+		CapabilitySchema, CapabilityMembership, CapabilityTransactionRecovery,
+	} {
+		if got := policy.Check(pin, capability); got != DecisionDenyCapability {
+			t.Fatalf("execution-pin implied capability %x: %d", capability, got)
+		}
+	}
+	for _, node := range []rafttransport.NodeID{topology, writer} {
+		if got := policy.Check(node, CapabilityExecutionPin); got != DecisionDenyCapability {
+			t.Fatalf("ordinary authority %x implied execution-pin: %d", node, got)
+		}
+	}
+}
+
 func TestAuthorityContextIsExactAndAllocationFreeOnRead(t *testing.T) {
 	authority := Authority{Node: authzNode(11), Generation: 19}
 	ctx, err := WithAuthority(context.Background(), authority)
