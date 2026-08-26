@@ -813,11 +813,49 @@ func (v *GlobalTabletCatalogNodeView) InsertChild(
 	id uint32,
 	ref PageRef,
 ) ([]byte, error) {
+	return v.insertChild(dst, generation, bounds, floor, id, ref, nil)
+}
+
+// InsertChildReplacing is InsertChild plus a bounded set of existing child
+// handle replacements in the same canonical node image. Macro-tablet split
+// uses this to publish the left replacement and right sibling without an
+// intermediate catalog generation.
+func (v *GlobalTabletCatalogNodeView) InsertChildReplacing(
+	dst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+) ([]byte, error) {
+	if len(rewrites) == 0 || len(rewrites) > v.Count() {
+		return nil, fmt.Errorf("%w: catalog insert rewrites", ErrInvalidWrite)
+	}
+	return v.insertChild(dst, generation, bounds, floor, id, ref, rewrites)
+}
+
+func (v *GlobalTabletCatalogNodeView) insertChild(
+	dst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+) ([]byte, error) {
 	if v == nil || len(v.image) == 0 || len(floor) == 0 ||
 		generation <= v.header.Generation || generation >= uint64(1)<<48 ||
 		len(dst) < len(v.image) || !bounds.extends(v.bounds) ||
 		globalTabletCatalogSlicesOverlap(dst[:len(v.image)], v.image) {
 		return nil, fmt.Errorf("%w: catalog insert generation or destination", ErrInvalidWrite)
+	}
+	for at := range rewrites {
+		for prior := 0; prior < at; prior++ {
+			if rewrites[prior].ID == rewrites[at].ID {
+				return nil, fmt.Errorf("%w: duplicate catalog insert rewrite", ErrInvalidWrite)
+			}
+		}
 	}
 
 	type floorSpan struct{ start, end int }
@@ -849,6 +887,7 @@ func (v *GlobalTabletCatalogNodeView) InsertChild(
 	}
 
 	entries := make([]GlobalTabletCatalogNodeEntry, 0, v.Count()+1)
+	matched := make([]bool, len(rewrites))
 	for ordinal := 0; ordinal <= v.Count(); ordinal++ {
 		if ordinal == insertAt {
 			entries = append(entries, GlobalTabletCatalogNodeEntry{
@@ -867,9 +906,22 @@ func (v *GlobalTabletCatalogNodeView) InsertChild(
 			span := spans[ordinal]
 			oldFloor = arena[span.start:span.end]
 		}
+		oldRef := route.Ref
+		for at, rewrite := range rewrites {
+			if rewrite.ID != route.ID {
+				continue
+			}
+			matched[at] = true
+			oldRef = rewrite.Ref
+		}
 		entries = append(entries, GlobalTabletCatalogNodeEntry{
-			Floor: oldFloor, ID: route.ID, Ref: route.Ref,
+			Floor: oldFloor, ID: route.ID, Ref: oldRef,
 		})
+	}
+	for _, ok := range matched {
+		if !ok {
+			return nil, fmt.Errorf("%w: missing catalog insert rewrite", ErrInvalidWrite)
+		}
 	}
 	return EncodeGlobalTabletCatalogNode(
 		dst,

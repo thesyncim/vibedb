@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,20 +11,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// Bounded structural transactions split full leaves and remove empty leaves.
-// Each is one write transaction that rebuilds exactly one tablet's
-// anchor pages, local-ID locator, and tablet root from the tablet's current
-// leaf set, then rewrites the catalog path and state root and publishes one
-// generation, retiring the predecessors. The resident router is rebuilt from
-// the freshly published graph; a concurrent reader that observes the new state
-// before the swap completes falls back to the rooted page-walk oracle through
-// the existing generation guard, so the swap is race-free.
-//
-// The tablet is rebuilt wholesale, including all its anchor pages. At the
-// current leaf-level scale a tablet holds one anchor page, so the rebuild
-// rewrites the same pages a surgical edit would. Because slot movement is
-// confined to this one bounded transaction, exact-index posting tiles for
-// moved rows are rebuilt in the same publication.
+// Bounded structural transactions split full leaves, reclaim empty leaves, and
+// spill a saturated tablet into a small sibling. Common leaf edits use localized
+// anchor COW; the bounded whole-tablet routing fallback repacks only metadata.
+// Macro spill re-encodes two leaves and publishes both tablet handles through
+// one catalog/state-root generation. Exact-index posting repairs share that
+// atomic publication.
 const (
 	// primaryStructuralRetryLimit bounds split re-attempts after a full leaf.
 	// A lexical-median split of a full leaf leaves both halves with ample
@@ -32,10 +25,9 @@ const (
 	primaryStructuralRetryLimit = 16
 )
 
-// ErrPrimaryMacroSplitRequired reports that a structural transaction cannot
-// proceed because the tablet's 4096 local IDs or its 16 anchor pages are
-// exhausted, so a macro-tablet split (the next phase) is required. It is
-// counted in Stats.PrimaryMacroSplitRequired.
+// ErrPrimaryMacroSplitRequired reports that sibling publication cannot proceed
+// because the tablet identity namespace or selected catalog node is exhausted.
+// It is counted in Stats.PrimaryMacroSplitRequired.
 var ErrPrimaryMacroSplitRequired = errors.New(
 	"vibedb: primary macro-tablet split required",
 )
@@ -45,6 +37,7 @@ type primaryStructuralKind uint8
 const (
 	structuralSplit primaryStructuralKind = iota
 	structuralEmptyReclaim
+	structuralMacroSplit
 )
 
 // structuralLeaf is one enumerated current leaf of a tablet: its stable
@@ -99,6 +92,8 @@ func (c *Collection) recordStructuralLatency(
 	case structuralEmptyReclaim:
 		c.primaryEmptyReclaims.Add(1)
 		updateMaxU64(&c.primaryEmptyReclaimMaxNS, ns)
+	case structuralMacroSplit:
+		c.primaryMacroSplits.Add(1)
 	}
 }
 
@@ -327,6 +322,132 @@ func (c *Collection) encodeStructuralLeaf(
 	return page.Ref(), nil
 }
 
+// stageNewPrimaryTablet encodes one freshly allocated sibling tablet. Its leaf
+// handles are already staged in tx; this routine creates only the compact
+// bounded routing set (anchors, dense locator, and tablet root).
+func (c *Collection) stageNewPrimaryTablet(
+	tx *storeio.WriteTransaction,
+	generation uint64,
+	tabletID uint32,
+	leaves []storeio.SegmentedTabletRouterLeaf,
+) (storeio.PageRef, uint64, error) {
+	if tx == nil || len(leaves) == 0 || len(leaves[0].Fence) != 0 {
+		return storeio.PageRef{}, 0, storeio.ErrInvalidWrite
+	}
+	pageCount := (len(leaves) + storeio.SegmentedTabletRouterRowsPerPage - 1) /
+		storeio.SegmentedTabletRouterRowsPerPage
+	if pageCount == 0 || pageCount > storeio.SegmentedTabletRouterMaxPages {
+		return storeio.PageRef{}, 0, ErrPrimaryMacroSplitRequired
+	}
+	anchorPages := make([]storeio.TransactionPage, pageCount)
+	anchorRefs := make([]storeio.PageRef, pageCount)
+	for pageID := range pageCount {
+		logicalID, ok := storeio.GlobalTabletCatalogAnchorLogicalID(
+			tabletID, uint8(pageID),
+		)
+		if !ok {
+			return storeio.PageRef{}, 0, ErrPrimaryMacroSplitRequired
+		}
+		page, err := tx.Allocate(
+			storeio.PagePrimaryAnchor,
+			storeio.SegmentedTabletRouterAnchorPageBytes,
+			logicalID,
+		)
+		if err != nil {
+			return storeio.PageRef{}, 0, err
+		}
+		anchorPages[pageID], anchorRefs[pageID] = page, page.Ref()
+	}
+	locatorLogical, ok := storeio.GlobalTabletCatalogLocatorLogicalID(tabletID)
+	if !ok {
+		return storeio.PageRef{}, 0, ErrPrimaryMacroSplitRequired
+	}
+	locatorPage, err := tx.Allocate(
+		storeio.PagePrimaryLocator, storeio.GlobalTabletCatalogLocatorBytes,
+		locatorLogical,
+	)
+	if err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+	tabletLogical, ok := storeio.GlobalTabletCatalogTabletRootLogicalID(tabletID)
+	if !ok {
+		return storeio.PageRef{}, 0, ErrPrimaryMacroSplitRequired
+	}
+	tabletPage, err := tx.Allocate(
+		storeio.PageTabletRoute, storeio.GlobalTabletCatalogTabletBytes,
+		tabletLogical,
+	)
+	if err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+
+	rawRoot := make([]byte, storeio.SegmentedTabletRouterRootBytes)
+	rawLocator := make([]byte, storeio.SegmentedTabletRouterLocatorBytes)
+	rawAnchors := make(
+		[]byte, pageCount*storeio.SegmentedTabletRouterAnchorPageBytes,
+	)
+	if _, _, _, _, err := storeio.EncodeSegmentedTabletRouter(
+		rawRoot, rawLocator, rawAnchors,
+		storeio.SegmentedTabletRouterHeader{
+			StoreID: c.storeID, TabletID: tabletID, Generation: generation,
+			AnchorKind: storeio.PagePrimaryAnchor, LeafKind: storeio.PagePrimaryLeaf,
+		},
+		anchorRefs, leaves,
+	); err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+	for pageID := range pageCount {
+		start := pageID * storeio.SegmentedTabletRouterAnchorPageBytes
+		copy(anchorPages[pageID].Bytes(),
+			rawAnchors[start:start+storeio.SegmentedTabletRouterAnchorPageBytes])
+		if err := anchorPages[pageID].Stage(); err != nil {
+			return storeio.PageRef{}, 0, err
+		}
+	}
+	locatorEntries := make([]storeio.GlobalTabletCatalogLocatorEntry, len(leaves))
+	for rank := range leaves {
+		locatorEntries[rank] = storeio.GlobalTabletCatalogLocatorEntry{
+			LocalID: leaves[rank].LocalID,
+			PageID:  uint8(rank / storeio.SegmentedTabletRouterRowsPerPage),
+			RowSlot: uint8(rank % storeio.SegmentedTabletRouterRowsPerPage),
+			State:   storeio.GlobalTabletCatalogLocatorLive,
+		}
+	}
+	sort.Slice(locatorEntries, func(i, j int) bool {
+		return locatorEntries[i].LocalID < locatorEntries[j].LocalID
+	})
+	bounds := c.primaryMutationBounds(tx)
+	if _, err := storeio.EncodeGlobalTabletCatalogLocatorPage(
+		locatorPage.Bytes(), c.storeID, generation, tabletID,
+		generation, bounds, locatorEntries,
+	); err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+	if err := locatorPage.Stage(); err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+	if _, err := storeio.EncodeGlobalTabletCatalogTabletRoot(
+		tabletPage.Bytes(),
+		storeio.PageHeader{
+			StoreID: c.storeID, Generation: generation,
+			LogicalID: tabletLogical, PageSize: storeio.GlobalTabletCatalogTabletBytes,
+			PayloadLength: storeio.GlobalTabletCatalogRootHeader +
+				storeio.SegmentedTabletRouterRootBytes,
+			Kind: storeio.PageTabletRoute,
+		},
+		bounds, locatorPage.Ref(), rawRoot,
+	); err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+	if err := tabletPage.Stage(); err != nil {
+		return storeio.PageRef{}, 0, err
+	}
+	bytes := uint64(storeio.GlobalTabletCatalogLocatorBytes +
+		storeio.GlobalTabletCatalogTabletBytes +
+		pageCount*storeio.SegmentedTabletRouterAnchorPageBytes)
+	return tabletPage.Ref(), bytes, nil
+}
+
 // structuralLeafStager stages the new leaf page(s) of a structural transaction
 // inside tx and returns the tablet's final leaf set in lexical order (leaf 0
 // with the empty floor) plus every leaf page superseded or removed.
@@ -339,6 +460,7 @@ type structuralLeafStager func(tx *storeio.WriteTransaction) (
 
 type primaryLocalizedLeafSplit struct {
 	remove       bool
+	macro        *primaryMacroTabletSplit
 	resident     storeio.ResidentPrimaryRoute
 	route        storeio.SegmentedTabletRouterRoute
 	leftRef      storeio.PageRef
@@ -346,6 +468,12 @@ type primaryLocalizedLeafSplit struct {
 	rightBucket  storeio.BucketID
 	rightLocalID uint16
 	rightFence   []byte
+}
+
+type primaryMacroTabletSplit struct {
+	tabletID uint32
+	floor    []byte
+	leaves   []storeio.SegmentedTabletRouterLeaf
 }
 
 // commitPrimaryStructural runs one bounded structural transaction: it stages the
@@ -409,15 +537,20 @@ func (c *Collection) commitPrimaryStructural(
 	if err != nil {
 		return err
 	}
-	if localized == nil && (len(finalLeaves) == 0 || len(finalLeaves[0].Fence) != 0) {
+	macro := (*primaryMacroTabletSplit)(nil)
+	if localized != nil {
+		macro = localized.macro
+	}
+	isLocalized := localized != nil && macro == nil
+	if !isLocalized && (len(finalLeaves) == 0 || len(finalLeaves[0].Fence) != 0) {
 		return storeio.ErrSegmentedTabletRouterCorrupt
 	}
 	pageCount := 0
-	if localized == nil {
+	if !isLocalized {
 		pageCount = (len(finalLeaves) + storeio.SegmentedTabletRouterRowsPerPage - 1) /
 			storeio.SegmentedTabletRouterRowsPerPage
 	}
-	if localized == nil && (pageCount == 0 || pageCount > storeio.SegmentedTabletRouterMaxPages) {
+	if !isLocalized && (pageCount == 0 || pageCount > storeio.SegmentedTabletRouterMaxPages) {
 		c.primaryMacroSplitRequired.Add(1)
 		return ErrPrimaryMacroSplitRequired
 	}
@@ -452,7 +585,7 @@ func (c *Collection) commitPrimaryStructural(
 	var rawRoot []byte
 	var nextRouter *storeio.ResidentPrimaryRouter
 	var structuralRoutingStaged, structuralRoutingRetired uint64
-	if localized != nil {
+	if isLocalized {
 		oldAnchorRefs = []storeio.PageRef{path.anchorRoute.Ref}
 		leftLogical, logicalOK := storeio.GlobalTabletCatalogAnchorLogicalID(
 			tabletID, path.anchorRoute.PageID,
@@ -667,6 +800,17 @@ func (c *Collection) commitPrimaryStructural(
 	if err := tabletPage.Stage(); err != nil {
 		return err
 	}
+	var macroTabletRef storeio.PageRef
+	if macro != nil {
+		var macroBytes uint64
+		macroTabletRef, macroBytes, err = c.stageNewPrimaryTablet(
+			tx, generation, macro.tabletID, macro.leaves,
+		)
+		if err != nil {
+			return err
+		}
+		structuralRoutingStaged += macroBytes
+	}
 
 	catalogPage, err := tx.AllocateNear(
 		storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
@@ -676,7 +820,21 @@ func (c *Collection) commitPrimaryStructural(
 		return err
 	}
 	bounds = c.primaryMutationBounds(tx)
-	if _, err := path.catalog.RewriteHandle(
+	if macro != nil {
+		if _, err := path.catalog.InsertChildReplacing(
+			catalogPage.Bytes(), generation, bounds,
+			macro.floor, macro.tabletID, macroTabletRef,
+			[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+				ID: path.tabletRoute.ID, Ref: tabletPage.Ref(),
+			}},
+		); err != nil {
+			if errors.Is(err, storeio.ErrGlobalTabletCatalogNoSpace) {
+				c.primaryMacroSplitRequired.Add(1)
+				return errors.Join(ErrPrimaryMacroSplitRequired, err)
+			}
+			return err
+		}
+	} else if _, err := path.catalog.RewriteHandle(
 		catalogPage.Bytes(), generation, bounds,
 		path.tabletRoute.ID, tabletPage.Ref(),
 	); err != nil {
@@ -856,6 +1014,12 @@ func (c *Collection) commitPrimaryStructural(
 		}
 		c.primaryRouter.Store(builtRouter)
 	}
+	if macro != nil {
+		c.primaryNextTabletID = macro.tabletID + 1
+	}
+	if kind == structuralSplit && !isLocalized {
+		c.primaryTabletRoutingRebuilds.Add(1)
+	}
 	c.recordStructuralLatency(kind, start)
 
 	// A deferred-canonical structural transaction is a checkpoint, not a volatile
@@ -916,6 +1080,9 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 	if sourceIndex < 0 {
 		return storeio.ErrSegmentedTabletRouterCorrupt
 	}
+	if _, ok := structuralFreeLocalID(current); !ok {
+		return c.structuralSplitPrimaryMacroTablet(state, &path, current)
+	}
 	tabletID := path.tablet.TabletID()
 	generation := state.root.Generation + 1
 	return c.commitPrimaryStructural(
@@ -973,6 +1140,35 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 			if encErr != nil {
 				return nil, nil, nil, encErr
 			}
+			// A full selected anchor normally spills one row into a fresh anchor.
+			// When all 16 stable anchor IDs already exist (including the now-partial
+			// trailing anchor left by a macro spill), rebuild only this tablet's
+			// bounded routing set so dense rank packing consumes that available slot.
+			if path.anchor.Count() == storeio.SegmentedTabletRouterRowsPerPage &&
+				path.tablet.AnchorCount() == storeio.SegmentedTabletRouterMaxPages {
+				final := make(
+					[]storeio.SegmentedTabletRouterLeaf, 0, len(current)+1,
+				)
+				for at := range current {
+					if at != sourceIndex {
+						final = append(final, storeio.SegmentedTabletRouterLeaf{
+							LocalID: current[at].localID, Fence: current[at].fence,
+							Ref: current[at].ref, Zone: current[at].zone,
+						})
+						continue
+					}
+					final = append(final,
+						storeio.SegmentedTabletRouterLeaf{
+							LocalID: current[at].localID, Fence: current[at].fence,
+							Ref: leftRef, Zone: current[at].zone,
+						},
+						storeio.SegmentedTabletRouterLeaf{
+							LocalID: rightLocalID, Fence: rightFence, Ref: rightRef,
+						},
+					)
+				}
+				return final, []storeio.PageRef{current[sourceIndex].ref}, nil, nil
+			}
 			// A split re-encodes both halves; their new posting contributions were
 			// captured above. The parent edit is localized after this callback.
 			return nil, []storeio.PageRef{current[sourceIndex].ref},
@@ -982,6 +1178,104 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 					rightBucket: rightBucket, rightLocalID: rightLocalID,
 					rightFence: rightFence,
 				}, nil
+		},
+	)
+}
+
+// structuralSplitPrimaryMacroTablet creates one small right sibling and moves
+// only the two trailing leaves into it. This frees two local identities in the
+// saturated source tablet while bounding foreground data rewrite independently
+// of tablet cardinality. A subsequent ordinary leaf split consumes at most one
+// of those IDs; the second is deliberate slack against immediate split trains.
+func (c *Collection) structuralSplitPrimaryMacroTablet(
+	state *fileStoreState,
+	path *filePrimaryMutationPath,
+	current []structuralLeaf,
+) error {
+	const spillLeaves = 2
+	if state == nil || path == nil || len(current) < spillLeaves+1 ||
+		c.primaryNextTabletID >= storeio.TabletLocalIdentityTabletCount {
+		c.primaryMacroSplitRequired.Add(1)
+		return ErrPrimaryMacroSplitRequired
+	}
+	newTabletID := c.primaryNextTabletID
+	moveAt := len(current) - spillLeaves
+	floor := bytes.Clone(current[moveAt].fence)
+	if len(floor) == 0 {
+		return storeio.ErrSegmentedTabletRouterCorrupt
+	}
+	generation := state.root.Generation + 1
+	return c.commitPrimaryStructural(
+		state, path, structuralMacroSplit,
+		func(tx *storeio.WriteTransaction) (
+			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
+			*primaryLocalizedLeafSplit, error,
+		) {
+			left := make(
+				[]storeio.SegmentedTabletRouterLeaf, 0, moveAt,
+			)
+			for at := 0; at < moveAt; at++ {
+				left = append(left, storeio.SegmentedTabletRouterLeaf{
+					LocalID: current[at].localID, Fence: current[at].fence,
+					Ref: current[at].ref, Zone: current[at].zone,
+				})
+			}
+			right := make(
+				[]storeio.SegmentedTabletRouterLeaf, 0, spillLeaves,
+			)
+			retired := make([]storeio.PageRef, 0, spillLeaves)
+			removedBuckets := make([]storeio.BucketID, 0, spillLeaves)
+			for rank := 0; rank < spillLeaves; rank++ {
+				source := current[moveAt+rank]
+				lease, err := c.cache.Acquire(source.ref)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+					lease.Page(), c.storeID, source.bucket,
+				)
+				if !ok {
+					lease.Release()
+					return nil, nil, nil, storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				rows, renderErr := stripe.RenderRecordsWithScratch(
+					c.primaryLeafMutationScratch,
+				)
+				if renderErr != nil {
+					lease.Release()
+					return nil, nil, nil, renderErr
+				}
+				bucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(
+					newTabletID, uint32(rank),
+				)
+				if !bucketOK {
+					lease.Release()
+					return nil, nil, nil, ErrPrimaryMacroSplitRequired
+				}
+				ref, encodeErr := c.encodeStructuralLeaf(
+					tx, generation, storeio.BucketID(bucketU), rows,
+				)
+				lease.Release()
+				if encodeErr != nil {
+					return nil, nil, nil, encodeErr
+				}
+				var leafFloor []byte
+				if rank != 0 {
+					leafFloor = source.fence
+				}
+				right = append(right, storeio.SegmentedTabletRouterLeaf{
+					LocalID: uint16(rank), Fence: leafFloor,
+					Ref: ref, Zone: source.zone,
+				})
+				retired = append(retired, source.ref)
+				removedBuckets = append(removedBuckets, source.bucket)
+			}
+			c.structuralRepairPostingsHook(removedBuckets)
+			return left, retired, &primaryLocalizedLeafSplit{
+				macro: &primaryMacroTabletSplit{
+					tabletID: newTabletID, floor: floor, leaves: right,
+				},
+			}, nil
 		},
 	)
 }

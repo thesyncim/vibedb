@@ -344,6 +344,8 @@ type Collection struct {
 	// harness can gate p-max without a full histogram allocation.
 	primaryLeafSplits               atomic.Uint64
 	primaryEmptyReclaims            atomic.Uint64
+	primaryMacroSplits              atomic.Uint64
+	primaryTabletRoutingRebuilds    atomic.Uint64
 	primaryMacroSplitRequired       atomic.Uint64
 	primarySplitMaxNS               atomic.Uint64
 	primaryEmptyReclaimMaxNS        atomic.Uint64
@@ -782,9 +784,14 @@ type Stats struct {
 	// transactions performed this session.
 	PrimaryLeafSplits    uint64
 	PrimaryEmptyReclaims uint64
-	// PrimaryMacroSplitRequired counts structural transactions that could not
-	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
-	// and a macro-tablet split (the next phase) is required.
+	// PrimaryMacroSplits counts bounded sibling-tablet publications performed
+	// after exhausting one tablet's 4096 stable local identities.
+	PrimaryMacroSplits uint64
+	// PrimaryTabletRoutingRebuilds counts bounded whole-tablet routing rewrites
+	// used when all stable anchor IDs exist but dense repacking still has room.
+	PrimaryTabletRoutingRebuilds uint64
+	// PrimaryMacroSplitRequired counts sibling publications that could not
+	// proceed because the tablet identity namespace or catalog node is full.
 	PrimaryMacroSplitRequired uint64
 	// PrimarySplitMaxNS and PrimaryEmptyReclaimMaxNS report the high-water
 	// bounded-transaction latency in nanoseconds for each structural kind.

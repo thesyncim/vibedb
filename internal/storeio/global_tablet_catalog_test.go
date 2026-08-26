@@ -218,6 +218,29 @@ func TestGlobalTabletCatalogInsertChildCanonicalCOW(t *testing.T) {
 	if got := view.Route([]byte("t")); got.ID != 19 {
 		t.Fatalf("insert changed old snapshot route = %d, want 19", got.ID)
 	}
+	replacement := entries[1].Ref
+	replacement.Offset += 256 << 10
+	replacement.Generation = generation
+	combined, err := view.InsertChildReplacing(
+		make([]byte, len(image)), generation, globalTabletCatalogTestBounds,
+		[]byte("t"), 23, inserted,
+		[]GlobalTabletCatalogNodeHandleRewrite{{ID: entries[1].ID, Ref: replacement}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinedView, err := OpenGlobalTabletCatalogNode(
+		combined, nextRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := combinedView.Route([]byte("m")); got.Ref != replacement {
+		t.Fatalf("combined left replacement = %+v, want %+v", got.Ref, replacement)
+	}
+	if got := combinedView.Route([]byte("t")); got.Ref != inserted {
+		t.Fatalf("combined sibling insertion = %+v, want %+v", got.Ref, inserted)
+	}
 
 	// The same logical source encoded at a different ancestor generation must
 	// produce the byte-identical canonical insertion image.

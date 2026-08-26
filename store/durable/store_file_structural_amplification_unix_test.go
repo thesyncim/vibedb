@@ -99,11 +99,15 @@ func runFilePrimaryStructuralChurnAmplification(
 		if len(buckets) < 3 {
 			t.Fatalf("cycle %d has only %d routed leaves", cycle, len(buckets))
 		}
-		// Churn the trailing, naturally partial leaf. At the 10M scale the current
-		// single-tablet format can be at its 4096-local-ID ceiling; reinserting a
-		// full middle leaf through its predecessor may transiently need two splits,
-		// whereas restoring the partial tail needs exactly the one ID just freed.
-		selected := byBucket[buckets[len(buckets)-1]]
+		selectedBucket := buckets[len(buckets)-1]
+		if rows == 10_000_000 {
+			// The large qualification deliberately churns full interior leaves.
+			// Restoring one through its predecessor transiently needs two splits and
+			// therefore exercises bounded sibling-tablet publication at the 4096-ID
+			// ceiling rather than avoiding it with the naturally partial tail.
+			selectedBucket = buckets[1+cycle%(len(buckets)-2)]
+		}
+		selected := byBucket[selectedBucket]
 		for _, index := range selected {
 			key := appendStructuralAmplificationKey(keyBuffer[:0], index)
 			value := structuralAmplificationValue(index)
@@ -129,8 +133,14 @@ func runFilePrimaryStructuralChurnAmplification(
 	after := collection.Stats()
 	reclaims := after.PrimaryEmptyReclaims - before.PrimaryEmptyReclaims
 	splits := after.PrimaryLeafSplits - before.PrimaryLeafSplits
+	macroSplits := after.PrimaryMacroSplits - before.PrimaryMacroSplits
+	routingRebuilds := after.PrimaryTabletRoutingRebuilds -
+		before.PrimaryTabletRoutingRebuilds
 	if reclaims == 0 {
 		t.Fatalf("structural churn reclaimed no empty leaf: %+v -> %+v", before, after)
+	}
+	if rows == 10_000_000 && macroSplits == 0 {
+		t.Fatal("10M interior churn did not exercise a sibling-tablet split")
 	}
 	// Each reclaim in this fixture removes one row from a non-singleton routing
 	// anchor, so it must take the localized COW path. Splits have the same base
@@ -142,13 +152,25 @@ func runFilePrimaryStructuralChurnAmplification(
 		before.PrimaryStructuralRoutingStagedBytes
 	retired := after.PrimaryStructuralRoutingRetiredBytes -
 		before.PrimaryStructuralRoutingRetiredBytes
-	minStaged := (reclaims + splits) * routingBase
-	maxStaged := minStaged + splits*storeio.SegmentedTabletRouterAnchorPageBytes
+	const fullTabletRouting = uint64(storeio.GlobalTabletCatalogLocatorBytes +
+		storeio.GlobalTabletCatalogTabletBytes +
+		storeio.SegmentedTabletRouterMaxPages*storeio.SegmentedTabletRouterAnchorPageBytes)
+	if splits < routingRebuilds {
+		t.Fatalf("leaf splits %d below tablet-routing rebuilds %d", splits, routingRebuilds)
+	}
+	localizedSplits := splits - routingRebuilds
+	macroStaged := macroSplits * (fullTabletRouting + routingBase)
+	macroRetired := macroSplits * fullTabletRouting
+	fallbackStaged := routingRebuilds * fullTabletRouting
+	minStaged := (reclaims+localizedSplits)*routingBase +
+		fallbackStaged + macroStaged
+	maxStaged := minStaged + localizedSplits*storeio.SegmentedTabletRouterAnchorPageBytes
 	if staged < minStaged || staged > maxStaged {
 		t.Fatalf("localized churn routing staged bytes = %d, want [%d,%d] for %d reclaims and %d splits",
 			staged, minStaged, maxStaged, reclaims, splits)
 	}
-	if want := (reclaims + splits) * routingBase; retired != want {
+	if want := (reclaims+localizedSplits)*routingBase +
+		routingRebuilds*fullTabletRouting + macroRetired; retired != want {
 		t.Fatalf("localized churn routing retired bytes = %d, want %d for %d reclaims and %d splits",
 			retired, want, reclaims, splits)
 	}
@@ -178,22 +200,26 @@ func runFilePrimaryStructuralChurnAmplification(
 	if mutatedBytes == 0 || deviceBytes > 8*mutatedBytes {
 		t.Fatalf("device write amplification = %d/%d (>8x)", deviceBytes, mutatedBytes)
 	}
-	t.Logf("structural churn ratios: apparent=%.3fx allocated=%.3fx device-write=%.3fx reclaims=%d splits=%d",
+	t.Logf("structural churn ratios: apparent=%.3fx allocated=%.3fx device-write=%.3fx reclaims=%d splits=%d macro_splits=%d tablet_rebuilds=%d",
 		float64(info.Size())/float64(logicalBytes), float64(allocated)/float64(logicalBytes),
 		float64(deviceBytes)/float64(mutatedBytes),
-		reclaims, splits)
-	if err = collection.Close(); err != nil {
-		t.Fatal(err)
+		reclaims, splits, macroSplits, routingRebuilds)
+	// Copy the durable bytes while the source process remains live, then open
+	// only the copied image. This is the external-crash boundary: no Close-time
+	// cleanup or in-memory router state may be required for sibling recovery.
+	crashPath := filepath.Join(directory, "structural-churn-crash.vibe")
+	copyFileForCrash(t, path, crashPath)
+	if _, journalErr := os.Stat(path + ".rjournal"); journalErr == nil {
+		copyFileForCrash(t, path+".rjournal", crashPath+".rjournal")
+	} else if !os.IsNotExist(journalErr) {
+		t.Fatal(journalErr)
 	}
-	if err = file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	crashFile, err := os.OpenFile(crashPath, os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
-	reopened, err := Open(file, options)
+	defer crashFile.Close()
+	reopened, err := Open(crashFile, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,6 +234,12 @@ func runFilePrimaryStructuralChurnAmplification(
 		if readErr != nil || !found || !bytes.Equal(got, want) {
 			t.Fatalf("reopened row %d = %q,%v,%v", index, got, found, readErr)
 		}
+	}
+	if err = collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
