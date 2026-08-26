@@ -381,11 +381,12 @@ func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 // Runtime is a non-serving kernel. Proposal success means only local core
 // admission. It does not certify leadership, commit, apply, or a client result.
 type Runtime struct {
-	wal      *raftstore.Store
-	database *sqldriver.Database
-	apply    *sqldriver.ReplicatedApply
-	node     *raftmodel.Node
-	identity RuntimeIdentity
+	wal           *raftstore.Store
+	database      *sqldriver.Database
+	apply         *sqldriver.ReplicatedApply
+	node          *raftmodel.Node
+	identity      RuntimeIdentity
+	walGeneration *walGenerationDriver
 
 	proposalBatchEntries int
 	proposalBatchBytes   int64
@@ -897,6 +898,7 @@ func (runtime *Runtime) Tick() error {
 		}
 		return err
 	}
+	runtime.tickWALGeneration()
 	return runtime.node.Tick()
 }
 
@@ -1268,6 +1270,11 @@ func (runtime *Runtime) Close() error {
 	}
 	runtime.stopping = true
 	runtime.node = nil
+	if runtime.walGeneration != nil {
+		clear(runtime.walGeneration.key.Material[:])
+		clear(runtime.walGeneration.key.Wrapped)
+		runtime.walGeneration = nil
+	}
 	if runtime.apply != nil {
 		if err := runtime.apply.Close(); err != nil {
 			return err
