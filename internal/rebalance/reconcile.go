@@ -29,6 +29,7 @@ const (
 	ActionPublishCatalog
 	ActionAwaitCatalogDrain
 	ActionRemoveSource
+	ActionRefreshCatalogFence
 	ActionRetireSource
 	ActionComplete
 )
@@ -57,6 +58,8 @@ func (kind ActionKind) String() string {
 		return "await-catalog-drain"
 	case ActionRemoveSource:
 		return "remove-source"
+	case ActionRefreshCatalogFence:
+		return "refresh-catalog-fence"
 	case ActionRetireSource:
 		return "retire-source"
 	case ActionComplete:
@@ -73,6 +76,7 @@ type Action struct {
 	Kind              ActionKind
 	Member            uint64
 	CatalogGeneration uint64
+	ReplicaSetVersion uint64
 }
 
 // ConfChange constructs the single-member Raft command for a membership
@@ -95,8 +99,9 @@ func (action Action) ConfChange() pb.ConfChangeI {
 
 // Observation is one detached controller cut. Publication, LeaderStatus, and
 // TargetProgress must come from the current leader; TargetStatus and
-// TargetState come from the destination member. OlderCatalogDrained is the
-// result of CatalogHolder.WaitOlderDrained for the plan's next generation.
+// TargetState come from the destination member. DrainedCatalogGeneration names
+// the exact generation whose older holders have drained; it cannot be reused
+// across the pre-remove and post-remove catalog publications.
 type Observation struct {
 	Catalog        *gateway.Snapshot
 	Publication    raftmodel.Publication
@@ -106,8 +111,8 @@ type Observation struct {
 	TargetProgress raftmodel.MemberProgress
 	ProgressFound  bool
 
-	OlderCatalogDrained bool
-	SourceRetired       bool
+	DrainedCatalogGeneration uint64
+	RetiringReplicaRetired   bool
 }
 
 type membershipStage uint8
@@ -123,7 +128,8 @@ type catalogStage uint8
 
 const (
 	catalogSource catalogStage = iota + 1
-	catalogTarget
+	catalogTargetPreRemove
+	catalogTargetPostRemove
 )
 
 // Reconcile proves the single safe next operation from current durable
@@ -148,9 +154,15 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{Kind: ActionAwaitLeader}, nil
 	}
 
-	if catalog == catalogTarget {
+	if catalog == catalogTargetPreRemove || catalog == catalogTargetPostRemove {
 		if !plan.targetBindingApplied(observed.TargetState) ||
-			(membership != membershipVoter && membership != membershipRemoved) {
+			(catalog == catalogTargetPreRemove &&
+				membership != membershipVoter && membership != membershipRemoved) ||
+			(catalog == catalogTargetPostRemove && membership != membershipRemoved) {
+			return Action{}, ErrTopologyConflict
+		}
+		if catalog == catalogTargetPostRemove &&
+			!plan.postRemoveCatalogFence(observed.Catalog, observed.Publication.ReplicaSetVersion) {
 			return Action{}, ErrTopologyConflict
 		}
 		if !targetPublicationApplied(observed) {
@@ -162,16 +174,26 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 			}
 			return Action{Kind: ActionTransferLeader, Member: plan.request.TargetMember}, nil
 		}
-		if !observed.OlderCatalogDrained {
+		drainGeneration := plan.nextCatalogGeneration
+		if catalog == catalogTargetPostRemove {
+			drainGeneration = plan.postRemoveGeneration
+		}
+		if observed.DrainedCatalogGeneration != drainGeneration {
 			return Action{
-				Kind: ActionAwaitCatalogDrain, CatalogGeneration: plan.nextCatalogGeneration,
+				Kind: ActionAwaitCatalogDrain, CatalogGeneration: drainGeneration,
 			}, nil
 		}
-		if membership == membershipVoter {
-			return Action{Kind: ActionRemoveSource, Member: plan.request.SourceMember}, nil
+		if catalog == catalogTargetPreRemove && membership == membershipVoter {
+			return Action{Kind: ActionRemoveSource, Member: plan.request.RetiringMember}, nil
 		}
-		if !observed.SourceRetired {
-			return Action{Kind: ActionRetireSource, Member: plan.request.SourceMember}, nil
+		if catalog == catalogTargetPreRemove {
+			return Action{
+				Kind: ActionRefreshCatalogFence, CatalogGeneration: plan.postRemoveGeneration,
+				ReplicaSetVersion: observed.Publication.ReplicaSetVersion,
+			}, nil
+		}
+		if !observed.RetiringReplicaRetired {
+			return Action{Kind: ActionRetireSource, Member: plan.request.RetiringMember}, nil
 		}
 		return Action{Kind: ActionComplete}, nil
 	}
@@ -184,7 +206,9 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{Kind: ActionAddLearner, Member: plan.request.TargetMember}, nil
 	case membershipLearner:
 		if !plan.baseBound {
-			return Action{Kind: ActionCreateSnapshotBase, Member: plan.request.TargetMember}, nil
+			return Action{
+				Kind: ActionCreateSnapshotBase, Member: plan.request.SnapshotSourceMember,
+			}, nil
 		}
 		if !plan.snapshotInstalled(observed.TargetState) {
 			return Action{Kind: ActionAwaitSnapshotInstall, Member: plan.request.TargetMember}, nil
@@ -237,10 +261,45 @@ func (p *Plan) catalogStage(snapshot *gateway.Snapshot) (catalogStage, error) {
 		if !manifest.Equal(p.targetManifest) {
 			return 0, ErrTopologyConflict
 		}
-		return catalogTarget, nil
+		return catalogTargetPreRemove, nil
+	case p.postRemoveGeneration:
+		if !manifest.Equal(p.targetManifest) {
+			return 0, ErrTopologyConflict
+		}
+		return catalogTargetPostRemove, nil
 	default:
 		return 0, ErrTopologyConflict
 	}
+}
+
+func (p *Plan) postRemoveCatalogFence(snapshot *gateway.Snapshot, replicaSetVersion uint64) bool {
+	if p == nil || snapshot == nil || replicaSetVersion == 0 {
+		return false
+	}
+	var workspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := snapshot.ResolveReplicatedRoute(
+		p.request.Distribution, p.request.Shard, workspace[:0],
+	)
+	if !ok || route.Group != p.request.Group ||
+		route.AllocationGeneration != p.baseState.Binding.AllocationGeneration ||
+		route.Command.ReplicaSetVersion != replicaSetVersion ||
+		route.Command.ActivePolicyGeneration != p.baseState.Binding.ActivePolicyGeneration ||
+		route.Command.ProtectionEpoch != p.baseState.Binding.ProtectionEpoch ||
+		route.Command.OwnershipEpoch != p.baseState.Binding.OwnershipEpoch+1 ||
+		route.Command.SchemaGeneration != p.baseState.Binding.SchemaGeneration ||
+		route.Command.RoutingVersion != p.baseState.Binding.RoutingVersion+1 ||
+		route.Command.RouteGeneration != p.baseState.Binding.RouteGeneration+1 ||
+		len(route.Replicas) != len(p.removedConf.GetVoters()) {
+		return false
+	}
+	for _, replica := range route.Replicas {
+		if replica.Member == p.request.RetiringMember ||
+			!memberInSorted(p.removedConf.GetVoters(), replica.Member) {
+			return false
+		}
+	}
+	return memberInSorted(p.removedConf.GetVoters(), p.request.SnapshotSourceMember) &&
+		memberInSorted(p.removedConf.GetVoters(), p.request.TargetMember)
 }
 
 func (p *Plan) membershipStage(conf *pb.ConfState) (membershipStage, error) {

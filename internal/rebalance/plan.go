@@ -27,17 +27,19 @@ var (
 	ErrSnapshotBaseBound = errors.New("rebalance: replica move snapshot base is already bound")
 )
 
-// MoveRequest names one destination for the existing shard Raft group. The
-// target endpoint must already be present in the catalog endpoint directory,
-// but it is not routed until the final topology CAS.
+// MoveRequest names one failed/proactively retired voter, one distinct healthy
+// voter that certifies the snapshot, and one replacement learner. Source is
+// the routed endpoint replaced by Target at catalog cutover; it need not be the
+// endpoint that serves the snapshot.
 type MoveRequest struct {
-	Distribution distribution.DistributionName
-	Shard        distribution.ShardID
-	Group        raftmember.GroupKey
-	SourceMember uint64
-	TargetMember uint64
-	Source       distribution.EndpointID
-	Target       distribution.EndpointID
+	Distribution         distribution.DistributionName
+	Shard                distribution.ShardID
+	Group                raftmember.GroupKey
+	RetiringMember       uint64
+	SnapshotSourceMember uint64
+	TargetMember         uint64
+	Source               distribution.EndpointID
+	Target               distribution.EndpointID
 }
 
 // Plan is an immutable replica-movement intent. A plan starts without a bulk
@@ -47,6 +49,7 @@ type Plan struct {
 	request               MoveRequest
 	catalogGeneration     uint64
 	nextCatalogGeneration uint64
+	postRemoveGeneration  uint64
 	sourceManifest        *distribution.Manifest
 	targetManifest        *distribution.Manifest
 	initialConf           *pb.ConfState
@@ -75,11 +78,12 @@ func PlanReplicaMove(
 	if current == nil || invalidMoveRequest(request) || publication.ConfState == nil ||
 		publication.Applied == 0 || publication.ReplicaSetVersion == 0 ||
 		publication.ReplicaSetVersion > publication.Applied ||
-		current.Generation() == math.MaxUint64 {
+		current.Generation() > math.MaxUint64-2 {
 		return nil, ErrInvalidPlan
 	}
 	if err := simpleConfState(publication.ConfState, publication.Applied); err != nil ||
-		!memberInSorted(publication.ConfState.GetVoters(), request.SourceMember) {
+		!memberInSorted(publication.ConfState.GetVoters(), request.RetiringMember) ||
+		!memberInSorted(publication.ConfState.GetVoters(), request.SnapshotSourceMember) {
 		return nil, ErrInvalidPlan
 	}
 	initial := proto.Clone(publication.ConfState).(*pb.ConfState)
@@ -117,7 +121,7 @@ func newPlan(
 	validationIndex uint64,
 ) (*Plan, error) {
 	if invalidMoveRequest(request) || sourceManifest == nil || targetManifest == nil ||
-		initial == nil || catalogGeneration == math.MaxUint64 ||
+		initial == nil || catalogGeneration > math.MaxUint64-2 ||
 		targetManifest.Distribution() != sourceManifest.Distribution() ||
 		sourceManifest.Version() == ^distribution.RoutingVersion(0) ||
 		targetManifest.Version() != sourceManifest.Version()+1 {
@@ -129,7 +133,7 @@ func newPlan(
 	voter.Learners = removeMember(voter.Learners, request.TargetMember)
 	voter.Voters = insertMember(voter.Voters, request.TargetMember)
 	removed := proto.Clone(voter).(*pb.ConfState)
-	removed.Voters = removeMember(removed.Voters, request.SourceMember)
+	removed.Voters = removeMember(removed.Voters, request.RetiringMember)
 	if validationIndex > math.MaxUint64-3 {
 		return nil, ErrInvalidPlan
 	}
@@ -145,6 +149,7 @@ func newPlan(
 	plan := &Plan{
 		request: request, catalogGeneration: catalogGeneration,
 		nextCatalogGeneration: catalogGeneration + 1,
+		postRemoveGeneration:  catalogGeneration + 2,
 		sourceManifest:        sourceManifest, targetManifest: targetManifest,
 		initialConf: initial, learnerConf: learner, voterConf: voter, removedConf: removed,
 	}
@@ -257,10 +262,11 @@ func recoverReplicaMoveCertificate(
 	}
 	state := certificate.Manifest.State
 	if simpleConfState(state.ConfState, state.Applied) != nil ||
-		state.Binding.RouteGeneration == math.MaxUint64 ||
+		state.Binding.RouteGeneration > math.MaxUint64-2 ||
 		state.Binding.RoutingVersion == math.MaxUint64 ||
 		state.Binding.OwnershipEpoch == math.MaxUint64 ||
-		!memberInSorted(state.ConfState.GetVoters(), request.SourceMember) ||
+		!memberInSorted(state.ConfState.GetVoters(), request.RetiringMember) ||
+		!memberInSorted(state.ConfState.GetVoters(), request.SnapshotSourceMember) ||
 		!memberInSorted(state.ConfState.GetLearners(), request.TargetMember) ||
 		memberInSorted(state.ConfState.GetVoters(), request.TargetMember) {
 		return nil, ErrInvalidPlan
@@ -282,7 +288,7 @@ func recoverReplicaMoveCertificate(
 	case state.Binding.RouteGeneration:
 		sourceManifest = manifest
 		targetManifest, err = targetManifestForMove(sourceManifest, request)
-	case state.Binding.RouteGeneration + 1:
+	case state.Binding.RouteGeneration + 1, state.Binding.RouteGeneration + 2:
 		targetManifest = manifest
 		sourceManifest, err = sourceManifestForRecovery(targetManifest, request)
 		if err == nil {
@@ -318,7 +324,9 @@ func recoverReplicaMoveCertificate(
 		return nil, ErrTopologyConflict
 	}
 	if (catalog == catalogSource && stage == membershipRemoved) ||
-		(catalog == catalogTarget && stage == membershipLearner) {
+		((catalog == catalogTargetPreRemove || catalog == catalogTargetPostRemove) &&
+			stage == membershipLearner) ||
+		catalog == catalogTargetPostRemove && stage != membershipRemoved {
 		return nil, ErrTopologyConflict
 	}
 	return plan, nil
@@ -362,8 +370,9 @@ func replicaMoveOperationID(plan *Plan) OperationID {
 		_, _ = hash.Write(id[:])
 	}
 	for _, value := range [...]uint64{
-		plan.request.Group.TopologyRecoveryEpoch, plan.request.SourceMember,
-		plan.request.TargetMember, plan.catalogGeneration, plan.nextCatalogGeneration,
+		plan.request.Group.TopologyRecoveryEpoch, plan.request.RetiringMember,
+		plan.request.SnapshotSourceMember, plan.request.TargetMember,
+		plan.catalogGeneration, plan.nextCatalogGeneration, plan.postRemoveGeneration,
 		uint64(plan.sourceManifest.Version()), uint64(shard.AllocationGeneration),
 		uint64(shard.Epoch),
 	} {
@@ -423,11 +432,25 @@ func (p *Plan) NextCatalogGeneration() uint64 {
 	return p.nextCatalogGeneration
 }
 
-func (p *Plan) SourceMember() uint64 {
+func (p *Plan) PostRemoveCatalogGeneration() uint64 {
 	if p == nil {
 		return 0
 	}
-	return p.request.SourceMember
+	return p.postRemoveGeneration
+}
+
+func (p *Plan) RetiringMember() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.request.RetiringMember
+}
+
+func (p *Plan) SnapshotSourceMember() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.request.SnapshotSourceMember
 }
 
 func (p *Plan) TargetMember() uint64 {
@@ -467,7 +490,7 @@ func (p *Plan) OwnershipCommand(replicaSetVersion uint64) ([]byte, error) {
 	}
 	return replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
 		From: p.baseState.Binding, ExpectedReplicaSetVersion: replicaSetVersion,
-		SourceMember: p.request.SourceMember, TargetMember: p.request.TargetMember,
+		SourceMember: p.request.SnapshotSourceMember, TargetMember: p.request.TargetMember,
 		ToOwnershipEpoch:  p.baseState.Binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  p.baseState.Binding.RoutingVersion + 1,
 		ToRouteGeneration: p.baseState.Binding.RouteGeneration + 1,
@@ -482,8 +505,11 @@ func invalidGroup(group raftmember.GroupKey) bool {
 
 func invalidMoveRequest(request MoveRequest) bool {
 	return request.Distribution == "" || request.Shard == "" || invalidGroup(request.Group) ||
-		request.SourceMember == request.TargetMember ||
-		raft.IsLocalMsgTarget(request.SourceMember) ||
+		request.RetiringMember == request.SnapshotSourceMember ||
+		request.RetiringMember == request.TargetMember ||
+		request.SnapshotSourceMember == request.TargetMember ||
+		raft.IsLocalMsgTarget(request.RetiringMember) ||
+		raft.IsLocalMsgTarget(request.SnapshotSourceMember) ||
 		raft.IsLocalMsgTarget(request.TargetMember) ||
 		request.Source == "" || request.Target == "" || request.Source == request.Target
 }
