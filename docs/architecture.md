@@ -188,12 +188,15 @@ stale serving fence, unavailable quorum, or mismatched position returns a typed
 refusal.
 
 `vibedb-shard serve-rf3` opens exact retained WAL, SQL, and apply artifacts,
-constructs one bounded Multi-Raft host plus authenticated peer transport, and
-serves the authenticated native replicated protocol. There is no RF3
-initializer, membership or snapshot orchestrator. Public RF3 writes are
-limited to the exact-key `exec_batch` lane above. Scatter and
-multi-table RF3 reads, a common cross-group RF3 read snapshot, and RF3
-global-index mutation lowering are absent.
+runs retained groups on bounded execution lanes with shared authenticated peer
+transport, and serves the authenticated native replicated protocol. The local
+`vibedb cluster dev` command can prepare and supervise an explicitly no-HA RF1
+member or one RF3 group plus gateway. Learner bootstrap and a resumable replica
+move controller exist; they are not a general topology operator. Public RF3
+exact-key reads include bounded multi-table and multi-group batches with one
+ReadIndex cut per group. Exact-key `exec_batch` supplies multi-table and
+multi-group writes. A common cross-group MVCC timestamp and RF3 global-index
+mutation lowering remain absent.
 
 The static shard service accepts only its `ReadStrong` policy and serves a
 statement-level snapshot from a statically configured leader endpoint. This
@@ -219,15 +222,17 @@ The same package writes deterministic hash-chained child artifacts. A verifier
 checks framing, key order, and document placement before it exposes a chunk.
 An ordered tail translator derives one exact batch for every child, including
 empty advances and shard-key moves. A non-serving child stage applies verified
-rows and tail batches to one durable collection. It validates the complete
-artifact image before tail catch-up and persists a fixed-size cursor through an
-atomic file replacement on Unix. An optional replicated-state capture writes
+rows and tail batches to one durable collection. It updates a constant-space
+authenticated image accumulator with those durable effects and persists a
+fixed-size cursor through an atomic file replacement on Unix. An optional replicated-state capture writes
 each exact before-and-after transition in the same durable
 transaction as its source publication. A terminal ownership-fence entry must
 advance all mutable serving coordinates together. Every child durably records
-its empty seal batch, scans and hashes its complete ordered final image, and
-rechecks that image on reopen before a fixed-size cutover certificate can be
-issued. The certificate binds every non-retained child image. A sealed stage
+its empty seal batch and seals its accumulated image in O(1) before a fixed-size
+cutover certificate can be issued. Recovery can explicitly audit the physical
+image once. The certificate binds every non-retained child image. Global-index
+relations maintain a canonical placement accumulator so their range ownership
+can also be certified without a cutover scan. A sealed stage
 can initialize the standard replicated-state snapshot base in place without a
 second durable user-row copy. The SQL driver holds an exclusive non-serving
 claim while it receives the child. Activation converts that claim to a
@@ -240,7 +245,9 @@ allocated once from the newer snapshot base and is rechecked against the SQL
 binding before the existing Raft runtime can adopt it.
 
 The certificate is evidence, not topology authority. It authorizes only the
-conditional catalog successor after every child is ready. The catalog CAS is
+conditional catalog successor after a coherent voting quorum for every child
+has applied at least the sealed source cut under the exact relation manifest.
+The catalog CAS is
 published durably before destructive cleanup; older catalog leases must then drain.
 An unforgeable sealed catalog capability binds the durable CAS receipt, drained serving generation,
 operation identity, manifest, and cutover certificate. Only that witness authorizes retained cleanup, which plans bounded

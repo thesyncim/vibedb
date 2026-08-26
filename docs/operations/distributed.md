@@ -15,6 +15,7 @@ For a task-oriented setup, start with:
 
 | Path | Command | Contract |
 | --- | --- | --- |
+| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 is explicitly no-HA and starts no gateway; replica count 3 starts one RF3 group and gateway. |
 | Static shard | `vibedb-shard serve` | One local store and a local ownership fence. No Raft election or copied-store revocation. |
 | RF3 preparation | `vibedb-shard prepare-rf3 -manifest <path>` | Atomic, fail-if-present creation of one member's WAL, SQL root, retained identities, key copy, and serving manifest. |
 | Replicated shard | `vibedb-shard serve-rf3 -manifest <path>` | One prepared Raft member with quorum writes, leader `ReadIndex`, authenticated peer, native, snapshot, and control traffic, and replica-move services. |
@@ -94,6 +95,24 @@ The RF3 and static SQL clients use separate authenticated connection pools.
 Add `-replica-control-manifest <path>` to run the authenticated, resumable
 replica-move controller and cluster catalog-drain service. The control manifest
 is not accepted in plaintext mode. See [Operate replica lifecycle](replica-lifecycle.md).
+
+## Range-split status
+
+The repository has durable split intent and runtime records, source capture,
+immutable child artifacts, resumable child staging, tail catch-up, an exact
+source ownership seal, child activation, catalog publication, and retained
+pruning primitives. Child image and global-index placement accumulators keep
+the cutover proof constant-size: the initial source partition is one bounded
+scan, while sealing and activation do not rescan or rewrite the child image.
+Before publication, the reconciler requires a coherent voting quorum for each
+child at or beyond the sealed source applied position.
+
+This is not yet an operable online-split command. There is no public split
+intake, and `serve-rf3` deliberately leaves its split-control route disabled
+because it does not yet reconstruct the complete durable observation and
+source/child action runtime. The gateway's replicated-operation scanner cannot
+complete a split until that route exists. External split-under-load kill,
+partition, and foreground-latency gates are also absent.
 
 ## Send requests
 
@@ -232,7 +251,9 @@ through the host or test harness.
 
 Current operating gaps include:
 
-- RF3 repair and copied-store revocation
+- Public range-split intake and complete shard-side split action routing
+- External split-under-load kill, partition, and latency qualification
+- Automated pressure collection and hot-shard plan execution
 - One global MVCC snapshot across RF3 groups
 - RF3 global-index mutation lowering
 - Durable request-ledger use by the public gateway command

@@ -437,8 +437,10 @@ a delete and a put.
 A non-serving child stage applies verified artifact chunks and tail batches to
 one durable collection. It persists a fixed-size cursor after durable row
 effects. Recovery revalidates an artifact prefix before it skips that prefix.
-The stage reconstructs the deterministic artifact from the completed
-destination and requires the exact expected digest before tail catch-up.
+Artifact receipt and every tail mutation also update a constant-space
+authenticated multiset of the child image. The initial source partition remains
+one bounded scan, but sealing the caught-up child is O(1) and does not rescan
+its rows. Recovery may explicitly audit a sealed physical image once.
 
 An optional capture collection receives each exact before-and-after source
 transition atomically with its replicated source publication. Its compact raw
@@ -448,18 +450,21 @@ mutable ownership coordinates. Recovery verifies the full retained chain.
 The source closes the final write gap with a terminal ownership-fence entry.
 All mutable serving coordinates advance together, every child persists the
 corresponding empty batch, and certification reconstructs that capture entry
-and matches every durable child cursor. Each destination also scans and hashes
-its complete ordered final image. Reopen verifies the same proof. A fixed-size
-checksum-protected certificate binds those non-retained child images and the
-exact cut but deliberately grants no serving authority.
+and matches every durable child cursor. A fixed-size checksum-protected
+certificate binds each child's accumulated image and the exact cut but
+deliberately grants no serving authority. Global-index relations carry
+canonical placement metadata and a separately authenticated constant-size
+ownership proof, so cutover does not need to decode or rescan an index relation.
 
 A sealed destination can be converted in place into the standard
-replicated-state snapshot base. The conversion reuses the sealed image proof,
-binds the exact state envelope in a cut-zero checkpoint-group certificate,
-then certifies and folds the one-row hidden-state seed. It does not rewrite,
-rescan, or serialize the user image again after the canonical preparation
-pass. The independent child Raft runtime must install that small base before
-the child is eligible to serve.
+replicated-state snapshot base. The conversion reuses the sealed image proof
+and an opaque durable image identity, binds the exact state envelope in a
+cut-zero checkpoint-group certificate, then certifies and folds the one-row
+hidden-state seed. It does not rewrite, rescan, or serialize the user image
+again after the canonical preparation pass. The independent child Raft
+runtime must install that small base, and a coherent voting quorum must report
+the exact relation manifest and at least the sealed source applied position,
+before the child is eligible for catalog publication.
 
 The SQL driver owns this conversion. It prevents SQL sessions while the child
 image is incomplete and while the activated claim still lacks its exact base.
@@ -529,9 +534,13 @@ and publish as one bounded successor batch. Every split retains its own data
 proofs; composition only removes repeated catalog cloning and CAS contention.
 The batch accepts distinct source allocations within one distribution as well
 as independent distributions.
-The gateway can run the replicated publish-before-prune split controller when
-the replicated catalog authority is configured. The repository still has no
-replica-move executor or merge planner.
+The gateway scans replicated split operation records and can trigger their
+source hosts. The durable controller and local source/child action runtimes can
+execute capture, stage, tail, seal, activation, publication, and prune steps,
+but `serve-rf3` deliberately does not register that route yet: the command does
+not reconstruct the complete local split observation and action runtime. There
+is also no public split-intake command. Replica movement is shipped through its
+separate resumable controller; a merge planner remains absent.
 
 ## Replication kernel
 
