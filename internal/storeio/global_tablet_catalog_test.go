@@ -300,6 +300,78 @@ func TestGlobalTabletCatalogInsertChildCanonicalCOW(t *testing.T) {
 	}
 }
 
+func TestGlobalTabletCatalogInsertChildFullNodeBackpressuresWithoutMutation(
+	t *testing.T,
+) {
+	const generation = uint64(100)
+	logicalID, _ := GlobalTabletCatalogCatalogLeafLogicalID(0)
+	var last []byte
+	var entries []GlobalTabletCatalogNodeEntry
+	for tabletID := uint32(0); ; tabletID++ {
+		childLogical, ok := GlobalTabletCatalogTabletRootLogicalID(tabletID)
+		if !ok {
+			t.Fatal("tablet namespace exhausted before catalog page")
+		}
+		floor := []byte(nil)
+		if tabletID != 0 {
+			floor = fmt.Appendf(nil, "%0255d", tabletID)
+		}
+		candidate := append(entries, GlobalTabletCatalogNodeEntry{
+			Floor: floor, ID: tabletID,
+			Ref: globalTabletCatalogTestRef(
+				uint64(tabletID+1)*GlobalTabletCatalogTabletBytes,
+				childLogical, generation, GlobalTabletCatalogTabletBytes,
+				PageTabletRoute,
+			),
+		})
+		image, err := EncodeGlobalTabletCatalogNode(
+			make([]byte, GlobalTabletCatalogNodeBytes),
+			GlobalTabletCatalogNodeHeader{
+				StoreID: globalTabletCatalogTestStoreID,
+				Bounds:  globalTabletCatalogTestBounds, Generation: generation,
+				LogicalID: logicalID, PageID: 0, Level: GlobalTabletCatalogLeaf,
+				Kind: PagePrimaryCatalog, ChildKind: PageTabletRoute,
+				ChildLength: GlobalTabletCatalogTabletBytes,
+			}, candidate,
+		)
+		if errors.Is(err, ErrGlobalTabletCatalogNoSpace) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, last = candidate, image
+	}
+	ref := globalTabletCatalogTestRef(
+		128<<10, logicalID, generation,
+		GlobalTabletCatalogNodeBytes, PagePrimaryCatalog,
+	)
+	view, err := OpenGlobalTabletCatalogNode(last, ref, globalTabletCatalogTestBounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newID := uint32(len(entries))
+	newLogical, _ := GlobalTabletCatalogTabletRootLogicalID(newID)
+	newRef := globalTabletCatalogTestRef(
+		uint64(newID+1)*GlobalTabletCatalogTabletBytes,
+		newLogical, generation+1, GlobalTabletCatalogTabletBytes,
+		PageTabletRoute,
+	)
+	dst := bytes.Repeat([]byte{0xa5}, GlobalTabletCatalogNodeBytes)
+	before := bytes.Clone(dst)
+	_, err = view.InsertChildReplacing(
+		dst, generation+1, globalTabletCatalogTestBounds,
+		fmt.Appendf(nil, "%0255d", newID), newID, newRef,
+		[]GlobalTabletCatalogNodeHandleRewrite{{ID: entries[0].ID, Ref: entries[0].Ref}},
+	)
+	if !errors.Is(err, ErrGlobalTabletCatalogNoSpace) {
+		t.Fatalf("full-node insertion error = %v, want %v", err, ErrGlobalTabletCatalogNoSpace)
+	}
+	if !bytes.Equal(dst, before) {
+		t.Fatal("full-node backpressure changed destination")
+	}
+}
+
 func TestGlobalTabletCatalogCOWIsCanonicalAcrossHistories(t *testing.T) {
 	view100, _, ref100, entries := globalTabletCatalogTestNode(t)
 	replacement := entries[1].Ref
