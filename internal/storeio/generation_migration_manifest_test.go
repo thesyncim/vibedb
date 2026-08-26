@@ -41,4 +41,20 @@ func TestGenerationMigrationManifestCanonicalAndCrashRejecting(t *testing.T) {
 	if _, err := OpenGenerationMigrationManifest(corrupt); !errors.Is(err, ErrGenerationMigrationManifestCorrupt) {
 		t.Fatalf("corrupt cursor error = %v", err)
 	}
+	next := m
+	next.Phase = GenerationMigrationReady
+	next.AppliedSequence = next.CapturedSequence
+	next.TargetFileEnd++
+	if err := ValidateGenerationMigrationAdvance(m, next); err != nil {
+		t.Fatalf("valid advance: %v", err)
+	}
+	for _, invalid := range []GenerationMigrationManifest{
+		func() GenerationMigrationManifest { n := next; n.Phase = GenerationMigrationCopying; return n }(),
+		func() GenerationMigrationManifest { n := next; n.AppliedSequence--; return n }(),
+		func() GenerationMigrationManifest { n := next; n.MigrationID[0]++; return n }(),
+	} {
+		if err := ValidateGenerationMigrationAdvance(m, invalid); err == nil {
+			t.Fatalf("invalid advance accepted: %+v", invalid)
+		}
+	}
 }

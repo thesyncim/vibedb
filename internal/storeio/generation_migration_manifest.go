@@ -104,3 +104,23 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.Cursor = src[generationMigrationHeaderBytes : generationMigrationHeaderBytes+cursorBytes]
 	return m, nil
 }
+
+// ValidateGenerationMigrationAdvance rejects rollback or identity substitution
+// before a newer manifest record is made durable.
+func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManifest) error {
+	if previous.StoreID != next.StoreID || previous.MigrationID != next.MigrationID ||
+		previous.SourceGeneration != next.SourceGeneration ||
+		previous.TargetGeneration != next.TargetGeneration || next.Phase < previous.Phase ||
+		next.CapturedSequence < previous.CapturedSequence ||
+		next.AppliedSequence < previous.AppliedSequence ||
+		next.AppliedSequence > next.CapturedSequence ||
+		next.SourceFileEnd != previous.SourceFileEnd ||
+		next.TargetFileEnd < previous.TargetFileEnd ||
+		(next.Phase == GenerationMigrationCopying &&
+			bytes.Compare(next.Cursor, previous.Cursor) < 0) ||
+		(next.Phase >= GenerationMigrationReady &&
+			next.AppliedSequence != next.CapturedSequence) {
+		return fmt.Errorf("%w: non-monotonic advance", ErrInvalidWrite)
+	}
+	return nil
+}
