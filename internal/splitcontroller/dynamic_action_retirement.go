@@ -31,6 +31,23 @@ type TerminalSplitOperationRetirer struct {
 	binder    *BoundPlanAdmissionBinder
 	grants    *DynamicShardActionGrants
 	routes    *DynamicShardActionRoutes
+	data      *DynamicSplitData
+	started   bool
+}
+
+// BindSplitData adds the shard data-plane index before retirement begins.
+// Rebinding or binding after the first cleanup attempt is rejected.
+func (retirer *TerminalSplitOperationRetirer) BindSplitData(data *DynamicSplitData) error {
+	if retirer == nil || data == nil {
+		return ErrSplitOperationRetirement
+	}
+	retirer.mu.Lock()
+	defer retirer.mu.Unlock()
+	if retirer.started || retirer.data != nil && retirer.data != data {
+		return ErrSplitOperationRetirement
+	}
+	retirer.data = data
+	return nil
 }
 
 func NewTerminalSplitOperationRetirer(
@@ -70,6 +87,7 @@ func (retirer *TerminalSplitOperationRetirer) RetireTerminalOperation(
 	}
 	retirer.mu.Lock()
 	defer retirer.mu.Unlock()
+	retirer.started = true
 	proof, terminal, err := retirer.authority.CertifySplitOperationTerminal(
 		ctx, operation, digest,
 	)
@@ -84,6 +102,9 @@ func (retirer *TerminalSplitOperationRetirer) RetireTerminalOperation(
 	}
 	if retirer.routes != nil {
 		retirer.routes.retire(operation, digest)
+	}
+	if retirer.data != nil {
+		retirer.data.retire(operation, digest)
 	}
 	if retirer.binder != nil {
 		if err = retirer.binder.retire(operation, digest); err != nil {
