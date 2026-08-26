@@ -83,7 +83,7 @@ func TestValidateRF3Addresses(t *testing.T) {
 	}
 	withTarget := valid
 	withTarget.EnrolledTarget = &rf3ManifestEnrolledTarget{
-		MemberID: 4, NodeID: rafttransport.NodeID{4},
+		MemberID: 4, NodeID: rafttransport.NodeID{4}, StoreID: [16]byte{5}, NodeIncarnation: 6,
 		PeerAddress: "member-4.internal:17400", NativeAddress: "member-4.internal:17500",
 		SnapshotAddress: "member-4.internal:17600", ControlAddress: "member-4.internal:17700",
 	}
@@ -381,7 +381,8 @@ func serveRF3TestManifest() rf3Manifest {
 
 func serveRF3TestEnrolledTarget() *rf3ManifestEnrolledTarget {
 	return &rf3ManifestEnrolledTarget{
-		MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: "member-4.internal:17400",
+		MemberID: 4, NodeID: rafttransport.NodeID{4}, StoreID: [16]byte{5}, NodeIncarnation: 6,
+		PeerAddress:   "member-4.internal:17400",
 		NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
 		ControlAddress: "member-4.internal:17700",
 	}

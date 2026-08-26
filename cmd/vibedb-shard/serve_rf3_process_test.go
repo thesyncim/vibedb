@@ -530,12 +530,18 @@ func rf3CommandManifestDocument(
 	nodes [rf3CommandMembers]rafttransport.NodeID,
 	peerAddresses [rf3CommandMembers]string,
 ) []byte {
-	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"listeners":{"peer":%q,"native":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
+	dataRoot := filepath.Dir(sqlPath)
+	if absolute, err := filepath.Abs(dataRoot); err == nil {
+		dataRoot = absolute
+	}
+	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"listeners":{"peer":%q,"native":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
 		walPath, keyPath,
 		options.MaxFileBytes, options.MaxRecordBytes, options.MaxRecords,
 		options.MaxEntries, options.MaxLiveBytes,
 		sqlPath, basePath, applyPath, peerAddress, nativeAddress, controlAddress,
 		credential.Certificate, credential.Key, roots, policyPath,
+		filepath.Join(dataRoot, "replica-actions"), dataRoot,
+		filepath.Join(dataRoot, "source-exports"), filepath.Join(dataRoot, "source-artifacts"),
 		nodes[0], peerAddresses[0], nodes[1], peerAddresses[1], nodes[2], peerAddresses[2],
 	))
 }

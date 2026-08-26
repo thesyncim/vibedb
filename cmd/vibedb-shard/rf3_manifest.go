@@ -7,10 +7,13 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
+	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -28,8 +31,26 @@ type rf3Manifest struct {
 	Listeners           rf3ManifestListeners
 	TLS                 rf3ManifestTLS
 	AuthorizationPolicy string
+	ReplicaControl      rf3ManifestReplicaControl
 	Members             [rf3ManifestMembers]rf3ManifestMember
 	EnrolledTarget      *rf3ManifestEnrolledTarget
+}
+
+// rf3ManifestReplicaControl fixes every local disk and memory bound used by
+// replica movement. Source fields are retained even before a target is
+// enrolled so provisioning does not rewrite the control grammar mid-move.
+type rf3ManifestReplicaControl struct {
+	ActionJournalPath      string
+	MaxActionRecords       int
+	SourceDataRoot         string
+	SourceJournalPath      string
+	MaxSourceRecords       int
+	SourceRepositoryPath   string
+	MaxSourceArtifacts     int
+	MaxSourceArtifactBytes uint64
+	MaxSourceDiskBytes     uint64
+	SourceChunkBytes       uint32
+	MaxSourceConcurrent    int
 }
 
 type rf3ManifestWAL struct {
@@ -71,6 +92,8 @@ type rf3ManifestMember struct {
 type rf3ManifestEnrolledTarget struct {
 	MemberID        uint64
 	NodeID          rafttransport.NodeID
+	StoreID         [16]byte
+	NodeIncarnation uint64
 	PeerAddress     string
 	NativeAddress   string
 	SnapshotAddress string
@@ -162,6 +185,13 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	if manifest.AuthorizationPolicy, err = rf3ManifestString(node, maxRF3ManifestStringBytes); err != nil {
 		return rf3Manifest{}, err
 	}
+	node, err = nextRF3Field(&fields, `"replica_control"`)
+	if err != nil {
+		return rf3Manifest{}, err
+	}
+	if manifest.ReplicaControl, err = parseRF3ManifestReplicaControl(node); err != nil {
+		return rf3Manifest{}, err
+	}
 	node, err = nextRF3Field(&fields, `"members"`)
 	if err != nil {
 		return rf3Manifest{}, err
@@ -184,6 +214,111 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		return rf3Manifest{}, errInvalidRF3Manifest
 	}
 	return manifest, nil
+}
+
+func parseRF3ManifestReplicaControl(node vibejson.Node) (rf3ManifestReplicaControl, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+	}
+	var result rf3ManifestReplicaControl
+	stringsOut := []*string{
+		&result.ActionJournalPath, &result.SourceDataRoot,
+		&result.SourceJournalPath, &result.SourceRepositoryPath,
+	}
+	stringNames := [...]string{
+		`"action_journal_path"`, `"source_data_root"`,
+		`"source_journal_path"`, `"source_repository_path"`,
+	}
+	value, err := nextRF3Field(&fields, stringNames[0])
+	if err != nil {
+		return result, err
+	}
+	if *stringsOut[0], err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+		return result, err
+	}
+	value, err = nextRF3Field(&fields, `"max_action_records"`)
+	if err != nil {
+		return result, err
+	}
+	if result.MaxActionRecords, err = rf3ManifestPositiveInt(value); err != nil ||
+		result.MaxActionRecords > replicaaction.AbsoluteMaxReplicaActionRecords {
+		return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+	}
+	for index := 1; index < len(stringsOut); index++ {
+		value, err = nextRF3Field(&fields, stringNames[index])
+		if err != nil {
+			return result, err
+		}
+		if *stringsOut[index], err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+			return result, err
+		}
+		if index == 2 {
+			value, err = nextRF3Field(&fields, `"max_source_records"`)
+			if err != nil {
+				return result, err
+			}
+			if result.MaxSourceRecords, err = rf3ManifestPositiveInt(value); err != nil ||
+				result.MaxSourceRecords > snapshottransfer.AbsoluteMaxSourceRecords {
+				return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+			}
+		}
+	}
+	positiveInts := []*int{&result.MaxSourceArtifacts, &result.MaxSourceConcurrent}
+	positiveIntNames := [...]string{`"max_source_artifacts"`, `"max_source_concurrent"`}
+	for index := range positiveInts {
+		value, err = nextRF3Field(&fields, positiveIntNames[index])
+		if err != nil {
+			return result, err
+		}
+		if *positiveInts[index], err = rf3ManifestPositiveInt(value); err != nil {
+			return result, err
+		}
+	}
+	uint64Out := []*uint64{&result.MaxSourceArtifactBytes, &result.MaxSourceDiskBytes}
+	uint64Names := [...]string{`"max_source_artifact_bytes"`, `"max_source_disk_bytes"`}
+	for index := range uint64Out {
+		value, err = nextRF3Field(&fields, uint64Names[index])
+		if err != nil {
+			return result, err
+		}
+		if *uint64Out[index], err = rf3ManifestPositiveUint64(value); err != nil {
+			return result, err
+		}
+	}
+	value, err = nextRF3Field(&fields, `"source_chunk_bytes"`)
+	if err != nil {
+		return result, err
+	}
+	chunk, err := rf3ManifestPositiveUint64(value)
+	if err != nil || chunk > math.MaxUint32 {
+		return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+	}
+	result.SourceChunkBytes = uint32(chunk)
+	if _, _, extra := fields.Next(); extra ||
+		result.MaxSourceArtifacts > 4096 ||
+		result.MaxSourceConcurrent > snapshottransfer.AbsoluteMaxSourceConcurrency ||
+		result.SourceChunkBytes < snapshottransfer.MinChunkBytes ||
+		result.SourceChunkBytes > snapshottransfer.AbsoluteMaxChunkBytes ||
+		result.MaxSourceArtifactBytes == 0 ||
+		result.MaxSourceDiskBytes < result.MaxSourceArtifactBytes {
+		return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+	}
+	paths := [...]string{
+		result.ActionJournalPath, result.SourceDataRoot,
+		result.SourceJournalPath, result.SourceRepositoryPath,
+	}
+	for index, path := range paths {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+		}
+		for prior := 0; prior < index; prior++ {
+			if path == paths[prior] {
+				return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
+			}
+		}
+	}
+	return result, nil
 }
 
 func parseRF3ManifestWAL(node vibejson.Node) (rf3ManifestWAL, error) {
@@ -417,6 +552,22 @@ func parseRF3ManifestEnrolledTarget(
 	}
 	if result.NodeID, err = rf3ManifestNodeID(value); err != nil {
 		return rf3ManifestEnrolledTarget{}, err
+	}
+	value, err = nextRF3Field(&fields, `"store_id"`)
+	if err != nil {
+		return result, err
+	}
+	store, err := rf3ManifestNodeID(value)
+	if err != nil {
+		return result, err
+	}
+	result.StoreID = [16]byte(store)
+	value, err = nextRF3Field(&fields, `"node_incarnation"`)
+	if err != nil {
+		return result, err
+	}
+	if result.NodeIncarnation, err = rf3ManifestPositiveUint64(value); err != nil {
+		return result, err
 	}
 	values := []*string{
 		&result.PeerAddress, &result.NativeAddress,

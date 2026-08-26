@@ -38,6 +38,19 @@ const canonicalRF3Manifest = `{
     "identity_oid": "1.3.6.1.4.1.32473.1.1"
   },
   "authorization_policy": "/etc/vibedb/authorization.json",
+  "replica_control": {
+    "action_journal_path": "/srv/vibedb/replica-actions",
+    "max_action_records": 4096,
+    "source_data_root": "/srv/vibedb",
+    "source_journal_path": "/srv/vibedb/source-exports",
+    "max_source_records": 4096,
+    "source_repository_path": "/srv/vibedb/source-artifacts",
+    "max_source_artifacts": 8,
+    "max_source_concurrent": 2,
+    "max_source_artifact_bytes": 1073741824,
+    "max_source_disk_bytes": 4294967296,
+    "source_chunk_bytes": 1048576
+  },
   "members": [
     {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"},
     {"member_id": 2, "node_id": "1112131415161718191a1b1c1d1e1f20", "peer_address": "member-2.internal:7400"},
@@ -84,6 +97,17 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 	if manifest.AuthorizationPolicy != "/etc/vibedb/authorization.json" {
 		t.Fatalf("authorization policy = %q", manifest.AuthorizationPolicy)
 	}
+	control := manifest.ReplicaControl
+	if control.ActionJournalPath != "/srv/vibedb/replica-actions" ||
+		control.MaxActionRecords != 4096 || control.SourceDataRoot != "/srv/vibedb" ||
+		control.SourceJournalPath != "/srv/vibedb/source-exports" ||
+		control.MaxSourceRecords != 4096 ||
+		control.SourceRepositoryPath != "/srv/vibedb/source-artifacts" ||
+		control.MaxSourceArtifacts != 8 || control.MaxSourceConcurrent != 2 ||
+		control.MaxSourceArtifactBytes != 1073741824 ||
+		control.MaxSourceDiskBytes != 4294967296 || control.SourceChunkBytes != 1048576 {
+		t.Fatalf("replica control = %+v", control)
+	}
 	var first rafttransport.NodeID
 	for index := range first {
 		first[index] = byte(index + 1)
@@ -114,6 +138,10 @@ func TestParseRF3ManifestRetainsOneEnrolledTargetOutsideServingRF3(t *testing.T)
 			0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
 			0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
 		}) ||
+		target.StoreID != ([16]byte{
+			0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+			0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50,
+		}) || target.NodeIncarnation != 9 ||
 		target.PeerAddress != "member-4.internal:7400" ||
 		target.NativeAddress != "member-4.internal:7500" ||
 		target.SnapshotAddress != "member-4.internal:7600" ||
@@ -156,6 +184,11 @@ func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
 		{"fractional-bound", replace(`"max_records": 4096`, `"max_records": 1.5`)},
 		{"int64-overflow", replace(`"max_file_bytes": 268435456`, `"max_file_bytes": 9223372036854775808`)},
 		{"int-overflow", replace(`"max_record_bytes": 8388608`, `"max_record_bytes": 18446744073709551615`)},
+		{"relative-action-journal", replace(`/srv/vibedb/replica-actions`, `replica-actions`)},
+		{"unclean-source-root", replace(`/srv/vibedb",`+"\n"+`    "source_journal_path`, `/srv/vibedb/../vibedb",`+"\n"+`    "source_journal_path`)},
+		{"oversize-action-records", replace(`"max_action_records": 4096`, `"max_action_records": 4097`)},
+		{"undersize-source-chunk", replace(`"source_chunk_bytes": 1048576`, `"source_chunk_bytes": 1024`)},
+		{"source-disk-below-artifact", replace(`"max_source_disk_bytes": 4294967296`, `"max_source_disk_bytes": 1024`)},
 		{"two-members", replace(`,`+"\n    "+`{"member_id": 3, "node_id": "2122232425262728292a2b2c2d2e2f30", "peer_address": "member-3.internal:7400"}`, ``)},
 		{"four-members", replace(`{"member_id": 3, "node_id": "2122232425262728292a2b2c2d2e2f30", "peer_address": "member-3.internal:7400"}`, `{"member_id": 3, "node_id": "2122232425262728292a2b2c2d2e2f30", "peer_address": "member-3.internal:7400"},`+"\n    "+`{"member_id": 4, "node_id": "3132333435363738393a3b3c3d3e3f40", "peer_address": "member-4.internal:7400"}`)},
 		{"reordered-member-fields", replace(`{"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10"`, `{"node_id": "0102030405060708090a0b0c0d0e0f10", "member_id": 1`)},
@@ -200,6 +233,8 @@ func TestParseRF3ManifestRejectsInvalidEnrolledTarget(t *testing.T) {
 		{"zero-member", replace(`"member_id": 4`, `"member_id": 0`)},
 		{"serving-member", replace(`"member_id": 4`, `"member_id": 2`)},
 		{"serving-node", replace(`3132333435363738393a3b3c3d3e3f40`, `1112131415161718191a1b1c1d1e1f20`)},
+		{"zero-store", replace(`4142434445464748494a4b4c4d4e4f50`, `00000000000000000000000000000000`)},
+		{"zero-incarnation", replace(`"node_incarnation": 9`, `"node_incarnation": 0`)},
 		{"serving-peer-address", replace(`member-4.internal:7400`, `member-2.internal:7400`)},
 		{"native-repeats-serving-peer", replace(`member-4.internal:7500`, `member-2.internal:7400`)},
 		{"repeated-target-address", replace(`member-4.internal:7700`, `member-4.internal:7600`)},
@@ -220,6 +255,8 @@ func enrolledRF3Manifest() string {
   "enrolled_target": {
     "member_id": 4,
     "node_id": "3132333435363738393a3b3c3d3e3f40",
+    "store_id": "4142434445464748494a4b4c4d4e4f50",
+    "node_incarnation": 9,
     "peer_address": "member-4.internal:7400",
     "native_address": "member-4.internal:7500",
     "snapshot_address": "member-4.internal:7600",

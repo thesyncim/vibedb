@@ -76,7 +76,7 @@ func servePreparedRF3WithListen(
 	parent context.Context,
 	manifest rf3Manifest,
 	listen rf3ListenFunc,
-) error {
+) (resultErr error) {
 	if parent == nil {
 		return errRF3Serving
 	}
@@ -286,7 +286,94 @@ func servePreparedRF3WithListen(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
-	controlMux, err := newRF3ControlMux(membershipControl, observationControl, nil, nil)
+	actionJournal, err := replicaaction.OpenFileJournal(
+		manifest.ReplicaControl.ActionJournalPath,
+		manifest.ReplicaControl.MaxActionRecords,
+	)
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, actionJournal.Close()) }()
+	actionControl, err := replicaaction.NewService(replicaaction.Options{
+		Journal: actionJournal, Owner: peer.Owner(),
+		Authorize: func(identity rafttransport.PeerIdentity, request replicaaction.Request) bool {
+			return request.Fence.Group == group &&
+				request.Fence.MemberID == runtimeIdentity.MemberID &&
+				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
+	})
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	var sourceControl shardcontrol.Handler
+	if target := manifest.EnrolledTarget; target != nil &&
+		runtimeIdentity.MemberID != target.MemberID {
+		sourceJournal, openErr := snapshottransfer.OpenSourceFileJournal(
+			manifest.ReplicaControl.SourceJournalPath,
+			manifest.ReplicaControl.MaxSourceRecords,
+		)
+		if openErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(openErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+		defer func() { resultErr = errors.Join(resultErr, sourceJournal.Close()) }()
+		provider, providerErr := snapshottransfer.OpenRetainedSourceExportProvider(
+			snapshottransfer.RetainedSourceExportOptions{
+				DataRoot:       manifest.ReplicaControl.SourceDataRoot,
+				RepositoryPath: manifest.ReplicaControl.SourceRepositoryPath,
+				Limits: snapshottransfer.Limits{
+					MaxArtifacts:     manifest.ReplicaControl.MaxSourceArtifacts,
+					MaxArtifactBytes: manifest.ReplicaControl.MaxSourceArtifactBytes,
+					MaxDiskBytes:     manifest.ReplicaControl.MaxSourceDiskBytes,
+				},
+				ChunkBytes:      manifest.ReplicaControl.SourceChunkBytes,
+				MaxConcurrent:   manifest.ReplicaControl.MaxSourceConcurrent,
+				RuntimeIdentity: runtimeIdentity,
+				SourceNode:      profile.LocalIdentity().Node,
+				TargetMember:    target.MemberID, TargetStore: target.StoreID,
+				TargetIncarnation: target.NodeIncarnation, Cut: apply,
+			},
+		)
+		if providerErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(providerErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+		defer func() { resultErr = errors.Join(resultErr, provider.Close()) }()
+		sourceService, serviceErr := snapshottransfer.NewSourceControlService(
+			snapshottransfer.SourceControlOptions{
+				Journal:  sourceJournal,
+				Exporter: snapshottransfer.PinnedSourceControlExporter{Provider: provider},
+				Authorize: func(identity rafttransport.PeerIdentity, request snapshottransfer.SourceControlRequest) bool {
+					return request.Group == group && request.SourceMember == runtimeIdentity.MemberID &&
+						request.SourceNode == profile.LocalIdentity().Node &&
+						request.TargetMember == target.MemberID && request.TargetStore == target.StoreID &&
+						request.TargetIncarnation == target.NodeIncarnation &&
+						policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+				},
+				ReadDeadline: deadline, WriteDeadline: deadline,
+				MaxConcurrent: manifest.ReplicaControl.MaxSourceConcurrent,
+			},
+		)
+		if serviceErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+		sourceControl = sourceService
+	}
+	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
