@@ -193,6 +193,7 @@ const (
 	ReplicatedRefusalUnauthorized
 	ReplicatedRefusalTransactionReadMalformed
 	ReplicatedRefusalRequestLedgerReadMalformed
+	ReplicatedRefusalReadIntentActive
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -1105,7 +1106,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) &&
 			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable ||
 				response.Refusal == ReplicatedRefusalUnauthorized) &&
-			response.Refusal <= ReplicatedRefusalRequestLedgerReadMalformed
+			response.Refusal <= ReplicatedRefusalReadIntentActive
 	case ReplicatedReadFound:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&

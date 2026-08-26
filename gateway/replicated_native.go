@@ -31,12 +31,13 @@ const (
 )
 
 var (
-	ErrReplicatedRoute           = errors.New("gateway: invalid replicated shard route")
-	ErrReplicatedLeader          = errors.New("gateway: replicated shard has no reachable leader")
-	ErrReplicatedDial            = errors.New("gateway: replicated shard dial is not configured")
-	ErrReplicatedReadBehind      = errors.New("gateway: replica is below the requested applied index")
-	ErrReplicatedReadBufferBound = errors.New("gateway: point-read response bound is below the relation limit")
-	ErrReplicatedUnauthorized    = errors.New("gateway: replicated authorization denied")
+	ErrReplicatedRoute            = errors.New("gateway: invalid replicated shard route")
+	ErrReplicatedLeader           = errors.New("gateway: replicated shard has no reachable leader")
+	ErrReplicatedDial             = errors.New("gateway: replicated shard dial is not configured")
+	ErrReplicatedReadBehind       = errors.New("gateway: replica is below the requested applied index")
+	ErrReplicatedReadBufferBound  = errors.New("gateway: point-read response bound is below the relation limit")
+	ErrReplicatedReadIntentActive = errors.New("gateway: replicated read intersects an active transaction intent")
+	ErrReplicatedUnauthorized     = errors.New("gateway: replicated authorization denied")
 )
 
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
@@ -384,9 +385,17 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 		if !validReplicatedResponseState(response) ||
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
-			response.State.Fence.MemberID != endpoint.Member ||
-			response.State.Fence.Command != route.Command {
+			response.State.Fence.MemberID != endpoint.Member {
 			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+			continue
+		}
+		if response.State.Fence.Command != route.Command {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			if validReplicatedReadRefusal(response, shardservice.ReplicatedRefusalStaleFence) {
+				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
 			joined = errors.Join(joined, ErrReplicatedRoute)
 			preferred = 0
 			continue
@@ -427,7 +436,8 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
-				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound {
+				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound ||
+				response.Refusal == shardservice.ReplicatedRefusalReadIntentActive {
 				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
 			}
 			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
@@ -577,7 +587,8 @@ func (executor *ReplicatedExecutor) readPoint(
 				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
-				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound {
+				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound ||
+				response.Refusal == shardservice.ReplicatedRefusalReadIntentActive {
 				return ReplicatedPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
 			}
 			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
@@ -668,6 +679,9 @@ func (e *ReplicatedRefusalError) Unwrap() error {
 	}
 	if e.Code == shardservice.ReplicatedRefusalReadBufferBound {
 		return ErrReplicatedReadBufferBound
+	}
+	if e.Code == shardservice.ReplicatedRefusalReadIntentActive {
+		return ErrReplicatedReadIntentActive
 	}
 	if e.Code == shardservice.ReplicatedRefusalUnauthorized {
 		return ErrReplicatedUnauthorized
@@ -1482,6 +1496,7 @@ func validReplicatedReadRefusal(
 		shardservice.ReplicatedRefusalUnavailable,
 		shardservice.ReplicatedRefusalReadBehind,
 		shardservice.ReplicatedRefusalReadBufferBound,
+		shardservice.ReplicatedRefusalReadIntentActive,
 		shardservice.ReplicatedRefusalUnauthorized:
 		return true
 	default:

@@ -509,6 +509,9 @@ func (server *ReplicatedServer) executeReplicated(
 		case errors.Is(readErr, replicatedstate.ErrReadBufferBound):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalReadBufferBound, HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrTransactionIntentActive):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalReadIntentActive, HasState: true, State: wireState}
 		case errors.Is(readErr, raftservice.ErrIngressFull),
 			errors.Is(readErr, raftservice.ErrPendingReadsFull):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
@@ -565,6 +568,9 @@ func (server *ReplicatedServer) executeReplicated(
 				HasState: true, State: wireState}
 		case errors.Is(readErr, replicatedstate.ErrReadBufferBound):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrTransactionIntentActive):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadIntentActive,
 				HasState: true, State: wireState}
 		case errors.Is(readErr, raftservice.ErrIngressFull),
 			errors.Is(readErr, raftservice.ErrPendingReadsFull):

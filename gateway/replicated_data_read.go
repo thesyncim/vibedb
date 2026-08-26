@@ -29,10 +29,12 @@ var (
 )
 
 const (
-	DefaultReplicatedReadConcurrency     = 256
-	DefaultReplicatedReadInFlight        = 256 << 20
-	AbsoluteMaxReplicatedReadConcurrency = 1 << 16
-	AbsoluteMaxReplicatedReadInFlight    = 64 << 30
+	DefaultReplicatedReadConcurrency        = 256
+	DefaultReplicatedReadInFlight           = 256 << 20
+	DefaultReplicatedScatterConcurrency     = 16
+	AbsoluteMaxReplicatedReadConcurrency    = 1 << 16
+	AbsoluteMaxReplicatedScatterConcurrency = 1 << 10
+	AbsoluteMaxReplicatedReadInFlight       = 64 << 30
 )
 
 // ReplicatedDataReadConsistency is an explicit public point-read contract.
@@ -146,14 +148,16 @@ func (result *ReplicatedTableReadResult) Release() {
 // ReplicatedDataReader binds public table/key reads to one atomically pinned
 // catalog generation and the SQL-free RF3 executor.
 type ReplicatedDataReader struct {
-	catalog      *CatalogHolder
-	executor     *ReplicatedExecutor
-	refresh      RefreshFunc
-	readSlots    chan uint32
-	reservations []replicatedReadReservation
-	maxReadBytes uint64
-	readBytes    atomic.Uint64
-	nextEpoch    atomic.Uint64
+	catalog            *CatalogHolder
+	executor           *ReplicatedExecutor
+	refresh            RefreshFunc
+	readSlots          chan uint32
+	reservations       []replicatedReadReservation
+	maxReadBytes       uint64
+	readBytes          atomic.Uint64
+	nextEpoch          atomic.Uint64
+	scatterSlots       chan struct{}
+	scatterConcurrency int
 
 	refreshMu sync.Mutex
 	active    *replicatedDataCatalogRefresh
@@ -180,10 +184,15 @@ type ReplicatedDataReaderOptions struct {
 	// MaxConcurrentReads bounds requests admitted to native RF3 point I/O.
 	// Zero selects DefaultReplicatedReadConcurrency.
 	MaxConcurrentReads int
-	// MaxInFlightReadBytes reserves each read at its schema-authenticated
-	// MaxDocumentBytes before network I/O. Zero selects
-	// DefaultReplicatedReadInFlight.
+	// MaxInFlightReadBytes bounds all admitted native-read response and scatter
+	// working sets. Point reads reserve the schema-authenticated document bound;
+	// scatter reads additionally reserve their fixed worker windows. Zero
+	// selects DefaultReplicatedReadInFlight.
 	MaxInFlightReadBytes uint64
+	// MaxScatterConcurrency bounds active shard-group ReadIndex calls across
+	// every admitted scatter read. It never caps the number of groups in one
+	// request; excess groups drain through the fixed worker lanes.
+	MaxScatterConcurrency int
 }
 
 func NewReplicatedDataReader(
@@ -206,16 +215,22 @@ func NewReplicatedDataReaderWithOptions(
 	if maximumBytes == 0 {
 		maximumBytes = DefaultReplicatedReadInFlight
 	}
+	scatterConcurrency := options.MaxScatterConcurrency
+	if scatterConcurrency == 0 {
+		scatterConcurrency = DefaultReplicatedScatterConcurrency
+	}
 	if options.Catalog == nil || options.Catalog.Current() == nil ||
 		options.Executor == nil || options.Executor.client == nil ||
 		concurrency <= 0 || concurrency > AbsoluteMaxReplicatedReadConcurrency ||
+		scatterConcurrency <= 0 || scatterConcurrency > AbsoluteMaxReplicatedScatterConcurrency ||
 		maximumBytes == 0 || maximumBytes > AbsoluteMaxReplicatedReadInFlight {
 		return nil, ErrReplicatedDataRead
 	}
 	reader := &ReplicatedDataReader{
 		catalog: options.Catalog, executor: options.Executor, refresh: options.Refresh,
 		readSlots: make(chan uint32, concurrency), reservations: make([]replicatedReadReservation, concurrency),
-		maxReadBytes: maximumBytes,
+		maxReadBytes: maximumBytes, scatterSlots: make(chan struct{}, scatterConcurrency),
+		scatterConcurrency: scatterConcurrency,
 	}
 	for slot := range reader.reservations {
 		reader.readSlots <- uint32(slot)
@@ -275,27 +290,8 @@ func (reader *ReplicatedDataReader) ReadBatch(
 	ctx context.Context,
 	request ReplicatedTableBatchReadRequest,
 ) (ReplicatedTableBatchReadResult, error) {
-	if reader == nil || reader.catalog == nil || reader.executor == nil || ctx == nil ||
-		len(request.Points) == 0 || request.MaxResultBytes == 0 ||
-		request.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
-		return ReplicatedTableBatchReadResult{}, ErrReplicatedDataRead
-	}
-	count := uint64(len(request.Points))
-	if count > uint64(^uint32(0)) || 4+(count+7)/8+count*4 > uint64(request.MaxResultBytes) {
-		return ReplicatedTableBatchReadResult{}, ErrReplicatedReadAdmission
-	}
-	requestBytes := uint64(4)
-	for index := range request.Points {
-		if len(request.Points[index].Table) == 0 ||
-			len(request.Points[index].Table) > replication.MaxIdentityBytes ||
-			len(request.Points[index].Key) == 0 ||
-			len(request.Points[index].Key) > replication.MaxMutationKeyBytes {
-			return ReplicatedTableBatchReadResult{}, ErrReplicatedDataRead
-		}
-		requestBytes += 5 + uint64(len(request.Points[index].Key))
-		if requestBytes > replicatedstate.MaxPointReadBatchBytes {
-			return ReplicatedTableBatchReadResult{}, ErrReplicatedReadAdmission
-		}
+	if err := validateReplicatedTableBatchReadRequest(reader, ctx, request); err != nil {
+		return ReplicatedTableBatchReadResult{}, err
 	}
 	result, generation, err := reader.readBatchPinned(ctx, request)
 	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
@@ -306,6 +302,36 @@ func (reader *ReplicatedDataReader) ReadBatch(
 	}
 	result, _, err = reader.readBatchPinned(ctx, request)
 	return result, err
+}
+
+func validateReplicatedTableBatchReadRequest(
+	reader *ReplicatedDataReader,
+	ctx context.Context,
+	request ReplicatedTableBatchReadRequest,
+) error {
+	if reader == nil || reader.catalog == nil || reader.executor == nil || ctx == nil ||
+		len(request.Points) == 0 || request.MaxResultBytes == 0 ||
+		request.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
+		return ErrReplicatedDataRead
+	}
+	count := uint64(len(request.Points))
+	if count > uint64(^uint32(0)) || 4+(count+7)/8+count*4 > uint64(request.MaxResultBytes) {
+		return ErrReplicatedReadAdmission
+	}
+	requestBytes := uint64(4)
+	for index := range request.Points {
+		if len(request.Points[index].Table) == 0 ||
+			len(request.Points[index].Table) > replication.MaxIdentityBytes ||
+			len(request.Points[index].Key) == 0 ||
+			len(request.Points[index].Key) > replication.MaxMutationKeyBytes {
+			return ErrReplicatedDataRead
+		}
+		requestBytes += 5 + uint64(len(request.Points[index].Key))
+		if requestBytes > replicatedstate.MaxPointReadBatchBytes {
+			return ErrReplicatedReadAdmission
+		}
+	}
+	return nil
 }
 
 func (reader *ReplicatedDataReader) readBatchPinned(
@@ -454,6 +480,18 @@ func (reader *ReplicatedDataReader) releaseRead(slot uint32, epoch, bytes uint64
 	}
 	reader.readBytes.Add(^(bytes - 1))
 	reader.readSlots <- slot
+}
+
+func (reader *ReplicatedDataReader) shrinkRead(slot uint32, epoch, from, to uint64) bool {
+	if reader == nil || epoch == 0 || from < to || to == 0 ||
+		uint64(slot) >= uint64(len(reader.reservations)) ||
+		reader.reservations[slot].epoch.Load() != epoch {
+		return false
+	}
+	if from != to {
+		reader.readBytes.Add(^(from - to - 1))
+	}
+	return true
 }
 
 func (reader *ReplicatedDataReader) refreshAfterFence(

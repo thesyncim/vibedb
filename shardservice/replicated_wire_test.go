@@ -182,6 +182,8 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
 			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadIntentActive,
+			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: state, RequestDigest: [32]byte{1}, Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8}},
@@ -953,6 +955,8 @@ func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadIntentActive,
 			HasState: true, State: state},
 	} {
 		var seed bytes.Buffer

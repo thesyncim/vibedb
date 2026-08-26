@@ -1108,6 +1108,7 @@ func TestReplicatedExecutorTreatsReadOnlyProposalRefusalsAsUnknown(t *testing.T)
 	}{
 		{"read behind", shardservice.ReplicatedRefusalReadBehind},
 		{"read buffer bound", shardservice.ReplicatedRefusalReadBufferBound},
+		{"read intent active", shardservice.ReplicatedRefusalReadIntentActive},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			response := &shardservice.ReplicatedResponse{
@@ -1127,7 +1128,8 @@ func TestReplicatedExecutorTreatsReadOnlyProposalRefusalsAsUnknown(t *testing.T)
 			if !errors.As(err, &unknown) || !bytes.Equal(unknown.Command, want) ||
 				!bytes.Equal(client.command, want) ||
 				errors.Is(err, ErrReplicatedReadBehind) ||
-				errors.Is(err, ErrReplicatedReadBufferBound) {
+				errors.Is(err, ErrReplicatedReadBufferBound) ||
+				errors.Is(err, ErrReplicatedReadIntentActive) {
 				t.Fatalf("error=%T %v unknown=%+v sent=%t", err, err,
 					unknown, bytes.Equal(client.command, want))
 			}

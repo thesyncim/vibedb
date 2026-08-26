@@ -150,7 +150,8 @@ func TestReplicatedServerPreservesTypedPointReadBounds(t *testing.T) {
 		err     error
 		refusal ReplicatedRefusalCode
 	}{{"future-applied-floor", replicatedstate.ErrReadBehind, ReplicatedRefusalReadBehind},
-		{"response-buffer", replicatedstate.ErrReadBufferBound, ReplicatedRefusalReadBufferBound}} {
+		{"response-buffer", replicatedstate.ErrReadBufferBound, ReplicatedRefusalReadBufferBound},
+		{"active-intent", replicatedstate.ErrTransactionIntentActive, ReplicatedRefusalReadIntentActive}} {
 		t.Run(test.name, func(t *testing.T) {
 			owner := &fakeReplicatedOwner{state: state, readErr: test.err}
 			server := &ReplicatedServer{owner: owner}
