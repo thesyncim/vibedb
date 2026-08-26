@@ -6,10 +6,17 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
+
+func TestTransactionRequestKeepsManifestMetadataCold(t *testing.T) {
+	if got := unsafe.Sizeof(TransactionRequest{}); got > 96 {
+		t.Fatalf("TransactionRequest size=%d, want at most 96 bytes", got)
+	}
+}
 
 func buildShardManifest(t testing.TB, id distributedtxn.ID, count int) ([]byte, [][]byte) {
 	t.Helper()
@@ -185,7 +192,7 @@ func TestEncodeSegmentedTransactionRequestDoesNotMutateReusableCaller(t *testing
 		request.Transaction.Revision != want.Revision || request.Transaction.SegmentIndex != want.SegmentIndex ||
 		!bytes.Equal(request.Transaction.Record, want.Record) ||
 		!bytes.Equal(request.Transaction.ManifestSegment, want.ManifestSegment) ||
-		request.Transaction.manifestMeta.valid {
+		request.Transaction.manifestMeta != nil {
 		t.Fatalf("EncodeRequest mutated caller transaction: %+v", request.Transaction)
 	}
 }

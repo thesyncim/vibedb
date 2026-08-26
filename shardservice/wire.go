@@ -96,7 +96,10 @@ type TransactionRequest struct {
 	// operations. Coordinator begin carries Record=VTCM and page zero together,
 	// so route identity is proven before the first journal write.
 	ManifestSegment []byte
-	manifestMeta    transactionManifestSegmentMeta
+	// manifestMeta is a cold decoded-request sidecar. Keeping only a pointer in
+	// TransactionRequest avoids adding two maximum-width shard identities to
+	// every ordinary SQL, point-read, and transaction request value.
+	manifestMeta *transactionManifestSegmentMeta
 }
 
 type transactionManifestSegmentMeta struct {

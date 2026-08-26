@@ -519,7 +519,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 			return errors.Join(errBadTransaction, err)
 		}
 		if cacheDecodedMeta {
-			tx.manifestMeta = meta
+			tx.manifestMeta = &meta
 		}
 		return nil
 	}
@@ -533,7 +533,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 			return errors.Join(errBadTransaction, err)
 		}
 		if cacheDecodedMeta {
-			tx.manifestMeta = meta
+			tx.manifestMeta = &meta
 		}
 		return nil
 	}

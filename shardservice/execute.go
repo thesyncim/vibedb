@@ -1055,12 +1055,12 @@ func (c *shardConn) readParticipant(id distributedtxn.ID) *ShardResponse {
 
 func (c *shardConn) stageManifestSegment(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
-	if !tx.manifestMeta.valid {
+	if tx.manifestMeta == nil || !tx.manifestMeta.valid {
 		meta, err := inspectTransactionManifestSegment(tx.ManifestSegment)
 		if err != nil {
 			return transactionError(err)
 		}
-		tx.manifestMeta = meta
+		tx.manifestMeta = &meta
 	}
 	if tx.manifestMeta.index == 0 {
 		return transactionError(distributedtxn.ErrJournalConflict)
@@ -1085,15 +1085,15 @@ func (c *shardConn) stageManifestCoordinator(req *ShardRequest) *ShardResponse {
 	if err != nil {
 		return transactionError(err)
 	}
-	if !tx.manifestMeta.valid {
+	if tx.manifestMeta == nil || !tx.manifestMeta.valid {
 		meta, inspectErr := inspectTransactionManifestFirstSegment(
 			tx.ManifestSegment, record.Manifest)
 		if inspectErr != nil {
 			return transactionError(inspectErr)
 		}
-		tx.manifestMeta = meta
+		tx.manifestMeta = &meta
 	}
-	meta := tx.manifestMeta
+	meta := *tx.manifestMeta
 	if !vibejson.BytesEqualString(meta.distribution[:meta.distributionLen], string(req.Distribution)) ||
 		!vibejson.BytesEqualString(meta.shard[:meta.shardLen], string(req.Shard)) ||
 		meta.routingVersion != uint64(req.RoutingVersion) ||
