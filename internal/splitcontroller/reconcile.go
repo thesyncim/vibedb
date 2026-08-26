@@ -479,7 +479,11 @@ type Observation struct {
 	Catalog      *gateway.Snapshot
 	SourceState  replicatedstate.State
 	SourceStatus raftmember.RuntimeStatus
-	Capture      *rangesplit.SourceCapture
+	// CaptureHead is the detached, wire-safe source-capture publication head.
+	// Local runtimes may also provide Capture for execution; reconciliation
+	// accepts either representation but requires them to agree when both exist.
+	CaptureHead uint64
+	Capture     *rangesplit.SourceCapture
 
 	Artifacts   *rangesplit.ChildArtifactSet
 	Tail        *rangesplit.TailCursor
@@ -489,6 +493,17 @@ type Observation struct {
 	Prune       *rangesplit.RetainedPruneCursor
 
 	OlderCatalogDrained bool
+}
+
+func observationCaptureHead(observed Observation) (uint64, bool) {
+	if observed.Capture == nil {
+		return observed.CaptureHead, observed.CaptureHead != 0
+	}
+	head := observed.Capture.Head()
+	if observed.CaptureHead != 0 && observed.CaptureHead != head {
+		return 0, false
+	}
+	return head, head != 0
 }
 
 // Reconcile proves the one safe next step from independently durable state.
@@ -518,7 +533,8 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		if observed.Prune != nil &&
 			observed.Prune.Phase() == rangesplit.RetainedPruneComplete &&
 			plan.sourceStateAheadOfCompletion(observed.SourceState, certificate, *observed.Prune) {
-			if observed.Capture == nil || observed.Capture.Head() != observed.SourceState.Applied {
+			captureHead, captureOK := observationCaptureHead(observed)
+			if !captureOK || captureHead != observed.SourceState.Applied {
 				return Action{}, ErrTopologyConflict
 			}
 			if !sourceLeader(observed.SourceStatus, observed.SourceState) {
@@ -549,13 +565,14 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 	if err := plan.validateSourceObservation(observed); err != nil {
 		return Action{}, err
 	}
-	if observed.Capture == nil || observed.Capture.Head() == 0 {
+	captureHead, hasCapture := observationCaptureHead(observed)
+	if !hasCapture {
 		if !sourceLeader(observed.SourceStatus, observed.SourceState) {
 			return Action{Kind: ActionAwaitSourceLeader}, nil
 		}
 		return Action{Kind: ActionStartCapture}, nil
 	}
-	if observed.Capture.Head() != observed.SourceState.Applied {
+	if captureHead != observed.SourceState.Applied {
 		return Action{}, ErrTopologyConflict
 	}
 	if observed.Artifacts == nil {
@@ -577,10 +594,10 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{}, ErrTopologyConflict
 	}
 	if !tail.Sealed() {
-		if observed.Capture.Head() < tail.SourceCut().Applied {
+		if captureHead < tail.SourceCut().Applied {
 			return Action{}, ErrTopologyConflict
 		}
-		if observed.Capture.Head() > tail.SourceCut().Applied {
+		if captureHead > tail.SourceCut().Applied {
 			return Action{Kind: ActionCatchUpTail}, nil
 		}
 		if !plan.sourceStateMatchesCut(observed.SourceState, tail) {
@@ -601,7 +618,7 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{Kind: ActionCatchUpTail}, nil
 	}
 	if observed.Certificate == nil {
-		if observed.Capture.Head() != tail.SourceCut().Applied ||
+		if captureHead != tail.SourceCut().Applied ||
 			!plan.sourceStateMatchesCut(observed.SourceState, tail) {
 			return Action{}, ErrTopologyConflict
 		}
