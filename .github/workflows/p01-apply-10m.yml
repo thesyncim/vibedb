@@ -107,10 +107,12 @@ jobs:
             .after.user.leaf_splits >= .before.user.leaf_splits and
             (.after.user.leaf_splits - .before.user.leaf_splits) <= 1 and
             .after.user.empty_reclaims == .before.user.empty_reclaims and
-            .before.system.rows == 3 and
-            .after.system.rows == 4 and
+            .before.system.rows == 4 and
+            .after.system.rows == 5 and
             .before.user.rows == 10000000 and
             .after.user.rows == 10000000 and
+            .after.user.file_end >= .before.user.file_end and
+            (.after.user.file_end - .before.user.file_end) <= 67108864 and
             .after.system.published_generation > .before.system.published_generation and
             .after.user.published_generation > .before.user.published_generation and
             .validator.put_calls == 1 and

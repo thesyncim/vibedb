@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -76,6 +77,13 @@ type Options struct {
 	// autonomous transaction-recovery loop. It must be explicitly configured
 	// by authenticated production startup; the zero value cannot forward.
 	InternalAuthority serviceauthz.Authority
+	// ReplicatedTransactions enables the byte-native RF3 multi-group write lane.
+	// The orchestrator is process-scoped and owns its admission/recovery budget;
+	// Executor never constructs one per request.
+	ReplicatedTransactions *ReplicatedTransactionOrchestrator
+	// ReplicatedTransactionRequests owns caller request identities and every
+	// outcome-unknown recovery handle used by the shipped RF3 write lane.
+	ReplicatedTransactionRequests *ReplicatedTransactionRequestRegistry
 }
 
 // defaultMaxRetries bounds stale-generation retries when Options leaves it zero.
@@ -84,14 +92,16 @@ const defaultMaxRetries = 2
 // Executor routes and dispatches bounded distributed reads over a pinned catalog
 // generation. It is safe for concurrent use.
 type Executor struct {
-	client            *Client
-	catalog           *CatalogHolder
-	profiles          map[OperationClass]Profile
-	refresh           RefreshFunc
-	maxRetry          int
-	routers           *routerPool
-	metrics           Metrics
-	internalAuthority serviceauthz.Authority
+	client                        *Client
+	catalog                       *CatalogHolder
+	profiles                      map[OperationClass]Profile
+	refresh                       RefreshFunc
+	maxRetry                      int
+	routers                       *routerPool
+	metrics                       Metrics
+	internalAuthority             serviceauthz.Authority
+	replicatedTransactions        *ReplicatedTransactionOrchestrator
+	replicatedTransactionRequests *ReplicatedTransactionRequestRegistry
 }
 
 // NewExecutor returns an executor that dispatches through client and pins
@@ -112,13 +122,15 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 		maxRetry = 0
 	}
 	return &Executor{
-		client:            client,
-		catalog:           catalog,
-		profiles:          profiles,
-		refresh:           opts.Refresh,
-		maxRetry:          maxRetry,
-		routers:           newRouterPool(),
-		internalAuthority: opts.InternalAuthority,
+		client:                        client,
+		catalog:                       catalog,
+		profiles:                      profiles,
+		refresh:                       opts.Refresh,
+		maxRetry:                      maxRetry,
+		routers:                       newRouterPool(),
+		internalAuthority:             opts.InternalAuthority,
+		replicatedTransactions:        opts.ReplicatedTransactions,
+		replicatedTransactionRequests: opts.ReplicatedTransactionRequests,
 	}
 }
 
@@ -143,6 +155,10 @@ type Result struct {
 	Columns      []shardservice.Column
 	Rows         [][]shardservice.Cell
 	RowsAffected int64
+	// TransactionID is nonzero for an RF3 multi-group write. It lets the shipped
+	// boundary report a typed durable identity rather than reducing recovery
+	// state to an error string.
+	TransactionID replication.ID128
 
 	RouteKind     distribution.RouteKind
 	Generation    uint64

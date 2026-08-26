@@ -793,10 +793,17 @@ func nativeCompletionMatches(
 			result.Role != role || result.Operation != operation {
 			return false
 		}
-	} else if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
-		completion.ResultLength != 0 || len(completion.InlineResult) != 0 ||
-		!nativeCompletionResultMatches(command.Kind(), completion.ResultCode) {
-		return false
+	} else {
+		if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
+			completion.ResultLength != uint64(len(completion.InlineResult)) ||
+			!nativeCompletionResultMatches(command.Kind(), completion.ResultCode) {
+			return false
+		}
+		if _, err := replicatedstate.OpenMutationCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		); err != nil {
+			return false
+		}
 	}
 	clientEpoch := command.ClientEpoch
 	if command.Kind() == replication.CommandSessionOpen {

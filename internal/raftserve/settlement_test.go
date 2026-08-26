@@ -177,6 +177,28 @@ func testCompletion(
 	applied uint64,
 ) replicatedstate.CompletionLookup {
 	t.Helper()
+	const resultCode = replicatedstate.ResultApplied
+	var result [replicatedstate.MutationCompletionResultBytes]byte
+	resultBytes, err := replicatedstate.AppendMutationCompletionResult(
+		result[:0], resultCode, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testCompletionResultBytes(
+		t, group, commandBytes, applied, resultCode, resultBytes,
+	)
+}
+
+func testCompletionResultBytes(
+	t testing.TB,
+	group raftmember.GroupKey,
+	commandBytes []byte,
+	applied uint64,
+	resultCode uint32,
+	resultBytes []byte,
+) replicatedstate.CompletionLookup {
+	t.Helper()
 	command, err := replication.OpenCommand(commandBytes)
 	if err != nil {
 		t.Fatal(err)
@@ -185,8 +207,7 @@ func testCompletion(
 	if command.Kind() == replication.CommandSessionOpen {
 		epoch = 17
 	}
-	const resultCode = uint32(1)
-	const resultFormat = uint16(1)
+	const resultFormat = replicatedstate.ResultFormatMutation
 	encoded, err := replication.AppendCompletion(nil, replication.Completion{
 		ClusterID:             replication.ID128(group.ClusterID),
 		ClusterIncarnation:    replication.ID128(group.ClusterIncarnation),
@@ -202,8 +223,9 @@ func testCompletion(
 		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
 		RetryHome: command.RetryHome, AppliedSequence: applied,
 		ResultCode: resultCode, ResultFormat: resultFormat,
-		Storage:      replication.CompletionInline,
-		ResultDigest: replication.CompletionResultDigest(resultCode, resultFormat, nil),
+		Storage: replication.CompletionInline, ResultLength: uint64(len(resultBytes)),
+		ResultDigest: replication.CompletionResultDigest(resultCode, resultFormat, resultBytes),
+		InlineResult: resultBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -295,6 +317,31 @@ func testTransactionCompletion(
 	return replicatedstate.CompletionLookup{
 		Key:   replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
 		Bytes: encoded, AppliedSequence: applied,
+	}
+}
+
+func TestRegistrySettlementValidatesMutationResultWithoutAllocations(t *testing.T) {
+	group := testGroup(19)
+	command := encodeTestCommand(t, testCommand(group, 1, 2))
+	const applied = uint64(28)
+	lookup := testCompletion(t, group, command, applied)
+	identity, err := openCommandIdentity(group, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if validateErr := validateCompletionLookup(identity, lookup); validateErr != nil {
+			panic(validateErr)
+		}
+	}); allocations != 0 {
+		t.Fatalf("mutation completion validation allocations = %v, want 0", allocations)
+	}
+
+	legacyEmpty := testCompletionResultBytes(
+		t, group, command, applied, replicatedstate.ResultApplied, nil,
+	)
+	if err := validateCompletionLookup(identity, legacyEmpty); !errors.Is(err, ErrSettlementResult) {
+		t.Fatalf("empty applied mutation result error = %v", err)
 	}
 }
 

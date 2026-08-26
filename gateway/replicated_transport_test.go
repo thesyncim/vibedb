@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -59,7 +60,8 @@ func TestAuthenticatedReplicatedClientDefaultsAndBoundsControlReserve(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats := client.Stats(); stats.ReservedControlConnections != 1 || stats.ReservedControlHandshakes != 1 {
+	if stats := client.Stats(); stats.ReservedControlConnections != 1 || stats.ReservedControlHandshakes != 1 ||
+		stats.ReservedControlWaiters != 1 {
 		t.Fatalf("default reserves = %+v", stats)
 	}
 	_ = client.Close()
@@ -71,6 +73,33 @@ func TestAuthenticatedReplicatedClientDefaultsAndBoundsControlReserve(t *testing
 	options.ReservedControlHandshakes = options.MaxHandshakes
 	if _, err = NewAuthenticatedReplicatedClient(options); !errors.Is(err, ErrReplicatedTLSProfile) {
 		t.Fatalf("handshake reserve bound = %v", err)
+	}
+	options.ReservedControlHandshakes = 1
+	options.ReservedControlWaiters = options.MaxWaiters
+	if _, err = NewAuthenticatedReplicatedClient(options); !errors.Is(err, ErrReplicatedTLSProfile) {
+		t.Fatalf("waiter reserve bound = %v", err)
+	}
+}
+
+func TestReplicatedCapabilityControlReserveClassification(t *testing.T) {
+	for _, capability := range []serviceauthz.Capability{
+		serviceauthz.CapabilitySchema,
+		serviceauthz.CapabilityMembership,
+		serviceauthz.CapabilityTopology,
+		serviceauthz.CapabilityTransactionRecovery,
+		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityTransactionRecovery,
+	} {
+		if !replicatedCapabilityUsesControlReserve(capability) {
+			t.Fatalf("capability %d did not use the control reserve", capability)
+		}
+	}
+	for _, capability := range []serviceauthz.Capability{
+		0, serviceauthz.CapabilityDataRead, serviceauthz.CapabilityDataWrite,
+		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite,
+	} {
+		if replicatedCapabilityUsesControlReserve(capability) {
+			t.Fatalf("data capability %d consumed the control reserve", capability)
+		}
 	}
 }
 
@@ -378,6 +407,75 @@ func TestAuthenticatedReplicatedClientControlWaitCancellationStats(t *testing.T)
 	client.release(data, true)
 	if stats := client.Stats(); stats.Waiters != 0 || stats.ControlWaiters != 0 || stats.DataWaiters != 0 {
 		t.Fatalf("canceled waiter remained: %+v", stats)
+	}
+}
+
+func TestAuthenticatedReplicatedClientReservesControlWaiter(t *testing.T) {
+	client, _ := testCapacityClient(t, 2, 1)
+	client.waiterReserve = 1
+	data, err := client.acquire(context.Background(), testCapacityEndpoint(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := client.acquireClass(context.Background(), testCapacityEndpoint(2), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dataWaitCtx, cancelDataWait := context.WithCancel(context.Background())
+	dataWait := make(chan error, 1)
+	go func() {
+		_, acquireErr := client.acquire(dataWaitCtx, testCapacityEndpoint(3))
+		dataWait <- acquireErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().DataWaiters != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := client.Stats(); stats.Waiters != 1 || stats.DataWaiters != 1 ||
+		stats.ReservedControlWaiters != 1 {
+		t.Fatalf("reserved waiter setup = %+v", stats)
+	}
+	rejectedCtx, cancelRejected := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelRejected()
+	if _, err = client.acquire(rejectedCtx, testCapacityEndpoint(4)); !errors.Is(err, ErrReplicatedTransportBound) {
+		t.Fatalf("data consumed reserved control waiter: %v", err)
+	}
+
+	type acquireResult struct {
+		connection *pooledReplicatedConn
+		err        error
+	}
+	recoveryWait := make(chan acquireResult, 1)
+	go func() {
+		connection, acquireErr := client.acquireClass(context.Background(), testCapacityEndpoint(5), true)
+		recoveryWait <- acquireResult{connection: connection, err: acquireErr}
+	}()
+	deadline = time.Now().Add(time.Second)
+	for client.Stats().ControlWaiters != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := client.Stats(); stats.Waiters != 2 || stats.DataWaiters != 1 || stats.ControlWaiters != 1 {
+		t.Fatalf("recovery waiter did not enter reserve: %+v", stats)
+	}
+
+	client.release(control, true)
+	select {
+	case result := <-recoveryWait:
+		if result.err != nil {
+			t.Fatalf("recovery waiter failed after capacity release: %v", result.err)
+		}
+		client.release(result.connection, true)
+	case <-time.After(time.Second):
+		t.Fatal("recovery waiter did not progress through reserved admission")
+	}
+	cancelDataWait()
+	if err := <-dataWait; !errors.Is(err, context.Canceled) {
+		t.Fatalf("data waiter cancellation = %v", err)
+	}
+	client.release(data, true)
+	if stats := client.Stats(); stats.Waiters != 0 || stats.ControlWaiters != 0 || stats.DataWaiters != 0 || stats.DataInUse != 0 {
+		t.Fatalf("settled stats = %+v", stats)
 	}
 }
 

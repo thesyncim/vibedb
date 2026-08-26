@@ -1377,6 +1377,9 @@ func (m *Machine) validateCompletionResult(completion replication.CompletionView
 		!isSessionResultCode(completion.ResultCode) {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
+	if _, err := OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult); err != nil {
+		return err
+	}
 	return nil
 }
 

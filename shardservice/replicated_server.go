@@ -183,6 +183,7 @@ const (
 	ReplicatedCompletionInvalidReadApplied
 	ReplicatedCompletionInvalidValue
 	ReplicatedCompletionInvalidStateBehind
+	ReplicatedCompletionInvalidResult
 )
 
 // NewReplicatedServer binds the native RF3 protocol to one serialized owner
@@ -753,6 +754,9 @@ func replicatedCompletionInvalidReasons(
 	if err != nil {
 		reasons |= ReplicatedCompletionInvalidEnvelope
 	} else {
+		if !validReplicatedCompletionResult(completion) {
+			reasons |= ReplicatedCompletionInvalidResult
+		}
 		if completion.AppliedSequence != response.Outcome.CompletionAppliedSequence {
 			reasons |= ReplicatedCompletionInvalidSequence
 		}

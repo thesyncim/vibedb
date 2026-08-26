@@ -108,6 +108,16 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	firstCompletion, err := replication.OpenCompletion(first.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRows, err := OpenMutationCompletionResult(
+		firstCompletion.ResultCode, firstCompletion.InlineResult,
+	)
+	if err != nil || firstRows != 1 {
+		t.Fatalf("pre-restart affected rows=%d err=%v", firstRows, err)
+	}
 
 	reopened, err := Open(
 		fixture.binding, bootstrap, fixture.system,
@@ -133,5 +143,15 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 	}
 	if second.AppliedSequence != first.AppliedSequence || string(second.Bytes) != string(first.Bytes) {
 		t.Fatalf("restart rewrote completion: before=%+v after=%+v", first, second)
+	}
+	secondCompletion, err := replication.OpenCompletion(second.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRows, err := OpenMutationCompletionResult(
+		secondCompletion.ResultCode, secondCompletion.InlineResult,
+	)
+	if err != nil || secondRows != firstRows {
+		t.Fatalf("restart affected rows=%d, want %d, err=%v", secondRows, firstRows, err)
 	}
 }

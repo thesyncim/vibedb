@@ -340,6 +340,107 @@ func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T)
 	}
 }
 
+func TestReplicatedProposalRecoveryCapabilityRequiresDataTransactionCommand(t *testing.T) {
+	fence := testReplicatedFence()
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 1}
+	mutation := testReplicatedCommand(t, fence)
+	transaction := testReplicatedTransactionCommandClass(
+		t, fence, replication.CommandAuthorityData,
+	)
+
+	accepted := []struct {
+		name       string
+		authority  serviceauthz.Authority
+		capability serviceauthz.Capability
+		command    []byte
+	}{
+		{name: "plaintext mutation", command: mutation},
+		{name: "data-write mutation", authority: authority,
+			capability: serviceauthz.CapabilityDataWrite, command: mutation},
+		{name: "plaintext transaction", command: transaction},
+		{name: "data-write transaction", authority: authority,
+			capability: serviceauthz.CapabilityDataWrite, command: transaction},
+		{name: "recovery transaction", authority: authority,
+			capability: serviceauthz.CapabilityTransactionRecovery, command: transaction},
+	}
+	for _, test := range accepted {
+		t.Run(test.name, func(t *testing.T) {
+			request := &ReplicatedRequest{
+				Operation: ReplicatedPropose, Authority: test.authority,
+				Capability: test.capability, Fence: fence, Command: test.command,
+			}
+			var encoded bytes.Buffer
+			if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			command, err := replication.OpenCommand(decoded.Command)
+			if err != nil || command.AuthorityClass != replication.CommandAuthorityData {
+				t.Fatalf("decoded command authority=%d err=%v",
+					command.AuthorityClass, err)
+			}
+			wantKind := replication.CommandMutationBatch
+			if bytes.Equal(test.command, transaction) {
+				wantKind = replication.CommandTransaction
+			}
+			if command.Kind() != wantKind {
+				t.Fatalf("decoded command kind=%d, want %d", command.Kind(), wantKind)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name       string
+		capability serviceauthz.Capability
+		command    []byte
+	}{
+		{name: "recovery ordinary mutation",
+			capability: serviceauthz.CapabilityTransactionRecovery, command: mutation},
+		{name: "recovery topology transaction",
+			capability: serviceauthz.CapabilityTransactionRecovery,
+			command: testReplicatedTransactionCommandClass(
+				t, fence, replication.CommandAuthorityTopology,
+			)},
+	}
+	for _, test := range rejected {
+		t.Run(test.name, func(t *testing.T) {
+			request := &ReplicatedRequest{
+				Operation: ReplicatedPropose, Authority: authority,
+				Capability: test.capability, Fence: fence, Command: test.command,
+			}
+			var encoded bytes.Buffer
+			if err := EncodeReplicatedRequest(&encoded, request); !errors.Is(err, ErrReplicatedWire) {
+				t.Fatalf("encode error=%v, want %v", err, ErrReplicatedWire)
+			}
+
+			// Produce a canonical proposal with its ordinary capability, then
+			// tamper only the fixed capability field. The decoder must inspect
+			// the authenticated command envelope instead of trusting the wire
+			// capability in isolation.
+			request.Capability = serviceauthz.CapabilityDataWrite
+			if command, err := replication.OpenCommand(request.Command); err != nil {
+				t.Fatal(err)
+			} else if command.AuthorityClass == replication.CommandAuthorityTopology {
+				request.Capability = serviceauthz.CapabilityTopology
+			}
+			encoded.Reset()
+			if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+				t.Fatalf("encode canonical base: %v", err)
+			}
+			frame := encoded.Bytes()
+			const capabilityOffset = 5 + 1 + 1 + 16 + 8
+			binary.BigEndian.PutUint64(frame[capabilityOffset:capabilityOffset+8],
+				uint64(serviceauthz.CapabilityTransactionRecovery))
+			if _, err := DecodeReplicatedRequest(bytes.NewReader(frame)); !errors.Is(err, ErrReplicatedWire) {
+				t.Fatalf("decode error=%v, want %v", err, ErrReplicatedWire)
+			}
+		})
+	}
+}
+
 func TestReplicatedPointReadWirePreservesFoundEmptyAndMiss(t *testing.T) {
 	fence := testReplicatedFence()
 	request := &ReplicatedRequest{
@@ -502,6 +603,67 @@ func TestReplicatedProposalResponseBoundCarriesTransactionCompletion(t *testing.
 	decoded, err := decodeReplicatedResponseLimit(bytes.NewReader(encoded.Bytes()), maximum)
 	if err != nil || !bytes.Equal(decoded.Completion, completion) {
 		t.Fatalf("bounded transaction completion = %dB, err=%v", len(decoded.Completion), err)
+	}
+}
+
+func TestReplicatedCompletionWireValidatesFixedResultGrammar(t *testing.T) {
+	fence := testReplicatedFence()
+	state := ReplicatedMemberState{
+		Fence: fence, LeaderID: fence.MemberID,
+		Commit: 9, Applied: 9, CheckpointApplied: 8,
+	}
+	responseFor := func(completion []byte) *ReplicatedResponse {
+		return &ReplicatedResponse{
+			Kind: ReplicatedCompletion, HasState: true, State: state,
+			RequestDigest: [32]byte{1}, Completion: completion,
+			Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
+				CompletionAppliedSequence: 9, CompletionBytes: len(completion),
+			},
+		}
+	}
+
+	valid := responseFor(testReplicatedCompletion(t, fence, 9))
+	if !validReplicatedResponse(valid) {
+		t.Fatal("canonical mutation result was rejected")
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if !validReplicatedResponse(valid) {
+			panic("canonical mutation result rejected")
+		}
+	}); allocations != 0 {
+		t.Fatalf("canonical completion validation allocations = %.1f, want 0", allocations)
+	}
+
+	invalid := [][]byte{
+		testReplicatedCompletionWithResult(
+			t, fence, 9, replicatedstate.ResultApplied,
+			replicatedstate.ResultFormatMutation, nil,
+		),
+		testReplicatedCompletionWithResult(
+			t, fence, 9, replicatedstate.ResultStaleFence,
+			replicatedstate.ResultFormatMutation, make([]byte, replicatedstate.MutationCompletionResultBytes),
+		),
+		testReplicatedCompletionWithResult(
+			t, fence, 9, replicatedstate.ResultApplied,
+			replicatedstate.ResultFormatTransaction, make([]byte, 24),
+		),
+		testReplicatedCompletionWithResult(
+			t, fence, 9, replicatedstate.ResultApplied, 77, nil,
+		),
+	}
+	for index, completion := range invalid {
+		response := responseFor(completion)
+		if validReplicatedResponse(response) {
+			t.Fatalf("invalid result %d was accepted", index)
+		}
+		if err := EncodeReplicatedResponse(io.Discard, response); !errors.Is(err, ErrReplicatedWire) {
+			t.Fatalf("encode invalid result %d: %v", index, err)
+		}
+		raw := encodeUncheckedReplicatedResponse(t, response)
+		if _, err := DecodeReplicatedResponse(bytes.NewReader(raw)); !errors.Is(err, ErrReplicatedWire) {
+			t.Fatalf("decode invalid result %d: %v", index, err)
+		}
 	}
 }
 
@@ -669,6 +831,58 @@ func testReplicatedTopologyCommand(t testing.TB, fence ReplicatedFence) []byte {
 		replication.CommandAuthorityTopology)
 }
 
+func testReplicatedTransactionCommandClass(
+	t testing.TB,
+	fence ReplicatedFence,
+	authorityClass replication.CommandAuthorityClass,
+) []byte {
+	t.Helper()
+	id := distributedtxn.ID{1}
+	control, err := distributedtxn.AppendReplicatedCommand(nil, distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedCommitCoordinator,
+		ID:        id, ExpectedRevision: 1,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence, err := replication.TransactionClientSequence(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := replication.Command{
+		Kind:                   replication.CommandTransaction,
+		AuthorityClass:         authorityClass,
+		ClusterID:              fence.Group.ClusterID,
+		ClusterIncarnation:     fence.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch:  fence.Group.TopologyRecoveryEpoch,
+		Distribution:           "orders",
+		Shard:                  "0000-ffff",
+		AllocationGeneration:   fence.AllocationGeneration,
+		ShardIncarnation:       fence.Group.ShardIncarnation,
+		GroupID:                fence.Group.GroupID,
+		ReplicaSetVersion:      1,
+		ActivePolicyGeneration: 1,
+		ProtectionEpoch:        1,
+		OwnershipEpoch:         1,
+		SchemaGeneration:       1,
+		RoutingVersion:         1,
+		RouteGeneration:        1,
+		Tenant:                 []byte("tenant"),
+		ClientID:               replication.ID128(id),
+		ClientEpoch:            1,
+		ClientSequence:         sequence,
+		Fingerprint:            sha256.Sum256([]byte("native-wire-transaction")),
+		Transaction:            control,
+	}
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
 func testReplicatedCommandClass(t testing.TB, fence ReplicatedFence, value []byte,
 	authorityClass replication.CommandAuthorityClass) []byte {
 	t.Helper()
@@ -702,7 +916,30 @@ func testReplicatedCompletion(
 	applied uint64,
 ) []byte {
 	t.Helper()
-	resultDigest := replication.CompletionResultDigest(1, 1, nil)
+	result, err := replicatedstate.AppendMutationCompletionResult(
+		nil, replicatedstate.ResultApplied, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testReplicatedCompletionWithResult(
+		t, fence, applied, replicatedstate.ResultApplied,
+		replicatedstate.ResultFormatMutation, result,
+	)
+}
+
+func testReplicatedCompletionWithResult(
+	t testing.TB,
+	fence ReplicatedFence,
+	applied uint64,
+	resultCode uint32,
+	resultFormat uint16,
+	result []byte,
+) []byte {
+	t.Helper()
+	resultDigest := replication.CompletionResultDigest(
+		resultCode, resultFormat, result,
+	)
 	encoded, err := replication.AppendCompletion(nil, replication.Completion{
 		ClusterID:             fence.Group.ClusterID,
 		ClusterIncarnation:    fence.Group.ClusterIncarnation,
@@ -714,11 +951,40 @@ func testReplicatedCompletion(
 		RoutingVersion: 1, RouteGeneration: 1, Tenant: []byte("tenant"),
 		ClientID: replication.ID128{1}, ClientEpoch: 2, ClientSequence: 1,
 		Fingerprint: sha256.Sum256([]byte("native-wire")), AppliedSequence: applied,
-		ResultCode: 1, ResultFormat: 1, Storage: replication.CompletionInline,
-		ResultDigest: resultDigest,
+		ResultCode:   resultCode,
+		ResultFormat: resultFormat,
+		Storage:      replication.CompletionInline, ResultLength: uint64(len(result)),
+		ResultDigest: resultDigest, InlineResult: result,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+func encodeUncheckedReplicatedResponse(t testing.TB, response *ReplicatedResponse) []byte {
+	t.Helper()
+	e := encbuf{b: make([]byte, 5, 5+replicatedResponseFixedBodyBytes+len(response.Completion))}
+	e.u8(replicatedWireVersion)
+	e.u8(uint8(response.Kind))
+	e.u8(uint8(response.Refusal))
+	e.u8(uint8(response.Outcome.Code))
+	if response.HasState {
+		e.u8(1)
+		encodeReplicatedMemberState(&e, response.State)
+	} else {
+		e.u8(0)
+	}
+	e.u64(response.Outcome.AppliedIndex)
+	e.u64(response.Outcome.CompletionAppliedSequence)
+	encodeReplicatedDigest(&e, response.RequestDigest)
+	e.bytes(response.Completion)
+	var encoded bytes.Buffer
+	if e.err != nil {
+		t.Fatal(e.err)
+	}
+	if err := writeEncodedFrame(&encoded, tagReplicatedResponse, e.b); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
 }

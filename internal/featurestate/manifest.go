@@ -85,7 +85,7 @@ var Distributed = []Feature{
 	},
 	{
 		Name: "Coherent multi-shard reads",
-		Primitive: Stage{StatusYes, "Bounded read-fence acquisition and release establish a scoped vector cut across selected shards.", []Reference{
+		Primitive: Stage{StatusYes, "Bounded read-fence acquisition and release establish a scoped vector cut across selected static shards. There is no common cross-group RF3 read snapshot.", []Reference{
 			ref("gateway/read_snapshot.go", "snapshotFanout"), ref("shardservice/read_fence.go", "readFenceSet"),
 		}},
 		Integrated: Stage{StatusYes, "The static gateway read path acquires fences before fanout and refuses partial results.", []Reference{
@@ -118,14 +118,14 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Fresh replicated operations atomically combine coordinator begin with its local prepare, remote stage with prepare, and participant apply or abort with release. Inline and greedily packed manifests remain byte-bounded without a participant-count contract.", []Reference{
 			ref("internal/distributedtxn/replicated_codec.go", "ReplicatedOperation"), ref("internal/replicatedstate/transaction_apply.go", "planCoordinatorBeginPrepare"),
 		}},
-		Integrated: Stage{StatusYes, "The public RF3 gateway orchestrator now drives fused commands across independently led groups through the leader-aware executor, retains exact outcome-unknown bytes, and recovers from replicated ReadIndex witnesses without consulting the legacy journal.", []Reference{
-			ref("gateway/replicated_transaction.go", "NewReplicatedTransactionOrchestrator"), ref("gateway/replicated_transaction_recover.go", "Recover"),
+		Integrated: Stage{StatusYes, "The public RF3 gateway orchestrator drives fused commands through the leader-aware executor, retains exact outcome-unknown bytes, and recovers from replicated ReadIndex witnesses without consulting the static shard transaction journal. Request replay runs before catalog pinning and reuses the first execution's generation and shard metadata instead of replanning against changed topology.", []Reference{
+			ref("gateway/replicated_transaction.go", "NewReplicatedTransactionOrchestrator"), ref("gateway/replicated_transaction_recover.go", "Recover"), ref("gateway/replicated_request_registry.go", "Replay"),
 		}},
-		Shipped: Stage{StatusNo, "No shipped SQL, native-client, or CLI command constructs the RF3 transaction orchestrator. The shipped gateway still uses the static transaction authority; serve-rf3 supplies prepared groups and recovery reads but does not expose multi-shard transaction execution.", []Reference{
-			ref("gateway/transaction.go", "executeTransaction"), ref("gateway/recovery.go", "RecoverAll"),
+		Shipped: Stage{StatusYes, "vibedb-gateway lowers one exec_batch over one or more RF3 groups into strict whole-document INSERT, exact-primary-key whole-document UPDATE, and exact-primary-key DELETE relation mutations. Same-group multi-statement and multi-relation batches remain atomic. The registry key is stable authenticated node scope plus caller request ID, excluding policy generation; its digest covers exact ordered SQL, class, and typed parameter bytes without routes or catalog generation. Typed responses return transaction identity, committed, and outcome-unknown fields.", []Reference{
+			ref("gateway/transaction.go", "ExecBatchRequest"), ref("cmd/vibedb-gateway/serve.go", "execRequest"),
 		}},
-		Qualification: Stage{StatusPartial, "State-machine and schedule gates cover atomic transitions, reclamation, exact retries, and a 2P+1 decision/apply proposal schedule without a participant-count contract. The normal success path adds one retirement proposal and trusts the P route-fenced applied completions instead of issuing a redundant P-wide ReadIndex wave; recovery and ambiguous cleanup still prove terminal state with leader ReadIndex. A real two-group RF3 gate drives the public orchestrator across different leaders and proves hidden-commit recovery after source isolation, byte-identical retry, replica convergence, correct group routing, and former-leader refusal. Shipped-command, external-process, exhaustive crash-cut, and sustained performance gates remain absent.", []Reference{
-			ref("internal/replication/transaction_perf_contract_test.go", "TestReplicatedTransactionEncodedSchedulePerformanceTargets"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolation"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwoGroups"),
+		Qualification: Stage{StatusPartial, "State-machine and schedule gates cover atomic transitions, reclamation, exact retries, and a 2P+1 decision/apply proposal schedule without a participant-count contract. The normal success path adds one retirement proposal and trusts the P route-fenced applied completions instead of issuing a redundant P-wide ReadIndex wave; recovery and ambiguous cleanup still prove terminal state with leader ReadIndex. One real RF3 gate drives the shipped executor across two independently led groups and a same-group multi-statement batch. It proves SQL lowering, hidden-commit recovery after source isolation, terminal retry caching, replica convergence, correct group routing, former-leader refusal, and single-participant atomic execution. Registry tests prove that unproved pre-admission failures are shared with current waiters and then removed rather than retained terminally. Command-envelope tests prove the typed response. External-process, exhaustive crash-cut, and sustained performance gates remain absent.", []Reference{
+			ref("internal/replication/transaction_perf_contract_test.go", "TestReplicatedTransactionEncodedSchedulePerformanceTargets"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups"), ref("gateway/replicated_request_registry_test.go", "TestReplicatedTransactionRequestRegistryDoesNotCacheUnprovedPreAdmissionError"), ref("cmd/vibedb-gateway/transaction_response_test.go", "TestWriteServeResponseCarriesTypedRF3TransactionOutcome"),
 		}},
 	},
 	{
@@ -136,11 +136,11 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The dedicated transaction-recovery capability, leader-only ReadIndex path, native shard protocol, and leader-aware gateway executor share exact byte, row, applied-index, and serving-fence bounds. The RF3 transaction orchestrator consumes those reads for coordinator, manifest, participant, and terminal proofs.", []Reference{
 			ref("gateway/replicated_transaction_recovery.go", "ReadTransactionRecovery"), ref("gateway/replicated_transaction_recover.go", "Recover"),
 		}},
-		Shipped: Stage{StatusPartial, "vibedb-shard serve-rf3 installs and serves the authenticated recovery reader. The shipped gateway command does not construct the RF3 transaction orchestrator or redirect its periodic static recovery controller.", []Reference{
-			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("gateway/recovery.go", "RecoverAll"),
+		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 installs the authenticated recovery reader. vibedb-gateway constructs the RF3 orchestrator plus a bounded same-process request registry and redrives retained outcome-unknown handles every five seconds. Executing, pending, and terminal retries replay before catalog pinning under stable authenticated-node scope, so catalog generation, split, or move does not replan an admitted request. The command performs no automatic terminal expiry, exposes no client ACK or expiry, and never calls the registry's scoped Forget API: 65,536 retained entries backpressure new RF3 writes. An embedding may call Forget only after it has an application-level acknowledgement that the terminal result no longer needs retry protection. A durable replicated ledger or safe explicit client ACK is required before shipped reclamation.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/serve.go", "startGatewayRecovery"),
 		}},
-		Qualification: Stage{StatusPartial, "Real RF3 tests prove leader-only recovery, replacement-leader continuity, and isolated-former-leader refusal. A two-group gate additionally proves the public orchestrator recovering a hidden committed result through exact retry and recovery reads on both groups. External process restarts, abort recovery, and the shipped periodic controller remain unqualified.", []Reference{
-			ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwoGroups"),
+		Qualification: Stage{StatusPartial, "Real RF3 tests prove leader-only recovery, replacement-leader continuity, isolated-former-leader refusal, and the shipped executor recovering a hidden committed result across two groups. Registry tests prove bounded capacity, duplicate coalescing, exact-handle ownership, terminal retention, and no lock held across I/O. Gateway-process restart, abort recovery, and the shipped periodic sweep remain unqualified.", []Reference{
+			ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement"), ref("internal/raftservice/owner_rf3_multigroup_transaction_test.go", "TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups"), ref("gateway/replicated_request_registry_test.go", "TestReplicatedTransactionRequestRegistryRetainsUnknownAndRetryRecovers"),
 		}},
 	},
 	{
@@ -148,7 +148,7 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Catalog metadata, independent index placement, exact lookup, lifecycle fencing, and write expansion exist.", []Reference{
 			ref("gateway/index_metadata.go", "IndexMetadata"), ref("gateway/global_index.go", "GlobalIndexProgram"),
 		}},
-		Integrated: Stage{StatusYes, "Planning can select a global index and writes add index participants without forcing the base row onto that shard.", []Reference{
+		Integrated: Stage{StatusYes, "Static planning can select a global index and static writes add index participants without forcing the base row onto that shard. RF3 exec_batch lowering does not yet emit global-index relation mutations.", []Reference{
 			ref("gateway/global_index_test.go", "TestGlobalIndexRoutesIndexAndBaseIndependently"), ref("gateway/writer.go", "prepareGlobalIndexWrites"),
 		}},
 		Shipped: Stage{StatusYes, "The static gateway consumes ready global-index metadata from its catalog and the shard service exposes raw exact lookup.", []Reference{
@@ -166,11 +166,11 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The replicated state machine validates the relation manifest and commits all relation targets with its system state.", []Reference{
 			ref("internal/replicatedstate/machine.go", "Machine"), ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleAtomicBaseLocalAndGlobalIndexApply"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 opens an externally prepared exact replicated SQL/apply bundle and serves its portable relation contract.", []Reference{
-			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
+		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 opens an externally prepared exact replicated SQL/apply bundle. vibedb-gateway can lower exact-key mutations for multiple RF3 base-table relations into the same participant without table or SQL strings entering Raft.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("gateway/replicated_sql_transaction.go", "planReplicatedSQLTransaction"),
 		}},
-		Qualification: Stage{StatusPartial, "Deterministic apply, replay, malformed-command, and failure-atomic tests exist. No shipped RF3 relation-index fault gate exists.", []Reference{
-			ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleCheckpointCrashPhasesNeverRecoverSkew"), ref("internal/replicatedstate/validation_test.go", "TestValidatedMutationRejectsMalformedJSONBeforeCustomValidator"),
+		Qualification: Stage{StatusPartial, "Deterministic apply, replay, malformed-command, failure-atomic, and multi-table SQL lowering tests exist. No shipped RF3 global-index mutation fault gate exists.", []Reference{
+			ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleCheckpointCrashPhasesNeverRecoverSkew"), ref("gateway/replicated_sql_transaction_test.go", "TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelation"),
 		}},
 	},
 	{
@@ -196,7 +196,7 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "Replicated table profiles bind a public table and one scalar string/number ordered placement key to exact routes. The gateway follows leaders, refreshes a definitely stale catalog route once, and can select a sufficiently applied follower for the explicit follower contract. Composite and tenant-path placement keys remain absent.", []Reference{
 			ref("gateway/replicated_data_read.go", "ReplicatedDataReader"), ref("gateway/replicated_table.go", "ResolveReplicatedTableKey"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-gateway serves canonical point get requests through the authenticated RF3 native pool when it consumes the replicated catalog. Linearizable reads use ReadIndex. Monotonic follower reads require the exact RouteID and applied index. SQL has no RF3 fallback.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb-gateway serves canonical point get requests through the authenticated RF3 native pool when it consumes the replicated catalog. Linearizable reads use ReadIndex. Monotonic follower reads require the exact RouteID and applied index. SQL reads have no RF3 fallback.", []Reference{
 			ref("cmd/vibedb-gateway/serve.go", "handleConnPolicy"), ref("gateway/replicated_data_read.go", "Read"),
 		}},
 		Qualification: Stage{StatusPartial, "Command-boundary tests cover canonical decoding, typed results, authorization, no SQL fallback, coalesced catalog refresh, follower selection, route mismatch, serving fences, duplicate-release-safe aggregate response reservations, direct zero-allocation response streaming, and blocked-client write timeout. There is no external public-gateway partition or staleness-latency gate.", []Reference{
@@ -255,7 +255,7 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusPartial, "vibedb-gateway consumes the replicated catalog and refuses arbitrary catalog placement coordinates, while serve-rf3 can open an externally prepared fixed catalog group. No command bootstraps that group, and distributed DDL remains refused.", []Reference{
 			ref("cmd/vibedb-gateway/serve.go", "newReplicatedCatalogGateway"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Rolling schema compatibility and DDL rollback gates are absent.", []Reference{
+		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Mixed-schema rollout and DDL rollback gates are absent.", []Reference{
 			ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
 		}},
 	},

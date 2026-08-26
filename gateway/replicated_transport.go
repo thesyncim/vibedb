@@ -41,18 +41,23 @@ type AuthenticatedReplicatedClientOptions struct {
 	// callers should set the smaller admission budget they intend to own.
 	MaxHandshakes int
 	// ReservedControlConnections keeps this many checkout slots available to
-	// schema, membership, and topology traffic. Zero selects one when the pool
-	// has more than one connection. The reservation limits active data
-	// checkouts, not physical stream reuse, so an idle stream remains reusable
-	// by every capability.
+	// schema, membership, topology, and transaction-recovery traffic. Zero
+	// selects one when the pool has more than one connection. The reservation
+	// limits active data checkouts, not physical stream reuse, so an idle stream
+	// remains reusable by every capability.
 	ReservedControlConnections int
 	// ReservedControlHandshakes similarly prevents data dial/TLS work from
 	// consuming every handshake slot. Zero selects one when MaxHandshakes is
 	// greater than one.
 	ReservedControlHandshakes int
-	MaxWaiters                int
-	MaxIdleAge                time.Duration
-	MaxLifetime               time.Duration
+	// ReservedControlWaiters prevents data requests from occupying every bounded
+	// waiter slot while a transaction-recovery or topology operation is waiting
+	// for its reserved connection. Zero selects one when MaxWaiters is greater
+	// than one.
+	ReservedControlWaiters int
+	MaxWaiters             int
+	MaxIdleAge             time.Duration
+	MaxLifetime            time.Duration
 }
 
 type pooledReplicatedConn struct {
@@ -109,6 +114,7 @@ type AuthenticatedReplicatedClient struct {
 	dataInUse          int
 	controlReserve     int
 	handshakeReserve   int
+	waiterReserve      int
 	perEndpoint        map[replicatedTransportEndpoint]int
 	idle               map[replicatedTransportEndpoint]replicatedIdleEndpoint
 	idleOldest         *pooledReplicatedConn
@@ -133,6 +139,7 @@ type AuthenticatedReplicatedClientStats struct {
 	ControlWaiters, DataWaiters, DataInUse    int
 	ReservedControlConnections                int
 	ReservedControlHandshakes                 int
+	ReservedControlWaiters                    int
 	Handshakes, PeakHandshakes, MaxHandshakes int
 	Generation                                uint64
 }
@@ -150,6 +157,10 @@ func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptio
 	if handshakeReserve == 0 && maxHandshakes > 1 {
 		handshakeReserve = 1
 	}
+	waiterReserve := options.ReservedControlWaiters
+	if waiterReserve == 0 && options.MaxWaiters > 1 {
+		waiterReserve = 1
+	}
 	if options.TLS == nil || options.TLS.LocalIdentity().Node == (rafttransport.NodeID{}) ||
 		options.Dial == nil || options.HandshakeDeadline == nil ||
 		options.MaxConnections <= 0 || options.MaxConnections > AbsoluteMaxReplicatedPoolConnections ||
@@ -159,6 +170,8 @@ func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptio
 		maxHandshakes > AbsoluteMaxReplicatedHandshakes ||
 		options.ReservedControlConnections < 0 || controlReserve >= options.MaxConnections ||
 		options.ReservedControlHandshakes < 0 || handshakeReserve >= maxHandshakes ||
+		options.ReservedControlWaiters < 0 ||
+		(options.MaxWaiters != 0 && waiterReserve >= options.MaxWaiters) ||
 		options.MaxWaiters < 0 || options.MaxWaiters > AbsoluteMaxReplicatedPoolWaiters ||
 		options.MaxIdleAge <= 0 || options.MaxIdleAge > AbsoluteMaxReplicatedConnectionAge ||
 		options.MaxLifetime <= 0 || options.MaxLifetime > AbsoluteMaxReplicatedConnectionAge ||
@@ -171,8 +184,9 @@ func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptio
 		maxConnections: options.MaxConnections, maxPerEndpoint: options.MaxPerEndpoint,
 		maxIdlePerEndpoint: options.MaxIdlePerEndpoint, maxHandshakes: maxHandshakes,
 		controlReserve: controlReserve, handshakeReserve: handshakeReserve,
-		maxWaiters: options.MaxWaiters,
-		maxIdleAge: options.MaxIdleAge, maxLifetime: options.MaxLifetime, generation: 1,
+		waiterReserve: waiterReserve,
+		maxWaiters:    options.MaxWaiters,
+		maxIdleAge:    options.MaxIdleAge, maxLifetime: options.MaxLifetime, generation: 1,
 		perEndpoint: make(map[replicatedTransportEndpoint]int),
 		idle:        make(map[replicatedTransportEndpoint]replicatedIdleEndpoint), wake: make(chan struct{}),
 		active: make(map[*pooledReplicatedConn]struct{}),
@@ -405,7 +419,8 @@ func (client *AuthenticatedReplicatedClient) acquireClass(
 			client.dials.Add(1)
 			return connection, nil
 		}
-		if client.waiters >= client.maxWaiters {
+		if client.waiters >= client.maxWaiters ||
+			!control && client.dataWaiters >= client.maxWaiters-client.waiterReserve {
 			client.rejected.Add(1)
 			client.mu.Unlock()
 			return nil, ErrReplicatedTransportBound
@@ -474,7 +489,7 @@ func (client *AuthenticatedReplicatedClient) release(connection *pooledReplicate
 }
 
 func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
-	control := request != nil && request.Capability&(serviceauthz.CapabilitySchema|serviceauthz.CapabilityMembership|serviceauthz.CapabilityTopology) != 0
+	control := request != nil && replicatedCapabilityUsesControlReserve(request.Capability)
 	connection, err := client.acquireClass(ctx, endpoint, control)
 	if err != nil {
 		return nil, err
@@ -489,6 +504,11 @@ func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, e
 		return nil, ErrReplicatedRoute
 	}
 	return response, err
+}
+
+func replicatedCapabilityUsesControlReserve(capability serviceauthz.Capability) bool {
+	return capability&(serviceauthz.CapabilitySchema|serviceauthz.CapabilityMembership|
+		serviceauthz.CapabilityTopology|serviceauthz.CapabilityTransactionRecovery) != 0
 }
 
 // RotateTLS atomically publishes a new profile and drains every idle stream.
@@ -554,6 +574,7 @@ func (client *AuthenticatedReplicatedClient) Stats() AuthenticatedReplicatedClie
 		ControlWaiters: client.controlWaiters, DataWaiters: client.dataWaiters,
 		DataInUse: client.dataInUse, ReservedControlConnections: client.controlReserve,
 		ReservedControlHandshakes: client.handshakeReserve,
+		ReservedControlWaiters:    client.waiterReserve,
 		PeakHandshakes:            client.peakHandshakes, MaxHandshakes: client.maxHandshakes,
 		Generation: client.generation}
 	client.mu.Unlock()

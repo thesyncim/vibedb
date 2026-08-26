@@ -3,9 +3,10 @@
 VibeDB has a runnable static-shard command layer and a fixed-RF3 serving
 composition. `vibedb-shard serve-rf3` constructs the latter for externally
 prepared exact member artifacts. The public gateway connects canonical point
-`get` requests to the native RF3 endpoint when its catalog authority is RF3.
-The gateway does not route SQL, writes, scatter reads, or multi-table reads to
-that endpoint. No command initializes or changes the RF3 topology.
+`get` requests and strict exact-key `exec_batch` mutations to the native RF3
+endpoint when its catalog authority is RF3. General SQL, scatter reads, and
+multi-table reads remain on the static path. No command initializes or changes
+the RF3 topology.
 
 ## Runnable static layer
 
@@ -44,12 +45,16 @@ The gateway has three execution lanes:
 The last lane uses loopback exchange by default. Cross-host exchange needs an
 injected trusted dialer. The shipped gateway CLI does not supply one.
 
-The canonical RF3 point-read lane is separate from these SQL lanes. It accepts
-one table and one canonical ordered scalar string/number primary-placement
-key. The replicated table profile binds that pair to an exact dense relation,
-schema generation, relation-manifest digest, and three-replica route.
-Composite placement tuples and tenant-path placement are not implemented on
-this public lane.
+The canonical RF3 data lane is separate from these SQL lanes. Point reads
+accept one table and one canonical ordered scalar string/number
+primary-placement key. Strict `exec_batch` writes lower whole-document insert,
+exact-primary-key whole-document update, and exact-primary-key delete into one
+or more relation-aware RF3 transaction participants. Same-group mutations use
+one atomic multi-relation apply; multiple groups use the replicated
+transaction protocol. The replicated table profile binds each table to an
+exact dense relation, schema generation, relation-manifest digest, and
+three-replica route. Composite placement tuples and tenant-path placement are
+not implemented on this public lane.
 
 A linearizable read follows the current leader and completes a Raft
 `ReadIndex`. An `at_least_applied` read supplies the exact `RouteID` and applied
@@ -57,7 +62,8 @@ index returned by an earlier operation. The gateway rejects a route mismatch
 before I/O and can select a follower that has reached the requested index.
 Successful reads return the exact route lineage and applied index.
 
-One bounded authenticated native pool is shared by catalog and data reads. Its
+One bounded authenticated native pool is shared by catalog, point-read,
+proposal, and transaction-recovery traffic. Its
 physical key is the authenticated node and address, so unrelated shard fences
 do not fragment connections. Global oldest-idle eviction admits endpoint churn
 without exceeding the pool, and reserved connection/handshake slots keep
@@ -76,9 +82,11 @@ definite serving fence coalesces one authenticated catalog refresh and one
 re-resolved retry; an ambiguous transport outcome never enters that replay
 path.
 
-The point-read lane never falls back to the static SQL service. Public RF3
-writes, scatter reads, multi-table reads, and a common distributed read
-timestamp are not implemented.
+The point-read lane never falls back to the static SQL service. The strict RF3
+mutation classifier fails closed to the static path when a statement is not in
+its supported exact-key vocabulary. RF3 scatter reads, multi-table reads,
+global-index mutation lowering, and a common distributed read timestamp are
+not implemented.
 
 The merge layer supports global limits, ordered results, aggregates, and
 grouped partial aggregates. It cancels remaining calls after a hard error or a
@@ -320,14 +328,14 @@ from the projected suffix until the exact final cut is proved. The
 per-generation build lease and deterministic stage name bound crash debris to
 one reclaimable image instead of an unbounded set of randomized WAL files.
 
-This WAL-generation lane is consumed by the RF3 serving composition, whose
-bounded authenticated peer runtime, Multi-Raft Host, replicated shard service,
-settlement path, and leader-aware native gateway executor serve real in-process
-and multi-process test traffic. `vibedb-shard serve-rf3` opens an already
-prepared fixed three-voter member and constructs its peer and native serving
-side. It does not create a WAL generation, provision a group, or make the
-ordinary public gateway use the native path except for canonical point reads,
-so it is not turnkey HA orchestration.
+The WAL-generation lane is integrated with Raft-member and SQL-apply
+internals, but the RF3 serving command does not drive it. The bounded
+authenticated peer runtime, Multi-Raft Host, replicated shard service,
+settlement path, and leader-aware native gateway executor serve real
+in-process and multi-process test traffic. `vibedb-shard serve-rf3` opens an
+already prepared fixed three-voter member and constructs its peer and native
+serving side. It does not build, select, or activate a WAL generation, provision
+a group, or orchestrate topology.
 Transition capture is deliberately rejected while a
 `CheckpointGroup` owns the apply state; online range split must use the later
 publish-before-prune serving integration rather than adding another ordinary
@@ -577,11 +585,12 @@ The composition has a bounded authenticated peer service, replicated shard
 service, leader-aware native gateway executor, request identities, and a
 separate authenticated snapshot-artifact service. `serve-rf3` constructs the
 peer and replicated shard services from one fixed manifest. The public gateway
-uses the executor for catalog-bound point reads through a shared authenticated
-pool and an exact leader-hint cache. It does not expose public RF3 writes or
-multi-relation query execution. `serve-rf3` does not construct the snapshot
-service and does not provide certificate enrollment, dynamic address
-discovery, member changes, or empty-learner snapshot activation.
+uses the executor for catalog-bound point reads, exact-key mutation proposals,
+and transaction recovery through a shared authenticated pool and an exact
+leader-hint cache. It does not expose RF3 scatter/multi-table query execution or
+RF3 global-index mutation lowering. `serve-rf3` does not construct the snapshot
+service and does not provide certificate enrollment, dynamic address discovery,
+member changes, or empty-learner snapshot activation.
 
 Do not describe this kernel as a turnkey replicated deployment.
 

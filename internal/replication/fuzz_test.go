@@ -26,6 +26,12 @@ func FuzzOpenCommand(f *testing.F) {
 	f.Add(encodeCommand(f, renew))
 	f.Add(encodeCommand(f, revoke))
 	f.Add(encodeCommand(f, ordered))
+	conditionalWrites := testCommand()
+	conditionalWrites.Batches[0].Mutations = []Mutation{
+		{Kind: MutationPutAbsent, Key: []byte("insert"), Value: []byte("new")},
+		{Kind: MutationPutPresent, Key: []byte("update"), Value: []byte("replacement")},
+	}
+	f.Add(encodeCommand(f, conditionalWrites))
 	multi := testCommand()
 	multi.Batches = []RelationMutationBatch{
 		{Relation: 1, Mutations: []Mutation{{Kind: MutationDelete, Key: []byte("a")}}},
@@ -230,7 +236,7 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 				t.Fatal("accepted invalid or unclamped mutation")
 			}
 			switch mutation.Kind {
-			case MutationPut, MutationPutAbsentOrEqual:
+			case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent:
 				if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 					t.Fatal("accepted invalid put")
 				}
@@ -244,6 +250,14 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 					mutation.ExpectedValueLength > MaxMutationValueBytes ||
 					mutation.ExpectedValueDigest == (Digest{}) {
 					t.Fatal("accepted invalid compare delete")
+				}
+			case MutationPutDigestEqual:
+				if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes ||
+					len(mutation.Compare) != MutationDigestCompareBytes ||
+					mutation.ExpectedValueLength == 0 ||
+					mutation.ExpectedValueLength > MaxMutationValueBytes ||
+					mutation.ExpectedValueDigest == (Digest{}) {
+					t.Fatal("accepted invalid compare put")
 				}
 			default:
 				t.Fatal("accepted unknown mutation kind")

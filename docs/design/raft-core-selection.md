@@ -6,8 +6,8 @@ validation, SQL apply, and resource admission around that dependency.
 
 Internal packages compose this code into the RF3 serving path.
 `vibedb-shard serve-rf3` constructs that composition for one externally
-prepared stable three-voter group. The gateway command still uses the static
-SQL shard path for ordinary public traffic.
+prepared stable three-voter group. General SQL remains on the static shard
+path; canonical `get` and supported exact-key `exec_batch` requests use RF3.
 
 ## Configuration controls
 

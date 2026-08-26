@@ -966,7 +966,7 @@ func validateMutation(mutation Mutation) error {
 	zeroExpected := mutation.ExpectedValueLength == 0 &&
 		mutation.ExpectedValueDigest == (Digest{})
 	switch mutation.Kind {
-	case MutationPut, MutationPutAbsentOrEqual:
+	case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent:
 		if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 			return semantic("put value length")
 		}
@@ -1309,7 +1309,7 @@ func validateMutationBytes(src []byte, count uint32) error {
 		end := cursor + int(payload)
 		value := src[cursor+keyLen : end]
 		switch kind {
-		case MutationPut, MutationPutAbsentOrEqual:
+		case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent:
 			if len(value) == 0 || len(value) > MaxMutationValueBytes {
 				return semantic("put value length")
 			}

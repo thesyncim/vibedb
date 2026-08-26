@@ -2,7 +2,7 @@
 
 ## Supported revisions
 
-This repository has no tagged release and no support window. Security fixes
+This development repository has no published support window. Security fixes
 land on `main`. Consumers must move to a fixing commit after they review and
 test it for their deployment.
 

@@ -736,7 +736,7 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 		}
 		command, err := replication.OpenCommand(request.Command)
 		return err == nil && replicatedCommandCapabilityMatches(
-			request.Capability, command.AuthorityClass,
+			request.Capability, command.Kind(), command.AuthorityClass,
 		) && command.ClusterID == request.Fence.Group.ClusterID &&
 			command.ClusterIncarnation == request.Fence.Group.ClusterIncarnation &&
 			command.TopologyRecoveryEpoch == request.Fence.Group.TopologyRecoveryEpoch &&
@@ -779,9 +779,14 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 }
 
 func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
+	kind replication.CommandKind,
 	class replication.CommandAuthorityClass) bool {
 	if capability == serviceauthz.CapabilityTopology {
 		return class == replication.CommandAuthorityTopology
+	}
+	if capability == serviceauthz.CapabilityTransactionRecovery {
+		return kind == replication.CommandTransaction &&
+			class == replication.CommandAuthorityData
 	}
 	return (capability == 0 || capability == serviceauthz.CapabilityDataWrite) &&
 		class == replication.CommandAuthorityData
@@ -797,7 +802,8 @@ func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
 
 func validReplicatedProposalCapability(capability serviceauthz.Capability) bool {
 	return capability == 0 || capability == serviceauthz.CapabilityDataWrite ||
-		capability == serviceauthz.CapabilityTopology
+		capability == serviceauthz.CapabilityTopology ||
+		capability == serviceauthz.CapabilityTransactionRecovery
 }
 
 func validReplicatedReadCapability(capability serviceauthz.Capability) bool {
@@ -831,7 +837,8 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedCompletion:
 		completion, err := replication.OpenCompletion(response.Completion)
-		return err == nil && completion.AppliedSequence == response.Outcome.CompletionAppliedSequence &&
+		return err == nil && validReplicatedCompletionResult(completion) &&
+			completion.AppliedSequence == response.Outcome.CompletionAppliedSequence &&
 			completion.ClusterID == response.State.Fence.Group.ClusterID &&
 			completion.ClusterIncarnation == response.State.Fence.Group.ClusterIncarnation &&
 			completion.TopologyRecoveryEpoch == response.State.Fence.Group.TopologyRecoveryEpoch &&
@@ -894,6 +901,33 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			validReplicatedTransactionReadValue(response.Value)
+	default:
+		return false
+	}
+}
+
+// validReplicatedCompletionResult closes the wire result grammar over the two
+// shipped state-machine formats. The generic completion envelope authenticates
+// arbitrary result metadata, so opening it alone is insufficient: accepting a
+// malformed fixed result here would turn a committed invariant failure into a
+// peer-visible success and defer detection to a downstream consumer. Both
+// decoders borrow the inline result and allocate nothing on the valid path.
+func validReplicatedCompletionResult(completion replication.CompletionView) bool {
+	if completion.Storage != replication.CompletionInline ||
+		completion.ResultLength != uint64(len(completion.InlineResult)) {
+		return false
+	}
+	switch completion.ResultFormat {
+	case replicatedstate.ResultFormatMutation:
+		_, err := replicatedstate.OpenMutationCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		return err == nil
+	case replicatedstate.ResultFormatTransaction:
+		_, err := replicatedstate.OpenTransactionCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		return err == nil
 	default:
 		return false
 	}

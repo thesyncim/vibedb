@@ -575,6 +575,65 @@ func TestNativeCompletionResultCodeIsBoundToCommandKind(t *testing.T) {
 	}
 }
 
+func TestNativeMutationCompletionBindsCanonicalAffectedRows(t *testing.T) {
+	_, encoded, _ := testReplicatedRouteCommand(t)
+	command, err := replication.OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, affectedRows := range []int64{0, 1, replicatedstate.MaxDistinctMutations} {
+		completionBytes, appendErr := appendNativeMutationCompletion(
+			nil, command, command.ClientEpoch, command.ClientEpoch+1,
+			replicatedstate.ResultApplied, affectedRows,
+		)
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+		completion, openErr := replication.OpenCompletion(completionBytes)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		if !nativeCompletionMatches(command, completion) {
+			t.Fatalf("applied affected rows %d did not match", affectedRows)
+		}
+		if allocations := testing.AllocsPerRun(1000, func() {
+			if !nativeCompletionMatches(command, completion) {
+				panic("native mutation completion mismatch")
+			}
+		}); allocations != 0 {
+			t.Fatalf("affected rows %d validation allocations=%v, want 0",
+				affectedRows, allocations)
+		}
+
+		missing := completion
+		missing.ResultLength, missing.InlineResult = 0, nil
+		if nativeCompletionMatches(command, missing) {
+			t.Fatal("applied completion without its fixed result matched")
+		}
+		refusalWithResult := completion
+		refusalWithResult.ResultCode = replicatedstate.ResultIndexConflict
+		if nativeCompletionMatches(command, refusalWithResult) {
+			t.Fatal("refusal carrying affected-row bytes matched")
+		}
+	}
+
+	refusalBytes, err := appendNativeMutationCompletion(
+		nil, command, command.ClientEpoch, command.ClientEpoch+1,
+		replicatedstate.ResultIndexConflict, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusal, err := replication.OpenCompletion(refusalBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nativeCompletionMatches(command, refusal) || refusal.ResultLength != 0 ||
+		len(refusal.InlineResult) != 0 {
+		t.Fatalf("canonical refusal did not match: %+v", refusal)
+	}
+}
+
 func TestNativeTransactionCompletionBindsValidatedRoleOperationAndFixedResult(t *testing.T) {
 	route, _, _ := testReplicatedRouteCommand(t)
 	id := distributedtxn.ID{0x71}
@@ -702,8 +761,31 @@ func appendNativeSessionCompletion(
 	clientEpoch, appliedSequence uint64,
 	resultCode uint32,
 ) ([]byte, error) {
+	affectedRows := int64(0)
+	if resultCode == replicatedstate.ResultApplied {
+		affectedRows = 1
+	}
+	return appendNativeMutationCompletion(
+		dst, command, clientEpoch, appliedSequence, resultCode, affectedRows,
+	)
+}
+
+func appendNativeMutationCompletion(
+	dst []byte,
+	command replication.CommandView,
+	clientEpoch, appliedSequence uint64,
+	resultCode uint32,
+	affectedRows int64,
+) ([]byte, error) {
+	var result [replicatedstate.MutationCompletionResultBytes]byte
+	resultBytes, err := replicatedstate.AppendMutationCompletionResult(
+		result[:0], resultCode, affectedRows,
+	)
+	if err != nil {
+		return dst, err
+	}
 	digest := replication.CompletionResultDigest(
-		resultCode, replicatedstate.ResultFormatMutation, nil,
+		resultCode, replicatedstate.ResultFormatMutation, resultBytes,
 	)
 	return replication.AppendCompletionBytes(dst, replication.CompletionBytes{
 		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
@@ -719,6 +801,7 @@ func appendNativeSessionCompletion(
 		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
 		RetryHome: command.RetryHome, AppliedSequence: appliedSequence,
 		ResultCode: resultCode, ResultFormat: replicatedstate.ResultFormatMutation,
-		Storage: replication.CompletionInline, ResultDigest: digest,
+		Storage: replication.CompletionInline, ResultLength: uint64(len(resultBytes)),
+		ResultDigest: digest, InlineResult: resultBytes,
 	})
 }

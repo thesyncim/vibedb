@@ -22,6 +22,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -91,7 +92,14 @@ type ReplicatedTransactionOrchestratorOptions struct {
 	MaxMutations     uint64
 	MaxMutationBytes uint64
 	RecoveryTimeout  time.Duration
-	IDSource         io.Reader
+	// RecoveryAuthority is the gateway service identity used only while
+	// recovering an already admitted transaction. It prevents a client retry
+	// from forwarding the client's narrower data authority to hidden
+	// transaction-control reads. A zero value is accepted only for an
+	// unauthenticated in-process embedding; Recover fails closed if its caller
+	// carries an authority and no distinct recovery identity is configured.
+	RecoveryAuthority serviceauthz.Authority
+	IDSource          io.Reader
 }
 
 type ReplicatedTransactionOrchestrator struct {
@@ -107,6 +115,7 @@ type ReplicatedTransactionOrchestrator struct {
 	maxMutations           uint64
 	maxMutationBytes       uint64
 	recoveryTimeout        time.Duration
+	recoveryAuthority      serviceauthz.Authority
 	idSource               io.Reader
 	byteBudget             replicatedTransactionByteBudget
 	activeByteBudget       replicatedTransactionByteBudget
@@ -229,7 +238,9 @@ func NewReplicatedTransactionOrchestrator(
 		options.MaxMutationBytes == 0 ||
 		options.MaxMutationBytes > maxReplicatedTransactionMutationBytes ||
 		options.RecoveryTimeout <= 0 ||
-		options.RecoveryTimeout > AbsoluteMaxReplicatedTransactionRecoveryTimeout {
+		options.RecoveryTimeout > AbsoluteMaxReplicatedTransactionRecoveryTimeout ||
+		(options.RecoveryAuthority != (serviceauthz.Authority{}) &&
+			!options.RecoveryAuthority.Valid()) {
 		return nil, ErrReplicatedTransaction
 	}
 	source := options.IDSource
@@ -241,7 +252,8 @@ func NewReplicatedTransactionOrchestrator(
 		retryHome: options.RetryHome, maxConcurrency: options.MaxConcurrency,
 		maxInFlightBytes: options.MaxInFlightBytes,
 		maxMutations:     options.MaxMutations, maxMutationBytes: options.MaxMutationBytes,
-		recoveryTimeout: options.RecoveryTimeout, idSource: source,
+		recoveryTimeout:   options.RecoveryTimeout,
+		recoveryAuthority: options.RecoveryAuthority, idSource: source,
 	}
 	activeBytes := uint64(replication.MaxCommandBytes) +
 		uint64(distributedtxn.MaxReplicatedCommandBytes) +
@@ -616,7 +628,7 @@ func replicatedTransactionOwnedLogicalBytes(
 	participants []ReplicatedTransactionParticipant,
 ) (planBytes, handleBytes uint64, err error) {
 	count := uint64(len(participants))
-	if count < 2 || count > maxReplicatedTransactionOrdinal {
+	if count == 0 || count > maxReplicatedTransactionOrdinal {
 		return 0, 0, ErrReplicatedTransaction
 	}
 	planBytes, err = checkedReplicatedTransactionLogicalProduct(
@@ -800,16 +812,18 @@ type replicatedTransactionWorkerScratch struct {
 	reusable bool
 }
 
-// Execute commits one multi-shard native transaction through RF3. Every
-// proposal uses ReplicatedExecutor.Propose; the method has no legacy transport
-// or journal fallback.
+// Execute commits one native transaction through one or more RF3 groups. A
+// singleton group preserves atomic multi-relation/multi-statement semantics;
+// larger plans add cross-group atomicity. Every proposal uses
+// ReplicatedExecutor.Propose; the method has no legacy transport or journal
+// fallback.
 func (orchestrator *ReplicatedTransactionOrchestrator) Execute(
 	ctx context.Context,
 	catalogGeneration uint64,
 	participants []ReplicatedTransactionParticipant,
 ) (result ReplicatedTransactionResult, resultErr error) {
 	if orchestrator == nil || orchestrator.executor == nil || ctx == nil ||
-		catalogGeneration == 0 || len(participants) < 2 ||
+		catalogGeneration == 0 || len(participants) == 0 ||
 		uint64(len(participants)) > maxReplicatedTransactionOrdinal {
 		return ReplicatedTransactionResult{}, ErrReplicatedTransaction
 	}
@@ -1307,8 +1321,42 @@ func (orchestrator *ReplicatedTransactionOrchestrator) propose(
 	ordinal uint32,
 	scratch replicatedTransactionWorkerScratch,
 ) (proposal replicatedTransactionProposal) {
+	return orchestrator.proposeWithCapability(
+		ctx, route, control, batches, ordinal, scratch,
+		serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) proposeRecovery(
+	ctx context.Context,
+	route ReplicatedRoute,
+	control distributedtxn.ReplicatedCommand,
+	batches []replication.RelationMutationBatch,
+	ordinal uint32,
+	scratch replicatedTransactionWorkerScratch,
+) replicatedTransactionProposal {
+	return orchestrator.proposeWithCapability(
+		ctx, route, control, batches, ordinal, scratch,
+		serviceauthz.CapabilityTransactionRecovery,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) proposeWithCapability(
+	ctx context.Context,
+	route ReplicatedRoute,
+	control distributedtxn.ReplicatedCommand,
+	batches []replication.RelationMutationBatch,
+	ordinal uint32,
+	scratch replicatedTransactionWorkerScratch,
+	capability serviceauthz.Capability,
+) (proposal replicatedTransactionProposal) {
 	proposal = replicatedTransactionProposal{ordinal: ordinal}
 	proposal.scratch = scratch
+	if capability != serviceauthz.CapabilityDataWrite &&
+		capability != serviceauthz.CapabilityTransactionRecovery {
+		proposal.err = ErrReplicatedTransaction
+		return proposal
+	}
 	controlSize, err := distributedtxn.ReplicatedCommandSize(control)
 	if err != nil {
 		proposal.err = err
@@ -1405,7 +1453,9 @@ func (orchestrator *ReplicatedTransactionOrchestrator) propose(
 		proposal.scratch.command = dst[:0]
 		proposal.scratch.control = controlBytes[:0]
 	}
-	proposal.result, proposal.err = orchestrator.executor.proposeOwned(ctx, route, dst)
+	proposal.result, proposal.err = orchestrator.executor.proposeOwnedWithCapability(
+		ctx, route, dst, capability,
+	)
 	if proposal.err != nil {
 		var unknown *raftservice.UnknownOutcomeError
 		if errors.As(proposal.err, &unknown) {
@@ -1566,6 +1616,27 @@ func (orchestrator *ReplicatedTransactionOrchestrator) finish(
 	handle *ReplicatedTransactionRecoveryHandle,
 	commit bool,
 ) (int64, error) {
+	return orchestrator.finishWithCapability(
+		ctx, handle, commit, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) finishRecovery(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	commit bool,
+) (int64, error) {
+	return orchestrator.finishWithCapability(
+		ctx, handle, commit, serviceauthz.CapabilityTransactionRecovery,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) finishWithCapability(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	commit bool,
+	capability serviceauthz.Capability,
+) (int64, error) {
 	handle.Phase = ReplicatedTransactionPhaseFinishing
 	operation := distributedtxn.ReplicatedAbortReleaseParticipant
 	if commit {
@@ -1581,8 +1652,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) finish(
 			Operation: operation, ID: handle.ID, ExpectedRevision: 2,
 			PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}
-		return orchestrator.propose(work, handle.Participants[ordinal].Route, control,
-			nil, uint32(ordinal), scratch)
+		return orchestrator.proposeWithCapability(
+			work, handle.Participants[ordinal].Route, control,
+			nil, uint32(ordinal), scratch, capability,
+		)
 	}, func(proposal replicatedTransactionProposal) {
 		if proposal.result.Outcome.AppliedIndex != 0 {
 			handle.Participants[proposal.ordinal].MinimumApplied = proposal.result.Outcome.AppliedIndex
@@ -1626,6 +1699,25 @@ func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndRelease(
 	ctx context.Context,
 	handle *ReplicatedTransactionRecoveryHandle,
 ) error {
+	return orchestrator.abortFenceAndReleaseWithCapability(
+		ctx, handle, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndReleaseRecovery(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+) error {
+	return orchestrator.abortFenceAndReleaseWithCapability(
+		ctx, handle, serviceauthz.CapabilityTransactionRecovery,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndReleaseWithCapability(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	capability serviceauthz.Capability,
+) error {
 	handle.Phase = ReplicatedTransactionPhaseFinishing
 	coordinator := handle.Participants[handle.CoordinatorOrdinal].Route
 	var joined error
@@ -1645,8 +1737,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndRelease(
 				ParticipantOrdinal:          uint32(ordinal),
 			},
 		}
-		proposal := orchestrator.propose(work, handle.Participants[ordinal].Route,
-			fence, nil, uint32(ordinal), scratch)
+		proposal := orchestrator.proposeWithCapability(
+			work, handle.Participants[ordinal].Route,
+			fence, nil, uint32(ordinal), scratch, capability,
+		)
 		if proposal.err != nil || proposal.code == replicatedstate.ResultApplied {
 			return proposal
 		}
@@ -1659,8 +1753,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndRelease(
 			ID:        handle.ID, ExpectedRevision: 2,
 			PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}
-		return orchestrator.propose(work, handle.Participants[ordinal].Route,
-			release, nil, uint32(ordinal), proposal.scratch)
+		return orchestrator.proposeWithCapability(
+			work, handle.Participants[ordinal].Route,
+			release, nil, uint32(ordinal), proposal.scratch, capability,
+		)
 	}, func(proposal replicatedTransactionProposal) {
 		if proposal.result.Outcome.AppliedIndex != 0 {
 			handle.Participants[proposal.ordinal].MinimumApplied = proposal.result.Outcome.AppliedIndex
@@ -1755,6 +1851,29 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retire(
 	route ReplicatedRoute,
 	summary distributedtxn.ReplicatedRetirementSummary,
 ) error {
+	return orchestrator.retireWithCapability(
+		ctx, handle, route, summary, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) retireRecovery(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	route ReplicatedRoute,
+	summary distributedtxn.ReplicatedRetirementSummary,
+) error {
+	return orchestrator.retireWithCapability(
+		ctx, handle, route, summary, serviceauthz.CapabilityTransactionRecovery,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) retireWithCapability(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	route ReplicatedRoute,
+	summary distributedtxn.ReplicatedRetirementSummary,
+	capability serviceauthz.Capability,
+) error {
 	for index := range handle.Participants {
 		witness := handle.Participants[index]
 		if !witness.Terminal {
@@ -1774,8 +1893,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retire(
 		ID:        handle.ID, ExpectedRevision: handle.DecisionRevision + 1,
 		PayloadKind: distributedtxn.ReplicatedPayloadRetirement, Payload: payload,
 	}
-	proposal := orchestrator.propose(ctx, route, control, nil,
-		handle.CoordinatorOrdinal, replicatedTransactionWorkerScratch{})
+	proposal := orchestrator.proposeWithCapability(
+		ctx, route, control, nil, handle.CoordinatorOrdinal,
+		replicatedTransactionWorkerScratch{}, capability,
+	)
 	orchestrator.capturePending(handle, proposal)
 	if proposal.err != nil || proposal.code != replicatedstate.ResultApplied ||
 		proposal.value.AffectedRowsValid != summary.AffectedRowsValid ||
@@ -1791,8 +1912,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retryPending(
 	ctx context.Context,
 	handle *ReplicatedTransactionRecoveryHandle,
 ) error {
-	return orchestrator.retryPendingMatching(ctx, handle,
-		func(distributedtxn.ReplicatedCommand) bool { return true })
+	return orchestrator.retryPendingMatchingWithCapability(
+		ctx, handle, func(distributedtxn.ReplicatedCommand) bool { return true },
+		serviceauthz.CapabilityDataWrite,
+	)
 }
 
 func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatching(
@@ -1800,7 +1923,30 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatching(
 	handle *ReplicatedTransactionRecoveryHandle,
 	allow func(distributedtxn.ReplicatedCommand) bool,
 ) error {
-	return orchestrator.retryPendingMatchingObserved(ctx, handle, allow, nil)
+	return orchestrator.retryPendingMatchingWithCapability(
+		ctx, handle, allow, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) retryRecoveryPendingMatching(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	allow func(distributedtxn.ReplicatedCommand) bool,
+) error {
+	return orchestrator.retryPendingMatchingWithCapability(
+		ctx, handle, allow, serviceauthz.CapabilityTransactionRecovery,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatchingWithCapability(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	allow func(distributedtxn.ReplicatedCommand) bool,
+	capability serviceauthz.Capability,
+) error {
+	return orchestrator.retryPendingMatchingObservedWithCapability(
+		ctx, handle, allow, nil, capability,
+	)
 }
 
 func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatchingObserved(
@@ -1808,6 +1954,29 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatchingObser
 	handle *ReplicatedTransactionRecoveryHandle,
 	allow func(distributedtxn.ReplicatedCommand) bool,
 	applied func(distributedtxn.ReplicatedCommand),
+) error {
+	return orchestrator.retryPendingMatchingObservedWithCapability(
+		ctx, handle, allow, applied, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) retryRecoveryPendingMatchingObserved(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	allow func(distributedtxn.ReplicatedCommand) bool,
+	applied func(distributedtxn.ReplicatedCommand),
+) error {
+	return orchestrator.retryPendingMatchingObservedWithCapability(
+		ctx, handle, allow, applied, serviceauthz.CapabilityTransactionRecovery,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatchingObservedWithCapability(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	allow func(distributedtxn.ReplicatedCommand) bool,
+	applied func(distributedtxn.ReplicatedCommand),
+	capability serviceauthz.Capability,
 ) error {
 	pendingCommands := handle.Pending
 	remaining := pendingCommands[:0]
@@ -1830,8 +1999,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retryPendingMatchingObser
 			remaining = append(remaining, pending)
 			continue
 		}
-		result, err := orchestrator.executor.retryUnknownBorrowed(
-			ctx, pending.Route, pending.Command,
+		result, err := orchestrator.executor.retryUnknownBorrowedWithCapability(
+			ctx, pending.Route, pending.Command, capability,
 		)
 		if err != nil {
 			remaining = append(remaining, pending)

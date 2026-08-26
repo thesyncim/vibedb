@@ -647,8 +647,19 @@ func (executor *ReplicatedExecutor) proposeOwned(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
+	return executor.proposeOwnedWithCapability(
+		ctx, route, command, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (executor *ReplicatedExecutor) proposeOwnedWithCapability(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+	capability serviceauthz.Capability,
+) (ReplicatedResult, error) {
 	return executor.propose(ctx, route, command, nil, false,
-		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandTransfer)
+		capability, replicatedUnknownCommandTransfer)
 }
 
 // retryUnknownBorrowed retries bytes retained and owned by a transaction
@@ -659,8 +670,19 @@ func (executor *ReplicatedExecutor) retryUnknownBorrowed(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
+	return executor.retryUnknownBorrowedWithCapability(
+		ctx, route, command, serviceauthz.CapabilityDataWrite,
+	)
+}
+
+func (executor *ReplicatedExecutor) retryUnknownBorrowedWithCapability(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+	capability serviceauthz.Capability,
+) (ReplicatedResult, error) {
 	return executor.propose(ctx, route, command, nil, true,
-		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandBorrowed)
+		capability, replicatedUnknownCommandBorrowed)
 }
 
 func (executor *ReplicatedExecutor) propose(

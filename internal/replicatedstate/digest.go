@@ -15,6 +15,8 @@ import (
 
 const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;" +
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
+	"strict-put-absent-conflict;put-present-missing-zero-rows;" +
+	"json-relation-affected-rows;global-index-results-excluded;fixed-mutation-result-int64;" +
 	"mutation-validation-result-map;bytewise-changed-key-order;" +
 	"ordered-client-session-sequences;authority-class-bound-session-identity;" +
 	"cumulative-ack-through;" +
@@ -45,17 +47,26 @@ var (
 )
 
 type finalMutation struct {
-	key               []byte
-	value             []byte
-	before            []byte
-	descriptorIndex   uint16
-	delete            bool
-	conditional       bool
-	conditionalDelete bool
-	absentOrEqual     bool
-	beforeFound       bool
-	described         bool
+	key             []byte
+	value           []byte
+	before          []byte
+	descriptorIndex uint16
+	condition       mutationCondition
+	delete          bool
+	beforeFound     bool
+	described       bool
 }
+
+type mutationCondition uint8
+
+const (
+	mutationUnconditional mutationCondition = iota
+	mutationPutAbsentOrEqual
+	mutationDeleteDigestEqual
+	mutationPutDigestEqual
+	mutationPutAbsent
+	mutationPutPresent
+)
 
 // mutationValueDescriptor is transient batch workspace, never per-Machine
 // state. Singleton apply keeps the raw before/after slices it already owns.
@@ -346,7 +357,7 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [2 + 19*4]byte
+	var grammar [2 + 21*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
@@ -367,6 +378,8 @@ func bundleApplyContractDigest(
 		uint32(replication.MutationPutAbsentOrEqual),
 		uint32(replication.MutationDeleteDigestEqual),
 		uint32(replication.MutationPutDigestEqual),
+		uint32(replication.MutationPutAbsent),
+		uint32(replication.MutationPutPresent),
 		replication.MutationDigestCompareBytes,
 	} {
 		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)

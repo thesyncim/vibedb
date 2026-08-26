@@ -26,8 +26,8 @@ const (
 	// MaxCompletionEnvelopeBytes bounds retained inline completion metadata.
 	MaxCompletionEnvelopeBytes = 128 << 10
 	// MaxEmptyResultCompletionEnvelopeBytes is the largest canonical completion
-	// carrying no inline result bytes. Replicated session mutations currently
-	// use this shape, so a serving result sink can reserve exact bounded scratch
+	// carrying no inline result bytes. Result grammars add their fixed maximum
+	// to this base so a serving result sink can reserve exact bounded scratch
 	// before proposal admission.
 	MaxEmptyResultCompletionEnvelopeBytes = completionHeaderBytes + envelopeChecksumBytes + 3*MaxIdentityBytes
 	// MaxCompletionResultBytes is the largest exact response a digest reference
@@ -188,6 +188,14 @@ const (
 	MutationPutAbsentOrEqual  MutationKind = 3
 	MutationDeleteDigestEqual MutationKind = 4
 	MutationPutDigestEqual    MutationKind = 5
+	// MutationPutAbsent inserts only when the key is absent. An existing key,
+	// including one with byte-identical value bytes, is a deterministic
+	// conflict. It is the byte-native strict-insert primitive.
+	MutationPutAbsent MutationKind = 6
+	// MutationPutPresent replaces only when the key is present. A missing key is
+	// an applied zero-row no-op. It is the byte-native conditional-update
+	// primitive.
+	MutationPutPresent MutationKind = 7
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed

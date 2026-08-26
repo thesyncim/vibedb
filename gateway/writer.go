@@ -369,6 +369,11 @@ type BoundWritePlan struct {
 	kind        sqlast.Kind
 	constraints distribution.BoundConstraints
 	rowKeys     [][]distribution.Scalar
+	// insertDoc borrows the exact whole-document operand for a single-row INSERT.
+	// It is nil for flat and multi-row INSERTs. Keeping one slice header in the
+	// bound plan avoids adding an allocation to the ordinary write lane while the
+	// RF3 lowering consumes the document without another JSON representation.
+	insertDoc []byte
 	// keyPointers holds one compiled shard-key pointer per ordinal for a
 	// whole-document insert or UPDATE; it is nil otherwise.
 	keyPointers []vibejson.CompiledPointer
@@ -432,11 +437,12 @@ func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
 	}
 	switch p.statement.Kind {
 	case sqlast.KindInsert:
-		keys, err := p.bindInsertRowKeys(args)
+		keys, document, err := p.bindInsertRowKeys(args)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
 		}
 		bound.rowKeys = keys
+		bound.insertDoc = document
 		if err := p.bindGlobalIndexInserts(bound, args); err != nil {
 			return nil, err
 		}
@@ -694,13 +700,15 @@ func sameWriteTarget(a, b distribution.Target) bool {
 // flat row reads each shard-key ordinal from the bound operand of its named
 // top-level column. A missing, null, or non-scalar shard-key value is a routing
 // error: the row cannot be proven single-shard.
-func (p *PreparedPlan) bindInsertRowKeys(args []any) ([][]distribution.Scalar, error) {
+func (p *PreparedPlan) bindInsertRowKeys(
+	args []any,
+) ([][]distribution.Scalar, []byte, error) {
 	ins := p.statement.Insert
 	if ins == nil {
-		return nil, errors.New("insert has no statement body")
+		return nil, nil, errors.New("insert has no statement body")
 	}
 	keys := make([][]distribution.Scalar, len(ins.Rows))
-	var doc []byte
+	var doc, singleDocument []byte
 	for i, row := range ins.Rows {
 		var (
 			key []distribution.Scalar
@@ -709,11 +717,14 @@ func (p *PreparedPlan) bindInsertRowKeys(args []any) ([][]distribution.Scalar, e
 		if len(ins.Columns) == 0 {
 			doc, err = writeOperandDocument(row.Values[0], args)
 			if err != nil {
-				return nil, fmt.Errorf("row %d: %w", i, err)
+				return nil, nil, fmt.Errorf("row %d: %w", i, err)
+			}
+			if len(ins.Rows) == 1 {
+				singleDocument = doc
 			}
 			key, err = writeDocShardKey(doc, p.writeKeyPointers)
 			if err != nil {
-				return nil, fmt.Errorf("row %d: %w", i, err)
+				return nil, nil, fmt.Errorf("row %d: %w", i, err)
 			}
 		} else {
 			key = make([]distribution.Scalar, 0, len(p.writeKeyColumns))
@@ -721,14 +732,14 @@ func (p *PreparedPlan) bindInsertRowKeys(args []any) ([][]distribution.Scalar, e
 				value := writeOperandValue(row.Values[colIdx], args)
 				scalar, err := writeScalarFromValue(value)
 				if err != nil {
-					return nil, fmt.Errorf("row %d: shard-key column ordinal %d: %w", i, ordinal, err)
+					return nil, nil, fmt.Errorf("row %d: shard-key column ordinal %d: %w", i, ordinal, err)
 				}
 				key = append(key, scalar)
 			}
 		}
 		keys[i] = key
 	}
-	return keys, nil
+	return keys, singleDocument, nil
 }
 
 // writeOperandDocument returns the JSON document bytes an insert operand

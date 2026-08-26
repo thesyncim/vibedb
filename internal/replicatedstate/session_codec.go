@@ -389,6 +389,7 @@ type SessionSlot struct {
 	Fingerprint            replication.Digest
 	LogicalCommandDigest   [sha256.Size]byte
 	ResultCode             uint32
+	AffectedRows           int64
 	ReplicaSetVersion      uint64
 	ActivePolicyGeneration uint64
 	ProtectionEpoch        uint64
@@ -408,6 +409,7 @@ type SessionSlotView struct {
 	Fingerprint            replication.Digest
 	LogicalCommandDigest   [sha256.Size]byte
 	ResultCode             uint32
+	AffectedRows           int64
 	ReplicaSetVersion      uint64
 	ActivePolicyGeneration uint64
 	ProtectionEpoch        uint64
@@ -448,6 +450,7 @@ func AppendSessionSlot(dst []byte, slot SessionSlot) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[160:168], slot.ProtectionEpoch)
 	binary.LittleEndian.PutUint64(frame[168:176], slot.RoutingVersion)
 	binary.LittleEndian.PutUint64(frame[176:184], slot.RouteGeneration)
+	binary.LittleEndian.PutUint64(frame[184:192], uint64(slot.AffectedRows))
 	sealRecord(frame, sessionSlotChecksumDomain)
 	return dst, nil
 }
@@ -462,7 +465,7 @@ func OpenSessionSlot(src []byte) (SessionSlotView, error) {
 		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionSlotHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		src[19] != 0 || !allZero(src[184:sessionSlotHeaderBytes]) ||
+		src[19] != 0 ||
 		!verifySessionChecksum(src, sessionSlotChecksumDomain) {
 		return SessionSlotView{}, fmt.Errorf("%w: session slot envelope", ErrSessionCorrupt)
 	}
@@ -479,6 +482,7 @@ func OpenSessionSlot(src []byte) (SessionSlotView, error) {
 		ProtectionEpoch:        binary.LittleEndian.Uint64(src[160:168]),
 		RoutingVersion:         binary.LittleEndian.Uint64(src[168:176]),
 		RouteGeneration:        binary.LittleEndian.Uint64(src[176:184]),
+		AffectedRows:           int64(binary.LittleEndian.Uint64(src[184:192])),
 		raw:                    src[:len(src):len(src)],
 	}
 	copy(view.SessionDigest[:], src[20:52])
@@ -501,6 +505,7 @@ func validateSessionSlot(slot SessionSlot) error {
 		Fingerprint:            slot.Fingerprint,
 		LogicalCommandDigest:   slot.LogicalCommandDigest,
 		ResultCode:             slot.ResultCode,
+		AffectedRows:           slot.AffectedRows,
 		ReplicaSetVersion:      slot.ReplicaSetVersion,
 		ActivePolicyGeneration: slot.ActivePolicyGeneration,
 		ProtectionEpoch:        slot.ProtectionEpoch,
@@ -519,6 +524,8 @@ func validateSessionSlotView(view SessionSlotView) error {
 		view.ReplicaSetVersion == 0 || view.ActivePolicyGeneration == 0 ||
 		view.ProtectionEpoch == 0 || view.RoutingVersion == 0 ||
 		view.RouteGeneration == 0 ||
+		view.AffectedRows < 0 || view.AffectedRows > MaxMutationAffectedRows ||
+		view.ResultCode != ResultApplied && view.AffectedRows != 0 ||
 		(view.AuthorityClass != replication.CommandAuthorityData &&
 			view.AuthorityClass != replication.CommandAuthorityTopology) ||
 		(view.ClientSequence == 1) != (view.ResultCode == ResultSessionOpened) ||

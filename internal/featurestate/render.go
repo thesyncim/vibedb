@@ -10,7 +10,7 @@ func RenderMarkdown() []byte {
 	var out bytes.Buffer
 	out.WriteString("# Distributed feature state\n\n")
 	out.WriteString("> Generated from `internal/featurestate.Distributed`. Do not edit this table by hand.\n\n")
-	out.WriteString("VibeDB has no tagged release. This ledger describes the current repository and the single path toward its first release. It does not describe compatibility generations or promise unfinished work.\n\n")
+	out.WriteString("This ledger reports the current repository state and predicts no unmerged work. Development contracts and the one accepted grammar can change between tested commits.\n\n")
 	out.WriteString("A **Yes** in the proof column requires a fault or benchmark gate for the stated contract. Ordinary correctness tests produce **Partial**, not **Yes**. A command is shipped when `vibedb-gateway` or `vibedb-shard` constructs the path. Internal test harnesses do not count as shipped commands.\n\n")
 	out.WriteString("| Feature | Primitive implemented | Internally integrated | Used by shipped commands | Proven under fault or benchmark gates |\n")
 	out.WriteString("| --- | --- | --- | --- | --- |\n")
@@ -24,7 +24,7 @@ func RenderMarkdown() []byte {
 	out.WriteString("1. Change `internal/featurestate/manifest.go` and cite production code or an executable test.\n")
 	out.WriteString("2. Run `go generate ./internal/featurestate`.\n")
 	out.WriteString("3. Run `go test ./internal/featurestate`. The test rejects stale output, invalid state transitions, duplicate rows, and missing evidence files.\n")
-	out.WriteString("\nThe embedded capability matrix remains in [capabilities.md](capabilities.md). Operational instructions for the current static-shard commands remain in [operations/distributed.md](operations/distributed.md).\n")
+	out.WriteString("\nThe embedded capability matrix remains in [capabilities.md](capabilities.md). Operational instructions for the current distributed commands remain in [operations/distributed.md](operations/distributed.md).\n")
 	return out.Bytes()
 }
 

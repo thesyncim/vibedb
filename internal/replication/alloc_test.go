@@ -66,6 +66,8 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	conditional := testCommand()
 	conditional.Batches[0].Mutations = []Mutation{
 		{Kind: MutationPutAbsentOrEqual, Key: []byte("global-key"), Value: []byte(`["doc-1"]`)},
+		{Kind: MutationPutAbsent, Key: []byte("insert-key"), Value: []byte(`{"v":1}`)},
+		{Kind: MutationPutPresent, Key: []byte("update-key"), Value: []byte(`{"v":2}`)},
 		{
 			Kind: MutationPutDigestEqual, Key: []byte("catalog-head"),
 			Value:               []byte(`{"generation":2}`),
