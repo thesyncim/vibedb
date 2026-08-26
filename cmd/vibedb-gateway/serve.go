@@ -1021,6 +1021,8 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 	var nativeResponseScratch nativeDataResponseScratch
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		structuredExecCandidate := durableExecBatchRequestCandidate(line)
+		structuredExecValid := structuredExecCandidate && validateDurableExecBatchEnvelope(line) == nil
 		if issuerOpenRequestCandidate(line) {
 			var request issuerOpenWireRequest
 			authority, authenticated := serviceauthz.FromContext(ctx)
@@ -1206,6 +1208,12 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			continue
 		}
 		if req.Op == "exec_batch" && hasAnyStructuredExecBatchIdentity(&req) {
+			if !structuredExecValid {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidDurableExecBatch.Error()}) != nil {
+					return
+				}
+				continue
+			}
 			authority, authenticated := serviceauthz.FromContext(ctx)
 			if !authenticated {
 				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {

@@ -127,6 +127,30 @@ func TestStructuredExecBatchBindsExactAuthorityAndReturnsAckHandle(t *testing.T)
 	}
 }
 
+func TestStructuredExecBatchWireRejectsIdentityAmbiguityAndSpoofing(t *testing.T) {
+	valid := `{"op":"exec_batch","request_id":"01000000000000000000000000000000","issuer_epoch":7,"issuer_lane":"0200000000000000","issuer_sequence":9,"issuer_authenticator":"` + strings.Repeat("03", 32) + `","class":"batch","statements":[{"sql":"DELETE FROM docs WHERE id = 1"}]}`
+	if err := validateDurableExecBatchEnvelope([]byte(valid)); err != nil {
+		t.Fatal(err)
+	}
+	checks := []string{
+		strings.Replace(valid, `"request_id":"01000000000000000000000000000000","issuer_epoch":7`, `"issuer_epoch":7,"request_id":"01000000000000000000000000000000"`, 1),
+		strings.Replace(valid, `"issuer_epoch":7`, `"issuer_epoch":7,"issuer_epoch":7`, 1),
+		strings.Replace(valid, `,"class":"batch"`, `,"tenant":"spoof","class":"batch"`, 1),
+		strings.Replace(valid, `,"class":"batch"`, `,"principal":"spoof","class":"batch"`, 1),
+		strings.Replace(valid, strings.Repeat("03", 32), strings.Repeat("03", 31), 1),
+		strings.Replace(valid, strings.Repeat("03", 32), strings.Repeat("0A", 32), 1),
+	}
+	for index, raw := range checks {
+		if err := validateDurableExecBatchEnvelope([]byte(raw)); !errors.Is(err, errInvalidDurableExecBatch) {
+			t.Fatalf("case %d err=%v", index, err)
+		}
+	}
+	oversized := append([]byte(valid), bytes.Repeat([]byte(" "), maxServeRequestBytes)...)
+	if err := validateDurableExecBatchEnvelope(oversized); !errors.Is(err, errInvalidDurableExecBatch) {
+		t.Fatalf("oversized err=%v", err)
+	}
+}
+
 func TestArbitraryRequestIDOnlyExecBatchFailsClosed(t *testing.T) {
 	request := serveRequest{
 		Op: "exec_batch", RequestID: "01000000000000000000000000000000",
