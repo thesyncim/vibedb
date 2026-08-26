@@ -278,6 +278,128 @@ func TestPayloadBuildWinnerChunksAndDynamicIovecs(t *testing.T) {
 	}
 }
 
+func TestRoutePinAndPayloadCleanupCommandCanonical(t *testing.T) {
+	head, _, _ := testHead(t, false)
+	home, err := Home(head.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := NewRoutePinAcquiring(head, PinID{3}, testDigest("route-binding"),
+		testDigest("physical-route"), bytes.Repeat([]byte{1}, MaxRouteGatePinCommandBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := RecordVerifiedRoutePinAcquired(
+		pin, pin.Revision+1, bytes.Repeat([]byte{2}, MaxRouteGatePinCompletionBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasing, err := BeginRoutePinRelease(
+		acquired, acquired.Revision+1, bytes.Repeat([]byte{3}, MaxRouteGatePinCommandBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err := RecordVerifiedRoutePinReleased(
+		releasing, releasing.Revision+1, bytes.Repeat([]byte{4}, MaxRouteGatePinCompletionBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		op    Operation
+		phase RoutePinPhase
+		pin   RoutePinRecord
+	}{
+		{OperationBeginRoutePinAcquire, RoutePinAcquiring, pin},
+		{OperationRecordRoutePinAcquired, RoutePinAcquired, acquired},
+		{OperationBeginRoutePinRelease, RoutePinReleasing, releasing},
+		{OperationRecordRoutePinReleased, RoutePinReleased, released},
+	}
+	for _, test := range tests {
+		payload, appendErr := AppendRoutePin(nil, test.pin)
+		if appendErr != nil {
+			t.Fatalf("op %d append route pin: %v", test.op, appendErr)
+		}
+		command := Command{
+			Operation: test.op, ExpectedRevision: 8, Revision: 9,
+			KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+			SubjectDigest: test.pin.RecordDigest, ExpectedRangeIdentity: testDigest("range"),
+			Home: home, Payload: payload,
+		}
+		raw, appendErr := AppendCommand(nil, command)
+		if appendErr != nil {
+			t.Fatalf("op %d append command: %v", test.op, appendErr)
+		}
+		opened, openErr := OpenCommandInto(raw, nil)
+		decoded, ok := opened.RoutePin()
+		if openErr != nil || !ok || decoded.Phase != test.phase ||
+			decoded.RecordDigest != test.pin.RecordDigest || !bytes.Equal(opened.Bytes(), raw) {
+			t.Fatalf("op %d route pin command: phase=%d ok=%v err=%v", test.op, decoded.Phase, ok, openErr)
+		}
+		if allocations := testing.AllocsPerRun(100, func() {
+			if _, openErr = OpenCommandInto(raw, nil); openErr != nil {
+				panic(openErr)
+			}
+		}); allocations != 0 {
+			t.Fatalf("op %d OpenCommandInto allocs=%v", test.op, allocations)
+		}
+	}
+
+	wrongPhasePayload, _ := AppendRoutePin(nil, pin)
+	wrongPhase, _ := AppendCommand(nil, Command{
+		Operation: OperationRecordRoutePinAcquired, ExpectedRevision: 8, Revision: 9,
+		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+		SubjectDigest: pin.RecordDigest, ExpectedRangeIdentity: testDigest("range"), Home: home,
+		Payload: wrongPhasePayload,
+	})
+	if _, err = OpenCommandInto(wrongPhase, nil); err == nil {
+		t.Fatal("route-pin operation accepted the wrong durable phase")
+	}
+
+	cleanup := PayloadCleanupRequest{BuildDigest: testDigest("cleanup-build"), MaxRows: 31, MaxBytes: 1 << 20}
+	cleanupPayload, err := AppendPayloadCleanupRequest(nil, cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupCommand := Command{
+		Operation: OperationCleanupPayload, ExpectedRevision: 9, Revision: 10,
+		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+		SubjectDigest: cleanup.BuildDigest, ExpectedRangeIdentity: testDigest("range"),
+		Home: home, Payload: cleanupPayload,
+	}
+	raw, err := AppendCommand(nil, cleanupCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenCommandInto(raw, nil)
+	decodedCleanup, ok := opened.PayloadCleanup()
+	if err != nil || !ok || decodedCleanup != cleanup {
+		t.Fatalf("cleanup command: %+v ok=%v err=%v", decodedCleanup, ok, err)
+	}
+	cleanupCommand.SubjectDigest[0] ^= 1
+	wrongSubject, _ := AppendCommand(nil, cleanupCommand)
+	if _, err = OpenCommandInto(wrongSubject, nil); err == nil {
+		t.Fatal("payload cleanup accepted a mismatched build digest")
+	}
+
+	if OperationBeginRoutePinAcquire != 13 || OperationRecordRoutePinAcquired != 14 ||
+		OperationBeginRoutePinRelease != 15 || OperationRecordRoutePinReleased != 16 ||
+		OperationCleanupPayload != 17 {
+		t.Fatal("route-pin/payload-cleanup operation codes changed")
+	}
+	if _, err = NewRoutePinAcquiring(head, PinID{3}, testDigest("route-binding"),
+		testDigest("physical-route"), make([]byte, MaxRouteGatePinCommandBytes+1)); err == nil {
+		t.Fatal("oversized route-gate command accepted")
+	}
+	if _, err = RecordVerifiedRoutePinAcquired(pin, pin.Revision+1,
+		make([]byte, MaxRouteGatePinCompletionBytes+1)); err == nil {
+		t.Fatal("oversized route-gate completion accepted")
+	}
+}
+
 func terminalFixture(t *testing.T, sequenced bool) (HeadRecord, ContinuationRecord, TerminalRecord) {
 	t.Helper()
 	head, plan, cursor := testHead(t, sequenced)
@@ -375,7 +497,7 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 	head, _, _ := testHead(t, false)
 	home, _ := Home(head.Key)
 	base := Command{KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot, SubjectDigest: testDigest("subject"), ExpectedRangeIdentity: testDigest("range"), Home: home, Payload: []byte{1}}
-	for op := OperationCreate; op <= OperationBeginPayloadBuild; op++ {
+	for op := OperationCreate; op <= OperationCleanupPayload; op++ {
 		c := base
 		c.Operation = op
 		if op == OperationCreate || op == OperationBeginPayloadBuild {

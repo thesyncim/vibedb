@@ -30,6 +30,11 @@ const (
 	OperationSealPayload
 	OperationBeginPayloadBuild
 	OperationExpirePlanning
+	OperationBeginRoutePinAcquire
+	OperationRecordRoutePinAcquired
+	OperationBeginRoutePinRelease
+	OperationRecordRoutePinReleased
+	OperationCleanupPayload
 )
 
 type Command struct {
@@ -103,6 +108,8 @@ type CommandView struct {
 	payloadChunk PayloadChunkRecord
 	payloadBuild PayloadBuildRecord
 	expiry       PlanningExpiryRequest
+	routePin     RoutePinRecord
+	cleanup      PayloadCleanupRequest
 }
 
 func (view CommandView) Bytes() []byte { return view.raw[:len(view.raw):len(view.raw)] }
@@ -133,6 +140,13 @@ func (view CommandView) PayloadBuild() (PayloadBuildRecord, bool) {
 }
 func (view CommandView) PlanningExpiry() (PlanningExpiryRequest, bool) {
 	return view.expiry, view.Operation == OperationExpirePlanning
+}
+func (view CommandView) RoutePin() (RoutePinRecord, bool) {
+	return view.routePin, view.Operation >= OperationBeginRoutePinAcquire &&
+		view.Operation <= OperationRecordRoutePinReleased
+}
+func (view CommandView) PayloadCleanup() (PayloadCleanupRequest, bool) {
+	return view.cleanup, view.Operation == OperationCleanupPayload
 }
 
 func AppendCommand(dst []byte, command Command) ([]byte, error) {
@@ -281,6 +295,30 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 			view.expiry.PlanBuildID != command.SubjectDigest) {
 			err = ErrCorrupt
 		}
+	case OperationBeginRoutePinAcquire, OperationRecordRoutePinAcquired,
+		OperationBeginRoutePinRelease, OperationRecordRoutePinReleased:
+		view.routePin, err = OpenRoutePin(payload)
+		wantPhase := RoutePinAcquiring
+		switch command.Operation {
+		case OperationRecordRoutePinAcquired:
+			wantPhase = RoutePinAcquired
+		case OperationBeginRoutePinRelease:
+			wantPhase = RoutePinReleasing
+		case OperationRecordRoutePinReleased:
+			wantPhase = RoutePinReleased
+		}
+		if err == nil && (view.routePin.KeyDigest != command.KeyDigest ||
+			view.routePin.RequestDigest != command.RequestDigest ||
+			view.routePin.PlanRoot != command.PlanRoot ||
+			view.routePin.RecordDigest != command.SubjectDigest ||
+			view.routePin.Phase != wantPhase) {
+			err = ErrCorrupt
+		}
+	case OperationCleanupPayload:
+		view.cleanup, err = OpenPayloadCleanupRequest(payload)
+		if err == nil && view.cleanup.BuildDigest != command.SubjectDigest {
+			err = ErrCorrupt
+		}
 	default:
 		err = ErrCorrupt
 	}
@@ -299,7 +337,7 @@ func ValidateCommand(raw []byte) error {
 }
 
 func validateCommandShape(command Command) error {
-	if command.Operation < OperationCreate || command.Operation > OperationExpirePlanning ||
+	if command.Operation < OperationCreate || command.Operation > OperationCleanupPayload ||
 		!nonzeroDigest(command.KeyDigest) || !nonzeroDigest(command.RequestDigest) ||
 		!nonzeroDigest(command.PlanRoot) || !nonzeroDigest(command.SubjectDigest) ||
 		!nonzeroDigest(command.ExpectedRangeIdentity) || command.Home == (LedgerHome{}) {
@@ -331,6 +369,7 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		commandMagic, headMagic, pageMagic, planMagic, pageBatchMagic,
 		pendingWaveMagic, continuationMagic, terminalMagic, ackMagic,
 		gcRequestMagic, payloadBuildMagic, payloadChunkMagic,
+		routePinMagic, payloadCleanupMagic,
 	} {
 		_, _ = hash.Write(magic[:])
 	}
@@ -343,12 +382,15 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		MaxDynamicWavePayloadBytes, MaxDynamicWavePayloadChunks,
 		MaxRouteGateReleaseCommandBytes, MaxRouteGateReleaseCompletionBytes,
 		MaxGCRequestBytes, MaxAckGCDeleteRows,
+		MaxRouteGatePinCommandBytes, MaxRouteGatePinCompletionBytes,
+		MaxRoutePinRecordBytes, PayloadCleanupRequestBytes,
 		commandHeaderBytes, headHeaderBytes, pageHeaderBytes, planHeaderBytes,
 		pageBatchHeaderBytes, pendingWaveHeaderBytes, stepRefBytes,
 		continuationHeaderBytes, terminalHeaderBytes, payloadBuildBytes,
-		payloadChunkHeaderBytes, gcRequestHeaderBytes,
+		payloadChunkHeaderBytes, gcRequestHeaderBytes, routePinHeaderBytes,
 		uint64(StoragePrefix), uint64(StorageHead), uint64(StoragePlanPage), uint64(StoragePending), uint64(StorageTerminal),
 		uint64(StorageAck), uint64(StorageContinuation), uint64(StoragePayloadChunk), uint64(StoragePayloadBuild),
+		uint64(StorageRoutePin),
 		FixedStorageKeyBytes, PageStorageKeyBytes, PayloadStorageKeyBytes,
 		uint64(ScopeAuthenticated), uint64(ScopeLocalInstall),
 		uint64(PhasePlanning), uint64(PhaseSealed), uint64(PhaseTerminal), uint64(PhaseAcked),
@@ -362,6 +404,11 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		uint64(OperationAck), uint64(OperationGC), uint64(OperationStagePayloadChunk),
 		uint64(OperationSealPayload), uint64(OperationBeginPayloadBuild),
 		uint64(OperationExpirePlanning),
+		uint64(OperationBeginRoutePinAcquire), uint64(OperationRecordRoutePinAcquired),
+		uint64(OperationBeginRoutePinRelease), uint64(OperationRecordRoutePinReleased),
+		uint64(OperationCleanupPayload),
+		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
+		uint64(RoutePinReleasing), uint64(RoutePinReleased),
 	}
 	var fixed [8]byte
 	for index, value := range values {
