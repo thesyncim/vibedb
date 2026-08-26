@@ -117,6 +117,26 @@ func newGatewayReplicaHealthController(
 	}, nil
 }
 
+// newGatewayReplicaHealthRuntime is the shipped composition seam used by
+// runServe once the replicated health authority is configured. The manifest
+// supplies inventory, the shard-control client supplies authenticated cuts,
+// and the existing move controller persists/executes the resulting intent.
+func newGatewayReplicaHealthRuntime(
+	catalog gatewayReplicaCatalogReader,
+	failures gatewayFailureCertificateAuthority,
+	observations gatewayReplicaObservationClient,
+	inventory gatewayReplicaCandidateInventory,
+	moves gatewayFailedReplicaMoveSubmitter,
+) (*gatewayReplicaHealthController, error) {
+	if observations == nil || moves == nil {
+		return nil, errGatewayReplicaHealth
+	}
+	return newGatewayReplicaHealthController(
+		catalog, failures, gatewayAuthenticatedHealthObserver{client: observations}, inventory,
+		gatewayFailedReplicaMoveSink{controller: moves},
+	)
+}
+
 func (controller *gatewayReplicaHealthController) RunPass(
 	ctx context.Context,
 ) (gatewayReplicaHealthPass, error) {
