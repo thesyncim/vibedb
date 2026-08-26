@@ -542,6 +542,20 @@ func validateExpectedChildArtifact(
 	return nil
 }
 
+// ValidateChildStageCursor binds recovered destination progress to one exact
+// child artifact and this immutable partition plan. It performs no I/O and
+// grants neither serving nor cutover authority.
+func (p *Partitioner) ValidateChildStageCursor(
+	expected ChildArtifactManifest,
+	cursor ChildStageCursor,
+) error {
+	if validateExpectedChildArtifact(p, expected) != nil ||
+		!childStageCursorMatchesExpected(&cursor, expected) {
+		return ErrChildStage
+	}
+	return nil
+}
+
 func childStageCursorMatchesExpected(
 	cursor *ChildStageCursor,
 	expected ChildArtifactManifest,

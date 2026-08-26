@@ -155,3 +155,45 @@ func (s *DurableRuntimeStore) LoadTailCursor(
 	}
 	return cursor, state.Revision, true, nil
 }
+
+// PersistChildStage stores only the constant-size authenticated destination
+// cursor. Child rows remain in their independently durable collection.
+func (s *DurableRuntimeStore) PersistChildStage(
+	child uint8,
+	revision uint64,
+	cursor rangesplit.ChildStageCursor,
+) error {
+	if cursor.Child() != child {
+		return ErrRuntimeStore
+	}
+	raw, err := rangesplit.AppendChildStageCursor(nil, &cursor)
+	if err != nil || len(raw) > MaxTailControlBytes {
+		return errors.Join(ErrRuntimeStore, err)
+	}
+	return s.Persist(RuntimeStateStage, child, revision, raw)
+}
+
+// LoadChildStage reconstructs one canonical destination cursor and binds it
+// to the exact child manifest and partition plan.
+func (s *DurableRuntimeStore) LoadChildStage(
+	partitioner *rangesplit.Partitioner,
+	expected rangesplit.ChildArtifactManifest,
+	child uint8,
+) (rangesplit.ChildStageCursor, uint64, bool, error) {
+	state, ok, err := s.Load(RuntimeStateStage, child)
+	if err != nil || !ok {
+		return rangesplit.ChildStageCursor{}, 0, ok, err
+	}
+	cursor, err := rangesplit.OpenChildStageCursor(state.Payload)
+	if err != nil || partitioner == nil || cursor == nil || cursor.Child() != child {
+		return rangesplit.ChildStageCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
+	}
+	if err = partitioner.ValidateChildStageCursor(expected, *cursor); err != nil {
+		return rangesplit.ChildStageCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
+	}
+	canonical, err := rangesplit.AppendChildStageCursor(nil, cursor)
+	if err != nil || !bytes.Equal(canonical, state.Payload) {
+		return rangesplit.ChildStageCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
+	}
+	return *cursor, state.Revision, true, nil
+}

@@ -23,6 +23,8 @@ type LocalSourceActions struct {
 	machine *replicatedstate.Machine
 	capture *durable.Collection
 	active  *rangesplit.SourceCapture
+	tail    rangesplit.TailWorkspace
+	read    rangesplit.SourceCaptureWorkspace
 }
 
 func NewLocalSourceActions(
@@ -239,6 +241,62 @@ func (a *LocalSourceActions) OpenChildArtifact(
 		return nil, err
 	}
 	return file, nil
+}
+
+// ExecuteCatchUpTail advances at most one captured source publication. Every
+// child sink (including the retained child's source-local acknowledgement)
+// must synchronously settle before the global tail cursor is advanced. A crash
+// after any child settles but before the cursor replacement safely replays the
+// same digest-addressed batch.
+func (a *LocalSourceActions) ExecuteCatchUpTail(
+	plan *Plan,
+	capture *rangesplit.SourceCapture,
+	set rangesplit.ChildArtifactSet,
+	sinks []rangesplit.TailSink,
+) (rangesplit.TailCursor, bool, error) {
+	if a == nil || plan == nil || capture == nil || plan.operation != a.store.operation ||
+		len(sinks) != int(plan.childCount) ||
+		plan.partitioner.ValidateChildArtifactSet(set) != nil {
+		return rangesplit.TailCursor{}, false, ErrInvalidPlan
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.active != capture {
+		return rangesplit.TailCursor{}, false, ErrTopologyConflict
+	}
+	stored, _, hasArtifacts, err := a.store.LoadChildArtifacts(plan.partitioner)
+	if err != nil || !hasArtifacts || stored != set {
+		return rangesplit.TailCursor{}, false, errors.Join(ErrTopologyConflict, err)
+	}
+	cursor, revision, ok, err := a.store.LoadTailCursor(plan.partitioner)
+	if err != nil {
+		return rangesplit.TailCursor{}, false, err
+	}
+	if !ok {
+		cursor, err = plan.partitioner.InitialTailCursor(set)
+		if err != nil {
+			return rangesplit.TailCursor{}, false, errors.Join(ErrRuntimeStore, err)
+		}
+		revision = 1
+		if err = a.store.PersistTailCursor(revision, cursor); err != nil {
+			return rangesplit.TailCursor{}, false, err
+		}
+	}
+	entry, present, err := capture.NextTailEntry(cursor, &a.read)
+	if err != nil || !present {
+		return cursor, false, err
+	}
+	next, _, err := plan.partitioner.TranslateTailEntry(cursor, entry, sinks, &a.tail)
+	if err != nil {
+		return cursor, false, err
+	}
+	if revision == ^uint64(0) {
+		return cursor, false, ErrRuntimeStore
+	}
+	if err = a.store.PersistTailCursor(revision+1, next); err != nil {
+		return cursor, false, err
+	}
+	return next, true, nil
 }
 
 func (a *LocalSourceActions) verifyArtifactSet(plan *Plan, set rangesplit.ChildArtifactSet) error {
