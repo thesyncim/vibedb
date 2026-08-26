@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 )
 
@@ -39,6 +40,13 @@ type ReplicatedShardDescriptor struct {
 	Group                raftmember.GroupKey
 	AllocationGeneration distribution.ShardAllocationGeneration
 	Command              raftservice.CommandFence
+	// RangeIdentity is the immutable logical range named by durable requests.
+	// LineageDigest and ForwardingRuleDigest authenticate how that logical
+	// range may be resolved after split or movement without allowing a retry to
+	// substitute an unrelated allocation.
+	RangeIdentity        replication.Digest
+	LineageDigest        replication.Digest
+	ForwardingRuleDigest replication.Digest
 	Replicas             []ReplicatedReplicaDescriptor
 	// EnrolledTarget is the one authenticated replacement endpoint that may
 	// participate in membership control. It is never included in the public
@@ -50,6 +58,9 @@ type replicatedCatalogShard struct {
 	group             raftmember.GroupKey
 	allocation        distribution.ShardAllocationGeneration
 	command           raftservice.CommandFence
+	rangeIdentity     replication.Digest
+	lineageDigest     replication.Digest
+	forwardingDigest  replication.Digest
 	replicaBase       uint32
 	manifest          uint32
 	shard             uint32
@@ -125,6 +136,9 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		if !validReplicatedCatalogGroup(descriptor.Group) ||
 			descriptor.Distribution == "" || descriptor.Shard == "" ||
 			descriptor.AllocationGeneration == 0 || !descriptor.Command.Valid() ||
+			descriptor.RangeIdentity == (replication.Digest{}) ||
+			descriptor.LineageDigest == (replication.Digest{}) ||
+			descriptor.ForwardingRuleDigest == (replication.Digest{}) ||
 			len(descriptor.Replicas) != ServingReplicaCount {
 			return &CatalogError{Reason: "replicated shard has an invalid RF3 identity"}
 		}
@@ -248,8 +262,11 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		}
 		shards[ordinal] = replicatedCatalogShard{
 			group: entry.descriptor.Group, allocation: entry.descriptor.AllocationGeneration,
-			command:     entry.descriptor.Command,
-			replicaBase: uint32(base), manifest: entry.manifest, shard: entry.shard,
+			command:          entry.descriptor.Command,
+			rangeIdentity:    entry.descriptor.RangeIdentity,
+			lineageDigest:    entry.descriptor.LineageDigest,
+			forwardingDigest: entry.descriptor.ForwardingRuleDigest,
+			replicaBase:      uint32(base), manifest: entry.manifest, shard: entry.shard,
 			replicaCount:      uint8(len(entry.descriptor.Replicas)),
 			hasEnrolledTarget: entry.descriptor.EnrolledTarget != nil,
 		}
@@ -343,7 +360,9 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	return ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
-		Command: entry.command, Replicas: dst,
+		Command: entry.command, RangeIdentity: entry.rangeIdentity,
+		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
+		Replicas: dst,
 	}, true
 }
 
@@ -374,7 +393,9 @@ func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
 	result := ReplicatedMembershipRoute{Serving: ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
-		Command: entry.command, Replicas: dst,
+		Command: entry.command, RangeIdentity: entry.rangeIdentity,
+		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
+		Replicas: dst,
 	}}
 	if targets != 0 {
 		result.EnrolledTarget = snapshot.replicatedReplicas[end]
@@ -411,7 +432,8 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 		descriptor := ReplicatedShardDescriptor{
 			Distribution: manifest.Distribution(), Shard: metadata.ID,
 			Group: entry.group, AllocationGeneration: entry.allocation,
-			Command:  entry.command,
+			Command: entry.command, RangeIdentity: entry.rangeIdentity,
+			LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 			Replicas: make([]ReplicatedReplicaDescriptor, entry.replicaCount),
 		}
 		for replicaOrdinal := range descriptor.Replicas {
@@ -486,6 +508,14 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 		if candidate.group != old.group {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated shard %q/%q changed Raft group within one allocation",
+				oldManifest.Distribution(), oldMetadata.ID,
+			)}
+		}
+		if candidate.rangeIdentity != old.rangeIdentity ||
+			candidate.lineageDigest != old.lineageDigest ||
+			candidate.forwardingDigest != old.forwardingDigest {
+			return &CatalogError{Reason: fmt.Sprintf(
+				"replicated shard %q/%q changed logical range authority within one allocation",
 				oldManifest.Distribution(), oldMetadata.ID,
 			)}
 		}
@@ -678,6 +708,9 @@ type persistedReplicatedShard struct {
 	OwnershipEpoch         uint64                       `json:"ownership_epoch"`
 	SchemaGeneration       uint64                       `json:"schema_generation"`
 	RelationManifestDigest string                       `json:"relation_manifest_digest"`
+	RangeIdentity          string                       `json:"range_identity"`
+	LineageDigest          string                       `json:"lineage_digest"`
+	ForwardingRuleDigest   string                       `json:"forwarding_rule_digest"`
 	RoutingVersion         uint64                       `json:"routing_version"`
 	RouteGeneration        uint64                       `json:"route_generation"`
 	Replicas               []persistedReplicatedReplica `json:"replicas"`
@@ -718,9 +751,12 @@ func persistedReplicatedDescriptors(
 			RelationManifestDigest: hex.EncodeToString(
 				descriptor.Command.RelationManifestDigest[:],
 			),
-			RoutingVersion:  descriptor.Command.RoutingVersion,
-			RouteGeneration: descriptor.Command.RouteGeneration,
-			Replicas:        make([]persistedReplicatedReplica, len(descriptor.Replicas)),
+			RangeIdentity:        hex.EncodeToString(descriptor.RangeIdentity[:]),
+			LineageDigest:        hex.EncodeToString(descriptor.LineageDigest[:]),
+			ForwardingRuleDigest: hex.EncodeToString(descriptor.ForwardingRuleDigest[:]),
+			RoutingVersion:       descriptor.Command.RoutingVersion,
+			RouteGeneration:      descriptor.Command.RouteGeneration,
+			Replicas:             make([]persistedReplicatedReplica, len(descriptor.Replicas)),
 		}
 		for replicaOrdinal, replica := range descriptor.Replicas {
 			entry.Replicas[replicaOrdinal] = persistReplicatedReplica(replica)
@@ -771,10 +807,27 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				Reason: "replicated shard relation manifest digest: " + err.Error(),
 			}
 		}
+		var rangeIdentity, lineageDigest, forwardingRuleDigest [32]byte
+		for _, item := range []struct {
+			name string
+			raw  string
+			dst  *[32]byte
+		}{
+			{"range identity", persisted.RangeIdentity, &rangeIdentity},
+			{"lineage digest", persisted.LineageDigest, &lineageDigest},
+			{"forwarding rule digest", persisted.ForwardingRuleDigest, &forwardingRuleDigest},
+		} {
+			if err := decodeFixed32Hex(item.raw, item.dst); err != nil {
+				return nil, &CatalogError{Reason: "replicated shard " + item.name + ": " + err.Error()}
+			}
+		}
 		descriptor := ReplicatedShardDescriptor{
 			Distribution: distribution.DistributionName(persisted.Distribution),
 			Shard:        distribution.ShardID(persisted.Shard), Group: group,
 			AllocationGeneration: distribution.ShardAllocationGeneration(persisted.AllocationGeneration),
+			RangeIdentity:        replication.Digest(rangeIdentity),
+			LineageDigest:        replication.Digest(lineageDigest),
+			ForwardingRuleDigest: replication.Digest(forwardingRuleDigest),
 			Command: raftservice.CommandFence{
 				ReplicaSetVersion:      persisted.ReplicaSetVersion,
 				ActivePolicyGeneration: persisted.ActivePolicyGeneration,

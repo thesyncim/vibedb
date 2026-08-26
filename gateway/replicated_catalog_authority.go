@@ -141,7 +141,10 @@ func sameReplicatedCatalogRoute(left, right ReplicatedRoute) bool {
 	if left.Distribution != right.Distribution || left.Shard != right.Shard ||
 		left.Group != right.Group ||
 		left.AllocationGeneration != right.AllocationGeneration ||
-		left.Command != right.Command || len(left.Replicas) != len(right.Replicas) {
+		left.Command != right.Command || left.RangeIdentity != right.RangeIdentity ||
+		left.LineageDigest != right.LineageDigest ||
+		left.ForwardingRuleDigest != right.ForwardingRuleDigest ||
+		len(left.Replicas) != len(right.Replicas) {
 		return false
 	}
 	for index := range left.Replicas {

@@ -467,6 +467,9 @@ func durableRequestRouteMatchesParticipant(
 ) bool {
 	return validReplicatedRoute(route) && route.Distribution == participant.Distribution &&
 		route.Shard == participant.Shard && route.Group == participant.Group &&
+		route.RangeIdentity == participant.RangeIdentity &&
+		route.LineageDigest == participant.LineageDigest &&
+		route.ForwardingRuleDigest == participant.ForwardingRuleDigest &&
 		route.Command.SchemaGeneration == participant.SchemaGeneration &&
 		route.Command.RelationManifestDigest == participant.RelationManifestDigest
 }

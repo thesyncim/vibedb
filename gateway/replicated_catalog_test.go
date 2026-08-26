@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -35,6 +36,9 @@ func TestReplicatedCatalogExactRF3RoundTripAndAllocationFreeRoute(t *testing.T) 
 		if !ok || route.Group != descriptor.Group ||
 			route.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
 			route.Command != descriptor.Command ||
+			route.RangeIdentity != descriptor.RangeIdentity ||
+			route.LineageDigest != descriptor.LineageDigest ||
+			route.ForwardingRuleDigest != descriptor.ForwardingRuleDigest ||
 			len(route.Replicas) != ServingReplicaCount {
 			t.Fatalf("resolved route = %+v,%v", route, ok)
 		}
@@ -64,6 +68,70 @@ func TestReplicatedCatalogExactRF3RoundTripAndAllocationFreeRoute(t *testing.T) 
 		t.Fatal(err)
 	}
 	assertRoute(loaded)
+}
+
+func TestReplicatedCatalogRejectsMissingLogicalRangeAuthority(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	for name, clear := range map[string]func(*ReplicatedShardDescriptor){
+		"range identity": func(value *ReplicatedShardDescriptor) {
+			value.RangeIdentity = replication.Digest{}
+		},
+		"lineage digest": func(value *ReplicatedShardDescriptor) {
+			value.LineageDigest = replication.Digest{}
+		},
+		"forwarding rule digest": func(value *ReplicatedShardDescriptor) {
+			value.ForwardingRuleDigest = replication.Digest{}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := descriptor
+			clear(&invalid)
+			if _, err := NewSnapshotWithReplicatedMetadata(
+				config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{invalid},
+			); err == nil {
+				t.Fatal("catalog accepted missing logical range authority")
+			}
+		})
+	}
+}
+
+func TestReplicatedCatalogFreezesLogicalRangeAuthorityWithinAllocation(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	current, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = initialCatalogState(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*ReplicatedShardDescriptor){
+		"range identity": func(value *ReplicatedShardDescriptor) {
+			value.RangeIdentity[1]++
+		},
+		"lineage digest": func(value *ReplicatedShardDescriptor) {
+			value.LineageDigest[1]++
+		},
+		"forwarding rule digest": func(value *ReplicatedShardDescriptor) {
+			value.ForwardingRuleDigest[1]++
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := descriptor
+			change(&changed)
+			next, err := NewSnapshotWithReplicatedMetadata(
+				config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{changed},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := advanceCatalogState(current, next); err == nil {
+				t.Fatal("catalog accepted changed logical range authority within one allocation")
+			}
+		})
+	}
 }
 
 func TestReplicatedCatalogSeparatesEnrolledTargetFromServingRF3(t *testing.T) {
@@ -458,6 +526,8 @@ func testReplicatedCatalogInput(
 	descriptor := ReplicatedShardDescriptor{
 		Distribution: manifest.Distribution(), Shard: first.ID, Group: group,
 		AllocationGeneration: first.AllocationGeneration,
+		RangeIdentity:        replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
+		ForwardingRuleDigest: replication.Digest{0x73},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
 			OwnershipEpoch: uint64(first.Epoch), SchemaGeneration: 8,

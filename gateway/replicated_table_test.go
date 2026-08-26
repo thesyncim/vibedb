@@ -370,6 +370,8 @@ func testReplicatedTableInput(
 	}
 	descriptor := ReplicatedShardDescriptor{
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 1,
+		RangeIdentity: replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
+		ForwardingRuleDigest: replication.Digest{0x73},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
 			OwnershipEpoch: 7, SchemaGeneration: 8,

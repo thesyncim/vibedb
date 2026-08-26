@@ -62,6 +62,9 @@ type ReplicatedRoute struct {
 	Group                raftmember.GroupKey
 	AllocationGeneration uint64
 	Command              raftservice.CommandFence
+	RangeIdentity        replication.Digest
+	LineageDigest        replication.Digest
+	ForwardingRuleDigest replication.Digest
 	Replicas             []ReplicatedEndpoint
 }
 
@@ -1627,7 +1630,9 @@ func validReplicatedAppliedRefusal(response *shardservice.ReplicatedResponse) bo
 func validReplicatedRoute(route ReplicatedRoute) bool {
 	if route.Distribution == "" || route.Shard == "" ||
 		!validReplicatedCatalogGroup(route.Group) || route.AllocationGeneration == 0 ||
-		!route.Command.Valid() ||
+		!route.Command.Valid() || route.RangeIdentity == (replication.Digest{}) ||
+		route.LineageDigest == (replication.Digest{}) ||
+		route.ForwardingRuleDigest == (replication.Digest{}) ||
 		len(route.Replicas) == 0 || len(route.Replicas) > AbsoluteMaxReplicatedRouteMembers {
 		return false
 	}
