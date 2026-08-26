@@ -17,9 +17,10 @@ import (
 
 // RepackReport summarises one offline repack.
 type RepackReport struct {
-	Documents     int
-	SourceFileEnd int64
-	OutputFileEnd int64
+	Documents         int
+	SourceFileEnd     int64
+	OutputFileEnd     int64
+	OutputDeviceBytes uint64
 }
 
 // Repack rewrites a quiescent store into a freshly clustered one. It opens src
@@ -184,6 +185,7 @@ func Repack(src, out *os.File, options Options) (RepackReport, error) {
 	if err := target.Flush(); err != nil {
 		return report, err
 	}
+	report.OutputDeviceBytes = target.Stats().DeviceBytes
 	if state := target.state.Load(); state != nil {
 		report.OutputFileEnd = int64(state.fileEnd)
 	}
