@@ -171,12 +171,19 @@ type TailBatch struct {
 	Bytes                 uint64
 	transitions           []TailTransition
 	routes                []tailRoute
+	wireOperations        []byte
+	wireEncoded           bool
 	translated            bool
 }
 
 // Iterator returns a zero-allocation forward iterator over child-local
 // operations in strict key order.
 func (b TailBatch) Iterator() TailOperationIterator {
+	if b.wireEncoded {
+		return TailOperationIterator{
+			wire: b.wireOperations, wireRemaining: b.Operations, wireEncoded: true,
+		}
+	}
 	return TailOperationIterator{
 		child: b.Child, transitions: b.transitions, routes: b.routes,
 	}
@@ -184,17 +191,39 @@ func (b TailBatch) Iterator() TailOperationIterator {
 
 // TailOperationIterator derives at most one operation per child per key.
 type TailOperationIterator struct {
-	child       uint8
-	transitions []TailTransition
-	routes      []tailRoute
-	next        int
-	current     TailOperation
+	child         uint8
+	transitions   []TailTransition
+	routes        []tailRoute
+	next          int
+	current       TailOperation
+	wire          []byte
+	wireRemaining uint64
+	wireEncoded   bool
+	wireInvalid   bool
 }
 
 // Next advances to the next operation.
 func (i *TailOperationIterator) Next() bool {
 	if i == nil {
 		return false
+	}
+	if i.wireEncoded {
+		if i.wireInvalid || i.wireRemaining == 0 {
+			return false
+		}
+		operation, remaining, ok := openTailWireOperation(i.wire)
+		if !ok {
+			i.wireInvalid = true
+			return false
+		}
+		i.current = operation
+		i.wire = remaining
+		i.wireRemaining--
+		if i.wireRemaining == 0 && len(i.wire) != 0 {
+			i.wireInvalid = true
+			return false
+		}
+		return true
 	}
 	for i.next < len(i.transitions) {
 		ordinal := i.next
@@ -444,8 +473,9 @@ func (p *Partitioner) VerifyTailBatch(
 	workspace *TailBatchVerifyWorkspace,
 ) error {
 	if p == nil || workspace == nil || !batch.translated ||
-		uint64(len(batch.transitions)) != batch.TransitionCount ||
-		len(batch.routes) != len(batch.transitions) ||
+		(!batch.wireEncoded && (uint64(len(batch.transitions)) != batch.TransitionCount ||
+			len(batch.routes) != len(batch.transitions))) ||
+		(batch.wireEncoded && (batch.transitions != nil || batch.routes != nil)) ||
 		int(batch.Child) >= int(p.childCount) ||
 		batch.PlanDigest != p.digest || batch.PlacementDigest != p.program.Digest() ||
 		batch.TranslationDigest == ([sha256.Size]byte{}) ||
@@ -480,9 +510,7 @@ func (p *Partitioner) VerifyTailBatch(
 	_, _ = h.Write(workspace.size[:1])
 	workspace.identity = batch.ChildBaseDigest
 	_, _ = h.Write(workspace.identity[:])
-	iterator := TailOperationIterator{
-		child: batch.Child, transitions: batch.transitions, routes: batch.routes,
-	}
+	iterator := batch.Iterator()
 	var previousKey []byte
 	var operations, bytesCount uint64
 	for iterator.Next() {
@@ -515,7 +543,7 @@ func (p *Partitioner) VerifyTailBatch(
 		hashTailFrame(h, &workspace.size, operation.Value)
 		previousKey = operation.Key
 	}
-	if operations != batch.Operations || bytesCount != batch.Bytes {
+	if iterator.wireInvalid || operations != batch.Operations || bytesCount != batch.Bytes {
 		return ErrTailEntry
 	}
 	workspace.identity = batch.TranslationDigest
