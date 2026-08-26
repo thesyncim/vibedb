@@ -39,11 +39,12 @@ type SnapshotArtifactStageOptions struct {
 type SnapshotArtifactStage struct {
 	mu sync.Mutex
 
-	expected SnapshotArtifactManifest
-	system   CollectionTarget
-	user     CollectionTarget
-	capture  CollectionTarget
-	cursor   *SnapshotArtifactCursor
+	expected  SnapshotArtifactManifest
+	system    CollectionTarget
+	user      CollectionTarget
+	relations []relationCollection
+	capture   CollectionTarget
+	cursor    *SnapshotArtifactCursor
 
 	payloadBuffer   []byte
 	cursorBuffer    []byte
@@ -77,6 +78,74 @@ func NewSnapshotArtifactStageWithOptions(
 	persistedCursor []byte,
 	options SnapshotArtifactStageOptions,
 ) (*SnapshotArtifactStage, error) {
+	if expected.Bundle {
+		return nil, fmt.Errorf("%w: bundle artifact requires bundle stage", ErrSnapshotStage)
+	}
+	return newSnapshotArtifactStage(
+		expected, system, user, nil, persistedCursor, options,
+	)
+}
+
+// NewBundleSnapshotArtifactStage constructs a bounded receiver for one
+// coherent dense relation bundle. Relation IDs are the only hot chunk-routing
+// identity; names remain cold authenticated open metadata.
+func NewBundleSnapshotArtifactStage(
+	expected SnapshotArtifactManifest,
+	system CollectionTarget,
+	relations []RelationCollection,
+	persistedCursor []byte,
+) (*SnapshotArtifactStage, error) {
+	return NewBundleSnapshotArtifactStageWithOptions(
+		expected, system, relations, persistedCursor, SnapshotArtifactStageOptions{},
+	)
+}
+
+// NewBundleSnapshotArtifactStageWithOptions is
+// NewBundleSnapshotArtifactStage with an explicit replay/checkpoint budget and
+// optional proven transition-capture destination.
+func NewBundleSnapshotArtifactStageWithOptions(
+	expected SnapshotArtifactManifest,
+	system CollectionTarget,
+	relations []RelationCollection,
+	persistedCursor []byte,
+	options SnapshotArtifactStageOptions,
+) (*SnapshotArtifactStage, error) {
+	if !expected.Bundle {
+		return nil, fmt.Errorf("%w: singleton artifact requires singleton stage", ErrSnapshotStage)
+	}
+	prepared, manifestDigest, err := prepareRelationCollections(expected.State.Binding, relations)
+	if err != nil || manifestDigest != expected.RelationManifestDigest ||
+		len(prepared) != len(expected.Relations) {
+		return nil, errors.Join(
+			fmt.Errorf("%w: relation manifest", ErrSnapshotStage), err,
+		)
+	}
+	for index := range prepared {
+		relation, certificate := &prepared[index], &expected.Relations[index]
+		if relation.id != certificate.Relation || relation.kind != certificate.Kind ||
+			!bytes.Equal([]byte(relation.name), certificate.Collection) ||
+			certificate.ImageDigest == ([32]byte{}) {
+			return nil, fmt.Errorf("%w: relation %d certificate", ErrSnapshotStage, index+1)
+		}
+		for prior := 0; prior < index; prior++ {
+			if relation.target.Collection == prepared[prior].target.Collection {
+				return nil, fmt.Errorf("%w: duplicate relation target", ErrSnapshotStage)
+			}
+		}
+	}
+	return newSnapshotArtifactStage(
+		expected, system, CollectionTarget{}, prepared, persistedCursor, options,
+	)
+}
+
+func newSnapshotArtifactStage(
+	expected SnapshotArtifactManifest,
+	system CollectionTarget,
+	user CollectionTarget,
+	relations []relationCollection,
+	persistedCursor []byte,
+	options SnapshotArtifactStageOptions,
+) (*SnapshotArtifactStage, error) {
 	checkpointBytes := options.CheckpointBytes
 	if checkpointBytes == 0 {
 		checkpointBytes = DefaultSnapshotStageCheckpointBytes
@@ -93,10 +162,12 @@ func NewSnapshotArtifactStageWithOptions(
 		system.ObserveMutationAttempt != nil {
 		return nil, fmt.Errorf("%w: system target: %v", ErrSnapshotStage, err)
 	}
-	if err := user.validate(); err != nil ||
-		user.Validation != ValidationDeterministicMutation ||
-		user.ValidationDigest == ([32]byte{}) || user.Validator == nil {
-		return nil, fmt.Errorf("%w: user target: %v", ErrSnapshotStage, err)
+	if len(relations) == 0 {
+		if err := user.validate(); err != nil ||
+			user.Validation != ValidationDeterministicMutation ||
+			user.ValidationDigest == ([32]byte{}) || user.Validator == nil {
+			return nil, fmt.Errorf("%w: user target: %v", ErrSnapshotStage, err)
+		}
 	}
 	capture := options.Capture
 	captureOptional := capture.Collection == nil && expected.CaptureRows == 0 &&
@@ -107,11 +178,18 @@ func NewSnapshotArtifactStageWithOptions(
 		capture.Limits.MaxDocumentBytes > MaxTransitionCaptureRecordBytes) {
 		return nil, fmt.Errorf("%w: capture target: %v", ErrSnapshotStage, err)
 	}
-	if system.Collection == user.Collection || !captureOptional &&
-		system.Collection == capture.Collection || user.Collection == capture.Collection ||
+	if len(relations) == 0 && (system.Collection == user.Collection ||
+		user.Collection == capture.Collection ||
 		user.Limits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
-		user.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes {
+		user.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes) ||
+		!captureOptional && system.Collection == capture.Collection {
 		return nil, fmt.Errorf("%w: collection targets", ErrSnapshotStage)
+	}
+	for index := range relations {
+		target := relations[index].target.Collection
+		if target == system.Collection || !captureOptional && target == capture.Collection {
+			return nil, fmt.Errorf("%w: relation target aliases private target", ErrSnapshotStage)
+		}
 	}
 	var cursor *SnapshotArtifactCursor
 	var err error
@@ -124,7 +202,19 @@ func NewSnapshotArtifactStageWithOptions(
 			return nil, err
 		}
 	}
-	systemRows, userRows, captureRows := system.Collection.Len(), user.Collection.Len(), uint64(0)
+	systemRows, userRows, captureRows := system.Collection.Len(), uint64(0), uint64(0)
+	if len(relations) == 0 {
+		userRows = user.Collection.Len()
+	} else {
+		for index := range relations {
+			rows := relations[index].target.Collection.Len()
+			if rows > expected.Relations[index].Rows ||
+				userRows > ^uint64(0)-rows {
+				return nil, fmt.Errorf("%w: destination relation row counts exceed artifact", ErrSnapshotStage)
+			}
+			userRows += rows
+		}
+	}
 	if capture.Collection != nil {
 		captureRows = capture.Collection.Len()
 	}
@@ -137,10 +227,21 @@ func NewSnapshotArtifactStageWithOptions(
 			captureRows < prefix.CaptureRows {
 			return nil, fmt.Errorf("%w: cursor advances beyond durable rows", ErrSnapshotStage)
 		}
+		if len(relations) != 0 {
+			if len(prefix.Relations) != len(relations) {
+				return nil, fmt.Errorf("%w: cursor relation geometry", ErrSnapshotStage)
+			}
+			for index := range relations {
+				if relations[index].target.Collection.Len() < prefix.Relations[index].Rows {
+					return nil, fmt.Errorf("%w: cursor advances beyond durable relation rows", ErrSnapshotStage)
+				}
+			}
+		}
 	}
 	stage := &SnapshotArtifactStage{
 		expected: cloneSnapshotArtifactManifest(expected), system: system, user: user, capture: capture,
-		cursor: cursor, payloadBuffer: make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
+		relations: relations,
+		cursor:    cursor, payloadBuffer: make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
 		checkpointBytes: checkpointBytes,
 	}
 	if cursor != nil {
@@ -229,12 +330,31 @@ func (s *SnapshotArtifactStage) Receive(
 
 func (s *SnapshotArtifactStage) applyRows(rows SnapshotArtifactRows) error {
 	var collection *durable.Collection
+	relation := rows.Relation()
 	switch rows.Collection() {
 	case SnapshotArtifactSystem:
+		if relation != 0 {
+			return fmt.Errorf("%w: private chunk relation", ErrSnapshotStage)
+		}
 		collection = s.system.Collection
 	case SnapshotArtifactUser:
-		collection = s.user.Collection
+		if len(s.relations) == 0 {
+			if relation != 0 {
+				return fmt.Errorf("%w: singleton chunk relation", ErrSnapshotStage)
+			}
+			collection = s.user.Collection
+		} else {
+			ordinal := int(relation) - 1
+			if relation == 0 || ordinal < 0 || ordinal >= len(s.relations) ||
+				s.relations[ordinal].id != relation {
+				return fmt.Errorf("%w: bundle chunk relation", ErrSnapshotStage)
+			}
+			collection = s.relations[ordinal].target.Collection
+		}
 	case SnapshotArtifactCapture:
+		if relation != 0 {
+			return fmt.Errorf("%w: private chunk relation", ErrSnapshotStage)
+		}
 		if s.capture.Collection == nil {
 			return fmt.Errorf("%w: absent capture target", ErrSnapshotStage)
 		}
@@ -288,6 +408,26 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	txnLog *durable.TxnLog,
 	options Options,
 ) (*Machine, error) {
+	return s.openCandidate(bootstrap, txnLog, options, false)
+}
+
+// OpenCandidateBundle performs the final cross-relation image and publication
+// proof through OpenBundle. The returned machine remains non-serving until the
+// caller completes learner catch-up and the topology cutover.
+func (s *SnapshotArtifactStage) OpenCandidateBundle(
+	bootstrap *pb.Snapshot,
+	txnLog *durable.TxnLog,
+	options Options,
+) (*Machine, error) {
+	return s.openCandidate(bootstrap, txnLog, options, true)
+}
+
+func (s *SnapshotArtifactStage) openCandidate(
+	bootstrap *pb.Snapshot,
+	txnLog *durable.TxnLog,
+	options Options,
+	bundle bool,
+) (*Machine, error) {
 	if s == nil {
 		return nil, fmt.Errorf("%w: nil stage", ErrSnapshotStage)
 	}
@@ -298,6 +438,9 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	}
 	if s.opened {
 		return nil, fmt.Errorf("%w: candidate already opened", ErrSnapshotStage)
+	}
+	if bundle != (len(s.relations) != 0) || bundle != s.expected.Bundle {
+		return nil, fmt.Errorf("%w: candidate artifact shape", ErrSnapshotStage)
 	}
 	// The stage's capture target is the independently verified destination.
 	// Never let caller options redirect the opened Machine to another opaque
@@ -317,11 +460,28 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 		}
 		options.TransitionCaptureTarget = want
 	}
-	machine, err := Open(
-		s.expected.State.Binding, bootstrap, s.system,
-		UserCollection{Name: string(s.expected.UserCollection), Target: s.user},
-		txnLog, options,
-	)
+	var machine *Machine
+	var err error
+	if bundle {
+		specs := make([]RelationCollection, len(s.relations))
+		for index := range s.relations {
+			relation := &s.relations[index]
+			specs[index] = RelationCollection{
+				Relation: relation.id, Kind: relation.kind, Name: relation.name,
+				Target: relation.target, LocalIndexes: relation.localIndexes,
+				GlobalIndex: relation.globalIndex,
+			}
+		}
+		machine, err = OpenBundle(
+			s.expected.State.Binding, bootstrap, s.system, specs, txnLog, options,
+		)
+	} else {
+		machine, err = Open(
+			s.expected.State.Binding, bootstrap, s.system,
+			UserCollection{Name: string(s.expected.UserCollection), Target: s.user},
+			txnLog, options,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -335,6 +495,21 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 		if digestErr != nil || closeErr != nil || s.capture.Collection.Len() != s.expected.CaptureRows ||
 			captureDigest != s.expected.CaptureImageDigest {
 			return nil, errors.Join(fmt.Errorf("%w: candidate capture image", ErrSnapshotStage), digestErr, closeErr)
+		}
+	}
+	if bundle {
+		if machine.manifestDigest != s.expected.RelationManifestDigest ||
+			len(machine.relations) != len(s.expected.Relations) {
+			return nil, fmt.Errorf("%w: candidate relation manifest", ErrSnapshotStage)
+		}
+		for index := range machine.relations {
+			relation, certificate := &machine.relations[index], &s.expected.Relations[index]
+			if relation.id != certificate.Relation || relation.kind != certificate.Kind ||
+				!bytes.Equal([]byte(relation.name), certificate.Collection) ||
+				relation.target.Collection.Len() != certificate.Rows ||
+				relation.openedImage != certificate.ImageDigest {
+				return nil, fmt.Errorf("%w: candidate relation %d image", ErrSnapshotStage, index+1)
+			}
 		}
 	}
 	if machine.openedImageApplied != s.expected.State.Applied ||
@@ -412,8 +587,7 @@ func (s *SnapshotArtifactStage) AppendRecoveredSeed(
 func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 	wantSystemRows, systemRowsOK := stateSystemRowCount(expected.State)
 	if err := validateState(expected.State); err != nil ||
-		expected.Seeded || expected.Bundle || len(expected.Relations) != 0 ||
-		expected.RelationManifestDigest != ([32]byte{}) ||
+		expected.Seeded ||
 		len(expected.UserCollection) == 0 ||
 		len(expected.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(expected.UserCollection) || bytes.IndexByte(expected.UserCollection, 0) >= 0 ||
@@ -428,16 +602,67 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		expected.Digest == ([32]byte{}) {
 		return fmt.Errorf("%w: expected artifact", ErrSnapshotStage)
 	}
+	if expected.Bundle {
+		if len(expected.Relations) < 2 ||
+			len(expected.Relations) > replication.MaxRelationsPerBundle ||
+			expected.RelationManifestDigest == ([32]byte{}) {
+			return fmt.Errorf("%w: expected relation manifest", ErrSnapshotStage)
+		}
+		var rows uint64
+		for index := range expected.Relations {
+			relation := &expected.Relations[index]
+			if relation.Relation != replication.RelationID(index+1) ||
+				(relation.Kind != RelationJSON && relation.Kind != RelationGlobalIndex) ||
+				len(relation.Collection) == 0 ||
+				len(relation.Collection) > replication.MaxIdentityBytes ||
+				!utf8.Valid(relation.Collection) ||
+				bytes.IndexByte(relation.Collection, 0) >= 0 ||
+				relation.ImageDigest == ([32]byte{}) || rows > ^uint64(0)-relation.Rows {
+				return fmt.Errorf("%w: expected relation %d", ErrSnapshotStage, index+1)
+			}
+			for prior := 0; prior < index; prior++ {
+				if bytes.Equal(relation.Collection, expected.Relations[prior].Collection) {
+					return fmt.Errorf("%w: duplicate expected relation", ErrSnapshotStage)
+				}
+			}
+			rows += relation.Rows
+		}
+		if expected.Relations[0].Kind != RelationJSON ||
+			!bytes.Equal(expected.Relations[0].Collection, expected.UserCollection) ||
+			rows != expected.UserRows {
+			return fmt.Errorf("%w: expected relation geometry", ErrSnapshotStage)
+		}
+	} else if len(expected.Relations) != 0 ||
+		expected.RelationManifestDigest != ([32]byte{}) {
+		return fmt.Errorf("%w: singleton relation manifest", ErrSnapshotStage)
+	}
 	stateEnvelope, err := AppendState(nil, expected.State)
 	if err != nil {
 		return fmt.Errorf("%w: expected state", ErrSnapshotStage)
 	}
-	header, headerDigest, err := makeSnapshotArtifactHeader(
+	headerRelations := make([]SnapshotArtifactRelation, len(expected.Relations))
+	for index := range expected.Relations {
+		headerRelations[index] = SnapshotArtifactRelation{
+			Relation:   expected.Relations[index].Relation,
+			Kind:       expected.Relations[index].Kind,
+			Collection: expected.Relations[index].Collection,
+		}
+	}
+	header, headerDigest, err := makeSnapshotArtifactHeaderForRelations(
 		stateEnvelope, string(expected.UserCollection), int(expected.TargetChunkBytes),
+		expected.RelationManifestDigest, headerRelations, expected.Bundle,
 	)
 	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
 		uint64(len(header)), expected.Chunks, expected.PayloadBytes, true,
 	)
+	if expected.Bundle {
+		certificates := uint64(len(expected.Relations)) * snapshotArtifactRelationBytes
+		if !encodedBytesOK || wantEncodedBytes > ^uint64(0)-certificates {
+			encodedBytesOK = false
+		} else {
+			wantEncodedBytes += certificates
+		}
+	}
 	_, wantFooterDigest := makeSnapshotArtifactFooter(
 		expected.Chunks, expected.SystemRows, expected.UserRows, expected.CaptureRows,
 		expected.PayloadBytes, expected.EncodedBytes,
@@ -458,12 +683,23 @@ func snapshotArtifactPrefixMatchesExpected(
 ) error {
 	if !equalState(prefix.State, expected.State) ||
 		!bytes.Equal(prefix.UserCollection, expected.UserCollection) ||
+		prefix.Bundle != expected.Bundle ||
+		prefix.RelationManifestDigest != expected.RelationManifestDigest ||
+		len(prefix.Relations) != len(expected.Relations) ||
 		prefix.TargetChunkBytes != expected.TargetChunkBytes ||
 		prefix.HeaderDigest != expected.HeaderDigest ||
 		prefix.Chunks > expected.Chunks || prefix.SystemRows > expected.SystemRows ||
 		prefix.UserRows > expected.UserRows || prefix.CaptureRows > expected.CaptureRows ||
 		prefix.PayloadBytes > expected.PayloadBytes {
 		return fmt.Errorf("%w: cursor belongs to another artifact", ErrSnapshotStage)
+	}
+	for index := range prefix.Relations {
+		got, want := &prefix.Relations[index], &expected.Relations[index]
+		if got.Relation != want.Relation || got.Kind != want.Kind ||
+			!bytes.Equal(got.Collection, want.Collection) || got.Rows > want.Rows ||
+			(got.ImageDigest != ([32]byte{}) && got.ImageDigest != want.ImageDigest) {
+			return fmt.Errorf("%w: cursor relation belongs to another artifact", ErrSnapshotStage)
+		}
 	}
 	return nil
 }

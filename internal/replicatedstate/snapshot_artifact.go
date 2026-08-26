@@ -16,12 +16,14 @@ import (
 )
 
 const (
-	snapshotArtifactFormat           = uint16(1)
-	snapshotArtifactHeaderFixedBytes = 64
-	snapshotArtifactChunkHeaderBytes = 96
-	snapshotArtifactFooterBytes      = 240
-	snapshotArtifactChecksumBytes    = sha256.Size
-	snapshotArtifactRowHeaderBytes   = 8
+	snapshotArtifactFormat             = uint16(1)
+	snapshotArtifactHeaderFixedBytes   = 64
+	snapshotArtifactChunkHeaderBytes   = 96
+	snapshotArtifactRelationBytes      = 128
+	snapshotArtifactRelationFixedBytes = 8
+	snapshotArtifactFooterBytes        = 240
+	snapshotArtifactChecksumBytes      = sha256.Size
+	snapshotArtifactRowHeaderBytes     = 8
 
 	// DefaultSnapshotArtifactChunkBytes bounds the ordinary retained transfer
 	// buffer. A single larger row is emitted alone from borrowed row segments,
@@ -38,7 +40,8 @@ const (
 	// authenticates completion but carries no mutable receive progress.
 	SnapshotArtifactFooterBytes    = snapshotArtifactFooterBytes
 	maxSnapshotArtifactHeaderBytes = snapshotArtifactHeaderFixedBytes +
-		MaxStateEnvelopeBytes + replication.MaxCollectionBytes + snapshotArtifactChecksumBytes
+		MaxStateEnvelopeBytes + replication.MaxCollectionBytes + snapshotArtifactChecksumBytes +
+		sha256.Size + replication.MaxRelationsPerBundle*(snapshotArtifactRelationFixedBytes+replication.MaxIdentityBytes)
 )
 
 // MaxTransitionCaptureRecordBytes is the global bound for one compact capture
@@ -58,14 +61,18 @@ const (
 )
 
 var (
-	snapshotArtifactHeaderMagic  = [8]byte{'V', 'D', 'B', 'S', 'N', 'A', 'P', 0}
-	snapshotArtifactChunkMagic   = [8]byte{'V', 'D', 'B', 'S', 'C', 'H', 'K', 0}
-	snapshotArtifactFooterMagic  = [8]byte{'V', 'D', 'B', 'S', 'E', 'N', 'D', 0}
-	snapshotArtifactHeaderDomain = []byte(
+	snapshotArtifactHeaderMagic   = [8]byte{'V', 'D', 'B', 'S', 'N', 'A', 'P', 0}
+	snapshotArtifactChunkMagic    = [8]byte{'V', 'D', 'B', 'S', 'C', 'H', 'K', 0}
+	snapshotArtifactRelationMagic = [8]byte{'V', 'D', 'B', 'S', 'R', 'E', 'L', 0}
+	snapshotArtifactFooterMagic   = [8]byte{'V', 'D', 'B', 'S', 'E', 'N', 'D', 0}
+	snapshotArtifactHeaderDomain  = []byte(
 		"vibedb/replicated-state/snapshot-artifact-header\x00",
 	)
 	snapshotArtifactChunkDomain = []byte(
 		"vibedb/replicated-state/snapshot-artifact-chunk\x00",
+	)
+	snapshotArtifactRelationDomain = []byte(
+		"vibedb/replicated-state/snapshot-artifact-relation\x00",
 	)
 	snapshotArtifactFooterDomain = []byte(
 		"vibedb/replicated-state/snapshot-artifact-footer\x00",
@@ -141,6 +148,7 @@ func RequiredSnapshotArtifactPayloadCapacity(
 type SnapshotArtifactCheckpoint struct {
 	Sequence     uint64
 	Collection   SnapshotArtifactCollection
+	Relation     replication.RelationID
 	Rows         uint64
 	PayloadBytes uint64
 	EndOffset    uint64
@@ -169,12 +177,17 @@ type SnapshotArtifactCallbacks struct {
 // borrows its payload only for the Rows callback that receives it.
 type SnapshotArtifactRows struct {
 	collection SnapshotArtifactCollection
+	relation   replication.RelationID
 	payload    []byte
 	rows       uint64
 }
 
 // Collection returns the collection shared by every row in the chunk.
 func (r SnapshotArtifactRows) Collection() SnapshotArtifactCollection { return r.collection }
+
+// Relation returns the dense relation ID for user chunks and zero for hidden
+// system or transition-capture chunks.
+func (r SnapshotArtifactRows) Relation() replication.RelationID { return r.relation }
 
 // Len returns the exact row count in the chunk.
 func (r SnapshotArtifactRows) Len() uint64 { return r.rows }
@@ -221,6 +234,7 @@ type SnapshotArtifactCursor struct {
 	previousKey           [replication.MaxMutationKeyBytes]byte
 	previousKeyBytes      uint16
 	currentCollection     SnapshotArtifactCollection
+	nextRelation          replication.RelationID
 	stateRowSeen          bool
 	captureImageDigest    [sha256.Size]byte
 }
@@ -265,9 +279,8 @@ func (c *SnapshotArtifactCursor) PrefixManifest() SnapshotArtifactManifest {
 type SnapshotArtifactManifest struct {
 	State          State
 	UserCollection []byte
-	// Bundle identifies a compact certificate over one coherent fixed relation
-	// set. Bundle certificates carry no streamed-artifact geometry; each
-	// relation image is authenticated below and remains in its durable file.
+	// Bundle identifies one coherent fixed relation set. A zero chunk target is a
+	// compact no-copy certificate; a nonzero target is one streamed bundle.
 	Bundle                 bool
 	RelationManifestDigest [sha256.Size]byte
 	Relations              []SnapshotArtifactRelation
@@ -303,11 +316,21 @@ type SnapshotArtifactRelation struct {
 	ImageDigest [sha256.Size]byte
 }
 
+// Clone returns an independently owned manifest suitable for retention across
+// caller mutation, asynchronous transfer, or activation recovery.
+func (m SnapshotArtifactManifest) Clone() SnapshotArtifactManifest {
+	return cloneSnapshotArtifactManifest(m)
+}
+
 type snapshotArtifactWriter struct {
 	w              io.Writer
 	target         int
 	payload        []byte
 	collection     SnapshotArtifactCollection
+	relation       replication.RelationID
+	relationKind   RelationKind
+	locatorCount   uint8
+	bundle         bool
 	chunkRows      uint32
 	chunks         uint64
 	systemRows     uint64
@@ -320,6 +343,7 @@ type snapshotArtifactWriter struct {
 	chunkHeader    [snapshotArtifactChunkHeaderBytes]byte
 	rowHeader      [snapshotArtifactRowHeaderBytes]byte
 	chunkDigest    [sha256.Size]byte
+	relationRecord [snapshotArtifactRelationBytes]byte
 	image          *canonicalImageHasher
 	captureImage   [sha256.Size]byte
 }
@@ -360,7 +384,26 @@ func WriteSnapshotArtifact(
 	if err != nil {
 		return SnapshotArtifactManifest{}, fmt.Errorf("%w: state envelope: %v", ErrSnapshotArtifact, err)
 	}
-	header, headerDigest, err := makeSnapshotArtifactHeader(stateEnvelope, snapshot.userName, target)
+	if len(snapshot.relations) == 0 {
+		return SnapshotArtifactManifest{}, ErrInconsistentSnapshot
+	}
+	bundle := len(snapshot.relations) > 1
+	relations := make([]SnapshotArtifactRelation, len(snapshot.relations))
+	for i := range snapshot.relations {
+		relation := &snapshot.relations[i]
+		relations[i] = SnapshotArtifactRelation{
+			Relation: relation.id, Kind: relation.kind, Collection: []byte(relation.name),
+		}
+	}
+	headerRelations := relations
+	headerManifestDigest := snapshot.manifestDigest
+	if !bundle {
+		headerRelations = nil
+		headerManifestDigest = [sha256.Size]byte{}
+	}
+	header, headerDigest, err := makeSnapshotArtifactHeaderForRelations(
+		stateEnvelope, snapshot.userName, target, headerManifestDigest, headerRelations, bundle,
+	)
 	if err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
@@ -370,29 +413,50 @@ func WriteSnapshotArtifact(
 	writer := snapshotArtifactWriter{
 		w: w, target: target, payload: payload,
 		encodedBytes: uint64(len(header)), headerDigest: headerDigest,
-		previousDigest: headerDigest,
-	}
-	writer.image, err = newCanonicalImageHasher(
-		snapshot.userName, snapshot.validation, snapshot.validationDigest, snapshot.validator,
-	)
-	if err != nil {
-		return SnapshotArtifactManifest{}, err
+		previousDigest: headerDigest, bundle: bundle,
 	}
 	writer.captureImage = snapshotArtifactEmptyCaptureImageDigest()
 	if err := writer.writeCollection(SnapshotArtifactSystem, snapshot.RangeSystem); err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
-	user, ok := snapshot.Collection(snapshot.userName)
-	if !ok || user == nil {
-		return SnapshotArtifactManifest{}, ErrInconsistentSnapshot
+	for i := range snapshot.relations {
+		relation := &snapshot.relations[i]
+		user, ok := snapshot.Relation(relation.id)
+		if !ok || user == nil {
+			return SnapshotArtifactManifest{}, ErrInconsistentSnapshot
+		}
+		writer.relation = 0
+		if bundle {
+			writer.relation = relation.id
+		}
+		writer.relationKind = relation.kind
+		writer.locatorCount = relation.globalIndex.LocatorCount
+		writer.image, err = newCanonicalImageHasher(
+			relation.name, relation.target.Validation,
+			relation.target.ValidationDigest, relation.target.Validator,
+		)
+		if err != nil {
+			return SnapshotArtifactManifest{}, err
+		}
+		before := writer.userRows
+		if err := writer.writeCollection(SnapshotArtifactUser, user.RangeRaw); err != nil {
+			return SnapshotArtifactManifest{}, err
+		}
+		relations[i].Rows = writer.userRows - before
+		relations[i].ImageDigest = writer.image.sum()
+		if bundle {
+			if err := writer.writeRelationCertificate(relations[i]); err != nil {
+				return SnapshotArtifactManifest{}, err
+			}
+		}
 	}
-	if err := writer.writeCollection(SnapshotArtifactUser, user.RangeRaw); err != nil {
-		return SnapshotArtifactManifest{}, err
-	}
+	writer.relation = 0
+	writer.relationKind = 0
+	writer.locatorCount = 0
 	if err := writer.writeCollection(SnapshotArtifactCapture, snapshot.RangeCapture); err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
-	imageDigest := writer.image.sum()
+	imageDigest := canonicalBundleImageDigest(relations)
 	captureImageDigest := writer.captureImage
 	digest, err := writer.writeFooter(imageDigest, captureImageDigest)
 	if err != nil {
@@ -400,6 +464,18 @@ func WriteSnapshotArtifact(
 	}
 	return SnapshotArtifactManifest{
 		State: cloneState(snapshot.state), UserCollection: []byte(snapshot.userName),
+		Bundle: bundle, Relations: func() []SnapshotArtifactRelation {
+			if !bundle {
+				return nil
+			}
+			return relations
+		}(),
+		RelationManifestDigest: func() [sha256.Size]byte {
+			if bundle {
+				return snapshot.manifestDigest
+			}
+			return [sha256.Size]byte{}
+		}(),
 		TargetChunkBytes: uint32(target), Chunks: writer.chunks,
 		SystemRows: writer.systemRows, UserRows: writer.userRows, CaptureRows: writer.captureRows,
 		PayloadBytes: writer.payloadBytes, EncodedBytes: writer.encodedBytes,
@@ -424,12 +500,55 @@ func makeSnapshotArtifactHeader(
 	userName string,
 	target int,
 ) ([]byte, [sha256.Size]byte, error) {
+	return makeSnapshotArtifactHeaderForRelations(
+		stateEnvelope, userName, target, [sha256.Size]byte{}, nil, false,
+	)
+}
+
+func makeSnapshotArtifactHeaderForRelations(
+	stateEnvelope []byte,
+	userName string,
+	target int,
+	manifestDigest [sha256.Size]byte,
+	relations []SnapshotArtifactRelation,
+	bundle bool,
+) ([]byte, [sha256.Size]byte, error) {
 	if len(stateEnvelope) == 0 || len(stateEnvelope) > MaxStateEnvelopeBytes ||
 		len(userName) == 0 || len(userName) > replication.MaxCollectionBytes {
 		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: header fields", ErrSnapshotArtifactBound)
 	}
+	descriptorBytes := 0
+	if bundle {
+		if len(relations) < 2 || len(relations) > replication.MaxRelationsPerBundle ||
+			manifestDigest == ([sha256.Size]byte{}) {
+			return nil, [sha256.Size]byte{}, fmt.Errorf("%w: relation header", ErrSnapshotArtifactBound)
+		}
+		descriptorBytes = sha256.Size
+		for i := range relations {
+			relation := &relations[i]
+			if relation.Relation != replication.RelationID(i+1) ||
+				(relation.Kind != RelationJSON && relation.Kind != RelationGlobalIndex) ||
+				len(relation.Collection) == 0 || len(relation.Collection) > replication.MaxIdentityBytes ||
+				!utf8.Valid(relation.Collection) || bytes.IndexByte(relation.Collection, 0) >= 0 ||
+				bytes.Equal(relation.Collection, []byte(systemCollectionName)) ||
+				relation.Rows != 0 || relation.ImageDigest != ([sha256.Size]byte{}) {
+				return nil, [sha256.Size]byte{}, fmt.Errorf("%w: relation header %d", ErrSnapshotArtifact, i+1)
+			}
+			for prior := 0; prior < i; prior++ {
+				if bytes.Equal(relation.Collection, relations[prior].Collection) {
+					return nil, [sha256.Size]byte{}, fmt.Errorf("%w: duplicate relation header", ErrSnapshotArtifact)
+				}
+			}
+			descriptorBytes += snapshotArtifactRelationFixedBytes + len(relation.Collection)
+		}
+		if !bytes.Equal(relations[0].Collection, []byte(userName)) {
+			return nil, [sha256.Size]byte{}, fmt.Errorf("%w: primary relation", ErrSnapshotArtifact)
+		}
+	} else if len(relations) != 0 || manifestDigest != ([sha256.Size]byte{}) {
+		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: singleton relation header", ErrSnapshotArtifact)
+	}
 	total := snapshotArtifactHeaderFixedBytes + len(stateEnvelope) + len(userName) +
-		snapshotArtifactChecksumBytes
+		descriptorBytes + snapshotArtifactChecksumBytes
 	if total > maxSnapshotArtifactHeaderBytes || uint64(total) > math.MaxUint32 {
 		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: header bytes", ErrSnapshotArtifactBound)
 	}
@@ -440,11 +559,30 @@ func makeSnapshotArtifactHeader(
 	binary.LittleEndian.PutUint32(header[12:16], uint32(total))
 	binary.LittleEndian.PutUint32(header[16:20], uint32(len(stateEnvelope)))
 	binary.LittleEndian.PutUint16(header[20:22], uint16(len(userName)))
+	if bundle {
+		binary.LittleEndian.PutUint16(header[22:24], 1)
+		binary.LittleEndian.PutUint16(header[32:34], uint16(len(relations)))
+		binary.LittleEndian.PutUint32(header[36:40], uint32(descriptorBytes))
+	}
 	binary.LittleEndian.PutUint32(header[24:28], uint32(target))
 	binary.LittleEndian.PutUint32(header[28:32], MaxSnapshotArtifactChunkBytes)
 	cursor := snapshotArtifactHeaderFixedBytes
 	cursor += copy(header[cursor:], stateEnvelope)
-	copy(header[cursor:], userName)
+	cursor += copy(header[cursor:], userName)
+	if bundle {
+		cursor += copy(header[cursor:], manifestDigest[:])
+		for i := range relations {
+			relation := &relations[i]
+			binary.LittleEndian.PutUint16(header[cursor:cursor+2], uint16(relation.Relation))
+			header[cursor+2] = byte(relation.Kind)
+			binary.LittleEndian.PutUint16(header[cursor+4:cursor+6], uint16(len(relation.Collection)))
+			cursor += snapshotArtifactRelationFixedBytes
+			cursor += copy(header[cursor:], relation.Collection)
+		}
+	}
+	if cursor != len(header)-sha256.Size {
+		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: header geometry", ErrSnapshotArtifact)
+	}
 	digest := snapshotArtifactDigest(snapshotArtifactHeaderDomain, header[:len(header)-sha256.Size])
 	copy(header[len(header)-sha256.Size:], digest[:])
 	return header, digest, nil
@@ -460,6 +598,10 @@ func (w *snapshotArtifactWriter) writeCollection(
 	w.collection = collection
 	err := rangeRows(func(key, value []byte) error {
 		if collection == SnapshotArtifactUser {
+			if w.relationKind == RelationGlobalIndex &&
+				!validGlobalIndexLocator(value, w.locatorCount) {
+				return ErrSchemaProfile
+			}
 			if err := w.image.add(key, value); err != nil {
 				return err
 			}
@@ -578,6 +720,35 @@ func (w *snapshotArtifactWriter) writeExceptionalRow(
 	return nil
 }
 
+func (w *snapshotArtifactWriter) writeRelationCertificate(
+	relation SnapshotArtifactRelation,
+) error {
+	if !w.bundle || relation.Relation == 0 || relation.Relation != w.relation ||
+		relation.Kind != w.relationKind || relation.ImageDigest == ([sha256.Size]byte{}) ||
+		len(w.payload) != 0 || w.chunkRows != 0 ||
+		w.encodedBytes > math.MaxUint64-snapshotArtifactRelationBytes {
+		return fmt.Errorf("%w: relation certificate state", ErrSnapshotArtifact)
+	}
+	clear(w.relationRecord[:])
+	copy(w.relationRecord[0:8], snapshotArtifactRelationMagic[:])
+	binary.LittleEndian.PutUint16(w.relationRecord[8:10], snapshotArtifactFormat)
+	binary.LittleEndian.PutUint16(w.relationRecord[10:12], snapshotArtifactRelationBytes)
+	binary.LittleEndian.PutUint32(w.relationRecord[12:16], snapshotArtifactRelationBytes)
+	binary.LittleEndian.PutUint16(w.relationRecord[16:18], uint16(relation.Relation))
+	w.relationRecord[18] = byte(relation.Kind)
+	binary.LittleEndian.PutUint64(w.relationRecord[24:32], relation.Rows)
+	copy(w.relationRecord[32:64], relation.ImageDigest[:])
+	copy(w.relationRecord[64:96], w.previousDigest[:])
+	digest := snapshotArtifactDigest(snapshotArtifactRelationDomain, w.relationRecord[:96])
+	copy(w.relationRecord[96:128], digest[:])
+	if err := writeSnapshotArtifactBytes(w.w, w.relationRecord[:]); err != nil {
+		return err
+	}
+	w.encodedBytes += snapshotArtifactRelationBytes
+	w.previousDigest = digest
+	return nil
+}
+
 func (w *snapshotArtifactWriter) prepareChunk(
 	payloadBytes int,
 	rows uint32,
@@ -616,6 +787,9 @@ func (w *snapshotArtifactWriter) prepareChunk(
 	binary.LittleEndian.PutUint32(w.chunkHeader[12:16], uint32(total))
 	binary.LittleEndian.PutUint64(w.chunkHeader[16:24], w.chunks)
 	w.chunkHeader[24] = byte(w.collection)
+	if w.collection == SnapshotArtifactUser {
+		binary.LittleEndian.PutUint16(w.chunkHeader[26:28], uint16(w.relation))
+	}
 	binary.LittleEndian.PutUint32(w.chunkHeader[28:32], rows)
 	binary.LittleEndian.PutUint32(w.chunkHeader[32:36], uint32(payloadBytes))
 	copy(w.chunkHeader[48:80], w.previousDigest[:])
@@ -699,11 +873,27 @@ func snapshotArtifactEncodedBytes(
 	payloadBytes uint64,
 	withFooter bool,
 ) (uint64, bool) {
+	return snapshotArtifactEncodedBytesWithRelations(
+		headerBytes, chunks, payloadBytes, 0, withFooter,
+	)
+}
+
+func snapshotArtifactEncodedBytesWithRelations(
+	headerBytes uint64,
+	chunks uint64,
+	payloadBytes uint64,
+	relationCertificates uint64,
+	withFooter bool,
+) (uint64, bool) {
 	const chunkOverhead = uint64(snapshotArtifactChunkHeaderBytes + sha256.Size)
-	if headerBytes == 0 || chunks > math.MaxUint64/chunkOverhead {
+	if headerBytes == 0 || chunks > math.MaxUint64/chunkOverhead ||
+		relationCertificates > math.MaxUint64/snapshotArtifactRelationBytes {
 		return 0, false
 	}
-	total := chunks * chunkOverhead
+	total := chunks*chunkOverhead + relationCertificates*snapshotArtifactRelationBytes
+	if total < chunks*chunkOverhead {
+		return 0, false
+	}
 	if headerBytes > math.MaxUint64-total {
 		return 0, false
 	}
@@ -764,11 +954,20 @@ func ContinueSnapshotArtifact(
 			currentCollection:  SnapshotArtifactSystem,
 			captureImageDigest: snapshotArtifactEmptyCaptureImageDigest(),
 		}
+		if headerManifest.Bundle {
+			current.nextRelation = 1
+		}
 	} else {
 		if err := validateSnapshotArtifactCursor(cursor); err != nil {
 			return SnapshotArtifactManifest{}, cursor, err
 		}
 		current = *cursor
+		// A persisted cursor is an immutable verified-prefix capability. Detach
+		// its small bounded relation table once per resumed range so speculative
+		// chunk accounting cannot mutate the caller's prior cursor.
+		current.manifest.Relations = append(
+			[]SnapshotArtifactRelation(nil), cursor.manifest.Relations...,
+		)
 	}
 	payload := callbacks.PayloadBuffer[:0]
 	if payload == nil {
@@ -789,7 +988,8 @@ func ContinueSnapshotArtifact(
 			}
 			chunk, payloadBytes, err := validateSnapshotArtifactChunkHeader(
 				header[:], current.nextSequence, current.previousDigest,
-				current.currentCollection,
+				current.currentCollection, current.manifest.Bundle,
+				current.nextRelation, len(current.manifest.Relations),
 			)
 			if err != nil {
 				return SnapshotArtifactManifest{}, &current, err
@@ -838,7 +1038,7 @@ func ContinueSnapshotArtifact(
 					fmt.Errorf("%w: capture rows", ErrSnapshotArtifactBound)
 			}
 			checkpoint := SnapshotArtifactCheckpoint{
-				Sequence: chunk.Sequence, Collection: chunk.Collection,
+				Sequence: chunk.Sequence, Collection: chunk.Collection, Relation: chunk.Relation,
 				Rows: chunk.Rows, PayloadBytes: uint64(payloadBytes),
 				EndOffset: current.encodedBytes + chunkBytes, Digest: storedDigest,
 			}
@@ -876,10 +1076,22 @@ func ContinueSnapshotArtifact(
 			candidate.stateRowSeen = candidate.stateRowSeen || seenState
 			candidate.encodedBytes = checkpoint.EndOffset
 			candidate.manifest.PayloadBytes += uint64(payloadBytes)
+			var relationRows *uint64
+			var priorRelationRows uint64
 			if chunk.Collection == SnapshotArtifactSystem {
 				candidate.manifest.SystemRows += chunk.Rows
 			} else if chunk.Collection == SnapshotArtifactUser {
 				candidate.manifest.UserRows += chunk.Rows
+				if candidate.manifest.Bundle {
+					relation := &candidate.manifest.Relations[int(chunk.Relation)-1]
+					if relation.Rows > math.MaxUint64-chunk.Rows {
+						return SnapshotArtifactManifest{}, &current,
+							fmt.Errorf("%w: relation rows", ErrSnapshotArtifactBound)
+					}
+					relationRows = &relation.Rows
+					priorRelationRows = relation.Rows
+					relation.Rows += chunk.Rows
+				}
 			} else {
 				candidate.manifest.CaptureRows += chunk.Rows
 			}
@@ -889,16 +1101,48 @@ func ContinueSnapshotArtifact(
 			candidate.nextSequence++
 			if callbacks.Rows != nil {
 				if err := callbacks.Rows(checkpoint, SnapshotArtifactRows{
-					collection: chunk.Collection, payload: payload, rows: chunk.Rows,
+					collection: chunk.Collection, relation: chunk.Relation,
+					payload: payload, rows: chunk.Rows,
 				}); err != nil {
+					if relationRows != nil {
+						*relationRows = priorRelationRows
+					}
 					return SnapshotArtifactManifest{}, &current, err
 				}
 			}
 			if callbacks.Chunk != nil {
 				if err := callbacks.Chunk(checkpoint, &candidate); err != nil {
+					if relationRows != nil {
+						*relationRows = priorRelationRows
+					}
 					return SnapshotArtifactManifest{}, &current, err
 				}
 			}
+			current = candidate
+		case snapshotArtifactRelationMagic:
+			var record [snapshotArtifactRelationBytes]byte
+			copy(record[:8], magic[:])
+			if err := readSnapshotArtifactBytes(r, record[8:], "relation certificate"); err != nil {
+				return SnapshotArtifactManifest{}, &current, err
+			}
+			relation, digest, err := validateSnapshotArtifactRelation(
+				record[:], current.manifest, current.nextRelation, current.previousDigest,
+			)
+			if err != nil {
+				return SnapshotArtifactManifest{}, &current, err
+			}
+			if current.encodedBytes > math.MaxUint64-snapshotArtifactRelationBytes {
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: relation certificate bytes", ErrSnapshotArtifactBound)
+			}
+			candidate := current
+			candidate.manifest.Relations[int(relation.Relation)-1].ImageDigest = relation.ImageDigest
+			candidate.encodedBytes += snapshotArtifactRelationBytes
+			candidate.previousDigest = digest
+			candidate.manifest.LastChunkDigest = digest
+			candidate.currentCollection = SnapshotArtifactUser
+			candidate.previousKeyBytes = 0
+			candidate.nextRelation++
 			current = candidate
 		case snapshotArtifactFooterMagic:
 			var footer [snapshotArtifactFooterBytes]byte
@@ -917,6 +1161,14 @@ func ContinueSnapshotArtifact(
 			if current.captureImageDigest != certified {
 				return SnapshotArtifactManifest{}, &current,
 					fmt.Errorf("%w: capture image digest", ErrSnapshotArtifact)
+			}
+			var image [sha256.Size]byte
+			copy(image[:], footer[136:168])
+			if current.manifest.Bundle &&
+				(current.nextRelation != replication.RelationID(len(current.manifest.Relations)+1) ||
+					canonicalBundleImageDigest(current.manifest.Relations) != image) {
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: relation image", ErrSnapshotArtifact)
 			}
 			manifest = cloneSnapshotArtifactManifest(current.manifest)
 			manifest.EncodedBytes = current.encodedBytes + snapshotArtifactFooterBytes
@@ -942,8 +1194,6 @@ func ContinueSnapshotArtifact(
 
 func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	if cursor == nil || cursor.encodedBytes == 0 ||
-		cursor.manifest.Bundle || len(cursor.manifest.Relations) != 0 ||
-		cursor.manifest.RelationManifestDigest != ([sha256.Size]byte{}) ||
 		cursor.nextSequence != cursor.manifest.Chunks ||
 		cursor.previousDigest != cursor.manifest.LastChunkDigest ||
 		cursor.manifest.ImageDigest != ([sha256.Size]byte{}) ||
@@ -960,6 +1210,55 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		len(cursor.expectedStateDocument) == 0 {
 		return fmt.Errorf("%w: resume cursor", ErrSnapshotArtifact)
 	}
+	completedRelations := 0
+	headerRelations := []SnapshotArtifactRelation(nil)
+	headerManifestDigest := [sha256.Size]byte{}
+	if cursor.manifest.Bundle {
+		if len(cursor.manifest.Relations) < 2 ||
+			len(cursor.manifest.Relations) > replication.MaxRelationsPerBundle ||
+			cursor.manifest.RelationManifestDigest == ([sha256.Size]byte{}) {
+			return fmt.Errorf("%w: resume relations", ErrSnapshotArtifact)
+		}
+		headerRelations = make([]SnapshotArtifactRelation, len(cursor.manifest.Relations))
+		var relationRows uint64
+		for i := range cursor.manifest.Relations {
+			relation := cursor.manifest.Relations[i]
+			if relation.Relation != replication.RelationID(i+1) ||
+				(relation.Kind != RelationJSON && relation.Kind != RelationGlobalIndex) ||
+				len(relation.Collection) == 0 || len(relation.Collection) > replication.MaxIdentityBytes ||
+				!utf8.Valid(relation.Collection) || bytes.IndexByte(relation.Collection, 0) >= 0 ||
+				relationRows > math.MaxUint64-relation.Rows {
+				return fmt.Errorf("%w: resume relation identity", ErrSnapshotArtifact)
+			}
+			for prior := 0; prior < i; prior++ {
+				if bytes.Equal(relation.Collection, cursor.manifest.Relations[prior].Collection) {
+					return fmt.Errorf("%w: duplicate resume relation", ErrSnapshotArtifact)
+				}
+			}
+			if relation.ImageDigest != ([sha256.Size]byte{}) {
+				if completedRelations != i {
+					return fmt.Errorf("%w: resume relation prefix", ErrSnapshotArtifact)
+				}
+				completedRelations++
+			} else if i < completedRelations || i > completedRelations && relation.Rows != 0 {
+				return fmt.Errorf("%w: resume relation rows", ErrSnapshotArtifact)
+			}
+			relationRows += relation.Rows
+			headerRelations[i] = SnapshotArtifactRelation{
+				Relation: relation.Relation, Kind: relation.Kind,
+				Collection: relation.Collection,
+			}
+		}
+		if relationRows != cursor.manifest.UserRows ||
+			cursor.nextRelation != replication.RelationID(completedRelations+1) ||
+			!bytes.Equal(cursor.manifest.UserCollection, cursor.manifest.Relations[0].Collection) {
+			return fmt.Errorf("%w: resume relation counters", ErrSnapshotArtifact)
+		}
+		headerManifestDigest = cursor.manifest.RelationManifestDigest
+	} else if len(cursor.manifest.Relations) != 0 ||
+		cursor.manifest.RelationManifestDigest != ([sha256.Size]byte{}) || cursor.nextRelation != 0 {
+		return fmt.Errorf("%w: resume singleton relation", ErrSnapshotArtifact)
+	}
 	stateEnvelope, err := AppendState(nil, cursor.manifest.State)
 	if err != nil || !bytes.Equal(stateEnvelope, cursor.expectedStateDocument) {
 		return fmt.Errorf("%w: resume state", ErrSnapshotArtifact)
@@ -970,12 +1269,14 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		bytes.IndexByte(cursor.manifest.UserCollection, 0) >= 0 {
 		return fmt.Errorf("%w: resume collection", ErrSnapshotArtifact)
 	}
-	header, headerDigest, err := makeSnapshotArtifactHeader(
+	header, headerDigest, err := makeSnapshotArtifactHeaderForRelations(
 		stateEnvelope, string(cursor.manifest.UserCollection),
-		int(cursor.manifest.TargetChunkBytes),
+		int(cursor.manifest.TargetChunkBytes), headerManifestDigest,
+		headerRelations, cursor.manifest.Bundle,
 	)
-	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
-		uint64(len(header)), cursor.manifest.Chunks, cursor.manifest.PayloadBytes, false,
+	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytesWithRelations(
+		uint64(len(header)), cursor.manifest.Chunks, cursor.manifest.PayloadBytes,
+		uint64(completedRelations), false,
 	)
 	wantSystemRows, systemRowsOK := stateSystemRowCount(cursor.manifest.State)
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
@@ -983,7 +1284,7 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		!systemRowsOK || cursor.manifest.SystemRows > wantSystemRows {
 		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
 	}
-	if cursor.manifest.Chunks == 0 {
+	if cursor.manifest.Chunks == 0 && completedRelations == 0 {
 		if cursor.encodedBytes != uint64(len(header)) || cursor.nextSequence != 0 ||
 			cursor.manifest.SystemRows != 0 || cursor.manifest.UserRows != 0 ||
 			cursor.manifest.CaptureRows != 0 ||
@@ -1006,7 +1307,17 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 			(cursor.manifest.SystemRows != wantSystemRows) ||
 		(cursor.manifest.CaptureRows == 0) !=
 			(cursor.captureImageDigest == snapshotArtifactEmptyCaptureImageDigest()) {
-		return fmt.Errorf("%w: resume prefix state", ErrSnapshotArtifact)
+		// A relation certificate is a safe zero-row boundary and intentionally
+		// clears the previous key before the next dense relation.
+		if !cursor.manifest.Bundle || cursor.currentCollection != SnapshotArtifactUser ||
+			cursor.previousKeyBytes != 0 || completedRelations == 0 ||
+			cursor.manifest.CaptureRows != 0 || !cursor.stateRowSeen ||
+			cursor.captureImageDigest != snapshotArtifactEmptyCaptureImageDigest() ||
+			cursor.manifest.SystemRows != wantSystemRows ||
+			completedRelations < len(cursor.manifest.Relations) &&
+				cursor.manifest.Relations[completedRelations].Rows != 0 {
+			return fmt.Errorf("%w: resume prefix state", ErrSnapshotArtifact)
+		}
 	}
 	return nil
 }
@@ -1024,6 +1335,7 @@ func cloneSnapshotArtifactManifest(manifest SnapshotArtifactManifest) SnapshotAr
 type snapshotArtifactChunk struct {
 	Sequence   uint64
 	Collection SnapshotArtifactCollection
+	Relation   replication.RelationID
 	Rows       uint64
 }
 
@@ -1036,15 +1348,25 @@ func readSnapshotArtifactHeader(
 	}
 	if !bytes.Equal(fixed[0:8], snapshotArtifactHeaderMagic[:]) ||
 		binary.LittleEndian.Uint16(fixed[8:10]) != snapshotArtifactFormat ||
-		binary.LittleEndian.Uint16(fixed[10:12]) != snapshotArtifactHeaderFixedBytes ||
-		binary.LittleEndian.Uint16(fixed[22:24]) != 0 || !allZero(fixed[32:64]) {
+		binary.LittleEndian.Uint16(fixed[10:12]) != snapshotArtifactHeaderFixedBytes {
 		return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: header", ErrSnapshotArtifact)
+	}
+	flags := binary.LittleEndian.Uint16(fixed[22:24])
+	bundle := flags == 1
+	relationCount := uint64(binary.LittleEndian.Uint16(fixed[32:34]))
+	descriptorBytes := uint64(binary.LittleEndian.Uint32(fixed[36:40]))
+	if flags > 1 || !allZero(fixed[34:36]) || !allZero(fixed[40:64]) ||
+		bundle != (relationCount != 0) || !bundle && descriptorBytes != 0 ||
+		bundle && (relationCount < 2 || relationCount > replication.MaxRelationsPerBundle ||
+			descriptorBytes < sha256.Size+relationCount*(snapshotArtifactRelationFixedBytes+1) ||
+			descriptorBytes > sha256.Size+relationCount*(snapshotArtifactRelationFixedBytes+replication.MaxIdentityBytes)) {
+		return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: relation header", ErrSnapshotArtifact)
 	}
 	total := uint64(binary.LittleEndian.Uint32(fixed[12:16]))
 	stateBytes := uint64(binary.LittleEndian.Uint32(fixed[16:20]))
 	nameBytes := uint64(binary.LittleEndian.Uint16(fixed[20:22]))
 	target := uint64(binary.LittleEndian.Uint32(fixed[24:28]))
-	if total != snapshotArtifactHeaderFixedBytes+stateBytes+nameBytes+sha256.Size ||
+	if total != snapshotArtifactHeaderFixedBytes+stateBytes+nameBytes+descriptorBytes+sha256.Size ||
 		total > maxSnapshotArtifactHeaderBytes || stateBytes == 0 ||
 		stateBytes > MaxStateEnvelopeBytes || nameBytes == 0 ||
 		nameBytes > replication.MaxCollectionBytes ||
@@ -1074,11 +1396,54 @@ func readSnapshotArtifactHeader(
 		bytes.Equal(name, []byte(systemCollectionName)) {
 		return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: user collection", ErrSnapshotArtifact)
 	}
-	expectedStateDocument := stateEnvelope
-	return SnapshotArtifactManifest{
+	manifest := SnapshotArtifactManifest{
 		State: state, UserCollection: name, TargetChunkBytes: uint32(target),
 		HeaderDigest: storedDigest, LastChunkDigest: storedDigest,
-	}, expectedStateDocument, total, nil
+		Bundle: bundle,
+	}
+	if bundle {
+		cursor := stateEnd + int(nameBytes)
+		descriptorEnd := cursor + int(descriptorBytes)
+		copy(manifest.RelationManifestDigest[:], header[cursor:cursor+sha256.Size])
+		cursor += sha256.Size
+		if manifest.RelationManifestDigest == ([sha256.Size]byte{}) {
+			return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: relation manifest", ErrSnapshotArtifact)
+		}
+		manifest.Relations = make([]SnapshotArtifactRelation, int(relationCount))
+		for i := range manifest.Relations {
+			if cursor > descriptorEnd-snapshotArtifactRelationFixedBytes {
+				return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: relation descriptor", ErrSnapshotArtifact)
+			}
+			fixedRelation := header[cursor : cursor+snapshotArtifactRelationFixedBytes]
+			nameBytes := int(binary.LittleEndian.Uint16(fixedRelation[4:6]))
+			if fixedRelation[3] != 0 || binary.LittleEndian.Uint16(fixedRelation[6:8]) != 0 ||
+				nameBytes == 0 || nameBytes > replication.MaxIdentityBytes ||
+				cursor+snapshotArtifactRelationFixedBytes > descriptorEnd-nameBytes {
+				return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: relation descriptor bounds", ErrSnapshotArtifact)
+			}
+			relation := &manifest.Relations[i]
+			relation.Relation = replication.RelationID(binary.LittleEndian.Uint16(fixedRelation[0:2]))
+			relation.Kind = RelationKind(fixedRelation[2])
+			cursor += snapshotArtifactRelationFixedBytes
+			relation.Collection = bytes.Clone(header[cursor : cursor+nameBytes])
+			cursor += nameBytes
+			if relation.Relation != replication.RelationID(i+1) ||
+				(relation.Kind != RelationJSON && relation.Kind != RelationGlobalIndex) ||
+				!utf8.Valid(relation.Collection) || bytes.IndexByte(relation.Collection, 0) >= 0 ||
+				bytes.Equal(relation.Collection, []byte(systemCollectionName)) {
+				return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: relation identity", ErrSnapshotArtifact)
+			}
+			for prior := 0; prior < i; prior++ {
+				if bytes.Equal(relation.Collection, manifest.Relations[prior].Collection) {
+					return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: duplicate relation", ErrSnapshotArtifact)
+				}
+			}
+		}
+		if cursor != descriptorEnd || !bytes.Equal(name, manifest.Relations[0].Collection) {
+			return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: relation geometry", ErrSnapshotArtifact)
+		}
+	}
+	return manifest, stateEnvelope, total, nil
 }
 
 func validateSnapshotArtifactChunkHeader(
@@ -1086,17 +1451,21 @@ func validateSnapshotArtifactChunkHeader(
 	expectedSequence uint64,
 	previousDigest [sha256.Size]byte,
 	currentCollection SnapshotArtifactCollection,
+	bundle bool,
+	nextRelation replication.RelationID,
+	relationCount int,
 ) (snapshotArtifactChunk, int, error) {
 	if len(header) != snapshotArtifactChunkHeaderBytes ||
 		!bytes.Equal(header[0:8], snapshotArtifactChunkMagic[:]) ||
 		binary.LittleEndian.Uint16(header[8:10]) != snapshotArtifactFormat ||
 		binary.LittleEndian.Uint16(header[10:12]) != snapshotArtifactChunkHeaderBytes ||
-		header[25] != 0 || binary.LittleEndian.Uint16(header[26:28]) != 0 ||
+		header[25] != 0 ||
 		!allZero(header[36:48]) || !allZero(header[80:96]) {
 		return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: chunk header", ErrSnapshotArtifact)
 	}
 	sequence := binary.LittleEndian.Uint64(header[16:24])
 	collection := SnapshotArtifactCollection(header[24])
+	relation := replication.RelationID(binary.LittleEndian.Uint16(header[26:28]))
 	rows := uint64(binary.LittleEndian.Uint32(header[28:32]))
 	payloadBytes := uint64(binary.LittleEndian.Uint32(header[32:36]))
 	total := uint64(binary.LittleEndian.Uint32(header[12:16]))
@@ -1113,9 +1482,58 @@ func validateSnapshotArtifactChunkHeader(
 		collection < currentCollection {
 		return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: chunk collection order", ErrSnapshotArtifact)
 	}
+	if !bundle {
+		if relation != 0 {
+			return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: singleton relation", ErrSnapshotArtifact)
+		}
+	} else if collection == SnapshotArtifactUser {
+		if relation == 0 || relation != nextRelation || int(relation) > relationCount {
+			return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: chunk relation order", ErrSnapshotArtifact)
+		}
+	} else if relation != 0 || collection == SnapshotArtifactCapture &&
+		nextRelation != replication.RelationID(relationCount+1) {
+		return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: chunk relation boundary", ErrSnapshotArtifact)
+	}
 	return snapshotArtifactChunk{
-		Sequence: sequence, Collection: collection, Rows: rows,
+		Sequence: sequence, Collection: collection, Relation: relation, Rows: rows,
 	}, int(payloadBytes), nil
+}
+
+func validateSnapshotArtifactRelation(
+	record []byte,
+	manifest SnapshotArtifactManifest,
+	next replication.RelationID,
+	previous [sha256.Size]byte,
+) (SnapshotArtifactRelation, [sha256.Size]byte, error) {
+	if len(record) != snapshotArtifactRelationBytes || !manifest.Bundle ||
+		!bytes.Equal(record[0:8], snapshotArtifactRelationMagic[:]) ||
+		binary.LittleEndian.Uint16(record[8:10]) != snapshotArtifactFormat ||
+		binary.LittleEndian.Uint16(record[10:12]) != snapshotArtifactRelationBytes ||
+		binary.LittleEndian.Uint32(record[12:16]) != snapshotArtifactRelationBytes ||
+		!allZero(record[19:24]) {
+		return SnapshotArtifactRelation{}, [sha256.Size]byte{},
+			fmt.Errorf("%w: relation certificate", ErrSnapshotArtifact)
+	}
+	id := replication.RelationID(binary.LittleEndian.Uint16(record[16:18]))
+	kind := RelationKind(record[18])
+	if id == 0 || id != next || int(id) > len(manifest.Relations) {
+		return SnapshotArtifactRelation{}, [sha256.Size]byte{},
+			fmt.Errorf("%w: relation certificate order", ErrSnapshotArtifact)
+	}
+	want := manifest.Relations[int(id)-1]
+	rows := binary.LittleEndian.Uint64(record[24:32])
+	var image, storedPrevious, digest [sha256.Size]byte
+	copy(image[:], record[32:64])
+	copy(storedPrevious[:], record[64:96])
+	copy(digest[:], record[96:128])
+	if kind != want.Kind || rows != want.Rows || image == ([sha256.Size]byte{}) ||
+		want.ImageDigest != ([sha256.Size]byte{}) || storedPrevious != previous ||
+		digest != snapshotArtifactDigest(snapshotArtifactRelationDomain, record[:96]) {
+		return SnapshotArtifactRelation{}, [sha256.Size]byte{},
+			fmt.Errorf("%w: relation certificate identity", ErrSnapshotArtifact)
+	}
+	want.ImageDigest = image
+	return want, digest, nil
 }
 
 func consumeSnapshotArtifactRows(

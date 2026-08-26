@@ -428,7 +428,7 @@ func (m *Machine) verifySnapshotBaseCapture(manifest SnapshotArtifactManifest) e
 			return ErrSnapshotBase
 		}
 		wantDigest := snapshotArtifactEmptyCaptureImageDigest()
-		if manifest.Bundle {
+		if manifest.Bundle && manifest.TargetChunkBytes == 0 {
 			wantDigest = [sha256.Size]byte{}
 		}
 		if manifest.CaptureRows != 0 || manifest.CaptureImageDigest != wantDigest {

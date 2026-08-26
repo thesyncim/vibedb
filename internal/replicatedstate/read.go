@@ -665,7 +665,7 @@ func (m *Machine) appendSessionCompletion(
 	})
 }
 
-// ReadSnapshot pins the sole user collection, hidden state, and reserved
+// ReadSnapshot pins every dense relation, hidden state, and reserved
 // transition-capture participant at one publication cut.
 type ReadSnapshot struct {
 	cut              durable.DatabaseSnapshot
@@ -677,8 +677,30 @@ type ReadSnapshot struct {
 	validation       ValidationProfile
 	validationDigest [32]byte
 	validator        MutationValidator
+	relations        []relationCollection
 	once             sync.Once
 	closeErr         error
+}
+
+// RelationCount returns the fixed dense relation count captured by this cut.
+func (s *ReadSnapshot) RelationCount() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.relations)
+}
+
+// Relation returns one relation snapshot by its compact bundle-local ID. The
+// returned handle remains owned by ReadSnapshot and is valid only until Close.
+func (s *ReadSnapshot) Relation(id replication.RelationID) (*durable.Snapshot, bool) {
+	if s == nil || id == 0 || int(id) > len(s.relations) {
+		return nil, false
+	}
+	relation := &s.relations[int(id)-1]
+	if relation.id != id {
+		return nil, false
+	}
+	return s.cut.Collection(relation.name)
 }
 
 // SnapshotFence is the allocation-free, immutable publication identity paired
@@ -763,20 +785,33 @@ func (s *ReadSnapshot) RangeSystem(fn func(key, value []byte) error) error {
 	return snapshot.RangeRaw(fn)
 }
 
-// CanonicalImageDigest performs an explicit, complete user-image audit. It is
+// CanonicalImageDigest performs an explicit, complete relation-image audit. It is
 // intentionally O(rows) and belongs at certification, import, or offline
 // verification boundaries—not on ordinary reads, admission, or apply.
 func (s *ReadSnapshot) CanonicalImageDigest() ([32]byte, error) {
 	if s == nil {
 		return [32]byte{}, ErrInconsistentSnapshot
 	}
-	user, ok := s.cut.Collection(s.userName)
-	if !ok || user == nil {
+	if len(s.relations) == 0 {
 		return [32]byte{}, ErrInconsistentSnapshot
 	}
-	return canonicalImageDigest(
-		s.userName, s.validation, s.validationDigest, s.validator, user, nil,
-	)
+	images := make([]SnapshotArtifactRelation, len(s.relations))
+	for i := range s.relations {
+		relation := &s.relations[i]
+		image, ok := s.cut.Collection(relation.name)
+		if !ok || image == nil {
+			return [32]byte{}, ErrInconsistentSnapshot
+		}
+		digest, err := openedRelationImageDigest(relation, image)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		images[i] = SnapshotArtifactRelation{
+			Relation: relation.id, Kind: relation.kind,
+			Collection: []byte(relation.name), Rows: image.Len(), ImageDigest: digest,
+		}
+	}
+	return canonicalBundleImageDigest(images), nil
 }
 
 // Close releases every pinned collection-generation lease. It is idempotent.
@@ -788,7 +823,7 @@ func (s *ReadSnapshot) Close() error {
 	return s.closeErr
 }
 
-// Snapshot captures the sole user collection, hidden system state, and the
+// Snapshot captures every dense relation, hidden system state, and the
 // private transition-capture participant under the Machine publication lock.
 // names may be empty or contain exactly the sole user name; system and capture
 // are automatic, and capture remains inaccessible through ReadSnapshot.Collection.
@@ -798,10 +833,11 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	if err := m.checkUsable(); err != nil {
 		return nil, err
 	}
-	if len(names) > 1 || len(names) == 1 && names[0] != m.userName {
+	if len(names) > 1 || len(names) == 1 &&
+		(len(m.relations) != 1 || names[0] != m.userName) {
 		return nil, fmt.Errorf("%w: snapshot names", ErrInvalidCollection)
 	}
-	cut, systemSnapshot, _, err := m.captureApplyCutLocked()
+	cut, systemSnapshot, _, err := m.captureBundleApplyCutLocked()
 	if err != nil {
 		return nil, m.fail(err)
 	}
@@ -830,5 +866,6 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 		userName:       m.userName, captureName: m.reservedCaptureTarget.Name,
 		validation:       m.user.Validation,
 		validationDigest: m.user.ValidationDigest, validator: m.user.Validator,
+		relations: slices.Clone(m.relations),
 	}, nil
 }

@@ -542,27 +542,10 @@ func (d *Database) openReplicatedApply(
 			"%w: hidden capture collection is not open", ErrReplicatedApplyMismatch,
 		)
 	}
-	groupMembers := make([]durable.NamedCollection, 1, int(expected.RelationCount)+2)
-	groupMembers[0] = durable.NamedCollection{
-		Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection,
+	groupMembers, err := replicatedApplyCheckpointMembers(expected, core)
+	if err != nil {
+		return nil, identity, err
 	}
-	for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
-		relation := expected.Relations[ordinal]
-		table := core.tables[relation.Table]
-		if table == nil || table.collection == nil {
-			return nil, identity, fmt.Errorf(
-				"%w: relation %q is unavailable",
-				ErrReplicatedApplyMismatch, relation.Table,
-			)
-		}
-		groupMembers = append(groupMembers, durable.NamedCollection{
-			Name: relation.Table, Collection: table.collection,
-		})
-	}
-	groupMembers = append(groupMembers, durable.NamedCollection{
-		Name:       replicatedstate.TransitionCaptureCollectionName,
-		Collection: core.replicatedCaptureCollection,
-	})
 	if core.checkpointGroup == nil {
 		core.checkpointGroup, err = durable.NewCheckpointGroup(
 			core.txnLog, groupMembers, durable.CheckpointGroupOptions{},
@@ -687,6 +670,41 @@ func replicatedApplyRelations(
 		result[ordinal] = spec
 	}
 	return result, nil
+}
+
+// replicatedApplyCheckpointMembers returns the exact dense ownership set used
+// by apply, snapshot capture, receiver activation, and restart. Keeping this
+// construction in one place prevents a newly added relation from escaping the
+// checkpoint cut while still preserving the singleton member order.
+func replicatedApplyCheckpointMembers(
+	base ReplicatedShardStoreIdentity,
+	database *database,
+) ([]durable.NamedCollection, error) {
+	if database == nil || database.replicatedApplyCollection == nil ||
+		database.replicatedCaptureCollection == nil || base.RelationCount == 0 ||
+		len(base.Relations) != int(base.RelationCount) {
+		return nil, ErrReplicatedApplyMismatch
+	}
+	members := make([]durable.NamedCollection, 0, int(base.RelationCount)+2)
+	members = append(members, durable.NamedCollection{
+		Name: replicatedstate.SystemCollectionName, Collection: database.replicatedApplyCollection,
+	})
+	for ordinal := range base.Relations {
+		relation := base.Relations[ordinal]
+		table := database.tables[relation.Table]
+		if table == nil || table.collection == nil {
+			return nil, fmt.Errorf(
+				"%w: relation %q is unavailable", ErrReplicatedApplyMismatch, relation.Table,
+			)
+		}
+		members = append(members, durable.NamedCollection{
+			Name: relation.Table, Collection: table.collection,
+		})
+	}
+	return append(members, durable.NamedCollection{
+		Name:       replicatedstate.TransitionCaptureCollectionName,
+		Collection: database.replicatedCaptureCollection,
+	}), nil
 }
 
 var replicatedGlobalIndexValidationDomain = []byte(
@@ -1418,9 +1436,9 @@ func (a *ReplicatedApply) PointReadInto(
 	return a.machine.PointReadInto(relation, key, minimumApplied, maxValueBytes, dst)
 }
 
-// SnapshotArtifactCut captures one coherent, read-only system/user cut for
-// streaming snapshot export. The returned handle owns the durable collection
-// snapshots until Close; it carries no SQL session or serving authority.
+// SnapshotArtifactCut captures one coherent, read-only system/relation/capture
+// cut for streaming snapshot export. The returned handle owns every durable
+// collection snapshot until Close; it carries no SQL session or serving authority.
 func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, error) {
 	if a == nil || a.database == nil {
 		return nil, ErrReplicatedApplyClosed
@@ -1434,16 +1452,10 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 		return nil, err
 	}
 	base := a.database.catalog.ReplicatedShardStore
-	if base == nil || base.UserTable == "" {
+	if base == nil || base.RelationCount == 0 {
 		return nil, ErrReplicatedApplyMismatch
 	}
-	if base.RelationCount != 1 {
-		return nil, fmt.Errorf(
-			"%w: relation bundles require one certified multi-image snapshot base",
-			replicatedstate.ErrSnapshotArtifact,
-		)
-	}
-	return a.machine.Snapshot(base.UserTable)
+	return a.machine.Snapshot()
 }
 
 // BuildBundleSnapshotBase captures and certifies the hidden apply image plus

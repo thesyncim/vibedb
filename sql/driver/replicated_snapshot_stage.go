@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -85,7 +84,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	if core.catalog.ReplicatedShardStore == nil ||
 		!core.catalog.ReplicatedShardStore.Equal(expected) ||
 		core.catalog.ReplicatedApply == nil || manifest.State.Binding != replicatedStateBinding(expected) ||
-		!bytes.Equal(manifest.UserCollection, []byte(expected.UserTable)) {
+		!equalWALBaseManifest(manifest, expected) {
 		return activation, false, fmt.Errorf("%w: durable activation identity", ErrReplicatedSnapshotStageProof)
 	}
 	if err := core.settleCatalogLocked(); err != nil {
@@ -95,6 +94,10 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	if table == nil || table.collection == nil || core.replicatedApplyCollection == nil ||
 		core.replicatedCaptureCollection == nil {
 		return activation, false, fmt.Errorf("%w: durable activation collections", ErrReplicatedSnapshotStageProof)
+	}
+	members, err := replicatedApplyCheckpointMembers(expected, core)
+	if err != nil || !core.checkpointGroup.Owns(members) {
+		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
 	identity, err := core.prepareReplicatedApplyStorageLocked(expected, applyOptions, nil)
 	if err != nil {
@@ -110,18 +113,16 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	}
 	claim := &ReplicatedApply{owner: connector, database: core, table: table,
 		identity: identity, exclusiveConnector: true}
-	machine, err := replicatedstate.Open(
+	relations, err := replicatedApplyRelations(expected, identity, core, claim)
+	if err != nil {
+		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
+	machine, err := replicatedstate.OpenBundle(
 		replicatedStateBinding(expected), staticBootstrap,
 		replicatedstate.CollectionTarget{Collection: core.replicatedApplyCollection,
 			Validation: replicatedstate.ValidationOpaqueBinary,
 			Limits:     replicatedStateCollectionLimits(identity.SystemLimits)},
-		replicatedstate.UserCollection{Name: expected.UserTable, Target: replicatedstate.CollectionTarget{
-			Collection: table.collection, Validation: replicatedstate.ValidationDeterministicMutation,
-			ValidationDigest:       identity.ValidationDigest,
-			Validator:              newReplicatedSQLMutationValidator(expected, table, identity.Placement),
-			ObserveMutationAttempt: claim.observeMutationAttempt,
-			Limits:                 replicatedStateCollectionLimits(expected.UserLimits),
-		}}, core.txnLog, replicatedstate.Options{
+		relations, core.txnLog, replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
@@ -133,7 +134,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	if err != nil {
 		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
-	cut, err := machine.Snapshot(expected.UserTable)
+	cut, err := machine.Snapshot()
 	if err != nil {
 		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
@@ -152,10 +153,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	expectedEnvelope, expectedErr := replicatedstate.AppendState(nil, manifest.State)
 	if writeErr != nil || closeErr != nil || currentErr != nil || expectedErr != nil ||
 		!bytes.Equal(currentEnvelope, expectedEnvelope) ||
-		!bytes.Equal(current.UserCollection, manifest.UserCollection) ||
-		current.ImageDigest != manifest.ImageDigest || current.SystemRows != manifest.SystemRows ||
-		current.UserRows != manifest.UserRows || current.CaptureRows != manifest.CaptureRows ||
-		current.CaptureImageDigest != manifest.CaptureImageDigest {
+		!equalReplicatedSnapshotImage(current, manifest) {
 		return activation, false, errors.Join(
 			fmt.Errorf("%w: durable activation image", ErrReplicatedSnapshotStageProof),
 			writeErr, closeErr, currentErr, expectedErr,
@@ -173,7 +171,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 
 // ReplicatedSnapshotStage is the exclusive non-serving owner of an empty
 // replica while one authenticated snapshot artifact is written directly into
-// its final hidden and user collections. Artifact memory is bounded by the
+// its final hidden and dense relation collections. Artifact memory is bounded by the
 // replicated-state verifier; no complete artifact copy is retained here.
 type ReplicatedSnapshotStage struct {
 	mu sync.Mutex
@@ -213,9 +211,7 @@ func (d *Database) OpenReplicatedSnapshotStage(
 	if err := validateReplicatedApplyOptions(expected, applyOptions); err != nil {
 		return nil, ReplicatedApplyIdentity{}, err
 	}
-	if expected.RelationCount != 1 || expected.Relations[0].Kind != ReplicatedShardRelationJSON ||
-		expected.Relations[0].Table != expected.UserTable ||
-		!bytes.Equal(manifest.UserCollection, []byte(expected.UserTable)) ||
+	if !equalWALBaseManifest(manifest, expected) ||
 		manifest.State.Binding != replicatedStateBinding(expected) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedSnapshotStageProof
 	}
@@ -254,27 +250,31 @@ func (d *Database) OpenReplicatedSnapshotStage(
 	if t == nil || t.collection == nil {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
 	}
-	if core.catalog.ReplicatedApply == nil && (t.collection.Len() != 0 || len(persistedCursor) != 0) {
-		return nil, ReplicatedApplyIdentity{}, ErrReplicatedSnapshotStageProof
+	if core.catalog.ReplicatedApply == nil {
+		for ordinal := range expected.Relations {
+			table := core.tables[expected.Relations[ordinal].Table]
+			if table == nil || table.collection == nil || table.collection.Len() != 0 {
+				return nil, ReplicatedApplyIdentity{}, ErrReplicatedSnapshotStageProof
+			}
+		}
+		if len(persistedCursor) != 0 {
+			return nil, ReplicatedApplyIdentity{}, ErrReplicatedSnapshotStageProof
+		}
 	}
 	if core.checkpointGroup != nil {
 		cursor, cursorErr := replicatedstate.OpenSnapshotArtifactCursor(persistedCursor)
-		members := []durable.NamedCollection{
-			{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
-			{Name: expected.UserTable, Collection: t.collection},
-			{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
-		}
+		members, membersErr := replicatedApplyCheckpointMembers(expected, core)
 		offset := cursor.Offset()
-		owns := core.checkpointGroup.Owns(members)
+		owns := membersErr == nil && core.checkpointGroup.Owns(members)
 		footerOffset, footerBound := uint64(0), manifest.EncodedBytes >= replicatedstate.SnapshotArtifactFooterBytes
 		if footerBound {
 			footerOffset = manifest.EncodedBytes - replicatedstate.SnapshotArtifactFooterBytes
 		}
-		if !footerBound || cursorErr != nil || offset != footerOffset || !owns {
+		if !footerBound || cursorErr != nil || membersErr != nil || offset != footerOffset || !owns {
 			return nil, ReplicatedApplyIdentity{}, errors.Join(
 				fmt.Errorf("%w: resumed cursor %d/%d group-owned=%v",
 					ErrReplicatedSnapshotStageProof, offset, manifest.EncodedBytes, owns),
-				cursorErr,
+				cursorErr, membersErr,
 			)
 		}
 	}
@@ -286,6 +286,10 @@ func (d *Database) OpenReplicatedSnapshotStage(
 		return nil, identity, ErrReplicatedApplyMismatch
 	}
 	validatorClaim := &ReplicatedApply{owner: connector, database: core, table: t, identity: identity}
+	relations, err := replicatedApplyRelations(expected, identity, core, validatorClaim)
+	if err != nil {
+		return nil, identity, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
 	stageOptions.Capture = replicatedstate.CollectionTarget{
 		Collection: core.replicatedCaptureCollection,
 		Validation: replicatedstate.ValidationOpaqueBinary,
@@ -296,23 +300,21 @@ func (d *Database) OpenReplicatedSnapshotStage(
 			MaxBatchBytes:        core.replicatedCaptureCollection.MaxBatchBytes(),
 		},
 	}
-	stage, err := replicatedstate.NewSnapshotArtifactStageWithOptions(
-		manifest,
-		replicatedstate.CollectionTarget{
-			Collection: core.replicatedApplyCollection,
-			Validation: replicatedstate.ValidationOpaqueBinary,
-			Limits:     replicatedStateCollectionLimits(identity.SystemLimits),
-		},
-		replicatedstate.CollectionTarget{
-			Collection:             t.collection,
-			Validation:             replicatedstate.ValidationDeterministicMutation,
-			ValidationDigest:       identity.ValidationDigest,
-			Validator:              newReplicatedSQLMutationValidator(expected, t, identity.Placement),
-			ObserveMutationAttempt: validatorClaim.observeMutationAttempt,
-			Limits:                 replicatedStateCollectionLimits(expected.UserLimits),
-		},
-		persistedCursor, stageOptions,
-	)
+	systemTarget := replicatedstate.CollectionTarget{
+		Collection: core.replicatedApplyCollection,
+		Validation: replicatedstate.ValidationOpaqueBinary,
+		Limits:     replicatedStateCollectionLimits(identity.SystemLimits),
+	}
+	var stage *replicatedstate.SnapshotArtifactStage
+	if expected.RelationCount == 1 {
+		stage, err = replicatedstate.NewSnapshotArtifactStageWithOptions(
+			manifest, systemTarget, relations[0].Target, persistedCursor, stageOptions,
+		)
+	} else {
+		stage, err = replicatedstate.NewBundleSnapshotArtifactStageWithOptions(
+			manifest, systemTarget, relations, persistedCursor, stageOptions,
+		)
+	}
 	if err != nil {
 		return nil, identity, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
@@ -330,13 +332,29 @@ func (d *Database) OpenReplicatedSnapshotStage(
 func ownedReplicatedSnapshotManifest(
 	manifest replicatedstate.SnapshotArtifactManifest,
 ) replicatedstate.SnapshotArtifactManifest {
-	manifest.UserCollection = bytes.Clone(manifest.UserCollection)
-	manifest.State.Binding.Distribution = strings.Clone(manifest.State.Binding.Distribution)
-	manifest.State.Binding.Shard = strings.Clone(manifest.State.Binding.Shard)
-	if manifest.State.ConfState != nil {
-		manifest.State.ConfState = proto.Clone(manifest.State.ConfState).(*pb.ConfState)
+	return manifest.Clone()
+}
+
+func equalReplicatedSnapshotImage(
+	left, right replicatedstate.SnapshotArtifactManifest,
+) bool {
+	if left.Bundle != right.Bundle ||
+		left.RelationManifestDigest != right.RelationManifestDigest ||
+		!bytes.Equal(left.UserCollection, right.UserCollection) ||
+		left.SystemRows != right.SystemRows || left.UserRows != right.UserRows ||
+		left.CaptureRows != right.CaptureRows || left.ImageDigest != right.ImageDigest ||
+		left.CaptureImageDigest != right.CaptureImageDigest ||
+		len(left.Relations) != len(right.Relations) {
+		return false
 	}
-	return manifest
+	for ordinal := range left.Relations {
+		a, b := left.Relations[ordinal], right.Relations[ordinal]
+		if a.Relation != b.Relation || a.Kind != b.Kind || a.Rows != b.Rows ||
+			a.ImageDigest != b.ImageDigest || !bytes.Equal(a.Collection, b.Collection) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ReplicatedSnapshotStage) Offset() uint64 {
@@ -366,7 +384,7 @@ func (s *ReplicatedSnapshotStage) Receive(
 	return s.stage.Receive(r, persist)
 }
 
-// Activate authenticates both final collection images, installs the exact
+// Activate authenticates every final collection image, installs the exact
 // snapshot base, and transfers the exclusive stage to ReplicatedApply. It does
 // not create a WAL, mint a node incarnation, join multiraft, promote the
 // learner, or grant serving authority.
@@ -393,12 +411,10 @@ func (s *ReplicatedSnapshotStage) Activate(
 		core.closed || core.replicatedSnapshotStageClaim != s || core.replicatedApplyClaim != nil {
 		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageClosed
 	}
-	members := []durable.NamedCollection{
-		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
-		{Name: s.base.UserTable, Collection: s.table.collection},
-		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
+	members, err := replicatedApplyCheckpointMembers(s.base, core)
+	if err != nil {
+		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
-	var err error
 	if s.snapshotBase == nil {
 		s.snapshotBase, err = replicatedstate.BuildSnapshotBase(s.expected, staticBootstrap)
 		if err != nil {
@@ -411,14 +427,19 @@ func (s *ReplicatedSnapshotStage) Activate(
 		}
 	}
 	if !s.candidateProved && core.checkpointGroup == nil {
-		_, err = s.stage.OpenCandidate(staticBootstrap, core.txnLog, replicatedstate.Options{
+		candidateOptions := replicatedstate.Options{
 			TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 			RetryWindow: s.identity.RetryWindow,
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
 			},
-		})
+		}
+		if s.base.RelationCount == 1 {
+			_, err = s.stage.OpenCandidate(staticBootstrap, core.txnLog, candidateOptions)
+		} else {
+			_, err = s.stage.OpenCandidateBundle(staticBootstrap, core.txnLog, candidateOptions)
+		}
 		if err != nil {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
@@ -437,14 +458,16 @@ func (s *ReplicatedSnapshotStage) Activate(
 	if len(s.seedEnvelope) == 0 || len(s.seedKey) == 0 {
 		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageProof
 	}
+	seedImages := make([]durable.CheckpointGroupSeedImage, 0, len(members))
+	for i := range members {
+		seedImages = append(seedImages, durable.CheckpointGroupSeedImage{
+			Collection: members[i].Collection, Generation: members[i].Collection.Generation(),
+		})
+	}
 	seed := durable.CheckpointGroupSeed{
 		Applied: s.expected.State.Applied, Member: replicatedstate.SystemCollectionName,
 		Envelope: s.seedEnvelope,
-		Images: []durable.CheckpointGroupSeedImage{
-			{Collection: core.replicatedApplyCollection, Generation: core.replicatedApplyCollection.Generation()},
-			{Collection: s.table.collection, Generation: s.table.collection.Generation()},
-			{Collection: core.replicatedCaptureCollection, Generation: core.replicatedCaptureCollection.Generation()},
-		},
+		Images:   seedImages,
 	}
 	if core.checkpointGroup == nil {
 		core.checkpointGroup, err = durable.NewSeededCheckpointGroup(
@@ -470,21 +493,18 @@ func (s *ReplicatedSnapshotStage) Activate(
 			identity: s.identity, exclusiveConnector: true}
 	}
 	if s.machine == nil {
-		s.machine, err = replicatedstate.Open(
+		relations, relationErr := replicatedApplyRelations(s.base, s.identity, core, s.claim)
+		if relationErr != nil {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, relationErr)
+		}
+		s.machine, err = replicatedstate.OpenBundle(
 			replicatedStateBinding(s.base), staticBootstrap,
 			replicatedstate.CollectionTarget{
 				Collection: core.replicatedApplyCollection,
 				Validation: replicatedstate.ValidationOpaqueBinary,
 				Limits:     replicatedStateCollectionLimits(s.identity.SystemLimits),
 			},
-			replicatedstate.UserCollection{Name: s.base.UserTable, Target: replicatedstate.CollectionTarget{
-				Collection:             s.table.collection,
-				Validation:             replicatedstate.ValidationDeterministicMutation,
-				ValidationDigest:       s.identity.ValidationDigest,
-				Validator:              newReplicatedSQLMutationValidator(s.base, s.table, s.identity.Placement),
-				ObserveMutationAttempt: s.claim.observeMutationAttempt,
-				Limits:                 replicatedStateCollectionLimits(s.base.UserLimits),
-			}},
+			relations,
 			core.txnLog, replicatedstate.Options{
 				TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 				RetryWindow: s.identity.RetryWindow, CheckpointGroup: core.checkpointGroup,

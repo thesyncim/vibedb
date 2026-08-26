@@ -63,6 +63,153 @@ func TestReplicatedSnapshotStageInstallsExactBaseAndRetriesActivation(t *testing
 	}
 }
 
+func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
+	openBundleRoot := func(name string, member uint64) (*Database, ReplicatedShardStoreIdentity) {
+		_, database, binding, _ := prepareReplicatedTestRoot(t, name, false)
+		binding.MemberID = member
+		binding.StoreID[0] = byte(member)
+		session, err := database.NewSession(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = testRuntimeExec(session, `CREATE TABLE email_claims (PRIMARY KEY (key))`, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err = session.Close(); err != nil {
+			t.Fatal(err)
+		}
+		identity, err := database.BindReplicatedShardStoreBundle(
+			binding, "docs", []ReplicatedGlobalIndexRelation{{
+				Relation: 2, Table: "email_claims", IndexID: 41,
+				Incarnation: 7, LocatorCount: 1, Unique: true,
+			}},
+		)
+		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return database, identity
+	}
+
+	source, sourceIdentity := openBundleRoot("snapshot-bundle-source", 9)
+	defer source.Close()
+	bootstrap := snapshotStageBootstrap()
+	apply, _, err := source.OpenReplicatedApply(
+		sourceIdentity, bootstrap, testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer apply.Close()
+	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	epoch := applyReplicatedApplySessionOpen(t, apply, sourceIdentity, 2)
+	document := []byte(`{"id":"bundle-doc","email":"a"}`)
+	baseKey := testReplicatedApplyKey(t, source, document)
+	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["bundle-doc"]`)
+	commandValue := testReplicatedApplyCommandValue(sourceIdentity, epoch, 2, nil)
+	commandValue.Fingerprint = sha256.Sum256([]byte("snapshot-stage-bundle"))
+	commandValue.Batches = []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: baseKey, Value: document,
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: locator,
+		}}},
+	}
+	command, err := replication.AppendCommand(nil, commandValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = apply.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact bytes.Buffer
+	manifest, writeErr := replicatedstate.WriteSnapshotArtifact(
+		&artifact, cut, replicatedstate.SnapshotArtifactOptions{},
+	)
+	closeErr := cut.Close()
+	if writeErr != nil || closeErr != nil || !manifest.Bundle ||
+		len(manifest.Relations) != 2 || manifest.Relations[0].Rows != 1 ||
+		manifest.Relations[1].Rows != 1 {
+		t.Fatalf("source bundle manifest=%+v write=%v close=%v", manifest, writeErr, closeErr)
+	}
+
+	target, targetIdentity := openBundleRoot("snapshot-bundle-target", 10)
+	defer target.Close()
+	stage, _, err := target.OpenReplicatedSnapshotStage(
+		targetIdentity, manifest, nil, testReplicatedApplyOptions(),
+		replicatedstate.SnapshotArtifactStageOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stage.Close()
+	var cursor []byte
+	received, err := stage.Receive(bytes.NewReader(artifact.Bytes()), func(raw []byte) error {
+		cursor = append(cursor[:0], raw...)
+		return nil
+	})
+	if err != nil || received.Digest != manifest.Digest || len(cursor) == 0 {
+		t.Fatalf("receive digest=%x cursor=%d err=%v", received.Digest, len(cursor), err)
+	}
+	activation, err := stage.Activate(bootstrap)
+	if err != nil || activation.Apply == nil || !activation.ArtifactManifest.Bundle ||
+		len(activation.ArtifactManifest.Relations) != 2 {
+		t.Fatalf("activation=%+v err=%v", activation, err)
+	}
+	activation.ArtifactManifest.Relations[1].Collection[0] ^= 0x20
+	retried, err := stage.Activate(bootstrap)
+	if err != nil || retried.Apply != activation.Apply ||
+		!bytes.Equal(retried.ArtifactManifest.Relations[1].Collection, []byte("email_claims")) {
+		t.Fatalf("detached activation retry=%+v err=%v", retried, err)
+	}
+	activation = retried
+	core := target.connector.db
+	core.mu.RLock()
+	baseCollection := core.tables["docs"].collection
+	globalCollection := core.tables["email_claims"].collection
+	members, membersErr := replicatedApplyCheckpointMembers(targetIdentity, core)
+	group := core.checkpointGroup
+	core.mu.RUnlock()
+	if membersErr != nil || group == nil || !group.Owns(members) {
+		t.Fatalf("bundle checkpoint ownership members=%v group=%v", membersErr, group)
+	}
+	if value, found, readErr := baseCollection.AppendRaw(nil, baseKey); readErr != nil ||
+		!found || !bytes.Equal(value, document) {
+		t.Fatalf("activated base value=%q found=%v err=%v", value, found, readErr)
+	}
+	if value, found, readErr := globalCollection.AppendRaw(nil, globalKey); readErr != nil ||
+		!found || !bytes.Equal(value, locator) {
+		t.Fatalf("activated global value=%q found=%v err=%v", value, found, readErr)
+	}
+	if _, err = activation.Apply.InstallSnapshot(activation.SnapshotBase); err != nil {
+		t.Fatal(err)
+	}
+	activatedCut, err := activation.Apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var activatedArtifact bytes.Buffer
+	activatedManifest, writeErr := replicatedstate.WriteSnapshotArtifact(
+		&activatedArtifact, activatedCut, replicatedstate.SnapshotArtifactOptions{},
+	)
+	closeErr = activatedCut.Close()
+	if writeErr != nil || closeErr != nil || activatedManifest.Digest != manifest.Digest ||
+		!activatedManifest.Bundle || len(activatedManifest.Relations) != 2 {
+		t.Fatalf("activated bundle re-export=%+v write=%v close=%v",
+			activatedManifest, writeErr, closeErr)
+	}
+	if err = activation.Apply.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSnapshotArtifactCaptureCommitmentPrecedesBorrowedCallback(t *testing.T) {
 	stage, target, _, artifact, _ := newReplicatedSnapshotStageFixture(t)
 	defer target.Close()

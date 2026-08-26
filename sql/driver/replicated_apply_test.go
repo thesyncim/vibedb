@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -509,17 +510,31 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	if _, found, err := baseCollection.AppendRaw(nil, conflictKey); err != nil || found {
 		t.Fatalf("conflicting base row escaped atomic bundle: found=%v err=%v", found, err)
 	}
-	if partial, err := claim.SnapshotArtifactCut(); partial != nil ||
-		!errors.Is(err, replicatedstate.ErrSnapshotArtifact) {
-		if partial != nil {
-			_ = partial.Close()
-		}
-		t.Fatalf("partial singleton snapshot of bundle = %p,%v", partial, err)
+	cut, err := claim.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if partial, err := claim.CaptureWALBase(WALBaseCaptureOptions{
+	streamedManifest, writeErr := replicatedstate.WriteSnapshotArtifact(
+		io.Discard, cut, replicatedstate.SnapshotArtifactOptions{},
+	)
+	closeErr := cut.Close()
+	if writeErr != nil || closeErr != nil || !streamedManifest.Bundle ||
+		len(streamedManifest.Relations) != 2 || streamedManifest.Relations[0].Rows != 1 ||
+		streamedManifest.Relations[1].Rows != 1 || streamedManifest.CaptureRows == 0 {
+		t.Fatalf("streamed bundle manifest=%+v write=%v close=%v",
+			streamedManifest, writeErr, closeErr)
+	}
+	preparation, err := claim.CaptureWALBase(WALBaseCaptureOptions{
 		Workspace: walBaseWorkspace(),
-	}); partial != nil || !errors.Is(err, replicatedstate.ErrSnapshotArtifact) {
-		t.Fatalf("partial singleton WAL base of bundle = %p,%v", partial, err)
+	})
+	if err != nil || preparation == nil {
+		t.Fatalf("bundle WAL base = %p,%v", preparation, err)
+	}
+	walCertificate, err := replicatedstate.OpenSnapshotBase(preparation.snapshotBase)
+	if err != nil || !walCertificate.Manifest.Bundle ||
+		len(walCertificate.Manifest.Relations) != 2 ||
+		walCertificate.Manifest.Digest != streamedManifest.Digest {
+		t.Fatalf("bundle WAL certificate=%+v err=%v", walCertificate.Manifest, err)
 	}
 	if err := group.Checkpoint(); err != nil {
 		t.Fatal(err)
