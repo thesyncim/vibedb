@@ -223,10 +223,12 @@ func servePreparedRF3WithListen(
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Owner: raftservice.Options{
 			Registry: servingRegistry, Host: host,
-			Members:       []raftmember.RuntimeIdentity{runtimeIdentity},
-			CommandFences: []raftservice.CommandFence{command},
-			ReadSources:   []raftservice.ReadSource{apply}, Pulse: pulse,
-			Limits: rf3OwnerLimits(),
+			Members:                    []raftmember.RuntimeIdentity{runtimeIdentity},
+			CommandFences:              []raftservice.CommandFence{command},
+			ReadSources:                []raftservice.ReadSource{apply},
+			TransactionRecoverySources: []raftservice.TransactionRecoverySource{apply},
+			Pulse:                      pulse,
+			Limits:                     rf3OwnerLimits(),
 		},
 		Transport: rf3TransportOptions(remoteNodes, deadline),
 		Receiver: rafttransport.OrdinaryReceiverOptions{

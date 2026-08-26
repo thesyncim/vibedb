@@ -1436,6 +1436,29 @@ func (a *ReplicatedApply) PointReadInto(
 	return a.machine.PointReadInto(relation, key, minimumApplied, maxValueBytes, dst)
 }
 
+// TransactionRecoveryReadInto forwards the closed hidden-state recovery read
+// to the replicated machine under the same live apply/activation fence as an
+// ordinary replicated point read. The caller owns both bounded arenas; SQL
+// names, planning, and the legacy local transaction journal are not involved.
+func (a *ReplicatedApply) TransactionRecoveryReadInto(
+	request replicatedstate.TransactionRecoveryReadRequest,
+	records []replicatedstate.TransactionRecoveryRecord,
+	payload []byte,
+) (replicatedstate.TransactionRecoveryReadResult, error) {
+	if a == nil || a.database == nil {
+		return replicatedstate.TransactionRecoveryReadResult{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedstate.TransactionRecoveryReadResult{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return replicatedstate.TransactionRecoveryReadResult{}, err
+	}
+	return a.machine.TransactionRecoveryReadInto(request, records, payload)
+}
+
 // SnapshotArtifactCut captures one coherent, read-only system/relation/capture
 // cut for streaming snapshot export. The returned handle owns every durable
 // collection snapshot until Close; it carries no SQL session or serving authority.

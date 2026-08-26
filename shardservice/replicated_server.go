@@ -25,6 +25,7 @@ type replicatedOwner interface {
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
 	ApplyMembership(context.Context, raftservice.MembershipRequest) error
 	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, raftservice.PointReadLease, error)
+	ReadTransaction(context.Context, raftservice.TransactionReadRequest) (raftservice.TransactionReadResult, raftservice.TransactionReadLease, error)
 }
 
 func replicatedRequestDigest(command []byte) [sha256.Size]byte {
@@ -503,6 +504,79 @@ func (server *ReplicatedServer) executeReplicated(
 		default:
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 				HasState: true, State: wireState}
+		}
+	}
+	if request.Operation == ReplicatedTransactionRead {
+		read, ok := replicatedTransactionRecoveryRead(request.TransactionRead)
+		if !ok {
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		result, readLease, readErr := server.owner.ReadTransaction(ctx, raftservice.TransactionReadRequest{
+			Fence: raftservice.ServingFence{
+				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+				Command: request.Fence.Command, MemberID: request.Fence.MemberID,
+				StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
+				Term: request.Fence.Term,
+			},
+			Capability: request.Capability, Read: read,
+		})
+		if readErr != nil && readLease != nil {
+			readLease.Release()
+			readLease = nil
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
+		}
+		if readErr == nil {
+			value, encodeErr := AppendReplicatedTransactionReadValue(nil,
+				ReplicatedTransactionReadValue{
+					Kind: request.TransactionRead.Kind, Complete: result.Complete,
+					Records: result.Records,
+				})
+			logicalBytes := len(value) - replicatedTransactionReadValueHeaderBytes
+			response := &ReplicatedResponse{
+				Kind: ReplicatedTransactionReadResult, HasState: true, State: wireState,
+				ReadApplied: result.Applied, Value: value, readLease: readLease,
+			}
+			if encodeErr == nil && logicalBytes >= 0 &&
+				logicalBytes <= int(request.TransactionRead.MaxBytes) &&
+				result.Applied >= request.TransactionRead.MinimumApplied &&
+				validReplicatedResponse(response) {
+				return response
+			}
+			if readLease != nil {
+				readLease.Release()
+			}
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		switch {
+		case errors.Is(readErr, raftmodel.ErrNotLeader),
+			errors.Is(readErr, raftmodel.ErrReadLeadershipLost):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingFence):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBehind):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBufferBound):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalReadBufferBound, HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrTransactionRecoveryRead):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalTransactionReadMalformed, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrTransactionRecoveryUnauthorized):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnauthorized, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrIngressFull),
+			errors.Is(readErr, raftservice.ErrPendingReadsFull):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalAdmissionBound, HasState: true, State: wireState}
+		default:
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 		}
 	}
 
