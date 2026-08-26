@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -126,6 +127,10 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 	manifest, err := loadRF3Manifest(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if manifest.Digest != sha256.Sum256([]byte(canonicalRF3Manifest)) ||
+		manifest.withGroup(manifest.groupBundles()[0]).Digest != manifest.Digest {
+		t.Fatalf("manifest binding digest was not retained across group projection")
 	}
 	if manifest.WAL.Path != "/srv/vibedb/member.wal" ||
 		manifest.WAL.KeyID != "production-key-1" ||

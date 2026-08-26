@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -29,6 +30,7 @@ const (
 var errInvalidRF3Manifest = errors.New("vibedb-shard: invalid RF3 manifest")
 
 type rf3Manifest struct {
+	Digest              [sha256.Size]byte
 	WAL                 rf3ManifestWAL
 	SQL                 rf3ManifestSQL
 	Listeners           rf3ManifestListeners
@@ -64,7 +66,7 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 }
 
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
-	return rf3Manifest{WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
+	return rf3Manifest{Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
 		ReplicaControl: manifest.ReplicaControl,
 		SplitControl:   manifest.SplitControl, Route: group.Route,
@@ -284,6 +286,7 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if _, _, extra := fields.Next(); extra {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
+		manifest.Digest = sha256.Sum256(data)
 		return manifest, nil
 	}
 	if !bytes.Equal(key.Raw().Bytes(), []byte(`"wal"`)) {
@@ -398,6 +401,7 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 			return rf3Manifest{}, err
 		}
 	}
+	manifest.Digest = sha256.Sum256(data)
 	return manifest, nil
 }
 
