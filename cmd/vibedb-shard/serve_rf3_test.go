@@ -66,6 +66,15 @@ func TestValidateRF3Addresses(t *testing.T) {
 	if err := validateRF3Addresses(wildcard); err != nil {
 		t.Fatalf("valid wildcard listeners: %v", err)
 	}
+	withTarget := valid
+	withTarget.EnrolledTarget = &rf3ManifestEnrolledTarget{
+		MemberID: 4, NodeID: rafttransport.NodeID{4},
+		PeerAddress: "member-4.internal:17400", NativeAddress: "member-4.internal:17500",
+		SnapshotAddress: "member-4.internal:17600", ControlAddress: "member-4.internal:17700",
+	}
+	if err := validateRF3Addresses(withTarget); err != nil {
+		t.Fatalf("valid enrolled target addresses: %v", err)
+	}
 
 	tests := []struct {
 		name   string
@@ -79,6 +88,20 @@ func TestValidateRF3Addresses(t *testing.T) {
 		{"member_missing_host", func(manifest *rf3Manifest) { manifest.Members[1].PeerAddress = ":17401" }},
 		{"member_missing_port", func(manifest *rf3Manifest) { manifest.Members[1].PeerAddress = "member-2.internal" }},
 		{"member_zero_port", func(manifest *rf3Manifest) { manifest.Members[1].PeerAddress = "member-2.internal:0" }},
+		{"target_missing_host", func(manifest *rf3Manifest) {
+			manifest.EnrolledTarget = &rf3ManifestEnrolledTarget{
+				MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: ":17400",
+				NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
+				ControlAddress: "member-4.internal:17700",
+			}
+		}},
+		{"target_control_zero_port", func(manifest *rf3Manifest) {
+			manifest.EnrolledTarget = &rf3ManifestEnrolledTarget{
+				MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: "member-4.internal:17400",
+				NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
+				ControlAddress: "member-4.internal:0",
+			}
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -115,6 +138,21 @@ func TestBuildRF3RosterRequiresExactStableDurableRF3(t *testing.T) {
 	}
 	if remote[0] != manifest.Members[0].NodeID || remote[1] != manifest.Members[2].NodeID {
 		t.Fatalf("remote nodes = %x, want members 1 and 3", remote)
+	}
+	withTarget := manifest
+	withTarget.EnrolledTarget = &rf3ManifestEnrolledTarget{
+		MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: "member-4.internal:17400",
+		NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
+		ControlAddress: "member-4.internal:17700",
+	}
+	targetMembers, targetRemote, _, err := buildRF3Roster(withTarget, group, 2, stable)
+	if err != nil || len(targetMembers) != rf3ManifestMembers || len(targetRemote) != rf3ManifestMembers-1 {
+		t.Fatalf("enrolled target changed serving roster: members=%d remote=%d err=%v", len(targetMembers), len(targetRemote), err)
+	}
+	for _, member := range targetMembers {
+		if member.MemberID == withTarget.EnrolledTarget.MemberID {
+			t.Fatal("enrolled target entered serving transport roster")
+		}
 	}
 	if _, err := dial(context.Background(), rafttransport.NodeID{0xff}); !errors.Is(err, rafttransport.ErrNodeNotFound) {
 		t.Fatalf("unknown-node dial error = %v, want ErrNodeNotFound", err)
