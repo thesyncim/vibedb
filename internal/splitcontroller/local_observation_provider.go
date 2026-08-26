@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -39,8 +40,10 @@ type LocalObservationGroup struct {
 // Groups are sorted once at construction; the serving lookup allocates no map
 // entry proportional to historical split operations.
 type LocalPlanObservationProvider struct {
+	mu     sync.RWMutex
 	owners LocalObservationOwner
 	groups []LocalObservationGroup
+	limit  int
 }
 
 func NewLocalPlanObservationProvider(
@@ -63,7 +66,65 @@ func NewLocalPlanObservationProvider(
 			return nil, ErrPlanObservation
 		}
 	}
-	return &LocalPlanObservationProvider{owners: owners, groups: owned}, nil
+	return &LocalPlanObservationProvider{
+		owners: owners, groups: owned, limit: MaxPlanObservationEndpoints,
+	}, nil
+}
+
+// RegisterGroups publishes exact, already-admitted child identities to the
+// observation service. It is bounded by the same endpoint ceiling as the wire
+// protocol and is idempotent for byte-identical bindings. A different binding
+// for an existing Raft group is rejected; replacement must first pass through
+// terminal operation cleanup so an old plan cannot redirect observations.
+func (provider *LocalPlanObservationProvider) RegisterGroups(groups []LocalObservationGroup) error {
+	if provider == nil || len(groups) == 0 || len(groups) > MaxPlanObservationEndpoints {
+		return ErrPlanObservation
+	}
+	owned := slices.Clone(groups)
+	slices.SortFunc(owned, func(left, right LocalObservationGroup) int {
+		return compareObservationGroup(left.Identity.Group, right.Identity.Group)
+	})
+	for index := range owned {
+		group := owned[index]
+		if !validLocalObservationGroup(group) ||
+			index != 0 && compareObservationGroup(owned[index-1].Identity.Group, group.Identity.Group) == 0 {
+			return ErrPlanObservation
+		}
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	merged := slices.Clone(provider.groups)
+	for _, group := range owned {
+		index, found := slices.BinarySearchFunc(merged, group.Identity.Group,
+			func(item LocalObservationGroup, key raftmember.GroupKey) int {
+				return compareObservationGroup(item.Identity.Group, key)
+			})
+		if found {
+			if !sameLocalObservationGroup(merged[index], group) {
+				return ErrPlanObservation
+			}
+			continue
+		}
+		if len(merged) == provider.limit {
+			return ErrPlanObservation
+		}
+		merged = append(merged, LocalObservationGroup{})
+		copy(merged[index+1:], merged[index:])
+		merged[index] = group
+	}
+	provider.groups = merged
+	return nil
+}
+
+func validLocalObservationGroup(group LocalObservationGroup) bool {
+	return group.Identity.Group != (raftmember.GroupKey{}) && group.Identity.MemberID != 0 &&
+		group.Identity.StoreID != ([16]byte{}) && group.Identity.NodeIncarnation != 0 &&
+		group.Command.Valid() && group.Registry != nil
+}
+
+func sameLocalObservationGroup(left, right LocalObservationGroup) bool {
+	return left.Identity == right.Identity && left.Command == right.Command &&
+		left.Registry == right.Registry
 }
 
 func (provider *LocalPlanObservationProvider) ObserveSplitSource(
@@ -157,6 +218,8 @@ func (provider *LocalPlanObservationProvider) resolve(
 	if provider == nil || !validNetworkPlanObservationRequest(request) || targetMember == 0 {
 		return LocalObservationGroup{}, false
 	}
+	provider.mu.RLock()
+	defer provider.mu.RUnlock()
 	index, found := slices.BinarySearchFunc(provider.groups, request.Group,
 		func(group LocalObservationGroup, key raftmember.GroupKey) int {
 			return compareObservationGroup(group.Identity.Group, key)

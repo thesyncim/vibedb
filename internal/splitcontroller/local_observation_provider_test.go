@@ -115,3 +115,50 @@ func TestLocalPlanObservationProviderReadsDurableBoundedSourceState(t *testing.T
 		t.Fatal("wrong command reached durable runtime registry")
 	}
 }
+
+func TestLocalPlanObservationProviderRegistersOnlyExactBoundedGroups(t *testing.T) {
+	request, _, _ := networkPlanObservationFixture(t)
+	runtimeRoot := filepath.Join(t.TempDir(), "split-runtime")
+	if err := os.Mkdir(runtimeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := OpenRuntimeStoreRegistry(runtimeRoot, [32]byte{1}, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = registry.Close() })
+	identity := raftmember.RuntimeIdentity{
+		Group: request.Group, MemberID: 1, AllocationGeneration: uint64(request.Allocation),
+		StoreID: [16]byte{1}, NodeIncarnation: 1,
+	}
+	provider, err := NewLocalPlanObservationProvider(
+		localObservationOwnerStub{}, []LocalObservationGroup{{
+			Identity: identity, Command: request.Command, Registry: registry,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := LocalObservationGroup{
+		Identity: identity, Command: request.Command, Registry: registry,
+	}
+	child.Identity.Group.GroupID[0]++
+	child.Identity.StoreID[0]++
+	if err = provider.RegisterGroups([]LocalObservationGroup{child}); err != nil {
+		t.Fatal(err)
+	}
+	if err = provider.RegisterGroups([]LocalObservationGroup{child}); err != nil {
+		t.Fatalf("exact registration is not idempotent: %v", err)
+	}
+	substitution := child
+	substitution.Identity.MemberID++
+	if err = provider.RegisterGroups([]LocalObservationGroup{substitution}); err == nil {
+		t.Fatal("accepted identity substitution for registered group")
+	}
+	childRequest := request
+	childRequest.Group = child.Identity.Group
+	childRequest.RequestDigest = planObservationRequestDigest(childRequest)
+	if resolved, ok := provider.resolve(childRequest, child.Identity.MemberID); !ok || resolved.Identity != child.Identity {
+		t.Fatalf("dynamic child group unavailable: resolved=%+v ok=%v", resolved, ok)
+	}
+}
