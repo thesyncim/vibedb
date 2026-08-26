@@ -7,17 +7,20 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/routegate"
+	"github.com/thesyncim/vibedb/internal/systemkey"
 )
 
 const (
-	routeGateHeadPrefix   byte = 0x20
-	routeGatePinPrefix    byte = 0x21
-	routeGateResultPrefix byte = 0x22
+	routeGateHeadPrefix   byte = systemkey.RouteGateFirst
+	routeGatePinPrefix    byte = systemkey.RouteGateFirst + 1
+	routeGateResultPrefix byte = systemkey.RouteGateFirst + 2
 
 	routeGatePinKeyBytes    = 1 + sha256.Size
 	routeGateResultKeyBytes = 1 + sha256.Size + 2
 	routeGateResultBytes    = 224
 )
+
+var _ [int(systemkey.RouteGateLast) - int(routeGateResultPrefix)]struct{}
 
 var (
 	routeGateHeadKey = []byte{routeGateHeadPrefix}
