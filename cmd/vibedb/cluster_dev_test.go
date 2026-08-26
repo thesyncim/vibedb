@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -23,9 +24,10 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		ClientEndpoint: "127.0.0.1:24000", CatalogPath: filepath.Join(root, "catalog.vibejson"),
 		GatewayCertificate: filepath.Join(root, "gateway-cert.pem"), GatewayKey: filepath.Join(root, "gateway-key.pem"),
 		Roots: filepath.Join(root, "roots.pem"), AuthorizationPolicy: filepath.Join(root, "policy.vibejson"),
-		GatewayNode: "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterRF3), LedgerMembers: make([]devClusterMember, devClusterRF3),
+		HotShardCapacity: filepath.Join(root, "hot-shard-capacity.vibejson"),
+		GatewayNode:      "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterRF3), LedgerMembers: make([]devClusterMember, devClusterRF3),
 	}
-	paths := []string{manifest.CatalogPath, manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy}
+	paths := []string{manifest.CatalogPath, manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy, manifest.HotShardCapacity}
 	for index := range manifest.Members {
 		manifest.Members[index] = devClusterMember{Member: uint64(index + 1), Node: "1111111111111111111111111111111" + string(rune('1'+index)), Store: "2222222222222222222222222222222" + string(rune('1'+index)), Peer: "127.0.0.1:2500" + string(rune('1'+index)), Native: "127.0.0.1:2510" + string(rune('1'+index)), Snapshot: "127.0.0.1:2520" + string(rune('1'+index)), Control: "127.0.0.1:2530" + string(rune('1'+index)), ServeManifest: filepath.Join(root, "member-"+string(rune('1'+index)), "serve-rf3.vibejson")}
 		manifest.LedgerMembers[index] = devClusterMember{Member: uint64(index + 1), Node: manifest.Members[index].Node, Store: "3333333333333333333333333333333" + string(rune('1'+index)), Peer: "127.0.0.1:2600" + string(rune('1'+index)), Native: "127.0.0.1:2610" + string(rune('1'+index)), Snapshot: "127.0.0.1:2620" + string(rune('1'+index)), Control: "127.0.0.1:2630" + string(rune('1'+index)), ServeManifest: filepath.Join(root, "ledger-member-"+string(rune('1'+index)), "serve-rf3.vibejson")}
@@ -63,8 +65,9 @@ func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
 		CatalogPath: filepath.Join(root, "catalog.vibejson"), GatewayCertificate: filepath.Join(root, "gateway-cert.pem"),
 		GatewayKey: filepath.Join(root, "gateway-key.pem"), Roots: filepath.Join(root, "roots.pem"),
 		AuthorizationPolicy: filepath.Join(root, "policy.vibejson"), GatewayNode: "01010101010101010101010101010101",
-		Members:       []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "22222222222222222222222222222222", Peer: "127.0.0.1:25001", Native: "127.0.0.1:25101", Snapshot: "127.0.0.1:25201", Control: "127.0.0.1:25301", ServeManifest: filepath.Join(root, "member-1", "serve-rf3.vibejson")}},
-		LedgerMembers: []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "33333333333333333333333333333333", Peer: "127.0.0.1:26001", Native: "127.0.0.1:26101", Snapshot: "127.0.0.1:26201", Control: "127.0.0.1:26301", ServeManifest: filepath.Join(root, "ledger-member-1", "serve-rf3.vibejson")}},
+		HotShardCapacity: filepath.Join(root, "hot-shard-capacity.vibejson"),
+		Members:          []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "22222222222222222222222222222222", Peer: "127.0.0.1:25001", Native: "127.0.0.1:25101", Snapshot: "127.0.0.1:25201", Control: "127.0.0.1:25301", ServeManifest: filepath.Join(root, "member-1", "serve-rf3.vibejson")}},
+		LedgerMembers:    []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "33333333333333333333333333333333", Peer: "127.0.0.1:26001", Native: "127.0.0.1:26101", Snapshot: "127.0.0.1:26201", Control: "127.0.0.1:26301", ServeManifest: filepath.Join(root, "ledger-member-1", "serve-rf3.vibejson")}},
 	}
 	if !validDevManifest(base, root) {
 		t.Fatal("explicit RF1 manifest rejected")
@@ -111,6 +114,23 @@ func TestDevPolicyIsAcceptedByProductionAuthorizationLoader(t *testing.T) {
 	policy, err := serviceauthz.LoadFile(path)
 	if err != nil || policy.Generation() != 1 || len(policy.Nodes()) != len(nodes) {
 		t.Fatalf("policy=%+v err=%v", policy, err)
+	}
+}
+
+func TestDevHotShardCapacityIsExplicitAndCanonical(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hot-shard-capacity.vibejson")
+	members := []devClusterMember{{Member: 1}, {Member: 2}, {Member: 3}}
+	if err := writeDevHotShardCapacity(path, members, members); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := hotshard.OpenStaticCapacityConfig(raw)
+	if err != nil || len(config.Nodes) != 6 || config.Nodes[0].Endpoint != "catalog-member-1" ||
+		config.Nodes[3].Endpoint != "ledger-member-1" {
+		t.Fatalf("config=%+v err=%v", config, err)
 	}
 }
 
