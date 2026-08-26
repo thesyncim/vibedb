@@ -16,14 +16,15 @@ var relationImageCertificateDomain = []byte(
 // commits global-index ownership, outside-range counts, XOR, and modular-sum
 // accumulators. Witness binds the complete certificate for a rollout receipt.
 type RelationImageCertificate struct {
-	SchemaGeneration uint64
-	RelationCount    uint16
-	TotalRows        uint64
-	ManifestDigest   [sha256.Size]byte
-	ImageRoot        [sha256.Size]byte
-	CardinalityRoot  [sha256.Size]byte
-	PlacementDigest  [sha256.Size]byte
-	Witness          [sha256.Size]byte
+	SchemaGeneration  uint64
+	RelationCount     uint16
+	TotalRows         uint64
+	NonEmptyRelations uint64
+	ManifestDigest    [sha256.Size]byte
+	ImageRoot         [sha256.Size]byte
+	CardinalityRoot   [sha256.Size]byte
+	PlacementDigest   [sha256.Size]byte
+	Witness           [sha256.Size]byte
 }
 
 // CertifyRelationImages scans each already materialized relation exactly once
@@ -45,7 +46,7 @@ func CertifyRelationImages(
 	binary.LittleEndian.PutUint64(fixed[0:8], binding.SchemaGeneration)
 	binary.LittleEndian.PutUint16(fixed[8:10], uint16(len(relations)))
 	_, _ = cardinality.Write(fixed[:10])
-	var total uint64
+	var total, nonEmpty uint64
 	for ordinal := range relations {
 		snapshot, snapshotErr := relations[ordinal].target.Collection.Snapshot()
 		if snapshotErr != nil {
@@ -72,6 +73,9 @@ func CertifyRelationImages(
 		relations[ordinal].openedImage = image
 		relations[ordinal].placement = placement
 		total += rows
+		if rows != 0 {
+			nonEmpty |= uint64(1) << uint(ordinal)
+		}
 		binary.LittleEndian.PutUint16(fixed[0:2], uint16(relations[ordinal].id))
 		binary.LittleEndian.PutUint64(fixed[2:10], rows)
 		_, _ = cardinality.Write(fixed[:10])
@@ -87,7 +91,8 @@ func CertifyRelationImages(
 	certificate := RelationImageCertificate{
 		SchemaGeneration: binding.SchemaGeneration,
 		RelationCount:    uint16(len(relations)), TotalRows: total,
-		ManifestDigest: manifest, ImageRoot: imageRoot,
+		NonEmptyRelations: nonEmpty,
+		ManifestDigest:    manifest, ImageRoot: imageRoot,
 		CardinalityRoot: cardinalityRoot, PlacementDigest: placement,
 	}
 	h := sha256.New()
@@ -96,6 +101,8 @@ func CertifyRelationImages(
 	binary.LittleEndian.PutUint16(fixed[8:10], certificate.RelationCount)
 	binary.LittleEndian.PutUint64(fixed[10:18], certificate.TotalRows)
 	_, _ = h.Write(fixed[:])
+	binary.LittleEndian.PutUint64(fixed[0:8], certificate.NonEmptyRelations)
+	_, _ = h.Write(fixed[:8])
 	_, _ = h.Write(certificate.ManifestDigest[:])
 	_, _ = h.Write(certificate.ImageRoot[:])
 	_, _ = h.Write(certificate.CardinalityRoot[:])

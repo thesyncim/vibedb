@@ -16,7 +16,7 @@ func TestRelationImageCertificateBindsCardinalityAndCanonicalRoots(t *testing.T)
 		t.Fatal(err)
 	}
 	if first.SchemaGeneration != fixture.binding.SchemaGeneration ||
-		first.RelationCount != 1 || first.TotalRows != 0 ||
+		first.RelationCount != 1 || first.TotalRows != 0 || first.NonEmptyRelations != 0 ||
 		first.ManifestDigest == ([32]byte{}) || first.ImageRoot == ([32]byte{}) ||
 		first.CardinalityRoot == ([32]byte{}) || first.Witness == ([32]byte{}) {
 		t.Fatalf("empty image certificate = %+v", first)
@@ -30,7 +30,8 @@ func TestRelationImageCertificateBindsCardinalityAndCanonicalRoots(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.TotalRows != 1 || second.ManifestDigest != first.ManifestDigest ||
+	if second.TotalRows != 1 || second.NonEmptyRelations != 1 ||
+		second.ManifestDigest != first.ManifestDigest ||
 		second.ImageRoot == first.ImageRoot || second.CardinalityRoot == first.CardinalityRoot ||
 		second.Witness == first.Witness {
 		t.Fatalf("changed image certificate: before=%+v after=%+v", first, second)

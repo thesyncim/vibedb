@@ -1,0 +1,76 @@
+package driver
+
+import "testing"
+
+func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T) {
+	_, database, identity := bindReplicatedApplyTestRoot(t, "schema-target-proof")
+	claim, _, err := database.OpenReplicatedApply(
+		identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core := database.connector.db
+	core.mu.Lock()
+	raw, err := appendCatalogJSON(nil, core.catalog)
+	if err != nil {
+		core.mu.Unlock()
+		t.Fatal(err)
+	}
+	var decoded catalogFileVibe
+	if err = decodeCatalogJSON(raw, &decoded); err != nil {
+		core.mu.Unlock()
+		t.Fatal(err)
+	}
+	target := catalogFile(decoded)
+	target.ReplicatedShardStore.Binding.Authority.SchemaGeneration++
+	target.ReplicatedShardStore.RelationSchemaGeneration++
+	storage, err := core.newStorageIdentityLocked()
+	if err != nil {
+		core.mu.Unlock()
+		t.Fatal(err)
+	}
+	target.ReplicatedShardStore.UserStorage = storage
+	target.ReplicatedShardStore.Relations[0].Storage = storage
+	target.Tables[target.ReplicatedShardStore.UserTable].Storage = storage
+	target.ReplicatedShardStore.RelationManifestDigest =
+		replicatedRelationManifestDigest(*target.ReplicatedShardStore)
+	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(
+		*target.ReplicatedShardStore, target.ReplicatedApply.Placement,
+	)
+	candidate := &table{meta: target.Tables[target.ReplicatedShardStore.UserTable]}
+	err = core.buildReplacementStorageLocked(
+		t.Context(), target.ReplicatedShardStore.UserTable,
+		core.tables[target.ReplicatedShardStore.UserTable], candidate, true,
+	)
+	core.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = candidate.collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = candidate.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	targetRaw, err := appendCatalogJSON(nil, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := claim.CertifyReplicatedSchemaTarget(targetRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Catalog.SchemaGeneration != identity.RelationSchemaGeneration+1 ||
+		proof.Relations.RelationCount != 1 ||
+		proof.Relations.ManifestDigest != proof.Catalog.RelationManifestDigest ||
+		proof.Relations.Witness == ([32]byte{}) || proof.Witness == ([32]byte{}) {
+		t.Fatalf("target proof = %+v", proof)
+	}
+	if err = claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
