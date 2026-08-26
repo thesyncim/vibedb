@@ -175,6 +175,108 @@ func TestGlobalTabletCatalogExactRouteCursorAndCOW(t *testing.T) {
 	}
 }
 
+func TestGlobalTabletCatalogInsertChildCanonicalCOW(t *testing.T) {
+	view, image, ref, entries := globalTabletCatalogTestNode(t)
+	const generation = uint64(102)
+	logicalID, ok := GlobalTabletCatalogTabletRootLogicalID(23)
+	if !ok {
+		t.Fatal("derive inserted tablet logical ID")
+	}
+	inserted := globalTabletCatalogTestRef(
+		6*GlobalTabletCatalogTabletBytes, logicalID, generation,
+		GlobalTabletCatalogTabletBytes, PageTabletRoute,
+	)
+	dst := make([]byte, len(image))
+	next, err := view.InsertChild(
+		dst, generation, globalTabletCatalogTestBounds,
+		[]byte("t"), 23, inserted,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRef := ref
+	nextRef.Generation = generation
+	nextView, err := OpenGlobalTabletCatalogNode(
+		next, nextRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextView.Count() != len(entries)+1 {
+		t.Fatalf("inserted count = %d, want %d", nextView.Count(), len(entries)+1)
+	}
+	for _, test := range []struct {
+		key  string
+		want uint32
+	}{
+		{"", 7}, {"m", 19}, {"s", 19}, {"t", 23}, {"y", 23}, {"z", 11},
+	} {
+		if got := nextView.Route([]byte(test.key)); got.ID != test.want {
+			t.Fatalf("route %q = %d, want %d", test.key, got.ID, test.want)
+		}
+	}
+	if got := view.Route([]byte("t")); got.ID != 19 {
+		t.Fatalf("insert changed old snapshot route = %d, want 19", got.ID)
+	}
+
+	// The same logical source encoded at a different ancestor generation must
+	// produce the byte-identical canonical insertion image.
+	newerSource, err := EncodeGlobalTabletCatalogNode(
+		make([]byte, GlobalTabletCatalogNodeBytes),
+		GlobalTabletCatalogNodeHeader{
+			StoreID: globalTabletCatalogTestStoreID, Bounds: globalTabletCatalogTestBounds,
+			Generation: 101, LogicalID: ref.LogicalID, PageID: 3,
+			Level: GlobalTabletCatalogLeaf, Kind: PagePrimaryCatalog,
+			ChildKind: PageTabletRoute, ChildLength: GlobalTabletCatalogTabletBytes,
+		}, entries,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerRef := ref
+	newerRef.Generation = 101
+	newerView, err := OpenGlobalTabletCatalogNode(
+		newerSource, newerRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromNewer, err := newerView.InsertChild(
+		make([]byte, len(image)), generation, globalTabletCatalogTestBounds,
+		[]byte("t"), 23, inserted,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(next, fromNewer) {
+		t.Fatal("catalog insertion depends on ancestor node generation")
+	}
+
+	for _, invalid := range []struct {
+		name  string
+		floor []byte
+		id    uint32
+	}{
+		{"empty-floor", nil, 23},
+		{"duplicate-floor", []byte("m"), 23},
+		{"duplicate-id", []byte("t"), entries[1].ID},
+	} {
+		t.Run(invalid.name, func(t *testing.T) {
+			rejected := bytes.Repeat([]byte{0xa5}, len(image))
+			before := bytes.Clone(rejected)
+			if _, err := view.InsertChild(
+				rejected, generation, globalTabletCatalogTestBounds,
+				invalid.floor, invalid.id, inserted,
+			); err == nil {
+				t.Fatal("invalid insertion accepted")
+			}
+			if !bytes.Equal(rejected, before) {
+				t.Fatal("rejected insertion changed destination")
+			}
+		})
+	}
+}
+
 func TestGlobalTabletCatalogCOWIsCanonicalAcrossHistories(t *testing.T) {
 	view100, _, ref100, entries := globalTabletCatalogTestNode(t)
 	replacement := entries[1].Ref

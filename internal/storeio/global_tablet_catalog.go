@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"unsafe"
 )
 
@@ -794,6 +795,92 @@ func (v *GlobalTabletCatalogNodeView) RewriteHandle(
 		[]GlobalTabletCatalogNodeHandleRewrite{{
 			ID: id, Ref: replacement,
 		}},
+	)
+}
+
+// InsertChild performs one immutable structural insertion into a catalog node.
+// Existing stable child IDs, floors, and handles remain byte-equivalent; the
+// caller supplies the exact new lexical floor and a previously unused stable
+// ID. The operation is canonical across source generations because it rebuilds
+// the node from its admitted logical entries rather than patching encoded
+// offsets. A full node reports ErrGlobalTabletCatalogNoSpace without changing
+// dst so its caller can split the catalog level first.
+func (v *GlobalTabletCatalogNodeView) InsertChild(
+	dst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+) ([]byte, error) {
+	if v == nil || len(v.image) == 0 || len(floor) == 0 ||
+		generation <= v.header.Generation || generation >= uint64(1)<<48 ||
+		len(dst) < len(v.image) || !bounds.extends(v.bounds) ||
+		globalTabletCatalogSlicesOverlap(dst[:len(v.image)], v.image) {
+		return nil, fmt.Errorf("%w: catalog insert generation or destination", ErrInvalidWrite)
+	}
+
+	type floorSpan struct{ start, end int }
+	spans := make([]floorSpan, v.Count())
+	arena := make([]byte, 0, len(v.floors.image)+len(floor))
+	for ordinal := 1; ordinal < v.Count(); ordinal++ {
+		common, restart, suffix, ok := v.floors.FenceAt(ordinal - 1)
+		if !ok {
+			return nil, fmt.Errorf("%w: catalog insert source floor", ErrInvalidWrite)
+		}
+		start := len(arena)
+		arena = append(arena, common...)
+		arena = append(arena, restart...)
+		arena = append(arena, suffix...)
+		spans[ordinal] = floorSpan{start: start, end: len(arena)}
+	}
+	insertAt := sort.Search(v.Count(), func(ordinal int) bool {
+		if ordinal == 0 {
+			return false
+		}
+		span := spans[ordinal]
+		return bytes.Compare(arena[span.start:span.end], floor) >= 0
+	})
+	if insertAt < v.Count() {
+		span := spans[insertAt]
+		if bytes.Equal(arena[span.start:span.end], floor) {
+			return nil, fmt.Errorf("%w: duplicate catalog insert floor", ErrInvalidWrite)
+		}
+	}
+
+	entries := make([]GlobalTabletCatalogNodeEntry, 0, v.Count()+1)
+	for ordinal := 0; ordinal <= v.Count(); ordinal++ {
+		if ordinal == insertAt {
+			entries = append(entries, GlobalTabletCatalogNodeEntry{
+				Floor: floor, ID: id, Ref: ref,
+			})
+		}
+		if ordinal == v.Count() {
+			break
+		}
+		route, ok := v.RouteAt(ordinal)
+		if !ok {
+			return nil, fmt.Errorf("%w: catalog insert source route", ErrInvalidWrite)
+		}
+		var oldFloor []byte
+		if ordinal != 0 {
+			span := spans[ordinal]
+			oldFloor = arena[span.start:span.end]
+		}
+		entries = append(entries, GlobalTabletCatalogNodeEntry{
+			Floor: oldFloor, ID: route.ID, Ref: route.Ref,
+		})
+	}
+	return EncodeGlobalTabletCatalogNode(
+		dst,
+		GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: v.header.LogicalID, PageID: v.pageID,
+			Level: v.level, RootChildLevel: v.childLevel,
+			Bounds: bounds, Kind: PagePrimaryCatalog,
+			ChildKind: v.childKind, ChildLength: v.childLength,
+		},
+		entries,
 	)
 }
 
