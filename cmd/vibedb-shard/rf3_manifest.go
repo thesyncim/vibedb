@@ -67,16 +67,16 @@ type rf3ManifestSQL struct {
 }
 
 type rf3ManifestListeners struct {
-	Peer    string
-	Native  string
-	Control string
+	Peer    string `json:"peer"`
+	Native  string `json:"native"`
+	Control string `json:"control"`
 }
 
 type rf3ManifestTLS struct {
-	Certificate string
-	Key         string
-	Roots       string
-	IdentityOID string
+	Certificate string `json:"certificate"`
+	Key         string `json:"key"`
+	Roots       string `json:"roots"`
+	IdentityOID string `json:"identity_oid"`
 }
 
 type rf3ManifestMember struct {
