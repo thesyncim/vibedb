@@ -1073,7 +1073,7 @@ func scanSessionSystemSnapshot(
 					}
 					continue
 				}
-				if len(transactionIntentKeys) > math.MaxUint32-len(mutation.Key) {
+				if uint64(len(transactionIntentKeys))+uint64(len(mutation.Key)) > math.MaxUint32 {
 					return fmt.Errorf("%w: transaction intent key arena", ErrTransactionStateCorrupt)
 				}
 				offset := len(transactionIntentKeys)
