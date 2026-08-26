@@ -27,10 +27,23 @@ type Route struct {
 
 // Mux is immutable after construction and performs no per-request allocation.
 // The caller's TLS listener remains the sole concurrency bound.
-type Mux struct{ routes []Route }
+type Mux struct {
+	routes  []Route
+	traffic rafttransport.TrafficClass
+}
 
 func New(routes ...Route) (*Mux, error) {
+	return NewForTraffic(rafttransport.TrafficShardControl, routes...)
+}
+
+// NewForTraffic constructs the same allocation-free discriminator mux for an
+// exact authenticated traffic class. Snapshot transfer and split artifacts
+// use this to share one snapshot listener without weakening ALPN isolation.
+func NewForTraffic(traffic rafttransport.TrafficClass, routes ...Route) (*Mux, error) {
 	if len(routes) == 0 || len(routes) > 16 {
+		return nil, ErrMux
+	}
+	if traffic != rafttransport.TrafficShardControl && traffic != rafttransport.TrafficSnapshot {
 		return nil, ErrMux
 	}
 	owned := make([]Route, len(routes))
@@ -45,12 +58,12 @@ func New(routes ...Route) (*Mux, error) {
 			}
 		}
 	}
-	return &Mux{routes: owned}, nil
+	return &Mux{routes: owned, traffic: traffic}, nil
 }
 
 func (mux *Mux) Serve(ctx context.Context, connection rafttransport.PeerConnection) error {
 	if mux == nil || ctx == nil || connection == nil ||
-		connection.TrafficClass() != rafttransport.TrafficShardControl {
+		connection.TrafficClass() != mux.traffic {
 		if connection != nil {
 			_ = connection.Close()
 		}

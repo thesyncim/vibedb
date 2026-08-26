@@ -30,6 +30,10 @@ var (
 	ErrSource       = errors.New("splitartifact: source failure")
 )
 
+// RequestDiscriminator identifies split-artifact streams on the shared
+// mutually authenticated snapshot listener.
+func RequestDiscriminator() [8]byte { return requestMagic }
+
 var (
 	requestMagic  = [8]byte{'V', 'B', 'S', 'P', 'R', 'E', 'Q', 0}
 	responseMagic = [8]byte{'V', 'B', 'S', 'P', 'R', 'E', 'S', 0}

@@ -94,3 +94,38 @@ func TestMuxRejectsUnknownDuplicateAndWrongTraffic(t *testing.T) {
 		}
 	}
 }
+
+func TestMuxDispatchesExactSnapshotTrafficWithoutAcceptingControl(t *testing.T) {
+	magic := [8]byte{'V', 'B', 'S', 'N', 'A', 'P', 0, 0}
+	handler := &testHandler{want: append(magic[:], 9), done: make(chan error, 1)}
+	mux, err := NewForTraffic(
+		rafttransport.TrafficSnapshot,
+		Route{Discriminator: magic, Handler: handler},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- mux.Serve(t.Context(), &testConnection{Conn: server, class: rafttransport.TrafficSnapshot})
+	}()
+	if _, err = client.Write(handler.want); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-handler.done; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	client, server = net.Pipe()
+	go func() {
+		done <- mux.Serve(t.Context(), &testConnection{Conn: server, class: rafttransport.TrafficShardControl})
+	}()
+	_ = client.Close()
+	if err = <-done; !errors.Is(err, ErrMux) {
+		t.Fatalf("control traffic err=%v", err)
+	}
+}

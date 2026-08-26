@@ -24,6 +24,10 @@ var (
 	responseMagic = [8]byte{'V', 'B', 'S', 'R', 'E', 'S', 0, 0}
 )
 
+// RequestDiscriminator identifies replica snapshot data streams on the shared
+// mutually authenticated snapshot listener.
+func RequestDiscriminator() [8]byte { return requestMagic }
+
 // AuthorizeFunc compares the descriptor against the caller's current durable
 // store/incarnation/schema/replica-set and snapshot lineage fence.
 type AuthorizeFunc func(Descriptor) bool
