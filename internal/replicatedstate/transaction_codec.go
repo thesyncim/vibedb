@@ -120,6 +120,10 @@ type TransactionControl struct {
 	// recorded a vote; the only durable nonzero values are ResultApplied and
 	// ResultIndexConflict.
 	PrepareResultCode uint32
+	// FusedPath permanently distinguishes controls created by atomic prepare
+	// operations from legacy split controls. The bit survives finish/retire so
+	// historical retries cannot reinterpret one protocol as the other.
+	FusedPath bool
 	// CoordinatorDecision is invalid while staging, matches the live terminal
 	// decision, and survives Retired so delayed Commit/Abort retries remain
 	// distinguishable after child-row reclamation.
@@ -302,6 +306,9 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	if control.AffectedRowsValid {
 		frame[15] |= 1
 	}
+	if control.FusedPath {
+		frame[15] |= 1 << 6
+	}
 	switch control.PrepareResultCode {
 	case 0:
 	case ResultApplied:
@@ -394,10 +401,11 @@ func OpenTransactionControlInto(
 	view.PayloadKind = distributedtxn.ReplicatedPayloadKind(src[12])
 	view.LastOperation = distributedtxn.ReplicatedOperation(src[13])
 	view.BucketBits = src[14]
-	if src[15]&0xc0 != 0 {
+	if src[15]&0x80 != 0 {
 		return TransactionControlView{}, ErrTransactionStateCorrupt
 	}
 	view.AffectedRowsValid = src[15]&1 != 0
+	view.FusedPath = src[15]&(1<<6) != 0
 	view.CoordinatorDecision = distributedtxn.CoordinatorState((src[15] >> 1) & 7)
 	switch (src[15] >> 4) & 3 {
 	case 0:
@@ -868,6 +876,10 @@ func transactionControlValid(control TransactionControl) bool {
 			!transactionFailedFusedPrepareWitness(control)) {
 		return false
 	}
+	if operationUsesFusedTransactionPath(control.LastOperation) != control.FusedPath &&
+		operationHasExclusiveTransactionPath(control.LastOperation) {
+		return false
+	}
 	creation := control.LastOperation == distributedtxn.ReplicatedStageCoordinator ||
 		control.LastOperation == distributedtxn.ReplicatedStageManifestCoordinator ||
 		control.LastOperation == distributedtxn.ReplicatedStageParticipant ||
@@ -909,6 +921,14 @@ func transactionControlValid(control TransactionControl) bool {
 			control.PrepareResultCode != ResultIndexConflict {
 			return false
 		}
+		if !control.FusedPath && control.PrepareResultCode != 0 {
+			return false
+		}
+		if control.FusedPath && control.PrepareResultCode == 0 &&
+			control.LastOperation != distributedtxn.ReplicatedBeginPrepareCoordinator &&
+			control.LastOperation != distributedtxn.ReplicatedBeginPrepareManifestCoordinator {
+			return false
+		}
 		if control.PrepareResultCode == 0 && control.CoordinatorParticipantOrdinal != 0 {
 			return false
 		}
@@ -945,6 +965,9 @@ func transactionControlValid(control TransactionControl) bool {
 		(control.PrepareCommandDigest != (replication.Digest{})) {
 		return false
 	}
+	if control.FusedPath && control.PrepareResultCode == 0 {
+		return false
+	}
 	active := distributedtxn.ParticipantState(control.State) != distributedtxn.ParticipantReleased
 	if active != (control.ResidentMutationBytes != 0) || active != (control.ResidentIntentBytes != 0) {
 		return false
@@ -958,6 +981,42 @@ func transactionControlValid(control TransactionControl) bool {
 		return !control.AffectedRowsValid && control.AffectedRows == 0 || control.AffectedRowsValid
 	default:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
+	}
+}
+
+func operationHasExclusiveTransactionPath(operation distributedtxn.ReplicatedOperation) bool {
+	switch operation {
+	case distributedtxn.ReplicatedStageCoordinator,
+		distributedtxn.ReplicatedStageManifestCoordinator,
+		distributedtxn.ReplicatedStageManifestSegment,
+		distributedtxn.ReplicatedStageParticipant,
+		distributedtxn.ReplicatedPrepareParticipant,
+		distributedtxn.ReplicatedApplyParticipant,
+		distributedtxn.ReplicatedAbortParticipant,
+		distributedtxn.ReplicatedReleaseParticipant,
+		distributedtxn.ReplicatedBeginPrepareCoordinator,
+		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+		distributedtxn.ReplicatedAppendManifestSegments,
+		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedApplyReleaseParticipant,
+		distributedtxn.ReplicatedAbortReleaseParticipant:
+		return true
+	default:
+		return false
+	}
+}
+
+func operationUsesFusedTransactionPath(operation distributedtxn.ReplicatedOperation) bool {
+	switch operation {
+	case distributedtxn.ReplicatedBeginPrepareCoordinator,
+		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+		distributedtxn.ReplicatedAppendManifestSegments,
+		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedApplyReleaseParticipant,
+		distributedtxn.ReplicatedAbortReleaseParticipant:
+		return true
+	default:
+		return false
 	}
 }
 

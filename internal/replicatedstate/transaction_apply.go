@@ -99,6 +99,10 @@ func (m *Machine) planTransactionCommand(
 		plan.command.conflict = true
 		return plan, nil
 	}
+	if !creation && operationHasExclusiveTransactionPath(control.Operation) &&
+		existing.FusedPath != operationUsesFusedTransactionPath(control.Operation) {
+		return transactionConflict(plan), nil
+	}
 	if state.TransactionControlCount >= MaxRetainedTransactions && creation {
 		plan.command.refusal = ErrAdmissionBound
 		return plan, nil
@@ -183,6 +187,12 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	systemSnapshot pointSnapshot,
 	relationSnapshots relationPointSnapshots,
 ) (transactionCommandPlan, error) {
+	if replication.ID128(control.Participant.CoordinatorGroup) != command.GroupID ||
+		replication.ID128(control.Participant.CoordinatorShardIncarnation) != command.ShardIncarnation ||
+		control.Participant.CoordinatorAllocation != command.AllocationGeneration {
+		plan.command.resultCode = ResultStaleFence
+		return plan, nil
+	}
 	coordinatorKey, _ := TransactionControlStorageKey(
 		distributedtxn.ReplicatedRoleCoordinator, control.ID,
 	)
@@ -281,6 +291,13 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	coordinatorPlan.delta.payloadRows += participantPlan.delta.payloadRows
 	coordinatorPlan.delta.intentRows += participantPlan.delta.intentRows
 	coordinatorPlan.delta.residentByte += participantPlan.delta.residentByte
+	wantActive := int64(1)
+	if participantPlan.command.resultCode == ResultApplied {
+		wantActive = 2
+	}
+	if coordinatorPlan.delta.controls != 2 || coordinatorPlan.delta.active != wantActive {
+		return transactionCommandPlan{}, ErrTransactionStateCorrupt
+	}
 	coordinatorPlan.command.resultCode = participantPlan.command.resultCode
 	if err := rewriteCoordinatorBeginWitness(
 		&coordinatorPlan, coordinatorKey, uint64(control.Participant.ParticipantOrdinal),
@@ -353,6 +370,7 @@ func (m *Machine) planInlineCoordinatorStage(
 		PayloadCount:     uint64(len(record.Participants)),
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
 		CoordinatorAllocation: command.AllocationGeneration, MutationDigest: payloadDigest,
+		FusedPath:            control.Operation == distributedtxn.ReplicatedBeginPrepareCoordinator,
 		ResidentControlBytes: controlBytes, ResidentPayloadBytes: payloadBytes,
 		LastOperation: control.Operation, LastExpectedRevision: 0,
 		LastCommandDigest: commandDigest, LastResultCode: ResultApplied,
@@ -432,6 +450,7 @@ func (m *Machine) planManifestCoordinatorStage(
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
 		CoordinatorAllocation: command.AllocationGeneration,
 		MutationDigest:        transactionManifestStartDigest(coordinatorRaw, firstPage),
+		FusedPath:             control.Operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		ResidentControlBytes:  controlBytes, ResidentPayloadBytes: payloadBytes,
 		ResidentManifestBytes: manifestBytes,
 		LastOperation:         control.Operation, LastExpectedRevision: 0,
@@ -468,7 +487,8 @@ func (m *Machine) planManifestPageStage(
 ) (transactionCommandPlan, error) {
 	if existing.Role != distributedtxn.ReplicatedRoleCoordinator ||
 		existing.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
-		distributedtxn.CoordinatorState(existing.State) != distributedtxn.CoordinatorStaging {
+		distributedtxn.CoordinatorState(existing.State) != distributedtxn.CoordinatorStaging ||
+		existing.FusedPath {
 		return transactionConflict(plan), nil
 	}
 	meta, ok := openTransactionManifestSegmentMeta(control.Payload)
@@ -477,6 +497,16 @@ func (m *Machine) planManifestPageStage(
 		existing.ManifestNextPage == math.MaxUint32 ||
 		uint64(meta.ParticipantCount) > existing.PayloadCount-existing.ManifestNextParticipant ||
 		uint64(len(control.Payload)) > existing.PayloadBytes-existing.ManifestEncodedBytes {
+		return transactionConflict(plan), nil
+	}
+	sequence, sequenceErr := distributedtxn.OpenManifestSegmentSequence(control.Payload)
+	follows, followErr := transactionManifestSequenceFollowsRetained(
+		snapshot, control.ID, existing.ManifestNextPage, sequence,
+	)
+	if followErr != nil {
+		return transactionCommandPlan{}, followErr
+	}
+	if sequenceErr != nil || !follows {
 		return transactionConflict(plan), nil
 	}
 	if existing.PrepareResultCode != 0 &&
@@ -552,7 +582,8 @@ func (m *Machine) planManifestSegmentsStage(
 ) (transactionCommandPlan, error) {
 	if existing.Role != distributedtxn.ReplicatedRoleCoordinator ||
 		existing.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
-		distributedtxn.CoordinatorState(existing.State) != distributedtxn.CoordinatorStaging {
+		distributedtxn.CoordinatorState(existing.State) != distributedtxn.CoordinatorStaging ||
+		!existing.FusedPath {
 		return transactionConflict(plan), nil
 	}
 	segments, err := distributedtxn.OpenManifestSegmentSequence(control.Payload)
@@ -561,6 +592,29 @@ func (m *Machine) planManifestSegmentsStage(
 		uint64(segments.Count()) > uint64(math.MaxUint32-existing.ManifestNextPage) ||
 		segments.ParticipantCount() > existing.PayloadCount-existing.ManifestNextParticipant ||
 		segments.EncodedBytes() > existing.PayloadBytes-existing.ManifestEncodedBytes {
+		return transactionConflict(plan), nil
+	}
+	descriptor, descriptorErr := transactionManifestDescriptorAt(snapshot, control.ID)
+	if descriptorErr != nil {
+		return transactionCommandPlan{}, descriptorErr
+	}
+	remainingPages := uint32(0)
+	if descriptorErr == nil && existing.ManifestNextPage <= descriptor.SegmentCount {
+		remainingPages = descriptor.SegmentCount - existing.ManifestNextPage
+	}
+	wantPages := uint32(distributedtxn.MaxManifestSegmentsPerCommand)
+	if remainingPages < wantPages {
+		wantPages = remainingPages
+	}
+	follows, followErr := transactionManifestSequenceFollowsRetained(
+		snapshot, control.ID, existing.ManifestNextPage, segments,
+	)
+	if followErr != nil {
+		return transactionCommandPlan{}, followErr
+	}
+	if descriptor.ParticipantCount != existing.PayloadCount ||
+		descriptor.EncodedBytes != existing.PayloadBytes || wantPages == 0 ||
+		uint32(segments.Count()) != wantPages || !follows {
 		return transactionConflict(plan), nil
 	}
 	var participant TransactionControlView
@@ -630,6 +684,48 @@ func (m *Machine) planManifestSegmentsStage(
 	plan.delta.residentByte = int64(resident)
 	plan.command.resultCode = ResultApplied
 	return plan, nil
+}
+
+func transactionManifestDescriptorAt(
+	snapshot pointSnapshot,
+	id distributedtxn.ID,
+) (distributedtxn.ManifestDescriptor, error) {
+	payloadKey, _ := TransactionCoordinatorPayloadStorageKey(id)
+	raw, found, err := snapshot.appendRaw(nil, payloadKey[:])
+	if err != nil || !found {
+		return distributedtxn.ManifestDescriptor{}, errors.Join(err, ErrTransactionStateCorrupt)
+	}
+	payload, err := OpenTransactionCoordinatorPayload(raw)
+	if err != nil || payload.ID != id ||
+		payload.Kind != distributedtxn.ReplicatedPayloadManifestCoordinator {
+		return distributedtxn.ManifestDescriptor{}, errors.Join(err, ErrTransactionStateCorrupt)
+	}
+	record, err := distributedtxn.OpenManifestCoordinator(payload.Payload)
+	if err != nil || record.ID != id {
+		return distributedtxn.ManifestDescriptor{}, errors.Join(err, ErrTransactionStateCorrupt)
+	}
+	return record.Manifest, nil
+}
+
+func transactionManifestSequenceFollowsRetained(
+	snapshot pointSnapshot,
+	id distributedtxn.ID,
+	nextPage uint32,
+	segments distributedtxn.ManifestSegmentSequence,
+) (bool, error) {
+	if nextPage == 0 {
+		return false, ErrTransactionStateCorrupt
+	}
+	previousKey, _ := TransactionManifestPageStorageKey(id, nextPage-1)
+	raw, found, err := snapshot.appendRaw(nil, previousKey[:])
+	if err != nil || !found {
+		return false, errors.Join(err, ErrTransactionStateCorrupt)
+	}
+	storedID, meta, previous, err := openTransactionManifestPageWitness(raw)
+	if err != nil || storedID != id || meta.Index != nextPage-1 {
+		return false, errors.Join(err, ErrTransactionStateCorrupt)
+	}
+	return distributedtxn.ManifestSegmentSequenceFollows(previous, segments) == nil, nil
 }
 
 func (m *Machine) planCoordinatorTransition(
@@ -894,6 +990,7 @@ func (m *Machine) planParticipantStageWithVote(
 			}
 			return replication.Digest{}
 		}(),
+		FusedPath:     prepare,
 		LastOperation: control.Operation, LastExpectedRevision: 0,
 		LastCommandDigest: commandDigest, LastResultCode: resultCode,
 		LastAppliedIndex: applied,
