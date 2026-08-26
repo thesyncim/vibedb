@@ -628,6 +628,10 @@ type ReplicatedOperationState uint8
 const (
 	ReplicatedOperationSplit ReplicatedOperationKind = iota + 1
 	ReplicatedOperationMove
+	// ReplicatedOperationSchema is the durable prepare/activate/abort witness
+	// for one exact relation-manifest rollout. It extends the one current
+	// operation grammar; there is no parallel protocol generation.
+	ReplicatedOperationSchema
 )
 
 const (
@@ -653,7 +657,7 @@ type ReplicatedOperationRecord struct {
 
 func validReplicatedOperation(record ReplicatedOperationRecord) bool {
 	return record.ID != ([32]byte{}) &&
-		record.Kind >= ReplicatedOperationSplit && record.Kind <= ReplicatedOperationMove &&
+		record.Kind >= ReplicatedOperationSplit && record.Kind <= ReplicatedOperationSchema &&
 		record.State >= ReplicatedOperationPlanned && record.State <= ReplicatedOperationCancelled &&
 		record.Revision != 0 && record.CatalogGeneration != 0 && record.Proof != ([32]byte{}) &&
 		record.IntentDigest != ([32]byte{}) && len(record.Intent) != 0 &&
