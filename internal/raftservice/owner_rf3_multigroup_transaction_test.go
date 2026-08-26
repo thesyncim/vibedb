@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/big"
@@ -1435,9 +1436,7 @@ func TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups(t *testing.T) {
 			Executor: replicatedExecutor, Tenant: []byte("tenant"), MaxConcurrency: 2,
 			MaxInFlightBytes: 64 << 20, MaxMutations: 2, MaxMutationBytes: 1 << 20,
 			RecoveryTimeout: time.Minute,
-			IDSource: bytes.NewReader(bytes.Repeat(
-				[]byte{0xa6}, 5*len(distributedtxn.ID{}),
-			)),
+			IDSource:        multiGroupRF3TransactionIDs(5),
 		},
 	)
 	if err != nil {
@@ -1588,8 +1587,14 @@ func TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups(t *testing.T) {
 			if readErr != nil || got.Found != (group == 0) {
 				t.Fatalf("group %d member %d shipped row found=%v err=%v", group, member, got.Found, readErr)
 			}
-			if group == 0 && !bytes.Equal(got.Value, []byte(`{"id":"exec-batch-a","group":2}`)) {
-				t.Fatalf("group %d member %d updated value=%q", group, member, got.Value)
+			if group == 0 {
+				want, canonicalErr := vibejson.AppendCanonicalize(
+					nil, []byte(`{"id":"exec-batch-a","group":2}`),
+				)
+				if canonicalErr != nil || !bytes.Equal(got.Value, want) {
+					t.Fatalf("group %d member %d updated value=%q canonical=%q err=%v",
+						group, member, got.Value, want, canonicalErr)
+				}
 			}
 		}
 	}
@@ -1636,6 +1641,17 @@ func TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups(t *testing.T) {
 			}
 		}
 	}
+}
+
+func multiGroupRF3TransactionIDs(count int) io.Reader {
+	encoded := make([]byte, 0, count*len(distributedtxn.ID{}))
+	for ordinal := 1; ordinal <= count; ordinal++ {
+		var id distributedtxn.ID
+		id[0] = 0xa6
+		binary.BigEndian.PutUint64(id[len(id)-8:], uint64(ordinal))
+		encoded = append(encoded, id[:]...)
+	}
+	return bytes.NewReader(encoded)
 }
 
 func multiGroupRF3SQLSnapshot(
