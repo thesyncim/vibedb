@@ -19,5 +19,5 @@ func run(args []string) int {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  vibedb cluster dev --nodes 3 --root <absolute-path>")
+	fmt.Fprintln(os.Stderr, "  vibedb cluster dev --replicas 1|3 --root <absolute-path>")
 }

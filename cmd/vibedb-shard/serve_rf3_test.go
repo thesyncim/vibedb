@@ -526,6 +526,21 @@ func serveRF3TestManifest() rf3Manifest {
 	}
 }
 
+func TestBuildRF1RosterIsExplicitlyDevelopmentOnly(t *testing.T) {
+	manifest := serveRF3TestManifest()
+	manifest.DevelopmentOnly = true
+	manifest.MemberCount = 1
+	group := serveRF3TestGroup()
+	roster, remote, _, native, err := buildRF3Roster(manifest, group, 1, serveRF3Publication(1))
+	if err != nil || len(roster) != 1 || len(remote) != 0 || !native {
+		t.Fatalf("RF1 roster=%+v remote=%+v native=%v err=%v", roster, remote, native, err)
+	}
+	manifest.DevelopmentOnly = false
+	if _, _, _, _, err = buildRF3Roster(manifest, group, 1, serveRF3Publication(1)); !errors.Is(err, errRF3Serving) {
+		t.Fatalf("unmarked RF1 error = %v", err)
+	}
+}
+
 func serveRF3TestEnrolledTarget() *rf3ManifestEnrolledTarget {
 	return &rf3ManifestEnrolledTarget{
 		MemberID: 4, NodeID: rafttransport.NodeID{4}, StoreID: [16]byte{5}, NodeIncarnation: 6,

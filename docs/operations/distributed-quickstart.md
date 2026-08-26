@@ -24,7 +24,7 @@ go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
 Choose an empty absolute directory and start the cluster:
 
 ```bash
-./bin/vibedb cluster dev --nodes 3 --root /tmp/vibedb-dev
+./bin/vibedb cluster dev --replicas 3 --root /tmp/vibedb-dev
 ```
 
 The command generates a local CA and node certificates, a canonical
@@ -40,9 +40,13 @@ interrupted preparation without replacing existing member roots or identities.
 The generated credentials and `local-development-only` key reference are for
 one-host tests, not an operator credential lifecycle.
 
-`--nodes` is explicit but currently accepts exactly `3`. There is no RF1
-shortcut: a one-process mode would not exercise quorum commit, leader loss, or
-follower catch-up. To run processes separately, use the manual path below.
+For a lighter local smoke test, `--replicas 1` prepares and serves one genuine
+Raft member and prints its authenticated native endpoint. This mode is
+explicitly development-only and has no high availability, quorum-failure, or
+follower-catch-up coverage; it does not start the distributed gateway.
+`--nodes 1|3` remains a deprecated unambiguous alias. A retained root is bound
+to its original replica count and cannot be silently reopened with another
+topology. To run processes separately, use the manual path below.
 
 ## Manual preparation
 

@@ -52,6 +52,7 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite(t *test
 		},
 		TLS:                 rf3ManifestTLS{Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: "1.3.6.1.4.1.32473.1.1"},
 		AuthorizationPolicy: policy,
+		Members:             make([]prepareRF3Member, rf3ManifestMembers),
 	}
 	for index := range input.Members {
 		input.Members[index] = prepareRF3Member{MemberID: uint64(index + 1), NodeID: idString(nodes[index][:]), PeerAddress: "127.0.0.1:" + []string{"21001", "21002", "21003"}[index]}

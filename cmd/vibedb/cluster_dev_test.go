@@ -16,11 +16,11 @@ import (
 func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) {
 	root := t.TempDir()
 	manifest := devClusterManifest{
-		Format: devClusterFormat, Nodes: devClusterNodes,
+		Format: devClusterFormat, Nodes: devClusterRF3,
 		ClientEndpoint: "127.0.0.1:24000", CatalogPath: filepath.Join(root, "catalog.vibejson"),
 		GatewayCertificate: filepath.Join(root, "gateway-cert.pem"), GatewayKey: filepath.Join(root, "gateway-key.pem"),
 		Roots: filepath.Join(root, "roots.pem"), AuthorizationPolicy: filepath.Join(root, "policy.vibejson"),
-		GatewayNode: "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterNodes),
+		GatewayNode: "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterRF3),
 	}
 	paths := []string{manifest.CatalogPath, manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy}
 	for index := range manifest.Members {
@@ -42,13 +42,44 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(root, "cluster.vibejson"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := ensureDevCluster(devClusterOptions{root: root, nodes: 3, shardBinary: "/does/not/run"})
+	loaded, err := ensureDevCluster(devClusterOptions{root: root, replicas: 3, shardBinary: "/does/not/run"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	again, err := vibejson.Marshal(&loaded)
 	if err != nil || !bytes.Equal(raw, again) {
 		t.Fatalf("resume changed manifest: %v", err)
+	}
+}
+
+func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
+	root := t.TempDir()
+	base := devClusterManifest{
+		Format: devClusterFormat, Nodes: devClusterRF1, ClientEndpoint: "127.0.0.1:24000",
+		CatalogPath: filepath.Join(root, "catalog.vibejson"), GatewayCertificate: filepath.Join(root, "gateway-cert.pem"),
+		GatewayKey: filepath.Join(root, "gateway-key.pem"), Roots: filepath.Join(root, "roots.pem"),
+		AuthorizationPolicy: filepath.Join(root, "policy.vibejson"), GatewayNode: "01010101010101010101010101010101",
+		Members: []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "22222222222222222222222222222222", Peer: "127.0.0.1:25001", Native: "127.0.0.1:25101", Snapshot: "127.0.0.1:25201", Control: "127.0.0.1:25301", ServeManifest: filepath.Join(root, "member-1", "serve-rf3.vibejson")}},
+	}
+	if !validDevManifest(base, root) {
+		t.Fatal("explicit RF1 manifest rejected")
+	}
+	base.Nodes = 2
+	if validDevManifest(base, root) {
+		t.Fatal("RF2 manifest accepted")
+	}
+}
+
+func TestClusterDevReplicaFlagsRejectAmbiguity(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	for _, args := range [][]string{
+		{"--root", root, "--replicas", "2"},
+		{"--root", root, "--nodes", "0"},
+		{"--root", root, "--replicas", "1", "--nodes", "3"},
+	} {
+		if code := runClusterDev(args); code != 2 {
+			t.Fatalf("runClusterDev(%v) = %d, want usage error", args, code)
+		}
 	}
 }
 

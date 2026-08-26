@@ -33,7 +33,9 @@ type rf3Manifest struct {
 	TLS                 rf3ManifestTLS
 	AuthorizationPolicy string
 	ReplicaControl      rf3ManifestReplicaControl
+	DevelopmentOnly     bool
 	Members             [rf3ManifestMembers]rf3ManifestMember
+	MemberCount         uint8
 	EnrolledTarget      *rf3ManifestEnrolledTarget
 	Groups              []rf3ManifestGroup
 }
@@ -42,6 +44,7 @@ type rf3ManifestGroup struct {
 	WAL            rf3ManifestWAL
 	SQL            rf3ManifestSQL
 	Members        [rf3ManifestMembers]rf3ManifestMember
+	MemberCount    uint8
 	EnrolledTarget *rf3ManifestEnrolledTarget
 }
 
@@ -50,14 +53,26 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 		return manifest.Groups
 	}
 	return []rf3ManifestGroup{{WAL: manifest.WAL, SQL: manifest.SQL,
-		Members: manifest.Members, EnrolledTarget: manifest.EnrolledTarget}}
+		Members: manifest.Members, MemberCount: uint8(len(manifest.memberRoster())),
+		EnrolledTarget: manifest.EnrolledTarget}}
 }
 
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 	return rf3Manifest{WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
-		ReplicaControl: manifest.ReplicaControl,
-		Members:        group.Members, EnrolledTarget: group.EnrolledTarget}
+		ReplicaControl:  manifest.ReplicaControl,
+		DevelopmentOnly: manifest.DevelopmentOnly, Members: group.Members,
+		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
+}
+
+func (manifest rf3Manifest) memberRoster() []rf3ManifestMember {
+	count := manifest.MemberCount
+	if count == 0 {
+		// In-memory RF3 fixtures and callers predating the explicit count always
+		// own the full fixed roster. Parsed manifests never rely on this fallback.
+		count = rf3ManifestMembers
+	}
+	return manifest.Members[:count]
 }
 
 // rf3ManifestReplicaControl fixes every local disk and memory bound used by
@@ -266,11 +281,24 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	if manifest.ReplicaControl, err = parseRF3ManifestReplicaControl(node); err != nil {
 		return rf3Manifest{}, err
 	}
-	node, err = nextRF3Field(&fields, `"members"`)
+	key, node, present = fields.Next()
+	if !present {
+		return rf3Manifest{}, errInvalidRF3Manifest
+	}
+	if bytes.Equal(key.Raw().Bytes(), []byte(`"development_only"`)) {
+		development, ok := node.Bool()
+		if !ok || !development {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		manifest.DevelopmentOnly = true
+		node, err = nextRF3Field(&fields, `"members"`)
+	} else if !bytes.Equal(key.Raw().Bytes(), []byte(`"members"`)) {
+		err = errInvalidRF3Manifest
+	}
 	if err != nil {
 		return rf3Manifest{}, err
 	}
-	if manifest.Members, err = parseRF3ManifestMembers(node); err != nil {
+	if manifest.Members, manifest.MemberCount, err = parseRF3ManifestMembers(node, manifest.DevelopmentOnly); err != nil {
 		return rf3Manifest{}, err
 	}
 	key, node, present = fields.Next()
@@ -278,7 +306,10 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if !bytes.Equal(key.Raw().Bytes(), []byte(`"enrolled_target"`)) {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
-		target, err := parseRF3ManifestEnrolledTarget(node, manifest.Members)
+		if manifest.DevelopmentOnly {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		target, err := parseRF3ManifestEnrolledTarget(node, manifest.memberRoster())
 		if err != nil {
 			return rf3Manifest{}, err
 		}
@@ -356,15 +387,17 @@ func parseRF3ManifestGroup(node vibejson.Node) (rf3ManifestGroup, error) {
 	if err != nil {
 		return group, err
 	}
-	if group.Members, err = parseRF3ManifestMembers(value); err != nil {
+	var count uint8
+	if group.Members, count, err = parseRF3ManifestMembers(value, false); err != nil || count != rf3ManifestMembers {
 		return group, err
 	}
+	group.MemberCount = count
 	key, value, present := fields.Next()
 	if present {
 		if !bytes.Equal(key.Raw().Bytes(), []byte(`"enrolled_target"`)) {
 			return group, errInvalidRF3Manifest
 		}
-		target, err := parseRF3ManifestEnrolledTarget(value, group.Members)
+		target, err := parseRF3ManifestEnrolledTarget(value, group.Members[:])
 		if err != nil {
 			return group, err
 		}
@@ -635,33 +668,33 @@ func parseRF3ManifestTLS(node vibejson.Node) (rf3ManifestTLS, error) {
 	return result, nil
 }
 
-func parseRF3ManifestMembers(node vibejson.Node) ([rf3ManifestMembers]rf3ManifestMember, error) {
+func parseRF3ManifestMembers(node vibejson.Node, developmentOnly bool) ([rf3ManifestMembers]rf3ManifestMember, uint8, error) {
 	var result [rf3ManifestMembers]rf3ManifestMember
 	count, ok := node.ArrayLen()
-	if !ok || count != len(result) {
-		return result, errInvalidRF3Manifest
+	if !ok || count != len(result) && (!developmentOnly || count != 1) {
+		return result, 0, errInvalidRF3Manifest
 	}
 	members, _ := node.ArrayIter()
-	for index := range result {
+	for index := 0; index < count; index++ {
 		node, present := members.Next()
 		if !present {
-			return [rf3ManifestMembers]rf3ManifestMember{}, errInvalidRF3Manifest
+			return [rf3ManifestMembers]rf3ManifestMember{}, 0, errInvalidRF3Manifest
 		}
 		member, err := parseRF3ManifestMember(node)
 		if err != nil || index > 0 && member.MemberID <= result[index-1].MemberID {
-			return [rf3ManifestMembers]rf3ManifestMember{}, errInvalidRF3Manifest
+			return [rf3ManifestMembers]rf3ManifestMember{}, 0, errInvalidRF3Manifest
 		}
 		for prior := 0; prior < index; prior++ {
 			if member.NodeID == result[prior].NodeID || member.PeerAddress == result[prior].PeerAddress {
-				return [rf3ManifestMembers]rf3ManifestMember{}, errInvalidRF3Manifest
+				return [rf3ManifestMembers]rf3ManifestMember{}, 0, errInvalidRF3Manifest
 			}
 		}
 		result[index] = member
 	}
 	if _, extra := members.Next(); extra {
-		return [rf3ManifestMembers]rf3ManifestMember{}, errInvalidRF3Manifest
+		return [rf3ManifestMembers]rf3ManifestMember{}, 0, errInvalidRF3Manifest
 	}
-	return result, nil
+	return result, uint8(count), nil
 }
 
 func parseRF3ManifestMember(node vibejson.Node) (rf3ManifestMember, error) {
@@ -699,7 +732,7 @@ func parseRF3ManifestMember(node vibejson.Node) (rf3ManifestMember, error) {
 
 func parseRF3ManifestEnrolledTarget(
 	node vibejson.Node,
-	members [rf3ManifestMembers]rf3ManifestMember,
+	members []rf3ManifestMember,
 ) (rf3ManifestEnrolledTarget, error) {
 	fields, ok := node.ObjectIter()
 	if !ok {

@@ -185,7 +185,7 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 }
 
 func peerAddressForRF3Member(manifest rf3Manifest, memberID uint64) string {
-	for _, member := range manifest.Members {
+	for _, member := range manifest.memberRoster() {
 		if member.MemberID == memberID {
 			return member.PeerAddress
 		}
@@ -669,8 +669,13 @@ func servePreparedRF3WithExecutionLanes(
 			)
 		}()
 	}
+	topology := "RF3"
+	if manifest.DevelopmentOnly {
+		topology = "RF1-development-only-no-HA"
+	}
 	fmt.Fprintf(os.Stderr,
-		"vibedb-shard RF3 ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s snapshot=%s control=%s\n",
+		"vibedb-shard %s ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s snapshot=%s control=%s\n",
+		topology,
 		base.Binding.Distribution, base.Binding.Shard, base.Binding.MemberID,
 		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress,
 		snapshotAddress, controlListener.Addr(),
@@ -847,7 +852,7 @@ func validateRF3Addresses(manifest rf3Manifest) error {
 		return err
 	}
 	for _, bundle := range manifest.groupBundles() {
-		for _, member := range bundle.Members {
+		for _, member := range bundle.Members[:bundle.MemberCount] {
 			if err := validateRF3Address(member.PeerAddress, false); err != nil {
 				return err
 			}
@@ -938,7 +943,7 @@ func rf3NativeServingAuthority(
 			return false
 		}
 		voters := 0
-		for _, member := range manifest.Members {
+		for _, member := range manifest.memberRoster() {
 			if role, err := registry.Role(group, member.MemberID); err == nil &&
 				role == rafttransport.MemberVoter {
 				voters++
@@ -994,7 +999,7 @@ func rf3NativeMembershipAuthority(
 			return false
 		}
 		voters := 0
-		for _, member := range manifest.Members {
+		for _, member := range manifest.memberRoster() {
 			if role, roleErr := registry.Role(group, member.MemberID); roleErr == nil &&
 				role == rafttransport.MemberVoter {
 				voters++
@@ -1030,7 +1035,7 @@ func buildRF3Roster(
 	}
 	voters, learners := conf.GetVoters(), conf.GetLearners()
 	configured := make([]rf3ManifestMember, 0, rf3ManifestMembers+1)
-	configured = append(configured, manifest.Members[:]...)
+	configured = append(configured, manifest.memberRoster()...)
 	if target := manifest.EnrolledTarget; target != nil {
 		configured = append(configured, rf3ManifestMember{
 			MemberID: target.MemberID, NodeID: target.NodeID, PeerAddress: target.PeerAddress,
@@ -1086,10 +1091,15 @@ func supportedRF3MembershipCut(
 	manifest rf3Manifest,
 	voters, learners []uint64,
 ) bool {
-	base := []uint64{
-		manifest.Members[0].MemberID,
-		manifest.Members[1].MemberID,
-		manifest.Members[2].MemberID,
+	base := make([]uint64, len(manifest.memberRoster()))
+	for index, member := range manifest.memberRoster() {
+		base[index] = member.MemberID
+	}
+	if manifest.DevelopmentOnly {
+		return manifest.EnrolledTarget == nil && len(learners) == 0 && slices.Equal(voters, base)
+	}
+	if len(base) != rf3ManifestMembers {
+		return false
 	}
 	if target := manifest.EnrolledTarget; target != nil {
 		if len(learners) == 1 && learners[0] == target.MemberID && slices.Equal(voters, base) {

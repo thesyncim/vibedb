@@ -124,6 +124,32 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 	}
 }
 
+func TestParseRF1ManifestRequiresExplicitDevelopmentOnly(t *testing.T) {
+	three := `    {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"},
+    {"member_id": 2, "node_id": "1112131415161718191a1b1c1d1e1f20", "peer_address": "member-2.internal:7400"},
+    {"member_id": 3, "node_id": "2122232425262728292a2b2c2d2e2f30", "peer_address": "member-3.internal:7400"}`
+	one := `    {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"}`
+	rf1 := strings.Replace(canonicalRF3Manifest, `  "members": [`,
+		"  \"development_only\": true,\n  \"members\": [", 1)
+	rf1 = strings.Replace(rf1, three, one, 1)
+	manifest, err := parseRF3Manifest([]byte(rf1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !manifest.DevelopmentOnly || manifest.MemberCount != 1 ||
+		len(manifest.memberRoster()) != 1 || manifest.Members[0].MemberID != 1 {
+		t.Fatalf("RF1 manifest = %+v", manifest)
+	}
+	withoutMarker := strings.Replace(rf1, "  \"development_only\": true,\n", "", 1)
+	if _, err = parseRF3Manifest([]byte(withoutMarker)); !errors.Is(err, errInvalidRF3Manifest) {
+		t.Fatalf("unmarked RF1 error = %v", err)
+	}
+	falseMarker := strings.Replace(rf1, `"development_only": true`, `"development_only": false`, 1)
+	if _, err = parseRF3Manifest([]byte(falseMarker)); !errors.Is(err, errInvalidRF3Manifest) {
+		t.Fatalf("false development marker error = %v", err)
+	}
+}
+
 func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 	document := multiGroupRF3Manifest(t)
 	manifest, err := parseRF3Manifest([]byte(document))

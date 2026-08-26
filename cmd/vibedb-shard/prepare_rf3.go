@@ -30,31 +30,32 @@ const maxPrepareRF3ManifestBytes = 64 << 10
 var errPrepareRF3 = errors.New("vibedb-shard: invalid RF3 preparation manifest")
 
 // prepareRF3Manifest is deliberately a single-member manifest. An operator
-// writes three canonical documents with one shared topology and distinct root,
-// member_id, store_id, certificate, key, and listeners. Artifact names and
-// placement are fixed by the command so an unsafe cross-directory publication
-// cannot be requested.
+// writes three canonical documents for RF3. The local development command may
+// instead write one explicitly marked RF1 document; it cannot enroll or replace
+// replicas. Artifact names and placement are fixed by the command so an unsafe
+// cross-directory publication cannot be requested.
 type prepareRF3Manifest struct {
-	Root                  string                               `json:"root"`
-	Distribution          string                               `json:"distribution"`
-	Shard                 string                               `json:"shard"`
-	ClusterID             string                               `json:"cluster_id"`
-	ClusterIncarnation    string                               `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch uint64                               `json:"topology_recovery_epoch"`
-	AllocationGeneration  uint64                               `json:"allocation_generation"`
-	ShardIncarnation      string                               `json:"shard_incarnation"`
-	GroupID               string                               `json:"group_id"`
-	MemberID              uint64                               `json:"member_id"`
-	StoreID               string                               `json:"store_id"`
-	Table                 string                               `json:"table"`
-	CreateTable           string                               `json:"create_table"`
-	Authority             prepareRF3Authority                  `json:"authority"`
-	WAL                   prepareRF3WAL                        `json:"wal"`
-	Apply                 prepareRF3Apply                      `json:"apply"`
-	Listeners             rf3ManifestListeners                 `json:"listeners"`
-	TLS                   rf3ManifestTLS                       `json:"tls"`
-	AuthorizationPolicy   string                               `json:"authorization_policy"`
-	Members               [rf3ManifestMembers]prepareRF3Member `json:"members"`
+	Root                  string               `json:"root"`
+	Distribution          string               `json:"distribution"`
+	Shard                 string               `json:"shard"`
+	ClusterID             string               `json:"cluster_id"`
+	ClusterIncarnation    string               `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch uint64               `json:"topology_recovery_epoch"`
+	AllocationGeneration  uint64               `json:"allocation_generation"`
+	ShardIncarnation      string               `json:"shard_incarnation"`
+	GroupID               string               `json:"group_id"`
+	MemberID              uint64               `json:"member_id"`
+	StoreID               string               `json:"store_id"`
+	Table                 string               `json:"table"`
+	CreateTable           string               `json:"create_table"`
+	Authority             prepareRF3Authority  `json:"authority"`
+	WAL                   prepareRF3WAL        `json:"wal"`
+	Apply                 prepareRF3Apply      `json:"apply"`
+	Listeners             rf3ManifestListeners `json:"listeners"`
+	TLS                   rf3ManifestTLS       `json:"tls"`
+	AuthorizationPolicy   string               `json:"authorization_policy"`
+	DevelopmentOnly       bool                 `json:"development_only,omitempty"`
+	Members               []prepareRF3Member   `json:"members"`
 }
 
 type prepareRF3Authority struct {
@@ -93,13 +94,14 @@ type prepareRF3Member struct {
 }
 
 type persistedRF3Manifest struct {
-	WAL                 persistedRF3WAL                        `json:"wal"`
-	SQL                 persistedRF3SQL                        `json:"sql"`
-	Listeners           rf3ManifestListeners                   `json:"listeners"`
-	TLS                 rf3ManifestTLS                         `json:"tls"`
-	AuthorizationPolicy string                                 `json:"authorization_policy"`
-	ReplicaControl      persistedRF3ReplicaControl             `json:"replica_control"`
-	Members             [rf3ManifestMembers]persistedRF3Member `json:"members"`
+	WAL                 persistedRF3WAL            `json:"wal"`
+	SQL                 persistedRF3SQL            `json:"sql"`
+	Listeners           rf3ManifestListeners       `json:"listeners"`
+	TLS                 rf3ManifestTLS             `json:"tls"`
+	AuthorizationPolicy string                     `json:"authorization_policy"`
+	ReplicaControl      persistedRF3ReplicaControl `json:"replica_control"`
+	DevelopmentOnly     bool                       `json:"development_only,omitempty"`
+	Members             []persistedRF3Member       `json:"members"`
 }
 
 type persistedRF3WAL struct {
@@ -150,7 +152,11 @@ func runPrepareRF3(args []string) int {
 		fmt.Fprintf(os.Stderr, "error prepare RF3 member: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 member prepared root=%q manifest=%q\n", manifest.Root, filepath.Join(manifest.Root, "serve-rf3.vibejson"))
+	topology := "RF3"
+	if manifest.DevelopmentOnly {
+		topology = "RF1 development-only/no-HA"
+	}
+	fmt.Fprintf(os.Stderr, "vibedb-shard %s member prepared root=%q manifest=%q\n", topology, manifest.Root, filepath.Join(manifest.Root, "serve-rf3.vibejson"))
 	return 0
 }
 
@@ -204,7 +210,10 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 	key := raftstore.Key{ID: input.WAL.KeyID, Wrapped: []byte(input.WAL.WrappedKey)}
 	copy(key.Material[:], keyMaterial)
 	index, term := uint64(1), uint64(1)
-	voters := []uint64{input.Members[0].MemberID, input.Members[1].MemberID, input.Members[2].MemberID}
+	voters := make([]uint64, len(input.Members))
+	for index := range input.Members {
+		voters[index] = input.Members[index].MemberID
+	}
 	wal, err := raftstore.Create(walPath, identity, key, raftstore.Bootstrap{TopologyRecoveryEpoch: input.TopologyRecoveryEpoch, Snapshot: &pb.Snapshot{Data: []byte("vibedb-rf3-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}}, options)
 	clear(key.Material[:])
 	clear(key.Wrapped)
@@ -303,6 +312,13 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 	if a.ActivePolicyGeneration == 0 || a.ProtectionEpoch == 0 || a.OwnershipEpoch == 0 || a.SchemaGeneration == 0 || a.RoutingVersion == 0 || a.RouteGeneration == 0 {
 		return bad()
 	}
+	if len(input.Members) != rf3ManifestMembers &&
+		(!input.DevelopmentOnly || len(input.Members) != 1) {
+		return bad()
+	}
+	if input.DevelopmentOnly && len(input.Members) != 1 {
+		return bad()
+	}
 	var nodes [3]rafttransport.NodeID
 	found := false
 	for i, member := range input.Members {
@@ -313,8 +329,15 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 			found = true
 		}
 	}
-	if !found || nodes[0] == nodes[1] || nodes[0] == nodes[2] || nodes[1] == nodes[2] {
+	if !found {
 		return bad()
+	}
+	for index := range input.Members {
+		for prior := 0; prior < index; prior++ {
+			if nodes[index] == nodes[prior] {
+				return bad()
+			}
+		}
 	}
 	material, err := readPrepareRF3File(input.WAL.KeyMaterialPath, 32)
 	if err != nil || len(material) != 32 || input.WAL.KeyID == "" || len(input.WAL.WrappedKey) == 0 {
@@ -349,7 +372,7 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 }
 
 func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.NodeID, p map[string]string) persistedRF3Manifest {
-	m := persistedRF3Manifest{WAL: persistedRF3WAL{Path: p["wal"], KeyID: input.WAL.KeyID, KeyMaterialPath: p["key"], MaxFileBytes: input.WAL.MaxFileBytes, MaxRecordBytes: input.WAL.MaxRecordBytes, MaxRecords: input.WAL.MaxRecords, MaxEntries: input.WAL.MaxEntries, MaxLiveBytes: input.WAL.MaxLiveBytes}, SQL: persistedRF3SQL{Path: p["sql"], IdentityPath: p["identity"], ApplyIdentityPath: p["apply"]}, Listeners: input.Listeners, TLS: input.TLS, AuthorizationPolicy: input.AuthorizationPolicy, ReplicaControl: persistedRF3ReplicaControl{ActionJournalPath: filepath.Join(input.Root, "replica-actions"), MaxActionRecords: 4096, SourceDataRoot: input.Root, SourceJournalPath: filepath.Join(input.Root, "source-exports"), MaxSourceRecords: 4096, SourceRepositoryPath: filepath.Join(input.Root, "source-artifacts"), MaxSourceArtifacts: 8, MaxSourceConcurrent: 2, MaxSourceArtifactBytes: 1 << 30, MaxSourceDiskBytes: 4 << 30, SourceChunkBytes: 1 << 20}}
+	m := persistedRF3Manifest{WAL: persistedRF3WAL{Path: p["wal"], KeyID: input.WAL.KeyID, KeyMaterialPath: p["key"], MaxFileBytes: input.WAL.MaxFileBytes, MaxRecordBytes: input.WAL.MaxRecordBytes, MaxRecords: input.WAL.MaxRecords, MaxEntries: input.WAL.MaxEntries, MaxLiveBytes: input.WAL.MaxLiveBytes}, SQL: persistedRF3SQL{Path: p["sql"], IdentityPath: p["identity"], ApplyIdentityPath: p["apply"]}, Listeners: input.Listeners, TLS: input.TLS, AuthorizationPolicy: input.AuthorizationPolicy, ReplicaControl: persistedRF3ReplicaControl{ActionJournalPath: filepath.Join(input.Root, "replica-actions"), MaxActionRecords: 4096, SourceDataRoot: input.Root, SourceJournalPath: filepath.Join(input.Root, "source-exports"), MaxSourceRecords: 4096, SourceRepositoryPath: filepath.Join(input.Root, "source-artifacts"), MaxSourceArtifacts: 8, MaxSourceConcurrent: 2, MaxSourceArtifactBytes: 1 << 30, MaxSourceDiskBytes: 4 << 30, SourceChunkBytes: 1 << 20}, DevelopmentOnly: input.DevelopmentOnly, Members: make([]persistedRF3Member, len(input.Members))}
 	for i, member := range input.Members {
 		m.Members[i] = persistedRF3Member{MemberID: member.MemberID, NodeID: hex.EncodeToString(nodes[i][:]), PeerAddress: member.PeerAddress}
 	}

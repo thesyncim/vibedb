@@ -190,17 +190,17 @@ var Distributed = []Feature{
 	},
 	{
 		Name: "Development cluster and Kubernetes test tooling",
-		Primitive: Stage{StatusYes, "A local RF3 process orchestrator and deterministic Helm-free Kubernetes manifest renderer exist.", []Reference{
+		Primitive: Stage{StatusYes, "A local RF1 development/no-HA or RF3 process orchestrator and deterministic Helm-free Kubernetes manifest renderer exist.", []Reference{
 			ref("cmd/vibedb/cluster_dev.go", "runClusterDev"), ref("internal/kubeoperator/render.go", "Render"),
 		}},
-		Integrated: Stage{StatusYes, "The local command generates credentials, policy, WAL material, retained member roots, and catalog before supervising three shards plus a gateway. The Kubernetes lane composes stable DNS, PVCs, disruption budgets, shard and gateway StatefulSets, and a scale-zero learner bootstrap template.", []Reference{
+		Integrated: Stage{StatusYes, "The local command generates credentials, policy, WAL material, and retained member roots before supervising either one direct RF1 shard or three RF3 shards plus a gateway. The Kubernetes lane composes stable DNS, PVCs, disruption budgets, shard and gateway StatefulSets, and a scale-zero learner bootstrap template.", []Reference{
 			ref("cmd/vibedb/cluster_dev.go", "ensureDevCluster"), ref("internal/kubeoperator/render.go", "Render"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb cluster dev starts or resumes an exact three-member loopback RF3 cluster. vibedb-operator render and prepare provide deterministic Kubernetes test manifests and idempotent ordinal preparation. The renderer is not a reconciliation watch-loop, and Kubernetes DNS is discovery rather than leader or topology authority.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb cluster dev --replicas 1|3 starts or resumes an explicitly no-HA RF1 member or an exact three-member loopback RF3 cluster. vibedb-operator render and prepare provide deterministic Kubernetes test manifests and idempotent ordinal preparation. The renderer is not a reconciliation watch-loop, and Kubernetes DNS is discovery rather than leader or topology authority.", []Reference{
 			ref("cmd/vibedb/main.go", "run"), ref("cmd/vibedb-operator/main.go", "render"), ref("cmd/vibedb-operator/main.go", "prepare"),
 		}},
-		Qualification: Stage{StatusPartial, "Tests prove canonical local-cluster resume, production-policy compatibility, child reaping, distinct loopback endpoints, deterministic Kubernetes output, and injection rejection. There is no end-to-end Kubernetes fault, storage, DNS, or rolling-restart gate.", []Reference{
-			ref("cmd/vibedb/cluster_dev_test.go", "TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision"), ref("cmd/vibedb/cluster_dev_test.go", "TestDevChildShutdownDoesNotLeakProcess"), ref("internal/kubeoperator/render_test.go", "TestRenderRF3GoldenAndSafetyContract"), ref("internal/kubeoperator/render_test.go", "TestRenderRejectsInvalidIdentityAndInjection"),
+		Qualification: Stage{StatusPartial, "Tests prove canonical local-cluster resume, explicit RF1/RF3 validation, production-policy compatibility, child reaping, distinct loopback endpoints, deterministic Kubernetes output, and injection rejection. There is no end-to-end Kubernetes fault, storage, DNS, or rolling-restart gate.", []Reference{
+			ref("cmd/vibedb/cluster_dev_test.go", "TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision"), ref("cmd/vibedb/cluster_dev_test.go", "TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3"), ref("cmd/vibedb/cluster_dev_test.go", "TestDevChildShutdownDoesNotLeakProcess"), ref("internal/kubeoperator/render_test.go", "TestRenderRF3GoldenAndSafetyContract"), ref("internal/kubeoperator/render_test.go", "TestRenderRejectsInvalidIdentityAndInjection"),
 		}},
 	},
 	{
