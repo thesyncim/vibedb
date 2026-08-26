@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -243,6 +244,8 @@ func TestCatalogPlanObservationPeerDirectoryBindsExactRF3Cut(t *testing.T) {
 		[]gateway.ReplicatedShardDescriptor{{
 			Distribution: "orders", Shard: "source", Group: group,
 			AllocationGeneration: 7, Command: command, Replicas: replicas,
+			RangeIdentity: replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
+			ForwardingRuleDigest: replication.Digest{0x73},
 		}},
 	)
 	if err != nil {
