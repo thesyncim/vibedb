@@ -1243,9 +1243,10 @@ func TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwo
 	cluster := newMultiGroupTransactionRF3Cluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
+	recoveryAuthority := serviceauthz.Authority{
 		Node: rafttransport.NodeID{0xee}, Generation: 1,
-	})
+	}
+	ctx, err := serviceauthz.WithAuthority(ctx, recoveryAuthority)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1275,7 +1276,8 @@ func TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwo
 			Executor: executor, Tenant: []byte("tenant"), MaxConcurrency: 2,
 			MaxInFlightBytes: 64 << 20,
 			MaxMutations:     2, MaxMutationBytes: 1 << 20, RecoveryTimeout: time.Minute,
-			IDSource: bytes.NewReader(bytes.Repeat([]byte{0xa7}, len(distributedtxn.ID{}))),
+			IDSource:          bytes.NewReader(bytes.Repeat([]byte{0xa7}, len(distributedtxn.ID{}))),
+			RecoveryAuthority: recoveryAuthority,
 		},
 	)
 	if err != nil {
@@ -1401,9 +1403,10 @@ func TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups(t *testing.T) {
 	cluster := newMultiGroupTransactionRF3Cluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
+	recoveryAuthority := serviceauthz.Authority{
 		Node: rafttransport.NodeID{0xed}, Generation: 1,
-	})
+	}
+	ctx, err := serviceauthz.WithAuthority(ctx, recoveryAuthority)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1435,8 +1438,9 @@ func TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups(t *testing.T) {
 		gateway.ReplicatedTransactionOrchestratorOptions{
 			Executor: replicatedExecutor, Tenant: []byte("tenant"), MaxConcurrency: 2,
 			MaxInFlightBytes: 64 << 20, MaxMutations: 2, MaxMutationBytes: 1 << 20,
-			RecoveryTimeout: time.Minute,
-			IDSource:        multiGroupRF3TransactionIDs(5),
+			RecoveryTimeout:   time.Minute,
+			IDSource:          multiGroupRF3TransactionIDs(5),
+			RecoveryAuthority: recoveryAuthority,
 		},
 	)
 	if err != nil {
