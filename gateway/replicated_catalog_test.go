@@ -528,6 +528,9 @@ func testReplicatedCatalogInput(
 		AllocationGeneration: first.AllocationGeneration,
 		RangeIdentity:        replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
 		ForwardingRuleDigest: replication.Digest{0x73},
+		RequestLedgerRanges: []DurableRequestLedgerRangeDescriptor{{
+			Identity: replication.Digest{0x91},
+		}},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
 			OwnershipEpoch: uint64(first.Epoch), SchemaGeneration: 8,

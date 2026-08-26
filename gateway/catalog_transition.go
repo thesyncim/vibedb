@@ -443,6 +443,7 @@ func snapshotWithCatalogLineage(
 		replicatedShards:               snapshot.replicatedShards,
 		replicatedReplicas:             snapshot.replicatedReplicas,
 		replicatedTables:               snapshot.replicatedTables,
+		durableRequestLedgerTopology:   snapshot.durableRequestLedgerTopology,
 		indexLineage:                   snapshot.indexLineage,
 		shardLineage:                   snapshot.shardLineage,
 		indexIDHighWater:               indexHighWater,

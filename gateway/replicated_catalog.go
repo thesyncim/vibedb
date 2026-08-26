@@ -47,7 +47,11 @@ type ReplicatedShardDescriptor struct {
 	RangeIdentity        replication.Digest
 	LineageDigest        replication.Digest
 	ForwardingRuleDigest replication.Digest
-	Replicas             []ReplicatedReplicaDescriptor
+	// RequestLedgerRanges explicitly assigns authenticated request-home ranges
+	// to this shard. Empty means this shard carries no ledger range; identities
+	// and boundaries are provisioned control-plane input, never synthesized.
+	RequestLedgerRanges []DurableRequestLedgerRangeDescriptor
+	Replicas            []ReplicatedReplicaDescriptor
 	// EnrolledTarget is the one authenticated replacement endpoint that may
 	// participate in membership control. It is never included in the public
 	// data route until a later catalog cut makes it one of Replicas.
@@ -113,6 +117,9 @@ func NewSnapshotWithReplicatedTableMetadata(
 		return nil, err
 	}
 	if err := snapshot.attachReplicatedTableProfiles(tables); err != nil {
+		return nil, err
+	}
+	if err := snapshot.attachDurableRequestLedgerRangesFromDescriptors(replicated); err != nil {
 		return nil, err
 	}
 	return snapshot, nil
@@ -468,6 +475,22 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 		}
 		descriptors[ordinal] = descriptor
 	}
+	if snapshot.durableRequestLedgerTopology != nil {
+		for _, value := range snapshot.durableRequestLedgerTopology.Ranges {
+			for ordinal := range descriptors {
+				if descriptors[ordinal].Distribution == value.Route.Distribution &&
+					descriptors[ordinal].Shard == value.Route.Shard {
+					descriptors[ordinal].RequestLedgerRanges = append(
+						descriptors[ordinal].RequestLedgerRanges,
+						DurableRequestLedgerRangeDescriptor{
+							Start: value.Start, End: value.End, Identity: value.Identity,
+						},
+					)
+					break
+				}
+			}
+		}
+	}
 	return descriptors
 }
 
@@ -482,6 +505,9 @@ func (snapshot *Snapshot) ReplicatedShardDescriptors() []ReplicatedShardDescript
 
 func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 	if err := validateReplicatedTableTransition(current, next); err != nil {
+		return err
+	}
+	if err := validateDurableRequestLedgerCatalogTransition(current, next); err != nil {
 		return err
 	}
 	if current == nil || len(current.replicatedShards) == 0 {
