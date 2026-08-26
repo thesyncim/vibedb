@@ -80,11 +80,34 @@ func (authority *ReplicatedIssuerAuthority) OpenIssuerLane(
 	return grant, nil
 }
 
-// ValidateRequest linearly validates the current lane on every execute and
-// terminal ACK. Cached immutable grants avoid repeated decode work, but never
-// replace the RF3 high-water read. A collected sequence cannot be resurrected,
-// and admission cannot skip beyond the exact next sequence.
+// ValidateRequest authenticates the immutable grant without a redundant RF3
+// preflight. On a warm cache this is local; on a miss the catalog performs one
+// linearizable point read. The first request-ledger CAS is the sole admission
+// linearization point and atomically enforces sequence and anti-resurrection.
 func (authority *ReplicatedIssuerAuthority) ValidateRequest(
+	ctx context.Context,
+	authenticated serviceauthz.Authority,
+	reference ReplicatedIssuerReference,
+	request requestledger.RequestID,
+	sequence uint64,
+) (requestledger.RequestKey, error) {
+	return authority.validate(ctx, authenticated, reference, request, sequence)
+}
+
+// ValidateAcknowledge authenticates the same immutable reference. The ACK
+// proposal itself verifies the exact terminal capability or retained tombstone,
+// including after collection and an outcome-unknown response.
+func (authority *ReplicatedIssuerAuthority) ValidateAcknowledge(
+	ctx context.Context,
+	authenticated serviceauthz.Authority,
+	reference ReplicatedIssuerReference,
+	request requestledger.RequestID,
+	sequence uint64,
+) (requestledger.RequestKey, error) {
+	return authority.validate(ctx, authenticated, reference, request, sequence)
+}
+
+func (authority *ReplicatedIssuerAuthority) validate(
 	ctx context.Context,
 	authenticated serviceauthz.Authority,
 	reference ReplicatedIssuerReference,
@@ -99,19 +122,6 @@ func (authority *ReplicatedIssuerAuthority) ValidateRequest(
 	)
 	if err != nil {
 		return requestledger.RequestKey{}, err
-	}
-	home, err := authority.home(key)
-	if err != nil {
-		return requestledger.RequestKey{}, err
-	}
-	status, err := authority.readLane(ctx, home, key, 1)
-	if err != nil {
-		return requestledger.RequestKey{}, err
-	}
-	if sequence <= status.Highwater.HighwaterSequence ||
-		status.Highwater.AdmittedSequence == ^uint64(0) ||
-		sequence > status.Highwater.AdmittedSequence+1 {
-		return requestledger.RequestKey{}, ErrDurableRequestConflict
 	}
 	return key, nil
 }

@@ -17,6 +17,7 @@ type replicatedIssuerAuthorityLedger struct {
 	identity  requestledger.Digest
 	applied   uint64
 	failApply bool
+	reads     uint64
 }
 
 func (ledger *replicatedIssuerAuthorityLedger) ApplyCAS(
@@ -25,6 +26,7 @@ func (ledger *replicatedIssuerAuthorityLedger) ApplyCAS(
 ) (DurableRequestLifecycleCASResult, error) {
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
+	ledger.reads++
 	if cas.Operation != requestledger.OperationOpenIssuerLane || cas.Revision != 1 ||
 		cas.ExpectedRevision != 0 || cas.IssuerOpen.Identity.IssuerLane != key.IssuerLane ||
 		cas.IssuerOpen.Home != home.Point {
@@ -100,16 +102,30 @@ func TestReplicatedIssuerAuthorityCrossGatewayLinearValidation(t *testing.T) {
 	if err != nil || key.IssuerLane != grant.Lane || key.Principal != grant.Principal {
 		t.Fatalf("key=%+v err=%v", key, err)
 	}
+	ledger.mu.Lock()
+	reads := ledger.reads
+	ledger.mu.Unlock()
 	forged := catalog.authority
 	forged.Node[0]++
 	if _, err = peer.ValidateRequest(t.Context(), forged, reference,
 		requestledger.RequestID{0x81}, 1); !errors.Is(err, ErrReplicatedCatalogConflict) {
 		t.Fatalf("forged principal err=%v", err)
 	}
+	// Sequence ordering is deliberately not preflighted: the first lifecycle
+	// CAS is its single linearization point.
 	if _, err = peer.ValidateRequest(t.Context(), catalog.authority, reference,
-		requestledger.RequestID{0x82}, 2); !errors.Is(err, ErrDurableRequestConflict) {
-		t.Fatalf("skipped sequence admitted err=%v", err)
+		requestledger.RequestID{0x82}, 2); err != nil {
+		t.Fatalf("local grant validation err=%v", err)
 	}
+	if _, err = peer.ValidateAcknowledge(t.Context(), catalog.authority, reference,
+		requestledger.RequestID{0x81}, 1); err != nil {
+		t.Fatalf("ack retry did not reach tombstone path err=%v", err)
+	}
+	ledger.mu.Lock()
+	if ledger.reads != reads {
+		t.Fatalf("warm validation performed ledger reads: before=%d after=%d", reads, ledger.reads)
+	}
+	ledger.mu.Unlock()
 }
 
 func TestReplicatedIssuerAuthorityOpenResponseLossRecovers(t *testing.T) {

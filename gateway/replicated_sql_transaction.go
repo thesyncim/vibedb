@@ -168,7 +168,21 @@ func (executor *Executor) planReplicatedSQLTransaction(
 	queries []Query,
 	profile Profile,
 ) ([]ReplicatedTransactionParticipant, bool, error) {
-	if executor == nil || executor.replicatedTransactions == nil || snapshot == nil ||
+	if executor == nil || executor.replicatedTransactions == nil {
+		return nil, false, nil
+	}
+	return executor.planReplicatedSQLTransactionWithData(ctx, snapshot, queries, profile,
+		executor.replicatedTransactions.executor)
+}
+
+func (executor *Executor) planReplicatedSQLTransactionWithData(
+	ctx context.Context,
+	snapshot *Snapshot,
+	queries []Query,
+	profile Profile,
+	data *ReplicatedExecutor,
+) ([]ReplicatedTransactionParticipant, bool, error) {
+	if executor == nil || snapshot == nil ||
 		len(queries) == 0 {
 		return nil, false, nil
 	}
@@ -284,7 +298,8 @@ func (executor *Executor) planReplicatedSQLTransaction(
 		baseMutation := replication.Mutation{Kind: kind, Key: ownedKey, Value: document}
 		if len(statement.prepared.writeGlobalIndexes) != 0 &&
 			(statement.bound.kind == sqlast.KindUpdate || statement.bound.kind == sqlast.KindDelete) {
-			oldDocument, readErr := executor.readReplicatedSQLIndexedDocument(
+			oldDocument, readErr := readReplicatedSQLIndexedDocument(
+				data,
 				ctx, resolved.Route, statement.profile, ownedKey,
 			)
 			if readErr != nil {
@@ -493,18 +508,18 @@ func sameReplicatedSQLGlobalIndexTarget(
 		left.scope == right.scope
 }
 
-func (executor *Executor) readReplicatedSQLIndexedDocument(
+func readReplicatedSQLIndexedDocument(
+	data *ReplicatedExecutor,
 	ctx context.Context,
 	route ReplicatedRoute,
 	profile ReplicatedTableProfile,
 	key []byte,
 ) ([]byte, error) {
-	if executor == nil || executor.replicatedTransactions == nil ||
-		executor.replicatedTransactions.executor == nil || profile.Relation == 0 ||
+	if data == nil || profile.Relation == 0 ||
 		profile.MaxDocumentBytes == 0 {
 		return nil, ErrReplicatedSQLTransactionUnsupported
 	}
-	result, err := executor.replicatedTransactions.executor.ReadPoint(
+	result, err := data.ReadPoint(
 		ctx, route, ReplicatedPointRead{
 			Relation: profile.Relation, Key: key, MinimumApplied: 1,
 			MaxValueBytes: profile.MaxDocumentBytes, Linearizable: true,
