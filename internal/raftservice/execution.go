@@ -337,6 +337,13 @@ func (owners *ExecutionOwners) ReadRequestLedger(ctx context.Context, request Re
 	}
 	return owner.ReadRequestLedger(ctx, request)
 }
+func (owners *ExecutionOwners) ReadExecutionPin(ctx context.Context, request ExecutionPinReadRequest) (ExecutionPinReadResult, ExecutionPinReadLease, error) {
+	owner, err := owners.owner(request.Fence.Group)
+	if err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	return owner.ReadExecutionPin(ctx, request)
+}
 func (owners *ExecutionOwners) Started() <-chan struct{} {
 	if owners == nil {
 		return nil

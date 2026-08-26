@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -214,6 +215,127 @@ type ReplicatedRequestLedgerReadResult struct {
 	Value             []byte
 	State             shardservice.ReplicatedMemberState
 	Retries           int
+}
+
+type ReplicatedExecutionPinRead struct {
+	Pin            executionpin.PinID
+	MinimumApplied uint64
+}
+
+type ReplicatedExecutionPinReadResult struct {
+	Applied uint64
+	Found   bool
+	Record  executionpin.Record
+	State   shardservice.ReplicatedMemberState
+	Retries int
+}
+
+// ReadExecutionPin performs one leader ReadIndex-fenced hidden-row lookup.
+// It is the only shipped gateway read that can authorize execution-pin side
+// effects; follower observations are intentionally not representable.
+func (executor *ReplicatedExecutor) ReadExecutionPin(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedExecutionPinRead,
+) (ReplicatedExecutionPinReadResult, error) {
+	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) ||
+		read.Pin == (executionpin.PinID{}) || read.MinimumApplied == 0 {
+		return ReplicatedExecutionPinReadResult{}, ErrReplicatedRoute
+	}
+	preferred := route.Replicas[0].Member
+	var joined error
+	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
+		endpoint, state, err := executor.discoverLeader(
+			ctx, route, preferred, serviceauthz.CapabilityExecutionPin,
+		)
+		if err != nil {
+			joined = errors.Join(joined, err)
+			preferred = 0
+			continue
+		}
+		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
+			Operation:  shardservice.ReplicatedExecutionPinRead,
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: state.Fence,
+			ExecutionPinRead: shardservice.ReplicatedExecutionPinReadRequest{
+				Pin: read.Pin, MinimumApplied: read.MinimumApplied,
+			},
+		})
+		if err != nil {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, err)
+			preferred = 0
+			continue
+		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedExecutionPinReadResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+		}
+		if !validReplicatedResponseState(response) || response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.MemberID != endpoint.Member ||
+			response.State.Fence.Command != route.Command {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+			continue
+		}
+		switch response.Kind {
+		case shardservice.ReplicatedExecutionPinReadResult:
+			value, openErr := shardservice.OpenReplicatedExecutionPinReadValue(response.Value)
+			if openErr != nil || response.ReadApplied < read.MinimumApplied ||
+				response.State.Applied < response.ReadApplied ||
+				value.Found && value.Record.PinID != read.Pin {
+				joined = errors.Join(joined, openErr, ErrReplicatedRoute)
+				continue
+			}
+			executor.leaderHints.publish(route, endpoint, response.State)
+			return ReplicatedExecutionPinReadResult{
+				Applied: response.ReadApplied, Found: value.Found, Record: value.Record,
+				State: response.State, Retries: attempt,
+			}, nil
+		case shardservice.ReplicatedNotLeader:
+			executor.leaderHints.invalidate(route, endpoint, state)
+			preferred = response.State.LeaderID
+			joined = errors.Join(joined, raftmodel.ErrNotLeader)
+		case shardservice.ReplicatedRefusal:
+			if response.Refusal == shardservice.ReplicatedRefusalStaleFence ||
+				response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
+				response.Refusal == shardservice.ReplicatedRefusalExecutionPinReadMalformed {
+				return ReplicatedExecutionPinReadResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			preferred = 0
+		default:
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+		}
+	}
+	return ReplicatedExecutionPinReadResult{}, errors.Join(ErrReplicatedLeader, joined)
+}
+
+// ValidateExecutionPinFence obtains a fresh leader ReadIndex cut and verifies
+// that lease remains the exact current controller certificate at that cut.
+// Callers invoke it immediately before each externally visible side effect.
+func (executor *ReplicatedExecutor) ValidateExecutionPinFence(
+	ctx context.Context,
+	route ReplicatedRoute,
+	lease executionpin.LeaseCertificate,
+	minimumApplied uint64,
+) (ReplicatedExecutionPinReadResult, error) {
+	if !lease.Valid() {
+		return ReplicatedExecutionPinReadResult{}, ErrReplicatedRoute
+	}
+	result, err := executor.ReadExecutionPin(ctx, route, ReplicatedExecutionPinRead{
+		Pin: lease.PinID, MinimumApplied: minimumApplied,
+	})
+	if err != nil {
+		return ReplicatedExecutionPinReadResult{}, err
+	}
+	if !result.Found || executionpin.ValidateSideEffectFence(
+		lease, result.Record, result.Applied,
+	) != nil {
+		return ReplicatedExecutionPinReadResult{}, ErrDurableRequestConflict
+	}
+	return result, nil
 }
 
 // ReadRequestLedger performs one leader ReadIndex-fenced, full-key hidden

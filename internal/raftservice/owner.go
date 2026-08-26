@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -54,6 +55,9 @@ var (
 	)
 	ErrRequestLedgerUnauthorized = errors.New(
 		"raftservice: request ledger recovery is not authorized",
+	)
+	ErrExecutionPinUnauthorized = errors.New(
+		"raftservice: execution-pin read is not authorized",
 	)
 )
 
@@ -104,6 +108,7 @@ const (
 	requestReadFollower
 	requestReadTransaction
 	requestReadRequestLedger
+	requestReadExecutionPin
 	requestReplicaObservation
 	requestOwnershipTransition
 	requestReplicaRetirement
@@ -174,6 +179,7 @@ type readAuthorization struct {
 	source         ReadSource
 	recovery       TransactionRecoverySource
 	requestLedger  RequestLedgerSource
+	executionPin   ExecutionPinSource
 	minimumApplied uint64
 }
 
@@ -183,6 +189,7 @@ type readDelivery struct {
 	source         ReadSource
 	recovery       TransactionRecoverySource
 	requestLedger  RequestLedgerSource
+	executionPin   ExecutionPinSource
 	minimumApplied uint64
 }
 
@@ -224,6 +231,12 @@ type RequestLedgerSource interface {
 		replicatedstate.RequestLedgerReadRequest,
 		[]byte,
 	) (replicatedstate.RequestLedgerReadResult, error)
+}
+
+// ExecutionPinSource exposes only the exact hidden execution-pin point read.
+// It cannot name ordinary data or request-ledger rows.
+type ExecutionPinSource interface {
+	ExecutionPinRead(executionpin.PinID, uint64) (replicatedstate.ExecutionPinReadResult, error)
 }
 
 // Result is one terminal deterministic apply result. Completion is the exact
@@ -314,6 +327,23 @@ type RequestLedgerReadResult struct {
 }
 
 type RequestLedgerReadLease interface {
+	Release()
+}
+
+type ExecutionPinReadRequest struct {
+	Fence          ServingFence
+	Capability     serviceauthz.Capability
+	Pin            executionpin.PinID
+	MinimumApplied uint64
+}
+
+type ExecutionPinReadResult struct {
+	Applied uint64
+	Found   bool
+	Record  executionpin.Record
+}
+
+type ExecutionPinReadLease interface {
 	Release()
 }
 
@@ -930,7 +960,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = owner.removeExecutionGroupNow(
 			request.group, request.install.Identity, request.publish,
 		)
-	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger:
+	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger,
+		requestReadExecutionPin:
 		member, found := owner.members[request.group]
 		if !found ||
 			!servingFenceMatchesIdentity(request.read.fence, member) {
@@ -944,6 +975,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 			}
 		} else if request.kind == requestReadRequestLedger {
 			if _, ok := member.recovery.(RequestLedgerSource); !ok {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadExecutionPin {
+			if _, ok := member.recovery.(ExecutionPinSource); !ok {
 				reply.err = ErrServingFence
 				break
 			}
@@ -988,6 +1024,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.source = member.read
 		request.read.delivery.recovery = member.recovery
 		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
+		request.read.delivery.executionPin, _ = member.recovery.(ExecutionPinSource)
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
@@ -996,7 +1033,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = ErrInvalidOwner
 	}
 	if (request.kind == requestReadLinear || request.kind == requestReadTransaction ||
-		request.kind == requestReadRequestLedger) &&
+		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin) &&
 		request.read.delivery != nil {
 		owner.settleReadDelivery(request.read.delivery, reply)
 	} else {
@@ -1165,6 +1202,7 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			reply.read.source = delivery.source
 			reply.read.recovery = delivery.recovery
 			reply.read.requestLedger = delivery.requestLedger
+			reply.read.executionPin = delivery.executionPin
 		}
 		owner.settleReadDelivery(delivery, reply)
 	}
@@ -1781,6 +1819,58 @@ func (owner *Owner) ReadRequestLedger(
 	return RequestLedgerReadResult{
 		Applied: value.Fence.Applied, Found: value.Found,
 		AuthoritativeKind: value.AuthoritativeKind, Value: value.Value,
+	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadExecutionPin serves one exact hidden pin row after a leader-only quorum
+// ReadIndex barrier. The returned applied position is the logical clock used
+// by executionpin.ValidateSideEffectFence.
+func (owner *Owner) ReadExecutionPin(
+	ctx context.Context,
+	request ExecutionPinReadRequest,
+) (ExecutionPinReadResult, ExecutionPinReadLease, error) {
+	if owner == nil || ctx == nil || request.Pin == (executionpin.PinID{}) ||
+		request.MinimumApplied == 0 {
+		return ExecutionPinReadResult{}, nil, ErrInvalidOwner
+	}
+	if request.Capability != serviceauthz.CapabilityExecutionPin {
+		return ExecutionPinReadResult{}, nil, ErrExecutionPinUnauthorized
+	}
+	responseCharge, ok := pointReadResponseCharge(executionpin.RecordBytes + 1)
+	if !ok {
+		return ExecutionPinReadResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadExecutionPin, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{
+			fence: request.Fence, minimumApplied: request.MinimumApplied, delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	value, err := reply.read.executionPin.ExecutionPinRead(request.Pin, reply.read.minimumApplied)
+	if err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		value.Found && value.Record.PinID != request.Pin {
+		return ExecutionPinReadResult{}, nil, ErrServingFence
+	}
+	releaseReservation = false
+	return ExecutionPinReadResult{
+		Applied: value.Fence.Applied, Found: value.Found, Record: value.Record,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 

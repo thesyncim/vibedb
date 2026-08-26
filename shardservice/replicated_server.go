@@ -27,6 +27,7 @@ type replicatedOwner interface {
 	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, raftservice.PointReadLease, error)
 	ReadTransaction(context.Context, raftservice.TransactionReadRequest) (raftservice.TransactionReadResult, raftservice.TransactionReadLease, error)
 	ReadRequestLedger(context.Context, raftservice.RequestLedgerReadRequest) (raftservice.RequestLedgerReadResult, raftservice.RequestLedgerReadLease, error)
+	ReadExecutionPin(context.Context, raftservice.ExecutionPinReadRequest) (raftservice.ExecutionPinReadResult, raftservice.ExecutionPinReadLease, error)
 }
 
 func replicatedRequestDigest(command []byte) [sha256.Size]byte {
@@ -759,6 +760,68 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalRequestLedgerReadMalformed, HasState: true, State: wireState}
 		case errors.Is(readErr, raftservice.ErrRequestLedgerUnauthorized):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnauthorized, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrIngressFull),
+			errors.Is(readErr, raftservice.ErrPendingReadsFull):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalAdmissionBound, HasState: true, State: wireState}
+		default:
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+	}
+	if request.Operation == ReplicatedExecutionPinRead {
+		wireRead := request.ExecutionPinRead
+		result, readLease, readErr := server.owner.ReadExecutionPin(ctx,
+			raftservice.ExecutionPinReadRequest{
+				Fence: raftservice.ServingFence{
+					Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+					Command: request.Fence.Command, MemberID: request.Fence.MemberID,
+					StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
+					Term: request.Fence.Term,
+				},
+				Capability: request.Capability, Pin: wireRead.Pin,
+				MinimumApplied: wireRead.MinimumApplied,
+			})
+		if readErr != nil && readLease != nil {
+			readLease.Release()
+			readLease = nil
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
+		}
+		if readErr == nil {
+			value, encodeErr := AppendReplicatedExecutionPinReadValue(nil,
+				ReplicatedExecutionPinReadValue{Found: result.Found, Record: result.Record})
+			response := &ReplicatedResponse{
+				Kind: ReplicatedExecutionPinReadResult, HasState: true, State: wireState,
+				ReadApplied: result.Applied, Value: value, readLease: readLease,
+			}
+			if encodeErr == nil && result.Applied >= wireRead.MinimumApplied &&
+				validReplicatedResponse(response) {
+				return response
+			}
+			if readLease != nil {
+				readLease.Release()
+			}
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		switch {
+		case errors.Is(readErr, raftmodel.ErrNotLeader),
+			errors.Is(readErr, raftmodel.ErrReadLeadershipLost):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingFence):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBehind):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrExecutionPinStateCorrupt):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalExecutionPinReadMalformed, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrExecutionPinUnauthorized):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalUnauthorized, HasState: true, State: wireState}
 		case errors.Is(readErr, raftservice.ErrIngressFull),

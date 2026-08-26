@@ -37,6 +37,10 @@ type fakeReplicatedOwner struct {
 	requestLedgerErr     error
 	requestLedgerLease   raftservice.RequestLedgerReadLease
 	requestLedgerRequest raftservice.RequestLedgerReadRequest
+	executionPinResult   raftservice.ExecutionPinReadResult
+	executionPinErr      error
+	executionPinLease    raftservice.ExecutionPinReadLease
+	executionPinRequest  raftservice.ExecutionPinReadRequest
 	probeCalls           atomic.Uint64
 }
 
@@ -173,6 +177,14 @@ func (owner *fakeReplicatedOwner) ReadRequestLedger(
 ) (raftservice.RequestLedgerReadResult, raftservice.RequestLedgerReadLease, error) {
 	owner.requestLedgerRequest = request
 	return owner.requestLedgerResult, owner.requestLedgerLease, owner.requestLedgerErr
+}
+
+func (owner *fakeReplicatedOwner) ReadExecutionPin(
+	_ context.Context,
+	request raftservice.ExecutionPinReadRequest,
+) (raftservice.ExecutionPinReadResult, raftservice.ExecutionPinReadLease, error) {
+	owner.executionPinRequest = request
+	return owner.executionPinResult, owner.executionPinLease, owner.executionPinErr
 }
 
 type testPointReadLease struct{ released atomic.Bool }
