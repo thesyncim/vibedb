@@ -127,10 +127,17 @@ func (waves *distributedRunnerWaves) RunWave(_ context.Context, wave DurableRequ
 	return DurableRequestWaveResult{Observation: observation, Revision: waves.ledger.head.Revision}, nil
 }
 
-type distributedRunnerTerminal struct{ plan DurableRequestTerminalPlan }
+type distributedRunnerTerminal struct {
+	plan  DurableRequestTerminalPlan
+	fault bool
+}
 
 func (terminal *distributedRunnerTerminal) Complete(_ context.Context, plan DurableRequestTerminalPlan) (DurableRequestTerminalResult, error) {
 	terminal.plan = plan
+	if terminal.fault {
+		terminal.fault = false
+		return DurableRequestTerminalResult{}, errLifecycleRunnerFault
+	}
 	return DurableRequestTerminalResult{Revision: 1, Applied: 1}, nil
 }
 
@@ -229,6 +236,70 @@ func TestDurableRequestDistributedRunnerDurablyAbortsPrepareConflict(t *testing.
 	if terminal.plan.Outcome != requestledger.OutcomeAborted || terminal.plan.AffectedRowsValid ||
 		terminal.plan.AffectedRows != 0 || ledger.head.NextStepOrdinal != 11 {
 		t.Fatalf("terminal=%+v waves=%d", terminal.plan, ledger.head.NextStepOrdinal)
+	}
+}
+
+func TestDurableRequestDistributedRunnerResumesTerminalHandoff(t *testing.T) {
+	execution := typedExecutionFixture(t)
+	execution.Recipe.Contract.CommitFinalWaveCount, execution.Recipe.Contract.AbortFinalWaveCount = 8, 11
+	commitCursor, abortCursor := []byte("terminal-commit"), []byte("terminal-abort")
+	execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.CommitTransitionTag, commitCursor))
+	execution.Recipe.Contract.AbortTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.AbortTransitionTag, abortCursor))
+	_, head, route := lifecycleRunnerFixture(t)
+	head.NextStepOrdinal, head.Revision = 0, 1
+	ledger := &distributedRunnerLedger{head: head}
+	waves := &distributedRunnerWaves{ledger: ledger}
+	terminal := &distributedRunnerTerminal{fault: true}
+	authority := DurableRequestTerminalAuthority{CommitCursor: commitCursor, AbortCursor: abortCursor, AckToken: requestledger.AckToken{1}, Release: terminalAuthorityRelease(t, execution)}
+	runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, distributedRunnerPayloads{}, terminal, distributedRunnerAuthority{value: authority})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runner.RunTyped(context.Background(), execution); !errors.Is(err, errLifecycleRunnerFault) {
+		t.Fatalf("first terminal err=%v", err)
+	}
+	if ledger.head.NextStepOrdinal != 8 {
+		t.Fatalf("waves=%d", ledger.head.NextStepOrdinal)
+	}
+	if err = execution.Participants.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runner.RunTyped(context.Background(), execution); err != nil {
+		t.Fatal(err)
+	}
+	if terminal.plan.Outcome != requestledger.OutcomeCommitted || terminal.plan.AffectedRows != 3 {
+		t.Fatalf("terminal=%+v", terminal.plan)
+	}
+}
+
+func BenchmarkDurableRequestDistributedRunnerBoundedStream(b *testing.B) {
+	for _, count := range []int{3, 129, 1025} {
+		b.Run(fmt.Sprintf("participants_%d", count), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				execution := typedExecutionFixtureCount(b, count)
+				// These fixtures fit one manifest command. The schedule has no
+				// participant cap and is derived from the sealed count.
+				execution.Recipe.Contract.CommitFinalWaveCount = uint64(2*count + 2)
+				execution.Recipe.Contract.AbortFinalWaveCount = uint64(3*count + 2)
+				commitCursor, abortCursor := []byte("terminal-commit"), []byte("terminal-abort")
+				execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.CommitTransitionTag, commitCursor))
+				execution.Recipe.Contract.AbortTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.AbortTransitionTag, abortCursor))
+				_, head, route := lifecycleRunnerFixture(b)
+				head.NextStepOrdinal, head.Revision = 0, 1
+				ledger := &distributedRunnerLedger{head: head}
+				waves := &distributedRunnerWaves{ledger: ledger}
+				terminal := &distributedRunnerTerminal{}
+				authority := DurableRequestTerminalAuthority{CommitCursor: commitCursor, AbortCursor: abortCursor, AckToken: requestledger.AckToken{1}, Release: terminalAuthorityRelease(b, execution)}
+				runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, distributedRunnerPayloads{}, terminal, distributedRunnerAuthority{value: authority})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err = runner.RunTyped(context.Background(), execution); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
