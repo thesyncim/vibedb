@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -42,11 +43,14 @@ var (
 	// ErrOutcomeUnknown reports cancellation or owner loss after the exact
 	// command entered the serving registry. Retrying the same command bytes is
 	// safe; changing its request identity is not.
-	ErrOutcomeUnknown         = errors.New("raftservice: admitted command outcome is unknown")
-	ErrMembershipUnauthorized = errors.New("raftservice: membership transition is not authorized")
-	ErrMembershipStale        = errors.New("raftservice: membership transition is stale")
-	ErrMembershipMalformed    = errors.New("raftservice: membership transition is malformed")
-	ErrMembershipNotCaughtUp  = errors.New("raftservice: membership target is not caught up")
+	ErrOutcomeUnknown                  = errors.New("raftservice: admitted command outcome is unknown")
+	ErrMembershipUnauthorized          = errors.New("raftservice: membership transition is not authorized")
+	ErrMembershipStale                 = errors.New("raftservice: membership transition is stale")
+	ErrMembershipMalformed             = errors.New("raftservice: membership transition is malformed")
+	ErrMembershipNotCaughtUp           = errors.New("raftservice: membership target is not caught up")
+	ErrTransactionRecoveryUnauthorized = errors.New(
+		"raftservice: transaction recovery is not authorized",
+	)
 )
 
 // Limits bounds every object retained outside Host and rafttransport. Host and
@@ -72,16 +76,17 @@ type OutboundSink interface {
 // and also retries a retained outbound message after transport backpressure.
 // Core never samples wall-clock time.
 type Options struct {
-	Registry                 *raftserve.Registry
-	Host                     *multiraft.Host
-	Members                  []raftmember.RuntimeIdentity
-	CommandFences            []CommandFence
-	ReadSources              []ReadSource
-	MembershipAuthorizations []MembershipAuthorization
-	MembershipAuthority      MembershipAuthoritySink
-	Outbound                 OutboundSink
-	Pulse                    <-chan struct{}
-	Limits                   Limits
+	Registry                   *raftserve.Registry
+	Host                       *multiraft.Host
+	Members                    []raftmember.RuntimeIdentity
+	CommandFences              []CommandFence
+	ReadSources                []ReadSource
+	TransactionRecoverySources []TransactionRecoverySource
+	MembershipAuthorizations   []MembershipAuthorization
+	MembershipAuthority        MembershipAuthoritySink
+	Outbound                   OutboundSink
+	Pulse                      <-chan struct{}
+	Limits                     Limits
 }
 
 type requestKind uint8
@@ -94,6 +99,7 @@ const (
 	requestMembership
 	requestReadLinear
 	requestReadFollower
+	requestReadTransaction
 )
 
 const (
@@ -137,6 +143,7 @@ type readRequest struct {
 
 type readAuthorization struct {
 	source         ReadSource
+	recovery       TransactionRecoverySource
 	minimumApplied uint64
 }
 
@@ -144,6 +151,7 @@ type readDelivery struct {
 	state          atomic.Uint32
 	reply          chan ownerReply
 	source         ReadSource
+	recovery       TransactionRecoverySource
 	minimumApplied uint64
 }
 
@@ -157,6 +165,17 @@ const (
 // cut without table names or SQL interpretation.
 type ReadSource interface {
 	PointReadInto(replication.RelationID, []byte, uint64, int, []byte) (replicatedstate.PointReadResult, error)
+}
+
+// TransactionRecoverySource exposes only the replicated transaction-control
+// reader. It is intentionally separate from ordinary relation reads so
+// installing a data-read source cannot enable coordinator discovery.
+type TransactionRecoverySource interface {
+	TransactionRecoveryReadInto(
+		replicatedstate.TransactionRecoveryReadRequest,
+		[]replicatedstate.TransactionRecoveryRecord,
+		[]byte,
+	) (replicatedstate.TransactionRecoveryReadResult, error)
 }
 
 // Result is one terminal deterministic apply result. Completion is the exact
@@ -192,6 +211,29 @@ type PointReadLease interface {
 	Release()
 }
 
+// TransactionReadRequest wraps the exact replicated-state recovery operation
+// with the live RF3 serving fence. Capability must be the one dedicated
+// recovery bit; ordinary data or topology authority is never accepted here.
+type TransactionReadRequest struct {
+	Fence      ServingFence
+	Capability serviceauthz.Capability
+	Read       replicatedstate.TransactionRecoveryReadRequest
+}
+
+// TransactionReadResult owns Records and every record payload. Applied is the
+// exact state-machine cut reached after the quorum ReadIndex barrier.
+type TransactionReadResult struct {
+	Applied  uint64
+	Complete bool
+	Records  []replicatedstate.TransactionRecoveryRecord
+}
+
+// TransactionReadLease holds the conservative response and scratch-memory
+// reservation until the native serving boundary finishes encoding the result.
+type TransactionReadLease interface {
+	Release()
+}
+
 const (
 	// Native read responses retain a five-byte frame header and a 309-byte
 	// fixed body in addition to the detached store value. Charge each of the
@@ -212,6 +254,37 @@ func pointReadResponseCharge(maximum int) (int64, bool) {
 		return 0, false
 	}
 	return payload*2 + fixed, true
+}
+
+const transactionRecoveryRecordRetainedBytes int64 = 256
+
+func transactionReadResponseCharge(
+	request replicatedstate.TransactionRecoveryReadRequest,
+) (charge int64, records int, scratch int, ok bool) {
+	if err := replicatedstate.ValidateTransactionRecoveryReadRequest(request); err != nil {
+		return 0, 0, 0, false
+	}
+	records = 1
+	switch request.Kind {
+	case replicatedstate.TransactionRecoveryLookupCoordinator,
+		replicatedstate.TransactionRecoveryReadManifestPage:
+		scratch = replicatedstate.MaxTransactionRecoveryPayloadArenaBytes
+	case replicatedstate.TransactionRecoveryLookupParticipant:
+	case replicatedstate.TransactionRecoveryScanCoordinator:
+		records = int(request.MaxRows)
+	default:
+		return 0, 0, 0, false
+	}
+	encoded, valid := pointReadResponseCharge(int(request.MaxBytes))
+	if !valid || records <= 0 {
+		return 0, 0, 0, false
+	}
+	retained := int64(records)*transactionRecoveryRecordRetainedBytes + int64(scratch)
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if retained < 0 || encoded > maxInt64-retained {
+		return 0, 0, 0, false
+	}
+	return encoded + retained, records, scratch, true
 }
 
 type pointReadLease struct {
@@ -351,6 +424,7 @@ type ownerMember struct {
 	command   CommandFence
 	authority MembershipAuthorization
 	read      ReadSource
+	recovery  TransactionRecoverySource
 }
 
 type MembershipKind uint8
@@ -437,6 +511,10 @@ func NewOwner(options Options) (*Owner, error) {
 	if len(options.ReadSources) != 0 && len(options.ReadSources) != len(options.Members) {
 		return nil, ErrInvalidOwner
 	}
+	if len(options.TransactionRecoverySources) != 0 &&
+		len(options.TransactionRecoverySources) != len(options.Members) {
+		return nil, ErrInvalidOwner
+	}
 	seen := make(map[raftmember.GroupKey]struct{}, len(options.Members))
 	groups := make([]raftmember.GroupKey, len(options.Members))
 	members := make(map[raftmember.GroupKey]ownerMember, len(options.Members))
@@ -470,8 +548,12 @@ func NewOwner(options Options) (*Owner, error) {
 		if len(options.ReadSources) != 0 {
 			source = options.ReadSources[index]
 		}
+		var recovery TransactionRecoverySource
+		if len(options.TransactionRecoverySources) != 0 {
+			recovery = options.TransactionRecoverySources[index]
+		}
 		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
-			authority: authority, read: source}
+			authority: authority, read: source, recovery: recovery}
 	}
 	return &Owner{
 		registry: options.Registry, host: options.Host, groups: groups, members: members,
@@ -679,10 +761,19 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 	case requestMembership:
 		reply.err = owner.applyMembership(request.membership)
-	case requestReadLinear, requestReadFollower:
+	case requestReadLinear, requestReadFollower, requestReadTransaction:
 		member, found := owner.members[request.group]
-		if !found || member.read == nil ||
+		if !found ||
 			!servingFenceMatchesIdentity(request.read.fence, member) {
+			reply.err = ErrServingFence
+			break
+		}
+		if request.kind == requestReadTransaction {
+			if member.recovery == nil {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if member.read == nil {
 			reply.err = ErrServingFence
 			break
 		}
@@ -721,6 +812,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			break
 		}
 		request.read.delivery.source = member.read
+		request.read.delivery.recovery = member.recovery
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
@@ -728,7 +820,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 	default:
 		reply.err = ErrInvalidOwner
 	}
-	if request.kind == requestReadLinear && request.read.delivery != nil {
+	if (request.kind == requestReadLinear || request.kind == requestReadTransaction) &&
+		request.read.delivery != nil {
 		owner.settleReadDelivery(request.read.delivery, reply)
 	} else {
 		request.reply <- reply
@@ -766,6 +859,7 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			// Source was authenticated at admission and remains bound to the
 			// immutable owner member for this allocation.
 			reply.read.source = delivery.source
+			reply.read.recovery = delivery.recovery
 		}
 		owner.settleReadDelivery(delivery, reply)
 	}
@@ -1068,6 +1162,74 @@ func (owner *Owner) ReadPoint(
 	releaseReservation = false
 	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value},
 		&pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadTransaction serves one bounded transaction-control recovery read after
+// the existing leader-only quorum ReadIndex path authorizes its exact serving
+// fence. The source executes outside the serialized Host lane against the
+// resulting minimum applied cut; it cannot create a follower or lease read.
+func (owner *Owner) ReadTransaction(
+	ctx context.Context,
+	request TransactionReadRequest,
+) (TransactionReadResult, TransactionReadLease, error) {
+	if owner == nil || ctx == nil {
+		return TransactionReadResult{}, nil, ErrInvalidOwner
+	}
+	if request.Capability != serviceauthz.CapabilityTransactionRecovery {
+		return TransactionReadResult{}, nil, ErrTransactionRecoveryUnauthorized
+	}
+	responseCharge, maxRecords, scratchBytes, ok := transactionReadResponseCharge(request.Read)
+	if !ok {
+		return TransactionReadResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return TransactionReadResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadTransaction, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{
+			fence: request.Fence, minimumApplied: request.Read.MinimumApplied,
+			delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return TransactionReadResult{}, nil, err
+	}
+	records := make([]replicatedstate.TransactionRecoveryRecord, 0, maxRecords)
+	payload := make([]byte, 0, scratchBytes)
+	value, err := reply.read.recovery.TransactionRecoveryReadInto(
+		request.Read, records, payload,
+	)
+	if err != nil {
+		return TransactionReadResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		len(value.Records) > maxRecords {
+		return TransactionReadResult{}, nil, ErrServingFence
+	}
+	returnedBytes := len(value.Records) * replicatedstate.TransactionRecoverySummaryBytes
+	for index := range value.Records {
+		if len(value.Records[index].Payload) > int(request.Read.MaxBytes)-returnedBytes {
+			return TransactionReadResult{}, nil, ErrServingFence
+		}
+		returnedBytes += len(value.Records[index].Payload)
+	}
+	if returnedBytes > int(request.Read.MaxBytes) {
+		return TransactionReadResult{}, nil, ErrServingFence
+	}
+	value.Records = value.Records[:len(value.Records):len(value.Records)]
+	releaseReservation = false
+	return TransactionReadResult{
+		Applied: value.Fence.Applied, Complete: value.Complete, Records: value.Records,
+	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
 func (owner *Owner) enqueueRead(

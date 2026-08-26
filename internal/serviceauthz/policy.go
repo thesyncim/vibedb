@@ -39,10 +39,16 @@ const (
 	// data writer cannot acquire routing or controller authority merely because
 	// the catalog is stored in an ordinary replicated relation.
 	CapabilityTopology
+	// CapabilityTransactionRecovery permits the replacement-gateway recovery
+	// reader to inspect replicated transaction control state. It is deliberately
+	// separate from ordinary data reads, writes, and topology authority: none of
+	// those capabilities can discover transaction participants or decisions.
+	CapabilityTransactionRecovery
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
-	CapabilityDelegate | CapabilityMembership | CapabilityTopology
+	CapabilityDelegate | CapabilityMembership | CapabilityTopology |
+	CapabilityTransactionRecovery
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

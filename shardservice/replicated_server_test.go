@@ -18,17 +18,22 @@ import (
 )
 
 type fakeReplicatedOwner struct {
-	state         raftservice.ServingState
-	result        raftservice.Result
-	err           error
-	blockSubmit   bool
-	membershipErr error
-	membership    raftservice.MembershipRequest
-	readResult    raftservice.PointReadResult
-	readErr       error
-	readLease     raftservice.PointReadLease
-	readCalled    chan struct{}
-	probeCalls    atomic.Uint64
+	state              raftservice.ServingState
+	result             raftservice.Result
+	err                error
+	blockSubmit        bool
+	membershipErr      error
+	membership         raftservice.MembershipRequest
+	readResult         raftservice.PointReadResult
+	readErr            error
+	readLease          raftservice.PointReadLease
+	readCalled         chan struct{}
+	transactionResult  raftservice.TransactionReadResult
+	transactionErr     error
+	transactionLease   raftservice.TransactionReadLease
+	transactionRequest raftservice.TransactionReadRequest
+	transactionCalled  chan struct{}
+	probeCalls         atomic.Uint64
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -71,6 +76,21 @@ func (owner *fakeReplicatedOwner) ReadPoint(
 		}
 	}
 	return owner.readResult, owner.readLease, owner.readErr
+}
+
+func (owner *fakeReplicatedOwner) ReadTransaction(
+	_ context.Context,
+	request raftservice.TransactionReadRequest,
+) (raftservice.TransactionReadResult, raftservice.TransactionReadLease, error) {
+	owner.transactionRequest = request
+	if owner.transactionCalled != nil {
+		select {
+		case <-owner.transactionCalled:
+		default:
+			close(owner.transactionCalled)
+		}
+	}
+	return owner.transactionResult, owner.transactionLease, owner.transactionErr
 }
 
 type testPointReadLease struct{ released atomic.Bool }

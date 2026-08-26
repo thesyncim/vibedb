@@ -79,6 +79,36 @@ func TestGateDenyDefaultRoleSeparationAndRotation(t *testing.T) {
 	}
 }
 
+func TestTransactionRecoveryCapabilityIsIndependent(t *testing.T) {
+	recovery, reader, writer, topology := authzNode(20), authzNode(21),
+		authzNode(22), authzNode(23)
+	policy, err := NewPolicy(11, []Entry{
+		{Node: recovery, Capabilities: CapabilityTransactionRecovery},
+		{Node: reader, Capabilities: CapabilityDataRead},
+		{Node: writer, Capabilities: CapabilityDataWrite},
+		{Node: topology, Capabilities: CapabilityTopology},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range []rafttransport.NodeID{reader, writer, topology} {
+		if got := policy.Check(node, CapabilityTransactionRecovery); got != DecisionDenyCapability {
+			t.Fatalf("ordinary capability %x implied transaction recovery: %d", node, got)
+		}
+	}
+	if got := policy.Check(recovery, CapabilityTransactionRecovery); got != DecisionAllow {
+		t.Fatalf("transaction recovery denied: %d", got)
+	}
+	for _, capability := range []Capability{
+		CapabilityDataRead, CapabilityDataWrite, CapabilitySchema,
+		CapabilityMembership, CapabilityTopology,
+	} {
+		if got := policy.Check(recovery, capability); got != DecisionDenyCapability {
+			t.Fatalf("transaction recovery implied capability %x: %d", capability, got)
+		}
+	}
+}
+
 func TestAuthorityContextIsExactAndAllocationFreeOnRead(t *testing.T) {
 	authority := Authority{Node: authzNode(11), Generation: 19}
 	ctx, err := WithAuthority(context.Background(), authority)

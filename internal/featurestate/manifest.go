@@ -114,6 +114,21 @@ var Distributed = []Feature{
 		}},
 	},
 	{
+		Name: "RF3 transaction recovery reads",
+		Primitive: Stage{StatusYes, "A closed hidden-state reader provides exact coordinator and participant lookup, paged manifest access, and bounded resumable active-coordinator scans without a participant-count contract.", []Reference{
+			ref("internal/replicatedstate/transaction_recovery_read.go", "TransactionRecoveryReadInto"), ref("internal/replicatedstate/transaction_recovery_read.go", "TransactionRecoveryReadRequest"),
+		}},
+		Integrated: Stage{StatusYes, "The dedicated transaction-recovery capability, leader-only ReadIndex path, native shard protocol, and leader-aware gateway executor share exact byte, row, applied-index, and serving-fence bounds.", []Reference{
+			ref("internal/raftservice/owner.go", "ReadTransaction"), ref("gateway/replicated_transaction_recovery.go", "ReadTransactionRecovery"),
+		}},
+		Shipped: Stage{StatusPartial, "vibedb-shard serve-rf3 installs and serves the authenticated recovery reader. The gateway executor can consume it, but the periodic gateway recovery controller still uses the static transaction authority and is not redirected piecemeal.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("gateway/recovery.go", "RecoverAll"),
+		}},
+		Qualification: Stage{StatusPartial, "Real RF3 tests prove leader-only recovery, replacement-leader continuity, and isolated-former-leader refusal. The complete RF3 transaction writer and recovery controller are not yet qualified end to end.", []Reference{
+			ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement"), ref("internal/raftservice/owner_rf3_transaction_test.go", "TestRF3IsolatedLeaderCannotCompleteTransactionRecoveryRead"),
+		}},
+	},
+	{
 		Name: "Global exact index routing and maintenance",
 		Primitive: Stage{StatusYes, "Catalog metadata, independent index placement, exact lookup, lifecycle fencing, and write expansion exist.", []Reference{
 			ref("gateway/index_metadata.go", "IndexMetadata"), ref("gateway/global_index.go", "GlobalIndexProgram"),

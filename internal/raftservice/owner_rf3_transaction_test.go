@@ -12,10 +12,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
@@ -123,7 +125,10 @@ func newTransactionRF3Cluster(t testing.TB) *transactionRF3Cluster {
 				Members:       []raftmember.RuntimeIdentity{runtimes[index].Identity()},
 				CommandFences: []CommandFence{rf3CommandFence(runtimes[index].Identity(), cluster.bases[index])},
 				ReadSources:   []ReadSource{cluster.reads[index]},
-				Pulse:         cluster.pulses[index],
+				TransactionRecoverySources: []TransactionRecoverySource{
+					cluster.reads[index],
+				},
+				Pulse: cluster.pulses[index],
 				Limits: Limits{MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
 					MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
 					MaxPendingReadItems: 64, MaxPendingReadBytes: 64 << 20,
@@ -469,6 +474,136 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 		t.Fatalf("released index read=%+v err=%v", indexRead, err)
 	}
 	indexLease.Release()
+}
+
+func TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement(t *testing.T) {
+	cluster := newTransactionRF3Cluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := cluster.owners[0].Campaign(ctx, cluster.group); err != nil {
+		t.Fatal(err)
+	}
+	leader := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.group)
+
+	id := distributedtxn.ID{0x72, 0x65, 0x63, 0x6f, 0x76, 0x65, 0x72, 0x79, 1}
+	record, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 1, RecoveryDeadline: time.Now().Add(time.Minute).UnixNano(),
+		Participants: []distributedtxn.ParticipantRef{{
+			Distribution:         []byte(cluster.bases[leader].Binding.Distribution),
+			Shard:                []byte(cluster.bases[leader].Binding.Shard),
+			RoutingVersion:       uint64(cluster.bases[leader].Binding.Authority.RoutingVersion),
+			AllocationGeneration: cluster.bases[leader].Binding.AllocationGeneration,
+			OwnershipEpoch:       uint64(cluster.bases[leader].Binding.Authority.OwnershipEpoch),
+			MutationDigest:       distributedtxn.Digest(sha256.Sum256([]byte("recovery-read"))),
+			State:                distributedtxn.ParticipantStaged,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := rf3TransactionCommand(t, cluster.bases[leader], distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedStageCoordinator,
+		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: record,
+	}, nil)
+	staged, _, _ := submitRF3Transaction(t, ctx, cluster.owners[leader], cluster.group, stage)
+	waitRF3Applied(t, ctx, cluster.owners[:], nil, cluster.group, staged.Outcome.AppliedIndex)
+
+	read := replicatedstate.TransactionRecoveryReadRequest{
+		Kind: replicatedstate.TransactionRecoveryLookupCoordinator, ID: id,
+		MinimumApplied: staged.Outcome.AppliedIndex, MaxRows: 1,
+		MaxBytes: uint32(replicatedstate.TransactionRecoverySummaryBytes +
+			distributedtxn.MaxCoordinatorRecordBytes),
+	}
+	leaderState := mustRF3State(t, ctx, cluster.owners[leader], cluster.group)
+	request := TransactionReadRequest{
+		Fence: leaderState.Fence(), Capability: serviceauthz.CapabilityTransactionRecovery,
+		Read: read,
+	}
+	for _, capability := range []serviceauthz.Capability{
+		serviceauthz.CapabilityDataRead,
+		serviceauthz.CapabilityDataWrite,
+		serviceauthz.CapabilityTopology,
+		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityTransactionRecovery,
+	} {
+		request.Capability = capability
+		if result, lease, readErr := cluster.owners[leader].ReadTransaction(ctx, request); !errors.Is(readErr, ErrTransactionRecoveryUnauthorized) || lease != nil ||
+			len(result.Records) != 0 {
+			t.Fatalf("capability %x recovery result=%+v lease=%T err=%v",
+				capability, result, lease, readErr)
+		}
+	}
+	request.Capability = serviceauthz.CapabilityTransactionRecovery
+	result, lease, err := cluster.owners[leader].ReadTransaction(ctx, request)
+	if err != nil || lease == nil || !result.Complete ||
+		result.Applied < staged.Outcome.AppliedIndex || len(result.Records) != 1 ||
+		result.Records[0].ID != id || !bytes.Equal(result.Records[0].Payload, record) {
+		t.Fatalf("leader recovery result=%+v lease=%T err=%v", result, lease, err)
+	}
+	lease.Release()
+
+	follower := (leader + 1) % len(cluster.owners)
+	followerState := mustRF3State(t, ctx, cluster.owners[follower], cluster.group)
+	request.Fence = followerState.Fence()
+	if result, deniedLease, readErr := cluster.owners[follower].ReadTransaction(ctx, request); !errors.Is(readErr, raftmodel.ErrNotLeader) || deniedLease != nil ||
+		len(result.Records) != 0 {
+		t.Fatalf("follower recovery result=%+v lease=%T err=%v", result, deniedLease, readErr)
+	}
+
+	formerFence := leaderState.Fence()
+	cluster.stop(t, leader)
+	request.Fence = formerFence
+	if result, deniedLease, readErr := cluster.owners[leader].ReadTransaction(ctx, request); !errors.Is(readErr, ErrOwnerClosed) || deniedLease != nil || len(result.Records) != 0 {
+		t.Fatalf("former leader recovery result=%+v lease=%T err=%v",
+			result, deniedLease, readErr)
+	}
+	removed := map[int]bool{leader: true}
+	if err := cluster.owners[follower].Campaign(ctx, cluster.group); err != nil {
+		t.Fatal(err)
+	}
+	newLeader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.group)
+	request.Fence = mustRF3State(t, ctx, cluster.owners[newLeader], cluster.group).Fence()
+	result, lease, err = cluster.owners[newLeader].ReadTransaction(ctx, request)
+	if err != nil || lease == nil || len(result.Records) != 1 ||
+		result.Records[0].ID != id || !bytes.Equal(result.Records[0].Payload, record) {
+		t.Fatalf("replacement recovery result=%+v lease=%T err=%v", result, lease, err)
+	}
+	lease.Release()
+}
+
+func TestRF3IsolatedLeaderCannotCompleteTransactionRecoveryRead(t *testing.T) {
+	cluster := newTransactionRF3Cluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := cluster.owners[0].Campaign(ctx, cluster.group); err != nil {
+		t.Fatal(err)
+	}
+	leader := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.group)
+	leaderState := mustRF3State(t, ctx, cluster.owners[leader], cluster.group)
+	for index := range cluster.owners {
+		if index != leader {
+			cluster.stop(t, index)
+		}
+	}
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer readCancel()
+	result, lease, err := cluster.owners[leader].ReadTransaction(
+		readCtx,
+		TransactionReadRequest{
+			Fence: leaderState.Fence(), Capability: serviceauthz.CapabilityTransactionRecovery,
+			Read: replicatedstate.TransactionRecoveryReadRequest{
+				Kind: replicatedstate.TransactionRecoveryLookupCoordinator,
+				ID:   distributedtxn.ID{1}, MinimumApplied: max(uint64(1), leaderState.Status.Applied),
+				MaxRows: 1, MaxBytes: uint32(replicatedstate.TransactionRecoverySummaryBytes +
+					distributedtxn.MaxCoordinatorRecordBytes),
+			},
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) || lease != nil || len(result.Records) != 0 {
+		t.Fatalf("isolated leader recovery result=%+v lease=%T err=%v", result, lease, err)
+	}
 }
 
 func mustRF3State(

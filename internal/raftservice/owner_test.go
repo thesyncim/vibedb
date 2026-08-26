@@ -5,12 +5,14 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 func newDeliveryTestOwner() *Owner {
@@ -200,6 +202,68 @@ func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
 	owner.releasePendingRead(charge)
 	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
 		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
+	}
+}
+
+func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) {
+	request := TransactionReadRequest{Read: replicatedstate.TransactionRecoveryReadRequest{
+		Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
+		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
+	}}
+	owner := &Owner{}
+	for _, capability := range []serviceauthz.Capability{
+		serviceauthz.CapabilityDataRead,
+		serviceauthz.CapabilityDataWrite,
+		serviceauthz.CapabilityTopology,
+		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityTransactionRecovery,
+	} {
+		request.Capability = capability
+		if result, lease, err := owner.ReadTransaction(context.Background(), request); !errors.Is(err, ErrTransactionRecoveryUnauthorized) || lease != nil ||
+			len(result.Records) != 0 {
+			t.Fatalf("capability %x result=%+v lease=%T err=%v", capability, result, lease, err)
+		}
+	}
+	request.Capability = serviceauthz.CapabilityTransactionRecovery
+	if result, lease, err := owner.ReadTransaction(context.Background(), request); !errors.Is(err, ErrOwnerClosed) || errors.Is(err, ErrTransactionRecoveryUnauthorized) ||
+		lease != nil || len(result.Records) != 0 {
+		t.Fatalf("dedicated capability result=%+v lease=%T err=%v", result, lease, err)
+	}
+}
+
+func TestTransactionRecoveryResponseChargeIncludesTypedArenaAndMaterialScratch(t *testing.T) {
+	participant := replicatedstate.TransactionRecoveryReadRequest{
+		Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
+		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
+	}
+	charge, records, scratch, ok := transactionReadResponseCharge(participant)
+	wire, _ := pointReadResponseCharge(replicatedstate.TransactionRecoverySummaryBytes)
+	if !ok || records != 1 || scratch != 0 ||
+		charge != wire+transactionRecoveryRecordRetainedBytes {
+		t.Fatalf("participant charge=%d records=%d scratch=%d ok=%t", charge, records, scratch, ok)
+	}
+	coordinator := participant
+	coordinator.Kind = replicatedstate.TransactionRecoveryLookupCoordinator
+	coordinator.MaxBytes = replicatedstate.TransactionRecoverySummaryBytes +
+		distributedtxn.MaxCoordinatorRecordBytes
+	charge, records, scratch, ok = transactionReadResponseCharge(coordinator)
+	wire, _ = pointReadResponseCharge(int(coordinator.MaxBytes))
+	want := wire + transactionRecoveryRecordRetainedBytes +
+		int64(replicatedstate.MaxTransactionRecoveryPayloadArenaBytes)
+	if !ok || records != 1 || scratch != replicatedstate.MaxTransactionRecoveryPayloadArenaBytes ||
+		charge != want {
+		t.Fatalf("coordinator charge=%d want=%d records=%d scratch=%d ok=%t",
+			charge, want, records, scratch, ok)
+	}
+	scan := replicatedstate.TransactionRecoveryReadRequest{
+		Kind:           replicatedstate.TransactionRecoveryScanCoordinator,
+		MinimumApplied: 1, MaxRows: replicatedstate.MaxTransactionRecoveryScanRows,
+		MaxBytes: replicatedstate.MaxTransactionRecoveryScanBytes,
+	}
+	charge, records, scratch, ok = transactionReadResponseCharge(scan)
+	if !ok || records != replicatedstate.MaxTransactionRecoveryScanRows || scratch != 0 || charge <= 0 {
+		t.Fatalf("scan charge=%d records=%d scratch=%d ok=%t", charge, records, scratch, ok)
 	}
 }
 

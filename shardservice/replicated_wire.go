@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -20,6 +21,7 @@ const (
 	replicatedWireVersion          = 1
 	tagReplicatedRequest           = 'P'
 	tagReplicatedMembershipRequest = 'M'
+	tagReplicatedTransactionRead   = 'T'
 	tagReplicatedResponse          = 'A'
 	// A response with state has a 297-byte body before a completion. The fixed
 	// request digest is zero for nonterminal responses and binds terminal
@@ -35,6 +37,19 @@ const (
 // 8-byte exact requested capability.
 const replicatedMembershipRequestBodyBytes = 311
 
+// Transaction recovery reads are fixed-width: the common 242-byte native
+// prefix followed by a one-byte closed read kind, one exact transaction ID,
+// an applied floor, a manifest-page ordinal, a scan item limit, and a response
+// byte ceiling. For a scan ID is the exclusive after-ID cursor. The dedicated
+// tag lets the decoder reject a hostile frame length before allocating its body.
+const replicatedTransactionReadRequestBodyBytes = 277
+
+const (
+	MaxReplicatedTransactionReadBytes = replicatedstate.MaxTransactionRecoveryReadBytes
+	MaxReplicatedTransactionScanItems = replicatedstate.MaxTransactionRecoveryScanRows
+	MaxReplicatedTransactionScanBytes = replicatedstate.MaxTransactionRecoveryScanBytes
+)
+
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
 
 // ReplicatedOperation is the closed byte-native serving operation set. SQL is
@@ -47,7 +62,33 @@ const (
 	ReplicatedMembership
 	ReplicatedReadLeader
 	ReplicatedReadFollower
+	ReplicatedTransactionRead
 )
+
+// ReplicatedTransactionReadKind is the complete RF3 recovery-read surface.
+// These operations inspect only the replicated hidden system collection; they
+// never consult the legacy process-local transaction journal.
+type ReplicatedTransactionReadKind uint8
+
+const (
+	ReplicatedTransactionLookupCoordinator ReplicatedTransactionReadKind = iota + 1
+	ReplicatedTransactionLookupParticipant
+	ReplicatedTransactionReadManifestPage
+	ReplicatedTransactionScanCoordinators
+)
+
+// ReplicatedTransactionReadRequest is fixed-size on the wire. ID is the exact
+// identity for point/page reads and the exclusive after-ID cursor for an
+// ordered coordinator scan. MaxRows is exactly one for a point/page read and
+// explicitly bounds a scan. MaxBytes bounds the detached canonical response.
+type ReplicatedTransactionReadRequest struct {
+	Kind           ReplicatedTransactionReadKind
+	ID             distributedtxn.ID
+	MinimumApplied uint64
+	SegmentIndex   uint32
+	MaxRows        uint16
+	MaxBytes       uint32
+}
 
 // ReplicatedFence identifies one exact live Runtime and leadership term. Probe
 // requires only Group and AllocationGeneration; Propose requires every field.
@@ -64,16 +105,17 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation      ReplicatedOperation
-	Authority      serviceauthz.Authority
-	Capability     serviceauthz.Capability
-	Fence          ReplicatedFence
-	Command        []byte
-	Membership     ReplicatedMembershipRequest
-	Relation       replication.RelationID
-	Key            []byte
-	MinimumApplied uint64
-	MaxValueBytes  uint32
+	Operation       ReplicatedOperation
+	Authority       serviceauthz.Authority
+	Capability      serviceauthz.Capability
+	Fence           ReplicatedFence
+	Command         []byte
+	Membership      ReplicatedMembershipRequest
+	Relation        replication.RelationID
+	Key             []byte
+	MinimumApplied  uint64
+	MaxValueBytes   uint32
+	TransactionRead ReplicatedTransactionReadRequest
 }
 
 // ReplicatedMembershipRequest is a fixed-width control envelope. It contains
@@ -102,6 +144,7 @@ const (
 	ReplicatedMembershipAccepted
 	ReplicatedReadFound
 	ReplicatedReadMissing
+	ReplicatedTransactionReadResult
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -122,6 +165,7 @@ const (
 	ReplicatedRefusalReadBehind
 	ReplicatedRefusalReadBufferBound
 	ReplicatedRefusalUnauthorized
+	ReplicatedRefusalTransactionReadMalformed
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -149,7 +193,7 @@ type ReplicatedResponse struct {
 	Completion    []byte
 	ReadApplied   uint64
 	Value         []byte
-	readLease     raftservice.PointReadLease
+	readLease     interface{ Release() }
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame.
@@ -179,6 +223,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
 		e.bytes(request.Key)
+	case ReplicatedTransactionRead:
+		encodeReplicatedTransactionRead(&e, request.TransactionRead)
 	}
 	if e.err != nil {
 		return e.err
@@ -186,6 +232,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	tag := byte(tagReplicatedRequest)
 	if request.Operation == ReplicatedMembership {
 		tag = tagReplicatedMembershipRequest
+	} else if request.Operation == ReplicatedTransactionRead {
+		tag = tagReplicatedTransactionRead
 	}
 	return writeEncodedFrame(w, tag, e.b)
 }
@@ -226,6 +274,9 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		e.u32(request.MaxValueBytes)
 		payload = request.Key
 		e.u32(uint32(len(payload)))
+	case ReplicatedTransactionRead:
+		encodeReplicatedTransactionRead(&e, request.TransactionRead)
+		tag = tagReplicatedTransactionRead
 	}
 	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
 		return errFrameTooLarge
@@ -265,7 +316,7 @@ func decodeReplicatedRequest(
 		return nil, 0, errBadVersion
 	}
 	request := &ReplicatedRequest{Operation: ReplicatedOperation(d.u8())}
-	if (request.Operation == ReplicatedMembership) != (tag == tagReplicatedMembershipRequest) {
+	if !replicatedRequestTagMatches(request.Operation, tag) {
 		if budget != nil {
 			budget.release(charged)
 		}
@@ -286,6 +337,8 @@ func decodeReplicatedRequest(
 		request.MinimumApplied = d.u64()
 		request.MaxValueBytes = d.u32()
 		request.Key = d.slice()
+	case ReplicatedTransactionRead:
+		request.TransactionRead = decodeReplicatedTransactionRead(&d)
 	}
 	if err := d.end(); err != nil {
 		if budget != nil {
@@ -346,6 +399,31 @@ func readReplicatedRequestFrame(
 			return nil, 0, tag, err
 		}
 		return body, charged, tag, nil
+	case tagReplicatedTransactionRead:
+		if size != replicatedTransactionReadRequestBodyBytes {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		var prefix [2]byte
+		if _, err := io.ReadFull(r, prefix[:]); err != nil {
+			return nil, 0, tag, err
+		}
+		if prefix[0] != replicatedWireVersion ||
+			ReplicatedOperation(prefix[1]) != ReplicatedTransactionRead {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		charged = int64(size)
+		if budget != nil && !budget.reserve(charged) {
+			return nil, 0, tag, errFrameBudget
+		}
+		body = make([]byte, size)
+		copy(body[:2], prefix[:])
+		if _, err := io.ReadFull(r, body[2:]); err != nil {
+			if budget != nil {
+				budget.release(charged)
+			}
+			return nil, 0, tag, err
+		}
+		return body, charged, tag, nil
 	case tagReplicatedRequest:
 		if size > maxFrameBody {
 			return nil, 0, tag, errFrameTooLarge
@@ -376,7 +454,8 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 		return ErrReplicatedWire
 	}
 	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
-	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
+		response.Kind == ReplicatedTransactionReadResult {
 		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
 	}
 	e := encbuf{b: make([]byte, 5, 5+bodyHint)}
@@ -394,7 +473,8 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	e.u64(response.Outcome.CompletionAppliedSequence)
 	encodeReplicatedDigest(&e, response.RequestDigest)
 	e.bytes(response.Completion)
-	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
+		response.Kind == ReplicatedTransactionReadResult {
 		e.u64(response.ReadApplied)
 		e.bytes(response.Value)
 	}
@@ -437,7 +517,8 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 	response.Completion = d.slice()
 	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
-	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
+		response.Kind == ReplicatedTransactionReadResult {
 		response.ReadApplied = d.u64()
 		response.Value = d.slice()
 		response.Value = response.Value[:len(response.Value):len(response.Value)]
@@ -465,9 +546,50 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 		return replicatedResponseFixedBodyBytes, nil
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
+	case ReplicatedTransactionRead:
+		return replicatedReadResponseFixedBodyBytes +
+			replicatedTransactionReadValueHeaderBytes + int(request.TransactionRead.MaxBytes), nil
 	default:
 		return 0, ErrReplicatedWire
 	}
+}
+
+func replicatedRequestTagMatches(operation ReplicatedOperation, tag byte) bool {
+	switch operation {
+	case ReplicatedMembership:
+		return tag == tagReplicatedMembershipRequest
+	case ReplicatedTransactionRead:
+		return tag == tagReplicatedTransactionRead
+	default:
+		return tag == tagReplicatedRequest
+	}
+}
+
+func encodeReplicatedTransactionRead(
+	e *encbuf,
+	request ReplicatedTransactionReadRequest,
+) {
+	e.u8(uint8(request.Kind))
+	e.b = append(e.b, request.ID[:]...)
+	e.u64(request.MinimumApplied)
+	e.u32(request.SegmentIndex)
+	e.b = binary.BigEndian.AppendUint16(e.b, request.MaxRows)
+	e.u32(request.MaxBytes)
+}
+
+func decodeReplicatedTransactionRead(d *deccur) ReplicatedTransactionReadRequest {
+	request := ReplicatedTransactionReadRequest{Kind: ReplicatedTransactionReadKind(d.u8())}
+	request.ID = distributedtxn.ID(d.fixed16())
+	request.MinimumApplied = d.u64()
+	request.SegmentIndex = d.u32()
+	if len(d.b) < 2 {
+		d.fail(errTruncated)
+	} else {
+		request.MaxRows = binary.BigEndian.Uint16(d.b[:2])
+		d.b = d.b[2:]
+	}
+	request.MaxBytes = d.u32()
+	return request
 }
 
 func encodeReplicatedFence(e *encbuf, fence ReplicatedFence) {
@@ -599,11 +721,13 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
 			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
-			request.MaxValueBytes == 0
+			request.MaxValueBytes == 0 &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{})
 	case ReplicatedPropose:
 		if !validReplicatedProposalCapability(request.Capability) ||
 			request.Membership != (ReplicatedMembershipRequest{}) || request.Relation != 0 ||
-			len(request.Key) != 0 || request.MinimumApplied != 0 || request.MaxValueBytes != 0 {
+			len(request.Key) != 0 || request.MinimumApplied != 0 || request.MaxValueBytes != 0 ||
+			request.TransactionRead != (ReplicatedTransactionReadRequest{}) {
 			return false
 		}
 		if !validReplicatedFence(request.Fence, true) || len(request.Command) == 0 ||
@@ -632,7 +756,8 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 		return (request.Capability == 0 || request.Capability == serviceauthz.CapabilityMembership) &&
 			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
-			request.MaxValueBytes == 0
+			request.MaxValueBytes == 0 &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{})
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		return validReplicatedReadCapability(request.Capability) &&
 			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
@@ -640,7 +765,14 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			request.Relation != 0 && request.Relation <= replication.MaxRelationID &&
 			len(request.Key) != 0 && len(request.Key) <= replication.MaxMutationKeyBytes &&
 			request.MinimumApplied != 0 && request.MaxValueBytes != 0 &&
-			request.MaxValueBytes <= replication.MaxMutationValueBytes
+			request.MaxValueBytes <= replication.MaxMutationValueBytes &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{})
+	case ReplicatedTransactionRead:
+		return request.Capability == serviceauthz.CapabilityTransactionRecovery &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) &&
+			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
+			request.MaxValueBytes == 0 && validReplicatedTransactionRead(request.TransactionRead)
 	default:
 		return false
 	}
@@ -659,7 +791,8 @@ func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
 	return capability == 0 || capability == serviceauthz.CapabilityDataRead ||
 		capability == serviceauthz.CapabilityDataWrite ||
 		capability == serviceauthz.CapabilityMembership ||
-		capability == serviceauthz.CapabilityTopology
+		capability == serviceauthz.CapabilityTopology ||
+		capability == serviceauthz.CapabilityTransactionRecovery
 }
 
 func validReplicatedProposalCapability(capability serviceauthz.Capability) bool {
@@ -670,6 +803,11 @@ func validReplicatedProposalCapability(capability serviceauthz.Capability) bool 
 func validReplicatedReadCapability(capability serviceauthz.Capability) bool {
 	return capability == 0 || capability == serviceauthz.CapabilityDataRead ||
 		capability == serviceauthz.CapabilityTopology
+}
+
+func validReplicatedTransactionRead(request ReplicatedTransactionReadRequest) bool {
+	_, ok := replicatedTransactionRecoveryRead(request)
+	return ok
 }
 
 func validReplicatedMemberState(state ReplicatedMemberState) bool {
@@ -738,7 +876,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) &&
 			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable ||
 				response.Refusal == ReplicatedRefusalUnauthorized) &&
-			response.Refusal <= ReplicatedRefusalUnauthorized
+			response.Refusal <= ReplicatedRefusalTransactionReadMalformed
 	case ReplicatedReadFound:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&
@@ -750,6 +888,12 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			len(response.Value) == 0
+	case ReplicatedTransactionReadResult:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+			validReplicatedTransactionReadValue(response.Value)
 	default:
 		return false
 	}
