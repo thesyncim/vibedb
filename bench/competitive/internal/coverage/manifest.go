@@ -406,12 +406,13 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			), "printHeader", "mutation-index", "apparent-bytes", "allocated-bytes", "elapsed-seconds", "publishable")},
 		},
 		{
-			Dimension: "stability", Case: "periodic crashes", Status: CoverageDiagnostic,
-			Boundary: "Injected crash-point sweeps prove recovery atomicity, but no long-running external kill/restart benchmark records latency, loss window, or storage growth.",
-			Targets: []CoverageTarget{testTarget(
-				"exhaustive commit crash sweep",
-				"store/durable", "TestFileStoreExhaustiveCommitCrashSweep",
-			)},
+			Dimension: "stability", Case: "periodic crashes", Status: CoverageImplemented,
+			Boundary: "The external RF3 qualification runs bounded kill/response cuts, two asymmetric directional partition/restart/heal loops, four 64-caller result-waiter waves, rolling restarts, and hard WAL/RSS growth bounds. It emits exact canonical TSV counters and fails closed without Linux physical-allocation, /proc RSS, signal, proxy, or synced-result controls. This is bounded qualification, not a time-based soak or failover-latency claim.",
+			Targets: []CoverageTarget{
+				commandTarget("bounded external RF3 durability qualification", "bench/rf3chaos",
+					"-output=/tmp/vibedb-rf3-chaos.tsv", "-runs=9", "-timeout=5m"),
+				testTarget("exhaustive commit crash sweep", "store/durable", "TestFileStoreExhaustiveCommitCrashSweep"),
+			},
 		},
 	}
 	return lanes

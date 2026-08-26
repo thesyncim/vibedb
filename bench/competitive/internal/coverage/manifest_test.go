@@ -179,7 +179,7 @@ func validateCoverageTarget(t *testing.T, repoRoot string, target CoverageTarget
 		if target.Symbol != "" {
 			t.Fatalf("command target unexpectedly names symbol %q", target.Symbol)
 		}
-		if !strings.HasPrefix(target.Package, "bench/competitive/cmd/") {
+		if !strings.HasPrefix(target.Package, "bench/competitive/cmd/") && target.Package != "bench/rf3chaos" {
 			t.Fatalf("command target %q is outside the competitive command module", target.Package)
 		}
 		flags, hasMain := coverageCommandSurface(t, packageDir)

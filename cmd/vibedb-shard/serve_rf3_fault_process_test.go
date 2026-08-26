@@ -3,15 +3,21 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -25,6 +31,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3bench"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
@@ -51,9 +58,17 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	if os.Getenv(rf3CommandHelperEnvironment) != "" {
 		return
 	}
+	if runtime.GOOS != "linux" {
+		t.Skip("external RF3 qualification requires Linux /proc RSS and strict physical WAL controls")
+	}
 	fixture := newRF3FaultFixture(t)
 	defer fixture.close(t)
 	fixture.startAll(t)
+	qualification := rf3bench.Qualification{
+		WALBaselineBytes:          uint64(fixture.walAllocatedBaseline),
+		WALGrowthBoundBytes:       rf3bench.WALGrowthBoundBytes,
+		WaiterRSSGrowthBoundBytes: rf3bench.WaiterRSSGrowthBoundBytes,
+	}
 
 	leader, states := fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
 	epoch, openApplied := fixture.openSession(t, leader, states[leader])
@@ -90,6 +105,7 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	// Kill before a proposal. The dead endpoint must fail and a byte-new command
 	// must settle through the newly elected live leader.
 	fixture.kill(t, newLeader)
+	qualification.KillBeforeRequestCuts++
 	deadCtx, cancelDead := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	_, deadErr := fixture.roundTripContext(deadCtx, newLeader, &shardservice.ReplicatedRequest{
 		Operation:  shardservice.ReplicatedProbe,
@@ -128,6 +144,7 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	// deliberately invariant to which side of admission won.
 	time.Sleep(500 * time.Microsecond)
 	fixture.kill(t, leader)
+	qualification.KillAdmissionResponseCuts++
 	select {
 	case first := <-raceDone:
 		if first.err == nil && first.response.Kind != shardservice.ReplicatedCompletion &&
@@ -159,6 +176,7 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	lostApplied := fixture.waitDocument(t, leader, states[leader], "response-lost", 30*time.Second)
 	_ = blindConnection.Close()
 	fixture.kill(t, leader)
+	qualification.KillAfterApplyResponseCuts++
 	live = rf3FaultOtherMembers(leader)
 	retryLeader, retryStates = fixture.waitLeader(t, live, 30*time.Second)
 	retried = fixture.propose(t, retryLeader, retryStates[retryLeader], lostResponse)
@@ -169,57 +187,121 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	lastApplied = retried.Outcome.AppliedIndex
 	fixture.restart(t, leader)
 	fixture.waitCaughtUp(t, leader, lastApplied, 30*time.Second)
+	qualification.LostResponseApplied = lostApplied
 
-	// Exercise the shipped registry's complete 64-waiter budget against one
-	// identity. Admission-bound callers are permitted, but every admitted caller
-	// must finish and capacity must be reusable by the following command.
-	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
-	coalesced := fixture.mutationCommand(t, states[leader], epoch, 5, "bounded-waiters")
-	const callers = 64
-	results := make(chan rf3FaultRoundTrip, callers)
-	var launch sync.WaitGroup
-	launch.Add(callers)
-	for range callers {
-		go func() {
-			defer launch.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			response, callErr := fixture.roundTripContext(ctx, leader,
-				fixture.proposalRequest(leader, states[leader], coalesced))
-			results <- rf3FaultRoundTrip{response: response, err: callErr}
-		}()
-	}
-	launch.Wait()
-	close(results)
-	completed, refused := 0, 0
-	for result := range results {
-		if result.err != nil {
-			t.Fatalf("bounded waiter caller leaked/block-failed: %v", result.err)
+	// Exercise two exact one-way peer cuts. The leader->follower relay is
+	// disabled while the reverse follower->leader relay remains enabled. A
+	// quorum mutation must still settle, the follower is restarted under the
+	// asymmetric cut, and only healing that exact direction may complete its
+	// catch-up. Relay interruption/rejection counts prove the control acted on
+	// an established or attempted peer connection rather than recording a
+	// no-op partition.
+	nextSequence := uint64(5)
+	for loop := uint32(0); loop < rf3bench.RequiredAsymmetricPartitionLoops; loop++ {
+		leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+		target := (leader + 1 + int(loop)) % rf3CommandMembers
+		link := fixture.links[leader][target]
+		beforeRejected := link.rejectedConnections()
+		cutCount := link.partition()
+		command = fixture.mutationCommand(t, states[leader], epoch, nextSequence,
+			fmt.Sprintf("asymmetric-partition-%d", loop+1))
+		settled = fixture.propose(t, leader, states[leader], command)
+		if settled.Kind != shardservice.ReplicatedCompletion {
+			t.Fatalf("asymmetric partition mutation %d = %+v", loop+1, settled)
 		}
-		switch {
-		case result.response.Kind == shardservice.ReplicatedCompletion:
-			completed++
-		case result.response.Kind == shardservice.ReplicatedRefusal &&
-			result.response.Refusal == shardservice.ReplicatedRefusalAdmissionBound:
-			refused++
-		default:
-			t.Fatalf("bounded waiter result = %+v", result.response)
+		lastApplied = settled.Outcome.AppliedIndex
+		fixture.kill(t, target)
+		fixture.restart(t, target)
+		link.waitRejectedAfter(t, beforeRejected, 5*time.Second)
+		link.heal()
+		fixture.waitCaughtUp(t, target, lastApplied, 30*time.Second)
+		if cutCount <= beforeRejected && link.rejectedConnections() <= beforeRejected {
+			t.Fatalf("asymmetric partition %d did not interrupt or reject a directional connection", loop+1)
 		}
+		qualification.AsymmetricRejectedConnections += link.rejectedConnections() - beforeRejected
+		qualification.AsymmetricPartitionLoops++
+		nextSequence++
 	}
-	if completed == 0 {
-		t.Fatal("no coalesced waiter observed the durable completion")
-	}
-	states[leader] = fixture.probe(t, leader)
-	afterBound := fixture.propose(t, leader, states[leader],
-		fixture.mutationCommand(t, states[leader], epoch, 6, "waiter-capacity-reused"))
-	if afterBound.Kind != shardservice.ReplicatedCompletion {
-		t.Fatalf("waiter capacity was not reusable: %+v", afterBound)
-	}
-	lastApplied = afterBound.Outcome.AppliedIndex
-	fixture.waitAllApplied(t, lastApplied, 30*time.Second)
 
-	// Sequence 6 durably acknowledges sequence 5. Restart every replica, one at
-	// a time with quorum retained, then replay sequence 5. The exact
+	// Repeat the complete 64-caller result-waiter pressure shape four times.
+	// Every caller must finish as either a byte-identical completion or the
+	// explicit admission bound, and a fresh command after every wave proves the
+	// capacity was returned. Linux process RSS is sampled before and after each
+	// wave; the qualification records the maximum growth rather than allowing a
+	// final GC to hide a transient waiter leak.
+	qualification.WaiterRSSBaselineBytes = rf3FaultProcessRSSBytes(t, fixture.children)
+	qualification.WaiterRSSPeakBytes = qualification.WaiterRSSBaselineBytes
+	var coalesced []byte
+	for wave := uint32(0); wave < rf3bench.RequiredWaiterWaves; wave++ {
+		leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+		waveCommand := fixture.mutationCommand(t, states[leader], epoch, nextSequence,
+			fmt.Sprintf("bounded-waiters-%d", wave+1))
+		if coalesced == nil {
+			coalesced = append([]byte(nil), waveCommand...)
+		}
+		const callers = int(rf3bench.RequiredWaiterCallsPerWave)
+		results := make(chan rf3FaultRoundTrip, callers)
+		var launch sync.WaitGroup
+		launch.Add(callers)
+		for range callers {
+			go func() {
+				defer launch.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				response, callErr := fixture.roundTripContext(ctx, leader,
+					fixture.proposalRequest(leader, states[leader], waveCommand))
+				results <- rf3FaultRoundTrip{response: response, err: callErr}
+			}()
+		}
+		launch.Wait()
+		close(results)
+		waveCompleted := uint32(0)
+		for result := range results {
+			if result.err != nil {
+				t.Fatalf("bounded waiter wave %d caller leaked/block-failed: %v", wave+1, result.err)
+			}
+			switch {
+			case result.response.Kind == shardservice.ReplicatedCompletion:
+				qualification.WaiterCompletions++
+				waveCompleted++
+			case result.response.Kind == shardservice.ReplicatedRefusal &&
+				result.response.Refusal == shardservice.ReplicatedRefusalAdmissionBound:
+				qualification.WaiterRefusals++
+			default:
+				t.Fatalf("bounded waiter wave %d result = %+v", wave+1, result.response)
+			}
+		}
+		if waveCompleted == 0 {
+			t.Fatalf("bounded waiter wave %d observed no durable completion", wave+1)
+		}
+		qualification.WaiterWaves++
+		qualification.WaiterCalls += rf3bench.RequiredWaiterCallsPerWave
+		nextSequence++
+		states[leader] = fixture.probe(t, leader)
+		afterBound := fixture.propose(t, leader, states[leader], fixture.mutationCommand(
+			t, states[leader], epoch, nextSequence, fmt.Sprintf("waiter-capacity-reused-%d", wave+1)))
+		if afterBound.Kind != shardservice.ReplicatedCompletion {
+			t.Fatalf("waiter capacity wave %d was not reusable: %+v", wave+1, afterBound)
+		}
+		qualification.WaiterReuseCompletions++
+		lastApplied = afterBound.Outcome.AppliedIndex
+		fixture.waitAllApplied(t, lastApplied, 30*time.Second)
+		nextSequence++
+		if rss := rf3FaultProcessRSSBytes(t, fixture.children); rss > qualification.WaiterRSSPeakBytes {
+			qualification.WaiterRSSPeakBytes = rss
+		}
+	}
+	if qualification.WaiterRSSPeakBytes > qualification.WaiterRSSBaselineBytes {
+		qualification.WaiterRSSGrowthBytes = qualification.WaiterRSSPeakBytes - qualification.WaiterRSSBaselineBytes
+	}
+	if qualification.WaiterRSSGrowthBytes > qualification.WaiterRSSGrowthBoundBytes {
+		t.Fatalf("waiter-phase RSS growth %d exceeds bound %d", qualification.WaiterRSSGrowthBytes,
+			qualification.WaiterRSSGrowthBoundBytes)
+	}
+
+	// The final reuse command durably acknowledges every preceding waiter wave.
+	// Restart every replica, one at a time with quorum retained, then replay the
+	// first waiter command. The exact
 	// RetryRetired outcome proves that the acknowledgement floor survived all
 	// three process lifetimes rather than existing only in a leader cache.
 	for member := 0; member < rf3CommandMembers; member++ {
@@ -238,12 +320,23 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 
 	allocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
 	allocatedDelta := allocated - fixture.walAllocatedBaseline
-	if allocatedDelta < 0 || allocatedDelta > 256<<20 {
+	if allocatedDelta < 0 || uint64(allocatedDelta) > rf3bench.WALGrowthBoundBytes {
 		t.Fatalf("small RF3 fault run allocated %d additional WAL bytes, want <= %d",
-			allocatedDelta, 256<<20)
+			allocatedDelta, rf3bench.WALGrowthBoundBytes)
 	}
-	t.Logf("RF3 evidence: lost_response_applied=%d waiter_completions=%d waiter_refusals=%d wal_allocated_delta_bytes=%d ack_outcome=%d",
-		lostApplied, completed, refused, allocatedDelta, acknowledged.Outcome.Code)
+	qualification.WALFinalBytes = uint64(allocated)
+	qualification.WALGrowthBytes = uint64(allocatedDelta)
+	qualification.AckOutcome = uint64(acknowledged.Outcome.Code)
+	if err := qualification.Validate(); err != nil {
+		t.Fatalf("RF3 qualification counters invalid: %+v: %v", qualification, err)
+	}
+	rf3FaultWriteQualification(t, qualification)
+	t.Logf("RF3 qualification: cuts=%d/%d/%d asymmetric_loops=%d rejected_connections=%d waiter_waves=%d waiter_calls=%d waiter_completions=%d waiter_refusals=%d wal_growth_bytes=%d waiter_rss_growth_bytes=%d ack_outcome=%d",
+		qualification.KillBeforeRequestCuts, qualification.KillAdmissionResponseCuts,
+		qualification.KillAfterApplyResponseCuts, qualification.AsymmetricPartitionLoops,
+		qualification.AsymmetricRejectedConnections, qualification.WaiterWaves, qualification.WaiterCalls,
+		qualification.WaiterCompletions, qualification.WaiterRefusals, qualification.WALGrowthBytes,
+		qualification.WaiterRSSGrowthBytes, qualification.AckOutcome)
 }
 
 type rf3FaultRoundTrip struct {
@@ -251,11 +344,194 @@ type rf3FaultRoundTrip struct {
 	err      error
 }
 
+func TestRF3FaultLinkCutsOneDirectionAndHeals(t *testing.T) {
+	backend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			connection, acceptErr := backend.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(connection, connection)
+				_ = connection.Close()
+			}()
+		}
+	}()
+	link := newRF3FaultLink(t, backend.Addr().String())
+	defer func() {
+		link.close()
+		_ = backend.Close()
+		<-done
+	}()
+	roundTrip := func(value byte) net.Conn {
+		connection, err := net.DialTimeout("tcp", link.address(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = connection.Write([]byte{value}); err != nil {
+			t.Fatal(err)
+		}
+		_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+		var response [1]byte
+		if _, err = io.ReadFull(connection, response[:]); err != nil || response[0] != value {
+			t.Fatalf("relay response=%x err=%v", response, err)
+		}
+		return connection
+	}
+	first := roundTrip(1)
+	before := link.rejectedConnections()
+	link.partition()
+	_ = first.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := first.Read(make([]byte, 1)); err == nil {
+		t.Fatal("partition retained established directional connection")
+	}
+	_ = first.Close()
+	link.waitRejectedAfter(t, before, time.Second)
+	link.heal()
+	_ = roundTrip(2).Close()
+}
+
+// rf3FaultLink is a test-owned directional TCP relay. Each source member gets
+// a distinct relay for each destination, so disabling source->destination
+// cannot accidentally disable the reverse direction. This avoids production
+// fault hooks and host-global firewall mutations while still closing every
+// established stream at an exact external cut.
+type rf3FaultLink struct {
+	listener *net.TCPListener
+	target   string
+	enabled  atomic.Bool
+	rejected atomic.Uint64
+	mu       sync.Mutex
+	active   map[net.Conn]net.Conn
+	closed   chan struct{}
+	wg       sync.WaitGroup
+}
+
+func newRF3FaultLink(t testing.TB, target string) *rf3FaultLink {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("create directional RF3 fault link: %v", err)
+	}
+	link := &rf3FaultLink{listener: listener, target: target, active: make(map[net.Conn]net.Conn), closed: make(chan struct{})}
+	link.enabled.Store(true)
+	link.wg.Add(1)
+	go link.accept()
+	return link
+}
+
+func (link *rf3FaultLink) address() string { return link.listener.Addr().String() }
+
+func (link *rf3FaultLink) accept() {
+	defer link.wg.Done()
+	for {
+		incoming, err := link.listener.Accept()
+		if err != nil {
+			select {
+			case <-link.closed:
+				return
+			default:
+				continue
+			}
+		}
+		if !link.enabled.Load() {
+			link.rejected.Add(1)
+			_ = incoming.Close()
+			continue
+		}
+		outgoing, err := net.DialTimeout("tcp", link.target, 3*time.Second)
+		if err != nil {
+			_ = incoming.Close()
+			continue
+		}
+		link.mu.Lock()
+		if !link.enabled.Load() {
+			link.rejected.Add(1)
+			link.mu.Unlock()
+			_ = incoming.Close()
+			_ = outgoing.Close()
+			continue
+		}
+		link.active[incoming] = outgoing
+		link.mu.Unlock()
+		link.wg.Add(1)
+		go link.relay(incoming, outgoing)
+	}
+}
+
+func (link *rf3FaultLink) relay(incoming, outgoing net.Conn) {
+	defer link.wg.Done()
+	done := make(chan struct{}, 2)
+	copyOne := func(destination, source net.Conn) {
+		_, _ = io.Copy(destination, source)
+		done <- struct{}{}
+	}
+	go copyOne(outgoing, incoming)
+	go copyOne(incoming, outgoing)
+	<-done
+	_ = incoming.Close()
+	_ = outgoing.Close()
+	<-done
+	link.mu.Lock()
+	delete(link.active, incoming)
+	link.mu.Unlock()
+}
+
+func (link *rf3FaultLink) partition() uint64 {
+	link.enabled.Store(false)
+	link.mu.Lock()
+	interrupted := uint64(len(link.active))
+	for incoming, outgoing := range link.active {
+		_ = incoming.Close()
+		_ = outgoing.Close()
+	}
+	link.mu.Unlock()
+	link.rejected.Add(interrupted)
+	return link.rejected.Load()
+}
+
+func (link *rf3FaultLink) heal() { link.enabled.Store(true) }
+
+func (link *rf3FaultLink) rejectedConnections() uint64 { return link.rejected.Load() }
+
+func (link *rf3FaultLink) waitRejectedAfter(t testing.TB, before uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if link.rejectedConnections() > before {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("directional RF3 link rejected=%d want >%d", link.rejectedConnections(), before)
+}
+
+func (link *rf3FaultLink) close() {
+	select {
+	case <-link.closed:
+		return
+	default:
+		close(link.closed)
+	}
+	_ = link.listener.Close()
+	link.partition()
+	link.wg.Wait()
+}
+
 type rf3FaultFixture struct {
 	root                 string
 	group                raftmember.GroupKey
 	nodes                [rf3CommandMembers]rafttransport.NodeID
 	peerAddresses        [rf3CommandMembers]string
+	peerRoutes           [rf3CommandMembers][rf3CommandMembers]string
+	links                [rf3CommandMembers][rf3CommandMembers]*rf3FaultLink
 	nativeAddresses      [rf3CommandMembers]string
 	snapshotAddresses    [rf3CommandMembers]string
 	controlAddresses     [rf3CommandMembers]string
@@ -285,6 +561,17 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		fixture.controlAddresses[member] = fixture.listeners[member][1].Addr().String()
 		fixture.nativeAddresses[member] = fixture.listeners[member][2].Addr().String()
 		fixture.snapshotAddresses[member] = fixture.listeners[member][3].Addr().String()
+	}
+	for source := 0; source < rf3CommandMembers; source++ {
+		for target := 0; target < rf3CommandMembers; target++ {
+			if source == target {
+				fixture.peerRoutes[source][target] = fixture.peerAddresses[target]
+				continue
+			}
+			link := newRF3FaultLink(t, fixture.peerAddresses[target])
+			fixture.links[source][target] = link
+			fixture.peerRoutes[source][target] = link.address()
+		}
 	}
 	credentials, roots, err := rf3testfixture.WriteCredentials(fixture.root, rf3CommandIdentityOID,
 		rafttransport.TrustDomain{ClusterID: fixture.group.ClusterID, ClusterIncarnation: fixture.group.ClusterIncarnation}, fixture.nodes[:])
@@ -339,7 +626,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		document := rf3CommandManifestDocument(prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
 			fixture.peerAddresses[member], fixture.nativeAddresses[member],
 			fixture.snapshotAddresses[member], fixture.controlAddresses[member], credentials[member], roots,
-			policyPath, walOptions, fixture.nodes, fixture.peerAddresses,
+			policyPath, walOptions, fixture.nodes, fixture.peerRoutes[member],
 			walIdentityFromBinding(prepared.Base.Binding), prepared.Base.Binding.TopologyRecoveryEpoch)
 		if err = os.WriteFile(fixture.manifestPaths[member], document, 0o600); err != nil {
 			t.Fatal(err)
@@ -450,6 +737,13 @@ func (fixture *rf3FaultFixture) close(t testing.TB) {
 		for lane := range fixture.listeners[member] {
 			if fixture.listeners[member][lane] != nil {
 				_ = fixture.listeners[member][lane].Close()
+			}
+		}
+	}
+	for source := range fixture.links {
+		for target := range fixture.links[source] {
+			if fixture.links[source][target] != nil {
+				fixture.links[source][target].close()
 			}
 		}
 	}
@@ -746,4 +1040,71 @@ func rf3FaultWALAllocatedBytes(t testing.TB, paths [rf3CommandMembers]string) in
 		}
 	}
 	return total
+}
+
+func rf3FaultProcessRSSBytes(t testing.TB, children [rf3CommandMembers]*rf3CommandChild) uint64 {
+	t.Helper()
+	var total uint64
+	for member, child := range children {
+		if child == nil || child.command == nil || child.command.Process == nil {
+			t.Fatalf("member %d has no live process for RSS evidence", member+1)
+		}
+		path := fmt.Sprintf("/proc/%d/status", child.command.Process.Pid)
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open Linux RSS evidence %q: %v", path, err)
+		}
+		scanner := bufio.NewScanner(file)
+		found := false
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) != 3 || fields[0] != "VmRSS:" || fields[2] != "kB" {
+				continue
+			}
+			kib, parseErr := strconv.ParseUint(fields[1], 10, 64)
+			if parseErr != nil || kib > ^uint64(0)/1024 {
+				_ = file.Close()
+				t.Fatalf("parse Linux RSS evidence %q: %v", scanner.Text(), parseErr)
+			}
+			total += kib * 1024
+			found = true
+			break
+		}
+		scanErr := scanner.Err()
+		closeErr := file.Close()
+		if scanErr != nil || closeErr != nil || !found {
+			t.Fatalf("read Linux RSS evidence for member %d: found=%t scan=%v close=%v",
+				member+1, found, scanErr, closeErr)
+		}
+	}
+	if total == 0 {
+		t.Fatal("RF3 RSS evidence is zero")
+	}
+	return total
+}
+
+func rf3FaultWriteQualification(t testing.TB, qualification rf3bench.Qualification) {
+	t.Helper()
+	path := os.Getenv(rf3bench.QualificationPathEnvironment)
+	if path == "" {
+		return
+	}
+	if !filepath.IsAbs(path) {
+		t.Fatalf("RF3 qualification output path must be absolute: %q", path)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("create RF3 qualification evidence: %v", err)
+	}
+	if err = rf3bench.WriteQualificationTSV(file, qualification); err != nil {
+		_ = file.Close()
+		t.Fatalf("write RF3 qualification evidence: %v", err)
+	}
+	if err = file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("sync RF3 qualification evidence: %v", err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatalf("close RF3 qualification evidence: %v", err)
+	}
 }

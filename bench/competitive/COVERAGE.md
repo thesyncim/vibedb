@@ -10,7 +10,7 @@ This table is the executable benchmark-coverage contract. Status describes the h
 
 `implemented` establishes an executable measurement shape, not a comparison. An evidence command selecting `-engine=vibedb` is VibeDB-only; a cross-engine claim additionally requires the repeated isolated `mixedsuite` publication protocol and recorded results.
 
-Current coverage: **28 implemented**, **10 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
+Current coverage: **29 implemented**, **9 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
 
 Evidence commands are rendered to run from the repository root.
 
@@ -53,7 +53,7 @@ Evidence commands are rendered to run from the repository root.
 | storage | allocated | **implemented** | [E30](#e30): allocated and apparent bytes | The VibeDB footprint command reports apparent bytes, allocated filesystem blocks, and both ratios to the key-inclusive logical payload after a durability fence. |
 | storage | write amplification | **diagnostic** | [E31](#e31): normalized VibeDB durability-payload diagnostic | On VibeDB's journal-backed durable acknowledgement lanes, mixed reports exact submitted mutation bytes, engine-issued durability payload bytes, and their normalized ratio. This is not OS, filesystem-metadata, or physical-media accounting. Counter regression, buffered-visible, and adapters without an equally strong native counter report durability-payload-known=false. |
 | stability | long churn | **diagnostic** | [E28](#e28): bounded sustained-churn run | The deterministic 200,000-mutation disk lane is sustained and sampled, but it is a bounded run rather than a time-based soak with health thresholds. |
-| stability | periodic crashes | **diagnostic** | [E32](#e32): exhaustive commit crash sweep | Injected crash-point sweeps prove recovery atomicity, but no long-running external kill/restart benchmark records latency, loss window, or storage growth. |
+| stability | periodic crashes | **implemented** | [E32](#e32): bounded external RF3 durability qualification<br>[E33](#e33): exhaustive commit crash sweep | The external RF3 qualification runs bounded kill/response cuts, two asymmetric directional partition/restart/heal loops, four 64-caller result-waiter waves, rolling restarts, and hard WAL/RSS growth bounds. It emits exact canonical TSV counters and fails closed without Linux physical-allocation, /proc RSS, signal, proxy, or synced-result controls. This is bounded qualification, not a time-based soak or failover-latency claim. |
 
 ## Executable evidence catalog
 
@@ -244,6 +244,12 @@ go test ./store/durable -run '^TestVerifyCleanPrimaryStoreVerifiesClean$' -count
 ```
 
 ### E32
+
+```sh
+(cd bench/competitive && go run ./bench/rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
+```
+
+### E33
 
 ```sh
 go test ./store/durable -run '^TestFileStoreExhaustiveCommitCrashSweep$' -count=1

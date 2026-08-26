@@ -40,9 +40,11 @@ jobs:
         if: matrix.runner == 'ubuntu-latest'
         run: |
           rf3_evidence_path="${RUNNER_TEMP}/rf3-chaos.tsv"
-          go run ./bench/rf3chaos -output "${rf3_evidence_path}" -runs 1 -timeout 3m
+          go run ./bench/rf3chaos -output "${rf3_evidence_path}" -runs 1 -timeout 5m
           test -s "${rf3_evidence_path}"
-          sed -n '1,40p' "${rf3_evidence_path}"
+          grep -F $'schema\tvibedb.rf3.chaos-evidence\t2' "${rf3_evidence_path}"
+          grep -F $'summary\tpassed\t1\tfailed\t0' "${rf3_evidence_path}"
+          sed -n '1,50p' "${rf3_evidence_path}"
       - name: PostgreSQL client integration
         if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient

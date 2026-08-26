@@ -128,9 +128,18 @@ type faultOutcome struct {
 }
 
 func executeFaultRun(binary string, ordinal uint32, timeout time.Duration) faultOutcome {
+	reservation, reserveErr := os.CreateTemp("", "vibedb-rf3-qualification-*.tsv")
+	if reserveErr != nil {
+		return faultOutcome{run: rf3bench.ChaosRun{Ordinal: ordinal, ElapsedNS: 1, ExitCode: -1}}
+	}
+	qualificationPath := reservation.Name()
+	_ = reservation.Close()
+	_ = os.Remove(qualificationPath)
+	defer os.Remove(qualificationPath)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, binary, "-test.run", "^"+faultTestName+"$", "-test.count=1", "-test.v")
+	command.Env = append(os.Environ(), rf3bench.QualificationPathEnvironment+"="+qualificationPath)
 	output := newDigestPrefixWriter(maximumLogPrefix)
 	command.Stdout, command.Stderr = output, output
 	started := time.Now()
@@ -148,10 +157,17 @@ func executeFaultRun(binary string, ordinal uint32, timeout time.Duration) fault
 	exactRun := bytes.Contains(prefix, []byte("=== RUN   "+faultTestName))
 	exactPass := bytes.Contains(prefix, []byte("--- PASS: "+faultTestName))
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	qualification, qualificationExact := rf3bench.Qualification{}, false
+	if raw, readErr := os.ReadFile(qualificationPath); readErr == nil {
+		if parsed, parseErr := rf3bench.ParseQualificationTSV(raw); parseErr == nil {
+			qualification, qualificationExact = parsed, true
+		}
+	}
 	return faultOutcome{prefix: prefix, run: rf3bench.ChaosRun{
 		Ordinal: ordinal, ElapsedNS: elapsed, OutputBytes: outputBytes,
 		OutputSHA256: digest, ExitCode: exitCode, TimedOut: timedOut,
-		ExactRun: exactRun, Passed: err == nil && !timedOut && exactRun && exactPass,
+		ExactRun: exactRun, QualificationExact: qualificationExact, Qualification: qualification,
+		Passed: err == nil && !timedOut && exactRun && exactPass && qualificationExact,
 	}}
 }
 
@@ -218,7 +234,7 @@ func environmentMetadata(root string, binaryDigest [32]byte) ([]rf3bench.Metadat
 		{Key: []byte("go_version"), Value: bytes.TrimSpace(goVersion)},
 		{Key: []byte("goarch"), Value: []byte(runtime.GOARCH)},
 		{Key: []byte("goos"), Value: []byte(runtime.GOOS)},
-		{Key: []byte("scenario"), Value: []byte("isolate-elect-kill-lose-response-retry-restart-ack-waiter-wal")},
+		{Key: []byte("scenario"), Value: []byte("kill-cuts-asymmetric-partition-restart-waiter-growth-wal-growth")},
 		{Key: []byte("test_name"), Value: []byte(faultTestName)},
 		{Key: []byte("vcs_modified"), Value: []byte(strconv.FormatBool(len(dirty) != 0))},
 		{Key: []byte("vcs_revision"), Value: bytes.TrimSpace(revision)},
