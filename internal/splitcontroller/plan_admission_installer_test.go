@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/thesyncim/vibedb/gateway"
 )
 
 var errPlanAdmissionBind = errors.New("injected plan admission bind failure")
@@ -26,7 +28,7 @@ type planAdmissionBinderStub struct {
 }
 
 func (stub *planAdmissionBinderStub) BindPlanAdmission(
-	_ context.Context, _ *Plan, _ PlanAdmission, leases []*RuntimeStoreLease,
+	_ context.Context, _ *gateway.Snapshot, _ *Plan, _ PlanAdmission, leases []*RuntimeStoreLease,
 ) error {
 	stub.calls++
 	if stub.fail {

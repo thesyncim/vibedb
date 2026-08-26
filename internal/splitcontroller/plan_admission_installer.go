@@ -21,7 +21,7 @@ type PlanAdmissionStoreResolver interface {
 // idempotent and memory-only; a restart requires the catalog authority to
 // replay installation before the shard accepts an action.
 type PlanAdmissionBinder interface {
-	BindPlanAdmission(context.Context, *Plan, PlanAdmission, []*RuntimeStoreLease) error
+	BindPlanAdmission(context.Context, *gateway.Snapshot, *Plan, PlanAdmission, []*RuntimeStoreLease) error
 }
 
 type PlanAdmissionInstaller struct {
@@ -96,7 +96,7 @@ func (installer *PlanAdmissionInstaller) Install(
 			return errors.Join(ErrPlanAdmission, err)
 		}
 	}
-	if err = installer.binder.BindPlanAdmission(ctx, plan, admission, leases); err != nil {
+	if err = installer.binder.BindPlanAdmission(ctx, catalog, plan, admission, leases); err != nil {
 		return errors.Join(ErrPlanAdmission, err)
 	}
 	bound = true

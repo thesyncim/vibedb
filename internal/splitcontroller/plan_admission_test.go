@@ -81,3 +81,39 @@ func TestPlanAdmissionRejectsSubstitutionAndNonCanonicalIntent(t *testing.T) {
 		t.Fatalf("wrong catalog digest err=%v", openErr)
 	}
 }
+
+func TestPlanAdmissionPersistsOneMonotonicPostPublicationRebind(t *testing.T) {
+	plan, catalog, _, _ := testPlan(t)
+	first, err := NewPlanAdmission(catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := plan.targetSnapshotForTest(t)
+	second, err := NewPlanAdmission(published, plan)
+	if err != nil || second.PlanDigest != first.PlanDigest {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	store, err := OpenDurableRuntimeStore(
+		t.TempDir(), plan.OperationID(), testManifestDigest("admission-generation-cut"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lease := &RuntimeStoreLease{store: store}
+	if err = PersistPlanAdmission(lease, first); err != nil {
+		t.Fatal(err)
+	}
+	if err = PersistPlanAdmission(lease, second); err != nil {
+		t.Fatal(err)
+	}
+	if err = PersistPlanAdmission(lease, first); !errors.Is(err, ErrPlanAdmission) {
+		t.Fatalf("catalog admission downgrade err=%v", err)
+	}
+	state, present, err := store.Load(RuntimeStatePlanAdmission, 0)
+	opened, openErr := OpenPlanAdmission(state.Payload)
+	if err != nil || openErr != nil || !present || state.Revision != 2 ||
+		opened.CatalogGeneration != second.CatalogGeneration || opened.CatalogDigest != second.CatalogDigest {
+		t.Fatalf("state=%+v opened=%+v present=%v err=%v open=%v", state, opened, present, err, openErr)
+	}
+}

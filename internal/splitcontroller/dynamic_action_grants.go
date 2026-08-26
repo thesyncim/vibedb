@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"sync"
+
+	"github.com/thesyncim/vibedb/gateway"
 )
 
 // DynamicShardActionGrants is the bounded serving index populated only after
@@ -62,6 +64,47 @@ func (grants *DynamicShardActionGrants) Install(input []ShardActionGrant) error 
 	return nil
 }
 
+func (grants *DynamicShardActionGrants) replace(
+	operation OperationID, digest [32]byte, input []ShardActionGrant,
+) error {
+	if grants == nil || operation == (OperationID{}) || digest == ([32]byte{}) ||
+		len(input) == 0 || len(input) > grants.limit {
+		return ErrRemoteExecution
+	}
+	keys := make([]shardActionGrantKey, len(input))
+	for index, grant := range input {
+		if !validShardActionGrant(grant) || grant.Operation != operation || grant.PlanDigest != digest {
+			return ErrRemoteExecution
+		}
+		keys[index] = shardActionGrantKey{grant.Operation, grant.PlanDigest, grant.Target}
+		for prior := 0; prior < index; prior++ {
+			if compareShardActionGrantKey(keys[prior], keys[index]) == 0 {
+				return ErrRemoteExecution
+			}
+		}
+	}
+	grants.mu.Lock()
+	defer grants.mu.Unlock()
+	remaining := len(grants.grants)
+	for key := range grants.grants {
+		if key.operation == operation && key.digest == digest {
+			remaining--
+		}
+	}
+	if len(keys) > grants.limit-remaining {
+		return ErrRemoteExecution
+	}
+	for key := range grants.grants {
+		if key.operation == operation && key.digest == digest {
+			delete(grants.grants, key)
+		}
+	}
+	for index, key := range keys {
+		grants.grants[key] = input[index]
+	}
+	return nil
+}
+
 func (grants *DynamicShardActionGrants) resolve(
 	operation OperationID, digest [32]byte, target ShardActionTarget,
 ) (ShardActionGrant, bool) {
@@ -92,7 +135,7 @@ func (grants *DynamicShardActionGrants) retire(operation OperationID, digest [32
 
 type PlanAdmissionGrantFactory interface {
 	BuildAdmittedShardActionGrants(
-		context.Context, *Plan, PlanAdmission, []*RuntimeStoreLease,
+		context.Context, *gateway.Snapshot, *Plan, PlanAdmission, []*RuntimeStoreLease,
 	) ([]ShardActionGrant, error)
 }
 
@@ -108,8 +151,10 @@ type BoundPlanAdmissionBinder struct {
 }
 
 type boundPlanAdmission struct {
-	digest [32]byte
-	leases []*RuntimeStoreLease
+	digest            [32]byte
+	catalogGeneration uint64
+	catalogDigest     [32]byte
+	leases            []*RuntimeStoreLease
 }
 
 func NewBoundPlanAdmissionBinder(
@@ -123,9 +168,11 @@ func NewBoundPlanAdmissionBinder(
 }
 
 func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
-	ctx context.Context, plan *Plan, admission PlanAdmission, leases []*RuntimeStoreLease,
+	ctx context.Context, catalog *gateway.Snapshot, plan *Plan,
+	admission PlanAdmission, leases []*RuntimeStoreLease,
 ) error {
-	if binder == nil || ctx == nil || plan == nil || plan.OperationID() != admission.Operation ||
+	if binder == nil || ctx == nil || catalog == nil || plan == nil ||
+		plan.OperationID() != admission.Operation ||
 		len(leases) == 0 {
 		return ErrRemoteExecution
 	}
@@ -136,20 +183,51 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 		binder.active = make(map[OperationID]boundPlanAdmission, min(binder.limit, 64))
 	}
 	if current, found := binder.active[admission.Operation]; found {
-		if current.digest != admission.PlanDigest {
+		if current.digest != admission.PlanDigest ||
+			admission.CatalogGeneration < current.catalogGeneration ||
+			admission.CatalogGeneration > current.catalogGeneration+1 ||
+			admission.CatalogGeneration == current.catalogGeneration &&
+				admission.CatalogDigest != current.catalogDigest {
 			return ErrRemoteExecution
 		}
-		for _, lease := range leases {
-			if err := lease.Release(); err != nil {
-				return err
+		if admission.CatalogGeneration == current.catalogGeneration {
+			for _, lease := range leases {
+				if err := lease.Release(); err != nil {
+					return err
+				}
 			}
+			return nil
+		}
+		created, err := binder.factory.BuildAdmittedShardActionGrants(
+			ctx, catalog, plan, admission, leases,
+		)
+		if err != nil || len(created) == 0 {
+			return ErrRemoteExecution
+		}
+		for index := range created {
+			grant := created[index]
+			if grant.Operation != admission.Operation || grant.PlanDigest != admission.PlanDigest ||
+				grant.Plan != plan {
+				return ErrRemoteExecution
+			}
+		}
+		if err = binder.grants.replace(admission.Operation, admission.PlanDigest, created); err != nil {
+			return err
+		}
+		for _, lease := range current.leases {
+			_ = lease.Release()
+		}
+		binder.active[admission.Operation] = boundPlanAdmission{
+			digest: admission.PlanDigest, catalogGeneration: admission.CatalogGeneration,
+			catalogDigest: admission.CatalogDigest,
+			leases:        append(append([]*RuntimeStoreLease(nil), current.leases...), leases...),
 		}
 		return nil
 	}
 	if len(binder.active) == binder.limit {
 		return ErrRemoteExecution
 	}
-	created, err := binder.factory.BuildAdmittedShardActionGrants(ctx, plan, admission, leases)
+	created, err := binder.factory.BuildAdmittedShardActionGrants(ctx, catalog, plan, admission, leases)
 	if err != nil || len(created) == 0 {
 		return ErrRemoteExecution
 	}
@@ -164,7 +242,9 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 		return err
 	}
 	binder.active[admission.Operation] = boundPlanAdmission{
-		digest: admission.PlanDigest, leases: append([]*RuntimeStoreLease(nil), leases...),
+		digest: admission.PlanDigest, catalogGeneration: admission.CatalogGeneration,
+		catalogDigest: admission.CatalogDigest,
+		leases:        append([]*RuntimeStoreLease(nil), leases...),
 	}
 	return nil
 }

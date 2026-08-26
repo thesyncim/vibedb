@@ -147,10 +147,25 @@ func PersistPlanAdmission(lease *RuntimeStoreLease, admission PlanAdmission) err
 		return err
 	}
 	if present {
-		if current.Revision == 1 && bytes.Equal(current.Payload, raw) {
+		if bytes.Equal(current.Payload, raw) {
 			return nil
 		}
-		return ErrPlanAdmission
+		prior, openErr := OpenPlanAdmission(current.Payload)
+		if openErr != nil || current.Revision == ^uint64(0) ||
+			prior.Operation != admission.Operation || prior.PlanDigest != admission.PlanDigest ||
+			!bytes.Equal(prior.Intent, admission.Intent) ||
+			admission.CatalogGeneration != prior.CatalogGeneration+1 {
+			return errors.Join(ErrPlanAdmission, openErr)
+		}
+		if err = lease.Persist(RuntimeStatePlanAdmission, 0, current.Revision+1, raw); err == nil {
+			return nil
+		}
+		settled, settledPresent, settleErr := lease.Load(RuntimeStatePlanAdmission, 0)
+		if settleErr == nil && settledPresent && settled.Revision == current.Revision+1 &&
+			bytes.Equal(settled.Payload, raw) {
+			return nil
+		}
+		return errors.Join(ErrRuntimeStoreOutcomeUnknown, err, settleErr)
 	}
 	if err = lease.Persist(RuntimeStatePlanAdmission, 0, 1, raw); err == nil {
 		return nil
