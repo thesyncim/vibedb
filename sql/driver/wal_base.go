@@ -190,7 +190,9 @@ func (a *ReplicatedApply) CaptureWALBase(
 	if !witness.BindsAppliedIndex(manifest.State.Applied) ||
 		manifest.State.Applied != applied ||
 		manifest.TargetChunkBytes != replicatedstate.DefaultSnapshotArtifactChunkBytes ||
-		!equalWALBaseManifest(manifest, *base) {
+		!equalWALBaseManifest(
+			manifest, *base, cut.Fence().RelationManifestDigest,
+		) {
 		return nil, ErrWALBasePreparation
 	}
 	snapshotBase, err := a.machine.BuildSnapshotBaseForManifest(manifest)
@@ -263,7 +265,7 @@ func (a *ReplicatedApply) ValidateWALBasePreparation(
 	}
 	base := core.catalog.ReplicatedShardStore
 	if core.checkpointGroup == nil || base == nil ||
-		!equalWALBaseManifest(certificate.Manifest, *base) {
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) {
 		return ErrReplicatedApplyMismatch
 	}
 	if err := core.checkpointGroup.ValidateRetentionWitness(preparation.retention); err != nil {
@@ -338,7 +340,7 @@ func (a *ReplicatedApply) PublishWALGenerationSelection(
 	}
 	base := core.catalog.ReplicatedShardStore
 	if core.checkpointGroup == nil || base == nil ||
-		!equalWALBaseManifest(certificate.Manifest, *base) {
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) {
 		core.mu.Unlock()
 		return ErrReplicatedApplyMismatch
 	}
@@ -415,7 +417,7 @@ func (a *ReplicatedApply) SettleGenerationActivation(
 	group := core.checkpointGroup
 	base := core.catalog.ReplicatedShardStore
 	if group == nil || base == nil || base.RelationCount == 0 ||
-		!equalWALBaseManifest(certificate.Manifest, *base) ||
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) ||
 		certificate.Manifest.State.Binding != replicatedStateBinding(*base) {
 		return ErrReplicatedApplyMismatch
 	}
@@ -469,7 +471,7 @@ func (a *ReplicatedApply) LatchGenerationActivation(
 	}
 	base := core.catalog.ReplicatedShardStore
 	if core.checkpointGroup == nil || base == nil || base.RelationCount == 0 ||
-		!equalWALBaseManifest(certificate.Manifest, *base) ||
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) ||
 		certificate.Manifest.State.Binding != replicatedStateBinding(*base) ||
 		a.machine.Applied() != certificate.Manifest.State.Applied {
 		return ErrReplicatedApplyMismatch
@@ -602,11 +604,15 @@ func walBaseRequiredWorkspaceBytes(
 	return required, nil
 }
 
-// equalWALBaseManifest binds a streamed certificate to the catalog's complete
-// logical relation set. A singleton deliberately retains the original
-// user-collection representation; a bundle authenticates every dense relation
-// by ID, kind, portable manifest digest, and collection name.
-func equalWALBaseManifest(
+// equalWALBaseManifestShape binds a streamed certificate to the catalog's
+// complete logical relation shape. It deliberately does not compare digest
+// fields: the replicated-state machine's relation-manifest digest has a
+// different domain and field grammar from the SQL catalog/apply-profile
+// digests. Callers which already own a Machine must additionally use
+// equalWALBaseManifest with that Machine's exact digest. Snapshot staging
+// performs the same exact check while constructing its replicated-state
+// bundle candidate from these catalog-checked relations.
+func equalWALBaseManifestShape(
 	manifest replicatedstate.SnapshotArtifactManifest,
 	base ReplicatedShardStoreIdentity,
 ) bool {
@@ -619,7 +625,7 @@ func equalWALBaseManifest(
 			manifest.RelationManifestDigest == ([sha256.Size]byte{})
 	}
 	if !manifest.Bundle || len(manifest.Relations) != int(base.RelationCount) ||
-		manifest.RelationManifestDigest != replicatedRelationApplyManifestDigest(base) {
+		manifest.RelationManifestDigest == ([sha256.Size]byte{}) {
 		return false
 	}
 	for ordinal := range base.Relations {
@@ -641,4 +647,33 @@ func equalWALBaseManifest(
 		}
 	}
 	return true
+}
+
+// equalWALBaseManifest adds the exact replicated-state Machine schema digest
+// to the catalog-shape proof. A singleton retains its original artifact
+// grammar, which intentionally carries no relation-manifest digest.
+func equalWALBaseManifest(
+	manifest replicatedstate.SnapshotArtifactManifest,
+	base ReplicatedShardStoreIdentity,
+	machineDigest [sha256.Size]byte,
+) bool {
+	if !equalWALBaseManifestShape(manifest, base) || machineDigest == ([sha256.Size]byte{}) {
+		return false
+	}
+	if base.RelationCount == 1 {
+		return true
+	}
+	return manifest.RelationManifestDigest == machineDigest
+}
+
+func walBaseManifestMatchesMachine(
+	apply *ReplicatedApply,
+	manifest replicatedstate.SnapshotArtifactManifest,
+	base ReplicatedShardStoreIdentity,
+) bool {
+	if apply == nil || apply.machine == nil {
+		return false
+	}
+	digest, err := apply.machine.RelationManifestDigest()
+	return err == nil && equalWALBaseManifest(manifest, base, digest)
 }

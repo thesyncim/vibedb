@@ -84,7 +84,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	if core.catalog.ReplicatedShardStore == nil ||
 		!core.catalog.ReplicatedShardStore.Equal(expected) ||
 		core.catalog.ReplicatedApply == nil || manifest.State.Binding != replicatedStateBinding(expected) ||
-		!equalWALBaseManifest(manifest, expected) {
+		!equalWALBaseManifestShape(manifest, expected) {
 		return activation, false, fmt.Errorf("%w: durable activation identity", ErrReplicatedSnapshotStageProof)
 	}
 	if err := core.settleCatalogLocked(); err != nil {
@@ -211,7 +211,7 @@ func (d *Database) OpenReplicatedSnapshotStage(
 	if err := validateReplicatedApplyOptions(expected, applyOptions); err != nil {
 		return nil, ReplicatedApplyIdentity{}, err
 	}
-	if !equalWALBaseManifest(manifest, expected) ||
+	if !equalWALBaseManifestShape(manifest, expected) ||
 		manifest.State.Binding != replicatedStateBinding(expected) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedSnapshotStageProof
 	}

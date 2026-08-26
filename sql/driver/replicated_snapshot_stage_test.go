@@ -105,7 +105,7 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	epoch := applyReplicatedApplySessionOpen(t, apply, sourceIdentity, 2)
-	document := []byte(`{"id":"bundle-doc","email":"a"}`)
+	document := []byte(`{"email":"a","id":"bundle-doc"}`)
 	baseKey := testReplicatedApplyKey(t, source, document)
 	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["bundle-doc"]`)
 	commandValue := testReplicatedApplyCommandValue(sourceIdentity, epoch, 2, nil)
@@ -200,7 +200,16 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 		&activatedArtifact, activatedCut, replicatedstate.SnapshotArtifactOptions{},
 	)
 	closeErr = activatedCut.Close()
-	if writeErr != nil || closeErr != nil || activatedManifest.Digest != manifest.Digest ||
+	certificate, certificateErr := replicatedstate.OpenSnapshotBase(activation.SnapshotBase)
+	activatedState := activatedManifest.State
+	activatedState.SnapshotBaseDigest = manifest.State.SnapshotBaseDigest
+	activatedEnvelope, activatedEnvelopeErr := replicatedstate.AppendState(nil, activatedState)
+	sourceEnvelope, sourceEnvelopeErr := replicatedstate.AppendState(nil, manifest.State)
+	if writeErr != nil || closeErr != nil || certificateErr != nil ||
+		activatedManifest.State.SnapshotBaseDigest != certificate.Digest ||
+		activatedEnvelopeErr != nil || sourceEnvelopeErr != nil ||
+		!bytes.Equal(activatedEnvelope, sourceEnvelope) ||
+		!equalReplicatedSnapshotImage(activatedManifest, manifest) ||
 		!activatedManifest.Bundle || len(activatedManifest.Relations) != 2 {
 		t.Fatalf("activated bundle re-export=%+v write=%v close=%v",
 			activatedManifest, writeErr, closeErr)

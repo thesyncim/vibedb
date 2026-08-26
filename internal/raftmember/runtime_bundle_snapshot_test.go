@@ -3,17 +3,38 @@ package raftmember
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/orderedkey"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 func TestRuntimeSnapshotStateCoversCompleteRelationBundle(t *testing.T) {
 	walIdentity := testWALIdentity(252)
-	_, wal, _, _ := createWAL(t, walIdentity)
+	walOptions := testWALOptions()
+	walOptions.MaxFileBytes = 256 << 20
+	walOptions.MaxLiveBytes = 2 * raftstore.MinimumReadyLiveBytes
+	walPath := filepath.Join(t.TempDir(), "runtime-bundle-snapshot.wal")
+	index, term := uint64(1), uint64(1)
+	wal, err := raftstore.Create(walPath, walIdentity, testWALKey(), raftstore.Bootstrap{
+		TopologyRecoveryEpoch: testTopologyRecoveryEpoch,
+		Snapshot: &pb.Snapshot{
+			Data: []byte("raftmember-runtime-bundle-snapshot-bootstrap"),
+			Metadata: &pb.SnapshotMetadata{
+				Index: &index, Term: &term,
+				ConfState: &pb.ConfState{Voters: []uint64{walIdentity.MemberID}},
+			},
+		},
+	}, walOptions)
+	if err != nil {
+		t.Fatalf("create runtime bundle WAL: %v", err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
 	_, database, _ := prepareSQLRoot(t, walIdentity, "runtime-bundle-snapshot")
 	session, err := database.NewSession(t.Context())
 	if err != nil {
