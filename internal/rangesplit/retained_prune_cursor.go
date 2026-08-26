@@ -305,6 +305,15 @@ func validPendingPruneKeys(cursor *RetainedPruneCursor) bool {
 		count++
 		keyBytes += uint64(size)
 		raw = raw[size:]
+		if len(raw) < 4 {
+			return false
+		}
+		documentSize := int(binary.LittleEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if documentSize == 0 || documentSize > len(raw) {
+			return false
+		}
+		raw = raw[documentSize:]
 	}
 	return count == cursor.pendingCount && keyBytes == cursor.pendingKeyBytes
 }

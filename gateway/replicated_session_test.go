@@ -31,6 +31,32 @@ type nativeSessionClient struct {
 	proposalMembers     []uint64
 }
 
+func TestExactRelationResolverRejectsUnboundRelationAndEmitsDenseIDs(t *testing.T) {
+	resolver := ExactRelationResolver{Base: 1, Relations: []replication.RelationID{3}}
+	builder := newRelationBundleBuilder(2, 2)
+	if err := resolver.ResolveNative(&builder, NativeMutation{
+		Relation: 1, Kind: replication.MutationDeleteDigestEqual, Key: []byte("base"),
+		ExpectedValueLength: 4, ExpectedValueDigest: replication.Digest{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolver.ResolveNative(&builder, NativeMutation{
+		Relation: 3, Kind: replication.MutationDeleteDigestEqual, Key: []byte("index"),
+		ExpectedValueLength: 5, ExpectedValueDigest: replication.Digest{2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(builder.batches) != 2 || builder.batches[0].Relation != 1 || builder.batches[1].Relation != 3 {
+		t.Fatalf("relation batches = %+v", builder.batches)
+	}
+	builder.reset()
+	if err := resolver.ResolveNative(&builder, NativeMutation{
+		Relation: 2, Kind: replication.MutationDelete, Key: []byte("foreign"),
+	}); !errors.Is(err, ErrNativeBundleBound) {
+		t.Fatalf("unbound relation error = %v", err)
+	}
+}
+
 func (client *nativeSessionClient) DoReplicated(
 	_ context.Context,
 	endpoint ReplicatedEndpoint,

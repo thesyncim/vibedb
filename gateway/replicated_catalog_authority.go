@@ -133,6 +133,12 @@ func nativeResolverBaseRelation(resolver BundleResolver) replication.RelationID 
 		if resolver != nil {
 			return resolver.Relation
 		}
+	case ExactRelationResolver:
+		return resolver.Base
+	case *ExactRelationResolver:
+		if resolver != nil {
+			return resolver.Base
+		}
 	}
 	return 0
 }

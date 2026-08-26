@@ -1848,6 +1848,11 @@ func (m *Machine) planMutations(
 					switch {
 					case !mutation.delete:
 						validation = MutationValidationInvalid
+					case relation.kind == RelationGlobalIndex:
+						// The base row's sealed-away ownership is the topology
+						// authority for its exact colocated index cleanup. Index
+						// keyspace points are independent of the base point.
+						validation = MutationValidationAccept
 					case !found, ownership == MutationValidationWrongShard:
 						validation = MutationValidationAccept
 					case ownership == MutationValidationAccept:

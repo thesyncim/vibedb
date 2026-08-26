@@ -15,6 +15,41 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+func TestRetainedPrunePendingRowsRoundTripExactOldDocuments(t *testing.T) {
+	keys := [][]byte{[]byte("a"), []byte("z")}
+	documents := [][]byte{[]byte(`{"id":"a","v":1}`), []byte(`{"id":"z","v":2}`)}
+	raw := appendPendingPruneRows(nil, keys, documents)
+	pruner := &RetainedPruner{cursor: RetainedPruneCursor{
+		pendingCount: 2, pendingKeyBytes: 2, pendingKeys: raw,
+	}}
+	if !validPendingPruneKeys(&pruner.cursor) {
+		t.Fatal("canonical pending rows rejected")
+	}
+	var workspace RetainedPruneWorkspace
+	batch, err := pruner.openPendingBatch(&workspace)
+	if err != nil || batch.Count != 2 || batch.KeyBytes != 2 ||
+		batch.DocumentBytes != uint64(len(documents[0])+len(documents[1])) {
+		t.Fatalf("batch=%+v err=%v", batch, err)
+	}
+	iterator := batch.Iterator()
+	for index := range keys {
+		if !iterator.Next() || !bytes.Equal(iterator.Key(), keys[index]) ||
+			!bytes.Equal(iterator.Document(), documents[index]) {
+			t.Fatalf("row %d was not byte exact", index)
+		}
+	}
+	corrupt := bytes.Clone(raw)
+	corrupt[len(corrupt)-1] ^= 1
+	pruner.cursor.pendingKeys = corrupt
+	changed, err := pruner.openPendingBatch(&workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Digest == batch.Digest {
+		t.Fatal("old-document change retained the same canonical digest")
+	}
+}
+
 func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(t)
 	pruner, err := newTestRetainedPruner(t, partitioner, certificate, nil)
@@ -53,6 +88,10 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatalf("plan batch=%+v has=%v err=%v close=%v", batch, hasBatch, err, closeErr)
 	}
 	firstKey := bytes.Clone(firstRetainedPruneKey(batch))
+	firstDocument := bytes.Clone(firstRetainedPruneDocument(batch))
+	if len(firstDocument) == 0 || batch.DocumentBytes < uint64(len(firstDocument)) {
+		t.Fatalf("batch lost exact old document: bytes=%d document=%q", batch.DocumentBytes, firstDocument)
+	}
 
 	// Crash before proposal: the persisted awaiting cursor deterministically
 	// replans the same exact batch from the unchanged source publication.
@@ -66,7 +105,8 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 	retry, hasBatch, err := pruner.Advance(snapshot, capture, limits, persist, &workspace)
 	if closeErr := snapshot.Close(); err != nil || closeErr != nil || !hasBatch ||
-		retry.Digest != batch.Digest || !bytes.Equal(firstRetainedPruneKey(retry), firstKey) {
+		retry.Digest != batch.Digest || !bytes.Equal(firstRetainedPruneKey(retry), firstKey) ||
+		!bytes.Equal(firstRetainedPruneDocument(retry), firstDocument) {
 		t.Fatalf("retry batch=%+v has=%v err=%v close=%v", retry, hasBatch, err, closeErr)
 	}
 
@@ -720,4 +760,12 @@ func firstRetainedPruneKey(b RetainedPruneBatch) []byte {
 		return nil
 	}
 	return iterator.Key()
+}
+
+func firstRetainedPruneDocument(b RetainedPruneBatch) []byte {
+	iterator := b.Iterator()
+	if !iterator.Next() {
+		return nil
+	}
+	return iterator.Document()
 }

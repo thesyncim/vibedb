@@ -862,7 +862,8 @@ func validateCommandHeader(command Command) error {
 			}
 			for batchIndex := range command.Batches {
 				for mutationIndex := range command.Batches[batchIndex].Mutations {
-					if command.Batches[batchIndex].Mutations[mutationIndex].Kind != MutationDelete {
+					kind := command.Batches[batchIndex].Mutations[mutationIndex].Kind
+					if kind != MutationDelete && kind != MutationDeleteDigestEqual {
 						return semantic("retained prune carries non-delete mutation")
 					}
 				}
@@ -1566,7 +1567,8 @@ func OpenCommand(src []byte) (CommandView, error) {
 			for batches.Next() {
 				mutations := batches.Batch().Mutations()
 				for mutations.Next() {
-					if mutations.Mutation().Kind != MutationDelete {
+					mutationKind := mutations.Mutation().Kind
+					if mutationKind != MutationDelete && mutationKind != MutationDeleteDigestEqual {
 						return CommandView{}, semantic("retained prune carries non-delete mutation")
 					}
 				}

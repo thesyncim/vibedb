@@ -2,6 +2,7 @@ package replicatedstate
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -134,12 +135,17 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 		MutationValidator: fixture.machine.relations[0].target.Validator,
 	}
 	insideKey, outsideKey := []byte{0x20}, []byte{0x90}
-	seed := fixture.command(t, 1, replication.RelationMutationBatch{
-		Relation: 1, Mutations: []replication.Mutation{
-			{Kind: replication.MutationPut, Key: insideKey, Value: []byte(`{"n":1}`)},
-			{Kind: replication.MutationPut, Key: outsideKey, Value: []byte(`{"n":2}`)},
-		},
-	})
+	insideValue, outsideValue := []byte(`{"email":"in","n":1}`), []byte(`{"email":"out","n":2}`)
+	globalKey, locator := []byte{0x91, 0x01, 'g'}, []byte(`["locator"]`)
+	seed := fixture.command(t, 1,
+		replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{
+			{Kind: replication.MutationPut, Key: insideKey, Value: insideValue},
+			{Kind: replication.MutationPut, Key: outsideKey, Value: outsideValue},
+		}},
+		replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: locator,
+		}}},
+	)
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
 		t.Fatal(err)
 	}
@@ -184,9 +190,39 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 	proof.BatchDigest = replication.Digest{7}
 	prune.ClientSequence, prune.AckThrough = 3, 2
 	prune.Fingerprint, prune.RetainedPrune = proof.BatchDigest, proof
-	prune.Batches[0].Mutations = prune.Batches[0].Mutations[:1]
+	prune.Batches = []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationDeleteDigestEqual, Key: outsideKey,
+			ExpectedValueLength: uint64(len(outsideValue)), ExpectedValueDigest: replication.Digest(sha256.Sum256(outsideValue)),
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationDeleteDigestEqual, Key: globalKey,
+			ExpectedValueLength: uint64(len(locator)), ExpectedValueDigest: replication.Digest(sha256.Sum256(locator)),
+		}}},
+	}
+	prune.Batches[1].Mutations[0].ExpectedValueDigest[0]++
+	conflict := encodeCommand(t, prune)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(6), conflict); err != nil {
+		t.Fatal(err)
+	}
+	if code := bundleCompletionResult(t, fixture.machine, conflict); code != ResultIndexConflict {
+		t.Fatalf("stale global identity result=%d", code)
+	}
+	if _, found, _ := fixture.base.Collection.AppendRaw(nil, outsideKey); !found {
+		t.Fatal("global identity conflict partially deleted base row")
+	}
+	if keys := exactIndexKeys(t, fixture.base.Collection, fixture.index.Name, []byte(`"out"`)); len(keys) != 1 {
+		t.Fatalf("global identity conflict changed local index = %q", keys)
+	}
+	if _, found, _ := fixture.global.Collection.AppendRaw(nil, globalKey); !found {
+		t.Fatal("global identity conflict deleted global row")
+	}
+	proof.BatchDigest = replication.Digest{8}
+	prune.ClientSequence, prune.AckThrough = 4, 3
+	prune.Fingerprint, prune.RetainedPrune = proof.BatchDigest, proof
+	prune.Batches[1].Mutations[0].ExpectedValueDigest = replication.Digest(sha256.Sum256(locator))
 	accepted := encodeCommand(t, prune)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(6), accepted); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(7), accepted); err != nil {
 		t.Fatal(err)
 	}
 	if code := bundleCompletionResult(t, fixture.machine, accepted); code != ResultApplied {
@@ -194,6 +230,12 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 	}
 	if _, found, _ := fixture.base.Collection.AppendRaw(nil, outsideKey); found {
 		t.Fatal("outside sealed row survived retained prune")
+	}
+	if keys := exactIndexKeys(t, fixture.base.Collection, fixture.index.Name, []byte(`"out"`)); len(keys) != 0 {
+		t.Fatalf("orphan local-index rows = %q", keys)
+	}
+	if _, found, _ := fixture.global.Collection.AppendRaw(nil, globalKey); found {
+		t.Fatal("orphan global-index row survived retained prune")
 	}
 	if _, found, _ := fixture.base.Collection.AppendRaw(nil, insideKey); !found {
 		t.Fatal("retained in-range row was deleted")

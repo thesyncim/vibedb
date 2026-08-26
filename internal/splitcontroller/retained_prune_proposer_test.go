@@ -19,8 +19,15 @@ func TestRetainedPrunePendingMatchBindsExactRF3SourceAndDeletes(t *testing.T) {
 	mutations := make([]gateway.NativeMutation, len(keys))
 	encodedMutations := make([]replication.Mutation, len(keys))
 	for index := range keys {
-		mutations[index] = gateway.NativeMutation{Kind: replication.MutationDelete, Key: keys[index]}
-		encodedMutations[index] = replication.Mutation{Kind: replication.MutationDelete, Key: keys[index]}
+		digest := replication.Digest{byte(index + 1)}
+		mutations[index] = gateway.NativeMutation{
+			Relation: 1, Kind: replication.MutationDeleteDigestEqual, Key: keys[index],
+			ExpectedValueLength: uint64(index + 10), ExpectedValueDigest: digest,
+		}
+		encodedMutations[index] = replication.Mutation{
+			Kind: replication.MutationDeleteDigestEqual, Key: keys[index],
+			ExpectedValueLength: uint64(index + 10), ExpectedValueDigest: digest,
+		}
 	}
 	digest := replication.Digest{20}
 	proof := retainedPruneTestProof(digest)
@@ -46,6 +53,42 @@ func TestRetainedPrunePendingMatchBindsExactRF3SourceAndDeletes(t *testing.T) {
 	if RetainedPruneClientID(OperationID{1, 2, 4}) == clientID ||
 		bytes.Equal(RetainedPruneTenant(operation), RetainedPruneTenant(OperationID{1, 2, 4})) {
 		t.Fatal("split operations shared controller identity")
+	}
+}
+
+func TestRetainedPrunePendingMatchBindsCanonicalMultiRelationDeletes(t *testing.T) {
+	fence := retainedPruneTestFence()
+	clientID := RetainedPruneClientID(OperationID{9})
+	proof := retainedPruneTestProof(replication.Digest{8})
+	mutations := []gateway.NativeMutation{
+		{Relation: 1, Kind: replication.MutationDeleteDigestEqual, Key: []byte("base"), ExpectedValueLength: 4, ExpectedValueDigest: replication.Digest{1}},
+		{Relation: 2, Kind: replication.MutationDeleteDigestEqual, Key: []byte("index"), ExpectedValueLength: 5, ExpectedValueDigest: replication.Digest{2}},
+	}
+	raw, err := replication.AppendCommand(nil, replication.Command{
+		Kind: replication.CommandRetainedPrune, AuthorityClass: replication.CommandAuthorityTopology,
+		ClusterID: replication.ID128(fence.Group.ClusterID), ClusterIncarnation: replication.ID128(fence.Group.ClusterIncarnation),
+		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch, Distribution: "docs", Shard: "source",
+		AllocationGeneration: fence.AllocationGeneration, ShardIncarnation: replication.ID128(fence.Group.ShardIncarnation),
+		GroupID: replication.ID128(fence.Group.GroupID), ReplicaSetVersion: fence.Command.ReplicaSetVersion,
+		ActivePolicyGeneration: fence.Command.ActivePolicyGeneration, ProtectionEpoch: fence.Command.ProtectionEpoch,
+		OwnershipEpoch: fence.Command.OwnershipEpoch, SchemaGeneration: fence.Command.SchemaGeneration,
+		RoutingVersion: fence.Command.RoutingVersion, RouteGeneration: fence.Command.RouteGeneration,
+		Tenant: []byte("split-prune"), ClientID: clientID, ClientEpoch: 19, ClientSequence: 2,
+		AckThrough: 1, Fingerprint: proof.BatchDigest, RetryHome: replication.RetryHome{21}, RetainedPrune: proof,
+		Batches: []replication.RelationMutationBatch{
+			{Relation: 1, Mutations: []replication.Mutation{{Kind: mutations[0].Kind, Key: mutations[0].Key, ExpectedValueLength: mutations[0].ExpectedValueLength, ExpectedValueDigest: mutations[0].ExpectedValueDigest}}},
+			{Relation: 2, Mutations: []replication.Mutation{{Kind: mutations[1].Kind, Key: mutations[1].Key, ExpectedValueLength: mutations[1].ExpectedValueLength, ExpectedValueDigest: mutations[1].ExpectedValueDigest}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retainedPrunePendingMatches(raw, fence, clientID, 1, proof, mutations) {
+		t.Fatal("exact multi-relation pending prune rejected")
+	}
+	mutations[1].ExpectedValueLength++
+	if retainedPrunePendingMatches(raw, fence, clientID, 1, proof, mutations) {
+		t.Fatal("changed old index identity accepted")
 	}
 }
 

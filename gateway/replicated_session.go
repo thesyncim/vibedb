@@ -32,11 +32,45 @@ var (
 // index relations are resolved. Key is already the engine's canonical ordered
 // key; Value is exact vibejson for Put and empty for Delete.
 type NativeMutation struct {
+	// Relation optionally names an exact dense relation. Zero selects the base.
+	Relation            replication.RelationID
 	Kind                replication.MutationKind
 	Key                 []byte
 	Value               []byte
 	ExpectedValueLength uint64
 	ExpectedValueDigest replication.Digest
+}
+
+// ExactRelationResolver admits an immutable schema-generation-bound set of
+// dense relation IDs. Relation names never enter the command or Raft log.
+type ExactRelationResolver struct {
+	Base      replication.RelationID
+	Relations []replication.RelationID
+}
+
+func (resolver ExactRelationResolver) ResolveNative(
+	builder *RelationBundleBuilder,
+	mutation NativeMutation,
+) error {
+	relation := mutation.Relation
+	if relation == 0 {
+		relation = resolver.Base
+	}
+	allowed := relation == resolver.Base
+	for index := range resolver.Relations {
+		if resolver.Relations[index] == relation {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return ErrNativeBundleBound
+	}
+	return builder.Add(relation, replication.Mutation{
+		Kind: mutation.Kind, Key: mutation.Key, Value: mutation.Value,
+		ExpectedValueLength: mutation.ExpectedValueLength,
+		ExpectedValueDigest: mutation.ExpectedValueDigest,
+	})
 }
 
 // BundleResolver emits dense, strictly increasing relation IDs for one native
@@ -279,9 +313,9 @@ func NativeSessionMatchesControlBinding(
 	return false
 }
 
-// NativeSessionSupportsMutationBound proves that every single-relation delete
-// batch inside the supplied independent key-count/key-byte ceilings fits the
-// session's configured relation, mutation, and exact canonical command bounds.
+// NativeSessionSupportsMutationBound proves that a worst-case conditional
+// delete batch inside the supplied independent key-count/key-byte ceilings fits
+// the session's configured mutation, relation, and canonical command bounds.
 // It is a cold controller-construction check; the serving hot path remains
 // allocation-free apart from its preallocated command workspace.
 func NativeSessionSupportsMutationBound(
@@ -305,12 +339,14 @@ func NativeSessionSupportsMutationBound(
 	largest := (maxKeyBytes + count - 1) / count
 	dummy := make([]byte, largest)
 	mutations := make([]replication.Mutation, count)
+	digest := replication.Digest{1}
 	remaining := maxKeyBytes
 	for index := range mutations {
 		left := count - index
 		size := (remaining + left - 1) / left
 		mutations[index] = replication.Mutation{
-			Kind: replication.MutationDelete, Key: dummy[:size],
+			Kind: replication.MutationDeleteDigestEqual, Key: dummy[:size],
+			ExpectedValueLength: 1, ExpectedValueDigest: digest,
 		}
 		remaining -= size
 	}
@@ -318,11 +354,67 @@ func NativeSessionSupportsMutationBound(
 		replication.CommandMutationBatch, session.epoch, session.nextSequence, session.ackThrough,
 	)
 	command.Fingerprint = replication.Digest{1}
-	command.Batches = []replication.RelationMutationBatch{{
-		Relation: relation, Mutations: mutations,
-	}}
+	relationCount := min(count, session.bundle.maxRelations)
+	command.Batches = make([]replication.RelationMutationBatch, relationCount)
+	for index := 0; index < relationCount; index++ {
+		start := index * count / relationCount
+		end := (index + 1) * count / relationCount
+		command.Batches[index] = replication.RelationMutationBatch{
+			Relation: replication.RelationID(index + 1), Mutations: mutations[start:end],
+		}
+	}
 	size, err := replication.CommandSize(command)
 	return err == nil && size <= session.maxCommand-replication.RetainedPruneProofBytes
+}
+
+// NativeSessionSupportsExactRelations proves that the session resolver is
+// pinned to precisely the expected schema-generation relation set.
+func NativeSessionSupportsExactRelations(
+	session *NativeSession,
+	base replication.RelationID,
+	relations []replication.RelationID,
+) bool {
+	if session == nil || nativeSessionBaseRelation(session) != base {
+		return false
+	}
+	if len(relations)+1 > session.bundle.maxRelations {
+		return false
+	}
+	if len(relations) == 0 {
+		switch resolver := session.resolver.(type) {
+		case BaseRelationResolver:
+			return resolver.Relation == base
+		case *BaseRelationResolver:
+			return resolver != nil && resolver.Relation == base
+		case ExactRelationResolver:
+			return resolver.Base == base && len(resolver.Relations) == 0
+		case *ExactRelationResolver:
+			return resolver != nil && resolver.Base == base && len(resolver.Relations) == 0
+		default:
+			return false
+		}
+	}
+	var exact ExactRelationResolver
+	switch resolver := session.resolver.(type) {
+	case ExactRelationResolver:
+		exact = resolver
+	case *ExactRelationResolver:
+		if resolver == nil {
+			return false
+		}
+		exact = *resolver
+	default:
+		return false
+	}
+	if exact.Base != base || len(exact.Relations) != len(relations) {
+		return false
+	}
+	for index := range relations {
+		if exact.Relations[index] != relations[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // NativeResult carries a canonical completion. Release is the one lifecycle

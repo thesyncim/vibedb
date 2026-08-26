@@ -28,9 +28,10 @@ var (
 )
 
 const (
-	DefaultRetainedPruneKeys     = 256
-	DefaultRetainedPruneKeyBytes = 1 << 20
-	DefaultRetainedPruneScanRows = 64 << 10
+	DefaultRetainedPruneKeys       = 256
+	DefaultRetainedPruneKeyBytes   = 1 << 20
+	DefaultRetainedPruneBatchBytes = replication.MaxCommandBytes
+	DefaultRetainedPruneScanRows   = 64 << 10
 	// MaxRetainedPruneScanRows is the hard per-advance work ceiling. Callers
 	// may lower it, but cannot turn one controller step into an unbounded scan.
 	MaxRetainedPruneScanRows = 1 << 20
@@ -39,7 +40,10 @@ const (
 type RetainedPruneLimits struct {
 	MaxKeys     int
 	MaxKeyBytes int
-	MaxScanRows uint64
+	// MaxBatchBytes bounds persisted key+old-document frames used to derive
+	// exact index cleanup after restart.
+	MaxBatchBytes int
+	MaxScanRows   uint64
 }
 
 type RetainedPruneCursorPersistence func(raw []byte) error
@@ -49,19 +53,32 @@ type RetainedPruneCursorPersistence func(raw []byte) error
 // command at the certificate's post-seal serving fences. Keys are borrowed
 // from the workspace until its next use.
 type RetainedPruneBatch struct {
-	Digest   [sha256.Size]byte
-	Count    uint64
-	KeyBytes uint64
-	keys     [][]byte
+	Digest        [sha256.Size]byte
+	Count         uint64
+	KeyBytes      uint64
+	DocumentBytes uint64
+	keys          [][]byte
+	documents     [][]byte
 }
 
 func (b RetainedPruneBatch) Iterator() RetainedPruneKeyIterator {
-	return RetainedPruneKeyIterator{keys: b.keys}
+	return RetainedPruneKeyIterator{keys: b.keys, documents: b.documents}
 }
 
 type RetainedPruneKeyIterator struct {
-	keys [][]byte
-	next int
+	keys      [][]byte
+	documents [][]byte
+	next      int
+}
+
+// Document returns the exact canonical old document captured with Key. It is
+// used only to derive schema-generation-bound index deletes and aliases the
+// batch workspace.
+func (i *RetainedPruneKeyIterator) Document() []byte {
+	if i == nil || i.next == 0 || i.next > len(i.documents) {
+		return nil
+	}
+	return i.documents[i.next-1]
 }
 
 func (i *RetainedPruneKeyIterator) Next() bool {
@@ -101,7 +118,9 @@ type RetainedPruneWorkspace struct {
 	document   distribution.DocumentPointWorkspace
 	capture    SourceCaptureWorkspace
 	keys       [][]byte
+	documents  [][]byte
 	arena      []byte
+	docArena   []byte
 	resume     []byte
 	pendingRaw []byte
 	scanRaw    []byte
@@ -291,7 +310,9 @@ func (p *RetainedPruner) Advance(
 		next.pendingApplied = p.cursor.applied
 		next.pendingEntry = p.cursor.entry
 		next.resumeAfter = workspace.resume
-		next.pendingKeys = appendPendingKeys(workspace.pendingRaw[:0], workspace.keys)
+		next.pendingKeys = appendPendingPruneRows(
+			workspace.pendingRaw[:0], workspace.keys, workspace.documents,
+		)
 		if len(next.pendingKeys) > replication.MaxCommandBytes {
 			return RetainedPruneBatch{}, false, ErrRetainedPrune
 		}
@@ -410,14 +431,17 @@ func (p *RetainedPruner) scan(
 	}
 	if cap(workspace.keys) < limits.MaxKeys {
 		workspace.keys = make([][]byte, 0, limits.MaxKeys)
+		workspace.documents = make([][]byte, 0, limits.MaxKeys)
 	} else {
 		workspace.keys = workspace.keys[:0]
+		workspace.documents = workspace.documents[:0]
 	}
 	if cap(workspace.arena) < limits.MaxKeyBytes {
 		workspace.arena = make([]byte, 0, limits.MaxKeyBytes)
 	} else {
 		workspace.arena = workspace.arena[:0]
 	}
+	workspace.docArena = workspace.docArena[:0]
 	workspace.resume = append(workspace.resume[:0], p.cursor.scanAfter...)
 	workspace.scan = retainedPruneScan{
 		partitioner: p.partitioner, workspace: workspace, limits: limits,
@@ -439,11 +463,12 @@ func (p *RetainedPruner) scan(
 	}
 	batch := RetainedPruneBatch{
 		Count: uint64(len(workspace.keys)), KeyBytes: keyBytes,
-		keys: workspace.keys,
+		DocumentBytes: uint64(len(workspace.docArena)),
+		keys:          workspace.keys, documents: workspace.documents,
 	}
 	if batch.Count != 0 {
 		batch.Digest = p.hashPruneBatch(
-			&p.cursor, workspace.resume, workspace.keys, workspace,
+			&p.cursor, workspace.resume, workspace.keys, workspace.documents, workspace,
 		)
 	}
 	return batch, scanned, !stopped && scanErr == nil, nil
@@ -466,9 +491,10 @@ func (s *retainedPruneScan) visitRow(key, document []byte) error {
 	if child < 0 {
 		return ErrRetainedPrune
 	}
+	used := len(workspace.arena) + len(workspace.docArena) + 8*len(workspace.keys)
 	if child != int(s.partitioner.retained) &&
-		(len(workspace.keys) >= s.limits.MaxKeys ||
-			len(key) > s.limits.MaxKeyBytes-len(workspace.arena)) {
+		(len(workspace.keys) >= s.limits.MaxKeys || len(key) > s.limits.MaxKeyBytes-len(workspace.arena) ||
+			used > s.limits.MaxBatchBytes || len(key)+len(document)+8 > s.limits.MaxBatchBytes-used) {
 		if len(workspace.keys) == 0 {
 			return ErrRetainedPrune
 		}
@@ -488,9 +514,15 @@ func (s *retainedPruneScan) visitRow(key, document []byte) error {
 	start := len(workspace.arena)
 	workspace.arena = append(workspace.arena, key...)
 	workspace.keys = append(workspace.keys, workspace.arena[start:len(workspace.arena)])
+	documentStart := len(workspace.docArena)
+	workspace.docArena = append(workspace.docArena, document...)
+	workspace.documents = append(
+		workspace.documents, workspace.docArena[documentStart:len(workspace.docArena)],
+	)
 	s.keyBytes += uint64(len(key))
 	if len(workspace.keys) == s.limits.MaxKeys ||
-		len(workspace.arena) == s.limits.MaxKeyBytes {
+		len(workspace.arena) == s.limits.MaxKeyBytes ||
+		len(workspace.arena)+len(workspace.docArena)+8*len(workspace.keys) >= s.limits.MaxBatchBytes {
 		s.stopped = true
 		return errRetainedPruneScanStop
 	}
@@ -506,10 +538,13 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 	if err != nil || !ok {
 		return errors.Join(ErrRetainedPrune, err)
 	}
-	workspace.keys = workspace.keys[:0]
 	keyBytes := uint64(0)
 	pruneEntry := uint64(len(entry.Transitions)) == p.cursor.pendingCount
 	if pruneEntry {
+		pending, pendingErr := p.openPendingBatch(workspace)
+		if pendingErr != nil {
+			return pendingErr
+		}
 		for index := range entry.Transitions {
 			transition := &entry.Transitions[index]
 			if !transition.BeforeWitness.Present || transition.After != nil {
@@ -520,13 +555,19 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 				pruneEntry = false
 				break
 			}
-			workspace.keys = append(workspace.keys, transition.Key)
+			if index >= len(pending.keys) || index >= len(pending.documents) ||
+				!bytes.Equal(transition.Key, pending.keys[index]) ||
+				transition.BeforeWitness.DocumentBytes != uint32(len(pending.documents[index])) ||
+				transition.BeforeWitness.Digest != sha256.Sum256(pending.documents[index]) {
+				pruneEntry = false
+				break
+			}
 			keyBytes += uint64(len(transition.Key))
 		}
 		if pruneEntry && (keyBytes != p.cursor.pendingKeyBytes ||
 			p.hashPruneBatchAt(
 				p.cursor.pendingApplied, p.cursor.pendingEntry,
-				p.cursor.resumeAfter, workspace.keys, workspace,
+				p.cursor.resumeAfter, pending.keys, pending.documents, workspace,
 			) != p.cursor.pending) {
 			pruneEntry = false
 		}
@@ -556,20 +597,27 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 	return p.persistCursor(next, persist)
 }
 
-func appendPendingKeys(dst []byte, keys [][]byte) []byte {
+func appendPendingPruneRows(dst []byte, keys, documents [][]byte) []byte {
+	if len(keys) != len(documents) {
+		return nil
+	}
 	var size [4]byte
-	for _, key := range keys {
+	for index, key := range keys {
 		binary.LittleEndian.PutUint32(size[:], uint32(len(key)))
 		dst = append(dst, size[:]...)
 		dst = append(dst, key...)
+		binary.LittleEndian.PutUint32(size[:], uint32(len(documents[index])))
+		dst = append(dst, size[:]...)
+		dst = append(dst, documents[index]...)
 	}
 	return dst
 }
 
 func (p *RetainedPruner) openPendingBatch(workspace *RetainedPruneWorkspace) (RetainedPruneBatch, error) {
 	workspace.keys = workspace.keys[:0]
+	workspace.documents = workspace.documents[:0]
 	raw := p.cursor.pendingKeys
-	var keyBytes uint64
+	var keyBytes, documentBytes uint64
 	for len(raw) != 0 {
 		if len(raw) < 4 {
 			return RetainedPruneBatch{}, ErrRetainedPrune
@@ -582,11 +630,25 @@ func (p *RetainedPruner) openPendingBatch(workspace *RetainedPruneWorkspace) (Re
 		workspace.keys = append(workspace.keys, raw[:size])
 		keyBytes += uint64(size)
 		raw = raw[size:]
+		if len(raw) < 4 {
+			return RetainedPruneBatch{}, ErrRetainedPrune
+		}
+		documentSize := int(binary.LittleEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if documentSize == 0 || documentSize > len(raw) {
+			return RetainedPruneBatch{}, ErrRetainedPrune
+		}
+		workspace.documents = append(workspace.documents, raw[:documentSize])
+		documentBytes += uint64(documentSize)
+		raw = raw[documentSize:]
 	}
-	batch := RetainedPruneBatch{Count: uint64(len(workspace.keys)), KeyBytes: keyBytes, keys: workspace.keys}
+	batch := RetainedPruneBatch{
+		Count: uint64(len(workspace.keys)), KeyBytes: keyBytes,
+		DocumentBytes: documentBytes, keys: workspace.keys, documents: workspace.documents,
+	}
 	batch.Digest = p.hashPruneBatchAt(
 		p.cursor.pendingApplied, p.cursor.pendingEntry,
-		p.cursor.resumeAfter, workspace.keys, workspace,
+		p.cursor.resumeAfter, workspace.keys, workspace.documents, workspace,
 	)
 	return batch, nil
 }
@@ -738,10 +800,11 @@ func (p *RetainedPruner) hashPruneBatch(
 	cursor *RetainedPruneCursor,
 	resumeAfter []byte,
 	keys [][]byte,
+	documents [][]byte,
 	workspace *RetainedPruneWorkspace,
 ) [sha256.Size]byte {
 	return p.hashPruneBatchAt(
-		cursor.applied, cursor.entry, resumeAfter, keys, workspace,
+		cursor.applied, cursor.entry, resumeAfter, keys, documents, workspace,
 	)
 }
 
@@ -750,8 +813,12 @@ func (p *RetainedPruner) hashPruneBatchAt(
 	entry [sha256.Size]byte,
 	resumeAfter []byte,
 	keys [][]byte,
+	documents [][]byte,
 	workspace *RetainedPruneWorkspace,
 ) [sha256.Size]byte {
+	if len(keys) != len(documents) {
+		return [sha256.Size]byte{}
+	}
 	h := retainedPruneHasher(workspace)
 	_, _ = h.Write(retainedPruneBatchDomain)
 	_, _ = h.Write(p.cursor.plan[:])
@@ -762,8 +829,9 @@ func (p *RetainedPruner) hashPruneBatchAt(
 	_, _ = h.Write(workspace.fixed[:16])
 	_, _ = h.Write(entry[:])
 	hashTailFrame(h, &workspace.size, resumeAfter)
-	for _, key := range keys {
+	for index, key := range keys {
 		hashTailFrame(h, &workspace.size, key)
+		hashTailFrame(h, &workspace.size, documents[index])
 	}
 	_ = h.Sum(workspace.digest[:0])
 	return workspace.digest
@@ -812,12 +880,16 @@ func normalizeRetainedPruneLimits(limits RetainedPruneLimits) (RetainedPruneLimi
 	if limits.MaxKeyBytes == 0 {
 		limits.MaxKeyBytes = DefaultRetainedPruneKeyBytes
 	}
+	if limits.MaxBatchBytes == 0 {
+		limits.MaxBatchBytes = DefaultRetainedPruneBatchBytes
+	}
 	if limits.MaxScanRows == 0 {
 		limits.MaxScanRows = DefaultRetainedPruneScanRows
 	}
 	if limits.MaxKeys < 1 || limits.MaxKeys > replication.MaxMutations ||
 		limits.MaxKeyBytes < 1 || limits.MaxKeyBytes > replication.MaxCommandBytes ||
-		limits.MaxKeyBytes > replication.MaxCommandBytes-4*limits.MaxKeys ||
+		limits.MaxBatchBytes < 1 || limits.MaxBatchBytes > replication.MaxCommandBytes ||
+		limits.MaxKeyBytes > limits.MaxBatchBytes-8*limits.MaxKeys ||
 		limits.MaxScanRows == 0 || limits.MaxScanRows > MaxRetainedPruneScanRows {
 		return RetainedPruneLimits{}, ErrRetainedPrune
 	}
