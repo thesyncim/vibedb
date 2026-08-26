@@ -162,6 +162,10 @@ type shardActionGrantKey struct {
 
 type StaticShardActionGrants struct{ grants []ShardActionGrant }
 
+type shardActionGrantResolver interface {
+	resolve(OperationID, [32]byte, ShardActionTarget) (ShardActionGrant, bool)
+}
+
 func NewStaticShardActionGrants(grants []ShardActionGrant) (*StaticShardActionGrants, error) {
 	if len(grants) == 0 || len(grants) > AbsoluteMaxShardActionGrants {
 		return nil, ErrRemoteExecution
@@ -257,10 +261,10 @@ func appendFixedShardActionTarget(dst []byte, target ShardActionTarget) []byte {
 // ShardActionRuntimeDispatcher is the concrete exact-operation runtime. It
 // performs an allocation-free grant lookup, obtains a fresh coherent cut, and
 // dispatches only a granted action to the pre-bound local capability.
-type ShardActionRuntimeDispatcher struct{ grants *StaticShardActionGrants }
+type ShardActionRuntimeDispatcher struct{ grants shardActionGrantResolver }
 
 func NewShardActionRuntimeDispatcher(
-	grants *StaticShardActionGrants,
+	grants shardActionGrantResolver,
 ) (*ShardActionRuntimeDispatcher, error) {
 	if grants == nil {
 		return nil, ErrRemoteExecution
