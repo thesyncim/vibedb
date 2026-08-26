@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -184,7 +185,7 @@ func (authority *ReplicatedCatalogAuthority) Read(ctx context.Context) (*Snapsho
 	if err != nil {
 		return nil, err
 	}
-	return authority.publishReadCatalogCut(cut.snapshot, cut.head)
+	return authority.publishReadCatalogCut(ctx, cut.snapshot, cut.head)
 }
 
 func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context) (replicatedCatalogCut, error) {
@@ -216,7 +217,9 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 	return replicatedCatalogCut{head: result.Value, witness: witnessResult.Value, snapshot: snapshot}, nil
 }
 
-func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(snapshot *Snapshot, raw []byte) (*Snapshot, error) {
+func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(
+	ctx context.Context, snapshot *Snapshot, raw []byte,
+) (*Snapshot, error) {
 	current := authority.holder.Current()
 	if current == nil {
 		if !authority.holder.PublishNewer(snapshot) {
@@ -224,7 +227,11 @@ func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(snapshot *Sna
 		}
 	} else if snapshot.Generation() > current.Generation() {
 		if err := authority.holder.publishNewerChecked(snapshot); err != nil {
-			return nil, err
+			if replacementErr := authority.publishCertifiedReplicaReplacementRead(
+				ctx, current, snapshot, raw,
+			); replacementErr != nil {
+				return nil, errors.Join(err, replacementErr)
+			}
 		}
 	} else if snapshot.Generation() < current.Generation() {
 		return nil, ErrStaleGeneration
@@ -235,6 +242,100 @@ func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(snapshot *Sna
 		}
 	}
 	return authority.holder.Current(), nil
+}
+
+// publishCertifiedReplicaReplacementRead is the only exceptional refresh
+// path. Generic catalog transition validation remains unchanged: an adjacent
+// generation with one apparent roster change must also carry the exact
+// replicated receipt, validate both head bytes, reproduce the certified next
+// snapshot, and enter CatalogHolder through its grant-aware transition.
+func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementRead(
+	ctx context.Context, current, next *Snapshot, nextRaw []byte,
+) error {
+	if authority == nil || ctx == nil || current == nil || next == nil ||
+		current.Generation() == ^uint64(0) ||
+		next.Generation() != current.Generation()+1 {
+		return ErrReplicatedCatalogConflict
+	}
+	group, ok := replicaReplacementCandidateGroup(current, next)
+	if !ok {
+		return ErrReplicatedCatalogConflict
+	}
+	key, _ := replicatedMembershipGrantKeys(group)
+	result, err := authority.readRaw(
+		ctx, key[:], uint32(maxReplicatedReplicaReplacementReceiptBytes),
+	)
+	if err != nil || !result.Found {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	currentRaw, err := appendReplicatedCatalogDocument(
+		nil, current, maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	grant, err := validateReplicaReplacementReceipt(
+		result.Value, currentRaw, nextRaw, current.Generation(), next.Generation(),
+	)
+	if err != nil || grant.Group != group {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	certified, err := advanceCatalogStateReplicaReplacement(current, next, grant)
+	if err != nil {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	certifiedRaw, err := appendReplicatedCatalogDocument(
+		nil, certified, maxReplicatedCatalogBytes,
+	)
+	if err != nil || !bytes.Equal(certifiedRaw, nextRaw) {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	if err = authority.holder.publishReplicaReplacementAfter(
+		current.Generation(), certified, grant,
+	); err == nil {
+		return nil
+	}
+	// Concurrent refreshes may both validate the same immutable receipt. The
+	// loser accepts only the byte-identical generation already installed.
+	installed := authority.holder.Current()
+	if installed == nil || installed.Generation() != next.Generation() {
+		return err
+	}
+	installedRaw, encodeErr := appendReplicatedCatalogDocument(
+		nil, installed, maxReplicatedCatalogBytes,
+	)
+	if encodeErr != nil || !bytes.Equal(installedRaw, nextRaw) {
+		return errors.Join(err, encodeErr, ErrReplicatedCatalogConflict)
+	}
+	return nil
+}
+
+func replicaReplacementCandidateGroup(current, next *Snapshot) (raftmember.GroupKey, bool) {
+	if current == nil || next == nil || len(current.replicatedShards) != len(next.replicatedShards) {
+		return raftmember.GroupKey{}, false
+	}
+	var group raftmember.GroupKey
+	found := false
+	for _, old := range current.replicatedShards {
+		manifest := current.config.Manifests[old.manifest]
+		metadata, ok := manifest.ShardMetadataAt(int(old.shard))
+		if !ok {
+			return raftmember.GroupKey{}, false
+		}
+		candidate, ok := next.replicatedShardAt(manifest.Distribution(), metadata.ID)
+		if !ok || candidate.group != old.group || candidate.allocation != old.allocation {
+			return raftmember.GroupKey{}, false
+		}
+		if candidate.command.ReplicaSetVersion == old.command.ReplicaSetVersion &&
+			sameReplicatedCatalogRoster(current, old, next, candidate) {
+			continue
+		}
+		if found {
+			return raftmember.GroupKey{}, false
+		}
+		group, found = old.group, true
+	}
+	return group, found
 }
 
 func appendReplicatedCatalogHeadWitness(dst []byte, generation uint64, head []byte) ([]byte, error) {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 )
 
 type catalogAuthorityClient struct {
+	mu                sync.Mutex
 	state             shardservice.ReplicatedMemberState
 	rows              map[string][]byte
 	applied           uint64
@@ -90,6 +92,7 @@ func TestReplicatedMembershipGrantCatalogWitnessClosesStaleInterleaving(t *testi
 
 func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testing.T) {
 	authority, client, current := newCatalogAuthorityFixture(t)
+	observer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x80)
 	_, _, descriptor := testReplicatedCatalogInput(t)
 	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
 	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
@@ -140,6 +143,10 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	if !errors.Is(err, ErrReplicatedCatalogPending) || !authority.session.Status().Pending {
 		t.Fatalf("unknown final publication err=%v pending=%v", err, authority.session.Status().Pending)
 	}
+	if refreshed, refreshErr := observer.Read(context.Background()); refreshErr != nil ||
+		refreshed.Generation() != next.Generation() {
+		t.Fatalf("observer refresh across unknown response=%v err=%v", refreshed, refreshErr)
+	}
 	retained := authority.session.PendingCommand()
 	client.holdUnknown = false
 	if err = authority.RetryPending(context.Background()); err != nil {
@@ -152,21 +159,155 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 		t.Fatalf("published generation=%d want=%d",
 			authority.holder.Current().Generation(), next.Generation())
 	}
-	if _, found := client.rows[string(recordKey[:])]; found {
-		t.Fatal("completed replacement retained its grant record")
+	receiptRaw, found := client.rows[string(recordKey[:])]
+	if !found {
+		t.Fatal("completed replacement did not retain its bounded receipt")
+	}
+	receipt, receiptErr := openReplicaReplacementReceipt(receiptRaw)
+	if receiptErr != nil || receipt.Grant != grant ||
+		receipt.OldGeneration != current.Generation() ||
+		receipt.NewGeneration != next.Generation() {
+		t.Fatalf("replacement receipt=%+v err=%v", receipt, receiptErr)
 	}
 	remainingPage, found := client.rows[string(pageKey[:])]
 	if !found {
 		t.Fatal("shared grant occupancy page was deleted")
 	}
 	remaining, err := openReplicatedMembershipGrantPage(pageKey[1], remainingPage)
-	if err != nil || len(remaining) != 1 || remaining[0] != other {
+	if err != nil || len(remaining) != 2 || remaining[0] != groups[0] ||
+		remaining[1] != groups[1] {
 		t.Fatalf("remaining occupancy groups=%+v err=%v", remaining, err)
 	}
 	if grantResult, found, readErr := authority.ReadMembershipGrant(
 		context.Background(), grant.Group,
 	); readErr != nil || found || grantResult != (membershipgrant.Grant{}) {
 		t.Fatalf("grant after final publication=%+v found=%v err=%v", grantResult, found, readErr)
+	}
+}
+
+func TestReplicaReplacementReceiptLetsConcurrentStaleGatewaysRefresh(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	first := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x81)
+	second := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x82)
+	_, _, descriptor := testReplicatedCatalogInput(t)
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, current.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(
+		context.Background(), current.Generation(), next, grant,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	wait.Add(2)
+	errorsByGateway := make([]error, 2)
+	for index, peer := range []*ReplicatedCatalogAuthority{first, second} {
+		go func(index int, peer *ReplicatedCatalogAuthority) {
+			defer wait.Done()
+			<-start
+			refreshed, refreshErr := peer.Read(context.Background())
+			if refreshErr == nil && refreshed.Generation() != next.Generation() {
+				refreshErr = ErrReplicatedCatalogConflict
+			}
+			errorsByGateway[index] = refreshErr
+		}(index, peer)
+	}
+	close(start)
+	wait.Wait()
+	for index, refreshErr := range errorsByGateway {
+		if refreshErr != nil {
+			t.Fatalf("gateway %d refresh=%v", index, refreshErr)
+		}
+	}
+}
+
+func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(map[string][]byte, [33]byte)
+	}{
+		{name: "missing", mutate: func(rows map[string][]byte, key [33]byte) {
+			delete(rows, string(key[:]))
+		}},
+		{name: "corrupt", mutate: func(rows map[string][]byte, key [33]byte) {
+			raw := append([]byte(nil), rows[string(key[:])]...)
+			raw[len(raw)-2] ^= 1
+			rows[string(key[:])] = raw
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			authority, client, current := newCatalogAuthorityFixture(t)
+			peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x83)
+			_, _, descriptor := testReplicatedCatalogInput(t)
+			grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+			if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+				t.Fatal(err)
+			}
+			next, err := BuildReplicaReplacementTransition(
+				current, manifest, current.Generation()+1, grant, target, command,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = authority.PublishReplicaReplacement(
+				context.Background(), current.Generation(), next, grant,
+			); err != nil {
+				t.Fatal(err)
+			}
+			recordKey, _ := replicatedMembershipGrantKeys(grant.Group)
+			testCase.mutate(client.rows, recordKey)
+			if _, err = peer.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+				t.Fatalf("refresh without exact receipt=%v", err)
+			}
+			if peer.holder.Current().Generation() != current.Generation() {
+				t.Fatal("failed receipt validation advanced stale holder")
+			}
+		})
+	}
+}
+
+func TestReplicaReplacementReceiptIsCanonicalAndBounded(t *testing.T) {
+	if maxReplicatedMembershipLifecycleBytes != 18<<20 {
+		t.Fatal("membership lifecycle retention bound drifted")
+	}
+	authority, client, current := newCatalogAuthorityFixture(t)
+	_, _, descriptor := testReplicatedCatalogInput(t)
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, current.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(
+		context.Background(), current.Generation(), next, grant,
+	); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := replicatedMembershipGrantKeys(grant.Group)
+	raw := client.rows[string(key[:])]
+	receipt, err := openReplicaReplacementReceipt(raw)
+	if err != nil || len(raw) == 0 || len(raw) > maxReplicatedReplicaReplacementReceiptBytes {
+		t.Fatalf("receipt bytes=%d value=%+v err=%v", len(raw), receipt, err)
+	}
+	canonical, err := appendReplicaReplacementReceiptRecord(nil, receipt)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		t.Fatalf("receipt is not canonical: err=%v", err)
+	}
+	if _, err = openReplicaReplacementReceipt(append(append([]byte(nil), raw...), ' ')); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("trailing receipt=%v", err)
 	}
 }
 
@@ -357,24 +498,34 @@ func (client *catalogAuthorityClient) DoReplicated(
 		return nil, errors.New("catalog request escaped exact topology authority")
 	}
 	if request.Operation == shardservice.ReplicatedProbe {
+		client.mu.Lock()
+		state := client.state
+		client.mu.Unlock()
 		return &shardservice.ReplicatedResponse{
-			Kind: shardservice.ReplicatedHandshake, HasState: true, State: client.state,
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
 		}, nil
 	}
 	if request.Operation == shardservice.ReplicatedReadLeader ||
 		request.Operation == shardservice.ReplicatedReadFollower {
+		client.mu.Lock()
 		client.readMaximums = append(client.readMaximums, request.MaxValueBytes)
-		if client.onRead != nil {
-			client.onRead(request.Key)
+		onRead := client.onRead
+		client.mu.Unlock()
+		if onRead != nil {
+			onRead(request.Key)
 		}
+		client.mu.Lock()
 		value, found := client.rows[string(request.Key)]
+		value = append([]byte(nil), value...)
+		state := client.state
+		client.mu.Unlock()
 		kind := shardservice.ReplicatedReadMissing
 		if found {
 			kind = shardservice.ReplicatedReadFound
 		}
 		return &shardservice.ReplicatedResponse{
-			Kind: kind, HasState: true, State: client.state,
-			ReadApplied: client.state.Applied, Value: append([]byte(nil), value...),
+			Kind: kind, HasState: true, State: state,
+			ReadApplied: state.Applied, Value: value,
 		}, nil
 	}
 	command, err := replication.OpenCommand(request.Command)
@@ -581,6 +732,41 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		t.Fatal(err)
 	}
 	return authority, client, current
+}
+
+func newCatalogAuthorityPeer(t *testing.T, source *ReplicatedCatalogAuthority,
+	holder *CatalogHolder, clientByte byte) *ReplicatedCatalogAuthority {
+	t.Helper()
+	if source == nil || holder == nil {
+		t.Fatal("invalid catalog authority peer input")
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: source.executor, Route: source.route,
+		Distribution: string(ReplicatedCatalogDistribution), Shard: string(ReplicatedCatalogShard),
+		Tenant: []byte("control-plane"), ClientID: replication.ID128{clientByte},
+		Resolver:           BaseRelationResolver{Relation: source.relation},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 4,
+		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(context.Background(), source.authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(ctx, 1<<50); err != nil {
+		t.Fatal(err)
+	}
+	peer, err := NewReplicatedCatalogAuthority(ReplicatedCatalogAuthorityOptions{
+		Executor: source.executor, Route: source.route, Relation: source.relation,
+		Holder: holder, Session: session, Authority: source.authority,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return peer
 }
 
 func TestReplicatedCatalogAuthorityPublishUnknownRetryConflictAndRefresh(t *testing.T) {

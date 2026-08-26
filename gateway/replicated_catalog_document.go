@@ -40,6 +40,10 @@ var (
 	replicatedCatalogHeadWitnessDocumentID = [...]byte{
 		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'w', 'i', 't', 'n', 'e', 's', 's',
 	}
+	replicatedReplicaReplacementReceiptDocumentID = [...]byte{
+		'c', 'a', 't', 'a', 'l', 'o', 'g', '/',
+		'r', 'e', 'p', 'l', 'a', 'c', 'e', 'm', 'e', 'n', 't',
+	}
 	replicatedOperationDirectoryDocumentID = [...]byte{
 		'o', 'p', 'e', 'r', 'a', 't', 'i', 'o', 'n', '/',
 		'd', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y',
