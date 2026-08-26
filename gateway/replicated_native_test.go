@@ -1631,6 +1631,9 @@ func testReplicatedRouteCommand(
 			RelationManifestDigest: [32]byte{1},
 			RoutingVersion:         1, RouteGeneration: 1,
 		},
+		RangeIdentity:        replication.Digest{0x71},
+		LineageDigest:        replication.Digest{0x72},
+		ForwardingRuleDigest: replication.Digest{0x73},
 		Replicas: []ReplicatedEndpoint{
 			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{1}, NodeIncarnation: 11, NativeEndpoint: "n1", Address: "m1"},
 			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{2}, NodeIncarnation: 12, NativeEndpoint: "n2", Address: "m2"},
