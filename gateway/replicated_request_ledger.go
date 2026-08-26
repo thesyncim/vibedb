@@ -475,6 +475,8 @@ type DurableRequestOutcome struct {
 	CatalogGeneration uint64
 	ShardsFanned      int
 	Result            []byte
+	TerminalRevision  uint64
+	ResultDigest      replication.Digest
 	AckToken          DurableRequestAckToken
 	Acknowledged      bool
 }

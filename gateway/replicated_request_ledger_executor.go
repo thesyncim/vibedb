@@ -646,6 +646,8 @@ func durableRequestOutcome(entry DurableRequestLedgerEntry) (DurableRequestOutco
 		CatalogGeneration: result.CatalogGeneration,
 		ShardsFanned:      int(result.ShardsFanned),
 		Result:            bytes.Clone(result.Payload),
+		TerminalRevision:  entry.Revision,
+		ResultDigest:      replication.Digest(requestledger.ResultDigest(entry.Terminal.Result)),
 		AckToken:          entry.AckToken,
 		Acknowledged:      entry.State == DurableRequestLedgerAcked,
 	}, nil
