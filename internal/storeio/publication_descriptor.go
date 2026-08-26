@@ -22,7 +22,7 @@ func EncodePublicationDescriptor(dst []byte, mutations []PublicationMutation) ([
 		used += 12 + len(m.Key) + len(m.Value)
 	}
 	length := (used + 4095) &^ 4095
-	if len(mutations) == 0 || length > len(dst) {
+	if length > len(dst) {
 		return nil, fmt.Errorf("%w: publication descriptor bounds", ErrInvalidWrite)
 	}
 	b := dst[:length]
@@ -63,9 +63,6 @@ func OpenPublicationDescriptor(src []byte) (PublicationDescriptorView, error) {
 		return PublicationDescriptorView{}, ErrGenerationMigrationManifestCorrupt
 	}
 	v := PublicationDescriptorView{image: src, count: int(binary.LittleEndian.Uint32(src[12:16])), cursor: publicationDescriptorHeader}
-	if v.count == 0 {
-		return PublicationDescriptorView{}, ErrGenerationMigrationManifestCorrupt
-	}
 	probe := v
 	for {
 		_, ok, err := probe.Next()

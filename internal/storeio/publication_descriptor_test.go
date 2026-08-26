@@ -31,6 +31,20 @@ func TestPublicationDescriptorCanonicalBinaryBatch(t *testing.T) {
 	}
 }
 
+func TestPublicationDescriptorCanonicalNoop(t *testing.T) {
+	b, err := EncodePublicationDescriptor(make([]byte, 4096), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := OpenPublicationDescriptor(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := v.Next(); err != nil || ok {
+		t.Fatalf("noop terminal = %v,%v", ok, err)
+	}
+}
+
 func BenchmarkPublicationDescriptorEncode(b *testing.B) {
 	mutations := make([]PublicationMutation, 64)
 	var keys [64][16]byte
