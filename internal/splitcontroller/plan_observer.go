@@ -23,15 +23,17 @@ var ErrPlanObservation = errors.New("splitcontroller: invalid coherent plan obse
 // endpoints that the client must contact; a client must authenticate every
 // peer, impose a deadline, and return only after its bounded read has settled.
 type PlanObservationRequest struct {
-	Operation         OperationID
-	CatalogGeneration uint64
-	CatalogDigest     [sha256.Size]byte
-	RequestDigest     [sha256.Size]byte
-	Distribution      distribution.DistributionName
-	Shard             distribution.ShardID
-	Allocation        distribution.ShardAllocationGeneration
-	Child             uint8
-	ControlEndpoints  []distribution.EndpointID
+	Operation         OperationID                            `json:"operation"`
+	CatalogGeneration uint64                                 `json:"catalog_generation"`
+	CatalogDigest     [sha256.Size]byte                      `json:"catalog_digest"`
+	RequestDigest     [sha256.Size]byte                      `json:"request_digest"`
+	Distribution      distribution.DistributionName          `json:"distribution"`
+	Shard             distribution.ShardID                   `json:"shard"`
+	Allocation        distribution.ShardAllocationGeneration `json:"allocation"`
+	Child             uint8                                  `json:"child"`
+	Group             raftmember.GroupKey                    `json:"group"`
+	Command           raftservice.CommandFence               `json:"command"`
+	ControlEndpoints  []distribution.EndpointID              `json:"control_endpoints"`
 }
 
 // SourcePlanObservation is one detached cut read by the source owner lane.
@@ -40,11 +42,15 @@ type SourcePlanObservation struct {
 	RequestDigest [sha256.Size]byte
 	State         replicatedstate.State
 	Status        raftmember.RuntimeStatus
-	CaptureHead   uint64
-	Artifacts     *rangesplit.ChildArtifactSet
-	Tail          *rangesplit.TailCursor
-	Certificate   *rangesplit.CutoverCertificate
-	Prune         *rangesplit.RetainedPruneCursor
+	// Serving is the production network proof from the exact serialized owner
+	// lane. Status remains for local observers; authenticated services require
+	// Serving and the coordinator derives Status from it.
+	Serving     raftservice.ServingState
+	CaptureHead uint64
+	Artifacts   *rangesplit.ChildArtifactSet
+	Tail        *rangesplit.TailCursor
+	Certificate *rangesplit.CutoverCertificate
+	Prune       *rangesplit.RetainedPruneCursor
 }
 
 // ChildPlanObservation is one destination's durable stage/runtime cut. A nil
@@ -200,6 +206,9 @@ func (observer *CoherentPlanObserver) observeAttempt(
 				return Observation{}, false, ErrPlanObservation
 			}
 			observed.SourceState, observed.SourceStatus = cut.State, cut.Status
+			if cut.Serving.Identity != (raftmember.RuntimeIdentity{}) {
+				observed.SourceStatus = cut.Serving.Status
+			}
 			observed.CaptureHead = cut.CaptureHead
 			observed.Artifacts, observed.Tail = cloneObservationPointer(cut.Artifacts), cloneObservationPointer(cut.Tail)
 			observed.Certificate, observed.Prune = cloneObservationPointer(cut.Certificate), cloneObservationPointer(cut.Prune)
@@ -324,6 +333,28 @@ func newPlanObservationRequest(
 		Shard: shard, Allocation: allocation, Child: child,
 		ControlEndpoints: append([]distribution.EndpointID(nil), endpoints...),
 	}
+	if route, found := catalog.ResolveReplicatedRoute(
+		distributionName, shard, make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+	); found && route.AllocationGeneration == uint64(allocation) {
+		request.Group, request.Command = route.Group, route.Command
+	} else if child != plan.retained {
+		target := plan.targets[child]
+		request.Group = raftmember.GroupKey{
+			ClusterID: target.WAL.ClusterID, ClusterIncarnation: target.WAL.ClusterIncarnation,
+			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
+			ShardIncarnation:      target.WAL.ShardIncarnation, GroupID: target.WAL.GroupID,
+		}
+		request.Command = raftservice.CommandFence{
+			ReplicaSetVersion:      1,
+			ActivePolicyGeneration: target.Authority.ActivePolicyGeneration,
+			ProtectionEpoch:        target.Authority.ProtectionEpoch,
+			OwnershipEpoch:         target.Authority.OwnershipEpoch,
+			SchemaGeneration:       target.Authority.SchemaGeneration,
+			RelationManifestDigest: target.SQL.RelationManifestDigest,
+			RoutingVersion:         target.Authority.RoutingVersion,
+			RouteGeneration:        target.Authority.RouteGeneration,
+		}
+	}
 	request.RequestDigest = planObservationRequestDigest(request)
 	return request
 }
@@ -333,11 +364,25 @@ func planObservationRequestDigest(request PlanObservationRequest) [sha256.Size]b
 	_, _ = hash.Write([]byte("vibedb/splitcontroller/plan-observation\x00"))
 	_, _ = hash.Write(request.Operation[:])
 	_, _ = hash.Write(request.CatalogDigest[:])
+	_, _ = hash.Write(request.Group.ClusterID[:])
+	_, _ = hash.Write(request.Group.ClusterIncarnation[:])
+	_, _ = hash.Write(request.Group.ShardIncarnation[:])
+	_, _ = hash.Write(request.Group.GroupID[:])
+	_, _ = hash.Write(request.Command.RelationManifestDigest[:])
 	var scalar [8]byte
 	binary.LittleEndian.PutUint64(scalar[:], request.CatalogGeneration)
 	_, _ = hash.Write(scalar[:])
 	binary.LittleEndian.PutUint64(scalar[:], uint64(request.Allocation))
 	_, _ = hash.Write(scalar[:])
+	for _, value := range [...]uint64{
+		request.Group.TopologyRecoveryEpoch, request.Command.ReplicaSetVersion,
+		request.Command.ActivePolicyGeneration, request.Command.ProtectionEpoch,
+		request.Command.OwnershipEpoch, request.Command.SchemaGeneration,
+		request.Command.RoutingVersion, request.Command.RouteGeneration,
+	} {
+		binary.LittleEndian.PutUint64(scalar[:], value)
+		_, _ = hash.Write(scalar[:])
+	}
 	_, _ = hash.Write([]byte{request.Child})
 	writeObservationString(hash, string(request.Distribution), &scalar)
 	writeObservationString(hash, string(request.Shard), &scalar)
