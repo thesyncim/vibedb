@@ -67,6 +67,7 @@ type devClusterManifest struct {
 	Roots               string             `json:"roots"`
 	AuthorizationPolicy string             `json:"authorization_policy"`
 	HotShardCapacity    string             `json:"hot_shard_capacity"`
+	DurableAckKey       string             `json:"durable_ack_key"`
 	GatewayNode         string             `json:"gateway_node"`
 	Members             []devClusterMember `json:"members"`
 	LedgerMembers       []devClusterMember `json:"ledger_members"`
@@ -314,6 +315,19 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	if err := writeDevPolicy(policyPath, nodes); err != nil {
 		return devClusterManifest{}, err
 	}
+	durableAckKeyPath := filepath.Join(options.root, "durable-ack-key")
+	var durableAckKey [sha256.Size]byte
+	if _, err := io.ReadFull(cryptorand.Reader, durableAckKey[:]); err != nil {
+		return devClusterManifest{}, err
+	}
+	var durableAckKeyHex [hex.EncodedLen(sha256.Size)]byte
+	hex.Encode(durableAckKeyHex[:], durableAckKey[:])
+	clear(durableAckKey[:])
+	if err := writeDevExclusive(durableAckKeyPath, durableAckKeyHex[:], 0o600); err != nil {
+		clear(durableAckKeyHex[:])
+		return devClusterManifest{}, err
+	}
+	clear(durableAckKeyHex[:])
 	keySource := filepath.Join(options.root, "wal-key-source")
 	keyMaterial := make([]byte, 32)
 	if _, err := io.ReadFull(cryptorand.Reader, keyMaterial); err != nil {
@@ -324,7 +338,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	}
 	clear(keyMaterial)
 	gatewayIndex := options.replicas
-	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas)}
+	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), DurableAckKey: durableAckKeyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas)}
 	catalogPrepareMembers := make([]devPrepareMember, options.replicas)
 	ledgerPrepareMembers := make([]devPrepareMember, options.replicas)
 	for i := 0; i < options.replicas; i++ {
@@ -630,7 +644,7 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 			return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
 		}
 	}
-	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
+	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-durable-ack-key", m.DurableAckKey, "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
 	for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers} {
 		for _, member := range members {
 			args = append(args, "-shard-peer", member.Native+"="+member.Node)
@@ -908,7 +922,7 @@ func validDevManifest(m devClusterManifest, root string) bool {
 	if _, err := decodeDev16(m.GatewayNode); err != nil {
 		return false
 	}
-	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity}
+	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity, m.DurableAckKey}
 	addresses := map[string]struct{}{m.ClientEndpoint: {}}
 	nodes := map[string]struct{}{m.GatewayNode: {}}
 	stores := make(map[string]struct{}, len(m.Members)+len(m.LedgerMembers))
