@@ -71,3 +71,26 @@ func FuzzCompatibilitySymmetric(f *testing.F) {
 		}
 	})
 }
+
+func FuzzOpenDiskIdentityCanonical(f *testing.F) {
+	canonical, err := AppendDiskIdentity(nil, CurrentDiskIdentity())
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(canonical)
+	f.Add([]byte(nil))
+	f.Add(canonical[:DiskIdentityBytes-1])
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		identity, err := OpenDiskIdentity(raw)
+		if err != nil {
+			return
+		}
+		reencoded, err := AppendDiskIdentity(nil, identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(reencoded, raw) {
+			t.Fatalf("accepted noncanonical disk identity\n got %x\nwant %x", raw, reencoded)
+		}
+	})
+}

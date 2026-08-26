@@ -79,7 +79,9 @@ func TestProfileRequiresOnlyProvidedCapabilities(t *testing.T) {
 func TestCurrentProfileIsExactAndImmutableByValue(t *testing.T) {
 	profile := CurrentProfile()
 	if !profile.Valid() || !profile.Provided.Has(CapabilityRaftTransport) ||
-		!profile.Required.Has(CapabilityRaftTransport) {
+		!profile.Required.Has(CapabilityRaftTransport) ||
+		!profile.Provided.Has(CapabilityGatewayShardTransport) ||
+		!profile.Required.Has(CapabilityGatewayShardTransport) {
 		t.Fatalf("invalid current profile: %#v", profile)
 	}
 	profile.WireGrammar = GrammarID{}
@@ -273,6 +275,25 @@ func TestDiskAdoptionFailsBeforeMutationOrRepair(t *testing.T) {
 	}
 }
 
+func TestDiskIdentityCanonicalRoundTrip(t *testing.T) {
+	identity := DiskIdentity{Grammar: testGrammar(9), Required: testCapabilities(0, 64, 255)}
+	prefix := []byte{1, 2, 3}
+	encoded, err := AppendDiskIdentity(append([]byte(nil), prefix...), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != len(prefix)+DiskIdentityBytes || !bytes.Equal(encoded[:len(prefix)], prefix) {
+		t.Fatalf("encoded identity length/prefix = %d/%x", len(encoded), encoded[:len(prefix)])
+	}
+	opened, err := OpenDiskIdentity(encoded[len(prefix):])
+	if err != nil || opened != identity {
+		t.Fatalf("opened identity = %#v, %v", opened, err)
+	}
+	if _, err := OpenDiskIdentity(encoded[len(prefix)+1:]); !errors.Is(err, ErrInvalidDiskIdentity) {
+		t.Fatalf("truncated identity = %v", err)
+	}
+}
+
 func TestDiskAdoptionPassesExactPermitAndMutationError(t *testing.T) {
 	profile := testProfile()
 	gate, err := NewCurrentDiskGate(profile)
@@ -319,6 +340,24 @@ func TestBuildGateHotPathsAllocateZero(t *testing.T) {
 	}
 	gate, _ := NewCurrentDiskGate(profile)
 	target := &recordingDiskTarget{identity: DiskIdentity{Grammar: profile.DiskGrammar, Required: profile.Required}}
+	identityBytes := make([]byte, 0, DiskIdentityBytes)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		out, err := AppendDiskIdentity(identityBytes[:0], target.identity)
+		if err != nil || len(out) != DiskIdentityBytes {
+			panic("disk identity append failed")
+		}
+	}); allocations != 0 {
+		t.Fatalf("disk identity append allocations = %v", allocations)
+	}
+	identityBytes, _ = AppendDiskIdentity(identityBytes[:0], target.identity)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		opened, err := OpenDiskIdentity(identityBytes)
+		if err != nil || opened != target.identity {
+			panic("disk identity open failed")
+		}
+	}); allocations != 0 {
+		t.Fatalf("disk identity open allocations = %v", allocations)
+	}
 	if allocations := testing.AllocsPerRun(1000, func() {
 		if err := AdoptDisk(&gate, target); err != nil {
 			panic("adoption failed")

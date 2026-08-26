@@ -1,6 +1,14 @@
 package buildgate
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+	"math"
+)
+
+// DiskIdentityBytes is the fixed canonical disk-identity width: one opaque
+// grammar followed by the fixed capability bitmap in big-endian word order.
+const DiskIdentityBytes = len(GrammarID{}) + capabilitySetBytes
 
 var (
 	ErrInvalidDiskIdentity = errors.New("buildgate: invalid disk identity")
@@ -15,6 +23,42 @@ type DiskIdentity struct {
 }
 
 func (identity DiskIdentity) Valid() bool { return identity.Grammar.Valid() }
+
+// AppendDiskIdentity appends the canonical fixed-width identity. dst is
+// unchanged when identity is invalid or its growth would overflow.
+func AppendDiskIdentity(dst []byte, identity DiskIdentity) ([]byte, error) {
+	if !identity.Valid() || len(dst) > math.MaxInt-DiskIdentityBytes {
+		return dst, ErrInvalidDiskIdentity
+	}
+	start := len(dst)
+	dst = append(dst, make([]byte, DiskIdentityBytes)...)
+	copy(dst[start:start+len(identity.Grammar)], identity.Grammar[:])
+	at := start + len(identity.Grammar)
+	for _, word := range identity.Required {
+		binary.BigEndian.PutUint64(dst[at:at+8], word)
+		at += 8
+	}
+	return dst, nil
+}
+
+// OpenDiskIdentity accepts exactly one canonical fixed-width identity and
+// performs no allocation based on input contents.
+func OpenDiskIdentity(raw []byte) (DiskIdentity, error) {
+	if len(raw) != DiskIdentityBytes {
+		return DiskIdentity{}, ErrInvalidDiskIdentity
+	}
+	var identity DiskIdentity
+	copy(identity.Grammar[:], raw[:len(identity.Grammar)])
+	at := len(identity.Grammar)
+	for index := range identity.Required {
+		identity.Required[index] = binary.BigEndian.Uint64(raw[at : at+8])
+		at += 8
+	}
+	if !identity.Valid() {
+		return DiskIdentity{}, ErrInvalidDiskIdentity
+	}
+	return identity, nil
+}
 
 // DiskAdoptionPermit is an opaque capability tied to one exact DiskIdentity.
 // Its zero value is invalid and callers outside this package cannot mint one.

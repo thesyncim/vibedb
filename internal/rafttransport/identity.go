@@ -636,7 +636,7 @@ func (peerTLS *PeerTLS) handshake(
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
 	capabilities := buildgate.CapabilitySet{}
-	if raftBuildPrefaceRequired(class) {
+	if internalBuildPrefaceRequired(class) {
 		capabilities, err = exchangeBuildPreface(connection, role, peerTLS.build)
 		if err != nil {
 			_ = connection.Close()
@@ -652,8 +652,14 @@ func (peerTLS *PeerTLS) handshake(
 	}, nil
 }
 
-func raftBuildPrefaceRequired(class TrafficClass) bool {
-	return class == TrafficOrdinary || class == TrafficSnapshot
+func internalBuildPrefaceRequired(class TrafficClass) bool {
+	switch class {
+	case TrafficOrdinary, TrafficSnapshot,
+		TrafficShardNative, TrafficShardSQL, TrafficShardControl:
+		return true
+	default:
+		return false
+	}
 }
 
 func exchangeBuildPreface(

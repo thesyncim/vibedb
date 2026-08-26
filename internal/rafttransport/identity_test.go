@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"testing"
@@ -372,7 +373,7 @@ func TestPeerTLSMutualAuthenticationDerivesExactNode(t *testing.T) {
 	}
 }
 
-func TestPeerTLSRaftBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities(t *testing.T) {
+func TestPeerTLSInternalBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 81)
 	clientIdentity := peerTLSTestIdentity(82, 83)
 	serverIdentity := peerTLSTestIdentity(82, 103)
@@ -386,7 +387,10 @@ func TestPeerTLSRaftBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities(t *tes
 	}
 	serverTLS = peerTLSTestBuildProfile(serverTLS, serverBuild)
 
-	for _, class := range []TrafficClass{TrafficOrdinary, TrafficSnapshot} {
+	for _, class := range []TrafficClass{
+		TrafficOrdinary, TrafficSnapshot,
+		TrafficShardNative, TrafficShardSQL, TrafficShardControl,
+	} {
 		client, server, clientErr, serverErr := peerTLSTestHandshake(
 			t, clientTLS, serverTLS, serverIdentity.Node, class, class,
 		)
@@ -411,7 +415,7 @@ func TestPeerTLSRaftBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities(t *tes
 	}
 }
 
-func TestPeerTLSRaftBuildPrefaceRefusesGrammarAndCapabilityMismatch(t *testing.T) {
+func TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 111)
 	clientIdentity := peerTLSTestIdentity(112, 113)
 	serverIdentity := peerTLSTestIdentity(112, 133)
@@ -470,7 +474,7 @@ func TestPeerTLSRaftBuildPrefaceRefusesGrammarAndCapabilityMismatch(t *testing.T
 	}
 }
 
-func TestPeerTLSNonRaftTrafficDoesNotConsumeRaftBuildPreface(t *testing.T) {
+func TestPeerTLSExternalGatewayTrafficDoesNotConsumeInternalBuildPreface(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 141)
 	clientIdentity := peerTLSTestIdentity(142, 143)
 	serverIdentity := peerTLSTestIdentity(142, 163)
@@ -482,7 +486,7 @@ func TestPeerTLSNonRaftTrafficDoesNotConsumeRaftBuildPreface(t *testing.T) {
 
 	client, server, clientErr, serverErr := peerTLSTestHandshake(
 		t, clientTLS, serverTLS, serverIdentity.Node,
-		TrafficShardNative, TrafficShardNative,
+		TrafficGatewayClient, TrafficGatewayClient,
 	)
 	if clientErr != nil || serverErr != nil {
 		t.Fatalf("non-Raft handshake errors = client %v server %v", clientErr, serverErr)
@@ -492,13 +496,13 @@ func TestPeerTLSNonRaftTrafficDoesNotConsumeRaftBuildPreface(t *testing.T) {
 			BuildCapabilities() buildgate.CapabilitySet
 		})
 		if proved.BuildCapabilities() != (buildgate.CapabilitySet{}) {
-			t.Fatalf("non-Raft traffic proved Raft capabilities: %#v", proved.BuildCapabilities())
+			t.Fatalf("external gateway traffic proved internal capabilities: %#v", proved.BuildCapabilities())
 		}
 		_ = connection.Close()
 	}
 }
 
-func TestPeerTLSRaftBuildPrefaceRetainsBoundedHandshakeDeadline(t *testing.T) {
+func TestPeerTLSInternalBuildPrefaceRetainsBoundedHandshakeDeadline(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 171)
 	clientIdentity := peerTLSTestIdentity(172, 173)
 	serverIdentity := peerTLSTestIdentity(172, 193)
@@ -577,6 +581,14 @@ func TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated(t *testi
 	if client.TrafficClass() != TrafficShardNative || server.TrafficClass() != TrafficShardNative {
 		t.Fatalf("traffic classes = %d/%d", client.TrafficClass(), server.TrafficClass())
 	}
+	for side, connection := range map[string]PeerConnection{"client": client, "server": server} {
+		proved := connection.(interface {
+			BuildCapabilities() buildgate.CapabilitySet
+		})
+		if !proved.BuildCapabilities().Has(buildgate.CapabilityGatewayShardTransport) {
+			t.Fatalf("%s omitted authenticated gateway-shard capability", side)
+		}
+	}
 
 	wrongClient, wrongServer, wrongClientErr, wrongServerErr := peerTLSTestHandshake(
 		t, clientTLS, serverTLS, serverIdentity.Node,
@@ -590,6 +602,41 @@ func TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated(t *testi
 	}
 	if !errors.Is(wrongClientErr, ErrPeerAuthentication) && !errors.Is(wrongServerErr, ErrPeerAuthentication) {
 		t.Fatalf("cross-capability errors = client %v server %v", wrongClientErr, wrongServerErr)
+	}
+}
+
+func TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 214)
+	clientIdentity := peerTLSTestIdentity(215, 216)
+	serverIdentity := peerTLSTestIdentity(215, 236)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	legacy := buildgate.CurrentProfile()
+	legacy.WireGrammar = buildgate.GrammarID{
+		0xb6, 0x92, 0x36, 0x3d, 0x9c, 0x0b, 0x49, 0x22,
+		0x9e, 0xb4, 0x35, 0xe5, 0x0d, 0xba, 0xb8, 0xdd,
+	}
+	legacy.DiskGrammar = buildgate.GrammarID{
+		0x71, 0xe5, 0xf4, 0x45, 0xb2, 0x45, 0x4a, 0x66,
+		0x8e, 0x68, 0xd4, 0x47, 0x2e, 0x26, 0xe1, 0x49,
+	}
+	serverTLS := peerTLSTestBuildProfile(
+		newPeerTLSTestProfile(t, authority, serverIdentity), legacy,
+	)
+	for _, class := range []TrafficClass{
+		TrafficShardSQL, TrafficShardNative, TrafficShardControl,
+	} {
+		t.Run(fmt.Sprintf("class-%d", class), func(t *testing.T) {
+			client, server, clientErr, serverErr := peerTLSTestHandshake(
+				t, clientTLS, serverTLS, serverIdentity.Node, class, class,
+			)
+			if client != nil || server != nil {
+				t.Fatalf("legacy/current build returned application streams %v/%v", client, server)
+			}
+			if !errors.Is(clientErr, ErrPeerBuild) || !errors.Is(serverErr, ErrPeerBuild) ||
+				!errors.Is(serverErr, buildgate.ErrWireGrammar) {
+				t.Fatalf("legacy/current errors = client %v server %v", clientErr, serverErr)
+			}
+		})
 	}
 }
 

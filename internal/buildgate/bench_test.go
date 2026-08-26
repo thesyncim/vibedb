@@ -7,6 +7,7 @@ var (
 	benchmarkBytes   []byte
 	benchmarkSet     CapabilitySet
 	benchmarkPermit  DiskAdoptionPermit
+	benchmarkDisk    DiskIdentity
 )
 
 func BenchmarkAppendPreface(b *testing.B) {
@@ -63,6 +64,21 @@ func BenchmarkAuthorizeDiskAdoption(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		benchmarkPermit, err = gate.AuthorizeDiskAdoption(identity)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOpenDiskIdentity(b *testing.B) {
+	raw, err := AppendDiskIdentity(nil, CurrentDiskIdentity())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(DiskIdentityBytes))
+	for b.Loop() {
+		benchmarkDisk, err = OpenDiskIdentity(raw)
 		if err != nil {
 			b.Fatal(err)
 		}

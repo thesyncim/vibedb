@@ -1,5 +1,7 @@
 package buildgate
 
+//go:generate go run ./cmd/buildgategen -manifest manifest/current.txt -output manifest_generated.go
+
 import "errors"
 
 const (
@@ -11,6 +13,9 @@ const (
 	// CapabilityRaftTransport proves support for the authenticated fixed-width
 	// compatibility preface before ordinary Raft and snapshot application bytes.
 	CapabilityRaftTransport Capability = 0
+	// CapabilityGatewayShardTransport proves the same exact compatibility
+	// admission on authenticated shard SQL, native, and control streams.
+	CapabilityGatewayShardTransport Capability = 1
 )
 
 var (
@@ -80,18 +85,29 @@ type Profile struct {
 }
 
 var currentProfile = Profile{
-	// These are opaque identities, not numeric versions. Any incompatible wire
-	// or disk grammar replaces the complete corresponding identifier.
-	WireGrammar: GrammarID{0xb6, 0x92, 0x36, 0x3d, 0x9c, 0x0b, 0x49, 0x22, 0x9e, 0xb4, 0x35, 0xe5, 0x0d, 0xba, 0xb8, 0xdd},
-	DiskGrammar: GrammarID{0x71, 0xe5, 0xf4, 0x45, 0xb2, 0x45, 0x4a, 0x66, 0x8e, 0x68, 0xd4, 0x47, 0x2e, 0x26, 0xe1, 0x49},
-	Provided:    CapabilitySet{1 << CapabilityRaftTransport},
-	Required:    CapabilitySet{1 << CapabilityRaftTransport},
+	// These opaque identities are generated from manifest/current.txt with the
+	// exact request-ledger semantics digest substituted into both domains.
+	WireGrammar: generatedWireGrammar,
+	DiskGrammar: generatedDiskGrammar,
+	Provided: CapabilitySet{
+		1<<CapabilityRaftTransport | 1<<CapabilityGatewayShardTransport,
+	},
+	Required: CapabilitySet{
+		1<<CapabilityRaftTransport | 1<<CapabilityGatewayShardTransport,
+	},
 }
 
 // CurrentProfile returns the sole grammar and minimum capability contract
 // implemented by this source tree. It returns a value so callers cannot mutate
 // process-global compatibility state.
 func CurrentProfile() Profile { return currentProfile }
+
+// CurrentDiskIdentity is the exact identity persisted beside a durable apply
+// image. Required capabilities are stored with the grammar so a future build
+// cannot silently adopt a disk whose mandatory machinery it lacks.
+func CurrentDiskIdentity() DiskIdentity {
+	return DiskIdentity{Grammar: currentProfile.DiskGrammar, Required: currentProfile.Required}
+}
 
 func (profile Profile) Valid() bool {
 	return profile.WireGrammar.Valid() && profile.DiskGrammar.Valid() &&
