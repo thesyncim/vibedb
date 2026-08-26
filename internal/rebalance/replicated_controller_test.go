@@ -102,7 +102,7 @@ type fixedMoveObserver struct {
 }
 
 func (observer *fixedMoveObserver) ObserveReplicaMove(
-	_ context.Context, _ OperationID,
+	_ context.Context, _ OperationID, _ gateway.ReplicatedOperationRecord, _ *Plan,
 ) (ReplicatedMoveCut, error) {
 	observer.calls++
 	return observer.cut, observer.err

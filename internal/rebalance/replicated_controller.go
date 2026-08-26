@@ -42,7 +42,9 @@ type ReplicatedMoveCut struct {
 // operation identity. Command, transport, and snapshot wiring remain outside
 // the controller core.
 type ReplicatedMoveObserver interface {
-	ObserveReplicaMove(context.Context, OperationID) (ReplicatedMoveCut, error)
+	ObserveReplicaMove(
+		context.Context, OperationID, gateway.ReplicatedOperationRecord, *Plan,
+	) (ReplicatedMoveCut, error)
 }
 
 // ReplicatedMoveActionExecutor executes one idempotent action. OperationID and
@@ -87,7 +89,7 @@ func ExecuteReplicatedMoveStep(
 	if readErr != nil && !errors.Is(readErr, gateway.ErrReplicatedOperationMissing) {
 		return Action{}, readErr
 	}
-	cut, err := observer.ObserveReplicaMove(ctx, operation)
+	cut, err := observer.ObserveReplicaMove(ctx, operation, record, initial)
 	if err != nil || cut.Catalog == nil {
 		return Action{}, errors.Join(err, ErrReplicatedMove)
 	}

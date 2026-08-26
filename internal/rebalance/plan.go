@@ -478,6 +478,16 @@ func (p *Plan) RetiringReplica() ReplicaIdentity {
 	return p.request.RetiringReplica
 }
 
+// Request returns the immutable placement identity for controller-side route
+// resolution. Every field is scalar or value-owned, so callers cannot mutate
+// the plan through the returned copy.
+func (p *Plan) Request() MoveRequest {
+	if p == nil {
+		return MoveRequest{}
+	}
+	return p.request
+}
+
 func (p *Plan) SnapshotSourceMember() uint64 {
 	if p == nil {
 		return 0

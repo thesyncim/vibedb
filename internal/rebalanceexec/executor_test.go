@@ -395,7 +395,7 @@ func (*controllerJournal) RetryPending(context.Context) error {
 type controllerObserver struct{ cut rebalance.ReplicatedMoveCut }
 
 func (observer *controllerObserver) ObserveReplicaMove(
-	context.Context, rebalance.OperationID,
+	context.Context, rebalance.OperationID, gateway.ReplicatedOperationRecord, *rebalance.Plan,
 ) (rebalance.ReplicatedMoveCut, error) {
 	return observer.cut, nil
 }

@@ -22,6 +22,24 @@ const MaxPlanIntentBytes = 2 * replicatedstate.MaxSnapshotBaseCertificateBytes
 
 var ErrPlanIntent = errors.New("rebalance: invalid persisted replica move intent")
 
+type ReplicaMoveIntentIdentity struct {
+	Operation        OperationID
+	SourceGeneration uint64
+	Request          MoveRequest
+}
+
+// InspectReplicaMoveIntent verifies canonical persisted bytes and returns only
+// the immutable addressing identity needed to collect the next remote cut. It
+// does not reconstruct a Plan or grant execution authority.
+func InspectReplicaMoveIntent(raw []byte) (ReplicaMoveIntentIdentity, error) {
+	intent, request, err := openPersistedPlanIntent(raw)
+	if err != nil || len(intent.Certificate) != 0 {
+		return ReplicaMoveIntentIdentity{}, errors.Join(err, ErrPlanIntent)
+	}
+	return ReplicaMoveIntentIdentity{Operation: OperationID(intent.Operation),
+		SourceGeneration: intent.SourceGeneration, Request: request}, nil
+}
+
 type persistedPlanIntent struct {
 	Operation        [32]byte             `json:"operation"`
 	SourceGeneration uint64               `json:"source_generation"`
