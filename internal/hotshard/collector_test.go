@@ -68,7 +68,7 @@ func TestCollectorIntakesExactGatewayBucketsAndPublishesReplicatedView(t *testin
 	}
 	collector := &Collector{provider: pulseCapacity{}, sequence: 1, catalogGeneration: 10,
 		policy:   autosplit.Policy{TriggerPressurePPM: 1, MaxChildPressurePPM: 900_000, CelebritySharePPM: 1},
-		entries:  []collectorEntry{{group: hotGroup(1), source: source, recorder: recorder}},
+		entries:  []collectorEntry{{group: hotGroup(1), source: source, leader: "source", recorder: recorder}},
 		bySource: map[autosplit.SourceIdentity]int{source: 0}}
 	for range 16 {
 		collector.ObservePressure(gateway.PressureObservation{Source: source, Write: true,
@@ -81,7 +81,8 @@ func TestCollectorIntakesExactGatewayBucketsAndPublishesReplicatedView(t *testin
 	}
 	view, err := OpenView(record.Payload)
 	if err != nil || len(view.Reports) != 1 || view.Reports[0].Recommendation.WindowSequence != 1 ||
-		view.Reports[0].Demand[autosplit.ResourceRequests] != 16 {
+		view.Reports[0].Demand[autosplit.ResourceRequests] != 16 ||
+		view.Nodes[0].Used[autosplit.ResourceRequests] != 16 {
 		t.Fatalf("view=%+v err=%v", view, err)
 	}
 	want, _ := distribution.VirtualBucketRange(17, source.BucketBits)
@@ -94,7 +95,7 @@ func TestCollectorRejectsNodeGenerationBeforeRotatingWindow(t *testing.T) {
 	_, source, nodes := hotCatalog(t)
 	recorder, _ := autosplit.NewRecorder(source, 1, 1)
 	collector := &Collector{provider: pulseCapacity{}, sequence: 1, catalogGeneration: 10,
-		entries:  []collectorEntry{{group: hotGroup(1), source: source, recorder: recorder}},
+		entries:  []collectorEntry{{group: hotGroup(1), source: source, leader: "source", recorder: recorder}},
 		bySource: map[autosplit.SourceIdentity]int{source: 0}}
 	nodes[0].CatalogGeneration++
 	if _, err := collector.Publish(context.Background(), &pressurePublisher{}, nodes); !errors.Is(err, ErrInvalidPressureCut) {

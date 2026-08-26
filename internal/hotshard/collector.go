@@ -32,6 +32,7 @@ type PressurePublisher interface {
 type collectorEntry struct {
 	group    raftmember.GroupKey
 	source   autosplit.SourceIdentity
+	leader   distribution.EndpointID
 	recorder *autosplit.Recorder
 }
 
@@ -68,7 +69,7 @@ func NewCollector(
 		entries:           make([]collectorEntry, 0, len(descriptors)),
 		bySource:          make(map[autosplit.SourceIdentity]int, len(descriptors))}
 	for _, descriptor := range descriptors {
-		source, ok := sourceForDescriptor(catalog, descriptor)
+		source, leader, ok := sourceForDescriptor(catalog, descriptor)
 		if !ok {
 			return nil, ErrInvalidPressureCut
 		}
@@ -77,7 +78,7 @@ func NewCollector(
 			return nil, errors.Join(err, ErrInvalidPressureCut)
 		}
 		collector.entries = append(collector.entries, collectorEntry{
-			group: descriptor.Group, source: source, recorder: recorder,
+			group: descriptor.Group, source: source, leader: leader, recorder: recorder,
 		})
 	}
 	slices.SortFunc(collector.entries, func(left, right collectorEntry) int {
@@ -98,10 +99,10 @@ func NewCollector(
 
 func sourceForDescriptor(
 	catalog *gateway.Snapshot, descriptor gateway.ReplicatedShardDescriptor,
-) (autosplit.SourceIdentity, bool) {
+) (autosplit.SourceIdentity, distribution.EndpointID, bool) {
 	manifest, ok := catalog.Manifest(descriptor.Distribution)
 	if !ok || descriptor.Group == (raftmember.GroupKey{}) {
-		return autosplit.SourceIdentity{}, false
+		return autosplit.SourceIdentity{}, "", false
 	}
 	var bucketBits uint8
 	for ordinal := 0; ordinal < catalog.DistributionCount(); ordinal++ {
@@ -115,13 +116,17 @@ func sourceForDescriptor(
 		metadata, found := manifest.ShardMetadataAt(ordinal)
 		if found && metadata.ID == descriptor.Shard &&
 			metadata.AllocationGeneration == descriptor.AllocationGeneration {
+			leader, leaderOK := manifest.ShardLeaderAt(ordinal, 0)
+			if !leaderOK {
+				return autosplit.SourceIdentity{}, "", false
+			}
 			return autosplit.SourceIdentity{Distribution: descriptor.Distribution,
 				Shard: descriptor.Shard, AllocationGeneration: descriptor.AllocationGeneration,
 				Range: metadata.Range, BucketBits: bucketBits,
-				RoutingVersion: manifest.Version(), OwnershipEpoch: metadata.Epoch}, bucketBits != 0
+				RoutingVersion: manifest.Version(), OwnershipEpoch: metadata.Epoch}, leader, bucketBits != 0
 		}
 	}
-	return autosplit.SourceIdentity{}, false
+	return autosplit.SourceIdentity{}, "", false
 }
 
 // ObservePressure implements gateway.PressureObserver. Exact single-bucket
@@ -250,9 +255,33 @@ func (collector *Collector) rotate(nodes []topologyscheduler.NodeCapacity) (View
 		view.Reports[index] = Report{Group: entry.group,
 			Recommendation: autosplit.Recommend(window, capacities, collector.policy),
 			Demand:         demand, MigrationBytes: migration}
+		if !addNodeDemand(view.Nodes, entry.leader, demand) {
+			return View{}, ErrInvalidPressureCut
+		}
 	}
 	collector.sequence++
 	return view, nil
+}
+
+func addNodeDemand(
+	nodes []topologyscheduler.NodeCapacity,
+	endpoint distribution.EndpointID,
+	demand autosplit.CapacityVector,
+) bool {
+	for index := range nodes {
+		if nodes[index].Endpoint != endpoint {
+			continue
+		}
+		for resource := range autosplit.ResourceCount {
+			if demand[resource] > ^uint64(0)-nodes[index].Used[resource] {
+				nodes[index].Used[resource] = ^uint64(0)
+			} else {
+				nodes[index].Used[resource] += demand[resource]
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // Node evidence and sources are both fenced to one catalog generation. Every

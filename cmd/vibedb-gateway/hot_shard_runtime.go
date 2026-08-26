@@ -116,7 +116,8 @@ func (runtime *gatewayHotShardRuntime) rebuild(ctx context.Context) error {
 		return err
 	}
 	collector, err := hotshard.NewCollector(snapshot, first, int(runtime.config.RecorderLanes),
-		hotshard.StaticCapacityProvider{Capacity: runtime.config.WindowCapacity}, autosplit.DefaultPolicy())
+		hotshard.StaticCapacityProvider{Capacity: runtime.config.WindowCapacity,
+			MigrationBytes: runtime.config.ShardMigrationBytes}, autosplit.DefaultPolicy())
 	if err != nil {
 		return err
 	}

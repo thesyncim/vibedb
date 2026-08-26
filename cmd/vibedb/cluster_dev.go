@@ -31,8 +31,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -64,6 +66,7 @@ type devClusterManifest struct {
 	GatewayKey          string             `json:"gateway_key"`
 	Roots               string             `json:"roots"`
 	AuthorizationPolicy string             `json:"authorization_policy"`
+	HotShardCapacity    string             `json:"hot_shard_capacity"`
 	GatewayNode         string             `json:"gateway_node"`
 	Members             []devClusterMember `json:"members"`
 	LedgerMembers       []devClusterMember `json:"ledger_members"`
@@ -321,7 +324,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	}
 	clear(keyMaterial)
 	gatewayIndex := options.replicas
-	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas)}
+	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas)}
 	catalogPrepareMembers := make([]devPrepareMember, options.replicas)
 	ledgerPrepareMembers := make([]devPrepareMember, options.replicas)
 	for i := 0; i < options.replicas; i++ {
@@ -354,6 +357,9 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 			}
 			(*role.members)[i] = devClusterMember{Member: uint64(i + 1), Node: role.prepareMembers[i].NodeID, Store: hex.EncodeToString(stores[roleIndex*options.replicas+i][:]), Peer: ports[base], Native: ports[base+1], Snapshot: ports[base+2], Control: ports[base+3], ServeManifest: filepath.Join(memberRoot, "serve-rf3.vibejson")}
 		}
+	}
+	if err = writeDevHotShardCapacity(m.HotShardCapacity, m.Members, m.LedgerMembers); err != nil {
+		return m, err
 	}
 	raw, err := vibejson.Marshal(&m)
 	if err != nil {
@@ -624,7 +630,7 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 			return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
 		}
 	}
-	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy}
+	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
 	for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers} {
 		for _, member := range members {
 			args = append(args, "-shard-peer", member.Native+"="+member.Node)
@@ -860,6 +866,39 @@ func writeDevPolicy(path string, nodes []rafttransport.NodeID) error {
 	return writeDevExclusive(path, raw, 0o600)
 }
 
+func writeDevHotShardCapacity(
+	path string, catalog, ledger []devClusterMember,
+) error {
+	if path == "" || len(catalog) == 0 || len(catalog) != len(ledger) {
+		return errDevCluster
+	}
+	var capacity autosplit.CapacityVector
+	for resource := range autosplit.ResourceCount {
+		capacity[resource] = 1_000_000
+	}
+	config := hotshard.StaticCapacityConfig{Format: hotshard.StaticCapacityFormat,
+		RecorderLanes: 4, WindowCapacity: capacity, NodeCapacity: capacity,
+		MigrationCapacity: 1 << 30, ShardMigrationBytes: 384 << 20, MaxReceives: 2,
+		Nodes: make([]hotshard.StaticCapacityNode, 0, len(catalog)+len(ledger))}
+	for role, members := range [][]devClusterMember{catalog, ledger} {
+		prefix := "catalog-member-"
+		if role == 1 {
+			prefix = "ledger-member-"
+		}
+		for index := range members {
+			config.Nodes = append(config.Nodes, hotshard.StaticCapacityNode{
+				Endpoint:      distribution.EndpointID(prefix + strconv.Itoa(index+1)),
+				FailureDomain: uint32(index + 1),
+			})
+		}
+	}
+	raw, err := hotshard.AppendStaticCapacityConfig(nil, config)
+	if err != nil {
+		return errors.Join(errDevCluster, err)
+	}
+	return writeDevExclusive(path, raw, 0o600)
+}
+
 func validDevManifest(m devClusterManifest, root string) bool {
 	if m.Format != devClusterFormat || m.Nodes != devClusterRF1 && m.Nodes != devClusterRF3 ||
 		len(m.Members) != int(m.Nodes) || len(m.LedgerMembers) != int(m.Nodes) ||
@@ -869,7 +908,7 @@ func validDevManifest(m devClusterManifest, root string) bool {
 	if _, err := decodeDev16(m.GatewayNode); err != nil {
 		return false
 	}
-	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.Roots, m.AuthorizationPolicy}
+	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity}
 	addresses := map[string]struct{}{m.ClientEndpoint: {}}
 	nodes := map[string]struct{}{m.GatewayNode: {}}
 	stores := make(map[string]struct{}, len(m.Members)+len(m.LedgerMembers))

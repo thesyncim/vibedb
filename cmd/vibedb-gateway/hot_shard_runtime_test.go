@@ -16,7 +16,7 @@ func TestGatewayHotShardCapacityRequiresCanonicalBoundedFile(t *testing.T) {
 	}
 	config := hotshard.StaticCapacityConfig{Format: hotshard.StaticCapacityFormat,
 		RecorderLanes: 2, WindowCapacity: capacity, NodeCapacity: capacity,
-		MigrationCapacity: 1024, MaxReceives: 1,
+		MigrationCapacity: 1024, ShardMigrationBytes: 512, MaxReceives: 1,
 		Nodes: []hotshard.StaticCapacityNode{{Endpoint: "member-1", FailureDomain: 1}}}
 	raw, err := hotshard.AppendStaticCapacityConfig(nil, config)
 	if err != nil {

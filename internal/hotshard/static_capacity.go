@@ -19,13 +19,14 @@ const (
 // deterministic tests. It supplies like-unit window and node ceilings; it does
 // not claim live utilization, liveness, serving authority, or spare replicas.
 type StaticCapacityConfig struct {
-	Format            uint16                   `json:"format"`
-	RecorderLanes     uint8                    `json:"recorder_lanes"`
-	WindowCapacity    autosplit.CapacityVector `json:"window_capacity"`
-	NodeCapacity      autosplit.CapacityVector `json:"node_capacity"`
-	MigrationCapacity uint64                   `json:"migration_capacity"`
-	MaxReceives       uint16                   `json:"max_receives"`
-	Nodes             []StaticCapacityNode     `json:"nodes"`
+	Format              uint16                   `json:"format"`
+	RecorderLanes       uint8                    `json:"recorder_lanes"`
+	WindowCapacity      autosplit.CapacityVector `json:"window_capacity"`
+	NodeCapacity        autosplit.CapacityVector `json:"node_capacity"`
+	MigrationCapacity   uint64                   `json:"migration_capacity"`
+	ShardMigrationBytes uint64                   `json:"shard_migration_bytes"`
+	MaxReceives         uint16                   `json:"max_receives"`
+	Nodes               []StaticCapacityNode     `json:"nodes"`
 }
 
 type StaticCapacityNode struct {
@@ -63,6 +64,7 @@ func validStaticCapacityConfig(config StaticCapacityConfig) bool {
 	if config.Format != StaticCapacityFormat || config.RecorderLanes == 0 ||
 		config.RecorderLanes > autosplit.MaxRecorderLanes || len(config.Nodes) == 0 ||
 		len(config.Nodes) > topologyscheduler.MaxPlacementNodes || config.MigrationCapacity == 0 ||
+		config.ShardMigrationBytes == 0 || config.ShardMigrationBytes > config.MigrationCapacity ||
 		config.MaxReceives == 0 {
 		return false
 	}
@@ -81,12 +83,15 @@ func validStaticCapacityConfig(config StaticCapacityConfig) bool {
 	return true
 }
 
-type StaticCapacityProvider struct{ Capacity autosplit.CapacityVector }
+type StaticCapacityProvider struct {
+	Capacity       autosplit.CapacityVector
+	MigrationBytes uint64
+}
 
 func (provider StaticCapacityProvider) PressureCapacity(pulse autosplit.Pulse) (
 	autosplit.CapacitySet, autosplit.CapacityVector, uint64, bool,
 ) {
-	if pulse.Source == (autosplit.SourceIdentity{}) || pulse.Sequence == 0 {
+	if pulse.Source == (autosplit.SourceIdentity{}) || pulse.Sequence == 0 || provider.MigrationBytes == 0 {
 		return autosplit.CapacitySet{}, autosplit.CapacityVector{}, 0, false
 	}
 	set := autosplit.CapacitySet{Source: pulse.Source, WindowSequence: pulse.Sequence,
@@ -99,7 +104,7 @@ func (provider StaticCapacityProvider) PressureCapacity(pulse autosplit.Pulse) (
 		}
 		demand[resource] = pulse.Total[resource]
 	}
-	return set, demand, demand[autosplit.ResourceLiveBytes], true
+	return set, demand, provider.MigrationBytes, true
 }
 
 func (config StaticCapacityConfig) NodeCapacities(generation uint64) []topologyscheduler.NodeCapacity {

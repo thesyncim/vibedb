@@ -14,7 +14,8 @@ func testStaticCapacity() StaticCapacityConfig {
 	}
 	return StaticCapacityConfig{Format: StaticCapacityFormat, RecorderLanes: 4,
 		WindowCapacity: vector, NodeCapacity: vector, MigrationCapacity: 1 << 30,
-		MaxReceives: 2, Nodes: []StaticCapacityNode{
+		ShardMigrationBytes: 384 << 20,
+		MaxReceives:         2, Nodes: []StaticCapacityNode{
 			{Endpoint: "member-1", FailureDomain: 1},
 			{Endpoint: "member-2", FailureDomain: 2},
 		}}
@@ -45,7 +46,7 @@ func TestStaticCapacityConfigCanonicalAndFailClosed(t *testing.T) {
 
 func TestStaticCapacityProviderUsesOnlyLogicalPulse(t *testing.T) {
 	_, source, _ := hotCatalog(t)
-	provider := StaticCapacityProvider{Capacity: testStaticCapacity().WindowCapacity}
+	provider := StaticCapacityProvider{Capacity: testStaticCapacity().WindowCapacity, MigrationBytes: 384 << 20}
 	pulse := autosplit.Pulse{Source: source, Sequence: 7}
 	pulse.Total[autosplit.ResourceRequests] = 19
 	set, demand, _, ok := provider.PressureCapacity(pulse)
