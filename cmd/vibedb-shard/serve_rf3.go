@@ -456,6 +456,12 @@ func servePreparedRF3WithListen(
 				transportRegistry, manifest, group, base,
 			))
 		}
+		if err == nil && manifest.EnrolledTarget != nil &&
+			base.Binding.MemberID == manifest.EnrolledTarget.MemberID {
+			err = server.BindTransitionalServingAuthority(rf3NativeMembershipAuthority(
+				transportRegistry, manifest, group, base,
+			))
+		}
 		if err != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
 			retire(context.Canceled)
@@ -811,6 +817,56 @@ func rf3NativeServingAuthority(
 				state.Command.RouteGeneration > initial.RouteGeneration
 		}
 		return true
+	}
+}
+
+func rf3NativeMembershipAuthority(
+	registry *rafttransport.StaticRegistry,
+	manifest rf3Manifest,
+	group raftmember.GroupKey,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) func(raftservice.ServingState, *shardservice.ReplicatedRequest) bool {
+	return func(state raftservice.ServingState, request *shardservice.ReplicatedRequest) bool {
+		target := manifest.EnrolledTarget
+		if registry == nil || target == nil || request == nil ||
+			state.Identity.Group != group || state.Identity.MemberID != target.MemberID ||
+			state.Identity.MemberID != base.Binding.MemberID ||
+			state.Identity.StoreID != target.StoreID || state.Identity.StoreID != base.Binding.StoreID ||
+			request.Operation != shardservice.ReplicatedMembership ||
+			request.Capability != serviceauthz.CapabilityMembership || !state.Command.Valid() ||
+			request.Fence.Group != group ||
+			request.Fence.AllocationGeneration != state.Identity.AllocationGeneration ||
+			request.Membership.ExpectedReplicaSetVersion != state.Command.ReplicaSetVersion {
+			return false
+		}
+		version, found := registry.ReplicaSetVersion(group)
+		if !found || version != state.Command.ReplicaSetVersion {
+			return false
+		}
+		role, err := registry.Role(group, target.MemberID)
+		if err != nil || role != rafttransport.MemberVoter {
+			return false
+		}
+		voters := 0
+		for _, member := range manifest.Members {
+			if role, roleErr := registry.Role(group, member.MemberID); roleErr == nil &&
+				role == rafttransport.MemberVoter {
+				voters++
+			}
+		}
+		voters++
+		if voters != rf3ManifestMembers+1 {
+			return false
+		}
+		grant, found, err := registry.CurrentTransitionGrant(group)
+		membership := request.Membership
+		return err == nil && found && grant.Valid() && grant.Group == group &&
+			grant.TargetMember == target.MemberID && grant.TargetNode == [16]byte(target.NodeID) &&
+			membership.TransitionID == grant.TransitionID &&
+			membership.MetadataEpoch == grant.MetadataEpoch &&
+			membership.CatalogGeneration == grant.CatalogGeneration &&
+			membership.SourceMember == grant.SourceMember &&
+			membership.TargetMember == grant.TargetMember
 	}
 }
 

@@ -44,6 +44,7 @@ type ReplicatedServer struct {
 	authorization  *serviceauthz.Gate
 	audit          serviceauthz.AuditSink
 	serving        func(raftservice.ServingState) bool
+	transition     func(raftservice.ServingState, *ReplicatedRequest) bool
 
 	accepted      atomic.Uint64
 	rejected      atomic.Uint64
@@ -87,6 +88,19 @@ func (server *ReplicatedServer) BindServingAuthority(
 		return ErrReplicatedWire
 	}
 	server.serving = serving
+	return nil
+}
+
+// BindTransitionalServingAuthority installs a narrow authenticated-request
+// exception to the serving gate. It is intended for membership-only control
+// on a pre-bound replacement voter before that replica enters the final RF3.
+func (server *ReplicatedServer) BindTransitionalServingAuthority(
+	transition func(raftservice.ServingState, *ReplicatedRequest) bool,
+) error {
+	if server == nil || transition == nil || server.state.Load() != replicatedServerReady {
+		return ErrReplicatedWire
+	}
+	server.transition = transition
 	return nil
 }
 
@@ -379,7 +393,7 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 			})
 		}
 	}
-	response := server.executeReplicated(requestCtx, request)
+	response := server.executeReplicatedAuthenticated(requestCtx, request, authenticated)
 	if response.readLease != nil {
 		defer response.readLease.Release()
 	}
@@ -414,6 +428,14 @@ func (server *ReplicatedServer) executeReplicated(
 	ctx context.Context,
 	request *ReplicatedRequest,
 ) *ReplicatedResponse {
+	return server.executeReplicatedAuthenticated(ctx, request, false)
+}
+
+func (server *ReplicatedServer) executeReplicatedAuthenticated(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	authenticated bool,
+) *ReplicatedResponse {
 	state, stateErr := server.owner.Probe(ctx, request.Fence.Group)
 	wireState := replicatedWireState(state)
 	if stateErr != nil {
@@ -421,7 +443,8 @@ func (server *ReplicatedServer) executeReplicated(
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 		}
 	}
-	if server.serving != nil && !server.serving(state) {
+	if server.serving != nil && !server.serving(state) &&
+		(!authenticated || server.transition == nil || !server.transition(state, request)) {
 		return &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 			HasState: true, State: wireState,

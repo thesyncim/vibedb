@@ -76,6 +76,48 @@ func TestReplicatedServerLiveServingAuthorityGatesEveryRequest(t *testing.T) {
 	}
 }
 
+func TestReplicatedServerTransitionalAuthorityRequiresAuthenticatedExactOperation(t *testing.T) {
+	owner := &fakeReplicatedOwner{state: testReplicatedServingState()}
+	server := testReplicatedServer(owner)
+	if err := server.BindServingAuthority(func(raftservice.ServingState) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.BindTransitionalServingAuthority(func(
+		state raftservice.ServingState, request *ReplicatedRequest,
+	) bool {
+		return state == owner.state && request != nil && request.Operation == ReplicatedMembership
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedMembership,
+		Fence: ReplicatedFence{Group: owner.state.Identity.Group,
+			AllocationGeneration: owner.state.Identity.AllocationGeneration,
+			Command:              owner.state.Command, MemberID: owner.state.Identity.MemberID,
+			StoreID:         owner.state.Identity.StoreID,
+			NodeIncarnation: owner.state.Identity.NodeIncarnation, Term: owner.state.Status.Term},
+		Membership: ReplicatedMembershipRequest{Kind: raftservice.MembershipAddLearner,
+			TransitionID: [16]byte{1}, MetadataEpoch: 2, CatalogGeneration: 3,
+			ExpectedReplicaSetVersion: owner.state.Command.ReplicaSetVersion,
+			SourceMember:              1, TargetMember: 2},
+	}
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal ||
+		response.Refusal != ReplicatedRefusalUnavailable {
+		t.Fatalf("unauthenticated transition response = %+v", response)
+	}
+	if response := server.executeReplicatedAuthenticated(
+		t.Context(), request, true,
+	); response.Kind != ReplicatedMembershipAccepted {
+		t.Fatalf("authenticated membership response = %+v", response)
+	}
+	probe := *request
+	probe.Operation = ReplicatedProbe
+	if response := server.executeReplicatedAuthenticated(
+		t.Context(), &probe, true,
+	); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable {
+		t.Fatalf("authenticated data-plane response = %+v", response)
+	}
+}
+
 func (owner *fakeReplicatedOwner) Probe(
 	context.Context,
 	raftmember.GroupKey,

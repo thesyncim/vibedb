@@ -15,6 +15,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -239,6 +241,40 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 		t.Fatal(err)
 	}
 	state.Command.ReplicaSetVersion = 11
+	membershipServing := rf3NativeMembershipAuthority(registry, manifest, group, base)
+	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedMembership,
+		Capability: serviceauthz.CapabilityMembership,
+		Fence: shardservice.ReplicatedFence{Group: group,
+			AllocationGeneration: base.Binding.AllocationGeneration},
+		Membership: shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipRemoveVoter, TransitionID: grant.TransitionID,
+			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
+			ExpectedReplicaSetVersion: 11, SourceMember: grant.SourceMember,
+			TargetMember: grant.TargetMember, TransferTerm: 3,
+		}}
+	if !membershipServing(state, &request) {
+		t.Fatal("exact authenticated RF4 membership request rejected")
+	}
+	for name, mutate := range map[string]func(*shardservice.ReplicatedRequest){
+		"data operation":  func(r *shardservice.ReplicatedRequest) { r.Operation = shardservice.ReplicatedProbe },
+		"data capability": func(r *shardservice.ReplicatedRequest) { r.Capability = serviceauthz.CapabilityDataWrite },
+		"stale rsv": func(r *shardservice.ReplicatedRequest) {
+			r.Membership.ExpectedReplicaSetVersion--
+		},
+		"wrong transition": func(r *shardservice.ReplicatedRequest) { r.Membership.TransitionID[0]++ },
+		"wrong metadata":   func(r *shardservice.ReplicatedRequest) { r.Membership.MetadataEpoch++ },
+		"wrong catalog":    func(r *shardservice.ReplicatedRequest) { r.Membership.CatalogGeneration++ },
+		"wrong source":     func(r *shardservice.ReplicatedRequest) { r.Membership.SourceMember++ },
+		"wrong target":     func(r *shardservice.ReplicatedRequest) { r.Membership.TargetMember++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := request
+			mutate(&candidate)
+			if membershipServing(state, &candidate) {
+				t.Fatal("mismatched RF4 membership request admitted")
+			}
+		})
+	}
 	state.Command.OwnershipEpoch++
 	state.Command.RoutingVersion++
 	state.Command.RouteGeneration++
