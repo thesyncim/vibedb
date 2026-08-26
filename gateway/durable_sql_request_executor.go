@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -125,6 +126,13 @@ func (executor *DurableSQLRequestExecutor) Execute(
 	}
 	var outcome DurableRequestOutcome
 	if begin.ProgramMatches {
+		// The fused Create is the one logical admission point for a caller
+		// request. Sample its already-grouped shard participants only for the
+		// successful creator: request retries and transaction recovery waves must
+		// not amplify hot-shard pressure.
+		if begin.Created {
+			executor.observeMutationPressure(lease.snapshot, participants)
+		}
 		outcome, err = executor.requests.ExecuteBegun(opctx, request, begin)
 	} else {
 		var found bool
@@ -137,6 +145,30 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		return DurableSQLRequestResult{}, err
 	}
 	return executor.result(key, outcome)
+}
+
+// observeMutationPressure samples one logical write per routed participant.
+// Participant scopes were canonicalized by SQL lowering, so this boundary
+// preserves exact bucket locality without counting every statement, relation
+// batch, global-index side effect, or distributed-transaction retry again.
+func (executor *DurableSQLRequestExecutor) observeMutationPressure(
+	snapshot *Snapshot,
+	participants []ReplicatedTransactionParticipant,
+) {
+	if executor == nil || executor.planner == nil || executor.planner.pressure == nil ||
+		snapshot == nil {
+		return
+	}
+	for index := range participants {
+		participant := &participants[index]
+		source := replicatedDataPressureSource(snapshot, participant.Route)
+		if source == (autosplit.SourceIdentity{}) {
+			continue
+		}
+		executor.planner.pressure.ObservePressure(PressureObservation{
+			Source: source, AccessScopes: participant.IntentScopes, Write: true,
+		})
+	}
 }
 
 func (executor *DurableSQLRequestExecutor) Replay(
