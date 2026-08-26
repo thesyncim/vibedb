@@ -211,9 +211,13 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	observed.TargetState.ConfState = plan.voterConf
 	observed.TargetState.ReplicaSetVersion = 9
 	observed.TargetProgress.Learner = false
+	observed.TargetProgress.Match = 9
+	observed.TargetProgress.Next = 10
+	observed.TargetStatus.Applied = 9
+	observed.LeaderStatus = leaderStatus(1, 9)
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionTransferLeader || action.Member != 2 {
-		t.Fatalf("voter action = %+v, %v", action, err)
+		t.Fatalf("retiring leader action = %+v, %v", action, err)
 	}
 	observed.LeaderStatus = leaderStatus(2, 9)
 	observed.TargetStatus = observed.LeaderStatus
@@ -255,11 +259,10 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 		Match: 10, Next: 11, RecentActive: true,
 	}
 	action, err = Reconcile(plan, observed)
-	if err != nil || action.Kind != ActionTransferLeader || action.Member != 2 {
+	if err != nil || action.Kind != ActionAwaitCatalogDrain ||
+		action.CatalogGeneration != plan.nextCatalogGeneration {
 		t.Fatalf("post-publication leader loss action = %+v, %v", action, err)
 	}
-	observed.LeaderStatus = leaderStatus(2, 10)
-	observed.TargetStatus = observed.LeaderStatus
 	observed.DrainedCatalogGeneration = 10
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionRemoveSource ||
@@ -291,6 +294,57 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionComplete {
 		t.Fatalf("complete action = %+v, %v", action, err)
+	}
+}
+
+func TestReplicaMoveTransfersOnlyRetiringSourceLeadership(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	plan = bindMoveTestPlan(plan)
+	state := plan.baseState
+	state.Applied = 9
+	state.ReplicaSetVersion = 9
+	state.ConfState = plan.voterConf
+	ready := Observation{
+		Catalog: catalog,
+		Publication: raftmodel.Publication{
+			Applied: 9, ReplicaSetVersion: 9, ConfState: plan.voterConf,
+		},
+		LeaderStatus: leaderStatus(plan.request.RetiringMember, 9),
+		TargetStatus: raftmember.RuntimeStatus{MemberID: plan.request.TargetMember, Applied: 9},
+		TargetState:  state,
+		TargetProgress: raftmodel.MemberProgress{
+			Match: 9, Next: 10, RecentActive: true,
+		},
+		ProgressFound: true,
+	}
+
+	lagging := ready
+	lagging.TargetProgress.Match = 8
+	if action, err := Reconcile(plan, lagging); err != nil ||
+		action.Kind != ActionAwaitCatchUp || action.Member != plan.request.TargetMember {
+		t.Fatalf("source leader with lagging target action = %+v, %v", action, err)
+	}
+	if action, err := Reconcile(plan, ready); err != nil ||
+		action.Kind != ActionTransferLeader || action.Member != plan.request.TargetMember {
+		t.Fatalf("source leader with ready target action = %+v, %v", action, err)
+	}
+
+	otherLeader := ready
+	otherLeader.LeaderStatus = leaderStatus(plan.request.SnapshotSourceMember, 9)
+	// Once a live observation proves leadership has left the retiring source,
+	// stale per-target progress cannot force an unnecessary second transfer.
+	otherLeader.ProgressFound = false
+	otherLeader.TargetProgress = raftmodel.MemberProgress{}
+	otherLeader.TargetStatus = raftmember.RuntimeStatus{}
+	if action, err := Reconcile(plan, otherLeader); err != nil ||
+		action.Kind != ActionAdvanceOwnership || action.Member != plan.request.TargetMember {
+		t.Fatalf("other leader action = %+v, %v", action, err)
+	}
+
+	staleLeader := ready
+	staleLeader.LeaderStatus.Term = 0
+	if action, err := Reconcile(plan, staleLeader); err != nil || action.Kind != ActionAwaitLeader {
+		t.Fatalf("stale leader observation action = %+v, %v", action, err)
 	}
 }
 

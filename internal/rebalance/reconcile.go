@@ -168,7 +168,7 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		if !targetPublicationApplied(observed) {
 			return Action{Kind: ActionAwaitCatchUp, Member: plan.request.TargetMember}, nil
 		}
-		if observed.LeaderStatus.MemberID != plan.request.TargetMember {
+		if observed.LeaderStatus.MemberID == plan.request.RetiringMember {
 			if !plan.targetCaughtUp(observed, false) {
 				return Action{Kind: ActionAwaitCatchUp, Member: plan.request.TargetMember}, nil
 			}
@@ -224,7 +224,7 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		if !targetPublicationApplied(observed) {
 			return Action{Kind: ActionAwaitCatchUp, Member: plan.request.TargetMember}, nil
 		}
-		if observed.LeaderStatus.MemberID != plan.request.TargetMember {
+		if observed.LeaderStatus.MemberID == plan.request.RetiringMember {
 			if !plan.targetCaughtUp(observed, false) {
 				return Action{Kind: ActionAwaitCatchUp, Member: plan.request.TargetMember}, nil
 			}
