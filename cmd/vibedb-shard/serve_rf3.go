@@ -30,6 +30,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	"github.com/thesyncim/vibedb/internal/splitartifact"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	publicshardcontrol "github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -611,7 +612,7 @@ func servePreparedRF3WithExecutionLanes(
 	// complete durable plan observation and execute every action class. The mux
 	// has a fixed shipped route for it once that runtime is supplied; it must not
 	// advertise a partial or memory-only executor.
-	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil, nil, nil)
+	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil, nil, nil, nil)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
@@ -762,9 +763,9 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action, split, schema, admission shardcontrol.Handler,
+	membership, observation, source, action, split, schema, admission, tail shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 7)
+	routes := make([]shardcontrol.Route, 0, 8)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -805,7 +806,28 @@ func newRF3ControlMux(
 			Handler:       admission,
 		})
 	}
+	if tail != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: splitcontroller.TailStreamRequestDiscriminator(),
+			Handler:       tail,
+		})
+	}
 	return shardcontrol.New(routes...)
+}
+
+func newRF3SnapshotMux(source, artifact shardcontrol.Handler) (*shardcontrol.Mux, error) {
+	routes := make([]shardcontrol.Route, 0, 2)
+	if source != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: snapshottransfer.RequestDiscriminator(), Handler: source,
+		})
+	}
+	if artifact != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: splitartifact.RequestDiscriminator(), Handler: artifact,
+		})
+	}
+	return shardcontrol.NewForTraffic(rafttransport.TrafficSnapshot, routes...)
 }
 
 func loadRF3RetainedIdentities(manifest rf3Manifest) (
