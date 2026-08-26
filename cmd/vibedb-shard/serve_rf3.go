@@ -25,6 +25,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/schemainstall"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
@@ -609,7 +610,7 @@ func servePreparedRF3WithExecutionLanes(
 	// complete durable plan observation and execute every action class. The mux
 	// has a fixed shipped route for it once that runtime is supplied; it must not
 	// advertise a partial or memory-only executor.
-	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil)
+	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil, nil)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
@@ -760,9 +761,9 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action, split shardcontrol.Handler,
+	membership, observation, source, action, split, schema shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 5)
+	routes := make([]shardcontrol.Route, 0, 6)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -789,6 +790,12 @@ func newRF3ControlMux(
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: publicshardcontrol.RequestDiscriminator(),
 			Handler:       split,
+		})
+	}
+	if schema != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: schemainstall.RequestDiscriminator(),
+			Handler:       schema,
 		})
 	}
 	return shardcontrol.New(routes...)

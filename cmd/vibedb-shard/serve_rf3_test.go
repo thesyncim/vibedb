@@ -61,10 +61,10 @@ func (rf3ControlTestHandler) Serve(context.Context, rafttransport.PeerConnection
 
 func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
 	handler := rf3ControlTestHandler{}
-	if mux, err := newRF3ControlMux(handler, handler, handler, handler, handler); err != nil || mux == nil {
+	if mux, err := newRF3ControlMux(handler, handler, handler, handler, handler, handler); err != nil || mux == nil {
 		t.Fatalf("all-service mux = %v, %v", mux, err)
 	}
-	if _, err := newRF3ControlMux(nil, handler, nil, nil, nil); err == nil {
+	if _, err := newRF3ControlMux(nil, handler, nil, nil, nil, nil); err == nil {
 		t.Fatal("missing mandatory membership service accepted")
 	}
 }
