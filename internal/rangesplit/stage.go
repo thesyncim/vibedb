@@ -201,6 +201,9 @@ func (s *ChildStage) ReceiveArtifact(
 			if err := s.applyArtifactRows(rows); err != nil {
 				return err
 			}
+			if err := s.accumulateArtifactRows(&working, rows); err != nil {
+				return err
+			}
 			working.artifactChunks++
 			working.artifactRows = verifiedRows
 			working.artifactPayload = verifiedPayload
@@ -238,6 +241,9 @@ func (s *ChildStage) ReceiveArtifact(
 	tail.artifactPayload = s.expected.PayloadBytes
 	tail.artifactOffset = s.expected.EncodedBytes
 	tail.lastChunkDigest = s.expected.LastChunkDigest
+	tail.imageRows = working.imageRows
+	tail.imageBytes = working.imageBytes
+	tail.imageDigest = working.imageDigest
 	if err := s.persistCursor(&tail, persist); err != nil {
 		return ChildArtifactManifest{}, err
 	}
@@ -289,6 +295,9 @@ func (s *ChildStage) ApplyTailBatch(
 		return err
 	}
 	next := *current
+	if err := s.accumulateTailBatch(&next, batch); err != nil {
+		return err
+	}
 	next.applied = batch.Applied
 	next.term = batch.Term
 	next.entryDigest = batch.EntryDigest
@@ -298,7 +307,7 @@ func (s *ChildStage) ApplyTailBatch(
 	sealed := batch.beforeCoordinates() != batch.afterCoordinates()
 	if sealed {
 		next.phase = ChildStageSealed
-		if err := s.certifySealedImage(&next); err != nil {
+		if err := s.sealAccumulatedImage(&next); err != nil {
 			return err
 		}
 	}
@@ -573,6 +582,8 @@ func childStageCursorMatchesExpected(
 	}
 	if cursor.phase == ChildStageArtifact {
 		return cursor.routeGeneration == expected.Source.RouteGeneration &&
+			cursor.imageRows == cursor.artifactRows &&
+			cursor.imageRows <= expected.Rows && cursor.imageBytes <= expected.RowBytes &&
 			cursor.applied == expected.Source.Applied &&
 			cursor.term == expected.Source.Term &&
 			cursor.dataChainDigest == expected.Source.DataChainDigest &&

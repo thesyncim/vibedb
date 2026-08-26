@@ -49,8 +49,11 @@ type ChildStageCursor struct {
 	applied         uint64
 	term            uint64
 	routeGeneration uint64
-	imageRows       uint64
-	imageBytes      uint64
+	// These carry the incremental image accumulator through artifact and tail
+	// phases. At seal imageDigest becomes the context-bound terminal proof.
+	// Cursor durability is the accumulator's crash-consistency boundary.
+	imageRows  uint64
+	imageBytes uint64
 
 	planDigest      [sha256.Size]byte
 	placementDigest [sha256.Size]byte
@@ -271,8 +274,8 @@ func validateChildStageCursor(cursor *ChildStageCursor) error {
 		if cursor.artifactChunks == 0 || cursor.artifactRows == 0 ||
 			cursor.artifactPayload == 0 || cursor.artifactOffset == 0 ||
 			cursor.lastBatchDigest != ([sha256.Size]byte{}) ||
-			cursor.imageRows != 0 || cursor.imageBytes != 0 ||
-			cursor.imageDigest != ([sha256.Size]byte{}) {
+			cursor.imageRows != cursor.artifactRows || cursor.imageBytes == 0 ||
+			cursor.imageDigest == ([sha256.Size]byte{}) {
 			return fmt.Errorf("%w: artifact cursor", ErrChildStage)
 		}
 	case ChildStageTail, ChildStageSealed:
@@ -280,9 +283,9 @@ func validateChildStageCursor(cursor *ChildStageCursor) error {
 			return fmt.Errorf("%w: tail cursor", ErrChildStage)
 		}
 		if cursor.phase == ChildStageTail &&
-			(cursor.imageRows != 0 || cursor.imageBytes != 0 ||
-				cursor.imageDigest != ([sha256.Size]byte{})) {
-			return fmt.Errorf("%w: unsealed image proof", ErrChildStage)
+			((cursor.imageRows == 0) != (cursor.imageBytes == 0) ||
+				cursor.imageRows != 0 && cursor.imageDigest == ([sha256.Size]byte{})) {
+			return fmt.Errorf("%w: tail image accumulator", ErrChildStage)
 		}
 		if cursor.phase == ChildStageSealed &&
 			(cursor.lastBatchDigest == ([sha256.Size]byte{}) ||
