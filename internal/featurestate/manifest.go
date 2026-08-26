@@ -99,6 +99,21 @@ var Distributed = []Feature{
 		}},
 	},
 	{
+		Name: "Distributed clock model and skew resilience",
+		Primitive: Stage{StatusPartial, "RF3 replicated order uses Raft term and index, leader reads use ReadOnlySafe, and cross-group reads expose vector cuts instead of a wall-clock timestamp. UTC still participates in TLS validity, recovery timing, session deadline construction, and the unreleased execution-pin recovery and expiry grammar.", []Reference{
+			ref("internal/raftmodel/config.go", "NewConfig"), ref("internal/executionpin/command.go", "Command"), ref("shardservice/read_fence.go", "readFenceSet"),
+		}},
+		Integrated: Stage{StatusPartial, "Raft authority, applied-index fences, catalog generations, ownership epochs, transaction decisions, and exact retries do not derive their order from UTC. Local timers remain availability and resource controls; TLS time is security-admission-critical, and consensus over an execution-pin observed timestamp does not attest that elapsed time is truthful.", []Reference{
+			ref("gateway/replicated_sql_read.go", "ReadSQLBatch"), ref("gateway/recovery.go", "recoverCoordinator"), ref("gateway/replicated_request_ledger_contract.go", "durableRequestClockContractDigest"),
+		}},
+		Shipped: Stage{StatusPartial, "The shipped RF3 lane provides per-group linearizable or explicit applied-index reads and multi-group vector cuts, not globally timestamped MVCC or external consistency. Its authenticated transports, deadlines, retries, and static read fences still depend on local time behavior. Execution-pin elapsed-time takeover is not a shipped clock-resilience claim.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "execRequest"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("internal/rafttransport/identity.go", "PeerTLS"),
+		}},
+		Qualification: Stage{StatusPartial, "Configuration tests pin ReadOnlySafe, injected-time tests cover certificate boundaries, and logical-tick tests stagger voters. No shipped-process gate combines independent UTC steps, suspend/resume, TLS boundaries, leader isolation, recovery, static fence overrun, or execution-pin false-time injection. The required matrix is specified in docs/design/distributed-clock-model.md and remains an exit gate.", []Reference{
+			ref("internal/raftmodel/config_test.go", "TestNewConfigPinsEveryField"), ref("internal/multiraft/host_leader_transfer_real_test.go", "driveUntilWithStaggeredVoterClocks"), ref("internal/rafttransport/identity_test.go", "TestPeerTLSRechecksCertificateTimeAtHandshake"),
+		}},
+	},
+	{
 		Name: "Byte-bounded distributed transactions",
 		Primitive: Stage{StatusYes, "Compact inline and root-bound paged coordinator manifests implement prepare, decision, apply, release, retry, and bounded recovery without a participant-count contract.", []Reference{
 			ref("internal/distributedtxn/manifest.go", "ManifestBuilder"), ref("gateway/transaction.go", "executeTransaction"),

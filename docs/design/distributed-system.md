@@ -125,6 +125,11 @@ The fence is not durable. It expires if a gateway abandons it. This protocol
 establishes a scoped vector cut. It does not assign a distributed MVCC
 timestamp or prove one wall-clock snapshot instant.
 
+The RF3 ordering path and the remaining wall-time obligations are separated in
+[Distributed clock contract](distributed-clock-model.md). That page is an
+unreleased skew and suspend qualification contract, not evidence that those
+fault gates currently pass.
+
 ## Global indexes
 
 A local index is stored with its base table. A global index uses a separate

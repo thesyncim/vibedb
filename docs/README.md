@@ -40,6 +40,7 @@ Start with the page that matches your task.
 - [SQL surface](design/sql-surface.md)
 - [Query planner](design/query-planner.md)
 - [Distributed transactions](design/distributed-transactions.md)
+- [Distributed clock contract](design/distributed-clock-model.md)
 - [Placement tuple format](design/distribution-tuple-format.md)
 - [Replicated state machine](design/replicated-state-machine.md)
 - [Raft WAL](design/raft-wal.md)
