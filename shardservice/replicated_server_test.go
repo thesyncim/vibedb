@@ -48,6 +48,34 @@ func (owner *fakeReplicatedOwner) ApplyMembership(
 	return owner.membershipErr
 }
 
+func TestReplicatedServerLiveServingAuthorityGatesEveryRequest(t *testing.T) {
+	owner := &fakeReplicatedOwner{state: testReplicatedServingState()}
+	server := testReplicatedServer(owner)
+	active := false
+	if err := server.BindServingAuthority(func(state raftservice.ServingState) bool {
+		return active && state == owner.state
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedProbe,
+		Fence: ReplicatedFence{Group: owner.state.Identity.Group,
+			AllocationGeneration: owner.state.Identity.AllocationGeneration},
+	}
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable ||
+		!response.HasState {
+		t.Fatalf("inactive response = %+v", response)
+	}
+	active = true
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedHandshake || !response.HasState {
+		t.Fatalf("active response = %+v", response)
+	}
+	active = false
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable {
+		t.Fatalf("revoked response = %+v", response)
+	}
+}
+
 func (owner *fakeReplicatedOwner) Probe(
 	context.Context,
 	raftmember.GroupKey,

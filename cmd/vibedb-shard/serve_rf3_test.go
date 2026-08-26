@@ -145,9 +145,9 @@ func TestBuildRF3RosterReconstructsEnrolledTransitionCuts(t *testing.T) {
 		{"stable", &pb.ConfState{Voters: []uint64{1, 2, 3}}, 2,
 			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberEnrolled}, true},
 		{"learner", &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}, 4,
-			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberLearner}, false},
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberLearner}, true},
 		{"promoted_rf4", &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}, 4,
-			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, false},
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, true},
 		{"promoted_rf4_original", &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}, 2,
 			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, true},
 		{"final_rf3", &pb.ConfState{Voters: []uint64{2, 3, 4}}, 4,
@@ -186,6 +186,76 @@ func TestBuildRF3RosterReconstructsEnrolledTransitionCuts(t *testing.T) {
 				t.Fatalf("unknown-node dial error = %v, want ErrNodeNotFound", err)
 			}
 		})
+	}
+}
+
+func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.T) {
+	manifest := serveRF3TestManifest()
+	manifest.EnrolledTarget = serveRF3TestEnrolledTarget()
+	group := serveRF3TestGroup()
+	grant := rf3MembershipGrantFixture(manifest, group, 9)
+	members := rf3GrantTransportMembers(
+		manifest, group, 10, rafttransport.MemberLearner,
+	)
+	registry, err := rafttransport.NewStaticRegistry(
+		manifest.EnrolledTarget.NodeID, members,
+		rafttransport.Limits{MaxGroups: 1, MaxMembers: len(members)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.InstallTransitionGrant(grant); err != nil {
+		t.Fatal(err)
+	}
+	authority := rf3CommandAuthority()
+	base := sqldriver.ReplicatedShardStoreIdentity{Binding: sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		Distribution:          "controlplane", Shard: "catalog", AllocationGeneration: 23,
+		ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
+		MemberID: manifest.EnrolledTarget.MemberID, StoreID: manifest.EnrolledTarget.StoreID,
+		Authority: authority,
+	}}
+	state := raftservice.ServingState{
+		Identity: raftmember.RuntimeIdentity{
+			Group: group, Distribution: base.Binding.Distribution, Shard: base.Binding.Shard,
+			AllocationGeneration: base.Binding.AllocationGeneration,
+			MemberID:             base.Binding.MemberID, StoreID: base.Binding.StoreID,
+			NodeIncarnation: 1, RelationManifestDigest: [32]byte{1},
+		},
+		Command: raftservice.CommandFence{
+			ReplicaSetVersion: 10, ActivePolicyGeneration: authority.ActivePolicyGeneration,
+			ProtectionEpoch: authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
+			SchemaGeneration: authority.SchemaGeneration, RelationManifestDigest: [32]byte{1},
+			RoutingVersion: authority.RoutingVersion, RouteGeneration: authority.RouteGeneration,
+		},
+	}
+	serving := rf3NativeServingAuthority(registry, manifest, group, base)
+	if serving(state) {
+		t.Fatal("learner served native traffic")
+	}
+	if err = registry.PublishCommittedAuthority(group, 11,
+		&pb.ConfState{Voters: []uint64{1, 2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	state.Command.ReplicaSetVersion = 11
+	state.Command.OwnershipEpoch++
+	state.Command.RoutingVersion++
+	state.Command.RouteGeneration++
+	if serving(state) {
+		t.Fatal("target served during RF4 despite owned routing cut")
+	}
+	if err = registry.PublishCommittedAuthority(group, 12,
+		&pb.ConfState{Voters: []uint64{2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	state.Command.ReplicaSetVersion = 12
+	if !serving(state) {
+		t.Fatal("target did not activate at final owned RF3")
+	}
+	state.Command.ReplicaSetVersion = 11
+	if serving(state) {
+		t.Fatal("stale pre-remove fence reactivated target")
 	}
 }
 

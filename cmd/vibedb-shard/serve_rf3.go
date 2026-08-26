@@ -162,7 +162,7 @@ func servePreparedRF3WithListen(
 	if err := rejectRF3UnappliedMembership(wal, publication.Applied); err != nil {
 		return closePrepared(err)
 	}
-	members, remoteNodes, dial, nativeAuthorized, err := buildRF3Roster(
+	members, remoteNodes, dial, nativeConfigured, err := buildRF3Roster(
 		manifest, group, base.Binding.MemberID, publication,
 	)
 	if err != nil {
@@ -223,7 +223,7 @@ func servePreparedRF3WithListen(
 		defer snapshotListener.Close()
 	}
 	var nativeListener net.Listener
-	if nativeAuthorized {
+	if nativeConfigured {
 		nativeListener, err = listen("tcp", manifest.Listeners.Native)
 		if err != nil {
 			return errors.Join(
@@ -446,10 +446,15 @@ func servePreparedRF3WithListen(
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
 	var server *shardservice.ReplicatedServer
-	if nativeAuthorized {
+	if nativeConfigured {
 		server, err = shardservice.NewReplicatedServer(peer.Owner(), 64<<20, rf3RequestTimeout)
 		if err == nil {
 			err = server.BindAuthorization(gate, nil)
+		}
+		if err == nil {
+			err = server.BindServingAuthority(rf3NativeServingAuthority(
+				transportRegistry, manifest, group, base,
+			))
 		}
 		if err != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
@@ -511,7 +516,7 @@ func servePreparedRF3WithListen(
 	}
 	var nativeDone chan error
 	nativeAddress := "fenced"
-	if nativeAuthorized {
+	if nativeConfigured {
 		nativeDone = make(chan error, 1)
 		nativeAddress = nativeListener.Addr().String()
 		go func() {
@@ -544,7 +549,7 @@ func servePreparedRF3WithListen(
 	}
 
 	// Fence and join client ingress before retiring Owner/Host/runtime.
-	if nativeAuthorized {
+	if nativeConfigured {
 		stopNative(context.Canceled)
 		if !nativeFinished {
 			primary = errors.Join(primary, componentShutdownError(<-nativeDone))
@@ -764,6 +769,51 @@ func rejectRF3UnappliedMembership(wal *raftstore.Store, applied uint64) error {
 	return nil
 }
 
+func rf3NativeServingAuthority(
+	registry *rafttransport.StaticRegistry,
+	manifest rf3Manifest,
+	group raftmember.GroupKey,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) func(raftservice.ServingState) bool {
+	return func(state raftservice.ServingState) bool {
+		if registry == nil || state.Identity.Group != group ||
+			state.Identity.MemberID != base.Binding.MemberID ||
+			state.Identity.StoreID != base.Binding.StoreID || !state.Command.Valid() {
+			return false
+		}
+		version, found := registry.ReplicaSetVersion(group)
+		if !found || version != state.Command.ReplicaSetVersion {
+			return false
+		}
+		voters := 0
+		for _, member := range manifest.Members {
+			if role, err := registry.Role(group, member.MemberID); err == nil &&
+				role == rafttransport.MemberVoter {
+				voters++
+			}
+		}
+		if target := manifest.EnrolledTarget; target != nil {
+			if role, err := registry.Role(group, target.MemberID); err == nil &&
+				role == rafttransport.MemberVoter {
+				voters++
+			}
+		}
+		role, err := registry.Role(group, base.Binding.MemberID)
+		if err != nil || role != rafttransport.MemberVoter {
+			return false
+		}
+		if target := manifest.EnrolledTarget; target != nil &&
+			base.Binding.MemberID == target.MemberID {
+			initial := base.Binding.Authority
+			return voters == rf3ManifestMembers &&
+				state.Command.OwnershipEpoch > initial.OwnershipEpoch &&
+				state.Command.RoutingVersion > initial.RoutingVersion &&
+				state.Command.RouteGeneration > initial.RouteGeneration
+		}
+		return true
+	}
+}
+
 func buildRF3Roster(
 	manifest rf3Manifest,
 	group raftmember.GroupKey,
@@ -808,10 +858,9 @@ func buildRF3Roster(
 		nodes[index], addresses[index] = configured.NodeID, configured.PeerAddress
 		if configured.MemberID == localMember {
 			localFound = true
-			localNativeAuthorized = role == rafttransport.MemberVoter &&
-				(manifest.EnrolledTarget == nil ||
-					configured.MemberID != manifest.EnrolledTarget.MemberID ||
-					len(voters) == rf3ManifestMembers)
+			localNativeAuthorized = role == rafttransport.MemberVoter ||
+				manifest.EnrolledTarget != nil &&
+					configured.MemberID == manifest.EnrolledTarget.MemberID
 		} else {
 			remote = append(remote, configured.NodeID)
 		}

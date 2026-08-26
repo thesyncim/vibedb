@@ -43,6 +43,7 @@ type ReplicatedServer struct {
 	frames         replicatedFrameByteBudget
 	authorization  *serviceauthz.Gate
 	audit          serviceauthz.AuditSink
+	serving        func(raftservice.ServingState) bool
 
 	accepted      atomic.Uint64
 	rejected      atomic.Uint64
@@ -72,6 +73,20 @@ func (server *ReplicatedServer) BindAuthorization(
 		return ErrReplicatedWire
 	}
 	server.authorization, server.audit = gate, audit
+	return nil
+}
+
+// BindServingAuthority installs an additional live committed-state gate for
+// runtimes whose client-serving role can change after startup. The predicate
+// is immutable once serving starts and observes the same serialized Owner cut
+// used to execute the request.
+func (server *ReplicatedServer) BindServingAuthority(
+	serving func(raftservice.ServingState) bool,
+) error {
+	if server == nil || serving == nil || server.state.Load() != replicatedServerReady {
+		return ErrReplicatedWire
+	}
+	server.serving = serving
 	return nil
 }
 
@@ -404,6 +419,12 @@ func (server *ReplicatedServer) executeReplicated(
 	if stateErr != nil {
 		return &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+		}
+	}
+	if server.serving != nil && !server.serving(state) {
+		return &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+			HasState: true, State: wireState,
 		}
 	}
 	if request.Fence.AllocationGeneration != state.Identity.AllocationGeneration {
