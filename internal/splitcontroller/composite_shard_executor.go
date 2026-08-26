@@ -89,7 +89,24 @@ func (executor *CompositeShardActionExecutor) ExecuteSplitAction(
 	if err != nil || want != action {
 		return errors.Join(ErrRemoteExecution, err)
 	}
+	return executor.ExecuteAuthorizedSplitAction(ctx, plan, observed, action)
+}
+
+// ExecuteAuthorizedSplitAction consumes a gateway-issued action witness after
+// the shard runtime has durably authenticated its admitted plan, predecessor
+// digest, monotonic sequence, and exact target. It deliberately does not run a
+// second global Reconcile: catalog/controller authority remains gateway-local.
+// Every concrete primitive below still verifies its local durable fence.
+func (executor *CompositeShardActionExecutor) ExecuteAuthorizedSplitAction(
+	ctx context.Context, plan *Plan, observed Observation, action Action,
+) error {
+	if executor == nil || ctx == nil || plan == nil ||
+		plan.OperationID() != executor.options.Operation ||
+		executor.options.Actions&actionBit(action.Kind) == 0 {
+		return ErrRemoteExecution
+	}
 	options := executor.options
+	var err error
 	switch action.Kind {
 	case ActionStartCapture:
 		_, err = options.Source.ExecuteStartCapture(plan)
@@ -163,6 +180,10 @@ func (executor *CompositeShardActionExecutor) ExecuteSplitAction(
 	default:
 		return ErrRemoteExecution
 	}
+}
+
+type AuthorizedShardActionExecutor interface {
+	ExecuteAuthorizedSplitAction(context.Context, *Plan, Observation, Action) error
 }
 
 func orderedSplitStages(plan *Plan, observed Observation) ([]rangesplit.ChildStageCursor, error) {

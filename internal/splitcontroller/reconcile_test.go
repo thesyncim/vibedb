@@ -20,6 +20,7 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func TestNewPlanBindsExactCatalogAndChildRuntimeIdentity(t *testing.T) {
@@ -589,9 +590,12 @@ func testSourceState(plan *Plan) replicatedstate.State {
 			RoutingVersion: uint64(plan.source.RoutingVersion), RouteGeneration: plan.current,
 			OwnedRange: plan.source.Range,
 		},
-		Applied: 41, LastTerm: 7, LastEntryDigest: sha256.Sum256([]byte("entry")),
-		DataChainDigest:    sha256.Sum256([]byte("data-chain")),
-		SnapshotBaseDigest: sha256.Sum256([]byte("base")),
+		Applied: 41, LastTerm: 7, LastKind: replicatedstate.RecordNormal,
+		LastEntryType: raftpb.EntryNormal, LastEntryDigest: sha256.Sum256([]byte("entry")),
+		DataChainDigest:     sha256.Sum256([]byte("data-chain")),
+		ApplyContractDigest: sha256.Sum256([]byte("apply-contract")),
+		SnapshotBaseDigest:  sha256.Sum256([]byte("base")),
+		ConfState:           &raftpb.ConfState{Voters: []uint64{1, 2, 3}},
 	}
 }
 

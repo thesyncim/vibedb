@@ -283,8 +283,11 @@ func (binder *BoundPlanAdmissionBinder) retire(
 }
 
 func validShardActionGrant(grant ShardActionGrant) bool {
+	witnessed := validPlanAdmission(grant.Admission) && grant.Catalog != nil && len(grant.Leases) != 0 &&
+		grant.Admission.Operation == grant.Operation && grant.Admission.PlanDigest == grant.PlanDigest &&
+		grant.Catalog.Generation() == grant.Admission.CatalogGeneration
 	return grant.Operation != (OperationID{}) && grant.PlanDigest != ([32]byte{}) &&
-		grant.Target.valid() && grant.Plan != nil && grant.Observer != nil && grant.Executor != nil &&
+		grant.Target.valid() && grant.Plan != nil && (grant.Observer != nil || witnessed) && grant.Executor != nil &&
 		grant.Actions != 0 && grant.Actions&^uint16((1<<uint(ActionComplete))-1) == 0 &&
 		grant.Plan.OperationID() == grant.Operation
 }

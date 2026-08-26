@@ -148,6 +148,9 @@ type ShardActionGrant struct {
 	Observer   PlanObserver
 	Executor   ShardActionExecutor
 	Actions    uint16
+	Admission  PlanAdmission
+	Catalog    *gateway.Snapshot
+	Leases     []*RuntimeStoreLease
 }
 
 type ShardActionExecutor interface {
@@ -301,6 +304,79 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteSplitAction(
 		return ErrRemoteExecution
 	}
 	return grant.Executor.ExecuteSplitAction(ctx, plan, observed, action)
+}
+
+func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
+	ctx context.Context, request shardcontrol.Request, payload remoteStepPayload, observed Observation,
+) error {
+	if runtime == nil || ctx == nil {
+		return ErrRemoteExecution
+	}
+	operation := OperationID(request.Operation)
+	grant, ok := runtime.grants.resolve(operation, request.PlanDigest, payload.Target)
+	if !ok || grant.Plan == nil || grant.Plan.OperationID() != operation ||
+		grant.Actions&actionBit(ActionKind(request.Action)) == 0 ||
+		!validPlanAdmission(grant.Admission) || grant.Admission.Operation != operation ||
+		grant.Admission.PlanDigest != request.PlanDigest ||
+		grant.Admission.CatalogGeneration != payload.Catalog ||
+		grant.Admission.CatalogDigest != payload.CatalogDigest ||
+		payload.AdmissionRevision != grant.Admission.CatalogGeneration || len(grant.Leases) == 0 {
+		return ErrRemoteExecution
+	}
+	action := Action{Kind: ActionKind(request.Action), Child: request.Child}
+	if request.Step != replicatedActionProof(request.Operation, replicatedActionCursor(action)) ||
+		payload.Sequence != remoteActionWitnessSequence(action) {
+		return ErrRemoteExecution
+	}
+	binding := observed.SourceState.Binding
+	wantFence := shardcontrol.Fence{
+		CatalogGeneration: payload.Catalog,
+		Allocation:        binding.AllocationGeneration, OwnershipEpoch: binding.OwnershipEpoch,
+		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
+		RouteGeneration: binding.RouteGeneration, ReplicaSetVersion: observed.SourceState.ReplicaSetVersion,
+		Applied: observed.SourceState.Applied,
+	}
+	if request.Fence != wantFence {
+		return ErrRemoteExecution
+	}
+	if remoteActionTargetsChild(action.Kind) {
+		target, found := grant.Plan.Target(action.Child)
+		if !found || !targetMatchesChild(payload.Target, target) {
+			return ErrRemoteExecution
+		}
+	} else if !targetMatchesSourceState(payload.Target, observed.SourceState) {
+		return ErrRemoteExecution
+	}
+	if action.Kind == ActionPruneRetained {
+		if observed.Certificate == nil || grant.Catalog == nil {
+			return ErrRemoteExecution
+		}
+		certificate, err := gateway.OpenRetainedPruneCertificate(payload.RetainedPrune)
+		if err != nil || !validRetainedPruneCertificate(grant.Plan, grant.Catalog, *observed.Certificate, certificate) {
+			return errors.Join(ErrRemoteExecution, err)
+		}
+		observed.OlderCatalogDrained = true
+		observed.CatalogDrainCertificate = certificate.CatalogDrain()
+		observed.RetainedPruneCertificate = certificate
+	} else if len(payload.RetainedPrune) != 0 {
+		return ErrRemoteExecution
+	}
+	witness := ActionWitness{
+		Operation: operation, PlanDigest: request.PlanDigest,
+		CatalogGeneration: payload.Catalog, CatalogDigest: payload.CatalogDigest,
+		Sequence: payload.Sequence, PredecessorDigest: payload.PredecessorDigest, Step: request.Step,
+	}
+	if err := BeginActionWitness(grant.Leases, witness); err != nil {
+		return err
+	}
+	executor, ok := grant.Executor.(AuthorizedShardActionExecutor)
+	if !ok {
+		return ErrRemoteExecution
+	}
+	if err := executor.ExecuteAuthorizedSplitAction(ctx, grant.Plan, observed, action); err != nil {
+		return err
+	}
+	return SettleActionWitness(grant.Leases, witness)
 }
 
 func sha256Sum(value []byte) [32]byte { return sha256.Sum256(value) }
