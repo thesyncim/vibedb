@@ -66,6 +66,11 @@ type checkpointMembershipCertificate struct {
 	members        []checkpointMembershipMember
 }
 
+type checkpointMembershipRecoveryAuthority struct {
+	witness       CheckpointMembershipWitness
+	authorization [sha256.Size]byte
+}
+
 // ObserveMembershipTransition settles an outcome-unknown prepare against the
 // exact current checkpoint owner and rollout authorization. It does not
 // activate the target membership.
@@ -257,6 +262,142 @@ func checkpointMembershipTargetDigest(members []checkpointMembershipMember) [sha
 	var out [sha256.Size]byte
 	_ = h.Sum(out[:0])
 	return out
+}
+
+func checkpointMembershipMembersFromCollections(
+	members []checkpointGroupMember,
+) ([]checkpointMembershipMember, error) {
+	target := make([]checkpointMembershipMember, len(members))
+	for i, member := range members {
+		if member.collection == nil || member.collection.file == nil ||
+			member.collection.Generation() == 0 ||
+			member.collection.Generation() != member.collection.DurableGeneration() {
+			return nil, ErrCheckpointMembershipTransition
+		}
+		target[i] = checkpointMembershipMember{
+			nameDigest: member.nameDigest,
+			pathDigest: sha256.Sum256([]byte(filepath.Base(member.collection.file.Name()))),
+			storeID:    member.storeID, journalID: member.journalID,
+			generation: member.collection.DurableGeneration(),
+		}
+	}
+	return target, nil
+}
+
+func selectCheckpointMembershipForRecovery(
+	log *TxnLog,
+	file *os.File,
+	source checkpointGroupCertificate,
+	members []checkpointGroupMember,
+	authority checkpointMembershipRecoveryAuthority,
+) (checkpointGroupCertificate, error) {
+	if file == nil || source.sequence == math.MaxUint64 ||
+		authority.authorization == ([sha256.Size]byte{}) {
+		return checkpointGroupCertificate{}, ErrCheckpointMembershipTransition
+	}
+	record, err := openCheckpointMembershipCertificate(log)
+	if err != nil || checkpointMembershipWitness(record) != authority.witness ||
+		record.authorization != authority.authorization ||
+		record.source != checkpointMembershipSourceDigest(source) {
+		return checkpointGroupCertificate{}, errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	target, err := checkpointMembershipMembersFromCollections(members)
+	if err != nil || record.target != checkpointMembershipTargetDigest(target) ||
+		!slices.EqualFunc(record.members, target, func(a, b checkpointMembershipMember) bool {
+			return a == b
+		}) {
+		return checkpointGroupCertificate{}, errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	selected := source
+	selected.sequence++
+	selected.members = members
+	// Retention seals bind membership lineage and cannot cross replacement.
+	selected.retentionApplied = 0
+	selected.retentionCommitment = [24]byte{}
+	if err := validateCheckpointGroupCertificateMembers(selected, members); err != nil {
+		return checkpointGroupCertificate{}, errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	encoded, err := encodeCheckpointGroupCertificate(selected)
+	if err != nil {
+		return checkpointGroupCertificate{}, errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	if _, err := file.WriteAt(
+		encoded, int64(selected.sequence%checkpointGroupSlots)*checkpointGroupSlotBytes,
+	); err != nil {
+		return checkpointGroupCertificate{}, journalCommitOutcomeUnknown(err)
+	}
+	if checkpointGroupFaultHook != nil {
+		if err := checkpointGroupFaultHook(checkpointGroupAfterCertificateWrite); err != nil {
+			return checkpointGroupCertificate{}, err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		return checkpointGroupCertificate{}, journalCommitOutcomeUnknown(err)
+	}
+	if checkpointGroupFaultHook != nil {
+		if err := checkpointGroupFaultHook(checkpointGroupAfterCertificateSync); err != nil {
+			return checkpointGroupCertificate{}, err
+		}
+	}
+	return selected, nil
+}
+
+func validateSelectedCheckpointMembership(
+	log *TxnLog,
+	selected checkpointGroupCertificate,
+	members []checkpointGroupMember,
+	authority checkpointMembershipRecoveryAuthority,
+) error {
+	record, err := openCheckpointMembershipCertificate(log)
+	if err != nil || checkpointMembershipWitness(record) != authority.witness ||
+		record.authorization != authority.authorization ||
+		record.applied != selected.applied ||
+		record.txnHighWater != selected.txnHighWater ||
+		record.markerID != selected.markerID {
+		return errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	target, err := checkpointMembershipMembersFromCollections(members)
+	if err != nil || record.target != checkpointMembershipTargetDigest(target) ||
+		!slices.Equal(record.members, target) {
+		return errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	return nil
+}
+
+func validCheckpointMembershipCertificateSuccessor(
+	log *TxnLog,
+	previous, selected checkpointGroupCertificate,
+) bool {
+	if previous.sequence == math.MaxUint64 || previous.sequence+1 != selected.sequence ||
+		previous.applied != selected.applied ||
+		previous.txnHighWater != selected.txnHighWater ||
+		previous.txnBase != selected.txnBase ||
+		previous.markerEpoch != selected.markerEpoch ||
+		previous.markerID != selected.markerID ||
+		previous.seedApplied != selected.seedApplied ||
+		previous.seedState != selected.seedState ||
+		previous.seedMember != selected.seedMember ||
+		previous.maxApplySpan != selected.maxApplySpan ||
+		previous.maxSpanTxn != selected.maxSpanTxn ||
+		previous.maxSpanFirst != selected.maxSpanFirst ||
+		previous.maxSpanLast != selected.maxSpanLast ||
+		selected.retentionApplied != 0 || selected.retentionCommitment != ([24]byte{}) {
+		return false
+	}
+	record, err := openCheckpointMembershipCertificate(log)
+	if err != nil || record.source != checkpointMembershipSourceDigest(previous) ||
+		len(record.members) != len(selected.members) {
+		return false
+	}
+	for i := range selected.members {
+		member := selected.members[i]
+		if record.members[i].nameDigest != member.nameDigest ||
+			record.members[i].storeID != member.storeID ||
+			record.members[i].journalID != member.journalID {
+			return false
+		}
+	}
+	return true
 }
 
 func encodeCheckpointMembershipCertificate(c checkpointMembershipCertificate) ([]byte, error) {

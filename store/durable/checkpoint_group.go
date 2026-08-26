@@ -3256,7 +3256,8 @@ func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCerti
 	selected := valid[len(valid)-1].certificate
 	if len(valid) > 1 {
 		previous := valid[len(valid)-2].certificate
-		if !validCheckpointGroupCertificateSuccessor(previous, selected) {
+		if !validCheckpointGroupCertificateSuccessor(previous, selected) &&
+			!validCheckpointMembershipCertificateSuccessor(log, previous, selected) {
 			_ = file.Close()
 			return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 		}

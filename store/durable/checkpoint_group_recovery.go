@@ -37,7 +37,29 @@ func OpenCollectionsWithCheckpointGroup(
 	options CheckpointGroupOptions,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	return openCollectionsWithCheckpointGroup(
-		dir, txnOptions, requests, names, "", options,
+		dir, txnOptions, requests, names, "", options, nil,
+	)
+}
+
+// OpenCollectionsWithCheckpointMembershipTransition is the catalog-authorized
+// recovery entry point for a prepared membership replacement. The ordinary
+// opener never selects a staged target. This call selects it only when the
+// supplied receipt, authorization, opened target files, and current source
+// checkpoint all match the durable two-slot transition certificate exactly.
+func OpenCollectionsWithCheckpointMembershipTransition(
+	dir string,
+	txnOptions TxnLogOptions,
+	requests []TransactionCollectionOpen,
+	names []string,
+	witness CheckpointMembershipWitness,
+	authorization [32]byte,
+	options CheckpointGroupOptions,
+) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
+	authority := checkpointMembershipRecoveryAuthority{
+		witness: witness, authorization: authorization,
+	}
+	return openCollectionsWithCheckpointGroup(
+		dir, txnOptions, requests, names, "", options, &authority,
 	)
 }
 
@@ -59,7 +81,7 @@ func OpenCollectionsWithSeededCheckpointGroup(
 		return nil, nil, nil, fmt.Errorf("%w: empty seed member", ErrTxnParticipant)
 	}
 	return openCollectionsWithCheckpointGroup(
-		dir, txnOptions, requests, names, seedMember, options,
+		dir, txnOptions, requests, names, seedMember, options, nil,
 	)
 }
 
@@ -70,6 +92,7 @@ func openCollectionsWithCheckpointGroup(
 	names []string,
 	seedPendingMember string,
 	options CheckpointGroupOptions,
+	membershipAuthority *checkpointMembershipRecoveryAuthority,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	if len(requests) != len(names) || len(requests) == 0 ||
 		len(requests) > checkpointGroupMaxMembers {
@@ -230,11 +253,28 @@ func openCollectionsWithCheckpointGroup(
 	if err != nil {
 		return abort(collections, err)
 	}
-	if err := validateCheckpointGroupCertificateMembers(certificate, members); err != nil {
-		return abort(collections, err)
-	}
+	// Prove the exact catalog-selected namespace before a transition-aware open
+	// can publish the target checkpoint certificate. A later namespace error
+	// must never turn a definitely unselected target into durable authority.
 	if err := validateCheckpointGroupDirectoryMembership(recovery.log, members); err != nil {
 		return abort(collections, err)
+	}
+	if err := validateCheckpointGroupCertificateMembers(certificate, members); err != nil {
+		if membershipAuthority == nil {
+			return abort(collections, err)
+		}
+		certificate, err = selectCheckpointMembershipForRecovery(
+			recovery.log, certificateFile, certificate, members, *membershipAuthority,
+		)
+		if err != nil {
+			return abort(collections, err)
+		}
+	} else if membershipAuthority != nil {
+		if err := validateSelectedCheckpointMembership(
+			recovery.log, certificate, members, *membershipAuthority,
+		); err != nil {
+			return abort(collections, err)
+		}
 	}
 	if checkpointGroupBeforeMemberReplayHook != nil {
 		checkpointGroupBeforeMemberReplayHook(collections)

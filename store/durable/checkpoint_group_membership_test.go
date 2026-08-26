@@ -150,6 +150,104 @@ func TestCheckpointMembershipPreparedSourceReopensServingOldMembership(t *testin
 	}
 }
 
+func TestCheckpointMembershipCatalogAuthorizedTargetRecovery(t *testing.T) {
+	dir, source, _, group := newCheckpointGroupTestStore(t, 1)
+	checkpointGroupPut(t, group, 1, source, "one")
+	staging := t.TempDir()
+	target := []NamedCollection{
+		openTxnNamedCollection(t, staging, "system", txnTestOptions()),
+		openTxnNamedCollection(t, staging, "user", txnTestOptions()),
+	}
+	authorization := sha256.Sum256([]byte("catalog-generation-2"))
+	witness, err := group.PrepareMembershipTransition(target, authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model the namespace transaction's target-selected crash image: catalog
+	// authority names the target and the canonical member paths hold its exact
+	// prepared primary/journal images.
+	image := copyCheckpointGroupDirectory(t, dir)
+	for _, member := range target {
+		for _, sourcePath := range []string{
+			member.Collection.file.Name(),
+			RecoveryJournalPath(member.Collection.file.Name()),
+		} {
+			data, err := os.ReadFile(sourcePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(image, filepath.Base(sourcePath)), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	wrong := authorization
+	wrong[0] ^= 0xff
+	requests, files := checkpointGroupTestOpenRequests(t, image)
+	collections, log, activated, err := OpenCollectionsWithCheckpointMembershipTransition(
+		image, TxnLogOptions{}, requests, []string{"system", "user"},
+		witness, wrong, CheckpointGroupOptions{},
+	)
+	for _, file := range files {
+		_ = file.Close()
+	}
+	if collections != nil || log != nil || activated != nil ||
+		!errors.Is(err, ErrCheckpointMembershipTransition) {
+		t.Fatalf("wrong authority selected target: collections=%v log=%v group=%v err=%v",
+			collections, log, activated, err)
+	}
+	requests, files = checkpointGroupTestOpenRequests(t, image)
+	collections, log, activated, err = OpenCollectionsWithCheckpointMembershipTransition(
+		image, TxnLogOptions{}, requests, []string{"system", "user"},
+		witness, authorization, CheckpointGroupOptions{},
+	)
+	for _, file := range files {
+		_ = file.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activated.Owns([]NamedCollection{
+		{Name: "system", Collection: collections[0]},
+		{Name: "user", Collection: collections[1]},
+	}) {
+		t.Fatal("recovered group does not own selected target")
+	}
+	if err := activated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, collection := range collections {
+		if err := collection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Once the target checkpoint certificate is synced, the ordinary opener is
+	// sufficient; transition authority is needed only to cross the catalog seam.
+	requests, files = checkpointGroupTestOpenRequests(t, image)
+	collections, log, activated, err = OpenCollectionsWithCheckpointGroup(
+		image, TxnLogOptions{}, requests, []string{"system", "user"},
+		CheckpointGroupOptions{},
+	)
+	for _, file := range files {
+		_ = file.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = activated.Close()
+		for _, collection := range collections {
+			_ = collection.Close()
+		}
+		_ = log.Close()
+	}()
+}
+
 func TestCheckpointMembershipPrepareSettlesEveryPublicationBoundary(t *testing.T) {
 	points := []checkpointGroupFaultPoint{
 		checkpointGroupAfterMembershipWrite,
