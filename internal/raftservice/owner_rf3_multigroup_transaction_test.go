@@ -1658,9 +1658,161 @@ func multiGroupRF3TransactionIDs(count int) io.Reader {
 	return bytes.NewReader(encoded)
 }
 
+func TestShippedExecBatchGlobalIndexSurvivesHiddenRF3Commit(t *testing.T) {
+	cluster := newMultiGroupTransactionRF3Cluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{0xec}, Generation: 1}
+	ctx, err := serviceauthz.WithAuthority(ctx, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for group := 0; group < multiGroupRF3Groups; group++ {
+		if err := cluster.owners[group].Campaign(ctx, cluster.groups[group].key); err != nil {
+			t.Fatal(err)
+		}
+		_ = waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[group].key)
+	}
+
+	client := newMultiGroupRF3RoundTripper(t, cluster)
+	client.hideCommit = true
+	native, err := gateway.NewReplicatedExecutorWithOptions(
+		client, gateway.ReplicatedExecutorOptions{
+			MaxAttempts: 1, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 8,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := gateway.NewReplicatedTransactionOrchestrator(
+		gateway.ReplicatedTransactionOrchestratorOptions{
+			Executor: native, Tenant: []byte("tenant"), MaxConcurrency: 2,
+			MaxInFlightBytes: 64 << 20, MaxMutations: 2, MaxMutationBytes: 1 << 20,
+			RecoveryTimeout: time.Minute, IDSource: multiGroupRF3TransactionIDs(6),
+			RecoveryAuthority: authority,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests, err := gateway.NewReplicatedTransactionRequestRegistry(
+		gateway.ReplicatedTransactionRequestRegistryOptions{
+			Orchestrator: orchestrator, MaxEntries: 4,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := multiGroupRF3SQLSnapshot(t, cluster, true)
+	executor := gateway.NewExecutor(nil, gateway.NewCatalogHolder(snapshot), gateway.Options{
+		ReplicatedTransactions: orchestrator, ReplicatedTransactionRequests: requests,
+	})
+	document := []byte(`{"id":"indexed-1","email":"indexed@example.test"}`)
+	query := []gateway.Query{{
+		SQL:    `INSERT INTO orders VALUES (?)`,
+		Params: []shardservice.Param{shardservice.DocumentParam(string(document))},
+	}}
+	requestID := replication.ID128{0x96}
+	if result, executeErr := executor.ExecBatchRequest(ctx, requestID, query); executeErr == nil || result != nil {
+		t.Fatalf("hidden global-index execution result=%+v err=%v", result, executeErr)
+	}
+
+	client.mu.Lock()
+	hiddenGroup, hiddenMember := client.hiddenGroup, client.hiddenMember
+	client.mu.Unlock()
+	if hiddenGroup < 0 || hiddenMember < 0 {
+		t.Fatalf("hidden global-index commit group=%d member=%d", hiddenGroup, hiddenMember)
+	}
+	removed := map[int]bool{hiddenMember: true}
+	candidate := (hiddenMember + 1) % multiGroupRF3Voters
+	if err := cluster.owners[candidate].Campaign(ctx, cluster.groups[hiddenGroup].key); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[hiddenGroup].key)
+
+	result, err := executor.ExecBatchRequest(ctx, requestID, query)
+	if err != nil || result == nil || result.RowsAffected != 1 ||
+		result.ShardsFanned != 2 || result.TransactionID == (replication.ID128{}) {
+		t.Fatalf("recovered global-index result=%+v err=%v", result, err)
+	}
+	traceCount := len(client.gatewayTrace())
+	replay, err := executor.ExecBatchRequest(ctx, requestID, query)
+	if err != nil || replay == nil || replay.TransactionID != result.TransactionID ||
+		replay.RowsAffected != 1 || len(client.gatewayTrace()) != traceCount {
+		t.Fatalf("cached global-index replay=%+v err=%v", replay, err)
+	}
+
+	program, err := snapshot.CompileGlobalIndex("orders", "by_email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace gateway.GlobalIndexWorkspace
+	indexRoute, err := program.RouteDocument(document, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseKey, ok := orderedkey.AppendString(nil, []byte("indexed-1"), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode indexed base key")
+	}
+	conflictingDocument := []byte(`{"id":"indexed-1","email":"rollback@example.test"}`)
+	conflict := []gateway.Query{{
+		SQL: `INSERT INTO orders VALUES (?)`, Params: []shardservice.Param{
+			shardservice.DocumentParam(string(conflictingDocument)),
+		},
+	}}
+	if conflictResult, conflictErr := executor.ExecBatchRequest(
+		ctx, replication.ID128{0x97}, conflict,
+	); conflictErr == nil || conflictResult != nil {
+		t.Fatalf("conflicting indexed insert result=%+v err=%v", conflictResult, conflictErr)
+	}
+	var conflictingWorkspace gateway.GlobalIndexWorkspace
+	conflictingIndex, err := program.RouteDocument(conflictingDocument, &conflictingWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeMember := (hiddenMember + 1) % multiGroupRF3Voters
+	indexState := mustRF3State(t, ctx, cluster.owners[probeMember], cluster.groups[1].key)
+	rolledBack, rollbackLease, rollbackErr := cluster.owners[probeMember].ReadPoint(
+		ctx, PointReadRequest{
+			Fence: indexState.Fence(), Relation: 1, Key: conflictingIndex.EntryKey,
+			MinimumApplied: 1, MaxValueBytes: replication.MaxMutationValueBytes,
+		},
+	)
+	if rollbackLease != nil {
+		rollbackLease.Release()
+	}
+	if rollbackErr != nil || rolledBack.Found {
+		t.Fatalf("aborted index participant leaked value=%q found=%v err=%v",
+			rolledBack.Value, rolledBack.Found, rollbackErr)
+	}
+	for member := 0; member < multiGroupRF3Voters; member++ {
+		if member == hiddenMember {
+			continue
+		}
+		for group, point := range []struct {
+			key, value []byte
+		}{{baseKey, document}, {indexRoute.EntryKey, indexRoute.LocatorValue}} {
+			state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[group].key)
+			got, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
+				Fence: state.Fence(), Relation: 1, Key: point.key, MinimumApplied: 1,
+				MaxValueBytes: replication.MaxMutationValueBytes,
+			})
+			if lease != nil {
+				lease.Release()
+			}
+			if readErr != nil || !got.Found || !bytes.Equal(got.Value, point.value) {
+				t.Fatalf("member %d group %d indexed value=%q found=%v err=%v",
+					member, group, got.Value, got.Found, readErr)
+			}
+		}
+	}
+}
+
 func multiGroupRF3SQLSnapshot(
 	t testing.TB,
 	cluster *multiGroupTransactionRF3Cluster,
+	globalIndex ...bool,
 ) *gateway.Snapshot {
 	t.Helper()
 	config := distribution.ClusterConfig{}
@@ -1670,6 +1822,14 @@ func multiGroupRF3SQLSnapshot(
 	for group := 0; group < multiGroupRF3Groups; group++ {
 		route := cluster.route(group)
 		table := "orders_" + string(rune('a'+group))
+		primary := "/id"
+		if len(globalIndex) != 0 && globalIndex[0] {
+			if group == 0 {
+				table = "orders"
+			} else {
+				table, primary = "orders_by_email", "/email"
+			}
+		}
 		leaders := make([]distribution.EndpointID, 0, multiGroupRF3Voters)
 		replicas := make([]gateway.ReplicatedReplicaDescriptor, 0, multiGroupRF3Voters)
 		for member := range route.Replicas {
@@ -1711,7 +1871,7 @@ func multiGroupRF3SQLSnapshot(
 		})
 		config.Manifests = append(config.Manifests, manifest)
 		config.Placements = append(config.Placements, distribution.TablePlacement{
-			Table: table, Distribution: route.Distribution, Columns: []string{"/id"},
+			Table: table, Distribution: route.Distribution, Columns: []string{primary},
 		})
 		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
 			Distribution: route.Distribution, Shard: route.Shard, Group: route.Group,
@@ -1720,15 +1880,25 @@ func multiGroupRF3SQLSnapshot(
 			Replicas:             replicas,
 		})
 		profiles = append(profiles, gateway.ReplicatedTableProfile{
-			Table: table, Relation: 1, PrimaryKey: "/id",
+			Table: table, Relation: 1, PrimaryKey: primary,
 			SchemaGeneration:       route.Command.SchemaGeneration,
 			RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
 			MaxKeyBytes:            replication.MaxMutationKeyBytes,
 			MaxDocumentBytes:       replication.MaxMutationValueBytes,
 		})
 	}
+	var indexes []gateway.IndexDescriptor
+	if len(globalIndex) != 0 && globalIndex[0] {
+		indexes = []gateway.IndexDescriptor{{
+			IndexID: 1, Incarnation: 1, Table: "orders", Name: "by_email",
+			Relation: "orders_by_email", Paths: []string{"/email"},
+			LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+			Flags:     gateway.IndexGlobal | gateway.IndexUnique | gateway.IndexOrdered,
+			Lifecycle: gateway.IndexReady,
+		}}
+	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(
-		config, endpoints, 31, nil, nil, descriptors, profiles,
+		config, endpoints, 31, indexes, nil, descriptors, profiles,
 	)
 	if err != nil {
 		t.Fatal(err)
