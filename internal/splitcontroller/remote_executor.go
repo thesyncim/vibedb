@@ -92,6 +92,16 @@ func appendRemoteStepRequest(
 	if err != nil {
 		return shardcontrol.Request{}, err
 	}
+	return appendRemoteStepRequestForTarget(dst, plan, observed, action, target)
+}
+
+func appendRemoteStepRequestForTarget(
+	dst []byte, plan *Plan, observed Observation, action Action, target ShardActionTarget,
+) (shardcontrol.Request, error) {
+	if plan == nil || observed.Catalog == nil || !target.valid() ||
+		action.Kind < ActionAwaitSourceLeader || action.Kind > ActionComplete {
+		return shardcontrol.Request{}, ErrRemoteExecution
+	}
 	catalogDigest, err := gateway.CatalogSnapshotDigest(observed.Catalog)
 	if err != nil {
 		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)

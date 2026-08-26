@@ -99,6 +99,43 @@ func remoteActionTarget(plan *Plan, observed Observation, action Action) (ShardA
 	return result, nil
 }
 
+func remoteActionTargetForChildReplica(
+	plan *Plan, child uint8, replica ChildReplicaTarget,
+) (ShardActionTarget, error) {
+	if plan == nil {
+		return ShardActionTarget{}, ErrRemoteExecution
+	}
+	target, ok := plan.Target(child)
+	if !ok || !targetMatchesPreparedReplica(target, replica) {
+		return ShardActionTarget{}, ErrRemoteExecution
+	}
+	binding := replica.SQL.Binding
+	result := ShardActionTarget{
+		Group: raftmember.GroupKey{
+			ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
+			TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
+			ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
+		},
+		Allocation: binding.AllocationGeneration, Member: replica.Member,
+		Authority: target.Authority, RelationManifestDigest: replica.SQL.RelationManifestDigest,
+	}
+	if !result.valid() {
+		return ShardActionTarget{}, ErrRemoteExecution
+	}
+	return result, nil
+}
+
+func targetMatchesPreparedReplica(target ChildTarget, replica ChildReplicaTarget) bool {
+	for _, prepared := range target.Replicas {
+		if prepared.Member == replica.Member && prepared.Node == replica.Node &&
+			prepared.StoreID == replica.StoreID && prepared.NodeIncarnation == replica.NodeIncarnation &&
+			prepared.CertificateDigest == replica.CertificateDigest && prepared.SQL.Equal(replica.SQL) {
+			return true
+		}
+	}
+	return false
+}
+
 func planRelationManifestDigest(plan *Plan) [32]byte {
 	if plan == nil || plan.relationDigest != ([32]byte{}) {
 		if plan == nil {
@@ -460,12 +497,23 @@ func targetMatchesSourceState(target ShardActionTarget, state replicatedstate.St
 }
 
 func targetMatchesChild(target ShardActionTarget, child ChildTarget) bool {
-	binding := child.SQL.Binding
+	for _, replica := range child.Replicas {
+		if targetMatchesChildReplica(target, child, replica) {
+			return true
+		}
+	}
+	return false
+}
+
+func targetMatchesChildReplica(
+	target ShardActionTarget, child ChildTarget, replica ChildReplicaTarget,
+) bool {
+	binding := replica.SQL.Binding
 	return target.Group == (raftmember.GroupKey{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
-	}) && target.Allocation == binding.AllocationGeneration && target.Member == binding.MemberID &&
+	}) && target.Allocation == binding.AllocationGeneration && target.Member == replica.Member &&
 		target.Authority == child.Authority &&
-		target.RelationManifestDigest == child.SQL.RelationManifestDigest
+		target.RelationManifestDigest == replica.SQL.RelationManifestDigest
 }

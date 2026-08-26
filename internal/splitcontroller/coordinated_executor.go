@@ -43,6 +43,33 @@ func ExecuteCoordinatedReplicatedStep(
 			case ActionComplete:
 				return nil
 			default:
+				if remoteActionTargetsChild(action.Kind) {
+					target, ok := plan.Target(action.Child)
+					if !ok || len(target.Replicas) != gateway.ServingReplicaCount {
+						return ErrRemoteExecution
+					}
+					for _, replica := range target.Replicas {
+						destination, targetErr := remoteActionTargetForChildReplica(plan, action.Child, replica)
+						if targetErr != nil {
+							return targetErr
+						}
+						request, requestErr := appendRemoteStepRequestForTarget(
+							nil, plan, observed, action, destination,
+						)
+						if requestErr != nil {
+							return errors.Join(ErrRemoteExecution, requestErr)
+						}
+						response, requestErr := router.ExecuteShardControl(ctx, action, request)
+						if requestErr != nil {
+							return requestErr
+						}
+						if response.Code != shardcontrol.ResultAccepted || response.Operation != request.Operation ||
+							response.Step != request.Step {
+							return ErrRemoteExecution
+						}
+					}
+					return nil
+				}
 				request, err := appendRemoteStepRequest(nil, plan, observed, action)
 				if err != nil {
 					return errors.Join(ErrRemoteExecution, err)
