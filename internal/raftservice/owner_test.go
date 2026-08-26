@@ -273,7 +273,7 @@ func TestOwnerAbandonedDeliveryCancelsRegisteredWaiter(t *testing.T) {
 		MaxGroups: 1, MaxOutstandingIdentities: 1,
 		MaxOutstandingAttempts: 1, MaxWaiters: 1,
 		MaxAttemptsPerIdentity:     1,
-		MaxRetainedCompletionBytes: replication.MaxEmptyResultCompletionEnvelopeBytes,
+		MaxRetainedCompletionBytes: replicatedstate.MaxCompletionEnvelopeBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -329,7 +329,7 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 		MaxGroups: 1, MaxOutstandingIdentities: 1,
 		MaxOutstandingAttempts: 1, MaxWaiters: 1,
 		MaxAttemptsPerIdentity:     1,
-		MaxRetainedCompletionBytes: replication.MaxEmptyResultCompletionEnvelopeBytes,
+		MaxRetainedCompletionBytes: replicatedstate.MaxCompletionEnvelopeBytes,
 	})
 	if err != nil {
 		t.Fatal(err)

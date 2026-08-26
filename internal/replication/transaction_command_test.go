@@ -95,6 +95,11 @@ func TestTransactionParticipantStageRoundTripBorrowedAndZeroAllocation(t *testin
 	if cap(view.TransactionBytes()) != len(view.TransactionBytes()) {
 		t.Fatal("transaction bytes are not capacity clamped")
 	}
+	role, operation, ok := view.TransactionIdentity()
+	if !ok || role != distributedtxn.ReplicatedRoleParticipant ||
+		operation != distributedtxn.ReplicatedStageParticipant {
+		t.Fatalf("transaction identity = (%d,%d,%t)", role, operation, ok)
+	}
 	var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
 	control, err := view.OpenTransactionInto(scopes[:])
 	if err != nil {
@@ -106,11 +111,22 @@ func TestTransactionParticipantStageRoundTripBorrowedAndZeroAllocation(t *testin
 	}
 	if got := testing.AllocsPerRun(1000, func() {
 		opened, openErr := OpenCommand(encoded)
-		if openErr != nil || len(opened.TransactionBytes()) == 0 {
+		openedRole, openedOperation, openedOK := opened.TransactionIdentity()
+		if openErr != nil || len(opened.TransactionBytes()) == 0 || !openedOK ||
+			openedRole != distributedtxn.ReplicatedRoleParticipant ||
+			openedOperation != distributedtxn.ReplicatedStageParticipant {
 			panic(openErr)
 		}
 	}); got != 0 {
 		t.Fatalf("OpenCommand allocations = %v, want 0", got)
+	}
+	ordinary, err := OpenCommand(encodeCommand(t, testCommand()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinaryRole, ordinaryOperation, ordinaryOK := ordinary.TransactionIdentity(); ordinaryOK || ordinaryRole != distributedtxn.ReplicatedRoleInvalid ||
+		ordinaryOperation != distributedtxn.ReplicatedOperationInvalid {
+		t.Fatalf("ordinary transaction identity = (%d,%d,%t)", ordinaryRole, ordinaryOperation, ordinaryOK)
 	}
 }
 

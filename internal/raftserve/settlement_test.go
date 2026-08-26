@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -209,6 +211,145 @@ func testCompletion(
 	return replicatedstate.CompletionLookup{
 		Key:   replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
 		Bytes: encoded, AppliedSequence: applied,
+	}
+}
+
+func testTransactionCommand(
+	t testing.TB,
+	group raftmember.GroupKey,
+) []byte {
+	t.Helper()
+	id := distributedtxn.ID{0xc1, 0x55, 0x81}
+	control, err := distributedtxn.AppendReplicatedCommand(nil, distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleParticipant,
+		Operation: distributedtxn.ReplicatedPrepareParticipant,
+		ID:        id, ExpectedRevision: 1,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence, err := replication.TransactionClientSequence(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := testCommand(group, id[0], sequence)
+	command.Kind = replication.CommandTransaction
+	command.Transaction = control
+	command.Batches = nil
+	command.ClientID = replication.ID128(id)
+	command.ClientEpoch = uint64(distributedtxn.ReplicatedRoleParticipant)
+	command.ClientSequence = sequence
+	command.AckThrough = 0
+	command.Fingerprint = sha256.Sum256(control)
+	return encodeTestCommand(t, command)
+}
+
+func testTransactionCompletion(
+	t testing.TB,
+	group raftmember.GroupKey,
+	commandBytes []byte,
+	applied uint64,
+	role distributedtxn.ReplicatedRole,
+	operation distributedtxn.ReplicatedOperation,
+) replicatedstate.CompletionLookup {
+	t.Helper()
+	command, err := replication.OpenCommand(commandBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result [24]byte
+	result[0] = byte(role)
+	result[1] = byte(operation)
+	result[2] = 2 // The control-revision-valid bit.
+	binary.LittleEndian.PutUint64(result[8:16], 2)
+	if _, err = replicatedstate.OpenTransactionCompletionResult(
+		replicatedstate.ResultApplied, result[:],
+	); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
+		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
+		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
+		Distribution:          command.Distribution, Shard: command.Shard,
+		AllocationGeneration: command.AllocationGeneration,
+		ShardIncarnation:     command.ShardIncarnation, GroupID: command.GroupID,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch,
+		RoutingVersion:         command.RoutingVersion, RouteGeneration: command.RouteGeneration,
+		Tenant: command.Tenant, ClientID: command.ClientID, ClientEpoch: command.ClientEpoch,
+		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
+		RetryHome: command.RetryHome, AppliedSequence: applied,
+		ResultCode:   replicatedstate.ResultApplied,
+		ResultFormat: replicatedstate.ResultFormatTransaction,
+		Storage:      replication.CompletionInline, ResultLength: uint64(len(result)),
+		ResultDigest: replication.CompletionResultDigest(
+			replicatedstate.ResultApplied, replicatedstate.ResultFormatTransaction, result[:],
+		),
+		InlineResult: result[:],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return replicatedstate.CompletionLookup{
+		Key:   replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
+		Bytes: encoded, AppliedSequence: applied,
+	}
+}
+
+func TestRegistrySettlementValidatesTransactionResultIdentityWithoutAllocations(t *testing.T) {
+	group := testGroup(20)
+	command := testTransactionCommand(t, group)
+	const applied = uint64(29)
+	lookup := testTransactionCompletion(
+		t, group, command, applied,
+		distributedtxn.ReplicatedRoleParticipant,
+		distributedtxn.ReplicatedPrepareParticipant,
+	)
+	identity, err := openCommandIdentity(group, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if validateErr := validateCompletionLookup(identity, lookup); validateErr != nil {
+			panic(validateErr)
+		}
+	}); allocations != 0 {
+		t.Fatalf("transaction completion validation allocations = %v, want 0", allocations)
+	}
+
+	registry := testRegistry(t, 1, 1, 1)
+	host := &testProposalHost{registry: registry, admit: true}
+	waiter, err := registry.Enqueue(host, group, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := newTestAppliedBatch(group, applied, 3, command)
+	batch.lookups[0].lookup = lookup
+	if err = settleAppliedBatch(registry, batch); err != nil {
+		t.Fatal(err)
+	}
+	completion := make([]byte, 0, replicatedstate.MaxCompletionEnvelopeBytes)
+	completion, outcome, err := waiter.TakeCompletionInto(completion)
+	if err != nil || outcome.Code != OutcomeCompletion || outcome.AppliedIndex != applied ||
+		!bytes.Equal(completion, lookup.Bytes) {
+		t.Fatalf("transaction completion = %dB, %+v, %v", len(completion), outcome, err)
+	}
+
+	for _, mismatch := range []struct {
+		role      distributedtxn.ReplicatedRole
+		operation distributedtxn.ReplicatedOperation
+	}{
+		{distributedtxn.ReplicatedRoleParticipant, distributedtxn.ReplicatedAbortParticipant},
+		{distributedtxn.ReplicatedRoleCoordinator, distributedtxn.ReplicatedCommitCoordinator},
+	} {
+		candidate := testTransactionCompletion(
+			t, group, command, applied, mismatch.role, mismatch.operation,
+		)
+		if err := validateCompletionLookup(identity, candidate); !errors.Is(err, ErrSettlementResult) {
+			t.Fatalf("mismatched transaction result (%d,%d) error = %v", mismatch.role, mismatch.operation, err)
+		}
 	}
 }
 

@@ -110,7 +110,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 			MaxGroups: 1, MaxOutstandingIdentities: 32,
 			MaxOutstandingAttempts: 64, MaxWaiters: 64,
 			MaxAttemptsPerIdentity:     4,
-			MaxRetainedCompletionBytes: 32 * int64(replication.MaxEmptyResultCompletionEnvelopeBytes),
+			MaxRetainedCompletionBytes: 32 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -576,6 +576,14 @@ func newRF3Runtime(
 	t testing.TB,
 	memberID uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	return newRF3RuntimeWithGlobalIndex(t, memberID, false)
+}
+
+func newRF3RuntimeWithGlobalIndex(
+	t testing.TB,
+	memberID uint64,
+	globalIndex bool,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
 	identity := raftstore.Identity{
 		Distribution: "orders", Shard: "0000-ffff",
@@ -622,12 +630,19 @@ func newRF3Runtime(
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := session.Prepare(context.Background(), `CREATE TABLE docs (PRIMARY KEY (id))`)
-	if err == nil {
-		_, err = prepared.Exec(context.Background(), nil)
+	statements := []string{`CREATE TABLE docs (PRIMARY KEY (id))`}
+	if globalIndex {
+		statements = append(statements, `CREATE TABLE email_claims (PRIMARY KEY (key))`)
 	}
-	if prepared != nil {
-		err = errors.Join(err, prepared.Close())
+	for _, statement := range statements {
+		prepared, prepareErr := session.Prepare(context.Background(), statement)
+		if prepareErr == nil {
+			_, prepareErr = prepared.Exec(context.Background(), nil)
+		}
+		if prepared != nil {
+			prepareErr = errors.Join(prepareErr, prepared.Close())
+		}
+		err = errors.Join(err, prepareErr)
 	}
 	err = errors.Join(err, session.Close())
 	if err != nil {
@@ -637,7 +652,21 @@ func newRF3Runtime(
 		ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11,
 		SchemaGeneration: 13, RoutingVersion: 17, RouteGeneration: 19,
 	}
-	base, err := raftmember.BindPreparedSQL(wal, database, authority, "docs")
+	var base sqldriver.ReplicatedShardStoreIdentity
+	if globalIndex {
+		binding, bindingErr := raftmember.BindingFromWAL(wal, authority)
+		if bindingErr != nil {
+			t.Fatal(bindingErr)
+		}
+		base, err = database.BindReplicatedShardStoreBundle(
+			binding, "docs", []sqldriver.ReplicatedGlobalIndexRelation{{
+				Relation: 2, Table: "email_claims", IndexID: 41,
+				Incarnation: 7, LocatorCount: 1, Unique: true,
+			}},
+		)
+	} else {
+		base, err = raftmember.BindPreparedSQL(wal, database, authority, "docs")
+	}
 	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
 		_ = database.Close()
 		_ = wal.Close()

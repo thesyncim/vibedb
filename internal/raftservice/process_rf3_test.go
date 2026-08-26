@@ -1525,7 +1525,7 @@ func buildProcessPeer(
 	serving, err := raftserve.NewRegistry(raftserve.Limits{
 		MaxGroups: 1, MaxOutstandingIdentities: 32,
 		MaxOutstandingAttempts: 64, MaxWaiters: 64, MaxAttemptsPerIdentity: 4,
-		MaxRetainedCompletionBytes: 32 * int64(replication.MaxEmptyResultCompletionEnvelopeBytes),
+		MaxRetainedCompletionBytes: 32 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
 	})
 	if err != nil {
 		return nil, nil, err

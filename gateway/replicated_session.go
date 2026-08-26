@@ -778,8 +778,21 @@ func nativeCompletionMatches(
 	command replication.CommandView,
 	completion replication.CompletionView,
 ) bool {
-	if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
-		completion.Storage != replication.CompletionInline ||
+	if completion.Storage != replication.CompletionInline {
+		return false
+	}
+	if command.Kind() == replication.CommandTransaction {
+		role, operation, ok := command.TransactionIdentity()
+		result, err := replicatedstate.OpenTransactionCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		if !ok || err != nil ||
+			completion.ResultFormat != replicatedstate.ResultFormatTransaction ||
+			completion.ResultLength != uint64(len(completion.InlineResult)) ||
+			result.Role != role || result.Operation != operation {
+			return false
+		}
+	} else if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
 		completion.ResultLength != 0 || len(completion.InlineResult) != 0 ||
 		!nativeCompletionResultMatches(command.Kind(), completion.ResultCode) {
 		return false
@@ -788,6 +801,10 @@ func nativeCompletionMatches(
 	if command.Kind() == replication.CommandSessionOpen {
 		clientEpoch = completion.ClientEpoch
 		if completion.AppliedSequence != completion.ClientEpoch {
+			return false
+		}
+	} else if command.Kind() == replication.CommandTransaction {
+		if completion.AppliedSequence == 0 {
 			return false
 		}
 	} else if completion.AppliedSequence <= completion.ClientEpoch {
@@ -822,7 +839,8 @@ func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) 
 			replicatedstate.ResultInvalidDocument,
 			replicatedstate.ResultTargetBound,
 			replicatedstate.ResultWrongShard,
-			replicatedstate.ResultIndexConflict:
+			replicatedstate.ResultIndexConflict,
+			replicatedstate.ResultIntentBusy:
 			return true
 		}
 	case replication.CommandSessionRetire:
@@ -909,6 +927,9 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.NextDeadlineUnixNano))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(command.RetryHome[:])
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Transaction)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.Transaction)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Batches)))
 	_, _ = hasher.Write(scalar[:])
 	for _, batch := range command.Batches {
@@ -925,6 +946,9 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 			binary.LittleEndian.PutUint64(scalar[:], uint64(len(mutation.Value)))
 			_, _ = hasher.Write(scalar[:])
 			_, _ = hasher.Write(mutation.Value)
+			binary.LittleEndian.PutUint64(scalar[:], mutation.ExpectedValueLength)
+			_, _ = hasher.Write(scalar[:])
+			_, _ = hasher.Write(mutation.ExpectedValueDigest[:])
 		}
 	}
 	var result replication.Digest

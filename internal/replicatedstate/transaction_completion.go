@@ -19,8 +19,11 @@ const (
 	// mutation precondition failure.
 	ResultTransactionConflict uint32 = 13
 
-	transactionCompletionResultBytes      = 24
-	MaxTransactionCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + transactionCompletionResultBytes
+	transactionCompletionResultBytes = 24
+	// MaxCompletionEnvelopeBytes is the sole shipped completion-envelope bound.
+	// Ordinary mutation/session completions use an empty result, while a
+	// transaction carries one fixed 24-byte result under the same envelope.
+	MaxCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + transactionCompletionResultBytes
 )
 
 const (
@@ -128,7 +131,7 @@ func (m *Machine) lookupTransactionCompletionAtSnapshot(
 		if appendErr != nil {
 			return CompletionLookup{}, m.fail(appendErr)
 		}
-		key := sha256.Sum256(storageKey[:])
+		key := SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)
 		return CompletionLookup{
 			Key: key, Bytes: completion, AppliedSequence: m.state.Applied,
 		}, nil
@@ -161,7 +164,7 @@ func (m *Machine) lookupTransactionCompletionAtSnapshot(
 	if err != nil {
 		return CompletionLookup{}, m.fail(err)
 	}
-	key := sha256.Sum256(storageKey[:])
+	key := SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	return CompletionLookup{
 		Key: key, Bytes: completion, AppliedSequence: settlementControl.LastAppliedIndex,
 	}, nil
