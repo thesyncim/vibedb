@@ -156,7 +156,7 @@ func PlanFailedReplicaReplacement(cut FailedReplicaPlanningCut) (FailedReplicaMo
 		Shard:                certificate.Shard,
 		Group:                certificate.Group,
 		RetiringMember:       certificate.SuspectMember,
-		SnapshotSourceMember: donor,
+		SnapshotSourceMember: donor.Member,
 		TargetMember:         target.Member,
 		Source:               distribution.EndpointID(source.Endpoint),
 		Target:               target.Endpoint,
@@ -169,15 +169,7 @@ func PlanFailedReplicaReplacement(cut FailedReplicaPlanningCut) (FailedReplicaMo
 	if err != nil {
 		return FailedReplicaMoveIntent{}, err
 	}
-	var donorEvidence HealthyReplica
-	for _, healthy := range cut.Healthy {
-		if healthy.Member == donor && (donorEvidence.Member == 0 ||
-			healthy.Applied > donorEvidence.Applied) {
-			donorEvidence = healthy
-		}
-	}
-	if donorEvidence.Member == 0 ||
-		authorizeFailedReplicaMove(plan, cut, donorEvidence, target) != nil {
+	if authorizeFailedReplicaMove(plan, cut, donor, target) != nil {
 		return FailedReplicaMoveIntent{}, ErrFailureEvidence
 	}
 	intent, err := AppendReplicaMoveIntent(nil, cut.Catalog, plan)
@@ -291,7 +283,7 @@ func selectSnapshotDonor(
 	replicas []gateway.ReplicatedEndpoint,
 	healthy []HealthyReplica,
 	certificate FailureQuorumCertificate,
-) (uint64, bool) {
+) (HealthyReplica, bool) {
 	selected := HealthyReplica{}
 	for _, candidate := range healthy {
 		if candidate.Member == certificate.SuspectMember || !candidate.RecentActive ||
@@ -309,7 +301,7 @@ func selectSnapshotDonor(
 			selected = candidate
 		}
 	}
-	return selected.Member, selected.Member != 0
+	return selected, selected.Member != 0
 }
 
 func selectReplacementCandidate(
