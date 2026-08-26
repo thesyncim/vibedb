@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -17,6 +18,38 @@ func (resolver replicatedIssuerTenantResolver) ResolveIssuerTenant(
 	context.Context, serviceauthz.Authority,
 ) (requestledger.ScopeKind, requestledger.Digest, error) {
 	return requestledger.ScopeAuthenticated, resolver.tenant, nil
+}
+
+func BenchmarkReplicatedIssuerGrantCacheParallelHit(b *testing.B) {
+	cache := newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants)
+	var references [replicatedIssuerGrantCacheShards]ReplicatedIssuerReference
+	for index := range references {
+		open := replicatedIssuerOpenFixture()
+		open.Installation[1] = byte(index)
+		open.LaneOrdinal = uint16(index)
+		grant, err := replicatedIssuerGrantFor(open, requestledger.ScopeAuthenticated,
+			requestledger.PrincipalID{0x72}, replicatedIssuerTenantFixture().tenant)
+		if err != nil {
+			b.Fatal(err)
+		}
+		cache.put(grant)
+		references[index] = ReplicatedIssuerReference{
+			Installation: grant.Installation, Epoch: grant.Epoch,
+			LaneOrdinal: grant.LaneOrdinal, GrantDigest: grant.GrantDigest,
+		}
+	}
+	var workers atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		index := workers.Add(1) - 1
+		reference := references[index%uint64(len(references))]
+		for pb.Next() {
+			if _, found := cache.get(reference); !found {
+				b.Fatal("cached grant disappeared")
+			}
+		}
+	})
 }
 
 func replicatedIssuerOpenFixture() ReplicatedIssuerOpen {

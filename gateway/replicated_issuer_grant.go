@@ -369,7 +369,14 @@ type replicatedIssuerGrantCacheKey struct {
 	GrantDigest  replication.Digest
 }
 
+const replicatedIssuerGrantCacheShards = 64
+
 type replicatedIssuerGrantCache struct {
+	shards [replicatedIssuerGrantCacheShards]replicatedIssuerGrantCacheShard
+	active uint64
+}
+
+type replicatedIssuerGrantCacheShard struct {
 	mu       sync.RWMutex
 	entries  map[replicatedIssuerGrantCacheKey]ReplicatedIssuerLaneGrant
 	order    []replicatedIssuerGrantCacheKey
@@ -381,8 +388,20 @@ func newReplicatedIssuerGrantCache(capacity int) *replicatedIssuerGrantCache {
 	if capacity <= 0 || capacity > MaxCachedReplicatedIssuerGrants {
 		capacity = MaxCachedReplicatedIssuerGrants
 	}
-	return &replicatedIssuerGrantCache{entries: make(map[replicatedIssuerGrantCacheKey]ReplicatedIssuerLaneGrant, capacity),
-		order: make([]replicatedIssuerGrantCacheKey, 0, capacity), capacity: capacity}
+	cache := new(replicatedIssuerGrantCache)
+	cache.active = uint64(min(capacity, replicatedIssuerGrantCacheShards))
+	base, remainder := capacity/int(cache.active), capacity%int(cache.active)
+	for index := uint64(0); index < cache.active; index++ {
+		shardCapacity := base
+		if int(index) < remainder {
+			shardCapacity++
+		}
+		shard := &cache.shards[index]
+		shard.entries = make(map[replicatedIssuerGrantCacheKey]ReplicatedIssuerLaneGrant, shardCapacity)
+		shard.order = make([]replicatedIssuerGrantCacheKey, 0, shardCapacity)
+		shard.capacity = shardCapacity
+	}
+	return cache
 }
 
 func replicatedIssuerCacheKey(grant ReplicatedIssuerLaneGrant) replicatedIssuerGrantCacheKey {
@@ -395,22 +414,23 @@ func (cache *replicatedIssuerGrantCache) put(grant ReplicatedIssuerLaneGrant) {
 		return
 	}
 	key := replicatedIssuerCacheKey(grant)
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	if _, exists := cache.entries[key]; exists {
+	shard := cache.shard(key.GrantDigest)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if _, exists := shard.entries[key]; exists {
 		return
 	}
-	if len(cache.order) < cache.capacity {
-		cache.order = append(cache.order, key)
+	if len(shard.order) < shard.capacity {
+		shard.order = append(shard.order, key)
 	} else {
-		delete(cache.entries, cache.order[cache.next])
-		cache.order[cache.next] = key
-		cache.next++
-		if cache.next == cache.capacity {
-			cache.next = 0
+		delete(shard.entries, shard.order[shard.next])
+		shard.order[shard.next] = key
+		shard.next++
+		if shard.next == shard.capacity {
+			shard.next = 0
 		}
 	}
-	cache.entries[key] = grant
+	shard.entries[key] = grant
 }
 
 func (cache *replicatedIssuerGrantCache) get(reference ReplicatedIssuerReference) (ReplicatedIssuerLaneGrant, bool) {
@@ -419,8 +439,16 @@ func (cache *replicatedIssuerGrantCache) get(reference ReplicatedIssuerReference
 	}
 	key := replicatedIssuerGrantCacheKey{Installation: reference.Installation, Epoch: reference.Epoch,
 		LaneOrdinal: reference.LaneOrdinal, GrantDigest: reference.GrantDigest}
-	cache.mu.RLock()
-	grant, found := cache.entries[key]
-	cache.mu.RUnlock()
+	shard := cache.shard(key.GrantDigest)
+	shard.mu.RLock()
+	grant, found := shard.entries[key]
+	shard.mu.RUnlock()
 	return grant, found
+}
+
+func (cache *replicatedIssuerGrantCache) shard(
+	digest replication.Digest,
+) *replicatedIssuerGrantCacheShard {
+	index := binary.LittleEndian.Uint64(digest[:8]) % cache.active
+	return &cache.shards[index]
 }
