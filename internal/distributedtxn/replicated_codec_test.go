@@ -284,6 +284,32 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 	}
 }
 
+func TestReplicatedCommandSizeExactParityAndAllocatesZero(t *testing.T) {
+	participant := replicatedTestParticipant()
+	size, err := ReplicatedCommandSize(participant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := AppendReplicatedCommand(make([]byte, 0, size), participant)
+	if err != nil || len(encoded) != size {
+		t.Fatalf("participant size=%d encoded=%d err=%v", size, len(encoded), err)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		measured, sizeErr := ReplicatedCommandSize(participant)
+		if sizeErr != nil || measured != size {
+			panic("replicated command size diverged")
+		}
+	}); got != 0 {
+		t.Fatalf("replicated command size allocs = %v", got)
+	}
+
+	invalid := participant
+	invalid.ID = ID{}
+	if measured, sizeErr := ReplicatedCommandSize(invalid); sizeErr == nil || measured != 0 {
+		t.Fatalf("invalid size=%d err=%v", measured, sizeErr)
+	}
+}
+
 func TestAppendReplicatedCommandRejectsPayloadAppendRegionOverlapWithoutMutation(t *testing.T) {
 	payload := replicatedTestCoordinator(t)
 	base := ReplicatedCommand{

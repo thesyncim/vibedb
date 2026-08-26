@@ -362,13 +362,9 @@ func ReplicatedCoordinatorBindsParticipant(
 // Payload must not overlap the writable append region in dst's current backing
 // array; aliases are rejected before any destination byte is changed.
 func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, error) {
-	if err := validateReplicatedCommand(command); err != nil {
+	total, err := ReplicatedCommandSize(command)
+	if err != nil {
 		return dst, err
-	}
-	total := replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
-		len(command.Payload) + replicatedCommandChecksumBytes
-	if total > MaxReplicatedCommandBytes {
-		return dst, ErrTooLarge
 	}
 	if replicatedPayloadOverlapsAppendRegion(dst, total, command.Payload) {
 		return dst, ErrCorrupt
@@ -407,6 +403,22 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	copy(out[cursor:], command.Payload)
 	binary.LittleEndian.PutUint32(out[total-4:], crc32.Checksum(out[:total-4], castagnoli))
 	return dst, nil
+}
+
+// ReplicatedCommandSize returns the exact canonical control-body size without
+// allocating or encoding. It performs the same semantic and byte-bound
+// validation as AppendReplicatedCommand, allowing callers to reserve the
+// complete proposal budget before either control or outer-command encoding.
+func ReplicatedCommandSize(command ReplicatedCommand) (int, error) {
+	if err := validateReplicatedCommand(command); err != nil {
+		return 0, err
+	}
+	return replicatedCommandEncodedSize(command), nil
+}
+
+func replicatedCommandEncodedSize(command ReplicatedCommand) int {
+	return replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
+		len(command.Payload) + replicatedCommandChecksumBytes
 }
 
 func replicatedPayloadOverlapsAppendRegion(dst []byte, total int, payload []byte) bool {
@@ -608,8 +620,7 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 	); err != nil {
 		return err
 	}
-	total := replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
-		len(command.Payload) + replicatedCommandChecksumBytes
+	total := replicatedCommandEncodedSize(command)
 	if total > MaxReplicatedCommandBytes || !replicatedCommandShapeWithinBound(command) {
 		return ErrTooLarge
 	}
