@@ -8,34 +8,31 @@ import (
 	"github.com/thesyncim/vibedb/shardcontrol"
 )
 
-// ControlService is the complete durable split-control endpoint carried by a
-// shipped shard-control listener. Controller triggers and fenced shard actions
-// deliberately share one replay journal: an operation/step identity has one
-// byte-identical result regardless of which peer retries it after a crash.
+// ControlService is the durable fenced-action endpoint carried by a shipped
+// shard-control listener. Catalog reconciliation is deliberately absent: the
+// gateway that owns the replicated catalog runs ControllerService directly.
 type ControlService struct {
 	server  *shardcontrol.Server
 	journal *shardcontrol.JournalExecutor
 }
 
 type controlActionDispatcher struct {
-	controller *ControllerService
-	remote     *RemoteActionService
+	remote *RemoteActionService
 }
 
-// OpenControlService opens the local durable result boundary before exposing
-// either split action class. Both runtimes are mandatory; registering a
-// partial service would advertise steps this process cannot safely resume.
-func OpenControlService(
+// OpenShardControlService opens the shard-local durable result boundary. A
+// shard accepts only ordinary fenced actions after its plan-admission runtime
+// has independently reconstructed the exact admitted intent.
+func OpenShardControlService(
 	path string,
 	limits shardcontrol.JournalLimits,
 	grants []shardcontrol.ActionGrant,
-	controller *ControllerService,
 	remote *RemoteActionService,
 ) (*ControlService, error) {
-	if controller == nil || remote == nil {
+	if remote == nil {
 		return nil, ErrRemoteExecution
 	}
-	dispatcher := &controlActionDispatcher{controller: controller, remote: remote}
+	dispatcher := &controlActionDispatcher{remote: remote}
 	journal, err := shardcontrol.OpenJournalExecutor(path, limits, dispatcher)
 	if err != nil {
 		return nil, err
@@ -51,16 +48,31 @@ func OpenControlService(
 	return &ControlService{server: server, journal: journal}, nil
 }
 
+// OpenControlService is retained as a source-compatible construction guard
+// for internal callers while composition migrates. ControllerService is not
+// installed in the shard dispatcher; passing it only proves the caller has
+// not silently omitted the gateway authority during the transition.
+func OpenControlService(
+	path string,
+	limits shardcontrol.JournalLimits,
+	grants []shardcontrol.ActionGrant,
+	controller *ControllerService,
+	remote *RemoteActionService,
+) (*ControlService, error) {
+	if controller == nil {
+		return nil, ErrRemoteExecution
+	}
+	return OpenShardControlService(path, limits, grants, remote)
+}
+
 func (dispatcher *controlActionDispatcher) ExecuteAction(
 	ctx context.Context,
 	peer rafttransport.PeerIdentity,
 	request shardcontrol.Request,
 ) (shardcontrol.Response, error) {
-	if dispatcher == nil || dispatcher.controller == nil || dispatcher.remote == nil {
+	if dispatcher == nil || dispatcher.remote == nil ||
+		request.Action == shardcontrol.ActionReconcileSplit {
 		return shardcontrol.Response{}, ErrRemoteExecution
-	}
-	if request.Action == shardcontrol.ActionReconcileSplit {
-		return dispatcher.controller.ExecuteAction(ctx, peer, request)
 	}
 	return dispatcher.remote.ExecuteAction(ctx, peer, request)
 }
