@@ -28,6 +28,7 @@ Start with the page that matches your task.
 - [Start a three-node replicated shard](operations/distributed-quickstart.md)
 - [Distributed runtime](operations/distributed.md)
 - [Replica lifecycle](operations/replica-lifecycle.md)
+- [Kubernetes RF3 test lane](operations/kubernetes.md)
 - [Performance tests](performance.md)
 - [Security boundary](../SECURITY.md)
 - [Unsafe-code inventory](../UNSAFE.md)
