@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
@@ -74,6 +75,56 @@ type ReplicatedTableReadResult struct {
 	reservationBytes uint64
 	reservationSlot  uint32
 	reservationEpoch uint64
+}
+
+// ReplicatedTableBatchPoint is one positional table/key lookup. A batch may
+// cross tables only when every point resolves to the same live Raft group.
+type ReplicatedTableBatchPoint struct {
+	Table []byte
+	Key   []byte
+}
+
+type ReplicatedTableBatchReadRequest struct {
+	Points         []ReplicatedTableBatchPoint
+	MaxResultBytes uint32
+}
+
+// ReplicatedTableBatchReadResult owns one packed bitmap/length/value response.
+// All positions share Position because one leader ReadIndex and one coherent
+// all-relation snapshot served the complete batch.
+type ReplicatedTableBatchReadResult struct {
+	Position ReplicatedReadPosition
+	Packed   []byte
+	Retries  int
+	view     replicatedstate.PointReadBatchValue
+
+	reservationOwner *ReplicatedDataReader
+	reservationBytes uint64
+	reservationSlot  uint32
+	reservationEpoch uint64
+}
+
+func (result ReplicatedTableBatchReadResult) Count() int { return result.view.Count() }
+
+func (result ReplicatedTableBatchReadResult) Lookup(index int) ([]byte, bool, bool) {
+	return result.view.Lookup(index)
+}
+
+func (result ReplicatedTableBatchReadResult) Cursor() ReplicatedBatchPointCursor {
+	return ReplicatedBatchPointCursor{cursor: result.view.Cursor()}
+}
+
+func (result *ReplicatedTableBatchReadResult) Release() {
+	if result == nil || result.reservationOwner == nil || result.reservationBytes == 0 ||
+		result.reservationEpoch == 0 {
+		return
+	}
+	owner, bytes := result.reservationOwner, result.reservationBytes
+	slot, epoch := result.reservationSlot, result.reservationEpoch
+	result.reservationOwner, result.reservationBytes, result.Packed = nil, 0, nil
+	result.reservationSlot, result.reservationEpoch = 0, 0
+	result.view = replicatedstate.PointReadBatchValue{}
+	owner.releaseRead(slot, epoch, bytes)
 }
 
 // Release returns the schema-bounded response reservation after the caller has
@@ -215,6 +266,106 @@ func (reader *ReplicatedDataReader) Read(
 	}
 	result, _, err = reader.readPinned(ctx, request, minimumApplied, linearizable)
 	return result, err
+}
+
+// ReadBatch executes a same-group, multi-table linearizable read through one
+// leader ReadIndex. Cross-group inputs fail before network I/O because they do
+// not share a globally meaningful applied index or snapshot timestamp.
+func (reader *ReplicatedDataReader) ReadBatch(
+	ctx context.Context,
+	request ReplicatedTableBatchReadRequest,
+) (ReplicatedTableBatchReadResult, error) {
+	if reader == nil || reader.catalog == nil || reader.executor == nil || ctx == nil ||
+		len(request.Points) == 0 || request.MaxResultBytes == 0 ||
+		request.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
+		return ReplicatedTableBatchReadResult{}, ErrReplicatedDataRead
+	}
+	count := uint64(len(request.Points))
+	if count > uint64(^uint32(0)) || 4+(count+7)/8+count*4 > uint64(request.MaxResultBytes) {
+		return ReplicatedTableBatchReadResult{}, ErrReplicatedReadAdmission
+	}
+	requestBytes := uint64(4)
+	for index := range request.Points {
+		if len(request.Points[index].Table) == 0 ||
+			len(request.Points[index].Table) > replication.MaxIdentityBytes ||
+			len(request.Points[index].Key) == 0 ||
+			len(request.Points[index].Key) > replication.MaxMutationKeyBytes {
+			return ReplicatedTableBatchReadResult{}, ErrReplicatedDataRead
+		}
+		requestBytes += 5 + uint64(len(request.Points[index].Key))
+		if requestBytes > replicatedstate.MaxPointReadBatchBytes {
+			return ReplicatedTableBatchReadResult{}, ErrReplicatedReadAdmission
+		}
+	}
+	result, generation, err := reader.readBatchPinned(ctx, request)
+	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
+		return result, err
+	}
+	if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
+		return ReplicatedTableBatchReadResult{}, errors.Join(err, refreshErr)
+	}
+	result, _, err = reader.readBatchPinned(ctx, request)
+	return result, err
+}
+
+func (reader *ReplicatedDataReader) readBatchPinned(
+	ctx context.Context,
+	request ReplicatedTableBatchReadRequest,
+) (ReplicatedTableBatchReadResult, uint64, error) {
+	lease := reader.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		return ReplicatedTableBatchReadResult{}, 0, ErrNoCatalog
+	}
+	defer lease.release()
+
+	points := make([]ReplicatedBatchPointRead, len(request.Points))
+	var route ReplicatedRoute
+	var routeID replication.Digest
+	maximum := uint64(request.MaxResultBytes)
+	if maximum > reader.maxReadBytes {
+		return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedReadAdmission
+	}
+	for index := range request.Points {
+		var replicas [ServingReplicaCount]ReplicatedEndpoint
+		var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
+		resolved, ok := lease.snapshot.ResolveReplicatedTableKey(
+			request.Points[index].Table, request.Points[index].Key,
+			scalarScratch[:0], replicas[:0],
+		)
+		if !ok {
+			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
+		}
+		if index == 0 {
+			route, routeID = resolved.Route, resolved.RouteID
+		} else if resolved.RouteID != routeID {
+			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
+		}
+		points[index] = ReplicatedBatchPointRead{
+			Relation: resolved.Profile.Relation, Key: request.Points[index].Key,
+		}
+	}
+	reservationSlot, reservationEpoch, err := reader.admitRead(ctx, maximum)
+	if err != nil {
+		return ReplicatedTableBatchReadResult{}, lease.generation, err
+	}
+	result, err := reader.executor.ReadPointBatch(ctx, route, ReplicatedBatchRead{
+		Points: points, MinimumApplied: 1, MaxResultBytes: uint32(maximum),
+	})
+	if err != nil {
+		reader.releaseRead(reservationSlot, reservationEpoch, maximum)
+		return ReplicatedTableBatchReadResult{}, lease.generation, err
+	}
+	view, err := replicatedstate.OpenPointReadBatchValue(result.Packed)
+	if err != nil || view.Count() != len(points) {
+		reader.releaseRead(reservationSlot, reservationEpoch, maximum)
+		return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedDataRead
+	}
+	return ReplicatedTableBatchReadResult{
+		Position: ReplicatedReadPosition{RouteID: routeID, Applied: result.Applied},
+		Packed:   result.Packed, Retries: result.Retries, view: view,
+		reservationOwner: reader, reservationBytes: maximum,
+		reservationSlot: reservationSlot, reservationEpoch: reservationEpoch,
+	}, lease.generation, nil
 }
 
 func (reader *ReplicatedDataReader) readPinned(

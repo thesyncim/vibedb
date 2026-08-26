@@ -72,6 +72,8 @@ const (
 	ReplicatedReadLeader
 	ReplicatedReadFollower
 	ReplicatedTransactionRead
+	ReplicatedReadBatchLeader
+	_ // wire operation 8 is reserved; never reuse a published operation byte.
 	ReplicatedRequestLedgerRead
 )
 
@@ -135,6 +137,7 @@ type ReplicatedRequest struct {
 	Key               []byte
 	MinimumApplied    uint64
 	MaxValueBytes     uint32
+	BatchRead         []byte
 	TransactionRead   ReplicatedTransactionReadRequest
 	RequestLedgerRead ReplicatedRequestLedgerReadRequest
 }
@@ -167,6 +170,7 @@ const (
 	ReplicatedReadMissing
 	ReplicatedTransactionReadResult
 	ReplicatedRequestLedgerReadResult
+	ReplicatedReadBatchResult
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -224,7 +228,7 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	payloadHint := len(request.Command) + len(request.Key) + 16
+	payloadHint := len(request.Command) + len(request.Key) + len(request.BatchRead) + 16
 	if request.Operation == ReplicatedMembership {
 		payloadHint += 65
 	}
@@ -246,6 +250,10 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
 		e.bytes(request.Key)
+	case ReplicatedReadBatchLeader:
+		e.u64(request.MinimumApplied)
+		e.u32(request.MaxValueBytes)
+		e.bytes(request.BatchRead)
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
 	case ReplicatedRequestLedgerRead:
@@ -300,6 +308,11 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
 		payload = request.Key
+		e.u32(uint32(len(payload)))
+	case ReplicatedReadBatchLeader:
+		e.u64(request.MinimumApplied)
+		e.u32(request.MaxValueBytes)
+		payload = request.BatchRead
 		e.u32(uint32(len(payload)))
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
@@ -367,6 +380,10 @@ func decodeReplicatedRequest(
 		request.MinimumApplied = d.u64()
 		request.MaxValueBytes = d.u32()
 		request.Key = d.slice()
+	case ReplicatedReadBatchLeader:
+		request.MinimumApplied = d.u64()
+		request.MaxValueBytes = d.u32()
+		request.BatchRead = d.slice()
 	case ReplicatedTransactionRead:
 		request.TransactionRead = decodeReplicatedTransactionRead(&d)
 	case ReplicatedRequestLedgerRead:
@@ -380,6 +397,7 @@ func decodeReplicatedRequest(
 	}
 	request.Command = request.Command[:len(request.Command):len(request.Command)]
 	request.Key = request.Key[:len(request.Key):len(request.Key)]
+	request.BatchRead = request.BatchRead[:len(request.BatchRead):len(request.BatchRead)]
 	if !validReplicatedRequest(request) {
 		if budget != nil {
 			budget.release(charged)
@@ -512,6 +530,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	}
 	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
+		response.Kind == ReplicatedReadBatchResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult {
 		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
@@ -532,6 +551,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	encodeReplicatedDigest(&e, response.RequestDigest)
 	e.bytes(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
+		response.Kind == ReplicatedReadBatchResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult {
 		e.u64(response.ReadApplied)
@@ -577,6 +597,7 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
+		response.Kind == ReplicatedReadBatchResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult {
 		response.ReadApplied = d.u64()
@@ -605,6 +626,8 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 	case ReplicatedMembership:
 		return replicatedResponseFixedBodyBytes, nil
 	case ReplicatedReadLeader, ReplicatedReadFollower:
+		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
+	case ReplicatedReadBatchLeader:
 		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
 	case ReplicatedTransactionRead:
 		return replicatedReadResponseFixedBodyBytes +
@@ -807,6 +830,9 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
 	}
+	if request.Operation != ReplicatedReadBatchLeader && len(request.BatchRead) != 0 {
+		return false
+	}
 	authorityPresent := request.Authority.Node != (rafttransport.NodeID{}) ||
 		request.Authority.Generation != 0
 	if authorityPresent && (request.Authority.Node == (rafttransport.NodeID{}) ||
@@ -873,6 +899,16 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			len(request.Key) != 0 && len(request.Key) <= replication.MaxMutationKeyBytes &&
 			request.MinimumApplied != 0 && request.MaxValueBytes != 0 &&
 			request.MaxValueBytes <= replication.MaxMutationValueBytes &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
+	case ReplicatedReadBatchLeader:
+		_, batchErr := replicatedstate.OpenPointReadBatch(request.BatchRead)
+		return validReplicatedReadCapability(request.Capability) &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) && request.Relation == 0 &&
+			len(request.Key) == 0 && request.MinimumApplied != 0 &&
+			request.MaxValueBytes != 0 &&
+			request.MaxValueBytes <= replicatedstate.MaxPointReadBatchBytes && batchErr == nil &&
 			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
 			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
 	case ReplicatedTransactionRead:
@@ -1081,6 +1117,12 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			len(response.Value) == 0
+	case ReplicatedReadBatchResult:
+		_, err := replicatedstate.OpenPointReadBatchValue(response.Value)
+		return err == nil && response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied
 	case ReplicatedTransactionReadResult:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&

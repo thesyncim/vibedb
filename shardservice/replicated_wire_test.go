@@ -107,6 +107,12 @@ func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
+	batch, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{
+		{Relation: 1, Key: []byte("a")}, {Relation: 2, Key: []byte("b")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
 		{Operation: ReplicatedProbe, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{
@@ -122,6 +128,9 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
 		{Operation: ReplicatedReadFollower, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: fence, Relation: 2,
 			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
+		{Operation: ReplicatedReadBatchLeader, Authority: authority,
+			Capability: serviceauthz.CapabilityDataRead, Fence: fence,
+			BatchRead: batch, MinimumApplied: 11, MaxValueBytes: 16384},
 	} {
 		var encoded bytes.Buffer
 		if err := EncodeReplicatedRequest(&encoded, request); err != nil {
@@ -142,6 +151,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			decoded.Capability != request.Capability || decoded.Fence != request.Fence ||
 			!bytes.Equal(decoded.Command, request.Command) || decoded.Membership != request.Membership ||
 			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
+			!bytes.Equal(decoded.BatchRead, request.BatchRead) ||
 			decoded.MinimumApplied != request.MinimumApplied ||
 			decoded.MaxValueBytes != request.MaxValueBytes {
 			t.Fatalf("request round trip = %+v", decoded)
@@ -192,6 +202,62 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			!bytes.Equal(decoded.Completion, response.Completion) {
 			t.Fatalf("response round trip = %+v, want %+v", decoded, response)
 		}
+	}
+}
+
+func TestReplicatedBatchReadWirePreservesBitmapLengthsAndEmptyFound(t *testing.T) {
+	packedRequest, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{
+		{Relation: 1, Key: []byte("a")}, {Relation: 2, Key: []byte("b")},
+		{Relation: 1, Key: []byte("c")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedReadBatchLeader,
+		Fence: testReplicatedFence(), BatchRead: packedRequest,
+		MinimumApplied: 7, MaxValueBytes: 4096}
+	var frame bytes.Buffer
+	if err := EncodeReplicatedRequestBorrowed(&frame, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReplicatedRequest(&frame)
+	if err != nil || !bytes.Equal(decoded.BatchRead, packedRequest) {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+
+	// count=3, bitmap positions 0 and 1 found, lengths 5,0,0, payload alpha.
+	value := binary.LittleEndian.AppendUint32(nil, 3)
+	value = append(value, 0b00000011)
+	value = binary.LittleEndian.AppendUint32(value, 5)
+	value = binary.LittleEndian.AppendUint32(value, 0)
+	value = binary.LittleEndian.AppendUint32(value, 0)
+	value = append(value, "alpha"...)
+	fence := request.Fence
+	response := &ReplicatedResponse{Kind: ReplicatedReadBatchResult, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: value}
+	frame.Reset()
+	if err := EncodeReplicatedResponse(&frame, response); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := DecodeReplicatedResponse(&frame)
+	if err != nil || opened.Kind != ReplicatedReadBatchResult ||
+		!bytes.Equal(opened.Value, value) {
+		t.Fatalf("opened=%+v err=%v", opened, err)
+	}
+	view, err := replicatedstate.OpenPointReadBatchValue(opened.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, found, ok := view.Lookup(0); !ok || !found || string(raw) != "alpha" {
+		t.Fatalf("first raw=%q found=%v ok=%v", raw, found, ok)
+	}
+	if raw, found, ok := view.Lookup(1); !ok || !found || len(raw) != 0 {
+		t.Fatalf("empty raw=%q found=%v ok=%v", raw, found, ok)
+	}
+	if _, found, ok := view.Lookup(2); !ok || found {
+		t.Fatalf("miss found=%v ok=%v", found, ok)
 	}
 }
 

@@ -96,8 +96,78 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 }
 
 type ownerTestReadSource struct {
-	result replicatedstate.PointReadResult
-	err    error
+	result      replicatedstate.PointReadResult
+	batchResult replicatedstate.PointReadBatchResult
+	batchCalls  int
+	err         error
+}
+
+func (source *ownerTestReadSource) PointReadBatchInto(
+	_ []byte, _ uint64, _ int, _ []byte,
+) (replicatedstate.PointReadBatchResult, error) {
+	source.batchCalls++
+	return source.batchResult, source.err
+}
+
+func TestOwnerPointReadBatchUsesOneLinearAuthorization(t *testing.T) {
+	group := peerServerTestGroup()
+	serving := ServingFence{Group: group, AllocationGeneration: 3,
+		Command: CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+			ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 9,
+			RelationManifestDigest: [32]byte{4}, RoutingVersion: 10, RouteGeneration: 11},
+		MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4, Term: 5}
+	packed, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{
+		{Relation: 1, Key: []byte("a")}, {Relation: 2, Key: []byte("b")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	fence := replicatedstate.SnapshotFence{Binding: replicatedstate.Binding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		AllocationGeneration:  serving.AllocationGeneration,
+		ShardIncarnation:      group.ShardIncarnation, GroupID: group.GroupID,
+		ActivePolicyGeneration: serving.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        serving.Command.ProtectionEpoch,
+		OwnershipEpoch:         serving.Command.OwnershipEpoch,
+		SchemaGeneration:       serving.Command.SchemaGeneration,
+		RoutingVersion:         serving.Command.RoutingVersion,
+		RouteGeneration:        serving.Command.RouteGeneration,
+	}, RelationManifestDigest: serving.Command.RelationManifestDigest,
+		ReplicaSetVersion: serving.Command.ReplicaSetVersion, Applied: 19}
+	source := &ownerTestReadSource{batchResult: replicatedstate.PointReadBatchResult{
+		Fence: fence, Data: value,
+	}}
+	charge, ok := pointReadResponseCharge(4096)
+	if !ok {
+		t.Fatal("charge")
+	}
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: int64(len(packed)),
+		MaxPendingReadItems: 1, MaxPendingReadBytes: charge,
+	}}
+	authorizations := 0
+	go func() {
+		request := <-owner.ingress
+		authorizations++
+		if request.kind != requestReadLinear {
+			t.Errorf("request kind=%d", request.kind)
+		}
+		request.reply <- ownerReply{read: readAuthorization{
+			source: source, minimumApplied: 19,
+		}}
+		owner.release(request.bytes)
+	}()
+	result, lease, err := owner.ReadPointBatch(context.Background(), PointReadBatchRequest{
+		Fence: serving, Packed: packed, MinimumApplied: 7, MaxResultBytes: 4096,
+	})
+	if err != nil || result.Applied != 19 || len(result.Data) != len(value) ||
+		authorizations != 1 || source.batchCalls != 1 || lease == nil {
+		t.Fatalf("result=%+v authorizations=%d sourceCalls=%d lease=%T err=%v",
+			result, authorizations, source.batchCalls, lease, err)
+	}
+	lease.Release()
 }
 
 func (source *ownerTestReadSource) PointReadInto(

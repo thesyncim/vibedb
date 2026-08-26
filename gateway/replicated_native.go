@@ -294,6 +294,152 @@ func (executor *ReplicatedExecutor) ReadRequestLedger(
 	return ReplicatedRequestLedgerReadResult{}, errors.Join(ErrReplicatedLeader, joined)
 }
 
+type ReplicatedBatchPointRead = replicatedstate.PointRead
+
+// ReplicatedBatchRead is one leader-only, one-ReadIndex positional request.
+// MaxResultBytes covers the complete found bitmap, lengths, and raw values.
+type ReplicatedBatchRead struct {
+	Points         []ReplicatedBatchPointRead
+	MinimumApplied uint64
+	MaxResultBytes uint32
+}
+
+type ReplicatedBatchPointResult struct {
+	Applied uint64
+	Packed  []byte
+	State   shardservice.ReplicatedMemberState
+	Retries int
+	view    replicatedstate.PointReadBatchValue
+}
+
+type ReplicatedBatchPointCursor struct {
+	cursor replicatedstate.PointReadBatchCursor
+}
+
+func (cursor *ReplicatedBatchPointCursor) Next() ([]byte, bool, bool) {
+	if cursor == nil {
+		return nil, false, false
+	}
+	return cursor.cursor.Next()
+}
+
+func (result ReplicatedBatchPointResult) Count() int { return result.view.Count() }
+
+func (result ReplicatedBatchPointResult) Lookup(index int) ([]byte, bool, bool) {
+	return result.view.Lookup(index)
+}
+
+func (result ReplicatedBatchPointResult) Cursor() ReplicatedBatchPointCursor {
+	return ReplicatedBatchPointCursor{cursor: result.view.Cursor()}
+}
+
+// ReadPointBatch routes one packed multi-relation request through one leader
+// ReadIndex. Retries preserve the exact packed bytes and positional ordering.
+func (executor *ReplicatedExecutor) ReadPointBatch(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedBatchRead,
+) (ReplicatedBatchPointResult, error) {
+	if executor == nil || executor.client == nil || ctx == nil ||
+		!validReplicatedRoute(route) || len(read.Points) == 0 ||
+		read.MinimumApplied == 0 || read.MaxResultBytes == 0 ||
+		read.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
+		return ReplicatedBatchPointResult{}, ErrReplicatedRoute
+	}
+	packed, err := replicatedstate.AppendPointReadBatch(nil, read.Points)
+	if err != nil {
+		return ReplicatedBatchPointResult{}, ErrReplicatedRoute
+	}
+	preferred := route.Replicas[0].Member
+	var joined error
+	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
+		endpoint, state, discoverErr := executor.discoverLeader(
+			ctx, route, preferred, serviceauthz.CapabilityDataRead,
+		)
+		if discoverErr != nil {
+			joined = errors.Join(joined, discoverErr)
+			preferred = 0
+			continue
+		}
+		response, callErr := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
+			Operation:  shardservice.ReplicatedReadBatchLeader,
+			Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
+			BatchRead: packed, MinimumApplied: read.MinimumApplied,
+			MaxValueBytes: read.MaxResultBytes,
+		})
+		if callErr != nil {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, callErr)
+			preferred = 0
+			continue
+		}
+		if validReplicatedUnavailableWithoutState(response) {
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			preferred = 0
+			continue
+		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+		}
+		if !validReplicatedResponseState(response) ||
+			response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.MemberID != endpoint.Member ||
+			response.State.Fence.Command != route.Command {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+			continue
+		}
+		switch response.Kind {
+		case shardservice.ReplicatedReadBatchResult:
+			view, openErr := replicatedstate.OpenPointReadBatchValue(response.Value)
+			if openErr != nil || view.Count() != len(read.Points) ||
+				response.Refusal != shardservice.ReplicatedRefusalNone ||
+				response.RequestDigest != ([sha256.Size]byte{}) ||
+				response.Outcome != (raftserve.Outcome{}) || len(response.Completion) != 0 ||
+				response.ReadApplied < read.MinimumApplied ||
+				response.State.Applied < response.ReadApplied ||
+				len(response.Value) > int(read.MaxResultBytes) {
+				joined = errors.Join(joined, ErrReplicatedRoute)
+				continue
+			}
+			executor.leaderHints.publish(route, endpoint, response.State)
+			return ReplicatedBatchPointResult{Applied: response.ReadApplied,
+				Packed: response.Value, State: response.State, Retries: attempt, view: view}, nil
+		case shardservice.ReplicatedNotLeader:
+			executor.leaderHints.invalidate(route, endpoint, state)
+			if !validReplicatedNonterminalResponse(response) {
+				joined = errors.Join(joined, ErrReplicatedRoute)
+				preferred = 0
+				continue
+			}
+			preferred = response.State.LeaderID
+			joined = errors.Join(joined, raftmodel.ErrNotLeader)
+		case shardservice.ReplicatedRefusal:
+			if !validReplicatedReadRefusal(response, response.Refusal) {
+				joined = errors.Join(joined, ErrReplicatedRoute)
+				preferred = 0
+				continue
+			}
+			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				executor.leaderHints.invalidate(route, endpoint, state)
+				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
+			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
+				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound {
+				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			preferred = 0
+		default:
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+		}
+	}
+	return ReplicatedBatchPointResult{}, errors.Join(ErrReplicatedLeader, joined)
+}
+
 func (executor *ReplicatedExecutor) ReadPoint(
 	ctx context.Context,
 	route ReplicatedRoute,

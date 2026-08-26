@@ -173,6 +173,13 @@ type ReadSource interface {
 	PointReadInto(replication.RelationID, []byte, uint64, int, []byte) (replicatedstate.PointReadResult, error)
 }
 
+// BatchReadSource is the optional packed multi-relation extension. Keeping it
+// separate preserves narrow test and recovery sources while shipped replicated
+// machines expose one coherent all-relation cut.
+type BatchReadSource interface {
+	PointReadBatchInto([]byte, uint64, int, []byte) (replicatedstate.PointReadBatchResult, error)
+}
+
 // TransactionRecoverySource exposes only the replicated transaction-control
 // reader. It is intentionally separate from ordinary relation reads so
 // installing a data-read source cannot enable coordinator discovery.
@@ -219,6 +226,21 @@ type PointReadResult struct {
 	Applied uint64
 	Found   bool
 	Value   []byte
+}
+
+// PointReadBatchRequest selects one leader ReadIndex for a packed positional
+// multi-relation request. Packed is the canonical replicatedstate grammar and
+// MaxResultBytes bounds its complete bitmap/length/value response.
+type PointReadBatchRequest struct {
+	Fence          ServingFence
+	Packed         []byte
+	MinimumApplied uint64
+	MaxResultBytes int
+}
+
+type PointReadBatchResult struct {
+	Applied uint64
+	Data    []byte
 }
 
 // PointReadLease holds the conservative response-memory reservation until the
@@ -1227,6 +1249,67 @@ func (owner *Owner) ReadPoint(
 	}
 	releaseReservation = false
 	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value},
+		&pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadPointBatch authorizes exactly one leader ReadIndex and then reads one
+// coherent all-relation snapshot outside the serialized Raft lane. The source
+// performs a complete intent pass before returning any value bytes.
+func (owner *Owner) ReadPointBatch(
+	ctx context.Context,
+	request PointReadBatchRequest,
+) (PointReadBatchResult, PointReadLease, error) {
+	packed, packedErr := replicatedstate.OpenPointReadBatch(request.Packed)
+	if owner == nil || ctx == nil || packedErr != nil || packed.Count() == 0 ||
+		request.MinimumApplied == 0 || request.MaxResultBytes <= 0 ||
+		request.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
+		return PointReadBatchResult{}, nil, ErrInvalidOwner
+	}
+	responseCharge, ok := pointReadResponseCharge(request.MaxResultBytes)
+	if !ok {
+		return PointReadBatchResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return PointReadBatchResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	owned := append([]byte(nil), request.Packed...)
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
+		bytes: int64(cap(owned)), read: readRequest{
+			fence: request.Fence, minimumApplied: request.MinimumApplied,
+			delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return PointReadBatchResult{}, nil, err
+	}
+	source, ok := reply.read.source.(BatchReadSource)
+	if !ok {
+		return PointReadBatchResult{}, nil, ErrInvalidOwner
+	}
+	value, err := source.PointReadBatchInto(
+		owned, reply.read.minimumApplied, request.MaxResultBytes, nil,
+	)
+	if err != nil {
+		return PointReadBatchResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		len(value.Data) > request.MaxResultBytes {
+		return PointReadBatchResult{}, nil, ErrServingFence
+	}
+	if _, err := replicatedstate.OpenPointReadBatchValue(value.Data); err != nil {
+		return PointReadBatchResult{}, nil, ErrServingFence
+	}
+	releaseReservation = false
+	return PointReadBatchResult{Applied: value.Fence.Applied, Data: value.Data},
 		&pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
