@@ -1040,6 +1040,87 @@ func (v *GlobalTabletCatalogNodeView) entriesWithInsertedChild(
 	return entries, nil
 }
 
+// SplitInsertChildReplacing applies one structural insertion plus handle
+// rewrites while splitting a full leaf or branch into two canonical nodes.
+// The source keeps its stable ID; Right receives the caller-authorized ID.
+func (v *GlobalTabletCatalogNodeView) SplitInsertChildReplacing(
+	leftDst, rightDst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+	rightPageID uint32,
+) (GlobalTabletCatalogNodeSplitResult, error) {
+	var result GlobalTabletCatalogNodeSplitResult
+	if v == nil || len(v.image) == 0 || v.level == GlobalTabletCatalogRoot ||
+		len(floor) == 0 || generation <= v.header.Generation ||
+		generation >= uint64(1)<<48 || len(leftDst) < len(v.image) ||
+		len(rightDst) < len(v.image) || !bounds.extends(v.bounds) ||
+		globalTabletCatalogSlicesOverlap(leftDst[:len(v.image)], v.image) ||
+		globalTabletCatalogSlicesOverlap(rightDst[:len(v.image)], v.image) ||
+		globalTabletCatalogSlicesOverlap(leftDst[:len(v.image)], rightDst[:len(v.image)]) {
+		return result, fmt.Errorf("%w: catalog split destination", ErrInvalidWrite)
+	}
+	rightLogicalID, rightBytes, ok := globalTabletCatalogNodeIdentity(v.level, rightPageID)
+	if !ok || int(rightBytes) != len(v.image) || rightPageID == v.pageID {
+		return result, fmt.Errorf("%w: catalog split right identity", ErrInvalidWrite)
+	}
+	entries, err := v.entriesWithInsertedChild(floor, id, ref, rewrites)
+	if err != nil || len(entries) < 2 {
+		return result, errors.Join(err, fmt.Errorf("%w: catalog split entries", ErrInvalidWrite))
+	}
+	header := func(pageID uint32, logicalID uint64) GlobalTabletCatalogNodeHeader {
+		return GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: logicalID, PageID: pageID,
+			Level: v.level, RootChildLevel: v.childLevel,
+			Bounds: bounds, Kind: PagePrimaryCatalog,
+			ChildKind: v.childKind, ChildLength: v.childLength,
+		}
+	}
+	leftScratch := make([]byte, len(v.image))
+	rightScratch := make([]byte, len(v.image))
+	middle := len(entries) / 2
+	for distance := 0; distance < len(entries); distance++ {
+		cuts := [...]int{middle - distance, middle + distance}
+		for side, cut := range cuts {
+			if side == 1 && cuts[0] == cuts[1] || cut <= 0 || cut >= len(entries) {
+				continue
+			}
+			rightEntries := append([]GlobalTabletCatalogNodeEntry(nil), entries[cut:]...)
+			promoted := bytes.Clone(rightEntries[0].Floor)
+			rightEntries[0].Floor = nil
+			left, leftErr := EncodeGlobalTabletCatalogNode(
+				leftScratch, header(v.pageID, v.header.LogicalID), entries[:cut],
+			)
+			if errors.Is(leftErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if leftErr != nil {
+				return result, leftErr
+			}
+			right, rightErr := EncodeGlobalTabletCatalogNode(
+				rightScratch, header(rightPageID, rightLogicalID), rightEntries,
+			)
+			if errors.Is(rightErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if rightErr != nil {
+				return result, rightErr
+			}
+			copy(leftDst, left)
+			copy(rightDst, right)
+			return GlobalTabletCatalogNodeSplitResult{
+				Left: leftDst[:len(left)], Right: rightDst[:len(right)],
+				PromotedFloor: promoted,
+			}, nil
+		}
+	}
+	return result, ErrGlobalTabletCatalogNoSpace
+}
+
 // PromoteRootInsertChildReplacing converts a full root->leaf catalog into a
 // root->branch->leaf catalog while applying the triggering leaf insertion and
 // handle rewrites. The old leaf pages remain untouched. All three destinations
