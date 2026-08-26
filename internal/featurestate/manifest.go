@@ -99,18 +99,18 @@ var Distributed = []Feature{
 		}},
 	},
 	{
-		Name: "Fixed-participant distributed transactions",
-		Primitive: Stage{StatusYes, "Durable coordinator and participant records implement prepare, decision, apply, release, retry, and recovery.", []Reference{
-			ref("gateway/transaction.go", "executeTransaction"), ref("shardservice/server.go", "Server"),
+		Name: "Byte-bounded distributed transactions",
+		Primitive: Stage{StatusYes, "Compact inline and root-bound paged coordinator manifests implement prepare, decision, apply, release, retry, and bounded recovery without a participant-count contract.", []Reference{
+			ref("internal/distributedtxn/manifest.go", "ManifestBuilder"), ref("gateway/transaction.go", "executeTransaction"),
 		}},
-		Integrated: Stage{StatusYes, "ExecBatch and global-index writes use the same bounded participant protocol.", []Reference{
-			ref("gateway/transaction.go", "ExecBatch"), ref("gateway/global_index.go", "GlobalIndexProgram"),
+		Integrated: Stage{StatusYes, "ExecBatch and global-index writes select the inline fast path or stream segmented manifests through the authenticated shard protocol and paged recovery.", []Reference{
+			ref("gateway/transaction_manifest.go", "stageTransactionCoordinator"), ref("gateway/recovery.go", "recoverManifestCoordinator"),
 		}},
-		Shipped: Stage{StatusYes, "The gateway serves fixed-participant batches and runs recovery at startup and on a timer.", []Reference{
+		Shipped: Stage{StatusYes, "The static gateway serves multi-table and cross-shard mutation batches under byte, mutation, deadline, and in-flight bounds and runs recovery at startup and on a timer.", []Reference{
 			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("gateway/recovery.go", "RecoverAll"),
 		}},
-		Qualification: Stage{StatusPartial, "Restart, idempotency, recovery, and failure-atomicity tests exist. External multi-process kill and partition gates do not cover this static command path.", []Reference{
-			ref("shardservice/server_test.go", "TestTransactionStageSurvivesShardRestart"), ref("gateway/recovery_test.go", "TestRecoverTransactionRedrivesCommittedParticipants"),
+		Qualification: Stage{StatusPartial, "A real 65-shard gateway transaction proves the segmented path, readback, and outcome-unknown handling. Multi-page restart, malformed-page, idempotency, recovery, and failure-atomicity tests also exist. External multi-process kill and partition gates do not cover this static command path.", []Reference{
+			ref("gateway/segmented_e2e_test.go", "TestSegmentedExecBatchAcross65RealShardServers"), ref("gateway/segmented_e2e_test.go", "TestSegmentedCoordinatorResponseLossAndRestartBoundaries"),
 		}},
 	},
 	{
