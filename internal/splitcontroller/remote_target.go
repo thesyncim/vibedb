@@ -168,7 +168,8 @@ func NewStaticShardActionGrants(grants []ShardActionGrant) (*StaticShardActionGr
 		grant := &owned[index]
 		if grant.Operation == (OperationID{}) || grant.PlanDigest == ([32]byte{}) ||
 			!grant.Target.valid() || grant.Plan == nil || grant.Observer == nil || grant.Executor == nil ||
-			grant.Actions == 0 || grant.Plan.OperationID() != grant.Operation {
+			grant.Actions == 0 || grant.Actions&^uint16((1<<uint(ActionComplete))-1) != 0 ||
+			grant.Plan.OperationID() != grant.Operation {
 			return nil, ErrRemoteExecution
 		}
 	}
