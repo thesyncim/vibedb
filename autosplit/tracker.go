@@ -44,6 +44,68 @@ type Tracker struct {
 	anchorBucket distribution.KeyspacePoint
 }
 
+// TrackerCheckpoint is the complete fixed-size restart image of one sustained
+// hotness tracker. It contains only logical evidence-window state: wall-clock
+// time never enters split qualification or cooldown decisions.
+//
+// The checkpoint is intentionally a value rather than an encoded document.
+// The replicated controller that owns it remains responsible for binding the
+// value to its catalog generation and durable authority revision.
+type TrackerCheckpoint struct {
+	Source       SourceIdentity
+	LastSequence uint64
+	History      uint64
+	Fast         uint64
+	Slow         uint64
+	Cooldown     uint16
+	Seen         uint8
+	AnchorBin    uint8
+	LastKind     RecommendationKind
+	Stable       bool
+	AnchorBucket distribution.KeyspacePoint
+}
+
+// Checkpoint returns a detached, allocation-free restart image.
+func (t *Tracker) Checkpoint() TrackerCheckpoint {
+	if t == nil {
+		return TrackerCheckpoint{}
+	}
+	return TrackerCheckpoint{
+		Source: t.source, LastSequence: t.lastSequence,
+		History: t.history, Fast: t.fast, Slow: t.slow,
+		Cooldown: t.cooldown, Seen: t.seen, AnchorBin: t.anchorBin,
+		LastKind: t.lastKind, Stable: t.stable, AnchorBucket: t.anchorBucket,
+	}
+}
+
+// RestoreTracker validates and restores one checkpoint. Empty checkpoints are
+// legal and restore the zero tracker. Malformed history, anchors, or source
+// identities fail closed instead of manufacturing hotness evidence.
+func RestoreTracker(checkpoint TrackerCheckpoint) (Tracker, bool) {
+	if checkpoint == (TrackerCheckpoint{}) {
+		return Tracker{}, true
+	}
+	if !checkpoint.Source.valid() || checkpoint.LastSequence == 0 ||
+		checkpoint.Seen > 64 || checkpoint.LastKind > RecommendationUnsplittableBucket ||
+		(checkpoint.Stable && checkpoint.LastKind != RecommendationBinarySplit &&
+			checkpoint.LastKind != RecommendationIsolateBucket) ||
+		(!checkpoint.Stable && (checkpoint.AnchorBin != 0 ||
+			checkpoint.AnchorBucket != (distribution.KeyspacePoint{}) ||
+			checkpoint.LastKind != RecommendationNone)) {
+		return Tracker{}, false
+	}
+	if checkpoint.Seen < 64 && checkpoint.History>>checkpoint.Seen != 0 {
+		return Tracker{}, false
+	}
+	return Tracker{
+		source: checkpoint.Source, lastSequence: checkpoint.LastSequence,
+		history: checkpoint.History, fast: checkpoint.Fast, slow: checkpoint.Slow,
+		cooldown: checkpoint.Cooldown, seen: checkpoint.Seen,
+		anchorBin: checkpoint.AnchorBin, lastKind: checkpoint.LastKind,
+		stable: checkpoint.Stable, anchorBucket: checkpoint.AnchorBucket,
+	}, true
+}
+
 // Observe consumes one recommendation window. It applies fast (1/2) and slow
 // (1/8) fixed-point EWMAs, boundary stability, N-of-M evidence, and cooldown.
 func (t *Tracker) Observe(rec Recommendation, policy TrackerPolicy) bool {
