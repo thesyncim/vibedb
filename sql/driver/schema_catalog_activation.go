@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 const (
@@ -24,6 +26,20 @@ var replicatedSchemaActivationChecksumDomain = []byte(
 var replicatedSchemaCatalogCASDomain = []byte(
 	"vibedb/sql/schema-catalog-cas/format-0\x00",
 )
+
+func replicatedSchemaCatalogCASDigest(
+	currentDigest, targetDigest, requestDigest, authorizationDigest [sha256.Size]byte,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(replicatedSchemaCatalogCASDomain)
+	_, _ = h.Write(currentDigest[:])
+	_, _ = h.Write(targetDigest[:])
+	_, _ = h.Write(requestDigest[:])
+	_, _ = h.Write(authorizationDigest[:])
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
 
 type replicatedSchemaActivation struct {
 	targetDigest [sha256.Size]byte
@@ -173,15 +189,116 @@ func (a *ReplicatedApply) ReplicatedSchemaCatalogCASDigest(
 		return [sha256.Size]byte{}, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
 	currentDigest := sha256.Sum256(raw)
-	h := sha256.New()
-	_, _ = h.Write(replicatedSchemaCatalogCASDomain)
-	_, _ = h.Write(currentDigest[:])
-	_, _ = h.Write(proof.Catalog.Digest[:])
-	_, _ = h.Write(requestDigest[:])
-	_, _ = h.Write(authorizationDigest[:])
-	var result [sha256.Size]byte
-	_ = h.Sum(result[:0])
-	return result, nil
+	return replicatedSchemaCatalogCASDigest(
+		currentDigest, proof.Catalog.Digest, requestDigest, authorizationDigest,
+	), nil
+}
+
+// PublishReplicatedSchemaCatalog performs the exact old->new catalog CAS only
+// after the persisted machine proves the authorized schema command is its
+// final durable Raft entry. Success deliberately leaves the old in-process
+// bundle fenced; the runtime must close it and activate the target membership
+// before serving resumes.
+func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err error) {
+	if a == nil || a.database == nil {
+		return false, ErrReplicatedApplyClosed
+	}
+	record, found, err := readReplicatedSchemaActivation(a.database.dataDir)
+	if err != nil || !found {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(record.command)
+	if err != nil || record.targetDigest == ([32]byte{}) {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	marker, markerFound, err := readReplicatedSchemaStageMarker(a.database.dataDir)
+	if err != nil || !markerFound || marker.catalogDigest != record.targetDigest ||
+		marker.sourceApplied == ^uint64(0) {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	root, err := os.OpenRoot(a.database.dataDir)
+	if err != nil {
+		return false, err
+	}
+	file, err := root.Open(replicatedSchemaTargetCatalogName)
+	if err != nil {
+		_ = root.Close()
+		return false, err
+	}
+	targetRaw, err := io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
+	err = errors.Join(err, file.Close(), root.Close())
+	if err != nil {
+		return false, err
+	}
+	targetImage, err := ValidateReplicatedSchemaCatalogImage(targetRaw)
+	if err != nil || targetImage.Digest != record.targetDigest ||
+		targetImage.SchemaGeneration != transition.ToSchemaGeneration ||
+		targetImage.RelationManifestDigest != transition.ToManifest {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+
+	d := a.database
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := a.checkLocked(); err != nil {
+		return false, err
+	}
+	applied, committed, err := a.machine.ObserveSchemaTransition(record.command)
+	if err != nil || !committed || applied != marker.sourceApplied+1 {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	bound, err := catalogSizeUpperBound(d.catalog)
+	if err != nil {
+		return false, err
+	}
+	currentMemory, err := appendCatalogJSON(make([]byte, 0, bound), d.catalog)
+	if err != nil {
+		return false, err
+	}
+	currentDisk, exists, err := readCatalogFile(d.path)
+	if err != nil || !exists || !bytes.Equal(currentMemory, currentDisk) {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	currentDigest := sha256.Sum256(currentDisk)
+	wantCAS := replicatedSchemaCatalogCASDigest(
+		currentDigest, targetImage.Digest, transition.RequestDigest,
+		transition.AuthorizationDigest,
+	)
+	if wantCAS != transition.CatalogCASDigest {
+		return false, ErrReplicatedSchemaCatalogImage
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(d.path), "."+filepath.Base(d.path)+".schema-*")
+	if err != nil {
+		return false, err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		_ = tmp.Close()
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(targetRaw)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return false, err
+	}
+	if err = replaceCatalogFile(tmpName, d.path); err != nil {
+		return false, err
+	}
+	cleanup = false
+	if err = d.directorySync(filepath.Dir(d.path)); err != nil {
+		return true, errors.Join(durable.ErrCommitOutcomeUnknown, err)
+	}
+	return true, nil
 }
 
 // PersistReplicatedSchemaTransition records the exact authorized command

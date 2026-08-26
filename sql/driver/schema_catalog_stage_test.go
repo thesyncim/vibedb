@@ -144,6 +144,28 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil || !bytes.Equal(stagedCatalog, targetRaw) {
 		t.Fatalf("reopened target catalog bytes=%d err=%v", len(stagedCatalog), err)
 	}
+	reopenedClaim, _, err := reopened.OpenReplicatedApply(
+		identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopenedClaim.ApplyNormal(
+		testReplicatedApplyMeta(prepared.SourceApplied+1), command,
+	); err != nil {
+		t.Fatal(err)
+	}
+	published, err := reopenedClaim.PublishReplicatedSchemaCatalog()
+	if err != nil || !published {
+		t.Fatalf("catalog publish=%t err=%v", published, err)
+	}
+	publishedRaw, found, err := readCatalogFile(path)
+	if err != nil || !found || !bytes.Equal(publishedRaw, targetRaw) {
+		t.Fatalf("published catalog found=%t bytes=%d err=%v", found, len(publishedRaw), err)
+	}
+	if err = reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
