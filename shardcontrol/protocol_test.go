@@ -37,10 +37,10 @@ func TestRequestCanonicalRoundTripAndDamage(t *testing.T) {
 	}
 	for _, damage := range []func([]byte){
 		func(raw []byte) { raw[0]++ },
-		func(raw []byte) { raw[5]++ },
-		func(raw []byte) { raw[8] = 1 },
-		func(raw []byte) { raw[9] = 0 },
-		func(raw []byte) { raw[173] = 0 },
+		func(raw []byte) { raw[8]++ },
+		func(raw []byte) { raw[frameHeaderBytes]++ },
+		func(raw []byte) { raw[frameHeaderBytes+3] = 1 },
+		func(raw []byte) { raw[frameHeaderBytes+requestFixedBodyBytes+1] = 0 },
 	} {
 		broken := append([]byte(nil), frame...)
 		damage(broken)
@@ -101,9 +101,9 @@ func TestResponseCanonicalRoundTripAndBoundedRead(t *testing.T) {
 		!bytes.Equal(opened.Payload, response.Payload) {
 		t.Fatalf("opened=%+v err=%v", opened, err)
 	}
-	var oversized [5]byte
-	oversized[0] = responseTag
-	for index := 1; index < len(oversized); index++ {
+	var oversized [frameHeaderBytes]byte
+	copy(oversized[:8], responseMagic[:])
+	for index := 8; index < len(oversized); index++ {
 		oversized[index] = 0xff
 	}
 	if _, err = ReadResponse(bytes.NewReader(oversized[:])); err == nil {

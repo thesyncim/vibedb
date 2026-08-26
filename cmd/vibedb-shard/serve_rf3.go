@@ -29,6 +29,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	publicshardcontrol "github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -571,7 +572,11 @@ func servePreparedRF3WithExecutionLanes(
 			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
 	}
-	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl)
+	// Split control remains absent until this process can reconstruct the
+	// complete durable plan observation and execute every action class. The mux
+	// has a fixed shipped route for it once that runtime is supplied; it must not
+	// advertise a partial or memory-only executor.
+	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
@@ -717,9 +722,9 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action shardcontrol.Handler,
+	membership, observation, source, action, split shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 4)
+	routes := make([]shardcontrol.Route, 0, 5)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -740,6 +745,12 @@ func newRF3ControlMux(
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: replicaaction.RequestDiscriminator(),
 			Handler:       action,
+		})
+	}
+	if split != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: publicshardcontrol.RequestDiscriminator(),
+			Handler:       split,
 		})
 	}
 	return shardcontrol.New(routes...)

@@ -67,6 +67,15 @@ type Server struct {
 	executor   Executor
 }
 
+// Serve implements the shared shard-control Handler contract. Ownership of
+// the authenticated stream transfers to the selected service.
+func (server *Server) Serve(ctx context.Context, connection rafttransport.PeerConnection) error {
+	if connection != nil {
+		defer connection.Close()
+	}
+	return server.ServeConnection(ctx, connection)
+}
+
 func NewServer(authorizer *Authorizer, executor Executor) (*Server, error) {
 	if authorizer == nil || executor == nil {
 		return nil, ErrUnauthorized
