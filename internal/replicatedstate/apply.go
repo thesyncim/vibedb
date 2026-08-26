@@ -9,6 +9,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/routegate"
@@ -1825,17 +1826,9 @@ func (m *Machine) planMutations(
 				validation = target.Validator.ValidatePut(mutation.key, mutation.value)
 			}
 			if validation == MutationValidationAccept {
-				if ownership, ok := target.Validator.(OwnershipMutationValidator); ok {
-					if mutation.delete {
-						validation = ownership.ValidateDeleteOwnership(
-							mutation.key, current, found, m.state.Binding.OwnedRange,
-						)
-					} else {
-						validation = ownership.ValidatePutOwnership(
-							mutation.key, mutation.value, m.state.Binding.OwnedRange,
-						)
-					}
-				}
+				validation = validateRelationMutationOwnership(
+					target.Validator, mutation, current, found, m.state.Binding.OwnedRange,
+				)
 			}
 			switch validation {
 			case MutationValidationAccept:
@@ -1944,6 +1937,31 @@ func (m *Machine) planMutations(
 		return bytes.Compare(left.key, right.key)
 	})
 	return changes, affectedRows, ResultApplied, nil
+}
+
+// validateRelationMutationOwnership applies the mutable placement fence after
+// the immutable row/schema validator. A validator that cannot decode the
+// relation's physical key grammar is compatible only while the group owns the
+// complete keyspace. Once ownership narrows, accepting such a mutation would
+// guess which split owns it; refuse instead. This covers independently keyed
+// global-index relations while preserving pre-split bundle compatibility.
+func validateRelationMutationOwnership(
+	validator MutationValidator,
+	mutation finalMutation,
+	current []byte,
+	found bool,
+	owned distribution.KeyRange,
+) MutationValidation {
+	if ownership, ok := validator.(OwnershipMutationValidator); ok {
+		if mutation.delete {
+			return ownership.ValidateDeleteOwnership(mutation.key, current, found, owned)
+		}
+		return ownership.ValidatePutOwnership(mutation.key, mutation.value, owned)
+	}
+	if completeOwnershipRange(owned) {
+		return MutationValidationAccept
+	}
+	return MutationValidationWrongShard
 }
 
 func finalMutationCondition(kind replication.MutationKind) mutationCondition {

@@ -329,7 +329,8 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		return transactionConflict(plan), nil
 	}
 	if participantPlan.command.resultCode != ResultApplied &&
-		participantPlan.command.resultCode != ResultIndexConflict {
+		participantPlan.command.resultCode != ResultIndexConflict &&
+		participantPlan.command.resultCode != ResultWrongShard {
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
 	participantOrdinal := uint64(control.Participant.ParticipantOrdinal)
@@ -814,7 +815,8 @@ func (m *Machine) planCoordinatorTransition(
 		return transactionConflict(plan), nil
 	}
 	if next == distributedtxn.CoordinatorCommitted &&
-		existing.PrepareResultCode == ResultIndexConflict {
+		(existing.PrepareResultCode == ResultIndexConflict ||
+			existing.PrepareResultCode == ResultWrongShard) {
 		return transactionConflict(plan), nil
 	}
 	if next == distributedtxn.CoordinatorCommitted &&
@@ -1022,7 +1024,7 @@ func (m *Machine) planParticipantStageWithVote(
 		if err != nil {
 			return transactionCommandPlan{}, err
 		}
-		if code != ResultApplied && code != ResultIndexConflict {
+		if code != ResultApplied && code != ResultIndexConflict && code != ResultWrongShard {
 			return transactionCommandPlan{}, fmt.Errorf(
 				"%w: fused participant prepare result %d", ErrTransactionStateCorrupt, code,
 			)

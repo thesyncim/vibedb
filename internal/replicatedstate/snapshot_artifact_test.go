@@ -63,7 +63,7 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
 	// The artifact authenticates the apply contract; changing conditional
 	// mutations or JSON-relation affected-row semantics changes this vector.
-	const golden = "ecd9abef86a717e7eac3f7e8b753d023a58eca83e2d3f2eb22988398942c61bd"
+	const golden = "b75f346d7a9251d8c633ce1519d947bc75f534dc23708015c23aebaff4a9254a"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}

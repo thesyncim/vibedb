@@ -122,8 +122,8 @@ type TransactionControl struct {
 	ParticipantOrdinal uint32
 	// PrepareResultCode is the immutable vote produced by an atomic
 	// stage+prepare. Zero denotes a legacy split-stage control which has not yet
-	// recorded a vote; the only durable nonzero values are ResultApplied and
-	// ResultIndexConflict.
+	// recorded a vote; the durable nonzero values are ResultApplied,
+	// ResultIndexConflict, and ResultWrongShard.
 	PrepareResultCode uint32
 	// FusedPath permanently distinguishes controls created by atomic prepare
 	// operations from legacy split controls. The bit survives finish/retire so
@@ -328,6 +328,8 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 		frame[15] |= 1 << 4
 	case ResultIndexConflict:
 		frame[15] |= 2 << 4
+	case ResultWrongShard:
+		frame[15] |= 3 << 4
 	default:
 		return dst[:start], ErrTransactionStateCorrupt
 	}
@@ -427,8 +429,8 @@ func OpenTransactionControlInto(
 		view.PrepareResultCode = ResultApplied
 	case 2:
 		view.PrepareResultCode = ResultIndexConflict
-	default:
-		return TransactionControlView{}, ErrTransactionStateCorrupt
+	case 3:
+		view.PrepareResultCode = ResultWrongShard
 	}
 	copy(view.ID[:], src[24:40])
 	view.Revision = binary.LittleEndian.Uint64(src[40:48])
@@ -945,7 +947,8 @@ func transactionControlValid(control TransactionControl) bool {
 		}
 		if control.PrepareResultCode != 0 &&
 			control.PrepareResultCode != ResultApplied &&
-			control.PrepareResultCode != ResultIndexConflict {
+			control.PrepareResultCode != ResultIndexConflict &&
+			control.PrepareResultCode != ResultWrongShard {
 			return false
 		}
 		if !control.FusedPath && control.PrepareResultCode != 0 {
@@ -989,7 +992,8 @@ func transactionControlValid(control TransactionControl) bool {
 		control.CoordinatorDecision != distributedtxn.CoordinatorInvalid ||
 		control.CoordinatorParticipantOrdinal != 0 ||
 		(control.PrepareResultCode != 0 && control.PrepareResultCode != ResultApplied &&
-			control.PrepareResultCode != ResultIndexConflict) {
+			control.PrepareResultCode != ResultIndexConflict &&
+			control.PrepareResultCode != ResultWrongShard) {
 		return false
 	}
 	if (control.PrepareResultCode != 0) !=
@@ -1087,7 +1091,8 @@ func transactionFailedPrepareWitness(control TransactionControl) bool {
 		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantStaged &&
 		control.LastOperation == distributedtxn.ReplicatedPrepareParticipant &&
 		control.LastExpectedRevision == control.Revision &&
-		control.LastResultCode == ResultIndexConflict
+		(control.LastResultCode == ResultIndexConflict ||
+			control.LastResultCode == ResultWrongShard)
 }
 
 func transactionFailedFusedPrepareWitness(control TransactionControl) bool {
@@ -1095,8 +1100,9 @@ func transactionFailedFusedPrepareWitness(control TransactionControl) bool {
 		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
 		control.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant &&
 		control.LastExpectedRevision == 0 &&
-		control.LastResultCode == ResultIndexConflict &&
-		control.PrepareResultCode == ResultIndexConflict &&
+		(control.LastResultCode == ResultIndexConflict ||
+			control.LastResultCode == ResultWrongShard) &&
+		control.PrepareResultCode == control.LastResultCode &&
 		!control.AffectedRowsValid && control.AffectedRows == 0 &&
 		control.ResidentMutationBytes == 0 && control.ResidentIntentBytes == 0
 }

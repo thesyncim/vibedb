@@ -34,6 +34,7 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 // mutation behavior shared by compact singleton and multi-relation commands.
 const deterministicBundleApplySemantics = "ordered-dense-relation-batches;" +
 	"one-checkpoint-group-publication;all-relations-or-none;" +
+	"mutable-owned-range-proof-or-complete-keyspace;wrong-shard-prepare-vote;" +
 	"global-put-absent-or-vibejson-semantic-equal;" +
 	"global-delete-raw-length-and-sha256-equal;" +
 	"json-put-absent-or-raw-equal;json-put-raw-length-and-sha256-equal;" +

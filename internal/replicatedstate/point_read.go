@@ -117,6 +117,10 @@ func relationOwnsPoint(
 	if ok {
 		return validator.ValidatePointOwnership(key, owned) == MutationValidationAccept
 	}
+	return completeOwnershipRange(owned)
+}
+
+func completeOwnershipRange(owned distribution.KeyRange) bool {
 	return owned.Start == (distribution.KeyspacePoint{}) && owned.End.Max &&
 		owned.End.Point == (distribution.KeyspacePoint{})
 }
