@@ -7,7 +7,6 @@ import (
 	"errors"
 	"hash"
 	"math"
-	"reflect"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -114,6 +113,53 @@ type RetainedPruner struct {
 	cursorCodec RetainedPruneCursorWorkspace
 }
 
+// RetainedPruneAuthorityProof is an immutable, package-issued proof that the
+// exact target manifest and cutover certificate authorize destructive cleanup.
+// External control-plane certificates are verified before callers request this
+// proof; unlike the legacy gateway capability, no concrete-type reflection or
+// fabricated sealed interface is involved.
+type RetainedPruneAuthorityProof struct {
+	operation  [sha256.Size]byte
+	generation uint64
+	manifest   *distribution.Manifest
+	cutover    [sha256.Size]byte
+}
+
+func NewRetainedPruneAuthorityProof(
+	partitioner *Partitioner,
+	certificate CutoverCertificate,
+	manifest *distribution.Manifest,
+	generation uint64,
+	operation [sha256.Size]byte,
+) (RetainedPruneAuthorityProof, error) {
+	if partitioner == nil || manifest == nil || operation == ([sha256.Size]byte{}) ||
+		partitioner.ValidateRetainedPruneAuthority(manifest, generation, certificate) != nil {
+		return RetainedPruneAuthorityProof{}, ErrRetainedPrune
+	}
+	return RetainedPruneAuthorityProof{
+		operation: operation, generation: generation, manifest: manifest,
+		cutover: certificate.Digest(),
+	}, nil
+}
+
+// NewCertifiedRetainedPruner consumes only a proof constructed by this
+// package's exact manifest validator.
+func NewCertifiedRetainedPruner(
+	partitioner *Partitioner,
+	certificate CutoverCertificate,
+	authority RetainedPruneAuthorityProof,
+	persistedCursor []byte,
+) (*RetainedPruner, error) {
+	if partitioner == nil || authority.manifest == nil ||
+		authority.operation == ([sha256.Size]byte{}) || authority.cutover != certificate.Digest() ||
+		partitioner.ValidateRetainedPruneAuthority(
+			authority.manifest, authority.generation, certificate,
+		) != nil {
+		return nil, ErrRetainedPrune
+	}
+	return newRetainedPruner(partitioner, certificate, authority.operation, persistedCursor)
+}
+
 type RetainedPruneWorkspace struct {
 	document   distribution.DocumentPointWorkspace
 	capture    SourceCaptureWorkspace
@@ -136,35 +182,10 @@ type RetainedPruneWorkspace struct {
 func NewRetainedPruner(
 	partitioner *Partitioner,
 	certificate CutoverCertificate,
-	authority any,
+	authority RetainedPruneAuthorityProof,
 	persistedCursor []byte,
 ) (*RetainedPruner, error) {
-	view, ok := sealedRetainedPruneAuthority(authority)
-	if !ok || partitioner == nil || partitioner.ValidateRetainedPruneAuthority(
-		view.Manifest(), view.Generation(), certificate,
-	) != nil || view.Operation() == ([sha256.Size]byte{}) ||
-		view.Certificate() != certificate.Digest() {
-		return nil, ErrRetainedPrune
-	}
-	return newRetainedPruner(partitioner, certificate, view.Operation(), persistedCursor)
-}
-
-type retainedPruneAuthorityView interface {
-	Manifest() *distribution.Manifest
-	Generation() uint64
-	Operation() [sha256.Size]byte
-	Certificate() [sha256.Size]byte
-}
-
-func sealedRetainedPruneAuthority(authority any) (retainedPruneAuthorityView, bool) {
-	view, ok := authority.(retainedPruneAuthorityView)
-	if !ok || view == nil {
-		return nil, false
-	}
-	typeOf := reflect.TypeOf(authority)
-	return view, typeOf.Kind() == reflect.Struct &&
-		typeOf.PkgPath() == "github.com/thesyncim/vibedb/gateway" &&
-		typeOf.Name() == "retainedPruneAuthority"
+	return NewCertifiedRetainedPruner(partitioner, certificate, authority, persistedCursor)
 }
 
 func newRetainedPruner(

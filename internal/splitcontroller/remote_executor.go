@@ -26,14 +26,14 @@ type ShardControlRouter interface {
 }
 
 type remoteStepPayload struct {
-	Action          uint8                                   `json:"action"`
-	Child           uint8                                   `json:"child"`
-	Catalog         uint64                                  `json:"catalog"`
-	Target          ShardActionTarget                       `json:"target"`
-	StateDigest     [32]byte                                `json:"state_digest"`
-	DataChainDigest [32]byte                                `json:"data_chain_digest"`
-	EntryDigest     [32]byte                                `json:"entry_digest"`
-	CatalogDrain    *gateway.ClusterCatalogDrainCertificate `json:"catalog_drain,omitempty"`
+	Action          uint8             `json:"action"`
+	Child           uint8             `json:"child"`
+	Catalog         uint64            `json:"catalog"`
+	Target          ShardActionTarget `json:"target"`
+	StateDigest     [32]byte          `json:"state_digest"`
+	DataChainDigest [32]byte          `json:"data_chain_digest"`
+	EntryDigest     [32]byte          `json:"entry_digest"`
+	RetainedPrune   []byte            `json:"retained_prune,omitempty"`
 }
 
 // ExecuteRemoteReplicatedStep is the serving controller composition: intent
@@ -88,12 +88,18 @@ func appendRemoteStepRequest(
 		EntryDigest:     observed.SourceState.LastEntryDigest,
 	}
 	if action.Kind == ActionPruneRetained {
-		if !observed.OlderCatalogDrained ||
-			!validCatalogDrainCertificate(plan, observed.Catalog, observed.CatalogDrainCertificate) {
+		if !observed.OlderCatalogDrained || observed.Certificate == nil ||
+			!validRetainedPruneCertificate(
+				plan, observed.Catalog, *observed.Certificate, observed.RetainedPruneCertificate,
+			) {
 			return shardcontrol.Request{}, ErrRemoteExecution
 		}
-		certificate := observed.CatalogDrainCertificate
-		payload.CatalogDrain = &certificate
+		payload.RetainedPrune, err = gateway.AppendRetainedPruneCertificate(
+			nil, observed.RetainedPruneCertificate,
+		)
+		if err != nil {
+			return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
+		}
 	}
 	raw, err := vibejson.Marshal(&payload)
 	if err != nil {

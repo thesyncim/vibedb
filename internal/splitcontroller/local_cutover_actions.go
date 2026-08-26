@@ -125,6 +125,71 @@ func (a *LocalSourceActions) ExecutePruneRetained(
 	if err != nil {
 		return err
 	}
+	proof, err := rangesplit.NewRetainedPruneAuthorityProof(
+		plan.partitioner, certificate, authority.Manifest(), authority.Generation(), authority.Operation(),
+	)
+	if err != nil || authority.Certificate() != certificate.Digest() {
+		return errors.Join(ErrTopologyConflict, err)
+	}
+	return a.executeCertifiedPruneLocked(ctx, plan, observed, serving, proposer, limits, certificate, proof)
+}
+
+// ExecuteCertifiedPruneRetained is the shipped gateway-to-shard path. The
+// shard validates the fixed external certificate against its admitted Plan,
+// exact published catalog, and cutover before rangesplit issues its immutable
+// manifest authority proof.
+func (a *LocalSourceActions) ExecuteCertifiedPruneRetained(
+	ctx context.Context,
+	plan *Plan,
+	observed Observation,
+	serving raftservice.ServingState,
+	proposer RetainedPruneProposer,
+	limits rangesplit.RetainedPruneLimits,
+) error {
+	if a == nil || ctx == nil || plan == nil || proposer == nil ||
+		plan.operation != a.store.operation || observed.Catalog == nil || observed.Certificate == nil ||
+		!validRetainedPruneCertificate(
+			plan, observed.Catalog, *observed.Certificate, observed.RetainedPruneCertificate,
+		) {
+		return ErrInvalidPlan
+	}
+	action, err := Reconcile(plan, observed)
+	if err != nil || action.Kind != ActionPruneRetained {
+		return errors.Join(ErrTopologyConflict, err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.active == nil || observed.Capture != a.active {
+		return ErrTopologyConflict
+	}
+	manifestDigest, err := a.runtime.RangeSplitRelationManifestDigest()
+	if err != nil || !sourceServingStateMatches(observed.SourceState, serving, manifestDigest) {
+		return errors.Join(ErrTopologyConflict, err)
+	}
+	manifest, ok := observed.Catalog.Manifest(plan.source.Distribution)
+	if !ok {
+		return ErrTopologyConflict
+	}
+	certificate := *observed.Certificate
+	proof, err := rangesplit.NewRetainedPruneAuthorityProof(
+		plan.partitioner, certificate, manifest, observed.Catalog.Generation(), [32]byte(plan.operation),
+	)
+	if err != nil {
+		return errors.Join(ErrTopologyConflict, err)
+	}
+	return a.executeCertifiedPruneLocked(ctx, plan, observed, serving, proposer, limits, certificate, proof)
+}
+
+func (a *LocalSourceActions) executeCertifiedPruneLocked(
+	ctx context.Context,
+	plan *Plan,
+	observed Observation,
+	serving raftservice.ServingState,
+	proposer RetainedPruneProposer,
+	limits rangesplit.RetainedPruneLimits,
+	certificate rangesplit.CutoverCertificate,
+	proof rangesplit.RetainedPruneAuthorityProof,
+) error {
 	cursor, revision, present, err := a.store.LoadRetainedPrune(
 		plan.partitioner, certificate,
 	)
@@ -147,8 +212,8 @@ func (a *LocalSourceActions) ExecutePruneRetained(
 			return errors.Join(ErrTopologyConflict, encodeErr)
 		}
 	}
-	pruner, err := rangesplit.NewRetainedPruner(
-		plan.partitioner, certificate, authority, persisted,
+	pruner, err := rangesplit.NewCertifiedRetainedPruner(
+		plan.partitioner, certificate, proof, persisted,
 	)
 	if err != nil {
 		return err

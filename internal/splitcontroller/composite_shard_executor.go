@@ -63,7 +63,7 @@ func NewCompositeShardActionExecutor(
 			return nil, ErrRemoteExecution
 		}
 		if options.Actions&actionBit(ActionPruneRetained) != 0 &&
-			(options.PruneSource == nil || options.Prune == nil) {
+			options.Prune == nil {
 			return nil, ErrRemoteExecution
 		}
 	}
@@ -157,9 +157,8 @@ func (executor *CompositeShardActionExecutor) ExecuteSplitAction(
 		}
 		return options.Lifecycle.ExecuteAdoptChildRuntime(ctx, plan)
 	case ActionPruneRetained:
-		return options.Source.ExecutePruneRetained(
-			ctx, plan, observed, observed.SourceServing, options.PruneSource,
-			options.Prune, options.PruneLimits,
+		return options.Source.ExecuteCertifiedPruneRetained(
+			ctx, plan, observed, observed.SourceServing, options.Prune, options.PruneLimits,
 		)
 	default:
 		return ErrRemoteExecution

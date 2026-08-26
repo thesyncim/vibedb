@@ -255,22 +255,37 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	observed.Catalog = next
 	assertCrashRecovery(observed, ActionAwaitCatalogDrain)
 	observed.OlderCatalogDrained = true
+	observed.RetainedPruneCertificate = testRetainedPruneCertificate(t, plan, next, certificate)
 	assertCrashRecovery(observed, ActionPruneRetained)
-	receipt, err := gateway.SaveSnapshotAfterWithReceipt(t.TempDir()+"/catalog", 0, next)
+	pruneRequest, err := appendRemoteStepRequest(
+		nil, plan, observed, Action{Kind: ActionPruneRetained},
+	)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("certified remote prune request: %v", err)
 	}
-	holder := gateway.NewCatalogHolder(next)
-	authority, err := holder.AuthorizeRetainedPrune(
-		receipt, split.Source.Distribution, [32]byte(plan.OperationID()), certificate.Digest(),
+	prunePayload, err := openRemoteStepPayload(pruneRequest)
+	if err != nil || len(prunePayload.RetainedPrune) != gateway.RetainedPruneCertificateBytes {
+		t.Fatalf("remote prune certificate bytes=%d err=%v", len(prunePayload.RetainedPrune), err)
+	}
+	forgedPrune := append([]byte(nil), prunePayload.RetainedPrune...)
+	forgedPrune[24] ^= 1
+	if _, err = gateway.OpenRetainedPruneCertificate(forgedPrune); err == nil {
+		t.Fatal("remote prune accepted forged operation certificate")
+	}
+	publishedManifest, ok := next.Manifest(split.Source.Distribution)
+	if !ok {
+		t.Fatal("published manifest absent")
+	}
+	authority, err := rangesplit.NewRetainedPruneAuthorityProof(
+		plan.partitioner, certificate, publishedManifest, next.Generation(), [32]byte(plan.OperationID()),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrongOperation := [32]byte(plan.OperationID())
 	wrongOperation[0] ^= 0xff
-	wrongAuthority, err := holder.AuthorizeRetainedPrune(
-		receipt, split.Source.Distribution, wrongOperation, certificate.Digest(),
+	wrongAuthority, err := rangesplit.NewRetainedPruneAuthorityProof(
+		plan.partitioner, certificate, publishedManifest, next.Generation(), wrongOperation,
 	)
 	if err != nil {
 		t.Fatal(err)

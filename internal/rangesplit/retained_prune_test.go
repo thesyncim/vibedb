@@ -341,15 +341,9 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatalf("unpublished prune authority=%v", err)
 	}
 	if _, err := NewRetainedPruner(
-		partitioner, certificate, nil, nil,
+		partitioner, certificate, RetainedPruneAuthorityProof{}, nil,
 	); !errors.Is(err, ErrRetainedPrune) {
 		t.Fatalf("pruner accepted unpublished source authority=%v", err)
-	}
-	if _, err := NewRetainedPruner(partitioner, certificate, forgedPruneAuthority{
-		manifest: nextManifest, generation: 20, operation: [sha256.Size]byte{1},
-		certificate: certificate.Digest(),
-	}, nil); !errors.Is(err, ErrRetainedPrune) {
-		t.Fatalf("pruner accepted structurally compatible forged authority=%v", err)
 	}
 	corrupt := bytes.Clone(persisted)
 	corrupt[len(corrupt)-1] ^= 1
@@ -357,17 +351,6 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatalf("corrupt cursor err=%v", err)
 	}
 }
-
-type forgedPruneAuthority struct {
-	manifest               *distribution.Manifest
-	generation             uint64
-	operation, certificate [sha256.Size]byte
-}
-
-func (a forgedPruneAuthority) Manifest() *distribution.Manifest { return a.manifest }
-func (a forgedPruneAuthority) Generation() uint64               { return a.generation }
-func (a forgedPruneAuthority) Operation() [sha256.Size]byte     { return a.operation }
-func (a forgedPruneAuthority) Certificate() [sha256.Size]byte   { return a.certificate }
 
 func BenchmarkRetainedPrunerPendingRetry(b *testing.B) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(b)

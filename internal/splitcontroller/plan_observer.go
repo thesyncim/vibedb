@@ -256,6 +256,16 @@ func (observer *CoherentPlanObserver) observeAttempt(
 		}
 		observed.OlderCatalogDrained = true
 		observed.CatalogDrainCertificate = proof.Certificate
+		if observed.Certificate == nil {
+			return Observation{}, false, ErrPlanObservation
+		}
+		pruneCertificate, certificateErr := deriveRetainedPruneCertificate(
+			plan, catalog, *observed.Certificate, proof.Certificate,
+		)
+		if certificateErr != nil {
+			return Observation{}, false, errors.Join(ErrPlanObservation, certificateErr)
+		}
+		observed.RetainedPruneCertificate = pruneCertificate
 	}
 	if _, err = Reconcile(plan, observed); err != nil {
 		return Observation{}, false, err
@@ -432,6 +442,6 @@ func planCatalogDrainRequest(
 func clusterPlanCatalogDrainRequest(request PlanCatalogDrainRequest) gateway.ClusterCatalogDrainRequest {
 	return gateway.ClusterCatalogDrainRequest{
 		Operation: [sha256.Size]byte(request.Operation), Step: request.RequestDigest,
-		Generation: request.CurrentGeneration, CatalogDigest: request.CatalogDigest,
+		Generation: request.NextGeneration, CatalogDigest: request.CatalogDigest,
 	}
 }

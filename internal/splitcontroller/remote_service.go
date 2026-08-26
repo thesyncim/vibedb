@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardcontrol"
 	vibejson "github.com/thesyncim/vibejson"
@@ -47,13 +48,19 @@ func (service *RemoteActionService) ExecuteAction(
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
 	if request.Action == shardcontrol.Action(ActionPruneRetained) {
-		if payload.CatalogDrain == nil ||
-			!validCatalogDrainCertificate(plan, observed.Catalog, *payload.CatalogDrain) {
+		if observed.Certificate == nil {
 			return shardcontrol.Response{}, ErrRemoteExecution
 		}
+		certificate, openErr := gateway.OpenRetainedPruneCertificate(payload.RetainedPrune)
+		if openErr != nil || !validRetainedPruneCertificate(
+			plan, observed.Catalog, *observed.Certificate, certificate,
+		) {
+			return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, openErr)
+		}
 		observed.OlderCatalogDrained = true
-		observed.CatalogDrainCertificate = *payload.CatalogDrain
-	} else if payload.CatalogDrain != nil {
+		observed.CatalogDrainCertificate = certificate.CatalogDrain()
+		observed.RetainedPruneCertificate = certificate
+	} else if len(payload.RetainedPrune) != 0 {
 		return shardcontrol.Response{}, ErrRemoteExecution
 	}
 	action, err := Reconcile(plan, observed)
