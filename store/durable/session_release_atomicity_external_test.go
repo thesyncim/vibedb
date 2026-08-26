@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -518,6 +519,7 @@ func sessionCrashBinding() replicatedstate.Binding {
 		GroupID: sessionCrashID(6), ActivePolicyGeneration: 7,
 		ProtectionEpoch: 8, OwnershipEpoch: 9, SchemaGeneration: 10,
 		RoutingVersion: 11, RouteGeneration: 12,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 	}
 }
 
