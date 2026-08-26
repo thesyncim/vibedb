@@ -13,6 +13,8 @@ func TestGenerationMigrationManifestCanonicalAndCrashRejecting(t *testing.T) {
 		SourceGeneration: 41, TargetGeneration: 42,
 		CapturedSequence: 99, AppliedSequence: 87,
 		SourceFileEnd: 1 << 20, TargetFileEnd: 512 << 10,
+		ReservedOffset: 2 << 20, ReservedBytes: 8 << 20,
+		FirstLogicalID: 100, LogicalIDCount: 1000,
 		Cursor: []byte("row-0000042"),
 	}
 	first, err := EncodeGenerationMigrationManifest(

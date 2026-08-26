@@ -9,7 +9,7 @@ import (
 
 const (
 	GenerationMigrationManifestBytes = 4096
-	generationMigrationHeaderBytes   = 112
+	generationMigrationHeaderBytes   = 144
 	generationMigrationTrailerAt     = GenerationMigrationManifestBytes - 8
 	generationMigrationMagic         = "SGMIGR00"
 )
@@ -38,6 +38,10 @@ type GenerationMigrationManifest struct {
 	AppliedSequence  uint64
 	SourceFileEnd    uint64
 	TargetFileEnd    uint64
+	ReservedOffset   uint64
+	ReservedBytes    uint64
+	FirstLogicalID   uint64
+	LogicalIDCount   uint64
 	Cursor           []byte
 }
 
@@ -47,7 +51,10 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 		m.Phase > GenerationMigrationPublished || m.SourceGeneration == 0 ||
 		m.TargetGeneration <= m.SourceGeneration ||
 		m.AppliedSequence > m.CapturedSequence || len(m.Cursor) >
-		generationMigrationTrailerAt-generationMigrationHeaderBytes {
+		generationMigrationTrailerAt-generationMigrationHeaderBytes ||
+		m.ReservedBytes == 0 || m.LogicalIDCount == 0 ||
+		m.ReservedOffset > ^uint64(0)-m.ReservedBytes ||
+		m.FirstLogicalID > ^uint64(0)-m.LogicalIDCount {
 		return nil, fmt.Errorf("%w: fields", ErrInvalidWrite)
 	}
 	image := dst[:GenerationMigrationManifestBytes]
@@ -63,7 +70,11 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 	binary.LittleEndian.PutUint64(image[72:80], m.AppliedSequence)
 	binary.LittleEndian.PutUint64(image[80:88], m.SourceFileEnd)
 	binary.LittleEndian.PutUint64(image[88:96], m.TargetFileEnd)
-	binary.LittleEndian.PutUint32(image[96:100], uint32(len(m.Cursor)))
+	binary.LittleEndian.PutUint64(image[96:104], m.ReservedOffset)
+	binary.LittleEndian.PutUint64(image[104:112], m.ReservedBytes)
+	binary.LittleEndian.PutUint64(image[112:120], m.FirstLogicalID)
+	binary.LittleEndian.PutUint64(image[120:128], m.LogicalIDCount)
+	binary.LittleEndian.PutUint32(image[128:132], uint32(len(m.Cursor)))
 	copy(image[generationMigrationHeaderBytes:], m.Cursor)
 	checksum := PageChecksum(image[:generationMigrationTrailerAt])
 	binary.LittleEndian.PutUint32(image[generationMigrationTrailerAt:], checksum)
@@ -92,11 +103,18 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.AppliedSequence = binary.LittleEndian.Uint64(src[72:80])
 	m.SourceFileEnd = binary.LittleEndian.Uint64(src[80:88])
 	m.TargetFileEnd = binary.LittleEndian.Uint64(src[88:96])
-	cursorBytes := int(binary.LittleEndian.Uint32(src[96:100]))
+	m.ReservedOffset = binary.LittleEndian.Uint64(src[96:104])
+	m.ReservedBytes = binary.LittleEndian.Uint64(src[104:112])
+	m.FirstLogicalID = binary.LittleEndian.Uint64(src[112:120])
+	m.LogicalIDCount = binary.LittleEndian.Uint64(src[120:128])
+	cursorBytes := int(binary.LittleEndian.Uint32(src[128:132]))
 	if m.StoreID == ([16]byte{}) || m.MigrationID == ([16]byte{}) ||
 		m.Phase < GenerationMigrationCopying || m.Phase > GenerationMigrationPublished ||
 		m.SourceGeneration == 0 || m.TargetGeneration <= m.SourceGeneration ||
 		m.AppliedSequence > m.CapturedSequence || cursorBytes < 0 ||
+		m.ReservedBytes == 0 || m.LogicalIDCount == 0 ||
+		m.ReservedOffset > ^uint64(0)-m.ReservedBytes ||
+		m.FirstLogicalID > ^uint64(0)-m.LogicalIDCount ||
 		cursorBytes > generationMigrationTrailerAt-generationMigrationHeaderBytes ||
 		!allZero(src[generationMigrationHeaderBytes+cursorBytes:generationMigrationTrailerAt]) {
 		return GenerationMigrationManifest{}, ErrGenerationMigrationManifestCorrupt
@@ -115,6 +133,10 @@ func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManife
 		next.AppliedSequence < previous.AppliedSequence ||
 		next.AppliedSequence > next.CapturedSequence ||
 		next.SourceFileEnd != previous.SourceFileEnd ||
+		next.ReservedOffset != previous.ReservedOffset ||
+		next.ReservedBytes != previous.ReservedBytes ||
+		next.FirstLogicalID != previous.FirstLogicalID ||
+		next.LogicalIDCount != previous.LogicalIDCount ||
 		next.TargetFileEnd < previous.TargetFileEnd ||
 		(next.Phase == GenerationMigrationCopying &&
 			bytes.Compare(next.Cursor, previous.Cursor) < 0) ||
