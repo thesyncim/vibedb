@@ -246,6 +246,9 @@ func TestCatalogPlanObservationPeerDirectoryBindsExactRF3Cut(t *testing.T) {
 			AllocationGeneration: 7, Command: command, Replicas: replicas,
 			RangeIdentity: replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
 			ForwardingRuleDigest: replication.Digest{0x73},
+			RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{
+				Identity: replication.Digest{0x91},
+			}},
 		}},
 	)
 	if err != nil {
