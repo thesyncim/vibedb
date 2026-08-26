@@ -52,6 +52,7 @@ const (
 	journalManifestCoordinatorSeal
 	journalCompactedCoordinator
 	journalCompactedParticipant
+	journalCoordinatorPulse
 )
 
 type RecordRole uint8
@@ -71,6 +72,7 @@ type Status struct {
 	CoordinatorState CoordinatorState
 	ParticipantState ParticipantState
 	MutationDigest   Digest
+	RecoveryPulse    uint8
 }
 
 type journalRecord struct {
@@ -140,14 +142,26 @@ func coordinatorControlReserve(state CoordinatorState, manifest bool) uint64 {
 	switch state {
 	case CoordinatorStaging:
 		if manifest {
-			return journalEncodedEntryBytes(manifestDescriptorBytes) + transition
+			return journalEncodedEntryBytes(manifestDescriptorBytes) + transition*4
 		}
-		return transition * 2
+		return transition * 5
 	case CoordinatorCommitted, CoordinatorAborted:
 		return transition
 	default:
 		return 0
 	}
+}
+
+func coordinatorStatusControlReserve(status Status, manifest bool) uint64 {
+	reserve := coordinatorControlReserve(status.CoordinatorState, manifest)
+	if status.CoordinatorState != CoordinatorStaging || status.RecoveryPulse == 0 {
+		return reserve
+	}
+	used := uint64(status.RecoveryPulse) * uint64(journalEntryHeaderBytes+4)
+	if used >= reserve {
+		return 0
+	}
+	return reserve - used
 }
 
 func participantControlReserve(state ParticipantState) uint64 {
@@ -194,7 +208,7 @@ func (j *Journal) rebuildControlReserveLocked() error {
 		return true
 	}
 	for _, record := range j.coordinators {
-		if !add(coordinatorControlReserve(record.status.CoordinatorState, record.hasManifest)) {
+		if !add(coordinatorStatusControlReserve(record.status, record.hasManifest)) {
 			return ErrTooLarge
 		}
 	}
@@ -398,9 +412,25 @@ func (j *Journal) replayEntry(
 		return j.replayCompactedCoordinator(id, revision, CoordinatorState(state), payload)
 	case journalCompactedParticipant:
 		return j.replayCompactedParticipant(id, revision, ParticipantState(state), payload)
+	case journalCoordinatorPulse:
+		if len(payload) != 0 {
+			return ErrCorrupt
+		}
+		return j.replayCoordinatorPulse(id, revision, state)
 	default:
 		return ErrUnsupported
 	}
+}
+
+func (j *Journal) replayCoordinatorPulse(id ID, revision uint64, pulse uint8) error {
+	record := j.coordinators[id]
+	if record == nil || record.status.Revision != revision ||
+		record.status.CoordinatorState != CoordinatorStaging || pulse == 0 ||
+		pulse != record.status.RecoveryPulse+1 {
+		return ErrCorrupt
+	}
+	record.status.RecoveryPulse = pulse
+	return nil
 }
 
 // replayCompactedCoordinator restores a retired coordinator without replaying
@@ -977,7 +1007,7 @@ func (j *Journal) SealManifestCoordinator(
 		return Status{}, err
 	}
 	j.replaceControlReserveLocked(
-		coordinatorControlReserve(record.status.CoordinatorState, true),
+		coordinatorStatusControlReserve(record.status, true),
 		coordinatorControlReserve(next, true),
 	)
 	record.status.Revision++
@@ -1095,7 +1125,7 @@ func (j *Journal) TransitionCoordinator(id ID, expected uint64, next Coordinator
 		return Status{}, err
 	}
 	j.replaceControlReserveLocked(
-		coordinatorControlReserve(record.status.CoordinatorState, record.hasManifest),
+		coordinatorStatusControlReserve(record.status, record.hasManifest),
 		coordinatorControlReserve(next, record.hasManifest),
 	)
 	record.status.Revision++
@@ -1104,6 +1134,64 @@ func (j *Journal) TransitionCoordinator(id ID, expected uint64, next Coordinator
 		j.releaseManifestLocked(id)
 	}
 	return record.status, nil
+}
+
+// PulseCoordinator advances one durable logical recovery observation without
+// changing the coordinator revision or decision. The immutable stage record
+// supplies the maximum pulse, so no caller or wall clock can widen the lease.
+func (j *Journal) PulseCoordinator(id ID, expected uint64, next uint8) (Status, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	record := j.coordinators[id]
+	if record == nil {
+		return Status{}, ErrJournalNotFound
+	}
+	limit, err := coordinatorRecoveryPulseLimit(record.stage, record.hasManifest)
+	if err != nil {
+		return Status{}, err
+	}
+	if record.status.Revision != expected ||
+		record.status.CoordinatorState != CoordinatorStaging || next == 0 ||
+		next > limit {
+		return Status{}, ErrJournalConflict
+	}
+	if record.status.RecoveryPulse >= next {
+		return record.status, nil
+	}
+	if next != record.status.RecoveryPulse+1 {
+		return Status{}, ErrJournalConflict
+	}
+	const pulseBytes = uint64(journalEntryHeaderBytes + 4)
+	if j.controlReserve < pulseBytes {
+		return Status{}, ErrCorrupt
+	}
+	if err = j.writeEntryLocked(journalCoordinatorPulse, next, expected, id, nil); err != nil {
+		return Status{}, err
+	}
+	j.controlReserve -= pulseBytes
+	record.status.RecoveryPulse = next
+	return record.status, nil
+}
+
+func coordinatorRecoveryPulseLimit(stage []byte, manifest bool) (uint8, error) {
+	var deadline int64
+	if manifest {
+		record, err := OpenManifestCoordinator(stage)
+		if err != nil {
+			return 0, err
+		}
+		deadline = record.RecoveryDeadline
+	} else {
+		record, err := OpenCoordinator(stage)
+		if err != nil {
+			return 0, err
+		}
+		deadline = record.RecoveryDeadline
+	}
+	if deadline <= 0 || deadline > int64(MaxRecoveryPulses) {
+		return 0, ErrCorrupt
+	}
+	return uint8(deadline), nil
 }
 
 func (j *Journal) TransitionParticipant(id ID, expected uint64, next ParticipantState) (Status, error) {

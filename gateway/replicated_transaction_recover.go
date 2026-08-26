@@ -88,6 +88,15 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 			)
 		}
 	}
+	// A response-lost pulse is settled byte-identically before observing the
+	// coordinator. This prevents two gateways from manufacturing extra logical
+	// lease progress from one admitted pulse.
+	if err := orchestrator.retryRecoveryPendingMatching(ctx, handle,
+		func(control distributedtxn.ReplicatedCommand) bool {
+			return control.Operation == distributedtxn.ReplicatedPulseCoordinator
+		}); err != nil {
+		return ReplicatedTransactionResult{}, orchestrator.executionError(handle, false, err)
+	}
 	coordinator := &handle.Participants[handle.CoordinatorOrdinal]
 	record, found, err := orchestrator.readCoordinator(ctx, handle, coordinator.Route)
 	if err != nil || !found {
@@ -119,6 +128,31 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 	}
 	switch state {
 	case distributedtxn.CoordinatorStaging:
+		limit := uint8(handle.RecoveryDeadline)
+		if record.RecoveryPulse < limit {
+			pulse := distributedtxn.ReplicatedCommand{
+				Role:      distributedtxn.ReplicatedRoleCoordinator,
+				Operation: distributedtxn.ReplicatedPulseCoordinator,
+				ID:        handle.ID, ExpectedRevision: record.Revision,
+				PayloadKind:   distributedtxn.ReplicatedPayloadNone,
+				RecoveryPulse: record.RecoveryPulse + 1,
+			}
+			proposal := orchestrator.proposeRecovery(
+				ctx, coordinator.Route, pulse, nil, handle.CoordinatorOrdinal,
+				replicatedTransactionWorkerScratch{},
+			)
+			orchestrator.capturePending(handle, proposal)
+			if proposal.err != nil || proposal.code != replicatedstate.ResultApplied {
+				return ReplicatedTransactionResult{}, orchestrator.executionError(
+					handle, false, errors.Join(proposal.err, ErrReplicatedTransactionUnknown),
+				)
+			}
+			handle.CoordinatorMinimumApplied = proposal.result.Outcome.AppliedIndex
+			if pulse.RecoveryPulse < limit {
+				return ReplicatedTransactionResult{ID: handle.ID, Recovery: handle},
+					orchestrator.executionError(handle, false, ErrRecoveryNotReady)
+			}
+		}
 		// This leader ReadIndex is ordered after every coordinator proposal known
 		// to the quorum. A still-staging record proves no commit crossed admission,
 		// so recovery chooses abort without replaying mutable-handle decision bytes.
@@ -258,6 +292,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) validReplicatedTransactio
 ) bool {
 	if handle == nil || handle.ID.IsZero() || handle.CatalogGeneration == 0 ||
 		handle.RecoveryDeadline <= 0 ||
+		handle.RecoveryDeadline > int64(distributedtxn.MaxRecoveryPulses) ||
 		len(handle.Participants) == 0 ||
 		uint64(len(handle.Participants)) > maxReplicatedTransactionOrdinal ||
 		int(handle.CoordinatorOrdinal) >= len(handle.Participants) ||
@@ -432,6 +467,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) validPendingTransactionCo
 		distributedtxn.ReplicatedApplyReleaseParticipant,
 		distributedtxn.ReplicatedAbortReleaseParticipant,
 		distributedtxn.ReplicatedRetireCoordinator:
+		return true
+	case distributedtxn.ReplicatedPulseCoordinator:
 		return true
 	default:
 		return false
@@ -656,6 +693,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) validateCoordinatorWitnes
 		return ErrReplicatedTransaction
 	}
 	state := distributedtxn.CoordinatorState(record.State)
+	if handle.RecoveryDeadline > int64(distributedtxn.MaxRecoveryPulses) ||
+		record.RecoveryPulse > uint8(handle.RecoveryDeadline) {
+		return ErrReplicatedTransaction
+	}
 	if state == distributedtxn.CoordinatorRetired {
 		if record.CoordinatorDecision == distributedtxn.CoordinatorCommitted {
 			if !record.AffectedRowsValid || record.AffectedRows < 0 {

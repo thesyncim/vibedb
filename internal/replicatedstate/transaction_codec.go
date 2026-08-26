@@ -107,7 +107,10 @@ type TransactionControl struct {
 	CoordinatorAllocation       uint64
 	MutationDigest              distributedtxn.Digest
 	BucketBits                  uint8
-	IntentScopes                []distributedtxn.IntentScope
+	// RecoveryPulse role-overlays BucketBits for coordinators. It is advanced
+	// only by replicated recovery-pulse commands and never by local time.
+	RecoveryPulse uint8
+	IntentScopes  []distributedtxn.IntentScope
 
 	AffectedRows      int64
 	AffectedRowsValid bool
@@ -311,7 +314,11 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	frame[11] = control.State
 	frame[12] = byte(control.PayloadKind)
 	frame[13] = byte(control.LastOperation)
-	frame[14] = control.BucketBits
+	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
+		frame[14] = control.RecoveryPulse
+	} else {
+		frame[14] = control.BucketBits
+	}
 	frame[15] = byte(control.CoordinatorDecision) << 1
 	if control.AffectedRowsValid {
 		frame[15] |= 1
@@ -418,7 +425,11 @@ func OpenTransactionControlInto(
 	view.State = src[11]
 	view.PayloadKind = distributedtxn.ReplicatedPayloadKind(src[12])
 	view.LastOperation = distributedtxn.ReplicatedOperation(src[13])
-	view.BucketBits = src[14]
+	if view.Role == distributedtxn.ReplicatedRoleCoordinator {
+		view.RecoveryPulse = src[14]
+	} else {
+		view.BucketBits = src[14]
+	}
 	view.AffectedRowsValid = src[15]&1 != 0
 	view.FusedPath = src[15]&(1<<6) != 0
 	view.CancellationWitness = src[15]&(1<<7) != 0
@@ -889,6 +900,7 @@ func OpenTransactionIntentForKey(
 func transactionControlValid(control TransactionControl) bool {
 	cancellation := transactionCancellationWitnessValid(control)
 	if control.ID.IsZero() || !transactionRoleValid(control.Role) || control.Revision == 0 ||
+		control.Role == distributedtxn.ReplicatedRoleParticipant && control.RecoveryPulse != 0 ||
 		control.PayloadDigest == (distributedtxn.Digest{}) ||
 		(!cancellation && (control.PayloadBytes == 0 || control.PayloadCount == 0)) ||
 		control.CoordinatorGroup == (replication.ID128{}) ||
@@ -1268,6 +1280,8 @@ func transactionOperationRole(
 		distributedtxn.ReplicatedAbortCoordinator,
 		distributedtxn.ReplicatedRetireCoordinator:
 		return role == distributedtxn.ReplicatedRoleCoordinator
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return role == distributedtxn.ReplicatedRoleCoordinator
 	case distributedtxn.ReplicatedStageParticipant,
 		distributedtxn.ReplicatedStagePrepareParticipant,
 		distributedtxn.ReplicatedPrepareParticipant,
@@ -1295,7 +1309,8 @@ func transactionStateOperationCompatible(
 				operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 				operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator ||
 				operation == distributedtxn.ReplicatedStageManifestSegment ||
-				operation == distributedtxn.ReplicatedAppendManifestSegments
+				operation == distributedtxn.ReplicatedAppendManifestSegments ||
+				operation == distributedtxn.ReplicatedPulseCoordinator
 		case distributedtxn.CoordinatorCommitted:
 			return operation == distributedtxn.ReplicatedCommitCoordinator
 		case distributedtxn.CoordinatorAborted:

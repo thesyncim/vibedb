@@ -44,7 +44,12 @@ const (
 	// ceiling, not a transaction-size or participant-count limit.
 	AbsoluteMaxReplicatedTransactionInFlightBytes = uint64(1 << 30)
 	maxReplicatedTransactionIDAttempts            = 4
-	maxReplicatedTransactionMutations             = uint64(replication.MaxMutations) *
+	// replicatedTransactionRecoveryPulseLimit is the number of distinct,
+	// quorum-committed recovery observations required before a staging
+	// coordinator may be aborted. Wall time can schedule observations but can
+	// never satisfy this authority.
+	replicatedTransactionRecoveryPulseLimit = distributedtxn.MaxRecoveryPulses
+	maxReplicatedTransactionMutations       = uint64(replication.MaxMutations) *
 		maxReplicatedTransactionOrdinal
 	maxReplicatedTransactionMutationBytes = uint64(replication.MaxCommandBytes) *
 		maxReplicatedTransactionOrdinal
@@ -176,6 +181,7 @@ type ReplicatedTransactionRecoveryHandle struct {
 	CoordinatorOrdinal        uint32
 	DecisionRevision          uint64
 	CoordinatorMinimumApplied uint64
+	// RecoveryDeadline is the persisted logical pulse limit, not wall time.
 	RecoveryDeadline          int64
 	Participants              []ReplicatedTransactionRouteWitness
 	Pending                   []ReplicatedTransactionPendingCommand
@@ -871,11 +877,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Execute(
 		return ReplicatedTransactionResult{}, err
 	}
 	coordinatorOrdinal := replicatedTransactionCoordinatorOrdinal(id, len(plan))
-	now := time.Now().UnixNano()
-	if now <= 0 || orchestrator.recoveryTimeout.Nanoseconds() > math.MaxInt64-now {
-		return ReplicatedTransactionResult{}, ErrReplicatedTransactionBound
-	}
-	deadline := now + orchestrator.recoveryTimeout.Nanoseconds()
+	deadline := int64(replicatedTransactionRecoveryPulseLimit)
 	handle = newReplicatedTransactionRecoveryHandle(
 		id, catalogGeneration, uint32(coordinatorOrdinal), deadline, plan,
 		handleReservation,

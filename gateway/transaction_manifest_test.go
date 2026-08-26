@@ -81,7 +81,7 @@ func testCoordinatorRecord(count int) distributedtxn.CoordinatorRecord {
 	id[0] = 9
 	return distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 7, RecoveryDeadline: 12345,
+		CatalogGeneration: 7, RecoveryDeadline: 3,
 		Participants: testTransactionRefs(count),
 	}
 }

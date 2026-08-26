@@ -500,7 +500,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 		return errBadTransaction
 	}
 	if tx.Operation == TransactionNone {
-		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 ||
+		if !tx.ID.IsZero() || tx.Revision != 0 || tx.RecoveryPulse != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 ||
 			len(tx.ManifestSegment) != 0 {
 			return errBadTransaction
 		}
@@ -508,6 +508,10 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 	}
 	if !tx.Operation.valid() {
 		return errBadEnum
+	}
+	if (tx.Operation == TransactionPulseCoordinator) != (tx.RecoveryPulse != 0) ||
+		tx.RecoveryPulse > distributedtxn.MaxRecoveryPulses {
+		return errBadTransaction
 	}
 	if tx.Operation.stages() {
 		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) == 0 ||
@@ -585,6 +589,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 func validateTransactionReply(tx TransactionReply) error {
 	if tx.Role == TransactionRoleNone {
 		if !tx.ID.IsZero() || tx.Revision != 0 ||
+			tx.RecoveryPulse != 0 ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
 			tx.ParticipantState != distributedtxn.ParticipantInvalid ||
 			tx.RecordKind != TransactionRecordNone || tx.SegmentIndex != 0 || len(tx.Record) != 0 {
@@ -636,7 +641,7 @@ func validateTransactionReply(tx TransactionReply) error {
 			return errBadTransaction
 		}
 	case TransactionRoleParticipant:
-		if tx.ParticipantState < distributedtxn.ParticipantStaged ||
+		if tx.RecoveryPulse != 0 || tx.ParticipantState < distributedtxn.ParticipantStaged ||
 			tx.ParticipantState > distributedtxn.ParticipantReleased ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
 			return errBadTransaction
@@ -1094,6 +1099,9 @@ func encodeTransactionRequest(e *encbuf, tx TransactionRequest) {
 	}
 	e.fixed16(tx.ID)
 	e.u64(tx.Revision)
+	if tx.Operation == TransactionPulseCoordinator {
+		e.u8(tx.RecoveryPulse)
+	}
 }
 
 func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
@@ -1118,6 +1126,9 @@ func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
 	} else {
 		tx.ID = distributedtxn.ID(d.fixed16())
 		tx.Revision = d.u64()
+		if tx.Operation == TransactionPulseCoordinator {
+			tx.RecoveryPulse = d.u8()
+		}
 	}
 	if d.bad() {
 		return TransactionRequest{}, d.why
@@ -1132,6 +1143,7 @@ func encodeTransactionReply(e *encbuf, tx TransactionReply) {
 	e.u8(uint8(tx.Role))
 	e.fixed16(tx.ID)
 	e.u64(tx.Revision)
+	e.u8(tx.RecoveryPulse)
 	if tx.Role == TransactionRoleCoordinator {
 		e.u8(uint8(tx.CoordinatorState))
 	} else {
@@ -1149,6 +1161,7 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 	}
 	tx.ID = distributedtxn.ID(d.fixed16())
 	tx.Revision = d.u64()
+	tx.RecoveryPulse = d.u8()
 	state := d.u8()
 	if tx.Role == TransactionRoleCoordinator {
 		tx.CoordinatorState = distributedtxn.CoordinatorState(state)

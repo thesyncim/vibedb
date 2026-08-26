@@ -147,7 +147,7 @@ func sealedRequestCapability(request *ShardRequest) (serviceauthz.Capability, bo
 			TransactionAbortCoordinator, TransactionAbortParticipant,
 			TransactionRetireCoordinator, TransactionReleaseParticipant,
 			TransactionPrepareParticipant, TransactionAcquireReadFence,
-			TransactionReleaseReadFence:
+			TransactionReleaseReadFence, TransactionPulseCoordinator:
 			return serviceauthz.CapabilityDataWrite, true
 		default:
 			return 0, false
@@ -807,6 +807,10 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	case TransactionAbortCoordinator:
 		status, err = c.transitionCoordinator(
 			tx.ID, tx.Revision, distributedtxn.CoordinatorAborted)
+	case TransactionPulseCoordinator:
+		status, err = c.server.journal.PulseCoordinator(
+			tx.ID, tx.Revision, tx.RecoveryPulse,
+		)
 	case TransactionAbortParticipant:
 		status, err = c.server.journal.AbortParticipant(tx.ID, tx.Revision)
 	case TransactionReleaseParticipant:
@@ -1398,6 +1402,7 @@ func transactionStatusResponse(status distributedtxn.Status) *ShardResponse {
 	resp := CompletionResponse(0)
 	resp.Transaction.ID = status.ID
 	resp.Transaction.Revision = status.Revision
+	resp.Transaction.RecoveryPulse = status.RecoveryPulse
 	switch status.Role {
 	case distributedtxn.RoleCoordinator:
 		resp.Transaction.Role = TransactionRoleCoordinator

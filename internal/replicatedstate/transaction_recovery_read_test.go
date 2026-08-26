@@ -45,8 +45,8 @@ func TestTransactionRecoveryReadRequestGrammarAndBounds(t *testing.T) {
 	}); allocations != 0 {
 		t.Fatalf("request validation allocations=%v", allocations)
 	}
-	if TransactionRecoverySummaryBytes != 121 || MaxTransactionRecoveryScanBytes != 30976 ||
-		MaxTransactionRecoveryReadBytes != 65657 {
+	if TransactionRecoverySummaryBytes != 122 || MaxTransactionRecoveryScanBytes != 31232 ||
+		MaxTransactionRecoveryReadBytes != 65658 {
 		t.Fatalf("recovery byte bounds summary=%d scan=%d read=%d",
 			TransactionRecoverySummaryBytes, MaxTransactionRecoveryScanBytes,
 			MaxTransactionRecoveryReadBytes)

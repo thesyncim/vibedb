@@ -192,6 +192,8 @@ type CoordinatorRecord struct {
 	State             CoordinatorState
 	Revision          uint64
 	CatalogGeneration uint64
+	// RecoveryDeadline is the legacy field name for the bounded logical pulse
+	// limit. It is never a Unix timestamp and is interpreted only as 1..3.
 	RecoveryDeadline  int64
 	Participants      []ParticipantRef
 }

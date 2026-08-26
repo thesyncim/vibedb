@@ -10,7 +10,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -645,7 +644,7 @@ func (e *Executor) executeTransaction(
 	coordinatorRecord := distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: transactionInitialRevision,
 		CatalogGeneration: snapshot.Generation(),
-		RecoveryDeadline:  time.Now().Add(profile.GlobalDeadline).UnixNano(),
+		RecoveryDeadline:  int64(replicatedTransactionRecoveryPulseLimit),
 		Participants:      refs,
 	}
 	stager := gatewayCoordinatorStager{

@@ -201,6 +201,15 @@ func (client *transactionOrchestratorClient) apply(
 		coordinator.CoordinatorDecision = distributedtxn.CoordinatorAborted
 		client.coordinators[group] = coordinator
 		return replicatedstate.ResultApplied, coordinator.Revision, 0
+	case distributedtxn.ReplicatedPulseCoordinator:
+		if distributedtxn.CoordinatorState(coordinator.State) != distributedtxn.CoordinatorStaging ||
+			control.ExpectedRevision != coordinator.Revision ||
+			control.RecoveryPulse != coordinator.RecoveryPulse+1 {
+			return replicatedstate.ResultTransactionConflict, max(1, coordinator.Revision), 0
+		}
+		coordinator.RecoveryPulse = control.RecoveryPulse
+		client.coordinators[group] = coordinator
+		return replicatedstate.ResultApplied, coordinator.Revision, 0
 	case distributedtxn.ReplicatedApplyReleaseParticipant:
 		if participant.ID != control.ID ||
 			distributedtxn.ParticipantState(participant.State) != distributedtxn.ParticipantPrepared {
@@ -438,6 +447,9 @@ func transactionOrchestratorRoutes(
 				SchemaGeneration: 1, RelationManifestDigest: [32]byte{1},
 				RoutingVersion: 1, RouteGeneration: 1,
 			},
+			RangeIdentity:        replication.Digest{byte(ordinal + 1), 1},
+			LineageDigest:        replication.Digest{byte(ordinal + 1), 2},
+			ForwardingRuleDigest: replication.Digest{byte(ordinal + 1), 3},
 		}
 		for member := 1; member <= 3; member++ {
 			address := fmt.Sprintf("g%08d-m%d", ordinal, member)
@@ -470,6 +482,21 @@ func transactionOrchestratorRoutes(
 		}
 	}
 	return participants, client
+}
+
+func recoverReplicatedTransactionAfterLogicalLease(
+	t *testing.T,
+	orchestrator *ReplicatedTransactionOrchestrator,
+	handle *ReplicatedTransactionRecoveryHandle,
+) (ReplicatedTransactionResult, error) {
+	t.Helper()
+	for pulse := uint8(1); pulse < replicatedTransactionRecoveryPulseLimit; pulse++ {
+		result, err := orchestrator.Recover(context.Background(), handle)
+		if !errors.Is(err, ErrRecoveryNotReady) || result.Recovery != handle {
+			t.Fatalf("logical recovery pulse %d result=%+v err=%v", pulse, result, err)
+		}
+	}
+	return orchestrator.Recover(context.Background(), handle)
 }
 
 func TestReplicatedTransactionOrchestratorExecutesExactFusedSchedule(t *testing.T) {
@@ -1227,7 +1254,7 @@ func TestReplicatedTransactionUnknownRetryKeepsAndReleasesExactBudget(t *testing
 	client.mu.Lock()
 	client.loseEveryMatching = false
 	client.mu.Unlock()
-	result, recoverErr := orchestrator.Recover(context.Background(), handle)
+	result, recoverErr := recoverReplicatedTransactionAfterLogicalLease(t, orchestrator, handle)
 	if recoverErr != nil || result.Committed || result.AffectedRows != 0 {
 		t.Fatalf("recovery result=%+v err=%v", result, recoverErr)
 	}
@@ -1361,7 +1388,7 @@ func TestReplicatedTransactionDetachedHandleRecoversOnAnotherOrchestrator(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, recoverErr := orchestratorTwo.Recover(context.Background(), detached)
+	result, recoverErr := recoverReplicatedTransactionAfterLogicalLease(t, orchestratorTwo, detached)
 	if recoverErr != nil || result.Committed || result.AffectedRows != 0 {
 		t.Fatalf("detached recovery result=%+v err=%v", result, recoverErr)
 	}
@@ -1726,7 +1753,9 @@ func TestReplicatedTransactionRecoverReadsStagingBeforeUnknownCommitRetry(t *tes
 		len(transactionErr.Recovery.Pending) != 1 {
 		t.Fatalf("execute error=%v", executeErr)
 	}
-	result, recoverErr := orchestrator.Recover(context.Background(), transactionErr.Recovery)
+	result, recoverErr := recoverReplicatedTransactionAfterLogicalLease(
+		t, orchestrator, transactionErr.Recovery,
+	)
 	if recoverErr != nil || result.Committed || result.Recovery != nil {
 		t.Fatalf("recover result=%+v err=%v", result, recoverErr)
 	}

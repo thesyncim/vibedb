@@ -539,17 +539,33 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 		fixture.machine.state.TransactionIntentRows != 1 {
 		t.Fatalf("fused begin accounting = %+v", fixture.machine.state)
 	}
+	pulse := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedPulseCoordinator, ID: id,
+		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		RecoveryPulse: 1,
+	}, nil)
+	applyTransactionCommand(t, fixture.machine, 4, pulse)
+	coordinatorRaw, found, err = fixture.system.Collection.AppendRaw(nil, coordinatorKey[:])
+	if err != nil || !found {
+		t.Fatalf("read pulsed coordinator: found=%v err=%v", found, err)
+	}
+	coordinator, err = OpenTransactionControl(coordinatorRaw)
+	if err != nil || coordinator.RecoveryPulse != 1 || coordinator.Revision != 1 ||
+		distributedtxn.CoordinatorState(coordinator.State) != distributedtxn.CoordinatorStaging {
+		t.Fatalf("logical pulse changed decision/revision: %+v err=%v", coordinator.TransactionControl, err)
+	}
 
 	commit := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedCommitCoordinator, ID: id,
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
-	applyTransactionCommand(t, fixture.machine, 4, commit)
+	applyTransactionCommand(t, fixture.machine, 5, commit)
 	finish := transactionCompletionCommand(t, fixture.binding, fusedParticipantControl(
 		t, fixture, id, distributedtxn.ReplicatedApplyReleaseParticipant, 2, nil,
 	), nil)
-	applyTransactionCommand(t, fixture.machine, 5, finish)
+	applyTransactionCommand(t, fixture.machine, 6, finish)
 	retire := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedRetireCoordinator, ID: id,
@@ -558,7 +574,7 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 			AffectedRows: 1, AffectedRowsValid: true,
 		}),
 	}, nil)
-	applyTransactionCommand(t, fixture.machine, 6, retire)
+	applyTransactionCommand(t, fixture.machine, 7, retire)
 	completion, _ := openTransactionCompletion(t, fixture.machine, begin)
 	if completion.ResultCode != ResultApplied {
 		t.Fatalf("retired fused begin result = %d", completion.ResultCode)

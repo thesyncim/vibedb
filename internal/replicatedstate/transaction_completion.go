@@ -311,6 +311,8 @@ func transactionHistoricalRetryExact(
 	case distributedtxn.ReplicatedAbortCoordinator:
 		return control.CoordinatorDecision == distributedtxn.CoordinatorAborted &&
 			transactionCoordinatorDecisionExpected(control) == command.ExpectedRevision, ResultApplied, nil
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return control.RecoveryPulse >= command.RecoveryPulse, ResultApplied, nil
 	case distributedtxn.ReplicatedRetireCoordinator:
 		summary, err := distributedtxn.OpenReplicatedRetirementSummary(command.Payload)
 		if err != nil {

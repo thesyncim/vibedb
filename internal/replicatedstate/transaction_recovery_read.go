@@ -24,8 +24,8 @@ const (
 const (
 	MaxTransactionRecoveryScanRows = 256
 	// TransactionRecoverySummaryBytes is the exact encoded fixed-record charge:
-	// 16+1+1+8+1+8+16+16+8+32+8+1+1+4.
-	TransactionRecoverySummaryBytes = 121
+	// 16+1+1+8+1+8+16+16+8+32+8+1+1+4+1.
+	TransactionRecoverySummaryBytes = 122
 	MaxTransactionRecoveryScanBytes = MaxTransactionRecoveryScanRows * TransactionRecoverySummaryBytes
 	// MaxTransactionRecoveryReadBytes is the exact largest legal material
 	// response: one fixed record followed by one maximum VTM1 page.
@@ -83,6 +83,7 @@ type TransactionRecoveryRecord struct {
 	ParticipantOrdinal  uint32
 	CoordinatorDecision distributedtxn.CoordinatorState
 	ManifestPage        uint32
+	RecoveryPulse       uint8
 	Payload             []byte
 }
 
@@ -557,5 +558,6 @@ func transactionRecoveryRecord(control TransactionControl) TransactionRecoveryRe
 		CancellationWitness: control.CancellationWitness,
 		ParticipantOrdinal:  control.ParticipantOrdinal,
 		CoordinatorDecision: control.CoordinatorDecision,
+		RecoveryPulse:       control.RecoveryPulse,
 	}
 }

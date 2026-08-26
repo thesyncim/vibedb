@@ -222,6 +222,7 @@ func appendReplicatedTransactionRecoveryRecord(
 	}
 	dst[116] = byte(record.CoordinatorDecision)
 	binary.BigEndian.PutUint32(dst[117:121], record.ManifestPage)
+	dst[121] = record.RecoveryPulse
 }
 
 func openReplicatedTransactionRecoveryRecord(
@@ -247,6 +248,7 @@ func openReplicatedTransactionRecoveryRecord(
 	}
 	record.CoordinatorDecision = distributedtxn.CoordinatorState(src[116])
 	record.ManifestPage = binary.BigEndian.Uint32(src[117:121])
+	record.RecoveryPulse = src[121]
 	return record
 }
 
@@ -323,6 +325,9 @@ func validReplicatedTransactionRecoveryRecord(
 			return false
 		}
 	} else {
+		if record.RecoveryPulse != 0 {
+			return false
+		}
 		state := distributedtxn.ParticipantState(record.State)
 		if record.CancellationWitness {
 			if state != distributedtxn.ParticipantReleased || record.Revision != 1 ||

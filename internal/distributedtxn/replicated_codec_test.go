@@ -3,6 +3,7 @@ package distributedtxn
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"slices"
 	"testing"
@@ -130,6 +131,38 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 		if reencodeErr != nil || !bytes.Equal(reencoded, encoded) {
 			t.Fatalf("case %d re-encode: %v", i, reencodeErr)
 		}
+	}
+}
+
+func TestReplicatedCoordinatorRecoveryPulseUsesReservedByteCanonically(t *testing.T) {
+	id := testID()
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedPulseCoordinator,
+		ID: id, ExpectedRevision: 9, PayloadKind: ReplicatedPayloadNone,
+		RecoveryPulse: 2,
+	}
+	raw, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != replicatedCommandHeaderBytes+replicatedCommandChecksumBytes || raw[121] != 2 {
+		t.Fatalf("pulse command bytes=%d pulse=%d", len(raw), raw[121])
+	}
+	opened, err := OpenReplicatedCommand(raw)
+	if err != nil || opened.Role != command.Role || opened.Operation != command.Operation ||
+		opened.ID != command.ID || opened.ExpectedRevision != command.ExpectedRevision ||
+		opened.PayloadKind != command.PayloadKind || opened.RecoveryPulse != command.RecoveryPulse {
+		t.Fatalf("opened=%+v err=%v", opened.Command(), err)
+	}
+	invalid := command
+	invalid.RecoveryPulse = 0
+	if _, err = AppendReplicatedCommand(nil, invalid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("zero pulse err=%v", err)
+	}
+	invalid = command
+	invalid.Operation = ReplicatedAbortCoordinator
+	if _, err = AppendReplicatedCommand(nil, invalid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("pulse on abort err=%v", err)
 	}
 }
 

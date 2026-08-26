@@ -58,10 +58,11 @@ const (
 	TransactionStageManifestCoordinator
 	TransactionStageManifestSegment
 	TransactionReadManifestSegment
+	TransactionPulseCoordinator
 )
 
 func (op TransactionOperation) valid() bool {
-	return op >= TransactionStageCoordinator && op <= TransactionReadManifestSegment
+	return op >= TransactionStageCoordinator && op <= TransactionPulseCoordinator
 }
 
 func (op TransactionOperation) stages() bool {
@@ -85,9 +86,10 @@ func (op TransactionOperation) readsManifestSegment() bool {
 // operation uses ID and Revision; lookup permits Revision zero, while a state
 // transition requires an exact nonzero revision for compare-and-swap replay.
 type TransactionRequest struct {
-	Operation TransactionOperation
-	ID        distributedtxn.ID
-	Revision  uint64
+	Operation     TransactionOperation
+	ID            distributedtxn.ID
+	Revision      uint64
+	RecoveryPulse uint8
 	// SegmentIndex is populated only by TransactionReadManifestSegment. Stage
 	// requests obtain the canonical index from the checksummed VTM1 page.
 	SegmentIndex uint32
@@ -239,6 +241,7 @@ type TransactionReply struct {
 	Role             TransactionRole
 	ID               distributedtxn.ID
 	Revision         uint64
+	RecoveryPulse    uint8
 	CoordinatorState distributedtxn.CoordinatorState
 	ParticipantState distributedtxn.ParticipantState
 	RecordKind       TransactionRecordKind
@@ -253,6 +256,7 @@ type TransactionReply struct {
 // Equal compares the fixed state and optional byte-native recovery record.
 func (r TransactionReply) Equal(other TransactionReply) bool {
 	return r.Role == other.Role && r.ID == other.ID && r.Revision == other.Revision &&
+		r.RecoveryPulse == other.RecoveryPulse &&
 		r.CoordinatorState == other.CoordinatorState &&
 		r.ParticipantState == other.ParticipantState && r.RecordKind == other.RecordKind &&
 		r.SegmentIndex == other.SegmentIndex && bytes.Equal(r.Record, other.Record)

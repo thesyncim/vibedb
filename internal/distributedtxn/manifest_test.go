@@ -246,7 +246,7 @@ func TestManifestCoordinatorRoundTripAndDescriptorBinding(t *testing.T) {
 	descriptor, _ := buildManifest(t, 1000)
 	record := ManifestCoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 9, RecoveryDeadline: 1234, Manifest: descriptor,
+		CatalogGeneration: 9, RecoveryDeadline: 3, Manifest: descriptor,
 	}
 	raw, err := AppendManifestCoordinator(nil, record)
 	if err != nil {
