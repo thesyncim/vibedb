@@ -118,6 +118,9 @@ func validateChildExecutionRoster(
 		return raftservice.CommandFence{}, ErrRuntimeStore
 	}
 	version := roster[0].ReplicaSetVersion
+	if version != target.ReplicaSetVersion {
+		return raftservice.CommandFence{}, ErrRuntimeStore
+	}
 	foundLocal := false
 	for index := range roster {
 		member := roster[index]

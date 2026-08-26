@@ -58,6 +58,7 @@ type persistedChildTarget struct {
 	Child                 uint8                                `json:"child"`
 	Endpoint              distribution.EndpointID              `json:"endpoint"`
 	Replicas              []persistedChildReplica              `json:"replicas"`
+	ReplicaSetVersion     uint64                               `json:"replica_set_version"`
 	WAL                   raftstore.Identity                   `json:"wal"`
 	TopologyRecoveryEpoch uint64                               `json:"topology_recovery_epoch"`
 	Authority             sqldriver.ReplicatedAuthorityProfile `json:"authority"`
@@ -117,6 +118,7 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 			intent.Targets = append(intent.Targets, persistedChildTarget{
 				Child: target.Child, Endpoint: target.Endpoint, WAL: target.WAL,
 				Replicas:              persistChildReplicas(target.Replicas),
+				ReplicaSetVersion:     target.ReplicaSetVersion,
 				TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
 				Authority:             target.Authority, SQL: persistSQLIdentity(target.SQL),
 			})
@@ -191,6 +193,7 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 		targets[index] = ChildTarget{
 			Child: target.Child, Endpoint: target.Endpoint, WAL: target.WAL,
 			Replicas:              openPersistedChildReplicas(target.Replicas),
+			ReplicaSetVersion:     target.ReplicaSetVersion,
 			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
 			Authority:             target.Authority,
 			SQL:                   openPersistedSQLIdentity(target.SQL),

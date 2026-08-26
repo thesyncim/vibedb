@@ -345,7 +345,7 @@ func newPlanObservationRequest(
 			ShardIncarnation:      target.WAL.ShardIncarnation, GroupID: target.WAL.GroupID,
 		}
 		request.Command = raftservice.CommandFence{
-			ReplicaSetVersion:      1,
+			ReplicaSetVersion:      target.ReplicaSetVersion,
 			ActivePolicyGeneration: target.Authority.ActivePolicyGeneration,
 			ProtectionEpoch:        target.Authority.ProtectionEpoch,
 			OwnershipEpoch:         target.Authority.OwnershipEpoch,

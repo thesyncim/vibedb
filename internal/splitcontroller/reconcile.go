@@ -69,6 +69,7 @@ type ChildTarget struct {
 	Child                 uint8
 	Endpoint              distribution.EndpointID
 	Replicas              []ChildReplicaTarget
+	ReplicaSetVersion     uint64
 	WAL                   raftstore.Identity
 	TopologyRecoveryEpoch uint64
 	Authority             sqldriver.ReplicatedAuthorityProfile
@@ -219,7 +220,7 @@ func newPlan(
 		child := int(target.Child)
 		descriptor, childOK := split.ChildIdentity(child)
 		leader, leaderOK := split.ChildLeader(child, 0)
-		if !childOK || descriptor.Retained || seen[child] ||
+		if !childOK || descriptor.Retained || seen[child] || target.ReplicaSetVersion == 0 ||
 			!leaderOK || target.Endpoint != leader ||
 			!validChildReplicaTargets(split, child, target) ||
 			target.WAL.Distribution != string(split.Source.Distribution) ||

@@ -545,6 +545,7 @@ func testChildTarget(
 	return ChildTarget{
 		Child: 1, Endpoint: child.Leaders[0], WAL: identity,
 		Replicas:              replicas,
+		ReplicaSetVersion:     1,
 		TopologyRecoveryEpoch: 1, Authority: authority,
 		SQL: sqldriver.ReplicatedShardStoreIdentity{
 			Binding: binding, LogID: testID(6), UserTable: partitioner.CollectionName(),
