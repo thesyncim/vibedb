@@ -339,6 +339,9 @@ const (
 	checkpointGroupAfterCertificateRename
 	checkpointGroupAfterPrepareAppend
 	checkpointGroupAfterDecisionAppend
+	checkpointGroupAfterMembershipWrite
+	checkpointGroupAfterMembershipSync
+	checkpointGroupAfterMembershipDirectorySync
 )
 
 var (
