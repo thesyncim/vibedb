@@ -360,6 +360,111 @@ type gatewayBoundedPeerConnection struct {
 	release func()
 }
 
+type gatewayControlEndpoint struct {
+	Member  gateway.ClusterCatalogDrainMember
+	Address string
+}
+
+type gatewayClusterControlOpener struct {
+	tls       *rafttransport.PeerTLS
+	deadline  rafttransport.DeadlineFunc
+	dial      func(context.Context, string) (net.Conn, error)
+	addresses map[rafttransport.NodeID]string
+	slots     chan struct{}
+}
+
+func newGatewayClusterControlOpener(
+	tls *rafttransport.PeerTLS,
+	deadline rafttransport.DeadlineFunc,
+	dial func(context.Context, string) (net.Conn, error),
+	endpoints []gatewayControlEndpoint,
+	maxConnections int,
+) (*gatewayClusterControlOpener, error) {
+	if tls == nil || deadline == nil || dial == nil || len(endpoints) == 0 ||
+		maxConnections <= 0 || maxConnections > gateway.AbsoluteMaxCatalogDrainConcurrency {
+		return nil, errGatewayReplicaControl
+	}
+	addresses := make(map[rafttransport.NodeID]string, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint.Member.Node == (rafttransport.NodeID{}) || endpoint.Member.Incarnation == 0 ||
+			endpoint.Address == "" {
+			return nil, errGatewayReplicaControl
+		}
+		if prior, found := addresses[endpoint.Member.Node]; found && prior != endpoint.Address {
+			return nil, errGatewayReplicaControl
+		}
+		addresses[endpoint.Member.Node] = endpoint.Address
+	}
+	return &gatewayClusterControlOpener{tls: tls, deadline: deadline, dial: dial,
+		addresses: addresses, slots: make(chan struct{}, maxConnections)}, nil
+}
+
+func (opener *gatewayClusterControlOpener) OpenGatewayControl(
+	ctx context.Context, node rafttransport.NodeID,
+) (rafttransport.PeerConnection, error) {
+	if opener == nil || ctx == nil || node == (rafttransport.NodeID{}) {
+		return nil, errGatewayReplicaControl
+	}
+	address, found := opener.addresses[node]
+	if !found {
+		return nil, errGatewayReplicaControl
+	}
+	select {
+	case opener.slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+	raw, err := opener.dial(ctx, address)
+	if err != nil || raw == nil {
+		<-opener.slots
+		if raw != nil {
+			_ = raw.Close()
+		}
+		return nil, errors.Join(err, errGatewayReplicaControl)
+	}
+	connection, err := opener.tls.Client(
+		ctx, raw, node, rafttransport.TrafficGatewayControl, opener.deadline,
+	)
+	if err != nil {
+		<-opener.slots
+		return nil, err
+	}
+	return &gatewayBoundedPeerConnection{PeerConnection: connection, release: func() {
+		<-opener.slots
+	}}, nil
+}
+
+func newGatewayClusterDrainCertifier(
+	trust rafttransport.TrustDomain,
+	tls *rafttransport.PeerTLS,
+	handshake, readDeadline, writeDeadline rafttransport.DeadlineFunc,
+	dial func(context.Context, string) (net.Conn, error),
+	endpoints []gatewayControlEndpoint,
+	maxConcurrent int,
+) (*gateway.ClusterCatalogDrainCoordinator, error) {
+	if len(endpoints) == 0 {
+		return nil, errGatewayReplicaControl
+	}
+	opener, err := newGatewayClusterControlOpener(
+		tls, handshake, dial, endpoints, maxConcurrent,
+	)
+	if err != nil {
+		return nil, err
+	}
+	client, err := gateway.NewClusterCatalogDrainClient(gateway.ClusterCatalogDrainClientOptions{
+		Opener: opener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
+		MaxConcurrent: maxConcurrent,
+	})
+	if err != nil {
+		return nil, err
+	}
+	members := make([]gateway.ClusterCatalogDrainMember, len(endpoints))
+	for index := range endpoints {
+		members[index] = endpoints[index].Member
+	}
+	return gateway.NewClusterCatalogDrainCoordinator(trust, members, client)
+}
+
 func (connection *gatewayBoundedPeerConnection) Close() error {
 	err := connection.PeerConnection.Close()
 	connection.once.Do(connection.release)

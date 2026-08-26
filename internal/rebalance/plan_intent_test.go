@@ -115,6 +115,12 @@ func TestReplicaMoveJournalIntentRemainsSmallAndImmutableAfterSnapshotBinding(t 
 	if len(boundIntent) >= 40<<10 {
 		t.Fatalf("immutable move intent exceeds replicated operation cell: %d", len(boundIntent))
 	}
+	identity, err := InspectReplicaMoveIntent(boundIntent)
+	if err != nil || identity.Operation != plan.OperationID() ||
+		identity.SourceGeneration != plan.CatalogGeneration() ||
+		identity.Request.RetiringReplica != plan.RetiringReplica() {
+		t.Fatalf("inspected identity=%+v err=%v", identity, err)
+	}
 	certificate := &replicatedstate.SnapshotBaseCertificate{
 		Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState},
 		Digest:   bound.baseDigest,
