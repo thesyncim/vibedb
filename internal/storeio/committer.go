@@ -760,6 +760,10 @@ func (c *Committer) publishRetiring(
 		}
 	}
 	c.observerMu.RUnlock()
+	if batch.conditionalPublication &&
+		!c.published.CompareAndSwap(batch.expectedPreviousGeneration, generation) {
+		return superseded, ErrPublicationConflict
+	}
 	if batch.materialized {
 		batch.journalSlot = c.materializationNextSlot.Load()
 		c.materializationNextSequence.Store(batch.journalSequence + 1)
@@ -775,7 +779,9 @@ func (c *Committer) publishRetiring(
 	}
 	batch.state.Store(batchPublished)
 	c.pending[tail&c.pendingMask] = batch
-	c.published.Store(generation)
+	if !batch.conditionalPublication {
+		c.published.Store(generation)
+	}
 	c.tail.Store(tail + 1)
 	// A normal publication wakes the automatic worker. A manual publication
 	// wakes it only when a concurrent Flush already captured this generation;
