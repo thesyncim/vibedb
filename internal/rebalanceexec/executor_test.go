@@ -35,6 +35,8 @@ type executorFixture struct {
 	unknownFinalize    bool
 	membershipErr      error
 	membershipHook     func()
+	drainRequests      []gateway.ClusterCatalogDrainRequest
+	drainCertificate   func(gateway.ClusterCatalogDrainRequest) gateway.ClusterCatalogDrainCertificate
 }
 
 func (fixture *executorFixture) ResolveReplicaMove(
@@ -141,10 +143,17 @@ func (fixture *executorFixture) Read(context.Context) (*gateway.Snapshot, error)
 	return fixture.cut.Catalog, nil
 }
 
-func (fixture *executorFixture) WaitOlderDrained(
-	_ context.Context, generation uint64,
-) (gateway.CatalogDrainStatus, error) {
-	return gateway.CatalogDrainStatus{CurrentGeneration: generation}, nil
+func (fixture *executorFixture) CertifyClusterCatalogDrain(
+	_ context.Context, request gateway.ClusterCatalogDrainRequest,
+) (gateway.ClusterCatalogDrainCertificate, error) {
+	fixture.drainRequests = append(fixture.drainRequests, request)
+	if fixture.drainCertificate != nil {
+		return fixture.drainCertificate(request), nil
+	}
+	return gateway.ClusterCatalogDrainCertificate{
+		Request: request, FenceDigest: [32]byte{1},
+		RosterDigest: [32]byte{2}, Proof: [32]byte{3},
+	}, nil
 }
 
 func (fixture *executorFixture) RetireReplicaSource(
@@ -217,8 +226,77 @@ func TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions(t *testing.T) {
 	}
 	drain := testExecution(rebalance.ActionAwaitCatalogDrain)
 	drain.Action.CatalogGeneration = plan.NextCatalogGeneration()
+	fixture.cut.Catalog, err = plan.CatalogSnapshot(fixture.cut.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = executor.ExecuteReplicaMove(ctx, plan.OperationID(), plan, drain); err != nil {
 		t.Fatal(err)
+	}
+	digest, err := gateway.CatalogSnapshotDigest(fixture.cut.Catalog)
+	if err != nil || len(fixture.drainRequests) != 1 ||
+		fixture.drainRequests[0] != (gateway.ClusterCatalogDrainRequest{
+			Operation: [32]byte(plan.OperationID()), Step: drain.Proof,
+			Generation: plan.NextCatalogGeneration(), CatalogDigest: digest,
+		}) {
+		t.Fatalf("drain request=%+v digest=%x err=%v", fixture.drainRequests, digest, err)
+	}
+	fixture.cut.Catalog, err = gateway.BuildManifestTransition(
+		fixture.cut.Catalog, plan.TargetManifest(), plan.PostRemoveCatalogGeneration(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postRemoveDrain := testExecution(rebalance.ActionAwaitCatalogDrain)
+	postRemoveDrain.Proof = [32]byte{0x92}
+	postRemoveDrain.Action.CatalogGeneration = plan.PostRemoveCatalogGeneration()
+	if err = executor.ExecuteReplicaMove(
+		ctx, plan.OperationID(), plan, postRemoveDrain,
+	); err != nil {
+		t.Fatal(err)
+	}
+	postRemoveDigest, err := gateway.CatalogSnapshotDigest(fixture.cut.Catalog)
+	if err != nil || len(fixture.drainRequests) != 2 ||
+		fixture.drainRequests[1].Generation != plan.PostRemoveCatalogGeneration() ||
+		fixture.drainRequests[1].CatalogDigest != postRemoveDigest ||
+		fixture.drainRequests[1].Step != postRemoveDrain.Proof || digest == postRemoveDigest {
+		t.Fatalf("post-remove drain=%+v digest=%x err=%v",
+			fixture.drainRequests, postRemoveDigest, err)
+	}
+}
+
+func TestExecutorCatalogDrainFailsClosedOnLocalOrCertificateCutMismatch(t *testing.T) {
+	plan, fixture := newExecutorFixture(t)
+	executor, err := New(Options{
+		Routes: fixture, Grants: fixture, Membership: fixture, Snapshots: fixture,
+		Bootstrap: fixture, Awaiter: fixture, Ownership: fixture, Catalog: fixture,
+		Drainer: fixture, Retirer: fixture,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain := testExecution(rebalance.ActionAwaitCatalogDrain)
+	drain.Action.CatalogGeneration = plan.NextCatalogGeneration()
+	if err = executor.ExecuteReplicaMove(
+		context.Background(), plan.OperationID(), plan, drain,
+	); !errors.Is(err, ErrExecutionFence) || len(fixture.drainRequests) != 0 {
+		t.Fatalf("stale local catalog error=%v requests=%+v", err, fixture.drainRequests)
+	}
+	fixture.cut.Catalog, err = plan.CatalogSnapshot(fixture.cut.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.drainCertificate = func(request gateway.ClusterCatalogDrainRequest) gateway.ClusterCatalogDrainCertificate {
+		request.Generation++
+		return gateway.ClusterCatalogDrainCertificate{
+			Request: request, FenceDigest: [32]byte{1},
+			RosterDigest: [32]byte{2}, Proof: [32]byte{3},
+		}
+	}
+	if err = executor.ExecuteReplicaMove(
+		context.Background(), plan.OperationID(), plan, drain,
+	); !errors.Is(err, ErrExecutionFence) || len(fixture.drainRequests) != 1 {
+		t.Fatalf("mismatched certificate error=%v requests=%+v", err, fixture.drainRequests)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
@@ -154,6 +155,144 @@ type ClusterCatalogDrainAck struct {
 	FenceDigest       [sha256.Size]byte
 	Member            ClusterCatalogDrainMember
 	CurrentGeneration uint64
+}
+
+// ClusterCatalogDrainRequest is the exact replica-move action cut presented to
+// the cluster drainer. Step prevents a certificate from one journaled action
+// attempt from settling another within the same operation and catalog.
+type ClusterCatalogDrainRequest struct {
+	Operation     [sha256.Size]byte
+	Step          [sha256.Size]byte
+	Generation    uint64
+	CatalogDigest [sha256.Size]byte
+}
+
+func (request ClusterCatalogDrainRequest) Valid() bool {
+	return request.Operation != ([sha256.Size]byte{}) &&
+		request.Step != ([sha256.Size]byte{}) && request.Generation != 0 &&
+		request.CatalogDigest != ([sha256.Size]byte{})
+}
+
+func (request ClusterCatalogDrainRequest) fenceOperation() [sha256.Size]byte {
+	hash := sha256.New()
+	hash.Write([]byte("vibedb/catalog-drain/move-step\x00"))
+	hash.Write(request.Operation[:])
+	hash.Write(request.Step[:])
+	var operation [sha256.Size]byte
+	hash.Sum(operation[:0])
+	return operation
+}
+
+// ClusterCatalogDrainCertificate is emitted only after every exact roster
+// member has authenticated and acknowledged the request cut.
+type ClusterCatalogDrainCertificate struct {
+	Request      ClusterCatalogDrainRequest
+	FenceDigest  [sha256.Size]byte
+	RosterDigest [sha256.Size]byte
+	Proof        [sha256.Size]byte
+}
+
+func (certificate ClusterCatalogDrainCertificate) ValidFor(request ClusterCatalogDrainRequest) bool {
+	return request.Valid() && certificate.Request == request &&
+		certificate.FenceDigest != ([sha256.Size]byte{}) &&
+		certificate.RosterDigest != ([sha256.Size]byte{}) &&
+		certificate.Proof != ([sha256.Size]byte{})
+}
+
+// CatalogSnapshotDigest returns the digest of the sole canonical vibejson
+// catalog representation. Replica-move drains use it to distinguish G+1 and
+// G+2 even if a generation number is accidentally reused by a faulty caller.
+func CatalogSnapshotDigest(snapshot *Snapshot) ([sha256.Size]byte, error) {
+	raw, err := AppendSnapshotDocument(nil, snapshot)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return sha256.Sum256(raw), nil
+}
+
+// ClusterCatalogDrainCollector fans one immutable fence to the serving
+// gateway roster over authenticated control streams. The implementation must
+// pass the mTLS peer identity with each acknowledgement, bound its own
+// concurrency and bytes, and finish all accept calls before returning.
+type ClusterCatalogDrainCollector interface {
+	CollectClusterCatalogDrain(
+		context.Context,
+		ClusterCatalogDrainFence,
+		func(rafttransport.PeerIdentity, ClusterCatalogDrainAck) error,
+	) error
+}
+
+// ClusterCatalogDrainCoordinator composes transport collection with the exact
+// replayable state machine. Retries may recollect the full roster: local drain
+// is monotonic and acknowledgements are idempotent, so coordinator crashes do
+// not weaken the fence or require a second local journal.
+type ClusterCatalogDrainCoordinator struct {
+	trust     rafttransport.TrustDomain
+	members   []ClusterCatalogDrainMember
+	collector ClusterCatalogDrainCollector
+}
+
+func NewClusterCatalogDrainCoordinator(
+	trust rafttransport.TrustDomain,
+	members []ClusterCatalogDrainMember,
+	collector ClusterCatalogDrainCollector,
+) (*ClusterCatalogDrainCoordinator, error) {
+	if collector == nil {
+		return nil, ErrClusterCatalogDrainFence
+	}
+	validation, err := NewClusterCatalogDrainFence(
+		[sha256.Size]byte{1}, 1, [sha256.Size]byte{1}, trust, members,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &ClusterCatalogDrainCoordinator{
+		trust: validation.trust, members: slices.Clone(validation.members), collector: collector,
+	}, nil
+}
+
+func (coordinator *ClusterCatalogDrainCoordinator) CertifyClusterCatalogDrain(
+	ctx context.Context,
+	request ClusterCatalogDrainRequest,
+) (ClusterCatalogDrainCertificate, error) {
+	if coordinator == nil || coordinator.collector == nil || ctx == nil || !request.Valid() {
+		return ClusterCatalogDrainCertificate{}, ErrClusterCatalogDrainFence
+	}
+	fence, err := NewClusterCatalogDrainFence(
+		request.fenceOperation(), request.Generation, request.CatalogDigest,
+		coordinator.trust, coordinator.members,
+	)
+	if err != nil {
+		return ClusterCatalogDrainCertificate{}, err
+	}
+	machine, err := NewClusterCatalogDrainMachine(fence)
+	if err != nil {
+		return ClusterCatalogDrainCertificate{}, err
+	}
+	var accepting atomic.Bool
+	accepting.Store(true)
+	err = coordinator.collector.CollectClusterCatalogDrain(
+		ctx, fence,
+		func(peer rafttransport.PeerIdentity, ack ClusterCatalogDrainAck) error {
+			if !accepting.Load() {
+				return ErrClusterCatalogDrainAck
+			}
+			_, applyErr := machine.ApplyAuthenticated(peer, ack)
+			return applyErr
+		},
+	)
+	accepting.Store(false)
+	if err != nil {
+		return ClusterCatalogDrainCertificate{}, err
+	}
+	proof, complete := machine.Certificate()
+	if !complete {
+		return ClusterCatalogDrainCertificate{}, ErrClusterCatalogDrainState
+	}
+	return ClusterCatalogDrainCertificate{
+		Request: request, FenceDigest: fence.digest,
+		RosterDigest: fence.rosterDigest, Proof: proof,
+	}, nil
 }
 
 // CollectClusterCatalogDrainAck closes the local old-plan admission race and

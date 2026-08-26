@@ -12,8 +12,9 @@ import (
 
 // gatewayReplicaMoveControls names only shard-control capabilities which do
 // not yet have shipped clients. The catalog journal, membership proposal path,
-// catalog publication, and local catalog drain are concrete gateway services
-// and are deliberately not replaceable here.
+// and catalog publication are concrete gateway services. Cluster catalog drain
+// is an authenticated fanout capability and must be supplied explicitly; a
+// local CatalogHolder is never sufficient move-completion authority.
 type gatewayReplicaMoveControls struct {
 	Observer   rebalance.ReplicatedMoveObserver
 	Routes     rebalanceexec.MoveRouteResolver
@@ -21,24 +22,24 @@ type gatewayReplicaMoveControls struct {
 	Bootstrap  rebalanceexec.SnapshotBootstrapClient
 	Awaiter    rebalanceexec.MoveAwaiter
 	Ownership  rebalanceexec.OwnershipProposer
+	Drainer    rebalanceexec.CatalogDrainCertifier
 	Retirement rebalanceexec.SourceRetirer
 }
 
 func newGatewayReplicaMoveController(
 	authority *gateway.ReplicatedCatalogAuthority,
-	holder *gateway.CatalogHolder,
 	replicated *gateway.ReplicatedExecutor,
 	controls gatewayReplicaMoveControls,
 ) (*rebalanceexec.Controller, error) {
-	if authority == nil || holder == nil || replicated == nil ||
-		controls.Observer == nil {
+	if authority == nil || replicated == nil || controls.Observer == nil ||
+		controls.Drainer == nil {
 		return nil, rebalanceexec.ErrControllerConfig
 	}
 	executor, err := rebalanceexec.New(rebalanceexec.Options{
 		Routes: controls.Routes, Grants: authority, Membership: replicated,
 		Snapshots: controls.Snapshots, Bootstrap: controls.Bootstrap,
 		Awaiter: controls.Awaiter, Ownership: controls.Ownership,
-		Catalog: authority, Drainer: holder, Retirer: controls.Retirement,
+		Catalog: authority, Drainer: controls.Drainer, Retirer: controls.Retirement,
 	})
 	if err != nil {
 		return nil, err

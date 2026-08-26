@@ -117,9 +117,13 @@ type CatalogAuthority interface {
 	Read(context.Context) (*gateway.Snapshot, error)
 }
 
-// CatalogDrainer is implemented by gateway.CatalogHolder.
-type CatalogDrainer interface {
-	WaitOlderDrained(context.Context, uint64) (gateway.CatalogDrainStatus, error)
+// CatalogDrainCertifier returns authority only after every gateway incarnation
+// in the exact cluster roster has drained the requested catalog cut.
+type CatalogDrainCertifier interface {
+	CertifyClusterCatalogDrain(
+		context.Context,
+		gateway.ClusterCatalogDrainRequest,
+	) (gateway.ClusterCatalogDrainCertificate, error)
 }
 
 type SourceRetirementRequest struct {
@@ -144,7 +148,7 @@ type Options struct {
 	Awaiter    MoveAwaiter
 	Ownership  OwnershipProposer
 	Catalog    CatalogAuthority
-	Drainer    CatalogDrainer
+	Drainer    CatalogDrainCertifier
 	Retirer    SourceRetirer
 }
 
@@ -194,19 +198,37 @@ func (executor *Executor) ExecuteReplicaMove(
 	case rebalance.ActionRefreshCatalogFence:
 		return executor.executeCatalogRefresh(ctx, operation, plan, execution)
 	case rebalance.ActionAwaitCatalogDrain:
-		status, err := executor.options.Drainer.WaitOlderDrained(
-			ctx, execution.Action.CatalogGeneration,
-		)
-		if err != nil || status.CurrentGeneration < execution.Action.CatalogGeneration ||
-			status.ActiveOlderOperations != 0 {
-			return errors.Join(err, ErrExecutionFence)
-		}
-		return nil
+		return executor.executeCatalogDrain(ctx, operation, execution)
 	case rebalance.ActionRetireSource:
 		return executor.executeRetirement(ctx, operation, plan, execution)
 	default:
 		return ErrExecutionFence
 	}
+}
+
+func (executor *Executor) executeCatalogDrain(
+	ctx context.Context,
+	operation rebalance.OperationID,
+	execution rebalance.ReplicatedMoveExecution,
+) error {
+	snapshot, err := executor.options.Catalog.Read(ctx)
+	if err != nil || snapshot == nil ||
+		snapshot.Generation() != execution.Action.CatalogGeneration {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	digest, err := gateway.CatalogSnapshotDigest(snapshot)
+	if err != nil {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	request := gateway.ClusterCatalogDrainRequest{
+		Operation: [32]byte(operation), Step: execution.Proof,
+		Generation: snapshot.Generation(), CatalogDigest: digest,
+	}
+	certificate, err := executor.options.Drainer.CertifyClusterCatalogDrain(ctx, request)
+	if err != nil || !certificate.ValidFor(request) {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	return nil
 }
 
 func (executor *Executor) executeMembership(

@@ -298,3 +298,84 @@ func TestClusterCatalogDrainConcurrentApplyAndCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+type clusterDrainCollector struct {
+	limit  int
+	fences []ClusterCatalogDrainFence
+}
+
+func (collector *clusterDrainCollector) CollectClusterCatalogDrain(
+	_ context.Context,
+	fence ClusterCatalogDrainFence,
+	accept func(rafttransport.PeerIdentity, ClusterCatalogDrainAck) error,
+) error {
+	collector.fences = append(collector.fences, fence)
+	count := fence.MemberCount()
+	if collector.limit != 0 && collector.limit < count {
+		count = collector.limit
+	}
+	for index := 0; index < count; index++ {
+		member, _ := fence.Member(index)
+		if err := accept(clusterDrainPeer(fence, member), ClusterCatalogDrainAck{
+			FenceDigest: fence.Digest(), Member: member,
+			CurrentGeneration: fence.Generation(),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestClusterCatalogDrainCoordinatorBindsExactMoveG1AndG2Cuts(t *testing.T) {
+	collector := new(clusterDrainCollector)
+	coordinator, err := NewClusterCatalogDrainCoordinator(
+		clusterDrainTrust(), clusterDrainMembers(3), collector,
+	)
+	if err != nil {
+		t.Fatalf("NewClusterCatalogDrainCoordinator: %v", err)
+	}
+	g1 := ClusterCatalogDrainRequest{
+		Operation: clusterDrainDigest(7), Step: clusterDrainDigest(8),
+		Generation: 42, CatalogDigest: clusterDrainDigest(9),
+	}
+	g1Certificate, err := coordinator.CertifyClusterCatalogDrain(context.Background(), g1)
+	if err != nil || !g1Certificate.ValidFor(g1) {
+		t.Fatalf("G+1 certificate=%+v err=%v", g1Certificate, err)
+	}
+	g2 := g1
+	g2.Step = clusterDrainDigest(10)
+	g2.Generation++
+	g2.CatalogDigest = clusterDrainDigest(11)
+	g2Certificate, err := coordinator.CertifyClusterCatalogDrain(context.Background(), g2)
+	if err != nil || !g2Certificate.ValidFor(g2) {
+		t.Fatalf("G+2 certificate=%+v err=%v", g2Certificate, err)
+	}
+	if g1Certificate.FenceDigest == g2Certificate.FenceDigest ||
+		g1Certificate.Proof == g2Certificate.Proof || len(collector.fences) != 2 {
+		t.Fatalf("G+1 and G+2 were not distinct: g1=%+v g2=%+v", g1Certificate, g2Certificate)
+	}
+	mutated := g1
+	mutated.Step[0]++
+	if g1Certificate.ValidFor(mutated) || g1Certificate.ValidFor(g2) {
+		t.Fatal("certificate crossed an exact move-step/catalog cut")
+	}
+}
+
+func TestClusterCatalogDrainCoordinatorRejectsIncompleteRoster(t *testing.T) {
+	collector := &clusterDrainCollector{limit: 2}
+	coordinator, err := NewClusterCatalogDrainCoordinator(
+		clusterDrainTrust(), clusterDrainMembers(3), collector,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := ClusterCatalogDrainRequest{
+		Operation: clusterDrainDigest(7), Step: clusterDrainDigest(8),
+		Generation: 42, CatalogDigest: clusterDrainDigest(9),
+	}
+	if _, err = coordinator.CertifyClusterCatalogDrain(
+		context.Background(), request,
+	); !errors.Is(err, ErrClusterCatalogDrainState) {
+		t.Fatalf("incomplete roster error = %v", err)
+	}
+}

@@ -31,7 +31,7 @@ func TestRunReplicaMoveControllerUsesReplicatedPass(t *testing.T) {
 }
 
 func TestNewGatewayReplicaMoveControllerRejectsMissingAuthorities(t *testing.T) {
-	controller, err := newGatewayReplicaMoveController(nil, nil, nil, gatewayReplicaMoveControls{})
+	controller, err := newGatewayReplicaMoveController(nil, nil, gatewayReplicaMoveControls{})
 	if controller != nil || !errors.Is(err, rebalanceexec.ErrControllerConfig) {
 		t.Fatalf("controller=%v err=%v", controller, err)
 	}
