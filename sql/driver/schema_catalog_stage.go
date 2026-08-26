@@ -2,6 +2,7 @@ package driver
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -19,9 +20,11 @@ var replicatedSchemaTargetProofDomain = []byte(
 // immutable relation images already prepared for it. ApplyContract is settled
 // separately when the target machine opens after the ordered Raft transition.
 type ReplicatedSchemaTargetProof struct {
-	Catalog   ReplicatedSchemaCatalogImage
-	Relations replicatedstate.RelationImageCertificate
-	Witness   [sha256.Size]byte
+	Catalog       ReplicatedSchemaCatalogImage
+	Relations     replicatedstate.RelationImageCertificate
+	SourceApplied uint64
+	Membership    durable.CheckpointMembershipWitness
+	Witness       [sha256.Size]byte
 }
 
 // CertifyReplicatedSchemaTarget opens only non-serving target storage names
@@ -36,6 +39,56 @@ type ReplicatedSchemaTargetProof struct {
 // backfill path, never synthesized as an empty shortcut here.
 func (a *ReplicatedApply) CertifyReplicatedSchemaTarget(
 	raw []byte,
+) (proof ReplicatedSchemaTargetProof, resultErr error) {
+	return a.certifyReplicatedSchemaTarget(raw, nil)
+}
+
+// PrepareReplicatedSchemaTarget performs the same immutable image audit and,
+// only if the live machine still equals expectedApplied, prepares the exact
+// checkpoint replacement membership. The final database lock covers only the
+// O(relation-count) membership certificate; the O(row-count) audit remains off
+// the serving path. expectedApplied must come from the backfill/capture barrier
+// that produced the target images.
+func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
+	raw []byte,
+	expectedApplied uint64,
+	authorization [sha256.Size]byte,
+) (ReplicatedSchemaTargetProof, error) {
+	if expectedApplied == 0 || authorization == ([sha256.Size]byte{}) {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	return a.certifyReplicatedSchemaTarget(raw, func(
+		staged *database,
+		target ReplicatedShardStoreIdentity,
+		proof *ReplicatedSchemaTargetProof,
+	) error {
+		a.database.mu.Lock()
+		defer a.database.mu.Unlock()
+		if err := a.checkLocked(); err != nil || a.machine.Applied() != expectedApplied ||
+			a.database.checkpointGroup == nil {
+			return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		}
+		staged.replicatedApplyCollection = a.database.replicatedApplyCollection
+		staged.replicatedCaptureCollection = a.database.replicatedCaptureCollection
+		members, err := replicatedApplyCheckpointMembers(target, staged)
+		if err != nil {
+			return err
+		}
+		witness, err := a.database.checkpointGroup.PrepareMembershipTransition(
+			members, authorization,
+		)
+		if err != nil {
+			return err
+		}
+		proof.SourceApplied = expectedApplied
+		proof.Membership = witness
+		return nil
+	})
+}
+
+func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
+	raw []byte,
+	settle func(*database, ReplicatedShardStoreIdentity, *ReplicatedSchemaTargetProof) error,
 ) (proof ReplicatedSchemaTargetProof, resultErr error) {
 	if a == nil || a.database == nil || a.owner == nil {
 		return proof, ErrReplicatedApplyClosed
@@ -145,13 +198,30 @@ func (a *ReplicatedApply) CertifyReplicatedSchemaTarget(
 			)
 		}
 	}
+	proof = ReplicatedSchemaTargetProof{Catalog: image, Relations: certificate}
+	if settle != nil {
+		if err := settle(staged, targetIdentity, &proof); err != nil {
+			return proof, err
+		}
+	} else {
+		a.database.mu.RLock()
+		if err := a.checkLocked(); err == nil {
+			proof.SourceApplied = a.machine.Applied()
+		}
+		a.database.mu.RUnlock()
+	}
 	h := sha256.New()
 	_, _ = h.Write(replicatedSchemaTargetProofDomain)
 	_, _ = h.Write(image.Digest[:])
 	_, _ = h.Write(image.LocalRelationManifestDigest[:])
 	_, _ = h.Write(image.ApplyProfileDigest[:])
 	_, _ = h.Write(certificate.Witness[:])
-	proof = ReplicatedSchemaTargetProof{Catalog: image, Relations: certificate}
+	var fixed [24]byte
+	binary.LittleEndian.PutUint64(fixed[0:8], proof.SourceApplied)
+	binary.LittleEndian.PutUint64(fixed[8:16], proof.Membership.Sequence)
+	_, _ = h.Write(fixed[:16])
+	_, _ = h.Write(proof.Membership.Source[:])
+	_, _ = h.Write(proof.Membership.Target[:])
 	_ = h.Sum(proof.Witness[:0])
 	return proof, nil
 }

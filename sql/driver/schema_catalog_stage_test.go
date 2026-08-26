@@ -10,6 +10,9 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err = claim.InstallSnapshot(testReplicatedApplyBootstrap()); err != nil {
+		t.Fatal(err)
+	}
 	core := database.connector.db
 	core.mu.Lock()
 	raw, err := appendCatalogJSON(nil, core.catalog)
@@ -66,6 +69,14 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		proof.Relations.ManifestDigest != proof.Catalog.RelationManifestDigest ||
 		proof.Relations.Witness == ([32]byte{}) || proof.Witness == ([32]byte{}) {
 		t.Fatalf("target proof = %+v", proof)
+	}
+	prepared, err := claim.PrepareReplicatedSchemaTarget(
+		targetRaw, claim.Applied(), [32]byte{0xa5},
+	)
+	if err != nil || prepared.SourceApplied != claim.Applied() ||
+		prepared.Membership.Sequence == 0 || prepared.Membership.Source == ([32]byte{}) ||
+		prepared.Membership.Target == ([32]byte{}) || prepared.Witness == proof.Witness {
+		t.Fatalf("prepared target proof = %+v, %v", prepared, err)
 	}
 	if err = claim.Close(); err != nil {
 		t.Fatal(err)
