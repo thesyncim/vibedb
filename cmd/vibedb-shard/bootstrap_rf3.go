@@ -224,7 +224,7 @@ func bootstrapPreparedRF3(
 	}
 	service, err := snapshottransfer.NewBootstrapControlService(
 		snapshottransfer.BootstrapControlOptions{
-			Journal: journal, Receiver: receiver, Installer: installer,
+			Journal: journal, Receiver: receiver, Installer: installer, Releaser: repository,
 			Authorize: func(identity rafttransport.PeerIdentity, request snapshottransfer.BootstrapRequest) bool {
 				return identity.TrustDomain == profile.LocalIdentity().TrustDomain &&
 					gate.Check(identity.Node, gate.Generation(), serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow &&

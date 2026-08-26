@@ -32,6 +32,7 @@ func TestBootstrapControlClientExecutesExactAuthenticatedRequest(t *testing.T) {
 		Journal:   journal,
 		Receiver:  bootstrapReceiveFunc(func(context.Context, rafttransport.NodeID, Descriptor) error { return nil }),
 		Installer: installer,
+		Releaser:  BootstrapArtifactReleaseFunc(func(context.Context, BootstrapRequest, raftmember.RuntimeIdentity) error { return nil }),
 		Authorize: func(peer rafttransport.PeerIdentity, got BootstrapRequest) bool {
 			return peer == controller && got == request
 		},

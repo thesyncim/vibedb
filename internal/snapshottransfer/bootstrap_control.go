@@ -83,6 +83,18 @@ type BootstrapInstaller interface {
 	InstallPublishedLearner(context.Context, Descriptor) (raftmember.RuntimeIdentity, error)
 }
 
+type BootstrapArtifactReleaser interface {
+	ReleaseInstalledArtifact(context.Context, BootstrapRequest, raftmember.RuntimeIdentity) error
+}
+
+type BootstrapArtifactReleaseFunc func(context.Context, BootstrapRequest, raftmember.RuntimeIdentity) error
+
+func (f BootstrapArtifactReleaseFunc) ReleaseInstalledArtifact(
+	ctx context.Context, request BootstrapRequest, identity raftmember.RuntimeIdentity,
+) error {
+	return f(ctx, request, identity)
+}
+
 type BootstrapAuthorizeFunc func(rafttransport.PeerIdentity, BootstrapRequest) bool
 type BootstrapSourceNodeFunc func(Descriptor) (rafttransport.NodeID, bool)
 
@@ -90,6 +102,7 @@ type BootstrapControlOptions struct {
 	Journal       BootstrapJournal
 	Receiver      BootstrapReceiver
 	Installer     BootstrapInstaller
+	Releaser      BootstrapArtifactReleaser
 	Authorize     BootstrapAuthorizeFunc
 	SourceNode    BootstrapSourceNodeFunc
 	ReadDeadline  rafttransport.DeadlineFunc
@@ -104,6 +117,7 @@ type BootstrapControlService struct {
 	journal       BootstrapJournal
 	receiver      BootstrapReceiver
 	installer     BootstrapInstaller
+	releaser      BootstrapArtifactReleaser
 	authorize     BootstrapAuthorizeFunc
 	sourceNode    BootstrapSourceNodeFunc
 	readDeadline  rafttransport.DeadlineFunc
@@ -113,14 +127,14 @@ type BootstrapControlService struct {
 }
 
 func NewBootstrapControlService(options BootstrapControlOptions) (*BootstrapControlService, error) {
-	if options.Journal == nil || options.Receiver == nil || options.Installer == nil ||
+	if options.Journal == nil || options.Receiver == nil || options.Installer == nil || options.Releaser == nil ||
 		options.Authorize == nil || options.SourceNode == nil || options.ReadDeadline == nil ||
 		options.WriteDeadline == nil || options.MaxConcurrent <= 0 ||
 		options.MaxConcurrent > AbsoluteMaxBootstrapConcurrency {
 		return nil, ErrBootstrapControl
 	}
 	return &BootstrapControlService{
-		journal: options.Journal, receiver: options.Receiver, installer: options.Installer,
+		journal: options.Journal, receiver: options.Receiver, installer: options.Installer, releaser: options.Releaser,
 		authorize: options.Authorize, sourceNode: options.SourceNode,
 		readDeadline: options.ReadDeadline, writeDeadline: options.WriteDeadline,
 		slots:   make(chan struct{}, options.MaxConcurrent),
@@ -190,8 +204,14 @@ func (service *BootstrapControlService) Execute(
 	defer stripe.Unlock()
 
 	record, err := service.loadOrCreate(ctx, request)
-	if err != nil || record.State == BootstrapComplete {
+	if err != nil {
 		return record, err
+	}
+	if record.State == BootstrapComplete {
+		if err = service.releaser.ReleaseInstalledArtifact(ctx, request, record.Identity); err != nil {
+			return BootstrapRecord{}, err
+		}
+		return record, nil
 	}
 	installed, found, err := service.installer.ObserveInstalled(ctx, request.Descriptor)
 	if err != nil {
@@ -222,6 +242,9 @@ func (service *BootstrapControlService) Execute(
 	terminal.State = BootstrapComplete
 	terminal.Identity = installed
 	if err = service.publishExact(ctx, record.Revision, terminal); err != nil {
+		return BootstrapRecord{}, err
+	}
+	if err = service.releaser.ReleaseInstalledArtifact(ctx, request, installed); err != nil {
 		return BootstrapRecord{}, err
 	}
 	return terminal, nil

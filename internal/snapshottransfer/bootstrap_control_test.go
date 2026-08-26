@@ -166,6 +166,45 @@ func TestBootstrapControlSettlesInstallAndJournalOutcomeUnknown(t *testing.T) {
 	}
 }
 
+func TestBootstrapControlDurablyCertifiesBeforeReleaseAndRedrivesTerminalCleanup(t *testing.T) {
+	request, identity, source := bootstrapControlFixture()
+	journal := &memoryBootstrapJournal{records: make(map[[32]byte]BootstrapRecord)}
+	installer := &testBootstrapInstaller{identity: identity}
+	releaseCalls := 0
+	releaseFault := errors.New("release result lost")
+	service, err := NewBootstrapControlService(BootstrapControlOptions{
+		Journal:   journal,
+		Receiver:  bootstrapReceiveFunc(func(context.Context, rafttransport.NodeID, Descriptor) error { return nil }),
+		Installer: installer,
+		Releaser: BootstrapArtifactReleaseFunc(func(_ context.Context, got BootstrapRequest, gotIdentity raftmember.RuntimeIdentity) error {
+			releaseCalls++
+			record, readErr := journal.ReadBootstrap(context.Background(), request.Operation)
+			if readErr != nil || record.State != BootstrapComplete || got != request || gotIdentity != identity {
+				t.Fatalf("release before exact terminal certificate: record=%+v request=%+v identity=%+v err=%v", record, got, gotIdentity, readErr)
+			}
+			if releaseCalls == 1 {
+				return releaseFault
+			}
+			return nil
+		}),
+		Authorize:     func(rafttransport.PeerIdentity, BootstrapRequest) bool { return true },
+		SourceNode:    func(Descriptor) (rafttransport.NodeID, bool) { return source, true },
+		ReadDeadline:  func() time.Time { return time.Now().Add(time.Second) },
+		WriteDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.Execute(context.Background(), request); !errors.Is(err, releaseFault) {
+		t.Fatalf("first release = %v", err)
+	}
+	record, err := service.Execute(context.Background(), request)
+	if err != nil || record.State != BootstrapComplete || releaseCalls != 2 || installer.installCalls != 1 {
+		t.Fatalf("retry record=%+v releases=%d installs=%d err=%v", record, releaseCalls, installer.installCalls, err)
+	}
+}
+
 func TestBootstrapControlResumesReceiveFromDurableRunningIntent(t *testing.T) {
 	request, identity, _ := bootstrapControlFixture()
 	journal := &memoryBootstrapJournal{records: make(map[[32]byte]BootstrapRecord)}
@@ -277,7 +316,7 @@ func TestBootstrapControlServeAuthenticatesAndReturnsTerminalObservation(t *test
 	deadline := func() time.Time { return time.Now().Add(time.Second) }
 	service, err := NewBootstrapControlService(BootstrapControlOptions{
 		Journal: journal, Receiver: bootstrapReceiveFunc(func(context.Context, rafttransport.NodeID, Descriptor) error { return nil }),
-		Installer: installer, Authorize: func(peer rafttransport.PeerIdentity, got BootstrapRequest) bool {
+		Installer: installer, Releaser: BootstrapArtifactReleaseFunc(func(context.Context, BootstrapRequest, raftmember.RuntimeIdentity) error { return nil }), Authorize: func(peer rafttransport.PeerIdentity, got BootstrapRequest) bool {
 			return peer == controller && got == request
 		},
 		SourceNode:   func(Descriptor) (rafttransport.NodeID, bool) { return source, true },
@@ -315,6 +354,7 @@ func newTestBootstrapControl(
 	deadline := func() time.Time { return time.Now().Add(time.Second) }
 	service, err := NewBootstrapControlService(BootstrapControlOptions{
 		Journal: journal, Receiver: receive, Installer: installer,
+		Releaser:     BootstrapArtifactReleaseFunc(func(context.Context, BootstrapRequest, raftmember.RuntimeIdentity) error { return nil }),
 		Authorize:    func(rafttransport.PeerIdentity, BootstrapRequest) bool { return true },
 		SourceNode:   func(Descriptor) (rafttransport.NodeID, bool) { return source, true },
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 1,
