@@ -30,3 +30,58 @@ func TestPublicationDescriptorCanonicalBinaryBatch(t *testing.T) {
 		t.Fatal("corruption accepted")
 	}
 }
+
+func BenchmarkPublicationDescriptorEncode(b *testing.B) {
+	mutations := make([]PublicationMutation, 64)
+	var keys [64][16]byte
+	var values [64][128]byte
+	for i := range mutations {
+		keys[i][0], values[i][0] = byte(i), byte(i+1)
+		mutations[i] = PublicationMutation{Key: keys[i][:], Value: values[i][:]}
+	}
+	dst := make([]byte, 16<<10)
+	encoded, err := EncodePublicationDescriptor(dst, mutations)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(encoded) / len(mutations)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := EncodePublicationDescriptor(dst, mutations); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(len(encoded))/float64(len(mutations)), "bytes/mutation")
+}
+
+func BenchmarkPublicationDescriptorIterate(b *testing.B) {
+	mutations := make([]PublicationMutation, 64)
+	key, value := make([]byte, 16), make([]byte, 128)
+	for i := range mutations {
+		mutations[i] = PublicationMutation{Key: key, Value: value}
+	}
+	encoded, err := EncodePublicationDescriptor(make([]byte, 16<<10), mutations)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(encoded) / len(mutations)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		view, err := OpenPublicationDescriptor(encoded)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for {
+			_, ok, err := view.Next()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !ok {
+				break
+			}
+		}
+	}
+	b.ReportMetric(float64(len(encoded))/float64(len(mutations)), "bytes/mutation")
+}
