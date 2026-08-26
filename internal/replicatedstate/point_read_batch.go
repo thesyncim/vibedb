@@ -244,6 +244,9 @@ func (m *Machine) PointReadBatchInto(
 		if selected.id != relation || len(key) > selected.target.Limits.MaxKeyBytes {
 			return ErrInvalidCollection
 		}
+		if !relationOwnsPoint(selected, key, m.state.Binding.OwnedRange) {
+			return ErrWrongBinding
+		}
 		return nil
 	})
 	if err != nil {

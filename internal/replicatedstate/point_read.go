@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"errors"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -48,8 +49,7 @@ func (m *Machine) PointReadInto(
 	if selected.id != relation || len(key) > selected.target.Limits.MaxKeyBytes {
 		return PointReadResult{}, ErrInvalidCollection
 	}
-	if ownership, ok := selected.target.Validator.(OwnershipPointValidator); ok &&
-		ownership.ValidatePointOwnership(key, m.state.Binding.OwnedRange) != MutationValidationAccept {
+	if !relationOwnsPoint(selected, key, m.state.Binding.OwnedRange) {
 		return PointReadResult{}, ErrWrongBinding
 	}
 	// Admission precedes snapshot acquisition and payload materialization.
@@ -101,4 +101,22 @@ func (m *Machine) PointReadInto(
 		return PointReadResult{}, m.fail(err)
 	}
 	return result, nil
+}
+
+// relationOwnsPoint fails closed after a split whenever a relation's key
+// grammar cannot prove the mapped placement point. Range-less validators are
+// safe only while the group still owns the complete keyspace; retaining that
+// compatibility keeps unsplit global-index images readable without allowing a
+// narrowed source to serve keys that may belong to a child.
+func relationOwnsPoint(
+	relation relationCollection,
+	key []byte,
+	owned distribution.KeyRange,
+) bool {
+	validator, ok := relation.target.Validator.(OwnershipPointValidator)
+	if ok {
+		return validator.ValidatePointOwnership(key, owned) == MutationValidationAccept
+	}
+	return owned.Start == (distribution.KeyspacePoint{}) && owned.End.Max &&
+		owned.End.Point == (distribution.KeyspacePoint{})
 }

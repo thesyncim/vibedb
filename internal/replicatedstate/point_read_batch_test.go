@@ -5,9 +5,26 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 )
+
+type pointOwnershipValidator struct{ MutationValidator }
+
+func (pointOwnershipValidator) ValidatePointOwnership(
+	key []byte,
+	owned distribution.KeyRange,
+) MutationValidation {
+	if len(key) == 0 {
+		return MutationValidationInvalid
+	}
+	point := distribution.KeyspacePoint{key[0]}
+	if !owned.Contains(point) {
+		return MutationValidationWrongShard
+	}
+	return MutationValidationAccept
+}
 
 func TestPointReadBatchGrammarAndPositionalValues(t *testing.T) {
 	reads := []PointRead{
@@ -127,6 +144,56 @@ func TestPointReadBatchRejectsWholeCutOnAnyActiveIntent(t *testing.T) {
 	result, err := fixture.machine.PointReadBatchInto(packed, 4, maximum, []byte("caller"))
 	if !errors.Is(err, ErrTransactionIntentActive) || result.Data != nil {
 		t.Fatalf("partial result=%x err=%v", result.Data, err)
+	}
+}
+
+func TestPointReadsFailClosedForUnprovableRelationAfterRangeNarrowing(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	fixture.machine.state.Binding.OwnedRange = distribution.KeyRange{
+		End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{0x80}},
+	}
+	maximum := fixture.global.Limits.MaxDocumentBytes
+	globalKey := []byte{0x91, 0x01, 'a'}
+	if _, err := fixture.machine.PointReadInto(
+		2, globalKey, 2, maximum, nil,
+	); !errors.Is(err, ErrWrongBinding) {
+		t.Fatalf("narrowed unprovable global-index point error=%v, want ErrWrongBinding", err)
+	}
+	packed, err := AppendPointReadBatch(nil, []PointRead{{Relation: 2, Key: globalKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := fixture.machine.PointReadBatchInto(
+		packed, 2, maximum, nil,
+	); !errors.Is(err, ErrWrongBinding) || result.Data != nil {
+		t.Fatalf("narrowed unprovable global-index batch=%x err=%v", result.Data, err)
+	}
+}
+
+func TestPointReadBatchAppliesOwnershipProofToEveryRelation(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	fixture.machine.state.Binding.OwnedRange = distribution.KeyRange{
+		End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{0x80}},
+	}
+	fixture.machine.relations[0].target.Validator = pointOwnershipValidator{
+		MutationValidator: fixture.machine.relations[0].target.Validator,
+	}
+	maximum := fixture.base.Limits.MaxDocumentBytes
+	inside, err := AppendPointReadBatch(nil, []PointRead{{Relation: 1, Key: []byte{0x20}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.PointReadBatchInto(inside, 2, maximum, nil); err != nil {
+		t.Fatalf("proved in-range point: %v", err)
+	}
+	outside, err := AppendPointReadBatch(nil, []PointRead{{Relation: 1, Key: []byte{0x90}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := fixture.machine.PointReadBatchInto(
+		outside, 2, maximum, nil,
+	); !errors.Is(err, ErrWrongBinding) || result.Data != nil {
+		t.Fatalf("proved outside-range point batch=%x err=%v", result.Data, err)
 	}
 }
 
