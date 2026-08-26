@@ -306,7 +306,7 @@ func encodeDurableRequestPlan(
 		mutationScratch = encoded[:0:cap(encoded)]
 		frameBytes := durableRequestLogicalParticipantHeaderBytes + len(participant.Distribution) +
 			len(participant.Shard) + len(participant.IntentScopes)*8 + len(encoded)
-		if frameBytes > durableRequestMaxParticipantFrameBytes || frameBytes > math.MaxUint32 {
+		if frameBytes > durableRequestMaxParticipantFrameBytes || uint64(frameBytes) > uint64(math.MaxUint32) {
 			return ErrDurableRequestBound
 		}
 		appendDurableRequestLogicalParticipantHeader(participantHeader[:], frameBytes, layout, *participant)
