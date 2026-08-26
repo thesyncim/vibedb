@@ -281,10 +281,11 @@ func replicatedCatalogInitialDescriptorDigest(snapshot *Snapshot, shardIndex int
 	return digest
 }
 
-// RevokeMembershipGrant fails closed until the replicated catalog can certify
-// the exact completed replacement roster in the same batch as grant removal.
-// Runtime-local state is not a durable deletion proof: deleting an observed
-// grant at an intermediate learner/RF4 cut would strand recovery after restart.
+// RevokeMembershipGrant deliberately has no standalone success path. Runtime-
+// local state is not a durable deletion proof: deleting an observed grant at
+// an intermediate learner/RF4 cut would strand recovery after restart. Use
+// PublishReplicaReplacement to settle the completed RF3 catalog and revoke the
+// exact grant in one replicated relation batch.
 func (authority *ReplicatedCatalogAuthority) RevokeMembershipGrant(ctx context.Context,
 	expected membershipgrant.Grant) error {
 	if authority == nil || authority.session == nil || ctx == nil || !expected.Valid() {
@@ -294,6 +295,148 @@ func (authority *ReplicatedCatalogAuthority) RevokeMembershipGrant(ctx context.C
 		return err
 	}
 	return ErrReplicatedCatalogConflict
+}
+
+// PublishReplicaReplacement atomically publishes one certified final RF3
+// catalog, deletes the exact transition grant, and removes its bounded page
+// occupancy witness. A lost response is retained by NativeSession and settled
+// byte-identically through RetryPending; no intermediate catalog-with-grant or
+// grant-without-catalog state can become visible.
+func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
+	ctx context.Context,
+	expectedGeneration uint64,
+	next *Snapshot,
+	expected membershipgrant.Grant,
+) error {
+	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
+		!expected.Valid() || expected.CatalogGeneration != expectedGeneration ||
+		expectedGeneration == ^uint64(0) || authority.session.bundle.maxMutations < 4 {
+		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.session.Status().Pending {
+		return ErrReplicatedCatalogPending
+	}
+	cut, err := authority.readCatalogCut(ctx)
+	if err != nil {
+		return err
+	}
+	if cut.snapshot.Generation() != expectedGeneration ||
+		next.Generation() != expectedGeneration+1 {
+		return ErrCatalogGenerationMismatch
+	}
+	current, err := initialCatalogState(cut.snapshot)
+	if err != nil {
+		return err
+	}
+	certified, err := advanceCatalogStateReplicaReplacement(current, next, expected)
+	if err != nil {
+		return err
+	}
+	if certified.Generation() != next.Generation() {
+		return ErrReplicatedCatalogConflict
+	}
+
+	recordKey, pageKey := replicatedMembershipGrantKeys(expected.Group)
+	record, err := authority.readRaw(ctx, recordKey[:], maxReplicatedMembershipGrantBytes)
+	if err != nil {
+		return err
+	}
+	if !record.Found {
+		return ErrReplicatedCatalogConflict
+	}
+	stored, err := openReplicatedMembershipGrant(record.Value)
+	if err != nil || stored != expected {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	page, err := authority.readRaw(ctx, pageKey[:], maxReplicatedMembershipGrantPageBytes)
+	if err != nil {
+		return err
+	}
+	if !page.Found {
+		return ErrReplicatedCatalogConflict
+	}
+	groups, err := openReplicatedMembershipGrantPage(pageKey[1], page.Value)
+	if err != nil {
+		return err
+	}
+	position, found := findReplicatedMembershipGrantGroup(groups, expected.Group)
+	if !found {
+		return ErrReplicatedCatalogConflict
+	}
+	groups = append(groups[:position], groups[position+1:]...)
+
+	authority.scratch = authority.scratch[:0]
+	authority.scratch, err = appendReplicatedCatalogDocument(
+		authority.scratch, certified, maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		return ErrCatalogTooLarge
+	}
+	nextWitness, err := appendReplicatedCatalogHeadWitness(
+		nil, certified.Generation(), authority.scratch,
+	)
+	if err != nil {
+		return err
+	}
+	headDigest := sha256.Sum256(cut.head)
+	witnessDigest := sha256.Sum256(cut.witness)
+	recordDigest := sha256.Sum256(record.Value)
+	pageDigest := sha256.Sum256(page.Value)
+	mutations := make([]NativeMutation, 0, 4)
+	mutations = append(mutations,
+		NativeMutation{Kind: replication.MutationPutDigestEqual,
+			Key: replicatedCatalogHeadKey, Value: authority.scratch,
+			ExpectedValueLength: uint64(len(cut.head)),
+			ExpectedValueDigest: replication.Digest(headDigest)},
+		NativeMutation{Kind: replication.MutationPutDigestEqual,
+			Key: replicatedCatalogHeadWitnessKey, Value: nextWitness,
+			ExpectedValueLength: uint64(len(cut.witness)),
+			ExpectedValueDigest: replication.Digest(witnessDigest)},
+		NativeMutation{Kind: replication.MutationDeleteDigestEqual,
+			Key: recordKey[:], ExpectedValueLength: uint64(len(record.Value)),
+			ExpectedValueDigest: replication.Digest(recordDigest)},
+	)
+	if len(groups) == 0 {
+		mutations = append(mutations, NativeMutation{
+			Kind: replication.MutationDeleteDigestEqual, Key: pageKey[:],
+			ExpectedValueLength: uint64(len(page.Value)),
+			ExpectedValueDigest: replication.Digest(pageDigest),
+		})
+	} else {
+		pageBytes, pageErr := appendReplicatedMembershipGrantPage(nil, pageKey[1], groups)
+		if pageErr != nil {
+			return pageErr
+		}
+		mutations = append(mutations, NativeMutation{
+			Kind: replication.MutationPutDigestEqual, Key: pageKey[:], Value: pageBytes,
+			ExpectedValueLength: uint64(len(page.Value)),
+			ExpectedValueDigest: replication.Digest(pageDigest),
+		})
+	}
+	result, err := authority.session.MutateBatch(ctx, mutations)
+	if err != nil {
+		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
+			authority.pendingCatalog, authority.pendingExpected = certified, expectedGeneration
+			authority.pendingGrant = expected
+			return errors.Join(ErrReplicatedCatalogPending, err)
+		}
+		return err
+	}
+	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
+		return ErrReplicatedCatalogConflict
+	}
+	if result.Completion.ResultCode != replicatedstate.ResultApplied {
+		return ErrReplicatedCatalog
+	}
+	return authority.holder.publishReplicaReplacementAfter(
+		expectedGeneration, certified, expected,
+	)
 }
 
 func finishReplicatedMembershipGrantMutation(authority *ReplicatedCatalogAuthority,

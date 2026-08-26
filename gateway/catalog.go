@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	vibejson "github.com/thesyncim/vibejson"
@@ -662,6 +663,37 @@ func (h *CatalogHolder) PublishAfter(expectedGeneration uint64, s *Snapshot) err
 		)
 	}
 	next, err := advanceCatalogState(cur, s)
+	if err != nil {
+		return err
+	}
+	h.ptr.Store(next)
+	h.signalLeaseChangeLocked()
+	return nil
+}
+
+func (h *CatalogHolder) publishReplicaReplacementAfter(
+	expectedGeneration uint64,
+	s *Snapshot,
+	grant membershipgrant.Grant,
+) error {
+	if s == nil || !grant.Valid() {
+		return &CatalogError{Reason: "invalid certified replica replacement"}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	current := h.ptr.Load()
+	currentGeneration := uint64(0)
+	if current != nil {
+		currentGeneration = current.generation
+	}
+	if currentGeneration != expectedGeneration {
+		return fmt.Errorf(
+			"%w: expected=%d current=%d",
+			ErrCatalogGenerationMismatch, expectedGeneration, currentGeneration,
+		)
+	}
+	next, err := advanceCatalogStateReplicaReplacement(current, s, grant)
 	if err != nil {
 		return err
 	}

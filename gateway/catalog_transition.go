@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 )
 
 // BuildManifestTransition constructs an unpublished catalog generation by
@@ -58,6 +60,76 @@ func BuildManifestTransitionsWithReplicatedMetadata(
 	replicated []ReplicatedShardDescriptor,
 ) (*Snapshot, error) {
 	return buildManifestTransitions(current, nextManifests, nextGeneration, replicated)
+}
+
+// BuildReplicaReplacementTransition constructs the sole catalog cut accepted
+// after one certified membership lifecycle has returned to RF3. The target
+// replaces exactly the grant's source member at the same ordered routing
+// position; every unrelated replica and serving fence remains byte-identical.
+// Construction grants no authority and does not revoke the grant. The
+// replicated catalog authority must publish this cut together with exact grant
+// deletion by calling PublishReplicaReplacement.
+func BuildReplicaReplacementTransition(
+	current *Snapshot,
+	nextManifest *distribution.Manifest,
+	nextGeneration uint64,
+	grant membershipgrant.Grant,
+	target ReplicatedReplicaDescriptor,
+	nextCommand raftservice.CommandFence,
+) (*Snapshot, error) {
+	if current == nil || nextManifest == nil || !grant.Valid() ||
+		grant.CatalogGeneration != current.Generation() ||
+		nextGeneration != current.Generation()+1 || target.Member != grant.TargetMember ||
+		[16]byte(target.Node) != grant.TargetNode {
+		return nil, &CatalogError{Reason: "replica replacement requires one exact certified successor"}
+	}
+	descriptors := current.replicatedDescriptors()
+	changed := false
+	for descriptorIndex := range descriptors {
+		descriptor := &descriptors[descriptorIndex]
+		if descriptor.Group != grant.Group {
+			continue
+		}
+		if changed {
+			return nil, &CatalogError{Reason: "replica replacement repeats one Raft group"}
+		}
+		for replicaIndex := range descriptor.Replicas {
+			if descriptor.Replicas[replicaIndex].Member != grant.SourceMember {
+				continue
+			}
+			descriptor.Replicas[replicaIndex] = target
+			descriptor.Command = nextCommand
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil, &CatalogError{Reason: "replica replacement source is absent"}
+	}
+	config := cloneConfig(current.config)
+	replaced := false
+	for index := range config.Manifests {
+		if config.Manifests[index].Distribution() == nextManifest.Distribution() {
+			config.Manifests[index] = nextManifest
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		return nil, &CatalogError{Reason: "replica replacement manifest is absent"}
+	}
+	next, err := NewSnapshotWithReplicatedTableMetadata(
+		config, current.endpoints, nextGeneration, current.indexDescriptors(),
+		current.statistics.Descriptors(), descriptors, current.replicatedTableProfiles(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	state, err := initialCatalogState(current)
+	if err != nil {
+		return nil, err
+	}
+	return advanceCatalogStateReplicaReplacement(state, next, grant)
 }
 
 func buildManifestTransitions(

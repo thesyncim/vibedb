@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -399,6 +400,125 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 		}
 	}
 	return nil
+}
+
+func advanceCatalogStateReplicaReplacement(
+	current, next *Snapshot, grant membershipgrant.Grant,
+) (*Snapshot, error) {
+	if current == nil || next == nil || !grant.Valid() ||
+		grant.CatalogGeneration != current.Generation() ||
+		next.Generation() != current.Generation()+1 {
+		return nil, &CatalogError{Reason: "invalid certified replica replacement cut"}
+	}
+	if err := validateRoutingTransition(current, next); err != nil {
+		return nil, err
+	}
+	if err := validateCertifiedReplicaReplacement(current, next, grant); err != nil {
+		return nil, err
+	}
+	indexHighWater, err := advanceIndexIDHighWater(current, next)
+	if err != nil {
+		return nil, err
+	}
+	shardHighWaters, err := advanceShardGenerationHighWaters(current, next)
+	if err != nil {
+		return nil, err
+	}
+	return snapshotWithCatalogLineage(next, indexHighWater, shardHighWaters), nil
+}
+
+func validateCertifiedReplicaReplacement(
+	current, next *Snapshot, grant membershipgrant.Grant,
+) error {
+	if err := validateReplicatedTableTransition(current, next); err != nil {
+		return err
+	}
+	if current == nil || next == nil || !grant.Valid() ||
+		len(current.replicatedShards) != len(next.replicatedShards) ||
+		!replicatedCatalogCertifiesInitialGrant(current, grant) {
+		return &CatalogError{Reason: "membership grant does not certify the current RF3 catalog"}
+	}
+	replaced := false
+	for _, old := range current.replicatedShards {
+		oldManifest := current.config.Manifests[old.manifest]
+		oldMetadata, _ := oldManifest.ShardMetadataAt(int(old.shard))
+		candidate, found := next.replicatedShardAt(oldManifest.Distribution(), oldMetadata.ID)
+		if !found || candidate.group != old.group || candidate.allocation != old.allocation {
+			return &CatalogError{Reason: "replica replacement changed allocation identity"}
+		}
+		if old.group != grant.Group {
+			if candidate.command != old.command ||
+				!sameReplicatedCatalogRoster(current, old, next, candidate) {
+				return &CatalogError{Reason: "replica replacement changed an unrelated RF3 group"}
+			}
+			continue
+		}
+		if replaced || !exactCertifiedReplicaReplacement(current, old, next, candidate, grant) {
+			return &CatalogError{Reason: "replica replacement final roster is not exact"}
+		}
+		replaced = true
+	}
+	if !replaced {
+		return &CatalogError{Reason: "replica replacement group is absent"}
+	}
+	return nil
+}
+
+func exactCertifiedReplicaReplacement(
+	current *Snapshot,
+	old replicatedCatalogShard,
+	next *Snapshot,
+	candidate replicatedCatalogShard,
+	grant membershipgrant.Grant,
+) bool {
+	if old.replicaCount != ServingReplicaCount || candidate.replicaCount != ServingReplicaCount ||
+		old.command.ReplicaSetVersion != grant.InitialReplicaSetVersion ||
+		candidate.command.ReplicaSetVersion <= old.command.ReplicaSetVersion ||
+		candidate.command.ActivePolicyGeneration != old.command.ActivePolicyGeneration ||
+		candidate.command.ProtectionEpoch != old.command.ProtectionEpoch ||
+		candidate.command.OwnershipEpoch != old.command.OwnershipEpoch+1 ||
+		candidate.command.SchemaGeneration != old.command.SchemaGeneration ||
+		candidate.command.RelationManifestDigest != old.command.RelationManifestDigest ||
+		candidate.command.RoutingVersion != old.command.RoutingVersion+1 ||
+		candidate.command.RouteGeneration != old.command.RouteGeneration+1 ||
+		int(old.replicaBase)+ServingReplicaCount > len(current.replicatedReplicas) ||
+		int(candidate.replicaBase)+ServingReplicaCount > len(next.replicatedReplicas) {
+		return false
+	}
+	changes := 0
+	changedOrdinal := -1
+	for ordinal := 0; ordinal < ServingReplicaCount; ordinal++ {
+		before := current.replicatedReplicas[int(old.replicaBase)+ordinal]
+		after := next.replicatedReplicas[int(candidate.replicaBase)+ordinal]
+		if before == after {
+			continue
+		}
+		if before.Member != grant.SourceMember || after.Member != grant.TargetMember ||
+			[16]byte(after.Node) != grant.TargetNode {
+			return false
+		}
+		changes++
+		changedOrdinal = ordinal
+	}
+	if changes != 1 {
+		return false
+	}
+	oldManifest := current.config.Manifests[old.manifest]
+	nextManifest := next.config.Manifests[candidate.manifest]
+	oldMetadata, ok := oldManifest.ShardMetadataAt(int(old.shard))
+	if !ok || oldMetadata.Epoch == ^distribution.OwnershipEpoch(0) ||
+		oldManifest.Version() == ^distribution.RoutingVersion(0) {
+		return false
+	}
+	targetEndpoint, ok := nextManifest.ShardLeaderAt(int(candidate.shard), changedOrdinal)
+	if !ok {
+		return false
+	}
+	expectedManifest, err := oldManifest.ReplaceShardLeader(
+		int(old.shard), oldManifest.Version()+1, changedOrdinal,
+		targetEndpoint, oldMetadata.Epoch+1,
+	)
+	return err == nil && nextManifest.Equal(expectedManifest)
 }
 
 func replicatedCommandFenceRegresses(old, next raftservice.CommandFence) bool {

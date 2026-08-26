@@ -49,7 +49,7 @@ func TestReplicatedMembershipGrantCatalogWitnessClosesStaleInterleaving(t *testi
 		Tenant: []byte("control-plane"), ClientID: replication.ID128{0x72},
 		Resolver:           BaseRelationResolver{Relation: authority.relation},
 		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 3,
+		MaxRelationBatches: 1, MaxMutations: 4,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
@@ -85,6 +85,88 @@ func TestReplicatedMembershipGrantCatalogWitnessClosesStaleInterleaving(t *testi
 	recordKey, _ := replicatedMembershipGrantKeys(grant.Group)
 	if _, found := client.rows[string(recordKey[:])]; found {
 		t.Fatal("stale witness conflict partially installed a grant record")
+	}
+}
+
+func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testing.T) {
+	authority, client, current := newCatalogAuthorityFixture(t)
+	_, _, descriptor := testReplicatedCatalogInput(t)
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, current.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordKey, pageKey := replicatedMembershipGrantKeys(grant.Group)
+	if _, found := client.rows[string(recordKey[:])]; !found {
+		t.Fatal("grant record was not installed")
+	}
+	if _, found := client.rows[string(pageKey[:])]; !found {
+		t.Fatal("grant occupancy page was not installed")
+	}
+	other := grant.Group
+	foundCollision := false
+	for candidate := uint64(1); candidate < 1<<20; candidate++ {
+		other.GroupID[8] = byte(candidate)
+		other.GroupID[9] = byte(candidate >> 8)
+		other.GroupID[10] = byte(candidate >> 16)
+		_, otherPage := replicatedMembershipGrantKeys(other)
+		if other != grant.Group && otherPage == pageKey {
+			foundCollision = true
+			break
+		}
+	}
+	if !foundCollision {
+		t.Fatal("could not construct a deterministic occupancy-page collision")
+	}
+	groups := []raftmember.GroupKey{grant.Group, other}
+	sort.Slice(groups, func(left, right int) bool {
+		return compareMembershipGrantGroup(groups[left], groups[right]) < 0
+	})
+	pageBytes, err := appendReplicatedMembershipGrantPage(nil, pageKey[1], groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(pageKey[:])] = pageBytes
+
+	client.unknownNext = true
+	err = authority.PublishReplicaReplacement(
+		context.Background(), current.Generation(), next, grant,
+	)
+	if !errors.Is(err, ErrReplicatedCatalogPending) || !authority.session.Status().Pending {
+		t.Fatalf("unknown final publication err=%v pending=%v", err, authority.session.Status().Pending)
+	}
+	retained := authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(retained, client.unknownCommand) {
+		t.Fatal("final replacement retry changed its exact command bytes")
+	}
+	if authority.holder.Current().Generation() != next.Generation() {
+		t.Fatalf("published generation=%d want=%d",
+			authority.holder.Current().Generation(), next.Generation())
+	}
+	if _, found := client.rows[string(recordKey[:])]; found {
+		t.Fatal("completed replacement retained its grant record")
+	}
+	remainingPage, found := client.rows[string(pageKey[:])]
+	if !found {
+		t.Fatal("shared grant occupancy page was deleted")
+	}
+	remaining, err := openReplicatedMembershipGrantPage(pageKey[1], remainingPage)
+	if err != nil || len(remaining) != 1 || remaining[0] != other {
+		t.Fatalf("remaining occupancy groups=%+v err=%v", remaining, err)
+	}
+	if grantResult, found, readErr := authority.ReadMembershipGrant(
+		context.Background(), grant.Group,
+	); readErr != nil || found || grantResult != (membershipgrant.Grant{}) {
+		t.Fatalf("grant after final publication=%+v found=%v err=%v", grantResult, found, readErr)
 	}
 }
 
@@ -477,7 +559,7 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		Shard: string(ReplicatedCatalogShard), Tenant: []byte("control-plane"),
 		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
 		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 3,
+		MaxRelationBatches: 1, MaxMutations: 4,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {

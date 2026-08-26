@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -60,6 +61,7 @@ type ReplicatedCatalogAuthority struct {
 	scratch         []byte
 	pendingCatalog  *Snapshot
 	pendingExpected uint64
+	pendingGrant    membershipgrant.Grant
 }
 
 type ReplicatedCatalogAuthorityOptions struct {
@@ -409,16 +411,27 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 	}
 	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
 		authority.pendingCatalog = nil
+		authority.pendingExpected = 0
+		authority.pendingGrant = membershipgrant.Grant{}
 		return ErrReplicatedCatalogConflict
 	}
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		authority.pendingCatalog = nil
+		authority.pendingExpected = 0
+		authority.pendingGrant = membershipgrant.Grant{}
 		return ErrReplicatedCatalog
 	}
 	if authority.pendingCatalog != nil {
-		err = authority.holder.PublishAfter(authority.pendingExpected, authority.pendingCatalog)
+		if authority.pendingGrant.Valid() {
+			err = authority.holder.publishReplicaReplacementAfter(
+				authority.pendingExpected, authority.pendingCatalog, authority.pendingGrant,
+			)
+		} else {
+			err = authority.holder.PublishAfter(authority.pendingExpected, authority.pendingCatalog)
+		}
 		authority.pendingCatalog = nil
 		authority.pendingExpected = 0
+		authority.pendingGrant = membershipgrant.Grant{}
 		return err
 	}
 	return nil
