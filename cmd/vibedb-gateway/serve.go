@@ -383,7 +383,8 @@ func runServe(args []string) int {
 		hotShardRuntime, err = newGatewayHotShardRuntime(
 			context.Background(), holder, catalogAuthority, capacity,
 		)
-		if err != nil || !exec.InstallPressureObserver(hotShardRuntime) {
+		if err != nil || !exec.InstallPressureObserver(hotShardRuntime) ||
+			dataReader != nil && !dataReader.InstallPressureObserver(hotShardRuntime) {
 			fmt.Fprintf(os.Stderr, "gateway: initialize hot-shard pressure: %v\n", err)
 			return 1
 		}

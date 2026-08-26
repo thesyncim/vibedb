@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -72,6 +73,7 @@ func (result *ReplicatedTableScatterReadResult) Release() {
 type replicatedScatterGroup struct {
 	route    ReplicatedRoute
 	routeID  replication.Digest
+	source   autosplit.SourceIdentity
 	points   []ReplicatedBatchPointRead
 	ordinals []uint32
 	result   ReplicatedBatchPointResult
@@ -150,6 +152,7 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 			groupByRoute[resolved.RouteID] = groupIndex
 			groups = append(groups, replicatedScatterGroup{
 				route: resolved.Route, routeID: resolved.RouteID,
+				source: replicatedDataPressureSource(snapshot, resolved.Route),
 			})
 		}
 		group := &groups[groupIndex]
@@ -232,6 +235,7 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 					group.err = context.Cause(scatterCtx)
 					continue
 				}
+				reader.observeReplicatedPressure(group.source, len(group.points), false)
 				result, readErr := reader.executor.ReadPointBatch(
 					scatterCtx, group.route, ReplicatedBatchRead{
 						Points: group.points, MinimumApplied: 1,

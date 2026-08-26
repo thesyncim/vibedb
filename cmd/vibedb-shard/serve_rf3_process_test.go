@@ -368,6 +368,17 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv(gatewayHotShardLiveChildEnvironment) == "1" {
+		runGatewayHotShardLiveChild(t, gatewayHotShardLiveFixture{
+			root: root, executable: executable, children: children, target: targetProcess,
+			nodes: nodes, group: group, credentials: credentials, roots: roots,
+			policyPath: policyPath, nativeAddresses: nativeAddresses,
+			controlAddresses: controlAddresses, targetNode: targetNode, targetStore: targetStore,
+			targetIncarnation: targetIncarnation, targetListeners: targetListeners,
+			targetProfile: targetProfile, authority: authority, grantClient: grantClient,
+		})
+		return
+	}
 	var initialRoster [3]membershipgrant.RosterMember
 	for index, node := range nodes {
 		initialRoster[index] = membershipgrant.RosterMember{
@@ -1261,7 +1272,7 @@ func rf3CommandPolicyWithTarget(
 	target rafttransport.NodeID,
 ) []byte {
 	return []byte(fmt.Sprintf(
-		`{"generation":5,"principals":[{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]}]}`,
+		`{"generation":5,"principals":[{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["delegate","membership","topology"]},{"node":"%x","capabilities":["data_read","data_write","delegate","execution_pin","membership","request_ledger","topology","transaction_recovery"]}]}`,
 		nodes[0], nodes[1], nodes[2], target,
 	))
 }

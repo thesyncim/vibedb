@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/autosplit"
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -158,9 +160,22 @@ type ReplicatedDataReader struct {
 	nextEpoch          atomic.Uint64
 	scatterSlots       chan struct{}
 	scatterConcurrency int
+	pressure           PressureObserver
 
 	refreshMu sync.Mutex
 	active    *replicatedDataCatalogRefresh
+}
+
+// InstallPressureObserver binds the startup-only bounded pressure intake used
+// by native RF3 reads. The reader is not yet reachable by request handlers when
+// the gateway composes this seam, so request execution never synchronizes on
+// observer replacement.
+func (reader *ReplicatedDataReader) InstallPressureObserver(observer PressureObserver) bool {
+	if reader == nil || observer == nil || reader.pressure != nil {
+		return false
+	}
+	reader.pressure = observer
+	return true
 }
 
 type replicatedDataCatalogRefresh struct {
@@ -374,6 +389,9 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 	if err != nil {
 		return ReplicatedTableBatchReadResult{}, lease.generation, err
 	}
+	reader.observeReplicatedPressure(
+		replicatedDataPressureSource(lease.snapshot, route), len(points), false,
+	)
 	result, err := reader.executor.ReadPointBatch(ctx, route, ReplicatedBatchRead{
 		Points: points, MinimumApplied: 1, MaxResultBytes: uint32(maximum),
 	})
@@ -422,6 +440,9 @@ func (reader *ReplicatedDataReader) readPinned(
 	if err != nil {
 		return ReplicatedTableReadResult{}, lease.generation, err
 	}
+	reader.observeReplicatedPressure(
+		replicatedDataPressureSource(lease.snapshot, resolved.Route), 1, false,
+	)
 
 	result, err := reader.executor.ReadPoint(ctx, resolved.Route, ReplicatedPointRead{
 		Relation: resolved.Profile.Relation, Key: request.Key,
@@ -438,6 +459,52 @@ func (reader *ReplicatedDataReader) readPinned(
 		reservationOwner: reader, reservationBytes: readBytes,
 		reservationSlot: reservationSlot, reservationEpoch: reservationEpoch,
 	}, lease.generation, nil
+}
+
+func (reader *ReplicatedDataReader) observeReplicatedPressure(
+	source autosplit.SourceIdentity, count int, write bool,
+) {
+	if reader == nil || reader.pressure == nil || source == (autosplit.SourceIdentity{}) || count <= 0 {
+		return
+	}
+	observation := PressureObservation{Source: source, Write: write}
+	for range count {
+		reader.pressure.ObservePressure(observation)
+	}
+}
+
+func replicatedDataPressureSource(snapshot *Snapshot, route ReplicatedRoute) autosplit.SourceIdentity {
+	if snapshot == nil || route.Distribution == "" || route.Shard == "" ||
+		route.AllocationGeneration == 0 {
+		return autosplit.SourceIdentity{}
+	}
+	manifest, ok := snapshot.Manifest(route.Distribution)
+	if !ok || uint64(manifest.Version()) != route.Command.RoutingVersion {
+		return autosplit.SourceIdentity{}
+	}
+	var bucketBits uint8
+	for ordinal := 0; ordinal < snapshot.DistributionCount(); ordinal++ {
+		spec, found := snapshot.DistributionAt(ordinal)
+		if found && spec.Name == route.Distribution {
+			bucketBits = spec.EffectiveBucketBits()
+			break
+		}
+	}
+	if bucketBits == 0 {
+		return autosplit.SourceIdentity{}
+	}
+	for ordinal := 0; ordinal < manifest.ShardCount(); ordinal++ {
+		metadata, found := manifest.ShardMetadataAt(ordinal)
+		if found && metadata.ID == route.Shard &&
+			uint64(metadata.AllocationGeneration) == route.AllocationGeneration &&
+			uint64(metadata.Epoch) == route.Command.OwnershipEpoch {
+			return autosplit.SourceIdentity{Distribution: route.Distribution, Shard: route.Shard,
+				AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration), Range: metadata.Range,
+				BucketBits: bucketBits, RoutingVersion: manifest.Version(),
+				OwnershipEpoch: metadata.Epoch}
+		}
+	}
+	return autosplit.SourceIdentity{}
 }
 
 func (reader *ReplicatedDataReader) admitRead(
