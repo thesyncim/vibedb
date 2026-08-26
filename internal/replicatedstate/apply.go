@@ -224,7 +224,8 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 			transition, openErr := OpenOwnershipTransition(data)
 			if openErr != nil || m.state.Binding.OwnershipEpoch != transition.ToOwnershipEpoch ||
 				m.state.Binding.RoutingVersion != transition.ToRoutingVersion ||
-				m.state.Binding.RouteGeneration != transition.ToRouteGeneration {
+				m.state.Binding.RouteGeneration != transition.ToRouteGeneration ||
+				m.state.Binding.OwnedRange != transition.ToOwnedRange {
 				return raftmodel.Publication{}, m.fail(ErrOwnershipTransition)
 			}
 		}
@@ -1643,6 +1644,19 @@ func (m *Machine) planMutations(
 				validation = target.Validator.ValidateDelete(mutation.key, current, found)
 			} else {
 				validation = target.Validator.ValidatePut(mutation.key, mutation.value)
+			}
+			if validation == MutationValidationAccept {
+				if ownership, ok := target.Validator.(OwnershipMutationValidator); ok {
+					if mutation.delete {
+						validation = ownership.ValidateDeleteOwnership(
+							mutation.key, current, found, m.state.Binding.OwnedRange,
+						)
+					} else {
+						validation = ownership.ValidatePutOwnership(
+							mutation.key, mutation.value, m.state.Binding.OwnedRange,
+						)
+					}
+				}
 			}
 			switch validation {
 			case MutationValidationAccept:

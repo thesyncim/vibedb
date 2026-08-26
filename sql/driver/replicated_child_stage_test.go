@@ -367,7 +367,7 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	}
 	openedBase, err := replicatedstate.OpenSnapshotBase(activated.SnapshotBase)
 	if err != nil || openedBase.Manifest.Digest != activated.ArtifactManifest.Digest ||
-		openedBase.Manifest.State.Binding != replicatedStateBinding(base) {
+		openedBase.Manifest.State.Binding != replicatedStateBindingAt(base, fixture.childRange) {
 		t.Fatalf("snapshot base = %+v, %v", openedBase, err)
 	}
 	firstBaseDigest := openedBase.Digest
@@ -579,6 +579,7 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 		GroupID: replicatedChildID(5), ActivePolicyGeneration: 11,
 		ProtectionEpoch: 13, OwnershipEpoch: 9, SchemaGeneration: 19,
 		RoutingVersion: 22, RouteGeneration: 28,
+		OwnedRange: full,
 	}
 	index, term := uint64(1), uint64(1)
 	bootstrap := &pb.Snapshot{
@@ -744,6 +745,9 @@ func (f *replicatedChildSourceFixture) catchUpAndSeal(
 			SourceMember: 1, TargetMember: 2,
 			ToOwnershipEpoch: f.binding.OwnershipEpoch + 1,
 			ToRoutingVersion: 23, ToRouteGeneration: 29,
+			ToOwnedRange: distribution.KeyRange{
+				End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{0x80}},
+			},
 		},
 	)
 	if err != nil {

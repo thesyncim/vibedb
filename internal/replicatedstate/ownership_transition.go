@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"go.etcd.io/raft/v3"
 )
 
 const (
-	ownershipTransitionFormat      = uint16(1)
+	ownershipTransitionFormat      = uint16(2)
 	ownershipTransitionHeaderBytes = 256
 	MaxOwnershipTransitionBytes    = ownershipTransitionHeaderBytes +
 		2*replication.MaxIdentityBytes + recordChecksumLen
@@ -34,6 +35,7 @@ type OwnershipTransition struct {
 	ToOwnershipEpoch          uint64
 	ToRoutingVersion          uint64
 	ToRouteGeneration         uint64
+	ToOwnedRange              distribution.KeyRange
 }
 
 // OwnershipTransitionView is a validated borrowed transition envelope.
@@ -61,6 +63,8 @@ type OwnershipTransitionView struct {
 	ToOwnershipEpoch          uint64
 	ToRoutingVersion          uint64
 	ToRouteGeneration         uint64
+	FromOwnedRange            distribution.KeyRange
+	ToOwnedRange              distribution.KeyRange
 	raw                       []byte
 }
 
@@ -110,6 +114,8 @@ func AppendOwnershipTransition(dst []byte, transition OwnershipTransition) ([]by
 	binary.LittleEndian.PutUint64(frame[192:200], transition.ToRouteGeneration)
 	binary.LittleEndian.PutUint16(frame[200:202], uint16(len(transition.From.Distribution)))
 	binary.LittleEndian.PutUint16(frame[202:204], uint16(len(transition.From.Shard)))
+	appendOwnershipRange(frame[204:221], transition.From.OwnedRange)
+	appendOwnershipRange(frame[221:238], transition.ToOwnedRange)
 	cursor := ownershipTransitionHeaderBytes
 	cursor += copy(frame[cursor:], transition.From.Distribution)
 	cursor += copy(frame[cursor:], transition.From.Shard)
@@ -136,7 +142,8 @@ func OpenOwnershipTransition(data []byte) (OwnershipTransitionView, error) {
 		binary.LittleEndian.Uint16(data[8:10]) != ownershipTransitionFormat ||
 		binary.LittleEndian.Uint16(data[10:12]) != ownershipTransitionHeaderBytes ||
 		binary.LittleEndian.Uint32(data[12:16]) != uint32(len(data)) ||
-		!zeroBytes(data[16:24]) || !zeroBytes(data[204:ownershipTransitionHeaderBytes]) ||
+		data[220] > 1 || data[237] > 1 ||
+		!zeroBytes(data[16:24]) || !zeroBytes(data[238:ownershipTransitionHeaderBytes]) ||
 		!verifyRecord(data, ownershipTransitionChecksumDomain) {
 		return OwnershipTransitionView{}, fmt.Errorf("%w: ownership transition envelope", ErrOwnershipTransition)
 	}
@@ -167,6 +174,8 @@ func OpenOwnershipTransition(data []byte) (OwnershipTransitionView, error) {
 		Shard:                     data[cursor+distributionBytes : cursor+distributionBytes+shardBytes : cursor+distributionBytes+shardBytes],
 		raw:                       data,
 	}
+	view.FromOwnedRange = openOwnershipRange(data[204:221])
+	view.ToOwnedRange = openOwnershipRange(data[221:238])
 	copy(view.ClusterID[:], data[24:40])
 	copy(view.ClusterIncarnation[:], data[40:56])
 	copy(view.ShardIncarnation[:], data[56:72])
@@ -196,6 +205,7 @@ func validateOwnershipTransitionInput(transition OwnershipTransition) error {
 		ToOwnershipEpoch:  transition.ToOwnershipEpoch,
 		ToRoutingVersion:  transition.ToRoutingVersion,
 		ToRouteGeneration: transition.ToRouteGeneration,
+		FromOwnedRange:    transition.From.OwnedRange, ToOwnedRange: transition.ToOwnedRange,
 	}
 	return validateOwnershipTransitionView(view)
 }
@@ -215,7 +225,9 @@ func validateOwnershipTransitionView(view OwnershipTransitionView) error {
 		view.RouteGeneration == math.MaxUint64 ||
 		view.ToOwnershipEpoch != view.OwnershipEpoch+1 ||
 		view.ToRoutingVersion != view.RoutingVersion+1 ||
-		view.ToRouteGeneration != view.RouteGeneration+1 {
+		view.ToRouteGeneration != view.RouteGeneration+1 ||
+		!canonicalOwnershipRange(view.FromOwnedRange) || !canonicalOwnershipRange(view.ToOwnedRange) ||
+		!ownershipRangeContains(view.FromOwnedRange, view.ToOwnedRange) {
 		return fmt.Errorf("%w: ownership transition semantics", ErrOwnershipTransition)
 	}
 	return nil
@@ -240,6 +252,7 @@ func (m *Machine) ownershipTransitionBinding(
 		transition.SchemaGeneration != current.SchemaGeneration ||
 		transition.RoutingVersion != current.RoutingVersion ||
 		transition.RouteGeneration != current.RouteGeneration ||
+		transition.FromOwnedRange != current.OwnedRange ||
 		transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion {
 		return Binding{}, ErrOwnershipTransition
 	}
@@ -252,7 +265,37 @@ func (m *Machine) ownershipTransitionBinding(
 	current.OwnershipEpoch = transition.ToOwnershipEpoch
 	current.RoutingVersion = transition.ToRoutingVersion
 	current.RouteGeneration = transition.ToRouteGeneration
+	current.OwnedRange = transition.ToOwnedRange
 	return current, nil
+}
+
+func appendOwnershipRange(dst []byte, owned distribution.KeyRange) {
+	copy(dst[0:8], owned.Start[:])
+	copy(dst[8:16], owned.End.Point[:])
+	if owned.End.Max {
+		dst[16] = 1
+	}
+}
+
+func openOwnershipRange(src []byte) (owned distribution.KeyRange) {
+	copy(owned.Start[:], src[0:8])
+	copy(owned.End.Point[:], src[8:16])
+	owned.End.Max = src[16] == 1
+	return owned
+}
+
+func canonicalOwnershipRange(owned distribution.KeyRange) bool {
+	return owned.Valid() && (!owned.End.Max || owned.End.Point == (distribution.KeyspacePoint{}))
+}
+
+func ownershipRangeContains(outer, inner distribution.KeyRange) bool {
+	if distribution.ComparePoints(outer.Start, inner.Start) > 0 {
+		return false
+	}
+	if outer.End.Max {
+		return true
+	}
+	return !inner.End.Max && distribution.ComparePoints(inner.End.Point, outer.End.Point) <= 0
 }
 
 func memberInSorted(members []uint64, member uint64) bool {

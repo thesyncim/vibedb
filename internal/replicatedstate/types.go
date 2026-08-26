@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -113,6 +114,11 @@ type Binding struct {
 	SchemaGeneration       uint64
 	RoutingVersion         uint64
 	RouteGeneration        uint64
+	// OwnedRange is the exact currently published half-open keyspace range.
+	// Unlike the immutable physical validation profile, it advances with an
+	// ownership transition and fences new reads and mutations immediately even
+	// while transferred rows remain available for later certified pruning.
+	OwnedRange distribution.KeyRange
 }
 
 func (b Binding) validate() error {
@@ -123,7 +129,8 @@ func (b Binding) validate() error {
 		b.TopologyRecoveryEpoch == 0 || b.AllocationGeneration == 0 ||
 		b.ActivePolicyGeneration == 0 || b.ProtectionEpoch == 0 ||
 		b.OwnershipEpoch == 0 || b.SchemaGeneration == 0 ||
-		b.RoutingVersion == 0 || b.RouteGeneration == 0 {
+		b.RoutingVersion == 0 || b.RouteGeneration == 0 || !b.OwnedRange.Valid() ||
+		(b.OwnedRange.End.Max && b.OwnedRange.End.Point != (distribution.KeyspacePoint{})) {
 		return ErrInvalidBinding
 	}
 	if b.Distribution == "" || len(b.Distribution) > replication.MaxIdentityBytes ||
@@ -173,6 +180,22 @@ const (
 type MutationValidator interface {
 	ValidatePut(key, value []byte) MutationValidation
 	ValidateDelete(key, current []byte, found bool) MutationValidation
+}
+
+// OwnershipMutationValidator proves the actual placement point encoded by a
+// mutation key against the current durable ownership range. It is deliberately
+// separate from MutationValidator: reopen and snapshot auditing must continue
+// to validate retained transferred rows against the immutable physical image.
+type OwnershipMutationValidator interface {
+	ValidatePutOwnership(key, value []byte, owned distribution.KeyRange) MutationValidation
+	ValidateDeleteOwnership(key, current []byte, found bool, owned distribution.KeyRange) MutationValidation
+}
+
+// OwnershipPointValidator proves the actual placement point encoded by a
+// point-read key. Relations whose key grammar cannot prove placement do not
+// implement it and are not silently treated as range-addressable.
+type OwnershipPointValidator interface {
+	ValidatePointOwnership(key []byte, owned distribution.KeyRange) MutationValidation
 }
 
 // AttemptedMutationKeys is an opaque view of the exact distinct user keys in

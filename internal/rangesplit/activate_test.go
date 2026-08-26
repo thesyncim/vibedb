@@ -129,6 +129,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		ToOwnershipEpoch:  source.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  source.binding.RoutingVersion + 1,
 		ToRouteGeneration: source.binding.RouteGeneration + 1,
+		ToOwnedRange:      partitioner.children[partitioner.retained].Range,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -189,6 +190,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	binding.OwnershipEpoch = uint64(child.OwnershipEpoch)
 	binding.RoutingVersion = uint64(partitioner.target)
 	binding.RouteGeneration = certificate.SourceCoordinates().RouteGeneration
+	binding.OwnedRange = child.Range
 	index, term := uint64(1), uint64(1)
 	bootstrap := &pb.Snapshot{
 		Data: []byte("range-split-child-bootstrap"),

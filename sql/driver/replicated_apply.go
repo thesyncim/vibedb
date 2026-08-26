@@ -567,8 +567,9 @@ func (d *Database) openReplicatedApply(
 	if err != nil {
 		return nil, identity, err
 	}
+	initialBinding := replicatedStateBindingAt(expected, options.Placement.Range)
 	machine, err := replicatedstate.OpenBundle(
-		replicatedStateBinding(expected), bootstrap,
+		initialBinding, bootstrap,
 		replicatedstate.CollectionTarget{
 			Collection: core.replicatedApplyCollection,
 			Validation: replicatedstate.ValidationOpaqueBinary,
@@ -1012,7 +1013,10 @@ func (d *database) detachReplicatedApplyCollection(collection *durable.Collectio
 	return d.txnLog.DetachCollection(collection)
 }
 
-func replicatedStateBinding(identity ReplicatedShardStoreIdentity) replicatedstate.Binding {
+func replicatedStateBindingAt(
+	identity ReplicatedShardStoreIdentity,
+	owned distribution.KeyRange,
+) replicatedstate.Binding {
 	b := identity.Binding
 	return replicatedstate.Binding{
 		ClusterID:             replication.ID128(b.ClusterID),
@@ -1028,6 +1032,7 @@ func replicatedStateBinding(identity ReplicatedShardStoreIdentity) replicatedsta
 		SchemaGeneration:       b.Authority.SchemaGeneration,
 		RoutingVersion:         b.Authority.RoutingVersion,
 		RouteGeneration:        b.Authority.RouteGeneration,
+		OwnedRange:             owned,
 	}
 }
 
@@ -1116,6 +1121,61 @@ func (v *replicatedSQLMutationValidator) ValidateDelete(
 		return replicatedstate.MutationValidationInvalid
 	}
 	if !v.placement.target.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
+	}
+	return replicatedstate.MutationValidationAccept
+}
+
+func (v *replicatedSQLMutationValidator) ValidatePutOwnership(
+	key, value []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	encoded, _, err := appendDocumentKey(
+		v.keyScratch[:0], value, v.primaryKey, v.primary, v.maxKeyBytes,
+	)
+	v.keyScratch = encoded
+	if errors.Is(err, durable.ErrKeyTooLarge) {
+		return replicatedstate.MutationValidationTargetBound
+	}
+	if err != nil || !bytes.Equal(encoded, key) {
+		return replicatedstate.MutationValidationInvalid
+	}
+	return v.validateOwnedKeyLocked(key, owned)
+}
+
+func (v *replicatedSQLMutationValidator) ValidateDeleteOwnership(
+	key, current []byte,
+	found bool,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	if found {
+		return v.ValidatePutOwnership(key, current, owned)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.validateOwnedKeyLocked(key, owned)
+}
+
+func (v *replicatedSQLMutationValidator) ValidatePointOwnership(
+	key []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.validateOwnedKeyLocked(key, owned)
+}
+
+func (v *replicatedSQLMutationValidator) validateOwnedKeyLocked(
+	key []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	point, ok := v.pointForEncodedKeyLocked(key)
+	if !ok {
+		return replicatedstate.MutationValidationInvalid
+	}
+	if !owned.Contains(point) {
 		return replicatedstate.MutationValidationWrongShard
 	}
 	return replicatedstate.MutationValidationAccept

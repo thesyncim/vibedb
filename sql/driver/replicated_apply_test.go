@@ -665,6 +665,10 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 }
 
 func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *testing.T) {
+	below, outside := func() (replicatedPlacementProbe, replicatedPlacementProbe) {
+		probes := testReplicatedPlacementProbes(t)
+		return probes[0], probes[1]
+	}()
 	path, database, base := bindReplicatedApplyTestRoot(t, "ownership-transition")
 	bootstrap := testReplicatedApplyBootstrap()
 	options := testReplicatedApplyOptions()
@@ -681,13 +685,15 @@ func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *tes
 	}, conf); err != nil {
 		t.Fatal(err)
 	}
-	binding := replicatedStateBinding(base)
+	binding := replicatedStateBindingAt(base, options.Placement.Range)
+	retained := distribution.KeyRange{End: distribution.KeyspaceEnd{Point: outside.point}}
 	transition, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
 		From: binding, ExpectedReplicaSetVersion: 2,
 		SourceMember: 1, TargetMember: 2,
 		ToOwnershipEpoch:  binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  binding.RoutingVersion + 1,
 		ToRouteGeneration: binding.RouteGeneration + 1,
+		ToOwnedRange:      retained,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -708,8 +714,42 @@ func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *tes
 	}
 	if state.Binding.OwnershipEpoch != binding.OwnershipEpoch+1 ||
 		state.Binding.RoutingVersion != binding.RoutingVersion+1 ||
-		state.Binding.RouteGeneration != binding.RouteGeneration+1 {
+		state.Binding.RouteGeneration != binding.RouteGeneration+1 ||
+		state.Binding.OwnedRange != retained {
 		t.Fatalf("transitioned SQL state = %+v", state.Binding)
+	}
+	advanced := base.Clone()
+	advanced.Binding.Authority.OwnershipEpoch = state.Binding.OwnershipEpoch
+	advanced.Binding.Authority.RoutingVersion = state.Binding.RoutingVersion
+	advanced.Binding.Authority.RouteGeneration = state.Binding.RouteGeneration
+	epoch := applyReplicatedApplySessionOpen(t, claim, advanced, 4)
+	outsidePut := testReplicatedApplyCommand(advanced, epoch, 2, replication.Mutation{
+		Kind: replication.MutationPut, Key: outside.key, Value: outside.document,
+	})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), outsidePut); err != nil {
+		t.Fatal(err)
+	}
+	if code := completionResultCode(t, claim, outsidePut); code != replicatedstate.ResultWrongShard {
+		t.Fatalf("post-cutover outside put = %d, want ResultWrongShard", code)
+	}
+	insidePut := testReplicatedApplyCommand(advanced, epoch, 3, replication.Mutation{
+		Kind: replication.MutationPut, Key: below.key, Value: below.document,
+	})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(6), insidePut); err != nil {
+		t.Fatal(err)
+	}
+	if code := completionResultCode(t, claim, insidePut); code != replicatedstate.ResultApplied {
+		t.Fatalf("post-cutover retained put = %d, want ResultApplied", code)
+	}
+	if _, err := claim.PointReadInto(
+		1, outside.key, 6, base.UserLimits.MaxDocumentBytes, nil,
+	); !errors.Is(err, replicatedstate.ErrWrongBinding) {
+		t.Fatalf("post-cutover outside point read = %v, want ErrWrongBinding", err)
+	}
+	if read, err := claim.PointReadInto(
+		1, below.key, 6, base.UserLimits.MaxDocumentBytes, nil,
+	); err != nil || !read.Found || !bytes.Equal(read.Value, below.document) {
+		t.Fatalf("post-cutover retained point read = %+v, %v", read, err)
 	}
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
@@ -734,7 +774,7 @@ func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *tes
 	if err := cut.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if reopenedState.Binding != state.Binding || reopenedState.Applied != 3 {
+	if reopenedState.Binding != state.Binding || reopenedState.Applied != 6 {
 		t.Fatalf("reopened transitioned state = %+v", reopenedState)
 	}
 	if err := reopenedClaim.Close(); err != nil {

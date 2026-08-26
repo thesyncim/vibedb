@@ -38,6 +38,7 @@ func (p *Plan) AppendSourceSeal(
 			ToOwnershipEpoch:  uint64(retained.OwnershipEpoch),
 			ToRoutingVersion:  uint64(p.targetManifest.Version()),
 			ToRouteGeneration: p.next,
+			ToOwnedRange:      retained.Range,
 		},
 	)
 	if err != nil {

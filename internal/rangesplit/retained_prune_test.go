@@ -626,6 +626,7 @@ func newRetainedPruneFixture(
 		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
 		ToRouteGeneration: fixture.binding.RouteGeneration + 1,
+		ToOwnedRange:      partitioner.children[partitioner.retained].Range,
 	})
 	if err != nil {
 		t.Fatal(err)

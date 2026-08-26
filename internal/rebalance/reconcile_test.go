@@ -97,6 +97,7 @@ func bindMoveTestPlan(plan *Plan) *Plan {
 			AllocationGeneration: 11, ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
 			ActivePolicyGeneration: 2, ProtectionEpoch: 3, OwnershipEpoch: 13,
 			SchemaGeneration: 4, RoutingVersion: 7, RouteGeneration: 9,
+			OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
 		Applied: 8, LastTerm: 2, ConfState: plan.learnerConf,
 		ReplicaSetVersion: 6, SnapshotBaseDigest: next.baseDigest,

@@ -159,6 +159,7 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
 		ToRouteGeneration: fixture.binding.RouteGeneration + 1,
+		ToOwnedRange:      partitioner.children[partitioner.retained].Range,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1061,6 +1062,7 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 		ActivePolicyGeneration: 6, ProtectionEpoch: 7,
 		OwnershipEpoch: uint64(partitioner.source.OwnershipEpoch), SchemaGeneration: 8,
 		RoutingVersion: uint64(partitioner.source.RoutingVersion), RouteGeneration: 19,
+		OwnedRange: partitioner.source.Range,
 	}
 	index, term := uint64(1), uint64(1)
 	bootstrap := &pb.Snapshot{

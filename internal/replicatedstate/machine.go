@@ -534,13 +534,15 @@ func bindingAdvancesFrom(initial, current Binding) bool {
 		initial.ActivePolicyGeneration != current.ActivePolicyGeneration ||
 		initial.ProtectionEpoch != current.ProtectionEpoch ||
 		initial.SchemaGeneration != current.SchemaGeneration ||
+		!ownershipRangeContains(initial.OwnedRange, current.OwnedRange) ||
 		current.OwnershipEpoch < initial.OwnershipEpoch ||
 		current.RoutingVersion < initial.RoutingVersion ||
 		current.RouteGeneration < initial.RouteGeneration {
 		return false
 	}
 	delta := current.OwnershipEpoch - initial.OwnershipEpoch
-	return current.RoutingVersion-initial.RoutingVersion == delta &&
+	return (delta != 0 || current.OwnedRange == initial.OwnedRange) &&
+		current.RoutingVersion-initial.RoutingVersion == delta &&
 		current.RouteGeneration-initial.RouteGeneration == delta
 }
 

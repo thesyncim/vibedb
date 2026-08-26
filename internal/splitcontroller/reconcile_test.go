@@ -520,6 +520,7 @@ func testSourceState(plan *Plan) replicatedstate.State {
 			ActivePolicyGeneration: 1, ProtectionEpoch: 1,
 			OwnershipEpoch: uint64(plan.source.OwnershipEpoch), SchemaGeneration: 1,
 			RoutingVersion: uint64(plan.source.RoutingVersion), RouteGeneration: plan.current,
+			OwnedRange: plan.source.Range,
 		},
 		Applied: 41, LastTerm: 7, LastEntryDigest: sha256.Sum256([]byte("entry")),
 		DataChainDigest:    sha256.Sum256([]byte("data-chain")),

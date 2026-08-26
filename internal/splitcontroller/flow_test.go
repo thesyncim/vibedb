@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -179,7 +180,7 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 		t.Fatalf("activation child = %d, want 1", action.Child)
 	}
 	if err := stage.CheckActivationCoordinates(
-		certificate, flowTargetBinding(target.SQL.Binding),
+		certificate, flowTargetBinding(target.SQL.Binding, plan.children[action.Child].Range),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -468,6 +469,7 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 		ActivePolicyGeneration: 1, ProtectionEpoch: 1,
 		OwnershipEpoch: uint64(plan.source.OwnershipEpoch), SchemaGeneration: 1,
 		RoutingVersion: uint64(plan.source.RoutingVersion), RouteGeneration: plan.current,
+		OwnedRange: plan.source.Range,
 	}
 	index, term := uint64(1), uint64(1)
 	bootstrap := &pb.Snapshot{
@@ -561,7 +563,10 @@ func raftmemberReadyStatus(target ChildTarget, applied uint64) raftmember.Runtim
 	}
 }
 
-func flowTargetBinding(binding sqldriver.ReplicatedShardStoreBinding) replicatedstate.Binding {
+func flowTargetBinding(
+	binding sqldriver.ReplicatedShardStoreBinding,
+	owned distribution.KeyRange,
+) replicatedstate.Binding {
 	return replicatedstate.Binding{
 		ClusterID:              replication.ID128(binding.ClusterID),
 		ClusterIncarnation:     replication.ID128(binding.ClusterIncarnation),
@@ -577,5 +582,6 @@ func flowTargetBinding(binding sqldriver.ReplicatedShardStoreBinding) replicated
 		SchemaGeneration:       binding.Authority.SchemaGeneration,
 		RoutingVersion:         binding.Authority.RoutingVersion,
 		RouteGeneration:        binding.Authority.RouteGeneration,
+		OwnedRange:             owned,
 	}
 }

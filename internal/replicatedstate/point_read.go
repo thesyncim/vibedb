@@ -48,6 +48,10 @@ func (m *Machine) PointReadInto(
 	if selected.id != relation || len(key) > selected.target.Limits.MaxKeyBytes {
 		return PointReadResult{}, ErrInvalidCollection
 	}
+	if ownership, ok := selected.target.Validator.(OwnershipPointValidator); ok &&
+		ownership.ValidatePointOwnership(key, m.state.Binding.OwnedRange) != MutationValidationAccept {
+		return PointReadResult{}, ErrWrongBinding
+	}
 	// Admission precedes snapshot acquisition and payload materialization.
 	if maxValueBytes < selected.target.Limits.MaxDocumentBytes {
 		return PointReadResult{}, ErrReadBufferBound

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -109,6 +110,7 @@ func testBinding() Binding {
 		ShardIncarnation: id128(5), GroupID: id128(6),
 		ActivePolicyGeneration: 7, ProtectionEpoch: 8, OwnershipEpoch: 9,
 		SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 	}
 }
 

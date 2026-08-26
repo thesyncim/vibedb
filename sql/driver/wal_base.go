@@ -418,7 +418,7 @@ func (a *ReplicatedApply) SettleGenerationActivation(
 	base := core.catalog.ReplicatedShardStore
 	if group == nil || base == nil || base.RelationCount == 0 ||
 		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) ||
-		certificate.Manifest.State.Binding != replicatedStateBinding(*base) {
+		certificate.Manifest.State.Binding != replicatedStateBindingAt(*base, a.identity.Placement.Range) {
 		return ErrReplicatedApplyMismatch
 	}
 	if !a.walBaseSelectPending {
@@ -472,7 +472,7 @@ func (a *ReplicatedApply) LatchGenerationActivation(
 	base := core.catalog.ReplicatedShardStore
 	if core.checkpointGroup == nil || base == nil || base.RelationCount == 0 ||
 		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) ||
-		certificate.Manifest.State.Binding != replicatedStateBinding(*base) ||
+		certificate.Manifest.State.Binding != replicatedStateBindingAt(*base, a.identity.Placement.Range) ||
 		a.machine.Applied() != certificate.Manifest.State.Applied {
 		return ErrReplicatedApplyMismatch
 	}

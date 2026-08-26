@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	stateCodecFormat            = uint16(1)
-	stateHeaderBytes            = 376
-	stateTransactionHeaderBytes = 416
+	stateCodecFormat            = uint16(2)
+	stateHeaderBytes            = 400
+	stateTransactionHeaderBytes = 440
 	recordChecksumLen           = sha256.Size
 )
 
@@ -139,12 +139,17 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[352:360], state.SessionSlotCount)
 	binary.LittleEndian.PutUint64(frame[360:368], state.SessionEpochHighWater)
 	binary.LittleEndian.PutUint64(frame[368:376], state.AuthorityBindingCount)
+	copy(frame[376:384], state.Binding.OwnedRange.Start[:])
+	copy(frame[384:392], state.Binding.OwnedRange.End.Point[:])
+	if state.Binding.OwnedRange.End.Max {
+		frame[392] = 1
+	}
 	if headerBytes == stateTransactionHeaderBytes {
-		binary.LittleEndian.PutUint64(frame[376:384], state.TransactionControlCount)
-		binary.LittleEndian.PutUint64(frame[384:392], state.ActiveTransactionCount)
-		binary.LittleEndian.PutUint64(frame[392:400], state.TransactionPayloadRows)
-		binary.LittleEndian.PutUint64(frame[400:408], state.TransactionIntentRows)
-		binary.LittleEndian.PutUint64(frame[408:416], state.TransactionResidentBytes)
+		binary.LittleEndian.PutUint64(frame[400:408], state.TransactionControlCount)
+		binary.LittleEndian.PutUint64(frame[408:416], state.ActiveTransactionCount)
+		binary.LittleEndian.PutUint64(frame[416:424], state.TransactionPayloadRows)
+		binary.LittleEndian.PutUint64(frame[424:432], state.TransactionIntentRows)
+		binary.LittleEndian.PutUint64(frame[432:440], state.TransactionResidentBytes)
 	}
 	cursor := headerBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
@@ -209,12 +214,18 @@ func OpenState(src []byte) (State, error) {
 	state.SessionSlotCount = binary.LittleEndian.Uint64(src[352:360])
 	state.SessionEpochHighWater = binary.LittleEndian.Uint64(src[360:368])
 	state.AuthorityBindingCount = binary.LittleEndian.Uint64(src[368:376])
+	copy(state.Binding.OwnedRange.Start[:], src[376:384])
+	copy(state.Binding.OwnedRange.End.Point[:], src[384:392])
+	if src[392] > 1 || !zeroBytes(src[393:400]) {
+		return State{}, fmt.Errorf("%w: ownership range", ErrStateCorrupt)
+	}
+	state.Binding.OwnedRange.End.Max = src[392] == 1
 	if headerBytes == stateTransactionHeaderBytes {
-		state.TransactionControlCount = binary.LittleEndian.Uint64(src[376:384])
-		state.ActiveTransactionCount = binary.LittleEndian.Uint64(src[384:392])
-		state.TransactionPayloadRows = binary.LittleEndian.Uint64(src[392:400])
-		state.TransactionIntentRows = binary.LittleEndian.Uint64(src[400:408])
-		state.TransactionResidentBytes = binary.LittleEndian.Uint64(src[408:416])
+		state.TransactionControlCount = binary.LittleEndian.Uint64(src[400:408])
+		state.ActiveTransactionCount = binary.LittleEndian.Uint64(src[408:416])
+		state.TransactionPayloadRows = binary.LittleEndian.Uint64(src[416:424])
+		state.TransactionIntentRows = binary.LittleEndian.Uint64(src[424:432])
+		state.TransactionResidentBytes = binary.LittleEndian.Uint64(src[432:440])
 		if !stateHasTransactions(state) {
 			return State{}, fmt.Errorf("%w: noncanonical empty transaction extension", ErrStateCorrupt)
 		}
