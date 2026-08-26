@@ -10,6 +10,109 @@ import (
 	"slices"
 )
 
+const (
+	// MinimumJournalCompactionReclaimBytes prevents tiny terminal transitions
+	// from turning the durability path into a rewrite loop.
+	MinimumJournalCompactionReclaimBytes = uint64(1 << 20)
+	journalCompactionRatio               = uint64(4)
+	journalCompactionPressureBytes       = MaxRetainedJournalBytes * 3 / 4
+)
+
+// JournalCompactionOpportunity is an exact snapshot of the current generation
+// and its canonical compact replacement. Recommended becomes true after at
+// least 1 MiB can be reclaimed and either dead bytes occupy at least one
+// quarter of the journal or admission is under 75%-of-capacity pressure.
+type JournalCompactionOpportunity struct {
+	RetainedBytes    uint64
+	CompactedBytes   uint64
+	ReclaimableBytes uint64
+	Recommended      bool
+}
+
+// CompactionOpportunity performs no I/O and allocates no payload copies. It is
+// intended for a bounded background driver, never the request hot path.
+func (j *Journal) CompactionOpportunity() JournalCompactionOpportunity {
+	if j == nil {
+		return JournalCompactionOpportunity{}
+	}
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed || j.sticky != nil {
+		return JournalCompactionOpportunity{RetainedBytes: j.retainedBytes}
+	}
+	compacted, ok := j.compactedBytesLocked()
+	if !ok || compacted >= j.retainedBytes {
+		return JournalCompactionOpportunity{
+			RetainedBytes: j.retainedBytes, CompactedBytes: compacted,
+		}
+	}
+	reclaimable := j.retainedBytes - compacted
+	recommended := reclaimable >= MinimumJournalCompactionReclaimBytes &&
+		(reclaimable >= (j.retainedBytes+journalCompactionRatio-1)/journalCompactionRatio ||
+			j.retainedBytes >= journalCompactionPressureBytes)
+	return JournalCompactionOpportunity{
+		RetainedBytes: j.retainedBytes, CompactedBytes: compacted,
+		ReclaimableBytes: reclaimable, Recommended: recommended,
+	}
+}
+
+func (j *Journal) compactedBytesLocked() (uint64, bool) {
+	var total uint64
+	add := func(payload int) bool {
+		bytes := journalEncodedEntryBytes(payload)
+		if total > MaxRetainedJournalBytes || bytes > MaxRetainedJournalBytes-total {
+			return false
+		}
+		total += bytes
+		return true
+	}
+	for _, record := range j.coordinators {
+		if record == nil || len(record.stage) == 0 || !add(len(record.stage)) {
+			return total, false
+		}
+		if record.status.CoordinatorState == CoordinatorRetired {
+			continue
+		}
+		if record.hasManifest {
+			manifest := j.manifests[record.status.ID]
+			if manifest == nil {
+				return total, false
+			}
+			for _, page := range manifest.segments {
+				if !add(len(page)) {
+					return total, false
+				}
+			}
+		}
+		if record.status.CoordinatorState == CoordinatorCommitted ||
+			record.status.CoordinatorState == CoordinatorAborted {
+			payload := 0
+			if record.hasManifest {
+				payload = manifestDescriptorBytes
+			}
+			if !add(payload) {
+				return total, false
+			}
+		}
+	}
+	for _, record := range j.participants {
+		if record == nil || !add(len(record.stage)) {
+			return total, false
+		}
+		if record.status.ParticipantState == ParticipantAborted ||
+			record.status.ParticipantState == ParticipantReleased {
+			continue
+		}
+		transitions := int(record.status.Revision) - 1
+		for range transitions {
+			if !add(0) {
+				return total, false
+			}
+		}
+	}
+	return total, true
+}
+
 // Compact rewrites the journal's current authoritative state into one
 // canonical generation and atomically installs it at the original path.
 //

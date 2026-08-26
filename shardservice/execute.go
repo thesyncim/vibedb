@@ -824,6 +824,10 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	if err != nil {
 		return transactionError(err)
 	}
+	if status.CoordinatorState == distributedtxn.CoordinatorRetired ||
+		status.ParticipantState == distributedtxn.ParticipantReleased {
+		c.server.scheduleJournalCompaction()
+	}
 	return transactionStatusResponse(status)
 }
 

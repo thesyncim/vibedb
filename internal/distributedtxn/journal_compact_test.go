@@ -63,6 +63,11 @@ func TestJournalCompactReclaimsRetiredManifestAndReopensExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	opportunity := j.CompactionOpportunity()
+	if !opportunity.Recommended || opportunity.RetainedBytes != uint64(before.Size()) ||
+		opportunity.CompactedBytes == 0 || opportunity.ReclaimableBytes < MinimumJournalCompactionReclaimBytes {
+		t.Fatalf("compaction opportunity = %+v", opportunity)
+	}
 	if err = j.Compact(); err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +84,10 @@ func TestJournalCompactReclaimsRetiredManifestAndReopensExact(t *testing.T) {
 	}
 	if usage.ActiveManifestBytes != 0 || usage.ControlReserveBytes != 0 {
 		t.Fatalf("terminal compacted usage = %+v", usage)
+	}
+	if opportunity = j.CompactionOpportunity(); opportunity.Recommended ||
+		opportunity.ReclaimableBytes != 0 || opportunity.CompactedBytes != usage.RetainedBytes {
+		t.Fatalf("post-compact opportunity = %+v usage=%+v", opportunity, usage)
 	}
 	if got, err := j.StageManifestCoordinator(coordinatorRaw); err != nil || got != retired {
 		t.Fatalf("retired coordinator retry = %+v, %v", got, err)

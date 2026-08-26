@@ -155,6 +155,9 @@ type Server struct {
 	// closes the server and then the database underneath it must know no
 	// connection is still executing.
 	wg sync.WaitGroup
+
+	journalCompact chan struct{}
+	maintenanceWG  sync.WaitGroup
 }
 
 // NewServer builds a shard server over db that owns the identity in cfg. The
@@ -256,7 +259,7 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 		)
 	}
 	baseCtx, cancel := context.WithCancel(context.Background())
-	return &Server{
+	server := &Server{
 		db:         db,
 		claim:      claim,
 		journal:    journal,
@@ -265,15 +268,20 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 			MaxMailboxes:           opts.MaxExchangeMailboxes,
 			MaxReservedBufferBytes: opts.MaxExchangeBufferBytes,
 		}),
-		hotRecorder: opts.HotRecorder,
-		ownership:   cfg,
-		opts:        opts,
-		baseCtx:     baseCtx,
-		cancel:      cancel,
-		conns:       map[net.Conn]struct{}{},
-		listeners:   map[net.Listener]struct{}{},
-		closeDone:   make(chan struct{}),
-	}, nil
+		hotRecorder:    opts.HotRecorder,
+		ownership:      cfg,
+		opts:           opts,
+		baseCtx:        baseCtx,
+		cancel:         cancel,
+		conns:          map[net.Conn]struct{}{},
+		listeners:      map[net.Listener]struct{}{},
+		closeDone:      make(chan struct{}),
+		journalCompact: make(chan struct{}, 1),
+	}
+	server.maintenanceWG.Add(1)
+	go server.runJournalCompactor()
+	server.scheduleJournalCompaction()
+	return server, nil
 }
 
 var (
@@ -423,6 +431,7 @@ func (s *Server) Close() error {
 		_ = c.Close()
 	}
 	s.wg.Wait()
+	s.maintenanceWG.Wait()
 	err = errors.Join(err, s.journal.Close(), s.claim.Close())
 	s.mu.Lock()
 	s.closeErr = err
