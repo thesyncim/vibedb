@@ -262,6 +262,18 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	if created, err := userCollection.Put([]byte("right"), right); err != nil || created {
 		t.Fatalf("restore post-seal replacement created=%v err=%v", created, err)
 	}
+	// Exact-generation fencing intentionally remains poisoned after a bytewise
+	// restore. Crash recovery performs the one cold O(rows) audit and remints a
+	// durable image identity; activation itself must not scan.
+	beforeReopenScans := userCollection.Stats().SnapshotFullScanCalls
+	stage, err = NewChildStage(partitioner, set.Children[1], userCollection, persisted)
+	if err != nil {
+		t.Fatalf("reopen sealed stage: %v", err)
+	}
+	afterReopenScans := userCollection.Stats().SnapshotFullScanCalls
+	if afterReopenScans != beforeReopenScans+1 {
+		t.Fatalf("reopen scans=%d, want exactly one", afterReopenScans-beforeReopenScans)
+	}
 	wrong := target
 	wrong.Binding.AllocationGeneration++
 	if _, _, _, err := stage.InitializeReplicatedChild(
@@ -269,6 +281,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	); !errors.Is(err, ErrChildStage) || systemCollection.Len() != 0 {
 		t.Fatalf("wrong target err=%v systemRows=%d", err, systemCollection.Len())
 	}
+	beforeActivationScans := userCollection.Stats().SnapshotFullScanCalls
 	machine, base, manifest, err := stage.InitializeReplicatedChild(certificate, target)
 	if err != nil {
 		t.Fatal(err)
@@ -277,6 +290,9 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	if err != nil || retryMachine.Published().DataChainDigest != machine.Published().DataChainDigest ||
 		retryManifest.Digest != manifest.Digest || !proto.Equal(base, retryBase) {
 		t.Fatalf("retry manifest=%x baseEqual=%v err=%v", retryManifest.Digest, proto.Equal(base, retryBase), err)
+	}
+	if scans := userCollection.Stats().SnapshotFullScanCalls - beforeActivationScans; scans != 0 {
+		t.Fatalf("activation scanned child image %d times", scans)
 	}
 	opened, err := replicatedstate.OpenSnapshotBase(base)
 	if err != nil || opened.Manifest.State.Binding != binding || manifest.UserRows != 1 ||
@@ -289,5 +305,17 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	}
 	if _, err := machine.InstallSnapshot(base); err != nil {
 		t.Fatal(err)
+	}
+	beforeMachineReopenScans := userCollection.Stats().SnapshotFullScanCalls
+	reopened, err := replicatedstate.Open(
+		binding, bootstrap, system,
+		replicatedstate.UserCollection{Name: "docs", Target: user},
+		txnLog, target.MachineOptions,
+	)
+	if err != nil || reopened.Published().DataChainDigest != machine.Published().DataChainDigest {
+		t.Fatalf("reopen activated child publication=%+v err=%v", reopened, err)
+	}
+	if scans := userCollection.Stats().SnapshotFullScanCalls - beforeMachineReopenScans; scans != 1 {
+		t.Fatalf("activated child reopen scans=%d, want one validation pass", scans)
 	}
 }

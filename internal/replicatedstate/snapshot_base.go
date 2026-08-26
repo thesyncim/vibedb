@@ -259,7 +259,9 @@ func (m *Machine) BuildBundleSnapshotBase() (
 		if !exists || snapshot == nil || snapshot.Generation() == 0 {
 			return nil, SnapshotArtifactManifest{}, m.fail(ErrInconsistentSnapshot)
 		}
-		digest, digestErr := openedRelationImageDigest(relation, snapshot)
+		digest, _, digestErr := openedRelationImageDigest(
+			relation, snapshot, state.Binding.OwnedRange,
+		)
 		if digestErr != nil {
 			return nil, SnapshotArtifactManifest{}, m.fail(digestErr)
 		}

@@ -224,6 +224,14 @@ type OwnershipPointValidator interface {
 	ValidatePointOwnership(key []byte, owned distribution.KeyRange) MutationValidation
 }
 
+// GlobalIndexPlacementValidator exposes the canonical point parser and
+// immutable physical range authenticated by a relation's ValidationDigest.
+// Relations without it remain usable but cannot issue O(1) split proofs.
+type GlobalIndexPlacementValidator interface {
+	GlobalIndexPlacementPoint(key []byte) (distribution.KeyspacePoint, bool)
+	GlobalIndexPlacementRange() distribution.KeyRange
+}
+
 // AttemptedMutationKeys is an opaque view of the exact distinct user keys in
 // one planned durable transition. Key bytes are borrowed and remain valid only
 // for the synchronous observer call.

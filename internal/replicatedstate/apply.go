@@ -890,6 +890,7 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ExecutionPinRecordCount:    m.state.ExecutionPinRecordCount,
 		ActiveExecutionPinCount:    m.state.ActiveExecutionPinCount,
 		ExecutionPinResidentBytes:  m.state.ExecutionPinResidentBytes,
+		RelationPlacementDigest:    m.state.RelationPlacementDigest,
 	}
 }
 
@@ -2324,6 +2325,13 @@ func (m *Machine) persistTransitionRows(
 	transactionRows []transactionRowMutation,
 ) error {
 	defer m.releaseCaptureChanges()
+	nextPlacements, err := m.nextRelationPlacements(changes, plan)
+	if err != nil {
+		return err
+	}
+	next.RelationPlacementDigest = relationPlacementStateDigestWith(
+		next.Binding.SchemaGeneration, m.manifestDigest, m.relations, &nextPlacements,
+	)
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
@@ -2523,6 +2531,14 @@ func (m *Machine) persistTransitionRows(
 			relation.openedGen = 0
 			relation.openedImage = [sha256.Size]byte{}
 		}
+	}
+	for i := range m.relations {
+		if m.relations[i].kind != RelationGlobalIndex {
+			continue
+		}
+		m.relations[i].placement = nextPlacements[i]
+		m.relations[i].placementApplied = next.Applied
+		m.relations[i].placementGen = m.relations[i].target.Collection.Generation()
 	}
 	m.state = next
 	if m.binding.Distribution != next.Binding.Distribution {

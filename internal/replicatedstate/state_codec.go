@@ -14,12 +14,13 @@ import (
 )
 
 const (
-	stateCodecFormat              = uint16(2)
-	stateHeaderBytes              = 400
-	stateTransactionHeaderBytes   = 440
-	stateRequestLedgerHeaderBytes = 480
-	stateExecutionPinHeaderBytes  = 504
-	recordChecksumLen             = sha256.Size
+	stateCodecFormat                  = uint16(2)
+	stateHeaderBytes                  = 400
+	stateTransactionHeaderBytes       = 440
+	stateRequestLedgerHeaderBytes     = 480
+	stateExecutionPinHeaderBytes      = 504
+	stateRelationPlacementHeaderBytes = 536
+	recordChecksumLen                 = sha256.Size
 )
 
 var (
@@ -91,6 +92,10 @@ type State struct {
 	ExecutionPinRecordCount   uint64
 	ActiveExecutionPinCount   uint64
 	ExecutionPinResidentBytes uint64
+	// RelationPlacementDigest authenticates the fixed-size incremental image
+	// accumulators for every placement-capable global-index relation. Zero means
+	// the opened bundle exposes no such relation contract.
+	RelationPlacementDigest [sha256.Size]byte
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -106,7 +111,9 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
 	headerBytes := stateHeaderBytes
-	if stateHasExecutionPins(state) {
+	if stateHasRelationPlacement(state) {
+		headerBytes = stateRelationPlacementHeaderBytes
+	} else if stateHasExecutionPins(state) {
 		headerBytes = stateExecutionPinHeaderBytes
 	} else if stateHasRequestLedger(state) {
 		headerBytes = stateRequestLedgerHeaderBytes
@@ -179,10 +186,13 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 		binary.LittleEndian.PutUint64(frame[464:472], state.RequestLedgerAckRows)
 		binary.LittleEndian.PutUint64(frame[472:480], state.RequestLedgerAckBytes)
 	}
-	if headerBytes == stateExecutionPinHeaderBytes {
+	if headerBytes >= stateExecutionPinHeaderBytes {
 		binary.LittleEndian.PutUint64(frame[480:488], state.ExecutionPinRecordCount)
 		binary.LittleEndian.PutUint64(frame[488:496], state.ActiveExecutionPinCount)
 		binary.LittleEndian.PutUint64(frame[496:504], state.ExecutionPinResidentBytes)
+	}
+	if headerBytes == stateRelationPlacementHeaderBytes {
+		copy(frame[504:536], state.RelationPlacementDigest[:])
 	}
 	cursor := headerBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
@@ -202,7 +212,8 @@ func OpenState(src []byte) (State, error) {
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
 		(headerBytes != stateHeaderBytes && headerBytes != stateTransactionHeaderBytes &&
 			headerBytes != stateRequestLedgerHeaderBytes &&
-			headerBytes != stateExecutionPinHeaderBytes) ||
+			headerBytes != stateExecutionPinHeaderBytes &&
+			headerBytes != stateRelationPlacementHeaderBytes) ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
@@ -275,12 +286,18 @@ func OpenState(src []byte) (State, error) {
 			return State{}, fmt.Errorf("%w: noncanonical empty request-ledger extension", ErrStateCorrupt)
 		}
 	}
-	if headerBytes == stateExecutionPinHeaderBytes {
+	if headerBytes >= stateExecutionPinHeaderBytes {
 		state.ExecutionPinRecordCount = binary.LittleEndian.Uint64(src[480:488])
 		state.ActiveExecutionPinCount = binary.LittleEndian.Uint64(src[488:496])
 		state.ExecutionPinResidentBytes = binary.LittleEndian.Uint64(src[496:504])
-		if !stateHasExecutionPins(state) {
+		if headerBytes == stateExecutionPinHeaderBytes && !stateHasExecutionPins(state) {
 			return State{}, fmt.Errorf("%w: noncanonical empty execution-pin extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes == stateRelationPlacementHeaderBytes {
+		copy(state.RelationPlacementDigest[:], src[504:536])
+		if !stateHasRelationPlacement(state) {
+			return State{}, fmt.Errorf("%w: empty relation placement extension", ErrStateCorrupt)
 		}
 	}
 	cursor := headerBytes
@@ -457,7 +474,12 @@ func equalState(left, right State) bool {
 		left.ExecutionPinRecordCount == right.ExecutionPinRecordCount &&
 		left.ActiveExecutionPinCount == right.ActiveExecutionPinCount &&
 		left.ExecutionPinResidentBytes == right.ExecutionPinResidentBytes &&
+		left.RelationPlacementDigest == right.RelationPlacementDigest &&
 		proto.Equal(left.ConfState, right.ConfState)
+}
+
+func stateHasRelationPlacement(state State) bool {
+	return state.RelationPlacementDigest != ([sha256.Size]byte{})
 }
 
 func stateHasRequestLedger(state State) bool {

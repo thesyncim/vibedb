@@ -119,7 +119,8 @@ func (c ChildStageCursor) LastBatchDigest() [sha256.Size]byte {
 	return c.lastBatchDigest
 }
 
-// ImageProof returns the exact ordered final child image recorded at seal.
+// ImageProof returns the exact order-independent final child image commitment
+// recorded at seal.
 func (c ChildStageCursor) ImageProof() (
 	rows, bytes uint64,
 	digest [sha256.Size]byte,

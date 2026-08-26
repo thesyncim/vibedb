@@ -672,7 +672,9 @@ func replicatedApplyRelations(
 			spec.Target.ValidationDigest = replicatedGlobalIndexValidationDigest(
 				base, relation, logicalManifest,
 			)
-			spec.Target.Validator = replicatedGlobalIndexMutationValidator{relation: relation}
+			spec.Target.Validator = replicatedGlobalIndexMutationValidator{
+				relation: relation, placement: apply.Placement.Range,
+			}
 			spec.GlobalIndex = replicatedstate.GlobalIndexProfile{
 				IndexID: relation.IndexID, Incarnation: relation.Incarnation,
 				LocatorCount: relation.LocatorCount, Unique: relation.Unique,
@@ -777,14 +779,19 @@ func replicatedGlobalIndexValidationDigest(
 }
 
 type replicatedGlobalIndexMutationValidator struct {
-	relation ReplicatedShardRelationIdentity
+	relation  ReplicatedShardRelationIdentity
+	placement distribution.KeyRange
 }
 
 func (v replicatedGlobalIndexMutationValidator) ValidatePut(
 	key, _ []byte,
 ) replicatedstate.MutationValidation {
-	if _, ok := v.relation.GlobalIndexStorageKeyPoint(key); !ok {
+	point, ok := v.relation.GlobalIndexStorageKeyPoint(key)
+	if !ok {
 		return replicatedstate.MutationValidationInvalid
+	}
+	if !v.placement.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
 	}
 	return replicatedstate.MutationValidationAccept
 }
@@ -792,10 +799,46 @@ func (v replicatedGlobalIndexMutationValidator) ValidatePut(
 func (v replicatedGlobalIndexMutationValidator) ValidateDelete(
 	key, _ []byte, _ bool,
 ) replicatedstate.MutationValidation {
-	if _, ok := v.relation.GlobalIndexStorageKeyPoint(key); !ok {
+	return v.ValidatePut(key, nil)
+}
+
+func (v replicatedGlobalIndexMutationValidator) ValidatePutOwnership(
+	key, _ []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	point, ok := v.relation.GlobalIndexStorageKeyPoint(key)
+	if !ok {
 		return replicatedstate.MutationValidationInvalid
 	}
+	if !owned.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
+	}
 	return replicatedstate.MutationValidationAccept
+}
+
+func (v replicatedGlobalIndexMutationValidator) ValidateDeleteOwnership(
+	key, _ []byte,
+	_ bool,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	return v.ValidatePutOwnership(key, nil, owned)
+}
+
+func (v replicatedGlobalIndexMutationValidator) ValidatePointOwnership(
+	key []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	return v.ValidatePutOwnership(key, nil, owned)
+}
+
+func (v replicatedGlobalIndexMutationValidator) GlobalIndexPlacementPoint(
+	key []byte,
+) (distribution.KeyspacePoint, bool) {
+	return v.relation.GlobalIndexStorageKeyPoint(key)
+}
+
+func (v replicatedGlobalIndexMutationValidator) GlobalIndexPlacementRange() distribution.KeyRange {
+	return v.placement
 }
 
 // prepareReplicatedApplyStorageLocked makes the hidden participant and its

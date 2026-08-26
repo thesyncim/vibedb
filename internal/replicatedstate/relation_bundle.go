@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"math"
+	"math/bits"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -60,16 +62,19 @@ type RelationCollection struct {
 }
 
 type relationCollection struct {
-	id            replication.RelationID
-	kind          RelationKind
-	name          string
-	target        CollectionTarget
-	localIndexes  []store.IndexDefinition
-	globalIndex   GlobalIndexProfile
-	contract      [sha256.Size]byte
-	openedImage   [sha256.Size]byte
-	openedApplied uint64
-	openedGen     uint64
+	id               replication.RelationID
+	kind             RelationKind
+	name             string
+	target           CollectionTarget
+	localIndexes     []store.IndexDefinition
+	globalIndex      GlobalIndexProfile
+	contract         [sha256.Size]byte
+	openedImage      [sha256.Size]byte
+	openedApplied    uint64
+	openedGen        uint64
+	placement        relationPlacementAccumulator
+	placementApplied uint64
+	placementGen     uint64
 }
 
 var relationManifestDigestDomain = []byte(
@@ -311,27 +316,137 @@ func validateRelationIndexCatalog(
 func openedRelationImageDigest(
 	relation *relationCollection,
 	snapshot *durable.Snapshot,
-) ([sha256.Size]byte, error) {
+	owned distribution.KeyRange,
+) ([sha256.Size]byte, relationPlacementAccumulator, error) {
 	if relation == nil || snapshot == nil {
-		return [sha256.Size]byte{}, ErrInvalidCollection
+		return [sha256.Size]byte{}, relationPlacementAccumulator{}, ErrInvalidCollection
 	}
 	h, err := newCanonicalImageHasher(
 		relation.name, relation.target.Validation,
 		relation.target.ValidationDigest, relation.target.Validator,
 	)
 	if err != nil {
-		return [sha256.Size]byte{}, err
+		return [sha256.Size]byte{}, relationPlacementAccumulator{}, err
 	}
+	placementValidator, placementEnabled :=
+		relation.target.Validator.(GlobalIndexPlacementValidator)
+	placementRange := owned
+	if placementEnabled {
+		placementRange = placementValidator.GlobalIndexPlacementRange()
+		if !placementRange.Valid() {
+			return [sha256.Size]byte{}, relationPlacementAccumulator{}, ErrSchemaProfile
+		}
+	}
+	placement := newRelationPlacementAccumulator(placementRange, placementEnabled)
 	if err := snapshot.RangeRaw(func(key, value []byte) error {
 		if relation.kind == RelationGlobalIndex &&
 			!validGlobalIndexLocator(value, relation.globalIndex.LocatorCount) {
 			return ErrSchemaProfile
 		}
+		if relation.kind == RelationGlobalIndex && placementEnabled {
+			point, ok := placementValidator.GlobalIndexPlacementPoint(key)
+			if !ok {
+				return ErrSchemaProfile
+			}
+			placement.addRaw(point, key, value)
+		}
 		return h.add(key, value)
 	}); err != nil {
-		return [sha256.Size]byte{}, err
+		return [sha256.Size]byte{}, relationPlacementAccumulator{}, err
 	}
-	return h.sum(), nil
+	return h.sum(), placement, nil
+}
+
+var certifiedIncrementalRowDomain = []byte("vibedb/range-split/child-stage-row\x00")
+var certifiedIncrementalEmptyDomain = []byte("vibedb/range-split/child-stage-empty\x00")
+
+// openedRelationImageDigests validates each row once while deriving both the
+// ordinary ordered digest and the constant-space split-import root. The latter
+// is used only to authenticate an untouched imported split child at reopen.
+func openedRelationImageDigests(
+	relation *relationCollection,
+	snapshot *durable.Snapshot,
+	owned distribution.KeyRange,
+) (
+	ordered, incremental [sha256.Size]byte,
+	placement relationPlacementAccumulator,
+	err error,
+) {
+	if relation == nil || snapshot == nil {
+		return ordered, incremental, placement, ErrInvalidCollection
+	}
+	canonical, err := newCanonicalImageHasher(
+		relation.name, relation.target.Validation,
+		relation.target.ValidationDigest, relation.target.Validator,
+	)
+	if err != nil {
+		return ordered, incremental, placement, err
+	}
+	placementValidator, placementEnabled :=
+		relation.target.Validator.(GlobalIndexPlacementValidator)
+	placementRange := owned
+	if placementEnabled {
+		placementRange = placementValidator.GlobalIndexPlacementRange()
+		if !placementRange.Valid() {
+			return ordered, incremental, placement, ErrSchemaProfile
+		}
+	}
+	placement = newRelationPlacementAccumulator(placementRange, placementEnabled)
+	rowHasher := sha256.New()
+	var size [8]byte
+	err = snapshot.RangeRaw(func(key, value []byte) error {
+		if relation.kind == RelationGlobalIndex &&
+			!validGlobalIndexLocator(value, relation.globalIndex.LocatorCount) {
+			return ErrSchemaProfile
+		}
+		if relation.kind == RelationGlobalIndex && placementEnabled {
+			point, ok := placementValidator.GlobalIndexPlacementPoint(key)
+			if !ok {
+				return ErrSchemaProfile
+			}
+			placement.addRaw(point, key, value)
+		}
+		if err := canonical.add(key, value); err != nil {
+			return err
+		}
+		row := certifiedIncrementalRowDigest(rowHasher, &size, key, value)
+		addCertifiedIncrementalDigest(&incremental, row)
+		return nil
+	})
+	if err != nil {
+		return ordered, [sha256.Size]byte{}, relationPlacementAccumulator{}, err
+	}
+	if snapshot.Len() == 0 {
+		incremental = sha256.Sum256(certifiedIncrementalEmptyDomain)
+	}
+	return canonical.sum(), incremental, placement, nil
+}
+
+func certifiedIncrementalRowDigest(
+	h hash.Hash, size *[8]byte, key, value []byte,
+) [sha256.Size]byte {
+	h.Reset()
+	_, _ = h.Write(certifiedIncrementalRowDomain)
+	writeHashFrame(h, key)
+	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = h.Write(size[:])
+	valueDigest := sha256.Sum256(value)
+	_, _ = h.Write(valueDigest[:])
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
+
+func addCertifiedIncrementalDigest(target *[sha256.Size]byte, value [sha256.Size]byte) {
+	carry := uint64(0)
+	for offset := 0; offset < sha256.Size; offset += 8 {
+		next, nextCarry := bits.Add64(
+			binary.LittleEndian.Uint64(target[offset:offset+8]),
+			binary.LittleEndian.Uint64(value[offset:offset+8]), carry,
+		)
+		binary.LittleEndian.PutUint64(target[offset:offset+8], next)
+		carry = nextCarry
+	}
 }
 
 func canonicalRelationImageDigest(

@@ -387,8 +387,34 @@ func (m *Machine) ApplyNormalBatch(
 		planned++
 	}
 	var finalizeErr error
+	var nextPlacements [replication.MaxRelationsPerBundle]relationPlacementAccumulator
 	if planned != 0 {
-		batch.state, finalizeErr = AppendState(batch.state[:0], working)
+		for ordinal := range m.relations {
+			nextPlacements[ordinal] = m.relations[ordinal].placement
+			if m.relations[ordinal].kind != RelationGlobalIndex ||
+				!m.relations[ordinal].placement.enabled {
+				continue
+			}
+			validator, ok := m.relations[ordinal].target.Validator.(GlobalIndexPlacementValidator)
+			if !ok {
+				finalizeErr = ErrSchemaProfile
+				break
+			}
+			if err := batch.relationOverlay(ordinal).updateRelationPlacement(
+				validator, &nextPlacements[ordinal],
+			); err != nil {
+				finalizeErr = err
+				break
+			}
+		}
+		if finalizeErr == nil {
+			working.RelationPlacementDigest = relationPlacementStateDigestWith(
+				working.Binding.SchemaGeneration, m.manifestDigest, m.relations, &nextPlacements,
+			)
+		}
+		if finalizeErr == nil {
+			batch.state, finalizeErr = AppendState(batch.state[:0], working)
+		}
 		if finalizeErr == nil && len(batch.state) != stateEnvelopeBytes {
 			finalizeErr = fmt.Errorf(
 				"%w: normal state envelope changed size", ErrStateCorrupt,
@@ -412,7 +438,6 @@ func (m *Machine) ApplyNormalBatch(
 		}
 		return 0, raftmodel.Publication{}, m.fail(deferredErr)
 	}
-
 	m.transitionMembers = m.transitionMembers[:0]
 	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
@@ -500,6 +525,15 @@ func (m *Machine) ApplyNormalBatch(
 			m.relations[ordinal].openedGen = 0
 		}
 	}
+	for ordinal := range m.relations {
+		if m.relations[ordinal].kind != RelationGlobalIndex {
+			continue
+		}
+		m.relations[ordinal].placement = nextPlacements[ordinal]
+		m.relations[ordinal].placementApplied = working.Applied
+		m.relations[ordinal].placementGen =
+			m.relations[ordinal].target.Collection.Generation()
+	}
 	m.state = working
 	m.initialized = true
 	m.publication = publicationFromState(working)
@@ -536,6 +570,7 @@ func (m *Machine) nextBatchState(
 		ExecutionPinRecordCount:    current.ExecutionPinRecordCount,
 		ActiveExecutionPinCount:    current.ActiveExecutionPinCount,
 		ExecutionPinResidentBytes:  current.ExecutionPinResidentBytes,
+		RelationPlacementDigest:    current.RelationPlacementDigest,
 	}
 }
 

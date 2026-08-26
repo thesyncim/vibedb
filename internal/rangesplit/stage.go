@@ -45,11 +45,15 @@ type ChildStage struct {
 	expected    ChildArtifactManifest
 	collection  *durable.Collection
 	cursor      *ChildStageCursor
-	// sealedVerified records the full image proof performed either while the
-	// sealed cursor was reopened or immediately before that cursor was durably
-	// published. Activation reuses this authenticated proof instead of scanning
-	// the same child-stage image a second time.
+	// sealedVerified records either the incremental proof completed at seal or
+	// the full recovery audit performed while reopening a sealed cursor.
+	// Activation reuses that proof instead of scanning the image again.
 	sealedVerified bool
+	// sealedRoot is the order-independent logical image root authenticated by
+	// imageDigest. sealedIdentity fences that proof to the exact durable store
+	// generation and rooted physical graph through activation.
+	sealedRoot     [sha256.Size]byte
+	sealedIdentity durable.ImageIdentity
 
 	checkpointBytes uint64
 	persistedOffset uint64
@@ -116,7 +120,14 @@ func NewChildStageWithOptions(
 		if cursor.phase == ChildStageSealed && stage.verifySealedImage(cursor) != nil {
 			return nil, ErrChildStage
 		}
-		stage.sealedVerified = cursor.phase == ChildStageSealed
+		if cursor.phase == ChildStageSealed {
+			identity, ok := collection.DurableImageIdentity()
+			if !ok {
+				return nil, ErrChildStage
+			}
+			stage.sealedIdentity = identity
+			stage.sealedVerified = true
+		}
 	}
 	return stage, nil
 }
@@ -315,6 +326,11 @@ func (s *ChildStage) ApplyTailBatch(
 		return err
 	}
 	if sealed {
+		identity, ok := s.collection.DurableImageIdentity()
+		if !ok {
+			return ErrChildStage
+		}
+		s.sealedIdentity = identity
 		s.sealedVerified = true
 	}
 	return nil

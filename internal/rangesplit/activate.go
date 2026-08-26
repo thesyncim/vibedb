@@ -45,10 +45,10 @@ func (s *ChildStage) InitializeReplicatedChild(
 	return prepared.Initialize()
 }
 
-// PrepareReplicatedChild authenticates the sealed child and performs the sole
-// replicated-state image audit without mutation. The returned preparation can
-// first be bound to a seeded checkpoint-group certificate, then finished
-// without another child-image or canonical-image scan.
+// PrepareReplicatedChild authenticates the sealed child and binds its already
+// audited stage commitment to the exact durable collection image in O(1). The
+// returned preparation can first be bound to a seeded checkpoint-group
+// certificate, then finished without a child-image or canonical-image scan.
 func (s *ChildStage) PrepareReplicatedChild(
 	certificate CutoverCertificate,
 	target ChildActivationTarget,
@@ -63,25 +63,24 @@ func (s *ChildStage) PrepareReplicatedChild(
 		target.User.Target.Collection != s.collection {
 		return nil, ErrChildStage
 	}
-	var imageAudit childStageSealedImageAudit
-	if err := imageAudit.begin(s, s.cursor); err != nil {
-		return nil, err
+	if s.sealedRoot == ([sha256.Size]byte{}) ||
+		!s.collection.MatchesDurableImage(s.sealedIdentity) {
+		return nil, ErrChildStage
 	}
-	defer imageAudit.close()
 	entryDigest := childActivationEntryDigest(
 		certificate, s.cursor.child, target.Binding,
 	)
-	return replicatedstate.PrepareStagedSnapshot(
+	return replicatedstate.PrepareStagedSnapshotFromCertifiedImage(
 		target.Binding, target.StaticBootstrap, target.System, target.User,
 		target.TxnLog, target.MachineOptions,
 		replicatedstate.StagedSnapshotCut{
 			Applied: certificate.cut.Applied, Term: certificate.cut.Term,
 			EntryDigest: entryDigest,
-			ImageAudit: replicatedstate.StagedSnapshotImageAudit{
-				Visit: imageAudit.visit, Finish: imageAudit.finish,
-			},
 		},
-		target.ArtifactOptions,
+		target.ArtifactOptions, replicatedstate.CertifiedStagedImage{
+			Rows: s.cursor.imageRows, ImageDigest: s.sealedRoot,
+			Identity: s.sealedIdentity,
+		},
 	)
 }
 
@@ -90,7 +89,7 @@ func (s *ChildStage) validActivationLocked(
 	binding replicatedstate.Binding,
 ) bool {
 	return s.validActivationCoordinatesLocked(certificate, binding) &&
-		s.sealedVerified
+		s.sealedVerified && s.collection.MatchesDurableImage(s.sealedIdentity)
 }
 
 // CheckActivationCoordinates validates the sealed cursor, cutover
@@ -106,7 +105,8 @@ func (s *ChildStage) CheckActivationCoordinates(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.sealedVerified || !s.validActivationCoordinatesLocked(certificate, binding) {
+	if !s.sealedVerified || !s.collection.MatchesDurableImage(s.sealedIdentity) ||
+		!s.validActivationCoordinatesLocked(certificate, binding) {
 		return ErrChildStage
 	}
 	return nil

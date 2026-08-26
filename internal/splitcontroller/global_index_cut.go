@@ -26,24 +26,48 @@ func (p *Plan) validateGlobalIndexCut(snapshot *replicatedstate.ReadSnapshot) er
 		snapshot.Fence().RelationManifestDigest != p.relationDigest {
 		return ErrTopologyConflict
 	}
+	var childRanges [autosplit.MaxSplitChildren]distribution.KeyRange
+	for child := 0; child < int(p.childCount); child++ {
+		childRanges[child] = p.children[child].Range
+	}
+	if !canonicalSplitCoverage(p.source.Range, childRanges[:p.childCount]) {
+		return ErrTopologyConflict
+	}
 	for index := range p.indexRelations {
 		relation := p.indexRelations[index]
-		rows, ok := snapshot.Relation(replication.RelationID(relation.Relation))
-		if !ok || rows == nil {
-			return ErrTopologyConflict
-		}
-		var childRanges [autosplit.MaxSplitChildren]distribution.KeyRange
-		for child := 0; child < int(p.childCount); child++ {
-			childRanges[child] = p.children[child].Range
-		}
-		err := validateGlobalIndexRows(
-			relation, p.source.Range, childRanges[:p.childCount], rows.RangeRaw,
+		_, err := snapshot.GlobalIndexPlacementProof(
+			replication.RelationID(relation.Relation), p.source.Range, [32]byte(p.operation),
 		)
 		if err != nil {
 			return errors.Join(ErrTopologyConflict, err)
 		}
 	}
 	return nil
+}
+
+// canonicalSplitCoverage proves once, independent of relation cardinality,
+// that the canonical child order partitions the exact source interval without
+// a gap, overlap, or extension.
+func canonicalSplitCoverage(
+	source distribution.KeyRange,
+	children []distribution.KeyRange,
+) bool {
+	if !source.Valid() || len(children) < 2 {
+		return false
+	}
+	next := source.Start
+	for index := range children {
+		child := children[index]
+		if !child.Valid() || child.Start != next || !source.Contains(child.Start) ||
+			child.End.Max && index != len(children)-1 {
+			return false
+		}
+		if child.End.Max {
+			return source.End.Max
+		}
+		next = child.End.Point
+	}
+	return !source.End.Max && next == source.End.Point
 }
 
 // validateGlobalIndexRows is kept separate from snapshot acquisition so the

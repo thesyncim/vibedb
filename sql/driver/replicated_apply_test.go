@@ -487,6 +487,31 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		!bytes.Equal(value, locator) {
 		t.Fatalf("global value = %q,%v,%v", value, found, err)
 	}
+	splitPlan := [sha256.Size]byte{1}
+	placementCut, err := claim.machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPlacementState := placementCut.State().RelationPlacementDigest
+	firstPlacementProof, proofErr := placementCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, splitPlan,
+	)
+	badRange := options.Placement.Range
+	badRange.Start[7]++
+	_, badRangeErr := placementCut.GlobalIndexPlacementProof(2, badRange, splitPlan)
+	_, zeroPlanErr := placementCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, [sha256.Size]byte{},
+	)
+	placementCloseErr := placementCut.Close()
+	if proofErr != nil || firstPlacementState == ([sha256.Size]byte{}) ||
+		firstPlacementProof == ([sha256.Size]byte{}) || badRangeErr == nil ||
+		zeroPlanErr == nil || placementCloseErr != nil {
+		t.Fatalf(
+			"global placement proof=%x state=%x proofErr=%v badRange=%v zeroPlan=%v close=%v",
+			firstPlacementProof, firstPlacementState, proofErr, badRangeErr, zeroPlanErr,
+			placementCloseErr,
+		)
+	}
 
 	conflictDocument := []byte(`{"email":"a","id":"doc-2"}`)
 	conflictKey := testReplicatedApplyKey(t, database, conflictDocument)
@@ -510,6 +535,23 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	if got := completionResultCode(t, claim, conflict); got != replicatedstate.ResultIndexConflict {
 		t.Fatalf("conflict result = %d", got)
+	}
+	conflictCut, err := claim.machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPlacementState := conflictCut.State().RelationPlacementDigest
+	secondPlacementProof, proofErr := conflictCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, splitPlan,
+	)
+	conflictCloseErr := conflictCut.Close()
+	if proofErr != nil || conflictCloseErr != nil ||
+		secondPlacementState != firstPlacementState ||
+		secondPlacementProof == firstPlacementProof {
+		t.Fatalf(
+			"conflict placement proof=%x state=%x proofErr=%v close=%v",
+			secondPlacementProof, secondPlacementState, proofErr, conflictCloseErr,
+		)
 	}
 	if _, found, err := baseCollection.AppendRaw(nil, conflictKey); err != nil || found {
 		t.Fatalf("conflicting base row escaped atomic bundle: found=%v err=%v", found, err)
@@ -625,6 +667,20 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	if reopenedGroup == nil || reopenedGroup.CheckpointAppliedIndex() != 4 {
 		t.Fatalf("reopened checkpoint cut = %v", reopenedGroup)
+	}
+	reopenedCut, err := reopenedClaim.machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedProof, proofErr := reopenedCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, splitPlan,
+	)
+	reopenedCloseErr := reopenedCut.Close()
+	if proofErr != nil || reopenedCloseErr != nil || reopenedProof != secondPlacementProof {
+		t.Fatalf(
+			"reopened placement proof=%x want=%x proofErr=%v close=%v",
+			reopenedProof, secondPlacementProof, proofErr, reopenedCloseErr,
+		)
 	}
 	recoveredCapture, err := reopenedClaim.BeginRangeSplitCapture(
 		replicatedApplyCapturePartitioner(t, base),

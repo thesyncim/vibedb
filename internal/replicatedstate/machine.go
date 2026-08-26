@@ -222,6 +222,7 @@ func OpenBundle(
 	if imageGeneration == 0 {
 		return nil, fmt.Errorf("%w: missing user image generation", ErrInconsistentSnapshot)
 	}
+	var importedIncrementalImage [sha256.Size]byte
 	for i := range m.relations {
 		snapshot, exists := cut.Collection(m.relations[i].name)
 		if !exists || snapshot == nil || snapshot.Generation() == 0 {
@@ -230,12 +231,24 @@ func OpenBundle(
 		if err := validateRelationIndexCatalog(snapshot, m.relations[i].localIndexes); err != nil {
 			return nil, fmt.Errorf("relation %d index catalog: %w", m.relations[i].id, err)
 		}
-		relationImage, relationErr := openedRelationImageDigest(&m.relations[i], snapshot)
+		var relationImage [sha256.Size]byte
+		var placement relationPlacementAccumulator
+		var relationErr error
+		if len(m.relations) == 1 {
+			relationImage, importedIncrementalImage, placement, relationErr =
+				openedRelationImageDigests(&m.relations[i], snapshot, binding.OwnedRange)
+		} else {
+			relationImage, placement, relationErr = openedRelationImageDigest(
+				&m.relations[i], snapshot, binding.OwnedRange,
+			)
+		}
 		if relationErr != nil {
 			return nil, fmt.Errorf("relation %d image: %w", m.relations[i].id, relationErr)
 		}
 		m.relations[i].openedImage = relationImage
 		m.relations[i].openedGen = snapshot.Generation()
+		m.relations[i].placement = placement
+		m.relations[i].placementGen = snapshot.Generation()
 	}
 	imageDigest, err := canonicalRelationImageDigest(m.relations)
 	if err != nil {
@@ -281,11 +294,15 @@ func OpenBundle(
 			ApplyContractDigest: prepared.applyContract,
 			ConfState:           new(pb.ConfState), BootstrapDigest: bootstrapDigest,
 		}
+		m.state.RelationPlacementDigest = relationPlacementStateDigest(
+			binding.SchemaGeneration, m.manifestDigest, m.relations,
+		)
 		m.publication = raftmodel.Publication{DataChainDigest: seedDigest, ConfState: new(pb.ConfState)}
 		m.openedImageDigest = imageDigest
 		m.openedImageGeneration = imageGeneration
 		for i := range m.relations {
 			m.relations[i].openedApplied = 0
+			m.relations[i].placementApplied = 0
 		}
 		m.routeGate = openedRouteGate
 		return m, nil
@@ -326,12 +343,24 @@ func OpenBundle(
 		state.ApplyContractDigest != prepared.applyContract ||
 		state.SessionCount != sessionCount || state.SessionSlotCount != slotCount ||
 		state.AuthorityBindingCount != authorityCount ||
+		state.RelationPlacementDigest != relationPlacementStateDigest(
+			state.Binding.SchemaGeneration, m.manifestDigest, m.relations,
+		) ||
 		state.SessionCount > options.MaxSessions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
 	}
-	if (state.LastKind == RecordStaticSnapshot || state.LastKind == RecordImportedSnapshot) &&
-		state.DataChainDigest != seedDigest {
+	if state.LastKind == RecordStaticSnapshot && state.DataChainDigest != seedDigest {
 		return nil, fmt.Errorf("%w: persisted base data-chain seed", ErrStateCorrupt)
+	}
+	if state.LastKind == RecordImportedSnapshot && state.DataChainDigest != seedDigest {
+		incrementalSeed, incrementalErr := dataChainSeedDigest(
+			prepared.applyContract, importedIncrementalImage,
+		)
+		if incrementalErr != nil || state.DataChainDigest != incrementalSeed {
+			return nil, fmt.Errorf("%w: persisted imported data-chain seed", ErrStateCorrupt)
+		}
+		imageDigest = importedIncrementalImage
+		m.relations[0].openedImage = importedIncrementalImage
 	}
 	if state.LastKind == RecordStaticSnapshot &&
 		(state.LastEntryDigest != bootstrapDigest ||
@@ -344,6 +373,7 @@ func OpenBundle(
 	m.openedImageGeneration = imageGeneration
 	for i := range m.relations {
 		m.relations[i].openedApplied = state.Applied
+		m.relations[i].placementApplied = state.Applied
 	}
 	m.binding = state.Binding
 	m.distribution = []byte(state.Binding.Distribution)

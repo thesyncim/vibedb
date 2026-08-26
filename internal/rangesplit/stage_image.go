@@ -15,6 +15,7 @@ import (
 var (
 	childStageImageDomain = []byte("vibedb/range-split/child-stage-image\x00")
 	childStageRowDomain   = []byte("vibedb/range-split/child-stage-row\x00")
+	childStageEmptyDomain = []byte("vibedb/range-split/child-stage-empty\x00")
 )
 
 // childStageImageAccumulator is a constant-space authenticated multiset of
@@ -48,12 +49,6 @@ type childStageImageScan struct {
 	workspace   *childStageImageWorkspace
 	cursor      *ChildStageCursor
 	accumulator childStageImageAccumulator
-}
-
-type childStageSealedImageAudit struct {
-	stage  *ChildStage
-	cursor *ChildStageCursor
-	active bool
 }
 
 func (s *ChildStage) accumulateArtifactRows(cursor *ChildStageCursor, rows ChildArtifactRows) error {
@@ -194,6 +189,10 @@ func (s *ChildStage) sealAccumulatedImage(cursor *ChildStageCursor) error {
 		return ErrChildStage
 	}
 	root := cursor.imageDigest
+	if cursor.imageRows == 0 {
+		root = sha256.Sum256(childStageEmptyDomain)
+	}
+	s.sealedRoot = root
 	cursor.imageDigest = s.terminalImageDigest(cursor, root)
 	if cursor.imageDigest == ([sha256.Size]byte{}) {
 		return ErrChildStage
@@ -286,11 +285,16 @@ func (s *ChildStage) finishImageProof() error {
 	}
 	cursor, accumulator := scan.cursor, scan.accumulator
 	scan.stage, scan.workspace, scan.cursor = nil, nil, nil
-	got := s.terminalImageDigest(cursor, accumulator.root)
+	root := accumulator.root
+	if accumulator.rows == 0 {
+		root = sha256.Sum256(childStageEmptyDomain)
+	}
+	got := s.terminalImageDigest(cursor, root)
 	if accumulator.rows != cursor.imageRows || accumulator.bytes != cursor.imageBytes ||
 		got != cursor.imageDigest {
 		return ErrChildStage
 	}
+	s.sealedRoot = root
 	return nil
 }
 
@@ -299,44 +303,6 @@ func (s *ChildStage) cancelImageProof() {
 		return
 	}
 	s.image.scan.stage, s.image.scan.workspace, s.image.scan.cursor = nil, nil, nil
-}
-
-func (a *childStageSealedImageAudit) begin(stage *ChildStage, cursor *ChildStageCursor) error {
-	if a == nil || stage == nil || cursor == nil || a.active {
-		return ErrChildStage
-	}
-	if err := stage.beginImageProof(cursor); err != nil {
-		return err
-	}
-	a.stage, a.cursor, a.active = stage, cursor, true
-	return nil
-}
-
-func (a *childStageSealedImageAudit) visit(key, value []byte) error {
-	if a == nil || !a.active || a.stage == nil || a.cursor == nil {
-		return ErrChildStage
-	}
-	return a.stage.image.scan.visitRow(key, value)
-}
-
-func (a *childStageSealedImageAudit) finish() error {
-	if a == nil || !a.active || a.stage == nil || a.cursor == nil {
-		return ErrChildStage
-	}
-	stage := a.stage
-	err := stage.finishImageProof()
-	a.stage, a.cursor, a.active = nil, nil, false
-	return err
-}
-
-func (a *childStageSealedImageAudit) close() {
-	if a == nil {
-		return
-	}
-	if a.active && a.stage != nil {
-		a.stage.cancelImageProof()
-	}
-	a.stage, a.cursor, a.active = nil, nil, false
 }
 
 func (s *childStageImageScan) visitRow(key, document []byte) error {

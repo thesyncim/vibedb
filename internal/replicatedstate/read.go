@@ -943,7 +943,7 @@ func (s *ReadSnapshot) CanonicalImageDigest() ([32]byte, error) {
 		if !ok || image == nil {
 			return [32]byte{}, ErrInconsistentSnapshot
 		}
-		digest, err := openedRelationImageDigest(relation, image)
+		digest, _, err := openedRelationImageDigest(relation, image, s.state.Binding.OwnedRange)
 		if err != nil {
 			return [32]byte{}, err
 		}
