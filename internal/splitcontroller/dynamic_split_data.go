@@ -16,7 +16,7 @@ type dynamicSplitDataEntry struct {
 	planDigest  [32]byte
 	source      *LocalSourceActions
 	sourceLease *RuntimeStoreLease
-	children    [autosplit.MaxSplitChildren]*LocalChildActions
+	children    [autosplit.MaxSplitChildren]TailStreamApplyTarget
 	childLeases [autosplit.MaxSplitChildren]*RuntimeStoreLease
 	sourceNodes []rafttransport.NodeID
 }
@@ -59,8 +59,8 @@ func (registry *DynamicSplitData) InstallSource(
 	return nil
 }
 
-func (registry *DynamicSplitData) InstallChild(
-	plan *Plan, digest [32]byte, child uint8, lease *RuntimeStoreLease, actions *LocalChildActions,
+func (registry *DynamicSplitData) InstallChildTarget(
+	plan *Plan, digest [32]byte, child uint8, lease *RuntimeStoreLease, actions TailStreamApplyTarget,
 ) error {
 	if registry == nil || plan == nil || digest == ([32]byte{}) || lease == nil || actions == nil ||
 		!plan.validNonRetainedChild(child) {
@@ -140,7 +140,18 @@ func (registry *DynamicSplitData) ResolveSplitTail(
 	if err != nil || artifacts == nil {
 		return TailStreamResolvedTarget{}, errors.Join(ErrTailStreamControl, err)
 	}
-	return ResolveLocalTailStreamTarget(plan, *artifacts, child, actions)
+	target, ok := plan.Target(child)
+	if !ok || plan.partitioner.ValidateChildArtifactSet(*artifacts) != nil {
+		return TailStreamResolvedTarget{}, ErrTailStreamControl
+	}
+	return TailStreamResolvedTarget{
+		Operation: plan.OperationID(), Partitioner: plan.partitioner,
+		Manifest: artifacts.Children[child],
+		TrustDomain: rafttransport.TrustDomain{
+			ClusterID: target.WAL.ClusterID, ClusterIncarnation: target.WAL.ClusterIncarnation,
+		},
+		Target: actions,
+	}, nil
 }
 
 func (registry *DynamicSplitData) AuthorizeArtifact(
