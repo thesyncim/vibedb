@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -430,6 +431,30 @@ func (authority *ReplicatedCatalogAuthority) Refresh(ctx context.Context, staleG
 		return nil, ErrStaleGeneration
 	}
 	return snapshot, nil
+}
+
+// AuthorizeRetainedPrune converts a linearizable catalog-Raft read into the
+// existing sealed post-drain cleanup capability. The RF3 read is the durable
+// publication receipt: no local catalog file or second topology authority is
+// introduced. CatalogHolder performs the final current-generation and local
+// lease-drain checks atomically.
+func (authority *ReplicatedCatalogAuthority) AuthorizeRetainedPrune(
+	ctx context.Context,
+	distributionName distribution.DistributionName,
+	operation [sha256.Size]byte,
+	certificate [sha256.Size]byte,
+) (RetainedPruneAuthority, error) {
+	if authority == nil || authority.holder == nil || ctx == nil {
+		return nil, ErrReplicatedCatalog
+	}
+	snapshot, err := authority.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return authority.holder.AuthorizeRetainedPrune(
+		DurableCatalogPublication{snapshot: snapshot, generation: snapshot.Generation()},
+		distributionName, operation, certificate,
+	)
 }
 
 // Publish conditionally replaces exactly expectedGeneration. Unknown outcomes

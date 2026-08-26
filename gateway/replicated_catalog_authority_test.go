@@ -1145,6 +1145,43 @@ func TestReplicatedCatalogAuthorityPublishUnknownRetryConflictAndRefresh(t *test
 	}
 }
 
+func TestReplicatedCatalogAuthorityAuthorizesPruneOnlyAfterRF3PublishAndDrain(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	_, _, descriptor := testReplicatedCatalogInput(t)
+	operation, certificate := [32]byte{0x51}, [32]byte{0x52}
+	if grant, err := authority.AuthorizeRetainedPrune(
+		context.Background(), descriptor.Distribution, operation, certificate,
+	); err != nil || grant.Generation() != current.Generation() ||
+		grant.Operation() != operation || grant.Certificate() != certificate {
+		t.Fatalf("initial grant=%v err=%v", grant, err)
+	}
+
+	lease := authority.holder.pinCurrent()
+	config, endpoints, replicated := testReplicatedCatalogInput(t)
+	next, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, current.Generation()+1, nil, nil,
+		[]ReplicatedShardDescriptor{replicated},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.Publish(context.Background(), current.Generation(), next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = authority.AuthorizeRetainedPrune(
+		context.Background(), descriptor.Distribution, operation, certificate,
+	); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("prune authorized before old-generation drain: %v", err)
+	}
+	lease.release()
+	grant, err := authority.AuthorizeRetainedPrune(
+		context.Background(), descriptor.Distribution, operation, certificate,
+	)
+	if err != nil || grant.Generation() != next.Generation() {
+		t.Fatalf("post-drain grant=%v err=%v", grant, err)
+	}
+}
+
 func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 	authority, _, _ := newCatalogAuthorityFixture(t)
 	record := testReplicatedOperation(ReplicatedOperationRecord{

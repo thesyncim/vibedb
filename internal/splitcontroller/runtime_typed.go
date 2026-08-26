@@ -237,3 +237,39 @@ func (s *DurableRuntimeStore) LoadCutoverCertificate(
 	}
 	return *certificate, state.Revision, true, nil
 }
+
+// PersistRetainedPrune stores the bounded post-publication cleanup cursor.
+// Pending delete keys are part of the authenticated cursor so an admitted but
+// unobserved batch is reconstructed byte-identically after restart.
+func (s *DurableRuntimeStore) PersistRetainedPrune(
+	revision uint64,
+	cursor rangesplit.RetainedPruneCursor,
+) error {
+	raw, err := rangesplit.AppendRetainedPruneCursor(nil, &cursor)
+	if err != nil || len(raw) > MaxPruneControlBytes {
+		return errors.Join(ErrRuntimeStore, err)
+	}
+	return s.Persist(RuntimeStatePrune, 0, revision, raw)
+}
+
+func (s *DurableRuntimeStore) LoadRetainedPrune(
+	partitioner *rangesplit.Partitioner,
+	certificate rangesplit.CutoverCertificate,
+) (rangesplit.RetainedPruneCursor, uint64, bool, error) {
+	state, ok, err := s.Load(RuntimeStatePrune, 0)
+	if err != nil || !ok {
+		return rangesplit.RetainedPruneCursor{}, 0, ok, err
+	}
+	cursor, err := rangesplit.OpenRetainedPruneCursor(state.Payload)
+	if err != nil || cursor == nil || partitioner == nil ||
+		cursor.OperationID() != [32]byte(s.operation) ||
+		partitioner.VerifyRetainedPruneCompletion(certificate, cursor.OperationID(), *cursor) != nil &&
+			cursor.Phase() == rangesplit.RetainedPruneComplete {
+		return rangesplit.RetainedPruneCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
+	}
+	canonical, err := rangesplit.AppendRetainedPruneCursor(nil, cursor)
+	if err != nil || !bytes.Equal(canonical, state.Payload) {
+		return rangesplit.RetainedPruneCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
+	}
+	return *cursor, state.Revision, true, nil
+}
