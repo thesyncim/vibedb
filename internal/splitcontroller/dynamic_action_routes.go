@@ -89,6 +89,18 @@ func (directory *DynamicShardActionRoutes) ResolveShardControl(
 	return gateway.ReplicatedRoute{}, ErrShardControlRoute
 }
 
+// retire removes only the exact admitted route set. It is intentionally
+// private: callers must pass through TerminalSplitOperationRetirer so catalog
+// terminal authority is checked before a live route disappears.
+func (directory *DynamicShardActionRoutes) retire(operation OperationID, digest [32]byte) {
+	if directory == nil || operation == (OperationID{}) || digest == ([32]byte{}) {
+		return
+	}
+	directory.mu.Lock()
+	delete(directory.plans, admittedPlanRouteKey{operation: operation, digest: digest})
+	directory.mu.Unlock()
+}
+
 func exactAdmittedPlanRoutes(catalog *gateway.Snapshot, plan *Plan) ([]gateway.ReplicatedRoute, error) {
 	source, ok := catalog.ResolveReplicatedRoute(
 		plan.source.Distribution, plan.source.Shard,

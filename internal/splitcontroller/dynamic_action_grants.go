@@ -2,6 +2,7 @@ package splitcontroller
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -71,6 +72,22 @@ func (grants *DynamicShardActionGrants) resolve(
 	grant, found := grants.grants[shardActionGrantKey{operation, digest, target}]
 	grants.mu.RUnlock()
 	return grant, found
+}
+
+// retire removes every capability for one exact admitted operation. Matching
+// the plan digest prevents a stale terminal notification from revoking a
+// replacement admission for the same operation identity.
+func (grants *DynamicShardActionGrants) retire(operation OperationID, digest [32]byte) {
+	if grants == nil || operation == (OperationID{}) || digest == ([32]byte{}) {
+		return
+	}
+	grants.mu.Lock()
+	for key := range grants.grants {
+		if key.operation == operation && key.digest == digest {
+			delete(grants.grants, key)
+		}
+	}
+	grants.mu.Unlock()
 }
 
 type PlanAdmissionGrantFactory interface {
@@ -150,6 +167,39 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 		digest: admission.PlanDigest, leases: append([]*RuntimeStoreLease(nil), leases...),
 	}
 	return nil
+}
+
+// retire releases the store pins retained by one exact admission. Release is
+// attempted for every lease and is retry-safe because RuntimeStoreLease.Release
+// is idempotent. The admission stays indexed when any release reports an error,
+// allowing the terminal cleanup call to settle an outcome-unknown close.
+func (binder *BoundPlanAdmissionBinder) retire(
+	operation OperationID, digest [32]byte,
+) error {
+	if binder == nil || operation == (OperationID{}) || digest == ([32]byte{}) {
+		return ErrRemoteExecution
+	}
+	binder.mu.Lock()
+	defer binder.mu.Unlock()
+	current, found := binder.active[operation]
+	if !found {
+		return nil
+	}
+	if current.digest != digest {
+		return ErrRemoteExecution
+	}
+	var releaseErr error
+	for _, lease := range current.leases {
+		if lease == nil {
+			releaseErr = errors.Join(releaseErr, ErrRemoteExecution)
+			continue
+		}
+		releaseErr = errors.Join(releaseErr, lease.Release())
+	}
+	if releaseErr == nil {
+		delete(binder.active, operation)
+	}
+	return releaseErr
 }
 
 func validShardActionGrant(grant ShardActionGrant) bool {
