@@ -1628,6 +1628,40 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 	return a.machine.Snapshot()
 }
 
+// RangeSplitSnapshot returns the same coherent full apply cut through the
+// narrow split-source capability consumed by the distributed split runtime.
+func (a *ReplicatedApply) RangeSplitSnapshot() (*replicatedstate.ReadSnapshot, error) {
+	return a.SnapshotArtifactCut()
+}
+
+// RangeSplitRelationManifestDigest returns the machine-authenticated logical
+// relation bundle identity without exposing the machine itself.
+func (a *ReplicatedApply) RangeSplitRelationManifestDigest() ([sha256.Size]byte, error) {
+	if a == nil || a.database == nil {
+		return [sha256.Size]byte{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return a.machine.RelationManifestDigest()
+}
+
+// RangeSplitCaptureCount is an O(1) recovery guard for a persisted capture
+// descriptor. Zero proves that no matching capture participant exists locally.
+func (a *ReplicatedApply) RangeSplitCaptureCount() (uint64, error) {
+	if a == nil || a.database == nil {
+		return 0, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil || a.database.replicatedCaptureCollection == nil {
+		return 0, errors.Join(err, ErrReplicatedApplyMismatch)
+	}
+	return a.database.replicatedCaptureCollection.Len(), nil
+}
+
 // BuildBundleSnapshotBase captures and certifies the hidden apply image plus
 // every fixed bundle relation at one database-snapshot cut. The certificate is
 // small; the durable member images are transported under its authenticated

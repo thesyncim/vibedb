@@ -22,6 +22,18 @@ type PressureObserver interface {
 	ObservePressure(PressureObservation)
 }
 
+// InstallPressureObserver installs the one startup observer before an Executor
+// is exposed to callers. Runtime replacement is deliberately refused: catalog
+// generation changes belong inside the observer and never add synchronization
+// to the request path.
+func (e *Executor) InstallPressureObserver(observer PressureObserver) bool {
+	if e == nil || observer == nil || e.pressure != nil {
+		return false
+	}
+	e.pressure = observer
+	return true
+}
+
 func (e *Executor) observePressureCalls(calls []shardCall) {
 	if e == nil || e.pressure == nil {
 		return

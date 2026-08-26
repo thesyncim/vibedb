@@ -149,6 +149,8 @@ func runServe(args []string) int {
 	catalogRetryHome := fs.String("catalog-retry-home", "", "stable 16-hex-character controller retry-home identity")
 	catalogSessionLease := fs.Duration("catalog-session-lease", 24*time.Hour, "monotonic controller session renewal interval")
 	controllerInterval := fs.Duration("controller-interval", time.Second, "bounded replicated split reconciliation interval")
+	hotShardCapacity := fs.String("hot-shard-capacity", "", "strict canonical vibejson provisioned pressure capacities")
+	hotShardInterval := fs.Duration("hot-shard-interval", time.Second, "pressure-window publication cadence; not correctness authority")
 	replicaControlManifestPath := fs.String("replica-control-manifest", "", "strict canonical vibejson replica-control topology and bounds")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
@@ -175,13 +177,14 @@ func runServe(args []string) int {
 		return 2
 	}
 	if *devStaticCatalog {
-		if !*devPlaintext || *catalogRelation != 0 {
+		if !*devPlaintext || *catalogRelation != 0 || *hotShardCapacity != "" {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
 		}
 	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
 		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *controllerInterval <= 0 ||
-		*catalogSessionLease <= 0 || len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
+		*catalogSessionLease <= 0 || *hotShardInterval <= 0 ||
+		len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
 		fmt.Fprintln(os.Stderr, "gateway: replicated catalog relation, identities, journal, and positive bounds are required")
 		return 2
 	}
@@ -352,6 +355,21 @@ func runServe(args []string) int {
 			return 2
 		}
 	}
+	var hotShardRuntime *gatewayHotShardRuntime
+	if *hotShardCapacity != "" {
+		capacity, capacityErr := loadGatewayHotShardCapacity(*hotShardCapacity)
+		if capacityErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: load hot-shard capacity: %v\n", capacityErr)
+			return 2
+		}
+		hotShardRuntime, err = newGatewayHotShardRuntime(
+			context.Background(), holder, catalogAuthority, capacity,
+		)
+		if err != nil || !exec.InstallPressureObserver(hotShardRuntime) {
+			fmt.Fprintf(os.Stderr, "gateway: initialize hot-shard pressure: %v\n", err)
+			return 1
+		}
+	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: listen %q: %v\n", *listen, err)
@@ -364,6 +382,12 @@ func runServe(args []string) int {
 	defer stop()
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
+	var hotShardDone <-chan struct{}
+	if hotShardRuntime != nil {
+		hotShardDone = runGatewayHotShardPublisher(
+			ctx, hotShardRuntime, *hotShardInterval, logf,
+		)
+	}
 	var replicaControlDone <-chan error
 	var replicaControllersDone <-chan struct{}
 	if replicaControlManifest != nil {
@@ -491,6 +515,10 @@ func runServe(args []string) int {
 	if replicaControllersDone != nil {
 		stop()
 		<-replicaControllersDone
+	}
+	if hotShardDone != nil {
+		stop()
+		<-hotShardDone
 	}
 	if serveErr := errors.Join(replicaControlErr, nonCanceledError(err)); serveErr != nil {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", serveErr)

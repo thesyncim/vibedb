@@ -41,22 +41,22 @@ func TestExecutorPressureObservationIsExactAndSynchronous(t *testing.T) {
 func TestPressureSourceUsesPinnedManifestOrdinalAndFullFence(t *testing.T) {
 	manifest, err := distribution.NewManifest("data", 7, []distribution.Shard{
 		{ID: "left", AllocationGeneration: 3,
-			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{31: 0x80}}},
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{distribution.KeyspaceWidth - 1: 0x80}}},
 			Leaders: []distribution.EndpointID{"left-node"}, Epoch: 9},
 		{ID: "right", AllocationGeneration: 4,
-			Range: distribution.KeyRange{Start: distribution.KeyspacePoint{31: 0x80}, End: distribution.KeyspaceEnd{Max: true}},
+			Range:   distribution.KeyRange{Start: distribution.KeyspacePoint{distribution.KeyspaceWidth - 1: 0x80}, End: distribution.KeyspaceEnd{Max: true}},
 			Leaders: []distribution.EndpointID{"right-node"}, Epoch: 10},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, ok := manifest.ResolvePointTarget(distribution.KeyspacePoint{31: 0x90})
+	target, ok := manifest.ResolvePointTarget(distribution.KeyspacePoint{distribution.KeyspaceWidth - 1: 0x90})
 	if !ok || target.ManifestOrdinal != 1 {
 		t.Fatalf("target=%+v ok=%v", target, ok)
 	}
 	source := pressureSourceForTarget(manifest, 20, target)
 	if source.Shard != "right" || source.Range != (distribution.KeyRange{
-		Start: distribution.KeyspacePoint{31: 0x80}, End: distribution.KeyspaceEnd{Max: true},
+		Start: distribution.KeyspacePoint{distribution.KeyspaceWidth - 1: 0x80}, End: distribution.KeyspaceEnd{Max: true},
 	}) {
 		t.Fatalf("source=%+v", source)
 	}

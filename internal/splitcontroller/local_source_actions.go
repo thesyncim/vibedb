@@ -20,11 +20,49 @@ type LocalSourceActions struct {
 	mu sync.Mutex
 
 	store   *DurableRuntimeStore
-	machine *replicatedstate.Machine
-	capture *durable.Collection
+	runtime splitSourceRuntime
 	active  *rangesplit.SourceCapture
 	tail    rangesplit.TailWorkspace
 	read    rangesplit.SourceCaptureWorkspace
+}
+
+type splitSourceRuntime interface {
+	RangeSplitSnapshot() (*replicatedstate.ReadSnapshot, error)
+	BeginRangeSplitCapture(*rangesplit.Partitioner) (*rangesplit.SourceCapture, error)
+	RangeSplitRelationManifestDigest() ([32]byte, error)
+	RangeSplitCaptureCount() (uint64, error)
+}
+
+type machineSplitSourceRuntime struct {
+	machine *replicatedstate.Machine
+	capture *durable.Collection
+}
+
+func (runtime machineSplitSourceRuntime) RangeSplitSnapshot() (*replicatedstate.ReadSnapshot, error) {
+	return runtime.machine.Snapshot()
+}
+
+func (runtime machineSplitSourceRuntime) BeginRangeSplitCapture(
+	partitioner *rangesplit.Partitioner,
+) (*rangesplit.SourceCapture, error) {
+	capture, err := rangesplit.NewSourceCapture(
+		partitioner, replicatedstate.TransitionCaptureCollectionName, runtime.capture,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err = runtime.machine.BeginTransitionCapture(capture); err != nil {
+		return nil, err
+	}
+	return capture, nil
+}
+
+func (runtime machineSplitSourceRuntime) RangeSplitRelationManifestDigest() ([32]byte, error) {
+	return runtime.machine.RelationManifestDigest()
+}
+
+func (runtime machineSplitSourceRuntime) RangeSplitCaptureCount() (uint64, error) {
+	return runtime.capture.Len(), nil
 }
 
 func NewLocalSourceActions(
@@ -35,7 +73,19 @@ func NewLocalSourceActions(
 	if store == nil || machine == nil || capture == nil || !capture.HasOpaqueValues() {
 		return nil, ErrRuntimeStore
 	}
-	return &LocalSourceActions{store: store, machine: machine, capture: capture}, nil
+	return NewLocalSourceRuntimeActions(store, machineSplitSourceRuntime{machine: machine, capture: capture})
+}
+
+// NewLocalSourceRuntimeActions binds the shipped opaque ReplicatedApply split
+// capability without exposing its machine or private capture collection.
+func NewLocalSourceRuntimeActions(
+	store *DurableRuntimeStore,
+	runtime splitSourceRuntime,
+) (*LocalSourceActions, error) {
+	if store == nil || runtime == nil {
+		return nil, ErrRuntimeStore
+	}
+	return &LocalSourceActions{store: store, runtime: runtime}, nil
 }
 
 // ExecuteStartCapture creates or recovers the exact source capture and binds
@@ -47,7 +97,7 @@ func (a *LocalSourceActions) ExecuteStartCapture(plan *Plan) (*rangesplit.Source
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	cut, err := a.machine.Snapshot()
+	cut, err := a.runtime.RangeSplitSnapshot()
 	if err != nil {
 		return nil, err
 	}
@@ -62,19 +112,18 @@ func (a *LocalSourceActions) ExecuteStartCapture(plan *Plan) (*rangesplit.Source
 		return nil, err
 	}
 	if a.active == nil {
-		if hasStored && a.capture.Len() == 0 {
+		captureCount, countErr := a.runtime.RangeSplitCaptureCount()
+		if countErr != nil {
+			return nil, countErr
+		}
+		if hasStored && captureCount == 0 {
 			// A durable descriptor may recover only its pre-existing capture
 			// participant. Never manufacture a fresh header beneath authority
 			// copied from another member root.
 			return nil, ErrRuntimeStore
 		}
-		capture, captureErr := rangesplit.NewSourceCapture(
-			plan.partitioner, replicatedstate.TransitionCaptureCollectionName, a.capture,
-		)
+		capture, captureErr := a.runtime.BeginRangeSplitCapture(plan.partitioner)
 		if captureErr != nil {
-			return nil, errors.Join(ErrRuntimeStore, captureErr)
-		}
-		if captureErr = a.machine.BeginTransitionCapture(capture); captureErr != nil {
 			return nil, errors.Join(ErrRuntimeStore, captureErr)
 		}
 		a.active = capture
@@ -133,7 +182,7 @@ func (a *LocalSourceActions) ExecuteBuildArtifacts(
 	if err != nil {
 		return rangesplit.ChildArtifactSet{}, err
 	}
-	cut, err := a.machine.Snapshot()
+	cut, err := a.runtime.RangeSplitSnapshot()
 	if err != nil {
 		return rangesplit.ChildArtifactSet{}, err
 	}

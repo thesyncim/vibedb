@@ -36,8 +36,8 @@ func (a *LocalSourceActions) ExecuteSealSource(
 		return ErrInvalidPlan
 	}
 	a.mu.Lock()
-	manifest, err := a.machine.RelationManifestDigest()
-	cut, snapshotErr := a.machine.Snapshot()
+	manifest, err := a.runtime.RangeSplitRelationManifestDigest()
+	cut, snapshotErr := a.runtime.RangeSplitSnapshot()
 	a.mu.Unlock()
 	if err != nil || snapshotErr != nil {
 		return errors.Join(err, snapshotErr)

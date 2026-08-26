@@ -112,7 +112,7 @@ func (a *LocalSourceActions) ExecutePruneRetained(
 	if a.active == nil || observed.Capture != a.active {
 		return ErrTopologyConflict
 	}
-	manifest, err := a.machine.RelationManifestDigest()
+	manifest, err := a.runtime.RangeSplitRelationManifestDigest()
 	if err != nil || !sourceServingStateMatches(
 		observed.SourceState, serving, manifest,
 	) {
@@ -153,7 +153,7 @@ func (a *LocalSourceActions) ExecutePruneRetained(
 	if err != nil {
 		return err
 	}
-	cut, err := a.machine.Snapshot(plan.partitioner.CollectionName())
+	cut, err := a.runtime.RangeSplitSnapshot()
 	if err != nil {
 		return err
 	}
