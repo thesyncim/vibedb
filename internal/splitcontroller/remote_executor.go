@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/shardcontrol"
@@ -35,6 +36,7 @@ type remoteStepPayload struct {
 	Sequence          uint64                          `json:"sequence"`
 	PredecessorDigest [32]byte                        `json:"predecessor_digest"`
 	Target            ShardActionTarget               `json:"target"`
+	SourceNode        rafttransport.NodeID            `json:"source_node"`
 	State             []byte                          `json:"state"`
 	Serving           planObservationWireServingState `json:"serving"`
 	Artifacts         []byte                          `json:"artifacts,omitempty"`
@@ -111,6 +113,10 @@ func appendRemoteStepRequestForTarget(
 		Catalog: observed.Catalog.Generation(), CatalogDigest: catalogDigest,
 		AdmissionRevision: observed.Catalog.Generation(),
 		Sequence:          remoteActionWitnessSequence(action), Target: target,
+	}
+	payload.SourceNode, err = remoteObservationSourceNode(plan, observed)
+	if err != nil {
+		return shardcontrol.Request{}, err
 	}
 	if payload.State, err = replicatedstate.AppendState(nil, observed.SourceState); err != nil {
 		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
@@ -203,6 +209,7 @@ func remoteStepPredecessorDigest(payload remoteStepPayload) [32]byte {
 	serving, _ := vibejson.Marshal(&payload.Serving)
 	serving, _ = vibejson.AppendCanonicalize(nil, serving)
 	_, _ = hash.Write(serving)
+	_, _ = hash.Write(payload.SourceNode[:])
 	for _, stage := range payload.Stages {
 		_, _ = hash.Write([]byte{stage.Child})
 		_, _ = hash.Write(stage.Value)
@@ -210,6 +217,28 @@ func remoteStepPredecessorDigest(payload remoteStepPayload) [32]byte {
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))
 	return result
+}
+
+func remoteObservationSourceNode(plan *Plan, observed Observation) (rafttransport.NodeID, error) {
+	if observed.SourceNode != (rafttransport.NodeID{}) {
+		return observed.SourceNode, nil
+	}
+	if plan == nil || observed.Catalog == nil || observed.SourceStatus.MemberID == 0 {
+		return rafttransport.NodeID{}, ErrRemoteExecution
+	}
+	route, ok := observed.Catalog.ResolveReplicatedRoute(
+		plan.source.Distribution, plan.source.Shard,
+		make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+	)
+	if !ok {
+		return rafttransport.NodeID{}, ErrRemoteExecution
+	}
+	for _, replica := range route.Replicas {
+		if replica.Member == observed.SourceStatus.MemberID && replica.Node != (rafttransport.NodeID{}) {
+			return replica.Node, nil
+		}
+	}
+	return rafttransport.NodeID{}, ErrRemoteExecution
 }
 
 func remoteObservationStateDigest(state replicatedstate.State) [32]byte {

@@ -61,7 +61,7 @@ func TestRemoteActionServiceReconcilesExactRequestBeforeExecution(t *testing.T) 
 	plan, catalog, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: catalog, SourceState: state}
+	observed := Observation{Catalog: catalog, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestRemoteActionServiceExecutesGatewayWitnessWithoutShardController(t *test
 			Commit: state.Applied, Applied: state.Applied, RaftState: raft.StateLeader},
 	}
 	observed := Observation{Catalog: catalog, SourceState: state,
-		SourceStatus: serving.Status, SourceServing: serving}
+		SourceStatus: serving.Status, SourceServing: serving, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionStartCapture {
 		t.Fatalf("action=%+v err=%v", action, err)

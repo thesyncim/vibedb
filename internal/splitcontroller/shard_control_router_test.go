@@ -159,7 +159,7 @@ func testShardControlRequestRoute() (shardcontrol.Request, gateway.ReplicatedRou
 	payload := remoteStepPayload{
 		Action: uint8(request.Action), Catalog: 1, CatalogDigest: [32]byte{8},
 		AdmissionRevision: 1, Sequence: remoteActionWitnessSequence(Action{Kind: ActionSealSource}),
-		State: []byte{1}, Target: ShardActionTarget{
+		State: []byte{1}, SourceNode: rafttransport.NodeID{9}, Target: ShardActionTarget{
 			Group: group, Allocation: 9,
 			Authority: sqldriver.ReplicatedAuthorityProfile{
 				ActivePolicyGeneration: command.ActivePolicyGeneration,

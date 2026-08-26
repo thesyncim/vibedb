@@ -28,7 +28,7 @@ func TestShardActionRuntimeDispatcherRequiresExactOperationPlanAndGroupGrant(t *
 	plan, catalog, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: catalog, SourceState: state}
+	observed := Observation{Catalog: catalog, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestExactShardActionRouteResolverUsesPreGrantedUnpublishedGroup(t *testing.
 	plan, catalog, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: catalog, SourceState: state}
+	observed := Observation{Catalog: catalog, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +121,7 @@ func TestRemoteActionEnvelopeBindsOwnedRangeAndRejectsNonCanonicalBytes(t *testi
 	plan, catalog, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: catalog, SourceState: state}
+	observed := Observation{Catalog: catalog, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func FuzzOpenRemoteActionTarget(f *testing.F) {
 	plan, catalog, _, _ := testPlan(f)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: catalog, SourceState: state}
+	observed := Observation{Catalog: catalog, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		f.Fatal(err)

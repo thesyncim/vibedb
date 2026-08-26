@@ -133,7 +133,7 @@ func openRemoteStepPayload(request shardcontrol.Request) (remoteStepPayload, err
 		!payload.Target.valid() || payload.Catalog == 0 || payload.CatalogDigest == ([32]byte{}) ||
 		payload.AdmissionRevision == 0 || payload.Sequence != remoteActionWitnessSequence(Action{
 		Kind: ActionKind(request.Action), Child: request.Child,
-	}) || payload.PredecessorDigest == ([32]byte{}) ||
+	}) || payload.SourceNode == (rafttransport.NodeID{}) || payload.PredecessorDigest == ([32]byte{}) ||
 		payload.PredecessorDigest != remoteStepPredecessorDigest(payload) {
 		return remoteStepPayload{}, errors.Join(ErrRemoteExecution, err)
 	}
@@ -149,7 +149,8 @@ func openRemoteWitnessObservation(payload remoteStepPayload) (Observation, error
 	if err != nil {
 		return Observation{}, err
 	}
-	result := Observation{SourceState: state, SourceStatus: serving.Status, SourceServing: serving}
+	result := Observation{SourceState: state, SourceStatus: serving.Status,
+		SourceServing: serving, SourceNode: payload.SourceNode}
 	if len(payload.Artifacts) != 0 {
 		value, openErr := rangesplit.OpenChildArtifactSet(payload.Artifacts)
 		if openErr != nil {
