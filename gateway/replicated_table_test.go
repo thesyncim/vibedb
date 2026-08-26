@@ -16,6 +16,9 @@ import (
 
 func TestReplicatedTableProfileRoundTripAndAllocationFreeResolution(t *testing.T) {
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	descriptor.RequestLedgerRanges = []DurableRequestLedgerRangeDescriptor{{
+		Identity: replication.Digest{0x91},
+	}}
 	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
 		config, endpoints, 5, nil, nil,
 		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},

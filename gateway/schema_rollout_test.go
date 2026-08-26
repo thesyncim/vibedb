@@ -232,6 +232,9 @@ func TestSchemaRolloutRejectsDifferentTargetAtActivation(t *testing.T) {
 
 func TestSchemaRolloutRejectsMixedOldAndNewShards(t *testing.T) {
 	config, endpoints, firstDescriptor := testReplicatedCatalogInput(t)
+	// This test expands one fixture shard into two data shards; neither is the
+	// separately provisioned request-ledger group.
+	firstDescriptor.RequestLedgerRanges = nil
 	first, _ := config.Manifests[0].ShardInfo(0)
 	second, _ := config.Manifests[0].ShardInfo(1)
 	second.Leaders = []distribution.EndpointID{"ep-b", "ep-c", "ep-d"}
