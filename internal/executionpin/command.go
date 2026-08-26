@@ -22,8 +22,10 @@ const (
 	OperationExpire
 )
 
-// Command is one fixed logical pin transition. Time is always an explicit
-// replicated scalar; this package never samples a local clock.
+// Command is one fixed logical pin transition. A lease is measured only in
+// committed catalog-group log positions. No wall-clock value is admitted to
+// this grammar: recovery/expiry is authorized by the apply index of the
+// transition itself crossing the previously certified lease fence.
 type Command struct {
 	Operation Operation
 	Binding   Binding
@@ -35,14 +37,13 @@ type Command struct {
 	AuthorityNode       ID
 	AuthorityGeneration uint64
 
-	ExpectedController      ID
-	ExpectedControllerEpoch uint64
-	NextController          ID
-	NextControllerEpoch     uint64
-	ExpectedLeaseDeadline   int64
-	ExpectedLeaseRevision   uint64
-	NextLeaseDeadline       int64
-	ObservedUnixNano        int64
+	ExpectedController          ID
+	ExpectedControllerEpoch     uint64
+	NextController              ID
+	NextControllerEpoch         uint64
+	ExpectedLeaseAppliedThrough uint64
+	ExpectedLeaseRevision       uint64
+	NextLeaseSpan               uint64
 
 	PrepareTerminalDigest    Digest
 	AcquireCertificateDigest Digest
@@ -55,32 +56,29 @@ func (command Command) Valid() bool {
 		return false
 	}
 	expected := command.ExpectedController != (ID{}) &&
-		command.ExpectedControllerEpoch != 0 && command.ExpectedLeaseDeadline > 0
+		command.ExpectedControllerEpoch != 0 && command.ExpectedLeaseAppliedThrough != 0
 	next := command.NextController != (ID{}) &&
-		command.NextControllerEpoch != 0 && command.NextLeaseDeadline > 0
+		command.NextControllerEpoch != 0 && command.NextLeaseSpan != 0
 	switch command.Operation {
 	case OperationAcquire:
-		return !expected && command.ExpectedLeaseRevision == 0 && next && command.ObservedUnixNano == 0 &&
+		return !expected && command.ExpectedLeaseRevision == 0 && next &&
 			command.PrepareTerminalDigest == (Digest{}) &&
 			command.AcquireCertificateDigest == (Digest{})
 	case OperationRenew:
 		return expected && command.ExpectedLeaseRevision != 0 && next && command.ExpectedController == command.NextController &&
 			command.ExpectedControllerEpoch == command.NextControllerEpoch &&
-			command.NextLeaseDeadline > command.ExpectedLeaseDeadline &&
-			command.ObservedUnixNano == 0 && command.PrepareTerminalDigest == (Digest{}) &&
+			command.PrepareTerminalDigest == (Digest{}) &&
 			command.AcquireCertificateDigest != (Digest{})
 	case OperationRecover:
 		return expected && command.ExpectedLeaseRevision != 0 && next && command.NextControllerEpoch > command.ExpectedControllerEpoch &&
-			command.ObservedUnixNano >= command.ExpectedLeaseDeadline &&
-			command.NextLeaseDeadline > command.ObservedUnixNano &&
 			command.PrepareTerminalDigest == (Digest{}) &&
 			command.AcquireCertificateDigest != (Digest{})
 	case OperationRelease:
-		return expected && command.ExpectedLeaseRevision != 0 && !next && command.ObservedUnixNano == 0 &&
+		return expected && command.ExpectedLeaseRevision != 0 && !next &&
 			command.PrepareTerminalDigest != (Digest{}) &&
 			command.AcquireCertificateDigest != (Digest{})
 	case OperationExpire:
-		return expected && command.ExpectedLeaseRevision != 0 && !next && command.ObservedUnixNano >= command.ExpectedLeaseDeadline &&
+		return expected && command.ExpectedLeaseRevision != 0 && !next &&
 			command.PrepareTerminalDigest == (Digest{}) &&
 			command.AcquireCertificateDigest == (Digest{})
 	default:
@@ -105,9 +103,8 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[288:296], command.ExpectedControllerEpoch)
 	copy(frame[296:312], command.NextController[:])
 	binary.LittleEndian.PutUint64(frame[312:320], command.NextControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[320:328], uint64(command.ExpectedLeaseDeadline))
-	binary.LittleEndian.PutUint64(frame[328:336], uint64(command.NextLeaseDeadline))
-	binary.LittleEndian.PutUint64(frame[336:344], uint64(command.ObservedUnixNano))
+	binary.LittleEndian.PutUint64(frame[320:328], command.ExpectedLeaseAppliedThrough)
+	binary.LittleEndian.PutUint64(frame[328:336], command.NextLeaseSpan)
 	copy(frame[344:376], command.PrepareTerminalDigest[:])
 	copy(frame[376:408], command.AcquireCertificateDigest[:])
 	binary.LittleEndian.PutUint64(frame[408:416], command.ExpectedLeaseRevision)
@@ -137,9 +134,11 @@ func OpenCommand(raw []byte) (Command, error) {
 	command.ExpectedControllerEpoch = binary.LittleEndian.Uint64(raw[288:296])
 	copy(command.NextController[:], raw[296:312])
 	command.NextControllerEpoch = binary.LittleEndian.Uint64(raw[312:320])
-	command.ExpectedLeaseDeadline = int64(binary.LittleEndian.Uint64(raw[320:328]))
-	command.NextLeaseDeadline = int64(binary.LittleEndian.Uint64(raw[328:336]))
-	command.ObservedUnixNano = int64(binary.LittleEndian.Uint64(raw[336:344]))
+	command.ExpectedLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[320:328])
+	command.NextLeaseSpan = binary.LittleEndian.Uint64(raw[328:336])
+	if !allZero(raw[336:344]) {
+		return Command{}, ErrCorrupt
+	}
 	copy(command.PrepareTerminalDigest[:], raw[344:376])
 	copy(command.AcquireCertificateDigest[:], raw[376:408])
 	command.ExpectedLeaseRevision = binary.LittleEndian.Uint64(raw[408:416])

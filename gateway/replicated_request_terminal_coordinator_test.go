@@ -242,7 +242,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 		Operation: executionpin.OperationAcquire, Binding: binding, PinID: executionPinID,
 		AuthorityNode: executionpin.ID{4}, AuthorityGeneration: 5,
 		NextController: executionpin.ID{6}, NextControllerEpoch: 7,
-		NextLeaseDeadline: 1_000,
+		NextLeaseSpan: 1_000,
 	}
 	acquired := executionpin.Apply(
 		executionpin.Record{}, false, acquire, 10, executionpin.Digest{11}, executionpin.Digest{12},
@@ -262,10 +262,10 @@ func terminalCoordinatorFixture(t testing.TB) (
 	release.Operation = executionpin.OperationRelease
 	release.ExpectedController = acquired.Record.Controller
 	release.ExpectedControllerEpoch = acquired.Record.ControllerEpoch
-	release.ExpectedLeaseDeadline = acquired.Record.LeaseDeadline
+	release.ExpectedLeaseAppliedThrough = acquired.Record.LeaseAppliedThrough
 	release.ExpectedLeaseRevision = acquired.Record.LeaseRevision
 	release.NextController = executionpin.ID{}
-	release.NextControllerEpoch, release.NextLeaseDeadline = 0, 0
+	release.NextControllerEpoch, release.NextLeaseSpan = 0, 0
 	release.AcquireCertificateDigest = certificateDigest
 
 	planBytes, err := requestledger.AppendPlan(nil, bytes.Repeat([]byte{0x44}, 4096))

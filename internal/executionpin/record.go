@@ -32,21 +32,20 @@ type Record struct {
 	AcquireAuthorityDigest Digest
 	CurrentAuthorityDigest Digest
 
-	AcquireApplied         uint64
-	AcquireController      ID
-	AcquireControllerEpoch uint64
-	AcquireLeaseDeadline   int64
+	AcquireApplied             uint64
+	AcquireController          ID
+	AcquireControllerEpoch     uint64
+	AcquireLeaseAppliedThrough uint64
 
-	Controller      ID
-	ControllerEpoch uint64
-	LeaseDeadline   int64
-	LeaseRevision   uint64
-	LeaseApplied    uint64
+	Controller          ID
+	ControllerEpoch     uint64
+	LeaseAppliedThrough uint64
+	LeaseRevision       uint64
+	LeaseApplied        uint64
 
 	TerminalApplied         uint64
 	TerminalAuthorityDigest Digest
 	PrepareTerminalDigest   Digest
-	TerminalObserved        int64
 
 	LastCommandDigest Digest
 	LastApplied       uint64
@@ -58,19 +57,19 @@ func (record Record) Valid() bool {
 		record.CurrentAuthorityDigest == (Digest{}) ||
 		record.Status < StatusActive || record.Status > StatusExpired ||
 		record.LastOperation < OperationAcquire || record.LastOperation > OperationExpire ||
-		record.Controller == (ID{}) || record.ControllerEpoch == 0 || record.LeaseDeadline <= 0 ||
+		record.Controller == (ID{}) || record.ControllerEpoch == 0 || record.LeaseAppliedThrough == 0 ||
 		record.LastCommandDigest == (Digest{}) || record.LastApplied == 0 {
 		return false
 	}
 	acquired := record.AcquireApplied != 0
 	if acquired {
 		if record.AcquireController == (ID{}) || record.AcquireControllerEpoch == 0 ||
-			record.AcquireLeaseDeadline <= 0 || record.LeaseRevision == 0 ||
+			record.AcquireLeaseAppliedThrough <= record.AcquireApplied || record.LeaseRevision == 0 ||
 			record.LeaseApplied < record.AcquireApplied {
 			return false
 		}
 	} else if record.AcquireController != (ID{}) || record.AcquireControllerEpoch != 0 ||
-		record.AcquireLeaseDeadline != 0 || record.LeaseRevision != 0 || record.LeaseApplied != 0 {
+		record.AcquireLeaseAppliedThrough != 0 || record.LeaseRevision != 0 || record.LeaseApplied != 0 {
 		return false
 	}
 	switch record.Status {
@@ -79,7 +78,7 @@ func (record Record) Valid() bool {
 			record.TerminalAuthorityDigest != (Digest{}) {
 			return false
 		}
-		if record.PrepareTerminalDigest != (Digest{}) || record.TerminalObserved != 0 {
+		if record.PrepareTerminalDigest != (Digest{}) {
 			return false
 		}
 		if record.LastOperation == OperationAcquire {
@@ -90,12 +89,12 @@ func (record Record) Valid() bool {
 	case StatusReleased:
 		return acquired && record.TerminalApplied >= record.AcquireApplied &&
 			record.TerminalAuthorityDigest != (Digest{}) &&
-			record.PrepareTerminalDigest != (Digest{}) && record.TerminalObserved == 0 &&
+			record.PrepareTerminalDigest != (Digest{}) &&
 			record.LastOperation == OperationRelease && record.LastApplied == record.TerminalApplied
 	case StatusExpired:
 		return record.TerminalApplied != 0 && record.PrepareTerminalDigest == (Digest{}) &&
 			record.TerminalAuthorityDigest != (Digest{}) &&
-			record.TerminalObserved >= record.LeaseDeadline &&
+			record.TerminalApplied > record.LeaseAppliedThrough &&
 			record.LastOperation == OperationExpire && record.LastApplied == record.TerminalApplied
 	default:
 		return false
@@ -121,15 +120,14 @@ func AppendRecord(dst []byte, record Record) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[320:328], record.AcquireApplied)
 	copy(frame[328:344], record.AcquireController[:])
 	binary.LittleEndian.PutUint64(frame[344:352], record.AcquireControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[352:360], uint64(record.AcquireLeaseDeadline))
+	binary.LittleEndian.PutUint64(frame[352:360], record.AcquireLeaseAppliedThrough)
 	copy(frame[360:376], record.Controller[:])
 	binary.LittleEndian.PutUint64(frame[376:384], record.ControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[384:392], uint64(record.LeaseDeadline))
+	binary.LittleEndian.PutUint64(frame[384:392], record.LeaseAppliedThrough)
 	binary.LittleEndian.PutUint64(frame[392:400], record.LeaseRevision)
 	binary.LittleEndian.PutUint64(frame[400:408], record.LeaseApplied)
 	binary.LittleEndian.PutUint64(frame[408:416], record.TerminalApplied)
 	copy(frame[416:448], record.PrepareTerminalDigest[:])
-	binary.LittleEndian.PutUint64(frame[448:456], uint64(record.TerminalObserved))
 	copy(frame[456:488], record.LastCommandDigest[:])
 	binary.LittleEndian.PutUint64(frame[488:496], record.LastApplied)
 	copy(frame[496:528], record.TerminalAuthorityDigest[:])
@@ -154,15 +152,17 @@ func OpenRecord(raw []byte) (Record, error) {
 	record.AcquireApplied = binary.LittleEndian.Uint64(raw[320:328])
 	copy(record.AcquireController[:], raw[328:344])
 	record.AcquireControllerEpoch = binary.LittleEndian.Uint64(raw[344:352])
-	record.AcquireLeaseDeadline = int64(binary.LittleEndian.Uint64(raw[352:360]))
+	record.AcquireLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[352:360])
 	copy(record.Controller[:], raw[360:376])
 	record.ControllerEpoch = binary.LittleEndian.Uint64(raw[376:384])
-	record.LeaseDeadline = int64(binary.LittleEndian.Uint64(raw[384:392]))
+	record.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[384:392])
 	record.LeaseRevision = binary.LittleEndian.Uint64(raw[392:400])
 	record.LeaseApplied = binary.LittleEndian.Uint64(raw[400:408])
 	record.TerminalApplied = binary.LittleEndian.Uint64(raw[408:416])
 	copy(record.PrepareTerminalDigest[:], raw[416:448])
-	record.TerminalObserved = int64(binary.LittleEndian.Uint64(raw[448:456]))
+	if !allZero(raw[448:456]) {
+		return Record{}, ErrCorrupt
+	}
 	copy(record.LastCommandDigest[:], raw[456:488])
 	record.LastApplied = binary.LittleEndian.Uint64(raw[488:496])
 	copy(record.TerminalAuthorityDigest[:], raw[496:528])

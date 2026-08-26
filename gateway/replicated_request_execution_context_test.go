@@ -170,7 +170,7 @@ func terminalAuthorityRelease(
 		Operation: executionpin.OperationRelease, Binding: binding, PinID: pin,
 		AuthorityNode: executionpin.ID{1}, AuthorityGeneration: 1,
 		ExpectedController: executionpin.ID{2}, ExpectedControllerEpoch: 1,
-		ExpectedLeaseDeadline: 2, ExpectedLeaseRevision: 1,
+		ExpectedLeaseAppliedThrough: 2, ExpectedLeaseRevision: 1,
 		AcquireCertificateDigest: executionpin.Digest{3},
 	}
 }

@@ -112,7 +112,7 @@ func TestExecutionPinAcquirePrepareTerminalReleaseRetryAndReopen(t *testing.T) {
 	acquire := executionpin.Command{
 		Operation: executionpin.OperationAcquire, Binding: binding, PinID: pin,
 		AuthorityNode: executionpin.ID(client), AuthorityGeneration: 7,
-		NextController: controller, NextControllerEpoch: 1, NextLeaseDeadline: 100,
+		NextController: controller, NextControllerEpoch: 1, NextLeaseSpan: 97,
 	}
 	acquireBytes := executionPinCommand(fixture.binding, client, 2, 2, acquire)
 	if err := fixture.machine.AdmitCommand(acquireBytes); err != nil {
@@ -146,7 +146,7 @@ func TestExecutionPinAcquirePrepareTerminalReleaseRetryAndReopen(t *testing.T) {
 		Operation: executionpin.OperationRelease, Binding: binding, PinID: pin,
 		AuthorityNode: executionpin.ID(client), AuthorityGeneration: 7,
 		ExpectedController: controller, ExpectedControllerEpoch: 1,
-		ExpectedLeaseDeadline: 100, ExpectedLeaseRevision: 1,
+		ExpectedLeaseAppliedThrough: 100, ExpectedLeaseRevision: 1,
 		PrepareTerminalDigest:    executionpin.Digest(sha256.Sum256([]byte("prepared-terminal"))),
 		AcquireCertificateDigest: acquireDigest,
 	}

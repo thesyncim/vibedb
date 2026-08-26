@@ -17,10 +17,10 @@ func ValidateAcquirePair(
 		completion.Lease.AuthorityDigest != expectedAuthority ||
 		completion.Acquire.Controller != command.NextController ||
 		completion.Acquire.ControllerEpoch != command.NextControllerEpoch ||
-		completion.Acquire.LeaseDeadline != command.NextLeaseDeadline ||
+		completion.Acquire.LeaseAppliedThrough != completion.Acquire.Applied+command.NextLeaseSpan ||
 		completion.Lease.Controller != command.NextController ||
 		completion.Lease.ControllerEpoch != command.NextControllerEpoch ||
-		completion.Lease.LeaseDeadline != command.NextLeaseDeadline ||
+		completion.Lease.LeaseAppliedThrough != completion.Lease.Applied+command.NextLeaseSpan ||
 		completion.Lease.Revision != 1 ||
 		completion.Lease.Applied != completion.Acquire.Applied {
 		return ErrCorrupt
@@ -52,11 +52,11 @@ func ValidateReleasePair(
 		completion.Terminal.PinID != command.PinID ||
 		completion.Lease.Controller != command.ExpectedController ||
 		completion.Lease.ControllerEpoch != command.ExpectedControllerEpoch ||
-		completion.Lease.LeaseDeadline != command.ExpectedLeaseDeadline ||
+		completion.Lease.LeaseAppliedThrough != command.ExpectedLeaseAppliedThrough ||
 		completion.Lease.Revision != command.ExpectedLeaseRevision ||
 		completion.Terminal.Controller != command.ExpectedController ||
 		completion.Terminal.ControllerEpoch != command.ExpectedControllerEpoch ||
-		completion.Terminal.ExpectedLeaseDeadline != command.ExpectedLeaseDeadline ||
+		completion.Terminal.ExpectedLeaseAppliedThrough != command.ExpectedLeaseAppliedThrough ||
 		completion.Terminal.AuthorityDigest != expectedAuthority ||
 		completion.Terminal.PrepareTerminalDigest != command.PrepareTerminalDigest ||
 		completion.Terminal.RequestKeyDigest != command.Binding.RequestKeyDigest {

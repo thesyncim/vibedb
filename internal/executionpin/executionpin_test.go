@@ -37,7 +37,7 @@ func testAcquire() Command {
 	return Command{
 		Operation: OperationAcquire, Binding: binding, PinID: pin,
 		AuthorityNode: testID(41), AuthorityGeneration: 42,
-		NextController: testID(10), NextControllerEpoch: 11, NextLeaseDeadline: 100,
+		NextController: testID(10), NextControllerEpoch: 11, NextLeaseSpan: 4,
 	}
 }
 
@@ -112,7 +112,7 @@ func TestPinIDBindsEveryLogicalFieldButNotControllerLease(t *testing.T) {
 	command := testAcquire()
 	command.NextController = testID(42)
 	command.NextControllerEpoch = 43
-	command.NextLeaseDeadline = 1000
+	command.NextLeaseSpan = 1000
 	if derived, deriveErr := DerivePinID(command.Binding); deriveErr != nil || derived != want {
 		t.Fatalf("controller/lease changed PinID: %x,%v", derived, deriveErr)
 	}
@@ -150,11 +150,11 @@ func TestAcquireRenewRecoverPrepareTerminalReleaseCertificatePair(t *testing.T) 
 	renew.ExpectedController, renew.ExpectedControllerEpoch = record.Controller, record.ControllerEpoch
 	renew.ExpectedLeaseRevision = record.LeaseRevision
 	renew.NextController, renew.NextControllerEpoch = record.Controller, record.ControllerEpoch
-	renew.ExpectedLeaseDeadline, renew.NextLeaseDeadline = record.LeaseDeadline, 200
+	renew.ExpectedLeaseAppliedThrough, renew.NextLeaseSpan = record.LeaseAppliedThrough, 4
 	renew.AcquireCertificateDigest = acquireCertificateDigest
 	transition = Apply(record, true, renew, 11, testDigest(22), testDigest(23))
 	if transition.Reason != ReasonApplied || !transition.Mutated ||
-		transition.Record.LeaseRevision != 2 || transition.Record.LeaseDeadline != 200 {
+		transition.Record.LeaseRevision != 2 || transition.Record.LeaseAppliedThrough != 15 {
 		t.Fatalf("renew = %+v", transition)
 	}
 	renewRecord := transition.Record
@@ -165,10 +165,10 @@ func TestAcquireRenewRecoverPrepareTerminalReleaseCertificatePair(t *testing.T) 
 	recover.ExpectedController, recover.ExpectedControllerEpoch = record.Controller, record.ControllerEpoch
 	recover.ExpectedLeaseRevision = record.LeaseRevision
 	recover.NextController, recover.NextControllerEpoch = testID(30), record.ControllerEpoch+1
-	recover.ExpectedLeaseDeadline, recover.ObservedUnixNano = record.LeaseDeadline, record.LeaseDeadline
-	recover.NextLeaseDeadline = 400
+	recover.ExpectedLeaseAppliedThrough = record.LeaseAppliedThrough
+	recover.NextLeaseSpan = 4
 	recover.AcquireCertificateDigest = acquireCertificateDigest
-	transition = Apply(record, true, recover, 12, testDigest(24), testDigest(25))
+	transition = Apply(record, true, recover, 16, testDigest(24), testDigest(25))
 	if transition.Reason != ReasonApplied || !transition.Mutated ||
 		transition.Record.Controller != recover.NextController || transition.Record.LeaseRevision != 3 {
 		t.Fatalf("recover = %+v", transition)
@@ -180,11 +180,11 @@ func TestAcquireRenewRecoverPrepareTerminalReleaseCertificatePair(t *testing.T) 
 	release.Operation = OperationRelease
 	release.ExpectedController, release.ExpectedControllerEpoch = record.Controller, record.ControllerEpoch
 	release.ExpectedLeaseRevision = record.LeaseRevision
-	release.ExpectedLeaseDeadline = record.LeaseDeadline
-	release.NextController, release.NextControllerEpoch, release.NextLeaseDeadline = ID{}, 0, 0
+	release.ExpectedLeaseAppliedThrough = record.LeaseAppliedThrough
+	release.NextController, release.NextControllerEpoch, release.NextLeaseSpan = ID{}, 0, 0
 	release.PrepareTerminalDigest = testDigest(31)
 	release.AcquireCertificateDigest = acquireCertificateDigest
-	transition = Apply(record, true, release, 13, testDigest(26), testDigest(27))
+	transition = Apply(record, true, release, 17, testDigest(26), testDigest(27))
 	if transition.Reason != ReasonApplied || !transition.Mutated ||
 		transition.Record.Status != StatusReleased {
 		t.Fatalf("release = %+v", transition)
@@ -213,7 +213,7 @@ func TestAcquireRenewRecoverPrepareTerminalReleaseCertificatePair(t *testing.T) 
 		revision  uint64
 	}{
 		{renew, testDigest(22), 11, 2},
-		{recover, testDigest(24), 12, 3},
+		{recover, testDigest(24), 16, 3},
 	} {
 		proof, proofErr := CompletionFromApplied(
 			historical.command, record, historical.authority, historical.applied,
@@ -254,9 +254,9 @@ func TestExpiryBeforeAcquireCreatesAntiResurrectionTombstone(t *testing.T) {
 	expire.ExpectedController, expire.ExpectedControllerEpoch =
 		acquire.NextController, acquire.NextControllerEpoch
 	expire.ExpectedLeaseRevision = 1
-	expire.ExpectedLeaseDeadline, expire.ObservedUnixNano = acquire.NextLeaseDeadline, 101
-	expire.NextController, expire.NextControllerEpoch, expire.NextLeaseDeadline = ID{}, 0, 0
-	transition := Apply(Record{}, false, expire, 10, testDigest(50), testDigest(51))
+	expire.ExpectedLeaseAppliedThrough = 14
+	expire.NextController, expire.NextControllerEpoch, expire.NextLeaseSpan = ID{}, 0, 0
+	transition := Apply(Record{}, false, expire, 15, testDigest(50), testDigest(51))
 	if transition.Reason != ReasonApplied || !transition.Mutated ||
 		transition.Record.Status != StatusExpired || transition.Record.AcquireApplied != 0 {
 		t.Fatalf("planned expiry = %+v", transition)

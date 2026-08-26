@@ -327,7 +327,7 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 	acquire := executionpin.Command{
 		Operation: executionpin.OperationAcquire, Binding: pinBinding, PinID: fullPin,
 		AuthorityNode: executionpin.ID(client), AuthorityGeneration: 7,
-		NextController: controller, NextControllerEpoch: 1, NextLeaseDeadline: 100,
+		NextController: controller, NextControllerEpoch: 1, NextLeaseSpan: 97,
 	}
 	acquireBytes := executionPinCommand(fixture.binding, client, 2, 2, acquire)
 	if _, err = fixture.machine.ApplyNormal(normalMeta(3), acquireBytes); err != nil {
@@ -342,7 +342,7 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 		Operation: executionpin.OperationRelease, Binding: pinBinding, PinID: fullPin,
 		AuthorityNode: executionpin.ID(client), AuthorityGeneration: 7,
 		ExpectedController: controller, ExpectedControllerEpoch: 1,
-		ExpectedLeaseDeadline: 100, ExpectedLeaseRevision: 1,
+		ExpectedLeaseAppliedThrough: 100, ExpectedLeaseRevision: 1,
 		PrepareTerminalDigest:    executionpin.Digest(prepared.PreparedDigest),
 		AcquireCertificateDigest: acquireDigest,
 	}

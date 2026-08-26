@@ -23,13 +23,13 @@ var (
 )
 
 type AcquireCertificate struct {
-	PinID           PinID
-	Binding         Binding
-	AuthorityDigest Digest
-	Applied         uint64
-	Controller      ID
-	ControllerEpoch uint64
-	LeaseDeadline   int64
+	PinID               PinID
+	Binding             Binding
+	AuthorityDigest     Digest
+	Applied             uint64
+	Controller          ID
+	ControllerEpoch     uint64
+	LeaseAppliedThrough uint64
 }
 
 func (certificate AcquireCertificate) Valid() bool {
@@ -37,7 +37,7 @@ func (certificate AcquireCertificate) Valid() bool {
 	return err == nil && certificate.PinID == derived &&
 		certificate.AuthorityDigest != (Digest{}) && certificate.Applied != 0 &&
 		certificate.Controller != (ID{}) && certificate.ControllerEpoch != 0 &&
-		certificate.LeaseDeadline > 0
+		certificate.LeaseAppliedThrough > certificate.Applied
 }
 
 type LeaseCertificate struct {
@@ -46,7 +46,7 @@ type LeaseCertificate struct {
 	AuthorityDigest          Digest
 	Controller               ID
 	ControllerEpoch          uint64
-	LeaseDeadline            int64
+	LeaseAppliedThrough      uint64
 	Revision                 uint64
 	Applied                  uint64
 }
@@ -55,29 +55,28 @@ func (certificate LeaseCertificate) Valid() bool {
 	return certificate.PinID != (PinID{}) &&
 		certificate.AcquireCertificateDigest != (Digest{}) &&
 		certificate.AuthorityDigest != (Digest{}) && certificate.Controller != (ID{}) &&
-		certificate.ControllerEpoch != 0 && certificate.LeaseDeadline > 0 &&
+		certificate.ControllerEpoch != 0 && certificate.LeaseAppliedThrough > certificate.Applied &&
 		certificate.Revision != 0 && certificate.Applied != 0
 }
 
 type TerminalCertificate struct {
-	Status                   Status
-	PinID                    PinID
-	RequestKeyDigest         Digest
-	AcquireCertificateDigest Digest
-	LeaseCertificateDigest   Digest
-	AuthorityDigest          Digest
-	PrepareTerminalDigest    Digest
-	Controller               ID
-	ControllerEpoch          uint64
-	ExpectedLeaseDeadline    int64
-	ObservedUnixNano         int64
-	Applied                  uint64
+	Status                      Status
+	PinID                       PinID
+	RequestKeyDigest            Digest
+	AcquireCertificateDigest    Digest
+	LeaseCertificateDigest      Digest
+	AuthorityDigest             Digest
+	PrepareTerminalDigest       Digest
+	Controller                  ID
+	ControllerEpoch             uint64
+	ExpectedLeaseAppliedThrough uint64
+	Applied                     uint64
 }
 
 func (certificate TerminalCertificate) Valid() bool {
 	if certificate.PinID == (PinID{}) || certificate.RequestKeyDigest == (Digest{}) ||
 		certificate.AuthorityDigest == (Digest{}) || certificate.Controller == (ID{}) ||
-		certificate.ControllerEpoch == 0 || certificate.ExpectedLeaseDeadline <= 0 ||
+		certificate.ControllerEpoch == 0 || certificate.ExpectedLeaseAppliedThrough == 0 ||
 		certificate.Applied == 0 {
 		return false
 	}
@@ -85,10 +84,10 @@ func (certificate TerminalCertificate) Valid() bool {
 	case StatusReleased:
 		return certificate.AcquireCertificateDigest != (Digest{}) &&
 			certificate.LeaseCertificateDigest != (Digest{}) &&
-			certificate.PrepareTerminalDigest != (Digest{}) && certificate.ObservedUnixNano == 0
+			certificate.PrepareTerminalDigest != (Digest{})
 	case StatusExpired:
 		return certificate.PrepareTerminalDigest == (Digest{}) &&
-			certificate.ObservedUnixNano >= certificate.ExpectedLeaseDeadline &&
+			certificate.Applied > certificate.ExpectedLeaseAppliedThrough &&
 			((certificate.AcquireCertificateDigest == (Digest{}) &&
 				certificate.LeaseCertificateDigest == (Digest{})) ||
 				(certificate.AcquireCertificateDigest != (Digest{}) &&
@@ -115,7 +114,7 @@ func AppendAcquireCertificate(dst []byte, certificate AcquireCertificate) ([]byt
 	binary.LittleEndian.PutUint64(frame[280:288], certificate.Applied)
 	copy(frame[288:304], certificate.Controller[:])
 	binary.LittleEndian.PutUint64(frame[304:312], certificate.ControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[312:320], uint64(certificate.LeaseDeadline))
+	binary.LittleEndian.PutUint64(frame[312:320], certificate.LeaseAppliedThrough)
 	sealSHA(frame, acquireCertificateDomain)
 	return dst, nil
 }
@@ -135,7 +134,7 @@ func OpenAcquireCertificate(raw []byte) (AcquireCertificate, error) {
 	certificate.Applied = binary.LittleEndian.Uint64(raw[280:288])
 	copy(certificate.Controller[:], raw[288:304])
 	certificate.ControllerEpoch = binary.LittleEndian.Uint64(raw[304:312])
-	certificate.LeaseDeadline = int64(binary.LittleEndian.Uint64(raw[312:320]))
+	certificate.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[312:320])
 	if !certificate.Valid() {
 		return AcquireCertificate{}, ErrCorrupt
 	}
@@ -155,7 +154,7 @@ func AppendLeaseCertificate(dst []byte, certificate LeaseCertificate) ([]byte, e
 	copy(frame[72:104], certificate.AuthorityDigest[:])
 	copy(frame[104:120], certificate.Controller[:])
 	binary.LittleEndian.PutUint64(frame[120:128], certificate.ControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[128:136], uint64(certificate.LeaseDeadline))
+	binary.LittleEndian.PutUint64(frame[128:136], certificate.LeaseAppliedThrough)
 	binary.LittleEndian.PutUint64(frame[136:144], certificate.Revision)
 	binary.LittleEndian.PutUint64(frame[144:152], certificate.Applied)
 	sealSHA(frame, leaseCertificateDomain)
@@ -173,7 +172,7 @@ func OpenLeaseCertificate(raw []byte) (LeaseCertificate, error) {
 	copy(certificate.AuthorityDigest[:], raw[72:104])
 	copy(certificate.Controller[:], raw[104:120])
 	certificate.ControllerEpoch = binary.LittleEndian.Uint64(raw[120:128])
-	certificate.LeaseDeadline = int64(binary.LittleEndian.Uint64(raw[128:136]))
+	certificate.LeaseAppliedThrough = binary.LittleEndian.Uint64(raw[128:136])
 	certificate.Revision = binary.LittleEndian.Uint64(raw[136:144])
 	certificate.Applied = binary.LittleEndian.Uint64(raw[144:152])
 	if !certificate.Valid() {
@@ -199,8 +198,7 @@ func AppendTerminalCertificate(dst []byte, certificate TerminalCertificate) ([]b
 	copy(frame[176:208], certificate.PrepareTerminalDigest[:])
 	copy(frame[208:224], certificate.Controller[:])
 	binary.LittleEndian.PutUint64(frame[224:232], certificate.ControllerEpoch)
-	binary.LittleEndian.PutUint64(frame[232:240], uint64(certificate.ExpectedLeaseDeadline))
-	binary.LittleEndian.PutUint64(frame[240:248], uint64(certificate.ObservedUnixNano))
+	binary.LittleEndian.PutUint64(frame[232:240], certificate.ExpectedLeaseAppliedThrough)
 	binary.LittleEndian.PutUint64(frame[248:256], certificate.Applied)
 	sealSHA(frame, terminalCertificateDomain)
 	return dst, nil
@@ -221,8 +219,10 @@ func OpenTerminalCertificate(raw []byte) (TerminalCertificate, error) {
 	copy(certificate.PrepareTerminalDigest[:], raw[176:208])
 	copy(certificate.Controller[:], raw[208:224])
 	certificate.ControllerEpoch = binary.LittleEndian.Uint64(raw[224:232])
-	certificate.ExpectedLeaseDeadline = int64(binary.LittleEndian.Uint64(raw[232:240]))
-	certificate.ObservedUnixNano = int64(binary.LittleEndian.Uint64(raw[240:248]))
+	certificate.ExpectedLeaseAppliedThrough = binary.LittleEndian.Uint64(raw[232:240])
+	if !allZero(raw[240:248]) {
+		return TerminalCertificate{}, ErrCorrupt
+	}
 	certificate.Applied = binary.LittleEndian.Uint64(raw[248:256])
 	if !certificate.Valid() {
 		return TerminalCertificate{}, ErrCorrupt
@@ -265,8 +265,8 @@ func (record Record) AcquireCertificate() (AcquireCertificate, bool) {
 		PinID: record.PinID, Binding: record.Binding,
 		AuthorityDigest: record.AcquireAuthorityDigest,
 		Applied:         record.AcquireApplied, Controller: record.AcquireController,
-		ControllerEpoch: record.AcquireControllerEpoch,
-		LeaseDeadline:   record.AcquireLeaseDeadline,
+		ControllerEpoch:     record.AcquireControllerEpoch,
+		LeaseAppliedThrough: record.AcquireLeaseAppliedThrough,
 	}, true
 }
 
@@ -282,7 +282,7 @@ func (record Record) LeaseCertificate() (LeaseCertificate, bool) {
 	return LeaseCertificate{
 		PinID: record.PinID, AcquireCertificateDigest: digest,
 		AuthorityDigest: record.CurrentAuthorityDigest, Controller: record.Controller,
-		ControllerEpoch: record.ControllerEpoch, LeaseDeadline: record.LeaseDeadline,
+		ControllerEpoch: record.ControllerEpoch, LeaseAppliedThrough: record.LeaseAppliedThrough,
 		Revision: record.LeaseRevision, Applied: record.LeaseApplied,
 	}, true
 }
@@ -314,7 +314,7 @@ func (record Record) TerminalCertificate() (TerminalCertificate, bool) {
 		AuthorityDigest:       record.TerminalAuthorityDigest,
 		PrepareTerminalDigest: record.PrepareTerminalDigest,
 		Controller:            record.Controller, ControllerEpoch: record.ControllerEpoch,
-		ExpectedLeaseDeadline: record.LeaseDeadline,
-		ObservedUnixNano:      record.TerminalObserved, Applied: record.TerminalApplied,
+		ExpectedLeaseAppliedThrough: record.LeaseAppliedThrough,
+		Applied:                     record.TerminalApplied,
 	}, true
 }

@@ -32,7 +32,7 @@ func testExecutionPinNested(t testing.TB) []byte {
 	raw, err := executionpin.AppendCommand(nil, executionpin.Command{
 		Operation: executionpin.OperationAcquire, Binding: binding, PinID: pin,
 		AuthorityNode: id(11), AuthorityGeneration: 12,
-		NextController: id(10), NextControllerEpoch: 11, NextLeaseDeadline: 12,
+		NextController: id(10), NextControllerEpoch: 11, NextLeaseSpan: 12,
 	})
 	if err != nil {
 		t.Fatal(err)

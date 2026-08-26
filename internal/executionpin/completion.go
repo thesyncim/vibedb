@@ -181,7 +181,7 @@ func CompletionFromApplied(
 			record.AcquireAuthorityDigest != authority ||
 			record.AcquireController != command.NextController ||
 			record.AcquireControllerEpoch != command.NextControllerEpoch ||
-			record.AcquireLeaseDeadline != command.NextLeaseDeadline {
+			record.AcquireLeaseAppliedThrough != applied+command.NextLeaseSpan {
 			return Completion{}, ErrCorrupt
 		}
 		digest, err := AcquireCertificateDigest(acquire)
@@ -194,8 +194,8 @@ func CompletionFromApplied(
 			Lease: LeaseCertificate{
 				PinID: command.PinID, AcquireCertificateDigest: digest,
 				AuthorityDigest: authority, Controller: command.NextController,
-				ControllerEpoch: command.NextControllerEpoch,
-				LeaseDeadline:   command.NextLeaseDeadline, Revision: 1, Applied: applied,
+				ControllerEpoch:     command.NextControllerEpoch,
+				LeaseAppliedThrough: record.AcquireLeaseAppliedThrough, Revision: 1, Applied: applied,
 			},
 		}
 		if !completion.Valid() {
@@ -211,7 +211,7 @@ func CompletionFromApplied(
 			(record.LeaseApplied != applied || record.CurrentAuthorityDigest != authority ||
 				record.Controller != command.NextController ||
 				record.ControllerEpoch != command.NextControllerEpoch ||
-				record.LeaseDeadline != command.NextLeaseDeadline) {
+				record.LeaseAppliedThrough != applied+command.NextLeaseSpan) {
 			return Completion{}, ErrCorrupt
 		}
 		digest, err := AcquireCertificateDigest(acquire)
@@ -224,9 +224,9 @@ func CompletionFromApplied(
 			Lease: LeaseCertificate{
 				PinID: command.PinID, AcquireCertificateDigest: digest,
 				AuthorityDigest: authority, Controller: command.NextController,
-				ControllerEpoch: command.NextControllerEpoch,
-				LeaseDeadline:   command.NextLeaseDeadline,
-				Revision:        command.ExpectedLeaseRevision + 1, Applied: applied,
+				ControllerEpoch:     command.NextControllerEpoch,
+				LeaseAppliedThrough: applied + command.NextLeaseSpan,
+				Revision:            command.ExpectedLeaseRevision + 1, Applied: applied,
 			},
 		}
 		if !completion.Valid() {

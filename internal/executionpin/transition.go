@@ -45,10 +45,14 @@ func Apply(
 	}
 	switch command.Operation {
 	case OperationAcquire:
+		leaseThrough, ok := leaseAppliedThrough(applied, command.NextLeaseSpan)
+		if !ok {
+			return Transition{Reason: ReasonConflict, Record: current, Found: found}
+		}
 		if found {
 			if current.Status != StatusActive || current.Controller != command.NextController ||
 				current.ControllerEpoch != command.NextControllerEpoch ||
-				current.LeaseDeadline != command.NextLeaseDeadline {
+				current.LeaseAppliedThrough != leaseThrough {
 				return Transition{Reason: ReasonConflict, Record: current, Found: true}
 			}
 			return Transition{Reason: ReasonApplied, Record: current, Found: true}
@@ -58,10 +62,10 @@ func Apply(
 			PinID: command.PinID, Binding: command.Binding,
 			AcquireAuthorityDigest: authority, CurrentAuthorityDigest: authority,
 			AcquireApplied: applied, AcquireController: command.NextController,
-			AcquireControllerEpoch: command.NextControllerEpoch,
-			AcquireLeaseDeadline:   command.NextLeaseDeadline,
-			Controller:             command.NextController, ControllerEpoch: command.NextControllerEpoch,
-			LeaseDeadline: command.NextLeaseDeadline, LeaseRevision: 1, LeaseApplied: applied,
+			AcquireControllerEpoch:     command.NextControllerEpoch,
+			AcquireLeaseAppliedThrough: leaseThrough,
+			Controller:                 command.NextController, ControllerEpoch: command.NextControllerEpoch,
+			LeaseAppliedThrough: leaseThrough, LeaseRevision: 1, LeaseApplied: applied,
 			LastCommandDigest: commandDigest, LastApplied: applied,
 		}
 		return Transition{Reason: ReasonApplied, Mutated: true, Record: record, Found: true}
@@ -79,11 +83,21 @@ func Apply(
 		if !matchesExpectedLease(current, command) {
 			return Transition{Reason: ReasonLeaseMismatch, Record: current, Found: true}
 		}
+		// Renewal is itself an ordered side effect and must land while the
+		// current certificate is still live. A delayed controller cannot
+		// resurrect its authority after the logical fence has passed.
+		if applied > current.LeaseAppliedThrough {
+			return Transition{Reason: ReasonTooEarly, Record: current, Found: true}
+		}
 		if current.LeaseRevision == math.MaxUint64 {
 			return Transition{Reason: ReasonConflict, Record: current, Found: true}
 		}
+		leaseThrough, ok := leaseAppliedThrough(applied, command.NextLeaseSpan)
+		if !ok {
+			return Transition{Reason: ReasonConflict, Record: current, Found: true}
+		}
 		current.CurrentAuthorityDigest = authority
-		current.LeaseDeadline = command.NextLeaseDeadline
+		current.LeaseAppliedThrough = leaseThrough
 		current.LeaseRevision++
 		current.LeaseApplied = applied
 		current.LastOperation = OperationRenew
@@ -103,16 +117,20 @@ func Apply(
 		if !matchesExpectedLease(current, command) {
 			return Transition{Reason: ReasonLeaseMismatch, Record: current, Found: true}
 		}
-		if command.ObservedUnixNano < current.LeaseDeadline {
+		if applied <= current.LeaseAppliedThrough {
 			return Transition{Reason: ReasonTooEarly, Record: current, Found: true}
 		}
 		if current.LeaseRevision == math.MaxUint64 {
 			return Transition{Reason: ReasonConflict, Record: current, Found: true}
 		}
+		leaseThrough, ok := leaseAppliedThrough(applied, command.NextLeaseSpan)
+		if !ok {
+			return Transition{Reason: ReasonConflict, Record: current, Found: true}
+		}
 		current.CurrentAuthorityDigest = authority
 		current.Controller = command.NextController
 		current.ControllerEpoch = command.NextControllerEpoch
-		current.LeaseDeadline = command.NextLeaseDeadline
+		current.LeaseAppliedThrough = leaseThrough
 		current.LeaseRevision++
 		current.LeaseApplied = applied
 		current.LastOperation = OperationRecover
@@ -156,17 +174,17 @@ func Apply(
 				TerminalAuthorityDigest: authority,
 				Controller:              command.ExpectedController,
 				ControllerEpoch:         command.ExpectedControllerEpoch,
-				LeaseDeadline:           command.ExpectedLeaseDeadline,
-				TerminalApplied:         applied, TerminalObserved: command.ObservedUnixNano,
-				LastCommandDigest: commandDigest, LastApplied: applied,
+				LeaseAppliedThrough:     command.ExpectedLeaseAppliedThrough,
+				TerminalApplied:         applied,
+				LastCommandDigest:       commandDigest, LastApplied: applied,
 			}
 			return Transition{Reason: ReasonApplied, Mutated: true, Record: record, Found: true}
 		}
 		if current.Status == StatusExpired {
 			if current.Controller == command.ExpectedController &&
 				current.ControllerEpoch == command.ExpectedControllerEpoch &&
-				current.LeaseDeadline == command.ExpectedLeaseDeadline &&
-				current.TerminalObserved == command.ObservedUnixNano {
+				current.LeaseAppliedThrough == command.ExpectedLeaseAppliedThrough &&
+				current.TerminalApplied == applied {
 				return Transition{Reason: ReasonApplied, Record: current, Found: true}
 			}
 			return Transition{Reason: ReasonConflict, Record: current, Found: true}
@@ -177,13 +195,12 @@ func Apply(
 		if !matchesExpectedLease(current, command) {
 			return Transition{Reason: ReasonLeaseMismatch, Record: current, Found: true}
 		}
-		if command.ObservedUnixNano < current.LeaseDeadline {
+		if applied <= current.LeaseAppliedThrough {
 			return Transition{Reason: ReasonTooEarly, Record: current, Found: true}
 		}
 		current.Status = StatusExpired
 		current.TerminalAuthorityDigest = authority
 		current.TerminalApplied = applied
-		current.TerminalObserved = command.ObservedUnixNano
 		current.LastOperation = OperationExpire
 		current.LastCommandDigest, current.LastApplied = commandDigest, applied
 		return Transition{Reason: ReasonApplied, Mutated: true, Record: current, Found: true}
@@ -195,8 +212,15 @@ func Apply(
 func matchesExpectedLease(record Record, command Command) bool {
 	return record.Controller == command.ExpectedController &&
 		record.ControllerEpoch == command.ExpectedControllerEpoch &&
-		record.LeaseDeadline == command.ExpectedLeaseDeadline &&
+		record.LeaseAppliedThrough == command.ExpectedLeaseAppliedThrough &&
 		record.LeaseRevision == command.ExpectedLeaseRevision
+}
+
+func leaseAppliedThrough(applied, span uint64) (uint64, bool) {
+	if applied == 0 || span == 0 || span > math.MaxUint64-applied {
+		return 0, false
+	}
+	return applied + span, true
 }
 
 func matchesAcquireCertificate(record Record, expected Digest) bool {
