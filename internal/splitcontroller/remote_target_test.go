@@ -117,6 +117,33 @@ func TestExactShardActionRouteResolverUsesPreGrantedUnpublishedGroup(t *testing.
 	}
 }
 
+func TestPreparedReplicaMatchAuthenticatesEveryLocalRuntimeField(t *testing.T) {
+	plan, _, _, _ := testPlan(t)
+	target, ok := plan.Target(1)
+	if !ok || len(target.Replicas) == 0 {
+		t.Fatal("missing prepared child target")
+	}
+	original := target.Replicas[0]
+	if !targetMatchesPreparedReplica(target, original) {
+		t.Fatal("exact prepared replica rejected")
+	}
+	mutations := []func(*ChildReplicaTarget){
+		func(replica *ChildReplicaTarget) { replica.WALPath += ".forged" },
+		func(replica *ChildReplicaTarget) { replica.SQLPath += ".forged" },
+		func(replica *ChildReplicaTarget) { replica.RuntimeRoot += ".forged" },
+		func(replica *ChildReplicaTarget) { replica.WAL.StoreID[0]++ },
+		func(replica *ChildReplicaTarget) { replica.Apply.Storage += "-forged" },
+		func(replica *ChildReplicaTarget) { replica.ControlEndpoint += "-forged" },
+	}
+	for index, mutate := range mutations {
+		forged := original
+		mutate(&forged)
+		if targetMatchesPreparedReplica(target, forged) {
+			t.Fatalf("mutation %d retained prepared authority", index)
+		}
+	}
+}
+
 func TestRemoteActionEnvelopeBindsOwnedRangeAndRejectsNonCanonicalBytes(t *testing.T) {
 	plan, catalog, _, _ := testPlan(t)
 	state := testSourceState(plan)
