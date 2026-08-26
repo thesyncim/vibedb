@@ -74,6 +74,7 @@ type Plan struct {
 	baseDigest            [32]byte
 	baseState             replicatedstate.State
 	certificate           replicatedstate.SnapshotBaseCertificate
+	failureAuthorization  []byte
 	operation             OperationID
 }
 
@@ -416,6 +417,13 @@ func replicaMoveOperationID(plan *Plan) OperationID {
 	}
 	writeOperationMembers(hash, plan.initialConf.GetVoters())
 	writeOperationMembers(hash, plan.initialConf.GetLearners())
+	if len(plan.failureAuthorization) == 0 {
+		_, _ = hash.Write([]byte{0})
+	} else {
+		_, _ = hash.Write([]byte{1})
+		writeOperationUint64(hash, uint64(len(plan.failureAuthorization)))
+		_, _ = hash.Write(plan.failureAuthorization)
+	}
 	var result OperationID
 	_ = hash.Sum(result[:0])
 	return result

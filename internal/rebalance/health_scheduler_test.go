@@ -172,6 +172,35 @@ func TestFailedReplicaSchedulerHandsExactIntentToDurableSink(t *testing.T) {
 	}
 }
 
+func TestFailedReplicaAuthorizationSurvivesRestartAndRejectsTampering(t *testing.T) {
+	cut := failedReplicaTestCut(t, 3)
+	planned, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, _, err := openPersistedPlanIntent(planned.Intent)
+	if err != nil || len(intent.FailureAuthority) == 0 {
+		t.Fatalf("missing persisted failure authority: bytes=%d err=%v",
+			len(intent.FailureAuthority), err)
+	}
+	recovered, err := OpenReplicaMoveIntent(
+		planned.Intent, cut.Catalog, cut.Publication, nil,
+	)
+	if err != nil || recovered.OperationID() != planned.Operation {
+		t.Fatalf("restart operation=%x want=%x err=%v",
+			recovered.OperationID(), planned.Operation, err)
+	}
+
+	intent.FailureAuthority[len(intent.FailureAuthority)-1] ^= 1
+	tampered, err := appendPersistedPlanIntent(nil, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = OpenReplicaMoveIntent(tampered, cut.Catalog, cut.Publication, nil); !errors.Is(err, ErrPlanIntent) && !errors.Is(err, ErrFailureEvidence) {
+		t.Fatalf("tampered failure authority accepted: %v", err)
+	}
+}
+
 type memoryFailedReplicaSink struct {
 	mu          sync.Mutex
 	record      FailedReplicaMoveIntent

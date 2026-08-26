@@ -169,6 +169,17 @@ func PlanFailedReplicaReplacement(cut FailedReplicaPlanningCut) (FailedReplicaMo
 	if err != nil {
 		return FailedReplicaMoveIntent{}, err
 	}
+	var donorEvidence HealthyReplica
+	for _, healthy := range cut.Healthy {
+		if healthy.Member == donor && (donorEvidence.Member == 0 ||
+			healthy.Applied > donorEvidence.Applied) {
+			donorEvidence = healthy
+		}
+	}
+	if donorEvidence.Member == 0 ||
+		authorizeFailedReplicaMove(plan, cut, donorEvidence, target) != nil {
+		return FailedReplicaMoveIntent{}, ErrFailureEvidence
+	}
 	intent, err := AppendReplicaMoveIntent(nil, cut.Catalog, plan)
 	if err != nil {
 		return FailedReplicaMoveIntent{}, err

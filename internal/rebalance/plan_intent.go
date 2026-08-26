@@ -45,6 +45,7 @@ type persistedPlanIntent struct {
 	SourceGeneration uint64               `json:"source_generation"`
 	Request          persistedMoveRequest `json:"request"`
 	Certificate      []byte               `json:"certificate"`
+	FailureAuthority []byte               `json:"failure_authority,omitempty"`
 }
 
 type persistedMoveRequest struct {
@@ -81,7 +82,7 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 	}
 	intent := persistedPlanIntent{
 		Operation: [32]byte(plan.operation), SourceGeneration: plan.catalogGeneration,
-		Request: persistMoveRequest(plan.request),
+		Request: persistMoveRequest(plan.request), FailureAuthority: bytes.Clone(plan.failureAuthorization),
 	}
 	if plan.baseBound {
 		if plan.certificate.Digest == ([32]byte{}) {
@@ -128,7 +129,7 @@ func AppendReplicaMoveIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) 
 	}
 	return appendPersistedPlanIntent(dst, persistedPlanIntent{
 		Operation: [32]byte(plan.operation), SourceGeneration: plan.catalogGeneration,
-		Request: persistMoveRequest(plan.request),
+		Request: persistMoveRequest(plan.request), FailureAuthority: bytes.Clone(plan.failureAuthorization),
 	})
 }
 
@@ -174,6 +175,9 @@ func OpenPlanIntent(
 		}
 		plan, err = RecoverReplicaMove(catalog, publication, request, snapshot)
 	}
+	if err == nil && len(intent.FailureAuthority) != 0 {
+		err = restoreFailedReplicaAuthorization(plan, intent.FailureAuthority)
+	}
 	if err != nil || plan == nil || plan.catalogGeneration != intent.SourceGeneration ||
 		[32]byte(plan.OperationID()) != intent.Operation {
 		return nil, errors.Join(err, ErrPlanIntent)
@@ -208,6 +212,9 @@ func OpenReplicaMoveIntent(
 		plan, err = PlanReplicaMove(catalog, publication, request)
 	} else {
 		plan, err = recoverReplicaMoveCertificate(catalog, publication, request, *certificate)
+	}
+	if err == nil && len(intent.FailureAuthority) != 0 {
+		err = restoreFailedReplicaAuthorization(plan, intent.FailureAuthority)
 	}
 	if err != nil || plan == nil || plan.catalogGeneration != intent.SourceGeneration ||
 		[32]byte(plan.OperationID()) != intent.Operation {
@@ -246,6 +253,11 @@ func openPersistedPlanIntent(raw []byte) (persistedPlanIntent, MoveRequest, erro
 		intent.SourceGeneration == 0 || invalidMoveRequest(request) ||
 		len(intent.Certificate) == 0 && intent.Certificate != nil {
 		return persistedPlanIntent{}, MoveRequest{}, errors.Join(err, ErrPlanIntent)
+	}
+	if len(intent.FailureAuthority) != 0 {
+		if _, authorizationErr := openFailureAuthorization(intent.FailureAuthority); authorizationErr != nil {
+			return persistedPlanIntent{}, MoveRequest{}, errors.Join(authorizationErr, ErrPlanIntent)
+		}
 	}
 	return intent, request, nil
 }
