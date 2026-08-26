@@ -42,6 +42,10 @@ type persistedMoveRequest struct {
 	TargetMember         uint64                        `json:"target_member"`
 	Source               distribution.EndpointID       `json:"source"`
 	Target               distribution.EndpointID       `json:"target"`
+	RetiringNode         [16]byte                      `json:"retiring_node"`
+	RetiringStore        [16]byte                      `json:"retiring_store"`
+	RetiringIncarnation  uint64                        `json:"retiring_incarnation"`
+	RetiringControl      distribution.EndpointID       `json:"retiring_control"`
 }
 
 // AppendPlanIntent appends the unique canonical restart image for a replica
@@ -97,7 +101,8 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 func AppendReplicaMoveIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte, error) {
 	if catalog == nil || plan == nil || plan.operation == (OperationID{}) ||
 		(catalog.Generation() != plan.catalogGeneration &&
-			catalog.Generation() != plan.nextCatalogGeneration) {
+			catalog.Generation() != plan.nextCatalogGeneration &&
+			catalog.Generation() != plan.postRemoveGeneration) {
 		return dst, ErrPlanIntent
 	}
 	if _, err := plan.catalogStage(catalog); err != nil {
@@ -235,6 +240,10 @@ func persistMoveRequest(request MoveRequest) persistedMoveRequest {
 		GroupID: request.Group.GroupID, RetiringMember: request.RetiringMember,
 		SnapshotSourceMember: request.SnapshotSourceMember,
 		TargetMember:         request.TargetMember, Source: request.Source, Target: request.Target,
+		RetiringNode:        request.RetiringReplica.Node,
+		RetiringStore:       request.RetiringReplica.StoreID,
+		RetiringIncarnation: request.RetiringReplica.NodeIncarnation,
+		RetiringControl:     request.RetiringReplica.ControlEndpoint,
 	}
 }
 
@@ -250,5 +259,10 @@ func openMoveRequest(request persistedMoveRequest) MoveRequest {
 		SnapshotSourceMember: request.SnapshotSourceMember,
 		TargetMember:         request.TargetMember,
 		Source:               request.Source, Target: request.Target,
+		RetiringReplica: ReplicaIdentity{
+			Member: request.RetiringMember, Node: request.RetiringNode,
+			StoreID: request.RetiringStore, NodeIncarnation: request.RetiringIncarnation,
+			ControlEndpoint: request.RetiringControl,
+		},
 	}
 }

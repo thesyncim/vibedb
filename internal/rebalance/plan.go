@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -40,6 +41,19 @@ type MoveRequest struct {
 	TargetMember         uint64
 	Source               distribution.EndpointID
 	Target               distribution.EndpointID
+	RetiringReplica      ReplicaIdentity
+}
+
+// ReplicaIdentity is the immutable control identity required to address a
+// replica after it leaves the serving catalog. Keeping it in the move intent
+// prevents a controller restart after either catalog cut from rediscovering a
+// stale process that reused the old endpoint or member ID.
+type ReplicaIdentity struct {
+	Member          uint64
+	Node            rafttransport.NodeID
+	StoreID         [16]byte
+	NodeIncarnation uint64
+	ControlEndpoint distribution.EndpointID
 }
 
 // Plan is an immutable replica-movement intent. A plan starts without a bulk
@@ -75,7 +89,7 @@ func PlanReplicaMove(
 	publication raftmodel.Publication,
 	request MoveRequest,
 ) (*Plan, error) {
-	if current == nil || invalidMoveRequest(request) || publication.ConfState == nil ||
+	if current == nil || invalidMoveRequestBase(request) || publication.ConfState == nil ||
 		publication.Applied == 0 || publication.ReplicaSetVersion == 0 ||
 		publication.ReplicaSetVersion > publication.Applied ||
 		current.Generation() > math.MaxUint64-2 {
@@ -103,6 +117,11 @@ func PlanReplicaMove(
 	}
 	if _, err := current.Address(request.Target); err != nil {
 		return nil, ErrInvalidPlan
+	}
+	var err error
+	request, err = bindRetiringReplica(current, request)
+	if err != nil {
+		return nil, err
 	}
 	targetManifest, err := targetManifestForMove(manifest, request)
 	if err != nil {
@@ -372,12 +391,16 @@ func replicaMoveOperationID(plan *Plan) OperationID {
 	for _, value := range [...]uint64{
 		plan.request.Group.TopologyRecoveryEpoch, plan.request.RetiringMember,
 		plan.request.SnapshotSourceMember, plan.request.TargetMember,
+		plan.request.RetiringReplica.Member, plan.request.RetiringReplica.NodeIncarnation,
 		plan.catalogGeneration, plan.nextCatalogGeneration, plan.postRemoveGeneration,
 		uint64(plan.sourceManifest.Version()), uint64(shard.AllocationGeneration),
 		uint64(shard.Epoch),
 	} {
 		writeOperationUint64(hash, value)
 	}
+	_, _ = hash.Write(plan.request.RetiringReplica.Node[:])
+	_, _ = hash.Write(plan.request.RetiringReplica.StoreID[:])
+	writeOperationString(hash, string(plan.request.RetiringReplica.ControlEndpoint))
 	writeOperationString(hash, string(plan.request.Source))
 	writeOperationString(hash, string(plan.request.Target))
 	_, _ = hash.Write(shard.Range.Start[:])
@@ -446,6 +469,15 @@ func (p *Plan) RetiringMember() uint64 {
 	return p.request.RetiringMember
 }
 
+// RetiringReplica returns the exact durable control identity captured before
+// catalog cutover. The returned value owns no mutable backing storage.
+func (p *Plan) RetiringReplica() ReplicaIdentity {
+	if p == nil {
+		return ReplicaIdentity{}
+	}
+	return p.request.RetiringReplica
+}
+
 func (p *Plan) SnapshotSourceMember() uint64 {
 	if p == nil {
 		return 0
@@ -503,7 +535,7 @@ func invalidGroup(group raftmember.GroupKey) bool {
 		group.GroupID == ([16]byte{})
 }
 
-func invalidMoveRequest(request MoveRequest) bool {
+func invalidMoveRequestBase(request MoveRequest) bool {
 	return request.Distribution == "" || request.Shard == "" || invalidGroup(request.Group) ||
 		request.RetiringMember == request.SnapshotSourceMember ||
 		request.RetiringMember == request.TargetMember ||
@@ -512,6 +544,59 @@ func invalidMoveRequest(request MoveRequest) bool {
 		raft.IsLocalMsgTarget(request.SnapshotSourceMember) ||
 		raft.IsLocalMsgTarget(request.TargetMember) ||
 		request.Source == "" || request.Target == "" || request.Source == request.Target
+}
+
+func invalidMoveRequest(request MoveRequest) bool {
+	return invalidMoveRequestBase(request) || !validReplicaIdentity(request.RetiringReplica) ||
+		request.RetiringReplica.Member != request.RetiringMember ||
+		request.RetiringReplica.ControlEndpoint == request.Source
+}
+
+func validReplicaIdentity(identity ReplicaIdentity) bool {
+	return !raft.IsLocalMsgTarget(identity.Member) && identity.Node != (rafttransport.NodeID{}) &&
+		identity.StoreID != ([16]byte{}) && identity.NodeIncarnation != 0 &&
+		identity.ControlEndpoint != ""
+}
+
+func bindRetiringReplica(current *gateway.Snapshot, request MoveRequest) (MoveRequest, error) {
+	var workspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := current.ResolveReplicatedMembershipRoute(
+		request.Distribution, request.Shard, workspace[:0],
+	)
+	var exact ReplicaIdentity
+	if ok {
+		if route.Serving.Group != request.Group {
+			return MoveRequest{}, ErrInvalidPlan
+		}
+		for _, replica := range route.Serving.Replicas {
+			if replica.Member != request.RetiringMember {
+				continue
+			}
+			if distribution.EndpointID(replica.Endpoint) != request.Source {
+				return MoveRequest{}, ErrInvalidPlan
+			}
+			exact = ReplicaIdentity{
+				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
+				NodeIncarnation: replica.NodeIncarnation,
+				ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint),
+			}
+			break
+		}
+		if !validReplicaIdentity(exact) {
+			return MoveRequest{}, ErrInvalidPlan
+		}
+		if request.RetiringReplica != (ReplicaIdentity{}) && request.RetiringReplica != exact {
+			return MoveRequest{}, ErrInvalidPlan
+		}
+		request.RetiringReplica = exact
+	} else if !validReplicaIdentity(request.RetiringReplica) ||
+		request.RetiringReplica.Member != request.RetiringMember {
+		return MoveRequest{}, ErrInvalidPlan
+	}
+	if _, err := current.Address(request.RetiringReplica.ControlEndpoint); err != nil {
+		return MoveRequest{}, ErrInvalidPlan
+	}
+	return request, nil
 }
 
 func targetManifestForMove(

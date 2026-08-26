@@ -160,6 +160,11 @@ func PlanFailedReplicaReplacement(cut FailedReplicaPlanningCut) (FailedReplicaMo
 		TargetMember:         target.Member,
 		Source:               distribution.EndpointID(source.Endpoint),
 		Target:               target.Endpoint,
+		RetiringReplica: ReplicaIdentity{
+			Member: source.Member, Node: source.Node, StoreID: source.StoreID,
+			NodeIncarnation: source.NodeIncarnation,
+			ControlEndpoint: distribution.EndpointID(source.ControlEndpoint),
+		},
 	})
 	if err != nil {
 		return FailedReplicaMoveIntent{}, err

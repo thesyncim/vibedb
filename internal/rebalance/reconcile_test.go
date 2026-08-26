@@ -55,7 +55,8 @@ func moveTestSnapshot(t testing.TB) *gateway.Snapshot {
 		"donor": "127.0.0.1:7003", "other": "127.0.0.1:7004",
 		"target-native": "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
 		"other-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7202",
-		"donor-control": "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
+		"source-control": "127.0.0.1:7201",
+		"donor-control":  "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
 	}, 9)
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +82,10 @@ func moveTestRequest() MoveRequest {
 		Distribution: "data", Shard: "all", Group: moveTestGroup(),
 		RetiringMember: 1, SnapshotSourceMember: 3, TargetMember: 2,
 		Source: "source", Target: "target",
+		RetiringReplica: ReplicaIdentity{
+			Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11},
+			NodeIncarnation: 21, ControlEndpoint: "source-control",
+		},
 	}
 }
 
@@ -116,7 +121,8 @@ func moveTestPostRemoveCatalog(t testing.TB, plan *Plan, replicaSetVersion uint6
 	endpoints := map[distribution.EndpointID]string{
 		"source": "127.0.0.1:7001", "target": "127.0.0.1:7002",
 		"donor": "127.0.0.1:7003", "other": "127.0.0.1:7004",
-		"target-native": "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
+		"source-control": "127.0.0.1:7201",
+		"target-native":  "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
 		"other-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7202",
 		"donor-control": "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
 	}
