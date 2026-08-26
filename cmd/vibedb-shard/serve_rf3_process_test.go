@@ -22,9 +22,14 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
+	"github.com/thesyncim/vibedb/internal/replicacontrol"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
@@ -165,9 +170,32 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
 	}
 	authority := rf3CommandAuthority()
+	applyOptions := sqldriver.ReplicatedApplyOptions{
+		MaxSessions: 32, RetryWindow: 8,
+		TxnLimits: durable.TxnLimits{
+			MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20,
+		},
+		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format:        sqldriver.ReplicatedPlacementProfileFormat,
+			ShardKey:      gateway.ReplicatedCatalogPrimaryKey,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+	}
 	targetStore := [16]byte{0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
 		0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90}
 	const targetIncarnation = uint64(9)
+	targetListeners := rf3ManifestListeners{
+		Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t),
+		Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t),
+	}
+	target := rf3ManifestEnrolledTarget{
+		MemberID: 4, NodeID: targetNode, StoreID: targetStore,
+		NodeIncarnation: targetIncarnation, PeerAddress: targetListeners.Peer,
+		NativeAddress: targetListeners.Native, SnapshotAddress: targetListeners.Snapshot,
+		ControlAddress: targetListeners.Control,
+	}
 	manifestPaths := make([]string, rf3CommandMembers)
 	for index := 0; index < rf3CommandMembers; index++ {
 		memberRoot := filepath.Join(root, fmt.Sprintf("member-%d", index+1))
@@ -183,19 +211,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			Identity:    identity, Key: key, WAL: walOptions,
 			Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
 			Authority: authority,
-			Apply: sqldriver.ReplicatedApplyOptions{
-				MaxSessions: 32, RetryWindow: 8,
-				TxnLimits: durable.TxnLimits{
-					MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20,
-				},
-				Placement: sqldriver.ReplicatedPlacementProfile{
-					Format:        sqldriver.ReplicatedPlacementProfileFormat,
-					ShardKey:      gateway.ReplicatedCatalogPrimaryKey,
-					TupleVersion:  distribution.CurrentTupleVersion,
-					MapperVersion: distribution.NativeMapperVersion,
-					Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
-				},
-			},
+			Apply:     applyOptions,
 		})
 		if errors.Is(prepareErr, storeio.ErrStrictAllocationUnsupported) ||
 			errors.Is(prepareErr, raftstore.ErrPlatformUnsupported) {
@@ -225,40 +241,25 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		)
 		document = rf3CommandEnrollTarget(
 			document, targetNode, targetStore, targetIncarnation,
-			"127.0.0.1:27400", "127.0.0.1:27500",
-			"127.0.0.1:27600", "127.0.0.1:27700",
+			target.PeerAddress, target.NativeAddress,
+			target.SnapshotAddress, target.ControlAddress,
 		)
 		if err := os.WriteFile(manifestPaths[index], document, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	payload := bytes.Repeat([]byte("shipped-snapshot-source"), 257)
-	descriptor := snapshottransfer.Descriptor{
-		Group: group, SourceMember: 1, TargetMember: 4,
-		TargetStore: targetStore, TargetIncarnation: targetIncarnation,
-		SchemaGeneration: authority.SchemaGeneration, ReplicaSetVersion: 1,
-		SnapshotIndex: 1, SnapshotTerm: 1,
-		Lineage: [32]byte{1}, ArtifactHash: sha256.Sum256(payload),
-		ArtifactBytes: uint64(len(payload)), ChunkBytes: snapshottransfer.MinChunkBytes,
-	}
-	sourceRepository, err := snapshottransfer.OpenRepository(
-		filepath.Join(root, "member-1", "source-artifacts"),
-		snapshottransfer.Limits{MaxArtifacts: 8, MaxArtifactBytes: 1 << 30, MaxDiskBytes: 4 << 30},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for offset := 0; offset < len(payload); {
-		end := min(offset+int(descriptor.ChunkBytes), len(payload))
-		chunk := payload[offset:end]
-		if _, _, err = sourceRepository.Append(descriptor, uint64(offset), chunk, sha256.Sum256(chunk)); err != nil {
-			t.Fatal(err)
-		}
-		offset = end
-	}
-	if err = sourceRepository.Close(); err != nil {
-		t.Fatal(err)
-	}
+	targetKey := raftstore.Key{ID: "rf3-command-key", Wrapped: []byte("explicit-test-wrapped-key")}
+	copy(targetKey.Material[:], keyMaterial)
+	targetProcess := prepareRF3ColdTarget(t, rf3ColdTargetOptions{
+		Root: filepath.Join(root, "member-4"), Group: group, Authority: authority,
+		WAL: walOptions, Apply: applyOptions, Key: targetKey,
+		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
+		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
+		Target: target, Listeners: targetListeners,
+		SourceNode: nodes[0], SourceSnapshotAddress: snapshotAddresses[0],
+		MaxArtifactBytes: 1 << 30,
+	})
+	defer targetProcess.Close(t)
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -353,37 +354,238 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetRepository, err := snapshottransfer.OpenRepository(
-		filepath.Join(root, "target-transfer"),
-		snapshottransfer.Limits{MaxArtifacts: 1, MaxArtifactBytes: 1 << 30, MaxDiskBytes: 2 << 30},
+	targetProcess.Start(t)
+	targetProcess.WaitColdReady(t)
+	networkDeadline := func() time.Time { return time.Now().Add(10 * time.Second) }
+	controlAddressesByNode := make(map[rafttransport.NodeID]string, rf3CommandMembers+1)
+	for index, node := range nodes {
+		controlAddressesByNode[node] = controlAddresses[index]
+	}
+	controlAddressesByNode[targetNode] = target.ControlAddress
+	opener := rf3CommandControlOpener{
+		profile: targetProfile, addresses: controlAddressesByNode, deadline: networkDeadline,
+	}
+	grantClient, err := shardservice.NewMembershipGrantControlClient(
+		opener, networkDeadline, networkDeadline,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer targetRepository.Close()
-	networkDeadline := func() time.Time { return time.Now().Add(10 * time.Second) }
-	receiver := snapshottransfer.Receiver{
-		Repository: targetRepository,
-		Opener: rafttransport.TLSSnapshotStreamOpener{
-			TLS: targetProfile,
-			Open: func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
-				if node != nodes[0] {
-					return nil, rafttransport.ErrNodeNotFound
-				}
-				return (&net.Dialer{}).DialContext(ctx, "tcp", snapshotAddresses[0])
-			},
-			HandshakeDeadline: networkDeadline,
+	var initialRoster [3]membershipgrant.RosterMember
+	for index, node := range nodes {
+		initialRoster[index] = membershipgrant.RosterMember{
+			Member: uint64(index + 1), Node: [16]byte(node),
+		}
+	}
+	grant := membershipgrant.Grant{
+		Group: group, TransitionID: [16]byte{0x41}, MetadataEpoch: 2,
+		CatalogGeneration: 1, InitialReplicaSetVersion: 1,
+		InitialVoters:           [3]uint64{1, 2, 3},
+		InitialRosterDigest:     membershipgrant.CertifiedRosterDigest(group, 1, initialRoster),
+		InitialDescriptorDigest: sha256.Sum256([]byte("rf3-process-catalog-descriptor")),
+		SourceMember:            1, TargetMember: 4, TargetNode: [16]byte(targetNode),
+	}
+	for _, node := range append(append([]rafttransport.NodeID(nil), nodes[:]...), targetNode) {
+		if err = grantClient.InstallMembershipGrant(t.Context(), node, grant); err != nil {
+			t.Fatalf("install grant on %x: %v", node, err)
+		}
+	}
+	authorityIdentity := serviceauthz.Authority{
+		Node: targetNode, Generation: authority.ActivePolicyGeneration,
+	}
+	servingAddresses := append([]string(nil), nativeAddresses[:]...)
+	servingNodes := append([]rafttransport.NodeID(nil), nodes[:]...)
+	learnerState := rf3CommandApplyMembership(
+		t, servingAddresses, servingNodes, targetProfile, authorityIdentity, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration,
+		shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipAddLearner, TransitionID: grant.TransitionID,
+			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
+			SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
 		},
-		ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
-		Workspace: make([]byte, descriptor.ChunkBytes),
+	)
+	sourceClient, err := snapshottransfer.NewSourceControlClient(
+		snapshottransfer.SourceControlClientOptions{
+			Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	transferCtx, cancelTransfer := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancelTransfer()
-	if err = receiver.Receive(transferCtx, nodes[0], descriptor); err != nil {
-		t.Fatalf("shipped source snapshot transfer: %v", err)
+	snapshotRequest := snapshottransfer.SourceControlRequest{
+		Operation: [32]byte{0x51}, Step: [32]byte{0x52}, Group: group,
+		SourceMember: 1, TargetMember: 4, TargetStore: targetStore,
+		TargetIncarnation: targetIncarnation,
+		ReplicaSetVersion: learnerState.Fence.Command.ReplicaSetVersion,
+		SourceNode:        nodes[0],
 	}
-	if _, err = targetRepository.Manifest(descriptor); err != nil {
-		t.Fatalf("target did not publish transferred artifact: %v", err)
+	descriptor, err := sourceClient.PrepareReplicaMoveSnapshot(t.Context(), snapshotRequest)
+	if err != nil {
+		t.Fatalf("prepare source snapshot: %v", err)
+	}
+	bootstrapClient, err := snapshottransfer.NewBootstrapControlClient(
+		snapshottransfer.BootstrapControlClientOptions{
+			Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = bootstrapClient.Execute(t.Context(), targetNode,
+		snapshottransfer.BootstrapRequest{
+			Operation: snapshotRequest.Operation, Step: snapshotRequest.Step,
+			Descriptor: descriptor,
+		}); err != nil {
+		t.Fatalf("bootstrap target: %v", err)
+	}
+	targetProcess.WaitServingReady(t)
+	targetProcess.Restart(t)
+	targetProcess.WaitServingReady(t)
+	if _, err = probeRF3CommandMember(
+		t.Context(), target.NativeAddress, targetNode, targetProfile, targetNode,
+		group, rf3CommandStoreIdentity(1).AllocationGeneration,
+		authority.ActivePolicyGeneration,
+	); err == nil {
+		t.Fatal("learner target served native traffic")
+	}
+	promotedState := rf3CommandApplyMembership(
+		t, servingAddresses, servingNodes, targetProfile, authorityIdentity, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration,
+		shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipPromoteVoter, TransitionID: grant.TransitionID,
+			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
+			SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
+		},
+	)
+	if _, err = probeRF3CommandMember(
+		t.Context(), target.NativeAddress, targetNode, targetProfile, targetNode,
+		group, rf3CommandStoreIdentity(1).AllocationGeneration,
+		authority.ActivePolicyGeneration,
+	); err == nil {
+		t.Fatal("RF4 target served native traffic")
+	}
+	observationClient, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
+		Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observationRequest := replicacontrol.Request{
+		Operation: [32]byte{0x61}, Step: [32]byte{0x62}, Group: group,
+		TargetMember: 4, ExpectedReplicaSetVersion: promotedState.Fence.Command.ReplicaSetVersion,
+	}
+	targetObservation, err := observationClient.Observe(t.Context(), targetNode, observationRequest)
+	if err != nil {
+		t.Fatalf("observe promoted target: %v", err)
+	}
+	binding := targetObservation.State.Binding
+	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
+		From: binding, ExpectedReplicaSetVersion: targetObservation.State.ReplicaSetVersion,
+		SourceMember: 1, TargetMember: 4,
+		ToOwnershipEpoch:  binding.OwnershipEpoch + 1,
+		ToRoutingVersion:  binding.RoutingVersion + 1,
+		ToRouteGeneration: binding.RouteGeneration + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionClient, err := replicaaction.NewClient(replicaaction.ClientOptions{
+		Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, leaderState := rf3CommandFindLeader(
+		t, servingAddresses, servingNodes, targetProfile, authorityIdentity.Node, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+	)
+	rf3CommandExecuteAction(t, actionClient, servingNodes[leader], replicaaction.Request{
+		Operation: [32]byte{0x63}, Step: [32]byte{0x64}, Kind: replicaaction.OwnershipTransition,
+		Fence: rf3CommandServingFence(leaderState.Fence), SourceMember: 1, TargetMember: 4,
+		Command: ownership,
+	})
+	leader, leaderState = rf3CommandFindLeader(
+		t, servingAddresses, servingNodes, targetProfile, authorityIdentity.Node, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+	)
+	if leaderState.Fence.Command.OwnershipEpoch != binding.OwnershipEpoch+1 ||
+		leaderState.Fence.Command.RoutingVersion != binding.RoutingVersion+1 ||
+		leaderState.Fence.Command.RouteGeneration != binding.RouteGeneration+1 {
+		t.Fatalf("ownership transition did not settle: %+v", leaderState.Fence.Command)
+	}
+	sourceState, err := probeRF3CommandMember(
+		t.Context(), nativeAddresses[0], nodes[0], targetProfile, authorityIdentity.Node,
+		group, rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+	)
+	if err != nil {
+		t.Fatalf("capture retiring source fence: %v", err)
+	}
+	removeRequest := shardservice.ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipRemoveVoter, TransitionID: grant.TransitionID,
+		MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
+		SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
+	}
+	if leaderState.LeaderID == grant.SourceMember {
+		beforeTerm := leaderState.Fence.Term
+		_ = rf3CommandApplyMembership(
+			t, servingAddresses, servingNodes, targetProfile, authorityIdentity, group,
+			rf3CommandStoreIdentity(1).AllocationGeneration,
+			shardservice.ReplicatedMembershipRequest{
+				Kind: raftservice.MembershipTransferLeader, TransitionID: grant.TransitionID,
+				MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
+				SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
+			},
+		)
+		leaderState = rf3CommandWaitLeaderWitness(
+			t, servingAddresses, servingNodes, targetProfile, authorityIdentity.Node,
+			group, rf3CommandStoreIdentity(1).AllocationGeneration,
+			authorityIdentity.Generation, grant.TargetMember, beforeTerm,
+		)
+		removeRequest.ExpectedReplicaSetVersion = leaderState.Fence.Command.ReplicaSetVersion
+		removeRequest.TransferTerm = leaderState.Fence.Term
+		response := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, targetProfile,
+			&shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedMembership, Authority: authorityIdentity,
+				Capability: serviceauthz.CapabilityMembership,
+				Fence: shardservice.ReplicatedFence{Group: group,
+					AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+					Command:              leaderState.Fence.Command, MemberID: 4, StoreID: targetStore,
+					NodeIncarnation: targetIncarnation, Term: leaderState.Fence.Term},
+				Membership: removeRequest,
+			})
+		if response.Kind != shardservice.ReplicatedMembershipAccepted {
+			t.Fatalf("target-leader removal response: %+v", response)
+		}
+	} else {
+		removeRequest.TransferTerm = leaderState.Fence.Term
+		_ = rf3CommandApplyMembership(
+			t, servingAddresses, servingNodes, targetProfile, authorityIdentity, group,
+			rf3CommandStoreIdentity(1).AllocationGeneration, removeRequest,
+		)
+	}
+	finalAddresses := []string{nativeAddresses[1], nativeAddresses[2], target.NativeAddress}
+	finalNodes := []rafttransport.NodeID{nodes[1], nodes[2], targetNode}
+	_, finalState := rf3CommandFindLeader(
+		t, finalAddresses, finalNodes, targetProfile, authorityIdentity.Node, group,
+		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+	)
+	if finalState.Fence.Command.ReplicaSetVersion <= promotedState.Fence.Command.ReplicaSetVersion {
+		t.Fatalf("final RF3 did not advance membership: %+v", finalState)
+	}
+	rf3CommandExecuteAction(t, actionClient, nodes[0], replicaaction.Request{
+		Operation: [32]byte{0x65}, Step: [32]byte{0x66}, Kind: replicaaction.SourceRetirement,
+		Fence: raftservice.ServingFence{Group: group,
+			AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+			Command:              finalState.Fence.Command, MemberID: 1,
+			StoreID:         rf3CommandStoreIdentity(1).StoreID,
+			NodeIncarnation: sourceState.Fence.NodeIncarnation, Term: finalState.Fence.Term},
+		SourceMember: 1, TargetMember: 4,
+	})
+	if _, err = probeRF3CommandMember(
+		t.Context(), nativeAddresses[0], nodes[0], targetProfile, authorityIdentity.Node,
+		group, rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+	); err == nil {
+		t.Fatal("retired source continued serving")
 	}
 
 	for _, child := range children {
@@ -469,6 +671,210 @@ type rf3CommandDiagnostic struct {
 	mu      sync.Mutex
 	data    []byte
 	maximum int
+}
+
+type rf3CommandControlOpener struct {
+	profile   *rafttransport.PeerTLS
+	addresses map[rafttransport.NodeID]string
+	deadline  rafttransport.DeadlineFunc
+}
+
+func (opener rf3CommandControlOpener) OpenShardControl(
+	ctx context.Context, node rafttransport.NodeID,
+) (rafttransport.PeerConnection, error) {
+	address, found := opener.addresses[node]
+	if opener.profile == nil || opener.deadline == nil || !found {
+		return nil, errors.New("invalid RF3 command control endpoint")
+	}
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := opener.profile.Client(
+		ctx, raw, node, rafttransport.TrafficShardControl, opener.deadline,
+	)
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return connection, nil
+}
+
+func rf3CommandFindLeader(
+	t testing.TB,
+	addresses []string,
+	nodes []rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	authorityNode rafttransport.NodeID,
+	group raftmember.GroupKey,
+	allocation, generation uint64,
+) (int, shardservice.ReplicatedMemberState) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		for index := range addresses {
+			state, err := probeRF3CommandMember(
+				ctx, addresses[index], nodes[index], profile, authorityNode,
+				group, allocation, generation,
+			)
+			if err == nil && state.Fence.MemberID == state.LeaderID && state.Fence.Term != 0 {
+				return index, state
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("RF3 leader unavailable: %v", ctx.Err())
+	return 0, shardservice.ReplicatedMemberState{}
+}
+
+func rf3CommandRoundTrip(
+	t testing.TB,
+	address string,
+	serverNode rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	request *shardservice.ReplicatedRequest,
+) *shardservice.ReplicatedResponse {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := func() time.Time { return time.Now().Add(10 * time.Second) }
+	connection, err := profile.Client(
+		ctx, raw, serverNode, rafttransport.TrafficShardNative, deadline,
+	)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	response, err := shardservice.RoundTripReplicated(ctx, connection, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func rf3CommandUnusedAddress(t testing.TB) string {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func rf3CommandServingFence(fence shardservice.ReplicatedFence) raftservice.ServingFence {
+	return raftservice.ServingFence{
+		Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+		Command: fence.Command, MemberID: fence.MemberID, StoreID: fence.StoreID,
+		NodeIncarnation: fence.NodeIncarnation, Term: fence.Term,
+	}
+}
+
+func rf3CommandExecuteAction(
+	t testing.TB,
+	client *replicaaction.Client,
+	node rafttransport.NodeID,
+	request replicaaction.Request,
+) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var err error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = client.Execute(ctx, node, request)
+		cancel()
+		if err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("replica action did not settle: %v", err)
+}
+
+func rf3CommandWaitLeaderWitness(
+	t testing.TB,
+	addresses []string,
+	nodes []rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	authorityNode rafttransport.NodeID,
+	group raftmember.GroupKey,
+	allocation, generation, leaderMember, afterTerm uint64,
+) shardservice.ReplicatedMemberState {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		for index := range addresses {
+			state, err := probeRF3CommandMember(
+				ctx, addresses[index], nodes[index], profile, authorityNode,
+				group, allocation, generation,
+			)
+			if err == nil && state.LeaderID == leaderMember && state.Fence.Term > afterTerm {
+				return state
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("leader %d witness unavailable after term %d", leaderMember, afterTerm)
+	return shardservice.ReplicatedMemberState{}
+}
+
+func rf3CommandApplyMembership(
+	t testing.TB,
+	addresses []string,
+	nodes []rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	authority serviceauthz.Authority,
+	group raftmember.GroupKey,
+	allocation uint64,
+	request shardservice.ReplicatedMembershipRequest,
+) shardservice.ReplicatedMemberState {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		leader, state := rf3CommandFindLeader(
+			t, addresses, nodes, profile, authority.Node, group, allocation,
+			authority.Generation,
+		)
+		request.ExpectedReplicaSetVersion = state.Fence.Command.ReplicaSetVersion
+		response := rf3CommandRoundTrip(t, addresses[leader], nodes[leader], profile,
+			&shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedMembership, Authority: authority,
+				Capability: serviceauthz.CapabilityMembership, Fence: state.Fence,
+				Membership: request,
+			})
+		switch response.Kind {
+		case shardservice.ReplicatedMembershipAccepted:
+			if !response.HasState ||
+				request.Kind != raftservice.MembershipTransferLeader &&
+					response.State.Fence.Command.ReplicaSetVersion <= request.ExpectedReplicaSetVersion {
+				t.Fatalf("membership did not advance exact cut: %+v", response)
+			}
+			return response.State
+		case shardservice.ReplicatedNotLeader, shardservice.ReplicatedOutcomeUnknown:
+			time.Sleep(10 * time.Millisecond)
+			continue
+		case shardservice.ReplicatedRefusal:
+			if response.Refusal == shardservice.ReplicatedRefusalMembershipNotCaughtUp {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			t.Fatalf("membership refused: %+v", response)
+		default:
+			t.Fatalf("membership refused: %+v", response)
+		}
+	}
+	t.Fatal("membership action did not settle")
+	return shardservice.ReplicatedMemberState{}
 }
 
 func (diagnostic *rf3CommandDiagnostic) Write(data []byte) (int, error) {

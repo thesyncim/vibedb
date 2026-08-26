@@ -229,6 +229,16 @@ func (process *rf3ColdTargetProcess) WaitServingReady(t testing.TB) {
 	process.waitReady(t, "vibedb-shard RF3 ready", 30*time.Second)
 }
 
+func (process *rf3ColdTargetProcess) Restart(t testing.TB) {
+	t.Helper()
+	process.Close(t)
+	process.mu.Lock()
+	process.command, process.exited, process.diagnostic = nil, nil, nil
+	process.waitErr = nil
+	process.mu.Unlock()
+	process.Start(t)
+}
+
 func (process *rf3ColdTargetProcess) waitReady(t testing.TB, marker string, timeout time.Duration) {
 	t.Helper()
 	if process == nil || process.command == nil {
