@@ -60,16 +60,7 @@ type MembershipClient interface {
 // SnapshotExportRequest binds source preparation/export to the exact journaled
 // operation and action proof. The source returns a fixed-width descriptor for
 // an already-published artifact; exact retries resume its durable cursor.
-type SnapshotExportRequest struct {
-	Operation         [32]byte
-	Step              [32]byte
-	Group             raftmember.GroupKey
-	SourceMember      uint64
-	TargetMember      uint64
-	TargetStore       [16]byte
-	TargetIncarnation uint64
-	ReplicaSetVersion uint64
-}
+type SnapshotExportRequest = snapshottransfer.SourceControlRequest
 
 // SnapshotSource prepares and exports one pinned learner snapshot.
 type SnapshotSource interface {
@@ -280,6 +271,7 @@ func (executor *Executor) executeSnapshot(
 			SourceMember: plan.SnapshotSourceMember(), TargetMember: plan.TargetMember(),
 			TargetStore: cut.Target.StoreID, TargetIncarnation: cut.Target.NodeIncarnation,
 			ReplicaSetVersion: execution.PublicationReplicaSet,
+			SourceNode:        cut.SnapshotSource.Node,
 		},
 	)
 	if err != nil {
