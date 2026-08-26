@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -172,17 +173,32 @@ func newRealAppliedBatchSettlementCycle(
 	tb testing.TB,
 	matched int,
 ) *realAppliedBatchSettlementCycle {
+	return newRealAppliedBatchSettlementCycleWithIdentity(
+		tb, matched, "orders", "0000-7fff", 0,
+	)
+}
+
+func newRealAppliedBatchSettlementCycleWithIdentity(
+	tb testing.TB,
+	matched int,
+	distributionName, shardID string,
+	tenantBytes int,
+) *realAppliedBatchSettlementCycle {
 	tb.Helper()
 	if matched <= 0 || matched > raftmodel.MaxNormalApplyBatchEntries {
 		tb.Fatalf("invalid real settlement match count %d", matched)
 	}
+	if tenantBytes < 0 || tenantBytes > replication.MaxIdentityBytes {
+		tb.Fatalf("invalid real settlement tenant length %d", tenantBytes)
+	}
 	seed := byte(100 + matched%100)
 	memberID := uint64(seed) + 1
 	leaderID := memberID + 1
-	runtime, base := newServingRuntimeWithVoters(
+	runtime, base := newServingRuntimeWithVotersAndIdentity(
 		tb, seed, replicatedstate.MaxSessionRetryWindow,
 		uint64(max(16, matched)),
 		[]uint64{memberID, leaderID},
+		distributionName, shardID,
 	)
 	cycle := &realAppliedBatchSettlementCycle{runtime: runtime, group: runtime.Identity().Group}
 	driveRealSettlementRuntimeIdle(tb, cycle, func(raftmember.AppliedBatch) error { return nil })
@@ -190,8 +206,12 @@ func newRealAppliedBatchSettlementCycle(
 	opens := make([][]byte, matched)
 	for index := range opens {
 		command := servingCommand(base, 0, 1)
+		tenantLength := 1 + (index*131)%replication.MaxIdentityBytes
+		if tenantBytes != 0 {
+			tenantLength = tenantBytes
+		}
 		command.Tenant = bytes.Repeat(
-			[]byte{'t'}, 1+(index*131)%replication.MaxIdentityBytes,
+			[]byte{'t'}, tenantLength,
 		)
 		command.Kind = replication.CommandSessionOpen
 		command.AckThrough = 0
@@ -230,8 +250,12 @@ func newRealAppliedBatchSettlementCycle(
 		// execution may split at the system-collection physical batch limit; the
 		// replay below has no per-session writes and forms one 128-entry batch.
 		command := servingCommand(base, epochs[index], 2)
+		tenantLength := 1 + (index*131)%replication.MaxIdentityBytes
+		if tenantBytes != 0 {
+			tenantLength = tenantBytes
+		}
 		command.Tenant = bytes.Repeat(
-			[]byte{'t'}, 1+(index*131)%replication.MaxIdentityBytes,
+			[]byte{'t'}, tenantLength,
 		)
 		binary.BigEndian.PutUint16(command.ClientID[14:], uint16(index+1))
 		cycle.commands[index] = encodeTestCommand(tb, command)
@@ -401,6 +425,55 @@ func TestRegistryRealAppliedBatchSettlementWarmAllocations(t *testing.T) {
 				t.Fatalf("real warm settlement allocations = %v, want 0", allocs)
 			}
 		})
+	}
+}
+
+func TestRegistryRealAppliedBatchSettlementMaximumIdentity(t *testing.T) {
+	cycle := newRealAppliedBatchSettlementCycleWithIdentity(
+		t, 1,
+		strings.Repeat("d", replication.MaxIdentityBytes),
+		strings.Repeat("s", replication.MaxIdentityBytes),
+		replication.MaxIdentityBytes,
+	)
+	lookup, hasCommand, err := cycle.batch.LookupCompletion(0)
+	if err != nil || !hasCommand {
+		t.Fatalf("real maximum-identity completion lookup = %+v, %v, %v", lookup, hasCommand, err)
+	}
+	if len(lookup.Bytes) != replicatedstate.MaxMutationCompletionEnvelopeBytes {
+		t.Fatalf(
+			"real maximum-identity completion bytes = %d, want %d",
+			len(lookup.Bytes), replicatedstate.MaxMutationCompletionEnvelopeBytes,
+		)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completion.Tenant) != replication.MaxIdentityBytes ||
+		len(completion.Distribution) != replication.MaxIdentityBytes ||
+		len(completion.Shard) != replication.MaxIdentityBytes ||
+		completion.ResultCode != replicatedstate.ResultApplied ||
+		completion.ResultFormat != replicatedstate.ResultFormatMutation ||
+		completion.ResultLength != replicatedstate.MutationCompletionResultBytes ||
+		len(completion.InlineResult) != replicatedstate.MutationCompletionResultBytes {
+		t.Fatalf("real maximum-identity completion = %+v", completion)
+	}
+	affectedRows, err := replicatedstate.OpenMutationCompletionResult(
+		completion.ResultCode, completion.InlineResult,
+	)
+	if err != nil || affectedRows != 1 {
+		t.Fatalf("real maximum-identity affected rows = %d, %v", affectedRows, err)
+	}
+	if err := cycle.run(); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(1_000, func() {
+		if err := cycle.run(); err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("real maximum-identity warm settlement allocations = %v, want 0", allocs)
 	}
 }
 

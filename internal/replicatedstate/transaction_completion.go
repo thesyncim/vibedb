@@ -22,8 +22,8 @@ const (
 
 	transactionCompletionResultBytes = 24
 	// MaxCompletionEnvelopeBytes is the sole shipped completion-envelope bound.
-	// Ordinary mutation/session completions use an empty result, while a
-	// transaction carries one fixed 24-byte result under the same envelope.
+	// A transaction carries the largest fixed result (24 bytes); ordinary
+	// mutation/session completions use the smaller mutation envelope bound.
 	MaxCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + transactionCompletionResultBytes
 )
 

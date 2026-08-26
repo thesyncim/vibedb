@@ -26,8 +26,8 @@ const (
 	// MaxCompletionEnvelopeBytes bounds retained inline completion metadata.
 	MaxCompletionEnvelopeBytes = 128 << 10
 	// MaxEmptyResultCompletionEnvelopeBytes is the largest canonical completion
-	// carrying no inline result bytes. Replicated session mutations currently
-	// use this shape, so a serving result sink can reserve exact bounded scratch
+	// carrying no inline result bytes. Result grammars add their fixed maximum
+	// to this base so a serving result sink can reserve exact bounded scratch
 	// before proposal admission.
 	MaxEmptyResultCompletionEnvelopeBytes = completionHeaderBytes + envelopeChecksumBytes + 3*MaxIdentityBytes
 	// MaxCompletionResultBytes is the largest exact response a digest reference

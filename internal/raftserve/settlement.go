@@ -779,8 +779,16 @@ func validateCompletionLookup(
 			result.Operation != identity.transactionOperation {
 			return ErrSettlementResult
 		}
-	} else if completion.ResultLength != 0 || len(completion.InlineResult) != 0 {
-		return ErrSettlementResult
+	} else {
+		if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
+			completion.ResultLength != uint64(len(completion.InlineResult)) {
+			return ErrSettlementResult
+		}
+		if _, resultErr := replicatedstate.OpenMutationCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		); resultErr != nil {
+			return ErrSettlementResult
+		}
 	}
 	if position.namespace == requestNamespaceOpen {
 		if position.epoch != 0 || completion.ClientEpoch == 0 {

@@ -14,6 +14,11 @@ import (
 // while rejecting negative or noncanonical values at every boundary.
 const MutationCompletionResultBytes = 8
 
+// MaxMutationCompletionEnvelopeBytes is the exact largest inline envelope for
+// an ordinary mutation or session-lifecycle completion. Applied mutations add
+// the fixed affected-row result; refusals and lifecycle results remain empty.
+const MaxMutationCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + MutationCompletionResultBytes
+
 // MaxMutationAffectedRows is the largest ordinary command result admitted by
 // the dense bundle grammar. Every JSON relation may contribute its complete
 // distinct-mutation bound; global-index relations contribute no user-visible

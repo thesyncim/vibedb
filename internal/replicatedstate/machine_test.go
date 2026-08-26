@@ -38,6 +38,10 @@ func (acceptAllMutationValidator) ValidateDelete(_, _ []byte, _ bool) MutationVa
 }
 
 func newMachineFixture(t testing.TB) machineFixture {
+	return newMachineFixtureWithBinding(t, testBinding())
+}
+
+func newMachineFixtureWithBinding(t testing.TB, binding Binding) machineFixture {
 	t.Helper()
 	dir := t.TempDir()
 	openCollection := func(name string, options durable.Options) CollectionTarget {
@@ -61,7 +65,6 @@ func newMachineFixture(t testing.TB) machineFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	binding := testBinding()
 	bootstrap := testBootstrap()
 	options := Options{
 		TxnLimits: durable.TxnLimits{
@@ -340,13 +343,13 @@ func TestMachineLookupCompletionIntoUsesExactCallerStorage(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
-	short := make([]byte, 7, replication.MaxEmptyResultCompletionEnvelopeBytes-1)
+	short := make([]byte, 7, MaxMutationCompletionEnvelopeBytes-1)
 	if lookup, err := fixture.machine.LookupCompletionInto(command, short); !errors.Is(err, ErrCompletionBufferSmall) ||
 		lookup.Key != ([32]byte{}) || len(lookup.Bytes) != 0 ||
 		lookup.AppliedSequence != 0 || len(short) != 7 {
 		t.Fatalf("short lookup = %+v, %v, len %d", lookup, err, len(short))
 	}
-	scratch := make([]byte, 9, replication.MaxEmptyResultCompletionEnvelopeBytes+32)
+	scratch := make([]byte, 9, MaxMutationCompletionEnvelopeBytes+32)
 	lookup, err := fixture.machine.LookupCompletionInto(command, scratch)
 	if err != nil || len(lookup.Bytes) == 0 || lookup.AppliedSequence != 3 ||
 		&lookup.Bytes[0] != &scratch[:cap(scratch)][0] {
@@ -357,6 +360,83 @@ func TestMachineLookupCompletionIntoUsesExactCallerStorage(t *testing.T) {
 	again, err := fixture.machine.LookupCompletionInto(command, scratch)
 	if err != nil || !bytes.Equal(again.Bytes, want) || &again.Bytes[0] != &scratch[:cap(scratch)][0] {
 		t.Fatalf("reused lookup = %+v, %v", again, err)
+	}
+}
+
+func TestMachineMutationCompletionUsesExactMaximumIdentityEnvelope(t *testing.T) {
+	binding := testBinding()
+	binding.Distribution = string(bytes.Repeat([]byte{'d'}, replication.MaxIdentityBytes))
+	binding.Shard = string(bytes.Repeat([]byte{'s'}, replication.MaxIdentityBytes))
+	fixture := newMachineFixtureWithBinding(t, binding)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(binding, 1)
+	prototype.Tenant = bytes.Repeat([]byte{'t'}, replication.MaxIdentityBytes)
+	_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
+	prototype.ClientEpoch = epoch
+	command := encodeCommand(t, prototype)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	short := make([]byte, 0, MaxMutationCompletionEnvelopeBytes-1)
+	if lookup, lookupErr := fixture.machine.LookupCompletionInto(
+		command, short,
+	); !errors.Is(lookupErr, ErrCompletionBufferSmall) || len(lookup.Bytes) != 0 {
+		t.Fatalf("short maximum-identity lookup=%+v err=%v", lookup, lookupErr)
+	}
+	exact := make([]byte, 0, MaxMutationCompletionEnvelopeBytes)
+	lookup, err := fixture.machine.LookupCompletionInto(command, exact)
+	if err != nil || len(lookup.Bytes) != MaxMutationCompletionEnvelopeBytes ||
+		&lookup.Bytes[0] != &exact[:cap(exact)][0] {
+		t.Fatalf("exact maximum-identity lookup=%dB err=%v", len(lookup.Bytes), err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult)
+	if err != nil || rows != 1 {
+		t.Fatalf("maximum-identity result rows=%d err=%v", rows, err)
+	}
+
+	var workspace CompletionLookupWorkspace
+	warmLookup := func() {
+		if beginErr := fixture.machine.BeginCompletionLookupBatch(
+			&workspace, publication,
+		); beginErr != nil {
+			panic(beginErr)
+		}
+		result, lookupErr := fixture.machine.LookupCompletionIntoWorkspace(
+			&workspace, command, exact[:0],
+		)
+		if lookupErr != nil || len(result.Bytes) != MaxMutationCompletionEnvelopeBytes ||
+			&result.Bytes[0] != &exact[:cap(exact)][0] {
+			panic("maximum-identity workspace lookup escaped exact storage")
+		}
+		if endErr := fixture.machine.EndCompletionLookupBatch(&workspace); endErr != nil {
+			panic(endErr)
+		}
+	}
+	if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
+		t.Fatal(err)
+	}
+	if result, lookupErr := fixture.machine.LookupCompletionIntoWorkspace(
+		&workspace, command, short,
+	); !errors.Is(lookupErr, ErrCompletionBufferSmall) || len(result.Bytes) != 0 {
+		t.Fatalf("short workspace lookup=%+v err=%v", result, lookupErr)
+	}
+	if err := fixture.machine.EndCompletionLookupBatch(&workspace); err != nil {
+		t.Fatal(err)
+	}
+	warmLookup()
+	if allocations := testing.AllocsPerRun(1000, warmLookup); allocations != 0 {
+		t.Fatalf("maximum-identity workspace lookup allocations=%v, want 0", allocations)
+	}
+	if err := workspace.Release(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -374,7 +454,7 @@ func TestMachineCompletionLookupWorkspaceIsExactReusableAndAllocationFree(t *tes
 		t.Fatal(err)
 	}
 	var workspace CompletionLookupWorkspace
-	scratch := make([]byte, 0, replication.MaxEmptyResultCompletionEnvelopeBytes)
+	scratch := make([]byte, 0, MaxMutationCompletionEnvelopeBytes)
 	lookup := func() {
 		if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
 			panic(err)
@@ -436,7 +516,7 @@ func BenchmarkMachineCompletionLookupWorkspace(b *testing.B) {
 		b.Fatal(err)
 	}
 	var workspace CompletionLookupWorkspace
-	scratch := make([]byte, 0, replication.MaxEmptyResultCompletionEnvelopeBytes)
+	scratch := make([]byte, 0, MaxMutationCompletionEnvelopeBytes)
 	if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
 		b.Fatal(err)
 	}

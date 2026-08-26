@@ -6,7 +6,19 @@ import (
 	"errors"
 	"math"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/replication"
 )
+
+func TestMutationCompletionEnvelopeBoundIncludesFixedResult(t *testing.T) {
+	if MaxMutationCompletionEnvelopeBytes !=
+		replication.MaxEmptyResultCompletionEnvelopeBytes+MutationCompletionResultBytes {
+		t.Fatalf("mutation completion envelope=%d empty=%d result=%d",
+			MaxMutationCompletionEnvelopeBytes,
+			replication.MaxEmptyResultCompletionEnvelopeBytes,
+			MutationCompletionResultBytes)
+	}
+}
 
 func TestMutationCompletionResultCanonicalRoundTrip(t *testing.T) {
 	for _, rows := range []int64{0, 1, MaxDistinctMutations, MaxMutationAffectedRows} {

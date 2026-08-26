@@ -405,6 +405,24 @@ func TestReplicatedServerCountsExceptionalProposalDowngrades(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid result grammar is outcome unknown", func(t *testing.T) {
+		malformed := testReplicatedCompletionWithResult(
+			t, fence, 8, replicatedstate.ResultApplied,
+			replicatedstate.ResultFormatMutation, nil,
+		)
+		server := testReplicatedServer(&fakeReplicatedOwner{state: state,
+			result: raftservice.Result{Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeCompletion, AppliedIndex: 8,
+				CompletionAppliedSequence: 8, CompletionBytes: len(malformed),
+			}, Completion: malformed}})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalInvalidCompletion != 1 ||
+			stats.ProposalInvalidCompletionReasons != ReplicatedCompletionInvalidResult {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
 	t.Run("settled completion advances response watermarks", func(t *testing.T) {
 		owner := &fakeReplicatedOwner{state: state,
 			result: raftservice.Result{Outcome: raftserve.Outcome{

@@ -440,9 +440,22 @@ func newServingRuntimeWithVoters(
 	maxSessions uint64,
 	voters []uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+	return newServingRuntimeWithVotersAndIdentity(
+		t, seed, retryWindow, maxSessions, voters, "orders", "0000-7fff",
+	)
+}
+
+func newServingRuntimeWithVotersAndIdentity(
+	t testing.TB,
+	seed byte,
+	retryWindow uint16,
+	maxSessions uint64,
+	voters []uint64,
+	distributionName, shardID string,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
 	t.Helper()
 	identity := raftstore.Identity{
-		Distribution: "orders", Shard: "0000-7fff",
+		Distribution: distributionName, Shard: shardID,
 		AllocationGeneration: uint64(seed) + 1,
 		MemberID:             uint64(seed) + 1,
 	}

@@ -24,12 +24,12 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 
 // LookupCompletionInto is LookupCompletion with caller-owned result storage.
 // dst is reused from length zero. It must have capacity for the largest
-// metadata-only session completion so lookup never allocates result bytes.
+// ordinary mutation/session completion so lookup never allocates result bytes.
 func (m *Machine) LookupCompletionInto(
 	data []byte,
 	dst []byte,
 ) (CompletionLookup, error) {
-	if cap(dst) < replication.MaxEmptyResultCompletionEnvelopeBytes {
+	if cap(dst) < MaxMutationCompletionEnvelopeBytes {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
 	result, err := m.lookupCompletion(
@@ -157,7 +157,7 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 	if workspace == nil || workspace.owner != m || workspace.snapshot == nil {
 		return CompletionLookup{}, ErrCompletionWorkspaceBusy
 	}
-	if cap(dst) < replication.MaxEmptyResultCompletionEnvelopeBytes {
+	if cap(dst) < MaxMutationCompletionEnvelopeBytes {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
 	command, err := replication.OpenCommand(data)
@@ -174,7 +174,7 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 	if command.Kind() != replication.CommandTransaction {
 		result, err := m.lookupCompletionAtSnapshot(
 			command,
-			dst[:0:replication.MaxEmptyResultCompletionEnvelopeBytes],
+			dst[:0:MaxMutationCompletionEnvelopeBytes],
 			workspace,
 		)
 		if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
@@ -268,7 +268,7 @@ func (m *Machine) lookupCompletion(
 	if command.Kind() == replication.CommandTransaction && completionScratch != nil {
 		completionScratch = completionScratch[:0:MaxCompletionEnvelopeBytes]
 	} else if completionScratch != nil {
-		completionScratch = completionScratch[:0:replication.MaxEmptyResultCompletionEnvelopeBytes]
+		completionScratch = completionScratch[:0:MaxMutationCompletionEnvelopeBytes]
 	}
 	result, lookupErr := m.lookupCompletionAtSnapshot(
 		command, completionScratch, &workspace,
