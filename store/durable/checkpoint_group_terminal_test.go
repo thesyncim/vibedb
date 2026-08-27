@@ -381,6 +381,7 @@ func checkpointGroupTestStageUncertifiedAtMarkerEpoch(
 		1,
 		members[:1],
 		map[string]*WriteBatch{members[0].Name: write},
+		TxnLimits{MaxCollections: 1, MaxDocuments: 1, MaxBytes: 1 << 20},
 	); err != nil {
 		t.Fatal(err)
 	}

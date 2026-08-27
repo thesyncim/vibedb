@@ -1442,7 +1442,7 @@ func (g *CheckpointGroup) Seed(
 			}
 			continue
 		}
-		err = g.commitTransitionLocked(1, applied, dirty, byName)
+		err = g.commitTransitionLocked(1, applied, dirty, byName, limits)
 		if errors.Is(err, ErrCheckpointGroupPressure) {
 			if err := g.checkpointLocked(); err != nil {
 				return err
@@ -1699,7 +1699,7 @@ func (g *CheckpointGroup) updateLocked(
 				return ErrTxnTooLarge
 			}
 		}
-		err = g.commitTransitionLocked(g.txn+1, update.lastApplied, dirty, batch.byName)
+		err = g.commitTransitionLocked(g.txn+1, update.lastApplied, dirty, batch.byName, limits)
 		if !errors.Is(err, ErrCheckpointGroupPressure) {
 			if err == nil {
 				if update.consecutive {
@@ -1738,6 +1738,7 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	applied uint64,
 	dirty []NamedCollection,
 	byName map[string]*WriteBatch,
+	limits TxnLimits,
 ) (err error) {
 	log := g.log
 	log.commitMu.Lock()
@@ -1776,6 +1777,14 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		}
 	}()
 
+	for _, c := range order {
+		if c.checkpointGroup.Load() != g || c.closed {
+			return ErrCheckpointGroupOwned
+		}
+	}
+	if err := canonicalizePrimaryTransactionBatches(dirty, byName, limits); err != nil {
+		return err
+	}
 	staged := make([]stagedPrimaryBatch, len(order))
 	stagedLive := 0
 	defer func() {
@@ -1787,9 +1796,6 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		}
 	}()
 	for i, c := range order {
-		if c.checkpointGroup.Load() != g || c.closed {
-			return ErrCheckpointGroupOwned
-		}
 		st, stageErr := c.stagePrimaryBatchConditionalLocked(byName[nameOf[c]])
 		if stageErr != nil {
 			return stageErr

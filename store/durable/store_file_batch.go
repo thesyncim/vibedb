@@ -38,6 +38,8 @@ type WriteBatch struct {
 	keys       []byte
 	values     []byte
 	active     bool
+	canonical  bool
+	recovery   bool
 }
 
 type writeBatchEntry struct {
@@ -59,6 +61,8 @@ func (b *WriteBatch) reset() {
 	b.keys = b.keys[:0]
 	b.values = b.values[:0]
 	clear(b.position)
+	b.canonical = false
+	b.recovery = false
 }
 
 // Len reports how many distinct keys the batch will mutate.
@@ -103,6 +107,7 @@ func (b *WriteBatch) Delete(key []byte) error {
 }
 
 func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
+	b.canonical = false
 	// m[string(b)] is the compiler's non-allocating map-read pattern: the string
 	// conversion is used only as the index expression and never escapes.
 	if at, exists := b.position[string(key)]; exists {
@@ -156,6 +161,8 @@ func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
 	b.values = append(b.values, src...)
 	b.entries = append(b.entries, entry)
 	b.position[string(b.key(entry))] = len(b.entries) - 1
+	b.canonical = false
+	b.recovery = true
 	return nil
 }
 

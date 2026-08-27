@@ -768,7 +768,7 @@ func UpdateCollections(
 	if err := checkTxnLimits(limits, len(dirty), totalDocs, totalBytes); err != nil {
 		return err
 	}
-	return log.commitMulti(dirty, ordered, batch.byName)
+	return log.commitMulti(dirty, ordered, batch.byName, limits)
 }
 
 func checkTxnLimits(limits TxnLimits, collections, documents int, bytes int64) error {
@@ -898,6 +898,7 @@ func (l *TxnLog) commitMulti(
 	dirty []NamedCollection,
 	members []NamedCollection,
 	byName map[string]*WriteBatch,
+	limits TxnLimits,
 ) (err error) {
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
@@ -966,6 +967,9 @@ func (l *TxnLog) commitMulti(
 	}
 	if l.nextTxnID == ^uint64(0) {
 		return fmt.Errorf("%w: transaction id space exhausted", ErrTxnTooLarge)
+	}
+	if err := canonicalizePrimaryTransactionBatches(dirty, byName, limits); err != nil {
+		return err
 	}
 
 	staged := make([]stagedPrimaryBatch, len(order))
