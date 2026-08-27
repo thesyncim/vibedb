@@ -688,7 +688,9 @@ func newFailedExecutorFixture(t testing.TB) (*rebalance.Plan, *executorFixture) 
 	}
 	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
-		Command: command,
+		RangeIdentity: [32]byte{0x71}, LineageDigest: [32]byte{0x72},
+		ForwardingRuleDigest: [32]byte{0x73},
+		Command:              command,
 		Replicas: []gateway.ReplicatedReplicaDescriptor{
 			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21, Endpoint: "source", NativeEndpoint: "source-native", ControlEndpoint: "source-control"},
 			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22, Endpoint: "donor", NativeEndpoint: "donor-native", ControlEndpoint: "donor-control"},

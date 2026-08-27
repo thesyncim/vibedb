@@ -130,6 +130,8 @@ func moveTestPostRemoveCatalog(t testing.TB, plan *Plan, replicaSetVersion uint6
 	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: "data", Shard: "all", Group: plan.request.Group,
 		AllocationGeneration: 11,
+		RangeIdentity:        [32]byte{0x71}, LineageDigest: [32]byte{0x72},
+		ForwardingRuleDigest: [32]byte{0x73},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: replicaSetVersion, ActivePolicyGeneration: 2,
 			ProtectionEpoch: 3, OwnershipEpoch: 14, SchemaGeneration: 4,

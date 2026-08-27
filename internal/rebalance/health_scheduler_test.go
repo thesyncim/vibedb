@@ -262,6 +262,8 @@ func failedReplicaTestCut(t testing.TB, candidateCount int) FailedReplicaPlannin
 	}
 	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
+		RangeIdentity: [32]byte{0x71}, LineageDigest: [32]byte{0x72},
+		ForwardingRuleDigest: [32]byte{0x73},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 7, ActivePolicyGeneration: 2, ProtectionEpoch: 3,
 			OwnershipEpoch: 13, SchemaGeneration: 4, RelationManifestDigest: [32]byte{5},
