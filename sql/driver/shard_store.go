@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
@@ -229,6 +230,7 @@ type shardStoreOpenPolicy struct {
 	schemaCheckpointAuthority   [32]byte
 	schemaAuthorization         [32]byte
 	schemaCatalogCAS            [32]byte
+	schemaSourceRecovery        *replicatedstate.SchemaSourceRecoveryProof
 }
 
 // InitializeShardStore explicitly binds a genuinely new SQL storage root and

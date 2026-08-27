@@ -251,6 +251,7 @@ type database struct {
 	schemaCheckpointAuthority [32]byte
 	schemaAuthorization       [32]byte
 	schemaCatalogCAS          [32]byte
+	schemaSourceRecovery      *replicatedstate.SchemaSourceRecoveryProof
 	// distributedTxnCollection is the raw-ID keyed, SQL-invisible participant
 	// state joined atomically with user-table publication. The larger staged
 	// mutation remains in the append-only transaction journal.
@@ -310,6 +311,7 @@ func openDatabaseWithShardStorePolicy(
 		schemaCheckpointAuthority: shardPolicy.schemaCheckpointAuthority,
 		schemaAuthorization:       shardPolicy.schemaAuthorization,
 		schemaCatalogCAS:          shardPolicy.schemaCatalogCAS,
+		schemaSourceRecovery:      shardPolicy.schemaSourceRecovery,
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false

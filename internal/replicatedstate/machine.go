@@ -274,6 +274,9 @@ func OpenBundle(
 		return nil, err
 	}
 	if !present {
+		if options.SchemaSourceRecovery != nil {
+			return nil, ErrSchemaTransition
+		}
 		if m.checkpointGroup != nil && m.checkpointGroup.CheckpointAppliedIndex() != 0 {
 			return nil, fmt.Errorf(
 				"%w: empty system at checkpoint cut %d",
@@ -341,17 +344,25 @@ func OpenBundle(
 			m.checkpointGroup.CheckpointAppliedIndex(),
 		)
 	}
-	if !bindingMatchesFenceOrigin(binding, state) || state.BootstrapDigest != bootstrapDigest ||
-		state.ApplyContractDigest != prepared.applyContract ||
-		state.SessionCount != sessionCount || state.SessionSlotCount != slotCount ||
-		state.AuthorityBindingCount != authorityCount ||
-		state.RelationPlacementDigest != relationPlacementStateDigest(
-			state.Binding.SchemaGeneration, m.manifestDigest, m.relations,
-		) ||
+	sourceRecovery := options.SchemaSourceRecovery != nil
+	if state.BootstrapDigest != bootstrapDigest || state.SessionCount != sessionCount ||
+		state.SessionSlotCount != slotCount || state.AuthorityBindingCount != authorityCount ||
 		state.SessionCount > options.MaxSessions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
 	}
-	if state.LastKind == RecordSchema {
+	if sourceRecovery {
+		if err := m.validateOpenedSchemaSource(state, prepared); err != nil {
+			return nil, err
+		}
+	}
+	if !sourceRecovery && (!bindingMatchesFenceOrigin(binding, state) ||
+		state.ApplyContractDigest != prepared.applyContract ||
+		state.RelationPlacementDigest != relationPlacementStateDigest(
+			state.Binding.SchemaGeneration, m.manifestDigest, m.relations,
+		)) {
+		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+	}
+	if state.LastKind == RecordSchema && !sourceRecovery {
 		if err := validateOpenedSchemaTransition(
 			state, binding, prepared.manifestDigest, prepared.applyContract, options,
 		); err != nil {
@@ -393,6 +404,10 @@ func OpenBundle(
 	m.transactionIntentKeys = openedTransactions.intentKeys
 	m.splitCaptureActivation = openedTransactions.activation
 	m.routeGate = openedRouteGate
+	if sourceRecovery {
+		m.schemaTransitioned = true
+		return m, nil
+	}
 	if openedTransactions.activation != nil {
 		if options.TransitionCaptureFactory == nil || options.TransitionCapture != nil {
 			return nil, ErrSplitCaptureActivation

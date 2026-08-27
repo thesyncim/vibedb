@@ -362,6 +362,19 @@ type Options struct {
 	SchemaMembershipWitness   durable.CheckpointMembershipWitness
 	SchemaAuthorizationDigest [sha256.Size]byte
 	SchemaCatalogCASDigest    [sha256.Size]byte
+	// SchemaSourceRecovery permits only authenticated recovery of a retired
+	// source bundle. It never grants serving authority or selects target files.
+	SchemaSourceRecovery *SchemaSourceRecoveryProof
+}
+
+// SchemaSourceRecoveryProof binds the original catalog preparation to its
+// exact durable Raft entry and source checkpoint membership.
+type SchemaSourceRecoveryProof struct {
+	Command             []byte
+	Membership          durable.CheckpointMembershipWitness
+	AuthorizationDigest [sha256.Size]byte
+	CatalogCASDigest    [sha256.Size]byte
+	SourceApplied       uint64
 }
 
 // RequestLedgerRange is the immutable, apply-contract-bound authority interval

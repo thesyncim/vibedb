@@ -634,6 +634,7 @@ func (d *Database) openReplicatedApply(
 			SchemaMembershipWitness:   core.schemaMembership,
 			SchemaAuthorizationDigest: core.schemaAuthorization,
 			SchemaCatalogCASDigest:    core.schemaCatalogCAS,
+			SchemaSourceRecovery:      core.schemaSourceRecovery,
 		},
 	)
 	if err != nil {
