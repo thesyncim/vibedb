@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 const MaxExecutionPinRecoveryScan = 1024
@@ -38,12 +39,12 @@ func (m *Machine) ExecutionPinRead(
 	if m.publication.Applied < minimumApplied {
 		return ExecutionPinReadResult{}, ErrReadBehind
 	}
-	snapshot, err := m.system.Collection.Snapshot()
+	snapshot, err := m.executionPinReadCutLocked()
 	if err != nil {
 		return ExecutionPinReadResult{}, m.fail(err)
 	}
 	record, found, readErr := executionPinRecordAt(pointSnapshot{value: snapshot}, pin)
-	closeErr := snapshot.Close()
+	closeErr := m.applyCut.Close()
 	if readErr != nil || closeErr != nil {
 		return ExecutionPinReadResult{}, m.fail(errors.Join(readErr, closeErr))
 	}
@@ -66,12 +67,12 @@ func (m *Machine) LookupExecutionPin(pin executionpin.PinID) (executionpin.Recor
 	if !m.initialized {
 		return executionpin.Record{}, false, ErrWrongBinding
 	}
-	snapshot, err := m.system.Collection.Snapshot()
+	snapshot, err := m.executionPinReadCutLocked()
 	if err != nil {
 		return executionpin.Record{}, false, m.fail(err)
 	}
 	record, found, readErr := executionPinRecordAt(pointSnapshot{value: snapshot}, pin)
-	closeErr := snapshot.Close()
+	closeErr := m.applyCut.Close()
 	if readErr != nil || closeErr != nil {
 		return executionpin.Record{}, false, m.fail(errors.Join(readErr, closeErr))
 	}
@@ -98,7 +99,7 @@ func (m *Machine) ScanActiveExecutionPins(
 	if !m.initialized {
 		return nil, ErrWrongBinding
 	}
-	snapshot, err := m.system.Collection.Snapshot()
+	snapshot, err := m.executionPinReadCutLocked()
 	if err != nil {
 		return nil, m.fail(err)
 	}
@@ -133,7 +134,7 @@ func (m *Machine) ScanActiveExecutionPins(
 	if errors.Is(err, errStopExecutionPinScan) {
 		err = nil
 	}
-	closeErr := snapshot.Close()
+	closeErr := m.applyCut.Close()
 	if err != nil || closeErr != nil {
 		return nil, m.fail(errors.Join(err, closeErr))
 	}
@@ -141,3 +142,21 @@ func (m *Machine) ScanActiveExecutionPins(
 }
 
 var errStopExecutionPinScan = errors.New("replicatedstate: stop execution-pin scan")
+
+// The caller holds m.mu and closes the entire reusable cut before returning.
+// A standalone system snapshot can require materialization beyond the durable
+// checkpoint certificate. The database snapshot API delegates that pressure
+// to the collection's owning checkpoint group, certifying every member before
+// retrying. Only the system relation needs a read lease: ordinary pin lookups
+// must not acquire leases or materialize unrelated user/index relations.
+func (m *Machine) executionPinReadCutLocked() (*durable.Snapshot, error) {
+	members := [1]durable.NamedCollection{{Name: systemCollectionName, Collection: m.system.Collection}}
+	if err := durable.SnapshotCollectionsInto(&m.applyCut, members[:]); err != nil {
+		return nil, err
+	}
+	snapshot, ok := m.applyCut.CollectionHandle(m.system.Collection)
+	if !ok || snapshot == nil {
+		return nil, errors.Join(ErrInconsistentSnapshot, m.applyCut.Close())
+	}
+	return snapshot, nil
+}
