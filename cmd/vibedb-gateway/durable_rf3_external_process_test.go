@@ -1344,40 +1344,6 @@ func (client *durableRF3ExternalWireClient) close() {
 	client.connection, client.transport = nil, nil
 }
 
-type durableRF3ExternalWireResponse struct {
-	OK               bool   `json:"ok"`
-	Op               string `json:"op"`
-	RowsAffected     int64  `json:"rows_affected"`
-	ShardsFanned     int    `json:"shards_fanned"`
-	Committed        bool   `json:"committed"`
-	OutcomeUnknown   bool   `json:"outcome_unknown"`
-	RequestID        string `json:"request_id"`
-	RequestDigest    string `json:"request_digest"`
-	InstallationID   string `json:"installation_id"`
-	IssuerEpoch      uint64 `json:"issuer_epoch"`
-	LaneOrdinal      uint16 `json:"lane_ordinal"`
-	GrantDigest      string `json:"grant_digest"`
-	IssuerSequence   uint64 `json:"issuer_sequence"`
-	TerminalRevision uint64 `json:"terminal_revision"`
-	ResultDigest     string `json:"result_digest"`
-	AckToken         string `json:"ack_token"`
-	Applied          uint64 `json:"applied"`
-	CollectionRounds uint64 `json:"collection_rounds"`
-	Error            string `json:"error"`
-}
-
-func durableRF3ExternalExecResponse(
-	t testing.TB,
-	raw []byte,
-) durableRF3ExternalWireResponse {
-	t.Helper()
-	var response durableRF3ExternalWireResponse
-	if err := vibejson.Unmarshal(raw, &response); err != nil {
-		t.Fatalf("decode external exec response=%s err=%v", raw, err)
-	}
-	return response
-}
-
 func durableRF3ExternalAckRequest(
 	t testing.TB,
 	raw []byte,

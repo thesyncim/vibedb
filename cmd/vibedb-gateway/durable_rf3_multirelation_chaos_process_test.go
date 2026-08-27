@@ -247,15 +247,6 @@ func (client *durableRF3ExternalWireClient) ackTerminal(t *testing.T, terminal [
 	return latency
 }
 
-func durableRF3ExternalAssertCommitted(t testing.TB, raw []byte, rows int64, shards int) {
-	t.Helper()
-	response := durableRF3ExternalExecResponse(t, raw)
-	if !response.OK || !response.Committed || response.OutcomeUnknown || response.Error != "" ||
-		response.RowsAffected != rows || response.ShardsFanned != shards {
-		t.Fatalf("multi-relation terminal=%s", raw)
-	}
-}
-
 func durableRF3ExternalChurnInsert(table, prefix string, ordinal int, phase string) serveStatement {
 	return serveStatement{SQL: "INSERT INTO " + table + " VALUES (?)", Params: []serveParam{{
 		Kind: "document", Text: fmt.Sprintf(
