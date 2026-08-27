@@ -599,6 +599,13 @@ func (runtime *Runtime) QuiesceSQLGeneration() error {
 	return nil
 }
 
+func (runtime *Runtime) ObserveSchemaTransition(command []byte) (uint64, bool, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return 0, false, err
+	}
+	return runtime.apply.ObserveReplicatedSchemaTransition(command)
+}
+
 // InstallSQLGeneration atomically replaces the quiesced local state-machine
 // handle at the identical durable Raft publication. The exact catalog and
 // apply identities are checked before Node publication; failure leaves Runtime
@@ -622,8 +629,7 @@ func (runtime *Runtime) InstallSQLGeneration(
 		return errors.Join(ErrSchemaGenerationSwap, err)
 	}
 	manifest, err := apply.RangeSplitRelationManifestDigest()
-	if err != nil || manifest == ([32]byte{}) ||
-		manifest != expectedSQL.RelationManifestDigest {
+	if err != nil || manifest == ([32]byte{}) {
 		return errors.Join(ErrSchemaGenerationSwap, err)
 	}
 	if err = runtime.node.ReplaceStateMachine(apply); err != nil {

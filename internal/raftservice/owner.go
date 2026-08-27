@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -115,6 +116,8 @@ const (
 	requestReplicaRetirement
 	requestInstallExecutionGroup
 	requestRemoveExecutionGroup
+	requestQuiesceSchemaGeneration
+	requestInstallSchemaGeneration
 )
 
 const (
@@ -147,6 +150,10 @@ type ownerRequest struct {
 	sourceMember uint64
 	install      ExecutionGroup
 	publish      func()
+	database     *sqldriver.Database
+	apply        *sqldriver.ReplicatedApply
+	schemaSQL    sqldriver.ReplicatedShardStoreIdentity
+	schemaApply  sqldriver.ReplicatedApplyIdentity
 }
 
 type ownerReply struct {
@@ -182,6 +189,7 @@ type readAuthorization struct {
 	requestLedger  RequestLedgerSource
 	executionPin   ExecutionPinSource
 	minimumApplied uint64
+	generation     *ownerGeneration
 }
 
 type readDelivery struct {
@@ -192,6 +200,47 @@ type readDelivery struct {
 	requestLedger  RequestLedgerSource
 	executionPin   ExecutionPinSource
 	minimumApplied uint64
+	generation     *ownerGeneration
+}
+
+type ownerGeneration struct {
+	pins      atomic.Int64
+	quiescing atomic.Bool
+}
+
+func (generation *ownerGeneration) acquire() bool {
+	if generation == nil || generation.quiescing.Load() {
+		return false
+	}
+	generation.pins.Add(1)
+	if generation.quiescing.Load() {
+		generation.pins.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (generation *ownerGeneration) release() {
+	if generation != nil {
+		generation.pins.Add(-1)
+	}
+}
+
+func (generation *ownerGeneration) quiesce() bool {
+	if generation == nil || !generation.quiescing.CompareAndSwap(false, true) {
+		return false
+	}
+	if generation.pins.Load() != 0 {
+		generation.quiescing.Store(false)
+		return false
+	}
+	return true
+}
+
+func (generation *ownerGeneration) resume() {
+	if generation != nil {
+		generation.quiescing.Store(false)
+	}
 }
 
 const (
@@ -568,6 +617,12 @@ type ownerHost interface {
 	SnapshotBaseCertificate(raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error)
 	Add(*raftmember.Runtime) error
 	Remove(raftmember.GroupKey) error
+	QuiesceSQLGeneration(raftmember.GroupKey) error
+	ObserveSchemaTransition(raftmember.GroupKey, []byte) (uint64, bool, error)
+	InstallSQLGeneration(
+		raftmember.GroupKey, *sqldriver.Database, *sqldriver.ReplicatedApply,
+		sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity,
+	) error
 	RunOne() (multiraft.Progress, bool, error)
 	PopOutbound() (raftmember.OutboundMessage, bool)
 	Close() error
@@ -581,11 +636,12 @@ type MembershipAuthority interface {
 }
 
 type ownerMember struct {
-	identity raftmember.RuntimeIdentity
-	command  CommandFence
-	read     ReadSource
-	recovery TransactionRecoverySource
-	retiring bool
+	identity   raftmember.RuntimeIdentity
+	command    CommandFence
+	read       ReadSource
+	recovery   TransactionRecoverySource
+	retiring   bool
+	generation *ownerGeneration
 }
 
 // ReplicaRetirementRequest is the exact final local-source fence for one
@@ -705,7 +761,7 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 			recovery = options.TransactionRecoverySources[index]
 		}
 		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
-			read: source, recovery: recovery}
+			read: source, recovery: recovery, generation: &ownerGeneration{}}
 	}
 	return &Owner{
 		registry: options.Registry, host: host, groups: groups, members: members,
@@ -963,6 +1019,10 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = owner.removeExecutionGroupNow(
 			request.group, request.install.Identity, request.publish,
 		)
+	case requestQuiesceSchemaGeneration:
+		reply.err = owner.quiesceSchemaGeneration(request)
+	case requestInstallSchemaGeneration:
+		reply.err = owner.installSchemaGeneration(request)
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger,
 		requestReadExecutionPin:
 		member, found := owner.members[request.group]
@@ -1008,7 +1068,12 @@ func (owner *Owner) handle(request ownerRequest) error {
 				reply.err = replicatedstate.ErrReadBehind
 				break
 			}
-			reply.read = readAuthorization{source: member.read, minimumApplied: request.read.minimumApplied}
+			if !member.generation.acquire() {
+				reply.err = ErrServingFence
+				break
+			}
+			reply.read = readAuthorization{source: member.read,
+				minimumApplied: request.read.minimumApplied, generation: member.generation}
 			break
 		}
 		if status.LeaderID != member.identity.MemberID {
@@ -1029,6 +1094,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
 		request.read.delivery.executionPin, _ = member.recovery.(ExecutionPinSource)
 		request.read.delivery.minimumApplied = request.read.minimumApplied
+		request.read.delivery.generation = member.generation
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
 		return nil
@@ -1043,6 +1109,62 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.reply <- reply
 	}
 	return reply.err
+}
+
+func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found || !servingFenceMatchesIdentity(request.fence, member) ||
+		len(owner.pendingReads) != 0 || !member.generation.quiesce() {
+		return ErrServingFence
+	}
+	transition, openErr := replicatedstate.OpenSchemaTransition(request.data)
+	applied, committed, err := owner.host.ObserveSchemaTransition(request.group, request.data)
+	if openErr != nil || err != nil || !committed || applied == 0 ||
+		transition.From.SchemaGeneration != member.command.SchemaGeneration ||
+		transition.ToSchemaGeneration != member.command.SchemaGeneration+1 {
+		member.generation.resume()
+		return errors.Join(openErr, err, ErrServingFence)
+	}
+	if err := owner.host.QuiesceSQLGeneration(request.group); err != nil {
+		member.generation.resume()
+		return err
+	}
+	owner.members[request.group] = member
+	return nil
+}
+
+func (owner *Owner) installSchemaGeneration(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found || request.database == nil || request.apply == nil ||
+		!member.generation.quiescing.Load() || member.generation.pins.Load() != 0 {
+		return ErrServingFence
+	}
+	binding := request.schemaSQL.Binding
+	manifest, manifestErr := request.apply.RangeSplitRelationManifestDigest()
+	if binding.ClusterID != request.group.ClusterID ||
+		binding.ClusterIncarnation != request.group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != request.group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != request.group.ShardIncarnation ||
+		binding.GroupID != request.group.GroupID ||
+		binding.AllocationGeneration != member.identity.AllocationGeneration ||
+		binding.MemberID != member.identity.MemberID || binding.StoreID != member.identity.StoreID ||
+		binding.Authority.SchemaGeneration != member.command.SchemaGeneration+1 ||
+		manifestErr != nil || manifest == ([32]byte{}) {
+		return errors.Join(manifestErr, ErrServingFence)
+	}
+	if err := owner.host.InstallSQLGeneration(
+		request.group, request.database, request.apply, request.schemaSQL, request.schemaApply,
+	); err != nil {
+		return err
+	}
+	member.read = request.apply
+	member.recovery = request.apply
+	member.identity.RelationManifestDigest = manifest
+	member.command.SchemaGeneration = binding.Authority.SchemaGeneration
+	member.command.RelationManifestDigest = manifest
+	member.generation = &ownerGeneration{}
+	owner.members[request.group] = member
+	return nil
 }
 
 func validExecutionGroup(group ExecutionGroup) bool {
@@ -1197,14 +1319,23 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			continue
 		}
 		delete(owner.pendingReads, key)
+		if delivery.state.Load() != readDeliveryPending {
+			continue
+		}
 		reply := ownerReply{err: outcome.Err}
 		if outcome.Err == nil {
+			if !delivery.generation.acquire() {
+				reply.err = ErrServingFence
+				owner.settleReadDelivery(delivery, reply)
+				continue
+			}
 			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
 			// Source was authenticated at admission and remains bound to the
 			// immutable owner member for this allocation.
 			reply.read.source = delivery.source
 			reply.read.recovery = delivery.recovery
 			reply.read.requestLedger = delivery.requestLedger
+			reply.read.generation = delivery.generation
 			reply.read.executionPin = delivery.executionPin
 		}
 		owner.settleReadDelivery(delivery, reply)
@@ -1666,6 +1797,7 @@ func (owner *Owner) ReadPoint(
 	if err != nil {
 		return PointReadResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	value, err := reply.read.source.PointReadInto(
 		request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes,
 		nil,
@@ -1720,6 +1852,7 @@ func (owner *Owner) ReadPointBatch(
 	if err != nil {
 		return PointReadBatchResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	source, ok := reply.read.source.(BatchReadSource)
 	if !ok {
 		return PointReadBatchResult{}, nil, ErrInvalidOwner
@@ -1781,6 +1914,7 @@ func (owner *Owner) ReadTransaction(
 	if err != nil {
 		return TransactionReadResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	records := make([]replicatedstate.TransactionRecoveryRecord, 0, maxRecords)
 	payload := make([]byte, 0, scratchBytes)
 	value, err := reply.read.recovery.TransactionRecoveryReadInto(
@@ -1852,6 +1986,7 @@ func (owner *Owner) ReadRequestLedger(
 	if err != nil {
 		return RequestLedgerReadResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	dst := make([]byte, 0, request.Read.MaxBytes)
 	value, err := reply.read.requestLedger.RequestLedgerReadInto(request.Read, dst)
 	if err != nil {
@@ -1907,6 +2042,7 @@ func (owner *Owner) ReadExecutionPin(
 	if err != nil {
 		return ExecutionPinReadResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	value, err := reply.read.executionPin.ExecutionPinRead(request.Pin, reply.read.minimumApplied)
 	if err != nil {
 		return ExecutionPinReadResult{}, nil, err
@@ -2300,6 +2436,49 @@ func (owner *Owner) ProposeSchemaTransition(
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
 	}
+	return err
+}
+
+// QuiesceSchemaGeneration fences new reads and proposals after the ordered
+// schema transition has settled, drains every escaped read pin, and releases
+// only this group's SQL generation while retaining its live Raft member.
+func (owner *Owner) QuiesceSchemaGeneration(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) error {
+	if owner == nil || ctx == nil || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return ErrInvalidOwner
+	}
+	owned := append([]byte(nil), command...)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestQuiesceSchemaGeneration, group: fence.Group, fence: fence,
+		data: owned, bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+	})
+	return err
+}
+
+// InstallSchemaGeneration publishes target SQL handles into one already
+// quiesced group. Success resumes the same Raft member with a new serving
+// generation; failure transfers no ownership and leaves the group fenced.
+func (owner *Owner) InstallSchemaGeneration(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	if owner == nil || ctx == nil || group == (raftmember.GroupKey{}) ||
+		database == nil || apply == nil {
+		return ErrInvalidOwner
+	}
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestInstallSchemaGeneration, group: group,
+		database: database, apply: apply, schemaSQL: expectedSQL, schemaApply: expectedApply,
+		reply: make(chan ownerReply, 1),
+	})
 	return err
 }
 

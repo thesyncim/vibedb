@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -210,6 +211,20 @@ type snapshotBaseRuntime interface {
 	SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error)
 }
 
+type schemaGenerationRuntime interface {
+	QuiesceSQLGeneration() error
+	InstallSQLGeneration(
+		*sqldriver.Database,
+		*sqldriver.ReplicatedApply,
+		sqldriver.ReplicatedShardStoreIdentity,
+		sqldriver.ReplicatedApplyIdentity,
+	) error
+}
+
+type schemaTransitionObserver interface {
+	ObserveSchemaTransition([]byte) (uint64, bool, error)
+}
+
 type queuedMessage struct {
 	message *pb.Message
 	size    int64
@@ -354,6 +369,7 @@ type groupState struct {
 	nextClass         inputClass
 	failure           error
 	retiring          bool
+	schemaQuiesced    bool
 	trackedLeaderTerm uint64
 }
 
@@ -914,6 +930,66 @@ func (host *Host) RequestTick(key raftmember.GroupKey) error {
 	return nil
 }
 
+// QuiesceSQLGeneration removes one idle group from scheduling while retaining
+// its WAL, RawNode, member incarnation, and replication progress.
+func (host *Host) QuiesceSQLGeneration(key raftmember.GroupKey) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	runtime, ok := group.runtime.(schemaGenerationRuntime)
+	if !ok || group.schemaQuiesced || group.retiring || group.items != 0 ||
+		group.messages.len() != 0 || group.proposals.len() != 0 || group.ticks != 0 ||
+		group.campaigns != 0 || group.runtime.HasPendingResultSettlement() {
+		return ErrGroupBusy
+	}
+	if err = runtime.QuiesceSQLGeneration(); err != nil {
+		return errors.Join(ErrGroupBusy, err)
+	}
+	group.schemaQuiesced = true
+	group.runnable = false
+	return nil
+}
+
+func (host *Host) ObserveSchemaTransition(
+	key raftmember.GroupKey, command []byte,
+) (uint64, bool, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return 0, false, err
+	}
+	observer, ok := group.runtime.(schemaTransitionObserver)
+	if !ok || group.schemaQuiesced {
+		return 0, false, ErrGroupBusy
+	}
+	return observer.ObserveSchemaTransition(command)
+}
+
+// InstallSQLGeneration publishes the exact target SQL handles into a quiesced
+// group and resumes its existing Raft runtime without reconstructing RawNode.
+func (host *Host) InstallSQLGeneration(
+	key raftmember.GroupKey,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	runtime, ok := group.runtime.(schemaGenerationRuntime)
+	if !ok || !group.schemaQuiesced || database == nil || apply == nil {
+		return ErrGroupBusy
+	}
+	if err = runtime.InstallSQLGeneration(database, apply, expectedSQL, expectedApply); err != nil {
+		return err
+	}
+	group.schemaQuiesced = false
+	host.wake(group)
+	return nil
+}
+
 // RequestCampaign retains one exact campaign request. Requests are not
 // coalesced because doing so would change protocol input semantics.
 func (host *Host) RequestCampaign(key raftmember.GroupKey) error {
@@ -931,6 +1007,9 @@ func (host *Host) RequestCampaign(key raftmember.GroupKey) error {
 }
 
 func (host *Host) admitInput(group *groupState, size int64) error {
+	if group.schemaQuiesced {
+		return ErrGroupBusy
+	}
 	if size < 0 || group.items >= host.limits.MaxGroupItems || host.queueItems >= host.limits.MaxQueueItems ||
 		size > host.limits.MaxGroupBytes-group.bytes || size > host.limits.MaxQueueBytes-host.queueBytes {
 		return ErrQueueFull
@@ -1013,7 +1092,8 @@ func (host *Host) RunOne() (Progress, bool, error) {
 	blockedOutbox := false
 	for range count {
 		group := host.popRunnable()
-		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
+		if group == nil || group.runtime == nil || group.failure != nil || group.retiring ||
+			group.schemaQuiesced {
 			continue
 		}
 		host.readyGroup = group

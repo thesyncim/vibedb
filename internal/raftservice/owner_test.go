@@ -23,6 +23,28 @@ func newDeliveryTestOwner() *Owner {
 	}
 }
 
+func TestOwnerGenerationPinsFenceQuiesceRace(t *testing.T) {
+	generation := &ownerGeneration{}
+	if !generation.acquire() || generation.pins.Load() != 1 {
+		t.Fatal("first generation pin refused")
+	}
+	if generation.quiesce() {
+		t.Fatal("generation quiesced with a live pin")
+	}
+	generation.quiescing.Store(true)
+	if generation.acquire() || generation.pins.Load() != 1 {
+		t.Fatal("quiescing generation admitted a new pin")
+	}
+	generation.release()
+	if generation.pins.Load() != 0 {
+		t.Fatalf("pins after release=%d", generation.pins.Load())
+	}
+	generation.resume()
+	if !generation.quiesce() || generation.pins.Load() != 0 {
+		t.Fatal("drained generation did not quiesce")
+	}
+}
+
 func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
 	owner := newDeliveryTestOwner()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +158,8 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	var contextKey [16]byte
 	contextKey[0], contextKey[15] = 3, 9
 	source := &ownerTestReadSource{}
-	delivery := &readDelivery{reply: make(chan ownerReply, 1), source: source, minimumApplied: 23}
+	delivery := &readDelivery{reply: make(chan ownerReply, 1), source: source,
+		minimumApplied: 23, generation: &ownerGeneration{}}
 	owner.pendingReads[contextKey] = delivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 17,
@@ -153,7 +176,8 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 		t.Fatal("settled read retained")
 	}
 
-	barrierDelivery := &readDelivery{reply: make(chan ownerReply, 1), source: source, minimumApplied: 11}
+	barrierDelivery := &readDelivery{reply: make(chan ownerReply, 1), source: source,
+		minimumApplied: 11, generation: &ownerGeneration{}}
 	owner.pendingReads[contextKey] = barrierDelivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 19,

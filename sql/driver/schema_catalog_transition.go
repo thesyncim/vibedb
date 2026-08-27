@@ -78,3 +78,19 @@ func (a *ReplicatedApply) AppendReplicatedSchemaTransition(
 		CatalogCASDigest:    authority.CatalogCASDigest,
 	})
 }
+
+// ObserveReplicatedSchemaTransition proves command is the exact durable final
+// entry of this source generation without reopening relation snapshots.
+func (a *ReplicatedApply) ObserveReplicatedSchemaTransition(
+	command []byte,
+) (uint64, bool, error) {
+	if a == nil || a.database == nil {
+		return 0, false, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return 0, false, err
+	}
+	return a.machine.ObserveSchemaTransition(command)
+}

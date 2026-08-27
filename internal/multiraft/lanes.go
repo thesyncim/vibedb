@@ -8,6 +8,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -181,6 +182,30 @@ func (lane *ExecutionLane) Remove(key raftmember.GroupKey) error {
 		return err
 	}
 	return lane.set.Remove(key)
+}
+func (lane *ExecutionLane) QuiesceSQLGeneration(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.QuiesceSQLGeneration(key)
+}
+func (lane *ExecutionLane) ObserveSchemaTransition(
+	key raftmember.GroupKey, command []byte,
+) (uint64, bool, error) {
+	if err := lane.accepts(key); err != nil {
+		return 0, false, err
+	}
+	return lane.set.ObserveSchemaTransition(key, command)
+}
+func (lane *ExecutionLane) InstallSQLGeneration(
+	key raftmember.GroupKey, database *sqldriver.Database, apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.InstallSQLGeneration(key, database, apply, expectedSQL, expectedApply)
 }
 
 // Add transfers a Runtime to this exact deterministic lane. It exists for
@@ -386,6 +411,36 @@ func (set *ExecutionLanes) withGroup(
 
 func (set *ExecutionLanes) Remove(key raftmember.GroupKey) error {
 	return set.withGroup(key, func(host *Host) error { return host.Remove(key) })
+}
+
+func (set *ExecutionLanes) QuiesceSQLGeneration(key raftmember.GroupKey) error {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return err
+	}
+	return lane.host.QuiesceSQLGeneration(key)
+}
+
+func (set *ExecutionLanes) ObserveSchemaTransition(
+	key raftmember.GroupKey, command []byte,
+) (uint64, bool, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return 0, false, err
+	}
+	return lane.host.ObserveSchemaTransition(key, command)
+}
+
+func (set *ExecutionLanes) InstallSQLGeneration(
+	key raftmember.GroupKey, database *sqldriver.Database, apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return err
+	}
+	return lane.host.InstallSQLGeneration(key, database, apply, expectedSQL, expectedApply)
 }
 
 func (set *ExecutionLanes) EnqueueMessage(key raftmember.GroupKey, message *pb.Message) error {

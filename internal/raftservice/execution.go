@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 var ErrExecutionGroup = errors.New("raftservice: group is not assigned to an execution lane owner")
@@ -308,6 +309,27 @@ func (owners *ExecutionOwners) ProposeSchemaTransition(ctx context.Context, fenc
 		return err
 	}
 	return owner.ProposeSchemaTransition(ctx, fence, command)
+}
+func (owners *ExecutionOwners) QuiesceSchemaGeneration(ctx context.Context, fence ServingFence, command []byte) error {
+	owner, err := owners.owner(fence.Group)
+	if err != nil {
+		return err
+	}
+	return owner.QuiesceSchemaGeneration(ctx, fence, command)
+}
+func (owners *ExecutionOwners) InstallSchemaGeneration(
+	ctx context.Context, group raftmember.GroupKey,
+	database *sqldriver.Database, apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	owner, err := owners.owner(group)
+	if err != nil {
+		return err
+	}
+	return owner.InstallSchemaGeneration(
+		ctx, group, database, apply, expectedSQL, expectedApply,
+	)
 }
 func (owners *ExecutionOwners) RetireReplicaSource(ctx context.Context, request ReplicaRetirementRequest) error {
 	owner, err := owners.owner(request.Fence.Group)
