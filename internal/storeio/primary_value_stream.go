@@ -29,7 +29,15 @@ type PrimaryValueGraphStreamBuilder struct {
 func NewPrimaryValueGraphStreamBuilder(
 	sink PrimaryGraphBuildSink, summaries []vibejson.CompiledPointer,
 ) (*PrimaryValueGraphStreamBuilder, error) {
-	planner, err := NewPrimaryValueLeafWindowPlanner(summaries)
+	return NewPrimaryValueGraphStreamBuilderOptions(sink, summaries, false)
+}
+
+// NewPrimaryValueGraphStreamBuilderOptions preserves the collection's opaque
+// value contract while retaining the same bounded streaming graph build.
+func NewPrimaryValueGraphStreamBuilderOptions(
+	sink PrimaryGraphBuildSink, summaries []vibejson.CompiledPointer, opaque bool,
+) (*PrimaryValueGraphStreamBuilder, error) {
+	planner, err := NewPrimaryValueLeafWindowPlannerOptions(summaries, opaque)
 	if err != nil {
 		return nil, err
 	}

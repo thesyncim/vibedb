@@ -16,7 +16,18 @@ type PrimaryValueLeafWindowPlanner struct {
 func NewPrimaryValueLeafWindowPlanner(
 	summaries []vibejson.CompiledPointer,
 ) (*PrimaryValueLeafWindowPlanner, error) {
+	return NewPrimaryValueLeafWindowPlannerOptions(summaries, false)
+}
+
+// NewPrimaryValueLeafWindowPlannerOptions configures JSON summaries and the
+// collection's immutable opaque-value policy on the one reusable builder.
+func NewPrimaryValueLeafWindowPlannerOptions(
+	summaries []vibejson.CompiledPointer, opaque bool,
+) (*PrimaryValueLeafWindowPlanner, error) {
 	builder := NewUnifiedPrimaryLeafBuilder()
+	if err := builder.SetOpaqueValues(opaque); err != nil {
+		return nil, err
+	}
 	if err := builder.SetCompactPrimarySummaries(summaries); err != nil {
 		return nil, err
 	}

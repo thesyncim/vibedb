@@ -16,7 +16,8 @@ type GenerationMigrationChainedSink struct {
 	file                        *os.File
 	storeID                     [16]byte
 	generation                  uint64
-	pageSize, chunkBytes        uint32
+	pageSize, maxChunkBytes     uint32
+	nextChunkBytes              uint64
 	logicalIDsPerChunk          uint64
 	grow                        GenerationMigrationStagingGrowFunc
 	scratch                     []byte
@@ -39,7 +40,8 @@ func NewGenerationMigrationChainedSink(
 	}
 	return &GenerationMigrationChainedSink{
 		file: file, storeID: storeID, generation: generation,
-		pageSize: pageSize, chunkBytes: chunkBytes,
+		pageSize: pageSize, maxChunkBytes: chunkBytes,
+		nextChunkBytes:     min(uint64(chunkBytes), max(uint64(pageSize), uint64(64<<10))),
 		logicalIDsPerChunk: logicalIDsPerChunk,
 		scratch:            scratch, grow: grow,
 	}, nil
@@ -105,7 +107,9 @@ func (s *GenerationMigrationChainedSink) EnsureContiguousBuildBytes(minimum uint
 	if s.writer != nil && s.allocatedBytes != s.writer.written {
 		return ErrBatchState
 	}
-	request := max(minimum, uint64(s.chunkBytes))
+	request := max(minimum, s.nextChunkBytes)
+	request = min(request, uint64(s.maxChunkBytes))
+	request = max(request, minimum)
 	logicalIDs := max(s.logicalIDsPerChunk, request/uint64(s.pageSize))
 	reservation, manifest, err := s.grow(request, logicalIDs)
 	if err != nil {
@@ -126,6 +130,9 @@ func (s *GenerationMigrationChainedSink) EnsureContiguousBuildBytes(minimum uint
 	s.scratchUsed = 0
 	s.nextLogicalID = reservation.FirstLogicalID
 	s.finalFileEnd = manifest.TargetFileEnd
+	if s.nextChunkBytes < uint64(s.maxChunkBytes) {
+		s.nextChunkBytes = min(uint64(s.maxChunkBytes), s.nextChunkBytes<<1)
+	}
 	return nil
 }
 

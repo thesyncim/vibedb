@@ -251,7 +251,7 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	if c == nil {
 		return report, ErrClosed
 	}
-	if len(c.options.indexes) != 0 || c.options.OpaqueValues {
+	if len(c.options.indexes) != 0 {
 		return report, storeio.ErrInvalidWrite
 	}
 	c.writer.Lock()
@@ -407,8 +407,7 @@ func (c *Collection) buildOnlineCompactionGeneration(
 	var result onlineCompactionBuild
 	sink, err := storeio.NewGenerationMigrationChainedSink(
 		c.file, c.storeID, manifest.TargetGeneration,
-		uint32(c.options.PageSize), uint32(c.options.MaxPageSize),
-		uint64(c.options.MaxPageSize)/uint64(c.options.PageSize),
+		uint32(c.options.PageSize), 4<<20, 1,
 		make([]byte, max(c.options.MaxPageSize, 512<<10)),
 		func(bytes, logicalIDs uint64) (storeio.UnrootedGenerationReservation, storeio.GenerationMigrationManifest, error) {
 			return c.growOnlineMigrationStaging(manifestStore, bytes, logicalIDs)
@@ -417,7 +416,9 @@ func (c *Collection) buildOnlineCompactionGeneration(
 	if err != nil {
 		return result, err
 	}
-	builder, err := storeio.NewPrimaryValueGraphStreamBuilder(sink, c.options.skipIndexes)
+	builder, err := storeio.NewPrimaryValueGraphStreamBuilderOptions(
+		sink, c.options.skipIndexes, c.options.OpaqueValues,
+	)
 	if err != nil {
 		return result, err
 	}

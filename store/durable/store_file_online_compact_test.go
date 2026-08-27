@@ -1,6 +1,8 @@
 package durable
 
 import (
+	"bytes"
+	"os"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -52,6 +54,44 @@ func TestOnlineCompactionManifestAndChainedExtentSurviveReopen(t *testing.T) {
 		reopenedManifest.TargetFileEnd != linked.TargetFileEnd {
 		t.Fatalf("reopened manifest=%+v err=%v", reopenedManifest, err)
 	}
+}
+
+func TestCompactOnlinePreservesOpaqueInlineAndOverflowValues(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "online-compact-opaque-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testBatchOptions(8)
+	options.OpaqueValues = true
+	options.InlineValueBytes = 64
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inline := []byte{0xff, 0, 1, 2}
+	overflow := bytes.Repeat([]byte{0, 0xfe, 0x80}, 100)
+	if _, err := collection.Put([]byte("inline"), inline); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collection.Put([]byte("overflow"), overflow); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collection.CompactOnline(); err != nil {
+		t.Fatal(err)
+	}
+	assertOpaqueValue(t, collection, []byte("inline"), inline)
+	assertOpaqueValue(t, collection, []byte("overflow"), overflow)
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertOpaqueValue(t, reopened, []byte("inline"), inline)
+	assertOpaqueValue(t, reopened, []byte("overflow"), overflow)
 }
 
 func TestCompactOnlineInstallsReopenableServingRoot(t *testing.T) {
