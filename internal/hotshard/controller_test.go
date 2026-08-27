@@ -117,6 +117,25 @@ func TestControllerFeedsReplicaMoveScheduler(t *testing.T) {
 	}
 }
 
+func TestControllerSplitOnlyPolicyDoesNotInventReplicaAuthority(t *testing.T) {
+	catalog, source, nodes := hotCatalog(t)
+	policy := hotPolicy()
+	policy.DisableMoves = true
+	policy.Tracker.WindowCount = 8
+	policy.Tracker.RequiredWindows = 8
+	controller, err := New(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &admissionSink{}
+	view := hotView(source, nodes, 1)
+	view.Reports[0].Demand[autosplit.ResourceLiveBytes] = 300
+	admission, err := controller.Process(context.Background(), catalog, view, sink)
+	if err != nil || !admission.Empty() || sink.calls != 0 {
+		t.Fatalf("split-only admission=%+v calls=%d err=%v", admission, sink.calls, err)
+	}
+}
+
 func TestControllerDoesNotComposeSplitAndMoveForSameAllocation(t *testing.T) {
 	catalog, source, nodes := hotCatalog(t)
 	controller, _ := New(hotPolicy())

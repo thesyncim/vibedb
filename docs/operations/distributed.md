@@ -15,7 +15,7 @@ For a task-oriented setup, start with:
 
 | Path | Command | Contract |
 | --- | --- | --- |
-| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 starts one no-HA member for each of the catalog, request-ledger, and data roles. Replica count 3 starts three independent RF3 groups and one gateway. |
+| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 starts one no-HA member for each of the catalog, request-ledger, and data roles. Replica count 3 starts three independent RF3 groups and one gateway, with distinct process identities and a generated authenticated replica-control manifest. |
 | Static shard | `vibedb-shard serve` | One local store and a local ownership fence. No Raft election or copied-store revocation. |
 | RF3 preparation | `vibedb-shard prepare-rf3 -manifest <path>` | Atomic, fail-if-present creation of one member's WAL, SQL root, retained identities, key copy, and serving manifest. |
 | Replicated shard | `vibedb-shard serve-rf3 -manifest <path>` | One prepared Raft member with quorum writes, leader `ReadIndex`, authenticated peer, native, snapshot, and control traffic, and replica-move services. |
@@ -129,9 +129,13 @@ is not accepted in plaintext mode. See [Operate replica lifecycle](replica-lifec
 
 Add `-hot-shard-capacity <path>` to record routed request pressure and publish a
 bounded canonical pressure cut through catalog RF3. `-hot-shard-interval`
-controls when publication is attempted. It is not correctness authority. The
-command does not run the internal pressure controller or its operation sink, so
-this option does not automatically split or move a shard.
+controls when publication is attempted. It is not correctness authority. When
+`-replica-control-manifest` is also present, the gateway consumes each cut with
+the clockless controller and submits at most one idempotent split or replica
+move for the current catalog generation through the replicated catalog
+operation journal. Without the control manifest, startup fails closed instead
+of inventing topology authority. Scheduling is per physical RF3 allocation;
+tenants are neither pinned to nor used as the unit of shard ownership.
 
 ## Range-split status
 

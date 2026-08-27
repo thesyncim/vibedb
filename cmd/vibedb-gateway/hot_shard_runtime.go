@@ -45,8 +45,24 @@ type gatewayHotShardOperationAuthorities struct {
 
 type refusingGatewayHotShardSink struct{}
 
+var errGatewayHotShardMissingOperationAuthority = errors.New(
+	"gateway: hot-shard automation requires replicated catalog and authenticated replica-control manifest",
+)
+
 func (refusingGatewayHotShardSink) SubmitHotShardAdmission(context.Context, hotshard.Admission) error {
 	return hotshard.ErrInvalidPressureCut
+}
+
+func validateGatewayHotShardServeMode(
+	capacityPath, controlManifestPath string, devStaticCatalog, devPlaintext bool,
+) error {
+	if capacityPath == "" {
+		return nil
+	}
+	if controlManifestPath == "" || devStaticCatalog || devPlaintext {
+		return errGatewayHotShardMissingOperationAuthority
+	}
+	return nil
 }
 
 func loadGatewayHotShardCapacity(path string) (hotshard.StaticCapacityConfig, error) {
@@ -102,6 +118,15 @@ func (runtime *gatewayHotShardRuntime) InstallOperationAuthorities(
 	defer runtime.mu.Unlock()
 	if runtime.operationsBound {
 		return false
+	}
+	if splits && !moves {
+		policy := hotshard.DefaultPolicy()
+		policy.DisableMoves = true
+		controller, err := hotshard.New(policy)
+		if err != nil {
+			return false
+		}
+		runtime.controller = controller
 	}
 	runtime.operations = authorities
 	runtime.operationsBound = true
@@ -218,7 +243,11 @@ func (runtime *gatewayHotShardRuntime) rebuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	controller, err := hotshard.New(hotshard.DefaultPolicy())
+	policy := hotshard.DefaultPolicy()
+	if runtime.operationsBound && runtime.operations.splits != nil && runtime.operations.moveRun == nil {
+		policy.DisableMoves = true
+	}
+	controller, err := hotshard.New(policy)
 	if err != nil {
 		return err
 	}

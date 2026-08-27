@@ -188,6 +188,12 @@ func runServe(args []string) int {
 		fmt.Fprintln(os.Stderr, "gateway: schema rollout requires replicated catalog and authenticated replica-control manifest")
 		return 2
 	}
+	if err := validateGatewayHotShardServeMode(
+		*hotShardCapacity, *replicaControlManifestPath, *devStaticCatalog, *devPlaintext,
+	); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	if *devStaticCatalog {
 		if !*devPlaintext || *catalogBootstrapIfMissing || *catalogRelation != 0 ||
 			*hotShardCapacity != "" || *durableAckKeyPath != "" {
@@ -467,15 +473,19 @@ func runServe(args []string) int {
 		moveController, controllerErr := newGatewayReplicaMoveController(
 			catalogAuthority, replicated, controls,
 		)
+		hotAuthorities := gatewayHotShardOperationAuthorities{
+			splits: splitFactory, journal: catalogAuthority,
+		}
+		if len(manifest.Candidates) != 0 {
+			hotAuthorities.moves = gatewayHotReplicaMoveFactory{
+				observations: controls.HealthObservations, grants: catalogAuthority,
+			}
+			hotAuthorities.moveRun = moveController
+		}
 		var hotShardBindErr error
 		if hotShardRuntime != nil && (controllerErr != nil || controlsErr != nil ||
 			childPrepareErr != nil || splitFactoryErr != nil ||
-			!hotShardRuntime.InstallOperationAuthorities(gatewayHotShardOperationAuthorities{
-				splits: splitFactory, journal: catalogAuthority,
-				moves: gatewayHotReplicaMoveFactory{observations: controls.HealthObservations,
-					grants: catalogAuthority},
-				moveRun: moveController,
-			})) {
+			!hotShardRuntime.InstallOperationAuthorities(hotAuthorities)) {
 			hotShardBindErr = hotshard.ErrInvalidPressureCut
 		}
 		healthController, healthErr := newGatewayReplicaHealthRuntime(

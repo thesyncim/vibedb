@@ -86,3 +86,25 @@ func TestGatewayReplicaControlManifestCanonicalExactAndInventoryBound(t *testing
 		}
 	}
 }
+
+func TestGatewayReplicaControlManifestAllowsCertifiedSplitOnlyInventory(t *testing.T) {
+	_, persisted := gatewayReplicaManifestFixture(t)
+	persisted.Candidates = nil
+	raw, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var local [16]byte
+	local[0] = 1
+	manifest, err := openGatewayReplicaControlManifest(raw, local)
+	if err != nil || len(manifest.Candidates) != 0 || len(manifest.Shards) == 0 {
+		t.Fatalf("manifest=%+v err=%v", manifest, err)
+	}
+	catalog := &gateway.Snapshot{}
+	certificate := rebalance.FailureQuorumCertificate{CatalogGeneration: catalog.Generation(),
+		ConfirmedEpoch: 1, Group: raftmember.GroupKey{TopologyRecoveryEpoch: 1}}
+	candidates, err := manifest.ReplacementCandidates(t.Context(), catalog, certificate)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("split-only candidates=%+v err=%v", candidates, err)
+	}
+}

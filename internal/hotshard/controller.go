@@ -56,6 +56,7 @@ type Policy struct {
 	Split                  topologyscheduler.Policy
 	Move                   topologyscheduler.ReplicaMovePolicy
 	MoveTriggerPressurePPM uint64
+	DisableMoves           bool
 }
 
 func DefaultPolicy() Policy {
@@ -352,7 +353,7 @@ func (c *Controller) consumeReports(catalog *gateway.Snapshot, view View) (int, 
 			c.splitGroups[splitCount] = report.Group
 			splitCount++
 		}
-		if recommendation.CurrentPressurePPM >= c.policy.MoveTriggerPressurePPM &&
+		if !c.policy.DisableMoves && recommendation.CurrentPressurePPM >= c.policy.MoveTriggerPressurePPM &&
 			report.Demand != (autosplit.CapacityVector{}) {
 			c.moveCandidates[moveCount] = topologyscheduler.ReplicaMoveCandidate{
 				CatalogGeneration: view.CatalogGeneration, Source: recommendation.Source,

@@ -33,13 +33,20 @@ Choose an empty absolute directory and start the cluster:
 
 The command generates a local CA and node certificates, a canonical
 authorization policy, a WAL key, a durable ACK key, nine prepared member roots,
-a generation-one catalog seed, and durable gateway journals. It reserves
+a generation-one catalog seed, a strict replica-control manifest, provisioned
+hot-shard capacity, and durable gateway journals. Every role process has a
+distinct authenticated NodeID and exact control/snapshot inventory. It reserves
 loopback ports and starts three members for each role. It waits for all nine
 members before it starts the gateway. The gateway publishes the catalog seed
 only when catalog RF3 is empty. The same replicated mutation publishes the
 generation-one head, head witness, and immutable genesis proof. The command
 prints the client endpoint only after every child reports ready.
 `SIGINT` or `SIGTERM` drains and reaps the child processes.
+
+The generated control inventory is deliberately split-only. The local topology
+has no cold target process that can truthfully accept another RF3 group, so it
+does not advertise replica-move candidates. Automatic replica movement requires
+an operator-supplied inventory containing certified target hosts.
 
 Run the same command with the same root to reopen the retained cluster. It
 validates the canonical `cluster.vibejson` and completes a previously

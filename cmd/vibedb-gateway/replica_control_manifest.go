@@ -161,7 +161,7 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 		}}
 	if manifest.Generation == 0 || !validGatewayReplicaTLSReferences(manifest.TLS) ||
 		!validGatewayReplicaBounds(manifest.Bounds) || len(persisted.ShardEndpoints) == 0 ||
-		len(persisted.GatewayEndpoints) == 0 || len(persisted.Candidates) == 0 ||
+		len(persisted.GatewayEndpoints) == 0 ||
 		!validGatewaySplitTemplate(manifest.SplitTemplate) {
 		return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 	}
@@ -321,8 +321,7 @@ func (manifest gatewayReplicaControlManifest) ReplacementCandidates(
 	_ context.Context, catalog *gateway.Snapshot, certificate rebalance.FailureQuorumCertificate,
 ) ([]rebalance.ReplacementCandidate, error) {
 	if catalog == nil || certificate.CatalogGeneration != catalog.Generation() ||
-		certificate.ConfirmedEpoch == 0 || certificate.Group.TopologyRecoveryEpoch == 0 ||
-		len(manifest.Candidates) == 0 {
+		certificate.ConfirmedEpoch == 0 || certificate.Group.TopologyRecoveryEpoch == 0 {
 		return nil, errGatewayReplicaControlManifest
 	}
 	result := make([]rebalance.ReplacementCandidate, len(manifest.Candidates))

@@ -51,6 +51,30 @@ func TestGatewayHotShardCapacityRequiresCanonicalBoundedFile(t *testing.T) {
 	}
 }
 
+func TestGatewayHotShardServeModeRequiresExactReplicatedOperationAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name                 string
+		capacity, control    string
+		devStatic, devPlain  bool
+		wantMissingAuthority bool
+	}{
+		{name: "disabled"},
+		{name: "authenticated", capacity: "capacity.vibejson", control: "replicas.vibejson"},
+		{name: "missing-control", capacity: "capacity.vibejson", wantMissingAuthority: true},
+		{name: "local-catalog", capacity: "capacity.vibejson", control: "replicas.vibejson", devStatic: true, wantMissingAuthority: true},
+		{name: "plaintext", capacity: "capacity.vibejson", control: "replicas.vibejson", devPlain: true, wantMissingAuthority: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateGatewayHotShardServeMode(
+				test.capacity, test.control, test.devStatic, test.devPlain,
+			)
+			if errors.Is(err, errGatewayHotShardMissingOperationAuthority) != test.wantMissingAuthority {
+				t.Fatalf("error=%v want_missing_authority=%t", err, test.wantMissingAuthority)
+			}
+		})
+	}
+}
+
 type gatewayHotShardTestAuthority struct {
 	record gateway.ReplicatedPressureRecord
 	reads  int

@@ -205,7 +205,11 @@ transport, and serves the authenticated native replicated protocol. The local
 `vibedb cluster dev` command can prepare and supervise an explicitly no-HA RF1
 member or an RF3 development topology plus gateway. Learner bootstrap and a
 resumable replica-move controller exist. They are not a general topology
-operator. Public RF3
+operator. RF3 development assigns a distinct authenticated NodeID to every
+role process and generates the strict replica-control inventory consumed by
+automatic hot-shard split admission; a NodeID never ambiguously names multiple
+control listeners. The dev inventory intentionally contains no replica-move
+candidates because it provisions no certified cold target host. Public RF3
 exact-key reads include bounded multi-table and multi-group batches with one
 ReadIndex cut per group. Exact-key `exec_batch` supplies multi-table and
 multi-group writes, including ready global-index maintenance. A common
@@ -287,7 +291,10 @@ lanes and publishes canonical cuts through catalog RF3 when the gateway receives
 `-hot-shard-capacity`. An internal clockless controller consumes those cuts,
 qualifies sustained pressure, selects one split or replica move, and hands an
 idempotent admission to the existing journals. The gateway command publishes
-the pressure cut but does not run that controller or its operation sink.
+the pressure cut and, when an authenticated replica-control manifest supplies
+the exact split and move authorities, runs the replicated pass and its
+operation sink. Admission is fenced by catalog generation and replicated
+pressure revision; tenant identity and wall time are not placement authority.
 
 The topology scheduler consumes fixed-width, exact-generation capacity reports.
 It nets source releases against target reservations in seven resource dimensions
@@ -297,7 +304,7 @@ per-node concentration are hard bounds. The warm scheduler is fixed-memory and
 allocation-free. The independent replica-control command path attaches Raft
 member identities and drives the resumable `internal/rebalanceexec` sequence
 when the operator supplies a strict control manifest. Pressure-selected
-admission is not yet connected to that command path.
+admission uses that same command path and catalog operation journal.
 Leader-only manifest cutover shares the immutable range index and untouched
 leader storage instead of rebuilding every shard.
 

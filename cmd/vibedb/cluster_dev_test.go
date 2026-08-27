@@ -34,14 +34,16 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		GatewayCertificate: filepath.Join(root, "gateway-cert.pem"), GatewayKey: filepath.Join(root, "gateway-key.pem"),
 		Roots: filepath.Join(root, "roots.pem"), AuthorizationPolicy: filepath.Join(root, "policy.vibejson"),
 		HotShardCapacity: filepath.Join(root, "hot-shard-capacity.vibejson"),
+		ReplicaControl:   filepath.Join(root, "replica-control.vibejson"),
 		DurableAckKey:    filepath.Join(root, "durable-ack-key"),
 		GatewayNode:      "01010101010101010101010101010101",
+		GatewayControl:   "127.0.0.1:24001",
 		Members:          make([]devClusterMember, devClusterRF3), LedgerMembers: make([]devClusterMember, devClusterRF3), DataMembers: make([]devClusterMember, devClusterRF3),
 	}
-	paths := []string{manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy, manifest.HotShardCapacity, manifest.DurableAckKey}
+	paths := []string{manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy, manifest.HotShardCapacity, manifest.ReplicaControl, manifest.DurableAckKey}
 	for index := range manifest.Members {
-		node := [16]byte{byte(index + 1)}
-		member := func(role string, storeBase byte, portBase, snapshotBase int) devClusterMember {
+		member := func(role string, nodeBase, storeBase byte, portBase, snapshotBase int) devClusterMember {
+			node := [16]byte{nodeBase + byte(index)}
 			store := [16]byte{storeBase + byte(index)}
 			return devClusterMember{
 				Member: uint64(index + 1), Node: idStringForDev(node[:]),
@@ -53,9 +55,9 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 				ServeManifest: filepath.Join(root, role+"-member-"+strconv.Itoa(index+1), "serve-rf3.vibejson"),
 			}
 		}
-		manifest.Members[index] = member("catalog", 0x41, 28000, 29000)
-		manifest.LedgerMembers[index] = member("ledger", 0x51, 28009, 29100)
-		manifest.DataMembers[index] = member("data", 0x61, 28018, 29200)
+		manifest.Members[index] = member("catalog", 0x11, 0x41, 28000, 29000)
+		manifest.LedgerMembers[index] = member("ledger", 0x21, 0x51, 28009, 29100)
+		manifest.DataMembers[index] = member("data", 0x31, 0x61, 28018, 29200)
 		paths = append(paths, manifest.Members[index].ServeManifest, manifest.LedgerMembers[index].ServeManifest, manifest.DataMembers[index].ServeManifest)
 	}
 	for _, path := range paths {
@@ -159,10 +161,12 @@ func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
 		GatewayKey: filepath.Join(root, "gateway-key.pem"), Roots: filepath.Join(root, "roots.pem"),
 		AuthorizationPolicy: filepath.Join(root, "policy.vibejson"), GatewayNode: "01010101010101010101010101010101",
 		HotShardCapacity: filepath.Join(root, "hot-shard-capacity.vibejson"),
+		ReplicaControl:   filepath.Join(root, "replica-control.vibejson"),
 		DurableAckKey:    filepath.Join(root, "durable-ack-key"),
+		GatewayControl:   "127.0.0.1:24001",
 		Members:          []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "22222222222222222222222222222222", Peer: "127.0.0.1:25001", Native: "127.0.0.1:25101", Snapshot: "127.0.0.1:25201", Control: "127.0.0.1:25301", ServeManifest: filepath.Join(root, "member-1", "serve-rf3.vibejson")}},
-		LedgerMembers:    []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "33333333333333333333333333333333", Peer: "127.0.0.1:26001", Native: "127.0.0.1:26101", Snapshot: "127.0.0.1:26201", Control: "127.0.0.1:26301", ServeManifest: filepath.Join(root, "ledger-member-1", "serve-rf3.vibejson")}},
-		DataMembers:      []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "44444444444444444444444444444444", Peer: "127.0.0.1:27001", Native: "127.0.0.1:27101", Snapshot: "127.0.0.1:27201", Control: "127.0.0.1:27301", ServeManifest: filepath.Join(root, "data-member-1", "serve-rf3.vibejson")}},
+		LedgerMembers:    []devClusterMember{{Member: 1, Node: "12121212121212121212121212121212", Store: "33333333333333333333333333333333", Peer: "127.0.0.1:26001", Native: "127.0.0.1:26101", Snapshot: "127.0.0.1:26201", Control: "127.0.0.1:26301", ServeManifest: filepath.Join(root, "ledger-member-1", "serve-rf3.vibejson")}},
+		DataMembers:      []devClusterMember{{Member: 1, Node: "13131313131313131313131313131313", Store: "44444444444444444444444444444444", Peer: "127.0.0.1:27001", Native: "127.0.0.1:27101", Snapshot: "127.0.0.1:27201", Control: "127.0.0.1:27301", ServeManifest: filepath.Join(root, "data-member-1", "serve-rf3.vibejson")}},
 	}
 	if !validDevManifest(base, root) {
 		t.Fatal("explicit RF1 manifest rejected")
@@ -195,11 +199,11 @@ func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
 	if validDevManifest(reusedDataPath, root) {
 		t.Fatal("data group reused the request-ledger serving manifest")
 	}
-	foreignDataNode := base
-	foreignDataNode.DataMembers = append([]devClusterMember(nil), base.DataMembers...)
-	foreignDataNode.DataMembers[0].Node = "55555555555555555555555555555555"
-	if validDevManifest(foreignDataNode, root) {
-		t.Fatal("data group escaped its colocated physical node")
+	reusedDataNode := base
+	reusedDataNode.DataMembers = append([]devClusterMember(nil), base.DataMembers...)
+	reusedDataNode.DataMembers[0].Node = base.Members[0].Node
+	if validDevManifest(reusedDataNode, root) {
+		t.Fatal("independent serving roles reused one physical node identity")
 	}
 	base.Nodes = 2
 	if validDevManifest(base, root) {
@@ -218,15 +222,16 @@ func TestInitializeDevClusterEmitsThreeIndependentApplyRoles(t *testing.T) {
 	}
 	if len(manifest.Members) != 1 || len(manifest.LedgerMembers) != 1 ||
 		len(manifest.DataMembers) != 1 ||
-		manifest.Members[0].Node != manifest.LedgerMembers[0].Node ||
-		manifest.Members[0].Node != manifest.DataMembers[0].Node ||
+		manifest.Members[0].Node == manifest.LedgerMembers[0].Node ||
+		manifest.Members[0].Node == manifest.DataMembers[0].Node ||
+		manifest.LedgerMembers[0].Node == manifest.DataMembers[0].Node ||
 		manifest.Members[0].Store == manifest.LedgerMembers[0].Store ||
 		manifest.Members[0].Store == manifest.DataMembers[0].Store ||
 		manifest.LedgerMembers[0].Store == manifest.DataMembers[0].Store {
-		t.Fatalf("independent colocated roles=%+v", manifest)
+		t.Fatalf("independent role identities=%+v", manifest)
 	}
 	prepared := make(map[string]devPrepareManifest, 3)
-	for _, role := range []string{"catalog", "ledger", "data"} {
+	for roleIndex, role := range []string{"catalog", "ledger", "data"} {
 		raw, readErr := os.ReadFile(filepath.Join(root, "prepare-"+role+"-member-1.vibejson"))
 		if readErr != nil {
 			t.Fatal(readErr)
@@ -236,8 +241,9 @@ func TestInitializeDevClusterEmitsThreeIndependentApplyRoles(t *testing.T) {
 			t.Fatal(decodeErr)
 		}
 		prepared[role] = decoded
+		roleMembers := [][]devClusterMember{manifest.Members, manifest.LedgerMembers, manifest.DataMembers}
 		if len(decoded.SplitControl.Grants) != 1 ||
-			decoded.SplitControl.Grants[0].NodeID != manifest.Members[0].Node {
+			decoded.SplitControl.Grants[0].NodeID != roleMembers[roleIndex][0].Node {
 			t.Fatalf("%s split profile=%+v", role, decoded.SplitControl)
 		}
 	}
@@ -258,6 +264,30 @@ func TestInitializeDevClusterEmitsThreeIndependentApplyRoles(t *testing.T) {
 		prepared["ledger"].Apply.RequestLedgerCleanupReserveBytes != devLedgerCleanupReserveBytes ||
 		prepared["ledger"].Apply.RequestLedgerRangeIdentity == "" {
 		t.Fatalf("ledger apply profile=%+v", prepared["ledger"].Apply)
+	}
+	controlRaw, err := os.ReadFile(manifest.ReplicaControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var control devReplicaControlManifest
+	if err = vibejson.Unmarshal(controlRaw, &control); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := vibejson.Marshal(&control)
+	if err != nil || !bytes.Equal(canonical, controlRaw) || control.Generation != 1 ||
+		control.LocalGateway.Node != manifest.GatewayNode ||
+		control.LocalGateway.ControlAddress != manifest.GatewayControl ||
+		len(control.GatewayEndpoints) != 1 || len(control.ShardEndpoints) != 3 ||
+		len(control.Candidates) != 0 {
+		t.Fatalf("replica control=%+v canonical=%t err=%v", control,
+			bytes.Equal(canonical, controlRaw), err)
+	}
+	for index := range control.ShardEndpoints {
+		shard := control.ShardEndpoints[index]
+		if index != 0 && control.ShardEndpoints[index-1].Node >= shard.Node ||
+			!filepath.IsAbs(shard.SplitChildRoot) {
+			t.Fatalf("replica control shard[%d]=%+v", index, shard)
+		}
 	}
 }
 
