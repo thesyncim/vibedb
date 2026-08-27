@@ -60,11 +60,7 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat,
 			ShardKey: gateway.ReplicatedCatalogPrimaryKey, TupleVersion: distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}
-	identity1 := rf3CommandStoreIdentity(1)
-	identity2 := identity1
-	identity2.GroupID[0] ^= 0x40
-	identity2.ShardIncarnation[0] ^= 0x20
-	identity2.StoreID[0] ^= 0x10
+	identity1, identity2 := rf3EnrolledGroupIdentities()
 	target1 := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{0xe1}, NodeIncarnation: 9,
 		Listeners: rf3testfixture.ProcessListeners{Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t), Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t)}}
 	target2 := target1
@@ -111,6 +107,7 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	}
 	cold1 := prepareRF3ColdTarget(t, rf3ColdTargetOptions{Root: filepath.Join(root, "target-first"),
 		Group: groupFor(identity1), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
+		Distribution: identity1.Distribution, Shard: identity1.Shard, AllocationGeneration: identity1.AllocationGeneration,
 		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
 		Target: rf3ManifestEnrolledTarget{MemberID: target1.MemberID, NodeID: target1.NodeID,
@@ -122,6 +119,7 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		SourceNode: nodes[0], SourceSnapshotAddress: addresses.Snapshot, MaxArtifactBytes: 1 << 30})
 	cold2 := prepareRF3ColdTarget(t, rf3ColdTargetOptions{Root: filepath.Join(root, "target-second"),
 		Group: groupFor(identity2), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
+		Distribution: identity2.Distribution, Shard: identity2.Shard, AllocationGeneration: identity2.AllocationGeneration,
 		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
 		Target: rf3ManifestEnrolledTarget{MemberID: target2.MemberID, NodeID: target2.NodeID,
@@ -309,6 +307,18 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	if maximum > 10*time.Second {
 		t.Fatalf("bounded control p99/max=%s samples=%v", maximum, latencies)
 	}
+}
+
+// Independent Raft groups must also identify independent logical shard
+// allocations; changing only GroupID aliases the retained split registry key.
+func rf3EnrolledGroupIdentities() (raftstore.Identity, raftstore.Identity) {
+	first := rf3CommandStoreIdentity(1)
+	second := first
+	second.GroupID[0] ^= 0x40
+	second.ShardIncarnation[0] ^= 0x20
+	second.StoreID[0] ^= 0x10
+	second.Shard += "-second"
+	return first, second
 }
 
 func reserveRF3ProcessListeners(t testing.TB) []*net.TCPListener {

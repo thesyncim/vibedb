@@ -42,6 +42,9 @@ const (
 type rf3ColdTargetOptions struct {
 	Root                  string
 	Group                 raftmember.GroupKey
+	Distribution          string
+	Shard                 string
+	AllocationGeneration  uint64
 	Authority             sqldriver.ReplicatedAuthorityProfile
 	WAL                   raftstore.Options
 	Apply                 sqldriver.ReplicatedApplyOptions
@@ -90,12 +93,7 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 		t.Fatal(err)
 	}
 
-	identity := rf3CommandStoreIdentity(options.Target.MemberID)
-	identity.ClusterID = options.Group.ClusterID
-	identity.ClusterIncarnation = options.Group.ClusterIncarnation
-	identity.ShardIncarnation = options.Group.ShardIncarnation
-	identity.GroupID = options.Group.GroupID
-	identity.StoreID = options.Target.StoreID
+	identity := rf3ColdTargetIdentity(t, options)
 	staticBootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
 	staticBootstrap.TopologyRecoveryEpoch = options.Group.TopologyRecoveryEpoch
 	// The transient preparation WAL must contain its local member. Its only job
@@ -190,6 +188,24 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 		MemberManifestPath: memberPath, BootstrapManifestPath: bootstrapPath,
 		StaticBootstrapPath: staticPath, member: options.Target.MemberID,
 	}
+}
+
+func rf3ColdTargetIdentity(t testing.TB, options rf3ColdTargetOptions) raftstore.Identity {
+	t.Helper()
+	identity := rf3CommandStoreIdentity(options.Target.MemberID)
+	identity.ClusterID = options.Group.ClusterID
+	identity.ClusterIncarnation = options.Group.ClusterIncarnation
+	identity.ShardIncarnation = options.Group.ShardIncarnation
+	identity.GroupID = options.Group.GroupID
+	identity.StoreID = options.Target.StoreID
+	if options.Distribution != "" || options.Shard != "" || options.AllocationGeneration != 0 {
+		if options.Distribution == "" || options.Shard == "" || options.AllocationGeneration == 0 {
+			t.Fatal("incomplete RF3 cold target logical placement")
+		}
+		identity.Distribution, identity.Shard = options.Distribution, options.Shard
+		identity.AllocationGeneration = options.AllocationGeneration
+	}
+	return identity
 }
 
 func (process *rf3ColdTargetProcess) Start(t testing.TB) {
