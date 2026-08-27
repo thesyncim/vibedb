@@ -386,14 +386,7 @@ func gatewayHotShardLiveAuthority(
 	t testing.TB, fixture gatewayHotShardLiveFixture, snapshot *gateway.Snapshot,
 ) (*gateway.ReplicatedCatalogAuthority, func()) {
 	t.Helper()
-	pool, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
-		TLS: fixture.clientProfile,
-		Dial: func(ctx context.Context, address string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
-		MaxConnections: 16, MaxPerEndpoint: 8, MaxIdlePerEndpoint: 4,
-		MaxHandshakes: 4, MaxWaiters: 16,
-	})
+	pool, err := gateway.NewAuthenticatedReplicatedClient(gatewayHotShardSeedClientOptions(fixture.clientProfile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,6 +442,18 @@ func gatewayHotShardLiveAuthority(
 		t.Fatal(err)
 	}
 	return authority, func() { _ = pool.Close() }
+}
+
+func gatewayHotShardSeedClientOptions(profile *rafttransport.PeerTLS) gateway.AuthenticatedReplicatedClientOptions {
+	return gateway.AuthenticatedReplicatedClientOptions{
+		TLS: profile,
+		Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
+		MaxConnections: 16, MaxPerEndpoint: 8, MaxIdlePerEndpoint: 4,
+		MaxHandshakes: 4, MaxWaiters: 16,
+		MaxIdleAge: time.Minute, MaxLifetime: 5 * time.Minute,
+	}
 }
 
 func gatewayHotShardLiveCapacity(t testing.TB, root string) string {
