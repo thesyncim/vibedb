@@ -154,7 +154,7 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 	expectedEnvelope, expectedErr := replicatedstate.AppendState(nil, manifest.State)
 	if writeErr != nil || closeErr != nil || currentErr != nil || expectedErr != nil ||
 		!bytes.Equal(currentEnvelope, expectedEnvelope) ||
-		!equalReplicatedSnapshotImage(current, manifest) {
+		!equalReplicatedActivatedSnapshotImage(current, manifest) {
 		return activation, false, errors.Join(
 			fmt.Errorf("%w: durable activation image", ErrReplicatedSnapshotStageProof),
 			writeErr, closeErr, currentErr, expectedErr,
@@ -356,6 +356,24 @@ func equalReplicatedSnapshotImage(
 		}
 	}
 	return true
+}
+
+// A compact singleton seed certifies the fresh user image before its one
+// imported State row is materialized. Its authenticated grammar requires
+// SystemRows=0; a streamed export of the activated image must contain exactly
+// that one row. All other image fields remain exact, and the caller separately
+// compares the canonical State against the authenticated snapshot base.
+func equalReplicatedActivatedSnapshotImage(
+	current, certified replicatedstate.SnapshotArtifactManifest,
+) bool {
+	if certified.Seeded {
+		if certified.Bundle || current.Seeded || current.Bundle ||
+			certified.SystemRows != 0 || current.SystemRows != 1 {
+			return false
+		}
+		certified.SystemRows = 1
+	}
+	return equalReplicatedSnapshotImage(current, certified)
 }
 
 func (s *ReplicatedSnapshotStage) Offset() uint64 {
