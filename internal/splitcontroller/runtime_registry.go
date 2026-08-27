@@ -531,6 +531,9 @@ func HasBoundRuntimeTerminalWitness(path string, operation OperationID) (bool, e
 	defer root.Close()
 	file, err := openRuntimeRegular(root, "manifest.binding", os.O_RDONLY, 0)
 	if errors.Is(err, os.ErrNotExist) {
+		if _, markerErr := root.Lstat(runtimeTerminalName(operation)); !errors.Is(markerErr, os.ErrNotExist) {
+			return false, errors.Join(ErrRuntimeStore, markerErr)
+		}
 		return false, nil
 	}
 	if err != nil {

@@ -13,6 +13,32 @@ import (
 
 const runtimeRegistryCrashRoot = "VIBEDB_SPLIT_REGISTRY_CRASH_ROOT"
 
+func TestHasBoundRuntimeTerminalWitnessRejectsMissingBinding(t *testing.T) {
+	root, operation := t.TempDir(), OperationID{1}
+	if found, err := HasBoundRuntimeTerminalWitness(root, operation); found || err != nil {
+		t.Fatalf("unprepared namespace found=%t err=%v", found, err)
+	}
+	registry, err := OpenRuntimeStoreRegistry(root, [32]byte{2}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.CollectCertifiedTerminal(operation, [32]byte{3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := HasBoundRuntimeTerminalWitness(root, operation); !found || err != nil {
+		t.Fatalf("terminal found=%t err=%v", found, err)
+	}
+	if err := os.Remove(filepath.Join(root, "manifest.binding")); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := HasBoundRuntimeTerminalWitness(root, operation); found || !errors.Is(err, ErrRuntimeStore) {
+		t.Fatalf("orphan terminal marker treated as fresh: found=%t err=%v", found, err)
+	}
+}
+
 type runtimeTerminalAuthorityStub struct {
 	operation OperationID
 	manifest  [sha256.Size]byte
