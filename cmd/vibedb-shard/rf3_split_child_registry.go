@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"math"
@@ -51,13 +53,18 @@ type rf3ManifestSplitChildWAL struct {
 }
 
 type rf3ManifestSplitChildApply struct {
-	MaxSessions   uint64
-	RetryWindow   uint16
-	TxnLimits     durable.TxnLimits
-	Format        uint16
-	ShardKey      string
-	TupleVersion  distribution.TupleVersion
-	MapperVersion distribution.MapperVersion
+	MaxSessions                      uint64
+	RetryWindow                      uint16
+	TxnLimits                        durable.TxnLimits
+	RequestLedgerCapacityBytes       uint64
+	RequestLedgerCleanupReserveBytes uint64
+	RequestLedgerRangeStart          [sha256.Size]byte
+	RequestLedgerRangeEnd            [sha256.Size]byte
+	RequestLedgerRangeIdentity       [sha256.Size]byte
+	Format                           uint16
+	ShardKey                         string
+	TupleVersion                     distribution.TupleVersion
+	MapperVersion                    distribution.MapperVersion
 }
 
 // rf3SplitChildPaths are the only local artifact names an admitted operation
@@ -333,6 +340,51 @@ func parseRF3ManifestSplitChildApply(node vibejson.Node) (rf3ManifestSplitChildA
 	}
 	if result.TxnLimits.MaxBytes, err = rf3ManifestPositiveInt64(value); err != nil {
 		return result, err
+	}
+	value, err = nextRF3Field(&fields, `"request_ledger_capacity_bytes"`)
+	if err != nil {
+		return result, err
+	}
+	if result.RequestLedgerCapacityBytes, ok = value.Uint64(); !ok {
+		return rf3ManifestSplitChildApply{}, errInvalidRF3Manifest
+	}
+	value, err = nextRF3Field(&fields, `"request_ledger_cleanup_reserve_bytes"`)
+	if err != nil {
+		return result, err
+	}
+	if result.RequestLedgerCleanupReserveBytes, ok = value.Uint64(); !ok {
+		return rf3ManifestSplitChildApply{}, errInvalidRF3Manifest
+	}
+	var ledgerRangeStart, ledgerRangeEnd, ledgerRangeIdentity string
+	for _, field := range [...]struct {
+		name string
+		dst  *string
+	}{
+		{`"request_ledger_range_start"`, &ledgerRangeStart},
+		{`"request_ledger_range_end"`, &ledgerRangeEnd},
+		{`"request_ledger_range_identity"`, &ledgerRangeIdentity},
+	} {
+		value, err = nextRF3Field(&fields, field.name)
+		if err != nil {
+			return result, err
+		}
+		if *field.dst, err = rf3ManifestOptionalString(value, sha256.Size*2); err != nil {
+			return result, err
+		}
+	}
+	ledgerEnabled := result.RequestLedgerCapacityBytes != 0 ||
+		result.RequestLedgerCleanupReserveBytes != 0 || ledgerRangeStart != "" ||
+		ledgerRangeEnd != "" || ledgerRangeIdentity != ""
+	if ledgerEnabled && (result.RequestLedgerCapacityBytes == 0 ||
+		result.RequestLedgerCapacityBytes > math.MaxInt64 ||
+		result.RequestLedgerCleanupReserveBytes == 0 ||
+		result.RequestLedgerCleanupReserveBytes >= result.RequestLedgerCapacityBytes ||
+		!decodeRF3FixedHex(ledgerRangeStart, result.RequestLedgerRangeStart[:], true) ||
+		!decodeRF3FixedHex(ledgerRangeEnd, result.RequestLedgerRangeEnd[:], true) ||
+		!decodeRF3FixedHex(ledgerRangeIdentity, result.RequestLedgerRangeIdentity[:], false) ||
+		(result.RequestLedgerRangeEnd != ([sha256.Size]byte{}) &&
+			bytes.Compare(result.RequestLedgerRangeStart[:], result.RequestLedgerRangeEnd[:]) >= 0)) {
+		return rf3ManifestSplitChildApply{}, errInvalidRF3Manifest
 	}
 	value, err = nextRF3Field(&fields, `"format"`)
 	if err != nil {

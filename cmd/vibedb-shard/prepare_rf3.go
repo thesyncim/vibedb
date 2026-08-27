@@ -8,9 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -99,12 +99,17 @@ type prepareRF3WAL struct {
 }
 
 type prepareRF3Apply struct {
-	MaxSessions    uint64 `json:"max_sessions"`
-	RetryWindow    uint16 `json:"retry_window"`
-	MaxCollections int    `json:"max_collections"`
-	MaxDocuments   int    `json:"max_documents"`
-	MaxBytes       int64  `json:"max_bytes"`
-	ShardKey       string `json:"shard_key"`
+	MaxSessions                      uint64 `json:"max_sessions"`
+	RetryWindow                      uint16 `json:"retry_window"`
+	MaxCollections                   int    `json:"max_collections"`
+	MaxDocuments                     int    `json:"max_documents"`
+	MaxBytes                         int64  `json:"max_bytes"`
+	ShardKey                         string `json:"shard_key"`
+	RequestLedgerCapacityBytes       uint64 `json:"request_ledger_capacity_bytes"`
+	RequestLedgerCleanupReserveBytes uint64 `json:"request_ledger_cleanup_reserve_bytes"`
+	RequestLedgerRangeStart          string `json:"request_ledger_range_start"`
+	RequestLedgerRangeEnd            string `json:"request_ledger_range_end"`
+	RequestLedgerRangeIdentity       string `json:"request_ledger_range_identity"`
 }
 
 type prepareRF3Member struct {
@@ -158,15 +163,20 @@ type persistedRF3SplitChildWAL struct {
 }
 
 type persistedRF3SplitChildApply struct {
-	MaxSessions    uint64 `json:"max_sessions"`
-	RetryWindow    uint16 `json:"retry_window"`
-	MaxCollections int    `json:"max_collections"`
-	MaxDocuments   int    `json:"max_documents"`
-	MaxBytes       int64  `json:"max_bytes"`
-	Format         uint16 `json:"format"`
-	ShardKey       string `json:"shard_key"`
-	TupleVersion   uint32 `json:"tuple_version"`
-	MapperVersion  uint32 `json:"mapper_version"`
+	MaxSessions                      uint64 `json:"max_sessions"`
+	RetryWindow                      uint16 `json:"retry_window"`
+	MaxCollections                   int    `json:"max_collections"`
+	MaxDocuments                     int    `json:"max_documents"`
+	MaxBytes                         int64  `json:"max_bytes"`
+	RequestLedgerCapacityBytes       uint64 `json:"request_ledger_capacity_bytes"`
+	RequestLedgerCleanupReserveBytes uint64 `json:"request_ledger_cleanup_reserve_bytes"`
+	RequestLedgerRangeStart          string `json:"request_ledger_range_start"`
+	RequestLedgerRangeEnd            string `json:"request_ledger_range_end"`
+	RequestLedgerRangeIdentity       string `json:"request_ledger_range_identity"`
+	Format                           uint16 `json:"format"`
+	ShardKey                         string `json:"shard_key"`
+	TupleVersion                     uint32 `json:"tuple_version"`
+	MapperVersion                    uint32 `json:"mapper_version"`
 }
 
 type persistedRF3ActionGrant struct {
@@ -437,6 +447,11 @@ func verifyPreparedRF3Member(root string, manifestRaw []byte) error {
 	if err != nil {
 		return errors.Join(errPrepareRF3, err)
 	}
+	base, apply, identityErr := loadRF3RetainedIdentities(manifest)
+	if identityErr != nil || !rf3RouteMatchesBinding(manifest.Route, base.Binding) ||
+		!rf3SplitChildTemplateMatchesRetained(manifest.SplitControl.ChildRegistry, base, apply) {
+		return errors.Join(errPrepareRF3, identityErr)
+	}
 	staticRaw, err := readPrepareRF3File(
 		manifest.SplitControl.ChildRegistry.StaticBootstrapPath,
 		replicatedstate.MaxStaticBootstrapEnvelopeBytes,
@@ -599,8 +614,50 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 		return bad()
 	}
 	o := raftstore.Options{MaxFileBytes: input.WAL.MaxFileBytes, MaxRecordBytes: input.WAL.MaxRecordBytes, MaxRecords: input.WAL.MaxRecords, MaxEntries: input.WAL.MaxEntries, MaxLiveBytes: input.WAL.MaxLiveBytes}
-	ap := sqldriver.ReplicatedApplyOptions{MaxSessions: input.Apply.MaxSessions, RetryWindow: input.Apply.RetryWindow, TxnLimits: durable.TxnLimits{MaxCollections: input.Apply.MaxCollections, MaxDocuments: input.Apply.MaxDocuments, MaxBytes: int64(input.Apply.MaxBytes)}, Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: input.Apply.ShardKey, TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}
+	ap, err := prepareRF3ApplyOptions(input.Apply)
+	if err != nil {
+		clear(material)
+		return bad()
+	}
 	return id, a, nodes, o, ap, material, nil
+}
+
+func prepareRF3ApplyOptions(input prepareRF3Apply) (sqldriver.ReplicatedApplyOptions, error) {
+	result := sqldriver.ReplicatedApplyOptions{
+		MaxSessions: input.MaxSessions, RetryWindow: input.RetryWindow,
+		TxnLimits: durable.TxnLimits{
+			MaxCollections: input.MaxCollections, MaxDocuments: input.MaxDocuments,
+			MaxBytes: input.MaxBytes,
+		},
+		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: input.ShardKey,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+	}
+	ledgerEnabled := input.RequestLedgerCapacityBytes != 0 ||
+		input.RequestLedgerCleanupReserveBytes != 0 || input.RequestLedgerRangeStart != "" ||
+		input.RequestLedgerRangeEnd != "" || input.RequestLedgerRangeIdentity != ""
+	if !ledgerEnabled {
+		return result, nil
+	}
+	if input.RequestLedgerCapacityBytes == 0 || input.RequestLedgerCapacityBytes > math.MaxInt64 ||
+		input.RequestLedgerCleanupReserveBytes == 0 ||
+		input.RequestLedgerCleanupReserveBytes >= input.RequestLedgerCapacityBytes ||
+		!decodeRF3FixedHex(input.RequestLedgerRangeStart,
+			result.RequestLedgerRangeStart[:], true) ||
+		!decodeRF3FixedHex(input.RequestLedgerRangeEnd,
+			result.RequestLedgerRangeEnd[:], true) ||
+		!decodeRF3FixedHex(input.RequestLedgerRangeIdentity,
+			result.RequestLedgerRangeIdentity[:], false) ||
+		(result.RequestLedgerRangeEnd != ([32]byte{}) &&
+			bytes.Compare(result.RequestLedgerRangeStart[:], result.RequestLedgerRangeEnd[:]) >= 0) {
+		return sqldriver.ReplicatedApplyOptions{}, errPrepareRF3
+	}
+	result.RequestLedgerCapacityBytes = input.RequestLedgerCapacityBytes
+	result.RequestLedgerCleanupReserveBytes = input.RequestLedgerCleanupReserveBytes
+	return result, nil
 }
 
 func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.NodeID, p map[string]string) persistedRF3Manifest {
@@ -620,10 +677,16 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 	childApply := persistedRF3SplitChildApply{
 		MaxSessions: input.Apply.MaxSessions, RetryWindow: input.Apply.RetryWindow,
 		MaxCollections: input.Apply.MaxCollections, MaxDocuments: input.Apply.MaxDocuments,
-		MaxBytes: int64(input.Apply.MaxBytes), Format: sqldriver.ReplicatedPlacementProfileFormat,
-		ShardKey:      input.Apply.ShardKey,
-		TupleVersion:  uint32(distribution.CurrentTupleVersion),
-		MapperVersion: uint32(distribution.NativeMapperVersion),
+		MaxBytes:                         int64(input.Apply.MaxBytes),
+		RequestLedgerCapacityBytes:       input.Apply.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: input.Apply.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          input.Apply.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            input.Apply.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       input.Apply.RequestLedgerRangeIdentity,
+		Format:                           sqldriver.ReplicatedPlacementProfileFormat,
+		ShardKey:                         input.Apply.ShardKey,
+		TupleVersion:                     uint32(distribution.CurrentTupleVersion),
+		MapperVersion:                    uint32(distribution.NativeMapperVersion),
 	}
 	childRegistry := persistedRF3SplitChildRegistry{
 		Root: childRoot, MaxOperations: input.SplitControl.MaxChildOperations,
@@ -676,14 +739,31 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 }
 
 func decodePrepareRF3ID(value string, dst []byte) bool {
-	if len(value) != hex.EncodedLen(len(dst)) || strings.ToLower(value) != value {
+	return decodeRF3FixedHex(value, dst, false)
+}
+
+func decodeRF3FixedHex(value string, dst []byte, allowZero bool) bool {
+	if len(value) != hex.EncodedLen(len(dst)) {
 		return false
+	}
+	for index := range value {
+		if digit := value[index]; digit < '0' || digit > '9' && (digit < 'a' || digit > 'f') {
+			return false
+		}
 	}
 	n, err := hex.Decode(dst, []byte(value))
 	if err != nil || n != len(dst) {
 		return false
 	}
-	return !bytes.Equal(dst, make([]byte, len(dst)))
+	if allowZero {
+		return true
+	}
+	for _, value := range dst {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
 }
 func readPrepareRF3File(path string, maximum int) ([]byte, error) {
 	f, err := os.Open(path)

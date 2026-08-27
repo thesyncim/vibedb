@@ -143,6 +143,7 @@ func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
 	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
+	catalogBootstrapIfMissing := fs.Bool("catalog-bootstrap-if-missing", false, "atomically publish the generation-one catalog file only when replicated authority is empty")
 	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
 	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
 	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
@@ -180,7 +181,8 @@ func runServe(args []string) int {
 		return 2
 	}
 	if *devStaticCatalog {
-		if !*devPlaintext || *catalogRelation != 0 || *hotShardCapacity != "" || *durableAckKeyPath != "" {
+		if !*devPlaintext || *catalogBootstrapIfMissing || *catalogRelation != 0 ||
+			*hotShardCapacity != "" || *durableAckKeyPath != "" {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
 		}
@@ -320,7 +322,7 @@ func runServe(args []string) int {
 		}
 		exec, holder, catalogAuthority, replicated, replicatedPool, err = newReplicatedCatalogGateway(
 			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
-			internalAuthority,
+			internalAuthority, *catalogBootstrapIfMissing,
 			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
 			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
 			*catalogSessionJournal, clientID, retryHome, *catalogSessionLease,
@@ -648,6 +650,7 @@ func newReplicatedCatalogGateway(
 	tlsProfile *rafttransport.PeerTLS,
 	devPlaintext bool,
 	internalAuthority serviceauthz.Authority,
+	bootstrapIfMissing bool,
 	relation replication.RelationID,
 	attempts int,
 	attemptTimeout time.Duration,
@@ -793,11 +796,42 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	if _, err = authority.Read(ctx); err != nil {
+	if _, err = authority.Read(ctx); err != nil &&
+		(!bootstrapIfMissing || !errors.Is(err, gateway.ErrReplicatedCatalogMissing)) {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
 		}
 		return nil, nil, nil, nil, nil, err
+	} else if err != nil {
+		if bootstrap.Generation() != 1 {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalog
+		}
+		publishErr := authority.Publish(ctx, 0, bootstrap)
+		for retry := 0; retry < attempts && errors.Is(publishErr, gateway.ErrReplicatedCatalogPending); retry++ {
+			publishErr = authority.RetryPending(ctx)
+		}
+		if publishErr != nil &&
+			!errors.Is(publishErr, gateway.ErrCatalogGenerationMismatch) &&
+			!errors.Is(publishErr, gateway.ErrReplicatedCatalogConflict) {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, publishErr
+		}
+		retained, readErr := authority.Read(ctx)
+		want, wantErr := gateway.AppendSnapshotDocument(nil, bootstrap)
+		got, gotErr := gateway.AppendSnapshotDocument(nil, retained)
+		if readErr != nil || wantErr != nil || gotErr != nil || !bytes.Equal(want, got) {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, errors.Join(
+				readErr, wantErr, gotErr, gateway.ErrReplicatedCatalogConflict,
+			)
+		}
 	}
 	executor := gateway.NewExecutor(
 		gateway.NewClient(shardDial), holder, gateway.Options{

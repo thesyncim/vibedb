@@ -1149,6 +1149,14 @@ func rf3ManifestString(node vibejson.Node, maximum int) (string, error) {
 	return strings.Clone(string(value)), nil
 }
 
+func rf3ManifestOptionalString(node vibejson.Node, maximum int) (string, error) {
+	value, ok := node.StringBytes()
+	if !ok || len(value) > maximum || bytes.IndexByte(value, 0) >= 0 {
+		return "", errInvalidRF3Manifest
+	}
+	return strings.Clone(string(value)), nil
+}
+
 func rf3ManifestPositiveUint64(node vibejson.Node) (uint64, error) {
 	value, ok := node.Uint64()
 	if !ok || value == 0 {

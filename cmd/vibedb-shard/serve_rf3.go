@@ -220,6 +220,11 @@ func rf3SplitChildTemplateMatchesRetained(
 		registry.Apply.MaxSessions == apply.MaxSessions &&
 		registry.Apply.RetryWindow == apply.RetryWindow &&
 		registry.Apply.TxnLimits == apply.TxnLimits &&
+		registry.Apply.RequestLedgerCapacityBytes == apply.RequestLedgerCapacityBytes &&
+		registry.Apply.RequestLedgerCleanupReserveBytes == apply.RequestLedgerCleanupReserveBytes &&
+		registry.Apply.RequestLedgerRangeStart == apply.RequestLedgerRangeStart &&
+		registry.Apply.RequestLedgerRangeEnd == apply.RequestLedgerRangeEnd &&
+		registry.Apply.RequestLedgerRangeIdentity == apply.RequestLedgerRangeIdentity &&
 		registry.Apply.Format == apply.Placement.Format &&
 		registry.Apply.ShardKey == apply.Placement.ShardKey &&
 		registry.Apply.TupleVersion == apply.Placement.TupleVersion &&

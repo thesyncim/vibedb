@@ -49,13 +49,20 @@ func TestRF3SplitChildRegistryDerivesInjectivePathsWithoutProvisioningOperations
 
 func TestRF3SplitChildTemplateMatchesExactRetainedApply(t *testing.T) {
 	limits := durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20}
+	ledgerStart, ledgerEnd, ledgerIdentity := [32]byte{0x20}, [32]byte{0x90}, [32]byte{0x5a}
 	registry := rf3ManifestSplitChildRegistry{Table: "docs", Apply: rf3ManifestSplitChildApply{
 		MaxSessions: 32, RetryWindow: 8, TxnLimits: limits, ShardKey: "id",
-		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		RequestLedgerCapacityBytes: 64 << 20, RequestLedgerCleanupReserveBytes: 8 << 20,
+		RequestLedgerRangeStart: ledgerStart, RequestLedgerRangeEnd: ledgerEnd,
+		RequestLedgerRangeIdentity: ledgerIdentity,
+		TupleVersion:               distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 	}}
 	base := sqldriver.ReplicatedShardStoreIdentity{UserTable: "docs"}
 	apply := sqldriver.ReplicatedApplyIdentity{
 		MaxSessions: 32, RetryWindow: 8, TxnLimits: limits,
+		RequestLedgerCapacityBytes: 64 << 20, RequestLedgerCleanupReserveBytes: 8 << 20,
+		RequestLedgerRangeStart: ledgerStart, RequestLedgerRangeEnd: ledgerEnd,
+		RequestLedgerRangeIdentity: ledgerIdentity,
 		Placement: sqldriver.ReplicatedPlacementProfile{
 			ShardKey: "id", TupleVersion: distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion,
@@ -67,6 +74,11 @@ func TestRF3SplitChildTemplateMatchesExactRetainedApply(t *testing.T) {
 	registry.Apply.MaxSessions++
 	if rf3SplitChildTemplateMatchesRetained(registry, base, apply) {
 		t.Fatal("mismatched child capacity accepted")
+	}
+	registry.Apply.MaxSessions--
+	registry.Apply.RequestLedgerRangeIdentity[0]++
+	if rf3SplitChildTemplateMatchesRetained(registry, base, apply) {
+		t.Fatal("mismatched child ledger authority accepted")
 	}
 }
 
