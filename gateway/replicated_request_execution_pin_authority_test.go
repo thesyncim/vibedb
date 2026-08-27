@@ -36,6 +36,14 @@ func TestDurableRequestDefaultPinTakeoverRequiresLaterExactApply(t *testing.T) {
 	if executionpin.ValidateSideEffectFence(lease, record, 11) != nil {
 		t.Fatal("old owner must remain live at the boundary observation")
 	}
+	if executionPinLeaseAdvanced(lease, record, 11) || !executionPinLeaseAdvanced(lease, record, 12) {
+		t.Fatal("stale-pin retry did not require authenticated lease expiration")
+	}
+	foreignLease := lease
+	foreignLease.AcquireCertificateDigest[0] ^= 1
+	if executionPinLeaseAdvanced(foreignLease, record, 12) {
+		t.Fatal("foreign acquisition accepted for retry")
+	}
 	foreign := serviceauthz.Authority{Node: [16]byte{8}, Generation: 1}
 	if durableRequestPinControllerMatches(lease, foreign) {
 		t.Fatal("replacement borrowed the old controller certificate")
@@ -50,6 +58,9 @@ func TestDurableRequestDefaultPinTakeoverRequiresLaterExactApply(t *testing.T) {
 		t.Fatalf("recovery applied before expiration: %+v", early)
 	}
 	recovered := executionpin.Apply(record, true, command, 12, executionpin.Digest{3}, executionpin.Digest{4})
+	if !executionPinLeaseAdvanced(lease, recovered.Record, 12) {
+		t.Fatal("exact recovered acquisition not recognized")
+	}
 	if recovered.Reason != executionpin.ReasonApplied || !recovered.Mutated || recovered.Record.Controller != command.NextController ||
 		executionpin.ValidateSideEffectFence(lease, recovered.Record, 12) == nil {
 		t.Fatalf("later recovery did not fence the old certificate: %+v", recovered)

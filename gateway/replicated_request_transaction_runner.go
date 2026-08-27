@@ -177,7 +177,13 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 		}
 	}
-	if continuation.Revision != 0 && state.branch != durableDistributedUndecided &&
+	finalWaves := execution.Recipe.Contract.CommitFinalWaveCount
+	if state.branch == durableDistributedAborted {
+		finalWaves = execution.Recipe.Contract.AbortFinalWaveCount
+	}
+	// Decision cursors can have the same bytes as the terminal cursor (zero
+	// affected rows). Only the certified final ordinal carries retirement.
+	if continuation.Revision != 0 && head.NextStepOrdinal == finalWaves && state.branch != durableDistributedUndecided &&
 		(bytes.Equal(continuation.Cursor, authority.CommitCursor) || bytes.Equal(continuation.Cursor, authority.AbortCursor)) {
 		completion, openErr := replication.OpenCompletion(continuation.Observation)
 		value, valueErr := replicatedstate.OpenTransactionCompletionResult(completion.ResultCode, completion.InlineResult)
@@ -187,10 +193,6 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 			return DurableRequestTerminalResult{}, errors.Join(openErr, valueErr, ErrDurableRequestConflict)
 		}
 		state.affected = value.AffectedRows
-	}
-	finalWaves := execution.Recipe.Contract.CommitFinalWaveCount
-	if state.branch == durableDistributedAborted {
-		finalWaves = execution.Recipe.Contract.AbortFinalWaveCount
 	}
 	if state.branch != durableDistributedUndecided && head.NextStepOrdinal == finalWaves {
 		stage = "terminal completion"
@@ -258,6 +260,23 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 }
 
 func (runner *DurableRequestDistributedRunner) completeTerminal(
+	ctx context.Context,
+	execution DurableRequestTypedExecutionContext,
+	authority DurableRequestTerminalAuthority,
+	state durableDistributedState,
+) (DurableRequestTerminalResult, error) {
+	for attempt := 0; ; attempt++ {
+		result, err := runner.completeTerminalAttempt(ctx, execution, authority, state)
+		var advanced *durableExecutionPinAdvancedError
+		if !errors.As(err, &advanced) || attempt == 3 || ctx.Err() != nil {
+			return result, err
+		}
+		// Re-read the durable terminal cut and refresh its exact authority.
+		// This marker proves the terminal side-effect fence admitted nothing.
+	}
+}
+
+func (runner *DurableRequestDistributedRunner) completeTerminalAttempt(
 	ctx context.Context,
 	execution DurableRequestTypedExecutionContext,
 	authority DurableRequestTerminalAuthority,
@@ -852,8 +871,24 @@ func (progress *durableDistributedProgress) command(
 		cursor := appendDurableDistributedState(nil, progress.state)
 		return progress.execution.Recipe.Contract.CommitTransitionTag, cursor, nil
 	}
-	if _, err = progress.runner.waves.RunStagedWave(ctx, wave); err != nil {
-		return false, err
+	for attempt := 0; ; attempt++ {
+		_, err = progress.runner.waves.RunStagedWave(ctx, wave)
+		var advanced *durableExecutionPinAdvancedError
+		if !errors.As(err, &advanced) || attempt == 3 || ctx.Err() != nil {
+			if err != nil {
+				return false, err
+			}
+			break
+		}
+		// A one-successor pin may expire while another catalog command is
+		// applying. No wave side effect ran: reacquire the exact execution pin
+		// and repeat admission with the unchanged participant command bytes.
+		progress.execution, err = progress.runner.refreshExecutionPin(ctx, progress.execution)
+		if err != nil {
+			return false, err
+		}
+		wave.ExecutionPinRoute, wave.ExecutionPinLease = progress.execution.ExecutionPinRoute, progress.execution.ExecutionPinLease
+		wave.GateEpoch = wave.ExecutionPinLease.ControllerEpoch
 	}
 	if _, err = progress.runner.payloads.Cleanup(ctx, progress.execution.Home, progress.execution.Key.RequestKey); err != nil {
 		return false, err

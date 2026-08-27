@@ -76,6 +76,14 @@ func TestReplicatedSplitUsesAppliedSourceFenceNotCatalogCAS(t *testing.T) {
 	if err := plan.validateSourceObservation(Observation{Catalog: catalog, SourceState: state}); err != nil {
 		t.Fatal(err)
 	}
+	artifacts := testArtifactSet(t, plan, state)
+	action, err := Reconcile(plan, Observation{
+		Catalog: catalog, SourceState: state, SourceStatus: testLeaderStatus(state),
+		CaptureHead: state.Applied, Artifacts: &artifacts,
+	})
+	if err != nil || action.Kind != ActionStageChild || action.Child != 1 {
+		t.Fatalf("artifacts at retained source generation: action=%+v err=%v", action, err)
+	}
 	raw, err := plan.AppendSourceCaptureActivation(nil, state)
 	if err != nil {
 		t.Fatal(err)

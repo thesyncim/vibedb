@@ -162,6 +162,21 @@ func openRF3SplitTopologySession(
 		return nil, nil, err
 	}
 	release := func() error { return pool.Close() }
+	authorized, err := serviceauthz.WithAuthority(ctx, authority)
+	if err != nil {
+		return nil, release, errors.Join(err, release())
+	}
+	// The catalog pins stable member/store identities, but process incarnations
+	// advance on restart. Bind control-session checks to authenticated current
+	// observations; never relax NativeSessionMatchesControlBinding's exact fence.
+	for index, endpoint := range route.Replicas {
+		attempt, cancel := context.WithTimeout(authorized, rf3NetworkTimeout)
+		probe, probeErr := pool.ProbeReplicated(attempt, route, endpoint, serviceauthz.CapabilityTopology)
+		cancel()
+		if probeErr == nil && probe != nil && probe.HasState {
+			route.Replicas[index].NodeIncarnation = probe.State.Fence.NodeIncarnation
+		}
+	}
 	retryHome := rf3SplitTopologyRetryHome(retryDomain, clientID)
 	journalBinding, err := gateway.NativeSessionJournalBinding(
 		route, string(binding.Distribution), string(binding.Shard), tenant, 1,
@@ -186,10 +201,6 @@ func openRF3SplitTopologySession(
 		MaxRelationBatches: 1, MaxMutations: replication.MaxMutations,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
-	if err != nil {
-		return nil, release, errors.Join(err, release())
-	}
-	authorized, err := serviceauthz.WithAuthority(ctx, authority)
 	if err != nil {
 		return nil, release, errors.Join(err, release())
 	}

@@ -304,6 +304,11 @@ func (executor *ReplicatedExecutor) ReadExecutionPin(
 				response.Refusal == shardservice.ReplicatedRefusalExecutionPinReadMalformed {
 				return ReplicatedExecutionPinReadResult{}, &ReplicatedRefusalError{Code: response.Refusal}
 			}
+			if response.Refusal == shardservice.ReplicatedRefusalAdmissionBound {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					return ReplicatedExecutionPinReadResult{}, err
+				}
+			}
 			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
 			preferred = 0
 		default:
@@ -335,9 +340,30 @@ func (executor *ReplicatedExecutor) ValidateExecutionPinFence(
 	if !result.Found || executionpin.ValidateSideEffectFence(
 		lease, result.Record, result.Applied,
 	) != nil {
+		if result.Found && executionPinLeaseAdvanced(lease, result.Record, result.Applied) {
+			return ReplicatedExecutionPinReadResult{}, &durableExecutionPinAdvancedError{}
+		}
 		return ReplicatedExecutionPinReadResult{}, ErrDurableRequestConflict
 	}
 	return result, nil
+}
+
+// This marker is emitted only for the same authenticated acquisition. It
+// permits a fresh admission check, never continuing with the stale lease.
+type durableExecutionPinAdvancedError struct{}
+
+func (*durableExecutionPinAdvancedError) Error() string {
+	return "gateway: execution pin lease advanced before wave admission"
+}
+func (*durableExecutionPinAdvancedError) Unwrap() error { return ErrDurableRequestConflict }
+
+func executionPinLeaseAdvanced(expected executionpin.LeaseCertificate, current executionpin.Record, applied uint64) bool {
+	actual, ok := current.LeaseCertificate()
+	return expected.Valid() && current.Valid() && ok && current.Status == executionpin.StatusActive &&
+		current.PrepareTerminalDigest == (executionpin.Digest{}) && actual.PinID == expected.PinID &&
+		actual.AcquireCertificateDigest == expected.AcquireCertificateDigest &&
+		applied >= actual.Applied && (actual.Revision > expected.Revision ||
+		actual == expected && applied > expected.LeaseAppliedThrough)
 }
 
 // ReadRequestLedger performs one leader ReadIndex-fenced, full-key hidden
@@ -422,6 +448,11 @@ func (executor *ReplicatedExecutor) ReadRequestLedger(
 				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound ||
 				response.Refusal == shardservice.ReplicatedRefusalRequestLedgerReadMalformed {
 				return ReplicatedRequestLedgerReadResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
+			if response.Refusal == shardservice.ReplicatedRefusalAdmissionBound {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					return ReplicatedRequestLedgerReadResult{}, err
+				}
 			}
 			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
 			preferred = 0

@@ -88,6 +88,62 @@ func NewLazyReplicatedChildExecutor(
 	return &LazyReplicatedChildExecutor{options: options}, nil
 }
 
+// PublishTailTarget restores the admitted endpoint even when its durable
+// stage means reconciliation will never schedule artifact staging again.
+func (executor *LazyReplicatedChildExecutor) PublishTailTarget() error {
+	if executor == nil {
+		return ErrTailStreamControl
+	}
+	return executor.options.Data.InstallChildTargetWithCleanup(
+		executor.options.Plan, executor.options.PlanDigest, executor.options.Child,
+		executor.options.Lease, executor, executor.Close,
+	)
+}
+
+func (executor *LazyReplicatedChildExecutor) ObserveTail(ctx context.Context) (rangesplit.ChildStageCursor, bool, error) {
+	if executor == nil || ctx == nil {
+		return rangesplit.ChildStageCursor{}, false, ErrTailStreamControl
+	}
+	if err := context.Cause(ctx); err != nil {
+		return rangesplit.ChildStageCursor{}, false, err
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.stage != nil {
+		return executor.stage.ObserveTail(ctx)
+	}
+	raw, present, err := executor.options.Lease.Load(RuntimeStateStage, executor.options.Child)
+	if err != nil || !present {
+		return rangesplit.ChildStageCursor{}, false, err
+	}
+	cursor, err := rangesplit.OpenChildStageCursor(raw.Payload)
+	if err != nil {
+		return rangesplit.ChildStageCursor{}, false, err
+	}
+	return *cursor, true, nil
+}
+
+func (executor *LazyReplicatedChildExecutor) ApplyTail(ctx context.Context, batch rangesplit.TailBatch) error {
+	if executor == nil || ctx == nil || batch.Child != executor.options.Child {
+		return ErrTailStreamControl
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.stage == nil {
+		artifacts, err := loadObservedArtifacts(executor.options.Lease)
+		if err != nil || artifacts == nil {
+			return errors.Join(ErrTailStreamControl, err)
+		}
+		if err = executor.open(ctx, Observation{Artifacts: artifacts}); err != nil {
+			return err
+		}
+	}
+	return executor.stage.ApplyTail(ctx, batch)
+}
+
 func (executor *LazyReplicatedChildExecutor) ExecuteSplitAction(
 	context.Context, *Plan, Observation, Action,
 ) error {
@@ -176,7 +232,7 @@ func (executor *LazyReplicatedChildExecutor) open(
 	if executor.stage != nil && executor.lifecycle != nil {
 		return nil
 	}
-	if observed.Artifacts == nil || observed.SourceNode == (rafttransport.NodeID{}) ||
+	if observed.Artifacts == nil ||
 		executor.options.Plan.partitioner.ValidateChildArtifactSet(*observed.Artifacts) != nil {
 		return ErrTopologyConflict
 	}
@@ -206,6 +262,12 @@ func (executor *LazyReplicatedChildExecutor) open(
 	var cursor []byte
 	if hasStage {
 		cursor = stageState.Payload
+	}
+	if observed.SourceNode == (rafttransport.NodeID{}) {
+		retained, openErr := rangesplit.OpenChildStageCursor(cursor)
+		if openErr != nil || (retained.Phase() != rangesplit.ChildStageTail && retained.Phase() != rangesplit.ChildStageSealed) {
+			return errors.Join(ErrTopologyConflict, openErr)
+		}
 	}
 	database, err := sqldriver.OpenReplicatedShardStore(
 		executor.options.Replica.SQLPath, executor.options.Replica.SQL,
@@ -287,12 +349,6 @@ func (executor *LazyReplicatedChildExecutor) open(
 		SQL: executor.options.Replica.SQL, Adopter: adopter,
 	})
 	if err != nil {
-		return errors.Join(err, stage.Close(), database.Close())
-	}
-	if err = executor.options.Data.InstallChildTargetWithCleanup(
-		executor.options.Plan, executor.options.PlanDigest, executor.options.Child,
-		executor.options.Lease, stageActions, executor.Close,
-	); err != nil {
 		return errors.Join(err, stage.Close(), database.Close())
 	}
 	executor.stage, executor.lifecycle = stageActions, lifecycle

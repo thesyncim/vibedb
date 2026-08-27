@@ -45,6 +45,19 @@ func TestNativeSessionControlBindingRequiresDurableExactRouteMember(t *testing.T
 	) {
 		t.Fatal("foreign source incarnation accepted")
 	}
+	restarted := raftServingFence(state.Fence)
+	restarted.NodeIncarnation++
+	if NativeSessionMatchesControlBinding(session, restarted, tenant, clientID, 1, serviceauthz.CapabilityTopology) {
+		t.Fatal("unobserved process incarnation accepted")
+	}
+	for index := range session.route.Replicas {
+		if session.route.Replicas[index].Member == restarted.MemberID {
+			session.route.Replicas[index].NodeIncarnation = restarted.NodeIncarnation
+		}
+	}
+	if !NativeSessionMatchesControlBinding(session, restarted, tenant, clientID, 1, serviceauthz.CapabilityTopology) {
+		t.Fatal("exact refreshed process incarnation rejected")
+	}
 	session.journal = nil
 	if NativeSessionMatchesControlBinding(
 		session, raftServingFence(state.Fence), tenant, clientID, 1,

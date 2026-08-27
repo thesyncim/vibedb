@@ -201,7 +201,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			client.requests, record.Payload, pressureErr, process.Diagnostics())
 	}
 	final := hotMutationWaitSplitComplete(t, ctx, authority,
-		snapshot.Generation()+1, operation, source)
+		snapshot.Generation()+1, operation, source, process)
 	children := 0
 	for _, descriptor := range final.ReplicatedShardDescriptors() {
 		if descriptor.Distribution != distribution.DistributionName("data") ||

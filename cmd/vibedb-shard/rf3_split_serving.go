@@ -274,6 +274,9 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		}
 		registered := false
 		return newRF3AdmittedExecutor(executor, func() error {
+			if err := executor.PublishTailTarget(); err != nil {
+				return err
+			}
 			if err := observation.provider.RegisterGroups([]splitcontroller.LocalObservationGroup{group}); err != nil {
 				return err
 			}

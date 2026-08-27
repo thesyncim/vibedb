@@ -4,7 +4,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +25,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -53,6 +56,18 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	defer cancel()
 	root := t.TempDir()
 	nodes := replicaProcessNodes()
+	groupNodes := [3][5]rafttransport.NodeID{nodes, nodes, nodes}
+	allNodes := append([]rafttransport.NodeID(nil), nodes[:]...)
+	credentialOffset := [3]int{0, 5, 8}
+	for group := 1; group < len(groupNodes); group++ {
+		for member := 0; member < 3; member++ {
+			groupNodes[group][member][0] ^= byte(group * 0x40)
+			allNodes = append(allNodes, groupNodes[group][member])
+		}
+	}
+	userNode := nodes[4]
+	userNode[15] ^= 0x80
+	allNodes = append(allNodes, userNode)
 	clusters := make([]*rf3testfixture.ProcessCluster, 3)
 	for index := range clusters {
 		var err error
@@ -76,20 +91,32 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	credentials, roots, err := rf3testfixture.WriteCredentials(root,
 		asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1},
 		rafttransport.TrustDomain{ClusterID: clusterIdentity[0].ClusterID,
-			ClusterIncarnation: clusterIdentity[0].ClusterIncarnation}, nodes[:])
+			ClusterIncarnation: clusterIdentity[0].ClusterIncarnation}, allNodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userCredential := credentials[len(credentials)-1]
+	userProfile, err := servicetls.LoadProfile(userCredential.Certificate, userCredential.Key,
+		roots, rf3testfixture.ProcessIdentityOID, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	policyPath := filepath.Join(root, "authorization-policy.vibejson")
-	if err = os.WriteFile(policyPath, replicaProcessPolicy(nodes), 0o600); err != nil {
+	policyNodes := append([]rafttransport.NodeID(nil), allNodes...)
+	sort.Slice(policyNodes, func(i, j int) bool { return bytes.Compare(policyNodes[i][:], policyNodes[j][:]) < 0 })
+	if err = os.WriteFile(policyPath, durableRF3ExternalPolicy(t, policyNodes), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	authorityProfile := sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 5,
 		ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13,
-		RoutingVersion: 17, RouteGeneration: 19}
-	wal := raftstore.Options{MaxFileBytes: 256 << 20,
-		MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096,
-		MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
+		RoutingVersion: 17, RouteGeneration: 1}
+	wal := rf3testfixture.DurableGatewayWALOptions()
+	// The catalog retains both request continuations and every split tail-step
+	// witness. Provision its fixed log for that workload before any process
+	// starts; data-shard and final growth limits remain unchanged.
+	catalogWAL := wal
+	catalogWAL.MaxFileBytes += 56 << 20
+	catalogWAL.MaxLiveBytes += 56 << 20
 	key := raftstore.Key{ID: "hot-mutation-key", Wrapped: []byte("test-wrapped-key")}
 	for index := range key.Material {
 		key.Material[index] = byte(index + 1)
@@ -102,6 +129,10 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 			MapperVersion: distribution.NativeMapperVersion,
 			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		}}
+	groupApply := [3]sqldriver.ReplicatedApplyOptions{apply, apply, apply}
+	groupApply[2].RequestLedgerCapacityBytes = 64 << 20
+	groupApply[2].RequestLedgerCleanupReserveBytes = 8 << 20
+	groupApply[2].RequestLedgerRangeIdentity = replication.Digest{0x91}
 
 	identities := [3][4]raftstore.Identity{
 		hotMutationIdentities(0, "messages-data", "messages-all"),
@@ -132,10 +163,10 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	logicalDigests := [3]replication.Digest{}
 	for group := range identities {
 		probe, probeErr := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
-			Root: filepath.Join(root, fmt.Sprintf("probe-%d", group)), Table: tables[group],
+			Root: t.TempDir(), Table: tables[group],
 			CreateTable: creates[group], Identity: identities[group][0], Key: key, WAL: wal,
 			Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-			Authority: authorityProfile, Apply: apply, SchemaStatements: schemas[group],
+			Authority: authorityProfile, Apply: groupApply[group], SchemaStatements: schemas[group],
 			GlobalIndexes: globalIndexes[group],
 		})
 		if errors.Is(probeErr, raftstore.ErrPlatformUnsupported) {
@@ -161,12 +192,12 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 
 	routes := [3]gateway.ReplicatedRoute{}
 	for group := range routes {
-		routes[group] = hotMutationRoute(identities[group], listeners[group], nodes,
+		routes[group] = hotMutationRoute(identities[group], listeners[group], groupNodes[group],
 			authorityProfile, digests[group])
 		routes[group].LogicalSchemaDigest = logicalDigests[group]
 	}
 	target := gateway.ReplicatedEndpoint{Member: 4, Node: nodes[3],
-		StoreID: identities[0][3].StoreID, NodeIncarnation: 44,
+		StoreID: identities[0][3].StoreID, NodeIncarnation: 1,
 		Endpoint: listeners[0][3].Peer, DataAddress: listeners[0][3].Peer,
 		NativeEndpoint: listeners[0][3].Native, Address: listeners[0][3].Native,
 		ControlEndpoint: listeners[0][3].Control, ControlAddress: listeners[0][3].Control}
@@ -205,25 +236,24 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if err = gateway.SaveSnapshot(catalogPath, built.Snapshot); err != nil {
 		t.Fatal(err)
 	}
-	seed := replicaProcessCatalogSeed(t, built.Snapshot)
 	prepared := [3][3]rf3testfixture.PreparedProcessMember{}
 	var cold rf3testfixture.PreparedColdTarget
 	for group := range prepared {
 		var memberNodes [3]rafttransport.NodeID
 		var peers [3]string
-		copy(memberNodes[:], nodes[:3])
+		copy(memberNodes[:], groupNodes[group][:3])
 		for member := range peers {
 			peers[member] = listeners[group][member].Peer
 		}
 		processTarget := &rf3testfixture.ProcessTarget{MemberID: 4, NodeID: nodes[3],
-			StoreID: identities[0][3].StoreID, NodeIncarnation: 44, Listeners: listeners[0][3]}
+			StoreID: identities[0][3].StoreID, NodeIncarnation: 1, Listeners: listeners[0][3]}
 		for member := range prepared[group] {
 			options := rf3testfixture.ProcessMemberOptions{
 				Root:  filepath.Join(root, fmt.Sprintf("group-%d-member-%d", group, member+1)),
 				Table: tables[group], CreateTable: creates[group], Identity: identities[group][member],
 				Key: key, WAL: wal, Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-				Authority: authorityProfile, Apply: apply, Listeners: listeners[group][member],
-				Credential: credentials[member], Roots: roots, AuthorizationPolicy: policyPath,
+				Authority: authorityProfile, Apply: groupApply[group], Listeners: listeners[group][member],
+				Credential: credentials[credentialOffset[group]+member], Roots: roots, AuthorizationPolicy: policyPath,
 				Nodes: memberNodes, PeerAddresses: peers, SchemaStatements: schemas[group],
 				GlobalIndexes: globalIndexes[group],
 			}
@@ -231,7 +261,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 				options.Target = processTarget
 			}
 			if group == 2 {
-				options.SeedDocuments = seed
+				options.WAL = catalogWAL
 			}
 			prepared[group][member], err = rf3testfixture.PrepareProcessMember(options)
 			if err != nil {
@@ -247,7 +277,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 				Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 				Nodes: memberNodes, PeerAddresses: peers, Target: processTarget,
 				SchemaStatements: schemas[0],
-			}, nodes[0], listeners[0][0].Snapshot, 1<<30)
+			}, nodes[1], listeners[0][1].Snapshot, 1<<30)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -288,6 +318,14 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replicaProcessStop(t, coldProcess)
+	defer func() {
+		if t.Failed() {
+			t.Logf("cold target diagnostics:\n%s", coldProcess.Diagnostics())
+			for index, process := range processes {
+				t.Logf("voter %d diagnostics:\n%s", index, process.Diagnostics())
+			}
+		}
+	}()
 	if err = coldProcess.WaitReady(ctx, "vibedb-shard RF3 cold bootstrap ready"); err != nil {
 		t.Fatalf("cold target readiness: %v\n%s", err, coldProcess.Diagnostics())
 	}
@@ -300,6 +338,9 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	catalogAuthority, closeAuthority := hotMutationCatalogAuthority(t, profile,
 		built.Snapshot, filepath.Join(root, "grant-session"))
 	defer closeAuthority()
+	if err = catalogAuthority.Publish(ctx, 0, built.Snapshot); err != nil {
+		t.Fatalf("publish immutable catalog genesis through RF3: %v", err)
+	}
 	grant, err := gateway.BuildReplicaReplacementMembershipGrant(built.Snapshot,
 		routes[0].Group, [16]byte{0x41}, 2, 1, 4)
 	if err != nil {
@@ -311,8 +352,8 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 
 	capacityPath := hotMutationCapacity(t, root)
 	controlPath := filepath.Join(root, "replica-control.vibejson")
-	if err = os.WriteFile(controlPath, hotMutationControlManifest(t, root, nodes, identities[0],
-		listeners[0], credentials[4], roots, policyPath, gatewayAddresses.Addresses[1], built.Snapshot, apply), 0o600); err != nil {
+	if err = os.WriteFile(controlPath, hotMutationControlManifest(t, root, groupNodes, identities[0],
+		listeners, credentials[4], roots, policyPath, gatewayAddresses.Addresses[1], built.Snapshot, apply), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	ackPath := filepath.Join(root, "durable-ack-key")
@@ -321,20 +362,26 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	}
 	gatewayProcess := hotMutationGatewayProcess(gatewayBinary, catalogPath,
 		gatewayAddresses.Addresses[0], controlPath, capacityPath, credentials[4], roots,
-		policyPath, ackPath, filepath.Join(root, "gateway-session"), listeners, nodes)
+		policyPath, ackPath, filepath.Join(root, "gateway-session"), listeners, groupNodes)
 	if err = gatewayProcess.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer replicaProcessStop(t, gatewayProcess)
+	defer func() {
+		if t.Failed() {
+			t.Logf("gateway diagnostics:\n%s", gatewayProcess.Diagnostics())
+		}
+	}()
 	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
 		t.Fatalf("gateway readiness: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
 	baselineRSS := replicaProcessRSS(gatewayProcess.PID())
 	baselineStorage := replicaProcessAllocatedBytes(root, "")
 	baselineSnapshotNetwork := replicaProcessSnapshotPayloadBytes(root)
-	connection := hotMutationDialGateway(t, profile, nodes[4], gatewayAddresses.Addresses[0])
+	connection := hotMutationDialGateway(t, userProfile, nodes[4], gatewayAddresses.Addresses[0])
 	defer connection.Close()
 	client := &hotMutationWireClient{connection: connection, reader: bufio.NewReader(connection)}
+	client.verifier = newHotMutationVerifier(t, userProfile, built.Snapshot, catalogAuthority, routes[0], routes[1])
 	reference := client.openIssuer(t)
 
 	var latencies []time.Duration
@@ -362,7 +409,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 			t.Fatalf("kill global-index leader %d: %v", leader, killErr)
 		}
 	})
-	client.reconnect(t, profile, nodes[4], gatewayAddresses.Addresses[0])
+	client.reconnect(t, userProfile, nodes[4], gatewayAddresses.Addresses[0])
 	latencies = append(latencies, client.execute(t, faultRequest))
 	hotMutationAssertMessage(t, client, "changed", "changed@example.com", 2)
 	hotMutationAssertSelectorEmpty(t, client, "kind", "initial")
@@ -403,6 +450,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if p99 > 5*time.Second {
 		t.Fatalf("foreground mutation p99=%s exceeds 5s", p99)
 	}
+	t.Logf("foreground mutations and exact retries passed: p99=%s", p99)
 
 	deadline := time.Now().Add(60 * time.Second)
 	maximumOperations := 0
@@ -417,6 +465,8 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if maximumOperations != 1 {
+		pressure, pressureErr := catalogAuthority.ReadPressureRecord(ctx)
+		t.Logf("pressure before admission: %s err=%v", pressure.Payload, pressureErr)
 		t.Fatalf("write pressure admitted operations=%d want=1\n%s", maximumOperations,
 			gatewayProcess.Diagnostics())
 	}
@@ -446,13 +496,19 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	var final *gateway.Snapshot
 	for time.Now().Before(deadline) {
 		candidate, readErr := catalogAuthority.Read(ctx)
-		if readErr == nil && candidate.Generation() >= 2 {
+		if readErr == nil && candidate.Generation() >= 3 {
 			var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 			route, found := candidate.ResolveReplicatedRoute(routes[0].Distribution,
 				routes[0].Shard, replicas[:0])
 			if found && hotMutationRosterContains(route, 4) && !hotMutationRosterContains(route, 1) {
-				final = candidate
-				break
+				ids, operationErr := catalogAuthority.ReadOperationIDs(ctx)
+				if operationErr == nil {
+					maximumOperations = max(maximumOperations, len(ids))
+					if len(ids) == 0 {
+						final = candidate
+						break
+					}
+				}
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -462,9 +518,10 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 			maximumOperations, gatewayProcess.Diagnostics())
 	}
 	terminalOperations, err := catalogAuthority.ReadOperationIDs(ctx)
-	if err != nil || len(terminalOperations) != 1 {
+	if err != nil || len(terminalOperations) != 0 {
 		t.Fatalf("topology operation amplification=%d err=%v", len(terminalOperations), err)
 	}
+	t.Logf("replacement completed and operation collected at catalog generation %d", final.Generation())
 
 	// Reopen both the killed remote-index voter and the complete shipped
 	// gateway. Reads then traverse newly opened retained identities and prove
@@ -483,6 +540,14 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatalf("stop gateway for reopen: %v", err)
 	}
 	restartCancel()
+	hotMutationRefreshSplitVoters(t, ctx, root, final, groupNodes[0], listeners[0], prepared[0], cold, processes[:3], coldProcess)
+	// Split roots are an explicit operator inventory. Refresh it to the
+	// certified replacement roster before reopening the gateway for the
+	// split phase; the retired source must not authorize child placement.
+	if err = os.WriteFile(controlPath, hotMutationControlManifest(t, root, groupNodes, identities[0],
+		listeners, credentials[4], roots, policyPath, gatewayAddresses.Addresses[1], final, apply), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err = gatewayProcess.Start(); err != nil {
 		t.Fatalf("restart gateway: %v", err)
 	}
@@ -490,7 +555,12 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		"vibedb-gateway serving catalog generation %d", final.Generation())); err != nil {
 		t.Fatalf("reopened gateway: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
-	client.reconnect(t, profile, nodes[4], gatewayAddresses.Addresses[0])
+	client.reconnect(t, userProfile, nodes[4], gatewayAddresses.Addresses[0])
+	reopenedRoute, ok := final.ResolveReplicatedRoute(routes[0].Distribution, routes[0].Shard,
+		make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount))
+	if !ok || hotMutationLeader(t, profile, reopenedRoute) == 0 {
+		t.Fatal("reopened source has no elected leader")
+	}
 	hotMutationAssertMessage(t, client, "final", "final@example.com", 7)
 	hotMutationAssertSelectorEmpty(t, client, "kind", "steady")
 	hotMutationAssertSelectorEmpty(t, client, "email", "steady@example.com")
@@ -505,7 +575,9 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if splitPlan == nil {
 		t.Fatal("exact split admission returned no plan")
 	}
+	t.Log("split admitted on the reopened replacement roster")
 	hotMutationWaitSplitRevision(t, ctx, catalogAuthority, [32]byte(splitPlan.OperationID()), 4)
+	t.Log("split capture/artifact execution started")
 	var splitLatencies []time.Duration
 	for sequence := uint64(8); sequence <= 9; sequence++ {
 		splitLatencies = append(splitLatencies, client.execute(t, hotMutationRequest(t, reference, sequence,
@@ -571,9 +643,9 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 			}}})))
 	}
 	splitCatalog := hotMutationWaitSplitComplete(
-		t, ctx, catalogAuthority, final.Generation()+1, [32]byte(splitPlan.OperationID()), routes[0],
+		t, ctx, catalogAuthority, final.Generation()+1, [32]byte(splitPlan.OperationID()), routes[0], gatewayProcess,
 	)
-	hotMutationAssertStaleParentRefused(t, profile, servingRoute)
+	hotMutationAssertStaleParentRefused(t, profile, servingRoute, splitCatalog)
 	for _, descriptor := range splitCatalog.ReplicatedShardDescriptors() {
 		if descriptor.Distribution != routes[0].Distribution || descriptor.Shard == routes[0].Shard {
 			continue
@@ -612,13 +684,144 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatalf("foreground/state amplification requests=%d bytes=%d storage_growth=%d snapshot_network_growth=%d",
 			client.requests, client.bytes, storageGrowth, snapshotNetworkGrowth)
 	}
+	hotMutationVerifyFinalStores(t, root, splitCatalog, splitPlan, client, processes, coldProcess, gatewayProcess)
 	t.Logf("write-driven hot move: split=true atomic_relation_index_visibility=true leader_kill=true source_partition=true response_partition=true reopen=true p99=%s split_p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d snapshot_network_growth=%d",
 		p99, splitP99, maximumOperations, len(record.Payload), client.requests, client.bytes,
 		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, snapshotNetworkGrowth)
 }
 
+// The split phase provisions new children on the replacement roster. Preserve
+// each source's durable WAL and SQL identities, and replace only the explicit
+// transport/child enrollment and the unused index-one child bootstrap.
+func hotMutationRefreshSplitVoters(t *testing.T, ctx context.Context, root string, catalog *gateway.Snapshot,
+	nodes [5]rafttransport.NodeID, listeners [4]rf3testfixture.ProcessListeners,
+	prepared [3]rf3testfixture.PreparedProcessMember, cold rf3testfixture.PreparedColdTarget,
+	processes []*rf3testfixture.ExternalProcess, coldProcess *rf3testfixture.ExternalProcess) {
+	t.Helper()
+	var roster []gateway.ReplicatedReplicaDescriptor
+	for _, descriptor := range catalog.ReplicatedShardDescriptors() {
+		if descriptor.Distribution == "messages-data" {
+			roster = descriptor.Replicas
+		}
+	}
+	sort.Slice(roster, func(i, j int) bool { return roster[i].Member < roster[j].Member })
+	if len(roster) != 3 || roster[0].Member != 2 || roster[1].Member != 3 || roster[2].Member != 4 {
+		t.Fatalf("uncertified split voter roster: %+v", roster)
+	}
+	memberList := func(members []uint64) []byte {
+		raw := []byte(`"members":[`)
+		for index, member := range members {
+			if index != 0 {
+				raw = append(raw, ',')
+			}
+			raw = fmt.Appendf(raw, `{"member_id":%d,"node_id":"%x","peer_address":%q}`, member, nodes[member-1], listeners[member-1].Peer)
+		}
+		return append(raw, ']')
+	}
+	oldMembers, newMembers := memberList([]uint64{1, 2, 3}), memberList([]uint64{2, 3, 4})
+	serving := []*rf3testfixture.ExternalProcess{processes[1], processes[2], coldProcess}
+	for _, process := range serving {
+		replicaProcessStop(t, process)
+	}
+	for _, replica := range roster {
+		member := replica.Member
+		manifestPath := cold.ManifestPath
+		if member != 4 {
+			manifestPath = prepared[member-1].ManifestPath
+		}
+		raw, err := os.ReadFile(manifestPath)
+		if err != nil || bytes.Count(raw, oldMembers) != 2 {
+			t.Fatalf("split enrollment %s: %v", manifestPath, err)
+		}
+		// These inventories are bound to the complete startup manifest. The
+		// operator is provisioning the first split, so only provably empty
+		// inventories may be archived before enrolling the replacement roster.
+		var manifest struct {
+			Route struct {
+				MembershipGrantPath string `json:"membership_grant_path"`
+			} `json:"route"`
+			ReplicaControl struct {
+				SourceDataRoot string `json:"source_data_root"`
+			} `json:"replica_control"`
+		}
+		if err := json.Unmarshal(raw, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		// The completed move's grant names the retired member, which is no
+		// longer enrolled by this new operator configuration. Preserve it as
+		// evidence; the final catalog and WAL now own the stable voter cut.
+		grantRaw, err := os.ReadFile(manifest.Route.MembershipGrantPath)
+		if err != nil || len(grantRaw) != membershipgrant.CanonicalGrantBytes+32 {
+			t.Fatalf("completed grant: %v", err)
+		}
+		completedGrant, err := membershipgrant.OpenCanonical(grantRaw[:membershipgrant.CanonicalGrantBytes])
+		grantDigest := completedGrant.Digest()
+		if err != nil || completedGrant.SourceMember != 1 || completedGrant.TargetMember != 4 ||
+			completedGrant.CatalogGeneration+2 != catalog.Generation() ||
+			!bytes.Equal(grantRaw[membershipgrant.CanonicalGrantBytes:], grantDigest[:]) {
+			t.Fatalf("completed replacement grant does not match split enrollment: %v", err)
+		}
+		if err := os.Rename(manifest.Route.MembershipGrantPath, manifest.Route.MembershipGrantPath+".before-split-enrollment"); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(raw)
+		for _, inventory := range []struct {
+			name, magic  string
+			digestOffset int
+		}{
+			{"adopted-groups.state", "VDBLIVEG", 8},
+			{"child-preparations.state", "VDBCHADM", 16},
+		} {
+			path := filepath.Join(manifest.ReplicaControl.SourceDataRoot, inventory.name)
+			state, err := os.ReadFile(path)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil || len(state) < 96 || string(state[:8]) != inventory.magic ||
+				!bytes.Equal(state[inventory.digestOffset:inventory.digestOffset+32], digest[:]) ||
+				sha256.Sum256(state[:len(state)-32]) != [32]byte(state[len(state)-32:]) ||
+				!bytes.Equal(state[64:len(state)-32], make([]byte, len(state)-96)) {
+				t.Fatalf("cannot reprovision nonempty or invalid split inventory %s: %v", path, err)
+			}
+			if err := os.Rename(path, path+".before-split-enrollment"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		raw = bytes.ReplaceAll(raw, oldMembers, newMembers)
+		// The fixture's default action grants cover shard peers only. The
+		// shipped gateway is a distinct authenticated principal and must be
+		// explicitly enrolled to drive this split's exact action grants.
+		grantEnd := []byte(`],"child_registry":`)
+		if bytes.Count(raw, grantEnd) != 1 {
+			t.Fatal("split action grant boundary missing")
+		}
+		raw = bytes.Replace(raw, grantEnd, fmt.Appendf(nil, `,{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}],"child_registry":`, nodes[3], nodes[4]), 1)
+		if at := bytes.Index(raw, []byte(`,"enrolled_target":`)); at >= 0 {
+			raw = append(raw[:at], '}')
+		}
+		if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := rf3testfixture.PrepareSplitRuntime(filepath.Join(root, fmt.Sprintf("group-0-member-%d", member)),
+			rf3testfixture.InitialBootstrap([]uint64{2, 3, 4})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coldProcess.Args = []string{"serve-rf3", "-manifest", cold.ManifestPath}
+	for _, process := range serving {
+		if err := process.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, process := range serving {
+		if err := process.WaitReady(ctx, "vibedb-shard RF3 ready"); err != nil {
+			t.Fatalf("reopen split voter: %v\n%s", err, process.Diagnostics())
+		}
+	}
+}
+
 func hotMutationAssertStaleParentRefused(
-	t *testing.T, profile *rafttransport.PeerTLS, route gateway.ReplicatedRoute,
+	t *testing.T, profile *rafttransport.PeerTLS, route gateway.ReplicatedRoute, current *gateway.Snapshot,
 ) {
 	t.Helper()
 	client, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
@@ -632,16 +835,28 @@ func hotMutationAssertStaleParentRefused(
 		t.Fatal(err)
 	}
 	defer client.Close()
-	fence := shardservice.ReplicatedFence{
-		Group: route.Group, AllocationGeneration: route.AllocationGeneration,
-		Command: route.Command,
+	currentRoute, ok := current.ResolveReplicatedRoute(route.Distribution, route.Shard, make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount))
+	if !ok {
+		t.Fatal("retained child route missing")
+	}
+	authority := serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: currentRoute.Command.ActivePolicyGeneration}
+	ctx, err := serviceauthz.WithAuthority(t.Context(), authority)
+	if err != nil {
+		t.Fatal(err)
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, endpoint := range route.Replicas {
-			response, requestErr := client.DoReplicated(t.Context(), endpoint, &shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedReadLeader, Capability: serviceauthz.CapabilityDataRead,
-				Fence: fence, Relation: 1, Key: []byte("m-0"), MaxValueBytes: 1 << 20,
+		for _, endpoint := range currentRoute.Replicas {
+			probe, probeErr := client.ProbeReplicated(ctx, currentRoute, endpoint, serviceauthz.CapabilityDataRead)
+			if probeErr != nil || probe == nil || !probe.HasState {
+				continue
+			}
+			endpoint.NodeIncarnation = probe.State.Fence.NodeIncarnation
+			fence := probe.State.Fence
+			fence.Command = route.Command
+			response, requestErr := client.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedReadLeader, Capability: serviceauthz.CapabilityDataRead, Authority: authority,
+				Fence: fence, Relation: 1, Key: []byte("m-0"), MinimumApplied: 1, MaxValueBytes: 1 << 20,
 			})
 			if requestErr != nil || response == nil || response.Kind == shardservice.ReplicatedNotLeader {
 				continue
@@ -665,7 +880,7 @@ func hotMutationWaitSplitRevision(
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		record, err := authority.ReadOperation(ctx, operation)
-		if err == nil && record.Revision >= revision {
+		if err == nil && record.Revision >= revision && record.Cursor[0] >= uint64(splitcontroller.ActionBuildArtifacts) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -676,6 +891,7 @@ func hotMutationWaitSplitRevision(
 func hotMutationWaitSplitComplete(
 	t *testing.T, ctx context.Context, authority *gateway.ReplicatedCatalogAuthority,
 	generation uint64, operation [32]byte, source gateway.ReplicatedRoute,
+	gatewayProcess *rf3testfixture.ExternalProcess,
 ) *gateway.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)
@@ -683,7 +899,16 @@ func hotMutationWaitSplitComplete(
 	var lastRecord gateway.ReplicatedOperationRecord
 	var lastReadErr, lastOperationErr error
 	progressReports := 0
+	lastDiagnostic := time.Now()
 	for time.Now().Before(deadline) {
+		if time.Since(lastDiagnostic) >= 5*time.Second {
+			diagnostic := gatewayProcess.Diagnostics()
+			if len(diagnostic) > 2048 {
+				diagnostic = diagnostic[len(diagnostic)-2048:]
+			}
+			t.Logf("split controller tail: %s", diagnostic)
+			lastDiagnostic = time.Now()
+		}
 		snapshot, err := authority.Read(ctx)
 		record, operationErr := authority.ReadOperation(ctx, operation)
 		lastReadErr, lastOperationErr = err, operationErr
@@ -851,7 +1076,8 @@ func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
+		CatalogBootstrap: snapshot,
+		Route:            route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xa1}, RetryHome: replication.RetryHome{0xb1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology})
@@ -873,7 +1099,7 @@ func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
-		Executor: executor, Route: route, Relation: 1, Holder: gateway.NewCatalogHolder(snapshot),
+		Executor: executor, Route: route, Relation: 1, Holder: gateway.NewCatalogHolder(nil),
 		Session: session, Authority: identity})
 	if err != nil {
 		t.Fatal(err)
@@ -898,22 +1124,31 @@ func hotMutationLeader(t *testing.T, profile *rafttransport.PeerTLS,
 	defer client.Close()
 	authority := serviceauthz.Authority{Node: profile.LocalIdentity().Node,
 		Generation: route.Command.ActivePolicyGeneration}
+	probeCtx, err := serviceauthz.WithAuthority(t.Context(), authority)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(15 * time.Second)
+	var lastProbeError error
+	var lastProbe *shardservice.ReplicatedResponse
 	for time.Now().Before(deadline) {
 		for _, endpoint := range route.Replicas {
-			response, probeErr := client.DoReplicated(t.Context(), endpoint,
-				rf3FixtureProbeRequest(route, authority, serviceauthz.CapabilityDataWrite))
+			response, probeErr := client.ProbeReplicated(probeCtx, route, endpoint, serviceauthz.CapabilityDataWrite)
+			lastProbe, lastProbeError = response, probeErr
 			if probeErr == nil && response != nil &&
 				response.Kind == shardservice.ReplicatedHandshake &&
 				response.State.Fence.Group == route.Group &&
-				response.State.LeaderID >= 1 &&
-				response.State.LeaderID <= gateway.ServingReplicaCount {
-				return response.State.LeaderID
+				response.State.LeaderID != 0 {
+				for _, voter := range route.Replicas {
+					if voter.Member == response.State.LeaderID {
+						return voter.Member
+					}
+				}
 			}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatal("discover remote global-index leader timeout")
+	t.Fatalf("discover %s/%s leader timeout: %v response=%+v", route.Distribution, route.Shard, lastProbeError, lastProbe)
 	return 0
 }
 
@@ -921,8 +1156,11 @@ func hotMutationCapacity(t *testing.T, root string) string {
 	t.Helper()
 	capacity := autosplit.CapacityVector{}
 	for resource := range autosplit.ResourceCount {
-		capacity[resource] = 2
+		capacity[resource] = 64 << 20
 	}
+	capacity[autosplit.ResourceRequests] = 2
+	spare := capacity
+	spare[autosplit.ResourceRequests] = 64
 	config := hotshard.StaticCapacityConfig{Format: hotshard.StaticCapacityFormat,
 		RecorderLanes: 8, WindowCapacity: capacity, NodeCapacity: capacity,
 		MigrationCapacity: 1024, ShardMigrationBytes: 1, MaxReceives: 1}
@@ -934,7 +1172,8 @@ func hotMutationCapacity(t *testing.T, root string) string {
 		}
 	}
 	config.Nodes = append(config.Nodes, hotshard.StaticCapacityNode{
-		Endpoint: "fixture-g0-target-data", FailureDomain: 4})
+		Endpoint: "fixture-g0-target-data", FailureDomain: 4, Capacity: &spare})
+	sort.Slice(config.Nodes, func(i, j int) bool { return config.Nodes[i].Endpoint < config.Nodes[j].Endpoint })
 	raw, err := hotshard.AppendStaticCapacityConfig(nil, config)
 	if err != nil {
 		t.Fatal(err)
@@ -946,13 +1185,14 @@ func hotMutationCapacity(t *testing.T, root string) string {
 	return path
 }
 
-func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttransport.NodeID,
-	identities [4]raftstore.Identity, listeners [4]rf3testfixture.ProcessListeners,
+func hotMutationControlManifest(t *testing.T, root string, groupNodes [3][5]rafttransport.NodeID,
+	identities [4]raftstore.Identity, groupListeners [3][4]rf3testfixture.ProcessListeners,
 	credential rf3testfixture.Credential, roots, policy, gatewayControl string,
 	catalog *gateway.Snapshot,
 	apply sqldriver.ReplicatedApplyOptions,
 ) []byte {
 	t.Helper()
+	nodes, listeners := groupNodes[0], groupListeners[0]
 	manifest := persistedGatewayReplicaControlManifest{Generation: 1,
 		LocalGateway: persistedGatewayControlEndpoint{Node: fmt.Sprintf("%x", nodes[4]),
 			Incarnation: 1, ControlAddress: gatewayControl},
@@ -963,13 +1203,21 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 		GatewayEndpoints: []persistedGatewayControlEndpoint{{Node: fmt.Sprintf("%x", nodes[4]),
 			Incarnation: 1, ControlAddress: gatewayControl}},
 		Candidates: []persistedGatewayReplacementCandidate{{Member: 4, Node: fmt.Sprintf("%x", nodes[3]),
-			Store: fmt.Sprintf("%x", identities[3].StoreID), NodeIncarnation: 44,
+			Store: fmt.Sprintf("%x", identities[3].StoreID), NodeIncarnation: 1,
 			Endpoint: "fixture-g0-target-data"}}}
 	for member := 0; member < 4; member++ {
 		manifest.ShardEndpoints = append(manifest.ShardEndpoints, persistedGatewayShardControlEndpoint{
 			Node: fmt.Sprintf("%x", nodes[member]), ControlAddress: listeners[member].Control,
 			SplitSnapshotAddress: listeners[member].Snapshot})
 	}
+	for group := 1; group < len(groupNodes); group++ {
+		for member := 0; member < 3; member++ {
+			manifest.ShardEndpoints = append(manifest.ShardEndpoints, persistedGatewayShardControlEndpoint{
+				Node: fmt.Sprintf("%x", groupNodes[group][member]), ControlAddress: groupListeners[group][member].Control,
+				SplitSnapshotAddress: groupListeners[group][member].Snapshot})
+		}
+	}
+	sort.Slice(manifest.ShardEndpoints, func(i, j int) bool { return manifest.ShardEndpoints[i].Node < manifest.ShardEndpoints[j].Node })
 	for _, source := range catalog.ReplicatedShardDescriptors() {
 		if source.Group.GroupID != identities[0].GroupID {
 			continue
@@ -983,7 +1231,7 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 				TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
 				SchemaGeneration: profile.SchemaGeneration, RelationManifestDigest: source.Command.RelationManifestDigest,
 				Table: profile.Table, Template: gatewaySplitTemplateFixture()}
-			identityRaw, err := os.ReadFile(filepath.Join(root, "group-0-member-1", "sql-identity.json"))
+			identityRaw, err := os.ReadFile(filepath.Join(root, fmt.Sprintf("group-0-member-%d", source.Replicas[0].Member), "sql-identity.json"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -995,10 +1243,11 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 			entry.Template.Format, entry.Template.ShardKey = apply.Placement.Format, placement.Columns[0]
 			entry.Placement = persistGatewaySplitPlacement(apply.Placement)
 			entry.Template.TupleVersion, entry.Template.MapperVersion = uint16(apply.Placement.TupleVersion), uint16(apply.Placement.MapperVersion)
-			for member := 0; member < 3; member++ {
+			for _, replica := range source.Replicas {
 				entry.Replicas = append(entry.Replicas, persistedGatewaySplitReplica{
-					Node: fmt.Sprintf("%x", nodes[member]), ChildRoot: filepath.Join(root, fmt.Sprintf("group-0-member-%d", member+1), "split-children")})
+					Node: fmt.Sprintf("%x", replica.Node), ChildRoot: filepath.Join(root, fmt.Sprintf("group-0-member-%d", replica.Member), "split-children")})
 			}
+			sort.Slice(entry.Replicas, func(i, j int) bool { return entry.Replicas[i].Node < entry.Replicas[j].Node })
 			manifest.SplitSources = append(manifest.SplitSources, entry)
 		}
 	}
@@ -1011,23 +1260,25 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 
 func hotMutationGatewayProcess(binary, catalog, listen, control, capacity string,
 	credential rf3testfixture.Credential, roots, policy, ack, journal string,
-	listeners [3][4]rf3testfixture.ProcessListeners, nodes [5]rafttransport.NodeID,
+	listeners [3][4]rf3testfixture.ProcessListeners, nodes [3][5]rafttransport.NodeID,
 ) *rf3testfixture.ExternalProcess {
 	args := []string{"serve", "-catalog", catalog,
 		"-catalog-route-seed", journal + ".catalog-route-seed", "-catalog-relation", "1",
 		"-catalog-session-journal", journal, "-durable-ack-key", ack,
 		"-catalog-client-id", strings.Repeat("1a", 16), "-catalog-retry-home", strings.Repeat("2b", 8),
 		"-catalog-attempts", "16", "-catalog-attempt-timeout", "2s", "-catalog-session-lease", "1h",
-		"-controller-interval", "20ms", "-hot-shard-capacity", capacity, "-hot-shard-interval", "10s",
+		// Accumulate the complete seven-request fault workload before the first
+		// placement cut. The separate split phase below runs during writes.
+		"-controller-interval", "20ms", "-hot-shard-capacity", capacity, "-hot-shard-interval", "30s",
 		"-listen", listen, "-tls-certificate", credential.Certificate, "-tls-key", credential.Key,
 		"-tls-roots", roots, "-tls-identity-oid", rf3testfixture.ProcessIdentityOID,
 		"-authorization-policy", policy, "-replica-control-manifest", control}
 	for group := range listeners {
 		for member := 0; member < 3; member++ {
-			args = append(args, "-shard-peer", listeners[group][member].Native+"="+fmt.Sprintf("%x", nodes[member]))
+			args = append(args, "-shard-peer", listeners[group][member].Native+"="+fmt.Sprintf("%x", nodes[group][member]))
 		}
 	}
-	args = append(args, "-shard-peer", listeners[0][3].Native+"="+fmt.Sprintf("%x", nodes[3]))
+	args = append(args, "-shard-peer", listeners[0][3].Native+"="+fmt.Sprintf("%x", nodes[0][3]))
 	return &rf3testfixture.ExternalProcess{Binary: binary, Args: args}
 }
 
@@ -1036,6 +1287,7 @@ type hotMutationWireClient struct {
 	reader     *bufio.Reader
 	requests   uint64
 	bytes      uint64
+	verifier   *hotMutationVerifier
 }
 
 func hotMutationDialGateway(t *testing.T, profile *rafttransport.PeerTLS,
@@ -1158,52 +1410,31 @@ func (client *hotMutationWireClient) reconnect(t *testing.T, profile *rafttransp
 	client.connection, client.reader = connection, bufio.NewReader(connection)
 }
 
-func (client *hotMutationWireClient) query(t *testing.T, sql, value string) [][]serveRawValue {
-	t.Helper()
-	raw, err := vibejson.Marshal(&serveRequest{Op: "query", SQL: sql, Class: "interactive",
-		Params: []serveParam{{Kind: "string", Text: value}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, _ := client.roundTrip(t, raw)
-	var decoded serveResponse
-	if err = json.Unmarshal(response, &decoded); err != nil || decoded.Error != "" {
-		t.Fatalf("query %q response=%s err=%v", sql, response, err)
-	}
-	return decoded.Rows
-}
-
 func hotMutationAssertMessage(t *testing.T, client *hotMutationWireClient,
 	kind, email string, value int,
 ) {
 	t.Helper()
-	for _, selector := range []struct {
-		field, value string
-	}{{"id", "m-0"}, {"kind", kind}, {"email", email}} {
-		rows := client.query(t,
-			fmt.Sprintf("SELECT id, kind, email, value FROM messages WHERE %s = ?", selector.field),
-			selector.value)
-		if len(rows) != 1 || len(rows[0]) != 4 || string(rows[0][0]) != `"m-0"` ||
-			string(rows[0][1]) != fmt.Sprintf("%q", kind) ||
-			string(rows[0][2]) != fmt.Sprintf("%q", email) ||
-			string(rows[0][3]) != fmt.Sprint(value) {
-			t.Fatalf("%s visibility rows=%q want m-0,%s,%s,%d",
-				selector.field, rows, kind, email, value)
-		}
+	document, found := client.getMessage(t)
+	if !found || document.ID != "m-0" || document.Kind != kind || document.Email != email || document.Value != value {
+		t.Fatalf("native base visibility found=%t document=%+v want m-0,%s,%s,%d", found, document, kind, email, value)
 	}
+	client.verifier.assertEmail(t, email, true)
 }
 
 func hotMutationAssertSelectorEmpty(t *testing.T, client *hotMutationWireClient,
 	field, value string,
 ) {
 	t.Helper()
-	if field != "id" && field != "kind" && field != "email" {
+	if field == "email" {
+		client.verifier.assertEmail(t, value, false)
+		return
+	}
+	if field != "id" && field != "kind" {
 		t.Fatalf("invalid visibility selector %q", field)
 	}
-	rows := client.query(t,
-		fmt.Sprintf("SELECT id, kind, email, value FROM messages WHERE %s = ?", field), value)
-	if len(rows) != 0 {
-		t.Fatalf("stale %s=%q rows=%q", field, value, rows)
+	document, found := client.getMessage(t)
+	if found && (field == "id" && document.ID == value || field == "kind" && document.Kind == value) {
+		t.Fatalf("stale native %s=%q document=%+v", field, value, document)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -49,13 +50,13 @@ func (service *RemoteActionService) ExecuteAction(
 	}
 	payload, err := openRemoteStepPayload(request)
 	if err != nil {
-		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
+		return shardcontrol.Response{}, fmt.Errorf("%w: open action payload: %w", ErrRemoteExecution, err)
 	}
 	operation := OperationID(request.Operation)
 	if witnessed, ok := service.runtime.(WitnessedShardActionRuntime); ok {
 		observed, openErr := openRemoteWitnessObservation(payload)
 		if openErr != nil {
-			return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, openErr)
+			return shardcontrol.Response{}, fmt.Errorf("%w: open action observation: %w", ErrRemoteExecution, openErr)
 		}
 		if err = witnessed.ExecuteWitnessedAction(ctx, request, payload, observed); err != nil {
 			return shardcontrol.Response{}, err

@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"math"
 	"net"
@@ -756,14 +757,18 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{Kind: ActionStartCapture}, nil
 	}
 	if captureHead != observed.SourceState.Applied {
-		return Action{}, ErrTopologyConflict
+		return Action{}, fmt.Errorf("%w: capture head %d differs from source applied %d", ErrTopologyConflict, captureHead, observed.SourceState.Applied)
 	}
 	if observed.Artifacts == nil {
 		return Action{Kind: ActionBuildArtifacts}, nil
 	}
 	initial, err := plan.partitioner.InitialTailCursor(*observed.Artifacts)
-	if err != nil || initial.SourceCoordinates().RouteGeneration != plan.current {
-		return Action{}, errors.Join(ErrTopologyConflict, err)
+	sourceGeneration := plan.current
+	if plan.sourceAuthority != nil {
+		sourceGeneration = plan.sourceAuthority.Command.RouteGeneration
+	}
+	if err != nil || initial.SourceCoordinates().RouteGeneration != sourceGeneration {
+		return Action{}, fmt.Errorf("%w: artifact source generation=%d expected=%d: %w", ErrTopologyConflict, initial.SourceCoordinates().RouteGeneration, sourceGeneration, err)
 	}
 	if action, ok, err := plan.stageAction(observed, initial); ok || err != nil {
 		return action, err
@@ -897,7 +902,7 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 	initial := p.sourceBindingInitial(binding)
 	sealed := p.sourceBindingSealed(binding)
 	if !initial && !sealed {
-		return ErrTopologyConflict
+		return fmt.Errorf("%w: source binding is neither initial nor sealed: %+v", ErrTopologyConflict, binding)
 	}
 	proofSealed := observed.Certificate != nil || observed.Tail != nil && observed.Tail.Sealed()
 	if proofSealed && !sealed {
@@ -1008,7 +1013,7 @@ func (p *Plan) stageAction(
 		if cursor.Child() != uint8(child) || cursor.PlanDigest() != p.partitioner.Digest() ||
 			cursor.PlacementDigest() != placement || cursor.ArtifactDigest() != artifact.Digest ||
 			cursor.SourceCut().Applied < artifact.Source.Applied {
-			return Action{}, false, ErrTopologyConflict
+			return Action{}, false, fmt.Errorf("%w: child %d staged artifact=%x applied=%d source artifact=%x applied=%d", ErrTopologyConflict, child, cursor.ArtifactDigest(), cursor.SourceCut().Applied, artifact.Digest, artifact.Source.Applied)
 		}
 		switch cursor.Phase() {
 		case rangesplit.ChildStageArtifact:

@@ -45,10 +45,16 @@ func NewReplicatedChildStageActions(
 	if options.Plan == nil || options.Lease == nil || options.Stage == nil ||
 		!options.Plan.validNonRetainedChild(options.Child) ||
 		options.Plan.partitioner.ValidateChildArtifactSet(options.Artifacts) != nil ||
-		options.Opener == nil || options.SourceNode == (rafttransport.NodeID{}) ||
+		options.Opener == nil ||
 		options.ReadDeadline == nil || options.WriteDeadline == nil || options.ChunkBytes == 0 ||
 		options.MaxReconnects < 0 || len(options.Workspace) < int(options.ChunkBytes) {
 		return nil, ErrRuntimeStore
+	}
+	if options.SourceNode == (rafttransport.NodeID{}) {
+		cursor, ok := options.Stage.Cursor()
+		if !ok || (cursor.Phase() != rangesplit.ChildStageTail && cursor.Phase() != rangesplit.ChildStageSealed) {
+			return nil, ErrRuntimeStore
+		}
 	}
 	options.Workspace = options.Workspace[:options.ChunkBytes]
 	return &ReplicatedChildStageActions{options: options, revision: options.Revision}, nil
@@ -62,12 +68,16 @@ func (actions *ReplicatedChildStageActions) ExecuteRemoteChildStage(
 		return ErrRemoteExecution
 	}
 	manifest := actions.options.Artifacts.Children[child]
+	source := observed.SourceNode
+	if source == (rafttransport.NodeID{}) {
+		source = actions.options.SourceNode
+	}
 	identity, err := splitartifact.NewIdentity([32]byte(plan.OperationID()), manifest)
 	if err != nil {
 		return err
 	}
 	stream, err := splitartifact.OpenStream(ctx, splitartifact.StreamOptions{
-		Opener: actions.options.Opener, SourceNode: actions.options.SourceNode, Identity: identity,
+		Opener: actions.options.Opener, SourceNode: source, Identity: identity,
 		ReadDeadline: actions.options.ReadDeadline, WriteDeadline: actions.options.WriteDeadline,
 		ChunkBytes: actions.options.ChunkBytes, MaxReconnects: actions.options.MaxReconnects,
 		Workspace: actions.options.Workspace,

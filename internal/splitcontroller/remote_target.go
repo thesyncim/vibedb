@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -389,12 +390,12 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 		grant.Admission.CatalogGeneration != payload.Catalog ||
 		grant.Admission.CatalogDigest != payload.CatalogDigest ||
 		payload.AdmissionRevision != grant.Admission.CatalogGeneration || len(grant.Leases) == 0 {
-		return ErrRemoteExecution
+		return fmt.Errorf("%w: action %d admission grant found=%t catalog=%d/%d admission=%d leases=%d", ErrRemoteExecution, request.Action, ok, payload.Catalog, grant.Admission.CatalogGeneration, payload.AdmissionRevision, len(grant.Leases))
 	}
 	action := Action{Kind: ActionKind(request.Action), Child: request.Child}
 	if request.Step != remoteExecutionStep(request.Operation, action, payload.ExecutionRevision) ||
 		payload.Sequence != remoteExecutionSequence(action, payload.ExecutionRevision) {
-		return ErrRemoteExecution
+		return fmt.Errorf("%w: action step or execution sequence", ErrRemoteExecution)
 	}
 	binding := observed.SourceState.Binding
 	wantFence := shardcontrol.Fence{
@@ -405,7 +406,7 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 		Applied: observed.SourceState.Applied,
 	}
 	if request.Fence != wantFence {
-		return ErrRemoteExecution
+		return fmt.Errorf("%w: action source fence", ErrRemoteExecution)
 	}
 	if remoteActionTargetsChild(action.Kind) {
 		target, found := grant.Plan.Target(action.Child)
@@ -413,7 +414,7 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 			return ErrRemoteExecution
 		}
 	} else if !targetMatchesSourceState(payload.Target, observed.SourceState) {
-		return ErrRemoteExecution
+		return fmt.Errorf("%w: action target differs from source state", ErrRemoteExecution)
 	}
 	if action.Kind == ActionPruneRetained {
 		if observed.Certificate == nil || grant.Catalog == nil {
@@ -446,7 +447,7 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 		return ErrRemoteExecution
 	}
 	if err := executor.ExecuteAuthorizedSplitAction(ctx, grant.Plan, observed, action); err != nil {
-		return err
+		return fmt.Errorf("splitcontroller: execute authorized action %d: %w", action.Kind, err)
 	}
 	return SettleActionWitness(grant.Leases, witness)
 }

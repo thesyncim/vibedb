@@ -118,11 +118,14 @@ func (distributedRunnerPayloads) Cleanup(context.Context, DurableRequestLedgerHo
 }
 
 type distributedRunnerWaves struct {
-	ledger          *distributedRunnerLedger
-	fault           distributedtxn.ReplicatedOperation
-	prepareConflict bool
-	manifestPayload []byte
-	decisionSettled bool
+	ledger            *distributedRunnerLedger
+	fault             distributedtxn.ReplicatedOperation
+	prepareConflict   bool
+	manifestPayload   []byte
+	decisionSettled   bool
+	admissionFailures int
+	admissionError    error
+	admissionCommands [][]byte
 }
 
 func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, _ ReplicatedRoute, read replicatedstate.TransactionRecoveryReadRequest) (ReplicatedTransactionRecoveryResult, error) {
@@ -152,6 +155,13 @@ func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, 
 }
 
 func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave DurableRequestWave) (DurableRequestWaveResult, error) {
+	if waves.admissionError != nil {
+		waves.admissionCommands = append(waves.admissionCommands, bytes.Clone(wave.Command))
+		if waves.admissionFailures > 0 {
+			waves.admissionFailures--
+			return DurableRequestWaveResult{}, waves.admissionError
+		}
+	}
 	command, err := replication.OpenCommand(wave.Command)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
@@ -315,13 +325,67 @@ func TestDurableRequestDistributedRunnerRefreshesOnlyUnfinishedWavesAndTerminal(
 	}
 }
 
+func TestDurableRequestWaveRetriesOnlyExpiredAdmissionWithinBound(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		failures, attempts int
+		fault              error
+		admitted           bool
+	}{
+		{"expired", 1, 2, &durableExecutionPinAdvancedError{}, true},
+		{"bounded", 4, 4, &durableExecutionPinAdvancedError{}, false},
+		{"identity-conflict", 1, 1, ErrDurableRequestConflict, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			execution := typedExecutionFixture(t)
+			execution.Recipe.Contract.CommitFinalWaveCount, execution.Recipe.Contract.AbortFinalWaveCount = 8, 11
+			commit, abort := []byte("terminal-commit"), []byte("terminal-abort")
+			execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.CommitTransitionTag, commit))
+			execution.Recipe.Contract.AbortTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.AbortTransitionTag, abort))
+			_, head, route := lifecycleRunnerFixture(t)
+			execution, release := bindTypedExecutionPin(t, execution, route)
+			head.NextStepOrdinal, head.Revision = 0, 1
+			base := &distributedRunnerLedger{head: head}
+			waves := &distributedRunnerWaves{ledger: base, fault: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+				admissionFailures: test.failures, admissionError: test.fault}
+			authority := &refreshingRunnerAuthority{distributedRunnerAuthority: distributedRunnerAuthority{value: DurableRequestTerminalAuthority{CommitCursor: commit, AbortCursor: abort, Release: release}}}
+			runner, err := newDurableRequestDistributedRunner(refreshingRunnerLedger{base}, distributedRunnerResolver{base: route}, waves, retainedEpochRunnerPayloads{}, &distributedRunnerTerminal{}, authority)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pins := &refreshingRunnerPins{}
+			runner.pins = pins
+			_, err = runner.RunTyped(t.Context(), execution)
+			want := test.fault
+			if test.admitted {
+				want = errLifecycleRunnerFault
+			}
+			if !errors.Is(err, want) || pins.calls != test.attempts || len(waves.admissionCommands) != test.attempts {
+				t.Fatalf("calls=%d commands=%d err=%v", pins.calls, len(waves.admissionCommands), err)
+			}
+			for _, command := range waves.admissionCommands {
+				if !bytes.Equal(command, waves.admissionCommands[0]) {
+					t.Fatal("lease refresh rebuilt exact participant command")
+				}
+			}
+		})
+	}
+}
+
 type distributedRunnerTerminal struct {
-	plan  DurableRequestTerminalPlan
-	fault bool
+	plan              DurableRequestTerminalPlan
+	fault             bool
+	admissionFailures int
+	calls             int
 }
 
 func (terminal *distributedRunnerTerminal) Complete(_ context.Context, plan DurableRequestTerminalPlan) (DurableRequestTerminalResult, error) {
 	terminal.plan = plan
+	terminal.calls++
+	if terminal.admissionFailures > 0 {
+		terminal.admissionFailures--
+		return DurableRequestTerminalResult{}, &durableExecutionPinAdvancedError{}
+	}
 	if terminal.fault {
 		terminal.fault = false
 		return DurableRequestTerminalResult{}, errLifecycleRunnerFault
@@ -366,7 +430,9 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 			execution := typedExecutionFixture(t)
 			execution.Recipe.Contract.CommitFinalWaveCount = 8
 			execution.Recipe.Contract.AbortFinalWaveCount = 11
-			commitCursor, abortCursor := []byte("terminal-commit"), []byte("terminal-abort")
+			// Production terminal cursors share the decision-state encoding.
+			commitCursor := appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedCommitted})
+			abortCursor := appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedAborted})
 			execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.CommitTransitionTag, commitCursor))
 			execution.Recipe.Contract.AbortTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.AbortTransitionTag, abortCursor))
 			wave, head, route := lifecycleRunnerFixture(t)
@@ -397,6 +463,20 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 				t.Fatalf("terminal=%+v", terminal.plan)
 			}
 		})
+	}
+}
+
+func TestDurableTerminalAdmissionRetryIsBounded(t *testing.T) {
+	for _, failures := range []int{1, 4} {
+		execution := typedExecutionFixture(t)
+		_, _, route := lifecycleRunnerFixture(t)
+		execution, _ = bindTypedExecutionPin(t, execution, route)
+		terminal := &distributedRunnerTerminal{admissionFailures: failures}
+		runner := &DurableRequestDistributedRunner{terminal: terminal}
+		_, err := runner.completeTerminal(t.Context(), execution, DurableRequestTerminalAuthority{}, durableDistributedState{branch: durableDistributedCommitted})
+		if terminal.calls != min(failures+1, 4) || (err != nil) != (failures == 4) {
+			t.Fatalf("failures=%d calls=%d err=%v", failures, terminal.calls, err)
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -163,7 +164,7 @@ func (observer *CoherentPlanObserver) observeAttempt(
 		return Observation{}, false, err
 	}
 	if _, err = plan.catalogStage(catalog); err != nil {
-		return Observation{}, false, err
+		return Observation{}, false, fmt.Errorf("catalog stage generation=%d source=%d target=%d: %w", catalog.Generation(), plan.current, plan.next, err)
 	}
 	catalogDigest, err := gateway.CatalogSnapshotDigest(catalog)
 	if err != nil {
@@ -208,7 +209,7 @@ func (observer *CoherentPlanObserver) observeAttempt(
 	observed := Observation{Catalog: catalog}
 	for index := range results {
 		if results[index].err != nil {
-			return Observation{}, false, results[index].err
+			return Observation{}, false, fmt.Errorf("observation member group %d (source=%d): %w", index, sourceIndex, results[index].err)
 		}
 		request := requests[index]
 		if index == sourceIndex {
@@ -277,7 +278,7 @@ func (observer *CoherentPlanObserver) observeAttempt(
 		observed.RetainedPruneCertificate = pruneCertificate
 	}
 	if _, err = Reconcile(plan, observed); err != nil {
-		return Observation{}, false, err
+		return Observation{}, false, fmt.Errorf("reconcile source applied=%d capture=%d artifacts=%t tail=%t certificate=%t: %w", observed.SourceState.Applied, observed.CaptureHead, observed.Artifacts != nil, observed.Tail != nil, observed.Certificate != nil, err)
 	}
 	return observed, false, nil
 }
