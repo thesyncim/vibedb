@@ -146,7 +146,7 @@ func AppendTailStreamRequestWithWorkspace(
 	}
 	batchBytes := len(frame) - batchStart
 	if batchBytes > MaxTailBatchWireBytes || len(frame)+sha256.Size > MaxTailStreamRequestBytes ||
-		len(frame)+sha256.Size > math.MaxUint32 {
+		uint64(len(frame))+sha256.Size > math.MaxUint32 {
 		return dst[:start], ErrTailStream
 	}
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(len(frame)+sha256.Size))

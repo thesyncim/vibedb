@@ -59,7 +59,7 @@ func AppendTailBatchWithWorkspace(
 		return dst, errors.Join(ErrTailBatchWire, err)
 	}
 	total := tailBatchWireHeaderBytes + operationBytes + sha256.Size
-	if total > MaxTailBatchWireBytes || total > math.MaxUint32 {
+	if total > MaxTailBatchWireBytes || uint64(total) > math.MaxUint32 {
 		return dst, ErrTailBatchWire
 	}
 	start := len(dst)
