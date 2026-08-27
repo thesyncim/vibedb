@@ -107,7 +107,7 @@ func TestReplicatedCatalogRouteSeedRejectsUnattestedForeignStaleAndDivergentCuts
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
-	foreign := *authority
+	foreign := &ReplicatedCatalogAuthority{}
 	if err = foreign.StageReplicatedCatalogRouteSeedAfter(
 		path, 0, receipt,
 	); !errors.Is(err, ErrReplicatedCatalog) {
