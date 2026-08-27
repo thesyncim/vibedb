@@ -1,7 +1,6 @@
 package storeio
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 )
@@ -139,23 +138,4 @@ func (it *GenerationMigrationExactRunIterator) Next() (GenerationMigrationExactR
 	it.at = end
 	it.remaining--
 	return result, true
-}
-
-func compareGenerationMigrationExactRunRecord(a, b GenerationMigrationExactRunRecord) int {
-	if a.IndexID < b.IndexID {
-		return -1
-	}
-	if a.IndexID > b.IndexID {
-		return 1
-	}
-	if cmp := bytes.Compare(a.Key, b.Key); cmp != 0 {
-		return cmp
-	}
-	if a.TileID < b.TileID {
-		return -1
-	}
-	if a.TileID > b.TileID {
-		return 1
-	}
-	return 0
 }
