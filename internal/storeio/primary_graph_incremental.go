@@ -316,3 +316,203 @@ func stagePrimaryTabletWindow(
 		floor: floor, id: tabletID, ref: routePage.Ref(),
 	}, nil
 }
+
+func stagePrimaryCatalogWindow(
+	sink PrimaryGraphBuildSink,
+	level GlobalTabletCatalogNodeLevel,
+	pageID uint32,
+	children []primaryCatalogChild,
+) (primaryCatalogChild, error) {
+	if sink == nil || len(children) == 0 ||
+		(level != GlobalTabletCatalogLeaf && level != GlobalTabletCatalogBranch) {
+		return primaryCatalogChild{}, fmt.Errorf(
+			"%w: incremental primary catalog window", ErrInvalidWrite,
+		)
+	}
+	logicalID, ok := GlobalTabletCatalogCatalogLeafLogicalID(pageID)
+	childKind := PageTabletRoute
+	childLength := uint32(GlobalTabletCatalogTabletBytes)
+	if level == GlobalTabletCatalogBranch {
+		logicalID, ok = GlobalTabletCatalogCatalogBranchLogicalID(pageID)
+		childKind = PagePrimaryCatalog
+		childLength = GlobalTabletCatalogNodeBytes
+	}
+	if !ok {
+		return primaryCatalogChild{}, fmt.Errorf(
+			"%w: incremental primary catalog ID", ErrInvalidWrite,
+		)
+	}
+	page, err := sink.AllocatePage(
+		PagePrimaryCatalog, GlobalTabletCatalogNodeBytes, logicalID,
+	)
+	if err != nil {
+		return primaryCatalogChild{}, err
+	}
+	if _, err := EncodeGlobalTabletCatalogNode(
+		page.Bytes(),
+		GlobalTabletCatalogNodeHeader{
+			StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
+			LogicalID: logicalID, PageID: pageID, Level: level,
+			Kind: PagePrimaryCatalog, ChildKind: childKind,
+			ChildLength: childLength, Bounds: primaryCatalogBounds(sink),
+		},
+		primaryCatalogEntries(children),
+	); err != nil {
+		return primaryCatalogChild{}, err
+	}
+	if err := page.Stage(); err != nil {
+		return primaryCatalogChild{}, err
+	}
+	return primaryCatalogChild{
+		floor: children[0].floor, id: pageID, ref: page.Ref(),
+	}, nil
+}
+
+// PrimaryGraphCatalogFolder incrementally folds tablet roots into the fixed
+// leaf/optional-branch/resident-root catalog. Before a branch is necessary it
+// retains at most rootFanout+1 leaf witnesses; afterwards it retains one leaf
+// fanout and at most rootFanout branch witnesses.
+type PrimaryGraphCatalogFolder struct {
+	sink                   PrimaryGraphBuildSink
+	leafFanout, rootFanout int
+	tablets                []primaryCatalogChild
+	leaves                 []primaryCatalogChild
+	branches               []primaryCatalogChild
+	leafPageID             uint32
+	branchPageID           uint32
+	tabletCount            uint32
+	lastTabletID           uint32
+	branching              bool
+	finished               bool
+}
+
+func NewPrimaryGraphCatalogFolder(
+	sink PrimaryGraphBuildSink,
+) (*PrimaryGraphCatalogFolder, error) {
+	leafFanout := GlobalTabletCatalogWorstCaseFanout(
+		GlobalTabletCatalogNodeBytes, CommonPrimaryLeafMaxKeyBytes,
+	)
+	rootFanout := GlobalTabletCatalogWorstCaseFanout(
+		GlobalTabletCatalogRootBytes, CommonPrimaryLeafMaxKeyBytes,
+	)
+	if sink == nil || leafFanout == 0 || rootFanout == 0 {
+		return nil, fmt.Errorf("%w: incremental primary catalog", ErrInvalidWrite)
+	}
+	return &PrimaryGraphCatalogFolder{
+		sink: sink, leafFanout: leafFanout, rootFanout: rootFanout,
+		tablets:  make([]primaryCatalogChild, 0, leafFanout),
+		leaves:   make([]primaryCatalogChild, 0, rootFanout+1),
+		branches: make([]primaryCatalogChild, 0, rootFanout),
+	}, nil
+}
+
+func (f *PrimaryGraphCatalogFolder) AddTablet(child primaryCatalogChild) error {
+	if f == nil || f.finished || child.ref.Kind != PageTabletRoute ||
+		f.tabletCount != 0 && child.id <= f.lastTabletID {
+		return fmt.Errorf("%w: incremental primary tablet child", ErrInvalidWrite)
+	}
+	f.tablets = append(f.tablets, child)
+	f.tabletCount++
+	f.lastTabletID = child.id
+	if len(f.tablets) == f.leafFanout {
+		return f.flushCatalogLeaf()
+	}
+	return nil
+}
+
+func (f *PrimaryGraphCatalogFolder) flushCatalogLeaf() error {
+	if len(f.tablets) == 0 {
+		return nil
+	}
+	child, err := stagePrimaryCatalogWindow(
+		f.sink, GlobalTabletCatalogLeaf, f.leafPageID, f.tablets,
+	)
+	if err != nil {
+		return err
+	}
+	f.leafPageID++
+	f.tablets = f.tablets[:0]
+	f.leaves = append(f.leaves, child)
+	if !f.branching && len(f.leaves) > f.rootFanout {
+		f.branching = true
+	}
+	if f.branching {
+		for len(f.leaves) >= f.leafFanout {
+			if err := f.flushCatalogBranch(f.leafFanout); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (f *PrimaryGraphCatalogFolder) flushCatalogBranch(count int) error {
+	if count < 1 || count > len(f.leaves) {
+		return fmt.Errorf("%w: incremental primary branch window", ErrInvalidWrite)
+	}
+	child, err := stagePrimaryCatalogWindow(
+		f.sink, GlobalTabletCatalogBranch, f.branchPageID, f.leaves[:count],
+	)
+	if err != nil {
+		return err
+	}
+	f.branchPageID++
+	f.branches = append(f.branches, child)
+	copy(f.leaves, f.leaves[count:])
+	f.leaves = f.leaves[:len(f.leaves)-count]
+	if len(f.branches) > f.rootFanout {
+		return fmt.Errorf("%w: incremental primary root capacity", ErrInvalidWrite)
+	}
+	return nil
+}
+
+func (f *PrimaryGraphCatalogFolder) Finish() (PageRef, error) {
+	if f == nil || f.finished {
+		return PageRef{}, ErrBatchState
+	}
+	f.finished = true
+	if err := f.flushCatalogLeaf(); err != nil {
+		return PageRef{}, err
+	}
+	rootChildren := f.leaves
+	rootChildLevel := GlobalTabletCatalogLeaf
+	if f.branching {
+		if len(f.leaves) != 0 {
+			if err := f.flushCatalogBranch(len(f.leaves)); err != nil {
+				return PageRef{}, err
+			}
+		}
+		rootChildren = f.branches
+		rootChildLevel = GlobalTabletCatalogBranch
+	}
+	if len(rootChildren) == 0 || len(rootChildren) > f.rootFanout {
+		return PageRef{}, fmt.Errorf(
+			"%w: incremental primary root children", ErrInvalidWrite,
+		)
+	}
+	page, err := f.sink.AllocatePage(
+		PagePrimaryCatalog, GlobalTabletCatalogRootBytes,
+		GlobalTabletCatalogRootLogicalID,
+	)
+	if err != nil {
+		return PageRef{}, err
+	}
+	if _, err := EncodeGlobalTabletCatalogNode(
+		page.Bytes(),
+		GlobalTabletCatalogNodeHeader{
+			StoreID: f.sink.StoreIdentity(), Generation: f.sink.BuildGeneration(),
+			LogicalID: GlobalTabletCatalogRootLogicalID,
+			Level:     GlobalTabletCatalogRoot, RootChildLevel: rootChildLevel,
+			Kind: PagePrimaryCatalog, ChildKind: PagePrimaryCatalog,
+			ChildLength: GlobalTabletCatalogNodeBytes,
+			Bounds:      primaryCatalogBounds(f.sink),
+		},
+		primaryCatalogEntries(rootChildren),
+	); err != nil {
+		return PageRef{}, err
+	}
+	if err := page.Stage(); err != nil {
+		return PageRef{}, err
+	}
+	return page.Ref(), nil
+}

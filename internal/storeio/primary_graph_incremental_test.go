@@ -262,6 +262,100 @@ func TestStagePrimaryTabletWindowUsesBoundedLeafWitnesses(t *testing.T) {
 	}
 }
 
+func TestPrimaryGraphCatalogFolderBoundsDirectAndBranchShapes(t *testing.T) {
+	leafFanout := GlobalTabletCatalogWorstCaseFanout(
+		GlobalTabletCatalogNodeBytes, CommonPrimaryLeafMaxKeyBytes,
+	)
+	rootFanout := GlobalTabletCatalogWorstCaseFanout(
+		GlobalTabletCatalogRootBytes, CommonPrimaryLeafMaxKeyBytes,
+	)
+	for _, test := range []struct {
+		name       string
+		tablets    int
+		childLevel GlobalTabletCatalogNodeLevel
+	}{
+		{name: "direct", tablets: 2 * leafFanout, childLevel: GlobalTabletCatalogLeaf},
+		{
+			name: "branch", tablets: (rootFanout + 1) * leafFanout,
+			childLevel: GlobalTabletCatalogBranch,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const base = uint64(64 << 10)
+			const stride = uint64(GlobalTabletCatalogTabletBytes)
+			sink := &incrementalPrimaryTestSink{
+				next: base + uint64(test.tablets)*stride,
+			}
+			folder, err := NewPrimaryGraphCatalogFolder(sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for tabletID := range test.tablets {
+				logicalID, ok := GlobalTabletCatalogTabletRootLogicalID(uint32(tabletID))
+				if !ok {
+					t.Fatal("tablet logical ID")
+				}
+				var floor []byte
+				if tabletID != 0 {
+					floor = []byte(fmt.Sprintf("f-%08d", tabletID))
+				}
+				if err := folder.AddTablet(primaryCatalogChild{
+					floor: floor, id: uint32(tabletID),
+					ref: PageRef{
+						Offset:    base + uint64(tabletID)*stride,
+						LogicalID: logicalID, Generation: 7,
+						Length: GlobalTabletCatalogTabletBytes,
+						Kind:   PageTabletRoute,
+					},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := folder.Finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var image []byte
+			for at := range sink.refs {
+				if sink.refs[at] == root {
+					image = sink.pages[at]
+					break
+				}
+			}
+			if image == nil {
+				t.Fatal("catalog root not staged")
+			}
+			view, err := OpenGlobalTabletCatalogNode(
+				image, root,
+				GlobalTabletCatalogBounds{
+					StoreID: testStoreID, SelectedRootGeneration: 7,
+					FileEnd:       sink.next,
+					NextLogicalID: PrimaryFirstDynamicLogicalID,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.Level() != GlobalTabletCatalogRoot ||
+				view.ChildLevel() != test.childLevel {
+				t.Fatalf(
+					"root level/child=%d/%d, want %d/%d",
+					view.Level(), view.ChildLevel(),
+					GlobalTabletCatalogRoot, test.childLevel,
+				)
+			}
+			if cap(folder.tablets) != leafFanout ||
+				cap(folder.leaves) > rootFanout+1 ||
+				cap(folder.branches) > rootFanout {
+				t.Fatalf(
+					"unbounded caps tablets/leaves/branches=%d/%d/%d",
+					cap(folder.tablets), cap(folder.leaves), cap(folder.branches),
+				)
+			}
+		})
+	}
+}
+
 func incrementalPrimaryFileEnd(s *incrementalPrimaryTestSink) uint64 {
 	return max(s.next, uint64(GlobalTabletCatalogRootBytes))
 }
