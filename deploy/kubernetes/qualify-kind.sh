@@ -27,18 +27,44 @@ start_port_forward() {
   port_forward_pid=$!
 }
 
-cleanup() {
-  local exit_status=$?
-  if [[ "${exit_status}" -ne 0 && "${cluster_created}" == true ]]; then
+collect_failure_evidence() {
     # Preserve bounded pod/init diagnostics before deleting this test cluster.
-    timeout 10s kubectl --request-timeout=5s get pods -n "${namespace}" -o wide \
+    timeout --kill-after=1s 10s kubectl --request-timeout=5s get pods -n "${namespace}" -o wide \
       2>&1 | head -c 1048576 > "${evidence_dir}/failed-pods.txt" || true
-    timeout 10s kubectl --request-timeout=5s get events -n "${namespace}" --sort-by=.lastTimestamp \
+    timeout --kill-after=1s 10s kubectl --request-timeout=5s get events -n "${namespace}" --sort-by=.lastTimestamp \
       2>&1 | tail -n 256 | head -c 1048576 > "${evidence_dir}/failed-events.txt" || true
-    timeout 20s kubectl --request-timeout=5s logs -n "${namespace}" \
+    timeout --kill-after=1s 20s kubectl --request-timeout=5s logs -n "${namespace}" \
       -l 'app.kubernetes.io/name in (vibedb-shard,vibedb-gateway)' \
       --all-containers=true --tail=100 --limit-bytes=65536 --prefix=true \
       2>&1 | head -c 1048576 > "${evidence_dir}/failed-containers.txt" || true
+    # Status projections deliberately exclude pod specs, environment, mounted
+    # secrets, and termination messages. Keep both init and serving exits.
+    timeout --kill-after=1s 10s kubectl --request-timeout=5s get pods -n "${namespace}" \
+      -l 'app.kubernetes.io/name in (vibedb-shard,vibedb-gateway)' \
+      -o 'custom-columns=POD:.metadata.name,CONTAINER:.status.containerStatuses[*].name,RESTARTS:.status.containerStatuses[*].restartCount,LAST_REASON:.status.containerStatuses[*].lastState.terminated.reason,LAST_EXIT:.status.containerStatuses[*].lastState.terminated.exitCode,LAST_SIGNAL:.status.containerStatuses[*].lastState.terminated.signal,LAST_FINISHED:.status.containerStatuses[*].lastState.terminated.finishedAt,INIT:.status.initContainerStatuses[*].name,INIT_LAST_REASON:.status.initContainerStatuses[*].lastState.terminated.reason,INIT_LAST_EXIT:.status.initContainerStatuses[*].lastState.terminated.exitCode' \
+      2>&1 | head -c 1048576 > "${evidence_dir}/failed-terminations.txt" || true
+    # Nine fixed requests, each <=3 seconds (+1 second kill grace) and <=64 KiB
+    # plus its label.
+    # Missing previous instances are expected; one must not suppress later pods.
+    # The entire failure collector is bounded by 90 seconds and <5 MiB.
+    local role ordinal pod
+    {
+      for role in catalog ledger data; do
+        for ordinal in 0 1 2; do
+          pod="vibedb-${role}-${ordinal}"
+          printf '\n=== %s previous shard ===\n' "${pod}"
+          timeout --kill-after=1s 3s kubectl --request-timeout=2s logs -n "${namespace}" \
+            "${pod}" -c shard --previous --tail=100 --limit-bytes=65536 --prefix=true \
+            2>&1 | head -c 65536 || true
+        done
+      done
+    } > "${evidence_dir}/failed-previous-shards.txt"
+}
+
+cleanup() {
+  local exit_status=$?
+  if [[ "${exit_status}" -ne 0 && "${cluster_created}" == true ]]; then
+    collect_failure_evidence
   fi
   if [[ -n "${port_forward_pid}" ]]; then
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
