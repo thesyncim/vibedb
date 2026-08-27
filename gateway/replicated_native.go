@@ -800,7 +800,8 @@ func (e *ReplicatedRefusalError) Error() string {
 }
 
 func (e *ReplicatedRefusalError) Unwrap() error {
-	if e.Code == shardservice.ReplicatedRefusalDeterministic {
+	if e.Code == shardservice.ReplicatedRefusalDeterministic ||
+		e.Code == shardservice.ReplicatedRefusalRetryRetired {
 		return e.Outcome.Err()
 	}
 	if e.Code == shardservice.ReplicatedRefusalAdmissionBound {
@@ -1254,8 +1255,8 @@ func (executor *ReplicatedExecutor) propose(
 			continue
 		}
 		// Unavailable without a member state is a definite owner-probe failure
-		// only when no earlier attempt could have been admitted. Once an outcome
-		// is unknown, no later pre-admission response can resolve it.
+		// only when no earlier attempt could have been admitted. A later generic
+		// pre-admission refusal cannot resolve an earlier unknown outcome.
 		if validReplicatedUnavailableWithoutState(response) {
 			if lastUnknown != nil {
 				continue
@@ -1359,6 +1360,20 @@ func (executor *ReplicatedExecutor) propose(
 			}
 			continue
 		case shardservice.ReplicatedRefusal:
+			if response.Refusal == shardservice.ReplicatedRefusalRetryRetired {
+				// A durable session retirement floor resolves an earlier unknown
+				// attempt without claiming a new commit or returning old results.
+				// Other pre-admission refusals cannot make that guarantee.
+				if response.RequestDigest == requestDigest && response.State.Fence == state.Fence &&
+					response.Outcome == (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}) &&
+					len(response.Completion) == 0 && response.ReadApplied == 0 && len(response.Value) == 0 {
+					return ReplicatedResult{}, &ReplicatedRefusalError{
+						Code: response.Refusal, Outcome: response.Outcome,
+					}
+				}
+				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
 			if response.Refusal == shardservice.ReplicatedRefusalDeterministic {
 				if response.RequestDigest == requestDigest &&
 					validReplicatedAppliedRefusal(response) {

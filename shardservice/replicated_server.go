@@ -908,6 +908,16 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalAdmissionBound,
 			HasState: true, State: wireState,
 		}
+	case result.Outcome == (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}) &&
+		len(result.Completion) == 0 && errors.Is(err, replicatedstate.ErrRetryRetired):
+		// Admission observed the durable session retirement floor, so this
+		// exact request cannot execute again. No new Raft entry was applied:
+		// preserve that distinction instead of manufacturing an apply witness.
+		return &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalRetryRetired,
+			HasState: true, State: proposalState, Outcome: result.Outcome,
+			RequestDigest: replicatedRequestDigest(request.Command),
+		}
 	case result.Outcome.Code > raftserve.OutcomeCompletion &&
 		result.Outcome.Code < raftserve.OutcomeProposalRefused:
 		wireState = replicatedStateAtApplied(proposalState, result.Outcome.AppliedIndex)

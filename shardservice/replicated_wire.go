@@ -205,6 +205,9 @@ const (
 	ReplicatedRefusalRequestLedgerReadMalformed
 	ReplicatedRefusalReadIntentActive
 	ReplicatedRefusalExecutionPinReadMalformed
+	// ReplicatedRefusalRetryRetired is a durable session-window refusal before
+	// proposal admission. It binds the exact request but claims no new apply.
+	ReplicatedRefusalRetryRetired
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -1179,6 +1182,10 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 				response.State.Applied >= response.Outcome.AppliedIndex &&
 				response.Outcome.CompletionAppliedSequence == 0 &&
 				response.Outcome.CompletionBytes == 0
+		}
+		if response.Refusal == ReplicatedRefusalRetryRetired {
+			return response.HasState && response.RequestDigest != ([sha256.Size]byte{}) &&
+				response.Outcome == (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired})
 		}
 		return response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) &&

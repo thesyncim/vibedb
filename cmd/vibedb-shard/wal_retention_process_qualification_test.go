@@ -150,8 +150,9 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
 	retired := fixture.propose(t, leader, states[leader], firstCommand)
 	if retired.Kind != shardservice.ReplicatedRefusal ||
-		retired.Refusal != shardservice.ReplicatedRefusalDeterministic ||
-		retired.Outcome.Code != raftserve.OutcomeRetryRetired {
+		retired.Refusal != shardservice.ReplicatedRefusalRetryRetired ||
+		retired.Outcome != (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}) ||
+		retired.RequestDigest != sha256.Sum256(firstCommand) || retired.State.Fence != states[leader].Fence {
 		t.Fatalf("acknowledged command was not durably retired after crash loops: %+v", retired)
 	}
 
