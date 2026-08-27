@@ -75,6 +75,15 @@ func TestRequestLedgerCommandRoundTripBorrowed(t *testing.T) {
 	if err != nil || inner.Operation != requestledger.OperationCreate || inner.KeyDigest == (requestledger.Digest{}) {
 		t.Fatalf("open inner ledger command = %+v, %v", inner.Command, err)
 	}
+	identity, ok := view.RequestLedgerIdentity()
+	if !ok || identity.Operation != inner.Operation || identity.KeyDigest != inner.KeyDigest ||
+		identity.RequestDigest != inner.RequestDigest || identity.PlanRoot != inner.PlanRoot ||
+		identity.RangeIdentity != inner.ExpectedRangeIdentity {
+		t.Fatalf("cached ledger identity = %+v, valid=%t", identity, ok)
+	}
+	if _, ok := (CommandView{}).RequestLedgerIdentity(); ok {
+		t.Fatal("empty command advertised a ledger identity")
+	}
 	if got := testing.AllocsPerRun(1000, func() {
 		opened, openErr := OpenCommand(encoded)
 		if openErr != nil || opened.Kind() != CommandRequestLedger ||

@@ -150,19 +150,20 @@ type CommandView struct {
 	ExpectedDeadlineUnixNano int64
 	NextDeadlineUnixNano     int64
 
-	raw                []byte
-	transactionBytes   []byte
-	requestLedgerBytes []byte
-	routeGateBytes     []byte
-	executionPinBytes  []byte
-	splitCaptureBytes  []byte
-	retainedPrune      RetainedPruneProof
-	relationBytes      []byte
-	mutationCount      uint32
-	relationCount      uint16
-	inlineRelationID   RelationID
-	transactionRole    distributedtxn.ReplicatedRole
-	transactionOp      distributedtxn.ReplicatedOperation
+	raw                   []byte
+	transactionBytes      []byte
+	requestLedgerBytes    []byte
+	requestLedgerIdentity RequestLedgerIdentity
+	routeGateBytes        []byte
+	executionPinBytes     []byte
+	splitCaptureBytes     []byte
+	retainedPrune         RetainedPruneProof
+	relationBytes         []byte
+	mutationCount         uint32
+	relationCount         uint16
+	inlineRelationID      RelationID
+	transactionRole       distributedtxn.ReplicatedRole
+	transactionOp         distributedtxn.ReplicatedOperation
 }
 
 // Bytes returns the exact validated envelope. The result aliases the decoder
@@ -182,6 +183,18 @@ func (v CommandView) TransactionBytes() []byte {
 // The result aliases the command envelope. Non-ledger commands return nil.
 func (v CommandView) RequestLedgerBytes() []byte {
 	return v.requestLedgerBytes[:len(v.requestLedgerBytes):len(v.requestLedgerBytes)]
+}
+
+// RequestLedgerIdentity is the fixed settlement identity of a validated ledger
+// command. Keeping it at decode avoids rehashing up to 16 MiB of payload when
+// checking the fixed-size completion.
+type RequestLedgerIdentity struct {
+	Operation                                         requestledger.Operation
+	KeyDigest, RequestDigest, PlanRoot, RangeIdentity requestledger.Digest
+}
+
+func (v CommandView) RequestLedgerIdentity() (RequestLedgerIdentity, bool) {
+	return v.requestLedgerIdentity, v.kind == CommandRequestLedger
 }
 
 // OpenRequestLedgerInto reopens the already outer-validated request-ledger
@@ -1678,10 +1691,16 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if len(payload) == 0 {
 			return CommandView{}, semantic("request ledger body length")
 		}
-		if err := requestledger.ValidateCommand(payload); err != nil {
+		ledger, err := requestledger.OpenCommandInto(payload, nil)
+		if err != nil {
 			return CommandView{}, corrupt("request ledger command")
 		}
 		view.requestLedgerBytes = payload
+		view.requestLedgerIdentity = RequestLedgerIdentity{
+			Operation: ledger.Operation, KeyDigest: ledger.KeyDigest,
+			RequestDigest: ledger.RequestDigest, PlanRoot: ledger.PlanRoot,
+			RangeIdentity: ledger.ExpectedRangeIdentity,
+		}
 	case CommandRouteGate:
 		gate, gateErr := routegate.OpenCommand(payload)
 		if len(payload) != routegate.CommandBytes || gateErr != nil ||

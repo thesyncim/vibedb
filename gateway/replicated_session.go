@@ -1080,6 +1080,19 @@ func nativeCompletionMatches(
 			result.Role != role || result.Operation != operation {
 			return false
 		}
+	} else if command.Kind() == replication.CommandRequestLedger {
+		identity, ok := command.RequestLedgerIdentity()
+		result, err := replicatedstate.OpenRequestLedgerCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		if !ok || err != nil ||
+			completion.ResultFormat != replicatedstate.ResultFormatRequestLedger ||
+			completion.ResultLength != replicatedstate.RequestLedgerCompletionResultBytes ||
+			result.Operation != identity.Operation || result.KeyDigest != identity.KeyDigest ||
+			result.RequestDigest != identity.RequestDigest || result.PlanRoot != identity.PlanRoot ||
+			result.RangeIdentity != identity.RangeIdentity {
+			return false
+		}
 	} else if command.Kind() == replication.CommandExecutionPin {
 		if completion.ResultFormat != replicatedstate.ResultFormatExecutionPin ||
 			completion.ResultLength != executionpin.CompletionBytes ||
@@ -1110,7 +1123,7 @@ func nativeCompletionMatches(
 		if completion.AppliedSequence != completion.ClientEpoch {
 			return false
 		}
-	} else if command.Kind() == replication.CommandTransaction {
+	} else if command.Kind() == replication.CommandTransaction || command.Kind() == replication.CommandRequestLedger {
 		if completion.AppliedSequence == 0 {
 			return false
 		}
