@@ -33,12 +33,19 @@ func main() {
 	fs := flag.NewFlagSet("publishcheck", flag.ExitOnError)
 	evidence := fs.String("evidence", "", "absolute evidence directory")
 	writeReceipt := fs.Bool("write-receipt", false, "atomically create VALIDATED.tsv")
+	qualification := fs.Bool("qualification", false, "validate the bounded CI qualification profile instead of publication evidence")
 	fs.Parse(os.Args[1:])
 	if fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "publishcheck: unexpected positional arguments")
 		os.Exit(2)
 	}
-	result, err := validate(*evidence)
+	var result []byte
+	var err error
+	if *qualification {
+		result, err = validateQualification(*evidence)
+	} else {
+		result, err = validate(*evidence)
+	}
 	if err == nil && *writeReceipt {
 		err = writeValidated(*evidence, result)
 	}
@@ -73,12 +80,13 @@ func validate(directory string) ([]byte, error) {
 	artifacts := make([]string, 0, 96)
 	artifacts = append(artifacts, "metadata.tsv")
 	for _, item := range []struct {
-		name, durability, shape string
-		engines                 []string
+		name, durability, shape, exactIndexes string
+		engines                               []string
 	}{
-		{"mixed-ordinary-sync.tsv", "ordinary-sync", "inline", engines},
-		{"mixed-overflow-ordinary-sync.tsv", "ordinary-sync", "overflow-heavy", engines},
-		{"mixed-power-safe.tsv", "power-safe", "inline", []string{"sqlite", "vibedb"}},
+		{"mixed-ordinary-sync.tsv", "ordinary-sync", "inline", "0", engines},
+		{"mixed-indexed-ordinary-sync.tsv", "ordinary-sync", "inline", "3", []string{"sqlite", "vibedb"}},
+		{"mixed-overflow-ordinary-sync.tsv", "ordinary-sync", "overflow-heavy", "0", engines},
+		{"mixed-power-safe.tsv", "power-safe", "inline", "3", []string{"sqlite", "vibedb"}},
 	} {
 		name := item.name
 		path := filepath.Join(directory, name)
@@ -86,7 +94,7 @@ func validate(directory string) ([]byte, error) {
 		if readErr != nil {
 			return nil, fmt.Errorf("%s: %w", name, readErr)
 		}
-		if err = validateMixed(t, meta["revision"], item.durability, item.shape, item.engines); err != nil {
+		if err = validateMixed(t, meta["revision"], item.durability, item.shape, item.exactIndexes, item.engines); err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 		artifacts = append(artifacts, name)
@@ -120,6 +128,20 @@ func validate(directory string) ([]byte, error) {
 			}
 			artifacts = append(artifacts, name)
 		}
+	}
+	for _, engine := range []string{"sqlite", "vibedb"} {
+		name := "footprint-indexed-" + engine + ".tsv"
+		t, readErr := readTable(filepath.Join(directory, name))
+		if readErr != nil {
+			return nil, fmt.Errorf("%s: %w", name, readErr)
+		}
+		if err = validateHeaderRows(t, engine, []string{"exact-indexes", "disk-bytes", "allocated-bytes", "logical-bytes", "disk/logical", "allocated/logical", "maxrss"}); err == nil {
+			err = validateColumnContract(t, map[string]string{"git-commit": meta["revision"], "vcs-modified": "false", "durability": "ordinary-sync", "exact-indexes": "3"})
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		artifacts = append(artifacts, name)
 	}
 
 	for run := 1; run <= minimumRepetitions; run++ {
@@ -208,7 +230,7 @@ func exactPairs(t table, kind string) (map[string]string, error) {
 	return result, nil
 }
 
-func validateMixed(t table, revision, durability, shape string, expectedEngines []string) error {
+func validateMixed(t table, revision, durability, shape, exactIndexes string, expectedEngines []string) error {
 	meta, err := exactPairs(t, "meta")
 	if err != nil {
 		return err
@@ -216,7 +238,7 @@ func validateMixed(t table, revision, durability, shape string, expectedEngines 
 	if meta["git-commit"] != revision || meta["git-dirty"] != "false" || meta["publishable-suite"] != "true" {
 		return errors.New("dirty, mismatched, or diagnostic suite")
 	}
-	if meta["durability"] != durability || meta["checkpoint-mutations"] != "0" || meta["document-shape"] != shape || meta["exact-indexes"] != "3" || meta["allow-diagnostic"] != "false" {
+	if meta["durability"] != durability || meta["checkpoint-mutations"] != "0" || meta["document-shape"] != shape || meta["exact-indexes"] != exactIndexes || meta["allow-diagnostic"] != "false" {
 		return errors.New("suite does not match the publication durability/index/shape contract")
 	}
 	if n, _ := strconv.Atoi(meta["repetitions"]); n < minimumRepetitions {
@@ -436,6 +458,10 @@ func validateRF3(t table, revision, workload, clients string) error {
 }
 
 func validateChaos(t table, revision string) error {
+	return validateChaosAtLeast(t, revision, minimumRepetitions)
+}
+
+func validateChaosAtLeast(t table, revision string, minimum int) error {
 	if !slices.Equal(t.lines[0], []string{"schema", "vibedb.rf3.chaos-evidence", "2"}) {
 		return errors.New("wrong chaos schema")
 	}
@@ -473,8 +499,8 @@ func validateChaos(t table, revision string) error {
 			passed++
 		}
 	}
-	if passed < minimumRepetitions {
-		return errors.New("fewer than nine passing chaos runs")
+	if passed < minimum {
+		return fmt.Errorf("fewer than %d passing chaos runs", minimum)
 	}
 	return nil
 }

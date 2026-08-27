@@ -1,0 +1,42 @@
+name: competitive-evidence
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: competitive-evidence-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  clean-ubuntu-qualification:
+    name: clean Ubuntu competitive and RF3 evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            bench/competitive/go.sum
+      - name: Run bounded matched-durability and RF3 qualification
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/vibedb-competitive-evidence
+        run: timeout --signal=TERM --kill-after=30s 50m scripts/bench/run-ci-competitive-evidence.sh "${EVIDENCE_DIR}"
+      - name: Verify immutable receipt before upload
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/vibedb-competitive-evidence
+        run: |
+          test -s "${EVIDENCE_DIR}/VALIDATED.tsv"
+          grep -Fx $'schema\tvibedb.ci-validation\t1' "${EVIDENCE_DIR}/VALIDATED.tsv"
+          grep -Fx $'result\tpass' "${EVIDENCE_DIR}/VALIDATED.tsv"
+      - name: Upload validated raw evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitive-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/vibedb-competitive-evidence
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: false
+          retention-days: 30

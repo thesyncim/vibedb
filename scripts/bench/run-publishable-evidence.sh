@@ -58,9 +58,14 @@ common_suite=(
   -workload=ycsb-a -corpus=10000 -operations=20000 -warmup=2000
   -durability=ordinary-sync -checkpoint-mutations=0 -clients=1 -cardinality=low
 )
-go run ./cmd/mixedsuite "${common_suite[@]}" -document-shape=inline -exact-indexes=3 \
+go run ./cmd/mixedsuite "${common_suite[@]}" -document-shape=inline -exact-indexes=0 \
   -output="${evidence}/mixed-ordinary-sync.tsv"
-go run ./cmd/mixedsuite "${common_suite[@]}" -document-shape=overflow-heavy -exact-indexes=3 \
+go run ./cmd/mixedsuite -mixed-bin="${scratch}/mixed" -engines=vibedb,sqlite \
+  -repetitions=10 -conditioning=true -timeout=30m -workload=ycsb-a \
+  -corpus=10000 -operations=20000 -warmup=2000 -durability=ordinary-sync \
+  -checkpoint-mutations=0 -clients=1 -cardinality=low -document-shape=inline \
+  -exact-indexes=3 -output="${evidence}/mixed-indexed-ordinary-sync.tsv"
+go run ./cmd/mixedsuite "${common_suite[@]}" -document-shape=overflow-heavy -exact-indexes=0 \
   -output="${evidence}/mixed-overflow-ordinary-sync.tsv"
 go run ./cmd/mixedsuite -mixed-bin="${scratch}/mixed" -engines=vibedb,sqlite \
   -repetitions=10 -conditioning=true -timeout=30m -workload=ycsb-a \
@@ -71,7 +76,7 @@ go run ./cmd/mixedsuite -mixed-bin="${scratch}/mixed" -engines=vibedb,sqlite \
 engines=(badger bbolt pebble sqlite vibedb)
 for engine in "${engines[@]}"; do
   go run ./cmd/footprint -header -engine="${engine}" -corpus=100000 \
-    -durability=ordinary-sync -document-shape=overflow-heavy -exact-indexes=3 \
+    -durability=ordinary-sync -document-shape=overflow-heavy -exact-indexes=0 \
     -storage-profile=intrinsic > "${evidence}/footprint-${engine}.tsv"
   go run ./cmd/churndisk -engine="${engine}" -corpus=100000 -mutations=200000 \
     -replace-percent=80 -sample-mutations=5000 -checkpoint-mutations=64 \
@@ -85,6 +90,11 @@ for engine in "${engines[@]}"; do
     -document-shape=overflow-heavy -checkpoint-documents=4096 \
     -max-loader-bytes=8388608 -max-rss-bytes=0 -max-physical-write-bytes=0 \
     > "${evidence}/outofram-${engine}.tsv"
+done
+for engine in sqlite vibedb; do
+  go run ./cmd/footprint -header -engine="${engine}" -corpus=100000 \
+    -durability=ordinary-sync -document-shape=overflow-heavy -exact-indexes=3 \
+    -storage-profile=intrinsic > "${evidence}/footprint-indexed-${engine}.tsv"
 done
 
 cd "${repo}"

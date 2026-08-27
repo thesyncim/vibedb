@@ -210,8 +210,10 @@ Choose `OUT_OF_RAM_DOCUMENTS` so the exact overflow-heavy logical corpus is
 larger than physical RAM; the loader verifies that inequality and fails before
 publishing when it is false. The runner requires a clean tree and creates no
 result row itself. It records ten isolated embedded repetitions at the strongest
-common durability contract (`ordinary-sync`), plus a separate matched
-`power-safe` VibeDB/SQLite lane. It also records per-engine
+common durability contract (`ordinary-sync`) without pretending that the three
+plain key/value engines have native JSON indexes. Separate three-index
+`ordinary-sync` and `power-safe` VibeDB/SQLite lanes compare the two engines
+that can maintain the same exact physical indexes. It also records per-engine
 space/churn/above-RAM cuts, nine isolated RF3 latency/counter matrices, and nine
 external RF3 fault runs. The RF3 matrices cover read, write, and mixed workloads
 at 1, 8, and 32 clients. The fault artifact supplies the independently bounded
@@ -229,3 +231,21 @@ accepted raw artifact. A validation receipt proves evidence completeness; it is
 not a claim that VibeDB won a comparison.
 
 The current replacement documentation publishes no benchmark result.
+
+### Pull-request qualification
+
+The `competitive-evidence` workflow runs a smaller, claim-free cut on a clean
+Ubuntu runner. It records nine isolated matched unindexed `ordinary-sync`
+repetitions for all five embedded engines; separate nine-repetition, three-index
+`ordinary-sync` and `power-safe` VibeDB/SQLite cuts; unindexed all-engine and
+three-index pairwise physical/logical footprint rows; three RF3 read/write/mixed
+matrices; and three external RF3 fault runs. Dataset and operation counts are
+fixed and the job has a hard wall-clock timeout.
+
+`cmd/publishcheck -qualification` verifies the clean revision, exact workload
+shape, latency/counter/resource contracts, complete artifact inventory, and
+every file digest before creating `VALIDATED.tsv`. CI uploads only a bundle with
+that receipt. These runner-dependent rows are regression and harness evidence;
+they are not publication-grade results and must not be copied into `RESULTS.md`
+or used as a superiority claim. The dedicated-host runner above remains the
+publication boundary, including its above-RAM and nine-run fault requirements.
