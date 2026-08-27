@@ -1623,7 +1623,10 @@ func rf3TransportOptions(
 			// One maximum command rounds to a 32 MiB owned frame. Each
 			// follower can retain one without making a valid proposal fatal.
 			PerPeerFrames: 32, PerPeerBytes: 32 << 20,
-			GlobalFrames: 64, GlobalBytes: 64 << 20,
+			// Frame slots cover each distinct remote, including enrolled
+			// learners and multigroup rosters. The shared byte admission
+			// ceiling stays fixed; more peers do not multiply payload memory.
+			GlobalFrames: max(64, 32*len(peers)), GlobalBytes: 64 << 20,
 		},
 		Coalesce: rafttransport.CoalesceLimits{
 			MaxFrames: 8,

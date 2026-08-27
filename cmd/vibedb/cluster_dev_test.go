@@ -657,6 +657,8 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 		},
 	}
 	wal := minimumDevTestWALOptions()
+	bootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
+	bootstrap.TopologyRecoveryEpoch = group.TopologyRecoveryEpoch
 	var portable [3]sqldriver.ReplicatedSchemaCatalogImage
 	var local [3][32]byte
 	var machine [3][32]byte
@@ -681,7 +683,7 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 			Root: root, Table: devDataTable,
 			CreateTable: "CREATE TABLE documents (PRIMARY KEY (id))",
 			Identity:    identity, Key: key, WAL: wal,
-			Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+			Bootstrap: bootstrap,
 			Authority: authority, Apply: apply,
 		})
 		if errors.Is(err, storeio.ErrStrictAllocationUnsupported) ||
