@@ -1,6 +1,7 @@
 package clusterbackup
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
@@ -453,6 +455,56 @@ func (r *BackupRepository) OpenArtifact(digest [sha256.Size]byte, index int) (*P
 	if r.closed || r.failed || !ok || index < 0 || index >= len(record.certificate.Groups) {
 		return nil, ErrNotFound
 	}
+	file, err := openBackupRegular(r.root, artifactName(digest, index), os.O_RDONLY, 0)
+	if err != nil {
+		return nil, errors.Join(ErrRepository, err)
+	}
+	if _, err = verifyArtifact(file, record.certificate.Groups[index]); err != nil {
+		_ = file.Close()
+		return nil, errors.Join(ErrRepository, err)
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &PublishedArtifact{file: file, remaining: record.certificate.Groups[index].ArtifactBytes}, nil
+}
+
+// OpenBackupArtifact implements ArtifactSource without allowing a restore
+// caller to select a path or a "latest" file. Operation and complete portable
+// group identity must resolve to exactly one published certificate entry;
+// ambiguity fails closed.
+func (r *BackupRepository) OpenBackupArtifact(ctx context.Context, operation [sha256.Size]byte,
+	group raftmember.GroupKey,
+) (io.ReadCloser, error) {
+	if r == nil || ctx == nil || operation == ([sha256.Size]byte{}) || !validGroup(group) {
+		return nil, ErrRepository
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, cause
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed || r.failed {
+		return nil, ErrRepository
+	}
+	var digest [sha256.Size]byte
+	index, matches := 0, 0
+	for candidateDigest, record := range r.records {
+		if record.certificate.Operation != operation {
+			continue
+		}
+		for ordinal, cut := range record.certificate.Groups {
+			if cut.Group == group {
+				digest, index = candidateDigest, ordinal
+				matches++
+			}
+		}
+	}
+	if matches != 1 {
+		return nil, ErrNotFound
+	}
+	record := r.records[digest]
 	file, err := openBackupRegular(r.root, artifactName(digest, index), os.O_RDONLY, 0)
 	if err != nil {
 		return nil, errors.Join(ErrRepository, err)

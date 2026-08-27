@@ -54,7 +54,7 @@ func NewBackupOperation(id [sha256.Size]byte, cut clusterbackup.CatalogCut) (Rep
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
 	for index, group := range cut.Groups {
-		if index != 0 && bytes.Compare(group.GroupID[:], cut.Groups[index-1].GroupID[:]) <= 0 {
+		if !validBackupGroup(group) || index != 0 && compareBackupGroup(cut.Groups[index-1], group) >= 0 {
 			return ReplicatedOperationRecord{}, ErrBackupOperation
 		}
 	}
@@ -112,7 +112,7 @@ func (controller *BackupOperationController) PublishCertified(ctx context.Contex
 	if !controller.authorized() || !validBackupRecord(record, backupStageCollecting) ||
 		certificate.Digest == ([32]byte{}) || certificate.Operation != record.ID ||
 		certificate.CatalogGeneration != record.CatalogGeneration || certificateBytes == 0 ||
-		len(certificate.Groups) != int(record.Cursor[1]) {
+		len(certificate.Groups) != int(record.Cursor[1]) || !backupCertificateMatchesIntent(record, certificate) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
 	next := record
@@ -121,6 +121,7 @@ func (controller *BackupOperationController) PublishCertified(ctx context.Contex
 	next.Cursor[0] = backupStageCertified
 	next.Cursor[2] = uint64(len(certificate.Groups))
 	next.Cursor[3] = certificateBytes
+	putBackupCertificateDigest(&next.Cursor, certificate.Digest)
 	next.Proof = certificate.Digest
 	if err := controller.authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
 		return ReplicatedOperationRecord{}, err
@@ -128,10 +129,29 @@ func (controller *BackupOperationController) PublishCertified(ctx context.Contex
 	return next, nil
 }
 
+func backupCertificateMatchesIntent(record ReplicatedOperationRecord, certificate clusterbackup.Certificate) bool {
+	var intent backupOperationIntent
+	if vibejson.Unmarshal(record.Intent, &intent) != nil || len(intent.CatalogDigest) != sha256.Size ||
+		len(intent.InventoryDigest) != sha256.Size || intent.PolicyGeneration == 0 ||
+		intent.GroupCount != uint64(len(certificate.Groups)) ||
+		!bytes.Equal(intent.CatalogDigest, certificate.CatalogDigest[:]) ||
+		intent.PolicyGeneration != certificate.PolicyGeneration {
+		return false
+	}
+	groups := make([]raftmember.GroupKey, len(certificate.Groups))
+	for index := range certificate.Groups {
+		groups[index] = certificate.Groups[index].Group
+	}
+	digest := backupInventoryDigest(groups)
+	return bytes.Equal(intent.InventoryDigest, digest[:])
+}
+
 func (controller *BackupOperationController) PublishExported(ctx context.Context,
 	record ReplicatedOperationRecord, exportDigest [sha256.Size]byte,
 ) (ReplicatedOperationRecord, error) {
+	certificateDigest := backupCertificateDigest(record.Cursor)
 	if !controller.authorized() || !validBackupRecord(record, backupStageCertified) ||
+		certificateDigest == ([sha256.Size]byte{}) || record.Proof != certificateDigest ||
 		exportDigest == ([sha256.Size]byte{}) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
@@ -148,8 +168,10 @@ func (controller *BackupOperationController) PublishExported(ctx context.Context
 func (controller *BackupOperationController) PublishRestoreStaged(ctx context.Context,
 	record ReplicatedOperationRecord, permit clusterbackup.RestoreStagingPermit,
 ) (ReplicatedOperationRecord, error) {
+	certificateDigest := backupCertificateDigest(record.Cursor)
 	if !controller.authorized() || !validBackupRecord(record, backupStageExported) ||
-		permit.CertificateDigest == ([32]byte{}) || permit.Groups != uint32(record.Cursor[1]) {
+		certificateDigest == ([sha256.Size]byte{}) ||
+		permit.CertificateDigest != certificateDigest || permit.Groups != uint32(record.Cursor[1]) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
 	var proofInput [sha256.Size * 2]byte
@@ -182,4 +204,55 @@ func (controller *BackupOperationController) Complete(ctx context.Context, recor
 func validBackupRecord(record ReplicatedOperationRecord, stage uint64) bool {
 	return validReplicatedOperation(record) && record.Kind == ReplicatedOperationBackup &&
 		record.State < ReplicatedOperationComplete && record.Cursor[0] == stage && record.Cursor[1] != 0
+}
+
+func validBackupGroup(group raftmember.GroupKey) bool {
+	return group.ClusterID != ([16]byte{}) && group.ClusterIncarnation != ([16]byte{}) &&
+		group.TopologyRecoveryEpoch != 0 && group.ShardIncarnation != ([16]byte{}) &&
+		group.GroupID != ([16]byte{})
+}
+
+func compareBackupGroup(left, right raftmember.GroupKey) int {
+	var a, b [72]byte
+	offset := 0
+	for _, pair := range [][2][]byte{{left.ClusterID[:], right.ClusterID[:]},
+		{left.ClusterIncarnation[:], right.ClusterIncarnation[:]}} {
+		copy(a[offset:], pair[0])
+		copy(b[offset:], pair[1])
+		offset += len(pair[0])
+	}
+	binary.BigEndian.PutUint64(a[offset:offset+8], left.TopologyRecoveryEpoch)
+	binary.BigEndian.PutUint64(b[offset:offset+8], right.TopologyRecoveryEpoch)
+	offset += 8
+	copy(a[offset:offset+16], left.ShardIncarnation[:])
+	copy(b[offset:offset+16], right.ShardIncarnation[:])
+	offset += 16
+	copy(a[offset:], left.GroupID[:])
+	copy(b[offset:], right.GroupID[:])
+	return bytesCompare72(a, b)
+}
+
+func bytesCompare72(left, right [72]byte) int {
+	for index := range left {
+		if left[index] < right[index] {
+			return -1
+		}
+		if left[index] > right[index] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func putBackupCertificateDigest(cursor *[8]uint64, digest [sha256.Size]byte) {
+	for index := range 4 {
+		cursor[index+4] = binary.BigEndian.Uint64(digest[index*8 : index*8+8])
+	}
+}
+
+func backupCertificateDigest(cursor [8]uint64) (digest [sha256.Size]byte) {
+	for index := range 4 {
+		binary.BigEndian.PutUint64(digest[index*8:index*8+8], cursor[index+4])
+	}
+	return digest
 }

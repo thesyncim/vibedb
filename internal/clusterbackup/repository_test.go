@@ -91,6 +91,14 @@ func TestRepositoryPublishesReopensAndExportsExactAuthenticatedArtifacts(t *test
 			t.Fatalf("artifact %d bytes=%d read=%v close=%v", index, len(got), readErr, closeErr)
 		}
 	}
+	artifact, err := repository.OpenBackupArtifact(t.Context(), certificate.Operation, certificate.Groups[1].Group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(artifact)
+	if closeErr := artifact.Close(); readErr != nil || closeErr != nil || !bytes.Equal(got, payloads[1]) {
+		t.Fatalf("artifact source got=%d read=%v close=%v", len(got), readErr, closeErr)
+	}
 }
 
 func TestRepositoryRejectsWrongSizeHashAndTrailingBytesWithoutPublication(t *testing.T) {

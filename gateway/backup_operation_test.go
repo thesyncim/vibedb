@@ -114,6 +114,11 @@ func TestBackupOperationCatalogLifecycleResumesOutcomeUnknown(t *testing.T) {
 	if err != nil || exported.Cursor[0] != backupStageExported {
 		t.Fatalf("exported=%+v err=%v", exported, err)
 	}
+	wrongPermit := clusterbackup.RestoreStagingPermit{Restore: backupTest32(21),
+		CertificateDigest: backupTest32(99), Groups: 2}
+	if _, err = controller.PublishRestoreStaged(t.Context(), exported, wrongPermit); !errors.Is(err, ErrBackupOperation) {
+		t.Fatalf("wrong certificate admitted err=%v", err)
+	}
 	permit := clusterbackup.RestoreStagingPermit{Restore: backupTest32(21), CertificateDigest: certificate.Digest, Groups: 2}
 	staged, err := controller.PublishRestoreStaged(t.Context(), exported, permit)
 	if err != nil || staged.Cursor[0] != backupStageRestoreStaged {
@@ -122,6 +127,16 @@ func TestBackupOperationCatalogLifecycleResumesOutcomeUnknown(t *testing.T) {
 	complete, err := controller.Complete(t.Context(), staged)
 	if err != nil || complete.State != ReplicatedOperationComplete {
 		t.Fatalf("complete=%+v err=%v", complete, err)
+	}
+}
+
+func TestBackupOperationRejectsInventoryNotInPortableGroupOrder(t *testing.T) {
+	first, second := backupTestGroup(1), backupTestGroup(2)
+	first.ClusterID[0], second.ClusterID[0] = 2, 1
+	cut := clusterbackup.CatalogCut{Generation: 7, Digest: backupTest32(8), PolicyGeneration: 9,
+		Groups: []raftmember.GroupKey{first, second}}
+	if _, err := NewBackupOperation(backupTest32(10), cut); !errors.Is(err, ErrBackupOperation) {
+		t.Fatalf("noncanonical inventory err=%v", err)
 	}
 }
 

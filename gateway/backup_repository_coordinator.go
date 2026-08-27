@@ -1,0 +1,105 @@
+package gateway
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+
+	"github.com/thesyncim/vibedb/internal/clusterbackup"
+)
+
+// BackupRepositoryCoordinator composes the replicated catalog lifecycle with
+// the durable artifact repository. The repository certificate is committed
+// before the catalog advances; a replacement coordinator settles an
+// outcome-unknown CAS from the catalog record and never trusts local phase
+// memory.
+type BackupRepositoryCoordinator struct {
+	lifecycle  *BackupOperationController
+	repository *clusterbackup.BackupRepository
+}
+
+func NewBackupRepositoryCoordinator(lifecycle *BackupOperationController,
+	repository *clusterbackup.BackupRepository,
+) (*BackupRepositoryCoordinator, error) {
+	if lifecycle == nil || repository == nil || !lifecycle.authorized() {
+		return nil, ErrBackupOperation
+	}
+	return &BackupRepositoryCoordinator{lifecycle: lifecycle, repository: repository}, nil
+}
+
+// Publish commits the exact complete vector and advances it to exported. The
+// readers are consumed only while collecting. Replaying a repository-committed
+// call may pass nil readers because repository publication is idempotent.
+func (coordinator *BackupRepositoryCoordinator) Publish(ctx context.Context,
+	record ReplicatedOperationRecord, certificate clusterbackup.Certificate,
+	artifacts ...clusterbackup.ArtifactInput,
+) (ReplicatedOperationRecord, error) {
+	if coordinator == nil || ctx == nil || coordinator.lifecycle == nil ||
+		coordinator.repository == nil || !coordinator.lifecycle.authorized() {
+		return ReplicatedOperationRecord{}, ErrBackupOperation
+	}
+	if validBackupRecord(record, backupStageCollecting) {
+		if err := coordinator.repository.Publish(certificate, artifacts...); err != nil {
+			return ReplicatedOperationRecord{}, err
+		}
+		published, err := coordinator.repository.Certificate(certificate.Digest)
+		if err != nil || published.Digest != certificate.Digest ||
+			!backupCertificateMatchesIntent(record, published) {
+			return ReplicatedOperationRecord{}, errors.Join(ErrBackupOperation, err)
+		}
+		bytes := uint64(clusterbackup.HeaderBytes + len(published.Groups)*clusterbackup.GroupCutBytes + clusterbackup.TrailerBytes)
+		next, advanceErr := coordinator.lifecycle.PublishCertified(ctx, record, published, bytes)
+		if advanceErr != nil {
+			next, advanceErr = coordinator.settle(ctx, record.ID, backupStageCertified, published.Digest, advanceErr)
+		}
+		if advanceErr != nil {
+			return ReplicatedOperationRecord{}, advanceErr
+		}
+		record = next
+	}
+	if validBackupRecord(record, backupStageCertified) {
+		published, err := coordinator.repository.Certificate(backupCertificateDigest(record.Cursor))
+		if err != nil || published.Operation != record.ID || !backupCertificateMatchesIntent(record, published) {
+			return ReplicatedOperationRecord{}, errors.Join(ErrBackupOperation, err)
+		}
+		exportDigest := backupExportDigest(published)
+		next, advanceErr := coordinator.lifecycle.PublishExported(ctx, record, exportDigest)
+		if advanceErr != nil {
+			next, advanceErr = coordinator.settle(ctx, record.ID, backupStageExported, exportDigest, advanceErr)
+		}
+		if advanceErr != nil {
+			return ReplicatedOperationRecord{}, advanceErr
+		}
+		record = next
+	}
+	if !validBackupRecord(record, backupStageExported) {
+		return ReplicatedOperationRecord{}, ErrBackupOperation
+	}
+	return record, nil
+}
+
+func (coordinator *BackupRepositoryCoordinator) settle(ctx context.Context, id [sha256.Size]byte,
+	stage uint64, proof [sha256.Size]byte, cause error,
+) (ReplicatedOperationRecord, error) {
+	current, err := coordinator.lifecycle.authority.ReadOperation(ctx, id)
+	if err == nil && validBackupRecord(current, stage) && current.Proof == proof {
+		return current, nil
+	}
+	return ReplicatedOperationRecord{}, errors.Join(cause, err)
+}
+
+func backupExportDigest(certificate clusterbackup.Certificate) [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb certified backup export\x00"))
+	_, _ = hash.Write(certificate.Digest[:])
+	var scalar [8]byte
+	for _, cut := range certificate.Groups {
+		_, _ = hash.Write(cut.ArtifactHash[:])
+		binary.BigEndian.PutUint64(scalar[:], cut.ArtifactBytes)
+		_, _ = hash.Write(scalar[:])
+	}
+	var result [sha256.Size]byte
+	copy(result[:], hash.Sum(nil))
+	return result
+}
