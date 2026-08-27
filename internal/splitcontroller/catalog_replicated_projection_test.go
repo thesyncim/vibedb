@@ -124,10 +124,14 @@ func testReplicatedProjectionPlanWithFence(t testing.TB, routing, generation uin
 	if err != nil {
 		t.Fatal(err)
 	}
-	catalog, err := gateway.NewSnapshotWithReplicatedMetadata(distribution.ClusterConfig{
+	catalog, err := gateway.NewSnapshotWithReplicatedTableMetadata(distribution.ClusterConfig{
 		Distributions: []distribution.DistributionSpec{{Name: "orders", Arity: 1, MapperVersion: distribution.NativeMapperVersion}, {Name: ledger.Distribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion}},
 		Placements:    []distribution.TablePlacement{{Table: "docs", Distribution: "orders", Columns: []string{"/tenant"}}}, Manifests: []*distribution.Manifest{manifest, ledgerManifest}},
-		endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{source, ledger})
+		endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{source, ledger}, []gateway.ReplicatedTableProfile{{
+			Table: "docs", Relation: 1, PrimaryKey: "/tenant", SchemaGeneration: source.Command.SchemaGeneration,
+			LogicalSchemaDigest: source.LogicalSchemaDigest, MaxKeyBytes: uint16(schema.SQL.UserLimits.MaxKeyBytes),
+			MaxDocumentBytes: uint32(schema.SQL.UserLimits.MaxDocumentBytes),
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}

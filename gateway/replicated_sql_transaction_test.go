@@ -269,6 +269,10 @@ func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testi
 	if len(participants) != 2 {
 		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
 	}
+	if participants[0].Route.Command.RelationManifestDigest == participants[1].Route.Command.RelationManifestDigest ||
+		participants[0].Route.LogicalSchemaDigest != participants[1].Route.LogicalSchemaDigest {
+		t.Fatal("shared logical table did not preserve distinct shard machine fences")
+	}
 	seen := make(map[string][]byte, len(documents))
 	borrowed := make(map[string]bool, len(documents))
 	for participantIndex := range participants {
@@ -364,6 +368,7 @@ func replicatedSQLSplitTransactionFixture(
 	descriptor.RangeIdentity[0]++
 	left := descriptor
 	right := descriptor
+	right.Command.RelationManifestDigest[0]++
 	right.Replicas = append([]ReplicatedReplicaDescriptor(nil), descriptor.Replicas...)
 	right.Shard = "right"
 	right.AllocationGeneration = 2
@@ -719,12 +724,12 @@ func replicatedSQLTransactionFixture(
 	profiles := []ReplicatedTableProfile{
 		{
 			Table: "accounts", Relation: 1, PrimaryKey: "/id", SchemaGeneration: 8,
-			RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+			LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 			MaxDocumentBytes: 4 << 20,
 		},
 		{
 			Table: "messages", Relation: 2, PrimaryKey: "/id", SchemaGeneration: 8,
-			RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+			LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 			MaxDocumentBytes: 4 << 20,
 		},
 	}
@@ -748,7 +753,7 @@ func replicatedSQLTransactionFixture(
 	})
 	profiles = append(profiles, ReplicatedTableProfile{
 		Table: "logs", Relation: 1, PrimaryKey: "/id", SchemaGeneration: 8,
-		RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+		LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 		MaxDocumentBytes: 4 << 20,
 	})
 	endpoints["logs-a"], endpoints["logs-b"], endpoints["logs-c"] =
@@ -822,7 +827,7 @@ func replicatedSQLTransactionFixture(
 		descriptors = append(descriptors, indexDescriptor)
 		profiles = append(profiles, ReplicatedTableProfile{
 			Table: "messages_email", Relation: 1, PrimaryKey: "/email",
-			SchemaGeneration: 8, RelationManifestDigest: replication.Digest{9},
+			SchemaGeneration: 8, LogicalSchemaDigest: replication.Digest{10},
 			MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
 		})
 	}

@@ -41,11 +41,12 @@ type persistedPlanIntent struct {
 }
 
 type persistedPlanSourceAuthority struct {
-	Group        raftmember.GroupKey      `json:"group"`
-	Command      raftservice.CommandFence `json:"command"`
-	SQL          persistedSQLIdentity     `json:"sql"`
-	Placement    persistedPlacement       `json:"placement"`
-	LocalIndexes []store.IndexDefinition  `json:"local_indexes"`
+	LogicalSchemaDigest [32]byte                 `json:"logical_schema_digest"`
+	Group               raftmember.GroupKey      `json:"group"`
+	Command             raftservice.CommandFence `json:"command"`
+	SQL                 persistedSQLIdentity     `json:"sql"`
+	Placement           persistedPlacement       `json:"placement"`
+	LocalIndexes        []store.IndexDefinition  `json:"local_indexes"`
 }
 
 type persistedLimits sqldriver.ReplicatedShardStoreLimits
@@ -138,7 +139,7 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 		Targets:  make([]persistedChildTarget, 0, int(plan.childCount)-1),
 	}
 	if source := plan.sourceAuthority; source != nil {
-		intent.SourceAuthority = &persistedPlanSourceAuthority{Group: source.Group, Command: source.Command,
+		intent.SourceAuthority = &persistedPlanSourceAuthority{Group: source.Group, Command: source.Command, LogicalSchemaDigest: source.LogicalSchemaDigest,
 			SQL: persistSQLIdentity(source.Schema.SQL), Placement: persistedPlacement(source.Schema.Placement), LocalIndexes: cloneSplitLocalIndexes(source.Schema.LocalIndexes)}
 	}
 	for child := 0; child < int(plan.childCount); child++ {
@@ -257,7 +258,7 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 	}
 	var source []PlanSourceAuthority
 	if authority := intent.SourceAuthority; authority != nil {
-		source = []PlanSourceAuthority{{Group: authority.Group, Command: authority.Command, Schema: PlanSourceSchema{
+		source = []PlanSourceAuthority{{Group: authority.Group, Command: authority.Command, LogicalSchemaDigest: authority.LogicalSchemaDigest, Schema: PlanSourceSchema{
 			SQL: openPersistedSQLIdentity(authority.SQL), Placement: sqldriver.ReplicatedPlacementProfile(authority.Placement), LocalIndexes: cloneSplitLocalIndexes(authority.LocalIndexes)}}}
 	}
 	plan, err := RecoverPlan(catalog, intent.SourceGeneration, split, partitioner, targets, source...)

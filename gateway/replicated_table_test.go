@@ -101,7 +101,7 @@ func TestReplicatedTableProfileRoundTripAndAllocationFreeResolution(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(document, []byte(`"replicated_tables":[{"max_document_bytes":4194304,"max_key_bytes":256,"primary_key":"/id","relation":1`)) {
+	if !bytes.Contains(document, []byte(`"replicated_tables":[{"logical_schema_digest":"0a00000000000000000000000000000000000000000000000000000000000000","max_document_bytes":4194304,"max_key_bytes":256,"primary_key":"/id","relation":1`)) {
 		t.Fatalf("replicated_tables is absent or noncanonical: %s", document)
 	}
 	opened, err := OpenSnapshotDocument(document)
@@ -130,7 +130,13 @@ func TestReplicatedTableProfileRejectsIncompleteOrMismatchedCatalog(t *testing.T
 			p.SchemaGeneration++
 		}},
 		{"digest", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
-			p.RelationManifestDigest[0]++
+			p.LogicalSchemaDigest[0]++
+		}},
+		{"missing-shard-logical-schema", func(_ *distribution.ClusterConfig, d *ReplicatedShardDescriptor, _ *ReplicatedTableProfile) {
+			d.LogicalSchemaDigest = replication.Digest{}
+		}},
+		{"machine-digest-as-logical", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
+			p.LogicalSchemaDigest = replication.Digest(descriptor.Command.RelationManifestDigest)
 		}},
 		{"zero-key-limit", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
 			p.MaxKeyBytes = 0
@@ -279,9 +285,8 @@ func TestReplicatedTableProfileTransitionIsMonotonicAndCannotDisappear(t *testin
 	advancedDescriptor.Command.RelationManifestDigest[0]++
 	advancedProfile := profile
 	advancedProfile.SchemaGeneration = advancedDescriptor.Command.SchemaGeneration
-	advancedProfile.RelationManifestDigest = replication.Digest(
-		advancedDescriptor.Command.RelationManifestDigest,
-	)
+	advancedDescriptor.LogicalSchemaDigest[0]++
+	advancedProfile.LogicalSchemaDigest = advancedDescriptor.LogicalSchemaDigest
 	// Relation slots are bundle-local and limits are schema-bound, so an
 	// authenticated schema generation may remap the table and revise its bounds.
 	advancedProfile.Relation = 2
@@ -375,6 +380,7 @@ func testReplicatedTableInput(
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 1,
 		RangeIdentity: replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
 		ForwardingRuleDigest: replication.Digest{0x73},
+		LogicalSchemaDigest:  replication.Digest{10},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
 			OwnershipEpoch: 7, SchemaGeneration: 8,
@@ -388,7 +394,7 @@ func testReplicatedTableInput(
 	}
 	profile := ReplicatedTableProfile{
 		Table: "messages", Relation: 1, PrimaryKey: "/id", SchemaGeneration: 8,
-		RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+		LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 		MaxDocumentBytes: 4 << 20,
 	}
 	return config, endpoints, descriptor, profile

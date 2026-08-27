@@ -577,15 +577,19 @@ func (snapshot *Snapshot) resolveReplicatedSQLGlobalIndex(
 	if !ok || profile.Relation == 0 {
 		return ReplicatedRoute{}, ReplicatedTableProfile{}, ErrReplicatedSQLWriteUnavailable
 	}
+	manifest, ok := snapshot.Manifest(index.distribution)
+	if !ok || manifest.Version() != index.routingVersion {
+		return ReplicatedRoute{}, ReplicatedTableProfile{}, ErrReplicatedSQLWriteUnavailable
+	}
 	var replicas [ServingReplicaCount]ReplicatedEndpoint
 	route, ok := snapshot.ResolveReplicatedRoute(
 		index.distribution, index.target.Shard, replicas[:0],
 	)
 	if !ok || route.AllocationGeneration != uint64(index.target.AllocationGeneration) ||
 		route.Command.OwnershipEpoch != uint64(index.target.OwnershipEpoch) ||
-		route.Command.RoutingVersion != uint64(index.routingVersion) ||
+		route.Command.RoutingVersion > uint64(index.routingVersion) ||
 		route.Command.SchemaGeneration != profile.SchemaGeneration ||
-		replication.Digest(route.Command.RelationManifestDigest) != profile.RelationManifestDigest {
+		route.LogicalSchemaDigest != profile.LogicalSchemaDigest {
 		return ReplicatedRoute{}, ReplicatedTableProfile{}, ErrReplicatedSQLWriteUnavailable
 	}
 	return route, profile, nil

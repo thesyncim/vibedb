@@ -157,6 +157,10 @@ func bindProjectionSourceAndChildSchemas(t testing.TB, source *gateway.Replicate
 	if err != nil {
 		t.Fatal(err)
 	}
+	source.LogicalSchemaDigest, err = sqldriver.ReplicatedRelationManifestDigest(schema.SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := range target.Replicas {
 		replica := &target.Replicas[i]
 		local := sqldriver.ShardStoreIdentity{Distribution: distribution.DistributionName(replica.WAL.Distribution), Shard: distribution.ShardID(replica.WAL.Shard),

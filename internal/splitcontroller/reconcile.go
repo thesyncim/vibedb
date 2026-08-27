@@ -24,6 +24,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store"
 	"go.etcd.io/raft/v3"
@@ -138,9 +139,10 @@ type Plan struct {
 // catalog CAS generation. Schema retains the original immutable validation
 // profile; later applied ownership fences do not rewrite that profile.
 type PlanSourceAuthority struct {
-	Group   raftmember.GroupKey      `json:"group"`
-	Command raftservice.CommandFence `json:"command"`
-	Schema  PlanSourceSchema         `json:"schema"`
+	Group               raftmember.GroupKey      `json:"group"`
+	Command             raftservice.CommandFence `json:"command"`
+	LogicalSchemaDigest replication.Digest       `json:"logical_schema_digest"`
+	Schema              PlanSourceSchema         `json:"schema"`
 }
 
 type PlanSourceSchema struct {
@@ -181,7 +183,7 @@ func NewPlan(
 		if len(sourceSchema) != 1 {
 			return nil, ErrInvalidPlan
 		}
-		authority = &PlanSourceAuthority{Group: sourceRoute.Group, Command: sourceRoute.Command, Schema: clonePlanSourceSchema(sourceSchema[0])}
+		authority = &PlanSourceAuthority{Group: sourceRoute.Group, Command: sourceRoute.Command, LogicalSchemaDigest: sourceRoute.LogicalSchemaDigest, Schema: clonePlanSourceSchema(sourceSchema[0])}
 		for index := range targets {
 			target := &targets[index]
 			if target.Authority.ActivePolicyGeneration != sourceRoute.Command.ActivePolicyGeneration ||
@@ -252,7 +254,7 @@ func RecoverPlan(
 		var endpoints [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 		retained, retainedOK := split.ChildIdentity(int(split.RetainedChild))
 		if route, replicated := current.ResolveReplicatedRoute(split.Source.Distribution, split.Source.Shard, endpoints[:0]); replicated {
-			if !retainedOK || authority == nil || route.Group != authority.Group || route.Command.ReplicaSetVersion != authority.Command.ReplicaSetVersion ||
+			if !retainedOK || authority == nil || route.Group != authority.Group || route.LogicalSchemaDigest != authority.LogicalSchemaDigest || route.Command.ReplicaSetVersion != authority.Command.ReplicaSetVersion ||
 				route.Command.ActivePolicyGeneration != authority.Command.ActivePolicyGeneration || route.Command.ProtectionEpoch != authority.Command.ProtectionEpoch ||
 				route.Command.SchemaGeneration != authority.Command.SchemaGeneration || route.Command.RelationManifestDigest != authority.Command.RelationManifestDigest ||
 				route.Command.OwnershipEpoch != uint64(retained.OwnershipEpoch) ||

@@ -64,6 +64,7 @@ type ReplicatedRoute struct {
 	Group                raftmember.GroupKey
 	AllocationGeneration uint64
 	Command              raftservice.CommandFence
+	LogicalSchemaDigest  replication.Digest
 	RangeIdentity        replication.Digest
 	LineageDigest        replication.Digest
 	ForwardingRuleDigest replication.Digest

@@ -40,6 +40,10 @@ type ReplicatedShardDescriptor struct {
 	Group                raftmember.GroupKey
 	AllocationGeneration distribution.ShardAllocationGeneration
 	Command              raftservice.CommandFence
+	// LogicalSchemaDigest binds the portable relation schema independently of
+	// Command.RelationManifestDigest, which includes this shard's validation
+	// profile. Authenticated producers derive both from the exact SQL schema.
+	LogicalSchemaDigest replication.Digest
 	// RangeIdentity is the immutable logical range named by durable requests.
 	// LineageDigest and ForwardingRuleDigest authenticate how that logical
 	// range may be resolved after split or movement without allowing a retry to
@@ -63,6 +67,7 @@ type replicatedCatalogShard struct {
 	group             raftmember.GroupKey
 	allocation        distribution.ShardAllocationGeneration
 	command           raftservice.CommandFence
+	logicalSchema     replication.Digest
 	rangeIdentity     replication.Digest
 	lineageDigest     replication.Digest
 	forwardingDigest  replication.Digest
@@ -278,6 +283,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		shards[ordinal] = replicatedCatalogShard{
 			group: entry.descriptor.Group, allocation: entry.descriptor.AllocationGeneration,
 			command:          entry.descriptor.Command,
+			logicalSchema:    entry.descriptor.LogicalSchemaDigest,
 			rangeIdentity:    entry.descriptor.RangeIdentity,
 			lineageDigest:    entry.descriptor.LineageDigest,
 			forwardingDigest: entry.descriptor.ForwardingRuleDigest,
@@ -376,7 +382,7 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	return ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
-		Command: entry.command, RangeIdentity: entry.rangeIdentity,
+		Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
 		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 		Replicas: dst,
 	}, true
@@ -412,7 +418,7 @@ func (snapshot *Snapshot) ReplicatedRouteAt(index int, dst []ReplicatedEndpoint)
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
 	dst = dst[:len(dst):len(dst)]
 	return ReplicatedRoute{Distribution: manifest.Distribution(), Shard: metadata.ID, Group: entry.group,
-		AllocationGeneration: uint64(entry.allocation), Command: entry.command,
+		AllocationGeneration: uint64(entry.allocation), Command: entry.command, LogicalSchemaDigest: entry.logicalSchema,
 		RangeIdentity: entry.rangeIdentity, LineageDigest: entry.lineageDigest,
 		ForwardingRuleDigest: entry.forwardingDigest, Replicas: dst}, true
 }
@@ -444,7 +450,7 @@ func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
 	result := ReplicatedMembershipRoute{Serving: ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
-		Command: entry.command, RangeIdentity: entry.rangeIdentity,
+		Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
 		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 		Replicas: dst,
 	}}
@@ -483,7 +489,7 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 		descriptor := ReplicatedShardDescriptor{
 			Distribution: manifest.Distribution(), Shard: metadata.ID,
 			Group: entry.group, AllocationGeneration: entry.allocation,
-			Command: entry.command, RangeIdentity: entry.rangeIdentity,
+			Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
 			LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 			Replicas:    make([]ReplicatedReplicaDescriptor, entry.replicaCount),
 			SplitOrigin: cloneReplicatedSplitOrigin(entry.splitOrigin),
@@ -595,6 +601,10 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 				oldManifest.Distribution(), oldMetadata.ID,
 			)}
 		}
+		if old.command.SchemaGeneration == candidate.command.SchemaGeneration && old.logicalSchema != candidate.logicalSchema ||
+			old.command.SchemaGeneration != candidate.command.SchemaGeneration && old.logicalSchema != (replication.Digest{}) && old.logicalSchema == candidate.logicalSchema {
+			return &CatalogError{Reason: "replicated shard changed or reused its logical schema without an exact schema transition"}
+		}
 		// Enrolling a non-serving target does not authorize a serving-roster
 		// change. Do not let a catalog reload imply that membership completed:
 		// an installed ReplicaSetVersion transition must certify that cut.
@@ -650,7 +660,7 @@ func validateCertifiedReplicaReplacement(
 		oldManifest := current.config.Manifests[old.manifest]
 		oldMetadata, _ := oldManifest.ShardMetadataAt(int(old.shard))
 		candidate, found := next.replicatedShardAt(oldManifest.Distribution(), oldMetadata.ID)
-		if !found || candidate.group != old.group || candidate.allocation != old.allocation || !sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) {
+		if !found || candidate.group != old.group || candidate.allocation != old.allocation || candidate.logicalSchema != old.logicalSchema || !sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) {
 			return &CatalogError{Reason: "replica replacement changed allocation identity"}
 		}
 		if old.group != grant.Group {
@@ -778,6 +788,7 @@ type persistedReplicatedShard struct {
 	OwnershipEpoch         uint64                          `json:"ownership_epoch"`
 	SchemaGeneration       uint64                          `json:"schema_generation"`
 	RelationManifestDigest string                          `json:"relation_manifest_digest"`
+	LogicalSchemaDigest    string                          `json:"logical_schema_digest"`
 	RangeIdentity          string                          `json:"range_identity"`
 	LineageDigest          string                          `json:"lineage_digest"`
 	ForwardingRuleDigest   string                          `json:"forwarding_rule_digest"`
@@ -822,6 +833,7 @@ func persistedReplicatedDescriptors(
 			RelationManifestDigest: hex.EncodeToString(
 				descriptor.Command.RelationManifestDigest[:],
 			),
+			LogicalSchemaDigest:  hex.EncodeToString(descriptor.LogicalSchemaDigest[:]),
 			RangeIdentity:        hex.EncodeToString(descriptor.RangeIdentity[:]),
 			LineageDigest:        hex.EncodeToString(descriptor.LineageDigest[:]),
 			ForwardingRuleDigest: hex.EncodeToString(descriptor.ForwardingRuleDigest[:]),
@@ -879,13 +891,14 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				Reason: "replicated shard relation manifest digest: " + err.Error(),
 			}
 		}
-		var rangeIdentity, lineageDigest, forwardingRuleDigest [32]byte
+		var rangeIdentity, lineageDigest, forwardingRuleDigest, logicalSchemaDigest [32]byte
 		for _, item := range []struct {
 			name string
 			raw  string
 			dst  *[32]byte
 		}{
 			{"range identity", persisted.RangeIdentity, &rangeIdentity},
+			{"logical schema digest", persisted.LogicalSchemaDigest, &logicalSchemaDigest},
 			{"lineage digest", persisted.LineageDigest, &lineageDigest},
 			{"forwarding rule digest", persisted.ForwardingRuleDigest, &forwardingRuleDigest},
 		} {
@@ -898,6 +911,7 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 			Shard:        distribution.ShardID(persisted.Shard), Group: group,
 			AllocationGeneration: distribution.ShardAllocationGeneration(persisted.AllocationGeneration),
 			RangeIdentity:        replication.Digest(rangeIdentity),
+			LogicalSchemaDigest:  replication.Digest(logicalSchemaDigest),
 			LineageDigest:        replication.Digest(lineageDigest),
 			ForwardingRuleDigest: replication.Digest(forwardingRuleDigest),
 			Command: raftservice.CommandFence{

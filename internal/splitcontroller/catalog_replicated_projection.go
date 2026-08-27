@@ -44,7 +44,9 @@ func (p *Plan) projectReplicatedSplitDescriptors(current *gateway.Snapshot, cuto
 		return nil, nil
 	}
 	source := descriptors[sourceIndex]
-	if len(source.Replicas) != gateway.ServingReplicaCount || len(source.RequestLedgerRanges) != 0 {
+	if p.sourceAuthority == nil || source.Group != p.sourceAuthority.Group || source.Command != p.sourceAuthority.Command ||
+		source.LogicalSchemaDigest != p.sourceAuthority.LogicalSchemaDigest ||
+		p.validateReplicatedSourceSchema() != nil || len(source.Replicas) != gateway.ServingReplicaCount || len(source.RequestLedgerRanges) != 0 {
 		return nil, ErrTopologyConflict
 	}
 	intent, err := AppendPlanIntent(nil, current, p)
@@ -71,6 +73,7 @@ func (p *Plan) projectReplicatedSplitDescriptors(current *gateway.Snapshot, cuto
 			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch, ShardIncarnation: target.WAL.ShardIncarnation, GroupID: target.WAL.GroupID}
 		descriptor := gateway.ReplicatedShardDescriptor{Distribution: p.source.Distribution, Shard: p.children[child].Shard,
 			Group: group, AllocationGeneration: p.children[child].AllocationGeneration,
+			LogicalSchemaDigest: p.sourceAuthority.LogicalSchemaDigest,
 			Command: raftservice.CommandFence{ReplicaSetVersion: target.ReplicaSetVersion,
 				ActivePolicyGeneration: target.Authority.ActivePolicyGeneration, ProtectionEpoch: target.Authority.ProtectionEpoch,
 				OwnershipEpoch: target.Authority.OwnershipEpoch, SchemaGeneration: target.Authority.SchemaGeneration,

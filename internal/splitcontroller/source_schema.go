@@ -41,7 +41,7 @@ func sameSplitLocalIndexes(left, right []store.IndexDefinition) bool {
 }
 
 func samePlanSourceAuthority(left, right PlanSourceAuthority) bool {
-	return left.Group == right.Group && left.Command == right.Command && left.Schema.SQL.Equal(right.Schema.SQL) &&
+	return left.Group == right.Group && left.Command == right.Command && left.LogicalSchemaDigest == right.LogicalSchemaDigest && left.Schema.SQL.Equal(right.Schema.SQL) &&
 		left.Schema.Placement == right.Schema.Placement && sameSplitLocalIndexes(left.Schema.LocalIndexes, right.Schema.LocalIndexes)
 }
 
@@ -62,6 +62,10 @@ func (p *Plan) validateReplicatedSourceSchema() error {
 	}
 	digest, err := sqldriver.ReplicatedSchemaManifest(schema.SQL, schema.Placement, schema.LocalIndexes)
 	if err != nil || digest != authority.Command.RelationManifestDigest {
+		return errors.Join(ErrInvalidPlan, err)
+	}
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(schema.SQL)
+	if err != nil || logical != authority.LogicalSchemaDigest {
 		return errors.Join(ErrInvalidPlan, err)
 	}
 	return nil
