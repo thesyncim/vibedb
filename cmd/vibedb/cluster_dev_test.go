@@ -444,6 +444,29 @@ func TestDevRequestLedgerPrepareProfileMatchesCatalogHomeAndKeepsCatalogDisabled
 	}
 }
 
+func minimumDevTestWALOptions() raftstore.Options {
+	return raftstore.Options{
+		MaxFileBytes: int64(raftstore.HeaderBytes+raftstore.MaxSnapshotBaseRecordBytes+
+			raftstore.MinimumReadyRecordBytes) + raftstore.MinimumReadyLiveBytes,
+		MaxRecordBytes: raftstore.MinimumReadyRecordBytes,
+		MaxRecords:     2,
+		MaxEntries:     raftstore.MaxReadyEntries,
+		MaxLiveBytes:   raftstore.MinimumReadyLiveBytes,
+	}
+}
+
+func TestDevRestartFixtureUsesMinimumProductionWALGeometry(t *testing.T) {
+	wal := minimumDevTestWALOptions()
+	wantFileBytes := int64(raftstore.HeaderBytes+raftstore.MaxSnapshotBaseRecordBytes+
+		raftstore.MinimumReadyRecordBytes) + raftstore.MinimumReadyLiveBytes
+	if wal.MaxFileBytes != wantFileBytes || wal.MaxFileBytes >= raftstore.DefaultMaxFileBytes ||
+		wal.MaxRecordBytes != raftstore.MinimumReadyRecordBytes || wal.MaxRecords != 2 ||
+		wal.MaxEntries != raftstore.MaxReadyEntries ||
+		wal.MaxLiveBytes != raftstore.MinimumReadyLiveBytes {
+		t.Fatalf("minimum production WAL profile=%+v want file bytes=%d", wal, wantFileBytes)
+	}
+}
+
 func prepareDevTestReplica(
 	t *testing.T,
 	member devClusterMember,
@@ -491,10 +514,7 @@ func prepareDevTestReplica(
 		Root: filepath.Dir(member.ServeManifest), Table: table,
 		CreateTable: "CREATE TABLE " + table + " (PRIMARY KEY (id))",
 		Identity:    identity, Key: key,
-		WAL: raftstore.Options{
-			MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-			MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
-		},
+		WAL:       minimumDevTestWALOptions(),
 		Bootstrap: bootstrap,
 		Authority: sqldriver.ReplicatedAuthorityProfile{
 			ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1,
@@ -549,10 +569,7 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
 	}
-	wal := raftstore.Options{
-		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
-	}
+	wal := minimumDevTestWALOptions()
 	var portable [3]sqldriver.ReplicatedSchemaCatalogImage
 	var local [3][32]byte
 	var profiles [3]gateway.ReplicatedTableProfile
