@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -34,6 +35,7 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 
 	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
 	for sequence := uint64(2); sequence <= 3; sequence++ {
+		beforeApplied := fixture.apply.Applied()
 		key, document := generationDriverMutation(t, sequence)
 		command := testApplyCommand(
 			fixture.base, epoch, sequence, key, document,
@@ -42,8 +44,21 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		drainRuntime(t, fixture.runtime, nil)
+		lookup, lookupErr := fixture.apply.LookupCompletion(command)
+		if lookupErr != nil {
+			t.Fatal(lookupErr)
+		}
+		completion, completionErr := replication.OpenCompletion(lookup.Bytes)
+		if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
+			completion.AppliedSequence != beforeApplied+1 || fixture.apply.Applied() != beforeApplied+1 {
+			t.Fatalf("sequence %d did not durably apply: %+v err=%v applied=%d", sequence, completion, completionErr, fixture.apply.Applied())
+		}
+		if sequence == 3 && fixture.apply.CheckpointAppliedIndex() != beforeApplied {
+			t.Fatalf("test requires a journal-durable suffix above the previous generation: checkpoint=%d previous=%d applied=%d",
+				fixture.apply.CheckpointAppliedIndex(), beforeApplied, fixture.apply.Applied())
+		}
 		info, err := awaitWALGeneration(t, fixture.runtime, fixture.wal, sequence-1)
-		if err != nil || info.Generation != sequence-1 {
+		if err != nil || info.Generation != sequence-1 || info.BaseIndex != beforeApplied+1 {
 			t.Fatalf("generation after sequence %d = %+v, %v; driver=%v", sequence, info, err, driverErr)
 		}
 	}

@@ -106,7 +106,7 @@ func (runtime *Runtime) tickWALGeneration() {
 }
 
 func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) error {
-	checkpoint, err := runtime.WALRetentionInput()
+	_, err := runtime.WALRetentionInput()
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,10 @@ func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) e
 	}
 	// A generation which cannot advance the retained base has no deletion
 	// benefit. This also prevents idle runtimes from manufacturing generations.
-	if base.GetMetadata() == nil || checkpoint <= base.GetMetadata().GetIndex() {
+	// A journal-durable apply can advance beyond the last folded certificate.
+	// CaptureWALBase seals that exact settled apply before creating a candidate;
+	// requiring the old certificate to advance first would strand compaction.
+	if base.GetMetadata() == nil || runtime.apply.Applied() <= base.GetMetadata().GetIndex() {
 		return nil
 	}
 	preparation, err := runtime.apply.CaptureWALBase(sqldriver.WALBaseCaptureOptions{
@@ -132,6 +135,14 @@ func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) e
 	if input.Snapshot.GetMetadata() == nil ||
 		input.Snapshot.GetMetadata().GetIndex() <= base.GetMetadata().GetIndex() {
 		return nil
+	}
+	checkpoint := input.Snapshot.GetMetadata().GetIndex()
+	sealed, err := runtime.WALRetentionInput()
+	if err != nil {
+		return err
+	}
+	if sealed != checkpoint {
+		return sqldriver.ErrWALBasePreparation
 	}
 	builder, err := PrepareWALGeneration(runtime.wal, runtime.apply, preparation, driver.key)
 	if err != nil {
