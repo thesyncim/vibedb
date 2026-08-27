@@ -30,7 +30,7 @@ type restoreGroupOutput struct {
 func restoreGroup(arguments []string) error {
 	flags := flag.NewFlagSet("restore-group", flag.ContinueOnError)
 	root := flags.String("root", "", "absolute private destination restore root")
-	templatePath := flags.String("template", "", "canonical target prepare-*.vibejson schema template")
+	templatePath := flags.String("template", "", "canonical ordered target restore-schema.vibejson")
 	operationPath := flags.String("operation", "", "authenticated binary restore operation")
 	artifactPath := flags.String("artifact", "", "certified source snapshot artifact")
 	ordinal := flags.Uint("group-ordinal", 0, "source and target group ordinal")

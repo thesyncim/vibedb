@@ -9,9 +9,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/clusterrestore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -69,10 +72,44 @@ func TestRestoreRF3BootstrapIsDeterministicAndFresh(t *testing.T) {
 	}
 }
 
-func validRestoreTestTemplate() bootstrapPrepare {
-	return bootstrapPrepare{
-		Distribution: "data", Shard: "data-0", AllocationGeneration: 1,
-		Table: "items", CreateTable: "CREATE TABLE items (id TEXT PRIMARY KEY)",
+func TestRestoreSchemaRequiresExactOrderedBundleManifest(t *testing.T) {
+	template := validRestoreTestTemplate()
+	template.DDL = append(template.DDL,
+		"CREATE INDEX by_email ON items (email)",
+		"CREATE TABLE email_claims (PRIMARY KEY (key))",
+	)
+	template.GlobalIndexes = []restoreGlobalIndexTemplate{{
+		Relation: 2, Table: "email_claims", IndexID: 41, Incarnation: 7,
+		LocatorCount: 1, Unique: true, KeyEncoding: uint8(sqldriver.ReplicatedRelationKeyCanonicalTuple),
+		KeyArity: 1, TupleVersion: uint32(distribution.CurrentTupleVersion),
+		MapperVersion: uint32(distribution.NativeMapperVersion), BucketBits: distribution.DefaultVirtualBucketBits,
+	}}
+	factory := restoreReplicaFactory{template: template}
+	manifest := replicatedstate.SnapshotArtifactManifest{
+		Bundle: true, UserCollection: []byte("items"), RelationManifestDigest: [32]byte{1},
+		Relations: []replicatedstate.SnapshotArtifactRelation{
+			{Relation: replication.RelationID(1), Kind: replicatedstate.RelationJSON, Collection: []byte("items")},
+			{Relation: replication.RelationID(2), Kind: replicatedstate.RelationGlobalIndex, Collection: []byte("email_claims")},
+		},
+	}
+	if !validRestoreTemplate(template) || !factory.manifestMatchesTemplate(manifest) {
+		t.Fatal("exact bundle schema rejected")
+	}
+	manifest.Relations[1].Collection = []byte("other")
+	if factory.manifestMatchesTemplate(manifest) {
+		t.Fatal("reordered or renamed relation accepted")
+	}
+	relations := factory.globalRelations()
+	if len(relations) != 1 || relations[0].Relation != 2 || relations[0].IndexID != 41 ||
+		relations[0].Table != "email_claims" || relations[0].TupleVersion != distribution.CurrentTupleVersion {
+		t.Fatalf("relations=%+v", relations)
+	}
+}
+
+func validRestoreTestTemplate() restoreSchemaTemplate {
+	return restoreSchemaTemplate{
+		Format: 1, Distribution: "data", Shard: "data-0", AllocationGeneration: 1,
+		BaseTable: "items", DDL: []string{"CREATE TABLE items (PRIMARY KEY (id))"},
 		Apply: bootstrapApply{MaxSessions: 1, RetryWindow: 1, MaxCollections: 1,
 			MaxDocuments: 1, MaxBytes: 1024, ShardKey: "id"},
 	}

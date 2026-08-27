@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/clusterrestore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/restoreservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -39,6 +40,31 @@ type RestoreGroupConfig struct {
 
 type RestoreGroupResult struct {
 	Witness clusterrestore.RootWitness
+}
+
+type restoreSchemaTemplate struct {
+	Format               uint16                       `json:"format"`
+	Distribution         string                       `json:"distribution"`
+	Shard                string                       `json:"shard"`
+	AllocationGeneration uint64                       `json:"allocation_generation"`
+	BaseTable            string                       `json:"base_table"`
+	DDL                  []string                     `json:"ddl"`
+	GlobalIndexes        []restoreGlobalIndexTemplate `json:"global_indexes"`
+	Apply                bootstrapApply               `json:"apply"`
+}
+
+type restoreGlobalIndexTemplate struct {
+	Relation      uint16 `json:"relation"`
+	Table         string `json:"table"`
+	IndexID       uint64 `json:"index_id"`
+	Incarnation   uint64 `json:"incarnation"`
+	LocatorCount  uint8  `json:"locator_count"`
+	Unique        bool   `json:"unique"`
+	KeyEncoding   uint8  `json:"key_encoding"`
+	KeyArity      uint8  `json:"key_arity"`
+	TupleVersion  uint32 `json:"tuple_version"`
+	MapperVersion uint32 `json:"mapper_version"`
+	BucketBits    uint8  `json:"bucket_bits"`
 }
 
 // RestoredReplicaState is the durable non-serving handoff consumed by the
@@ -110,15 +136,15 @@ func OpenRestoredReplicaState(root string) (RestoredReplicaState, error) {
 
 // RestoreGroup imports one certified artifact into three fresh non-serving SQL
 // roots. Template is the explicit canonical target-schema projection; its
-// digest must be Operation.TargetCatalogDigest. The current Kubernetes prepare
-// grammar is singleton-only, so bundle artifacts fail closed.
+// digest must be Operation.TargetCatalogDigest. Ordered DDL and relation
+// descriptors are explicit; no schema or index definition is inferred.
 func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupResult, error) {
 	if ctx == nil || config.Artifact == nil || !validBootstrapStateDirectory(config.Root) ||
 		len(config.Template) == 0 || len(config.Template) > RestoreTemplateMaxBytes ||
 		sha256.Sum256(config.Template) != config.Operation.TargetCatalogDigest {
 		return RestoreGroupResult{}, ErrBootstrap
 	}
-	var template bootstrapPrepare
+	var template restoreSchemaTemplate
 	if err := vibejson.Unmarshal(config.Template, &template); err != nil {
 		return RestoreGroupResult{}, errors.Join(ErrBootstrap, err)
 	}
@@ -144,11 +170,68 @@ func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupR
 	return RestoreGroupResult{Witness: witness}, nil
 }
 
-func validRestoreTemplate(t bootstrapPrepare) bool {
-	return t.Distribution != "" && t.Shard != "" && t.AllocationGeneration != 0 &&
-		t.Table != "" && t.CreateTable != "" && t.Apply.MaxSessions != 0 &&
-		t.Apply.RetryWindow != 0 && t.Apply.MaxCollections != 0 &&
-		t.Apply.MaxDocuments != 0 && t.Apply.MaxBytes != 0 && t.Apply.ShardKey != ""
+func validRestoreTemplate(t restoreSchemaTemplate) bool {
+	if t.Format != 1 || t.Distribution == "" || t.Shard == "" || t.AllocationGeneration == 0 ||
+		t.BaseTable == "" || len(t.DDL) == 0 || t.Apply.MaxSessions == 0 ||
+		t.Apply.RetryWindow == 0 || t.Apply.MaxCollections == 0 ||
+		t.Apply.MaxDocuments == 0 || t.Apply.MaxBytes == 0 || t.Apply.ShardKey == "" {
+		return false
+	}
+	for index, ddl := range t.DDL {
+		if ddl == "" || index > int(^uint16(0)) {
+			return false
+		}
+	}
+	for index, relation := range t.GlobalIndexes {
+		if relation.Relation != uint16(index+2) || relation.Table == "" || relation.IndexID == 0 ||
+			relation.Incarnation == 0 || relation.LocatorCount == 0 || relation.KeyEncoding == 0 ||
+			relation.KeyArity == 0 || relation.TupleVersion == 0 || relation.MapperVersion == 0 || relation.BucketBits == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *restoreReplicaFactory) manifestMatchesTemplate(manifest replicatedstate.SnapshotArtifactManifest) bool {
+	bundle := len(f.template.GlobalIndexes) != 0
+	if manifest.Bundle != bundle {
+		return false
+	}
+	if !bundle {
+		return len(manifest.Relations) == 0 && manifest.RelationManifestDigest == ([sha256.Size]byte{})
+	}
+	if len(manifest.Relations) != len(f.template.GlobalIndexes)+1 ||
+		manifest.RelationManifestDigest == ([sha256.Size]byte{}) {
+		return false
+	}
+	for index, relation := range manifest.Relations {
+		if relation.Relation != replication.RelationID(index+1) {
+			return false
+		}
+		if index == 0 {
+			if relation.Kind != replicatedstate.RelationJSON || string(relation.Collection) != f.template.BaseTable {
+				return false
+			}
+		} else if relation.Kind != replicatedstate.RelationGlobalIndex ||
+			string(relation.Collection) != f.template.GlobalIndexes[index-1].Table {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *restoreReplicaFactory) globalRelations() []sqldriver.ReplicatedGlobalIndexRelation {
+	result := make([]sqldriver.ReplicatedGlobalIndexRelation, len(f.template.GlobalIndexes))
+	for index, relation := range f.template.GlobalIndexes {
+		result[index] = sqldriver.ReplicatedGlobalIndexRelation{
+			Relation: relation.Relation, Table: relation.Table, IndexID: relation.IndexID,
+			Incarnation: relation.Incarnation, LocatorCount: relation.LocatorCount, Unique: relation.Unique,
+			KeyEncoding: sqldriver.ReplicatedRelationKeyEncoding(relation.KeyEncoding), KeyArity: relation.KeyArity,
+			TupleVersion:  distribution.TupleVersion(relation.TupleVersion),
+			MapperVersion: distribution.MapperVersion(relation.MapperVersion), BucketBits: relation.BucketBits,
+		}
+	}
+	return result
 }
 
 type restoreReplicaAllocation struct {
@@ -181,7 +264,7 @@ type restoreReplicaTarget struct {
 
 type restoreReplicaFactory struct {
 	root           string
-	template       bootstrapPrepare
+	template       restoreSchemaTemplate
 	templateDigest [sha256.Size]byte
 }
 
@@ -192,10 +275,10 @@ func (f *restoreReplicaFactory) OpenReplica(
 	if cause := context.Cause(ctx); cause != nil {
 		return restoreservice.ReplicaRoot{}, cause
 	}
-	if f == nil || int(group) >= len(operation.Targets) || replica >= 3 || manifest.Bundle ||
-		len(manifest.Relations) != 0 || string(manifest.UserCollection) != f.template.Table ||
+	if f == nil || int(group) >= len(operation.Targets) || replica >= 3 ||
+		string(manifest.UserCollection) != f.template.BaseTable || !f.manifestMatchesTemplate(manifest) ||
 		operation.TargetCatalogDigest != f.templateDigest ||
-		operation.Certificate.Groups[group].RelationManifestDigest != ([sha256.Size]byte{}) {
+		operation.Certificate.Groups[group].RelationManifestDigest != manifest.RelationManifestDigest {
 		return restoreservice.ReplicaRoot{}, ErrBootstrap
 	}
 	directory := filepath.Join(f.root, "roots", fmt.Sprintf("group-%08d", group), "replica-"+strconv.Itoa(int(replica+1)))
@@ -218,6 +301,10 @@ func (f *restoreReplicaFactory) OpenReplica(
 	allocation, database, identity, err := f.openOrCreateRoot(path, allocationPath, operation, group, replica, binding)
 	if err != nil {
 		return restoreservice.ReplicaRoot{}, err
+	}
+	if manifest.Bundle && identity.RelationManifestDigest != manifest.RelationManifestDigest {
+		_ = database.Close()
+		return restoreservice.ReplicaRoot{}, ErrBootstrap
 	}
 	receipt, committed, err := readRestoreReceipt(receiptPath, operation, group, replica)
 	if err != nil {
@@ -299,7 +386,7 @@ func (f *restoreReplicaFactory) openOrCreateRoot(
 			return allocation, nil, sqldriver.ReplicatedShardStoreIdentity{}, ErrBootstrap
 		}
 		if database, identity, settleErr := sqldriver.OpenReplicatedShardStoreForSettlement(
-			path, binding, logID, f.template.Table,
+			path, binding, logID, f.template.BaseTable,
 		); settleErr == nil {
 			return allocation, database, identity, nil
 		}
@@ -313,7 +400,7 @@ func (f *restoreReplicaFactory) openOrCreateRoot(
 		if err != nil {
 			return allocation, nil, sqldriver.ReplicatedShardStoreIdentity{}, err
 		}
-		if err = executeRestoreDDL(database, f.template.CreateTable); err != nil {
+		if err = executeRestoreDDLs(database, f.template.DDL); err != nil {
 			_ = database.Close()
 			return allocation, nil, sqldriver.ReplicatedShardStoreIdentity{}, err
 		}
@@ -332,9 +419,12 @@ func (f *restoreReplicaFactory) openOrCreateRoot(
 			return allocation, nil, sqldriver.ReplicatedShardStoreIdentity{}, err
 		}
 	}
-	identity, err := database.BindReplicatedShardStoreStorageIdentity(
-		binding, f.template.Table, allocation.UserStorage,
-	)
+	var identity sqldriver.ReplicatedShardStoreIdentity
+	if len(f.template.GlobalIndexes) == 0 {
+		identity, err = database.BindReplicatedShardStoreStorageIdentity(binding, f.template.BaseTable, allocation.UserStorage)
+	} else {
+		identity, err = database.BindReplicatedShardStoreBundle(binding, f.template.BaseTable, f.globalRelations())
+	}
 	if err != nil {
 		_ = database.Close()
 		return allocation, nil, identity, err
@@ -342,19 +432,24 @@ func (f *restoreReplicaFactory) openOrCreateRoot(
 	return allocation, database, identity, nil
 }
 
-func executeRestoreDDL(database *sqldriver.Database, ddl string) error {
+func executeRestoreDDLs(database *sqldriver.Database, ddls []string) error {
 	session, err := database.NewSession(context.Background())
 	if err != nil {
 		return err
 	}
-	statement, err := session.Prepare(context.Background(), ddl)
-	if err == nil {
-		_, err = statement.Exec(context.Background(), nil)
+	for _, ddl := range ddls {
+		statement, prepareErr := session.Prepare(context.Background(), ddl)
+		if prepareErr == nil {
+			_, prepareErr = statement.Exec(context.Background(), nil)
+		}
+		if statement != nil {
+			prepareErr = errors.Join(prepareErr, statement.Close())
+		}
+		if prepareErr != nil {
+			return errors.Join(prepareErr, session.Close())
+		}
 	}
-	if statement != nil {
-		err = errors.Join(err, statement.Close())
-	}
-	return errors.Join(err, session.Close())
+	return session.Close()
 }
 
 func restoreApplyOptions(in bootstrapApply) (sqldriver.ReplicatedApplyOptions, error) {
