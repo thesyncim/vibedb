@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 )
 
 func TestOnlineCompactionManifestAndChainedExtentSurviveReopen(t *testing.T) {
@@ -53,6 +54,50 @@ func TestOnlineCompactionManifestAndChainedExtentSurviveReopen(t *testing.T) {
 	if err != nil || reopenedManifest.StagingChainTail != linked.StagingChainTail ||
 		reopenedManifest.TargetFileEnd != linked.TargetFileEnd {
 		t.Fatalf("reopened manifest=%+v err=%v", reopenedManifest, err)
+	}
+}
+
+func TestCompactOnlineRebuildsExactIndexesAndResidentEpoch(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "online-compact-indexed-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testBatchOptions(16)
+	options.Indexes = []store.IndexDefinition{{Name: "country", Paths: []string{"/country"}}}
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, country := range map[string]string{"a": "pt", "b": "us", "c": "pt"} {
+		if _, err := collection.Put([]byte(key), []byte(`{"country":"`+country+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	needle := primaryExactTestNeedle(t, `"pt"`)
+	if got := primaryExactTestKeys(t, collection, "country", needle); len(got) != 2 {
+		t.Fatalf("before keys=%v", got)
+	}
+	oldEpoch := collection.primaryEpoch
+	if _, err := collection.CompactOnline(); err != nil {
+		t.Fatal(err)
+	}
+	if collection.primaryEpoch == oldEpoch {
+		t.Fatal("resident exact epoch was not atomically replaced")
+	}
+	if got := primaryExactTestKeys(t, collection, "country", needle); len(got) != 2 {
+		t.Fatalf("after keys=%v", got)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := primaryExactTestKeys(t, reopened, "country", needle); len(got) != 2 {
+		t.Fatalf("reopened keys=%v", got)
 	}
 }
 

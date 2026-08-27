@@ -106,7 +106,12 @@ func (c *Collection) primaryExactActive() bool {
 func (c *Collection) derivePrimaryLive(
 	state *fileStoreState,
 ) (map[uint32]*[storeio.TermPostingTileChunks]uint64, error) {
-	router := c.primaryRouter.Load()
+	return c.derivePrimaryLiveFromRouter(c.primaryRouter.Load(), state)
+}
+
+func (c *Collection) derivePrimaryLiveFromRouter(
+	router *storeio.ResidentPrimaryRouter, state *fileStoreState,
+) (map[uint32]*[storeio.TermPostingTileChunks]uint64, error) {
 	if router == nil {
 		return nil, storeio.ErrPrimaryExactIndexCorrupt
 	}
@@ -240,26 +245,41 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	if state.root.ExactIndexRoot == (storeio.PageRef{}) {
 		return nil
 	}
+	epoch, err := c.buildPrimaryExactEpoch(state, c.primaryRouter.Load())
+	if err != nil {
+		return err
+	}
+	c.primaryEpoch = epoch
+	// Retire/pool lists are bounded by fold cadence against the reclaim
+	// floor; pre-sizing them keeps the publish-gate append allocation-free.
+	c.primaryEpochRetired = make([]retiredPrimaryExactEpoch, 0, 8)
+	c.primaryEpochPool = make([]*primaryExactEpoch, 0, 8)
+	return nil
+}
+
+func (c *Collection) buildPrimaryExactEpoch(
+	state *fileStoreState, router *storeio.ResidentPrimaryRouter,
+) (*primaryExactEpoch, error) {
 	bounds := storeio.PrimaryExactIndexBounds{
 		StoreID: state.root.StoreID, Generation: state.root.Generation,
 		FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 		MaxPageSize:       state.root.MaxPageSize, IndexCount: state.root.IndexCount,
 	}
-	live, err := c.derivePrimaryLive(state)
+	live, err := c.derivePrimaryLiveFromRouter(router, state)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rootLease, err := c.cache.Acquire(state.root.ExactIndexRoot)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	root, err := storeio.OpenPrimaryExactRootPage(
 		rootLease.Page(), state.root.ExactIndexRoot, bounds,
 	)
 	rootLease.Release()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	epoch := newPrimaryExactEpoch(root.Len())
 	epoch.live = newPrimaryLiveTable(live)
@@ -274,7 +294,7 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	for indexID := 0; indexID < root.Len(); indexID++ {
 		rootEntry, ok := root.Entry(uint32(indexID))
 		if !ok {
-			return storeio.ErrPrimaryExactIndexCorrupt
+			return nil, storeio.ErrPrimaryExactIndexCorrupt
 		}
 		if rootEntry.LeafCount == 0 {
 			continue
@@ -284,10 +304,10 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 			&epoch.exact[indexID].catalog,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if uint32(len(entries)) != rootEntry.LeafCount {
-			return storeio.ErrPrimaryExactIndexCorrupt
+			return nil, storeio.ErrPrimaryExactIndexCorrupt
 		}
 		resident := &epoch.exact[indexID]
 		resident.leaves = make([]primaryExactLeaf, 0, len(entries))
@@ -296,24 +316,19 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 				entries[at], bounds, liveLookup,
 			)
 			if leafErr != nil {
-				return leafErr
+				return nil, leafErr
 			}
 			if n := len(resident.leaves); n != 0 {
 				previous := &resident.leaves[n-1]
 				cmp := bytes.Compare(previous.firstKey, leaf.firstKey)
 				if cmp > 0 || cmp == 0 && previous.firstTile >= leaf.firstTile {
-					return storeio.ErrPrimaryExactIndexCorrupt
+					return nil, storeio.ErrPrimaryExactIndexCorrupt
 				}
 			}
 			resident.leaves = append(resident.leaves, leaf)
 		}
 	}
-	c.primaryEpoch = epoch
-	// Retire/pool lists are bounded by fold cadence against the reclaim
-	// floor; pre-sizing them keeps the publish-gate append allocation-free.
-	c.primaryEpochRetired = make([]retiredPrimaryExactEpoch, 0, 8)
-	c.primaryEpochPool = make([]*primaryExactEpoch, 0, 8)
-	return nil
+	return epoch, nil
 }
 
 // collectPrimaryExactCatalog walks one physical index's catalog (depth ≤ 2)

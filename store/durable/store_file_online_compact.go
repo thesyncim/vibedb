@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -16,8 +17,10 @@ type OnlineCompactionReport struct {
 
 type onlineCompactionBuild struct {
 	primary   storeio.PageRef
+	exact     storeio.PageRef
 	catalog   storeio.StagedPageCatalog
 	router    *storeio.ResidentPrimaryRouter
+	epoch     *primaryExactEpoch
 	documents uint64
 }
 
@@ -243,16 +246,35 @@ func (c *Collection) growOnlineMigrationStaging(
 
 // CompactOnline rewrites the live primary graph into bounded same-file staging
 // extents while reads continue. Publications are observed from before the
-// snapshot cut; this first shipped coordinator fails with typed starvation if
-// a concurrent mutation invalidates the full graph and can be retried without
-// risking the serving root.
+// snapshot cut. A bounded retry loop converges after ordinary foreground bursts
+// while preserving typed starvation/backpressure under a continuously dirty
+// collection.
 func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
+	var total OnlineCompactionReport
+	for attempt := uint64(1); attempt <= 4; attempt++ {
+		report, err := c.compactOnlineAttempt()
+		if total.SourceFileEnd == 0 {
+			total.SourceFileEnd = report.SourceFileEnd
+		}
+		total.Attempts = attempt
+		if err == nil {
+			report.Attempts = attempt
+			if total.SourceFileEnd != 0 {
+				report.SourceFileEnd = total.SourceFileEnd
+			}
+			return report, nil
+		}
+		if !errors.Is(err, storeio.ErrGenerationMigrationStarved) {
+			return report, err
+		}
+	}
+	return total, storeio.ErrGenerationMigrationStarved
+}
+
+func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 	var report OnlineCompactionReport
 	if c == nil {
 		return report, ErrClosed
-	}
-	if len(c.options.indexes) != 0 {
-		return report, storeio.ErrInvalidWrite
 	}
 	c.writer.Lock()
 	if c.onlineMigrationDirty != nil {
@@ -336,6 +358,7 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	target := current.root
 	target.Generation = generation
 	target.PrimaryRoot = build.primary
+	target.ExactIndexRoot = build.exact
 	if build.catalog.Head != (storeio.PageRef{}) {
 		target.PageCatalogHead = build.catalog.Head
 		target.PageCatalogDigest = build.catalog.Digest
@@ -353,12 +376,16 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	ready.CapturedSequence = current.root.Generation
 	ready.AppliedSequence = ready.CapturedSequence
 	ready.TargetPrimaryRoot = build.primary
+	ready.TargetExactIndexRoot = build.exact
 	ready.TargetCatalogHead = build.catalog.Head
 	if err := manifestStore.Advance(ready); err != nil {
 		return report, err
 	}
 
 	nextState := &fileStoreState{root: target, fileEnd: current.fileEnd, freeHead: current.freeHead}
+	if build.epoch != nil {
+		c.primaryEpochRetired = slices.Grow(c.primaryEpochRetired, 1)
+	}
 	c.snapshotGate.Lock()
 	c.beginReaderFence()
 	if err := storeio.PublishStagedStateConditional(tx, current.root, target, c.inlineFree, descriptor); err != nil {
@@ -369,6 +396,13 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	abort = false
 	build.router.AdvanceGeneration(generation)
 	c.primaryRouter.Store(build.router)
+	if build.epoch != nil {
+		old := c.primaryEpoch
+		c.primaryEpoch = build.epoch
+		if old != nil {
+			c.primaryEpochRetired = append(c.primaryEpochRetired, retiredPrimaryExactEpoch{epoch: old, gen: generation})
+		}
+	}
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
 	c.endReaderFence()
@@ -422,10 +456,31 @@ func (c *Collection) buildOnlineCompactionGeneration(
 	if err != nil {
 		return result, err
 	}
+	readRun := func(ref storeio.PageRef, dst []byte) error {
+		_, err := c.file.ReadAt(dst, int64(ref.Offset))
+		return err
+	}
+	var exactBuilder *storeio.GenerationMigrationExactRunBuilder
+	var exactRuns *storeio.GenerationMigrationExactRunSet
+	live := make(map[uint32]*[storeio.TermPostingTileChunks]uint64)
+	if len(c.options.indexes) != 0 {
+		exactRuns, err = storeio.NewGenerationMigrationExactRunSet(sink, readRun, uint32(c.options.MaxPageSize))
+		if err != nil {
+			return result, err
+		}
+		exactBuilder, err = storeio.NewStreamingGenerationMigrationExactRunBuilder(
+			sink, uint32(c.options.MaxPageSize), 4096, 1<<20, exactRuns.Add,
+		)
+		if err != nil {
+			return result, err
+		}
+	}
 	type row struct{ keyAt, keyEnd, valueAt, valueEnd int }
 	rows := make([]row, 0, min(256, c.options.MaxBatchDocuments))
 	arena := make([]byte, 0, min(4<<20, c.options.MaxDocumentBytes+c.options.MaxKeyBytes))
 	records := make([]storeio.CommonPrimaryLeafRecord, cap(rows))
+	placements := make([]storeio.PrimaryGraphPlacement, cap(rows))
+	exactRecords := make([]storeio.PrimaryGraphRecord, cap(rows))
 	flush := func() error {
 		if len(rows) == 0 {
 			return nil
@@ -445,8 +500,31 @@ func (c *Collection) buildOnlineCompactionGeneration(
 				records[index].Value.Overflow = head
 			}
 		}
-		if err := builder.StageWindow(records, nil); err != nil {
+		var windowPlacements []storeio.PrimaryGraphPlacement
+		if exactBuilder != nil {
+			windowPlacements = placements[:len(rows)]
+		}
+		if err := builder.StageWindow(records, windowPlacements); err != nil {
 			return err
+		}
+		if exactBuilder != nil {
+			windowExact := exactRecords[:len(rows)]
+			for index, source := range rows {
+				windowExact[index] = storeio.BorrowPrimaryGraphRecord(
+					arena[source.keyAt:source.keyEnd], arena[source.valueAt:source.valueEnd],
+				)
+				placement := windowPlacements[index]
+				tile := uint32(placement.Bucket)<<2 | uint32(placement.Slot>>6)
+				mask := live[tile]
+				if mask == nil {
+					mask = new([storeio.TermPostingTileChunks]uint64)
+					live[tile] = mask
+				}
+				mask[0] |= uint64(1) << uint(placement.Slot&63)
+			}
+			if err := stagePrimaryExactRunWindow(exactBuilder, windowExact, windowPlacements, c.options.indexes); err != nil {
+				return err
+			}
 		}
 		result.documents += uint64(len(rows))
 		rows, arena = rows[:0], arena[:0]
@@ -479,6 +557,40 @@ func (c *Collection) buildOnlineCompactionGeneration(
 	if err != nil {
 		return result, err
 	}
+	if exactBuilder != nil {
+		if _, err := exactBuilder.Finish(); err != nil {
+			return result, err
+		}
+		merged, err := exactRuns.Finish()
+		if err != nil {
+			return result, err
+		}
+		if merged.Pages == 0 {
+			rootPage, err := sink.AllocatePage(storeio.PagePrimaryExactRoot, uint32(c.options.PageSize), 0)
+			if err != nil {
+				return result, err
+			}
+			if _, err := storeio.EncodePrimaryExactRootPage(
+				rootPage.Bytes(), sink.StoreIdentity(), sink.BuildGeneration(),
+				rootPage.Ref().LogicalID, make([]storeio.PrimaryExactRootEntry, len(c.options.indexes)),
+			); err != nil {
+				return result, err
+			}
+			if err := rootPage.Stage(); err != nil {
+				return result, err
+			}
+			result.exact = rootPage.Ref()
+		} else {
+			result.exact, err = buildPrimaryExactIndexesFromMergedRun(
+				sink, readRun, merged, uint32(len(c.options.indexes)),
+				uint32(c.options.PageSize), uint32(c.options.MaxPageSize),
+				func(tile uint32) *[storeio.TermPostingTileChunks]uint64 { return live[tile] },
+			)
+			if err != nil {
+				return result, err
+			}
+		}
+	}
 	if c.options.pageCatalog != nil && c.options.pageCatalog.CanonicalSize() != 0 {
 		result.catalog, err = storeio.StageCanonicalPageCatalog(sink, c.options.pageCatalog, uint32(c.options.PageSize))
 		if err != nil {
@@ -493,5 +605,15 @@ func (c *Collection) buildOnlineCompactionGeneration(
 		StoreID: c.storeID, SelectedRootGeneration: state.root.Generation,
 		FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 	})
+	if err != nil {
+		return result, err
+	}
+	if result.exact != (storeio.PageRef{}) {
+		target := &fileStoreState{root: state.root, fileEnd: state.fileEnd, freeHead: state.freeHead}
+		target.root.Generation++
+		target.root.PrimaryRoot = result.primary
+		target.root.ExactIndexRoot = result.exact
+		result.epoch, err = c.buildPrimaryExactEpoch(target, result.router)
+	}
 	return result, err
 }
