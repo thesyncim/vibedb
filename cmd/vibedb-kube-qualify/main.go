@@ -87,12 +87,13 @@ type queryRequest struct {
 }
 
 type qualificationEvidence struct {
-	Format        uint16 `json:"format"`
-	Samples       int    `json:"samples"`
-	P50Micros     int64  `json:"p50_micros"`
-	P99Micros     int64  `json:"p99_micros"`
-	MaximumMicros int64  `json:"maximum_micros"`
-	Recovered     bool   `json:"recovered"`
+	Format         uint16 `json:"format"`
+	Samples        int    `json:"samples"`
+	TerminalMicros int64  `json:"terminal_micros"`
+	P50Micros      int64  `json:"p50_micros"`
+	P99Micros      int64  `json:"p99_micros"`
+	MaximumMicros  int64  `json:"maximum_micros"`
+	Recovered      bool   `json:"recovered"`
 }
 
 type processEvidence struct {
@@ -349,9 +350,13 @@ func runClient(mode string, options clientOptions) error {
 	if err != nil {
 		return err
 	}
-	response, _, err := wire.roundTrip(request)
+	response, terminalLatency, err := wire.roundTrip(request)
 	if err != nil || !committedResponse(response) {
 		return errors.Join(errQualification, err)
+	}
+	if terminalLatency > options.maximumLatency {
+		return fmt.Errorf("%w: terminal=%s/%s", errQualification,
+			terminalLatency, options.maximumLatency)
 	}
 	latencies := make([]time.Duration, options.samples)
 	for index := range latencies {
@@ -363,9 +368,10 @@ func runClient(mode string, options clientOptions) error {
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	evidence := qualificationEvidence{Format: 1, Samples: len(latencies),
-		P50Micros:     latencies[(len(latencies)-1)/2].Microseconds(),
-		P99Micros:     latencies[((len(latencies)-1)*99)/100].Microseconds(),
-		MaximumMicros: latencies[len(latencies)-1].Microseconds(), Recovered: mode == "verify"}
+		TerminalMicros: terminalLatency.Microseconds(),
+		P50Micros:      latencies[(len(latencies)-1)/2].Microseconds(),
+		P99Micros:      latencies[((len(latencies)-1)*99)/100].Microseconds(),
+		MaximumMicros:  latencies[len(latencies)-1].Microseconds(), Recovered: mode == "verify"}
 	if latencies[((len(latencies)-1)*99)/100] > options.maximumP99 ||
 		latencies[len(latencies)-1] > options.maximumLatency {
 		return fmt.Errorf("%w: p99=%s/%s maximum=%s/%s", errQualification,

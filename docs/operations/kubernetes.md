@@ -169,8 +169,8 @@ fresh test authority, and starts all three RF3 groups plus the gateway. It then
 requires stable Pod DNS, ten retained PVC identities, an acknowledged durable
 write and repeated reads, a rolling restart of every catalog, ledger, data, and
 gateway ordinal, exact-request recovery, and post-restart row visibility. Each
-serving process must remain below hard one-second p99 and five-second maximum
-read latency, 1 GiB RSS, 1 GiB apparent durable storage, and 512 MiB WAL. The
+serving process must remain below hard one-second read p99 and five-second
+terminal/read maximum latency, 1 GiB RSS, 1 GiB apparent durable storage, and 512 MiB WAL. The
 gate has no skip mode and uploads bounded evidence even on failure.
 
 This qualification proves a disposable single-data-shard RF3 serving and
