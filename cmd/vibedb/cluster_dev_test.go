@@ -764,6 +764,7 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 	var portable [3]sqldriver.ReplicatedSchemaCatalogImage
 	var local [3][32]byte
 	var machine [3][32]byte
+	var logical [3][32]byte
 	var profiles [3]gateway.ReplicatedTableProfile
 	for index := range profiles {
 		root := filepath.Join(t.TempDir(), "member")
@@ -819,6 +820,10 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 			t.Fatal(err)
 		}
 		local[index] = prepared.Base.RelationManifestDigest
+		logical[index], err = sqldriver.ReplicatedRelationManifestDigest(prepared.Base)
+		if err != nil {
+			t.Fatal(err)
+		}
 		machine[index], err = prepared.Apply.RangeSplitRelationManifestDigest()
 		if err != nil {
 			t.Fatal(err)
@@ -838,7 +843,8 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 		if err != nil {
 			t.Fatal(err)
 		}
-		if readMachine != machine[index] {
+		if readMachine != machine[index] || portable[index].RelationManifestDigest != machine[index] ||
+			profiles[index].LogicalSchemaDigest != replication.Digest(logical[index]) {
 			t.Fatal("prepared command machine digest changed during profile read")
 		}
 	}
@@ -855,7 +861,7 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 	if profiles[0].Table != devDataTable || profiles[0].PrimaryKey != devDataPrimaryKey ||
 		profiles[0].Relation != 1 || profiles[0].SchemaGeneration != 1 ||
 		profiles[0].LogicalSchemaDigest == replication.Digest(machine[0]) ||
-		profiles[0].LogicalSchemaDigest != replication.Digest(portable[0].RelationManifestDigest) {
+		profiles[0].LogicalSchemaDigest != replication.Digest(logical[0]) {
 		t.Fatalf("portable data profile=%+v image=%+v", profiles[0], portable[0])
 	}
 }

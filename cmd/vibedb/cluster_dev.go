@@ -1090,8 +1090,8 @@ func readDevReplicatedTableProfile(
 	if err := errors.Join(manifestErr, database.Close()); err != nil {
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
-	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(identity)
-	if err != nil || logicalDigest != image.RelationManifestDigest {
+	logicalDigest, err := devLogicalSchemaForPreparedImage(identity, manifestDigest, image)
+	if err != nil {
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	return gateway.ReplicatedTableProfile{
@@ -1101,6 +1101,19 @@ func readDevReplicatedTableProfile(
 		MaxKeyBytes:         uint16(identity.UserLimits.MaxKeyBytes),
 		MaxDocumentBytes:    uint32(identity.UserLimits.MaxDocumentBytes),
 	}, manifestDigest, nil
+}
+
+func devLogicalSchemaForPreparedImage(identity sqldriver.ReplicatedShardStoreIdentity,
+	machine [sha256.Size]byte, image sqldriver.ReplicatedSchemaCatalogImage,
+) ([sha256.Size]byte, error) {
+	if machine == ([sha256.Size]byte{}) || machine != image.RelationManifestDigest ||
+		identity.RelationManifestDigest != image.LocalRelationManifestDigest || identity.RelationSchemaGeneration != image.SchemaGeneration {
+		return [sha256.Size]byte{}, fmt.Errorf("%w: prepared catalog schema differs from opened store", errDevCluster)
+	}
+	// The image certifies the placement-bound machine manifest. Public table
+	// profiles instead use the portable logical schema derived from the exact
+	// authenticated SQL identity, never that machine digest.
+	return sqldriver.ReplicatedRelationManifestDigest(identity)
 }
 
 // deriveDevLogicalRangeAuthority certifies the three independent logical
