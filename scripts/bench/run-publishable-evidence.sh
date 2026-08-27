@@ -30,8 +30,8 @@ if [[ -n $(git -C "${repo}" status --porcelain=v1 --untracked-files=normal) ]]; 
 fi
 revision=$(git -C "${repo}" rev-parse HEAD)
 mkdir -m 700 "${evidence}"
-trap 'rm -rf "${scratch:-}"' EXIT
 scratch=$(mktemp -d)
+trap 'rm -rf -- "${scratch}"' EXIT
 
 filesystem=$(stat -f -c '%T' "${evidence}")
 {
