@@ -370,6 +370,11 @@ func retainedReplicatedMetadataBytes(
 	retained := uint64(cap(shards))*uint64(unsafe.Sizeof(replicatedCatalogShard{})) +
 		uint64(cap(replicas))*uint64(unsafe.Sizeof(ReplicatedEndpoint{}))
 	retained += replicatedTableMetadataBytes(tables)
+	for _, shard := range shards {
+		if shard.splitOrigin != nil {
+			retained += uint64(unsafe.Sizeof(ReplicatedSplitOrigin{}))
+		}
+	}
 	return retained
 }
 

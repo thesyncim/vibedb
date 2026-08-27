@@ -56,6 +56,7 @@ type ReplicatedShardDescriptor struct {
 	// participate in membership control. It is never included in the public
 	// data route until a later catalog cut makes it one of Replicas.
 	EnrolledTarget *ReplicatedReplicaDescriptor
+	SplitOrigin    *ReplicatedSplitOrigin
 }
 
 type replicatedCatalogShard struct {
@@ -70,6 +71,7 @@ type replicatedCatalogShard struct {
 	shard             uint32
 	replicaCount      uint8
 	hasEnrolledTarget bool
+	splitOrigin       *ReplicatedSplitOrigin
 }
 
 type unresolvedReplicatedCatalogShard struct {
@@ -146,7 +148,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			descriptor.RangeIdentity == (replication.Digest{}) ||
 			descriptor.LineageDigest == (replication.Digest{}) ||
 			descriptor.ForwardingRuleDigest == (replication.Digest{}) ||
-			len(descriptor.Replicas) != ServingReplicaCount {
+			len(descriptor.Replicas) != ServingReplicaCount || !validReplicatedSplitOrigin(descriptor.SplitOrigin, descriptor) {
 			return &CatalogError{Reason: "replicated shard has an invalid RF3 identity"}
 		}
 		manifestOrdinal, manifest := snapshot.manifestOrdinal(descriptor.Distribution)
@@ -156,10 +158,13 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			)}
 		}
 		shardOrdinal, metadata := manifestShardOrdinal(manifest, descriptor.Shard)
+		// A routing manifest can advance for a different shard. Keep this
+		// allocation's actually applied command fence; never fabricate a
+		// cluster-wide Raft transition from a catalog version increment.
 		if shardOrdinal < 0 || metadata.AllocationGeneration != descriptor.AllocationGeneration ||
 			metadata.LeaderCount != ServingReplicaCount ||
 			descriptor.Command.OwnershipEpoch != uint64(metadata.Epoch) ||
-			descriptor.Command.RoutingVersion != uint64(manifest.Version()) {
+			descriptor.Command.RoutingVersion > uint64(manifest.Version()) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated shard %q/%q does not match one RF3 manifest allocation",
 				descriptor.Distribution, descriptor.Shard,
@@ -181,6 +186,9 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			address, endpointExists := snapshot.endpoints[replica.Endpoint]
 			nativeAddress, nativeExists := snapshot.endpoints[replica.NativeEndpoint]
 			controlAddress, controlExists := snapshot.endpoints[replica.ControlEndpoint]
+			// Static RF3 manifests name peer endpoints; certified split
+			// manifests name native endpoints. Both must resolve to this
+			// exact replica, whose transport roles remain stored separately.
 			if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
 				replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
 				replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
@@ -188,7 +196,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 				replica.ControlEndpoint == replica.NativeEndpoint || !endpointExists || !nativeExists ||
 				!controlExists || address == "" || nativeAddress == "" || controlAddress == "" ||
 				address == nativeAddress || address == controlAddress || nativeAddress == controlAddress ||
-				replica.Endpoint != manifestEndpoint {
+				(replica.Endpoint != manifestEndpoint && replica.NativeEndpoint != manifestEndpoint) {
 				return &CatalogError{Reason: fmt.Sprintf(
 					"replicated shard %q/%q replica %d does not match its manifest endpoint",
 					descriptor.Distribution, descriptor.Shard, replicaOrdinal,
@@ -276,6 +284,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			replicaBase:      uint32(base), manifest: entry.manifest, shard: entry.shard,
 			replicaCount:      uint8(len(entry.descriptor.Replicas)),
 			hasEnrolledTarget: entry.descriptor.EnrolledTarget != nil,
+			splitOrigin:       cloneReplicatedSplitOrigin(entry.descriptor.SplitOrigin),
 		}
 	}
 	snapshot.replicatedShards = shards
@@ -476,16 +485,16 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 			Group: entry.group, AllocationGeneration: entry.allocation,
 			Command: entry.command, RangeIdentity: entry.rangeIdentity,
 			LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
-			Replicas: make([]ReplicatedReplicaDescriptor, entry.replicaCount),
+			Replicas:    make([]ReplicatedReplicaDescriptor, entry.replicaCount),
+			SplitOrigin: cloneReplicatedSplitOrigin(entry.splitOrigin),
 		}
 		for replicaOrdinal := range descriptor.Replicas {
-			endpoint, _ := manifest.ShardLeaderAt(int(entry.shard), replicaOrdinal)
 			descriptor.Replicas[replicaOrdinal] = ReplicatedReplicaDescriptor{
 				Member:          snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Member,
 				Node:            snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Node,
 				StoreID:         snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].StoreID,
 				NodeIncarnation: snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NodeIncarnation,
-				Endpoint:        endpoint,
+				Endpoint:        distribution.EndpointID(snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Endpoint),
 				NativeEndpoint: distribution.EndpointID(
 					snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NativeEndpoint,
 				),
@@ -572,7 +581,7 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 				oldManifest.Distribution(), oldMetadata.ID,
 			)}
 		}
-		if candidate.rangeIdentity != old.rangeIdentity ||
+		if !sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) || candidate.rangeIdentity != old.rangeIdentity ||
 			candidate.lineageDigest != old.lineageDigest ||
 			candidate.forwardingDigest != old.forwardingDigest {
 			return &CatalogError{Reason: fmt.Sprintf(
@@ -641,7 +650,7 @@ func validateCertifiedReplicaReplacement(
 		oldManifest := current.config.Manifests[old.manifest]
 		oldMetadata, _ := oldManifest.ShardMetadataAt(int(old.shard))
 		candidate, found := next.replicatedShardAt(oldManifest.Distribution(), oldMetadata.ID)
-		if !found || candidate.group != old.group || candidate.allocation != old.allocation {
+		if !found || candidate.group != old.group || candidate.allocation != old.allocation || !sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) {
 			return &CatalogError{Reason: "replica replacement changed allocation identity"}
 		}
 		if old.group != grant.Group {
@@ -755,27 +764,28 @@ func sameReplicatedCatalogRoster(
 }
 
 type persistedReplicatedShard struct {
-	Distribution           string                       `json:"distribution"`
-	Shard                  string                       `json:"shard"`
-	AllocationGeneration   uint64                       `json:"allocation_generation"`
-	ClusterID              string                       `json:"cluster_id"`
-	ClusterIncarnation     string                       `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch  uint64                       `json:"topology_recovery_epoch"`
-	ShardIncarnation       string                       `json:"shard_incarnation"`
-	GroupID                string                       `json:"group_id"`
-	ReplicaSetVersion      uint64                       `json:"replica_set_version"`
-	ActivePolicyGeneration uint64                       `json:"active_policy_generation"`
-	ProtectionEpoch        uint64                       `json:"protection_epoch"`
-	OwnershipEpoch         uint64                       `json:"ownership_epoch"`
-	SchemaGeneration       uint64                       `json:"schema_generation"`
-	RelationManifestDigest string                       `json:"relation_manifest_digest"`
-	RangeIdentity          string                       `json:"range_identity"`
-	LineageDigest          string                       `json:"lineage_digest"`
-	ForwardingRuleDigest   string                       `json:"forwarding_rule_digest"`
-	RoutingVersion         uint64                       `json:"routing_version"`
-	RouteGeneration        uint64                       `json:"route_generation"`
-	Replicas               []persistedReplicatedReplica `json:"replicas"`
-	EnrolledTarget         *persistedReplicatedReplica  `json:"enrolled_target,omitempty"`
+	Distribution           string                          `json:"distribution"`
+	Shard                  string                          `json:"shard"`
+	AllocationGeneration   uint64                          `json:"allocation_generation"`
+	ClusterID              string                          `json:"cluster_id"`
+	ClusterIncarnation     string                          `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch  uint64                          `json:"topology_recovery_epoch"`
+	ShardIncarnation       string                          `json:"shard_incarnation"`
+	GroupID                string                          `json:"group_id"`
+	ReplicaSetVersion      uint64                          `json:"replica_set_version"`
+	ActivePolicyGeneration uint64                          `json:"active_policy_generation"`
+	ProtectionEpoch        uint64                          `json:"protection_epoch"`
+	OwnershipEpoch         uint64                          `json:"ownership_epoch"`
+	SchemaGeneration       uint64                          `json:"schema_generation"`
+	RelationManifestDigest string                          `json:"relation_manifest_digest"`
+	RangeIdentity          string                          `json:"range_identity"`
+	LineageDigest          string                          `json:"lineage_digest"`
+	ForwardingRuleDigest   string                          `json:"forwarding_rule_digest"`
+	RoutingVersion         uint64                          `json:"routing_version"`
+	RouteGeneration        uint64                          `json:"route_generation"`
+	Replicas               []persistedReplicatedReplica    `json:"replicas"`
+	EnrolledTarget         *persistedReplicatedReplica     `json:"enrolled_target,omitempty"`
+	SplitOrigin            *persistedReplicatedSplitOrigin `json:"split_origin,omitempty"`
 }
 
 type persistedReplicatedReplica struct {
@@ -818,6 +828,7 @@ func persistedReplicatedDescriptors(
 			RoutingVersion:       descriptor.Command.RoutingVersion,
 			RouteGeneration:      descriptor.Command.RouteGeneration,
 			Replicas:             make([]persistedReplicatedReplica, len(descriptor.Replicas)),
+			SplitOrigin:          persistReplicatedSplitOrigin(descriptor.SplitOrigin),
 		}
 		for replicaOrdinal, replica := range descriptor.Replicas {
 			entry.Replicas[replicaOrdinal] = persistReplicatedReplica(replica)
@@ -899,7 +910,8 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				RoutingVersion:         persisted.RoutingVersion,
 				RouteGeneration:        persisted.RouteGeneration,
 			},
-			Replicas: make([]ReplicatedReplicaDescriptor, len(persisted.Replicas)),
+			Replicas:    make([]ReplicatedReplicaDescriptor, len(persisted.Replicas)),
+			SplitOrigin: openReplicatedSplitOrigin(persisted.SplitOrigin),
 		}
 		for replicaOrdinal, replica := range persisted.Replicas {
 			decoded, err := openPersistedReplicatedReplica(replica)
