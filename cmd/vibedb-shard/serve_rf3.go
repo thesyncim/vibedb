@@ -763,13 +763,24 @@ func servePreparedRF3WithExecutionLanes(
 			return errors.Join(childErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
 	}
+	splitObservationRuntime, splitObservationErr := newRF3SplitObservationRuntime(
+		preparedSet.groups, identities, commands, peer.Owners(), policy, deadline,
+		manifest.SplitControl.ChildRegistry.MaxOperations,
+	)
+	if splitObservationErr != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(splitObservationErr, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, splitObservationRuntime.Close()) }()
 	// Split control remains absent until this process can reconstruct the
 	// complete durable plan observation and execute every action class. The mux
 	// has a fixed shipped route for it once that runtime is supplied; it must not
 	// advertise a partial or memory-only executor.
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, sourceControl, actionControl,
-		nil, schemaControl, nil, nil, nil, childPrepareControl,
+		nil, schemaControl, splitObservationRuntime.service, nil, nil, childPrepareControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
