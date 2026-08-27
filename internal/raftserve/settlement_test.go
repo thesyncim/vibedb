@@ -308,10 +308,13 @@ func testTransactionCommand(
 	t.Helper()
 	id := distributedtxn.ID{0xc1, 0x55, 0x81}
 	control, err := distributedtxn.AppendReplicatedCommand(nil, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant,
-		ID:        id, ExpectedRevision: 1,
-		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		Role:               distributedtxn.ReplicatedRoleParticipant,
+		Operation:          distributedtxn.ReplicatedPrepareParticipant,
+		ID:                 id,
+		ExpectedRevision:   1,
+		PayloadKind:        distributedtxn.ReplicatedPayloadNone,
+		ControllerEpoch:    7,
+		ExecutionPinDigest: distributedtxn.Digest(sha256.Sum256([]byte("raftserve/test-execution-pin"))),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -413,6 +416,16 @@ func TestRegistrySettlementValidatesMutationResultWithoutAllocations(t *testing.
 func TestRegistrySettlementValidatesTransactionResultIdentityWithoutAllocations(t *testing.T) {
 	group := testGroup(20)
 	command := testTransactionCommand(t, group)
+	outer, err := replication.OpenCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := outer.OpenTransactionInto(nil)
+	if err != nil || control.ControllerEpoch != 7 ||
+		control.ExecutionPinDigest == (distributedtxn.Digest{}) {
+		t.Fatalf("transaction controller fence = epoch:%d pin:%x err:%v",
+			control.ControllerEpoch, control.ExecutionPinDigest, err)
+	}
 	const applied = uint64(29)
 	lookup := testTransactionCompletion(
 		t, group, command, applied,
