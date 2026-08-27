@@ -27,6 +27,11 @@ const multiGroupRF3RequestLedgerRangeDomain = "vibedb/test/multiraft-request-led
 
 const multiGroupRF3DataRangeDomain = "vibedb/test/multiraft-data-range/format-0\x00"
 
+const (
+	multiGroupRF3LedgerCapacityBytes       = 64 << 20
+	multiGroupRF3LedgerCleanupReserveBytes = 8 << 20
+)
+
 func multiGroupRF3RequestLedgerRangeIdentity(group int) [sha256.Size]byte {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(multiGroupRF3RequestLedgerRangeDomain))
@@ -361,6 +366,12 @@ func multiGroupRF3RequestHead(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This fixture exercises Create and retry, not maximum-size terminal
+	// payloads. Two live requests must fit the unchanged ordinary ledger budget;
+	// default heads reserve two maximum-size terminal images apiece.
+	head.MaxPendingWaveBytes = requestledger.SingleStepPendingWaveRecordBytes
+	head.MaxContinuationBytes = 4 << 10
+	head.MaxTerminalBytes = 4 << 10
 	return head
 }
 

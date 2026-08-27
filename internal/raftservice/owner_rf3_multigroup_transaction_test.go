@@ -1033,8 +1033,8 @@ func newMultiGroupRF3Runtime(
 		},
 	}
 	if group == multiGroupRF3LedgerGroup {
-		applyOptions.RequestLedgerCapacityBytes = 64 << 20
-		applyOptions.RequestLedgerCleanupReserveBytes = 8 << 20
+		applyOptions.RequestLedgerCapacityBytes = multiGroupRF3LedgerCapacityBytes
+		applyOptions.RequestLedgerCleanupReserveBytes = multiGroupRF3LedgerCleanupReserveBytes
 		applyOptions.RequestLedgerRangeIdentity = multiGroupRF3RequestLedgerRangeIdentity(group)
 	}
 	apply, _, err := raftmember.OpenPreparedApply(

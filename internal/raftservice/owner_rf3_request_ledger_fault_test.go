@@ -75,3 +75,56 @@ func TestRequestLedgerRF3NativeDiagnosticsRetainBoundedRecentResults(t *testing.
 		t.Fatalf("failed native probe inherited a successful response: %+v", last)
 	}
 }
+
+func TestRequestLedgerRF3SequenceFixtureFitsOrdinaryCapacity(t *testing.T) {
+	key1, key2 := multiGroupRF3RequestKey(1, 0x81), multiGroupRF3RequestKey(2, 0x82)
+	head1, head2 := multiGroupRF3RequestHead(t, key1), multiGroupRF3RequestHead(t, key2)
+	highwater, err := requestledger.NewIssuerHighwater(key1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lane, err := requestledger.AppendIssuerHighwater(nil, highwater)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed := uint64(len(requestledger.AppendIssuerHighwaterKey(nil, highwater.Home, highwater.IssuerDigest)) + len(lane))
+	defaultConsumed := consumed
+	for _, head := range []requestledger.HeadRecord{head1, head2} {
+		raw, encodeErr := requestledger.AppendHead(nil, head)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		if _, openErr := requestledger.OpenHead(raw); openErr != nil {
+			t.Fatal(openErr)
+		}
+		resident, reserved, reservationErr := requestledger.Reservation(head)
+		if reservationErr != nil {
+			t.Fatal(reservationErr)
+		}
+		consumed += resident + reserved
+		defaults, defaultErr := requestledger.NewHeadWithContract(head.Key, head.RequestDigest, head.TerminalContractDigest, head.InlinePlan)
+		if defaultErr != nil {
+			t.Fatal(defaultErr)
+		}
+		resident, reserved, reservationErr = requestledger.Reservation(defaults)
+		if reservationErr != nil {
+			t.Fatal(reservationErr)
+		}
+		defaultConsumed += resident + reserved
+	}
+	const ordinary = multiGroupRF3LedgerCapacityBytes - multiGroupRF3LedgerCleanupReserveBytes
+	if consumed > ordinary || defaultConsumed <= ordinary {
+		t.Fatalf("fixture reservation=%d default=%d ordinary=%d", consumed, defaultConsumed, ordinary)
+	}
+	// Capacity correction must not bypass the contiguous issuer contract.
+	if _, err := requestledger.AdmitIssuerSequence(highwater, key2, head2.RequestDigest, highwater.Revision+1); err == nil {
+		t.Fatal("issuer gap accepted")
+	}
+	highwater, err = requestledger.AdmitIssuerSequence(highwater, key1, head1.RequestDigest, highwater.Revision+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := requestledger.AdmitIssuerSequence(highwater, key2, head2.RequestDigest, highwater.Revision+1); err != nil {
+		t.Fatalf("contiguous second request rejected: %v", err)
+	}
+}
