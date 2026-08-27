@@ -478,6 +478,46 @@ func TestPrimaryGraphStreamBuilderConsumesPinnedWindowsAndReopens(t *testing.T) 
 	}
 }
 
+func TestPrimaryValueLeafWindowPlannerStagesMixedOverflow(t *testing.T) {
+	overflow := PageRef{
+		Offset: 1 << 20, LogicalID: PrimaryFirstDynamicLogicalID, Generation: 7,
+		Length: format0PageSize, Kind: PageOverflow,
+	}
+	records := []CommonPrimaryLeafRecord{
+		{Slot: 0, Key: []byte("a"), Value: CommonPrimaryLeafValue{Inline: []byte(`{"v":1}`)}},
+		{Slot: 1, Key: []byte("b"), Value: CommonPrimaryLeafValue{Overflow: overflow}},
+		{Slot: 2, Key: []byte("c"), Value: CommonPrimaryLeafValue{Inline: []byte(`{"v":3}`)}},
+	}
+	planner, err := NewPrimaryValueLeafWindowPlanner(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &incrementalPrimaryTestSink{next: 2 << 20}
+	emission, err := planner.Stage(
+		sink, 0, 0, records, CommonPrimaryLeafMaxExtentBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenCompactPrimaryStripe(
+		sink.pages[0], testStoreID, emission.Bucket, emission.Ref, 7,
+		CommonPrimaryLeafBounds{
+			FileEnd: sink.next, NextLogicalID: PrimaryFirstDynamicLogicalID + 100,
+			AllocationQuantum: format0PageSize,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Len() != len(records) || !view.HasOverflowRows() {
+		t.Fatalf("mixed leaf rows/overflow=%d/%v", view.Len(), view.HasOverflowRows())
+	}
+	got, ok := view.OverflowRef(1)
+	if !ok || got != overflow {
+		t.Fatalf("overflow ref=%+v,%v want %+v", got, ok, overflow)
+	}
+}
+
 func incrementalPrimaryFileEnd(s *incrementalPrimaryTestSink) uint64 {
 	return max(s.next, uint64(GlobalTabletCatalogRootBytes))
 }
