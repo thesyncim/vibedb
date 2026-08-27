@@ -213,6 +213,35 @@ func writeGatewayStageMetrics(writer *vibejson.Writer, stages servicemetrics.Sta
 	return nil
 }
 
+func writeGatewayControllerMetrics(writer *vibejson.Writer, metrics gatewayControllerMetricsSnapshot) error {
+	if err := writer.Key("controller_metrics"); err != nil {
+		return err
+	}
+	if err := writer.BeginObject(); err != nil {
+		return err
+	}
+	for _, field := range [...]struct {
+		name  string
+		value uint64
+	}{
+		{"move_passes", metrics.MovePasses}, {"move_discovered", metrics.MoveDiscovered},
+		{"move_advanced", metrics.MoveAdvanced}, {"move_completed", metrics.MoveCompleted},
+		{"move_faults", metrics.MoveFaults}, {"move_duration_ns", metrics.MoveDurationNS},
+		{"move_duration_max_ns", metrics.MoveDurationMaxNS}, {"split_passes", metrics.SplitPasses},
+		{"split_discovered", metrics.SplitDiscovered}, {"split_triggered", metrics.SplitTriggered},
+		{"split_completed", metrics.SplitCompleted}, {"split_faults", metrics.SplitFaults},
+		{"split_duration_ns", metrics.SplitDurationNS}, {"split_duration_max_ns", metrics.SplitDurationMaxNS},
+	} {
+		if err := writer.Key(field.name); err != nil {
+			return err
+		}
+		if err := writer.Uint(field.value); err != nil {
+			return err
+		}
+	}
+	return writer.EndObject()
+}
+
 func writeGatewayMetricCut(writer *vibejson.Writer, cut raftservice.ProgressMetricsSnapshot) error {
 	for _, field := range [...]struct {
 		name  string

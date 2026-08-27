@@ -403,7 +403,9 @@ func startGatewayReplicaControllers(
 				logf("gateway: replica health controller submitted %d/%d certified replacement(s)",
 					healthPass.Submitted, healthPass.Certificates)
 			}
+			moveStarted := time.Now()
 			movePass, moveErr := moves.RunPass(ctx)
+			gatewayControllerMetricsFromContext(ctx).observeMove(movePass, moveErr, time.Since(moveStarted))
 			if moveErr != nil && !errors.Is(moveErr, context.Canceled) {
 				logf("gateway: replica move controller: %v", moveErr)
 			} else if movePass.Advanced != 0 || movePass.Completed != 0 || movePass.AbandonmentDeleted != 0 {

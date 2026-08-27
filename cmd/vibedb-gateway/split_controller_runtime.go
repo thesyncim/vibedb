@@ -159,7 +159,9 @@ func runServingSplitController(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		started := time.Now()
 		pass, err := splitcontroller.RunDirectControllerPass(ctx, directory, controller)
+		gatewayControllerMetricsFromContext(ctx).observeSplit(pass, err, time.Since(started))
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logf("gateway: split controller: %v", err)
 		} else if pass.Triggered != 0 {

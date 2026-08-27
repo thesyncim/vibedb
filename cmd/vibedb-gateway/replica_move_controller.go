@@ -82,7 +82,9 @@ func runReplicaMoveController(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		started := time.Now()
 		pass, err := controller.RunPass(ctx)
+		gatewayControllerMetricsFromContext(ctx).observeMove(pass, err, time.Since(started))
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logf("gateway: replica move controller: %v", err)
 		} else if pass.Advanced != 0 || pass.Completed != 0 || pass.AbandonmentDeleted != 0 {

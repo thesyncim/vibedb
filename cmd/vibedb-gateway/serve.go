@@ -123,6 +123,7 @@ type serveResponse struct {
 	DurableAck         *durableExecBatchAckWireRequest `json:"-"`
 	Metrics            *gateway.MetricsSnapshot        `json:"metrics,omitempty"`
 	DistributedMetrics *gateway.DistributedMetrics     `json:"-"`
+	ControllerMetrics  *gatewayControllerMetrics       `json:"-"`
 	BackupID           [32]byte                        `json:"-"`
 	BackupStage        uint64                          `json:"backup_stage,omitempty"`
 	BackupProof        [32]byte                        `json:"-"`
@@ -455,6 +456,8 @@ func runServe(args []string) (exitCode int) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	controllerMetrics := new(gatewayControllerMetrics)
+	ctx = withGatewayControllerMetrics(ctx, controllerMetrics)
 	routeHandoffCompleted := false
 	defer func() {
 		if routeHandoffCompleted {
@@ -1575,7 +1578,8 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			}
 			metrics := exec.Metrics()
 			if writeServeResponse(writer, &serveResponse{Metrics: &metrics,
-				DistributedMetrics: gatewayDistributedMetricsFromContext(ctx)}) != nil {
+				DistributedMetrics: gatewayDistributedMetricsFromContext(ctx),
+				ControllerMetrics:  gatewayControllerMetricsFromContext(ctx)}) != nil {
 				return
 			}
 			continue
@@ -1883,6 +1887,11 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 	}
 	if resp.DistributedMetrics != nil {
 		if err := writeGatewayDistributedMetrics(w, resp.DistributedMetrics); err != nil {
+			return err
+		}
+	}
+	if resp.ControllerMetrics != nil {
+		if err := writeGatewayControllerMetrics(w, resp.ControllerMetrics.Snapshot()); err != nil {
 			return err
 		}
 	}
