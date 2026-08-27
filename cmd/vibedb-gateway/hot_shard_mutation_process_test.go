@@ -879,16 +879,13 @@ func hotMutationLeader(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	defer client.Close()
+	authority := serviceauthz.Authority{Node: profile.LocalIdentity().Node,
+		Generation: route.Command.ActivePolicyGeneration}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, endpoint := range route.Replicas {
 			response, probeErr := client.DoReplicated(t.Context(), endpoint,
-				&shardservice.ReplicatedRequest{
-					Operation:  shardservice.ReplicatedProbe,
-					Capability: serviceauthz.CapabilityDataWrite,
-					Fence: shardservice.ReplicatedFence{Group: route.Group,
-						AllocationGeneration: route.AllocationGeneration},
-				})
+				rf3FixtureProbeRequest(route, authority, serviceauthz.CapabilityDataWrite))
 			if probeErr == nil && response != nil &&
 				response.Kind == shardservice.ReplicatedHandshake &&
 				response.State.Fence.Group == route.Group &&

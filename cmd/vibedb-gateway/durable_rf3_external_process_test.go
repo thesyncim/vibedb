@@ -918,10 +918,9 @@ func (fixture *durableRF3ExternalFixture) tryProbe(
 	defer cancel()
 	route := fixture.routes[group]
 	response, err := fixture.probeClient.DoReplicated(ctx, route.Replicas[member],
-		&shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
-			Capability: fixture.capability[group], Fence: shardservice.ReplicatedFence{
-				Group: route.Group, AllocationGeneration: route.AllocationGeneration,
-			}},
+		rf3FixtureProbeRequest(route, serviceauthz.Authority{
+			Node: fixture.nodes[fixture.observerNode], Generation: 5,
+		}, fixture.capability[group]),
 	)
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
@@ -948,6 +947,8 @@ func (fixture *durableRF3ExternalFixture) waitRouteLeader(
 ) (uint64, uint64) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	var lastStates [durableRF3ExternalVoters]shardservice.ReplicatedMemberState
+	var lastErrors [durableRF3ExternalVoters]error
 	for time.Now().Before(deadline) {
 		leader := uint64(0)
 		applied := uint64(0)
@@ -958,6 +959,7 @@ func (fixture *durableRF3ExternalFixture) waitRouteLeader(
 				continue
 			}
 			state, err := fixture.tryProbe(group, member)
+			lastStates[member], lastErrors[member] = state, err
 			if err != nil || leader != 0 && state.LeaderID != leader ||
 				excluded >= 0 && state.LeaderID == uint64(excluded+1) {
 				consistent = false
@@ -971,6 +973,12 @@ func (fixture *durableRF3ExternalFixture) waitRouteLeader(
 			return leader, applied
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	for member, state := range lastStates {
+		if member != excluded {
+			t.Logf("role %s probe member=%d leader=%d term=%d applied=%d error=%v",
+				durableRF3ExternalRoleNames[group], member+1, state.LeaderID, state.Term, state.Applied, lastErrors[member])
+		}
 	}
 	t.Fatalf("role %s has no consistent RF3 leader excluding member %d",
 		durableRF3ExternalRoleNames[group], excluded+1)
