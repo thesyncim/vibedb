@@ -120,6 +120,20 @@ func (typedServiceRunnerStop) RunTyped(
 	return DurableRequestTerminalResult{}, errors.New("runner must not run")
 }
 
+type typedServiceAckRetirer struct {
+	typedServicePinStop
+	acks []requestledger.AckRecord
+}
+
+func (retirer *typedServiceAckRetirer) RetireAcknowledged(
+	_ context.Context,
+	_ DurableRequestLedgerHome,
+	ack requestledger.AckRecord,
+) error {
+	retirer.acks = append(retirer.acks, ack)
+	return nil
+}
+
 func TestDurableRequestServiceAdmitsSealsAndReopensBeforePin(t *testing.T) {
 	participants := durableFaultParticipants(t)
 	request := durableFaultRequest(t, participants)
@@ -201,6 +215,72 @@ func TestDurableRequestServiceReplaysTerminalFromReplicatedStateOnly(t *testing.
 	}
 }
 
+func TestDurableRequestServiceExistingAckResumesGCAndRetiresLocalPinJournal(t *testing.T) {
+	terminalPlan, head, continuation, terminalPin := terminalCoordinatorFixture(t)
+	terminalLedger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	coordinator, err := newDurableRequestTerminalCoordinator(terminalLedger, terminalPin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := coordinator.Complete(t.Context(), terminalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := requestledger.NewAck(
+		terminalLedger.head, terminal.Terminal, terminal.Terminal.Revision+1, 4096,
+	)
+	if err != nil || ack.GCPhase != requestledger.AckGCCollecting {
+		t.Fatalf("ack=%+v err=%v", ack, err)
+	}
+	ledger := &ackCollectorLedger{
+		head: terminalLedger.head, terminal: terminal.Terminal, ack: ack,
+	}
+	terminalPlan.Home.route = terminalPin.route
+	topology, err := NewDurableRequestLedgerTopologyHolder(DurableRequestLedgerTopology{
+		Generation: 1,
+		Ranges: []DurableRequestLedgerRange{{
+			Identity: terminalPlan.Home.Identity, Route: terminalPin.route,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := new(typedServiceAckRetirer)
+	service, err := newDurableRequestService(topology, ledger, typedServiceRunnerStop{}, pins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := DurableRequestLedgerKey{
+		RequestKey: terminalPlan.Key,
+		Digest:     replication.Digest(ack.RequestDigest),
+	}
+	result, err := service.Acknowledge(
+		t.Context(), key, terminal.Terminal.Revision,
+		replication.Digest(terminal.Terminal.ResultDigest),
+		DurableRequestAckToken(terminal.Terminal.AckToken),
+	)
+	if err != nil || result.Ack.GCPhase != requestledger.AckGCComplete ||
+		result.Rounds != 1 || len(pins.acks) != 1 ||
+		pins.acks[0].AckDigest != result.Ack.AckDigest {
+		t.Fatalf("result=%+v retirements=%d err=%v", result, len(pins.acks), err)
+	}
+	if len(ledger.operations) != 1 || ledger.operations[0] != requestledger.OperationGC {
+		t.Fatalf("operations=%v", ledger.operations)
+	}
+	before := len(ledger.operations)
+	retry, err := service.Acknowledge(
+		t.Context(), key, terminal.Terminal.Revision,
+		replication.Digest(terminal.Terminal.ResultDigest),
+		DurableRequestAckToken(terminal.Terminal.AckToken),
+	)
+	if err != nil || retry.Ack.AckDigest != result.Ack.AckDigest ||
+		len(ledger.operations) != before || len(pins.acks) != 2 {
+		t.Fatalf("retry=%+v operations=%v retirements=%d err=%v",
+			retry, ledger.operations, len(pins.acks), err)
+	}
+}
+
 var _ DurableRequestLedger = (*typedServiceLedger)(nil)
 var _ DurableRequestExecutionPinAuthority = (*typedServicePinStop)(nil)
+var _ DurableRequestExecutionPinAckRetirer = (*typedServiceAckRetirer)(nil)
 var _ DurableRequestTypedRunner = typedServiceRunnerStop{}

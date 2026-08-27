@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,6 +79,59 @@ func TestReleasedExecutionPinJournalChurnLeavesNoFilesAndActiveSurvivesRestart(t
 	}
 	if len(entries) > 2 {
 		t.Fatalf("journal churn retained %d files, want only one recoverable two-slot journal", len(entries))
+	}
+}
+
+func TestAcknowledgedExecutionPinJournalCleanupUsesExactFullPinIdentity(t *testing.T) {
+	directory := t.TempDir()
+	principal := serviceauthz.Authority{Node: rafttransport.NodeID{4}, Generation: 5}
+	binding := executionpin.Binding{
+		RequestKeyDigest: executionpin.Digest{1}, RequestDigest: executionpin.Digest{2},
+		CatalogGeneration: 3, SchemaManifestDigest: executionpin.Digest{4},
+		TransactionManifestDigest: executionpin.Digest{5},
+		ParticipantAuthorityRoot:  executionpin.Digest{6}, ParticipantCount: 1,
+		ExecutionContractDigest: executionpin.Digest{7}, LedgerHomeGroup: executionpin.ID{8},
+	}
+	bindingDigest, err := executionpin.BindingDigest(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := executionpin.DerivePinIDFromBindingDigest(bindingDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := durableExecutionPinSessionIdentity(pin, principal)
+	base := filepath.Join(directory, fmt.Sprintf("%x", identity))
+	journal, err := OpenNativeSessionJournal(NativeSessionJournalOptions{
+		Path: base, ClientID: identity, RetryHome: replication.RetryHome{1},
+		MaxCommandBytes: replication.MaxCommandBytes, Binding: replication.Digest{9},
+	})
+	if err != nil || journal == nil {
+		t.Fatalf("journal=%v err=%v", journal, err)
+	}
+	factory := &JournaledDurableRequestExecutionPinSessionFactory{
+		directory: directory, principal: principal,
+	}
+	route := durableFaultParticipants(t)[0].Route
+	if err = factory.RetireAcknowledgedExecutionPinSession(
+		t.Context(), pin, route, replication.Digest{10},
+	); err != nil {
+		t.Fatal(err)
+	}
+	for slot := 0; slot < 2; slot++ {
+		if _, statErr := os.Stat(base + "." + string(rune('0'+slot))); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("slot %d survived acknowledged cleanup: %v", slot, statErr)
+		}
+	}
+	if err = factory.RetireAcknowledgedExecutionPinSession(
+		t.Context(), pin, route, replication.Digest{10},
+	); err != nil {
+		t.Fatalf("idempotent cleanup: %v", err)
+	}
+	changed := pin
+	changed[0]++
+	if durableExecutionPinSessionIdentity(changed, principal) == identity {
+		t.Fatal("changed full pin identity aliased journal path")
 	}
 }
 
