@@ -21,6 +21,26 @@ type rf3MetricsProvider struct {
 	split  *splitcontroller.ControlService
 }
 
+type coldRF3MetricsProvider struct{ groups []*preparedColdRF3Group }
+
+func (*coldRF3MetricsProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
+	return raftservice.ProgressMetricsSnapshot{}
+}
+func (provider *coldRF3MetricsProvider) StageMetrics() servicemetrics.StageMetricsSnapshot {
+	var result servicemetrics.StageMetricsSnapshot
+	for _, group := range provider.groups {
+		metrics := group.service.Metrics()
+		result.BootstrapRequests = rf3MetricsAdd(result.BootstrapRequests, metrics.Requests)
+		result.BootstrapChunks = rf3MetricsAdd(result.BootstrapChunks, metrics.Chunks)
+		result.BootstrapBytes = rf3MetricsAdd(result.BootstrapBytes, metrics.Bytes)
+		result.BootstrapCompletions = rf3MetricsAdd(result.BootstrapCompletions, metrics.Completions)
+		result.BootstrapFaults = rf3MetricsAdd(result.BootstrapFaults, metrics.Faults)
+		result.BootstrapResidentBytes = rf3MetricsAdd(result.BootstrapResidentBytes, metrics.ResidentBytes)
+		result.BootstrapInflight = rf3MetricsAdd(result.BootstrapInflight, metrics.Inflight)
+	}
+	return result
+}
+
 func (provider *rf3MetricsProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
 	return provider.owners.ProgressMetrics()
 }

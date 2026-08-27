@@ -16,7 +16,7 @@ import (
 
 const (
 	RequestBytes  = 80
-	ResponseBytes = 336
+	ResponseBytes = 408
 )
 
 var (
@@ -52,6 +52,8 @@ type StageMetricsSnapshot struct {
 	SnapshotTransferChunks, SnapshotTransferBytes, SnapshotResidentBytes        uint64
 	ReplicaActionRequests, ReplicaActionCompletions, ReplicaActionFaults        uint64
 	SplitControlRequests, SplitControlCompletions, SplitControlFaults           uint64
+	BootstrapRequests, BootstrapChunks, BootstrapBytes, BootstrapCompletions    uint64
+	BootstrapFaults, BootstrapResidentBytes, BootstrapInflight                  uint64
 }
 
 type StageProvider interface{ StageMetrics() StageMetricsSnapshot }
@@ -127,7 +129,8 @@ func appendResponse(snapshot Snapshot) (response [ResponseBytes]byte) {
 	binary.BigEndian.PutUint64(response[80:88], snapshot.Member)
 	metrics := snapshot.Metrics
 	values := [...]uint64{metrics.ProposalCommands, metrics.ProposalBytes, metrics.AppliedEntries,
-		metrics.ReadyPersisted, metrics.SnapshotsFinished, metrics.ReadCompletions, metrics.Faults}
+		metrics.ReadyPersisted, metrics.SnapshotsFinished, metrics.ReadCompletions, metrics.Faults,
+		metrics.CommitAdvancements, metrics.CommittedEntries}
 	for index, value := range values {
 		binary.BigEndian.PutUint64(response[88+index*8:96+index*8], value)
 	}
@@ -137,18 +140,20 @@ func appendResponse(snapshot Snapshot) (response [ResponseBytes]byte) {
 		stages.BackupRequests, stages.BackupFaults, stages.BackupLogicalBytes, stages.BackupScanBytes,
 		stages.SnapshotTransferChunks, stages.SnapshotTransferBytes, stages.SnapshotResidentBytes,
 		stages.ReplicaActionRequests, stages.ReplicaActionCompletions, stages.ReplicaActionFaults,
-		stages.SplitControlRequests, stages.SplitControlCompletions, stages.SplitControlFaults}
+		stages.SplitControlRequests, stages.SplitControlCompletions, stages.SplitControlFaults,
+		stages.BootstrapRequests, stages.BootstrapChunks, stages.BootstrapBytes,
+		stages.BootstrapCompletions, stages.BootstrapFaults, stages.BootstrapResidentBytes, stages.BootstrapInflight}
 	for index, value := range stageValues {
-		binary.BigEndian.PutUint64(response[144+index*8:152+index*8], value)
+		binary.BigEndian.PutUint64(response[160+index*8:168+index*8], value)
 	}
-	digest := sha256.Sum256(response[:304])
-	copy(response[304:], digest[:])
+	digest := sha256.Sum256(response[:376])
+	copy(response[376:], digest[:])
 	return response
 }
 
 func OpenResponse(response []byte) (Snapshot, error) {
 	if len(response) != ResponseBytes || responseMagic != [8]byte(response[:8]) ||
-		sha256.Sum256(response[:304]) != [sha256.Size]byte(response[304:]) {
+		sha256.Sum256(response[:376]) != [sha256.Size]byte(response[376:]) {
 		return Snapshot{}, ErrMetrics
 	}
 	group := openGroup(response[8:80])
@@ -156,23 +161,25 @@ func OpenResponse(response []byte) (Snapshot, error) {
 	if (group == (raftmember.GroupKey{})) != (member == 0) {
 		return Snapshot{}, ErrMetrics
 	}
-	values := [7]uint64{}
+	values := [9]uint64{}
 	for index := range values {
 		values[index] = binary.BigEndian.Uint64(response[88+index*8 : 96+index*8])
 	}
-	stageValues := [20]uint64{}
+	stageValues := [27]uint64{}
 	for index := range stageValues {
-		stageValues[index] = binary.BigEndian.Uint64(response[144+index*8 : 152+index*8])
+		stageValues[index] = binary.BigEndian.Uint64(response[160+index*8 : 168+index*8])
 	}
 	return Snapshot{Group: group, Member: member, Metrics: raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1],
 		AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4],
-		ReadCompletions: values[5], Faults: values[6]}, Stages: StageMetricsSnapshot{
+		ReadCompletions: values[5], Faults: values[6], CommitAdvancements: values[7], CommittedEntries: values[8]}, Stages: StageMetricsSnapshot{
 		CheckpointApplied: stageValues[0], Checkpoints: stageValues[1], PhysicalCheckpoints: stageValues[2],
 		CheckpointBarrierSyncs: stageValues[3], WALLiveBytes: stageValues[4], WALEntries: stageValues[5], WALSyncs: stageValues[6],
 		BackupRequests: stageValues[7], BackupFaults: stageValues[8], BackupLogicalBytes: stageValues[9], BackupScanBytes: stageValues[10],
 		SnapshotTransferChunks: stageValues[11], SnapshotTransferBytes: stageValues[12], SnapshotResidentBytes: stageValues[13],
 		ReplicaActionRequests: stageValues[14], ReplicaActionCompletions: stageValues[15], ReplicaActionFaults: stageValues[16],
 		SplitControlRequests: stageValues[17], SplitControlCompletions: stageValues[18], SplitControlFaults: stageValues[19],
+		BootstrapRequests: stageValues[20], BootstrapChunks: stageValues[21], BootstrapBytes: stageValues[22],
+		BootstrapCompletions: stageValues[23], BootstrapFaults: stageValues[24], BootstrapResidentBytes: stageValues[25], BootstrapInflight: stageValues[26],
 	}}, nil
 }
 

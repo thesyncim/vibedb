@@ -42,7 +42,7 @@ func (*testConnection) TrafficClass() rafttransport.TrafficClass {
 func TestAuthenticatedMetricsServiceRoundTripAndCorruption(t *testing.T) {
 	want := raftservice.ProgressMetricsSnapshot{ProposalCommands: 1, ProposalBytes: 2,
 		AppliedEntries: 3, ReadyPersisted: 4, SnapshotsFinished: 5,
-		ReadCompletions: 6, Faults: 7}
+		ReadCompletions: 6, Faults: 7, CommitAdvancements: 8, CommittedEntries: 9}
 	identity := rafttransport.PeerIdentity{Node: rafttransport.NodeID{1}}
 	service, err := NewService(ServiceOptions{Provider: testProvider{snapshot: want},
 		Authorize:     func(peer rafttransport.PeerIdentity) bool { return peer == identity },
@@ -145,7 +145,9 @@ func TestMetricsNodeStageSnapshotIsAuthenticatedAndCanonical(t *testing.T) {
 		BackupRequests: 8, BackupFaults: 9, BackupLogicalBytes: 10, BackupScanBytes: 11,
 		SnapshotTransferChunks: 12, SnapshotTransferBytes: 13, SnapshotResidentBytes: 14,
 		ReplicaActionRequests: 15, ReplicaActionCompletions: 16, ReplicaActionFaults: 17,
-		SplitControlRequests: 18, SplitControlCompletions: 19, SplitControlFaults: 20}
+		SplitControlRequests: 18, SplitControlCompletions: 19, SplitControlFaults: 20,
+		BootstrapRequests: 21, BootstrapChunks: 22, BootstrapBytes: 23, BootstrapCompletions: 24,
+		BootstrapFaults: 25, BootstrapResidentBytes: 26, BootstrapInflight: 27}
 	encoded := appendResponse(Snapshot{Stages: stages})
 	opened, err := OpenResponse(encoded[:])
 	if err != nil || opened.Stages != stages || opened.Group != (raftmember.GroupKey{}) || opened.Member != 0 {

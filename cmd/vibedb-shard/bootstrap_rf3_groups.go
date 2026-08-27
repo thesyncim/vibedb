@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
@@ -171,6 +172,15 @@ func bootstrapPreparedRF3Groups(
 	if err != nil {
 		return err
 	}
+	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: &coldRF3MetricsProvider{groups: prepared},
+		Authorize: func(identity rafttransport.PeerIdentity) bool {
+			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		}, ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		return err
+	}
 	complete := make(chan struct{}, 1)
 	completed := make(map[raftmember.GroupKey]struct{}, len(prepared))
 	var completeMu sync.Mutex
@@ -197,6 +207,7 @@ func bootstrapPreparedRF3Groups(
 	}
 	controlMux, err := shardcontrol.New(
 		shardcontrol.Route{Discriminator: shardservice.MembershipGrantRequestDiscriminator(), Handler: membershipControl},
+		shardcontrol.Route{Discriminator: servicemetrics.RequestDiscriminator(), Handler: metricsControl},
 		shardcontrol.Route{Discriminator: snapshottransfer.BootstrapRequestDiscriminator(), Handler: bootstrapControl},
 	)
 	if err != nil {

@@ -48,8 +48,8 @@ type distributedMetricsSlot struct {
 	node          rafttransport.NodeID
 	seq           atomic.Uint64
 	refreshing    atomic.Bool
-	values        [7]atomic.Uint64
-	stages        [20]atomic.Uint64
+	values        [9]atomic.Uint64
+	stages        [27]atomic.Uint64
 	nodeAggregate bool
 	reads         atomic.Uint64
 	faults        atomic.Uint64
@@ -151,7 +151,8 @@ func (metrics *DistributedMetrics) RefreshOne(ctx context.Context, index int) er
 	}
 	values := [...]uint64{snapshot.Metrics.ProposalCommands, snapshot.Metrics.ProposalBytes,
 		snapshot.Metrics.AppliedEntries, snapshot.Metrics.ReadyPersisted,
-		snapshot.Metrics.SnapshotsFinished, snapshot.Metrics.ReadCompletions, snapshot.Metrics.Faults}
+		snapshot.Metrics.SnapshotsFinished, snapshot.Metrics.ReadCompletions, snapshot.Metrics.Faults,
+		snapshot.Metrics.CommitAdvancements, snapshot.Metrics.CommittedEntries}
 	slot.seq.Add(1)
 	for i, value := range values {
 		slot.values[i].Store(value)
@@ -162,7 +163,9 @@ func (metrics *DistributedMetrics) RefreshOne(ctx context.Context, index int) er
 		stages.BackupRequests, stages.BackupFaults, stages.BackupLogicalBytes, stages.BackupScanBytes,
 		stages.SnapshotTransferChunks, stages.SnapshotTransferBytes, stages.SnapshotResidentBytes,
 		stages.ReplicaActionRequests, stages.ReplicaActionCompletions, stages.ReplicaActionFaults,
-		stages.SplitControlRequests, stages.SplitControlCompletions, stages.SplitControlFaults}
+		stages.SplitControlRequests, stages.SplitControlCompletions, stages.SplitControlFaults,
+		stages.BootstrapRequests, stages.BootstrapChunks, stages.BootstrapBytes, stages.BootstrapCompletions,
+		stages.BootstrapFaults, stages.BootstrapResidentBytes, stages.BootstrapInflight}
 	for i, value := range stageValues {
 		slot.stages[i].Store(value)
 	}
@@ -252,7 +255,9 @@ func (metrics *DistributedMetrics) SnapshotInto(dst []DistributedMetricsSample) 
 				&aggregate.Stages.BackupRequests, &aggregate.Stages.BackupFaults, &aggregate.Stages.BackupLogicalBytes, &aggregate.Stages.BackupScanBytes,
 				&aggregate.Stages.SnapshotTransferChunks, &aggregate.Stages.SnapshotTransferBytes, &aggregate.Stages.SnapshotResidentBytes,
 				&aggregate.Stages.ReplicaActionRequests, &aggregate.Stages.ReplicaActionCompletions, &aggregate.Stages.ReplicaActionFaults,
-				&aggregate.Stages.SplitControlRequests, &aggregate.Stages.SplitControlCompletions, &aggregate.Stages.SplitControlFaults}
+				&aggregate.Stages.SplitControlRequests, &aggregate.Stages.SplitControlCompletions, &aggregate.Stages.SplitControlFaults,
+				&aggregate.Stages.BootstrapRequests, &aggregate.Stages.BootstrapChunks, &aggregate.Stages.BootstrapBytes,
+				&aggregate.Stages.BootstrapCompletions, &aggregate.Stages.BootstrapFaults, &aggregate.Stages.BootstrapResidentBytes, &aggregate.Stages.BootstrapInflight}
 			for field, value := range stageValues {
 				*stageFields[field], aggregate.Overflow = saturatingAdd(*stageFields[field], value, aggregate.Overflow)
 			}
@@ -260,7 +265,8 @@ func (metrics *DistributedMetrics) SnapshotInto(dst []DistributedMetricsSample) 
 		}
 		fields := []*uint64{&aggregate.Cut.ProposalCommands, &aggregate.Cut.ProposalBytes,
 			&aggregate.Cut.AppliedEntries, &aggregate.Cut.ReadyPersisted, &aggregate.Cut.SnapshotsFinished,
-			&aggregate.Cut.ReadCompletions, &aggregate.Cut.Faults}
+			&aggregate.Cut.ReadCompletions, &aggregate.Cut.Faults, &aggregate.Cut.CommitAdvancements,
+			&aggregate.Cut.CommittedEntries}
 		for field, value := range values {
 			*fields[field], aggregate.Overflow = saturatingAdd(*fields[field], value, aggregate.Overflow)
 		}
@@ -294,14 +300,17 @@ func (metrics *DistributedMetrics) Aggregate() (DistributedMetricsAggregate, err
 				&aggregate.Stages.BackupRequests, &aggregate.Stages.BackupFaults, &aggregate.Stages.BackupLogicalBytes, &aggregate.Stages.BackupScanBytes,
 				&aggregate.Stages.SnapshotTransferChunks, &aggregate.Stages.SnapshotTransferBytes, &aggregate.Stages.SnapshotResidentBytes,
 				&aggregate.Stages.ReplicaActionRequests, &aggregate.Stages.ReplicaActionCompletions, &aggregate.Stages.ReplicaActionFaults,
-				&aggregate.Stages.SplitControlRequests, &aggregate.Stages.SplitControlCompletions, &aggregate.Stages.SplitControlFaults}
+				&aggregate.Stages.SplitControlRequests, &aggregate.Stages.SplitControlCompletions, &aggregate.Stages.SplitControlFaults,
+				&aggregate.Stages.BootstrapRequests, &aggregate.Stages.BootstrapChunks, &aggregate.Stages.BootstrapBytes,
+				&aggregate.Stages.BootstrapCompletions, &aggregate.Stages.BootstrapFaults, &aggregate.Stages.BootstrapResidentBytes, &aggregate.Stages.BootstrapInflight}
 			for field, value := range stageValues {
 				*fields[field], aggregate.Overflow = saturatingAdd(*fields[field], value, aggregate.Overflow)
 			}
 			continue
 		}
 		fields := []*uint64{&aggregate.Cut.ProposalCommands, &aggregate.Cut.ProposalBytes, &aggregate.Cut.AppliedEntries,
-			&aggregate.Cut.ReadyPersisted, &aggregate.Cut.SnapshotsFinished, &aggregate.Cut.ReadCompletions, &aggregate.Cut.Faults}
+			&aggregate.Cut.ReadyPersisted, &aggregate.Cut.SnapshotsFinished, &aggregate.Cut.ReadCompletions, &aggregate.Cut.Faults,
+			&aggregate.Cut.CommitAdvancements, &aggregate.Cut.CommittedEntries}
 		for field, value := range values {
 			*fields[field], aggregate.Overflow = saturatingAdd(*fields[field], value, aggregate.Overflow)
 		}
@@ -309,13 +318,13 @@ func (metrics *DistributedMetrics) Aggregate() (DistributedMetricsAggregate, err
 	return aggregate, nil
 }
 
-func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSample, [7]uint64, [20]uint64, error) {
+func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSample, [9]uint64, [27]uint64, error) {
 	if metrics == nil || index < 0 || index >= len(metrics.slots) {
-		return DistributedMetricsSample{}, [7]uint64{}, [20]uint64{}, ErrDistributedMetrics
+		return DistributedMetricsSample{}, [9]uint64{}, [27]uint64{}, ErrDistributedMetrics
 	}
 	slot := &metrics.slots[index]
-	var values [7]uint64
-	var stages [20]uint64
+	var values [9]uint64
+	var stages [27]uint64
 	for range 4 {
 		before := slot.seq.Load()
 		if before&1 != 0 {
@@ -332,8 +341,8 @@ func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSamp
 		}
 		return DistributedMetricsSample{Group: slot.group, Member: slot.member, Node: slot.node,
 			NodeAggregate: slot.nodeAggregate, Reads: slot.reads.Load(), Faults: slot.faults.Load(),
-			Cut:    raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1], AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4], ReadCompletions: values[5], Faults: values[6]},
-			Stages: servicemetrics.StageMetricsSnapshot{CheckpointApplied: stages[0], Checkpoints: stages[1], PhysicalCheckpoints: stages[2], CheckpointBarrierSyncs: stages[3], WALLiveBytes: stages[4], WALEntries: stages[5], WALSyncs: stages[6], BackupRequests: stages[7], BackupFaults: stages[8], BackupLogicalBytes: stages[9], BackupScanBytes: stages[10], SnapshotTransferChunks: stages[11], SnapshotTransferBytes: stages[12], SnapshotResidentBytes: stages[13], ReplicaActionRequests: stages[14], ReplicaActionCompletions: stages[15], ReplicaActionFaults: stages[16], SplitControlRequests: stages[17], SplitControlCompletions: stages[18], SplitControlFaults: stages[19]},
+			Cut:    raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1], AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4], ReadCompletions: values[5], Faults: values[6], CommitAdvancements: values[7], CommittedEntries: values[8]},
+			Stages: servicemetrics.StageMetricsSnapshot{CheckpointApplied: stages[0], Checkpoints: stages[1], PhysicalCheckpoints: stages[2], CheckpointBarrierSyncs: stages[3], WALLiveBytes: stages[4], WALEntries: stages[5], WALSyncs: stages[6], BackupRequests: stages[7], BackupFaults: stages[8], BackupLogicalBytes: stages[9], BackupScanBytes: stages[10], SnapshotTransferChunks: stages[11], SnapshotTransferBytes: stages[12], SnapshotResidentBytes: stages[13], ReplicaActionRequests: stages[14], ReplicaActionCompletions: stages[15], ReplicaActionFaults: stages[16], SplitControlRequests: stages[17], SplitControlCompletions: stages[18], SplitControlFaults: stages[19], BootstrapRequests: stages[20], BootstrapChunks: stages[21], BootstrapBytes: stages[22], BootstrapCompletions: stages[23], BootstrapFaults: stages[24], BootstrapResidentBytes: stages[25], BootstrapInflight: stages[26]},
 		}, values, stages, nil
 	}
 	return DistributedMetricsSample{}, values, stages, ErrDistributedMetrics

@@ -202,6 +202,10 @@ func writeGatewayStageMetrics(writer *vibejson.Writer, stages servicemetrics.Sta
 		{"replica_action_completions", stages.ReplicaActionCompletions}, {"replica_action_faults", stages.ReplicaActionFaults},
 		{"split_control_requests", stages.SplitControlRequests}, {"split_control_completions", stages.SplitControlCompletions},
 		{"split_control_faults", stages.SplitControlFaults},
+		{"bootstrap_requests", stages.BootstrapRequests}, {"bootstrap_chunks", stages.BootstrapChunks},
+		{"bootstrap_bytes", stages.BootstrapBytes}, {"bootstrap_completions", stages.BootstrapCompletions},
+		{"bootstrap_faults", stages.BootstrapFaults}, {"bootstrap_resident_bytes", stages.BootstrapResidentBytes},
+		{"bootstrap_inflight", stages.BootstrapInflight},
 	} {
 		if err := writer.Key(field.name); err != nil {
 			return err
@@ -249,7 +253,8 @@ func writeGatewayMetricCut(writer *vibejson.Writer, cut raftservice.ProgressMetr
 	}{{"proposal_commands", cut.ProposalCommands}, {"proposal_bytes", cut.ProposalBytes},
 		{"applied_entries", cut.AppliedEntries}, {"ready_persisted", cut.ReadyPersisted},
 		{"snapshots_finished", cut.SnapshotsFinished}, {"read_completions", cut.ReadCompletions},
-		{"raft_faults", cut.Faults}} {
+		{"raft_faults", cut.Faults}, {"quorum_commit_advancements", cut.CommitAdvancements},
+		{"committed_entries", cut.CommittedEntries}} {
 		if err := writer.Key(field.name); err != nil {
 			return err
 		}
