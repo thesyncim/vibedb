@@ -9,7 +9,7 @@ import (
 
 const (
 	GenerationMigrationManifestBytes = 4096
-	generationMigrationHeaderBytes   = 336
+	generationMigrationHeaderBytes   = 352
 	generationMigrationTrailerAt     = GenerationMigrationManifestBytes - 8
 	generationMigrationMagic         = "SGMIGR00"
 )
@@ -23,6 +23,16 @@ const (
 	GenerationMigrationCatchingUp
 	GenerationMigrationReady
 	GenerationMigrationPublished
+)
+
+type GenerationMigrationRetirementPhase uint8
+
+const (
+	GenerationMigrationRetireNone GenerationMigrationRetirementPhase = iota
+	GenerationMigrationRetirePrimary
+	GenerationMigrationRetireExact
+	GenerationMigrationRetireCatalog
+	GenerationMigrationRetireDone
 )
 
 // GenerationMigrationManifest is one bounded, restartable migration cut.
@@ -45,6 +55,8 @@ type GenerationMigrationManifest struct {
 	SourcePrimaryRoot, SourceExactIndexRoot, SourceCatalogHead PageRef
 	TargetPrimaryRoot, TargetExactIndexRoot, TargetCatalogHead PageRef
 	SourceCatalogBytes, SourceIndexCount                       uint32
+	ManifestSequence, RetirementOrdinal                        uint64
+	RetirementPhase                                            GenerationMigrationRetirementPhase
 	Cursor                                                     []byte
 }
 
@@ -74,6 +86,8 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 		!validGenerationMigrationRoot(m.TargetCatalogHead, PageCatalogSegment, false) ||
 		(m.SourceCatalogBytes == 0) != (m.SourceCatalogHead == (PageRef{})) ||
 		(m.SourceIndexCount == 0) != (m.SourceExactIndexRoot == (PageRef{})) ||
+		m.RetirementPhase > GenerationMigrationRetireDone ||
+		(m.RetirementPhase != GenerationMigrationRetireNone && m.Phase != GenerationMigrationPublished) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration {
 		return nil, fmt.Errorf("%w: fields", ErrInvalidWrite)
@@ -104,6 +118,9 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 	binary.LittleEndian.PutUint32(image[320:324], uint32(len(m.Cursor)))
 	binary.LittleEndian.PutUint32(image[324:328], m.SourceCatalogBytes)
 	binary.LittleEndian.PutUint32(image[328:332], m.SourceIndexCount)
+	image[332] = byte(m.RetirementPhase)
+	binary.LittleEndian.PutUint64(image[336:344], m.ManifestSequence)
+	binary.LittleEndian.PutUint64(image[344:352], m.RetirementOrdinal)
 	copy(image[generationMigrationHeaderBytes:], m.Cursor)
 	checksum := PageChecksum(image[:generationMigrationTrailerAt])
 	binary.LittleEndian.PutUint32(image[generationMigrationTrailerAt:], checksum)
@@ -144,6 +161,9 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.TargetCatalogHead = decodePageRef(src[288:320])
 	m.SourceCatalogBytes = binary.LittleEndian.Uint32(src[324:328])
 	m.SourceIndexCount = binary.LittleEndian.Uint32(src[328:332])
+	m.RetirementPhase = GenerationMigrationRetirementPhase(src[332])
+	m.ManifestSequence = binary.LittleEndian.Uint64(src[336:344])
+	m.RetirementOrdinal = binary.LittleEndian.Uint64(src[344:352])
 	cursorBytes := int(binary.LittleEndian.Uint32(src[320:324]))
 	if m.StoreID == ([16]byte{}) || m.MigrationID == ([16]byte{}) ||
 		m.Phase < GenerationMigrationCopying || m.Phase > GenerationMigrationPublished ||
@@ -160,9 +180,11 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 		!validGenerationMigrationRoot(m.TargetCatalogHead, PageCatalogSegment, false) ||
 		(m.SourceCatalogBytes == 0) != (m.SourceCatalogHead == (PageRef{})) ||
 		(m.SourceIndexCount == 0) != (m.SourceExactIndexRoot == (PageRef{})) ||
+		m.RetirementPhase > GenerationMigrationRetireDone ||
+		(m.RetirementPhase != GenerationMigrationRetireNone && m.Phase != GenerationMigrationPublished) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration ||
-		!allZero(src[332:336]) ||
+		!allZero(src[333:336]) ||
 		cursorBytes > generationMigrationTrailerAt-generationMigrationHeaderBytes ||
 		!allZero(src[generationMigrationHeaderBytes+cursorBytes:generationMigrationTrailerAt]) {
 		return GenerationMigrationManifest{}, ErrGenerationMigrationManifestCorrupt
@@ -190,6 +212,9 @@ func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManife
 		next.SourceCatalogHead != previous.SourceCatalogHead ||
 		next.SourceCatalogBytes != previous.SourceCatalogBytes ||
 		next.SourceIndexCount != previous.SourceIndexCount ||
+		(previous.ManifestSequence != 0 && next.ManifestSequence <= previous.ManifestSequence) ||
+		next.RetirementPhase < previous.RetirementPhase ||
+		(next.RetirementPhase == previous.RetirementPhase && next.RetirementOrdinal < previous.RetirementOrdinal) ||
 		previous.TargetPrimaryRoot != (PageRef{}) && next.TargetPrimaryRoot != previous.TargetPrimaryRoot ||
 		previous.TargetExactIndexRoot != (PageRef{}) && next.TargetExactIndexRoot != previous.TargetExactIndexRoot ||
 		previous.TargetCatalogHead != (PageRef{}) && next.TargetCatalogHead != previous.TargetCatalogHead ||
