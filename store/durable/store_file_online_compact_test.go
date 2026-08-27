@@ -55,6 +55,12 @@ func TestOnlineCompactionManifestAndChainedExtentSurviveReopen(t *testing.T) {
 		reopenedManifest.TargetFileEnd != linked.TargetFileEnd {
 		t.Fatalf("reopened manifest=%+v err=%v", reopenedManifest, err)
 	}
+	if _, err := reopened.CompactOnline(); err != nil {
+		t.Fatalf("resume compaction after allocation crash cut: %v", err)
+	}
+	if resumed := reopened.state.Load(); resumed.root.MigrationManifestOffset != 0 {
+		t.Fatalf("resumed manifest locator=%d", resumed.root.MigrationManifestOffset)
+	}
 }
 
 func TestCompactOnlineRebuildsExactIndexesAndResidentEpoch(t *testing.T) {

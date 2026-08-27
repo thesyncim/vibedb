@@ -38,6 +38,47 @@ func AppendGenerationMigrationChainRetirements(
 	return dst, nil
 }
 
+// AppendGenerationMigrationStagingRetirements collects complete abandoned
+// reservations. It is valid only before target-root publication, when every
+// byte in each extent (including its chain link) remains unreachable.
+func AppendGenerationMigrationStagingRetirements(
+	dst []FreeExtent, file *os.File, manifest GenerationMigrationManifest,
+	scratch []byte, retiredGeneration uint64,
+) ([]FreeExtent, error) {
+	if file == nil || retiredGeneration == 0 ||
+		manifest.StagingChainTail != (PageRef{}) && len(scratch) < int(manifest.StagingChainTail.Length) {
+		return dst, fmt.Errorf("%w: abandoned migration retirement", ErrInvalidWrite)
+	}
+	for chain := manifest.StagingChainTail; chain != (PageRef{}); {
+		page := scratch[:chain.Length]
+		if _, err := file.ReadAt(page, int64(chain.Offset)); err != nil {
+			return dst, err
+		}
+		view, err := OpenGenerationMigrationStagingChainPage(
+			page, chain, manifest.StoreID, manifest.MigrationID, manifest.TargetGeneration,
+		)
+		if err != nil {
+			return dst, err
+		}
+		it := view.Iterator()
+		for {
+			extent, ok := it.Next()
+			if !ok {
+				break
+			}
+			if len(dst) == cap(dst) {
+				return dst, ErrRetiredExtentCapacity
+			}
+			dst = append(dst, FreeExtent{
+				Offset: extent.Offset, Length: extent.Length,
+				RetiredGeneration: retiredGeneration,
+			})
+		}
+		chain = view.Previous()
+	}
+	return dst, nil
+}
+
 // VisitGenerationMigrationScratch walks authenticated staging links and emits
 // only external-sort and padding pages. Target graph/index/catalog pages share
 // the extents but remain reachable after installation and are never emitted.

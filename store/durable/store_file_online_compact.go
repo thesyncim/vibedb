@@ -13,6 +13,7 @@ type OnlineCompactionReport struct {
 	Documents, Attempts                     uint64
 	SourceFileEnd, InstalledFileEnd         uint64
 	StagingAllocatedBytes, StagingUsedBytes uint64
+	StagingExtentCount, DeviceBytes         uint64
 }
 
 type onlineCompactionBuild struct {
@@ -222,6 +223,13 @@ func (c *Collection) growOnlineMigrationStaging(
 	if c.closed {
 		return reservation, storeio.GenerationMigrationManifest{}, ErrClosed
 	}
+	// Foreground packed publications can accumulate between staging grows.
+	// Materialize them while the observer is still attached before the allocator
+	// root advances the physical generation; otherwise a later grow could leap
+	// over an unmaterialized logical cut.
+	if err := c.flushPendingForStructural(); err != nil {
+		return reservation, storeio.GenerationMigrationManifest{}, err
+	}
 	state := c.state.Load()
 	if state == nil {
 		return reservation, storeio.GenerationMigrationManifest{}, storeio.ErrInvalidWrite
@@ -251,6 +259,33 @@ func (c *Collection) growOnlineMigrationStaging(
 // collection.
 func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	var total OnlineCompactionReport
+	if state := c.state.Load(); state != nil && state.root.MigrationManifestOffset != 0 {
+		manifestStore, err := storeio.OpenGenerationMigrationManifestStore(
+			c.file, int64(state.root.MigrationManifestOffset),
+		)
+		if err != nil {
+			return total, err
+		}
+		manifest, err := manifestStore.Load()
+		if err != nil {
+			return total, err
+		}
+		if manifest.Phase == storeio.GenerationMigrationPublished {
+			total.SourceFileEnd = manifest.SourceFileEnd
+			total.InstalledFileEnd = state.fileEnd
+			total.StagingAllocatedBytes = manifest.StagingAllocatedBytes
+			total.StagingUsedBytes = manifest.StagingUsedBytes
+			total.StagingExtentCount = manifest.StagingExtentCount
+			return total, c.retirePublishedOnlineMigration()
+		}
+		// Copying/Ready without a published root is a crash-abandoned generation.
+		// Its authenticated extent chain makes whole-reservation cleanup exact;
+		// begin a fresh source cut after clearing it.
+		if err := c.abandonOnlineMigration(); err != nil {
+			return total, err
+		}
+	}
+	deviceBefore := c.Stats().DeviceBytes
 	for attempt := uint64(1); attempt <= 4; attempt++ {
 		report, err := c.compactOnlineAttempt()
 		if total.SourceFileEnd == 0 {
@@ -265,13 +300,54 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 			if cleanupErr := c.retirePublishedOnlineMigration(); cleanupErr != nil {
 				return report, cleanupErr
 			}
+			report.DeviceBytes = report.StagingAllocatedBytes + c.Stats().DeviceBytes - deviceBefore
 			return report, nil
 		}
-		if !errors.Is(err, storeio.ErrGenerationMigrationStarved) {
+		if !errors.Is(err, storeio.ErrGenerationMigrationStarved) &&
+			!errors.Is(err, storeio.ErrPublicationConflict) {
 			return report, err
+		}
+		if abandonErr := c.abandonOnlineMigration(); abandonErr != nil {
+			return report, errors.Join(err, abandonErr)
 		}
 	}
 	return total, storeio.ErrGenerationMigrationStarved
+}
+
+func (c *Collection) abandonOnlineMigration() error {
+	state := c.state.Load()
+	if state == nil || state.root.MigrationManifestOffset == 0 {
+		return nil
+	}
+	manifestStore, err := storeio.OpenGenerationMigrationManifestStore(
+		c.file, int64(state.root.MigrationManifestOffset),
+	)
+	if err != nil {
+		return err
+	}
+	manifest, err := manifestStore.Load()
+	if err != nil {
+		return err
+	}
+	if manifest.Phase == storeio.GenerationMigrationPublished {
+		return storeio.ErrPublicationConflict
+	}
+	retired := make([]storeio.FreeExtent, 0, min(cap(c.retireScratch), int(manifest.StagingExtentCount)+1))
+	retired, err = storeio.AppendGenerationMigrationStagingRetirements(
+		retired, c.file, manifest, make([]byte, c.options.PageSize), state.root.Generation,
+	)
+	if err != nil {
+		return err
+	}
+	if len(retired) == cap(retired) {
+		return storeio.ErrRetiredExtentCapacity
+	}
+	retired = append(retired, storeio.FreeExtent{
+		Offset:            state.root.MigrationManifestOffset,
+		Length:            uint64(2 * storeio.GenerationMigrationManifestBytes),
+		RetiredGeneration: state.root.Generation,
+	})
+	return c.retireOnlineMigrationMetadata(retired)
 }
 
 func (c *Collection) retirePublishedOnlineMigration() error {
@@ -349,6 +425,9 @@ func (c *Collection) retireOnlineMigrationExtentsAndMaybeClear(
 	defer c.writer.Unlock()
 	if c.closed {
 		return ErrClosed
+	}
+	if err := c.flushPendingForStructural(); err != nil {
+		return err
 	}
 	state := c.state.Load()
 	if state == nil || len(extents) == 0 || len(extents) > cap(c.retireScratch) ||
@@ -482,6 +561,18 @@ func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 		if len(descriptor) == 0 {
 			return dirty.MarkTopology(generation)
 		}
+		view, err := storeio.OpenPublicationDescriptor(descriptor)
+		if err != nil {
+			return err
+		}
+		if _, ok, err := view.Next(); err != nil {
+			return err
+		} else if !ok {
+			// Empty descriptors are reserved for topology/allocator publications.
+			// Migration-owned allocator cuts detach this observer explicitly, so
+			// any empty descriptor observed here must conservatively invalidate.
+			return dirty.MarkTopology(generation)
+		}
 		return keyObserver(generation, descriptor)
 	}
 	c.onlineMigrationDirty, c.onlineMigrationObserver = dirty, observer
@@ -506,6 +597,14 @@ func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 
 	c.writer.Lock()
 	defer c.writer.Unlock()
+	// A packed/overlay mutation may have advanced the logical root without a
+	// physical committer publication while the scan ran. Materialize it while
+	// the observer is still attached so the attempt is invalidated, and so a
+	// later clean attempt's conditional witness is the physical root generation.
+	if err := c.flushPendingForStructural(); err != nil {
+		return report, fmt.Errorf("online compaction final structural flush state=%d published=%d: %w",
+			c.state.Load().root.Generation, c.committer.PublishedGeneration(), err)
+	}
 	if err := c.committer.SetPublicationObserver(nil); err != nil {
 		return report, err
 	}
@@ -557,7 +656,7 @@ func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 	ready.TargetExactIndexRoot = build.exact
 	ready.TargetCatalogHead = build.catalog.Head
 	if err := manifestStore.Advance(ready); err != nil {
-		return report, err
+		return report, fmt.Errorf("online compaction ready manifest: %w", err)
 	}
 
 	nextState := &fileStoreState{root: target, fileEnd: current.fileEnd, freeHead: current.freeHead}
@@ -569,7 +668,8 @@ func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 	if err := storeio.PublishStagedStateConditional(tx, current.root, target, c.inlineFree, descriptor); err != nil {
 		c.endReaderFence()
 		c.snapshotGate.Unlock()
-		return report, err
+		return report, fmt.Errorf("online compaction conditional install expected=%d published=%d: %w",
+			current.root.Generation, c.committer.PublishedGeneration(), err)
 	}
 	abort = false
 	build.router.AdvanceGeneration(generation)
@@ -601,6 +701,7 @@ func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 	report.InstalledFileEnd = nextState.fileEnd
 	report.StagingAllocatedBytes = published.StagingAllocatedBytes
 	report.StagingUsedBytes = published.StagingUsedBytes
+	report.StagingExtentCount = published.StagingExtentCount
 	return report, err
 }
 
