@@ -18,8 +18,9 @@ import (
 func TestRetainedPrunePendingRowsRoundTripExactOldDocuments(t *testing.T) {
 	keys := [][]byte{[]byte("a"), []byte("z")}
 	documents := [][]byte{[]byte(`{"id":"a","v":1}`), []byte(`{"id":"z","v":2}`)}
-	raw := appendPendingPruneRows(nil, keys, documents)
+	raw := appendPendingPruneRows(nil, 1, keys, documents)
 	pruner := &RetainedPruner{cursor: RetainedPruneCursor{
+		relation: 1, relationCount: 1,
 		pendingCount: 2, pendingKeyBytes: 2, pendingKeys: raw,
 	}}
 	if !validPendingPruneKeys(&pruner.cursor) {

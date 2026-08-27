@@ -34,8 +34,10 @@ const (
 )
 
 type RetainedPruneCursor struct {
-	phase    RetainedPrunePhase
-	retained uint8
+	phase         RetainedPrunePhase
+	retained      uint8
+	relation      replication.RelationID
+	relationCount uint16
 
 	applied            uint64
 	term               uint64
@@ -138,6 +140,8 @@ func AppendRetainedPruneCursorWithWorkspace(
 	binary.LittleEndian.PutUint16(frame[10:12], retainedPruneCursorHeader)
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	frame[16], frame[17] = byte(cursor.phase), cursor.retained
+	binary.LittleEndian.PutUint16(frame[18:20], uint16(cursor.relation))
+	binary.LittleEndian.PutUint16(frame[20:22], cursor.relationCount)
 	values := [...]uint64{
 		cursor.applied, cursor.term, cursor.ownershipEpoch, cursor.routingVersion,
 		cursor.routeGeneration, cursor.scannedRows, cursor.scannedBytes,
@@ -178,16 +182,18 @@ func OpenRetainedPruneCursor(raw []byte) (*RetainedPruneCursor, error) {
 		binary.LittleEndian.Uint16(raw[8:10]) != retainedPruneCursorFormat ||
 		binary.LittleEndian.Uint16(raw[10:12]) != retainedPruneCursorHeader ||
 		binary.LittleEndian.Uint32(raw[12:16]) != uint32(len(raw)) ||
-		!allChildArtifactZero(raw[18:24]) {
+		!allChildArtifactZero(raw[22:24]) {
 		return nil, ErrRetainedPrune
 	}
-	scanBytes := int(binary.LittleEndian.Uint32(raw[464:468]))
-	resumeBytes := int(binary.LittleEndian.Uint32(raw[468:472]))
-	pendingBytes := int(binary.LittleEndian.Uint32(raw[472:476]))
-	if scanBytes > replication.MaxMutationKeyBytes ||
-		resumeBytes > replication.MaxMutationKeyBytes ||
-		pendingBytes > replication.MaxCommandBytes ||
-		retainedPruneCursorHeader+scanBytes+resumeBytes+pendingBytes+sha256.Size != len(raw) {
+	scanSize := binary.LittleEndian.Uint32(raw[464:468])
+	resumeSize := binary.LittleEndian.Uint32(raw[468:472])
+	pendingSize := binary.LittleEndian.Uint32(raw[472:476])
+	if scanSize > replication.MaxMutationKeyBytes || resumeSize > replication.MaxMutationKeyBytes ||
+		pendingSize > replication.MaxCommandBytes {
+		return nil, ErrRetainedPrune
+	}
+	scanBytes, resumeBytes, pendingBytes := int(scanSize), int(resumeSize), int(pendingSize)
+	if retainedPruneCursorHeader+scanBytes+resumeBytes+pendingBytes+sha256.Size != len(raw) {
 		return nil, ErrRetainedPrune
 	}
 	var workspace RetainedPruneCursorWorkspace
@@ -201,7 +207,9 @@ func OpenRetainedPruneCursor(raw []byte) (*RetainedPruneCursor, error) {
 	}
 	cursor := &RetainedPruneCursor{
 		phase: RetainedPrunePhase(raw[16]), retained: raw[17],
-		applied: values[0], term: values[1], ownershipEpoch: values[2],
+		relation:      replication.RelationID(binary.LittleEndian.Uint16(raw[18:20])),
+		relationCount: binary.LittleEndian.Uint16(raw[20:22]),
+		applied:       values[0], term: values[1], ownershipEpoch: values[2],
 		routingVersion: values[3], routeGeneration: values[4],
 		scannedRows: values[5], scannedBytes: values[6],
 		deletedRows: values[7], deletedKeyBytes: values[8],
@@ -244,6 +252,8 @@ func retainedPruneCursorDigestInto(
 
 func validRetainedPruneCursor(cursor *RetainedPruneCursor) bool {
 	if cursor == nil || cursor.retained >= 3 || cursor.applied == 0 ||
+		cursor.relation == 0 || cursor.relationCount == 0 ||
+		cursor.relationCount > replication.MaxRelationsPerBundle || uint16(cursor.relation) > cursor.relationCount ||
 		cursor.applied == math.MaxUint64 || cursor.term == 0 || cursor.term == math.MaxUint64 ||
 		cursor.ownershipEpoch == 0 || cursor.routingVersion == 0 ||
 		cursor.routeGeneration == 0 || cursor.plan == ([sha256.Size]byte{}) ||
@@ -280,7 +290,7 @@ func validRetainedPruneCursor(cursor *RetainedPruneCursor) bool {
 			len(cursor.pendingKeys) == 0 && cursor.snapshotGeneration != 0 &&
 			cursor.retainedDigest != ([sha256.Size]byte{})
 	case RetainedPruneComplete:
-		return cursor.pendingCount == 0 && cursor.pendingKeyBytes == 0 &&
+		return uint16(cursor.relation) == cursor.relationCount && cursor.pendingCount == 0 && cursor.pendingKeyBytes == 0 &&
 			cursor.pendingApplied == 0 && cursor.pending == ([sha256.Size]byte{}) &&
 			cursor.pendingEntry == ([sha256.Size]byte{}) && len(cursor.resumeAfter) == 0 &&
 			len(cursor.pendingKeys) == 0 &&
@@ -291,29 +301,41 @@ func validRetainedPruneCursor(cursor *RetainedPruneCursor) bool {
 }
 
 func validPendingPruneKeys(cursor *RetainedPruneCursor) bool {
+	if cursor == nil || cursor.relation == 0 || cursor.pendingCount == 0 ||
+		cursor.pendingCount > replication.MaxMutations {
+		return false
+	}
 	raw := cursor.pendingKeys
 	var count, keyBytes uint64
+	var previous []byte
 	for len(raw) != 0 {
-		if len(raw) < 4 {
+		if count >= cursor.pendingCount || len(raw) < 6 ||
+			replication.RelationID(binary.LittleEndian.Uint16(raw[:2])) != cursor.relation {
 			return false
 		}
-		size := int(binary.LittleEndian.Uint32(raw[:4]))
+		raw = raw[2:]
+		keySize := binary.LittleEndian.Uint32(raw[:4])
 		raw = raw[4:]
-		if size == 0 || size > len(raw) {
+		if keySize == 0 || keySize > replication.MaxMutationKeyBytes || uint64(keySize) > uint64(len(raw)) {
 			return false
 		}
+		size := int(keySize)
+		if previous != nil && bytes.Compare(previous, raw[:size]) >= 0 {
+			return false
+		}
+		previous = raw[:size]
 		count++
 		keyBytes += uint64(size)
 		raw = raw[size:]
 		if len(raw) < 4 {
 			return false
 		}
-		documentSize := int(binary.LittleEndian.Uint32(raw[:4]))
+		documentSize := binary.LittleEndian.Uint32(raw[:4])
 		raw = raw[4:]
-		if documentSize == 0 || documentSize > len(raw) {
+		if documentSize == 0 || documentSize > replication.MaxMutationValueBytes || uint64(documentSize) > uint64(len(raw)) {
 			return false
 		}
-		raw = raw[documentSize:]
+		raw = raw[int(documentSize):]
 	}
 	return count == cursor.pendingCount && keyBytes == cursor.pendingKeyBytes
 }

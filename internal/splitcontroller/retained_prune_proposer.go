@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"slices"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -26,28 +25,19 @@ type RF3RetainedPruneProposerOptions struct {
 	Operation OperationID
 	Session   *gateway.NativeSession
 	Relation  replication.RelationID
-	// GlobalIndexes is the schema-generation-bound set of global-index
-	// relations physically colocated in this source RF3 group. Independently
-	// placed indexes are intentionally retained: their base locator remains
-	// valid after a split.
-	GlobalIndexes []RF3RetainedPruneGlobalIndex
+	// Relations is the exact dense set after base relation 1. Each prune
+	// batch carries its own relation and exact stored values; index deletes
+	// are never reconstructed from base-table documents.
+	Relations     []replication.RelationID
 	MaxKeys       int
 	MaxKeyBytes   int
 	Certificate   rangesplit.CutoverCertificate
 	RetainedRange distribution.KeyRange
 }
 
-type RF3RetainedPruneGlobalIndex struct {
-	Relation    replication.RelationID
-	Program     gateway.GlobalIndexProgram
-	BaseTarget  distribution.Target
-	IndexTarget distribution.Target
-}
-
 // NewRF3RetainedPruneProposerForPlan binds the destructive proposal to the
-// immutable split geometry. Plans with global indexes fail closed until every
-// index relation has a schema-authenticated extraction program; deleting only
-// base rows would strand globally indexed entries.
+// immutable split geometry. Plans with global indexes remain closed until the
+// complete relation-aware capture and image-certificate path is installed.
 func NewRF3RetainedPruneProposerForPlan(
 	plan *Plan,
 	observed Observation,
@@ -73,18 +63,17 @@ func NewRF3RetainedPruneProposerForPlan(
 type RF3RetainedPruneProposer struct {
 	mu sync.Mutex
 
-	operation  OperationID
-	session    *gateway.NativeSession
-	relation   replication.RelationID
-	clientID   replication.ID128
-	tenant     []byte
-	maxKeys    int
-	maxBytes   int
-	mutations  []gateway.NativeMutation
-	arena      []byte
-	indexes    []RF3RetainedPruneGlobalIndex
-	workspaces []gateway.GlobalIndexWorkspace
-	proof      replication.RetainedPruneProof
+	operation     OperationID
+	session       *gateway.NativeSession
+	relation      replication.RelationID
+	clientID      replication.ID128
+	tenant        []byte
+	maxKeys       int
+	maxBytes      int
+	mutations     []gateway.NativeMutation
+	arena         []byte
+	relationCount uint16
+	proof         replication.RetainedPruneProof
 }
 
 func NewRF3RetainedPruneProposer(
@@ -110,21 +99,15 @@ func NewRF3RetainedPruneProposer(
 		OwnershipEpoch: coordinates.OwnershipEpoch, RoutingVersion: coordinates.RoutingVersion,
 		RouteGeneration: coordinates.RouteGeneration, RetainedRange: options.RetainedRange,
 	}
-	relations := make([]replication.RelationID, len(options.GlobalIndexes))
-	for index := range options.GlobalIndexes {
-		relations[index] = options.GlobalIndexes[index].Relation
-	}
 	if options.Operation == (OperationID{}) || options.Session == nil ||
-		options.Relation == 0 || options.Relation > replication.MaxRelationID ||
+		options.Relation != 1 ||
 		options.MaxKeys <= 0 || options.MaxKeys > replication.MaxMutations ||
 		options.MaxKeyBytes <= 0 || options.MaxKeyBytes > replication.MaxCommandBytes ||
 		clientID == (replication.ID128{}) || !status.Active || !proof.Valid() ||
-		len(options.GlobalIndexes) >= replication.MaxRelationBatches ||
-		options.MaxKeys > replication.MaxMutations/(1+len(options.GlobalIndexes)) ||
-		!validRetainedPruneIndexes(options.Relation, options.GlobalIndexes) ||
-		!gateway.NativeSessionSupportsExactRelations(options.Session, options.Relation, relations) ||
+		!validRetainedPruneRelations(options.Relations) ||
+		!gateway.NativeSessionSupportsExactRelations(options.Session, options.Relation, options.Relations) ||
 		!gateway.NativeSessionSupportsMutationBound(
-			options.Session, options.Relation, options.MaxKeys*(1+len(options.GlobalIndexes)), options.MaxKeyBytes,
+			options.Session, options.Relation, options.MaxKeys, options.MaxKeyBytes,
 		) {
 		return nil, ErrInvalidPlan
 	}
@@ -132,24 +115,21 @@ func NewRF3RetainedPruneProposer(
 		operation: options.Operation, session: options.Session, relation: options.Relation,
 		clientID: clientID, tenant: RetainedPruneTenant(options.Operation),
 		maxKeys: options.MaxKeys, maxBytes: options.MaxKeyBytes,
-		mutations:  make([]gateway.NativeMutation, 0, options.MaxKeys*(1+len(options.GlobalIndexes))),
-		arena:      make([]byte, 0, options.MaxKeyBytes),
-		indexes:    append([]RF3RetainedPruneGlobalIndex(nil), options.GlobalIndexes...),
-		workspaces: make([]gateway.GlobalIndexWorkspace, len(options.GlobalIndexes)),
-		proof:      proof,
+		mutations:     make([]gateway.NativeMutation, 0, options.MaxKeys),
+		arena:         make([]byte, 0, options.MaxKeyBytes),
+		relationCount: uint16(1 + len(options.Relations)),
+		proof:         proof,
 	}, nil
 }
 
-func validRetainedPruneIndexes(base replication.RelationID, indexes []RF3RetainedPruneGlobalIndex) bool {
-	prior := base
-	for index := range indexes {
-		binding := &indexes[index]
-		if binding.Relation == 0 || binding.Relation > replication.MaxRelationID ||
-			binding.Relation <= prior || binding.BaseTarget.Shard == "" ||
-			binding.IndexTarget.Shard == "" {
+func validRetainedPruneRelations(relations []replication.RelationID) bool {
+	if len(relations) >= replication.MaxRelationsPerBundle {
+		return false
+	}
+	for index, relation := range relations {
+		if relation != replication.RelationID(index+2) {
 			return false
 		}
-		prior = binding.Relation
 	}
 	return true
 }
@@ -178,6 +158,7 @@ func (p *RF3RetainedPruneProposer) ProposeRetainedPrune(
 	batch rangesplit.RetainedPruneBatch,
 ) error {
 	if p == nil || ctx == nil || operation != p.operation ||
+		batch.Relation() == 0 || uint16(batch.Relation()) > p.relationCount ||
 		batch.Digest == ([sha256.Size]byte{}) || batch.Count == 0 ||
 		batch.Count > uint64(p.maxKeys) || batch.KeyBytes == 0 ||
 		batch.KeyBytes > uint64(p.maxBytes) || batch.DocumentBytes == 0 ||
@@ -194,11 +175,15 @@ func (p *RF3RetainedPruneProposer) ProposeRetainedPrune(
 	p.arena = p.arena[:0]
 	iterator := batch.Iterator()
 	var prior []byte
+	var documentBytes uint64
 	for iterator.Next() {
 		key := iterator.Key()
 		document := iterator.Document()
 		if len(key) == 0 || len(key) > replication.MaxMutationKeyBytes ||
-			len(document) == 0 || len(key) > p.maxBytes-len(p.arena) ||
+			len(p.mutations) >= p.maxKeys || uint64(len(p.mutations)) >= batch.Count ||
+			len(document) == 0 || len(document) > replication.MaxMutationValueBytes ||
+			documentBytes > batch.DocumentBytes || uint64(len(document)) > batch.DocumentBytes-documentBytes ||
+			iterator.Relation() != batch.Relation() || len(key) > p.maxBytes-len(p.arena) ||
 			(prior != nil && bytes.Compare(prior, key) >= 0) {
 			p.reset()
 			return rangesplit.ErrRetainedPrune
@@ -207,50 +192,16 @@ func (p *RF3RetainedPruneProposer) ProposeRetainedPrune(
 		p.arena = append(p.arena, key...)
 		owned := p.arena[start:len(p.arena):len(p.arena)]
 		p.mutations = append(p.mutations, gateway.NativeMutation{
-			Relation: p.relation, Kind: replication.MutationDeleteDigestEqual, Key: owned,
+			Relation: batch.Relation(), Kind: replication.MutationDeleteDigestEqual, Key: owned,
 			ExpectedValueLength: uint64(len(document)), ExpectedValueDigest: replication.Digest(sha256.Sum256(document)),
 		})
-		for index := range p.indexes {
-			binding := &p.indexes[index]
-			route, routeErr := binding.Program.RouteDocument(document, &p.workspaces[index])
-			if routeErr != nil || !bytes.Equal(route.BasePrimaryKey, key) ||
-				!sameRetainedPruneTarget(route.BaseTarget, binding.BaseTarget) ||
-				!sameRetainedPruneTarget(route.IndexTarget, binding.IndexTarget) ||
-				len(route.EntryKey) == 0 || len(route.LocatorValue) == 0 ||
-				len(route.EntryKey) > p.maxBytes-len(p.arena) {
-				p.reset()
-				return rangesplit.ErrRetainedPrune
-			}
-			indexStart := len(p.arena)
-			p.arena = append(p.arena, route.EntryKey...)
-			indexKey := p.arena[indexStart:len(p.arena):len(p.arena)]
-			p.mutations = append(p.mutations, gateway.NativeMutation{
-				Relation: binding.Relation, Kind: replication.MutationDeleteDigestEqual, Key: indexKey,
-				ExpectedValueLength: uint64(len(route.LocatorValue)),
-				ExpectedValueDigest: replication.Digest(sha256.Sum256(route.LocatorValue)),
-			})
-		}
+		documentBytes += uint64(len(document))
 		prior = owned
 	}
-	if uint64(len(p.mutations)) != batch.Count*uint64(1+len(p.indexes)) {
+	if uint64(len(p.mutations)) != batch.Count || uint64(len(p.arena)) != batch.KeyBytes ||
+		documentBytes != batch.DocumentBytes {
 		p.reset()
 		return rangesplit.ErrRetainedPrune
-	}
-	slices.SortFunc(p.mutations, func(left, right gateway.NativeMutation) int {
-		if left.Relation < right.Relation {
-			return -1
-		}
-		if left.Relation > right.Relation {
-			return 1
-		}
-		return bytes.Compare(left.Key, right.Key)
-	})
-	for index := 1; index < len(p.mutations); index++ {
-		if p.mutations[index-1].Relation == p.mutations[index].Relation &&
-			bytes.Equal(p.mutations[index-1].Key, p.mutations[index].Key) {
-			p.reset()
-			return rangesplit.ErrRetainedPrune
-		}
 	}
 
 	var result gateway.NativeResult
@@ -259,7 +210,7 @@ func (p *RF3RetainedPruneProposer) ProposeRetainedPrune(
 	proof.BatchDigest = replication.Digest(batch.Digest)
 	if p.session.Status().Pending {
 		if !retainedPrunePendingMatches(
-			p.session.PendingCommand(), fence, p.clientID, p.relation,
+			p.session.PendingCommand(), fence, p.clientID, batch.Relation(),
 			proof, p.mutations,
 		) {
 			p.reset()
@@ -278,12 +229,6 @@ func (p *RF3RetainedPruneProposer) ProposeRetainedPrune(
 		return rangesplit.ErrRetainedPrune
 	}
 	return nil
-}
-
-func sameRetainedPruneTarget(left, right distribution.Target) bool {
-	return left.Shard == right.Shard &&
-		left.AllocationGeneration == right.AllocationGeneration &&
-		left.OwnershipEpoch == right.OwnershipEpoch
 }
 
 func (p *RF3RetainedPruneProposer) reset() {
@@ -336,7 +281,7 @@ func retainedPrunePendingMatches(
 		firstBatch = false
 		items := batch.Mutations()
 		for items.Next() {
-			if mutationIndex >= len(mutations) {
+			if mutationIndex >= len(mutations) || mutations[mutationIndex].Relation != batch.Relation {
 				return false
 			}
 			got, want := items.Mutation(), mutations[mutationIndex]
