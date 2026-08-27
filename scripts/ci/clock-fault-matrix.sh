@@ -18,10 +18,12 @@ run_gate() {
   timeout="$4"
   output="${evidence_dir}/${gate}.jsonl"
   go test -json -count=1 -timeout="${timeout}" -run="^${test_name}$" "${package}" | tee "${output}"
+  test "$(stat -c %s "${output}")" -le 67108864
   test "$(jq -r --arg test_name "${test_name}" \
     'select(.Action == "pass" and .Test == $test_name) | .Test' "${output}" | wc -l)" -eq 1
   if jq -e --arg test_name "${test_name}" \
-    'select(.Action == "skip" and .Test == $test_name)' "${output}" >/dev/null; then
+    'select(.Action == "skip" and (.Test == $test_name or (.Test | startswith($test_name + "/"))))' \
+    "${output}" >/dev/null; then
     echo "clock-fault gate skipped: ${test_name}" >&2
     exit 1
   fi
@@ -57,4 +59,3 @@ contract	global_timestamp	not_offered
 contract	live_process_utc_step	not_injected
 EOF
 test "$(stat -c %s "${evidence_dir}/matrix.tsv")" -le 65536
-
