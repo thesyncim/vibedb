@@ -1992,10 +1992,11 @@ func (m *Machine) planMutations(
 					case !mutation.delete:
 						validation = MutationValidationInvalid
 					case relation.kind == RelationGlobalIndex:
-						// The base row's sealed-away ownership is the topology
-						// authority for its exact colocated index cleanup. Index
-						// keyspace points are independent of the base point.
-						validation = MutationValidationAccept
+						// Global rows move by their own authenticated key
+						// profile, independently of the base row's placement.
+						validation = validateGlobalRetainedPrune(
+							relation.globalIndex, mutation.key, m.state.Binding.OwnedRange,
+						)
 					case !found, ownership == MutationValidationWrongShard:
 						validation = MutationValidationAccept
 					case ownership == MutationValidationAccept:

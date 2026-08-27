@@ -136,7 +136,9 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 	}
 	insideKey, outsideKey := []byte{0x20}, []byte{0x90}
 	insideValue, outsideValue := []byte(`{"email":"in","n":1}`), []byte(`{"email":"out","n":2}`)
-	globalKey, locator := []byte{0x91, 0x01, 'g'}, []byte(`["locator"]`)
+	globalKey := testRetainedPruneGlobalKey(t, fixture.machine.relations[1].globalIndex, false)
+	retainedGlobalKey := testRetainedPruneGlobalKey(t, fixture.machine.relations[1].globalIndex, true)
+	locator := []byte(`["locator"]`)
 	seed := fixture.command(t, 1,
 		replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{
 			{Kind: replication.MutationPut, Key: insideKey, Value: insideValue},
@@ -144,6 +146,8 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 		}},
 		replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
 			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: locator,
+		}, {
+			Kind: replication.MutationPutAbsentOrEqual, Key: retainedGlobalKey, Value: locator,
 		}}},
 	)
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
@@ -221,8 +225,26 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 	prune.ClientSequence, prune.AckThrough = 4, 3
 	prune.Fingerprint, prune.RetainedPrune = proof.BatchDigest, proof
 	prune.Batches[1].Mutations[0].ExpectedValueDigest = replication.Digest(sha256.Sum256(locator))
+	prune.Batches[1].Mutations[0].Key = retainedGlobalKey
+	insideGlobal := encodeCommand(t, prune)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(7), insideGlobal); err != nil {
+		t.Fatal(err)
+	}
+	if code := bundleCompletionResult(t, fixture.machine, insideGlobal); code != ResultWrongShard {
+		t.Fatalf("retained global row prune result=%d", code)
+	}
+	if _, found, _ := fixture.base.Collection.AppendRaw(nil, outsideKey); !found {
+		t.Fatal("retained global ownership refusal partially deleted base row")
+	}
+	if keys := exactIndexKeys(t, fixture.base.Collection, fixture.index.Name, []byte(`"out"`)); len(keys) != 1 {
+		t.Fatalf("retained global ownership refusal changed local index = %q", keys)
+	}
+	proof.BatchDigest = replication.Digest{9}
+	prune.ClientSequence, prune.AckThrough = 5, 4
+	prune.Fingerprint, prune.RetainedPrune = proof.BatchDigest, proof
+	prune.Batches[1].Mutations[0].Key = globalKey
 	accepted := encodeCommand(t, prune)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(7), accepted); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(8), accepted); err != nil {
 		t.Fatal(err)
 	}
 	if code := bundleCompletionResult(t, fixture.machine, accepted); code != ResultApplied {
@@ -239,6 +261,9 @@ func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
 	}
 	if _, found, _ := fixture.base.Collection.AppendRaw(nil, insideKey); !found {
 		t.Fatal("retained in-range row was deleted")
+	}
+	if _, found, _ := fixture.global.Collection.AppendRaw(nil, retainedGlobalKey); !found {
+		t.Fatal("retained global-index row was deleted")
 	}
 }
 
