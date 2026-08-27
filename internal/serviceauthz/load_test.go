@@ -25,6 +25,13 @@ func TestLoadVibeJSONBoundsAndCanonicalPolicy(t *testing.T) {
 	if err != nil || backupPolicy.Check(backupPolicy.Nodes()[0], CapabilityBackup) != DecisionAllow {
 		t.Fatalf("backup capability policy=%v err=%v", backupPolicy, err)
 	}
+	restorePolicy, err := Load([]byte(`{"generation":7,"principals":[{"node":"` + node +
+		`","capabilities":["restore_activate"]}]}`))
+	if err != nil || restorePolicy.Check(
+		restorePolicy.Nodes()[0], CapabilityRestoreActivate,
+	) != DecisionAllow {
+		t.Fatalf("restore activation capability policy=%v err=%v", restorePolicy, err)
+	}
 	for _, raw := range [][]byte{
 		nil,
 		[]byte(`{"generation":0,"principals":[]}`),

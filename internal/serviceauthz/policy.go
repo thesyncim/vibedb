@@ -57,12 +57,17 @@ const (
 	// restore staging. It grants no data, topology, membership, schema, or
 	// serving authority by itself.
 	CapabilityBackup
+	// CapabilityRestoreActivate permits only the one-time target-catalog
+	// transition from a completely prepared restore inventory to its replicated
+	// activation witness. Backup staging, topology, membership, schema, and data
+	// authorities do not imply it, and it grants none of them in return.
+	CapabilityRestoreActivate
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
 	CapabilityDelegate | CapabilityMembership | CapabilityTopology |
 	CapabilityTransactionRecovery | CapabilityRequestLedger | CapabilityExecutionPin |
-	CapabilityBackup
+	CapabilityBackup | CapabilityRestoreActivate
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

@@ -140,6 +140,8 @@ func parseCapabilityRaw(raw []byte) Capability {
 		return CapabilityExecutionPin
 	case bytes.Equal(raw, []byte(`"backup"`)):
 		return CapabilityBackup
+	case bytes.Equal(raw, []byte(`"restore_activate"`)):
+		return CapabilityRestoreActivate
 	default:
 		return 0
 	}

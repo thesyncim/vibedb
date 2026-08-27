@@ -185,6 +185,37 @@ func TestBackupCapabilityCannotAcquireServingOrTopologyAuthority(t *testing.T) {
 	}
 }
 
+func TestRestoreActivationCapabilityIsIndependent(t *testing.T) {
+	restore, backup, topology, membership := authzNode(51), authzNode(52),
+		authzNode(53), authzNode(54)
+	policy, err := NewPolicy(13, []Entry{
+		{Node: restore, Capabilities: CapabilityRestoreActivate},
+		{Node: backup, Capabilities: CapabilityBackup},
+		{Node: topology, Capabilities: CapabilityTopology},
+		{Node: membership, Capabilities: CapabilityMembership},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Check(restore, CapabilityRestoreActivate); got != DecisionAllow {
+		t.Fatalf("restore activation denied: %d", got)
+	}
+	for _, node := range []rafttransport.NodeID{backup, topology, membership} {
+		if got := policy.Check(node, CapabilityRestoreActivate); got != DecisionDenyCapability {
+			t.Fatalf("ordinary control authority %x implied restore activation: %d", node, got)
+		}
+	}
+	for _, capability := range []Capability{
+		CapabilityDataRead, CapabilityDataWrite, CapabilitySchema, CapabilityDelegate,
+		CapabilityMembership, CapabilityTopology, CapabilityTransactionRecovery,
+		CapabilityRequestLedger, CapabilityExecutionPin, CapabilityBackup,
+	} {
+		if got := policy.Check(restore, capability); got != DecisionDenyCapability {
+			t.Fatalf("restore activation implied capability %x: %d", capability, got)
+		}
+	}
+}
+
 func TestAuthorityContextIsExactAndAllocationFreeOnRead(t *testing.T) {
 	authority := Authority{Node: authzNode(11), Generation: 19}
 	ctx, err := WithAuthority(context.Background(), authority)
