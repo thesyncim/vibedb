@@ -2,10 +2,43 @@ package clusterrestore
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"testing"
 )
+
+func TestPlanFreshTargetsPrecedesExactCatalogProjectionSeal(t *testing.T) {
+	fixture := restoreOperationFixture(t, 2)
+	targets, err := planFreshTargets(bytes.NewReader(identityEntropy(2)), fixture.Permit, fixture.Certificate, 9)
+	if err != nil || len(targets) != 2 {
+		t.Fatalf("targets=%d err=%v", len(targets), err)
+	}
+	// The canonical projection can now bind the actual fresh identities before
+	// NewOperation seals its digest; no operation bytes need to be rewritten.
+	projection := sha256.New()
+	for _, target := range targets {
+		_, _ = projection.Write(target.Group.GroupID[:])
+		for _, replica := range target.Replicas {
+			_, _ = projection.Write(replica.Node[:])
+		}
+	}
+	var digest [32]byte
+	copy(digest[:], projection.Sum(nil))
+	operation, err := NewOperation(fixture.Permit, fixture.Certificate, 0, 1,
+		filled32(1), filled32(2), digest, targets)
+	if err != nil || operation.TargetCatalogDigest != digest || operation.Digest == ([32]byte{}) {
+		t.Fatalf("sealed projection err=%v", err)
+	}
+	targets[0].Replicas[0].Node[0] ^= 1
+	if operation.Targets[0].Replicas[0].Node == targets[0].Replicas[0].Node {
+		t.Fatal("sealed operation aliases mutable target plan")
+	}
+	if _, err = planFreshTargets(bytes.NewReader(make([]byte, len(identityEntropy(2)))),
+		fixture.Permit, fixture.Certificate, 9); err == nil {
+		t.Fatal("zero or colliding identity plan accepted")
+	}
+}
 
 func TestSealFreshOperationMintsCanonicalDistinctRF3Identity(t *testing.T) {
 	fixture := restoreOperationFixture(t, 3)

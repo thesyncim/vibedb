@@ -35,34 +35,62 @@ func sealFreshOperation(entropy io.Reader, permit clusterbackup.RestoreStagingPe
 	certificate clusterbackup.Certificate,
 	spec TargetSpec,
 ) (Operation, error) {
-	if entropy == nil || spec.TopologyEpoch == 0 || len(certificate.Groups) == 0 {
-		return Operation{}, ErrOperation
+	targets, err := planFreshTargets(entropy, permit, certificate, spec.TopologyEpoch)
+	if err != nil {
+		return Operation{}, err
+	}
+	return NewOperation(permit, certificate, spec.CatalogOrdinal, spec.PolicyGeneration,
+		spec.BuildGrammarDigest, spec.TargetPolicyDigest, spec.TargetCatalogDigest, targets)
+}
+
+// PlanFreshTargets mints identities before the caller constructs its fresh
+// catalog/schema projection. The returned plan grants no serving authority;
+// NewOperation must subsequently seal its exact projection and policy digests.
+// This avoids a circular dependency between fresh node IDs and catalog bytes.
+func PlanFreshTargets(permit clusterbackup.RestoreStagingPermit,
+	certificate clusterbackup.Certificate, topologyEpoch uint64,
+) ([]TargetGroup, error) {
+	return planFreshTargets(rand.Reader, permit, certificate, topologyEpoch)
+}
+
+func planFreshTargets(entropy io.Reader, permit clusterbackup.RestoreStagingPermit,
+	certificate clusterbackup.Certificate, topologyEpoch uint64,
+) ([]TargetGroup, error) {
+	if entropy == nil || topologyEpoch == 0 || len(certificate.Groups) == 0 ||
+		permit.CertificateDigest != certificate.Digest || permit.CatalogGeneration != certificate.CatalogGeneration ||
+		permit.CatalogDigest != certificate.CatalogDigest || permit.Restore == ([sha256.Size]byte{}) {
+		return nil, ErrOperation
+	}
+	if _, err := clusterbackup.AppendCertificate(nil, certificate); err != nil {
+		return nil, errors.Join(ErrOperation, err)
 	}
 	targets := make([]TargetGroup, len(certificate.Groups))
 	for ordinal := range targets {
 		target := &targets[ordinal]
 		target.Group = raftmember.GroupKey{ClusterID: permit.TargetClusterID,
 			ClusterIncarnation:    permit.TargetClusterIncarnation,
-			TopologyRecoveryEpoch: spec.TopologyEpoch}
+			TopologyRecoveryEpoch: topologyEpoch}
 		if err := readIdentity(entropy, target.Group.ShardIncarnation[:]); err != nil {
-			return Operation{}, err
+			return nil, err
 		}
 		if err := readIdentity(entropy, target.Group.GroupID[:]); err != nil {
-			return Operation{}, err
+			return nil, err
 		}
 		for replica := range target.Replicas {
 			target.Replicas[replica].Member = uint64(replica + 1)
 			target.Replicas[replica].NodeIncarnation = 1
 			if err := readIdentity(entropy, target.Replicas[replica].Node[:]); err != nil {
-				return Operation{}, err
+				return nil, err
 			}
 			if err := readIdentity(entropy, target.Replicas[replica].Store[:]); err != nil {
-				return Operation{}, err
+				return nil, err
 			}
 		}
 	}
-	return NewOperation(permit, certificate, spec.CatalogOrdinal, spec.PolicyGeneration,
-		spec.BuildGrammarDigest, spec.TargetPolicyDigest, spec.TargetCatalogDigest, targets)
+	if !validTargetGroups(permit, certificate, targets) {
+		return nil, ErrOperation
+	}
+	return targets, nil
 }
 
 func readIdentity(entropy io.Reader, destination []byte) error {

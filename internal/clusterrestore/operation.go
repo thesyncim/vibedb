@@ -173,13 +173,24 @@ func validOperation(operation Operation, certificateRaw []byte) bool {
 		operation.TargetCatalogDigest == ([sha256.Size]byte{}) || len(certificateRaw) == 0 {
 		return false
 	}
+	return validTargetGroups(operation.Permit, operation.Certificate, operation.Targets)
+}
+
+func validTargetGroups(permit clusterbackup.RestoreStagingPermit, certificate clusterbackup.Certificate,
+	targets []TargetGroup,
+) bool {
+	count := len(targets)
+	if count == 0 || count != len(certificate.Groups) || count != int(permit.Groups) ||
+		permit.TargetClusterID == ([16]byte{}) || permit.TargetClusterIncarnation == ([16]byte{}) {
+		return false
+	}
 	seenNodes := make(map[rafttransport.NodeID]struct{}, count*3)
 	seenStores := make(map[[16]byte]struct{}, count*3)
 	seenGroups := make(map[raftmember.GroupKey]struct{}, count)
-	for index, target := range operation.Targets {
-		source := operation.Certificate.Groups[index]
-		if !source.Valid() || target.Group.ClusterID != operation.Permit.TargetClusterID ||
-			target.Group.ClusterIncarnation != operation.Permit.TargetClusterIncarnation ||
+	for index, target := range targets {
+		source := certificate.Groups[index]
+		if !source.Valid() || target.Group.ClusterID != permit.TargetClusterID ||
+			target.Group.ClusterIncarnation != permit.TargetClusterIncarnation ||
 			target.Group.TopologyRecoveryEpoch == 0 || target.Group.ShardIncarnation == ([16]byte{}) ||
 			target.Group.GroupID == ([16]byte{}) || target.Group == source.Group {
 			return false
@@ -188,7 +199,7 @@ func validOperation(operation Operation, certificateRaw []byte) bool {
 			return false
 		}
 		seenGroups[target.Group] = struct{}{}
-		for _, sourceCut := range operation.Certificate.Groups {
+		for _, sourceCut := range certificate.Groups {
 			if target.Group.ShardIncarnation == sourceCut.Group.ShardIncarnation ||
 				target.Group.GroupID == sourceCut.Group.GroupID {
 				return false
