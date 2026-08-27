@@ -54,3 +54,40 @@ func TestGenerationMigrationManifestStoreFallsBackAcrossTornAdvance(t *testing.T
 		t.Fatalf("empty load error = %v", err)
 	}
 }
+
+func TestGenerationMigrationManifestStoreRejectsDivergentEqualSequence(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "migration-manifest-divergent-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	store, err := OpenGenerationMigrationManifestStore(file, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := GenerationMigrationManifest{
+		StoreID: testStoreID, MigrationID: [16]byte{2}, Phase: GenerationMigrationCopying,
+		SourceGeneration: 3, TargetGeneration: 4, ReservedOffset: 1 << 20, ReservedBytes: 8 << 20,
+		FirstLogicalID: 10, LogicalIDCount: 100, SourceFileEnd: 1 << 20,
+		SourcePrimaryRoot: PageRef{Offset: 64 << 10, LogicalID: GlobalTabletCatalogRootLogicalID, Generation: 3, Length: GlobalTabletCatalogRootBytes, Kind: PagePrimaryCatalog},
+		Cursor:            []byte("a"),
+	}
+	if err := store.Create(m); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored.Cursor = []byte("divergent")
+	image, err := EncodeGenerationMigrationManifest(make([]byte, GenerationMigrationManifestBytes), stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(image, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(); !errors.Is(err, ErrGenerationMigrationManifestCorrupt) {
+		t.Fatalf("divergent slots error = %v", err)
+	}
+}

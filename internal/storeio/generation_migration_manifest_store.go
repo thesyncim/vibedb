@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ func OpenGenerationMigrationManifestStore(file *os.File, offset int64) (*Generat
 
 func (s *GenerationMigrationManifestStore) Load() (GenerationMigrationManifest, error) {
 	var best GenerationMigrationManifest
+	var bestImage [GenerationMigrationManifestBytes]byte
 	found := false
 	for slot := 0; slot < 2; slot++ {
 		var image [GenerationMigrationManifestBytes]byte
@@ -40,8 +42,22 @@ func (s *GenerationMigrationManifestStore) Load() (GenerationMigrationManifest, 
 		if found && (candidate.StoreID != best.StoreID || candidate.MigrationID != best.MigrationID) {
 			return GenerationMigrationManifest{}, ErrGenerationMigrationManifestCorrupt
 		}
+		if found && candidate.ManifestSequence == best.ManifestSequence &&
+			!bytes.Equal(image[:], bestImage[:]) {
+			return GenerationMigrationManifest{}, ErrGenerationMigrationManifestCorrupt
+		}
+		if found {
+			high, low := candidate.ManifestSequence, best.ManifestSequence
+			if high < low {
+				high, low = low, high
+			}
+			if high-low > 1 {
+				return GenerationMigrationManifest{}, ErrGenerationMigrationManifestCorrupt
+			}
+		}
 		if !found || candidate.ManifestSequence > best.ManifestSequence {
 			best, found = candidate, true
+			copy(bestImage[:], image[:])
 		}
 	}
 	if !found {
