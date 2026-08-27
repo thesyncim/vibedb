@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 )
 
 const (
@@ -34,6 +35,8 @@ type GenerationMigrationTabletVector struct {
 	tablets     uint32
 	storeID     [16]byte
 	migrationID [16]byte
+	mu          sync.Mutex
+	pages       [3][generationMigrationTabletVectorPageBytes]byte
 }
 
 func OpenGenerationMigrationTabletVector(file *os.File, offset int64, tablets uint32, storeID, migrationID [16]byte) (*GenerationMigrationTabletVector, error) {
@@ -53,7 +56,9 @@ func (v *GenerationMigrationTabletVector) Get(tablet uint32) (GenerationMigratio
 		return GenerationMigrationTabletRef{}, false, fmt.Errorf("%w: tablet vector ordinal", ErrInvalidWrite)
 	}
 	block := tablet / GenerationMigrationTabletVectorFanout
-	entries, _, found, err := v.readBlock(block)
+	v.mu.Lock()
+	entries, _, found, err := v.readBlockLocked(block)
+	v.mu.Unlock()
 	if err != nil || !found {
 		return GenerationMigrationTabletRef{}, false, err
 	}
@@ -67,7 +72,9 @@ func (v *GenerationMigrationTabletVector) Put(tablet uint32, entry GenerationMig
 		return fmt.Errorf("%w: tablet vector entry", ErrInvalidWrite)
 	}
 	block := tablet / GenerationMigrationTabletVectorFanout
-	entries, sequence, found, err := v.readBlock(block)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	entries, sequence, found, err := v.readBlockLocked(block)
 	if err != nil {
 		return err
 	}
@@ -84,7 +91,7 @@ func (v *GenerationMigrationTabletVector) Put(tablet uint32, entry GenerationMig
 	}
 	entries[ordinal] = entry
 	sequence++
-	var image [generationMigrationTabletVectorPageBytes]byte
+	image := &v.pages[2]
 	encodeGenerationMigrationTabletVectorPage(image[:], v.storeID, v.migrationID, block, sequence, entries[:])
 	slot := sequence & 1
 	_, err = v.file.WriteAt(image[:], v.blockSlotOffset(block, slot))
@@ -100,7 +107,9 @@ func (v *GenerationMigrationTabletVector) Visit(fn func(uint32, GenerationMigrat
 	blocks := (v.tablets + GenerationMigrationTabletVectorFanout - 1) /
 		GenerationMigrationTabletVectorFanout
 	for block := uint32(0); block < blocks; block++ {
-		entries, _, found, err := v.readBlock(block)
+		v.mu.Lock()
+		entries, _, found, err := v.readBlockLocked(block)
+		v.mu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -127,12 +136,12 @@ func validMigrationTabletRef(ref PageRef) bool {
 	return ref.Offset != 0 && ref.LogicalID != 0 && ref.Generation != 0 && ref.Length != 0 && validPhysicalPageSize(ref.Length) && ref.Kind == PageTabletRoute
 }
 
-func (v *GenerationMigrationTabletVector) readBlock(block uint32) ([GenerationMigrationTabletVectorFanout]GenerationMigrationTabletRef, uint64, bool, error) {
+func (v *GenerationMigrationTabletVector) readBlockLocked(block uint32) ([GenerationMigrationTabletVectorFanout]GenerationMigrationTabletRef, uint64, bool, error) {
 	var best [GenerationMigrationTabletVectorFanout]GenerationMigrationTabletRef
 	var bestSequence uint64
 	found := false
 	for slot := uint64(0); slot < 2; slot++ {
-		var image [generationMigrationTabletVectorPageBytes]byte
+		image := &v.pages[slot]
 		_, readErr := v.file.ReadAt(image[:], v.blockSlotOffset(block, slot))
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return best, 0, false, readErr

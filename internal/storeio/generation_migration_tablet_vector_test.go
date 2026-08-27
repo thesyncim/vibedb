@@ -76,3 +76,27 @@ func TestGenerationMigrationTabletVectorTornLatestFallsBack(t *testing.T) {
 		t.Fatalf("fallback = %+v ok=%v err=%v", entry, ok, err)
 	}
 }
+
+func TestGenerationMigrationTabletVectorWarmGetAllocations(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "tablet-vector-alloc-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	v, err := OpenGenerationMigrationTabletVector(file, 0, 1, testStoreID, [16]byte{9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := PageRef{Offset: 4096, LogicalID: PrimaryTabletRootLogicalIDBase, Generation: 7, Length: SegmentedTabletRouterRootBytes, Kind: PageTabletRoute}
+	if err := v.Put(0, GenerationMigrationTabletRef{Source: source}); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, ok, err := v.Get(0); err != nil || !ok {
+			t.Fatalf("get ok=%v err=%v", ok, err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warm Get allocations = %.2f, want zero", allocs)
+	}
+}
