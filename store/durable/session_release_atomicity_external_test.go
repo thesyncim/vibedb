@@ -156,7 +156,7 @@ func newSessionReleaseCrashFixture(
 		filepath.Join(fixture.dir, "user.vdb"),
 	}
 	fixture.options = []durable.Options{
-		{OpaqueValues: true, MaxBatchDocuments: int(sessionCrashRetryWindow) + 2},
+		{OpaqueValues: true, MaxBatchDocuments: 2*int(sessionCrashRetryWindow) + 2},
 		{},
 	}
 	if withCapture {
@@ -272,7 +272,7 @@ func assertSessionReleaseCrashImage(
 		filepath.Join(dir, "user.vdb"),
 	}
 	options := []durable.Options{
-		{OpaqueValues: true, MaxBatchDocuments: int(sessionCrashRetryWindow) + 2},
+		{OpaqueValues: true, MaxBatchDocuments: 2*int(sessionCrashRetryWindow) + 2},
 		{},
 	}
 	if withCapture {
@@ -402,13 +402,15 @@ func assertSessionReleaseCrashImage(
 
 func sessionCrashMachineOptions(withCapture bool) replicatedstate.Options {
 	collections := 2
+	documents := replicatedstate.MaxDistinctMutations + 4
 	if withCapture {
 		collections = 3
+		documents++
 	}
 	return replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: collections,
-			MaxDocuments:   68,
+			MaxDocuments:   documents,
 			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 1,

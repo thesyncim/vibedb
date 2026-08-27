@@ -82,7 +82,7 @@ func newNormalBatchFixtureWithOptions(
 		t.Cleanup(func() { _ = collection.Close() })
 		return targetOf(collection)
 	}
-	systemDocuments := int(retryWindow) + 2
+	systemDocuments := 2*int(retryWindow) + 2
 	if systemDocuments < 32 {
 		systemDocuments = 32
 	}

@@ -35,10 +35,7 @@ func newSessionReleaseFixture(
 		return targetOf(collection)
 	}
 
-	systemDocuments := int(retryWindow) + 3
-	if systemDocuments < 6 {
-		systemDocuments = 6
-	}
+	systemDocuments := max(7, 2*int(retryWindow)+2)
 	system := openCollection("system", durable.Options{
 		OpaqueValues:      true,
 		MaxBatchDocuments: systemDocuments,
