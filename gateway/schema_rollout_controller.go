@@ -36,6 +36,49 @@ type SchemaRolloutReplicaPlan struct {
 	Bundle  []byte
 }
 
+// NewSchemaRolloutReplicaPlan derives every portable request field from the
+// authenticated base/target catalogs. The admin surface supplies only the
+// replica identity, its local canonical bundle, and the target apply contract;
+// it cannot restate group epochs or relation manifests independently.
+func NewSchemaRolloutReplicaPlan(
+	id [32]byte, base, target *Snapshot, node rafttransport.NodeID, member uint64,
+	applyContract [32]byte, bundle []byte,
+) (SchemaRolloutReplicaPlan, error) {
+	if id == ([32]byte{}) || base == nil || target == nil || node == (rafttransport.NodeID{}) ||
+		member == 0 || applyContract == ([32]byte{}) || len(bundle) == 0 ||
+		len(bundle) > schemainstall.AbsoluteMaxBundleBytes {
+		return SchemaRolloutReplicaPlan{}, ErrSchemaRollout
+	}
+	changes, err := schemaRolloutChanges(base, target)
+	if err != nil {
+		return SchemaRolloutReplicaPlan{}, err
+	}
+	descriptors := target.replicatedDescriptors()
+	for _, change := range changes {
+		for _, descriptor := range descriptors {
+			if descriptor.Group != change.group {
+				continue
+			}
+			for _, replica := range descriptor.Replicas {
+				if replica.Node != node || replica.Member != member {
+					continue
+				}
+				owned := slices.Clone(bundle)
+				return SchemaRolloutReplicaPlan{Member: member, Node: node, Bundle: owned,
+					Request: schemainstall.Request{Operation: id, Group: change.group,
+						AllocationGeneration:       change.allocation,
+						FromSchemaGeneration:       change.fromSchemaGeneration,
+						FromRelationManifestDigest: change.fromRelationManifestDigest,
+						ToSchemaGeneration:         change.toSchemaGeneration,
+						ToRelationManifestDigest:   change.toRelationManifestDigest,
+						ApplyContractDigest:        applyContract, BundleDigest: sha256.Sum256(owned),
+						BundleBytes: uint64(len(owned))}}, nil
+			}
+		}
+	}
+	return SchemaRolloutReplicaPlan{}, ErrSchemaRollout
+}
+
 type SchemaRolloutControllerOptions struct {
 	Authority     *ReplicatedCatalogAuthority
 	Client        SchemaInstallClient
