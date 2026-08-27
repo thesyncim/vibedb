@@ -25,6 +25,7 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	template := validRestoreTestTemplate()
 	template.Apply.MaxSessions, template.Apply.RetryWindow = 128, 8
 	template.Apply.MaxCollections, template.Apply.MaxDocuments, template.Apply.MaxBytes = 16, 256, 384<<20
+	template.Apply.ShardKey = "/id"
 	template.DDL = append(template.DDL,
 		"CREATE INDEX by_email ON items (email)",
 		"CREATE TABLE email_claims (PRIMARY KEY (key))",
@@ -45,7 +46,7 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 		ShardIncarnation:     [16]byte{3}, GroupID: [16]byte{4}, MemberID: 1, StoreID: [16]byte{5},
 		Authority: sqldriver.ReplicatedAuthorityProfile{
 			ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1,
-			SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+			SchemaGeneration: 1, RoutingVersion: 17, RouteGeneration: 19,
 		},
 	}
 	directory := filepath.Join(root, "replica")
@@ -95,6 +96,16 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	if err = apply.Close(); err != nil {
 		t.Fatal(err)
 	}
+	freshBinding := binding
+	freshBinding.ClusterID, freshBinding.ClusterIncarnation = [16]byte{11}, [16]byte{12}
+	freshBinding.TopologyRecoveryEpoch = 2
+	freshBinding.ShardIncarnation, freshBinding.GroupID = [16]byte{13}, [16]byte{14}
+	freshBinding.MemberID, freshBinding.StoreID = 1, [16]byte{30}
+	freshBinding.Authority.RoutingVersion, freshBinding.Authority.RouteGeneration = 1, 1
+	targetDigest, err := database.ReplicatedRelationManifestForBinding(identity, options.Placement, freshBinding)
+	if err != nil || targetDigest == manifest.RelationManifestDigest {
+		t.Fatalf("fresh target must have its own schema domain: %x source=%x err=%v", targetDigest, manifest.RelationManifestDigest, err)
+	}
 	if err = database.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -104,11 +115,27 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	}
 	sourceGroup := raftmember.GroupKey{ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch, ShardIncarnation: binding.ShardIncarnation, GroupID: binding.GroupID}
-	catalogGroup := sourceGroup
-	catalogGroup.GroupID[0]++
-	catalogCut := groupCut
-	catalogCut.Group = catalogGroup
-	catalogCut.RelationManifestDigest = [32]byte{}
+	catalogTemplate := template
+	catalogTemplate.Distribution = "catalog"
+	catalogTemplate.Shard = "controlplane"
+	catalogTemplate.BaseTable = "controlplane"
+	catalogTemplate.DDL = []string{"CREATE TABLE controlplane (PRIMARY KEY (id))"}
+	catalogTemplate.GlobalIndexes = nil
+	catalogBinding := binding
+	catalogBinding.Distribution, catalogBinding.Shard = catalogTemplate.Distribution, catalogTemplate.Shard
+	catalogBinding.GroupID[0]++
+	catalogBinding.ShardIncarnation[0]++
+	catalogFreshBinding := freshBinding
+	catalogFreshBinding.Distribution, catalogFreshBinding.Shard = catalogTemplate.Distribution, catalogTemplate.Shard
+	catalogFreshBinding.GroupID[0]++
+	catalogFreshBinding.ShardIncarnation[0]++
+	catalogFreshBinding.StoreID[0] += 10
+	catalogArtifact, catalogManifest, catalogDigest := restoreTestSourceArtifact(t, catalogTemplate, catalogBinding, catalogFreshBinding)
+	catalogCut, err := clusterbackup.GroupCutFromVerifiedArtifact(1, catalogManifest, sha256.Sum256(catalogArtifact), uint64(len(catalogArtifact)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogGroup := catalogCut.Group
 	certificate, err := clusterbackup.Certify([32]byte{9}, clusterbackup.CatalogCut{Generation: 1, Digest: [32]byte{10}, PolicyGeneration: 1, Groups: []raftmember.GroupKey{sourceGroup, catalogGroup}}, []clusterbackup.GroupCut{groupCut, catalogCut})
 	if err != nil {
 		t.Fatal(err)
@@ -132,16 +159,26 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 		catalogTarget.Replicas[i].Node[0] += 10
 		catalogTarget.Replicas[i].Store[0] += 10
 	}
-	catalogTemplate := validRestoreTestTemplate()
-	catalogTemplate.Distribution = "catalog"
-	catalogTemplate.Shard = "controlplane"
-	catalogTemplate.BaseTable = "controlplane"
-	catalogTemplate.DDL = []string{"CREATE TABLE controlplane (PRIMARY KEY (id))"}
 	targets := []clusterrestore.TargetGroup{target, catalogTarget}
-	schemaRaw, policy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, clusterrestore.Operation{Targets: targets, Certificate: certificate})
+	plan := clusterrestore.Operation{Targets: targets, Certificate: certificate}
+	schemaRaw, policy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, plan, targetDigest, catalogDigest)
 	operation, err = clusterrestore.NewOperation(permit, certificate, 1, 1, [32]byte{16}, sha256.Sum256(policy), sha256.Sum256(schemaRaw), targets)
 	if err != nil {
 		t.Fatal(err)
+	}
+	wrongDigest := targetDigest
+	wrongDigest[0] ^= 1
+	wrongSchema, wrongPolicy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, plan, wrongDigest, catalogDigest)
+	wrongOperation, err := clusterrestore.NewOperation(permit, certificate, 1, 1, [32]byte{16}, sha256.Sum256(wrongPolicy), sha256.Sum256(wrongSchema), targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongRoot := t.TempDir()
+	if _, err := RestoreGroup(context.Background(), RestoreGroupConfig{Root: wrongRoot, Template: wrongSchema, Operation: wrongOperation, Artifact: bytes.NewReader(artifact.Bytes())}); err == nil {
+		t.Fatal("sealed but incorrect fresh target machine digest accepted")
+	}
+	if _, err := os.Stat(filepath.Join(restoreGroupDirectory(wrongRoot, 0), "replica-1", "activation.vibejson")); !os.IsNotExist(err) {
+		t.Fatalf("rejected schema published activation receipt: %v", err)
 	}
 	restoredRoot := filepath.Join(t.TempDir(), "restored")
 	if err = os.Mkdir(restoredRoot, 0o700); err != nil {
@@ -151,6 +188,9 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	first, err := RestoreGroup(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if first.Witness.SanitizedImageDigest == manifest.ImageDigest {
+		t.Fatal("restored image retained the source routing hash domain")
 	}
 	memberRoot := filepath.Join(restoreGroupDirectory(restoredRoot, 0), "replica-1")
 	state, err := OpenRestoredReplicaState(memberRoot)
@@ -180,4 +220,49 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	if _, err = RestoreGroup(context.Background(), config); err == nil {
 		t.Fatal("corrupt sealed receipt accepted")
 	}
+}
+
+// Build a real source artifact rather than relabeling another group's cut.
+// The target digest uses the same live schema with its exact fresh binding.
+func restoreTestSourceArtifact(t *testing.T, template restoreSchemaTemplate, source, target sqldriver.ReplicatedShardStoreBinding) ([]byte, replicatedstate.SnapshotArtifactManifest, [32]byte) {
+	t.Helper()
+	root := t.TempDir()
+	factory := restoreReplicaFactory{root: root, template: template}
+	operation := clusterrestore.Operation{Digest: sha256.Sum256([]byte("catalog-source-operation"))}
+	_, database, identity, err := factory.openOrCreateRoot(filepath.Join(root, "member.vdb"), filepath.Join(root, "allocation.vibejson"), operation, 0, 0, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	options, err := restoreApplyOptions(template.Apply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := database.ReplicatedRelationManifestForBinding(identity, options.Placement, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := restoreRF3Bootstrap(operation, 0, [32]byte{1})
+	apply, _, err := database.OpenReplicatedApply(identity, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer apply.Close()
+	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = apply.ApplyConfiguration(raftmodel.ApplyMeta{Index: 2, Term: 1, Type: pb.EntryConfChange}, bootstrap.Metadata.ConfState); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cut.Close()
+	var artifact bytes.Buffer
+	manifest, err := replicatedstate.WriteSnapshotArtifact(&artifact, cut, replicatedstate.SnapshotArtifactOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return artifact.Bytes(), manifest, digest
 }

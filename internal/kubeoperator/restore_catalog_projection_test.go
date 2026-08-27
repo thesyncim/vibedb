@@ -17,8 +17,11 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func restoreTestSchemaProjection(t *testing.T, templates []restoreSchemaTemplate, operation clusterrestore.Operation) ([]byte, []byte) {
+func restoreTestSchemaProjection(t *testing.T, templates []restoreSchemaTemplate, operation clusterrestore.Operation, targetDigests ...[32]byte) ([]byte, []byte) {
 	t.Helper()
+	if len(targetDigests) != 0 && len(targetDigests) != len(templates) {
+		t.Fatal("target machine digests must cover the exact schema set")
+	}
 	policy := []byte(`{"generation":1,"principals":[{"node":"01000000000000000000000000000000","capabilities":["topology","restore_activate"]}]}`)
 	var config distribution.ClusterConfig
 	endpoints := make(map[distribution.EndpointID]string)
@@ -46,6 +49,9 @@ func restoreTestSchemaProjection(t *testing.T, templates []restoreSchemaTemplate
 		}
 		config.Manifests = append(config.Manifests, m)
 		digest := replication.Digest(operation.Certificate.Groups[i].RelationManifestDigest)
+		if len(targetDigests) != 0 {
+			digest = replication.Digest(targetDigests[i])
+		}
 		if digest == (replication.Digest{}) {
 			digest[0] = 1
 		}
