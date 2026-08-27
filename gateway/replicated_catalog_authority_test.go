@@ -1365,6 +1365,31 @@ func TestReplicatedCatalogGenesisPreventsDeletedHeadRecreation(t *testing.T) {
 	}
 }
 
+func TestReplicatedCatalogGenesisReadConvergesAcrossAtomicBootstrap(t *testing.T) {
+	source, client, _ := newCatalogAuthorityFixture(t)
+	emptyCatalogAuthorityRows(client)
+	genesis := testCatalogAuthoritySnapshot(t, 1)
+	reader := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x88)
+	publisher := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x89)
+	var publishErr error
+	client.onRead = func(key []byte) {
+		if !bytes.Equal(key, replicatedCatalogHeadWitnessKey) {
+			return
+		}
+		client.mu.Lock()
+		client.onRead = nil
+		client.mu.Unlock()
+		publishErr = publisher.Publish(context.Background(), 0, genesis)
+	}
+	observed, err := reader.Read(context.Background())
+	if publishErr != nil || err != nil || observed.Generation() != 1 {
+		t.Fatalf("bootstrap race publish=%v read=%v observed=%v", publishErr, err, observed)
+	}
+	if err = reader.AttestGenesis(context.Background(), genesis); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplicatedCatalogAuthorityPublishUnknownRetryConflictAndRefresh(t *testing.T) {
 	authority, client, current := newCatalogAuthorityFixture(t)
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
