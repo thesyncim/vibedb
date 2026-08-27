@@ -54,7 +54,7 @@ func TestDurableRequestProgramExactContinuationAndTerminalBounds(t *testing.T) {
 				t.Fatalf("fixed terminal result: bytes=%d err=%v", len(result), err)
 			}
 			prepared, err := requestledger.NewPreparedTerminal(head, continuation, head.Revision+1,
-				outcome, 0, committed, result, head.TerminalSummaryDigest, requestledger.AckToken{1})
+				outcome, 0, committed, result, requestledger.Digest(program.Contract.RetirementWitnessDigest), requestledger.AckToken{1})
 			if err != nil {
 				t.Fatal(err)
 			}

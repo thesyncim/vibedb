@@ -352,10 +352,14 @@ func durableRequestLifecycleExecutionContract(
 		TerminalTransitionTag:        contract.CommitTransitionTag,
 		FinalWaveCount:               contract.CommitFinalWaveCount,
 		TerminalStateDigest:          requestledger.Digest(contract.CommitTerminalStateDigest),
-		TerminalSummaryDigest:        requestledger.Digest(contract.TerminalSummaryDigest),
-		AbortTerminalTransitionTag:   contract.AbortTransitionTag,
-		AbortFinalWaveCount:          contract.AbortFinalWaveCount,
-		AbortTerminalStateDigest:     requestledger.Digest(contract.AbortTerminalStateDigest),
+		// The ledger head's TerminalSummaryDigest is the expected retirement
+		// witness checked by ValidateTerminalContinuation, not the gateway's
+		// distinct aggregate terminal-summary digest. Both remain authenticated
+		// by the recipe's terminal contract; never substitute one for the other.
+		TerminalSummaryDigest:      requestledger.Digest(contract.RetirementWitnessDigest),
+		AbortTerminalTransitionTag: contract.AbortTransitionTag,
+		AbortFinalWaveCount:        contract.AbortFinalWaveCount,
+		AbortTerminalStateDigest:   requestledger.Digest(contract.AbortTerminalStateDigest),
 	}
 }
 
