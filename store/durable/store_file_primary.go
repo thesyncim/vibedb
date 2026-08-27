@@ -743,11 +743,15 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		c.primaryVolatileRetired = make([]storeio.PageRef, 0, pendingCapacity)
 		// The deferred-canonical lane mints out-of-line values as volatile chains and
 		// resolves them at read, checkpoint, and exact-index maintenance. Size the
-		// chain scratch for one worst-case document so a steady-state overflow Put
-		// never grows it, and the durable-retirement queue for one worst-case
-		// checkpoint's superseded chains.
+		// chain scratch for one worst-case document and the durable-retirement
+		// queue for one worst-case checkpoint's superseded chains. Value bytes
+		// start at the inline/leaf working set; the authenticated overflow reader
+		// grows them once to the observed value length and reuses that storage.
+		// Opening a shard must not reserve MaxDocumentBytes for every cold table.
 		c.overflowRefScratch = make([]storeio.PageRef, 0, maxOverflowPages)
-		c.overflowValueScratch = make([]byte, 0, c.options.MaxDocumentBytes)
+		valueScratchBytes := min(c.options.MaxDocumentBytes,
+			max(c.options.InlineValueBytes, storeio.CommonPrimaryLeafMaxExtentBytes))
+		c.overflowValueScratch = make([]byte, 0, valueScratchBytes)
 		c.overflowPageScratch = make([]byte, c.options.MaxPageSize)
 		c.primaryPendingOverflowRetire = make(
 			[]storeio.PageRef, 0, c.options.MaxRetiredExtents,
