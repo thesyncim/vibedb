@@ -26,6 +26,7 @@ import (
 // lookup, wire grammars, and restart all use their production implementations.
 type routeSessionMachineClient struct {
 	machine      *replicatedstate.Machine
+	batched      bool
 	state        shardservice.ReplicatedMemberState
 	hide         bool
 	first, retry []byte
@@ -57,8 +58,20 @@ func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoin
 		return nil, err
 	}
 	index := client.state.Applied + 1
-	if _, err := client.machine.ApplyNormal(raftmodel.ApplyMeta{Index: index, Term: client.state.Fence.Term, Type: pb.EntryNormal}, request.Command); err != nil {
-		return nil, err
+	meta := raftmodel.ApplyMeta{Index: index, Term: client.state.Fence.Term, Type: pb.EntryNormal}
+	applied := 0
+	if client.batched {
+		var witnesses [1][32]byte
+		var err error
+		applied, _, err = client.machine.ApplyNormalBatch([]raftmodel.NormalApply{{Meta: meta, Data: request.Command}}, witnesses[:])
+		if err != nil {
+			return nil, err
+		}
+	}
+	if applied == 0 {
+		if _, err := client.machine.ApplyNormal(meta, request.Command); err != nil {
+			return nil, err
+		}
 	}
 	client.state.Applied, client.state.Commit = index, index
 	lookup, err := client.machine.LookupCompletion(request.Command)
@@ -103,6 +116,10 @@ func (routeSessionValidator) ValidateDelete(_, _ []byte, _ bool) replicatedstate
 }
 
 func newRouteSessionMachine(t *testing.T) (ReplicatedRoute, *routeSessionMachineClient, func()) {
+	return newRouteSessionMachineWithCheckpoint(t, false)
+}
+
+func newRouteSessionMachineWithCheckpoint(t *testing.T, checkpoint bool) (ReplicatedRoute, *routeSessionMachineClient, func()) {
 	t.Helper()
 	route, _, states := testReplicatedRouteCommand(t)
 	dir := t.TempDir()
@@ -144,7 +161,18 @@ func newRouteSessionMachine(t *testing.T) (ReplicatedRoute, *routeSessionMachine
 	bootstrap := &pb.Snapshot{Data: []byte("route-session-test"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}
 	options := replicatedstate.Options{MaxSessions: 8, RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 4, MaxBytes: 64 << 20}}
-	client := &routeSessionMachineClient{state: states["m2"]}
+	if checkpoint {
+		group, err := durable.NewCheckpointGroup(log, []durable.NamedCollection{
+			{Name: replicatedstate.SystemCollectionName, Collection: system.Collection},
+			{Name: "docs", Collection: user.Collection},
+		}, durable.CheckpointGroupOptions{CheckpointEvery: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = group.Close() })
+		options.CheckpointGroup = group
+	}
+	client := &routeSessionMachineClient{state: states["m2"], batched: checkpoint}
 	reopen := func() {
 		machine, err := replicatedstate.Open(binding, bootstrap, system, replicatedstate.UserCollection{Name: "docs", Target: user}, log, options)
 		if err != nil {

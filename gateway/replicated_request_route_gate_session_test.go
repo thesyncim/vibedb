@@ -67,7 +67,17 @@ func (client *routeSessionDropClient) DoReplicated(ctx context.Context, endpoint
 }
 
 func TestDurableRequestRouteSessionLedgerRecovery(t *testing.T) {
-	route, machineClient, reopen := newRouteSessionMachine(t)
+	for _, checkpoint := range []bool{false, true} {
+		name := "singleton"
+		if checkpoint {
+			name = "checkpoint-batch"
+		}
+		t.Run(name, func(t *testing.T) { testDurableRequestRouteSessionLedgerRecovery(t, checkpoint) })
+	}
+}
+
+func testDurableRequestRouteSessionLedgerRecovery(t *testing.T, checkpoint bool) {
+	route, machineClient, reopen := newRouteSessionMachineWithCheckpoint(t, checkpoint)
 	client := &routeSessionDropClient{base: machineClient}
 	executor, err := NewReplicatedExecutor(client, 1, time.Second)
 	if err != nil {
