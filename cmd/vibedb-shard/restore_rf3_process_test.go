@@ -292,7 +292,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 	if err != nil {
 		t.Fatal(err)
 	}
-	apply := prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: "id"}
+	apply := prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: "/id"}
 	schemas := [2]restoreRF3Schema{
 		{1, string(gateway.ReplicatedCatalogDistribution), string(gateway.ReplicatedCatalogShard), 23, gateway.ReplicatedCatalogTable, []string{"CREATE TABLE controlplane (PRIMARY KEY (id))"}, nil, apply},
 		{1, "items", "items-0", 23, "items", []string{"CREATE TABLE items (PRIMARY KEY (id))", "CREATE INDEX by_email ON items (email)", "CREATE TABLE email_claims (PRIMARY KEY (key))"},
@@ -457,7 +457,7 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 			MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}, Bootstrap: bootstrap,
 		Authority: rf3CommandAuthority(), Apply: sqldriver.ReplicatedApplyOptions{MaxSessions: 32, RetryWindow: 8,
 			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
-			Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "id",
+			Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 				TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 				Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}})
 	if err != nil {
