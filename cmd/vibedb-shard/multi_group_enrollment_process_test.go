@@ -360,8 +360,11 @@ func TestCombineRF3ProcessGroupsPreflightWithNestedMemberRoster(t *testing.T) {
 		WAL: raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
 			MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
 		Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-		Apply: sqldriver.ReplicatedApplyOptions{Placement: sqldriver.ReplicatedPlacementProfile{
-			ShardKey: gateway.ReplicatedCatalogPrimaryKey}},
+		Apply: sqldriver.ReplicatedApplyOptions{MaxSessions: 32, RetryWindow: 8,
+			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
+			Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat,
+				ShardKey: gateway.ReplicatedCatalogPrimaryKey, TupleVersion: distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}},
 		Listeners: rf3testfixture.ProcessListeners{Peer: "127.0.0.1:21001", Native: "127.0.0.1:22001",
 			Snapshot: "127.0.0.1:23001", Control: "127.0.0.1:24001"},
 		Credential: rf3testfixture.Credential{Certificate: "/cert", Key: "/key"},
@@ -389,10 +392,13 @@ func TestCombineRF3ProcessGroupsPreflightWithNestedMemberRoster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Groups) != 2 || manifest.SplitControl.ChildRegistry.MemberCount != 3 {
-		t.Fatalf("incomplete composite: groups=%d child members=%d", len(manifest.Groups), manifest.SplitControl.ChildRegistry.MemberCount)
+	if len(manifest.Groups) != 2 {
+		t.Fatalf("incomplete composite: groups=%d", len(manifest.Groups))
 	}
 	for index, group := range manifest.Groups {
+		if group.ChildRegistry.MemberCount != 3 || group.ChildRegistry.Root != filepath.Join(group.Route.MemberRoot, "split-children") {
+			t.Fatalf("group %d lost exact child registry: %+v", index, group.ChildRegistry)
+		}
 		if group.EnrolledTarget == nil || group.EnrolledTarget.MemberID != 4 || group.MemberCount != 3 {
 			t.Fatalf("group %d lost enrolled target or voter roster: %+v", index, group)
 		}

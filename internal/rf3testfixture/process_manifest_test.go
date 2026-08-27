@@ -4,9 +4,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -22,8 +24,15 @@ func TestProcessMemberManifestIsCanonicalJSONWithColdEnrollment(t *testing.T) {
 		ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}}
 	controlRoot := filepath.Join(root, "shared-control")
 	options := ProcessMemberOptions{Root: root, ControlRoot: controlRoot, Identity: identity,
-		Apply: sqldriver.ReplicatedApplyOptions{Placement: sqldriver.ReplicatedPlacementProfile{ShardKey: "/home"}},
-		Key:   raftstore.Key{ID: "rf3-command-key"},
+		Apply: sqldriver.ReplicatedApplyOptions{MaxSessions: 96, RetryWindow: 16,
+			TxnLimits:                  durable.TxnLimits{MaxCollections: 16, MaxDocuments: 2048, MaxBytes: 256 << 20},
+			RequestLedgerCapacityBytes: 64 << 20, RequestLedgerCleanupReserveBytes: 8 << 20,
+			RequestLedgerRangeStart: [32]byte{0x20}, RequestLedgerRangeEnd: [32]byte{0x90},
+			RequestLedgerRangeIdentity: [32]byte{0x5a},
+			Placement: sqldriver.ReplicatedPlacementProfile{ShardKey: "/home",
+				Format: sqldriver.ReplicatedPlacementProfileFormat, TupleVersion: distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion}},
+		Key: raftstore.Key{ID: "rf3-command-key"},
 		WAL: raftstore.Options{MaxFileBytes: 1, MaxRecordBytes: 2, MaxRecords: 3,
 			MaxEntries: 4, MaxLiveBytes: 5}, Bootstrap: InitialBootstrap([]uint64{1, 2, 3}),
 		Listeners: ProcessListeners{Peer: "127.0.0.1:1", Native: "127.0.0.1:2",
@@ -61,14 +70,14 @@ func TestProcessMemberManifestIsCanonicalJSONWithColdEnrollment(t *testing.T) {
 	if !found {
 		t.Fatal("split control has no child registry")
 	}
-	if got := processManifestTestText(t, registry, "root"); got != filepath.Join(controlRoot, "split-children") {
+	if got := processManifestTestText(t, registry, "root"); got != filepath.Join(root, "split-children") {
 		t.Fatalf("split child root=%q", got)
 	}
 	childWAL, found := registry.Get("wal")
 	if !found {
 		t.Fatal("split child registry has no WAL")
 	}
-	if got := processManifestTestText(t, childWAL, "key_material_path"); got != filepath.Join(controlRoot, "wal-key") {
+	if got := processManifestTestText(t, childWAL, "key_material_path"); got != filepath.Join(root, "key") {
 		t.Fatalf("split child WAL key=%q", got)
 	}
 	childApply, found := registry.Get("apply")
@@ -80,6 +89,22 @@ func TestProcessMemberManifestIsCanonicalJSONWithColdEnrollment(t *testing.T) {
 		if _, found := childApply.Get(field); !found {
 			t.Fatalf("child apply missing current grammar field %q", field)
 		}
+	}
+	for _, field := range []struct {
+		name string
+		want uint64
+	}{
+		{"max_sessions", 96}, {"retry_window", 16}, {"max_collections", 16},
+		{"max_documents", 2048}, {"max_bytes", 256 << 20},
+		{"request_ledger_capacity_bytes", 64 << 20}, {"request_ledger_cleanup_reserve_bytes", 8 << 20},
+	} {
+		value, _ := childApply.Get(field.name)
+		if actual, ok := value.Uint64(); !ok || actual != field.want {
+			t.Fatalf("child apply %s=%d want=%d", field.name, actual, field.want)
+		}
+	}
+	if got := processManifestTestText(t, childApply, "request_ledger_range_identity"); got != "5a00000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("child ledger range identity=%q", got)
 	}
 }
 
