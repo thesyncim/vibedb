@@ -35,7 +35,7 @@ func TestQualificationWireContractsUseVibeJSON(t *testing.T) {
 	query := qualificationQuery()
 	if !vibejson.Valid(query) || !bytes.Contains(query, []byte(`"kind-proof"`)) ||
 		qualificationRowVisible([]byte(`{"ok":true,"rows":[["other"]]}`)) ||
-		!qualificationRowVisible([]byte(`{"ok":true,"rows":[["kind-proof"]]}`)) ||
+		!qualificationRowVisible(qualificationBatchResponseFixture()) ||
 		qualificationRowVisible([]byte(`{"ok":true,"rows":[["kind-proof"],["kind-proof"]]}`)) {
 		t.Fatalf("query/response contract query=%s", query)
 	}

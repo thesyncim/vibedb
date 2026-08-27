@@ -80,10 +80,10 @@ type execBatchRequest struct {
 }
 
 type queryRequest struct {
-	Op     string         `json:"op"`
-	SQL    string         `json:"sql"`
-	Class  string         `json:"class"`
-	Params []qualifyParam `json:"params"`
+	Op             string             `json:"op"`
+	Class          string             `json:"class"`
+	MaxResultBytes uint32             `json:"max_result_bytes"`
+	Statements     []qualifyStatement `json:"statements"`
 }
 
 type qualificationEvidence struct {
@@ -471,9 +471,12 @@ func loadOrCreateRequest(mode, path string, wire *qualificationWire) ([]byte, er
 }
 
 func qualificationQuery() []byte {
-	raw, _ := vibejson.Marshal(&queryRequest{Op: "query",
-		SQL: "SELECT id FROM documents WHERE id = ?", Class: "interactive",
-		Params: []qualifyParam{{Kind: "string", Text: "kind-proof"}}})
+	// Only native RF3 endpoints are authorized by this qualification profile.
+	// Legacy query would use SQL endpoints and would not qualify a ReadIndex.
+	raw, _ := vibejson.Marshal(&queryRequest{Op: "read_batch", Class: "interactive",
+		MaxResultBytes: qualificationMaxResponseBytes,
+		Statements: []qualifyStatement{{SQL: "SELECT * FROM documents WHERE id = ?",
+			Params: []qualifyParam{{Kind: "string", Text: "kind-proof"}}}}})
 	return raw
 }
 
@@ -482,9 +485,12 @@ func qualificationQuery() []byte {
 func qualificationResponseError(stage string, raw []byte) error {
 	detail := "unexpected response"
 	if document, err := vibejson.Parse(raw); err == nil {
-		if node, found := document.Get("error"); found {
-			if message, ok := node.Text(); ok && message != "" {
-				detail = message[:min(len(message), 256)]
+		for _, field := range []string{"error", "code"} {
+			if node, found := document.Get(field); found {
+				if message, ok := node.Text(); ok && message != "" {
+					detail = message[:min(len(message), 256)]
+					break
+				}
 			}
 		}
 	}
@@ -505,24 +511,90 @@ func committedResponse(raw []byte) bool {
 }
 
 func qualificationRowVisible(raw []byte) bool {
+	if len(raw) > qualificationMaxResponseBytes {
+		return false
+	}
 	document, err := vibejson.Parse(raw)
 	if err != nil {
 		return false
 	}
-	rowsNode, ok := document.Get("rows")
-	if !ok {
+	members, objectOK := document.Object()
+	okNode, hasOK := document.Get("ok")
+	okValue, boolOK := okNode.Bool()
+	if !objectOK || len(members) != 4 || !hasOK || !boolOK || !okValue {
 		return false
 	}
-	rows, ok := rowsNode.Array()
-	if !ok || len(rows) != 1 {
+	foundNode, hasFound := document.Get("found")
+	found, arrayOK := foundNode.Array()
+	if !hasFound || !arrayOK || len(found) != 1 {
 		return false
 	}
-	cells, ok := rows[0].Array()
-	text, textOK := "", false
-	if ok && len(cells) == 1 {
-		text, textOK = cells[0].Text()
+	isFound, boolOK := found[0].Bool()
+	if !boolOK || !isFound {
+		return false
 	}
-	return textOK && text == "kind-proof"
+	rowsNode, hasRows := document.Get("documents")
+	rows, arrayOK := rowsNode.Array()
+	if !hasRows || !arrayOK || len(rows) != 1 {
+		return false
+	}
+	fields, objectOK := rows[0].Object()
+	idNode, hasID := rows[0].Get("id")
+	id, textOK := idNode.Text()
+	if !objectOK || len(fields) != 1 || !hasID || !textOK || id != "kind-proof" {
+		return false
+	}
+	observationsNode, hasObservations := document.Get("observations")
+	observations, arrayOK := observationsNode.Array()
+	if !hasObservations || !arrayOK || len(observations) != 1 {
+		return false
+	}
+	observation := observations[0]
+	fields, objectOK = observation.Object()
+	retries, hasRetries := observation.Get("retries")
+	fieldCount := 7
+	if hasRetries {
+		if _, ok := retries.Uint64(); !ok {
+			return false
+		}
+		fieldCount++
+	}
+	if !objectOK || len(fields) != fieldCount {
+		return false
+	}
+	for _, field := range []string{"applied", "topology_recovery_epoch"} {
+		node, found := observation.Get(field)
+		value, ok := node.Uint64()
+		if !found || !ok || value == 0 {
+			return false
+		}
+	}
+	for _, field := range []string{"cluster_id", "cluster_incarnation", "shard_incarnation", "group_id", "route_id"} {
+		node, found := observation.Get(field)
+		value, ok := node.Text()
+		width := 32
+		if field == "route_id" {
+			width = 64
+		}
+		if !found || !ok || !qualificationNonzeroHex(value, width) {
+			return false
+		}
+	}
+	return true
+}
+
+func qualificationNonzeroHex(value string, width int) bool {
+	if len(value) != width {
+		return false
+	}
+	nonzero := false
+	for _, digit := range value {
+		if digit < '0' || digit > '9' && digit < 'a' || digit > 'f' {
+			return false
+		}
+		nonzero = nonzero || digit != '0'
+	}
+	return nonzero
 }
 
 func writeExclusive(path string, raw []byte) error {
