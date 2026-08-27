@@ -225,6 +225,8 @@ func rf3TransactionCommand(
 	batches []replication.RelationMutationBatch,
 ) []byte {
 	t.Helper()
+	control.ControllerEpoch = 1
+	control.ExecutionPinDigest = distributedtxn.Digest(sha256.Sum256(control.ID[:]))
 	transaction, err := distributedtxn.AppendReplicatedCommand(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -250,6 +252,102 @@ func rf3TransactionCommand(
 		Fingerprint: sha256.Sum256(transaction), Transaction: transaction, Batches: batches,
 	}
 	return appendRF3Command(t, command)
+}
+
+func rf3TransactionCoordinatorRecord(
+	t testing.TB,
+	base sqldriver.ReplicatedShardStoreIdentity,
+	id distributedtxn.ID,
+	digest distributedtxn.Digest,
+) []byte {
+	t.Helper()
+	record, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 1, RecoveryDeadline: int64(distributedtxn.MaxRecoveryPulses),
+		Participants: []distributedtxn.ParticipantRef{{
+			Distribution: []byte(base.Binding.Distribution), Shard: []byte(base.Binding.Shard),
+			RoutingVersion:       base.Binding.Authority.RoutingVersion,
+			AllocationGeneration: base.Binding.AllocationGeneration,
+			OwnershipEpoch:       base.Binding.Authority.OwnershipEpoch,
+			MutationDigest:       digest, State: distributedtxn.ParticipantStaged,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+// Keep the shared transaction fixtures qualified on hosts where strict
+// allocation prevents starting the physical RF3 cluster.
+func TestRF3TransactionCommandFixturesPreflight(t *testing.T) {
+	base := sqldriver.ReplicatedShardStoreIdentity{Binding: sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
+		Distribution: "orders", Shard: "all", AllocationGeneration: 7,
+		ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
+		Authority: sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11,
+			SchemaGeneration: 13, RoutingVersion: 17, RouteGeneration: 19,
+		},
+	}}
+	id := distributedtxn.ID{1, 2, 3}
+	batches := []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: []byte("base"), Value: []byte(`{"id":"base"}`),
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: []byte("index"), Value: []byte(`["base"]`),
+		}}},
+	}
+	digest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := rf3TransactionCoordinatorRecord(t, base, id, digest)
+	coordinator, err := distributedtxn.OpenCoordinator(record)
+	if err != nil || coordinator.RecoveryDeadline != int64(distributedtxn.MaxRecoveryPulses) {
+		t.Fatalf("logical recovery budget: %+v, %v", coordinator, err)
+	}
+	retirement, err := distributedtxn.AppendReplicatedRetirementSummary(nil,
+		distributedtxn.ReplicatedRetirementSummary{AffectedRows: 1, AffectedRowsValid: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, control := range []distributedtxn.ReplicatedCommand{
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedStageCoordinator,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: record},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStageParticipant,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+			Participant: distributedtxn.ParticipantStage{
+				CoordinatorGroup:            distributedtxn.ID(base.Binding.GroupID),
+				CoordinatorShardIncarnation: distributedtxn.ID(base.Binding.ShardIncarnation),
+				CoordinatorAllocation:       base.Binding.AllocationGeneration, BucketBits: 8,
+				IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}}, MutationDigest: digest,
+			}},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedPrepareParticipant,
+			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedCommitCoordinator,
+			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyParticipant,
+			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedReleaseParticipant,
+			ID: id, ExpectedRevision: 3, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedRetireCoordinator,
+			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadRetirement, Payload: retirement},
+	} {
+		var mutations []replication.RelationMutationBatch
+		if control.Operation == distributedtxn.ReplicatedStageParticipant {
+			mutations = batches
+		}
+		outer, err := replication.OpenCommand(rf3TransactionCommand(t, base, control, mutations))
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner, err := distributedtxn.OpenReplicatedCommand(outer.TransactionBytes())
+		if err != nil || inner.ControllerEpoch != 1 || inner.ExecutionPinDigest != distributedtxn.Digest(sha256.Sum256(id[:])) {
+			t.Fatalf("fenced operation %d: %+v, %v", control.Operation, inner, err)
+		}
+	}
 }
 
 func submitRF3Transaction(
@@ -329,21 +427,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 		t.Fatal(err)
 	}
 	id := distributedtxn.ID{0x74, 0x78, 0x6e, 0x2d, 0x72, 0x66, 0x33, 1}
-	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
-		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 1, RecoveryDeadline: time.Now().Add(time.Minute).UnixNano(),
-		Participants: []distributedtxn.ParticipantRef{{
-			Distribution:         []byte(cluster.bases[leader].Binding.Distribution),
-			Shard:                []byte(cluster.bases[leader].Binding.Shard),
-			RoutingVersion:       uint64(cluster.bases[leader].Binding.Authority.RoutingVersion),
-			AllocationGeneration: cluster.bases[leader].Binding.AllocationGeneration,
-			OwnershipEpoch:       uint64(cluster.bases[leader].Binding.Authority.OwnershipEpoch),
-			MutationDigest:       mutationDigest, State: distributedtxn.ParticipantStaged,
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	coordinatorRecord := rf3TransactionCoordinatorRecord(t, cluster.bases[leader], id, mutationDigest)
 	stageCoordinator := rf3TransactionCommand(t, cluster.bases[leader], distributedtxn.ReplicatedCommand{
 		Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedStageCoordinator,
 		ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinatorRecord,
@@ -494,22 +578,8 @@ func TestRF3TransactionRecoveryReadIsLeaderOnlyAndSurvivesGatewayReplacement(t *
 	leader := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.group)
 
 	id := distributedtxn.ID{0x72, 0x65, 0x63, 0x6f, 0x76, 0x65, 0x72, 0x79, 1}
-	record, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
-		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 1, RecoveryDeadline: time.Now().Add(time.Minute).UnixNano(),
-		Participants: []distributedtxn.ParticipantRef{{
-			Distribution:         []byte(cluster.bases[leader].Binding.Distribution),
-			Shard:                []byte(cluster.bases[leader].Binding.Shard),
-			RoutingVersion:       uint64(cluster.bases[leader].Binding.Authority.RoutingVersion),
-			AllocationGeneration: cluster.bases[leader].Binding.AllocationGeneration,
-			OwnershipEpoch:       uint64(cluster.bases[leader].Binding.Authority.OwnershipEpoch),
-			MutationDigest:       distributedtxn.Digest(sha256.Sum256([]byte("recovery-read"))),
-			State:                distributedtxn.ParticipantStaged,
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	record := rf3TransactionCoordinatorRecord(t, cluster.bases[leader], id,
+		distributedtxn.Digest(sha256.Sum256([]byte("recovery-read"))))
 	stage := rf3TransactionCommand(t, cluster.bases[leader], distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedStageCoordinator,
