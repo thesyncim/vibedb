@@ -160,6 +160,44 @@ func TestGatewaySplitSourceLookupBounds(t *testing.T) {
 	}
 }
 
+func TestGatewaySplitSourceProfileInventoryMatchesCanonicalSlots(t *testing.T) {
+	_, source, profile, _ := gatewayHotSplitFactoryFixture(t)
+	entry := gatewaySplitSourceFixture(t, source, profile)
+	if !gatewaySplitSourceProfilesMatch(entry, []gateway.ReplicatedTableProfile{profile}) {
+		t.Fatal("base rejected")
+	}
+	indexProfile := profile
+	indexProfile.Relation, indexProfile.Table, indexProfile.PrimaryKey = 2, "emails", "/key"
+	if gatewaySplitSourceProfilesMatch(entry, []gateway.ReplicatedTableProfile{profile, indexProfile}) {
+		t.Fatal("public relation absent from exact SQL bundle accepted")
+	}
+	// This unit checks the inventory projection only. The composed Linux test
+	// below uses sealed SQL and recomputes both authenticated schema digests.
+	index := entry.SQL.Relations[0]
+	index.Relation, index.Kind, index.Table = 2, sqldriver.ReplicatedShardRelationGlobalIndex, indexProfile.Table
+	entry.SQL.Relations = append(entry.SQL.Relations, index)
+	if !gatewaySplitSourceProfilesMatch(entry, []gateway.ReplicatedTableProfile{profile, indexProfile}) {
+		t.Fatal("colocated exact index mistaken for another base")
+	}
+	for _, mutate := range []func(*gateway.ReplicatedTableProfile){
+		func(p *gateway.ReplicatedTableProfile) { p.Table = "foreign" },
+		func(p *gateway.ReplicatedTableProfile) { p.Relation = 3 },
+		func(p *gateway.ReplicatedTableProfile) { p.MaxKeyBytes++ },
+		func(p *gateway.ReplicatedTableProfile) { p.MaxDocumentBytes++ },
+		func(p *gateway.ReplicatedTableProfile) { p.SchemaGeneration++ },
+		func(p *gateway.ReplicatedTableProfile) { p.LogicalSchemaDigest[0]++ },
+	} {
+		bad := indexProfile
+		mutate(&bad)
+		if gatewaySplitSourceProfilesMatch(entry, []gateway.ReplicatedTableProfile{profile, bad}) {
+			t.Fatal("unbound index profile accepted")
+		}
+	}
+	if gatewaySplitSourceProfilesMatch(entry, []gateway.ReplicatedTableProfile{profile, profile}) {
+		t.Fatal("repeated base accepted")
+	}
+}
+
 func TestGatewaySplitSourcesSelectSeparateRootsOnSharedHosts(t *testing.T) {
 	initial, source, profile, work := gatewayHotSplitFactoryFixture(t)
 	other := source

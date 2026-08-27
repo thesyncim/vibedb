@@ -124,7 +124,7 @@ func gatewayHotSplitSource(
 	count := 0
 	for _, candidate := range catalog.ReplicatedTableProfiles() {
 		candidatePlacement, ok := catalog.Placement(candidate.Table)
-		if ok && candidatePlacement.Distribution == source.Distribution {
+		if ok && candidatePlacement.Distribution == source.Distribution && candidate.Relation == 1 {
 			profile, placement, count = candidate, candidatePlacement, count+1
 		}
 	}

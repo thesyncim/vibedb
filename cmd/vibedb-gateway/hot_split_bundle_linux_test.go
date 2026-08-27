@@ -74,6 +74,14 @@ func TestGatewayHotSplitComposedLocalGlobalBundle(t *testing.T) {
 			placement, _ := initial.Placement(profile.Table)
 			route, _ := initial.Manifest(source.Distribution)
 			config.Distributions, config.Placements, config.Manifests = []distribution.DistributionSpec{spec}, []distribution.TablePlacement{placement}, []*distribution.Manifest{route}
+			profiles := []gateway.ReplicatedTableProfile{profile}
+			if global {
+				relation := entry.SQL.Relations[1]
+				config.Placements = append(config.Placements, distribution.TablePlacement{Table: relation.Table, Distribution: source.Distribution, Columns: []string{"/key"}})
+				profiles = append(profiles, gateway.ReplicatedTableProfile{Table: relation.Table, Relation: replication.RelationID(relation.Relation), PrimaryKey: "/key",
+					SchemaGeneration: profile.SchemaGeneration, LogicalSchemaDigest: profile.LogicalSchemaDigest,
+					MaxKeyBytes: uint16(relation.Limits.MaxKeyBytes), MaxDocumentBytes: uint32(relation.Limits.MaxDocumentBytes)})
+			}
 			addresses := make(map[distribution.EndpointID]string)
 			for _, replica := range source.Replicas {
 				for _, endpoint := range []distribution.EndpointID{replica.Endpoint, replica.NativeEndpoint, replica.ControlEndpoint} {
@@ -84,9 +92,13 @@ func TestGatewayHotSplitComposedLocalGlobalBundle(t *testing.T) {
 				}
 			}
 			catalog, err := gateway.NewSnapshotWithReplicatedTableMetadata(config, addresses, initial.Generation(), nil, nil,
-				[]gateway.ReplicatedShardDescriptor{source}, []gateway.ReplicatedTableProfile{profile})
+				[]gateway.ReplicatedShardDescriptor{source}, profiles)
 			if err != nil {
 				t.Fatal(err)
+			}
+			selected, selectedProfile, _, err := gatewayHotSplitSource(catalog, work)
+			if err != nil || selected.Group != source.Group || selectedProfile != profile {
+				t.Fatalf("actual public bundle source selection: %v", err)
 			}
 			inventory := gatewayReplicaControlManifest{SplitSources: []gatewaySplitSource{entry}}
 			for _, replica := range source.Replicas {

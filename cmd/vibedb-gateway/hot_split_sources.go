@@ -143,8 +143,14 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 		byGroup[descriptor.Group] = descriptor
 	}
 	byTable := make(map[string]gateway.ReplicatedTableProfile, len(profiles))
+	byDistribution := make(map[distribution.DistributionName][]gateway.ReplicatedTableProfile)
 	for _, profile := range profiles {
 		byTable[profile.Table] = profile
+		placement, ok := catalog.Placement(profile.Table)
+		if !ok {
+			return nil, hotshard.ErrInvalidPressureCut
+		}
+		byDistribution[placement.Distribution] = append(byDistribution[placement.Distribution], profile)
 	}
 	result := make(map[raftmember.GroupKey]gatewaySplitSource, len(sources))
 	// A node-local root cannot authorize two independent source groups.
@@ -164,7 +170,7 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 			len(descriptor.Replicas) != gateway.ServingReplicaCount {
 			return nil, hotshard.ErrInvalidPressureCut
 		}
-		if !gatewaySplitSourceSQLIdentityMatches(source) || source.SQL.Binding.Distribution != string(descriptor.Distribution) ||
+		if !gatewaySplitSourceSQLIdentityMatches(source) || !gatewaySplitSourceProfilesMatch(source, byDistribution[descriptor.Distribution]) || source.SQL.Binding.Distribution != string(descriptor.Distribution) ||
 			source.SQL.Binding.Shard != string(descriptor.Shard) || source.SQL.Binding.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
 			source.SQL.UserPrimaryKey != profile.PrimaryKey || source.SQL.UserLimits.MaxKeyBytes != int(profile.MaxKeyBytes) ||
 			source.SQL.UserLimits.MaxDocumentBytes != int(profile.MaxDocumentBytes) ||
@@ -257,4 +263,34 @@ func gatewaySplitSourceMatches(source gatewaySplitSource, descriptor gateway.Rep
 		source.SchemaGeneration == profile.SchemaGeneration && source.RelationManifestDigest == descriptor.Command.RelationManifestDigest &&
 		source.LogicalSchemaDigest == descriptor.LogicalSchemaDigest && source.LogicalSchemaDigest == profile.LogicalSchemaDigest &&
 		source.Table == profile.Table && profile.Relation == 1
+}
+
+// Public colocated index profiles do not create a second base table. Every
+// advertised relation must still belong to the authenticated full SQL bundle;
+// indexing by its canonical relation slot bounds startup work by bundle size.
+func gatewaySplitSourceProfilesMatch(source gatewaySplitSource, profiles []gateway.ReplicatedTableProfile) bool {
+	if len(profiles) == 0 || len(profiles) > len(source.SQL.Relations) {
+		return false
+	}
+	base := 0
+	for _, profile := range profiles {
+		if profile.Relation == 0 || int(profile.Relation) > len(source.SQL.Relations) {
+			return false
+		}
+		relation := source.SQL.Relations[int(profile.Relation)-1]
+		if relation.Relation != uint16(profile.Relation) || relation.Table != profile.Table ||
+			profile.SchemaGeneration != source.SchemaGeneration || profile.LogicalSchemaDigest != source.LogicalSchemaDigest ||
+			relation.Limits.MaxKeyBytes != int(profile.MaxKeyBytes) || relation.Limits.MaxDocumentBytes != int(profile.MaxDocumentBytes) {
+			return false
+		}
+		if profile.Relation == 1 {
+			if relation.Kind != sqldriver.ReplicatedShardRelationJSON || profile.PrimaryKey != source.SQL.UserPrimaryKey {
+				return false
+			}
+			base++
+		} else if relation.Kind != sqldriver.ReplicatedShardRelationGlobalIndex {
+			return false
+		}
+	}
+	return base == 1
 }
