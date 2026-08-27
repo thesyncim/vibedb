@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -519,11 +520,35 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	default:
 		t.Fatalf("split source leader=%d", splitLeader)
 	}
+	partitionMember := uint64(0)
+	var partitionProcess *rf3testfixture.ExternalProcess
+	for _, replica := range servingRoute.Replicas {
+		if replica.Member == splitLeader {
+			continue
+		}
+		partitionMember = replica.Member
+		if replica.Member == 4 {
+			partitionProcess = coldProcess
+		} else {
+			partitionProcess = processes[int(replica.Member)-1]
+		}
+		break
+	}
+	if partitionProcess == nil || partitionProcess.PID() == 0 {
+		t.Fatal("no live source follower available for split partition")
+	}
+	if signalErr := syscall.Kill(partitionProcess.PID(), syscall.SIGSTOP); signalErr != nil {
+		t.Fatalf("partition split follower %d: %v", partitionMember, signalErr)
+	}
 	if err = splitLeaderProcess.Kill(ctx); err != nil {
 		t.Fatalf("kill split source leader %d: %v", splitLeader, err)
 	}
 	if err = splitLeaderProcess.Start(); err != nil {
 		t.Fatalf("restart split source leader %d: %v", splitLeader, err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if signalErr := syscall.Kill(partitionProcess.PID(), syscall.SIGCONT); signalErr != nil {
+		t.Fatalf("heal split follower %d: %v", partitionMember, signalErr)
 	}
 	if err = splitLeaderProcess.WaitReady(ctx, "vibedb-shard RF3"); err != nil {
 		t.Fatalf("restarted split source leader %d: %v\n%s", splitLeader, err, splitLeaderProcess.Diagnostics())
@@ -599,12 +624,7 @@ func hotMutationAssertStaleParentRefused(
 	defer client.Close()
 	fence := shardservice.ReplicatedFence{
 		Group: route.Group, AllocationGeneration: route.AllocationGeneration,
-		ReplicaSetVersion:      route.Command.ReplicaSetVersion,
-		ActivePolicyGeneration: route.Command.ActivePolicyGeneration,
-		ProtectionEpoch:        route.Command.ProtectionEpoch, OwnershipEpoch: route.Command.OwnershipEpoch,
-		SchemaGeneration:       route.Command.SchemaGeneration,
-		RelationManifestDigest: route.Command.RelationManifestDigest,
-		RoutingVersion:         route.Command.RoutingVersion, RouteGeneration: route.Command.RouteGeneration,
+		Command: route.Command,
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
