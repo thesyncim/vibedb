@@ -148,8 +148,9 @@ preparation validates it against the exact authenticated relation identity
 before creating storage; it does not infer a schema from table names.
 
 The base-only example below omits those optional fields. Full-schema child
-preparation is implemented, but automatic gateway allocation of bundled
-children still needs the authenticated source-schema inventory. See
+preparation uses the gateway's explicit `split_sources` inventory, including
+the actual prepared SQL identity, local-index definitions, and immutable
+placement profile. The composed Linux serving-split gate remains unqualified. See
 [Online range-split status](distributed.md#online-range-split-status).
 
 A manually configured gateway-backed test needs catalog, request-ledger, and

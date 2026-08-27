@@ -139,6 +139,11 @@ domains separately. The schema-rollout caller audit for that distinction is
 still pending, so the gates below are not a claim that every logical-to-machine
 digest caller is qualified.
 
+Persisted schema-directory publication and directory-sync recovery are under
+independent review. Local rollover/reopen tests do not establish power-loss
+safety at every filesystem publication cut. Required Linux integration runs
+are still failing or pending; this remains an experimental rollout boundary.
+
 Repository gates cover restart after a leader-loss outcome-unknown error, the
 mixed-generation interval, refusal to roll back after authorization, an old
 global catalog until every replica is active, and exact completion from a fresh

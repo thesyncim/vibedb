@@ -190,6 +190,11 @@ bundles, including restart after partial schema creation. The gateway's
 `split_sources` inventory selects an exact group/schema/machine-digest binding
 and separate per-node templates and roots; there is no shared-template fallback.
 An empty inventory disables split intake without disabling replica moves.
+Planning does not prepare remote storage. The controller first commits the
+exact plan intent in catalog Raft, then persists a pending preparation step
+before sending child-preparation requests. It records settled receipts before
+admitting the shard runtime. Restart retries the same committed intent and
+receipts; activated, drained, and terminal operations do not prepare again.
 The inventory now includes authenticated source SQL, local-index definitions,
 and the immutable placement profile. Logical table schema and per-shard machine
 digests are separate; allocation and plan preparation share one geometry-derived
@@ -203,14 +208,15 @@ An unfinished split reuses an already adopted child instead of reopening its
 exclusively owned SQL store. This has local fault and race coverage, not yet
 the required Linux external kill/restart proof.
 
-Remaining integration gates include admission-before-preparation (to avoid
-orphan child reservations), exact source-versus-catalog fence handling through
-durable seal and reopen, and gateway discovery of descendant split sources.
+Remaining integration gates include exact source-versus-catalog fence handling
+through durable seal and reopen, and gateway discovery of descendant split sources.
 Unlisted sources fail closed. Certified child catalog projection alone does
 not prove a serving cutover; completion requires the composed
 allocation-through-publication and process-restart gates.
-Mandatory Linux split-under-load fault gates remain Partial until CI records
-their required unskipped runs.
+The first composed serving split and repeated descendant splits remain
+unqualified. Mandatory Linux split-under-load fault gates remain Partial while
+CI is failing; local unit and race results do not replace their required
+unskipped runs.
 
 ## Send requests
 
