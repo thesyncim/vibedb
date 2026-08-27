@@ -1,9 +1,12 @@
 package storeio
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 )
+
+var ErrGenerationMigrationStarved = errors.New("vibedb: generation migration reconciliation starved")
 
 // GenerationMigrationDirtySet is a fixed-memory coalescing set of immutable
 // source leaf identities dirtied while a replacement generation is copied.
@@ -141,4 +144,67 @@ func (s *GenerationMigrationDirtySet) Capacity() int {
 		return 0
 	}
 	return len(s.entries)
+}
+
+type GenerationMigrationReconcileStats struct {
+	Rounds, Recopied, TopologyRevalidations int
+	ObservedGeneration                      uint64
+}
+
+// ReconcileGenerationMigration drains bounded dirty rounds outside the final
+// writer fence. New publications observed during callbacks enter the next
+// round. Exhausting maxRounds is a typed starvation result; callers should
+// pause/back off before retrying rather than monopolizing foreground writes.
+func ReconcileGenerationMigration(
+	dirty *GenerationMigrationDirtySet,
+	maxRounds int,
+	scratch []uint64,
+	recopy func(id uint64) error,
+	revalidateTopology func() error,
+) (GenerationMigrationReconcileStats, error) {
+	var stats GenerationMigrationReconcileStats
+	if dirty == nil || maxRounds < 1 || cap(scratch) < dirty.Capacity() ||
+		recopy == nil || revalidateTopology == nil {
+		return stats, fmt.Errorf("%w: migration reconcile", ErrInvalidWrite)
+	}
+	for round := 0; round < maxRounds; round++ {
+		ids, generation, topology := dirty.Drain(scratch[:0])
+		if generation > stats.ObservedGeneration {
+			stats.ObservedGeneration = generation
+		}
+		if len(ids) == 0 && !topology {
+			return stats, nil
+		}
+		stats.Rounds++
+		if topology {
+			if err := revalidateTopology(); err != nil {
+				return stats, err
+			}
+			stats.TopologyRevalidations++
+		}
+		for _, id := range ids {
+			if err := recopy(id); err != nil {
+				return stats, err
+			}
+			stats.Recopied++
+		}
+	}
+	ids, _, topology := dirty.Drain(scratch[:0])
+	if len(ids) != 0 || topology {
+		// Preserve the terminal work for a later backed-off retry. Re-marking can
+		// only fail if callbacks concurrently refilled the entire bounded set;
+		// that is already explicit queue backpressure and the migration aborts.
+		for _, id := range ids {
+			if err := dirty.Mark(id, max(stats.ObservedGeneration, 1)); err != nil {
+				return stats, errors.Join(ErrGenerationMigrationStarved, err)
+			}
+		}
+		if topology {
+			dirty.mu.Lock()
+			dirty.topology = true
+			dirty.mu.Unlock()
+		}
+		return stats, ErrGenerationMigrationStarved
+	}
+	return stats, nil
 }

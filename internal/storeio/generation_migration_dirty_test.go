@@ -99,3 +99,48 @@ func TestGenerationMigrationDirtySetWarmObserverIsZeroAllocation(t *testing.T) {
 		t.Fatalf("observer allocs/run = %.2f, want 0", allocs)
 	}
 }
+
+func TestReconcileGenerationMigrationIteratesAndBoundsStarvation(t *testing.T) {
+	dirty, err := NewGenerationMigrationDirtySet(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dirty.Mark(1, 10); err != nil {
+		t.Fatal(err)
+	}
+	recopies := 0
+	stats, err := ReconcileGenerationMigration(
+		dirty, 4, make([]uint64, 0, dirty.Capacity()),
+		func(id uint64) error {
+			recopies++
+			if id == 1 && recopies == 1 {
+				return dirty.Mark(2, 11)
+			}
+			return nil
+		},
+		func() error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Rounds != 2 || stats.Recopied != 2 ||
+		stats.ObservedGeneration != 11 {
+		t.Fatalf("reconcile stats = %+v", stats)
+	}
+
+	if err := dirty.Mark(7, 12); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = ReconcileGenerationMigration(
+		dirty, 2, make([]uint64, 0, dirty.Capacity()),
+		func(id uint64) error { return dirty.Mark(id, 13) },
+		func() error { return nil },
+	)
+	if !errors.Is(err, ErrGenerationMigrationStarved) || stats.Rounds != 2 {
+		t.Fatalf("starved reconcile = %+v,%v", stats, err)
+	}
+	ids, _, _ := dirty.Drain(make([]uint64, 0, dirty.Capacity()))
+	if len(ids) != 1 || ids[0] != 7 {
+		t.Fatalf("starvation lost terminal work: %v", ids)
+	}
+}
