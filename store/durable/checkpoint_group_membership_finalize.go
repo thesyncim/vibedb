@@ -40,21 +40,11 @@ func (g *CheckpointGroup) FinalizeMembershipTransition(
 		return errors.Join(ErrCheckpointMembershipTransition, err)
 	}
 	current := g.certificateLocked()
+	if !checkpointMembershipCommittedSourceMatches(prior, current, committedApplied, commandDigest) {
+		return ErrCheckpointMembershipTransition
+	}
 	if prior.prepared.Sequence != 0 {
-		if prior.applied != committedApplied || prior.commandDigest != commandDigest ||
-			prior.source != checkpointMembershipSourceDigest(current) {
-			return ErrCheckpointMembershipTransition
-		}
 		return g.ensureMembershipDurableLocked(prior)
-	}
-	if prior.sequence == math.MaxUint64 || prior.applied == math.MaxUint64 || prior.txnHighWater == math.MaxUint64 ||
-		current.applied != committedApplied || current.applied != prior.applied+1 || current.txnHighWater != prior.txnHighWater+1 {
-		return ErrCheckpointMembershipTransition
-	}
-	before := current
-	before.applied, before.txnHighWater = prior.applied, prior.txnHighWater
-	if checkpointMembershipSourceDigest(before) != prior.source {
-		return ErrCheckpointMembershipTransition
 	}
 	if err := g.ensureMembershipDurableLocked(prior); err != nil {
 		return err
@@ -100,6 +90,63 @@ func (g *CheckpointGroup) FinalizeMembershipTransition(
 	}
 	g.membershipDurableSequence = final.sequence
 	return nil
+}
+
+// ObserveCommittedSourceMembershipTransition verifies the exact source-side
+// recovery cut after one committed schema entry. The caller must first verify
+// that entry's complete command, term/index, and source schema contract; the
+// prepared membership record predates the command and cannot prove its bytes.
+// A finalized record additionally binds commandDigest to the original witness.
+//
+// This read-only check never finalizes membership, selects the target, syncs
+// files, or grants serving authority. The reopened source must remain fenced.
+// It accepts neither an uncheckpointed live apply nor an already-selected
+// target, even if the target is at the same applied index as the source cut.
+func (g *CheckpointGroup) ObserveCommittedSourceMembershipTransition(
+	witness CheckpointMembershipWitness,
+	authorization [sha256.Size]byte,
+	committedApplied uint64,
+	commandDigest [sha256.Size]byte,
+) error {
+	if g == nil || witness.Sequence == 0 || authorization == ([sha256.Size]byte{}) ||
+		committedApplied == 0 || commandDigest == ([sha256.Size]byte{}) {
+		return ErrCheckpointMembershipTransition
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.checkUsableLocked(); err != nil {
+		return err
+	}
+	record, err := openCheckpointMembershipCertificate(g.log)
+	if err != nil || checkpointMembershipWitness(record) != witness || record.authorization != authorization {
+		return errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	current := g.certificateLocked()
+	if current.applied != g.certApplied.Load() || current.txnHighWater != g.certTxn.Load() ||
+		!checkpointMembershipCommittedSourceMatches(record, current, committedApplied, commandDigest) {
+		return ErrCheckpointMembershipTransition
+	}
+	return nil
+}
+
+func checkpointMembershipCommittedSourceMatches(
+	record checkpointMembershipCertificate, current checkpointGroupCertificate,
+	committedApplied uint64, commandDigest [sha256.Size]byte,
+) bool {
+	if current.applied != committedApplied {
+		return false
+	}
+	if record.prepared.Sequence != 0 {
+		return record.applied == committedApplied && record.commandDigest == commandDigest &&
+			record.source == checkpointMembershipSourceDigest(current)
+	}
+	if record.sequence == math.MaxUint64 || record.applied == math.MaxUint64 || record.txnHighWater == math.MaxUint64 ||
+		current.applied != record.applied+1 || current.txnHighWater != record.txnHighWater+1 {
+		return false
+	}
+	before := current
+	before.applied, before.txnHighWater = record.applied, record.txnHighWater
+	return checkpointMembershipSourceDigest(before) == record.source
 }
 
 func (g *CheckpointGroup) ensureMembershipDurableLocked(record checkpointMembershipCertificate) error {

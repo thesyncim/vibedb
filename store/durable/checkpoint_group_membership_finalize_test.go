@@ -266,6 +266,9 @@ func TestCheckpointMembershipFinalizationCrashCutsRecoverOriginalWitness(t *test
 			if activated.applied != 2 || activated.members[0].storeID != source[0].Collection.storeID || activated.members[1].storeID != fresh.Collection.storeID {
 				t.Fatal("wrong finalized cut or shared/replaced membership")
 			}
+			if err := activated.ObserveCommittedSourceMembershipTransition(witness, auth, 2, command); !errors.Is(err, ErrCheckpointMembershipTransition) {
+				t.Fatal("selected target masqueraded as prepared source", err)
+			}
 			if err := ValidateSelectedCheckpointMembershipTransition(image, witness, auth, 2, command); err != nil {
 				t.Fatal("selected target not witnessed", err)
 			}
