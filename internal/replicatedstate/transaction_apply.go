@@ -1318,6 +1318,7 @@ func (m *Machine) planStoredTransactionMutations(
 	dataChain [sha256.Size]byte,
 	snapshots relationPointSnapshots,
 ) ([]finalMutation, []plannedRelationChanges, [sha256.Size]byte, int64, uint32, error) {
+	m.canonicalMutations.begin(command, rows)
 	if snapshots.count != uint16(len(m.relations)) {
 		return nil, nil, dataChain, 0, 0, ErrInconsistentSnapshot
 	}

@@ -16,6 +16,7 @@ import (
 )
 
 const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;" +
+	"json-canonical-afterimage-before-validation-condition-capture-hash-persistence;" +
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
 	"strict-put-absent-conflict;put-present-missing-zero-rows;" +
 	"json-relation-affected-rows;global-index-results-excluded;fixed-mutation-result-int64;" +
@@ -37,7 +38,7 @@ const deterministicBundleApplySemantics = "ordered-dense-relation-batches;" +
 	"mutable-owned-range-proof-or-complete-keyspace;wrong-shard-prepare-vote;" +
 	"global-put-absent-or-vibejson-semantic-equal;" +
 	"global-delete-raw-length-and-sha256-equal;" +
-	"json-put-absent-or-raw-equal;json-put-raw-length-and-sha256-equal;" +
+	"json-put-absent-or-canonical-equal;json-put-raw-length-and-sha256-equal;" +
 	"json-delete-raw-length-and-sha256-equal;" +
 	"global-duplicate-key-conflict;byte-native-global-locator-array"
 

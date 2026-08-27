@@ -1155,6 +1155,7 @@ func (m *Machine) planBundleCommandUnaccounted(
 	scratch *commandPlanScratch,
 ) (commandPlan, error) {
 	scratch.begin()
+	m.canonicalMutations.begin(command, nil)
 	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
 	plan.authorityDigest = AuthorityIdentityKey(command.Tenant, command.ClientID)
 	plan.authorityKey = AuthorityBindingStorageKey(plan.authorityDigest)
@@ -1959,7 +1960,16 @@ func (m *Machine) planMutations(
 			return nil, 0, ResultTargetBound, nil
 		}
 		if !mutation.delete {
-			if err := vibejson.Validate(mutation.value); err != nil {
+			if relation.kind == RelationJSON {
+				value, code := m.canonicalMutationValue(mutation.value)
+				if code != ResultApplied {
+					return nil, 0, code, nil
+				}
+				mutation.value = value
+				if len(value) > target.Limits.MaxDocumentBytes {
+					return nil, 0, ResultTargetBound, nil
+				}
+			} else if err := vibejson.Validate(mutation.value); err != nil {
 				return nil, 0, ResultInvalidDocument, nil
 			}
 			if relation.kind == RelationGlobalIndex &&
@@ -2267,6 +2277,7 @@ func (m *Machine) releaseMutationPlan() {
 	m.bundlePlan = m.bundlePlan[:0]
 	clear(m.bundleRelations)
 	m.bundleRelations = m.bundleRelations[:0]
+	m.canonicalMutations.release()
 }
 
 // pointSnapshot is the planning capability. It exposes point reads plus one

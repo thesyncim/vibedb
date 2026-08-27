@@ -56,6 +56,7 @@ type Machine struct {
 	applyContract          [32]byte
 	dataChainHash          *dataChainHasher
 	mutationPlan           []finalMutation
+	canonicalMutations     canonicalMutationScratch
 	mutationInline         [8]finalMutation
 	bundlePlan             []finalMutation
 	bundleRelations        []plannedRelationChanges
