@@ -334,9 +334,10 @@ func startGatewayReplicaControllers(
 			movePass, moveErr := moves.RunPass(ctx)
 			if moveErr != nil && !errors.Is(moveErr, context.Canceled) {
 				logf("gateway: replica move controller: %v", moveErr)
-			} else if movePass.Advanced != 0 || movePass.Completed != 0 {
-				logf("gateway: replica move controller advanced %d/%d move(s), completed %d",
-					movePass.Advanced, movePass.Moves, movePass.Completed)
+			} else if movePass.Advanced != 0 || movePass.Completed != 0 || movePass.AbandonmentDeleted != 0 {
+				logf("gateway: replica move controller advanced %d/%d move(s), completed %d; abandoned %d/%d witnessed (%d scanned, %d bytes)",
+					movePass.Advanced, movePass.Moves, movePass.Completed, movePass.AbandonmentDeleted,
+					movePass.AbandonmentWitnessed, movePass.AbandonmentScanned, movePass.AbandonmentBytes)
 			}
 			select {
 			case <-ctx.Done():

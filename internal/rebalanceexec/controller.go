@@ -21,10 +21,20 @@ type MoveDirectory interface {
 // reconciler. It intentionally has no process-local queue or progress cursor:
 // every restart rediscovers work and resumes from the replicated record.
 type Controller struct {
-	directory MoveDirectory
-	journal   rebalance.ReplicatedOperationJournal
-	observer  rebalance.ReplicatedMoveObserver
-	executor  rebalance.ReplicatedMoveActionExecutor
+	directory         MoveDirectory
+	journal           rebalance.ReplicatedOperationJournal
+	observer          rebalance.ReplicatedMoveObserver
+	executor          rebalance.ReplicatedMoveActionExecutor
+	abandonment       *AbandonmentScheduler
+	abandonmentCursor AbandonmentSchedulerCursor
+}
+
+func (controller *Controller) InstallAbandonmentScheduler(scheduler *AbandonmentScheduler) bool {
+	if controller == nil || scheduler == nil || controller.abandonment != nil {
+		return false
+	}
+	controller.abandonment = scheduler
+	return true
 }
 
 func NewController(
@@ -71,10 +81,14 @@ func (controller *Controller) Resume(
 }
 
 type ControllerPass struct {
-	Discovered uint32
-	Moves      uint32
-	Advanced   uint32
-	Completed  uint32
+	Discovered           uint32
+	Moves                uint32
+	Advanced             uint32
+	Completed            uint32
+	AbandonmentScanned   uint32
+	AbandonmentWitnessed uint32
+	AbandonmentDeleted   uint32
+	AbandonmentBytes     uint64
 }
 
 // RunPass discovers the complete catalog-bounded work directory and advances
@@ -91,6 +105,17 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 	}
 	pass := ControllerPass{Discovered: uint32(len(ids))}
 	var failures error
+	if controller.abandonment != nil {
+		abandoned, abandonErr := controller.abandonment.RunPass(ctx, controller.abandonmentCursor)
+		controller.abandonmentCursor = abandoned.Cursor
+		if abandoned.Done {
+			controller.abandonmentCursor = AbandonmentSchedulerCursor{}
+		}
+		pass.AbandonmentScanned, pass.AbandonmentWitnessed, pass.AbandonmentDeleted =
+			abandoned.Scanned, abandoned.Witnessed, abandoned.Deleted
+		pass.AbandonmentBytes = abandoned.ScheduledBytes
+		failures = errors.Join(failures, abandonErr)
+	}
 	for index := range ids {
 		if err = ctx.Err(); err != nil {
 			return pass, errors.Join(failures, err)
@@ -104,6 +129,9 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 			continue
 		}
 		if record.Kind != gateway.ReplicatedOperationMove {
+			continue
+		}
+		if record.State == gateway.ReplicatedOperationCancelled {
 			continue
 		}
 		pass.Moves++

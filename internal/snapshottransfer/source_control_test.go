@@ -61,6 +61,17 @@ type testSourceExporter struct {
 	errorAfterExport error
 	releaseCalls     int
 	releaseErr       error
+	abandonCalls     int
+	abandonErr       error
+}
+
+func (exporter *testSourceExporter) AbandonReplicaMoveSnapshot(
+	context.Context, SourceControlRequest, ArtifactAbandonmentWitness,
+) error {
+	exporter.mu.Lock()
+	defer exporter.mu.Unlock()
+	exporter.abandonCalls++
+	return exporter.abandonErr
 }
 
 func (exporter *testSourceExporter) ReleaseReplicaMoveSnapshot(
@@ -309,6 +320,14 @@ func TestSourceControlCanonicalFixedProtocol(t *testing.T) {
 	if err != nil || readErr != nil || command != sourceControlRelease || releasedRequest != request {
 		t.Fatalf("release command=%d request=%+v append=%v read=%v", command, releasedRequest, err, readErr)
 	}
+	witness := testAbandonmentWitness(request, descriptor)
+	abandonRequest, err := appendSourceControlAbandonRequest(nil, request, witness)
+	command, abandonedRequest, readErr := readSourceControlCommand(bytes.NewReader(abandonRequest))
+	if err != nil || readErr != nil || command != sourceControlAbandon || abandonedRequest != request ||
+		len(abandonRequest) != SourceControlRequestBytes+AbandonmentWitnessBytes {
+		t.Fatalf("abandon command=%d request=%+v bytes=%d append=%v read=%v",
+			command, abandonedRequest, len(abandonRequest), err, readErr)
+	}
 	forged := append([]byte(nil), encoded...)
 	forged[len(forged)-1] = 1
 	if _, err = OpenSourceControlRequest(forged); !errors.Is(err, ErrSourceControl) {
@@ -327,6 +346,55 @@ func TestSourceControlCanonicalFixedProtocol(t *testing.T) {
 	}
 	if _, err = OpenSourceControlResponse(append(response, 0)); !errors.Is(err, ErrSourceControl) {
 		t.Fatalf("trailing response err=%v", err)
+	}
+}
+
+func TestSourceControlClientRoutesExactReplicatedAbandonment(t *testing.T) {
+	request, descriptor := sourceControlFixture()
+	witness := testAbandonmentWitness(request, descriptor)
+	controller := rafttransport.PeerIdentity{Node: rafttransport.NodeID{9}, TrustDomain: sourceTrustDomain(request)}
+	sourceIdentity := rafttransport.PeerIdentity{Node: request.SourceNode, TrustDomain: sourceTrustDomain(request)}
+	journal := &memorySourceJournal{records: map[[32]byte]SourceControlRecord{
+		request.Operation: {Request: request, Revision: 1, State: SourceControlRunning},
+	}}
+	exporter := &testSourceExporter{descriptor: descriptor}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	service, err := NewSourceControlService(SourceControlOptions{Journal: journal, Exporter: exporter,
+		Authorize: func(peer rafttransport.PeerIdentity, got SourceControlRequest) bool {
+			return peer == controller && got == request
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 2)
+	opener := bootstrapOpenFunc(func(_ context.Context, node rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+		if node != request.SourceNode {
+			return nil, ErrSourceConflict
+		}
+		clientSide, serverSide := net.Pipe()
+		go func() {
+			done <- service.Serve(context.Background(), &testPeerConn{
+				Conn: serverSide, identity: controller, class: rafttransport.TrafficShardControl})
+		}()
+		return &testPeerConn{Conn: clientSide, identity: sourceIdentity, class: rafttransport.TrafficShardControl}, nil
+	})
+	client, err := NewSourceControlClient(SourceControlClientOptions{Opener: opener,
+		ReadDeadline: deadline, WriteDeadline: deadline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = client.AbandonReplicaMoveSnapshot(t.Context(), request, witness); err != nil {
+		t.Fatal(err)
+	}
+	if serveErr := <-done; serveErr != nil || exporter.abandonCalls != 1 {
+		t.Fatalf("serve=%v abandon calls=%d", serveErr, exporter.abandonCalls)
+	}
+	if err = client.AbandonReplicaMoveSnapshot(t.Context(), request, witness); err != nil {
+		t.Fatal(err)
+	}
+	if serveErr := <-done; serveErr != nil || exporter.abandonCalls != 1 {
+		t.Fatalf("retry serve=%v abandon calls=%d", serveErr, exporter.abandonCalls)
 	}
 }
 

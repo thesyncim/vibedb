@@ -24,7 +24,7 @@ func (authority abandonmentAuthority) ReadArtifactAbandonment(
 
 func testAbandonmentWitness(request SourceControlRequest, descriptor Descriptor) ArtifactAbandonmentWitness {
 	return ArtifactAbandonmentWitness{
-		Operation: request.Operation, Artifact: descriptor.ArtifactHash,
+		Operation: request.Operation, Step: request.Step, Artifact: descriptor.ArtifactHash,
 		TargetStore: descriptor.TargetStore, TargetIncarnation: descriptor.TargetIncarnation,
 		SchemaGeneration: descriptor.SchemaGeneration, ReplicaSetVersion: descriptor.ReplicaSetVersion,
 		Owner: request.SourceNode, OwnerEpoch: 7, LeaseRevision: 8,
@@ -79,7 +79,7 @@ func TestAbandonmentWitnessCanonicalFixedGrammar(t *testing.T) {
 		}
 	}
 	corrupt := bytes.Clone(raw)
-	corrupt[40]++
+	corrupt[72]++
 	if _, err = OpenAbandonmentWitness(corrupt); !errors.Is(err, ErrAbandonment) {
 		t.Fatalf("mismatched artifact accepted: %v", err)
 	}

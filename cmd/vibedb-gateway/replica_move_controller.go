@@ -50,7 +50,17 @@ func newGatewayReplicaMoveController(
 	if err != nil {
 		return nil, err
 	}
-	return rebalanceexec.NewController(authority, authority, controls.Observer, executor)
+	controller, err := rebalanceexec.NewController(authority, authority, controls.Observer, executor)
+	if err != nil {
+		return nil, err
+	}
+	if source, ok := controls.Snapshots.(rebalanceexec.SnapshotAbandonmentClient); ok {
+		controller.InstallAbandonmentScheduler(&rebalanceexec.AbandonmentScheduler{
+			Directory: authority, Authority: rebalanceexec.CatalogAbandonmentAuthority{Journal: authority},
+			Source: source, MaxRecords: 64, MaxBytes: 4 << 30,
+		})
+	}
+	return controller, nil
 }
 
 type replicaMovePassRunner interface {
@@ -75,10 +85,11 @@ func runReplicaMoveController(
 		pass, err := controller.RunPass(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logf("gateway: replica move controller: %v", err)
-		} else if pass.Advanced != 0 || pass.Completed != 0 {
+		} else if pass.Advanced != 0 || pass.Completed != 0 || pass.AbandonmentDeleted != 0 {
 			logf(
-				"gateway: replica move controller advanced %d/%d move(s), completed %d",
-				pass.Advanced, pass.Moves, pass.Completed,
+				"gateway: replica move controller advanced %d/%d move(s), completed %d; abandoned %d/%d witnessed (%d scanned, %d bytes)",
+				pass.Advanced, pass.Moves, pass.Completed, pass.AbandonmentDeleted,
+				pass.AbandonmentWitnessed, pass.AbandonmentScanned, pass.AbandonmentBytes,
 			)
 		}
 		select {

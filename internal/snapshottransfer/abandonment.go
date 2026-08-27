@@ -12,7 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
-const AbandonmentWitnessBytes = 400
+const AbandonmentWitnessBytes = 432
 
 var abandonmentWitnessMagic = [8]byte{'V', 'B', 'A', 'B', 'N', 'D', 0, 0}
 
@@ -30,6 +30,7 @@ var (
 // mistaken for abandoned work.
 type ArtifactAbandonmentWitness struct {
 	Operation               [sha256.Size]byte
+	Step                    [sha256.Size]byte
 	Artifact                [sha256.Size]byte
 	TargetStore             [16]byte
 	TargetIncarnation       uint64
@@ -46,7 +47,8 @@ type ArtifactAbandonmentWitness struct {
 
 func (w ArtifactAbandonmentWitness) Valid() bool {
 	d := w.Descriptor
-	return w.Operation != ([sha256.Size]byte{}) && w.Artifact != ([sha256.Size]byte{}) &&
+	return w.Operation != ([sha256.Size]byte{}) && w.Step != ([sha256.Size]byte{}) &&
+		w.Artifact != ([sha256.Size]byte{}) &&
 		w.TargetStore != ([16]byte{}) && w.TargetIncarnation != 0 &&
 		w.SchemaGeneration != 0 && w.ReplicaSetVersion != 0 &&
 		w.Owner != (rafttransport.NodeID{}) && w.OwnerEpoch != 0 && w.LeaseRevision != 0 &&
@@ -68,18 +70,19 @@ func AppendAbandonmentWitness(dst []byte, witness ArtifactAbandonmentWitness) ([
 	out := dst[start:]
 	copy(out[:8], abandonmentWitnessMagic[:])
 	copy(out[8:40], witness.Operation[:])
-	copy(out[40:72], witness.Artifact[:])
-	copy(out[72:88], witness.TargetStore[:])
-	binary.BigEndian.PutUint64(out[88:96], witness.TargetIncarnation)
-	binary.BigEndian.PutUint64(out[96:104], witness.SchemaGeneration)
-	binary.BigEndian.PutUint64(out[104:112], witness.ReplicaSetVersion)
-	copy(out[112:128], witness.Owner[:])
-	binary.BigEndian.PutUint64(out[128:136], witness.OwnerEpoch)
-	binary.BigEndian.PutUint64(out[136:144], witness.LeaseRevision)
-	binary.BigEndian.PutUint64(out[144:152], witness.LeaseAppliedThrough)
-	binary.BigEndian.PutUint64(out[152:160], witness.AbandonedAppliedThrough)
-	binary.BigEndian.PutUint64(out[160:168], witness.AuthorityRevision)
-	encoded, err := AppendDescriptor(out[:168], witness.Descriptor)
+	copy(out[40:72], witness.Step[:])
+	copy(out[72:104], witness.Artifact[:])
+	copy(out[104:120], witness.TargetStore[:])
+	binary.BigEndian.PutUint64(out[120:128], witness.TargetIncarnation)
+	binary.BigEndian.PutUint64(out[128:136], witness.SchemaGeneration)
+	binary.BigEndian.PutUint64(out[136:144], witness.ReplicaSetVersion)
+	copy(out[144:160], witness.Owner[:])
+	binary.BigEndian.PutUint64(out[160:168], witness.OwnerEpoch)
+	binary.BigEndian.PutUint64(out[168:176], witness.LeaseRevision)
+	binary.BigEndian.PutUint64(out[176:184], witness.LeaseAppliedThrough)
+	binary.BigEndian.PutUint64(out[184:192], witness.AbandonedAppliedThrough)
+	binary.BigEndian.PutUint64(out[192:200], witness.AuthorityRevision)
+	encoded, err := AppendDescriptor(out[:200], witness.Descriptor)
 	if err != nil || len(encoded) != AbandonmentWitnessBytes {
 		return dst[:start], errors.Join(ErrAbandonment, err)
 	}
@@ -92,19 +95,20 @@ func OpenAbandonmentWitness(raw []byte) (ArtifactAbandonmentWitness, error) {
 	}
 	var witness ArtifactAbandonmentWitness
 	copy(witness.Operation[:], raw[8:40])
-	copy(witness.Artifact[:], raw[40:72])
-	copy(witness.TargetStore[:], raw[72:88])
-	witness.TargetIncarnation = binary.BigEndian.Uint64(raw[88:96])
-	witness.SchemaGeneration = binary.BigEndian.Uint64(raw[96:104])
-	witness.ReplicaSetVersion = binary.BigEndian.Uint64(raw[104:112])
-	copy(witness.Owner[:], raw[112:128])
-	witness.OwnerEpoch = binary.BigEndian.Uint64(raw[128:136])
-	witness.LeaseRevision = binary.BigEndian.Uint64(raw[136:144])
-	witness.LeaseAppliedThrough = binary.BigEndian.Uint64(raw[144:152])
-	witness.AbandonedAppliedThrough = binary.BigEndian.Uint64(raw[152:160])
-	witness.AuthorityRevision = binary.BigEndian.Uint64(raw[160:168])
+	copy(witness.Step[:], raw[40:72])
+	copy(witness.Artifact[:], raw[72:104])
+	copy(witness.TargetStore[:], raw[104:120])
+	witness.TargetIncarnation = binary.BigEndian.Uint64(raw[120:128])
+	witness.SchemaGeneration = binary.BigEndian.Uint64(raw[128:136])
+	witness.ReplicaSetVersion = binary.BigEndian.Uint64(raw[136:144])
+	copy(witness.Owner[:], raw[144:160])
+	witness.OwnerEpoch = binary.BigEndian.Uint64(raw[160:168])
+	witness.LeaseRevision = binary.BigEndian.Uint64(raw[168:176])
+	witness.LeaseAppliedThrough = binary.BigEndian.Uint64(raw[176:184])
+	witness.AbandonedAppliedThrough = binary.BigEndian.Uint64(raw[184:192])
+	witness.AuthorityRevision = binary.BigEndian.Uint64(raw[192:200])
 	var err error
-	witness.Descriptor, err = OpenDescriptor(raw[168:])
+	witness.Descriptor, err = OpenDescriptor(raw[200:])
 	if err != nil || !witness.Valid() {
 		return ArtifactAbandonmentWitness{}, errors.Join(ErrAbandonment, err)
 	}
@@ -221,6 +225,7 @@ func (collector *AbandonmentCollector) RunPass(
 		}
 		pass.Witnessed++
 		if !witness.Valid() || witness.Operation != record.Request.Operation ||
+			witness.Step != record.Request.Step || witness.Owner != record.Request.SourceNode ||
 			!descriptorMatchesSourceRequest(witness.Descriptor, record.Request) {
 			return pass, ErrAbandonment
 		}

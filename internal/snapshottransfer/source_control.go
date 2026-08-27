@@ -49,6 +49,7 @@ type sourceControlCommand uint8
 const (
 	sourceControlPrepare sourceControlCommand = iota
 	sourceControlRelease
+	sourceControlAbandon
 )
 
 // SourceControlRequest is the immutable identity of one journaled replica-move
@@ -89,6 +90,10 @@ type SourceControlExporter interface {
 	ObserveReplicaMoveSnapshot(context.Context, SourceControlRequest) (Descriptor, bool, error)
 	ExportReplicaMoveSnapshot(context.Context, SourceControlRequest) (Descriptor, error)
 	ReleaseReplicaMoveSnapshot(context.Context, SourceControlRequest, Descriptor) error
+}
+
+type SourceControlAbandoner interface {
+	AbandonReplicaMoveSnapshot(context.Context, SourceControlRequest, ArtifactAbandonmentWitness) error
 }
 
 // SourceExportPlanProvider owns source-specific Raft ReadIndex fencing and
@@ -163,6 +168,18 @@ func (exporter PinnedSourceControlExporter) ReleaseReplicaMoveSnapshot(
 	return exporter.Provider.ReleaseSourceExport(ctx, request, descriptor)
 }
 
+func (exporter PinnedSourceControlExporter) AbandonReplicaMoveSnapshot(
+	ctx context.Context, request SourceControlRequest, witness ArtifactAbandonmentWitness,
+) error {
+	provider, ok := exporter.Provider.(interface {
+		AbandonSourceExport(context.Context, SourceControlRequest, ArtifactAbandonmentWitness) error
+	})
+	if !ok {
+		return ErrAbandonment
+	}
+	return provider.AbandonSourceExport(ctx, request, witness)
+}
+
 type SourceControlAuthorizeFunc func(rafttransport.PeerIdentity, SourceControlRequest) bool
 
 type SourceControlOptions struct {
@@ -218,6 +235,17 @@ func (service *SourceControlService) Serve(ctx context.Context, connection raftt
 	if err != nil {
 		return err
 	}
+	if command == sourceControlAbandon {
+		var raw [AbandonmentWitnessBytes]byte
+		if _, err = io.ReadFull(connection, raw[:]); err != nil {
+			return err
+		}
+		witness, openErr := OpenAbandonmentWitness(raw[:])
+		if openErr != nil {
+			return openErr
+		}
+		return service.serveAbandonCommand(ctx, connection, request, witness)
+	}
 	return service.serveCommand(ctx, connection, command, request)
 }
 
@@ -246,6 +274,33 @@ func (service *SourceControlService) serveCommand(
 	} else {
 		record, err = service.Execute(ctx, request)
 	}
+	if err != nil {
+		return err
+	}
+	if deadline := service.writeDeadline(); deadline.IsZero() {
+		return ErrSourceControl
+	} else if err = connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	return WriteSourceControlResponse(connection, record)
+}
+
+func (service *SourceControlService) serveAbandonCommand(
+	ctx context.Context, connection rafttransport.PeerConnection, request SourceControlRequest,
+	witness ArtifactAbandonmentWitness,
+) error {
+	if service == nil || ctx == nil || connection == nil ||
+		connection.TrafficClass() != rafttransport.TrafficShardControl ||
+		!validSourceControlRequest(request) || !witness.Valid() {
+		return ErrSourceUnauthorized
+	}
+	peer := connection.PeerIdentity()
+	wantDomain := rafttransport.TrustDomain{ClusterID: request.Group.ClusterID,
+		ClusterIncarnation: request.Group.ClusterIncarnation}
+	if peer.TrustDomain != wantDomain || !service.authorize(peer, request) {
+		return ErrSourceUnauthorized
+	}
+	record, err := service.Abandon(ctx, request, witness)
 	if err != nil {
 		return err
 	}
@@ -355,6 +410,52 @@ func (service *SourceControlService) Release(
 		return SourceControlRecord{}, err
 	}
 	return released, nil
+}
+
+// Abandon accepts no local timeout. Only an exact replicated witness which
+// fences the source owner lease may authorize repository deletion.
+func (service *SourceControlService) Abandon(
+	ctx context.Context, request SourceControlRequest, witness ArtifactAbandonmentWitness,
+) (SourceControlRecord, error) {
+	if service == nil || ctx == nil || !validSourceControlRequest(request) || !witness.Valid() ||
+		witness.Operation != request.Operation || witness.Step != request.Step ||
+		witness.Owner != request.SourceNode || !descriptorMatchesSourceRequest(witness.Descriptor, request) {
+		return SourceControlRecord{}, ErrAbandonment
+	}
+	abandoner, ok := service.exporter.(SourceControlAbandoner)
+	if !ok {
+		return SourceControlRecord{}, ErrAbandonment
+	}
+	select {
+	case service.slots <- struct{}{}:
+		defer func() { <-service.slots }()
+	default:
+		return SourceControlRecord{}, ErrBound
+	}
+	stripe := &service.stripes[binary.LittleEndian.Uint64(request.Operation[:8])%uint64(len(service.stripes))]
+	stripe.Lock()
+	defer stripe.Unlock()
+	record, err := service.journal.ReadSourceExport(ctx, request.Operation)
+	if err != nil || !validSourceControlRecord(record) || record.Request != request {
+		return SourceControlRecord{}, errors.Join(err, ErrSourceConflict)
+	}
+	if record.State == SourceControlReleased {
+		if record.Descriptor != witness.Descriptor {
+			return SourceControlRecord{}, ErrSourceConflict
+		}
+		return record, nil
+	}
+	if err = abandoner.AbandonReplicaMoveSnapshot(ctx, request, witness); err != nil {
+		return SourceControlRecord{}, err
+	}
+	retired := record
+	retired.Revision++
+	retired.State = SourceControlReleased
+	retired.Descriptor = witness.Descriptor
+	if err = service.publishExact(ctx, record.Revision, retired); err != nil {
+		return SourceControlRecord{}, err
+	}
+	return retired, nil
 }
 
 func (service *SourceControlService) Observe(ctx context.Context, operation [32]byte) (SourceControlRecord, error) {
@@ -490,6 +591,26 @@ func appendSourceControlReleaseRequest(dst []byte, request SourceControlRequest)
 	return dst, nil
 }
 
+func appendSourceControlAbandonRequest(
+	dst []byte, request SourceControlRequest, witness ArtifactAbandonmentWitness,
+) ([]byte, error) {
+	if !witness.Valid() || witness.Operation != request.Operation || witness.Step != request.Step ||
+		witness.Owner != request.SourceNode || !descriptorMatchesSourceRequest(witness.Descriptor, request) {
+		return dst, ErrAbandonment
+	}
+	start := len(dst)
+	dst, err := AppendSourceControlRequest(dst, request)
+	if err != nil {
+		return dst[:start], err
+	}
+	dst[len(dst)-8] = byte(sourceControlAbandon)
+	dst, err = AppendAbandonmentWitness(dst, witness)
+	if err != nil {
+		return dst[:start], err
+	}
+	return dst, nil
+}
+
 func readSourceControlCommand(reader io.Reader) (
 	sourceControlCommand, SourceControlRequest, error,
 ) {
@@ -504,7 +625,7 @@ func openSourceControlCommand(raw [SourceControlRequestBytes]byte) (
 	sourceControlCommand, SourceControlRequest, error,
 ) {
 	command := sourceControlCommand(raw[208])
-	if command > sourceControlRelease || !allZero(raw[209:216]) {
+	if command > sourceControlAbandon || !allZero(raw[209:216]) {
 		return 0, SourceControlRequest{}, ErrSourceControl
 	}
 	raw[208] = 0

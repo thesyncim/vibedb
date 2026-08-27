@@ -1223,6 +1223,37 @@ func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 	}
 }
 
+func TestReplicatedMoveAbandonmentAtomicallyReplacesIntentOnlyAtCancellation(t *testing.T) {
+	authority, _, _ := newCatalogAuthorityFixture(t)
+	record := testReplicatedOperation(ReplicatedOperationRecord{
+		ID: [32]byte{0x19}, Kind: ReplicatedOperationMove,
+		State: ReplicatedOperationPlanned, Revision: 1, CatalogGeneration: 12,
+		Cursor: [8]uint64{1}, Proof: [32]byte{7},
+	})
+	if err := authority.SubmitOperation(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := record
+	cancelled.State, cancelled.Revision = ReplicatedOperationCancelled, 2
+	cancelled.Intent = []byte(`{"witness":"AQ=="}`)
+	cancelled.IntentDigest = sha256.Sum256(cancelled.Intent)
+	cancelled.Proof = cancelled.IntentDigest
+	cancelled.Cursor = [8]uint64{1, 2}
+	if err := authority.PublishOperation(context.Background(), 1, cancelled); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("ordinary publish replaced immutable intent: %v", err)
+	}
+	if err := authority.PublishReplicaMoveAbandonment(context.Background(), 1, cancelled); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := authority.ReadOperation(context.Background(), record.ID)
+	if err != nil || !loaded.Equal(cancelled) {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	if err = authority.PublishReplicaMoveAbandonment(context.Background(), 2, cancelled); !errors.Is(err, ErrReplicatedCatalog) && !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("terminal abandonment rewrite=%v", err)
+	}
+}
+
 func TestReplicatedOperationSubmissionPublishesBoundedSortedDirectoryAtomically(t *testing.T) {
 	authority, client, _ := newCatalogAuthorityFixture(t)
 	second := testReplicatedOperation(ReplicatedOperationRecord{

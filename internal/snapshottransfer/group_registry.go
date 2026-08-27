@@ -210,13 +210,26 @@ func (registry *GroupSourceControlRegistry) Serve(
 		return ErrSourceUnauthorized
 	}
 	peer := connection.PeerIdentity()
-	targetMember, err := registry.registry.Member(request.Group, peer.Node)
-	if err != nil || targetMember != request.TargetMember {
-		return ErrSourceUnauthorized
+	if command != sourceControlAbandon {
+		targetMember, memberErr := registry.registry.Member(request.Group, peer.Node)
+		if memberErr != nil || targetMember != request.TargetMember {
+			return ErrSourceUnauthorized
+		}
 	}
 	localMember, err := registry.registry.LocalMember(request.Group)
 	if err != nil || localMember != request.SourceMember {
 		return ErrSourceUnauthorized
+	}
+	if command == sourceControlAbandon {
+		var witnessRaw [AbandonmentWitnessBytes]byte
+		if _, err = io.ReadFull(connection, witnessRaw[:]); err != nil {
+			return err
+		}
+		witness, witnessErr := OpenAbandonmentWitness(witnessRaw[:])
+		if witnessErr != nil {
+			return witnessErr
+		}
+		return service.serveAbandonCommand(ctx, connection, request, witness)
 	}
 	return service.serveCommand(ctx, connection, command, request)
 }

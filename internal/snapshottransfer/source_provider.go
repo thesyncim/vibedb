@@ -178,6 +178,26 @@ func (provider *RetainedSourceExportProvider) ObserveSourceExport(
 	return provider.repository.findPublishedSource(request)
 }
 
+func (provider *RetainedSourceExportProvider) AbandonSourceExport(
+	ctx context.Context, request SourceControlRequest, witness ArtifactAbandonmentWitness,
+) error {
+	if provider == nil || ctx == nil || !provider.matchesRequest(request) || !witness.Valid() ||
+		witness.Operation != request.Operation || witness.Step != request.Step ||
+		witness.Owner != request.SourceNode || !descriptorMatchesSourceRequest(witness.Descriptor, request) {
+		return ErrAbandonment
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	provider.mu.RLock()
+	defer provider.mu.RUnlock()
+	if provider.closed || provider.repository == nil {
+		return ErrSourceControl
+	}
+	_, err := provider.repository.AbandonArtifact(witness)
+	return err
+}
+
 func (provider *RetainedSourceExportProvider) PinSourceExport(
 	ctx context.Context,
 	request SourceControlRequest,
