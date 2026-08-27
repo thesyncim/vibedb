@@ -9,6 +9,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -124,6 +125,43 @@ type BootstrapControlService struct {
 	writeDeadline rafttransport.DeadlineFunc
 	slots         chan struct{}
 	stripes       []sync.Mutex
+	receiverStats *Receiver
+	requests      atomic.Uint64
+	completions   atomic.Uint64
+	faults        atomic.Uint64
+	inflight      atomic.Uint64
+}
+
+// BootstrapMetrics is one detached, constant-size target-side bootstrap
+// snapshot. Counters are monotonic; ResidentBytes and Inflight are gauges at
+// the instant each field is loaded. It contains no borrowed mutable state.
+type BootstrapMetrics struct {
+	Requests      uint64
+	Chunks        uint64
+	Bytes         uint64
+	Completions   uint64
+	Faults        uint64
+	ResidentBytes uint64
+	Inflight      uint64
+}
+
+// Metrics returns the online bootstrap stages owned by this target. A custom
+// BootstrapReceiver cannot expose chunk authority, so those transfer fields
+// remain zero unless the service owns the package Receiver implementation.
+func (service *BootstrapControlService) Metrics() BootstrapMetrics {
+	if service == nil {
+		return BootstrapMetrics{}
+	}
+	result := BootstrapMetrics{
+		Requests: service.requests.Load(), Completions: service.completions.Load(),
+		Faults: service.faults.Load(), Inflight: service.inflight.Load(),
+	}
+	if receiver := service.receiverStats; receiver != nil {
+		result.Chunks = receiver.chunks.Load()
+		result.Bytes = receiver.bytes.Load()
+		result.ResidentBytes = uint64(cap(receiver.Workspace))
+	}
+	return result
 }
 
 func NewBootstrapControlService(options BootstrapControlOptions) (*BootstrapControlService, error) {
@@ -133,13 +171,15 @@ func NewBootstrapControlService(options BootstrapControlOptions) (*BootstrapCont
 		options.MaxConcurrent > AbsoluteMaxBootstrapConcurrency {
 		return nil, ErrBootstrapControl
 	}
-	return &BootstrapControlService{
+	service := &BootstrapControlService{
 		journal: options.Journal, receiver: options.Receiver, installer: options.Installer, releaser: options.Releaser,
 		authorize: options.Authorize, sourceNode: options.SourceNode,
 		readDeadline: options.ReadDeadline, writeDeadline: options.WriteDeadline,
 		slots:   make(chan struct{}, options.MaxConcurrent),
 		stripes: make([]sync.Mutex, options.MaxConcurrent),
-	}, nil
+	}
+	service.receiverStats, _ = options.Receiver.(*Receiver)
+	return service, nil
 }
 
 // Serve handles exactly one fixed-width command on one already-authenticated
@@ -147,12 +187,22 @@ func NewBootstrapControlService(options BootstrapControlOptions) (*BootstrapCont
 func (service *BootstrapControlService) Serve(
 	ctx context.Context,
 	connection rafttransport.PeerConnection,
-) error {
+) (resultErr error) {
 	if service == nil || ctx == nil || connection == nil ||
 		connection.TrafficClass() != rafttransport.TrafficShardControl {
 		return ErrBootstrapUnauthorized
 	}
 	defer connection.Close()
+	service.requests.Add(1)
+	service.inflight.Add(1)
+	defer func() {
+		service.inflight.Add(^uint64(0))
+		if resultErr != nil {
+			service.faults.Add(1)
+		} else {
+			service.completions.Add(1)
+		}
+	}()
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stop()
 	if deadline := service.readDeadline(); deadline.IsZero() {

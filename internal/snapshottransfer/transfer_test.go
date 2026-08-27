@@ -512,6 +512,49 @@ func TestAuthenticatedServiceDisconnectResumeAndIdentityRotation(t *testing.T) {
 	}
 }
 
+func TestBootstrapMetricsOwnTargetChunksBytesAndResidentWorkspace(t *testing.T) {
+	payload := bytes.Repeat([]byte("target-bootstrap-metrics"), 700)
+	d := testDescriptor(payload)
+	sourceRepo := openTestRepository(t, filepath.Join(t.TempDir(), "source"))
+	appendAll(t, sourceRepo, d, payload, 0)
+	targetRepo := openTestRepository(t, filepath.Join(t.TempDir(), "target"))
+	registry, source, target := testRegistry(t)
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	data, err := NewService(ServiceOptions{Repository: sourceRepo, Registry: registry,
+		Authorize: func(got Descriptor) bool { return got == d }, ReadDeadline: deadline,
+		WriteDeadline: deadline, MaxConnections: 2, MaxChunkBytes: MinChunkBytes,
+		MaxInflightBytes: 2 * MinChunkBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver := &Receiver{Repository: targetRepo,
+		Opener:       &testOpener{service: data, source: source, target: target},
+		ReadDeadline: deadline, WriteDeadline: deadline, Workspace: make([]byte, MinChunkBytes)}
+	request, identity, sourceNode := bootstrapControlFixture()
+	control, err := NewBootstrapControlService(BootstrapControlOptions{
+		Journal:  &memoryBootstrapJournal{records: make(map[[32]byte]BootstrapRecord)},
+		Receiver: receiver, Installer: &testBootstrapInstaller{identity: identity},
+		Releaser:     BootstrapArtifactReleaseFunc(func(context.Context, BootstrapRequest, raftmember.RuntimeIdentity) error { return nil }),
+		Authorize:    func(rafttransport.PeerIdentity, BootstrapRequest) bool { return true },
+		SourceNode:   func(Descriptor) (rafttransport.NodeID, bool) { return sourceNode, true },
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics := control.Metrics(); metrics.ResidentBytes != MinChunkBytes {
+		t.Fatalf("initial metrics=%+v", metrics)
+	}
+	if err = receiver.Receive(context.Background(), source.Node, d); err != nil {
+		t.Fatal(err)
+	}
+	wantChunks := uint64((len(payload) + MinChunkBytes - 1) / MinChunkBytes)
+	if metrics := control.Metrics(); metrics.Chunks != wantChunks || metrics.Bytes != uint64(len(payload)) ||
+		metrics.ResidentBytes != MinChunkBytes || metrics.Requests != 0 || metrics.Inflight != 0 {
+		t.Fatalf("transfer metrics=%+v request=%+v", metrics, request)
+	}
+}
+
 func TestSequentialConnectionsCannotOverRetainInflightBudget(t *testing.T) {
 	payload := bytes.Repeat([]byte{44}, MinChunkBytes)
 	d := testDescriptor(payload)

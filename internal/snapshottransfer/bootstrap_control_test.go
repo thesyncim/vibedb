@@ -341,6 +341,64 @@ func TestBootstrapControlServeAuthenticatesAndReturnsTerminalObservation(t *test
 		response.Request.Operation != request.Operation || response.Request.Step != request.Step {
 		t.Fatalf("response=%+v readErr=%v serveErr=%v", response, err, serveErr)
 	}
+	if metrics := service.Metrics(); metrics != (BootstrapMetrics{
+		Requests: 1, Completions: 1,
+	}) {
+		t.Fatalf("terminal metrics=%+v", metrics)
+	}
+}
+
+func TestBootstrapMetricsTracksInflightAndEveryServeFault(t *testing.T) {
+	request, identity, _ := bootstrapControlFixture()
+	service := newTestBootstrapControl(t,
+		&memoryBootstrapJournal{records: make(map[[32]byte]BootstrapRecord)},
+		&testBootstrapInstaller{identity: identity},
+		func(context.Context, rafttransport.NodeID, Descriptor) error { return nil })
+	client, server := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.Serve(context.Background(), &testPeerConn{
+			Conn: server, class: rafttransport.TrafficShardControl,
+		})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for service.Metrics().Inflight != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if metrics := service.Metrics(); metrics.Requests != 1 || metrics.Inflight != 1 ||
+		metrics.Completions != 0 || metrics.Faults != 0 {
+		t.Fatalf("live metrics=%+v", metrics)
+	}
+	_ = client.Close()
+	if err := <-done; err == nil {
+		t.Fatal("truncated request succeeded")
+	}
+	if metrics := service.Metrics(); metrics.Requests != 1 || metrics.Inflight != 0 ||
+		metrics.Completions != 0 || metrics.Faults != 1 {
+		t.Fatalf("fault metrics=%+v", metrics)
+	}
+
+	// Direct Execute is not a served target request and must not perturb the
+	// endpoint lifecycle totals.
+	if _, err := service.Execute(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := service.Metrics(); metrics.Requests != 1 || metrics.Completions != 0 ||
+		metrics.Faults != 1 || metrics.Inflight != 0 {
+		t.Fatalf("execute-only metrics=%+v", metrics)
+	}
+}
+
+func BenchmarkBootstrapMetricsSnapshot(b *testing.B) {
+	_, identity, _ := bootstrapControlFixture()
+	service := newTestBootstrapControl(b,
+		&memoryBootstrapJournal{records: make(map[[32]byte]BootstrapRecord)},
+		&testBootstrapInstaller{identity: identity},
+		func(context.Context, rafttransport.NodeID, Descriptor) error { return nil })
+	b.ReportAllocs()
+	for range b.N {
+		_ = service.Metrics()
+	}
 }
 
 func newTestBootstrapControl(

@@ -255,6 +255,8 @@ type Receiver struct {
 	ReadDeadline  rafttransport.DeadlineFunc
 	WriteDeadline rafttransport.DeadlineFunc
 	Workspace     []byte
+	chunks        atomic.Uint64
+	bytes         atomic.Uint64
 }
 
 // Receive resumes until the exact descriptor is atomically published locally.
@@ -343,5 +345,9 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 		return ErrChunk
 	}
 	_, _, err := r.Repository.Append(d, offset, chunk, digest)
+	if err == nil {
+		r.chunks.Add(1)
+		r.bytes.Add(uint64(len(chunk)))
+	}
 	return err
 }
