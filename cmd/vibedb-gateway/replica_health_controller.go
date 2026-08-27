@@ -64,6 +64,14 @@ type gatewayFailedReplicaMoveSubmitter interface {
 	Submit(context.Context, *rebalance.Plan) (rebalance.Action, error)
 }
 
+type gatewayFailedReplicaMoveSetSubmitter interface {
+	SubmitSet(context.Context, []*rebalance.Plan) ([]rebalance.Action, error)
+}
+
+type gatewayFailedReplicaMoveSetSink interface {
+	SubmitFailedReplicaMoves(context.Context, []rebalance.FailedReplicaMoveIntent) error
+}
+
 type gatewayFailedReplicaGrantAuthority interface {
 	Read(context.Context) (*gateway.Snapshot, error)
 	PublishMembershipGrant(context.Context, membershipgrant.Grant) error
@@ -137,6 +145,55 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 	}
 	_, err = sink.controller.Submit(ctx, intent.Plan)
 	return err
+}
+
+// SubmitFailedReplicaMoves first installs every exact per-group grant, then
+// atomically admits all immutable move records through the catalog RF3 group.
+// Grants are safe to replay if admission is interrupted; no learner action can
+// begin until the complete move set is discoverable.
+func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMoves(
+	ctx context.Context, intents []rebalance.FailedReplicaMoveIntent,
+) error {
+	controller, ok := sink.controller.(gatewayFailedReplicaMoveSetSubmitter)
+	if ctx == nil || !ok || len(intents) == 0 {
+		return errGatewayReplicaHealth
+	}
+	capture := &gatewayReplicaMovePlanCapture{plans: make([]*rebalance.Plan, 0, len(intents))}
+	staged := sink
+	staged.controller = capture
+	for _, intent := range intents {
+		if err := staged.SubmitFailedReplicaMove(ctx, intent); err != nil {
+			return err
+		}
+	}
+	_, err := controller.SubmitSet(ctx, capture.plans)
+	return err
+}
+
+type gatewayReplicaMovePlanCapture struct{ plans []*rebalance.Plan }
+
+func (capture *gatewayReplicaMovePlanCapture) Submit(
+	_ context.Context, plan *rebalance.Plan,
+) (rebalance.Action, error) {
+	if capture == nil || plan == nil {
+		return rebalance.Action{}, errGatewayReplicaHealth
+	}
+	capture.plans = append(capture.plans, plan)
+	return rebalance.Action{}, nil
+}
+
+type gatewayFailedReplicaMoveCollector struct {
+	intents []rebalance.FailedReplicaMoveIntent
+}
+
+func (collector *gatewayFailedReplicaMoveCollector) SubmitFailedReplicaMove(
+	_ context.Context, intent rebalance.FailedReplicaMoveIntent,
+) error {
+	if collector == nil || intent.Operation == (rebalance.OperationID{}) {
+		return errGatewayReplicaHealth
+	}
+	collector.intents = append(collector.intents, intent)
+	return nil
 }
 
 func gatewayFailedReplicaGrantIdentity(
@@ -223,6 +280,12 @@ func (controller *gatewayReplicaHealthController) RunPass(
 	}
 	var pass gatewayReplicaHealthPass
 	var failures error
+	scheduleSink := controller.sink
+	batchSink, batches := controller.sink.(gatewayFailedReplicaMoveSetSink)
+	collector := new(gatewayFailedReplicaMoveCollector)
+	if batches {
+		scheduleSink = collector
+	}
 	err = controller.failures.VisitFailureCertificates(ctx, catalog,
 		func(certificate rebalance.FailureQuorumCertificate) error {
 			pass.Certificates++
@@ -248,15 +311,24 @@ func (controller *gatewayReplicaHealthController) RunPass(
 				Leader: observation.Leader, Certificate: certificate,
 				Healthy: observation.Healthy, Candidates: candidates,
 			}
-			_, scheduleErr := controller.schedule(ctx, cut, controller.sink)
+			_, scheduleErr := controller.schedule(ctx, cut, scheduleSink)
 			if scheduleErr != nil {
 				failures = errors.Join(failures, scheduleErr)
 				return nil
 			}
 			pass.Eligible++
-			pass.Submitted++
+			if !batches {
+				pass.Submitted++
+			}
 			return nil
 		})
+	if err == nil && batches && len(collector.intents) != 0 {
+		if batchErr := batchSink.SubmitFailedReplicaMoves(ctx, collector.intents); batchErr != nil {
+			failures = errors.Join(failures, batchErr)
+		} else {
+			pass.Submitted = uint64(len(collector.intents))
+		}
+	}
 	return pass, errors.Join(failures, err)
 }
 
