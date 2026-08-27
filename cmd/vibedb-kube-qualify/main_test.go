@@ -3,12 +3,35 @@ package main
 import (
 	"bytes"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibejson"
 )
 
+func TestQualificationFailureReportsBoundedStageWithoutAuthorityPayload(t *testing.T) {
+	err := qualificationResponseError("issuer_open", []byte(`{"error":"shard unavailable","grant_digest":"private-grant","rows":[["private-row"]]}`))
+	if !strings.Contains(err.Error(), "issuer_open") || !strings.Contains(err.Error(), "shard unavailable") ||
+		strings.Contains(err.Error(), "private-") {
+		t.Fatalf("unsafe or missing failure detail: %v", err)
+	}
+	raw, marshalErr := vibejson.Marshal(&issuerOpenResponse{Error: strings.Repeat("x", 4096)})
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if err := qualificationResponseError("query", raw); len(err.Error()) > 350 {
+		t.Fatalf("unbounded failure message: %d", len(err.Error()))
+	}
+	if err := qualificationResponseError("exec_batch", []byte(`{"grant_digest":"private-grant"}`)); !strings.Contains(err.Error(), "unexpected response") || strings.Contains(err.Error(), "private-grant") {
+		t.Fatalf("unsafe unrecognized response: %v", err)
+	}
+}
+
 func TestQualificationWireContractsUseVibeJSON(t *testing.T) {
+	var grant issuerOpenResponse
+	if err := vibejson.Unmarshal([]byte(`{"ok":true,"op":"issuer_open","installation_id":"81000000000000000000000000000000","issuer_epoch":1,"lane_ordinal":0,"grant_digest":"0300000000000000000000000000000000000000000000000000000000000000"}`), &grant); err != nil || !grant.OK {
+		t.Fatalf("real issuer response: %+v %v", grant, err)
+	}
 	query := qualificationQuery()
 	if !vibejson.Valid(query) || !bytes.Contains(query, []byte(`"kind-proof"`)) ||
 		qualificationRowVisible([]byte(`{"ok":true,"rows":[["other"]]}`)) ||

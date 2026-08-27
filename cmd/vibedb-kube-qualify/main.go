@@ -352,7 +352,7 @@ func runClient(mode string, options clientOptions) error {
 	}
 	response, terminalLatency, err := wire.roundTrip(request)
 	if err != nil || !committedResponse(response) {
-		return errors.Join(errQualification, err)
+		return errors.Join(qualificationResponseError("exec_batch", response), err)
 	}
 	if terminalLatency > options.maximumLatency {
 		return fmt.Errorf("%w: terminal=%s/%s", errQualification,
@@ -362,7 +362,7 @@ func runClient(mode string, options clientOptions) error {
 	for index := range latencies {
 		response, latency, roundErr := wire.roundTrip(qualificationQuery())
 		if roundErr != nil || !qualificationRowVisible(response) {
-			return errors.Join(errQualification, roundErr)
+			return errors.Join(qualificationResponseError("query", response), roundErr)
 		}
 		latencies[index] = latency
 	}
@@ -457,7 +457,7 @@ func loadOrCreateRequest(mode, path string, wire *qualificationWire) ([]byte, er
 	if err != nil || vibejson.Unmarshal(response, &grant) != nil || !grant.OK || grant.Error != "" ||
 		grant.InstallationID != installation || grant.IssuerEpoch != 1 || grant.LaneOrdinal != 0 ||
 		len(grant.GrantDigest) != 64 {
-		return nil, errors.Join(errQualification, err)
+		return nil, errors.Join(qualificationResponseError("issuer_open", response), err)
 	}
 	request, err := vibejson.Marshal(&execBatchRequest{Op: "exec_batch",
 		RequestID: "91000000000000000000000000000000", InstallationID: installation,
@@ -475,6 +475,20 @@ func qualificationQuery() []byte {
 		SQL: "SELECT id FROM documents WHERE id = ?", Class: "interactive",
 		Params: []qualifyParam{{Kind: "string", Text: "kind-proof"}}})
 	return raw
+}
+
+// Report only the bounded server error, never issuer grants, ACK handles,
+// credentials, or row contents from the response envelope.
+func qualificationResponseError(stage string, raw []byte) error {
+	detail := "unexpected response"
+	if document, err := vibejson.Parse(raw); err == nil {
+		if node, found := document.Get("error"); found {
+			if message, ok := node.Text(); ok && message != "" {
+				detail = message[:min(len(message), 256)]
+			}
+		}
+	}
+	return fmt.Errorf("%w: %s: %q", errQualification, stage, detail)
 }
 
 func committedResponse(raw []byte) bool {
