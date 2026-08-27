@@ -314,4 +314,38 @@ func TestDurableRequestLedgerRF3AppliesTypedCASAndReopensAuthoritativeAck(t *tes
 		row.Ack.AckDigest != rows.ack.AckDigest || row.Applied != 42 {
 		t.Fatalf("row=%+v err=%v", row, err)
 	}
+	if len(row.Raw) == 0 || &row.Raw[0] != &ackRaw[0] {
+		t.Fatal("typed lifecycle read copied its owned RF3 response")
+	}
+}
+
+func BenchmarkDurableRequestLedgerRF3ReopenOwnedHead(b *testing.B) {
+	head, _, _ := lifecycleHead(b)
+	homePoint, _ := requestledger.Home(head.Key)
+	home := DurableRequestLedgerHome{
+		Identity: replication.Digest(lifecycleDigest("range")), Point: homePoint,
+	}
+	raw, err := requestledger.AppendHead(nil, head)
+	if err != nil {
+		b.Fatal(err)
+	}
+	stub := lifecycleRF3Stub{
+		read: func(context.Context, DurableRequestLedgerHome, ReplicatedRequestLedgerRead) (ReplicatedRequestLedgerReadResult, error) {
+			return ReplicatedRequestLedgerReadResult{Applied: 1, Found: true,
+				AuthoritativeKind: replicatedstate.RequestLedgerReadHead, Value: raw}, nil
+		},
+	}
+	ledger := &DurableRequestLedgerRF3{client: stub}
+	read := DurableRequestLifecycleRead{
+		Key: head.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for range b.N {
+		row, readErr := ledger.ReadRow(context.Background(), home, read)
+		if readErr != nil || row.Head.Key != head.Key {
+			b.Fatalf("row=%+v err=%v", row, readErr)
+		}
+	}
 }

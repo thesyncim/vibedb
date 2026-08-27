@@ -112,6 +112,9 @@ type DurableRequestLifecycleRow struct {
 
 type durableRequestLedgerRF3Client interface {
 	Apply(context.Context, DurableRequestLedgerHome, []byte) (ReplicatedRequestLedgerApplyResult, error)
+	// Read transfers ownership of result.Value to its caller. Production
+	// transport responses are detached allocations, so the typed lifecycle
+	// adapter can reopen even maximum-size plan pages without a second copy.
 	Read(context.Context, DurableRequestLedgerHome, ReplicatedRequestLedgerRead) (ReplicatedRequestLedgerReadResult, error)
 }
 
@@ -314,9 +317,11 @@ func (ledger *DurableRequestLedgerRF3) ReadRow(
 	if !result.Found {
 		return row, nil
 	}
-	// Own the returned bytes: transport response buffers are not part of the
-	// public row lifetime, and all variable-size typed records alias Raw.
-	row.Raw = append([]byte(nil), result.Value...)
+	// Read transfers its detached transport value. Keep the sole backing buffer:
+	// every variable-size typed record aliases Raw, and duplicating a maximum
+	// plan page here otherwise adds a full page allocation and memory copy to
+	// every recovery read.
+	row.Raw = result.Value
 	if err := openDurableRequestLifecycleRow(&row, read.PendingSteps); err != nil {
 		return DurableRequestLifecycleRow{}, errors.Join(err, ErrDurableRequestConflict)
 	}

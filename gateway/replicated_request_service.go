@@ -532,7 +532,7 @@ func (service *DurableRequestService) drive(
 		TotalBytes: head.TotalPlanBytes, Root: replication.Digest(head.PlanRoot),
 	}
 	if len(head.InlinePlan) != 0 {
-		descriptor.Inline = bytes.Clone(head.InlinePlan)
+		descriptor.Inline = head.InlinePlan
 	} else if head.PlanPageCount > math.MaxUint32 {
 		return DurableRequestOutcome{}, ErrDurableRequestBound
 	} else {
@@ -546,7 +546,7 @@ func (service *DurableRequestService) drive(
 		if err != nil || !row.Found || row.Kind != replicatedstate.RequestLedgerReadPlanPage {
 			return nil, errors.Join(err, ErrDurableRequestUnresolved)
 		}
-		return bytes.Clone(row.PlanPage.Data), nil
+		return row.PlanPage.Data, nil
 	})
 	reader, err := openDurableRequestRecipeStream(key, descriptor, source)
 	if err != nil {
@@ -606,7 +606,7 @@ func (service *DurableRequestService) openTerminalExecution(
 		TotalBytes: head.TotalPlanBytes, Root: replication.Digest(head.PlanRoot),
 	}
 	if len(head.InlinePlan) != 0 {
-		descriptor.Inline = bytes.Clone(head.InlinePlan)
+		descriptor.Inline = head.InlinePlan
 	} else if head.PlanPageCount > math.MaxUint32 {
 		return DurableRequestTypedExecutionContext{}, ErrDurableRequestBound
 	} else {
@@ -620,7 +620,7 @@ func (service *DurableRequestService) openTerminalExecution(
 		if err != nil || !row.Found || row.Kind != replicatedstate.RequestLedgerReadPlanPage {
 			return nil, errors.Join(err, ErrDurableRequestUnresolved)
 		}
-		return bytes.Clone(row.PlanPage.Data), nil
+		return row.PlanPage.Data, nil
 	})
 	reader, err := openDurableRequestRecipeStream(key, descriptor, source)
 	if err != nil {
