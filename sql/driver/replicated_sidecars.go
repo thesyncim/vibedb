@@ -13,7 +13,9 @@ const (
 	// ReplicatedUserRecoveryJournalBytes is the exact record region required by
 	// the current replicated SQL user limits. The file also contains two
 	// storeio header sectors.
-	ReplicatedUserRecoveryJournalBytes = storeio.RecoveryJournalMaxCapacityBytes
+	// Retain the data-only geometry independently of the larger optional
+	// request-ledger system journal ceiling.
+	ReplicatedUserRecoveryJournalBytes = (uint64(16) << 20) + 34*storeio.RecoveryJournalMinSectorSize
 	// ReplicatedTransactionMarkerBytes is the exact fixed decision-log window.
 	// Replicated SQL has exactly the user and system participants; one MiB holds
 	// 2,048 current two-participant decisions so recycle is pressure handling,

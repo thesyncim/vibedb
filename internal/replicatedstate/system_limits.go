@@ -66,6 +66,10 @@ func RequiredSystemCollectionLimits(
 				MaxDistinctMutations*requestledger.PageStorageKeyBytes,
 		)
 	}
+	// The durable collection admits one maximum value together with every
+	// distinct key in a batch. Use the largest supported key, not just the
+	// ledger page-key width: payload keys carry a longer identity.
+	maxBatchBytes = max(maxBatchBytes, maxDocumentBytes+maxDocuments*maxKeyBytes)
 	return CollectionLimits{
 		MaxKeyBytes: maxKeyBytes, MaxDocumentBytes: maxDocumentBytes,
 		MaxDistinctMutations: maxDocuments, MaxBatchBytes: maxBatchBytes,

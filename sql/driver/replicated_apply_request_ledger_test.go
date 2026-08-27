@@ -118,6 +118,10 @@ func TestReplicatedApplyRequestLedgerGeometryIsBoundedAndCanonical(t *testing.T)
 			t.Fatalf("retry=%d ledger geometry=%+v required=%+v", retryWindow, limits, required)
 		}
 		sidecars := canonicalReplicatedApplySidecarsForLimits(limits)
+		if sidecars.SystemRecoveryJournalBytes != storeio.RecoveryJournalMaxCapacityBytes {
+			t.Fatalf("maximum ledger profile=%d differs from bounded recovery ceiling=%d",
+				sidecars.SystemRecoveryJournalBytes, storeio.RecoveryJournalMaxCapacityBytes)
+		}
 		if err := validateReplicatedApplySidecarsForLimits(sidecars, limits); err != nil ||
 			sidecars.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes {
 			t.Fatalf("retry=%d bounded ledger sidecars=%+v err=%v", retryWindow, sidecars, err)

@@ -44,11 +44,26 @@ func TestRecoveryJournalReplicatedSQLConditionalCeiling(t *testing.T) {
 	if got != want {
 		t.Fatalf("replicated SQL conditional ceiling = %d, want %d", got, want)
 	}
-	if uint64(got) != RecoveryJournalMaxCapacityBytes {
+	if uint64(got) > RecoveryJournalMaxCapacityBytes {
 		t.Fatalf(
 			"replicated SQL conditional ceiling = %d, journal clamp = %d",
 			got, RecoveryJournalMaxCapacityBytes,
 		)
+	}
+}
+
+func TestRecoveryJournalReplicatedLedgerConditionalCeiling(t *testing.T) {
+	const (
+		entryCount   = 258 // Maximum session retry window plus two control records.
+		keyBytes     = 106 // Longest ledger storage key, including payload identity.
+		payloadBytes = (16 << 20) + entryCount*keyBytes
+	)
+	got := RecoveryBatchRecordPaddedSizeForPayload(
+		RecoveryJournalMinSectorSize, entryCount,
+		payloadBytes+RecoveryConditionalHeaderSize,
+	)
+	if uint64(got) != RecoveryJournalMaxCapacityBytes {
+		t.Fatalf("replicated ledger conditional ceiling = %d, journal clamp = %d", got, RecoveryJournalMaxCapacityBytes)
 	}
 }
 
