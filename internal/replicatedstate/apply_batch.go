@@ -327,7 +327,8 @@ func (m *Machine) ApplyNormalBatch(
 			if command.Kind() == replication.CommandTransaction ||
 				command.Kind() == replication.CommandRequestLedger ||
 				command.Kind() == replication.CommandRouteGate ||
-				command.Kind() == replication.CommandExecutionPin {
+				command.Kind() == replication.CommandExecutionPin ||
+				command.Kind() == replication.CommandSplitCaptureActivate {
 				break
 			}
 			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)

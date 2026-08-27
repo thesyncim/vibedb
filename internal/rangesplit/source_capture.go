@@ -281,6 +281,14 @@ func (c *SourceCapture) Head() uint64 {
 	return c.head.Load()
 }
 
+// PartitionerDigest identifies the immutable portable recipe recovered by this capture.
+func (c *SourceCapture) PartitionerDigest() [sha256.Size]byte {
+	if c == nil || c.partitioner == nil {
+		return [sha256.Size]byte{}
+	}
+	return c.partitioner.Digest()
+}
+
 // ValidateDescriptorAncestor proves that descriptor names an exact published
 // boundary in this capture's authenticated chain. It performs one bounded
 // point read regardless of capture length. This lets a restarted controller

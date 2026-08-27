@@ -141,6 +141,7 @@ type ReplicatedApply struct {
 	machine              *replicatedstate.Machine
 	table                *table
 	identity             ReplicatedApplyIdentity
+	rangeSplitCapture    *rangesplit.SourceCapture
 	closed               bool
 	attemptGeneration    uint64
 	attemptActive        bool
@@ -600,6 +601,20 @@ func (d *Database) openReplicatedApply(
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
+			},
+			TransitionCaptureFactory: func(activation replicatedstate.SplitCaptureActivation) (replicatedstate.TransitionCapture, error) {
+				partitioner, openErr := rangesplit.OpenPortablePartitioner(activation.Command.Spec)
+				if openErr != nil || partitioner.Digest() != activation.Command.PartitionerDigest {
+					return nil, errors.Join(openErr, replicatedstate.ErrSplitCaptureActivation)
+				}
+				capture, captureErr := rangesplit.NewSourceCapture(
+					partitioner, replicatedstate.TransitionCaptureCollectionName,
+					core.replicatedCaptureCollection,
+				)
+				if captureErr == nil {
+					claim.rangeSplitCapture = capture
+				}
+				return capture, captureErr
 			},
 			SchemaTransition:          core.schemaTransition,
 			SchemaMembershipWitness:   core.schemaMembership,
@@ -1530,6 +1545,12 @@ func (a *ReplicatedApply) BeginRangeSplitCapture(
 	if err := a.checkLocked(); err != nil || a.database.replicatedCaptureCollection == nil {
 		return nil, errors.Join(err, ErrReplicatedApplyMismatch)
 	}
+	if a.rangeSplitCapture != nil {
+		if a.rangeSplitCapture.PartitionerDigest() != partitioner.Digest() {
+			return nil, replicatedstate.ErrSplitCaptureActivation
+		}
+		return a.rangeSplitCapture, nil
+	}
 	capture, err := rangesplit.NewSourceCapture(
 		partitioner, replicatedstate.TransitionCaptureCollectionName,
 		a.database.replicatedCaptureCollection,
@@ -1540,6 +1561,7 @@ func (a *ReplicatedApply) BeginRangeSplitCapture(
 	if err = a.machine.BeginTransitionCapture(capture); err != nil {
 		return nil, err
 	}
+	a.rangeSplitCapture = capture
 	return capture, nil
 }
 

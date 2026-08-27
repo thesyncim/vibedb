@@ -342,6 +342,9 @@ type Options struct {
 	// from treating a different group/range generation as authoritative.
 	RequestLedgerRange RequestLedgerRange
 	TransitionCapture  TransitionCapture
+	// TransitionCaptureFactory deterministically reconstructs a capture from a
+	// Raft-applied activation witness before Open permits subsequent apply.
+	TransitionCaptureFactory func(SplitCaptureActivation) (TransitionCapture, error)
 	// TransitionCaptureTarget reserves an authenticated participant in the
 	// fixed checkpoint membership before capture begins. A non-nil capture must
 	// name this exact target. It may be installed later under the Machine lock.

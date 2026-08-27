@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
+	"github.com/thesyncim/vibedb/internal/splitcapture"
 )
 
 const (
@@ -105,7 +106,8 @@ type Command struct {
 	RouteGate []byte
 	// ExecutionPin is one fixed canonical logical-pin command. It is present
 	// only for CommandExecutionPin and carries no relation mutations.
-	ExecutionPin []byte
+	ExecutionPin           []byte
+	SplitCaptureActivation []byte
 	// Batches retains the shared multi-relation mutation payload used by data
 	// and transaction commands; control commands require it to be empty.
 	Batches []RelationMutationBatch
@@ -153,6 +155,7 @@ type CommandView struct {
 	requestLedgerBytes []byte
 	routeGateBytes     []byte
 	executionPinBytes  []byte
+	splitCaptureBytes  []byte
 	retainedPrune      RetainedPruneProof
 	relationBytes      []byte
 	mutationCount      uint32
@@ -283,6 +286,17 @@ func (v CommandView) OpenExecutionPin() (executionpin.Command, error) {
 		return executionpin.Command{}, ErrEnvelopeSemantic
 	}
 	return executionpin.OpenCommand(v.executionPinBytes)
+}
+
+func (v CommandView) SplitCaptureActivationBytes() []byte {
+	return v.splitCaptureBytes[:len(v.splitCaptureBytes):len(v.splitCaptureBytes)]
+}
+
+func (v CommandView) OpenSplitCaptureActivation() (splitcapture.View, error) {
+	if v.kind != CommandSplitCaptureActivate {
+		return splitcapture.View{}, ErrEnvelopeSemantic
+	}
+	return splitcapture.OpenCommand(v.splitCaptureBytes)
 }
 
 // RetainedPruneProof returns the validated fixed proof carried by a retained
@@ -598,6 +612,9 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 		putRetainedPruneProof(frame[cursor:cursor+retainedPruneProofBytes], command.RetainedPrune)
 		cursor += retainedPruneProofBytes
 	}
+	if command.Kind == CommandSplitCaptureActivate {
+		cursor += copy(frame[cursor:], command.SplitCaptureActivation)
+	}
 	for batchIndex := range command.Batches {
 		batch := &command.Batches[batchIndex]
 		headerAt := -1
@@ -685,6 +702,7 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 		byteSlicesOverlap(region, command.RequestLedger) ||
 		byteSlicesOverlap(region, command.RouteGate) ||
 		byteSlicesOverlap(region, command.ExecutionPin) ||
+		byteSlicesOverlap(region, command.SplitCaptureActivation) ||
 		typedSliceOverlapsBytes(region, command.Batches) {
 		return true
 	}
@@ -727,6 +745,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireExecutionPin
 	case CommandRetainedPrune:
 		return commandWireRetainedPrune
+	case CommandSplitCaptureActivate:
+		return commandWireSplitCaptureActivate
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -795,6 +815,13 @@ func measureValidatedCommand(command Command, transactionBytes int) (int, error)
 			return 0, ErrEnvelopeTooLarge
 		}
 	}
+	if command.Kind == CommandSplitCaptureActivate {
+		var ok bool
+		total, ok = checkedAdd(total, uint64(len(command.SplitCaptureActivation)), MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
 	if len(command.Batches) > 1 {
 		var ok bool
 		total, ok = checkedAdd(
@@ -833,6 +860,9 @@ func validateCommandHeader(command Command) error {
 	}
 	if command.Kind != CommandRetainedPrune && command.RetainedPrune != (RetainedPruneProof{}) {
 		return semantic("unrelated retained prune proof")
+	}
+	if command.Kind != CommandSplitCaptureActivate && len(command.SplitCaptureActivation) != 0 {
+		return semantic("unrelated split capture payload")
 	}
 	if (command.Kind == CommandRequestLedger) !=
 		(command.AuthorityClass == CommandAuthorityRequestLedger) {
@@ -930,6 +960,16 @@ func validateCommandHeader(command Command) error {
 		}
 		if _, err := executionpin.OpenCommand(command.ExecutionPin); err != nil {
 			return semantic("execution-pin command")
+		}
+	case CommandSplitCaptureActivate:
+		if command.AuthorityClass != CommandAuthorityTopology || len(command.Batches) != 0 ||
+			len(command.Transaction) != 0 || len(command.RequestLedger) != 0 ||
+			len(command.RouteGate) != 0 || len(command.ExecutionPin) != 0 ||
+			len(command.SplitCaptureActivation) == 0 {
+			return semantic("split capture command payload")
+		}
+		if _, err := splitcapture.OpenCommand(command.SplitCaptureActivation); err != nil {
+			return semantic("split capture command")
 		}
 	default:
 		return semantic("unknown command kind")
@@ -1488,6 +1528,10 @@ func OpenCommand(src []byte) (CommandView, error) {
 			inlineRelationID != 0 {
 			return CommandView{}, semantic("execution-pin command header")
 		}
+	case CommandSplitCaptureActivate:
+		if authorityClass != CommandAuthorityTopology || count != 0 || relationCount != 0 || inlineRelationID != 0 {
+			return CommandView{}, semantic("split capture command header")
+		}
 	}
 
 	view := CommandView{kind: kind, AuthorityClass: authorityClass}
@@ -1653,6 +1697,11 @@ func OpenCommand(src []byte) (CommandView, error) {
 			return CommandView{}, semantic("execution-pin command")
 		}
 		view.executionPinBytes = payload
+	case CommandSplitCaptureActivate:
+		if _, err := splitcapture.OpenCommand(payload); err != nil {
+			return CommandView{}, semantic("split capture command body")
+		}
+		view.splitCaptureBytes = payload
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count
@@ -1697,6 +1746,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandExecutionPin, true
 	case commandWireRetainedPrune:
 		return CommandRetainedPrune, true
+	case commandWireSplitCaptureActivate:
+		return CommandSplitCaptureActivate, true
 	default:
 		return 0, false
 	}

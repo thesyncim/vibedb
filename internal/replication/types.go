@@ -70,12 +70,13 @@ const (
 	commandWireTransaction     = uint8(7)
 	// Wire kind 8 is owned by the route-gate command family. Request-ledger is
 	// fixed at 9 and execution-pin at 10 in the cross-package command registry.
-	commandWireRouteGate     = uint8(8)
-	commandWireRequestLedger = uint8(9)
-	commandWireExecutionPin  = uint8(10)
-	commandWireRetainedPrune = uint8(11)
-	sessionLeaseBodyBytes    = 16
-	transactionLengthBytes   = 4
+	commandWireRouteGate            = uint8(8)
+	commandWireRequestLedger        = uint8(9)
+	commandWireExecutionPin         = uint8(10)
+	commandWireRetainedPrune        = uint8(11)
+	commandWireSplitCaptureActivate = uint8(12)
+	sessionLeaseBodyBytes           = 16
+	transactionLengthBytes          = 4
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -211,7 +212,8 @@ const (
 	// CommandRetainedPrune deletes only rows proven to be outside the source's
 	// already-narrowed owned range. It is topology-only and carries one exact
 	// split/cut/batch proof plus ordinary relation delete frames.
-	CommandRetainedPrune CommandKind = 11
+	CommandRetainedPrune        CommandKind = 11
+	CommandSplitCaptureActivate CommandKind = 12
 )
 
 // MutationKind selects one logical relation mutation.

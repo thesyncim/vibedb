@@ -448,6 +448,11 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err := m.persistTransitionRows(next, plan.changes, plan, plan.systemRows); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
+	if command.Kind() == replication.CommandSplitCaptureActivate && !plan.conflict && !plan.exactDuplicate && m.capture == nil {
+		if err := m.activateAppliedSplitCapture(command, meta.Index); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+	}
 	return clonePublication(m.publication), nil
 }
 
@@ -1332,6 +1337,12 @@ func (m *Machine) planBundleCommand(
 				return commandPlan{}, err
 			}
 		}
+	case replication.CommandSplitCaptureActivate:
+		if !m.mutableBindingMatchesState(command, state) {
+			plan.resultCode = ResultStaleFence
+			break
+		}
+		return m.planSplitCaptureActivation(plan, command, applied, state, systemSnapshot)
 	default:
 		if !m.mutableBindingMatchesState(command, state) {
 			plan.resultCode = ResultStaleFence

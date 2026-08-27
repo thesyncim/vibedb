@@ -42,40 +42,41 @@ var (
 type Machine struct {
 	mu sync.RWMutex
 
-	binding               Binding
-	bootstrap             []byte
-	bootstrapDigest       [32]byte
-	system                CollectionTarget
-	userName              string
-	user                  CollectionTarget
-	relations             []relationCollection
-	manifestDigest        [sha256.Size]byte
-	members               []durable.NamedCollection
-	distribution          []byte
-	shard                 []byte
-	applyContract         [32]byte
-	dataChainHash         *dataChainHasher
-	mutationPlan          []finalMutation
-	mutationInline        [8]finalMutation
-	bundlePlan            []finalMutation
-	bundleRelations       []plannedRelationChanges
-	transitionMembers     []durable.NamedCollection
-	batchTelemetry        normalBatchTelemetry
-	txnLog                *durable.TxnLog
-	checkpointGroup       *durable.CheckpointGroup
-	options               Options
-	transactionIntents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
-	transactionIntentKeys []byte
-	routeGate             *routegate.Machine
-	routeGateMaxRecords   uint64
-	applyCut              durable.DatabaseSnapshot
-	capture               TransitionCapture
-	captureTarget         TransitionCaptureTarget
-	reservedCaptureTarget TransitionCaptureTarget
-	captureBuffer         []byte
-	captureChanges        []finalMutation
-	captureKey            [8]byte
-	requestLedgerSteps    [requestledger.MaxPendingWaveSteps]requestledger.StepRef
+	binding                Binding
+	bootstrap              []byte
+	bootstrapDigest        [32]byte
+	system                 CollectionTarget
+	userName               string
+	user                   CollectionTarget
+	relations              []relationCollection
+	manifestDigest         [sha256.Size]byte
+	members                []durable.NamedCollection
+	distribution           []byte
+	shard                  []byte
+	applyContract          [32]byte
+	dataChainHash          *dataChainHasher
+	mutationPlan           []finalMutation
+	mutationInline         [8]finalMutation
+	bundlePlan             []finalMutation
+	bundleRelations        []plannedRelationChanges
+	transitionMembers      []durable.NamedCollection
+	batchTelemetry         normalBatchTelemetry
+	txnLog                 *durable.TxnLog
+	checkpointGroup        *durable.CheckpointGroup
+	options                Options
+	transactionIntents     map[transactionIntentIdentity]reopenedTransactionIntentOwner
+	transactionIntentKeys  []byte
+	routeGate              *routegate.Machine
+	routeGateMaxRecords    uint64
+	applyCut               durable.DatabaseSnapshot
+	capture                TransitionCapture
+	splitCaptureActivation *SplitCaptureActivation
+	captureTarget          TransitionCaptureTarget
+	reservedCaptureTarget  TransitionCaptureTarget
+	captureBuffer          []byte
+	captureChanges         []finalMutation
+	captureKey             [8]byte
+	requestLedgerSteps     [requestledger.MaxPendingWaveSteps]requestledger.StepRef
 
 	state                 State
 	publication           raftmodel.Publication
@@ -390,8 +391,20 @@ func OpenBundle(
 	m.publication = publicationFromState(state)
 	m.transactionIntents = openedTransactions.intents
 	m.transactionIntentKeys = openedTransactions.intentKeys
+	m.splitCaptureActivation = openedTransactions.activation
 	m.routeGate = openedRouteGate
-	if options.TransitionCapture != nil {
+	if openedTransactions.activation != nil {
+		if options.TransitionCaptureFactory == nil || options.TransitionCapture != nil {
+			return nil, ErrSplitCaptureActivation
+		}
+		capture, captureErr := options.TransitionCaptureFactory(*openedTransactions.activation)
+		if captureErr != nil || capture == nil {
+			return nil, errors.Join(captureErr, ErrSplitCaptureActivation)
+		}
+		if err := m.beginTransitionCapture(capture); err != nil {
+			return nil, err
+		}
+	} else if options.TransitionCapture != nil {
 		if err := m.beginTransitionCapture(options.TransitionCapture); err != nil {
 			return nil, err
 		}
@@ -764,6 +777,7 @@ type scannedTransactionControl struct {
 type scannedTransactions struct {
 	intents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
 	intentKeys []byte
+	activation *SplitCaptureActivation
 }
 
 type scannedExecutionPin struct {
@@ -804,6 +818,7 @@ func scanSessionSystemSnapshot(
 	var transactionPayloadRows, transactionIntentRows, transactionResidentBytes uint64
 	var activeTransactionIntents map[transactionIntentIdentity]reopenedTransactionIntentOwner
 	var transactionIntentKeys []byte
+	var splitActivation *SplitCaptureActivation
 	var transactionScopeScratch []distributedtxn.IntentScope
 	var manifestParticipantScratch []distributedtxn.ParticipantRef
 	var manifestIdentityScratch []byte
@@ -1340,6 +1355,17 @@ func scanSessionSystemSnapshot(
 			executionPinResidentBytes += uint64(len(key) + len(value))
 			return nil
 
+		case bytes.Equal(key, splitCaptureActivationKey[:]):
+			if !statePresent || splitActivation != nil {
+				return ErrSplitCaptureActivation
+			}
+			activation, openErr := openSplitCaptureActivation(value)
+			if openErr != nil || activation.Applied > state.Applied {
+				return errors.Join(openErr, ErrSplitCaptureActivation)
+			}
+			splitActivation = &activation
+			return nil
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}
@@ -1507,6 +1533,7 @@ func scanSessionSystemSnapshot(
 	if len(transactionResult) != 0 && transactionResult[0] != nil {
 		transactionResult[0].intents = activeTransactionIntents
 		transactionResult[0].intentKeys = transactionIntentKeys
+		transactionResult[0].activation = splitActivation
 	}
 	return state, true, sessionCount, slotCount, authorityCount, openedRouteGate, nil
 }
