@@ -33,14 +33,15 @@ Choose an empty absolute directory and start the cluster:
 
 The command generates a local CA and node certificates, a canonical
 authorization policy, a WAL key, a durable ACK key, nine prepared member roots,
-a generation-one catalog seed, a strict replica-control manifest, provisioned
-hot-shard capacity, and durable gateway journals. Every role process has a
-distinct authenticated NodeID and exact control/snapshot inventory. It reserves
-loopback ports and starts three members for each role. It waits for all nine
-members before it starts the gateway. The gateway publishes the catalog seed
-only when catalog RF3 is empty. The same replicated mutation publishes the
-generation-one head, head witness, and immutable genesis proof. The command
-prints the client endpoint only after every child reports ready.
+a generation-one catalog seed, a private mutable gateway route-seed path, a
+strict replica-control manifest, provisioned hot-shard capacity, and durable
+gateway journals. Every role process has a distinct authenticated NodeID and
+exact control/snapshot inventory. It reserves loopback ports and starts three
+members for each role. It waits for all nine members before it starts the
+gateway. The gateway publishes the catalog seed only when catalog RF3 is empty.
+The same replicated mutation publishes the generation-one head, head witness,
+and immutable genesis proof. The command prints the client endpoint only after
+every child reports ready.
 `SIGINT` or `SIGTERM` drains and reaps the child processes.
 
 The generated control inventory is deliberately split-only. The local topology
@@ -56,9 +57,11 @@ schema witnesses with the catalog seed. It also attests that the local
 generation-one seed matches the immutable replicated genesis proof. This
 attestation remains valid after the mutable catalog head advances. After
 catalog genesis completes, a missing replicated catalog head fails closed
-instead of silently republishing the seed. The generated credentials and
-`local-development-only` key reference are for one-host tests, not an operator
-credential lifecycle.
+instead of silently republishing the seed. RF3 mode supplies
+`catalog.vibejson.route-seed` as the gateway's separate mutable route seed; the
+gateway creates or advances it only from an authenticated certified catalog
+head. The generated credentials and `local-development-only` key reference are
+for one-host tests, not an operator credential lifecycle.
 
 For a lighter local smoke test, `--replicas 1` prepares and serves one genuine
 Raft member for each of the same three roles and prints the data member's
@@ -92,6 +95,9 @@ You need:
 - One catalog bootstrap file that points to that catalog group and contains the
   catalog, request-ledger, and data descriptors, one full ledger-home range,
   and the public data table profile used by the gateway.
+- One private route-seed path per gateway. It must be a regular-file path that
+  is distinct from the catalog bootstrap and every other gateway's route seed.
+- One private catalog session journal per gateway, retained across restarts.
 - One regular file that contains exactly 32 raw bytes for the durable ACK
   derivation key.
 
@@ -119,7 +125,8 @@ The catalog exposes only the data table profile. Trusted code must build the
 exact generation-one catalog seed. `-catalog-bootstrap-if-missing` authorizes
 publication only when catalog RF3 has no head or immutable genesis proof. The
 gateway then attests the exact seed against the replicated proof on every
-restart.
+restart. Keep that file immutable. A different per-gateway mutable route seed
+tracks later certified heads without changing the genesis proof.
 
 ### 1. Build the commands
 
@@ -239,6 +246,7 @@ List every native or SQL shard address the catalog can resolve. Each
 ```bash
 ./bin/vibedb-gateway serve \
   -catalog ./cluster.vibejson \
+  -catalog-route-seed ./state/gateway-catalog-route-seed.vibejson \
   -catalog-bootstrap-if-missing \
   -catalog-relation 1 \
   -catalog-session-journal ./state/gateway-catalog-session \
@@ -265,6 +273,23 @@ this example because their operator-assigned addresses and identities are not
 derivable from the data group. The durable ACK key file contains exactly 64
 lowercase hexadecimal characters. Every replacement gateway must use the same
 key.
+
+The two catalog paths have different jobs. `-catalog` remains the immutable
+generation-one bootstrap and attestation seed. `-catalog-route-seed` is this
+gateway identity's crash-safe locator for the latest authenticated catalog
+head; never share it or `-catalog-session-journal` with a replacement gateway.
+Every certified read or publication advances the mutable seed through a staged
+file. A byte-identical head does no disk work, and a newer head with the same
+catalog session binding is promoted while serving continues.
+
+If the catalog self-route changes that binding, the gateway first durably
+stages the certified head and seals catalog authority. It then quiesces public
+and control work, settles Retire then Release for the old native session,
+removes the old journal, promotes the staged seed, and exits nonzero with
+`gateway.ErrReplicatedCatalogRouteRestartRequired`. Run the gateway under a
+supervisor that restarts it. Startup recovers the pending seed and exact old
+journal state after a crash; it never opens a fresh session through a stale
+route.
 
 ### 7. Check a linearizable read
 
@@ -299,6 +324,11 @@ member ID, or group identity between runs. A follower reopens its WAL and apply
 state, reconnects to the other members, and catches up through Raft. See
 [Operate replica lifecycle](replica-lifecycle.md) for learner replacement and
 failure exercises.
+
+Restart a gateway with the same immutable catalog seed, private mutable route
+seed, session journal, client ID, and retry home. A replacement gateway may
+share the immutable genesis and durable ACK key, but it needs its own route seed,
+session identity, and journal.
 
 ## Next steps
 

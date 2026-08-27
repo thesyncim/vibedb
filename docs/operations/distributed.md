@@ -20,7 +20,7 @@ For a task-oriented setup, start with:
 | RF3 preparation | `vibedb-shard prepare-rf3 -manifest <path>` | Atomic, fail-if-present creation of one member's WAL, SQL root, retained identities, key copy, and serving manifest. |
 | Replicated shard | `vibedb-shard serve-rf3 -manifest <path>` | One prepared Raft member with quorum writes, leader `ReadIndex`, authenticated peer, native, snapshot, and control traffic, and replica-move services. |
 | Cold learner | `vibedb-shard bootstrap-rf3 -manifest <path>` | One enrolled empty target that installs an authorized snapshot before reopening through `serve-rf3`. |
-| Gateway | `vibedb-gateway serve -catalog <path> ...` | Catalog-pinned routing, bounded fanout, leader-aware RF3 requests, distributed exact-key reads, durable sequenced transactions with client ACK, and optional replica-move execution. |
+| Gateway | `vibedb-gateway serve -catalog <genesis> -catalog-route-seed <private-path> ...` | Catalog-pinned routing, bounded fanout, leader-aware RF3 requests, distributed exact-key reads, durable sequenced transactions with client ACK, and optional replica-move execution. |
 
 RF3 means a replication factor of three: one shard has three voters. It is not
 a VibeDB format or API version.
@@ -63,10 +63,29 @@ relation profiles needed to locate the catalog RF3 group. In normal mode the
 gateway reads the authoritative head from that replicated group.
 
 The repository has no general catalog-creation CLI. Trusted application or
-operator code must build a valid `gateway.Snapshot`. `SaveSnapshot` or
-`SaveSnapshotAfter` publishes a local seed or successor. A catalog file is
-limited to 16 MiB and is replaced through a synced sibling and parent-directory
-sync.
+operator code must build a valid `gateway.Snapshot`. The local snapshot helpers
+write operator-owned files; they do not authorize a replicated catalog change.
+A catalog file is limited to 16 MiB and is replaced through a synced sibling
+and parent-directory sync.
+
+Replicated mode deliberately keeps two catalog files. `-catalog` is the
+immutable generation-one bootstrap and attestation seed. Never replace it with
+a newer head. `-catalog-route-seed` is a separate mutable, per-gateway regular
+file containing the last authenticated catalog head that can locate catalog
+RF3. Do not share this path, or the catalog session journal, between gateway
+process identities.
+
+Every authenticated authoritative catalog read and successful publication is
+fed through one certified-head persistence gate. A byte-identical head performs
+no disk write. A newer head whose catalog self-route retains the exact native
+session binding is staged, synced, and promoted while the gateway remains live.
+A head that changes that binding is staged first and seals catalog authority
+before the new head can reach the holder. The command then stops accepting
+work, drains all catalog users, retires and releases the old replicated session,
+destroys its journal, promotes the staged seed, and exits with
+`gateway.ErrReplicatedCatalogRouteRestartRequired`. Run the command under a
+supervisor that restarts it after this fail-closed handoff. Startup resumes the
+same transition from the pending seed and journal after a crash at any step.
 
 Use the command validators before startup:
 
@@ -93,6 +112,7 @@ the replicated-catalog flags, `-replica-control-manifest`, and
 Authenticated replicated-catalog mode requires all of these flags:
 
 - `-catalog`
+- `-catalog-route-seed`
 - `-catalog-relation`
 - `-catalog-session-journal`
 - `-durable-ack-key`
@@ -105,14 +125,17 @@ Authenticated replicated-catalog mode requires all of these flags:
 The stable catalog client ID is 32 lowercase hexadecimal characters. The retry
 home is 16 lowercase hexadecimal characters. The durable ACK key file contains
 exactly 64 lowercase hexadecimal characters and must be shared by replacement
-gateways. Values must remain stable across gateway restarts.
+gateways. Values must remain stable across gateway restarts. The route-seed
+path must be a private regular file distinct from `-catalog`; path or inode
+aliasing fails closed.
 
 Use `-catalog-bootstrap-if-missing` only when the local generation-one seed is
 authorized to initialize an empty catalog RF3 group. The first publication
 atomically stores the head, its witness, and an immutable genesis proof. Later
 starts attest the local seed against that replicated proof even when the current
 catalog head has advanced. A missing head beside an existing genesis proof is
-corruption and fails closed.
+corruption and fails closed. The mutable route seed never replaces or weakens
+this generation-one proof.
 
 `-catalog-attempts` and `-catalog-attempt-timeout` bound leader routing. A
 definite stale serving fence coalesces one authenticated catalog refresh and
@@ -304,6 +327,15 @@ Restart an RF3 member with the exact same manifest and retained artifacts. The
 process reopens its WAL and apply state, then catches up through Raft. An
 isolated former leader must refuse writes and linearizable reads.
 
+Run each gateway under a restart supervisor. A certified catalog self-route
+change deliberately ends the serving process only after public and control
+work has quiesced, the old native session has reached Retire then Release, its
+journal has been removed, and the staged route seed has been promoted. The
+nonzero exit reports `gateway.ErrReplicatedCatalogRouteRestartRequired`; the
+next process opens the promoted binding. Preserve both catalog files, the
+route-seed pending sibling, and the session journal across an interrupted
+handoff so startup can settle it exactly.
+
 For an outcome-unknown write, retry the exact request bytes with the same
 request ID, issuer grant reference, and lane sequence. For a lost ACK response,
 retry the exact ACK handle.
@@ -313,8 +345,21 @@ evidence.
 
 The repository includes deterministic and selected external-process tests for
 leader failure, stale former-leader refusal, retry identity, follower catch-up,
-snapshot resume, and move-action reconciliation. It does not yet provide an
-exhaustive production fault or upgrade qualification matrix.
+snapshot resume, and move-action reconciliation.
+`TestGatewayDurableRF3ExternalProcessRecovery` is the shipped durable-SQL gate:
+three shard processes each host catalog, request-ledger, and two data RF3
+groups; two gateways use distinct principals and retained sessions; all tested
+traffic uses native mutual TLS. It covers a stopped catalog voter, killed shard
+leaders, gateway replacement, lost terminal and ACK responses, exact replay,
+ACK collection, and rolling voter restarts. Its bounds cover foreground p99,
+RSS, allocated storage, WAL allocation, exact public client request/response
+wire bytes, and snapshot payload bytes. It does not measure total Raft or total
+network bytes. The mandatory Ubuntu workflow requires three unskipped runs;
+the generated feature state remains Partial until those runs are recorded.
+Docker Desktop containerd corruption prevented an equivalent local Linux run,
+so no local substitute is counted as qualification evidence. The repository
+does not yet provide an exhaustive production fault or upgrade qualification
+matrix.
 
 ## Metrics and limits
 
@@ -346,8 +391,8 @@ admission fail closed. A distributed read never returns partial documents.
 
 ## Implementation references
 
-- `cmd/vibedb-gateway/serve.go`, `replica_move_controller.go`, and
-  `replica_move_remote.go`
+- `cmd/vibedb-gateway/serve.go`, `catalog_route_seed_test.go`,
+  `replica_move_controller.go`, and `replica_move_remote.go`
 - `cmd/vibedb-shard/serve_rf3.go`, `bootstrap_rf3.go`, and `rf3_manifest.go`
 - `gateway/replicated_data_read.go`, `replicated_sql_read.go`,
   `replicated_sql_transaction.go`, `replicated_transaction.go`,
@@ -358,6 +403,8 @@ admission fail closed. A distributed read never returns partial documents.
   `durable_exec_batch_wire.go`, `issuer_open_wire.go`, and
   `exec_batch_ack_wire.go`
 - `gateway/schema_rollout.go` and `internal/schemainstall`
+- `gateway/replicated_catalog_authority.go` and
+  `replicated_catalog_route_seed.go`
 - `internal/hotshard`
 - `internal/splitcontroller/local_observation_provider.go` and
   `composite_shard_executor.go`
