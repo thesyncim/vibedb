@@ -190,17 +190,25 @@ bundles, including restart after partial schema creation. The gateway's
 `split_sources` inventory selects an exact group/schema/machine-digest binding
 and separate per-node templates and roots; there is no shared-template fallback.
 An empty inventory disables split intake without disabling replica moves.
-Automatic bundled-child allocation still needs full authenticated source SQL
-metadata. Repeated descendant splits also need certified live-source registry
-and restart integration; unlisted sources fail closed. These remain integration
-gaps, not a completed heterogeneous split path.
-The first automatic split also remains blocked by cross-boundary contract
-mismatches: source-artifact and child-serving digests are conflated, allocation
-and plan preparation use different operation IDs, and plan admission assumes
-per-shard fences equal global catalog versions. These checks currently fail
-closed. Certified child catalog projection alone does not prove a serving
-cutover. Completion requires a composed allocation-through-publication test
-and reconstruction of live adopted groups after process restart.
+The inventory now includes authenticated source SQL, local-index definitions,
+and the immutable placement profile. Logical table schema and per-shard machine
+digests are separate; allocation and plan preparation share one geometry-derived
+operation identity. A narrower retained range does not rewrite its original
+machine validation profile. Co-located global-index relations do not count as
+additional base tables when selecting a source.
+
+Serving startup can reconstruct certified adopted groups from a fixed-size live
+inventory and exact receipt references, without scanning operation history.
+An unfinished split reuses an already adopted child instead of reopening its
+exclusively owned SQL store. This has local fault and race coverage, not yet
+the required Linux external kill/restart proof.
+
+Remaining integration gates include admission-before-preparation (to avoid
+orphan child reservations), exact source-versus-catalog fence handling through
+durable seal and reopen, and gateway discovery of descendant split sources.
+Unlisted sources fail closed. Certified child catalog projection alone does
+not prove a serving cutover; completion requires the composed
+allocation-through-publication and process-restart gates.
 Mandatory Linux split-under-load fault gates remain Partial until CI records
 their required unskipped runs.
 
