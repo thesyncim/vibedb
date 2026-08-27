@@ -457,6 +457,8 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("vibedb/request-ledger/semantics\x00"))
+	_, _ = hash.Write([]byte("payload-build-command-epoch-u64-reserved288-digest-bound;"))
+	_, _ = hash.Write([]byte("schema-release-intent-atomic-exact-pin-lease-freeze;"))
 	for _, magic := range [...][4]byte{
 		commandMagic, headMagic, pageMagic, planMagic, pageBatchMagic,
 		pendingWaveMagic, continuationMagic, terminalMagic, ackMagic,

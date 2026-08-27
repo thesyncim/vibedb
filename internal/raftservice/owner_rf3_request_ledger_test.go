@@ -519,7 +519,7 @@ func newMultiGroupRF3DurableGateway(
 		t.Fatal(err)
 	}
 	runner, err := gateway.NewDurableRequestDistributedRunner(
-		ledger, resolver, waves, payloads, terminal, terminalAuthority,
+		ledger, resolver, waves, payloads, terminal, terminalAuthority, pins,
 	)
 	if err != nil {
 		t.Fatal(err)

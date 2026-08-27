@@ -31,13 +31,16 @@ type DurableRequestWave struct {
 	Binding           requestledger.Digest
 	ExecutionPinRoute ReplicatedRoute
 	ExecutionPinLease executionpin.LeaseCertificate
-	Build             requestledger.PayloadBuildRecord
-	Step              requestledger.StepRef
-	Ordinal           uint64
-	Target            []byte
-	Command           []byte
-	Transition        uint32
-	Cursor            []byte
+	// CommandEpoch is immutable once payload-build admission wins; a retry
+	// may carry a newer ExecutionPinLease without rewriting this command.
+	CommandEpoch uint64
+	Build        requestledger.PayloadBuildRecord
+	Step         requestledger.StepRef
+	Ordinal      uint64
+	Target       []byte
+	Command      []byte
+	Transition   uint32
+	Cursor       []byte
 	// Settle derives result-dependent protocol state only after Command has an
 	// authenticated completion. Exactly one of Settle or the fixed
 	// Transition/Cursor pair is accepted.
@@ -67,7 +70,7 @@ type durableRequestExecutionPinFencer interface {
 }
 
 type durableRequestWaveStager interface {
-	Stage(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, uint64, []byte, []byte) (DurableRequestDynamicPayload, error)
+	Stage(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, uint64, []byte, []byte, uint64) (DurableRequestDynamicPayload, error)
 }
 
 // DurableRequestLifecycleRunner drives one participant at a time. Width is
@@ -218,7 +221,7 @@ func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, 
 		return runner.runAdmittedWave(ctx, retained, keyDigest)
 	}
 	stage = "payload"
-	payload, err := runner.payloads.Stage(ctx, wave.Home, wave.Key, wave.Ordinal, wave.Target, wave.Command)
+	payload, err := runner.payloads.Stage(ctx, wave.Home, wave.Key, wave.Ordinal, wave.Target, wave.Command, wave.CommandEpoch)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
 	}
@@ -664,7 +667,7 @@ func validateDurableRequestWave(wave DurableRequestWave) (requestledger.Digest, 
 		wave.Identity.ID == ([16]byte{}) ||
 		wave.Identity.RetryHome == (replication.RetryHome{}) || len(wave.Tenant) == 0 ||
 		len(wave.Tenant) > replication.MaxIdentityBytes || wave.PinID == (requestledger.PinID{}) ||
-		wave.GateEpoch == 0 || wave.Binding == (requestledger.Digest{}) ||
+		wave.GateEpoch == 0 || wave.CommandEpoch == 0 || wave.CommandEpoch > wave.ExecutionPinLease.ControllerEpoch || wave.Binding == (requestledger.Digest{}) ||
 		!validReplicatedRoute(wave.ExecutionPinRoute) || !wave.ExecutionPinLease.Valid() ||
 		(wave.Settle == nil && (wave.Transition == 0 || len(wave.Cursor) == 0)) ||
 		(wave.Settle != nil && (wave.Transition != 0 || len(wave.Cursor) != 0)) ||

@@ -82,6 +82,7 @@ func (runner *DurableRequestLifecycleRunner) openAdvancedWave(
 		return DurableRequestWave{}, errors.Join(err, gateErr, completionErr, ErrDurableRequestConflict)
 	}
 	wave.Ordinal, wave.Build, wave.Step = cut.route.WaveOrdinal, payload.Build, payload.Step
+	wave.CommandEpoch = payload.Build.CommandEpoch
 	wave.Target, wave.Command = payload.Target, payload.Command
 	return wave, nil
 }

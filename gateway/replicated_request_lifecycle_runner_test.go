@@ -371,7 +371,7 @@ func lifecycleRunnerFixture(t testing.TB) (
 			ID: [16]byte{7}, RetryHome: retry, CatalogGeneration: 7,
 			RecoveryDeadline: 1, CoordinatorOrdinal: 0,
 		},
-		Tenant: tenant, PinID: head.PinID, GateEpoch: 1,
+		Tenant: tenant, PinID: head.PinID, GateEpoch: 1, CommandEpoch: 1,
 		Binding: lifecycleDigest("logical-binding"), Step: step,
 		ExecutionPinRoute: physical.Route, ExecutionPinLease: lease,
 		Target: target, Command: command, Transition: 9, Cursor: cursor,
@@ -531,7 +531,7 @@ type lifecycleWaveStager struct {
 	fail     bool
 }
 
-func (stager *lifecycleWaveStager) Stage(ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey, ordinal uint64, target, command []byte) (DurableRequestDynamicPayload, error) {
+func (stager *lifecycleWaveStager) Stage(ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey, ordinal uint64, target, command []byte, commandEpoch uint64) (DurableRequestDynamicPayload, error) {
 	stager.calls++
 	stager.events.add("stage")
 	if stager.proposer.fenceCalls != stager.calls || ordinal != stager.wave.Ordinal || key != stager.wave.Key ||

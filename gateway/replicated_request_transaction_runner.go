@@ -33,6 +33,7 @@ type DurableRequestDistributedRunner struct {
 	payloads  durableDistributedPayloadStore
 	terminal  durableDistributedTerminal
 	authority DurableRequestTerminalAuthorityProvider
+	pins      DurableRequestExecutionPinAuthority
 	recovery  durableDistributedRecoveryReader
 }
 
@@ -56,13 +57,14 @@ func NewDurableRequestDistributedRunner(
 	payloads *DurableRequestDynamicPayloadStore,
 	terminal *DurableRequestTerminalCoordinator,
 	authority DurableRequestTerminalAuthorityProvider,
+	pins DurableRequestExecutionPinAuthority,
 ) (*DurableRequestDistributedRunner, error) {
-	if ledger == nil || resolver == nil || waves == nil || payloads == nil || terminal == nil || authority == nil {
+	if ledger == nil || resolver == nil || waves == nil || payloads == nil || terminal == nil || authority == nil || pins == nil {
 		return nil, ErrDurableRequest
 	}
 	runner := &DurableRequestDistributedRunner{
 		ledger: ledger, resolver: resolver, waves: waves, payloads: payloads,
-		terminal: terminal, authority: authority,
+		terminal: terminal, authority: authority, pins: pins,
 	}
 	if executor, ok := waves.proposer.(*ReplicatedExecutor); ok {
 		runner.recovery = executor
@@ -136,6 +138,10 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	if head.CleanupBuildDigest != (requestledger.Digest{}) &&
 		(head.OutstandingRoutePinDigest != (requestledger.Digest{}) || head.CleanupNextChunk == 0) {
 		stage = "advanced wave recovery"
+		execution, err = runner.refreshExecutionPin(ctx, execution)
+		if err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
 		recovery, ok := runner.waves.(interface {
 			ResumeAdvancedWave(context.Context, DurableRequestTypedExecutionContext) error
 		})
@@ -245,7 +251,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		return DurableRequestTerminalResult{}, err
 	}
 	stage = "terminal completion"
-	return runner.completeTerminal(ctx, execution, authority, progress.state)
+	return runner.completeTerminal(ctx, progress.execution, authority, progress.state)
 }
 
 func (runner *DurableRequestDistributedRunner) completeTerminal(
@@ -254,6 +260,33 @@ func (runner *DurableRequestDistributedRunner) completeTerminal(
 	authority DurableRequestTerminalAuthority,
 	state durableDistributedState,
 ) (DurableRequestTerminalResult, error) {
+	// Terminal recovery owns an immutable prepared ACK and, when present, an
+	// exact release intent. Read that cut before any attempted lease takeover.
+	if runner.pins != nil {
+		reader, ok := runner.ledger.(durableRequestTerminalCutReader)
+		if !ok {
+			return DurableRequestTerminalResult{}, ErrDurableRequestUnresolved
+		}
+		cut, err := reader.ReadTerminalCut(ctx, execution.Home, execution.Key.RequestKey)
+		if err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
+		execution.terminalCut = nil
+		if cut.Head.Phase == requestledger.PhasePrepared {
+			if err = validateDurableRequestPreparedCut(execution, cut); err != nil {
+				return DurableRequestTerminalResult{}, err
+			}
+			execution.terminalCut = &cut
+		}
+		execution, err = runner.refreshExecutionPin(ctx, execution)
+		if err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
+		authority, err = runner.authority.TerminalAuthority(ctx, execution)
+		if err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
+	}
 	progress := durableDistributedProgress{execution: execution, state: state}
 	result, err := progress.result()
 	if err != nil {
@@ -273,6 +306,19 @@ func (runner *DurableRequestDistributedRunner) completeTerminal(
 		AckToken:          authority.AckToken, Release: authority.Release,
 		Lease: execution.ExecutionPinLease,
 	})
+}
+
+func (runner *DurableRequestDistributedRunner) refreshExecutionPin(ctx context.Context, execution DurableRequestTypedExecutionContext) (DurableRequestTypedExecutionContext, error) {
+	// The private fixture constructor can omit the native pin driver. The
+	// exported production constructor requires it, before accepting traffic.
+	if runner.pins == nil {
+		return execution, nil
+	}
+	route, acquire, lease, err := runner.pins.AcquireOrRecover(ctx, execution)
+	if err != nil {
+		return DurableRequestTypedExecutionContext{}, err
+	}
+	return BindDurableRequestExecutionPin(execution, route, acquire, lease)
 }
 
 func (runner *DurableRequestDistributedRunner) recoverManifestDescriptor(
@@ -734,6 +780,14 @@ func (progress *durableDistributedProgress) command(
 	if ordinal != progress.next {
 		return false, ErrDurableRequestConflict
 	}
+	if progress.execution.terminalCut != nil {
+		return false, ErrDurableRequestConflict
+	}
+	var err error
+	progress.execution, err = progress.runner.refreshExecutionPin(ctx, progress.execution)
+	if err != nil {
+		return false, err
+	}
 	// Every participant and coordinator transition carries the same aggregate
 	// execution authority and the controller epoch proven at wave admission.
 	// Replicas persist this pair and reject stale or mismatched controllers
@@ -743,7 +797,19 @@ func (progress *durableDistributedProgress) command(
 		progress.execution.Recipe.Contract.PinDigest == (replication.Digest{}) {
 		return false, ErrDurableRequestConflict
 	}
-	control.ControllerEpoch = lease.ControllerEpoch
+	commandEpoch := lease.ControllerEpoch
+	if store, ok := progress.runner.payloads.(interface {
+		ExistingCommandEpoch(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, uint64) (uint64, error)
+	}); ok {
+		retained, readErr := store.ExistingCommandEpoch(ctx, progress.execution.Home, progress.execution.Key.RequestKey, ordinal)
+		if readErr != nil || retained > commandEpoch {
+			return false, errors.Join(readErr, ErrDurableRequestConflict)
+		}
+		if retained != 0 {
+			commandEpoch = retained
+		}
+	}
+	control.ControllerEpoch = commandEpoch
 	control.ExecutionPinDigest = distributedtxn.Digest(progress.execution.Recipe.Contract.PinDigest)
 	exact, err := progress.encoder.appendExact(
 		nil, progress.execution.Recipe.Identity.RetryHome, route, control, batches,
@@ -761,6 +827,7 @@ func (progress *durableDistributedProgress) command(
 		Binding:           requestledger.Digest(progress.execution.Recipe.Contract.PinDigest),
 		ExecutionPinRoute: progress.execution.ExecutionPinRoute,
 		ExecutionPinLease: progress.execution.ExecutionPinLease,
+		CommandEpoch:      commandEpoch,
 		Ordinal:           ordinal, Target: target, Command: exact,
 	}
 	wave.Settle = func(observation []byte) (uint32, []byte, error) {

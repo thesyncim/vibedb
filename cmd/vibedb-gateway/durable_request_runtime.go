@@ -89,7 +89,7 @@ func newReplicatedDurableRuntime(
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)
 	}
 	runner, err := gateway.NewDurableRequestDistributedRunner(
-		ledger, resolver, waves, payloads, terminal, terminalAuthority,
+		ledger, resolver, waves, payloads, terminal, terminalAuthority, pins,
 	)
 	if err != nil {
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)

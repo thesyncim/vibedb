@@ -56,6 +56,28 @@ func (provider *NativeDurableRequestTerminalAuthorityProvider) TerminalAuthority
 	if err != nil || replication.Digest(bindingDigest) != execution.Recipe.Contract.PinDigest {
 		return DurableRequestTerminalAuthority{}, errors.Join(err, ErrDurableRequestConflict)
 	}
+	if cut := execution.terminalCut; cut != nil {
+		if err := validateDurableRequestPreparedCut(execution, *cut); err != nil {
+			return DurableRequestTerminalAuthority{}, err
+		}
+		if cut.SchemaPin.Revision != 0 {
+			_, release, err := durableRequestTerminalReleaseCommand(execution, *cut)
+			if err != nil {
+				return DurableRequestTerminalAuthority{}, err
+			}
+			release.PrepareTerminalDigest = executionpin.Digest{}
+			result, err := NewDurableRequestTerminalAuthority(execution, provider.ackKey,
+				appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedCommitted}),
+				appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedAborted}), release)
+			if err != nil {
+				return DurableRequestTerminalAuthority{}, err
+			}
+			// This is immutable terminal recovery, not renewed side-effect
+			// authority. The prepared row already owns the client capability.
+			result.AckToken = cut.Prepared.AckToken
+			return result, nil
+		}
+	}
 
 	acquire, lease := execution.ExecutionPinAcquire, execution.ExecutionPinLease
 	acquireDigest, acquireErr := executionpin.AcquireCertificateDigest(acquire)
@@ -98,9 +120,13 @@ func (provider *NativeDurableRequestTerminalAuthorityProvider) TerminalAuthority
 	derivedKey := provider.deriveAckKey(
 		bindingDigest, acquireDigest, leaseDigest,
 	)
-	return NewDurableRequestTerminalAuthority(
+	result, err := NewDurableRequestTerminalAuthority(
 		execution, derivedKey, commitCursor, abortCursor, release,
 	)
+	if err == nil && execution.terminalCut != nil {
+		result.AckToken = execution.terminalCut.Prepared.AckToken
+	}
+	return result, err
 }
 
 func (provider *NativeDurableRequestTerminalAuthorityProvider) deriveAckKey(

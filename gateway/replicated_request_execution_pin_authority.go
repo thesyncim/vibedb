@@ -122,6 +122,18 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 		return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
 			errors.Join(err, pinErr, ErrDurableRequestConflict)
 	}
+	var retainedRelease executionpin.Command
+	if execution.terminalCut != nil {
+		if err = validateDurableRequestPreparedCut(execution, *execution.terminalCut); err != nil {
+			return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
+		}
+		if execution.terminalCut.SchemaPin.Revision != 0 {
+			_, retainedRelease, err = durableRequestTerminalReleaseCommand(execution, *execution.terminalCut)
+			if err != nil {
+				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
+			}
+		}
+	}
 	session, principal, releaseSession, openErr := authority.sessions.OpenExecutionPinSession(ctx, execution, route)
 	if releaseSession != nil {
 		defer releaseSession()
@@ -151,12 +163,34 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 			if read.Record.Binding != binding || !acquireOK || !leaseOK {
 				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 			}
-			if executionpin.ValidateSideEffectFence(lease, read.Record, read.Applied) == nil {
+			if retainedRelease.Operation == executionpin.OperationRelease {
+				acquireDigest, digestErr := executionpin.AcquireCertificateDigest(acquire)
+				if digestErr != nil || acquireDigest != retainedRelease.AcquireCertificateDigest ||
+					read.Record.PrepareTerminalDigest != retainedRelease.PrepareTerminalDigest ||
+					(read.Record.Status != executionpin.StatusActive && read.Record.Status != executionpin.StatusReleased) ||
+					lease.Controller != retainedRelease.ExpectedController ||
+					lease.ControllerEpoch != retainedRelease.ExpectedControllerEpoch ||
+					lease.LeaseAppliedThrough != retainedRelease.ExpectedLeaseAppliedThrough ||
+					lease.Revision != retainedRelease.ExpectedLeaseRevision {
+					return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
+				}
+				// This pair is only for exact terminal release replay. Frozen and
+				// released records both fail the ordinary wave side-effect fence.
 				return route, acquire, lease, nil
 			}
-			if read.Record.Status != executionpin.StatusActive || read.Applied <= read.Record.LeaseAppliedThrough {
+			if executionpin.ValidateSideEffectFence(lease, read.Record, read.Applied) == nil {
+				if !durableRequestPinControllerMatches(lease, principal) {
+					return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
+				}
+				return route, acquire, lease, nil
+			}
+			if read.Record.Status != executionpin.StatusActive || read.Record.PrepareTerminalDigest != (executionpin.Digest{}) ||
+				read.Applied <= read.Record.LeaseAppliedThrough {
 				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 			}
+		}
+		if retainedRelease.Operation == executionpin.OperationRelease {
+			return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 		}
 
 		if session.pending {
@@ -204,6 +238,10 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 		}
 	}
 	return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestUnresolved
+}
+
+func durableRequestPinControllerMatches(lease executionpin.LeaseCertificate, principal serviceauthz.Authority) bool {
+	return lease.Valid() && principal.Valid() && lease.Controller == executionpin.ID(principal.Node)
 }
 
 var _ DurableRequestExecutionPinAuthority = (*NativeDurableRequestExecutionPinAuthority)(nil)

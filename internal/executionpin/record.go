@@ -78,9 +78,8 @@ func (record Record) Valid() bool {
 			record.TerminalAuthorityDigest != (Digest{}) {
 			return false
 		}
-		if record.PrepareTerminalDigest != (Digest{}) {
-			return false
-		}
+		// A nonzero prepared digest is an irreversible release-pending freeze.
+		// It remains active for retention accounting until the exact release.
 		if record.LastOperation == OperationAcquire {
 			return record.LastApplied == record.AcquireApplied
 		}

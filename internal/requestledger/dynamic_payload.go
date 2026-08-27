@@ -72,21 +72,25 @@ type PayloadBuildRecord struct {
 	PriorContinuationDigest, ContentRoot, BuildDigest, Chain Digest
 	WaveOrdinal, Revision, TotalBytes, ChunkCount            uint64
 	NextChunkOrdinal, StagedBytes                            uint64
-	Phase                                                    PayloadBuildPhase
+	// CommandEpoch freezes the producer epoch before the first payload chunk.
+	// A recovered controller must reconstruct this exact command, not rebind
+	// its bytes to the newer lease used to admit the retry.
+	CommandEpoch uint64
+	Phase        PayloadBuildPhase
 }
 
-func NewPayloadBuild(head HeadRecord, contentRoot Digest, totalBytes, chunkCount uint64) (PayloadBuildRecord, error) {
+func NewPayloadBuild(head HeadRecord, contentRoot Digest, totalBytes, chunkCount, commandEpoch uint64) (PayloadBuildRecord, error) {
 	if err := validateHead(head); err != nil || head.Phase != PhaseSealed ||
 		nonzeroDigest(head.CleanupBuildDigest) ||
 		head.MaxActivePayloadBytes == 0 || !nonzeroDigest(contentRoot) || totalBytes == 0 ||
 		totalBytes > head.MaxActivePayloadBytes || chunkCount == 0 || chunkCount > head.MaxActivePayloadChunks ||
-		chunkCount != (totalBytes+MaxPlanPageBytes-1)/MaxPlanPageBytes {
+		chunkCount != (totalBytes+MaxPlanPageBytes-1)/MaxPlanPageBytes || commandEpoch == 0 {
 		return PayloadBuildRecord{}, ErrInvalidState
 	}
 	record := PayloadBuildRecord{KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest,
 		PlanRoot: head.PlanRoot, PriorContinuationDigest: head.ContinuationDigest,
 		ContentRoot: contentRoot, WaveOrdinal: head.NextStepOrdinal, Revision: 1,
-		TotalBytes: totalBytes, ChunkCount: chunkCount, Phase: PayloadBuildStaging}
+		TotalBytes: totalBytes, ChunkCount: chunkCount, CommandEpoch: commandEpoch, Phase: PayloadBuildStaging}
 	record.BuildDigest = payloadBuildDigest(record)
 	return record, validatePayloadBuild(record)
 }
@@ -113,15 +117,17 @@ func AppendPayloadBuild(dst []byte, record PayloadBuildRecord) ([]byte, error) {
 	putDigest(out[192:224], record.ContentRoot)
 	putDigest(out[224:256], record.BuildDigest)
 	putDigest(out[256:288], record.Chain)
+	binary.LittleEndian.PutUint64(out[288:296], record.CommandEpoch)
 	dst = appendChecksum(dst, start)
 	return dst, nil
 }
 
 func OpenPayloadBuild(raw []byte) (PayloadBuildRecord, error) {
-	if len(raw) != payloadBuildBytes || !magicOK(raw, payloadBuildMagic) || !zeroBytes(raw[4:8]) || !zeroBytes(raw[9:16]) || !zeroBytes(raw[288:388]) || !checksumOK(raw) {
+	if len(raw) != payloadBuildBytes || !magicOK(raw, payloadBuildMagic) || !zeroBytes(raw[4:8]) || !zeroBytes(raw[9:16]) || !zeroBytes(raw[296:388]) || !checksumOK(raw) {
 		return PayloadBuildRecord{}, ErrCorrupt
 	}
 	r := PayloadBuildRecord{Phase: PayloadBuildPhase(raw[8]), WaveOrdinal: binary.LittleEndian.Uint64(raw[16:24]), Revision: binary.LittleEndian.Uint64(raw[24:32]), TotalBytes: binary.LittleEndian.Uint64(raw[32:40]), ChunkCount: binary.LittleEndian.Uint64(raw[40:48]), NextChunkOrdinal: binary.LittleEndian.Uint64(raw[48:56]), StagedBytes: binary.LittleEndian.Uint64(raw[56:64]), KeyDigest: readDigest(raw[64:96]), RequestDigest: readDigest(raw[96:128]), PlanRoot: readDigest(raw[128:160]), PriorContinuationDigest: readDigest(raw[160:192]), ContentRoot: readDigest(raw[192:224]), BuildDigest: readDigest(raw[224:256]), Chain: readDigest(raw[256:288])}
+	r.CommandEpoch = binary.LittleEndian.Uint64(raw[288:296])
 	if err := validatePayloadBuild(r); err != nil {
 		return PayloadBuildRecord{}, ErrCorrupt
 	}
@@ -208,6 +214,9 @@ func OpenPayloadChunk(raw []byte) (PayloadChunkRecord, error) {
 }
 
 func validatePayloadBuild(r PayloadBuildRecord) error {
+	if r.CommandEpoch == 0 {
+		return ErrCorrupt
+	}
 	if !nonzeroDigest(r.KeyDigest) || !nonzeroDigest(r.RequestDigest) || !nonzeroDigest(r.PlanRoot) || !nonzeroDigest(r.ContentRoot) || r.BuildDigest != payloadBuildDigest(r) || r.Revision == 0 || r.TotalBytes == 0 || r.TotalBytes > MaxDynamicWavePayloadBytes || r.ChunkCount == 0 || r.ChunkCount > MaxDynamicWavePayloadChunks || r.ChunkCount != (r.TotalBytes+MaxPlanPageBytes-1)/MaxPlanPageBytes || r.NextChunkOrdinal > r.ChunkCount || r.StagedBytes > r.TotalBytes || (r.WaveOrdinal == 0) != !nonzeroDigest(r.PriorContinuationDigest) || r.Phase < PayloadBuildStaging || r.Phase > PayloadBuildSealed || (r.NextChunkOrdinal == 0) != !nonzeroDigest(r.Chain) || (r.Phase == PayloadBuildSealed && (r.NextChunkOrdinal != r.ChunkCount || r.StagedBytes != r.TotalBytes || r.Chain != r.ContentRoot)) {
 		return ErrCorrupt
 	}
@@ -223,7 +232,7 @@ func validatePayloadChunk(r PayloadChunkRecord) error {
 
 func payloadBuildDigest(r PayloadBuildRecord) Digest {
 	const domain = "vibedb/request-ledger/payload-build\x00"
-	var framed [len(domain) + 5*sha256.Size + 24]byte
+	var framed [len(domain) + 5*sha256.Size + 32]byte
 	at := copy(framed[:], payloadBuildDigestDomain)
 	for _, d := range [...]Digest{r.KeyDigest, r.RequestDigest, r.PlanRoot, r.PriorContinuationDigest, r.ContentRoot} {
 		at += copy(framed[at:], d[:])
@@ -231,5 +240,6 @@ func payloadBuildDigest(r PayloadBuildRecord) Digest {
 	binary.LittleEndian.PutUint64(framed[at:at+8], r.WaveOrdinal)
 	binary.LittleEndian.PutUint64(framed[at+8:at+16], r.TotalBytes)
 	binary.LittleEndian.PutUint64(framed[at+16:at+24], r.ChunkCount)
+	binary.LittleEndian.PutUint64(framed[at+24:at+32], r.CommandEpoch)
 	return Digest(sha256.Sum256(framed[:]))
 }

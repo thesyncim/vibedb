@@ -569,6 +569,20 @@ func (service *DurableRequestService) drive(
 	if err != nil {
 		return DurableRequestOutcome{}, err
 	}
+	if head.Phase == requestledger.PhasePrepared {
+		reader, ok := service.ledger.(durableRequestTerminalCutReader)
+		if !ok {
+			return DurableRequestOutcome{}, ErrDurableRequestUnresolved
+		}
+		cut, readErr := reader.ReadTerminalCut(ctx, home, key.RequestKey)
+		if readErr != nil {
+			return DurableRequestOutcome{}, readErr
+		}
+		if err = validateDurableRequestPreparedCut(execution, cut); err != nil {
+			return DurableRequestOutcome{}, err
+		}
+		execution.terminalCut = &cut
+	}
 	route, acquire, lease, err := service.pins.AcquireOrRecover(ctx, execution)
 	if err != nil {
 		return DurableRequestOutcome{}, err

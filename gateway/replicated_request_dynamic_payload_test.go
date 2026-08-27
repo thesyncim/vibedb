@@ -178,10 +178,10 @@ func TestDurableRequestDynamicPayloadResumesEveryStageBoundary(t *testing.T) {
 		t.Run(fmt.Sprintf("operation_%d", operation), func(t *testing.T) {
 			store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
 			ledger.fault = operation
-			if _, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command); !errors.Is(err, errDynamicPayloadFault) {
+			if _, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command, 1); !errors.Is(err, errDynamicPayloadFault) {
 				t.Fatalf("first stage err=%v", err)
 			}
-			payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command)
+			payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -194,12 +194,53 @@ func TestDurableRequestDynamicPayloadResumesEveryStageBoundary(t *testing.T) {
 	}
 }
 
+func TestDurableRequestDynamicPayloadFreezesEpochBeforeFirstChunk(t *testing.T) {
+	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
+	ledger.fault = requestledger.OperationBeginPayloadBuild
+	if _, err := store.Stage(t.Context(), home, key, 0, target, command, 1); !errors.Is(err, errDynamicPayloadFault) {
+		t.Fatal("missing after-Begin crash cut", err)
+	}
+	if len(ledger.chunks) != 0 || ledger.build.CommandEpoch != 1 {
+		t.Fatal("Begin did not retain command epoch before chunks")
+	}
+	original, err := requestledger.AppendPayloadBuild(nil, ledger.build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, takeover := range []uint64{2, 3} {
+		// Reconstruct from the persisted canonical header, with no local epoch
+		// cache and no chunk from which to extract a transaction command.
+		ledger.build, err = requestledger.OpenPayloadBuild(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err = NewDurableRequestDynamicPayloadStore(ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		epoch, err := store.ExistingCommandEpoch(t.Context(), home, key, 0)
+		if err != nil || epoch != 1 || epoch >= takeover {
+			t.Fatal("lost prior epoch", epoch, err)
+		}
+		if _, err = store.Stage(t.Context(), home, key, 0, target, command, takeover); !errors.Is(err, ErrDurableRequestConflict) {
+			t.Fatal("takeover rewrote admitted command epoch", err)
+		}
+		if len(ledger.chunks) != 0 {
+			t.Fatal("conflicting epoch wrote chunks")
+		}
+	}
+	payload, err := store.Stage(t.Context(), home, key, 0, target, command, 1)
+	if err != nil || payload.Build.CommandEpoch != 1 || !bytes.Equal(payload.Command, command) {
+		t.Fatal("exact old command failed recovery", err)
+	}
+}
+
 func TestDurableRequestDynamicPayloadRejectsDelayedWaveBeforeWrites(t *testing.T) {
 	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
 	ordinal := ledger.head.NextStepOrdinal
 	ledger.head.NextStepOrdinal++
 	before := ledger.head
-	if _, err := store.Stage(t.Context(), home, key, ordinal, target, command); !errors.Is(err, ErrDurableRequestConflict) {
+	if _, err := store.Stage(t.Context(), home, key, ordinal, target, command, 1); !errors.Is(err, ErrDurableRequestConflict) {
 		t.Fatalf("delayed wave accepted: %v", err)
 	}
 	if !reflect.DeepEqual(ledger.head, before) || ledger.build != (requestledger.PayloadBuildRecord{}) || len(ledger.chunks) != 0 {
@@ -217,7 +258,7 @@ func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			payload, err := store.Stage(t.Context(), home, key, ledger.head.NextStepOrdinal, target, command)
+			payload, err := store.Stage(t.Context(), home, key, ledger.head.NextStepOrdinal, target, command, 1)
 			if err != nil {
 				t.Fatalf("new build encoded against head revision instead of absent build: %v", err)
 			}
@@ -227,7 +268,7 @@ func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T
 				payload.Build.RequestDigest != before.RequestDigest || payload.Build.PlanRoot != before.PlanRoot {
 				t.Fatal("independent build revision changed its sealed head binding")
 			}
-			retry, err := store.Stage(t.Context(), home, key, ledger.head.NextStepOrdinal, target, command)
+			retry, err := store.Stage(t.Context(), home, key, ledger.head.NextStepOrdinal, target, command, 1)
 			if err != nil || retry.Build != payload.Build || !bytes.Equal(retry.Bytes, payload.Bytes) {
 				t.Fatalf("exact retry changed winning build: %v", err)
 			}
@@ -237,7 +278,7 @@ func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T
 
 func TestDurableRequestDynamicPayloadReopensExactChunksAndRejectsReplacement(t *testing.T) {
 	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
-	payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command)
+	payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +292,7 @@ func TestDurableRequestDynamicPayloadReopensExactChunksAndRejectsReplacement(t *
 		!bytes.Equal(reopened.Target, target) || !bytes.Equal(reopened.Command, command) {
 		t.Fatal("reopened payload changed exact bytes")
 	}
-	if _, err = store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, append(bytes.Clone(command), 1)); !errors.Is(err, ErrDurableRequestConflict) {
+	if _, err = store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, append(bytes.Clone(command), 1), 1); !errors.Is(err, ErrDurableRequestConflict) {
 		t.Fatalf("replacement err=%v", err)
 	}
 	chunk := ledger.chunks[1]
@@ -265,7 +306,7 @@ func TestDurableRequestDynamicPayloadReopensExactChunksAndRejectsReplacement(t *
 
 func TestDurableRequestDynamicPayloadCleanupResumesUnknownOutcome(t *testing.T) {
 	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
-	payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command)
+	payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

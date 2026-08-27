@@ -23,6 +23,9 @@ type DurableRequestTypedExecutionContext struct {
 	ExecutionPinRoute   ReplicatedRoute
 	ExecutionPinAcquire executionpin.AcquireCertificate
 	ExecutionPinLease   executionpin.LeaseCertificate
+	// terminalCut is populated only by authenticated ledger recovery inside
+	// the gateway. It is not a caller-supplied permission for new side effects.
+	terminalCut *durableRequestTerminalReadCut
 }
 
 // BuildDurableRequestExecutionPinBinding derives the one aggregate authority

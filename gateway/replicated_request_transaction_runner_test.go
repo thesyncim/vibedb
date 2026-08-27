@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -154,7 +155,7 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 		return DurableRequestWaveResult{}, err
 	}
 	control := controlView.Command()
-	if control.ControllerEpoch != wave.ExecutionPinLease.ControllerEpoch ||
+	if control.ControllerEpoch != wave.CommandEpoch || wave.CommandEpoch == 0 || wave.CommandEpoch > wave.ExecutionPinLease.ControllerEpoch ||
 		control.ExecutionPinDigest != distributedtxn.Digest(wave.Binding) ||
 		wave.GateEpoch != wave.ExecutionPinLease.ControllerEpoch {
 		return DurableRequestWaveResult{}, fmt.Errorf("transaction command lacks exact execution-pin fence")
@@ -201,6 +202,108 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 		return DurableRequestWaveResult{}, errLifecycleRunnerFault
 	}
 	return DurableRequestWaveResult{Observation: observation, Revision: waves.ledger.head.Revision}, nil
+}
+
+type refreshingRunnerLedger struct{ *distributedRunnerLedger }
+
+func (l refreshingRunnerLedger) ReadTerminalCut(context.Context, DurableRequestLedgerHome, requestledger.RequestKey) (durableRequestTerminalReadCut, error) {
+	return durableRequestTerminalReadCut{Head: l.head, Continuation: l.continuation, Applied: max(uint64(1), l.head.Revision)}, nil
+}
+
+type refreshingRunnerPins struct {
+	record executionpin.Record
+	calls  int
+}
+
+func (p *refreshingRunnerPins) AcquireOrRecover(_ context.Context, e DurableRequestTypedExecutionContext) (ReplicatedRoute, executionpin.AcquireCertificate, executionpin.LeaseCertificate, error) {
+	if p.calls == 0 {
+		a, l := e.ExecutionPinAcquire, e.ExecutionPinLease
+		p.record = executionpin.Record{Status: executionpin.StatusActive, LastOperation: executionpin.OperationAcquire,
+			PinID: a.PinID, Binding: a.Binding, AcquireAuthorityDigest: a.AuthorityDigest, CurrentAuthorityDigest: l.AuthorityDigest,
+			AcquireApplied: a.Applied, AcquireController: a.Controller, AcquireControllerEpoch: a.ControllerEpoch, AcquireLeaseAppliedThrough: a.LeaseAppliedThrough,
+			Controller: l.Controller, ControllerEpoch: l.ControllerEpoch, LeaseAppliedThrough: l.LeaseAppliedThrough, LeaseRevision: l.Revision, LeaseApplied: l.Applied,
+			LastApplied: a.Applied, LastCommandDigest: executionpin.Digest{1}}
+	}
+	a, _ := p.record.AcquireCertificate()
+	digest, _ := executionpin.AcquireCertificateDigest(a)
+	c := executionpin.Command{Operation: executionpin.OperationRecover, Binding: p.record.Binding, PinID: p.record.PinID,
+		AuthorityNode: p.record.Controller, AuthorityGeneration: 1, ExpectedController: p.record.Controller, ExpectedControllerEpoch: p.record.ControllerEpoch,
+		ExpectedLeaseAppliedThrough: p.record.LeaseAppliedThrough, ExpectedLeaseRevision: p.record.LeaseRevision,
+		NextController: p.record.Controller, NextControllerEpoch: p.record.ControllerEpoch + 1, NextLeaseSpan: 1, AcquireCertificateDigest: digest}
+	transition := executionpin.Apply(p.record, true, c, p.record.LeaseAppliedThrough+1, executionpin.Digest{3}, executionpin.Digest{byte(p.calls + 2)})
+	if transition.Reason != executionpin.ReasonApplied || !transition.Mutated {
+		return ReplicatedRoute{}, a, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
+	}
+	p.record = transition.Record
+	p.calls++
+	l, _ := p.record.LeaseCertificate()
+	return e.Home.borrowedRoute(), a, l, nil
+}
+
+type retainedEpochRunnerPayloads struct{ distributedRunnerPayloads }
+
+func (retainedEpochRunnerPayloads) ExistingCommandEpoch(_ context.Context, _ DurableRequestLedgerHome, _ requestledger.RequestKey, ordinal uint64) (uint64, error) {
+	if ordinal == 0 {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+type refreshingRunnerAuthority struct {
+	distributedRunnerAuthority
+	lastEpoch uint64
+}
+
+func (a *refreshingRunnerAuthority) TerminalAuthority(_ context.Context, e DurableRequestTypedExecutionContext) (DurableRequestTerminalAuthority, error) {
+	a.lastEpoch = e.ExecutionPinLease.ControllerEpoch
+	value := a.value
+	value.AckToken[0] = byte(a.lastEpoch)
+	value.Release.ExpectedController = e.ExecutionPinLease.Controller
+	value.Release.ExpectedControllerEpoch = a.lastEpoch
+	value.Release.ExpectedLeaseAppliedThrough = e.ExecutionPinLease.LeaseAppliedThrough
+	value.Release.ExpectedLeaseRevision = e.ExecutionPinLease.Revision
+	return value, nil
+}
+
+func TestDurableRequestDistributedRunnerRefreshesOnlyUnfinishedWavesAndTerminal(t *testing.T) {
+	execution := typedExecutionFixture(t)
+	execution.Recipe.Contract.CommitFinalWaveCount, execution.Recipe.Contract.AbortFinalWaveCount = 8, 11
+	commit, abort := []byte("terminal-commit"), []byte("terminal-abort")
+	execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.CommitTransitionTag, commit))
+	execution.Recipe.Contract.AbortTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.AbortTransitionTag, abort))
+	_, head, route := lifecycleRunnerFixture(t)
+	execution, release := bindTypedExecutionPin(t, execution, route)
+	head.NextStepOrdinal, head.Revision = 0, 1
+	base := &distributedRunnerLedger{head: head}
+	ledger := refreshingRunnerLedger{base}
+	waves := &distributedRunnerWaves{ledger: base, fault: distributedtxn.ReplicatedBeginPrepareManifestCoordinator}
+	terminal := &distributedRunnerTerminal{}
+	authority := &refreshingRunnerAuthority{distributedRunnerAuthority: distributedRunnerAuthority{value: DurableRequestTerminalAuthority{CommitCursor: commit, AbortCursor: abort, Release: release}}}
+	runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, retainedEpochRunnerPayloads{}, terminal, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := &refreshingRunnerPins{}
+	runner.pins = pins
+	if _, err = runner.RunTyped(t.Context(), execution); !errors.Is(err, errLifecycleRunnerFault) {
+		t.Fatal("expected committed first-wave cut", err)
+	}
+	if pins.calls != 1 {
+		t.Fatalf("first wave acquisitions=%d", pins.calls)
+	}
+	if err = execution.Participants.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runner.RunTyped(t.Context(), execution); err != nil {
+		t.Fatal(err)
+	}
+	if pins.calls != 9 || terminal.plan.Lease.ControllerEpoch != 10 || authority.lastEpoch != 10 || terminal.plan.AckToken[0] != 10 || terminal.plan.Release.ExpectedControllerEpoch != 10 {
+		t.Fatalf("refreshes=%d terminalepoch=%d authority=%d ack=%d release=%d", pins.calls, terminal.plan.Lease.ControllerEpoch, authority.lastEpoch, terminal.plan.AckToken[0], terminal.plan.Release.ExpectedControllerEpoch)
+	}
+	old := execution.ExecutionPinLease
+	if executionpin.ValidateSideEffectFence(old, pins.record, pins.record.LeaseApplied) == nil {
+		t.Fatal("old controller retained side-effect authority")
+	}
 }
 
 type distributedRunnerTerminal struct {

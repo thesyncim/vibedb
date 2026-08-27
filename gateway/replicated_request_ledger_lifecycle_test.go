@@ -482,7 +482,7 @@ func lifecycleRowFixture(t testing.TB) lifecycleRows {
 	}
 
 	buildHead, _, _ := lifecycleHead(t)
-	build, err := requestledger.NewPayloadBuild(buildHead, lifecycleDigest("content"), 4, 1)
+	build, err := requestledger.NewPayloadBuild(buildHead, lifecycleDigest("content"), 4, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -239,11 +241,18 @@ func NewDurableRequestTerminalCoordinatorWithSessionFactory(
 func (coordinator *DurableRequestTerminalCoordinator) Complete(
 	ctx context.Context,
 	plan DurableRequestTerminalPlan,
-) (DurableRequestTerminalResult, error) {
+) (_ DurableRequestTerminalResult, failure error) {
+	stage := "validate"
+	defer func() {
+		if failure != nil {
+			failure = fmt.Errorf("gateway: terminal %s: %w", stage, failure)
+		}
+	}()
 	if coordinator == nil || coordinator.ledger == nil || (coordinator.pin == nil && coordinator.pinFactory == nil) ||
 		ctx == nil || !validDurableRequestTerminalPlan(plan) {
 		return DurableRequestTerminalResult{}, ErrDurableRequest
 	}
+	stage = "read cut"
 	head, continuation, prepared, release, terminal, applied, err :=
 		coordinator.openTerminalRows(ctx, plan)
 	if err != nil {
@@ -253,7 +262,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		if terminal.Outcome != plan.Outcome || terminal.AffectedRows != plan.AffectedRows ||
 			terminal.AffectedRowsValid != plan.AffectedRowsValid ||
 			terminal.RetirementWitnessDigest != plan.RetirementWitness ||
-			terminal.AckToken != plan.AckToken || !bytes.Equal(terminal.Result, plan.Result) {
+			!bytes.Equal(terminal.Result, plan.Result) {
 			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 		}
 		return DurableRequestTerminalResult{
@@ -262,7 +271,8 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 	}
 	pin, pinCtx := coordinator.pin, ctx
 	var releasePinSession func()
-	if coordinator.pinFactory != nil {
+	stage = "pin session"
+	if coordinator.pinFactory != nil && release.Phase != requestledger.SchemaPinReleased {
 		if plan.Execution.Key.RequestKey != plan.Key ||
 			plan.Execution.Home.Identity != plan.Home.Identity ||
 			plan.Execution.Home.Point != plan.Home.Point ||
@@ -279,12 +289,14 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		}
 	}
 	if prepared.Revision == 0 || release.Phase == requestledger.SchemaPinReleaseInvalid {
+		stage = "pin fence"
 		if err = pin.ValidateFence(pinCtx, plan.Lease); err != nil {
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 	}
 
 	if prepared.Revision == 0 {
+		stage = "prepare result"
 		prepared, err = requestledger.NewPreparedTerminal(
 			head, continuation, head.Revision+1, plan.Outcome,
 			plan.AffectedRows, plan.AffectedRowsValid, plan.Result,
@@ -293,6 +305,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		if err != nil {
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
+		stage = "prepare CAS"
 		cas, applyErr := coordinator.ledger.ApplyCAS(ctx, plan.Home, plan.Key,
 			DurableRequestLifecycleCAS{
 				Operation:        requestledger.OperationPrepareTerminal,
@@ -311,27 +324,49 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 	}
+	stage = "prepared identity"
 	if prepared.Outcome != plan.Outcome || prepared.AffectedRows != plan.AffectedRows ||
 		prepared.AffectedRowsValid != plan.AffectedRowsValid ||
 		prepared.RetirementWitnessDigest != plan.RetirementWitness ||
-		prepared.AckToken != plan.AckToken || !bytes.Equal(prepared.Result, plan.Result) {
+		!bytes.Equal(prepared.Result, plan.Result) {
 		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 	}
 
 	createdRelease := false
+	stage = "release authority"
 	transition := plan.Release
 	transition.PrepareTerminalDigest = executionpin.Digest(prepared.PreparedDigest)
 	if !transition.Valid() || transition.Operation != executionpin.OperationRelease {
 		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 	}
 	if release.Phase != requestledger.SchemaPinReleaseInvalid {
-		outer, openErr := replication.OpenCommand(release.Command)
-		persisted, nestedErr := outer.OpenExecutionPin()
-		if openErr != nil || nestedErr != nil || persisted != transition {
-			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+		if plan.Execution.terminalCut != nil {
+			_, persisted, openErr := durableRequestTerminalReleaseCommand(plan.Execution,
+				durableRequestTerminalReadCut{Head: head, Continuation: continuation,
+					Prepared: prepared, SchemaPin: release, Applied: applied})
+			if openErr != nil {
+				return DurableRequestTerminalResult{}, openErr
+			}
+			transition = persisted
+			// Existing Delegate authorization forwards this exact retained
+			// principal. The server still checks current policy for both the
+			// authenticated gateway peer and the command's original authority.
+			pinCtx, err = serviceauthz.WithAuthority(pinCtx, serviceauthz.Authority{
+				Node: rafttransport.NodeID(persisted.AuthorityNode), Generation: persisted.AuthorityGeneration,
+			})
+			if err != nil {
+				return DurableRequestTerminalResult{}, err
+			}
+		} else {
+			outer, openErr := replication.OpenCommand(release.Command)
+			persisted, nestedErr := outer.OpenExecutionPin()
+			if openErr != nil || nestedErr != nil || persisted != transition {
+				return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+			}
 		}
 	}
 	if release.Phase == requestledger.SchemaPinReleaseInvalid {
+		stage = "release intent"
 		exact, buildErr := pin.BuildRelease(transition)
 		if buildErr != nil {
 			return DurableRequestTerminalResult{}, buildErr
@@ -342,6 +377,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		if err != nil {
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
+		stage = "release intent CAS"
 		cas, applyErr := coordinator.ledger.ApplyCAS(ctx, plan.Home, plan.Key,
 			DurableRequestLifecycleCAS{
 				Operation:        requestledger.OperationBeginSchemaPinRelease,
@@ -363,6 +399,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 	}
 
 	if release.Phase == requestledger.SchemaPinReleasing {
+		stage = "release proposal"
 		var settled ReplicatedResult
 		if createdRelease {
 			settled, err = pin.ProposeNew(pinCtx, transition, release.Command)
@@ -372,6 +409,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		if err != nil {
 			return DurableRequestTerminalResult{}, err
 		}
+		stage = "release settlement"
 		if !validDurableRequestSettlement(release.Command, settled) {
 			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 		}
@@ -381,6 +419,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		if recordErr != nil {
 			return DurableRequestTerminalResult{}, errors.Join(recordErr, ErrDurableRequestConflict)
 		}
+		stage = "release proof CAS"
 		cas, applyErr := coordinator.ledger.ApplyCAS(ctx, plan.Home, plan.Key,
 			DurableRequestLifecycleCAS{
 				Operation:        requestledger.OperationRecordSchemaPinReleased,
@@ -401,10 +440,12 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		release = next
 	}
 
+	stage = "terminal result"
 	terminal, err = requestledger.NewTerminal(head, prepared, release, head.Revision+1)
 	if err != nil {
 		return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 	}
+	stage = "terminal CAS"
 	cas, err := coordinator.ledger.ApplyCAS(ctx, plan.Home, plan.Key,
 		DurableRequestLifecycleCAS{
 			Operation:        requestledger.OperationComplete,
@@ -447,6 +488,18 @@ func (coordinator *DurableRequestTerminalCoordinator) openTerminalRows(
 	requestledger.PreparedTerminalRecord, requestledger.SchemaPinReleaseRecord,
 	requestledger.TerminalRecord, uint64, error,
 ) {
+	if cut := plan.Execution.terminalCut; cut != nil {
+		err := validateDurableRequestPreparedCut(plan.Execution, *cut)
+		if err == nil && cut.SchemaPin.Revision != 0 {
+			_, _, err = durableRequestTerminalReleaseCommand(plan.Execution, *cut)
+		}
+		if err != nil {
+			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
+				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
+				requestledger.TerminalRecord{}, 0, err
+		}
+		return cut.Head, cut.Continuation, cut.Prepared, cut.SchemaPin, cut.Terminal, cut.Applied, nil
+	}
 	if reader, ok := coordinator.ledger.(durableRequestTerminalCutReader); ok {
 		cut, err := reader.ReadTerminalCut(ctx, plan.Home, plan.Key)
 		if err != nil {

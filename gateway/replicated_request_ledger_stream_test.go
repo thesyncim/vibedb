@@ -436,13 +436,15 @@ func TestDurableRequestLogicalContractGolden(t *testing.T) {
 		want string
 	}{
 		{"transaction_manifest", program.Contract.TransactionManifestDigest, "51e7388c9e85977a405006ea2d4b44fe374a9f8336f534d63bb2fdfd33082eb3"},
-		{"protocol_program", program.Contract.ProtocolProgramDigest, "92cab27aaf2313fc726a40dac0872ab8098e9c86f300a9266df4cbc795b65169"},
-		{"terminal_contract", program.Contract.TerminalContractDigest, "c1ded632b0491aa40226e21c4df5ffa52c223462ae1c541787fd84bf7c1f9e33"},
+		// The protocol binds the required persisted command epoch and atomic
+		// terminal pin freeze via KernelSemanticsDigest; terminal binds protocol.
+		{"protocol_program", program.Contract.ProtocolProgramDigest, "b4f57c6da55de076c0d3abd9eaf955857a8a4f27ab75e00a8a7ad81d3d5be936"},
+		{"terminal_contract", program.Contract.TerminalContractDigest, "91cf64778907e63143a5388604d2acf6da5aeae0113b4b90fa3e84bfb22600e2"},
 		{"retry_home", program.Contract.RetryHomeDerivationDigest, "f8d18eb29f23cf552f4f74ab86fdf1717bcb18c8599c08692941e2dd2163f7a3"},
 		{"plan_build", program.Contract.PlanBuildID, "cd61dffcc1b2288c743473b7fac0ac8fcbdf2bffb64d214ef6a58cf857a24325"},
 	} {
 		if got := fmt.Sprintf("%x", golden.got); got != golden.want {
-			t.Fatalf("%s digest=%s want=%s", golden.name, got, golden.want)
+			t.Errorf("%s digest=%s want=%s", golden.name, got, golden.want)
 		}
 	}
 }

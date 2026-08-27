@@ -51,11 +51,11 @@ func TestBuildDurableRequestLogicalProgramReservesOneLiveWave(t *testing.T) {
 			}
 			// The tighter contract still admits the largest encoded command plus
 			// its exact group-ID target, including the final partial payload page.
-			payload, err := requestledger.NewPayloadBuild(head, requestledger.Digest{1}, liveBytes, liveChunks)
+			payload, err := requestledger.NewPayloadBuild(head, requestledger.Digest{1}, liveBytes, liveChunks, 1)
 			if err != nil || payload.TotalBytes != uint64(len(replication.ID128{}))+replication.MaxCommandBytes {
 				t.Fatalf("maximum one-command wave was under-reserved: %+v %v", payload, err)
 			}
-			if _, err = requestledger.NewPayloadBuild(head, requestledger.Digest{1}, liveBytes+1, liveChunks); err == nil {
+			if _, err = requestledger.NewPayloadBuild(head, requestledger.Digest{1}, liveBytes+1, liveChunks, 1); err == nil {
 				t.Fatal("accepted payload above the authenticated runner bound")
 			}
 		})

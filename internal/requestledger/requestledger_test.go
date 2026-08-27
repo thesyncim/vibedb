@@ -431,11 +431,11 @@ func TestPayloadBuildWinnerChunksAndDynamicIovecs(t *testing.T) {
 		offset = end
 	}
 	root, _ := acc.Root()
-	build, err := NewPayloadBuild(head, root, uint64(len(data)), 2)
+	build, err := NewPayloadBuild(head, root, uint64(len(data)), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := NewPayloadBuild(head, testDigest("other-root"), uint64(len(data)), 2)
+	other, err := NewPayloadBuild(head, testDigest("other-root"), uint64(len(data)), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

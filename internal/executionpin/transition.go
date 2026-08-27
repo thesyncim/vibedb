@@ -36,6 +36,12 @@ func Apply(
 		commandDigest == (Digest{}) || found && !current.Valid() {
 		return Transition{Reason: ReasonInvalid}
 	}
+	// Even an exact old acquisition/recovery retry cannot grant a side-effect
+	// result after the ledger atomically freezes this lease for release.
+	if found && current.Status == StatusActive && current.PrepareTerminalDigest != (Digest{}) &&
+		command.Operation != OperationRelease {
+		return Transition{Reason: ReasonTerminal, Record: current, Found: true}
+	}
 	if found && current.LastOperation == command.Operation &&
 		current.LastCommandDigest == commandDigest {
 		return Transition{Reason: ReasonApplied, Record: current, Found: true}
@@ -150,6 +156,9 @@ func Apply(
 		}
 		if current.Status != StatusActive {
 			return Transition{Reason: ReasonTerminal, Record: current, Found: true}
+		}
+		if current.PrepareTerminalDigest != (Digest{}) && current.PrepareTerminalDigest != command.PrepareTerminalDigest {
+			return Transition{Reason: ReasonConflict, Record: current, Found: true}
 		}
 		if !matchesAcquireCertificate(current, command.AcquireCertificateDigest) {
 			return Transition{Reason: ReasonConflict, Record: current, Found: true}

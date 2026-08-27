@@ -66,7 +66,7 @@ func TestRequestLedgerDynamicReservationSurvivesAdvanceAndCleanup(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	build, err := requestledger.NewPayloadBuild(head, root, uint64(len(data)), 2)
+	build, err := requestledger.NewPayloadBuild(head, root, uint64(len(data)), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

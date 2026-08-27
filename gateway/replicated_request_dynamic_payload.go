@@ -39,6 +39,44 @@ func NewDurableRequestDynamicPayloadStore(
 	return &DurableRequestDynamicPayloadStore{ledger: ledger}, nil
 }
 
+// ExistingCommandEpoch reads only the bounded, authenticated build header.
+// It remains available even when a crash followed Begin before any chunk was
+// stored. Zero means no winner yet; a nonzero epoch is immutable, including
+// across later controller takeovers. Stage still verifies the exact full root.
+func (store *DurableRequestDynamicPayloadStore) ExistingCommandEpoch(
+	ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey, ordinal uint64,
+) (uint64, error) {
+	if store == nil || store.ledger == nil || ctx == nil || !key.Valid() {
+		return 0, ErrDurableRequest
+	}
+	head, err := store.readHead(ctx, home, key)
+	if err != nil {
+		return 0, err
+	}
+	if head.Head.NextStepOrdinal != ordinal {
+		return 0, ErrDurableRequestConflict
+	}
+	row, err := store.ledger.ReadRow(ctx, home, DurableRequestLifecycleRead{
+		Key: key, Kind: replicatedstate.RequestLedgerReadPayloadBuild, MinimumApplied: head.Applied,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !row.Found {
+		return 0, nil
+	}
+	build := row.PayloadBuild
+	if row.Kind != replicatedstate.RequestLedgerReadPayloadBuild || build.CommandEpoch == 0 ||
+		!durableRequestDynamicBuildMatches(build, head.Head, build.ContentRoot, build.TotalBytes) {
+		return 0, ErrDurableRequestConflict
+	}
+	var storage [requestledger.PayloadBuildRecordBytes]byte
+	if _, err := requestledger.AppendPayloadBuild(storage[:0], build); err != nil {
+		return 0, errors.Join(err, ErrDurableRequestConflict)
+	}
+	return build.CommandEpoch, nil
+}
+
 // Stage seals target||command under the expected head wave. Repeated calls with
 // the same bytes resume the winning build; different bytes lose deterministically.
 func (store *DurableRequestDynamicPayloadStore) Stage(
@@ -48,10 +86,11 @@ func (store *DurableRequestDynamicPayloadStore) Stage(
 	ordinal uint64,
 	target []byte,
 	command []byte,
+	commandEpoch uint64,
 ) (DurableRequestDynamicPayload, error) {
 	if store == nil || store.ledger == nil || ctx == nil || !key.Valid() ||
 		len(target) == 0 || len(target) > requestledger.MaxTargetBytes ||
-		len(command) == 0 || len(command) > replication.MaxCommandBytes ||
+		len(command) == 0 || len(command) > replication.MaxCommandBytes || commandEpoch == 0 ||
 		uint64(len(target)) > requestledger.MaxDynamicWavePayloadBytes-uint64(len(command)) {
 		return DurableRequestDynamicPayload{}, ErrDurableRequest
 	}
@@ -88,6 +127,7 @@ func (store *DurableRequestDynamicPayloadStore) Stage(
 		build, err = requestledger.NewPayloadBuild(
 			head, root, uint64(len(exact)),
 			(uint64(len(exact))+requestledger.MaxPlanPageBytes-1)/requestledger.MaxPlanPageBytes,
+			commandEpoch,
 		)
 		if err != nil {
 			return DurableRequestDynamicPayload{}, errors.Join(err, ErrDurableRequestConflict)
@@ -107,7 +147,7 @@ func (store *DurableRequestDynamicPayloadStore) Stage(
 			return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
 		}
 	}
-	if !durableRequestDynamicBuildMatches(build, head, root, uint64(len(exact))) {
+	if build.CommandEpoch != commandEpoch || !durableRequestDynamicBuildMatches(build, head, root, uint64(len(exact))) {
 		return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
 	}
 

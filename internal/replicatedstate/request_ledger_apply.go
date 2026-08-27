@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
@@ -184,7 +185,7 @@ func (m *Machine) planRequestLedgerCommand(
 	case requestledger.OperationPrepareTerminal:
 		return planRequestLedgerPrepareTerminal(plan, command, rows)
 	case requestledger.OperationBeginSchemaPinRelease:
-		return planRequestLedgerBeginSchemaPinRelease(plan, command, rows)
+		return planRequestLedgerBeginSchemaPinRelease(plan, command, rows, snapshot)
 	case requestledger.OperationRecordSchemaPinReleased:
 		return planRequestLedgerRecordSchemaPinReleased(plan, command, rows)
 	case requestledger.OperationBeginRoutePinAcquire,
@@ -1031,6 +1032,7 @@ func planRequestLedgerBeginSchemaPinRelease(
 	plan requestLedgerCommandPlan,
 	command requestledger.CommandView,
 	rows requestLedgerRows,
+	snapshot pointSnapshot,
 ) (requestLedgerCommandPlan, error) {
 	release, _ := command.SchemaPinRelease()
 	if rows.head.Revision == command.Revision && rows.schemaPinFound &&
@@ -1048,6 +1050,26 @@ func planRequestLedgerBeginSchemaPinRelease(
 		!requestLedgerSchemaReleaseCommandAvailable(release) {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
+	// The release intent and its exact pin lease are one atomic system-row
+	// publication. A concurrent Recover either wins first and invalidates this
+	// intent, or observes the irreversible freeze; no read/CAS gap is exposed.
+	outer, openErr := replication.OpenCommand(release.Command)
+	nested, nestedErr := outer.OpenExecutionPin()
+	if openErr != nil || nestedErr != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	pin, found, err := executionPinRecordAt(snapshot, nested.PinID)
+	if err != nil {
+		return plan, err
+	}
+	frozen, freezeErr := executionpin.FreezeRelease(pin, nested)
+	if !found || freezeErr != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	encodedPin, err := executionpin.AppendRecord(nil, frozen)
+	if err != nil {
+		return plan, ErrExecutionPinStateCorrupt
+	}
 	next, err := requestledger.InstallSchemaPinRelease(rows.head, rows.prepared, release)
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
@@ -1064,6 +1086,11 @@ func planRequestLedgerBeginSchemaPinRelease(
 	}
 	key := requestledger.AppendSchemaPinReleaseKey(nil, command.Home, command.KeyDigest)
 	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload))
+	// Both existing values have fixed size: no new retained row or byte is
+	// charged, and the active-index hash must track the frozen record exactly.
+	pinKey, activeKey := executionPinRecordStorageKey(frozen.PinID), executionPinActiveStorageKey(frozen)
+	activeDigest := sha256.Sum256(encodedPin)
+	plan.rows = append(plan.rows, newTransactionPut(pinKey[:], encodedPin), newTransactionPut(activeKey[:], activeDigest[:]))
 	plan.delta.rows++
 	plan.delta.residentBytes += int64(len(key) + len(command.Payload))
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)

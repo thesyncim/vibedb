@@ -125,6 +125,7 @@ func TestDurableRequestBuiltProgramCompletesExactTerminalContract(t *testing.T) 
 			if err != nil || !bytes.Equal(encoded, again) || len(pin.attempts) != 1 || len(ledger.operations) != 4 {
 				t.Fatalf("exact terminal retry changed proof or repeated side effects: %v", err)
 			}
+			runBuiltTerminalRecoveryCases(t, execution, authority, state, head, continuation, acquired.Record)
 		})
 	}
 }

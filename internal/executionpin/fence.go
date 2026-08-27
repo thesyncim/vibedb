@@ -10,6 +10,7 @@ func ValidateSideEffectFence(
 	observedApplied uint64,
 ) error {
 	if !expected.Valid() || !current.Valid() || current.Status != StatusActive ||
+		current.PrepareTerminalDigest != (Digest{}) ||
 		observedApplied < current.LeaseApplied ||
 		observedApplied > current.LeaseAppliedThrough {
 		return ErrCorrupt

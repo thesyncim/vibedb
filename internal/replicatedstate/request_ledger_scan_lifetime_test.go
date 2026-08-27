@@ -39,7 +39,7 @@ func requestLedgerBorrowedScanRows(t testing.TB) (requestledger.HeadRecord, []re
 	if err != nil {
 		t.Fatal(err)
 	}
-	build, err := requestledger.NewPayloadBuild(head, root, uint64(len(data)), 1)
+	build, err := requestledger.NewPayloadBuild(head, root, uint64(len(data)), 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
