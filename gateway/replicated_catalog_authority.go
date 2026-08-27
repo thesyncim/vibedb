@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -847,10 +848,38 @@ func (authority *ReplicatedCatalogAuthority) ReadOperation(
 func (authority *ReplicatedCatalogAuthority) SubmitOperation(
 	ctx context.Context, record ReplicatedOperationRecord,
 ) error {
-	if authority == nil || authority.session == nil || ctx == nil ||
-		!validReplicatedOperation(record) || record.Revision != 1 ||
-		record.State != ReplicatedOperationPlanned {
+	return authority.SubmitOperations(ctx, []ReplicatedOperationRecord{record})
+}
+
+// SubmitOperations atomically admits a bounded move set into the replicated
+// work directory. Every record and the complete sorted directory are one
+// conditional replicated batch: controllers can observe all children or none,
+// and an outcome-unknown retry reuses byte-identical command material. The
+// children remain independent Raft-group sagas after admission, allowing
+// snapshot/catch-up work to overlap while each catalog topology publication is
+// serialized by its existing generation CAS.
+func (authority *ReplicatedCatalogAuthority) SubmitOperations(
+	ctx context.Context, records []ReplicatedOperationRecord,
+) error {
+	if authority == nil || authority.session == nil || ctx == nil || len(records) == 0 ||
+		len(records) > maxReplicatedOperations {
 		return ErrReplicatedCatalog
+	}
+	ordered := slices.Clone(records)
+	for index := range ordered {
+		record := ordered[index]
+		if !validReplicatedOperation(record) || record.Revision != 1 ||
+			record.State != ReplicatedOperationPlanned {
+			return ErrReplicatedCatalog
+		}
+	}
+	slices.SortFunc(ordered, func(left, right ReplicatedOperationRecord) int {
+		return bytes.Compare(left.ID[:], right.ID[:])
+	})
+	for index := 1; index < len(ordered); index++ {
+		if ordered[index-1].ID == ordered[index].ID {
+			return ErrReplicatedCatalog
+		}
 	}
 	ctx, err := authority.authorizedContext(ctx)
 	if err != nil {
@@ -874,22 +903,28 @@ func (authority *ReplicatedCatalogAuthority) SubmitOperation(
 			return err
 		}
 	}
-	position := 0
-	for position < len(ids) && bytes.Compare(ids[position][:], record.ID[:]) < 0 {
-		position++
-	}
-	if position == len(ids) || ids[position] != record.ID {
-		if len(ids) == maxReplicatedOperations {
-			return ErrReplicatedCatalog
+	for _, record := range ordered {
+		position := 0
+		for position < len(ids) && bytes.Compare(ids[position][:], record.ID[:]) < 0 {
+			position++
 		}
-		ids = append(ids, [32]byte{})
-		copy(ids[position+1:], ids[position:])
-		ids[position] = record.ID
+		if position == len(ids) || ids[position] != record.ID {
+			if len(ids) == maxReplicatedOperations {
+				return ErrReplicatedCatalog
+			}
+			ids = append(ids, [32]byte{})
+			copy(ids[position+1:], ids[position:])
+			ids[position] = record.ID
+		}
 	}
 	authority.scratch = authority.scratch[:0]
-	authority.scratch, err = appendReplicatedOperation(authority.scratch, record)
-	if err != nil {
-		return err
+	ends := make([]int, len(ordered))
+	for index, record := range ordered {
+		authority.scratch, err = appendReplicatedOperation(authority.scratch, record)
+		if err != nil {
+			return err
+		}
+		ends[index] = len(authority.scratch)
 	}
 	recordBytes := len(authority.scratch)
 	authority.scratch, err = appendReplicatedOperationDirectory(authority.scratch, ids)
@@ -907,11 +942,16 @@ func (authority *ReplicatedCatalogAuthority) SubmitOperation(
 		directoryMutation.ExpectedValueLength = uint64(len(directoryResult.Value))
 		directoryMutation.ExpectedValueDigest = replication.Digest(digest)
 	}
-	key := replicatedOperationKey(record.ID)
-	result, err := authority.session.MutateBatch(ctx, []NativeMutation{
-		{Kind: replication.MutationPutAbsentOrEqual, Key: key[:], Value: authority.scratch[:recordBytes]},
-		directoryMutation,
-	})
+	mutations := make([]NativeMutation, 0, len(ordered)+1)
+	start := 0
+	for index, record := range ordered {
+		key := replicatedOperationKey(record.ID)
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
+			Key: key[:], Value: authority.scratch[start:ends[index]]})
+		start = ends[index]
+	}
+	mutations = append(mutations, directoryMutation)
+	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {
 		if authority.session.Status().Pending {
 			return errors.Join(ErrReplicatedCatalogPending, err)
@@ -973,6 +1013,64 @@ func (authority *ReplicatedCatalogAuthority) PublishOperation(
 			ctx, key[:], authority.scratch, uint64(len(current.Value)), replication.Digest(digest),
 		)
 	}
+	if err != nil {
+		if authority.session.Status().Pending {
+			return errors.Join(ErrReplicatedCatalogPending, err)
+		}
+		return err
+	}
+	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
+		return ErrReplicatedCatalogConflict
+	}
+	if result.Completion.ResultCode != replicatedstate.ResultApplied {
+		return ErrReplicatedCatalog
+	}
+	return nil
+}
+
+// PublishReplicaMoveAbandonment is the sole exception to immutable operation
+// intent: it atomically replaces a live move intent with the exact canonical
+// abandonment witness while transitioning to Cancelled. The terminal record
+// cannot be rewritten, and ordinary PublishOperation continues to reject
+// intent replacement.
+func (authority *ReplicatedCatalogAuthority) PublishReplicaMoveAbandonment(
+	ctx context.Context, expectedRevision uint64, record ReplicatedOperationRecord,
+) error {
+	if authority == nil || authority.session == nil || ctx == nil ||
+		!validReplicatedOperation(record) || record.Kind != ReplicatedOperationMove ||
+		record.State != ReplicatedOperationCancelled || record.Revision != expectedRevision+1 {
+		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.session.Status().Pending {
+		return ErrReplicatedCatalogPending
+	}
+	key := replicatedOperationKey(record.ID)
+	current, err := authority.readRaw(ctx, key[:], MaxReplicatedOperationBytes)
+	if err != nil {
+		return err
+	}
+	if !current.Found {
+		return ErrReplicatedCatalogConflict
+	}
+	prior, openErr := openReplicatedOperation(current.Value)
+	if openErr != nil || prior.ID != record.ID || prior.Revision != expectedRevision ||
+		prior.Kind != ReplicatedOperationMove || prior.State >= ReplicatedOperationComplete {
+		return errors.Join(openErr, ErrReplicatedCatalogConflict)
+	}
+	authority.scratch = authority.scratch[:0]
+	authority.scratch, err = appendReplicatedOperation(authority.scratch, record)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(current.Value)
+	result, err := authority.session.ComparePut(ctx, key[:], authority.scratch,
+		uint64(len(current.Value)), replication.Digest(digest))
 	if err != nil {
 		if authority.session.Status().Pending {
 			return errors.Join(ErrReplicatedCatalogPending, err)
