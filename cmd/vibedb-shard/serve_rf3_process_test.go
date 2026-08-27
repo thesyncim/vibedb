@@ -736,6 +736,8 @@ func TestServeRF3CommandProcessHelper(t *testing.T) {
 	if os.Getenv(rf3CommandHelperEnvironment) != "1" {
 		return
 	}
+	stopMemoryDiagnostics := startWALRetentionMemoryDiagnostics(t)
+	defer stopMemoryDiagnostics()
 	manifest, err := loadRF3Manifest(os.Getenv(rf3CommandManifestEnvironment))
 	if err != nil {
 		t.Fatal(err)

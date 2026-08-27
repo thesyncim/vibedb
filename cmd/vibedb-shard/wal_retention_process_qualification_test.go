@@ -65,6 +65,7 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 		t.Skip("set VIBEDB_WAL_RETENTION_E2E=1; mandatory Linux CI rejects this skip")
 	}
 
+	memoryDirectory := prepareWALRetentionMemoryDiagnostics(t)
 	fixture := newRF3FaultFixture(t)
 	defer fixture.close(t)
 	fixture.startAll(t)
@@ -77,6 +78,7 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 	previousInodes := initialInodes
 	baselineAllocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
 	baselineRSS := rf3FaultProcessRSSBytes(t, fixture.children)
+	logWALRetentionMemory(t, fixture.children, "baseline")
 	baselineFDs := walRetentionProcessFDs(t, fixture.children)
 	peakRSS, peakFDs := baselineRSS, baselineFDs
 
@@ -140,6 +142,7 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 		if rss := rf3FaultProcessRSSBytes(t, fixture.children); rss > peakRSS {
 			peakRSS = rss
 		}
+		logWALRetentionMemory(t, fixture.children, fmt.Sprintf("cycle-%d", cycle+1))
 		if fds := walRetentionProcessFDs(t, fixture.children); fds > peakFDs {
 			peakFDs = fds
 		}
@@ -177,6 +180,9 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 			ratioPermille, walRetentionMaximumRatioPermille, growth, liveBytes)
 	}
 	if peakRSS-baselineRSS > walRetentionMaximumRSSGrowthBytes {
+		// Capture only after recording the unchanged gate. Profiling never
+		// collects garbage or changes the baseline/peak used for the verdict.
+		captureWALRetentionMemory(t, fixture.children, memoryDirectory)
 		t.Fatalf("RSS grew %d bytes, bound %d", peakRSS-baselineRSS, walRetentionMaximumRSSGrowthBytes)
 	}
 	if peakFDs > baselineFDs+walRetentionMaximumFDGrowth {
