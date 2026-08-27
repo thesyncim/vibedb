@@ -282,6 +282,15 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 		{1, "items", "items-0", 23, "items", []string{"CREATE TABLE items (PRIMARY KEY (id))", "CREATE INDEX by_email ON items (email)", "CREATE TABLE email_claims (PRIMARY KEY (key))"},
 			[]restoreRF3GlobalIndex{{2, "email_claims", 41, 7, 1, true, uint8(sqldriver.ReplicatedRelationKeyCanonicalTuple), 1, uint32(distribution.CurrentTupleVersion), uint32(distribution.NativeMapperVersion), distribution.DefaultVirtualBucketBits}}, apply},
 	}
+	// The canonical RF3 catalog requires an explicit request-home directory.
+	// Provision its fresh full-range ledger even though this gate exercises
+	// restore activation rather than the request coordinator.
+	ledgerIdentity := sha256.Sum256(append([]byte("restored/request-ledger/"), fixtures[0].group.GroupID[:]...))
+	schemas[0].Apply.RequestLedgerCapacityBytes = 64 << 20
+	schemas[0].Apply.RequestLedgerCleanupReserveBytes = 8 << 20
+	schemas[0].Apply.RequestLedgerRangeStart = fmt.Sprintf("%064x", 0)
+	schemas[0].Apply.RequestLedgerRangeEnd = fmt.Sprintf("%064x", 0)
+	schemas[0].Apply.RequestLedgerRangeIdentity = fmt.Sprintf("%x", ledgerIdentity)
 	artifacts := make([][]byte, 2)
 	manifests := make([]replicatedstate.SnapshotArtifactManifest, 2)
 	cuts := make([]clusterbackup.GroupCut, 2)
@@ -376,7 +385,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 		for member := range fixture.manifestPaths {
 			memberRoot := filepath.Join(installer.root, "roots", fmt.Sprintf("group-%08d", ordinal), fmt.Sprintf("replica-%d", member+1))
 			identity := restoreRF3TargetIdentity(fixture, ordinal, member, schemas[ordinal])
-			input := prepareRF3Manifest{Root: memberRoot, Distribution: identity.Distribution, Shard: identity.Shard, ClusterID: idString(fixture.group.ClusterID[:]), ClusterIncarnation: idString(fixture.group.ClusterIncarnation[:]), TopologyRecoveryEpoch: fixture.group.TopologyRecoveryEpoch, AllocationGeneration: 23, ShardIncarnation: idString(fixture.group.ShardIncarnation[:]), GroupID: idString(fixture.group.GroupID[:]), MemberID: uint64(member + 1), StoreID: idString(identity.StoreID[:]), Table: schemas[ordinal].BaseTable, CreateTable: schemas[ordinal].DDL[0], Apply: apply, Authority: prepareRF3Authority{5, 1, 1, 13, 1, 1},
+			input := prepareRF3Manifest{Root: memberRoot, Distribution: identity.Distribution, Shard: identity.Shard, ClusterID: idString(fixture.group.ClusterID[:]), ClusterIncarnation: idString(fixture.group.ClusterIncarnation[:]), TopologyRecoveryEpoch: fixture.group.TopologyRecoveryEpoch, AllocationGeneration: 23, ShardIncarnation: idString(fixture.group.ShardIncarnation[:]), GroupID: idString(fixture.group.GroupID[:]), MemberID: uint64(member + 1), StoreID: idString(identity.StoreID[:]), Table: schemas[ordinal].BaseTable, CreateTable: schemas[ordinal].DDL[0], Apply: schemas[ordinal].Apply, Authority: prepareRF3Authority{5, 1, 1, 13, 1, 1},
 				WAL:                 prepareRF3WAL{"rf3-command-key", keyPath, "restore-process-wrapped-key", 256 << 20, raftstore.DefaultMaxRecordBytes, 4096, 16384, raftstore.DefaultMaxLiveBytes},
 				Listeners:           rf3ManifestListeners{Peer: fixture.peerAddresses[member], Native: fixture.nativeAddresses[member], Snapshot: fixture.snapshotAddresses[member], Control: fixture.controlAddresses[member]},
 				TLS:                 rf3ManifestTLS{Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: roots, IdentityOID: rf3testfixture.ProcessIdentityOID},
@@ -574,11 +583,14 @@ func restoreRF3TargetSnapshot(t *testing.T, fixtures [2]*rf3FaultFixture, target
 			t.Fatal(err)
 		}
 		config.Distributions = append(config.Distributions, distribution.DistributionSpec{Name: distributionName, Arity: 1, MapperVersion: distribution.NativeMapperVersion})
-		config.Placements = append(config.Placements, distribution.TablePlacement{Table: schema.BaseTable, Distribution: distributionName, Columns: []string{"id"}})
+		config.Placements = append(config.Placements, distribution.TablePlacement{Table: schema.BaseTable, Distribution: distributionName, Columns: []string{"/id"}})
 		config.Manifests = append(config.Manifests, manifest)
 		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{Distribution: distributionName, Shard: shard, Group: fixture.group, AllocationGeneration: 23, Command: fences[ordinal],
 			RangeIdentity: sha256.Sum256(append([]byte("restored/full-keyspace/"), fixture.group.GroupID[:]...)), LineageDigest: sha256.Sum256(append([]byte("restored/fresh-lineage/"), fixture.group.GroupID[:]...)), ForwardingRuleDigest: sha256.Sum256(append([]byte("restored/no-forwarding/"), fixture.group.GroupID[:]...)), Replicas: replicas})
-		profiles = append(profiles, gateway.ReplicatedTableProfile{Table: schema.BaseTable, Relation: 1, PrimaryKey: "id", SchemaGeneration: 13, RelationManifestDigest: fences[ordinal].RelationManifestDigest, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20})
+		if ordinal == 0 {
+			descriptors[ordinal].RequestLedgerRanges = []gateway.DurableRequestLedgerRangeDescriptor{{Identity: sha256.Sum256(append([]byte("restored/request-ledger/"), fixture.group.GroupID[:]...))}}
+		}
+		profiles = append(profiles, gateway.ReplicatedTableProfile{Table: schema.BaseTable, Relation: 1, PrimaryKey: "/id", SchemaGeneration: 13, RelationManifestDigest: fences[ordinal].RelationManifestDigest, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20})
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(config, endpoints, 1, nil, nil, descriptors, profiles)
 	if err != nil {
