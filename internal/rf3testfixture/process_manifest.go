@@ -28,26 +28,27 @@ type ProcessTarget struct {
 }
 
 type ProcessMemberOptions struct {
-	Root, Table, CreateTable   string
-	SchemaStatements           []string
-	GlobalIndexes              []sqldriver.ReplicatedGlobalIndexRelation
-	Identity                   raftstore.Identity
-	Key                        raftstore.Key
-	WAL                        raftstore.Options
-	Bootstrap                  raftstore.Bootstrap
-	Authority                  sqldriver.ReplicatedAuthorityProfile
-	Apply                      sqldriver.ReplicatedApplyOptions
-	Listeners                  ProcessListeners
-	Credential                 Credential
-	Roots, AuthorizationPolicy string
-	Nodes                      [3]rafttransport.NodeID
-	PeerAddresses              [3]string
-	Target                     *ProcessTarget
-	SeedDocuments              [][]byte
+	Root, ControlRoot, Table, CreateTable string
+	SchemaStatements                      []string
+	GlobalIndexes                         []sqldriver.ReplicatedGlobalIndexRelation
+	Identity                              raftstore.Identity
+	Key                                   raftstore.Key
+	WAL                                   raftstore.Options
+	Bootstrap                             raftstore.Bootstrap
+	Authority                             sqldriver.ReplicatedAuthorityProfile
+	Apply                                 sqldriver.ReplicatedApplyOptions
+	Listeners                             ProcessListeners
+	Credential                            Credential
+	Roots, AuthorizationPolicy            string
+	Nodes                                 [3]rafttransport.NodeID
+	PeerAddresses                         [3]string
+	Target                                *ProcessTarget
+	SeedDocuments                         [][]byte
 }
 
 type PreparedProcessMember struct {
 	ManifestPath, WALPath, SQLPath string
+	RelationManifestDigest         [32]byte
 }
 
 type PreparedColdTarget struct {
@@ -158,6 +159,18 @@ func prepareProcessMember(
 	if err = os.WriteFile(keyPath, options.Key.Material[:], 0o600); err != nil {
 		return PreparedProcessMember{}, err
 	}
+	if options.ControlRoot != "" {
+		controlRoot, absErr := filepath.Abs(options.ControlRoot)
+		if absErr != nil {
+			return PreparedProcessMember{}, absErr
+		}
+		if err = os.MkdirAll(controlRoot, 0o700); err != nil {
+			return PreparedProcessMember{}, err
+		}
+		if err = os.WriteFile(filepath.Join(controlRoot, "wal-key"), options.Key.Material[:], 0o600); err != nil {
+			return PreparedProcessMember{}, err
+		}
+	}
 	manifestPath := filepath.Join(options.Root, "serve-rf3.json")
 	document := processMemberManifest(options, prepared, basePath, applyPath, keyPath)
 	if err = os.WriteFile(manifestPath, document, 0o600); err != nil {
@@ -167,7 +180,8 @@ func prepareProcessMember(
 		return PreparedProcessMember{}, err
 	}
 	return PreparedProcessMember{ManifestPath: manifestPath,
-		WALPath: prepared.WALPath, SQLPath: prepared.SQLPath}, nil
+		WALPath: prepared.WALPath, SQLPath: prepared.SQLPath,
+		RelationManifestDigest: prepared.Base.RelationManifestDigest}, nil
 }
 
 func writeProcessJSON(path string, value interface{ MarshalJSON() ([]byte, error) }) error {
@@ -184,6 +198,12 @@ func processMemberManifest(
 	basePath, applyPath, keyPath string,
 ) []byte {
 	dataRoot, _ := filepath.Abs(filepath.Dir(prepared.SQLPath))
+	controlRoot := dataRoot
+	controlKeyPath := keyPath
+	if options.ControlRoot != "" {
+		controlRoot, _ = filepath.Abs(options.ControlRoot)
+		controlKeyPath = filepath.Join(controlRoot, "wal-key")
+	}
 	document := []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":%q,"key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"route":{"cluster_id":"%x","cluster_incarnation":"%x","topology_recovery_epoch":%d,"shard_incarnation":"%x","group_id":"%x","distribution":%q,"shard":%q,"allocation_generation":%d,"member_id":%d,"store_id":"%x","member_root":%q,"split_runtime_root":%q,"membership_grant_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":%q},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"split_control":{"journal_path":%q,"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}],"child_registry":{"root":%q,"max_operations":8,"stage_checkpoint_bytes":33554432,"table":%q,"create_table":%q,"wal":{"key_id":%q,"key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"format":0,"shard_key":"id","tuple_version":1,"mapper_version":1},"static_bootstrap_path":%q,"replica_set_version":1,"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
 		prepared.WALPath, options.Key.ID, keyPath, options.WAL.MaxFileBytes,
 		options.WAL.MaxRecordBytes, options.WAL.MaxRecords, options.WAL.MaxEntries,
@@ -196,14 +216,14 @@ func processMemberManifest(
 		options.Listeners.Peer, options.Listeners.Native, options.Listeners.Snapshot,
 		options.Listeners.Control, options.Credential.Certificate, options.Credential.Key,
 		options.Roots, ProcessIdentityOID, options.AuthorizationPolicy,
-		filepath.Join(dataRoot, "replica-actions"), dataRoot,
-		filepath.Join(dataRoot, "source-exports"), filepath.Join(dataRoot, "source-artifacts"),
-		filepath.Join(dataRoot, "split-control.journal"), options.Nodes[0], options.Nodes[1],
-		options.Nodes[2], filepath.Join(dataRoot, "split-children"), options.Table, options.CreateTable,
-		options.Key.ID, keyPath,
+		filepath.Join(controlRoot, "replica-actions"), controlRoot,
+		filepath.Join(controlRoot, "source-exports"), filepath.Join(controlRoot, "source-artifacts"),
+		filepath.Join(controlRoot, "split-control.journal"), options.Nodes[0], options.Nodes[1],
+		options.Nodes[2], filepath.Join(controlRoot, "split-children"), options.Table, options.CreateTable,
+		options.Key.ID, controlKeyPath,
 		options.WAL.MaxFileBytes, options.WAL.MaxRecordBytes, options.WAL.MaxRecords,
 		options.WAL.MaxEntries, options.WAL.MaxLiveBytes,
-		filepath.Join(dataRoot, "split-children", "static-bootstrap.pb"),
+		filepath.Join(controlRoot, "split-children", "static-bootstrap.pb"),
 		options.Nodes[0], options.PeerAddresses[0], options.Nodes[1], options.PeerAddresses[1],
 		options.Nodes[2], options.PeerAddresses[2], options.Nodes[0], options.PeerAddresses[0],
 		options.Nodes[1], options.PeerAddresses[1], options.Nodes[2], options.PeerAddresses[2]))
