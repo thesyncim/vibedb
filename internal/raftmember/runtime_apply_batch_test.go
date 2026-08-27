@@ -20,8 +20,9 @@ import (
 )
 
 type runtimeMemoryBatchMachine struct {
-	publication raftmodel.Publication
-	batchCalls  int
+	publication        raftmodel.Publication
+	batchCalls         int
+	originalCompletion []byte
 }
 
 func newRuntimeMemoryBatchMachine(t *testing.T, stable *raftsim.MemoryStore) *runtimeMemoryBatchMachine {
@@ -70,6 +71,9 @@ func (machine *runtimeMemoryBatchMachine) ApplyNormalBatch(
 ) (int, raftmodel.Publication, error) {
 	machine.batchCalls++
 	clear(witnesses)
+	if machine.originalCompletion != nil {
+		return 0, raftmodel.Publication{}, nil
+	}
 	for index := range entries {
 		publication, err := machine.ApplyNormal(entries[index].Meta, entries[index].Data)
 		if err != nil {

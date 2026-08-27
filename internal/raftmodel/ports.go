@@ -61,6 +61,9 @@ const (
 	// bound: a maximum-sized entry still fits, while a batch cannot retain an
 	// unbounded collection of smaller command envelopes.
 	MaxNormalApplyBatchBytes = MaxProposalBytes
+	// MaxNormalApplyCompletionBytes bounds the ephemeral singleton settlement
+	// result. Large retained results continue to use the durable lookup path.
+	MaxNormalApplyCompletionBytes = 4 << 10
 )
 
 // NormalApply is one borrowed normal-entry input to NormalBatchStateMachine.
@@ -88,6 +91,16 @@ type AppliedNormalBatch struct {
 	readyID     uint64
 	entries     []*pb.Entry
 	publication Publication
+	completion  []byte
+}
+
+// Completion returns the optional original singleton apply result. Bytes are
+// borrowed with the same lifetime as Entry; absence requests durable lookup.
+func (batch AppliedNormalBatch) Completion(index int) ([]byte, bool) {
+	if index != 0 || len(batch.entries) != 1 || len(batch.completion) == 0 {
+		return nil, false
+	}
+	return batch.completion, true
 }
 
 // Len returns the exact number of atomically published normal entries.
@@ -136,6 +149,16 @@ func (batch AppliedNormalBatch) FinalPublication() Publication { return batch.pu
 type ApplyBatchResult struct {
 	Applied int
 	Normal  AppliedNormalBatch
+}
+
+// NormalCompletionStateMachine optionally preserves an original singleton
+// result which cannot be reconstructed from the post-apply state (for example,
+// creation versus an exact duplicate). A successful nonempty result transfers
+// ownership of at most MaxNormalApplyCompletionBytes to the caller. It may not
+// alias input or mutable machine storage. Nil uses ordinary durable lookup.
+// Errors must not expose a completion; publication obeys StateMachine rules.
+type NormalCompletionStateMachine interface {
+	ApplyNormalWithCompletion(ApplyMeta, []byte) (Publication, []byte, error)
 }
 
 // Publication is the state visible to readers after an apply operation

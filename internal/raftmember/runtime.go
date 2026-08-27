@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -214,6 +215,10 @@ func (batch AppliedBatch) LookupCompletion(
 	if batch.apply == nil {
 		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
 	}
+	if completion, ok := batch.normal.Completion(index); ok {
+		lookup, err = lookupOriginalCompletion(entry, completion, nil, false)
+		return lookup, true, err
+	}
 	lookup, err = batch.apply.LookupCompletion(entry.Data)
 	return lookup, true, err
 }
@@ -232,6 +237,10 @@ func (batch AppliedBatch) LookupCompletionInto(
 	}
 	if batch.apply == nil {
 		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
+	}
+	if completion, ok := batch.normal.Completion(index); ok {
+		lookup, err = lookupOriginalCompletion(entry, completion, dst, true)
+		return lookup, true, err
 	}
 	lookup, err = batch.apply.LookupCompletionInto(entry.Data, dst)
 	return lookup, true, err
@@ -275,8 +284,30 @@ func (batch AppliedBatch) LookupCompletionIntoWorkspace(
 	if len(entry.Data) == 0 {
 		return replicatedstate.CompletionLookup{}, false, nil
 	}
+	if completion, ok := batch.normal.Completion(index); ok {
+		lookup, err = lookupOriginalCompletion(entry, completion, dst, true)
+		return lookup, true, err
+	}
 	lookup, err = batch.apply.LookupCompletionIntoWorkspace(&workspace.apply, entry.Data, dst)
 	return lookup, true, err
+}
+
+// Original results belong to the pending settlement token, not the current
+// storage cut. Copy out so sinks cannot mutate a later settlement retry.
+func lookupOriginalCompletion(
+	entry raftmodel.NormalApply, completion, dst []byte, into bool,
+) (replicatedstate.CompletionLookup, error) {
+	command, err := replication.OpenCommand(entry.Data)
+	if err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	if into && (cap(dst) < replicatedstate.MaxCompletionEnvelopeBytes || cap(dst) < len(completion)) {
+		return replicatedstate.CompletionLookup{}, replicatedstate.ErrCompletionBufferSmall
+	}
+	return replicatedstate.CompletionLookup{
+		Key:   replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
+		Bytes: append(dst[:0], completion...), AppliedSequence: entry.Meta.Index,
+	}, nil
 }
 
 // EndCompletionLookup releases the exact durable cut. The workspace remains

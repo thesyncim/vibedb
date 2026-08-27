@@ -40,9 +40,10 @@ type Node struct {
 	readBytes    int
 	readSeq      uint64
 
-	settlementReadyID uint64
-	settlementStart   int
-	settlementCount   int
+	settlementReadyID    uint64
+	settlementStart      int
+	settlementCount      int
+	settlementCompletion []byte
 
 	readyFromInput    bool
 	pendingInputCalls int
@@ -709,6 +710,7 @@ func (n *Node) pendingAppliedNormalBatch() AppliedNormalBatch {
 		owner: n, readyID: n.settlementReadyID,
 		entries:     n.ready.CommittedEntries[n.settlementStart:end],
 		publication: n.published,
+		completion:  n.settlementCompletion,
 	}
 }
 
@@ -746,6 +748,7 @@ func (n *Node) SettleAppliedNormalBatch(batch AppliedNormalBatch) error {
 	n.settlementReadyID = 0
 	n.settlementStart = 0
 	n.settlementCount = 0
+	n.settlementCompletion = nil
 	if n.entryPos == len(n.ready.CommittedEntries) {
 		n.phase = PhaseEntriesApplied
 	}
@@ -1148,13 +1151,25 @@ func (n *Node) applyEntry(entry *pb.Entry) error {
 	meta := ApplyMeta{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType()}
 	switch entry.GetType() {
 	case pb.EntryType_EntryNormal:
-		pub, err := n.machine.ApplyNormal(meta, entry.GetData())
+		var pub Publication
+		var completion []byte
+		var err error
+		if machine, ok := n.machine.(NormalCompletionStateMachine); ok {
+			pub, completion, err = machine.ApplyNormalWithCompletion(meta, entry.GetData())
+		} else {
+			pub, err = n.machine.ApplyNormal(meta, entry.GetData())
+		}
 		if err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
+		}
+		if len(completion) > MaxNormalApplyCompletionBytes || cap(completion) > MaxNormalApplyCompletionBytes ||
+			(len(entry.GetData()) == 0 && len(completion) != 0) {
+			return n.fail(PhaseEntriesApplied, meta.Index, errors.New("invalid normal apply completion bound"))
 		}
 		if err := n.acceptNormalPublication(meta, len(entry.GetData()) == 0, pub); err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
 		}
+		n.settlementCompletion = completion
 	case pb.EntryType_EntryConfChange, pb.EntryType_EntryConfChangeV2:
 		change, err := decodeConfChange(entry)
 		if err != nil {

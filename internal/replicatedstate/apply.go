@@ -270,6 +270,23 @@ func (s *commandPlanScratch) appendSessionSlot(
 
 // ApplyNormal implements raftmodel.StateMachine.
 func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, error) {
+	return m.applyNormal(meta, data, nil)
+}
+
+// ApplyNormalWithCompletion preserves an operation's original completion when
+// durable lookup would instead describe a retry. The result is owned by the
+// caller and exists only for synchronous settlement, never as a retained log.
+// A nil completion requests the ordinary durable lookup path.
+func (m *Machine) ApplyNormalWithCompletion(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, []byte, error) {
+	var completion []byte
+	publication, err := m.applyNormal(meta, data, &completion)
+	if err != nil {
+		return publication, nil, err
+	}
+	return publication, completion, err
+}
+
+func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion *[]byte) (raftmodel.Publication, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer m.releaseMutationPlan()
@@ -403,6 +420,17 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 			next, nil, commandPlan{dataChainDigest: next.DataChainDigest}, ledgerPlan.rows,
 		); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
+		}
+		if completion != nil {
+			var result [RequestLedgerCompletionResultBytes]byte
+			resultBytes, err := AppendRequestLedgerCompletionResult(result[:0], ledgerPlan.completion)
+			if err != nil {
+				return raftmodel.Publication{}, m.fail(err)
+			}
+			*completion, err = m.appendRequestLedgerCompletion(nil, command, ledgerPlan.completion, resultBytes)
+			if err != nil {
+				return raftmodel.Publication{}, m.fail(err)
+			}
 		}
 		return clonePublication(m.publication), nil
 	}
