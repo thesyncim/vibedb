@@ -130,6 +130,13 @@ func TestRequestLedgerProgressAndTerminalCutsShareOneSnapshot(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(2), create); err != nil {
 		t.Fatal(err)
 	}
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
 	for _, kind := range []RequestLedgerReadKind{
 		RequestLedgerReadProgress, RequestLedgerReadTerminalCut,
 	} {
@@ -137,7 +144,7 @@ func TestRequestLedgerProgressAndTerminalCutsShareOneSnapshot(t *testing.T) {
 			Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
 			Kind: kind, MinimumApplied: 2, MaxBytes: uint32(RequestLedgerReadMaxBytes(kind)),
 		}
-		result, err := fixture.machine.RequestLedgerReadInto(
+		result, err := reopened.RequestLedgerReadInto(
 			read, make([]byte, 0, read.MaxBytes),
 		)
 		if err != nil || !result.Found || result.AuthoritativeKind != kind {
