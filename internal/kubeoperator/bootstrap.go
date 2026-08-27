@@ -255,6 +255,7 @@ type bootstrapRole struct {
 	group                  raftmember.GroupKey
 	nodes                  [3]rafttransport.NodeID
 	stores                 [3][16]byte
+	candidateStores        [3][16]byte
 	digest                 replication.Digest
 	limits                 sqldriver.ReplicatedShardStoreLimits
 }
@@ -458,6 +459,10 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 				return nil, state, readErr
 			}
 			roles[ri].stores[mi], readErr = readBootstrap16(random)
+			if readErr != nil {
+				return nil, state, readErr
+			}
+			roles[ri].candidateStores[mi], readErr = readBootstrap16(random)
 			if readErr != nil {
 				return nil, state, readErr
 			}
@@ -768,7 +773,7 @@ func bootstrapReplicaControl(roles [3]bootstrapRole, state bootstrapState) ([]by
 			})
 			m.Candidates = append(m.Candidates, bootstrapCandidate{
 				uint64(100 + roleIndex*3 + member), node,
-				hex.EncodeToString(role.stores[member][:]), 1,
+				hex.EncodeToString(role.candidateStores[member][:]), 1,
 				fmt.Sprintf("%s-member-%d", role.name, member+1), 0,
 			})
 		}
