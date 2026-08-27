@@ -3,13 +3,13 @@
 `gateway.Executor.ExecBatch` runs a byte-bounded atomic write across shards
 and tables. The gateway proves every statement's owner before it sends
 transaction traffic. A participant is one exact shard target, not one row or
-table; mutations routed to the same fenced target share a participant.
+table. Mutations routed to the same fenced target share a participant.
 
 The executor has two transaction authorities. General SQL uses the static
 shard journal described below. A batch whose every table has replicated
 metadata and whose mutations resolve to one or more RF3 groups uses the fused
 Raft path. Classification and complete validation happen before either
-authority receives I/O; a batch never crosses both.
+authority receives I/O. A batch never crosses both.
 
 ## Bounds
 
@@ -36,8 +36,8 @@ bytes, deadline, and in-flight shard requests. Staging and recovery retain one
 manifest page plus a worker-sized result window instead of the aggregate page
 set or one response per participant. A shard journal reserves the exact bytes
 needed to decide and retire every admitted local record. Retiring a segmented
-coordinator immediately drops its resident page set, including during replay;
-the append-only journal currently retains the historical entries on disk until
+coordinator immediately drops its resident page set, including during replay.
+The append-only journal currently retains the historical entries on disk until
 its finite ceiling rather than compacting them.
 
 ## RF3 SQL lowering
@@ -45,16 +45,16 @@ its finite ceiling rather than compacting them.
 The public RF3 lane deliberately accepts only statement shapes with one exact,
 byte-native meaning:
 
-- one or more whole-document insert rows, each lowered to insert-if-absent;
-- one exact-primary-key whole-document update, lowered to replace-if-present;
-- one exact-primary-key delete or one finite primary-key `IN` set.
+- one or more whole-document insert rows, each lowered to insert-if-absent
+- one exact-primary-key whole-document update, lowered to replace-if-present
+- one exact-primary-key delete or one finite primary-key `IN` set
 
 The update document must preserve the placement key. Returning clauses,
 column-list inserts, conflict clauses, residual predicates, ordering, limits,
 repeated relation keys, and mixed static/RF3 tables are refused before
 execution. Multiple statements
 and tables in one group become sorted numeric relation batches on the same
-participant and commit atomically. Ordered keys and document bytes enter Raft;
+participant and commit atomically. Ordered keys and document bytes enter Raft.
 SQL and table-name strings do not.
 
 Mutation count, encoded bytes, relation-batch size, and intent-scope count are
@@ -68,30 +68,26 @@ the same deterministic apply. The state machine returns one fixed-width
 affected-row result, stores it with the session result, and reproduces it on an
 exact retry.
 
-The NDJSON caller supplies a nonzero 128-bit request ID distinct from the
-generated transaction ID. Its registry key combines the ID with stable request
-scope. Authenticated traffic uses the certificate's node identity but excludes
-authorization-policy generation, allowing the same node to retry across policy
-rotation. Local/plaintext traffic uses a distinct scope and cannot alias an
-authenticated node.
+The authenticated client durably owns one nonzero installation ID. It opens
+epoch 1 and a fixed lane ordinal through `issuer_open`. Replicated catalog and
+request-ledger authority return a grant digest. Each write carries the exact
+grant reference, a strictly monotonic lane sequence, and a nonzero 128-bit
+request ID distinct from the generated transaction ID. The transport supplies
+the principal and tenant.
 
-The request digest is independent of catalog generation, routes, lowering, and
-mutation placement. It hashes the exact ordered statements, operation class,
-parameter kinds, boolean values, and parameter bytes. Reuse in the same scope
-with different caller bytes fails before orchestration. Concurrent exact
-duplicates share one execution or recovery call.
+One fused home-group transition advances the contiguous issuer high-water and
+creates the request head. This transition rejects sequence gaps, rewinds,
+foreign principals, forged grants, and a request ID reused with different
+bytes. The request digest is independent of catalog generation, routes,
+lowering, and mutation placement. It hashes the exact ordered statements,
+operation class, parameter kinds, boolean values, and parameter bytes.
 
-The request registry has a strict finite capacity; the shipped command admits
-65,536 identities. It never evicts executing work, live recovery ownership, or
-terminal outcomes to make room. The command performs no automatic terminal
-expiry and exposes no client ACK or expiry operation. The command never calls
-the registry's scoped `Forget` API. An embedding may call `Forget` only after
-it has an application-level acknowledgement that the terminal result no longer
-needs retry protection. At 65,536 retained entries, new RF3 writes backpressure
-instead of dropping idempotency evidence. A durable replicated ledger or safe
-explicit client ACK is required before this legacy registry can reclaim a
-terminal result. The separate durable request-ledger path has replicated ACK
-and collection primitives, but the gateway command does not yet construct it.
+The ledger streams the sealed program, pending waves, and terminal result under
+bounded capacities. A committed response carries an opaque authenticated ACK
+capability. `ack_exec_batch` verifies the exact request, terminal revision,
+result digest, and token before it advances bounded collection. Exact ACK retry
+resumes after a lost response. A completed ACK retry performs no new write.
+The command has no unsequenced or process-local RF3 fallback.
 
 ## State machines
 
@@ -131,7 +127,7 @@ finish later.
 A SQL participant publishes its user-table mutation and one hidden applied
 marker through the same database transaction log. The marker is keyed by the
 raw 16-byte transaction ID and retains only the applied revision and affected
-row count; the larger staged mutation remains in the participant journal.
+row count. The larger staged mutation remains in the participant journal.
 
 Before publication, an existing marker is read under the catalog write lock.
 An exact revision match returns the retained affected-row count and discards
@@ -160,10 +156,11 @@ or cleanup work did not finish. Recover the same transaction ID.
 A journal sync failure poisons the journal handle. A torn final append can be
 truncated during recovery. Corruption before the tail fails closed.
 
-The NDJSON RF3 response carries `transaction_id` plus `committed:true` after a
-durable decision. If the decision cannot be established, it carries the same
-transaction identity plus `outcome_unknown:true`. The client must retry the
-same batch with the same request ID, not invent a new request.
+The public durable RF3 response carries `transaction_id`, `committed:true`, and
+the complete ACK handle after a durable decision. If the connection closes or
+the operation reports an error after admission, the client must retry the exact
+batch with the same request ID, grant reference, and issuer sequence. It must
+not invent a new identity or skip the sequence.
 
 ## Recovery
 
@@ -178,34 +175,23 @@ the recovery authority.
 `RecoverAll` scans non-retired coordinators on all current shards. The shipped
 gateway calls it every five seconds.
 
-The RF3 orchestrator instead retains its exact recovery handle in the bounded
-request registry. An exact retry or the five-second RF3 sweep performs
-leader-only transaction recovery reads and resumes the fused state machine.
-This recovers a hidden commit and caches the terminal result without exposing
-the live handle to the client.
+The RF3 request service stores the exact recovery handle in the request-ledger
+RF3 group. It stores request identity, streamed logical plan, pending waves,
+terminal result, ACK state, issuer lane, and contiguous issuer high-water. Each
+transaction wave is fenced by one logical execution-pin epoch.
 
-Request replay occurs before the executor pins a catalog or lowers SQL. A
-terminal, pending, or executing entry therefore survives a newer catalog
-generation, split, or move without being replanned. Replay returns the first
-execution's catalog generation and shard count, while pending recovery keeps
-the original generation and participant route metadata in its handle.
+Request replay occurs before new SQL planning. A terminal or pending entry
+therefore survives gateway replacement and does not replan against a newer
+catalog generation, split, or move. The replacement gateway uses leader-only
+transaction recovery reads to resume the sealed program or return the retained
+terminal result. A plain pre-admission failure that created no request head can
+be retried at the same sequence. A gap or a changed exact retry fails closed.
 
-An error is retained only when execution produced transaction identity, a
-commit proof, or recovery ownership. A plain pre-admission or transient error
-is delivered to the waiters on that attempt and then removed from the registry;
-a later retry can pin the then-current catalog.
-
-That legacy ownership is process-local. A gateway restart loses pending handles
-and terminal request-ID mappings. Replicated coordinator and participant records
-remain durable, but the ordinary request-ID form cannot rediscover them by the
-caller request ID after that loss.
-
-The separate durable request service stores the request identity, streamed
-logical plan, pending waves, terminal result, ACK, issuer lane, and contiguous
-issuer high-water in RF3 state. It can recover from another gateway and fences
-each transaction wave with one logical execution-pin epoch. Its catalog range
-topology and service are internally composed and tested. `runServe` still passes
-a nil durable service, so the structured wire operations return unavailable.
+`runServe` constructs the durable service and refuses to start without its
+catalog topology, RF3 ledger client, execution-pin journals, replicated issuer
+authority, terminal authority, and shared ACK key. It installs no process-local
+request registry. After explicit authenticated ACK, the collector advances
+only contiguous GC-complete issuer sequences.
 
 Recovery matches the routing version, allocation generation, and ownership
 epoch that the transaction recorded. The implementation does not prove
@@ -231,13 +217,17 @@ scan, join, aggregate, or historical read contract.
 - `gateway/recovery.go`
 - `gateway/transaction_manifest.go`
 - `gateway/replicated_sql_transaction.go`
-- `gateway/replicated_request_registry.go`
+- `gateway/durable_sql_request_executor.go`
 - `gateway/replicated_request_service.go`
 - `gateway/replicated_request_ledger_catalog.go`
 - `gateway/replicated_request_issuer_collector.go`
 - `gateway/replicated_transaction.go`
 - `gateway/replicated_transaction_recover.go`
 - `gateway/writer.go`
+- `cmd/vibedb-gateway/durable_request_runtime.go`
+- `cmd/vibedb-gateway/durable_exec_batch_wire.go`
+- `cmd/vibedb-gateway/issuer_open_wire.go`
+- `cmd/vibedb-gateway/exec_batch_ack_wire.go`
 - `internal/distributedtxn/codec.go`
 - `internal/distributedtxn/manifest.go`
 - `internal/distributedtxn/journal.go`

@@ -25,7 +25,7 @@ Start with the page that matches your task.
 
 - [Durability and recovery](durability.md)
 - [Offline verification, salvage, and repack](operations/verification.md)
-- [Start a three-node replicated shard](operations/distributed-quickstart.md)
+- [Start a local replicated cluster](operations/distributed-quickstart.md)
 - [Distributed runtime](operations/distributed.md)
 - [Roll out a replicated schema](operations/schema-rollouts.md)
 - [Replica lifecycle](operations/replica-lifecycle.md)
