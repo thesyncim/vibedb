@@ -207,6 +207,11 @@ func TestAbandonedUnrootedGenerationWaitsForSnapshotAndRecoveryFloors(t *testing
 		ReservedOffset: reservation.Offset, ReservedBytes: reservation.Length,
 		FirstLogicalID: reservation.FirstLogicalID,
 		LogicalIDCount: reservation.LogicalIDCount,
+		SourcePrimaryRoot: PageRef{
+			Offset: 32 << 10, LogicalID: GlobalTabletCatalogRootLogicalID,
+			Generation: 5, Length: GlobalTabletCatalogRootBytes,
+			Kind: PagePrimaryCatalog,
+		},
 	}
 	got, ok := AbandonedUnrootedGenerationReservation(manifest)
 	if !ok || got != reservation {

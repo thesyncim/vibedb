@@ -15,6 +15,11 @@ func TestGenerationMigrationManifestCanonicalAndCrashRejecting(t *testing.T) {
 		SourceFileEnd: 1 << 20, TargetFileEnd: 512 << 10,
 		ReservedOffset: 2 << 20, ReservedBytes: 8 << 20,
 		FirstLogicalID: 100, LogicalIDCount: 1000,
+		SourcePrimaryRoot: PageRef{
+			Offset: 64 << 10, LogicalID: GlobalTabletCatalogRootLogicalID,
+			Generation: 41, Length: GlobalTabletCatalogRootBytes,
+			Kind: PagePrimaryCatalog,
+		},
 		Cursor: []byte("row-0000042"),
 	}
 	first, err := EncodeGenerationMigrationManifest(
@@ -47,6 +52,11 @@ func TestGenerationMigrationManifestCanonicalAndCrashRejecting(t *testing.T) {
 	next.Phase = GenerationMigrationReady
 	next.AppliedSequence = next.CapturedSequence
 	next.TargetFileEnd++
+	next.TargetPrimaryRoot = PageRef{
+		Offset: m.ReservedOffset, LogicalID: GlobalTabletCatalogRootLogicalID,
+		Generation: 42, Length: GlobalTabletCatalogRootBytes,
+		Kind: PagePrimaryCatalog,
+	}
 	if err := ValidateGenerationMigrationAdvance(m, next); err != nil {
 		t.Fatalf("valid advance: %v", err)
 	}
