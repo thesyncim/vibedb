@@ -103,6 +103,7 @@ type multiGroupRequestLedgerRF3RoundTripper struct {
 	hideOperation requestledger.Operation
 	hidden        bool
 	hiddenMember  int
+	disconnected  bool
 	trace         []multiGroupRequestLedgerRF3Trace
 }
 
@@ -146,11 +147,47 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) proposalTrace() []multiGro
 	return trace
 }
 
+func (client *multiGroupRequestLedgerRF3RoundTripper) callerDisconnected() bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.disconnected
+}
+
+func (client *multiGroupRequestLedgerRF3RoundTripper) reconnectCaller() {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.disconnected = false
+}
+
+func (client *multiGroupRequestLedgerRF3RoundTripper) recordProposal(
+	trace multiGroupRequestLedgerRF3Trace, response *shardservice.ReplicatedResponse,
+) bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	hide := !client.hidden && client.hideOperation != requestledger.OperationInvalid &&
+		trace.operation == client.hideOperation && response != nil &&
+		response.Kind == shardservice.ReplicatedCompletion
+	if hide {
+		client.hidden = true
+		client.hiddenMember = trace.member
+		client.disconnected = true
+		trace.hidden = true
+	}
+	client.trace = append(client.trace, trace)
+	return hide
+}
+
 func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 	ctx context.Context,
 	endpoint gateway.ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
+	// Losing one response alone is not a lost caller: production retries can
+	// resolve it through a healthy quorum. Keep this caller disconnected for
+	// every retry in the logical call, until the fixture explicitly reconnects.
+	if client.callerDisconnected() {
+		return nil, io.ErrUnexpectedEOF
+	}
 	member := int(endpoint.Member - 1)
 	if member < 0 || member >= multiGroupRF3Voters {
 		return nil, errors.New("RF3 request-ledger endpoint is outside the cluster")
@@ -214,17 +251,7 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 				trace.result, _ = replicatedstate.OpenRequestLedgerCompletionResult(completion.ResultCode, completion.InlineResult)
 			}
 		}
-		client.mu.Lock()
-		hide = !client.hidden && client.hideOperation != requestledger.OperationInvalid &&
-			trace.operation == client.hideOperation && response != nil &&
-			response.Kind == shardservice.ReplicatedCompletion
-		if hide {
-			client.hidden = true
-			client.hiddenMember = member
-			trace.hidden = true
-		}
-		client.trace = append(client.trace, trace)
-		client.mu.Unlock()
+		hide = client.recordProposal(trace, response)
 	}
 	if hide {
 		client.cluster.network.isolate(member)
@@ -242,6 +269,11 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) logRecentSettlements(t tes
 		t.Logf("ledger group=%d member=%d op=%d result=%d phase=%d revision=%d duplicate=%t hidden=%t",
 			trace.group, trace.member, trace.operation, trace.result.ResultCode,
 			trace.result.Phase, trace.result.Revision, trace.result.ExactDuplicate, trace.hidden)
+	}
+	for member, server := range client.servers {
+		if server != nil {
+			t.Logf("native member=%d settlement diagnostics=%+v", member, server.Stats())
+		}
 	}
 }
 
@@ -503,6 +535,7 @@ func TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition(t 
 		Operation: requestledger.OperationCreate, Revision: head1.Revision, Head: head1,
 	})
 	if !errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		clientA.logRecentSettlements(t)
 		t.Fatalf("lost create error=%v", err)
 	}
 	if !cluster.network.nodeIsolated(leader) {
@@ -709,6 +742,7 @@ func TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions(t *
 	if ackReplacement == ackLeader {
 		t.Fatal("ACK recovery retained the partitioned ledger leader")
 	}
+	gatewayB.client.reconnectCaller()
 
 	acknowledged, err := gatewayB.sql.Acknowledge(ctx, recovered.Key,
 		recovered.TerminalRevision, recovered.ResultDigest, recovered.AckToken)

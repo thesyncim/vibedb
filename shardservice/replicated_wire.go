@@ -1258,6 +1258,32 @@ func validReplicatedCompletionResult(completion replication.CompletionView) bool
 		}
 		_, err := routegate.OpenOutcome(completion.InlineResult)
 		return err == nil
+	case replicatedstate.ResultFormatExecutionPin:
+		proof, err := executionpin.OpenCompletion(completion.InlineResult)
+		if err != nil {
+			return false
+		}
+		switch completion.ResultCode {
+		case replicatedstate.ResultApplied:
+			if !proof.Found {
+				return false
+			}
+			switch proof.Operation {
+			case executionpin.OperationAcquire, executionpin.OperationRenew, executionpin.OperationRecover:
+				return proof.Status == executionpin.StatusActive &&
+					proof.Lease.Applied == completion.AppliedSequence
+			case executionpin.OperationRelease:
+				return proof.Status == executionpin.StatusReleased &&
+					proof.Terminal.Applied == completion.AppliedSequence
+			case executionpin.OperationExpire:
+				return proof.Status == executionpin.StatusExpired &&
+					proof.Terminal.Applied == completion.AppliedSequence
+			}
+		case replicatedstate.ResultIndexConflict, replicatedstate.ResultIntentBusy,
+			replicatedstate.ResultTargetBound, replicatedstate.ResultStaleFence:
+			return !proof.Found
+		}
+		return false
 	default:
 		return false
 	}
