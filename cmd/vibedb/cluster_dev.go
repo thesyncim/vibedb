@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -52,6 +51,9 @@ const (
 	devClusterRF1                                              = 1
 	devClusterOID                                              = "1.3.6.1.4.1.32473.1.1"
 	devReadyTimeout                                            = 30 * time.Second
+	devChildDiagnosticBytes                                    = 64 << 10
+	devChildLogDrainTimeout                                    = 250 * time.Millisecond
+	devChildReadyMarkerBytes                                   = 256
 	devLedgerDistribution        distribution.DistributionName = "request-ledger"
 	devLedgerShard               distribution.ShardID          = "all"
 	devLedgerTable                                             = "request_ledger"
@@ -1193,7 +1195,7 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 	memberCount := len(m.Members) + len(m.LedgerMembers) + len(m.DataMembers)
 	children := make([]*devChild, 0, memberCount+1)
 	exits := make(chan devChildExit, memberCount+1)
-	defer stopDevChildren(children)
+	defer func() { stopDevChildren(children) }()
 	for _, role := range []struct {
 		name    string
 		members []devClusterMember
@@ -1252,7 +1254,11 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 func watchDevChildExit(exits chan<- devChildExit, name string, child *devChild) {
 	go func() {
 		<-child.done
-		exits <- devChildExit{name: name, err: child.waitError()}
+		err := child.waitError()
+		if tail := child.diagnostics.String(); tail != "" {
+			err = errors.Join(err, fmt.Errorf("last child output (at most %d bytes):\n%s", devChildDiagnosticBytes, tail))
+		}
+		exits <- devChildExit{name: name, err: err}
 	}()
 }
 
@@ -1271,13 +1277,18 @@ func waitDevReadyOrExit(ctx context.Context, child *devChild, exits <-chan devCh
 	}
 }
 func startDevChild(binary string, args []string, marker string) (*devChild, error) {
-	diagnostics := &devDiagnostics{maximum: 64 << 10}
+	if len(marker) == 0 || len(marker) > devChildReadyMarkerBytes {
+		return nil, errors.New("invalid development child readiness marker")
+	}
+	diagnostics := &devDiagnostics{maximum: devChildDiagnosticBytes}
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
 	command := exec.Command(binary, args...)
-	command.Stdout = diagnostics
+	// Own both streams so exec.Wait cannot hang on an inherited stdout pipe
+	// held by a descendant after the supervised process has exited.
+	command.Stdout = writer
 	command.Stderr = writer
 	child := &devChild{command: command, ready: make(chan error, 1), done: make(chan struct{}), diagnostics: diagnostics}
 	if err = command.Start(); err != nil {
@@ -1286,31 +1297,57 @@ func startDevChild(binary string, args []string, marker string) (*devChild, erro
 		return nil, err
 	}
 	writer.Close()
+	drained := make(chan struct{})
 	go func() {
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 4096), 64<<10)
-		found := false
-		for scanner.Scan() {
-			line := scanner.Text()
-			diagnostics.Write([]byte(line + "\n"))
-			if !found && strings.Contains(line, marker) {
-				found = true
-				child.ready <- nil
-			}
-		}
-		if !found {
-			child.ready <- errors.Join(errors.New(diagnostics.String()), scanner.Err())
-		}
-		reader.Close()
+		defer close(drained)
+		defer reader.Close()
+		captureDevChildOutput(reader, diagnostics, marker, child.ready)
 	}()
 	go func() {
 		err := command.Wait()
+		// Preserve final fatal output before publishing the exit, but bound
+		// draining if a descendant inherited either stream.
+		timer := time.AfterFunc(devChildLogDrainTimeout, func() { _ = reader.Close() })
+		<-drained
+		timer.Stop()
 		child.waitMu.Lock()
 		child.waitErr = err
 		child.waitMu.Unlock()
 		close(child.done)
 	}()
 	return child, nil
+}
+
+func captureDevChildOutput(reader io.Reader, diagnostics *devDiagnostics, marker string, ready chan<- error) {
+	var buffer [4096 + devChildReadyMarkerBytes]byte
+	markerBytes := []byte(marker)
+	overlap, found := 0, false
+	for {
+		n, err := reader.Read(buffer[overlap : overlap+4096])
+		if n != 0 {
+			_, _ = diagnostics.Write(buffer[overlap : overlap+n])
+			total := overlap + n
+			if !found && bytes.Contains(buffer[:total], markerBytes) {
+				found = true
+				ready <- nil
+			}
+			if !found {
+				overlap = min(len(marker)-1, total)
+				copy(buffer[:overlap], buffer[total-overlap:total])
+			} else {
+				overlap = 0
+			}
+		}
+		if err != nil {
+			if !found {
+				if errors.Is(err, io.EOF) {
+					err = nil
+				}
+				ready <- errors.Join(errors.New(diagnostics.String()), err)
+			}
+			return
+		}
+	}
 }
 
 func (child *devChild) waitError() error {
@@ -1350,20 +1387,44 @@ type devDiagnostics struct {
 	mu      sync.Mutex
 	data    []byte
 	maximum int
+	write   int
+	count   int
 }
 
 func (d *devDiagnostics) Write(p []byte) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if n := d.maximum - len(d.data); n > 0 {
-		d.data = append(d.data, p[:min(n, len(p))]...)
+	inputBytes := len(p)
+	if d.maximum <= 0 || len(p) == 0 {
+		return inputBytes, nil
 	}
-	return len(p), nil
+	if d.data == nil {
+		d.data = make([]byte, d.maximum)
+	}
+	if len(p) >= d.maximum {
+		copy(d.data, p[len(p)-d.maximum:])
+		d.write, d.count = 0, d.maximum
+		return inputBytes, nil
+	}
+	first := copy(d.data[d.write:], p)
+	copy(d.data, p[first:])
+	d.write = (d.write + len(p)) % d.maximum
+	d.count = min(d.maximum, d.count+len(p))
+	return inputBytes, nil
 }
 func (d *devDiagnostics) String() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return string(bytes.Clone(d.data))
+	if d.count == 0 {
+		return ""
+	}
+	start := (d.write - d.count + d.maximum) % d.maximum
+	var tail strings.Builder
+	tail.Grow(d.count)
+	first := min(d.count, d.maximum-start)
+	tail.Write(d.data[start : start+first])
+	tail.Write(d.data[:d.count-first])
+	return tail.String()
 }
 
 func reserveDevPorts(count int) ([]string, error) {
@@ -1714,7 +1775,7 @@ func decodeDev16(value string) ([16]byte, error) {
 }
 func runDevCommand(binary string, args ...string) error {
 	command := exec.Command(binary, args...)
-	diagnostic := &devDiagnostics{maximum: 64 << 10}
+	diagnostic := &devDiagnostics{maximum: devChildDiagnosticBytes}
 	command.Stdout = diagnostic
 	command.Stderr = diagnostic
 	if err := command.Run(); err != nil {
