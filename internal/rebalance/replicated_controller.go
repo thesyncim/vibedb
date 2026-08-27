@@ -30,6 +30,13 @@ type ReplicatedOperationJournal interface {
 	RetryPending(context.Context) error
 }
 
+// ReplicatedOperationSetJournal atomically admits multiple independent move
+// records into the catalog RF3 work directory. Execution remains a per-group
+// saga; only admission is cross-group atomic.
+type ReplicatedOperationSetJournal interface {
+	SubmitOperations(context.Context, []gateway.ReplicatedOperationRecord) error
+}
+
 // ReplicatedMoveCut is one detached observation. SnapshotBase is the verified
 // durable certificate recovered from the shard runtime after snapshot
 // creation. It is never copied into the bounded catalog operation record.
@@ -229,6 +236,31 @@ func ExecuteReplicatedMoveStep(
 		return action, err
 	}
 	return action, nil
+}
+
+// PrepareReplicatedMoveRecord observes and freezes revision one without
+// executing an external action. It is the admission half used by a move set;
+// ordinary Resume performs a fresh observation after the atomic catalog batch.
+func PrepareReplicatedMoveRecord(
+	ctx context.Context, plan *Plan, observer ReplicatedMoveObserver,
+) (gateway.ReplicatedOperationRecord, error) {
+	if ctx == nil || plan == nil || observer == nil || plan.OperationID() == (OperationID{}) {
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedMove
+	}
+	operation := plan.OperationID()
+	cut, err := observer.ObserveReplicaMove(ctx, operation, gateway.ReplicatedOperationRecord{}, plan)
+	if err != nil || cut.Catalog == nil {
+		return gateway.ReplicatedOperationRecord{}, errors.Join(err, ErrReplicatedMove)
+	}
+	intent, err := AppendReplicaMoveIntent(nil, cut.Catalog, plan)
+	if err != nil {
+		return gateway.ReplicatedOperationRecord{}, errors.Join(err, ErrReplicatedMove)
+	}
+	action, err := Reconcile(plan, cut.Observation)
+	if err != nil {
+		return gateway.ReplicatedOperationRecord{}, err
+	}
+	return newReplicaMoveRecord(operation, cut.Catalog.Generation(), intent, plan, cut, action), nil
 }
 
 func newReplicaMoveRecord(

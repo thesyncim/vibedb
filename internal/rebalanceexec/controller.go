@@ -67,6 +67,56 @@ func (controller *Controller) Submit(
 	)
 }
 
+// SubmitSet atomically admits every move record through the catalog RF3 group,
+// then advances each group once. Snapshot/catch-up work may overlap across
+// later passes, while each topology publication retains its exact generation
+// CAS. A crash before admission exposes none of the set; after admission the
+// ordinary directory scan resumes every child without process-local state.
+func (controller *Controller) SubmitSet(
+	ctx context.Context, plans []*rebalance.Plan,
+) ([]rebalance.Action, error) {
+	if controller == nil || ctx == nil || len(plans) == 0 {
+		return nil, ErrControllerConfig
+	}
+	journal, ok := controller.journal.(rebalance.ReplicatedOperationSetJournal)
+	if !ok {
+		return nil, ErrControllerConfig
+	}
+	records := make([]gateway.ReplicatedOperationRecord, len(plans))
+	for index, plan := range plans {
+		if plan == nil {
+			return nil, ErrControllerConfig
+		}
+		record, err := rebalance.PrepareReplicatedMoveRecord(ctx, plan, controller.observer)
+		if err != nil {
+			return nil, err
+		}
+		records[index] = record
+	}
+	if err := journal.SubmitOperations(ctx, records); err != nil {
+		if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+			return nil, err
+		}
+		if err = controller.journal.RetryPending(ctx); err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			settled, readErr := controller.journal.ReadOperation(ctx, record.ID)
+			if readErr != nil || !settled.Equal(record) {
+				return nil, errors.Join(readErr, rebalance.ErrReplicatedMove)
+			}
+		}
+	}
+	actions := make([]rebalance.Action, len(plans))
+	var failures error
+	for index, plan := range plans {
+		action, err := controller.Resume(ctx, plan.OperationID())
+		actions[index] = action
+		failures = errors.Join(failures, err)
+	}
+	return actions, failures
+}
+
 // Resume executes one journaled step for an already submitted move.
 func (controller *Controller) Resume(
 	ctx context.Context, operation rebalance.OperationID,
