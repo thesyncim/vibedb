@@ -27,6 +27,7 @@ Start with the page that matches your task.
 - [Offline verification, salvage, and repack](operations/verification.md)
 - [Start a three-node replicated shard](operations/distributed-quickstart.md)
 - [Distributed runtime](operations/distributed.md)
+- [Roll out a replicated schema](operations/schema-rollouts.md)
 - [Replica lifecycle](operations/replica-lifecycle.md)
 - [Kubernetes RF3 test lane](operations/kubernetes.md)
 - [Performance tests](performance.md)
