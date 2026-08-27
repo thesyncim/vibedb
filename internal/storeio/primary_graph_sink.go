@@ -23,6 +23,39 @@ type PrimaryGraphBuildSink interface {
 
 type transactionPrimaryGraphSink struct{ tx *WriteTransaction }
 
+// AllocatePage and the Build* accessors let a live transaction participate in
+// the same sink abstraction directly. They are deliberately thin aliases over
+// Allocate and its immutable transaction options.
+func (t *WriteTransaction) AllocatePage(
+	kind PageKind, length uint32, logicalID uint64,
+) (PrimaryGraphBuildPage, error) {
+	p, err := t.Allocate(kind, length, logicalID)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+func (t *WriteTransaction) StoreIdentity() [16]byte    { return t.StoreID() }
+func (t *WriteTransaction) BuildGeneration() uint64    { return t.Generation() }
+func (t *WriteTransaction) BuildFileEnd() uint64       { return t.FileEnd() }
+func (t *WriteTransaction) BuildNextLogicalID() uint64 { return t.NextLogicalID() }
+func (t *WriteTransaction) MaxBuildPageBytes() int {
+	if t == nil || t.committer == nil {
+		return 0
+	}
+	return t.committer.bufferSize
+}
+
+// NewTransactionPrimaryGraphSink exposes the same allocation sink used by the
+// primary builder to sibling schema/index/overflow builders. The adapter owns
+// nothing and remains valid only while tx is active.
+func NewTransactionPrimaryGraphSink(tx *WriteTransaction) (PrimaryGraphBuildSink, error) {
+	if tx == nil || !tx.active || tx.batch == nil {
+		return nil, ErrBatchState
+	}
+	return transactionPrimaryGraphSink{tx: tx}, nil
+}
+
 func (s transactionPrimaryGraphSink) AllocatePage(kind PageKind, length uint32, logicalID uint64) (PrimaryGraphBuildPage, error) {
 	p, err := s.tx.Allocate(kind, length, logicalID)
 	if err != nil {
