@@ -114,6 +114,26 @@ func BenchmarkDurableSQLMultiRowInsertLowering(b *testing.B) {
 	}
 }
 
+func BenchmarkDurableSQLFiniteDeleteLowering(b *testing.B) {
+	snapshot, planner, _ := replicatedSQLSplitTransactionFixture(b)
+	profile := planner.profileFor(ClassInteractive)
+	for _, rows := range []int{2, 16, 64} {
+		query := durableSQLFiniteDelete(rows)
+		b.Run(strconv.Itoa(rows), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+					context.Background(), snapshot, []Query{query}, profile, nil,
+				)
+				if err != nil || !handled || len(participants) == 0 {
+					b.Fatal(err)
+				}
+				durableSQLPerfParticipants = participants
+			}
+		})
+	}
+}
+
 func durableSQLPerfQueries(messages int) []Query {
 	queries := make([]Query, 0, messages+1)
 	for index := range messages {
@@ -143,5 +163,20 @@ func durableSQLMultiRowInsert(rows int) Query {
 			`{"id":"multi-row-` + strconv.Itoa(index) + `","n":1}`,
 		)
 	}
+	return Query{SQL: sql.String(), Class: ClassInteractive, Params: params}
+}
+
+func durableSQLFiniteDelete(rows int) Query {
+	var sql strings.Builder
+	sql.WriteString("DELETE FROM messages WHERE id IN (")
+	params := make([]shardservice.Param, rows)
+	for index := range rows {
+		if index != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteByte('?')
+		params[index] = shardservice.StringParam("multi-delete-" + strconv.Itoa(index))
+	}
+	sql.WriteByte(')')
 	return Query{SQL: sql.String(), Class: ClassInteractive, Params: params}
 }

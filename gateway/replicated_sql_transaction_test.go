@@ -305,6 +305,42 @@ func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testi
 	}
 }
 
+func TestReplicatedSQLTransactionLowersFiniteDeleteAcrossRF3Shards(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
+	participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, []Query{{
+			SQL: `DELETE FROM messages WHERE id IN (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(keys[0]), shardservice.StringParam(keys[1]),
+			},
+		}}, executor.profileFor(ClassInteractive),
+	)
+	if err != nil || !handled {
+		t.Fatalf("plan handled=%v err=%v", handled, err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
+	}
+	mutations := 0
+	for participantIndex := range participants {
+		participant := &participants[participantIndex]
+		if len(participant.IntentScopes) != 1 || len(participant.Batches) != 1 ||
+			participant.Batches[0].Relation != 1 {
+			t.Fatalf("participant %d=%+v", participantIndex, participant)
+		}
+		for mutationIndex := range participant.Batches[0].Mutations {
+			if participant.Batches[0].Mutations[mutationIndex].Kind != replication.MutationDelete {
+				t.Fatalf("participant %d mutation %d kind=%d", participantIndex, mutationIndex,
+					participant.Batches[0].Mutations[mutationIndex].Kind)
+			}
+			mutations++
+		}
+	}
+	if mutations != 2 {
+		t.Fatalf("mutations=%d want=2", mutations)
+	}
+}
+
 func replicatedSQLSplitTransactionFixture(
 	t testing.TB,
 ) (*Snapshot, *Executor, [2]string) {

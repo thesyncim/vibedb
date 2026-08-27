@@ -230,6 +230,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
 
+			indexStart := len(statement.bound.globalIndexes)
 			baseMutation := replication.Mutation{Kind: kind, Key: ownedKey, Value: document}
 			if len(statement.prepared.writeGlobalIndexes) != 0 &&
 				(statement.bound.kind == sqlast.KindUpdate || statement.bound.kind == sqlast.KindDelete) {
@@ -276,7 +277,10 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				participant: participantIndex, relation: statement.profile.Relation, key: ownedKey,
 			})
 
-			indexStart, indexEnd := replicatedSQLGlobalIndexRange(statement, inputOrdinal)
+			indexEnd := len(statement.bound.globalIndexes)
+			if statement.bound.kind == sqlast.KindInsert {
+				indexStart, indexEnd = replicatedSQLGlobalIndexRange(statement, inputOrdinal)
+			}
 			for indexOrdinal := indexStart; indexOrdinal < indexEnd; indexOrdinal++ {
 				index := &statement.bound.globalIndexes[indexOrdinal]
 				indexRoute, indexProfile, routeErr := snapshot.resolveReplicatedSQLGlobalIndex(index)
@@ -430,15 +434,17 @@ func replicatedSQLMutationInputCount(
 		deleteStatement := prepared.statement.Delete
 		if deleteStatement == nil || deleteStatement.Returning != nil ||
 			len(deleteStatement.OrderBy) != 0 || deleteStatement.Limit != nil ||
-			deleteStatement.All || !replicatedSQLExactPrimaryFilter(
+			deleteStatement.All || !replicatedSQLFinitePrimaryFilter(
 			deleteStatement.Filter, statement.profile.PrimaryKey,
 		) {
 			return 0, ErrReplicatedSQLTransactionUnsupported
 		}
-		if _, ok := replicatedSQLExactConstraint(bound.constraints); !ok {
+		if len(bound.constraints) != 1 ||
+			bound.constraints[0].Kind != distribution.DomainFinite ||
+			len(bound.constraints[0].Values) == 0 {
 			return 0, ErrReplicatedSQLTransactionUnsupported
 		}
-		return 1, nil
+		return len(bound.constraints[0].Values), nil
 	default:
 		return 0, ErrReplicatedSQLTransactionUnsupported
 	}
@@ -472,11 +478,12 @@ func replicatedSQLMutationInput(
 		}
 		return scalar, bound.updateDoc, replication.MutationPutPresent, nil
 	case sqlast.KindDelete:
-		scalar, ok := replicatedSQLExactConstraint(bound.constraints)
-		if !ok || ordinal != 0 {
+		if len(bound.constraints) != 1 ||
+			bound.constraints[0].Kind != distribution.DomainFinite ||
+			ordinal >= len(bound.constraints[0].Values) {
 			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
 		}
-		return scalar, nil, replication.MutationDelete, nil
+		return bound.constraints[0].Values[ordinal], nil, replication.MutationDelete, nil
 	default:
 		return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
 	}
@@ -664,6 +671,40 @@ func replicatedSQLExactPrimaryFilter(filter *sqlast.SelectStmt, primary string) 
 		where.Agg != sqlast.AggNone || where.Column != -1 || where.Path == nil ||
 		where.Path.Source != 0 || where.Path.MergedUsing != 0 || where.RightPath != nil ||
 		where.Subquery != nil || len(where.Kids) != 0 {
+		return false
+	}
+	var pointer [replication.MaxIdentityBytes]byte
+	encoded := where.Path.AppendPointer(pointer[:0])
+	return vibejson.BytesEqualString(encoded, primary)
+}
+
+// replicatedSQLFinitePrimaryFilter accepts exactly one positive primary-key
+// equality or membership predicate and no residual SQL operator. The bound
+// constraint must still prove a non-empty finite domain before lowering. This
+// makes DELETE ... IN (...) a native set of exact conditional mutations rather
+// than a read-before-write scatter.
+func replicatedSQLFinitePrimaryFilter(filter *sqlast.SelectStmt, primary string) bool {
+	if filter == nil || filter.Where == nil || filter.With != nil || filter.Set != nil ||
+		len(filter.From) != 1 || filter.Having != nil || len(filter.GroupBy) != 0 ||
+		len(filter.OrderBy) != 0 || filter.Limit != nil || filter.Offset != nil {
+		return false
+	}
+	where := filter.Where
+	if where.Negated || where.Agg != sqlast.AggNone || where.Column != -1 ||
+		where.Path == nil || where.Path.Source != 0 || where.Path.MergedUsing != 0 ||
+		where.RightPath != nil || where.Subquery != nil || len(where.Kids) != 0 {
+		return false
+	}
+	switch where.Kind {
+	case sqlast.ExprCompare:
+		if where.Op != sqlast.OpEq {
+			return false
+		}
+	case sqlast.ExprIn:
+		if len(where.List) == 0 {
+			return false
+		}
+	default:
 		return false
 	}
 	var pointer [replication.MaxIdentityBytes]byte
