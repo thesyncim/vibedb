@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/asn1"
 	"errors"
 	"fmt"
@@ -36,19 +35,10 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
-	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
 const durableRF3ExternalEnvironment = "VIBEDB_DURABLE_RF3_PROCESS_E2E"
-
-const (
-	durableRF3CatalogGroup = iota
-	durableRF3LedgerGroup
-	durableRF3DataAGroup
-	durableRF3DataBGroup
-	durableRF3ExternalGroups
-)
 
 const (
 	durableRF3ExternalVoters = 3
@@ -56,8 +46,6 @@ const (
 	// independent observation principal all carry distinct certificate IDs.
 	durableRF3ExternalNodes = 7
 )
-
-var durableRF3ExternalRoleNames = [...]string{"catalog", "request-ledger", "data-a", "data-b"}
 
 // TestGatewayDurableRF3ExternalProcessRecovery is the black-box deployment
 // qualification for the shipped durable SQL path. Three shard OS processes
@@ -388,6 +376,7 @@ type durableRF3ExternalFixture struct {
 	catalogClose     func()
 
 	measurements *durableRF3ExternalMeasurements
+	seeded       bool
 }
 
 type durableRF3ExternalMeasurements struct {
@@ -435,60 +424,14 @@ func newDurableRF3ExternalFixture(
 		t.Fatal(err)
 	}
 
-	authority := sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 5,
-		ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13,
-		RoutingVersion: 17, RouteGeneration: 19}
+	profiles := durableRF3ExternalMemberProfiles()
+	authority := profiles[durableRF3CatalogGroup].Authority
 	wal := durableRF3ExternalWALOptions()
 	key := raftstore.Key{ID: "durable-rf3-process-key", Wrapped: []byte("external-wrapped-key")}
 	for index := range key.Material {
 		key.Material[index] = byte(index + 1)
 	}
-	apply := sqldriver.ReplicatedApplyOptions{MaxSessions: 96, RetryWindow: 16,
-		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 2048, MaxBytes: 256 << 20},
-		Placement: sqldriver.ReplicatedPlacementProfile{
-			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "id",
-			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
-			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
-		}}
-	ledgerIdentity := sha256.Sum256([]byte("vibedb/external-process/request-ledger/range\x00"))
-	tables := [...]string{"controlplane", "request_ledger_home", "orders_a", "orders_b"}
-	creates := [...]string{
-		"CREATE TABLE controlplane (PRIMARY KEY (id))",
-		"CREATE TABLE request_ledger_home (PRIMARY KEY (home))",
-		"CREATE TABLE orders_a (PRIMARY KEY (id))",
-		"CREATE TABLE orders_b (PRIMARY KEY (id))",
-	}
-	schemas := [durableRF3ExternalGroups][]string{
-		nil, nil,
-		{`CREATE INDEX by_kind_a ON orders_a (kind)`,
-			`CREATE TABLE orders_b_email (PRIMARY KEY (key))`},
-		{`CREATE INDEX by_kind_b ON orders_b (kind)`,
-			`CREATE TABLE orders_a_email (PRIMARY KEY (key))`},
-	}
-	// Each base shard owns its local exact index and the other table's global
-	// exact-index relation. Consequently every orders_a/orders_b mutation batch
-	// crosses both independently led RF3 groups while each group applies one
-	// base/local bundle and one remote global-index relation atomically.
-	globalIndexes := [durableRF3ExternalGroups][]sqldriver.ReplicatedGlobalIndexRelation{
-		nil, nil,
-		{{Relation: 2, Table: "orders_b_email", IndexID: 42, Incarnation: 1,
-			LocatorCount: 1, Unique: true,
-			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
-			TupleVersion:  distribution.CurrentTupleVersion,
-			MapperVersion: distribution.NativeMapperVersion,
-			BucketBits:    distribution.DefaultVirtualBucketBits}},
-		{{Relation: 2, Table: "orders_a_email", IndexID: 41, Incarnation: 1,
-			LocatorCount: 1, Unique: true,
-			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
-			TupleVersion:  distribution.CurrentTupleVersion,
-			MapperVersion: distribution.NativeMapperVersion,
-			BucketBits:    distribution.DefaultVirtualBucketBits}},
-	}
-	seed := [durableRF3ExternalGroups][][]byte{
-		nil, nil,
-		{[]byte(`{"id":"seed-a","kind":"seed","email":"seed-a@example.test","value":1}`)},
-		{[]byte(`{"id":"seed-b","kind":"seed","email":"seed-b@example.test","value":2}`)},
-	}
+	ledgerIdentity := profiles[durableRF3LedgerGroup].Apply.RequestLedgerRangeIdentity
 	var prepared [durableRF3ExternalGroups][durableRF3ExternalVoters]rf3testfixture.PreparedProcessMember
 	var memberNodes [3]rafttransport.NodeID
 	var peerAddresses [3]string
@@ -497,24 +440,19 @@ func newDurableRF3ExternalFixture(
 		peerAddresses[member] = fixture.listeners[member].Peer
 	}
 	for group := 0; group < durableRF3ExternalGroups; group++ {
-		groupApply := apply
-		if group == durableRF3LedgerGroup {
-			groupApply.RequestLedgerCapacityBytes = 64 << 20
-			groupApply.RequestLedgerCleanupReserveBytes = 8 << 20
-			groupApply.RequestLedgerRangeIdentity = ledgerIdentity
-		}
+		profile := profiles[group]
 		for member := 0; member < durableRF3ExternalVoters; member++ {
 			prepared[group][member], err = rf3testfixture.PrepareProcessMember(
 				rf3testfixture.ProcessMemberOptions{
 					Root:        filepath.Join(fixture.root, fmt.Sprintf("role-%d-member-%d", group, member+1)),
 					ControlRoot: filepath.Join(fixture.root, fmt.Sprintf("node-%d-control", member+1)),
-					Table:       tables[group], CreateTable: creates[group], Identity: fixture.identities[group][member],
+					Table:       profile.Table, CreateTable: profile.CreateTable, Identity: fixture.identities[group][member],
 					Key: key, WAL: wal, Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-					Authority: authority, Apply: groupApply, Listeners: fixture.listeners[member],
+					Authority: profile.Authority, Apply: profile.Apply, Listeners: fixture.listeners[member],
 					Credential: fixture.credentials[member], Roots: fixture.roots,
 					AuthorizationPolicy: fixture.policy, Nodes: memberNodes,
-					PeerAddresses: peerAddresses, SeedDocuments: seed[group],
-					SchemaStatements: schemas[group], GlobalIndexes: globalIndexes[group],
+					PeerAddresses: peerAddresses, SeedDocuments: profile.SeedDocuments,
+					SchemaStatements: profile.SchemaStatements, GlobalIndexes: profile.GlobalIndexes,
 				},
 			)
 			if errors.Is(err, storeio.ErrStrictAllocationUnsupported) ||
@@ -546,17 +484,17 @@ func newDurableRF3ExternalFixture(
 	}
 	built, err := rf3testfixture.NewDurableCatalog(rf3testfixture.DurableCatalogOptions{
 		Generation: 1, AckKey: ackKey, Groups: []rf3testfixture.DurableCatalogGroup{
-			{Route: fixture.routes[durableRF3CatalogGroup], Table: tables[durableRF3CatalogGroup],
+			{Route: fixture.routes[durableRF3CatalogGroup], Table: profiles[durableRF3CatalogGroup].Table,
 				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20},
-			{Route: fixture.routes[durableRF3LedgerGroup], Table: tables[durableRF3LedgerGroup],
+			{Route: fixture.routes[durableRF3LedgerGroup], Table: profiles[durableRF3LedgerGroup].Table,
 				PrimaryKey: "/home", LedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{
 					Identity: replication.Digest(ledgerIdentity),
 				}}},
-			{Route: fixture.routes[durableRF3DataAGroup], Table: tables[durableRF3DataAGroup],
+			{Route: fixture.routes[durableRF3DataAGroup], Table: profiles[durableRF3DataAGroup].Table,
 				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
 				AdditionalTables: []rf3testfixture.DurableCatalogTable{{Table: "orders_b_email",
 					PrimaryKey: "/email", Relation: 2, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20}}},
-			{Route: fixture.routes[durableRF3DataBGroup], Table: tables[durableRF3DataBGroup],
+			{Route: fixture.routes[durableRF3DataBGroup], Table: profiles[durableRF3DataBGroup].Table,
 				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
 				AdditionalTables: []rf3testfixture.DurableCatalogTable{{Table: "orders_a_email",
 					PrimaryKey: "/email", Relation: 2, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20}}},
@@ -714,15 +652,6 @@ func durableRF3ExternalPolicy(t testing.TB, nodes []rafttransport.NodeID) []byte
 	return raw
 }
 
-func durableRF3ExternalWALOptions() raftstore.Options {
-	return raftstore.Options{
-		MaxFileBytes: int64(raftstore.HeaderBytes+raftstore.MaxSnapshotBaseRecordBytes+
-			raftstore.MinimumReadyRecordBytes) + raftstore.MinimumReadyLiveBytes,
-		MaxRecordBytes: raftstore.MinimumReadyRecordBytes, MaxRecords: 2,
-		MaxEntries: raftstore.MaxReadyEntries, MaxLiveBytes: raftstore.MinimumReadyLiveBytes,
-	}
-}
-
 func durableRF3ExternalRoute(
 	identities [4]raftstore.Identity,
 	listeners [4]rf3testfixture.ProcessListeners,
@@ -861,7 +790,7 @@ func (fixture *durableRF3ExternalFixture) startShards(t testing.TB) {
 }
 
 func (fixture *durableRF3ExternalFixture) startGateway(
-	t testing.TB,
+	t *testing.T,
 	process *rf3testfixture.ExternalProcess,
 ) {
 	t.Helper()
@@ -870,6 +799,26 @@ func (fixture *durableRF3ExternalFixture) startGateway(
 	}
 	if err := process.WaitReady(fixture.ctx, "vibedb-gateway serving catalog generation"); err != nil {
 		t.Fatalf("gateway readiness: %v\n%s", err, process.Diagnostics())
+	}
+	if !fixture.seeded {
+		// Bundle activation requires unmaterialized base/index tables. Seeding
+		// through the shipped transaction path also initializes both remote
+		// global indexes instead of leaving the initial rows unindexed.
+		node, address := fixture.gatewayANode, fixture.gatewayAAddress
+		if process == fixture.gatewayB {
+			node, address = fixture.gatewayBNode, fixture.gatewayBAddress
+		}
+		client := fixture.dialGateway(t, node, address)
+		defer client.close()
+		reference, _ := client.openIssuerInstallation(t, 0x92)
+		request := hotMutationRequest(t, reference, 1, []serveStatement{
+			{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-a","kind":"seed","email":"seed-a@example.test","value":1}`}}},
+			{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-b","kind":"seed","email":"seed-b@example.test","value":2}`}}},
+		})
+		response, _ := client.roundTrip(t, request)
+		durableRF3ExternalAssertCommitted(t, response, 2, 2)
+		client.ackTerminal(t, response)
+		fixture.seeded = true
 	}
 }
 
