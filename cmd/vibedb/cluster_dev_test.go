@@ -605,6 +605,7 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 	wal := minimumDevTestWALOptions()
 	var portable [3]sqldriver.ReplicatedSchemaCatalogImage
 	var local [3][32]byte
+	var machine [3][32]byte
 	var profiles [3]gateway.ReplicatedTableProfile
 	for index := range profiles {
 		root := filepath.Join(t.TempDir(), "member")
@@ -660,6 +661,10 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 			t.Fatal(err)
 		}
 		local[index] = prepared.Base.RelationManifestDigest
+		machine[index], err = prepared.Apply.RangeSplitRelationManifestDigest()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err = prepared.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -681,13 +686,14 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 		}
 		if portable[index].RelationManifestDigest != portable[0].RelationManifestDigest ||
 			portable[index].ApplyProfileDigest != portable[0].ApplyProfileDigest ||
-			profiles[index] != profiles[0] {
+			profiles[index] != profiles[0] || machine[index] != machine[0] {
 			t.Fatalf("portable profile diverged: %+v != %+v", profiles[index], profiles[0])
 		}
 	}
 	if profiles[0].Table != devDataTable || profiles[0].PrimaryKey != devDataPrimaryKey ||
 		profiles[0].Relation != 1 || profiles[0].SchemaGeneration != 1 ||
-		profiles[0].RelationManifestDigest != replication.Digest(portable[0].RelationManifestDigest) {
+		profiles[0].RelationManifestDigest != replication.Digest(machine[0]) ||
+		profiles[0].RelationManifestDigest == replication.Digest(portable[0].RelationManifestDigest) {
 		t.Fatalf("portable data profile=%+v image=%+v", profiles[0], portable[0])
 	}
 }

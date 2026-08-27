@@ -835,13 +835,13 @@ func inspectDevPreparedRoute(
 			return devPreparedRoute{}, profileErr
 		}
 		if index == 0 {
-			result.digest = image.RelationManifestDigest
+			result.digest = [32]byte(profile.RelationManifestDigest)
 			result.applyDigest = image.ApplyProfileDigest
 			result.schemaGeneration = image.SchemaGeneration
 			if publishTable {
 				result.table = profile
 			}
-		} else if result.digest != image.RelationManifestDigest ||
+		} else if result.digest != [32]byte(profile.RelationManifestDigest) ||
 			result.applyDigest != image.ApplyProfileDigest ||
 			result.schemaGeneration != image.SchemaGeneration ||
 			publishTable && result.table != profile {
@@ -1029,13 +1029,14 @@ func readDevReplicatedTableProfile(
 	if err != nil {
 		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
 	}
-	if err := database.Close(); err != nil {
+	manifestDigest, manifestErr := database.ReplicatedRelationManifestForBinding(identity, apply.Placement, identity.Binding)
+	if err := errors.Join(manifestErr, database.Close()); err != nil {
 		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
 	}
 	return gateway.ReplicatedTableProfile{
 		Table: table, Relation: replication.RelationID(relation.Relation),
 		PrimaryKey: primaryKey, SchemaGeneration: image.SchemaGeneration,
-		RelationManifestDigest: replication.Digest(image.RelationManifestDigest),
+		RelationManifestDigest: replication.Digest(manifestDigest),
 		MaxKeyBytes:            uint16(identity.UserLimits.MaxKeyBytes),
 		MaxDocumentBytes:       uint32(identity.UserLimits.MaxDocumentBytes),
 	}, nil
