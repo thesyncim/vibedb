@@ -110,7 +110,7 @@ func OpenRestoredReplicaState(root string) (RestoredReplicaState, error) {
 	var allocation restoreReplicaAllocation
 	found, err := readRestoreVibe(filepath.Join(root, "allocation.vibejson"), &allocation)
 	if err != nil || !found || allocation.Format != 1 || len(allocation.Operation) != 64 ||
-		len(allocation.LogID) != 32 || len(allocation.UserStorage) != 32 {
+		len(allocation.LogID) != 32 || len(allocation.UserStorage) != sha256.Size*2 {
 		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
 	}
 	var receipt restoreReplicaReceipt
@@ -132,7 +132,8 @@ func OpenRestoredReplicaState(root string) (RestoredReplicaState, error) {
 		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
 	}
 	var operation [sha256.Size]byte
-	if decodeRestoreHex(operation[:], receipt.Operation) != nil {
+	if decodeRestoreHex(operation[:], receipt.Operation) != nil ||
+		allocation.UserStorage != restoreStorageIdentity(operation, allocation.GroupOrdinal, allocation.ReplicaOrdinal) {
 		return RestoredReplicaState{}, ErrBootstrap
 	}
 	var targets [3]RestoredReplicaTarget
@@ -667,7 +668,8 @@ func readRestoreAllocation(path string, operation clusterrestore.Operation, grou
 		return value, found, err
 	}
 	if value.Format != 1 || value.Operation != hex.EncodeToString(operation.Digest[:]) ||
-		value.GroupOrdinal != group || value.ReplicaOrdinal != replica || len(value.UserStorage) != 32 {
+		value.GroupOrdinal != group || value.ReplicaOrdinal != replica ||
+		value.UserStorage != restoreStorageIdentity(operation.Digest, group, replica) {
 		return value, false, ErrBootstrap
 	}
 	return value, true, nil
@@ -735,7 +737,7 @@ func restoreStorageIdentity(operation [sha256.Size]byte, group uint32, replica u
 	h.Write([]byte("vibedb/kubeoperator/restore-storage/format-1\x00"))
 	h.Write(operation[:])
 	h.Write([]byte{byte(group >> 24), byte(group >> 16), byte(group >> 8), byte(group), replica})
-	return hex.EncodeToString(h.Sum(nil)[:16])
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func decodeRestoreHex(destination []byte, raw string) error {

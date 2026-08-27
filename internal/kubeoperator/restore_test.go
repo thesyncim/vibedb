@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -17,6 +19,39 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
+
+func TestRestoreStorageAllocationUsesFullCanonicalIdentity(t *testing.T) {
+	operation := clusterrestore.Operation{Digest: sha256.Sum256([]byte("restore-operation"))}
+	storage := restoreStorageIdentity(operation.Digest, 7, 2)
+	decoded, err := hex.DecodeString(storage)
+	if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != storage {
+		t.Fatalf("storage is not a full canonical 256-bit identity: %q %v", storage, err)
+	}
+	if restoreStorageIdentity(operation.Digest, 7, 2) != storage ||
+		restoreStorageIdentity(operation.Digest, 6, 2) == storage ||
+		restoreStorageIdentity(operation.Digest, 7, 1) == storage ||
+		restoreStorageIdentity(sha256.Sum256([]byte("other-operation")), 7, 2) == storage {
+		t.Fatal("storage identity is not deterministic and operation/group/replica scoped")
+	}
+	path := filepath.Join(t.TempDir(), "allocation.vibejson")
+	allocation := restoreReplicaAllocation{Format: 1, Operation: hex.EncodeToString(operation.Digest[:]),
+		GroupOrdinal: 7, ReplicaOrdinal: 2, LogID: strings.Repeat("ab", 16), UserStorage: storage}
+	if err := writeRestoreVibe(path, &allocation); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := readRestoreAllocation(path, operation, 7, 2); err != nil || !found {
+		t.Fatalf("exact allocation rejected: found=%v err=%v", found, err)
+	}
+	for _, invalid := range []string{storage[:32], strings.ToUpper(storage), strings.Repeat("ab", 32)} {
+		allocation.UserStorage = invalid
+		if err := writeRestoreVibe(path, &allocation); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := readRestoreAllocation(path, operation, 7, 2); err == nil || found {
+			t.Fatalf("invalid allocation accepted: %q", invalid)
+		}
+	}
+}
 
 func TestRestoreGroupRejectsUnboundTemplateBeforeCreatingState(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "restore")
