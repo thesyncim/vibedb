@@ -208,8 +208,7 @@ func (a *rf3SchemaActivator) exactInstallation(
 	)
 	if err != nil || !found ||
 		schemainstall.InstallationDigest(request,
-			schemainstall.MaterializedArtifactDigest(request.BundleDigest, witness)) != installation ||
-		authorization.TargetCatalogDigest != request.BundleDigest {
+			schemainstall.MaterializedArtifactDigest(request.BundleDigest, witness)) != installation {
 		clear(raw)
 		return nil, nil, errors.Join(err, schemainstall.ErrConflict)
 	}
