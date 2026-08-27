@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,7 +183,41 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		t.Fatal(err)
 	}
 	gatewayExited := make(chan error, 1)
-	go func() { gatewayExited <- command.Wait() }()
+	go func(command *exec.Cmd, exited chan error) { exited <- command.Wait() }(command, gatewayExited)
+	restarts := 0
+	var exitedPeakRSS uint64
+	restartQuiescedGateway := func() {
+		t.Helper()
+		select {
+		case exitErr := <-gatewayExited:
+			if restarts >= 2 || !strings.Contains(diagnostic.String(), gateway.ErrReplicatedCatalogRouteRestartRequired.Error()) {
+				t.Fatalf("unexpected gateway exit: %v\n%s", exitErr, diagnostic.String())
+			}
+			usage, ok := command.ProcessState.SysUsage().(*syscall.Rusage)
+			if !ok || usage.Maxrss <= 0 {
+				t.Fatal("missing exited gateway peak RSS")
+			}
+			peak := uint64(usage.Maxrss)
+			if runtime.GOOS == "linux" {
+				peak <<= 10 // Linux reports KiB; Darwin reports bytes.
+			}
+			exitedPeakRSS = max(exitedPeakRSS, peak)
+			// Catalog self-placement changes deliberately quiesce and destroy
+			// the old bound session before promoting the certified route seed.
+			// Model the deployment supervisor by restarting the same executable
+			// with the same durable files, never by reseeding the catalog.
+			restarts++
+			diagnostic = &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
+			command = exec.Command(gatewayBinary, arguments...)
+			command.Stdout, command.Stderr = diagnostic, diagnostic
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			gatewayExited = make(chan error, 1)
+			go func(command *exec.Cmd, exited chan error) { exited <- command.Wait() }(command, gatewayExited)
+		default:
+		}
+	}
 	defer func() {
 		if command.Process != nil {
 			_ = command.Process.Signal(syscall.SIGTERM)
@@ -251,10 +286,13 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 
 	var final *gateway.Snapshot
 	for time.Now().Before(deadline) {
+		restartQuiescedGateway()
 		candidate, readErr := authority.Read(t.Context())
 		if readErr == nil && candidate.Generation() >= 3 {
-			final = candidate
-			break
+			if currentIDs, idsErr := authority.ReadOperationIDs(t.Context()); idsErr == nil && len(currentIDs) == 0 {
+				final = candidate
+				break
+			}
 		}
 		if currentIDs, idsErr := authority.ReadOperationIDs(t.Context()); idsErr == nil {
 			maximumOperations = max(maximumOperations, len(currentIDs))
@@ -262,6 +300,10 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		time.Sleep(50 * time.Millisecond)
 	}
 	if final == nil {
+		for _, id := range ids {
+			record, readErr := authority.ReadOperation(t.Context(), id)
+			t.Logf("hot move diagnostic: state=%d revision=%d catalog=%d cursor=%v err=%v", record.State, record.Revision, record.CatalogGeneration, record.Cursor, readErr)
+		}
 		t.Fatalf("automatic replica move did not publish final catalog\n%s", diagnostic.String())
 	}
 	var workspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
@@ -280,12 +322,21 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	if !targetFound || maximumOperations > 1 {
 		t.Fatalf("final route=%+v max_operations=%d", route, maximumOperations)
 	}
+	if restarts != 2 {
+		t.Fatalf("catalog self-move handoffs=%d, want exactly two durable route-seed restarts", restarts)
+	}
+	finalConnection := gatewayHotShardDialGateway(t, fixture.clientProfile, fixture.gatewayNode,
+		gatewayAddress, diagnostic, gatewayExited)
+	defer finalConnection.Close()
+	gatewayHotShardDriveReads(t, finalConnection, 1)
 	record, err := authority.ReadPressureRecord(t.Context())
 	if err != nil || len(record.Payload) == 0 || len(record.Payload) > hotshard.MaxStaticCapacityBytes {
 		t.Fatalf("bounded pressure record bytes=%d err=%v", len(record.Payload), err)
 	}
 
-	finalRSS := gatewayHotShardProcessRSS(t, command.Process.Pid)
+	// Supervisor restarts must not erase the old processes' memory high-water
+	// marks from the existing resource gate.
+	finalRSS := max(exitedPeakRSS, gatewayHotShardProcessRSS(t, command.Process.Pid))
 	const maximumRSSGrowth = uint64(128 << 20)
 	if finalRSS > baselineRSS && finalRSS-baselineRSS > maximumRSSGrowth {
 		t.Fatalf("gateway RSS growth=%d exceeds %d", finalRSS-baselineRSS, maximumRSSGrowth)
@@ -301,8 +352,8 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		t.Fatalf("control amplification connections=%d rejected=%d bytes=%d peak=%d",
 			accepted, rejected, bytes, peak)
 	}
-	t.Logf("hot-move live qualification: foreground_reads=%d p99=%s max_operations=%d pressure_bytes=%d control_connections=%d rejected=%d control_bytes=%d peak_connections=%d rss_growth=%d",
-		len(latencies), p99, maximumOperations, len(record.Payload), accepted, rejected, bytes, peak,
+	t.Logf("hot-move live qualification: initial_leader=%d foreground_reads=%d p99=%s max_operations=%d pressure_bytes=%d control_connections=%d rejected=%d control_bytes=%d peak_connections=%d rss_growth=%d",
+		states[0].LeaderID, len(latencies), p99, maximumOperations, len(record.Payload), accepted, rejected, bytes, peak,
 		max(finalRSS, baselineRSS)-baselineRSS)
 }
 

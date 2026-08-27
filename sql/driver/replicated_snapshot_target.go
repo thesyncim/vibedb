@@ -21,7 +21,12 @@ func (d *Database) PrepareReplicatedSnapshotTarget(
 // Ordinary initialized Raft stores cannot enter this recovery path.
 func OpenReplicatedSnapshotTarget(
 	path string, expected ReplicatedShardStoreIdentity, expectedApply ReplicatedApplyIdentity,
+	openingOptions ...ReplicatedOpenOptions,
 ) (*Database, error) {
+	options, err := replicatedOpeningOptions(openingOptions)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, err
 	}
@@ -32,6 +37,7 @@ func OpenReplicatedSnapshotTarget(
 		mode:                    shardStoreOpenReplicatedSnapshotTarget,
 		expectedReplicated:      ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply: expectedApply,
+		openOptions:             options,
 	})
 	if err != nil {
 		return nil, err

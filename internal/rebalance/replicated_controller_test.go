@@ -109,11 +109,12 @@ func (observer *fixedMoveObserver) ObserveReplicaMove(
 }
 
 type moveActionExecutor struct {
-	journal *memoryMoveJournal
-	calls   []Action
-	fail    error
-	unknown bool
-	bound   bool
+	journal    *memoryMoveJournal
+	calls      []Action
+	executions []ReplicatedMoveExecution
+	fail       error
+	unknown    bool
+	bound      bool
 }
 
 func (executor *moveActionExecutor) ExecuteReplicaMove(
@@ -121,6 +122,7 @@ func (executor *moveActionExecutor) ExecuteReplicaMove(
 ) error {
 	action := execution.Action
 	executor.calls = append(executor.calls, action)
+	executor.executions = append(executor.executions, execution)
 	executor.bound = plan.SnapshotBaseBound()
 	if executor.unknown {
 		executor.unknown = false
@@ -188,6 +190,50 @@ func TestReplicatedMoveControllerSettlesEveryCrashBoundary(t *testing.T) {
 		journal.record.Revision != 6 {
 		t.Fatalf("next action=%+v calls=%d record=%+v err=%v",
 			action, len(executor.calls), journal.record, err)
+	}
+}
+
+func TestReplicatedMoveSnapshotRetryRetainsExactExecution(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	observer := &fixedMoveObserver{cut: ReplicatedMoveCut{Observation: Observation{
+		Catalog: catalog,
+		Publication: raftmodel.Publication{
+			Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf,
+		},
+		LeaderStatus: leaderStatus(1, 5),
+	}}}
+	journal := &memoryMoveJournal{}
+	executor := &moveActionExecutor{journal: journal}
+	if _, err := ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), plan, journal, observer, executor); err != nil {
+		t.Fatal(err)
+	}
+	observer.cut.Publication = raftmodel.Publication{
+		Applied: 6, ReplicaSetVersion: 6, ConfState: plan.learnerConf,
+	}
+	observer.cut.LeaderStatus = leaderStatus(1, 6)
+	lostReply := errors.New("snapshot response lost")
+	executor.fail = lostReply
+	action, err := ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor)
+	if !errors.Is(err, lostReply) || action.Kind != ActionCreateSnapshotBase {
+		t.Fatalf("snapshot action=%+v err=%v", action, err)
+	}
+	witness := executor.executions[len(executor.executions)-1]
+	revision := journal.record.Revision
+	// When the catalog group itself is moving, journaling the executing phase
+	// advances this very publication. A retry must not create a different
+	// source export or bootstrap identity merely because the journal advanced.
+	observer.cut.Publication.Applied += 10
+	observer.cut.LeaderStatus = leaderStatus(1, observer.cut.Publication.Applied)
+	observer.cut.LeaderStatus.Term++
+	action, err = ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor)
+	if err != nil || action.Kind != ActionCreateSnapshotBase {
+		t.Fatalf("retry action=%+v err=%v", action, err)
+	}
+	if got := executor.executions[len(executor.executions)-1]; got != witness {
+		t.Fatalf("snapshot retry changed execution: before=%+v after=%+v", witness, got)
+	}
+	if journal.record.Revision != revision+1 || journal.record.Cursor[3] != replicaMoveCursorApplied {
+		t.Fatalf("retry replaced pending action: revision=%d cursor=%v", journal.record.Revision, journal.record.Cursor)
 	}
 }
 

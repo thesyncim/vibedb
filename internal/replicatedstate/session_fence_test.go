@@ -78,6 +78,58 @@ func TestSessionFenceStaleResultsExcludedAndReclaimed(t *testing.T) {
 	reopenFenceFixture(t, &f)
 }
 
+func TestSessionFenceNormalBatchAccountsGrowingAndShrinkingEnvelope(t *testing.T) {
+	batched := newNormalBatchFixture(t, 8, 1)
+	sequential := newNormalBatchFixture(t, 8, 1)
+	var commands [][]byte
+	for _, fixture := range []normalBatchFixture{batched, sequential} {
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		session := openDistinctBatchSessions(t, fixture.machine, fixture.binding, 2, 1)[0]
+		if commands == nil {
+			stale := session
+			stale.RoutingVersion++
+			fresh := session
+			fresh.ClientSequence++
+			commands = [][]byte{encodeCommand(t, stale), encodeCommand(t, fresh)}
+		}
+	}
+	initial, err := AppendState(nil, batched.machine.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ordinal, command := range commands {
+		entries := normalBatchEntries(uint64(ordinal)+3, command)
+		want, err := sequential.machine.ApplyNormal(entries[0].Meta, command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, publication, err := batched.machine.ApplyNormalBatch(entries, normalBatchWitnesses(entries))
+		if err != nil || n != 1 {
+			t.Fatalf("batch %d changed envelope geometry: applied=%d err=%v", ordinal, n, err)
+		}
+		assertPublicationEqual(t, publication, want)
+		encoded, err := AppendState(nil, batched.machine.state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBytes, _ := AppendState(nil, sequential.machine.state)
+		if !bytes.Equal(encoded, wantBytes) || (len(encoded) > len(initial)) != (ordinal == 0) {
+			t.Fatalf("batch %d state diverged from sequential encoding", ordinal)
+		}
+		if err := batched.group.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		batched = batched.crashReopen(t)
+		got, err := batched.machine.LookupCompletion(command)
+		wantCompletion, wantErr := sequential.machine.LookupCompletion(command)
+		if err != nil || wantErr != nil || !bytes.Equal(got.Bytes, wantCompletion.Bytes) {
+			t.Fatalf("reopened completion %d differs: %v %v", ordinal, err, wantErr)
+		}
+	}
+}
+
 // This helper isolates the accounting half of an already-authorized ownership
 // publication. Actual jump admission and durable capture authorization are
 // independently exercised by the rangesplit post-seal/reopen integration gate.

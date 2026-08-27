@@ -224,7 +224,10 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		execution.Recipe.Contract.AbortFinalWaveCount != abortWaves {
 		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 	}
-	if head.NextStepOrdinal > manifestCommands {
+	// Before a decision, recover prepares to retain any conflict. After the
+	// authenticated continuation records the decision, participants may already
+	// be applied/released: requiring their old prepare state strands recovery.
+	if state.branch == durableDistributedUndecided && head.NextStepOrdinal > manifestCommands {
 		stage = "prepared prefix recovery"
 		if err = progress.recoverPreparedPrefix(ctx, manifestCommands); err != nil {
 			return DurableRequestTerminalResult{}, err

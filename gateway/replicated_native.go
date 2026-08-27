@@ -854,6 +854,22 @@ type MembershipTransferWitness struct {
 	Term         uint64
 }
 
+// ObserveMembershipLeader returns a fresh authenticated serving identity from
+// the certified voters or enrolled target. Placement authority must still
+// match exactly; only a restart of the same physical member may advance its
+// incarnation. Control proposals must use this identity, not the bootstrap
+// incarnation retained in the catalog.
+func (executor *ReplicatedExecutor) ObserveMembershipLeader(ctx context.Context,
+	route ReplicatedMembershipRoute,
+) (shardservice.ReplicatedMemberState, error) {
+	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedMembershipRoute(route) {
+		return shardservice.ReplicatedMemberState{}, ErrReplicatedRoute
+	}
+	_, state, err := executor.discoverMembershipLeaderFresh(ctx, route, route.Serving.Replicas[0].Member,
+		serviceauthz.CapabilityMembership)
+	return state, err
+}
+
 // ObserveMembershipTransfer resolves a prior outcome-unknown transfer without
 // resending the transfer command. Success is an exact barrier: target is the
 // observed leader and its term is newer than the source term observed before
@@ -1174,6 +1190,14 @@ func (executor *ReplicatedExecutor) propose(
 	var lastUnknown error
 	if priorUnknown {
 		lastUnknown = raftservice.ErrOutcomeUnknown
+		// Recovery must probe afresh, but a later successful operation may
+		// already have discovered the replacement leader. Use that observation
+		// only to order the fresh probes, never as the proposal's serving fence.
+		// Otherwise each retained command pays the first (partitioned) voter's
+		// entire dial timeout again. Failed proposals invalidate this hint below.
+		if endpoint, _, ok := executor.leaderHints.lookup(route); ok {
+			preferred = endpoint.Member
+		}
 	}
 	hintPending := hint != nil
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
@@ -1540,15 +1564,21 @@ func (executor *ReplicatedExecutor) discoverLeader(
 }
 
 // discoverLeaderFresh always obtains a current authenticated handshake. It is
-// required after any proposal outcome becomes unknown: a latency hint must not
-// spend the retained command's bounded retry budget on the possibly failed
-// member that created the ambiguity.
+// required after any proposal outcome becomes unknown. A latency hint may
+// choose the first probe, but cannot supply the retained proposal's fence.
 func (executor *ReplicatedExecutor) discoverLeaderFresh(
 	ctx context.Context,
 	route ReplicatedRoute,
 	preferred uint64,
 	capability serviceauthz.Capability,
 ) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	if executor.parallelDiscovery() {
+		endpoint, state, err := executor.discoverResponsiveLeader(ctx, route, route.Replicas, preferred, capability, false)
+		if err == nil {
+			executor.leaderHints.publish(route, endpoint, state)
+		}
+		return endpoint, state, err
+	}
 	visited := uint64(0)
 	member := preferred
 	var joined error
@@ -1621,15 +1651,7 @@ func (executor *ReplicatedExecutor) discoverMembershipLeaderFresh(
 			}
 		}
 		visited |= uint8(1) << ordinal
-		response, err := executor.doReplicated(ctx, endpoint,
-			&shardservice.ReplicatedRequest{
-				Operation:  shardservice.ReplicatedProbe,
-				Capability: capability,
-				Fence: shardservice.ReplicatedFence{
-					Group:                route.Serving.Group,
-					AllocationGeneration: route.Serving.AllocationGeneration,
-				},
-			})
+		response, observedEndpoint, err := executor.probeReplicated(ctx, route.Serving, endpoint, capability)
 		if err != nil {
 			joined = errors.Join(joined, err)
 			member = 0
@@ -1651,7 +1673,7 @@ func (executor *ReplicatedExecutor) discoverMembershipLeaderFresh(
 			continue
 		}
 		if response.State.LeaderID == response.State.Fence.MemberID {
-			return endpoint, response.State, nil
+			return observedEndpoint, response.State, nil
 		}
 		member = response.State.LeaderID
 	}
@@ -1835,6 +1857,10 @@ func validReplicatedEndpoint(endpoint ReplicatedEndpoint) bool {
 
 func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
 	view, err := replication.OpenCommand(command)
+	if err == nil && catalogBootstrapRoute(route) && raftservice.CatalogCommandReplayMatchesFence(view,
+		raftservice.ServingFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration, Command: route.Command}) {
+		return true
+	}
 	return err == nil && view.ClusterID == route.Group.ClusterID &&
 		view.ClusterIncarnation == route.Group.ClusterIncarnation &&
 		view.TopologyRecoveryEpoch == route.Group.TopologyRecoveryEpoch &&

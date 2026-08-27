@@ -959,7 +959,8 @@ func newReplicatedCatalogGateway(
 		}
 		return gateway.NewNativeSession(gateway.NativeSessionOptions{
 			Executor: replicated, Route: sessionRoute,
-			Distribution: string(distributionName), Shard: string(shardID),
+			CatalogBootstrap: routeSeed,
+			Distribution:     string(distributionName), Shard: string(shardID),
 			Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID,
 			RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: relation},
 			Journal: journal, ProposalCapability: serviceauthz.CapabilityTopology,

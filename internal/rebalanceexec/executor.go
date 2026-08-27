@@ -6,6 +6,7 @@ package rebalanceexec
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -301,7 +302,7 @@ func (executor *Executor) executeSnapshot(
 	}
 	descriptor, err := executor.options.Snapshots.PrepareReplicaMoveSnapshot(ctx, sourceRequest)
 	if err != nil {
-		return err
+		return fmt.Errorf("rebalanceexec: prepare snapshot: %w", err)
 	}
 	if !descriptor.Valid() || descriptor.Group != plan.Group() ||
 		descriptor.SourceMember != plan.SnapshotSourceMember() ||
@@ -316,14 +317,17 @@ func (executor *Executor) executeSnapshot(
 			Operation: [32]byte(operation), Step: execution.Proof, Descriptor: descriptor,
 		})
 	if err != nil {
-		return err
+		return fmt.Errorf("rebalanceexec: bootstrap snapshot: %w", err)
 	}
 	if record.State != snapshottransfer.BootstrapComplete ||
 		record.Request.Operation != [32]byte(operation) ||
 		record.Request.Step != execution.Proof || record.Request.Descriptor != descriptor {
 		return ErrExecutionFence
 	}
-	return executor.options.Snapshots.ReleaseReplicaMoveSnapshot(ctx, sourceRequest, descriptor)
+	if err := executor.options.Snapshots.ReleaseReplicaMoveSnapshot(ctx, sourceRequest, descriptor); err != nil {
+		return fmt.Errorf("rebalanceexec: release snapshot: %w", err)
+	}
+	return nil
 }
 
 func (executor *Executor) executeOwnership(

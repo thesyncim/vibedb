@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -882,21 +883,33 @@ func TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions(t *
 		if !keyOK {
 			t.Fatalf("encode durable key %q", identifier)
 		}
+		leader := waitRF3Leader(t, ctx, cluster.owners[:], removedAck, cluster.groups[group].key)
+		cut := mustRF3State(t, ctx, cluster.owners[leader], cluster.groups[group].key).Status.Applied
+		waitRF3Applied(t, ctx, cluster.owners[:], removedAck, cluster.groups[group].key, cut)
 		for member := 0; member < multiGroupRF3Voters; member++ {
 			if cluster.network.nodeIsolated(member) {
 				continue
 			}
-			state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[group].key)
-			row, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
-				Fence: state.Fence(), Relation: 1, Key: key, MinimumApplied: 1,
-				MaxValueBytes: replication.MaxMutationValueBytes,
-			})
-			if lease != nil {
-				lease.Release()
-			}
-			if readErr != nil || !row.Found {
-				t.Fatalf("group %d member %d durable row found=%v err=%v",
-					group, member, row.Found, readErr)
+			for {
+				state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[group].key)
+				row, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
+					Fence: state.Fence(), Relation: 1, Key: key, MinimumApplied: cut,
+					MaxValueBytes: replication.MaxMutationValueBytes,
+				})
+				if lease != nil {
+					lease.Release()
+				}
+				// The partition affects every co-located group. A data-group
+				// election may advance its term between Probe and this bounded
+				// follower read; refresh only that typed stale-term refusal.
+				if errors.Is(readErr, raftmodel.ErrNotLeader) && ctx.Err() == nil {
+					continue
+				}
+				if readErr != nil || !row.Found {
+					t.Fatalf("group %d member %d durable row found=%v err=%v",
+						group, member, row.Found, readErr)
+				}
+				break
 			}
 		}
 	}

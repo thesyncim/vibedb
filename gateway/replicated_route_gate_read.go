@@ -31,9 +31,15 @@ func (executor *ReplicatedExecutor) ReadRouteGate(
 		return ReplicatedRouteGateReadResult{}, ErrReplicatedRoute
 	}
 	preferred := route.Replicas[0].Member
+	if endpoint, _, ok := executor.leaderHints.lookup(route); ok {
+		preferred = endpoint.Member
+	}
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.discoverLeader(
+		// A wave acquires gates across several groups. Refresh their leaders
+		// before admission so one stopped co-located voter cannot consume a
+		// full RPC timeout per group from the shared request deadline.
+		endpoint, state, err := executor.discoverLeaderFresh(
 			ctx, route, preferred, serviceauthz.CapabilityDataWrite,
 		)
 		if err != nil {

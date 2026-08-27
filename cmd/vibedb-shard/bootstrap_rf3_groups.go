@@ -138,9 +138,14 @@ func bootstrapPreparedRF3Groups(
 	}()
 	authorities := make(coldRF3GrantAuthorityRouter, len(pending))
 	services := make([]snapshottransfer.GroupBootstrapControlService, 0, len(pending))
+	// A killed io_uring owner can retain a kernel file reference briefly after
+	// waitpid. Share the serving startup lock budget across every cold group;
+	// recovery is still attempted only once, after acquiring the real lock.
+	openOptions := sqldriver.ReplicatedOpenOptions{WriterLockContext: parent,
+		WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait)}
 	for _, index := range pending {
 		group, prepareErr := prepareColdRF3Group(bootstrap.withGroup(bootstrap.Groups[index]),
-			members[index], profile, gate, deadline, host)
+			members[index], profile, gate, deadline, host, openOptions)
 		if prepareErr != nil {
 			return prepareErr
 		}
@@ -254,6 +259,7 @@ func bootstrapPreparedRF3Groups(
 func prepareColdRF3Group(
 	bootstrap bootstrapRF3Manifest, member rf3Manifest, profile *rafttransport.PeerTLS,
 	gate *serviceauthz.Gate, deadline rafttransport.DeadlineFunc, host *multiraft.Host,
+	openOptions sqldriver.ReplicatedOpenOptions,
 ) (_ *preparedColdRF3Group, resultErr error) {
 	if host == nil {
 		return nil, errInvalidBootstrapRF3Manifest
@@ -278,7 +284,7 @@ func prepareColdRF3Group(
 			resultErr = errors.Join(resultErr, prepared.close())
 		}
 	}()
-	prepared.database, err = sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity)
+	prepared.database, err = sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity, openOptions)
 	if err != nil {
 		return nil, err
 	}

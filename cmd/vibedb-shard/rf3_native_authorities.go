@@ -20,7 +20,7 @@ type rf3NativeAuthorities struct {
 
 type rf3NativeGroupAuthority struct {
 	baseServing      func(raftservice.ServingState) bool
-	membership       func(raftservice.ServingState, *shardservice.ReplicatedRequest) bool
+	move             func(raftservice.ServingState, *shardservice.ReplicatedRequest) bool
 	restorePreparing func(raftservice.ServingState, *shardservice.ReplicatedRequest) bool
 	restoreGate      *shardservice.RestoreServingGate
 }
@@ -47,7 +47,7 @@ func newRF3NativeAuthorities(registry *rafttransport.StaticRegistry, authorizati
 			restoreGate: restoreGates[group],
 		}
 		if target := item.manifest.EnrolledTarget; target != nil && target.MemberID == item.base.Binding.MemberID {
-			entry.membership = rf3NativeMembershipAuthority(registry, item.manifest, group, item.base)
+			entry.move = rf3NativeMoveAuthority(registry, item.manifest, group, item.base)
 		}
 		entry.restorePreparing = rf3RestoreCatalogPreparingAuthority(authorization, restoreOperations[group], group, item.base, entry.baseServing)
 		result.groups[group] = entry
@@ -71,5 +71,6 @@ func (authority *rf3NativeAuthorities) transitional(state raftservice.ServingSta
 		return false
 	}
 	entry, found := authority.groups[state.Identity.Group]
-	return found && (entry.restorePreparing(state, request) || entry.membership != nil && entry.membership(state, request))
+	return found && (entry.restorePreparing(state, request) || entry.move != nil && entry.move(state, request) &&
+		(request.Capability != serviceauthz.CapabilityTopology || entry.restoreGate == nil || entry.restoreGate.Allows(state)))
 }

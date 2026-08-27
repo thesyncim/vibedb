@@ -222,7 +222,7 @@ func TestSealedRequestCapabilityIgnoresCallerExecutionMode(t *testing.T) {
 		if !ok || got != serviceauthz.CapabilityDataWrite {
 			panic("classification changed")
 		}
-	}); allocations != 0 {
+	}); !raceDetectorEnabled && allocations != 0 {
 		t.Fatalf("sealed request classification allocations=%v", allocations)
 	}
 }
@@ -240,7 +240,7 @@ func TestShardAuthorizationHotCheckAllocationFree(t *testing.T) {
 		if !connection.authorize(request) {
 			panic("authorization changed")
 		}
-	}); allocations != 0 {
+	}); !raceDetectorEnabled && allocations != 0 {
 		t.Fatalf("authorization allocations=%v", allocations)
 	}
 }

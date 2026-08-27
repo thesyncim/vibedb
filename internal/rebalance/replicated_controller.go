@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -128,12 +129,12 @@ func ExecuteReplicatedMoveStep(
 			record.Intent, cut.Catalog, cut.Publication, cut.SnapshotBase,
 		)
 		if err != nil || plan.OperationID() != operation {
-			return Action{}, errors.Join(err, ErrReplicatedMove)
+			return Action{}, fmt.Errorf("rebalance: recover move intent: %w", errors.Join(err, ErrReplicatedMove))
 		}
 	}
 	action, err := Reconcile(plan, cut.Observation)
 	if err != nil {
-		return Action{}, err
+		return Action{}, fmt.Errorf("rebalance: reconcile move: %w", err)
 	}
 	if (action.Kind == ActionRefreshCatalogFence) != (action.ReplicaSetVersion != 0) ||
 		action.ReplicaSetVersion != 0 &&
@@ -150,6 +151,25 @@ func ExecuteReplicatedMoveStep(
 			return Action{}, err
 		}
 		return action, nil
+	}
+	// A prepared snapshot export and its target bootstrap share one exact Step.
+	// In particular, a catalog self-move advances Publication.Applied just by
+	// journaling this action. Keep its admitted witness across retries; making a
+	// new proof would strand the already prepared source export or bootstrap.
+	// Reconcile above still proves the current membership/catalog stage, and no
+	// replica-set, snapshot-base, or catalog authority change is accepted here.
+	if action.Kind == ActionCreateSnapshotBase &&
+		(record.State == gateway.ReplicatedOperationPlanned && record.Cursor[3] == replicaMoveCursorReady ||
+			record.State == gateway.ReplicatedOperationRunning && record.Cursor[3] == replicaMoveCursorExecuting) &&
+		sameReplicaMoveAction(record.Cursor, replicaMoveActionCursor(action, record.Cursor[3], plan, cut)) {
+		if record.CatalogGeneration != cut.Catalog.Generation() ||
+			record.Cursor[4] != cut.Publication.ReplicaSetVersion ||
+			record.Cursor[5] > cut.Publication.Applied || record.Cursor[6] > cut.LeaderStatus.Term ||
+			record.Proof != replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor) {
+			return Action{}, ErrReplicatedMove
+		}
+		cut.Publication.Applied = record.Cursor[5]
+		cut.LeaderStatus.Term = record.Cursor[6]
 	}
 	wanted, wantedProof := replicaMoveActionWitness(
 		operation, record.IntentDigest, plan, cut, action, replicaMoveCursorReady,

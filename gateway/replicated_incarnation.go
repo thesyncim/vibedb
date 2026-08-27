@@ -16,6 +16,22 @@ func (client *AuthenticatedReplicatedClient) ProbeReplicated(
 	ctx context.Context, route ReplicatedRoute, endpoint ReplicatedEndpoint,
 	capability serviceauthz.Capability,
 ) (*shardservice.ReplicatedResponse, error) {
+	return client.probeReplicatedBound(ctx, route, endpoint, capability, false)
+}
+
+func (client *AuthenticatedReplicatedClient) probeCatalog(ctx context.Context, route ReplicatedRoute,
+	endpoint ReplicatedEndpoint,
+) (*shardservice.ReplicatedResponse, error) {
+	if !catalogBootstrapRoute(route) {
+		return nil, ErrReplicatedRoute
+	}
+	return client.probeReplicatedBound(ctx, route, endpoint, serviceauthz.CapabilityTopology, true)
+}
+
+func (client *AuthenticatedReplicatedClient) probeReplicatedBound(
+	ctx context.Context, route ReplicatedRoute, endpoint ReplicatedEndpoint,
+	capability serviceauthz.Capability, catalog bool,
+) (*shardservice.ReplicatedResponse, error) {
 	if ctx == nil {
 		return nil, ErrReplicatedUnauthorized
 	}
@@ -36,6 +52,9 @@ func (client *AuthenticatedReplicatedClient) ProbeReplicated(
 	})
 	healthy := err == nil && context.Cause(ctx) == nil
 	if err == nil && !validReplicatedUnauthorizedWithoutState(response) {
+		if catalog && response != nil && catalogCommandProgression(route.Command, response.State.Fence.Command) {
+			route.Command = response.State.Fence.Command
+		}
 		if _, err = bindReplicatedObservation(route, endpoint, response); err != nil {
 			healthy = false
 		}

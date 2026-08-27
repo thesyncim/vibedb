@@ -196,6 +196,11 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
 	}
 	authority := rf3CommandAuthority()
+	if os.Getenv(gatewayHotShardLiveChildEnvironment) == "1" {
+		// This fixture publishes an immutable generation-one catalog. Its
+		// prepared snapshot must carry that same source route generation.
+		authority.RouteGeneration = 1
+	}
 	applyOptions := sqldriver.ReplicatedApplyOptions{
 		MaxSessions: 32, RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{
@@ -280,6 +285,12 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	}
 	targetKey := raftstore.Key{ID: "rf3-command-key", Wrapped: []byte("explicit-test-wrapped-key")}
 	copy(targetKey.Material[:], keyMaterial)
+	snapshotSourceIndex := 0
+	if os.Getenv(gatewayHotShardLiveChildEnvironment) == "1" {
+		// The hot-move fixture retires member 1 and freezes member 2 as its
+		// snapshot source. Cold bootstrap authorizes exactly that source.
+		snapshotSourceIndex = 1
+	}
 	targetProcess := prepareRF3ColdTarget(t, rf3ColdTargetOptions{
 		StaticBootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
 		Root:            filepath.Join(root, "member-4"), Group: group, Authority: authority,
@@ -287,7 +298,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
 		Target: target, Listeners: targetListeners,
-		SourceNode: nodes[0], SourceSnapshotAddress: snapshotAddresses[0],
+		SourceNode: nodes[snapshotSourceIndex], SourceSnapshotAddress: snapshotAddresses[snapshotSourceIndex],
 		MaxArtifactBytes: 1 << 30,
 	})
 	defer targetProcess.Close(t)
@@ -552,12 +563,13 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
 		},
 	)
-	if _, err = probeRF3CommandMember(
-		t.Context(), target.NativeAddress, targetNode, clientProfile, clientNode,
-		group, rf3CommandStoreIdentity(1).AllocationGeneration,
-		authority.ActivePolicyGeneration,
-	); err == nil {
-		t.Fatal("RF4 target served native traffic")
+	dataProbe := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
+		&shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
+			Authority: authorityIdentity, Capability: serviceauthz.CapabilityDataRead,
+			Fence: shardservice.ReplicatedFence{Group: group,
+				AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration}})
+	if dataProbe.Kind != shardservice.ReplicatedRefusal || dataProbe.Refusal != shardservice.ReplicatedRefusalUnavailable {
+		t.Fatalf("RF4 target served public data: %+v", dataProbe)
 	}
 	observationRequest.ExpectedReplicaSetVersion = promotedState.Fence.Command.ReplicaSetVersion
 	targetObservation, err = observationClient.Observe(t.Context(), targetNode, observationRequest)
@@ -647,8 +659,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 				Capability: serviceauthz.CapabilityTopology,
 				Fence:      shardservice.ReplicatedFence{Group: group, AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration},
 			})
-		if identityProbe.Kind != shardservice.ReplicatedRefusal ||
-			identityProbe.Refusal != shardservice.ReplicatedRefusalUnavailable || !identityProbe.HasState ||
+		if identityProbe.Kind != shardservice.ReplicatedHandshake || !identityProbe.HasState ||
 			identityProbe.State.Fence.Group != group || identityProbe.State.Fence.MemberID != target.MemberID ||
 			identityProbe.State.Fence.StoreID != targetStore || identityProbe.State.Fence.NodeIncarnation <= targetIncarnation ||
 			identityProbe.State.Fence.Command != leaderState.Fence.Command ||

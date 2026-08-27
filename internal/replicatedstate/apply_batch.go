@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 var _ raftmodel.NormalBatchStateMachine = (*Machine)(nil)
@@ -274,6 +275,7 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, m.fail(errors.Join(stateErr, m.applyCut.Close()))
 	}
 	stateEnvelopeBytes := len(batch.state)
+	confBytes := proto.Size(m.state.ConfState)
 	batch.state = batch.state[:0]
 	working := m.state
 	planned := 0
@@ -358,6 +360,15 @@ func (m *Machine) ApplyNormalBatch(
 			}
 		}
 
+		// A stale result can create the first unfenced retry slot, and replacing
+		// the last such slot can remove that extension again. Normal batches do
+		// not change ConfState, but their canonical state header is not constant.
+		// Charge the exact prospective envelope before admitting each prefix.
+		nextEnvelopeBytes, sizeErr := stateEncodingSize(next, confBytes)
+		if sizeErr != nil {
+			deferredErr = sizeErr
+			break
+		}
 		systemMark := batch.system.mark()
 		for ordinal := range m.relations {
 			batch.relationMarks[ordinal] = batch.relationOverlay(ordinal).mark()
@@ -371,7 +382,7 @@ func (m *Machine) ApplyNormalBatch(
 			}
 			break
 		}
-		if !m.batchFits(batch, 1, len(stateKey)+stateEnvelopeBytes) {
+		if !m.batchFits(batch, 1, len(stateKey)+nextEnvelopeBytes) {
 			batch.system.rollback(systemMark)
 			for ordinal := range m.relations {
 				batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
@@ -386,6 +397,7 @@ func (m *Machine) ApplyNormalBatch(
 			batch.attemptedOverlay(ordinal).commit(batch.attemptedMarks[ordinal])
 		}
 		working = next
+		stateEnvelopeBytes = nextEnvelopeBytes
 		dataChainWitnesses[planned] = working.DataChainDigest
 		planned++
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -130,6 +131,8 @@ func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*
 	}
 	route := options.Route
 	route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
+	options.Session.catalogControl = true
+	options.Session.catalogHolder = options.Holder
 	return &ReplicatedCatalogAuthority{
 		executor: options.Executor, route: route, relation: options.Relation,
 		holder: options.Holder, session: options.Session,
@@ -221,14 +224,29 @@ func (authority *ReplicatedCatalogAuthority) readRaw(
 	if err != nil {
 		return ReplicatedPointResult{}, err
 	}
-	result, err := authority.executor.ReadTopologyPoint(ctx, authority.route, ReplicatedPointRead{
-		Relation: authority.relation, Key: key, MinimumApplied: 1,
-		// Point-read admission is certified against the relation's frozen maximum,
-		// not the expected size of one logical row kind. The catalog head and its
-		// smaller operation rows share this relation, so reserve the complete
-		// relation bound and enforce the row-kind bound after the read.
-		MaxValueBytes: uint32(maxReplicatedCatalogBytes), Linearizable: true,
-	})
+	var result ReplicatedPointResult
+	for attempt := 0; ; attempt++ {
+		// Membership may advance again after discovery but before ReadIndex.
+		// Retry only the read, with a fresh fully authenticated placement cut.
+		// Discovery still fails closed on unrelated authority or identity changes.
+		route, discoverErr := authority.executor.catalogOperationalRoute(ctx, authority.route, authority.holder.Current())
+		if discoverErr != nil {
+			return ReplicatedPointResult{}, discoverErr
+		}
+		result, err = authority.executor.ReadTopologyPoint(ctx, route, ReplicatedPointRead{
+			Relation: authority.relation, Key: key, MinimumApplied: 1,
+			// Reserve the complete frozen relation bound, then enforce the
+			// individual catalog row's smaller bound below.
+			MaxValueBytes: uint32(maxReplicatedCatalogBytes), Linearizable: true,
+		})
+		if err == nil || attempt+1 >= authority.executor.maxAttempts || errors.Is(err, ErrReplicatedUnauthorized) ||
+			!errors.Is(err, raftservice.ErrServingFence) && !errors.Is(err, ErrReplicatedLeader) {
+			break
+		}
+		if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+			return ReplicatedPointResult{}, errors.Join(err, waitErr)
+		}
+	}
 	if err != nil || !result.Found {
 		return result, err
 	}

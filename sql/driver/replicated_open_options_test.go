@@ -8,12 +8,76 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"golang.org/x/sys/unix"
 )
+
+func TestReplicatedColdSnapshotOpenWaitsOnlyForKernelWriterRelease(t *testing.T) {
+	path, db, binding, _ := prepareReplicatedTestRoot(t, "cold-lock", false)
+	base := requireReplicatedShardStoreBind(t, db, binding, "docs")
+	reserved, err := NewReplicatedChildApplyIdentity(base, strings.Repeat("a", 64), strings.Repeat("b", 64), testReplicatedApplyOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PrepareReplicatedSnapshotTarget(base, reserved); err != nil {
+		t.Fatal(err)
+	}
+	collectionPath := db.connector.db.tablePath("docs")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := os.OpenFile(collectionPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Flock(int(owner.Fd()), unix.LOCK_UN)
+	if opened, err := OpenReplicatedSnapshotTarget(path, base, reserved); !errors.Is(err, storeio.ErrWriterLocked) {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatalf("default cold open did not retain nonblocking lock admission: %v", err)
+	}
+	type result struct {
+		db  *Database
+		err error
+	}
+	completed := make(chan result, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		opened, err := OpenReplicatedSnapshotTarget(path, base, reserved, ReplicatedOpenOptions{
+			WriterLockContext: ctx, WriterLockDeadline: time.Now().Add(time.Second),
+		})
+		completed <- result{opened, err}
+	}()
+	select {
+	case got := <-completed:
+		if got.db != nil {
+			_ = got.db.Close()
+		}
+		t.Fatalf("cold open returned before kernel lock release: %v", got.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	got := <-completed
+	if got.err != nil || got.db == nil {
+		t.Fatalf("cold restart did not acquire the released lock: %v", got.err)
+	}
+	defer got.db.Close()
+	if _, err := got.db.NewSession(t.Context()); !errors.Is(err, ErrReplicatedChildStageBusy) {
+		t.Fatalf("cold lock waiting authorized ordinary SQL: %v", err)
+	}
+}
 
 func TestReplicatedOpeningOptionsAreExplicitAndBounded(t *testing.T) {
 	ctx := context.Background()

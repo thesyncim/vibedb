@@ -122,10 +122,16 @@ type distributedRunnerWaves struct {
 	fault           distributedtxn.ReplicatedOperation
 	prepareConflict bool
 	manifestPayload []byte
+	decisionSettled bool
 }
 
 func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, _ ReplicatedRoute, read replicatedstate.TransactionRecoveryReadRequest) (ReplicatedTransactionRecoveryResult, error) {
 	if read.Kind == replicatedstate.TransactionRecoveryLookupParticipant {
+		if waves.decisionSettled {
+			// Once the decision is durable, participants may already have
+			// applied/released and retired their prepare records.
+			return ReplicatedTransactionRecoveryResult{}, errors.New("prepared state read after durable decision")
+		}
 		return ReplicatedTransactionRecoveryResult{Complete: true, Records: []replicatedstate.TransactionRecoveryRecord{{
 			ID: read.ID, Role: distributedtxn.ReplicatedRoleParticipant,
 			State: uint8(distributedtxn.ParticipantPrepared),
@@ -196,6 +202,9 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 	waves.ledger.continuation = requestledger.ContinuationRecord{
 		Revision: waves.ledger.head.Revision, SettledOrdinal: wave.Ordinal,
 		TransitionTag: transition, Cursor: bytes.Clone(cursor), Observation: bytes.Clone(observation),
+	}
+	if control.Operation == distributedtxn.ReplicatedCommitCoordinator || control.Operation == distributedtxn.ReplicatedAbortCoordinator {
+		waves.decisionSettled = true
 	}
 	if waves.fault == control.Operation {
 		waves.fault = distributedtxn.ReplicatedOperationInvalid
@@ -349,8 +358,11 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 		distributedtxn.ReplicatedCommitCoordinator,
 		distributedtxn.ReplicatedApplyReleaseParticipant,
 		distributedtxn.ReplicatedRetireCoordinator,
+		distributedtxn.ReplicatedAbortCoordinator,
+		distributedtxn.ReplicatedAbortReleaseParticipant,
 	} {
 		t.Run(fmt.Sprintf("operation_%d", fault), func(t *testing.T) {
+			aborted := fault == distributedtxn.ReplicatedAbortCoordinator || fault == distributedtxn.ReplicatedAbortReleaseParticipant
 			execution := typedExecutionFixture(t)
 			execution.Recipe.Contract.CommitFinalWaveCount = 8
 			execution.Recipe.Contract.AbortFinalWaveCount = 11
@@ -361,7 +373,7 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 			execution, release := bindTypedExecutionPin(t, execution, route)
 			head.NextStepOrdinal, head.Revision = 0, 1
 			ledger := &distributedRunnerLedger{head: head}
-			waves := &distributedRunnerWaves{ledger: ledger, fault: fault}
+			waves := &distributedRunnerWaves{ledger: ledger, fault: fault, prepareConflict: aborted}
 			terminal := &distributedRunnerTerminal{}
 			authority := DurableRequestTerminalAuthority{CommitCursor: commitCursor, AbortCursor: abortCursor, AckToken: requestledger.AckToken{1}, Release: release}
 			runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, distributedRunnerPayloads{}, terminal, distributedRunnerAuthority{value: authority})
@@ -377,7 +389,11 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 			if _, err = runner.RunTyped(context.Background(), execution); err != nil {
 				t.Fatal(err)
 			}
-			if !terminal.plan.AffectedRowsValid || terminal.plan.AffectedRows != 3 || terminal.plan.Outcome != requestledger.OutcomeCommitted || wave.Identity.ID == ([16]byte{}) {
+			wantOutcome, wantRows := requestledger.OutcomeCommitted, int64(3)
+			if aborted {
+				wantOutcome, wantRows = requestledger.OutcomeAborted, 0
+			}
+			if terminal.plan.AffectedRowsValid == aborted || terminal.plan.AffectedRows != wantRows || terminal.plan.Outcome != wantOutcome || wave.Identity.ID == ([16]byte{}) {
 				t.Fatalf("terminal=%+v", terminal.plan)
 			}
 		})

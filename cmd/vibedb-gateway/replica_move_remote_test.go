@@ -105,6 +105,24 @@ func gatewayMembershipFixture() (membershipgrant.Grant, gateway.ReplicatedMember
 	return grant, route, request
 }
 
+func TestGatewayGrantedMembershipInstallsPublishedTargetBeforeSourceRemoval(t *testing.T) {
+	grant, route, request := gatewayMembershipFixture()
+	route.Serving.Replicas[0] = route.EnrolledTarget
+	route.HasEnrolledTarget = false
+	route.EnrolledTarget = gateway.ReplicatedEndpoint{}
+	request.Kind = raftservice.MembershipRemoveVoter
+	request.TransferTerm = 2
+	installer := new(gatewayTestGrantInstaller)
+	applier := new(gatewayTestMembershipApplier)
+	client := gatewayGrantedMembershipClient{grants: gatewayTestGrantSource{grant}, installer: installer, applier: applier}
+	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil {
+		t.Fatalf("published target lost its membership grant route: %v", err)
+	}
+	if applier.calls != 1 || !slices.Contains(installer.nodes, rafttransport.NodeID(grant.TargetNode)) {
+		t.Fatalf("target not installed before removal: nodes=%v calls=%d", installer.nodes, applier.calls)
+	}
+}
+
 type gatewayTestObservationClient struct{ observation replicacontrol.Observation }
 
 func (client gatewayTestObservationClient) Observe(
@@ -119,6 +137,14 @@ type gatewayTestActionClient struct {
 	node    rafttransport.NodeID
 	request replicaaction.Request
 	err     error
+}
+
+type gatewayTestMembershipLeader struct {
+	state shardservice.ReplicatedMemberState
+}
+
+func (client gatewayTestMembershipLeader) ObserveMembershipLeader(context.Context, gateway.ReplicatedMembershipRoute) (shardservice.ReplicatedMemberState, error) {
+	return client.state, nil
 }
 
 func (client *gatewayTestActionClient) Execute(
@@ -162,7 +188,10 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 	actions := new(gatewayTestActionClient)
 	remote := gatewayReplicaRemoteActions{observer: gatewayTestObservationClient{observation: replicacontrol.Observation{
 		Status: raftmember.RuntimeStatus{MemberID: leader.Member, LeaderID: leader.Member, Term: 17},
-	}}, actions: actions}
+	}}, actions: actions, native: gatewayTestMembershipLeader{state: shardservice.ReplicatedMemberState{
+		LeaderID: leader.Member, Fence: shardservice.ReplicatedFence{Group: route.Serving.Group,
+			AllocationGeneration: route.Serving.AllocationGeneration, Command: commandFence,
+			MemberID: leader.Member, StoreID: leader.StoreID, NodeIncarnation: leader.NodeIncarnation + 1, Term: 17}}}}
 	operation := rebalance.OperationID{18}
 	step := [32]byte{19}
 	if err = remote.ProposeReplicaMoveOwnership(t.Context(), operation, step, route, command); err != nil {
@@ -172,7 +201,7 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 		actions.request.Fence.Term != 17 || actions.request.SourceMember != 1 ||
 		actions.request.TargetMember != 4 || actions.request.Fence.MemberID != leader.Member ||
 		actions.request.Fence.StoreID != leader.StoreID ||
-		actions.request.Fence.NodeIncarnation != leader.NodeIncarnation {
+		actions.request.Fence.NodeIncarnation != leader.NodeIncarnation+1 {
 		t.Fatalf("ownership request=%+v node=%x", actions.request, actions.node)
 	}
 	staleLeader := &raftservice.NotLeaderError{Status: raftmember.RuntimeStatus{

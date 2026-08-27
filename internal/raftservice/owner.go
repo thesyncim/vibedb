@@ -998,7 +998,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = err
 			break
 		}
-		if !commandMatchesFence(command, request.fence) {
+		if !commandMatchesFence(command, request.fence) && !CatalogCommandReplayMatchesFence(command, request.fence) {
 			reply.err = ErrServingFence
 			break
 		}

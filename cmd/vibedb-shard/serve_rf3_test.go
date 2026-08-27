@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -301,11 +302,12 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 	base := sqldriver.ReplicatedShardStoreIdentity{Binding: sqldriver.ReplicatedShardStoreBinding{
 		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
 		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
-		Distribution:          "controlplane", Shard: "catalog", AllocationGeneration: 23,
+		Distribution:          string(gateway.ReplicatedCatalogDistribution), Shard: string(gateway.ReplicatedCatalogShard), AllocationGeneration: 23,
 		ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
 		MemberID: manifest.EnrolledTarget.MemberID, StoreID: manifest.EnrolledTarget.StoreID,
 		Authority: authority,
 	}}
+	base.UserTable = gateway.ReplicatedCatalogTable
 	state := raftservice.ServingState{
 		Identity: raftmember.RuntimeIdentity{
 			Group: group, Distribution: base.Binding.Distribution, Shard: base.Binding.Shard,
@@ -324,12 +326,18 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 	if serving(state) {
 		t.Fatal("learner served native traffic")
 	}
+	membershipServing := rf3NativeMoveAuthority(registry, manifest, group, base)
+	catalogProbe := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
+		Capability: serviceauthz.CapabilityTopology, Fence: shardservice.ReplicatedFence{Group: group,
+			AllocationGeneration: base.Binding.AllocationGeneration}}
+	if membershipServing(state, &catalogProbe) {
+		t.Fatal("unpromoted learner served catalog control")
+	}
 	if err = registry.PublishCommittedAuthority(group, 11,
 		&pb.ConfState{Voters: []uint64{1, 2, 3, 4}}); err != nil {
 		t.Fatal(err)
 	}
 	state.Command.ReplicaSetVersion = 11
-	membershipServing := rf3NativeMembershipAuthority(registry, manifest, group, base)
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedMembership,
 		Capability: serviceauthz.CapabilityMembership,
 		Fence: shardservice.ReplicatedFence{Group: group,
@@ -342,6 +350,60 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 		}}
 	if !membershipServing(state, &request) {
 		t.Fatal("exact authenticated RF4 membership request rejected")
+	}
+	if !membershipServing(state, &catalogProbe) {
+		t.Fatal("promoted catalog target cannot discover its own move journal")
+	}
+	membershipProbe := catalogProbe
+	membershipProbe.Capability = serviceauthz.CapabilityMembership
+	if !membershipServing(state, &membershipProbe) {
+		t.Fatal("promoted target cannot discover its exact membership authority")
+	}
+	catalogRead := catalogProbe
+	catalogRead.Operation, catalogRead.Relation = shardservice.ReplicatedReadLeader, 1
+	if !membershipServing(state, &catalogRead) {
+		t.Fatal("promoted target cannot read its catalog move journal")
+	}
+	for name, mutate := range map[string]func(*shardservice.ReplicatedRequest){
+		"public read":    func(r *shardservice.ReplicatedRequest) { r.Capability = serviceauthz.CapabilityDataRead },
+		"public write":   func(r *shardservice.ReplicatedRequest) { r.Capability = serviceauthz.CapabilityDataWrite },
+		"other relation": func(r *shardservice.ReplicatedRequest) { r.Relation = 2 },
+		"follower read":  func(r *shardservice.ReplicatedRequest) { r.Operation = shardservice.ReplicatedReadFollower },
+		"group":          func(r *shardservice.ReplicatedRequest) { r.Fence.Group.GroupID[0]++ },
+		"allocation":     func(r *shardservice.ReplicatedRequest) { r.Fence.AllocationGeneration++ },
+		"invalid proposal": func(r *shardservice.ReplicatedRequest) {
+			r.Operation, r.Command = shardservice.ReplicatedPropose, []byte("not a catalog command")
+		},
+	} {
+		t.Run("catalog/"+name, func(t *testing.T) {
+			candidate := catalogRead
+			mutate(&candidate)
+			if membershipServing(state, &candidate) {
+				t.Fatal("move authority admitted unrelated catalog/data access")
+			}
+		})
+	}
+	for name, mutate := range map[string]func(*sqldriver.ReplicatedShardStoreIdentity){
+		"distribution": func(b *sqldriver.ReplicatedShardStoreIdentity) { b.Binding.Distribution = "data" },
+		"shard":        func(b *sqldriver.ReplicatedShardStoreIdentity) { b.Binding.Shard = "other" },
+		"table":        func(b *sqldriver.ReplicatedShardStoreIdentity) { b.UserTable = "orders" },
+	} {
+		t.Run("noncatalog/"+name, func(t *testing.T) {
+			candidate := base
+			mutate(&candidate)
+			if rf3NativeMoveAuthority(registry, manifest, group, candidate)(state, &catalogProbe) {
+				t.Fatal("catalog exception admitted a different relation identity")
+			}
+		})
+	}
+	missingGrant, err := rafttransport.NewStaticRegistry(manifest.EnrolledTarget.NodeID,
+		rf3GrantTransportMembers(manifest, group, 11, rafttransport.MemberVoter),
+		rafttransport.Limits{MaxGroups: 1, MaxMembers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf3NativeMoveAuthority(missingGrant, manifest, group, base)(state, &catalogProbe) {
+		t.Fatal("catalog exception admitted a target without its exact move grant")
 	}
 	for name, mutate := range map[string]func(*shardservice.ReplicatedRequest){
 		"data operation":  func(r *shardservice.ReplicatedRequest) { r.Operation = shardservice.ReplicatedProbe },
@@ -374,6 +436,9 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 		t.Fatal(err)
 	}
 	state.Command.ReplicaSetVersion = 12
+	if membershipServing(state, &catalogProbe) {
+		t.Fatal("move exception remained active after final RF3")
+	}
 	if !serving(state) {
 		t.Fatal("target did not activate at final owned RF3")
 	}

@@ -19,6 +19,40 @@ type routeGateReadClient struct {
 	authority serviceauthz.Authority
 }
 
+type stalledRouteGateClient struct{ *routeGateReadClient }
+
+func (*stalledRouteGateClient) parallelReplicatedDiscovery() {}
+
+func (client *stalledRouteGateClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	if endpoint.Member == 1 {
+		<-ctx.Done()
+		return nil, context.Cause(ctx)
+	}
+	return client.routeGateReadClient.DoReplicated(ctx, endpoint, request)
+}
+
+func TestReplicatedRouteGateRefreshesWarmHintBeforeAcquiringWave(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	for address, state := range states {
+		state.Applied, state.Commit = 11, 11
+		states[address] = state
+	}
+	client := &stalledRouteGateClient{&routeGateReadClient{states: states, status: routegate.Status{Epoch: 29}}}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := states["m1"]
+	old.LeaderID = 1
+	executor.leaderHints.publish(route, route.Replicas[0], old)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	result, err := executor.ReadRouteGate(ctx, route, 7)
+	if err != nil || result.State.Fence.MemberID != 2 || context.Cause(ctx) != nil {
+		t.Fatalf("stale route-gate hint consumed wave deadline: result=%+v err=%v", result, err)
+	}
+}
+
 func (c *routeGateReadClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
 	state := c.states[endpoint.Address]
 	if request.Capability != serviceauthz.CapabilityDataWrite || request.Authority != c.authority {

@@ -148,7 +148,8 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
-	database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity)
+	database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity,
+		sqldriver.ReplicatedOpenOptions{WriterLockContext: parent, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait)})
 	if err != nil {
 		return err
 	}

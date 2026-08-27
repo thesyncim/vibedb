@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
 	"github.com/thesyncim/vibedb/internal/kubeoperator"
@@ -30,6 +31,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/serviceerrors"
@@ -1468,7 +1470,12 @@ func rf3NativeServingAuthority(
 	}
 }
 
-func rf3NativeMembershipAuthority(
+// A promoted target can lead RF4 before it is allowed to serve public data.
+// The exact installed move grant must nevertheless remain discoverable, and a
+// catalog target must be able to journal its own move to reach the final RF3.
+// The native listener authenticates and authorizes these capabilities first;
+// owner admission still enforces the current complete serving fence.
+func rf3NativeMoveAuthority(
 	registry *rafttransport.StaticRegistry,
 	manifest rf3Manifest,
 	group raftmember.GroupKey,
@@ -1480,11 +1487,10 @@ func rf3NativeMembershipAuthority(
 			state.Identity.Group != group || state.Identity.MemberID != target.MemberID ||
 			state.Identity.MemberID != base.Binding.MemberID ||
 			state.Identity.StoreID != target.StoreID || state.Identity.StoreID != base.Binding.StoreID ||
-			request.Operation != shardservice.ReplicatedMembership ||
-			request.Capability != serviceauthz.CapabilityMembership || !state.Command.Valid() ||
+			state.Identity.Distribution != base.Binding.Distribution || state.Identity.Shard != base.Binding.Shard ||
+			state.Identity.AllocationGeneration != base.Binding.AllocationGeneration || !state.Command.Valid() ||
 			request.Fence.Group != group ||
-			request.Fence.AllocationGeneration != state.Identity.AllocationGeneration ||
-			request.Membership.ExpectedReplicaSetVersion != state.Command.ReplicaSetVersion {
+			request.Fence.AllocationGeneration != state.Identity.AllocationGeneration {
 			return false
 		}
 		version, found := registry.ReplicaSetVersion(group)
@@ -1507,15 +1513,57 @@ func rf3NativeMembershipAuthority(
 			return false
 		}
 		grant, found, err := registry.CurrentTransitionGrant(group)
+		if err != nil || !found || !grant.Valid() || grant.Group != group ||
+			grant.TargetMember != target.MemberID || grant.TargetNode != [16]byte(target.NodeID) {
+			return false
+		}
+		if request.Capability == serviceauthz.CapabilityTopology {
+			return rf3CatalogMoveRequest(base, request)
+		}
+		if request.Capability != serviceauthz.CapabilityMembership {
+			return false
+		}
+		if request.Operation == shardservice.ReplicatedProbe {
+			return request.Membership == (shardservice.ReplicatedMembershipRequest{})
+		}
 		membership := request.Membership
-		return err == nil && found && grant.Valid() && grant.Group == group &&
-			grant.TargetMember == target.MemberID && grant.TargetNode == [16]byte(target.NodeID) &&
+		return request.Operation == shardservice.ReplicatedMembership &&
+			membership.ExpectedReplicaSetVersion == state.Command.ReplicaSetVersion &&
 			membership.TransitionID == grant.TransitionID &&
 			membership.MetadataEpoch == grant.MetadataEpoch &&
 			membership.CatalogGeneration == grant.CatalogGeneration &&
 			membership.SourceMember == grant.SourceMember &&
 			membership.TargetMember == grant.TargetMember
 	}
+}
+
+func rf3CatalogMoveRequest(base sqldriver.ReplicatedShardStoreIdentity, request *shardservice.ReplicatedRequest) bool {
+	if base.Binding.Distribution != string(gateway.ReplicatedCatalogDistribution) ||
+		base.Binding.Shard != string(gateway.ReplicatedCatalogShard) || base.UserTable != gateway.ReplicatedCatalogTable {
+		return false
+	}
+	switch request.Operation {
+	case shardservice.ReplicatedProbe:
+		return true
+	case shardservice.ReplicatedReadLeader:
+		return request.Relation == 1
+	case shardservice.ReplicatedPropose:
+		command, err := replication.OpenCommand(request.Command)
+		if err != nil || command.AuthorityClass != replication.CommandAuthorityTopology ||
+			!bytes.Equal(command.Distribution, []byte(gateway.ReplicatedCatalogDistribution)) ||
+			!bytes.Equal(command.Shard, []byte(gateway.ReplicatedCatalogShard)) {
+			return false
+		}
+		switch command.Kind() {
+		case replication.CommandSessionOpen, replication.CommandSessionRenew, replication.CommandSessionRevoke,
+			replication.CommandSessionRetire, replication.CommandSessionRelease:
+			return true
+		case replication.CommandMutationBatch:
+			batches := command.RelationBatches()
+			return batches.Next() && batches.Batch().Relation == 1 && !batches.Next()
+		}
+	}
+	return false
 }
 
 func buildRF3Roster(

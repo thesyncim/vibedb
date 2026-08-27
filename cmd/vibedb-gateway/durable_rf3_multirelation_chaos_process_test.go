@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"syscall"
 	"testing"
 	"time"
@@ -39,6 +38,15 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	defer cancel()
 	fixture := newDurableRF3ExternalFixture(t, ctx)
 	defer fixture.close(t)
+	defer func() {
+		if t.Failed() {
+			for member, process := range fixture.shards {
+				t.Logf("multi-relation shard %d diagnostics:\n%s", member+1, process.Diagnostics())
+			}
+			t.Logf("multi-relation gateway A diagnostics:\n%s", fixture.gatewayA.Diagnostics())
+			t.Logf("multi-relation gateway B diagnostics:\n%s", fixture.gatewayB.Diagnostics())
+		}
+	}()
 	fixture.startShards(t)
 	fixture.startGateway(t, fixture.gatewayA)
 	fixture.initializeObservers(t)
@@ -90,7 +98,9 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	partitionStarted := time.Now()
 	fixture.waitAllRoleLeaders(t, partitioned, 30*time.Second)
 	partitionFailover := time.Since(partitionStarted)
-	latencies = append(latencies, client.loseResponseAfterFirstByte(t, insertRequest))
+	insertLoss := client.loseResponseAfterFirstByte(t, insertRequest)
+	t.Logf("insert response lost after %s", insertLoss)
+	latencies = append(latencies, insertLoss)
 	if err := fixture.gatewayA.Kill(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +131,9 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	killStarted := time.Now()
 	fixture.waitAllRoleLeaders(t, updateKilled, 30*time.Second)
 	killFailover := time.Since(killStarted)
-	latencies = append(latencies, client.loseResponseAfterFirstByte(t, updateRequest))
+	updateLoss := client.loseResponseAfterFirstByte(t, updateRequest)
+	t.Logf("update response lost after %s", updateLoss)
+	latencies = append(latencies, updateLoss)
 	client = fixture.dialGateway(t, fixture.gatewayBNode, fixture.gatewayBAddress)
 	updateRaw, updateLatency := client.roundTrip(t, updateRequest)
 	latencies = append(latencies, updateLatency)
@@ -147,17 +159,7 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	durableRF3ExternalAssertCommitted(t, deleteRaw, 12, 2)
 	latencies = append(latencies, client.ackTerminal(t, deleteRaw))
 
-	for _, table := range []struct{ name, prefix string }{{"orders_a", "a"}, {"orders_b", "b"}} {
-		retainedID := fmt.Sprintf("churn-%s-%02d", table.prefix, 1)
-		deletedID := fmt.Sprintf("churn-%s-%02d", table.prefix, 0)
-		latencies = append(latencies,
-			client.assertIDs(t, table.name, "kind", "final-01", retainedID),
-			client.assertIDs(t, table.name, "email", "final-01@example.test", retainedID),
-			client.assertIDs(t, table.name, "kind", "initial-01"),
-			client.assertIDs(t, table.name, "email", "initial-01@example.test"),
-			client.assertIDs(t, table.name, "id", deletedID),
-			client.assertCardinality(t, table.name, 7))
-	}
+	latencies = append(latencies, fixture.verifyNativeMultiRelation(t, client)...)
 
 	// Reopen every persisted voter and re-prove both index paths after catch-up.
 	for member := 0; member < durableRF3ExternalVoters; member++ {
@@ -166,21 +168,20 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 		fixture.restartShard(t, member)
 		fixture.waitMemberCaughtUpAllRoles(t, member, 45*time.Second)
 	}
-	latencies = append(latencies,
-		client.assertIDs(t, "orders_a", "kind", "final-11", "churn-a-11"),
-		client.assertIDs(t, "orders_a", "email", "final-11@example.test", "churn-a-11"),
-		client.assertIDs(t, "orders_b", "kind", "final-11", "churn-b-11"),
-		client.assertIDs(t, "orders_b", "email", "final-11@example.test", "churn-b-11"))
+	latencies = append(latencies, fixture.verifyNativeMultiRelation(t, client)...)
 	client.close()
 	close(measurementStop)
 	<-measurementDone
+	fixture.verifyRecoveredMultiRelationIndexes(t)
 
 	slices.Sort(latencies)
 	p99 := latencies[(len(latencies)*99+99)/100-1]
-	if p99 > 5*time.Second || partitionFailover > 15*time.Second ||
+	// Extra verification samples must not hide a slow mutation in p99.
+	maxLatency := latencies[len(latencies)-1]
+	if maxLatency > 5*time.Second || partitionFailover > 15*time.Second ||
 		killFailover > 15*time.Second || replacementRecovery > 15*time.Second {
-		t.Fatalf("latency bounds p99=%s partition=%s kill=%s replacement=%s",
-			p99, partitionFailover, killFailover, replacementRecovery)
+		t.Fatalf("latency bounds p99=%s max=%s partition=%s kill=%s replacement=%s",
+			p99, maxLatency, partitionFailover, killFailover, replacementRecovery)
 	}
 	finalStorage := replicaProcessAllocatedBytes(fixture.root, "")
 	finalWALs := fixture.captureWALAllocatedBytes(t)
@@ -208,8 +209,8 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 			t.Fatalf("unbounded multi-relation gateway journal %q", journal)
 		}
 	}
-	t.Logf("durable RF3 multi-relation chaos: shipped_gateway=true tables=2 data_groups=2 base_relations=2 local_exact_indexes=2 global_exact_indexes=2 insert_update_delete=true sustained_churn_mutations=60 persisted_transaction_recovery=true gateway_replacement=true leader_kill=true process_partition=true outcome_unknown_retry=true exact_terminal_replay=true exact_index_visibility=true stale_index_visibility=false final_cardinality_exact=true all_voters_reopened=true p99=%s partition_failover=%s leader_kill_failover=%s gateway_replacement_recovery=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d",
-		p99, partitionFailover, killFailover, replacementRecovery, rssGrowth, storageGrowth,
+	t.Logf("durable RF3 multi-relation chaos: shipped_gateway=true tables=2 data_groups=2 base_relations=2 local_exact_indexes=2 global_exact_indexes=2 insert_update_delete=true sustained_churn_mutations=60 persisted_transaction_recovery=true gateway_replacement=true leader_kill=true process_partition=true outcome_unknown_retry=true exact_terminal_replay=true native_point_verification=true persisted_index_voters=3 exact_index_visibility=true stale_index_visibility=false final_cardinality_exact=true all_voters_reopened=true p99=%s max=%s partition_failover=%s leader_kill_failover=%s gateway_replacement_recovery=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d",
+		p99, maxLatency, partitionFailover, killFailover, replacementRecovery, rssGrowth, storageGrowth,
 		walGrowth, publicWireBytes, snapshotGrowth)
 }
 
@@ -268,76 +269,4 @@ func durableRF3ExternalChurnUpdate(table, prefix string, ordinal int, phase stri
 func durableRF3ExternalChurnDelete(table, prefix string, ordinal int) serveStatement {
 	return serveStatement{SQL: "DELETE FROM " + table + " WHERE id = ?",
 		Params: []serveParam{{Kind: "string", Text: fmt.Sprintf("churn-%s-%02d", prefix, ordinal)}}}
-}
-
-func (client *durableRF3ExternalWireClient) assertIDs(
-	t testing.TB, table, field, value string, expected ...string,
-) time.Duration {
-	t.Helper()
-	raw, err := vibejson.Marshal(&serveRequest{Op: "query",
-		SQL: "SELECT id, value FROM " + table + " WHERE " + field + " = ?", Class: "interactive",
-		Params: []serveParam{{Kind: "string", Text: value}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, latency := client.roundTrip(t, raw)
-	actual := durableRF3ExternalResponseIDs(t, response)
-	sort.Strings(expected)
-	if !slices.Equal(actual, expected) {
-		t.Fatalf("indexed read %s.%s=%q ids=%v want=%v response=%s",
-			table, field, value, actual, expected, response)
-	}
-	return latency
-}
-
-func (client *durableRF3ExternalWireClient) assertCardinality(
-	t testing.TB, table string, expected int,
-) time.Duration {
-	t.Helper()
-	raw, err := vibejson.Marshal(&serveRequest{Op: "query",
-		SQL: "SELECT id, value FROM " + table, Class: "interactive"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, latency := client.roundTrip(t, raw)
-	if actual := len(durableRF3ExternalResponseIDs(t, response)); actual != expected {
-		t.Fatalf("table %s cardinality=%d want=%d response=%s", table, actual, expected, response)
-	}
-	return latency
-}
-
-func durableRF3ExternalResponseIDs(t testing.TB, response []byte) []string {
-	t.Helper()
-	document, err := vibejson.Parse(response)
-	if err != nil {
-		t.Fatalf("query response=%s err=%v", response, err)
-	}
-	if failure, found := document.Get("error"); found {
-		message, _ := failure.Text()
-		if message != "" {
-			t.Fatalf("query response=%s", response)
-		}
-	}
-	rows, found := document.Get("rows")
-	if !found {
-		t.Fatalf("query response has no rows: %s", response)
-	}
-	values, ok := rows.Array()
-	if !ok {
-		t.Fatalf("query rows malformed: %s", response)
-	}
-	identifiers := make([]string, 0, len(values))
-	for ordinal := range values {
-		cells, arrayOK := values[ordinal].Array()
-		if !arrayOK || len(cells) != 2 {
-			t.Fatalf("query row %d malformed: %s", ordinal, response)
-		}
-		identifier, textOK := cells[0].Text()
-		if !textOK || identifier == "" {
-			t.Fatalf("query row %d id malformed: %s", ordinal, response)
-		}
-		identifiers = append(identifiers, identifier)
-	}
-	sort.Strings(identifiers)
-	return identifiers
 }

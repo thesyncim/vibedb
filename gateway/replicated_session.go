@@ -164,6 +164,10 @@ type NativeSessionOptions struct {
 	RetryHome    replication.RetryHome
 	Resolver     BundleResolver
 	Journal      *NativeSessionJournal
+	// CatalogBootstrap enables placement discovery for the reserved catalog
+	// control session before its first Open. It does not alter the durable
+	// journal binding or permit a data session to follow stale routes.
+	CatalogBootstrap *Snapshot
 	// ProposalCapability is the exact authorization class placed on every
 	// probe and proposal. DataWrite, Topology, and ExecutionPin are admitted.
 	ProposalCapability serviceauthz.Capability
@@ -265,6 +269,9 @@ type NativeSession struct {
 	leader              shardservice.ReplicatedMemberState
 	journal             *NativeSessionJournal
 	proposalCapability  serviceauthz.Capability
+	catalogControl      bool
+	catalogBootstrap    *Snapshot
+	catalogHolder       *CatalogHolder
 }
 
 // NativeSessionStatus is a detached fixed-width view. Pending means callers
@@ -458,6 +465,10 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		options.ProposalCapability != serviceauthz.CapabilityExecutionPin {
 		return nil, ErrNativeSession
 	}
+	if options.CatalogBootstrap != nil && (!catalogBootstrapRoute(options.Route) ||
+		options.ProposalCapability != serviceauthz.CapabilityTopology) {
+		return nil, ErrNativeSession
+	}
 	route := options.Route
 	route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
 	tenant := append([]byte(nil), options.Tenant...)
@@ -472,6 +483,7 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		nextSequence:       1,
 		journal:            options.Journal,
 		proposalCapability: options.ProposalCapability,
+		catalogControl:     options.CatalogBootstrap != nil, catalogBootstrap: options.CatalogBootstrap,
 	}
 	if options.Journal != nil {
 		relation := nativeResolverBaseRelation(options.Resolver)
@@ -930,6 +942,16 @@ func (session *NativeSession) prepareAndExecute(
 	if ctx == nil {
 		return NativeResult{}, ErrNativeSessionState
 	}
+	if session.catalogControl {
+		route, err := session.catalogOperationalRoute(ctx)
+		if err != nil {
+			return NativeResult{}, err
+		}
+		command.ReplicaSetVersion = route.Command.ReplicaSetVersion
+		command.OwnershipEpoch = route.Command.OwnershipEpoch
+		command.RoutingVersion = route.Command.RoutingVersion
+		command.RouteGeneration = route.Command.RouteGeneration
+	}
 	if err := session.prepareCommand(command, preserveFingerprint); err != nil {
 		return NativeResult{}, err
 	}
@@ -972,15 +994,28 @@ func (session *NativeSession) executePending(
 	ctx context.Context,
 	priorUnknown bool,
 ) (NativeResult, error) {
+	route := session.route
+	if session.catalogControl {
+		var err error
+		route, err = session.catalogOperationalRoute(ctx)
+		if err != nil {
+			return NativeResult{}, &raftservice.UnknownOutcomeError{
+				Command: append([]byte(nil), session.command...), Cause: err,
+			}
+		}
+	}
 	var hint *shardservice.ReplicatedMemberState
 	// A cached leader is a latency hint only while no admitted outcome is in
 	// doubt. RetryPending may follow that leader's failure; discover the current
 	// leader before spending a bounded proposal attempt on the retained bytes.
-	if !priorUnknown && session.leader != (shardservice.ReplicatedMemberState{}) {
+	// Catalog discovery above just published a fresh authenticated leader to
+	// the executor. A session-local hint from before failover must not replace
+	// that observation and spend another full timeout on the stopped voter.
+	if !priorUnknown && !session.catalogControl && session.leader != (shardservice.ReplicatedMemberState{}) {
 		hint = &session.leader
 	}
 	result, err := session.executor.propose(
-		ctx, session.route, session.command, hint, priorUnknown, session.proposalCapability,
+		ctx, route, session.command, hint, priorUnknown, session.proposalCapability,
 		replicatedUnknownCommandClone,
 	)
 	if err != nil {

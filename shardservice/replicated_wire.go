@@ -978,11 +978,23 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			return false
 		}
 		command, err := replication.OpenCommand(request.Command)
-		return err == nil && replicatedCommandCapabilityMatches(
+		if err != nil || !replicatedCommandCapabilityMatches(
 			request.Capability, command.Kind(), command.AuthorityClass,
-		) && validReplicatedRequestLedgerPrincipal(request, command) &&
-			replicatedExecutionPinAuthorityMatches(request, command) &&
-			command.ClusterID == request.Fence.Group.ClusterID &&
+		) || !validReplicatedRequestLedgerPrincipal(request, command) ||
+			!replicatedExecutionPinAuthorityMatches(request, command) {
+			return false
+		}
+		// The catalog coordinates its own placement. An unknown journal write
+		// must keep its original bytes while settling under the current serving
+		// fence; owner admission permits only its exact retained completion.
+		if request.Capability == serviceauthz.CapabilityTopology &&
+			raftservice.CatalogCommandReplayMatchesFence(command, raftservice.ServingFence{
+				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+				Command: request.Fence.Command,
+			}) {
+			return true
+		}
+		return command.ClusterID == request.Fence.Group.ClusterID &&
 			command.ClusterIncarnation == request.Fence.Group.ClusterIncarnation &&
 			command.TopologyRecoveryEpoch == request.Fence.Group.TopologyRecoveryEpoch &&
 			command.ShardIncarnation == request.Fence.Group.ShardIncarnation &&

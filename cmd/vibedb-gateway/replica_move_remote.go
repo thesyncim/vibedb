@@ -115,7 +115,8 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	var leader replicacontrol.Observation
 	var leaderFound bool
 	var observeErrors error
-	for _, endpoint := range route.Membership.Serving.Replicas {
+	candidates := gatewayReplicaMoveObservationCandidates(route.Membership)
+	for _, endpoint := range candidates {
 		candidate, observeErr := observer.remote.Observe(ctx, endpoint.Node, observeRequest)
 		if observeErr == nil && candidate.Publication.ReplicaSetVersion >= minimumReplicaSet &&
 			candidate.Status.MemberID == endpoint.Member && candidate.Status.MemberID == candidate.Status.LeaderID &&
@@ -180,7 +181,10 @@ func gatewayReplicaObservationStep(operation rebalance.OperationID, generation u
 // authoritative catalog plus the exact retiring identity persisted in the
 // move intent. It therefore remains restart-safe after G+1 removes the source
 // from the serving RF3 directory.
-type gatewayReplicaMoveRouteResolver struct{ catalog gatewayReplicaCatalogReader }
+type gatewayReplicaMoveRouteResolver struct {
+	catalog  gatewayReplicaCatalogReader
+	observer gatewayReplicaObservationClient
+}
 
 func (resolver gatewayReplicaMoveRouteResolver) ResolveReplicaMove(
 	ctx context.Context,
@@ -197,7 +201,21 @@ func (resolver gatewayReplicaMoveRouteResolver) ResolveReplicaMove(
 		return rebalanceexec.MoveRoute{}, errors.Join(err, errGatewayReplicaControl)
 	}
 	request := plan.Request()
-	return resolveGatewayReplicaMoveRoute(catalog, request)
+	cut, err := resolveGatewayReplicaMoveRoute(catalog, request)
+	if err != nil {
+		return rebalanceexec.MoveRoute{}, err
+	}
+	switch execution.Action.Kind {
+	case rebalance.ActionPublishCatalog, rebalance.ActionRefreshCatalogFence, rebalance.ActionRetireSource:
+		// These actions publish or retire a placement that already committed in
+		// Raft. The old catalog command cannot describe that newer state.
+		command, err := observeGatewayReplicaMoveCommand(ctx, resolver.observer, cut, operation, execution)
+		if err != nil {
+			return rebalanceexec.MoveRoute{}, err
+		}
+		cut.Command = command
+	}
+	return cut, nil
 }
 
 func resolveGatewayReplicaMoveRoute(
@@ -249,11 +267,8 @@ func resolveGatewayReplicaMoveRoute(
 func newGatewayReplicaRemoteClients(
 	options gatewayReplicaRemoteClientOptions,
 ) (gatewayReplicaMoveControls, error) {
-	if options.Routes == nil && options.Authority != nil {
-		options.Routes = gatewayReplicaMoveRouteResolver{catalog: options.Authority}
-	}
 	if options.Opener == nil || options.ReadDeadline == nil || options.WriteDeadline == nil ||
-		options.Authority == nil || options.Replicated == nil || options.Routes == nil ||
+		options.Authority == nil || options.Replicated == nil ||
 		options.Drainer == nil {
 		return gatewayReplicaMoveControls{}, errGatewayReplicaControl
 	}
@@ -263,6 +278,9 @@ func newGatewayReplicaRemoteClients(
 	})
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
+	}
+	if options.Routes == nil {
+		options.Routes = gatewayReplicaMoveRouteResolver{catalog: options.Authority, observer: observations}
 	}
 	if options.Observer == nil {
 		options.Observer = gatewayReplicaMoveObserver{authority: options.Authority,
@@ -296,7 +314,7 @@ func newGatewayReplicaRemoteClients(
 		return gatewayReplicaMoveControls{}, err
 	}
 	remote := &gatewayReplicaRemoteActions{observer: observations, actions: actions,
-		routes: options.Routes}
+		routes: options.Routes, native: options.Replicated}
 	return gatewayReplicaMoveControls{
 		Observer: options.Observer, HealthObservations: observations,
 		GrantInstaller: grantInstaller, Routes: options.Routes,
@@ -548,9 +566,18 @@ func installGatewayMembershipGrant(
 	installer gatewayMembershipGrantInstaller,
 ) error {
 	if ctx == nil || installer == nil || route.Serving.Group != grant.Group ||
-		len(route.Serving.Replicas) != gateway.ServingReplicaCount ||
-		!route.HasEnrolledTarget || route.EnrolledTarget.Member != grant.TargetMember ||
-		[16]byte(route.EnrolledTarget.Node) != grant.TargetNode {
+		len(route.Serving.Replicas) != gateway.ServingReplicaCount {
+		return errGatewayReplicaControl
+	}
+	target := route.EnrolledTarget
+	if !route.HasEnrolledTarget {
+		for _, endpoint := range route.Serving.Replicas {
+			if endpoint.Member == grant.TargetMember {
+				target = endpoint
+			}
+		}
+	}
+	if target.Member != grant.TargetMember || [16]byte(target.Node) != grant.TargetNode {
 		return errGatewayReplicaControl
 	}
 	installedVoters := 0
@@ -560,15 +587,18 @@ func installGatewayMembershipGrant(
 		installErr := installer.InstallMembershipGrant(ctx, endpoint.Node, grant)
 		if installErr == nil {
 			installedVoters++
+			targetInstalled = targetInstalled || endpoint == target
 		} else {
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}
-	installErr := installer.InstallMembershipGrant(ctx, route.EnrolledTarget.Node, grant)
-	if installErr == nil {
-		targetInstalled = true
-	} else {
-		installErrors = errors.Join(installErrors, installErr)
+	if route.HasEnrolledTarget {
+		installErr := installer.InstallMembershipGrant(ctx, target.Node, grant)
+		if installErr == nil {
+			targetInstalled = true
+		} else {
+			installErrors = errors.Join(installErrors, installErr)
+		}
 	}
 	if installedVoters < gateway.ServingReplicaCount/2+1 || !targetInstalled {
 		return errors.Join(installErrors, errGatewayReplicaControl)
@@ -592,6 +622,9 @@ type gatewayReplicaRemoteActions struct {
 	observer gatewayReplicaObservationClient
 	actions  gatewayReplicaActionClient
 	routes   rebalanceexec.MoveRouteResolver
+	native   interface {
+		ObserveMembershipLeader(context.Context, gateway.ReplicatedMembershipRoute) (shardservice.ReplicatedMemberState, error)
+	}
 }
 
 func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
@@ -612,7 +645,7 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 		ExpectedReplicaSetVersion: execution.PublicationReplicaSet}
 	switch execution.Action.Kind {
 	case rebalance.ActionAwaitLeader:
-		for _, endpoint := range cut.Membership.Serving.Replicas {
+		for _, endpoint := range gatewayReplicaMoveObservationCandidates(cut.Membership) {
 			request.TargetMember = endpoint.Member
 			observation, observeErr := remote.observer.Observe(ctx, endpoint.Node, request)
 			if observeErr == nil && observation.Status.LeaderID != 0 &&
@@ -630,7 +663,7 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 		}
 		return nil
 	case rebalance.ActionAwaitCatchUp:
-		leader := cut.Membership.Serving.Replicas
+		leader := gatewayReplicaMoveObservationCandidates(cut.Membership)
 		for _, endpoint := range leader {
 			observation, observeErr := remote.observer.Observe(ctx, endpoint.Node, request)
 			if observeErr == nil && observation.Status.MemberID == observation.Status.LeaderID &&
@@ -653,7 +686,7 @@ func (remote gatewayReplicaRemoteActions) ProposeReplicaMoveOwnership(
 	route gateway.ReplicatedMembershipRoute,
 	command []byte,
 ) error {
-	if ctx == nil || remote.observer == nil || remote.actions == nil || len(command) == 0 {
+	if ctx == nil || remote.native == nil || remote.actions == nil || len(command) == 0 {
 		return errGatewayReplicaControl
 	}
 	targetMember := ownershipTarget(command)
@@ -661,38 +694,30 @@ func (remote gatewayReplicaRemoteActions) ProposeReplicaMoveOwnership(
 	if !route.HasEnrolledTarget || target.Member != targetMember {
 		return errGatewayReplicaControl
 	}
-	request := replicacontrol.Request{Operation: [32]byte(operation), Step: step,
-		Group: route.Serving.Group, TargetMember: target.Member,
-		ExpectedReplicaSetVersion: route.Serving.Command.ReplicaSetVersion}
-	candidates := append([]gateway.ReplicatedEndpoint(nil), route.Serving.Replicas...)
-	foundTarget := false
-	for _, candidate := range candidates {
-		foundTarget = foundTarget || candidate.Member == target.Member
+	state, err := remote.native.ObserveMembershipLeader(ctx, route)
+	if err != nil {
+		return err
 	}
-	if !foundTarget {
-		candidates = append(candidates, target)
-	}
+	candidates := gatewayReplicaMoveObservationCandidates(route)
 	var leader gateway.ReplicatedEndpoint
-	var observation replicacontrol.Observation
-	var observeErrors error
 	for _, candidate := range candidates {
-		cut, observeErr := remote.observer.Observe(ctx, candidate.Node, request)
-		if observeErr == nil && cut.Status.MemberID == candidate.Member &&
-			cut.Status.LeaderID == candidate.Member && cut.Status.Term != 0 {
-			leader, observation = candidate, cut
+		if state.Fence.MemberID == candidate.Member && state.LeaderID == candidate.Member &&
+			state.Fence.StoreID == candidate.StoreID && state.Fence.NodeIncarnation >= candidate.NodeIncarnation {
+			leader = candidate
 			break
 		}
-		observeErrors = errors.Join(observeErrors, observeErr)
 	}
-	if leader.Member == 0 {
-		return errors.Join(observeErrors, errGatewayReplicaControl)
+	if leader.Member == 0 || state.Fence.Group != route.Serving.Group ||
+		state.Fence.AllocationGeneration != route.Serving.AllocationGeneration ||
+		state.Fence.Command != route.Serving.Command || state.Fence.Term == 0 {
+		return errGatewayReplicaControl
 	}
 	return remote.actions.Execute(ctx, leader.Node, replicaaction.Request{
 		Operation: [32]byte(operation), Step: step, Kind: replicaaction.OwnershipTransition,
 		Fence: raftservice.ServingFence{Group: route.Serving.Group,
 			AllocationGeneration: route.Serving.AllocationGeneration, Command: route.Serving.Command,
 			MemberID: leader.Member, StoreID: leader.StoreID,
-			NodeIncarnation: leader.NodeIncarnation, Term: observation.Status.Term},
+			NodeIncarnation: state.Fence.NodeIncarnation, Term: state.Fence.Term},
 		SourceMember: ownershipSource(command), TargetMember: target.Member,
 		Command: command,
 	})

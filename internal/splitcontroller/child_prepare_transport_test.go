@@ -43,13 +43,26 @@ type childPrepareTestOpener struct {
 	service *ChildPrepareService
 	peer    rafttransport.PeerIdentity
 	drop    bool
+	done    <-chan struct{}
 }
 
 func (opener *childPrepareTestOpener) OpenShardControl(
 	ctx context.Context, _ rafttransport.NodeID,
 ) (rafttransport.PeerConnection, error) {
+	// The lost reply and the single-slot admission limit are separate faults.
+	// Wait for the previous server to release its slot before replaying.
+	if opener.done != nil {
+		select {
+		case <-opener.done:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
+	}
 	client, server := net.Pipe()
+	done := make(chan struct{})
+	opener.done = done
 	go func() {
+		defer close(done)
 		_ = opener.service.Serve(ctx, &planObservationTestConnection{
 			Conn: server, peer: opener.peer, class: rafttransport.TrafficShardControl,
 		})

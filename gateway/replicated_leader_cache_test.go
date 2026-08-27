@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -10,6 +11,54 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+type freshLeaderHintClient struct {
+	*scriptedReplicatedClient
+	probes []uint64
+}
+
+func (client *freshLeaderHintClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedProbe {
+		client.probes = append(client.probes, endpoint.Member)
+		if endpoint.Member == 1 {
+			return nil, context.DeadlineExceeded // The first configured voter is partitioned.
+		}
+	}
+	return client.scriptedReplicatedClient.DoReplicated(ctx, endpoint, request)
+}
+
+func TestReplicatedExecutorUnknownRetryFreshlyProbesLastObservedLeader(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	client := &freshLeaderHintClient{scriptedReplicatedClient: &scriptedReplicatedClient{states: states, proposals: 1}}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := states["m2"]
+	executor.leaderHints.publish(route, route.Replicas[1], old)
+	current := old
+	current.Fence.Term++
+	states["m2"] = current
+	for retry := 0; retry < 4; retry++ {
+		result, err := executor.RetryUnknown(t.Context(), route, command)
+		if err != nil || result.State.Fence.Term != current.Fence.Term {
+			t.Fatalf("retry=%d current term=%d result=%+v err=%v", retry, current.Fence.Term, result, err)
+		}
+	}
+	if len(client.probes) != 4 {
+		t.Fatalf("each recovery must freshly probe the last observed leader, probes=%v", client.probes)
+	}
+	for _, member := range client.probes {
+		if member != 2 {
+			t.Fatalf("repeatedly probed the partitioned first voter: %v", client.probes)
+		}
+	}
+	for _, got := range client.commands {
+		if !bytes.Equal(got, command) {
+			t.Fatal("fresh discovery changed retained command bytes")
+		}
+	}
+}
 
 func TestReplicatedLeaderHintCacheExactFenceIdentityAndSafeInvalidation(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
