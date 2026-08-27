@@ -793,7 +793,7 @@ func validWirePlanObservationResponse(response planObservationWireResponse) bool
 
 func writePlanObservationFrame[T any](writer io.Writer, magic [8]byte, value *T, maximum int) error {
 	payload, err := appendCanonicalVibeJSON(nil, value)
-	if err != nil || len(payload) == 0 || len(payload) > maximum || len(payload) > math.MaxUint32 {
+	if err != nil || len(payload) == 0 || len(payload) > maximum || uint64(len(payload)) > math.MaxUint32 {
 		return errors.Join(ErrPlanObservation, err)
 	}
 	var header [planObservationFrameHeaderBytes]byte

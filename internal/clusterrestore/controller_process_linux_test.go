@@ -131,8 +131,8 @@ func TestActivationExternalProcessRecoversEveryPublicationCutWithinBounds(t *tes
 			if exit != wantExit {
 				t.Fatalf("cut=%d stop=%d exit=%d want=%d output=%s", cut, stop, exit, wantExit, output)
 			}
-			if usage, ok := command.ProcessState.SysUsage().(*syscall.Rusage); ok && usage.Maxrss > maximumRSS {
-				maximumRSS = usage.Maxrss
+			if usage, ok := command.ProcessState.SysUsage().(*syscall.Rusage); ok && int64(usage.Maxrss) > maximumRSS {
+				maximumRSS = int64(usage.Maxrss)
 			}
 		}
 		run(cut, 91)
