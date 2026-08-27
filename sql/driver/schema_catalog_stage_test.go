@@ -217,6 +217,20 @@ func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Dat
 	if err = database.Close(); err != nil {
 		t.Fatal(err)
 	}
+	preparedSource, err := OpenReplicatedShardStoreWithSchemaSourceTransition(path, identity, applyIdentity, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if earlyClaim, _, err := preparedSource.OpenReplicatedApply(identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions()); earlyClaim != nil || !errors.Is(err, ErrSchemaSourceNotCommitted) {
+		if earlyClaim != nil {
+			_ = earlyClaim.Close()
+		}
+		_ = preparedSource.Close()
+		t.Fatalf("prepared source must distinguish not-yet-committed: claim=%v err=%v", earlyClaim, err)
+	}
+	if err := preparedSource.Close(); err != nil {
+		t.Fatal(err)
+	}
 	reopened, err := OpenReplicatedShardStoreWithApply(path, identity, applyIdentity)
 	if err != nil {
 		t.Fatal(err)
@@ -258,6 +272,72 @@ func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Dat
 		testReplicatedApplyMeta(prepared.SourceApplied+1), command,
 	); err != nil {
 		t.Fatal(err)
+	}
+	// The committed schema entry and target catalog publication are separate
+	// durable boundaries. Drop every source handle between them: recovery must
+	// retain the exact original command while keeping this generation fenced.
+	if err := reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	persisted, found, err := ObservePersistedReplicatedSchemaTransition(path)
+	if err != nil || !found || !bytes.Equal(persisted.Bytes(), command) {
+		t.Fatalf("committed source restart lost original command: found=%t err=%v", found, err)
+	}
+	if _, published, err := ObservePublishedReplicatedSchemaTransition(path); published || err != nil {
+		t.Fatalf("source catalog changed before publish: published=%t err=%v", published, err)
+	}
+	ordinary, ordinaryErr := OpenReplicatedShardStoreWithApply(path, identity, applyIdentity)
+	if ordinaryErr == nil {
+		ordinaryClaim, _, claimErr := ordinary.OpenReplicatedApply(identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions())
+		if claimErr == nil || ordinaryClaim != nil {
+			if ordinaryClaim != nil {
+				_ = ordinaryClaim.Close()
+			}
+			_ = ordinary.Close()
+			t.Fatalf("ordinary opener admitted retired schema source: claim=%v err=%v", ordinaryClaim, claimErr)
+		}
+		if err := ordinary.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	corruptCommand := bytes.Clone(command)
+	corruptCommand[len(corruptCommand)-1] ^= 1
+	foreignSource := persisted.SchemaTransition
+	foreignSource.AuthorizationDigest[0] ^= 1
+	foreignSourceCommand, err := replicatedstate.AppendSchemaTransition(nil, foreignSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, badCommand := range [][]byte{corruptCommand, foreignSourceCommand} {
+		if source, err := OpenReplicatedShardStoreWithSchemaSourceTransition(path, identity, applyIdentity, badCommand); source != nil || err == nil {
+			if source != nil {
+				_ = source.Close()
+			}
+			t.Fatalf("source recovery accepted substituted command: database=%v err=%v", source, err)
+		}
+	}
+	reopened, err = OpenReplicatedShardStoreWithSchemaSourceTransition(path, identity, applyIdentity, command)
+	if err != nil {
+		t.Fatalf("recover committed source before catalog publish: %v", err)
+	}
+	reopenedClaim, _, err = reopened.OpenReplicatedApply(identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions())
+	if err != nil {
+		t.Fatalf("recover fenced source apply: %v", err)
+	}
+	if applied, committed, err := reopenedClaim.ObserveReplicatedSchemaTransition(command); err != nil || !committed || applied != prepared.SourceApplied+1 {
+		t.Fatalf("reopened source lost exact commit: applied=%d committed=%t err=%v", applied, committed, err)
+	}
+	if _, err := reopenedClaim.ApplyNormal(testReplicatedApplyMeta(prepared.SourceApplied+2), nil); !errors.Is(err, replicatedstate.ErrSchemaTransitionPending) {
+		t.Fatalf("reopened source accepted post-schema entry: %v", err)
+	}
+	if cut, err := reopenedClaim.SnapshotArtifactCut(); cut != nil || !errors.Is(err, replicatedstate.ErrSchemaTransitionPending) {
+		if cut != nil {
+			_ = cut.Close()
+		}
+		t.Fatalf("reopened source exposed a readable snapshot: %v", err)
 	}
 	// A canonical command with the same target generation is still not the
 	// exact committed entry. It must fail before membership finalization.
