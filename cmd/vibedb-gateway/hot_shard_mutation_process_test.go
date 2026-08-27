@@ -495,6 +495,14 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatal("exact split admission returned no plan")
 	}
 	hotMutationWaitSplitRevision(t, ctx, catalogAuthority, [32]byte(splitPlan.OperationID()), 4)
+	var splitLatencies []time.Duration
+	for sequence := uint64(8); sequence <= 9; sequence++ {
+		splitLatencies = append(splitLatencies, client.execute(t, hotMutationRequest(t, reference, sequence,
+			[]serveStatement{{SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
+				{Kind: "document", Text: fmt.Sprintf(`{"id":"m-0","kind":"splitting","email":"split@example.com","value":%d}`, sequence)},
+				{Kind: "string", Text: "m-0"},
+			}}})))
+	}
 	servingRoute, found := final.ResolveReplicatedRoute(
 		routes[0].Distribution, routes[0].Shard, make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
 	)
@@ -520,6 +528,13 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if err = splitLeaderProcess.WaitReady(ctx, "vibedb-shard RF3"); err != nil {
 		t.Fatalf("restarted split source leader %d: %v\n%s", splitLeader, err, splitLeaderProcess.Diagnostics())
 	}
+	for sequence := uint64(10); sequence <= 11; sequence++ {
+		splitLatencies = append(splitLatencies, client.execute(t, hotMutationRequest(t, reference, sequence,
+			[]serveStatement{{SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
+				{Kind: "document", Text: fmt.Sprintf(`{"id":"m-0","kind":"splitting","email":"split@example.com","value":%d}`, sequence)},
+				{Kind: "string", Text: "m-0"},
+			}}})))
+	}
 	splitCatalog := hotMutationWaitSplitComplete(
 		t, ctx, catalogAuthority, final.Generation()+1, [32]byte(splitPlan.OperationID()), routes[0],
 	)
@@ -534,6 +549,11 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		if !ok || hotMutationLeader(t, profile, childRoute) == 0 {
 			t.Fatalf("split child %q did not serve RF3", descriptor.Shard)
 		}
+	}
+	sort.Slice(splitLatencies, func(left, right int) bool { return splitLatencies[left] < splitLatencies[right] })
+	splitP99 := splitLatencies[(len(splitLatencies)*99+99)/100-1]
+	if splitP99 > 5*time.Second {
+		t.Fatalf("split-under-write p99=%s exceeds 5s", splitP99)
 	}
 
 	finalRSS := replicaProcessRSS(gatewayProcess.PID())
