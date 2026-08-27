@@ -8,7 +8,10 @@ import (
 )
 
 const (
-	MaxPortableSpecBytes = 32 << 10
+	// The bounded recipe includes the original topology plus all dense relation
+	// descriptors and source/child schema commitments. rangesplit proves its
+	// worst-case canonical encoding fits this authoritative capture ceiling.
+	MaxPortableSpecBytes = 192 << 10
 	headerBytes          = 312
 	checksumBytes        = sha256.Size
 )

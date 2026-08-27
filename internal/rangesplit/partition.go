@@ -81,6 +81,8 @@ type Partitioner struct {
 	geometryDigest     [sha256.Size]byte
 	sourceCoordinates  TailSourceCoordinates
 	targetGeneration   uint64
+	bundle             *BundleProfile
+	relationDigest     [sha256.Size]byte
 }
 
 // NewPartitioner binds one desired split to the collection's compiled shard
@@ -168,8 +170,14 @@ func (p *Partitioner) PartitionSnapshot(
 	sinks []RowSink,
 	workspace *PartitionWorkspace,
 ) (PartitionStats, error) {
-	if p == nil || snapshot == nil {
+	if p == nil || snapshot == nil || p.RelationCount() != 1 {
 		return PartitionStats{}, ErrInvalidPartition
+	}
+	if p.bundle != nil {
+		fence := snapshot.Fence()
+		if !p.MatchesSourceSchema(fence.Binding.SchemaGeneration, fence.RelationManifestDigest) {
+			return PartitionStats{}, ErrSourceFence
+		}
 	}
 	user, ok := snapshot.Collection(p.collection)
 	if !ok || user == nil {
@@ -184,7 +192,7 @@ func (p *Partitioner) partitionRows(
 	sinks []RowSink,
 	workspace *PartitionWorkspace,
 ) (PartitionStats, error) {
-	if p == nil || rangeRows == nil || workspace == nil ||
+	if p == nil || p.RelationCount() != 1 || rangeRows == nil || workspace == nil ||
 		len(sinks) != int(p.childCount) || !p.matchesSource(state) {
 		if p != nil && rangeRows != nil && workspace != nil &&
 			len(sinks) == int(p.childCount) {

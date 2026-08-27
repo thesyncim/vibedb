@@ -10,8 +10,6 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const MaxPortablePartitionerBytes = 32 << 10
-
 var ErrPortablePartitioner = errors.New("rangesplit: invalid portable partitioner")
 
 type portablePartitioner struct {
@@ -27,6 +25,7 @@ type portablePartitioner struct {
 	Digest             [32]byte                      `json:"digest"`
 	SourceCoordinates  TailSourceCoordinates         `json:"source_coordinates,omitempty"`
 	TargetGeneration   uint64                        `json:"target_generation,omitempty"`
+	Bundle             *BundleProfile                `json:"bundle,omitempty"`
 }
 
 func AppendPortablePartitioner(dst []byte, p *Partitioner) ([]byte, error) {
@@ -35,6 +34,7 @@ func AppendPortablePartitioner(dst []byte, p *Partitioner) ([]byte, error) {
 	}
 	s := portablePartitioner{Source: p.source, ChildCount: p.childCount, Retained: p.retained, Collection: p.collection, Columns: slices.Clone(p.columns), Target: p.target, TargetDistribution: p.targetDistribution, Manifest: slices.Clone(p.manifest), Digest: p.digest, Children: make([]autosplit.SplitChild, p.childCount)}
 	s.SourceCoordinates, s.TargetGeneration = p.sourceCoordinates, p.targetGeneration
+	s.Bundle = p.bundle
 	copy(s.Children, p.children[:p.childCount])
 	raw, err := vibejson.Marshal(&s)
 	if err != nil {
@@ -42,7 +42,8 @@ func AppendPortablePartitioner(dst []byte, p *Partitioner) ([]byte, error) {
 	}
 	start := len(dst)
 	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst)-start == 0 || len(dst)-start > MaxPortablePartitionerBytes {
+	if err != nil || len(dst)-start == 0 || len(dst)-start > MaxPortablePartitionerBytes ||
+		validatePortableBounds(dst[start:]) != nil {
 		return dst[:start], errors.Join(err, ErrPortablePartitioner)
 	}
 	return dst, nil
@@ -51,6 +52,9 @@ func AppendPortablePartitioner(dst []byte, p *Partitioner) ([]byte, error) {
 func OpenPortablePartitioner(raw []byte) (*Partitioner, error) {
 	if len(raw) == 0 || len(raw) > MaxPortablePartitionerBytes {
 		return nil, ErrPortablePartitioner
+	}
+	if err := validatePortableBounds(raw); err != nil {
+		return nil, err
 	}
 	var s portablePartitioner
 	if err := vibejson.Unmarshal(raw, &s); err != nil {
@@ -68,7 +72,8 @@ func OpenPortablePartitioner(raw []byte) (*Partitioner, error) {
 		return nil, errors.Join(err, ErrPortablePartitioner)
 	}
 	target, err := distribution.NewManifest(s.TargetDistribution, s.Target, s.Manifest)
-	if err != nil || s.TargetDistribution != s.Source.Distribution || s.Target != s.Source.RoutingVersion+1 {
+	if err != nil || s.TargetDistribution != s.Source.Distribution || s.Target != s.Source.RoutingVersion+1 ||
+		target.ShardCount() < len(s.Children) {
 		return nil, errors.Join(err, ErrPortablePartitioner)
 	}
 	childIDs := make(map[distribution.ShardID]struct{}, len(s.Children))
@@ -117,6 +122,12 @@ func OpenPortablePartitioner(raw []byte) (*Partitioner, error) {
 	}
 	if s.SourceCoordinates != (TailSourceCoordinates{}) || s.TargetGeneration != 0 {
 		p, err = p.BindSourceFence(s.SourceCoordinates, s.TargetGeneration)
+		if err != nil {
+			return nil, errors.Join(err, ErrPortablePartitioner)
+		}
+	}
+	if s.Bundle != nil {
+		p, err = p.BindRelations(*s.Bundle)
 		if err != nil {
 			return nil, errors.Join(err, ErrPortablePartitioner)
 		}

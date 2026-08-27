@@ -152,25 +152,15 @@ type ReplicatedShardRelationIdentity struct {
 func (r ReplicatedShardRelationIdentity) GlobalIndexStorageKeyPoint(
 	key []byte,
 ) (distribution.KeyspacePoint, bool) {
-	if r.Kind != ReplicatedShardRelationGlobalIndex || r.IndexID == 0 ||
-		r.Incarnation == 0 || r.LocatorCount == 0 || r.LocatorCount > 8 ||
-		!validReplicatedGlobalIndexPlacement(r.KeyEncoding, r.KeyArity,
-			r.TupleVersion, r.MapperVersion, r.BucketBits) {
+	if r.Kind != ReplicatedShardRelationGlobalIndex {
 		return distribution.KeyspacePoint{}, false
 	}
-	point, consumed, ok := distribution.NativePointForEncodedTuplePrefix(
-		key, int(r.KeyArity), r.BucketBits,
-	)
-	if !ok {
-		return distribution.KeyspacePoint{}, false
-	}
-	if r.Unique {
-		return point, consumed == len(key)
-	}
-	locatorBytes, ok := distribution.CanonicalTuplePrefixLen(
-		key[consumed:], int(r.LocatorCount),
-	)
-	return point, ok && consumed+locatorBytes == len(key)
+	return (replicatedstate.GlobalIndexProfile{
+		IndexID: r.IndexID, Incarnation: r.Incarnation, LocatorCount: r.LocatorCount,
+		Unique: r.Unique, KeyEncoding: replicatedstate.GlobalIndexKeyEncoding(r.KeyEncoding),
+		KeyArity: r.KeyArity, TupleVersion: r.TupleVersion, MapperVersion: r.MapperVersion,
+		BucketBits: r.BucketBits,
+	}).GlobalIndexStorageKeyPoint(key)
 }
 
 func validReplicatedGlobalIndexPlacement(

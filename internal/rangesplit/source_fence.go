@@ -51,6 +51,7 @@ func (p *Partitioner) BindSourceFence(before TailSourceCoordinates, targetGenera
 	binary.LittleEndian.PutUint64(fixed[24:32], targetGeneration)
 	_, _ = h.Write(fixed[:])
 	_ = h.Sum(bound.digest[:0])
+	bound.bindRelationDigest()
 	return &bound, nil
 }
 
