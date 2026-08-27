@@ -106,6 +106,11 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	if err != nil || targetDigest == manifest.RelationManifestDigest {
 		t.Fatalf("fresh target must have its own schema domain: %x source=%x err=%v", targetDigest, manifest.RelationManifestDigest, err)
 	}
+	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetSchema := restoreTestSchemaDigests{Machine: targetDigest, Logical: logicalDigest}
 	if err = database.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -161,13 +166,13 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	}
 	targets := []clusterrestore.TargetGroup{target, catalogTarget}
 	plan := clusterrestore.Operation{Targets: targets, Certificate: certificate}
-	schemaRaw, policy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, plan, targetDigest, catalogDigest)
+	schemaRaw, policy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, plan, targetSchema, catalogDigest)
 	operation, err = clusterrestore.NewOperation(permit, certificate, 1, 1, [32]byte{16}, sha256.Sum256(policy), sha256.Sum256(schemaRaw), targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongDigest := targetDigest
-	wrongDigest[0] ^= 1
+	wrongDigest := targetSchema
+	wrongDigest.Machine[0] ^= 1
 	wrongSchema, wrongPolicy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, plan, wrongDigest, catalogDigest)
 	wrongOperation, err := clusterrestore.NewOperation(permit, certificate, 1, 1, [32]byte{16}, sha256.Sum256(wrongPolicy), sha256.Sum256(wrongSchema), targets)
 	if err != nil {
@@ -179,6 +184,20 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(restoreGroupDirectory(wrongRoot, 0), "replica-1", "activation.vibejson")); !os.IsNotExist(err) {
 		t.Fatalf("rejected schema published activation receipt: %v", err)
+	}
+	wrongLogical := targetSchema
+	wrongLogical.Logical[0] ^= 1
+	wrongSchema, wrongPolicy = restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, plan, wrongLogical, catalogDigest)
+	wrongOperation, err = clusterrestore.NewOperation(permit, certificate, 1, 1, [32]byte{16}, sha256.Sum256(wrongPolicy), sha256.Sum256(wrongSchema), targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongRoot = t.TempDir()
+	if _, err := RestoreGroup(context.Background(), RestoreGroupConfig{Root: wrongRoot, Template: wrongSchema, Operation: wrongOperation, Artifact: bytes.NewReader(artifact.Bytes())}); err == nil {
+		t.Fatal("sealed incorrect logical schema accepted despite exact machine digest")
+	}
+	if _, err := os.Stat(filepath.Join(restoreGroupDirectory(wrongRoot, 0), "replica-1", "activation.vibejson")); !os.IsNotExist(err) {
+		t.Fatalf("rejected logical schema published activation receipt: %v", err)
 	}
 	restoredRoot := filepath.Join(t.TempDir(), "restored")
 	if err = os.Mkdir(restoredRoot, 0o700); err != nil {
@@ -224,7 +243,7 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 
 // Build a real source artifact rather than relabeling another group's cut.
 // The target digest uses the same live schema with its exact fresh binding.
-func restoreTestSourceArtifact(t *testing.T, template restoreSchemaTemplate, source, target sqldriver.ReplicatedShardStoreBinding) ([]byte, replicatedstate.SnapshotArtifactManifest, [32]byte) {
+func restoreTestSourceArtifact(t *testing.T, template restoreSchemaTemplate, source, target sqldriver.ReplicatedShardStoreBinding) ([]byte, replicatedstate.SnapshotArtifactManifest, restoreTestSchemaDigests) {
 	t.Helper()
 	root := t.TempDir()
 	factory := restoreReplicaFactory{root: root, template: template}
@@ -239,6 +258,10 @@ func restoreTestSourceArtifact(t *testing.T, template restoreSchemaTemplate, sou
 		t.Fatal(err)
 	}
 	digest, err := database.ReplicatedRelationManifestForBinding(identity, options.Placement, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,5 +287,5 @@ func restoreTestSourceArtifact(t *testing.T, template restoreSchemaTemplate, sou
 	if err != nil {
 		t.Fatal(err)
 	}
-	return artifact.Bytes(), manifest, digest
+	return artifact.Bytes(), manifest, restoreTestSchemaDigests{Machine: digest, Logical: logical}
 }

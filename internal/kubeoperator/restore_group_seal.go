@@ -107,6 +107,10 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 			state.Identity.UserTable != template.BaseTable || receipt.RootDigest != hex.EncodeToString(seal.Witness.ReplicaRoots[index][:]) {
 			return RestoreGroupResult{}, true, errors.Join(ErrBootstrap, readErr, stateErr, bindingErr, allocationErr)
 		}
+		logical, logicalErr := sqldriver.ReplicatedRelationManifestDigest(state.Identity)
+		if logicalErr != nil || logical != template.logicalSchemaDigest {
+			return RestoreGroupResult{}, true, errors.Join(ErrBootstrap, logicalErr)
+		}
 		if restoreRootDigest(allocation, receipt.SnapshotBase, config.Operation, config.Ordinal, uint8(index)) != seal.Witness.ReplicaRoots[index] ||
 			allocation.UserStorage != restoreStorageIdentity(config.Operation.Digest, config.Ordinal, uint8(index)) {
 			return RestoreGroupResult{}, true, ErrBootstrap

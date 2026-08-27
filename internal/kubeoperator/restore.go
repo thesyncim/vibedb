@@ -65,6 +65,7 @@ type restoreSchemaTemplate struct {
 	Apply                bootstrapApply               `json:"apply"`
 	projection           []replicatedstate.ProjectionRow
 	relationDigest       [32]byte
+	logicalSchemaDigest  [32]byte
 }
 
 type restoreGlobalIndexTemplate struct {
@@ -183,7 +184,7 @@ func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupR
 	if config.Ordinal == config.Operation.CatalogOrdinal {
 		template.projection = projection
 	}
-	template.relationDigest, err = restorePlannedRelationDigest(config.Template, template)
+	template.relationDigest, template.logicalSchemaDigest, err = restorePlannedSchemaDigests(config.Template, template)
 	if err != nil {
 		return RestoreGroupResult{}, err
 	}
@@ -379,6 +380,11 @@ func (f *restoreReplicaFactory) OpenReplica(
 	allocation, database, identity, err := f.openOrCreateRoot(path, allocationPath, operation, group, replica, binding)
 	if err != nil {
 		return restoreservice.ReplicaRoot{}, err
+	}
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(identity)
+	if err != nil || logical != f.template.logicalSchemaDigest {
+		_ = database.Close()
+		return restoreservice.ReplicaRoot{}, errors.Join(ErrBootstrap, err)
 	}
 	if manifest.Bundle || f.template.relationDigest != ([32]byte{}) {
 		digest, digestErr := database.ReplicatedRelationManifestForBinding(identity, options.Placement, identity.Binding)

@@ -312,8 +312,9 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 	manifests := make([]replicatedstate.SnapshotArtifactManifest, 2)
 	cuts := make([]clusterbackup.GroupCut, 2)
 	fences := make([]raftservice.CommandFence, 2)
+	logicalSchemas := make([]replication.Digest, 2)
 	for ordinal := range schemas {
-		artifacts[ordinal], manifests[ordinal], fences[ordinal] = restoreRF3SourceArtifact(t, root, ordinal, schemas[ordinal])
+		artifacts[ordinal], manifests[ordinal], fences[ordinal], logicalSchemas[ordinal] = restoreRF3SourceArtifact(t, root, ordinal, schemas[ordinal])
 		cuts[ordinal], err = clusterbackup.GroupCutFromVerifiedArtifact(1, manifests[ordinal], sha256.Sum256(artifacts[ordinal]), uint64(len(artifacts[ordinal])))
 		if err != nil {
 			t.Fatal(err)
@@ -350,7 +351,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 			targets[ordinal].Replicas[member] = clusterrestore.ReplicaIdentity{Member: uint64(member + 1), Node: fixture.nodes[member], Store: identity.StoreID, NodeIncarnation: 1}
 		}
 	}
-	snapshot := restoreRF3TargetSnapshot(t, fixtures, targets, schemas, fences)
+	snapshot := restoreRF3TargetSnapshot(t, fixtures, targets, schemas, fences, logicalSchemas)
 	catalogRaw, err := gateway.AppendSnapshotDocument(nil, snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -445,7 +446,7 @@ func restoreRF3TargetIdentity(fixture *rf3FaultFixture, ordinal, member int, sch
 	identity.StoreID[0] += byte(ordinal * 16)
 	return identity
 }
-func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema restoreRF3Schema) ([]byte, replicatedstate.SnapshotArtifactManifest, raftservice.CommandFence) {
+func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema restoreRF3Schema) ([]byte, replicatedstate.SnapshotArtifactManifest, raftservice.CommandFence, replication.Digest) {
 	t.Helper()
 	if err := os.Mkdir(filepath.Join(root, fmt.Sprintf("source-%d", ordinal)), 0o700); err != nil {
 		t.Fatal(err)
@@ -561,7 +562,13 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 	if err = errors.Join(err, cut.Close()); err != nil {
 		t.Fatal(err)
 	}
-	return artifact.Bytes(), manifest, fence
+	logicalSchema, err := sqldriver.ReplicatedRelationManifestDigest(prepared.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// SQL's logical descriptor remains stable across routing resets; the
+	// command fence above seals the separate target machine validation domain.
+	return artifact.Bytes(), manifest, fence, replication.Digest(logicalSchema)
 }
 
 func restoreRF3IndexEntry(t *testing.T, indexValue, locator string) ([]byte, []byte) {
@@ -623,7 +630,7 @@ func restoreRF3GlobalRelations(schema restoreRF3Schema) []sqldriver.ReplicatedGl
 	}
 	return result
 }
-func restoreRF3TargetSnapshot(t *testing.T, fixtures [2]*rf3FaultFixture, targets []clusterrestore.TargetGroup, schemas [2]restoreRF3Schema, fences []raftservice.CommandFence) *gateway.Snapshot {
+func restoreRF3TargetSnapshot(t *testing.T, fixtures [2]*rf3FaultFixture, targets []clusterrestore.TargetGroup, schemas [2]restoreRF3Schema, fences []raftservice.CommandFence, logicalSchemas []replication.Digest) *gateway.Snapshot {
 	t.Helper()
 	config := distribution.ClusterConfig{}
 	endpoints := make(map[distribution.EndpointID]string)
@@ -648,12 +655,12 @@ func restoreRF3TargetSnapshot(t *testing.T, fixtures [2]*rf3FaultFixture, target
 		config.Distributions = append(config.Distributions, distribution.DistributionSpec{Name: distributionName, Arity: 1, MapperVersion: distribution.NativeMapperVersion})
 		config.Placements = append(config.Placements, distribution.TablePlacement{Table: schema.BaseTable, Distribution: distributionName, Columns: []string{"/id"}})
 		config.Manifests = append(config.Manifests, manifest)
-		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{Distribution: distributionName, Shard: shard, Group: fixture.group, AllocationGeneration: 23, Command: fences[ordinal],
+		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{Distribution: distributionName, Shard: shard, Group: fixture.group, AllocationGeneration: 23, Command: fences[ordinal], LogicalSchemaDigest: logicalSchemas[ordinal],
 			RangeIdentity: sha256.Sum256(append([]byte("restored/full-keyspace/"), fixture.group.GroupID[:]...)), LineageDigest: sha256.Sum256(append([]byte("restored/fresh-lineage/"), fixture.group.GroupID[:]...)), ForwardingRuleDigest: sha256.Sum256(append([]byte("restored/no-forwarding/"), fixture.group.GroupID[:]...)), Replicas: replicas})
 		if ordinal == 0 {
 			descriptors[ordinal].RequestLedgerRanges = []gateway.DurableRequestLedgerRangeDescriptor{{Identity: sha256.Sum256(append([]byte("restored/request-ledger/"), fixture.group.GroupID[:]...))}}
 		}
-		profiles = append(profiles, gateway.ReplicatedTableProfile{Table: schema.BaseTable, Relation: 1, PrimaryKey: "/id", SchemaGeneration: 13, RelationManifestDigest: fences[ordinal].RelationManifestDigest, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20})
+		profiles = append(profiles, gateway.ReplicatedTableProfile{Table: schema.BaseTable, Relation: 1, PrimaryKey: "/id", SchemaGeneration: 13, LogicalSchemaDigest: logicalSchemas[ordinal], MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20})
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(config, endpoints, 1, nil, nil, descriptors, profiles)
 	if err != nil {

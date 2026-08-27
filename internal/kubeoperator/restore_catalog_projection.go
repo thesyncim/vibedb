@@ -31,21 +31,21 @@ func validateRestoreSchemaSetSnapshot(raw []byte, operation clusterrestore.Opera
 	return openRestoreCatalogProjection(raw, operation)
 }
 
-func restorePlannedRelationDigest(raw []byte, template restoreSchemaTemplate) ([32]byte, error) {
+func restorePlannedSchemaDigests(raw []byte, template restoreSchemaTemplate) ([32]byte, [32]byte, error) {
 	var set restoreSchemaSet
 	if err := vibejson.Unmarshal(raw, &set); err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, [32]byte{}, err
 	}
 	snapshot, err := gateway.OpenSnapshotDocument(set.Catalog)
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, [32]byte{}, err
 	}
 	var replicas [3]gateway.ReplicatedEndpoint
 	route, ok := snapshot.ResolveReplicatedRoute(distribution.DistributionName(template.Distribution), distribution.ShardID(template.Shard), replicas[:0])
-	if !ok {
-		return [32]byte{}, ErrBootstrap
+	if !ok || route.LogicalSchemaDigest == ([32]byte{}) {
+		return [32]byte{}, [32]byte{}, ErrBootstrap
 	}
-	return [32]byte(route.Command.RelationManifestDigest), nil
+	return [32]byte(route.Command.RelationManifestDigest), [32]byte(route.LogicalSchemaDigest), nil
 }
 
 func openRestoreCatalogProjection(raw []byte, operation clusterrestore.Operation) ([]replicatedstate.ProjectionRow, error) {

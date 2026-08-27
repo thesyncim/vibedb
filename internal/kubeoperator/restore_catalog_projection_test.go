@@ -17,7 +17,12 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func restoreTestSchemaProjection(t *testing.T, templates []restoreSchemaTemplate, operation clusterrestore.Operation, targetDigests ...[32]byte) ([]byte, []byte) {
+type restoreTestSchemaDigests struct {
+	Machine [32]byte
+	Logical [32]byte
+}
+
+func restoreTestSchemaProjection(t *testing.T, templates []restoreSchemaTemplate, operation clusterrestore.Operation, targetDigests ...restoreTestSchemaDigests) ([]byte, []byte) {
 	t.Helper()
 	if len(targetDigests) != 0 && len(targetDigests) != len(templates) {
 		t.Fatal("target machine digests must cover the exact schema set")
@@ -49,13 +54,17 @@ func restoreTestSchemaProjection(t *testing.T, templates []restoreSchemaTemplate
 		}
 		config.Manifests = append(config.Manifests, m)
 		digest := replication.Digest(operation.Certificate.Groups[i].RelationManifestDigest)
+		// Pure catalog-projection tests use distinct nonzero commitments. The
+		// importing tests supply both digests derived from real bound SQL roots.
+		logical := replication.Digest{byte(90 + i)}
 		if len(targetDigests) != 0 {
-			digest = replication.Digest(targetDigests[i])
+			digest = replication.Digest(targetDigests[i].Machine)
+			logical = replication.Digest(targetDigests[i].Logical)
 		}
 		if digest == (replication.Digest{}) {
 			digest[0] = 1
 		}
-		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{Distribution: dist, Shard: shard, AllocationGeneration: distribution.ShardAllocationGeneration(template.AllocationGeneration), Group: operation.Targets[i].Group,
+		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{Distribution: dist, Shard: shard, AllocationGeneration: distribution.ShardAllocationGeneration(template.AllocationGeneration), Group: operation.Targets[i].Group, LogicalSchemaDigest: logical,
 			RangeIdentity: replication.Digest{byte(40 + i)}, LineageDigest: replication.Digest{byte(50 + i)}, ForwardingRuleDigest: replication.Digest{byte(60 + i)},
 			Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: operation.Certificate.Groups[i].SchemaGeneration, RelationManifestDigest: digest, RoutingVersion: 1, RouteGeneration: 1}, Replicas: replicas})
 		if i == 0 {
@@ -91,6 +100,10 @@ func TestRestoreCatalogProjectionIsOperationBoundAndExcludesSourceAuthority(t *t
 	raw, policy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template}, operation)
 	operation.TargetCatalogDigest = sha256.Sum256(raw)
 	operation.TargetPolicyDigest = sha256.Sum256(policy)
+	machine, logical, err := restorePlannedSchemaDigests(raw, template)
+	if err != nil || machine != ([32]byte{1}) || logical != ([32]byte{90}) || machine == logical {
+		t.Fatalf("separate planned schema commitments: machine=%x logical=%x err=%v", machine, logical, err)
+	}
 	rows, err := openRestoreCatalogProjection(raw, operation)
 	if err != nil {
 		t.Fatal(err)
