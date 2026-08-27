@@ -43,6 +43,7 @@ jobs:
           go run ./cmd/vibedb-operator render -image vibedb:${GITHUB_SHA} -namespace vibedb-test -shard-node-ids "${ids}" > "${second}"
           cmp "${first}" "${second}"
           go run ./cmd/vibedb-operator validate -manifest "${first}"
+          kubectl apply --dry-run=client --validate=false -f "${first}"
   test:
     name: test (${{ matrix.runner }})
     strategy:
