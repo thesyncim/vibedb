@@ -23,6 +23,18 @@ type DurableCatalogGroup struct {
 	MaxDocumentBytes uint32
 	LedgerRanges     []gateway.DurableRequestLedgerRangeDescriptor
 	EnrolledTarget   *gateway.ReplicatedEndpoint
+	AdditionalTables []DurableCatalogTable
+}
+
+// DurableCatalogTable describes an additional logical relation colocated in
+// the same already-prepared physical RF3 group as DurableCatalogGroup.Table.
+// It is test-only fixture metadata; ledger groups may not carry tables.
+type DurableCatalogTable struct {
+	Table            string
+	PrimaryKey       string
+	Relation         replication.RelationID
+	MaxKeyBytes      uint16
+	MaxDocumentBytes uint32
 }
 
 // DurableCatalogOptions is the complete immutable catalog input shared by two
@@ -31,6 +43,7 @@ type DurableCatalogGroup struct {
 type DurableCatalogOptions struct {
 	Generation uint64
 	Groups     []DurableCatalogGroup
+	Indexes    []gateway.IndexDescriptor
 	AckKey     gateway.DurableRequestAckDerivationKey
 }
 
@@ -163,7 +176,7 @@ func NewDurableCatalog(options DurableCatalogOptions) (DurableCatalog, error) {
 		descriptors = append(descriptors, descriptor)
 		if len(group.LedgerRanges) != 0 {
 			ledgerGroups++
-			if group.Relation != 0 {
+			if group.Relation != 0 || len(group.AdditionalTables) != 0 {
 				return DurableCatalog{}, ErrDurableCatalogFixture
 			}
 			continue
@@ -177,12 +190,33 @@ func NewDurableCatalog(options DurableCatalogOptions) (DurableCatalog, error) {
 			RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
 			MaxKeyBytes:            group.MaxKeyBytes, MaxDocumentBytes: group.MaxDocumentBytes,
 		})
+		for _, table := range group.AdditionalTables {
+			if table.Table == "" || table.PrimaryKey == "" || table.Relation == 0 ||
+				table.MaxKeyBytes == 0 || table.MaxDocumentBytes == 0 {
+				return DurableCatalog{}, ErrDurableCatalogFixture
+			}
+			if _, exists := seenTables[table.Table]; exists {
+				return DurableCatalog{}, ErrDurableCatalogFixture
+			}
+			seenTables[table.Table] = struct{}{}
+			config.Placements = append(config.Placements, distribution.TablePlacement{
+				Table: table.Table, Distribution: route.Distribution,
+				Columns: []string{table.PrimaryKey},
+			})
+			profiles = append(profiles, gateway.ReplicatedTableProfile{
+				Table: table.Table, Relation: table.Relation, PrimaryKey: table.PrimaryKey,
+				SchemaGeneration:       route.Command.SchemaGeneration,
+				RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
+				MaxKeyBytes:            table.MaxKeyBytes,
+				MaxDocumentBytes:       table.MaxDocumentBytes,
+			})
+		}
 	}
-	if ledgerGroups != 1 || len(profiles) != len(options.Groups)-1 {
+	if ledgerGroups != 1 || len(profiles) < len(options.Groups)-1 {
 		return DurableCatalog{}, ErrDurableCatalogFixture
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(
-		config, endpoints, options.Generation, nil, nil, descriptors, profiles,
+		config, endpoints, options.Generation, options.Indexes, nil, descriptors, profiles,
 	)
 	if err != nil {
 		return DurableCatalog{}, errors.Join(ErrDurableCatalogFixture, err)

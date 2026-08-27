@@ -30,6 +30,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
@@ -110,13 +111,29 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	creates := [3]string{"CREATE TABLE messages (PRIMARY KEY (id))",
 		"CREATE TABLE logs (PRIMARY KEY (id))",
 		"CREATE TABLE controlplane (PRIMARY KEY (id))"}
+	schemas := [3][]string{
+		{`CREATE INDEX by_kind ON messages (kind)`},
+		{`CREATE TABLE messages_email (PRIMARY KEY (key))`},
+		nil,
+	}
+	globalIndexes := [3][]sqldriver.ReplicatedGlobalIndexRelation{
+		nil,
+		{{Relation: 2, Table: "messages_email", IndexID: 41, Incarnation: 7,
+			LocatorCount: 1, Unique: true,
+			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits}},
+		nil,
+	}
 	digests := [3]replication.Digest{}
 	for group := range identities {
 		probe, probeErr := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
 			Root: filepath.Join(root, fmt.Sprintf("probe-%d", group)), Table: tables[group],
 			CreateTable: creates[group], Identity: identities[group][0], Key: key, WAL: wal,
 			Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-			Authority: authorityProfile, Apply: apply,
+			Authority: authorityProfile, Apply: apply, SchemaStatements: schemas[group],
+			GlobalIndexes: globalIndexes[group],
 		})
 		if errors.Is(probeErr, raftstore.ErrPlatformUnsupported) {
 			t.Skipf("strict durable allocation unsupported: %v", probeErr)
@@ -149,9 +166,23 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 			{Route: routes[0], Table: tables[0], PrimaryKey: "/id", Relation: 1,
 				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20, EnrolledTarget: &target},
 			{Route: routes[1], Table: tables[1], PrimaryKey: "/id", Relation: 1,
-				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20},
+				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+				AdditionalTables: []rf3testfixture.DurableCatalogTable{{
+					Table: "messages_email", PrimaryKey: "/email", Relation: 2,
+					MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+				}}},
 			{Route: routes[2], Table: "request_ledger", PrimaryKey: "/id",
 				LedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: replication.Digest{0x91}}}},
+		},
+		Indexes: []gateway.IndexDescriptor{
+			{IndexID: 40, Incarnation: 1, Table: "messages", Name: "by_kind",
+				Paths: []string{"/kind"}, Flags: gateway.IndexLocal | gateway.IndexOrdered,
+				Lifecycle: gateway.IndexReady},
+			{IndexID: 41, Incarnation: 7, Table: "messages", Name: "by_email",
+				Relation: "messages_email", Paths: []string{"/email"},
+				LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+				Flags:     gateway.IndexGlobal | gateway.IndexUnique | gateway.IndexOrdered,
+				Lifecycle: gateway.IndexReady},
 		},
 	})
 	if err != nil {
@@ -180,7 +211,8 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 				Key: key, WAL: wal, Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
 				Authority: authorityProfile, Apply: apply, Listeners: listeners[group][member],
 				Credential: credentials[member], Roots: roots, AuthorizationPolicy: policyPath,
-				Nodes: memberNodes, PeerAddresses: peers,
+				Nodes: memberNodes, PeerAddresses: peers, SchemaStatements: schemas[group],
+				GlobalIndexes: globalIndexes[group],
 			}
 			if group == 0 {
 				options.Target = processTarget
@@ -201,6 +233,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 				Authority: authorityProfile, Apply: apply, Listeners: listeners[0][3],
 				Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 				Nodes: memberNodes, PeerAddresses: peers, Target: processTarget,
+				SchemaStatements: schemas[0],
 			}, nodes[0], listeners[0][0].Snapshot, 1<<30)
 			if err != nil {
 				t.Fatal(err)
@@ -284,6 +317,8 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatalf("gateway readiness: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
 	baselineRSS := replicaProcessRSS(gatewayProcess.PID())
+	baselineStorage := replicaProcessAllocatedBytes(root, "")
+	baselineSnapshotNetwork := replicaProcessSnapshotPayloadBytes(root)
 	connection := hotMutationDialGateway(t, profile, nodes[4], gatewayAddresses.Addresses[0])
 	defer connection.Close()
 	client := &hotMutationWireClient{connection: connection, reader: bufio.NewReader(connection)}
@@ -291,26 +326,64 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 
 	var latencies []time.Duration
 	request := hotMutationRequest(t, reference, 1, []serveStatement{{
-		SQL: `INSERT INTO messages VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"m-0","value":1}`}},
+		SQL: `INSERT INTO messages VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"m-0","kind":"initial","email":"initial@example.com","value":1}`}},
 	}})
 	latencies = append(latencies, client.execute(t, request), client.execute(t, request))
-	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 2, []serveStatement{
+	hotMutationAssertMessage(t, client, "initial", "initial@example.com", 1)
+
+	// Submit an index-changing replacement, kill the exact remote-index RF3
+	// leader while apply may be in flight, and sever the client response path.
+	// The byte-identical retry must resolve the outcome through the shipped
+	// request ledger without duplicating base, local, or global maintenance.
+	leader := hotMutationLeader(t, profile, routes[1])
+	faultRequest := hotMutationRequest(t, reference, 2, []serveStatement{{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
+			{Kind: "document", Text: `{"id":"m-0","kind":"changed","email":"changed@example.com","value":2}`},
+			{Kind: "string", Text: "m-0"},
+		},
+	}})
+	client.partitionAfterWrite(t, faultRequest, func() {
+		time.Sleep(10 * time.Millisecond)
+		fault := processes[3+int(leader)-1]
+		if killErr := fault.Kill(ctx); killErr != nil {
+			t.Fatalf("kill global-index leader %d: %v", leader, killErr)
+		}
+	})
+	client.reconnect(t, profile, nodes[4], gatewayAddresses.Addresses[0])
+	latencies = append(latencies, client.execute(t, faultRequest))
+	hotMutationAssertMessage(t, client, "changed", "changed@example.com", 2)
+	hotMutationAssertSelectorEmpty(t, client, "kind", "initial")
+	hotMutationAssertSelectorEmpty(t, client, "email", "initial@example.com")
+
+	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 3, []serveStatement{
 		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []serveParam{{Kind: "string", Text: "m-0"}}},
-		{SQL: `INSERT INTO logs VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"l-1","value":2}`}}},
+		{SQL: `INSERT INTO logs VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"l-1","value":3}`}}},
 	})))
-	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 3, []serveStatement{{
-		SQL: `INSERT INTO messages VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"m-0","value":3}`}},
+	hotMutationAssertSelectorEmpty(t, client, "id", "m-0")
+	hotMutationAssertSelectorEmpty(t, client, "kind", "changed")
+	hotMutationAssertSelectorEmpty(t, client, "email", "changed@example.com")
+	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 4, []serveStatement{{
+		SQL: `INSERT INTO messages VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"m-0","kind":"steady","email":"steady@example.com","value":4}`}},
 	}})))
-	for sequence := uint64(4); sequence <= 7; sequence++ {
+	for sequence := uint64(5); sequence <= 6; sequence++ {
 		statement := serveStatement{SQL: `DELETE FROM messages WHERE id = ?`,
 			Params: []serveParam{{Kind: "string", Text: "m-0"}}}
-		if sequence%2 != 0 {
+		if sequence%2 == 0 {
 			statement = serveStatement{SQL: `INSERT INTO messages VALUES (?)`,
-				Params: []serveParam{{Kind: "document", Text: fmt.Sprintf(`{"id":"m-0","value":%d}`, sequence)}}}
+				Params: []serveParam{{Kind: "document", Text: fmt.Sprintf(`{"id":"m-0","kind":"steady","email":"steady@example.com","value":%d}`, sequence)}}}
 		}
 		latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, sequence,
 			[]serveStatement{statement})))
 	}
+	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 7, []serveStatement{{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
+			{Kind: "document", Text: `{"id":"m-0","kind":"final","email":"final@example.com","value":7}`},
+			{Kind: "string", Text: "m-0"},
+		},
+	}})))
+	hotMutationAssertMessage(t, client, "final", "final@example.com", 7)
+	hotMutationAssertSelectorEmpty(t, client, "kind", "steady")
+	hotMutationAssertSelectorEmpty(t, client, "email", "steady@example.com")
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	p99 := latencies[(len(latencies)*99+99)/100-1]
 	if p99 > 5*time.Second {
@@ -350,10 +423,11 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 			coldDemand = report.Demand[autosplit.ResourceRequests]
 		}
 	}
-	// Seven created admissions hit messages. The exact retry does not count;
-	// the cross-shard admission contributes once to each participant.
-	if hotDemand != 7 || coldDemand != 1 {
-		t.Fatalf("participant pressure hot=%d cold=%d want=7,1", hotDemand, coldDemand)
+	// Seven created admissions hit the base group and the remote global-index
+	// group. Exact retries do not count, and the cross-table batch still emits
+	// one sample for the already-created index/log participant.
+	if hotDemand != 7 || coldDemand != 7 {
+		t.Fatalf("participant pressure base=%d remote-index=%d want=7,7", hotDemand, coldDemand)
 	}
 	var final *gateway.Snapshot
 	for time.Now().Before(deadline) {
@@ -377,17 +451,58 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if err != nil || len(terminalOperations) != 1 {
 		t.Fatalf("topology operation amplification=%d err=%v", len(terminalOperations), err)
 	}
+
+	// Reopen both the killed remote-index voter and the complete shipped
+	// gateway. Reads then traverse newly opened retained identities and prove
+	// the base/local/global state stayed atomically aligned across the fault.
+	faultProcess := processes[3+int(leader)-1]
+	if err = faultProcess.Start(); err != nil {
+		t.Fatalf("restart global-index voter %d: %v", leader, err)
+	}
+	if err = faultProcess.WaitReady(ctx, "vibedb-shard RF3 ready"); err != nil {
+		t.Fatalf("reopened global-index voter: %v\n%s", err, faultProcess.Diagnostics())
+	}
+	_ = client.connection.Close()
+	restartCtx, restartCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err = gatewayProcess.Stop(restartCtx); err != nil {
+		restartCancel()
+		t.Fatalf("stop gateway for reopen: %v", err)
+	}
+	restartCancel()
+	if err = gatewayProcess.Start(); err != nil {
+		t.Fatalf("restart gateway: %v", err)
+	}
+	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
+		t.Fatalf("reopened gateway: %v\n%s", err, gatewayProcess.Diagnostics())
+	}
+	client.reconnect(t, profile, nodes[4], gatewayAddresses.Addresses[0])
+	hotMutationAssertMessage(t, client, "final", "final@example.com", 7)
+	hotMutationAssertSelectorEmpty(t, client, "kind", "steady")
+	hotMutationAssertSelectorEmpty(t, client, "email", "steady@example.com")
+
 	finalRSS := replicaProcessRSS(gatewayProcess.PID())
+	finalStorage := replicaProcessAllocatedBytes(root, "")
+	finalSnapshotNetwork := replicaProcessSnapshotPayloadBytes(root)
+	storageGrowth := uint64(0)
+	if finalStorage > baselineStorage {
+		storageGrowth = finalStorage - baselineStorage
+	}
 	if finalRSS > baselineRSS && finalRSS-baselineRSS > 128<<20 {
 		t.Fatalf("gateway RSS growth=%d exceeds 128MiB", finalRSS-baselineRSS)
 	}
-	if client.requests > 16 || client.bytes > 1<<20 ||
-		!replicaProcessTreeBounded(t, root, "gateway-session", 64, 64<<20) {
-		t.Fatalf("foreground/state amplification requests=%d bytes=%d", client.requests, client.bytes)
+	snapshotNetworkGrowth := uint64(0)
+	if finalSnapshotNetwork > baselineSnapshotNetwork {
+		snapshotNetworkGrowth = finalSnapshotNetwork - baselineSnapshotNetwork
 	}
-	t.Logf("write-driven hot move: p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d",
+	if client.requests > 48 || client.bytes > 1<<20 || storageGrowth > 512<<20 ||
+		snapshotNetworkGrowth > 1<<30 ||
+		!replicaProcessTreeBounded(t, root, "gateway-session", 64, 64<<20) {
+		t.Fatalf("foreground/state amplification requests=%d bytes=%d storage_growth=%d snapshot_network_growth=%d",
+			client.requests, client.bytes, storageGrowth, snapshotNetworkGrowth)
+	}
+	t.Logf("write-driven hot move: atomic_relation_index_visibility=true leader_kill=true response_partition=true reopen=true p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d snapshot_network_growth=%d",
 		p99, maximumOperations, len(record.Payload), client.requests, client.bytes,
-		max(finalRSS, baselineRSS)-baselineRSS)
+		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, snapshotNetworkGrowth)
 }
 
 func hotMutationIdentities(ordinal byte, distributionName, shard string) (identities [4]raftstore.Identity) {
@@ -486,6 +601,45 @@ func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	return authority, func() { _ = client.Close() }
+}
+
+func hotMutationLeader(t *testing.T, profile *rafttransport.PeerTLS,
+	route gateway.ReplicatedRoute,
+) uint64 {
+	t.Helper()
+	client, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
+		TLS: profile, Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
+		MaxConnections: 8, MaxPerEndpoint: 4, MaxIdlePerEndpoint: 2, MaxHandshakes: 2,
+		MaxWaiters: 8, MaxIdleAge: time.Minute, MaxLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, endpoint := range route.Replicas {
+			response, probeErr := client.DoReplicated(t.Context(), endpoint,
+				&shardservice.ReplicatedRequest{
+					Operation:  shardservice.ReplicatedProbe,
+					Capability: serviceauthz.CapabilityDataWrite,
+					Fence: shardservice.ReplicatedFence{Group: route.Group,
+						AllocationGeneration: route.AllocationGeneration},
+				})
+			if probeErr == nil && response != nil &&
+				response.Kind == shardservice.ReplicatedHandshake &&
+				response.State.Fence.Group == route.Group &&
+				response.State.LeaderID >= 1 &&
+				response.State.LeaderID <= gateway.ServingReplicaCount {
+				return response.State.LeaderID
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("discover remote global-index leader timeout")
+	return 0
 }
 
 func hotMutationCapacity(t *testing.T, root string) string {
@@ -687,6 +841,86 @@ func (client *hotMutationWireClient) execute(t *testing.T, request []byte) time.
 		t.Fatalf("exec_batch response=%s", response)
 	}
 	return latency
+}
+
+func (client *hotMutationWireClient) partitionAfterWrite(t *testing.T, request []byte,
+	afterWrite func(),
+) {
+	t.Helper()
+	if client == nil || client.connection == nil || afterWrite == nil {
+		t.Fatal("invalid response-partition fixture")
+	}
+	if err := client.connection.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	wire := append(append([]byte(nil), request...), '\n')
+	written, err := client.connection.Write(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.requests++
+	client.bytes += uint64(written)
+	afterWrite()
+	if err = client.connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (client *hotMutationWireClient) reconnect(t *testing.T, profile *rafttransport.PeerTLS,
+	node rafttransport.NodeID, address string,
+) {
+	t.Helper()
+	connection := hotMutationDialGateway(t, profile, node, address)
+	client.connection, client.reader = connection, bufio.NewReader(connection)
+}
+
+func (client *hotMutationWireClient) query(t *testing.T, sql, value string) [][]serveRawValue {
+	t.Helper()
+	raw, err := vibejson.Marshal(&serveRequest{Op: "query", SQL: sql, Class: "interactive",
+		Params: []serveParam{{Kind: "string", Text: value}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, _ := client.roundTrip(t, raw)
+	var decoded serveResponse
+	if err = json.Unmarshal(response, &decoded); err != nil || decoded.Error != "" {
+		t.Fatalf("query %q response=%s err=%v", sql, response, err)
+	}
+	return decoded.Rows
+}
+
+func hotMutationAssertMessage(t *testing.T, client *hotMutationWireClient,
+	kind, email string, value int,
+) {
+	t.Helper()
+	for _, selector := range []struct {
+		field, value string
+	}{{"id", "m-0"}, {"kind", kind}, {"email", email}} {
+		rows := client.query(t,
+			fmt.Sprintf("SELECT id, kind, email, value FROM messages WHERE %s = ?", selector.field),
+			selector.value)
+		if len(rows) != 1 || len(rows[0]) != 4 || string(rows[0][0]) != `"m-0"` ||
+			string(rows[0][1]) != fmt.Sprintf("%q", kind) ||
+			string(rows[0][2]) != fmt.Sprintf("%q", email) ||
+			string(rows[0][3]) != fmt.Sprint(value) {
+			t.Fatalf("%s visibility rows=%q want m-0,%s,%s,%d",
+				selector.field, rows, kind, email, value)
+		}
+	}
+}
+
+func hotMutationAssertSelectorEmpty(t *testing.T, client *hotMutationWireClient,
+	field, value string,
+) {
+	t.Helper()
+	if field != "id" && field != "kind" && field != "email" {
+		t.Fatalf("invalid visibility selector %q", field)
+	}
+	rows := client.query(t,
+		fmt.Sprintf("SELECT id, kind, email, value FROM messages WHERE %s = ?", field), value)
+	if len(rows) != 0 {
+		t.Fatalf("stale %s=%q rows=%q", field, value, rows)
+	}
 }
 
 func hotMutationRequest(t *testing.T, reference gateway.ReplicatedIssuerReference,

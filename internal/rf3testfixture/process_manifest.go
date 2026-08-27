@@ -29,6 +29,8 @@ type ProcessTarget struct {
 
 type ProcessMemberOptions struct {
 	Root, Table, CreateTable   string
+	SchemaStatements           []string
+	GlobalIndexes              []sqldriver.ReplicatedGlobalIndexRelation
 	Identity                   raftstore.Identity
 	Key                        raftstore.Key
 	WAL                        raftstore.Options
@@ -138,6 +140,7 @@ func prepareProcessMember(
 	prepared, err := PrepareMember(MemberOptions{Root: options.Root, Table: options.Table,
 		CreateTable: options.CreateTable, Identity: options.Identity, Key: options.Key,
 		WAL: options.WAL, Bootstrap: bootstrap, Authority: options.Authority, Apply: options.Apply,
+		SchemaStatements: options.SchemaStatements, GlobalIndexes: options.GlobalIndexes,
 		SeedDocuments: options.SeedDocuments})
 	if err != nil {
 		return PreparedProcessMember{}, err

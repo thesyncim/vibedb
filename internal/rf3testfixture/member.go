@@ -16,15 +16,17 @@ import (
 
 // MemberOptions is the complete prepared-member input retained by serve-rf3.
 type MemberOptions struct {
-	Root        string
-	Table       string
-	CreateTable string
-	Identity    raftstore.Identity
-	Key         raftstore.Key
-	WAL         raftstore.Options
-	Bootstrap   raftstore.Bootstrap
-	Authority   sqldriver.ReplicatedAuthorityProfile
-	Apply       sqldriver.ReplicatedApplyOptions
+	Root             string
+	Table            string
+	CreateTable      string
+	SchemaStatements []string
+	GlobalIndexes    []sqldriver.ReplicatedGlobalIndexRelation
+	Identity         raftstore.Identity
+	Key              raftstore.Key
+	WAL              raftstore.Options
+	Bootstrap        raftstore.Bootstrap
+	Authority        sqldriver.ReplicatedAuthorityProfile
+	Apply            sqldriver.ReplicatedApplyOptions
 	// SeedDocuments are inserted before the store is bound to replicated apply.
 	// They let an external control-plane process start from an authenticated
 	// catalog head without issuing an unsafe direct write after Raft ownership
@@ -73,23 +75,28 @@ func PrepareMember(options MemberOptions) (*PreparedMember, error) {
 	closeBoth := func(cause error) (*PreparedMember, error) {
 		return nil, errors.Join(cause, database.Close(), wal.Close())
 	}
-	session, err := database.NewSession(context.Background())
-	if err != nil {
-		return closeBoth(err)
-	}
-	statement, err := session.Prepare(context.Background(), options.CreateTable)
-	if err == nil {
-		_, err = statement.Exec(context.Background(), nil)
-	}
-	if statement != nil {
-		err = errors.Join(err, statement.Close())
-	}
-	err = errors.Join(err, session.Close())
-	if err != nil {
-		return closeBoth(err)
+	for _, schema := range append([]string{options.CreateTable}, options.SchemaStatements...) {
+		if schema == "" {
+			return closeBoth(errors.New("rf3 test fixture: empty schema statement"))
+		}
+		session, sessionErr := database.NewSession(context.Background())
+		if sessionErr != nil {
+			return closeBoth(sessionErr)
+		}
+		statement, statementErr := session.Prepare(context.Background(), schema)
+		if statementErr == nil {
+			_, statementErr = statement.Exec(context.Background(), nil)
+		}
+		if statement != nil {
+			statementErr = errors.Join(statementErr, statement.Close())
+		}
+		statementErr = errors.Join(statementErr, session.Close())
+		if statementErr != nil {
+			return closeBoth(statementErr)
+		}
 	}
 	if len(options.SeedDocuments) != 0 {
-		session, err = database.NewSession(context.Background())
+		session, err := database.NewSession(context.Background())
 		if err != nil {
 			return closeBoth(err)
 		}
@@ -114,9 +121,20 @@ func PrepareMember(options MemberOptions) (*PreparedMember, error) {
 			return closeBoth(prepareErr)
 		}
 	}
-	base, err := raftmember.BindPreparedSQL(
-		wal, database, options.Authority, options.Table,
-	)
+	var base sqldriver.ReplicatedShardStoreIdentity
+	if len(options.GlobalIndexes) == 0 {
+		base, err = raftmember.BindPreparedSQL(
+			wal, database, options.Authority, options.Table,
+		)
+	} else {
+		var binding sqldriver.ReplicatedShardStoreBinding
+		binding, err = raftmember.BindingFromWAL(wal, options.Authority)
+		if err == nil {
+			base, err = database.BindReplicatedShardStoreBundle(
+				binding, options.Table, options.GlobalIndexes,
+			)
+		}
+	}
 	if err != nil {
 		return closeBoth(err)
 	}

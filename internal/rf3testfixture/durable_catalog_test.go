@@ -62,7 +62,11 @@ func TestDurableCatalogBindsTwoDataGroupsLedgerAndSharedAckAuthority(t *testing.
 		Generation: 11, AckKey: ackKey,
 		Groups: []DurableCatalogGroup{
 			{Route: first, Table: "orders", PrimaryKey: "/id", Relation: 1,
-				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20, EnrolledTarget: &target},
+				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20, EnrolledTarget: &target,
+				AdditionalTables: []DurableCatalogTable{{
+					Table: "orders_email", PrimaryKey: "/email", Relation: 2,
+					MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+				}}},
 			{Route: second, Table: "customers", PrimaryKey: "/id", Relation: 1,
 				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20},
 			{Route: ledger, Table: "request_ledger", PrimaryKey: "/id",
@@ -70,6 +74,13 @@ func TestDurableCatalogBindsTwoDataGroupsLedgerAndSharedAckAuthority(t *testing.
 					Identity: replication.Digest{0x91},
 				}}},
 		},
+		Indexes: []gateway.IndexDescriptor{{
+			IndexID: 41, Incarnation: 7, Table: "orders", Name: "by_email",
+			Relation: "orders_email", Paths: []string{"/email"},
+			LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+			Flags:     gateway.IndexGlobal | gateway.IndexUnique | gateway.IndexOrdered,
+			Lifecycle: gateway.IndexReady,
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +97,7 @@ func TestDurableCatalogBindsTwoDataGroupsLedgerAndSharedAckAuthority(t *testing.
 	for _, candidate := range []struct {
 		table string
 		route gateway.ReplicatedRoute
-	}{{"orders", first}, {"customers", second}} {
+	}{{"orders", first}, {"orders_email", first}, {"customers", second}} {
 		resolved, found := built.Snapshot.ResolveReplicatedTableKey(
 			[]byte(candidate.table), key, scratch[:0], replicas[:0],
 		)
@@ -95,6 +106,13 @@ func TestDurableCatalogBindsTwoDataGroupsLedgerAndSharedAckAuthority(t *testing.
 			len(resolved.Route.Replicas) != gateway.ServingReplicaCount {
 			t.Fatalf("resolve %s = %+v,%v", candidate.table, resolved, found)
 		}
+	}
+	if _, err = built.Snapshot.CompileGlobalIndex("orders", "by_email"); err != nil {
+		t.Fatal(err)
+	}
+	index, found := built.Snapshot.Index("orders", "by_email")
+	if !found || index.Relation != "orders_email" || index.IndexID != 41 {
+		t.Fatalf("global index = %+v,%v", index, found)
 	}
 	membership, found := built.Snapshot.ResolveReplicatedMembershipRoute(
 		first.Distribution, first.Shard, replicas[:0],
@@ -142,6 +160,18 @@ func TestDurableCatalogFailsClosedOnAuthorityAndRoleAmbiguity(t *testing.T) {
 		},
 		"missing lineage": func(options *DurableCatalogOptions) {
 			options.Groups[0].Route.LineageDigest = replication.Digest{}
+		},
+		"duplicate additional table": func(options *DurableCatalogOptions) {
+			options.Groups[0].AdditionalTables = []DurableCatalogTable{{
+				Table: "request_ledger", PrimaryKey: "/id", Relation: 2,
+				MaxKeyBytes: 64, MaxDocumentBytes: 1024,
+			}}
+		},
+		"ledger additional table": func(options *DurableCatalogOptions) {
+			options.Groups[1].AdditionalTables = []DurableCatalogTable{{
+				Table: "hidden", PrimaryKey: "/id", Relation: 2,
+				MaxKeyBytes: 64, MaxDocumentBytes: 1024,
+			}}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
