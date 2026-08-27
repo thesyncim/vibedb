@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -94,5 +95,45 @@ func TestCollectLiveFailureAndCrashDraftRecoveryRemainUnpublished(t *testing.T) 
 	defer repository.Close()
 	if _, err = os.Stat(filepath.Join(root, liveDraftName(filled32(10), 0))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan draft stat=%v", err)
+	}
+}
+
+func TestCollectLiveExternalExitBeforeCertificateRecoversNoBackup(t *testing.T) {
+	if os.Getenv("VIBEDB_LIVE_BACKUP_EXIT_HELPER") == "1" {
+		root := os.Getenv("VIBEDB_LIVE_BACKUP_EXIT_ROOT")
+		repository, err := openBackupRepository(root, repositoryLimits(), func(point repositoryFault) error {
+			if point == faultAfterArtifactsSync {
+				os.Exit(97)
+			}
+			return nil
+		})
+		if err != nil {
+			os.Exit(96)
+		}
+		group := backupGroup(1)
+		authority := CatalogCut{Generation: 7, Digest: filled32(8), PolicyGeneration: 9,
+			Groups: []raftmember.GroupKey{group}}
+		source := LiveArtifactSource{Group: group, SourceMember: 1,
+			Exporter: liveCollectExporter{payload: bytes.Repeat([]byte{1}, 8192), cut: backupCut(1)}}
+		_, _ = repository.CollectLive(context.Background(), filled32(10), authority,
+			[]LiveArtifactSource{source})
+		os.Exit(95)
+	}
+	root := t.TempDir()
+	command := exec.Command(os.Args[0], "-test.run=^TestCollectLiveExternalExitBeforeCertificateRecoversNoBackup$")
+	command.Env = append(os.Environ(), "VIBEDB_LIVE_BACKUP_EXIT_HELPER=1",
+		"VIBEDB_LIVE_BACKUP_EXIT_ROOT="+root)
+	err := command.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 97 {
+		t.Fatalf("helper err=%v", err)
+	}
+	repository, err := OpenBackupRepository(root, repositoryLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if repository.Stats().Backups != 0 || repository.Stats().Artifacts != 0 || repository.Stats().DiskBytes != 0 {
+		t.Fatalf("post-exit stats=%+v", repository.Stats())
 	}
 }

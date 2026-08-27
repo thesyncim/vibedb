@@ -97,3 +97,26 @@ func TestLiveClientStreamsExactBoundedArtifactWithDeadlines(t *testing.T) {
 		t.Fatal(serverErr)
 	}
 }
+
+func TestLiveClientPartitionFailsWithinConfiguredDeadline(t *testing.T) {
+	request := LiveRequest{Operation: filled32(1), Group: backupGroup(2), SourceMember: 3}
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer server.Close()
+		var raw [LiveRequestBytes]byte
+		_, _ = io.ReadFull(server, raw[:])
+		var probe [1]byte
+		_, _ = server.Read(probe[:])
+	}()
+	deadline := func() time.Time { return time.Now().Add(20 * time.Millisecond) }
+	liveClient := LiveClient{Open: func(context.Context) (rafttransport.PeerConnection, error) {
+		return liveTestConnection{client}, nil
+	}, ReadDeadline: deadline, WriteDeadline: deadline}
+	started := time.Now()
+	if _, err := liveClient.Export(t.Context(), request, io.Discard); err == nil || time.Since(started) > time.Second {
+		t.Fatalf("partition err=%v elapsed=%v", err, time.Since(started))
+	}
+	<-done
+}

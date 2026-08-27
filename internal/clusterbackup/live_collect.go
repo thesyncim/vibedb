@@ -135,6 +135,11 @@ func (r *BackupRepository) CollectLive(ctx context.Context, operation [sha256.Si
 	if err = syncBackupRoot(r.root); err != nil {
 		return Certificate{}, err
 	}
+	if r.fault != nil {
+		if err = r.fault(faultAfterArtifactsSync); err != nil {
+			return Certificate{}, err
+		}
+	}
 	raw, err := AppendCertificate(nil, certificate)
 	if err != nil {
 		return Certificate{}, err
