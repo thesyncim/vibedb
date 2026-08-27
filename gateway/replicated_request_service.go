@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
@@ -402,7 +403,8 @@ func (service *DurableRequestService) create(
 			applyErr = errors.Join(materializeErr, ErrDurableRequestConflict)
 			minimum = result.Applied
 		} else {
-			applyErr = ErrDurableRequestConflict
+			applyErr = fmt.Errorf("%w: Create settlement code=%d phase=%d revision=%d",
+				ErrDurableRequestConflict, result.Ledger.ResultCode, result.Ledger.Phase, result.Ledger.Revision)
 		}
 	}
 	head, ack, applied, readErr := service.openHead(ctx, home, key.RequestKey, minimum)

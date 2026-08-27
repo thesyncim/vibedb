@@ -10,6 +10,9 @@ const (
 	pendingWaveHeaderBytes    = 288
 	stepRefBytes              = 104
 	MaxPendingWaveRecordBytes = pendingWaveHeaderBytes + MaxPendingWaveSteps*stepRefBytes + checksumBytes
+	// SingleStepPendingWaveRecordBytes permits serial runners to reserve only
+	// their one live step, without imposing a transaction participant limit.
+	SingleStepPendingWaveRecordBytes = pendingWaveHeaderBytes + stepRefBytes + checksumBytes
 )
 
 var (

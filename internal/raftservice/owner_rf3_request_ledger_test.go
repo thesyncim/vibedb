@@ -91,6 +91,7 @@ type multiGroupRequestLedgerRF3Trace struct {
 	operation requestledger.Operation
 	outer     []byte
 	inner     []byte
+	result    replicatedstate.RequestLedgerCompletionResult
 	hidden    bool
 }
 
@@ -208,6 +209,11 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 
 	hide := false
 	if ledgerProposal {
+		if response != nil && response.Kind == shardservice.ReplicatedCompletion {
+			if completion, openErr := replication.OpenCompletion(response.Completion); openErr == nil {
+				trace.result, _ = replicatedstate.OpenRequestLedgerCompletionResult(completion.ResultCode, completion.InlineResult)
+			}
+		}
 		client.mu.Lock()
 		hide = !client.hidden && client.hideOperation != requestledger.OperationInvalid &&
 			trace.operation == client.hideOperation && response != nil &&
@@ -225,6 +231,18 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 		return nil, io.ErrUnexpectedEOF
 	}
 	return response, nil
+}
+
+func (client *multiGroupRequestLedgerRF3RoundTripper) logRecentSettlements(t testing.TB) {
+	t.Helper()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	// Keep failure output bounded and exclude command payloads and credentials.
+	for _, trace := range client.trace[max(0, len(client.trace)-12):] {
+		t.Logf("ledger group=%d member=%d op=%d result=%d phase=%d revision=%d duplicate=%t hidden=%t",
+			trace.group, trace.member, trace.operation, trace.result.ResultCode,
+			trace.result.Phase, trace.result.Revision, trace.result.ExactDuplicate, trace.hidden)
+	}
 }
 
 func multiGroupRF3RequestKey(sequence uint64, requestByte byte) requestledger.RequestKey {
@@ -621,6 +639,7 @@ func TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions(t *
 	if err != nil || lost.Result == nil || lost.Result.RowsAffected != multiGroupRF3Groups ||
 		lost.Result.ShardsFanned != multiGroupRF3Groups || lost.TerminalRevision == 0 ||
 		lost.ResultDigest == (replication.Digest{}) || lost.AckToken == (gateway.DurableRequestAckToken{}) {
+		gatewayA.client.logRecentSettlements(t)
 		t.Fatalf("gateway A durable terminal=%+v err=%v", lost, err)
 	}
 

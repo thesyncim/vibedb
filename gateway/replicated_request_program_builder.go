@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/executionpin"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -133,11 +134,22 @@ func BuildDurableRequestLogicalProgram(
 	contract.ParticipantCount = uint64(len(program.Participants))
 	contract.CommitTransitionTag = durableRequestCommitTransitionTag
 	contract.AbortTransitionTag = durableRequestAbortTransitionTag
-	contract.MaxPendingWaveBytes = requestledger.MaxPendingWaveRecordBytes
-	contract.MaxContinuationBytes = requestledger.MaxContinuationRecordBytes
-	contract.MaxTerminalBytes = requestledger.MaxLifecyclePayloadBytes
-	contract.MaxActivePayloadBytes = requestledger.MaxDynamicWavePayloadBytes
-	contract.MaxActivePayloadChunks = requestledger.MaxDynamicWavePayloadChunks
+	// The typed runner persists one group ID and one command, settles it, then
+	// collects that payload before staging another wave (including on resume).
+	// Reserving the generic 256-step maximum would require over 4 GiB even for
+	// a tiny transaction. This bound still admits a maximum-width command and
+	// arbitrarily many sequential participants, with all recovery space prepaid.
+	contract.MaxPendingWaveBytes = requestledger.SingleStepPendingWaveRecordBytes
+	contract.MaxContinuationBytes = requestledger.MaxContinuationRecordBytes -
+		requestledger.MaxContinuationCursorBytes - requestledger.MaxContinuationObservationBytes +
+		durableDistributedCursorBytes + replicatedstate.MaxTransactionCompletionEnvelopeBytes
+	contract.MaxTerminalBytes = max(
+		requestledger.MaxLifecyclePayloadBytes-requestledger.MaxTerminalResultBytes,
+		requestledger.MaxPreparedTerminalRecordBytes-requestledger.MaxPreparedTerminalResultBytes,
+	) + durableRequestResultHeaderBytes
+	contract.MaxActivePayloadBytes = uint64(len(replication.ID128{})) + replication.MaxCommandBytes
+	contract.MaxActivePayloadChunks = (contract.MaxActivePayloadBytes + requestledger.MaxPlanPageBytes - 1) /
+		requestledger.MaxPlanPageBytes
 	contract.ResultGrammarDigest = durableRequestResultGrammarDigest()
 
 	var mutationDigester replication.TransactionMutationDigester

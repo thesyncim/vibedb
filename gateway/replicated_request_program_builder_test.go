@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -8,6 +9,58 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
+
+func TestBuildDurableRequestLogicalProgramReservesOneLiveWave(t *testing.T) {
+	var liveBytes, liveChunks uint64
+	for _, count := range []int{1, 2, 65, 512} {
+		t.Run(fmt.Sprintf("participants_%d", count), func(t *testing.T) {
+			build := durableRequestProgramBuildFixture(t)
+			build.Participants = durableFaultParticipantsN(t, count)
+			program, err := BuildDurableRequestLogicalProgram(build)
+			if err != nil {
+				t.Fatal(err)
+			}
+			measurement, err := measureDurableRequestPlan(build.Key, program)
+			if err != nil {
+				t.Fatal(err)
+			}
+			head, err := durableRequestHeadForMeasurement(build.Key, measurement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resident, future, err := requestledger.Reservation(head)
+			// Keep the ordinary transaction within the real RF3 fixture's 64 MiB
+			// capacity, including its separately protected 8 MiB cleanup reserve.
+			if err != nil || resident+future > 56<<20 {
+				t.Fatalf("admission reservation resident=%d future=%d: %v", resident, future, err)
+			}
+			if count == 1 {
+				liveBytes, liveChunks = head.MaxActivePayloadBytes, head.MaxActivePayloadChunks
+			}
+			if head.MaxActivePayloadBytes != liveBytes || head.MaxActivePayloadChunks != liveChunks ||
+				head.MaxPendingWaveBytes != requestledger.SingleStepPendingWaveRecordBytes {
+				t.Fatal("sequential participant count inflated the live wave reservation")
+			}
+			t.Logf("participants=%d plan=%d reserved=%d live_payload=%d chunks=%d",
+				count, head.TotalPlanBytes, resident+future, liveBytes, liveChunks)
+			if count != 1 {
+				return
+			}
+			if head.Phase != requestledger.PhaseSealed {
+				t.Fatal("single-participant fixture must use the inline sealed plan")
+			}
+			// The tighter contract still admits the largest encoded command plus
+			// its exact group-ID target, including the final partial payload page.
+			payload, err := requestledger.NewPayloadBuild(head, requestledger.Digest{1}, liveBytes, liveChunks)
+			if err != nil || payload.TotalBytes != uint64(len(replication.ID128{}))+replication.MaxCommandBytes {
+				t.Fatalf("maximum one-command wave was under-reserved: %+v %v", payload, err)
+			}
+			if _, err = requestledger.NewPayloadBuild(head, requestledger.Digest{1}, liveBytes+1, liveChunks); err == nil {
+				t.Fatal("accepted payload above the authenticated runner bound")
+			}
+		})
+	}
+}
 
 func durableRequestProgramBuildFixture(t *testing.T) DurableRequestLogicalProgramBuild {
 	t.Helper()
