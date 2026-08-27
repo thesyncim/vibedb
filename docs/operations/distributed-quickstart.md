@@ -278,14 +278,16 @@ The two catalog paths have different jobs. `-catalog` remains the immutable
 generation-one bootstrap and attestation seed. `-catalog-route-seed` is this
 gateway identity's crash-safe locator for the latest authenticated catalog
 head; never share it or `-catalog-session-journal` with a replacement gateway.
-Every certified read or publication advances the mutable seed through a staged
-file. A byte-identical head does no disk work, and a newer head with the same
-catalog session binding is promoted while serving continues.
+Route-seed control installation performs an attested catch-up read before
+serving. After installation, every subsequent certified read or publication
+advances the mutable seed through a staged file. A byte-identical head does no
+disk work, and a newer head with the exact same catalog self-route is promoted
+while serving continues.
 
-If the catalog self-route changes that binding, the gateway first durably
-stages the certified head and seals catalog authority. It then quiesces public
-and control work, settles Retire then Release for the old native session,
-removes the old journal, promotes the staged seed, and exits nonzero with
+If the catalog self-route changes, the gateway first durably stages the
+certified head and seals catalog authority. It then quiesces public and control
+work, settles Retire then Release for the old native session, removes the old
+journal, promotes the staged seed, and exits nonzero with
 `gateway.ErrReplicatedCatalogRouteRestartRequired`. Run the gateway under a
 supervisor that restarts it. Startup recovers the pending seed and exact old
 journal state after a crash; it never opens a fresh session through a stale
