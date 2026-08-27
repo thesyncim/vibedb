@@ -85,10 +85,10 @@ func LockWriter(file *os.File) error {
 	clear(writerLockRegistry.entries[len(live):])
 	writerLockRegistry.entries = live
 	if conflict {
-		return fmt.Errorf("%w: descriptor %d", ErrWriterLocked, fd)
+		return fmt.Errorf("%w: file %q descriptor %d", ErrWriterLocked, file.Name(), fd)
 	}
 	if err := lockWriterPlatform(file); err != nil {
-		return err
+		return fmt.Errorf("lock writer file %q: %w", file.Name(), err)
 	}
 	writerLockRegistry.entries = append(writerLockRegistry.entries, writerLockIdentity{
 		owner: ownerIdentity,

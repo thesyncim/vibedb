@@ -214,7 +214,8 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, in
 		base, applyIdentity, database, apply, err := openRF3RetainedApply(bundle.SQL.Path, wal, base, applyIdentity)
 		if err != nil {
 			clear(key.Material[:])
-			return result, closePreparedRF3Groups(result.groups, errors.Join(err, wal.Close()))
+			return result, closePreparedRF3Groups(result.groups,
+				errors.Join(fmt.Errorf("open RF3 SQL/apply group %d: %w", index, err), wal.Close()))
 		}
 		if index < initialCount {
 			runtimeDigest = base.RelationManifestDigest

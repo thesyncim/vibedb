@@ -300,8 +300,9 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
 	acknowledged := fixture.propose(t, leader, states[leader], coalesced)
 	if acknowledged.Kind != shardservice.ReplicatedRefusal ||
-		acknowledged.Refusal != shardservice.ReplicatedRefusalDeterministic ||
-		acknowledged.Outcome.Code != raftserve.OutcomeRetryRetired {
+		acknowledged.Refusal != shardservice.ReplicatedRefusalRetryRetired ||
+		acknowledged.Outcome != (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}) ||
+		acknowledged.RequestDigest != sha256.Sum256(coalesced) || acknowledged.State.Fence != states[leader].Fence {
 		t.Fatalf("acknowledged result survived as a replayable completion: %+v", acknowledged)
 	}
 
