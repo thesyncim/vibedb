@@ -1,6 +1,9 @@
 package storeio
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 type migrationExactMemorySink struct {
 	storeID    [16]byte
@@ -147,4 +150,47 @@ func TestMergeGenerationMigrationExactRunsFixedFanIn(t *testing.T) {
 			t.Fatalf("unordered at %d", index)
 		}
 	}
+}
+
+func TestGenerationMigrationExactRunsBoundNormalizedWriteAmplification(t *testing.T) {
+	const records = 10_000
+	sink := &migrationExactMemorySink{storeID: testStoreID, generation: 9, nextID: 100, nextAt: 64 << 10, pages: make(map[PageRef][]byte)}
+	start := sink.nextAt
+	builder, err := NewGenerationMigrationExactRunBuilder(sink, 4096, 256, 32<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logicalBytes := uint64(0)
+	for index := 0; index < records; index++ {
+		key := migrationExactRunKey(t, fmt.Sprintf(`"term-%08d"`, index))
+		logicalBytes += uint64(generationMigrationExactRunRecordBytes + len(key))
+		if err := builder.Add(uint32(index&3), key, uint32(index>>6), uint64(1)<<uint(index&63)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	region, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(ref PageRef, dst []byte) error {
+		image := sink.pages[ref]
+		if len(image) != len(dst) {
+			return ErrGenerationMigrationManifestCorrupt
+		}
+		copy(dst, image)
+		return nil
+	}
+	merged, err := MergeGenerationMigrationExactRuns(sink, read, region, 4096, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	totalWritten := sink.nextAt - start
+	finalBytes := merged.Pages * 4096
+	if totalWritten*100 > logicalBytes*500 {
+		t.Fatalf("normalized run write amplification=%.3fx want <=5x (written=%d logical=%d)", float64(totalWritten)/float64(logicalBytes), totalWritten, logicalBytes)
+	}
+	if finalBytes*100 > logicalBytes*135 {
+		t.Fatalf("final run space amplification=%.3fx want <=1.35x (final=%d logical=%d)", float64(finalBytes)/float64(logicalBytes), finalBytes, logicalBytes)
+	}
+	t.Logf("external exact runs: initial_runs=%d final_pages=%d write_amp=%.3fx space_amp=%.3fx", region.Runs, merged.Pages, float64(totalWritten)/float64(logicalBytes), float64(finalBytes)/float64(logicalBytes))
 }
