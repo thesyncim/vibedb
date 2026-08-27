@@ -116,6 +116,7 @@ const (
 	requestReplicaRetirement
 	requestInstallExecutionGroup
 	requestRemoveExecutionGroup
+	requestObserveSchemaTransition
 	requestQuiesceSchemaGeneration
 	requestInstallSchemaGeneration
 )
@@ -162,6 +163,7 @@ type ownerReply struct {
 	err         error
 	read        readAuthorization
 	observation ReplicaObservation
+	committed   bool
 }
 
 // ReplicaObservation is one coherent control-plane cut collected by the sole
@@ -1018,6 +1020,10 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestRemoveExecutionGroup:
 		reply.err = owner.removeExecutionGroupNow(
 			request.group, request.install.Identity, request.publish,
+		)
+	case requestObserveSchemaTransition:
+		_, reply.committed, reply.err = owner.host.ObserveSchemaTransition(
+			request.group, request.data,
 		)
 	case requestQuiesceSchemaGeneration:
 		reply.err = owner.quiesceSchemaGeneration(request)
@@ -2437,6 +2443,27 @@ func (owner *Owner) ProposeSchemaTransition(
 		return errors.Join(ErrOutcomeUnknown, err)
 	}
 	return err
+}
+
+// ObserveSchemaTransition settles the exact replicated schema command without
+// changing admissions or SQL handles. Callers use this boundary before the
+// catalog CAS; the later quiesce repeats the observation defensively.
+func (owner *Owner) ObserveSchemaTransition(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	command []byte,
+) (bool, error) {
+	if owner == nil || ctx == nil || group == (raftmember.GroupKey{}) || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return false, ErrInvalidOwner
+	}
+	owned := make([]byte, len(command))
+	copy(owned, command)
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestObserveSchemaTransition, group: group, data: owned,
+		bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+	})
+	return reply.committed, err
 }
 
 // QuiesceSchemaGeneration fences new reads and proposals after the ordered

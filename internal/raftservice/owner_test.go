@@ -153,6 +153,36 @@ func TestProposeSchemaTransitionDetachesBoundedCommand(t *testing.T) {
 	}
 }
 
+func TestObserveSchemaTransitionDetachesBoundedCommand(t *testing.T) {
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: replicatedstate.MaxSchemaTransitionBytes,
+	}}
+	group := peerServerTestGroup()
+	command := []byte{1, 2, 3}
+	type result struct {
+		committed bool
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		committed, err := owner.ObserveSchemaTransition(context.Background(), group, command)
+		done <- result{committed: committed, err: err}
+	}()
+	request := <-owner.ingress
+	command[0] = 9
+	if request.kind != requestObserveSchemaTransition || request.group != group ||
+		request.data[0] != 1 || cap(request.data) != len(request.data) {
+		t.Fatalf("request kind=%d group=%+v data=%v len/cap=%d/%d",
+			request.kind, request.group, request.data, len(request.data), cap(request.data))
+	}
+	request.reply <- ownerReply{committed: true}
+	owner.release(request.bytes)
+	got := <-done
+	if got.err != nil || !got.committed {
+		t.Fatalf("observation committed=%t err=%v", got.committed, got.err)
+	}
+}
+
 func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *testing.T) {
 	owner := &Owner{pendingReads: make(map[[16]byte]*readDelivery)}
 	var contextKey [16]byte

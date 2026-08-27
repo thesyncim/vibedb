@@ -310,6 +310,15 @@ func (owners *ExecutionOwners) ProposeSchemaTransition(ctx context.Context, fenc
 	}
 	return owner.ProposeSchemaTransition(ctx, fence, command)
 }
+func (owners *ExecutionOwners) ObserveSchemaTransition(
+	ctx context.Context, group raftmember.GroupKey, command []byte,
+) (bool, error) {
+	owner, err := owners.owner(group)
+	if err != nil {
+		return false, err
+	}
+	return owner.ObserveSchemaTransition(ctx, group, command)
+}
 func (owners *ExecutionOwners) QuiesceSchemaGeneration(ctx context.Context, fence ServingFence, command []byte) error {
 	owner, err := owners.owner(fence.Group)
 	if err != nil {

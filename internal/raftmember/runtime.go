@@ -569,28 +569,30 @@ func (runtime *Runtime) checkUsable() error {
 // owned by Runtime for an exact target-generation install.
 func (runtime *Runtime) QuiesceSQLGeneration() error {
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
-		runtime.node == nil || runtime.wal == nil || runtime.apply == nil ||
-		runtime.database == nil || runtime.schemaGenerationQuiesced {
+		runtime.node == nil || runtime.wal == nil || runtime.database == nil ||
+		runtime.schemaGenerationQuiesced {
 		return ErrSchemaGenerationSwap
 	}
-	if err := runtime.node.ReplaceStateMachine(runtime.apply); err != nil {
-		return errors.Join(ErrSchemaGenerationSwap, err)
-	}
-	if driver := runtime.walGeneration; driver != nil {
-		driver.stopAndWait()
-		resume := &WALGenerationDriverOptions{
-			IntervalTicks: driver.interval, Key: driver.key, OnError: driver.onError,
+	if runtime.apply != nil {
+		if err := runtime.node.ReplaceStateMachine(runtime.apply); err != nil {
+			return errors.Join(ErrSchemaGenerationSwap, err)
 		}
-		resume.Key.Wrapped = append([]byte(nil), driver.key.Wrapped...)
-		runtime.schemaWALResume = resume
-		clear(driver.key.Material[:])
-		clear(driver.key.Wrapped)
-		runtime.walGeneration = nil
+		if driver := runtime.walGeneration; driver != nil {
+			driver.stopAndWait()
+			resume := &WALGenerationDriverOptions{
+				IntervalTicks: driver.interval, Key: driver.key, OnError: driver.onError,
+			}
+			resume.Key.Wrapped = append([]byte(nil), driver.key.Wrapped...)
+			runtime.schemaWALResume = resume
+			clear(driver.key.Material[:])
+			clear(driver.key.Wrapped)
+			runtime.walGeneration = nil
+		}
+		if err := runtime.apply.Close(); err != nil {
+			return errors.Join(ErrSchemaGenerationSwap, err)
+		}
+		runtime.apply = nil
 	}
-	if err := runtime.apply.Close(); err != nil {
-		return errors.Join(ErrSchemaGenerationSwap, err)
-	}
-	runtime.apply = nil
 	if err := runtime.database.Close(); err != nil {
 		return errors.Join(ErrSchemaGenerationSwap, err)
 	}
