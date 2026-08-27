@@ -16,6 +16,17 @@ func requestLedgerPreparedForExecutionPin(t testing.TB) (
 	executionpin.Binding,
 ) {
 	t.Helper()
+	head, _, prepared, binding := requestLedgerPreparedForExecutionPinRows(t)
+	return head, prepared, binding
+}
+
+func requestLedgerPreparedForExecutionPinRows(t testing.TB) (
+	requestledger.HeadRecord,
+	requestledger.ContinuationRecord,
+	requestledger.PreparedTerminalRecord,
+	executionpin.Binding,
+) {
+	t.Helper()
 	plan, err := requestledger.AppendPlan(nil, []byte("execution-pin ledger recipe"))
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +46,7 @@ func requestLedgerPreparedForExecutionPin(t testing.TB) (
 		RequestKeyDigest:          executionpin.Digest(keyDigest),
 		RequestDigest:             executionpin.Digest(requestDigest),
 		CatalogGeneration:         7,
-		SchemaManifestDigest:      executionpin.Digest(routeCertificate),
+		SchemaManifestDigest:      executionpin.Digest(requestLedgerStateTestDigest("logical schema manifest")),
 		TransactionManifestDigest: executionpin.Digest(requestLedgerStateTestDigest("transaction manifest")),
 		ParticipantAuthorityRoot:  executionpin.Digest(requestLedgerStateTestDigest("participant authority")),
 		ParticipantCount:          2,
@@ -157,7 +168,7 @@ func requestLedgerPreparedForExecutionPin(t testing.TB) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	return head, prepared, binding
+	return head, continuation, prepared, binding
 }
 
 func requestLedgerRouteGateOuter(
@@ -307,6 +318,9 @@ func TestRequestLedgerRouteEvidenceBindsRealSettlementAndPhysicalAuthority(t *te
 
 func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing.T) {
 	head, prepared, pinBinding := requestLedgerPreparedForExecutionPin(t)
+	if pinBinding.SchemaManifestDigest == executionpin.Digest(head.RouteSchemaCertificateDigest) {
+		t.Fatal("fixture must keep schema and route-certificate domains distinct")
+	}
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -353,6 +367,31 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 	)
 	if err != nil || !requestLedgerSchemaReleaseCommandAvailable(intent) {
 		t.Fatalf("schema release intent evidence = %v", err)
+	}
+	for name, mutate := range map[string]func(*executionpin.Binding){
+		"schema":       func(binding *executionpin.Binding) { binding.SchemaManifestDigest[0] ^= 1 },
+		"manifest":     func(binding *executionpin.Binding) { binding.TransactionManifestDigest[0] ^= 1 },
+		"participants": func(binding *executionpin.Binding) { binding.ParticipantAuthorityRoot[0] ^= 1 },
+		"count":        func(binding *executionpin.Binding) { binding.ParticipantCount++ },
+		"contract":     func(binding *executionpin.Binding) { binding.ExecutionContractDigest[0] ^= 1 },
+		"home":         func(binding *executionpin.Binding) { binding.LedgerHomeGroup[0] ^= 1 },
+	} {
+		t.Run("foreign_"+name, func(t *testing.T) {
+			foreign := release
+			mutate(&foreign.Binding)
+			foreign.PinID, err = executionpin.DerivePinID(foreign.Binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := executionPinCommand(fixture.binding, client, 2, 3, foreign)
+			row, err := requestledger.NewSchemaPinRelease(head, prepared, head.Revision+1, command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if requestLedgerSchemaReleaseCommandAvailable(row) {
+				t.Fatal("canonical foreign binding passed sealed aggregate pin digest")
+			}
+		})
 	}
 	if _, err = fixture.machine.ApplyNormal(normalMeta(4), releaseBytes); err != nil {
 		t.Fatal(err)

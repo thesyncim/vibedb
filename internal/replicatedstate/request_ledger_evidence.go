@@ -190,7 +190,10 @@ func requestLedgerSchemaReleaseCommandMatches(
 		command.Binding.RequestKeyDigest == executionpin.Digest(record.KeyDigest) &&
 		command.Binding.RequestDigest == executionpin.Digest(record.RequestDigest) &&
 		command.Binding.CatalogGeneration == record.CatalogGeneration &&
-		command.Binding.SchemaManifestDigest == executionpin.Digest(record.RouteSchemaCertificateDigest) &&
+		// SchemaManifestDigest and RouteSchemaCertificateDigest are distinct
+		// domains. The sealed aggregate pin digest authenticates the complete
+		// binding, including its schema manifest; the ledger row separately
+		// binds the route certificate to its head/prepared result.
 		bindingDigest == executionpin.Digest(record.PinDigest) &&
 		command.PrepareTerminalDigest == executionpin.Digest(record.PreparedTerminalDigest)
 }
