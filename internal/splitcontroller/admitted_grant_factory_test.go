@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"testing"
+
+	"github.com/thesyncim/vibedb/gateway"
 )
 
 func TestLocalAdmittedGrantFactoryBindsExactPreparedChildLease(t *testing.T) {
@@ -29,7 +31,7 @@ func TestLocalAdmittedGrantFactoryBindsExactPreparedChildLease(t *testing.T) {
 	factory, err := NewLocalAdmittedGrantFactory(LocalAdmittedGrantFactoryOptions{
 		Node: replica.Node,
 		Children: func(
-			_ context.Context, _ *Plan, _ PlanAdmission, child uint8,
+			_ context.Context, _ *gateway.Snapshot, _ *Plan, _ PlanAdmission, child uint8,
 			gotReplica ChildReplicaTarget, gotLease *RuntimeStoreLease,
 		) (ShardActionExecutor, error) {
 			if child != target.Child || !targetMatchesPreparedReplica(target, gotReplica) || gotLease != lease {

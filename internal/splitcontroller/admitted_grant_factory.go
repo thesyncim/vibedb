@@ -14,11 +14,11 @@ import (
 // resolver: all physical and placement authority is supplied separately by the
 // authenticated retained manifest or PlanIntent.
 type AdmittedShardExecutorFactory func(
-	context.Context, *Plan, PlanAdmission, *RuntimeStoreLease,
+	context.Context, *gateway.Snapshot, *Plan, PlanAdmission, *RuntimeStoreLease,
 ) (ShardActionExecutor, error)
 
 type AdmittedChildExecutorFactory func(
-	context.Context, *Plan, PlanAdmission, uint8, ChildReplicaTarget, *RuntimeStoreLease,
+	context.Context, *gateway.Snapshot, *Plan, PlanAdmission, uint8, ChildReplicaTarget, *RuntimeStoreLease,
 ) (ShardActionExecutor, error)
 
 type AdmittedSourceRuntime struct {
@@ -95,7 +95,7 @@ func (factory *LocalAdmittedGrantFactory) BuildAdmittedShardActionGrants(
 		if err != nil {
 			return nil, err
 		}
-		executor, err := source.NewExecutor(ctx, plan, admission, lease)
+		executor, err := source.NewExecutor(ctx, catalog, plan, admission, lease)
 		if err != nil || executor == nil {
 			return nil, errors.Join(ErrRemoteExecution, err)
 		}
@@ -124,7 +124,7 @@ func (factory *LocalAdmittedGrantFactory) BuildAdmittedShardActionGrants(
 			if err != nil {
 				return nil, err
 			}
-			executor, err := factory.options.Children(ctx, plan, admission, child, replica, lease)
+			executor, err := factory.options.Children(ctx, catalog, plan, admission, child, replica, lease)
 			if err != nil || executor == nil {
 				return nil, errors.Join(ErrRemoteExecution, err)
 			}
