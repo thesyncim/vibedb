@@ -17,12 +17,59 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 type rf3RetainedPruneFactory struct {
 	tls       *rafttransport.PeerTLS
 	authority serviceauthz.Authority
 	lease     *splitcontroller.RuntimeStoreLease
+	source    *sqldriver.ReplicatedApply
+}
+
+func (factory *rf3RetainedPruneFactory) RetireSourceCaptureActivationSession(ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation) error {
+	if factory == nil || factory.source == nil || plan == nil || observed.Catalog == nil {
+		return errRF3Serving
+	}
+	cut, err := factory.source.RangeSplitSnapshot()
+	if err != nil {
+		return err
+	}
+	defer cut.Close()
+	activation, found, err := cut.SplitCaptureActivation()
+	if err != nil || !found || activation.Command.Operation != [32]byte(plan.OperationID()) {
+		return errors.Join(err, splitcontroller.ErrSourceCaptureActivation)
+	}
+	state := cut.State()
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, found := observed.Catalog.ResolveReplicatedRoute(distribution.DistributionName(state.Binding.Distribution), distribution.ShardID(state.Binding.Shard), replicas[:0])
+	if !found {
+		return errRF3Serving
+	}
+	pool, executor, err := newRF3SplitTopologyTransport(factory.tls)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	authorized, err := serviceauthz.WithAuthority(ctx, factory.authority)
+	if err != nil {
+		return err
+	}
+	client := splitcontroller.SourceCaptureClientID(plan.OperationID())
+	cleanup, err := gateway.NewNativeTopologySessionCleanup(gateway.NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: state.Binding.Distribution, Shard: state.Binding.Shard,
+		Tenant: splitcontroller.SourceCaptureTenant(plan.OperationID()), ClientID: client,
+		RetryHome: rf3SplitTopologyRetryHome([]byte("vibedb/split-capture/retry-home\x00"), client),
+		Resolver:  gateway.BaseRelationResolver{Relation: 1}, ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 1, InitialCommandBytes: 4 << 10, MaxCommandBytes: 4 << 10,
+	}, cut)
+	if err != nil {
+		return err
+	}
+	if err := cut.Close(); err != nil {
+		return err
+	}
+	return cleanup.Run(authorized)
 }
 
 func (factory *rf3RetainedPruneFactory) OpenSourceCaptureActivationProposer(
@@ -110,29 +157,12 @@ func openRF3SplitTopologySession(
 	if err != nil {
 		return nil, nil, err
 	}
-	pool, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
-		TLS: tls,
-		Dial: func(ctx context.Context, address string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: rf3NetworkTimeout}).DialContext(ctx, "tcp", address)
-		},
-		HandshakeDeadline: func() time.Time { return time.Now().Add(rf3NetworkTimeout) },
-		MaxConnections:    4, MaxPerEndpoint: 2, MaxIdlePerEndpoint: 1, MaxHandshakes: 2,
-		MaxWaiters: 4, MaxIdleAge: 30 * time.Second, MaxLifetime: 10 * time.Minute,
-	})
+	pool, executor, err := newRF3SplitTopologyTransport(tls)
 	if err != nil {
 		return nil, nil, err
 	}
 	release := func() error { return pool.Close() }
-	executor, err := gateway.NewReplicatedExecutor(pool, 3, rf3RequestTimeout)
-	if err != nil {
-		return nil, release, errors.Join(err, release())
-	}
-	retryInput := make([]byte, 0, len(retryDomain)+len(clientID))
-	retryInput = append(retryInput, retryDomain...)
-	retryInput = append(retryInput, clientID[:]...)
-	retryDigest := sha256.Sum256(retryInput)
-	var retryHome replication.RetryHome
-	copy(retryHome[:], retryDigest[:len(retryHome)])
+	retryHome := rf3SplitTopologyRetryHome(retryDomain, clientID)
 	journalBinding, err := gateway.NativeSessionJournalBinding(
 		route, string(binding.Distribution), string(binding.Shard), tenant, 1,
 		serviceauthz.CapabilityTopology,
@@ -173,6 +203,36 @@ func openRF3SplitTopologySession(
 		return nil, release, errors.Join(err, release())
 	}
 	return session, release, nil
+}
+
+func newRF3SplitTopologyTransport(tls *rafttransport.PeerTLS) (*gateway.AuthenticatedReplicatedClient, *gateway.ReplicatedExecutor, error) {
+	pool, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
+		TLS: tls,
+		Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: rf3NetworkTimeout}).DialContext(ctx, "tcp", address)
+		},
+		HandshakeDeadline: func() time.Time { return time.Now().Add(rf3NetworkTimeout) },
+		MaxConnections:    4, MaxPerEndpoint: 2, MaxIdlePerEndpoint: 1, MaxHandshakes: 2,
+		MaxWaiters: 4, MaxIdleAge: 30 * time.Second, MaxLifetime: 10 * time.Minute,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	executor, err := gateway.NewReplicatedExecutor(pool, 3, rf3RequestTimeout)
+	if err != nil {
+		return nil, nil, errors.Join(err, pool.Close())
+	}
+	return pool, executor, nil
+}
+
+func rf3SplitTopologyRetryHome(retryDomain []byte, clientID replication.ID128) replication.RetryHome {
+	retryInput := make([]byte, 0, len(retryDomain)+len(clientID))
+	retryInput = append(retryInput, retryDomain...)
+	retryInput = append(retryInput, clientID[:]...)
+	retryDigest := sha256.Sum256(retryInput)
+	var retryHome replication.RetryHome
+	copy(retryHome[:], retryDigest[:len(retryHome)])
+	return retryHome
 }
 
 type rf3AuthorizedRetainedPruneProposer struct {

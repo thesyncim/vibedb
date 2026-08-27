@@ -102,6 +102,14 @@ func TestReplicatedChildSourceFixtureSealsCertifiedImage(t *testing.T) {
 }
 
 func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *testing.T) {
+	for _, unknownPublication := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown_publication=%t", unknownPublication), func(t *testing.T) {
+			testReplicatedChildStageNoCopyApplyHandoff(t, unknownPublication)
+		})
+	}
+}
+
+func testReplicatedChildStageNoCopyApplyHandoff(t *testing.T, unknownPublication bool) {
 	fixture := newReplicatedChildSourceFixture(t)
 	targetBinding := testReplicatedBinding(91)
 	targetBinding.Distribution = string(fixture.partitioner.SourceDistribution())
@@ -204,20 +212,32 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	}
 	core.mu.RUnlock()
 
-	unknown, err := stage.activate(
-		certificate, fixture.targetBootstrap,
-		replicatedstate.SnapshotArtifactOptions{},
-		func(database *database) (bool, error) {
+	var publication func(*database) (bool, error)
+	if unknownPublication {
+		publication = func(database *database) (bool, error) {
 			published, persistErr := database.persistCatalogLocked()
 			if persistErr != nil {
 				return published, persistErr
 			}
 			return true, durable.ErrCommitOutcomeUnknown
-		},
+		}
+	}
+	unknown, err := stage.activate(
+		certificate, fixture.targetBootstrap,
+		replicatedstate.SnapshotArtifactOptions{}, publication,
 	)
-	if unknown.Apply != nil || unknown.ApplyIdentity != reservedApply ||
-		!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+	if unknown.ApplyIdentity != reservedApply || (unknownPublication &&
+		(unknown.Apply != nil || !errors.Is(err, durable.ErrCommitOutcomeUnknown))) ||
+		(!unknownPublication && (unknown.Apply == nil || err != nil)) {
 		t.Fatalf("unknown descriptor publication = %+v, %v", unknown, err)
+	}
+	if unknown.Apply != nil {
+		if unknown.Apply.table.collection != finalCollection {
+			t.Fatal("fresh activation copied the sealed user collection")
+		}
+		if err := unknown.Apply.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if opened, err := db.NewSession(context.Background()); opened != nil ||
 		!errors.Is(err, ErrReplicatedChildStageBusy) {
@@ -233,13 +253,15 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if ordinary, _, err := OpenReplicatedShardStoreWithApplyForSettlement(
-		path, base, applyOptions,
-	); ordinary != nil || !errors.Is(err, durable.ErrCheckpointGroupCorrupt) {
-		if ordinary != nil {
-			_ = ordinary.Close()
+	if unknownPublication {
+		if ordinary, _, err := OpenReplicatedShardStoreWithApplyForSettlement(
+			path, base, applyOptions,
+		); ordinary != nil || !errors.Is(err, durable.ErrCheckpointGroupCorrupt) {
+			if ordinary != nil {
+				_ = ordinary.Close()
+			}
+			t.Fatalf("ordinary open of seed-pending image = %v, %v", ordinary, err)
 		}
-		t.Fatalf("ordinary open of seed-pending image = %v, %v", ordinary, err)
 	}
 	resumed, resumedIdentity, err := OpenReplicatedShardStoreForChildStageResume(
 		path, base, applyOptions,

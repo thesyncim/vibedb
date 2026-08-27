@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 	"go.etcd.io/raft/v3"
 )
@@ -63,8 +65,35 @@ type planObservationWireResponse struct {
 	Certificate   []byte                            `json:"certificate,omitempty"`
 	Prune         []byte                            `json:"prune,omitempty"`
 	Stage         []byte                            `json:"stage,omitempty"`
-	Runtime       *ChildObservation                 `json:"runtime,omitempty"`
+	Runtime       *planObservationWireChild         `json:"runtime,omitempty"`
 	Ready         []planObservationWireServingState `json:"ready,omitempty"`
+}
+
+// The WAL identity does not exist during the activated phase. A pointer
+// expresses that absence without asking the strict SQL identity codec to
+// encode an invalid all-zero binding. Apply uses the same lossless cold
+// projection as the admitted plan; reconciliation validates its exact value.
+type planObservationWireChild struct {
+	Child           uint8
+	Phase           ChildPhase
+	ApplyIdentity   persistedApplyIdentity
+	ApplyProfile    sqldriver.ReplicatedApplyCapacityProfile
+	WALBinding      *sqldriver.ReplicatedShardStoreBinding `json:",omitempty"`
+	RuntimeIdentity raftmember.RuntimeIdentity
+}
+
+func appendWireChildObservation(runtime *ChildObservation) *planObservationWireChild {
+	if runtime == nil {
+		return nil
+	}
+	result := &planObservationWireChild{Child: runtime.Child, Phase: runtime.Phase,
+		ApplyIdentity: persistApplyIdentity(runtime.ApplyIdentity), ApplyProfile: runtime.ApplyProfile,
+		RuntimeIdentity: runtime.RuntimeIdentity}
+	if runtime.WALBinding != (sqldriver.ReplicatedShardStoreBinding{}) {
+		binding := runtime.WALBinding
+		result.WALBinding = &binding
+	}
+	return result
 }
 
 type planObservationWireServingState struct {
@@ -170,7 +199,7 @@ func (service *PlanObservationService) Serve(
 			ctx, request.Request, request.TargetMember,
 		)
 		if observeErr != nil {
-			return observeErr
+			return fmt.Errorf("source observation member %d: %w", request.TargetMember, observeErr)
 		}
 		if cut.RequestDigest != request.Request.RequestDigest ||
 			!validNetworkSourceObservation(request, cut) {
@@ -198,22 +227,21 @@ func (service *PlanObservationService) Serve(
 			ctx, request.Request, request.TargetMember,
 		)
 		if observeErr != nil {
-			return observeErr
+			return fmt.Errorf("child observation member %d: %w", request.TargetMember, observeErr)
 		}
 		if cut.RequestDigest != request.Request.RequestDigest ||
 			!validNetworkChildObservation(request, cut) {
-			return ErrPlanObservation
+			return fmt.Errorf("%w: child member %d response binding", ErrPlanObservation, request.TargetMember)
 		}
 		if response.Stage, err = appendOptionalStage(cut.Stage); err != nil {
 			return err
 		}
-		response.Runtime = cloneChildPlanRuntime(cut.Runtime)
+		response.Runtime = appendWireChildObservation(cut.Runtime)
 		if response.Runtime != nil {
-			response.Ready = make([]planObservationWireServingState, len(response.Runtime.ReadyReplicas))
-			for index := range response.Runtime.ReadyReplicas {
-				response.Ready[index] = appendWireServingState(response.Runtime.ReadyReplicas[index])
+			response.Ready = make([]planObservationWireServingState, len(cut.Runtime.ReadyReplicas))
+			for index := range cut.Runtime.ReadyReplicas {
+				response.Ready[index] = appendWireServingState(cut.Runtime.ReadyReplicas[index])
 			}
-			response.Runtime.ReadyReplicas = nil
 		}
 	default:
 		return ErrPlanObservation
@@ -364,6 +392,10 @@ func (client *NetworkPlanObservationClient) ObserveSplitSource(
 			failures = errors.Join(failures, err)
 			continue
 		}
+		if !validNetworkSourceObservation(planObservationWireRequest{Request: request, TargetMember: peer.MemberID}, cut) {
+			failures = errors.Join(failures, ErrPlanObservation)
+			continue
+		}
 		if first == nil {
 			copy := cut
 			first = &copy
@@ -414,6 +446,11 @@ func (client *NetworkPlanObservationClient) ObserveSplitChild(
 				return
 			}
 			results[index].cut, results[index].err = openChildPlanObservation(response)
+			if results[index].err == nil && !validNetworkChildObservation(planObservationWireRequest{
+				Request: request, TargetMember: peer.MemberID,
+			}, results[index].cut) {
+				results[index].err = ErrPlanObservation
+			}
 		}()
 	}
 	group.Wait()
@@ -473,16 +510,42 @@ func validNetworkPlanObservationRequest(request PlanObservationRequest) bool {
 		request.Group.ClusterID != ([16]byte{}) && request.Group.ClusterIncarnation != ([16]byte{}) &&
 		request.Group.ShardIncarnation != ([16]byte{}) && request.Group.GroupID != ([16]byte{}) &&
 		request.Group.TopologyRecoveryEpoch != 0 && request.Command.Valid() &&
+		validPlanObservationSourceTransition(request) &&
 		len(request.ControlEndpoints) > 0 && len(request.ControlEndpoints) <= MaxPlanObservationEndpoints
+}
+
+func validPlanObservationSourceTransition(request PlanObservationRequest) bool {
+	transition := request.SourceTransition
+	if transition == nil {
+		return true
+	}
+	from, to := transition.From, transition.To
+	if !from.Valid() || !to.Valid() || !transition.Range.Valid() || request.Command != from && request.Command != to ||
+		to.OwnershipEpoch != from.OwnershipEpoch+1 || to.OwnershipEpoch <= from.OwnershipEpoch ||
+		to.RoutingVersion <= from.RoutingVersion || to.RouteGeneration <= from.RouteGeneration {
+		return false
+	}
+	to.OwnershipEpoch, to.RoutingVersion, to.RouteGeneration = from.OwnershipEpoch, from.RoutingVersion, from.RouteGeneration
+	return to == from
+}
+
+func planObservationSourceCommandMatches(request PlanObservationRequest, command raftservice.CommandFence) bool {
+	if request.SourceTransition == nil {
+		return command == request.Command
+	}
+	return command == request.SourceTransition.From || command == request.SourceTransition.To
 }
 
 func validNetworkSourceObservation(
 	request planObservationWireRequest, cut SourcePlanObservation,
 ) bool {
 	state, serving := cut.State, cut.Serving
-	binding := state.Binding
+	binding, command := state.Binding, serving.Command
 	identity, status := serving.Identity, serving.Status
 	return validNetworkPlanObservationRequest(request.Request) &&
+		planObservationSourceCommandMatches(request.Request, command) &&
+		(request.Request.SourceTransition == nil || command != request.Request.SourceTransition.To ||
+			binding.OwnedRange == request.Request.SourceTransition.Range) &&
 		request.TargetMember != 0 && state.Applied != 0 &&
 		binding.ClusterID == request.Request.Group.ClusterID &&
 		binding.ClusterIncarnation == request.Request.Group.ClusterIncarnation &&
@@ -492,25 +555,25 @@ func validNetworkSourceObservation(
 		binding.Distribution == string(request.Request.Distribution) &&
 		binding.Shard == string(request.Request.Shard) &&
 		binding.AllocationGeneration == uint64(request.Request.Allocation) &&
-		state.ReplicaSetVersion == request.Request.Command.ReplicaSetVersion &&
-		binding.ActivePolicyGeneration == request.Request.Command.ActivePolicyGeneration &&
-		binding.ProtectionEpoch == request.Request.Command.ProtectionEpoch &&
-		binding.OwnershipEpoch == request.Request.Command.OwnershipEpoch &&
-		binding.SchemaGeneration == request.Request.Command.SchemaGeneration &&
-		binding.RoutingVersion == request.Request.Command.RoutingVersion &&
-		binding.RouteGeneration == request.Request.Command.RouteGeneration &&
+		state.ReplicaSetVersion == command.ReplicaSetVersion &&
+		binding.ActivePolicyGeneration == command.ActivePolicyGeneration &&
+		binding.ProtectionEpoch == command.ProtectionEpoch &&
+		binding.OwnershipEpoch == command.OwnershipEpoch &&
+		binding.SchemaGeneration == command.SchemaGeneration &&
+		binding.RoutingVersion == command.RoutingVersion &&
+		binding.RouteGeneration == command.RouteGeneration &&
 		identity.Group == request.Request.Group &&
 		identity.AllocationGeneration == uint64(request.Request.Allocation) &&
 		identity.MemberID == request.TargetMember && status.MemberID == request.TargetMember &&
 		identity.NodeIncarnation != 0 && identity.StoreID != ([16]byte{}) &&
-		serving.Command == request.Request.Command && status.Applied == state.Applied &&
+		status.Applied == state.Applied &&
 		status.Applied <= status.Commit && status.Term != 0
 }
 
 func validNetworkChildObservation(
 	request planObservationWireRequest, cut ChildPlanObservation,
 ) bool {
-	if !validNetworkPlanObservationRequest(request.Request) || request.TargetMember == 0 {
+	if !validNetworkPlanObservationRequest(request.Request) || request.TargetMember == 0 || request.Request.SourceTransition != nil {
 		return false
 	}
 	if cut.Stage != nil && cut.Stage.Child() != request.Request.Child {
@@ -520,7 +583,8 @@ func validNetworkChildObservation(
 		return true
 	}
 	runtime := cut.Runtime
-	if runtime.Child != request.Request.Child || len(runtime.ReadyReplicas) > 1 {
+	if runtime.Child != request.Request.Child || len(runtime.ReadyReplicas) > 1 || len(runtime.Members) != 0 ||
+		(runtime.ApplyProfile.Binding.MemberID != 0 && runtime.ApplyProfile.Binding.MemberID != request.TargetMember) {
 		return false
 	}
 	for _, serving := range runtime.ReadyReplicas {
@@ -570,12 +634,33 @@ func mergeChildPlanObservations(
 		base := *cut.Runtime
 		ready := base.ReadyReplicas
 		base.ReadyReplicas = nil
-		if merged.Runtime != nil && !sameChildObservationBase(*merged.Runtime, base) {
+		if len(base.Members) != 0 {
+			return ChildPlanObservation{}, ErrPlanObservation
+		}
+		member := base.ApplyProfile.Binding.MemberID
+		if merged.Runtime != nil && (member == 0) != (merged.Runtime.ApplyProfile.Binding.MemberID == 0) {
+			return ChildPlanObservation{}, ErrPlanObservation
+		}
+		if merged.Runtime != nil && member == 0 && !sameChildObservationBase(*merged.Runtime, base) {
 			return ChildPlanObservation{}, ErrPlanObservation
 		}
 		if merged.Runtime == nil {
 			copy := base
 			merged.Runtime = &copy
+		}
+		if member != 0 {
+			if len(merged.Runtime.Members) >= gateway.ServingReplicaCount {
+				return ChildPlanObservation{}, ErrPlanObservation
+			}
+			for _, prior := range merged.Runtime.Members {
+				if prior.Member == member {
+					return ChildPlanObservation{}, ErrPlanObservation
+				}
+			}
+			merged.Runtime.Members = append(merged.Runtime.Members, ChildReplicaObservation{
+				Member: member, Phase: base.Phase, ApplyIdentity: base.ApplyIdentity, ApplyProfile: base.ApplyProfile,
+				WALBinding: base.WALBinding, RuntimeIdentity: base.RuntimeIdentity,
+			})
 		}
 		for _, serving := range ready {
 			duplicate := false
@@ -607,6 +692,7 @@ func cloneChildPlanRuntime(runtime *ChildObservation) *ChildObservation {
 	}
 	copy := *runtime
 	copy.ReadyReplicas = append([]raftservice.ServingState(nil), runtime.ReadyReplicas...)
+	copy.Members = append([]ChildReplicaObservation(nil), runtime.Members...)
 	return &copy
 }
 
@@ -685,8 +771,15 @@ func openSourcePlanObservation(response planObservationWireResponse) (SourcePlan
 }
 
 func openChildPlanObservation(response planObservationWireResponse) (ChildPlanObservation, error) {
-	result := ChildPlanObservation{RequestDigest: response.RequestDigest,
-		Runtime: cloneChildPlanRuntime(response.Runtime)}
+	result := ChildPlanObservation{RequestDigest: response.RequestDigest}
+	if runtime := response.Runtime; runtime != nil {
+		result.Runtime = &ChildObservation{Child: runtime.Child, Phase: runtime.Phase,
+			ApplyIdentity: openPersistedApplyIdentity(runtime.ApplyIdentity), ApplyProfile: runtime.ApplyProfile,
+			RuntimeIdentity: runtime.RuntimeIdentity}
+		if runtime.WALBinding != nil {
+			result.Runtime.WALBinding = *runtime.WALBinding
+		}
+	}
 	if result.Runtime == nil && len(response.Ready) != 0 {
 		return ChildPlanObservation{}, ErrPlanObservation
 	}
@@ -794,7 +887,7 @@ func validWirePlanObservationResponse(response planObservationWireResponse) bool
 func writePlanObservationFrame[T any](writer io.Writer, magic [8]byte, value *T, maximum int) error {
 	payload, err := appendCanonicalVibeJSON(nil, value)
 	if err != nil || len(payload) == 0 || len(payload) > maximum || uint64(len(payload)) > math.MaxUint32 {
-		return errors.Join(ErrPlanObservation, err)
+		return fmt.Errorf("%w: observation frame bytes=%d maximum=%d", errors.Join(ErrPlanObservation, err), len(payload), maximum)
 	}
 	var header [planObservationFrameHeaderBytes]byte
 	copy(header[:8], magic[:])

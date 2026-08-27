@@ -56,7 +56,7 @@ func newRF3SplitObservationRuntime(
 		result.registries = append(result.registries, registry)
 		groups = append(groups, splitcontroller.LocalObservationGroup{
 			Identity: identities[index], Command: commands[index],
-			Registry: registry,
+			Registry: registry, Capture: item.apply,
 		})
 	}
 	provider, err := splitcontroller.NewLocalPlanObservationProvider(owners, groups)

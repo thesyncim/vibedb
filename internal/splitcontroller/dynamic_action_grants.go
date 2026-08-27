@@ -146,8 +146,32 @@ func (grants *DynamicShardActionGrants) resolve(
 	}
 	grants.mu.RLock()
 	grant, found := grants.grants[shardActionGrantKey{operation, digest, target}]
+	if !found {
+		// A source's exact seal is already part of its admitted plan. Reuse
+		// that one executor/lease only for post-seal actions, without creating
+		// a duplicate lifecycle owner or accepting arbitrary later epochs.
+		for key, candidate := range grants.grants {
+			if key.operation != operation || key.digest != digest || candidate.Plan == nil ||
+				candidate.Actions&sourceSplitActionMask() == 0 {
+				continue
+			}
+			sealed := candidate.Target
+			sealed.Authority.OwnershipEpoch = uint64(candidate.Plan.children[candidate.Plan.retained].OwnershipEpoch)
+			sealed.Authority.RoutingVersion = uint64(candidate.Plan.targetManifest.Version())
+			sealed.Authority.RouteGeneration = candidate.Plan.next
+			if sealed == target {
+				grant, found = candidate, true
+				grant.Target, grant.Actions = target, candidate.Actions&sourceSealedActionMask()
+				break
+			}
+		}
+	}
 	grants.mu.RUnlock()
 	return grant, found
+}
+
+func sourceSealedActionMask() uint16 {
+	return actionBit(ActionCatchUpTail) | actionBit(ActionCertifyCutover) | actionBit(ActionPruneRetained)
 }
 
 // retire removes every capability for one exact admitted operation. Matching

@@ -115,6 +115,16 @@ func (service *ControllerService) ExecuteReplicatedOperation(
 			return Action{}, admissionErr
 		}
 	}
+	if len(record.Execution) != 0 && !record.ExecutionSettled {
+		// A destination may already have changed ownership. Obtaining another
+		// global cut is neither necessary nor safe as a prerequisite to replay:
+		// the catalog already owns every byte and target of this pending wave.
+		action, err := pendingRemoteAction(record)
+		if err != nil {
+			return Action{}, err
+		}
+		return action, executeRemoteActionWave(ctx, service.catalog, plan, Observation{}, action, service.router, service.gateway != nil)
+	}
 	observed, err := service.observer.ObservePlan(ctx, plan)
 	if err != nil {
 		return Action{}, err

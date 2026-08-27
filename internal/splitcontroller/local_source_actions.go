@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/splitcapture"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -26,6 +27,35 @@ type LocalSourceActions struct {
 	active  *rangesplit.SourceCapture
 	tail    rangesplit.TailWorkspace
 	read    rangesplit.SourceCaptureWorkspace
+}
+
+// CaptureActivated consults replicated authority before a replay can open a
+// fresh control session. A lost action response must not resurrect that session
+// after the following artifact step has retired it.
+func (a *LocalSourceActions) CaptureActivated(plan *Plan) (bool, error) {
+	if a == nil || plan == nil || plan.operation != a.store.operation {
+		return false, ErrInvalidPlan
+	}
+	a.mu.Lock()
+	cut, err := a.runtime.RangeSplitSnapshot()
+	a.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	defer cut.Close()
+	activation, found, err := cut.SplitCaptureActivation()
+	if err != nil || !found {
+		return false, err
+	}
+	raw, err := plan.AppendSourceCaptureActivation(nil, cut.State())
+	if err != nil {
+		return false, err
+	}
+	want, err := splitcapture.OpenCommand(raw)
+	if err != nil || !sameSourceCaptureAuthority(activation.Command, want.Command) {
+		return false, errors.Join(err, ErrTopologyConflict)
+	}
+	return true, nil
 }
 
 // ExecuteActivateCapture admits the immutable capture cut through the source

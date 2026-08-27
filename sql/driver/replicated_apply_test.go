@@ -3015,6 +3015,10 @@ func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(
 	if err != nil || capture.Head() != 2 {
 		t.Fatalf("recovered header-only capture head=%d err=%v", capture.Head(), err)
 	}
+	ancestor, err := capture.Descriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
 	document := []byte(`{"id":"capture","value":1}`)
 	key := testReplicatedApplyKey(t, database, document)
 	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
@@ -3044,6 +3048,32 @@ func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(
 	recovered, err := reopenedClaim.BeginRangeSplitCapture(partitioner)
 	if err != nil || recovered.Head() != 3 {
 		t.Fatalf("recovered capture head=%d err=%v", recovered.Head(), err)
+	}
+	cut, err := reopenedClaim.RangeSplitSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := cut.State()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if head, err := reopenedClaim.RangeSplitCaptureHeadAt(state, ancestor); err != nil || head != 3 {
+		t.Fatalf("lagging controller descriptor did not recover the exact live head: head=%d err=%v", head, err)
+	}
+	for _, mutate := range []func(*replicatedstate.State){
+		func(s *replicatedstate.State) { s.Applied-- },
+		func(s *replicatedstate.State) { s.LastEntryDigest[0]++ },
+		func(s *replicatedstate.State) { s.Binding.OwnershipEpoch++ },
+	} {
+		forged := state
+		mutate(&forged)
+		if _, err := reopenedClaim.RangeSplitCaptureHeadAt(forged, ancestor); err == nil {
+			t.Fatal("mixed source/capture cut was accepted")
+		}
+	}
+	ancestor.Head.EntryDigest[0]++
+	if _, err := reopenedClaim.RangeSplitCaptureHeadAt(state, ancestor); err == nil {
+		t.Fatal("forged controller descriptor was accepted")
 	}
 }
 

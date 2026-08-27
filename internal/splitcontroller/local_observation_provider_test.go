@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
@@ -13,6 +14,59 @@ import (
 
 type localObservationOwnerStub struct {
 	observation raftservice.ReplicaObservation
+}
+
+type localChildObservationStub struct{ child ChildObservation }
+
+func (stub localChildObservationStub) ObserveLocalSplitChild(context.Context, PlanObservationRequest, uint64) (*ChildObservation, error) {
+	return cloneChildPlanRuntime(&stub.child), nil
+}
+
+func TestLocalChildReadinessComesFromExactLiveOwnerCut(t *testing.T) {
+	request, state, _ := networkPlanObservationFixture(t)
+	request.Child = 1
+	request.RequestDigest = planObservationRequestDigest(request)
+	serving := servingForPlanObservation(request, 1, state.Applied)
+	runtimeRoot := filepath.Join(t.TempDir(), "split-runtime")
+	if err := os.Mkdir(runtimeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := OpenRuntimeStoreRegistry(runtimeRoot, [32]byte{1}, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = registry.Close() })
+	ownerCut := raftservice.ReplicaObservation{Identity: serving.Identity, State: state, Status: serving.Status}
+	provider, err := NewLocalPlanObservationProvider(localObservationOwnerStub{ownerCut}, []LocalObservationGroup{{
+		Identity: serving.Identity, Command: request.Command, Registry: registry,
+		Children: localChildObservationStub{ChildObservation{Child: 1, Phase: ChildPhaseRuntimeAdopted, RuntimeIdentity: serving.Identity}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := provider.ObserveSplitChild(t.Context(), request, 1)
+	if err != nil || got.Runtime == nil || len(got.Runtime.ReadyReplicas) != 1 || got.Runtime.ReadyReplicas[0].Identity != serving.Identity || got.Runtime.ReadyReplicas[0].Status.Applied != state.Applied {
+		t.Fatalf("member-local readiness missing: %v", err)
+	}
+	for _, mutate := range []func(*raftservice.ReplicaObservation){
+		func(o *raftservice.ReplicaObservation) { o.Identity.StoreID[0]++ },
+		func(o *raftservice.ReplicaObservation) { o.Identity.NodeIncarnation++ },
+		func(o *raftservice.ReplicaObservation) { o.State.Binding.OwnershipEpoch++ },
+		func(o *raftservice.ReplicaObservation) { o.Status.Applied++ },
+	} {
+		forged := ownerCut
+		mutate(&forged)
+		provider.owners = localObservationOwnerStub{forged}
+		if _, err := provider.ObserveSplitChild(t.Context(), request, 1); err == nil {
+			t.Fatal("substituted local owner cut counted as a ready member")
+		}
+	}
+	ownerCut.Status.LeaderID = 0
+	provider.owners = localObservationOwnerStub{ownerCut}
+	got, err = provider.ObserveSplitChild(t.Context(), request, 1)
+	if err != nil || got.Runtime == nil || len(got.Runtime.ReadyReplicas) != 0 {
+		t.Fatalf("leaderless member counted as ready: %v", err)
+	}
 }
 
 func (stub localObservationOwnerStub) ObserveReplica(
@@ -113,6 +167,33 @@ func TestLocalPlanObservationProviderReadsDurableBoundedSourceState(t *testing.T
 	wrong.RequestDigest = planObservationRequestDigest(wrong)
 	if _, err = provider.ObserveSplitSource(t.Context(), wrong, 1); err == nil {
 		t.Fatal("wrong command reached durable runtime registry")
+	}
+	// The source commits its narrowed ownership before the catalog CAS. Both
+	// a still-parent catalog and a reopened source must observe that exact cut.
+	transition := PlanObservationSourceTransition{From: request.Command, To: request.Command,
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{128}}}}
+	transition.To.OwnershipEpoch++
+	transition.To.RoutingVersion++
+	transition.To.RouteGeneration++
+	actual.Binding.OwnershipEpoch = transition.To.OwnershipEpoch
+	actual.Binding.RoutingVersion = transition.To.RoutingVersion
+	actual.Binding.RouteGeneration = transition.To.RouteGeneration
+	actual.Binding.OwnedRange = transition.Range
+	provider.owners = localObservationOwnerStub{raftservice.ReplicaObservation{State: actual, Status: serving.Status}}
+	if _, err := provider.ObserveSplitSource(t.Context(), request, 1); err == nil {
+		t.Fatal("an unnamed ownership successor was accepted")
+	}
+	request.SourceTransition = &transition
+	for _, startup := range []raftservice.CommandFence{transition.From, transition.To} {
+		provider.groups[0].Command = startup
+		for _, catalogCommand := range []raftservice.CommandFence{transition.From, transition.To} {
+			request.Command = catalogCommand
+			request.RequestDigest = planObservationRequestDigest(request)
+			got, err := provider.ObserveSplitSource(t.Context(), request, 1)
+			if err != nil || got.Serving.Command != transition.To || got.State.Binding != actual.Binding {
+				t.Fatalf("sealed source observation startup=%+v catalog=%+v got=%+v err=%v", startup, catalogCommand, got, err)
+			}
+		}
 	}
 }
 

@@ -1608,6 +1608,39 @@ func (a *ReplicatedApply) CheckpointAppliedIndex() uint64 {
 	return a.machine.CheckpointAppliedIndex()
 }
 
+// RangeSplitCaptureHeadAt proves a retained descriptor is an ancestor of the
+// exact observed source publication. Controller files can lag committed Raft
+// entries (including the terminal seal); they are not the live capture head.
+func (a *ReplicatedApply) RangeSplitCaptureHeadAt(state replicatedstate.State, ancestor rangesplit.SourceCaptureDescriptor) (uint64, error) {
+	if a == nil || a.database == nil {
+		return 0, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return 0, err
+	}
+	if a.rangeSplitCapture == nil {
+		return 0, rangesplit.ErrSourceCapture
+	}
+	current, err := a.rangeSplitCapture.Descriptor()
+	if err != nil {
+		return 0, err
+	}
+	if current.Head.Applied != state.Applied || current.Head.Term != state.LastTerm ||
+		current.Head.EntryDigest != state.LastEntryDigest || current.Head.DataChainDigest != state.DataChainDigest ||
+		current.Head.BaseDigest != state.SnapshotBaseDigest || current.Head.RouteGeneration != state.Binding.RouteGeneration ||
+		current.Coordinates.OwnershipEpoch != state.Binding.OwnershipEpoch ||
+		current.Coordinates.RoutingVersion != state.Binding.RoutingVersion || current.Coordinates.RouteGeneration != state.Binding.RouteGeneration {
+		return 0, rangesplit.ErrSourceCapture
+	}
+	var workspace rangesplit.SourceCaptureWorkspace
+	if err := a.rangeSplitCapture.ValidateDescriptorAncestor(ancestor, &workspace); err != nil {
+		return 0, err
+	}
+	return current.Head.Applied, nil
+}
+
 // Published implements raftmodel.StateMachine.
 func (a *ReplicatedApply) Published() raftmodel.Publication {
 	if a == nil || a.database == nil {

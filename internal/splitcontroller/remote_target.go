@@ -392,8 +392,8 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 		return ErrRemoteExecution
 	}
 	action := Action{Kind: ActionKind(request.Action), Child: request.Child}
-	if request.Step != replicatedActionProof(request.Operation, replicatedActionCursor(action)) ||
-		payload.Sequence != remoteActionWitnessSequence(action) {
+	if request.Step != remoteExecutionStep(request.Operation, action, payload.ExecutionRevision) ||
+		payload.Sequence != remoteExecutionSequence(action, payload.ExecutionRevision) {
 		return ErrRemoteExecution
 	}
 	binding := observed.SourceState.Binding

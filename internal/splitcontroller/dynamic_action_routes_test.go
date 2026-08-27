@@ -87,6 +87,71 @@ func TestRF3AdmissionSettlesEveryMemberBeforePublishingExactRoutes(t *testing.T)
 	}
 }
 
+func TestAdmittedSourceSealRoutesAndGrantsStayExactBeforeCatalogPublication(t *testing.T) {
+	plan, catalog := testRF3AdmissionPlan(t)
+	admission, err := NewPlanAdmission(catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := NewDynamicShardActionRoutes(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := routes.InstallPlanRoutes(catalog, plan, admission); err != nil {
+		t.Fatal(err)
+	}
+	state := testSourceState(plan)
+	observed := Observation{Catalog: catalog, SourceState: state, SourceStatus: testLeaderStatus(state)}
+	parent, err := remoteActionTarget(plan, observed, Action{Kind: ActionStartCapture})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := parent
+	sealed.Authority.OwnershipEpoch = uint64(plan.children[plan.retained].OwnershipEpoch)
+	sealed.Authority.RoutingVersion = uint64(plan.targetManifest.Version())
+	sealed.Authority.RouteGeneration = plan.next
+	request := shardcontrol.Request{Operation: [32]byte(plan.OperationID()), PlanDigest: admission.PlanDigest}
+	action := Action{Kind: ActionCatchUpTail}
+	route, err := routes.ResolveShardControl(t.Context(), sealed, action, request)
+	if err != nil || !targetMatchesRoute(sealed, route) || catalog.Generation() != plan.current {
+		t.Fatalf("post-seal control route unavailable before catalog CAS: %v", err)
+	}
+	if _, err := routes.ResolveShardControl(t.Context(), sealed, Action{Kind: ActionStartCapture}, request); err == nil {
+		t.Fatal("sealed control route widened pre-seal actions")
+	}
+	grants, err := NewDynamicShardActionGrants(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &recordingShardActionExecutor{}
+	grant := ShardActionGrant{Operation: plan.OperationID(), PlanDigest: admission.PlanDigest, Target: parent,
+		Plan: plan, Observer: &testPlanObserver{operation: plan.OperationID(), observed: observed},
+		Executor: executor, Actions: sourceSplitActionMask()}
+	if err := grants.Install([]ShardActionGrant{grant}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, found := grants.resolve(plan.OperationID(), admission.PlanDigest, sealed)
+	if !found || resolved.Executor != executor || resolved.Actions != sourceSealedActionMask() || len(grants.grants) != 1 {
+		t.Fatal("sealed source did not retain exactly one lifecycle owner with restricted actions")
+	}
+	for _, mutate := range []func(*ShardActionTarget){
+		func(v *ShardActionTarget) { v.Authority.OwnershipEpoch++ },
+		func(v *ShardActionTarget) { v.Authority.SchemaGeneration++ },
+		func(v *ShardActionTarget) { v.Authority.RouteGeneration++ },
+		func(v *ShardActionTarget) { v.Group.GroupID[0]++ },
+		func(v *ShardActionTarget) { v.RelationManifestDigest[0]++ },
+	} {
+		forged := sealed
+		mutate(&forged)
+		if _, err := routes.ResolveShardControl(t.Context(), forged, action, request); err == nil {
+			t.Fatal("substituted sealed route accepted")
+		}
+		if _, found := grants.resolve(plan.OperationID(), admission.PlanDigest, forged); found {
+			t.Fatal("substituted sealed action grant accepted")
+		}
+	}
+}
+
 func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 	t.Helper()
 	sourceLeaders := []distribution.EndpointID{"source-a", "source-b", "source-c"}

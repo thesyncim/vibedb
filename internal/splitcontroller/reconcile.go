@@ -634,6 +634,20 @@ type ChildObservation struct {
 	// applying the certified cut. A leader's progress tracker alone is not an
 	// apply proof for followers, so every slot is one member-local ServingState.
 	ReadyReplicas []raftservice.ServingState
+
+	// Members retains independently authenticated local lifecycle evidence.
+	// Store IDs, apply storage and WAL bindings differ across RF3 replicas;
+	// they must be checked against each prepared member, never equated.
+	Members []ChildReplicaObservation `json:"members,omitempty"`
+}
+
+type ChildReplicaObservation struct {
+	Member          uint64
+	Phase           ChildPhase
+	ApplyIdentity   sqldriver.ReplicatedApplyIdentity
+	ApplyProfile    sqldriver.ReplicatedApplyCapacityProfile
+	WALBinding      sqldriver.ReplicatedShardStoreBinding
+	RuntimeIdentity raftmember.RuntimeIdentity
 }
 
 // Observation is one detached control-loop cut. Pointers distinguish absent
@@ -1048,6 +1062,13 @@ func (p *Plan) childAction(
 		if status == nil {
 			return Action{Kind: ActionActivateChild, Child: uint8(child)}, true, nil
 		}
+		if len(status.Members) != 0 {
+			action, needed, err := replicatedChildAction(target, *status, certificate)
+			if needed || err != nil {
+				return action, needed, err
+			}
+			continue
+		}
 		if status.Child != uint8(child) ||
 			status.Phase < ChildPhaseActivated || status.Phase > ChildPhaseRuntimeAdopted ||
 			status.ApplyIdentity.Storage == "" ||
@@ -1096,6 +1117,98 @@ func (p *Plan) childAction(
 		}
 	}
 	return Action{}, false, nil
+}
+
+func replicatedChildAction(target ChildTarget, status ChildObservation, certificate rangesplit.CutoverCertificate) (Action, bool, error) {
+	if status.Child != target.Child || len(status.Members) > len(target.Replicas) || len(target.Replicas) != gateway.ServingReplicaCount {
+		return Action{}, false, ErrTopologyConflict
+	}
+	minimumPhase := ChildPhaseRuntimeAdopted
+	var profile sqldriver.ReplicatedApplyCapacityProfile
+	for index, member := range status.Members {
+		var replica *ChildReplicaTarget
+		for candidate := range target.Replicas {
+			if target.Replicas[candidate].Member == member.Member {
+				replica = &target.Replicas[candidate]
+				break
+			}
+		}
+		if replica == nil || member.Phase < ChildPhaseActivated || member.Phase > ChildPhaseRuntimeAdopted ||
+			member.ApplyIdentity != replica.Apply || member.ApplyProfile.Binding != replica.SQL.Binding ||
+			member.ApplyProfile.RelationManifestDigest != target.RelationManifestDigest ||
+			!member.ApplyProfile.Initialized || member.ApplyProfile.Applied < certificate.SourceCut().Applied ||
+			member.ApplyProfile.SessionEpochHighWater != certificate.SourceCut().Applied ||
+			member.ApplyProfile.MaxSessions != member.ApplyIdentity.MaxSessions || member.ApplyProfile.RetryWindow != member.ApplyIdentity.RetryWindow {
+			return Action{}, false, ErrTopologyConflict
+		}
+		for prior := 0; prior < index; prior++ {
+			if status.Members[prior].Member == member.Member {
+				return Action{}, false, ErrTopologyConflict
+			}
+		}
+		if member.Phase == ChildPhaseActivated {
+			if member.WALBinding != (sqldriver.ReplicatedShardStoreBinding{}) || member.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
+				member.ApplyProfile.Applied != certificate.SourceCut().Applied || member.ApplyProfile.SessionCount != 0 || member.ApplyProfile.SessionSlotCount != 0 {
+				return Action{}, false, ErrTopologyConflict
+			}
+		} else if member.WALBinding != replica.SQL.Binding {
+			return Action{}, false, ErrTopologyConflict
+		}
+		if member.Phase == ChildPhaseWALCreated && member.RuntimeIdentity != (raftmember.RuntimeIdentity{}) {
+			return Action{}, false, ErrTopologyConflict
+		}
+		if member.Phase == ChildPhaseRuntimeAdopted {
+			local := target
+			local.WAL, local.SQL = replica.WAL, replica.SQL
+			if !runtimeIdentityMatches(local, member.RuntimeIdentity) {
+				return Action{}, false, ErrTopologyConflict
+			}
+		}
+		minimumPhase = min(minimumPhase, member.Phase)
+		profile = member.ApplyProfile
+	}
+	action := Action{Child: target.Child}
+	if minimumPhase != ChildPhaseRuntimeAdopted && len(status.Members) != len(target.Replicas) {
+		action.Kind = ActionActivateChild
+		return action, true, nil
+	}
+	switch minimumPhase {
+	case ChildPhaseActivated:
+		action.Kind = ActionCreateChildWAL
+	case ChildPhaseWALCreated:
+		action.Kind = ActionAdoptChildRuntime
+	case ChildPhaseRuntimeAdopted:
+		for _, ready := range status.ReadyReplicas {
+			found := false
+			for _, member := range status.Members {
+				found = found || member.RuntimeIdentity == ready.Identity
+			}
+			if !found {
+				return Action{}, false, ErrTopologyConflict
+			}
+		}
+		// RF3 may elect any prepared voter. The first target owns no special
+		// publication authority; bind the quorum check to the independently
+		// observed leader, whose exact local identity was validated above.
+		quorumTarget := target
+		if len(status.ReadyReplicas) != 0 {
+			for _, replica := range target.Replicas {
+				if replica.Member == status.ReadyReplicas[0].Status.LeaderID {
+					quorumTarget.WAL, quorumTarget.SQL = replica.WAL, replica.SQL
+					break
+				}
+			}
+		}
+		ready, valid := childQuorumReady(quorumTarget, profile, status.ReadyReplicas, len(target.Replicas), certificate.SourceCut().Applied)
+		if !valid {
+			return Action{}, false, ErrTopologyConflict
+		}
+		if ready {
+			return Action{}, false, nil
+		}
+		action.Kind = ActionAwaitChildReady
+	}
+	return action, true, nil
 }
 
 func childQuorumReady(

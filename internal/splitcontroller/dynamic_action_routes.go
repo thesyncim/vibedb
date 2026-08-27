@@ -21,7 +21,8 @@ type admittedPlanRouteKey struct {
 }
 
 type admittedPlanRoutes struct {
-	routes []gateway.ReplicatedRoute
+	routes       []gateway.ReplicatedRoute
+	sealedSource gateway.ReplicatedRoute
 }
 
 // DynamicShardActionRoutes is the bounded gateway-local routing capability
@@ -57,18 +58,22 @@ func (directory *DynamicShardActionRoutes) InstallPlanRoutes(
 	if err != nil {
 		return err
 	}
+	sealed := cloneReplicatedRoute(routes[0])
+	sealed.Command.OwnershipEpoch = uint64(plan.children[plan.retained].OwnershipEpoch)
+	sealed.Command.RoutingVersion = uint64(plan.targetManifest.Version())
+	sealed.Command.RouteGeneration = plan.next
 	key := admittedPlanRouteKey{operation: admission.Operation, digest: admission.PlanDigest}
 	directory.mu.Lock()
 	defer directory.mu.Unlock()
 	if _, found := directory.plans[key]; !found && len(directory.plans) == directory.limit {
 		return ErrShardControlRoute
 	}
-	directory.plans[key] = admittedPlanRoutes{routes: routes}
+	directory.plans[key] = admittedPlanRoutes{routes: routes, sealedSource: sealed}
 	return nil
 }
 
 func (directory *DynamicShardActionRoutes) ResolveShardControl(
-	_ context.Context, target ShardActionTarget, _ Action, request shardcontrol.Request,
+	_ context.Context, target ShardActionTarget, action Action, request shardcontrol.Request,
 ) (gateway.ReplicatedRoute, error) {
 	if directory == nil || !target.valid() || request.Operation == ([32]byte{}) ||
 		request.PlanDigest == ([32]byte{}) {
@@ -78,6 +83,12 @@ func (directory *DynamicShardActionRoutes) ResolveShardControl(
 	directory.mu.RLock()
 	set, found := directory.plans[key]
 	if found {
+		// These control-only coordinates are derived from the admitted plan,
+		// not published as a client route before the certified catalog CAS.
+		if sourceSealedActionMask()&actionBit(action.Kind) != 0 && targetMatchesRoute(target, set.sealedSource) {
+			directory.mu.RUnlock()
+			return cloneReplicatedRoute(set.sealedSource), nil
+		}
 		for _, route := range set.routes {
 			if targetMatchesRoute(target, route) {
 				directory.mu.RUnlock()

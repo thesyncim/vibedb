@@ -31,6 +31,7 @@ type SourceCaptureActivationProposerFactory interface {
 	OpenSourceCaptureActivationProposer(
 		context.Context, *Plan, Observation,
 	) (SourceCaptureActivationProposer, func() error, error)
+	RetireSourceCaptureActivationSession(context.Context, *Plan, Observation) error
 }
 
 // RF3SourceCaptureActivationProposer binds activation to the operation's

@@ -34,6 +34,7 @@ type remoteStepPayload struct {
 	CatalogDigest     [32]byte                        `json:"catalog_digest"`
 	AdmissionRevision uint64                          `json:"admission_revision"`
 	Sequence          uint64                          `json:"sequence"`
+	ExecutionRevision uint64                          `json:"execution_revision,omitempty"`
 	PredecessorDigest [32]byte                        `json:"predecessor_digest"`
 	Target            ShardActionTarget               `json:"target"`
 	SourceNode        rafttransport.NodeID            `json:"source_node"`
@@ -71,19 +72,7 @@ func ExecuteRemoteReplicatedStep(
 			if action.Kind == ActionComplete {
 				return nil
 			}
-			request, err := appendRemoteStepRequest(nil, plan, observed, action)
-			if err != nil || request.Operation != [32]byte(operation) {
-				return errors.Join(ErrRemoteExecution, err)
-			}
-			response, err := router.ExecuteShardControl(ctx, action, request)
-			if err != nil {
-				return err
-			}
-			if response.Code != shardcontrol.ResultAccepted ||
-				response.Operation != request.Operation || response.Step != request.Step {
-				return ErrRemoteExecution
-			}
-			return nil
+			return executeRemoteActionWave(ctx, journal, plan, observed, action, router, false)
 		})
 }
 

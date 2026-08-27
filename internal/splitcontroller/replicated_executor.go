@@ -81,9 +81,8 @@ func AdmitReplicatedPlan(
 }
 
 // ExecuteReplicatedStep records intent in the catalog RF3 group before invoking
-// one reconciled action. On restart, a Running record is re-executed only when
-// observation still requests the same action; when durable observation has
-// advanced, the record itself advances to the next planned action.
+// one reconciled action. On restart, an outcome-unknown remote wave settles
+// before observation may advance the operation to the next planned action.
 func ExecuteReplicatedStep(
 	ctx context.Context,
 	journal ReplicatedOperationJournal,
@@ -130,6 +129,13 @@ func ExecuteReplicatedStep(
 		record.State > gateway.ReplicatedOperationComplete:
 		return Action{}, ErrReplicatedExecution
 	case record.Cursor != wantCursor || record.Proof != wantProof:
+		if len(record.Execution) != 0 && !record.ExecutionSettled {
+			prior, err := pendingRemoteAction(record)
+			if err != nil {
+				return Action{}, err
+			}
+			return prior, execute(ctx, plan.OperationID(), prior)
+		}
 		unbound := record.Cursor == preparationCursor(preparationPending) && record.Proof == preparationProof(id, intentDigest, preparationPending)
 		if record.State != gateway.ReplicatedOperationRunning &&
 			!(record.State == gateway.ReplicatedOperationPlanned && unbound) {
@@ -140,6 +146,7 @@ func ExecuteReplicatedStep(
 		next.Revision++
 		next.CatalogGeneration = observed.Catalog.Generation()
 		next.Cursor, next.Proof = wantCursor, wantProof
+		next.Execution, next.ExecutionRevision, next.ExecutionSettled = nil, 0, false
 		if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 			return Action{}, err
 		}
@@ -149,6 +156,7 @@ func ExecuteReplicatedStep(
 		if record.State != gateway.ReplicatedOperationComplete {
 			next := record
 			next.State = gateway.ReplicatedOperationComplete
+			next.Execution, next.ExecutionRevision, next.ExecutionSettled = nil, 0, false
 			next.Revision++
 			if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 				return Action{}, err

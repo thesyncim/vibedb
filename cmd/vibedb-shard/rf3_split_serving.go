@@ -163,7 +163,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 					return nil, openErr
 				}
 				topologyFactory := &rf3RetainedPruneFactory{
-					tls: options.profile, authority: authority, lease: lease,
+					tls: options.profile, authority: authority, lease: lease, source: apply,
 				}
 				composite, openErr := splitcontroller.NewCompositeShardActionExecutor(splitcontroller.CompositeShardActionExecutorOptions{
 					Operation: plan.OperationID(), Actions: splitcontroller.SourceSplitActionMask(),
@@ -234,6 +234,11 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		)
 		if openErr != nil {
 			return nil, openErr
+		}
+		defer clear(key.Material[:])
+		key.Wrapped, openErr = options.prepared[registryIndex].wal.AuthenticatedWrappedKeyMetadata(key)
+		if openErr != nil {
+			return nil, fmt.Errorf("authenticate split child WAL key metadata: %w", openErr)
 		}
 		workspace := make([]byte, rangesplit.DefaultChildArtifactChunkBytes)
 		executor, openErr := splitcontroller.NewLazyReplicatedChildExecutor(

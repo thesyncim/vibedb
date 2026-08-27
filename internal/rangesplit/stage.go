@@ -343,6 +343,14 @@ func (s *ChildStage) ApplyTailBatch(
 		if err := s.sealAccumulatedImage(&next); err != nil {
 			return err
 		}
+		// Bind the seal to the final physical root, not a durable redo overlay.
+		// Checkpoint-group activation must discharge that overlay before it
+		// publishes its descriptor; folding it later would invalidate the exact
+		// image identity retained below. This folds only the bounded journal,
+		// without rescanning the child rows or weakening the image fence.
+		if err := s.collection.Flush(); err != nil {
+			return err
+		}
 	}
 	if err := s.persistCursor(&next, persist); err != nil {
 		return err

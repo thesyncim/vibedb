@@ -1004,6 +1004,11 @@ type ReplicatedOperationRecord struct {
 	Proof             [32]byte                 `json:"proof"`
 	IntentDigest      [32]byte                 `json:"intent_digest"`
 	Intent            []byte                   `json:"intent"`
+	// Execution retains one bounded exact action wave before any external
+	// effect. It is replaced only after settlement or an observed phase change.
+	Execution         []byte `json:"execution,omitempty"`
+	ExecutionRevision uint64 `json:"execution_revision,omitempty"`
+	ExecutionSettled  bool   `json:"execution_settled,omitempty"`
 }
 
 func validReplicatedOperation(record ReplicatedOperationRecord) bool {
@@ -1013,7 +1018,16 @@ func validReplicatedOperation(record ReplicatedOperationRecord) bool {
 		record.Revision != 0 && record.CatalogGeneration != 0 && record.Proof != ([32]byte{}) &&
 		record.IntentDigest != ([32]byte{}) && len(record.Intent) != 0 &&
 		len(record.Intent) <= maxReplicatedOperationIntentBytes &&
-		sha256.Sum256(record.Intent) == record.IntentDigest
+		sha256.Sum256(record.Intent) == record.IntentDigest && validReplicatedOperationExecution(record)
+}
+
+func validReplicatedOperationExecution(record ReplicatedOperationRecord) bool {
+	if len(record.Execution) == 0 {
+		return record.ExecutionRevision == 0 && !record.ExecutionSettled
+	}
+	return record.Kind == ReplicatedOperationSplit && len(record.Execution) <= MaxReplicatedOperationBytes &&
+		record.ExecutionRevision != 0 && record.ExecutionRevision <= record.Revision &&
+		record.State == ReplicatedOperationRunning
 }
 
 // Valid applies the same bounded record contract used by catalog-Raft
@@ -1027,7 +1041,8 @@ func (record ReplicatedOperationRecord) Equal(other ReplicatedOperationRecord) b
 		record.Revision == other.Revision &&
 		record.CatalogGeneration == other.CatalogGeneration && record.Cursor == other.Cursor &&
 		record.Proof == other.Proof && record.IntentDigest == other.IntentDigest &&
-		bytes.Equal(record.Intent, other.Intent)
+		bytes.Equal(record.Intent, other.Intent) && bytes.Equal(record.Execution, other.Execution) &&
+		record.ExecutionRevision == other.ExecutionRevision && record.ExecutionSettled == other.ExecutionSettled
 }
 
 type replicatedOperationPayload struct {
@@ -1039,6 +1054,9 @@ type replicatedOperationPayload struct {
 	Proof             []byte                   `json:"proof"`
 	IntentDigest      []byte                   `json:"intent_digest"`
 	Intent            []byte                   `json:"intent"`
+	Execution         []byte                   `json:"execution,omitempty"`
+	ExecutionRevision uint64                   `json:"execution_revision,omitempty"`
+	ExecutionSettled  bool                     `json:"execution_settled,omitempty"`
 }
 
 func appendReplicatedOperation(dst []byte, record ReplicatedOperationRecord) ([]byte, error) {
@@ -1053,6 +1071,7 @@ func appendReplicatedOperation(dst []byte, record ReplicatedOperationRecord) ([]
 		Kind: record.Kind, State: record.State, Revision: record.Revision,
 		CatalogGeneration: record.CatalogGeneration, Cursor: record.Cursor,
 		Proof: record.Proof[:], IntentDigest: record.IntentDigest[:], Intent: record.Intent,
+		Execution: record.Execution, ExecutionRevision: record.ExecutionRevision, ExecutionSettled: record.ExecutionSettled,
 	}
 	raw, err := vibejson.Marshal(&payload)
 	if err != nil {
@@ -1079,7 +1098,8 @@ func openReplicatedOperation(raw []byte) (ReplicatedOperationRecord, error) {
 	record := ReplicatedOperationRecord{
 		ID: id, Kind: payload.Kind, State: payload.State, Revision: payload.Revision,
 		CatalogGeneration: payload.CatalogGeneration, Cursor: payload.Cursor,
-		Intent: payload.Intent,
+		Intent: payload.Intent, Execution: payload.Execution,
+		ExecutionRevision: payload.ExecutionRevision, ExecutionSettled: payload.ExecutionSettled,
 	}
 	copy(record.Proof[:], payload.Proof)
 	copy(record.IntentDigest[:], payload.IntentDigest)
@@ -1357,6 +1377,9 @@ func (authority *ReplicatedCatalogAuthority) PublishOperation(
 			prior.IntentDigest != record.IntentDigest || !bytes.Equal(prior.Intent, record.Intent) {
 			return errors.Join(openErr, ErrReplicatedCatalogConflict)
 		}
+		if !validReplicatedExecutionSuccessor(prior, record) {
+			return ErrReplicatedCatalogConflict
+		}
 		digest := sha256.Sum256(current.Value)
 		result, err = authority.session.ComparePut(
 			ctx, key[:], authority.scratch, uint64(len(current.Value)), replication.Digest(digest),
@@ -1375,6 +1398,23 @@ func (authority *ReplicatedCatalogAuthority) PublishOperation(
 		return ErrReplicatedCatalog
 	}
 	return nil
+}
+
+func validReplicatedExecutionSuccessor(prior, next ReplicatedOperationRecord) bool {
+	if len(prior.Execution) != 0 && !prior.ExecutionSettled {
+		// Observing an effect cannot discard an outcome-unknown request: every
+		// destination must first settle the exact retained wave.
+		return next.Cursor == prior.Cursor && next.Proof == prior.Proof &&
+			next.ExecutionRevision == prior.ExecutionRevision && bytes.Equal(next.Execution, prior.Execution)
+	}
+	if len(next.Execution) == 0 {
+		return true
+	}
+	if next.ExecutionRevision == prior.ExecutionRevision {
+		return prior.ExecutionSettled && next.ExecutionSettled && next.Cursor == prior.Cursor &&
+			next.Proof == prior.Proof && bytes.Equal(next.Execution, prior.Execution)
+	}
+	return next.ExecutionRevision == next.Revision && !next.ExecutionSettled
 }
 
 // PublishReplicaMoveAbandonment is the sole exception to immutable operation

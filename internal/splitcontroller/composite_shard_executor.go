@@ -126,6 +126,14 @@ func (executor *CompositeShardActionExecutor) ExecuteAuthorizedSplitAction(
 	var err error
 	switch action.Kind {
 	case ActionStartCapture:
+		active, activeErr := options.Source.CaptureActivated(plan)
+		if activeErr != nil {
+			return activeErr
+		}
+		if active {
+			_, err := options.Source.ExecuteStartCapture(plan)
+			return err
+		}
 		proposer := options.Capture
 		release := func() error { return nil }
 		if options.CaptureFactory != nil {
@@ -143,6 +151,11 @@ func (executor *CompositeShardActionExecutor) ExecuteAuthorizedSplitAction(
 		)
 		return err
 	case ActionBuildArtifacts:
+		if options.CaptureFactory != nil {
+			if err := options.CaptureFactory.RetireSourceCaptureActivationSession(ctx, plan, observed); err != nil {
+				return err
+			}
+		}
 		capture, openErr := options.Source.ExecuteStartCapture(plan)
 		if openErr != nil {
 			return openErr

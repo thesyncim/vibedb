@@ -359,6 +359,64 @@ func (buffer *bytesBuffer) Read(dst []byte) (int, error) {
 	return n, nil
 }
 
+func TestPlanObservationSourceSealIsExactReadOnlyScope(t *testing.T) {
+	request, state, _ := networkPlanObservationFixture(t)
+	transition := PlanObservationSourceTransition{From: request.Command, To: request.Command,
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{128}}}}
+	transition.To.OwnershipEpoch++
+	transition.To.RoutingVersion++
+	transition.To.RouteGeneration++
+	request.SourceTransition = &transition
+	request.RequestDigest = planObservationRequestDigest(request)
+	state.Binding.OwnershipEpoch = transition.To.OwnershipEpoch
+	state.Binding.RoutingVersion = transition.To.RoutingVersion
+	state.Binding.RouteGeneration = transition.To.RouteGeneration
+	state.Binding.OwnedRange = transition.Range
+	cut := SourcePlanObservation{State: state, Serving: servingForPlanObservation(request, 1, state.Applied)}
+	cut.Serving.Command = transition.To
+	wire := planObservationWireRequest{Request: request, TargetMember: 1}
+	if !validNetworkSourceObservation(wire, cut) {
+		t.Fatal("exact source seal cannot be observed before catalog publication")
+	}
+	if validNetworkChildObservation(wire, ChildPlanObservation{}) {
+		t.Fatal("source transition widened child observation authority")
+	}
+	for _, mutate := range []func(*SourcePlanObservation){
+		func(c *SourcePlanObservation) { c.State.Binding.OwnedRange.Start[0]++ },
+		func(c *SourcePlanObservation) { c.State.Binding.OwnershipEpoch++ },
+		func(c *SourcePlanObservation) { c.Serving.Command.RouteGeneration++ },
+		func(c *SourcePlanObservation) { c.State.ReplicaSetVersion++ },
+		func(c *SourcePlanObservation) { c.Serving.Command.RelationManifestDigest[0]++ },
+		func(c *SourcePlanObservation) { c.State.Binding.GroupID[0]++ },
+	} {
+		forged := cut
+		mutate(&forged)
+		if validNetworkSourceObservation(wire, forged) {
+			t.Fatal("substituted sealed source passed exact observation")
+		}
+	}
+	for _, mutate := range []func(*PlanObservationSourceTransition){
+		func(s *PlanObservationSourceTransition) { s.To.OwnershipEpoch++ },
+		func(s *PlanObservationSourceTransition) { s.To.SchemaGeneration++ },
+		func(s *PlanObservationSourceTransition) { s.To.ProtectionEpoch++ },
+		func(s *PlanObservationSourceTransition) { s.To.ReplicaSetVersion++ },
+		func(s *PlanObservationSourceTransition) { s.To.RelationManifestDigest[0]++ },
+		func(s *PlanObservationSourceTransition) { s.Range = distribution.KeyRange{} },
+	} {
+		forged := transition
+		mutate(&forged)
+		candidate := request
+		candidate.SourceTransition = &forged
+		if validNetworkPlanObservationRequest(candidate) {
+			t.Fatal("source transition substitution escaped request digest")
+		}
+		candidate.RequestDigest = planObservationRequestDigest(candidate)
+		if validNetworkPlanObservationRequest(candidate) {
+			t.Fatal("source transition changed non-ownership authority")
+		}
+	}
+}
+
 func networkPlanObservationFixture(
 	t testing.TB,
 ) (PlanObservationRequest, replicatedstate.State, rafttransport.TrustDomain) {

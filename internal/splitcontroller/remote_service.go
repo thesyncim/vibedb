@@ -99,6 +99,9 @@ func (service *RemoteActionService) ExecuteAction(
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
 	expected, err := appendRemoteStepRequest(nil, plan, observed, action)
+	if err == nil && payload.ExecutionRevision != 0 {
+		expected, err = bindRemoteExecutionRevision(expected, action, payload.ExecutionRevision)
+	}
 	if err != nil || expected.Operation != request.Operation || expected.Step != request.Step ||
 		expected.PlanDigest != request.PlanDigest || expected.Fence != request.Fence ||
 		!bytes.Equal(expected.Payload, request.Payload) {
@@ -131,9 +134,9 @@ func openRemoteStepPayload(request shardcontrol.Request) (remoteStepPayload, err
 	if err != nil || !bytes.Equal(canonical, request.Payload) ||
 		payload.Action != uint8(request.Action) || payload.Child != request.Child ||
 		!payload.Target.valid() || payload.Catalog == 0 || payload.CatalogDigest == ([32]byte{}) ||
-		payload.AdmissionRevision == 0 || payload.Sequence != remoteActionWitnessSequence(Action{
+		payload.AdmissionRevision == 0 || payload.Sequence == 0 || payload.Sequence != remoteExecutionSequence(Action{
 		Kind: ActionKind(request.Action), Child: request.Child,
-	}) || payload.SourceNode == (rafttransport.NodeID{}) || payload.PredecessorDigest == ([32]byte{}) ||
+	}, payload.ExecutionRevision) || payload.SourceNode == (rafttransport.NodeID{}) || payload.PredecessorDigest == ([32]byte{}) ||
 		payload.PredecessorDigest != remoteStepPredecessorDigest(payload) {
 		return remoteStepPayload{}, errors.Join(ErrRemoteExecution, err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 // LocalObservationOwner is the serialized Multi-Raft ownership capability.
@@ -27,6 +29,10 @@ type LocalChildRuntimeObserver interface {
 	ObserveLocalSplitChild(context.Context, PlanObservationRequest, uint64) (*ChildObservation, error)
 }
 
+type LocalSourceCaptureObserver interface {
+	RangeSplitCaptureHeadAt(replicatedstate.State, rangesplit.SourceCaptureDescriptor) (uint64, error)
+}
+
 // LocalObservationGroup binds one retained group to its durable split runtime
 // registry. Command is checked before any operation directory is acquired.
 type LocalObservationGroup struct {
@@ -34,6 +40,7 @@ type LocalObservationGroup struct {
 	Command  raftservice.CommandFence
 	Registry *RuntimeStoreRegistry
 	Children LocalChildRuntimeObserver
+	Capture  LocalSourceCaptureObserver
 }
 
 // PreparedChildObservationGroup projects one authenticated local replica
@@ -231,9 +238,17 @@ func (provider *LocalPlanObservationProvider) ObserveSplitSource(
 		return SourcePlanObservation{}, errors.Join(ErrPlanObservation, err)
 	}
 	state := observation.State
+	command := request.Command
+	command.ReplicaSetVersion = state.ReplicaSetVersion
+	command.ActivePolicyGeneration, command.ProtectionEpoch = state.Binding.ActivePolicyGeneration, state.Binding.ProtectionEpoch
+	command.OwnershipEpoch, command.SchemaGeneration = state.Binding.OwnershipEpoch, state.Binding.SchemaGeneration
+	command.RoutingVersion, command.RouteGeneration = state.Binding.RoutingVersion, state.Binding.RouteGeneration
 	serving := raftservice.ServingState{
 		Identity: group.Identity,
-		Command:  request.Command, Status: observation.Status,
+		Command:  command, Status: observation.Status,
+	}
+	if !validNetworkSourceObservation(planObservationWireRequest{Request: request, TargetMember: targetMember}, SourcePlanObservation{State: state, Serving: serving}) {
+		return SourcePlanObservation{}, ErrPlanObservation
 	}
 	lease, err := group.Registry.Acquire(request.Operation)
 	if err != nil {
@@ -252,6 +267,12 @@ func (provider *LocalPlanObservationProvider) ObserveSplitSource(
 			return SourcePlanObservation{}, errors.Join(ErrPlanObservation, openErr)
 		}
 		result.CaptureHead = descriptor.Head.Applied
+		if group.Capture != nil {
+			result.CaptureHead, err = group.Capture.RangeSplitCaptureHeadAt(state, descriptor)
+			if err != nil {
+				return SourcePlanObservation{}, errors.Join(ErrPlanObservation, err)
+			}
+		}
 	}
 	if result.Artifacts, err = loadObservedArtifacts(lease); err != nil {
 		return SourcePlanObservation{}, err
@@ -275,7 +296,7 @@ func (provider *LocalPlanObservationProvider) ObserveSplitChild(
 ) (ChildPlanObservation, error) {
 	group, ok := provider.resolve(request, targetMember)
 	if !ok || ctx == nil {
-		return ChildPlanObservation{}, ErrPlanObservation
+		return ChildPlanObservation{}, fmt.Errorf("%w: child group resolution", ErrPlanObservation)
 	}
 	lease, err := group.Registry.Acquire(request.Operation)
 	if err != nil {
@@ -288,14 +309,32 @@ func (provider *LocalPlanObservationProvider) ObserveSplitChild(
 	} else if present {
 		cursor, openErr := rangesplit.OpenChildStageCursor(raw.Payload)
 		if openErr != nil || cursor == nil || cursor.Child() != request.Child {
-			return ChildPlanObservation{}, errors.Join(ErrPlanObservation, openErr)
+			return ChildPlanObservation{}, fmt.Errorf("%w: child cursor: %w", ErrPlanObservation, openErr)
 		}
 		result.Stage = cursor
 	}
 	if group.Children != nil {
 		result.Runtime, err = group.Children.ObserveLocalSplitChild(ctx, request, targetMember)
 		if err != nil {
-			return ChildPlanObservation{}, err
+			return ChildPlanObservation{}, fmt.Errorf("child lifecycle observation: %w", err)
+		}
+		if result.Runtime != nil && result.Runtime.Phase == ChildPhaseRuntimeAdopted {
+			local, observeErr := provider.owners.ObserveReplica(ctx, request.Group, targetMember)
+			if observeErr != nil {
+				return ChildPlanObservation{}, observeErr
+			}
+			serving := raftservice.ServingState{Identity: local.Identity, Command: request.Command, Status: local.Status}
+			if local.Identity != result.Runtime.RuntimeIdentity || !validNetworkSourceObservation(
+				planObservationWireRequest{Request: request, TargetMember: targetMember},
+				SourcePlanObservation{State: local.State, Serving: serving},
+			) {
+				return ChildPlanObservation{}, ErrPlanObservation
+			}
+			// No leader yet is a valid activation observation, not a ready vote.
+			// The serialized local owner supplies each member's own applied cut.
+			if serving.Status.LeaderID != 0 {
+				result.Runtime.ReadyReplicas = []raftservice.ServingState{serving}
+			}
 		}
 	}
 	return result, nil
@@ -320,7 +359,7 @@ func (provider *LocalPlanObservationProvider) resolve(
 	group := provider.groups[index]
 	return group, group.Identity.MemberID == targetMember &&
 		group.Identity.AllocationGeneration == uint64(request.Allocation) &&
-		group.Command == request.Command
+		planObservationSourceCommandMatches(request, group.Command)
 }
 
 func compareObservationGroup(left, right raftmember.GroupKey) int {

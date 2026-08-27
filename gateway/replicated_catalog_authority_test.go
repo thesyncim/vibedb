@@ -2233,6 +2233,71 @@ func testReplicatedOperation(record ReplicatedOperationRecord) ReplicatedOperati
 	return record
 }
 
+func TestReplicatedOperationRetainsExactPendingExecutionWithinOriginalBound(t *testing.T) {
+	authority, _, _ := newCatalogAuthorityFixture(t)
+	record := testReplicatedOperation(ReplicatedOperationRecord{ID: [32]byte{47}, Kind: ReplicatedOperationSplit,
+		State: ReplicatedOperationRunning, Revision: 1, CatalogGeneration: 1, Proof: [32]byte{48},
+		Execution: []byte(`{"requests":["exact"]}`), ExecutionRevision: 1})
+	if err := authority.PublishOperation(t.Context(), 0, record); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := authority.ReadOperation(t.Context(), record.ID)
+	if err != nil || !recovered.Equal(record) {
+		t.Fatalf("execution did not survive catalog read: %v", err)
+	}
+	changed := record
+	changed.Revision++
+	changed.Execution = []byte(`{"requests":["different"]}`)
+	if err := authority.PublishOperation(t.Context(), record.Revision, changed); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("pending execution substitution accepted: %v", err)
+	}
+	advanced := record
+	advanced.Revision++
+	advanced.Cursor[0]++
+	advanced.Execution, advanced.ExecutionRevision, advanced.ExecutionSettled = nil, 0, false
+	if err := authority.PublishOperation(t.Context(), record.Revision, advanced); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("observation discarded an outcome-unknown wave: %v", err)
+	}
+	settled := record
+	settled.Revision++
+	settled.ExecutionSettled = true
+	if err := authority.PublishOperation(t.Context(), record.Revision, settled); err != nil {
+		t.Fatal(err)
+	}
+	regressed := settled
+	regressed.Revision++
+	regressed.ExecutionSettled = false
+	if err := authority.PublishOperation(t.Context(), settled.Revision, regressed); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("settled wave became pending with its old identity: %v", err)
+	}
+	regressed.ExecutionRevision = settled.Revision
+	if err := authority.PublishOperation(t.Context(), settled.Revision, regressed); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("new wave reused an earlier revision: %v", err)
+	}
+	changed.Revision, changed.ExecutionRevision = settled.Revision+1, settled.Revision+1
+	if err := authority.PublishOperation(t.Context(), settled.Revision, changed); err != nil {
+		t.Fatalf("settled wave prevented a later exact invocation: %v", err)
+	}
+	tooLarge := changed
+	tooLarge.Execution = make([]byte, MaxReplicatedOperationBytes)
+	if _, err := appendReplicatedOperation(nil, tooLarge); err == nil {
+		t.Fatal("action execution silently expanded the catalog document ceiling")
+	}
+	for _, mutate := range []func(*ReplicatedOperationRecord){
+		func(r *ReplicatedOperationRecord) { r.ExecutionRevision = 0 },
+		func(r *ReplicatedOperationRecord) { r.ExecutionRevision = r.Revision + 1 },
+		func(r *ReplicatedOperationRecord) { r.Kind = ReplicatedOperationMove },
+		func(r *ReplicatedOperationRecord) { r.State = ReplicatedOperationComplete },
+		func(r *ReplicatedOperationRecord) { r.Execution = nil },
+	} {
+		forged := changed
+		mutate(&forged)
+		if _, err := appendReplicatedOperation(nil, forged); err == nil {
+			t.Fatal("invalid execution lifecycle encoded")
+		}
+	}
+}
+
 func TestReplicatedCatalogAuthorityRejectsMismatchedWriteSession(t *testing.T) {
 	authority, _, _ := newCatalogAuthorityFixture(t)
 	options := ReplicatedCatalogAuthorityOptions{

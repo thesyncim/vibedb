@@ -33,7 +33,18 @@ type PlanObservationRequest struct {
 	Child             uint8                                  `json:"child"`
 	Group             raftmember.GroupKey                    `json:"group"`
 	Command           raftservice.CommandFence               `json:"command"`
+	SourceTransition  *PlanObservationSourceTransition       `json:"source_transition,omitempty"`
 	ControlEndpoints  []distribution.EndpointID              `json:"control_endpoints"`
+}
+
+// PlanObservationSourceTransition names the two exact read-only source cuts
+// of this plan. Sealing necessarily precedes catalog publication, so the
+// catalog command alone cannot describe the current source during cutover.
+// This is observation scope, never authority to submit a command.
+type PlanObservationSourceTransition struct {
+	From  raftservice.CommandFence `json:"from"`
+	To    raftservice.CommandFence `json:"to"`
+	Range distribution.KeyRange    `json:"range"`
 }
 
 // SourcePlanObservation is one detached cut read by the source owner lane.
@@ -224,9 +235,7 @@ func (observer *CoherentPlanObserver) observeAttempt(
 			observed.Stages[request.Child] = &copy
 		}
 		if cut.Runtime != nil {
-			copy := *cut.Runtime
-			copy.ReadyReplicas = append([]raftservice.ServingState(nil), copy.ReadyReplicas...)
-			observed.Children[request.Child] = &copy
+			observed.Children[request.Child] = cloneChildPlanRuntime(cut.Runtime)
 		}
 	}
 
@@ -296,6 +305,24 @@ func (plan *Plan) observationRequests(
 		plan, catalog, catalogDigest, plan.source.Distribution, plan.source.Shard,
 		plan.source.AllocationGeneration, plan.retained, sourceEndpoints,
 	))
+	if requests[0].Command.Valid() {
+		from := requests[0].Command
+		if plan.sourceAuthority != nil {
+			from = plan.sourceAuthority.Command
+		} else {
+			from.OwnershipEpoch = uint64(plan.source.OwnershipEpoch)
+			from.RoutingVersion = uint64(plan.source.RoutingVersion)
+			from.RouteGeneration = plan.current
+		}
+		to := from
+		to.OwnershipEpoch = uint64(plan.children[plan.retained].OwnershipEpoch)
+		to.RoutingVersion = uint64(plan.targetManifest.Version())
+		to.RouteGeneration = plan.next
+		requests[0].SourceTransition = &PlanObservationSourceTransition{
+			From: from, To: to, Range: plan.children[plan.retained].Range,
+		}
+		requests[0].RequestDigest = planObservationRequestDigest(requests[0])
+	}
 	for child := uint8(0); child < plan.childCount; child++ {
 		identity := plan.children[child]
 		if identity.Retained {
@@ -406,6 +433,16 @@ func planObservationRequestDigest(request PlanObservationRequest) [sha256.Size]b
 	_, _ = hash.Write(scalar[:])
 	for _, endpoint := range request.ControlEndpoints {
 		writeObservationString(hash, string(endpoint), &scalar)
+	}
+	if request.SourceTransition != nil {
+		// Canonical, fixed-size transition coordinates are covered by the
+		// request digest; omitting the optional field preserves old requests.
+		raw, err := appendCanonicalVibeJSON(nil, request.SourceTransition)
+		if err != nil {
+			return [sha256.Size]byte{}
+		}
+		_, _ = hash.Write([]byte("\x00source-transition\x00"))
+		_, _ = hash.Write(raw)
 	}
 	var result [sha256.Size]byte
 	hash.Sum(result[:0])

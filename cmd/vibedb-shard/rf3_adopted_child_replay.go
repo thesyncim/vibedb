@@ -115,6 +115,6 @@ func (resolver *rf3AdoptedSourceResolver) adoptedChildReplay(plan *splitcontroll
 		OwnershipEpoch: target.Authority.OwnershipEpoch, SchemaGeneration: target.Authority.SchemaGeneration,
 		RoutingVersion: target.Authority.RoutingVersion, RouteGeneration: target.Authority.RouteGeneration, RelationManifestDigest: target.RelationManifestDigest}
 	executor := &rf3AdoptedChildReplay{plan: plan, child: child, live: live, owners: resolver.owners, cutover: entry.cutover, target: replica, apply: live.runtime.apply}
-	observation := splitcontroller.LocalObservationGroup{Identity: live.runtime.identity, Command: command, Registry: live.registry, Children: executor}
+	observation := splitcontroller.LocalObservationGroup{Identity: live.runtime.identity, Command: command, Registry: live.registry, Children: executor, Capture: live.runtime.apply}
 	return executor, observation, true, nil
 }

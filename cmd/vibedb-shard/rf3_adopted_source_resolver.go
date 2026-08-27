@@ -150,7 +150,7 @@ func (resolver *rf3AdoptedSourceResolver) ensureDescriptor(ctx context.Context, 
 	}); err != nil {
 		return err
 	}
-	group := splitcontroller.LocalObservationGroup{Identity: identity, Command: descriptor.Command, Registry: registry}
+	group := splitcontroller.LocalObservationGroup{Identity: identity, Command: descriptor.Command, Registry: registry, Capture: live.runtime.apply}
 	if err = resolver.observation.RegisterGroups([]splitcontroller.LocalObservationGroup{group}); err != nil {
 		if err = resolver.observation.RefreshRetainedGroup(group); err != nil {
 			return err

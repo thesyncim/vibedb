@@ -1512,6 +1512,25 @@ func (store *Store) WrappedKeyMetadata() []byte {
 	return append([]byte(nil), store.header.wrapped...)
 }
 
+// AuthenticatedWrappedKeyMetadata returns the retained provider metadata only
+// when key opens this exact live WAL. This is the same constant-time key proof
+// used by generation rollover. A child WAL can reuse an existing provider key
+// without inventing wrapped metadata or retaining another plaintext key copy.
+func (store *Store) AuthenticatedWrappedKeyMetadata(key Key) ([]byte, error) {
+	if store == nil {
+		return nil, ErrClosed
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if err := store.checkLocked(); err != nil {
+		return nil, err
+	}
+	if err := validateGenerationKey(key, store.header); err != nil {
+		return nil, err
+	}
+	return bytes.Clone(store.header.wrapped), nil
+}
+
 func (store *Store) TopologyRecoveryEpoch() uint64 {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
