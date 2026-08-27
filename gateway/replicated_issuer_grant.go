@@ -249,6 +249,9 @@ func (authority *ReplicatedCatalogAuthority) OpenIssuerLaneGrant(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return ReplicatedIssuerLaneGrant{}, err
+	}
 	if authority.session.Status().Pending {
 		return ReplicatedIssuerLaneGrant{}, ErrReplicatedCatalogPending
 	}

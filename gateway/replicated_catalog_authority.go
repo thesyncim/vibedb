@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
@@ -93,6 +94,7 @@ type ReplicatedCatalogAuthority struct {
 	pendingGrant                       membershipgrant.Grant
 	pendingPostRemoveReplicaSetVersion uint64
 	issuerGrants                       *replicatedIssuerGrantCache
+	routeSeed                          atomic.Pointer[replicatedCatalogRouteSeedTracker]
 }
 
 type ReplicatedCatalogAuthorityOptions struct {
@@ -143,8 +145,26 @@ func (authority *ReplicatedCatalogAuthority) authorizedContext(
 	if authority == nil || ctx == nil || !authority.authority.Valid() {
 		return nil, ErrReplicatedCatalog
 	}
+	if tracker := authority.routeSeed.Load(); tracker != nil && tracker.terminal.Load() {
+		return nil, ErrReplicatedCatalogRouteRestartRequired
+	}
 	bound, err := serviceauthz.WithAuthority(ctx, authority.authority)
 	return bound, err
+}
+
+// requireRouteSeedServingLocked closes the authorization-to-session race. All
+// durable session mutators call authorizedContext before waiting on authority.mu
+// and must recheck after acquiring it: a certified route change may seal the
+// authority while they wait, and CompleteQuiescedHandoff uses the same mutex to
+// retire and destroy the old binding.
+func (authority *ReplicatedCatalogAuthority) requireRouteSeedServingLocked() error {
+	if authority == nil {
+		return ErrReplicatedCatalog
+	}
+	if tracker := authority.routeSeed.Load(); tracker != nil && tracker.terminal.Load() {
+		return ErrReplicatedCatalogRouteRestartRequired
+	}
+	return nil
 }
 
 func nativeSessionBaseRelation(session *NativeSession) replication.RelationID {
@@ -221,6 +241,15 @@ func (authority *ReplicatedCatalogAuthority) readRaw(
 // Read fetches the authoritative RF3 catalog head and validates the complete
 // routing/index/lineage image before publishing it to the lock-free holder.
 func (authority *ReplicatedCatalogAuthority) Read(ctx context.Context) (*Snapshot, error) {
+	if authority != nil {
+		if tracker := authority.routeSeed.Load(); tracker != nil {
+			receipt, err := authority.readAttested(ctx, tracker.immutable)
+			if err != nil {
+				return nil, err
+			}
+			return receipt.Snapshot(), nil
+		}
+	}
 	cut, err := authority.readCatalogCut(ctx)
 	if err != nil {
 		return nil, err
@@ -309,6 +338,23 @@ func (authority *ReplicatedCatalogAuthority) ReadAttested(
 	ctx context.Context,
 	immutableGenesis *Snapshot,
 ) (ReplicatedCatalogSeedReceipt, error) {
+	if authority != nil {
+		if tracker := authority.routeSeed.Load(); tracker != nil {
+			equal, compareErr := equalCatalogSnapshots(tracker.immutable, immutableGenesis)
+			if compareErr != nil || !equal {
+				return ReplicatedCatalogSeedReceipt{}, errors.Join(
+					compareErr, ErrReplicatedCatalogConflict,
+				)
+			}
+		}
+	}
+	return authority.readAttested(ctx, immutableGenesis)
+}
+
+func (authority *ReplicatedCatalogAuthority) readAttested(
+	ctx context.Context,
+	immutableGenesis *Snapshot,
+) (ReplicatedCatalogSeedReceipt, error) {
 	if authority == nil || ctx == nil || immutableGenesis == nil ||
 		immutableGenesis.Generation() != 1 {
 		return ReplicatedCatalogSeedReceipt{}, ErrReplicatedCatalog
@@ -323,7 +369,7 @@ func (authority *ReplicatedCatalogAuthority) ReadAttested(
 	if err != nil || validateReplicatedCatalogGenesis(cut.genesis, genesisHead) != nil {
 		return ReplicatedCatalogSeedReceipt{}, errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	snapshot, err := authority.publishReadCatalogCut(ctx, cut.snapshot, cut.head)
+	snapshot, publish, err := authority.prepareReadCatalogCut(ctx, cut.snapshot, cut.head)
 	if err != nil {
 		return ReplicatedCatalogSeedReceipt{}, err
 	}
@@ -331,37 +377,84 @@ func (authority *ReplicatedCatalogAuthority) ReadAttested(
 	if err != nil {
 		return ReplicatedCatalogSeedReceipt{}, err
 	}
-	return ReplicatedCatalogSeedReceipt{
+	receipt := ReplicatedCatalogSeedReceipt{
 		authority: authority, snapshot: snapshot, canonical: canonical,
 		headBytes: uint64(len(cut.head)), headDigest: sha256.Sum256(cut.head),
-	}, nil
+	}
+	if tracker := authority.routeSeed.Load(); tracker != nil {
+		if err = tracker.observe(receipt); err != nil {
+			return ReplicatedCatalogSeedReceipt{}, err
+		}
+	}
+	if err = publish(); err != nil {
+		return ReplicatedCatalogSeedReceipt{}, err
+	}
+	receipt.snapshot = authority.holder.Current()
+	return receipt, nil
 }
 
 func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(
 	ctx context.Context, snapshot *Snapshot, raw []byte,
 ) (*Snapshot, error) {
+	_, publish, err := authority.prepareReadCatalogCut(ctx, snapshot, raw)
+	if err != nil {
+		return nil, err
+	}
+	if err = publish(); err != nil {
+		return nil, err
+	}
+	return authority.holder.Current(), nil
+}
+
+func (authority *ReplicatedCatalogAuthority) prepareReadCatalogCut(
+	ctx context.Context, snapshot *Snapshot, raw []byte,
+) (*Snapshot, func() error, error) {
 	current := authority.holder.Current()
 	if current == nil {
-		if !authority.holder.PublishNewer(snapshot) {
-			return nil, ErrReplicatedCatalogConflict
+		certified, err := initialCatalogState(snapshot)
+		if err != nil {
+			return nil, nil, err
 		}
-	} else if snapshot.Generation() > current.Generation() {
-		if err := authority.holder.publishNewerChecked(snapshot); err != nil {
-			if replacementErr := authority.publishCertifiedReplicaReplacementRead(
-				ctx, current, snapshot, raw,
-			); replacementErr != nil {
-				return nil, errors.Join(err, replacementErr)
+		return certified, func() error {
+			if !authority.holder.PublishNewer(certified) {
+				installed := authority.holder.Current()
+				installedRaw, encodeErr := appendReplicatedCatalogDocument(
+					nil, installed, maxReplicatedCatalogBytes,
+				)
+				if encodeErr != nil || !bytes.Equal(installedRaw, raw) {
+					return errors.Join(encodeErr, ErrReplicatedCatalogConflict)
+				}
 			}
+			return nil
+		}, nil
+	} else if snapshot.Generation() > current.Generation() {
+		currentState, currentErr := initialCatalogState(current)
+		var certified *Snapshot
+		var advanceErr error
+		if currentErr == nil {
+			certified, advanceErr = advanceCatalogState(currentState, snapshot)
 		}
+		if currentErr == nil && advanceErr == nil {
+			return certified, func() error {
+				return authority.holder.publishNewerChecked(certified)
+			}, nil
+		}
+		certified, publish, replacementErr := authority.prepareCertifiedReplicaReplacementRead(
+			ctx, current, snapshot, raw,
+		)
+		if replacementErr != nil {
+			return nil, nil, errors.Join(currentErr, advanceErr, replacementErr)
+		}
+		return certified, publish, nil
 	} else if snapshot.Generation() < current.Generation() {
-		return nil, ErrStaleGeneration
+		return nil, nil, ErrStaleGeneration
 	} else {
 		currentBytes, encodeErr := appendReplicatedCatalogDocument(nil, current, maxReplicatedCatalogBytes)
 		if encodeErr != nil || !bytes.Equal(currentBytes, raw) {
-			return nil, errors.Join(encodeErr, ErrReplicatedCatalogConflict)
+			return nil, nil, errors.Join(encodeErr, ErrReplicatedCatalogConflict)
 		}
 	}
-	return authority.holder.Current(), nil
+	return current, func() error { return nil }, nil
 }
 
 // publishCertifiedReplicaReplacementRead is the only exceptional refresh
@@ -372,31 +465,43 @@ func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(
 func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementRead(
 	ctx context.Context, current, next *Snapshot, nextRaw []byte,
 ) error {
+	_, publish, err := authority.prepareCertifiedReplicaReplacementRead(
+		ctx, current, next, nextRaw,
+	)
+	if err != nil {
+		return err
+	}
+	return publish()
+}
+
+func (authority *ReplicatedCatalogAuthority) prepareCertifiedReplicaReplacementRead(
+	ctx context.Context, current, next *Snapshot, nextRaw []byte,
+) (*Snapshot, func() error, error) {
 	if authority == nil || ctx == nil || current == nil || next == nil ||
 		current.Generation() == ^uint64(0) ||
 		next.Generation() != current.Generation()+1 {
-		return ErrReplicatedCatalogConflict
+		return nil, nil, ErrReplicatedCatalogConflict
 	}
 	group, ok := replicaReplacementCandidateGroup(current, next)
 	if !ok {
-		return ErrReplicatedCatalogConflict
+		return nil, nil, ErrReplicatedCatalogConflict
 	}
 	key, _ := replicatedReplicaReplacementReceiptKeys(group)
 	result, err := authority.readRaw(
 		ctx, key[:], uint32(maxReplicatedReplicaReplacementReceiptBytes),
 	)
 	if err != nil || !result.Found {
-		return errors.Join(err, ErrReplicatedCatalogConflict)
+		return nil, nil, errors.Join(err, ErrReplicatedCatalogConflict)
 	}
 	currentRaw, err := appendReplicatedCatalogDocument(
 		nil, current, maxReplicatedCatalogBytes,
 	)
 	if err != nil {
-		return errors.Join(err, ErrReplicatedCatalogConflict)
+		return nil, nil, errors.Join(err, ErrReplicatedCatalogConflict)
 	}
 	receipt, err := openReplicaReplacementReceipt(result.Value)
 	if err != nil || receipt.Grant.Group != group {
-		return errors.Join(err, ErrReplicatedCatalogConflict)
+		return nil, nil, errors.Join(err, ErrReplicatedCatalogConflict)
 	}
 	var certified *Snapshot
 	var publish func() error
@@ -407,7 +512,7 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 			result.Value, currentRaw, nextRaw, current.Generation(), next.Generation(),
 		)
 		if validateErr != nil || grant.Group != group {
-			return errors.Join(validateErr, ErrReplicatedCatalogConflict)
+			return nil, nil, errors.Join(validateErr, ErrReplicatedCatalogConflict)
 		}
 		certified, err = advanceCatalogStateReplicaReplacement(current, next, grant)
 		if err == nil {
@@ -427,7 +532,7 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 			receipt.NewHeadDigest != sha256.Sum256(currentRaw) ||
 			receipt.PostRemoveHeadBytes != uint64(len(nextRaw)) ||
 			receipt.PostRemoveHeadDigest != sha256.Sum256(nextRaw) {
-			return ErrReplicatedCatalogConflict
+			return nil, nil, ErrReplicatedCatalogConflict
 		}
 		err = validateReplicaReplacementPostRemoveTransition(
 			current, next, receipt.Grant, receipt.PostRemoveReplicaSetVersion,
@@ -449,33 +554,36 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 			)
 		}
 	default:
-		return ErrReplicatedCatalogConflict
+		return nil, nil, ErrReplicatedCatalogConflict
 	}
 	if err != nil {
-		return errors.Join(err, ErrReplicatedCatalogConflict)
+		return nil, nil, errors.Join(err, ErrReplicatedCatalogConflict)
 	}
 	certifiedRaw, err := appendReplicatedCatalogDocument(
 		nil, certified, maxReplicatedCatalogBytes,
 	)
 	if err != nil || !bytes.Equal(certifiedRaw, nextRaw) {
-		return errors.Join(err, ErrReplicatedCatalogConflict)
+		return nil, nil, errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	if err = publish(); err == nil {
-		return nil
-	}
-	// Concurrent refreshes may both validate the same immutable receipt. The
-	// loser accepts only the byte-identical generation already installed.
-	installed := authority.holder.Current()
-	if installed == nil || installed.Generation() != next.Generation() {
-		return err
-	}
-	installedRaw, encodeErr := appendReplicatedCatalogDocument(
-		nil, installed, maxReplicatedCatalogBytes,
-	)
-	if encodeErr != nil || !bytes.Equal(installedRaw, nextRaw) {
-		return errors.Join(err, encodeErr, ErrReplicatedCatalogConflict)
-	}
-	return nil
+	return certified, func() error {
+		if publishErr := publish(); publishErr == nil {
+			return nil
+		} else {
+			// Concurrent refreshes may both validate the same immutable receipt.
+			// The loser accepts only the byte-identical generation already installed.
+			installed := authority.holder.Current()
+			if installed == nil || installed.Generation() != next.Generation() {
+				return publishErr
+			}
+			installedRaw, encodeErr := appendReplicatedCatalogDocument(
+				nil, installed, maxReplicatedCatalogBytes,
+			)
+			if encodeErr != nil || !bytes.Equal(installedRaw, nextRaw) {
+				return errors.Join(publishErr, encodeErr, ErrReplicatedCatalogConflict)
+			}
+			return nil
+		}
+	}, nil
 }
 
 func replicaReplacementCandidateGroup(current, next *Snapshot) (raftmember.GroupKey, bool) {
@@ -664,6 +772,9 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -782,6 +893,13 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	if native.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
+	// The RF3 head is already committed. Persist or stage its certified local
+	// reachability coordinate before making the head visible to any in-process
+	// consumer. A binding-changing route closes ShutdownRequired and leaves the
+	// holder on the old cut until the process is fully quiesced.
+	if err = authority.observePublishedCatalog(next); err != nil {
+		return err
+	}
 	return authority.holder.PublishAfter(expectedGeneration, next)
 }
 
@@ -797,6 +915,9 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if !authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -819,22 +940,31 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		return ErrReplicatedCatalog
 	}
 	if authority.pendingCatalog != nil {
-		if authority.pendingPostRemoveReplicaSetVersion != 0 && authority.pendingGrant.Valid() {
-			err = authority.holder.publishReplicaReplacementPostRemoveAfter(
-				authority.pendingExpected, authority.pendingCatalog, authority.pendingGrant,
-				authority.pendingPostRemoveReplicaSetVersion,
-			)
-		} else if authority.pendingGrant.Valid() {
-			err = authority.holder.publishReplicaReplacementAfter(
-				authority.pendingExpected, authority.pendingCatalog, authority.pendingGrant,
-			)
-		} else {
-			err = authority.holder.PublishAfter(authority.pendingExpected, authority.pendingCatalog)
-		}
+		published := authority.pendingCatalog
+		expected := authority.pendingExpected
+		grant := authority.pendingGrant
+		postRemoveReplicaSetVersion := authority.pendingPostRemoveReplicaSetVersion
+		// RetryPending has now settled the durable command. Clear the local
+		// retry witness even when route-seed durability seals this authority;
+		// CompleteQuiescedHandoff must be able to retire a non-pending session.
 		authority.pendingCatalog = nil
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
+		if err = authority.observePublishedCatalog(published); err != nil {
+			return err
+		}
+		if postRemoveReplicaSetVersion != 0 && grant.Valid() {
+			err = authority.holder.publishReplicaReplacementPostRemoveAfter(
+				expected, published, grant, postRemoveReplicaSetVersion,
+			)
+		} else if grant.Valid() {
+			err = authority.holder.publishReplicaReplacementAfter(
+				expected, published, grant,
+			)
+		} else {
+			err = authority.holder.PublishAfter(expected, published)
+		}
 		return err
 	}
 	return nil
@@ -1096,6 +1226,9 @@ func (authority *ReplicatedCatalogAuthority) SubmitOperations(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -1191,6 +1324,9 @@ func (authority *ReplicatedCatalogAuthority) PublishOperation(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -1256,6 +1392,9 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaMoveAbandonment(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -1311,6 +1450,9 @@ func (authority *ReplicatedCatalogAuthority) DeleteOperation(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
