@@ -341,7 +341,7 @@ func OpenBundle(
 			m.checkpointGroup.CheckpointAppliedIndex(),
 		)
 	}
-	if !bindingAdvancesFrom(binding, state.Binding) || state.BootstrapDigest != bootstrapDigest ||
+	if !bindingMatchesFenceOrigin(binding, state) || state.BootstrapDigest != bootstrapDigest ||
 		state.ApplyContractDigest != prepared.applyContract ||
 		state.SessionCount != sessionCount || state.SessionSlotCount != slotCount ||
 		state.AuthorityBindingCount != authorityCount ||
@@ -545,7 +545,7 @@ func prepareOpenInputs(
 		)
 	}
 	if options.TxnLimits.MaxDocuments < max(
-		user.Limits.MaxDistinctMutations+3,
+		user.Limits.MaxDistinctMutations+4,
 		requiredSystem.MaxDistinctMutations,
 	) ||
 		options.TxnLimits.MaxBytes < requiredTxnBytes {
@@ -820,6 +820,9 @@ func scanSessionSystemSnapshot(
 	var activeTransactionIntents map[transactionIntentIdentity]reopenedTransactionIntentOwner
 	var transactionIntentKeys []byte
 	var splitActivation *SplitCaptureActivation
+	var historicalFences map[[18]byte]sessionFence
+	var historicalSeen map[[18]byte]uint64
+	var unfencedSlots uint64
 	var transactionScopeScratch []distributedtxn.IntentScope
 	var manifestParticipantScratch []distributedtxn.ParticipantRef
 	var manifestIdentityScratch []byte
@@ -877,6 +880,8 @@ func scanSessionSystemSnapshot(
 				return fmt.Errorf("%w: bounded session counts", ErrStateCorrupt)
 			}
 			statePresent = true
+			historicalFences = make(map[[18]byte]sessionFence, int(state.HistoricalFenceCount))
+			historicalSeen = make(map[[18]byte]uint64, int(state.HistoricalFenceCount))
 			if state.TransactionControlCount > MaxRetainedTransactions {
 				return fmt.Errorf("%w: bounded transaction count", ErrStateCorrupt)
 			}
@@ -902,6 +907,21 @@ func scanSessionSystemSnapshot(
 				return fmt.Errorf("%w: transaction resident reopen arena", ErrTransactionStateCorrupt)
 			}
 			transactionIntentKeys = make([]byte, 0, min(int(state.TransactionResidentBytes), 1<<20))
+			return nil
+
+		case len(key) == 18 && bytes.Equal(key[:2], sessionFencePrefix[:]):
+			if !statePresent || uint64(len(historicalFences)) >= state.HistoricalFenceCount {
+				return ErrSessionCorrupt
+			}
+			f, err := openSessionFence(value)
+			if err != nil || !validHistoricalSessionFence(state, f) {
+				return ErrSessionCorrupt
+			}
+			want := sessionFenceKey(f.routing, f.generation)
+			if !bytes.Equal(key, want[:]) {
+				return ErrSessionCorrupt
+			}
+			historicalFences[want] = f
 			return nil
 
 		case len(key) == 1+sha256.Size && key[0] == 1:
@@ -967,8 +987,13 @@ func scanSessionSystemSnapshot(
 			// physicalSlots, the exact count checked after the scan proves the
 			// complete [0, physicalSlots) set without a per-session bitmap.
 			summary.seenSlots++
-			if err := validateStoredSessionSlot(state, view); err != nil {
+			if err := validateStoredSessionSlot(state, view, sessionFenceLookup{fences: historicalFences}); err != nil {
 				return err
+			}
+			if view.ResultCode == ResultStaleFence {
+				unfencedSlots++
+			} else if view.RoutingVersion != state.Binding.RoutingVersion || view.RouteGeneration != state.Binding.RouteGeneration {
+				historicalSeen[sessionFenceKey(view.RoutingVersion, view.RouteGeneration)]++
 			}
 			if err := validateSessionSlotAgainstHeader(SessionView{
 				Digest: view.SessionDigest, ClientEpoch: summary.epoch,
@@ -1395,6 +1420,16 @@ func scanSessionSystemSnapshot(
 		authorityCount != state.AuthorityBindingCount {
 		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
 	}
+	var historicalSlots uint64
+	for key, f := range historicalFences {
+		if historicalSeen[key] != f.refs || historicalSlots > math.MaxUint64-f.refs {
+			return State{}, false, 0, 0, 0, nil, ErrSessionCorrupt
+		}
+		historicalSlots += f.refs
+	}
+	if uint64(len(historicalFences)) != state.HistoricalFenceCount || historicalSlots != state.HistoricalFenceSlots || unfencedSlots != state.UnfencedSessionSlots {
+		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: fence reference counts", ErrSessionCorrupt)
+	}
 	if routeGateResultCount > authorityCount*uint64(retryWindow) {
 		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: route-gate result bound", ErrStateCorrupt)
 	}
@@ -1560,7 +1595,7 @@ var scannedTransactionMutationDigestDomain = [...]byte{
 	'V', 'i', 'b', 'e', 'D', 'B', '/', 't', 'x', 'n', '/', 'r', 'e', 'l', '/', '1', 0,
 }
 
-func validateStoredSessionSlot(state State, slot SessionSlotView) error {
+func validateStoredSessionSlot(state State, slot SessionSlotView, lookup ...sessionFenceLookup) error {
 	if !isSessionResultCode(slot.ResultCode) {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrSessionCorrupt)
 	}
@@ -1574,10 +1609,21 @@ func validateStoredSessionSlot(state State, slot SessionSlotView) error {
 			slot.ActivePolicyGeneration != state.Binding.ActivePolicyGeneration ||
 			slot.ProtectionEpoch != state.Binding.ProtectionEpoch ||
 			slot.RoutingVersion > state.Binding.RoutingVersion ||
-			slot.RouteGeneration > state.Binding.RouteGeneration ||
-			state.Binding.RoutingVersion-slot.RoutingVersion !=
-				state.Binding.RouteGeneration-slot.RouteGeneration {
+			slot.RouteGeneration > state.Binding.RouteGeneration {
 			return fmt.Errorf("%w: retained session result mutable binding", ErrSessionCorrupt)
+		}
+		if slot.RoutingVersion == state.Binding.RoutingVersion && slot.RouteGeneration == state.Binding.RouteGeneration {
+			if slot.AppliedSequence <= state.FenceApplied {
+				return ErrSessionCorrupt
+			}
+		} else {
+			if len(lookup) != 1 {
+				return ErrSessionCorrupt
+			}
+			f, err := lookup[0].get(state, slot.RoutingVersion, slot.RouteGeneration)
+			if err != nil || slot.AppliedSequence <= f.start || slot.AppliedSequence >= f.end {
+				return ErrSessionCorrupt
+			}
 		}
 	}
 	return nil

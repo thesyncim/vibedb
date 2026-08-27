@@ -297,7 +297,8 @@ func (p *Partitioner) InitialTailCursor(set ChildArtifactSet) (TailCursor, error
 		set.Partition.SourceBase == ([sha256.Size]byte{}) ||
 		set.Partition.SourceEntry == ([sha256.Size]byte{}) ||
 		set.Partition.SourceApplied == 0 || set.Partition.SourceTerm == 0 ||
-		set.Partition.RouteGeneration == 0 {
+		set.Partition.RouteGeneration == 0 ||
+		set.Partition.RouteGeneration != p.initialCoordinates(set.Partition.RouteGeneration).RouteGeneration {
 		return TailCursor{}, ErrTailCursor
 	}
 	placement := p.program.Digest()
@@ -340,8 +341,8 @@ func (p *Partitioner) InitialTailCursor(set ChildArtifactSet) (TailCursor, error
 		planDigest: p.digest, placementDigest: placement,
 		dataChainDigest: cut.DataChainDigest, baseDigest: cut.BaseDigest,
 		entryDigest: cut.EntryDigest, applied: cut.Applied, term: cut.Term,
-		ownershipEpoch:  uint64(p.source.OwnershipEpoch),
-		routingVersion:  uint64(p.source.RoutingVersion),
+		ownershipEpoch:  p.initialCoordinates(cut.RouteGeneration).OwnershipEpoch,
+		routingVersion:  p.initialCoordinates(cut.RouteGeneration).RoutingVersion,
 		routeGeneration: cut.RouteGeneration, childBaseDigests: childBases,
 	}, nil
 }
@@ -488,6 +489,9 @@ func (p *Partitioner) VerifyTailBatch(
 		batch.Applied == 0 || batch.Applied == math.MaxUint64 ||
 		batch.Term == 0 || batch.Term == math.MaxUint64 ||
 		!validTailBatchCoordinates(batch) ||
+		batch.beforeCoordinates() != p.initialCoordinates(batch.BeforeRouteGeneration) ||
+		(batch.beforeCoordinates() != batch.afterCoordinates() &&
+			batch.afterCoordinates() != p.sealCoordinates(batch.beforeCoordinates())) ||
 		batch.TransitionCount > replication.MaxMutations ||
 		batch.Operations > batch.TransitionCount {
 		return ErrTailEntry
@@ -564,6 +568,14 @@ func (p *Partitioner) validTailCursor(cursor TailCursor) bool {
 		cursor.routingVersion == 0 || cursor.routeGeneration == 0 {
 		return false
 	}
+	if !cursor.sealed && cursor.coordinates() != p.initialCoordinates(cursor.routeGeneration) {
+		return false
+	}
+	if cursor.sealed && (cursor.ownershipEpoch != uint64(p.children[p.retained].OwnershipEpoch) ||
+		cursor.routingVersion != uint64(p.target) ||
+		(p.targetGeneration != 0 && cursor.routeGeneration != p.targetGeneration)) {
+		return false
+	}
 	for child := 0; child < int(p.childCount); child++ {
 		if cursor.childBaseDigests[child] == ([sha256.Size]byte{}) {
 			return false
@@ -593,7 +605,7 @@ func (p *Partitioner) validTailEntry(cursor TailCursor, entry TailEntry) bool {
 	retained := p.children[p.retained]
 	return len(entry.Transitions) == 0 &&
 		entry.AfterDataChainDigest == entry.BeforeDataChainDigest &&
-		before.incremented() == after &&
+		p.sealCoordinates(before) == after &&
 		after.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
 		after.RoutingVersion == uint64(p.target)
 }
@@ -633,17 +645,6 @@ func (b TailBatch) afterCoordinates() TailSourceCoordinates {
 	}
 }
 
-func (c TailSourceCoordinates) incremented() TailSourceCoordinates {
-	if c.OwnershipEpoch == math.MaxUint64 || c.RoutingVersion == math.MaxUint64 ||
-		c.RouteGeneration == math.MaxUint64 {
-		return TailSourceCoordinates{}
-	}
-	return TailSourceCoordinates{
-		OwnershipEpoch: c.OwnershipEpoch + 1, RoutingVersion: c.RoutingVersion + 1,
-		RouteGeneration: c.RouteGeneration + 1,
-	}
-}
-
 func tailEntrySeals(entry TailEntry) bool {
 	return entry.beforeCoordinates() != entry.afterCoordinates()
 }
@@ -652,7 +653,9 @@ func validTailBatchCoordinates(batch TailBatch) bool {
 	before, after := batch.beforeCoordinates(), batch.afterCoordinates()
 	return before.OwnershipEpoch != 0 && before.RoutingVersion != 0 &&
 		before.RouteGeneration != 0 &&
-		(after == before || before.incremented() == after && batch.TransitionCount == 0 &&
+		(after == before || before.OwnershipEpoch != math.MaxUint64 &&
+			after.OwnershipEpoch == before.OwnershipEpoch+1 &&
+			after.RoutingVersion > before.RoutingVersion && after.RouteGeneration > before.RouteGeneration && batch.TransitionCount == 0 &&
 			batch.AfterDataChainDigest == batch.BeforeDataChainDigest)
 }
 

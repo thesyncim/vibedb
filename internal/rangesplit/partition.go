@@ -78,6 +78,9 @@ type Partitioner struct {
 	targetDistribution distribution.DistributionName
 	manifest           []distribution.Shard
 	digest             [sha256.Size]byte
+	geometryDigest     [sha256.Size]byte
+	sourceCoordinates  TailSourceCoordinates
+	targetGeneration   uint64
 }
 
 // NewPartitioner binds one desired split to the collection's compiled shard
@@ -256,7 +259,8 @@ func (p *Partitioner) matchesSource(state replicatedstate.State) bool {
 		binding.Shard == string(p.source.Shard) &&
 		binding.AllocationGeneration == uint64(p.source.AllocationGeneration) &&
 		binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
-		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
+		binding.RoutingVersion == p.initialCoordinates(binding.RouteGeneration).RoutingVersion &&
+		(p.sourceCoordinates == (TailSourceCoordinates{}) || binding.RouteGeneration == p.sourceCoordinates.RouteGeneration) &&
 		binding.OwnedRange == p.source.Range
 }
 

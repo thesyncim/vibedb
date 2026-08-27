@@ -574,6 +574,9 @@ func (m *Machine) nextBatchState(
 		ActiveExecutionPinCount:    current.ActiveExecutionPinCount,
 		ExecutionPinResidentBytes:  current.ExecutionPinResidentBytes,
 		RelationPlacementDigest:    current.RelationPlacementDigest,
+		FenceOriginDigest:          current.FenceOriginDigest, FenceApplied: current.FenceApplied,
+		HistoricalFenceCount: current.HistoricalFenceCount, HistoricalFenceSlots: current.HistoricalFenceSlots,
+		UnfencedSessionSlots: current.UnfencedSessionSlots,
 	}
 }
 
@@ -583,6 +586,11 @@ func (m *Machine) recordBatchPlan(
 ) error {
 	if batch == nil {
 		return ErrInvalidCollection
+	}
+	for _, row := range plan.systemRows {
+		if err := batch.system.record(row.key, row.value, row.delete); err != nil {
+			return err
+		}
 	}
 	if plan.writeSession {
 		if err := batch.system.record(plan.sessionKey[:], plan.sessionRecord, false); err != nil {

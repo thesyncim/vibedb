@@ -141,7 +141,7 @@ func (p *Partitioner) CertifyCutover(
 		capture.base.BaseDigest != cursor.baseDigest ||
 		capture.base.Applied >= cursor.applied ||
 		capture.base.RouteGeneration == math.MaxUint64 ||
-		cursor.routeGeneration != capture.base.RouteGeneration+1 {
+		cursor.coordinates() != p.sealCoordinates(p.initialCoordinates(capture.base.RouteGeneration)) {
 		return CutoverCertificate{}, ErrCutoverCertificate
 	}
 	pre := cursor
@@ -234,7 +234,8 @@ func (p *Partitioner) VerifyCutoverCertificateWithWorkspace(
 		certificate.childCount != p.childCount || certificate.retained != p.retained ||
 		certificate.coordinates.OwnershipEpoch !=
 			uint64(p.children[p.retained].OwnershipEpoch) ||
-		certificate.coordinates.RoutingVersion != uint64(p.target) {
+		certificate.coordinates.RoutingVersion != uint64(p.target) ||
+		(p.targetGeneration != 0 && certificate.coordinates.RouteGeneration != p.targetGeneration) {
 		return ErrCutoverCertificate
 	}
 	if cutoverDigest(&certificate, workspace) != certificate.digest {

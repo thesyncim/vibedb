@@ -291,9 +291,19 @@ func newPlan(
 		return nil, ErrInvalidPlan
 	}
 	digest, err := rangesplit.SplitPlanDigest(split)
-	if err != nil || digest != partitioner.Digest() ||
+	if err != nil || digest != partitioner.GeometryDigest() ||
 		partitioner.ValidateManifestTransition(sourceManifest, split.Manifest()) != nil {
 		return nil, errors.Join(ErrInvalidPlan, err)
+	}
+	if authority != nil {
+		partitioner, err = partitioner.BindSourceFence(rangesplit.TailSourceCoordinates{
+			OwnershipEpoch:  authority.Command.OwnershipEpoch,
+			RoutingVersion:  authority.Command.RoutingVersion,
+			RouteGeneration: authority.Command.RouteGeneration,
+		}, sourceGeneration+1)
+		if err != nil {
+			return nil, errors.Join(ErrInvalidPlan, err)
+		}
 	}
 
 	plan := &Plan{
@@ -477,7 +487,7 @@ func (p *Plan) OperationID() OperationID {
 func splitOperationID(plan *Plan) OperationID {
 	digestWriter := sha256.New()
 	_, _ = digestWriter.Write([]byte("vibedb/splitcontroller/operation\x00"))
-	digest := plan.partitioner.Digest()
+	digest := plan.partitioner.GeometryDigest()
 	_, _ = digestWriter.Write(digest[:])
 	writeSplitOperationUint64(digestWriter, plan.current)
 	writeSplitOperationUint64(digestWriter, plan.next)
@@ -497,7 +507,7 @@ func OperationIDForSplit(sourceGeneration uint64, split *autosplit.SplitPlan, pa
 		return OperationID{}, ErrInvalidPlan
 	}
 	digest, err := rangesplit.SplitPlanDigest(split)
-	if err != nil || digest != partitioner.Digest() {
+	if err != nil || digest != partitioner.GeometryDigest() {
 		return OperationID{}, errors.Join(err, ErrInvalidPlan)
 	}
 	return splitOperationID(&Plan{partitioner: partitioner, current: sourceGeneration, next: sourceGeneration + 1,

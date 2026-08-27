@@ -406,7 +406,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 			slotErr = fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
 		}
 		if slotErr == nil {
-			slotErr = validateStoredSessionSlot(m.state, record)
+			slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 		}
 		if slotErr == nil {
 			slotErr = validateSessionSlotAgainstHeader(session, record)
@@ -483,7 +483,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 			slotErr = fmt.Errorf("%w: retirement slot mismatch", ErrSessionCorrupt)
 		}
 		if slotErr == nil {
-			slotErr = validateStoredSessionSlot(m.state, record)
+			slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 		}
 		if slotErr == nil {
 			slotErr = validateSessionSlotAgainstHeader(session, record)
@@ -526,7 +526,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 		slotErr = fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
 	}
 	if slotErr == nil {
-		slotErr = validateStoredSessionSlot(m.state, record)
+		slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 	}
 	if slotErr == nil {
 		slotErr = validateSessionSlotAgainstHeader(session, record)
@@ -734,7 +734,7 @@ func (m *Machine) LookupSessionLease(
 		slotErr = fmt.Errorf("%w: latest lease slot mismatch", ErrSessionCorrupt)
 	}
 	if slotErr == nil {
-		slotErr = validateStoredSessionSlot(m.state, record)
+		slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 	}
 	if slotErr == nil {
 		slotErr = validateSessionSlotAgainstHeader(session, record)

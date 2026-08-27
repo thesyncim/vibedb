@@ -668,6 +668,9 @@ func (c *SourceCapture) decodeHeader(
 		entryDigest:     entry,
 		dataChainDigest: dataChain,
 	}
+	if (TailSourceCoordinates{OwnershipEpoch: publication.ownershipEpoch, RoutingVersion: publication.routingVersion, RouteGeneration: publication.routeGeneration}) != c.partitioner.initialCoordinates(publication.routeGeneration) {
+		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
+	}
 	if publication.applied == 0 || publication.applied == math.MaxUint64 ||
 		publication.term == 0 || publication.term == math.MaxUint64 ||
 		publication.ownershipEpoch == 0 || publication.routingVersion == 0 ||
@@ -920,6 +923,11 @@ func (c *SourceCapture) transitionFollowsCurrent(
 	transition replicatedstate.CapturedTransition,
 ) bool {
 	current := c.current
+	before := TailSourceCoordinates{OwnershipEpoch: transition.BeforeOwnershipEpoch, RoutingVersion: transition.BeforeRoutingVersion, RouteGeneration: transition.BeforeRouteGeneration}
+	after := TailSourceCoordinates{OwnershipEpoch: transition.AfterOwnershipEpoch, RoutingVersion: transition.AfterRoutingVersion, RouteGeneration: transition.AfterRouteGeneration}
+	if after != before && (after != c.partitioner.sealCoordinates(before) || transition.MutationCount() != 0 || transition.BeforeDataChainDigest != transition.AfterDataChainDigest) {
+		return false
+	}
 	return current.applied != math.MaxUint64 && transition.Applied == current.applied+1 &&
 		transition.Term >= current.term &&
 		transition.PreviousEntryDigest == current.entryDigest &&

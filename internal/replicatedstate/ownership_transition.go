@@ -224,8 +224,8 @@ func validateOwnershipTransitionView(view OwnershipTransitionView) error {
 		view.OwnershipEpoch == math.MaxUint64 || view.RoutingVersion == math.MaxUint64 ||
 		view.RouteGeneration == math.MaxUint64 ||
 		view.ToOwnershipEpoch != view.OwnershipEpoch+1 ||
-		view.ToRoutingVersion != view.RoutingVersion+1 ||
-		view.ToRouteGeneration != view.RouteGeneration+1 ||
+		view.ToRoutingVersion <= view.RoutingVersion ||
+		view.ToRouteGeneration <= view.RouteGeneration ||
 		!canonicalOwnershipRange(view.FromOwnedRange) || !canonicalOwnershipRange(view.ToOwnedRange) ||
 		!ownershipRangeContains(view.FromOwnedRange, view.ToOwnedRange) {
 		return fmt.Errorf("%w: ownership transition semantics", ErrOwnershipTransition)
@@ -261,6 +261,23 @@ func (m *Machine) ownershipTransitionBinding(
 		!memberInSorted(m.state.ConfState.GetVoters(), transition.SourceMember) ||
 		!memberInSorted(m.state.ConfState.GetVoters(), transition.TargetMember) {
 		return Binding{}, ErrOwnershipTransition
+	}
+	if transition.ToRoutingVersion != current.RoutingVersion+1 ||
+		transition.ToRouteGeneration != current.RouteGeneration+1 {
+		// Catalog generations can advance without applying an ownership entry
+		// to this shard. A jump is legal only for the exact target of its
+		// committed capture recipe, never from monotonicity alone.
+		authorizer, ok := m.capture.(interface {
+			PartitionerDigest() [32]byte
+			AuthorizesOwnershipTransition(OwnershipTransitionView) bool
+		})
+		activation := m.splitCaptureActivation
+		if !ok || activation == nil ||
+			activation.Command.BindingDigest != SplitCaptureBindingDigest(current) ||
+			authorizer.PartitionerDigest() != activation.Command.PartitionerDigest ||
+			!authorizer.AuthorizesOwnershipTransition(transition) {
+			return Binding{}, ErrOwnershipTransition
+		}
 	}
 	current.OwnershipEpoch = transition.ToOwnershipEpoch
 	current.RoutingVersion = transition.ToRoutingVersion

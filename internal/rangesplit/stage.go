@@ -101,7 +101,7 @@ func NewChildStageWithOptions(
 	var err error
 	if len(persistedCursor) != 0 {
 		cursor, err = OpenChildStageCursor(persistedCursor)
-		if err != nil || !childStageCursorMatchesExpected(cursor, expected) {
+		if err != nil || !childStageCursorMatchesExpected(partitioner, cursor, expected) {
 			return nil, ErrChildStage
 		}
 	}
@@ -341,8 +341,7 @@ func (s *ChildStage) validTailBatchCoordinates(
 	currentRouteGeneration uint64,
 ) bool {
 	before, after := batch.beforeCoordinates(), batch.afterCoordinates()
-	if before.OwnershipEpoch != uint64(s.partitioner.source.OwnershipEpoch) ||
-		before.RoutingVersion != uint64(s.partitioner.source.RoutingVersion) ||
+	if before != s.partitioner.initialCoordinates(currentRouteGeneration) ||
 		before.RouteGeneration != currentRouteGeneration {
 		return false
 	}
@@ -350,7 +349,7 @@ func (s *ChildStage) validTailBatchCoordinates(
 		return true
 	}
 	retained := s.partitioner.children[s.partitioner.retained]
-	return before.incremented() == after && batch.TransitionCount == 0 &&
+	return s.partitioner.sealCoordinates(before) == after && batch.TransitionCount == 0 &&
 		after.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
 		after.RoutingVersion == uint64(s.partitioner.target)
 }
@@ -575,17 +574,18 @@ func (p *Partitioner) ValidateChildStageCursor(
 	cursor ChildStageCursor,
 ) error {
 	if validateExpectedChildArtifact(p, expected) != nil ||
-		!childStageCursorMatchesExpected(&cursor, expected) {
+		!childStageCursorMatchesExpected(p, &cursor, expected) {
 		return ErrChildStage
 	}
 	return nil
 }
 
 func childStageCursorMatchesExpected(
+	p *Partitioner,
 	cursor *ChildStageCursor,
 	expected ChildArtifactManifest,
 ) bool {
-	if cursor == nil || cursor.child != expected.Child ||
+	if p == nil || cursor == nil || cursor.child != expected.Child ||
 		cursor.planDigest != expected.PlanDigest ||
 		cursor.placementDigest != expected.PlacementDigest ||
 		cursor.artifactDigest != expected.Digest ||
@@ -623,7 +623,7 @@ func childStageCursorMatchesExpected(
 	}
 	if cursor.phase == ChildStageSealed &&
 		(expected.Source.RouteGeneration == math.MaxUint64 ||
-			cursor.routeGeneration != expected.Source.RouteGeneration+1) {
+			cursor.routeGeneration != p.sealCoordinates(p.initialCoordinates(expected.Source.RouteGeneration)).RouteGeneration) {
 		return false
 	}
 	if cursor.applied == expected.Source.Applied {

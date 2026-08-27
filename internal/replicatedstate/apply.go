@@ -45,6 +45,7 @@ type commandPlan struct {
 	changes            []finalMutation
 	systemRows         []transactionRowMutation
 	executionPinDelta  executionPinStateDelta
+	fenceDelta         sessionFenceDelta
 	relations          []plannedRelationChanges
 	dataChainDigest    [32]byte
 	resultCode         uint32
@@ -359,7 +360,11 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 		}
 		next := m.nextState(meta, RecordOwnership, digest)
 		next.Binding = binding
-		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
+		rows, fenceErr := archiveSessionFence(m.state, &next)
+		if fenceErr != nil {
+			return raftmodel.Publication{}, m.fail(fenceErr)
+		}
+		if err := m.persistTransitionRows(next, nil, commandPlan{}, rows); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		return clonePublication(m.publication), nil
@@ -780,7 +785,11 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 		next := m.nextState(meta, RecordOwnership, normalEntryDigest(meta, transition.Bytes()))
 		next.Binding = binding
-		return m.checkTransitionCapacity(next, nil, commandPlan{})
+		rows, err := archiveSessionFence(m.state, &next)
+		if err != nil {
+			return err
+		}
+		return m.checkTransitionCapacity(next, nil, commandPlan{systemRows: rows})
 	}
 	command, err := replication.OpenCommand(data)
 	if err != nil {
@@ -955,7 +964,7 @@ func applyCommandPlanToState(next *State, plan commandPlan) error {
 		next.SessionCount--
 		next.SessionSlotCount -= uint64(plan.deleteSlots)
 	}
-	return nil
+	return applySessionFenceDelta(next, plan.fenceDelta)
 }
 
 func (m *Machine) checkTransition(meta raftmodel.ApplyMeta, kind RecordKind, digest [32]byte) (bool, error) {
@@ -1001,6 +1010,9 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ActiveExecutionPinCount:    m.state.ActiveExecutionPinCount,
 		ExecutionPinResidentBytes:  m.state.ExecutionPinResidentBytes,
 		RelationPlacementDigest:    m.state.RelationPlacementDigest,
+		FenceOriginDigest:          m.state.FenceOriginDigest, FenceApplied: m.state.FenceApplied,
+		HistoricalFenceCount: m.state.HistoricalFenceCount, HistoricalFenceSlots: m.state.HistoricalFenceSlots,
+		UnfencedSessionSlots: m.state.UnfencedSessionSlots,
 	}
 }
 
@@ -1127,6 +1139,21 @@ func (m *Machine) planBundleCommand(
 	relationSnapshots relationPointSnapshots,
 	scratch *commandPlanScratch,
 ) (commandPlan, error) {
+	plan, err := m.planBundleCommandUnaccounted(command, applied, state, systemSnapshot, relationSnapshots, scratch)
+	if err != nil {
+		return plan, err
+	}
+	return accountSessionFencePlan(state, systemSnapshot, plan)
+}
+
+func (m *Machine) planBundleCommandUnaccounted(
+	command replication.CommandView,
+	applied uint64,
+	state State,
+	systemSnapshot pointSnapshot,
+	relationSnapshots relationPointSnapshots,
+	scratch *commandPlanScratch,
+) (commandPlan, error) {
 	scratch.begin()
 	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
 	plan.authorityDigest = AuthorityIdentityKey(command.Tenant, command.ClientID)
@@ -1240,7 +1267,7 @@ func (m *Machine) planBundleCommand(
 					existing.ClientSequence != command.ClientSequence {
 					return commandPlan{}, fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
 				}
-				if err := validateStoredSessionSlot(state, existing); err != nil {
+				if err := validateStoredSessionSlot(state, existing, sessionFenceLookup{snapshot: systemSnapshot}); err != nil {
 					return commandPlan{}, err
 				}
 				if err := validateSessionSlotAgainstHeader(session, existing); err != nil {
@@ -1573,7 +1600,7 @@ func (m *Machine) planSessionOpen(
 			record.ClientEpoch != session.ClientEpoch {
 			return commandPlan{}, fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
 		}
-		if err := validateStoredSessionSlot(state, record); err != nil {
+		if err := validateStoredSessionSlot(state, record, sessionFenceLookup{snapshot: systemSnapshot}); err != nil {
 			return commandPlan{}, err
 		}
 		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
@@ -1767,7 +1794,7 @@ func (m *Machine) planSessionRelease(
 			record.ClientEpoch != session.ClientEpoch {
 			return fmt.Errorf("%w: release slot mismatch", ErrSessionCorrupt)
 		}
-		if err := validateStoredSessionSlot(state, record); err != nil {
+		if err := validateStoredSessionSlot(state, record, sessionFenceLookup{snapshot: systemSnapshot}); err != nil {
 			return err
 		}
 		if err := validateSessionSlotAgainstHeader(session, record); err != nil {

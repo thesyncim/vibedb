@@ -25,6 +25,8 @@ type portablePartitioner struct {
 	TargetDistribution distribution.DistributionName `json:"target_distribution"`
 	Manifest           []distribution.Shard          `json:"manifest"`
 	Digest             [32]byte                      `json:"digest"`
+	SourceCoordinates  TailSourceCoordinates         `json:"source_coordinates,omitempty"`
+	TargetGeneration   uint64                        `json:"target_generation,omitempty"`
 }
 
 func AppendPortablePartitioner(dst []byte, p *Partitioner) ([]byte, error) {
@@ -32,6 +34,7 @@ func AppendPortablePartitioner(dst []byte, p *Partitioner) ([]byte, error) {
 		return dst, ErrPortablePartitioner
 	}
 	s := portablePartitioner{Source: p.source, ChildCount: p.childCount, Retained: p.retained, Collection: p.collection, Columns: slices.Clone(p.columns), Target: p.target, TargetDistribution: p.targetDistribution, Manifest: slices.Clone(p.manifest), Digest: p.digest, Children: make([]autosplit.SplitChild, p.childCount)}
+	s.SourceCoordinates, s.TargetGeneration = p.sourceCoordinates, p.targetGeneration
 	copy(s.Children, p.children[:p.childCount])
 	raw, err := vibejson.Marshal(&s)
 	if err != nil {
@@ -104,13 +107,22 @@ func OpenPortablePartitioner(raw []byte) (*Partitioner, error) {
 		return nil, errors.Join(err, ErrPortablePartitioner)
 	}
 	digest, err := SplitPlanDigest(restored)
-	if err != nil || digest != s.Digest {
+	if err != nil {
 		return nil, errors.Join(err, ErrPortablePartitioner)
 	}
 	p := &Partitioner{source: s.Source, childCount: s.ChildCount, retained: s.Retained, collection: s.Collection, columns: slices.Clone(s.Columns), program: program, target: s.Target, targetDistribution: s.TargetDistribution, manifest: slices.Clone(s.Manifest), digest: digest}
 	for i, c := range s.Children {
 		p.children[i] = c
 		p.ranges[i] = c.Range
+	}
+	if s.SourceCoordinates != (TailSourceCoordinates{}) || s.TargetGeneration != 0 {
+		p, err = p.BindSourceFence(s.SourceCoordinates, s.TargetGeneration)
+		if err != nil {
+			return nil, errors.Join(err, ErrPortablePartitioner)
+		}
+	}
+	if p.digest != s.Digest {
+		return nil, ErrPortablePartitioner
 	}
 	return p, nil
 }
