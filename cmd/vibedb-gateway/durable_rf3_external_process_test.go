@@ -976,8 +976,8 @@ func (fixture *durableRF3ExternalFixture) waitRouteLeader(
 	}
 	for member, state := range lastStates {
 		if member != excluded {
-			t.Logf("role %s probe member=%d leader=%d term=%d applied=%d error=%v",
-				durableRF3ExternalRoleNames[group], member+1, state.LeaderID, state.Term, state.Applied, lastErrors[member])
+			t.Logf("role %s probe member=%d leader=%d applied=%d error=%v",
+				durableRF3ExternalRoleNames[group], member+1, state.LeaderID, state.Applied, lastErrors[member])
 		}
 	}
 	t.Fatalf("role %s has no consistent RF3 leader excluding member %d",
