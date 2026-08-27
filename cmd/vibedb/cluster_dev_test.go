@@ -291,13 +291,58 @@ func TestInitializeDevClusterEmitsThreeIndependentApplyRoles(t *testing.T) {
 	}
 }
 
-func TestInitializeDevRF3BindsHotSplitSourceToDataGroup(t *testing.T) {
+func TestInitializeDevRF3DoesNotInventUnpreparedSplitSource(t *testing.T) {
 	root := t.TempDir()
 	manifest, err := initializeDevCluster(devClusterOptions{root: root, replicas: devClusterRF3, shardBinary: "/usr/bin/true"}, filepath.Join(root, "cluster.vibejson"))
 	// The no-op child exercises generation only; completion must then fail
 	// because it did not materialize the RF3 stores.
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected unmaterialized-store refusal, got %v", err)
+	}
+	if _, err := os.Stat(manifest.ReplicaControl); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("published source inventory before prepared SQL identity: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "cluster.vibejson")); err != nil {
+		t.Fatalf("preparation cannot resume: %v", err)
+	}
+	if _, err := devReplicaSplitSourceForCluster(manifest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invented absent SQL identity: %v", err)
+	}
+}
+
+func TestInitializeDevRF3BindsHotSplitSourceToDataGroup(t *testing.T) {
+	root := t.TempDir()
+	manifest, err := initializeDevCluster(devClusterOptions{root: root, replicas: devClusterRF3, shardBinary: "/usr/bin/true"}, filepath.Join(root, "cluster.vibejson"))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected unmaterialized-store refusal, got %v", err)
+	}
+	preparePath := filepath.Join(root, "prepare-data-member-1.vibejson")
+	prepareRaw, err := os.ReadFile(preparePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prepare devPrepareManifest
+	if err := vibejson.Unmarshal(prepareRaw, &prepare); err != nil {
+		t.Fatal(err)
+	}
+	group := raftmember.GroupKey{TopologyRecoveryEpoch: prepare.TopologyRecoveryEpoch}
+	for _, field := range []struct {
+		raw    string
+		target *[16]byte
+	}{{prepare.ClusterID, &group.ClusterID}, {prepare.ClusterIncarnation, &group.ClusterIncarnation},
+		{prepare.ShardIncarnation, &group.ShardIncarnation}, {prepare.GroupID, &group.GroupID}} {
+		*field.target, err = decodeDev16(field.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(prepare.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prepareDevTestReplica(t, manifest.DataMembers[0], group, devDataDistribution,
+		devDataShard, devDataTable, devDataPrimaryKey, replication.Digest{})
+	if err := writeDevReplicaControl(manifest.ReplicaControl, manifest); err != nil {
+		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(manifest.ReplicaControl)
 	if err != nil {
@@ -311,8 +356,16 @@ func TestInitializeDevRF3BindsHotSplitSourceToDataGroup(t *testing.T) {
 		t.Fatalf("control=%+v", control)
 	}
 	source := control.SplitSources[0]
-	if source.Table != devDataTable || source.SchemaGeneration != 1 || source.RelationManifestDigest == ([32]byte{}) || len(source.Replicas) != 3 {
+	if source.Table != devDataTable || source.SchemaGeneration != 1 || source.RelationManifestDigest == ([32]byte{}) || len(source.Replicas) != 3 || len(source.LocalIndexes) != 0 {
 		t.Fatalf("source=%+v", source)
+	}
+	identityRaw, err := os.ReadFile(filepath.Join(prepare.Root, "sql-identity.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	emittedIdentity, err := vibejson.Marshal(&source.SQL)
+	if err != nil || !bytes.Equal(identityRaw, emittedIdentity) {
+		t.Fatalf("source SQL identity is not the exact prepared identity: %v", err)
 	}
 	for i, replica := range source.Replicas {
 		if i > 0 && source.Replicas[i-1].Node >= replica.Node {
@@ -343,6 +396,31 @@ func TestInitializeDevRF3BindsHotSplitSourceToDataGroup(t *testing.T) {
 	second, err := vibejson.Marshal(&rebuilt)
 	if err != nil || !bytes.Equal(first, second) {
 		t.Fatal("source authority changed on restart", err)
+	}
+	for _, change := range []struct {
+		name   string
+		mutate func(*devPrepareManifest)
+	}{
+		{"member", func(p *devPrepareManifest) { p.MemberID++ }},
+		{"store", func(p *devPrepareManifest) { p.StoreID = manifest.DataMembers[1].Store }},
+		{"root", func(p *devPrepareManifest) { p.Root = filepath.Dir(manifest.DataMembers[1].ServeManifest) }},
+		{"recovery epoch", func(p *devPrepareManifest) { p.TopologyRecoveryEpoch++ }},
+		{"schema", func(p *devPrepareManifest) { p.Authority.SchemaGeneration++ }},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			wrong := prepare
+			change.mutate(&wrong)
+			encoded, err := vibejson.Marshal(&wrong)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(preparePath, encoded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := devReplicaSplitSourceForCluster(manifest); !errors.Is(err, errDevCluster) {
+				t.Fatalf("accepted mismatched source preparation: %v", err)
+			}
+		})
 	}
 }
 

@@ -135,16 +135,23 @@ type devReplicaControlShard struct {
 }
 
 type devReplicaSplitSource struct {
-	ClusterID              [16]byte                       `json:"cluster_id"`
-	ClusterIncarnation     [16]byte                       `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch  uint64                         `json:"topology_recovery_epoch"`
-	ShardIncarnation       [16]byte                       `json:"shard_incarnation"`
-	GroupID                [16]byte                       `json:"group_id"`
-	SchemaGeneration       uint64                         `json:"schema_generation"`
-	RelationManifestDigest [32]byte                       `json:"relation_manifest_digest"`
-	Table                  string                         `json:"table"`
-	Template               devReplicaSplitTemplate        `json:"template"`
-	Replicas               []devReplicaSplitSourceReplica `json:"replicas"`
+	ClusterID              [16]byte                               `json:"cluster_id"`
+	ClusterIncarnation     [16]byte                               `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch  uint64                                 `json:"topology_recovery_epoch"`
+	ShardIncarnation       [16]byte                               `json:"shard_incarnation"`
+	GroupID                [16]byte                               `json:"group_id"`
+	SchemaGeneration       uint64                                 `json:"schema_generation"`
+	RelationManifestDigest [32]byte                               `json:"relation_manifest_digest"`
+	Table                  string                                 `json:"table"`
+	SQL                    sqldriver.ReplicatedShardStoreIdentity `json:"sql"`
+	LocalIndexes           []devReplicaSplitIndex                 `json:"local_indexes,omitempty"`
+	Template               devReplicaSplitTemplate                `json:"template"`
+	Replicas               []devReplicaSplitSourceReplica         `json:"replicas"`
+}
+
+type devReplicaSplitIndex struct {
+	Name  string   `json:"name"`
+	Paths []string `json:"paths"`
 }
 
 type devReplicaSplitSourceReplica struct {
@@ -519,8 +526,10 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	if err = writeDevHotShardCapacity(m.HotShardCapacity, m.Members, m.LedgerMembers, m.DataMembers); err != nil {
 		return m, err
 	}
-	if err = writeDevReplicaControl(m.ReplicaControl, m); err != nil {
-		return m, err
+	if m.Nodes == devClusterRF1 {
+		if err = writeDevReplicaControl(m.ReplicaControl, m); err != nil {
+			return m, err
+		}
 	}
 	raw, err := vibejson.Marshal(&m)
 	if err != nil {
@@ -586,6 +595,18 @@ func completeDevCluster(options devClusterOptions, manifest devClusterManifest) 
 	}
 	if manifest.Nodes == devClusterRF1 {
 		return nil
+	}
+	// RF3 source inventory includes real prepared storage identities. Keep
+	// creation resumable after the durable cluster manifest, before serving.
+	if _, err := os.Stat(manifest.ReplicaControl); errors.Is(err, os.ErrNotExist) {
+		if err := writeDevReplicaControl(manifest.ReplicaControl, manifest); err != nil {
+			return err
+		}
+		if err := syncDevDir(options.root); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 	raw, err := readDevFile(filepath.Join(options.root, "prepare-catalog-member-1.vibejson"), 1<<20)
 	if err != nil {
@@ -1493,10 +1514,12 @@ func writeDevReplicaControl(
 	return writeDevExclusive(path, raw, 0o600)
 }
 
-// Build from the immutable data preparation authority, before processes start.
-// The shared engine helper computes the same portable machine-schema digest
-// later checked against the prepared stores and replicated catalog.
+// Build from immutable preparation authority and the actual prepared SQL
+// identity before processes start. No storage names or log IDs are synthesized.
 func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSplitSource, error) {
+	if cluster.Nodes != devClusterRF3 || len(cluster.DataMembers) != devClusterRF3 {
+		return devReplicaSplitSource{}, errDevCluster
+	}
 	raw, err := readDevFile(filepath.Join(filepath.Dir(cluster.CatalogPath), "prepare-data-member-1.vibejson"), 1<<20)
 	if err != nil {
 		return devReplicaSplitSource{}, err
@@ -1504,6 +1527,13 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 	var prepare devPrepareManifest
 	if err = vibejson.Unmarshal(raw, &prepare); err != nil {
 		return devReplicaSplitSource{}, err
+	}
+	member := cluster.DataMembers[0]
+	if prepare.MemberID != member.Member || prepare.StoreID != member.Store ||
+		prepare.Root != filepath.Dir(member.ServeManifest) ||
+		prepare.Distribution != string(devDataDistribution) || prepare.Shard != string(devDataShard) ||
+		prepare.Table != devDataTable {
+		return devReplicaSplitSource{}, errDevCluster
 	}
 	var entry devReplicaSplitSource
 	for _, item := range []struct {
@@ -1531,6 +1561,17 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 			ProtectionEpoch: prepare.Authority.ProtectionEpoch, OwnershipEpoch: prepare.Authority.OwnershipEpoch,
 			SchemaGeneration: prepare.Authority.SchemaGeneration, RoutingVersion: prepare.Authority.RoutingVersion,
 			RouteGeneration: prepare.Authority.RouteGeneration}}
+	identityRaw, err := readDevFile(filepath.Join(prepare.Root, "sql-identity.vibejson"), 1<<20)
+	if err != nil {
+		return devReplicaSplitSource{}, err
+	}
+	if err := entry.SQL.UnmarshalJSON(identityRaw); err != nil {
+		return devReplicaSplitSource{}, errors.Join(errDevCluster, err)
+	}
+	if entry.SQL.Binding != binding || entry.SQL.UserTable != prepare.Table ||
+		entry.SQL.UserPrimaryKey != devDataPrimaryKey || entry.SQL.RelationCount != 1 {
+		return devReplicaSplitSource{}, errDevCluster
+	}
 	placement := sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat,
 		ShardKey: prepare.Apply.ShardKey, TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
@@ -1538,6 +1579,10 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 		sqldriver.InitialReplicatedRelationSchema{Table: prepare.Table, PrimaryKey: devDataPrimaryKey})
 	if err != nil {
 		return devReplicaSplitSource{}, err
+	}
+	actualDigest, err := sqldriver.ReplicatedSchemaManifest(entry.SQL, placement, nil)
+	if err != nil || actualDigest != digest || entry.SQL.UserLimits != limits {
+		return devReplicaSplitSource{}, errors.Join(errDevCluster, err)
 	}
 	entry.RelationManifestDigest = digest
 	entry.Template = devReplicaSplitTemplate{MaxSessions: prepare.Apply.MaxSessions, RetryWindow: prepare.Apply.RetryWindow,
