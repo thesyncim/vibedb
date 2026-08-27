@@ -668,7 +668,24 @@ func syncDirectory(path string) error {
 }
 
 func probeBootstrapRole(role bootstrapRole) (replication.Digest, sqldriver.ReplicatedShardStoreLimits, error) {
-	digest, limits, err := sqldriver.InitialReplicatedRelationManifest(role.table)
+	binding := sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: role.group.ClusterID, ClusterIncarnation: role.group.ClusterIncarnation,
+		TopologyRecoveryEpoch: role.group.TopologyRecoveryEpoch,
+		Distribution:          string(role.distribution), Shard: string(role.shard), AllocationGeneration: 1,
+		ShardIncarnation: role.group.ShardIncarnation, GroupID: role.group.GroupID,
+		MemberID: 1, StoreID: role.stores[0],
+		Authority: sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1,
+			SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		},
+	}
+	placement := sqldriver.ReplicatedPlacementProfile{
+		Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: role.primary,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+	}
+	digest, limits, err := sqldriver.InitialReplicatedRelationManifest(binding, placement,
+		sqldriver.InitialReplicatedRelationSchema{Table: role.table, PrimaryKey: role.primary})
 	return replication.Digest(digest), limits, err
 }
 

@@ -9,12 +9,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibejson"
 )
 
 type failingBootstrapReader struct{}
 
 func (failingBootstrapReader) Read([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
+
+func TestBootstrapRoleManifestBindsServingProfile(t *testing.T) {
+	role := bootstrapRole{distribution: "data", shard: "all", table: "documents", primary: "/id",
+		group: raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+			TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}}}
+	role.stores[0] = [16]byte{5}
+	digest, limits, err := probeBootstrapRole(role)
+	if err != nil || digest == ([32]byte{}) || limits.MaxKeyBytes == 0 {
+		t.Fatalf("initial serving profile: %x %+v %v", digest, limits, err)
+	}
+	for i := byte(6); i < 9; i++ {
+		role.stores[0] = [16]byte{i}
+		got, gotLimits, err := probeBootstrapRole(role)
+		if err != nil || got != digest || gotLimits != limits {
+			t.Fatal("replica-local store identity changed the serving schema digest")
+		}
+	}
+	role.shard = "other"
+	changed, _, err := probeBootstrapRole(role)
+	if err != nil || changed == digest {
+		t.Fatal("catalog routing profile was omitted from the serving schema digest")
+	}
+}
 
 func TestBootstrapCreatesCanonicalResumableRF3Authority(t *testing.T) {
 	root := t.TempDir()
