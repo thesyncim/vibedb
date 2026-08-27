@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -31,10 +32,18 @@ type ReplicatedTransactionResult struct {
 }
 
 type replicatedTransactionCommandEncoder struct {
-	tenant []byte
+	tenant         []byte
+	controlScratch []byte
 }
 
-func (encoder replicatedTransactionCommandEncoder) appendExact(
+// replicatedTransactionRetainedControlBytes keeps the ordinary transaction
+// lane allocation-free after its first wave without pinning a maximum-width
+// manifest page pack for the lifetime of an active request. Oversized control
+// bodies are still bounded by distributedtxn.MaxReplicatedCommandBytes and are
+// released after the outer proposal has copied them.
+const replicatedTransactionRetainedControlBytes = 64 << 10
+
+func (encoder *replicatedTransactionCommandEncoder) appendExact(
 	dst []byte,
 	retryHome replication.RetryHome,
 	route ReplicatedRoute,
@@ -45,7 +54,13 @@ func (encoder replicatedTransactionCommandEncoder) appendExact(
 	if err != nil {
 		return dst, err
 	}
-	controlBytes := make([]byte, 0, controlSize)
+	if encoder == nil {
+		return dst, ErrReplicatedTransaction
+	}
+	controlBytes := encoder.controlScratch[:0]
+	if cap(controlBytes) < controlSize {
+		controlBytes = make([]byte, 0, controlSize)
+	}
 	controlBytes, err = distributedtxn.AppendReplicatedCommand(controlBytes, control)
 	if err != nil {
 		return dst, err
@@ -67,10 +82,15 @@ func (encoder replicatedTransactionCommandEncoder) appendExact(
 		return dst, err
 	}
 	if cap(dst)-len(dst) < commandSize {
-		dst = make([]byte, 0, commandSize)
+		dst = slices.Grow(dst, commandSize)
 	}
 	start := len(dst)
 	dst, err = replication.AppendCommand(dst, command)
+	if cap(controlBytes) <= replicatedTransactionRetainedControlBytes {
+		encoder.controlScratch = controlBytes[:0]
+	} else {
+		encoder.controlScratch = nil
+	}
 	if err != nil || len(dst)-start != commandSize {
 		return dst[:start], errors.Join(err, ErrReplicatedTransaction)
 	}
