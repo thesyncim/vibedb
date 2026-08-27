@@ -50,6 +50,10 @@ type commandIdentity struct {
 	ledgerRequestDigest  requestledger.Digest
 	ledgerPlanRoot       requestledger.Digest
 	ledgerRangeIdentity  requestledger.Digest
+	// Borrowed only while opening/validating a command. Registry records retain
+	// the existing position/digests, never this nested payload or this struct.
+	executionPin          []byte
+	executionPinAuthority replication.Digest
 }
 
 func openCommandIdentity(
@@ -86,6 +90,14 @@ func openCommandIdentity(
 		ledgerRangeIdentity = ledger.ExpectedRangeIdentity
 	}
 	logical := replicatedstate.LogicalCommandDigest(command)
+	var pinAuthority replication.Digest
+	if command.Kind() == replication.CommandExecutionPin {
+		var valid bool
+		pinAuthority, valid = replication.ExecutionPinAuthorityDigest(command)
+		if !valid {
+			return commandIdentity{}, ErrCommandGroupMismatch
+		}
+	}
 	return commandIdentity{
 		position: requestPosition{
 			group:         group,
@@ -95,19 +107,21 @@ func openCommandIdentity(
 			sequence:      command.ClientSequence,
 			namespace:     namespaceForCommand(command.Kind()),
 		},
-		completionKey:        completionKey,
-		fingerprint:          command.Fingerprint,
-		logical:              logical,
-		attempt:              attemptDigest(command, logical),
-		tenant:               command.Tenant,
-		kind:                 command.Kind(),
-		transactionRole:      transactionRole,
-		transactionOperation: transactionOperation,
-		ledgerOperation:      ledgerOperation,
-		ledgerKeyDigest:      ledgerKeyDigest,
-		ledgerRequestDigest:  ledgerRequestDigest,
-		ledgerPlanRoot:       ledgerPlanRoot,
-		ledgerRangeIdentity:  ledgerRangeIdentity,
+		completionKey:         completionKey,
+		fingerprint:           command.Fingerprint,
+		logical:               logical,
+		attempt:               attemptDigest(command, logical),
+		tenant:                command.Tenant,
+		kind:                  command.Kind(),
+		transactionRole:       transactionRole,
+		transactionOperation:  transactionOperation,
+		ledgerOperation:       ledgerOperation,
+		ledgerKeyDigest:       ledgerKeyDigest,
+		ledgerRequestDigest:   ledgerRequestDigest,
+		ledgerPlanRoot:        ledgerPlanRoot,
+		ledgerRangeIdentity:   ledgerRangeIdentity,
+		executionPin:          command.ExecutionPinBytes(),
+		executionPinAuthority: pinAuthority,
 	}, nil
 }
 

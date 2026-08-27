@@ -784,6 +784,10 @@ func validateCompletionLookup(
 			result.RangeIdentity != identity.ledgerRangeIdentity {
 			return ErrSettlementResult
 		}
+	} else if identity.kind == replication.CommandExecutionPin {
+		if err := validateExecutionPinSettlement(identity, completion); err != nil {
+			return err
+		}
 	} else if identity.transactionRole != 0 {
 		result, resultErr := replicatedstate.OpenTransactionCompletionResult(
 			completion.ResultCode, completion.InlineResult,
