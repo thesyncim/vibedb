@@ -228,15 +228,14 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 			if witnessErr != nil {
 				return replicatedCatalogCut{}, witnessErr
 			}
-			if witness.Found {
-				return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
+			if !witness.Found {
+				return replicatedCatalogCut{}, ErrReplicatedCatalogMissing
 			}
-			return replicatedCatalogCut{}, ErrReplicatedCatalogMissing
 		}
 		// A concurrent atomic genesis publication can linearize between the
-		// first head read and the genesis read. Re-read the head once; a still
-		// missing head beside an immutable genesis proof is durable corruption,
-		// never authorization to recreate generation one.
+		// first head read and either following proof read. Re-read the head once;
+		// a still missing head beside an immutable genesis proof or witness is
+		// durable corruption, never authorization to recreate generation one.
 		result, err = authority.readRaw(
 			ctx, replicatedCatalogHeadKey, uint32(maxReplicatedCatalogBytes),
 		)
