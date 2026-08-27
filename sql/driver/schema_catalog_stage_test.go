@@ -213,4 +213,16 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err = activated.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if drained, err := ObserveDrainedReplicatedSchemaSource(path, command); err != nil || drained {
+		t.Fatalf("source drain before authority=%t err=%v", drained, err)
+	}
+	if drained, err := DrainPublishedReplicatedSchemaSource(path, command); err != nil || !drained {
+		t.Fatalf("source drain=%t err=%v", drained, err)
+	}
+	if _, err = os.Stat(path + ".tables/" + identity.Relations[0].Storage + ".vjc"); !os.IsNotExist(err) {
+		t.Fatalf("source relation survived drain: %v", err)
+	}
+	if _, err = os.Stat(path + ".tables/" + storage + ".vjc"); err != nil {
+		t.Fatalf("target relation removed by source drain: %v", err)
+	}
 }

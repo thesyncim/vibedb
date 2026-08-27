@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -274,6 +275,79 @@ func ObservePublishedReplicatedSchemaTransition(
 			errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
 	return transition, true, nil
+}
+
+// ObserveDrainedReplicatedSchemaSource reports whether every source relation
+// protected by the exact activation certificate has been reclaimed. Hidden
+// apply sidecars are intentionally outside this relation-generation drain.
+func ObserveDrainedReplicatedSchemaSource(path string, command []byte) (bool, error) {
+	return drainPublishedReplicatedSchemaSource(path, command, false)
+}
+
+// DrainPublishedReplicatedSchemaSource reclaims only old relation files after
+// the caller has validated the catalog DrainProof and quiesced every old
+// execution pin. The activation and current target catalog are reauthenticated
+// locally before any removal; target storage identities can never be removed.
+func DrainPublishedReplicatedSchemaSource(path string, command []byte) (bool, error) {
+	return drainPublishedReplicatedSchemaSource(path, command, true)
+}
+
+func drainPublishedReplicatedSchemaSource(
+	path string, command []byte, remove bool,
+) (bool, error) {
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil || len(command) == 0 || len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !found || !bytes.Equal(record.command, command) {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if _, active, observeErr := ObservePublishedReplicatedSchemaTransition(path); observeErr != nil || !active {
+		return false, errors.Join(observeErr, ErrReplicatedSchemaCatalogImage)
+	}
+	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
+	if err != nil || !found || len(marker.sourceStorages) == 0 {
+		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	targets := make(map[[32]byte]struct{}, len(marker.storages))
+	for _, storage := range marker.storages {
+		targets[storage] = struct{}{}
+	}
+	root, err := os.OpenRoot(absolute + ".tables")
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	removed := false
+	for _, storage := range marker.sourceStorages {
+		if _, target := targets[storage]; target {
+			return false, ErrReplicatedSchemaCatalogImage
+		}
+		base := hex.EncodeToString(storage[:]) + ".vjc"
+		for _, name := range [...]string{base, base + ".rjournal"} {
+			_, statErr := root.Stat(name)
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			if statErr != nil {
+				return false, statErr
+			}
+			if !remove {
+				return false, nil
+			}
+			if err = root.Remove(name); err != nil && !os.IsNotExist(err) {
+				return false, err
+			}
+			removed = removed || err == nil
+		}
+	}
+	if removed {
+		if err = syncDirectory(absolute + ".tables"); err != nil {
+			return false, errors.Join(durable.ErrCommitOutcomeUnknown, err)
+		}
+	}
+	return true, nil
 }
 
 // PublishReplicatedSchemaCatalog performs the exact old->new catalog CAS only
