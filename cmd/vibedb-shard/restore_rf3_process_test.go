@@ -459,7 +459,7 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
 			Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "id",
 				TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
-				Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}, SeedDocuments: [][]byte{[]byte(`{"id":"source-catalog-sentinel"}`)}})
+				Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,10 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 	// The source configuration entry at index two advances its membership
 	// version even though its voter set is unchanged.
 	fence := raftservice.CommandFence{ReplicaSetVersion: 2, ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13, RelationManifestDigest: profile.RelationManifestDigest, RoutingVersion: 17, RouteGeneration: 19}
-	if ordinal == 1 {
+	// Bind the empty SQL schema first, then populate both source groups through
+	// committed apply. Pre-binding SQL inserts materialize the user table and
+	// violate the replicated-store profile.
+	{
 		group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
 		helper := rf3FaultFixture{group: group}
 		state := shardservice.ReplicatedMemberState{Fence: shardservice.ReplicatedFence{AllocationGeneration: 23, Command: fence}}
@@ -499,11 +502,17 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 		if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened {
 			t.Fatalf("source session: %+v %v", completion, err)
 		}
-		cmd = helper.command(state, completion.ClientEpoch, 2, sha256.Sum256([]byte("restore-source-bundle")), nil)
+		cmd = helper.command(state, completion.ClientEpoch, 2, sha256.Sum256([]byte("restore-source-image")), nil)
 		cmd.Distribution, cmd.Shard = schema.Distribution, schema.Shard
-		cmd.Batches = []replication.RelationMutationBatch{
-			{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: rf3FaultKey(t, "restored-row"), Value: []byte("{\"id\":\"restored-row\"}")}}},
-			{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{0x91, 0x01, 'r'}, Value: []byte("[\"restored-row\"]")}}}}
+		if ordinal == 0 {
+			cmd.Batches = []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: rf3FaultKey(t, "source-catalog-sentinel"), Value: []byte(`{"id":"source-catalog-sentinel"}`),
+			}}}}
+		} else {
+			cmd.Batches = []replication.RelationMutationBatch{
+				{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: rf3FaultKey(t, "restored-row"), Value: []byte("{\"id\":\"restored-row\"}")}}},
+				{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{0x91, 0x01, 'r'}, Value: []byte("[\"restored-row\"]")}}}}
+		}
 		encoded, err = replication.AppendCommand(nil, cmd)
 		if err != nil {
 			t.Fatal(err)
@@ -517,7 +526,7 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 		}
 		completion, err = replication.OpenCompletion(lookup.Bytes)
 		if err != nil || completion.ResultCode != replicatedstate.ResultApplied {
-			t.Fatalf("source bundle: %+v %v", completion, err)
+			t.Fatalf("source group %d image: %+v %v", ordinal, completion, err)
 		}
 	}
 	fence.ProtectionEpoch, fence.OwnershipEpoch, fence.RoutingVersion, fence.RouteGeneration = 1, 1, 1, 1
