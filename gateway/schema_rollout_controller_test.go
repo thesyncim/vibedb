@@ -18,6 +18,7 @@ type schemaControllerClient struct {
 	authorized   atomic.Uint64
 	activated    atomic.Uint64
 	failActivate atomic.Bool
+	activateErr  error
 }
 
 func (client *schemaControllerClient) Prepare(
@@ -55,6 +56,9 @@ func (client *schemaControllerClient) Activate(
 	}
 	client.activated.Add(1)
 	if client.failActivate.CompareAndSwap(true, false) {
+		if client.activateErr != nil {
+			return schemainstall.Record{}, client.activateErr
+		}
 		return schemainstall.Record{}, errors.New("injected shard activation failure")
 	}
 	return schemainstall.Record{State: schemainstall.StateActive}, nil
