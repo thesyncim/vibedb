@@ -164,6 +164,17 @@ func (service *BootstrapControlService) Serve(
 	if err != nil {
 		return err
 	}
+	return service.serveRequest(ctx, connection, request)
+}
+
+func (service *BootstrapControlService) serveRequest(
+	ctx context.Context, connection rafttransport.PeerConnection, request BootstrapRequest,
+) error {
+	if service == nil || ctx == nil || connection == nil ||
+		connection.TrafficClass() != rafttransport.TrafficShardControl ||
+		!validBootstrapRequest(request) {
+		return ErrBootstrapUnauthorized
+	}
 	identity := connection.PeerIdentity()
 	if !service.authorize(identity, request) {
 		return ErrBootstrapUnauthorized
