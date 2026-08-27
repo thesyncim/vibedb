@@ -95,6 +95,10 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	states[leader] = data.probe(t, leader)
 	command = data.command(states[leader], completion.ClientEpoch, 2, sha256.Sum256([]byte("acknowledged-after-restore")), []replication.Mutation{{Kind: replication.MutationPut, Key: rf3FaultKey(t, "acknowledged-after-restore"), Value: []byte("{\"id\":\"acknowledged-after-restore\"}")}})
 	command.Distribution, command.Shard = "items", "items-0"
+	newIndexKey, newLocator := []byte{0x91, 0x01, 'a'}, []byte(`["acknowledged-after-restore"]`)
+	command.Batches = append(command.Batches, replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
+		Kind: replication.MutationPutAbsentOrEqual, Key: newIndexKey, Value: newLocator,
+	}}})
 	writeStarted := time.Now()
 	settled := restoreRF3ProposeCommand(t, data, leader, states[leader], command)
 	writeLatency := time.Since(writeStarted)
@@ -103,6 +107,8 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 		t.Fatalf("restored write: %+v %v", completion, err)
 	}
 	data.waitAllApplied(t, settled.Outcome.AppliedIndex, 10*time.Second)
+	data.waitDocument(t, leader, states[leader], "acknowledged-after-restore", 5*time.Second)
+	restoreRF3ReadRelation(t, data, leader, states[leader], 2, newIndexKey, newLocator, true)
 	rssBaseline, walBaseline := restoreRF3Resources(t, fixtures)
 	storageBaseline := restoreRF3AllocatedBytes(t, options.Installer.(*restoreRF3Installer).root)
 	failoverStarted := time.Now()
@@ -110,6 +116,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	newLeader, liveStates := data.waitLeader(t, rf3FaultOtherMembers(leader), 15*time.Second)
 	data.waitDocument(t, newLeader, liveStates[newLeader], "restored-row", 5*time.Second)
 	data.waitDocument(t, newLeader, liveStates[newLeader], "acknowledged-after-restore", 5*time.Second)
+	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, newIndexKey, newLocator, true)
 	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, []byte{0x91, 0x01, 'r'}, []byte("[\"restored-row\"]"), true)
 	failoverLatency := time.Since(failoverStarted)
 	data.restart(t, leader)
@@ -122,6 +129,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	data.waitCaughtUp(t, leader, settled.Outcome.AppliedIndex, 10*time.Second)
 	newLeader, liveStates = data.waitLeader(t, []int{0, 1, 2}, 15*time.Second)
 	data.waitDocument(t, newLeader, liveStates[newLeader], "acknowledged-after-restore", 5*time.Second)
+	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, newIndexKey, newLocator, true)
 	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, []byte{0x91, 0x01, 'r'}, []byte("[\"restored-row\"]"), true)
 	rssFinal, walFinal := restoreRF3Resources(t, fixtures)
 	storageFinal := restoreRF3AllocatedBytes(t, options.Installer.(*restoreRF3Installer).root)
