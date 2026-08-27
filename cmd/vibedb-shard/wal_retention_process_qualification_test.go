@@ -20,7 +20,6 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replication"
-	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -229,12 +228,9 @@ func walRetentionWaitValue(t testing.TB, fixture *rf3FaultFixture, member int,
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		response, err := fixture.roundTrip(t, member, &shardservice.ReplicatedRequest{
-			Operation:  shardservice.ReplicatedReadLeader,
-			Authority:  serviceauthz.Authority{Node: fixture.nodes[(member+1)%rf3CommandMembers], Generation: fixture.authority.ActivePolicyGeneration},
-			Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
-			Relation: 1, Key: rf3FaultKey(t, id), MaxValueBytes: walRetentionDocumentBytes + 4096,
-		})
+		request := fixture.readRequest(member, state, rf3FaultKey(t, id))
+		request.MaxValueBytes = walRetentionDocumentBytes + 4096
+		response, err := fixture.roundTrip(t, member, request)
 		if err == nil && response.Kind == shardservice.ReplicatedReadFound && bytes.Equal(response.Value, want) {
 			return
 		}

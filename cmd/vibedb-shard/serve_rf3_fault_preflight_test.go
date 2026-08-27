@@ -22,14 +22,22 @@ func TestRF3FaultReadRequestCanonicalPreflight(t *testing.T) {
 	state := shardservice.ReplicatedMemberState{Fence: shardservice.ReplicatedFence{Group: identity.Group,
 		AllocationGeneration: identity.AllocationGeneration, MemberID: identity.MemberID, StoreID: identity.StoreID,
 		NodeIncarnation: identity.NodeIncarnation, Term: 2, Command: commandFenceFromPublication(fixture.authority, identity, 1)}, Applied: 9}
-	for _, name := range []string{"isolated-former-leader", "response-lost"} {
-		request := fixture.readRequest(0, state, rf3FaultKey(t, name))
+	for _, test := range []struct {
+		name    string
+		maximum uint32
+	}{
+		{"isolated-former-leader", 1 << 20},
+		{"response-lost", 1 << 20},
+		{"retained-23", walRetentionDocumentBytes + 4096},
+	} {
+		request := fixture.readRequest(0, state, rf3FaultKey(t, test.name))
+		request.MaxValueBytes = test.maximum
 		var frame bytes.Buffer
 		if err := shardservice.EncodeReplicatedRequestBorrowed(&frame, request); err != nil {
 			t.Fatal("harness read rejected before server", err)
 		}
 		decoded, err := shardservice.DecodeReplicatedRequest(&frame)
-		if err != nil || decoded.Fence != state.Fence || decoded.MinimumApplied != state.Applied || !bytes.Equal(decoded.Key, request.Key) {
+		if err != nil || decoded.Fence != state.Fence || decoded.MinimumApplied != state.Applied || decoded.MaxValueBytes != test.maximum || !bytes.Equal(decoded.Key, request.Key) {
 			t.Fatalf("decoded=%+v err=%v", decoded, err)
 		}
 	}
