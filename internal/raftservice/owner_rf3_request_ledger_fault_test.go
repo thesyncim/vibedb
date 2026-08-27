@@ -2,14 +2,98 @@ package raftservice_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+func TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan(t *testing.T) {
+	cluster := newMultiGroupRF3Cluster(t, multiGroupRF3MaxGroups)
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	for group := range cluster.groupCount {
+		if err := cluster.owners[0].Campaign(ctx, cluster.groups[group].key); err != nil {
+			t.Fatal(err)
+		}
+		waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[group].key)
+	}
+	fixture := multiGroupRF3DurableCatalog(t, cluster)
+	gatewayA := newMultiGroupRF3DurableGateway(t, cluster, fixture.Snapshot, fixture.AckKey,
+		serviceauthz.Authority{Node: [16]byte{0xa2}, Generation: 1})
+	gatewayB := newMultiGroupRF3DurableGateway(t, cluster, fixture.Snapshot, fixture.AckKey,
+		serviceauthz.Authority{Node: [16]byte{0xb2}, Generation: 1})
+	tenant := []byte("tenant")
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		Principal: requestledger.PrincipalID{0xc1}, Request: requestledger.RequestID{0xd2},
+		IssuerEpoch: 11, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0xe1},
+	}
+	ctx = multiGroupRF3DurableCallerContext(t, ctx, key, cluster.route(0).Command.ActivePolicyGeneration)
+	point, err := requestledger.Home(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, _, ok := gatewayA.topology.Lookup(point)
+	if !ok {
+		t.Fatal("missing ledger home")
+	}
+	highwater, err := requestledger.NewIssuerHighwater(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = gatewayA.ledger.ApplyCAS(ctx, home, key, gateway.DurableRequestLifecycleCAS{
+		Operation: requestledger.OperationOpenIssuerLane, Revision: 1, IssuerOpen: highwater,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	queries := []gateway.Query{
+		{SQL: `INSERT INTO orders_a VALUES (?)`, Class: gateway.ClassInteractive,
+			Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"unfinished-a","group":0}`)}},
+		{SQL: `INSERT INTO orders_b VALUES (?)`, Class: gateway.ClassInteractive,
+			Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"unfinished-b","group":1}`)}},
+	}
+	// Lose the caller after pin acquisition and durable route intent, before a
+	// terminal result exists. The replacement has a distinct controller and no
+	// copy of the old gateway's journals. No unrelated workload advances leases.
+	gatewayA.client.armLostResponse(requestledger.OperationPutPending)
+	_, err = gatewayA.sql.Execute(ctx, key, tenant, queries)
+	if err == nil || !gatewayA.client.callerDisconnected() {
+		gatewayA.client.logRecentSettlements(t)
+		t.Fatalf("did not lose unfinished caller: %v", err)
+	}
+	isolated := gatewayA.client.hiddenMember
+	removed := map[int]bool{isolated: true}
+	for group := range cluster.groupCount {
+		if err := cluster.owners[(isolated+1)%multiGroupRF3Voters].Campaign(ctx, cluster.groups[group].key); err != nil {
+			t.Fatal(err)
+		}
+		waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[group].key)
+	}
+	head, err := gatewayB.ledger.ReadRow(ctx, home, gateway.DurableRequestLifecycleRead{
+		Key: key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
+	})
+	if err != nil || !head.Found || head.Head.Phase != requestledger.PhaseSealed {
+		t.Fatalf("fault must leave a sealed unfinished request: %+v err=%v", head, err)
+	}
+	recovered, err := gatewayB.sql.Execute(ctx, key, tenant, queries)
+	if err != nil || recovered.Result == nil || recovered.TerminalRevision == 0 ||
+		recovered.Result.RowsAffected != 2 || recovered.Result.ShardsFanned != 2 {
+		gatewayB.client.logRecentSettlements(t)
+		t.Fatalf("replacement unfinished recovery=%+v err=%v", recovered, err)
+	}
+	replayed, found, err := gatewayB.sql.Replay(ctx, recovered.Key)
+	if err != nil || !found || replayed.ResultDigest != recovered.ResultDigest || replayed.AckToken != recovered.AckToken {
+		t.Fatalf("replacement exact terminal replay=%+v found=%t err=%v", replayed, found, err)
+	}
+}
 
 func TestRequestLedgerRF3LostCallerStaysDisconnectedAcrossRetries(t *testing.T) {
 	client := &multiGroupRequestLedgerRF3RoundTripper{hiddenMember: -1}

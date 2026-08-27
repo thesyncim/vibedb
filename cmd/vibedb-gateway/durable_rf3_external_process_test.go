@@ -824,6 +824,9 @@ func (fixture *durableRF3ExternalFixture) startGateway(
 		t.Fatalf("gateway readiness: %v\n%s", err, process.Diagnostics())
 	}
 	if !fixture.seeded {
+		// Listener readiness is not RF3 leader readiness. Establish all four
+		// independent groups before sending the fixture's first mutation.
+		fixture.waitAllRoleLeaders(t, -1, 30*time.Second)
 		// Bundle activation requires unmaterialized base/index tables. Seeding
 		// through the shipped transaction path also initializes both remote
 		// global indexes instead of leaving the initial rows unindexed.

@@ -101,6 +101,13 @@ trusted elapsed time from the authority decision, but it still needs operational
 qualification for write amplification, stalled progress, controller churn, and
 index exhaustion boundaries.
 
+The shipped durable-request default reserves one successor log position and
+refreshes the certificate at each unfinished wave. Opening a replacement's
+session and applying an exact lease-recovery CAS therefore advances past an
+abandoned lease without unrelated traffic. At an observation equal to the old
+fence, recovery may be proposed, but only a strictly later replicated apply can
+grant the new controller authority; the old certificate is never borrowed.
+
 ## Comparison contract
 
 This comparison defines semantics only. It is not a performance or superiority

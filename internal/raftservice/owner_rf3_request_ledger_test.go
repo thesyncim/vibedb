@@ -494,7 +494,7 @@ func newMultiGroupRF3DurableGateway(
 	if err != nil {
 		t.Fatal(err)
 	}
-	pins, err := gateway.NewNativeDurableRequestExecutionPinAuthority(native, sessions, 1)
+	pins, err := gateway.NewNativeDurableRequestExecutionPinAuthority(native, sessions, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

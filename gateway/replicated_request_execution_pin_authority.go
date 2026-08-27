@@ -12,7 +12,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
-const DefaultDurableRequestExecutionPinSpan = uint64(1 << 20)
+// One successor position is a progress lease, not a duration. Each unfinished
+// wave refreshes its exact certificate. A replacement's session Open and
+// compare-exact Recover can therefore advance past an abandoned pin without
+// unrelated traffic or a million synthetic log entries. The replicated kernel
+// still requires Recover to apply strictly beyond the previous lease fence.
+const DefaultDurableRequestExecutionPinSpan = uint64(1)
 
 // DurableRequestExecutionPinSessionFactory opens the journal-backed,
 // serialized session for one ledger-home group. Reopening after an
@@ -180,15 +185,16 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 				return route, acquire, lease, nil
 			}
 			if executionpin.ValidateSideEffectFence(lease, read.Record, read.Applied) == nil {
-				if !durableRequestPinControllerMatches(lease, principal) {
+				if durableRequestPinControllerMatches(lease, principal) {
+					return route, acquire, lease, nil
+				}
+				if !durableRequestPinRecoverableAtNextApply(read.Record, read.Applied) {
 					return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
 						fmt.Errorf("%w: live execution pin belongs to another controller (applied=%d through=%d epoch=%d)",
 							ErrDurableRequestConflict, read.Applied, lease.LeaseAppliedThrough, lease.ControllerEpoch)
 				}
-				return route, acquire, lease, nil
 			}
-			if read.Record.Status != executionpin.StatusActive || read.Record.PrepareTerminalDigest != (executionpin.Digest{}) ||
-				read.Applied <= read.Record.LeaseAppliedThrough {
+			if !durableRequestPinRecoverableAtNextApply(read.Record, read.Applied) {
 				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 			}
 		}
@@ -245,6 +251,15 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 
 func durableRequestPinControllerMatches(lease executionpin.LeaseCertificate, principal serviceauthz.Authority) bool {
 	return lease.Valid() && principal.Valid() && lease.Controller == executionpin.ID(principal.Node)
+}
+
+func durableRequestPinRecoverableAtNextApply(record executionpin.Record, applied uint64) bool {
+	// At equality the old certificate remains valid for its owner; it is never
+	// returned to a different controller. The subsequent Recover must win the
+	// exact lease CAS at a strictly later index before any new authority exists.
+	return record.Valid() && record.Status == executionpin.StatusActive &&
+		record.PrepareTerminalDigest == (executionpin.Digest{}) &&
+		applied >= record.LeaseAppliedThrough && applied < math.MaxUint64
 }
 
 var _ DurableRequestExecutionPinAuthority = (*NativeDurableRequestExecutionPinAuthority)(nil)
