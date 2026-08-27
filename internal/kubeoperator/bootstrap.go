@@ -247,6 +247,7 @@ type bootstrapRole struct {
 	stores                 [3][16]byte
 	candidateStores        [3][16]byte
 	digest                 replication.Digest
+	logicalSchema          replication.Digest
 	limits                 sqldriver.ReplicatedShardStoreLimits
 }
 
@@ -503,11 +504,11 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 	}
 	ledgerIdentity := bootstrapLedgerIdentity(roles[1].group)
 	for i := range roles {
-		digest, limits, e := probeBootstrapRole(roles[i])
+		digest, logical, limits, e := probeBootstrapRole(roles[i])
 		if e != nil {
 			return nil, state, e
 		}
-		roles[i].digest, roles[i].limits = digest, limits
+		roles[i].digest, roles[i].logicalSchema, roles[i].limits = digest, logical, limits
 	}
 	catalogRaw, err := bootstrapCatalog(c.StateDirectory, roles)
 	if err != nil {
@@ -654,7 +655,7 @@ func syncDirectory(path string) error {
 	return errors.Join(d.Sync(), d.Close())
 }
 
-func probeBootstrapRole(role bootstrapRole) (replication.Digest, sqldriver.ReplicatedShardStoreLimits, error) {
+func probeBootstrapRole(role bootstrapRole) (replication.Digest, replication.Digest, sqldriver.ReplicatedShardStoreLimits, error) {
 	binding := sqldriver.ReplicatedShardStoreBinding{
 		ClusterID: role.group.ClusterID, ClusterIncarnation: role.group.ClusterIncarnation,
 		TopologyRecoveryEpoch: role.group.TopologyRecoveryEpoch,
@@ -671,9 +672,13 @@ func probeBootstrapRole(role bootstrapRole) (replication.Digest, sqldriver.Repli
 		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
 		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 	}
-	digest, limits, err := sqldriver.InitialReplicatedRelationManifest(binding, placement,
-		sqldriver.InitialReplicatedRelationSchema{Table: role.table, PrimaryKey: role.primary})
-	return replication.Digest(digest), limits, err
+	schema := sqldriver.InitialReplicatedRelationSchema{Table: role.table, PrimaryKey: role.primary}
+	digest, limits, err := sqldriver.InitialReplicatedRelationManifest(binding, placement, schema)
+	if err != nil {
+		return replication.Digest{}, replication.Digest{}, limits, err
+	}
+	logical, err := sqldriver.InitialReplicatedLogicalSchemaDigest(binding, placement, schema)
+	return replication.Digest(digest), replication.Digest(logical), limits, err
 }
 
 func bootstrapLedgerIdentity(group raftmember.GroupKey) (result replication.Digest) {
@@ -745,14 +750,14 @@ func bootstrapCatalog(root string, roles [3]bootstrapRole) ([]byte, error) {
 		rangeID := authorityDigest("vibedb/dev/range-identity/format-0\x00", r.group, r.distribution, r.shard, r.digest)
 		lineage := authorityDigest("vibedb/dev/range-lineage/format-0\x00", r.group, r.distribution, r.shard, r.digest)
 		forward := authorityDigest("vibedb/dev/forwarding-rule/format-0\x00", r.group, r.distribution, r.shard, r.digest)
-		desc := gateway.ReplicatedShardDescriptor{Distribution: r.distribution, Shard: r.shard, Group: r.group, AllocationGeneration: 1, Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: r.digest, RoutingVersion: 1, RouteGeneration: 1}, RangeIdentity: rangeID, LineageDigest: lineage, ForwardingRuleDigest: forward, Replicas: replicas}
+		desc := gateway.ReplicatedShardDescriptor{Distribution: r.distribution, Shard: r.shard, Group: r.group, AllocationGeneration: 1, Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: r.digest, RoutingVersion: 1, RouteGeneration: 1}, LogicalSchemaDigest: r.logicalSchema, RangeIdentity: rangeID, LineageDigest: lineage, ForwardingRuleDigest: forward, Replicas: replicas}
 		if ri == 1 {
 			desc.RequestLedgerRanges = []gateway.DurableRequestLedgerRangeDescriptor{{Identity: bootstrapLedgerIdentity(r.group)}}
 		}
 		descriptors[ri] = desc
 	}
 	config := distribution.ClusterConfig{Distributions: []distribution.DistributionSpec{{Name: roles[0].distribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion}, {Name: roles[1].distribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion}, {Name: roles[2].distribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion}}, Placements: []distribution.TablePlacement{{Table: roles[0].table, Distribution: roles[0].distribution, Columns: []string{roles[0].primary}}, {Table: roles[1].table, Distribution: roles[1].distribution, Columns: []string{roles[1].primary}}, {Table: roles[2].table, Distribution: roles[2].distribution, Columns: []string{roles[2].primary}}}, Manifests: manifests}
-	profile := gateway.ReplicatedTableProfile{Table: roles[2].table, Relation: 1, PrimaryKey: roles[2].primary, SchemaGeneration: 1, RelationManifestDigest: roles[2].digest, MaxKeyBytes: uint16(roles[2].limits.MaxKeyBytes), MaxDocumentBytes: uint32(roles[2].limits.MaxDocumentBytes)}
+	profile := gateway.ReplicatedTableProfile{Table: roles[2].table, Relation: 1, PrimaryKey: roles[2].primary, SchemaGeneration: 1, LogicalSchemaDigest: roles[2].logicalSchema, MaxKeyBytes: uint16(roles[2].limits.MaxKeyBytes), MaxDocumentBytes: uint32(roles[2].limits.MaxDocumentBytes)}
 	snapshot, e := gateway.NewSnapshotWithReplicatedTableMetadata(config, endpoints, 1, nil, nil, descriptors, []gateway.ReplicatedTableProfile{profile})
 	if e != nil {
 		return nil, e

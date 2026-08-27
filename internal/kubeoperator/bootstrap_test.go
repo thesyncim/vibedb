@@ -53,20 +53,20 @@ func TestBootstrapRoleManifestBindsServingProfile(t *testing.T) {
 		group: raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
 			TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}}}
 	role.stores[0] = [16]byte{5}
-	digest, limits, err := probeBootstrapRole(role)
-	if err != nil || digest == ([32]byte{}) || limits.MaxKeyBytes == 0 {
+	digest, logical, limits, err := probeBootstrapRole(role)
+	if err != nil || digest == ([32]byte{}) || logical == ([32]byte{}) || logical == digest || limits.MaxKeyBytes == 0 {
 		t.Fatalf("initial serving profile: %x %+v %v", digest, limits, err)
 	}
 	for i := byte(6); i < 9; i++ {
 		role.stores[0] = [16]byte{i}
-		got, gotLimits, err := probeBootstrapRole(role)
-		if err != nil || got != digest || gotLimits != limits {
+		got, gotLogical, gotLimits, err := probeBootstrapRole(role)
+		if err != nil || got != digest || gotLogical != logical || gotLimits != limits {
 			t.Fatal("replica-local store identity changed the serving schema digest")
 		}
 	}
 	role.shard = "other"
-	changed, _, err := probeBootstrapRole(role)
-	if err != nil || changed == digest {
+	changed, unchangedLogical, _, err := probeBootstrapRole(role)
+	if err != nil || changed == digest || unchangedLogical != logical {
 		t.Fatal("catalog routing profile was omitted from the serving schema digest")
 	}
 }

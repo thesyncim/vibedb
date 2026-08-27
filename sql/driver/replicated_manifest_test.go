@@ -38,6 +38,11 @@ func TestInitialReplicatedRelationManifestMatchesServingIdentity(t *testing.T) {
 					t.Fatal(err)
 				}
 				identity := requireReplicatedShardStoreBind(t, database, binding, "docs")
+				logical, err := InitialReplicatedLogicalSchemaDigest(binding, options.Placement, schema)
+				boundLogical, boundErr := ReplicatedRelationManifestDigest(identity)
+				if err != nil || boundErr != nil || logical != boundLogical || logical == digest {
+					t.Fatalf("member %d initial logical=%x bound=%x machine=%x err=%v boundErr=%v", member, logical, boundLogical, digest, err, boundErr)
+				}
 				claim, _, err := database.OpenReplicatedApply(identity, testReplicatedApplyBootstrap(), options)
 				if err != nil {
 					t.Fatal(err)
@@ -76,6 +81,27 @@ func TestInitialReplicatedRelationManifestPureContract(t *testing.T) {
 		if err != nil || got != digest || gotLimits != limits {
 			t.Fatalf("replica %d: %x %v", member, got, err)
 		}
+	}
+	logical, err := InitialReplicatedLogicalSchemaDigest(binding, placement, schema)
+	if err != nil || logical == ([sha256.Size]byte{}) || logical == digest {
+		t.Fatalf("initial logical=%x machine=%x err=%v", logical, digest, err)
+	}
+	otherPlacement := placement
+	otherPlacement.Range.Start[0] = 1
+	unchanged, err := InitialReplicatedLogicalSchemaDigest(binding, otherPlacement, schema)
+	if err != nil || unchanged != logical {
+		t.Fatal("physical range entered portable logical schema")
+	}
+	indexed := schema
+	indexed.LocalIndexes = []store.IndexDefinition{{Name: "by_email", Paths: []string{"/email"}}}
+	changed, err := InitialReplicatedLogicalSchemaDigest(binding, placement, indexed)
+	if err != nil || changed == logical {
+		t.Fatal("local index schema omitted from logical commitment")
+	}
+	invalid := binding
+	invalid.Authority.SchemaGeneration = 0
+	if _, err := InitialReplicatedLogicalSchemaDigest(invalid, placement, schema); err == nil {
+		t.Fatal("invalid initial logical schema accepted")
 	}
 	tests := []struct {
 		name    string

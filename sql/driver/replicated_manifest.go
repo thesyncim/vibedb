@@ -39,11 +39,39 @@ func InitialReplicatedRelationManifest(
 	placement ReplicatedPlacementProfile,
 	schema InitialReplicatedRelationSchema,
 ) ([sha256.Size]byte, ReplicatedShardStoreLimits, error) {
-	if err := validateReplicatedShardStoreBinding(binding); err != nil {
+	identity, err := initialReplicatedSchemaIdentity(binding, placement, schema)
+	if err != nil {
 		return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, err
 	}
+	digest, err := replicatedstate.InitialJSONRelationManifest(binding.Authority.SchemaGeneration,
+		schema.Table, replicatedStateCollectionLimits(identity.UserLimits), replicatedApplyProfileDigest(identity, placement), schema.LocalIndexes)
+	if err != nil {
+		return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, fmt.Errorf("initial replicated schema: %w", err)
+	}
+	return digest, identity.UserLimits, nil
+}
+
+// InitialReplicatedLogicalSchemaDigest computes the portable SQL schema
+// commitment before storage exists. It shares the bound identity's exact hash
+// grammar, but never invents log IDs, storage names, or serving authority.
+func InitialReplicatedLogicalSchemaDigest(binding ReplicatedShardStoreBinding,
+	placement ReplicatedPlacementProfile, schema InitialReplicatedRelationSchema,
+) ([sha256.Size]byte, error) {
+	identity, err := initialReplicatedSchemaIdentity(binding, placement, schema)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return replicatedRelationApplyManifestDigest(identity), nil
+}
+
+func initialReplicatedSchemaIdentity(binding ReplicatedShardStoreBinding,
+	placement ReplicatedPlacementProfile, schema InitialReplicatedRelationSchema,
+) (ReplicatedShardStoreIdentity, error) {
+	if err := validateReplicatedShardStoreBinding(binding); err != nil {
+		return ReplicatedShardStoreIdentity{}, err
+	}
 	if err := validateReplicatedBundleRelationName(schema.Table); err != nil {
-		return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, err
+		return ReplicatedShardStoreIdentity{}, err
 	}
 	limits := schema.Limits
 	if limits == (ReplicatedShardStoreLimits{}) {
@@ -53,13 +81,13 @@ func InitialReplicatedRelationManifest(
 		}
 	}
 	if err := validateReplicatedShardStoreLimits(limits); err != nil {
-		return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, err
+		return ReplicatedShardStoreIdentity{}, err
 	}
 	indexes := make([]indexMeta, len(schema.LocalIndexes))
 	for i, index := range schema.LocalIndexes {
 		compiled, err := store.CompileExactIndex(index)
 		if err != nil {
-			return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, err
+			return ReplicatedShardStoreIdentity{}, err
 		}
 		indexes[i] = indexMeta{Name: index.Name, Paths: compiled.Specs[:compiled.N]}
 	}
@@ -74,12 +102,7 @@ func InitialReplicatedRelationManifest(
 		}},
 	}
 	if err := validateReplicatedPlacementProfile(placement, identity); err != nil {
-		return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, err
+		return ReplicatedShardStoreIdentity{}, err
 	}
-	digest, err := replicatedstate.InitialJSONRelationManifest(binding.Authority.SchemaGeneration,
-		schema.Table, replicatedStateCollectionLimits(limits), replicatedApplyProfileDigest(identity, placement), schema.LocalIndexes)
-	if err != nil {
-		return [sha256.Size]byte{}, ReplicatedShardStoreLimits{}, fmt.Errorf("initial replicated schema: %w", err)
-	}
-	return digest, limits, nil
+	return identity, nil
 }
