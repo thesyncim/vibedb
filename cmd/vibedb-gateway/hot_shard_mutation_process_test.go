@@ -301,7 +301,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	capacityPath := hotMutationCapacity(t, root)
 	controlPath := filepath.Join(root, "replica-control.vibejson")
 	if err = os.WriteFile(controlPath, hotMutationControlManifest(t, root, nodes, identities[0],
-		listeners[0], credentials[4], roots, policyPath, gatewayAddresses.Addresses[1]), 0o600); err != nil {
+		listeners[0], credentials[4], roots, policyPath, gatewayAddresses.Addresses[1], built.Snapshot, apply), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	ackPath := filepath.Join(root, "durable-ack-key")
@@ -722,7 +722,7 @@ func hotMutationAdmitExactSplit(
 	if err != nil {
 		t.Fatal(err)
 	}
-	factory, err := newGatewayHotSplitFactory(prepare, manifest)
+	factory, err := newGatewayHotSplitFactory(prepare, manifest, catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,6 +942,8 @@ func hotMutationCapacity(t *testing.T, root string) string {
 func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttransport.NodeID,
 	identities [4]raftstore.Identity, listeners [4]rf3testfixture.ProcessListeners,
 	credential rf3testfixture.Credential, roots, policy, gatewayControl string,
+	catalog *gateway.Snapshot,
+	apply sqldriver.ReplicatedApplyOptions,
 ) []byte {
 	t.Helper()
 	manifest := persistedGatewayReplicaControlManifest{Generation: 1,
@@ -955,12 +957,34 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 			Incarnation: 1, ControlAddress: gatewayControl}},
 		Candidates: []persistedGatewayReplacementCandidate{{Member: 4, Node: fmt.Sprintf("%x", nodes[3]),
 			Store: fmt.Sprintf("%x", identities[3].StoreID), NodeIncarnation: 44,
-			Endpoint: "fixture-g0-target-data"}}, SplitTemplate: gatewaySplitTemplateFixture()}
+			Endpoint: "fixture-g0-target-data"}}}
 	for member := 0; member < 4; member++ {
 		manifest.ShardEndpoints = append(manifest.ShardEndpoints, persistedGatewayShardControlEndpoint{
 			Node: fmt.Sprintf("%x", nodes[member]), ControlAddress: listeners[member].Control,
-			SplitSnapshotAddress: listeners[member].Snapshot,
-			SplitChildRoot:       filepath.Join(root, fmt.Sprintf("group-0-member-%d", member+1), "split-children")})
+			SplitSnapshotAddress: listeners[member].Snapshot})
+	}
+	for _, source := range catalog.ReplicatedShardDescriptors() {
+		if source.Group.GroupID != identities[0].GroupID {
+			continue
+		}
+		for _, profile := range catalog.ReplicatedTableProfiles() {
+			placement, ok := catalog.Placement(profile.Table)
+			if !ok || placement.Distribution != source.Distribution || profile.Relation != 1 {
+				continue
+			}
+			entry := persistedGatewaySplitSource{ClusterID: source.Group.ClusterID, ClusterIncarnation: source.Group.ClusterIncarnation,
+				TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
+				SchemaGeneration: profile.SchemaGeneration, RelationManifestDigest: source.Command.RelationManifestDigest,
+				Table: profile.Table, Template: gatewaySplitTemplateFixture()}
+			entry.Template.MaxSessions, entry.Template.RetryWindow, entry.Template.TxnLimits = apply.MaxSessions, apply.RetryWindow, apply.TxnLimits
+			entry.Template.Format, entry.Template.ShardKey = apply.Placement.Format, placement.Columns[0]
+			entry.Template.TupleVersion, entry.Template.MapperVersion = uint16(apply.Placement.TupleVersion), uint16(apply.Placement.MapperVersion)
+			for member := 0; member < 3; member++ {
+				entry.Replicas = append(entry.Replicas, persistedGatewaySplitReplica{
+					Node: fmt.Sprintf("%x", nodes[member]), ChildRoot: filepath.Join(root, fmt.Sprintf("group-0-member-%d", member+1), "split-children")})
+			}
+			manifest.SplitSources = append(manifest.SplitSources, entry)
+		}
 	}
 	raw, err := vibejson.Marshal(&manifest)
 	if err != nil {

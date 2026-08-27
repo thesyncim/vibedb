@@ -25,15 +25,14 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 			{Node: source.Replicas[1].Node},
 			{Node: source.Replicas[2].Node},
 		},
-		SplitChildRoots: []string{
-			filepath.Join(t.TempDir(), "one"),
-			filepath.Join(t.TempDir(), "two"),
-			filepath.Join(t.TempDir(), "three"),
-		},
 		SplitSnapshots: []string{"127.0.0.1:9301", "127.0.0.1:9302", "127.0.0.1:9303"},
-		SplitTemplate:  gatewaySplitTemplateFixture(),
+		SplitSources:   []gatewaySplitSource{gatewaySplitSourceFixture(t, source, profile)},
 	}
-	factory := &gatewayHotSplitFactory{manifest: manifest}
+	sources, err := gatewayHotSplitSources(manifest, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := &gatewayHotSplitFactory{sources: sources}
 	admission := [32]byte{0xa7, 0x42}
 	split, err := factory.allocateSplit(catalog, admission, work, source)
 	if err != nil {
@@ -57,7 +56,7 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 		if replica.Node != source.Replicas[index].Node ||
 			replica.Member != source.Replicas[index].Member ||
 			replica.SQL.RelationManifestDigest == ([32]byte{}) ||
-			replica.SQLPath != filepath.Join(manifest.SplitChildRoots[index], operationDirectory, "child-1", "stage.vdb") ||
+			replica.SQLPath != filepath.Join(manifest.SplitSources[0].Replicas[index].Root, operationDirectory, "child-1", "stage.vdb") ||
 			replica.SnapshotAddress != manifest.SplitSnapshots[index] {
 			t.Fatalf("replica[%d]=%+v", index, replica)
 		}
@@ -74,6 +73,16 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	if len(localDigests) != gateway.ServingReplicaCount {
 		t.Fatalf("replica-local relation identities collapsed: %x", localDigests)
 	}
+}
+
+func gatewaySplitSourceFixture(t testing.TB, source gateway.ReplicatedShardDescriptor, profile gateway.ReplicatedTableProfile) gatewaySplitSource {
+	t.Helper()
+	entry := gatewaySplitSource{Group: source.Group, SchemaGeneration: profile.SchemaGeneration,
+		RelationManifestDigest: source.Command.RelationManifestDigest, Table: profile.Table, Template: gatewaySplitTemplateFixture()}
+	for i, replica := range source.Replicas {
+		entry.Replicas[i] = gatewaySplitReplica{Node: replica.Node, Root: t.TempDir()}
+	}
+	return entry
 }
 
 func gatewayHotSplitFactoryFixture(

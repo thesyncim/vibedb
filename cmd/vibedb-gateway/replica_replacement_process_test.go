@@ -711,14 +711,12 @@ func replicaProcessControlManifest(t testing.TB, nodes [5]rafttransport.NodeID,
 		Candidates: []persistedGatewayReplacementCandidate{{Member: 4,
 			Node: fmt.Sprintf("%x", nodes[3]), Store: fmt.Sprintf("%x", identities[3].StoreID),
 			NodeIncarnation: 44, Endpoint: "member-4-peer", Load: 0}},
-		SplitTemplate: gatewaySplitTemplateFixture(),
 	}
 	for index := 0; index < 4; index++ {
 		manifest.ShardEndpoints = append(manifest.ShardEndpoints,
 			persistedGatewayShardControlEndpoint{Node: fmt.Sprintf("%x", nodes[index]),
 				ControlAddress:       listeners[index].Control,
-				SplitSnapshotAddress: listeners[index].Snapshot,
-				SplitChildRoot:       filepath.Join(os.TempDir(), fmt.Sprintf("vibedb-replacement-split-%x", nodes[index]))})
+				SplitSnapshotAddress: listeners[index].Snapshot})
 	}
 	slices.SortFunc(manifest.ShardEndpoints, func(left, right persistedGatewayShardControlEndpoint) int {
 		return strings.Compare(left.Node, right.Node)

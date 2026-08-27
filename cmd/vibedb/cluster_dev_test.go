@@ -285,10 +285,64 @@ func TestInitializeDevClusterEmitsThreeIndependentApplyRoles(t *testing.T) {
 	}
 	for index := range control.ShardEndpoints {
 		shard := control.ShardEndpoints[index]
-		if index != 0 && control.ShardEndpoints[index-1].Node >= shard.Node ||
-			!filepath.IsAbs(shard.SplitChildRoot) {
+		if index != 0 && control.ShardEndpoints[index-1].Node >= shard.Node {
 			t.Fatalf("replica control shard[%d]=%+v", index, shard)
 		}
+	}
+}
+
+func TestInitializeDevRF3BindsHotSplitSourceToDataGroup(t *testing.T) {
+	root := t.TempDir()
+	manifest, err := initializeDevCluster(devClusterOptions{root: root, replicas: devClusterRF3, shardBinary: "/usr/bin/true"}, filepath.Join(root, "cluster.vibejson"))
+	// The no-op child exercises generation only; completion must then fail
+	// because it did not materialize the RF3 stores.
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected unmaterialized-store refusal, got %v", err)
+	}
+	raw, err := os.ReadFile(manifest.ReplicaControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var control devReplicaControlManifest
+	if err = vibejson.Unmarshal(raw, &control); err != nil {
+		t.Fatal(err)
+	}
+	if len(control.SplitSources) != 1 || len(control.ShardEndpoints) != 9 {
+		t.Fatalf("control=%+v", control)
+	}
+	source := control.SplitSources[0]
+	if source.Table != devDataTable || source.SchemaGeneration != 1 || source.RelationManifestDigest == ([32]byte{}) || len(source.Replicas) != 3 {
+		t.Fatalf("source=%+v", source)
+	}
+	for i, replica := range source.Replicas {
+		if i > 0 && source.Replicas[i-1].Node >= replica.Node {
+			t.Fatal("noncanonical replica order")
+		}
+		found := false
+		for _, member := range manifest.DataMembers {
+			if member.Node == replica.Node {
+				found = true
+				if replica.ChildRoot != filepath.Join(filepath.Dir(member.ServeManifest), "split-children") {
+					t.Fatal("wrong per-role root")
+				}
+			}
+		}
+		if !found {
+			t.Fatal("catalog or ledger node acquired split authority")
+		}
+	}
+	// Re-reading immutable preparation authority, as on restart, is byte exact.
+	rebuilt, err := devReplicaSplitSourceForCluster(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := vibejson.Marshal(&source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := vibejson.Marshal(&rebuilt)
+	if err != nil || !bytes.Equal(first, second) {
+		t.Fatal("source authority changed on restart", err)
 	}
 }
 

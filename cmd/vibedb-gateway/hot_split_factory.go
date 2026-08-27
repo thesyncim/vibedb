@@ -24,21 +24,23 @@ import (
 const gatewayHotSplitPrepareAttempts = 3
 
 type gatewayHotSplitFactory struct {
-	client   *splitcontroller.ChildPrepareClient
-	manifest gatewayReplicaControlManifest
+	client  *splitcontroller.ChildPrepareClient
+	sources map[raftmember.GroupKey]gatewaySplitSource
 }
 
 func newGatewayHotSplitFactory(
 	client *splitcontroller.ChildPrepareClient,
 	manifest gatewayReplicaControlManifest,
+	catalog *gateway.Snapshot,
 ) (*gatewayHotSplitFactory, error) {
-	if client == nil || len(manifest.Shards) == 0 ||
-		len(manifest.Shards) != len(manifest.SplitChildRoots) ||
-		len(manifest.Shards) != len(manifest.SplitSnapshots) ||
-		!validGatewaySplitTemplate(manifest.SplitTemplate) {
+	if client == nil {
 		return nil, hotshard.ErrInvalidPressureCut
 	}
-	return &gatewayHotSplitFactory{client: client, manifest: manifest}, nil
+	sources, err := gatewayHotSplitSources(manifest, catalog)
+	if err != nil {
+		return nil, err
+	}
+	return &gatewayHotSplitFactory{client: client, sources: sources}, nil
 }
 
 func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
@@ -158,6 +160,11 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 	source gateway.ReplicatedShardDescriptor,
 	profile gateway.ReplicatedTableProfile,
 ) (splitcontroller.ChildTarget, error) {
+	configuration, found := factory.sources[source.Group]
+	if !found || !gatewaySplitSourceMatches(configuration, source, profile) {
+		return splitcontroller.ChildTarget{}, hotshard.ErrInvalidPressureCut
+	}
+	template := configuration.Template
 	groupID := gatewayHotSplitID("group", admission, child, 0)
 	shardIncarnation := gatewayHotSplitID("shard", admission, child, 0)
 	authority := sqldriver.ReplicatedAuthorityProfile{
@@ -170,13 +177,18 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 	}
 	replicas := make([]splitcontroller.ChildReplicaTarget, len(source.Replicas))
 	for index, sourceReplica := range source.Replicas {
-		root, ok := factory.splitRoot(sourceReplica.Node)
-		snapshot, snapshotOK := factory.splitSnapshot(sourceReplica.Node)
-		if !ok || !snapshotOK {
+		var localReplica gatewaySplitReplica
+		for _, replica := range configuration.Replicas {
+			if replica.Node == sourceReplica.Node {
+				localReplica = replica
+				break
+			}
+		}
+		if localReplica.Root == "" || localReplica.Snapshot == "" {
 			return splitcontroller.ChildTarget{}, hotshard.ErrInvalidPressureCut
 		}
 		operationName := hex.EncodeToString(admission[:])
-		runtimeRoot := filepath.Join(root, operationName, "child-"+strconv.Itoa(int(child)))
+		runtimeRoot := filepath.Join(localReplica.Root, operationName, "child-"+strconv.Itoa(int(child)))
 		storeID := gatewayHotSplitID("store", admission, child, uint8(index))
 		wal := raftstore.Identity{
 			ClusterID: source.Group.ClusterID, ClusterIncarnation: source.Group.ClusterIncarnation,
@@ -198,8 +210,8 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 		}
 		limits := sqldriver.ReplicatedShardStoreLimits{
 			MaxKeyBytes: int(profile.MaxKeyBytes), MaxDocumentBytes: int(profile.MaxDocumentBytes),
-			MaxBatchDocuments: factory.manifest.SplitTemplate.MaxBatchDocuments,
-			MaxBatchBytes:     factory.manifest.SplitTemplate.MaxBatchBytes,
+			MaxBatchDocuments: template.MaxBatchDocuments,
+			MaxBatchBytes:     template.MaxBatchBytes,
 		}
 		base, baseErr := sqldriver.NewReplicatedChildShardStoreIdentity(
 			local, binding, profile.Table,
@@ -212,14 +224,14 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 			base, gatewayHotSplitStorage("apply", admission, child, uint8(index)),
 			gatewayHotSplitStorage("capture", admission, child, uint8(index)),
 			sqldriver.ReplicatedApplyOptions{
-				MaxSessions: factory.manifest.SplitTemplate.MaxSessions,
-				RetryWindow: factory.manifest.SplitTemplate.RetryWindow,
-				TxnLimits:   factory.manifest.SplitTemplate.TxnLimits,
+				MaxSessions: template.MaxSessions,
+				RetryWindow: template.RetryWindow,
+				TxnLimits:   template.TxnLimits,
 				Placement: sqldriver.ReplicatedPlacementProfile{
-					Format:        factory.manifest.SplitTemplate.Format,
-					ShardKey:      factory.manifest.SplitTemplate.ShardKey,
-					TupleVersion:  distribution.TupleVersion(factory.manifest.SplitTemplate.TupleVersion),
-					MapperVersion: distribution.MapperVersion(factory.manifest.SplitTemplate.MapperVersion),
+					Format:        template.Format,
+					ShardKey:      template.ShardKey,
+					TupleVersion:  distribution.TupleVersion(template.TupleVersion),
+					MapperVersion: distribution.MapperVersion(template.MapperVersion),
 					Range:         descriptor.Range,
 				},
 			},
@@ -232,7 +244,7 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 			NodeIncarnation: sourceReplica.NodeIncarnation,
 			Endpoint:        sourceReplica.Endpoint, NativeEndpoint: sourceReplica.NativeEndpoint,
 			ControlEndpoint: sourceReplica.ControlEndpoint, WAL: wal,
-			SnapshotAddress: snapshot,
+			SnapshotAddress: localReplica.Snapshot,
 			WALPath:         filepath.Join(runtimeRoot, "child.wal"),
 			SQLPath:         filepath.Join(runtimeRoot, "stage.vdb"), RuntimeRoot: runtimeRoot,
 			SQL: base, Apply: apply,
@@ -301,24 +313,6 @@ func (factory *gatewayHotSplitFactory) prepareTargets(
 	}
 	wait.Wait()
 	return errors.Join(errorsByJob...)
-}
-
-func (factory *gatewayHotSplitFactory) splitRoot(node [16]byte) (string, bool) {
-	for index := range factory.manifest.Shards {
-		if factory.manifest.Shards[index].Node == node {
-			return factory.manifest.SplitChildRoots[index], true
-		}
-	}
-	return "", false
-}
-
-func (factory *gatewayHotSplitFactory) splitSnapshot(node [16]byte) (string, bool) {
-	for index := range factory.manifest.Shards {
-		if factory.manifest.Shards[index].Node == node {
-			return factory.manifest.SplitSnapshots[index], true
-		}
-	}
-	return "", false
 }
 
 func gatewayHotSplitShardID(admission [32]byte, child uint8) distribution.ShardID {

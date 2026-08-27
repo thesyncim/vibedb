@@ -559,7 +559,7 @@ func runServe(args []string) (exitCode int) {
 				MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * uint64(prepareConcurrency),
 			},
 		)
-		splitFactory, splitFactoryErr := newGatewayHotSplitFactory(childPrepareClient, manifest)
+		splitFactory, splitFactoryErr := newGatewayHotSplitFactory(childPrepareClient, manifest, holder.Current())
 		moveController, controllerErr := newGatewayReplicaMoveController(
 			catalogAuthority, replicated, controls,
 		)

@@ -108,7 +108,7 @@ type devReplicaControlManifest struct {
 	ShardEndpoints   []devReplicaControlShard     `json:"shard_endpoints"`
 	GatewayEndpoints []devReplicaControlEndpoint  `json:"gateway_endpoints"`
 	Candidates       []devReplicaControlCandidate `json:"candidates"`
-	SplitTemplate    devReplicaSplitTemplate      `json:"split_template"`
+	SplitSources     []devReplicaSplitSource      `json:"split_sources"`
 }
 
 type devReplicaControlTLS struct {
@@ -132,7 +132,24 @@ type devReplicaControlShard struct {
 	Node                 string `json:"node"`
 	ControlAddress       string `json:"control_address"`
 	SplitSnapshotAddress string `json:"split_snapshot_address"`
-	SplitChildRoot       string `json:"split_child_root"`
+}
+
+type devReplicaSplitSource struct {
+	ClusterID              [16]byte                       `json:"cluster_id"`
+	ClusterIncarnation     [16]byte                       `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch  uint64                         `json:"topology_recovery_epoch"`
+	ShardIncarnation       [16]byte                       `json:"shard_incarnation"`
+	GroupID                [16]byte                       `json:"group_id"`
+	SchemaGeneration       uint64                         `json:"schema_generation"`
+	RelationManifestDigest [32]byte                       `json:"relation_manifest_digest"`
+	Table                  string                         `json:"table"`
+	Template               devReplicaSplitTemplate        `json:"template"`
+	Replicas               []devReplicaSplitSourceReplica `json:"replicas"`
+}
+
+type devReplicaSplitSourceReplica struct {
+	Node      string `json:"node"`
+	ChildRoot string `json:"child_root"`
 }
 
 type devReplicaControlEndpoint struct {
@@ -1451,19 +1468,19 @@ func writeDevReplicaControl(
 			AuthorizationPolicy: cluster.AuthorizationPolicy},
 		Bounds: devReplicaControlBounds{MaxConnections: 64, MaxHandshakes: 16,
 			MaxConcurrentDrains: 8, ControllerInterval: 100, ReadTimeout: 2_000, WriteTimeout: 5_000},
-		GatewayEndpoints: []devReplicaControlEndpoint{local},
-		SplitTemplate: devReplicaSplitTemplate{Format: 1, MaxSessions: 128, RetryWindow: 8,
-			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 4_096, MaxBytes: 384 << 20},
-			ShardKey:  devDataPrimaryKey, MaxBatchDocuments: 64,
-			MaxBatchBytes: 16<<20 + 64*replication.MaxMutationKeyBytes,
-			TupleVersion:  uint16(distribution.CurrentTupleVersion),
-			MapperVersion: uint16(distribution.NativeMapperVersion)}}
+		GatewayEndpoints: []devReplicaControlEndpoint{local}}
+	if cluster.Nodes == devClusterRF3 {
+		source, err := devReplicaSplitSourceForCluster(cluster)
+		if err != nil {
+			return err
+		}
+		manifest.SplitSources = []devReplicaSplitSource{source}
+	}
 	for _, roleMembers := range members {
 		for _, member := range roleMembers {
-			root := filepath.Join(filepath.Dir(member.ServeManifest), "split-children")
 			manifest.ShardEndpoints = append(manifest.ShardEndpoints, devReplicaControlShard{
 				Node: member.Node, ControlAddress: member.Control,
-				SplitSnapshotAddress: member.Snapshot, SplitChildRoot: root})
+				SplitSnapshotAddress: member.Snapshot})
 		}
 	}
 	sort.Slice(manifest.ShardEndpoints, func(left, right int) bool {
@@ -1474,6 +1491,65 @@ func writeDevReplicaControl(
 		return errors.Join(errDevCluster, err)
 	}
 	return writeDevExclusive(path, raw, 0o600)
+}
+
+// Build from the immutable data preparation authority, before processes start.
+// The shared engine helper computes the same portable machine-schema digest
+// later checked against the prepared stores and replicated catalog.
+func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSplitSource, error) {
+	raw, err := readDevFile(filepath.Join(filepath.Dir(cluster.CatalogPath), "prepare-data-member-1.vibejson"), 1<<20)
+	if err != nil {
+		return devReplicaSplitSource{}, err
+	}
+	var prepare devPrepareManifest
+	if err = vibejson.Unmarshal(raw, &prepare); err != nil {
+		return devReplicaSplitSource{}, err
+	}
+	var entry devReplicaSplitSource
+	for _, item := range []struct {
+		encoded string
+		target  *[16]byte
+	}{
+		{prepare.ClusterID, &entry.ClusterID}, {prepare.ClusterIncarnation, &entry.ClusterIncarnation},
+		{prepare.ShardIncarnation, &entry.ShardIncarnation}, {prepare.GroupID, &entry.GroupID},
+	} {
+		*item.target, err = decodeDev16(item.encoded)
+		if err != nil {
+			return devReplicaSplitSource{}, err
+		}
+	}
+	storeID, err := decodeDev16(prepare.StoreID)
+	if err != nil {
+		return devReplicaSplitSource{}, err
+	}
+	entry.TopologyRecoveryEpoch, entry.SchemaGeneration, entry.Table = prepare.TopologyRecoveryEpoch, prepare.Authority.SchemaGeneration, prepare.Table
+	binding := sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: entry.ClusterID, ClusterIncarnation: entry.ClusterIncarnation, TopologyRecoveryEpoch: entry.TopologyRecoveryEpoch,
+		Distribution: prepare.Distribution, Shard: prepare.Shard, AllocationGeneration: prepare.AllocationGeneration,
+		ShardIncarnation: entry.ShardIncarnation, GroupID: entry.GroupID, MemberID: prepare.MemberID, StoreID: storeID,
+		Authority: sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: prepare.Authority.ActivePolicyGeneration,
+			ProtectionEpoch: prepare.Authority.ProtectionEpoch, OwnershipEpoch: prepare.Authority.OwnershipEpoch,
+			SchemaGeneration: prepare.Authority.SchemaGeneration, RoutingVersion: prepare.Authority.RoutingVersion,
+			RouteGeneration: prepare.Authority.RouteGeneration}}
+	placement := sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat,
+		ShardKey: prepare.Apply.ShardKey, TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
+	digest, limits, err := sqldriver.InitialReplicatedRelationManifest(binding, placement,
+		sqldriver.InitialReplicatedRelationSchema{Table: prepare.Table, PrimaryKey: devDataPrimaryKey})
+	if err != nil {
+		return devReplicaSplitSource{}, err
+	}
+	entry.RelationManifestDigest = digest
+	entry.Template = devReplicaSplitTemplate{MaxSessions: prepare.Apply.MaxSessions, RetryWindow: prepare.Apply.RetryWindow,
+		TxnLimits: durable.TxnLimits{MaxCollections: prepare.Apply.MaxCollections, MaxDocuments: prepare.Apply.MaxDocuments, MaxBytes: prepare.Apply.MaxBytes},
+		Format:    placement.Format, ShardKey: placement.ShardKey, TupleVersion: uint16(placement.TupleVersion), MapperVersion: uint16(placement.MapperVersion),
+		MaxBatchDocuments: limits.MaxBatchDocuments, MaxBatchBytes: limits.MaxBatchBytes}
+	for _, member := range cluster.DataMembers {
+		entry.Replicas = append(entry.Replicas, devReplicaSplitSourceReplica{Node: member.Node,
+			ChildRoot: filepath.Join(filepath.Dir(member.ServeManifest), "split-children")})
+	}
+	sort.Slice(entry.Replicas, func(i, j int) bool { return entry.Replicas[i].Node < entry.Replicas[j].Node })
+	return entry, nil
 }
 
 func validDevManifest(m devClusterManifest, root string) bool {

@@ -40,7 +40,7 @@ type persistedGatewayReplicaControlManifest struct {
 	ShardEndpoints   []persistedGatewayShardControlEndpoint `json:"shard_endpoints"`
 	GatewayEndpoints []persistedGatewayControlEndpoint      `json:"gateway_endpoints"`
 	Candidates       []persistedGatewayReplacementCandidate `json:"candidates"`
-	SplitTemplate    persistedGatewaySplitTemplate          `json:"split_template"`
+	SplitSources     []persistedGatewaySplitSource          `json:"split_sources"`
 }
 
 type persistedGatewayReplicaTLS struct {
@@ -64,7 +64,6 @@ type persistedGatewayShardControlEndpoint struct {
 	Node                 string `json:"node"`
 	ControlAddress       string `json:"control_address"`
 	SplitSnapshotAddress string `json:"split_snapshot_address"`
-	SplitChildRoot       string `json:"split_child_root"`
 }
 
 type persistedGatewaySplitTemplate struct {
@@ -99,16 +98,15 @@ type gatewayReplicaTLSReferences struct {
 }
 
 type gatewayReplicaControlManifest struct {
-	Generation      uint64
-	Local           gatewayControlEndpoint
-	TLS             gatewayReplicaTLSReferences
-	Bounds          persistedGatewayReplicaBounds
-	Shards          []gateway.ReplicatedEndpoint
-	SplitChildRoots []string
-	SplitSnapshots  []string
-	Gateways        []gatewayControlEndpoint
-	Candidates      []gatewayReplicaCandidate
-	SplitTemplate   persistedGatewaySplitTemplate
+	Generation     uint64
+	Local          gatewayControlEndpoint
+	TLS            gatewayReplicaTLSReferences
+	Bounds         persistedGatewayReplicaBounds
+	Shards         []gateway.ReplicatedEndpoint
+	SplitSnapshots []string
+	Gateways       []gatewayControlEndpoint
+	Candidates     []gatewayReplicaCandidate
+	SplitSources   []gatewaySplitSource
 }
 
 type gatewayReplicaCandidate struct {
@@ -153,33 +151,27 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 		return gatewayReplicaControlManifest{}, errors.Join(err, errGatewayReplicaControlManifest)
 	}
 	manifest := gatewayReplicaControlManifest{Generation: persisted.Generation,
-		SplitTemplate: persisted.SplitTemplate,
-		Bounds:        persisted.Bounds, TLS: gatewayReplicaTLSReferences{
+		Bounds: persisted.Bounds, TLS: gatewayReplicaTLSReferences{
 			Certificate: persisted.TLS.Certificate, Key: persisted.TLS.Key,
 			Roots: persisted.TLS.Roots, IdentityOID: persisted.TLS.IdentityOID,
 			AuthorizationPolicy: persisted.TLS.AuthorizationPolicy,
 		}}
 	if manifest.Generation == 0 || !validGatewayReplicaTLSReferences(manifest.TLS) ||
 		!validGatewayReplicaBounds(manifest.Bounds) || len(persisted.ShardEndpoints) == 0 ||
-		len(persisted.GatewayEndpoints) == 0 ||
-		!validGatewaySplitTemplate(manifest.SplitTemplate) {
+		len(persisted.GatewayEndpoints) == 0 {
 		return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 	}
 	manifest.Shards = make([]gateway.ReplicatedEndpoint, len(persisted.ShardEndpoints))
-	manifest.SplitChildRoots = make([]string, len(persisted.ShardEndpoints))
 	manifest.SplitSnapshots = make([]string, len(persisted.ShardEndpoints))
 	shardAddresses := make(map[string]struct{}, len(persisted.ShardEndpoints))
 	for index, encoded := range persisted.ShardEndpoints {
 		node, parseErr := parseGatewayReplicaNode(encoded.Node)
 		if parseErr != nil || !validGatewayReplicaAddress(encoded.ControlAddress) ||
-			!validGatewayReplicaAddress(encoded.SplitSnapshotAddress) ||
-			!filepath.IsAbs(encoded.SplitChildRoot) || filepath.Clean(encoded.SplitChildRoot) != encoded.SplitChildRoot ||
-			encoded.SplitChildRoot == string(filepath.Separator) {
+			!validGatewayReplicaAddress(encoded.SplitSnapshotAddress) {
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 		}
 		manifest.Shards[index] = gateway.ReplicatedEndpoint{Node: node,
 			ControlAddress: strings.Clone(encoded.ControlAddress)}
-		manifest.SplitChildRoots[index] = strings.Clone(encoded.SplitChildRoot)
 		manifest.SplitSnapshots[index] = strings.Clone(encoded.SplitSnapshotAddress)
 		if index != 0 && bytes.Compare(manifest.Shards[index-1].Node[:], node[:]) >= 0 {
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
@@ -188,6 +180,10 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 		}
 		shardAddresses[encoded.ControlAddress] = struct{}{}
+	}
+	manifest.SplitSources, err = openGatewaySplitSources(persisted.SplitSources, manifest.Shards)
+	if err != nil {
+		return gatewayReplicaControlManifest{}, err
 	}
 	manifest.Gateways = make([]gatewayControlEndpoint, len(persisted.GatewayEndpoints))
 	gatewayAddresses := make(map[string]struct{}, len(persisted.GatewayEndpoints))
@@ -225,6 +221,10 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 		}
 	}
 	return manifest, nil
+}
+
+func validGatewaySplitRoot(root string) bool {
+	return filepath.IsAbs(root) && filepath.Clean(root) == root && root != string(filepath.Separator)
 }
 
 func validGatewaySplitTemplate(template persistedGatewaySplitTemplate) bool {
