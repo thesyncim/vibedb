@@ -20,6 +20,7 @@ const (
 	stateRequestLedgerHeaderBytes     = 480
 	stateExecutionPinHeaderBytes      = 504
 	stateRelationPlacementHeaderBytes = 536
+	stateFenceHeaderBytes             = 600
 	recordChecksumLen                 = sha256.Size
 )
 
@@ -99,6 +100,16 @@ type State struct {
 	// accumulators for every placement-capable global-index relation. Zero means
 	// the opened bundle exposes no such relation contract.
 	RelationPlacementDigest [sha256.Size]byte
+	// FenceOriginDigest binds the original command fence. FenceApplied is the
+	// first apply index of the current fence, or zero for the initial fence.
+	FenceOriginDigest [sha256.Size]byte
+	FenceApplied      uint64
+	// HistoricalFenceCount and HistoricalFenceSlots authenticate retained
+	// historical fences and their retry slots. UnfencedSessionSlots counts
+	// retained ResultStaleFence slots, which do not belong to a command fence.
+	HistoricalFenceCount uint64
+	HistoricalFenceSlots uint64
+	UnfencedSessionSlots uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -114,7 +125,9 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
 	headerBytes := stateHeaderBytes
-	if stateHasRelationPlacement(state) {
+	if stateHasFence(state) {
+		headerBytes = stateFenceHeaderBytes
+	} else if stateHasRelationPlacement(state) {
 		headerBytes = stateRelationPlacementHeaderBytes
 	} else if stateHasExecutionPins(state) {
 		headerBytes = stateExecutionPinHeaderBytes
@@ -194,8 +207,15 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 		binary.LittleEndian.PutUint64(frame[488:496], state.ActiveExecutionPinCount)
 		binary.LittleEndian.PutUint64(frame[496:504], state.ExecutionPinResidentBytes)
 	}
-	if headerBytes == stateRelationPlacementHeaderBytes {
+	if headerBytes >= stateRelationPlacementHeaderBytes {
 		copy(frame[504:536], state.RelationPlacementDigest[:])
+	}
+	if headerBytes == stateFenceHeaderBytes {
+		copy(frame[536:568], state.FenceOriginDigest[:])
+		binary.LittleEndian.PutUint64(frame[568:576], state.FenceApplied)
+		binary.LittleEndian.PutUint64(frame[576:584], state.HistoricalFenceCount)
+		binary.LittleEndian.PutUint64(frame[584:592], state.HistoricalFenceSlots)
+		binary.LittleEndian.PutUint64(frame[592:600], state.UnfencedSessionSlots)
 	}
 	cursor := headerBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
@@ -216,7 +236,8 @@ func OpenState(src []byte) (State, error) {
 		(headerBytes != stateHeaderBytes && headerBytes != stateTransactionHeaderBytes &&
 			headerBytes != stateRequestLedgerHeaderBytes &&
 			headerBytes != stateExecutionPinHeaderBytes &&
-			headerBytes != stateRelationPlacementHeaderBytes) ||
+			headerBytes != stateRelationPlacementHeaderBytes &&
+			headerBytes != stateFenceHeaderBytes) ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
@@ -297,10 +318,20 @@ func OpenState(src []byte) (State, error) {
 			return State{}, fmt.Errorf("%w: noncanonical empty execution-pin extension", ErrStateCorrupt)
 		}
 	}
-	if headerBytes == stateRelationPlacementHeaderBytes {
+	if headerBytes >= stateRelationPlacementHeaderBytes {
 		copy(state.RelationPlacementDigest[:], src[504:536])
-		if !stateHasRelationPlacement(state) {
+		if headerBytes == stateRelationPlacementHeaderBytes && !stateHasRelationPlacement(state) {
 			return State{}, fmt.Errorf("%w: empty relation placement extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes == stateFenceHeaderBytes {
+		copy(state.FenceOriginDigest[:], src[536:568])
+		state.FenceApplied = binary.LittleEndian.Uint64(src[568:576])
+		state.HistoricalFenceCount = binary.LittleEndian.Uint64(src[576:584])
+		state.HistoricalFenceSlots = binary.LittleEndian.Uint64(src[584:592])
+		state.UnfencedSessionSlots = binary.LittleEndian.Uint64(src[592:600])
+		if !stateHasFence(state) {
+			return State{}, fmt.Errorf("%w: noncanonical empty fence extension", ErrStateCorrupt)
 		}
 	}
 	cursor := headerBytes
@@ -351,6 +382,9 @@ func validateState(state State) error {
 	}
 	if !validStateExecutionPinCounters(state) {
 		return fmt.Errorf("%w: invalid execution-pin counters", ErrStateCorrupt)
+	}
+	if !validStateFenceCounters(state) {
+		return fmt.Errorf("%w: invalid fence counters", ErrStateCorrupt)
 	}
 	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
 		return fmt.Errorf("%w: unknown ConfState fields", ErrStateCorrupt)
@@ -483,7 +517,32 @@ func equalState(left, right State) bool {
 		left.ActiveExecutionPinCount == right.ActiveExecutionPinCount &&
 		left.ExecutionPinResidentBytes == right.ExecutionPinResidentBytes &&
 		left.RelationPlacementDigest == right.RelationPlacementDigest &&
+		left.FenceOriginDigest == right.FenceOriginDigest &&
+		left.FenceApplied == right.FenceApplied &&
+		left.HistoricalFenceCount == right.HistoricalFenceCount &&
+		left.HistoricalFenceSlots == right.HistoricalFenceSlots &&
+		left.UnfencedSessionSlots == right.UnfencedSessionSlots &&
 		proto.Equal(left.ConfState, right.ConfState)
+}
+
+func stateHasFence(state State) bool {
+	return state.FenceOriginDigest != ([sha256.Size]byte{}) || state.FenceApplied != 0 ||
+		state.HistoricalFenceCount != 0 || state.HistoricalFenceSlots != 0 ||
+		state.UnfencedSessionSlots != 0
+}
+
+func validStateFenceCounters(state State) bool {
+	if state.FenceApplied > state.Applied ||
+		state.HistoricalFenceCount > state.HistoricalFenceSlots ||
+		state.HistoricalFenceSlots > state.SessionSlotCount ||
+		state.UnfencedSessionSlots > state.SessionSlotCount-state.HistoricalFenceSlots {
+		return false
+	}
+	if state.FenceOriginDigest == ([sha256.Size]byte{}) &&
+		(state.FenceApplied != 0 || state.HistoricalFenceSlots != 0) {
+		return false
+	}
+	return state.HistoricalFenceSlots == 0 || state.FenceApplied != 0
 }
 
 func stateHasRelationPlacement(state State) bool {
@@ -578,6 +637,7 @@ func validStateExecutionPinCounters(state State) bool {
 func stateSystemRowCount(state State) (uint64, bool) {
 	values := [...]uint64{
 		1, state.SessionCount, state.SessionSlotCount, state.AuthorityBindingCount,
+		state.HistoricalFenceCount,
 		state.TransactionControlCount, state.TransactionPayloadRows, state.TransactionIntentRows,
 		state.RequestLedgerRows,
 		state.ExecutionPinRecordCount, state.ActiveExecutionPinCount,
