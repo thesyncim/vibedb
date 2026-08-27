@@ -1410,7 +1410,7 @@ func writeDevHotShardCapacity(
 	}
 	var capacity autosplit.CapacityVector
 	for resource := range autosplit.ResourceCount {
-		capacity[resource] = 1_000_000
+		capacity[resource] = 64
 	}
 	config := hotshard.StaticCapacityConfig{Format: hotshard.StaticCapacityFormat,
 		RecorderLanes: 4, WindowCapacity: capacity, NodeCapacity: capacity,

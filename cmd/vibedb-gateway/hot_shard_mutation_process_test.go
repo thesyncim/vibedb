@@ -807,7 +807,7 @@ func hotMutationRoute(identities [4]raftstore.Identity,
 }
 
 func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
-	snapshot *gateway.Snapshot, journalPath string,
+	snapshot *gateway.Snapshot, journalPath string, policyGeneration ...uint64,
 ) (*gateway.ReplicatedCatalogAuthority, func()) {
 	t.Helper()
 	client, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
@@ -849,7 +849,13 @@ func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: 5}
+	generation := uint64(5)
+	if len(policyGeneration) == 1 && policyGeneration[0] != 0 {
+		generation = policyGeneration[0]
+	} else if len(policyGeneration) != 0 {
+		t.Fatal("invalid catalog authority policy generation")
+	}
+	identity := serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: generation}
 	authenticated, err := serviceauthz.WithAuthority(t.Context(), identity)
 	if err != nil {
 		t.Fatal(err)

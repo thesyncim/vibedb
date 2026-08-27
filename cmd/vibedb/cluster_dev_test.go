@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
@@ -333,6 +334,8 @@ func TestDevHotShardCapacityIsExplicitAndCanonical(t *testing.T) {
 	if err != nil || len(config.Nodes) != 9 || config.Nodes[0].Endpoint != "catalog-member-1" ||
 		config.Nodes[3].Endpoint != "data-member-1" ||
 		config.Nodes[6].Endpoint != "ledger-member-1" ||
+		config.WindowCapacity[autosplit.ResourceRequests] != 64 ||
+		config.WindowCapacity[autosplit.ResourceWriteCPU] != 64 ||
 		config.Nodes[0].FailureDomain != 1 || config.Nodes[3].FailureDomain != 1 ||
 		config.Nodes[6].FailureDomain != 1 {
 		t.Fatalf("config=%+v err=%v", config, err)
