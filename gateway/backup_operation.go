@@ -174,10 +174,7 @@ func (controller *BackupOperationController) PublishRestoreStaged(ctx context.Co
 		permit.CertificateDigest != certificateDigest || permit.Groups != uint32(record.Cursor[1]) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
-	var proofInput [sha256.Size * 2]byte
-	copy(proofInput[:sha256.Size], permit.Restore[:])
-	copy(proofInput[sha256.Size:], permit.CertificateDigest[:])
-	proof := sha256.Sum256(proofInput[:])
+	proof := backupRestoreProof(permit)
 	next := record
 	next.Revision++
 	next.Cursor[0] = backupStageRestoreStaged
@@ -186,6 +183,13 @@ func (controller *BackupOperationController) PublishRestoreStaged(ctx context.Co
 		return ReplicatedOperationRecord{}, err
 	}
 	return next, nil
+}
+
+func backupRestoreProof(permit clusterbackup.RestoreStagingPermit) [sha256.Size]byte {
+	var proofInput [sha256.Size * 2]byte
+	copy(proofInput[:sha256.Size], permit.Restore[:])
+	copy(proofInput[sha256.Size:], permit.CertificateDigest[:])
+	return sha256.Sum256(proofInput[:])
 }
 
 func (controller *BackupOperationController) Complete(ctx context.Context, record ReplicatedOperationRecord) (ReplicatedOperationRecord, error) {

@@ -19,6 +19,17 @@ type BackupRepositoryCoordinator struct {
 	repository *clusterbackup.BackupRepository
 }
 
+type RestoreStagingOptions struct {
+	Path                     string
+	RepositoryLimits         clusterbackup.RepositoryLimits
+	Restore                  [sha256.Size]byte
+	TargetClusterID          [16]byte
+	TargetClusterIncarnation [16]byte
+	MaxArtifactBytes         uint64
+	MaxTotalBytes            uint64
+	PayloadBuffer            []byte
+}
+
 func NewBackupRepositoryCoordinator(lifecycle *BackupOperationController,
 	repository *clusterbackup.BackupRepository,
 ) (*BackupRepositoryCoordinator, error) {
@@ -77,6 +88,64 @@ func (coordinator *BackupRepositoryCoordinator) Publish(ctx context.Context,
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
 	return record, nil
+}
+
+// StageRestore verifies every artifact from the coordinator-owned immutable
+// export, builds a non-serving root, and only then advances the replicated
+// lifecycle. It never creates databases, members, stores, routes, or grants.
+func (coordinator *BackupRepositoryCoordinator) StageRestore(ctx context.Context,
+	record ReplicatedOperationRecord, certificate clusterbackup.Certificate,
+	options RestoreStagingOptions,
+) (*clusterbackup.RestoreStagingRoot, ReplicatedOperationRecord, error) {
+	if coordinator == nil || ctx == nil || coordinator.lifecycle == nil ||
+		coordinator.repository == nil || !coordinator.lifecycle.authorized() ||
+		backupCertificateDigest(record.Cursor) != certificate.Digest ||
+		!backupCertificateMatchesIntent(record, certificate) {
+		return nil, ReplicatedOperationRecord{}, ErrBackupOperation
+	}
+	if validBackupRecord(record, backupStageRestoreStaged) {
+		staged, err := clusterbackup.OpenRestoreStagingRoot(options.Path, options.RepositoryLimits)
+		if err != nil || staged.Permit.CertificateDigest != certificate.Digest ||
+			staged.Permit.Restore != options.Restore ||
+			staged.Permit.TargetClusterID != options.TargetClusterID ||
+			staged.Permit.TargetClusterIncarnation != options.TargetClusterIncarnation ||
+			record.Proof != backupRestoreProof(staged.Permit) {
+			if staged != nil {
+				_ = staged.Close()
+			}
+			return nil, ReplicatedOperationRecord{}, errors.Join(ErrBackupOperation, err)
+		}
+		return staged, record, nil
+	}
+	if !validBackupRecord(record, backupStageExported) || record.Proof != backupExportDigest(certificate) {
+		return nil, ReplicatedOperationRecord{}, ErrBackupOperation
+	}
+	published, err := coordinator.repository.Certificate(certificate.Digest)
+	if err != nil || published.Digest != certificate.Digest {
+		return nil, ReplicatedOperationRecord{}, errors.Join(ErrBackupOperation, err)
+	}
+	permit, err := clusterbackup.VerifyRestoreArtifacts(ctx, published, options.Restore,
+		options.TargetClusterID, options.TargetClusterIncarnation, clusterbackup.RestoreVerifyOptions{
+			Source: coordinator.repository, MaxArtifactBytes: options.MaxArtifactBytes,
+			MaxTotalBytes: options.MaxTotalBytes, PayloadBuffer: options.PayloadBuffer})
+	if err != nil {
+		return nil, ReplicatedOperationRecord{}, err
+	}
+	staged, err := clusterbackup.BuildRestoreStagingRoot(ctx, options.Path, options.RepositoryLimits,
+		published, permit, coordinator.repository)
+	if err != nil {
+		return nil, ReplicatedOperationRecord{}, err
+	}
+	next, advanceErr := coordinator.lifecycle.PublishRestoreStaged(ctx, record, permit)
+	if advanceErr != nil {
+		next, advanceErr = coordinator.settle(ctx, record.ID, backupStageRestoreStaged,
+			backupRestoreProof(permit), advanceErr)
+	}
+	if advanceErr != nil {
+		_ = staged.Close()
+		return nil, ReplicatedOperationRecord{}, advanceErr
+	}
+	return staged, next, nil
 }
 
 func (coordinator *BackupRepositoryCoordinator) settle(ctx context.Context, id [sha256.Size]byte,
