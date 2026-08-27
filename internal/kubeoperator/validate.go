@@ -51,6 +51,7 @@ func ValidateRendered(raw []byte) error {
 		{"automountServiceAccountToken: false", 5}, {"enableServiceLinks: false", 5},
 		{"runAsNonRoot: true", 5}, {"seccompProfile: {type: RuntimeDefault}", 5},
 		{"volumeClaimTemplates:", 5}, {"clusterIP: None", 5},
+		{"{name: bootstrap, mountPath: /bootstrap, readOnly: true}", 6},
 	}
 	for _, check := range checks {
 		if count(raw, check.text) != check.want {
@@ -62,7 +63,7 @@ func ValidateRendered(raw []byte) error {
 			return ErrManifest
 		}
 	}
-	for _, required := range []string{"- -catalog-bootstrap-if-missing", "- -durable-ack-key=/run/secrets/vibedb/durable-ack-key", "{name: control, port: 7401, targetPort: control}", "{name: control, containerPort: 7401}"} {
+	for _, required := range []string{"- -catalog-bootstrap-if-missing", "- -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson", "- -durable-ack-key=/run/secrets/vibedb/durable-ack-key", "{name: control, port: 7401, targetPort: control}", "{name: control, containerPort: 7401}"} {
 		if !bytes.Contains(raw, []byte(required)) {
 			return ErrManifest
 		}

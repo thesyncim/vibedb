@@ -54,10 +54,10 @@ func TestRenderRF3GoldenAndSafetyContract(t *testing.T) {
 	if err := ValidateRendered(output.Bytes()); err != nil {
 		t.Fatalf("rendered contract: %v", err)
 	}
-	want := [sha256.Size]byte{0x07, 0xc0, 0xd2, 0x0a, 0x5e, 0x1a, 0xb7, 0x88,
-		0xec, 0xa2, 0xb1, 0x2e, 0x05, 0xd4, 0x71, 0x12,
-		0xd8, 0x17, 0x93, 0x1d, 0x58, 0x81, 0xa8, 0x72,
-		0x5f, 0x41, 0xb9, 0x28, 0xeb, 0xd1, 0x17, 0xd2}
+	want := [sha256.Size]byte{0x75, 0x2d, 0x7b, 0x29, 0xe4, 0x7c, 0x39, 0x0f,
+		0x53, 0x80, 0x5f, 0x22, 0x74, 0xc0, 0xfc, 0xea,
+		0x3c, 0x04, 0x1a, 0x8f, 0xdd, 0xd3, 0x16, 0x0c,
+		0xdd, 0xe7, 0x7d, 0xca, 0xc4, 0x2d, 0xed, 0x1c}
 	if got := sha256.Sum256(output.Bytes()); got != want {
 		t.Fatalf("golden digest = %x; update want only after reviewing the complete manifest", got)
 	}
@@ -73,6 +73,8 @@ func TestValidateRenderedRejectsLostDurabilityAndTopologyControls(t *testing.T) 
 		{"whenUnsatisfiable: DoNotSchedule", "whenUnsatisfiable: ScheduleAnyway"},
 		{"  replicas: 3\n", "  replicas: 2\n"},
 		{"livenessProbe:", "lostProbe:"},
+		{"{name: bootstrap, mountPath: /bootstrap, readOnly: true}", "{name: bootstrap, mountPath: /lost-bootstrap, readOnly: true}"},
+		{"- -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson", "- -catalog-route-seed=/etc/vibedb/cluster.vibejson"},
 	} {
 		raw := strings.Replace(output.String(), mutation.old, mutation.replacement, 1)
 		if err := ValidateRendered([]byte(raw)); err != ErrManifest {

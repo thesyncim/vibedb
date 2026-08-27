@@ -199,6 +199,7 @@ spec:
           resources: {requests: {cpu: "500m", memory: 1Gi}}
           volumeMounts:
             - {name: data, mountPath: /var/lib/vibedb}
+            - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
             - {name: tls, mountPath: /run/secrets/vibedb, readOnly: true}
       volumes:
         - name: bootstrap
@@ -268,6 +269,7 @@ spec:
           args:
             - serve
             - -catalog=/etc/vibedb/cluster.vibejson
+            - -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson
             - -catalog-bootstrap-if-missing
             - -catalog-relation=1
             - -catalog-session-journal=/var/lib/vibedb/catalog-session
