@@ -66,4 +66,3 @@ A live command is complete only when an external kill/partition test proves:
 - retention release only after an authenticated completed or abandoned backup;
 - bounded foreground p99.9 impact, memory, network, WAL retention, and artifact
   space amplification.
-

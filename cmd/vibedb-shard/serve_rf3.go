@@ -450,6 +450,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 
 	pulse := make(chan struct{}, 1)
+	progressMetrics := new(raftservice.ProgressMetrics)
 	peer, err := raftservice.NewAuthenticatedExecutionPeerRuntime(raftservice.AuthenticatedExecutionPeerOptions{
 		Registry: transportRegistry, TLS: profile, Dial: dial, Listener: peerListener,
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
@@ -461,6 +462,7 @@ func servePreparedRF3WithExecutionLanes(
 			TransactionRecoverySources: recoverySources,
 			Pulse:                      pulse,
 			Limits:                     rf3OwnerLimits(),
+			ProgressMetrics:            progressMetrics,
 		},
 		Transport: rf3TransportOptions(remoteNodes, deadline),
 		Receiver: rafttransport.OrdinaryReceiverOptions{

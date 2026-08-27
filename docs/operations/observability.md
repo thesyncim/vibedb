@@ -55,4 +55,3 @@ Observability must remain downstream of correctness and off the hot path:
 - collectors bound concurrency, response bytes, and scrape time;
 - telemetry failure never authorizes routing, membership, split, move, cleanup,
   or acknowledgement.
-

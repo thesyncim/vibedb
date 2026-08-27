@@ -95,6 +95,7 @@ type Options struct {
 	Outbound                   OutboundSink
 	Pulse                      <-chan struct{}
 	Limits                     Limits
+	ProgressMetrics            *ProgressMetrics
 }
 
 type requestKind uint8
@@ -581,6 +582,7 @@ type Owner struct {
 	pulse     <-chan struct{}
 	limits    Limits
 	authority MembershipAuthority
+	metrics   *ProgressMetrics
 
 	ingress chan ownerRequest
 	ready   chan struct{}
@@ -769,6 +771,7 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 		registry: options.Registry, host: host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
 		authority:    options.MembershipAuthority,
+		metrics:      options.ProgressMetrics,
 		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
 		ready:        make(chan struct{}),
 		done:         make(chan struct{}),
@@ -828,6 +831,7 @@ func (owner *Owner) Run(ctx context.Context) error {
 
 		if !transportBlocked && !readyBlocked {
 			progress, done, err := owner.host.RunOne()
+			owner.metrics.observeProgress(progress, done, err)
 			switch {
 			case errors.Is(err, multiraft.ErrOutboxFull):
 				// The next loop transfers one Host-owned message into the retained

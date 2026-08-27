@@ -34,6 +34,7 @@ type ExecutionOptions struct {
 	Outbound                   OutboundSink
 	Pulse                      <-chan struct{}
 	Limits                     Limits
+	ProgressMetrics            *ProgressMetrics
 }
 
 // ExecutionOwners is the group-keyed serving capability over all execution
@@ -42,6 +43,7 @@ type ExecutionOptions struct {
 type ExecutionOwners struct {
 	lanes   *multiraft.ExecutionLanes
 	owners  []*Owner
+	metrics *ProgressMetrics
 	byGroup atomic.Pointer[executionOwnerGroups]
 	pulse   <-chan struct{}
 	ticks   []chan struct{}
@@ -108,7 +110,8 @@ func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 	}
 	result := &ExecutionOwners{
 		lanes: options.Lanes, owners: make([]*Owner, count),
-		pulse: options.Pulse, ticks: make([]chan struct{}, count),
+		metrics: options.ProgressMetrics,
+		pulse:   options.Pulse, ticks: make([]chan struct{}, count),
 		started: make(chan struct{}), done: make(chan struct{}),
 	}
 	groups := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(options.Members))}
@@ -124,6 +127,7 @@ func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 			ReadSources: item.reads, TransactionRecoverySources: item.recoveries,
 			MembershipAuthority: options.MembershipAuthority, Outbound: options.Outbound,
 			Pulse: result.ticks[lane], Limits: options.Limits,
+			ProgressMetrics: options.ProgressMetrics,
 		}, view, true)
 		if err != nil {
 			return nil, err
@@ -135,6 +139,15 @@ func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 	}
 	result.byGroup.Store(groups)
 	return result, nil
+}
+
+// ProgressMetrics returns the current bounded RF3 serving counter cut. It is
+// safe to call concurrently with every owner lane.
+func (owners *ExecutionOwners) ProgressMetrics() ProgressMetricsSnapshot {
+	if owners == nil {
+		return ProgressMetricsSnapshot{}
+	}
+	return owners.metrics.Snapshot()
 }
 
 func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) {
