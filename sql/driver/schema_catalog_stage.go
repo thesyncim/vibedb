@@ -83,6 +83,7 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 		}
 		proof.SourceApplied = expectedApplied
 		proof.Membership = witness
+		proof.Witness = replicatedSchemaTargetProofDigest(*proof)
 		if err := writeReplicatedSchemaTargetCatalog(
 			a.database.dataDir, raw, proof.Catalog,
 		); err != nil {
@@ -98,7 +99,7 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 			catalogDigest:   proof.Catalog.Digest,
 			relationWitness: proof.Relations.Witness,
 			applyContract:   proof.ApplyContract,
-			authorization:   authorization, storages: storages,
+			authorization:   authorization, targetWitness: proof.Witness, storages: storages,
 		})
 	})
 }
@@ -128,7 +129,38 @@ func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTarget(
 	proof.SourceApplied = marker.sourceApplied
 	proof.Membership = marker.membership
 	proof.Witness = replicatedSchemaTargetProofDigest(proof)
+	if proof.Witness != marker.targetWitness {
+		return proof, ErrReplicatedSchemaCatalogImage
+	}
 	return proof, nil
+}
+
+// ObservePreparedReplicatedSchemaTarget settles a durable prepare after a
+// restart without opening the serving apply machine or rescanning relation
+// rows. The returned witness is covered by the stage marker checksum.
+func ObservePreparedReplicatedSchemaTarget(
+	path string, raw []byte, requestDigest [sha256.Size]byte,
+) ([sha256.Size]byte, bool, error) {
+	if path == "" || requestDigest == ([sha256.Size]byte{}) {
+		return [sha256.Size]byte{}, false, ErrReplicatedSchemaCatalogImage
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil {
+		return [sha256.Size]byte{}, false, err
+	}
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return [sha256.Size]byte{}, false, err
+	}
+	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
+	if err != nil || !found {
+		return [sha256.Size]byte{}, found, err
+	}
+	if marker.authorization != requestDigest || marker.catalogDigest != image.Digest ||
+		marker.schemaGeneration != image.SchemaGeneration || marker.targetWitness == ([32]byte{}) {
+		return [sha256.Size]byte{}, false, ErrReplicatedSchemaCatalogImage
+	}
+	return marker.targetWitness, true, nil
 }
 
 func (a *ReplicatedApply) certifyReplicatedSchemaTarget(

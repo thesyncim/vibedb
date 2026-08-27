@@ -15,7 +15,7 @@ func TestReplicatedSchemaStageMarkerCanonicalAndCorruptionClosed(t *testing.T) {
 			Sequence: 3, Source: [32]byte{1}, Target: [32]byte{2},
 		},
 		catalogDigest: [32]byte{3}, relationWitness: [32]byte{4},
-		applyContract: [32]byte{5}, authorization: [32]byte{6},
+		applyContract: [32]byte{5}, authorization: [32]byte{6}, targetWitness: [32]byte{9},
 		storages: [][32]byte{{7}, {8}},
 	}
 	raw, err := encodeReplicatedSchemaStageMarker(marker)

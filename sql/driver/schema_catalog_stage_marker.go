@@ -19,7 +19,7 @@ const (
 	replicatedSchemaStageMarkerTemp    = ".schema-membership-stage.tmp"
 	replicatedSchemaTargetCatalogName  = ".schema-target-catalog"
 	replicatedSchemaTargetCatalogTemp  = ".schema-target-catalog.tmp"
-	replicatedSchemaStageHeaderBytes   = 232
+	replicatedSchemaStageHeaderBytes   = 264
 	replicatedSchemaStageChecksumBytes = sha256.Size
 )
 
@@ -34,6 +34,7 @@ type replicatedSchemaStageMarker struct {
 	relationWitness  [sha256.Size]byte
 	applyContract    [sha256.Size]byte
 	authorization    [sha256.Size]byte
+	targetWitness    [sha256.Size]byte
 	storages         [][32]byte
 }
 
@@ -42,7 +43,7 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 		marker.membership.Sequence == 0 || marker.membership.Source == ([32]byte{}) ||
 		marker.membership.Target == ([32]byte{}) || marker.catalogDigest == ([32]byte{}) ||
 		marker.relationWitness == ([32]byte{}) || marker.applyContract == ([32]byte{}) ||
-		marker.authorization == ([32]byte{}) ||
+		marker.authorization == ([32]byte{}) || marker.targetWitness == ([32]byte{}) ||
 		len(marker.storages) == 0 || len(marker.storages) > replication.MaxRelationsPerBundle {
 		return nil, ErrReplicatedSchemaCatalogImage
 	}
@@ -62,6 +63,7 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 	copy(raw[136:168], marker.applyContract[:])
 	copy(raw[168:200], marker.membership.Source[:])
 	copy(raw[200:232], marker.membership.Target[:])
+	copy(raw[232:264], marker.targetWitness[:])
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		if marker.storages[i] == ([32]byte{}) {
@@ -112,6 +114,7 @@ func decodeReplicatedSchemaStageMarker(raw []byte) (replicatedSchemaStageMarker,
 	copy(marker.applyContract[:], raw[136:168])
 	copy(marker.membership.Source[:], raw[168:200])
 	copy(marker.membership.Target[:], raw[200:232])
+	copy(marker.targetWitness[:], raw[232:264])
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		copy(marker.storages[i][:], raw[at:at+32])

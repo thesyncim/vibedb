@@ -85,6 +85,13 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		prepared.Membership.Target == ([32]byte{}) || prepared.Witness == proof.Witness {
 		t.Fatalf("prepared target proof = %+v, %v", prepared, err)
 	}
+	observedWitness, found, err := ObservePreparedReplicatedSchemaTarget(
+		path, targetRaw, [32]byte{0xa5},
+	)
+	if err != nil || !found || observedWitness != prepared.Witness {
+		t.Fatalf("observed target witness=%x found=%t err=%v",
+			observedWitness, found, err)
+	}
 	stagedCatalog, err := readReplicatedSchemaTargetCatalog(
 		path+".tables", prepared.Catalog,
 	)
@@ -132,7 +139,7 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil || !found || marker.membership != prepared.Membership ||
 		marker.catalogDigest != prepared.Catalog.Digest ||
 		marker.relationWitness != prepared.Relations.Witness ||
-		marker.applyContract != prepared.ApplyContract {
+		marker.applyContract != prepared.ApplyContract || marker.targetWitness != prepared.Witness {
 		t.Fatalf("reopened stage marker = %+v, found=%v err=%v", marker, found, err)
 	}
 	if _, err = os.Stat(path + ".tables/" + storage + ".vjc"); err != nil {
