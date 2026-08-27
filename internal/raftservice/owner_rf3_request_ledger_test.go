@@ -95,6 +95,21 @@ type multiGroupRequestLedgerRF3Trace struct {
 	hidden    bool
 }
 
+const multiGroupRF3NativeTraceLimit = 12
+
+type multiGroupRF3NativeTrace struct {
+	group, member int
+	operation     shardservice.ReplicatedOperation
+	kind          shardservice.ReplicatedResponseKind
+	refusal       shardservice.ReplicatedRefusalCode
+	hasState      bool
+	leader, term  uint64
+	applied       uint64
+	commit        uint64
+	readApplied   uint64
+	err           error
+}
+
 type multiGroupRequestLedgerRF3RoundTripper struct {
 	cluster *multiGroupTransactionRF3Cluster
 	servers [multiGroupRF3Voters]*shardservice.ReplicatedServer
@@ -105,6 +120,26 @@ type multiGroupRequestLedgerRF3RoundTripper struct {
 	hiddenMember  int
 	disconnected  bool
 	trace         []multiGroupRequestLedgerRF3Trace
+	nativeTrace   [multiGroupRF3NativeTraceLimit]multiGroupRF3NativeTrace
+	nativeNext    int
+	nativeCount   int
+}
+
+func (client *multiGroupRequestLedgerRF3RoundTripper) recordNativeResult(
+	group, member int, operation shardservice.ReplicatedOperation,
+	response *shardservice.ReplicatedResponse, err error,
+) {
+	trace := multiGroupRF3NativeTrace{group: group, member: member, operation: operation, err: err}
+	if response != nil {
+		trace.kind, trace.refusal, trace.hasState = response.Kind, response.Refusal, response.HasState
+		trace.leader, trace.term = response.State.LeaderID, response.State.Fence.Term
+		trace.applied, trace.commit, trace.readApplied = response.State.Applied, response.State.Commit, response.ReadApplied
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.nativeTrace[client.nativeNext] = trace
+	client.nativeNext = (client.nativeNext + 1) % len(client.nativeTrace)
+	client.nativeCount = min(client.nativeCount+1, len(client.nativeTrace))
 }
 
 func newMultiGroupRequestLedgerRF3RoundTripper(
@@ -181,7 +216,7 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 	ctx context.Context,
 	endpoint gateway.ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
-) (*shardservice.ReplicatedResponse, error) {
+) (response *shardservice.ReplicatedResponse, resultErr error) {
 	// Losing one response alone is not a lost caller: production retries can
 	// resolve it through a healthy quorum. Keep this caller disconnected for
 	// every retry in the logical call, until the fixture explicitly reconnects.
@@ -202,6 +237,7 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 	if group < 0 {
 		return nil, errors.New("RF3 request-ledger request names an unknown group")
 	}
+	defer func() { client.recordNativeResult(group, member, request.Operation, response, resultErr) }()
 	if client.cluster.network.nodeIsolated(member) {
 		return nil, errMultiGroupRF3Isolated
 	}
@@ -273,6 +309,27 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) logRecentSettlements(t tes
 	for member, server := range client.servers {
 		if server != nil {
 			t.Logf("native member=%d settlement diagnostics=%+v", member, server.Stats())
+		}
+	}
+	for ordinal := 0; ordinal < client.nativeCount; ordinal++ {
+		index := (client.nativeNext - client.nativeCount + ordinal + len(client.nativeTrace)) % len(client.nativeTrace)
+		trace := client.nativeTrace[index]
+		t.Logf("native group=%d member=%d op=%d response=%d refusal=%d state=%t leader=%d term=%d applied=%d commit=%d read_applied=%d err=%v",
+			trace.group, trace.member, trace.operation, trace.kind, trace.refusal, trace.hasState,
+			trace.leader, trace.term, trace.applied, trace.commit, trace.readApplied, trace.err)
+	}
+	if client.cluster != nil {
+		// One shared diagnostic deadline bounds all probes; it does not alter any
+		// request, election, or fault-injection budget in the test itself.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		for member, owner := range client.cluster.owners {
+			for group := 0; group < client.cluster.groupCount; group++ {
+				state, err := owner.Probe(ctx, client.cluster.groups[group].key)
+				t.Logf("owner group=%d member=%d running=%t leader=%d term=%d applied=%d commit=%d err=%v",
+					group, member, client.cluster.peers[member].Running(), state.Status.LeaderID,
+					state.Status.Term, state.Status.Applied, state.Status.Commit, err)
+			}
 		}
 	}
 }
@@ -565,7 +622,10 @@ func TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition(t 
 	if err != nil || !row.Found || row.Kind != replicatedstate.RequestLedgerReadHead ||
 		row.Head.Key != key1 || row.Head.KeyDigest != head1.KeyDigest ||
 		row.Head.PlanningLeaseExpiryIndex != recovered.Ledger.PlanningLeaseExpiryIndex {
-		t.Fatalf("replacement ReadIndex head=%+v err=%v", row, err)
+		clientB.logRecentSettlements(t)
+		t.Fatalf("replacement ReadIndex applied=%d found=%t kind=%d revision=%d lease_expiry=%d expected_lease_expiry=%d err=%v",
+			row.Applied, row.Found, row.Kind, row.Head.Revision, row.Head.PlanningLeaseExpiryIndex,
+			recovered.Ledger.PlanningLeaseExpiryIndex, err)
 	}
 
 	accepted, err := ledgerB.ApplyCAS(ctx, home, key2, gateway.DurableRequestLifecycleCAS{

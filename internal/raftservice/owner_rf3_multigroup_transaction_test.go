@@ -664,7 +664,10 @@ func (cluster *multiGroupTransactionRF3Cluster) close(t testing.TB) {
 	}
 	for member, done := range cluster.runErrors {
 		select {
-		case <-done:
+		case err := <-done:
+			if t.Failed() {
+				t.Logf("multi-group RF3 peer %d terminal error: %v", member, err)
+			}
 		case <-time.After(10 * time.Second):
 			t.Errorf("multi-group RF3 owner %d did not stop", member)
 		}
