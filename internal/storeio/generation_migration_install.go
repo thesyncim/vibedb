@@ -50,5 +50,6 @@ func stagedStateLogicalFieldsEqual(a, b StateRoot) bool {
 		a.InlineValueBytes == b.InlineValueBytes &&
 		a.MaxDocumentBytes == b.MaxDocumentBytes &&
 		a.JournalID == b.JournalID &&
-		a.PhysicalCapacityBytes == b.PhysicalCapacityBytes
+		a.PhysicalCapacityBytes == b.PhysicalCapacityBytes &&
+		a.MigrationManifestOffset == b.MigrationManifestOffset
 }
