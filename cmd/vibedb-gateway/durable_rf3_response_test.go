@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -52,6 +53,59 @@ func durableRF3ExternalAssertCommitted(t testing.TB, raw []byte, rows int64, sha
 	t.Helper()
 	if !durableRF3ExternalExecResponse(t, raw).committed(rows, shards) {
 		t.Fatalf("multi-relation terminal=%s", raw)
+	}
+}
+
+// Completed ACK retries echo the same capability and do no collection work.
+// Applied is the current ReadIndex observation, not the tombstone's creation
+// index: unrelated writes and election no-ops may advance it. Compare every
+// other byte, and require this observation to be nonzero and nondecreasing.
+func durableRF3ExternalSameCompletedAck(before, after []byte) bool {
+	var previous, next durableRF3ExternalWireResponse
+	if vibejson.Unmarshal(before, &previous) != nil || vibejson.Unmarshal(after, &next) != nil ||
+		!previous.OK || previous.Op != "ack_exec_batch" || previous.Error != "" ||
+		previous.Applied == 0 || next.Applied < previous.Applied ||
+		previous.CollectionRounds != 0 || next.CollectionRounds != 0 {
+		return false
+	}
+	oldField := fmt.Appendf(nil, `"applied":%d,`, previous.Applied)
+	newField := fmt.Appendf(nil, `"applied":%d,`, next.Applied)
+	return bytes.Count(before, oldField) == 1 && bytes.Count(after, newField) == 1 &&
+		bytes.Equal(bytes.Replace(before, oldField, newField, 1), after)
+}
+
+func TestDurableRF3CompletedAckReplayAllowsOnlyAdvancingObservation(t *testing.T) {
+	var request durableExecBatchAckWireRequest
+	if err := decodeDurableExecBatchAckRequest([]byte(validDurableExecBatchAckFixture), &request); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	response := durableExecBatchAckWireResponse{durableExecBatchAckWireRequest: request, Applied: 17}
+	if err := writeDurableExecBatchAckResponse(vibejson.NewWriter(&output), &response); err != nil {
+		t.Fatal(err)
+	}
+	before := output.Bytes()
+	for name, test := range map[string]struct {
+		old, new string
+		want     bool
+	}{
+		"unchanged":  {`"applied":17`, `"applied":17`, true},
+		"election":   {`"applied":17`, `"applied":20`, true},
+		"rollback":   {`"applied":17`, `"applied":16`, false},
+		"zero":       {`"applied":17`, `"applied":0`, false},
+		"collection": {`"collection_rounds":0`, `"collection_rounds":1`, false},
+		"terminal":   {`"terminal_revision":11`, `"terminal_revision":12`, false},
+		"sequence":   {`"issuer_sequence":9`, `"issuer_sequence":10`, false},
+		"token":      {`41414141`, `42424242`, false},
+		"digest":     {`31313131`, `32323232`, false},
+		"error":      {`"ok":true`, `"ok":false`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			after := bytes.Replace(before, []byte(test.old), []byte(test.new), 1)
+			if got := durableRF3ExternalSameCompletedAck(before, after); got != test.want {
+				t.Fatalf("ACK comparison=%t want=%t response=%s", got, test.want, after)
+			}
+		})
 	}
 }
 

@@ -241,7 +241,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	ackARaw, ackALatency := clientA.roundTrip(t, ackWire)
 	latencies = append(latencies, ackALatency)
 	durableRF3ExternalAssertAckResponse(t, ackARaw, ackRequest)
-	if !bytes.Equal(ackARaw, ackRetryRaw) {
+	if !durableRF3ExternalSameCompletedAck(ackRetryRaw, ackARaw) {
 		t.Fatalf("exact ACK replay drifted across gateways\nB=%s\nA=%s", ackRetryRaw, ackARaw)
 	}
 	fixture.assertPinJournalRetired(t, fixture.gatewayAJournal)
@@ -274,7 +274,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	postRestartAck, postRestartLatency := clientA.roundTrip(t, ackWire)
 	latencies = append(latencies, postRestartLatency)
 	durableRF3ExternalAssertAckResponse(t, postRestartAck, ackRequest)
-	if !bytes.Equal(postRestartAck, ackRetryRaw) {
+	if !durableRF3ExternalSameCompletedAck(ackARaw, postRestartAck) {
 		t.Fatalf("exact ACK replay drifted after every voter restart\nwant=%s\ngot=%s",
 			ackRetryRaw, postRestartAck)
 	}

@@ -10,12 +10,13 @@ import (
 )
 
 type ackCollectorLedger struct {
-	head       requestledger.HeadRecord
-	terminal   requestledger.TerminalRecord
-	ack        requestledger.AckRecord
-	faultAck   bool
-	faultGC    bool
-	operations []requestledger.Operation
+	head        requestledger.HeadRecord
+	terminal    requestledger.TerminalRecord
+	ack         requestledger.AckRecord
+	faultAck    bool
+	faultGC     bool
+	operations  []requestledger.Operation
+	readAdvance uint64
 }
 
 func (ledger *ackCollectorLedger) ApplyCAS(
@@ -81,7 +82,7 @@ func (ledger *ackCollectorLedger) ReadRow(
 	}
 	if ledger.ack.Revision != 0 {
 		return DurableRequestLifecycleRow{
-			Applied: ledger.ack.Revision + 100, Found: true,
+			Applied: ledger.ack.Revision + 100 + ledger.readAdvance, Found: true,
 			Kind: replicatedstate.RequestLedgerReadAck, Ack: ledger.ack,
 		}, nil
 	}
@@ -143,13 +144,16 @@ func TestDurableRequestAckCollectorResumesAmbiguousAckAndCollection(t *testing.T
 	// A replay with the same possession witness performs no writes and returns
 	// the permanent compact tombstone.
 	before := len(ledger.operations)
+	// Elections and unrelated writes advance the observation, not the ACK.
+	ledger.readAdvance = 3
 	replayed, err := collector.AcknowledgeAndCollect(t.Context(), DurableRequestAckPlan{
 		Home: terminalPlan.Home, Key: terminalPlan.Key,
 		TerminalRevision: terminal.Terminal.Revision,
 		ResultDigest:     terminal.Terminal.ResultDigest,
 		AckToken:         terminal.Terminal.AckToken,
 	})
-	if err != nil || replayed.Ack.AckDigest != result.Ack.AckDigest ||
+	if err != nil || replayed.Ack != result.Ack || replayed.Rounds != 0 ||
+		replayed.Applied != result.Applied+ledger.readAdvance ||
 		len(ledger.operations) != before {
 		t.Fatalf("replayed=%+v operations=%v err=%v", replayed, ledger.operations, err)
 	}

@@ -585,11 +585,11 @@ func (service *DurableRequestService) drive(
 	}
 	route, acquire, lease, err := service.pins.AcquireOrRecover(ctx, execution)
 	if err != nil {
-		return DurableRequestOutcome{}, err
+		return DurableRequestOutcome{}, fmt.Errorf("gateway: execution pin acquire/recover: %w", err)
 	}
 	execution, err = BindDurableRequestExecutionPin(execution, route, acquire, lease)
 	if err != nil {
-		return DurableRequestOutcome{}, err
+		return DurableRequestOutcome{}, fmt.Errorf("gateway: execution pin binding: %w", err)
 	}
 	terminal, runErr := service.runner.RunTyped(ctx, execution)
 	if runErr == nil {

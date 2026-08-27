@@ -42,6 +42,9 @@ type durableExecBatchAckWireRequest struct {
 // durableExecBatchAckWireResponse echoes the exact resumable handle. A client
 // that loses this response can safely retry the same request: the replicated
 // ACK tombstone authenticates the token digest after result collection.
+// Applied is the current linearizable observation, and CollectionRounds counts
+// work in this invocation. Neither is part of the durable capability: elections
+// may advance Applied on a write-free completed retry (CollectionRounds == 0).
 type durableExecBatchAckWireResponse struct {
 	durableExecBatchAckWireRequest
 	Applied          uint64

@@ -359,6 +359,10 @@ After the application has durably consumed the terminal result, send
 It advances bounded collection and can be retried exactly after a lost response.
 An exact completed ACK retry is write-free. Never ACK a result that the
 application cannot reconstruct.
+The ACK response echoes the exact handle. Its `applied` field is the current
+linearizable observation and can advance after unrelated writes or elections;
+`collection_rounds` counts this invocation's work and is zero on a completed
+retry. These observations are not part of the durable ACK identity.
 
 ## Operation classes
 

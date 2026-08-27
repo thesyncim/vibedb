@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
@@ -180,7 +181,9 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 			}
 			if executionpin.ValidateSideEffectFence(lease, read.Record, read.Applied) == nil {
 				if !durableRequestPinControllerMatches(lease, principal) {
-					return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
+					return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
+						fmt.Errorf("%w: live execution pin belongs to another controller (applied=%d through=%d epoch=%d)",
+							ErrDurableRequestConflict, read.Applied, lease.LeaseAppliedThrough, lease.ControllerEpoch)
 				}
 				return route, acquire, lease, nil
 			}
