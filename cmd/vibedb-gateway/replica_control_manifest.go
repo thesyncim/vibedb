@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
+	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -31,6 +33,7 @@ type persistedGatewayReplicaControlManifest struct {
 	ShardEndpoints   []persistedGatewayShardControlEndpoint `json:"shard_endpoints"`
 	GatewayEndpoints []persistedGatewayControlEndpoint      `json:"gateway_endpoints"`
 	Candidates       []persistedGatewayReplacementCandidate `json:"candidates"`
+	SplitTemplate    persistedGatewaySplitTemplate          `json:"split_template"`
 }
 
 type persistedGatewayReplicaTLS struct {
@@ -53,6 +56,17 @@ type persistedGatewayReplicaBounds struct {
 type persistedGatewayShardControlEndpoint struct {
 	Node           string `json:"node"`
 	ControlAddress string `json:"control_address"`
+	SplitChildRoot string `json:"split_child_root"`
+}
+
+type persistedGatewaySplitTemplate struct {
+	MaxSessions   uint64            `json:"max_sessions"`
+	RetryWindow   uint16            `json:"retry_window"`
+	TxnLimits     durable.TxnLimits `json:"txn_limits"`
+	Format        uint16            `json:"format"`
+	ShardKey      string            `json:"shard_key"`
+	TupleVersion  uint16            `json:"tuple_version"`
+	MapperVersion uint16            `json:"mapper_version"`
 }
 
 type persistedGatewayControlEndpoint struct {
@@ -75,13 +89,15 @@ type gatewayReplicaTLSReferences struct {
 }
 
 type gatewayReplicaControlManifest struct {
-	Generation uint64
-	Local      gatewayControlEndpoint
-	TLS        gatewayReplicaTLSReferences
-	Bounds     persistedGatewayReplicaBounds
-	Shards     []gateway.ReplicatedEndpoint
-	Gateways   []gatewayControlEndpoint
-	Candidates []gatewayReplicaCandidate
+	Generation      uint64
+	Local           gatewayControlEndpoint
+	TLS             gatewayReplicaTLSReferences
+	Bounds          persistedGatewayReplicaBounds
+	Shards          []gateway.ReplicatedEndpoint
+	SplitChildRoots []string
+	Gateways        []gatewayControlEndpoint
+	Candidates      []gatewayReplicaCandidate
+	SplitTemplate   persistedGatewaySplitTemplate
 }
 
 type gatewayReplicaCandidate struct {
@@ -126,25 +142,31 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 		return gatewayReplicaControlManifest{}, errors.Join(err, errGatewayReplicaControlManifest)
 	}
 	manifest := gatewayReplicaControlManifest{Generation: persisted.Generation,
-		Bounds: persisted.Bounds, TLS: gatewayReplicaTLSReferences{
+		SplitTemplate: persisted.SplitTemplate,
+		Bounds:        persisted.Bounds, TLS: gatewayReplicaTLSReferences{
 			Certificate: persisted.TLS.Certificate, Key: persisted.TLS.Key,
 			Roots: persisted.TLS.Roots, IdentityOID: persisted.TLS.IdentityOID,
 			AuthorizationPolicy: persisted.TLS.AuthorizationPolicy,
 		}}
 	if manifest.Generation == 0 || !validGatewayReplicaTLSReferences(manifest.TLS) ||
 		!validGatewayReplicaBounds(manifest.Bounds) || len(persisted.ShardEndpoints) == 0 ||
-		len(persisted.GatewayEndpoints) == 0 || len(persisted.Candidates) == 0 {
+		len(persisted.GatewayEndpoints) == 0 || len(persisted.Candidates) == 0 ||
+		!validGatewaySplitTemplate(manifest.SplitTemplate) {
 		return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 	}
 	manifest.Shards = make([]gateway.ReplicatedEndpoint, len(persisted.ShardEndpoints))
+	manifest.SplitChildRoots = make([]string, len(persisted.ShardEndpoints))
 	shardAddresses := make(map[string]struct{}, len(persisted.ShardEndpoints))
 	for index, encoded := range persisted.ShardEndpoints {
 		node, parseErr := parseGatewayReplicaNode(encoded.Node)
-		if parseErr != nil || !validGatewayReplicaAddress(encoded.ControlAddress) {
+		if parseErr != nil || !validGatewayReplicaAddress(encoded.ControlAddress) ||
+			!filepath.IsAbs(encoded.SplitChildRoot) || filepath.Clean(encoded.SplitChildRoot) != encoded.SplitChildRoot ||
+			encoded.SplitChildRoot == string(filepath.Separator) {
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 		}
 		manifest.Shards[index] = gateway.ReplicatedEndpoint{Node: node,
 			ControlAddress: strings.Clone(encoded.ControlAddress)}
+		manifest.SplitChildRoots[index] = strings.Clone(encoded.SplitChildRoot)
 		if index != 0 && bytes.Compare(manifest.Shards[index-1].Node[:], node[:]) >= 0 {
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 		}
@@ -189,6 +211,14 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 		}
 	}
 	return manifest, nil
+}
+
+func validGatewaySplitTemplate(template persistedGatewaySplitTemplate) bool {
+	return template.MaxSessions != 0 && template.RetryWindow != 0 &&
+		template.TxnLimits.MaxCollections > 0 && template.TxnLimits.MaxDocuments > 0 &&
+		template.TxnLimits.MaxBytes > 0 && template.ShardKey != "" &&
+		template.TupleVersion == uint16(distribution.CurrentTupleVersion) &&
+		template.MapperVersion == uint16(distribution.NativeMapperVersion)
 }
 
 func validGatewayReplicaTLSReferences(references gatewayReplicaTLSReferences) bool {

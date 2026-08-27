@@ -344,6 +344,13 @@ func (snapshot *Snapshot) replicatedTableProfiles() []ReplicatedTableProfile {
 	return profiles
 }
 
+// ReplicatedTableProfiles returns the detached portable table/schema directory
+// used by cold topology allocation. Replica-local SQL storage names and LogIDs
+// are intentionally absent.
+func (snapshot *Snapshot) ReplicatedTableProfiles() []ReplicatedTableProfile {
+	return snapshot.replicatedTableProfiles()
+}
+
 func validateReplicatedTableTransition(current, next *Snapshot) error {
 	if current == nil || len(current.replicatedTables) == 0 {
 		return nil

@@ -122,7 +122,8 @@ func (preparer *rf3ChildPreparer) matchesLocalTarget(
 		string(target.Endpoint) != preparer.peer || string(target.ControlEndpoint) != preparer.control ||
 		(preparer.native == "" || string(target.NativeEndpoint) != preparer.native) ||
 		target.WAL.MemberID != target.Member || target.WAL.StoreID != target.StoreID ||
-		target.SQL.Binding.MemberID != target.Member || target.SQL.Binding.StoreID != target.StoreID {
+		target.SQL.Binding.MemberID != target.Member || target.SQL.Binding.StoreID != target.StoreID ||
+		!rf3SplitChildTemplateMatchesRetained(preparer.registry.template, target.SQL, target.Apply) {
 		return false
 	}
 	for _, member := range preparer.registry.template.Members[:preparer.registry.template.MemberCount] {

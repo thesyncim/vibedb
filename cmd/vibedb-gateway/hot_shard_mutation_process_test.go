@@ -533,10 +533,11 @@ func hotMutationControlManifest(t *testing.T, nodes [5]rafttransport.NodeID,
 			Incarnation: 1, ControlAddress: gatewayControl}},
 		Candidates: []persistedGatewayReplacementCandidate{{Member: 4, Node: fmt.Sprintf("%x", nodes[3]),
 			Store: fmt.Sprintf("%x", identities[3].StoreID), NodeIncarnation: 44,
-			Endpoint: "fixture-g0-target-data"}}}
+			Endpoint: "fixture-g0-target-data"}}, SplitTemplate: gatewaySplitTemplateFixture()}
 	for member := 0; member < 4; member++ {
 		manifest.ShardEndpoints = append(manifest.ShardEndpoints, persistedGatewayShardControlEndpoint{
-			Node: fmt.Sprintf("%x", nodes[member]), ControlAddress: listeners[member].Control})
+			Node: fmt.Sprintf("%x", nodes[member]), ControlAddress: listeners[member].Control,
+			SplitChildRoot: filepath.Join(os.TempDir(), fmt.Sprintf("vibedb-hot-split-%x", nodes[member]))})
 	}
 	raw, err := vibejson.Marshal(&manifest)
 	if err != nil {

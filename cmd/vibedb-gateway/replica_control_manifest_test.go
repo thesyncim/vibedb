@@ -4,11 +4,22 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rebalance"
+	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
+
+func gatewaySplitTemplateFixture() persistedGatewaySplitTemplate {
+	return persistedGatewaySplitTemplate{
+		MaxSessions: 32, RetryWindow: 8,
+		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
+		ShardKey:  "id", TupleVersion: uint16(distribution.CurrentTupleVersion),
+		MapperVersion: uint16(distribution.NativeMapperVersion),
+	}
+}
 
 func gatewayReplicaManifestFixture(t testing.TB) ([]byte, persistedGatewayReplicaControlManifest) {
 	t.Helper()
@@ -20,10 +31,10 @@ func gatewayReplicaManifestFixture(t testing.TB) ([]byte, persistedGatewayReplic
 		Bounds: persistedGatewayReplicaBounds{MaxConnections: 32, MaxHandshakes: 8,
 			MaxConcurrentDrains: 4, ControllerInterval: 100, ReadTimeout: 1000, WriteTimeout: 1000},
 		ShardEndpoints: []persistedGatewayShardControlEndpoint{
-			{Node: "0a000000000000000000000000000000", ControlAddress: "127.0.0.1:7201"},
-			{Node: "0b000000000000000000000000000000", ControlAddress: "127.0.0.1:7202"},
-			{Node: "1f000000000000000000000000000000", ControlAddress: "127.0.0.1:7203"},
-			{Node: "20000000000000000000000000000000", ControlAddress: "127.0.0.1:7204"}},
+			{Node: "0a000000000000000000000000000000", ControlAddress: "127.0.0.1:7201", SplitChildRoot: "/srv/vibedb/a/split-children"},
+			{Node: "0b000000000000000000000000000000", ControlAddress: "127.0.0.1:7202", SplitChildRoot: "/srv/vibedb/b/split-children"},
+			{Node: "1f000000000000000000000000000000", ControlAddress: "127.0.0.1:7203", SplitChildRoot: "/srv/vibedb/c/split-children"},
+			{Node: "20000000000000000000000000000000", ControlAddress: "127.0.0.1:7204", SplitChildRoot: "/srv/vibedb/d/split-children"}},
 		GatewayEndpoints: []persistedGatewayControlEndpoint{
 			{Node: "01000000000000000000000000000000", Incarnation: 11, ControlAddress: "127.0.0.1:7101"},
 			{Node: "02000000000000000000000000000000", Incarnation: 12, ControlAddress: "127.0.0.1:7102"}},
@@ -32,6 +43,7 @@ func gatewayReplicaManifestFixture(t testing.TB) ([]byte, persistedGatewayReplic
 				NodeIncarnation: 41, Endpoint: "candidate-a", Load: 2},
 			{Member: 32, Node: "20000000000000000000000000000000", Store: "2a000000000000000000000000000000",
 				NodeIncarnation: 42, Endpoint: "candidate-b", Load: 3}},
+		SplitTemplate: gatewaySplitTemplateFixture(),
 	}
 	raw, err := vibejson.Marshal(&manifest)
 	if err != nil {
