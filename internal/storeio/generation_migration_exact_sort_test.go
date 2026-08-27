@@ -77,3 +77,74 @@ func TestGenerationMigrationExactRunBuilderBoundsAndCoalescesWindows(t *testing.
 		t.Fatalf("coalesced first = %+v ok=%v", first, ok)
 	}
 }
+
+func TestMergeGenerationMigrationExactRunsFixedFanIn(t *testing.T) {
+	sink := &migrationExactMemorySink{storeID: testStoreID, generation: 9, nextID: 100, nextAt: 64 << 10, pages: make(map[PageRef][]byte)}
+	builder, err := NewGenerationMigrationExactRunBuilder(sink, 4096, 3, IndexTermMaxKeyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := migrationExactRunKey(t, `"a"`)
+	b := migrationExactRunKey(t, `"b"`)
+	input := []GenerationMigrationExactRunRecord{
+		{IndexID: 1, Key: b, TileID: 3, Mask: 1},
+		{IndexID: 0, Key: a, TileID: 2, Mask: 2},
+		{IndexID: 0, Key: b, TileID: 1, Mask: 8},
+		{IndexID: 0, Key: a, TileID: 2, Mask: 4},
+		{IndexID: 0, Key: a, TileID: 0, Mask: 16},
+		{IndexID: 1, Key: a, TileID: 0, Mask: 32},
+		{IndexID: 1, Key: b, TileID: 0, Mask: 64},
+	}
+	for _, record := range input {
+		if err := builder.Add(record.IndexID, record.Key, record.TileID, record.Mask); err != nil {
+			t.Fatal(err)
+		}
+	}
+	region, err := builder.Finish()
+	if err != nil || region.Runs != 3 {
+		t.Fatalf("initial region=%+v err=%v", region, err)
+	}
+	read := func(ref PageRef, dst []byte) error {
+		image := sink.pages[ref]
+		if len(image) != len(dst) {
+			return ErrGenerationMigrationManifestCorrupt
+		}
+		copy(dst, image)
+		return nil
+	}
+	merged, err := MergeGenerationMigrationExactRuns(sink, read, region, 4096, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Runs != 1 || merged.Pages == 0 {
+		t.Fatalf("merged=%+v", merged)
+	}
+	var got []GenerationMigrationExactRunRecord
+	for pageAt := uint64(0); pageAt < merged.Pages; pageAt++ {
+		ref, ok := merged.RefAt(pageAt)
+		if !ok {
+			t.Fatal("merged ref")
+		}
+		view, err := OpenGenerationMigrationExactRunPage(sink.pages[ref], ref, sink.storeID, sink.generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		it := view.Iterator()
+		for {
+			record, ok := it.Next()
+			if !ok {
+				break
+			}
+			record.Key = append([]byte(nil), record.Key...)
+			got = append(got, record)
+		}
+	}
+	if len(got) != 6 || got[1].IndexID != 0 || got[1].TileID != 2 || got[1].Mask != 6 {
+		t.Fatalf("merged records=%+v", got)
+	}
+	for index := 1; index < len(got); index++ {
+		if compareGenerationMigrationExactRunRecord(got[index-1], got[index]) >= 0 {
+			t.Fatalf("unordered at %d", index)
+		}
+	}
+}
