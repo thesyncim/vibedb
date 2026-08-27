@@ -317,7 +317,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	closePrepared := func(cause error) error { return closePreparedRF3Groups(preparedSet.groups, cause) }
 	first := &preparedSet.groups[0]
-	base, apply := first.base, first.apply
+	base := first.base
 	group := groupFromBinding(base.Binding)
 	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
 	nativeConfigured := preparedSet.nativeConfigured
@@ -363,8 +363,15 @@ func servePreparedRF3WithExecutionLanes(
 		)
 	}
 	defer controlListener.Close()
-	sourceEligible := manifest.EnrolledTarget != nil &&
-		base.Binding.MemberID != manifest.EnrolledTarget.MemberID
+	sourceEligible := false
+	for index := range preparedSet.groups {
+		item := &preparedSet.groups[index]
+		if target := item.manifest.EnrolledTarget; target != nil &&
+			item.base.Binding.MemberID != target.MemberID {
+			sourceEligible = true
+			break
+		}
+	}
 	var snapshotListener net.Listener
 	if sourceEligible {
 		snapshotListener, err = listen("tcp", manifest.Listeners.Snapshot)
@@ -396,6 +403,7 @@ func servePreparedRF3WithExecutionLanes(
 	commands := make([]raftservice.CommandFence, 0, len(preparedSet.groups))
 	readSources := make([]raftservice.ReadSource, 0, len(preparedSet.groups))
 	recoverySources := make([]raftservice.TransactionRecoverySource, 0, len(preparedSet.groups))
+	publications := make([]raftmodel.Publication, 0, len(preparedSet.groups))
 	closeAdopted := func(cause error) error {
 		for _, runtime := range runtimes {
 			cause = errors.Join(cause, runtime.Close())
@@ -427,11 +435,11 @@ func servePreparedRF3WithExecutionLanes(
 		}
 		identity := runtime.Identity()
 		identities = append(identities, identity)
+		publications = append(publications, runtimePublication)
 		commands = append(commands, commandFenceFromPublication(item.base.Binding.Authority, identity, runtimePublication.ReplicaSetVersion))
 		readSources = append(readSources, item.apply)
 		recoverySources = append(recoverySources, item.apply)
 	}
-	runtimeIdentity := identities[0]
 	runtimePublication, _ := runtimes[0].Publication()
 
 	servingRegistry, err := raftserve.NewRegistry(rf3RegistryLimitsForGroups(len(runtimes)))
@@ -567,10 +575,20 @@ func servePreparedRF3WithExecutionLanes(
 		return err
 	}
 	var sourceControl shardcontrol.Handler
-	var sourceData *snapshottransfer.Service
+	var sourceData shardcontrol.Handler
 	var snapshotTLS *servicetls.Server
-	if target := manifest.EnrolledTarget; target != nil &&
-		runtimeIdentity.MemberID != target.MemberID {
+	dataServices := make([]snapshottransfer.GroupDataService, 0, len(preparedSet.groups))
+	controlServices := make([]snapshottransfer.GroupSourceControlService, 0, len(preparedSet.groups))
+	targetNodes := make([]rafttransport.NodeID, 0, len(preparedSet.groups))
+	for index := range preparedSet.groups {
+		item := &preparedSet.groups[index]
+		target := item.manifest.EnrolledTarget
+		groupIdentity := identities[index]
+		publication := publications[index]
+		itemGroup := groupIdentity.Group
+		if target == nil || groupIdentity.MemberID == target.MemberID {
+			continue
+		}
 		if policy.Check(target.NodeID, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
 			retireCtx, retire := context.WithCancelCause(context.Background())
 			retire(context.Canceled)
@@ -579,7 +597,7 @@ func servePreparedRF3WithExecutionLanes(
 				componentShutdownError(peerErr), servingRegistry.Close())
 		}
 		sourceJournal, openErr := snapshottransfer.OpenSourceFileJournal(
-			manifest.ReplicaControl.SourceJournalPath,
+			rf3SnapshotGroupPath(manifest.ReplicaControl.SourceJournalPath, itemGroup, len(preparedSet.groups) > 1),
 			manifest.ReplicaControl.MaxSourceRecords,
 		)
 		if openErr != nil {
@@ -588,11 +606,13 @@ func servePreparedRF3WithExecutionLanes(
 			peerErr := peer.Run(retireCtx)
 			return errors.Join(openErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
-		defer func() { resultErr = errors.Join(resultErr, sourceJournal.Close()) }()
+		defer func(journal *snapshottransfer.SourceFileJournal) {
+			resultErr = errors.Join(resultErr, journal.Close())
+		}(sourceJournal)
 		provider, providerErr := snapshottransfer.OpenRetainedSourceExportProvider(
 			snapshottransfer.RetainedSourceExportOptions{
 				DataRoot:       manifest.ReplicaControl.SourceDataRoot,
-				RepositoryPath: manifest.ReplicaControl.SourceRepositoryPath,
+				RepositoryPath: rf3SnapshotGroupPath(manifest.ReplicaControl.SourceRepositoryPath, itemGroup, len(preparedSet.groups) > 1),
 				Limits: snapshottransfer.Limits{
 					MaxArtifacts:     manifest.ReplicaControl.MaxSourceArtifacts,
 					MaxArtifactBytes: manifest.ReplicaControl.MaxSourceArtifactBytes,
@@ -600,10 +620,10 @@ func servePreparedRF3WithExecutionLanes(
 				},
 				ChunkBytes:      manifest.ReplicaControl.SourceChunkBytes,
 				MaxConcurrent:   manifest.ReplicaControl.MaxSourceConcurrent,
-				RuntimeIdentity: runtimeIdentity,
+				RuntimeIdentity: groupIdentity,
 				SourceNode:      profile.LocalIdentity().Node,
 				TargetMember:    target.MemberID, TargetStore: target.StoreID,
-				TargetIncarnation: target.NodeIncarnation, Cut: apply,
+				TargetIncarnation: target.NodeIncarnation, Cut: item.apply,
 			},
 		)
 		if providerErr != nil {
@@ -612,17 +632,19 @@ func servePreparedRF3WithExecutionLanes(
 			peerErr := peer.Run(retireCtx)
 			return errors.Join(providerErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
-		defer func() { resultErr = errors.Join(resultErr, provider.Close()) }()
+		defer func(provider *snapshottransfer.RetainedSourceExportProvider) {
+			resultErr = errors.Join(resultErr, provider.Close())
+		}(provider)
 		sourceService, serviceErr := snapshottransfer.NewSourceControlService(
 			snapshottransfer.SourceControlOptions{
 				Journal:  sourceJournal,
 				Exporter: snapshottransfer.PinnedSourceControlExporter{Provider: provider},
-				Authorize: func(identity rafttransport.PeerIdentity, request snapshottransfer.SourceControlRequest) bool {
-					return request.Group == group && request.SourceMember == runtimeIdentity.MemberID &&
+				Authorize: func(peerIdentity rafttransport.PeerIdentity, request snapshottransfer.SourceControlRequest) bool {
+					return request.Group == itemGroup && request.SourceMember == groupIdentity.MemberID &&
 						request.SourceNode == profile.LocalIdentity().Node &&
 						request.TargetMember == target.MemberID && request.TargetStore == target.StoreID &&
 						request.TargetIncarnation == target.NodeIncarnation &&
-						policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+						policy.Check(peerIdentity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
 				},
 				ReadDeadline: deadline, WriteDeadline: deadline,
 				MaxConcurrent: manifest.ReplicaControl.MaxSourceConcurrent,
@@ -634,37 +656,65 @@ func servePreparedRF3WithExecutionLanes(
 			peerErr := peer.Run(retireCtx)
 			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
-		sourceControl = sourceService
-		snapshotAuthorizer, authorizerErr := servicetls.NewNodeAuthorizer(
-			[]rafttransport.NodeID{target.NodeID},
-		)
-		if authorizerErr != nil {
+		controlServices = append(controlServices, snapshottransfer.GroupSourceControlService{
+			Group: itemGroup, Service: sourceService,
+		})
+		dataService, serviceErr := provider.NewDataService(snapshottransfer.ServiceOptions{
+			Registry: transportRegistry,
+			Authorize: func(descriptor snapshottransfer.Descriptor) bool {
+				return descriptor.Group == itemGroup &&
+					descriptor.SourceMember == groupIdentity.MemberID &&
+					descriptor.TargetMember == target.MemberID &&
+					descriptor.TargetStore == target.StoreID &&
+					descriptor.TargetIncarnation == target.NodeIncarnation &&
+					descriptor.SchemaGeneration == item.base.Binding.Authority.SchemaGeneration &&
+					descriptor.ReplicaSetVersion == publication.ReplicaSetVersion
+			},
+			ReadDeadline: deadline, WriteDeadline: deadline,
+			MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
+			MaxChunkBytes:  manifest.ReplicaControl.SourceChunkBytes,
+			MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
+				int64(manifest.ReplicaControl.MaxSourceConcurrent),
+		})
+		if serviceErr != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
 			retire(context.Canceled)
 			peerErr := peer.Run(retireCtx)
-			return errors.Join(authorizerErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
-		snapshotTLS, serviceErr = servicetls.NewServer(
-			profile, rafttransport.TrafficSnapshot, snapshotAuthorizer,
+		dataServices = append(dataServices, snapshottransfer.GroupDataService{
+			Group: itemGroup, Service: dataService,
+		})
+		targetNodes = append(targetNodes, target.NodeID)
+	}
+	if len(dataServices) != 0 {
+		var serviceErr error
+		sourceControl, serviceErr = snapshottransfer.NewGroupSourceControlRegistry(
+			snapshottransfer.GroupSourceControlRegistryOptions{
+				Registry: transportRegistry, Services: controlServices,
+				ReadDeadline: deadline, MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
+			},
 		)
 		if serviceErr == nil {
-			sourceData, serviceErr = provider.NewDataService(snapshottransfer.ServiceOptions{
-				Registry: transportRegistry,
-				Authorize: func(descriptor snapshottransfer.Descriptor) bool {
-					return descriptor.Group == group &&
-						descriptor.SourceMember == runtimeIdentity.MemberID &&
-						descriptor.TargetMember == target.MemberID &&
-						descriptor.TargetStore == target.StoreID &&
-						descriptor.TargetIncarnation == target.NodeIncarnation &&
-						descriptor.SchemaGeneration == base.Binding.Authority.SchemaGeneration &&
-						descriptor.ReplicaSetVersion == runtimePublication.ReplicaSetVersion
+			sourceData, serviceErr = snapshottransfer.NewGroupDataRegistry(
+				snapshottransfer.GroupDataRegistryOptions{
+					Registry: transportRegistry, Services: dataServices,
+					ReadDeadline: deadline, MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
+					MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
+						int64(manifest.ReplicaControl.MaxSourceConcurrent),
 				},
-				ReadDeadline: deadline, WriteDeadline: deadline,
-				MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
-				MaxChunkBytes:  manifest.ReplicaControl.SourceChunkBytes,
-				MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
-					int64(manifest.ReplicaControl.MaxSourceConcurrent),
-			})
+			)
+		}
+		slices.SortFunc(targetNodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
+		targetNodes = slices.Compact(targetNodes)
+		var snapshotAuthorizer *servicetls.NodeAuthorizer
+		if serviceErr == nil {
+			snapshotAuthorizer, serviceErr = servicetls.NewNodeAuthorizer(targetNodes)
+		}
+		if serviceErr == nil {
+			snapshotTLS, serviceErr = servicetls.NewServer(
+				profile, rafttransport.TrafficSnapshot, snapshotAuthorizer,
+			)
 		}
 		if serviceErr != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
@@ -1070,9 +1120,6 @@ func validateRF3Addresses(manifest rf3Manifest) error {
 			}
 		}
 		if target := bundle.EnrolledTarget; target != nil {
-			if len(manifest.Groups) > 1 {
-				return fmt.Errorf("%w: multi-group enrolled targets require per-group snapshot listeners", errRF3Serving)
-			}
 			for _, address := range [...]string{target.PeerAddress, target.NativeAddress, target.SnapshotAddress, target.ControlAddress} {
 				if err := validateRF3Address(address, false); err != nil {
 					return err
