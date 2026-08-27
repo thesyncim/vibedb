@@ -56,6 +56,33 @@ type RetainedSourceExportProvider struct {
 	closed bool
 }
 
+// InstallAbandonmentExitFaultForQualification installs one deterministic
+// external-process crash cut. It is intentionally unavailable through serving
+// manifests; callers must opt in through the qualification-only command path.
+func (provider *RetainedSourceExportProvider) InstallAbandonmentExitFaultForQualification(
+	phase string, exit func(),
+) bool {
+	if provider == nil || exit == nil || (phase != "after_rename" && phase != "after_unlink") {
+		return false
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.closed || provider.repository == nil || provider.repository.fault != nil {
+		return false
+	}
+	wanted := faultAfterAbandonRename
+	if phase == "after_unlink" {
+		wanted = faultAfterAbandonUnlink
+	}
+	provider.repository.fault = func(got repositoryFault) error {
+		if got == wanted {
+			exit()
+		}
+		return nil
+	}
+	return true
+}
+
 // NewDataService binds the snapshot data plane to the exact repository owned
 // by this retained source provider. Keeping repository ownership private makes
 // it impossible for the shipped source-control and data listeners to drift to

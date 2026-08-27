@@ -8,6 +8,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,8 +27,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/rebalanceexec"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -185,6 +190,8 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	firstAbandonment := replicaProcessSeedAbandonment(t, root, group, identities[0], target,
+		nodes[0], 0xa1)
 	cold, err := rf3testfixture.PrepareColdProcessTarget(
 		rf3testfixture.ProcessMemberOptions{
 			Root: filepath.Join(root, "member-4"), Table: gateway.ReplicatedCatalogTable,
@@ -222,6 +229,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	for index := range voters {
 		voters[index] = &rf3testfixture.ExternalProcess{Binary: shardBinary,
 			Args: []string{"serve-rf3", "-manifest", prepared[index].ManifestPath}}
+		if index == 0 {
+			voters[index].Env = append(os.Environ(), "VIBEDB_REPLICA_REPLACEMENT_E2E=1",
+				"VIBEDB_QUALIFICATION_ABANDON_CRASH=after_rename")
+		}
 		if err = voters[index].Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -243,6 +254,15 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		t.Fatalf("cold target readiness: %v\n%s", err, coldTarget.Diagnostics())
 	}
 	phase = "cold_target_ready"
+	profile, err := servicetls.LoadProfile(credentials[4].Certificate, credentials[4].Key,
+		roots, rf3testfixture.ProcessIdentityOID, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogAuthority, closeCatalogAuthority := replicaProcessCatalogAuthority(t, profile, snapshot,
+		filepath.Join(root, "abandonment-catalog-session"))
+	defer closeCatalogAuthority()
+	replicaProcessPublishAbandonment(t, ctx, catalogAuthority, snapshot.Generation(), firstAbandonment)
 	gatewayProcess := replicaProcessGateway(gatewayBinary, catalogPath, gatewayNative,
 		replicaManifestPath, credentials[4], roots, policyPath, ackPath,
 		filepath.Join(root, "gateway-session"), listeners, nodes)
@@ -269,6 +289,42 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			<-metricDone
 		}
 	}()
+	measurements.abandonmentControlBytes += snapshottransfer.SourceControlRequestBytes +
+		snapshottransfer.AbandonmentWitnessBytes + snapshottransfer.SourceControlResponseBytes
+	measurements.abandonRenameMillis = replicaProcessSettleAbandonmentCrash(t, ctx, "after_rename",
+		root, voters[0], gatewayProcess, catalogAuthority, firstAbandonment.Operation)
+
+	// Re-arm the second durable cut only while both source and gateway are
+	// stopped, so no process-local cursor or open repository can participate.
+	if err = gatewayProcess.Kill(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = voters[0].Kill(ctx); err != nil {
+		t.Fatal(err)
+	}
+	secondAbandonment := replicaProcessSeedAbandonment(t, root, group, identities[0], target,
+		nodes[0], 0xa2)
+	voters[0].Env = append(os.Environ(), "VIBEDB_REPLICA_REPLACEMENT_E2E=1",
+		"VIBEDB_QUALIFICATION_ABANDON_CRASH=after_unlink")
+	if err = voters[0].Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err = voters[0].WaitReady(ctx, "vibedb-shard RF3 ready"); err != nil {
+		t.Fatal(err)
+	}
+	replicaProcessPublishAbandonment(t, ctx, catalogAuthority, snapshot.Generation(), secondAbandonment)
+	if err = gatewayProcess.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
+		t.Fatal(err)
+	}
+	measurements.abandonmentControlBytes += snapshottransfer.SourceControlRequestBytes +
+		snapshottransfer.AbandonmentWitnessBytes + snapshottransfer.SourceControlResponseBytes
+	measurements.abandonUnlinkMillis = replicaProcessSettleAbandonmentCrash(t, ctx, "after_unlink",
+		root, voters[0], gatewayProcess, catalogAuthority, secondAbandonment.Operation)
+	measurements.abandonmentRetainedBytes = replicaProcessRetainedAbandonmentBytes(root)
+	phase = "abandonment_crash_reopen_verified"
 	started := time.Now()
 	if err = voters[0].Kill(ctx); err != nil {
 		t.Fatal(err)
@@ -585,6 +641,66 @@ func replicaProcessRosterContains(descriptor gateway.ReplicatedShardDescriptor, 
 	return false
 }
 
+func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
+	snapshot *gateway.Snapshot, journalPath string,
+) (*gateway.ReplicatedCatalogAuthority, func()) {
+	t.Helper()
+	client, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
+		TLS: profile, Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
+		MaxConnections: 16, MaxPerEndpoint: 8, MaxIdlePerEndpoint: 4, MaxHandshakes: 4,
+		MaxWaiters: 32, MaxIdleAge: time.Minute, MaxLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := gateway.NewReplicatedExecutor(client, 8, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := snapshot.ResolveReplicatedRoute(gateway.ReplicatedCatalogDistribution,
+		gateway.ReplicatedCatalogShard, replicas[:0])
+	if !ok {
+		t.Fatal("resolve catalog route")
+	}
+	binding, err := gateway.NativeSessionJournalBinding(route, string(route.Distribution),
+		string(route.Shard), []byte{1}, 1, serviceauthz.CapabilityTopology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := gateway.OpenNativeSessionJournal(gateway.NativeSessionJournalOptions{
+		Path: journalPath, ClientID: replication.ID128{0xc1}, RetryHome: replication.RetryHome{0xd1},
+		MaxCommandBytes: replication.MaxCommandBytes, Binding: binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
+		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
+		Tenant: []byte{1}, ClientID: replication.ID128{0xc1}, RetryHome: replication.RetryHome{0xd1},
+		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
+		ProposalCapability: serviceauthz.CapabilityTopology})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: 5}
+	authenticated, err := serviceauthz.WithAuthority(t.Context(), identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(authenticated, time.Now().Add(time.Hour).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
+		Executor: executor, Route: route, Relation: 1, Holder: gateway.NewCatalogHolder(snapshot),
+		Session: session, Authority: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authority, func() { _ = client.Close() }
+}
+
 func replicaProcessArtifactsEmpty(path string) bool {
 	entries, err := os.ReadDir(path)
 	return errors.Is(err, os.ErrNotExist) || err == nil && len(entries) == 0
@@ -600,15 +716,150 @@ func replicaProcessAllArtifactsEmpty(root string) bool {
 	return true
 }
 
+func replicaProcessSeedAbandonment(t testing.TB, root string, group raftmember.GroupKey,
+	identity raftstore.Identity, target rf3testfixture.ProcessTarget,
+	source rafttransport.NodeID, operationByte byte,
+) snapshottransfer.ArtifactAbandonmentWitness {
+	t.Helper()
+	payload := make([]byte, 2<<20)
+	for index := range payload {
+		payload[index] = byte(index) ^ operationByte
+	}
+	descriptor := snapshottransfer.Descriptor{Group: group, SourceMember: identity.MemberID,
+		TargetMember: target.MemberID, TargetStore: target.StoreID,
+		TargetIncarnation: target.NodeIncarnation, SchemaGeneration: 13,
+		ReplicaSetVersion: 1, SnapshotIndex: 1, SnapshotTerm: 1,
+		Lineage: sha256.Sum256([]byte{operationByte, 0x71}), ArtifactHash: sha256.Sum256(payload),
+		ArtifactBytes: uint64(len(payload)), ChunkBytes: 1 << 20}
+	request := snapshottransfer.SourceControlRequest{Operation: [32]byte{operationByte},
+		Step: [32]byte{operationByte, 0x52}, Group: group, SourceMember: identity.MemberID,
+		TargetMember: target.MemberID, TargetStore: target.StoreID,
+		TargetIncarnation: target.NodeIncarnation, ReplicaSetVersion: 1, SourceNode: source}
+	memberRoot := filepath.Join(root, "member-1")
+	repository, err := snapshottransfer.OpenRepository(filepath.Join(memberRoot, "source-artifacts"),
+		snapshottransfer.Limits{MaxArtifacts: 8, MaxArtifactBytes: 1 << 30, MaxDiskBytes: 4 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := payload[:1<<20]
+	if _, _, err = repository.Append(descriptor, 0, chunk, sha256.Sum256(chunk)); err != nil {
+		_ = repository.Close()
+		t.Fatal(err)
+	}
+	if err = repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := snapshottransfer.OpenSourceFileJournal(filepath.Join(memberRoot, "source-exports"), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = journal.PublishSourceExport(context.Background(), 0, snapshottransfer.SourceControlRecord{
+		Request: request, Revision: 1, State: snapshottransfer.SourceControlRunning,
+	}); err != nil {
+		_ = journal.Close()
+		t.Fatal(err)
+	}
+	if err = journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return snapshottransfer.ArtifactAbandonmentWitness{Operation: request.Operation, Step: request.Step,
+		Artifact: descriptor.ArtifactHash, TargetStore: descriptor.TargetStore,
+		TargetIncarnation: descriptor.TargetIncarnation, SchemaGeneration: descriptor.SchemaGeneration,
+		ReplicaSetVersion: descriptor.ReplicaSetVersion, Owner: source, Descriptor: descriptor}
+}
+
+func replicaProcessPublishAbandonment(t testing.TB, ctx context.Context,
+	authority *gateway.ReplicatedCatalogAuthority, generation uint64,
+	witness snapshottransfer.ArtifactAbandonmentWitness,
+) {
+	t.Helper()
+	intent := []byte("{}")
+	record := gateway.ReplicatedOperationRecord{ID: witness.Operation,
+		Kind: gateway.ReplicatedOperationMove, State: gateway.ReplicatedOperationPlanned,
+		Revision: 1, CatalogGeneration: generation, Cursor: [8]uint64{1},
+		Proof:        sha256.Sum256([]byte{witness.Operation[0], 0x63}),
+		IntentDigest: sha256.Sum256(intent), Intent: intent}
+	if err := authority.SubmitOperation(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (rebalanceexec.CatalogAbandonmentAuthority{Journal: authority}).Publish(
+		ctx, record.Revision, witness); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replicaProcessRetainedAbandonmentBytes(root string) uint64 {
+	var total uint64
+	entries, _ := os.ReadDir(filepath.Join(root, "member-1", "source-artifacts"))
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) < 2 || name[1] != '-' || !strings.Contains("scptda", name[:1]) {
+			continue
+		}
+		if info, err := entry.Info(); err == nil && info.Size() > 0 {
+			total += uint64(info.Size())
+		}
+	}
+	return total
+}
+
+func replicaProcessSettleAbandonmentCrash(t testing.TB, ctx context.Context, phase string,
+	root string, source, gatewayProcess *rf3testfixture.ExternalProcess,
+	authority *gateway.ReplicatedCatalogAuthority, operation [32]byte,
+) uint64 {
+	t.Helper()
+	started := time.Now()
+	for source.PID() != 0 {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("%s source crash timeout: %v", phase, err)
+		}
+		if time.Since(started) > 15*time.Second {
+			t.Fatalf("%s source did not crash", phase)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := gatewayProcess.Kill(ctx); err != nil {
+		t.Fatal(err)
+	}
+	source.Env = os.Environ()
+	if err := source.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.WaitReady(ctx, "vibedb-shard RF3 ready"); err != nil {
+		t.Fatalf("%s source reopen: %v\n%s", phase, err, source.Diagnostics())
+	}
+	if err := gatewayProcess.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
+		t.Fatalf("%s gateway reopen: %v\n%s", phase, err, gatewayProcess.Diagnostics())
+	}
+	for {
+		_, readErr := authority.ReadOperation(ctx, operation)
+		if errors.Is(readErr, gateway.ErrReplicatedOperationMissing) &&
+			replicaProcessRetainedAbandonmentBytes(root) == 0 {
+			break
+		}
+		if err := ctx.Err(); err != nil || time.Since(started) > 15*time.Second {
+			t.Fatalf("%s cleanup convergence err=%v retained=%d gateway=%s",
+				phase, readErr, replicaProcessRetainedAbandonmentBytes(root), gatewayProcess.Diagnostics())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return uint64(time.Since(started).Milliseconds())
+}
+
 type replicaProcessMeasurements struct {
 	mu sync.Mutex
 
-	failoverMillis, replacementMillis, cleanupMillis uint64
-	controllerRestartMillis                          uint64
-	logicalBytes                                     uint64
-	initialStorageBytes, finalStorageBytes           uint64
-	initialWALBytes, finalWALBytes                   uint64
-	maxSnapshotPayloadBytes, maxRSSBytes             uint64
+	failoverMillis, replacementMillis, cleanupMillis  uint64
+	controllerRestartMillis                           uint64
+	logicalBytes                                      uint64
+	initialStorageBytes, finalStorageBytes            uint64
+	initialWALBytes, finalWALBytes                    uint64
+	maxSnapshotPayloadBytes, maxRSSBytes              uint64
+	abandonRenameMillis, abandonUnlinkMillis          uint64
+	abandonmentControlBytes, abandonmentRetainedBytes uint64
 }
 
 func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
@@ -617,6 +868,8 @@ func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
 		cleanupMillis: 5, logicalBytes: 100, initialStorageBytes: 1_000,
 		finalStorageBytes: 2_000, initialWALBytes: 500, finalWALBytes: 700,
 		maxSnapshotPayloadBytes: 300, maxRSSBytes: 400,
+		abandonRenameMillis: 12, abandonUnlinkMillis: 13,
+		abandonmentControlBytes: 1968,
 	}
 	if err := measurements.validate(); err != nil {
 		t.Fatal(err)
@@ -662,6 +915,10 @@ func (measurements *replicaProcessMeasurements) appendTSV(raw []byte) []byte {
 		{"wal_growth_bytes", walGrowth},
 		{"storage_amplification_milli", amplification},
 		{"logical_catalog_bytes", measurements.logicalBytes},
+		{"abandonment_rename_restart_millis", measurements.abandonRenameMillis},
+		{"abandonment_unlink_restart_millis", measurements.abandonUnlinkMillis},
+		{"abandonment_control_payload_bytes", measurements.abandonmentControlBytes},
+		{"abandonment_retained_bytes", measurements.abandonmentRetainedBytes},
 	}
 	for _, metric := range metrics {
 		raw = fmt.Appendf(raw, "metric\t%s\t%d\n", metric.name, metric.value)
@@ -681,6 +938,10 @@ func (measurements *replicaProcessMeasurements) validate() error {
 		measurements.cleanupMillis == 0 || measurements.cleanupMillis > 60_000 ||
 		measurements.maxSnapshotPayloadBytes == 0 || measurements.maxSnapshotPayloadBytes > 1<<30 ||
 		measurements.maxRSSBytes == 0 || measurements.maxRSSBytes > 8<<30 ||
+		measurements.abandonRenameMillis == 0 || measurements.abandonRenameMillis > 15_000 ||
+		measurements.abandonUnlinkMillis == 0 || measurements.abandonUnlinkMillis > 15_000 ||
+		measurements.abandonmentControlBytes == 0 || measurements.abandonmentControlBytes > 4096 ||
+		measurements.abandonmentRetainedBytes != 0 ||
 		storageGrowth > 2<<30 || walGrowth > 512<<20 || measurements.logicalBytes == 0 {
 		return fmt.Errorf("replica process performance bounds: failover=%dms restart=%dms replacement=%dms cleanup=%dms snapshot=%d rss=%d storage-growth=%d wal-growth=%d logical=%d",
 			measurements.failoverMillis, measurements.controllerRestartMillis,

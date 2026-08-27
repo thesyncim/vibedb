@@ -637,6 +637,12 @@ func servePreparedRF3WithExecutionLanes(
 			peerErr := peer.Run(retireCtx)
 			return errors.Join(providerErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
+		if phase := os.Getenv("VIBEDB_QUALIFICATION_ABANDON_CRASH"); phase != "" {
+			if os.Getenv("VIBEDB_REPLICA_REPLACEMENT_E2E") != "1" ||
+				!provider.InstallAbandonmentExitFaultForQualification(phase, func() { os.Exit(97) }) {
+				return errors.Join(errRF3Serving, errors.New("invalid abandonment qualification crash cut"))
+			}
+		}
 		defer func(provider *snapshottransfer.RetainedSourceExportProvider) {
 			resultErr = errors.Join(resultErr, provider.Close())
 		}(provider)

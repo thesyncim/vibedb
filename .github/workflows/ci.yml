@@ -191,6 +191,10 @@ jobs:
           controller_restart_millis 15000
           replacement_millis 90000
           cleanup_millis 60000
+          abandonment_rename_restart_millis 15000
+          abandonment_unlink_restart_millis 15000
+          abandonment_control_payload_bytes 4096
+          abandonment_retained_bytes 0
           snapshot_network_payload_bytes 1073741824
           max_rss_bytes 8589934592
           storage_growth_bytes 2147483648
