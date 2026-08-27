@@ -68,6 +68,9 @@ func (installer GroupInstaller) Install(
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return clusterrestore.RootWitness{}, err
 	}
+	if !privateRoot(directory) {
+		return clusterrestore.RootWitness{}, ErrInstaller
+	}
 	if !privateRoot(directory) || !privateRoot(filepath.Dir(directory)) {
 		return clusterrestore.RootWitness{}, ErrInstaller
 	}
@@ -219,6 +222,13 @@ func materializeArtifact(path string, reader io.Reader, size uint64, digest [sha
 		return err
 	}
 	temporary := path + ".tmp"
+	if removeErr := os.Remove(temporary); removeErr == nil {
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(removeErr) {
+		return removeErr
+	}
 	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if os.IsExist(err) {
 		if removeErr := os.Remove(temporary); removeErr != nil {

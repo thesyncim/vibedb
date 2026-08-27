@@ -61,3 +61,29 @@ func TestArtifactSpoolRejectsWrongBoundAndExistingCorruption(t *testing.T) {
 		t.Fatal("accepted corrupt existing spool")
 	}
 }
+
+func TestArtifactSpoolRecoversTornTemporaryAndRejectsUnsafeDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte("complete-authenticated-artifact")
+	digest := sha256.Sum256(raw)
+	path := filepath.Join(root, "artifact.snap")
+	if err := os.WriteFile(path+".tmp", raw[:7], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := materializeArtifact(path, bytes.NewReader(raw), uint64(len(raw)), digest); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("spool=%q err=%v", got, err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if privateRoot(root) {
+		t.Fatal("world-readable restore directory accepted")
+	}
+}
