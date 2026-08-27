@@ -998,6 +998,16 @@ func newCatalogAuthorityFixture(t *testing.T) (
 ) {
 	t.Helper()
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	genesis, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 1, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err = initialCatalogState(genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
 	current, err := NewSnapshotWithReplicatedMetadata(
 		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
 	)
@@ -1046,6 +1056,17 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		t.Fatal(err)
 	}
 	client.rows[string(replicatedCatalogHeadWitnessKey)] = witness
+	genesisHead, err := appendReplicatedCatalogDocument(
+		nil, genesis, maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesisProof, err := appendReplicatedCatalogGenesis(nil, genesisHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(replicatedCatalogGenesisKey)] = genesisProof
 	executor, err := NewReplicatedExecutor(client, 2, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -1077,6 +1098,30 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		t.Fatal(err)
 	}
 	return authority, client, current
+}
+
+func testCatalogAuthoritySnapshot(t testing.TB, generation uint64) *Snapshot {
+	t.Helper()
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	snapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, generation, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = initialCatalogState(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func emptyCatalogAuthorityRows(client *catalogAuthorityClient) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	for key := range client.rows {
+		delete(client.rows, key)
+	}
 }
 
 func newCatalogAuthorityPeer(t *testing.T, source *ReplicatedCatalogAuthority,
@@ -1112,6 +1157,212 @@ func newCatalogAuthorityPeer(t *testing.T, source *ReplicatedCatalogAuthority,
 		t.Fatal(err)
 	}
 	return peer
+}
+
+func TestReplicatedCatalogGenesisProofIsCanonicalAndRequired(t *testing.T) {
+	authority, client, _ := newCatalogAuthorityFixture(t)
+	genesis := testCatalogAuthoritySnapshot(t, 1)
+	raw := bytes.Clone(client.rows[string(replicatedCatalogGenesisKey)])
+	if err := validateReplicatedCatalogGenesis(raw, nil); err != nil {
+		t.Fatalf("canonical genesis proof=%v", err)
+	}
+	if err := authority.AttestGenesis(context.Background(), genesis); err != nil {
+		t.Fatalf("canonical genesis attestation=%v", err)
+	}
+
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	endpoints["ep-b"] = "127.0.0.1:7999"
+	divergent, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 1, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	divergent, err = initialCatalogState(divergent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.AttestGenesis(context.Background(), divergent); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("divergent generation-one attestation=%v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		damage func(*catalogAuthorityClient)
+	}{
+		{name: "missing", damage: func(client *catalogAuthorityClient) {
+			delete(client.rows, string(replicatedCatalogGenesisKey))
+		}},
+		{name: "non-canonical", damage: func(client *catalogAuthorityClient) {
+			client.rows[string(replicatedCatalogGenesisKey)] = append(bytes.Clone(raw), ' ')
+		}},
+		{name: "corrupt", damage: func(client *catalogAuthorityClient) {
+			damaged := bytes.Clone(raw)
+			damaged[len(damaged)-1] ^= 1
+			client.rows[string(replicatedCatalogGenesisKey)] = damaged
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authority, client, _ := newCatalogAuthorityFixture(t)
+			test.damage(client)
+			if _, err := authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+				t.Fatalf("damaged genesis read=%v", err)
+			}
+		})
+	}
+}
+
+func TestReplicatedCatalogGenesisUnknownRetrySurvivesAdvanceAndRestart(t *testing.T) {
+	source, client, _ := newCatalogAuthorityFixture(t)
+	emptyCatalogAuthorityRows(client)
+	genesis := testCatalogAuthoritySnapshot(t, 1)
+	first := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x81)
+	if _, err := first.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogMissing) {
+		t.Fatalf("completely empty authority=%v", err)
+	}
+
+	client.unknownNext = true
+	err := first.Publish(context.Background(), 0, genesis)
+	if !errors.Is(err, ErrReplicatedCatalogPending) || !first.session.Status().Pending {
+		t.Fatalf("unknown genesis publish=%v pending=%v", err, first.session.Status().Pending)
+	}
+	pending := first.session.PendingCommand()
+	if len(pending) == 0 || len(client.rows) != 3 {
+		t.Fatalf("pending genesis command=%d replicated rows=%d", len(pending), len(client.rows))
+	}
+	if err = validateReplicatedCatalogGenesis(
+		client.rows[string(replicatedCatalogGenesisKey)],
+		client.rows[string(replicatedCatalogHeadKey)],
+	); err != nil {
+		t.Fatalf("atomically published genesis proof=%v", err)
+	}
+
+	// A replacement gateway observes the committed generation even though the
+	// first gateway lost its terminal response, then advances the catalog.
+	replacement := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x82)
+	observed, err := replacement.Read(context.Background())
+	if err != nil || observed.Generation() != 1 {
+		t.Fatalf("replacement read=%v err=%v", observed, err)
+	}
+	if err = replacement.AttestGenesis(context.Background(), genesis); err != nil {
+		t.Fatal(err)
+	}
+	next := testCatalogAuthoritySnapshot(t, 2)
+	if err = replacement.Publish(context.Background(), 1, next); err != nil {
+		t.Fatalf("replacement advance=%v", err)
+	}
+
+	// Recovery first settles only the retained byte-identical command. Its
+	// local holder can then refresh from generation one to the certified head.
+	client.holdUnknown = false
+	if err = first.RetryPending(context.Background()); err != nil {
+		t.Fatalf("settle genesis publication=%v", err)
+	}
+	if !bytes.Equal(pending, client.unknownCommand) {
+		t.Fatal("genesis retry changed command bytes")
+	}
+	observed, err = first.Read(context.Background())
+	if err != nil || observed.Generation() != 2 {
+		t.Fatalf("restarted refresh=%v err=%v", observed, err)
+	}
+	if err = first.AttestGenesis(context.Background(), genesis); err != nil {
+		t.Fatalf("advanced head lost immutable genesis attestation=%v", err)
+	}
+}
+
+func TestReplicatedCatalogGenesisConcurrentPublishersConvergeOrConflict(t *testing.T) {
+	t.Run("identical", func(t *testing.T) {
+		source, client, _ := newCatalogAuthorityFixture(t)
+		emptyCatalogAuthorityRows(client)
+		genesis := testCatalogAuthoritySnapshot(t, 1)
+		first := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x83)
+		second := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x84)
+		var secondErr error
+		client.onRead = func(key []byte) {
+			if !bytes.Equal(key, replicatedCatalogGenesisKey) {
+				return
+			}
+			client.mu.Lock()
+			client.onRead = nil
+			client.mu.Unlock()
+			secondErr = second.Publish(context.Background(), 0, genesis)
+		}
+		firstErr := first.Publish(context.Background(), 0, genesis)
+		if secondErr != nil || !errors.Is(firstErr, ErrReplicatedCatalogConflict) {
+			t.Fatalf("identical concurrent publish first=%v second=%v", firstErr, secondErr)
+		}
+		observed, err := first.Read(context.Background())
+		if err != nil || observed.Generation() != 1 {
+			t.Fatalf("identical losing publisher convergence=%v err=%v", observed, err)
+		}
+		if err = first.AttestGenesis(context.Background(), genesis); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("conflicting", func(t *testing.T) {
+		source, client, _ := newCatalogAuthorityFixture(t)
+		emptyCatalogAuthorityRows(client)
+		firstGenesis := testCatalogAuthoritySnapshot(t, 1)
+		config, endpoints, descriptor := testReplicatedCatalogInput(t)
+		endpoints["ep-b"] = "127.0.0.1:7999"
+		secondGenesis, err := NewSnapshotWithReplicatedMetadata(
+			config, endpoints, 1, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondGenesis, err = initialCatalogState(secondGenesis)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x85)
+		second := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x86)
+		var secondErr error
+		client.onRead = func(key []byte) {
+			if !bytes.Equal(key, replicatedCatalogGenesisKey) {
+				return
+			}
+			client.mu.Lock()
+			client.onRead = nil
+			client.mu.Unlock()
+			secondErr = second.Publish(context.Background(), 0, secondGenesis)
+		}
+		firstErr := first.Publish(context.Background(), 0, firstGenesis)
+		if secondErr != nil || !errors.Is(firstErr, ErrReplicatedCatalogConflict) {
+			t.Fatalf("conflicting concurrent publish first=%v second=%v", firstErr, secondErr)
+		}
+		if err = second.AttestGenesis(context.Background(), secondGenesis); err != nil {
+			t.Fatalf("winning genesis attestation=%v", err)
+		}
+		if err = first.AttestGenesis(context.Background(), firstGenesis); !errors.Is(err, ErrReplicatedCatalogConflict) {
+			t.Fatalf("losing genesis attestation=%v", err)
+		}
+	})
+}
+
+func TestReplicatedCatalogGenesisPreventsDeletedHeadRecreation(t *testing.T) {
+	source, client, _ := newCatalogAuthorityFixture(t)
+	emptyCatalogAuthorityRows(client)
+	genesis := testCatalogAuthoritySnapshot(t, 1)
+	authority := newCatalogAuthorityPeer(t, source, NewCatalogHolder(nil), 0x87)
+	if err := authority.Publish(context.Background(), 0, genesis); err != nil {
+		t.Fatal(err)
+	}
+	delete(client.rows, string(replicatedCatalogHeadKey))
+	if _, err := authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("read with deleted established head=%v", err)
+	}
+	if err := authority.Publish(context.Background(), 0, genesis); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("recreate deleted established head=%v", err)
+	}
+	if _, found := client.rows[string(replicatedCatalogHeadKey)]; found {
+		t.Fatal("deleted established head was recreated")
+	}
+	delete(client.rows, string(replicatedCatalogGenesisKey))
+	if _, err := authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("orphaned witness reopened bootstrap=%v", err)
+	}
 }
 
 func TestReplicatedCatalogAuthorityPublishUnknownRetryConflictAndRefresh(t *testing.T) {
