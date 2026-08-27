@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"time"
 
@@ -44,7 +45,7 @@ func (metrics *gatewayControllerMetrics) observeMove(pass rebalanceexec.Controll
 	metrics.moveDiscovered.Add(uint64(pass.Moves))
 	metrics.moveAdvanced.Add(uint64(pass.Advanced))
 	metrics.moveCompleted.Add(uint64(pass.Completed))
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		metrics.moveFaults.Add(1)
 	}
 	metrics.moveDurationNS.Add(uint64(max(elapsed, 0)))
@@ -58,7 +59,7 @@ func (metrics *gatewayControllerMetrics) observeSplit(pass splitcontroller.Contr
 	metrics.splitDiscovered.Add(uint64(pass.Discovered))
 	metrics.splitTriggered.Add(uint64(pass.Triggered))
 	metrics.splitCompleted.Add(uint64(pass.Completed))
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		metrics.splitFaults.Add(1)
 	}
 	metrics.splitDurationNS.Add(uint64(max(elapsed, 0)))
