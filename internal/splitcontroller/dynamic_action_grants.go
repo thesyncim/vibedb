@@ -172,6 +172,14 @@ type PlanAdmissionGrantFactory interface {
 	) ([]ShardActionGrant, error)
 }
 
+// AdmittedShardExecutorActivation separates construction from publication.
+// Factories may prepare bounded handles, but observation/data capabilities do
+// not become reachable until the binder has atomically installed every grant.
+type AdmittedShardExecutorActivation interface {
+	ActivateAdmittedShardExecutor() error
+	AbortAdmittedShardExecutor() error
+}
+
 // BoundPlanAdmissionBinder is the production bridge from durable admission to
 // the live action dispatcher. The factory receives the already-authenticated
 // Plan and may bind only local manifest-owned observers/executors.
@@ -190,6 +198,7 @@ type boundPlanAdmission struct {
 	catalogDigest     [32]byte
 	leases            []*RuntimeStoreLease
 	registries        []*RuntimeStoreRegistry
+	activations       []AdmittedShardExecutorActivation
 }
 
 func NewBoundPlanAdmissionBinder(
@@ -246,6 +255,7 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 			catalogDigest: admission.CatalogDigest,
 			leases:        append(append([]*RuntimeStoreLease(nil), current.leases...), leases...),
 			registries:    mergeAdmissionRegistries(current.registries, leases),
+			activations:   current.activations,
 		}
 		return nil
 	}
@@ -264,13 +274,34 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 		}
 	}
 	if err = binder.grants.Install(created); err != nil {
+		for index := range created {
+			if activation, ok := created[index].Executor.(AdmittedShardExecutorActivation); ok {
+				err = errors.Join(err, activation.AbortAdmittedShardExecutor())
+			}
+		}
 		return err
+	}
+	for index := range created {
+		activation, ok := created[index].Executor.(AdmittedShardExecutorActivation)
+		if !ok {
+			continue
+		}
+		if err = activation.ActivateAdmittedShardExecutor(); err != nil {
+			binder.grants.retire(admission.Operation, admission.PlanDigest)
+			for rollback := range created {
+				if item, found := created[rollback].Executor.(AdmittedShardExecutorActivation); found {
+					err = errors.Join(err, item.AbortAdmittedShardExecutor())
+				}
+			}
+			return errors.Join(ErrRemoteExecution, err)
+		}
 	}
 	binder.active[admission.Operation] = boundPlanAdmission{
 		digest: admission.PlanDigest, catalogGeneration: admission.CatalogGeneration,
 		catalogDigest: admission.CatalogDigest,
 		leases:        append([]*RuntimeStoreLease(nil), leases...),
 		registries:    mergeAdmissionRegistries(nil, leases),
+		activations:   admittedExecutorActivations(created),
 	}
 	return nil
 }
@@ -291,11 +322,24 @@ func (binder *BoundPlanAdmissionBinder) Close() error {
 	var result error
 	for operation, current := range binder.active {
 		binder.grants.retire(operation, current.digest)
+		for _, activation := range current.activations {
+			result = errors.Join(result, activation.AbortAdmittedShardExecutor())
+		}
 		for _, lease := range current.leases {
 			result = errors.Join(result, lease.Release())
 		}
 	}
 	clear(binder.active)
+	return result
+}
+
+func admittedExecutorActivations(grants []ShardActionGrant) []AdmittedShardExecutorActivation {
+	result := make([]AdmittedShardExecutorActivation, 0, len(grants))
+	for index := range grants {
+		if activation, ok := grants[index].Executor.(AdmittedShardExecutorActivation); ok {
+			result = append(result, activation)
+		}
+	}
 	return result
 }
 
@@ -319,6 +363,9 @@ func (binder *BoundPlanAdmissionBinder) retire(
 		return ErrRemoteExecution
 	}
 	var releaseErr error
+	for _, activation := range current.activations {
+		releaseErr = errors.Join(releaseErr, activation.AbortAdmittedShardExecutor())
+	}
 	for _, lease := range current.leases {
 		if lease == nil {
 			releaseErr = errors.Join(releaseErr, ErrRemoteExecution)

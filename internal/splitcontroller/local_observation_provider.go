@@ -155,6 +155,28 @@ func (provider *LocalPlanObservationProvider) RegisterGroups(groups []LocalObser
 	return nil
 }
 
+// UnregisterGroups removes only byte-identical dynamically admitted groups.
+// Retained groups are never passed by production admission and a substituted
+// observer or registry cannot revoke an existing binding.
+func (provider *LocalPlanObservationProvider) UnregisterGroups(groups []LocalObservationGroup) error {
+	if provider == nil || len(groups) == 0 || len(groups) > MaxPlanObservationEndpoints {
+		return ErrPlanObservation
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	for _, group := range groups {
+		index, found := slices.BinarySearchFunc(provider.groups, group.Identity.Group,
+			func(item LocalObservationGroup, key raftmember.GroupKey) int {
+				return compareObservationGroup(item.Identity.Group, key)
+			})
+		if !found || !sameLocalObservationGroup(provider.groups[index], group) {
+			return ErrPlanObservation
+		}
+		provider.groups = append(provider.groups[:index], provider.groups[index+1:]...)
+	}
+	return nil
+}
+
 func validLocalObservationGroup(group LocalObservationGroup) bool {
 	return group.Identity.Group != (raftmember.GroupKey{}) && group.Identity.MemberID != 0 &&
 		group.Identity.StoreID != ([16]byte{}) && group.Identity.NodeIncarnation != 0 &&

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -138,9 +139,6 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 				for replicaIndex := range route.Replicas {
 					sourceNodes[replicaIndex] = route.Replicas[replicaIndex].Node
 				}
-				if openErr = data.InstallSource(plan, admission.PlanDigest, lease, source, sourceNodes); openErr != nil {
-					return nil, openErr
-				}
 				opener, openErr := newRF3SplitStreamOpener(
 					options.profile, options.deadline,
 					func(ctx context.Context, address string) (net.Conn, error) {
@@ -158,7 +156,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 				if openErr != nil {
 					return nil, openErr
 				}
-				return splitcontroller.NewCompositeShardActionExecutor(splitcontroller.CompositeShardActionExecutorOptions{
+				composite, openErr := splitcontroller.NewCompositeShardActionExecutor(splitcontroller.CompositeShardActionExecutorOptions{
 					Operation: plan.OperationID(), Actions: splitcontroller.SourceSplitActionMask(),
 					Source: source, TailSinks: splitcontroller.RF3TailSinkResolver{Client: tailClient},
 					Seal: options.owners,
@@ -168,6 +166,14 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 					PruneLimits:        rangesplit.RetainedPruneLimits{},
 					ArtifactChunkBytes: rangesplit.DefaultChildArtifactChunkBytes,
 				})
+				if openErr != nil {
+					return nil, openErr
+				}
+				return newRF3AdmittedExecutor(composite, func() error {
+					return data.InstallSource(plan, admission.PlanDigest, lease, source, sourceNodes)
+				}, func() error {
+					return data.RevokeLocal(plan.OperationID(), admission.PlanDigest)
+				}), nil
 			},
 		}
 	}
@@ -219,11 +225,24 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			return nil, registryErr
 		}
 		group, openErr := splitcontroller.PreparedChildObservationGroup(target, replica, registry, executor)
-		if openErr != nil || observation.provider.RegisterGroups([]splitcontroller.LocalObservationGroup{group}) != nil {
+		if openErr != nil {
 			_ = executor.Close()
 			return nil, errors.Join(errRF3Serving, openErr)
 		}
-		return executor, nil
+		registered := false
+		return newRF3AdmittedExecutor(executor, func() error {
+			if err := observation.provider.RegisterGroups([]splitcontroller.LocalObservationGroup{group}); err != nil {
+				return err
+			}
+			registered = true
+			return nil
+		}, func() error {
+			var unregister error
+			if registered {
+				unregister = observation.provider.UnregisterGroups([]splitcontroller.LocalObservationGroup{group})
+			}
+			return errors.Join(unregister, executor.Close())
+		}), nil
 	}
 	factory, err := splitcontroller.NewLocalAdmittedGrantFactory(splitcontroller.LocalAdmittedGrantFactoryOptions{
 		Node: options.profile.LocalIdentity().Node, Sources: sources, Children: childFactory,
@@ -290,6 +309,77 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	result.admission, result.tail, result.artifact = admission, tail, artifact
 	return result, nil
 }
+
+type rf3AdmittedExecutor struct {
+	mu       sync.Mutex
+	executor splitcontroller.ShardActionExecutor
+	activate func() error
+	abort    func() error
+	active   bool
+	aborted  bool
+}
+
+func newRF3AdmittedExecutor(
+	executor splitcontroller.ShardActionExecutor, activate, abort func() error,
+) *rf3AdmittedExecutor {
+	return &rf3AdmittedExecutor{executor: executor, activate: activate, abort: abort}
+}
+
+func (executor *rf3AdmittedExecutor) ActivateAdmittedShardExecutor() error {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.aborted {
+		return errRF3Serving
+	}
+	if executor.active {
+		return nil
+	}
+	if err := executor.activate(); err != nil {
+		return err
+	}
+	executor.active = true
+	return nil
+}
+
+func (executor *rf3AdmittedExecutor) AbortAdmittedShardExecutor() error {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.aborted {
+		return nil
+	}
+	executor.aborted = true
+	return executor.abort()
+}
+
+func (executor *rf3AdmittedExecutor) ExecuteSplitAction(
+	ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation,
+	action splitcontroller.Action,
+) error {
+	executor.mu.Lock()
+	active := executor.active && !executor.aborted
+	executor.mu.Unlock()
+	if !active {
+		return splitcontroller.ErrRemoteExecution
+	}
+	return executor.executor.ExecuteSplitAction(ctx, plan, observed, action)
+}
+
+func (executor *rf3AdmittedExecutor) ExecuteAuthorizedSplitAction(
+	ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation,
+	action splitcontroller.Action,
+) error {
+	executor.mu.Lock()
+	active := executor.active && !executor.aborted
+	delegate, ok := executor.executor.(splitcontroller.AuthorizedShardActionExecutor)
+	executor.mu.Unlock()
+	if !active || !ok {
+		return splitcontroller.ErrRemoteExecution
+	}
+	return delegate.ExecuteAuthorizedSplitAction(ctx, plan, observed, action)
+}
+
+var _ splitcontroller.AdmittedShardExecutorActivation = (*rf3AdmittedExecutor)(nil)
+var _ splitcontroller.AuthorizedShardActionExecutor = (*rf3AdmittedExecutor)(nil)
 
 func loadRF3SplitStaticBootstrap(registry rf3ManifestSplitChildRegistry) (*pb.Snapshot, error) {
 	raw, err := readRF3BoundedFile(registry.StaticBootstrapPath, replicatedstate.MaxStaticBootstrapEnvelopeBytes)

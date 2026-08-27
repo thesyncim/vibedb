@@ -2,10 +2,28 @@ package splitcontroller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
 )
+
+type activatingShardExecutor struct {
+	recordingShardActionExecutor
+	activateErr error
+	activated   int
+	aborted     int
+}
+
+func (executor *activatingShardExecutor) ActivateAdmittedShardExecutor() error {
+	executor.activated++
+	return executor.activateErr
+}
+
+func (executor *activatingShardExecutor) AbortAdmittedShardExecutor() error {
+	executor.aborted++
+	return nil
+}
 
 type planAdmissionGrantFactoryStub struct {
 	grants []ShardActionGrant
@@ -156,5 +174,57 @@ func TestDynamicShardActionGrantAppearsOnlyThroughBoundAdmission(t *testing.T) {
 	)
 	if err != nil || resolved != plan || cut.Catalog != catalog || factory.calls != 1 {
 		t.Fatalf("resolved=%p calls=%d err=%v", resolved, factory.calls, err)
+	}
+}
+
+func TestBoundPlanAdmissionRollsBackAllPreparedExecutorsBeforeVisibility(t *testing.T) {
+	plan, catalog, _, _ := testPlan(t)
+	state := testSourceState(plan)
+	state.ReplicaSetVersion = 1
+	observed := Observation{Catalog: catalog, SourceState: state}
+	action, err := Reconcile(plan, observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := remoteActionTarget(plan, observed, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := NewPlanAdmission(catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := new(activatingShardExecutor)
+	second := &activatingShardExecutor{activateErr: errors.New("activation fault")}
+	dynamic, _ := NewDynamicShardActionGrants(2)
+	factory := &planAdmissionGrantFactoryStub{grants: []ShardActionGrant{
+		{Operation: plan.OperationID(), PlanDigest: admission.PlanDigest, Target: target,
+			Observer: &testPlanObserver{operation: plan.OperationID(), observed: observed},
+			Executor: first, Actions: actionBit(action.Kind)},
+		{Operation: plan.OperationID(), PlanDigest: admission.PlanDigest,
+			Target: ShardActionTarget{Group: target.Group, Allocation: target.Allocation,
+				Member: target.Member + 1, Authority: target.Authority,
+				RelationManifestDigest: target.RelationManifestDigest},
+			Observer: &testPlanObserver{operation: plan.OperationID(), observed: observed},
+			Executor: second, Actions: actionBit(action.Kind)},
+	}}
+	binder, err := NewBoundPlanAdmissionBinder(factory, dynamic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenDurableRuntimeStore(t.TempDir(), plan.OperationID(), testManifestDigest("activation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = binder.BindPlanAdmission(t.Context(), catalog, plan, admission,
+		[]*RuntimeStoreLease{{store: store}}); err == nil {
+		t.Fatal("activation failure admitted capabilities")
+	}
+	if first.activated != 1 || second.activated != 1 || first.aborted != 1 || second.aborted != 1 {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+	if _, found := dynamic.resolve(plan.OperationID(), admission.PlanDigest, target); found {
+		t.Fatal("failed activation remained visible")
 	}
 }

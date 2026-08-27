@@ -231,6 +231,12 @@ func (registry *DynamicSplitData) retire(operation OperationID, digest [32]byte)
 	return result
 }
 
+// RevokeLocal removes one non-terminal process-local data binding. Durable
+// state and store leases remain controlled by admission replay/retirement.
+func (registry *DynamicSplitData) RevokeLocal(operation OperationID, digest [32]byte) error {
+	return registry.retire(operation, digest)
+}
+
 // Close removes all process-local data capabilities and settles every child
 // stage owner. It grants no terminal authority and leaves durable operation
 // state intact for admission replay after restart.
