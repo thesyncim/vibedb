@@ -119,14 +119,19 @@ func validTerminalRetirement(value TerminalRetirement) bool {
 }
 
 type TerminalRetirementService struct {
-	retirer     *LocalTerminalRetirer
+	retirer     TerminalRetirer
 	authorize   func(rafttransport.PeerIdentity, TerminalRetirement) bool
 	read, write rafttransport.DeadlineFunc
 	slots       chan struct{}
 }
 
+// TerminalRetirer settles certified local retirement before a response.
+type TerminalRetirer interface {
+	RetireTerminal(TerminalRetirement) error
+}
+
 func NewTerminalRetirementService(
-	retirer *LocalTerminalRetirer,
+	retirer TerminalRetirer,
 	authorize func(rafttransport.PeerIdentity, TerminalRetirement) bool,
 	read, write rafttransport.DeadlineFunc,
 ) (*TerminalRetirementService, error) {

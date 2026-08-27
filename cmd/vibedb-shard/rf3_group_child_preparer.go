@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
@@ -16,11 +20,15 @@ type rf3GroupChildPreparer struct {
 	manifest  rf3Manifest
 	preparers []*rf3ChildPreparer
 	slots     [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot
+	store     *rf3ChildAdmissionStore
+	inflight  [maxRF3SplitChildOperations]int
 }
 
 type rf3GroupChildPrepareSlot struct {
-	operation [32]byte
-	group     int
+	operation    [32]byte
+	group        int
+	certificates [autosplit.MaxSplitChildren][32]byte
+	requests     [autosplit.MaxSplitChildren][32]byte
 }
 
 func newRF3GroupChildPreparer(
@@ -46,6 +54,28 @@ func newRF3GroupChildPreparer(
 			return nil, err
 		}
 	}
+	var err error
+	result.store, result.slots, err = openRF3ChildAdmissionStore(manifest.ReplicaControl.SourceDataRoot, manifest.Digest, limit)
+	if err != nil {
+		return nil, err
+	}
+	for _, slot := range result.slots {
+		if slot.operation == ([32]byte{}) {
+			continue
+		}
+		if slot.group < 0 || slot.group >= len(result.preparers) {
+			_ = result.Close()
+			return nil, errRF3Serving
+		}
+		if _, err = result.preparers[slot.group].registry.acquire(slot.operation, 0); err != nil {
+			_ = result.Close()
+			return nil, err
+		}
+	}
+	if err = result.recoverTerminal(); err != nil {
+		_ = result.Close()
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -55,8 +85,19 @@ func (preparer *rf3GroupChildPreparer) PrepareChild(
 	if preparer == nil || ctx == nil {
 		return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
 	}
+	if err := context.Cause(ctx); err != nil {
+		return splitcontroller.ChildPrepareReceipt{}, err
+	}
 	preparer.mu.Lock()
-	defer preparer.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			preparer.mu.Unlock()
+		}
+	}()
+	if err := context.Cause(ctx); err != nil {
+		return splitcontroller.ChildPrepareReceipt{}, err
+	}
 	target := preparation.ReplicaTarget()
 	operation := [32]byte(preparation.OperationID())
 	index, registry, ok := rf3SplitChildRegistryForTarget(preparer.manifest, operation, preparation.Child(), target)
@@ -67,34 +108,219 @@ func (preparer *rf3GroupChildPreparer) PrepareChild(
 	if err != nil || !preparer.preparers[index].matchesLocalTarget(target, paths) {
 		return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
 	}
-	if err := preparer.admit(operation, index); err != nil {
+	request, err := splitcontroller.ChildPreparationDigest(preparation)
+	if err != nil {
 		return splitcontroller.ChildPrepareReceipt{}, err
 	}
+	previous := preparer.slots
+	slot, err := preparer.reserve(operation, index, int(preparation.Child()), target.CertificateDigest, request)
+	if err != nil {
+		return splitcontroller.ChildPrepareReceipt{}, err
+	}
+	_, registryErr := preparer.preparers[index].registry.acquire(operation, preparation.Child())
+	if registryErr != nil {
+		if previous != preparer.slots {
+			if err := preparer.store.save(previous); err != nil {
+				return splitcontroller.ChildPrepareReceipt{}, errors.Join(registryErr, err)
+			}
+			preparer.slots = previous
+		}
+		return splitcontroller.ChildPrepareReceipt{}, registryErr
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		// No child preparer has run yet: rollback only this known no-I/O
+		// admission. Later errors retain their durable outcome-unknown slot.
+		if previous != preparer.slots {
+			if err := preparer.store.save(previous); err != nil {
+				return splitcontroller.ChildPrepareReceipt{}, errors.Join(cause, err)
+			}
+			preparer.slots = previous
+		}
+		if previous[slot].operation == ([32]byte{}) {
+			preparer.preparers[index].registry.release(operation)
+		}
+		return splitcontroller.ChildPrepareReceipt{}, cause
+	}
+	preparer.inflight[slot]++
+	preparer.mu.Unlock()
+	locked = false
+	defer func() { preparer.mu.Lock(); preparer.inflight[slot]--; preparer.mu.Unlock() }()
 	return preparer.preparers[index].PrepareChild(ctx, preparation)
 }
 
-func (preparer *rf3GroupChildPreparer) admit(operation [32]byte, group int) error {
-	if operation == ([32]byte{}) || group < 0 || group >= len(preparer.preparers) {
-		return splitcontroller.ErrChildPreparation
+func (preparer *rf3GroupChildPreparer) reserve(operation [32]byte, group, child int, certificate, request [32]byte) (int, error) {
+	if operation == ([32]byte{}) || group < 0 || group >= len(preparer.preparers) ||
+		child < 0 || child >= autosplit.MaxSplitChildren || certificate == ([32]byte{}) || request == ([32]byte{}) {
+		return 0, splitcontroller.ErrChildPreparation
 	}
 	empty := -1
+	existing := -1
 	for index := 0; index < preparer.manifest.SplitControl.operationLimit(); index++ {
 		slot := preparer.slots[index]
 		if slot.operation == operation {
 			if slot.group != group {
-				return splitcontroller.ErrChildPreparation
+				return 0, splitcontroller.ErrChildPreparation
 			}
-			return nil
+			existing = index
+			break
 		}
 		if empty < 0 && slot.operation == ([32]byte{}) {
 			empty = index
 		}
 	}
-	if empty < 0 {
-		return errRF3SplitChildRegistryBound
+	if existing >= 0 {
+		empty = existing
 	}
-	preparer.slots[empty] = rf3GroupChildPrepareSlot{operation: operation, group: group}
+	if empty < 0 {
+		return 0, errRF3SplitChildRegistryBound
+	}
+	if existing < 0 {
+		if err := preparer.checkPriorPreparation(operation, group); err != nil {
+			return 0, err
+		}
+	}
+	next := preparer.slots
+	if existing < 0 {
+		next[empty] = rf3GroupChildPrepareSlot{operation: operation, group: group}
+	}
+	old := next[empty]
+	if old.certificates[child] != ([32]byte{}) && (old.certificates[child] != certificate || old.requests[child] != request) {
+		return 0, splitcontroller.ErrChildPreparation
+	}
+	next[empty].certificates[child], next[empty].requests[child] = certificate, request
+	if next != preparer.slots {
+		if err := preparer.store.save(next); err != nil {
+			return 0, err
+		}
+		preparer.slots = next
+	}
+	return empty, nil
+}
+
+func (preparer *rf3GroupChildPreparer) Close() error {
+	if preparer == nil {
+		return nil
+	}
+	return preparer.store.Close()
+}
+
+// A reclaimed admission must not resurrect under another group. Existing
+// per-child receipts and terminal witnesses are addressed directly; there is
+// no directory walk over historical operations and no second tombstone log.
+func (preparer *rf3GroupChildPreparer) checkPriorPreparation(operation [32]byte, group int) error {
+	for index, candidate := range preparer.manifest.groupBundles() {
+		for child := uint8(0); child < autosplit.MaxSplitChildren; child++ {
+			paths, err := candidate.ChildRegistry.childPaths(operation, child)
+			if err != nil {
+				return err
+			}
+			raw, err := readPrepareRF3File(filepath.Join(paths.Root, rf3ChildPrepareReceiptName), splitcontroller.MaxChildPreparationBytes)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			receipt, err := splitcontroller.OpenChildPrepareReceipt(raw)
+			if err != nil || receipt.Operation != splitcontroller.OperationID(operation) || receipt.Child != child || index != group {
+				return splitcontroller.ErrChildPreparation
+			}
+			terminal, err := splitcontroller.HasRuntimeTerminalWitness(paths.Root, receipt.Operation, receipt.Target.CertificateDigest)
+			if err != nil {
+				return err
+			}
+			if terminal {
+				return splitcontroller.ErrRuntimeTerminal
+			}
+		}
+	}
 	return nil
+}
+
+func (preparer *rf3GroupChildPreparer) slotTerminal(slot rf3GroupChildPrepareSlot) (bool, error) {
+	found := false
+	for child, certificate := range slot.certificates {
+		if certificate == ([32]byte{}) {
+			continue
+		}
+		found = true
+		paths, err := preparer.manifest.groupBundles()[slot.group].ChildRegistry.childPaths(slot.operation, uint8(child))
+		if err != nil {
+			return false, err
+		}
+		terminal, err := splitcontroller.HasRuntimeTerminalWitness(paths.Root, splitcontroller.OperationID(slot.operation), certificate)
+		if err != nil || !terminal {
+			return false, err
+		}
+	}
+	return found, nil
+}
+
+func (preparer *rf3GroupChildPreparer) recoverTerminal() error {
+	next := preparer.slots
+	for index, slot := range next {
+		if slot.operation == ([32]byte{}) {
+			continue
+		}
+		if preparer.inflight[index] != 0 {
+			continue
+		}
+		terminal, err := preparer.slotTerminal(slot)
+		if err != nil {
+			return err
+		}
+		if terminal {
+			next[index] = rf3GroupChildPrepareSlot{}
+		}
+	}
+	if next == preparer.slots {
+		return nil
+	}
+	if err := preparer.store.save(next); err != nil {
+		return err
+	}
+	for index, slot := range preparer.slots {
+		if slot.operation != ([32]byte{}) && next[index].operation == ([32]byte{}) {
+			preparer.preparers[slot.group].registry.release(slot.operation)
+		}
+	}
+	preparer.slots = next
+	return nil
+}
+
+type rf3PreparedChildRetirer struct {
+	certified *splitcontroller.LocalTerminalRetirer
+	preparer  *rf3GroupChildPreparer
+}
+
+func (retirer rf3PreparedChildRetirer) RetireTerminal(retirement splitcontroller.TerminalRetirement) error {
+	if retirer.preparer == nil {
+		return retirer.certified.RetireTerminal(retirement)
+	}
+	preparer := retirer.preparer
+	preparer.mu.Lock()
+	defer preparer.mu.Unlock()
+	for index, slot := range preparer.slots {
+		if slot.operation != [32]byte(retirement.Operation) {
+			continue
+		}
+		if preparer.inflight[index] != 0 {
+			return splitcontroller.ErrRuntimeRegistryInUse
+		}
+	}
+	if err := retirer.certified.RetireTerminal(retirement); err != nil {
+		return err
+	}
+	for _, slot := range preparer.slots {
+		if slot.operation != [32]byte(retirement.Operation) {
+			continue
+		}
+		terminal, err := preparer.slotTerminal(slot)
+		if err != nil || !terminal {
+			return errors.Join(splitcontroller.ErrSplitOperationRetirement, err)
+		}
+	}
+	return preparer.recoverTerminal()
 }
 
 // The signed catalog target carries its complete retained SQL/apply identity

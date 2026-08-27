@@ -37,15 +37,16 @@ type rf3SplitServingRuntime struct {
 }
 
 type rf3SplitServingOptions struct {
-	manifest   rf3Manifest
-	prepared   []preparedRF3Group
-	identities []raftmember.RuntimeIdentity
-	commands   []raftservice.CommandFence
-	owners     *raftservice.ExecutionOwners
-	registrar  splitcontroller.ExecutionGroupRegistrar
-	profile    *rafttransport.PeerTLS
-	policy     *serviceauthz.Policy
-	deadline   rafttransport.DeadlineFunc
+	childPreparer *rf3GroupChildPreparer
+	manifest      rf3Manifest
+	prepared      []preparedRF3Group
+	identities    []raftmember.RuntimeIdentity
+	commands      []raftservice.CommandFence
+	owners        *raftservice.ExecutionOwners
+	registrar     splitcontroller.ExecutionGroupRegistrar
+	profile       *rafttransport.PeerTLS
+	policy        *serviceauthz.Policy
+	deadline      rafttransport.DeadlineFunc
 }
 
 func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServingRuntime, error) {
@@ -323,7 +324,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		return closeOnError(err)
 	}
 	terminal, err := splitcontroller.NewTerminalRetirementService(
-		retirer, func(peer rafttransport.PeerIdentity, _ splitcontroller.TerminalRetirement) bool {
+		rf3PreparedChildRetirer{certified: retirer, preparer: options.childPreparer}, func(peer rafttransport.PeerIdentity, _ splitcontroller.TerminalRetirement) bool {
 			return options.policy.Check(peer.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
 		}, options.deadline, options.deadline,
 	)

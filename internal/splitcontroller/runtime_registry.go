@@ -487,6 +487,28 @@ func runtimeTerminalName(operation OperationID) string {
 	return "terminal-" + runtimeOperationName(operation) + ".state"
 }
 
+// HasRuntimeTerminalWitness verifies an existing exact terminal witness
+// without acquiring execution authority or creating a runtime namespace.
+// Callers use this only with their already-authenticated operation/root cut.
+func HasRuntimeTerminalWitness(path string, operation OperationID, manifest [sha256.Size]byte) (bool, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || operation == (OperationID{}) || manifest == ([sha256.Size]byte{}) {
+		return false, ErrRuntimeStore
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.Join(ErrRuntimeStore, err)
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return false, err
+	}
+	found, err := runtimeTerminalExists(root, operation, manifest)
+	return found, errors.Join(err, root.Close())
+}
+
 func runtimeTerminalExists(
 	root *os.Root, operation OperationID, manifest [sha256.Size]byte,
 ) (bool, error) {

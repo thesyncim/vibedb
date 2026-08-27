@@ -784,11 +784,16 @@ func servePreparedRF3WithExecutionLanes(
 		return errors.Join(errRF3Serving, err)
 	}
 	var childPrepareControl shardcontrol.Handler
+	var childPreparer *rf3GroupChildPreparer
 	if nativeListener != nil {
-		childPreparer, childErr := newRF3GroupChildPreparer(
+		var childErr error
+		childPreparer, childErr = newRF3GroupChildPreparer(
 			manifest, profile.LocalIdentity().Node,
 			peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(), snapshotListener.Addr(),
 		)
+		if childErr == nil {
+			defer func() { resultErr = errors.Join(resultErr, childPreparer.Close()) }()
+		}
 		if childErr == nil {
 			concurrency := min(manifest.SplitControl.operationLimit(), 8)
 			childPrepareControl, childErr = splitcontroller.NewChildPrepareService(
@@ -814,6 +819,7 @@ func servePreparedRF3WithExecutionLanes(
 	splitRuntime, splitRuntimeErr := newRF3SplitServingRuntime(rf3SplitServingOptions{
 		manifest: manifest, prepared: preparedSet.groups, identities: identities, commands: commands,
 		owners: peer.Owners(), registrar: peer, profile: profile, policy: policy, deadline: deadline,
+		childPreparer: childPreparer,
 	})
 	if splitRuntimeErr != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())

@@ -39,6 +39,7 @@ var (
 	ErrReplicatedReadBufferBound  = errors.New("gateway: point-read response bound is below the relation limit")
 	ErrReplicatedReadIntentActive = errors.New("gateway: replicated read intersects an active transaction intent")
 	ErrReplicatedUnauthorized     = errors.New("gateway: replicated authorization denied")
+	errReplicatedLeaderUnobserved = errors.New("gateway: no authenticated replica reported itself as leader")
 )
 
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
@@ -1207,6 +1208,20 @@ func (executor *ReplicatedExecutor) propose(
 					}
 					continue
 				}
+				// A complete, authenticated sweep can precede the initial
+				// election. Spend the existing retry budget without submitting
+				// or rebuilding the command. Refusals, transport errors and
+				// mismatched fences do not qualify for this startup retry.
+				if errors.Is(err, errReplicatedLeaderUnobserved) {
+					if attempt+1 == executor.maxAttempts {
+						return ReplicatedResult{}, fmt.Errorf("gateway: leader discovery exhausted after %d attempts: %w", attempt+1, err)
+					}
+					preferred = 0
+					if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+						return ReplicatedResult{}, errors.Join(err, waitErr)
+					}
+					continue
+				}
 				return ReplicatedResult{}, err
 			}
 		}
@@ -1562,6 +1577,9 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 			return endpoint, response.State, nil
 		}
 		member = response.State.LeaderID
+	}
+	if joined == nil {
+		joined = errReplicatedLeaderUnobserved
 	}
 	return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
 		errors.Join(ErrReplicatedLeader, joined)
