@@ -93,16 +93,21 @@ func TestDurableRequestLedgerRF3ReadsProgressAndTerminalCutsOnce(t *testing.T) {
 		reads++
 		switch read.Kind {
 		case replicatedstate.RequestLedgerReadProgress:
+			if reads == 3 {
+				return ReplicatedRequestLedgerReadResult{Applied: 23, Found: true, Retries: 5,
+					AuthoritativeKind: read.Kind, Value: []byte{1}}, nil
+			}
 			return ReplicatedRequestLedgerReadResult{Applied: 21, Found: true,
-				AuthoritativeKind: read.Kind, Value: progressRaw}, nil
+				AuthoritativeKind: read.Kind, Retries: 2, Value: progressRaw}, nil
 		case replicatedstate.RequestLedgerReadTerminalCut:
 			return ReplicatedRequestLedgerReadResult{Applied: 22, Found: true,
-				AuthoritativeKind: read.Kind, Value: terminalCutRaw}, nil
+				AuthoritativeKind: read.Kind, Retries: 3, Value: terminalCutRaw}, nil
 		default:
 			return ReplicatedRequestLedgerReadResult{}, ErrDurableRequest
 		}
 	}}
-	ledger := &DurableRequestLedgerRF3{client: stub}
+	metrics := &DurableRequestLedgerReadMetrics{}
+	ledger := &DurableRequestLedgerRF3{client: stub, readCollector: metrics}
 	progress, err := ledger.ReadProgressCut(context.Background(), home, rows.head.Key)
 	if err != nil || progress.Applied != 21 ||
 		progress.Continuation.ContinuationDigest != rows.continuation.ContinuationDigest {
@@ -112,6 +117,63 @@ func TestDurableRequestLedgerRF3ReadsProgressAndTerminalCutsOnce(t *testing.T) {
 	if err != nil || terminal.Applied != 22 ||
 		terminal.Terminal.ResultDigest != rows.terminal.ResultDigest || reads != 2 {
 		t.Fatalf("reads=%d terminal=%+v err=%v", reads, terminal, err)
+	}
+	if _, err := ledger.ReadProgressCut(context.Background(), home, rows.head.Key); err == nil {
+		t.Fatal("malformed progress cut succeeded")
+	}
+	progressMetrics := DurableRequestLedgerReadSnapshot{
+		Calls: 2, Retries: 7, ResponseBytes: uint64(len(progressRaw) + 1), Errors: 1,
+	}
+	if got := metrics.Snapshot(replicatedstate.RequestLedgerReadProgress); got != progressMetrics {
+		t.Fatalf("progress metrics=%+v want=%+v", got, progressMetrics)
+	}
+	terminalMetrics := DurableRequestLedgerReadSnapshot{
+		Calls: 1, Retries: 3, ResponseBytes: uint64(len(terminalCutRaw)),
+	}
+	if got := metrics.Snapshot(replicatedstate.RequestLedgerReadTerminalCut); got != terminalMetrics {
+		t.Fatalf("terminal metrics=%+v want=%+v", got, terminalMetrics)
+	}
+}
+
+func BenchmarkDurableRequestLedgerRF3ReadProgressCutMetrics(b *testing.B) {
+	rows := lifecycleRowFixture(b)
+	homePoint, _ := requestledger.Home(rows.head.Key)
+	home := DurableRequestLedgerHome{
+		Identity: replication.Digest(lifecycleDigest("range")), Point: homePoint,
+	}
+	headRaw, _ := requestledger.AppendHead(nil, rows.head)
+	continuationRaw, _ := requestledger.AppendContinuation(nil, rows.continuation)
+	raw := make([]byte, 9, 9+len(headRaw)+len(continuationRaw))
+	raw[0] = 1
+	binary.LittleEndian.PutUint32(raw[1:5], uint32(len(headRaw)))
+	binary.LittleEndian.PutUint32(raw[5:9], uint32(len(continuationRaw)))
+	raw = append(raw, headRaw...)
+	raw = append(raw, continuationRaw...)
+	stub := lifecycleRF3Stub{read: func(
+		context.Context, DurableRequestLedgerHome, ReplicatedRequestLedgerRead,
+	) (ReplicatedRequestLedgerReadResult, error) {
+		return ReplicatedRequestLedgerReadResult{Applied: 17, Found: true,
+			AuthoritativeKind: replicatedstate.RequestLedgerReadProgress, Value: raw}, nil
+	}}
+	for _, test := range []struct {
+		name      string
+		collector DurableRequestLedgerReadCollector
+	}{
+		{name: "metrics_disabled"},
+		{name: "metrics_enabled", collector: &DurableRequestLedgerReadMetrics{}},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			ledger := &DurableRequestLedgerRF3{client: stub, readCollector: test.collector}
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				cut, err := ledger.ReadProgressCut(ctx, home, rows.head.Key)
+				if err != nil || cut.Head.KeyDigest != rows.head.KeyDigest {
+					b.Fatalf("cut=%+v err=%v", cut, err)
+				}
+			}
+		})
 	}
 }
 

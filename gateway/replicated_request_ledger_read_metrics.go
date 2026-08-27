@@ -42,7 +42,7 @@ type durableRequestLedgerReadCounters struct {
 	errors        atomic.Uint64
 }
 
-const durableRequestLedgerReadKindCount = 13
+const durableRequestLedgerReadKindCount = 15
 
 // DurableRequestLedgerReadMetrics is the optional lock-free collector shipped
 // with the gateway. It uses a dense closed-kind index rather than allocating a
@@ -115,8 +115,12 @@ func durableRequestLedgerReadKindIndex(kind replicatedstate.RequestLedgerReadKin
 		return 10, true
 	case replicatedstate.RequestLedgerReadWave:
 		return 11, true
-	case replicatedstate.RequestLedgerReadIssuerStatus:
+	case replicatedstate.RequestLedgerReadProgress:
 		return 12, true
+	case replicatedstate.RequestLedgerReadTerminalCut:
+		return 13, true
+	case replicatedstate.RequestLedgerReadIssuerStatus:
+		return 14, true
 	default:
 		return 0, false
 	}

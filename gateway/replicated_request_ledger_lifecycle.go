@@ -510,43 +510,51 @@ func (ledger *DurableRequestLedgerRF3) ReadWaveCut(
 func (ledger *DurableRequestLedgerRF3) ReadProgressCut(
 	ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey,
 ) (durableRequestProgressReadCut, error) {
-	result, err := ledger.readCut(ctx, home, key, replicatedstate.RequestLedgerReadProgress,
+	result, observation, err := ledger.readCut(ctx, home, key, replicatedstate.RequestLedgerReadProgress,
 		replicatedstate.MaxRequestLedgerProgressReadBytes)
 	if err != nil {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestProgressReadCut{}, err
 	}
 	value, err := replicatedstate.OpenRequestLedgerProgressReadValue(result.Value)
 	if err != nil {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestProgressReadCut{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	head, err := requestledger.OpenHead(value.Head)
 	if err != nil || head.Key != key {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestProgressReadCut{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	cut := durableRequestProgressReadCut{Head: head, Applied: result.Applied}
 	if value.ContinuationFound {
 		cut.Continuation, err = requestledger.OpenContinuation(value.Continuation)
 		if err != nil {
+			ledger.observeRequestLedgerRead(observation, true)
 			return durableRequestProgressReadCut{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 	}
+	ledger.observeRequestLedgerRead(observation, false)
 	return cut, nil
 }
 
 func (ledger *DurableRequestLedgerRF3) ReadTerminalCut(
 	ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey,
 ) (durableRequestTerminalReadCut, error) {
-	result, err := ledger.readCut(ctx, home, key, replicatedstate.RequestLedgerReadTerminalCut,
+	result, observation, err := ledger.readCut(ctx, home, key, replicatedstate.RequestLedgerReadTerminalCut,
 		replicatedstate.MaxRequestLedgerTerminalReadBytes)
 	if err != nil {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestTerminalReadCut{}, err
 	}
 	value, err := replicatedstate.OpenRequestLedgerTerminalReadValue(result.Value)
 	if err != nil {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestTerminalReadCut{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	head, err := requestledger.OpenHead(value.Head)
 	if err != nil || head.Key != key {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestTerminalReadCut{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	cut := durableRequestTerminalReadCut{Head: head, Applied: result.Applied}
@@ -563,8 +571,10 @@ func (ledger *DurableRequestLedgerRF3) ReadTerminalCut(
 		cut.Terminal, err = requestledger.OpenTerminal(value.Terminal)
 	}
 	if err != nil {
+		ledger.observeRequestLedgerRead(observation, true)
 		return durableRequestTerminalReadCut{}, errors.Join(err, ErrDurableRequestConflict)
 	}
+	ledger.observeRequestLedgerRead(observation, false)
 	return cut, nil
 }
 
@@ -574,31 +584,47 @@ func (ledger *DurableRequestLedgerRF3) readCut(
 	key requestledger.RequestKey,
 	kind replicatedstate.RequestLedgerReadKind,
 	maximum int,
-) (ReplicatedRequestLedgerReadResult, error) {
+) (ReplicatedRequestLedgerReadResult, DurableRequestLedgerReadObservation, error) {
+	observation := DurableRequestLedgerReadObservation{Kind: kind}
 	if ledger == nil || ledger.client == nil || ctx == nil || !key.Valid() || maximum <= 0 {
-		return ReplicatedRequestLedgerReadResult{}, ErrDurableRequest
+		return ReplicatedRequestLedgerReadResult{}, observation, ErrDurableRequest
 	}
 	derivedHome, err := requestledger.Home(key)
 	if err != nil || derivedHome != home.Point {
-		return ReplicatedRequestLedgerReadResult{}, errors.Join(err, ErrDurableRequestConflict)
+		return ReplicatedRequestLedgerReadResult{}, observation, errors.Join(err, ErrDurableRequestConflict)
 	}
 	result, err := ledger.client.Read(ctx, home, ReplicatedRequestLedgerRead{
 		Key: key, ExpectedRangeIdentity: requestledger.Digest(home.Identity),
 		Kind: kind, MinimumApplied: 1, MaxBytes: uint32(maximum),
 	})
+	observation.ResponseBytes = uint64(len(result.Value))
+	if result.Retries > 0 {
+		observation.Retries = uint64(result.Retries)
+	}
 	if err != nil {
-		return ReplicatedRequestLedgerReadResult{}, err
+		return ReplicatedRequestLedgerReadResult{}, observation, err
 	}
 	if !result.Found {
-		return ReplicatedRequestLedgerReadResult{}, ErrDurableRequestConflict
+		return ReplicatedRequestLedgerReadResult{}, observation, ErrDurableRequestConflict
 	}
 	if result.AuthoritativeKind == replicatedstate.RequestLedgerReadAck {
-		return ReplicatedRequestLedgerReadResult{}, ErrDurableRequestAcknowledged
+		return ReplicatedRequestLedgerReadResult{}, observation, ErrDurableRequestAcknowledged
 	}
 	if result.AuthoritativeKind != kind {
-		return ReplicatedRequestLedgerReadResult{}, ErrDurableRequestConflict
+		return ReplicatedRequestLedgerReadResult{}, observation, ErrDurableRequestConflict
 	}
-	return result, nil
+	return result, observation, nil
+}
+
+func (ledger *DurableRequestLedgerRF3) observeRequestLedgerRead(
+	observation DurableRequestLedgerReadObservation,
+	failed bool,
+) {
+	if ledger == nil || ledger.readCollector == nil {
+		return
+	}
+	observation.Failed = failed
+	ledger.readCollector.ObserveDurableRequestLedgerRead(observation)
 }
 
 func openDurableRequestLifecycleRow(
