@@ -64,6 +64,17 @@ func TestRequestLedgerRecoveryReadUsesExactHeadBound(t *testing.T) {
 		t.Fatalf("wave read bound = %d, exact=%d command=%d", got,
 			MaxRequestLedgerWaveReadBytes, requestledger.MaxCommandBytes)
 	}
+	if got := RequestLedgerReadMaxBytes(RequestLedgerReadProgress); got !=
+		MaxRequestLedgerProgressReadBytes || got > requestledger.MaxCommandBytes {
+		t.Fatalf("progress read bound = %d, exact=%d command=%d", got,
+			MaxRequestLedgerProgressReadBytes, requestledger.MaxCommandBytes)
+	}
+	if got := RequestLedgerReadMaxBytes(RequestLedgerReadTerminalCut); got !=
+		MaxRequestLedgerTerminalReadBytes || got <= requestledger.MaxCommandBytes ||
+		got > requestledger.MaxCommandBytes+(1<<20) {
+		t.Fatalf("terminal cut bound = %d, exact=%d command=%d", got,
+			MaxRequestLedgerTerminalReadBytes, requestledger.MaxCommandBytes)
+	}
 }
 
 func TestRequestLedgerWaveRecoveryReadUsesOneCoherentCut(t *testing.T) {
