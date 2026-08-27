@@ -27,6 +27,13 @@ func TestReplicatedExecutionPinReadUsesPublicationAndActivationFences(t *testing
 	defer apply.Close()
 	pin := executionpin.PinID{1}
 	got, err := apply.ExecutionPinRead(pin, 1)
+	if !errors.Is(err, replicatedstate.ErrWrongBinding) || got != (replicatedstate.ExecutionPinReadResult{}) {
+		t.Fatalf("uninitialized owner read=%+v/%v", got, err)
+	}
+	if _, err = apply.InstallSnapshot(testReplicatedApplyBootstrap()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = apply.ExecutionPinRead(pin, 1)
 	want, wantErr := apply.machine.ExecutionPinRead(pin, 1)
 	if err != nil || wantErr != nil || got != want || got.Found {
 		t.Fatalf("missing pin read=%+v/%v machine=%+v/%v", got, err, want, wantErr)
