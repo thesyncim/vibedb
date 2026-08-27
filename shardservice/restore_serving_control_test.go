@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -70,9 +71,70 @@ func TestRestoreServingControlRequiresLiveDedicatedAuthorityAndExactReplica(t *t
 		t.Fatal("exact live grant did not open restored serving")
 	}
 	// A new process-local gate starts closed even beside the same durable root.
+	identity.NodeIncarnation++
 	restarted, err := NewRestoreServingGate(identity, node)
-	if err != nil || restarted.Allows(state) {
-		t.Fatalf("restarted gate open=%t err=%v", restarted.Allows(state), err)
+	restartedState := raftservice.ServingState{Identity: identity}
+	if err != nil || restarted.Allows(restartedState) {
+		t.Fatalf("restarted gate open=%t err=%v", restarted.Allows(restartedState), err)
+	}
+	service, err = NewRestoreServingControlService(restarted, policy, deadline, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = client.Install(t.Context(), node, grant); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-serveDone; err != nil || !restarted.Allows(restartedState) {
+		t.Fatalf("observed restart grant open=%t err=%v", restarted.Allows(restartedState), err)
+	}
+}
+
+func TestRestoreServingControlRejectsDelayedFinalGrantAfterRestart(t *testing.T) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	node, store := rafttransport.NodeID{6}, [16]byte{7}
+	identity := raftmember.RuntimeIdentity{Group: group, MemberID: 1, StoreID: store, NodeIncarnation: 2}
+	gate, err := NewRestoreServingGate(identity, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := rafttransport.PeerIdentity{TrustDomain: rafttransport.TrustDomain{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}, Node: rafttransport.NodeID{9}}
+	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{Node: controller.Node,
+		Capabilities: serviceauthz.CapabilityRestoreActivate}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	service, err := NewRestoreServingControlService(gate, policy, deadline, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	defer serverSide.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.Serve(t.Context(), &membershipGrantTestConnection{
+			Conn: serverSide, identity: controller, class: rafttransport.TrafficShardControl})
+	}()
+	old := restoreServingGrantFixture(t, group, 1, node, store, 1)
+	raw, err := clusterrestore.AppendServingGrant(nil, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = clientSide.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	var observed [restoreServingObservationBytes]byte
+	if _, err = io.ReadFull(clientSide, observed[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = clientSide.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; !errors.Is(err, ErrRestoreServingControl) || gate.Allows(raftservice.ServingState{Identity: identity}) {
+		t.Fatalf("delayed grant opened restarted gate: err=%v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package shardservice
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync/atomic"
@@ -21,8 +22,10 @@ var (
 )
 
 const restoreServingResponseBytes = 8 + 32
+const restoreServingObservationBytes = 8 + 8 + 32
 
 var restoreServingResponseMagic = [8]byte{'V', 'B', 'R', 'S', 'G', 'A', 'C', 'K'}
+var restoreServingObservationMagic = [8]byte{'V', 'B', 'R', 'S', 'G', 'O', 'B', 'S'}
 
 func RestoreServingRequestDiscriminator() [8]byte {
 	return clusterrestore.ServingGrantDiscriminator()
@@ -150,6 +153,36 @@ func (service *RestoreServingControlService) Serve(ctx context.Context,
 	if !found {
 		return ErrRestoreServingControl
 	}
+	if grant.Member() != gate.member || grant.Node() != gate.node || grant.Store() != gate.store {
+		return ErrRestoreServingControl
+	}
+	expected, err := grant.ForObservedIncarnation(gate.nodeIncarnation)
+	if err != nil {
+		return ErrRestoreServingControl
+	}
+	// The first message grants nothing. Observe the exact durable process
+	// incarnation, then require a second message bound to that incarnation.
+	// A delayed final message from a prior process can never open this gate.
+	if deadline := boundedMembershipGrantDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
+		return ErrRestoreServingControl
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	var observation [restoreServingObservationBytes]byte
+	copy(observation[:8], restoreServingObservationMagic[:])
+	binary.BigEndian.PutUint64(observation[8:16], gate.nodeIncarnation)
+	initialDigest := grant.Digest()
+	copy(observation[16:], initialDigest[:])
+	if err := writeMembershipGrantFull(connection, observation[:]); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(connection, raw[:]); err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	grant, err = clusterrestore.OpenServingGrant(raw[:])
+	if err != nil || grant.Digest() != expected.Digest() {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
 	if err := gate.Install(grant); err != nil {
 		return err
 	}
@@ -198,6 +231,8 @@ func (client *RestoreServingControlClient) Install(ctx context.Context,
 		return errors.Join(ErrRestoreServingControl, err)
 	}
 	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
 	peer := connection.PeerIdentity()
 	wantDomain := rafttransport.TrustDomain{ClusterID: grant.Group().ClusterID,
 		ClusterIncarnation: grant.Group().ClusterIncarnation}
@@ -220,6 +255,29 @@ func (client *RestoreServingControlClient) Install(ctx context.Context,
 	if deadline := boundedMembershipGrantDeadline(ctx, client.readDeadline()); deadline.IsZero() {
 		return ErrRestoreServingUnknown
 	} else if err := connection.SetReadDeadline(deadline); err != nil {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	var observation [restoreServingObservationBytes]byte
+	initialDigest := grant.Digest()
+	if _, err = io.ReadFull(connection, observation[:]); err != nil ||
+		!bytes.Equal(observation[:8], restoreServingObservationMagic[:]) ||
+		[32]byte(observation[16:]) != initialDigest {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	grant, err = grant.ForObservedIncarnation(binary.BigEndian.Uint64(observation[8:16]))
+	if err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	raw, err = clusterrestore.AppendServingGrant(raw[:0], grant)
+	if err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	if deadline := boundedMembershipGrantDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
+		return ErrRestoreServingControl
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	if err := writeMembershipGrantFull(connection, raw); err != nil {
 		return errors.Join(ErrRestoreServingUnknown, err)
 	}
 	var response [restoreServingResponseBytes]byte

@@ -77,6 +77,22 @@ func (grant ServingGrant) Store() [16]byte            { return grant.store }
 func (grant ServingGrant) NodeIncarnation() uint64    { return grant.nodeIncarnation }
 func (grant ServingGrant) Digest() [sha256.Size]byte  { return grant.digest }
 
+// ForObservedIncarnation binds a catalog grant to a freshly authenticated
+// process incarnation. The sealed bootstrap incarnation remains a monotonic
+// lower bound; the shard still requires exact equality to its current runtime.
+func (grant ServingGrant) ForObservedIncarnation(incarnation uint64) (ServingGrant, error) {
+	if grant.digest == ([sha256.Size]byte{}) || incarnation < grant.nodeIncarnation {
+		return ServingGrant{}, ErrActivation
+	}
+	grant.nodeIncarnation = incarnation
+	raw, err := AppendServingGrant(nil, grant)
+	if err != nil {
+		return ServingGrant{}, err
+	}
+	copy(grant.digest[:], raw[len(raw)-sha256.Size:])
+	return grant, nil
+}
+
 func AppendServingGrant(dst []byte, grant ServingGrant) ([]byte, error) {
 	if grant.operation == ([32]byte{}) || grant.catalog == ([32]byte{}) ||
 		grant.group == (raftmember.GroupKey{}) || grant.member == 0 ||
