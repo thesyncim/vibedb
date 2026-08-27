@@ -74,13 +74,16 @@ type gatewayHotShardLiveFixture struct {
 	credentials       []rf3testfixture.Credential
 	roots             string
 	policyPath        string
+	peerAddresses     [rf3CommandMembers]string
 	nativeAddresses   [rf3CommandMembers]string
 	controlAddresses  [rf3CommandMembers]string
 	targetNode        rafttransport.NodeID
 	targetStore       [16]byte
 	targetIncarnation uint64
 	targetListeners   rf3ManifestListeners
-	targetProfile     *rafttransport.PeerTLS
+	clientProfile     *rafttransport.PeerTLS
+	clientNode        rafttransport.NodeID
+	gatewayNode       rafttransport.NodeID
 	authority         sqldriver.ReplicatedAuthorityProfile
 	grantClient       *shardservice.MembershipGrantControlClient
 }
@@ -90,7 +93,7 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	states := make([]shardservice.ReplicatedMemberState, rf3CommandMembers)
 	for index := range states {
 		state, err := probeRF3CommandMember(t.Context(), fixture.nativeAddresses[index],
-			fixture.nodes[index], fixture.targetProfile, fixture.targetNode, fixture.group,
+			fixture.nodes[index], fixture.clientProfile, fixture.clientNode, fixture.group,
 			rf3CommandStoreIdentity(1).AllocationGeneration,
 			fixture.authority.ActivePolicyGeneration)
 		if err != nil {
@@ -160,8 +163,8 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		"-catalog-retry-home", "1122334455667788", "-catalog-session-lease", "1h",
 		"-controller-interval", "50ms", "-hot-shard-capacity", capacityPath,
 		"-hot-shard-interval", "5s", "-replica-control-manifest", manifestPath,
-		"-listen", gatewayAddress, "-tls-certificate", fixture.credentials[3].Certificate,
-		"-tls-key", fixture.credentials[3].Key, "-tls-roots", fixture.roots,
+		"-listen", gatewayAddress, "-tls-certificate", fixture.credentials[5].Certificate,
+		"-tls-key", fixture.credentials[5].Key, "-tls-roots", fixture.roots,
 		"-tls-identity-oid", "1.3.6.1.4.1.32473.1.1",
 		"-authorization-policy", fixture.policyPath, "-tls-handshake-timeout", "2s",
 		"-max-shard-connections-per-pool", "32", "-max-shard-handshakes-per-pool", "8"}
@@ -191,7 +194,7 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		}
 	}()
 
-	connection := gatewayHotShardDialGateway(t, fixture.targetProfile, fixture.targetNode,
+	connection := gatewayHotShardDialGateway(t, fixture.clientProfile, fixture.gatewayNode,
 		gatewayAddress, diagnostic, gatewayExited)
 	defer connection.Close()
 	baselineRSS := gatewayHotShardProcessRSS(t, command.Process.Pid)
@@ -301,6 +304,15 @@ func gatewayHotShardLiveSnapshot(
 	if err != nil {
 		t.Fatal(err)
 	}
+	return gatewayHotShardSnapshotForLogical(t, fixture, states, links, logical)
+}
+
+// Keep catalog endpoint qualification independent of sealed SQL allocation so
+// every host can exercise the exact serving fixture's transport-role mapping.
+func gatewayHotShardSnapshotForLogical(t testing.TB, fixture gatewayHotShardLiveFixture,
+	states []shardservice.ReplicatedMemberState, links []*gatewayHotShardNetworkLink, logical [32]byte,
+) *gateway.Snapshot {
+	t.Helper()
 	command := states[0].Fence.Command
 	for index := 1; index < len(states); index++ {
 		if states[index].Fence.Command != command {
@@ -325,7 +337,7 @@ func gatewayHotShardLiveSnapshot(
 		endpoint, native, control := endpointNames[index],
 			distribution.EndpointID(fmt.Sprintf("member-%d-native", index+1)),
 			distribution.EndpointID(fmt.Sprintf("member-%d-control", index+1))
-		endpoints[endpoint] = fixture.nativeAddresses[index]
+		endpoints[endpoint] = fixture.peerAddresses[index]
 		endpoints[native] = fixture.nativeAddresses[index]
 		endpoints[control] = links[index].address()
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{Member: uint64(index + 1),
@@ -333,7 +345,7 @@ func gatewayHotShardLiveSnapshot(
 			NodeIncarnation: states[index].Fence.NodeIncarnation,
 			Endpoint:        endpoint, NativeEndpoint: native, ControlEndpoint: control}
 	}
-	endpoints["target"] = fixture.targetListeners.Native
+	endpoints["target"] = fixture.targetListeners.Peer
 	endpoints["target-native"] = fixture.targetListeners.Native
 	endpoints["target-control"] = links[rf3CommandMembers].address()
 	target := gateway.ReplicatedReplicaDescriptor{Member: 4, Node: fixture.targetNode,
@@ -375,7 +387,7 @@ func gatewayHotShardLiveAuthority(
 ) (*gateway.ReplicatedCatalogAuthority, func()) {
 	t.Helper()
 	pool, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
-		TLS: fixture.targetProfile,
+		TLS: fixture.clientProfile,
 		Dial: func(ctx context.Context, address string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
@@ -420,7 +432,7 @@ func gatewayHotShardLiveAuthority(
 	if err != nil {
 		t.Fatal(err)
 	}
-	authorityIdentity := serviceauthz.Authority{Node: fixture.targetNode,
+	authorityIdentity := serviceauthz.Authority{Node: fixture.clientNode,
 		Generation: fixture.authority.ActivePolicyGeneration}
 	ctx, err := serviceauthz.WithAuthority(t.Context(), authorityIdentity)
 	if err != nil {
@@ -513,11 +525,11 @@ type gatewayHotShardPersistedCandidate struct {
 func gatewayHotShardLiveManifest(t testing.TB, fixture gatewayHotShardLiveFixture,
 	links []*gatewayHotShardNetworkLink, gatewayControlAddress string) string {
 	t.Helper()
-	local := gatewayHotShardPersistedGatewayEndpoint{Node: fmt.Sprintf("%x", fixture.targetNode),
+	local := gatewayHotShardPersistedGatewayEndpoint{Node: fmt.Sprintf("%x", fixture.gatewayNode),
 		Incarnation: fixture.targetIncarnation, ControlAddress: gatewayControlAddress}
 	document := gatewayHotShardPersistedManifest{Generation: 1, LocalGateway: local,
-		TLS: gatewayHotShardPersistedTLS{Certificate: fixture.credentials[3].Certificate,
-			Key: fixture.credentials[3].Key, Roots: fixture.roots,
+		TLS: gatewayHotShardPersistedTLS{Certificate: fixture.credentials[5].Certificate,
+			Key: fixture.credentials[5].Key, Roots: fixture.roots,
 			IdentityOID: "1.3.6.1.4.1.32473.1.1", AuthorizationPolicy: fixture.policyPath},
 		Bounds: gatewayHotShardPersistedBounds{MaxConnections: 8, MaxHandshakes: 4,
 			MaxConcurrentDrains: 2, ControllerInterval: 50, ReadTimeout: 250, WriteTimeout: 250},
