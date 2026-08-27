@@ -208,8 +208,10 @@ An unfinished split reuses an already adopted child instead of reopening its
 exclusively owned SQL store. This has local fault and race coverage, not yet
 the required Linux external kill/restart proof.
 
-Remaining integration gates include exact source-versus-catalog fence handling
-through durable seal and reopen, and gateway discovery of descendant split sources.
+Local tests now cover exact source-versus-catalog fence handling through durable
+seal and reopen, including old retry results across unequal generation jumps.
+Repeated descendant splits still need actual split-capture replacement and
+gateway source-discovery qualification, not just historical-result accounting.
 Unlisted sources fail closed. Certified child catalog projection alone does
 not prove a serving cutover; completion requires the composed
 allocation-through-publication and process-restart gates.

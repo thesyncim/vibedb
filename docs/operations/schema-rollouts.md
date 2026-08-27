@@ -109,9 +109,25 @@ the new generation while the global catalog still points at the old one. The
 safe recovery is to finish forward. Stale-generation proposal and read fences
 prevent a mixed replica from silently applying the wrong contract.
 
+`serve-rf3` also handles a crash after the exact schema command commits at
+source applied position N+1 but before the local SQL catalog publishes its
+replacement. Startup authenticates the retained command, checkpoint membership,
+authorization, and catalog compare-and-swap proof. It opens the old source only
+as a fenced recovery handle, finishes that exact catalog publication, closes
+the source, and then opens the target before creating the serving runtime.
+An authenticated prepared-but-uncommitted source follows the old-schema path;
+mismatched or ambiguous proofs fail closed.
+
 The shard retains both generations until an exact drain proof establishes that
 old catalog leases and execution pins are gone. Draining is separate from
 catalog publication; never delete old relation files manually.
+
+Repeated DDL is not complete. The write-once `.schema-target-catalog`,
+`.schema-membership-stage`, and `.schema-activation` proofs do not yet have an
+authorized post-drain replacement lifecycle. Retained startup identity accepts
+one exact successor, not an arbitrary later generation. Advancing that trusted
+identity and retiring superseded proofs remain required before another rollout;
+deleting these files is not a supported workaround.
 
 ## Resource bounds
 
@@ -139,10 +155,12 @@ domains separately. The schema-rollout caller audit for that distinction is
 still pending, so the gates below are not a claim that every logical-to-machine
 digest caller is qualified.
 
-Persisted schema-directory publication and directory-sync recovery are under
-independent review. Local rollover/reopen tests do not establish power-loss
-safety at every filesystem publication cut. Required Linux integration runs
-are still failing or pending; this remains an experimental rollout boundary.
+Schema-directory publication and retry paths now sync their directory entries
+before exposing authority. Local normal and race tests cover exact committed
+source recovery, fenced handles, and settlement before runtime startup. They do
+not establish power-loss safety at every filesystem publication cut. Required
+Linux physical integration runs are still failing or pending; this remains an
+experimental rollout boundary.
 
 Repository gates cover restart after a leader-loss outcome-unknown error, the
 mixed-generation interval, refusal to roll back after authorization, an old
@@ -155,4 +173,6 @@ See:
 - [`gateway/schema_rollout_process_test.go`](../../gateway/schema_rollout_process_test.go)
 - [`gateway/schema_rollout_controller.go`](../../gateway/schema_rollout_controller.go)
 - [`cmd/vibedb-shard/schema_install_rf3.go`](../../cmd/vibedb-shard/schema_install_rf3.go)
+- [`cmd/vibedb-shard/schema_startup_recovery.go`](../../cmd/vibedb-shard/schema_startup_recovery.go)
+- [`cmd/vibedb-shard/schema_startup_recovery_linux_test.go`](../../cmd/vibedb-shard/schema_startup_recovery_linux_test.go)
 - [`internal/schemainstall/control.go`](../../internal/schemainstall/control.go)
