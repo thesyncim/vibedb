@@ -97,8 +97,11 @@ jobs:
             final="$(awk -F $'\t' '$1 == "metric" && $2 == "wal_final_bytes" {print $3}' "${result}")"
             growth="$(awk -F $'\t' '$1 == "metric" && $2 == "wal_growth_bytes" {print $3}' "${result}")"
             test "${baseline}" -gt 0
-            test "${final}" -ge "${baseline}"
-            test "$(( final - baseline ))" -eq "${growth}"
+            # Successful reclamation may finish below the baseline. Growth
+            # is the nonnegative delta, as recorded by the process test.
+            test "${final}" -gt 0
+            expected_growth=$(( final > baseline ? final - baseline : 0 ))
+            test "${expected_growth}" -eq "${growth}"
             test "$(awk -F $'\t' '$1 == "metric" && $2 == "wal_growth_bytes" {print $3}' "${result}")" -le 1048576
             test "$(awk -F $'\t' '$1 == "metric" && $2 == "wal_live_ratio_permille" {print $3}' "${result}")" -le 250
             test "$(awk -F $'\t' '$1 == "metric" && $2 == "rss_growth_bytes" {print $3}' "${result}")" -le 134217728
