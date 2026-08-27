@@ -612,7 +612,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		if prepareErr != nil {
 			t.Fatal(prepareErr)
 		}
-		prepareRF3CommandSplitRuntime(t, memberRoot)
+		prepareRF3CommandSplitRuntime(t, memberRoot, rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}))
 		basePath, applyPath, keyPath := filepath.Join(memberRoot, "sql-identity.vibejson"), filepath.Join(memberRoot, "apply-identity.vibejson"), filepath.Join(memberRoot, "wal-key")
 		writeRF3CommandIdentity(t, basePath, prepared.Base)
 		writeRF3CommandIdentity(t, applyPath, prepared.ApplyIdentity)

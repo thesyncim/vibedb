@@ -140,7 +140,7 @@ func prepareProcessMember(
 	}
 	// The shipped server opens this provisioned namespace without creating it.
 	// Keep that fail-closed startup contract even in external process fixtures.
-	if err := os.MkdirAll(filepath.Join(options.Root, "split-runtime"), 0o700); err != nil {
+	if err := PrepareSplitRuntime(options.Root, options.Bootstrap); err != nil {
 		return PreparedProcessMember{}, err
 	}
 	prepared, err := PrepareMember(MemberOptions{Root: options.Root, Table: options.Table,
@@ -178,12 +178,16 @@ func prepareProcessMember(
 	if err = os.WriteFile(manifestPath, document, 0o600); err != nil {
 		return PreparedProcessMember{}, err
 	}
+	relationDigest, err := prepared.Apply.RangeSplitRelationManifestDigest()
+	if err != nil {
+		return PreparedProcessMember{}, err
+	}
 	if err = prepared.Close(); err != nil {
 		return PreparedProcessMember{}, err
 	}
 	return PreparedProcessMember{ManifestPath: manifestPath,
 		WALPath: prepared.WALPath, SQLPath: prepared.SQLPath,
-		RelationManifestDigest: prepared.Base.RelationManifestDigest}, nil
+		RelationManifestDigest: relationDigest}, nil
 }
 
 func writeProcessJSON(path string, value interface{ MarshalJSON() ([]byte, error) }) error {

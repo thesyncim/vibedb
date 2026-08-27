@@ -245,7 +245,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		if prepareErr != nil {
 			t.Fatal(prepareErr)
 		}
-		prepareRF3CommandSplitRuntime(t, memberRoot)
+		prepareRF3CommandSplitRuntime(t, memberRoot, rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}))
 		t.Cleanup(func() { _ = prepared.Close() })
 		basePath := filepath.Join(memberRoot, "sql-identity.json")
 		applyPath := filepath.Join(memberRoot, "apply-identity.json")
@@ -1256,9 +1256,9 @@ func writeRF3CommandIdentity(t testing.TB, path string, identity interface{ Mars
 
 // Raw member fixtures bypass prepare-rf3, so retain its required runtime
 // namespace explicitly before handing the artifacts to the serving command.
-func prepareRF3CommandSplitRuntime(t testing.TB, memberRoot string) {
+func prepareRF3CommandSplitRuntime(t testing.TB, memberRoot string, bootstrap raftstore.Bootstrap) {
 	t.Helper()
-	if err := os.Mkdir(filepath.Join(memberRoot, "split-runtime"), 0o700); err != nil {
+	if err := rf3testfixture.PrepareSplitRuntime(memberRoot, bootstrap); err != nil {
 		t.Fatal(err)
 	}
 }

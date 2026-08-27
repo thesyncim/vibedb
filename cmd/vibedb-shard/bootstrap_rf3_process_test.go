@@ -120,7 +120,7 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepareRF3CommandSplitRuntime(t, options.Root)
+	prepareRF3CommandSplitRuntime(t, options.Root, staticBootstrap)
 	basePath := filepath.Join(options.Root, "sql-identity.json")
 	applyPath := filepath.Join(options.Root, "apply-identity.json")
 	keyPath := filepath.Join(options.Root, "wal-key")
