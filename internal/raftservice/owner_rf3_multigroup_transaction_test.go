@@ -867,6 +867,12 @@ func rf3Command(
 	return command
 }
 
+func rf3SessionOpenCommand(base sqldriver.ReplicatedShardStoreIdentity) replication.Command {
+	command := rf3Command(base, replication.CommandSessionOpen, 0, 1, nil)
+	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+	return command
+}
+
 func rf3TransactionCommand(
 	t testing.TB,
 	base sqldriver.ReplicatedShardStoreIdentity,
@@ -874,6 +880,10 @@ func rf3TransactionCommand(
 	batches []replication.RelationMutationBatch,
 ) []byte {
 	t.Helper()
+	// This direct-kernel fixture has one fixed controller tenure. Every
+	// transition binds the same immutable execution witness for its transaction.
+	control.ControllerEpoch = 1
+	control.ExecutionPinDigest = distributedtxn.Digest(sha256.Sum256(control.ID[:]))
 	transaction, err := distributedtxn.AppendReplicatedCommand(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -1055,8 +1065,7 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	}
 
 	for group, leader := range []int{leader0, leader1} {
-		open := rf3Command(cluster.groups[group].bases[leader], replication.CommandSessionOpen, 0, 1, nil)
-		open.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+		open := rf3SessionOpenCommand(cluster.groups[group].bases[leader])
 		result, err := cluster.submit(ctx, group, leader, appendRF3Command(t, open), multiGroupRF3NoFault)
 		if err != nil {
 			t.Fatalf("group %d session open: %v", group, err)
@@ -1109,7 +1118,7 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: uint64(cluster.groups[0].bases[leader0].Binding.Authority.SchemaGeneration),
-		RecoveryDeadline:  time.Now().Add(time.Minute).UnixNano(), Participants: participants,
+		RecoveryDeadline:  int64(distributedtxn.MaxRecoveryPulses), Participants: participants,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1312,8 +1321,7 @@ func TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit(t *testing.T) {
 			if err := cluster.owners[candidate].Campaign(ctx, cluster.groups[0].key); err != nil {
 				t.Fatal(err)
 			}
-			command := appendRF3Command(t, rf3Command(cluster.groups[0].bases[candidate],
-				replication.CommandSessionOpen, 1, 1, nil))
+			command := appendRF3Command(t, rf3SessionOpenCommand(cluster.groups[0].bases[candidate]))
 			if bits.OnesCount8(activeMask) >= 2 {
 				leader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[0].key)
 				result, err := cluster.submit(ctx, 0, leader, command, multiGroupRF3NoFault)
@@ -1331,6 +1339,78 @@ func TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit(t *testing.T) {
 				t.Fatalf("minority cut error=%v", err)
 			}
 		})
+	}
+}
+
+// This host-only preflight exercises the exact fixture constructors before any
+// strict-allocation setup can skip the RF3 fault tests on unsupported hosts.
+func TestMultiGroupRF3CommandFixturesPreflight(t *testing.T) {
+	base := sqldriver.ReplicatedShardStoreIdentity{Binding: sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
+		Distribution: "orders-a", Shard: "0000-7fff", AllocationGeneration: 7,
+		ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
+		Authority: sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11,
+			SchemaGeneration: 13, RoutingVersion: 17, RouteGeneration: 19,
+		},
+	}}
+	open, err := replication.OpenCommand(appendRF3Command(t, rf3SessionOpenCommand(base)))
+	if err != nil || open.Kind() != replication.CommandSessionOpen || open.ClientEpoch != 0 ||
+		open.ClientSequence != 1 || open.NextDeadlineUnixNano == 0 {
+		t.Fatalf("canonical session-open fixture: %+v, %v", open, err)
+	}
+	id := distributedtxn.ID{0x70, 0x32, 1}
+	key, ok := orderedkey.AppendJSONString(nil, []byte(`"fixture"`), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode fixture key")
+	}
+	batches := []replication.RelationMutationBatch{{Relation: 1,
+		Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual,
+			Key: key, Value: []byte(`{"id":"fixture"}`)}}}}
+	digest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 13, RecoveryDeadline: int64(distributedtxn.MaxRecoveryPulses),
+		Participants: []distributedtxn.ParticipantRef{{Distribution: []byte("orders-a"),
+			Shard: []byte("0000-7fff"), RoutingVersion: 17, AllocationGeneration: 7,
+			OwnershipEpoch: 11, AuthorityWitness: distributedtxn.AuthorityWitness{1},
+			MutationDigest: digest, State: distributedtxn.ParticipantStaged}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	participant := distributedtxn.ParticipantStage{
+		CoordinatorGroup:            distributedtxn.ID(base.Binding.GroupID),
+		CoordinatorShardIncarnation: distributedtxn.ID(base.Binding.ShardIncarnation),
+		CoordinatorAllocation:       7, BucketBits: 8,
+		IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}}, MutationDigest: digest,
+	}
+	for _, control := range []distributedtxn.ReplicatedCommand{
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinator, Participant: participant},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStagePrepareParticipant,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage, Participant: participant},
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedCommitCoordinator,
+			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
+			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+	} {
+		var mutations []replication.RelationMutationBatch
+		if control.PayloadKind != distributedtxn.ReplicatedPayloadNone {
+			mutations = batches
+		}
+		outer, openErr := replication.OpenCommand(rf3TransactionCommand(t, base, control, mutations))
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		inner, openErr := distributedtxn.OpenReplicatedCommand(outer.TransactionBytes())
+		if openErr != nil || inner.ControllerEpoch != 1 ||
+			inner.ExecutionPinDigest != distributedtxn.Digest(sha256.Sum256(id[:])) {
+			t.Fatalf("fenced transaction operation %d: %+v, %v", control.Operation, inner, openErr)
+		}
 	}
 }
 
