@@ -378,6 +378,11 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 		t.Fatal(err)
 	}
 	activationRoot := filepath.Join(root, "activation")
+	// The controller requires an existing private authority directory; unlike
+	// the shipped CLI, this pre-catalog fault-injection call does not create it.
+	if err = os.Mkdir(activationRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	catalog := new(restoreRF3Catalog)
 	cutError := errors.New("stop after all durable roots, before catalog")
 	completed := 0
