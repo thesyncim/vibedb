@@ -63,6 +63,35 @@ gateway creates or advances it only from an authenticated certified catalog
 head. The generated credentials and `local-development-only` key reference are
 for one-host tests, not an operator credential lifecycle.
 
+### Connect to the development gateway
+
+For RF3, read the connection settings from `<root>/cluster.vibejson`:
+
+| Field | Client use |
+| --- | --- |
+| `client_endpoint` | Gateway TCP address |
+| `client_certificate`, `client_key` | Application client certificate and private key |
+| `client_node` | Exact application identity authenticated by that certificate |
+| `roots` | Generated development CA trust roots |
+| `gateway_node` | Exact expected server identity |
+
+Use the VibeDB gateway-client TLS profile with identity OID
+`1.3.6.1.4.1.32473.1.1`, then send the newline-delimited requests described in
+[Send requests](distributed.md#send-requests). The generated application
+principal has only `data_read` and `data_write`; it cannot act as a schema,
+topology, membership, backup, restore, or internal coordinator principal.
+
+Do not connect with `gateway_certificate` and `gateway_key`: those are the
+gateway's internal service credentials, and authenticating a service to itself
+is rejected. The application identity is distinct from the gateway and every
+Raft member. There is no standalone interactive client command yet; the
+[development process client](../../cmd/vibedb-gateway/hot_shard_dev_process_test.go)
+shows loading the client profile, verifying `gateway_node`, and issuing reads
+and durable writes. Generic TLS tools do not implement this authenticated
+identity profile automatically.
+
+### Single-replica smoke test
+
 For a lighter local smoke test, `--replicas 1` prepares and serves one genuine
 Raft member for each of the same three roles and prints the data member's
 authenticated native endpoint. This mode is explicitly development-only and
