@@ -59,6 +59,7 @@ func (activation Activation) AuthorizeServing(observed CatalogWitness) (*Serving
 // from the local serving.permit file alone.
 type ServingAuthority struct {
 	operation [32]byte
+	catalog   [32]byte
 	replicas  map[raftmember.GroupKey][3]ReplicaIdentity
 }
 
@@ -89,7 +90,7 @@ func NewServingAuthority(operation Operation, roots []RootWitness, catalog Catal
 	if catalog != wantCatalog || permit != wantPermit {
 		return nil, ErrActivation
 	}
-	authority := &ServingAuthority{operation: opened.Digest,
+	authority := &ServingAuthority{operation: opened.Digest, catalog: catalog.CatalogDigest,
 		replicas: make(map[raftmember.GroupKey][3]ReplicaIdentity, len(opened.Targets))}
 	for _, target := range opened.Targets {
 		authority.replicas[target.Group] = target.Replicas
