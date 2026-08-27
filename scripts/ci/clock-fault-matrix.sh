@@ -34,6 +34,12 @@ go version > "${evidence_dir}/go-version.txt"
 go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence_dir}/go-env.txt"
 uname -a > "${evidence_dir}/uname.txt"
 
+# Diagnostic only: io_uring is optional for production's automatic backend.
+# Preserve explicit skips when unavailable; a live-writer exclusion failure or
+# persistent post-SIGKILL lease still fails the command through pipefail.
+go test -v -count=1 -timeout=1m -run='^TestRegisteredWriterSIGKILLRelease$' ./internal/storeio \
+  | tee "${evidence_dir}/registered-writer-sigkill.txt"
+
 run_gate utc_tls ./internal/rafttransport TestPeerTLSIndependentUTCStepMatrix 2m
 run_gate logical_pulse ./gateway TestRecoveryManifestMissingPageRequiresLogicalPulsesAcrossRestart 2m
 run_gate transaction_recovery ./internal/raftservice TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolation 3m
