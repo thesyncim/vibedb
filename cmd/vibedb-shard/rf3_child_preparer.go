@@ -162,8 +162,14 @@ func prepareRF3ChildSQL(
 	path string,
 	target splitcontroller.ChildReplicaTarget,
 ) error {
-	if err := verifyRF3PreparedChildSQL(path, target); err == nil {
-		return nil
+	if !rf3SplitChildSchemaMatchesRetained(template, target.SQL) {
+		return splitcontroller.ErrChildPreparation
+	}
+	if database, err := sqldriver.OpenReplicatedShardStore(path, target.SQL); err == nil {
+		// Binding and apply reservation are separate durable catalog writes.
+		// Resume the narrow crash window between them without attempting DDL
+		// against an already-bound (and therefore write-fenced) store.
+		return errors.Join(database.ReserveReplicatedChildApply(target.SQL, target.Apply), database.Close())
 	}
 	local := sqldriver.ShardStoreIdentity{
 		Distribution: distribution.DistributionName(target.SQL.Binding.Distribution),
@@ -182,18 +188,34 @@ func prepareRF3ChildSQL(
 	if err != nil {
 		return closeWith(err)
 	}
-	statement, prepareErr := session.Prepare(ctx, template.CreateTable)
 	var execErr error
-	if prepareErr == nil {
-		_, execErr = statement.Exec(ctx, nil)
+	for i := -1; i < len(template.SchemaStatements); i++ {
+		ddl := template.CreateTable
+		if i >= 0 {
+			ddl = template.SchemaStatements[i]
+		}
+		statement, prepareErr := session.Prepare(ctx, ddl)
+		execErr = prepareErr
+		if prepareErr == nil {
+			_, execErr = statement.Exec(ctx, nil)
+		}
+		// A controller may restart after any durable DDL publication. Duplicate
+		// definitions are only provisional successes: exact bundle bind below
+		// authenticates every existing definition before materialization.
+		if errors.Is(execErr, sqldriver.ErrTableExists) || errors.Is(execErr, sqldriver.ErrIndexExists) {
+			execErr = nil
+		}
+		if statement != nil {
+			execErr = errors.Join(execErr, statement.Close())
+		}
+		if execErr != nil {
+			break
+		}
 	}
-	if statement != nil {
-		execErr = errors.Join(execErr, statement.Close())
+	if execErr = errors.Join(execErr, session.Close()); execErr != nil {
+		return closeWith(errors.Join(splitcontroller.ErrChildPreparation, execErr))
 	}
-	execErr = errors.Join(prepareErr, execErr, session.Close())
-	base, bindErr := database.BindReplicatedShardStoreStorageIdentity(
-		target.SQL.Binding, template.Table, target.SQL.UserStorage,
-	)
+	base, bindErr := database.BindReplicatedShardStoreBundleIdentity(target.SQL, template.GlobalIndexes)
 	if bindErr != nil {
 		return closeWith(errors.Join(splitcontroller.ErrChildPreparation, execErr, bindErr))
 	}

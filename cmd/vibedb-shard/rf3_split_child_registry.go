@@ -38,6 +38,8 @@ type rf3ManifestSplitChildRegistry struct {
 	StageCheckpointBytes uint64
 	Table                string
 	CreateTable          string
+	SchemaStatements     []string
+	GlobalIndexes        []sqldriver.ReplicatedGlobalIndexRelation
 	WAL                  rf3ManifestSplitChildWAL
 	Apply                rf3ManifestSplitChildApply
 	StaticBootstrapPath  string
@@ -203,9 +205,21 @@ func parseRF3ManifestSplitChildRegistry(node vibejson.Node) (rf3ManifestSplitChi
 	if result.CreateTable, err = rf3ManifestString(value, maxRF3SplitChildDDLBytes); err != nil {
 		return result, err
 	}
-	value, err = nextRF3Field(&fields, `"wal"`)
-	if err != nil {
-		return result, err
+	name, value, present := fields.Next()
+	if present && bytes.Equal(name.Raw().Bytes(), []byte(`"schema_statements"`)) {
+		if result.SchemaStatements, err = parseRF3ChildSchemaStatements(value, len(result.CreateTable)); err != nil {
+			return result, err
+		}
+		name, value, present = fields.Next()
+	}
+	if present && bytes.Equal(name.Raw().Bytes(), []byte(`"global_indexes"`)) {
+		if result.GlobalIndexes, err = parseRF3ChildGlobalIndexes(value); err != nil {
+			return result, err
+		}
+		name, value, present = fields.Next()
+	}
+	if !present || !bytes.Equal(name.Raw().Bytes(), []byte(`"wal"`)) {
+		return result, errInvalidRF3Manifest
 	}
 	if result.WAL, err = parseRF3ManifestSplitChildWAL(value); err != nil {
 		return result, err

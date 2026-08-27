@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -61,6 +62,10 @@ func TestDurableGatewayFourRoleManifestPreflight(t *testing.T) {
 	for group, profile := range profiles {
 		single := manifest.withGroup(bundles[group])
 		registry := single.SplitControl.ChildRegistry
+		if !slices.Equal(registry.SchemaStatements, profile.SchemaStatements) ||
+			!slices.Equal(registry.GlobalIndexes, profile.GlobalIndexes) {
+			t.Fatalf("group %d loses exact local/global child schema metadata", group)
+		}
 		apply := profile.Apply
 		retained := sqldriver.ReplicatedApplyIdentity{
 			MaxSessions: apply.MaxSessions, RetryWindow: apply.RetryWindow,

@@ -41,28 +41,30 @@ const rf3SplitChildBootstrapData = "vibedb-rf3-split-child-bootstrap"
 // replicas. Artifact names and placement are fixed by the command so an unsafe
 // cross-directory publication cannot be requested.
 type prepareRF3Manifest struct {
-	Root                  string                 `json:"root"`
-	Distribution          string                 `json:"distribution"`
-	Shard                 string                 `json:"shard"`
-	ClusterID             string                 `json:"cluster_id"`
-	ClusterIncarnation    string                 `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch uint64                 `json:"topology_recovery_epoch"`
-	AllocationGeneration  uint64                 `json:"allocation_generation"`
-	ShardIncarnation      string                 `json:"shard_incarnation"`
-	GroupID               string                 `json:"group_id"`
-	MemberID              uint64                 `json:"member_id"`
-	StoreID               string                 `json:"store_id"`
-	Table                 string                 `json:"table"`
-	CreateTable           string                 `json:"create_table"`
-	Authority             prepareRF3Authority    `json:"authority"`
-	WAL                   prepareRF3WAL          `json:"wal"`
-	Apply                 prepareRF3Apply        `json:"apply"`
-	Listeners             rf3ManifestListeners   `json:"listeners"`
-	TLS                   rf3ManifestTLS         `json:"tls"`
-	AuthorizationPolicy   string                 `json:"authorization_policy"`
-	SplitControl          prepareRF3SplitControl `json:"split_control"`
-	DevelopmentOnly       bool                   `json:"development_only,omitempty"`
-	Members               []prepareRF3Member     `json:"members"`
+	Root                  string                                    `json:"root"`
+	Distribution          string                                    `json:"distribution"`
+	Shard                 string                                    `json:"shard"`
+	ClusterID             string                                    `json:"cluster_id"`
+	ClusterIncarnation    string                                    `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch uint64                                    `json:"topology_recovery_epoch"`
+	AllocationGeneration  uint64                                    `json:"allocation_generation"`
+	ShardIncarnation      string                                    `json:"shard_incarnation"`
+	GroupID               string                                    `json:"group_id"`
+	MemberID              uint64                                    `json:"member_id"`
+	StoreID               string                                    `json:"store_id"`
+	Table                 string                                    `json:"table"`
+	CreateTable           string                                    `json:"create_table"`
+	SchemaStatements      []string                                  `json:"schema_statements,omitempty"`
+	GlobalIndexes         []sqldriver.ReplicatedGlobalIndexRelation `json:"global_indexes,omitempty"`
+	Authority             prepareRF3Authority                       `json:"authority"`
+	WAL                   prepareRF3WAL                             `json:"wal"`
+	Apply                 prepareRF3Apply                           `json:"apply"`
+	Listeners             rf3ManifestListeners                      `json:"listeners"`
+	TLS                   rf3ManifestTLS                            `json:"tls"`
+	AuthorizationPolicy   string                                    `json:"authorization_policy"`
+	SplitControl          prepareRF3SplitControl                    `json:"split_control"`
+	DevelopmentOnly       bool                                      `json:"development_only,omitempty"`
+	Members               []prepareRF3Member                        `json:"members"`
 }
 
 type prepareRF3SplitControl struct {
@@ -140,16 +142,18 @@ type persistedRF3SplitControl struct {
 }
 
 type persistedRF3SplitChildRegistry struct {
-	Root                 string                      `json:"root"`
-	MaxOperations        int                         `json:"max_operations"`
-	StageCheckpointBytes uint64                      `json:"stage_checkpoint_bytes"`
-	Table                string                      `json:"table"`
-	CreateTable          string                      `json:"create_table"`
-	WAL                  persistedRF3SplitChildWAL   `json:"wal"`
-	Apply                persistedRF3SplitChildApply `json:"apply"`
-	StaticBootstrapPath  string                      `json:"static_bootstrap_path"`
-	ReplicaSetVersion    uint64                      `json:"replica_set_version"`
-	Members              []persistedRF3Member        `json:"members"`
+	Root                 string                                    `json:"root"`
+	MaxOperations        int                                       `json:"max_operations"`
+	StageCheckpointBytes uint64                                    `json:"stage_checkpoint_bytes"`
+	Table                string                                    `json:"table"`
+	CreateTable          string                                    `json:"create_table"`
+	SchemaStatements     []string                                  `json:"schema_statements,omitempty"`
+	GlobalIndexes        []sqldriver.ReplicatedGlobalIndexRelation `json:"global_indexes,omitempty"`
+	WAL                  persistedRF3SplitChildWAL                 `json:"wal"`
+	Apply                persistedRF3SplitChildApply               `json:"apply"`
+	StaticBootstrapPath  string                                    `json:"static_bootstrap_path"`
+	ReplicaSetVersion    uint64                                    `json:"replica_set_version"`
+	Members              []persistedRF3Member                      `json:"members"`
 }
 
 type persistedRF3SplitChildWAL struct {
@@ -352,19 +356,41 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 	if err != nil {
 		return closeBase(err)
 	}
-	statement, err := session.Prepare(context.Background(), input.CreateTable)
-	if err == nil {
-		_, err = statement.Exec(context.Background(), nil)
-	}
-	if statement != nil {
-		err = errors.Join(err, statement.Close())
+	for i := -1; i < len(input.SchemaStatements); i++ {
+		ddl := input.CreateTable
+		if i >= 0 {
+			ddl = input.SchemaStatements[i]
+		}
+		statement, prepareErr := session.Prepare(context.Background(), ddl)
+		err = prepareErr
+		if err == nil {
+			_, err = statement.Exec(context.Background(), nil)
+		}
+		if statement != nil {
+			err = errors.Join(err, statement.Close())
+		}
+		if err != nil {
+			break
+		}
 	}
 	err = errors.Join(err, session.Close())
 	if err != nil {
 		return closeBase(err)
 	}
-	baseIdentity, err := raftmember.BindPreparedSQL(wal, database, authority, input.Table)
+	var baseIdentity sqldriver.ReplicatedShardStoreIdentity
+	if len(input.GlobalIndexes) == 0 {
+		baseIdentity, err = raftmember.BindPreparedSQL(wal, database, authority, input.Table)
+	} else {
+		var binding sqldriver.ReplicatedShardStoreBinding
+		binding, err = raftmember.BindingFromWAL(wal, authority)
+		if err == nil {
+			baseIdentity, err = database.BindReplicatedShardStoreBundle(binding, input.Table, input.GlobalIndexes)
+		}
+	}
 	if err != nil {
+		return closeBase(err)
+	}
+	if err = sqldriver.ValidateReplicatedChildSchema(baseIdentity, input.CreateTable, input.SchemaStatements, input.GlobalIndexes); err != nil {
 		return closeBase(err)
 	}
 	applyHandle, applyIdentity, err := raftmember.OpenPreparedApply(wal, database, authority, baseIdentity, apply)
@@ -449,7 +475,8 @@ func verifyPreparedRF3Member(root string, manifestRaw []byte) error {
 	}
 	base, apply, identityErr := loadRF3RetainedIdentities(manifest)
 	if identityErr != nil || !rf3RouteMatchesBinding(manifest.Route, base.Binding) ||
-		!rf3SplitChildTemplateMatchesRetained(manifest.SplitControl.ChildRegistry, base, apply) {
+		!rf3SplitChildTemplateMatchesRetained(manifest.SplitControl.ChildRegistry, base, apply) ||
+		!rf3SplitChildSchemaMatchesRetained(manifest.SplitControl.ChildRegistry, base) {
 		return errors.Join(errPrepareRF3, identityErr)
 	}
 	staticRaw, err := readPrepareRF3File(
@@ -523,6 +550,10 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 		return raftstore.Identity{}, sqldriver.ReplicatedAuthorityProfile{}, [3]rafttransport.NodeID{}, raftstore.Options{}, sqldriver.ReplicatedApplyOptions{}, nil, errPrepareRF3
 	}
 	if !filepath.IsAbs(input.Root) || filepath.Clean(input.Root) != input.Root || input.Root == string(filepath.Separator) || input.Distribution == "" || input.Shard == "" || input.MemberID == 0 || input.AllocationGeneration == 0 || input.TopologyRecoveryEpoch == 0 || input.Table == "" || input.CreateTable == "" || input.Apply.ShardKey == "" {
+		return bad()
+	}
+	if sqldriver.ValidateReplicatedChildSchemaDefinition(input.Table, input.Apply.ShardKey,
+		input.CreateTable, input.SchemaStatements, input.GlobalIndexes) != nil {
 		return bad()
 	}
 	for _, path := range [...]string{input.WAL.KeyMaterialPath, input.TLS.Certificate, input.TLS.Key, input.TLS.Roots, input.AuthorizationPolicy} {
@@ -692,6 +723,7 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 		Root: childRoot, MaxOperations: input.SplitControl.MaxChildOperations,
 		StageCheckpointBytes: input.SplitControl.StageCheckpointBytes,
 		Table:                input.Table, CreateTable: input.CreateTable, WAL: childWAL, Apply: childApply,
+		SchemaStatements: input.SchemaStatements, GlobalIndexes: input.GlobalIndexes,
 		StaticBootstrapPath: filepath.Join(childRoot, "static-bootstrap.pb"),
 		ReplicaSetVersion:   1, Members: make([]persistedRF3Member, len(input.Members)),
 	}

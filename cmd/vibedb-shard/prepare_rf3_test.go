@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -98,6 +99,11 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 			NodeID: idString(nodes[index][:]), Actions: ^uint16(0),
 		}
 	}
+	// Exercise the shipped preparation command with the complete base/local/
+	// global schema, not merely the singleton used by earlier fixtures.
+	input.SchemaStatements = []string{`CREATE INDEX by_email ON docs (email)`, `CREATE TABLE emails (PRIMARY KEY (key))`}
+	input.GlobalIndexes = rf3testfixture.DurableGatewayMemberProfiles()[rf3testfixture.DurableGatewayDataAGroup].GlobalIndexes
+	input.GlobalIndexes[0].Table = "emails"
 	raw, err := vibejson.Marshal(&input)
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +115,9 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 	loaded, err := loadPrepareRF3Manifest(inputPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(loaded.SchemaStatements, input.SchemaStatements) || !slices.Equal(loaded.GlobalIndexes, input.GlobalIndexes) {
+		t.Fatal("canonical prepare input loses complete child schema")
 	}
 	if err := provisionRF3Member(loaded); errors.Is(err, storeio.ErrStrictAllocationUnsupported) || errors.Is(err, raftstore.ErrPlatformUnsupported) {
 		t.Skipf("strict durable allocation unsupported: %v", err)
@@ -153,7 +162,9 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 		t.Fatalf("bounded child registry entries = %v, %v", entries, err)
 	}
 	base, apply, err := loadRF3RetainedIdentities(manifest)
-	if err != nil || base.Binding.MemberID != 1 || apply.MaxSessions != input.Apply.MaxSessions ||
+	if err != nil || base.Binding.MemberID != 1 || base.RelationCount != 2 ||
+		!rf3SplitChildSchemaMatchesRetained(manifest.SplitControl.ChildRegistry, base) ||
+		apply.MaxSessions != input.Apply.MaxSessions ||
 		apply.RequestLedgerCapacityBytes != input.Apply.RequestLedgerCapacityBytes ||
 		apply.RequestLedgerCleanupReserveBytes != input.Apply.RequestLedgerCleanupReserveBytes ||
 		apply.RequestLedgerRangeStart != requestLedgerStart ||

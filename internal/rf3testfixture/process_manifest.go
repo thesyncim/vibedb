@@ -1,6 +1,7 @@
 package rf3testfixture
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -253,6 +255,26 @@ func processMemberManifest(
 		options.Nodes[0], options.PeerAddresses[0], options.Nodes[1], options.PeerAddresses[1],
 		options.Nodes[2], options.PeerAddresses[2], options.Nodes[0], options.PeerAddresses[0],
 		options.Nodes[1], options.PeerAddresses[1], options.Nodes[2], options.PeerAddresses[2]))
+	if len(options.SchemaStatements) != 0 || len(options.GlobalIndexes) != 0 {
+		fields, err := vibejson.Marshal(&struct {
+			SchemaStatements []string                                  `json:"schema_statements,omitempty"`
+			GlobalIndexes    []sqldriver.ReplicatedGlobalIndexRelation `json:"global_indexes,omitempty"`
+		}{options.SchemaStatements, options.GlobalIndexes})
+		if err != nil {
+			panic(err)
+		}
+		// This marker occurs only in the child template (the top-level WAL
+		// begins with path), and keeps the optional fields in canonical order.
+		position := bytes.Index(document, []byte(`,"wal":{"key_id":`))
+		if position < 0 {
+			panic("missing split child WAL template")
+		}
+		withSchema := make([]byte, 0, len(document)+len(fields))
+		withSchema = append(withSchema, document[:position]...)
+		withSchema = append(withSchema, ',')
+		withSchema = append(withSchema, fields[1:len(fields)-1]...)
+		document = append(withSchema, document[position:]...)
+	}
 	if options.Target == nil {
 		return document
 	}

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -47,6 +48,45 @@ func NewReplicatedChildShardStoreIdentity(
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 			"%w: %v", ErrReplicatedShardStoreProfile, err,
 		)
+	}
+	return identity, nil
+}
+
+// NewReplicatedChildShardStoreBundleIdentity copies only authenticated schema
+// from a retained source. The topology allocator must issue every destination
+// storage name explicitly; none is derived from a relation or collection name.
+func NewReplicatedChildShardStoreBundleIdentity(local ShardStoreIdentity,
+	binding ReplicatedShardStoreBinding, source ReplicatedShardStoreIdentity, storages []string,
+) (ReplicatedShardStoreIdentity, error) {
+	if err := validateReplicatedShardStoreIdentity(source); err != nil {
+		return ReplicatedShardStoreIdentity{}, err
+	}
+	if len(storages) != int(source.RelationCount) || binding.Authority.SchemaGeneration != source.RelationSchemaGeneration ||
+		binding.ClusterID != source.Binding.ClusterID || binding.ClusterIncarnation != source.Binding.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != source.Binding.TopologyRecoveryEpoch || binding.Distribution != source.Binding.Distribution {
+		return ReplicatedShardStoreIdentity{}, ErrReplicatedShardStoreProfile
+	}
+	identity, err := NewReplicatedChildShardStoreIdentity(local, binding, source.UserTable, storages[0], source.UserPrimaryKey, source.UserLimits)
+	if err != nil {
+		return ReplicatedShardStoreIdentity{}, err
+	}
+	identity.Relations = slices.Clone(source.Relations)
+	identity.RelationCount = source.RelationCount
+	for i := range identity.Relations {
+		if validateStorageIdentity(storages[i]) != nil {
+			return ReplicatedShardStoreIdentity{}, ErrReplicatedShardStoreProfile
+		}
+		for j := 0; j < i; j++ {
+			if storages[i] == storages[j] {
+				return ReplicatedShardStoreIdentity{}, ErrReplicatedShardStoreProfile
+			}
+		}
+		identity.Relations[i].Storage = strings.Clone(storages[i])
+		identity.Relations[i].Table = strings.Clone(identity.Relations[i].Table)
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
+	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
+		return ReplicatedShardStoreIdentity{}, err
 	}
 	return identity, nil
 }

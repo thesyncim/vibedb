@@ -158,7 +158,7 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 		}
 		if !rf3SplitChildTemplateMatchesRetained(
 			single.SplitControl.ChildRegistry, base, applyIdentity,
-		) {
+		) || !rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
 			return result, closePreparedRF3Groups(result.groups,
 				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index))
 		}
