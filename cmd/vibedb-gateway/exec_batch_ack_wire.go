@@ -128,9 +128,10 @@ func (request *durableExecBatchAckWireRequest) UnmarshalVibeJSON(
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
 	var ordinal uint64
-	if cursor, ordinal, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+	// Match exec_batch's zero-based lane identity without relaxing epoch/sequence.
+	if cursor, ordinal, err = decodeServeUint64(cursor); err != nil ||
 		ordinal >= uint64(gateway.MaxReplicatedIssuerLanes) {
-		return cursor, err
+		return cursor, errInvalidDurableExecBatchAckRequest
 	}
 	request.Identity.Reference.LaneOrdinal = uint16(ordinal)
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(6)) {

@@ -92,7 +92,8 @@ func (envelope *durableExecBatchEnvelope) UnmarshalVibeJSON(
 		return cursor, errInvalidDurableExecBatch
 	}
 	var ordinal uint64
-	if cursor, ordinal, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+	// Issuer lanes are zero-based; epochs and sequences remain positive-only.
+	if cursor, ordinal, err = decodeServeUint64(cursor); err != nil ||
 		ordinal >= uint64(gateway.MaxReplicatedIssuerLanes) ||
 		!cursor.Field(false, durableExecBatchFields.Field(5)) {
 		return cursor, errInvalidDurableExecBatch

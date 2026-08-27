@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/asn1"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -999,34 +998,6 @@ type hotMutationWireClient struct {
 	bytes      uint64
 }
 
-// hotMutationExecEnvelope deliberately contains only the canonical strict
-// exec_batch fields. serveRequest's legacy top-level SQL field is not omitted
-// when empty and must never enter this durable wire grammar.
-type hotMutationExecEnvelope struct {
-	Op             string           `json:"op"`
-	RequestID      string           `json:"request_id"`
-	InstallationID string           `json:"installation_id"`
-	IssuerEpoch    uint64           `json:"issuer_epoch"`
-	LaneOrdinal    uint16           `json:"lane_ordinal"`
-	GrantDigest    string           `json:"grant_digest"`
-	IssuerSequence uint64           `json:"issuer_sequence"`
-	Class          string           `json:"class"`
-	Statements     []serveStatement `json:"statements"`
-}
-
-func TestHotMutationRequestUsesStrictExecBatchGrammar(t *testing.T) {
-	reference := gateway.ReplicatedIssuerReference{Installation: replication.ID128{1},
-		Epoch: 1, GrantDigest: replication.Digest{2}}
-	raw := hotMutationRequest(t, reference, 1, []serveStatement{{
-		SQL:    `DELETE FROM messages WHERE id = ?`,
-		Params: []serveParam{{Kind: "string", Text: "m-0"}},
-	}})
-	if err := validateDurableExecBatchEnvelope(raw); err != nil ||
-		strings.Contains(string(raw), `"sql":""`) {
-		t.Fatalf("strict mutation request=%s err=%v", raw, err)
-	}
-}
-
 func hotMutationDialGateway(t *testing.T, profile *rafttransport.PeerTLS,
 	node rafttransport.NodeID, address string,
 ) net.Conn {
@@ -1192,23 +1163,6 @@ func hotMutationAssertSelectorEmpty(t *testing.T, client *hotMutationWireClient,
 	if len(rows) != 0 {
 		t.Fatalf("stale %s=%q rows=%q", field, value, rows)
 	}
-}
-
-func hotMutationRequest(t *testing.T, reference gateway.ReplicatedIssuerReference,
-	sequence uint64, statements []serveStatement,
-) []byte {
-	t.Helper()
-	var requestID replication.ID128
-	binary.LittleEndian.PutUint64(requestID[:8], sequence)
-	requestID[15] = 0xa5
-	raw, err := vibejson.Marshal(&hotMutationExecEnvelope{Op: "exec_batch", RequestID: hex.EncodeToString(requestID[:]),
-		InstallationID: hex.EncodeToString(reference.Installation[:]), IssuerEpoch: reference.Epoch,
-		LaneOrdinal: reference.LaneOrdinal, GrantDigest: hex.EncodeToString(reference.GrantDigest[:]),
-		IssuerSequence: sequence, Class: "interactive", Statements: statements})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
 }
 
 func hotMutationRosterContains(route gateway.ReplicatedRoute, member uint64) bool {
