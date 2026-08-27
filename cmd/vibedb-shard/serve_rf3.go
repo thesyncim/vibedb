@@ -608,11 +608,49 @@ func servePreparedRF3WithExecutionLanes(
 			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
 	}
+	var childPrepareControl shardcontrol.Handler
+	if nativeListener != nil {
+		childPaths, childErr := newRF3SplitChildPathRegistry(manifest.SplitControl.ChildRegistry)
+		if childErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(childErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+		childPreparer, childErr := newRF3ChildPreparer(
+			childPaths, profile.LocalIdentity().Node,
+			peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(),
+		)
+		if childErr == nil {
+			concurrency := min(manifest.SplitControl.ChildRegistry.MaxOperations, 8)
+			childPrepareControl, childErr = splitcontroller.NewChildPrepareService(
+				splitcontroller.ChildPrepareServiceOptions{
+					Preparer: childPreparer,
+					Authorize: func(identity rafttransport.PeerIdentity, request splitcontroller.ChildPreparation) bool {
+						return request.ReplicaTarget().Node == profile.LocalIdentity().Node &&
+							policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+					},
+					ReadDeadline: deadline, WriteDeadline: deadline,
+					MaxConcurrent:    concurrency,
+					MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * uint64(concurrency),
+				},
+			)
+		}
+		if childErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(childErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+	}
 	// Split control remains absent until this process can reconstruct the
 	// complete durable plan observation and execute every action class. The mux
 	// has a fixed shipped route for it once that runtime is supplied; it must not
 	// advertise a partial or memory-only executor.
-	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil, nil, nil, nil)
+	controlMux, err := newRF3ControlMux(
+		membershipControl, observationControl, sourceControl, actionControl,
+		nil, nil, nil, nil, childPrepareControl,
+	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
@@ -763,9 +801,10 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action, split, schema, admission, tail shardcontrol.Handler,
+	membership, observation, source, action, split, schema, admission, tail,
+	childPrepare shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 8)
+	routes := make([]shardcontrol.Route, 0, 9)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -810,6 +849,12 @@ func newRF3ControlMux(
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: splitcontroller.TailStreamRequestDiscriminator(),
 			Handler:       tail,
+		})
+	}
+	if childPrepare != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: splitcontroller.ChildPrepareRequestDiscriminator(),
+			Handler:       childPrepare,
 		})
 	}
 	return shardcontrol.New(routes...)
