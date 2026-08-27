@@ -242,22 +242,14 @@ func walRetentionDuplicateWave(t testing.TB, fixture *rf3FaultFixture, member in
 	state shardservice.ReplicatedMemberState, command []byte) {
 	t.Helper()
 	const callers = 32
-	type result struct {
-		response *shardservice.ReplicatedResponse
-		err      error
-	}
-	results := make(chan result, callers)
-	for range callers {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			response, err := fixture.roundTripContext(ctx, member, fixture.proposalRequest(member, state, command))
-			results <- result{response: response, err: err}
-		}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	results, err := fixture.roundTripWave(ctx, member, fixture.proposalRequest(member, state, command), callers)
+	if err != nil {
+		t.Fatalf("duplicate wave preparation: %v", err)
 	}
 	completed := 0
-	for range callers {
-		result := <-results
+	for _, result := range results {
 		if result.err != nil {
 			t.Fatal(result.err)
 		}

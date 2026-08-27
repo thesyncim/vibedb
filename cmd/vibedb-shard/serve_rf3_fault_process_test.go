@@ -235,23 +235,15 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 			coalesced = append([]byte(nil), waveCommand...)
 		}
 		const callers = int(rf3bench.RequiredWaiterCallsPerWave)
-		results := make(chan rf3FaultRoundTrip, callers)
-		var launch sync.WaitGroup
-		launch.Add(callers)
-		for range callers {
-			go func() {
-				defer launch.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				response, callErr := fixture.roundTripContext(ctx, leader,
-					fixture.proposalRequest(leader, states[leader], waveCommand))
-				results <- rf3FaultRoundTrip{response: response, err: callErr}
-			}()
+		waveCtx, cancelWave := context.WithTimeout(context.Background(), 30*time.Second)
+		results, waveErr := fixture.roundTripWave(waveCtx, leader,
+			fixture.proposalRequest(leader, states[leader], waveCommand), callers)
+		cancelWave()
+		if waveErr != nil {
+			t.Fatalf("bounded waiter wave %d preparation failed: %v", wave+1, waveErr)
 		}
-		launch.Wait()
-		close(results)
 		waveCompleted := uint32(0)
-		for result := range results {
+		for _, result := range results {
 			if result.err != nil {
 				t.Fatalf("bounded waiter wave %d caller leaked/block-failed: %v", wave+1, result.err)
 			}
@@ -926,6 +918,15 @@ func (fixture *rf3FaultFixture) roundTrip(t testing.TB, member int, request *sha
 }
 
 func (fixture *rf3FaultFixture) roundTripContext(ctx context.Context, member int, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	connection, err := fixture.dialNative(ctx, member)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+	return shardservice.RoundTripReplicated(ctx, connection, request)
+}
+
+func (fixture *rf3FaultFixture) dialNative(ctx context.Context, member int) (rafttransport.PeerConnection, error) {
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", fixture.nativeAddresses[member])
 	if err != nil {
 		return nil, err
@@ -937,8 +938,7 @@ func (fixture *rf3FaultFixture) roundTripContext(ctx context.Context, member int
 		_ = raw.Close()
 		return nil, err
 	}
-	defer connection.Close()
-	return shardservice.RoundTripReplicated(ctx, connection, request)
+	return connection, nil
 }
 
 func (fixture *rf3FaultFixture) sendWithoutReadingResponse(
