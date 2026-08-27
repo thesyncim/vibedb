@@ -155,4 +155,8 @@ func TestMetricsNodeStageSnapshotIsAuthenticatedAndCanonical(t *testing.T) {
 	if _, err = OpenResponse(encoded[:]); err == nil {
 		t.Fatal("corrupt stage frame accepted")
 	}
+	malformed := appendResponse(Snapshot{Member: 1})
+	if _, err = OpenResponse(malformed[:]); err == nil {
+		t.Fatal("node aggregate with member accepted")
+	}
 }

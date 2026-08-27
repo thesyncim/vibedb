@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -107,5 +108,25 @@ func BenchmarkDistributedMetricsSnapshotInto(b *testing.B) {
 		if _, _, err := metrics.SnapshotInto(workspace); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestDistributedMetricsAggregateSaturatesOverflow(t *testing.T) {
+	base := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	other := base
+	other.GroupID[0] = 6
+	metrics, err := NewDistributedMetrics(distributedMetricsTestOpener{}, []ReplicatedRoute{
+		{Group: base, Replicas: []ReplicatedEndpoint{{Member: 1, Node: rafttransport.NodeID{1}}}},
+		{Group: other, Replicas: []ReplicatedEndpoint{{Member: 2, Node: rafttransport.NodeID{1}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.slots[0].values[2].Store(math.MaxUint64)
+	metrics.slots[1].values[2].Store(1)
+	aggregate, err := metrics.Aggregate()
+	if err != nil || !aggregate.Overflow || aggregate.Cut.AppliedEntries != math.MaxUint64 {
+		t.Fatalf("aggregate=%+v err=%v", aggregate, err)
 	}
 }
