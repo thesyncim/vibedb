@@ -68,11 +68,11 @@ func (network *multiGroupRF3Network) nodeIsolated(node int) bool {
 	network.mu.Lock()
 	defer network.mu.Unlock()
 	for peer := 0; peer < multiGroupRF3Voters; peer++ {
-		if peer != node && network.blocked[node][peer] && network.blocked[peer][node] {
-			return true
+		if peer != node && (!network.blocked[node][peer] || !network.blocked[peer][node]) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (network *multiGroupRF3Network) heal(node int) {
