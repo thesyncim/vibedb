@@ -324,7 +324,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 			t.Fatalf("unbounded gateway journal tree %q", journal)
 		}
 	}
-	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true terminal_response_lost=true ack_response_lost=true partition_failover=%s terminal_failover=%s ack_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d client_network_bytes=%d snapshot_network_bytes=%d ack_gc_complete=true pin_journals_retired=true",
+	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d client_network_bytes=%d snapshot_network_bytes=%d ack_gc_complete=true pin_journals_retired=true",
 		partitionFailover, terminalFailover, ackFailover, p99, rssGrowth, storageGrowth,
 		walGrowth, clientBytes, snapshotGrowth)
 }
