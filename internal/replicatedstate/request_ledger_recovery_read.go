@@ -200,7 +200,8 @@ func (m *Machine) RequestLedgerReadInto(
 	}
 
 	// The tombstone is the first and authoritative point read for every kind.
-	ackKey := requestledger.AppendAckKey(nil, home, keyDigest)
+	var storageKey [requestledger.PayloadStorageKeyBytes]byte
+	ackKey := requestledger.AppendAckKey(storageKey[:0], home, keyDigest)
 	ackRaw, ackFound, err := snapshot.AppendRaw(dst[:0], ackKey)
 	if err == nil && ackFound {
 		ack, openErr := requestledger.OpenAck(ackRaw)
@@ -213,7 +214,7 @@ func (m *Machine) RequestLedgerReadInto(
 		}
 	}
 	if err == nil && !ackFound {
-		headKey := requestledger.AppendHeadKey(nil, home, keyDigest)
+		headKey := requestledger.AppendHeadKey(storageKey[:0], home, keyDigest)
 		headRaw, headFound, headErr := snapshot.AppendRaw(dst[:0], headKey)
 		err = headErr
 		if err == nil && headFound {
@@ -231,7 +232,7 @@ func (m *Machine) RequestLedgerReadInto(
 					result.AuthoritativeKind = RequestLedgerReadWave
 				}
 			} else {
-				selectedKey := requestLedgerReadStorageKey(request, home, keyDigest)
+				selectedKey := requestLedgerReadStorageKey(storageKey[:0], request, home, keyDigest)
 				if selectedKey == nil {
 					err = ErrRequestLedgerRead
 				} else {
@@ -272,7 +273,8 @@ func requestLedgerWaveRead(
 	clear(value[:requestLedgerWaveReadHeaderBytes])
 
 	routeStart := len(value)
-	routeKey := requestledger.AppendRoutePinKey(nil, home, keyDigest)
+	var storageKey [requestledger.FixedStorageKeyBytes]byte
+	routeKey := requestledger.AppendRoutePinKey(storageKey[:0], home, keyDigest)
 	var routeFound bool
 	var err error
 	value, routeFound, err = snapshot.AppendRaw(value, routeKey)
@@ -285,7 +287,7 @@ func requestLedgerWaveRead(
 	}
 
 	pendingStart := len(value)
-	pendingKey := requestledger.AppendPendingKey(nil, home, keyDigest)
+	pendingKey := requestledger.AppendPendingKey(storageKey[:0], home, keyDigest)
 	var pendingFound bool
 	value, pendingFound, err = snapshot.AppendRaw(value, pendingKey)
 	if err != nil {
@@ -367,31 +369,32 @@ func requestLedgerIssuerStatusRead(
 }
 
 func requestLedgerReadStorageKey(
+	dst []byte,
 	request RequestLedgerReadRequest,
 	home requestledger.LedgerHome,
 	key requestledger.Digest,
 ) []byte {
 	switch request.Kind {
 	case RequestLedgerReadPlanPage:
-		return requestledger.AppendPlanPageKey(nil, home, key, request.Ordinal)
+		return requestledger.AppendPlanPageKey(dst, home, key, request.Ordinal)
 	case RequestLedgerReadPending:
-		return requestledger.AppendPendingKey(nil, home, key)
+		return requestledger.AppendPendingKey(dst, home, key)
 	case RequestLedgerReadTerminal:
-		return requestledger.AppendTerminalKey(nil, home, key)
+		return requestledger.AppendTerminalKey(dst, home, key)
 	case RequestLedgerReadAck:
-		return requestledger.AppendAckKey(nil, home, key)
+		return requestledger.AppendAckKey(dst, home, key)
 	case RequestLedgerReadContinuation:
-		return requestledger.AppendContinuationKey(nil, home, key)
+		return requestledger.AppendContinuationKey(dst, home, key)
 	case RequestLedgerReadPayloadChunk:
-		return requestledger.AppendPayloadChunkKey(nil, home, key, request.ContentRoot, request.Ordinal)
+		return requestledger.AppendPayloadChunkKey(dst, home, key, request.ContentRoot, request.Ordinal)
 	case RequestLedgerReadPayloadBuild:
-		return requestledger.AppendPayloadBuildKey(nil, home, key)
+		return requestledger.AppendPayloadBuildKey(dst, home, key)
 	case RequestLedgerReadRoutePin:
-		return requestledger.AppendRoutePinKey(nil, home, key)
+		return requestledger.AppendRoutePinKey(dst, home, key)
 	case RequestLedgerReadPrepared:
-		return requestledger.AppendPreparedTerminalKey(nil, home, key)
+		return requestledger.AppendPreparedTerminalKey(dst, home, key)
 	case RequestLedgerReadSchemaPin:
-		return requestledger.AppendSchemaPinReleaseKey(nil, home, key)
+		return requestledger.AppendSchemaPinReleaseKey(dst, home, key)
 	default:
 		return nil
 	}

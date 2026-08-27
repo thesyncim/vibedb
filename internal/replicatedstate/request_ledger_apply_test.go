@@ -107,6 +107,34 @@ func TestRequestLedgerWaveRecoveryReadUsesOneCoherentCut(t *testing.T) {
 	}
 }
 
+func BenchmarkRequestLedgerWaveRecoveryRead(b *testing.B) {
+	fixture := newRequestLedgerMachineFixture(b, 64<<20)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		b.Fatal(err)
+	}
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest{0x11}, Principal: requestledger.PrincipalID{0x21},
+		Request: requestledger.RequestID{0x31}}
+	create, _ := requestLedgerCreateCommand(b, fixture, key)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), create); err != nil {
+		b.Fatal(err)
+	}
+	read := RequestLedgerReadRequest{
+		Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Kind: RequestLedgerReadWave, MinimumApplied: 2,
+		MaxBytes: uint32(RequestLedgerReadMaxBytes(RequestLedgerReadWave)),
+	}
+	dst := make([]byte, 0, read.MaxBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		result, err := fixture.machine.RequestLedgerReadInto(read, dst[:0])
+		if err != nil || !result.Found {
+			b.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+}
+
 func requestLedgerCreateCommand(t testing.TB, fixture machineFixture, key requestledger.RequestKey) ([]byte, requestledger.HeadRecord) {
 	t.Helper()
 	plan, err := requestledger.AppendPlan(nil, []byte("canonical durable recipe"))
