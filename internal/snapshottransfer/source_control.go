@@ -218,6 +218,18 @@ func (service *SourceControlService) Serve(ctx context.Context, connection raftt
 	if err != nil {
 		return err
 	}
+	return service.serveCommand(ctx, connection, command, request)
+}
+
+func (service *SourceControlService) serveCommand(
+	ctx context.Context, connection rafttransport.PeerConnection,
+	command sourceControlCommand, request SourceControlRequest,
+) error {
+	if service == nil || ctx == nil || connection == nil ||
+		connection.TrafficClass() != rafttransport.TrafficShardControl ||
+		command > sourceControlRelease || !validSourceControlRequest(request) {
+		return ErrSourceUnauthorized
+	}
 	peer := connection.PeerIdentity()
 	wantDomain := rafttransport.TrustDomain{
 		ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation,
@@ -225,7 +237,10 @@ func (service *SourceControlService) Serve(ctx context.Context, connection raftt
 	if peer.TrustDomain != wantDomain || !service.authorize(peer, request) {
 		return ErrSourceUnauthorized
 	}
-	var record SourceControlRecord
+	var (
+		record SourceControlRecord
+		err    error
+	)
 	if command == sourceControlRelease {
 		record, err = service.Release(ctx, request)
 	} else {
@@ -482,6 +497,12 @@ func readSourceControlCommand(reader io.Reader) (
 	if _, err := io.ReadFull(reader, raw[:]); err != nil {
 		return 0, SourceControlRequest{}, err
 	}
+	return openSourceControlCommand(raw)
+}
+
+func openSourceControlCommand(raw [SourceControlRequestBytes]byte) (
+	sourceControlCommand, SourceControlRequest, error,
+) {
 	command := sourceControlCommand(raw[208])
 	if command > sourceControlRelease || !allZero(raw[209:216]) {
 		return 0, SourceControlRequest{}, ErrSourceControl
