@@ -75,14 +75,16 @@ file containing the last authenticated catalog head that can locate catalog
 RF3. Do not share this path, or the catalog session journal, between gateway
 process identities.
 
-Every authenticated authoritative catalog read and successful publication is
-fed through one certified-head persistence gate. A byte-identical head performs
-no disk write. A newer head whose catalog self-route retains the exact native
-session binding is staged, synced, and promoted while the gateway remains live.
-A head that changes that binding is staged first and seals catalog authority
-before the new head can reach the holder. The command then stops accepting
-work, drains all catalog users, retires and releases the old replicated session,
-destroys its journal, promotes the staged seed, and exits with
+Route-seed control installation performs one attested catch-up read before the
+gateway starts serving. After installation, every subsequent authenticated
+authoritative catalog read and successful publication is fed through the same
+certified-head persistence gate. A byte-identical head performs no disk write.
+A newer head that retains the exact catalog self-route is staged, synced, and
+promoted while the gateway remains live. Any catalog self-route change is
+staged first and seals catalog authority before the new head can reach the
+holder. The command then stops accepting work, drains all catalog users,
+retires and releases the old replicated session, destroys its journal, promotes
+the staged seed, and exits with
 `gateway.ErrReplicatedCatalogRouteRestartRequired`. Run the command under a
 supervisor that restarts it after this fail-closed handoff. Startup resumes the
 same transition from the pending seed and journal after a crash at any step.
