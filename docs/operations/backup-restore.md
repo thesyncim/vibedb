@@ -3,6 +3,15 @@
 VibeDB does not yet ship a safe live RF3 cluster backup or restore command.
 This is an explicit unreleased boundary, not an invitation to copy live files.
 
+The `internal/clusterbackup` boundary now certifies one complete catalog group
+inventory against exact per-group snapshot index/term, lineage, relation
+manifest, artifact hash/bytes, and artifact-manifest digest. The canonical
+certificate has a 16 MiB total byte bound; group count is derived from that
+bound rather than an arbitrary participant limit. Restore admission requires
+the complete ordered verified-artifact vector and returns only a non-serving
+staging permit for a new cluster identity. It cannot mint a member, store,
+ownership epoch, route generation, or membership grant.
+
 ## Why replica snapshots are not backups
 
 Learner bootstrap creates an authenticated snapshot artifact for one exact RF3
@@ -66,3 +75,9 @@ A live command is complete only when an external kill/partition test proves:
 - retention release only after an authenticated completed or abandoned backup;
 - bounded foreground p99.9 impact, memory, network, WAL retention, and artifact
   space amplification.
+
+The exact remaining composition is a catalog-RF3 operation record and
+controller that drives artifact export/retention for every certified group,
+persists the certificate before release, transfers it to backup storage, and
+uses the staging permit to build new roots before a separate catalog bootstrap
+grants serving authority. No existing command performs those steps yet.
