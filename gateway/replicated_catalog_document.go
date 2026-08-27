@@ -40,6 +40,9 @@ var (
 	replicatedCatalogHeadWitnessDocumentID = [...]byte{
 		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'w', 'i', 't', 'n', 'e', 's', 's',
 	}
+	replicatedCatalogGenesisDocumentID = [...]byte{
+		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'g', 'e', 'n', 'e', 's', 'i', 's',
+	}
 	replicatedReplicaReplacementReceiptDocumentID = [...]byte{
 		'c', 'a', 't', 'a', 'l', 'o', 'g', '/',
 		'r', 'e', 'p', 'l', 'a', 'c', 'e', 'm', 'e', 'n', 't',
@@ -56,6 +59,7 @@ var (
 
 	replicatedCatalogHeadKey        = fixedControlPlaneKey(replicatedCatalogHeadDocumentID[:])
 	replicatedCatalogHeadWitnessKey = fixedControlPlaneKey(replicatedCatalogHeadWitnessDocumentID[:])
+	replicatedCatalogGenesisKey     = fixedControlPlaneKey(replicatedCatalogGenesisDocumentID[:])
 	replicatedOperationDirectoryKey = fixedControlPlaneKey(
 		replicatedOperationDirectoryDocumentID[:],
 	)

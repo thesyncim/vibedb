@@ -31,6 +31,7 @@ const (
 	maxReplicatedOperations              = 64
 	maxReplicatedOperationDirectoryBytes = 16 << 10
 	maxReplicatedCatalogHeadWitnessBytes = 512
+	maxReplicatedCatalogGenesisBytes     = 512
 	// One catalog head remains one atomic relation value. The final /id
 	// envelope—not merely its nested catalog payload—must fit the replicated
 	// mutation grammar.
@@ -38,6 +39,12 @@ const (
 )
 
 type persistedCatalogHeadWitness struct {
+	Generation uint64   `json:"generation"`
+	HeadBytes  uint64   `json:"head_bytes"`
+	HeadDigest [32]byte `json:"head_digest"`
+}
+
+type persistedCatalogGenesis struct {
 	Generation uint64   `json:"generation"`
 	HeadBytes  uint64   `json:"head_bytes"`
 	HeadDigest [32]byte `json:"head_digest"`
@@ -208,7 +215,28 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 		return replicatedCatalogCut{}, err
 	}
 	if !result.Found {
-		return replicatedCatalogCut{}, ErrReplicatedCatalogMissing
+		genesis, genesisErr := authority.readRaw(
+			ctx, replicatedCatalogGenesisKey, uint32(maxReplicatedCatalogGenesisBytes),
+		)
+		if genesisErr != nil {
+			return replicatedCatalogCut{}, genesisErr
+		}
+		if !genesis.Found {
+			return replicatedCatalogCut{}, ErrReplicatedCatalogMissing
+		}
+		// A concurrent atomic genesis publication can linearize between the
+		// first head read and the genesis read. Re-read the head once; a still
+		// missing head beside an immutable genesis proof is durable corruption,
+		// never authorization to recreate generation one.
+		result, err = authority.readRaw(
+			ctx, replicatedCatalogHeadKey, uint32(maxReplicatedCatalogBytes),
+		)
+		if err != nil {
+			return replicatedCatalogCut{}, err
+		}
+		if !result.Found {
+			return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
+		}
 	}
 	payload, err := openTypedControlPlaneDocument(result.Value,
 		replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes)
@@ -218,6 +246,19 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 	snapshot, err := OpenSnapshotDocument(payload)
 	if err != nil {
 		return replicatedCatalogCut{}, err
+	}
+	genesisResult, err := authority.readRaw(
+		ctx, replicatedCatalogGenesisKey, uint32(maxReplicatedCatalogGenesisBytes),
+	)
+	if err != nil || !genesisResult.Found {
+		return replicatedCatalogCut{}, errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	var genesisHead []byte
+	if snapshot.Generation() == 1 {
+		genesisHead = result.Value
+	}
+	if validateReplicatedCatalogGenesis(genesisResult.Value, genesisHead) != nil {
+		return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
 	}
 	witnessResult, err := authority.readRaw(ctx, replicatedCatalogHeadWitnessKey,
 		uint32(maxReplicatedCatalogBytes))
@@ -432,6 +473,80 @@ func validateReplicatedCatalogHeadWitness(raw []byte, generation uint64, head []
 	return nil
 }
 
+func appendReplicatedCatalogGenesis(dst, head []byte) ([]byte, error) {
+	if len(head) == 0 || len(head) > maxReplicatedCatalogBytes {
+		return dst, ErrReplicatedCatalog
+	}
+	persisted := persistedCatalogGenesis{
+		Generation: 1, HeadBytes: uint64(len(head)), HeadDigest: sha256.Sum256(head),
+	}
+	payload, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		return dst, err
+	}
+	return appendControlPlaneDocument(
+		dst, replicatedCatalogGenesisDocumentID[:], payload,
+		maxReplicatedCatalogGenesisBytes,
+	)
+}
+
+func validateReplicatedCatalogGenesis(raw, initialHead []byte) error {
+	payload, err := openTypedControlPlaneDocument(
+		raw, replicatedCatalogGenesisDocumentID[:], maxReplicatedCatalogGenesisBytes,
+	)
+	if err != nil {
+		return err
+	}
+	var persisted persistedCatalogGenesis
+	if err = vibejson.Unmarshal(payload, &persisted); err != nil ||
+		persisted.Generation != 1 || persisted.HeadBytes == 0 ||
+		persisted.HeadBytes > maxReplicatedCatalogBytes ||
+		persisted.HeadDigest == ([sha256.Size]byte{}) {
+		return errors.Join(err, ErrReplicatedCatalog)
+	}
+	canonicalPayload, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		return err
+	}
+	canonical, err := appendControlPlaneDocument(
+		nil, replicatedCatalogGenesisDocumentID[:], canonicalPayload,
+		maxReplicatedCatalogGenesisBytes,
+	)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return errors.Join(err, ErrReplicatedCatalog)
+	}
+	if initialHead != nil && (persisted.HeadBytes != uint64(len(initialHead)) ||
+		persisted.HeadDigest != sha256.Sum256(initialHead)) {
+		return ErrReplicatedCatalogConflict
+	}
+	return nil
+}
+
+// AttestGenesis proves that candidate is the immutable generation-one catalog
+// committed atomically with the replicated head and witness. It remains valid
+// after the mutable head advances and introduces no node-local bootstrap bit.
+func (authority *ReplicatedCatalogAuthority) AttestGenesis(
+	ctx context.Context, candidate *Snapshot,
+) error {
+	if authority == nil || ctx == nil || candidate == nil || candidate.Generation() != 1 {
+		return ErrReplicatedCatalog
+	}
+	head, err := appendReplicatedCatalogDocument(nil, candidate, maxReplicatedCatalogBytes)
+	if err != nil {
+		return err
+	}
+	result, err := authority.readRaw(
+		ctx, replicatedCatalogGenesisKey, uint32(maxReplicatedCatalogGenesisBytes),
+	)
+	if err != nil || !result.Found {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	if err = validateReplicatedCatalogGenesis(result.Value, head); err != nil {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	return nil
+}
+
 // Refresh implements the shipped gateway RefreshFunc using a linearizable RF3
 // point read instead of the static file authority.
 func (authority *ReplicatedCatalogAuthority) Refresh(ctx context.Context, staleGeneration uint64) (*Snapshot, error) {
@@ -499,6 +614,12 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	if err != nil {
 		return err
 	}
+	genesisResult, err := authority.readRaw(
+		ctx, replicatedCatalogGenesisKey, uint32(maxReplicatedCatalogGenesisBytes),
+	)
+	if err != nil {
+		return err
+	}
 	authority.scratch = authority.scratch[:0]
 	authority.scratch, err = appendReplicatedCatalogDocument(
 		authority.scratch, next, maxReplicatedCatalogBytes,
@@ -510,13 +631,25 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	if err != nil {
 		return err
 	}
-	mutations := make([]NativeMutation, 0, 2)
+	mutations := make([]NativeMutation, 0, 3)
 	var native NativeResult
 	if !currentResult.Found {
-		if expectedGeneration != 0 || currentWitness.Found {
+		if expectedGeneration != 0 {
 			return ErrCatalogGenerationMismatch
 		}
+		if currentWitness.Found || genesisResult.Found {
+			return ErrReplicatedCatalogConflict
+		}
+		if next.Generation() != 1 {
+			return ErrCatalogGenerationMismatch
+		}
+		genesis, genesisErr := appendReplicatedCatalogGenesis(nil, authority.scratch)
+		if genesisErr != nil {
+			return genesisErr
+		}
 		mutations = append(mutations,
+			NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
+				Key: replicatedCatalogGenesisKey, Value: genesis},
 			NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
 				Key: replicatedCatalogHeadKey, Value: authority.scratch},
 			NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
@@ -532,6 +665,14 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 		current, openErr := OpenSnapshotDocument(currentPayload)
 		if openErr != nil {
 			return openErr
+		}
+		var genesisHead []byte
+		if current.Generation() == 1 {
+			genesisHead = currentResult.Value
+		}
+		if !genesisResult.Found ||
+			validateReplicatedCatalogGenesis(genesisResult.Value, genesisHead) != nil {
+			return ErrReplicatedCatalogConflict
 		}
 		if current.Generation() != expectedGeneration || next.Generation() <= expectedGeneration {
 			return ErrCatalogGenerationMismatch

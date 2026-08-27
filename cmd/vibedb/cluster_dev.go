@@ -1089,7 +1089,7 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 			return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
 		}
 	}
-	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-bootstrap-marker", filepath.Join(filepath.Dir(m.CatalogPath), "catalog-bootstrap-complete"), "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-durable-ack-key", m.DurableAckKey, "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
+	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-bootstrap-if-missing", "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-durable-ack-key", m.DurableAckKey, "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
 	for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers, m.DataMembers} {
 		for _, member := range members {
 			args = append(args, "-shard-peer", member.Native+"="+member.Node)

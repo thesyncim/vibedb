@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -17,34 +15,6 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
-
-func TestCatalogBootstrapMarkerIsDurableAndExact(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "catalog-bootstrap-complete")
-	digest := [32]byte{0x51}
-	if marked, err := readCatalogBootstrapMarker(path, digest); err != nil || marked {
-		t.Fatalf("absent marker marked=%v err=%v", marked, err)
-	}
-	if err := persistCatalogBootstrapMarker(path, digest); err != nil {
-		t.Fatal(err)
-	}
-	if marked, err := readCatalogBootstrapMarker(path, digest); err != nil || !marked {
-		t.Fatalf("retained marker marked=%v err=%v", marked, err)
-	}
-	if err := persistCatalogBootstrapMarker(path, digest); err != nil {
-		t.Fatalf("identical marker retry: %v", err)
-	}
-	conflict := digest
-	conflict[0]++
-	if err := persistCatalogBootstrapMarker(path, conflict); !errors.Is(err, gateway.ErrReplicatedCatalogConflict) {
-		t.Fatalf("conflicting marker error=%v", err)
-	}
-	if err := os.WriteFile(path, digest[:len(digest)-1], 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if marked, err := readCatalogBootstrapMarker(path, digest); marked || !errors.Is(err, gateway.ErrReplicatedCatalogConflict) {
-		t.Fatalf("partial marker marked=%v err=%v", marked, err)
-	}
-}
 
 // serveShard is one in-process shard server bound to a real loopback listener,
 // plus the ownership coordinates a request must carry to be admitted.
