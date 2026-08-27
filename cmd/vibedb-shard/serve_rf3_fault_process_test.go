@@ -264,7 +264,17 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 		qualification.WaiterWaves++
 		qualification.WaiterCalls += rf3bench.RequiredWaiterCallsPerWave
 		nextSequence++
-		states[leader] = fixture.probe(t, leader)
+		// Client Close precedes the server observing EOF and returning its
+		// connection slot. Wait within the same three-second probe budget.
+		probeCtx, cancelProbe := context.WithTimeout(context.Background(), 3*time.Second)
+		probeDeadline, _ := probeCtx.Deadline()
+		states[leader], waveErr = rf3FaultProbeAfterWave(probeCtx, func() (shardservice.ReplicatedMemberState, error) {
+			return fixture.tryProbe(leader, time.Until(probeDeadline))
+		})
+		cancelProbe()
+		if waveErr != nil {
+			t.Fatalf("waiter capacity wave %d did not return within probe budget: %v", wave+1, waveErr)
+		}
 		afterBound := fixture.propose(t, leader, states[leader], fixture.mutationCommand(
 			t, states[leader], epoch, nextSequence, fmt.Sprintf("waiter-capacity-reused-%d", wave+1)))
 		if afterBound.Kind != shardservice.ReplicatedCompletion {
