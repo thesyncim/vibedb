@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -408,6 +409,46 @@ type multiGroupRF3DurableGateway struct {
 	client   *multiGroupRequestLedgerRF3RoundTripper
 }
 
+func multiGroupRF3DurableCallerContext(t testing.TB, parent context.Context,
+	key requestledger.RequestKey, policyGeneration uint64,
+) context.Context {
+	t.Helper()
+	ctx, err := serviceauthz.WithAuthority(parent, serviceauthz.Authority{
+		Node: [16]byte(key.Principal), Generation: policyGeneration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx
+}
+
+func TestMultiGroupRF3DurableCallerConstructsAuthorizedProbe(t *testing.T) {
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{0xc1}}
+	ctx := multiGroupRF3DurableCallerContext(t, t.Context(), key, 5)
+	authority, ok := serviceauthz.FromContext(ctx)
+	if !ok || authority.Node != [16]byte(key.Principal) || authority.Generation != 5 {
+		t.Fatal("durable SQL caller context lost its request principal or policy generation")
+	}
+	request := &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
+		Authority: authority, Capability: serviceauthz.CapabilityDataWrite,
+		Fence: shardservice.ReplicatedFence{AllocationGeneration: 7, Group: raftmember.GroupKey{
+			ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
+			ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
+		}}}
+	var wire bytes.Buffer
+	if err := shardservice.EncodeReplicatedRequest(&wire, request); err != nil {
+		t.Fatalf("caller-bound route-gate probe is not encodable: %v", err)
+	}
+	decoded, err := shardservice.DecodeReplicatedRequest(&wire)
+	if err != nil || decoded.Authority != authority || decoded.Capability != serviceauthz.CapabilityDataWrite {
+		t.Fatalf("probe lost explicit caller authority: request=%+v error=%v", decoded, err)
+	}
+	request.Authority = serviceauthz.Authority{}
+	if err := shardservice.EncodeReplicatedRequest(io.Discard, request); err == nil {
+		t.Fatal("data-write probe without caller authority was accepted")
+	}
+}
+
 func newMultiGroupRF3DurableGateway(
 	t testing.TB,
 	cluster *multiGroupTransactionRF3Cluster,
@@ -710,6 +751,11 @@ func TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions(t *
 		Principal:    requestledger.PrincipalID{0xc1}, Request: requestledger.RequestID{0xd1},
 		IssuerEpoch: 11, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0xe1},
 	}
+	// Shipped requests arrive with an authenticated caller context. The ledger
+	// and session factories bind their own service identities, but participant
+	// route-gate discovery must retain the request's caller, not a gateway ID.
+	ctx = multiGroupRF3DurableCallerContext(t, ctx, requestKey,
+		cluster.route(0).Command.ActivePolicyGeneration)
 	point, err := requestledger.Home(requestKey)
 	if err != nil {
 		t.Fatal(err)

@@ -28,6 +28,7 @@ const (
 	walRetentionQualificationEnvironment = "VIBEDB_WAL_RETENTION_E2E"
 	walRetentionEvidenceEnvironment      = "VIBEDB_WAL_RETENTION_EVIDENCE"
 	walRetentionCycles                   = 3
+	walRetentionGenerationIntervalTicks  = 8
 	walRetentionKeysPerCycle             = 24
 	walRetentionDocumentBytes            = 64 << 10
 	walRetentionMaximumGrowthBytes       = 1 << 20
@@ -45,7 +46,7 @@ var walRetentionEvidenceRun atomic.Uint32
 // so three complete maintenance and crash cycles fit in a bounded CI job.
 func init() {
 	if os.Getenv(walRetentionQualificationEnvironment) == "1" {
-		rf3WALGenerationIntervalTicks = 8
+		rf3WALGenerationIntervalTicks = walRetentionGenerationIntervalTicks
 	}
 }
 
@@ -160,7 +161,19 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 		t.Fatalf("acknowledged command was not durably retired after crash loops: %+v", retired)
 	}
 
-	finalAllocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
+	// The last generation replacement above precedes the duplicate wave and
+	// fresh command. Let their asynchronous maintenance settle before measuring
+	// retained space; every private candidate/stage inode remains counted.
+	settleContext, cancelSettlement := context.WithTimeout(t.Context(), 45*time.Second)
+	finalAllocated, settleErr := waitWALRetentionSettlement(settleContext,
+		baselineAllocated+walRetentionMaximumGrowthBytes, 2*walRetentionGenerationIntervalTicks*rf3TickInterval,
+		func() (int64, error) { return rf3FaultWALDirectoryAllocatedBytes(fixture.walPaths[:]) })
+	cancelSettlement()
+	if settleErr != nil {
+		logWALRetentionInventory(t, fixture.walPaths[:])
+		t.Fatalf("retained WAL did not settle within 45s: allocated=%d baseline=%d bound=%d: %v",
+			finalAllocated, baselineAllocated, walRetentionMaximumGrowthBytes, settleErr)
+	}
 	if finalAllocated <= 0 {
 		t.Fatal("final WAL allocation has no physical blocks")
 	}

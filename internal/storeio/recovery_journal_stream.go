@@ -82,7 +82,9 @@ func (s *recoveryRecordStream) fill(cursor uint64, needed int) error {
 		s.buffer = s.buffer[:n]
 	}
 	s.start = cursor
-	end := min(cap(s.buffer), int(s.capacity-cursor))
+	// Reused storage may be much larger than this record. Keep read-ahead tied
+	// to current work, not the largest record encountered by an earlier replay.
+	end := min(cap(s.buffer), max(recoveryReadWindowBytes, needed), int(s.capacity-cursor))
 	previous := len(s.buffer)
 	s.buffer = s.buffer[:end]
 	_, err := readFullAt(s.file, s.buffer[previous:], int64(recoveryJournalRegionStart)+int64(cursor)+int64(previous))

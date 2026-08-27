@@ -16,6 +16,7 @@ import (
 // command is proved and the catalog CAS settles, only the target is opened.
 func openRF3RetainedApply(path string, wal *raftstore.Store,
 	base sqldriver.ReplicatedShardStoreIdentity, applyID sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity, *sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	_, published, err := sqldriver.ObservePublishedReplicatedSchemaTransition(path)
 	if err != nil {
@@ -33,7 +34,7 @@ func openRF3RetainedApply(path string, wal *raftstore.Store,
 			return base, applyID, nil, nil, err
 		}
 		if found {
-			database, source, err := raftmember.OpenBoundSQLWithApplyForSchemaSourceTransition(path, wal, base.Binding.Authority, base, applyID, transition.Bytes())
+			database, source, err := raftmember.OpenBoundSQLWithApplyForSchemaSourceTransition(path, wal, base.Binding.Authority, base, applyID, transition.Bytes(), opening...)
 			if err != nil && !errors.Is(err, sqldriver.ErrSchemaSourceNotCommitted) {
 				return base, applyID, nil, nil, err
 			}
@@ -49,7 +50,7 @@ func openRF3RetainedApply(path string, wal *raftstore.Store,
 			}
 		}
 	}
-	database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(path, wal, base.Binding.Authority, base, applyID)
+	database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(path, wal, base.Binding.Authority, base, applyID, opening...)
 	return base, applyID, database, apply, err
 }
 

@@ -567,7 +567,12 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 	path string,
 	expected ReplicatedShardStoreIdentity,
 	expectedApply ReplicatedApplyIdentity,
+	opening ...ReplicatedOpenOptions,
 ) (*Database, error) {
+	openOptions, err := replicatedOpeningOptions(opening)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, err
 	}
@@ -624,11 +629,12 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 	); err != nil {
 		return nil, err
 	}
-	if err := activateReplicatedSchemaNamespace(dataDir, marker, expected); err != nil {
+	if err := activateReplicatedSchemaNamespace(dataDir, marker, expected, openOptions); err != nil {
 		return nil, err
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                      shardStoreOpenReplicatedSchemaTransition,
+		openOptions:               openOptions,
 		expectedReplicated:        ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply:   expectedApply,
 		schemaTransition:          record.command,

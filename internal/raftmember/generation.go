@@ -82,6 +82,7 @@ func OpenBoundSQLWithApplyForGenerationActivation(
 	authority sqldriver.ReplicatedAuthorityProfile,
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	binding, bootstrap, err := pendingGenerationApplyPrerequisites(wal, authority)
 	if err != nil {
@@ -91,7 +92,7 @@ func OpenBoundSQLWithApplyForGenerationActivation(
 		return nil, nil, ErrBindingMismatch
 	}
 	database, err := sqldriver.OpenReplicatedShardStoreWithApply(
-		path, expectedSQL, expectedApply,
+		path, expectedSQL, expectedApply, opening...,
 	)
 	if err != nil {
 		return nil, nil, err

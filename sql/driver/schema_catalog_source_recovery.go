@@ -22,7 +22,12 @@ func OpenReplicatedShardStoreWithSchemaSourceTransition(
 	expected ReplicatedShardStoreIdentity,
 	expectedApply ReplicatedApplyIdentity,
 	command []byte,
+	opening ...ReplicatedOpenOptions,
 ) (*Database, error) {
+	openOptions, err := replicatedOpeningOptions(opening)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, err
 	}
@@ -64,6 +69,7 @@ func OpenReplicatedShardStoreWithSchemaSourceTransition(
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                    shardStoreOpenReplicatedApplyExisting,
+		openOptions:             openOptions,
 		expectedReplicated:      ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply: expectedApply,
 		schemaSourceRecovery:    proof,

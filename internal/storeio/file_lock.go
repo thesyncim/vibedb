@@ -1,10 +1,13 @@
 package storeio
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
+	"time"
 	"weak"
 )
 
@@ -71,9 +74,10 @@ func LockWriter(file *os.File) error {
 		}
 		ownerInfo, ownerErr := owner.Stat()
 		if ownerErr != nil || !os.SameFile(entry.info, ownerInfo) {
-			// Closing an os.File releases its operating-system lock. The exact
-			// owner identity lets us detect that fact even when the kernel has
-			// already reused both its descriptor number and its inode.
+			// This os.File no longer owns a process lease. A registered kernel
+			// reference may still retain its flock after descriptor close; the
+			// operating-system admission below continues to enforce that lock.
+			// Exact owner identity also handles descriptor/inode reuse.
 			continue
 		}
 		if os.SameFile(entry.info, info) {
@@ -95,6 +99,56 @@ func LockWriter(file *os.File) error {
 		info:  info,
 	})
 	return nil
+}
+
+// LockWriterUntil keeps the ordinary nonblocking admission attempt, but permits
+// bounded waiting for an operating-system writer lock. A killed io_uring owner
+// can leave registered file descriptions alive after waitpid returns. Only the
+// kernel releasing that lock permits admission; this never unlocks another
+// owner or retries recovery. In-process ownership conflicts remain immediate.
+// The deadline limits contention waiting, not subsequent recovery work. Callers
+// opening several files must reuse one absolute deadline. A nil context and
+// zero deadline retain LockWriter's immediate behavior.
+func LockWriterUntil(file *os.File, ctx context.Context, deadline time.Time) error {
+	if ctx == nil && deadline.IsZero() {
+		return LockWriter(file)
+	}
+	if ctx == nil || deadline.IsZero() {
+		return ErrInvalidWrite
+	}
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		err := LockWriter(file)
+		if err == nil || !errors.Is(err, ErrWriterLocked) ||
+			!errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errors.Join(err, context.DeadlineExceeded)
+		}
+		// LockWriter has released the process registry mutex before this wait.
+		// One reusable timer bounds allocations independently of contention.
+		delay := min(remaining, time.Millisecond)
+		if timer == nil {
+			timer = time.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, context.Cause(ctx))
+		case <-timer.C:
+		}
+	}
 }
 
 // UnlockWriter releases a lease acquired by LockWriter. Unknown owners are

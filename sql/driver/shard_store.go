@@ -216,6 +216,7 @@ const (
 )
 
 type shardStoreOpenPolicy struct {
+	openOptions                 ReplicatedOpenOptions
 	mode                        shardStoreOpenMode
 	expected                    ShardStoreBinding
 	expectedIdentity            ShardStoreIdentity

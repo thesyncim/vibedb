@@ -17,6 +17,7 @@ func OpenBoundSQLWithApplyForSchemaSourceTransition(
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
 	command []byte,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	if wal == nil {
 		return nil, nil, ErrWALUnavailable
@@ -28,7 +29,7 @@ func OpenBoundSQLWithApplyForSchemaSourceTransition(
 		return nil, nil, err
 	}
 	return openBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply,
-		func(path string, base sqldriver.ReplicatedShardStoreIdentity, apply sqldriver.ReplicatedApplyIdentity) (*sqldriver.Database, error) {
-			return sqldriver.OpenReplicatedShardStoreWithSchemaSourceTransition(path, base, apply, command)
-		})
+		func(path string, base sqldriver.ReplicatedShardStoreIdentity, apply sqldriver.ReplicatedApplyIdentity, options ...sqldriver.ReplicatedOpenOptions) (*sqldriver.Database, error) {
+			return sqldriver.OpenReplicatedShardStoreWithSchemaSourceTransition(path, base, apply, command, options...)
+		}, opening...)
 }

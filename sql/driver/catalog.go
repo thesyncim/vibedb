@@ -294,7 +294,7 @@ func openDatabaseWithShardStorePolicy(
 	if err != nil {
 		return nil, err
 	}
-	if err := storeio.LockWriter(lockFile); err != nil {
+	if err := shardPolicy.openOptions.lockWriter(lockFile); err != nil {
 		_ = lockFile.Close()
 		return nil, fmt.Errorf("vibedb: lock SQL catalog %s: %w", absolute, err)
 	}
@@ -637,7 +637,7 @@ func openDatabaseWithShardStorePolicy(
 	if err := d.validateViewCatalog(); err != nil {
 		return nil, err
 	}
-	if err := d.openCatalogCollectionsWithTransactionsLocked(); err != nil {
+	if err := d.openCatalogCollectionsWithTransactionsLocked(shardPolicy.openOptions); err != nil {
 		return nil, err
 	}
 	if err := addReplicatedSchemaStageProtection(d.dataDir, paths); err != nil {
@@ -730,7 +730,7 @@ type catalogCollectionOpen struct {
 	distributed bool
 }
 
-func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
+func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions ReplicatedOpenOptions) error {
 	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+3)
 	opened := make([]catalogCollectionOpen, 0, len(d.tables)+3)
 	abortFiles := func(cause error) error {
@@ -813,6 +813,10 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		requests = append(requests, durable.TransactionCollectionOpen{
 			File: file, Options: options,
 		})
+	}
+	for i := range requests {
+		requests[i].Options.OpenWriterLockContext = openOptions.WriterLockContext
+		requests[i].Options.OpenWriterLockDeadline = openOptions.WriterLockDeadline
 	}
 	txnOptions := durable.TxnLogOptions{}
 	if replicated := d.catalog.ReplicatedShardStore; replicated != nil {

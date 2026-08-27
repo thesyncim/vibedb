@@ -46,8 +46,9 @@ func OpenBoundSQLWithApply(
 	authority sqldriver.ReplicatedAuthorityProfile,
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
-	return openBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, sqldriver.OpenReplicatedShardStoreWithApply)
+	return openBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, sqldriver.OpenReplicatedShardStoreWithApply, opening...)
 }
 
 func openBoundSQLWithApply(
@@ -56,7 +57,8 @@ func openBoundSQLWithApply(
 	authority sqldriver.ReplicatedAuthorityProfile,
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
-	open func(string, sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity) (*sqldriver.Database, error),
+	open func(string, sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity, ...sqldriver.ReplicatedOpenOptions) (*sqldriver.Database, error),
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	binding, bootstrap, err := applyPrerequisites(wal, authority)
 	if err != nil {
@@ -66,7 +68,7 @@ func openBoundSQLWithApply(
 		return nil, nil, ErrBindingMismatch
 	}
 	database, err := open(
-		path, expectedSQL, expectedApply,
+		path, expectedSQL, expectedApply, opening...,
 	)
 	if err != nil {
 		return nil, nil, err

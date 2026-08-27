@@ -26,6 +26,7 @@ type requestLedgerImageScanner struct {
 	requestBytes                                              uint64
 	ackRowBytes                                               uint64
 	head                                                      requestledger.HeadRecord
+	inlinePlan                                                []byte
 	ack                                                       requestledger.AckRecord
 	pending                                                   requestledger.PendingWaveRecord
 	continuation                                              requestledger.ContinuationRecord
@@ -109,6 +110,19 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 			err = ErrStateCorrupt
 		}
 		scan.headFound = err == nil
+		if err == nil {
+			// RangeRaw's value is borrowed only during this callback. Head is
+			// revalidated during final reservation accounting, including its
+			// inline plan. Own only that bounded plan and reuse its storage for
+			// the next request; never retain the entire overflow row.
+			if cap(scan.inlinePlan) < len(scan.head.InlinePlan) {
+				scan.inlinePlan = make([]byte, len(scan.head.InlinePlan))
+			} else {
+				scan.inlinePlan = scan.inlinePlan[:len(scan.head.InlinePlan)]
+			}
+			copy(scan.inlinePlan, scan.head.InlinePlan)
+			scan.head.InlinePlan = scan.inlinePlan
+		}
 	case requestledger.StoragePlanPage:
 		page, openErr := requestledger.OpenPlanPage(value)
 		if openErr != nil || page.KeyDigest != view.Key || page.Ordinal != view.Ordinal ||
@@ -150,6 +164,9 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 		}
 		scan.continuationBytes = len(value)
 		scan.continuationFound = err == nil
+		// Open authenticated the variable bytes; only copied digests and
+		// scalar fields participate in the remaining cross-row checks.
+		scan.continuation.Cursor, scan.continuation.Observation = nil, nil
 	case requestledger.StorageTerminal:
 		if scan.terminalFound {
 			return ErrStateCorrupt
@@ -159,6 +176,7 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 			err = ErrStateCorrupt
 		}
 		scan.terminalFound = err == nil
+		scan.terminal.Result = nil
 	case requestledger.StorageAck:
 		if scan.ackFound {
 			return ErrStateCorrupt
@@ -228,6 +246,7 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 			err = ErrStateCorrupt
 		}
 		scan.routePinBytes, scan.routePinFound = len(value), err == nil
+		scan.routePin.Command, scan.routePin.Completion = nil, nil
 	case requestledger.StoragePrepared:
 		if scan.preparedFound {
 			return ErrStateCorrupt
@@ -237,6 +256,7 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 			err = ErrStateCorrupt
 		}
 		scan.preparedBytes, scan.preparedFound = len(value), err == nil
+		scan.prepared.Result = nil
 	case requestledger.StorageSchemaPin:
 		if scan.schemaPinFound {
 			return ErrStateCorrupt
@@ -246,6 +266,7 @@ func (scan *requestLedgerImageScanner) observe(key, value []byte) error {
 			err = ErrStateCorrupt
 		}
 		scan.schemaPinBytes, scan.schemaPinFound = len(value), err == nil
+		scan.schemaPin.Command, scan.schemaPin.Completion = nil, nil
 	default:
 		err = ErrStateCorrupt
 	}
@@ -568,12 +589,14 @@ func (scan *requestLedgerImageScanner) resetRequest() {
 	rows, resident, reserved := scan.rows, scan.resident, scan.reserved
 	ackRows, ackBytes := scan.ackRows, scan.ackBytes
 	issuerHighwaters := scan.issuerHighwaters
+	inlinePlan := scan.inlinePlan[:0]
 	expectedIssuerSequences, actualIssuerSequences := scan.expectedIssuerSequences, scan.actualIssuerSequences
 	expectedIssuerSequenceDigest, actualIssuerSequenceDigest := scan.expectedIssuerSequenceDigest, scan.actualIssuerSequenceDigest
 	expectedPlanningExpiry, actualPlanningExpiry := scan.expectedPlanningExpiry, scan.actualPlanningExpiry
 	expectedPlanningExpiryDigest, actualPlanningExpiryDigest := scan.expectedPlanningExpiryDigest, scan.actualPlanningExpiryDigest
 	*scan = requestLedgerImageScanner{capacity: capacity, cleanup: cleanup, authority: authority,
-		rows: rows, resident: resident, reserved: reserved, ackRows: ackRows, ackBytes: ackBytes,
+		inlinePlan: inlinePlan,
+		rows:       rows, resident: resident, reserved: reserved, ackRows: ackRows, ackBytes: ackBytes,
 		issuerHighwaters:        issuerHighwaters,
 		expectedIssuerSequences: expectedIssuerSequences, actualIssuerSequences: actualIssuerSequences,
 		expectedIssuerSequenceDigest: expectedIssuerSequenceDigest,

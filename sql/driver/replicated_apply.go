@@ -215,7 +215,12 @@ func OpenReplicatedShardStoreWithApply(
 	path string,
 	expected ReplicatedShardStoreIdentity,
 	expectedApply ReplicatedApplyIdentity,
+	opening ...ReplicatedOpenOptions,
 ) (*Database, error) {
+	openOptions, err := replicatedOpeningOptions(opening)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, err
 	}
@@ -229,7 +234,7 @@ func OpenReplicatedShardStoreWithApply(
 	if schemaRecovery, recoveryErr := replicatedSchemaActivationMatchesCatalog(absolute); recoveryErr != nil {
 		return nil, recoveryErr
 	} else if schemaRecovery {
-		return OpenReplicatedShardStoreWithSchemaTransition(path, expected, expectedApply)
+		return OpenReplicatedShardStoreWithSchemaTransition(path, expected, expectedApply, openOptions)
 	}
 	if _, err := os.Stat(absolute); err != nil {
 		if os.IsNotExist(err) {
@@ -239,6 +244,7 @@ func OpenReplicatedShardStoreWithApply(
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                    shardStoreOpenReplicatedApplyExisting,
+		openOptions:             openOptions,
 		expectedReplicated:      ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply: expectedApply,
 	})

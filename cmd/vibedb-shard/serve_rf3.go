@@ -51,6 +51,7 @@ const (
 	rf3DefaultWALGenerationIntervalTicks = uint64((10 * time.Minute) / rf3TickInterval)
 	rf3NetworkTimeout                    = 10 * time.Second
 	rf3RequestTimeout                    = 15 * time.Second
+	rf3StartupWriterLockWait             = 2 * time.Second
 	rf3DefaultExecutionLanes             = 8
 	rf3SchemaInstallRecords              = 256
 	rf3SchemaInstallArtifacts            = 16
@@ -144,7 +145,7 @@ func closePreparedRF3Groups(groups []preparedRF3Group, cause error) error {
 	return cause
 }
 
-func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
+func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
 	var result preparedRF3Set
 	bundles := manifest.groupBundles()
 	initialCount := len(bundles)
@@ -211,7 +212,7 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, in
 			clear(key.Material[:])
 			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("open RF3 WAL group %d: %w", index, err))
 		}
-		base, applyIdentity, database, apply, err := openRF3RetainedApply(bundle.SQL.Path, wal, base, applyIdentity)
+		base, applyIdentity, database, apply, err := openRF3RetainedApply(bundle.SQL.Path, wal, base, applyIdentity, opening)
 		if err != nil {
 			clear(key.Material[:])
 			return result, closePreparedRF3Groups(result.groups,
@@ -333,6 +334,13 @@ func servePreparedRF3WithExecutionLanes(
 	if cause := context.Cause(parent); cause != nil {
 		return componentShutdownError(cause)
 	}
+	// io_uring registered-file references can outlive SIGKILL+waitpid. Share
+	// one bounded contention deadline across every startup group and recovery
+	// branch; never reset it for another file or retry recovery. Uncontended
+	// opens remain possible after this deadline: it is not a recovery timeout.
+	opening := sqldriver.ReplicatedOpenOptions{
+		WriterLockContext: parent, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait),
+	}
 	if err := validateRF3Addresses(manifest); err != nil {
 		return err
 	}
@@ -375,7 +383,7 @@ func servePreparedRF3WithExecutionLanes(
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, adoptedInventory.Close()) }()
-	preparedSet, err := prepareRF3GroupSet(manifest, profile, adoptedInventory)
+	preparedSet, err := prepareRF3GroupSet(manifest, profile, opening, adoptedInventory)
 	if err != nil {
 		return err
 	}

@@ -1315,8 +1315,9 @@ type RecoveryJournal struct {
 	nextSequence uint64
 	// headerSlot is the alternating slot the live header occupies. Recycle and
 	// GrowCapacity write the opposite slot and flip this after sync succeeds.
-	headerSlot uint32
-	scratch    []byte
+	headerSlot    uint32
+	scratch       []byte
+	replayScratch recoveryReplayScratch
 	// journalSync and journalDataSync are injected so a fault seam can wrap the
 	// real barriers; production wires the platform sync helpers.
 	journalSync     func(*os.File) error
@@ -2348,7 +2349,8 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 	if rj.header.BaseSequence == ^uint64(0) {
 		return nil
 	}
-	var stream recoveryRecordStream
+	stream := recoveryRecordStream{buffer: rj.replayScratch.take()}
+	defer func() { rj.replayScratch.put(stream.buffer) }()
 	if err := stream.open(rj.file, rj.header.Capacity); err != nil {
 		return err
 	}
@@ -2408,6 +2410,7 @@ func (rj *RecoveryJournal) Close() error {
 	if rj == nil || rj.file == nil {
 		return nil
 	}
+	rj.replayScratch.close()
 	return rj.file.Close()
 }
 

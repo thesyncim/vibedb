@@ -76,7 +76,12 @@ type schemaNamespaceMove struct {
 // same-inode double name is an idempotent link/unlink cut, not another image.
 func activateReplicatedSchemaNamespace(
 	dataDir string, marker replicatedSchemaStageMarker, target ReplicatedShardStoreIdentity,
+	opening ...ReplicatedOpenOptions,
 ) (resultErr error) {
+	openOptions, err := replicatedOpeningOptions(opening)
+	if err != nil {
+		return err
+	}
 	targets, err := schemaStageStorageIDs(target)
 	if err != nil || len(marker.sourceStorages) == 0 || !slices.Equal(targets, marker.storages) {
 		return errors.Join(ErrReplicatedSchemaCatalogImage, err)
@@ -163,7 +168,7 @@ func activateReplicatedSchemaNamespace(
 		if err != nil || !os.SameFile(info, move.info) {
 			return errors.Join(ErrReplicatedSchemaCatalogImage, err, file.Close())
 		}
-		if err := storeio.LockWriter(file); err != nil {
+		if err := openOptions.lockWriter(file); err != nil {
 			return errors.Join(err, file.Close())
 		}
 		locked = append(locked, file)

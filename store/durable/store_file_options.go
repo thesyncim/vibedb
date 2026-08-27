@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -160,7 +161,13 @@ const (
 // concerns the resident engine does not have. The zero value is a working
 // power-safe configuration; every field below documents what it overrides.
 type Options struct {
-	Collection store.Options
+	// OpenWriterLockContext and OpenWriterLockDeadline enable bounded OS-lock
+	// contention waiting during Open only. Both must be supplied together.
+	// Reuse one absolute deadline across a startup. They are runtime-only and
+	// cleared before normalization; they never change a persisted profile.
+	OpenWriterLockContext  context.Context
+	OpenWriterLockDeadline time.Time
+	Collection             store.Options
 	// OpaqueValues stores primary values as uninterpreted, non-empty byte
 	// strings. It disables JSON parsing and canonicalization and therefore
 	// cannot be combined with schemas, exact or skip indexes, or the resident
@@ -906,6 +913,9 @@ const (
 )
 
 func (o Options) normalized() (normalizedFileStoreOptions, error) {
+	// Opening policy is not collection state or an immutable format option.
+	o.OpenWriterLockContext = nil
+	o.OpenWriterLockDeadline = time.Time{}
 	storeOptions, err := o.Collection.Normalized()
 	if err != nil {
 		return normalizedFileStoreOptions{}, err

@@ -2,6 +2,8 @@ package shardservice
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -70,6 +72,48 @@ func TestReplicatedRequestLedgerReadValuePreservesAuthoritativeKind(t *testing.T
 			!bytes.Equal(opened.Value, value.Value) {
 			t.Fatalf("round trip: opened=%+v err=%v", opened, err)
 		}
+	}
+}
+
+func TestReplicatedTerminalCutFitsNativeFrameLimit(t *testing.T) {
+	request := &ReplicatedRequest{
+		Operation: ReplicatedRequestLedgerRead, Fence: testReplicatedFence(),
+		Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 3},
+		Capability: serviceauthz.CapabilityRequestLedger, RequestLedgerRead: testReplicatedRequestLedgerRead(),
+	}
+	request.RequestLedgerRead.Kind = replicatedstate.RequestLedgerReadTerminalCut
+	request.RequestLedgerRead.MaxBytes = uint32(replicatedstate.RequestLedgerReadMaxBytes(request.RequestLedgerRead.Kind))
+	maximum, err := maximumReplicatedResponseBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Even a small valid reply was rejected before reading its frame header:
+	// the canonical terminal-read maximum exceeded the generic codec ceiling.
+	value, err := AppendReplicatedRequestLedgerReadValue(nil, ReplicatedRequestLedgerReadValue{
+		Found: true, AuthoritativeKind: request.RequestLedgerRead.Kind, Value: []byte{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := &ReplicatedResponse{Kind: ReplicatedRequestLedgerReadResult, HasState: true,
+		State: ReplicatedMemberState{Fence: request.Fence, LeaderID: request.Fence.MemberID,
+			Commit: 1, Applied: 1, CheckpointApplied: 1},
+		ReadApplied: 1, Value: value}
+	var wire bytes.Buffer
+	if err := EncodeReplicatedResponse(&wire, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeReplicatedResponseLimit(bytes.NewReader(wire.Bytes()), maximum); err != nil {
+		t.Fatalf("valid terminal read: %v", err)
+	}
+	if maximum != maxFrameBody {
+		t.Fatalf("frame ceiling is not the exact largest envelope: %d != %d", maximum, maxFrameBody)
+	}
+	var header [5]byte
+	header[0] = tagReplicatedResponse
+	binary.BigEndian.PutUint32(header[1:], uint32(maximum+5))
+	if _, err := decodeReplicatedResponseLimit(bytes.NewReader(header[:]), maximum); !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("oversized terminal envelope was not rejected at header: %v", err)
 	}
 }
 

@@ -243,18 +243,19 @@ func OpenBoundSQLWithApplyRecoveringGeneration(
 	authority sqldriver.ReplicatedAuthorityProfile,
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	if wal == nil {
 		return nil, nil, ErrWALUnavailable
 	}
 	if _, err := wal.PendingGenerationActivation(); err != nil {
 		if errors.Is(err, raftstore.ErrGenerationActivationPending) {
-			return OpenBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply)
+			return OpenBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, opening...)
 		}
 		return nil, nil, err
 	}
 	database, apply, err := OpenBoundSQLWithApplyForGenerationActivation(
-		path, wal, authority, expectedSQL, expectedApply,
+		path, wal, authority, expectedSQL, expectedApply, opening...,
 	)
 	if err != nil {
 		return nil, nil, err

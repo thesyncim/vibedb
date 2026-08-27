@@ -189,9 +189,10 @@ func registeredWriterKillCycle(t *testing.T, mode string, cycle int) (bool, time
 	err = LockWriter(contender)
 	immediatelyBlocked := errors.Is(err, ErrWriterLocked)
 	deadline := started.Add(2 * time.Second)
-	for errors.Is(err, ErrWriterLocked) && time.Now().Before(deadline) {
-		time.Sleep(100 * time.Microsecond)
-		err = LockWriter(contender)
+	if immediatelyBlocked {
+		// Exercise the shipped startup waiter against an actual registered OFD
+		// left by SIGKILL; retain the same measured two-second release gate.
+		err = LockWriterUntil(contender, context.Background(), deadline)
 	}
 	elapsed := time.Since(started)
 	if err != nil || elapsed > 2*time.Second {

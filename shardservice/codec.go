@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 // The shard-service codec: a big-endian length-prefixed framing mirroring
@@ -53,10 +54,13 @@ const (
 // bound caps the whole message; the element counts bound the per-collection
 // slices before they are grown against bytes that may not be present.
 const (
-	// maxFrameBody is the largest request or response body this codec reads. It
-	// is generous for a large statement or document parameter and small enough
-	// that a frame cannot request an arbitrary allocation.
-	maxFrameBody = distributedtxn.MaxMutationBytes + (64 << 10)
+	// The envelope must contain the largest admitted canonical result, including
+	// the terminal cut's head, continuation, prepared result and release proof.
+	// Per-operation limits and the shared byte budget still apply before any
+	// peer-sized allocation; a caller-supplied limit cannot enlarge this ceiling.
+	maxFrameBody = max(distributedtxn.MaxMutationBytes+(64<<10),
+		replicatedReadResponseFixedBodyBytes+replicatedRequestLedgerReadValueHeaderBytes+
+			replicatedstate.MaxRequestLedgerTerminalReadBytes)
 
 	// maxParams, maxColumns, and maxRows bound the three repeated collections.
 	// The frame-body bound already limits total bytes; these keep a small frame
