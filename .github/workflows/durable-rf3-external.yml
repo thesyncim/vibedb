@@ -100,6 +100,8 @@ jobs:
                 contains("partition_failover=") and
                 contains("terminal_failover=") and
                 contains("ack_failover=") and
+                contains("gateway_replacement_recovery=") and
+                contains("max_voter_failover=") and
                 contains("p99=") and
                 contains("rss_growth=") and
                 contains("storage_growth=") and

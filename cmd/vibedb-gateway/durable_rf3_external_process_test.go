@@ -176,10 +176,15 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	if terminalFailover > 15*time.Second {
 		t.Fatalf("terminal leader failover=%s exceeds 15s", terminalFailover)
 	}
+	gatewayReplacementStarted := time.Now()
 	fixture.startGateway(t, fixture.gatewayB)
 	clientB := fixture.dialGateway(t, fixture.gatewayBNode, fixture.gatewayBAddress)
 	recoveredRaw, recoveredLatency := clientB.roundTrip(t, terminalRequest)
 	latencies = append(latencies, recoveredLatency)
+	gatewayReplacement := time.Since(gatewayReplacementStarted)
+	if gatewayReplacement > 15*time.Second {
+		t.Fatalf("gateway replacement recovery=%s exceeds 15s", gatewayReplacement)
+	}
 	recovered := durableRF3ExternalExecResponse(t, recoveredRaw)
 	if !recovered.Committed || recovered.RowsAffected != 2 || recovered.ShardsFanned != 2 ||
 		recovered.Error != "" {
@@ -263,9 +268,16 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	// Restart every shard process one at a time. Since a process hosts all four
 	// roles, each kill must leave and then restore an independently probed RF3
 	// quorum for catalog, ledger, and both data groups.
+	maxVoterFailover := time.Duration(0)
 	for member := 0; member < durableRF3ExternalVoters; member++ {
+		failoverStarted := time.Now()
 		fixture.killShard(t, member)
 		fixture.waitAllRoleLeaders(t, member, 30*time.Second)
+		failover := time.Since(failoverStarted)
+		maxVoterFailover = max(maxVoterFailover, failover)
+		if failover > 15*time.Second {
+			t.Fatalf("rolling voter %d failover=%s exceeds 15s", member+1, failover)
+		}
 		fixture.restartShard(t, member)
 		fixture.waitMemberCaughtUpAllRoles(t, member, 45*time.Second)
 	}
@@ -331,9 +343,9 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	// The public wire counter is exact for every test-owned gateway request and
 	// response. No shipped external Raft byte counter exists, so the gate names
 	// that boundary honestly and separately proves zero snapshot payload growth.
-	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
-		partitionFailover, terminalFailover, ackFailover, p99, rssGrowth, storageGrowth,
-		walGrowth, clientBytes, snapshotGrowth)
+	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s gateway_replacement_recovery=%s max_voter_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
+		partitionFailover, terminalFailover, ackFailover, gatewayReplacement, maxVoterFailover,
+		p99, rssGrowth, storageGrowth, walGrowth, clientBytes, snapshotGrowth)
 }
 
 type durableRF3ExternalFixture struct {
