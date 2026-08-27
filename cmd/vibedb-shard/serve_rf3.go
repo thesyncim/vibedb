@@ -157,7 +157,7 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 			return result, closePreparedRF3Groups(result.groups, err)
 		}
 		if !rf3SplitChildTemplateMatchesRetained(
-			manifest.SplitControl.ChildRegistry, base, applyIdentity,
+			single.SplitControl.ChildRegistry, base, applyIdentity,
 		) {
 			return result, closePreparedRF3Groups(result.groups,
 				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index))
@@ -785,19 +785,12 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	var childPrepareControl shardcontrol.Handler
 	if nativeListener != nil {
-		childPaths, childErr := newRF3SplitChildPathRegistry(manifest.SplitControl.ChildRegistry)
-		if childErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(childErr, componentShutdownError(peerErr), servingRegistry.Close())
-		}
-		childPreparer, childErr := newRF3ChildPreparer(
-			childPaths, profile.LocalIdentity().Node,
+		childPreparer, childErr := newRF3GroupChildPreparer(
+			manifest, profile.LocalIdentity().Node,
 			peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(), snapshotListener.Addr(),
 		)
 		if childErr == nil {
-			concurrency := min(manifest.SplitControl.ChildRegistry.MaxOperations, 8)
+			concurrency := min(manifest.SplitControl.operationLimit(), 8)
 			childPrepareControl, childErr = splitcontroller.NewChildPrepareService(
 				splitcontroller.ChildPrepareServiceOptions{
 					Preparer: childPreparer,
@@ -946,7 +939,7 @@ func servePreparedRF3WithExecutionLanes(
 	snapshotDone := make(chan error, 1)
 	snapshotAddress := snapshotListener.Addr().String()
 	snapshotConcurrency := max(manifest.ReplicaControl.MaxSourceConcurrent,
-		min(manifest.SplitControl.ChildRegistry.MaxOperations, 8))
+		min(manifest.SplitControl.operationLimit(), 8))
 	go func() {
 		snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotListener, servicetls.Limits{
 			MaxConnections: snapshotConcurrency, MaxHandshakes: snapshotConcurrency,

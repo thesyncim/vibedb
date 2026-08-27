@@ -250,6 +250,15 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 	if len(manifest.Groups) != 2 || len(manifest.groupBundles()) != 2 {
 		t.Fatalf("group bundles = %d", len(manifest.Groups))
 	}
+	if manifest.SplitControl.ChildRegistry.Root != "" || manifest.SplitControl.operationLimit() != 8 {
+		t.Fatal("multi-group control retained an ambiguous shared child template")
+	}
+	for _, group := range manifest.Groups {
+		if manifest.withGroup(group).SplitControl.ChildRegistry.Root != group.ChildRegistry.Root ||
+			group.ChildRegistry.Root != filepath.Join(group.Route.MemberRoot, "split-children") {
+			t.Fatal("group child template was not preserved by projection")
+		}
+	}
 	if err := validateRF3Addresses(manifest); err != nil {
 		t.Fatalf("multi-group addresses: %v", err)
 	}
@@ -259,6 +268,10 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 		t.Fatalf("groups = %+v", manifest.Groups)
 	}
 	for name, invalid := range map[string]string{
+		"missing child registry":      strings.Replace(document, `"child_registry":`, `"unknown_registry":`, 1),
+		"group bound exceeds process": strings.Replace(document, `"max_operations": 8`, `"max_operations": 4`, 1),
+		"aliased child root": strings.Replace(document, `"root": "/srv/vibedb/second/split-children"`,
+			`"root": "/srv/vibedb/split-children"`, 1),
 		"artifact path": strings.Replace(document, "/srv/vibedb/second/member.wal", "/srv/vibedb/member.wal", 1),
 		"control path":  strings.Replace(document, "/srv/vibedb/split-control.journal", "/srv/vibedb/member.wal", 1),
 		"group key": strings.Replace(document,
@@ -286,8 +299,15 @@ func multiGroupRF3Manifest(t testing.TB) string {
 	}
 	walSQL := canonicalRF3Manifest[2:listener]
 	common := canonicalRF3Manifest[listener:members]
+	registryStart := strings.Index(common, `    "child_registry":`)
+	registryEnd := strings.LastIndex(common, "\n    }\n  },") + len("\n    }")
+	if registryStart < 0 || registryEnd <= registryStart {
+		t.Fatal("canonical child registry section not found")
+	}
+	registry := common[registryStart:registryEnd]
+	common = common[:registryStart] + `    "max_operations": 8` + common[registryEnd:]
 	roster := strings.TrimSuffix(canonicalRF3Manifest[members:], "\n}")
-	first := "{\n" + walSQL + roster + "\n  }"
+	first := "{\n" + walSQL + registry + "," + roster + "\n  }"
 	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
 	second = strings.Replace(second, `"group_id": "3132333435363738393a3b3c3d3e3f40"`,
 		`"group_id": "5152535455565758595a5b5c5d5e5f60"`, 1)
@@ -299,7 +319,8 @@ func multiGroupRF3Manifest(t testing.TB) string {
 		`"split_runtime_root": "/srv/vibedb/second/split-runtime"`, 1)
 	second = strings.Replace(second, `"membership_grant_path": "/srv/vibedb/membership-grant"`,
 		`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
-	second = strings.Replace(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2", 1)
+	second = strings.ReplaceAll(second, "/srv/vibedb/split-children", "/srv/vibedb/second/split-children")
+	second = strings.ReplaceAll(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2")
 	return "{\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
 }
 

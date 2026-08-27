@@ -49,7 +49,7 @@ type rf3SplitServingOptions struct {
 }
 
 func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServingRuntime, error) {
-	maxOperations := options.manifest.SplitControl.ChildRegistry.MaxOperations
+	maxOperations := options.manifest.SplitControl.operationLimit()
 	if len(options.prepared) == 0 || len(options.prepared) != len(options.identities) ||
 		len(options.prepared) != len(options.commands) || options.owners == nil || options.registrar == nil ||
 		options.profile == nil || options.policy == nil || options.deadline == nil || maxOperations <= 0 {
@@ -93,9 +93,13 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		return closeOnError(err)
 	}
 	result.grants, result.data = grants, data
-	staticBootstrap, err := loadRF3SplitStaticBootstrap(options.manifest.SplitControl.ChildRegistry)
-	if err != nil {
-		return closeOnError(err)
+	groupBundles := options.manifest.groupBundles()
+	staticBootstraps := make([]*pb.Snapshot, len(groupBundles))
+	for index, group := range groupBundles {
+		staticBootstraps[index], err = loadRF3SplitStaticBootstrap(group.ChildRegistry)
+		if err != nil {
+			return closeOnError(err)
+		}
 	}
 	authority := serviceauthz.Authority{
 		Node: options.profile.LocalIdentity().Node, Generation: options.policy.Generation(),
@@ -184,6 +188,12 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		admission splitcontroller.PlanAdmission, child uint8, replica splitcontroller.ChildReplicaTarget,
 		lease *splitcontroller.RuntimeStoreLease,
 	) (splitcontroller.ShardActionExecutor, error) {
+		registryIndex, childRegistry, found := rf3SplitChildRegistryForTarget(
+			options.manifest, [32]byte(plan.OperationID()), child, replica,
+		)
+		if !found {
+			return nil, errRF3Serving
+		}
 		opener, openErr := newRF3SplitStreamOpener(
 			options.profile, options.deadline,
 			func(ctx context.Context, address string) (net.Conn, error) {
@@ -194,8 +204,8 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			return nil, openErr
 		}
 		key, openErr := loadRF3WALKey(
-			options.manifest.SplitControl.ChildRegistry.WAL.KeyID,
-			options.manifest.SplitControl.ChildRegistry.WAL.KeyMaterialPath,
+			childRegistry.WAL.KeyID,
+			childRegistry.WAL.KeyMaterialPath,
 		)
 		if openErr != nil {
 			return nil, openErr
@@ -204,10 +214,10 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		executor, openErr := splitcontroller.NewLazyReplicatedChildExecutor(
 			splitcontroller.LazyReplicatedChildExecutorOptions{
 				Plan: plan, PlanDigest: admission.PlanDigest, Child: child, Replica: replica, Lease: lease,
-				Registrar: options.registrar, StaticBootstrap: proto.Clone(staticBootstrap).(*pb.Snapshot),
+				Registrar: options.registrar, StaticBootstrap: proto.Clone(staticBootstraps[registryIndex]).(*pb.Snapshot),
 				ArtifactOptions: replicatedstate.SnapshotArtifactOptions{}, WALKey: key,
-				WALOptions:      options.manifest.SplitControl.ChildRegistry.WAL.Options,
-				CheckpointBytes: options.manifest.SplitControl.ChildRegistry.StageCheckpointBytes,
+				WALOptions:      childRegistry.WAL.Options,
+				CheckpointBytes: childRegistry.StageCheckpointBytes,
 				Data:            data, Opener: opener, ReadDeadline: options.deadline, WriteDeadline: options.deadline,
 				ChunkBytes: rangesplit.DefaultChildArtifactChunkBytes, MaxReconnects: 3, Workspace: workspace,
 			},

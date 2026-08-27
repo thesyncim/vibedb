@@ -50,6 +50,7 @@ type rf3ManifestGroup struct {
 	WAL            rf3ManifestWAL
 	SQL            rf3ManifestSQL
 	Route          rf3ManifestGroupRoute
+	ChildRegistry  rf3ManifestSplitChildRegistry
 	Members        [rf3ManifestMembers]rf3ManifestMember
 	MemberCount    uint8
 	EnrolledTarget *rf3ManifestEnrolledTarget
@@ -60,16 +61,18 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 		return manifest.Groups
 	}
 	return []rf3ManifestGroup{{WAL: manifest.WAL, SQL: manifest.SQL,
-		Route:   manifest.Route,
+		Route: manifest.Route, ChildRegistry: manifest.SplitControl.ChildRegistry,
 		Members: manifest.Members, MemberCount: uint8(len(manifest.memberRoster())),
 		EnrolledTarget: manifest.EnrolledTarget}}
 }
 
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
+	split := manifest.SplitControl
+	split.ChildRegistry = group.ChildRegistry
 	return rf3Manifest{Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
 		ReplicaControl: manifest.ReplicaControl,
-		SplitControl:   manifest.SplitControl, Route: group.Route,
+		SplitControl:   split, Route: group.Route,
 		DevelopmentOnly: manifest.DevelopmentOnly, Members: group.Members,
 		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
 }
@@ -79,7 +82,15 @@ type rf3ManifestSplitControl struct {
 	MaxRecords    int
 	MaxFileBytes  int64
 	Grants        []protocol.ActionGrant
+	MaxOperations int
 	ChildRegistry rf3ManifestSplitChildRegistry
+}
+
+func (control rf3ManifestSplitControl) operationLimit() int {
+	if control.MaxOperations != 0 {
+		return control.MaxOperations
+	}
+	return control.ChildRegistry.MaxOperations
 }
 
 type rf3ManifestGroupRoute struct {
@@ -251,13 +262,8 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if err != nil {
 			return rf3Manifest{}, err
 		}
-		if manifest.SplitControl, err = parseRF3ManifestSplitControl(node); err != nil {
+		if manifest.SplitControl, err = parseRF3ManifestSplitControlMode(node, true); err != nil {
 			return rf3Manifest{}, err
-		}
-		if manifest.SplitControl.ChildRegistry.Root != filepath.Join(
-			manifest.ReplicaControl.SourceDataRoot, "split-children",
-		) {
-			return rf3Manifest{}, errInvalidRF3Manifest
 		}
 		node, err = nextRF3Field(&fields, `"groups"`)
 		if err != nil {
@@ -266,16 +272,16 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if manifest.Groups, err = parseRF3ManifestGroups(node); err != nil {
 			return rf3Manifest{}, err
 		}
-		if err = validateRF3SplitChildRegistryRoster(manifest.SplitControl.ChildRegistry, manifest.Groups); err != nil {
-			return rf3Manifest{}, err
-		}
 		controlPaths := [...]string{
 			manifest.ReplicaControl.ActionJournalPath, manifest.ReplicaControl.SourceJournalPath,
 			manifest.ReplicaControl.SourceRepositoryPath, manifest.SplitControl.JournalPath,
-			manifest.SplitControl.ChildRegistry.StaticBootstrapPath,
 		}
 		for _, group := range manifest.Groups {
-			for _, path := range [...]string{group.WAL.Path, group.WAL.KeyMaterialPath, group.SQL.Path, group.SQL.IdentityPath, group.SQL.ApplyIdentityPath} {
+			if group.ChildRegistry.MaxOperations > manifest.SplitControl.MaxOperations {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
+			for _, path := range [...]string{group.WAL.Path, group.WAL.KeyMaterialPath, group.SQL.Path, group.SQL.IdentityPath, group.SQL.ApplyIdentityPath,
+				group.ChildRegistry.Root, group.ChildRegistry.StaticBootstrapPath} {
 				for _, control := range controlPaths {
 					if path == control {
 						return rf3Manifest{}, errInvalidRF3Manifest
@@ -345,7 +351,7 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		return rf3Manifest{}, err
 	}
 	if manifest.SplitControl.ChildRegistry.Root != filepath.Join(
-		manifest.ReplicaControl.SourceDataRoot, "split-children",
+		manifest.Route.MemberRoot, "split-children",
 	) {
 		return rf3Manifest{}, errInvalidRF3Manifest
 	}
@@ -434,6 +440,7 @@ func parseRF3ManifestGroups(node vibejson.Node) ([]rf3ManifestGroup, error) {
 			group.SQL.IdentityPath, group.SQL.ApplyIdentityPath,
 			group.Route.MemberRoot, group.Route.SplitRuntimeRoot,
 			group.Route.MembershipGrantPath,
+			group.ChildRegistry.Root, group.ChildRegistry.StaticBootstrapPath,
 		} {
 			if _, duplicate := paths[path]; duplicate {
 				return nil, errInvalidRF3Manifest
@@ -484,6 +491,16 @@ func parseRF3ManifestGroup(node vibejson.Node) (rf3ManifestGroup, error) {
 	if group.Route, err = parseRF3ManifestGroupRoute(value); err != nil {
 		return group, err
 	}
+	value, err = nextRF3Field(&fields, `"child_registry"`)
+	if err != nil {
+		return group, err
+	}
+	if group.ChildRegistry, err = parseRF3ManifestSplitChildRegistry(value); err != nil {
+		return group, err
+	}
+	if group.ChildRegistry.Root != filepath.Join(group.Route.MemberRoot, "split-children") {
+		return group, errInvalidRF3Manifest
+	}
 	value, err = nextRF3Field(&fields, `"members"`)
 	if err != nil {
 		return group, err
@@ -508,6 +525,9 @@ func parseRF3ManifestGroup(node vibejson.Node) (rf3ManifestGroup, error) {
 		return group, errInvalidRF3Manifest
 	}
 	if err := validateRF3ManifestGroupRoute(group); err != nil {
+		return group, err
+	}
+	if err := validateRF3SplitChildRegistryRoster(group.ChildRegistry, []rf3ManifestGroup{group}); err != nil {
 		return group, err
 	}
 	return group, nil
@@ -542,6 +562,10 @@ func validateRF3ManifestGroupRoute(group rf3ManifestGroup) error {
 }
 
 func parseRF3ManifestSplitControl(node vibejson.Node) (rf3ManifestSplitControl, error) {
+	return parseRF3ManifestSplitControlMode(node, false)
+}
+
+func parseRF3ManifestSplitControlMode(node vibejson.Node, grouped bool) (rf3ManifestSplitControl, error) {
 	fields, ok := node.ObjectIter()
 	if !ok {
 		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
@@ -612,12 +636,22 @@ func parseRF3ManifestSplitControl(node vibejson.Node) (rf3ManifestSplitControl, 
 	if _, extra := grants.Next(); extra {
 		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
 	}
-	value, err = nextRF3Field(&fields, `"child_registry"`)
-	if err != nil {
-		return result, err
-	}
-	if result.ChildRegistry, err = parseRF3ManifestSplitChildRegistry(value); err != nil {
-		return result, err
+	if grouped {
+		value, err = nextRF3Field(&fields, `"max_operations"`)
+		if err != nil {
+			return result, err
+		}
+		if result.MaxOperations, err = rf3ManifestPositiveInt(value); err != nil || result.MaxOperations > maxRF3SplitChildOperations {
+			return result, errInvalidRF3Manifest
+		}
+	} else {
+		value, err = nextRF3Field(&fields, `"child_registry"`)
+		if err != nil {
+			return result, err
+		}
+		if result.ChildRegistry, err = parseRF3ManifestSplitChildRegistry(value); err != nil {
+			return result, err
+		}
 	}
 	if _, _, extra := fields.Next(); extra {
 		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
