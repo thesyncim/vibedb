@@ -1,9 +1,26 @@
 package clusterbackup
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
 	"errors"
+	"io"
+	"net"
 	"testing"
+	"time"
+
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
+
+type liveTestConnection struct{ net.Conn }
+
+func (liveTestConnection) PeerIdentity() rafttransport.PeerIdentity {
+	return rafttransport.PeerIdentity{}
+}
+func (liveTestConnection) TrafficClass() rafttransport.TrafficClass {
+	return rafttransport.TrafficShardControl
+}
 
 func TestLiveBackupRequestResponseCanonicalAndCorruptionClosed(t *testing.T) {
 	request := LiveRequest{Operation: filled32(1), Group: backupGroup(2), SourceMember: 3}
@@ -37,5 +54,46 @@ func TestLiveBackupRequestResponseCanonicalAndCorruptionClosed(t *testing.T) {
 	}
 	if _, err = OpenLiveResponse(response[:len(response)-1], request.Operation); !errors.Is(err, ErrLiveBackup) {
 		t.Fatalf("response truncated err=%v", err)
+	}
+}
+
+func TestLiveClientStreamsExactBoundedArtifactWithDeadlines(t *testing.T) {
+	payload := bytes.Repeat([]byte("artifact"), 8192)
+	request := LiveRequest{Operation: filled32(1), Group: backupGroup(2), SourceMember: 3}
+	cut := backupCut(2)
+	cut.SourceMember = request.SourceMember
+	cut.ArtifactBytes = uint64(len(payload))
+	cut.ArtifactHash = sha256.Sum256(payload)
+	server, client := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		var raw [LiveRequestBytes]byte
+		if _, err := io.ReadFull(server, raw[:]); err != nil {
+			done <- err
+			return
+		}
+		opened, err := OpenLiveRequest(raw[:])
+		if err != nil || opened != request {
+			done <- errors.Join(ErrLiveBackup, err)
+			return
+		}
+		response := AppendLiveResponse(request.Operation, cut)
+		if err = writeFull(server, response[:]); err == nil {
+			err = writeFull(server, payload)
+		}
+		done <- err
+	}()
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	liveClient := LiveClient{Open: func(context.Context) (rafttransport.PeerConnection, error) {
+		return liveTestConnection{client}, nil
+	}, ReadDeadline: deadline, WriteDeadline: deadline}
+	var output bytes.Buffer
+	got, err := liveClient.Export(t.Context(), request, &output)
+	if err != nil || got != cut || !bytes.Equal(output.Bytes(), payload) {
+		t.Fatalf("cut=%+v bytes=%d err=%v", got, output.Len(), err)
+	}
+	if serverErr := <-done; serverErr != nil {
+		t.Fatal(serverErr)
 	}
 }

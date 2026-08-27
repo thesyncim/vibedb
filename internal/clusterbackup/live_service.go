@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -154,7 +155,7 @@ func (client LiveClient) Export(ctx context.Context, request LiveRequest, destin
 		return GroupCut{}, err
 	}
 	n, trailingErr := connection.Read(trailing[:])
-	if n != 0 || !errors.Is(trailingErr, io.EOF) {
+	if n != 0 || !errors.Is(trailingErr, io.EOF) && !errors.Is(trailingErr, net.ErrClosed) {
 		return GroupCut{}, errors.Join(ErrLiveBackup, trailingErr)
 	}
 	return cut, nil
