@@ -306,6 +306,20 @@ func (l *RuntimeStoreLease) PinnedStore() (*DurableRuntimeStore, error) {
 	return l.store, nil
 }
 
+// PinnedRegistry returns the manifest-owned registry backing this live lease.
+// It is used only to bind exact observation authority for a prepared child.
+func (l *RuntimeStoreLease) PinnedRegistry() (*RuntimeStoreRegistry, error) {
+	if l == nil {
+		return nil, ErrRuntimeStore
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released || l.registry == nil || l.store == nil {
+		return nil, ErrRuntimeStore
+	}
+	return l.registry, nil
+}
+
 func (l *RuntimeStoreLease) Release() error {
 	if l == nil {
 		return nil

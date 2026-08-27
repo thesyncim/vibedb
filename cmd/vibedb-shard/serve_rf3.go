@@ -368,26 +368,14 @@ func servePreparedRF3WithExecutionLanes(
 		)
 	}
 	defer controlListener.Close()
-	sourceEligible := false
-	for index := range preparedSet.groups {
-		item := &preparedSet.groups[index]
-		if target := item.manifest.EnrolledTarget; target != nil &&
-			item.base.Binding.MemberID != target.MemberID {
-			sourceEligible = true
-			break
-		}
+	snapshotListener, err := listen("tcp", manifest.Listeners.Snapshot)
+	if err != nil {
+		return errors.Join(
+			closePrepared(fmt.Errorf("listen RF3 snapshot %q: %w", manifest.Listeners.Snapshot, err)),
+			peerListener.Close(), controlListener.Close(),
+		)
 	}
-	var snapshotListener net.Listener
-	if sourceEligible {
-		snapshotListener, err = listen("tcp", manifest.Listeners.Snapshot)
-		if err != nil {
-			return errors.Join(
-				closePrepared(fmt.Errorf("listen RF3 snapshot %q: %w", manifest.Listeners.Snapshot, err)),
-				peerListener.Close(), controlListener.Close(),
-			)
-		}
-		defer snapshotListener.Close()
-	}
+	defer snapshotListener.Close()
 	var nativeListener net.Listener
 	if nativeConfigured {
 		nativeListener, err = listen("tcp", manifest.Listeners.Native)
@@ -718,21 +706,22 @@ func servePreparedRF3WithExecutionLanes(
 		}
 		slices.SortFunc(targetNodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
 		targetNodes = slices.Compact(targetNodes)
-		var snapshotAuthorizer *servicetls.NodeAuthorizer
-		if serviceErr == nil {
-			snapshotAuthorizer, serviceErr = servicetls.NewNodeAuthorizer(targetNodes)
-		}
-		if serviceErr == nil {
-			snapshotTLS, serviceErr = servicetls.NewServer(
-				profile, rafttransport.TrafficSnapshot, snapshotAuthorizer,
-			)
-		}
 		if serviceErr != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
 			retire(context.Canceled)
 			peerErr := peer.Run(retireCtx)
 			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
+	}
+	snapshotNodes := policy.NodesWith(serviceauthz.CapabilityMembership)
+	snapshotAuthorizer, err := servicetls.NewNodeAuthorizer(snapshotNodes)
+	if err == nil {
+		snapshotTLS, err = servicetls.NewServer(
+			profile, rafttransport.TrafficSnapshot, snapshotAuthorizer,
+		)
+	}
+	if err != nil {
+		return errors.Join(errRF3Serving, err)
 	}
 	var childPrepareControl shardcontrol.Handler
 	if nativeListener != nil {
@@ -769,30 +758,31 @@ func servePreparedRF3WithExecutionLanes(
 			return errors.Join(childErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
 	}
-	splitObservationRuntime, splitObservationErr := newRF3SplitObservationRuntime(
-		preparedSet.groups, identities, commands, peer.Owners(), policy, deadline,
-		manifest.SplitControl.ChildRegistry.MaxOperations,
-	)
-	if splitObservationErr != nil {
+	splitRuntime, splitRuntimeErr := newRF3SplitServingRuntime(rf3SplitServingOptions{
+		manifest: manifest, prepared: preparedSet.groups, identities: identities, commands: commands,
+		owners: peer.Owners(), registrar: peer, profile: profile, policy: policy, deadline: deadline,
+	})
+	if splitRuntimeErr != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
 		peerErr := peer.Run(retireCtx)
-		return errors.Join(splitObservationErr, componentShutdownError(peerErr), servingRegistry.Close())
+		return errors.Join(splitRuntimeErr, componentShutdownError(peerErr), servingRegistry.Close())
 	}
-	defer func() { resultErr = errors.Join(resultErr, splitObservationRuntime.Close()) }()
-	// Split control remains absent until this process can reconstruct the
-	// complete durable plan observation and execute every action class. The mux
-	// has a fixed shipped route for it once that runtime is supplied; it must not
-	// advertise a partial or memory-only executor.
+	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, sourceControl, actionControl,
-		nil, schemaControl, splitObservationRuntime.service, nil, nil, childPrepareControl,
+		splitRuntime.action, schemaControl, splitRuntime.observation.service,
+		splitRuntime.admission, splitRuntime.tail, childPrepareControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	snapshotMux, err := newRF3SnapshotMux(sourceData, splitRuntime.artifact)
+	if err != nil {
+		return errors.Join(err, servingRegistry.Close())
 	}
 	var server *shardservice.ReplicatedServer
 	if nativeConfigured {
@@ -854,21 +844,18 @@ func servePreparedRF3WithExecutionLanes(
 			_ = controlMux.Serve(ctx, connection)
 		})
 	}()
-	var snapshotDone chan error
-	snapshotAddress := "fenced"
-	if sourceData != nil {
-		snapshotDone = make(chan error, 1)
-		snapshotAddress = snapshotListener.Addr().String()
-		go func() {
-			snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotListener, servicetls.Limits{
-				MaxConnections:    manifest.ReplicaControl.MaxSourceConcurrent,
-				MaxHandshakes:     manifest.ReplicaControl.MaxSourceConcurrent,
-				HandshakeDeadline: deadline,
-			}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-				_ = sourceData.Serve(ctx, connection)
-			})
-		}()
-	}
+	snapshotDone := make(chan error, 1)
+	snapshotAddress := snapshotListener.Addr().String()
+	snapshotConcurrency := max(manifest.ReplicaControl.MaxSourceConcurrent,
+		min(manifest.SplitControl.ChildRegistry.MaxOperations, 8))
+	go func() {
+		snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotListener, servicetls.Limits{
+			MaxConnections: snapshotConcurrency, MaxHandshakes: snapshotConcurrency,
+			HandshakeDeadline: deadline,
+		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
+			_ = snapshotMux.Serve(ctx, connection)
+		})
+	}()
 	var nativeDone chan error
 	nativeAddress := "fenced"
 	if nativeConfigured {
@@ -915,11 +902,9 @@ func servePreparedRF3WithExecutionLanes(
 			primary = errors.Join(primary, componentShutdownError(<-nativeDone))
 		}
 	}
-	if sourceData != nil {
-		stopSnapshot(context.Canceled)
-		if !snapshotFinished {
-			primary = errors.Join(primary, componentShutdownError(<-snapshotDone))
-		}
+	stopSnapshot(context.Canceled)
+	if !snapshotFinished {
+		primary = errors.Join(primary, componentShutdownError(<-snapshotDone))
 	}
 	stopControl(context.Canceled)
 	if !controlFinished {

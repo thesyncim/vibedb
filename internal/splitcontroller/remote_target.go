@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/shardcontrol"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -27,6 +28,29 @@ type ShardActionTarget struct {
 	Member                 uint64                               `json:"member"`
 	Authority              sqldriver.ReplicatedAuthorityProfile `json:"authority"`
 	RelationManifestDigest [32]byte                             `json:"relation_manifest_digest"`
+}
+
+// ShardActionTargetForServing projects an already-adopted local member and
+// command fence into the fixed action authority used by admission. It refuses
+// a command/identity relation mismatch and does not consult DNS or paths.
+func ShardActionTargetForServing(
+	identity raftmember.RuntimeIdentity,
+	command raftservice.CommandFence,
+) (ShardActionTarget, error) {
+	result := ShardActionTarget{
+		Group: identity.Group, Allocation: identity.AllocationGeneration, Member: identity.MemberID,
+		Authority: sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: command.ActivePolicyGeneration,
+			ProtectionEpoch:        command.ProtectionEpoch, OwnershipEpoch: command.OwnershipEpoch,
+			SchemaGeneration: command.SchemaGeneration, RoutingVersion: command.RoutingVersion,
+			RouteGeneration: command.RouteGeneration,
+		},
+		RelationManifestDigest: command.RelationManifestDigest,
+	}
+	if identity.RelationManifestDigest != command.RelationManifestDigest || !result.valid() {
+		return ShardActionTarget{}, ErrRemoteExecution
+	}
+	return result, nil
 }
 
 func (target ShardActionTarget) valid() bool {

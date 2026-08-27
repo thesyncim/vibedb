@@ -181,6 +181,7 @@ type BoundPlanAdmissionBinder struct {
 	grants  *DynamicShardActionGrants
 	active  map[OperationID]boundPlanAdmission
 	limit   int
+	closed  bool
 }
 
 type boundPlanAdmission struct {
@@ -212,6 +213,9 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 	}
 	binder.mu.Lock()
 	defer binder.mu.Unlock()
+	if binder.closed {
+		return ErrRemoteExecution
+	}
 	if binder.active == nil {
 		binder.limit = binder.grants.limit
 		binder.active = make(map[OperationID]boundPlanAdmission, min(binder.limit, 64))
@@ -269,6 +273,30 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 		registries:    mergeAdmissionRegistries(nil, leases),
 	}
 	return nil
+}
+
+// Close revokes every memory-only action capability and releases its durable
+// store pins. It does not collect operation directories: process shutdown is
+// not replicated terminal authority, so replay can safely rebind them.
+func (binder *BoundPlanAdmissionBinder) Close() error {
+	if binder == nil {
+		return nil
+	}
+	binder.mu.Lock()
+	defer binder.mu.Unlock()
+	if binder.closed {
+		return nil
+	}
+	binder.closed = true
+	var result error
+	for operation, current := range binder.active {
+		binder.grants.retire(operation, current.digest)
+		for _, lease := range current.leases {
+			result = errors.Join(result, lease.Release())
+		}
+	}
+	clear(binder.active)
+	return result
 }
 
 // retire releases the store pins retained by one exact admission. Release is

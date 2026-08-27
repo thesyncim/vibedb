@@ -231,5 +231,30 @@ func (registry *DynamicSplitData) retire(operation OperationID, digest [32]byte)
 	return result
 }
 
+// Close removes all process-local data capabilities and settles every child
+// stage owner. It grants no terminal authority and leaves durable operation
+// state intact for admission replay after restart.
+func (registry *DynamicSplitData) Close() error {
+	if registry == nil {
+		return nil
+	}
+	var cleanup []func() error
+	registry.mu.Lock()
+	for operation, entry := range registry.entries {
+		for _, closeChild := range entry.childCleanup {
+			if closeChild != nil {
+				cleanup = append(cleanup, closeChild)
+			}
+		}
+		delete(registry.entries, operation)
+	}
+	registry.mu.Unlock()
+	var result error
+	for _, closeChild := range cleanup {
+		result = errors.Join(result, closeChild())
+	}
+	return result
+}
+
 var _ splitartifact.Source = (*DynamicSplitData)(nil)
 var _ TailStreamTargetResolver = (*DynamicSplitData)(nil)

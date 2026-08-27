@@ -55,6 +55,7 @@ func (executor *LazyReplicatedChildExecutor) Close() error {
 	}
 	executor.mu.Lock()
 	defer executor.mu.Unlock()
+	defer clear(executor.options.WALKey.Material[:])
 	if executor.lifecycle == nil {
 		return nil
 	}

@@ -234,6 +234,10 @@ func sourceSplitActionMask() uint16 {
 		actionBit(ActionCertifyCutover) | actionBit(ActionPruneRetained)
 }
 
+// SourceSplitActionMask is the complete shard-local source capability set.
+// Gateway-only publication and drain actions are deliberately excluded.
+func SourceSplitActionMask() uint16 { return sourceSplitActionMask() }
+
 func childSplitActionMask() uint16 {
 	return actionBit(ActionStageChild) | actionBit(ActionActivateChild) |
 		actionBit(ActionCreateChildWAL) | actionBit(ActionAdoptChildRuntime)
