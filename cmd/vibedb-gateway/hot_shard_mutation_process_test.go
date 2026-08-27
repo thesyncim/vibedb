@@ -602,8 +602,8 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatalf("foreground/state amplification requests=%d bytes=%d storage_growth=%d snapshot_network_growth=%d",
 			client.requests, client.bytes, storageGrowth, snapshotNetworkGrowth)
 	}
-	t.Logf("write-driven hot move: atomic_relation_index_visibility=true leader_kill=true response_partition=true reopen=true p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d snapshot_network_growth=%d",
-		p99, maximumOperations, len(record.Payload), client.requests, client.bytes,
+	t.Logf("write-driven hot move+split: atomic_relation_index_visibility=true leader_kill=true source_partition=true response_partition=true reopen=true p99=%s split_p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_wal_growth=%d snapshot_network_growth=%d",
+		p99, splitP99, maximumOperations, len(record.Payload), client.requests, client.bytes,
 		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, snapshotNetworkGrowth)
 }
 
