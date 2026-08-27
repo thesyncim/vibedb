@@ -22,6 +22,39 @@ func rf3FixtureProbeRequest(route gateway.ReplicatedRoute, authority serviceauth
 	}
 }
 
+func rf3FixtureProbeState(response *shardservice.ReplicatedResponse, group raftmember.GroupKey,
+	requireLeader bool) (shardservice.ReplicatedMemberState, error) {
+	if response == nil || response.Kind != shardservice.ReplicatedHandshake || !response.HasState ||
+		response.State.Fence.Group != group || requireLeader && response.State.LeaderID == 0 {
+		return shardservice.ReplicatedMemberState{}, errors.New("external RF3: incomplete probe")
+	}
+	return response.State, nil
+}
+
+func TestRF3FixtureIsolatedMemberProbeDoesNotRequireLeader(t *testing.T) {
+	group := raftmember.GroupKey{GroupID: [16]byte{1}}
+	response := &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+		HasState: true, State: shardservice.ReplicatedMemberState{Fence: shardservice.ReplicatedFence{Group: group}}}
+	if _, err := rf3FixtureProbeState(response, group, false); err != nil {
+		t.Fatalf("isolated follower's valid leaderless state: %v", err)
+	}
+	if _, err := rf3FixtureProbeState(response, group, true); err == nil {
+		t.Fatal("leaderless member counted toward quorum leader readiness")
+	}
+	response.State.LeaderID = 2
+	if _, err := rf3FixtureProbeState(response, group, true); err != nil {
+		t.Fatal(err)
+	}
+	response.HasState = false
+	if _, err := rf3FixtureProbeState(response, group, false); err == nil {
+		t.Fatal("missing state accepted")
+	}
+	response.HasState = true
+	if _, err := rf3FixtureProbeState(response, raftmember.GroupKey{}, false); err == nil {
+		t.Fatal("foreign group accepted")
+	}
+}
+
 func TestRF3FixtureProbeCarriesExactObserverAuthority(t *testing.T) {
 	route := gateway.ReplicatedRoute{
 		Group: raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},

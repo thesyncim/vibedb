@@ -931,6 +931,10 @@ func (fixture *durableRF3ExternalFixture) assertRouteSeedFilesDistinct(t testing
 func (fixture *durableRF3ExternalFixture) tryProbe(
 	group, member int,
 ) (shardservice.ReplicatedMemberState, error) {
+	return fixture.probeMember(group, member, true)
+}
+
+func (fixture *durableRF3ExternalFixture) probeMember(group, member int, requireLeader bool) (shardservice.ReplicatedMemberState, error) {
 	if group < 0 || group >= durableRF3ExternalGroups || member < 0 || member >= durableRF3ExternalVoters {
 		return shardservice.ReplicatedMemberState{}, errors.New("external RF3: invalid probe")
 	}
@@ -945,11 +949,7 @@ func (fixture *durableRF3ExternalFixture) tryProbe(
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
 	}
-	if response == nil || response.Kind != shardservice.ReplicatedHandshake ||
-		response.State.Fence.Group != route.Group || response.State.LeaderID == 0 {
-		return shardservice.ReplicatedMemberState{}, errors.New("external RF3: incomplete probe")
-	}
-	return response.State, nil
+	return rf3FixtureProbeState(response, route.Group, requireLeader)
 }
 
 func durableRF3ExternalLeaderMember(t testing.TB, leader uint64) int {

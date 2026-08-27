@@ -328,7 +328,7 @@ func assertReadBatchRF3FormerLeaderRefuses(
 	member int,
 ) {
 	t.Helper()
-	state, err := fixture.tryProbe(durableRF3DataAGroup, member)
+	state, err := fixture.probeMember(durableRF3DataAGroup, member, false)
 	if err != nil {
 		t.Fatal(err)
 	}
