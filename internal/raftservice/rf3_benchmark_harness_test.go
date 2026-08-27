@@ -350,7 +350,9 @@ func readRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.Replic
 }
 
 func evidenceValue(client uint32, sequence uint64) []byte {
-	raw := append([]byte(`{"client":`), strconv.FormatUint(uint64(client), 10)...)
+	raw := strconv.AppendUint([]byte(`{"id":"rf3-evidence-`), uint64(client), 10)
+	raw = append(raw, `","client":`...)
+	raw = strconv.AppendUint(raw, uint64(client), 10)
 	raw = append(raw, []byte(`,"sequence":`)...)
 	raw = strconv.AppendUint(raw, sequence, 10)
 	raw = append(raw, '}')
@@ -359,6 +361,13 @@ func evidenceValue(client uint32, sequence uint64) []byte {
 		panic(err)
 	}
 	return canonical
+}
+
+func TestRF3EvidenceValueIncludesMatchingPrimaryKey(t *testing.T) {
+	want := []byte(`{"client":7,"id":"rf3-evidence-7","sequence":11}`)
+	if got := evidenceValue(7, 11); !bytes.Equal(got, want) {
+		t.Fatalf("evidence document = %s, want %s", got, want)
+	}
 }
 
 func evidenceOperation(workload rf3bench.Workload, seed, ordinal uint64) rf3bench.Operation {
