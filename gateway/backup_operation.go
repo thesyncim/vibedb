@@ -299,3 +299,16 @@ func backupCertificateDigest(cursor [8]uint64) (digest [sha256.Size]byte) {
 	}
 	return digest
 }
+
+// BackupOperationCertificateDigest returns the immutable repository certificate
+// selected after certificate publication. Later lifecycle proofs cannot replace
+// this identity because it remains encoded in the replicated cursor.
+func BackupOperationCertificateDigest(record ReplicatedOperationRecord) ([sha256.Size]byte, bool) {
+	if record.Kind != ReplicatedOperationBackup || record.ID == ([sha256.Size]byte{}) ||
+		record.Revision < 2 || record.Cursor[0] < backupStageCertified ||
+		record.Cursor[0] > backupStageRestoreStaged || record.Cursor[1] == 0 {
+		return [sha256.Size]byte{}, false
+	}
+	digest := backupCertificateDigest(record.Cursor)
+	return digest, digest != ([sha256.Size]byte{})
+}

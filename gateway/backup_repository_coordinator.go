@@ -145,6 +145,31 @@ func (coordinator *BackupRepositoryCoordinator) CollectFromLeaders(ctx context.C
 	return coordinator.CollectLive(ctx, record, cut, sources)
 }
 
+// ResumeExport settles a certificate-last repository publication after a
+// gateway restart without reading or copying any shard artifact again.
+func (coordinator *BackupRepositoryCoordinator) ResumeExport(ctx context.Context,
+	record ReplicatedOperationRecord,
+) (ReplicatedOperationRecord, clusterbackup.Certificate, error) {
+	if coordinator == nil || ctx == nil || coordinator.repository == nil ||
+		!validBackupRecord(record, backupStageCertified) &&
+			!validBackupRecord(record, backupStageExported) {
+		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, ErrBackupOperation
+	}
+	digest := backupCertificateDigest(record.Cursor)
+	certificate, err := coordinator.repository.Certificate(digest)
+	if err != nil || certificate.Operation != record.ID ||
+		!backupCertificateMatchesIntent(record, certificate) {
+		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, errors.Join(ErrBackupOperation, err)
+	}
+	if validBackupRecord(record, backupStageCertified) {
+		record, err = coordinator.Publish(ctx, record, certificate)
+		if err != nil {
+			return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, err
+		}
+	}
+	return record, certificate, nil
+}
+
 // StageRestore verifies every artifact from the coordinator-owned immutable
 // export, builds a non-serving root, and only then advances the replicated
 // lifecycle. It never creates databases, members, stores, routes, or grants.

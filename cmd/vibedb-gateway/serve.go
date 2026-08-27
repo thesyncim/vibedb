@@ -12,12 +12,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -76,6 +78,7 @@ type serveRequest struct {
 	// MaxResultBytes is required by read_batch and bounds its complete JSON
 	// success response, including documents and the per-group observation vector.
 	MaxResultBytes uint32           `json:"max_result_bytes,omitempty"`
+	BackupID       string           `json:"backup_id,omitempty"`
 	Params         []serveParam     `json:"params,omitempty"`
 	Statements     []serveStatement `json:"statements,omitempty"`
 }
@@ -109,6 +112,9 @@ type serveResponse struct {
 	OutcomeUnknown bool                            `json:"outcome_unknown,omitempty"`
 	DurableAck     *durableExecBatchAckWireRequest `json:"-"`
 	Metrics        *gateway.MetricsSnapshot        `json:"metrics,omitempty"`
+	BackupID       [32]byte                        `json:"-"`
+	BackupStage    uint64                          `json:"backup_stage,omitempty"`
+	BackupProof    [32]byte                        `json:"-"`
 	Error          string                          `json:"error,omitempty"`
 }
 
@@ -158,6 +164,11 @@ func runServe(args []string) (exitCode int) {
 	hotShardCapacity := fs.String("hot-shard-capacity", "", "strict canonical vibejson provisioned pressure capacities")
 	hotShardInterval := fs.Duration("hot-shard-interval", time.Second, "pressure-window publication cadence; not correctness authority")
 	replicaControlManifestPath := fs.String("replica-control-manifest", "", "strict canonical vibejson replica-control topology and bounds")
+	backupRepositoryPath := fs.String("backup-repository", "", "absolute server-local durable backup repository directory")
+	backupMaxBackups := fs.Int("backup-max-backups", 16, "hard retained certified backup bound")
+	backupMaxArtifacts := fs.Int("backup-max-artifacts", 4096, "hard retained backup artifact bound")
+	backupMaxArtifactBytes := fs.Uint64("backup-max-artifact-bytes", 64<<30, "hard bytes per backup artifact")
+	backupMaxDiskBytes := fs.Uint64("backup-max-disk-bytes", 256<<30, "hard aggregate backup repository bytes")
 	schemaRolloutPlan := fs.String("schema-rollout-plan", "", "strict canonical vibejson per-replica schema rollout plan")
 	schemaRolloutOnce := fs.Bool("schema-rollout-once", false, "execute the authenticated schema rollout and exit")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
@@ -187,6 +198,12 @@ func runServe(args []string) (exitCode int) {
 	if *schemaRolloutOnce && *schemaRolloutPlan == "" ||
 		*schemaRolloutPlan != "" && (*devStaticCatalog || *devPlaintext || *replicaControlManifestPath == "") {
 		fmt.Fprintln(os.Stderr, "gateway: schema rollout requires replicated catalog and authenticated replica-control manifest")
+		return 2
+	}
+	if *backupRepositoryPath != "" && (!filepath.IsAbs(*backupRepositoryPath) ||
+		filepath.Clean(*backupRepositoryPath) != *backupRepositoryPath || *devStaticCatalog ||
+		*devPlaintext || *replicaControlManifestPath == "") {
+		fmt.Fprintln(os.Stderr, "gateway: backup repository requires an absolute clean path, replicated catalog, TLS, and replica-control manifest")
 		return 2
 	}
 	if err := validateGatewayHotShardServeMode(
@@ -251,6 +268,9 @@ func runServe(args []string) (exitCode int) {
 			serviceauthz.CapabilityRequestLedger | serviceauthz.CapabilityExecutionPin
 		if *schemaRolloutPlan != "" {
 			required |= serviceauthz.CapabilitySchema
+		}
+		if *backupRepositoryPath != "" {
+			required |= serviceauthz.CapabilityBackup
 		}
 		if policy.Check(internalAuthority.Node, required) != serviceauthz.DecisionAllow {
 			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks required data, schema, delegation, topology, recovery, ledger, or execution-pin authority")
@@ -456,6 +476,7 @@ func runServe(args []string) (exitCode int) {
 	var replicaControllersDone <-chan struct{}
 	var splitControllerDone <-chan struct{}
 	var splitRuntime *gatewayServingSplitRuntime
+	var backupOperator gatewayBackupOperator
 	if replicaControlManifest != nil {
 		manifest := *replicaControlManifest
 		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
@@ -492,6 +513,24 @@ func runServe(args []string) (exitCode int) {
 			Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
 			Authority: catalogAuthority, Replicated: replicated, Drainer: drainer,
 		})
+		var backupRepository *clusterbackup.BackupRepository
+		var backupErr error
+		if *backupRepositoryPath != "" {
+			backupRepository, backupErr = clusterbackup.OpenBackupRepository(*backupRepositoryPath,
+				clusterbackup.RepositoryLimits{MaxBackups: *backupMaxBackups,
+					MaxArtifacts: *backupMaxArtifacts, MaxArtifactBytes: *backupMaxArtifactBytes,
+					MaxDiskBytes: *backupMaxDiskBytes})
+			if backupErr == nil {
+				var gate *serviceauthz.Gate
+				gate, backupErr = serviceauthz.NewGate(authorization)
+				if backupErr == nil {
+					backupOperator = &gatewayBackupOperatorRuntime{authority: catalogAuthority,
+						gate: gate, principal: internalAuthority, repository: backupRepository,
+						opener: shardOpener, observer: controls.HealthObservations,
+						read: readDeadline, write: writeDeadline}
+				}
+			}
+		}
 		prepareConcurrency := min(int(manifest.Bounds.MaxConnections), gatewaySplitAdmissionConcurrency)
 		childPrepareClient, childPrepareErr := splitcontroller.NewChildPrepareClient(
 			splitcontroller.ChildPrepareClientOptions{
@@ -552,7 +591,10 @@ func runServe(args []string) (exitCode int) {
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
 		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, childPrepareErr, splitFactoryErr,
 			controllerErr, hotShardBindErr, healthErr, revisionErr,
-			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
+			authorizeErr, tlsErr, serviceErr, listenErr, backupErr); joined != nil {
+			if backupRepository != nil {
+				_ = backupRepository.Close()
+			}
 			if splitRuntime != nil {
 				_ = splitRuntime.Close()
 			}
@@ -562,6 +604,9 @@ func runServe(args []string) (exitCode int) {
 			_ = listener.Close()
 			fmt.Fprintf(os.Stderr, "gateway: initialize replica control: %v\n", joined)
 			return 1
+		}
+		if backupRepository != nil {
+			defer backupRepository.Close()
 		}
 		if *schemaRolloutPlan != "" {
 			started := time.Now()
@@ -609,6 +654,12 @@ func runServe(args []string) (exitCode int) {
 			stop()
 		}()
 	}
+	if *backupRepositoryPath != "" && backupOperator == nil {
+		_ = listener.Close()
+		fmt.Fprintln(os.Stderr, "gateway: backup operator unavailable")
+		return 1
+	}
+	ctx = withGatewayBackupOperator(ctx, backupOperator)
 	if hotShardRuntime != nil {
 		hotShardDone = runGatewayHotShardPublisher(
 			ctx, hotShardRuntime, *hotShardInterval, logf,
@@ -1288,6 +1339,8 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 		line := scanner.Bytes()
 		structuredExecCandidate := durableExecBatchRequestCandidate(line)
 		structuredExecValid := structuredExecCandidate && validateDurableExecBatchEnvelope(line) == nil
+		backupCandidate := gatewayBackupRequestCandidate(line)
+		backupValid := backupCandidate && validateGatewayBackupEnvelope(line) == nil
 		if issuerOpenRequestCandidate(line) {
 			var request issuerOpenWireRequest
 			authority, authenticated := serviceauthz.FromContext(ctx)
@@ -1487,6 +1540,20 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			}
 			continue
 		}
+		if req.Op == "backup" || req.Op == "backup_status" {
+			if !backupCandidate || !backupValid {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidGatewayBackupRequest.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if writeServeResponse(writer, executeGatewayBackup(
+				ctx, gatewayBackupOperatorFromContext(ctx), req,
+			)) != nil {
+				return
+			}
+			continue
+		}
 		if req.Op == "exec_batch" {
 			// The public RF3 batch endpoint is durable-only. Raw identity-field
 			// presence must never be inferred from decoded nonzero values: an
@@ -1594,6 +1661,9 @@ func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
 	}
 	if request.Op == "metrics" {
 		return serviceauthz.CapabilityTopology
+	}
+	if request.Op == "backup" || request.Op == "backup_status" {
+		return serviceauthz.CapabilityBackup
 	}
 	var required serviceauthz.Capability
 	if request.SQL != "" {
@@ -1768,6 +1838,30 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 	}
 	if resp.Metrics != nil {
 		if err := writeGatewayMetrics(w, *resp.Metrics); err != nil {
+			return err
+		}
+	}
+	if resp.BackupID != ([32]byte{}) {
+		if err := w.Key("backup_id"); err != nil {
+			return err
+		}
+		if err := writeNativeHex(w, resp.BackupID[:]); err != nil {
+			return err
+		}
+	}
+	if resp.BackupStage != 0 {
+		if err := w.Key("backup_stage"); err != nil {
+			return err
+		}
+		if err := w.Uint(resp.BackupStage); err != nil {
+			return err
+		}
+	}
+	if resp.BackupProof != ([32]byte{}) {
+		if err := w.Key("backup_proof"); err != nil {
+			return err
+		}
+		if err := writeNativeHex(w, resp.BackupProof[:]); err != nil {
 			return err
 		}
 	}

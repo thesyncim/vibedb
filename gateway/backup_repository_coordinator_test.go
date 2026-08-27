@@ -81,6 +81,10 @@ func TestBackupRepositoryCoordinatorSettlesAndResumesCatalogPublication(t *testi
 	if err != nil || !replayed.Equal(exported) {
 		t.Fatalf("replayed=%+v err=%v", replayed, err)
 	}
+	resumed, resumedCertificate, err := coordinator.ResumeExport(t.Context(), exported)
+	if err != nil || !resumed.Equal(exported) || resumedCertificate.Digest != certificate.Digest {
+		t.Fatalf("resumed=%+v certificate=%+v err=%v", resumed, resumedCertificate, err)
+	}
 }
 
 func TestBackupRepositoryCoordinatorCollectsCompleteLiveInventory(t *testing.T) {
