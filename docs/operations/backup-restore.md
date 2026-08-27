@@ -134,6 +134,22 @@ head witness, genesis proof, and restore-policy projection. Old routes,
 ownership, operation records, and catalog history do not survive that import.
 It does not publish catalog activation or activate any replica.
 
+The logical SQL relation manifest is not the replicated machine manifest.
+The machine digest also binds the schema/index definitions and validation
+profile. Restore verifies the artifact against the exact source machine
+manifest under its authenticated source binding, then computes a separate
+fresh machine manifest under the target binding. The sealed target catalog
+descriptor must match that fresh digest before installation. Source and target
+machine digests must not be treated as interchangeable.
+
+Canonical image hashes also include their validation profile. Even unchanged
+base/index rows are verified once per group against the source artifact and
+rehashed under the fresh target profile with bounded memory. The catalog
+instead hashes its fresh projection after discarding source rows. A sealed
+retry revalidates the source artifact, fresh image digest, and exact receipt
+machine digest without reopening live SQL/WAL stores. This is identity-domain
+rebinding, not cross-build schema migration.
+
 After provisioning certificates for the operation's fresh target identities,
 adopt each replica with its own exact preparation manifest:
 

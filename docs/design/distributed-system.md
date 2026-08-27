@@ -554,6 +554,12 @@ intake. There is no general public operator split command. Replica movement is
 command-composed through its separate resumable controller. A merge planner
 remains absent.
 
+The serving manifest carries a private child registry per group and one shared
+operation-admission ceiling. This does not complete child schema provisioning:
+the command still provisions singleton base relations, and hot admission still
+has one split template rather than a per-source-group template. Multi-relation
+and heterogeneous multi-group split qualification remains incomplete.
+
 ## Replication kernel
 
 The internal replication kernel contains:

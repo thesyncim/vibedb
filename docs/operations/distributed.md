@@ -185,6 +185,12 @@ With a strict replica-control manifest and hot-shard policy, the gateway can
 derive one bounded split, persist its replicated operation, run the controller,
 publish the catalog successor, and retire the source after the drain witness.
 This is automatic pressure-driven intake, not a general operator split CLI.
+The current child SQL provisioner still creates one base-table relation and
+fails closed for multi-relation targets. Group-scoped child registries select
+the correct paths and profile, but do not remove that limitation. Gateway hot
+admission also retains one split template rather than a template for each
+source group. Multi-relation child provisioning and heterogeneous multi-group
+hot admission remain incomplete. The singleton development path is unchanged.
 Mandatory Linux split-under-load fault gates remain Partial until CI records
 their required unskipped runs.
 

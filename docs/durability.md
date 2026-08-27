@@ -76,6 +76,21 @@ An unresolved conditional transaction record makes a standalone collection
 return `ErrCollectionInDoubt`. Open the complete database directory so the
 decision log and all participants can be reconciled.
 
+Replicated SQL seals role-specific recovery record regions:
+
+| Role | Sealed record-region capacity |
+| --- | --- |
+| User relation | 16 MiB + 34 × 512 bytes = 16,794,624 bytes |
+| Request-ledger system relation | 16 MiB + 60 × 512 bytes = 16,807,936 bytes |
+
+The shared recovery allocation ceiling is 16,807,936 bytes. It accounts for
+the ledger's 258-record profile, maximum key widths, conditional-record
+framing, checksum, and sector padding. It does not enlarge the user-relation
+journal: that sidecar contract remains fixed at 16,794,624 bytes. Recovery
+rejects a header requesting more than the shared ceiling before allocating
+its record buffer. These capacities describe the record region, not total
+sidecar file size or a transaction participant limit.
+
 ## Root publication
 
 The file has two alternate roots. The selected root is the canonical physical

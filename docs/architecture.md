@@ -253,6 +253,10 @@ can turn a certified hot-shard cut into a replicated split operation and drive
 it to its terminal catalog and retirement state. `serve-rf3` installs the
 group-scoped split, plan-admission, artifact, tail, child-preparation, and
 retirement handlers. There is no general operator split-intake CLI. The
+command-side child SQL provisioner remains singleton-only, and gateway hot
+admission does not yet select a split template per source group. Per-group
+registries therefore provide exact routing, not complete multi-relation split
+provisioning. The
 internal splitter scans
 one certified source image once and routes each borrowed row to at most three
 children. It uses a compiled `vibejson` placement program and does not use

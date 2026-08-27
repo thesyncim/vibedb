@@ -120,6 +120,27 @@ authority even when they share one authenticated node identity and endpoint.
 The 64-group manifest bound is per process, not a transaction participant or
 cluster-wide shard limit.
 
+The serving manifest keeps split-child provisioning separate from shared
+control admission:
+
+| Manifest | Split-control fields | Child registry |
+| --- | --- | --- |
+| Singleton | `journal_path`, `max_records`, `max_file_bytes`, `grants`, `child_registry` | Retained inside `split_control`, as before |
+| Multi-group | `journal_path`, `max_records`, `max_file_bytes`, `grants`, `max_operations` | Required separately in every `groups[]` entry |
+
+A grouped entry has canonical field order `wal`, `sql`, `route`,
+`child_registry`, `members`, then optional `enrolled_target`. Each registry
+uses that group's own roster, table, WAL/apply profile, and private root at
+`route.member_root/split-children`. Its bootstrap file stays under that root.
+The top-level `max_operations` is a process-wide bound from 1 through 64, and
+each registry's limit must fit within it. Relabeling an operation for another
+group does not create a second admission slot. Do not reuse one group's
+registry as a shared template for heterogeneous groups.
+
+These are `serve-rf3` manifests. The singleton `prepare-rf3` input below is
+unchanged. Exact group routing does not by itself provide multi-relation child
+provisioning. See [Online range-split status](distributed.md#online-range-split-status).
+
 A manually configured gateway-backed test needs catalog, request-ledger, and
 data groups. Role replicas can share one multi-group process or run as nine
 separate `serve-rf3` processes. Repeat the preparation procedure with distinct

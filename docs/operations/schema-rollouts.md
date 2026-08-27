@@ -133,6 +133,12 @@ generation bytes, and recovery duration before increasing cluster concurrency.
 
 ## Verify the safety contract
 
+The logical SQL relation digest is not the exact replicated machine-schema
+digest used in command fences. Initial routing and restore now compute those
+domains separately. The schema-rollout caller audit for that distinction is
+still pending, so the gates below are not a claim that every logical-to-machine
+digest caller is qualified.
+
 Repository gates cover restart after a leader-loss outcome-unknown error, the
 mixed-generation interval, refusal to roll back after authorization, an old
 global catalog until every replica is active, and exact completion from a fresh
@@ -145,4 +151,3 @@ See:
 - [`gateway/schema_rollout_controller.go`](../../gateway/schema_rollout_controller.go)
 - [`cmd/vibedb-shard/schema_install_rf3.go`](../../cmd/vibedb-shard/schema_install_rf3.go)
 - [`internal/schemainstall/control.go`](../../internal/schemainstall/control.go)
-
