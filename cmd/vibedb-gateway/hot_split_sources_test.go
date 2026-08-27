@@ -23,6 +23,7 @@ func TestGatewaySplitSourceCanonicalBounds(t *testing.T) {
 		TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
 		SchemaGeneration: profile.SchemaGeneration, RelationManifestDigest: source.Command.RelationManifestDigest, Table: profile.Table,
 		SQL: gatewaySplitSourceSQLFixture(t, source, profile), Template: gatewaySplitTemplateFixture()}
+	entry.Placement = persistGatewaySplitPlacement(gatewaySplitSourceFixture(t, source, profile).Placement)
 	for i := 0; i < 3; i++ {
 		entry.Replicas = append(entry.Replicas, persistedGatewaySplitReplica{
 			Node: persisted.ShardEndpoints[i].Node, ChildRoot: filepath.Join(t.TempDir(), "split-children")})
@@ -44,13 +45,16 @@ func TestGatewaySplitSourceCanonicalBounds(t *testing.T) {
 	}
 	check(t, persisted, true)
 	for name, mutate := range map[string]func(*persistedGatewaySplitSource){
-		"zero group":      func(s *persistedGatewaySplitSource) { s.GroupID = [16]byte{} },
-		"zero generation": func(s *persistedGatewaySplitSource) { s.SchemaGeneration = 0 },
-		"zero digest":     func(s *persistedGatewaySplitSource) { s.RelationManifestDigest = [32]byte{} },
-		"invalid root":    func(s *persistedGatewaySplitSource) { s.Replicas[0].ChildRoot = "/" },
-		"unlisted node":   func(s *persistedGatewaySplitSource) { s.Replicas[0].Node = hex.EncodeToString(make([]byte, 16)) },
-		"duplicate node":  func(s *persistedGatewaySplitSource) { s.Replicas[1].Node = s.Replicas[0].Node },
-		"missing replica": func(s *persistedGatewaySplitSource) { s.Replicas = s.Replicas[:2] },
+		"zero group":                 func(s *persistedGatewaySplitSource) { s.GroupID = [16]byte{} },
+		"zero generation":            func(s *persistedGatewaySplitSource) { s.SchemaGeneration = 0 },
+		"zero digest":                func(s *persistedGatewaySplitSource) { s.RelationManifestDigest = [32]byte{} },
+		"missing placement":          func(s *persistedGatewaySplitSource) { s.Placement = persistedGatewaySplitPlacement{} },
+		"rebound narrower placement": func(s *persistedGatewaySplitSource) { s.Placement.RangeEndMax = false; s.Placement.RangeEnd[0] = 0x80 },
+		"foreign placement shape":    func(s *persistedGatewaySplitSource) { s.Placement.ShardKey = "/other" },
+		"invalid root":               func(s *persistedGatewaySplitSource) { s.Replicas[0].ChildRoot = "/" },
+		"unlisted node":              func(s *persistedGatewaySplitSource) { s.Replicas[0].Node = hex.EncodeToString(make([]byte, 16)) },
+		"duplicate node":             func(s *persistedGatewaySplitSource) { s.Replicas[1].Node = s.Replicas[0].Node },
+		"missing replica":            func(s *persistedGatewaySplitSource) { s.Replicas = s.Replicas[:2] },
 	} {
 		t.Run(name, func(t *testing.T) {
 			copyEntry := entry
@@ -66,6 +70,96 @@ func TestGatewaySplitSourceCanonicalBounds(t *testing.T) {
 	check(t, candidate, false)
 	if _, err := openGatewaySplitSources(make([]persistedGatewaySplitSource, maxGatewaySplitSources+1), nil); err == nil {
 		t.Fatal("unbounded source inventory accepted")
+	}
+}
+
+func TestGatewaySplitSourceRestartPreservesOriginalPlacementAfterRetainedCut(t *testing.T) {
+	initial, source, profile, _ := gatewayHotSplitFactoryFixture(t)
+	entry := gatewaySplitSourceFixture(t, source, profile)
+	encoded := persistedGatewaySplitSource{ClusterID: source.Group.ClusterID, ClusterIncarnation: source.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
+		SchemaGeneration: entry.SchemaGeneration, RelationManifestDigest: entry.RelationManifestDigest, Table: entry.Table, SQL: entry.SQL,
+		Template: entry.Template, Placement: persistGatewaySplitPlacement(entry.Placement)}
+	manifest := gatewayReplicaControlManifest{}
+	for _, replica := range entry.Replicas {
+		encoded.Replicas = append(encoded.Replicas, persistedGatewaySplitReplica{Node: hex.EncodeToString(replica.Node[:]), ChildRoot: replica.Root})
+		manifest.Shards = append(manifest.Shards, gateway.ReplicatedEndpoint{Node: replica.Node})
+		manifest.SplitSnapshots = append(manifest.SplitSnapshots, "127.0.0.1:9301")
+	}
+	raw, err := vibejson.Marshal(&encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted persistedGatewaySplitSource
+	if err := vibejson.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	manifest.SplitSources, err = openGatewaySplitSources([]persistedGatewaySplitSource{persisted}, manifest.Shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gatewayHotSplitSources(manifest, initial); err != nil {
+		t.Fatal(err)
+	}
+	oldManifest, _ := initial.Manifest(source.Distribution)
+	oldMetadata, _ := oldManifest.ShardMetadataAt(0)
+	cut := distribution.KeyspacePoint{0x80}
+	narrow := distribution.KeyRange{End: distribution.KeyspaceEnd{Point: cut}}
+	left := source
+	left.Command.OwnershipEpoch++
+	left.Command.RoutingVersion++
+	left.Command.RouteGeneration++
+	right := left
+	right.Shard = "next-child"
+	right.AllocationGeneration++
+	right.Group.ShardIncarnation[0]++
+	right.Group.GroupID[0]++
+	right.RangeIdentity[0]++
+	right.Command.RelationManifestDigest[0]++
+	leaders := make([]distribution.EndpointID, len(source.Replicas))
+	addresses := make(map[distribution.EndpointID]string)
+	for i, replica := range source.Replicas {
+		leaders[i] = replica.Endpoint
+		for _, endpoint := range []distribution.EndpointID{replica.Endpoint, replica.NativeEndpoint, replica.ControlEndpoint} {
+			addresses[endpoint], err = initial.Address(endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	nextManifest, err := distribution.NewManifest(source.Distribution, oldManifest.Version()+1, []distribution.Shard{
+		{ID: source.Shard, AllocationGeneration: source.AllocationGeneration, Range: narrow, Leaders: leaders, Epoch: oldMetadata.Epoch + 1},
+		{ID: right.Shard, AllocationGeneration: right.AllocationGeneration, Range: distribution.KeyRange{Start: cut, End: distribution.KeyspaceEnd{Max: true}}, Leaders: leaders, Epoch: oldMetadata.Epoch + 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := initial.Spec(source.Distribution)
+	placement, _ := initial.Placement(profile.Table)
+	// This is a metadata/restart contract test, not a fabricated cutover
+	// certificate: production publishes these coordinates through Plan proofs.
+	next, err := gateway.NewSnapshotWithReplicatedTableMetadata(distribution.ClusterConfig{Distributions: []distribution.DistributionSpec{spec}, Placements: []distribution.TablePlacement{placement}, Manifests: []*distribution.Manifest{nextManifest}},
+		addresses, initial.Generation()+1, nil, nil, []gateway.ReplicatedShardDescriptor{left, right}, []gateway.ReplicatedTableProfile{profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := gatewayHotSplitSources(manifest, next)
+	if err != nil || sources[source.Group].Placement != entry.Placement {
+		t.Fatalf("restart rebound immutable source: %v", err)
+	}
+	if !gatewaySplitSourceRetainedRangeMatches(entry, left, narrow) {
+		t.Fatal("certified later cut rejected")
+	}
+	for _, mutate := range []func(*gateway.ReplicatedShardDescriptor){
+		func(d *gateway.ReplicatedShardDescriptor) { d.Command.OwnershipEpoch = source.Command.OwnershipEpoch },
+		func(d *gateway.ReplicatedShardDescriptor) { d.Command.RoutingVersion = source.Command.RoutingVersion },
+		func(d *gateway.ReplicatedShardDescriptor) { d.Command.RouteGeneration = source.Command.RouteGeneration },
+	} {
+		bad := left
+		mutate(&bad)
+		if gatewaySplitSourceRetainedRangeMatches(entry, bad, narrow) {
+			t.Fatal("narrowing without later exact authority accepted")
+		}
 	}
 }
 

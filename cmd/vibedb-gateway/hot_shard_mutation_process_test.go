@@ -997,6 +997,7 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 			entry.LocalIndexes = []persistedGatewaySplitIndex{{Name: "by_kind", Paths: []string{"/kind"}}}
 			entry.Template.MaxSessions, entry.Template.RetryWindow, entry.Template.TxnLimits = apply.MaxSessions, apply.RetryWindow, apply.TxnLimits
 			entry.Template.Format, entry.Template.ShardKey = apply.Placement.Format, placement.Columns[0]
+			entry.Placement = persistGatewaySplitPlacement(apply.Placement)
 			entry.Template.TupleVersion, entry.Template.MapperVersion = uint16(apply.Placement.TupleVersion), uint16(apply.Placement.MapperVersion)
 			for member := 0; member < 3; member++ {
 				entry.Replicas = append(entry.Replicas, persistedGatewaySplitReplica{

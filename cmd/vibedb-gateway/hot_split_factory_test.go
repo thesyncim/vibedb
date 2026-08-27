@@ -113,6 +113,9 @@ func gatewaySplitSourceFixture(t testing.TB, source gateway.ReplicatedShardDescr
 	entry := gatewaySplitSource{Group: source.Group, SchemaGeneration: profile.SchemaGeneration,
 		RelationManifestDigest: source.Command.RelationManifestDigest, Table: profile.Table, Template: gatewaySplitTemplateFixture()}
 	entry.SQL = gatewaySplitSourceSQLFixture(t, source, profile)
+	entry.Placement = sqldriver.ReplicatedPlacementProfile{Format: entry.Template.Format, ShardKey: entry.Template.ShardKey,
+		TupleVersion: distribution.TupleVersion(entry.Template.TupleVersion), MapperVersion: distribution.MapperVersion(entry.Template.MapperVersion),
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
 	logical, err := sqldriver.ReplicatedRelationManifestDigest(entry.SQL)
 	if err != nil {
 		t.Fatal(err)

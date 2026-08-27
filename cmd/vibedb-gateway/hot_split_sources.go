@@ -29,9 +29,30 @@ type persistedGatewaySplitSource struct {
 	RelationManifestDigest [32]byte                               `json:"relation_manifest_digest"`
 	Table                  string                                 `json:"table"`
 	SQL                    sqldriver.ReplicatedShardStoreIdentity `json:"sql"`
+	Placement              persistedGatewaySplitPlacement         `json:"placement"`
 	LocalIndexes           []persistedGatewaySplitIndex           `json:"local_indexes,omitempty"`
 	Template               persistedGatewaySplitTemplate          `json:"template"`
 	Replicas               []persistedGatewaySplitReplica         `json:"replicas"`
+}
+
+type persistedGatewaySplitPlacement struct {
+	Format        uint16  `json:"format"`
+	ShardKey      string  `json:"shard_key"`
+	TupleVersion  uint16  `json:"tuple_version"`
+	MapperVersion uint16  `json:"mapper_version"`
+	RangeStart    [8]byte `json:"range_start"`
+	RangeEnd      [8]byte `json:"range_end"`
+	RangeEndMax   bool    `json:"range_end_max"`
+}
+
+func persistGatewaySplitPlacement(p sqldriver.ReplicatedPlacementProfile) persistedGatewaySplitPlacement {
+	return persistedGatewaySplitPlacement{Format: p.Format, ShardKey: p.ShardKey, TupleVersion: uint16(p.TupleVersion), MapperVersion: uint16(p.MapperVersion),
+		RangeStart: p.Range.Start, RangeEnd: p.Range.End.Point, RangeEndMax: p.Range.End.Max}
+}
+
+func (p persistedGatewaySplitPlacement) open() sqldriver.ReplicatedPlacementProfile {
+	return sqldriver.ReplicatedPlacementProfile{Format: p.Format, ShardKey: p.ShardKey, TupleVersion: distribution.TupleVersion(p.TupleVersion), MapperVersion: distribution.MapperVersion(p.MapperVersion),
+		Range: distribution.KeyRange{Start: p.RangeStart, End: distribution.KeyspaceEnd{Point: p.RangeEnd, Max: p.RangeEndMax}}}
 }
 
 type persistedGatewaySplitIndex struct {
@@ -74,7 +95,7 @@ func openGatewaySplitSources(encoded []persistedGatewaySplitSource, endpoints []
 			ClusterID: entry.ClusterID, ClusterIncarnation: entry.ClusterIncarnation,
 			TopologyRecoveryEpoch: entry.TopologyRecoveryEpoch, ShardIncarnation: entry.ShardIncarnation, GroupID: entry.GroupID},
 			SchemaGeneration: entry.SchemaGeneration, RelationManifestDigest: entry.RelationManifestDigest,
-			Table: entry.Table, Template: entry.Template, SQL: entry.SQL}
+			Table: entry.Table, Template: entry.Template, SQL: entry.SQL, Placement: entry.Placement.open()}
 		if entry.ClusterID == ([16]byte{}) || entry.ClusterIncarnation == ([16]byte{}) ||
 			entry.TopologyRecoveryEpoch == 0 || entry.ShardIncarnation == ([16]byte{}) || entry.GroupID == ([16]byte{}) ||
 			entry.SchemaGeneration == 0 || entry.RelationManifestDigest == ([32]byte{}) || entry.Table == "" ||
@@ -96,6 +117,13 @@ func openGatewaySplitSources(encoded []persistedGatewaySplitSource, endpoints []
 			if _, err := store.CompileExactIndex(source.LocalIndexes[j]); err != nil {
 				return nil, errGatewayReplicaControlManifest
 			}
+		}
+		if !gatewaySplitSourcePlacementMatches(source) {
+			return nil, errGatewayReplicaControlManifest
+		}
+		machine, err := sqldriver.ReplicatedSchemaManifest(source.SQL, source.Placement, source.LocalIndexes)
+		if err != nil || machine != source.RelationManifestDigest {
+			return nil, errGatewayReplicaControlManifest
 		}
 		if _, duplicate := seen[source.Group]; duplicate {
 			return nil, errGatewayReplicaControlManifest
@@ -195,11 +223,9 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 				}
 			}
 		}
-		if !matchedReplica || !matchedRange {
+		if !matchedReplica || !matchedRange || !gatewaySplitSourceRetainedRangeMatches(source, descriptor, sourceRange) {
 			return nil, hotshard.ErrInvalidPressureCut
 		}
-		source.Placement = sqldriver.ReplicatedPlacementProfile{Format: source.Template.Format, ShardKey: source.Template.ShardKey,
-			TupleVersion: distribution.TupleVersion(source.Template.TupleVersion), MapperVersion: distribution.MapperVersion(source.Template.MapperVersion), Range: sourceRange}
 		digest, err := sqldriver.ReplicatedSchemaManifest(source.SQL, source.Placement, source.LocalIndexes)
 		if err != nil || digest != source.RelationManifestDigest {
 			return nil, hotshard.ErrInvalidPressureCut
@@ -238,6 +264,28 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 		result[source.Group] = source
 	}
 	return result, nil
+}
+
+func gatewaySplitSourcePlacementMatches(source gatewaySplitSource) bool {
+	p, t := source.Placement, source.Template
+	return p.Format == t.Format && p.ShardKey == t.ShardKey && uint16(p.TupleVersion) == t.TupleVersion && uint16(p.MapperVersion) == t.MapperVersion
+}
+
+func gatewaySplitSourceRetainedRangeMatches(source gatewaySplitSource, descriptor gateway.ReplicatedShardDescriptor, current distribution.KeyRange) bool {
+	initial := source.Placement.Range
+	if !gatewaySplitSourcePlacementMatches(source) || !initial.Contains(current.Start) ||
+		!initial.End.Max && (current.End.Max || bytes.Compare(initial.End.Point[:], current.End.Point[:]) < 0) {
+		return false
+	}
+	old, applied := source.SQL.Binding.Authority, descriptor.Command
+	if applied.OwnershipEpoch < old.OwnershipEpoch || applied.RoutingVersion < old.RoutingVersion || applied.RouteGeneration < old.RouteGeneration ||
+		applied.ActivePolicyGeneration < old.ActivePolicyGeneration || applied.ProtectionEpoch < old.ProtectionEpoch {
+		return false
+	}
+	// A narrower live range is accepted only behind a later catalog-certified
+	// ownership cut of this exact group. Its immutable validation range remains
+	// untouched, so restart recomputes the same source machine schema.
+	return current == initial || applied.OwnershipEpoch > old.OwnershipEpoch && applied.RoutingVersion > old.RoutingVersion && applied.RouteGeneration > old.RouteGeneration
 }
 
 func cloneGatewaySplitIndexes(indexes []store.IndexDefinition) []store.IndexDefinition {
