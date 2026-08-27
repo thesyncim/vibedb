@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -130,11 +131,18 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	defer connection.Close()
 	client := &hotMutationWireClient{connection: connection, reader: bufio.NewReader(connection)}
 	reference := client.openIssuer(t)
+	keySetupStarted := time.Now()
+	keys := devHotStableSplitKeys(t, 4_096)
+	keySetup := time.Since(keySetupStarted)
+	if keySetup > 2*time.Second {
+		t.Fatalf("stable split key setup=%s", keySetup)
+	}
 	latencies := make([]time.Duration, 0, 2_048)
 	var operation [32]byte
 	pressureDeadline := time.Now().Add(25 * time.Second)
-	for sequence := uint64(1); time.Now().Before(pressureDeadline); sequence++ {
-		key := fmt.Sprintf("dev-hot-%08d", sequence)
+	for sequence := uint64(1); sequence <= uint64(len(keys)) &&
+		time.Now().Before(pressureDeadline); sequence++ {
+		key := keys[sequence-1]
 		latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, sequence,
 			[]serveStatement{{SQL: `INSERT INTO documents VALUES (?)`, Params: []serveParam{{
 				Kind: "document", Text: fmt.Sprintf(`{"id":%q,"value":%d}`, key, sequence),
@@ -186,8 +194,8 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
 			storageGrowth, walGrowth, networkGrowth)
 	}
-	t.Logf("zero-config hot split: children=%d p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
-		children, p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
+	t.Logf("zero-config hot split: children=%d key_setup=%s p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
+		children, keySetup, p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
 		storageGrowth, walGrowth, networkGrowth)
 }
 
@@ -234,4 +242,58 @@ func devHotProcessTreeRSS(t testing.TB, root int) uint64 {
 		}
 	}
 	return total
+}
+
+// devHotStableSplitKeys selects two well-separated SABLE bins, then
+// alternates them. This keeps the qualifying boundary byte-identical across
+// evidence windows without pinning traffic to one virtual bucket or relying
+// on wall time. Keys remain unique and use the exact production tuple/hash
+// grammar consumed by the development table's native mapper.
+func devHotStableSplitKeys(t testing.TB, count int) []string {
+	t.Helper()
+	const maxKeyCount = 1 << 20
+	if count <= 0 || count > maxKeyCount {
+		t.Fatal("invalid stable split key count")
+	}
+	const leftBin, rightBin = autosplit.BinCount / 4, autosplit.BinCount * 3 / 4
+	left := make([]string, 0, (count+1)/2)
+	right := make([]string, 0, count/2)
+	searchLimit := count * 256
+	for candidate := 0; candidate < searchLimit && len(left)+len(right) < count; candidate++ {
+		key := fmt.Sprintf("dev-hot-%08d", candidate)
+		var values [1]distribution.Scalar
+		values[0] = distribution.NewString(key)
+		var storage [64]byte
+		encoded, err := distribution.CurrentTupleCodec.AppendTuple(storage[:0], values[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		point, consumed, ok := distribution.NativePointForEncodedTuplePrefix(
+			encoded, len(values), distribution.DefaultVirtualBucketBits,
+		)
+		if !ok || consumed != len(encoded) {
+			t.Fatal("stable split key placement failed")
+		}
+		bin := int(point[0]) * autosplit.BinCount / 256
+		switch {
+		case bin == leftBin && len(left) < cap(left):
+			left = append(left, key)
+		case bin == rightBin && len(right) < cap(right):
+			right = append(right, key)
+		}
+	}
+	if len(left) != cap(left) || len(right) != cap(right) {
+		t.Fatalf("stable split key search exhausted left=%d/%d right=%d/%d limit=%d",
+			len(left), cap(left), len(right), cap(right), searchLimit)
+	}
+	keys := make([]string, 0, count)
+	for index := 0; len(keys) < count; index++ {
+		if index < len(left) {
+			keys = append(keys, left[index])
+		}
+		if index < len(right) {
+			keys = append(keys, right[index])
+		}
+	}
+	return keys
 }
