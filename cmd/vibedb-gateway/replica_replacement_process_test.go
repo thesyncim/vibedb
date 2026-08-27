@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/asn1"
@@ -100,11 +101,14 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 
 	nodes := replicaProcessNodes()
 	identities := replicaProcessIdentities()
-	group := replicaProcessGroup(identities[0])
+	secondaryIdentities := replicaProcessSecondaryIdentities(identities)
+	groups := [2]raftmember.GroupKey{
+		replicaProcessGroup(identities[0]), replicaProcessGroup(secondaryIdentities[0]),
+	}
 	credentials, roots, err := rf3testfixture.WriteCredentials(
 		root, asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1},
-		rafttransport.TrustDomain{ClusterID: group.ClusterID,
-			ClusterIncarnation: group.ClusterIncarnation}, nodes[:],
+		rafttransport.TrustDomain{ClusterID: groups[0].ClusterID,
+			ClusterIncarnation: groups[0].ClusterIncarnation}, nodes[:],
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -154,7 +158,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snapshot := replicaProcessCatalog(t, nodes, identities, listeners, group,
+	snapshot := replicaProcessCatalog(t, nodes, identities, secondaryIdentities, listeners, groups,
 		authority, relationDigest)
 	catalogPath := filepath.Join(root, "catalog.vibejson")
 	if err = gateway.SaveSnapshot(catalogPath, snapshot); err != nil {
@@ -173,6 +177,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	target := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: nodes[3],
 		StoreID: identities[3].StoreID, NodeIncarnation: 44, Listeners: listeners[3]}
 	prepared := make([]rf3testfixture.PreparedProcessMember, 3)
+	secondaryPrepared := make([]rf3testfixture.PreparedProcessMember, 3)
 	for index := range prepared {
 		prepared[index], err = rf3testfixture.PrepareProcessMember(
 			rf3testfixture.ProcessMemberOptions{
@@ -189,8 +194,29 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		secondaryPrepared[index], err = rf3testfixture.PrepareProcessMember(
+			rf3testfixture.ProcessMemberOptions{
+				Root:        filepath.Join(root, fmt.Sprintf("member-%d-secondary", index+1)),
+				Table:       gateway.ReplicatedCatalogTable,
+				CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))",
+				Identity:    secondaryIdentities[index], Key: key, WAL: wal,
+				Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+				Authority: authority, Apply: apply, Listeners: listeners[index],
+				Credential: credentials[index], Roots: roots,
+				AuthorizationPolicy: policyPath, Nodes: servingNodes,
+				PeerAddresses: servingPeers, Target: &target, SeedDocuments: seed,
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		combinedPath := filepath.Join(root, fmt.Sprintf("member-%d-groups.vibejson", index+1))
+		if err = os.WriteFile(combinedPath, replicaProcessCombineServingGroups(t,
+			prepared[index].ManifestPath, secondaryPrepared[index].ManifestPath), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		prepared[index].ManifestPath = combinedPath
 	}
-	firstAbandonment := replicaProcessSeedAbandonment(t, root, group, identities[0], target,
+	firstAbandonment := replicaProcessSeedAbandonment(t, root, groups[0], identities[0], target,
 		nodes[0], 0xa1)
 	cold, err := rf3testfixture.PrepareColdProcessTarget(
 		rf3testfixture.ProcessMemberOptions{
@@ -202,11 +228,32 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 			Nodes: servingNodes, PeerAddresses: servingPeers, Target: &target,
 			SeedDocuments: seed,
-		}, nodes[0], listeners[0].Snapshot, 1<<30,
+		}, nodes[1], listeners[1].Snapshot, 1<<30,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondaryCold, err := rf3testfixture.PrepareColdProcessTarget(
+		rf3testfixture.ProcessMemberOptions{
+			Root: filepath.Join(root, "member-4-secondary"), Table: gateway.ReplicatedCatalogTable,
+			CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))",
+			Identity:    secondaryIdentities[3], Key: key, WAL: wal,
+			Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+			Authority: authority, Apply: apply, Listeners: listeners[3],
+			Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
+			Nodes: servingNodes, PeerAddresses: servingPeers, Target: &target,
+			SeedDocuments: seed,
+		}, nodes[1], listeners[1].Snapshot, 1<<30,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinedBootstrapPath := filepath.Join(root, "member-4-bootstrap-groups.vibejson")
+	if err = os.WriteFile(combinedBootstrapPath, replicaProcessCombineBootstrapGroups(t,
+		cold.BootstrapManifestPath, secondaryCold.BootstrapManifestPath), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cold.BootstrapManifestPath = combinedBootstrapPath
 	replicaManifestPath := filepath.Join(root, "replica-control.vibejson")
 	if err = os.WriteFile(replicaManifestPath, replicaProcessControlManifest(t,
 		nodes, identities, listeners, credentials[4], roots, policyPath,
@@ -302,7 +349,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = voters[0].Kill(ctx); err != nil {
 		t.Fatal(err)
 	}
-	secondAbandonment := replicaProcessSeedAbandonment(t, root, group, identities[0], target,
+	secondAbandonment := replicaProcessSeedAbandonment(t, root, groups[0], identities[0], target,
 		nodes[0], 0xa2)
 	voters[0].Env = append(os.Environ(), "VIBEDB_REPLICA_REPLACEMENT_E2E=1",
 		"VIBEDB_QUALIFICATION_ABANDON_CRASH=after_unlink")
@@ -325,6 +372,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		root, voters[0], gatewayProcess, catalogAuthority, secondAbandonment.Operation)
 	measurements.abandonmentRetainedBytes = replicaProcessRetainedAbandonmentBytes(root)
 	phase = "abandonment_crash_reopen_verified"
+	baselineOperations, err := catalogAuthority.ReadOperationIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
 	if err = voters[0].Kill(ctx); err != nil {
 		t.Fatal(err)
@@ -350,20 +401,34 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	restartedSource := false
 	sourceReady := false
 	var sourceRestarted time.Time
+	groupCompletion := make(map[raftmember.GroupKey]time.Duration, 2)
 	for {
 		if err = ctx.Err(); err != nil {
 			t.Fatalf("replacement timeout: %v\ngateway:\n%s\ntarget:\n%s",
 				err, gatewayProcess.Diagnostics(), coldTarget.Diagnostics())
 		}
-		current, loadErr := gateway.LoadSnapshot(catalogPath)
+		current, loadErr := catalogAuthority.Read(ctx)
+		if measurements.admissionMillis == 0 {
+			operations, operationErr := catalogAuthority.ReadOperationIDs(ctx)
+			if operationErr == nil && len(operations) >= len(baselineOperations)+2 {
+				measurements.admissionMillis = uint64(max(time.Since(started).Milliseconds(), 1))
+			}
+		}
 		if measurements.failoverMillis == 0 &&
 			strings.Contains(gatewayProcess.Diagnostics(), "revision controller published") {
 			measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
 		}
 		if loadErr == nil {
 			descriptors := current.ReplicatedShardDescriptors()
-			if len(descriptors) == 1 && replicaProcessRosterContains(descriptors[0], 4) &&
-				!replicaProcessRosterContains(descriptors[0], 1) {
+			for _, descriptor := range descriptors {
+				if replicaProcessRosterContains(descriptor, 4) &&
+					!replicaProcessRosterContains(descriptor, 1) {
+					if _, found := groupCompletion[descriptor.Group]; !found {
+						groupCompletion[descriptor.Group] = time.Since(started)
+					}
+				}
+			}
+			if replicaProcessAllRostersReplaced(descriptors, 2, 1, 4) {
 				if !restartedSource {
 					if err = voters[0].Start(); err != nil {
 						t.Fatal(err)
@@ -375,7 +440,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 					sourceReady = true
 				}
 				if strings.Contains(coldTarget.Diagnostics(), "vibedb-shard RF3 ready") &&
-					sourceReady && strings.Contains(gatewayProcess.Diagnostics(), "completed 1") &&
+					sourceReady && strings.Contains(gatewayProcess.Diagnostics(), "completed 2") &&
 					replicaProcessAllArtifactsEmpty(root) &&
 					time.Since(started) < 90*time.Second {
 					break
@@ -387,8 +452,13 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if !restartedSource {
 		t.Fatal("retired source was not reopened for cleanup")
 	}
+	if measurements.admissionMillis == 0 {
+		t.Fatal("two-group move set was never atomically discoverable")
+	}
 	phase = "replacement_complete"
 	measurements.replacementMillis = uint64(time.Since(started).Milliseconds())
+	measurements.groupP50Millis, measurements.groupP99Millis, measurements.groupMaxMillis =
+		replicaProcessGroupLatencyQuantiles(groupCompletion)
 	if !sourceRestarted.IsZero() {
 		measurements.cleanupMillis = uint64(time.Since(sourceRestarted).Milliseconds())
 	}
@@ -397,6 +467,8 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	if !replicaProcessTreeBounded(t, root, "gateway-session", 32, 64<<20) ||
 		!replicaProcessTreeBounded(t, filepath.Join(root, "member-1"),
+			"replica-actions", 4097, 64<<20) ||
+		!replicaProcessTreeBounded(t, filepath.Join(root, "member-1-secondary"),
 			"replica-actions", 4097, 64<<20) {
 		t.Fatal("controller state exceeded its process qualification bound")
 	}
@@ -409,13 +481,12 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
 		t.Fatalf("terminal controller reopen: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
-	final, err := gateway.LoadSnapshot(catalogPath)
+	final, err := catalogAuthority.Read(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	descriptors := final.ReplicatedShardDescriptors()
-	if len(descriptors) != 1 || !replicaProcessRosterContains(descriptors[0], 4) ||
-		replicaProcessRosterContains(descriptors[0], 1) {
+	if !replicaProcessAllRostersReplaced(descriptors, 2, 1, 4) {
 		t.Fatalf("retired source rejoined after controller restart: %+v", descriptors)
 	}
 	finalGeneration = final.Generation()
@@ -426,6 +497,36 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	measurements.finalWALBytes = replicaProcessAllocatedBytes(root, ".wal")
 	if err := measurements.validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReplicaProcessCatalogCarriesTwoPhysicalNodeGroups(t *testing.T) {
+	nodes := replicaProcessNodes()
+	primary := replicaProcessIdentities()
+	secondary := replicaProcessSecondaryIdentities(primary)
+	var listeners [4]rf3testfixture.ProcessListeners
+	for index := range listeners {
+		listeners[index] = rf3testfixture.ProcessListeners{
+			Peer:     fmt.Sprintf("127.0.0.1:%d", 10000+index*4),
+			Native:   fmt.Sprintf("127.0.0.1:%d", 10001+index*4),
+			Control:  fmt.Sprintf("127.0.0.1:%d", 10002+index*4),
+			Snapshot: fmt.Sprintf("127.0.0.1:%d", 10003+index*4),
+		}
+	}
+	authority := sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 5,
+		ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13,
+		RoutingVersion: 17, RouteGeneration: 19}
+	snapshot := replicaProcessCatalog(t, nodes, primary, secondary, listeners,
+		[2]raftmember.GroupKey{replicaProcessGroup(primary[0]), replicaProcessGroup(secondary[0])},
+		authority, [32]byte{1})
+	descriptors := snapshot.ReplicatedShardDescriptors()
+	if len(descriptors) != 2 || descriptors[0].Group == descriptors[1].Group {
+		t.Fatalf("descriptors=%+v", descriptors)
+	}
+	for _, descriptor := range descriptors {
+		if descriptor.EnrolledTarget == nil || descriptor.EnrolledTarget.StoreID != primary[3].StoreID {
+			t.Fatalf("physical target identity diverged across groups: %+v", descriptor)
+		}
 	}
 }
 
@@ -454,6 +555,19 @@ func replicaProcessIdentities() (identities [4]raftstore.Identity) {
 	return identities
 }
 
+func replicaProcessSecondaryIdentities(primary [4]raftstore.Identity) (secondary [4]raftstore.Identity) {
+	for index := range primary {
+		secondary[index] = primary[index]
+		secondary[index].Distribution = "replica-secondary"
+		secondary[index].Shard = "all"
+		secondary[index].GroupID[0] ^= 0x40
+		secondary[index].ShardIncarnation[0] ^= 0x20
+		// StoreID names the physical store and therefore remains stable across
+		// every group hosted by the same process.
+	}
+	return secondary
+}
+
 func replicaProcessGroup(identity raftstore.Identity) raftmember.GroupKey {
 	return raftmember.GroupKey{ClusterID: identity.ClusterID,
 		ClusterIncarnation: identity.ClusterIncarnation, TopologyRecoveryEpoch: 3,
@@ -473,8 +587,9 @@ func replicaProcessPolicy(nodes [5]rafttransport.NodeID) []byte {
 }
 
 func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
-	identities [4]raftstore.Identity, listeners [4]rf3testfixture.ProcessListeners,
-	group raftmember.GroupKey, authority sqldriver.ReplicatedAuthorityProfile,
+	identities, secondaryIdentities [4]raftstore.Identity,
+	listeners [4]rf3testfixture.ProcessListeners, groups [2]raftmember.GroupKey,
+	authority sqldriver.ReplicatedAuthorityProfile,
 	relationDigest [32]byte,
 ) *gateway.Snapshot {
 	t.Helper()
@@ -485,6 +600,15 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 			AllocationGeneration: distribution.ShardAllocationGeneration(identities[0].AllocationGeneration),
 			Range:                distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 			Leaders:              leaders, Epoch: distribution.OwnershipEpoch(authority.OwnershipEpoch),
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryManifest, err := distribution.NewManifest("replica-secondary",
+		distribution.RoutingVersion(authority.RoutingVersion), []distribution.Shard{{
+			ID: "all", AllocationGeneration: distribution.ShardAllocationGeneration(secondaryIdentities[0].AllocationGeneration),
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: leaders, Epoch: distribution.OwnershipEpoch(authority.OwnershipEpoch),
 		}})
 	if err != nil {
 		t.Fatal(err)
@@ -508,7 +632,7 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 		listeners[3].Native, listeners[3].Control
 	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard,
-		Group: group, AllocationGeneration: distribution.ShardAllocationGeneration(identities[0].AllocationGeneration),
+		Group: groups[0], AllocationGeneration: distribution.ShardAllocationGeneration(identities[0].AllocationGeneration),
 		Command: raftservice.CommandFence{ReplicaSetVersion: 1,
 			ActivePolicyGeneration: authority.ActivePolicyGeneration,
 			ProtectionEpoch:        authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
@@ -520,13 +644,26 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 			StoreID: identities[3].StoreID, NodeIncarnation: 44, Endpoint: targetPeer,
 			NativeEndpoint: targetNative, ControlEndpoint: targetControl},
 	}
+	secondaryDescriptor := descriptor
+	secondaryDescriptor.Distribution = "replica-secondary"
+	secondaryDescriptor.Shard = "all"
+	secondaryDescriptor.Group = groups[1]
+	secondaryDescriptor.AllocationGeneration = distribution.ShardAllocationGeneration(secondaryIdentities[0].AllocationGeneration)
+	secondaryDescriptor.RangeIdentity = replication.Digest{0x81}
+	secondaryDescriptor.LineageDigest = replication.Digest{0x82}
+	secondaryDescriptor.ForwardingRuleDigest = replication.Digest{0x83}
+	for index := range secondaryDescriptor.Replicas {
+		secondaryDescriptor.Replicas[index].StoreID = secondaryIdentities[index].StoreID
+	}
+	secondaryDescriptor.EnrolledTarget.StoreID = secondaryIdentities[3].StoreID
 	config := distribution.ClusterConfig{Distributions: []distribution.DistributionSpec{{
 		Name: gateway.ReplicatedCatalogDistribution, Arity: 1,
+		MapperVersion: distribution.NativeMapperVersion}, {Name: "replica-secondary", Arity: 1,
 		MapperVersion: distribution.NativeMapperVersion}}, Placements: []distribution.TablePlacement{{
 		Table: gateway.ReplicatedCatalogTable, Distribution: gateway.ReplicatedCatalogDistribution,
-		Columns: []string{gateway.ReplicatedCatalogPrimaryKey}}}, Manifests: []*distribution.Manifest{manifest}}
+		Columns: []string{gateway.ReplicatedCatalogPrimaryKey}}}, Manifests: []*distribution.Manifest{manifest, secondaryManifest}}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 1, nil, nil,
-		[]gateway.ReplicatedShardDescriptor{descriptor})
+		[]gateway.ReplicatedShardDescriptor{descriptor, secondaryDescriptor})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,6 +778,112 @@ func replicaProcessRosterContains(descriptor gateway.ReplicatedShardDescriptor, 
 	return false
 }
 
+func replicaProcessAllRostersReplaced(descriptors []gateway.ReplicatedShardDescriptor,
+	want int, retired, target uint64,
+) bool {
+	if len(descriptors) != want {
+		return false
+	}
+	for _, descriptor := range descriptors {
+		if !replicaProcessRosterContains(descriptor, target) ||
+			replicaProcessRosterContains(descriptor, retired) ||
+			descriptor.Command.ReplicaSetVersion <= 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func replicaProcessGroupLatencyQuantiles(completed map[raftmember.GroupKey]time.Duration) (
+	p50, p99, maximum uint64,
+) {
+	if len(completed) != 2 {
+		return 0, 0, 0
+	}
+	latencies := make([]time.Duration, 0, len(completed))
+	for _, latency := range completed {
+		latencies = append(latencies, latency)
+	}
+	slices.Sort(latencies)
+	milliseconds := func(value time.Duration) uint64 {
+		return uint64(max(value.Milliseconds(), 1))
+	}
+	return milliseconds(latencies[0]), milliseconds(latencies[len(latencies)-1]),
+		milliseconds(latencies[len(latencies)-1])
+}
+
+func replicaProcessCombineServingGroups(t testing.TB, paths ...string) []byte {
+	t.Helper()
+	groups := make([][]byte, 0, len(paths))
+	var common []byte
+	for index, path := range paths {
+		document, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener := bytes.Index(document, []byte(`"listeners":`))
+		members := bytes.Index(document, []byte(`,"members":`))
+		if listener < 2 || members <= listener || document[listener-1] != ',' ||
+			len(document) == 0 || document[len(document)-1] != '}' {
+			t.Fatalf("invalid singleton serving manifest %q", path)
+		}
+		if index == 0 {
+			common = append([]byte(nil), document[listener:members]...)
+		}
+		group := make([]byte, 0, len(document))
+		group = append(group, '{')
+		group = append(group, document[1:listener-1]...)
+		group = append(group, ',')
+		group = append(group, document[members+1:len(document)-1]...)
+		groups = append(groups, append(group, '}'))
+	}
+	result := append([]byte{'{'}, common...)
+	result = append(result, `,"groups":[`...)
+	for index, group := range groups {
+		if index != 0 {
+			result = append(result, ',')
+		}
+		result = append(result, group...)
+	}
+	return append(result, ']', '}')
+}
+
+func replicaProcessCombineBootstrapGroups(t testing.TB, paths ...string) []byte {
+	t.Helper()
+	groups := make([][]byte, 0, len(paths))
+	var control []byte
+	for index, path := range paths {
+		document, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		controlStart := bytes.Index(document, []byte(`,"control_listener":`))
+		sourceStart := bytes.Index(document, []byte(`,"source_node":`))
+		if controlStart < 1 || sourceStart <= controlStart || len(document) == 0 ||
+			document[len(document)-1] != '}' {
+			t.Fatalf("invalid singleton bootstrap manifest %q", path)
+		}
+		candidate := document[controlStart+1 : sourceStart]
+		if index == 0 {
+			control = append([]byte(nil), candidate...)
+		} else if !bytes.Equal(control, candidate) {
+			t.Fatal("multi-group bootstrap manifests do not share one control listener")
+		}
+		group := append([]byte{'{'}, document[1:controlStart]...)
+		group = append(group, document[sourceStart:]...)
+		groups = append(groups, group)
+	}
+	result := append([]byte{'{'}, control...)
+	result = append(result, `,"groups":[`...)
+	for index, group := range groups {
+		if index != 0 {
+			result = append(result, ',')
+		}
+		result = append(result, group...)
+	}
+	return append(result, ']', '}')
+}
+
 func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 	snapshot *gateway.Snapshot, journalPath string,
 ) (*gateway.ReplicatedCatalogAuthority, func()) {
@@ -708,9 +951,11 @@ func replicaProcessArtifactsEmpty(path string) bool {
 
 func replicaProcessAllArtifactsEmpty(root string) bool {
 	for member := 1; member <= 3; member++ {
-		if !replicaProcessArtifactsEmpty(filepath.Join(root,
-			fmt.Sprintf("member-%d", member), "source-artifacts")) {
-			return false
+		for _, suffix := range []string{"", "-secondary"} {
+			if !replicaProcessArtifactsEmpty(filepath.Join(root,
+				fmt.Sprintf("member-%d%s", member, suffix), "source-artifacts")) {
+				return false
+			}
 		}
 	}
 	return true
@@ -852,7 +1097,9 @@ func replicaProcessSettleAbandonmentCrash(t testing.TB, ctx context.Context, pha
 type replicaProcessMeasurements struct {
 	mu sync.Mutex
 
-	failoverMillis, replacementMillis, cleanupMillis  uint64
+	failoverMillis, admissionMillis                   uint64
+	replacementMillis, cleanupMillis                  uint64
+	groupP50Millis, groupP99Millis, groupMaxMillis    uint64
 	controllerRestartMillis                           uint64
 	logicalBytes                                      uint64
 	initialStorageBytes, finalStorageBytes            uint64
@@ -864,8 +1111,9 @@ type replicaProcessMeasurements struct {
 
 func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
 	measurements := replicaProcessMeasurements{
-		failoverMillis: 10, controllerRestartMillis: 11, replacementMillis: 20,
-		cleanupMillis: 5, logicalBytes: 100, initialStorageBytes: 1_000,
+		failoverMillis: 10, admissionMillis: 9, controllerRestartMillis: 11, replacementMillis: 20,
+		cleanupMillis: 5, groupP50Millis: 17, groupP99Millis: 19, groupMaxMillis: 19,
+		logicalBytes: 100, initialStorageBytes: 1_000,
 		finalStorageBytes: 2_000, initialWALBytes: 500, finalWALBytes: 700,
 		maxSnapshotPayloadBytes: 300, maxRSSBytes: 400,
 		abandonRenameMillis: 12, abandonUnlinkMillis: 13,
@@ -877,6 +1125,8 @@ func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
 	raw := measurements.appendTSV(nil)
 	for _, exact := range [][]byte{
 		[]byte("metric\tfailover_millis\t10\n"),
+		[]byte("metric\tmove_set_admission_millis\t9\n"),
+		[]byte("metric\tgroup_replacement_p99_millis\t19\n"),
 		[]byte("metric\tstorage_growth_bytes\t1000\n"),
 		[]byte("metric\twal_growth_bytes\t200\n"),
 		[]byte("metric\tstorage_amplification_milli\t10000\n"),
@@ -906,8 +1156,12 @@ func (measurements *replicaProcessMeasurements) appendTSV(raw []byte) []byte {
 		value uint64
 	}{
 		{"failover_millis", measurements.failoverMillis},
+		{"move_set_admission_millis", measurements.admissionMillis},
 		{"controller_restart_millis", measurements.controllerRestartMillis},
 		{"replacement_millis", measurements.replacementMillis},
+		{"group_replacement_p50_millis", measurements.groupP50Millis},
+		{"group_replacement_p99_millis", measurements.groupP99Millis},
+		{"group_replacement_max_millis", measurements.groupMaxMillis},
 		{"cleanup_millis", measurements.cleanupMillis},
 		{"snapshot_network_payload_bytes", measurements.maxSnapshotPayloadBytes},
 		{"max_rss_bytes", measurements.maxRSSBytes},
@@ -933,8 +1187,12 @@ func (measurements *replicaProcessMeasurements) validate() error {
 		measurements.initialStorageBytes)
 	walGrowth := positiveDifference(measurements.finalWALBytes, measurements.initialWALBytes)
 	if measurements.failoverMillis == 0 || measurements.failoverMillis > 30_000 ||
+		measurements.admissionMillis == 0 || measurements.admissionMillis > 30_000 ||
 		measurements.controllerRestartMillis == 0 || measurements.controllerRestartMillis > 15_000 ||
 		measurements.replacementMillis == 0 || measurements.replacementMillis > 90_000 ||
+		measurements.groupP50Millis == 0 || measurements.groupP50Millis > 90_000 ||
+		measurements.groupP99Millis < measurements.groupP50Millis ||
+		measurements.groupMaxMillis < measurements.groupP99Millis || measurements.groupMaxMillis > 90_000 ||
 		measurements.cleanupMillis == 0 || measurements.cleanupMillis > 60_000 ||
 		measurements.maxSnapshotPayloadBytes == 0 || measurements.maxSnapshotPayloadBytes > 1<<30 ||
 		measurements.maxRSSBytes == 0 || measurements.maxRSSBytes > 8<<30 ||
@@ -943,8 +1201,8 @@ func (measurements *replicaProcessMeasurements) validate() error {
 		measurements.abandonmentControlBytes == 0 || measurements.abandonmentControlBytes > 4096 ||
 		measurements.abandonmentRetainedBytes != 0 ||
 		storageGrowth > 2<<30 || walGrowth > 512<<20 || measurements.logicalBytes == 0 {
-		return fmt.Errorf("replica process performance bounds: failover=%dms restart=%dms replacement=%dms cleanup=%dms snapshot=%d rss=%d storage-growth=%d wal-growth=%d logical=%d",
-			measurements.failoverMillis, measurements.controllerRestartMillis,
+		return fmt.Errorf("replica process performance bounds: failover=%dms admission=%dms restart=%dms replacement=%dms cleanup=%dms snapshot=%d rss=%d storage-growth=%d wal-growth=%d logical=%d",
+			measurements.failoverMillis, measurements.admissionMillis, measurements.controllerRestartMillis,
 			measurements.replacementMillis, measurements.cleanupMillis,
 			measurements.maxSnapshotPayloadBytes, measurements.maxRSSBytes,
 			storageGrowth, walGrowth, measurements.logicalBytes)
