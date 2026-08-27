@@ -373,6 +373,41 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	}, true
 }
 
+// ReplicatedRouteCount reports the complete catalog RF3 inventory, including
+// reserved control relations that need not appear in a user routing manifest.
+func (snapshot *Snapshot) ReplicatedRouteCount() int {
+	if snapshot == nil {
+		return 0
+	}
+	return len(snapshot.replicatedShards)
+}
+
+// ReplicatedRouteAt returns route i into caller-owned replica workspace. It is
+// the bounded inventory seam used by cluster backup; callers must consume
+// every ordinal rather than selecting user-visible tables.
+func (snapshot *Snapshot) ReplicatedRouteAt(index int, dst []ReplicatedEndpoint) (ReplicatedRoute, bool) {
+	if snapshot == nil || index < 0 || index >= len(snapshot.replicatedShards) {
+		return ReplicatedRoute{}, false
+	}
+	entry := snapshot.replicatedShards[index]
+	if int(entry.manifest) >= len(snapshot.config.Manifests) ||
+		int(entry.replicaCount) != ServingReplicaCount ||
+		int(entry.replicaBase)+int(entry.replicaCount) > len(snapshot.replicatedReplicas) {
+		return ReplicatedRoute{}, false
+	}
+	manifest := snapshot.config.Manifests[entry.manifest]
+	metadata, ok := manifest.ShardMetadataAt(int(entry.shard))
+	if !ok {
+		return ReplicatedRoute{}, false
+	}
+	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
+	dst = dst[:len(dst):len(dst)]
+	return ReplicatedRoute{Distribution: manifest.Distribution(), Shard: metadata.ID, Group: entry.group,
+		AllocationGeneration: uint64(entry.allocation), Command: entry.command,
+		RangeIdentity: entry.rangeIdentity, LineageDigest: entry.lineageDigest,
+		ForwardingRuleDigest: entry.forwardingDigest, Replicas: dst}, true
+}
+
 // ResolveReplicatedMembershipRoute resolves the active serving RF3 together
 // with its optional enrolled replacement. The replacement is kept outside the
 // serving slice, so ordinary reads, writes, and transactions cannot select it.

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -14,6 +15,44 @@ import (
 )
 
 var ErrBackupOperation = errors.New("gateway: invalid backup operation")
+
+// BackupCatalogCut derives the complete RF3 inventory from one immutable
+// catalog snapshot, including reserved replicated routes that are not exposed
+// as user tables. Routes and Groups are returned in the same portable order.
+func BackupCatalogCut(snapshot *Snapshot) (clusterbackup.CatalogCut, []ReplicatedRoute, error) {
+	if snapshot == nil || snapshot.Generation() == 0 || snapshot.ReplicatedRouteCount() == 0 ||
+		snapshot.ReplicatedRouteCount() > clusterbackup.AbsoluteMaxGroupCuts {
+		return clusterbackup.CatalogCut{}, nil, ErrBackupOperation
+	}
+	digest, err := CatalogSnapshotDigest(snapshot)
+	if err != nil || digest == ([sha256.Size]byte{}) {
+		return clusterbackup.CatalogCut{}, nil, errors.Join(ErrBackupOperation, err)
+	}
+	routes := make([]ReplicatedRoute, snapshot.ReplicatedRouteCount())
+	for index := range routes {
+		var workspace [ServingReplicaCount]ReplicatedEndpoint
+		route, ok := snapshot.ReplicatedRouteAt(index, workspace[:0])
+		if !ok || route.Command.ActivePolicyGeneration == 0 {
+			return clusterbackup.CatalogCut{}, nil, ErrBackupOperation
+		}
+		route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
+		routes[index] = route
+	}
+	slices.SortFunc(routes, func(left, right ReplicatedRoute) int {
+		return compareBackupGroup(left.Group, right.Group)
+	})
+	groups := make([]raftmember.GroupKey, len(routes))
+	policy := routes[0].Command.ActivePolicyGeneration
+	for index, route := range routes {
+		if route.Command.ActivePolicyGeneration != policy ||
+			index != 0 && compareBackupGroup(routes[index-1].Group, route.Group) >= 0 {
+			return clusterbackup.CatalogCut{}, nil, ErrBackupOperation
+		}
+		groups[index] = route.Group
+	}
+	return clusterbackup.CatalogCut{Generation: snapshot.Generation(), Digest: digest,
+		PolicyGeneration: policy, Groups: groups}, routes, nil
+}
 
 const (
 	backupStageCollecting uint64 = iota + 1
