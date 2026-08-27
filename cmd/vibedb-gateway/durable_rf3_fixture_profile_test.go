@@ -3,28 +3,24 @@
 package main
 
 import (
-	"crypto/sha256"
 	"errors"
 	"runtime"
 	"testing"
 
-	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	vibesql "github.com/thesyncim/vibedb/sql"
-	sqldriver "github.com/thesyncim/vibedb/sql/driver"
-	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
-	durableRF3CatalogGroup = iota
-	durableRF3LedgerGroup
-	durableRF3DataAGroup
-	durableRF3DataBGroup
-	durableRF3ExternalGroups
+	durableRF3CatalogGroup   = rf3testfixture.DurableGatewayCatalogGroup
+	durableRF3LedgerGroup    = rf3testfixture.DurableGatewayLedgerGroup
+	durableRF3DataAGroup     = rf3testfixture.DurableGatewayDataAGroup
+	durableRF3DataBGroup     = rf3testfixture.DurableGatewayDataBGroup
+	durableRF3ExternalGroups = rf3testfixture.DurableGatewayGroups
 )
 
 var durableRF3ExternalRoleNames = [...]string{"catalog", "request-ledger", "data-a", "data-b"}
@@ -33,59 +29,11 @@ var durableRF3ExternalRoleNames = [...]string{"catalog", "request-ledger", "data
 // schema/apply profile. Keep canonical JSON pointers here: the ledger has a
 // different primary key from the catalog and user-data relations.
 func durableRF3ExternalMemberProfiles() [durableRF3ExternalGroups]rf3testfixture.MemberOptions {
-	authority := sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 5,
-		ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13,
-		RoutingVersion: 17, RouteGeneration: 19}
-	apply := sqldriver.ReplicatedApplyOptions{MaxSessions: 96, RetryWindow: 16,
-		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 2048, MaxBytes: 256 << 20},
-		Placement: sqldriver.ReplicatedPlacementProfile{
-			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
-			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
-			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
-		}}
-	profiles := [durableRF3ExternalGroups]rf3testfixture.MemberOptions{
-		{Table: "controlplane", CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))"},
-		{Table: "request_ledger_home", CreateTable: "CREATE TABLE request_ledger_home (PRIMARY KEY (home))"},
-		{Table: "orders_a", CreateTable: "CREATE TABLE orders_a (PRIMARY KEY (id))",
-			SchemaStatements: []string{`CREATE INDEX by_kind_a ON orders_a (kind)`,
-				`CREATE TABLE orders_b_email (PRIMARY KEY (key))`},
-			GlobalIndexes: []sqldriver.ReplicatedGlobalIndexRelation{{
-				Relation: 2, Table: "orders_b_email", IndexID: 42, Incarnation: 1,
-				LocatorCount: 1, Unique: true,
-				KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
-				TupleVersion:  distribution.CurrentTupleVersion,
-				MapperVersion: distribution.NativeMapperVersion,
-				BucketBits:    distribution.DefaultVirtualBucketBits}}},
-		{Table: "orders_b", CreateTable: "CREATE TABLE orders_b (PRIMARY KEY (id))",
-			SchemaStatements: []string{`CREATE INDEX by_kind_b ON orders_b (kind)`,
-				`CREATE TABLE orders_a_email (PRIMARY KEY (key))`},
-			GlobalIndexes: []sqldriver.ReplicatedGlobalIndexRelation{{
-				Relation: 2, Table: "orders_a_email", IndexID: 41, Incarnation: 1,
-				LocatorCount: 1, Unique: true,
-				KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
-				TupleVersion:  distribution.CurrentTupleVersion,
-				MapperVersion: distribution.NativeMapperVersion,
-				BucketBits:    distribution.DefaultVirtualBucketBits}}},
-	}
-	for group := range profiles {
-		profiles[group].Authority = authority
-		profiles[group].Apply = apply
-	}
-	ledger := &profiles[durableRF3LedgerGroup].Apply
-	ledger.Placement.ShardKey = "/home"
-	ledger.RequestLedgerCapacityBytes = 64 << 20
-	ledger.RequestLedgerCleanupReserveBytes = 8 << 20
-	ledger.RequestLedgerRangeIdentity = sha256.Sum256([]byte("vibedb/external-process/request-ledger/range\x00"))
-	return profiles
+	return rf3testfixture.DurableGatewayMemberProfiles()
 }
 
 func durableRF3ExternalWALOptions() raftstore.Options {
-	return raftstore.Options{
-		MaxFileBytes: int64(raftstore.HeaderBytes+raftstore.MaxSnapshotBaseRecordBytes+
-			raftstore.MinimumReadyRecordBytes) + raftstore.MinimumReadyLiveBytes,
-		MaxRecordBytes: raftstore.MinimumReadyRecordBytes, MaxRecords: 2,
-		MaxEntries: raftstore.MaxReadyEntries, MaxLiveBytes: raftstore.MinimumReadyLiveBytes,
-	}
+	return rf3testfixture.DurableGatewayWALOptions()
 }
 
 // This is deliberately not Linux-only or opt-in: compile-only checks cannot
