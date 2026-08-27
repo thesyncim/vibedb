@@ -435,11 +435,10 @@ func validateSchemaRolloutTarget(
 	return nil
 }
 
-// ActivateSchemaRollout first durably records that the prepared cut may no
-// longer be aborted, then CAS-publishes the exact target catalog, then marks
-// the operation complete. A restart can resume from either side of the catalog
-// CAS without republishing a different target.
-func (authority *ReplicatedCatalogAuthority) ActivateSchemaRollout(
+// AuthorizeSchemaRollout crosses the no-return boundary without publishing the
+// target catalog. A controller must durably reach this state before issuing
+// shard activation certificates; after it succeeds Abort is forbidden.
+func (authority *ReplicatedCatalogAuthority) AuthorizeSchemaRollout(
 	ctx context.Context, id [32]byte, target *Snapshot,
 ) (ReplicatedOperationRecord, error) {
 	if authority == nil || ctx == nil || target == nil || id == ([32]byte{}) {
@@ -471,10 +470,72 @@ func (authority *ReplicatedCatalogAuthority) ActivateSchemaRollout(
 		intent.BaseCatalogGeneration, intent.BaseHeadBytes,
 		intent.BaseHeadDigest, cut.snapshot, cut.head,
 	)
-	targetActive := schemaRolloutHeadMatches(
-		intent.TargetCatalogGeneration, intent.TargetHeadBytes,
-		intent.TargetHeadDigest, cut.snapshot, cut.head,
-	)
+	targetActive := schemaRolloutHeadMatches(intent.TargetCatalogGeneration,
+		intent.TargetHeadBytes, intent.TargetHeadDigest, cut.snapshot, cut.head)
+	if record.State == ReplicatedOperationComplete {
+		if !targetActive {
+			return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
+		}
+		return record, nil
+	}
+	if record.State == ReplicatedOperationRunning {
+		if !baseActive && !targetActive {
+			return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
+		}
+		return record, nil
+	}
+	if !baseActive {
+		return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
+	}
+	if err = validateSchemaRolloutTarget(intent, cut.snapshot, target, targetRaw); err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	if record.State != ReplicatedOperationPlanned {
+		return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
+	}
+	running := record
+	running.State, running.Revision = ReplicatedOperationRunning, record.Revision+1
+	if err = authority.PublishOperation(ctx, record.Revision, running); err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	return running, nil
+}
+
+// CommitSchemaRollout CAS-publishes the exact target only after the separate
+// Running witness proves shard activation was authorized. A restart can resume
+// from either side of the catalog CAS without selecting a different target.
+func (authority *ReplicatedCatalogAuthority) CommitSchemaRollout(
+	ctx context.Context, id [32]byte, target *Snapshot,
+) (ReplicatedOperationRecord, error) {
+	if authority == nil || ctx == nil || target == nil || id == ([32]byte{}) {
+		return ReplicatedOperationRecord{}, ErrSchemaRollout
+	}
+	if authority.session.Status().Pending {
+		return ReplicatedOperationRecord{}, ErrReplicatedCatalogPending
+	}
+	record, err := authority.ReadOperation(ctx, id)
+	if err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	intent, err := openSchemaRolloutOperation(record)
+	if err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	if record.State == ReplicatedOperationCancelled || record.State == ReplicatedOperationPlanned {
+		return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
+	}
+	targetRaw, err := schemaRolloutCatalogDocument(target)
+	if err != nil {
+		return ReplicatedOperationRecord{}, errors.Join(err, ErrSchemaRollout)
+	}
+	cut, err := authority.readCatalogCut(ctx)
+	if err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	baseActive := schemaRolloutHeadMatches(intent.BaseCatalogGeneration, intent.BaseHeadBytes,
+		intent.BaseHeadDigest, cut.snapshot, cut.head)
+	targetActive := schemaRolloutHeadMatches(intent.TargetCatalogGeneration, intent.TargetHeadBytes,
+		intent.TargetHeadDigest, cut.snapshot, cut.head)
 	if !baseActive && !targetActive {
 		return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
 	}
@@ -491,17 +552,7 @@ func (authority *ReplicatedCatalogAuthority) ActivateSchemaRollout(
 		}
 		return record, nil
 	}
-	if record.State == ReplicatedOperationPlanned {
-		if !baseActive {
-			return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
-		}
-		running := record
-		running.State, running.Revision = ReplicatedOperationRunning, record.Revision+1
-		if err = authority.PublishOperation(ctx, record.Revision, running); err != nil {
-			return ReplicatedOperationRecord{}, err
-		}
-		record = running
-	} else if record.State != ReplicatedOperationRunning {
+	if record.State != ReplicatedOperationRunning {
 		return ReplicatedOperationRecord{}, ErrSchemaRolloutConflict
 	}
 	if baseActive {
@@ -519,6 +570,17 @@ func (authority *ReplicatedCatalogAuthority) ActivateSchemaRollout(
 		return ReplicatedOperationRecord{}, err
 	}
 	return complete, nil
+}
+
+// ActivateSchemaRollout preserves the single-process convenience API while
+// using the same two durable boundaries required by the network controller.
+func (authority *ReplicatedCatalogAuthority) ActivateSchemaRollout(
+	ctx context.Context, id [32]byte, target *Snapshot,
+) (ReplicatedOperationRecord, error) {
+	if _, err := authority.AuthorizeSchemaRollout(ctx, id, target); err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	return authority.CommitSchemaRollout(ctx, id, target)
 }
 
 // AbortSchemaRollout is a forward-safe rollback of a prepared plan. Once the

@@ -86,6 +86,36 @@ func TestSchemaRolloutPrepareActivateExactCatalog(t *testing.T) {
 	}
 }
 
+func TestSchemaRolloutSeparatesAuthorizationFromCatalogCommit(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	target, receipts := testSchemaRolloutTarget(t, current)
+	id := [32]byte{0x7d}
+	if _, err := authority.PrepareSchemaRollout(
+		context.Background(), id, target, receipts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.CommitSchemaRollout(context.Background(), id, target); !errors.Is(err, ErrSchemaRolloutConflict) {
+		t.Fatalf("commit before authorization=%v", err)
+	}
+	running, err := authority.AuthorizeSchemaRollout(context.Background(), id, target)
+	if err != nil || running.State != ReplicatedOperationRunning {
+		t.Fatalf("authorize=%+v err=%v", running, err)
+	}
+	cut, err := authority.readCatalogCut(context.Background())
+	if err != nil || cut.snapshot.Generation() != current.Generation() {
+		t.Fatalf("authorization published catalog generation=%d err=%v",
+			cut.snapshot.Generation(), err)
+	}
+	if _, err = authority.AbortSchemaRollout(context.Background(), id); !errors.Is(err, ErrSchemaRolloutConflict) {
+		t.Fatalf("abort after authorization=%v", err)
+	}
+	complete, err := authority.CommitSchemaRollout(context.Background(), id, target)
+	if err != nil || complete.State != ReplicatedOperationComplete {
+		t.Fatalf("commit=%+v err=%v", complete, err)
+	}
+}
+
 func TestSchemaRolloutRestartCompletesPublishedRunningCut(t *testing.T) {
 	authority, _, current := newCatalogAuthorityFixture(t)
 	target, receipts := testSchemaRolloutTarget(t, current)
