@@ -135,6 +135,7 @@ func newRelationBundleFixtureWithSecondKind(
 	reserveCapture bool,
 	baseOptions, globalOptions durable.Options,
 	secondKind RelationKind,
+	globalValidation ...MutationValidator,
 ) relationBundleFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -161,6 +162,11 @@ func newRelationBundleFixtureWithSecondKind(
 	baseOptions.Indexes = []store.IndexDefinition{index}
 	base := open("base", baseOptions)
 	global := open("global", globalOptions)
+	if len(globalValidation) != 0 {
+		global.Validation = ValidationDeterministicMutation
+		global.ValidationDigest = sha256.Sum256([]byte("canonical-global-placement/full-range"))
+		global.Validator = globalValidation[0]
+	}
 	var capture CollectionTarget
 	if reserveCapture {
 		capture = open(TransitionCaptureCollectionName, durable.Options{

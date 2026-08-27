@@ -29,6 +29,7 @@ func (a *ReplicatedApply) AppendReplicatedSchemaTransition(
 	if a == nil || a.database == nil || proof.SourceApplied == 0 ||
 		proof.Catalog.SchemaGeneration == 0 || proof.Catalog.RelationManifestDigest == ([32]byte{}) ||
 		proof.ApplyContract == ([32]byte{}) || proof.Membership.Sequence == 0 ||
+		!proof.Relations.Valid() ||
 		authority.RequestDigest == ([32]byte{}) ||
 		authority.AuthorizationDigest == ([32]byte{}) ||
 		authority.CatalogCASDigest == ([32]byte{}) {
@@ -39,6 +40,7 @@ func (a *ReplicatedApply) AppendReplicatedSchemaTransition(
 		marker.sourceApplied != proof.SourceApplied || marker.membership != proof.Membership ||
 		marker.catalogDigest != proof.Catalog.Digest ||
 		marker.relationWitness != proof.Relations.Witness ||
+		marker.placementDigest != proof.Relations.PlacementDigest ||
 		marker.applyContract != proof.ApplyContract || marker.authorization != authority.RequestDigest {
 		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
@@ -61,6 +63,10 @@ func (a *ReplicatedApply) AppendReplicatedSchemaTransition(
 	if err != nil {
 		return dst, err
 	}
+	fromPlacement, err := a.machine.RelationPlacementDigest()
+	if err != nil {
+		return dst, err
+	}
 	publication := a.machine.Published()
 	if publication.ReplicaSetVersion == 0 {
 		return dst, ErrReplicatedSchemaCatalogImage
@@ -73,6 +79,7 @@ func (a *ReplicatedApply) AppendReplicatedSchemaTransition(
 		MembershipSource:          proof.Membership.Source, MembershipTarget: proof.Membership.Target,
 		FromManifest: fromManifest, FromApplyContract: fromContract,
 		ToManifest: proof.Catalog.RelationManifestDigest, ToApplyContract: proof.ApplyContract,
+		FromPlacementDigest: fromPlacement, ToPlacementDigest: proof.Relations.PlacementDigest,
 		RequestDigest:       authority.RequestDigest,
 		AuthorizationDigest: authority.AuthorizationDigest,
 		CatalogCASDigest:    authority.CatalogCASDigest,

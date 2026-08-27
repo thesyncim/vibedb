@@ -305,7 +305,7 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 		}
 		transition, err := OpenSchemaTransition(data)
 		if err != nil || m.state.Binding != schemaTransitionBinding(transition) ||
-			m.state.ApplyContractDigest != transition.ToApplyContract {
+			m.state.ApplyContractDigest != transition.ToApplyContract || m.state.RelationPlacementDigest != transition.ToPlacementDigest {
 			return raftmodel.Publication{}, errors.Join(ErrSchemaTransition, err)
 		}
 		return clonePublication(m.publication), nil
@@ -342,7 +342,7 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 		} else if kind == RecordSchema {
 			transition, openErr := OpenSchemaTransition(data)
 			if openErr != nil || m.state.Binding != schemaTransitionBinding(transition) ||
-				m.state.ApplyContractDigest != transition.ToApplyContract {
+				m.state.ApplyContractDigest != transition.ToApplyContract || m.state.RelationPlacementDigest != transition.ToPlacementDigest {
 				return raftmodel.Publication{}, m.fail(ErrSchemaTransition)
 			}
 		}
@@ -372,12 +372,13 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 		if transition.From != m.binding ||
 			transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion ||
 			transition.FromManifest != m.manifestDigest ||
-			transition.FromApplyContract != m.applyContract {
+			transition.FromApplyContract != m.applyContract || transition.FromPlacementDigest != m.state.RelationPlacementDigest {
 			return raftmodel.Publication{}, m.fail(ErrSchemaTransition)
 		}
 		next := m.nextState(meta, RecordSchema, digest)
 		next.Binding = schemaTransitionBinding(transition)
 		next.ApplyContractDigest = transition.ToApplyContract
+		next.RelationPlacementDigest = transition.ToPlacementDigest
 		next.DataChainDigest = schemaTransitionDataChain(m.state.DataChainDigest, transition)
 		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
@@ -747,13 +748,14 @@ func (m *Machine) AdmitCommand(data []byte) error {
 			transition.From != m.binding ||
 			transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion ||
 			transition.FromManifest != m.manifestDigest ||
-			transition.FromApplyContract != m.applyContract {
+			transition.FromApplyContract != m.applyContract || transition.FromPlacementDigest != m.state.RelationPlacementDigest {
 			return ErrSchemaTransition
 		}
 		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 		next := m.nextState(meta, RecordSchema, normalEntryDigest(meta, transition.Bytes()))
 		next.Binding = schemaTransitionBinding(transition)
 		next.ApplyContractDigest = transition.ToApplyContract
+		next.RelationPlacementDigest = transition.ToPlacementDigest
 		next.DataChainDigest = schemaTransitionDataChain(m.state.DataChainDigest, transition)
 		return m.checkTransitionCapacity(next, nil, commandPlan{})
 	}
@@ -2476,9 +2478,11 @@ func (m *Machine) persistTransitionRows(
 	if err != nil {
 		return err
 	}
-	next.RelationPlacementDigest = relationPlacementStateDigestWith(
-		next.Binding.SchemaGeneration, m.manifestDigest, m.relations, &nextPlacements,
-	)
+	if next.LastKind != RecordSchema {
+		next.RelationPlacementDigest = relationPlacementStateDigestWith(
+			next.Binding.SchemaGeneration, m.manifestDigest, m.relations, &nextPlacements,
+		)
+	}
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {

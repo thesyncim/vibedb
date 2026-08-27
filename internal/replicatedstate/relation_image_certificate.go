@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math"
+
+	"github.com/thesyncim/vibedb/internal/replication"
 )
 
 var relationImageCertificateDomain = []byte(
@@ -25,6 +27,16 @@ type RelationImageCertificate struct {
 	CardinalityRoot   [sha256.Size]byte
 	PlacementDigest   [sha256.Size]byte
 	Witness           [sha256.Size]byte
+}
+
+// Valid verifies every certificate field against its existing fixed witness.
+// This does not certify new images: it authenticates a detached certificate
+// against the witness retained by the prepared rollout owner.
+func (certificate RelationImageCertificate) Valid() bool {
+	return certificate.SchemaGeneration != 0 && certificate.RelationCount != 0 &&
+		certificate.RelationCount <= replication.MaxRelationsPerBundle &&
+		certificate.ManifestDigest != ([sha256.Size]byte{}) && certificate.ImageRoot != ([sha256.Size]byte{}) &&
+		certificate.CardinalityRoot != ([sha256.Size]byte{}) && certificate.Witness == relationImageCertificateWitness(certificate)
 }
 
 // BundleApplyContractOptions is the constant-size part of Options that enters
@@ -125,8 +137,14 @@ func CertifyRelationImages(
 		ManifestDigest:    manifest, ImageRoot: imageRoot,
 		CardinalityRoot: cardinalityRoot, PlacementDigest: placement,
 	}
+	certificate.Witness = relationImageCertificateWitness(certificate)
+	return certificate, nil
+}
+
+func relationImageCertificateWitness(certificate RelationImageCertificate) [sha256.Size]byte {
 	h := sha256.New()
 	_, _ = h.Write(relationImageCertificateDomain)
+	var fixed [18]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], certificate.SchemaGeneration)
 	binary.LittleEndian.PutUint16(fixed[8:10], certificate.RelationCount)
 	binary.LittleEndian.PutUint64(fixed[10:18], certificate.TotalRows)
@@ -137,6 +155,7 @@ func CertifyRelationImages(
 	_, _ = h.Write(certificate.ImageRoot[:])
 	_, _ = h.Write(certificate.CardinalityRoot[:])
 	_, _ = h.Write(certificate.PlacementDigest[:])
-	_ = h.Sum(certificate.Witness[:0])
-	return certificate, nil
+	var digest [sha256.Size]byte
+	_ = h.Sum(digest[:0])
+	return digest
 }

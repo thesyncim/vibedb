@@ -41,6 +41,8 @@ func TestSchemaTransitionCodecIsCanonicalAndBounded(t *testing.T) {
 		sha256.Sum256([]byte("from-contract")), sha256.Sum256([]byte("to-manifest")),
 		sha256.Sum256([]byte("to-contract")), 3,
 	)
+	transition.FromPlacementDigest = sha256.Sum256([]byte("from-placement"))
+	transition.ToPlacementDigest = sha256.Sum256([]byte("to-placement"))
 	encoded, err := AppendSchemaTransition([]byte("prefix"), transition)
 	if err != nil {
 		t.Fatal(err)
@@ -53,6 +55,19 @@ func TestSchemaTransitionCodecIsCanonicalAndBounded(t *testing.T) {
 	reencoded, err := AppendSchemaTransition(nil, opened.SchemaTransition)
 	if err != nil || !bytes.Equal(reencoded, frame) || !bytes.Equal(opened.Bytes(), frame) {
 		t.Fatalf("canonical round trip failed: %v", err)
+	}
+	if opened.FromPlacementDigest != transition.FromPlacementDigest || opened.ToPlacementDigest != transition.ToPlacementDigest {
+		t.Fatal("placement authority lost in canonical envelope")
+	}
+	for offset := range frame {
+		if _, err := OpenSchemaTransition(frame[:offset]); err == nil {
+			t.Fatalf("accepted schema frame truncated at %d", offset)
+		}
+		damaged := bytes.Clone(frame)
+		damaged[offset] ^= 1
+		if _, err := OpenSchemaTransition(damaged); err == nil {
+			t.Fatalf("accepted schema frame corruption at %d", offset)
+		}
 	}
 	corrupt := bytes.Clone(frame)
 	corrupt[485] = 1

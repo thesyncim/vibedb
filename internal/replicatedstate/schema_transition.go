@@ -12,7 +12,7 @@ import (
 
 const (
 	schemaTransitionFormat      uint16 = 0
-	schemaTransitionHeaderBytes        = 512
+	schemaTransitionHeaderBytes        = 576
 	MaxSchemaTransitionBytes           = schemaTransitionHeaderBytes +
 		2*replication.MaxIdentityBytes + recordChecksumLen
 )
@@ -37,6 +37,8 @@ type SchemaTransition struct {
 	FromApplyContract         [sha256.Size]byte
 	ToManifest                [sha256.Size]byte
 	ToApplyContract           [sha256.Size]byte
+	FromPlacementDigest       [sha256.Size]byte
+	ToPlacementDigest         [sha256.Size]byte
 	RequestDigest             [sha256.Size]byte
 	AuthorizationDigest       [sha256.Size]byte
 	CatalogCASDigest          [sha256.Size]byte
@@ -95,6 +97,8 @@ func AppendSchemaTransition(dst []byte, transition SchemaTransition) ([]byte, er
 	binary.LittleEndian.PutUint16(frame[464:466], uint16(len(transition.From.Distribution)))
 	binary.LittleEndian.PutUint16(frame[466:468], uint16(len(transition.From.Shard)))
 	appendOwnershipRange(frame[468:485], transition.From.OwnedRange)
+	copy(frame[512:544], transition.FromPlacementDigest[:])
+	copy(frame[544:576], transition.ToPlacementDigest[:])
 	cursor := schemaTransitionHeaderBytes
 	cursor += copy(frame[cursor:], transition.From.Distribution)
 	cursor += copy(frame[cursor:], transition.From.Shard)
@@ -117,7 +121,7 @@ func OpenSchemaTransition(data []byte) (SchemaTransitionView, error) {
 		binary.LittleEndian.Uint16(data[10:12]) != schemaTransitionHeaderBytes ||
 		binary.LittleEndian.Uint32(data[12:16]) != uint32(len(data)) ||
 		!zeroBytes(data[16:24]) || data[484] > 1 ||
-		!zeroBytes(data[485:schemaTransitionHeaderBytes]) ||
+		!zeroBytes(data[485:512]) ||
 		!verifyRecord(data, schemaTransitionChecksumDomain) {
 		return SchemaTransitionView{}, fmt.Errorf("%w: schema transition envelope", ErrSchemaTransition)
 	}
@@ -156,6 +160,8 @@ func OpenSchemaTransition(data []byte) (SchemaTransitionView, error) {
 	copy(t.AuthorizationDigest[:], data[400:432])
 	copy(t.CatalogCASDigest[:], data[432:464])
 	t.From.OwnedRange = openOwnershipRange(data[468:485])
+	copy(t.FromPlacementDigest[:], data[512:544])
+	copy(t.ToPlacementDigest[:], data[544:576])
 	t.From.Distribution = string(data[cursor : cursor+distributionBytes])
 	t.From.Shard = string(data[cursor+distributionBytes : cursor+distributionBytes+shardBytes])
 	if err := validateSchemaTransition(*t); err != nil {

@@ -426,6 +426,7 @@ func validateOpenedSchemaTransition(
 	if err != nil || normalEntryDigest(meta, options.SchemaTransition) != state.LastEntryDigest ||
 		schemaTransitionBinding(transition) != binding ||
 		transition.ToManifest != manifest || transition.ToApplyContract != contract ||
+		transition.ToPlacementDigest != state.RelationPlacementDigest ||
 		transition.MembershipSequence != witness.Sequence ||
 		transition.MembershipSource != witness.Source ||
 		transition.MembershipTarget != witness.Target ||
@@ -1779,7 +1780,7 @@ func (m *Machine) ObserveSchemaTransition(command []byte) (uint64, bool, error) 
 	if !m.schemaTransitioned || state.LastKind != RecordSchema ||
 		state.LastEntryType != pb.EntryNormal || state.LastTerm == 0 ||
 		state.Binding != schemaTransitionBinding(transition) ||
-		state.ApplyContractDigest != transition.ToApplyContract {
+		state.ApplyContractDigest != transition.ToApplyContract || state.RelationPlacementDigest != transition.ToPlacementDigest {
 		return state.Applied, false, nil
 	}
 	digest := normalEntryDigest(raftmodel.ApplyMeta{
