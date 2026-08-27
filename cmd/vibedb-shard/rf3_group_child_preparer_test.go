@@ -133,6 +133,25 @@ func TestRF3ChildAdmissionCanceledDoesNotConsumeCapacity(t *testing.T) {
 	}
 }
 
+func TestRF3ChildAdmissionPoisonedCheckpointRejectsExactRetry(t *testing.T) {
+	preparer := testRF3ChildAdmissionPreparer(t, 1)
+	op := [32]byte{1}
+	if err := preparer.admit(op, 0); err != nil {
+		t.Fatal(err)
+	}
+	preparer.store.failed = true
+	if err := preparer.admit(op, 0); err == nil {
+		t.Fatal("exact retry bypassed poisoned publication")
+	}
+	preparer.store.failed = false
+	if err := preparer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := preparer.admit(op, 0); err == nil {
+		t.Fatal("exact retry bypassed closed handle")
+	}
+}
+
 func TestRF3ChildAdmissionRecoversCapacityAndRejectsRelabel(t *testing.T) {
 	preparer := testRF3ChildAdmissionPreparer(t, 1)
 	op := [32]byte{1}
@@ -213,6 +232,9 @@ func TestRF3ChildAdmissionReclaimsOnlyDurableTerminalCapacity(t *testing.T) {
 	if err := registry.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := preparer.reserve(op, 0, 1, certificate, [32]byte{3}); !errors.Is(err, splitcontroller.ErrRuntimeTerminal) {
+		t.Fatalf("partial terminal retry=%v", err)
+	}
 	// Crash after terminal witness but before admission checkpoint release.
 	if err := preparer.Close(); err != nil {
 		t.Fatal(err)
@@ -223,6 +245,9 @@ func TestRF3ChildAdmissionReclaimsOnlyDurableTerminalCapacity(t *testing.T) {
 	}
 	if err := preparer.recoverTerminal(); err != nil {
 		t.Fatal(err)
+	}
+	if err := preparer.admit(op, 1); !errors.Is(err, splitcontroller.ErrRuntimeTerminal) {
+		t.Fatalf("terminal without receipt was relabelled: %v", err)
 	}
 	if err := preparer.admit([32]byte{4}, 1); err != nil {
 		t.Fatalf("terminal slot not reclaimed=%v", err)

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,7 +49,7 @@ func TestRF3ChildAdmissionCheckpointExactRestartAndBound(t *testing.T) {
 }
 
 func TestRF3ChildAdmissionCheckpointRejectsCorruption(t *testing.T) {
-	for _, kind := range []string{"truncate", "digest", "symlink"} {
+	for _, kind := range []string{"truncate", "digest", "symlink", "high-group-bits"} {
 		t.Run(kind, func(t *testing.T) {
 			root, digest := t.TempDir(), [32]byte{1}
 			store, _, err := openRF3ChildAdmissionStore(root, digest, 1)
@@ -67,6 +69,11 @@ func TestRF3ChildAdmissionCheckpointRejectsCorruption(t *testing.T) {
 				err = os.WriteFile(path, raw[:len(raw)-1], 0o600)
 			case "digest":
 				raw[100] ^= 1
+				err = os.WriteFile(path, raw, 0o600)
+			case "high-group-bits":
+				binary.LittleEndian.PutUint64(raw[96:104], 1<<32)
+				digest := sha256.Sum256(raw[:len(raw)-32])
+				copy(raw[len(raw)-32:], digest[:])
 				err = os.WriteFile(path, raw, 0o600)
 			case "symlink":
 				outside := filepath.Join(t.TempDir(), "state")

@@ -149,9 +149,23 @@ func (preparer *rf3GroupChildPreparer) PrepareChild(
 }
 
 func (preparer *rf3GroupChildPreparer) reserve(operation [32]byte, group, child int, certificate, request [32]byte) (int, error) {
+	if preparer.store == nil || preparer.store.failed || preparer.store.root == nil {
+		return 0, errRF3Serving
+	}
 	if operation == ([32]byte{}) || group < 0 || group >= len(preparer.preparers) ||
 		child < 0 || child >= autosplit.MaxSplitChildren || certificate == ([32]byte{}) || request == ([32]byte{}) {
 		return 0, splitcontroller.ErrChildPreparation
+	}
+	paths, err := preparer.manifest.groupBundles()[group].ChildRegistry.childPaths(operation, uint8(child))
+	if err != nil {
+		return 0, err
+	}
+	terminal, err := splitcontroller.HasRuntimeTerminalWitness(paths.Root, splitcontroller.OperationID(operation), certificate)
+	if err != nil {
+		return 0, err
+	}
+	if terminal {
+		return 0, splitcontroller.ErrRuntimeTerminal
 	}
 	empty := -1
 	existing := -1
@@ -201,6 +215,13 @@ func (preparer *rf3GroupChildPreparer) Close() error {
 	if preparer == nil {
 		return nil
 	}
+	preparer.mu.Lock()
+	defer preparer.mu.Unlock()
+	for _, active := range preparer.inflight {
+		if active != 0 {
+			return splitcontroller.ErrRuntimeRegistryInUse
+		}
+	}
 	return preparer.store.Close()
 }
 
@@ -214,6 +235,13 @@ func (preparer *rf3GroupChildPreparer) checkPriorPreparation(operation [32]byte,
 			if err != nil {
 				return err
 			}
+			terminal, err := splitcontroller.HasBoundRuntimeTerminalWitness(paths.Root, splitcontroller.OperationID(operation))
+			if err != nil {
+				return err
+			}
+			if terminal {
+				return splitcontroller.ErrRuntimeTerminal
+			}
 			raw, err := readPrepareRF3File(filepath.Join(paths.Root, rf3ChildPrepareReceiptName), splitcontroller.MaxChildPreparationBytes)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -225,7 +253,7 @@ func (preparer *rf3GroupChildPreparer) checkPriorPreparation(operation [32]byte,
 			if err != nil || receipt.Operation != splitcontroller.OperationID(operation) || receipt.Child != child || index != group {
 				return splitcontroller.ErrChildPreparation
 			}
-			terminal, err := splitcontroller.HasRuntimeTerminalWitness(paths.Root, receipt.Operation, receipt.Target.CertificateDigest)
+			terminal, err = splitcontroller.HasRuntimeTerminalWitness(paths.Root, receipt.Operation, receipt.Target.CertificateDigest)
 			if err != nil {
 				return err
 			}
@@ -257,6 +285,9 @@ func (preparer *rf3GroupChildPreparer) slotTerminal(slot rf3GroupChildPrepareSlo
 }
 
 func (preparer *rf3GroupChildPreparer) recoverTerminal() error {
+	if preparer.store == nil || preparer.store.failed || preparer.store.root == nil {
+		return errRF3Serving
+	}
 	next := preparer.slots
 	for index, slot := range next {
 		if slot.operation == ([32]byte{}) {

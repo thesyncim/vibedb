@@ -80,7 +80,11 @@ func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int) (*rf3
 	for index := range slots {
 		slot := &slots[index]
 		copy(slot.operation[:], raw[position:position+32])
-		slot.group = int(binary.LittleEndian.Uint64(raw[position+32 : position+40]))
+		group := binary.LittleEndian.Uint64(raw[position+32 : position+40])
+		if group >= maxRF3ManifestGroups {
+			return closeError(errRF3Serving)
+		}
+		slot.group = int(group)
 		position += 40
 		for child := range slot.certificates {
 			copy(slot.certificates[child][:], raw[position:position+32])

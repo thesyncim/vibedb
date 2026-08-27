@@ -509,6 +509,46 @@ func HasRuntimeTerminalWitness(path string, operation OperationID, manifest [sha
 	return found, errors.Join(err, root.Close())
 }
 
+// HasBoundRuntimeTerminalWitness rejects resurrection even when SQL
+// preparation never produced a receipt. It recovers the authenticated root
+// binding solely to check for a terminal marker; callers must not use this
+// absence check to grant execution or reclaim an active admission.
+func HasBoundRuntimeTerminalWitness(path string, operation OperationID) (bool, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || operation == (OperationID{}) {
+		return false, ErrRuntimeStore
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.Join(ErrRuntimeStore, err)
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	file, err := openRuntimeRegular(root, "manifest.binding", os.O_RDONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var raw [runtimeRegistryBindingBytes]byte
+	_, readErr := io.ReadFull(file, raw[:])
+	var extra [1]byte
+	n, trailingErr := file.Read(extra[:])
+	closeErr := file.Close()
+	manifest := [sha256.Size]byte(raw[16:48])
+	if readErr != nil || n != 0 || !errors.Is(trailingErr, io.EOF) || closeErr != nil ||
+		manifest == ([sha256.Size]byte{}) || !validRuntimeRegistryBinding(raw[:], manifest) {
+		return false, errors.Join(ErrRuntimeStore, readErr, trailingErr, closeErr)
+	}
+	return runtimeTerminalExists(root, operation, manifest)
+}
+
 func runtimeTerminalExists(
 	root *os.Root, operation OperationID, manifest [sha256.Size]byte,
 ) (bool, error) {
