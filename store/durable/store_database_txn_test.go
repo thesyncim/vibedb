@@ -526,7 +526,12 @@ func TestDatabaseTxnDeadlockComposition(t *testing.T) {
 		}()
 	}
 	start(func() {
-		_, _ = db.Snapshot()
+		snapshot, err := db.Snapshot()
+		if err == nil {
+			if err := snapshot.Close(); err != nil {
+				t.Errorf("close database snapshot: %v", err)
+			}
+		}
 	})
 	start(func() {
 		_ = db.Update(func(batch *DatabaseBatch) error {
@@ -558,6 +563,11 @@ func TestDatabaseTxnDeadlockComposition(t *testing.T) {
 	}
 	stop.Store(true)
 	wg.Wait()
+	for _, collection := range []*Collection{a, b} {
+		if active := collection.leases.Stats(collection.Generation()).Active; active != 0 {
+			t.Fatalf("composition leaked %d snapshot leases", active)
+		}
+	}
 }
 
 func TestDatabaseTxnLaneRefusals(t *testing.T) {
