@@ -152,3 +152,68 @@ func TestPlannedPrimaryGraphEmitsIntoReservedSink(t *testing.T) {
 		t.Fatal("reserved graph has no routes")
 	}
 }
+
+func TestAbandonedUnrootedGenerationWaitsForSnapshotAndRecoveryFloors(t *testing.T) {
+	leases, err := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := NewExtentReclaimer(
+		leases, ExtentReclaimerOptions{MaxRetiredExtents: 4},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := leases.Acquire(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := UnrootedGenerationReservation{
+		Offset: 64 << 10, Length: 8 << 20,
+		FirstLogicalID: 100, LogicalIDCount: 1000,
+	}
+	if err := RetireAbandonedUnrootedGeneration(reclaimer, reservation, 6); err != nil {
+		t.Fatal(err)
+	}
+	reusable, err := reclaimer.AppendReusable(nil, 7, 7, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reusable) != 0 {
+		t.Fatalf("active snapshot reclaimed abandoned range: %+v", reusable)
+	}
+	lease.Release()
+	reusable = make([]FreeExtent, 0, 1)
+	reusable, err = reclaimer.AppendReusable(reusable, 7, 6, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reusable) != 0 {
+		t.Fatalf("fallback root reclaimed abandoned range: %+v", reusable)
+	}
+	reusable, err = reclaimer.AppendReusable(reusable, 7, 7, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reusable) != 1 || reusable[0].Offset != reservation.Offset ||
+		reusable[0].Length != reservation.Length {
+		t.Fatalf("reclaimed abandoned range = %+v", reusable)
+	}
+
+	manifest := GenerationMigrationManifest{
+		StoreID: testStoreID, MigrationID: [16]byte{9},
+		Phase:            GenerationMigrationCatchingUp,
+		SourceGeneration: 5, TargetGeneration: 7,
+		ReservedOffset: reservation.Offset, ReservedBytes: reservation.Length,
+		FirstLogicalID: reservation.FirstLogicalID,
+		LogicalIDCount: reservation.LogicalIDCount,
+	}
+	got, ok := AbandonedUnrootedGenerationReservation(manifest)
+	if !ok || got != reservation {
+		t.Fatalf("manifest reservation = %+v,%v", got, ok)
+	}
+	manifest.Phase = GenerationMigrationPublished
+	if _, ok := AbandonedUnrootedGenerationReservation(manifest); ok {
+		t.Fatal("published migration was treated as abandoned")
+	}
+}

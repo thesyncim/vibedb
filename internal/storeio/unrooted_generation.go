@@ -58,6 +58,42 @@ func (w *UnrootedGenerationWriter) WrittenBytes() uint64 {
 	return w.written
 }
 
+// RetireAbandonedUnrootedGeneration makes a reservation that was never named
+// by a published state root eligible for ordinary snapshot/recovery-fenced
+// reuse. The entire range is one extent: partially written staging pages were
+// unreachable, so subdividing them only consumes bounded retirement metadata.
+func RetireAbandonedUnrootedGeneration(
+	reclaimer *ExtentReclaimer,
+	reservation UnrootedGenerationReservation,
+	retiredGeneration uint64,
+) error {
+	if reclaimer == nil || reservation.Offset == 0 || reservation.Length == 0 ||
+		reservation.Offset > ^uint64(0)-reservation.Length || retiredGeneration == 0 {
+		return fmt.Errorf("%w: abandoned unrooted generation", ErrInvalidWrite)
+	}
+	return reclaimer.Retire(FreeExtent{
+		Offset: reservation.Offset, Length: reservation.Length,
+		RetiredGeneration: retiredGeneration,
+	})
+}
+
+// AbandonedUnrootedGenerationReservation reconstructs the exact reservation
+// from a durable non-published migration manifest after a crash.
+func AbandonedUnrootedGenerationReservation(
+	manifest GenerationMigrationManifest,
+) (UnrootedGenerationReservation, bool) {
+	if manifest.Phase == GenerationMigrationPublished ||
+		manifest.ReservedOffset == 0 || manifest.ReservedBytes == 0 ||
+		manifest.FirstLogicalID == 0 || manifest.LogicalIDCount == 0 {
+		return UnrootedGenerationReservation{}, false
+	}
+	return UnrootedGenerationReservation{
+		Offset: manifest.ReservedOffset, Length: manifest.ReservedBytes,
+		FirstLogicalID: manifest.FirstLogicalID,
+		LogicalIDCount: manifest.LogicalIDCount,
+	}, true
+}
+
 func errorsJoinInvalid(err error, context string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrInvalidWrite, context, err)
