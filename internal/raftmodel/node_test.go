@@ -186,6 +186,41 @@ func TestNormalProposalsShareOneBoundedUncapturedReady(t *testing.T) {
 	}
 }
 
+func TestCommitMetricsAdvanceOnlyAtCoreCommitAuthority(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1})
+	if got := node.CommitMetrics(); got != (CommitMetrics{}) {
+		t.Fatalf("recovery metrics = %+v, want zero baseline", got)
+	}
+	driveCampaign(t, node)
+	afterElection := node.CommitMetrics()
+	if afterElection.Advancements != 1 || afterElection.Entries != 1 {
+		t.Fatalf("election metrics = %+v, want one committed no-op", afterElection)
+	}
+	if err := node.Propose([]byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Propose([]byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.CommitMetrics(); got != afterElection {
+		t.Fatalf("unpersisted proposals changed commit metrics: got %+v want %+v", got, afterElection)
+	}
+	driveAllReady(t, node)
+	if got := node.CommitMetrics(); got.Advancements != afterElection.Advancements+1 ||
+		got.Entries != afterElection.Entries+2 {
+		t.Fatalf("post-authority metrics = %+v, want advancements=%d entries=%d",
+			got, afterElection.Advancements+1, afterElection.Entries+2)
+	}
+}
+
+func BenchmarkNodeObserveCommitAdvancementNoChange(b *testing.B) {
+	node, _, _ := newTestNode(b, 1, []uint64{1})
+	b.ReportAllocs()
+	for b.Loop() {
+		node.observeCommitAdvancement()
+	}
+}
+
 func TestProposalBatchLimitsMatchUncapturedReadyWindow(t *testing.T) {
 	if MaxProposalBatchEntries != MaxPendingInputCalls ||
 		MaxProposalBatchEntries > MaxPendingInputUnits ||
@@ -1705,13 +1740,13 @@ func (m *fakeStateMachine) InstallSnapshot(snapshot *pb.Snapshot) (Publication, 
 	return m.Published(), nil
 }
 
-func newTestNode(t *testing.T, incarnation uint64, voters []uint64) (*Node, *fakeStable, *fakeStateMachine) {
+func newTestNode(t testing.TB, incarnation uint64, voters []uint64) (*Node, *fakeStable, *fakeStateMachine) {
 	t.Helper()
 	return newTestNodeWithConfState(t, 1, incarnation, &pb.ConfState{Voters: slices.Clone(voters)})
 }
 
 func newTestNodeWithConfState(
-	t *testing.T,
+	t testing.TB,
 	memberID, incarnation uint64,
 	confState *pb.ConfState,
 ) (*Node, *fakeStable, *fakeStateMachine) {

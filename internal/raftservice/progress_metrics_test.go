@@ -16,6 +16,7 @@ func TestProgressMetricsCountsExistingOwnerSeamsExactly(t *testing.T) {
 	}, true, nil)
 	metrics.observeProgress(multiraft.Progress{
 		ReadyKind: raftmember.DrivePersisted, AppliedCount: 2,
+		CommitAdvancements: 1, CommittedEntries: 4,
 	}, true, nil)
 	metrics.observeProgress(multiraft.Progress{
 		ReadyKind: raftmember.DriveSnapshotFinished,
@@ -27,6 +28,7 @@ func TestProgressMetricsCountsExistingOwnerSeamsExactly(t *testing.T) {
 	metrics.observeProgress(multiraft.Progress{Kind: multiraft.ProgressFault}, true, errors.New("disk"))
 	want := ProgressMetricsSnapshot{ProposalCommands: 3, ProposalBytes: 19,
 		AppliedEntries: 2, ReadyPersisted: 1, SnapshotsFinished: 1,
+		CommitAdvancements: 1, CommittedEntries: 4,
 		ReadCompletions: 2, Faults: 1}
 	if got := metrics.Snapshot(); got != want {
 		t.Fatalf("metrics=%+v want=%+v", got, want)
@@ -54,9 +56,11 @@ func TestProgressMetricsGroupDirectoryIsExactAndBounded(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	metrics.observeProgress(multiraft.Progress{Group: groupA, ProposalCount: 2, ProposalBytes: 11}, true, nil)
+	metrics.observeProgress(multiraft.Progress{Group: groupA, ProposalCount: 2, ProposalBytes: 11,
+		CommitAdvancements: 3, CommittedEntries: 7}, true, nil)
 	identity, got, found := metrics.GroupProgressMetrics(groupA)
-	if !found || identity.MemberID != 7 || got.ProposalCommands != 2 || got.ProposalBytes != 11 {
+	if !found || identity.MemberID != 7 || got.ProposalCommands != 2 || got.ProposalBytes != 11 ||
+		got.CommitAdvancements != 3 || got.CommittedEntries != 7 {
 		t.Fatalf("identity=%+v metrics=%+v found=%v", identity, got, found)
 	}
 	if _, got, found = metrics.GroupProgressMetrics(groupB); !found || got != (ProgressMetricsSnapshot{}) {

@@ -17,14 +17,16 @@ const AbsoluteMaxProgressMetricsGroups = 1 << 14
 // RF3 owner loops. It observes already-produced fixed-width progress after a
 // Host turn; no formatting, labels, clocks, maps, or callbacks enter Raft.
 type ProgressMetrics struct {
-	proposalCommands  atomic.Uint64
-	proposalBytes     atomic.Uint64
-	appliedEntries    atomic.Uint64
-	readyPersisted    atomic.Uint64
-	snapshotsFinished atomic.Uint64
-	readCompletions   atomic.Uint64
-	faults            atomic.Uint64
-	groups            atomic.Pointer[progressMetricsGroupTable]
+	proposalCommands   atomic.Uint64
+	proposalBytes      atomic.Uint64
+	appliedEntries     atomic.Uint64
+	commitAdvancements atomic.Uint64
+	committedEntries   atomic.Uint64
+	readyPersisted     atomic.Uint64
+	snapshotsFinished  atomic.Uint64
+	readCompletions    atomic.Uint64
+	faults             atomic.Uint64
+	groups             atomic.Pointer[progressMetricsGroupTable]
 }
 
 type progressMetricsGroup struct {
@@ -34,6 +36,7 @@ type progressMetricsGroup struct {
 
 type progressMetricsCounters struct {
 	proposalCommands, proposalBytes, appliedEntries atomic.Uint64
+	commitAdvancements, committedEntries            atomic.Uint64
 	readyPersisted, snapshotsFinished               atomic.Uint64
 	readCompletions, faults                         atomic.Uint64
 }
@@ -46,13 +49,15 @@ type progressMetricsGroupTable struct {
 // ProgressMetricsSnapshot is a detached, consistent-enough counter cut. Every
 // field is cumulative for one process incarnation.
 type ProgressMetricsSnapshot struct {
-	ProposalCommands  uint64
-	ProposalBytes     uint64
-	AppliedEntries    uint64
-	ReadyPersisted    uint64
-	SnapshotsFinished uint64
-	ReadCompletions   uint64
-	Faults            uint64
+	ProposalCommands   uint64
+	ProposalBytes      uint64
+	AppliedEntries     uint64
+	CommitAdvancements uint64
+	CommittedEntries   uint64
+	ReadyPersisted     uint64
+	SnapshotsFinished  uint64
+	ReadCompletions    uint64
+	Faults             uint64
 }
 
 func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, done bool, err error) {
@@ -65,6 +70,12 @@ func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, don
 	}
 	if progress.AppliedCount > 0 {
 		metrics.appliedEntries.Add(uint64(progress.AppliedCount))
+	}
+	if progress.CommitAdvancements != 0 {
+		metrics.commitAdvancements.Add(progress.CommitAdvancements)
+	}
+	if progress.CommittedEntries != 0 {
+		metrics.committedEntries.Add(progress.CommittedEntries)
 	}
 	switch progress.ReadyKind {
 	case raftmember.DrivePersisted:
@@ -91,6 +102,12 @@ func (counters *progressMetricsCounters) observe(progress multiraft.Progress, do
 	}
 	if progress.AppliedCount > 0 {
 		counters.appliedEntries.Add(uint64(progress.AppliedCount))
+	}
+	if progress.CommitAdvancements != 0 {
+		counters.commitAdvancements.Add(progress.CommitAdvancements)
+	}
+	if progress.CommittedEntries != 0 {
+		counters.committedEntries.Add(progress.CommittedEntries)
 	}
 	switch progress.ReadyKind {
 	case raftmember.DrivePersisted:
@@ -189,6 +206,7 @@ func (metrics *ProgressMetrics) GroupProgressMetrics(group raftmember.GroupKey) 
 	return slot.identity, ProgressMetricsSnapshot{
 		ProposalCommands: c.proposalCommands.Load(), ProposalBytes: c.proposalBytes.Load(),
 		AppliedEntries: c.appliedEntries.Load(), ReadyPersisted: c.readyPersisted.Load(),
+		CommitAdvancements: c.commitAdvancements.Load(), CommittedEntries: c.committedEntries.Load(),
 		SnapshotsFinished: c.snapshotsFinished.Load(), ReadCompletions: c.readCompletions.Load(),
 		Faults: c.faults.Load(),
 	}, true
@@ -199,12 +217,14 @@ func (metrics *ProgressMetrics) Snapshot() ProgressMetricsSnapshot {
 		return ProgressMetricsSnapshot{}
 	}
 	return ProgressMetricsSnapshot{
-		ProposalCommands:  metrics.proposalCommands.Load(),
-		ProposalBytes:     metrics.proposalBytes.Load(),
-		AppliedEntries:    metrics.appliedEntries.Load(),
-		ReadyPersisted:    metrics.readyPersisted.Load(),
-		SnapshotsFinished: metrics.snapshotsFinished.Load(),
-		ReadCompletions:   metrics.readCompletions.Load(),
-		Faults:            metrics.faults.Load(),
+		ProposalCommands:   metrics.proposalCommands.Load(),
+		ProposalBytes:      metrics.proposalBytes.Load(),
+		AppliedEntries:     metrics.appliedEntries.Load(),
+		CommitAdvancements: metrics.commitAdvancements.Load(),
+		CommittedEntries:   metrics.committedEntries.Load(),
+		ReadyPersisted:     metrics.readyPersisted.Load(),
+		SnapshotsFinished:  metrics.snapshotsFinished.Load(),
+		ReadCompletions:    metrics.readCompletions.Load(),
+		Faults:             metrics.faults.Load(),
 	}
 }

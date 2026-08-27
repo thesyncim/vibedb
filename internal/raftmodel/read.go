@@ -142,6 +142,7 @@ func (n *Node) ReadIndex(context []byte) error {
 	}
 	n.readBytes += len(copyOfContext)
 	n.raw.ReadIndex(copyOfContext)
+	n.observeCommitAdvancement()
 	n.recordProtocolInput(1, 0)
 	return nil
 }

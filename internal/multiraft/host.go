@@ -170,17 +170,25 @@ const (
 // promotes Kind to ProgressFault, and are zero for all other work. When RunOne
 // also returns an error, Done is still true if input was consumed or a group
 // was newly latched faulted. ReadOutcomes is owned by the caller and present
-// only on the corresponding Ready completion step.
+// only on the corresponding Ready completion step. CommitAdvancements and
+// CommittedEntries are deltas from counters recorded at the RawNode mutation
+// authority, not deductions from Ready persistence or application.
 type Progress struct {
-	Group         raftmember.GroupKey
-	Kind          ProgressKind
-	ReadyKind     raftmember.DriveKind
-	ProposalCount int
-	ProposalBytes int64
-	AppliedCount  int
-	AppliedFirst  uint64
-	AppliedLast   uint64
-	ReadOutcomes  []raftmodel.ReadOutcome
+	Group              raftmember.GroupKey
+	Kind               ProgressKind
+	ReadyKind          raftmember.DriveKind
+	ProposalCount      int
+	ProposalBytes      int64
+	AppliedCount       int
+	AppliedFirst       uint64
+	AppliedLast        uint64
+	CommitAdvancements uint64
+	CommittedEntries   uint64
+	ReadOutcomes       []raftmodel.ReadOutcome
+}
+
+type commitMetricsRuntime interface {
+	CommitMetrics() raftmodel.CommitMetrics
 }
 
 type memberRuntime interface {
@@ -371,6 +379,7 @@ type groupState struct {
 	retiring          bool
 	schemaQuiesced    bool
 	trackedLeaderTerm uint64
+	commitMetrics     raftmodel.CommitMetrics
 }
 
 type outboundItem struct {
@@ -582,6 +591,9 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 		key: key, memberID: identity.MemberID, runtime: runtime,
 		sourceOwner: owner, sourceToken: sourceToken,
 		sourceClaimed: host.serving.ClaimSource != nil,
+	}
+	if provider, ok := runtime.(commitMetricsRuntime); ok {
+		group.commitMetrics = provider.CommitMetrics()
 	}
 	host.groups[key] = group
 	host.order = append(host.order, group)
@@ -1113,7 +1125,9 @@ func (host *Host) RunOne() (Progress, bool, error) {
 					group.failure = err
 				}
 				host.purgeGroup(group)
-				return Progress{Group: group.key, Kind: ProgressFault}, true, err
+				progress := Progress{Group: group.key, Kind: ProgressFault}
+				host.observeCommitProgress(group, &progress)
+				return progress, true, err
 			}
 			// Persistence and other nonterminal boundary errors retain their exact
 			// Runtime phase. Re-wake the group so an explicit later RunOne can retry.
@@ -1124,12 +1138,14 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		host.observeTrackedLeadership(group)
 		if ready.Progressed() {
 			host.wake(group)
-			return Progress{
+			progress := Progress{
 				Group: group.key, Kind: ProgressReady, ReadyKind: ready.Kind,
 				AppliedCount: ready.Applied.Len(), AppliedFirst: ready.Applied.FirstIndex(),
 				AppliedLast:  ready.Applied.LastIndex(),
 				ReadOutcomes: ready.ReadOutcomes,
-			}, true, nil
+			}
+			host.observeCommitProgress(group, &progress)
+			return progress, true, nil
 		}
 
 		progress, consumed, inputErr := host.runInput(group)
@@ -1285,7 +1301,12 @@ func (host *Host) purgeGroup(group *groupState) {
 	group.runnable = false
 }
 
-func (host *Host) runInput(group *groupState) (Progress, bool, error) {
+func (host *Host) runInput(group *groupState) (result Progress, consumed bool, resultErr error) {
+	defer func() {
+		if consumed {
+			host.observeCommitProgress(group, &result)
+		}
+	}()
 	for checked := inputClass(0); checked < inputClassCount; checked++ {
 		class := (group.nextClass + checked) % inputClassCount
 		progress := Progress{Group: group.key}
@@ -1388,6 +1409,24 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 		}
 	}
 	return Progress{}, false, nil
+}
+
+func (host *Host) observeCommitProgress(group *groupState, progress *Progress) {
+	if group == nil || progress == nil || group.runtime == nil {
+		return
+	}
+	provider, ok := group.runtime.(commitMetricsRuntime)
+	if !ok {
+		return
+	}
+	current := provider.CommitMetrics()
+	if current.Advancements >= group.commitMetrics.Advancements {
+		progress.CommitAdvancements = current.Advancements - group.commitMetrics.Advancements
+	}
+	if current.Entries >= group.commitMetrics.Entries {
+		progress.CommittedEntries = current.Entries - group.commitMetrics.Entries
+	}
+	group.commitMetrics = current
 }
 
 func (host *Host) enqueueReadyOutbound(outbound raftmember.OutboundMessage) error {

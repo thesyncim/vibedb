@@ -50,6 +50,7 @@ type fakeRuntime struct {
 	settlementSink      bool
 	pendingSettlement   bool
 	discardProposals    bool
+	commitMetrics       raftmodel.CommitMetrics
 }
 
 func newFakeRuntime(seed byte) *fakeRuntime {
@@ -131,9 +132,10 @@ func newTestServingHost(
 	})
 }
 
-func (runtime *fakeRuntime) Identity() raftmember.RuntimeIdentity { return runtime.identity }
-func (runtime *fakeRuntime) Failure() error                       { return runtime.failure }
-func (runtime *fakeRuntime) HasPendingResultSettlement() bool     { return runtime.pendingSettlement }
+func (runtime *fakeRuntime) Identity() raftmember.RuntimeIdentity   { return runtime.identity }
+func (runtime *fakeRuntime) Failure() error                         { return runtime.failure }
+func (runtime *fakeRuntime) HasPendingResultSettlement() bool       { return runtime.pendingSettlement }
+func (runtime *fakeRuntime) CommitMetrics() raftmodel.CommitMetrics { return runtime.commitMetrics }
 
 func (runtime *fakeRuntime) Propose(data []byte) error {
 	if !runtime.discardProposals {
@@ -248,6 +250,40 @@ func (runtime *fakeRuntime) DriveReady(
 	return raftmember.DriveResult{
 		Kind: step.kind, ReadyID: 1, ReadOutcomes: step.readOutcomes,
 	}, nil
+}
+
+func TestHostPublishesOnlyAuthoritativeCommitMetricDeltas(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(44)
+	runtime.commitMetrics = raftmodel.CommitMetrics{Advancements: 7, Entries: 19}
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	// Adding an already-live Runtime establishes a baseline; historical core
+	// transitions must not be attributed to this Host incarnation.
+	runtime.tickHook = func() {
+		runtime.commitMetrics.Advancements += 2
+		runtime.commitMetrics.Entries += 5
+	}
+	if err := host.RequestTick(runtime.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.Kind != ProgressTick ||
+		progress.CommitAdvancements != 2 || progress.CommittedEntries != 5 {
+		t.Fatalf("progress = %+v, done=%v err=%v", progress, done, err)
+	}
+	if err := host.RequestTick(runtime.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	runtime.tickHook = nil
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.CommitAdvancements != 0 || progress.CommittedEntries != 0 {
+		t.Fatalf("unchanged progress = %+v, done=%v err=%v", progress, done, err)
+	}
 }
 
 func TestHostUsesOneReadyWorkspaceAndExplicitSettlementSinkAtMaximumDensity(t *testing.T) {

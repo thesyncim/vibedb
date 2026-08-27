@@ -933,6 +933,16 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 	}, nil
 }
 
+// CommitMetrics returns the cumulative core-authority counters. Runtime and
+// Node share the same serialized owner, so this adds no synchronization or
+// allocation to the Raft hot path.
+func (runtime *Runtime) CommitMetrics() raftmodel.CommitMetrics {
+	if runtime == nil {
+		return raftmodel.CommitMetrics{}
+	}
+	return runtime.node.CommitMetrics()
+}
+
 // WALRetentionInput returns the certificate-backed contiguous apply cut. The
 // current append-only store uses it only as qualification evidence; a future
 // compactor must additionally prove the exact term, configuration, member
