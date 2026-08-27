@@ -914,7 +914,16 @@ func (owner *Owner) Run(ctx context.Context) error {
 				continue
 			}
 			for _, group := range owner.groups {
-				if err := owner.host.RequestTick(group); err != nil {
+				switch err := owner.host.RequestTick(group); err {
+				case nil:
+				case multiraft.ErrQueueFull, multiraft.ErrGroupBusy:
+					// A timer pulse is an offer, not an admitted protocol input.
+					// Like the bounded upstream pulse channels, omit this offer
+					// when full or intentionally quiesced/retiring. Never accrue
+					// catch-up debt or discard a tick/message already in Host.
+					// Match exact sentinels: a group fault wrapping either error
+					// remains fatal, as do missing groups and closed runtimes.
+				default:
 					return owner.stop(err)
 				}
 			}
