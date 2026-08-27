@@ -54,10 +54,10 @@ func TestRenderRF3GoldenAndSafetyContract(t *testing.T) {
 	if err := ValidateRendered(output.Bytes()); err != nil {
 		t.Fatalf("rendered contract: %v", err)
 	}
-	want := [sha256.Size]byte{0x75, 0x2d, 0x7b, 0x29, 0xe4, 0x7c, 0x39, 0x0f,
-		0x53, 0x80, 0x5f, 0x22, 0x74, 0xc0, 0xfc, 0xea,
-		0x3c, 0x04, 0x1a, 0x8f, 0xdd, 0xd3, 0x16, 0x0c,
-		0xdd, 0xe7, 0x7d, 0xca, 0xc4, 0x2d, 0xed, 0x1c}
+	want := [sha256.Size]byte{0x53, 0xf9, 0x9e, 0xee, 0xeb, 0xe7, 0x9c, 0x52,
+		0xc7, 0x9e, 0x3e, 0x97, 0xb5, 0xcd, 0xe1, 0x5e,
+		0x16, 0xb8, 0xef, 0x94, 0xcd, 0xb2, 0x8f, 0x41,
+		0x64, 0x99, 0x9a, 0x8a, 0x2f, 0xed, 0xcc, 0xdd}
 	if got := sha256.Sum256(output.Bytes()); got != want {
 		t.Fatalf("golden digest = %x; update want only after reviewing the complete manifest", got)
 	}
@@ -75,6 +75,8 @@ func TestValidateRenderedRejectsLostDurabilityAndTopologyControls(t *testing.T) 
 		{"livenessProbe:", "lostProbe:"},
 		{"{name: bootstrap, mountPath: /bootstrap, readOnly: true}", "{name: bootstrap, mountPath: /lost-bootstrap, readOnly: true}"},
 		{"- -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson", "- -catalog-route-seed=/etc/vibedb/cluster.vibejson"},
+		{"- -catalog=/var/lib/vibedb/catalog-genesis.vibejson", "- -catalog=/etc/vibedb/cluster.vibejson"},
+		{"args: [prepare-gateway,", "args: [missing-init,"},
 	} {
 		raw := strings.Replace(output.String(), mutation.old, mutation.replacement, 1)
 		if err := ValidateRendered([]byte(raw)); err != ErrManifest {

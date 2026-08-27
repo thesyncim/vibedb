@@ -93,7 +93,7 @@ func Render(writer io.Writer, config Config) error {
 		}
 	}
 	_, err := fmt.Fprintf(writer, kubeGatewayTemplate,
-		config.Namespace, config.Namespace, config.Namespace, config.Namespace, config.Image,
+		config.Namespace, config.Namespace, config.Namespace, config.Namespace, config.Image, config.Image,
 		config.ShardNodeIDs[0], config.ShardNodeIDs[1], config.ShardNodeIDs[2],
 		config.ShardNodeIDs[3], config.ShardNodeIDs[4], config.ShardNodeIDs[5],
 		config.ShardNodeIDs[6], config.ShardNodeIDs[7], config.ShardNodeIDs[8],
@@ -262,13 +262,22 @@ spec:
         fsGroup: 65532
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        - name: prepare-catalog
+          image: %s
+          command: [vibedb-operator]
+          args: [prepare-gateway, -catalog-source=/etc/vibedb/cluster.vibejson, -catalog-target=/var/lib/vibedb/catalog-genesis.vibejson]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/vibedb}
+            - {name: config, mountPath: /etc/vibedb, readOnly: true}
       containers:
         - name: gateway
           image: %s
           command: [vibedb-gateway]
           args:
             - serve
-            - -catalog=/etc/vibedb/cluster.vibejson
+            - -catalog=/var/lib/vibedb/catalog-genesis.vibejson
             - -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson
             - -catalog-bootstrap-if-missing
             - -catalog-relation=1

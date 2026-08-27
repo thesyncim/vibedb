@@ -44,6 +44,11 @@ catalog ordinals 0–2, ledger ordinals 0–2, then data ordinals 0–2.
 
 The ConfigMaps are bootstrap inputs, not live authority. Changing one does not
 rewrite an existing PVC's sealed identities or durable membership.
+The gateway init container validates and atomically pins the generation-one
+catalog to a regular file on its PVC. Restarts require the same seed; a changed
+ConfigMap is rejected rather than replacing the immutable catalog. The serving
+process retains its strict separation between that seed and the mutable route
+seed, without accepting Kubernetes projection symlinks as durable authority.
 
 Automatic splitting is not enabled by this Kubernetes bootstrap. It emits an
 explicit empty `split_sources` inventory because the init containers have not

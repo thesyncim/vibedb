@@ -19,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: vibedb-operator adopt-restore|bootstrap|render|prepare|restore-group|validate")
+		fmt.Fprintln(os.Stderr, "usage: vibedb-operator adopt-restore|bootstrap|render|prepare|prepare-gateway|restore-group|validate")
 		os.Exit(2)
 	}
 	var err error
@@ -32,6 +32,8 @@ func main() {
 		err = render(os.Args[2:])
 	case "prepare":
 		err = prepare(os.Args[2:])
+	case "prepare-gateway":
+		err = prepareGateway(os.Args[2:])
 	case "restore-group":
 		err = restoreGroup(os.Args[2:])
 	case "validate":
@@ -43,6 +45,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "vibedb-operator: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+func prepareGateway(arguments []string) error {
+	flags := flag.NewFlagSet("prepare-gateway", flag.ContinueOnError)
+	source := flags.String("catalog-source", "", "read-only projected generation-one catalog")
+	target := flags.String("catalog-target", "", "regular immutable generation-one catalog on gateway PVC")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("prepare-gateway accepts no positional arguments")
+	}
+	return kubeoperator.PrepareGatewaySeed(*source, *target)
 }
 
 func adoptRestore(arguments []string) error {

@@ -83,6 +83,12 @@ func TestPrepareRejectsRelativeDirectoriesAndSymlinkResume(t *testing.T) {
 }
 
 func TestRenderAndPrepareRejectPositionalArguments(t *testing.T) {
+	if err := prepareGateway([]string{"junk"}); err == nil {
+		t.Fatal("prepare-gateway positional argument accepted")
+	}
+	if err := prepareGateway([]string{"-catalog-source=relative", "-catalog-target=/tmp/catalog"}); err == nil {
+		t.Fatal("prepare-gateway relative source accepted")
+	}
 	if err := render([]string{"junk"}); err == nil {
 		t.Fatal("render positional argument accepted")
 	}

@@ -63,7 +63,7 @@ func ValidateRendered(raw []byte) error {
 			return ErrManifest
 		}
 	}
-	for _, required := range []string{"- -catalog-bootstrap-if-missing", "- -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson", "- -durable-ack-key=/run/secrets/vibedb/durable-ack-key", "{name: control, port: 7401, targetPort: control}", "{name: control, containerPort: 7401}"} {
+	for _, required := range []string{"- -catalog-bootstrap-if-missing", "- -catalog=/var/lib/vibedb/catalog-genesis.vibejson", "args: [prepare-gateway, -catalog-source=/etc/vibedb/cluster.vibejson, -catalog-target=/var/lib/vibedb/catalog-genesis.vibejson]", "- -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson", "- -durable-ack-key=/run/secrets/vibedb/durable-ack-key", "{name: control, port: 7401, targetPort: control}", "{name: control, containerPort: 7401}"} {
 		if !bytes.Contains(raw, []byte(required)) {
 			return ErrManifest
 		}
