@@ -43,8 +43,10 @@ type RestoreGroupResult struct {
 }
 
 type restoreSchemaSet struct {
-	Format uint16              `json:"format"`
-	Groups []restoreSchemaSlot `json:"groups"`
+	Format  uint16              `json:"format"`
+	Groups  []restoreSchemaSlot `json:"groups"`
+	Catalog []byte              `json:"catalog"`
+	Policy  []byte              `json:"policy"`
 }
 
 type restoreSchemaSlot struct {
@@ -61,6 +63,8 @@ type restoreSchemaTemplate struct {
 	DDL                  []string                     `json:"ddl"`
 	GlobalIndexes        []restoreGlobalIndexTemplate `json:"global_indexes"`
 	Apply                bootstrapApply               `json:"apply"`
+	projection           []replicatedstate.ProjectionRow
+	relationDigest       [32]byte
 }
 
 type restoreGlobalIndexTemplate struct {
@@ -154,7 +158,26 @@ func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupR
 		sha256.Sum256(config.Template) != config.Operation.TargetCatalogDigest {
 		return RestoreGroupResult{}, ErrBootstrap
 	}
+	operationRaw, err := clusterrestore.AppendOperation(nil, config.Operation)
+	if err != nil {
+		return RestoreGroupResult{}, err
+	}
+	sealed, err := clusterrestore.OpenOperation(operationRaw)
+	if err != nil || sealed.Digest != config.Operation.Digest {
+		return RestoreGroupResult{}, ErrBootstrap
+	}
 	template, err := openRestoreSchemaSet(config.Template, config.Operation, config.Ordinal)
+	if err != nil {
+		return RestoreGroupResult{}, err
+	}
+	projection, err := openRestoreCatalogProjection(config.Template, config.Operation)
+	if err != nil {
+		return RestoreGroupResult{}, err
+	}
+	if config.Ordinal == config.Operation.CatalogOrdinal {
+		template.projection = projection
+	}
+	template.relationDigest, err = restorePlannedRelationDigest(config.Template, template)
 	if err != nil {
 		return RestoreGroupResult{}, err
 	}
@@ -187,6 +210,10 @@ func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupR
 // catalog, ledger, and user groups to retain different explicit schemas.
 func ValidateRestoreSchemaSet(raw []byte, operation clusterrestore.Operation, ordinal uint32) error {
 	_, err := openRestoreSchemaSet(raw, operation, ordinal)
+	if err != nil {
+		return err
+	}
+	_, err = openRestoreCatalogProjection(raw, operation)
 	return err
 }
 
@@ -322,6 +349,9 @@ func (f *restoreReplicaFactory) OpenReplica(
 		operation.Certificate.Groups[group].RelationManifestDigest != manifest.RelationManifestDigest {
 		return restoreservice.ReplicaRoot{}, ErrBootstrap
 	}
+	if (group == operation.CatalogOrdinal) != (f.template.projection != nil) {
+		return restoreservice.ReplicaRoot{}, ErrBootstrap
+	}
 	directory := filepath.Join(f.root, "roots", fmt.Sprintf("group-%08d", group), "replica-"+strconv.Itoa(int(replica+1)))
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return restoreservice.ReplicaRoot{}, err
@@ -343,9 +373,9 @@ func (f *restoreReplicaFactory) OpenReplica(
 	if err != nil {
 		return restoreservice.ReplicaRoot{}, err
 	}
-	if manifest.Bundle {
+	if manifest.Bundle || f.template.relationDigest != ([32]byte{}) {
 		digest, digestErr := sqldriver.ReplicatedRelationManifestDigest(identity)
-		if digestErr != nil || digest != manifest.RelationManifestDigest {
+		if digestErr != nil || manifest.Bundle && digest != manifest.RelationManifestDigest || f.template.relationDigest != ([32]byte{}) && digest != f.template.relationDigest {
 			_ = database.Close()
 			return restoreservice.ReplicaRoot{}, errors.Join(ErrBootstrap, digestErr)
 		}
@@ -371,12 +401,13 @@ func (f *restoreReplicaFactory) OpenReplica(
 	bootstrap := restoreRF3Bootstrap(operation, group, f.templateDigest)
 	root := restoreservice.ReplicaRoot{
 		Database: database, Identity: identity, ApplyOptions: options, Bootstrap: bootstrap,
+		Projection: f.template.projection,
 	}
 	root.Recover = func(ctx context.Context, source replicatedstate.SnapshotArtifactManifest) (
 		sqldriver.ReplicatedChildActivation, [sha256.Size]byte, bool, error,
 	) {
 		return recoverRestoreReplica(ctx, receiptPath, database, identity, options, bootstrap,
-			operation, group, replica, source)
+			operation, group, replica, source, f.template.projection)
 	}
 	root.Commit = func(ctx context.Context, activation sqldriver.ReplicatedChildActivation) ([sha256.Size]byte, error) {
 		digest, commitErr := commitRestoreReplica(ctx, receiptPath, allocation, identity, activation, operation, group, replica)
@@ -538,6 +569,7 @@ func recoverRestoreReplica(
 	options sqldriver.ReplicatedApplyOptions, bootstrap *pb.Snapshot,
 	operation clusterrestore.Operation, group uint32, replica uint8,
 	source replicatedstate.SnapshotArtifactManifest,
+	projection []replicatedstate.ProjectionRow,
 ) (sqldriver.ReplicatedChildActivation, [sha256.Size]byte, bool, error) {
 	if cause := context.Cause(ctx); cause != nil {
 		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, cause
@@ -551,7 +583,14 @@ func recoverRestoreReplica(
 		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, err
 	}
 	certificate, err := replicatedstate.OpenSnapshotBase(&snapshot)
-	if err != nil || certificate.Manifest.ImageDigest != source.ImageDigest {
+	if err != nil {
+		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, err
+	}
+	expectedImage := source.ImageDigest
+	if projection != nil {
+		expectedImage, err = replicatedstate.ProjectionImageDigest(identity.UserTable, receipt.Apply.ValidationDigest, projection)
+	}
+	if err != nil || certificate.Manifest.ImageDigest != expectedImage {
 		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, errors.Join(ErrBootstrap, err)
 	}
 	activation, resumed, err := database.ResumeReplicatedSnapshotActivation(identity, certificate.Manifest, bootstrap, options)

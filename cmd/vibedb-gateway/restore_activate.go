@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -110,6 +111,15 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	snapshot, err := gateway.LoadSnapshot(manifest.TargetCatalog)
 	if err != nil {
 		return clusterrestore.ServingPermit{}, err
+	}
+	sealedSnapshot, err := kubeoperator.RestoreTargetCatalog(schemas, operation)
+	if err != nil {
+		return clusterrestore.ServingPermit{}, err
+	}
+	actualCatalog, err := gateway.AppendSnapshotDocument(nil, snapshot)
+	sealedCatalog, sealedErr := gateway.AppendSnapshotDocument(nil, sealedSnapshot)
+	if err != nil || sealedErr != nil || !bytes.Equal(actualCatalog, sealedCatalog) {
+		return clusterrestore.ServingPermit{}, gateway.ErrRestoreActivation
 	}
 	for _, path := range []string{manifest.ActivationRoot, filepath.Dir(manifest.Sessions[0].Journal), filepath.Dir(manifest.Sessions[1].Journal)} {
 		if err = ensureGatewayRestoreDirectory(path); err != nil {

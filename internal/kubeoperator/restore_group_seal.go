@@ -76,7 +76,7 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 	}
 	factory := restoreReplicaFactory{root: config.Root, template: template, templateDigest: config.Operation.TargetCatalogDigest}
 	if !factory.manifestMatchesTemplate(source) || string(source.UserCollection) != template.BaseTable ||
-		seal.Witness.ArtifactManifest != source.Digest || seal.Witness.SanitizedImageDigest != source.ImageDigest ||
+		seal.Witness.ArtifactManifest != source.Digest || template.projection == nil && seal.Witness.SanitizedImageDigest != source.ImageDigest ||
 		seal.Witness.SnapshotIndex != cut.SnapshotIndex || seal.Witness.SnapshotTerm != cut.SnapshotTerm ||
 		seal.Witness.TargetGroup != restoreEncodedTargetGroup(config.Operation, config.Ordinal) {
 		return RestoreGroupResult{}, true, ErrBootstrap
@@ -108,6 +108,14 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 			}
 		}
 		certificate, certificateErr := replicatedstate.OpenSnapshotBase(state.SnapshotBase)
+		expectedImage := source.ImageDigest
+		if template.projection != nil {
+			var imageErr error
+			expectedImage, imageErr = replicatedstate.ProjectionImageDigest(template.BaseTable, state.Apply.ValidationDigest, template.projection)
+			if imageErr != nil {
+				return RestoreGroupResult{}, true, imageErr
+			}
+		}
 		options, optionsErr := restoreApplyOptions(template.Apply)
 		expectedBinding := replicatedstate.Binding{
 			ClusterID: replication.ID128(binding.ClusterID), ClusterIncarnation: replication.ID128(binding.ClusterIncarnation),
@@ -119,14 +127,14 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 		}
 		if certificateErr != nil || certificate.Digest != seal.Witness.GenesisProof ||
 			optionsErr != nil || certificate.Manifest.State.Binding != expectedBinding || certificate.Manifest.SystemRows != 1 || certificate.Manifest.CaptureRows != 0 ||
-			certificate.Manifest.ImageDigest != source.ImageDigest || certificate.Manifest.RelationManifestDigest != source.RelationManifestDigest ||
+			certificate.Manifest.ImageDigest != expectedImage || seal.Witness.SanitizedImageDigest != expectedImage || certificate.Manifest.RelationManifestDigest != source.RelationManifestDigest ||
 			certificate.Manifest.State.Applied != source.State.Applied || certificate.Manifest.State.LastTerm != source.State.LastTerm ||
 			!proto.Equal(certificate.StaticBootstrap, restoreRF3Bootstrap(config.Operation, config.Ordinal, config.Operation.TargetCatalogDigest)) {
 			return RestoreGroupResult{}, true, errors.Join(ErrBootstrap, certificateErr)
 		}
-		if source.Bundle {
+		if source.Bundle || template.relationDigest != ([32]byte{}) {
 			manifestDigest, digestErr := sqldriver.ReplicatedRelationManifestDigest(state.Identity)
-			if digestErr != nil || manifestDigest != source.RelationManifestDigest {
+			if digestErr != nil || source.Bundle && manifestDigest != source.RelationManifestDigest || template.relationDigest != ([32]byte{}) && manifestDigest != template.relationDigest {
 				return RestoreGroupResult{}, true, errors.Join(ErrBootstrap, digestErr)
 			}
 		}

@@ -31,8 +31,11 @@ type ReplicaRoot struct {
 	Identity     sqldriver.ReplicatedShardStoreIdentity
 	ApplyOptions sqldriver.ReplicatedApplyOptions
 	Bootstrap    *pb.Snapshot
-	Recover      func(context.Context, replicatedstate.SnapshotArtifactManifest) (sqldriver.ReplicatedChildActivation, [sha256.Size]byte, bool, error)
-	Commit       func(context.Context, sqldriver.ReplicatedChildActivation) ([sha256.Size]byte, error)
+	// Projection replaces all source user rows for an explicitly catalog-role
+	// restore. It is authenticated by the factory's sealed target plan.
+	Projection []replicatedstate.ProjectionRow
+	Recover    func(context.Context, replicatedstate.SnapshotArtifactManifest) (sqldriver.ReplicatedChildActivation, [sha256.Size]byte, bool, error)
+	Commit     func(context.Context, sqldriver.ReplicatedChildActivation) ([sha256.Size]byte, error)
 }
 
 // ReplicaFactory provisions or reopens the exact fresh physical root selected
@@ -147,6 +150,7 @@ func (installer GroupInstaller) Install(
 		}
 		if replica == 0 {
 			witness.GenesisProof = certificate.Digest
+			witness.SanitizedImageDigest = certificate.Manifest.ImageDigest
 		} else if witness.GenesisProof != certificate.Digest {
 			return clusterrestore.RootWitness{}, ErrInstaller
 		}
@@ -164,9 +168,12 @@ func installReplica(
 	if err != nil {
 		return sqldriver.ReplicatedChildActivation{}, err
 	}
-	stage, _, err := root.Database.OpenReplicatedRestoreStage(
-		root.Identity, manifest, cursor, root.ApplyOptions,
-	)
+	var stage *sqldriver.ReplicatedRestoreStage
+	if root.Projection != nil {
+		stage, _, err = root.Database.OpenReplicatedRestoreProjection(root.Identity, manifest, cursor, root.ApplyOptions, root.Projection)
+	} else {
+		stage, _, err = root.Database.OpenReplicatedRestoreStage(root.Identity, manifest, cursor, root.ApplyOptions)
+	}
 	if err != nil {
 		return sqldriver.ReplicatedChildActivation{}, err
 	}

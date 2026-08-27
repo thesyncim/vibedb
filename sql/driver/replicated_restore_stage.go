@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -38,6 +39,7 @@ type ReplicatedRestoreStage struct {
 	complete     bool
 	closed       bool
 	activation   ReplicatedChildActivation
+	projection   []replicatedstate.ProjectionRow
 }
 
 // OpenReplicatedRestoreStage opens or resumes a fresh destination import.
@@ -49,6 +51,41 @@ func (d *Database) OpenReplicatedRestoreStage(
 	source replicatedstate.SnapshotArtifactManifest,
 	persistedCursor []byte,
 	applyOptions ReplicatedApplyOptions,
+) (*ReplicatedRestoreStage, ReplicatedApplyIdentity, error) {
+	return d.openReplicatedRestoreStage(expected, source, persistedCursor, applyOptions, nil)
+}
+
+// OpenReplicatedRestoreProjection authenticates but discards every source row
+// and installs only the caller's operation-bound, ordered singleton projection.
+// The caller must authenticate the projection before acquiring this owner.
+func (d *Database) OpenReplicatedRestoreProjection(expected ReplicatedShardStoreIdentity,
+	source replicatedstate.SnapshotArtifactManifest, persistedCursor []byte,
+	applyOptions ReplicatedApplyOptions, rows []replicatedstate.ProjectionRow,
+) (*ReplicatedRestoreStage, ReplicatedApplyIdentity, error) {
+	if expected.RelationCount != 1 || len(rows) == 0 || applyOptions.TxnLimits.MaxDocuments <= 0 || applyOptions.TxnLimits.MaxBytes <= 0 || uint64(len(rows)) > uint64(applyOptions.TxnLimits.MaxDocuments) {
+		return nil, ReplicatedApplyIdentity{}, ErrReplicatedRestoreStageProof
+	}
+	var total uint64
+	for i, row := range rows {
+		if len(row.Key) == 0 || len(row.Key) > replication.MaxMutationKeyBytes || len(row.Value) == 0 || len(row.Value) > replication.MaxMutationValueBytes || i > 0 && bytes.Compare(rows[i-1].Key, row.Key) >= 0 {
+			return nil, ReplicatedApplyIdentity{}, ErrReplicatedRestoreStageProof
+		}
+		width := uint64(len(row.Key)) + uint64(len(row.Value))
+		if width > uint64(applyOptions.TxnLimits.MaxBytes)-total {
+			return nil, ReplicatedApplyIdentity{}, ErrReplicatedRestoreStageProof
+		}
+		total += width
+	}
+	owned := make([]replicatedstate.ProjectionRow, len(rows))
+	for i, row := range rows {
+		owned[i] = replicatedstate.ProjectionRow{Key: bytes.Clone(row.Key), Value: bytes.Clone(row.Value)}
+	}
+	return d.openReplicatedRestoreStage(expected, source, persistedCursor, applyOptions, owned)
+}
+
+func (d *Database) openReplicatedRestoreStage(expected ReplicatedShardStoreIdentity,
+	source replicatedstate.SnapshotArtifactManifest, persistedCursor []byte,
+	applyOptions ReplicatedApplyOptions, projection []replicatedstate.ProjectionRow,
 ) (*ReplicatedRestoreStage, ReplicatedApplyIdentity, error) {
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, ReplicatedApplyIdentity{}, err
@@ -126,17 +163,29 @@ func (d *Database) OpenReplicatedRestoreStage(
 	if core.checkpointGroup == nil && core.replicatedApplyCollection.Len() != 0 {
 		return nil, identity, ErrReplicatedRestoreStageProof
 	}
-	if cursor != nil && !restoreRowsCoverPrefix(core, expected, cursor.PrefixManifest()) {
+	if projection == nil && cursor != nil && !restoreRowsCoverPrefix(core, expected, cursor.PrefixManifest()) {
 		return nil, identity, ErrReplicatedRestoreStageProof
 	}
 	table := core.tables[expected.UserTable]
 	if table == nil || table.collection == nil {
 		return nil, identity, ErrReplicatedApplyMismatch
 	}
+	if projection != nil && !restoreProjectionPrefix(table.collection, projection) {
+		return nil, identity, ErrReplicatedRestoreStageProof
+	}
+	if projection != nil {
+		validator := newReplicatedSQLMutationValidator(expected, table, identity.Placement)
+		for _, row := range projection {
+			if validator.ValidatePut(row.Key, row.Value) != replicatedstate.MutationValidationAccept {
+				return nil, identity, ErrReplicatedRestoreStageProof
+			}
+		}
+	}
 	stage := &ReplicatedRestoreStage{
 		owner: connector, database: core, table: table, base: expected, identity: identity,
 		source: source.Clone(), cursor: cursor,
-		payload: make([]byte, 0, replicatedstate.DefaultSnapshotArtifactChunkBytes),
+		projection: projection,
+		payload:    make([]byte, 0, replicatedstate.DefaultSnapshotArtifactChunkBytes),
 	}
 	core.replicatedRestoreStageClaim = stage
 	core.replicatedSeedPending = true
@@ -218,7 +267,7 @@ func (s *ReplicatedRestoreStage) Receive(r io.Reader, persist replicatedstate.Sn
 		r, s.cursor, replicatedstate.SnapshotArtifactCallbacks{
 			PayloadBuffer: s.payload,
 			Rows: func(_ replicatedstate.SnapshotArtifactCheckpoint, rows replicatedstate.SnapshotArtifactRows) error {
-				if rows.Collection() != replicatedstate.SnapshotArtifactUser {
+				if s.projection != nil || rows.Collection() != replicatedstate.SnapshotArtifactUser {
 					return nil
 				}
 				collection, lookupErr := s.relationCollection(int(rows.Relation()))
@@ -309,6 +358,20 @@ func restoreApplyRows(collection *durable.Collection, rows replicatedstate.Snaps
 	return nil
 }
 
+func restoreProjectionPrefix(collection *durable.Collection, rows []replicatedstate.ProjectionRow) bool {
+	var foundRows uint64
+	for _, row := range rows {
+		value, found, err := collection.AppendRaw(nil, row.Key)
+		if err != nil || found && !bytes.Equal(value, row.Value) {
+			return false
+		}
+		if found {
+			foundRows++
+		}
+	}
+	return collection.Len() == foundRows
+}
+
 // Activate audits the imported relation image, synthesizes destination-owned
 // state at cut, certifies it with a fresh checkpoint group, and returns a
 // non-serving apply claim plus snapshot base. The caller must still initialize
@@ -345,6 +408,19 @@ func (s *ReplicatedRestoreStage) Activate(
 	relations, err := replicatedApplyRelations(s.base, s.identity, core, claim)
 	if err != nil {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedRestoreStageProof, err)
+	}
+	if s.projection != nil {
+		if !restoreProjectionPrefix(s.table.collection, s.projection) {
+			return ReplicatedChildActivation{}, ErrReplicatedRestoreStageProof
+		}
+		for _, row := range s.projection {
+			if relations[0].Target.Validator.ValidatePut(row.Key, row.Value) != replicatedstate.MutationValidationAccept {
+				return ReplicatedChildActivation{}, ErrReplicatedRestoreStageProof
+			}
+			if err := s.table.collection.Update(func(batch *durable.WriteBatch) error { return batch.Put(row.Key, row.Value) }); err != nil {
+				return ReplicatedChildActivation{}, err
+			}
+		}
 	}
 	members, err := replicatedApplyCheckpointMembers(s.base, core)
 	if err != nil {

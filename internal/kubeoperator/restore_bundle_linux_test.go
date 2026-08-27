@@ -18,7 +18,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
-	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -105,7 +104,12 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	}
 	sourceGroup := raftmember.GroupKey{ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch, ShardIncarnation: binding.ShardIncarnation, GroupID: binding.GroupID}
-	certificate, err := clusterbackup.Certify([32]byte{9}, clusterbackup.CatalogCut{Generation: 1, Digest: [32]byte{10}, PolicyGeneration: 1, Groups: []raftmember.GroupKey{sourceGroup}}, []clusterbackup.GroupCut{groupCut})
+	catalogGroup := sourceGroup
+	catalogGroup.GroupID[0]++
+	catalogCut := groupCut
+	catalogCut.Group = catalogGroup
+	catalogCut.RelationManifestDigest = [32]byte{}
+	certificate, err := clusterbackup.Certify([32]byte{9}, clusterbackup.CatalogCut{Generation: 1, Digest: [32]byte{10}, PolicyGeneration: 1, Groups: []raftmember.GroupKey{sourceGroup, catalogGroup}}, []clusterbackup.GroupCut{groupCut, catalogCut})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,15 +120,26 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	evidence := []clusterbackup.ArtifactEvidence{{Group: groupCut.Group, SnapshotIndex: groupCut.SnapshotIndex, SnapshotTerm: groupCut.SnapshotTerm,
 		Lineage: groupCut.Lineage, RelationManifestDigest: groupCut.RelationManifestDigest, ArtifactHash: groupCut.ArtifactHash,
 		ArtifactBytes: groupCut.ArtifactBytes, ArtifactManifestDigest: groupCut.ArtifactManifestDigest}}
+	evidence = append(evidence, clusterbackup.ArtifactEvidence{Group: catalogCut.Group, SnapshotIndex: catalogCut.SnapshotIndex, SnapshotTerm: catalogCut.SnapshotTerm, Lineage: catalogCut.Lineage, RelationManifestDigest: catalogCut.RelationManifestDigest, ArtifactHash: catalogCut.ArtifactHash, ArtifactBytes: catalogCut.ArtifactBytes, ArtifactManifestDigest: catalogCut.ArtifactManifestDigest})
 	permit, err := clusterbackup.AdmitRestore(certificate, evidence, [32]byte{15}, target.Group.ClusterID, target.Group.ClusterIncarnation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	schemaRaw, err := vibejson.Marshal(&restoreSchemaSet{Format: 1, Groups: []restoreSchemaSlot{{Ordinal: 0, Schema: template}}})
-	if err != nil {
-		t.Fatal(err)
+	catalogTarget := target
+	catalogTarget.Group.GroupID[0]++
+	catalogTarget.Group.ShardIncarnation[0]++
+	for i := range catalogTarget.Replicas {
+		catalogTarget.Replicas[i].Node[0] += 10
+		catalogTarget.Replicas[i].Store[0] += 10
 	}
-	operation, err = clusterrestore.NewOperation(permit, certificate, 0, 1, [32]byte{16}, [32]byte{17}, sha256.Sum256(schemaRaw), []clusterrestore.TargetGroup{target})
+	catalogTemplate := validRestoreTestTemplate()
+	catalogTemplate.Distribution = "catalog"
+	catalogTemplate.Shard = "controlplane"
+	catalogTemplate.BaseTable = "controlplane"
+	catalogTemplate.DDL = []string{"CREATE TABLE controlplane (PRIMARY KEY (id))"}
+	targets := []clusterrestore.TargetGroup{target, catalogTarget}
+	schemaRaw, policy := restoreTestSchemaProjection(t, []restoreSchemaTemplate{template, catalogTemplate}, clusterrestore.Operation{Targets: targets, Certificate: certificate})
+	operation, err = clusterrestore.NewOperation(permit, certificate, 1, 1, [32]byte{16}, sha256.Sum256(policy), sha256.Sum256(schemaRaw), targets)
 	if err != nil {
 		t.Fatal(err)
 	}
