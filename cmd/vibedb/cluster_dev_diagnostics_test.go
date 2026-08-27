@@ -198,9 +198,54 @@ func TestDevSupervisorStopsChildrenAppendedAfterDeferredCleanup(t *testing.T) {
 	for i, target := range []*[]devClusterMember{&m.Members, &m.LedgerMembers, &m.DataMembers} {
 		*target = []devClusterMember{{Member: 1, ServeManifest: filepath.Join(root, strconv.Itoa(i))}}
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-	if err := serveDevCluster(ctx, m, binary, "unused"); err != nil {
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		result <- serveDevCluster(ctx, m, binary, "unused")
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Error("supervisor did not stop after cancellation")
+		}
+	})
+	// Wait for actual child startup, not a fixed sleep that can expire before
+	// readiness is consumed on a busy test host. Cancellation may reach either
+	// the readiness wait or the serving wait; both must reap every child.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		started := 0
+		for i := 0; i < 3; i++ {
+			if raw, err := os.ReadFile(filepath.Join(root, strconv.Itoa(i)+".pid")); err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 {
+					started++
+				}
+			}
+		}
+		if started == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("supervisor did not start all three children")
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("supervisor stopped before child startup: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	var stopErr error
+	select {
+	case stopErr = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not reap children")
+	}
+	if err := stopErr; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
