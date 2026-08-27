@@ -70,11 +70,11 @@ The root module contains 68 non-test Go files that import `unsafe`:
 
 ```text
 autosplit/recorder.go
+cmd/vibedb-gateway/serve_request_wire.go
 gateway/catalog.go
 gateway/index_metadata.go
 gateway/replicated_request_ledger_stream_reader.go
 gateway/replicated_table.go
-gateway/replicated_transaction.go
 internal/distributedtxn/replicated_codec.go
 internal/raftstore/preallocate_windows.go
 internal/rafttransport/frame.go
