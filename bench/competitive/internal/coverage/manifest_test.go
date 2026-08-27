@@ -57,6 +57,28 @@ func TestBenchmarkCoverageManifestCoversRequiredMatrix(t *testing.T) {
 	}
 }
 
+// TestBenchmarkCoverageExitGateIsComplete keeps the review exit criterion
+// executable. Adding a required cell, or weakening an existing cell back to a
+// diagnostic/gap, must fail CI until a dedicated evidence harness exists.
+func TestBenchmarkCoverageExitGateIsComplete(t *testing.T) {
+	manifest := BenchmarkCoverageManifest()
+	implemented, diagnostic, gaps := 0, 0, 0
+	for _, lane := range manifest {
+		switch lane.Status {
+		case CoverageImplemented:
+			implemented++
+		case CoverageDiagnostic:
+			diagnostic++
+		case CoverageGap:
+			gaps++
+		}
+	}
+	if implemented != 38 || diagnostic != 0 || gaps != 0 {
+		t.Fatalf("competitive evidence exit gate = %d implemented/%d diagnostic/%d gaps; want 38/0/0",
+			implemented, diagnostic, gaps)
+	}
+}
+
 func TestBenchmarkCoverageClaimsRequireExecutableEvidence(t *testing.T) {
 	seen := make(map[string]struct{})
 	for _, lane := range BenchmarkCoverageManifest() {

@@ -9,6 +9,29 @@ concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  repository-contracts:
+    name: repository contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Reject stale generated contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go generate ./internal/buildgate ./internal/featurestate
+          (cd bench/competitive && go generate .)
+          git diff --exit-code -- \
+            internal/buildgate/manifest_generated.go \
+            docs/distributed-feature-state.md \
+            bench/competitive/COVERAGE.md
+      - name: Require complete competitive evidence matrix
+        working-directory: bench/competitive
+        run: go test -count=1 ./internal/coverage
   test:
     name: test (${{ matrix.runner }})
     strategy:
@@ -31,6 +54,15 @@ jobs:
           GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...
           (cd integration/pgclient && GOOS=linux GOARCH=386 go test -run '^$' -exec=true ./...)
           (cd integration/pgclient && GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...)
+      - name: Cross-compile Windows 64-bit packages and tests
+        if: matrix.runner == 'ubuntu-latest'
+        env:
+          CGO_ENABLED: 0
+        run: |
+          GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./...
+          GOOS=windows GOARCH=arm64 go test -run '^$' -exec=true ./...
+          (cd integration/pgclient && GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./...)
+          (cd integration/pgclient && GOOS=windows GOARCH=arm64 go test -run '^$' -exec=true ./...)
       - name: Tests
         # Durable-backed package tests reserve large mmap arenas. Serializing
         # package binaries keeps the aggregate virtual-memory reservation
@@ -326,3 +358,24 @@ jobs:
           go-version: '1.26'
       - name: Focused LATERAL race tests
         run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
+  distributed-race:
+    name: race (distributed serving)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Distributed serving race tests
+        # External qualification corpora have dedicated no-skip Linux jobs in
+        # the test matrix. This lane instruments the serving, quorum, durable
+        # ledger, and snapshot concurrency paths without duplicating those
+        # multi-process resource gates under race overhead.
+        run: >-
+          go test -race -p=1 -count=1 -timeout=30m
+          ./gateway
+          ./internal/multiraft
+          ./internal/raftservice
+          ./internal/replicatedstate
+          ./internal/snapshottransfer
