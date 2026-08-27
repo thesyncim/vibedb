@@ -434,8 +434,14 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	}
 	servingAddresses := append([]string(nil), nativeAddresses[:]...)
 	servingNodes := append([]rafttransport.NodeID(nil), nodes[:]...)
+	observationClient, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
+		Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	learnerState := rf3CommandApplyMembership(
-		t, servingAddresses, servingNodes, clientProfile, authorityIdentity, group,
+		t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration,
 		shardservice.ReplicatedMembershipRequest{
 			Kind: raftservice.MembershipAddLearner, TransitionID: grant.TransitionID,
@@ -503,12 +509,6 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	); err == nil {
 		t.Fatal("learner target served native traffic")
 	}
-	observationClient, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
-		Opener: opener, ReadDeadline: networkDeadline, WriteDeadline: networkDeadline,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	observationRequest := replicacontrol.Request{
 		Operation: [32]byte{0x61}, Step: [32]byte{0x62}, Group: group,
 		TargetMember: 4, ExpectedReplicaSetVersion: learnerState.Fence.Command.ReplicaSetVersion,
@@ -537,7 +537,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			leaderObservation, targetObservation, err)
 	}
 	promotedState := rf3CommandApplyMembership(
-		t, servingAddresses, servingNodes, clientProfile, authorityIdentity, group,
+		t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration,
 		shardservice.ReplicatedMembershipRequest{
 			Kind: raftservice.MembershipPromoteVoter, TransitionID: grant.TransitionID,
@@ -607,7 +607,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if leaderState.LeaderID == grant.SourceMember {
 		beforeTerm := leaderState.Fence.Term
 		_ = rf3CommandApplyMembership(
-			t, servingAddresses, servingNodes, clientProfile, authorityIdentity, group,
+			t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 			rf3CommandStoreIdentity(1).AllocationGeneration,
 			shardservice.ReplicatedMembershipRequest{
 				Kind: raftservice.MembershipTransferLeader, TransitionID: grant.TransitionID,
@@ -622,6 +622,14 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		)
 		removeRequest.ExpectedReplicaSetVersion = leaderState.Fence.Command.ReplicaSetVersion
 		removeRequest.TransferTerm = leaderState.Fence.Term
+		removeObservationRequest := replicacontrol.Request{
+			Operation: sha256.Sum256(removeRequest.TransitionID[:]), Step: [32]byte{0x6d, byte(removeRequest.Kind)},
+			Group: group, TargetMember: removeRequest.TargetMember, ExpectedReplicaSetVersion: removeRequest.ExpectedReplicaSetVersion,
+		}
+		beforeRemoval, err := observationClient.Observe(t.Context(), targetNode, removeObservationRequest)
+		if err != nil {
+			t.Fatalf("observe target leader before removal: %v", err)
+		}
 		response := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedMembership, Authority: authorityIdentity,
@@ -635,10 +643,18 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		if response.Kind != shardservice.ReplicatedMembershipAccepted {
 			t.Fatalf("target-leader removal response: %+v", response)
 		}
+		settlementContext, cancelSettlement := context.WithTimeout(t.Context(), 30*time.Second)
+		_, settleErr := rf3AwaitMembershipSettlement(settlementContext, beforeRemoval, removeRequest,
+			rf3MembershipNetworkObserver(observationClient, target.NativeAddress, targetNode, clientProfile,
+				authorityIdentity, rf3CommandStoreIdentity(1).AllocationGeneration, removeObservationRequest))
+		cancelSettlement()
+		if settleErr != nil {
+			t.Fatalf("accepted target-leader removal did not settle: %v", settleErr)
+		}
 	} else {
 		removeRequest.TransferTerm = leaderState.Fence.Term
 		_ = rf3CommandApplyMembership(
-			t, servingAddresses, servingNodes, clientProfile, authorityIdentity, group,
+			t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 			rf3CommandStoreIdentity(1).AllocationGeneration, removeRequest,
 		)
 	}
@@ -1050,6 +1066,7 @@ func rf3CommandApplyMembership(
 	addresses []string,
 	nodes []rafttransport.NodeID,
 	profile *rafttransport.PeerTLS,
+	observer *replicacontrol.Client,
 	authority serviceauthz.Authority,
 	group raftmember.GroupKey,
 	allocation uint64,
@@ -1057,12 +1074,24 @@ func rf3CommandApplyMembership(
 ) shardservice.ReplicatedMemberState {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
 	for time.Now().Before(deadline) {
 		leader, state := rf3CommandFindLeader(
 			t, addresses, nodes, profile, authority.Node, group, allocation,
 			authority.Generation,
 		)
 		request.ExpectedReplicaSetVersion = state.Fence.Command.ReplicaSetVersion
+		observationRequest := replicacontrol.Request{
+			Operation: sha256.Sum256(request.TransitionID[:]), Step: [32]byte{0x6d, byte(request.Kind)},
+			Group: group, TargetMember: request.TargetMember,
+			ExpectedReplicaSetVersion: request.ExpectedReplicaSetVersion,
+		}
+		before, err := observer.Observe(ctx, nodes[leader], observationRequest)
+		if err != nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		response := rf3CommandRoundTrip(t, addresses[leader], nodes[leader], profile,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedMembership, Authority: authority,
@@ -1071,12 +1100,17 @@ func rf3CommandApplyMembership(
 			})
 		switch response.Kind {
 		case shardservice.ReplicatedMembershipAccepted:
-			if !response.HasState ||
-				request.Kind != raftservice.MembershipTransferLeader &&
-					response.State.Fence.Command.ReplicaSetVersion <= request.ExpectedReplicaSetVersion {
-				t.Fatalf("membership did not advance exact cut: %+v", response)
+			if !response.HasState {
+				t.Fatal("membership admission omitted member identity")
 			}
-			return response.State
+			// Accepted is admission, not quorum/apply settlement. Once accepted,
+			// never submit this mutation again; observe its exact resulting cut.
+			settled, err := rf3AwaitMembershipSettlement(ctx, before, request,
+				rf3MembershipNetworkObserver(observer, addresses[leader], nodes[leader], profile, authority, allocation, observationRequest))
+			if err != nil {
+				t.Fatalf("accepted membership did not settle exact cut: %v", err)
+			}
+			return settled
 		case shardservice.ReplicatedNotLeader, shardservice.ReplicatedOutcomeUnknown:
 			time.Sleep(10 * time.Millisecond)
 			continue
