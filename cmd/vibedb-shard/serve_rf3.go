@@ -772,7 +772,7 @@ func servePreparedRF3WithExecutionLanes(
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
-		splitRuntime.admission, splitRuntime.tail, childPrepareControl,
+		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
@@ -924,9 +924,9 @@ func servePreparedRF3WithExecutionLanes(
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
 	membership, observation, source, action, split, schema, planObservation, admission, tail,
-	childPrepare shardcontrol.Handler,
+	terminal, childPrepare shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 10)
+	routes := make([]shardcontrol.Route, 0, 11)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -977,6 +977,11 @@ func newRF3ControlMux(
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: splitcontroller.TailStreamRequestDiscriminator(),
 			Handler:       tail,
+		})
+	}
+	if terminal != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: splitcontroller.TerminalRetirementRequestDiscriminator(), Handler: terminal,
 		})
 	}
 	if childPrepare != nil {

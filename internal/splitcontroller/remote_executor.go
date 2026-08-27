@@ -68,6 +68,9 @@ func ExecuteRemoteReplicatedStep(
 	}
 	return ExecuteReplicatedStep(ctx, journal, plan, observed,
 		func(ctx context.Context, operation OperationID, action Action) error {
+			if action.Kind == ActionComplete {
+				return nil
+			}
 			request, err := appendRemoteStepRequest(nil, plan, observed, action)
 			if err != nil || request.Operation != [32]byte(operation) {
 				return errors.Join(ErrRemoteExecution, err)

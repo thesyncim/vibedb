@@ -150,6 +150,9 @@ func ExecuteReplicatedStep(
 			}
 			record = next
 		}
+		if err := execute(ctx, plan.OperationID(), action); err != nil {
+			return Action{}, err
+		}
 		if err := settleReplicatedOperationDelete(ctx, journal, record); err != nil {
 			return Action{}, err
 		}

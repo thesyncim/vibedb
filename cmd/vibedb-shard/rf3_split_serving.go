@@ -33,6 +33,7 @@ type rf3SplitServingRuntime struct {
 	admission shardcontrol.Handler
 	tail      shardcontrol.Handler
 	artifact  shardcontrol.Handler
+	terminal  shardcontrol.Handler
 }
 
 type rf3SplitServingOptions struct {
@@ -306,7 +307,19 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	if err != nil {
 		return closeOnError(err)
 	}
-	result.admission, result.tail, result.artifact = admission, tail, artifact
+	retirer, err := splitcontroller.NewLocalTerminalRetirer(binder, grants, data)
+	if err != nil {
+		return closeOnError(err)
+	}
+	terminal, err := splitcontroller.NewTerminalRetirementService(
+		retirer, func(peer rafttransport.PeerIdentity, _ splitcontroller.TerminalRetirement) bool {
+			return options.policy.Check(peer.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		}, options.deadline, options.deadline,
+	)
+	if err != nil {
+		return closeOnError(err)
+	}
+	result.admission, result.tail, result.artifact, result.terminal = admission, tail, artifact, terminal
 	return result, nil
 }
 

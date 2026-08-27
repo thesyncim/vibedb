@@ -390,6 +390,72 @@ func (binder *BoundPlanAdmissionBinder) retire(
 	return releaseErr
 }
 
+func (binder *BoundPlanAdmissionBinder) retireCertified(
+	operation OperationID, digest [32]byte, catalogGeneration uint64,
+	catalogDigest [32]byte, proof [32]byte,
+) error {
+	if binder == nil || operation == (OperationID{}) || digest == ([32]byte{}) ||
+		catalogGeneration == 0 || catalogDigest == ([32]byte{}) || proof == ([32]byte{}) {
+		return ErrRemoteExecution
+	}
+	binder.mu.Lock()
+	defer binder.mu.Unlock()
+	current, found := binder.active[operation]
+	if !found {
+		return nil
+	}
+	if current.digest != digest || current.catalogGeneration != catalogGeneration ||
+		current.catalogDigest != catalogDigest {
+		return ErrRemoteExecution
+	}
+	binder.grants.retire(operation, digest)
+	var result error
+	for _, activation := range current.activations {
+		result = errors.Join(result, activation.AbortAdmittedShardExecutor())
+	}
+	for _, lease := range current.leases {
+		result = errors.Join(result, lease.Release())
+	}
+	if result != nil {
+		return result
+	}
+	for _, registry := range current.registries {
+		if registry == nil {
+			return ErrRemoteExecution
+		}
+		_, result = registry.CollectCertifiedTerminal(operation, proof)
+		if result != nil {
+			return result
+		}
+	}
+	delete(binder.active, operation)
+	return nil
+}
+
+// validateCertifiedRetirement checks the exact live admission before any
+// sibling runtime capability is revoked. An absent admission is an idempotent
+// replay after terminal collection; a mismatched live admission fails closed.
+func (binder *BoundPlanAdmissionBinder) validateCertifiedRetirement(
+	operation OperationID, digest [32]byte, catalogGeneration uint64,
+	catalogDigest [32]byte, proof [32]byte,
+) error {
+	if binder == nil || operation == (OperationID{}) || digest == ([32]byte{}) ||
+		catalogGeneration == 0 || catalogDigest == ([32]byte{}) || proof == ([32]byte{}) {
+		return ErrRemoteExecution
+	}
+	binder.mu.Lock()
+	defer binder.mu.Unlock()
+	current, found := binder.active[operation]
+	if !found {
+		return nil
+	}
+	if current.digest != digest || current.catalogGeneration != catalogGeneration ||
+		current.catalogDigest != catalogDigest {
+		return ErrRemoteExecution
+	}
+	return nil
+}
+
 func mergeAdmissionRegistries(
 	current []*RuntimeStoreRegistry, leases []*RuntimeStoreLease,
 ) []*RuntimeStoreRegistry {

@@ -100,6 +100,18 @@ func newGatewayServingSplitRuntime(
 	if err != nil {
 		return nil, err
 	}
+	terminalClient, err := splitcontroller.NewTerminalRetirementClient(
+		options.opener, options.read, options.write,
+	)
+	if err != nil {
+		return nil, err
+	}
+	terminal, err := splitcontroller.NewRF3TerminalRetirementCoordinator(
+		terminalClient, gatewaySplitAdmissionAttempts,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	client, err := splitcontroller.NewAuthenticatedShardControlClient(
 		splitcontroller.AuthenticatedShardControlClientOptions{
@@ -121,7 +133,7 @@ func newGatewayServingSplitRuntime(
 	}
 	controller, err := splitcontroller.NewServingControllerService(
 		options.catalog, observer, router, coordinator,
-		splitcontroller.CatalogGatewaySplitActions{Authority: options.catalog},
+		splitcontroller.CatalogGatewaySplitActions{Authority: options.catalog, Terminal: terminal},
 	)
 	if err != nil {
 		_ = client.Close()

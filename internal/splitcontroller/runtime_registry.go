@@ -412,6 +412,46 @@ func (r *RuntimeStoreRegistry) CollectTerminal(
 	return true, nil
 }
 
+// CollectCertifiedTerminal consumes a proof already authenticated by the
+// serving control protocol. It preserves the same marker-before-removal crash
+// ordering as authority-driven collection without a shard-to-gateway RTT.
+func (r *RuntimeStoreRegistry) CollectCertifiedTerminal(
+	operation OperationID, proof [sha256.Size]byte,
+) (bool, error) {
+	if r == nil || operation == (OperationID{}) || proof == ([sha256.Size]byte{}) {
+		return false, ErrRuntimeStore
+	}
+	r.mu.Lock()
+	if r.closed || r.active[operation] != nil {
+		r.mu.Unlock()
+		return false, ErrRuntimeRegistryInUse
+	}
+	if _, busy := r.collecting[operation]; busy {
+		r.mu.Unlock()
+		return false, ErrRuntimeRegistryInUse
+	}
+	r.collecting[operation] = struct{}{}
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.collecting, operation)
+		r.mu.Unlock()
+	}()
+	terminal, err := runtimeTerminalExists(r.root, operation, r.manifest)
+	if err != nil {
+		return false, err
+	}
+	if !terminal {
+		if err = persistRuntimeTerminal(r.root, operation, r.manifest, proof); err != nil {
+			return false, err
+		}
+	}
+	if err = removeRuntimeOperation(r.root, operation); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Close requires every lease to have been released. This avoids invalidating
 // a caller in the middle of a durable write.
 func (r *RuntimeStoreRegistry) Close() error {

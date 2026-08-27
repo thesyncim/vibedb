@@ -42,7 +42,7 @@ func ExecuteCoordinatedReplicatedStep(
 			case ActionPublishCatalog:
 				return gatewayExecutor.ExecuteGatewaySplitAction(ctx, plan, observed, action)
 			case ActionComplete:
-				return nil
+				return gatewayExecutor.ExecuteGatewaySplitAction(ctx, plan, observed, action)
 			default:
 				if remoteActionTargetsChild(action.Kind) {
 					target, ok := plan.Target(action.Child)

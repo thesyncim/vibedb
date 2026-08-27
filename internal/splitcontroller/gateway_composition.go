@@ -9,11 +9,21 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
-type CatalogGatewaySplitActions struct{ Authority SplitCatalogAuthority }
+type GatewayTerminalRetirer interface {
+	RetirePlan(context.Context, *gateway.Snapshot, *Plan, Observation) error
+}
+
+type CatalogGatewaySplitActions struct {
+	Authority SplitCatalogAuthority
+	Terminal  GatewayTerminalRetirer
+}
 
 func (actions CatalogGatewaySplitActions) ExecuteGatewaySplitAction(
 	ctx context.Context, plan *Plan, observed Observation, action Action,
 ) error {
+	if action.Kind == ActionComplete && actions.Terminal != nil {
+		return actions.Terminal.RetirePlan(ctx, observed.Catalog, plan, observed)
+	}
 	if actions.Authority == nil || action.Kind != ActionPublishCatalog {
 		return ErrControllerTrigger
 	}
