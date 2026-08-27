@@ -5,6 +5,39 @@ import (
 	"os"
 )
 
+// AppendGenerationMigrationChainRetirements collects the authenticated link
+// pages themselves. A full destination is explicit bounded backpressure; the
+// caller clears the root locator in the same publication that retires them.
+func AppendGenerationMigrationChainRetirements(
+	dst []FreeExtent, file *os.File, manifest GenerationMigrationManifest,
+	scratch []byte, retiredGeneration uint64,
+) ([]FreeExtent, error) {
+	if file == nil || retiredGeneration == 0 ||
+		manifest.StagingChainTail != (PageRef{}) && len(scratch) < int(manifest.StagingChainTail.Length) {
+		return dst, fmt.Errorf("%w: migration chain retirement", ErrInvalidWrite)
+	}
+	for chain := manifest.StagingChainTail; chain != (PageRef{}); {
+		if len(dst) == cap(dst) {
+			return dst, ErrRetiredExtentCapacity
+		}
+		page := scratch[:chain.Length]
+		if _, err := file.ReadAt(page, int64(chain.Offset)); err != nil {
+			return dst, err
+		}
+		view, err := OpenGenerationMigrationStagingChainPage(
+			page, chain, manifest.StoreID, manifest.MigrationID, manifest.TargetGeneration,
+		)
+		if err != nil {
+			return dst, err
+		}
+		dst = append(dst, FreeExtent{
+			Offset: chain.Offset, Length: uint64(chain.Length), RetiredGeneration: retiredGeneration,
+		})
+		chain = view.Previous()
+	}
+	return dst, nil
+}
+
 // VisitGenerationMigrationScratch walks authenticated staging links and emits
 // only external-sort and padding pages. Target graph/index/catalog pages share
 // the extents but remain reachable after installation and are never emitted.

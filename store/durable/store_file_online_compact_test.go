@@ -153,7 +153,8 @@ func TestCompactOnlineInstallsReopenableServingRoot(t *testing.T) {
 	after := collection.state.Load()
 	if report.Documents != 1000 || report.SourceFileEnd < before.fileEnd ||
 		after.root.PrimaryRoot == before.root.PrimaryRoot || after.root.Generation <= before.root.Generation ||
-		report.StagingAllocatedBytes == 0 || report.InstalledFileEnd != after.fileEnd {
+		report.StagingAllocatedBytes == 0 || report.InstalledFileEnd > after.fileEnd ||
+		after.root.MigrationManifestOffset != 0 || collection.Stats().PendingRetiredExtents == 0 {
 		t.Fatalf("report=%+v before=%+v after=%+v", report, before, after)
 	}
 	rows := 0

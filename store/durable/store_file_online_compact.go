@@ -294,10 +294,37 @@ func (c *Collection) retirePublishedOnlineMigration() error {
 	}
 	for {
 		done, err := driver.Step()
-		if err != nil || done {
+		if err != nil {
 			return err
 		}
+		if done {
+			break
+		}
 	}
+	manifest, err := manifestStore.Load()
+	if err != nil {
+		return err
+	}
+	state = c.state.Load()
+	if state == nil || state.root.MigrationManifestOffset == 0 {
+		return nil
+	}
+	metadata := make([]storeio.FreeExtent, 0, min(cap(c.retireScratch), int(manifest.StagingExtentCount)+1))
+	metadata, err = storeio.AppendGenerationMigrationChainRetirements(
+		metadata, c.file, manifest, make([]byte, c.options.PageSize), state.root.Generation,
+	)
+	if err != nil {
+		return err
+	}
+	if len(metadata) == cap(metadata) {
+		return storeio.ErrRetiredExtentCapacity
+	}
+	metadata = append(metadata, storeio.FreeExtent{
+		Offset:            state.root.MigrationManifestOffset,
+		Length:            uint64(2 * storeio.GenerationMigrationManifestBytes),
+		RetiredGeneration: state.root.Generation,
+	})
+	return c.retireOnlineMigrationMetadata(metadata)
 }
 
 func samePhysicalExtent(a, b storeio.FreeExtent) bool {
@@ -308,13 +335,24 @@ func samePhysicalExtent(a, b storeio.FreeExtent) bool {
 // ordinary free-log grammar. Repeated delivery after a crash is idempotent by
 // physical identity; the fresh publication generation is a conservative fence.
 func (c *Collection) retireOnlineMigrationExtents(extents []storeio.FreeExtent) (err error) {
+	return c.retireOnlineMigrationExtentsAndMaybeClear(extents, false)
+}
+
+func (c *Collection) retireOnlineMigrationMetadata(extents []storeio.FreeExtent) error {
+	return c.retireOnlineMigrationExtentsAndMaybeClear(extents, true)
+}
+
+func (c *Collection) retireOnlineMigrationExtentsAndMaybeClear(
+	extents []storeio.FreeExtent, clearManifest bool,
+) (err error) {
 	c.writer.Lock()
 	defer c.writer.Unlock()
 	if c.closed {
 		return ErrClosed
 	}
 	state := c.state.Load()
-	if state == nil || len(extents) == 0 || len(extents) > cap(c.retireScratch) {
+	if state == nil || len(extents) == 0 || len(extents) > cap(c.retireScratch) ||
+		clearManifest && state.root.MigrationManifestOffset == 0 {
 		return storeio.ErrRetiredExtentCapacity
 	}
 	existing := c.reclaimer.AppendPending(c.freeFenced[:0])
@@ -341,7 +379,7 @@ func (c *Collection) retireOnlineMigrationExtents(extents []storeio.FreeExtent) 
 		extent.RetiredGeneration = state.root.Generation
 		c.retireScratch = append(c.retireScratch, extent)
 	}
-	if len(c.retireScratch) == 0 {
+	if len(c.retireScratch) == 0 && !clearManifest {
 		return nil
 	}
 	generation := state.root.Generation + 1
@@ -381,6 +419,9 @@ func (c *Collection) retireOnlineMigrationExtents(extents []storeio.FreeExtent) 
 	next := &fileStoreState{root: state.root, fileEnd: tx.FileEnd(), freeHead: freeLog.head}
 	next.root.Generation = generation
 	next.root.NextLogicalID = tx.NextLogicalID()
+	if clearManifest {
+		next.root.MigrationManifestOffset = 0
+	}
 	nextInline := *freeLog.inline
 	if err = c.reserveFileRetirements(); err != nil {
 		return err
