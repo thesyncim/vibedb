@@ -445,10 +445,11 @@ func servePreparedRF3WithExecutionLanes(
 		recoverySources = append(recoverySources, item.apply)
 	}
 	restoreGates := make(map[raftmember.GroupKey]*shardservice.RestoreServingGate)
+	restoreOperations := make(map[raftmember.GroupKey][32]byte)
 	restoreGateList := make([]*shardservice.RestoreServingGate, 0, len(preparedSet.groups))
 	for index := range preparedSet.groups {
 		item := &preparedSet.groups[index]
-		restored, markerErr := hasRestoredRF3PreparingMarker(item.manifest.SQL.Path)
+		operation, restored, markerErr := restoredRF3PreparingOperation(item.manifest.SQL.Path)
 		if markerErr != nil {
 			return closeAdopted(markerErr)
 		}
@@ -463,6 +464,7 @@ func servePreparedRF3WithExecutionLanes(
 			return closeAdopted(gateErr)
 		}
 		restoreGates[itemGroup] = restoreGate
+		restoreOperations[itemGroup] = operation
 		restoreGateList = append(restoreGateList, restoreGate)
 	}
 	runtimePublication, _ := runtimes[0].Publication()
@@ -867,12 +869,12 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	var server *shardservice.ReplicatedServer
 	if nativeConfigured {
+		baseServing := rf3NativeServingAuthority(transportRegistry, manifest, group, base)
 		server, err = shardservice.NewReplicatedServer(peer.Owners(), 64<<20, rf3RequestTimeout)
 		if err == nil {
 			err = server.BindAuthorization(gate, nil)
 		}
 		if err == nil {
-			baseServing := rf3NativeServingAuthority(transportRegistry, manifest, group, base)
 			err = server.BindServingAuthority(func(state raftservice.ServingState) bool {
 				if !baseServing(state) {
 					return false
@@ -881,11 +883,18 @@ func servePreparedRF3WithExecutionLanes(
 				return !restored || restoreGate.Allows(state)
 			})
 		}
-		if err == nil && manifest.EnrolledTarget != nil &&
-			base.Binding.MemberID == manifest.EnrolledTarget.MemberID {
-			err = server.BindTransitionalServingAuthority(rf3NativeMembershipAuthority(
-				transportRegistry, manifest, group, base,
-			))
+		if err == nil {
+			membershipPreparing := rf3NativeMembershipAuthority(transportRegistry, manifest, group, base)
+			restorePreparing := rf3RestoreCatalogPreparingAuthority(
+				gate, restoreOperations[group], group, base, baseServing,
+			)
+			err = server.BindTransitionalServingAuthority(func(state raftservice.ServingState,
+				request *shardservice.ReplicatedRequest,
+			) bool {
+				return restorePreparing(state, request) ||
+					(manifest.EnrolledTarget != nil && base.Binding.MemberID == manifest.EnrolledTarget.MemberID &&
+						membershipPreparing(state, request))
+			})
 		}
 		if err != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
@@ -1095,23 +1104,28 @@ func newRF3ControlMux(
 }
 
 func hasRestoredRF3PreparingMarker(sqlPath string) (bool, error) {
+	_, found, err := restoredRF3PreparingOperation(sqlPath)
+	return found, err
+}
+
+func restoredRF3PreparingOperation(sqlPath string) ([32]byte, bool, error) {
 	if sqlPath == "" {
-		return false, errRF3Serving
+		return [32]byte{}, false, errRF3Serving
 	}
 	path := filepath.Join(filepath.Dir(sqlPath), "restore_preparing")
 	raw, err := readRF3BoundedFile(path, 37)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return [32]byte{}, false, nil
 	}
 	if err != nil || len(raw) != 37 {
-		return false, errors.Join(errRF3Serving, err)
+		return [32]byte{}, false, errors.Join(errRF3Serving, err)
 	}
 	var digest [32]byte
 	copy(digest[:], raw[:32])
 	if digest == ([32]byte{}) || raw[36] >= 3 {
-		return false, errRF3Serving
+		return [32]byte{}, false, errRF3Serving
 	}
-	return true, nil
+	return digest, true, nil
 }
 
 func newRF3SnapshotMux(source, artifact shardcontrol.Handler) (*shardcontrol.Mux, error) {

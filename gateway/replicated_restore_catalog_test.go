@@ -33,6 +33,11 @@ func TestReplicatedRestoreCatalogExactCASAndLinearizableObservation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	document, err := appendRestoreCatalogDocument(nil, command)
+	if err != nil || !RestoreCatalogActivationDocumentMatches(document, witness.Operation, authority.route.Group) ||
+		RestoreCatalogActivationDocumentMatches(document, [32]byte{0xff}, authority.route.Group) {
+		t.Fatalf("restore-only shard validator err=%v", err)
+	}
 	result, err := catalog.ProposeRestoreActivation(ctx, command)
 	if err != nil || !bytes.Equal(result, witness.CatalogDigest[:]) {
 		t.Fatalf("propose result=%x err=%v", result, err)

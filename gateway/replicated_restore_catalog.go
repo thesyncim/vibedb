@@ -21,6 +21,23 @@ var (
 	ErrRestoreCatalogConflict   = errors.New("gateway: restore activation conflicts")
 )
 
+// RestoreCatalogActivationKeyMatches identifies the sole restore-activation
+// catalog row without exposing mutable shared key storage.
+func RestoreCatalogActivationKeyMatches(key []byte) bool {
+	return bytes.Equal(key, restoreCatalogDocumentKey)
+}
+
+// RestoreCatalogActivationDocumentMatches is the shipped shard's narrow
+// pre-activation validator. It accepts only the canonical one-time witness for
+// this exact restored operation and target catalog group.
+func RestoreCatalogActivationDocumentMatches(raw []byte, operation [sha256.Size]byte,
+	group raftmember.GroupKey,
+) bool {
+	witness, err := openRestoreCatalogDocument(raw)
+	return err == nil && operation != ([sha256.Size]byte{}) &&
+		witness.Operation == operation && witness.CatalogGroup == restoreCatalogGroup(group)
+}
+
 const (
 	restoreCatalogDocumentFormat   = 1
 	maxRestoreCatalogDocumentBytes = 1024
