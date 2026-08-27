@@ -67,7 +67,7 @@ func remoteActionTarget(plan *Plan, observed Observation, action Action) (ShardA
 				ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
 			},
 			Allocation: binding.AllocationGeneration, Member: binding.MemberID,
-			Authority: target.Authority, RelationManifestDigest: target.SQL.RelationManifestDigest,
+			Authority: target.Authority, RelationManifestDigest: target.RelationManifestDigest,
 		}
 		if !result.valid() || result.Member == 0 {
 			return ShardActionTarget{}, ErrRemoteExecution
@@ -148,8 +148,8 @@ func planRelationManifestDigest(plan *Plan) [32]byte {
 		return plan.relationDigest
 	}
 	for child := uint8(0); child < plan.childCount; child++ {
-		if target, ok := plan.Target(child); ok && target.SQL.RelationManifestDigest != ([32]byte{}) {
-			return target.SQL.RelationManifestDigest
+		if target, ok := plan.Target(child); ok && target.RelationManifestDigest != ([32]byte{}) {
+			return target.RelationManifestDigest
 		}
 	}
 	return [32]byte{}

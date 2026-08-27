@@ -68,14 +68,18 @@ type Action struct {
 // non-retained child. SQL must already be bound to the exact final WAL identity
 // derived by BindingForNewWAL. None of these fields grants serving authority.
 type ChildTarget struct {
-	Child                 uint8
-	Endpoint              distribution.EndpointID
-	Replicas              []ChildReplicaTarget
-	ReplicaSetVersion     uint64
-	WAL                   raftstore.Identity
-	TopologyRecoveryEpoch uint64
-	Authority             sqldriver.ReplicatedAuthorityProfile
-	SQL                   sqldriver.ReplicatedShardStoreIdentity
+	Child             uint8
+	Endpoint          distribution.EndpointID
+	Replicas          []ChildReplicaTarget
+	ReplicaSetVersion uint64
+	// RelationManifestDigest is the portable validated schema-image digest
+	// shared by every replica. Replica.SQL.RelationManifestDigest remains the
+	// exact replica-local storage/catalog digest and is allowed to differ.
+	RelationManifestDigest [sha256.Size]byte
+	WAL                    raftstore.Identity
+	TopologyRecoveryEpoch  uint64
+	Authority              sqldriver.ReplicatedAuthorityProfile
+	SQL                    sqldriver.ReplicatedShardStoreIdentity
 }
 
 // ChildReplicaTarget is one exact pre-published RF3 member route. A split plan
@@ -140,6 +144,20 @@ func NewPlan(
 	sourceManifest, ok := current.Manifest(split.Source.Distribution)
 	if !ok {
 		return nil, ErrInvalidPlan
+	}
+	if sourceRoute, replicated := current.ResolveReplicatedRoute(
+		split.Source.Distribution, split.Source.Shard,
+		make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+	); replicated {
+		for index := range targets {
+			target := &targets[index]
+			if target.RelationManifestDigest != sourceRoute.Command.RelationManifestDigest ||
+				target.Authority.ActivePolicyGeneration != sourceRoute.Command.ActivePolicyGeneration ||
+				target.Authority.ProtectionEpoch != sourceRoute.Command.ProtectionEpoch ||
+				target.Authority.SchemaGeneration != sourceRoute.Command.SchemaGeneration {
+				return nil, ErrInvalidPlan
+			}
+		}
 	}
 	return newPlan(
 		sourceManifest, current.Generation(), split, partitioner, targets,
@@ -234,6 +252,7 @@ func newPlan(
 		descriptor, childOK := split.ChildIdentity(child)
 		leader, leaderOK := split.ChildLeader(child, 0)
 		if !childOK || descriptor.Retained || seen[child] || target.ReplicaSetVersion == 0 ||
+			target.RelationManifestDigest == ([sha256.Size]byte{}) ||
 			!leaderOK || target.Endpoint != leader ||
 			!validChildReplicaTargets(split, child, target) ||
 			target.WAL.Distribution != string(split.Source.Distribution) ||
@@ -271,25 +290,34 @@ func newPlan(
 			return nil, ErrInvalidPlan
 		}
 	}
+	var portableRelationDigest [sha256.Size]byte
+	for child := 0; child < int(split.ChildCount); child++ {
+		if child == int(split.RetainedChild) {
+			continue
+		}
+		target := &plan.targets[child]
+		if portableRelationDigest != ([sha256.Size]byte{}) &&
+			target.RelationManifestDigest != portableRelationDigest {
+			return nil, ErrInvalidPlan
+		}
+		portableRelationDigest = target.RelationManifestDigest
+	}
+	plan.relationDigest = portableRelationDigest
 	hasGlobalIndex := false
 	for index := range relationTemplate {
 		hasGlobalIndex = hasGlobalIndex ||
 			relationTemplate[index].Kind == sqldriver.ReplicatedShardRelationGlobalIndex
 	}
 	if hasGlobalIndex {
-		var relationDigest [sha256.Size]byte
 		for child := 0; child < int(split.ChildCount); child++ {
 			if child == int(split.RetainedChild) {
 				continue
 			}
 			target := &plan.targets[child]
 			if !sameSplitRelationPlacement(relationTemplate, target.SQL.Relations) ||
-				target.SQL.RelationManifestDigest == ([sha256.Size]byte{}) ||
-				relationDigest != ([sha256.Size]byte{}) &&
-					target.SQL.RelationManifestDigest != relationDigest {
+				target.SQL.RelationManifestDigest == ([sha256.Size]byte{}) {
 				return nil, ErrInvalidPlan
 			}
-			relationDigest = target.SQL.RelationManifestDigest
 		}
 		for index := range relationTemplate {
 			relation := relationTemplate[index]
@@ -314,7 +342,6 @@ func newPlan(
 				plan.indexRelations = append(plan.indexRelations, relation)
 			}
 		}
-		plan.relationDigest = relationDigest
 	}
 	plan.operation = splitOperationID(plan)
 	return plan, nil
@@ -383,6 +410,7 @@ func splitOperationID(plan *Plan) OperationID {
 			replicaDigest := preparedChildReplicaDigest(target.Replicas[replicaIndex])
 			_, _ = digestWriter.Write(replicaDigest[:])
 		}
+		_, _ = digestWriter.Write(target.RelationManifestDigest[:])
 	}
 	var result OperationID
 	copy(result[:], digestWriter.Sum(nil))
@@ -1116,7 +1144,6 @@ func validPreparedChildReplicas(
 			replica.WAL.ShardIncarnation != target.WAL.ShardIncarnation ||
 			replica.WAL.GroupID != target.WAL.GroupID || replica.SQL.UserTable != collection ||
 			replica.SQL.LogID == ([16]byte{}) ||
-			replica.SQL.RelationManifestDigest != target.SQL.RelationManifestDigest ||
 			!sameSplitRelationPlacement(replica.SQL.Relations, target.SQL.Relations) ||
 			replica.Apply.Storage == "" || replica.Apply.CaptureStorage == "" ||
 			replica.Apply.Storage == replica.Apply.CaptureStorage ||

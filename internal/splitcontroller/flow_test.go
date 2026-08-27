@@ -193,7 +193,7 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 		},
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true,
-			RelationManifestDigest: target.SQL.RelationManifestDigest,
+			RelationManifestDigest: target.RelationManifestDigest,
 			Applied:                certificate.SourceCut().Applied,
 			SessionEpochHighWater:  certificate.SourceCut().Applied,
 			MaxSessions:            8, RetryWindow: 8,

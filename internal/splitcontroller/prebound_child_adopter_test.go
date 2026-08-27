@@ -47,7 +47,7 @@ func TestPreboundChildRuntimeAdopterFreezesRF3Authority(t *testing.T) {
 		adopter.command.ProtectionEpoch != target.Authority.ProtectionEpoch ||
 		adopter.command.OwnershipEpoch != target.Authority.OwnershipEpoch ||
 		adopter.command.SchemaGeneration != target.Authority.SchemaGeneration ||
-		adopter.command.RelationManifestDigest != target.SQL.RelationManifestDigest ||
+		adopter.command.RelationManifestDigest != target.RelationManifestDigest ||
 		adopter.command.RoutingVersion != target.Authority.RoutingVersion ||
 		adopter.command.RouteGeneration != target.Authority.RouteGeneration {
 		t.Fatalf("derived command fence = %+v", adopter.command)

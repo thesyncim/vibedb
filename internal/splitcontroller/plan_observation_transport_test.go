@@ -383,7 +383,7 @@ func networkPlanObservationFixture(
 		ProtectionEpoch:        state.Binding.ProtectionEpoch,
 		OwnershipEpoch:         state.Binding.OwnershipEpoch,
 		SchemaGeneration:       state.Binding.SchemaGeneration,
-		RelationManifestDigest: target.SQL.RelationManifestDigest,
+		RelationManifestDigest: target.RelationManifestDigest,
 		RoutingVersion:         state.Binding.RoutingVersion,
 		RouteGeneration:        state.Binding.RouteGeneration,
 	}

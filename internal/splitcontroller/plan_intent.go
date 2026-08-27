@@ -78,12 +78,13 @@ type persistedSQLIdentity struct {
 }
 
 type persistedChildTarget struct {
-	Child                 uint8                                `json:"child"`
-	Endpoint              distribution.EndpointID              `json:"endpoint"`
-	Replicas              []persistedChildReplica              `json:"replicas"`
-	ReplicaSetVersion     uint64                               `json:"replica_set_version"`
-	TopologyRecoveryEpoch uint64                               `json:"topology_recovery_epoch"`
-	Authority             sqldriver.ReplicatedAuthorityProfile `json:"authority"`
+	Child                  uint8                                `json:"child"`
+	Endpoint               distribution.EndpointID              `json:"endpoint"`
+	Replicas               []persistedChildReplica              `json:"replicas"`
+	ReplicaSetVersion      uint64                               `json:"replica_set_version"`
+	RelationManifestDigest [32]byte                             `json:"relation_manifest_digest"`
+	TopologyRecoveryEpoch  uint64                               `json:"topology_recovery_epoch"`
+	Authority              sqldriver.ReplicatedAuthorityProfile `json:"authority"`
 }
 
 type persistedChildReplica struct {
@@ -145,10 +146,11 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 		if target, targetOK := plan.Target(uint8(child)); targetOK {
 			intent.Targets = append(intent.Targets, persistedChildTarget{
 				Child: target.Child, Endpoint: target.Endpoint,
-				Replicas:              persistChildReplicas(target.Replicas),
-				ReplicaSetVersion:     target.ReplicaSetVersion,
-				TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
-				Authority:             target.Authority,
+				Replicas:               persistChildReplicas(target.Replicas),
+				ReplicaSetVersion:      target.ReplicaSetVersion,
+				RelationManifestDigest: target.RelationManifestDigest,
+				TopologyRecoveryEpoch:  target.TopologyRecoveryEpoch,
+				Authority:              target.Authority,
 			})
 		}
 	}
@@ -224,12 +226,13 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 		}
 		targets[index] = ChildTarget{
 			Child: target.Child, Endpoint: target.Endpoint,
-			Replicas:              replicas,
-			ReplicaSetVersion:     target.ReplicaSetVersion,
-			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
-			Authority:             target.Authority,
-			WAL:                   replicas[0].WAL,
-			SQL:                   replicas[0].SQL.Clone(),
+			Replicas:               replicas,
+			ReplicaSetVersion:      target.ReplicaSetVersion,
+			RelationManifestDigest: target.RelationManifestDigest,
+			TopologyRecoveryEpoch:  target.TopologyRecoveryEpoch,
+			Authority:              target.Authority,
+			WAL:                    replicas[0].WAL,
+			SQL:                    replicas[0].SQL.Clone(),
 		}
 	}
 	plan, err := RecoverPlan(

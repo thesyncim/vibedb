@@ -116,10 +116,11 @@ func AppendChildPreparation(dst []byte, preparation ChildPreparation) ([]byte, e
 		Collection: preparation.collection, Replica: preparation.replica,
 		Target: persistedChildTarget{
 			Child: preparation.target.Child, Endpoint: preparation.target.Endpoint,
-			Replicas:              persistChildReplicas(preparation.target.Replicas),
-			ReplicaSetVersion:     preparation.target.ReplicaSetVersion,
-			TopologyRecoveryEpoch: preparation.target.TopologyRecoveryEpoch,
-			Authority:             preparation.target.Authority,
+			Replicas:               persistChildReplicas(preparation.target.Replicas),
+			ReplicaSetVersion:      preparation.target.ReplicaSetVersion,
+			RelationManifestDigest: preparation.target.RelationManifestDigest,
+			TopologyRecoveryEpoch:  preparation.target.TopologyRecoveryEpoch,
+			Authority:              preparation.target.Authority,
 		},
 	}
 	raw, err := vibejson.Marshal(&wire)
@@ -152,8 +153,9 @@ func OpenChildPreparation(raw []byte) (ChildPreparation, error) {
 	replicas := openPersistedChildReplicas(wire.Target.Replicas)
 	target := ChildTarget{
 		Child: wire.Target.Child, Endpoint: wire.Target.Endpoint, Replicas: replicas,
-		ReplicaSetVersion:     wire.Target.ReplicaSetVersion,
-		TopologyRecoveryEpoch: wire.Target.TopologyRecoveryEpoch, Authority: wire.Target.Authority,
+		ReplicaSetVersion:      wire.Target.ReplicaSetVersion,
+		RelationManifestDigest: wire.Target.RelationManifestDigest,
+		TopologyRecoveryEpoch:  wire.Target.TopologyRecoveryEpoch, Authority: wire.Target.Authority,
 	}
 	if len(replicas) != 0 {
 		target.WAL, target.SQL = replicas[0].WAL, replicas[0].SQL.Clone()

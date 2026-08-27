@@ -167,6 +167,7 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 		t.Fatal(err)
 	}
 	target := testChildTarget(t, split, partitioner)
+	target.RelationManifestDigest = descriptor.Command.RelationManifestDigest
 	for index := range target.Replicas {
 		target.Replicas[index].Node = descriptor.Replicas[index].Node
 	}

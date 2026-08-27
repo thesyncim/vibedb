@@ -129,7 +129,7 @@ func validateChildExecutionRoster(
 	if target.Child >= autosplit.MaxSplitChildren || group == (raftmember.GroupKey{}) ||
 		target.WAL.MemberID == 0 || target.WAL.StoreID == ([16]byte{}) ||
 		len(roster) != gateway.ServingReplicaCount ||
-		target.SQL.RelationManifestDigest == ([32]byte{}) {
+		target.RelationManifestDigest == ([32]byte{}) {
 		return raftservice.CommandFence{}, ErrRuntimeStore
 	}
 	version := roster[0].ReplicaSetVersion
@@ -172,7 +172,7 @@ func validateChildExecutionRoster(
 		ProtectionEpoch:        target.Authority.ProtectionEpoch,
 		OwnershipEpoch:         target.Authority.OwnershipEpoch,
 		SchemaGeneration:       target.Authority.SchemaGeneration,
-		RelationManifestDigest: target.SQL.RelationManifestDigest,
+		RelationManifestDigest: target.RelationManifestDigest,
 		RoutingVersion:         target.Authority.RoutingVersion,
 		RouteGeneration:        target.Authority.RouteGeneration,
 	}

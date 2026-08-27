@@ -345,7 +345,7 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 		Child: 1, Phase: ChildPhaseActivated, ApplyIdentity: identity,
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true,
-			RelationManifestDigest: target.SQL.RelationManifestDigest,
+			RelationManifestDigest: target.RelationManifestDigest,
 			MaxSessions:            8, RetryWindow: 8,
 		},
 	}
@@ -543,7 +543,7 @@ func testChildTarget(
 		replicaSQL := sqldriver.ReplicatedShardStoreIdentity{
 			Binding: replicaBinding, LogID: testID(byte(60 + index)),
 			UserTable:              partitioner.CollectionName(),
-			RelationManifestDigest: sha256.Sum256([]byte("child-relations")),
+			RelationManifestDigest: sha256.Sum256([]byte("child-local-relations-" + strconv.Itoa(index+1))),
 		}
 		replicaRoot := filepath.Join(root, "replica-"+strconv.Itoa(index+1))
 		replicas[index] = ChildReplicaTarget{
@@ -569,9 +569,10 @@ func testChildTarget(
 	}
 	return ChildTarget{
 		Child: 1, Endpoint: child.Leaders[0], WAL: identity,
-		Replicas:              replicas,
-		ReplicaSetVersion:     1,
-		TopologyRecoveryEpoch: 1, Authority: authority,
+		Replicas:               replicas,
+		ReplicaSetVersion:      1,
+		RelationManifestDigest: sha256.Sum256([]byte("portable-child-relations")),
+		TopologyRecoveryEpoch:  1, Authority: authority,
 		SQL: replicas[0].SQL.Clone(),
 	}
 }

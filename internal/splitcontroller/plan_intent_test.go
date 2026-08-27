@@ -100,6 +100,7 @@ func TestPlanIntentAuthenticatesEveryPreparedReplicaAndRejectsIncompleteGrammar(
 
 	for _, mutate := range []func(*ChildTarget){
 		func(candidate *ChildTarget) { candidate.Replicas[0].CertificateDigest[0] ^= 1 },
+		func(candidate *ChildTarget) { candidate.RelationManifestDigest[0] ^= 1 },
 		func(candidate *ChildTarget) {
 			candidate.Replicas[0].SQLPath = filepath.Join(candidate.Replicas[0].RuntimeRoot, "other.vdb")
 		},

@@ -87,7 +87,7 @@ func preparedObservationTargetMatches(
 		ProtectionEpoch:        target.Authority.ProtectionEpoch,
 		OwnershipEpoch:         target.Authority.OwnershipEpoch,
 		SchemaGeneration:       target.Authority.SchemaGeneration,
-		RelationManifestDigest: target.SQL.RelationManifestDigest,
+		RelationManifestDigest: target.RelationManifestDigest,
 		RoutingVersion:         target.Authority.RoutingVersion,
 		RouteGeneration:        target.Authority.RouteGeneration,
 	}
