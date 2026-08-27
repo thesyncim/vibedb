@@ -498,6 +498,11 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 		if discoverErr != nil {
 			joined = errors.Join(joined, discoverErr)
 			preferred = 0
+			if errors.Is(discoverErr, errReplicatedLeaderUnobserved) && attempt+1 < executor.maxAttempts {
+				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+					return ReplicatedBatchPointResult{}, errors.Join(ErrReplicatedLeader, joined, waitErr)
+				}
+			}
 			continue
 		}
 		response, callErr := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
@@ -639,6 +644,11 @@ func (executor *ReplicatedExecutor) readPoint(
 		if err != nil {
 			joined = errors.Join(joined, err)
 			preferred = 0
+			if errors.Is(err, errReplicatedLeaderUnobserved) && attempt+1 < executor.maxAttempts {
+				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+					return ReplicatedPointResult{}, errors.Join(ErrReplicatedLeader, joined, waitErr)
+				}
+			}
 			continue
 		}
 		operation := shardservice.ReplicatedReadFollower

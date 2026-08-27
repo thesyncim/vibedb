@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,6 +293,60 @@ type pointReadClient struct {
 	readAddress   string
 	readOperation shardservice.ReplicatedOperation
 	readRefusal   shardservice.ReplicatedRefusalCode
+}
+
+type electingPointReadClient struct {
+	states     map[string]shardservice.ReplicatedMemberState
+	electionAt time.Time
+	probes     atomic.Int64
+}
+
+func (*electingPointReadClient) parallelReplicatedDiscovery() {}
+
+func (client *electingPointReadClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	if endpoint.Member == 1 {
+		return nil, io.EOF
+	}
+	state := client.states[endpoint.Address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		client.probes.Add(1)
+		if time.Now().Before(client.electionAt) {
+			state.LeaderID = 0
+		}
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
+	}
+	if state.LeaderID != endpoint.Member {
+		return nil, errors.New("read sent to follower")
+	}
+	response := &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedReadFound, HasState: true, State: state, ReadApplied: state.Applied, Value: []byte("value")}
+	if request.Operation == shardservice.ReplicatedReadBatchLeader {
+		response.Kind = shardservice.ReplicatedReadBatchResult
+		response.Value = appendScatterValues(nil, [][]byte{[]byte("value")})
+	}
+	return response, nil
+}
+
+func TestReplicatedReadsWaitForReplacementElection(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		route, _, states := testReplicatedRouteCommand(t)
+		for address, state := range states {
+			state.Applied, state.Commit = 10, 10
+			states[address] = state
+		}
+		client := &electingPointReadClient{states: states, electionAt: time.Now().Add(80 * time.Millisecond)}
+		executor, err := NewReplicatedExecutor(client, 5, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if batch {
+			_, err = executor.ReadPointBatch(t.Context(), route, ReplicatedBatchRead{Points: []ReplicatedBatchPointRead{{Relation: 1, Key: []byte("k")}}, MinimumApplied: 1, MaxResultBytes: 1024})
+		} else {
+			_, err = executor.ReadPoint(t.Context(), route, ReplicatedPointRead{Relation: 1, Key: []byte("k"), MinimumApplied: 1, MaxValueBytes: 1024, Linearizable: true})
+		}
+		if err != nil || client.probes.Load() > 10 {
+			t.Fatalf("batch=%t probes=%d err=%v", batch, client.probes.Load(), err)
+		}
+	}
 }
 
 type fixedReplicatedResponseClient struct {
