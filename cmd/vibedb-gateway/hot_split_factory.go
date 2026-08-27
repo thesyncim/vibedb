@@ -34,6 +34,7 @@ func newGatewayHotSplitFactory(
 ) (*gatewayHotSplitFactory, error) {
 	if client == nil || len(manifest.Shards) == 0 ||
 		len(manifest.Shards) != len(manifest.SplitChildRoots) ||
+		len(manifest.Shards) != len(manifest.SplitSnapshots) ||
 		!validGatewaySplitTemplate(manifest.SplitTemplate) {
 		return nil, hotshard.ErrInvalidPressureCut
 	}
@@ -170,7 +171,8 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 	replicas := make([]splitcontroller.ChildReplicaTarget, len(source.Replicas))
 	for index, sourceReplica := range source.Replicas {
 		root, ok := factory.splitRoot(sourceReplica.Node)
-		if !ok {
+		snapshot, snapshotOK := factory.splitSnapshot(sourceReplica.Node)
+		if !ok || !snapshotOK {
 			return splitcontroller.ChildTarget{}, hotshard.ErrInvalidPressureCut
 		}
 		operationName := hex.EncodeToString(admission[:])
@@ -230,8 +232,9 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 			NodeIncarnation: sourceReplica.NodeIncarnation,
 			Endpoint:        sourceReplica.Endpoint, NativeEndpoint: sourceReplica.NativeEndpoint,
 			ControlEndpoint: sourceReplica.ControlEndpoint, WAL: wal,
-			WALPath: filepath.Join(runtimeRoot, "child.wal"),
-			SQLPath: filepath.Join(runtimeRoot, "stage.vdb"), RuntimeRoot: runtimeRoot,
+			SnapshotAddress: snapshot,
+			WALPath:         filepath.Join(runtimeRoot, "child.wal"),
+			SQLPath:         filepath.Join(runtimeRoot, "stage.vdb"), RuntimeRoot: runtimeRoot,
 			SQL: base, Apply: apply,
 			CertificateDigest: gatewayHotSplitDigest("certificate", admission, child, uint8(index)),
 		}
@@ -304,6 +307,15 @@ func (factory *gatewayHotSplitFactory) splitRoot(node [16]byte) (string, bool) {
 	for index := range factory.manifest.Shards {
 		if factory.manifest.Shards[index].Node == node {
 			return factory.manifest.SplitChildRoots[index], true
+		}
+	}
+	return "", false
+}
+
+func (factory *gatewayHotSplitFactory) splitSnapshot(node [16]byte) (string, bool) {
+	for index := range factory.manifest.Shards {
+		if factory.manifest.Shards[index].Node == node {
+			return factory.manifest.SplitSnapshots[index], true
 		}
 	}
 	return "", false

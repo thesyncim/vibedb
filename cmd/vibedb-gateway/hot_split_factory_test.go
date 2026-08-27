@@ -30,7 +30,8 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 			filepath.Join(t.TempDir(), "two"),
 			filepath.Join(t.TempDir(), "three"),
 		},
-		SplitTemplate: gatewaySplitTemplateFixture(),
+		SplitSnapshots: []string{"127.0.0.1:9301", "127.0.0.1:9302", "127.0.0.1:9303"},
+		SplitTemplate:  gatewaySplitTemplateFixture(),
 	}
 	factory := &gatewayHotSplitFactory{manifest: manifest}
 	admission := [32]byte{0xa7, 0x42}
@@ -56,7 +57,8 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 		if replica.Node != source.Replicas[index].Node ||
 			replica.Member != source.Replicas[index].Member ||
 			replica.SQL.RelationManifestDigest == ([32]byte{}) ||
-			replica.SQLPath != filepath.Join(manifest.SplitChildRoots[index], operationDirectory, "child-1", "stage.vdb") {
+			replica.SQLPath != filepath.Join(manifest.SplitChildRoots[index], operationDirectory, "child-1", "stage.vdb") ||
+			replica.SnapshotAddress != manifest.SplitSnapshots[index] {
 			t.Fatalf("replica[%d]=%+v", index, replica)
 		}
 		localDigests[replica.SQL.RelationManifestDigest] = struct{}{}

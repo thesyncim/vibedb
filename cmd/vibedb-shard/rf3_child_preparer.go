@@ -24,18 +24,19 @@ type rf3ChildPreparer struct {
 	peer     string
 	native   string
 	control  string
+	snapshot string
 }
 
 func newRF3ChildPreparer(
 	registry *rf3SplitChildPathRegistry,
 	local rafttransport.NodeID,
-	peer, native, control net.Addr,
+	peer, native, control, snapshot net.Addr,
 ) (*rf3ChildPreparer, error) {
-	if registry == nil || local == (rafttransport.NodeID{}) || peer == nil || native == nil || control == nil {
+	if registry == nil || local == (rafttransport.NodeID{}) || peer == nil || native == nil || control == nil || snapshot == nil {
 		return nil, errRF3Serving
 	}
 	result := &rf3ChildPreparer{
-		registry: registry, local: local, peer: peer.String(), control: control.String(),
+		registry: registry, local: local, peer: peer.String(), control: control.String(), snapshot: snapshot.String(),
 	}
 	result.native = native.String()
 	return result, nil
@@ -120,6 +121,7 @@ func (preparer *rf3ChildPreparer) matchesLocalTarget(
 	if target.Node != preparer.local || target.RuntimeRoot != paths.Root ||
 		target.SQLPath != paths.Database || target.WALPath != paths.WAL ||
 		string(target.Endpoint) != preparer.peer || string(target.ControlEndpoint) != preparer.control ||
+		target.SnapshotAddress != preparer.snapshot ||
 		(preparer.native == "" || string(target.NativeEndpoint) != preparer.native) ||
 		target.WAL.MemberID != target.Member || target.WAL.StoreID != target.StoreID ||
 		target.SQL.Binding.MemberID != target.Member || target.SQL.Binding.StoreID != target.StoreID ||

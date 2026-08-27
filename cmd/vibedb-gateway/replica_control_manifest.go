@@ -61,9 +61,10 @@ type persistedGatewayReplicaBounds struct {
 }
 
 type persistedGatewayShardControlEndpoint struct {
-	Node           string `json:"node"`
-	ControlAddress string `json:"control_address"`
-	SplitChildRoot string `json:"split_child_root"`
+	Node                 string `json:"node"`
+	ControlAddress       string `json:"control_address"`
+	SplitSnapshotAddress string `json:"split_snapshot_address"`
+	SplitChildRoot       string `json:"split_child_root"`
 }
 
 type persistedGatewaySplitTemplate struct {
@@ -104,6 +105,7 @@ type gatewayReplicaControlManifest struct {
 	Bounds          persistedGatewayReplicaBounds
 	Shards          []gateway.ReplicatedEndpoint
 	SplitChildRoots []string
+	SplitSnapshots  []string
 	Gateways        []gatewayControlEndpoint
 	Candidates      []gatewayReplicaCandidate
 	SplitTemplate   persistedGatewaySplitTemplate
@@ -165,10 +167,12 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 	}
 	manifest.Shards = make([]gateway.ReplicatedEndpoint, len(persisted.ShardEndpoints))
 	manifest.SplitChildRoots = make([]string, len(persisted.ShardEndpoints))
+	manifest.SplitSnapshots = make([]string, len(persisted.ShardEndpoints))
 	shardAddresses := make(map[string]struct{}, len(persisted.ShardEndpoints))
 	for index, encoded := range persisted.ShardEndpoints {
 		node, parseErr := parseGatewayReplicaNode(encoded.Node)
 		if parseErr != nil || !validGatewayReplicaAddress(encoded.ControlAddress) ||
+			!validGatewayReplicaAddress(encoded.SplitSnapshotAddress) ||
 			!filepath.IsAbs(encoded.SplitChildRoot) || filepath.Clean(encoded.SplitChildRoot) != encoded.SplitChildRoot ||
 			encoded.SplitChildRoot == string(filepath.Separator) {
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
@@ -176,6 +180,7 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 		manifest.Shards[index] = gateway.ReplicatedEndpoint{Node: node,
 			ControlAddress: strings.Clone(encoded.ControlAddress)}
 		manifest.SplitChildRoots[index] = strings.Clone(encoded.SplitChildRoot)
+		manifest.SplitSnapshots[index] = strings.Clone(encoded.SplitSnapshotAddress)
 		if index != 0 && bytes.Compare(manifest.Shards[index-1].Node[:], node[:]) >= 0 {
 			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
 		}

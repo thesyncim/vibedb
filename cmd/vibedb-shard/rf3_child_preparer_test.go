@@ -31,6 +31,7 @@ func TestRF3ChildPreparerAcceptsOnlyExactLocalManifestSlot(t *testing.T) {
 		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1101},
 		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1102},
 		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1103},
+		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1104},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +43,7 @@ func TestRF3ChildPreparerAcceptsOnlyExactLocalManifestSlot(t *testing.T) {
 	target := splitcontroller.ChildReplicaTarget{
 		Member: 2, Node: node, StoreID: [16]byte{3},
 		Endpoint: "127.0.0.1:1101", NativeEndpoint: "127.0.0.1:1102",
-		ControlEndpoint: "127.0.0.1:1103", RuntimeRoot: paths.Root,
+		ControlEndpoint: "127.0.0.1:1103", SnapshotAddress: "127.0.0.1:1104", RuntimeRoot: paths.Root,
 		SQLPath: paths.Database, WALPath: paths.WAL,
 	}
 	target.WAL.MemberID, target.WAL.StoreID = target.Member, target.StoreID

@@ -31,10 +31,10 @@ func gatewayReplicaManifestFixture(t testing.TB) ([]byte, persistedGatewayReplic
 		Bounds: persistedGatewayReplicaBounds{MaxConnections: 32, MaxHandshakes: 8,
 			MaxConcurrentDrains: 4, ControllerInterval: 100, ReadTimeout: 1000, WriteTimeout: 1000},
 		ShardEndpoints: []persistedGatewayShardControlEndpoint{
-			{Node: "0a000000000000000000000000000000", ControlAddress: "127.0.0.1:7201", SplitChildRoot: "/srv/vibedb/a/split-children"},
-			{Node: "0b000000000000000000000000000000", ControlAddress: "127.0.0.1:7202", SplitChildRoot: "/srv/vibedb/b/split-children"},
-			{Node: "1f000000000000000000000000000000", ControlAddress: "127.0.0.1:7203", SplitChildRoot: "/srv/vibedb/c/split-children"},
-			{Node: "20000000000000000000000000000000", ControlAddress: "127.0.0.1:7204", SplitChildRoot: "/srv/vibedb/d/split-children"}},
+			{Node: "0a000000000000000000000000000000", ControlAddress: "127.0.0.1:7201", SplitSnapshotAddress: "127.0.0.1:7301", SplitChildRoot: "/srv/vibedb/a/split-children"},
+			{Node: "0b000000000000000000000000000000", ControlAddress: "127.0.0.1:7202", SplitSnapshotAddress: "127.0.0.1:7302", SplitChildRoot: "/srv/vibedb/b/split-children"},
+			{Node: "1f000000000000000000000000000000", ControlAddress: "127.0.0.1:7203", SplitSnapshotAddress: "127.0.0.1:7303", SplitChildRoot: "/srv/vibedb/c/split-children"},
+			{Node: "20000000000000000000000000000000", ControlAddress: "127.0.0.1:7204", SplitSnapshotAddress: "127.0.0.1:7304", SplitChildRoot: "/srv/vibedb/d/split-children"}},
 		GatewayEndpoints: []persistedGatewayControlEndpoint{
 			{Node: "01000000000000000000000000000000", Incarnation: 11, ControlAddress: "127.0.0.1:7101"},
 			{Node: "02000000000000000000000000000000", Incarnation: 12, ControlAddress: "127.0.0.1:7102"}},

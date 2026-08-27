@@ -739,7 +739,7 @@ func servePreparedRF3WithExecutionLanes(
 		}
 		childPreparer, childErr := newRF3ChildPreparer(
 			childPaths, profile.LocalIdentity().Node,
-			peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(),
+			peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(), snapshotListener.Addr(),
 		)
 		if childErr == nil {
 			concurrency := min(manifest.SplitControl.ChildRegistry.MaxOperations, 8)
