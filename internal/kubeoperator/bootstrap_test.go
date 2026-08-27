@@ -2,6 +2,7 @@ package kubeoperator
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,6 +17,45 @@ import (
 type failingBootstrapReader struct{}
 
 func (failingBootstrapReader) Read([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
+
+func TestBootstrapReplicaControlBindsOnlyDataSplitSource(t *testing.T) {
+	roles := [3]bootstrapRole{{name: "catalog"}, {name: "ledger"}, {
+		name: "data", table: "documents", primary: "/id", digest: [32]byte{9},
+		group: raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+			TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}},
+	}}
+	state := bootstrapState{GatewayNodeID: "10101010101010101010101010101010"}
+	for i := range state.ShardNodeIDs {
+		node := [16]byte{byte(9 - i)}
+		state.ShardNodeIDs[i] = hex.EncodeToString(node[:])
+	}
+	raw, err := bootstrapReplicaControl(roles, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"split_template"`)) || bytes.Contains(raw, []byte(`"split_child_root"`)) {
+		t.Fatal("legacy unscoped split authority in generated manifest")
+	}
+	var control bootstrapControl
+	if err := vibejson.Unmarshal(raw, &control); err != nil {
+		t.Fatal(err)
+	}
+	if len(control.SplitSources) != 1 {
+		t.Fatalf("split sources=%d", len(control.SplitSources))
+	}
+	source, data := control.SplitSources[0], roles[2]
+	if source.ClusterID != data.group.ClusterID || source.ClusterIncarnation != data.group.ClusterIncarnation ||
+		source.TopologyRecoveryEpoch != data.group.TopologyRecoveryEpoch || source.ShardIncarnation != data.group.ShardIncarnation ||
+		source.GroupID != data.group.GroupID || source.SchemaGeneration != 1 || source.RelationManifestDigest != data.digest ||
+		source.Table != data.table || source.Template.ShardKey != data.primary || len(source.Replicas) != 3 {
+		t.Fatalf("source did not bind exact data group/schema: %+v", source)
+	}
+	for i, replica := range source.Replicas {
+		if replica.Node != state.ShardNodeIDs[8-i] || replica.ChildRoot != "/var/lib/vibedb/member/split-children" {
+			t.Fatalf("replica %d is not canonical data-only authority: %+v", i, replica)
+		}
+	}
+}
 
 func TestBootstrapRoleManifestBindsServingProfile(t *testing.T) {
 	role := bootstrapRole{distribution: "data", shard: "all", table: "documents", primary: "/id",
