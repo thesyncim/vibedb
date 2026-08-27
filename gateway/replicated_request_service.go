@@ -67,6 +67,12 @@ func NewDurableRequestService(
 	runner *DurableRequestDistributedRunner,
 	pins DurableRequestExecutionPinAuthority,
 ) (*DurableRequestService, error) {
+	if _, ok := pins.(DurableRequestExecutionPinRetirer); !ok {
+		return nil, ErrDurableRequest
+	}
+	if _, ok := pins.(DurableRequestExecutionPinAckRetirer); !ok {
+		return nil, ErrDurableRequest
+	}
 	return newDurableRequestService(topology, ledger, runner, pins)
 }
 
