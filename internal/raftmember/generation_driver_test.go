@@ -44,6 +44,20 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		drainRuntime(t, fixture.runtime, nil)
+		if fixture.apply.Applied() != beforeApplied+1 {
+			t.Fatalf("sequence %d apply index=%d, want %d", sequence, fixture.apply.Applied(), beforeApplied+1)
+		}
+		// Inspect the journal-only cut before any completion snapshot. A lookup
+		// can materialize system parents and legitimately checkpoint the group,
+		// which would erase the exact compaction-stall precondition under test.
+		if sequence == 3 && fixture.apply.CheckpointAppliedIndex() != beforeApplied {
+			t.Fatalf("test requires a journal-durable suffix above the previous generation: checkpoint=%d previous=%d applied=%d",
+				fixture.apply.CheckpointAppliedIndex(), beforeApplied, fixture.apply.Applied())
+		}
+		info, err := awaitWALGeneration(t, fixture.runtime, fixture.wal, sequence-1)
+		if err != nil || info.Generation != sequence-1 || info.BaseIndex != beforeApplied+1 {
+			t.Fatalf("generation after sequence %d = %+v, %v; driver=%v", sequence, info, err, driverErr)
+		}
 		lookup, lookupErr := fixture.apply.LookupCompletion(command)
 		if lookupErr != nil {
 			t.Fatal(lookupErr)
@@ -52,14 +66,6 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 		if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
 			completion.AppliedSequence != beforeApplied+1 || fixture.apply.Applied() != beforeApplied+1 {
 			t.Fatalf("sequence %d did not durably apply: %+v err=%v applied=%d", sequence, completion, completionErr, fixture.apply.Applied())
-		}
-		if sequence == 3 && fixture.apply.CheckpointAppliedIndex() != beforeApplied {
-			t.Fatalf("test requires a journal-durable suffix above the previous generation: checkpoint=%d previous=%d applied=%d",
-				fixture.apply.CheckpointAppliedIndex(), beforeApplied, fixture.apply.Applied())
-		}
-		info, err := awaitWALGeneration(t, fixture.runtime, fixture.wal, sequence-1)
-		if err != nil || info.Generation != sequence-1 || info.BaseIndex != beforeApplied+1 {
-			t.Fatalf("generation after sequence %d = %+v, %v; driver=%v", sequence, info, err, driverErr)
 		}
 	}
 	before, err := fixture.wal.GenerationInfo()
