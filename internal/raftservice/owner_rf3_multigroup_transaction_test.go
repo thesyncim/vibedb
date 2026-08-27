@@ -406,11 +406,13 @@ func (client *multiGroupRF3RoundTripper) DoReplicated(
 		if err != nil {
 			return nil, err
 		}
-		control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
-		if err != nil {
-			return nil, err
+		if command.Kind() == replication.CommandTransaction {
+			control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
+			if err != nil {
+				return nil, err
+			}
+			operation = control.Operation
 		}
-		operation = control.Operation
 		client.mu.Lock()
 		client.trace = append(client.trace, multiGroupRF3GatewayTrace{
 			group: group, member: member, operation: operation,

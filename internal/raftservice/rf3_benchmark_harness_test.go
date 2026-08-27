@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3bench"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -140,6 +141,12 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 	cluster := newMultiGroupTransactionRF3Cluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
+		Node: rafttransport.NodeID{0xe1}, Generation: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cluster.owners[0].Campaign(ctx, cluster.groups[0].key); err != nil {
 		t.Fatal(err)
 	}
