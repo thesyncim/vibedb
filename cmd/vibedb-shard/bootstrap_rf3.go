@@ -44,14 +44,23 @@ func runBootstrapRF3(args []string) int {
 		fmt.Fprintf(os.Stderr, "error RF3 bootstrap manifest: %v\n", err)
 		return 2
 	}
-	member, err := loadRF3Manifest(manifest.MemberManifest)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error RF3 member manifest: %v\n", err)
-		return 2
+	bundles := manifest.groupBundles()
+	members := make([]rf3Manifest, len(bundles))
+	for index, bundle := range bundles {
+		members[index], err = loadRF3Manifest(bundle.MemberManifest)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error RF3 member manifest group %d: %v\n", index, err)
+			return 2
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err = bootstrapPreparedRF3(ctx, manifest, member); err != nil {
+	if len(members) == 1 {
+		err = bootstrapPreparedRF3(ctx, manifest.withGroup(bundles[0]), members[0])
+	} else {
+		err = bootstrapPreparedRF3Groups(ctx, manifest, members)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error bootstrap RF3: %v\n", err)
 		return 1
 	}
