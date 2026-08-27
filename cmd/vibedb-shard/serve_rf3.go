@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"syscall"
@@ -46,9 +47,22 @@ const (
 	rf3NetworkTimeout             = 10 * time.Second
 	rf3RequestTimeout             = 15 * time.Second
 	rf3DefaultExecutionLanes      = 8
+	rf3SchemaInstallRecords       = 256
+	rf3SchemaInstallArtifacts     = 16
+	rf3SchemaInstallDiskBytes     = 1 << 30
 )
 
 var errRF3Serving = errors.New("vibedb-shard: invalid RF3 serving configuration")
+
+func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
+	if policy == nil {
+		return nil
+	}
+	nodes := append(policy.NodesWith(serviceauthz.CapabilityMembership),
+		policy.NodesWith(serviceauthz.CapabilitySchema)...)
+	slices.SortFunc(nodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
+	return slices.Compact(nodes)
+}
 
 func runServeRF3(args []string) int {
 	fs := flag.NewFlagSet("serve-rf3", flag.ContinueOnError)
@@ -285,7 +299,7 @@ func servePreparedRF3WithExecutionLanes(
 		return fmt.Errorf("%w: native TLS authority: %v", errRF3Serving, err)
 	}
 	controlAuthorizer, err := servicetls.NewNodeAuthorizer(
-		policy.NodesWith(serviceauthz.CapabilityMembership),
+		rf3ControlNodes(policy),
 	)
 	if err != nil {
 		return fmt.Errorf("%w: control TLS authority: %v", errRF3Serving, err)
@@ -501,6 +515,57 @@ func servePreparedRF3WithExecutionLanes(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
+	schemaActivator, err := newRF3SchemaActivator(peer.Owners(), preparedSet.groups)
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	schemaRoot := manifest.ReplicaControl.SourceDataRoot
+	schemaJournal, err := schemainstall.OpenFileJournal(
+		filepath.Join(schemaRoot, "schema-rollout-journal"), rf3SchemaInstallRecords,
+	)
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, schemaJournal.Close()) }()
+	schemaArtifacts, err := schemainstall.OpenDirectoryBackend(schemainstall.DirectoryOptions{
+		Path:         filepath.Join(schemaRoot, "schema-rollout-artifacts"),
+		MaxArtifacts: rf3SchemaInstallArtifacts, MaxDiskBytes: rf3SchemaInstallDiskBytes,
+		Activator: schemaActivator,
+	})
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, schemaArtifacts.Close()) }()
+	if err = schemaActivator.bindArtifacts(schemaArtifacts); err != nil {
+		return err
+	}
+	schemaInstaller, err := schemainstall.New(schemainstall.Options{
+		Journal: schemaJournal, Backend: schemaArtifacts, MaxConcurrent: 8,
+	})
+	if err != nil {
+		return err
+	}
+	schemaControl, err := schemainstall.NewControlService(schemainstall.ControlOptions{
+		Installer: schemaInstaller,
+		Authorize: func(identity rafttransport.PeerIdentity, request schemainstall.Request, _ schemainstall.Command) bool {
+			_, served := servedGroups[request.Group]
+			return served && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+		MaxBundleBytes: schemainstall.AbsoluteMaxBundleBytes,
+	})
+	if err != nil {
+		return err
+	}
 	var sourceControl shardcontrol.Handler
 	var sourceData *snapshottransfer.Service
 	var snapshotTLS *servicetls.Server
@@ -649,7 +714,7 @@ func servePreparedRF3WithExecutionLanes(
 	// advertise a partial or memory-only executor.
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, sourceControl, actionControl,
-		nil, nil, nil, nil, childPrepareControl,
+		nil, schemaControl, nil, nil, childPrepareControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
