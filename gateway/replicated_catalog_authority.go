@@ -222,6 +222,15 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 			return replicatedCatalogCut{}, genesisErr
 		}
 		if !genesis.Found {
+			witness, witnessErr := authority.readRaw(
+				ctx, replicatedCatalogHeadWitnessKey, uint32(maxReplicatedCatalogBytes),
+			)
+			if witnessErr != nil {
+				return replicatedCatalogCut{}, witnessErr
+			}
+			if witness.Found {
+				return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
+			}
 			return replicatedCatalogCut{}, ErrReplicatedCatalogMissing
 		}
 		// A concurrent atomic genesis publication can linearize between the
