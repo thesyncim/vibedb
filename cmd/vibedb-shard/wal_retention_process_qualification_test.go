@@ -160,10 +160,10 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 	}
 
 	finalAllocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
-	if finalAllocated < baselineAllocated {
-		t.Fatalf("WAL allocation regressed below reserved baseline: before=%d after=%d", baselineAllocated, finalAllocated)
+	if finalAllocated <= 0 {
+		t.Fatal("final WAL allocation has no physical blocks")
 	}
-	growth := uint64(finalAllocated - baselineAllocated)
+	growth := uint64(max(int64(0), finalAllocated-baselineAllocated))
 	if growth > walRetentionMaximumGrowthBytes {
 		t.Fatalf("retained WAL allocation grew %d bytes, bound %d", growth, walRetentionMaximumGrowthBytes)
 	}
@@ -334,10 +334,14 @@ type walRetentionEvidence struct {
 }
 
 func (e walRetentionEvidence) validate() error {
+	expectedGrowth := uint64(0)
+	if e.WALFinalBytes > e.WALBaselineBytes {
+		expectedGrowth = e.WALFinalBytes - e.WALBaselineBytes
+	}
 	if e.Cycles != walRetentionCycles || e.Writes != walRetentionCycles*walRetentionKeysPerCycle ||
 		e.Restarts != walRetentionCycles || e.GenerationChanges != walRetentionCycles*rf3CommandMembers ||
-		e.LiveBytes == 0 || e.WALBaselineBytes == 0 || e.WALFinalBytes < e.WALBaselineBytes ||
-		e.WALGrowthBytes != e.WALFinalBytes-e.WALBaselineBytes ||
+		e.LiveBytes == 0 || e.WALBaselineBytes == 0 || e.WALFinalBytes == 0 ||
+		e.WALGrowthBytes != expectedGrowth ||
 		e.WALGrowthBytes > walRetentionMaximumGrowthBytes || e.WALRatioPermille > walRetentionMaximumRatioPermille ||
 		e.RSSGrowthBytes > walRetentionMaximumRSSGrowthBytes || e.FDGrowth > walRetentionMaximumFDGrowth ||
 		e.P99NS == 0 || e.P99NS > uint64(walRetentionP99Bound) || e.MaxNS < e.P99NS ||
@@ -414,7 +418,28 @@ func TestWALRetentionEvidenceRejectsInvalidBounds(t *testing.T) {
 	if err := valid.validate(); err != nil {
 		t.Fatal(err)
 	}
-	invalid := valid
+	reclaimed := valid
+	reclaimed.WALBaselineBytes = 2
+	if err := reclaimed.validate(); err != nil {
+		t.Fatalf("reclaimed WAL allocation rejected: %v", err)
+	}
+	invalid := reclaimed
+	invalid.WALGrowthBytes = 1
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted invented WAL growth after reclamation")
+	}
+	invalid = reclaimed
+	invalid.WALFinalBytes = 0
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted absent final WAL allocation")
+	}
+	invalid = valid
+	invalid.WALBaselineBytes = 0
+	invalid.WALGrowthBytes = invalid.WALFinalBytes
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted absent baseline WAL allocation")
+	}
+	invalid = valid
 	invalid.WALGrowthBytes = walRetentionMaximumGrowthBytes + 1
 	invalid.WALFinalBytes = invalid.WALBaselineBytes + invalid.WALGrowthBytes
 	if err := invalid.validate(); err == nil {

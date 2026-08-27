@@ -23,8 +23,8 @@ const (
 
 // Qualification is the exact bounded evidence emitted by the external RF3
 // process test. All counters describe observed cuts, not inferred availability
-// or latency. Growth is high-water growth and never wraps when the final sample
-// is below the baseline.
+// or latency. RSS growth uses the sampled high-water mark. WAL growth is the
+// positive endpoint delta; reclamation never causes unsigned underflow.
 type Qualification struct {
 	KillBeforeRequestCuts, KillAdmissionResponseCuts, KillAfterApplyResponseCuts                uint32
 	AsymmetricPartitionLoops                                                                    uint32
@@ -36,6 +36,12 @@ type Qualification struct {
 }
 
 func (q Qualification) Validate() error {
+	// Reclamation can reduce allocation. Preserve both measured endpoints;
+	// growth is the positive delta, never unsigned underflow.
+	expectedWALGrowth := uint64(0)
+	if q.WALFinalBytes > q.WALBaselineBytes {
+		expectedWALGrowth = q.WALFinalBytes - q.WALBaselineBytes
+	}
 	expectedRSSGrowth := uint64(0)
 	if q.WaiterRSSPeakBytes > q.WaiterRSSBaselineBytes {
 		expectedRSSGrowth = q.WaiterRSSPeakBytes - q.WaiterRSSBaselineBytes
@@ -47,7 +53,7 @@ func (q Qualification) Validate() error {
 		q.WaiterCalls != RequiredWaiterWaves*RequiredWaiterCallsPerWave ||
 		q.WaiterCompletions == 0 || q.WaiterCompletions+q.WaiterRefusals != q.WaiterCalls ||
 		q.WaiterReuseCompletions != q.WaiterWaves || q.WALBaselineBytes == 0 ||
-		q.WALFinalBytes < q.WALBaselineBytes || q.WALGrowthBytes != q.WALFinalBytes-q.WALBaselineBytes ||
+		q.WALFinalBytes == 0 || q.WALGrowthBytes != expectedWALGrowth ||
 		q.WALGrowthBoundBytes != WALGrowthBoundBytes || q.WALGrowthBytes > q.WALGrowthBoundBytes ||
 		q.WaiterRSSBaselineBytes == 0 || q.WaiterRSSPeakBytes < q.WaiterRSSBaselineBytes ||
 		q.WaiterRSSGrowthBoundBytes != WaiterRSSGrowthBoundBytes ||

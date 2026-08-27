@@ -307,8 +307,8 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	}
 
 	allocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
-	allocatedDelta := allocated - fixture.walAllocatedBaseline
-	if allocatedDelta < 0 || uint64(allocatedDelta) > rf3bench.WALGrowthBoundBytes {
+	allocatedDelta := max(int64(0), allocated-fixture.walAllocatedBaseline)
+	if uint64(allocatedDelta) > rf3bench.WALGrowthBoundBytes {
 		t.Fatalf("small RF3 fault run allocated %d additional WAL bytes, want <= %d",
 			allocatedDelta, rf3bench.WALGrowthBoundBytes)
 	}
@@ -1034,33 +1034,9 @@ func rf3FaultPolicy(nodes [rf3CommandMembers]rafttransport.NodeID) []byte {
 
 func rf3FaultWALAllocatedBytes(t testing.TB, paths [rf3CommandMembers]string) int64 {
 	t.Helper()
-	var total int64
-	for _, path := range paths {
-		matches, err := filepath.Glob(path + "*")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(matches) == 0 {
-			t.Fatalf("WAL allocation evidence path %q has no files", path)
-		}
-		regular := false
-		for _, match := range matches {
-			info, err := os.Stat(match)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if info.Mode().IsRegular() {
-				regular = true
-				stat, ok := info.Sys().(*syscall.Stat_t)
-				if !ok {
-					t.Fatalf("WAL allocation evidence lacks physical block metadata for %q", match)
-				}
-				total += int64(stat.Blocks) * 512
-			}
-		}
-		if !regular {
-			t.Fatalf("WAL allocation evidence path %q has no regular files", path)
-		}
+	total, err := rf3FaultWALDirectoryAllocatedBytes(paths[:])
+	if err != nil {
+		t.Fatal(err)
 	}
 	return total
 }
