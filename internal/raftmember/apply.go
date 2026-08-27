@@ -47,6 +47,17 @@ func OpenBoundSQLWithApply(
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
+	return openBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, sqldriver.OpenReplicatedShardStoreWithApply)
+}
+
+func openBoundSQLWithApply(
+	path string,
+	wal *raftstore.Store,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+	open func(string, sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity) (*sqldriver.Database, error),
+) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	binding, bootstrap, err := applyPrerequisites(wal, authority)
 	if err != nil {
 		return nil, nil, err
@@ -54,7 +65,7 @@ func OpenBoundSQLWithApply(
 	if expectedSQL.Binding != binding {
 		return nil, nil, ErrBindingMismatch
 	}
-	database, err := sqldriver.OpenReplicatedShardStoreWithApply(
+	database, err := open(
 		path, expectedSQL, expectedApply,
 	)
 	if err != nil {
@@ -76,6 +87,12 @@ func OpenBoundSQLWithApply(
 			_ = claim.Close()
 		}
 		closeErr := database.Close()
+		// A source-not-committed proof permits an ordinary reopen only after
+		// this recovery handle closed cleanly. Never hide cleanup uncertainty
+		// behind the otherwise retryable exact-cut sentinel.
+		if closeErr != nil && errors.Is(err, sqldriver.ErrSchemaSourceNotCommitted) {
+			err = fmt.Errorf("%w: schema source cleanup: %v", ErrRuntimeOwnership, err)
+		}
 		if err == nil {
 			err = sqldriver.ErrReplicatedApplyMismatch
 		}

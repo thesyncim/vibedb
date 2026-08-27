@@ -211,12 +211,20 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, in
 			clear(key.Material[:])
 			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("open RF3 WAL group %d: %w", index, err))
 		}
-		database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(bundle.SQL.Path, wal, base.Binding.Authority, base, applyIdentity)
+		base, applyIdentity, database, apply, err := openRF3RetainedApply(bundle.SQL.Path, wal, base, applyIdentity)
 		if err != nil {
 			clear(key.Material[:])
 			return result, closePreparedRF3Groups(result.groups, errors.Join(err, wal.Close()))
 		}
+		if index < initialCount {
+			runtimeDigest = base.RelationManifestDigest
+		}
 		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
+		if !rf3SplitChildTemplateMatchesRetained(single.SplitControl.ChildRegistry, base, applyIdentity) ||
+			!rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
+			return result, closePreparedRF3Groups(append(result.groups, item),
+				fmt.Errorf("%w: group %d split child template differs from activated schema", errRF3Serving, index))
+		}
 		item.restoreOperation, err = validateRestoredRF3Bootstrap(wal, bundle.SQL.Path, base.Binding.MemberID)
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
