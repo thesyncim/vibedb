@@ -28,6 +28,11 @@ const (
 	// used at wave admission. It avoids three independent leader ReadIndex
 	// rounds while retaining ACK precedence and one applied-index fence.
 	RequestLedgerReadWave RequestLedgerReadKind = 0xe0
+	// Progress and terminal cuts are phase-aware coherent recovery images. A
+	// terminal cut returns head+terminal when terminal exists; otherwise it
+	// returns head plus the continuation/prepared/schema rows needed to resume.
+	RequestLedgerReadProgress    RequestLedgerReadKind = 0xe1
+	RequestLedgerReadTerminalCut RequestLedgerReadKind = 0xe2
 	// Issuer status is a synthetic, fixed-size coherent view rather than one
 	// directly addressable storage row.
 	RequestLedgerReadIssuerStatus RequestLedgerReadKind = 0xf0
@@ -120,6 +125,10 @@ func RequestLedgerReadMaxBytes(kind RequestLedgerReadKind) int {
 		return requestledger.MaxSchemaPinReleaseRecordBytes
 	case RequestLedgerReadWave:
 		return MaxRequestLedgerWaveReadBytes
+	case RequestLedgerReadProgress:
+		return MaxRequestLedgerProgressReadBytes
+	case RequestLedgerReadTerminalCut:
+		return MaxRequestLedgerTerminalReadBytes
 	case RequestLedgerReadIssuerStatus:
 		return requestledger.IssuerLaneStatusBytes
 	default:
@@ -230,6 +239,18 @@ func (m *Machine) RequestLedgerReadInto(
 				if err == nil {
 					result.Found = true
 					result.AuthoritativeKind = RequestLedgerReadWave
+				}
+			} else if request.Kind == RequestLedgerReadProgress {
+				result.Value, err = requestLedgerProgressRead(snapshot, dst, headRaw, home, keyDigest)
+				if err == nil {
+					result.Found = true
+					result.AuthoritativeKind = RequestLedgerReadProgress
+				}
+			} else if request.Kind == RequestLedgerReadTerminalCut {
+				result.Value, err = requestLedgerTerminalRead(snapshot, dst, headRaw, home, keyDigest)
+				if err == nil {
+					result.Found = true
+					result.AuthoritativeKind = RequestLedgerReadTerminalCut
 				}
 			} else {
 				selectedKey := requestLedgerReadStorageKey(storageKey[:0], request, home, keyDigest)

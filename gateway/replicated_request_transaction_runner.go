@@ -792,6 +792,13 @@ func (runner *DurableRequestDistributedRunner) openProgress(
 	ctx context.Context,
 	execution DurableRequestTypedExecutionContext,
 ) (requestledger.HeadRecord, requestledger.ContinuationRecord, error) {
+	if reader, ok := runner.ledger.(durableRequestProgressCutReader); ok {
+		cut, err := reader.ReadProgressCut(ctx, execution.Home, execution.Key.RequestKey)
+		if err != nil {
+			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{}, err
+		}
+		return cut.Head, cut.Continuation, nil
+	}
 	headRow, err := runner.ledger.ReadRow(ctx, execution.Home, DurableRequestLifecycleRead{
 		Key: execution.Key.RequestKey, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
 	})

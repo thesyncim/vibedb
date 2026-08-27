@@ -1126,7 +1126,8 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		len(response.Completion) > replicatedstate.MaxCompletionEnvelopeBytes ||
 		response.Outcome.CompletionBytes != len(response.Completion) ||
 		len(response.Value) > max(replication.MaxMutationValueBytes,
-			requestledger.MaxCommandBytes+replicatedRequestLedgerReadValueHeaderBytes) {
+			replicatedstate.MaxRequestLedgerTerminalReadBytes+
+				replicatedRequestLedgerReadValueHeaderBytes) {
 		return false
 	}
 	switch response.Kind {

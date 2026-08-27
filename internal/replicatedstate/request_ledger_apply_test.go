@@ -107,6 +107,61 @@ func TestRequestLedgerWaveRecoveryReadUsesOneCoherentCut(t *testing.T) {
 	}
 }
 
+func TestRequestLedgerProgressAndTerminalCutsShareOneSnapshot(t *testing.T) {
+	fixture := newRequestLedgerMachineFixture(t, 64<<20)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest{0x13}, Principal: requestledger.PrincipalID{0x23},
+		Request: requestledger.RequestID{0x33}}
+	create, wantHead := requestLedgerCreateCommand(t, fixture, key)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), create); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []RequestLedgerReadKind{
+		RequestLedgerReadProgress, RequestLedgerReadTerminalCut,
+	} {
+		read := RequestLedgerReadRequest{
+			Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+			Kind: kind, MinimumApplied: 2, MaxBytes: uint32(RequestLedgerReadMaxBytes(kind)),
+		}
+		result, err := fixture.machine.RequestLedgerReadInto(
+			read, make([]byte, 0, read.MaxBytes),
+		)
+		if err != nil || !result.Found || result.AuthoritativeKind != kind {
+			t.Fatalf("kind=%d result=%+v err=%v", kind, result, err)
+		}
+		var headRaw []byte
+		if kind == RequestLedgerReadProgress {
+			value, openErr := OpenRequestLedgerProgressReadValue(result.Value)
+			if openErr != nil || value.ContinuationFound {
+				t.Fatalf("progress=%+v err=%v", value, openErr)
+			}
+			headRaw = value.Head
+		} else {
+			value, openErr := OpenRequestLedgerTerminalReadValue(result.Value)
+			if openErr != nil || value.ContinuationFound || value.PreparedFound ||
+				value.SchemaPinFound || value.TerminalFound {
+				t.Fatalf("terminal=%+v err=%v", value, openErr)
+			}
+			headRaw = value.Head
+		}
+		head, openErr := requestledger.OpenHead(headRaw)
+		if openErr != nil || head.KeyDigest != wantHead.KeyDigest {
+			t.Fatalf("head=%+v err=%v", head, openErr)
+		}
+		if _, openErr = func() (any, error) {
+			if kind == RequestLedgerReadProgress {
+				return OpenRequestLedgerProgressReadValue(result.Value[:len(result.Value)-1])
+			}
+			return OpenRequestLedgerTerminalReadValue(result.Value[:len(result.Value)-1])
+		}(); openErr == nil {
+			t.Fatal("accepted truncated coherent cut")
+		}
+	}
+}
+
 func BenchmarkRequestLedgerWaveRecoveryRead(b *testing.B) {
 	fixture := newRequestLedgerMachineFixture(b, 64<<20)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {

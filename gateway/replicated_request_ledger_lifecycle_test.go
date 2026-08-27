@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -44,10 +45,11 @@ func TestDurableRequestLedgerRF3ReadsWaveCutInOneRequest(t *testing.T) {
 			read.MaxBytes != uint32(replicatedstate.MaxRequestLedgerWaveReadBytes) {
 			t.Fatalf("read=%+v", read)
 		}
-		return ReplicatedRequestLedgerReadResult{Applied: 17, Found: true,
+		return ReplicatedRequestLedgerReadResult{Applied: 17, Found: true, Retries: 2,
 			AuthoritativeKind: replicatedstate.RequestLedgerReadWave, Value: raw}, nil
 	}}
-	ledger := &DurableRequestLedgerRF3{client: stub}
+	metrics := &DurableRequestLedgerReadMetrics{}
+	ledger := &DurableRequestLedgerRF3{client: stub, readCollector: metrics}
 	steps := make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps)
 	cut, err := ledger.ReadWaveCut(context.Background(), home, rows.head.Key, steps)
 	if err != nil || reads != 1 || cut.Applied != 17 ||
@@ -56,6 +58,60 @@ func TestDurableRequestLedgerRF3ReadsWaveCutInOneRequest(t *testing.T) {
 		cut.Pending.WaveDigest != rows.pending.WaveDigest ||
 		len(cut.Pending.Steps) != len(rows.pending.Steps) {
 		t.Fatalf("reads=%d cut=%+v err=%v", reads, cut, err)
+	}
+	if snapshot := metrics.Snapshot(replicatedstate.RequestLedgerReadWave); snapshot !=
+		(DurableRequestLedgerReadSnapshot{Calls: 1, Retries: 2, ResponseBytes: uint64(len(raw))}) {
+		t.Fatalf("metrics=%+v", snapshot)
+	}
+}
+
+func TestDurableRequestLedgerRF3ReadsProgressAndTerminalCutsOnce(t *testing.T) {
+	rows := lifecycleRowFixture(t)
+	homePoint, _ := requestledger.Home(rows.head.Key)
+	home := DurableRequestLedgerHome{
+		Identity: replication.Digest(lifecycleDigest("range")), Point: homePoint,
+	}
+	headRaw, _ := requestledger.AppendHead(nil, rows.head)
+	continuationRaw, _ := requestledger.AppendContinuation(nil, rows.continuation)
+	progressRaw := make([]byte, 9, 9+len(headRaw)+len(continuationRaw))
+	progressRaw[0] = 1
+	binary.LittleEndian.PutUint32(progressRaw[1:5], uint32(len(headRaw)))
+	binary.LittleEndian.PutUint32(progressRaw[5:9], uint32(len(continuationRaw)))
+	progressRaw = append(progressRaw, headRaw...)
+	progressRaw = append(progressRaw, continuationRaw...)
+	terminalRaw, _ := requestledger.AppendTerminal(nil, rows.terminal)
+	terminalCutRaw := make([]byte, 21, 21+len(headRaw)+len(terminalRaw))
+	terminalCutRaw[0] = 8
+	binary.LittleEndian.PutUint32(terminalCutRaw[1:5], uint32(len(headRaw)))
+	binary.LittleEndian.PutUint32(terminalCutRaw[17:21], uint32(len(terminalRaw)))
+	terminalCutRaw = append(terminalCutRaw, headRaw...)
+	terminalCutRaw = append(terminalCutRaw, terminalRaw...)
+	reads := 0
+	stub := lifecycleRF3Stub{read: func(
+		_ context.Context, _ DurableRequestLedgerHome, read ReplicatedRequestLedgerRead,
+	) (ReplicatedRequestLedgerReadResult, error) {
+		reads++
+		switch read.Kind {
+		case replicatedstate.RequestLedgerReadProgress:
+			return ReplicatedRequestLedgerReadResult{Applied: 21, Found: true,
+				AuthoritativeKind: read.Kind, Value: progressRaw}, nil
+		case replicatedstate.RequestLedgerReadTerminalCut:
+			return ReplicatedRequestLedgerReadResult{Applied: 22, Found: true,
+				AuthoritativeKind: read.Kind, Value: terminalCutRaw}, nil
+		default:
+			return ReplicatedRequestLedgerReadResult{}, ErrDurableRequest
+		}
+	}}
+	ledger := &DurableRequestLedgerRF3{client: stub}
+	progress, err := ledger.ReadProgressCut(context.Background(), home, rows.head.Key)
+	if err != nil || progress.Applied != 21 ||
+		progress.Continuation.ContinuationDigest != rows.continuation.ContinuationDigest {
+		t.Fatalf("progress=%+v err=%v", progress, err)
+	}
+	terminal, err := ledger.ReadTerminalCut(context.Background(), home, rows.head.Key)
+	if err != nil || terminal.Applied != 22 ||
+		terminal.Terminal.ResultDigest != rows.terminal.ResultDigest || reads != 2 {
+		t.Fatalf("reads=%d terminal=%+v err=%v", reads, terminal, err)
 	}
 }
 
@@ -75,15 +131,81 @@ func BenchmarkDurableRequestLedgerRF3ReadWaveCut(b *testing.B) {
 		return ReplicatedRequestLedgerReadResult{Applied: 17, Found: true,
 			AuthoritativeKind: replicatedstate.RequestLedgerReadWave, Value: raw}, nil
 	}}
-	ledger := &DurableRequestLedgerRF3{client: stub}
-	steps := make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		cut, err := ledger.ReadWaveCut(context.Background(), home, head.Key, steps)
-		if err != nil || cut.Head.KeyDigest != head.KeyDigest {
-			b.Fatalf("cut=%+v err=%v", cut, err)
+	for _, test := range []struct {
+		name      string
+		collector DurableRequestLedgerReadCollector
+	}{
+		{name: "metrics_disabled"},
+		{name: "metrics_enabled", collector: &DurableRequestLedgerReadMetrics{}},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			ledger := &DurableRequestLedgerRF3{client: stub, readCollector: test.collector}
+			steps := make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps)
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				cut, err := ledger.ReadWaveCut(ctx, home, head.Key, steps)
+				if err != nil || cut.Head.KeyDigest != head.KeyDigest {
+					b.Fatalf("cut=%+v err=%v", cut, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDurableRequestLedgerRF3ReadMetricsCoverRowsAndFailures(t *testing.T) {
+	head, _, _ := lifecycleHead(t)
+	homePoint, _ := requestledger.Home(head.Key)
+	home := DurableRequestLedgerHome{
+		Identity: replication.Digest(lifecycleDigest("range")), Point: homePoint,
+	}
+	headRaw, err := requestledger.AppendHead(nil, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	stub := lifecycleRF3Stub{read: func(
+		context.Context, DurableRequestLedgerHome, ReplicatedRequestLedgerRead,
+	) (ReplicatedRequestLedgerReadResult, error) {
+		calls++
+		if calls == 1 {
+			return ReplicatedRequestLedgerReadResult{
+				Applied: 9, Found: true, AuthoritativeKind: replicatedstate.RequestLedgerReadHead,
+				Retries: 3, Value: headRaw,
+			}, nil
 		}
+		return ReplicatedRequestLedgerReadResult{
+			Retries: 4, Value: []byte("partial"),
+		}, context.Canceled
+	}}
+	metrics := &DurableRequestLedgerReadMetrics{}
+	ledger := &DurableRequestLedgerRF3{client: stub, readCollector: metrics}
+	read := DurableRequestLifecycleRead{
+		Key: head.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
+	}
+	row, err := ledger.ReadRow(context.Background(), home, read)
+	if err != nil || !row.Found || row.Head.KeyDigest != head.KeyDigest {
+		t.Fatalf("row=%+v err=%v", row, err)
+	}
+	if _, err := ledger.ReadRow(context.Background(), home, read); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	want := DurableRequestLedgerReadSnapshot{
+		Calls: 2, Retries: 7, ResponseBytes: uint64(len(headRaw) + len("partial")), Errors: 1,
+	}
+	if got := metrics.Snapshot(replicatedstate.RequestLedgerReadHead); got != want {
+		t.Fatalf("metrics=%+v want=%+v", got, want)
+	}
+	if got := metrics.Snapshot(replicatedstate.RequestLedgerReadKind(0xff)); got !=
+		(DurableRequestLedgerReadSnapshot{}) {
+		t.Fatalf("unknown metrics=%+v", got)
+	}
+	metrics.ObserveDurableRequestLedgerRead(DurableRequestLedgerReadObservation{
+		Kind: replicatedstate.RequestLedgerReadKind(0xff), Failed: true,
+	})
+	if got := metrics.Snapshot(replicatedstate.RequestLedgerReadHead); got != want {
+		t.Fatalf("known metrics changed by unknown kind: %+v", got)
 	}
 }
 

@@ -447,6 +447,21 @@ func (coordinator *DurableRequestTerminalCoordinator) openTerminalRows(
 	requestledger.PreparedTerminalRecord, requestledger.SchemaPinReleaseRecord,
 	requestledger.TerminalRecord, uint64, error,
 ) {
+	if reader, ok := coordinator.ledger.(durableRequestTerminalCutReader); ok {
+		cut, err := reader.ReadTerminalCut(ctx, plan.Home, plan.Key)
+		if err != nil {
+			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
+				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
+				requestledger.TerminalRecord{}, 0, err
+		}
+		if cut.Terminal.Revision == 0 && cut.Continuation.Revision == 0 {
+			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
+				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
+				requestledger.TerminalRecord{}, 0, ErrDurableRequestConflict
+		}
+		return cut.Head, cut.Continuation, cut.Prepared, cut.SchemaPin,
+			cut.Terminal, cut.Applied, nil
+	}
 	headRow, err := coordinator.ledger.ReadRow(ctx, plan.Home, DurableRequestLifecycleRead{
 		Key: plan.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
 	})
