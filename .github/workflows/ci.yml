@@ -276,6 +276,7 @@ jobs:
         run: |
           go test ./gateway -run '^TestAuthorizedClientTLSNetworkChaosAndThroughputGate$' -count=1 -v
           go test ./gateway -run '^TestAuthenticated(GatewayShardHotAuthorizationAllocationFree|ShardBoundaryRotationAndConfusedDeputyFault)$' -count=1 -v
+          VIBEDB_AUTH_TRANSPORT_PROCESS_E2E=1 go test ./gateway -run '^TestAuthenticatedGatewayShardProcessPartitionRotationAndDeputyFaults$' -count=3 -v
           go test ./gateway -run '^$' -bench '^BenchmarkAuthorizedClientTLSRequest$' -benchtime=2000x -count=1
           go test ./gateway -run '^$' -bench '^BenchmarkAuthenticatedGatewayShardStream$' -benchtime=2000x -count=1
       - name: RF3 exhaustive quorum and multi-group scaling evidence
