@@ -32,10 +32,9 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 
 	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
 	for sequence := uint64(2); sequence <= 3; sequence++ {
-		key, _ := orderedkey.AppendJSONString(nil, []byte{byte('a' + sequence - 2)}, orderedkey.Ascending)
+		key, document := generationDriverMutation(t, sequence)
 		command := testApplyCommand(
-			fixture.base, epoch, sequence, key,
-			[]byte(`{"id":"generation-driver","value":1}`),
+			fixture.base, epoch, sequence, key, document,
 		)
 		if err := fixture.runtime.Propose(command); err != nil {
 			t.Fatal(err)
@@ -87,6 +86,27 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 	}
 	if err := reopenedWAL.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func generationDriverMutation(t testing.TB, sequence uint64) ([]byte, []byte) {
+	t.Helper()
+	id := byte('a' + sequence - 2)
+	key, ok := orderedkey.AppendJSONString(nil, []byte{'"', id, '"'}, orderedkey.Ascending)
+	if !ok {
+		t.Fatal("invalid JSON primary key")
+	}
+	document := []byte(`{"id":"a","value":1}`)
+	document[7] = id
+	return key, document
+}
+
+func TestGenerationDriverMutationPreflight(t *testing.T) {
+	for sequence := uint64(2); sequence <= 3; sequence++ {
+		key, document := generationDriverMutation(t, sequence)
+		if len(key) == 0 || document[7] != byte('a'+sequence-2) {
+			t.Fatalf("invalid generation fixture: key=%x document=%s", key, document)
+		}
 	}
 }
 
