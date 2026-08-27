@@ -82,6 +82,9 @@ type bootstrapState struct {
 // LoadBootstrapState opens the authenticated committed bootstrap cut and
 // returns the renderer identities without exposing private key material.
 func LoadBootstrapState(stateDirectory string) (BootstrapResult, error) {
+	if !validBootstrapStateDirectory(stateDirectory) {
+		return BootstrapResult{}, ErrBootstrap
+	}
 	raw, err := os.ReadFile(filepath.Join(stateDirectory, bootstrapStateName))
 	if err != nil {
 		return BootstrapResult{}, err
@@ -267,9 +270,8 @@ func Bootstrap(writer io.Writer, config BootstrapConfig) (BootstrapResult, error
 	if err := os.MkdirAll(config.StateDirectory, 0o700); err != nil {
 		return BootstrapResult{}, err
 	}
-	info, err := os.Lstat(config.StateDirectory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return BootstrapResult{}, errors.Join(ErrBootstrap, err)
+	if !validBootstrapStateDirectory(config.StateDirectory) {
+		return BootstrapResult{}, ErrBootstrap
 	}
 	if bundle, state, found, err := recoverBootstrap(config); err != nil {
 		return BootstrapResult{}, err
@@ -305,6 +307,13 @@ func bootstrapResult(state bootstrapState, size int) BootstrapResult {
 
 func validBootstrapConfig(c BootstrapConfig) bool {
 	return dnsLabel.MatchString(c.Namespace) && dnsLabel.MatchString(c.ManifestConfigMap) && dnsLabel.MatchString(c.TLSSecret) && dnsLabel.MatchString(c.GatewayConfigMap) && dnsLabel.MatchString(c.GatewayTLSSecret) && filepath.IsAbs(c.StateDirectory) && filepath.Clean(c.StateDirectory) == c.StateDirectory && c.StateDirectory != "/"
+}
+func validBootstrapStateDirectory(path string) bool {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
+		return false
+	}
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o077 == 0
 }
 func validBootstrapState(s bootstrapState, c BootstrapConfig, bundle []byte) bool {
 	if s.Format != bootstrapFormat || s.Namespace != c.Namespace || s.ManifestConfigMap != c.ManifestConfigMap || s.TLSSecret != c.TLSSecret || s.GatewayConfigMap != c.GatewayConfigMap || s.GatewayTLSSecret != c.GatewayTLSSecret || s.BundleBytes != uint64(len(bundle)) || len(s.BundleDigest) != 64 {

@@ -44,6 +44,29 @@ jobs:
           cmp "${first}" "${second}"
           go run ./cmd/vibedb-operator validate -manifest "${first}"
           kubectl apply --dry-run=client --validate=false -f "${first}"
+  kubernetes-rf3:
+    name: Kubernetes RF3 serving and restart qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Install pinned Kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Qualify three-worker RF3 topology
+        env:
+          VIBEDB_KUBE_EVIDENCE_DIR: ${{ runner.temp }}/vibedb-kube-rf3-evidence
+        run: deploy/kubernetes/qualify-kind.sh
+      - name: Upload Kubernetes RF3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-rf3-${{ github.sha }}
+          path: ${{ runner.temp }}/vibedb-kube-rf3-evidence
+          if-no-files-found: error
+          retention-days: 30
   test:
     name: test (${{ matrix.runner }})
     strategy:

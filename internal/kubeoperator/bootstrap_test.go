@@ -78,6 +78,12 @@ func TestBootstrapCreatesCanonicalResumableRF3Authority(t *testing.T) {
 	if err != nil || loaded != result {
 		t.Fatalf("loaded=%+v err=%v", loaded, err)
 	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadBootstrapState(root); !errors.Is(err, ErrBootstrap) {
+		t.Fatalf("loaded authority from public directory: %v", err)
+	}
 }
 
 func TestBootstrapPropagatesEntropyFailure(t *testing.T) {

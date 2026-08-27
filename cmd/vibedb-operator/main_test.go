@@ -89,4 +89,8 @@ func TestRenderAndPrepareRejectPositionalArguments(t *testing.T) {
 	if err := prepare([]string{"junk"}); err == nil {
 		t.Fatal("prepare positional argument accepted")
 	}
+	if err := render([]string{"-shard-node-ids=a,b,c,d,e,f,g,h,i",
+		"-bootstrap-state-dir=" + t.TempDir()}); err == nil {
+		t.Fatal("render accepted competing node identity authorities")
+	}
 }

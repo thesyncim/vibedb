@@ -100,6 +100,7 @@ func render(arguments []string) error {
 	namespace := flags.String("namespace", "vibedb", "Kubernetes namespace")
 	image := flags.String("image", "", "VibeDB image reference")
 	nodes := flags.String("shard-node-ids", "", "nine comma-separated TLS node IDs: catalog, ledger, then data ordinal order")
+	bootstrapState := flags.String("bootstrap-state-dir", "", "absolute private bootstrap state directory supplying authenticated node IDs")
 	manifestConfig := flags.String("shard-manifests", "vibedb-rf3-manifests", "ConfigMap containing catalog-, ledger-, and data-{0,1,2}.vibejson")
 	tlsSecret := flags.String("shard-tls", "vibedb-rf3-tls", "Secret containing shard TLS material and WAL key source")
 	gatewayConfig := flags.String("gateway-config", "vibedb-gateway-config", "ConfigMap containing catalog, policy, and replica-control manifests")
@@ -113,12 +114,27 @@ func render(arguments []string) error {
 	if flags.NArg() != 0 {
 		return errors.New("render accepts no positional arguments")
 	}
-	parts := strings.Split(*nodes, ",")
-	if len(parts) != 9 {
+	var shardNodeIDs [9]string
+	if *bootstrapState != "" {
+		if *nodes != "" {
+			return errors.New("-bootstrap-state-dir and -shard-node-ids are mutually exclusive")
+		}
+		result, err := kubeoperator.LoadBootstrapState(*bootstrapState)
+		if err != nil {
+			return err
+		}
+		shardNodeIDs = result.ShardNodeIDs
+	} else {
+		parts := strings.Split(*nodes, ",")
+		if len(parts) == len(shardNodeIDs) {
+			shardNodeIDs = [9]string(parts)
+		}
+	}
+	if shardNodeIDs == ([9]string{}) {
 		return errors.New("-shard-node-ids requires exactly nine values")
 	}
 	return kubeoperator.Render(os.Stdout, kubeoperator.Config{Namespace: *namespace, Image: *image,
-		ShardNodeIDs:      [9]string(parts),
+		ShardNodeIDs:      shardNodeIDs,
 		ManifestConfigMap: *manifestConfig, TLSSecret: *tlsSecret,
 		GatewayConfigMap: *gatewayConfig, GatewayTLSSecret: *gatewayTLS,
 		StorageClass: *storageClass, ShardStorage: *shardStorage, GatewayStorage: *gatewayStorage})

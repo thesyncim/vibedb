@@ -196,7 +196,7 @@ spec:
           startupProbe: {tcpSocket: {port: native}, failureThreshold: 60, periodSeconds: 2}
           readinessProbe: {tcpSocket: {port: native}, periodSeconds: 2, failureThreshold: 2}
           livenessProbe: {tcpSocket: {port: native}, periodSeconds: 10, failureThreshold: 6}
-          resources: {requests: {cpu: "1", memory: 1Gi}}
+          resources: {requests: {cpu: "500m", memory: 1Gi}}
           volumeMounts:
             - {name: data, mountPath: /var/lib/vibedb}
             - {name: tls, mountPath: /run/secrets/vibedb, readOnly: true}
@@ -219,8 +219,11 @@ kind: Service
 metadata: {name: vibedb-gateway-peer, namespace: %s}
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector: {app.kubernetes.io/name: vibedb-gateway}
-  ports: [{name: client, port: 7400, targetPort: client}]
+  ports:
+    - {name: client, port: 7400, targetPort: client}
+    - {name: control, port: 7401, targetPort: control}
 ---
 apiVersion: v1
 kind: Service
@@ -265,10 +268,12 @@ spec:
           args:
             - serve
             - -catalog=/etc/vibedb/cluster.vibejson
+            - -catalog-bootstrap-if-missing
             - -catalog-relation=1
             - -catalog-session-journal=/var/lib/vibedb/catalog-session
             - -catalog-client-id=21000000000000000000000000000000
             - -catalog-retry-home=2200000000000000
+            - -durable-ack-key=/run/secrets/vibedb/durable-ack-key
             - -listen=0.0.0.0:7400
             - -tls-certificate=/run/secrets/vibedb/gateway-cert.pem
             - -tls-key=/run/secrets/vibedb/gateway-key.pem
@@ -286,11 +291,13 @@ spec:
             - -shard-peer=vibedb-data-1.vibedb-data-peer:7511=%s
             - -shard-peer=vibedb-data-2.vibedb-data-peer:7511=%s
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
-          ports: [{name: client, containerPort: 7400}]
+          ports:
+            - {name: client, containerPort: 7400}
+            - {name: control, containerPort: 7401}
           startupProbe: {tcpSocket: {port: client}, failureThreshold: 60, periodSeconds: 2}
           readinessProbe: {tcpSocket: {port: client}, periodSeconds: 2, failureThreshold: 2}
           livenessProbe: {tcpSocket: {port: client}, periodSeconds: 10, failureThreshold: 6}
-          resources: {requests: {cpu: "1", memory: 1Gi}}
+          resources: {requests: {cpu: "500m", memory: 1Gi}}
           volumeMounts:
             - {name: data, mountPath: /var/lib/vibedb}
             - {name: config, mountPath: /etc/vibedb, readOnly: true}

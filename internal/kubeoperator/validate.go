@@ -62,6 +62,11 @@ func ValidateRendered(raw []byte) error {
 			return ErrManifest
 		}
 	}
+	for _, required := range []string{"- -catalog-bootstrap-if-missing", "- -durable-ack-key=/run/secrets/vibedb/durable-ack-key", "{name: control, port: 7401, targetPort: control}", "{name: control, containerPort: 7401}"} {
+		if !bytes.Contains(raw, []byte(required)) {
+			return ErrManifest
+		}
+	}
 	return nil
 }
 
