@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -624,6 +623,7 @@ func evidenceCounters(before, after rf3EvidenceCut, reads, writes, retries, logi
 }
 
 func evidenceMetadata(readLimit uint32) []rf3bench.Metadata {
+	revision, modified := rf3bench.BuildProvenance()
 	metadata := []rf3bench.Metadata{
 		{Key: []byte("counter_cut"), Value: []byte("followers-applied")},
 		{Key: []byte("go_version"), Value: []byte(runtime.Version())},
@@ -633,18 +633,8 @@ func evidenceMetadata(readLimit uint32) []rf3bench.Metadata {
 		{Key: []byte("read_max_value_bytes"), Value: strconv.AppendUint(nil, uint64(readLimit), 10)},
 		{Key: []byte("read_retry_backoff_cap_ns"), Value: strconv.AppendUint(nil, uint64(rf3EvidenceReadBackoffCap), 10)},
 		{Key: []byte("read_retry_rounds"), Value: strconv.AppendUint(nil, rf3EvidenceReadAttempts, 10)},
-		{Key: []byte("vcs_modified"), Value: []byte("unknown")},
-		{Key: []byte("vcs_revision"), Value: []byte("unknown")},
-	}
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			switch setting.Key {
-			case "vcs.revision":
-				metadata[len(metadata)-1].Value = []byte(setting.Value)
-			case "vcs.modified":
-				metadata[len(metadata)-2].Value = []byte(setting.Value)
-			}
-		}
+		{Key: []byte("vcs_modified"), Value: []byte(modified)},
+		{Key: []byte("vcs_revision"), Value: []byte(revision)},
 	}
 	return metadata
 }

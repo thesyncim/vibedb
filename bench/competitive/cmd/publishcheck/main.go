@@ -399,10 +399,25 @@ func validateRF3(t table, revision, workload, clients string) error {
 	if len(t.lines) == 0 || !slices.Equal(t.lines[0], []string{"schema", "vibedb.rf3.evidence", "1"}) {
 		return errors.New("wrong RF3 schema")
 	}
-	meta, _ := exactPairs(t, "meta")
-	config, _ := exactPairs(t, "config")
-	if meta["durability"] != "power-safe" || meta["replicas"] != "3" || meta["vcs_modified"] != "false" || meta["vcs_revision"] != revision || config["workload"] != workload || config["clients"] != clients {
-		return errors.New("RF3 metadata mismatch")
+	meta, err := exactPairs(t, "meta")
+	if err != nil {
+		return fmt.Errorf("RF3 meta: %w", err)
+	}
+	config, err := exactPairs(t, "config")
+	if err != nil {
+		return fmt.Errorf("RF3 config: %w", err)
+	}
+	for _, required := range []struct{ kind, key, got, want string }{
+		{"meta", "durability", meta["durability"], "power-safe"},
+		{"meta", "replicas", meta["replicas"], "3"},
+		{"meta", "vcs_modified", meta["vcs_modified"], "false"},
+		{"meta", "vcs_revision", meta["vcs_revision"], revision},
+		{"config", "workload", config["workload"], workload},
+		{"config", "clients", config["clients"], clients},
+	} {
+		if required.got != required.want {
+			return fmt.Errorf("RF3 %s %q mismatch: got %q, want %q", required.kind, required.key, required.got, required.want)
+		}
 	}
 	requiredSummary := map[string]bool{"p50_ns": false, "p99_ns": false, "p99.9_ns": false, "max_ns": false}
 	requiredCounters := map[string]bool{"network\tsent_bytes": false, "storage\tdevice_bytes": false, "storage\tfile_end": false, "workload\tlogical_write_bytes": workload == "read"}

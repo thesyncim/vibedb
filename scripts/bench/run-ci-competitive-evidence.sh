@@ -28,6 +28,25 @@ mkdir -m 700 "${evidence}"
 scratch=$(mktemp -d)
 trap 'rm -rf -- "${scratch}"' EXIT
 
+# Test binaries omit Go's vcs.* build settings. Stamp this binary from the
+# checked compile-time tree, then run that same binary for every RF3 sample.
+if [[ ! ${revision} =~ ^[0-9a-f]{40}$ && ! ${revision} =~ ^[0-9a-f]{64}$ ]]; then
+  echo "invalid compile-time source revision" >&2
+  exit 1
+fi
+cd "${repo}"
+if [[ $(git rev-parse HEAD) != "${revision}" || -n $(git status --porcelain=v1 --untracked-files=normal) ]]; then
+  echo "source changed before RF3 qualification build" >&2
+  exit 1
+fi
+go test -c \
+  -ldflags "-X github.com/thesyncim/vibedb/internal/rf3bench.buildRevision=${revision} -X github.com/thesyncim/vibedb/internal/rf3bench.buildModified=false" \
+  -o "${scratch}/rf3-evidence.test" ./internal/raftservice
+if [[ $(git rev-parse HEAD) != "${revision}" || -n $(git status --porcelain=v1 --untracked-files=normal) ]]; then
+  echo "source changed during RF3 qualification build" >&2
+  exit 1
+fi
+
 filesystem=$(stat -f -c '%T' "${evidence}")
 {
   printf 'meta\tcommand_schema\tvibedb.ci-evidence/1\n'
@@ -91,7 +110,7 @@ for run in 1 2 3; do
     VIBEDB_RF3_OPERATIONS=512 \
     VIBEDB_RF3_WARMUP=32 \
     VIBEDB_RF3_WORKLOAD="${workload}" \
-      go test -count=1 -timeout=10m -run '^TestRF3EvidenceMatrix$' ./internal/raftservice
+      "${scratch}/rf3-evidence.test" -test.count=1 -test.timeout=10m -test.run '^TestRF3EvidenceMatrix$'
   done
 done
 go run ./bench/rf3chaos -output "${evidence}/rf3-chaos.tsv" -runs 3 -timeout 3m
