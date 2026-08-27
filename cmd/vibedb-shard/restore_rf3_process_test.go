@@ -464,7 +464,9 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13, RelationManifestDigest: profile.RelationManifestDigest, RoutingVersion: 17, RouteGeneration: 19}
+	// The source configuration entry at index two advances its membership
+	// version even though its voter set is unchanged.
+	fence := raftservice.CommandFence{ReplicaSetVersion: 2, ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13, RelationManifestDigest: profile.RelationManifestDigest, RoutingVersion: 17, RouteGeneration: 19}
 	if ordinal == 1 {
 		group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
 		helper := rf3FaultFixture{group: group}
@@ -511,6 +513,7 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 		}
 	}
 	fence.ProtectionEpoch, fence.OwnershipEpoch, fence.RoutingVersion, fence.RouteGeneration = 1, 1, 1, 1
+	fence.ReplicaSetVersion = 1
 	cut, err := prepared.Apply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
