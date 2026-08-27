@@ -67,6 +67,9 @@ type LocalChildLifecycle struct {
 	activation sqldriver.ReplicatedChildActivation
 	wal        *raftstore.Store
 	adopted    raftmember.RuntimeIdentity
+	applyID    sqldriver.ReplicatedApplyIdentity
+	profile    sqldriver.ReplicatedApplyCapacityProfile
+	walBinding sqldriver.ReplicatedShardStoreBinding
 }
 
 func NewLocalChildLifecycle(options LocalChildLifecycleOptions) (*LocalChildLifecycle, error) {
@@ -125,6 +128,11 @@ func (l *LocalChildLifecycle) ExecuteActivateChild(
 		return err
 	}
 	l.activation = activation
+	l.applyID = activation.ApplyIdentity
+	l.profile, err = activation.Apply.CapacityQualificationProfile()
+	if err != nil {
+		return err
+	}
 	return l.validateActivation(target, certificate)
 }
 
@@ -160,7 +168,34 @@ func (l *LocalChildLifecycle) ExecuteCreateChildWAL(
 		return err
 	}
 	l.wal = wal
+	l.walBinding, err = raftmember.BindingFromWAL(wal, l.options.Authority)
+	if err != nil {
+		return err
+	}
 	return nil
+}
+
+// ObserveChild returns the monotonic, bounded local lifecycle proof without
+// reopening SQL or WAL state. The proof remains available after ownership is
+// transferred to the serving multi-Raft runtime.
+func (l *LocalChildLifecycle) ObserveChild(child uint8) (*ChildObservation, error) {
+	if l == nil || child != l.options.Child {
+		return nil, ErrRuntimeStore
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.applyID.Storage == "" {
+		return nil, nil
+	}
+	result := &ChildObservation{Child: child, Phase: ChildPhaseActivated,
+		ApplyIdentity: l.applyID, ApplyProfile: l.profile}
+	if l.walBinding != (sqldriver.ReplicatedShardStoreBinding{}) {
+		result.Phase, result.WALBinding = ChildPhaseWALCreated, l.walBinding
+	}
+	if l.adopted != (raftmember.RuntimeIdentity{}) {
+		result.Phase, result.RuntimeIdentity = ChildPhaseRuntimeAdopted, l.adopted
+	}
+	return result, nil
 }
 
 // ExecuteAdoptChildRuntime mints one runtime incarnation and transfers it to

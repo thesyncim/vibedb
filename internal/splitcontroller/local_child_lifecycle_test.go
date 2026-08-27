@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -17,6 +18,24 @@ func (a rejectingSplitChildAdopter) AdoptSplitChild(
 	context.Context, OperationID, uint8, PreparedChildRuntime,
 ) error {
 	return a.err
+}
+
+func TestLocalChildLifecycleObservationSurvivesRuntimeHandoff(t *testing.T) {
+	lifecycle := &LocalChildLifecycle{options: LocalChildLifecycleOptions{Child: 1},
+		applyID:    sqldriver.ReplicatedApplyIdentity{Storage: "apply"},
+		profile:    sqldriver.ReplicatedApplyCapacityProfile{Initialized: true},
+		walBinding: sqldriver.ReplicatedShardStoreBinding{MemberID: 2},
+		adopted:    raftmember.RuntimeIdentity{MemberID: 2},
+	}
+	observed, err := lifecycle.ObserveChild(1)
+	if err != nil || observed == nil || observed.Phase != ChildPhaseRuntimeAdopted ||
+		observed.ApplyIdentity.Storage != "apply" || observed.WALBinding.MemberID != 2 ||
+		observed.RuntimeIdentity.MemberID != 2 {
+		t.Fatalf("observation=%+v err=%v", observed, err)
+	}
+	if _, err = lifecycle.ObserveChild(2); !errors.Is(err, ErrRuntimeStore) {
+		t.Fatalf("wrong child err=%v", err)
+	}
 }
 
 func TestLocalChildLifecycleRejectsActionBeforeExactCertifiedPredecessor(t *testing.T) {

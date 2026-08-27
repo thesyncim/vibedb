@@ -124,6 +124,24 @@ func (executor *LazyReplicatedChildExecutor) ExecuteAuthorizedSplitAction(
 	}
 }
 
+func (executor *LazyReplicatedChildExecutor) ObserveLocalSplitChild(
+	_ context.Context, request PlanObservationRequest, member uint64,
+) (*ChildObservation, error) {
+	if executor == nil || member != executor.options.Replica.Member || request.Child != executor.options.Child {
+		return nil, ErrPlanObservation
+	}
+	target, ok := executor.options.Plan.Target(request.Child)
+	if !ok || request.Group != groupFromChildTarget(target) {
+		return nil, ErrPlanObservation
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.lifecycle == nil {
+		return nil, nil
+	}
+	return executor.lifecycle.ObserveChild(request.Child)
+}
+
 func (executor *LazyReplicatedChildExecutor) open(
 	ctx context.Context, observed Observation,
 ) error {
@@ -268,3 +286,4 @@ func groupFromChildTarget(target ChildTarget) raftmember.GroupKey {
 
 var _ AuthorizedShardActionExecutor = (*LazyReplicatedChildExecutor)(nil)
 var _ ShardActionExecutor = (*LazyReplicatedChildExecutor)(nil)
+var _ LocalChildRuntimeObserver = (*LazyReplicatedChildExecutor)(nil)
