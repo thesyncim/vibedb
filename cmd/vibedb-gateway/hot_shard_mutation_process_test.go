@@ -129,6 +129,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		nil,
 	}
 	digests := [3]replication.Digest{}
+	logicalDigests := [3]replication.Digest{}
 	for group := range identities {
 		probe, probeErr := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
 			Root: filepath.Join(root, fmt.Sprintf("probe-%d", group)), Table: tables[group],
@@ -143,7 +144,16 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		if probeErr != nil {
 			t.Fatal(probeErr)
 		}
-		digests[group] = replication.Digest(probe.Base.RelationManifestDigest)
+		machineDigest, digestErr := probe.Apply.RangeSplitRelationManifestDigest()
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		logicalDigest, digestErr := sqldriver.ReplicatedRelationManifestDigest(probe.Base)
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		digests[group] = replication.Digest(machineDigest)
+		logicalDigests[group] = replication.Digest(logicalDigest)
 		if err = probe.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -153,6 +163,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	for group := range routes {
 		routes[group] = hotMutationRoute(identities[group], listeners[group], nodes,
 			authorityProfile, digests[group])
+		routes[group].LogicalSchemaDigest = logicalDigests[group]
 	}
 	target := gateway.ReplicatedEndpoint{Member: 4, Node: nodes[3],
 		StoreID: identities[0][3].StoreID, NodeIncarnation: 44,

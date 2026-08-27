@@ -129,7 +129,7 @@ func gatewayHotSplitSource(
 		}
 	}
 	if count != 1 || profile.Relation != 1 || profile.SchemaGeneration != source.Command.SchemaGeneration ||
-		[32]byte(profile.RelationManifestDigest) != source.Command.RelationManifestDigest ||
+		profile.LogicalSchemaDigest != source.LogicalSchemaDigest ||
 		len(placement.Columns) != 1 {
 		return source, profile, placement, hotshard.ErrInvalidPressureCut
 	}

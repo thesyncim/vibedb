@@ -51,6 +51,7 @@ type ProcessMemberOptions struct {
 type PreparedProcessMember struct {
 	ManifestPath, WALPath, SQLPath string
 	RelationManifestDigest         [32]byte
+	LogicalSchemaDigest            [32]byte
 }
 
 type PreparedColdTarget struct {
@@ -184,12 +185,16 @@ func prepareProcessMember(
 	if err != nil {
 		return PreparedProcessMember{}, err
 	}
+	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(prepared.Base)
+	if err != nil {
+		return PreparedProcessMember{}, err
+	}
 	if err = prepared.Close(); err != nil {
 		return PreparedProcessMember{}, err
 	}
 	return PreparedProcessMember{ManifestPath: manifestPath,
 		WALPath: prepared.WALPath, SQLPath: prepared.SQLPath,
-		RelationManifestDigest: relationDigest}, nil
+		RelationManifestDigest: relationDigest, LogicalSchemaDigest: logicalDigest}, nil
 }
 
 func writeProcessJSON(path string, value interface{ MarshalJSON() ([]byte, error) }) error {

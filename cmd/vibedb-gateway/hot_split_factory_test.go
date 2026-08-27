@@ -82,6 +82,10 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	operationDirectory := hex.EncodeToString(operation[:])
 	localDigests := make(map[[32]byte]struct{}, gateway.ServingReplicaCount)
 	for index, replica := range target.Replicas {
+		logical, logicalErr := sqldriver.ReplicatedRelationManifestDigest(replica.SQL)
+		if logicalErr != nil || replication.Digest(logical) != profile.LogicalSchemaDigest || logical == target.RelationManifestDigest {
+			t.Fatalf("child logical schema differs from table or collapsed into machine digest: %v", logicalErr)
+		}
 		if replica.Node != source.Replicas[index].Node ||
 			replica.Member != source.Replicas[index].Member ||
 			replica.SQL.RelationManifestDigest == ([32]byte{}) ||
@@ -109,6 +113,11 @@ func gatewaySplitSourceFixture(t testing.TB, source gateway.ReplicatedShardDescr
 	entry := gatewaySplitSource{Group: source.Group, SchemaGeneration: profile.SchemaGeneration,
 		RelationManifestDigest: source.Command.RelationManifestDigest, Table: profile.Table, Template: gatewaySplitTemplateFixture()}
 	entry.SQL = gatewaySplitSourceSQLFixture(t, source, profile)
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(entry.SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.LogicalSchemaDigest = replication.Digest(logical)
 	for i, replica := range source.Replicas {
 		entry.Replicas[i] = gatewaySplitReplica{Node: replica.Node, Root: t.TempDir()}
 	}
@@ -179,11 +188,15 @@ func gatewayHotSplitFactoryFixture(
 	}
 	profile := gateway.ReplicatedTableProfile{
 		Table: "messages", Relation: 1, PrimaryKey: "/id", SchemaGeneration: 1,
-		RelationManifestDigest: replication.Digest{0x51}, MaxKeyBytes: 256,
+		LogicalSchemaDigest: replication.Digest{0x51}, MaxKeyBytes: 256,
 		MaxDocumentBytes: 4 << 20,
 	}
 	source.Command.RelationManifestDigest = gatewaySplitSourceDigestFixture(t, source, profile)
-	profile.RelationManifestDigest = replication.Digest(source.Command.RelationManifestDigest)
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(gatewaySplitSourceSQLFixture(t, source, profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.LogicalSchemaDigest, profile.LogicalSchemaDigest = replication.Digest(logical), replication.Digest(logical)
 	endpoints := map[distribution.EndpointID]string{
 		"peer-a": "127.0.0.1:1", "peer-b": "127.0.0.1:2", "peer-c": "127.0.0.1:3",
 		"native-a": "127.0.0.1:11", "native-b": "127.0.0.1:12", "native-c": "127.0.0.1:13",

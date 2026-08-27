@@ -10,6 +10,8 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/replication"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -114,6 +116,16 @@ func TestGatewaySplitSourceRejectsWrongRoleSchemaAndDescendant(t *testing.T) {
 	if !gatewaySplitSourceMatches(entry, source, profile) {
 		t.Fatal("exact source rejected")
 	}
+	wrongLogical := profile
+	wrongLogical.LogicalSchemaDigest = replication.Digest(source.Command.RelationManifestDigest)
+	if gatewaySplitSourceMatches(entry, source, wrongLogical) {
+		t.Fatal("machine digest accepted as logical table schema")
+	}
+	wrongDescriptor := source
+	wrongDescriptor.LogicalSchemaDigest[0]++
+	if gatewaySplitSourceMatches(entry, wrongDescriptor, profile) {
+		t.Fatal("foreign catalog logical schema accepted")
+	}
 	profile.SchemaGeneration++
 	if gatewaySplitSourceMatches(entry, source, profile) {
 		t.Fatal("stale authority survived schema change")
@@ -156,7 +168,11 @@ func TestGatewaySplitSourcesSelectSeparateRootsOnSharedHosts(t *testing.T) {
 	otherProfile := profile
 	otherProfile.Table = "other_messages"
 	other.Command.RelationManifestDigest = gatewaySplitSourceDigestFixture(t, other, otherProfile)
-	otherProfile.RelationManifestDigest = other.Command.RelationManifestDigest
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(gatewaySplitSourceSQLFixture(t, other, otherProfile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.LogicalSchemaDigest, otherProfile.LogicalSchemaDigest = replication.Digest(logical), replication.Digest(logical)
 	oldManifest, _ := initial.Manifest(source.Distribution)
 	otherManifest, err := distribution.NewManifest(other.Distribution, 7, []distribution.Shard{{ID: other.Shard,
 		AllocationGeneration: other.AllocationGeneration, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},

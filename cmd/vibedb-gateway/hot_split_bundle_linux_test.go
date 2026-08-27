@@ -60,7 +60,14 @@ func TestGatewayHotSplitComposedLocalGlobalBundle(t *testing.T) {
 			}
 			entry.Template.MaxBatchDocuments, entry.Template.MaxBatchBytes = entry.SQL.UserLimits.MaxBatchDocuments, entry.SQL.UserLimits.MaxBatchBytes
 			source.Command.RelationManifestDigest = entry.RelationManifestDigest
-			profile.RelationManifestDigest = replication.Digest(entry.RelationManifestDigest)
+			logical, err := sqldriver.ReplicatedRelationManifestDigest(entry.SQL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source.LogicalSchemaDigest, profile.LogicalSchemaDigest = replication.Digest(logical), replication.Digest(logical)
+			if logical == entry.RelationManifestDigest {
+				t.Fatal("logical and serving schema identity collapsed")
+			}
 			profile.MaxKeyBytes, profile.MaxDocumentBytes = uint16(entry.SQL.UserLimits.MaxKeyBytes), uint32(entry.SQL.UserLimits.MaxDocumentBytes)
 			config := distribution.ClusterConfig{}
 			spec, _ := initial.Spec(source.Distribution)

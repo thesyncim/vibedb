@@ -101,7 +101,14 @@ func TestRuntimeSnapshotStateCoversCompleteRelationBundle(t *testing.T) {
 		t.Fatal("encode bundle base key")
 	}
 	document := []byte(`{"id":"bundle-doc","email":"a"}`)
-	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["bundle-doc"]`)
+	globalKey, err := distribution.CurrentTupleCodec.AppendTuple(nil, []distribution.Scalar{distribution.NewString("a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := base.Relations[1].GlobalIndexStorageKeyPoint(globalKey); !ok {
+		t.Fatal("canonical global-index key rejected by retained relation")
+	}
+	locator := []byte(`["bundle-doc"]`)
 	commandValue := testApplyCommandValue(base, epoch, 2, baseKey, document)
 	commandValue.Batches = append(commandValue.Batches, replication.RelationMutationBatch{
 		Relation: 2,

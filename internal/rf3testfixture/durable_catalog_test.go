@@ -31,6 +31,7 @@ func durableCatalogTestRoute(ordinal byte) gateway.ReplicatedRoute {
 			RoutingVersion:         7, RouteGeneration: 8,
 		},
 		RangeIdentity:        replication.Digest{0x71, ordinal + 1},
+		LogicalSchemaDigest:  replication.Digest{0x74, ordinal + 1},
 		LineageDigest:        replication.Digest{0x72, ordinal + 1},
 		ForwardingRuleDigest: replication.Digest{0x73, ordinal + 1},
 		Replicas:             make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
@@ -102,6 +103,8 @@ func TestDurableCatalogBindsTwoDataGroupsLedgerAndSharedAckAuthority(t *testing.
 			[]byte(candidate.table), key, scratch[:0], replicas[:0],
 		)
 		if !found || resolved.Route.Group != candidate.route.Group ||
+			resolved.Route.LogicalSchemaDigest != candidate.route.LogicalSchemaDigest ||
+			resolved.Profile.LogicalSchemaDigest != candidate.route.LogicalSchemaDigest ||
 			resolved.Route.RangeIdentity != candidate.route.RangeIdentity ||
 			len(resolved.Route.Replicas) != gateway.ServingReplicaCount {
 			t.Fatalf("resolve %s = %+v,%v", candidate.table, resolved, found)
@@ -160,6 +163,9 @@ func TestDurableCatalogFailsClosedOnAuthorityAndRoleAmbiguity(t *testing.T) {
 		},
 		"missing lineage": func(options *DurableCatalogOptions) {
 			options.Groups[0].Route.LineageDigest = replication.Digest{}
+		},
+		"missing logical schema": func(options *DurableCatalogOptions) {
+			options.Groups[0].Route.LogicalSchemaDigest = replication.Digest{}
 		},
 		"duplicate additional table": func(options *DurableCatalogOptions) {
 			options.Groups[0].AdditionalTables = []DurableCatalogTable{{

@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store"
 )
@@ -47,6 +48,7 @@ type gatewaySplitSource struct {
 	Group                  raftmember.GroupKey
 	SchemaGeneration       uint64
 	RelationManifestDigest [32]byte
+	LogicalSchemaDigest    replication.Digest
 	Table                  string
 	SQL                    sqldriver.ReplicatedShardStoreIdentity
 	LocalIndexes           []store.IndexDefinition
@@ -83,6 +85,11 @@ func openGatewaySplitSources(encoded []persistedGatewaySplitSource, endpoints []
 			return nil, errGatewayReplicaControlManifest
 		}
 		source.SQL = source.SQL.Clone()
+		logical, err := sqldriver.ReplicatedRelationManifestDigest(source.SQL)
+		if err != nil {
+			return nil, errGatewayReplicaControlManifest
+		}
+		source.LogicalSchemaDigest = replication.Digest(logical)
 		source.LocalIndexes = make([]store.IndexDefinition, len(entry.LocalIndexes))
 		for j, index := range entry.LocalIndexes {
 			source.LocalIndexes[j] = store.IndexDefinition{Name: strings.Clone(index.Name), Paths: slices.Clone(index.Paths)}
@@ -143,6 +150,11 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 	// A node-local root cannot authorize two independent source groups.
 	roots := make(map[gatewaySplitReplica]struct{}, len(sources)*gateway.ServingReplicaCount)
 	for _, source := range sources {
+		logical, err := sqldriver.ReplicatedRelationManifestDigest(source.SQL)
+		if err != nil {
+			return nil, hotshard.ErrInvalidPressureCut
+		}
+		source.LogicalSchemaDigest = replication.Digest(logical)
 		descriptor, found := byGroup[source.Group]
 		profile, tableFound := byTable[source.Table]
 		placement, placed := catalog.Placement(source.Table)
@@ -243,5 +255,6 @@ func gatewaySplitSourceSQLIdentityMatches(source gatewaySplitSource) bool {
 func gatewaySplitSourceMatches(source gatewaySplitSource, descriptor gateway.ReplicatedShardDescriptor, profile gateway.ReplicatedTableProfile) bool {
 	return source.Group == descriptor.Group && source.SchemaGeneration == descriptor.Command.SchemaGeneration &&
 		source.SchemaGeneration == profile.SchemaGeneration && source.RelationManifestDigest == descriptor.Command.RelationManifestDigest &&
-		source.RelationManifestDigest == [32]byte(profile.RelationManifestDigest) && source.Table == profile.Table && profile.Relation == 1
+		source.LogicalSchemaDigest == descriptor.LogicalSchemaDigest && source.LogicalSchemaDigest == profile.LogicalSchemaDigest &&
+		source.Table == profile.Table && profile.Relation == 1
 }

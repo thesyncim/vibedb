@@ -78,7 +78,7 @@ func NewDurableCatalog(options DurableCatalogOptions) (DurableCatalog, error) {
 		group := options.Groups[ordinal]
 		route := group.Route
 		if route.Distribution == "" || route.Shard == "" || route.AllocationGeneration == 0 ||
-			!route.Command.Valid() || route.RangeIdentity == (replication.Digest{}) ||
+			!route.Command.Valid() || route.LogicalSchemaDigest == (replication.Digest{}) || route.RangeIdentity == (replication.Digest{}) ||
 			route.LineageDigest == (replication.Digest{}) ||
 			route.ForwardingRuleDigest == (replication.Digest{}) ||
 			len(route.Replicas) != gateway.ServingReplicaCount || group.Table == "" ||
@@ -146,7 +146,8 @@ func NewDurableCatalog(options DurableCatalogOptions) (DurableCatalog, error) {
 			Distribution: route.Distribution, Shard: route.Shard, Group: route.Group,
 			AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration),
 			Command:              route.Command, RangeIdentity: route.RangeIdentity,
-			LineageDigest: route.LineageDigest, ForwardingRuleDigest: route.ForwardingRuleDigest,
+			LogicalSchemaDigest: route.LogicalSchemaDigest,
+			LineageDigest:       route.LineageDigest, ForwardingRuleDigest: route.ForwardingRuleDigest,
 			RequestLedgerRanges: group.LedgerRanges, Replicas: replicas,
 		}
 		if group.EnrolledTarget != nil {
@@ -186,9 +187,9 @@ func NewDurableCatalog(options DurableCatalogOptions) (DurableCatalog, error) {
 		}
 		profiles = append(profiles, gateway.ReplicatedTableProfile{
 			Table: group.Table, Relation: group.Relation, PrimaryKey: group.PrimaryKey,
-			SchemaGeneration:       route.Command.SchemaGeneration,
-			RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
-			MaxKeyBytes:            group.MaxKeyBytes, MaxDocumentBytes: group.MaxDocumentBytes,
+			SchemaGeneration:    route.Command.SchemaGeneration,
+			LogicalSchemaDigest: route.LogicalSchemaDigest,
+			MaxKeyBytes:         group.MaxKeyBytes, MaxDocumentBytes: group.MaxDocumentBytes,
 		})
 		for _, table := range group.AdditionalTables {
 			if table.Table == "" || table.PrimaryKey == "" || table.Relation == 0 ||
@@ -205,10 +206,10 @@ func NewDurableCatalog(options DurableCatalogOptions) (DurableCatalog, error) {
 			})
 			profiles = append(profiles, gateway.ReplicatedTableProfile{
 				Table: table.Table, Relation: table.Relation, PrimaryKey: table.PrimaryKey,
-				SchemaGeneration:       route.Command.SchemaGeneration,
-				RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
-				MaxKeyBytes:            table.MaxKeyBytes,
-				MaxDocumentBytes:       table.MaxDocumentBytes,
+				SchemaGeneration:    route.Command.SchemaGeneration,
+				LogicalSchemaDigest: route.LogicalSchemaDigest,
+				MaxKeyBytes:         table.MaxKeyBytes,
+				MaxDocumentBytes:    table.MaxDocumentBytes,
 			})
 		}
 	}
