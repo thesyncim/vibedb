@@ -59,7 +59,7 @@ func TestGroupInstallerBuildsAndRecoversThreeAuthorityFreeRoots(t *testing.T) {
 	for i := range target.Replicas {
 		target.Replicas[i] = clusterrestore.ReplicaIdentity{
 			Member: uint64(i + 1), Node: rafttransport.NodeID(filled16(byte(40 + i))),
-			Store: filled16(byte(50 + i)),
+			Store: filled16(byte(50 + i)), NodeIncarnation: 1,
 		}
 	}
 	operation, err := clusterrestore.NewOperation(
