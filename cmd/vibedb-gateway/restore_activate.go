@@ -312,7 +312,7 @@ func ensureGatewayRestoreDirectory(path string) error {
 	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return errors.Join(gateway.ErrRestoreActivation, err)
+		return fmt.Errorf("private restore authority directory: %w", errors.Join(gateway.ErrRestoreActivation, err))
 	}
 	return nil
 }

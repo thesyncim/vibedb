@@ -237,7 +237,7 @@ type restoreRF3GlobalIndex struct {
 
 func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.RestoreActivationOptions, *gateway.Snapshot) {
 	t.Helper()
-	root := t.TempDir()
+	root := restoreRF3PrivateProcessRoot(t)
 	fixtures := [2]*rf3FaultFixture{}
 	for ordinal := range fixtures {
 		fixture := &rf3FaultFixture{root: root, group: rf3CommandGroup(), nodes: rf3CommandNodes(),

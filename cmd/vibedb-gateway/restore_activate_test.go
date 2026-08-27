@@ -3,15 +3,42 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterrestore"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson"
 )
+
+func TestGatewayRestoreAuthorityDirectoryRejectsPublicMode(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "authority")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureGatewayRestoreDirectory(root); !errors.Is(err, gateway.ErrRestoreActivation) ||
+		!strings.Contains(err.Error(), "private restore authority directory") {
+		t.Fatalf("public authority directory must fail with its exact stage: %v", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("rejection must not silently repair existing permissions: info=%v err=%v", info, err)
+	}
+	private, err := os.MkdirTemp(t.TempDir(), "restore-authority-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = ensureGatewayRestoreDirectory(private); err != nil {
+		t.Fatalf("MkdirTemp private fixture rejected: %v", err)
+	}
+}
 
 func gatewayRestoreTestManifest(root string) gatewayRestoreManifest {
 	path := func(name string) string { return filepath.Join(root, name) }
