@@ -153,3 +153,34 @@ func TestBootstrapRejectsNonEmptyAndDriftedState(t *testing.T) {
 		t.Fatalf("nonempty state err=%v", err)
 	}
 }
+
+func TestBootstrapRejectsUnsafeAuthorityDirectory(t *testing.T) {
+	parent := t.TempDir()
+	config := BootstrapConfig{Namespace: "vibedb-test",
+		ManifestConfigMap: "vibedb-rf3-manifests", TLSSecret: "vibedb-rf3-tls",
+		GatewayConfigMap: "vibedb-gateway-config", GatewayTLSSecret: "vibedb-gateway-tls"}
+	t.Run("group readable", func(t *testing.T) {
+		root := filepath.Join(parent, "unsafe")
+		if err := os.Mkdir(root, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		config.StateDirectory = root
+		if _, err := Bootstrap(&bytes.Buffer{}, config); !errors.Is(err, ErrBootstrap) {
+			t.Fatalf("unsafe mode err=%v", err)
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		target := filepath.Join(parent, "target")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(parent, "link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		config.StateDirectory = link
+		if _, err := Bootstrap(&bytes.Buffer{}, config); !errors.Is(err, ErrBootstrap) {
+			t.Fatalf("symlink err=%v", err)
+		}
+	})
+}

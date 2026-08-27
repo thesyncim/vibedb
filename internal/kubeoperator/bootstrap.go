@@ -267,6 +267,10 @@ func Bootstrap(writer io.Writer, config BootstrapConfig) (BootstrapResult, error
 	if err := os.MkdirAll(config.StateDirectory, 0o700); err != nil {
 		return BootstrapResult{}, err
 	}
+	info, err := os.Lstat(config.StateDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return BootstrapResult{}, errors.Join(ErrBootstrap, err)
+	}
 	if bundle, state, found, err := recoverBootstrap(config); err != nil {
 		return BootstrapResult{}, err
 	} else if found {
@@ -313,8 +317,16 @@ func validBootstrapState(s bootstrapState, c BootstrapConfig, bundle []byte) boo
 func recoverBootstrap(config BootstrapConfig) ([]byte, bootstrapState, bool, error) {
 	root := config.StateDirectory
 	path := func(name string) string { return filepath.Join(root, name) }
+	cleaned := false
 	for _, name := range []string{bootstrapBundleWrite, bootstrapStateWrite} {
-		if err := os.Remove(path(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(path(name)); err == nil {
+			cleaned = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, bootstrapState{}, false, err
+		}
+	}
+	if cleaned {
+		if err := syncDirectory(root); err != nil {
 			return nil, bootstrapState{}, false, err
 		}
 	}
