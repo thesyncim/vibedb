@@ -20,7 +20,11 @@ func TestGenerationMigrationManifestCanonicalAndCrashRejecting(t *testing.T) {
 			Generation: 41, Length: GlobalTabletCatalogRootBytes,
 			Kind: PagePrimaryCatalog,
 		},
-		Cursor: []byte("row-0000042"),
+		SourceCatalogHead:    PageRef{Offset: 128 << 10, LogicalID: 8, Generation: 41, Length: 4096, Kind: PageCatalogSegment},
+		SourceExactIndexRoot: PageRef{Offset: 192 << 10, LogicalID: 9, Generation: 41, Length: 4096, Kind: PagePrimaryExactRoot},
+		SourceCatalogBytes:   PageCatalogCanonicalHeaderSize,
+		SourceIndexCount:     2,
+		Cursor:               []byte("row-0000042"),
 	}
 	first, err := EncodeGenerationMigrationManifest(
 		make([]byte, GenerationMigrationManifestBytes), m,

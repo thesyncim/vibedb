@@ -44,6 +44,7 @@ type GenerationMigrationManifest struct {
 	LogicalIDCount                                             uint64
 	SourcePrimaryRoot, SourceExactIndexRoot, SourceCatalogHead PageRef
 	TargetPrimaryRoot, TargetExactIndexRoot, TargetCatalogHead PageRef
+	SourceCatalogBytes, SourceIndexCount                       uint32
 	Cursor                                                     []byte
 }
 
@@ -71,6 +72,8 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 		!validGenerationMigrationRoot(m.TargetPrimaryRoot, PagePrimaryCatalog, m.Phase >= GenerationMigrationReady) ||
 		!validGenerationMigrationRoot(m.TargetExactIndexRoot, PagePrimaryExactRoot, false) ||
 		!validGenerationMigrationRoot(m.TargetCatalogHead, PageCatalogSegment, false) ||
+		(m.SourceCatalogBytes == 0) != (m.SourceCatalogHead == (PageRef{})) ||
+		(m.SourceIndexCount == 0) != (m.SourceExactIndexRoot == (PageRef{})) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration {
 		return nil, fmt.Errorf("%w: fields", ErrInvalidWrite)
@@ -99,6 +102,8 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 	encodePageRef(image[256:288], m.TargetExactIndexRoot)
 	encodePageRef(image[288:320], m.TargetCatalogHead)
 	binary.LittleEndian.PutUint32(image[320:324], uint32(len(m.Cursor)))
+	binary.LittleEndian.PutUint32(image[324:328], m.SourceCatalogBytes)
+	binary.LittleEndian.PutUint32(image[328:332], m.SourceIndexCount)
 	copy(image[generationMigrationHeaderBytes:], m.Cursor)
 	checksum := PageChecksum(image[:generationMigrationTrailerAt])
 	binary.LittleEndian.PutUint32(image[generationMigrationTrailerAt:], checksum)
@@ -137,6 +142,8 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.TargetPrimaryRoot = decodePageRef(src[224:256])
 	m.TargetExactIndexRoot = decodePageRef(src[256:288])
 	m.TargetCatalogHead = decodePageRef(src[288:320])
+	m.SourceCatalogBytes = binary.LittleEndian.Uint32(src[324:328])
+	m.SourceIndexCount = binary.LittleEndian.Uint32(src[328:332])
 	cursorBytes := int(binary.LittleEndian.Uint32(src[320:324]))
 	if m.StoreID == ([16]byte{}) || m.MigrationID == ([16]byte{}) ||
 		m.Phase < GenerationMigrationCopying || m.Phase > GenerationMigrationPublished ||
@@ -151,9 +158,11 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 		!validGenerationMigrationRoot(m.TargetPrimaryRoot, PagePrimaryCatalog, m.Phase >= GenerationMigrationReady) ||
 		!validGenerationMigrationRoot(m.TargetExactIndexRoot, PagePrimaryExactRoot, false) ||
 		!validGenerationMigrationRoot(m.TargetCatalogHead, PageCatalogSegment, false) ||
+		(m.SourceCatalogBytes == 0) != (m.SourceCatalogHead == (PageRef{})) ||
+		(m.SourceIndexCount == 0) != (m.SourceExactIndexRoot == (PageRef{})) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration ||
-		!allZero(src[324:336]) ||
+		!allZero(src[332:336]) ||
 		cursorBytes > generationMigrationTrailerAt-generationMigrationHeaderBytes ||
 		!allZero(src[generationMigrationHeaderBytes+cursorBytes:generationMigrationTrailerAt]) {
 		return GenerationMigrationManifest{}, ErrGenerationMigrationManifestCorrupt
@@ -179,6 +188,8 @@ func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManife
 		next.SourcePrimaryRoot != previous.SourcePrimaryRoot ||
 		next.SourceExactIndexRoot != previous.SourceExactIndexRoot ||
 		next.SourceCatalogHead != previous.SourceCatalogHead ||
+		next.SourceCatalogBytes != previous.SourceCatalogBytes ||
+		next.SourceIndexCount != previous.SourceIndexCount ||
 		previous.TargetPrimaryRoot != (PageRef{}) && next.TargetPrimaryRoot != previous.TargetPrimaryRoot ||
 		previous.TargetExactIndexRoot != (PageRef{}) && next.TargetExactIndexRoot != previous.TargetExactIndexRoot ||
 		previous.TargetCatalogHead != (PageRef{}) && next.TargetCatalogHead != previous.TargetCatalogHead ||
