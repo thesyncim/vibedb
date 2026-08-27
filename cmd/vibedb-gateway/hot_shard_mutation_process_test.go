@@ -472,7 +472,8 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if err = gatewayProcess.Start(); err != nil {
 		t.Fatalf("restart gateway: %v", err)
 	}
-	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
+	if err = gatewayProcess.WaitReady(ctx, fmt.Sprintf(
+		"vibedb-gateway serving catalog generation %d", final.Generation())); err != nil {
 		t.Fatalf("reopened gateway: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
 	client.reconnect(t, profile, nodes[4], gatewayAddresses.Addresses[0])
