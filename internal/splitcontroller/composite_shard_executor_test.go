@@ -12,6 +12,14 @@ type testPruneFactory struct{}
 
 type testRetainedPruneProposer struct{}
 
+type testCaptureActivationProposer struct{}
+
+func (testCaptureActivationProposer) ProposeSourceCaptureActivation(
+	context.Context, OperationID, raftservice.ServingFence, []byte,
+) error {
+	return nil
+}
+
 func (testRetainedPruneProposer) ProposeRetainedPrune(
 	context.Context, OperationID, raftservice.ServingFence, rangesplit.RetainedPruneBatch,
 ) error {
@@ -43,6 +51,7 @@ func TestCompositeShardActionExecutorDispatchesDurableSourceCapture(t *testing.T
 	}
 	executor, err := NewCompositeShardActionExecutor(CompositeShardActionExecutorOptions{
 		Operation: plan.OperationID(), Actions: actionBit(ActionStartCapture), Source: source,
+		Capture: testCaptureActivationProposer{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +59,7 @@ func TestCompositeShardActionExecutorDispatchesDurableSourceCapture(t *testing.T
 	state := flowSourceState(t, sourceFixture.machine)
 	observed := Observation{
 		Catalog: catalog, SourceState: state, SourceStatus: testLeaderStatus(state),
+		SourceServing: sourceServingState(t, sourceFixture.machine, state),
 	}
 	action, err := Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionStartCapture {

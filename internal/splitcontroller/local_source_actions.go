@@ -1,6 +1,7 @@
 package splitcontroller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/autosplit"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -24,6 +26,50 @@ type LocalSourceActions struct {
 	active  *rangesplit.SourceCapture
 	tail    rangesplit.TailWorkspace
 	read    rangesplit.SourceCaptureWorkspace
+}
+
+// ExecuteActivateCapture admits the immutable capture cut through the source
+// Raft group before opening the local capture handle. Every replica therefore
+// persists and reconstructs the same activation witness; a process-local
+// BeginRangeSplitCapture call is never activation authority.
+func (a *LocalSourceActions) ExecuteActivateCapture(
+	ctx context.Context,
+	plan *Plan,
+	state replicatedstate.State,
+	serving raftservice.ServingState,
+	proposer SourceCaptureActivationProposer,
+) (*rangesplit.SourceCapture, error) {
+	if a == nil || ctx == nil || plan == nil || proposer == nil ||
+		plan.operation != a.store.operation {
+		return nil, ErrInvalidPlan
+	}
+	a.mu.Lock()
+	manifest, manifestErr := a.runtime.RangeSplitRelationManifestDigest()
+	cut, snapshotErr := a.runtime.RangeSplitSnapshot()
+	a.mu.Unlock()
+	if manifestErr != nil || snapshotErr != nil {
+		return nil, errors.Join(manifestErr, snapshotErr)
+	}
+	cutState := cut.State()
+	placementErr := plan.validateGlobalIndexCut(cut)
+	closeErr := cut.Close()
+	if placementErr != nil || closeErr != nil {
+		return nil, errors.Join(placementErr, closeErr)
+	}
+	if !sameSplitCut(state, cutState) ||
+		!sourceServingStateMatches(state, serving, manifest) {
+		return nil, ErrTopologyConflict
+	}
+	body, err := plan.AppendSourceCaptureActivation(nil, state)
+	if err != nil {
+		return nil, err
+	}
+	if err = proposer.ProposeSourceCaptureActivation(
+		ctx, plan.operation, serving.Fence(), body,
+	); err != nil {
+		return nil, err
+	}
+	return a.ExecuteStartCapture(plan)
 }
 
 type splitSourceRuntime interface {

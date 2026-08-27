@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
@@ -25,6 +26,31 @@ type rf3RetainedPruneFactory struct {
 	lease     *splitcontroller.RuntimeStoreLease
 }
 
+func (factory *rf3RetainedPruneFactory) OpenSourceCaptureActivationProposer(
+	ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation,
+) (splitcontroller.SourceCaptureActivationProposer, func() error, error) {
+	if factory == nil || ctx == nil || factory.tls == nil || factory.lease == nil ||
+		plan == nil || observed.Catalog == nil {
+		return nil, nil, errRF3Serving
+	}
+	session, release, err := openRF3SplitTopologySession(
+		ctx, plan, observed.Catalog, observed.SourceState.Binding,
+		factory.tls, factory.authority, factory.lease,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	proposer, err := splitcontroller.NewRF3SourceCaptureActivationProposer(
+		plan.OperationID(), session,
+	)
+	if err != nil {
+		return nil, release, errors.Join(err, release())
+	}
+	return rf3AuthorizedSourceCaptureActivationProposer{
+		authority: factory.authority, proposer: proposer,
+	}, release, nil
+}
+
 func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 	ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation,
 ) (splitcontroller.RetainedPruneProposer, func() error, error) {
@@ -32,20 +58,48 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 		plan == nil || observed.Catalog == nil || observed.Certificate == nil {
 		return nil, nil, errRF3Serving
 	}
-	binding := observed.SourceState.Binding
+	session, release, err := openRF3SplitTopologySession(
+		ctx, plan, observed.Catalog, observed.SourceState.Binding,
+		factory.tls, factory.authority, factory.lease,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	proposer, err := splitcontroller.NewRF3RetainedPruneProposerForPlan(
+		plan, observed, session, rangesplit.DefaultRetainedPruneKeys,
+		rangesplit.DefaultRetainedPruneKeyBytes,
+	)
+	if err != nil {
+		return nil, release, errors.Join(err, release())
+	}
+	return rf3AuthorizedRetainedPruneProposer{authority: factory.authority, proposer: proposer}, release, nil
+}
+
+func openRF3SplitTopologySession(
+	ctx context.Context,
+	plan *splitcontroller.Plan,
+	catalog *gateway.Snapshot,
+	binding replicatedstate.Binding,
+	tls *rafttransport.PeerTLS,
+	authority serviceauthz.Authority,
+	lease *splitcontroller.RuntimeStoreLease,
+) (*gateway.NativeSession, func() error, error) {
+	if ctx == nil || plan == nil || catalog == nil || tls == nil || lease == nil {
+		return nil, nil, errRF3Serving
+	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
-	route, ok := observed.Catalog.ResolveReplicatedRoute(
+	route, ok := catalog.ResolveReplicatedRoute(
 		distribution.DistributionName(binding.Distribution), distribution.ShardID(binding.Shard), replicas[:0],
 	)
 	if !ok {
 		return nil, nil, errRF3Serving
 	}
-	journalPath, err := factory.lease.TopologySessionJournalPath()
+	journalPath, err := lease.TopologySessionJournalPath()
 	if err != nil {
 		return nil, nil, err
 	}
 	pool, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
-		TLS: factory.tls,
+		TLS: tls,
 		Dial: func(ctx context.Context, address string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: rf3NetworkTimeout}).DialContext(ctx, "tcp", address)
 		},
@@ -93,7 +147,7 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 	if err != nil {
 		return nil, release, errors.Join(err, release())
 	}
-	authorized, err := serviceauthz.WithAuthority(ctx, factory.authority)
+	authorized, err := serviceauthz.WithAuthority(ctx, authority)
 	if err != nil {
 		return nil, release, errors.Join(err, release())
 	}
@@ -106,19 +160,32 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 	if err != nil {
 		return nil, release, errors.Join(err, release())
 	}
-	proposer, err := splitcontroller.NewRF3RetainedPruneProposerForPlan(
-		plan, observed, session, rangesplit.DefaultRetainedPruneKeys,
-		rangesplit.DefaultRetainedPruneKeyBytes,
-	)
-	if err != nil {
-		return nil, release, errors.Join(err, release())
-	}
-	return rf3AuthorizedRetainedPruneProposer{authority: factory.authority, proposer: proposer}, release, nil
+	return session, release, nil
 }
 
 type rf3AuthorizedRetainedPruneProposer struct {
 	authority serviceauthz.Authority
 	proposer  splitcontroller.RetainedPruneProposer
+}
+
+type rf3AuthorizedSourceCaptureActivationProposer struct {
+	authority serviceauthz.Authority
+	proposer  splitcontroller.SourceCaptureActivationProposer
+}
+
+func (proposer rf3AuthorizedSourceCaptureActivationProposer) ProposeSourceCaptureActivation(
+	ctx context.Context,
+	operation splitcontroller.OperationID,
+	fence raftservice.ServingFence,
+	body []byte,
+) error {
+	authorized, err := serviceauthz.WithAuthority(ctx, proposer.authority)
+	if err != nil {
+		return err
+	}
+	return proposer.proposer.ProposeSourceCaptureActivation(
+		authorized, operation, fence, body,
+	)
 }
 
 func (proposer rf3AuthorizedRetainedPruneProposer) ProposeRetainedPrune(
@@ -133,3 +200,4 @@ func (proposer rf3AuthorizedRetainedPruneProposer) ProposeRetainedPrune(
 }
 
 var _ splitcontroller.RetainedPruneProposerFactory = (*rf3RetainedPruneFactory)(nil)
+var _ splitcontroller.SourceCaptureActivationProposerFactory = (*rf3RetainedPruneFactory)(nil)

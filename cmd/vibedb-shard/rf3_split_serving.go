@@ -157,13 +157,14 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 				if openErr != nil {
 					return nil, openErr
 				}
+				topologyFactory := &rf3RetainedPruneFactory{
+					tls: options.profile, authority: authority, lease: lease,
+				}
 				composite, openErr := splitcontroller.NewCompositeShardActionExecutor(splitcontroller.CompositeShardActionExecutorOptions{
 					Operation: plan.OperationID(), Actions: splitcontroller.SourceSplitActionMask(),
 					Source: source, TailSinks: splitcontroller.RF3TailSinkResolver{Client: tailClient},
-					Seal: options.owners,
-					PruneFactory: &rf3RetainedPruneFactory{
-						tls: options.profile, authority: authority, lease: lease,
-					},
+					CaptureFactory: topologyFactory, Seal: options.owners,
+					PruneFactory:       topologyFactory,
 					PruneLimits:        rangesplit.RetainedPruneLimits{},
 					ArtifactChunkBytes: rangesplit.DefaultChildArtifactChunkBytes,
 				})

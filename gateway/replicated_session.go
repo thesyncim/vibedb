@@ -685,6 +685,27 @@ func (session *NativeSession) ExecutionPin(
 	return session.prepareAndExecute(ctx, command, false)
 }
 
+// SplitCaptureActivate proposes one canonical source-capture activation through
+// a durable topology session. The journal owns the exact nested command before
+// admission, so an outcome-unknown retry cannot move the capture cut.
+func (session *NativeSession) SplitCaptureActivate(
+	ctx context.Context,
+	activation []byte,
+) (NativeResult, error) {
+	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.proposalCapability != serviceauthz.CapabilityTopology ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 ||
+		len(activation) == 0 || len(activation) > replication.MaxCommandBytes {
+		return NativeResult{}, sessionStateError(session)
+	}
+	command := session.commandHeader(
+		replication.CommandSplitCaptureActivate,
+		session.epoch, session.nextSequence, session.ackThrough,
+	)
+	command.SplitCaptureActivation = activation
+	return session.prepareAndExecute(ctx, command, false)
+}
+
 func (session *NativeSession) validateNativeMutation(mutation NativeMutation) error {
 	// Reject byte bounds before vibejson validation, resolver fanout, command
 	// hashing, or buffer growth. An oversized value cannot fit this session's
@@ -1144,6 +1165,10 @@ func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) 
 		return false
 	case replication.CommandExecutionPin:
 		return nativeExecutionPinResultCode(result)
+	case replication.CommandSplitCaptureActivate:
+		return result == replicatedstate.ResultApplied ||
+			result == replicatedstate.ResultStaleFence ||
+			result == replicatedstate.ResultIndexConflict
 	}
 	return false
 }
@@ -1235,6 +1260,9 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.ExecutionPin)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(command.ExecutionPin)
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.SplitCaptureActivation)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.SplitCaptureActivation)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Batches)))
 	_, _ = hasher.Write(scalar[:])
 	for _, batch := range command.Batches {
@@ -1326,6 +1354,10 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(executionPin)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(executionPin)
+	splitCapture := command.SplitCaptureActivationBytes()
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(splitCapture)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(splitCapture)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = hasher.Write(scalar[:])
 	relations := command.RelationBatches()

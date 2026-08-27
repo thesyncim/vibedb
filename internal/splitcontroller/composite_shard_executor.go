@@ -29,14 +29,16 @@ type CompositeShardActionExecutorOptions struct {
 	Operation OperationID
 	Actions   uint16
 
-	Source       *LocalSourceActions
-	Stage        RemoteChildStageExecutor
-	TailSinks    SplitTailSinkResolver
-	Seal         SourceSealProposer
-	PruneSource  RetainedPruneAuthoritySource
-	Prune        RetainedPruneProposer
-	PruneFactory RetainedPruneProposerFactory
-	PruneLimits  rangesplit.RetainedPruneLimits
+	Source         *LocalSourceActions
+	Capture        SourceCaptureActivationProposer
+	CaptureFactory SourceCaptureActivationProposerFactory
+	Stage          RemoteChildStageExecutor
+	TailSinks      SplitTailSinkResolver
+	Seal           SourceSealProposer
+	PruneSource    RetainedPruneAuthoritySource
+	Prune          RetainedPruneProposer
+	PruneFactory   RetainedPruneProposerFactory
+	PruneLimits    rangesplit.RetainedPruneLimits
 
 	Child     uint8
 	Lifecycle *LocalChildLifecycle
@@ -61,6 +63,10 @@ func NewCompositeShardActionExecutor(
 	}
 	if options.Actions&sourceSplitActionMask() != 0 {
 		if options.Source == nil {
+			return nil, ErrRemoteExecution
+		}
+		if options.Actions&actionBit(ActionStartCapture) != 0 &&
+			(options.Capture == nil) == (options.CaptureFactory == nil) {
 			return nil, ErrRemoteExecution
 		}
 		if options.Actions&actionBit(ActionBuildArtifacts) != 0 &&
@@ -120,7 +126,21 @@ func (executor *CompositeShardActionExecutor) ExecuteAuthorizedSplitAction(
 	var err error
 	switch action.Kind {
 	case ActionStartCapture:
-		_, err = options.Source.ExecuteStartCapture(plan)
+		proposer := options.Capture
+		release := func() error { return nil }
+		if options.CaptureFactory != nil {
+			var openErr error
+			proposer, release, openErr = options.CaptureFactory.OpenSourceCaptureActivationProposer(
+				ctx, plan, observed,
+			)
+			if openErr != nil || proposer == nil || release == nil {
+				return errors.Join(ErrRemoteExecution, openErr)
+			}
+		}
+		defer func() { _ = release() }()
+		_, err = options.Source.ExecuteActivateCapture(
+			ctx, plan, observed.SourceState, observed.SourceServing, proposer,
+		)
 		return err
 	case ActionBuildArtifacts:
 		capture, openErr := options.Source.ExecuteStartCapture(plan)

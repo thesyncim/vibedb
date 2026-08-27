@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/splitcapture"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -252,6 +253,60 @@ func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	}
 	if client.probes != retryProbes {
 		t.Fatalf("steady native session added probes: after-retry=%d final=%d", retryProbes, client.probes)
+	}
+}
+
+func TestNativeSessionSplitCaptureActivationRetainsExactUnknownCommand(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	client := &nativeSessionClient{
+		state: states["m2"], unknownKind: replication.CommandSplitCaptureActivate,
+	}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("split:test"), ClientID: replication.ID128{19},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		RetryHome:          replication.RetryHome{7},
+		Resolver:           BaseRelationResolver{Relation: 1},
+		MaxRelationBatches: 1, MaxMutations: 1,
+		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(t.Context(), time.Now().Add(time.Minute).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	body, err := splitcapture.AppendCommand(nil, splitcapture.Command{
+		Operation: [32]byte{1}, PlanDigest: [32]byte{2},
+		PartitionerDigest: [32]byte{3}, RelationManifestDigest: [32]byte{4},
+		LineageDigest: [32]byte{5}, BindingDigest: [32]byte{6},
+		PriorEntryDigest: [32]byte{7}, PriorDataChainDigest: [32]byte{8},
+		PriorApplied: 9, PriorTerm: 10, SourceGeneration: 11, SchemaGeneration: 12,
+		Spec: []byte("portable"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.SplitCaptureActivate(t.Context(), body); !errors.Is(err, raftservice.ErrOutcomeUnknown) ||
+		!session.Status().Pending {
+		t.Fatalf("activation unknown=%v status=%+v", err, session.Status())
+	}
+	pending := session.PendingCommand()
+	view, err := replication.OpenCommand(pending)
+	if err != nil || view.Kind() != replication.CommandSplitCaptureActivate ||
+		!bytes.Equal(view.SplitCaptureActivationBytes(), body) ||
+		nativeCommandViewFingerprint(view) != view.Fingerprint {
+		t.Fatalf("pending activation view=%+v err=%v", view, err)
+	}
+	result, err := session.RetryPending(t.Context())
+	if err != nil || result.Completion.ResultCode != replicatedstate.ResultApplied ||
+		!bytes.Equal(client.unknownCommand, client.retriedCommand) {
+		t.Fatalf("retry result=%+v err=%v exact=%v", result, err,
+			bytes.Equal(client.unknownCommand, client.retriedCommand))
 	}
 }
 
