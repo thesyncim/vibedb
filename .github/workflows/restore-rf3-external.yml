@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   qualify:
-    name: Ubuntu restored RF3 serving and failover (count=3)
+    name: Ubuntu restored catalog and data RF3 serving (count=3)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -37,11 +37,13 @@ jobs:
           test_name='TestRestoredRF3ExternalProcessServingAndFailover'
           go test -list "^${test_name}$" ./cmd/vibedb-shard > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          go build -o "${RUNNER_TEMP}/vibedb-gateway" ./cmd/vibedb-gateway
       - name: Qualify real restored shard processes
         shell: bash
         env:
           TMPDIR: ${{ runner.temp }}/restore-rf3-tmp
           VIBEDB_RESTORE_RF3_PROCESS_E2E: '1'
+          VIBEDB_RESTORE_GATEWAY_BINARY: ${{ runner.temp }}/vibedb-gateway
         run: |
           set -euo pipefail
           go test -json -count=3 -timeout=8m \
@@ -64,11 +66,14 @@ jobs:
           test "$(jq -r --arg name "${test_name}" '
             select(.Action == "output" and .Test == $name and
               (.Output | contains("restored external RF3:") and
-                contains("shard_processes=3") and contains("certified_artifact=true") and
+                contains("shard_processes=6") and contains("certified_groups=2") and
+                contains("certified_artifact=true") and contains("activation_cli=true") and
+                contains("source_catalog_discarded=true") and contains("fresh_catalog=true") and
                 contains("fresh_roots=true") and contains("closed_before_catalog=true") and
                 contains("marker_removal_refused=true") and
                 contains("catalog_witness=replicated_readindex") and
                 contains("catalog_observations=2") and contains("restored_read=true") and
+                contains("restored_global_index=true") and
                 contains("acknowledged_write_survived=true") and contains("leader_sigkill=true") and
                 contains("restart_closed=true") and contains("regrant=true") and
                 contains("write=") and contains("failover=") and contains("rss_bytes=") and
