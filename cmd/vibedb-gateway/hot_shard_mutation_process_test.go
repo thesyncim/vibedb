@@ -373,6 +373,10 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatalf("automatic write-driven move incomplete operations=%d\n%s",
 			maximumOperations, gatewayProcess.Diagnostics())
 	}
+	terminalOperations, err := catalogAuthority.ReadOperationIDs(ctx)
+	if err != nil || len(terminalOperations) != 1 {
+		t.Fatalf("topology operation amplification=%d err=%v", len(terminalOperations), err)
+	}
 	finalRSS := replicaProcessRSS(gatewayProcess.PID())
 	if finalRSS > baselineRSS && finalRSS-baselineRSS > 128<<20 {
 		t.Fatalf("gateway RSS growth=%d exceeds 128MiB", finalRSS-baselineRSS)
