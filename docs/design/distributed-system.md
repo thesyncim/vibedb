@@ -226,9 +226,30 @@ Reopen validates the hidden image in one ordered pass, including exact epoch,
 slot-count, modulo-position, applied-order, and retirement invariants. Scratch
 state is proportional to retained session identities. Persistent dedupe rows
 and the dedupe portion of reopen are bounded by
-`1 + MaxSessions + MaxSessions * RetryWindow`, not by total operations.
+`1 + 2 * MaxSessions + MaxSessions * RetryWindow`, including the separate
+class-independent authority-binding rows, not by total operations on reused
+stable identities.
 Release makes `SessionCount` and `SessionSlotCount` reusable; a new Open is
 refused at `MaxSessions` while that many images remain retained.
+Release does not delete authority bindings or decrement
+`AuthorityBindingCount`: a new distinct client identity is also refused once
+that independent bound reaches `MaxSessions`, even with no active sessions.
+This preserves the binding that prevents an identity from being reused under
+a different command-authority class.
+
+The current durable route-session factory derives a fresh client identity
+from each request wave. That integration therefore exhausts the lifetime
+authority budget under sustained churn; reclaiming its retry slots does not
+solve the problem. The same risk must be audited in per-request execution-pin
+sessions. A serving fix must provide bounded reusable identities, uniquely
+bind each Open to its logical operation, and durably recover an Open admitted
+before route-intent publication. Hashing operations into reusable slots alone
+is insufficient: collisions and delayed retries must not share an active
+session or strand a slot. Raising the limit or deleting authority bindings
+would not establish this contract. The capacity regression is
+`TestNativeDurableRouteSessionAuthorityCapacityIsNotReclaimedByRelease`;
+passing it proves the refusal boundary, not sustained-serving completion.
+
 `LookupSessionLease` recovers the retained deadline and sequence fence with
 point reads. This kernel does not run timers, attest elapsed time, authenticate
 the proposer, or expose serving authority; RF3 serving still owns those
