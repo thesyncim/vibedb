@@ -2,6 +2,7 @@ package splitcontroller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -126,8 +127,20 @@ func TestPlanIntentAuthenticatesEveryPreparedReplicaAndRejectsIncompleteGrammar(
 		if planErr != nil {
 			t.Fatal(planErr)
 		}
-		if changed.OperationID() == plan.OperationID() {
-			t.Fatal("replica-local authenticated authority did not change operation id")
+		if changed.OperationID() != plan.OperationID() {
+			t.Fatal("runtime authority changed the preallocated operation namespace")
+		}
+		originalIntent, originalErr := AppendPlanIntent(nil, catalog, plan)
+		changedIntent, changedErr := AppendPlanIntent(nil, catalog, changed)
+		if originalErr != nil || changedErr != nil || bytes.Equal(originalIntent, changedIntent) {
+			t.Fatal("changed runtime authority did not change immutable intent")
+		}
+		journal := &memoryReplicatedOperationJournal{}
+		if _, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := AdmitReplicatedPlan(context.Background(), journal, catalog, changed); !errors.Is(err, ErrReplicatedExecution) {
+			t.Fatalf("changed prepared identity reused admitted operation: %v", err)
 		}
 	}
 }

@@ -64,7 +64,7 @@ func (p *Plan) projectReplicatedSplitDescriptors(current *gateway.Snapshot, cuto
 			continue
 		}
 		target := p.targets[child]
-		if len(target.Replicas) != gateway.ServingReplicaCount || target.RelationManifestDigest != source.Command.RelationManifestDigest {
+		if len(target.Replicas) != gateway.ServingReplicaCount || p.validateReplicatedChildSchema(target) != nil {
 			return nil, ErrTopologyConflict
 		}
 		group := raftmember.GroupKey{ClusterID: target.WAL.ClusterID, ClusterIncarnation: target.WAL.ClusterIncarnation,

@@ -112,7 +112,7 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 	}
 	group := raftmember.GroupKey{
 		ClusterID: testID(1), ClusterIncarnation: testID(2), TopologyRecoveryEpoch: 1,
-		ShardIncarnation: testID(3), GroupID: testID(4),
+		ShardIncarnation: testID(7), GroupID: testID(8),
 	}
 	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: "orders", Shard: "source", Group: group, AllocationGeneration: 7,
@@ -122,7 +122,7 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
 			OwnershipEpoch: 5, SchemaGeneration: 1, RelationManifestDigest: [32]byte{9},
-			RoutingVersion: 11, RouteGeneration: 20,
+			RoutingVersion: 11, RouteGeneration: 19,
 		},
 		Replicas: make([]gateway.ReplicatedReplicaDescriptor, gateway.ServingReplicaCount),
 	}
@@ -167,11 +167,15 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 		t.Fatal(err)
 	}
 	target := testChildTarget(t, split, partitioner)
-	target.RelationManifestDigest = descriptor.Command.RelationManifestDigest
 	for index := range target.Replicas {
 		target.Replicas[index].Node = descriptor.Replicas[index].Node
 	}
-	plan, err := NewPlan(catalog, split, partitioner, []ChildTarget{target})
+	schema := bindProjectionSourceAndChildSchemas(t, &descriptor, &target)
+	catalog, err = gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewPlan(catalog, split, partitioner, []ChildTarget{target}, schema)
 	if err != nil {
 		t.Fatal(err)
 	}

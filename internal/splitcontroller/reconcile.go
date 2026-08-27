@@ -25,6 +25,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
 	"go.etcd.io/raft/v3"
 )
 
@@ -81,6 +82,7 @@ type ChildTarget struct {
 	TopologyRecoveryEpoch  uint64
 	Authority              sqldriver.ReplicatedAuthorityProfile
 	SQL                    sqldriver.ReplicatedShardStoreIdentity
+	LocalIndexes           []store.IndexDefinition
 }
 
 // ChildReplicaTarget is one exact pre-published RF3 member route. A split plan
@@ -115,24 +117,41 @@ type ChildReplicaTarget struct {
 // non-retained child to its final SQL/Raft identity. It is immutable after
 // construction.
 type Plan struct {
-	partitioner    *rangesplit.Partitioner
-	sourceManifest *distribution.Manifest
-	targetManifest *distribution.Manifest
-	source         autosplit.SourceIdentity
-	children       [autosplit.MaxSplitChildren]autosplit.SplitChildIdentity
-	leaderCounts   [autosplit.MaxSplitChildren]uint16
-	childCount     uint8
-	retained       uint8
-	current        uint64
-	next           uint64
-	targets        [autosplit.MaxSplitChildren]ChildTarget
-	indexRelations []sqldriver.ReplicatedShardRelationIdentity
-	relationDigest [sha256.Size]byte
-	operation      OperationID
+	partitioner     *rangesplit.Partitioner
+	sourceManifest  *distribution.Manifest
+	targetManifest  *distribution.Manifest
+	source          autosplit.SourceIdentity
+	children        [autosplit.MaxSplitChildren]autosplit.SplitChildIdentity
+	leaderCounts    [autosplit.MaxSplitChildren]uint16
+	childCount      uint8
+	retained        uint8
+	current         uint64
+	next            uint64
+	targets         [autosplit.MaxSplitChildren]ChildTarget
+	indexRelations  []sqldriver.ReplicatedShardRelationIdentity
+	relationDigest  [sha256.Size]byte
+	operation       OperationID
+	sourceAuthority *PlanSourceAuthority
+}
+
+// PlanSourceAuthority separates the source's applied Raft fence from the
+// catalog CAS generation. Schema retains the original immutable validation
+// profile; later applied ownership fences do not rewrite that profile.
+type PlanSourceAuthority struct {
+	Group   raftmember.GroupKey      `json:"group"`
+	Command raftservice.CommandFence `json:"command"`
+	Schema  PlanSourceSchema         `json:"schema"`
+}
+
+type PlanSourceSchema struct {
+	SQL          sqldriver.ReplicatedShardStoreIdentity
+	Placement    sqldriver.ReplicatedPlacementProfile
+	LocalIndexes []store.IndexDefinition
 }
 
 // OperationID is the fixed byte-native idempotency identity of one exact split
-// geometry, catalog CAS, and prepared child runtime set.
+// geometry and catalog CAS. The immutable plan digest separately binds the
+// prepared runtime set, preventing a retry from changing those coordinates.
 type OperationID [sha256.Size]byte
 
 // NewPlan validates the complete cold control-plane intent before any source
@@ -142,6 +161,7 @@ func NewPlan(
 	split *autosplit.SplitPlan,
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
+	sourceSchema ...PlanSourceSchema,
 ) (*Plan, error) {
 	if current == nil || split == nil {
 		return nil, ErrInvalidPlan
@@ -150,22 +170,31 @@ func NewPlan(
 	if !ok {
 		return nil, ErrInvalidPlan
 	}
+	var authority *PlanSourceAuthority
 	if sourceRoute, replicated := current.ResolveReplicatedRoute(
 		split.Source.Distribution, split.Source.Shard,
 		make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
 	); replicated {
+		if len(sourceRoute.Replicas) != gateway.ServingReplicaCount {
+			return nil, ErrInvalidPlan
+		}
+		if len(sourceSchema) != 1 {
+			return nil, ErrInvalidPlan
+		}
+		authority = &PlanSourceAuthority{Group: sourceRoute.Group, Command: sourceRoute.Command, Schema: clonePlanSourceSchema(sourceSchema[0])}
 		for index := range targets {
 			target := &targets[index]
-			if target.RelationManifestDigest != sourceRoute.Command.RelationManifestDigest ||
-				target.Authority.ActivePolicyGeneration != sourceRoute.Command.ActivePolicyGeneration ||
+			if target.Authority.ActivePolicyGeneration != sourceRoute.Command.ActivePolicyGeneration ||
 				target.Authority.ProtectionEpoch != sourceRoute.Command.ProtectionEpoch ||
 				target.Authority.SchemaGeneration != sourceRoute.Command.SchemaGeneration {
 				return nil, ErrInvalidPlan
 			}
 		}
+	} else if len(sourceSchema) != 0 {
+		return nil, ErrInvalidPlan
 	}
 	return newPlan(
-		sourceManifest, current.Generation(), split, partitioner, targets,
+		sourceManifest, current.Generation(), split, partitioner, targets, authority,
 	)
 }
 
@@ -180,13 +209,25 @@ func RecoverPlan(
 	split *autosplit.SplitPlan,
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
+	retainedAuthority ...PlanSourceAuthority,
 ) (*Plan, error) {
 	if current == nil || split == nil || sourceGeneration == math.MaxUint64 {
 		return nil, ErrInvalidPlan
 	}
 	switch current.Generation() {
 	case sourceGeneration:
-		return NewPlan(current, split, partitioner, targets)
+		var schema []PlanSourceSchema
+		if len(retainedAuthority) == 1 {
+			schema = []PlanSourceSchema{retainedAuthority[0].Schema}
+		}
+		plan, err := NewPlan(current, split, partitioner, targets, schema...)
+		if err != nil {
+			return nil, err
+		}
+		if len(retainedAuthority) > 1 || len(retainedAuthority) == 1 && (plan.sourceAuthority == nil || !samePlanSourceAuthority(*plan.sourceAuthority, retainedAuthority[0])) {
+			return nil, ErrTopologyConflict
+		}
+		return plan, nil
 	case sourceGeneration + 1:
 		target, ok := current.Manifest(split.Source.Distribution)
 		if !ok || split.Manifest() == nil {
@@ -200,7 +241,28 @@ func RecoverPlan(
 			partitioner.ValidatePublishedManifestTransition(source, target) != nil {
 			return nil, ErrTopologyConflict
 		}
-		return newPlan(source, sourceGeneration, split, partitioner, targets)
+		var authority *PlanSourceAuthority
+		if len(retainedAuthority) > 1 {
+			return nil, ErrInvalidPlan
+		}
+		if len(retainedAuthority) == 1 {
+			value := retainedAuthority[0]
+			authority = &value
+		}
+		var endpoints [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		retained, retainedOK := split.ChildIdentity(int(split.RetainedChild))
+		if route, replicated := current.ResolveReplicatedRoute(split.Source.Distribution, split.Source.Shard, endpoints[:0]); replicated {
+			if !retainedOK || authority == nil || route.Group != authority.Group || route.Command.ReplicaSetVersion != authority.Command.ReplicaSetVersion ||
+				route.Command.ActivePolicyGeneration != authority.Command.ActivePolicyGeneration || route.Command.ProtectionEpoch != authority.Command.ProtectionEpoch ||
+				route.Command.SchemaGeneration != authority.Command.SchemaGeneration || route.Command.RelationManifestDigest != authority.Command.RelationManifestDigest ||
+				route.Command.OwnershipEpoch != uint64(retained.OwnershipEpoch) ||
+				route.Command.RouteGeneration != sourceGeneration+1 || route.Command.RoutingVersion != uint64(split.Manifest().Version()) {
+				return nil, ErrTopologyConflict
+			}
+		} else if authority != nil {
+			return nil, ErrTopologyConflict
+		}
+		return newPlan(source, sourceGeneration, split, partitioner, targets, authority)
 	default:
 		return nil, ErrTopologyConflict
 	}
@@ -212,6 +274,7 @@ func newPlan(
 	split *autosplit.SplitPlan,
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
+	authority *PlanSourceAuthority,
 ) (*Plan, error) {
 	if sourceManifest == nil || split == nil || split.Manifest() == nil || partitioner == nil ||
 		sourceGeneration == math.MaxUint64 || split.ChildCount < 2 ||
@@ -237,6 +300,11 @@ func newPlan(
 		source:     cloneSourceIdentity(split.Source),
 		childCount: split.ChildCount, retained: split.RetainedChild,
 		current: sourceGeneration, next: sourceGeneration + 1,
+	}
+	if authority != nil {
+		copy := *authority
+		copy.Schema = clonePlanSourceSchema(authority.Schema)
+		plan.sourceAuthority = &copy
 	}
 	for child := 0; child < int(split.ChildCount); child++ {
 		identity, identityOK := split.ChildIdentity(child)
@@ -301,13 +369,30 @@ func newPlan(
 			continue
 		}
 		target := &plan.targets[child]
-		if portableRelationDigest != ([sha256.Size]byte{}) &&
+		if authority == nil && portableRelationDigest != ([sha256.Size]byte{}) &&
 			target.RelationManifestDigest != portableRelationDigest {
 			return nil, ErrInvalidPlan
 		}
 		portableRelationDigest = target.RelationManifestDigest
 	}
 	plan.relationDigest = portableRelationDigest
+	if authority != nil {
+		if !authority.Command.Valid() ||
+			authority.Command.OwnershipEpoch != uint64(split.Source.OwnershipEpoch) || authority.Command.RoutingVersion > uint64(split.Source.RoutingVersion) {
+			return nil, ErrInvalidPlan
+		}
+		plan.relationDigest = authority.Command.RelationManifestDigest
+		if err := plan.validateReplicatedSourceSchema(); err != nil {
+			return nil, err
+		}
+		for child := uint8(0); child < plan.childCount; child++ {
+			if child != plan.retained {
+				if err := plan.validateReplicatedChildSchema(plan.targets[child]); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 	hasGlobalIndex := false
 	for index := range relationTemplate {
 		hasGlobalIndex = hasGlobalIndex ||
@@ -395,31 +480,26 @@ func splitOperationID(plan *Plan) OperationID {
 	writeSplitOperationUint64(digestWriter, plan.current)
 	writeSplitOperationUint64(digestWriter, plan.next)
 	_, _ = digestWriter.Write([]byte{plan.childCount, plan.retained})
-	for child := 0; child < int(plan.childCount); child++ {
-		target := &plan.targets[child]
-		_, _ = digestWriter.Write([]byte{uint8(child)})
-		if target.Endpoint == "" {
-			continue
-		}
-		writeSplitOperationUint64(digestWriter, target.ReplicaSetVersion)
-		values := [...]uint64{
-			target.TopologyRecoveryEpoch,
-			target.Authority.ActivePolicyGeneration, target.Authority.ProtectionEpoch,
-			target.Authority.OwnershipEpoch, target.Authority.SchemaGeneration,
-			target.Authority.RoutingVersion, target.Authority.RouteGeneration,
-		}
-		for _, value := range values {
-			writeSplitOperationUint64(digestWriter, value)
-		}
-		for replicaIndex := range target.Replicas {
-			replicaDigest := preparedChildReplicaDigest(target.Replicas[replicaIndex])
-			_, _ = digestWriter.Write(replicaDigest[:])
-		}
-		_, _ = digestWriter.Write(target.RelationManifestDigest[:])
-	}
 	var result OperationID
 	copy(result[:], digestWriter.Sum(nil))
 	return result
+}
+
+// OperationIDForSplit fixes the operation namespace before preparing child
+// paths, WAL identities or SQL stores. It cannot depend on those derived
+// coordinates without introducing a hash/path cycle. Admission binds their
+// full immutable plan digest before any split action is executed.
+func OperationIDForSplit(sourceGeneration uint64, split *autosplit.SplitPlan, partitioner *rangesplit.Partitioner) (OperationID, error) {
+	if sourceGeneration == 0 || sourceGeneration == math.MaxUint64 || split == nil || partitioner == nil ||
+		split.ChildCount < 2 || split.ChildCount > autosplit.MaxSplitChildren || split.RetainedChild >= split.ChildCount {
+		return OperationID{}, ErrInvalidPlan
+	}
+	digest, err := rangesplit.SplitPlanDigest(split)
+	if err != nil || digest != partitioner.Digest() {
+		return OperationID{}, errors.Join(err, ErrInvalidPlan)
+	}
+	return splitOperationID(&Plan{partitioner: partitioner, current: sourceGeneration, next: sourceGeneration + 1,
+		childCount: split.ChildCount, retained: split.RetainedChild}), nil
 }
 
 func writeSplitOperationUint64(target hash.Hash, value uint64) {
@@ -791,13 +871,25 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 }
 
 func (p *Plan) sourceBindingInitial(binding replicatedstate.Binding) bool {
-	return p != nil && binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
-		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
-		binding.RouteGeneration == p.current && binding.OwnedRange == p.source.Range
+	if p == nil {
+		return false
+	}
+	routing, generation := uint64(p.source.RoutingVersion), p.current
+	if p.sourceAuthority != nil {
+		if !p.sourceBindingAuthorityMatches(binding) {
+			return false
+		}
+		routing, generation = p.sourceAuthority.Command.RoutingVersion, p.sourceAuthority.Command.RouteGeneration
+	}
+	return binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) && binding.RoutingVersion == routing &&
+		binding.RouteGeneration == generation && binding.OwnedRange == p.source.Range
 }
 
 func (p *Plan) sourceBindingSealed(binding replicatedstate.Binding) bool {
 	if p == nil {
+		return false
+	}
+	if p.sourceAuthority != nil && !p.sourceBindingAuthorityMatches(binding) {
 		return false
 	}
 	retained := p.children[p.retained]
@@ -1097,6 +1189,7 @@ func runtimeIdentityMatches(target ChildTarget, identity raftmember.RuntimeIdent
 }
 
 func cloneChildTarget(target ChildTarget) ChildTarget {
+	target.LocalIndexes = cloneSplitLocalIndexes(target.LocalIndexes)
 	target.Endpoint = distribution.EndpointID(strings.Clone(string(target.Endpoint)))
 	target.Replicas = append([]ChildReplicaTarget(nil), target.Replicas...)
 	for index := range target.Replicas {

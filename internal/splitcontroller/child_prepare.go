@@ -121,6 +121,7 @@ func AppendChildPreparation(dst []byte, preparation ChildPreparation) ([]byte, e
 			RelationManifestDigest: preparation.target.RelationManifestDigest,
 			TopologyRecoveryEpoch:  preparation.target.TopologyRecoveryEpoch,
 			Authority:              preparation.target.Authority,
+			LocalIndexes:           cloneSplitLocalIndexes(preparation.target.LocalIndexes),
 		},
 	}
 	raw, err := vibejson.Marshal(&wire)
@@ -153,6 +154,7 @@ func OpenChildPreparation(raw []byte) (ChildPreparation, error) {
 	replicas := openPersistedChildReplicas(wire.Target.Replicas)
 	target := ChildTarget{
 		Child: wire.Target.Child, Endpoint: wire.Target.Endpoint, Replicas: replicas,
+		LocalIndexes:           cloneSplitLocalIndexes(wire.Target.LocalIndexes),
 		ReplicaSetVersion:      wire.Target.ReplicaSetVersion,
 		RelationManifestDigest: wire.Target.RelationManifestDigest,
 		TopologyRecoveryEpoch:  wire.Target.TopologyRecoveryEpoch, Authority: wire.Target.Authority,

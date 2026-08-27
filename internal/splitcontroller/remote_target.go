@@ -141,7 +141,7 @@ func remoteActionTargetForChildReplica(
 			ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
 		},
 		Allocation: binding.AllocationGeneration, Member: replica.Member,
-		Authority: target.Authority, RelationManifestDigest: replica.SQL.RelationManifestDigest,
+		Authority: target.Authority, RelationManifestDigest: target.RelationManifestDigest,
 	}
 	if !result.valid() {
 		return ShardActionTarget{}, ErrRemoteExecution
@@ -548,5 +548,5 @@ func targetMatchesChildReplica(
 		ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
 	}) && target.Allocation == binding.AllocationGeneration && target.Member == replica.Member &&
 		target.Authority == child.Authority &&
-		target.RelationManifestDigest == replica.SQL.RelationManifestDigest
+		target.RelationManifestDigest == child.RelationManifestDigest
 }

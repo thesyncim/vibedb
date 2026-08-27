@@ -9,10 +9,13 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -26,14 +29,23 @@ var ErrPlanIntent = errors.New("splitcontroller: invalid persisted plan intent")
 // revisions. No controller-local file or remembered recommendation is needed
 // to reconstruct the exact plan after a process loss.
 type persistedPlanIntent struct {
-	Operation        [32]byte                 `json:"operation"`
-	SourceGeneration uint64                   `json:"source_generation"`
-	Collection       string                   `json:"collection"`
-	Columns          []string                 `json:"columns"`
-	Source           autosplit.SourceIdentity `json:"source"`
-	Retained         uint8                    `json:"retained"`
-	Children         []autosplit.SplitChild   `json:"children"`
-	Targets          []persistedChildTarget   `json:"targets"`
+	Operation        [32]byte                      `json:"operation"`
+	SourceGeneration uint64                        `json:"source_generation"`
+	Collection       string                        `json:"collection"`
+	Columns          []string                      `json:"columns"`
+	Source           autosplit.SourceIdentity      `json:"source"`
+	Retained         uint8                         `json:"retained"`
+	Children         []autosplit.SplitChild        `json:"children"`
+	Targets          []persistedChildTarget        `json:"targets"`
+	SourceAuthority  *persistedPlanSourceAuthority `json:"source_authority"`
+}
+
+type persistedPlanSourceAuthority struct {
+	Group        raftmember.GroupKey      `json:"group"`
+	Command      raftservice.CommandFence `json:"command"`
+	SQL          persistedSQLIdentity     `json:"sql"`
+	Placement    persistedPlacement       `json:"placement"`
+	LocalIndexes []store.IndexDefinition  `json:"local_indexes"`
 }
 
 type persistedLimits sqldriver.ReplicatedShardStoreLimits
@@ -85,6 +97,7 @@ type persistedChildTarget struct {
 	RelationManifestDigest [32]byte                             `json:"relation_manifest_digest"`
 	TopologyRecoveryEpoch  uint64                               `json:"topology_recovery_epoch"`
 	Authority              sqldriver.ReplicatedAuthorityProfile `json:"authority"`
+	LocalIndexes           []store.IndexDefinition              `json:"local_indexes"`
 }
 
 type persistedChildReplica struct {
@@ -124,6 +137,10 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 		Children: make([]autosplit.SplitChild, plan.childCount),
 		Targets:  make([]persistedChildTarget, 0, int(plan.childCount)-1),
 	}
+	if source := plan.sourceAuthority; source != nil {
+		intent.SourceAuthority = &persistedPlanSourceAuthority{Group: source.Group, Command: source.Command,
+			SQL: persistSQLIdentity(source.Schema.SQL), Placement: persistedPlacement(source.Schema.Placement), LocalIndexes: cloneSplitLocalIndexes(source.Schema.LocalIndexes)}
+	}
 	for child := 0; child < int(plan.childCount); child++ {
 		descriptor := plan.children[child]
 		intent.Children[child] = autosplit.SplitChild{
@@ -152,6 +169,7 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 				RelationManifestDigest: target.RelationManifestDigest,
 				TopologyRecoveryEpoch:  target.TopologyRecoveryEpoch,
 				Authority:              target.Authority,
+				LocalIndexes:           cloneSplitLocalIndexes(target.LocalIndexes),
 			})
 		}
 	}
@@ -234,11 +252,15 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 			Authority:              target.Authority,
 			WAL:                    replicas[0].WAL,
 			SQL:                    replicas[0].SQL.Clone(),
+			LocalIndexes:           cloneSplitLocalIndexes(target.LocalIndexes),
 		}
 	}
-	plan, err := RecoverPlan(
-		catalog, intent.SourceGeneration, split, partitioner, targets,
-	)
+	var source []PlanSourceAuthority
+	if authority := intent.SourceAuthority; authority != nil {
+		source = []PlanSourceAuthority{{Group: authority.Group, Command: authority.Command, Schema: PlanSourceSchema{
+			SQL: openPersistedSQLIdentity(authority.SQL), Placement: sqldriver.ReplicatedPlacementProfile(authority.Placement), LocalIndexes: cloneSplitLocalIndexes(authority.LocalIndexes)}}}
+	}
+	plan, err := RecoverPlan(catalog, intent.SourceGeneration, split, partitioner, targets, source...)
 	if err != nil || [32]byte(plan.OperationID()) != intent.Operation {
 		return nil, errors.Join(err, ErrPlanIntent)
 	}

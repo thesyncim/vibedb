@@ -82,6 +82,10 @@ func TestCertifiedSplitProjectsRF3ChildAndPreservesPeerCoordinates(t *testing.T)
 }
 
 func testReplicatedProjectionPlan(t testing.TB) (*Plan, *gateway.Snapshot, gateway.ReplicatedShardDescriptor) {
+	return testReplicatedProjectionPlanWithFence(t, 11, 19)
+}
+
+func testReplicatedProjectionPlanWithFence(t testing.TB, routing, generation uint64) (*Plan, *gateway.Snapshot, gateway.ReplicatedShardDescriptor) {
 	t.Helper()
 	basePlan, _, target, _ := testPlanWithChildLeaders(t, []distribution.EndpointID{"node-b", "node-c", "node-d"})
 	leaders := []distribution.EndpointID{"source-a", "source-b", "source-c"}
@@ -93,7 +97,7 @@ func testReplicatedProjectionPlan(t testing.TB) (*Plan, *gateway.Snapshot, gatew
 	source := gateway.ReplicatedShardDescriptor{Distribution: "orders", Shard: "source", AllocationGeneration: 7,
 		Group: raftmember.GroupKey{ClusterID: testID(1), ClusterIncarnation: testID(2), TopologyRecoveryEpoch: 1, ShardIncarnation: testID(7), GroupID: testID(8)},
 		Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 5,
-			SchemaGeneration: 1, RelationManifestDigest: target.RelationManifestDigest, RoutingVersion: 11, RouteGeneration: 19},
+			SchemaGeneration: 1, RelationManifestDigest: target.RelationManifestDigest, RoutingVersion: routing, RouteGeneration: generation},
 		RangeIdentity: replication.Digest{1}, LineageDigest: replication.Digest{2}, ForwardingRuleDigest: replication.Digest{3}}
 	endpoints := make(map[distribution.EndpointID]string)
 	for i, leader := range leaders {
@@ -109,6 +113,7 @@ func testReplicatedProjectionPlan(t testing.TB) (*Plan, *gateway.Snapshot, gatew
 			endpoints[id] = "127.0.0.1:" + strconv.Itoa(2000+i*3+j)
 		}
 	}
+	schema := bindProjectionSourceAndChildSchemas(t, &source, &target)
 	ledger := source
 	ledger.Distribution, ledger.Shard = "request-ledger", "ledger"
 	ledger.Group.GroupID[0]++
@@ -137,7 +142,7 @@ func testReplicatedProjectionPlan(t testing.TB) (*Plan, *gateway.Snapshot, gatew
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := NewPlan(catalog, split, partitioner, []ChildTarget{target})
+	plan, err := NewPlan(catalog, split, partitioner, []ChildTarget{target}, schema)
 	if err != nil {
 		t.Fatal(err)
 	}

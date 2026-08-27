@@ -16,7 +16,7 @@ var ErrSourceCaptureActivation = errors.New("splitcontroller: invalid source cap
 // an observed serving cut. The caller wraps it in a topology-authority
 // replication.Command using the same route/session identity.
 func (p *Plan) AppendSourceCaptureActivation(dst []byte, state replicatedstate.State) ([]byte, error) {
-	if p == nil || p.partitioner == nil || state.Applied == 0 || state.LastTerm == 0 || state.Binding.Distribution != string(p.source.Distribution) || state.Binding.Shard != string(p.source.Shard) || state.Binding.AllocationGeneration != uint64(p.source.AllocationGeneration) || state.Binding.OwnershipEpoch != uint64(p.source.OwnershipEpoch) || state.Binding.SchemaGeneration == 0 || state.Binding.OwnedRange != p.source.Range {
+	if p == nil || p.partitioner == nil || state.Applied == 0 || state.LastTerm == 0 || state.Binding.Distribution != string(p.source.Distribution) || state.Binding.Shard != string(p.source.Shard) || state.Binding.AllocationGeneration != uint64(p.source.AllocationGeneration) || state.Binding.SchemaGeneration == 0 || !p.sourceBindingInitial(state.Binding) {
 		return dst, ErrSourceCaptureActivation
 	}
 	spec, err := rangesplit.AppendPortablePartitioner(nil, p.partitioner)
