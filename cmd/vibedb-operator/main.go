@@ -19,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: vibedb-operator bootstrap|render|prepare|validate")
+		fmt.Fprintln(os.Stderr, "usage: vibedb-operator bootstrap|render|prepare|restore-group|validate")
 		os.Exit(2)
 	}
 	var err error
@@ -30,6 +30,8 @@ func main() {
 		err = render(os.Args[2:])
 	case "prepare":
 		err = prepare(os.Args[2:])
+	case "restore-group":
+		err = restoreGroup(os.Args[2:])
 	case "validate":
 		err = validate(os.Args[2:])
 	default:
