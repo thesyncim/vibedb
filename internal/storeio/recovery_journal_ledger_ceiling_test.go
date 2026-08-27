@@ -12,10 +12,10 @@ import (
 
 func TestRecoveryJournalLedgerCeilingAppendReopen(t *testing.T) {
 	const (
-		entryCount = 258
+		entryCount = 514
 		keyBytes   = 106
 		valueBytes = 16 << 20
-		wantBytes  = valueBytes + 60*RecoveryJournalMinSectorSize
+		wantBytes  = valueBytes + 119*RecoveryJournalMinSectorSize
 	)
 	// Exercise the actual admitted rectangle: one maximum opaque value and
 	// every maximum-width key, including the largest session-release count.

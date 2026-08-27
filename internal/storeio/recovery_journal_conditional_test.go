@@ -54,7 +54,7 @@ func TestRecoveryJournalReplicatedSQLConditionalCeiling(t *testing.T) {
 
 func TestRecoveryJournalReplicatedLedgerConditionalCeiling(t *testing.T) {
 	const (
-		entryCount   = 258 // Maximum session retry window plus two control records.
+		entryCount   = 514 // Maximum retry slots and historical fences plus two control records.
 		keyBytes     = 106 // Longest ledger storage key, including payload identity.
 		payloadBytes = (16 << 20) + entryCount*keyBytes
 	)

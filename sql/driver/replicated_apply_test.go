@@ -2884,7 +2884,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"format":0,"storage":"storage","capture_storage":"capture","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":49,"max_document_bytes":2048,"max_batch_documents":10,"max_batch_bytes":3462},"capture_limits":{"max_key_bytes":8,"max_document_bytes":4096,"max_batch_documents":1,"max_batch_bytes":4104},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"request_ledger_capacity_bytes":0,"request_ledger_cleanup_reserve_bytes":0,"request_ledger_range_start":"0000000000000000000000000000000000000000000000000000000000000000","request_ledger_range_end":"0000000000000000000000000000000000000000000000000000000000000000","request_ledger_range_identity":"0000000000000000000000000000000000000000000000000000000000000000","placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
+	const want = `{"format":0,"storage":"storage","capture_storage":"capture","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":49,"max_document_bytes":2048,"max_batch_documents":18,"max_batch_bytes":3592},"capture_limits":{"max_key_bytes":8,"max_document_bytes":4096,"max_batch_documents":1,"max_batch_bytes":4104},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"request_ledger_capacity_bytes":0,"request_ledger_cleanup_reserve_bytes":0,"request_ledger_range_start":"0000000000000000000000000000000000000000000000000000000000000000","request_ledger_range_end":"0000000000000000000000000000000000000000000000000000000000000000","request_ledger_range_identity":"0000000000000000000000000000000000000000000000000000000000000000","placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
 	if string(encoded) != want {
 		t.Fatalf("identity JSON = %s, want %s", encoded, want)
 	}
@@ -2908,8 +2908,8 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	}
 	invalidMaximum := bytes.Replace(
 		maximumEncoded,
-		[]byte(`"max_batch_documents":258`),
-		[]byte(`"max_batch_documents":257`),
+		[]byte(`"max_batch_documents":514`),
+		[]byte(`"max_batch_documents":513`),
 		1,
 	)
 	if bytes.Equal(invalidMaximum, maximumEncoded) {

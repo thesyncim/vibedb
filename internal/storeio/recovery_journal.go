@@ -85,12 +85,15 @@ const (
 	// RecoveryJournalMaxCapacityBytes is the authoritative upper bound for the
 	// preallocated record region and the buffer read by recovery. Its extra bytes
 	// cover the largest replicated system profile: a 16 MiB command budget,
-	// every maximum-size key across 258 records (256 slots, session, and state),
+	// every maximum-size key across 514 records (256 slots, 256 historical
+	// fences, session, and state),
 	// conditional and per-entry framing,
 	// checksum trailer, and sector padding. Keeping the bound here makes a
 	// checksummed hostile header unable to request an unbounded allocation and
 	// keeps durable's creation clamp from drifting.
-	RecoveryJournalMaxCapacityBytes = (uint64(16) << 20) + 60*RecoveryJournalMinSectorSize
+	// Compared with the former 258-record bound, the exact additional framing
+	// and keys require 59 sectors (30,208 bytes), not a larger command budget.
+	RecoveryJournalMaxCapacityBytes = (uint64(16) << 20) + 119*RecoveryJournalMinSectorSize
 
 	// RecoveryJournalFormat is the sole admitted recovery-journal grammar.
 	RecoveryJournalFormat = uint32(0)
