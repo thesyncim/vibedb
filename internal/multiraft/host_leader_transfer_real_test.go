@@ -11,14 +11,17 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply(t *testing.T) {
@@ -545,16 +548,9 @@ func newRealTransferRuntimeWithLearners(
 	t *testing.T,
 	identity raftstore.Identity,
 	voters, learners []uint64,
-	bootstrapIndex ...uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
 	t.Helper()
-	index, term := uint64(1), uint64(1)
-	if len(bootstrapIndex) > 1 || (len(bootstrapIndex) == 1 && bootstrapIndex[0] == 0) {
-		t.Fatal("invalid real-transfer bootstrap index")
-	}
-	if len(bootstrapIndex) == 1 {
-		index = bootstrapIndex[0]
-	}
+	bootstrap := realTransferStaticBootstrap(t, voters, learners)
 	walPath := filepath.Join(t.TempDir(), "member.wal")
 	sqlPath := filepath.Join(t.TempDir(), "member.vdb")
 	options := raftstore.Options{
@@ -563,14 +559,7 @@ func newRealTransferRuntimeWithLearners(
 	}
 	wal, err := raftstore.Create(walPath, identity, realTransferWALKey(), raftstore.Bootstrap{
 		TopologyRecoveryEpoch: 29,
-		Snapshot: &pb.Snapshot{
-			Data: []byte("multiraft-real-transfer-bootstrap"),
-			Metadata: &pb.SnapshotMetadata{
-				Index: &index, Term: &term, ConfState: &pb.ConfState{
-					Voters: append([]uint64(nil), voters...), Learners: append([]uint64(nil), learners...),
-				},
-			},
-		},
+		Snapshot:              bootstrap,
 	}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -629,7 +618,7 @@ func newRealTransferRuntimeWithLearners(
 		_ = wal.Close()
 		t.Fatal(err)
 	}
-	bootstrap, err := wal.Snapshot()
+	bootstrap, err = wal.Snapshot()
 	if err == nil {
 		_, err = apply.InstallSnapshot(bootstrap)
 	}
@@ -638,6 +627,33 @@ func newRealTransferRuntimeWithLearners(
 		_ = database.Close()
 		_ = wal.Close()
 		t.Fatal(err)
+	}
+	if len(learners) != 0 {
+		// This fixture starts with an enrolled learner. Publish a real durable
+		// configuration entry before testing its later promotion, not a raw
+		// index-two snapshot masquerading as the index-one static bootstrap.
+		entry := realTransferLearnerCheckpoint(t, identity, learners)
+		incarnation, seedErr := wal.BeginIncarnation()
+		if seedErr == nil {
+			seedErr = wal.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
+				HardState: &pb.HardState{Term: entry.Term, Commit: entry.Index},
+				Entries:   []*pb.Entry{entry}, MustSync: true})
+		}
+		if seedErr == nil {
+			var publication raftmodel.Publication
+			publication, seedErr = apply.ApplyConfiguration(raftmodel.ApplyMeta{Index: entry.GetIndex(),
+				Term: entry.GetTerm(), Type: entry.GetType()}, bootstrap.GetMetadata().GetConfState())
+			if seedErr == nil && (publication.Applied != entry.GetIndex() || publication.ReplicaSetVersion != entry.GetIndex() ||
+				publication.ConfState.Equivalent(bootstrap.GetMetadata().GetConfState()) != nil) {
+				seedErr = errors.New("learner checkpoint did not publish its exact durable configuration")
+			}
+		}
+		if seedErr != nil {
+			_ = apply.Close()
+			_ = database.Close()
+			_ = wal.Close()
+			t.Fatal(seedErr)
+		}
 	}
 	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
 	if err != nil {
@@ -677,6 +693,36 @@ func newRealTransferRuntimeWithLearners(
 		return restarted
 	}
 	return runtime, base, reopen
+}
+
+func realTransferStaticBootstrap(t *testing.T, voters, learners []uint64) *pb.Snapshot {
+	t.Helper()
+	index, term := uint64(1), uint64(1)
+	bootstrap := &pb.Snapshot{Data: []byte("multiraft-real-transfer-bootstrap"),
+		Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{
+			Voters: append([]uint64(nil), voters...), Learners: append([]uint64(nil), learners...),
+		}}}
+	if _, err := replicatedstate.StaticBootstrapForSnapshot(bootstrap); err != nil {
+		t.Fatalf("invalid real-transfer static bootstrap: %v", err)
+	}
+	return bootstrap
+}
+
+func realTransferLearnerCheckpoint(t *testing.T, identity raftstore.Identity, learners []uint64) *pb.Entry {
+	t.Helper()
+	if len(learners) != 1 {
+		t.Fatal("real-transfer checkpoint requires exactly one enrolled learner")
+	}
+	group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
+		TopologyRecoveryEpoch: 29, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
+	digest := realTransferMembershipGrant(group).Digest()
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(&pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &learners[0], Context: digest[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, term := uint64(2), uint64(1)
+	return &pb.Entry{Index: &index, Term: &term, Type: pb.EntryConfChange.Enum(), Data: data}
 }
 
 func realTransferIdentities() [4]raftstore.Identity {

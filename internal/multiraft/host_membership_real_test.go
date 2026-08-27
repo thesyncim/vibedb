@@ -1,6 +1,7 @@
 package multiraft
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -8,7 +9,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // This uses an RF3 voter set plus one enrolled replacement. The replacement
@@ -24,10 +27,10 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	nodes := [4]rafttransport.NodeID{{1}, {2}, {3}, {4}}
 	members := make([]rafttransport.Member, 4)
 	for index := range hosts {
-		// The grant certifies the original RF3 at version 1. This fixture starts
-		// after learner enrollment, whose snapshot must be a later durable cut.
+		// This fixture starts after learner enrollment; a persisted and applied
+		// configuration entry establishes version 2 before serving begins.
 		runtime, _, reopenRuntime := newRealTransferRuntimeWithLearners(
-			t, identities[index], voters, []uint64{identities[3].MemberID}, 2)
+			t, identities[index], voters, []uint64{identities[3].MemberID})
 		reopen[index] = reopenRuntime
 		host, err := NewHost(testHostLimits())
 		if err != nil {
@@ -277,9 +280,30 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 func preflightRealTransferLearnerGrant(t *testing.T) {
 	t.Helper()
 	identity := realTransferIdentities()[0]
+	bootstrap := realTransferStaticBootstrap(t, []uint64{1, 2, 3}, []uint64{4})
+	if bootstrap.GetMetadata().GetIndex() != 1 || bootstrap.GetMetadata().GetTerm() != 1 {
+		t.Fatal("static bootstrap must remain index one, term one")
+	}
+	advanced := proto.Clone(bootstrap).(*pb.Snapshot)
+	index := uint64(2)
+	advanced.Metadata.Index = &index
+	if _, err := replicatedstate.StaticBootstrapForSnapshot(advanced); !errors.Is(err, replicatedstate.ErrStaticSnapshotOnly) {
+		t.Fatalf("raw advanced snapshot accepted as static bootstrap: %v", err)
+	}
+	entry := realTransferLearnerCheckpoint(t, identity, []uint64{4})
+	var change pb.ConfChange
+	if err := proto.Unmarshal(entry.Data, &change); err != nil || entry.GetIndex() != 2 ||
+		entry.GetTerm() != 1 || entry.GetType() != pb.EntryConfChange ||
+		change.GetType() != pb.ConfChangeAddLearnerNode || change.GetNodeId() != 4 {
+		t.Fatalf("invalid progressed learner checkpoint: entry=%v change=%v err=%v", entry, &change, err)
+	}
 	group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
 		TopologyRecoveryEpoch: 29, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
 	grant := realTransferMembershipGrant(group)
+	grantDigest := grant.Digest()
+	if !bytes.Equal(change.Context, grantDigest[:]) {
+		t.Fatal("learner checkpoint lost its exact transition grant")
+	}
 	for _, version := range []uint64{1, 2} {
 		members := make([]rafttransport.Member, 4)
 		for i := range members {
