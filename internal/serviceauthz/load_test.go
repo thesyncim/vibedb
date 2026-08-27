@@ -20,6 +20,11 @@ func TestLoadVibeJSONBoundsAndCanonicalPolicy(t *testing.T) {
 			CapabilityExecutionPin) != DecisionAllow {
 		t.Fatalf("loaded policy mismatch")
 	}
+	backupPolicy, err := Load([]byte(`{"generation":6,"principals":[{"node":"` + node +
+		`","capabilities":["backup"]}]}`))
+	if err != nil || backupPolicy.Check(backupPolicy.Nodes()[0], CapabilityBackup) != DecisionAllow {
+		t.Fatalf("backup capability policy=%v err=%v", backupPolicy, err)
+	}
 	for _, raw := range [][]byte{
 		nil,
 		[]byte(`{"generation":0,"principals":[]}`),

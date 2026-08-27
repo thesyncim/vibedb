@@ -53,11 +53,16 @@ const (
 	// catalog RF3 group. It grants no catalog publication or physical route-gate
 	// authority.
 	CapabilityExecutionPin
+	// CapabilityBackup permits catalog-authorized backup export and non-serving
+	// restore staging. It grants no data, topology, membership, schema, or
+	// serving authority by itself.
+	CapabilityBackup
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
 	CapabilityDelegate | CapabilityMembership | CapabilityTopology |
-	CapabilityTransactionRecovery | CapabilityRequestLedger | CapabilityExecutionPin
+	CapabilityTransactionRecovery | CapabilityRequestLedger | CapabilityExecutionPin |
+	CapabilityBackup
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

@@ -12,6 +12,12 @@ the complete ordered verified-artifact vector and returns only a non-serving
 staging permit for a new cluster identity. It cannot mint a member, store,
 ownership epoch, route generation, or membership grant.
 
+Authorization uses the independent `backup` policy capability. A backup
+principal does not acquire data read/write, schema, topology, membership,
+delegation, transaction-recovery, request-ledger, execution-pin, or serving
+authority. The internal gateway controller still uses its separate topology
+identity when it conditionally advances the catalog-RF3 operation record.
+
 ## Why replica snapshots are not backups
 
 Learner bootstrap creates an authenticated snapshot artifact for one exact RF3

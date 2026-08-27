@@ -167,6 +167,24 @@ func TestExecutionPinCapabilityIsIndependentFromTopology(t *testing.T) {
 	}
 }
 
+func TestBackupCapabilityCannotAcquireServingOrTopologyAuthority(t *testing.T) {
+	backup := authzNode(31)
+	policy, err := NewPolicy(9, []Entry{{Node: backup, Capabilities: CapabilityBackup}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Check(backup, CapabilityBackup) != DecisionAllow {
+		t.Fatal("backup authority denied")
+	}
+	for _, capability := range []Capability{CapabilityDataRead, CapabilityDataWrite, CapabilitySchema,
+		CapabilityDelegate, CapabilityMembership, CapabilityTopology, CapabilityTransactionRecovery,
+		CapabilityRequestLedger, CapabilityExecutionPin} {
+		if policy.Check(backup, capability) != DecisionDenyCapability {
+			t.Fatalf("backup principal acquired capability %x", capability)
+		}
+	}
+}
+
 func TestAuthorityContextIsExactAndAllocationFreeOnRead(t *testing.T) {
 	authority := Authority{Node: authzNode(11), Generation: 19}
 	ctx, err := WithAuthority(context.Background(), authority)
