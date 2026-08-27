@@ -26,6 +26,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
@@ -39,10 +40,9 @@ import (
 const restoreRF3ProcessEnvironment = "VIBEDB_RESTORE_RF3_PROCESS_E2E"
 
 // TestRestoredRF3ExternalProcessServingAndFailover exercises the shipped
-// adopter and serve-rf3 composition over actual restored SQL/WAL roots. The
-// catalog boundary is an exact, separately observed test authority; catalog
-// replication itself is qualified by the catalog RF3 tests. No marker file or
-// local receipt grants serving permission in this test.
+// adopter and serve-rf3 composition over actual restored SQL/WAL roots. Its
+// activation witness is committed to, and separately ReadIndex-observed from,
+// the same real target RF3 catalog. No local receipt grants serving permission.
 func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	if os.Getenv(restoreRF3ProcessEnvironment) != "1" {
 		t.Skip("set " + restoreRF3ProcessEnvironment + "=1 for the bounded Linux process gate")
@@ -67,6 +67,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	catalog.delegate = newRestoredRF3Catalog(t, fixture, operatorProfile, options.Gate, options.Operator)
 	client, err := shardservice.NewRestoreServingControlClient(rf3CommandControlOpener{
 		profile: operatorProfile, addresses: addresses, deadline: deadline,
 	}, deadline, deadline)
@@ -126,7 +127,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 		storageFinal > 1<<30 || storageFinal > storageBaseline+64<<20 {
 		t.Fatalf("space bound: rss=%d/%d wal=%d/%d storage=%d/%d", rssBaseline, rssFinal, walBaseline, walFinal, storageBaseline, storageFinal)
 	}
-	t.Logf("restored external RF3: shard_processes=3 certified_artifact=true fresh_roots=true closed_before_catalog=true catalog_witness=test_boundary catalog_observations=%d restored_read=true acknowledged_write_survived=true leader_sigkill=true restart_closed=true regrant=true total=%s write=%s failover=%s rss_bytes=%d rss_growth=%d storage_growth=%d wal_growth=%d",
+	t.Logf("restored external RF3: shard_processes=3 certified_artifact=true fresh_roots=true closed_before_catalog=true catalog_witness=replicated_readindex catalog_observations=%d restored_read=true acknowledged_write_survived=true leader_sigkill=true restart_closed=true regrant=true total=%s write=%s failover=%s rss_bytes=%d rss_growth=%d storage_growth=%d wal_growth=%d",
 		catalog.observations, time.Since(started), writeLatency, failoverLatency, rssFinal,
 		max(int64(rssFinal)-int64(rssBaseline), 0), max(storageFinal-storageBaseline, 0), max(walFinal-walBaseline, 0))
 }
@@ -146,26 +147,92 @@ func (installer *restoreRF3Installer) Install(ctx context.Context, operation clu
 }
 
 type restoreRF3Catalog struct {
-	witness      clusterrestore.CatalogWitness
+	delegate     gateway.RestoreCatalog
 	published    bool
 	observations int
 }
 
-func (catalog *restoreRF3Catalog) ProposeRestoreActivation(_ context.Context, raw []byte) ([]byte, error) {
-	witness, err := clusterrestore.OpenCatalogActivation(raw)
-	if err != nil || catalog.published && catalog.witness != witness {
+func (catalog *restoreRF3Catalog) ProposeRestoreActivation(ctx context.Context, raw []byte) ([]byte, error) {
+	if catalog.delegate == nil {
 		return nil, clusterrestore.ErrActivation
 	}
-	catalog.witness, catalog.published = witness, true
-	return append([]byte(nil), witness.CatalogDigest[:]...), nil
+	result, err := catalog.delegate.ProposeRestoreActivation(ctx, raw)
+	if err == nil {
+		catalog.published = true
+	}
+	return result, err
 }
 
-func (catalog *restoreRF3Catalog) ObserveRestoreActivation(_ context.Context, operation [32]byte) (clusterrestore.CatalogWitness, error) {
-	if !catalog.published || catalog.witness.Operation != operation {
+func (catalog *restoreRF3Catalog) ObserveRestoreActivation(ctx context.Context, operation [32]byte) (clusterrestore.CatalogWitness, error) {
+	if catalog.delegate == nil || !catalog.published {
 		return clusterrestore.CatalogWitness{}, clusterrestore.ErrActivation
 	}
-	catalog.observations++
-	return catalog.witness, nil
+	witness, err := catalog.delegate.ObserveRestoreActivation(ctx, operation)
+	if err == nil {
+		catalog.observations++
+	}
+	return witness, err
+}
+
+func newRestoredRF3Catalog(t *testing.T, fixture *rf3FaultFixture, profile *rafttransport.PeerTLS,
+	gate *serviceauthz.Gate, operator serviceauthz.Authority,
+) gateway.RestoreCatalog {
+	t.Helper()
+	_, state := rf3CommandFindLeader(t, fixture.nativeAddresses[:], fixture.nodes[:], profile,
+		operator.Node, fixture.group, 23, operator.Generation)
+	route := gateway.ReplicatedRoute{Distribution: gateway.ReplicatedCatalogDistribution,
+		Shard: gateway.ReplicatedCatalogShard, Group: fixture.group, AllocationGeneration: 23,
+		Command: state.Fence.Command}
+	for member, node := range fixture.nodes {
+		route.Replicas = append(route.Replicas, gateway.ReplicatedEndpoint{Member: uint64(member + 1), Node: node,
+			StoreID: rf3CommandStoreIdentity(uint64(member + 1)).StoreID, NodeIncarnation: 1,
+			Address: fixture.nativeAddresses[member]})
+	}
+	transport, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
+		TLS: profile, Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, HandshakeDeadline: func() time.Time { return time.Now().Add(3 * time.Second) },
+		MaxConnections: 6, MaxPerEndpoint: 2, MaxIdlePerEndpoint: 1, MaxHandshakes: 3,
+		MaxWaiters: 8, MaxIdleAge: time.Minute, MaxLifetime: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = transport.Close() })
+	executor, err := gateway.NewReplicatedExecutor(transport, 8, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(t.Context(), operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openSession := func(id byte, mutations int) *gateway.NativeSession {
+		session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor, Route: route,
+			Distribution: string(gateway.ReplicatedCatalogDistribution), Shard: string(gateway.ReplicatedCatalogShard),
+			Tenant: []byte("restore-process-catalog"), ClientID: replication.ID128{id},
+			Resolver: gateway.BaseRelationResolver{Relation: 1}, ProposalCapability: serviceauthz.CapabilityTopology,
+			MaxRelationBatches: 1, MaxMutations: mutations, InitialCommandBytes: 4096, MaxCommandBytes: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
+			t.Fatalf("preparing target catalog session: %v", err)
+		}
+		return session
+	}
+	base, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
+		Executor: executor, Route: route, Relation: 1, Holder: gateway.NewCatalogHolder(nil),
+		Session: openSession(0xa1, 3), Authority: operator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := gateway.NewReplicatedRestoreCatalog(gateway.ReplicatedRestoreCatalogOptions{
+		Catalog: base, Session: openSession(0xa2, 1), Gate: gate, Operator: operator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
 }
 
 func newRestoredRF3ProcessFixture(t *testing.T) (*rf3FaultFixture, gateway.RestoreActivationOptions, *restoreRF3Catalog) {
