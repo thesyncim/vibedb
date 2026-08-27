@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 type backupAuthorityStub struct {
@@ -63,6 +64,25 @@ func backupTestCut(group raftmember.GroupKey, value byte) clusterbackup.GroupCut
 		ArtifactBytes: 4096, ArtifactManifestDigest: backupTest32(value + 3)}
 }
 
+func backupTestController(t testing.TB, authority BackupOperationAuthority) *BackupOperationController {
+	t.Helper()
+	operator := serviceauthz.Authority{Node: [16]byte{31}, Generation: 1}
+	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{Node: operator.Node,
+		Capabilities: serviceauthz.CapabilityBackup}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := serviceauthz.NewGate(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewBackupOperationController(authority, gate, operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controller
+}
+
 func TestBackupOperationCatalogLifecycleResumesOutcomeUnknown(t *testing.T) {
 	groups := []raftmember.GroupKey{backupTestGroup(1), backupTestGroup(2)}
 	cut := clusterbackup.CatalogCut{Generation: 7, Digest: backupTest32(8), PolicyGeneration: 9, Groups: groups}
@@ -71,7 +91,7 @@ func TestBackupOperationCatalogLifecycleResumesOutcomeUnknown(t *testing.T) {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
 	authority := new(backupAuthorityStub)
-	controller := BackupOperationController{Authority: authority}
+	controller := backupTestController(t, authority)
 	if err = controller.Submit(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +109,7 @@ func TestBackupOperationCatalogLifecycleResumesOutcomeUnknown(t *testing.T) {
 		t.Fatalf("replayed=%+v err=%v", replayed, err)
 	}
 	// A replacement controller resumes from the catalog record, never local phase state.
-	controller = BackupOperationController{Authority: authority}
+	controller = backupTestController(t, authority)
 	exported, err := controller.PublishExported(t.Context(), replayed, backupTest32(20))
 	if err != nil || exported.Cursor[0] != backupStageExported {
 		t.Fatalf("exported=%+v err=%v", exported, err)
@@ -117,12 +137,26 @@ func TestBackupOperationRejectsPartialCertificateAndWrongCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	controller := BackupOperationController{Authority: new(backupAuthorityStub)}
+	controller := backupTestController(t, new(backupAuthorityStub))
 	if _, err = controller.PublishCertified(t.Context(), record, certificate, 1024); !errors.Is(err, ErrBackupOperation) {
 		t.Fatalf("partial certificate err=%v", err)
 	}
 	certificate.CatalogGeneration++
 	if _, err = controller.PublishCertified(t.Context(), record, certificate, 1024); !errors.Is(err, ErrBackupOperation) {
 		t.Fatalf("wrong catalog err=%v", err)
+	}
+}
+
+func TestBackupOperationControllerRequiresIndependentBackupAuthority(t *testing.T) {
+	authority := new(backupAuthorityStub)
+	operator := serviceauthz.Authority{Node: [16]byte{30}, Generation: 1}
+	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{Node: operator.Node,
+		Capabilities: serviceauthz.CapabilityTopology | serviceauthz.CapabilityDataRead}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, _ := serviceauthz.NewGate(policy)
+	if _, err = NewBackupOperationController(authority, gate, operator); !errors.Is(err, ErrBackupOperation) {
+		t.Fatalf("topology/data principal admitted err=%v", err)
 	}
 }

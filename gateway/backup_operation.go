@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -78,19 +79,37 @@ type BackupOperationAuthority interface {
 
 // BackupOperationController advances only after the external repository has
 // durably published the exact certificate/artifacts represented by each proof.
-type BackupOperationController struct{ Authority BackupOperationAuthority }
-
-func (controller BackupOperationController) Submit(ctx context.Context, record ReplicatedOperationRecord) error {
-	if controller.Authority == nil || !validBackupRecord(record, backupStageCollecting) {
-		return ErrBackupOperation
-	}
-	return controller.Authority.SubmitOperation(ctx, record)
+type BackupOperationController struct {
+	authority BackupOperationAuthority
+	gate      *serviceauthz.Gate
+	operator  serviceauthz.Authority
 }
 
-func (controller BackupOperationController) PublishCertified(ctx context.Context,
+func NewBackupOperationController(authority BackupOperationAuthority, gate *serviceauthz.Gate,
+	operator serviceauthz.Authority) (*BackupOperationController, error) {
+	if authority == nil || gate == nil || !operator.Valid() ||
+		gate.CheckAuthority(operator, serviceauthz.CapabilityBackup) != serviceauthz.DecisionAllow {
+		return nil, ErrBackupOperation
+	}
+	return &BackupOperationController{authority: authority, gate: gate, operator: operator}, nil
+}
+
+func (controller *BackupOperationController) authorized() bool {
+	return controller != nil && controller.authority != nil && controller.gate != nil &&
+		controller.gate.CheckAuthority(controller.operator, serviceauthz.CapabilityBackup) == serviceauthz.DecisionAllow
+}
+
+func (controller *BackupOperationController) Submit(ctx context.Context, record ReplicatedOperationRecord) error {
+	if !controller.authorized() || !validBackupRecord(record, backupStageCollecting) {
+		return ErrBackupOperation
+	}
+	return controller.authority.SubmitOperation(ctx, record)
+}
+
+func (controller *BackupOperationController) PublishCertified(ctx context.Context,
 	record ReplicatedOperationRecord, certificate clusterbackup.Certificate, certificateBytes uint64,
 ) (ReplicatedOperationRecord, error) {
-	if controller.Authority == nil || !validBackupRecord(record, backupStageCollecting) ||
+	if !controller.authorized() || !validBackupRecord(record, backupStageCollecting) ||
 		certificate.Digest == ([32]byte{}) || certificate.Operation != record.ID ||
 		certificate.CatalogGeneration != record.CatalogGeneration || certificateBytes == 0 ||
 		len(certificate.Groups) != int(record.Cursor[1]) {
@@ -103,16 +122,16 @@ func (controller BackupOperationController) PublishCertified(ctx context.Context
 	next.Cursor[2] = uint64(len(certificate.Groups))
 	next.Cursor[3] = certificateBytes
 	next.Proof = certificate.Digest
-	if err := controller.Authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
+	if err := controller.authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
 		return ReplicatedOperationRecord{}, err
 	}
 	return next, nil
 }
 
-func (controller BackupOperationController) PublishExported(ctx context.Context,
+func (controller *BackupOperationController) PublishExported(ctx context.Context,
 	record ReplicatedOperationRecord, exportDigest [sha256.Size]byte,
 ) (ReplicatedOperationRecord, error) {
-	if controller.Authority == nil || !validBackupRecord(record, backupStageCertified) ||
+	if !controller.authorized() || !validBackupRecord(record, backupStageCertified) ||
 		exportDigest == ([sha256.Size]byte{}) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
@@ -120,16 +139,16 @@ func (controller BackupOperationController) PublishExported(ctx context.Context,
 	next.Revision++
 	next.Cursor[0] = backupStageExported
 	next.Proof = exportDigest
-	if err := controller.Authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
+	if err := controller.authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
 		return ReplicatedOperationRecord{}, err
 	}
 	return next, nil
 }
 
-func (controller BackupOperationController) PublishRestoreStaged(ctx context.Context,
+func (controller *BackupOperationController) PublishRestoreStaged(ctx context.Context,
 	record ReplicatedOperationRecord, permit clusterbackup.RestoreStagingPermit,
 ) (ReplicatedOperationRecord, error) {
-	if controller.Authority == nil || !validBackupRecord(record, backupStageExported) ||
+	if !controller.authorized() || !validBackupRecord(record, backupStageExported) ||
 		permit.CertificateDigest == ([32]byte{}) || permit.Groups != uint32(record.Cursor[1]) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
@@ -141,20 +160,20 @@ func (controller BackupOperationController) PublishRestoreStaged(ctx context.Con
 	next.Revision++
 	next.Cursor[0] = backupStageRestoreStaged
 	next.Proof = proof
-	if err := controller.Authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
+	if err := controller.authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
 		return ReplicatedOperationRecord{}, err
 	}
 	return next, nil
 }
 
-func (controller BackupOperationController) Complete(ctx context.Context, record ReplicatedOperationRecord) (ReplicatedOperationRecord, error) {
-	if controller.Authority == nil || !validBackupRecord(record, backupStageExported) && !validBackupRecord(record, backupStageRestoreStaged) {
+func (controller *BackupOperationController) Complete(ctx context.Context, record ReplicatedOperationRecord) (ReplicatedOperationRecord, error) {
+	if !controller.authorized() || !validBackupRecord(record, backupStageExported) && !validBackupRecord(record, backupStageRestoreStaged) {
 		return ReplicatedOperationRecord{}, ErrBackupOperation
 	}
 	next := record
 	next.Revision++
 	next.State = ReplicatedOperationComplete
-	if err := controller.Authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
+	if err := controller.authority.AdvanceOperation(ctx, record.Revision, next); err != nil {
 		return ReplicatedOperationRecord{}, err
 	}
 	return next, nil
