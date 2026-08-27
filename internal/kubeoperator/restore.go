@@ -312,15 +312,16 @@ type restoreReplicaAllocation struct {
 }
 
 type restoreReplicaReceipt struct {
-	Format       uint16                                 `json:"format"`
-	Operation    string                                 `json:"operation"`
-	GroupOrdinal uint32                                 `json:"group_ordinal"`
-	Replica      uint8                                  `json:"replica"`
-	Identity     sqldriver.ReplicatedShardStoreIdentity `json:"identity"`
-	Apply        sqldriver.ReplicatedApplyIdentity      `json:"apply"`
-	Targets      [3]restoreReplicaTarget                `json:"targets"`
-	SnapshotBase []byte                                 `json:"snapshot_base"`
-	RootDigest   string                                 `json:"root_digest"`
+	Format          uint16                                 `json:"format"`
+	Operation       string                                 `json:"operation"`
+	GroupOrdinal    uint32                                 `json:"group_ordinal"`
+	Replica         uint8                                  `json:"replica"`
+	Identity        sqldriver.ReplicatedShardStoreIdentity `json:"identity"`
+	Apply           sqldriver.ReplicatedApplyIdentity      `json:"apply"`
+	Targets         [3]restoreReplicaTarget                `json:"targets"`
+	SnapshotBase    []byte                                 `json:"snapshot_base"`
+	RootDigest      string                                 `json:"root_digest"`
+	MachineManifest [32]byte                               `json:"machine_manifest"`
 }
 
 type restoreReplicaTarget struct {
@@ -374,8 +375,8 @@ func (f *restoreReplicaFactory) OpenReplica(
 		return restoreservice.ReplicaRoot{}, err
 	}
 	if manifest.Bundle || f.template.relationDigest != ([32]byte{}) {
-		digest, digestErr := sqldriver.ReplicatedRelationManifestDigest(identity)
-		if digestErr != nil || manifest.Bundle && digest != manifest.RelationManifestDigest || f.template.relationDigest != ([32]byte{}) && digest != f.template.relationDigest {
+		digest, digestErr := database.ReplicatedRelationManifestForBinding(identity, options.Placement, identity.Binding)
+		if digestErr != nil || f.template.relationDigest != ([32]byte{}) && digest != f.template.relationDigest {
 			_ = database.Close()
 			return restoreservice.ReplicaRoot{}, errors.Join(ErrBootstrap, digestErr)
 		}
@@ -586,12 +587,17 @@ func recoverRestoreReplica(
 	if err != nil {
 		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, err
 	}
-	expectedImage := source.ImageDigest
-	if projection != nil {
-		expectedImage, err = replicatedstate.ProjectionImageDigest(identity.UserTable, receipt.Apply.ValidationDigest, projection)
+	if certificate.Manifest.State.Applied != source.State.Applied || certificate.Manifest.State.LastTerm != source.State.LastTerm {
+		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, ErrBootstrap
 	}
-	if err != nil || certificate.Manifest.ImageDigest != expectedImage {
-		return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, errors.Join(ErrBootstrap, err)
+	// The group installer verifies the unchanged data image once against the
+	// complete source artifact in the fresh validation domain. Source and target
+	// image hashes cannot be compared directly when routing authority changed.
+	if projection != nil {
+		expectedImage, imageErr := replicatedstate.ProjectionImageDigest(identity.UserTable, receipt.Apply.ValidationDigest, projection)
+		if imageErr != nil || certificate.Manifest.ImageDigest != expectedImage {
+			return sqldriver.ReplicatedChildActivation{}, [sha256.Size]byte{}, false, errors.Join(ErrBootstrap, imageErr)
+		}
 	}
 	activation, resumed, err := database.ResumeReplicatedSnapshotActivation(identity, certificate.Manifest, bootstrap, options)
 	if err != nil || !resumed {
@@ -624,9 +630,13 @@ func commitRestoreReplica(
 		return [sha256.Size]byte{}, err
 	}
 	digest := restoreRootDigest(allocation, base, operation, group, replica)
+	profile, err := activation.Apply.CapacityQualificationProfile()
+	if err != nil {
+		return [32]byte{}, err
+	}
 	receipt := restoreReplicaReceipt{Format: 1, Operation: hex.EncodeToString(operation.Digest[:]),
 		GroupOrdinal: group, Replica: replica, Identity: identity, Apply: activation.ApplyIdentity,
-		SnapshotBase: base, RootDigest: hex.EncodeToString(digest[:])}
+		SnapshotBase: base, RootDigest: hex.EncodeToString(digest[:]), MachineManifest: profile.RelationManifestDigest}
 	for index, target := range operation.Targets[group].Replicas {
 		receipt.Targets[index] = restoreReplicaTarget{Member: target.Member,
 			Node: hex.EncodeToString(target.Node[:]), Store: hex.EncodeToString(target.Store[:]),

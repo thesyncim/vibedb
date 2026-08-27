@@ -68,7 +68,17 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 	cut := config.Operation.Certificate.Groups[config.Ordinal]
 	hash := sha256.New()
 	reader := &restoreCountingReader{reader: io.TeeReader(config.Artifact, hash)}
-	source, err := replicatedstate.VerifySnapshotArtifact(reader, replicatedstate.SnapshotArtifactCallbacks{})
+	var source replicatedstate.SnapshotArtifactManifest
+	var importedImage [32]byte
+	if template.projection == nil {
+		first, stateErr := OpenRestoredReplicaState(filepath.Join(directory, "replica-1"))
+		if stateErr != nil {
+			return RestoreGroupResult{}, true, stateErr
+		}
+		source, importedImage, err = sqldriver.VerifyReplicatedRestoreImage(first.Identity, first.Apply, reader)
+	} else {
+		source, err = replicatedstate.VerifySnapshotArtifact(reader, replicatedstate.SnapshotArtifactCallbacks{})
+	}
 	if err != nil || reader.bytes != cut.ArtifactBytes || !bytes.Equal(hash.Sum(nil), cut.ArtifactHash[:]) ||
 		source.Digest != cut.ArtifactManifestDigest || source.RelationManifestDigest != cut.RelationManifestDigest ||
 		source.State.Applied != cut.SnapshotIndex || source.State.LastTerm != cut.SnapshotTerm {
@@ -76,7 +86,7 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 	}
 	factory := restoreReplicaFactory{root: config.Root, template: template, templateDigest: config.Operation.TargetCatalogDigest}
 	if !factory.manifestMatchesTemplate(source) || string(source.UserCollection) != template.BaseTable ||
-		seal.Witness.ArtifactManifest != source.Digest || template.projection == nil && seal.Witness.SanitizedImageDigest != source.ImageDigest ||
+		seal.Witness.ArtifactManifest != source.Digest || template.projection == nil && seal.Witness.SanitizedImageDigest != importedImage ||
 		seal.Witness.SnapshotIndex != cut.SnapshotIndex || seal.Witness.SnapshotTerm != cut.SnapshotTerm ||
 		seal.Witness.TargetGroup != restoreEncodedTargetGroup(config.Operation, config.Ordinal) {
 		return RestoreGroupResult{}, true, ErrBootstrap
@@ -108,7 +118,7 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 			}
 		}
 		certificate, certificateErr := replicatedstate.OpenSnapshotBase(state.SnapshotBase)
-		expectedImage := source.ImageDigest
+		expectedImage := importedImage
 		if template.projection != nil {
 			var imageErr error
 			expectedImage, imageErr = replicatedstate.ProjectionImageDigest(template.BaseTable, state.Apply.ValidationDigest, template.projection)
@@ -127,16 +137,13 @@ func recoverSealedRestoreGroup(ctx context.Context, config RestoreGroupConfig, t
 		}
 		if certificateErr != nil || certificate.Digest != seal.Witness.GenesisProof ||
 			optionsErr != nil || certificate.Manifest.State.Binding != expectedBinding || certificate.Manifest.SystemRows != 1 || certificate.Manifest.CaptureRows != 0 ||
-			certificate.Manifest.ImageDigest != expectedImage || seal.Witness.SanitizedImageDigest != expectedImage || certificate.Manifest.RelationManifestDigest != source.RelationManifestDigest ||
+			certificate.Manifest.ImageDigest != expectedImage || seal.Witness.SanitizedImageDigest != expectedImage ||
 			certificate.Manifest.State.Applied != source.State.Applied || certificate.Manifest.State.LastTerm != source.State.LastTerm ||
 			!proto.Equal(certificate.StaticBootstrap, restoreRF3Bootstrap(config.Operation, config.Ordinal, config.Operation.TargetCatalogDigest)) {
 			return RestoreGroupResult{}, true, errors.Join(ErrBootstrap, certificateErr)
 		}
-		if source.Bundle || template.relationDigest != ([32]byte{}) {
-			manifestDigest, digestErr := sqldriver.ReplicatedRelationManifestDigest(state.Identity)
-			if digestErr != nil || source.Bundle && manifestDigest != source.RelationManifestDigest || template.relationDigest != ([32]byte{}) && manifestDigest != template.relationDigest {
-				return RestoreGroupResult{}, true, errors.Join(ErrBootstrap, digestErr)
-			}
+		if receipt.MachineManifest != template.relationDigest || source.Bundle && certificate.Manifest.RelationManifestDigest != template.relationDigest {
+			return RestoreGroupResult{}, true, ErrBootstrap
 		}
 	}
 	return RestoreGroupResult{Witness: seal.Witness}, true, nil

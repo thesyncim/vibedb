@@ -101,6 +101,7 @@ func (installer GroupInstaller) Install(
 	var commonBinding sqldriver.ReplicatedShardStoreBinding
 	var commonOptions sqldriver.ReplicatedApplyOptions
 	var commonBootstrap *pb.Snapshot
+	var expectedImage [32]byte
 	for replica := uint8(0); replica < 3; replica++ {
 		if cause := context.Cause(ctx); cause != nil {
 			return clusterrestore.RootWitness{}, cause
@@ -149,10 +150,30 @@ func (installer GroupInstaller) Install(
 			return clusterrestore.RootWitness{}, err
 		}
 		if replica == 0 {
+			if root.Projection != nil {
+				expectedImage, err = replicatedstate.ProjectionImageDigest(root.Identity.UserTable, activation.ApplyIdentity.ValidationDigest, root.Projection)
+			} else {
+				var artifact *os.File
+				artifact, err = os.Open(artifactPath)
+				if err == nil {
+					var sourceAgain replicatedstate.SnapshotArtifactManifest
+					sourceAgain, expectedImage, err = sqldriver.VerifyReplicatedRestoreImage(root.Identity, activation.ApplyIdentity, artifact)
+					err = errors.Join(err, artifact.Close())
+					if sourceAgain.Digest != manifest.Digest {
+						err = errors.Join(ErrInstaller, err)
+					}
+				}
+			}
+			if err != nil {
+				return clusterrestore.RootWitness{}, err
+			}
 			witness.GenesisProof = certificate.Digest
 			witness.SanitizedImageDigest = certificate.Manifest.ImageDigest
 		} else if witness.GenesisProof != certificate.Digest {
 			return clusterrestore.RootWitness{}, ErrInstaller
+		}
+		if certificate.Manifest.ImageDigest != expectedImage {
+			return clusterrestore.RootWitness{}, fmt.Errorf("%w: source-to-target relation image", ErrInstaller)
 		}
 		witness.ReplicaRoots[replica] = rootDigest
 	}

@@ -42,9 +42,6 @@ func RestoreCatalogProjection(operation clusterrestore.Operation, snapshot *Snap
 		}
 		seen[ordinal] = true
 		f := descriptor.Command
-		if digest := operation.Certificate.Groups[ordinal].RelationManifestDigest; digest != ([32]byte{}) && [32]byte(f.RelationManifestDigest) != digest {
-			return nil, ErrRestoreActivation
-		}
 		if f.ReplicaSetVersion != 1 || f.ActivePolicyGeneration != operation.PolicyGeneration || f.ProtectionEpoch != 1 || f.OwnershipEpoch != 1 || f.RoutingVersion != 1 || f.RouteGeneration != 1 || f.SchemaGeneration != operation.Certificate.Groups[ordinal].SchemaGeneration {
 			return nil, ErrRestoreActivation
 		}

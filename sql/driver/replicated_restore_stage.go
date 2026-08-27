@@ -3,6 +3,7 @@ package driver
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -97,12 +98,6 @@ func (d *Database) openReplicatedRestoreStage(expected ReplicatedShardStoreIdent
 		source.Digest == ([32]byte{}) || source.State.Binding == replicatedStateBindingAt(expected, applyOptions.Placement.Range) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedRestoreStageProof
 	}
-	if expected.RelationCount > 1 {
-		manifestDigest, err := ReplicatedRelationManifestDigest(expected)
-		if err != nil || manifestDigest != source.RelationManifestDigest {
-			return nil, ReplicatedApplyIdentity{}, errors.Join(ErrReplicatedRestoreStageProof, err)
-		}
-	}
 	expected = ownedReplicatedShardStoreIdentity(expected)
 	applyOptions.Placement = ownedReplicatedPlacementProfile(applyOptions.Placement)
 	if d == nil || d.connector == nil {
@@ -126,6 +121,14 @@ func (d *Database) openReplicatedRestoreStage(expected ReplicatedShardStoreIdent
 	}
 	if core.catalog.ReplicatedShardStore == nil || !core.catalog.ReplicatedShardStore.Equal(expected) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedShardStoreIdentityMismatch
+	}
+	if expected.RelationCount > 1 {
+		sourcePlacement := applyOptions.Placement
+		sourcePlacement.Range = source.State.Binding.OwnedRange
+		digest, err := replicatedRestoreManifestAt(core, expected, sourcePlacement, restoreSourceSchemaBinding(expected.Binding, source.State.Binding))
+		if err != nil || digest != source.RelationManifestDigest {
+			return nil, ReplicatedApplyIdentity{}, fmt.Errorf("%w: authenticated source machine relation manifest: %v", ErrReplicatedRestoreStageProof, err)
+		}
 	}
 	if err := core.settleCatalogLocked(); err != nil {
 		return nil, ReplicatedApplyIdentity{}, err

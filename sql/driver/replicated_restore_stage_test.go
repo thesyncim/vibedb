@@ -67,6 +67,23 @@ func TestReplicatedRestoreStageDiscardsAuthorityAndResumesBundle(t *testing.T) {
 
 	target, targetIdentity := openRestoreBundleRoot(t, "restore-target", 77, 2)
 	defer target.Close()
+	logical, err := ReplicatedRelationManifestDigest(targetIdentity)
+	sourceMachine, sourceErr := target.ReplicatedRelationManifestForBinding(targetIdentity, testReplicatedApplyOptions().Placement, sourceIdentity.Binding)
+	if err != nil || sourceErr != nil || logical == sourceManifest.RelationManifestDigest || sourceMachine != sourceManifest.RelationManifestDigest {
+		t.Fatalf("source machine/schema domain mismatch logical=%x machine=%x want=%x err=%v/%v", logical, sourceMachine, sourceManifest.RelationManifestDigest, err, sourceErr)
+	}
+	freshBinding := targetIdentity.Binding
+	freshBinding.Authority.RoutingVersion++
+	freshBinding.Authority.RouteGeneration++
+	freshMachine, freshErr := target.ReplicatedRelationManifestForBinding(targetIdentity, testReplicatedApplyOptions().Placement, freshBinding)
+	if freshErr != nil || freshMachine == sourceMachine {
+		t.Fatalf("fresh routing domain unchanged err=%v", freshErr)
+	}
+	wrongSource := sourceManifest.Clone()
+	wrongSource.RelationManifestDigest[0] ^= 1
+	if rejected, _, rejectErr := target.OpenReplicatedRestoreStage(targetIdentity, wrongSource, nil, testReplicatedApplyOptions()); !errors.Is(rejectErr, ErrReplicatedRestoreStageProof) || rejected != nil {
+		t.Fatalf("accepted wrong authenticated source schema: stage=%v err=%v", rejected, rejectErr)
+	}
 	stage, _, err := target.OpenReplicatedRestoreStage(
 		targetIdentity, sourceManifest, nil, testReplicatedApplyOptions(),
 	)
