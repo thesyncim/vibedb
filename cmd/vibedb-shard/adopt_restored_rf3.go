@@ -260,5 +260,5 @@ func restoredApplyMatchesPrepare(identity driver.ReplicatedApplyIdentity, option
 		bytes.Equal(identity.RequestLedgerRangeStart[:], options.RequestLedgerRangeStart[:]) &&
 		bytes.Equal(identity.RequestLedgerRangeEnd[:], options.RequestLedgerRangeEnd[:]) &&
 		bytes.Equal(identity.RequestLedgerRangeIdentity[:], options.RequestLedgerRangeIdentity[:]) &&
-		identity.Format != 0 && identity.Storage != "" && identity.ValidationDigest != ([32]byte{})
+		identity.Format == driver.ReplicatedApplyFormat && identity.Storage != "" && identity.ValidationDigest != ([32]byte{})
 }

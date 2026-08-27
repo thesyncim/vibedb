@@ -8,7 +8,31 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/kubeoperator"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/sql/driver"
 )
+
+func TestRestoredApplyMatchesCurrentFormatAndExactOptions(t *testing.T) {
+	options := driver.ReplicatedApplyOptions{MaxSessions: 8, RetryWindow: 4}
+	identity := driver.ReplicatedApplyIdentity{Format: driver.ReplicatedApplyFormat,
+		Storage: "prepared", ValidationDigest: [32]byte{1}, MaxSessions: 8, RetryWindow: 4}
+	if !restoredApplyMatchesPrepare(identity, options) {
+		t.Fatal("exact current-format restored apply rejected")
+	}
+	for _, mutate := range []func(*driver.ReplicatedApplyIdentity){
+		func(i *driver.ReplicatedApplyIdentity) { i.Format++ },
+		func(i *driver.ReplicatedApplyIdentity) { i.MaxSessions++ },
+		func(i *driver.ReplicatedApplyIdentity) { i.RetryWindow++ },
+		func(i *driver.ReplicatedApplyIdentity) { i.Storage = "" },
+		func(i *driver.ReplicatedApplyIdentity) { i.ValidationDigest = [32]byte{} },
+		func(i *driver.ReplicatedApplyIdentity) { i.RequestLedgerCapacityBytes++ },
+	} {
+		changed := identity
+		mutate(&changed)
+		if restoredApplyMatchesPrepare(changed, options) {
+			t.Fatal("mismatched restored apply accepted")
+		}
+	}
+}
 
 func TestWriteRestoredRF3ArtifactIsExactAndIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "restore_preparing")
