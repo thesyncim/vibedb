@@ -538,6 +538,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	splitCatalog := hotMutationWaitSplitComplete(
 		t, ctx, catalogAuthority, final.Generation()+1, [32]byte(splitPlan.OperationID()), routes[0],
 	)
+	hotMutationAssertStaleParentRefused(t, profile, servingRoute)
 	for _, descriptor := range splitCatalog.ReplicatedShardDescriptors() {
 		if descriptor.Distribution != routes[0].Distribution || descriptor.Shard == routes[0].Shard {
 			continue
@@ -579,6 +580,51 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	t.Logf("write-driven hot move: atomic_relation_index_visibility=true leader_kill=true response_partition=true reopen=true p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d snapshot_network_growth=%d",
 		p99, maximumOperations, len(record.Payload), client.requests, client.bytes,
 		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, snapshotNetworkGrowth)
+}
+
+func hotMutationAssertStaleParentRefused(
+	t *testing.T, profile *rafttransport.PeerTLS, route gateway.ReplicatedRoute,
+) {
+	t.Helper()
+	client, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
+		TLS: profile, Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
+		MaxConnections: 8, MaxPerEndpoint: 4, MaxIdlePerEndpoint: 2, MaxHandshakes: 2,
+		MaxWaiters: 8, MaxIdleAge: time.Minute, MaxLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	fence := shardservice.ReplicatedFence{
+		Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+		ReplicaSetVersion:      route.Command.ReplicaSetVersion,
+		ActivePolicyGeneration: route.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        route.Command.ProtectionEpoch, OwnershipEpoch: route.Command.OwnershipEpoch,
+		SchemaGeneration:       route.Command.SchemaGeneration,
+		RelationManifestDigest: route.Command.RelationManifestDigest,
+		RoutingVersion:         route.Command.RoutingVersion, RouteGeneration: route.Command.RouteGeneration,
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, endpoint := range route.Replicas {
+			response, requestErr := client.DoReplicated(t.Context(), endpoint, &shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedReadLeader, Capability: serviceauthz.CapabilityDataRead,
+				Fence: fence, Relation: 1, Key: []byte("m-0"), MaxValueBytes: 1 << 20,
+			})
+			if requestErr != nil || response == nil || response.Kind == shardservice.ReplicatedNotLeader {
+				continue
+			}
+			if response.Kind == shardservice.ReplicatedRefusal &&
+				response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				return
+			}
+			t.Fatalf("stale parent served old route: %+v", response)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("stale parent produced no explicit stale-fence refusal")
 }
 
 func hotMutationWaitSplitRevision(
