@@ -104,8 +104,8 @@ jobs:
                 contains("rss_growth=") and
                 contains("storage_growth=") and
                 contains("wal_growth=") and
-                contains("client_network_bytes=") and
-                contains("snapshot_network_bytes=") and
+                contains("public_client_wire_bytes=") and
+                contains("snapshot_payload_bytes=") and
                 contains("ack_gc_complete=true") and
                 contains("pin_journals_retired=true"))) | .Test' \
             "${result}" | wc -l)" -eq 3

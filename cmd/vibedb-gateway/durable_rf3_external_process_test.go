@@ -139,13 +139,11 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	}
 	queryLatency := clientA.assertPoint(t, "orders_a", "seed-a")
 	latencies = append(latencies, queryLatency)
-	if err := syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT); err != nil {
-		t.Fatal(err)
-	}
-	partitionActive = false
-	fixture.waitMemberCaughtUpAllRoles(t, partitioned, 45*time.Second)
-	fixture.waitAllRoleLeaders(t, -1, 30*time.Second)
 
+	// Keep the selected process partitioned through the actual two-group
+	// durable write, terminal publication, lost response, and independent
+	// readback. This exercises the shipped path on two-voter quorums for every
+	// role rather than proving only adjacent read availability.
 	terminalRequest := hotMutationRequest(t, reference, 1, []serveStatement{
 		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-a","value":101}`}}},
 		{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-b","value":202}`}}},
@@ -159,6 +157,12 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	latencies = append(latencies, proofA.assertPoint(t, "orders_a", "terminal-a"))
 	latencies = append(latencies, proofA.assertPoint(t, "orders_b", "terminal-b"))
 	proofA.close()
+	if err := syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	partitionActive = false
+	fixture.waitMemberCaughtUpAllRoles(t, partitioned, 45*time.Second)
+	fixture.waitAllRoleLeaders(t, -1, 30*time.Second)
 	if err := fixture.gatewayA.Kill(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +320,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	rssGrowth := positiveDifference(peakRSS, baselineRSS)
 	if storageGrowth > 128<<20 || walGrowth > 64<<20 || rssGrowth > 384<<20 ||
 		snapshotGrowth != 0 || clientBytes > 2<<20 {
-		t.Fatalf("external durable RF3 bounds rss=%d storage=%d wal=%d client_network=%d snapshot_network=%d",
+		t.Fatalf("external durable RF3 bounds rss=%d storage=%d wal=%d public_client_wire=%d snapshot_payload=%d",
 			rssGrowth, storageGrowth, walGrowth, clientBytes, snapshotGrowth)
 	}
 	for _, journal := range []string{fixture.gatewayAJournal, fixture.gatewayBJournal} {
@@ -324,7 +328,10 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 			t.Fatalf("unbounded gateway journal tree %q", journal)
 		}
 	}
-	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d client_network_bytes=%d snapshot_network_bytes=%d ack_gc_complete=true pin_journals_retired=true",
+	// The public wire counter is exact for every test-owned gateway request and
+	// response. No shipped external Raft byte counter exists, so the gate names
+	// that boundary honestly and separately proves zero snapshot payload growth.
+	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
 		partitionFailover, terminalFailover, ackFailover, p99, rssGrowth, storageGrowth,
 		walGrowth, clientBytes, snapshotGrowth)
 }
