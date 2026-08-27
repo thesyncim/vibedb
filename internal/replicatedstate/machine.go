@@ -1382,7 +1382,7 @@ func scanSessionSystemSnapshot(
 				return ErrExecutionPinStateCorrupt
 			}
 			var pin executionpin.PinID
-			copy(pin[:], key[33:])
+			copy(pin[:], key[executionPinActiveStorageKeyBytes-len(pin):])
 			summary := activeExecutionPins[pin]
 			if summary == nil || summary.activeSeen {
 				return ErrExecutionPinStateCorrupt
