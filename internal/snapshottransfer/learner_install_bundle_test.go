@@ -128,6 +128,35 @@ func learnerBundleOptions(
 	return options
 }
 
+func learnerBundleGlobalKey(t *testing.T, relation sqldriver.ReplicatedShardRelationIdentity) []byte {
+	t.Helper()
+	key, err := distribution.CurrentTupleCodec.AppendTuple(nil, []distribution.Scalar{distribution.NewString("a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := relation.GlobalIndexStorageKeyPoint(key); !ok {
+		t.Fatalf("fixture global key is invalid for retained relation: %x", key)
+	}
+	return key
+}
+
+func TestLearnerBundleGlobalKeyPreflight(t *testing.T) {
+	relation := sqldriver.ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: sqldriver.ReplicatedShardRelationGlobalIndex,
+		IndexID: 41, Incarnation: 7, LocatorCount: 1, Unique: true,
+		KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		BucketBits: distribution.DefaultVirtualBucketBits,
+	}
+	key := learnerBundleGlobalKey(t, relation)
+	if consumed, ok := distribution.CanonicalTuplePrefixLen(key, 1); !ok || consumed != len(key) {
+		t.Fatalf("noncanonical fixture tuple %x", key)
+	}
+	if _, ok := relation.GlobalIndexStorageKeyPoint([]byte{0x91, 0x01, 'a'}); ok {
+		t.Fatal("obsolete handwritten key unexpectedly accepted")
+	}
+}
+
 func TestInstallPublishedLearnerInstallsRelationBundleAndReexportsCertificate(t *testing.T) {
 	id := func(seed byte) (out [16]byte) {
 		for i := range out {
@@ -192,7 +221,7 @@ func TestInstallPublishedLearnerInstallsRelationBundleAndReexportsCertificate(t 
 		t.Fatal(err)
 	}
 	completion, err := replication.OpenCompletion(lookup.Bytes)
-	if err != nil || completion.ClientEpoch == 0 {
+	if err != nil || completion.ClientEpoch == 0 || completion.ResultCode != replicatedstate.ResultSessionOpened {
 		t.Fatalf("session completion=%+v err=%v", completion, err)
 	}
 	document := []byte(`{"email":"a","id":"doc-1"}`)
@@ -200,7 +229,7 @@ func TestInstallPublishedLearnerInstallsRelationBundleAndReexportsCertificate(t 
 	if !ok {
 		t.Fatal("encode base key")
 	}
-	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["doc-1"]`)
+	globalKey, locator := learnerBundleGlobalKey(t, sourceIdentity.Relations[1]), []byte(`["doc-1"]`)
 	command.Kind = replication.CommandMutationBatch
 	command.ClientEpoch, command.ClientSequence = completion.ClientEpoch, 2
 	command.Fingerprint = sha256.Sum256([]byte("learner-bundle-put"))
@@ -221,6 +250,14 @@ func TestInstallPublishedLearnerInstallsRelationBundleAndReexportsCertificate(t 
 		Index: 3, Term: 1, Type: pb.EntryNormal,
 	}, documentCommand); err != nil {
 		t.Fatal(err)
+	}
+	documentLookup, err := apply.LookupCompletion(documentCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentCompletion, err := replication.OpenCompletion(documentLookup.Bytes)
+	if err != nil || documentCompletion.ResultCode != replicatedstate.ResultApplied {
+		t.Fatalf("bundle mutation completion=%+v err=%v", documentCompletion, err)
 	}
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {
