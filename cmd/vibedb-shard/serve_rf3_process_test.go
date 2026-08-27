@@ -211,7 +211,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	}
 	targetStore := [16]byte{0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
 		0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90}
-	const targetIncarnation = uint64(9)
+	// A cold store has no WAL incarnation yet. Its first adoption must mint 1;
+	// later incarnations require an existing durable WAL, not a fixture label.
+	const targetIncarnation = uint64(1)
 	targetListeners := rf3ManifestListeners{
 		Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t),
 		Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t),
@@ -405,7 +407,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			root: root, executable: executable, children: children, target: targetProcess,
 			nodes: nodes, group: group, credentials: credentials, roots: roots,
 			policyPath: policyPath, peerAddresses: peerAddresses, nativeAddresses: nativeAddresses,
-			controlAddresses: controlAddresses, targetNode: targetNode, targetStore: targetStore,
+			controlAddresses: controlAddresses, snapshotAddresses: snapshotAddresses, targetNode: targetNode, targetStore: targetStore,
 			targetIncarnation: targetIncarnation, targetListeners: targetListeners,
 			clientNode: clientNode, gatewayNode: gatewayNode, clientProfile: clientProfile, authority: authority, grantClient: grantClient,
 		})
@@ -519,21 +521,25 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		rf3CommandStoreIdentity(1).AllocationGeneration,
 		authority.ActivePolicyGeneration,
 	)
-	leaderObservation, err := observationClient.Observe(
-		t.Context(), servingNodes[learnerLeader], observationRequest,
-	)
-	if err != nil {
-		t.Fatalf("observe learner progress: %v", err)
+	var leaderObservation, targetObservation replicacontrol.Observation
+	caughtUp := false
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		leaderObservation, err = observationClient.Observe(t.Context(), servingNodes[learnerLeader], observationRequest)
+		if err == nil {
+			targetObservation, err = observationClient.Observe(t.Context(), targetNode, observationRequest)
+		}
+		caughtUp = err == nil && leaderObservation.ProgressFound &&
+			leaderObservation.Progress.Learner && leaderObservation.Progress.RecentActive &&
+			leaderObservation.Progress.PendingSnapshot == 0 &&
+			leaderObservation.Progress.Match >= learnerLeaderState.Commit &&
+			targetObservation.Status.Applied >= learnerLeaderState.Commit &&
+			targetObservation.State.SnapshotBaseDigest != ([sha256.Size]byte{})
+		if caughtUp {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	targetObservation, err := observationClient.Observe(
-		t.Context(), targetNode, observationRequest,
-	)
-	if err != nil || !leaderObservation.ProgressFound ||
-		!leaderObservation.Progress.Learner || !leaderObservation.Progress.RecentActive ||
-		leaderObservation.Progress.PendingSnapshot != 0 ||
-		leaderObservation.Progress.Match < learnerLeaderState.Commit ||
-		targetObservation.Status.Applied < learnerLeaderState.Commit ||
-		targetObservation.State.SnapshotBaseDigest == ([sha256.Size]byte{}) {
+	if !caughtUp {
 		t.Fatalf("learner did not expose a caught-up installed cut: leader=%+v target=%+v err=%v",
 			leaderObservation, targetObservation, err)
 	}
@@ -565,6 +571,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		ToOwnershipEpoch:  binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  binding.RoutingVersion + 1,
 		ToRouteGeneration: binding.RouteGeneration + 1,
+		ToOwnedRange:      binding.OwnedRange,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -631,14 +638,28 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		if err != nil {
 			t.Fatalf("observe target leader before removal: %v", err)
 		}
+		// The target has reopened since its preplanned bootstrap incarnation.
+		// An authenticated fenced probe reports its current identity without
+		// granting data service to this still-RF4 member.
+		identityProbe := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
+			&shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
+				Capability: serviceauthz.CapabilityTopology,
+				Fence:      shardservice.ReplicatedFence{Group: group, AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration},
+			})
+		if identityProbe.Kind != shardservice.ReplicatedRefusal ||
+			identityProbe.Refusal != shardservice.ReplicatedRefusalUnavailable || !identityProbe.HasState ||
+			identityProbe.State.Fence.Group != group || identityProbe.State.Fence.MemberID != target.MemberID ||
+			identityProbe.State.Fence.StoreID != targetStore || identityProbe.State.Fence.NodeIncarnation <= targetIncarnation ||
+			identityProbe.State.Fence.Command != leaderState.Fence.Command ||
+			identityProbe.State.LeaderID != target.MemberID || identityProbe.State.Fence.Term != leaderState.Fence.Term {
+			t.Fatalf("target-leader identity observation: %+v", identityProbe)
+		}
 		response := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedMembership, Authority: authorityIdentity,
 				Capability: serviceauthz.CapabilityMembership,
-				Fence: shardservice.ReplicatedFence{Group: group,
-					AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
-					Command:              leaderState.Fence.Command, MemberID: 4, StoreID: targetStore,
-					NodeIncarnation: targetIncarnation, Term: leaderState.Fence.Term},
+				Fence:      identityProbe.State.Fence,
 				Membership: removeRequest,
 			})
 		if response.Kind != shardservice.ReplicatedMembershipAccepted {
@@ -1264,6 +1285,9 @@ func closeRF3CommandChildren(t testing.TB, children []*rf3CommandChild) {
 	for _, child := range children {
 		if child == nil {
 			continue
+		}
+		if t.Failed() {
+			t.Logf("member %d process diagnostics:\n%s", child.member, child.diagnostic.String())
 		}
 		select {
 		case <-child.exited:

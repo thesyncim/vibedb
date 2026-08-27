@@ -1,10 +1,33 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
 )
+
+func TestReplicaHealthKeysMatchSQLDocumentPrimaryKeys(t *testing.T) {
+	_, _, catalog := newCatalogAuthorityFixture(t)
+	group := catalog.ReplicatedShardDescriptors()[0].Group
+	for suspect := uint64(1); suspect <= 256; suspect++ {
+		record, page := replicatedFailureKeys(group, suspect)
+		id := replicatedFailureDocumentID(group, suspect)
+		if !bytes.Equal(record[:], fixedControlPlaneKey(id[:])) {
+			t.Fatal("health record key is not its canonical SQL primary key")
+		}
+		digest := replicatedFailureDigest(group, suspect)
+		index := digest[0] & (replicatedFailurePageCount - 1)
+		encoded, err := appendReplicatedFailurePage(nil, index, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pageID, _, ok := openFixedControlPlaneDocument(encoded, 15)
+		if !ok || !bytes.Equal(page[:], fixedControlPlaneKey(pageID)) {
+			t.Fatal("health page key is not its canonical SQL primary key")
+		}
+	}
+}
 
 func TestReplicatedFailureAuthorityRequiresQuorumWindowAndSurvivesRestart(t *testing.T) {
 	authority, _, catalog := newCatalogAuthorityFixture(t)
@@ -129,7 +152,7 @@ func TestReplicatedFailureAuthorityTermChangeRestartsWindowAndExactGC(t *testing
 	if err != nil || !page.Found {
 		t.Fatalf("page absent err=%v", err)
 	}
-	identities, err := openReplicatedFailurePage(pageKey[1], page.Value)
+	identities, err := openReplicatedFailurePage(pageKey.bucket(), page.Value)
 	if err != nil || len(identities) != 0 {
 		t.Fatalf("page identities=%d err=%v", len(identities), err)
 	}

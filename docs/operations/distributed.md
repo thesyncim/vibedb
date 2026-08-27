@@ -166,6 +166,12 @@ operation journal. Without the control manifest, startup fails closed instead
 of inventing topology authority. Scheduling is per physical RF3 allocation;
 tenants are neither pinned to nor used as the unit of shard ownership.
 
+Static capacity files use `node_capacity` as the homogeneous default. A node
+may supply an optional `capacity` vector for its explicitly provisioned
+resource ceilings. All entries must be positive. These are capacity limits,
+not invented utilization; the collector adds actual window demand. Moving a
+single allocation between equally sized idle nodes provides no load relief.
+
 ## Online range-split status
 
 The repository has durable split intent and runtime records, source capture,

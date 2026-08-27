@@ -82,7 +82,13 @@ func (client *Client) Observe(
 	if err != nil {
 		return Observation{}, err
 	}
-	if observation.Request != request {
+	expected := request
+	if expected.ExpectedReplicaSetVersion == 0 {
+		// The canonical response derives this value from its authenticated
+		// state. Only this read-only discovery field may differ from the request.
+		expected.ExpectedReplicaSetVersion = observation.Publication.ReplicaSetVersion
+	}
+	if observation.Request != expected {
 		return Observation{}, errors.Join(ErrStale, ErrControl)
 	}
 	return observation, nil

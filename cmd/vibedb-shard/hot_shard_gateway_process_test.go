@@ -76,6 +76,7 @@ type gatewayHotShardLiveFixture struct {
 	policyPath        string
 	peerAddresses     [rf3CommandMembers]string
 	nativeAddresses   [rf3CommandMembers]string
+	snapshotAddresses [rf3CommandMembers]string
 	controlAddresses  [rf3CommandMembers]string
 	targetNode        rafttransport.NodeID
 	targetStore       [16]byte
@@ -163,7 +164,7 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		"-catalog-client-id", "102132435465768798a9bacbdcedfe0f",
 		"-catalog-retry-home", "1122334455667788", "-catalog-session-lease", "1h",
 		"-controller-interval", "50ms", "-hot-shard-capacity", capacityPath,
-		"-hot-shard-interval", "5s", "-replica-control-manifest", manifestPath,
+		"-hot-shard-interval", "10s", "-replica-control-manifest", manifestPath,
 		"-listen", gatewayAddress, "-tls-certificate", fixture.credentials[5].Certificate,
 		"-tls-key", fixture.credentials[5].Key, "-tls-roots", fixture.roots,
 		"-tls-identity-oid", "1.3.6.1.4.1.32473.1.1",
@@ -207,8 +208,20 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	}
 
 	maximumOperations := 0
+	maximumDemand := uint64(0)
+	var peakPressure []byte
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
+		if record, pressureErr := authority.ReadPressureRecord(t.Context()); pressureErr == nil {
+			if view, viewErr := hotshard.OpenView(record.Payload); viewErr == nil {
+				for _, report := range view.Reports {
+					if demand := report.Demand[autosplit.ResourceRequests]; demand > maximumDemand {
+						maximumDemand = demand
+						peakPressure = append(peakPressure[:0], record.Payload...)
+					}
+				}
+			}
+		}
 		ids, readErr := authority.ReadOperationIDs(t.Context())
 		if readErr == nil {
 			maximumOperations = max(maximumOperations, len(ids))
@@ -219,8 +232,9 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		time.Sleep(25 * time.Millisecond)
 	}
 	if maximumOperations != 1 {
-		t.Fatalf("automatic hot move was not admitted; max operations=%d\n%s",
-			maximumOperations, diagnostic.String())
+		record, pressureErr := authority.ReadPressureRecord(t.Context())
+		t.Fatalf("automatic hot move was not admitted; max operations=%d max requests/window=%d peak=%s pressure=%s err=%v\n%s",
+			maximumOperations, maximumDemand, peakPressure, record.Payload, pressureErr, diagnostic.String())
 	}
 
 	beforeRejected := links[0].rejected.Load()
@@ -487,15 +501,21 @@ func gatewayHotShardSeedClientOptions(profile *rafttransport.PeerTLS) gateway.Au
 func gatewayHotShardLiveCapacity(t testing.TB, root string) string {
 	t.Helper()
 	capacity := autosplit.CapacityVector{}
+	targetCapacity := autosplit.CapacityVector{}
 	for resource := range autosplit.ResourceCount {
 		capacity[resource] = 1_000
+		// Moving the only allocation between equal empty nodes provides no
+		// relief. Provision the cold destination with twice the source capacity:
+		// 950 requests move from 95% source pressure to 47.5% target pressure,
+		// below the unchanged 85% destination ceiling.
+		targetCapacity[resource] = 2_000
 	}
 	config := hotshard.StaticCapacityConfig{Format: hotshard.StaticCapacityFormat,
 		RecorderLanes: 8, WindowCapacity: capacity, NodeCapacity: capacity,
 		MigrationCapacity: 1_000, ShardMigrationBytes: 1, MaxReceives: 1,
 		Nodes: []hotshard.StaticCapacityNode{
 			{Endpoint: "member-1", FailureDomain: 1}, {Endpoint: "member-2", FailureDomain: 2},
-			{Endpoint: "member-3", FailureDomain: 3}, {Endpoint: "target", FailureDomain: 4},
+			{Endpoint: "member-3", FailureDomain: 3}, {Endpoint: "target", FailureDomain: 4, Capacity: &targetCapacity},
 		}}
 	raw, err := hotshard.AppendStaticCapacityConfig(nil, config)
 	if err != nil {
@@ -516,6 +536,9 @@ type gatewayHotShardPersistedManifest struct {
 	ShardEndpoints   []gatewayHotShardPersistedShardEndpoint   `json:"shard_endpoints"`
 	GatewayEndpoints []gatewayHotShardPersistedGatewayEndpoint `json:"gateway_endpoints"`
 	Candidates       []gatewayHotShardPersistedCandidate       `json:"candidates"`
+	// This replacement-only fixture has no split sources, but the strict
+	// canonical manifest still requires the explicit null field.
+	SplitSources []struct{} `json:"split_sources"`
 }
 
 type gatewayHotShardPersistedTLS struct {
@@ -536,8 +559,9 @@ type gatewayHotShardPersistedBounds struct {
 }
 
 type gatewayHotShardPersistedShardEndpoint struct {
-	Node           string `json:"node"`
-	ControlAddress string `json:"control_address"`
+	Node                 string `json:"node"`
+	ControlAddress       string `json:"control_address"`
+	SplitSnapshotAddress string `json:"split_snapshot_address"`
 }
 
 type gatewayHotShardPersistedGatewayEndpoint struct {
@@ -571,9 +595,13 @@ func gatewayHotShardLiveManifest(t testing.TB, fixture gatewayHotShardLiveFixtur
 			Node: fmt.Sprintf("%x", fixture.targetNode), Store: fmt.Sprintf("%x", fixture.targetStore),
 			NodeIncarnation: fixture.targetIncarnation, Endpoint: "target"}}}
 	for index, node := range append(append([]rafttransport.NodeID(nil), fixture.nodes[:]...), fixture.targetNode) {
+		snapshotAddress := fixture.targetListeners.Snapshot
+		if index < len(fixture.snapshotAddresses) {
+			snapshotAddress = fixture.snapshotAddresses[index]
+		}
 		document.ShardEndpoints = append(document.ShardEndpoints,
 			gatewayHotShardPersistedShardEndpoint{Node: fmt.Sprintf("%x", node),
-				ControlAddress: links[index].address()})
+				ControlAddress: links[index].address(), SplitSnapshotAddress: snapshotAddress})
 	}
 	raw, err := vibejson.Marshal(&document)
 	if err != nil {

@@ -284,6 +284,9 @@ func runServe(args []string) (exitCode int) {
 		if *backupRepositoryPath != "" {
 			required |= serviceauthz.CapabilityBackup
 		}
+		if *replicaControlManifestPath != "" {
+			required |= serviceauthz.CapabilityMembership
+		}
 		if policy.Check(internalAuthority.Node, required) != serviceauthz.DecisionAllow {
 			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks required data, schema, delegation, topology, recovery, ledger, or execution-pin authority")
 			return 2
@@ -458,6 +461,18 @@ func runServe(args []string) (exitCode int) {
 	defer stop()
 	controllerMetrics := new(gatewayControllerMetrics)
 	ctx = withGatewayControllerMetrics(ctx, controllerMetrics)
+	// Controller-initiated native operations must carry the gateway service
+	// authority, just as catalog sessions do. Keep it off the public listener
+	// context: authenticated clients must continue to supply their own identity.
+	controllerCtx := ctx
+	if internalAuthority.Valid() {
+		controllerCtx, err = serviceauthz.WithAuthority(ctx, internalAuthority)
+		if err != nil {
+			_ = listener.Close()
+			fmt.Fprintf(os.Stderr, "gateway: establish controller authority: %v\n", err)
+			return 1
+		}
+	}
 	routeHandoffCompleted := false
 	defer func() {
 		if routeHandoffCompleted {
@@ -640,7 +655,7 @@ func runServe(args []string) (exitCode int) {
 			}
 		}
 		replicaControllersDone, err = startGatewayReplicaControllers(
-			ctx, healthRevisions, moveController, healthController,
+			controllerCtx, healthRevisions, moveController, healthController,
 			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, logf,
 		)
 		if err != nil {
@@ -684,7 +699,7 @@ func runServe(args []string) (exitCode int) {
 	}
 	if hotShardRuntime != nil {
 		hotShardDone = runGatewayHotShardPublisher(
-			ctx, hotShardRuntime, *hotShardInterval, logf,
+			controllerCtx, hotShardRuntime, *hotShardInterval, logf,
 		)
 	}
 	if splitRuntime != nil {
@@ -694,7 +709,7 @@ func runServe(args []string) (exitCode int) {
 		go func() {
 			defer close(done)
 			runServingSplitController(
-				ctx, catalogAuthority, splitRuntime.controller, *controllerInterval, logf,
+				controllerCtx, catalogAuthority, splitRuntime.controller, *controllerInterval, logf,
 			)
 		}()
 	}

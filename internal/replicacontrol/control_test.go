@@ -163,6 +163,15 @@ func TestAuthenticatedServiceAndClientReturnExactLeaderAndTargetWitnesses(t *tes
 	if !settled || inFlight {
 		t.Fatalf("transfer witness settled=%t inflight=%t", settled, inFlight)
 	}
+	// The catalog cannot know the next membership apply index before the
+	// ConfChange commits. Read-only discovery must return that authenticated
+	// version; subsequent mutations still use the exact discovered fence.
+	request.ExpectedReplicaSetVersion = 0
+	observed, err = client.Observe(context.Background(), node, request)
+	if err != nil || observed.Publication.ReplicaSetVersion != cut.Publication.ReplicaSetVersion ||
+		observed.Request.ExpectedReplicaSetVersion != cut.Publication.ReplicaSetVersion {
+		t.Fatalf("current membership discovery=%+v err=%v", observed, err)
+	}
 }
 
 func TestServiceRejectsWrongTrafficAndStaleReplicaSetBeforeResponse(t *testing.T) {

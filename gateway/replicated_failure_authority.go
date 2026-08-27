@@ -24,8 +24,6 @@ const (
 	replicatedFailurePageCount               = 64
 	maxReplicatedFailureGroupsPerPage        = 64
 	maxReplicatedFailurePageBytes            = 32 << 10
-	replicatedFailureRecordKeyByte           = byte(7)
-	replicatedFailurePageKeyByte             = byte(8)
 )
 
 var ErrReplicatedFailureAuthority = errors.New("gateway: invalid replicated failure authority")
@@ -216,7 +214,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaHealthRevision(
 	} else if revision.Revision != 1 {
 		return ErrReplicatedCatalogConflict
 	}
-	identities, err := openOptionalReplicatedFailurePage(pageKey[1], page)
+	identities, err := openOptionalReplicatedFailurePage(pageKey.bucket(), page)
 	if err != nil {
 		return err
 	}
@@ -243,7 +241,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaHealthRevision(
 		}
 		return nil
 	}
-	authority.scratch, err = appendReplicatedFailurePage(authority.scratch, pageKey[1], identities)
+	authority.scratch, err = appendReplicatedFailurePage(authority.scratch, pageKey.bucket(), identities)
 	if err != nil {
 		return err
 	}
@@ -355,7 +353,7 @@ func (authority *ReplicatedCatalogAuthority) DeleteReplicaHealthRecord(
 	if err != nil || !page.Found {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	identities, err := openReplicatedFailurePage(pageKey[1], page.Value)
+	identities, err := openReplicatedFailurePage(pageKey.bucket(), page.Value)
 	if err != nil {
 		return err
 	}
@@ -367,7 +365,7 @@ func (authority *ReplicatedCatalogAuthority) DeleteReplicaHealthRecord(
 	copy(identities[position:], identities[position+1:])
 	identities = identities[:len(identities)-1]
 	authority.scratch = authority.scratch[:0]
-	authority.scratch, err = appendReplicatedFailurePage(authority.scratch, pageKey[1], identities)
+	authority.scratch, err = appendReplicatedFailurePage(authority.scratch, pageKey.bucket(), identities)
 	if err != nil {
 		return err
 	}
@@ -560,12 +558,35 @@ func replicatedFailureDigest(group raftmember.GroupKey, suspect uint64) [32]byte
 	return sha256.Sum256(raw[:offset])
 }
 
-func replicatedFailureKeys(group raftmember.GroupKey, suspect uint64) ([33]byte, [2]byte) {
+type replicatedFailureRecordKey [71 + 3]byte
+type replicatedFailurePageKey [15 + 3]byte
+
+func replicatedFailureKeys(group raftmember.GroupKey, suspect uint64) (replicatedFailureRecordKey, replicatedFailurePageKey) {
 	digest := replicatedFailureDigest(group, suspect)
-	var record [33]byte
-	record[0] = replicatedFailureRecordKeyByte
-	copy(record[1:], digest[:])
-	return record, [2]byte{replicatedFailurePageKeyByte, digest[0] & (replicatedFailurePageCount - 1)}
+	id := replicatedFailureDocumentID(group, suspect)
+	pageID := replicatedFailurePageID(digest[0] & (replicatedFailurePageCount - 1))
+	var record replicatedFailureRecordKey
+	var page replicatedFailurePageKey
+	copy(record[:], fixedControlPlaneKey(id[:]))
+	copy(page[:], fixedControlPlaneKey(pageID[:]))
+	return record, page
+}
+
+func (key replicatedFailurePageKey) bucket() byte {
+	// Privately constructed ASCII IDs end in two hex digits and an 'x'.
+	high, highOK := lowerHexNibble(key[len(key)-5])
+	low, lowOK := lowerHexNibble(key[len(key)-4])
+	if !highOK || !lowOK || high<<4|low >= replicatedFailurePageCount {
+		panic("gateway: invalid replica health page key")
+	}
+	return high<<4 | low
+}
+
+func replicatedFailurePageID(index byte) [15]byte {
+	var id [15]byte
+	copy(id[:], []byte("health/page/"))
+	id[12], id[13], id[14] = lowerHex[index>>4], lowerHex[index&15], 'x'
+	return id
 }
 
 func appendReplicatedFailurePage(dst []byte, index byte, identities []persistedFailureIdentity) ([]byte, error) {
@@ -576,7 +597,7 @@ func appendReplicatedFailurePage(dst []byte, index byte, identities []persistedF
 	for ordinal, identity := range identities {
 		group := openPersistedMembershipGrantGroup(identity.Group)
 		_, pageKey := replicatedFailureKeys(group, identity.Suspect)
-		if !validMembershipGrantGroup(group) || identity.Suspect == 0 || pageKey[1] != index ||
+		if !validMembershipGrantGroup(group) || identity.Suspect == 0 || pageKey.bucket() != index ||
 			ordinal > 0 && compareReplicatedFailureIdentity(identities[ordinal-1], identity) >= 0 {
 			return dst, ErrReplicatedFailureAuthority
 		}
@@ -585,9 +606,7 @@ func appendReplicatedFailurePage(dst []byte, index byte, identities []persistedF
 	if err != nil {
 		return dst, err
 	}
-	var id [15]byte
-	copy(id[:], []byte("health/page/"))
-	id[12], id[13], id[14] = lowerHex[index>>4], lowerHex[index&15], 'x'
+	id := replicatedFailurePageID(index)
 	return appendControlPlaneDocument(dst, id[:], raw, maxReplicatedFailurePageBytes)
 }
 
@@ -602,9 +621,7 @@ func openReplicatedFailurePage(index byte, raw []byte) ([]persistedFailureIdenti
 	if index >= replicatedFailurePageCount || len(raw) == 0 || len(raw) > maxReplicatedFailurePageBytes {
 		return nil, ErrReplicatedFailureAuthority
 	}
-	var id [15]byte
-	copy(id[:], []byte("health/page/"))
-	id[12], id[13], id[14] = lowerHex[index>>4], lowerHex[index&15], 'x'
+	id := replicatedFailurePageID(index)
 	payload, err := openTypedControlPlaneDocument(raw, id[:], maxReplicatedFailurePageBytes)
 	if err != nil {
 		return nil, err
@@ -616,7 +633,7 @@ func openReplicatedFailurePage(index byte, raw []byte) ([]persistedFailureIdenti
 	for ordinal, identity := range page.Identities {
 		group := openPersistedMembershipGrantGroup(identity.Group)
 		_, pageKey := replicatedFailureKeys(group, identity.Suspect)
-		if !validMembershipGrantGroup(group) || identity.Suspect == 0 || pageKey[1] != index ||
+		if !validMembershipGrantGroup(group) || identity.Suspect == 0 || pageKey.bucket() != index ||
 			ordinal > 0 && compareReplicatedFailureIdentity(page.Identities[ordinal-1], identity) >= 0 {
 			return nil, ErrReplicatedFailureAuthority
 		}

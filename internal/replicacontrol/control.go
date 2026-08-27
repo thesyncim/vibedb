@@ -49,8 +49,10 @@ var (
 )
 
 // Request binds a read-only observation to one durable controller operation
-// and exact reconciled step. ExpectedReplicaSetVersion rejects replies from a
-// stale local member before they consume controller state.
+// and exact reconciled step. A nonzero ExpectedReplicaSetVersion requires that
+// exact version. Zero performs read-only discovery after a membership change;
+// the response always carries the actual nonzero applied version. Discovery
+// grants no mutation authority and callers must validate their durable cut.
 type Request struct {
 	Operation                 [32]byte
 	Step                      [32]byte
@@ -163,8 +165,12 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	observation := Observation{Request: request, Publication: cut.Publication,
 		Status: cut.Status, Progress: cut.TargetProgress, ProgressFound: cut.ProgressFound,
 		State: cut.State, SnapshotBase: cut.SnapshotBase}
+	if request.ExpectedReplicaSetVersion == 0 {
+		observation.Request.ExpectedReplicaSetVersion = cut.Publication.ReplicaSetVersion
+	}
 	if !validObservation(observation) ||
-		observation.Publication.ReplicaSetVersion != request.ExpectedReplicaSetVersion {
+		(request.ExpectedReplicaSetVersion != 0 &&
+			observation.Publication.ReplicaSetVersion != request.ExpectedReplicaSetVersion) {
 		return ErrStale
 	}
 	if deadline := boundedDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
@@ -383,13 +389,13 @@ func WriteResponse(writer io.Writer, observation Observation) error {
 
 func validRequest(request Request) bool {
 	return request.Operation != ([32]byte{}) && request.Step != ([32]byte{}) &&
-		validGroup(request.Group) && request.TargetMember != 0 &&
-		request.ExpectedReplicaSetVersion != 0
+		validGroup(request.Group) && request.TargetMember != 0
 }
 
 func validObservation(observation Observation) bool {
 	state := observation.State
-	if !validRequest(observation.Request) || state.ConfState == nil || state.Applied == 0 ||
+	if !validRequest(observation.Request) || observation.Request.ExpectedReplicaSetVersion == 0 ||
+		state.ConfState == nil || state.Applied == 0 ||
 		state.ReplicaSetVersion != observation.Request.ExpectedReplicaSetVersion ||
 		observation.Publication.Applied != state.Applied ||
 		observation.Publication.ReplicaSetVersion != state.ReplicaSetVersion ||

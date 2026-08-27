@@ -32,6 +32,10 @@ type StaticCapacityConfig struct {
 type StaticCapacityNode struct {
 	Endpoint      distribution.EndpointID `json:"endpoint"`
 	FailureDomain uint32                  `json:"failure_domain"`
+	// Capacity, when present, is the provisioned ceiling of this node. Omitting
+	// it preserves the homogeneous NodeCapacity default and the format-1 wire
+	// image. It is never inferred from the demand being moved.
+	Capacity *autosplit.CapacityVector `json:"capacity,omitempty"`
 }
 
 func AppendStaticCapacityConfig(dst []byte, config StaticCapacityConfig) ([]byte, error) {
@@ -79,6 +83,13 @@ func validStaticCapacityConfig(config StaticCapacityConfig) bool {
 			index != 0 && config.Nodes[index-1].Endpoint >= node.Endpoint {
 			return false
 		}
+		if node.Capacity != nil {
+			for _, ceiling := range *node.Capacity {
+				if ceiling == 0 {
+					return false
+				}
+			}
+		}
 	}
 	return true
 }
@@ -113,9 +124,13 @@ func (config StaticCapacityConfig) NodeCapacities(generation uint64) []topologys
 	}
 	nodes := make([]topologyscheduler.NodeCapacity, len(config.Nodes))
 	for index := range config.Nodes {
+		capacity := config.NodeCapacity
+		if config.Nodes[index].Capacity != nil {
+			capacity = *config.Nodes[index].Capacity
+		}
 		nodes[index] = topologyscheduler.NodeCapacity{CatalogGeneration: generation,
 			Endpoint: config.Nodes[index].Endpoint, FailureDomain: config.Nodes[index].FailureDomain,
-			Flags: topologyscheduler.NodePlacementReady, Capacity: config.NodeCapacity,
+			Flags: topologyscheduler.NodePlacementReady, Capacity: capacity,
 			MigrationCapacity: config.MigrationCapacity, MaxReceives: config.MaxReceives}
 	}
 	return nodes

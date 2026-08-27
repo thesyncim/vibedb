@@ -106,14 +106,19 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		step = gatewayReplicaObservationStep(operation, catalog.Generation())
 	}
 	observeRequest := replicacontrol.Request{Operation: [32]byte(operation), Step: step,
-		Group: request.Group, TargetMember: request.TargetMember,
-		ExpectedReplicaSetVersion: route.Command.ReplicaSetVersion}
+		Group: request.Group, TargetMember: request.TargetMember}
+	// Membership commits before catalog publication. Requiring the old catalog
+	// version here prevents observing the very ConfChange this controller just
+	// proposed. Discover an authenticated current cut, then reject regressions;
+	// the reconciler still validates the exact roster and journaled transition.
+	minimumReplicaSet := max(route.Command.ReplicaSetVersion, record.Cursor[4])
 	var leader replicacontrol.Observation
 	var leaderFound bool
 	var observeErrors error
 	for _, endpoint := range route.Membership.Serving.Replicas {
 		candidate, observeErr := observer.remote.Observe(ctx, endpoint.Node, observeRequest)
-		if observeErr == nil && candidate.Status.MemberID == candidate.Status.LeaderID &&
+		if observeErr == nil && candidate.Publication.ReplicaSetVersion >= minimumReplicaSet &&
+			candidate.Status.MemberID == endpoint.Member && candidate.Status.MemberID == candidate.Status.LeaderID &&
 			candidate.Status.Term != 0 {
 			leader, leaderFound = candidate, true
 			break

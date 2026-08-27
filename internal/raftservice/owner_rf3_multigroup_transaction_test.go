@@ -1343,10 +1343,19 @@ func TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit(t *testing.T) {
 				return
 			}
 			minorityCtx, minorityCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			_, err := cluster.submit(minorityCtx, 0, candidate, command, multiGroupRF3NoFault)
+			result, err := cluster.submit(minorityCtx, 0, candidate, command, multiGroupRF3NoFault)
 			minorityCancel()
-			if !multiGroupRF3SafeProposalIsolationError(err) {
+			// Cancellation may win before owner ingress. That is a definite
+			// non-admission, not an outcome-unknown proposal. Neither path may
+			// return a completion from the isolated minority.
+			preAdmissionTimeout := errors.Is(err, context.DeadlineExceeded) &&
+				!errors.Is(err, ErrOutcomeUnknown) && result.Outcome == (raftserve.Outcome{}) &&
+				len(result.Completion) == 0
+			if !multiGroupRF3SafeProposalIsolationError(err) && !preAdmissionTimeout {
 				t.Fatalf("minority cut error=%v", err)
+			}
+			if result.Outcome.AppliedIndex != 0 || len(result.Completion) != 0 {
+				t.Fatalf("minority cut returned an applied result: %+v", result.Outcome)
 			}
 		})
 	}

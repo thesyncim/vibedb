@@ -54,3 +54,37 @@ func TestStaticCapacityProviderUsesOnlyLogicalPulse(t *testing.T) {
 		t.Fatalf("set=%+v demand=%+v ok=%v", set, demand, ok)
 	}
 }
+
+func TestStaticCapacityPerNodeCeilings(t *testing.T) {
+	config := testStaticCapacity()
+	legacy, err := AppendStaticCapacityConfig(nil, config)
+	if err != nil || bytes.Contains(legacy, []byte(`"capacity"`)) {
+		t.Fatalf("homogeneous format changed: %s err=%v", legacy, err)
+	}
+	larger := config.NodeCapacity
+	for resource := range larger {
+		larger[resource] *= 2
+	}
+	config.Nodes[1].Capacity = &larger
+	raw, err := AppendStaticCapacityConfig(nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenStaticCapacityConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := opened.NodeCapacities(7)
+	if len(nodes) != 2 || nodes[0].Capacity != config.NodeCapacity || nodes[1].Capacity != larger ||
+		nodes[0].Used != (autosplit.CapacityVector{}) || nodes[1].Used != (autosplit.CapacityVector{}) {
+		t.Fatalf("provisioned ceilings or empty utilization changed: %+v", nodes)
+	}
+	// Returned observations do not alias the provisioning configuration.
+	larger[autosplit.ResourceRequests] = 0
+	if nodes[1].Capacity[autosplit.ResourceRequests] != 2000 {
+		t.Fatal("capacity evidence aliases configuration")
+	}
+	if _, err = AppendStaticCapacityConfig(nil, config); err == nil {
+		t.Fatal("partially unspecified node capacity accepted")
+	}
+}
