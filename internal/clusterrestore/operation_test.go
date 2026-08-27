@@ -60,7 +60,7 @@ func restoreOperationFixture(t *testing.T, groups int) Operation {
 		for replica := range targets[index].Replicas {
 			node := rafttransport.NodeID(filled16(byte(100 + index*3 + replica)))
 			targets[index].Replicas[replica] = ReplicaIdentity{Member: uint64(replica + 1),
-				Node: node, Store: filled16(byte(120 + index*3 + replica))}
+				Node: node, Store: filled16(byte(120 + index*3 + replica)), NodeIncarnation: 1}
 		}
 	}
 	operation, err := NewOperation(permit, certificate, 0, 1, filled32(75), filled32(76), filled32(77), targets)

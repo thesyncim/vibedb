@@ -67,6 +67,46 @@ jobs:
           path: ${{ runner.temp }}/vibedb-kube-rf3-evidence
           if-no-files-found: error
           retention-days: 30
+  restore-activation:
+    name: Fresh RF3 restore activation crash qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Run every external activation publication cut
+        shell: bash
+        env:
+          VIBEDB_RESTORE_ACTIVATION_E2E: "1"
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/restore-activation"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          test_name='TestActivationExternalProcessRecoversEveryPublicationCutWithinBounds'
+          go test -json -count=3 -timeout=3m -run "^${test_name}$" ./internal/clusterrestore \
+            | tee "${evidence}/go-test.jsonl"
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "restore activation qualification skipped" >&2
+            exit 1
+          fi
+          grep -F 'restore_activation_evidence cuts=6' "${evidence}/go-test.jsonl" >/dev/null
+      - name: Upload restore activation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-activation-${{ github.sha }}
+          path: ${{ runner.temp }}/restore-activation
+          if-no-files-found: error
+          retention-days: 30
   test:
     name: test (${{ matrix.runner }})
     strategy:

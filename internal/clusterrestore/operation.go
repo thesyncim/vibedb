@@ -19,16 +19,17 @@ var ErrOperation = errors.New("clusterrestore: invalid activation operation")
 
 const (
 	operationHeaderBytes  = 128 + clusterbackup.RestoreStagingPermitBytes
-	targetGroupBytes      = 72 + 3*(8+16+16)
+	targetGroupBytes      = 72 + 3*(8+16+16+8)
 	operationTrailerBytes = sha256.Size
 )
 
 var operationMagic = [8]byte{'V', 'B', 'R', 'S', 'T', 'A', 'C', 'T'}
 
 type ReplicaIdentity struct {
-	Member uint64
-	Node   rafttransport.NodeID
-	Store  [16]byte
+	Member          uint64
+	Node            rafttransport.NodeID
+	Store           [16]byte
+	NodeIncarnation uint64
 }
 
 // TargetGroup is fresh authority for one source cut. It has no ownership,
@@ -100,7 +101,8 @@ func AppendOperation(dst []byte, operation Operation) ([]byte, error) {
 			binary.BigEndian.PutUint64(raw[offset:offset+8], replica.Member)
 			copy(raw[offset+8:offset+24], replica.Node[:])
 			copy(raw[offset+24:offset+40], replica.Store[:])
-			offset += 40
+			binary.BigEndian.PutUint64(raw[offset+40:offset+48], replica.NodeIncarnation)
+			offset += 48
 		}
 	}
 	digest := sha256.Sum256(raw[:offset])
@@ -141,7 +143,8 @@ func OpenOperation(raw []byte) (Operation, error) {
 			targets[index].Replicas[replica].Member = binary.BigEndian.Uint64(raw[offset : offset+8])
 			copy(targets[index].Replicas[replica].Node[:], raw[offset+8:offset+24])
 			copy(targets[index].Replicas[replica].Store[:], raw[offset+24:offset+40])
-			offset += 40
+			targets[index].Replicas[replica].NodeIncarnation = binary.BigEndian.Uint64(raw[offset+40 : offset+48])
+			offset += 48
 		}
 	}
 	operation := Operation{Permit: permit, Certificate: certificate,
@@ -193,7 +196,7 @@ func validOperation(operation Operation, certificateRaw []byte) bool {
 		}
 		for ordinal, replica := range target.Replicas {
 			if replica.Member != uint64(ordinal+1) || replica.Node == (rafttransport.NodeID{}) ||
-				replica.Store == ([16]byte{}) {
+				replica.Store == ([16]byte{}) || replica.NodeIncarnation != 1 {
 				return false
 			}
 			if _, duplicate := seenNodes[replica.Node]; duplicate {
