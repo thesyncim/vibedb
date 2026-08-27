@@ -11,7 +11,7 @@ evidence ledger.
 VibeDB does not currently expose a globally ordered transaction timestamp or a
 single-time cross-group MVCC snapshot. Within one RF3 group, Raft term, log
 index, and applied index order state. A linearizable read uses Raft
-`ReadIndex` with `ReadOnlySafe`; it does not use a leader lease derived from
+`ReadIndex` with `ReadOnlySafe`. It does not use a leader lease derived from
 wall time. A multi-group exact-key read obtains one such cut per group and
 returns the sorted vector of route and applied-index observations. Replicated
 prepare, decision, apply, and terminal records determine transaction outcome.
@@ -36,7 +36,7 @@ collapsed into one cluster-skew number.
 “Liveness-only” means that changing the clock can change when work retries,
 times out, or elects a leader, but cannot authorize a conflicting replicated
 state transition. It does not mean the behavior is operationally harmless.
-An early deadline can reject useful work; a late deadline can retain memory,
+An early deadline can reject useful work. A late deadline can retain memory,
 locks, pins, or unavailable transactions longer than intended.
 
 ## RF3 read and write safety
@@ -51,7 +51,7 @@ One group has one Raft order. Multiple groups do not. `read_batch` first pins
 one catalog and then obtains a cut from every involved group. It returns no
 partial result and reports an observation vector rather than inventing a
 scalar timestamp. The vector proves the per-group cuts that were actually
-read; it does not provide external consistency or historical reads at a common
+read. It does not provide external consistency or historical reads at a common
 instant.
 
 Transaction IDs, request IDs, catalog generations, route generations,
@@ -89,8 +89,10 @@ Replicated session apply compares exact deadline scalars and never samples a
 replica-local clock. The current gateway constructs those UTC deadline values.
 The durable-request contract binds its fixed logical recovery-pulse count into
 `ClockContractDigest`, preventing a retry from silently changing that bound.
-The public gateway command does not yet construct the durable request service,
-so this internal contract is not command-composition evidence.
+The public gateway constructs this service, and its structured RF3 write path
+uses the same applied-index execution-pin authority. Missing pin or ledger
+authority fails startup instead of selecting a wall-clock or process-local
+fallback.
 
 An applied-index lease is deliberately a progress lease, not a duration. A quiet
 catalog group does not grant takeover merely because real time passed. A
@@ -134,7 +136,7 @@ process composition and assert both safety and bounded degradation:
    or leaked unbounded admission ownership.
 4. Exercise certificates that are valid, not-yet-valid, expired, and near both
    validity boundaries under skew. Prove the exact configured X.509 policy,
-   trust domain, node identity, and traffic class remain fail closed; document
+   trust domain, node identity, and traffic class remain fail closed. Document
    the operator alarm and renewal margin.
 5. Crash and restart at every static and RF3 recovery phase while wall clocks
    disagree and pulse scheduling stalls or bursts. Prove that no schedule can
@@ -167,3 +169,4 @@ are useful evidence, but they do not satisfy these process-level gates.
 - `internal/rafttransport/identity.go`
 - `internal/executionpin/command.go` and `transition.go`
 - `gateway/replicated_request_ledger_contract.go`
+- `cmd/vibedb-gateway/durable_request_runtime.go`

@@ -1,6 +1,6 @@
 # Operate the distributed runtime
 
-The distributed runtime is experimental. It combines a
+The distributed runtime is experimental and unreleased. It combines a
 routing gateway, static shard services, and prepared RF3 shard
 groups. The generated [distributed feature state](../distributed-feature-state.md)
 separates primitives, internal integration, command integration, and test
@@ -8,19 +8,19 @@ evidence.
 
 For a task-oriented setup, start with:
 
-- [Start a three-node replicated shard](distributed-quickstart.md)
+- [Start a local replicated cluster](distributed-quickstart.md)
 - [Operate replica lifecycle](replica-lifecycle.md)
 
 ## Choose a serving path
 
 | Path | Command | Contract |
 | --- | --- | --- |
-| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 is explicitly no-HA and starts no gateway. Replica count 3 starts an RF3 development topology and gateway, including its dedicated request-ledger group. |
+| Local development | `vibedb cluster dev --replicas 1\|3 --root <absolute-path>` | Resumable one-host process orchestration. Replica count 1 starts one no-HA member for each of the catalog, request-ledger, and data roles. Replica count 3 starts three independent RF3 groups and one gateway. |
 | Static shard | `vibedb-shard serve` | One local store and a local ownership fence. No Raft election or copied-store revocation. |
 | RF3 preparation | `vibedb-shard prepare-rf3 -manifest <path>` | Atomic, fail-if-present creation of one member's WAL, SQL root, retained identities, key copy, and serving manifest. |
 | Replicated shard | `vibedb-shard serve-rf3 -manifest <path>` | One prepared Raft member with quorum writes, leader `ReadIndex`, authenticated peer, native, snapshot, and control traffic, and replica-move services. |
 | Cold learner | `vibedb-shard bootstrap-rf3 -manifest <path>` | One enrolled empty target that installs an authorized snapshot before reopening through `serve-rf3`. |
-| Gateway | `vibedb-gateway serve -catalog <path> ...` | Catalog-pinned routing, bounded fanout, leader-aware RF3 requests, distributed exact-key reads and transactions, and optional replica-move execution. |
+| Gateway | `vibedb-gateway serve -catalog <path> ...` | Catalog-pinned routing, bounded fanout, leader-aware RF3 requests, distributed exact-key reads, durable sequenced transactions with client ACK, and optional replica-move execution. |
 
 RF3 means a replication factor of three: one shard has three voters. It is not
 a VibeDB format or API version.
@@ -41,9 +41,10 @@ listener through an untrusted proxy or port forward.
 The gateway identity needs the capabilities consumed by its configured paths:
 `data_read`, `data_write`, `delegate`, `topology`, `transaction_recovery`, and
 `request_ledger`. Replica control additionally requires `membership`. The
-internal durable request service also needs `execution_pin`, but `runServe` does
-not yet construct that service. An application principal should receive only
-the data or schema operations it needs.
+durable request service also needs `execution_pin`. `runServe` constructs that
+service for replicated-catalog mode and fails startup if its catalog,
+request-ledger, execution-pin, or ACK authority is incomplete. An application
+principal should receive only the data or schema operations it needs.
 
 ## Catalog authority
 
@@ -52,10 +53,11 @@ shard manifests, endpoint addresses, replicated shard descriptors, and table
 relation profiles needed to locate the catalog RF3 group. In normal mode the
 gateway reads the authoritative head from that replicated group.
 
-The repository has no catalog administration CLI. Trusted application or
-operator code must build a valid `gateway.Snapshot` and publish it with
-`SaveSnapshot` or `SaveSnapshotAfter`. A catalog file is limited to 16 MiB and
-is replaced through a synced sibling and parent-directory sync.
+The repository has no general catalog-creation CLI. Trusted application or
+operator code must build a valid `gateway.Snapshot`. `SaveSnapshot` or
+`SaveSnapshotAfter` publishes a local seed or successor. A catalog file is
+limited to 16 MiB and is replaced through a synced sibling and parent-directory
+sync.
 
 Use the command validators before startup:
 
@@ -67,13 +69,15 @@ Use the command validators before startup:
 `inspect` reads the file supplied on the command line. It is not a live
 inspection of a newer replicated catalog head.
 
-The repository has exact schema rollout primitives. A shard installer can
+The repository has an experimental exact schema rollout command. A shard installer can
 prepare an immutable relation bundle, persist its authorization, activate it,
 drain the old generation, and recover after restart. Catalog authority can bind
 the exact prepared receipts, activate one target catalog generation, or abort
-before activation. These are internal contracts. `serve-rf3` passes no schema
-handler to its control mux, and no gateway command gathers receipts or drives a
-rollout.
+before activation. `vibedb-gateway schema-rollout` consumes a strict canonical
+plan, contacts authenticated shard schema-control handlers with bounded
+concurrency, and publishes the exact authorized catalog cut. The command needs
+the replicated-catalog flags, `-replica-control-manifest`, and
+`-schema-rollout-plan`. It is not a general SQL DDL endpoint.
 
 ## Gateway startup contract
 
@@ -82,6 +86,7 @@ Authenticated replicated-catalog mode requires all of these flags:
 - `-catalog`
 - `-catalog-relation`
 - `-catalog-session-journal`
+- `-durable-ack-key`
 - `-catalog-client-id`
 - `-catalog-retry-home`
 - `-tls-certificate`, `-tls-key`, `-tls-roots`, and `-tls-identity-oid`
@@ -89,8 +94,16 @@ Authenticated replicated-catalog mode requires all of these flags:
 - one `-shard-peer address=node-id` for every address the catalog can use
 
 The stable catalog client ID is 32 lowercase hexadecimal characters. The retry
-home is 16 lowercase hexadecimal characters. Values must remain stable across
-gateway restarts.
+home is 16 lowercase hexadecimal characters. The durable ACK key file contains
+exactly 64 lowercase hexadecimal characters and must be shared by replacement
+gateways. Values must remain stable across gateway restarts.
+
+Use `-catalog-bootstrap-if-missing` only when the local generation-one seed is
+authorized to initialize an empty catalog RF3 group. The first publication
+atomically stores the head, its witness, and an immutable genesis proof. Later
+starts attest the local seed against that replicated proof even when the current
+catalog head has advanced. A missing head beside an existing genesis proof is
+corruption and fails closed.
 
 `-catalog-attempts` and `-catalog-attempt-timeout` bound leader routing. A
 definite stale serving fence coalesces one authenticated catalog refresh and
@@ -223,36 +236,42 @@ column-list inserts, `INSERT ... SELECT`, conflict clauses, partial-document
 updates, replacement documents that move a primary key, and predicates that
 require row discovery. Those shapes never fall back after RF3 admission.
 
+Before the first write on a client lane, generate and durably retain one
+nonzero 128-bit installation ID. Open epoch 1 and one fixed lane ordinal:
+
 ```vibejson
-{"op":"exec_batch","request_id":"0123456789abcdef0123456789abcdef","class":"interactive","statements":[{"sql":"INSERT INTO orders VALUES (?)","params":[{"kind":"document","text":"{\"id\":\"order-1\"}"}]},{"sql":"DELETE FROM ledger WHERE id = ?","params":[{"kind":"string","text":"ledger-1"}]}]}
+{"op":"issuer_open","installation_id":"11111111111111111111111111111111","issuer_epoch":1,"lane_ordinal":0}
 ```
 
-The nonzero request ID is 32 lowercase hexadecimal characters. Retry the exact
-ordered statements, parameter kinds, and parameter bytes with the same ID.
-Never create a new request ID merely because the response was lost.
+The response echoes the installation, epoch, and lane ordinal and adds one
+64-character lowercase hexadecimal `grant_digest`. Persist that exact grant.
+Then allocate strictly monotonic sequence numbers on the lane and send the
+complete structured identity:
 
-A committed response carries `transaction_id` and `committed:true`. An
-ambiguous failure carries `transaction_id`, `outcome_unknown:true`, and an
-error. A committed cleanup failure carries `committed:true` and an error. The
-gateway recovery path uses the original group identities instead of replanning
-an admitted request against a newer catalog.
+```vibejson
+{"op":"exec_batch","request_id":"0123456789abcdef0123456789abcdef","installation_id":"11111111111111111111111111111111","issuer_epoch":1,"lane_ordinal":0,"grant_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","issuer_sequence":1,"class":"interactive","statements":[{"sql":"INSERT INTO orders VALUES (?)","params":[{"kind":"document","text":"{\"id\":\"order-1\"}"}]},{"sql":"DELETE FROM ledger WHERE id = ?","params":[{"kind":"string","text":"ledger-1"}]}]}
+```
 
-The ordinary request-ID form still retains RF3 request coalescing and terminal
-results in a bounded process-local registry. A gateway restart therefore loses
-that registry. Treat this as a material availability and exact-retry
-limitation.
+The request ID and installation ID are 32 lowercase hexadecimal characters.
+The grant digest is 64 lowercase hexadecimal characters. The first sequence is
+1. A duplicate must carry the same request ID, grant, sequence, ordered
+statements, parameter kinds, and parameter bytes. A gap, rewind, changed
+request body, foreign principal, or forged grant fails closed. There is no
+unsequenced RF3 fallback.
 
-The durable request-ledger implementation is more complete than that legacy
-path. Catalog metadata stores exact ledger-home ranges. Replicated state stores
-streamed plans, pending waves, terminal results, ACK state, issuer lanes, and
-contiguous issuer high-water. A logical execution pin fences the complete
-transaction across gateway replacement. Internal tests drive concurrent
-gateways, recovery, ACK, collection, and high-water restart.
+A committed response carries `transaction_id`, `committed:true`, and the exact
+durable handle. The handle contains `request_id`, `request_digest`, the issuer
+grant reference and sequence, `terminal_revision`, `result_digest`, and an
+opaque 64-character `ack_token`. If the response is lost, reconnect to any
+gateway that shares the catalog, ledger, and ACK authority and retry the exact
+request. The gateway recovers the sealed program and terminal result from RF3
+state instead of replanning it against a newer catalog.
 
-The public command does not yet connect that implementation. The wire decoder
-recognizes issuer-open, structured `exec_batch`, and `exec_batch_ack`, but
-`runServe` passes a nil durable request service. Those operations return
-unavailable. No command-level gateway-replacement test covers the wire path.
+After the application has durably consumed the terminal result, send
+`ack_exec_batch` with every field from that handle. The ACK is authenticated.
+It advances bounded collection and can be retried exactly after a lost response.
+An exact completed ACK retry is write-free. Never ACK a result that the
+application cannot reconstruct.
 
 ## Operation classes
 
@@ -272,7 +291,9 @@ Restart an RF3 member with the exact same manifest and retained artifacts. The
 process reopens its WAL and apply state, then catches up through Raft. An
 isolated former leader must refuse writes and linearizable reads.
 
-For an outcome-unknown write, retry the exact request bytes and request ID.
+For an outcome-unknown write, retry the exact request bytes with the same
+request ID, issuer grant reference, and lane sequence. For a lost ACK response,
+retry the exact ACK handle.
 For a cold learner or replica move, retain every bootstrap, source-export,
 action, and catalog journal. Deleting a journal destroys the operation's resume
 evidence.
@@ -295,13 +316,13 @@ Current operating gaps include:
 - External split-under-load kill, partition, and latency qualification
 - Pressure-to-operation controller command composition
 - One global MVCC snapshot across RF3 groups
-- Durable request-ledger use by the public gateway command
-- Durable request-ledger expiry policy after explicit ACK
-- Schema rollout command composition and public DDL
+- A time-based durable request expiry policy. The shipped lifecycle reclaims
+  only after an authenticated explicit ACK and contiguous issuer collection.
+- General public DDL beyond the experimental exact schema rollout command
 - A public move, live-status, or leader-transfer CLI
 - Live RF3 backup/restore procedures
 - A mixed-build rolling disk- and wire-format upgrade or migration policy.
-  Only the exact same-build pre-release restart boundary is qualified; see
+  Only the exact same-build pre-release restart boundary is qualified. See
   [Unreleased compatibility and rolling restarts](unreleased-compatibility.md).
 - A released or production-supported distributed contract
 - A complete production qualification matrix
@@ -316,8 +337,12 @@ admission fail closed. A distributed read never returns partial documents.
 - `cmd/vibedb-shard/serve_rf3.go`, `bootstrap_rf3.go`, and `rf3_manifest.go`
 - `gateway/replicated_data_read.go`, `replicated_sql_read.go`,
   `replicated_sql_transaction.go`, `replicated_transaction.go`,
-  `replicated_request_service.go`, `replicated_request_ledger_catalog.go`, and
+  `replicated_request_service.go`, `durable_sql_request_executor.go`,
+  `replicated_request_ledger_catalog.go`, and
   `replicated_request_issuer_collector.go`
+- `cmd/vibedb-gateway/durable_request_runtime.go`,
+  `durable_exec_batch_wire.go`, `issuer_open_wire.go`, and
+  `exec_batch_ack_wire.go`
 - `gateway/schema_rollout.go` and `internal/schemainstall`
 - `internal/hotshard`
 - `internal/splitcontroller/local_observation_provider.go` and

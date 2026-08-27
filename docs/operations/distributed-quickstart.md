@@ -1,9 +1,13 @@
 # Start a local three-node replicated cluster
 
-The shortest path prepares and starts one three-voter Raft group and one
-gateway on a single host. Use it for development and fault testing. The manual
-path later in this guide exposes the retained identities and manifests that an
-operator must own.
+> The distributed runtime is experimental and unreleased. Its command and
+> retained-state contracts can change before the first release.
+
+The shortest path prepares and starts three independent three-voter Raft
+groups and one gateway on a single host. The groups own the replicated catalog,
+the durable request ledger, and public data. Use this path for development and
+fault testing. The manual path later in this guide exposes the retained
+identities and manifests that an operator must own.
 
 VibeDB calls this topology **RF3**: one shard has three voting replicas. A
 write is acknowledged after Raft commits it to a quorum and the replicated
@@ -28,22 +32,32 @@ Choose an empty absolute directory and start the cluster:
 ```
 
 The command generates a local CA and node certificates, a canonical
-authorization policy, a WAL key, three prepared member roots, a bootstrap
-catalog, and a durable gateway session journal. It reserves loopback ports,
-starts all three members, waits for them, starts the gateway, and prints the
-client endpoint only after every child reports ready. `SIGINT` or `SIGTERM`
-drains and reaps the child processes.
+authorization policy, a WAL key, a durable ACK key, nine prepared member roots,
+a generation-one catalog seed, and durable gateway journals. It reserves
+loopback ports and starts three members for each role. It waits for all nine
+members before it starts the gateway. The gateway publishes the catalog seed
+only when catalog RF3 is empty. The same replicated mutation publishes the
+generation-one head, head witness, and immutable genesis proof. The command
+prints the client endpoint only after every child reports ready.
+`SIGINT` or `SIGTERM` drains and reaps the child processes.
 
 Run the same command with the same root to reopen the retained cluster. It
 validates the canonical `cluster.vibejson` and completes a previously
 interrupted preparation without replacing existing member roots or identities.
-The generated credentials and `local-development-only` key reference are for
-one-host tests, not an operator credential lifecycle.
+It exact-opens all nine retained SQL/apply profiles and compares their portable
+schema witnesses with the catalog seed. It also attests that the local
+generation-one seed matches the immutable replicated genesis proof. This
+attestation remains valid after the mutable catalog head advances. After
+catalog genesis completes, a missing replicated catalog head fails closed
+instead of silently republishing the seed. The generated credentials and
+`local-development-only` key reference are for one-host tests, not an operator
+credential lifecycle.
 
 For a lighter local smoke test, `--replicas 1` prepares and serves one genuine
-Raft member and prints its authenticated native endpoint. This mode is
-explicitly development-only and has no high availability, quorum-failure, or
-follower-catch-up coverage; it does not start the distributed gateway.
+Raft member for each of the same three roles and prints the data member's
+authenticated native endpoint. This mode is explicitly development-only and
+has no high availability, quorum-failure, or follower-catch-up coverage. It
+does not start the distributed gateway.
 `--nodes 1|3` remains a deprecated unambiguous alias. A retained root is bound
 to its original replica count and cannot be silently reopened with another
 topology. To run processes separately, use the manual path below.
@@ -55,20 +69,24 @@ topology. To run processes separately, use the manual path below.
 You need:
 
 - Go 1.26 or a compatible newer toolchain.
-- Five distinct 128-bit identities for the data example: three shard nodes,
-  one gateway, and one application client. Prepare a sixth data identity for
-  the optional learner in the replica-lifecycle guide. The separately serving
-  catalog group needs three additional node identities.
+- Five distinct 128-bit identities: three voter nodes, one gateway, and one
+  application client. The same three voter node identities can host catalog,
+  request-ledger, and data groups, but every role needs distinct group, shard,
+  store, retained-path, and listener authority. Prepare a sixth node identity
+  for the optional learner in the replica-lifecycle guide.
 - One CA, and one TLS certificate and private key for each identity.
 - A critical binary certificate extension at an operator-owned OID. The
   extension contains the exact VibeDB trust domain and node identity.
 - One canonical `vibejson` authorization policy shared by all processes.
 - One regular file that contains exactly 32 raw bytes of WAL key material.
-- Four empty TCP ports per shard member for peer, native, snapshot, and control
-  traffic.
-- A separately prepared and serving RF3 catalog group.
+- Four empty TCP ports per role member for peer, native, snapshot, and control
+  traffic. Three separately served RF3 roles need 36 ports.
+- Separately prepared and serving RF3 catalog, request-ledger, and data groups.
 - One catalog bootstrap file that points to that catalog group and contains the
-  data-shard descriptors used by the gateway.
+  catalog, request-ledger, and data descriptors, one full ledger-home range,
+  and the public data table profile used by the gateway.
+- One regular file that contains exactly 32 raw bytes for the durable ACK
+  derivation key.
 
 The repository does not provide a certificate-generation or catalog
 administration command. Test credential fixtures are not an operator API. The
@@ -78,20 +96,23 @@ exactly.
 The singleton manifest emitted by `prepare-rf3` opens one group. `serve-rf3`
 also accepts a strict common envelope with `groups` containing 1 through 64
 retained group bundles. Those groups share the process TLS identity, policy,
-listeners, bounded execution lanes, and one authenticated transport per peer;
-each group retains distinct WAL, SQL, apply, membership, and Raft identities.
+listeners, bounded execution lanes, and one authenticated transport per peer.
+Each group retains distinct WAL, SQL, apply, membership, and Raft identities.
 Duplicate retained paths, inconsistent node addresses, and duplicate group
 identities fail before any listener opens. A multi-group process cannot carry
 an enrolled replacement target yet because snapshot listeners and source
 control are still process-scoped rather than group-scoped.
 
-A manually configured gateway-backed data test needs this data group plus a
-separately serving catalog group. The catalog replicas may be colocated with
-data replicas through a multi-group manifest or run as three separate
-`serve-rf3` processes. Repeat the preparation procedure with distinct group,
-shard, store, and retained-path identities for that group. Trusted code must
-then publish its initial catalog document. This guide does not invent a catalog
-creation command that the repository does not provide.
+A manually configured gateway-backed test needs catalog, request-ledger, and
+data groups. Role replicas can share one multi-group process or run as nine
+separate `serve-rf3` processes. Repeat the preparation procedure with distinct
+group, shard, store, listener, and retained-path identities for each role. The
+request-ledger group alone carries the ledger capacity and home-range fields.
+The catalog exposes only the data table profile. Trusted code must build the
+exact generation-one catalog seed. `-catalog-bootstrap-if-missing` authorizes
+publication only when catalog RF3 has no head or immutable genesis proof. The
+gateway then attests the exact seed against the replicated proof on every
+restart.
 
 ### 1. Build the commands
 
@@ -131,7 +152,7 @@ OID with an identity OID under an IANA Private Enterprise Number that you own.
 All file paths must be absolute and clean.
 
 ```vibejson
-{"root":"/srv/vibedb/member-1","distribution":"data","shard":"all","cluster_id":"a1000000000000000000000000000000","cluster_incarnation":"a2000000000000000000000000000000","topology_recovery_epoch":1,"allocation_generation":1,"shard_incarnation":"a3000000000000000000000000000000","group_id":"a4000000000000000000000000000000","member_id":1,"store_id":"b1000000000000000000000000000000","table":"docs","create_table":"CREATE TABLE docs (PRIMARY KEY (id))","authority":{"active_policy_generation":1,"protection_epoch":1,"ownership_epoch":1,"schema_generation":1,"routing_version":1,"route_generation":1},"wal":{"key_id":"cluster-wal-key","key_material_path":"/run/secrets/vibedb/wal-key-source","wrapped_key":"operator-key-reference","max_file_bytes":268435456,"max_record_bytes":83886080,"max_records":4096,"max_entries":16384,"max_live_bytes":134217728},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"shard_key":"id"},"listeners":{"peer":"127.0.0.1:7411","native":"127.0.0.1:7511","snapshot":"127.0.0.1:7611","control":"127.0.0.1:7711"},"tls":{"certificate":"/run/secrets/vibedb/member-1-cert.pem","key":"/run/secrets/vibedb/member-1-key.pem","roots":"/run/secrets/vibedb/cluster-roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":"/srv/vibedb/authorization-policy.vibejson","members":[{"member_id":1,"node_id":"11000000000000000000000000000000","peer_address":"127.0.0.1:7411"},{"member_id":2,"node_id":"12000000000000000000000000000000","peer_address":"127.0.0.1:7412"},{"member_id":3,"node_id":"13000000000000000000000000000000","peer_address":"127.0.0.1:7413"}]}
+{"root":"/srv/vibedb/member-1","distribution":"data","shard":"all","cluster_id":"a1000000000000000000000000000000","cluster_incarnation":"a2000000000000000000000000000000","topology_recovery_epoch":1,"allocation_generation":1,"shard_incarnation":"a3000000000000000000000000000000","group_id":"a4000000000000000000000000000000","member_id":1,"store_id":"b1000000000000000000000000000000","table":"docs","create_table":"CREATE TABLE docs (PRIMARY KEY (id))","authority":{"active_policy_generation":1,"protection_epoch":1,"ownership_epoch":1,"schema_generation":1,"routing_version":1,"route_generation":1},"wal":{"key_id":"cluster-wal-key","key_material_path":"/run/secrets/vibedb/wal-key-source","wrapped_key":"operator-key-reference","max_file_bytes":268435456,"max_record_bytes":83886080,"max_records":4096,"max_entries":16384,"max_live_bytes":134217728},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"shard_key":"/id"},"listeners":{"peer":"127.0.0.1:7411","native":"127.0.0.1:7511","snapshot":"127.0.0.1:7611","control":"127.0.0.1:7711"},"tls":{"certificate":"/run/secrets/vibedb/member-1-cert.pem","key":"/run/secrets/vibedb/member-1-key.pem","roots":"/run/secrets/vibedb/cluster-roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":"/srv/vibedb/authorization-policy.vibejson","split_control":{"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"11000000000000000000000000000000","actions":65535},{"node_id":"12000000000000000000000000000000","actions":65535},{"node_id":"13000000000000000000000000000000","actions":65535}],"max_child_operations":8,"stage_checkpoint_bytes":33554432},"members":[{"member_id":1,"node_id":"11000000000000000000000000000000","peer_address":"127.0.0.1:7411"},{"member_id":2,"node_id":"12000000000000000000000000000000","peer_address":"127.0.0.1:7412"},{"member_id":3,"node_id":"13000000000000000000000000000000","peer_address":"127.0.0.1:7413"}]}
 ```
 
 Create member-2 and member-3 inputs with the same cluster, shard, authority,
@@ -167,7 +188,7 @@ Protect both the source and retained copies.
 The WAL bounds become authenticated reopen parameters. They are not live
 tuning knobs after preparation.
 
-### 4. Start the three members
+### 4. Start the three members for each role
 
 Open one terminal for each process:
 
@@ -185,7 +206,9 @@ Open one terminal for each process:
 
 Each process validates all retained identities before it listens. A ready
 member logs its member ID, replica-set version, and peer, native, snapshot, and
-control listener addresses. No RF3 plaintext mode exists.
+control listener addresses. Start the three catalog manifests and the three
+request-ledger manifests in the same way. Do not start the gateway until all
+nine members report ready. No RF3 plaintext mode exists.
 
 ### 5. Validate and inspect the catalog bootstrap
 
@@ -209,10 +232,12 @@ List every native or SQL shard address the catalog can resolve. Each
 ```bash
 ./bin/vibedb-gateway serve \
   -catalog ./cluster.vibejson \
+  -catalog-bootstrap-if-missing \
   -catalog-relation 1 \
   -catalog-session-journal ./state/gateway-catalog-session \
   -catalog-client-id 21000000000000000000000000000000 \
   -catalog-retry-home 2200000000000000 \
+  -durable-ack-key ./secrets/durable-ack-key.hex \
   -listen 127.0.0.1:7400 \
   -tls-certificate ./secrets/gateway-cert.pem \
   -tls-key ./secrets/gateway-key.pem \
@@ -225,12 +250,14 @@ List every native or SQL shard address the catalog can resolve. Each
 ```
 
 The bootstrap must resolve the separately serving catalog group. The
-authoritative catalog document must describe the `docs` group prepared above.
-The certificate extension, catalog, preparation manifests, and `-shard-peer`
-mappings must agree exactly. Add the catalog-group native endpoints to
-`-shard-peer` as well. They are omitted from this example because their
-operator-assigned addresses and identities are not derivable from the data
-group.
+authoritative catalog document must describe the request-ledger and `docs`
+groups prepared above. The certificate extension, catalog, preparation
+manifests, and `-shard-peer` mappings must agree exactly. Add the catalog and
+request-ledger native endpoints to `-shard-peer` as well. They are omitted from
+this example because their operator-assigned addresses and identities are not
+derivable from the data group. The durable ACK key file contains exactly 64
+lowercase hexadecimal characters. Every replacement gateway must use the same
+key.
 
 ### 7. Check a linearizable read
 
