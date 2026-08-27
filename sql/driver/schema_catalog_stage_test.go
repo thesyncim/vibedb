@@ -9,12 +9,19 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 )
 
 func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T) {
 	path, database, identity := bindReplicatedApplyTestRoot(t, "schema-target-proof")
+	testReplicatedSchemaTargetRollover(t, path, database, identity)
+}
+
+func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Database, identity ReplicatedShardStoreIdentity) {
+	t.Helper()
 	claim, applyIdentity, err := database.OpenReplicatedApply(
 		identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 	)
@@ -23,6 +30,29 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	}
 	if _, err = claim.InstallSnapshot(testReplicatedApplyBootstrap()); err != nil {
 		t.Fatal(err)
+	}
+	var seeded []replication.RelationMutationBatch
+	if identity.RelationCount > 1 {
+		epoch := applyReplicatedApplySessionOpen(t, claim, identity, 2)
+		document := []byte(`{"id":"schema-doc","email":"a"}`)
+		seeded = []replication.RelationMutationBatch{
+			{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut,
+				Key: testReplicatedApplyKey(t, database, document), Value: document}}},
+			{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual,
+				Key: testReplicatedGlobalIndexKey(t, identity.Relations[1], "a"), Value: []byte(`["schema-doc"]`)}}},
+		}
+		command := testReplicatedApplyCommandValue(identity, epoch, 2, nil)
+		command.Batches = seeded
+		encoded, err := replication.AppendCommand(nil, command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), encoded); err != nil {
+			t.Fatal(err)
+		}
+		if result := completionResultCode(t, claim, encoded); result != replicatedstate.ResultApplied {
+			t.Fatalf("source seed failed: %d", result)
+		}
 	}
 	targetDirectory, err := claim.ReplicatedSchemaTargetDirectory()
 	if err != nil {
@@ -43,37 +73,51 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	target := catalogFile(decoded)
 	target.ReplicatedShardStore.Binding.Authority.SchemaGeneration++
 	target.ReplicatedShardStore.RelationSchemaGeneration++
-	storage, err := core.newStorageIdentityLocked()
-	if err != nil {
-		core.mu.Unlock()
-		t.Fatal(err)
+	candidates := make([]*table, len(target.ReplicatedShardStore.Relations))
+	for i := range target.ReplicatedShardStore.Relations {
+		relation := &target.ReplicatedShardStore.Relations[i]
+		storage, err := core.newStorageIdentityLocked()
+		if err != nil {
+			core.mu.Unlock()
+			t.Fatal(err)
+		}
+		relation.Storage = storage
+		target.Tables[relation.Table].Storage = storage
+		candidates[i] = &table{meta: target.Tables[relation.Table]}
 	}
+	storage := target.ReplicatedShardStore.Relations[0].Storage
 	target.ReplicatedShardStore.UserStorage = storage
-	target.ReplicatedShardStore.Relations[0].Storage = storage
-	target.Tables[target.ReplicatedShardStore.UserTable].Storage = storage
 	target.ReplicatedShardStore.RelationManifestDigest =
 		replicatedRelationManifestDigest(*target.ReplicatedShardStore)
 	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(
 		*target.ReplicatedShardStore, target.ReplicatedApply.Placement,
 	)
-	candidate := &table{meta: target.Tables[target.ReplicatedShardStore.UserTable]}
 	core.mu.Unlock()
-	// Backfill images are built outside the fixed serving namespace. This
-	// source is empty, so its exact replacement is an independently closed root.
-	candidate.file, err = os.OpenFile(filepath.Join(targetDirectory, storage+".vjc"), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	candidate.collection, err = durable.Create(candidate.file, durableOptions(candidate))
-	if err != nil {
-		_ = candidate.file.Close()
-		t.Fatal(err)
-	}
-	if err = candidate.collection.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err = candidate.file.Close(); err != nil {
-		t.Fatal(err)
+	// Build exact replacement images in the non-serving target namespace.
+	for ordinal, candidate := range candidates {
+		candidate.file, err = os.OpenFile(filepath.Join(targetDirectory, candidate.meta.Storage+".vjc"), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate.collection, err = durable.Create(candidate.file, durableOptions(candidate))
+		if err != nil {
+			_ = candidate.file.Close()
+			t.Fatal(err)
+		}
+		if ordinal < len(seeded) {
+			if err := candidate.collection.Update(func(batch *durable.WriteBatch) error {
+				mutation := seeded[ordinal].Mutations[0]
+				return batch.Put(mutation.Key, mutation.Value)
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err = candidate.collection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err = candidate.file.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	targetRaw, err := appendCatalogJSON(nil, target)
 	if err != nil {
@@ -84,11 +128,17 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		t.Fatal(err)
 	}
 	if proof.Catalog.SchemaGeneration != identity.RelationSchemaGeneration+1 ||
-		proof.Relations.RelationCount != 1 ||
+		proof.Relations.RelationCount != identity.RelationCount ||
 		proof.Relations.ManifestDigest != proof.Catalog.RelationManifestDigest ||
 		proof.Relations.Witness == ([32]byte{}) || proof.ApplyContract == ([32]byte{}) ||
 		proof.Witness == ([32]byte{}) {
 		t.Fatalf("target proof = %+v", proof)
+	}
+	if identity.RelationCount > 1 && proof.Relations.PlacementDigest == ([32]byte{}) {
+		t.Fatal("global-index target lacks certified placement")
+	}
+	if proof.Relations.TotalRows != uint64(len(seeded)) {
+		t.Fatalf("target row count=%d want=%d", proof.Relations.TotalRows, len(seeded))
 	}
 	prepared, err := claim.PrepareReplicatedSchemaTarget(
 		targetRaw, claim.Applied(), [32]byte{0xa5},
@@ -271,7 +321,9 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	t.Cleanup(func() { replicatedSchemaNamespaceFaultHook = nil })
 	var activated *Database
 	interruptions := 0
-	for attempt := 0; attempt < 9; attempt++ {
+	// Two files per relation, old and new namespaces, link then unlink.
+	expectedInterruptions := 8 * int(identity.RelationCount)
+	for attempt := 0; attempt <= expectedInterruptions; attempt++ {
 		replicatedSchemaNamespaceFaultHook = func(stage string) error {
 			if stage == "linked" || stage == "unlinked" {
 				return injected
@@ -291,7 +343,7 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		interruptions++
 	}
 	replicatedSchemaNamespaceFaultHook = nil
-	if activated == nil || err != nil || interruptions != 8 {
+	if activated == nil || err != nil || interruptions != expectedInterruptions {
 		t.Fatalf("target resume interruptions=%d database=%v err=%v", interruptions, activated, err)
 	}
 	activatedClaim, gotApplyIdentity, err := activated.OpenReplicatedApply(
@@ -300,6 +352,56 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	placement, placementErr := activatedClaim.machine.RelationPlacementDigest()
+	if placementErr != nil || placement != prepared.Relations.PlacementDigest {
+		t.Fatalf("activated placement=%x target=%x err=%v", placement, prepared.Relations.PlacementDigest, placementErr)
+	}
+	verifyRows := func() {
+		t.Helper()
+		for _, batch := range seeded {
+			mutation := batch.Mutations[0]
+			row, readErr := activatedClaim.PointReadInto(batch.Relation, mutation.Key, activatedClaim.Applied(), identity.UserLimits.MaxDocumentBytes, nil)
+			if readErr != nil || !bytes.Equal(row.Value, mutation.Value) {
+				t.Fatalf("relation %d lost row after rollover: %+v err=%v", batch.Relation, row, readErr)
+			}
+		}
+		if len(seeded) == 0 {
+			return
+		}
+		activeCore := activated.connector.db
+		activeCore.mu.RLock()
+		collection := activeCore.tables[targetIdentity.UserTable].collection
+		activeCore.mu.RUnlock()
+		snapshot, err := collection.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := snapshot.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		var entries [1]vibejson.IndexEntry
+		needle, err := vibejson.BuildIndex([]byte(`"a"`), entries[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		masks, err := snapshot.AppendIndexMasks(nil, "by_email", needle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := 0
+		if err := snapshot.RangeMasksRaw(masks, func(key, value []byte) error {
+			rows++
+			if !bytes.Equal(key, seeded[0].Mutations[0].Key) || !bytes.Equal(value, seeded[0].Mutations[0].Value) {
+				t.Fatalf("local exact index returned foreign row: %x %s", key, value)
+			}
+			return nil
+		}); err != nil || rows != 1 {
+			t.Fatalf("local exact index rows=%d err=%v", rows, err)
+		}
+	}
+	verifyRows()
 	if gotApplyIdentity != targetApplyIdentity ||
 		activatedClaim.Applied() != prepared.SourceApplied+1 {
 		t.Fatalf("target activation identity=%+v applied=%d err=%v",
@@ -322,6 +424,7 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil || activatedClaim.Applied() != prepared.SourceApplied+2 {
 		t.Fatalf("reopened target after later normal apply: claim=%v err=%v", activatedClaim, err)
 	}
+	verifyRows()
 	if err = activatedClaim.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -334,10 +437,12 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if drained, err := DrainPublishedReplicatedSchemaSource(path, command); err != nil || !drained {
 		t.Fatalf("source drain=%t err=%v", drained, err)
 	}
-	if _, err = os.Stat(filepath.Join(path+".tables", replicatedSchemaSourcesDirectory, identity.Relations[0].Storage+".vjc")); !os.IsNotExist(err) {
-		t.Fatalf("source relation survived drain: %v", err)
-	}
-	if _, err = os.Stat(path + ".tables/" + storage + ".vjc"); err != nil {
-		t.Fatalf("target relation removed by source drain: %v", err)
+	for ordinal, relation := range identity.Relations {
+		if _, err = os.Stat(filepath.Join(path+".tables", replicatedSchemaSourcesDirectory, relation.Storage+".vjc")); !os.IsNotExist(err) {
+			t.Fatalf("source relation ordinal %d survived drain: %v", ordinal, err)
+		}
+		if _, err = os.Stat(filepath.Join(path+".tables", targetIdentity.Relations[ordinal].Storage+".vjc")); err != nil {
+			t.Fatalf("target relation ordinal %d removed by source drain: %v", ordinal, err)
+		}
 	}
 }
