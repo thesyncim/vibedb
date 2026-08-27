@@ -3,13 +3,11 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -168,14 +166,7 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 		t.Fatal(err)
 	}
 	bootstrapPath := filepath.Join(options.Root, "bootstrap-rf3.json")
-	bootstrapDocument := []byte(fmt.Sprintf(
-		`{"member_manifest":%q,"control_listener":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"max_artifact_bytes":%d}`,
-		memberPath, options.Listeners.Control, options.SourceNode,
-		options.SourceSnapshotAddress, filepath.Join(options.Root, "target-artifacts"),
-		filepath.Join(options.Root, "snapshot-cursor"),
-		filepath.Join(options.Root, "bootstrap-journal"), staticPath,
-		options.MaxArtifactBytes,
-	))
+	bootstrapDocument := rf3ColdTargetBootstrapDocument(options, memberPath, staticPath)
 	if err = os.WriteFile(bootstrapPath, bootstrapDocument, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +179,17 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 		MemberManifestPath: memberPath, BootstrapManifestPath: bootstrapPath,
 		StaticBootstrapPath: staticPath, member: options.Target.MemberID,
 	}
+}
+
+func rf3ColdTargetBootstrapDocument(options rf3ColdTargetOptions, memberPath, staticPath string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"member_manifest":%q,"control_listener":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"max_artifact_bytes":%d}`,
+		memberPath, options.Listeners.Control, options.SourceNode,
+		options.SourceSnapshotAddress, filepath.Join(options.Root, "target-artifacts"),
+		filepath.Join(options.Root, "snapshot-cursor"),
+		filepath.Join(options.Root, "bootstrap-journal"), staticPath,
+		options.MaxArtifactBytes,
+	))
 }
 
 func rf3ColdTargetIdentity(t testing.TB, options rf3ColdTargetOptions) raftstore.Identity {
@@ -306,18 +308,10 @@ func TestBootstrapRF3CommandProcessHelper(t *testing.T) {
 	if os.Getenv(rf3ColdTargetHelperEnvironment) != "1" {
 		return
 	}
-	bootstrap, err := loadBootstrapRF3Manifest(os.Getenv(rf3ColdTargetBootstrapEnvironment))
-	if err != nil {
-		t.Fatal(err)
-	}
-	member, err := loadRF3Manifest(bootstrap.MemberManifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if err = bootstrapPreparedRF3(ctx, bootstrap, member); err != nil {
-		t.Fatal(err)
+	// Use the shipped singleton/multi-group dispatcher, including its exact
+	// manifest loading and signal lifecycle; do not duplicate a singleton path.
+	if code := runBootstrapRF3([]string{"-manifest", os.Getenv(rf3ColdTargetBootstrapEnvironment)}); code != 0 {
+		t.Fatalf("bootstrap-rf3 exited with status %d", code)
 	}
 }
 
