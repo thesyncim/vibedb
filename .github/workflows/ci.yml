@@ -99,6 +99,23 @@ jobs:
             exit 1
           fi
           grep -F 'restore_activation_evidence cuts=6' "${evidence}/go-test.jsonl" >/dev/null
+      - name: Build three authority-free SQL roots per restored group
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/restore-activation"
+          test_name='TestGroupInstallerBuildsAndRecoversThreeAuthorityFreeRoots'
+          go test -json -count=3 -timeout=3m -run "^${test_name}$" ./internal/restoreservice \
+            | tee "${evidence}/group-installer.jsonl"
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/group-installer.jsonl" | wc -l)" -eq 3
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${evidence}/group-installer.jsonl" >/dev/null; then
+            echo "restore group installer qualification skipped" >&2
+            exit 1
+          fi
       - name: Upload restore activation evidence
         if: always()
         uses: actions/upload-artifact@v4
