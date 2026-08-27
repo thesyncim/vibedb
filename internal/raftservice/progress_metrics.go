@@ -15,18 +15,26 @@ const AbsoluteMaxProgressMetricsGroups = 1 << 14
 
 // ProgressMetrics is the bounded process-incarnation counter seam for shipped
 // RF3 owner loops. It observes already-produced fixed-width progress after a
-// Host turn; no formatting, labels, clocks, maps, or callbacks enter Raft.
+// Host turn. Successful progress uses no formatting, labels, clocks, maps, or
+// callbacks. An optional first-seen failure diagnostic runs after the Host turn.
 type ProgressMetrics struct {
-	proposalCommands   atomic.Uint64
-	proposalBytes      atomic.Uint64
-	appliedEntries     atomic.Uint64
-	commitAdvancements atomic.Uint64
-	committedEntries   atomic.Uint64
-	readyPersisted     atomic.Uint64
-	snapshotsFinished  atomic.Uint64
-	readCompletions    atomic.Uint64
-	faults             atomic.Uint64
-	groups             atomic.Pointer[progressMetricsGroupTable]
+	// ProposalFailure is optional and must be set before the owner starts.
+	// It receives at most one callback per fixed reason across all lanes.
+	// Calls for different reasons may be concurrent. No command or raw error
+	// is exposed. The callback runs synchronously on an owner lane and should
+	// perform only bounded local diagnostic work, not remote I/O.
+	ProposalFailure     func(raftmember.GroupKey, ProposalFailureReason)
+	proposalFailureSeen atomic.Uint64
+	proposalCommands    atomic.Uint64
+	proposalBytes       atomic.Uint64
+	appliedEntries      atomic.Uint64
+	commitAdvancements  atomic.Uint64
+	committedEntries    atomic.Uint64
+	readyPersisted      atomic.Uint64
+	snapshotsFinished   atomic.Uint64
+	readCompletions     atomic.Uint64
+	faults              atomic.Uint64
+	groups              atomic.Pointer[progressMetricsGroupTable]
 }
 
 type progressMetricsGroup struct {
@@ -63,6 +71,11 @@ type ProgressMetricsSnapshot struct {
 func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, done bool, err error) {
 	if metrics == nil {
 		return
+	}
+	if err != nil && metrics.ProposalFailure != nil &&
+		(progress.Kind == multiraft.ProgressProposal ||
+			progress.Kind == multiraft.ProgressFault && progress.ProposalCount != 0) {
+		metrics.observeProposalFailure(progress.Group, err)
 	}
 	if progress.ProposalCount > 0 {
 		metrics.proposalCommands.Add(uint64(progress.ProposalCount))

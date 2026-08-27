@@ -541,6 +541,9 @@ func servePreparedRF3WithExecutionLanes(
 
 	pulse := make(chan struct{}, 1)
 	progressMetrics := new(raftservice.ProgressMetrics)
+	progressMetrics.ProposalFailure = func(group raftmember.GroupKey, reason raftservice.ProposalFailureReason) {
+		fmt.Fprintf(os.Stderr, "RF3 proposal admission refused group=%x reason=%s\n", group.GroupID, reason)
+	}
 	if err := progressMetrics.ConfigureGroups(identities); err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
