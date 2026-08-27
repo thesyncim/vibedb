@@ -408,6 +408,8 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 			memberRoot := filepath.Join(installer.root, "roots", fmt.Sprintf("group-%08d", ordinal), fmt.Sprintf("replica-%d", member+1))
 			identity := restoreRF3TargetIdentity(fixture, ordinal, member, schemas[ordinal])
 			input := prepareRF3Manifest{Root: memberRoot, Distribution: identity.Distribution, Shard: identity.Shard, ClusterID: idString(fixture.group.ClusterID[:]), ClusterIncarnation: idString(fixture.group.ClusterIncarnation[:]), TopologyRecoveryEpoch: fixture.group.TopologyRecoveryEpoch, AllocationGeneration: 23, ShardIncarnation: idString(fixture.group.ShardIncarnation[:]), GroupID: idString(fixture.group.GroupID[:]), MemberID: uint64(member + 1), StoreID: idString(identity.StoreID[:]), Table: schemas[ordinal].BaseTable, CreateTable: schemas[ordinal].DDL[0], Apply: schemas[ordinal].Apply, Authority: prepareRF3Authority{5, 1, 1, 13, 1, 1},
+				SchemaStatements:    schemas[ordinal].DDL[1:],
+				GlobalIndexes:       restoreRF3GlobalRelations(schemas[ordinal]),
 				WAL:                 prepareRF3WAL{"rf3-command-key", keyPath, "restore-process-wrapped-key", 256 << 20, raftstore.DefaultMaxRecordBytes, 4096, 16384, raftstore.DefaultMaxLiveBytes},
 				Listeners:           rf3ManifestListeners{Peer: fixture.peerAddresses[member], Native: fixture.nativeAddresses[member], Snapshot: fixture.snapshotAddresses[member], Control: fixture.controlAddresses[member]},
 				TLS:                 rf3ManifestTLS{Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: roots, IdentityOID: rf3testfixture.ProcessIdentityOID},
