@@ -49,6 +49,8 @@ func run(args []string) int {
 		return runServe(args[2:])
 	case "schema-rollout":
 		return runServe(append(args[2:], "-schema-rollout-once"))
+	case "restore-activate":
+		return runRestoreActivate(args[2:])
 	default:
 		usage()
 		return 2
@@ -61,6 +63,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  vibedb-gateway validate -catalog <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-gateway serve    -catalog <path> [-listen <addr>]")
 	fmt.Fprintln(os.Stderr, "  vibedb-gateway schema-rollout <authenticated serve flags> -schema-rollout-plan <path>")
+	fmt.Fprintln(os.Stderr, "  vibedb-gateway restore-activate -manifest <path>")
 }
 
 // runValidate loads and re-validates a persisted catalog, reporting the outcome.
