@@ -127,6 +127,10 @@ func TestAbandonmentCollectorProtectsSlowTransferAndRetiresExactStage(t *testing
 	if _, err = collector.RunPass(t.Context(), SourceExportCursor{}); !errors.Is(err, ErrAbandonment) {
 		t.Fatalf("unexpired lease err=%v", err)
 	}
+	invalidPass, _ := collector.RunPass(t.Context(), SourceExportCursor{})
+	if invalidPass.Cursor != (SourceExportCursor{}) {
+		t.Fatalf("failed witness advanced resumable cursor: %+v", invalidPass.Cursor)
+	}
 	if repository.Stats().Staged != 1 {
 		t.Fatal("invalid witness deleted slow transfer")
 	}

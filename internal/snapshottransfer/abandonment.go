@@ -202,12 +202,13 @@ func (collector *AbandonmentCollector) RunPass(
 	options := collector.options
 	workspace := make([]SourceControlRecord, 0, options.MaxRecords)
 	records, next, err := options.Journal.ScanSourceExports(ctx, cursor, workspace)
-	pass := AbandonmentPass{Cursor: next, Scanned: len(records)}
+	pass := AbandonmentPass{Cursor: cursor, Scanned: len(records)}
 	if err != nil {
 		return pass, err
 	}
 	for _, record := range records {
 		if record.State == SourceControlReleased {
+			pass.Cursor.AfterOperation = record.Request.Operation
 			continue
 		}
 		witness, found, readErr := options.Authority.ReadArtifactAbandonment(ctx, record.Request.Operation)
@@ -215,6 +216,7 @@ func (collector *AbandonmentCollector) RunPass(
 			return pass, readErr
 		}
 		if !found {
+			pass.Cursor.AfterOperation = record.Request.Operation
 			continue
 		}
 		pass.Witnessed++
@@ -246,7 +248,9 @@ func (collector *AbandonmentCollector) RunPass(
 			}
 		}
 		pass.Deleted++
+		pass.Cursor.AfterOperation = record.Request.Operation
 	}
+	pass.Cursor.Done = next.Done
 	pass.RetainedBytes = options.Repository.Stats().DiskBytes
 	if pass.Cursor.Done && pass.RetainedBytes > options.MaxRetainedBytes {
 		return pass, ErrRetainedBytes
