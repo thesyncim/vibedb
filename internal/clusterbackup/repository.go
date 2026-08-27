@@ -223,18 +223,28 @@ func (r *BackupRepository) recover() error {
 		}
 		delete(certificates, digest)
 	}
-	// Orphan artifacts are incomplete publication state.
+	// Orphan artifacts are incomplete publication state. For a live
+	// certificate, retain the exact observed index set so loadCertificate can
+	// remove every out-of-vector file before accounting the committed cut.
+	liveArtifacts := make(map[[sha256.Size]byte]map[int]struct{}, len(certificates))
 	entries, err = fs.ReadDir(r.root.FS(), ".")
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		digest, _, ok := parseArtifactName(entry.Name(), "a-")
+		digest, index, ok := parseArtifactName(entry.Name(), "a-")
 		if ok {
 			if _, live := certificates[digest]; !live {
 				if err := r.root.Remove(entry.Name()); err != nil {
 					return err
 				}
+			} else {
+				indices := liveArtifacts[digest]
+				if indices == nil {
+					indices = make(map[int]struct{})
+					liveArtifacts[digest] = indices
+				}
+				indices[index] = struct{}{}
 			}
 		}
 	}
@@ -242,14 +252,14 @@ func (r *BackupRepository) recover() error {
 		return err
 	}
 	for digest := range certificates {
-		if err := r.loadCertificate(digest); err != nil {
+		if err := r.loadCertificate(digest, liveArtifacts[digest]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *BackupRepository) loadCertificate(digest [sha256.Size]byte) error {
+func (r *BackupRepository) loadCertificate(digest [sha256.Size]byte, observed map[int]struct{}) error {
 	file, err := openBackupRegular(r.root, certificateName(digest), os.O_RDONLY, 0)
 	if err != nil {
 		return err
@@ -267,8 +277,33 @@ func (r *BackupRepository) loadCertificate(digest [sha256.Size]byte) error {
 		len(certificate.Groups) > r.limits.MaxArtifacts || len(r.records) >= r.limits.MaxBackups {
 		return errors.Join(ErrRepository, readErr, closeErr, openErr)
 	}
+	// Artifact names beyond the authenticated certificate vector are never
+	// live. Reclaim and sync them before admitting/accounting this backup. This
+	// closes both retained-space leaks and MaxDiskBytes bypasses after crashes.
+	removed := false
+	for index := range observed {
+		if index < len(certificate.Groups) {
+			continue
+		}
+		if err := r.root.Remove(artifactName(digest, index)); err != nil {
+			return err
+		}
+		delete(observed, index)
+		removed = true
+	}
+	if removed {
+		if err := syncBackupRoot(r.root); err != nil {
+			return err
+		}
+	}
+	if len(observed) != len(certificate.Groups) {
+		return ErrRepository
+	}
 	bytes := uint64(len(raw))
 	for index, cut := range certificate.Groups {
+		if _, ok := observed[index]; !ok {
+			return ErrRepository
+		}
 		if cut.ArtifactBytes > r.limits.MaxArtifactBytes {
 			return ErrBound
 		}

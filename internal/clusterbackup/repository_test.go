@@ -307,6 +307,72 @@ func TestRepositoryRecoveryRemovesPartialTemporaryAndUncommittedArtifactState(t 
 	}
 }
 
+func TestRepositoryRecoveryDurablyRemovesRogueLiveCertificateArtifacts(t *testing.T) {
+	directory := t.TempDir()
+	payload := bytes.Repeat([]byte{3}, 4096)
+	certificate := repositoryCertificate(t, payload)
+	repository, err := OpenBackupRepository(directory, repositoryLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = repository.Publish(certificate, artifactInputs(payload)...); err != nil {
+		t.Fatal(err)
+	}
+	if err = repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a crash leaving a published-looking, but uncertified, high index.
+	// It is larger than MaxDiskBytes and must not survive or enter accounting.
+	rogue := make([]byte, 9<<20)
+	state := uint64(0x9e3779b97f4a7c15)
+	for index := range rogue {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		rogue[index] = byte(state)
+	}
+	rogueName := artifactName(certificate.Digest, len(certificate.Groups)+77)
+	if err = os.WriteFile(filepath.Join(directory, rogueName), rogue, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, measured, err := repositoryAllocatedBytes(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repository, err = OpenBackupRepository(directory, repositoryLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := repository.Stats()
+	if stats.Backups != 1 || stats.Artifacts != 1 || stats.DiskBytes != uint64(len(payload)+HeaderBytes+GroupCutBytes+TrailerBytes) {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if _, err = os.Lstat(filepath.Join(directory, rogueName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rogue artifact survived: %v", err)
+	}
+	after, afterMeasured, err := repositoryAllocatedBytes(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if measured && afterMeasured && (after >= before || after > 64<<10) {
+		t.Fatalf("allocated bytes before=%d after=%d", before, after)
+	}
+	if err = repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Cleanup is itself durable; a second reopen cannot resurrect or account it.
+	repository, err = OpenBackupRepository(directory, repositoryLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if repository.Stats() != stats {
+		t.Fatalf("second reopen stats=%+v want=%+v", repository.Stats(), stats)
+	}
+}
+
 func TestRepositoryEnforcesResourceBoundsBeforeWriting(t *testing.T) {
 	payload := bytes.Repeat([]byte{1}, 1024)
 	certificate := repositoryCertificate(t, payload)
