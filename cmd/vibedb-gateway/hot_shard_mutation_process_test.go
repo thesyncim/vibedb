@@ -675,10 +675,13 @@ func hotMutationWaitSplitComplete(
 		if err == nil && snapshot.Generation() >= generation &&
 			errors.Is(operationErr, gateway.ErrReplicatedOperationMissing) {
 			var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
-			if _, found := snapshot.ResolveReplicatedRoute(
+			retained, found := snapshot.ResolveReplicatedRoute(
 				source.Distribution, source.Shard, replicas[:0],
-			); found {
-				t.Fatal("stale parent route remained published after terminal split")
+			)
+			if !found || retained.Command.OwnershipEpoch <= source.Command.OwnershipEpoch ||
+				retained.Command.RoutingVersion <= source.Command.RoutingVersion ||
+				retained.Command.RouteGeneration <= source.Command.RouteGeneration {
+				t.Fatalf("retained child did not replace stale parent authority: %+v", retained)
 			}
 			return snapshot
 		}
