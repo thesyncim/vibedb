@@ -84,6 +84,9 @@ type NativeDurableRequestExecutionPinAuthority struct {
 	span     uint64
 }
 
+var _ DurableRequestExecutionPinRetirer = (*NativeDurableRequestExecutionPinAuthority)(nil)
+var _ DurableRequestExecutionPinAckRetirer = (*NativeDurableRequestExecutionPinAuthority)(nil)
+
 func NewNativeDurableRequestExecutionPinAuthority(
 	executor *ReplicatedExecutor,
 	sessions DurableRequestExecutionPinSessionFactory,
