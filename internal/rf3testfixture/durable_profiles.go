@@ -68,10 +68,17 @@ func DurableGatewayMemberProfiles() [DurableGatewayGroups]MemberOptions {
 }
 
 func DurableGatewayWALOptions() raftstore.Options {
+	// The maximum Ready is an admission reserve, not useful live-log capacity.
+	// Leave a bounded 16 MiB/16K-entry workload suffix in addition to that
+	// reserve. A profile with only two records and one Ready of live bytes
+	// can be created, but cannot survive its first election and proposal.
+	const suffixBytes = 16 << 20
+	const suffixEntries = 16 << 10
 	return raftstore.Options{
 		MaxFileBytes: int64(raftstore.HeaderBytes+raftstore.MaxSnapshotBaseRecordBytes+
-			raftstore.MinimumReadyRecordBytes) + raftstore.MinimumReadyLiveBytes,
-		MaxRecordBytes: raftstore.MinimumReadyRecordBytes, MaxRecords: 2,
-		MaxEntries: raftstore.MaxReadyEntries, MaxLiveBytes: raftstore.MinimumReadyLiveBytes,
+			raftstore.MinimumReadyRecordBytes) + raftstore.MinimumReadyLiveBytes + suffixBytes,
+		MaxRecordBytes: raftstore.MinimumReadyRecordBytes, MaxRecords: suffixEntries,
+		MaxEntries:   raftstore.MaxReadyEntries + suffixEntries,
+		MaxLiveBytes: raftstore.MinimumReadyLiveBytes + suffixBytes,
 	}
 }
