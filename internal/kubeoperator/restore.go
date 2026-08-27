@@ -115,9 +115,7 @@ func OpenRestoredReplicaState(root string) (RestoredReplicaState, error) {
 	}
 	var receipt restoreReplicaReceipt
 	found, err = readRestoreVibe(filepath.Join(root, "activation.vibejson"), &receipt)
-	if err != nil || !found || receipt.Format != 1 || receipt.Operation != allocation.Operation ||
-		receipt.GroupOrdinal != allocation.GroupOrdinal || receipt.Replica != allocation.ReplicaOrdinal ||
-		len(receipt.RootDigest) != 64 || receipt.Apply.Format == 0 || receipt.Apply.Storage == "" {
+	if err != nil || !found || !restoreReceiptMatchesAllocation(receipt, allocation) {
 		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
 	}
 	var logID [16]byte
@@ -147,6 +145,13 @@ func OpenRestoredReplicaState(root string) (RestoredReplicaState, error) {
 	return RestoredReplicaState{Identity: receipt.Identity, Apply: receipt.Apply, SnapshotBase: &snapshot,
 		OperationDigest: operation, GroupOrdinal: receipt.GroupOrdinal, ReplicaOrdinal: receipt.Replica,
 		Targets: targets}, nil
+}
+
+func restoreReceiptMatchesAllocation(receipt restoreReplicaReceipt, allocation restoreReplicaAllocation) bool {
+	return receipt.Format == 1 && receipt.Operation == allocation.Operation &&
+		receipt.GroupOrdinal == allocation.GroupOrdinal && receipt.Replica == allocation.ReplicaOrdinal &&
+		len(receipt.RootDigest) == sha256.Size*2 && receipt.Apply.Format == sqldriver.ReplicatedApplyFormat &&
+		receipt.Apply.Storage != ""
 }
 
 // RestoreGroup imports one certified artifact into three fresh non-serving SQL

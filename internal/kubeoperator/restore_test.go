@@ -53,6 +53,36 @@ func TestRestoreStorageAllocationUsesFullCanonicalIdentity(t *testing.T) {
 	}
 }
 
+func TestRestoreReceiptMatchesCurrentApplyFormat(t *testing.T) {
+	allocation := restoreReplicaAllocation{Format: 1, Operation: strings.Repeat("ab", sha256.Size),
+		GroupOrdinal: 3, ReplicaOrdinal: 2}
+	receipt := restoreReplicaReceipt{Format: 1, Operation: allocation.Operation,
+		GroupOrdinal: allocation.GroupOrdinal, Replica: allocation.ReplicaOrdinal,
+		RootDigest: strings.Repeat("cd", sha256.Size),
+		Apply:      sqldriver.ReplicatedApplyIdentity{Format: sqldriver.ReplicatedApplyFormat, Storage: "apply-storage"}}
+	// Format zero is the current unreleased apply grammar, not a missing receipt.
+	if !restoreReceiptMatchesAllocation(receipt, allocation) {
+		t.Fatal("receipt with the current replicated apply format rejected")
+	}
+	for name, mutate := range map[string]func(*restoreReplicaReceipt){
+		"unsupported apply format": func(r *restoreReplicaReceipt) { r.Apply.Format++ },
+		"missing apply storage":    func(r *restoreReplicaReceipt) { r.Apply.Storage = "" },
+		"unsupported receipt":      func(r *restoreReplicaReceipt) { r.Format++ },
+		"different operation":      func(r *restoreReplicaReceipt) { r.Operation = strings.Repeat("ef", sha256.Size) },
+		"different group":          func(r *restoreReplicaReceipt) { r.GroupOrdinal++ },
+		"different replica":        func(r *restoreReplicaReceipt) { r.Replica++ },
+		"truncated root digest":    func(r *restoreReplicaReceipt) { r.RootDigest = r.RootDigest[:32] },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := receipt
+			mutate(&invalid)
+			if restoreReceiptMatchesAllocation(invalid, allocation) {
+				t.Fatal("invalid receipt accepted")
+			}
+		})
+	}
+}
+
 func TestRestoreGroupRejectsUnboundTemplateBeforeCreatingState(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "restore")
 	if err := os.Mkdir(root, 0o700); err != nil {
