@@ -68,8 +68,16 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	catalog, data := fixtures[0], fixtures[1]
 	catalogLeader, catalogStates := catalog.waitLeader(t, []int{0, 1, 2}, 15*time.Second)
 	restoreRF3ReadRelation(t, catalog, catalogLeader, catalogStates[catalogLeader], 1, rf3FaultKey(t, "source-catalog-sentinel"), nil, false)
-	for _, key := range []string{"catalog/head", "catalog/witness", "catalog/genesis", "catalog/restore-policy"} {
-		restoreRF3ReadRelation(t, catalog, catalogLeader, catalogStates[catalogLeader], 1, rf3FaultKey(t, key), nil, true)
+	policyRaw, err := os.ReadFile(filepath.Join(catalog.root, "policy.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := gateway.RestoreCatalogProjection(options.Operation, snapshot, policyRaw)
+	if err != nil || len(projection) != 4 {
+		t.Fatalf("sealed fresh catalog projection: rows=%d err=%v", len(projection), err)
+	}
+	for _, row := range projection {
+		restoreRF3ReadRelation(t, catalog, catalogLeader, catalogStates[catalogLeader], 1, row.Key, row.Value, true)
 	}
 	leader, states := data.waitLeader(t, []int{0, 1, 2}, 15*time.Second)
 	data.waitDocument(t, leader, states[leader], "restored-row", 5*time.Second)
@@ -263,7 +271,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 	extra := rf3FaultPolicy(fixtures[1].nodes)
 	prefix := bytes.Index(extra, []byte("["))
 	policyRaw = append(append(policyRaw[:len(policyRaw)-2], ','), extra[prefix+1:len(extra)-2]...)
-	policyRaw = fmt.Appendf(policyRaw, `,{"node":"%x","capabilities":["restore_activate","delegate","topology"]}]}`, operatorNode)
+	policyRaw = fmt.Appendf(policyRaw, `,{"node":"%x","capabilities":["delegate","topology","restore_activate"]}]}`, operatorNode)
 	policyPath := filepath.Join(root, "policy.vibejson")
 	if err = os.WriteFile(policyPath, policyRaw, 0600); err != nil {
 		t.Fatal(err)
