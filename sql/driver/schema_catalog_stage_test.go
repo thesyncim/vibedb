@@ -177,6 +177,11 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil || !found || !bytes.Equal(publishedRaw, targetRaw) {
 		t.Fatalf("published catalog found=%t bytes=%d err=%v", found, len(publishedRaw), err)
 	}
+	observedTransition, found, err := ObservePublishedReplicatedSchemaTransition(path)
+	if err != nil || !found || observedTransition.SchemaTransition != opened.SchemaTransition {
+		t.Fatalf("published transition=%+v found=%t err=%v",
+			observedTransition, found, err)
+	}
 	if err = reopenedClaim.Close(); err != nil {
 		t.Fatal(err)
 	}

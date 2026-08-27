@@ -243,6 +243,39 @@ func (a *ReplicatedApply) ReplicatedSchemaCatalogCASDigest(
 	), nil
 }
 
+// ObservePublishedReplicatedSchemaTransition returns the exact authenticated
+// command only when its target catalog is the currently durable catalog. This
+// settles activation after a process crash without trusting retained CLI
+// identity files or controller memory.
+func ObservePublishedReplicatedSchemaTransition(
+	path string,
+) (replicatedstate.SchemaTransitionView, bool, error) {
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !found {
+		return replicatedstate.SchemaTransitionView{}, found, err
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(record.command)
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	raw, found, err := readCatalogFile(absolute)
+	if err != nil || !found {
+		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil || image.Digest != record.targetDigest ||
+		image.SchemaGeneration != transition.ToSchemaGeneration ||
+		image.RelationManifestDigest != transition.ToManifest {
+		return replicatedstate.SchemaTransitionView{}, false,
+			errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return transition, true, nil
+}
+
 // PublishReplicatedSchemaCatalog performs the exact old->new catalog CAS only
 // after the persisted machine proves the authorized schema command is its
 // final durable Raft entry. Success deliberately leaves the old in-process
