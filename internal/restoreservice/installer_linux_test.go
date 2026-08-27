@@ -74,6 +74,19 @@ func TestGroupInstallerBuildsAndRecoversThreeAuthorityFreeRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	factory := &linuxReplicaFactory{t: t, root: filepath.Join(t.TempDir(), "replicas")}
+	if err := os.Mkdir(factory.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, held := range factory.roots {
+			if held.activation.Apply != nil {
+				_ = held.activation.Apply.Close()
+			}
+			if held.database != nil {
+				_ = held.database.Close()
+			}
+		}
+	})
 	installer := GroupInstaller{Root: root, Factory: factory}
 	witness, err := installer.Install(context.Background(), operation, 0, bytes.NewReader(artifact))
 	if err != nil || witness.SanitizedImageDigest != manifest.ImageDigest ||
@@ -91,14 +104,6 @@ func TestGroupInstallerBuildsAndRecoversThreeAuthorityFreeRoots(t *testing.T) {
 	replayed, err := installer.Install(context.Background(), operation, 0, bytes.NewReader(nil))
 	if err != nil || replayed != witness || factory.commits != 3 || factory.recovers != 3 {
 		t.Fatalf("replay=%+v commits=%d recovers=%d err=%v", replayed, factory.commits, factory.recovers, err)
-	}
-	for _, held := range factory.roots {
-		if held.activation.Apply != nil {
-			_ = held.activation.Apply.Close()
-		}
-		if held.database != nil {
-			_ = held.database.Close()
-		}
 	}
 }
 
