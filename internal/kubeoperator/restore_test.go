@@ -106,6 +106,34 @@ func TestRestoreSchemaRequiresExactOrderedBundleManifest(t *testing.T) {
 	}
 }
 
+func TestRestoreSchemaSetBindsDistinctDenseGroupSchemas(t *testing.T) {
+	first, second := validRestoreTestTemplate(), validRestoreTestTemplate()
+	second.BaseTable, second.Shard = "catalog", "controlplane"
+	second.DDL = []string{"CREATE TABLE catalog (PRIMARY KEY (id))"}
+	set := restoreSchemaSet{Format: 1, Groups: []restoreSchemaSlot{{Ordinal: 0, Schema: first}, {Ordinal: 1, Schema: second}}}
+	raw, err := vibejson.Marshal(&set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := clusterrestore.Operation{Targets: make([]clusterrestore.TargetGroup, 2), TargetCatalogDigest: sha256.Sum256(raw)}
+	selected, err := openRestoreSchemaSet(raw, operation, 1)
+	if err != nil || selected.BaseTable != "catalog" {
+		t.Fatalf("selected=%+v err=%v", selected, err)
+	}
+	set.Groups[1].Ordinal = 0
+	raw, _ = vibejson.Marshal(&set)
+	operation.TargetCatalogDigest = sha256.Sum256(raw)
+	if err := ValidateRestoreSchemaSet(raw, operation, 1); err == nil {
+		t.Fatal("duplicate ordinal accepted")
+	}
+	set.Groups = set.Groups[:1]
+	raw, _ = vibejson.Marshal(&set)
+	operation.TargetCatalogDigest = sha256.Sum256(raw)
+	if err := ValidateRestoreSchemaSet(raw, operation, 0); err == nil {
+		t.Fatal("missing schema accepted")
+	}
+}
+
 func validRestoreTestTemplate() restoreSchemaTemplate {
 	return restoreSchemaTemplate{
 		Format: 1, Distribution: "data", Shard: "data-0", AllocationGeneration: 1,

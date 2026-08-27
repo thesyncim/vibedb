@@ -42,6 +42,16 @@ type RestoreGroupResult struct {
 	Witness clusterrestore.RootWitness
 }
 
+type restoreSchemaSet struct {
+	Format uint16              `json:"format"`
+	Groups []restoreSchemaSlot `json:"groups"`
+}
+
+type restoreSchemaSlot struct {
+	Ordinal uint32                `json:"ordinal"`
+	Schema  restoreSchemaTemplate `json:"schema"`
+}
+
 type restoreSchemaTemplate struct {
 	Format               uint16                       `json:"format"`
 	Distribution         string                       `json:"distribution"`
@@ -144,13 +154,12 @@ func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupR
 		sha256.Sum256(config.Template) != config.Operation.TargetCatalogDigest {
 		return RestoreGroupResult{}, ErrBootstrap
 	}
-	var template restoreSchemaTemplate
-	if err := vibejson.Unmarshal(config.Template, &template); err != nil {
-		return RestoreGroupResult{}, errors.Join(ErrBootstrap, err)
+	template, err := openRestoreSchemaSet(config.Template, config.Operation, config.Ordinal)
+	if err != nil {
+		return RestoreGroupResult{}, err
 	}
-	canonical, err := vibejson.Marshal(&template)
-	if err != nil || !bytes.Equal(canonical, config.Template) || !validRestoreTemplate(template) {
-		return RestoreGroupResult{}, errors.Join(ErrBootstrap, err)
+	if result, found, err := recoverSealedRestoreGroup(ctx, config, template); found || err != nil {
+		return result, err
 	}
 	staging := filepath.Join(config.Root, "staging")
 	if err := os.MkdirAll(staging, 0o700); err != nil {
@@ -167,7 +176,39 @@ func RestoreGroup(ctx context.Context, config RestoreGroupConfig) (RestoreGroupR
 	if err != nil {
 		return RestoreGroupResult{}, err
 	}
+	if err := sealRestoreGroup(config, witness); err != nil {
+		return RestoreGroupResult{}, err
+	}
 	return RestoreGroupResult{Witness: witness}, nil
+}
+
+// ValidateRestoreSchemaSet checks one canonical, operation-bound schema-set
+// projection. Every source group has exactly one dense ordinal, allowing
+// catalog, ledger, and user groups to retain different explicit schemas.
+func ValidateRestoreSchemaSet(raw []byte, operation clusterrestore.Operation, ordinal uint32) error {
+	_, err := openRestoreSchemaSet(raw, operation, ordinal)
+	return err
+}
+
+func openRestoreSchemaSet(raw []byte, operation clusterrestore.Operation, ordinal uint32) (restoreSchemaTemplate, error) {
+	if len(raw) == 0 || len(raw) > RestoreTemplateMaxBytes ||
+		sha256.Sum256(raw) != operation.TargetCatalogDigest || int(ordinal) >= len(operation.Targets) {
+		return restoreSchemaTemplate{}, ErrBootstrap
+	}
+	var set restoreSchemaSet
+	if err := vibejson.Unmarshal(raw, &set); err != nil {
+		return restoreSchemaTemplate{}, errors.Join(ErrBootstrap, err)
+	}
+	canonical, err := vibejson.Marshal(&set)
+	if err != nil || !bytes.Equal(canonical, raw) || set.Format != 1 || len(set.Groups) != len(operation.Targets) {
+		return restoreSchemaTemplate{}, errors.Join(ErrBootstrap, err)
+	}
+	for index, slot := range set.Groups {
+		if slot.Ordinal != uint32(index) || !validRestoreTemplate(slot.Schema) {
+			return restoreSchemaTemplate{}, ErrBootstrap
+		}
+	}
+	return set.Groups[ordinal].Schema, nil
 }
 
 func validRestoreTemplate(t restoreSchemaTemplate) bool {
@@ -302,9 +343,12 @@ func (f *restoreReplicaFactory) OpenReplica(
 	if err != nil {
 		return restoreservice.ReplicaRoot{}, err
 	}
-	if manifest.Bundle && identity.RelationManifestDigest != manifest.RelationManifestDigest {
-		_ = database.Close()
-		return restoreservice.ReplicaRoot{}, ErrBootstrap
+	if manifest.Bundle {
+		digest, digestErr := sqldriver.ReplicatedRelationManifestDigest(identity)
+		if digestErr != nil || digest != manifest.RelationManifestDigest {
+			_ = database.Close()
+			return restoreservice.ReplicaRoot{}, errors.Join(ErrBootstrap, digestErr)
+		}
 	}
 	receipt, committed, err := readRestoreReceipt(receiptPath, operation, group, replica)
 	if err != nil {
@@ -539,15 +583,7 @@ func commitRestoreReplica(
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
-	h := sha256.New()
-	h.Write([]byte("vibedb/kubeoperator/restore-root/format-1\x00"))
-	h.Write(operation.Digest[:])
-	h.Write([]byte{byte(group >> 24), byte(group >> 16), byte(group >> 8), byte(group), replica})
-	h.Write([]byte(allocation.LogID))
-	h.Write([]byte(allocation.UserStorage))
-	h.Write(base)
-	var digest [sha256.Size]byte
-	copy(digest[:], h.Sum(nil))
+	digest := restoreRootDigest(allocation, base, operation, group, replica)
 	receipt := restoreReplicaReceipt{Format: 1, Operation: hex.EncodeToString(operation.Digest[:]),
 		GroupOrdinal: group, Replica: replica, Identity: identity, Apply: activation.ApplyIdentity,
 		SnapshotBase: base, RootDigest: hex.EncodeToString(digest[:])}
@@ -560,6 +596,18 @@ func commitRestoreReplica(
 		return [sha256.Size]byte{}, err
 	}
 	return digest, nil
+}
+
+func restoreRootDigest(allocation restoreReplicaAllocation, snapshot []byte, operation clusterrestore.Operation, group uint32, replica uint8) (digest [sha256.Size]byte) {
+	h := sha256.New()
+	h.Write([]byte("vibedb/kubeoperator/restore-root/format-1\x00"))
+	h.Write(operation.Digest[:])
+	h.Write([]byte{byte(group >> 24), byte(group >> 16), byte(group >> 8), byte(group), replica})
+	h.Write([]byte(allocation.LogID))
+	h.Write([]byte(allocation.UserStorage))
+	h.Write(snapshot)
+	copy(digest[:], h.Sum(nil))
+	return digest
 }
 
 func readRestoreAllocation(path string, operation clusterrestore.Operation, group uint32, replica uint8) (restoreReplicaAllocation, bool, error) {
@@ -589,7 +637,7 @@ func readRestoreReceipt(path string, operation clusterrestore.Operation, group u
 }
 
 func readRestoreVibe[T any](path string, destination *T) (bool, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := readRestoreBounded(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
