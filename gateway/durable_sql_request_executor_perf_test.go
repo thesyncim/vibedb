@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -92,6 +93,27 @@ func BenchmarkDurableSQLWideLowering(b *testing.B) {
 	}
 }
 
+func BenchmarkDurableSQLMultiRowInsertLowering(b *testing.B) {
+	snapshot, planner, _ := replicatedSQLSplitTransactionFixture(b)
+	profile := planner.profileFor(ClassInteractive)
+	for _, rows := range []int{2, 16, 64} {
+		query := durableSQLMultiRowInsert(rows)
+		b.Run(strconv.Itoa(rows), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(rows * 32))
+			for b.Loop() {
+				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+					context.Background(), snapshot, []Query{query}, profile, nil,
+				)
+				if err != nil || !handled || len(participants) == 0 {
+					b.Fatal(err)
+				}
+				durableSQLPerfParticipants = participants
+			}
+		})
+	}
+}
+
 func durableSQLPerfQueries(messages int) []Query {
 	queries := make([]Query, 0, messages+1)
 	for index := range messages {
@@ -106,4 +128,20 @@ func durableSQLPerfQueries(messages int) []Query {
 		SQL: `DELETE FROM logs WHERE id = ?`, Class: ClassInteractive,
 		Params: []shardservice.Param{shardservice.StringParam("log-boundary")},
 	})
+}
+
+func durableSQLMultiRowInsert(rows int) Query {
+	var sql strings.Builder
+	sql.WriteString("INSERT INTO messages VALUES ")
+	params := make([]shardservice.Param, rows)
+	for index := range rows {
+		if index != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString("(?)")
+		params[index] = shardservice.DocumentParam(
+			`{"id":"multi-row-` + strconv.Itoa(index) + `","n":1}`,
+		)
+	}
+	return Query{SQL: sql.String(), Class: ClassInteractive, Params: params}
 }

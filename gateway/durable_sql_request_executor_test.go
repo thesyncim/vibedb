@@ -63,6 +63,56 @@ func TestDurableSQLRequestExecutorFusesLoweringCreateAndTypedExecution(t *testin
 	}
 }
 
+func TestDurableSQLRequestExecutorAdmitsAtomicMultiRowCrossShardInsert(t *testing.T) {
+	_, planner, keys := replicatedSQLSplitTransactionFixture(t)
+	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := []Query{{
+		SQL: `INSERT INTO messages VALUES (?),(?)`, Class: ClassInteractive,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(`{"id":"` + keys[0] + `","n":1}`),
+			shardservice.DocumentParam(`{"id":"` + keys[1] + `","n":2}`),
+		},
+	}}
+	tenant := []byte("durable-multi-row-tenant")
+	requestKey := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{0x71},
+		Request: requestledger.RequestID{0x72}, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		IssuerEpoch: 7, IssuerLane: requestledger.IssuerLane{0x73}, IssuerSequence: 1,
+	}
+	ledger := new(typedServiceLedger)
+	pins := new(typedServicePinStop)
+	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	current := topology.Current()
+	current.Generation = 7
+	if err = topology.Publish(*current); err != nil {
+		t.Fatal(err)
+	}
+	service, err := newDurableRequestService(
+		topology, ledger, typedServiceRunnerStop{}, pins,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewDurableSQLRequestExecutor(DurableSQLRequestExecutorOptions{
+		Planner: planner, ReplicatedData: data, Requests: service,
+		RecoveryPulseLimit: 3, PlanningLeaseSpan: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, executeErr := executor.Execute(t.Context(), requestKey, tenant, queries); !errors.Is(
+		executeErr, errTypedServicePin,
+	) {
+		t.Fatalf("execute error=%v", executeErr)
+	}
+	if ledger.applies != 1 || ledger.reads != 0 || pins.called != 1 {
+		t.Fatalf("admission applies=%d reads=%d pins=%d", ledger.applies, ledger.reads, pins.called)
+	}
+}
+
 func TestDurableSQLRequestExecutorRejectsTenantMismatchBeforeAdmission(t *testing.T) {
 	queries := []Query{{SQL: `DELETE FROM accounts WHERE id = ?`,
 		Params: []shardservice.Param{shardservice.StringParam("account-1")}}}

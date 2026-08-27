@@ -163,177 +163,184 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 
 	for statementIndex := range statements {
 		statement := &statements[statementIndex]
-		scalar, document, kind, err := replicatedSQLMutationInput(statement)
+		inputCount, err := replicatedSQLMutationInputCount(statement)
 		if err != nil {
 			return nil, true, err
 		}
+		for inputOrdinal := 0; inputOrdinal < inputCount; inputOrdinal++ {
+			scalar, document, kind, inputErr := replicatedSQLMutationInput(statement, inputOrdinal)
+			if inputErr != nil {
+				return nil, true, inputErr
+			}
 
-		var encodedKey [replication.MaxMutationKeyBytes]byte
-		key, ok := appendReplicatedSQLScalarKey(encodedKey[:0], scalar)
-		if !ok || len(key) == 0 || len(key) > int(statement.profile.MaxKeyBytes) {
-			return nil, true, ErrReplicatedSQLTransactionUnsupported
-		}
-		if kind == replication.MutationPutPresent {
-			replacement, replacementErr := replicatedSQLDocumentPrimaryScalar(
-				document, statement.bound.keyPointers, &documentWorkspace,
-			)
-			if replacementErr != nil {
-				return nil, true, replacementErr
-			}
-			var replacementKey [replication.MaxMutationKeyBytes]byte
-			encodedReplacement, replacementOK := appendReplicatedSQLScalarKey(
-				replacementKey[:0], replacement,
-			)
-			if !replacementOK || !bytes.Equal(key, encodedReplacement) {
-				return nil, true, ErrWriteShardKeyMove
-			}
-		}
-		if len(document) > int(statement.profile.MaxDocumentBytes) {
-			return nil, true, ErrTransactionByteLimit
-		}
-		mapper := distribution.NewNativeMapperWithBucketBits(
-			statement.bound.spec.Arity, statement.bound.spec.EffectiveBucketBits(),
-		)
-		var tuple [1]distribution.Scalar
-		tuple[0] = scalar
-		point, pointErr := mapper.PointFor(tuple[:])
-		if pointErr != nil {
-			return nil, true, ErrReplicatedSQLTransactionUnsupported
-		}
-		target, targetOK := statement.bound.manifest.ResolvePointTarget(point)
-		if !targetOK {
-			return nil, true, ErrReplicatedSQLTransactionUnsupported
-		}
-		bits := statement.bound.spec.EffectiveBucketBits()
-		bucket, bucketOK := distribution.VirtualBucketForPoint(point, bits)
-		owner, ownerOK := statement.bound.manifest.ResolveVirtualBucket(bucket, bits)
-		if !bucketOK || !ownerOK || owner.Shard != target.Shard ||
-			owner.AllocationGeneration != target.AllocationGeneration {
-			return nil, true, ErrReplicatedSQLTransactionUnsupported
-		}
-
-		keyStart := len(keyArena)
-		keyArena = append(keyArena, key...)
-		ownedKey := keyArena[keyStart:len(keyArena):len(keyArena)]
-		var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
-		var replicaScratch [ServingReplicaCount]ReplicatedEndpoint
-		resolved, resolvedOK := snapshot.ResolveReplicatedTableKey(
-			byteview.Bytes(statement.bound.table), ownedKey,
-			scalarScratch[:0], replicaScratch[:0],
-		)
-		if !resolvedOK || resolved.Profile.Relation != statement.profile.Relation {
-			return nil, true, ErrReplicatedSQLTransactionUnsupported
-		}
-
-		baseMutation := replication.Mutation{Kind: kind, Key: ownedKey, Value: document}
-		if len(statement.prepared.writeGlobalIndexes) != 0 &&
-			(statement.bound.kind == sqlast.KindUpdate || statement.bound.kind == sqlast.KindDelete) {
-			oldDocument, readErr := readReplicatedSQLIndexedDocument(
-				data,
-				ctx, resolved.Route, statement.profile, ownedKey,
-			)
-			if readErr != nil {
-				return nil, true, readErr
-			}
-			captureRows := [][]shardservice.Cell{{
-				{Bytes: ownedKey}, {Bytes: oldDocument},
-			}}
-			if captureErr := statement.prepared.bindGlobalIndexCapture(
-				statement.bound, target, captureRows,
-			); captureErr != nil {
-				return nil, true, captureErr
-			}
-			baseMutation.ExpectedValueLength = uint64(len(oldDocument))
-			baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
-			if baseMutation.ExpectedValueDigest == (replication.Digest{}) {
+			var encodedKey [replication.MaxMutationKeyBytes]byte
+			key, ok := appendReplicatedSQLScalarKey(encodedKey[:0], scalar)
+			if !ok || len(key) == 0 || len(key) > int(statement.profile.MaxKeyBytes) {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
-			if kind == replication.MutationDelete {
-				baseMutation.Kind = replication.MutationDeleteDigestEqual
-			} else {
-				baseMutation.Kind = replication.MutationPutDigestEqual
-			}
-		}
-		participantIndex, appendErr := appendReplicatedSQLMutation(
-			&builders, &byGroup, resolved.Route, bits,
-			distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
-			statement.profile.Relation, baseMutation,
-		)
-		if appendErr != nil {
-			return nil, true, appendErr
-		}
-		if err := admitReplicatedSQLMutation(
-			profile, &mutationCount, &mutationBytes, baseMutation,
-		); err != nil {
-			return nil, true, err
-		}
-		identities = append(identities, replicatedSQLMutationIdentity{
-			participant: participantIndex, relation: statement.profile.Relation, key: ownedKey,
-		})
-
-		for indexOrdinal := 0; indexOrdinal < len(statement.bound.globalIndexes); indexOrdinal++ {
-			index := &statement.bound.globalIndexes[indexOrdinal]
-			indexRoute, indexProfile, routeErr := snapshot.resolveReplicatedSQLGlobalIndex(index)
-			if routeErr != nil {
-				return nil, true, routeErr
-			}
-			entryKey := statement.bound.globalIndexArena[index.entryStart:index.entryEnd]
-			locator := statement.bound.globalIndexArena[index.valueStart:index.valueEnd]
-			indexMutation := replication.Mutation{
-				Kind: replication.MutationPutAbsentOrEqual, Key: entryKey, Value: locator,
-			}
-			if index.kind == shardservice.MutationGlobalIndexDelete &&
-				indexOrdinal+1 < len(statement.bound.globalIndexes) {
-				next := &statement.bound.globalIndexes[indexOrdinal+1]
-				nextKey := statement.bound.globalIndexArena[next.entryStart:next.entryEnd]
-				if sameReplicatedSQLGlobalIndexTarget(index, next) &&
-					next.kind == shardservice.MutationGlobalIndexPut &&
-					bytes.Equal(entryKey, nextKey) {
-					nextLocator := statement.bound.globalIndexArena[next.valueStart:next.valueEnd]
-					if len(nextLocator) == 0 || len(nextLocator) > int(indexProfile.MaxDocumentBytes) {
-						return nil, true, ErrTransactionByteLimit
-					}
-					indexMutation.Kind = replication.MutationPutDigestEqual
-					indexMutation.Value = nextLocator
-					indexMutation.ExpectedValueLength = uint64(len(locator))
-					indexMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(locator))
-					indexOrdinal++
+			if kind == replication.MutationPutPresent {
+				replacement, replacementErr := replicatedSQLDocumentPrimaryScalar(
+					document, statement.bound.keyPointers, &documentWorkspace,
+				)
+				if replacementErr != nil {
+					return nil, true, replacementErr
+				}
+				var replacementKey [replication.MaxMutationKeyBytes]byte
+				encodedReplacement, replacementOK := appendReplicatedSQLScalarKey(
+					replacementKey[:0], replacement,
+				)
+				if !replacementOK || !bytes.Equal(key, encodedReplacement) {
+					return nil, true, ErrWriteShardKeyMove
 				}
 			}
-			if len(entryKey) == 0 || len(entryKey) > int(indexProfile.MaxKeyBytes) ||
-				len(locator) == 0 || len(locator) > int(indexProfile.MaxDocumentBytes) {
+			if len(document) > int(statement.profile.MaxDocumentBytes) {
 				return nil, true, ErrTransactionByteLimit
 			}
-			if index.kind == shardservice.MutationGlobalIndexDelete {
-				if indexMutation.Kind != replication.MutationPutDigestEqual {
-					indexMutation.Kind = replication.MutationDeleteDigestEqual
-					indexMutation.Value = nil
-					indexMutation.ExpectedValueLength = uint64(len(locator))
-					indexMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(locator))
-				}
-			} else if index.kind != shardservice.MutationGlobalIndexPut {
-				return nil, true, ErrReplicatedSQLTransactionUnsupported
-			}
-			if (indexMutation.Kind == replication.MutationDeleteDigestEqual ||
-				indexMutation.Kind == replication.MutationPutDigestEqual) &&
-				indexMutation.ExpectedValueDigest == (replication.Digest{}) {
-				return nil, true, ErrReplicatedSQLTransactionUnsupported
-			}
-			indexParticipant, indexErr := appendReplicatedSQLMutation(
-				&builders, &byGroup, indexRoute, index.bucketBits, index.scope,
-				indexProfile.Relation, indexMutation,
+			mapper := distribution.NewNativeMapperWithBucketBits(
+				statement.bound.spec.Arity, statement.bound.spec.EffectiveBucketBits(),
 			)
-			if indexErr != nil {
-				return nil, true, indexErr
+			var tuple [1]distribution.Scalar
+			tuple[0] = scalar
+			point, pointErr := mapper.PointFor(tuple[:])
+			if pointErr != nil {
+				return nil, true, ErrReplicatedSQLTransactionUnsupported
+			}
+			target, targetOK := statement.bound.manifest.ResolvePointTarget(point)
+			if !targetOK {
+				return nil, true, ErrReplicatedSQLTransactionUnsupported
+			}
+			bits := statement.bound.spec.EffectiveBucketBits()
+			bucket, bucketOK := distribution.VirtualBucketForPoint(point, bits)
+			owner, ownerOK := statement.bound.manifest.ResolveVirtualBucket(bucket, bits)
+			if !bucketOK || !ownerOK || owner.Shard != target.Shard ||
+				owner.AllocationGeneration != target.AllocationGeneration {
+				return nil, true, ErrReplicatedSQLTransactionUnsupported
+			}
+
+			keyStart := len(keyArena)
+			keyArena = append(keyArena, key...)
+			ownedKey := keyArena[keyStart:len(keyArena):len(keyArena)]
+			var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
+			var replicaScratch [ServingReplicaCount]ReplicatedEndpoint
+			resolved, resolvedOK := snapshot.ResolveReplicatedTableKey(
+				byteview.Bytes(statement.bound.table), ownedKey,
+				scalarScratch[:0], replicaScratch[:0],
+			)
+			if !resolvedOK || resolved.Profile.Relation != statement.profile.Relation {
+				return nil, true, ErrReplicatedSQLTransactionUnsupported
+			}
+
+			baseMutation := replication.Mutation{Kind: kind, Key: ownedKey, Value: document}
+			if len(statement.prepared.writeGlobalIndexes) != 0 &&
+				(statement.bound.kind == sqlast.KindUpdate || statement.bound.kind == sqlast.KindDelete) {
+				oldDocument, readErr := readReplicatedSQLIndexedDocument(
+					data,
+					ctx, resolved.Route, statement.profile, ownedKey,
+				)
+				if readErr != nil {
+					return nil, true, readErr
+				}
+				captureRows := [][]shardservice.Cell{{
+					{Bytes: ownedKey}, {Bytes: oldDocument},
+				}}
+				if captureErr := statement.prepared.bindGlobalIndexCapture(
+					statement.bound, target, captureRows,
+				); captureErr != nil {
+					return nil, true, captureErr
+				}
+				baseMutation.ExpectedValueLength = uint64(len(oldDocument))
+				baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
+				if baseMutation.ExpectedValueDigest == (replication.Digest{}) {
+					return nil, true, ErrReplicatedSQLTransactionUnsupported
+				}
+				if kind == replication.MutationDelete {
+					baseMutation.Kind = replication.MutationDeleteDigestEqual
+				} else {
+					baseMutation.Kind = replication.MutationPutDigestEqual
+				}
+			}
+			participantIndex, appendErr := appendReplicatedSQLMutation(
+				&builders, &byGroup, resolved.Route, bits,
+				distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
+				statement.profile.Relation, baseMutation,
+			)
+			if appendErr != nil {
+				return nil, true, appendErr
 			}
 			if err := admitReplicatedSQLMutation(
-				profile, &mutationCount, &mutationBytes, indexMutation,
+				profile, &mutationCount, &mutationBytes, baseMutation,
 			); err != nil {
 				return nil, true, err
 			}
 			identities = append(identities, replicatedSQLMutationIdentity{
-				participant: indexParticipant, relation: indexProfile.Relation, key: entryKey,
+				participant: participantIndex, relation: statement.profile.Relation, key: ownedKey,
 			})
+
+			indexStart, indexEnd := replicatedSQLGlobalIndexRange(statement, inputOrdinal)
+			for indexOrdinal := indexStart; indexOrdinal < indexEnd; indexOrdinal++ {
+				index := &statement.bound.globalIndexes[indexOrdinal]
+				indexRoute, indexProfile, routeErr := snapshot.resolveReplicatedSQLGlobalIndex(index)
+				if routeErr != nil {
+					return nil, true, routeErr
+				}
+				entryKey := statement.bound.globalIndexArena[index.entryStart:index.entryEnd]
+				locator := statement.bound.globalIndexArena[index.valueStart:index.valueEnd]
+				indexMutation := replication.Mutation{
+					Kind: replication.MutationPutAbsentOrEqual, Key: entryKey, Value: locator,
+				}
+				if index.kind == shardservice.MutationGlobalIndexDelete &&
+					indexOrdinal+1 < indexEnd {
+					next := &statement.bound.globalIndexes[indexOrdinal+1]
+					nextKey := statement.bound.globalIndexArena[next.entryStart:next.entryEnd]
+					if sameReplicatedSQLGlobalIndexTarget(index, next) &&
+						next.kind == shardservice.MutationGlobalIndexPut &&
+						bytes.Equal(entryKey, nextKey) {
+						nextLocator := statement.bound.globalIndexArena[next.valueStart:next.valueEnd]
+						if len(nextLocator) == 0 || len(nextLocator) > int(indexProfile.MaxDocumentBytes) {
+							return nil, true, ErrTransactionByteLimit
+						}
+						indexMutation.Kind = replication.MutationPutDigestEqual
+						indexMutation.Value = nextLocator
+						indexMutation.ExpectedValueLength = uint64(len(locator))
+						indexMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(locator))
+						indexOrdinal++
+					}
+				}
+				if len(entryKey) == 0 || len(entryKey) > int(indexProfile.MaxKeyBytes) ||
+					len(locator) == 0 || len(locator) > int(indexProfile.MaxDocumentBytes) {
+					return nil, true, ErrTransactionByteLimit
+				}
+				if index.kind == shardservice.MutationGlobalIndexDelete {
+					if indexMutation.Kind != replication.MutationPutDigestEqual {
+						indexMutation.Kind = replication.MutationDeleteDigestEqual
+						indexMutation.Value = nil
+						indexMutation.ExpectedValueLength = uint64(len(locator))
+						indexMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(locator))
+					}
+				} else if index.kind != shardservice.MutationGlobalIndexPut {
+					return nil, true, ErrReplicatedSQLTransactionUnsupported
+				}
+				if (indexMutation.Kind == replication.MutationDeleteDigestEqual ||
+					indexMutation.Kind == replication.MutationPutDigestEqual) &&
+					indexMutation.ExpectedValueDigest == (replication.Digest{}) {
+					return nil, true, ErrReplicatedSQLTransactionUnsupported
+				}
+				indexParticipant, indexErr := appendReplicatedSQLMutation(
+					&builders, &byGroup, indexRoute, index.bucketBits, index.scope,
+					indexProfile.Relation, indexMutation,
+				)
+				if indexErr != nil {
+					return nil, true, indexErr
+				}
+				if err := admitReplicatedSQLMutation(
+					profile, &mutationCount, &mutationBytes, indexMutation,
+				); err != nil {
+					return nil, true, err
+				}
+				identities = append(identities, replicatedSQLMutationIdentity{
+					participant: indexParticipant, relation: indexProfile.Relation, key: entryKey,
+				})
+			}
 		}
 	}
 
@@ -375,37 +382,50 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	return participants, true, nil
 }
 
-func replicatedSQLMutationInput(
+func replicatedSQLMutationInputCount(
 	statement *replicatedSQLBoundStatement,
-) (distribution.Scalar, []byte, replication.MutationKind, error) {
+) (int, error) {
 	if statement == nil || statement.prepared == nil || statement.bound == nil ||
 		statement.profile.Relation == 0 {
-		return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+		return 0, ErrReplicatedSQLTransactionUnsupported
 	}
 	prepared, bound := statement.prepared, statement.bound
 	switch prepared.statement.Kind {
 	case sqlast.KindInsert:
 		insert := prepared.statement.Insert
 		if insert == nil || insert.Source != nil || insert.Returning != nil ||
-			insert.OnConflictDoNothing || len(insert.Columns) != 0 || len(insert.Rows) != 1 ||
-			len(bound.rowKeys) != 1 || len(bound.rowKeys[0]) != 1 ||
-			len(bound.insertDoc) == 0 {
-			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+			insert.OnConflictDoNothing || len(insert.Columns) != 0 || len(insert.Rows) == 0 ||
+			len(bound.rowKeys) != len(insert.Rows) ||
+			len(bound.globalIndexes) != len(insert.Rows)*len(prepared.writeGlobalIndexes) {
+			return 0, ErrReplicatedSQLTransactionUnsupported
 		}
-		return bound.rowKeys[0][0], bound.insertDoc, replication.MutationPutAbsent, nil
+		if len(insert.Rows) == 1 {
+			if len(bound.rowKeys[0]) != 1 || len(bound.insertDoc) == 0 {
+				return 0, ErrReplicatedSQLTransactionUnsupported
+			}
+		} else {
+			if len(bound.insertDocs) != len(insert.Rows) {
+				return 0, ErrReplicatedSQLTransactionUnsupported
+			}
+			for ordinal := range bound.rowKeys {
+				if len(bound.rowKeys[ordinal]) != 1 || len(bound.insertDocs[ordinal]) == 0 {
+					return 0, ErrReplicatedSQLTransactionUnsupported
+				}
+			}
+		}
+		return len(insert.Rows), nil
 	case sqlast.KindUpdate:
 		update := prepared.statement.Update
 		if update == nil || update.Returning != nil || len(update.OrderBy) != 0 ||
 			update.Limit != nil || !replicatedSQLExactPrimaryFilter(
 			update.Filter, statement.profile.PrimaryKey,
 		) || len(bound.updateDoc) == 0 {
-			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+			return 0, ErrReplicatedSQLTransactionUnsupported
 		}
-		scalar, ok := replicatedSQLExactConstraint(bound.constraints)
-		if !ok {
-			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+		if _, ok := replicatedSQLExactConstraint(bound.constraints); !ok {
+			return 0, ErrReplicatedSQLTransactionUnsupported
 		}
-		return scalar, bound.updateDoc, replication.MutationPutPresent, nil
+		return 1, nil
 	case sqlast.KindDelete:
 		deleteStatement := prepared.statement.Delete
 		if deleteStatement == nil || deleteStatement.Returning != nil ||
@@ -413,16 +433,73 @@ func replicatedSQLMutationInput(
 			deleteStatement.All || !replicatedSQLExactPrimaryFilter(
 			deleteStatement.Filter, statement.profile.PrimaryKey,
 		) {
+			return 0, ErrReplicatedSQLTransactionUnsupported
+		}
+		if _, ok := replicatedSQLExactConstraint(bound.constraints); !ok {
+			return 0, ErrReplicatedSQLTransactionUnsupported
+		}
+		return 1, nil
+	default:
+		return 0, ErrReplicatedSQLTransactionUnsupported
+	}
+}
+
+func replicatedSQLMutationInput(
+	statement *replicatedSQLBoundStatement,
+	ordinal int,
+) (distribution.Scalar, []byte, replication.MutationKind, error) {
+	if ordinal < 0 {
+		return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+	}
+	prepared, bound := statement.prepared, statement.bound
+	switch prepared.statement.Kind {
+	case sqlast.KindInsert:
+		if ordinal >= len(bound.rowKeys) || len(bound.rowKeys[ordinal]) != 1 {
 			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
 		}
+		document := bound.insertDoc
+		if len(bound.rowKeys) > 1 {
+			if ordinal >= len(bound.insertDocs) {
+				return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+			}
+			document = bound.insertDocs[ordinal]
+		}
+		return bound.rowKeys[ordinal][0], document, replication.MutationPutAbsent, nil
+	case sqlast.KindUpdate:
 		scalar, ok := replicatedSQLExactConstraint(bound.constraints)
-		if !ok {
+		if !ok || ordinal != 0 {
+			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+		}
+		return scalar, bound.updateDoc, replication.MutationPutPresent, nil
+	case sqlast.KindDelete:
+		scalar, ok := replicatedSQLExactConstraint(bound.constraints)
+		if !ok || ordinal != 0 {
 			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
 		}
 		return scalar, nil, replication.MutationDelete, nil
 	default:
 		return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
 	}
+}
+
+// replicatedSQLGlobalIndexRange selects only the index mutations derived from
+// one VALUES row. bindGlobalIndexInserts records a dense row-major vector, so
+// this is constant-time and does not allocate. UPDATE/DELETE capture appends a
+// single statement-wide vector and therefore keeps the full range.
+func replicatedSQLGlobalIndexRange(
+	statement *replicatedSQLBoundStatement,
+	ordinal int,
+) (int, int) {
+	if statement == nil || statement.bound == nil || statement.prepared == nil ||
+		statement.bound.kind != sqlast.KindInsert {
+		if statement == nil || statement.bound == nil {
+			return 0, 0
+		}
+		return 0, len(statement.bound.globalIndexes)
+	}
+	perRow := len(statement.prepared.writeGlobalIndexes)
+	start := ordinal * perRow
+	return start, start + perRow
 }
 
 func sameReplicatedSQLGlobalIndexTarget(

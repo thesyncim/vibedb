@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -210,17 +211,17 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 			want: ErrReplicatedSQLTransactionUnsupported,
 		},
 		{
-			name: "multi row insert",
+			name: "duplicate rows within multi row insert",
 			queries: []Query{
 				{SQL: `INSERT INTO messages VALUES (?),(?)`, Params: []shardservice.Param{
 					shardservice.DocumentParam(`{"id":"message-1"}`),
-					shardservice.DocumentParam(`{"id":"message-2"}`),
+					shardservice.DocumentParam(`{"id":"message-1"}`),
 				}},
 				{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
 					shardservice.StringParam("log-1"),
 				}},
 			},
-			want: ErrReplicatedSQLTransactionUnsupported,
+			want: ErrReplicatedSQLTransactionDuplicate,
 		},
 		{
 			name: "returning",
@@ -244,6 +245,172 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 				t.Fatalf("plan = %d handled %v err %v, want %v", len(participants), handled, err, test.want)
 			}
 		})
+	}
+}
+
+func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
+	documents := [][]byte{
+		[]byte(`{"id":"` + keys[0] + `","n":1}`),
+		[]byte(`{"id":"` + keys[1] + `","n":2}`),
+	}
+	participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, []Query{{
+			SQL: `INSERT INTO messages VALUES (?),(?)`,
+			Params: []shardservice.Param{
+				shardservice.DocumentBytesParam(documents[0]),
+				shardservice.DocumentBytesParam(documents[1]),
+			},
+		}}, executor.profileFor(ClassInteractive),
+	)
+	if err != nil || !handled {
+		t.Fatalf("plan handled=%v err=%v", handled, err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
+	}
+	seen := make(map[string][]byte, len(documents))
+	borrowed := make(map[string]bool, len(documents))
+	for participantIndex := range participants {
+		participant := &participants[participantIndex]
+		if len(participant.IntentScopes) != 1 {
+			t.Fatalf("participant %d intent scopes=%v want one exact bucket", participantIndex, participant.IntentScopes)
+		}
+		for batchIndex := range participant.Batches {
+			batch := &participant.Batches[batchIndex]
+			if batch.Relation != 1 {
+				t.Fatalf("participant %d relation=%d want messages relation 1", participantIndex, batch.Relation)
+			}
+			for mutationIndex := range batch.Mutations {
+				mutation := &batch.Mutations[mutationIndex]
+				if mutation.Kind != replication.MutationPutAbsent {
+					t.Fatalf("mutation kind=%d want put-absent", mutation.Kind)
+				}
+				seen[string(mutation.Value)] = mutation.Key
+				for _, document := range documents {
+					if bytes.Equal(mutation.Value, document) {
+						borrowed[string(document)] = &mutation.Value[0] == &document[0]
+					}
+				}
+			}
+		}
+	}
+	for _, document := range documents {
+		if len(seen[string(document)]) == 0 {
+			t.Fatalf("document %s was not lowered", document)
+		}
+		if !borrowed[string(document)] {
+			t.Fatalf("document %s was copied during byte-native lowering", document)
+		}
+	}
+}
+
+func replicatedSQLSplitTransactionFixture(
+	t testing.TB,
+) (*Snapshot, *Executor, [2]string) {
+	t.Helper()
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	cut := point(0x80)
+	manifest, err := distribution.NewManifest("data", 4, []distribution.Shard{
+		{ID: "left", AllocationGeneration: 1,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Point: cut}},
+			Leaders: []distribution.EndpointID{"peer-a", "peer-b", "peer-c"}, Epoch: 7},
+		{ID: "right", AllocationGeneration: 2,
+			Range:   distribution.KeyRange{Start: cut, End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: []distribution.EndpointID{"right-a", "right-b", "right-c"}, Epoch: 7},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Manifests = []*distribution.Manifest{manifest}
+	descriptor.Shard = "left"
+	descriptor.Command.RoutingVersion = 4
+	descriptor.RangeIdentity[0]++
+	left := descriptor
+	right := descriptor
+	right.Replicas = append([]ReplicatedReplicaDescriptor(nil), descriptor.Replicas...)
+	right.Shard = "right"
+	right.AllocationGeneration = 2
+	right.Group.ShardIncarnation[0]++
+	right.Group.GroupID[0]++
+	right.RangeIdentity[0]++
+	right.LineageDigest[0]++
+	right.ForwardingRuleDigest[0]++
+	for ordinal := range right.Replicas {
+		letter := string(rune('a' + ordinal))
+		right.Replicas[ordinal].Endpoint = distribution.EndpointID("right-" + letter)
+		right.Replicas[ordinal].NativeEndpoint = distribution.EndpointID("right-native-" + letter)
+		right.Replicas[ordinal].ControlEndpoint = distribution.EndpointID("right-control-" + letter)
+		endpoints[right.Replicas[ordinal].Endpoint] = "127.0.0.1:" + string(rune('1'+ordinal)) + "401"
+		endpoints[right.Replicas[ordinal].NativeEndpoint] = "127.0.0.1:" + string(rune('1'+ordinal)) + "411"
+		endpoints[right.Replicas[ordinal].ControlEndpoint] = "127.0.0.1:" + string(rune('1'+ordinal)) + "421"
+	}
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 7, nil, nil, []ReplicatedShardDescriptor{left, right},
+		[]ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapper := distribution.NewNativeMapper(1)
+	var keys [2]string
+	for candidate := 0; candidate < 10_000 && (keys[0] == "" || keys[1] == ""); candidate++ {
+		key := fmt.Sprintf("multi-row-%d", candidate)
+		point, pointErr := mapper.PointFor([]distribution.Scalar{distribution.NewString(key)})
+		if pointErr != nil {
+			t.Fatal(pointErr)
+		}
+		ordinal := 0
+		if bytes.Compare(point[:], cut[:]) >= 0 {
+			ordinal = 1
+		}
+		if keys[ordinal] == "" {
+			keys[ordinal] = key
+		}
+	}
+	if keys[0] == "" || keys[1] == "" {
+		t.Fatal("could not find keys on both sides of split")
+	}
+	return snapshot, NewExecutor(nil, NewCatalogHolder(snapshot), Options{}), keys
+}
+
+func TestReplicatedSQLTransactionMultiRowInsertMaintainsGlobalIndexAtomically(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
+	participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, []Query{{
+			SQL: `INSERT INTO messages VALUES (?),(?)`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(`{"id":"message-1","email":"one@example.test"}`),
+				shardservice.DocumentParam(`{"id":"message-2","email":"two@example.test"}`),
+			},
+		}}, executor.profileFor(ClassInteractive),
+	)
+	if err != nil || !handled {
+		t.Fatalf("plan handled=%v err=%v", handled, err)
+	}
+	baseMutations, indexMutations := 0, 0
+	locators := make(map[string]bool, 2)
+	for participantIndex := range participants {
+		participant := &participants[participantIndex]
+		for batchIndex := range participant.Batches {
+			batch := &participant.Batches[batchIndex]
+			if participant.Route.Distribution == "messages-email" {
+				for mutationIndex := range batch.Mutations {
+					mutation := &batch.Mutations[mutationIndex]
+					if mutation.Kind != replication.MutationPutAbsentOrEqual {
+						t.Fatalf("index mutation kind=%d", mutation.Kind)
+					}
+					locators[string(mutation.Value)] = true
+					indexMutations++
+				}
+			} else if participant.Route.Distribution == "data" && batch.Relation == 2 {
+				baseMutations += len(batch.Mutations)
+			}
+		}
+	}
+	if baseMutations != 2 || indexMutations != 2 ||
+		!locators[`["message-1"]`] || !locators[`["message-2"]`] {
+		t.Fatalf("base=%d index=%d locators=%v", baseMutations, indexMutations, locators)
 	}
 }
 
