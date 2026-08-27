@@ -85,6 +85,12 @@ func (d *GenerationMigrationRetirementDriver) Step() (bool, error) {
 			ordinal = 1
 		}
 		complete = true
+	case GenerationMigrationRetireScratch:
+		if m.TargetScratchBytes != 0 && m.RetirementOrdinal == 0 {
+			extents = append(extents, FreeExtent{Offset: m.TargetScratchOffset, Length: m.TargetScratchBytes, RetiredGeneration: m.TargetGeneration})
+			ordinal = 1
+		}
+		complete = true
 	default:
 		return false, ErrGenerationMigrationManifestCorrupt
 	}

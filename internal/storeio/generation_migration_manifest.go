@@ -9,7 +9,7 @@ import (
 
 const (
 	GenerationMigrationManifestBytes = 4096
-	generationMigrationHeaderBytes   = 352
+	generationMigrationHeaderBytes   = 368
 	generationMigrationTrailerAt     = GenerationMigrationManifestBytes - 8
 	generationMigrationMagic         = "SGMIGR00"
 )
@@ -32,6 +32,7 @@ const (
 	GenerationMigrationRetirePrimary
 	GenerationMigrationRetireExact
 	GenerationMigrationRetireCatalog
+	GenerationMigrationRetireScratch
 	GenerationMigrationRetireDone
 )
 
@@ -56,6 +57,7 @@ type GenerationMigrationManifest struct {
 	TargetPrimaryRoot, TargetExactIndexRoot, TargetCatalogHead PageRef
 	SourceCatalogBytes, SourceIndexCount                       uint32
 	ManifestSequence, RetirementOrdinal                        uint64
+	TargetScratchOffset, TargetScratchBytes                    uint64
 	RetirementPhase                                            GenerationMigrationRetirementPhase
 	Cursor                                                     []byte
 }
@@ -88,6 +90,10 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 		(m.SourceIndexCount == 0) != (m.SourceExactIndexRoot == (PageRef{})) ||
 		m.RetirementPhase > GenerationMigrationRetireDone ||
 		(m.RetirementPhase != GenerationMigrationRetireNone && m.Phase != GenerationMigrationPublished) ||
+		(m.TargetScratchOffset == 0) != (m.TargetScratchBytes == 0) ||
+		m.TargetScratchOffset&4095 != 0 || m.TargetScratchBytes&4095 != 0 ||
+		m.TargetScratchOffset > ^uint64(0)-m.TargetScratchBytes ||
+		(m.TargetScratchBytes != 0 && (m.TargetScratchOffset < m.ReservedOffset || m.TargetScratchOffset+m.TargetScratchBytes > m.ReservedOffset+m.ReservedBytes)) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration {
 		return nil, fmt.Errorf("%w: fields", ErrInvalidWrite)
@@ -121,6 +127,8 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 	image[332] = byte(m.RetirementPhase)
 	binary.LittleEndian.PutUint64(image[336:344], m.ManifestSequence)
 	binary.LittleEndian.PutUint64(image[344:352], m.RetirementOrdinal)
+	binary.LittleEndian.PutUint64(image[352:360], m.TargetScratchOffset)
+	binary.LittleEndian.PutUint64(image[360:368], m.TargetScratchBytes)
 	copy(image[generationMigrationHeaderBytes:], m.Cursor)
 	checksum := PageChecksum(image[:generationMigrationTrailerAt])
 	binary.LittleEndian.PutUint32(image[generationMigrationTrailerAt:], checksum)
@@ -164,6 +172,8 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.RetirementPhase = GenerationMigrationRetirementPhase(src[332])
 	m.ManifestSequence = binary.LittleEndian.Uint64(src[336:344])
 	m.RetirementOrdinal = binary.LittleEndian.Uint64(src[344:352])
+	m.TargetScratchOffset = binary.LittleEndian.Uint64(src[352:360])
+	m.TargetScratchBytes = binary.LittleEndian.Uint64(src[360:368])
 	cursorBytes := int(binary.LittleEndian.Uint32(src[320:324]))
 	if m.StoreID == ([16]byte{}) || m.MigrationID == ([16]byte{}) ||
 		m.Phase < GenerationMigrationCopying || m.Phase > GenerationMigrationPublished ||
@@ -182,6 +192,10 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 		(m.SourceIndexCount == 0) != (m.SourceExactIndexRoot == (PageRef{})) ||
 		m.RetirementPhase > GenerationMigrationRetireDone ||
 		(m.RetirementPhase != GenerationMigrationRetireNone && m.Phase != GenerationMigrationPublished) ||
+		(m.TargetScratchOffset == 0) != (m.TargetScratchBytes == 0) ||
+		m.TargetScratchOffset&4095 != 0 || m.TargetScratchBytes&4095 != 0 ||
+		m.TargetScratchOffset > ^uint64(0)-m.TargetScratchBytes ||
+		(m.TargetScratchBytes != 0 && (m.TargetScratchOffset < m.ReservedOffset || m.TargetScratchOffset+m.TargetScratchBytes > m.ReservedOffset+m.ReservedBytes)) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration ||
 		!allZero(src[333:336]) ||
@@ -215,6 +229,7 @@ func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManife
 		(previous.ManifestSequence != 0 && next.ManifestSequence <= previous.ManifestSequence) ||
 		next.RetirementPhase < previous.RetirementPhase ||
 		(next.RetirementPhase == previous.RetirementPhase && next.RetirementOrdinal < previous.RetirementOrdinal) ||
+		(previous.TargetScratchBytes != 0 && (next.TargetScratchOffset != previous.TargetScratchOffset || next.TargetScratchBytes != previous.TargetScratchBytes)) ||
 		previous.TargetPrimaryRoot != (PageRef{}) && next.TargetPrimaryRoot != previous.TargetPrimaryRoot ||
 		previous.TargetExactIndexRoot != (PageRef{}) && next.TargetExactIndexRoot != previous.TargetExactIndexRoot ||
 		previous.TargetCatalogHead != (PageRef{}) && next.TargetCatalogHead != previous.TargetCatalogHead ||
