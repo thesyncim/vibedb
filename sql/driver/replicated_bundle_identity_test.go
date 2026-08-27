@@ -139,6 +139,70 @@ func TestBindReplicatedShardStoreBundleIdentityExactRetryAndReopen(t *testing.T)
 	}
 }
 
+func TestBindReplicatedShardStoreBundleIdentitySingleton(t *testing.T) {
+	for _, mismatch := range []bool{true, false} {
+		name := "exact"
+		if mismatch {
+			name = "foreign_local_index"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, _, template, _ := prepareReservedReplicatedBundle(t)
+			path, db, binding, local := prepareReplicatedTestRoot(t, "exact-singleton", false)
+			defer db.Close()
+			session, err := db.NewSession(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := testRuntimeExec(session, `CREATE INDEX by_email ON docs (email)`, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := session.Close(); err != nil {
+				t.Fatal(err)
+			}
+			expected := ownedReplicatedShardStoreIdentity(template)
+			expected.Binding, expected.LogID = binding, local.LogID
+			expected.RelationCount = 1
+			expected.Relations = expected.Relations[:1]
+			if mismatch {
+				expected.Relations[0].LocalIndexDigest[0] ^= 1
+			}
+			expected.RelationManifestDigest = replicatedRelationManifestDigest(expected)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := db.BindReplicatedShardStoreBundleIdentity(expected, nil)
+			if mismatch {
+				if !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+					t.Fatalf("foreign local index = %v", err)
+				}
+				assertReservedBundleUnchanged(t, db, path, before, nil)
+				return
+			}
+			skipReplicatedStrictAllocationUnsupported(t, db, got, err)
+			if err != nil || !got.Equal(expected) {
+				t.Fatalf("exact singleton = %+v, %v", got, err)
+			}
+			got, err = db.BindReplicatedShardStoreBundleIdentity(expected, nil)
+			if err != nil || !got.Equal(expected) {
+				t.Fatalf("singleton retry = %+v, %v", got, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenReplicatedShardStore(path, expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			got, err = reopened.BindReplicatedShardStoreBundleIdentity(expected, nil)
+			if err != nil || !got.Equal(expected) {
+				t.Fatalf("singleton reopened retry = %+v, %v", got, err)
+			}
+		})
+	}
+}
+
 func TestBindReplicatedShardStoreBundleIdentityRejectsBeforeMaterialization(t *testing.T) {
 	tests := []struct {
 		name   string

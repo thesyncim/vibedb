@@ -302,6 +302,8 @@ func (d *Database) BindReplicatedShardStoreBundle(
 // BindReplicatedShardStoreBundleIdentity provisions a complete bundle using the
 // retained identity of every relation. The identity and catalog schema must
 // agree before any storage is created; an exact retry settles the same binding.
+// An empty globalIndexes list provisions the base relation alone, including its
+// exact local-index manifest.
 func (d *Database) BindReplicatedShardStoreBundleIdentity(
 	expected ReplicatedShardStoreIdentity,
 	globalIndexes []ReplicatedGlobalIndexRelation,
@@ -340,7 +342,7 @@ func (d *Database) bindReplicatedShardStoreBundleExact(
 	if err := validateReplicatedBundleRelationName(userTable); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if len(globalIndexes) == 0 || len(globalIndexes)+1 > replication.MaxRelationsPerBundle {
+	if (len(globalIndexes) == 0 && expected == nil) || len(globalIndexes)+1 > replication.MaxRelationsPerBundle {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 			"%w: global relation count", ErrReplicatedShardStoreProfile,
 		)
