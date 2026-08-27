@@ -43,10 +43,6 @@ var (
 	replicatedCatalogGenesisDocumentID = [...]byte{
 		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'g', 'e', 'n', 'e', 's', 'i', 's',
 	}
-	replicatedReplicaReplacementReceiptDocumentID = [...]byte{
-		'c', 'a', 't', 'a', 'l', 'o', 'g', '/',
-		'r', 'e', 'p', 'l', 'a', 'c', 'e', 'm', 'e', 'n', 't',
-	}
 	replicatedOperationDirectoryDocumentID = [...]byte{
 		'o', 'p', 'e', 'r', 'a', 't', 'i', 'o', 'n', '/',
 		'd', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y',

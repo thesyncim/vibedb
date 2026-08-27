@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -22,6 +23,8 @@ const (
 	replicatedReplicaReplacementReceiptKeyByte     = byte(5)
 	replicatedReplicaReplacementReceiptPageKeyByte = byte(6)
 	replicatedMembershipGrantPages                 = 64
+	membershipLifecycleRecordIDBytes               = len("member/00/") + sha256.Size*2
+	membershipLifecyclePageIDBytes                 = len("member/00/") + 2
 	maxReplicatedMembershipGrantsPerPage           = 64
 	// The distributed quota is explicit without a global counter/CAS hot spot.
 	// Each independently updated page rejects its 65th collision, so retained
@@ -222,7 +225,7 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 	}
 	var groups []raftmember.GroupKey
 	if page.Found {
-		groups, err = openReplicatedMembershipGrantPage(pageKey[1], page.Value)
+		groups, err = openReplicatedMembershipGrantPage(pageKey.bucket(), page.Value)
 		if err != nil {
 			return err
 		}
@@ -249,7 +252,7 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 		return err
 	}
 	authority.scratch = authority.scratch[:0]
-	authority.scratch, err = appendReplicatedMembershipGrantPage(authority.scratch, pageKey[1], groups)
+	authority.scratch, err = appendReplicatedMembershipGrantPage(authority.scratch, pageKey.bucket(), groups)
 	if err != nil {
 		return err
 	}
@@ -649,7 +652,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	if !page.Found {
 		return ErrReplicatedCatalogConflict
 	}
-	groups, err := openReplicatedMembershipGrantPage(pageKey[1], page.Value)
+	groups, err := openReplicatedMembershipGrantPage(pageKey.bucket(), page.Value)
 	if err != nil {
 		return err
 	}
@@ -673,7 +676,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	var receiptGroups []raftmember.GroupKey
 	if receiptPage.Found {
 		receiptGroups, err = openReplicaReplacementReceiptPage(
-			receiptPageKey[1], receiptPage.Value,
+			receiptPageKey.bucket(), receiptPage.Value,
 		)
 		if err != nil {
 			return err
@@ -752,7 +755,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
 			Key: receiptKey[:], Value: receipt})
 		receiptPageBytes, pageErr := appendReplicaReplacementReceiptPage(
-			nil, receiptPageKey[1], receiptGroups,
+			nil, receiptPageKey.bucket(), receiptGroups,
 		)
 		if pageErr != nil {
 			return pageErr
@@ -995,7 +998,7 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 	if !page.Found {
 		return ErrReplicatedCatalogConflict
 	}
-	groups, err := openReplicatedMembershipGrantPage(pageKey[1], page.Value)
+	groups, err := openReplicatedMembershipGrantPage(pageKey.bucket(), page.Value)
 	if err != nil {
 		return err
 	}
@@ -1024,7 +1027,7 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 			Key: pageKey[:], ExpectedValueLength: uint64(len(page.Value)),
 			ExpectedValueDigest: replication.Digest(pageDigest)})
 	} else {
-		pageBytes, pageErr := appendReplicatedMembershipGrantPage(nil, pageKey[1], groups)
+		pageBytes, pageErr := appendReplicatedMembershipGrantPage(nil, pageKey.bucket(), groups)
 		if pageErr != nil {
 			return pageErr
 		}
@@ -1064,20 +1067,20 @@ func appendReplicatedMembershipGrant(dst []byte,
 	if err != nil {
 		return dst, err
 	}
-	start := len(dst)
-	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst)-start == 0 || len(dst)-start > maxReplicatedMembershipGrantBytes {
-		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
-	}
-	return dst, nil
+	id := membershipLifecycleRecordID(grant.Group, replicatedMembershipGrantKeyByte)
+	return appendControlPlaneDocument(dst, id[:], raw, maxReplicatedMembershipGrantBytes)
 }
 
 func openReplicatedMembershipGrant(raw []byte) (membershipgrant.Grant, error) {
 	if len(raw) == 0 || len(raw) > maxReplicatedMembershipGrantBytes {
 		return membershipgrant.Grant{}, ErrReplicatedCatalog
 	}
+	_, payload, ok := openFixedControlPlaneDocument(raw, membershipLifecycleRecordIDBytes)
+	if !ok {
+		return membershipgrant.Grant{}, ErrReplicatedCatalog
+	}
 	var persisted persistedMembershipGrant
-	if err := vibejson.Unmarshal(raw, &persisted); err != nil {
+	if err := vibejson.Unmarshal(payload, &persisted); err != nil {
 		return membershipgrant.Grant{}, errors.Join(err, ErrReplicatedCatalog)
 	}
 	grant := openPersistedMembershipGrant(persisted)
@@ -1126,20 +1129,17 @@ func appendReplicaReplacementReceiptRecord(dst []byte,
 	if err != nil {
 		return dst, err
 	}
-	return appendControlPlaneDocument(dst,
-		replicatedReplicaReplacementReceiptDocumentID[:], payload,
-		maxReplicatedReplicaReplacementReceiptBytes)
+	id := membershipLifecycleRecordID(receipt.Grant.Group, replicatedReplicaReplacementReceiptKeyByte)
+	return appendControlPlaneDocument(dst, id[:], payload, maxReplicatedReplicaReplacementReceiptBytes)
 }
 
 func openReplicaReplacementReceipt(raw []byte) (replicaReplacementReceipt, error) {
-	payload, err := openTypedControlPlaneDocument(raw,
-		replicatedReplicaReplacementReceiptDocumentID[:],
-		maxReplicatedReplicaReplacementReceiptBytes)
-	if err != nil {
-		return replicaReplacementReceipt{}, err
+	_, payload, ok := openFixedControlPlaneDocument(raw, membershipLifecycleRecordIDBytes)
+	if !ok || len(raw) > maxReplicatedReplicaReplacementReceiptBytes {
+		return replicaReplacementReceipt{}, ErrReplicatedCatalog
 	}
 	var persisted persistedReplicaReplacementReceipt
-	if err = vibejson.Unmarshal(payload, &persisted); err != nil {
+	if err := vibejson.Unmarshal(payload, &persisted); err != nil {
 		return replicaReplacementReceipt{}, errors.Join(err, ErrReplicatedCatalog)
 	}
 	receipt := replicaReplacementReceipt{
@@ -1213,7 +1213,7 @@ func appendReplicatedMembershipGrantPage(dst []byte, pageIndex byte,
 	}
 	for index := range groups {
 		_, pageKey := replicatedMembershipGrantKeys(groups[index])
-		if !validMembershipGrantGroup(groups[index]) || pageKey[1] != pageIndex || index != 0 &&
+		if !validMembershipGrantGroup(groups[index]) || pageKey.bucket() != pageIndex || index != 0 &&
 			compareMembershipGrantGroup(groups[index-1], groups[index]) >= 0 {
 			return dst, ErrReplicatedCatalog
 		}
@@ -1223,13 +1223,8 @@ func appendReplicatedMembershipGrantPage(dst []byte, pageIndex byte,
 	if err != nil {
 		return dst, err
 	}
-	start := len(dst)
-	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst)-start == 0 ||
-		len(dst)-start > maxReplicatedMembershipGrantPageBytes {
-		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
-	}
-	return dst, nil
+	id := membershipLifecyclePageID(replicatedMembershipGrantPageKeyByte, pageIndex)
+	return appendControlPlaneDocument(dst, id[:], raw, maxReplicatedMembershipGrantPageBytes)
 }
 
 func openReplicatedMembershipGrantPage(pageIndex byte, raw []byte) ([]raftmember.GroupKey, error) {
@@ -1237,8 +1232,13 @@ func openReplicatedMembershipGrantPage(pageIndex byte, raw []byte) ([]raftmember
 		len(raw) > maxReplicatedMembershipGrantPageBytes {
 		return nil, ErrReplicatedCatalog
 	}
+	id := membershipLifecyclePageID(replicatedMembershipGrantPageKeyByte, pageIndex)
+	payload, err := openTypedControlPlaneDocument(raw, id[:], maxReplicatedMembershipGrantPageBytes)
+	if err != nil {
+		return nil, err
+	}
 	var page persistedMembershipGrantPage
-	if err := vibejson.Unmarshal(raw, &page); err != nil ||
+	if err := vibejson.Unmarshal(payload, &page); err != nil ||
 		len(page.Groups) > maxReplicatedMembershipGrantsPerPage {
 		return nil, errors.Join(err, ErrReplicatedCatalog)
 	}
@@ -1246,7 +1246,7 @@ func openReplicatedMembershipGrantPage(pageIndex byte, raw []byte) ([]raftmember
 	for index := range page.Groups {
 		groups[index] = openPersistedMembershipGrantGroup(page.Groups[index])
 		_, pageKey := replicatedMembershipGrantKeys(groups[index])
-		if !validMembershipGrantGroup(groups[index]) || pageKey[1] != pageIndex || index != 0 &&
+		if !validMembershipGrantGroup(groups[index]) || pageKey.bucket() != pageIndex || index != 0 &&
 			compareMembershipGrantGroup(groups[index-1], groups[index]) >= 0 {
 			return nil, ErrReplicatedCatalog
 		}
@@ -1269,7 +1269,7 @@ func appendReplicaReplacementReceiptPage(dst []byte, pageIndex byte,
 	}
 	for index := range groups {
 		_, pageKey := replicatedReplicaReplacementReceiptKeys(groups[index])
-		if !validMembershipGrantGroup(groups[index]) || pageKey[1] != pageIndex || index != 0 &&
+		if !validMembershipGrantGroup(groups[index]) || pageKey.bucket() != pageIndex || index != 0 &&
 			compareMembershipGrantGroup(groups[index-1], groups[index]) >= 0 {
 			return dst, ErrReplicatedCatalog
 		}
@@ -1279,13 +1279,8 @@ func appendReplicaReplacementReceiptPage(dst []byte, pageIndex byte,
 	if err != nil {
 		return dst, err
 	}
-	start := len(dst)
-	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst)-start == 0 ||
-		len(dst)-start > maxReplicatedMembershipGrantPageBytes {
-		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
-	}
-	return dst, nil
+	id := membershipLifecyclePageID(replicatedReplicaReplacementReceiptPageKeyByte, pageIndex)
+	return appendControlPlaneDocument(dst, id[:], raw, maxReplicatedMembershipGrantPageBytes)
 }
 
 func openReplicaReplacementReceiptPage(pageIndex byte, raw []byte) ([]raftmember.GroupKey, error) {
@@ -1293,8 +1288,13 @@ func openReplicaReplacementReceiptPage(pageIndex byte, raw []byte) ([]raftmember
 		len(raw) > maxReplicatedMembershipGrantPageBytes {
 		return nil, ErrReplicatedCatalog
 	}
+	id := membershipLifecyclePageID(replicatedReplicaReplacementReceiptPageKeyByte, pageIndex)
+	payload, err := openTypedControlPlaneDocument(raw, id[:], maxReplicatedMembershipGrantPageBytes)
+	if err != nil {
+		return nil, err
+	}
 	var page persistedMembershipGrantPage
-	if err := vibejson.Unmarshal(raw, &page); err != nil ||
+	if err := vibejson.Unmarshal(payload, &page); err != nil ||
 		len(page.Groups) > maxReplicatedMembershipGrantsPerPage {
 		return nil, errors.Join(err, ErrReplicatedCatalog)
 	}
@@ -1302,7 +1302,7 @@ func openReplicaReplacementReceiptPage(pageIndex byte, raw []byte) ([]raftmember
 	for index := range page.Groups {
 		groups[index] = openPersistedMembershipGrantGroup(page.Groups[index])
 		_, pageKey := replicatedReplicaReplacementReceiptKeys(groups[index])
-		if !validMembershipGrantGroup(groups[index]) || pageKey[1] != pageIndex || index != 0 &&
+		if !validMembershipGrantGroup(groups[index]) || pageKey.bucket() != pageIndex || index != 0 &&
 			compareMembershipGrantGroup(groups[index-1], groups[index]) >= 0 {
 			return nil, ErrReplicatedCatalog
 		}
@@ -1322,13 +1322,16 @@ func findReplicatedMembershipGrantGroup(groups []raftmember.GroupKey,
 	return index, index < len(groups) && groups[index] == group
 }
 
-func replicatedMembershipGrantKeys(group raftmember.GroupKey) ([33]byte, [2]byte) {
+type replicatedMembershipRecordKey [membershipLifecycleRecordIDBytes + 3]byte
+type replicatedMembershipPageKey [membershipLifecyclePageIDBytes + 3]byte
+
+func replicatedMembershipGrantKeys(group raftmember.GroupKey) (replicatedMembershipRecordKey, replicatedMembershipPageKey) {
 	return replicatedMembershipLifecycleKeys(
 		group, replicatedMembershipGrantKeyByte, replicatedMembershipGrantPageKeyByte,
 	)
 }
 
-func replicatedReplicaReplacementReceiptKeys(group raftmember.GroupKey) ([33]byte, [2]byte) {
+func replicatedReplicaReplacementReceiptKeys(group raftmember.GroupKey) (replicatedMembershipRecordKey, replicatedMembershipPageKey) {
 	return replicatedMembershipLifecycleKeys(
 		group, replicatedReplicaReplacementReceiptKeyByte,
 		replicatedReplicaReplacementReceiptPageKeyByte,
@@ -1336,7 +1339,24 @@ func replicatedReplicaReplacementReceiptKeys(group raftmember.GroupKey) ([33]byt
 }
 
 func replicatedMembershipLifecycleKeys(group raftmember.GroupKey,
-	recordKind, pageKind byte) ([33]byte, [2]byte) {
+	recordKind, pageKind byte) (replicatedMembershipRecordKey, replicatedMembershipPageKey) {
+	digest := membershipLifecycleGroupDigest(group)
+	var recordID [membershipLifecycleRecordIDBytes]byte
+	appendMembershipLifecycleID(recordID[:0], recordKind, digest[:])
+	pageID := membershipLifecyclePageID(pageKind, digest[0]&(replicatedMembershipGrantPages-1))
+	var record replicatedMembershipRecordKey
+	var page replicatedMembershipPageKey
+	recordKey, recordOK := orderedkey.AppendString(record[:0], recordID[:], orderedkey.Ascending)
+	pageKey, pageOK := orderedkey.AppendString(page[:0], pageID[:], orderedkey.Ascending)
+	if !recordOK || !pageOK || len(recordKey) != len(record) || len(pageKey) != len(page) {
+		panic("gateway: invalid membership lifecycle primary key")
+	}
+	return record, page
+}
+
+// The group digest and bucket are unchanged; only their representation is
+// mapped into the catalog SQL table's canonical ordered /id namespace.
+func membershipLifecycleGroupDigest(group raftmember.GroupKey) [sha256.Size]byte {
 	var input [96]byte
 	offset := copy(input[:], []byte("vibedb/membership-grant\x00"))
 	offset += copy(input[offset:], group.ClusterID[:])
@@ -1345,13 +1365,39 @@ func replicatedMembershipLifecycleKeys(group raftmember.GroupKey,
 	offset += 8
 	offset += copy(input[offset:], group.ShardIncarnation[:])
 	offset += copy(input[offset:], group.GroupID[:])
-	digest := sha256.Sum256(input[:offset])
-	var record [33]byte
-	record[0] = recordKind
-	copy(record[1:], digest[:])
-	page := [2]byte{pageKind,
-		digest[0] & (replicatedMembershipGrantPages - 1)}
-	return record, page
+	return sha256.Sum256(input[:offset])
+}
+
+func membershipLifecycleRecordID(group raftmember.GroupKey, kind byte) [membershipLifecycleRecordIDBytes]byte {
+	digest := membershipLifecycleGroupDigest(group)
+	var id [membershipLifecycleRecordIDBytes]byte
+	appendMembershipLifecycleID(id[:0], kind, digest[:])
+	return id
+}
+
+func membershipLifecyclePageID(kind, bucket byte) [membershipLifecyclePageIDBytes]byte {
+	var id [membershipLifecyclePageIDBytes]byte
+	appendMembershipLifecycleID(id[:0], kind, []byte{bucket})
+	return id
+}
+
+func appendMembershipLifecycleID(dst []byte, kind byte, identity []byte) []byte {
+	dst = append(dst, 'm', 'e', 'm', 'b', 'e', 'r', '/', lowerHex[kind>>4], lowerHex[kind&15], '/')
+	for _, value := range identity {
+		dst = append(dst, lowerHex[value>>4], lowerHex[value&15])
+	}
+	return dst
+}
+
+func (key replicatedMembershipPageKey) bucket() byte {
+	// Keys are privately constructed above; ASCII identifiers never require
+	// ordered-key escaping. Decode only their last two identifier digits.
+	high, highOK := lowerHexNibble(key[len(key)-4])
+	low, lowOK := lowerHexNibble(key[len(key)-3])
+	if !highOK || !lowOK || high<<4|low >= replicatedMembershipGrantPages {
+		panic("gateway: invalid membership lifecycle bucket key")
+	}
+	return high<<4 | low
 }
 
 func compareMembershipGrantGroup(left, right raftmember.GroupKey) int {

@@ -564,7 +564,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	sort.Slice(groups, func(left, right int) bool {
 		return compareMembershipGrantGroup(groups[left], groups[right]) < 0
 	})
-	pageBytes, err := appendReplicatedMembershipGrantPage(nil, pageKey[1], groups)
+	pageBytes, err := appendReplicatedMembershipGrantPage(nil, pageKey.bucket(), groups)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +616,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	if !found {
 		t.Fatal("shared grant occupancy page was deleted")
 	}
-	remaining, err := openReplicatedMembershipGrantPage(pageKey[1], remainingPage)
+	remaining, err := openReplicatedMembershipGrantPage(pageKey.bucket(), remainingPage)
 	if err != nil || len(remaining) != 2 || remaining[0] != groups[0] ||
 		remaining[1] != groups[1] {
 		t.Fatalf("remaining occupancy groups=%+v err=%v", remaining, err)
@@ -626,7 +626,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 		t.Fatal("replacement receipt occupancy page is missing")
 	}
 	receiptGroups, err := openReplicaReplacementReceiptPage(
-		receiptPageKey[1], receiptPageRaw,
+		receiptPageKey.bucket(), receiptPageRaw,
 	)
 	if err != nil || len(receiptGroups) != 1 || receiptGroups[0] != grant.Group {
 		t.Fatalf("receipt occupancy=%+v err=%v", receiptGroups, err)
@@ -698,7 +698,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	if !found {
 		t.Fatal("finalization deleted shared active-grant page")
 	}
-	remaining, err = openReplicatedMembershipGrantPage(pageKey[1], remainingPage)
+	remaining, err = openReplicatedMembershipGrantPage(pageKey.bucket(), remainingPage)
 	if err != nil || len(remaining) != 1 || remaining[0] != other {
 		t.Fatalf("final active occupancy=%+v err=%v", remaining, err)
 	}
@@ -924,12 +924,12 @@ func TestReplicaReplacementPostRemoveRejectsFenceDriftAndStaleObservation(t *tes
 func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
-		mutate func(map[string][]byte, [33]byte)
+		mutate func(map[string][]byte, replicatedMembershipRecordKey)
 	}{
-		{name: "missing", mutate: func(rows map[string][]byte, key [33]byte) {
+		{name: "missing", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
 			delete(rows, string(key[:]))
 		}},
-		{name: "corrupt", mutate: func(rows map[string][]byte, key [33]byte) {
+		{name: "corrupt", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
 			raw := append([]byte(nil), rows[string(key[:])]...)
 			raw[len(raw)-2] ^= 1
 			rows[string(key[:])] = raw
@@ -969,12 +969,12 @@ func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.
 func TestReplicaReplacementPostRemoveRefreshRequiresCanonicalReceipt(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
-		mutate func(map[string][]byte, [33]byte)
+		mutate func(map[string][]byte, replicatedMembershipRecordKey)
 	}{
-		{name: "missing", mutate: func(rows map[string][]byte, key [33]byte) {
+		{name: "missing", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
 			delete(rows, string(key[:]))
 		}},
-		{name: "corrupt", mutate: func(rows map[string][]byte, key [33]byte) {
+		{name: "corrupt", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
 			raw := append([]byte(nil), rows[string(key[:])]...)
 			raw[len(raw)-2] ^= 1
 			rows[string(key[:])] = raw
@@ -1207,7 +1207,7 @@ func TestReplicatedMembershipGrantPageBoundOrderAndCanonicality(t *testing.T) {
 		group := base.Group
 		group.GroupID = [16]byte{byte(candidate >> 8), byte(candidate)}
 		_, pageKey := replicatedMembershipGrantKeys(group)
-		if pageKey[1] == pageIndex {
+		if pageKey.bucket() == pageIndex {
 			groups = append(groups, group)
 		}
 	}
