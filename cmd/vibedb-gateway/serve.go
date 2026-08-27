@@ -159,6 +159,8 @@ func runServe(args []string) int {
 	hotShardCapacity := fs.String("hot-shard-capacity", "", "strict canonical vibejson provisioned pressure capacities")
 	hotShardInterval := fs.Duration("hot-shard-interval", time.Second, "pressure-window publication cadence; not correctness authority")
 	replicaControlManifestPath := fs.String("replica-control-manifest", "", "strict canonical vibejson replica-control topology and bounds")
+	schemaRolloutPlan := fs.String("schema-rollout-plan", "", "strict canonical vibejson per-replica schema rollout plan")
+	schemaRolloutOnce := fs.Bool("schema-rollout-once", false, "execute the authenticated schema rollout and exit")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
@@ -181,6 +183,11 @@ func runServe(args []string) int {
 	}
 	if *catalog == "" {
 		usage()
+		return 2
+	}
+	if *schemaRolloutOnce && *schemaRolloutPlan == "" ||
+		*schemaRolloutPlan != "" && (*devStaticCatalog || *devPlaintext || *replicaControlManifestPath == "") {
+		fmt.Fprintln(os.Stderr, "gateway: schema rollout requires replicated catalog and authenticated replica-control manifest")
 		return 2
 	}
 	if *devStaticCatalog {
@@ -235,12 +242,15 @@ func runServe(args []string) int {
 			Node: profile.LocalIdentity().Node, Generation: policy.Generation(),
 		}
 		authorization = policy
-		if policy.Check(internalAuthority.Node,
-			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
-				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology|
-				serviceauthz.CapabilityTransactionRecovery|
-				serviceauthz.CapabilityRequestLedger|serviceauthz.CapabilityExecutionPin) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, transaction_recovery, request_ledger, and execution_pin authority")
+		required := serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite |
+			serviceauthz.CapabilityDelegate | serviceauthz.CapabilityTopology |
+			serviceauthz.CapabilityTransactionRecovery |
+			serviceauthz.CapabilityRequestLedger | serviceauthz.CapabilityExecutionPin
+		if *schemaRolloutPlan != "" {
+			required |= serviceauthz.CapabilitySchema
+		}
+		if policy.Check(internalAuthority.Node, required) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks required data, schema, delegation, topology, recovery, ledger, or execution-pin authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -516,6 +526,25 @@ func runServe(args []string) int {
 			_ = listener.Close()
 			fmt.Fprintf(os.Stderr, "gateway: initialize replica control: %v\n", joined)
 			return 1
+		}
+		if *schemaRolloutPlan != "" {
+			started := time.Now()
+			result, rolloutErr := executeGatewaySchemaRollout(
+				ctx, *schemaRolloutPlan, catalogAuthority, shardOpener,
+				readDeadline, writeDeadline, min(int(manifest.Bounds.MaxConnections), 64),
+			)
+			if rolloutErr != nil {
+				_ = controlListener.Close()
+				_ = listener.Close()
+				fmt.Fprintf(os.Stderr, "gateway: schema rollout: %v\n", rolloutErr)
+				return 1
+			}
+			printGatewaySchemaRolloutResult(result, time.Since(started))
+			if *schemaRolloutOnce {
+				_ = controlListener.Close()
+				_ = listener.Close()
+				return 0
+			}
 		}
 		replicaControllersDone, err = startGatewayReplicaControllers(
 			ctx, healthRevisions, moveController, healthController,
