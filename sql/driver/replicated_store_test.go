@@ -37,7 +37,8 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 		replicatedMaxDistinctMutations,
 		replicatedMaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
 	)
-	if required <= 0 || uint64(required) != storeio.RecoveryJournalMaxCapacityBytes {
+	if required <= 0 || uint64(required) != ReplicatedUserRecoveryJournalBytes ||
+		uint64(required) > storeio.RecoveryJournalMaxCapacityBytes {
 		t.Fatalf(
 			"replicated batch ceiling record = %d, journal clamp = %d",
 			required, storeio.RecoveryJournalMaxCapacityBytes,
