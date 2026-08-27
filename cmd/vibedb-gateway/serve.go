@@ -25,6 +25,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/serviceerrors"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -738,7 +739,7 @@ func runServe(args []string) (exitCode int) {
 		routeSeedControl, *catalogAttempts, *catalogAttemptTimeout,
 	)
 	if serveErr := errors.Join(
-		replicaControlErr, nonCanceledError(err), routeHandoffErr,
+		replicaControlErr, nonCanceledError(err, context.Cause(ctx)), routeHandoffErr,
 	); serveErr != nil {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", serveErr)
 		return 1
@@ -766,11 +767,8 @@ func completeReplicatedCatalogRouteSeedHandoff(
 	return true, control.CompleteQuiescedHandoff(ctx)
 }
 
-func nonCanceledError(err error) error {
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
+func nonCanceledError(err error, shutdownCause ...error) error {
+	return serviceerrors.Without(err, append(shutdownCause, context.Canceled)...)
 }
 
 // requireLoopbackListen keeps the explicitly selected unauthenticated

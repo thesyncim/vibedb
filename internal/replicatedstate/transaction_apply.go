@@ -1059,8 +1059,9 @@ func (m *Machine) planParticipantStageWithVote(
 	}
 	resultCode := uint32(ResultApplied)
 	state, revision := distributedtxn.ParticipantStaged, uint64(1)
+	var finishPlan commandPlan
 	if prepare {
-		_, _, _, _, code, err := m.planStoredTransactionMutations(
+		changes, spans, digest, _, code, err := m.planStoredTransactionMutations(
 			command, payloads, plan.command.dataChainDigest, relationSnapshots,
 		)
 		if err != nil {
@@ -1074,6 +1075,7 @@ func (m *Machine) planParticipantStageWithVote(
 		resultCode = code
 		if code == ResultApplied {
 			state, revision = distributedtxn.ParticipantPrepared, 2
+			finishPlan = commandPlan{changes: changes, relations: spans, dataChainDigest: digest}
 		} else {
 			// A rejected vote retains only the compact control witness. No intent
 			// or mutation row becomes durable, so cleanup needs no proposal.
@@ -1130,6 +1132,26 @@ func (m *Machine) planParticipantStageWithVote(
 		residentByte: int64(uint64(controlBytes) + residentMutation + residentIntent),
 	}
 	plan.command.resultCode = resultCode
+	if prepare && resultCode == ResultApplied {
+		// Finishing publishes the user mutations and deletes their durable
+		// intents/payloads atomically. A prepare that fits by itself can still
+		// exceed the frozen transaction budget at finish. Refuse before storing
+		// any prepared intent, while retaining the same exact apply limits.
+		finishPlan.systemRows = make([]transactionRowMutation, len(plan.rows))
+		for index, row := range plan.rows[:len(plan.rows)-1] {
+			finishPlan.systemRows[index] = newTransactionDelete(row.key)
+		}
+		// Control encoding is fixed-width apart from the unchanged scope list.
+		finishPlan.systemRows[len(plan.rows)-1] = plan.rows[len(plan.rows)-1]
+		next, stateErr := m.hypotheticalTransactionState(command, plan)
+		if stateErr != nil {
+			return transactionCommandPlan{}, stateErr
+		}
+		next.DataChainDigest = finishPlan.dataChainDigest
+		if err := m.checkTransitionCapacity(next, finishPlan.changes, finishPlan); err != nil {
+			return transactionCommandPlan{}, err
+		}
+	}
 	return plan, nil
 }
 

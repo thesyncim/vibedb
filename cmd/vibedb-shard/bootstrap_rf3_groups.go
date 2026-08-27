@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -57,6 +58,7 @@ func (group *preparedColdRF3Group) close() error {
 		err = errors.Join(err, group.journal.Close())
 	}
 	clear(group.key.Material[:])
+	clear(group.key.Wrapped)
 	return err
 }
 
@@ -220,7 +222,9 @@ func bootstrapPreparedRF3Groups(
 		done <- controlTLS.Serve(controlCtx, listener, servicetls.Limits{
 			MaxConnections: 8, MaxHandshakes: 4, HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			_ = controlMux.Serve(ctx, connection)
+			if err := controlMux.Serve(ctx, connection); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "RF3 cold bootstrap control failed: %v\n", err)
+			}
 		})
 	}()
 	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 cold bootstrap ready groups=%d control=%s\n", len(members), listener.Addr())
@@ -308,6 +312,7 @@ func prepareColdRF3Group(
 	if err != nil {
 		return nil, err
 	}
+	prepared.key.Wrapped = bytes.Clone(bootstrap.WALWrappedKey)
 	opener := rafttransport.TLSSnapshotStreamOpener{TLS: profile,
 		Open: func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
 			if node != bootstrap.SourceNode {

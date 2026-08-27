@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibejson"
 )
@@ -21,6 +23,7 @@ type bootstrapRF3Manifest struct {
 	CursorPath            string
 	JournalPath           string
 	StaticBootstrapPath   string
+	WALWrappedKey         []byte
 	MaxArtifactBytes      uint64
 	Groups                []bootstrapRF3ManifestGroup
 }
@@ -33,6 +36,7 @@ type bootstrapRF3ManifestGroup struct {
 	CursorPath            string
 	JournalPath           string
 	StaticBootstrapPath   string
+	WALWrappedKey         []byte
 	MaxArtifactBytes      uint64
 }
 
@@ -45,7 +49,7 @@ func (manifest bootstrapRF3Manifest) groupBundles() []bootstrapRF3ManifestGroup 
 		SourceSnapshotAddress: manifest.SourceSnapshotAddress,
 		RepositoryPath:        manifest.RepositoryPath, CursorPath: manifest.CursorPath,
 		JournalPath: manifest.JournalPath, StaticBootstrapPath: manifest.StaticBootstrapPath,
-		MaxArtifactBytes: manifest.MaxArtifactBytes,
+		MaxArtifactBytes: manifest.MaxArtifactBytes, WALWrappedKey: manifest.WALWrappedKey,
 	}}
 }
 
@@ -55,7 +59,7 @@ func (manifest bootstrapRF3Manifest) withGroup(group bootstrapRF3ManifestGroup) 
 		SourceNode: group.SourceNode, SourceSnapshotAddress: group.SourceSnapshotAddress,
 		RepositoryPath: group.RepositoryPath, CursorPath: group.CursorPath,
 		JournalPath: group.JournalPath, StaticBootstrapPath: group.StaticBootstrapPath,
-		MaxArtifactBytes: group.MaxArtifactBytes,
+		MaxArtifactBytes: group.MaxArtifactBytes, WALWrappedKey: group.WALWrappedKey,
 	}
 }
 
@@ -184,6 +188,18 @@ func parseBootstrapRF3ManifestGroupFields(fields *vibejson.ObjectIter, group boo
 		if *strings[index], err = rf3ManifestString(node, maxRF3ManifestStringBytes); err != nil {
 			return bootstrapRF3ManifestGroup{}, err
 		}
+	}
+	key, node, present = fields.Next()
+	if !present || !bytes.Equal(key.Raw().Bytes(), []byte(`"wal_wrapped_key"`)) {
+		return bootstrapRF3ManifestGroup{}, errInvalidBootstrapRF3Manifest
+	}
+	wrapped, err := rf3ManifestString(node, 2*raftstore.MaxWrappedKeyBytes)
+	if err != nil {
+		return bootstrapRF3ManifestGroup{}, err
+	}
+	group.WALWrappedKey, err = hex.DecodeString(wrapped)
+	if err != nil || len(group.WALWrappedKey) == 0 || hex.EncodeToString(group.WALWrappedKey) != wrapped {
+		return bootstrapRF3ManifestGroup{}, errInvalidBootstrapRF3Manifest
 	}
 	key, node, present = fields.Next()
 	if !present || !bytes.Equal(key.Raw().Bytes(), []byte(`"max_artifact_bytes"`)) {

@@ -15,6 +15,7 @@ const canonicalBootstrapRF3Manifest = `{
   "cursor_path": "/srv/vibedb/bootstrap.cursor",
   "journal_path": "/srv/vibedb/bootstrap-journal",
   "static_bootstrap_path": "/srv/vibedb/static-bootstrap.pb",
+  "wal_wrapped_key": "00a1ff",
   "max_artifact_bytes": 1073741824
 }`
 
@@ -29,6 +30,7 @@ const canonicalMultiGroupBootstrapRF3Manifest = `{
       "cursor_path": "/srv/vibedb/bootstrap.cursor",
       "journal_path": "/srv/vibedb/bootstrap-journal",
       "static_bootstrap_path": "/srv/vibedb/static-bootstrap.pb",
+      "wal_wrapped_key": "00a1ff",
       "max_artifact_bytes": 1073741824
     },
     {
@@ -39,6 +41,7 @@ const canonicalMultiGroupBootstrapRF3Manifest = `{
       "cursor_path": "/srv/vibedb/second/bootstrap.cursor",
       "journal_path": "/srv/vibedb/second/bootstrap-journal",
       "static_bootstrap_path": "/srv/vibedb/second/static-bootstrap.pb",
+      "wal_wrapped_key": "02a1ff",
       "max_artifact_bytes": 536870912
     }
   ]
@@ -56,6 +59,7 @@ func TestParseBootstrapRF3ManifestCanonical(t *testing.T) {
 		manifest.CursorPath != "/srv/vibedb/bootstrap.cursor" ||
 		manifest.JournalPath != "/srv/vibedb/bootstrap-journal" ||
 		manifest.StaticBootstrapPath != "/srv/vibedb/static-bootstrap.pb" ||
+		string(manifest.WALWrappedKey) != "\x00\xa1\xff" ||
 		manifest.MaxArtifactBytes != 1<<30 || manifest.SourceNode[0] != 1 ||
 		manifest.SourceNode[15] != 0x10 {
 		t.Fatalf("manifest=%+v", manifest)
@@ -77,13 +81,14 @@ func TestParseBootstrapRF3ManifestCanonicalMultiGroup(t *testing.T) {
 	if groups[0].MemberManifest != "/srv/vibedb/member.vibejson" ||
 		groups[1].MemberManifest != "/srv/vibedb/second/member.vibejson" ||
 		groups[1].SourceNode[0] != 0x11 || groups[1].SourceNode[15] != 0x20 ||
-		groups[1].MaxArtifactBytes != 1<<29 {
+		groups[1].MaxArtifactBytes != 1<<29 || string(groups[1].WALWrappedKey) != "\x02\xa1\xff" {
 		t.Fatalf("groups=%+v", groups)
 	}
 	projected := manifest.withGroup(groups[1])
 	if projected.ControlListener != manifest.ControlListener ||
 		projected.MemberManifest != groups[1].MemberManifest ||
-		projected.SourceNode != groups[1].SourceNode || len(projected.Groups) != 0 {
+		projected.SourceNode != groups[1].SourceNode || len(projected.Groups) != 0 ||
+		string(projected.WALWrappedKey) != string(groups[1].WALWrappedKey) {
 		t.Fatalf("projected=%+v", projected)
 	}
 	legacy, err := parseBootstrapRF3Manifest([]byte(canonicalBootstrapRF3Manifest))
@@ -104,6 +109,11 @@ func TestParseBootstrapRF3ManifestRejectsNoncanonicalMultiGroupInputs(t *testing
 	}
 	second := canonicalMultiGroupBootstrapRF3Manifest[secondStart : len(canonicalMultiGroupBootstrapRF3Manifest)-4]
 	tests := map[string]string{
+		"missing wrapped key": strings.Replace(canonicalBootstrapRF3Manifest,
+			`"wal_wrapped_key": "00a1ff",`, "", 1),
+		"empty wrapped key":     strings.Replace(canonicalBootstrapRF3Manifest, "00a1ff", "", 1),
+		"uppercase wrapped key": strings.Replace(canonicalBootstrapRF3Manifest, "00a1ff", "00A1FF", 1),
+		"odd wrapped key":       strings.Replace(canonicalBootstrapRF3Manifest, "00a1ff", "00a1f", 1),
 		"empty groups": strings.Replace(canonicalMultiGroupBootstrapRF3Manifest,
 			canonicalMultiGroupBootstrapRF3Manifest[strings.Index(canonicalMultiGroupBootstrapRF3Manifest, "[\n"):strings.LastIndex(canonicalMultiGroupBootstrapRF3Manifest, "]")+1], "[]", 1),
 		"reordered top level": strings.Replace(canonicalMultiGroupBootstrapRF3Manifest,

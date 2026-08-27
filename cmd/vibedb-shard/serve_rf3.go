@@ -32,6 +32,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/serviceerrors"
 	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
@@ -94,7 +95,8 @@ func runServeRF3(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := servePreparedRF3WithExecutionLanes(ctx, manifest, *executionLanes, net.Listen); err != nil {
+	err = servePreparedRF3WithExecutionLanes(ctx, manifest, *executionLanes, net.Listen)
+	if err = componentShutdownError(err, context.Cause(ctx)); err != nil {
 		fmt.Fprintf(os.Stderr, "error serve RF3: %v\n", err)
 		return 1
 	}
@@ -981,7 +983,9 @@ func servePreparedRF3WithExecutionLanes(
 		controlDone <- controlTLS.Serve(controlCtx, controlListener, servicetls.Limits{
 			MaxConnections: 32, MaxHandshakes: 8, HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			_ = controlMux.Serve(ctx, connection)
+			if err := controlMux.Serve(ctx, connection); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "RF3 control request failed: %v\n", err)
+			}
 		})
 	}()
 	snapshotDone := make(chan error, 1)
@@ -1705,11 +1709,8 @@ func runRF3Pulse(ctx context.Context, pulse chan<- struct{}, done chan<- struct{
 	}
 }
 
-func componentShutdownError(err error) error {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-	return err
+func componentShutdownError(err error, shutdownCause ...error) error {
+	return serviceerrors.Without(err, append(shutdownCause, context.Canceled, net.ErrClosed)...)
 }
 
 func validRF3ExecutionLanes(count int) bool {

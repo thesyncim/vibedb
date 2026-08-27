@@ -67,10 +67,10 @@ func canonicalReplicatedApplySidecars() ReplicatedApplySidecarProfile {
 	}
 }
 
-// The ledger profile is derived from its largest supported retry window,
-// rather than imposing its 16 MiB control-record ceiling on data-only nodes.
-// Both profiles are immutable retained geometry, checked again against the
-// exact collection limits before creating or opening any sidecar.
+// Retain the legacy ledger geometry as a compatibility floor. Transaction-
+// capable data members also need the 16 MiB payload ceiling; their exact
+// journal additionally includes the bounded intent and control rows. Every
+// profile is checked against its collection limits before opening a sidecar.
 func canonicalReplicatedLedgerApplySidecars() ReplicatedApplySidecarProfile {
 	limits := replicatedApplySystemLimitsForLedger(replicatedstate.MaxSessionRetryWindow, true)
 	return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: uint64(
@@ -82,7 +82,14 @@ func canonicalReplicatedLedgerApplySidecars() ReplicatedApplySidecarProfile {
 
 func canonicalReplicatedApplySidecarsForLimits(limits ReplicatedShardStoreLimits) ReplicatedApplySidecarProfile {
 	if limits.MaxDocumentBytes == requestledger.MaxCommandBytes {
-		return canonicalReplicatedLedgerApplySidecars()
+		legacy := canonicalReplicatedLedgerApplySidecars()
+		required := uint64(
+			storeio.RecoveryBatchRecordPaddedSizeForPayload(storeio.RecoveryJournalMinSectorSize,
+				limits.MaxBatchDocuments, limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize))
+		if required > legacy.SystemRecoveryJournalBytes {
+			return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: required}
+		}
+		return legacy
 	}
 	return canonicalReplicatedApplySidecars()
 }
@@ -104,7 +111,10 @@ func validateReplicatedApplySidecarGrammar(
 	profile ReplicatedApplySidecarProfile,
 ) error {
 	if profile != canonicalReplicatedApplySidecars() &&
-		profile != canonicalReplicatedLedgerApplySidecars() {
+		profile != canonicalReplicatedLedgerApplySidecars() &&
+		(profile.SystemRecoveryJournalBytes < canonicalReplicatedLedgerApplySidecars().SystemRecoveryJournalBytes ||
+			profile.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes ||
+			profile.SystemRecoveryJournalBytes%storeio.RecoveryJournalMinSectorSize != 0) {
 		return fmt.Errorf(
 			"%w: invalid sealed system-journal geometry",
 			ErrReplicatedApplyMismatch,

@@ -180,8 +180,8 @@ func (runtime *AuthenticatedExecutionPeerRuntime) Run(parent context.Context) er
 		cause = ErrPeerServerClosed
 	}
 	cancel(cause)
-	_ = runtime.server.Close()
-	_ = runtime.transport.Close()
+	// Cancellation closes both components with this exact cause. A concurrent
+	// explicit Close would race it with an unrelated "closed" sentinel.
 	joined := cause
 	for completed := 1; completed < 3; completed++ {
 		result := <-results

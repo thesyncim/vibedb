@@ -132,7 +132,22 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	nodes := rf3CommandNodes()
 	targetNode := rafttransport.NodeID{0xd1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	credentials, roots, policyPath, profile := rf3EnrolledGroupOperatorCredentials(t, root, nodes, targetNode)
-	peerAddresses := [3]string{addresses.Peer, rf3CommandUnusedAddress(t), rf3CommandUnusedAddress(t)}
+	// Snapshot activation requires a committed cut beyond genesis. Run the
+	// other voters too: one process with an RF3 roster cannot establish it.
+	quorum := &rf3FaultFixture{}
+	memberAddresses := [3]rf3testfixture.ProcessListeners{addresses}
+	peerAddresses := [3]string{addresses.Peer}
+	for member := 1; member < rf3CommandMembers; member++ {
+		reserved := reserveRF3ProcessListeners(t)
+		defer closeRF3ProcessListeners(reserved)
+		copy(quorum.listeners[member][:], reserved)
+		memberAddresses[member] = rf3testfixture.ProcessListeners{
+			Peer: reserved[0].Addr().String(), Control: reserved[1].Addr().String(),
+			Native: reserved[2].Addr().String(), Snapshot: reserved[3].Addr().String(),
+		}
+		peerAddresses[member] = memberAddresses[member].Peer
+	}
+	defer func() { closeRF3CommandChildren(t, quorum.children[:]) }()
 	walOptions := raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
 		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
 	authority := rf3CommandAuthority()
@@ -142,23 +157,27 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 			ShardKey: gateway.ReplicatedCatalogPrimaryKey, TupleVersion: distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}
 	identity1, identity2 := rf3EnrolledGroupIdentities()
-	target1 := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{0xe1}, NodeIncarnation: 9,
+	target1 := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{0xe1}, NodeIncarnation: 1,
 		Listeners: rf3testfixture.ProcessListeners{Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t), Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t)}}
 	target2 := target1
 	target2.StoreID[0]++
 	staticBootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
 	staticBootstrap.Snapshot.Metadata.ConfState.Learners = []uint64{4}
-	prepare := func(name string, identity raftstore.Identity, target rf3testfixture.ProcessTarget) rf3testfixture.PreparedProcessMember {
+	prepare := func(name string, identity raftstore.Identity, target rf3testfixture.ProcessTarget, member int) rf3testfixture.PreparedProcessMember {
 		key := raftstore.Key{ID: "multi-group-key", Wrapped: []byte("test-wrapped")}
 		for i := range key.Material {
 			key.Material[i] = byte(i + 1)
 		}
 		bootstrap := staticBootstrap
+		if member != 0 {
+			identity.MemberID = uint64(member + 1)
+			identity.StoreID[15] = byte(member + 1)
+		}
 		prepared, prepareErr := rf3testfixture.PrepareProcessMember(rf3testfixture.ProcessMemberOptions{
-			Root: filepath.Join(root, name), ControlRoot: filepath.Join(root, "control"),
+			Root: filepath.Join(root, name), ControlRoot: filepath.Join(root, fmt.Sprintf("control-%d", member)),
 			Table: gateway.ReplicatedCatalogTable, CreateTable: `CREATE TABLE controlplane (PRIMARY KEY (id))`,
 			Identity: identity, Key: key, WAL: walOptions, Bootstrap: bootstrap,
-			Authority: authority, Apply: apply, Listeners: addresses, Credential: credentials[0], Roots: roots,
+			Authority: authority, Apply: apply, Listeners: memberAddresses[member], Credential: credentials[member], Roots: roots,
 			AuthorizationPolicy: policyPath, Nodes: nodes, PeerAddresses: peerAddresses, Target: &target,
 		})
 		if info, statErr := os.Stat(filepath.Join(root, name, "split-runtime")); statErr != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
@@ -172,8 +191,17 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		}
 		return prepared
 	}
-	first := prepare("first", identity1, target1)
-	second := prepare("second", identity2, target2)
+	first := prepare("first", identity1, target1, 0)
+	second := prepare("second", identity2, target2, 0)
+	for member := 1; member < rf3CommandMembers; member++ {
+		firstPeer := prepare(fmt.Sprintf("first-%d", member), identity1, target1, member)
+		secondPeer := prepare(fmt.Sprintf("second-%d", member), identity2, target2, member)
+		quorum.manifestPaths[member] = filepath.Join(root, fmt.Sprintf("multi-group-peer-%d.vibejson", member))
+		if err := os.WriteFile(quorum.manifestPaths[member], combineRF3ProcessGroups(t, firstPeer.ManifestPath, secondPeer.ManifestPath), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		quorum.start(t, member)
+	}
 	manifestPath := filepath.Join(root, "multi-group-serve.vibejson")
 	if err := os.WriteFile(manifestPath, combineRF3ProcessGroups(t, first.ManifestPath, second.ManifestPath), 0o600); err != nil {
 		t.Fatal(err)
@@ -305,6 +333,19 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	for _, item := range groups {
 		group := raftmember.GroupKey{ClusterID: item.identity.ClusterID, ClusterIncarnation: item.identity.ClusterIncarnation,
 			TopologyRecoveryEpoch: rf3CommandGroup().TopologyRecoveryEpoch, ShardIncarnation: item.identity.ShardIncarnation, GroupID: item.identity.GroupID}
+		committed := false
+		for until := time.Now().Add(30 * time.Second); time.Now().Before(until); {
+			state, probeErr := probeRF3CommandMember(t.Context(), addresses.Native, nodes[0], profile,
+				profile.LocalIdentity().Node, group, item.identity.AllocationGeneration, authority.ActivePolicyGeneration)
+			if probeErr == nil && state.Commit > 1 && state.Applied >= state.Commit {
+				committed = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !committed {
+			t.Fatalf("group %x has no post-genesis committed snapshot cut: %s", group.GroupID, diagnostic.String())
+		}
 		request := snapshottransfer.SourceControlRequest{Operation: [32]byte{item.op}, Step: [32]byte{item.op + 1}, Group: group,
 			SourceMember: 1, TargetMember: 4, TargetStore: item.target.StoreID, TargetIncarnation: item.target.NodeIncarnation,
 			ReplicaSetVersion: 1, SourceNode: nodes[0]}
@@ -360,18 +401,22 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		t.Fatalf("multi-group learner bootstrap latency=%s", elapsed)
 	}
 	coldTarget.WaitServingReady(t)
-	baseRoot := filepath.Join(root, "first")
+	servingManifest, err := loadRF3Manifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryRoot := servingManifest.ReplicaControl.SourceRepositoryPath
 	for _, identity := range []raftstore.Identity{identity1, identity2} {
 		group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
 			TopologyRecoveryEpoch: rf3CommandGroup().TopologyRecoveryEpoch, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
-		if info, statErr := os.Stat(rf3SnapshotGroupPath(filepath.Join(baseRoot, "source-artifacts"), group, true)); statErr != nil || !info.IsDir() {
+		if info, statErr := os.Stat(rf3SnapshotGroupPath(repositoryRoot, group, true)); statErr != nil || !info.IsDir() {
 			t.Fatalf("group %x repository isolation: %v", group.GroupID, statErr)
 		}
 	}
 	if networkBytes == 0 || networkBytes > 64<<20 {
 		t.Fatalf("bounded snapshot bytes=%d", networkBytes)
 	}
-	if bytesOnDisk := rf3ProcessTreeBytes(t, filepath.Join(baseRoot, "source-artifacts")); bytesOnDisk > 64<<20 {
+	if bytesOnDisk := rf3ProcessTreeBytes(t, repositoryRoot); bytesOnDisk > 64<<20 {
 		t.Fatalf("bounded source storage bytes=%d", bytesOnDisk)
 	}
 	if rss := rf3ProcessRSSBytes(t, command.Process.Pid); rss > 1<<30 {
@@ -545,10 +590,10 @@ func combineBootstrapRF3ProcessGroups(t testing.TB, paths ...string) []byte {
 			raw = append(raw, ',')
 		}
 		raw = fmt.Appendf(raw,
-			`{"member_manifest":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"max_artifact_bytes":%d}`,
+			`{"member_manifest":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"wal_wrapped_key":"%x","max_artifact_bytes":%d}`,
 			group.MemberManifest, group.SourceNode, group.SourceSnapshotAddress,
 			group.RepositoryPath, group.CursorPath, group.JournalPath,
-			group.StaticBootstrapPath, group.MaxArtifactBytes)
+			group.StaticBootstrapPath, group.WALWrappedKey, group.MaxArtifactBytes)
 	}
 	return append(raw, ']', '}')
 }

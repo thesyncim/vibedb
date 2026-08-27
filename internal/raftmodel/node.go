@@ -356,7 +356,10 @@ func (n *Node) observeCommitAdvancement() {
 // Progress returns one detached tracker record without allocating a map. It is
 // available only when the local member is leader and the member is configured.
 func (n *Node) Progress(memberID uint64) (MemberProgress, bool) {
-	if memberID == raft.None || raft.IsLocalMsgTarget(memberID) {
+	// RawNode.WithProgress visits the tracker even on followers. Those entries
+	// are not replication evidence and must never be published as a leader cut.
+	if n == nil || n.raw.BasicStatus().RaftState != raft.StateLeader ||
+		memberID == raft.None || raft.IsLocalMsgTarget(memberID) {
 		return MemberProgress{}, false
 	}
 	var result MemberProgress

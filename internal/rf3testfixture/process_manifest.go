@@ -52,6 +52,7 @@ type PreparedProcessMember struct {
 	ManifestPath, WALPath, SQLPath string
 	RelationManifestDigest         [32]byte
 	LogicalSchemaDigest            [32]byte
+	SystemRecoveryJournalBytes     uint64
 }
 
 type PreparedColdTarget struct {
@@ -60,7 +61,7 @@ type PreparedColdTarget struct {
 }
 
 func PrepareProcessMember(options ProcessMemberOptions) (PreparedProcessMember, error) {
-	prepared, err := prepareProcessMember(options, options.Bootstrap)
+	prepared, err := prepareProcessMember(options, options.Bootstrap, false)
 	if err != nil {
 		return PreparedProcessMember{}, err
 	}
@@ -99,11 +100,8 @@ func prepareColdProcessTarget(
 	sourceSnapshotAddress string,
 	maxArtifactBytes uint64,
 ) (PreparedColdTarget, error) {
-	prepared, err := prepareProcessMember(options, preparation)
+	prepared, err := prepareProcessMember(options, preparation, true)
 	if err != nil {
-		return PreparedColdTarget{}, err
-	}
-	if err = os.Remove(prepared.WALPath); err != nil {
 		return PreparedColdTarget{}, err
 	}
 	staticPath := filepath.Join(options.Root, "static-bootstrap.pb")
@@ -116,10 +114,10 @@ func prepareColdProcessTarget(
 	}
 	bootstrapPath := filepath.Join(options.Root, "bootstrap-rf3.json")
 	document := []byte(fmt.Sprintf(
-		`{"member_manifest":%q,"control_listener":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"max_artifact_bytes":%d}`,
+		`{"member_manifest":%q,"control_listener":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"wal_wrapped_key":"%x","max_artifact_bytes":%d}`,
 		prepared.ManifestPath, options.Listeners.Control, sourceNode, sourceSnapshotAddress,
 		filepath.Join(options.Root, "target-artifacts"), filepath.Join(options.Root, "snapshot-cursor"),
-		filepath.Join(options.Root, "bootstrap-journal"), staticPath, maxArtifactBytes,
+		filepath.Join(options.Root, "bootstrap-journal"), staticPath, options.Key.Wrapped, maxArtifactBytes,
 	))
 	if err = os.WriteFile(bootstrapPath, document, 0o600); err != nil {
 		return PreparedColdTarget{}, err
@@ -129,7 +127,7 @@ func prepareColdProcessTarget(
 }
 
 func prepareProcessMember(
-	options ProcessMemberOptions, bootstrap raftstore.Bootstrap,
+	options ProcessMemberOptions, bootstrap raftstore.Bootstrap, coldSnapshot bool,
 ) (PreparedProcessMember, error) {
 	if options.Root == "" || options.Table == "" || options.CreateTable == "" ||
 		options.Key.ID == "" || bootstrap.Snapshot == nil || options.Listeners.Peer == "" ||
@@ -146,7 +144,11 @@ func prepareProcessMember(
 	if err := PrepareSplitRuntime(options.Root, options.Bootstrap); err != nil {
 		return PreparedProcessMember{}, err
 	}
-	prepared, err := PrepareMember(MemberOptions{Root: options.Root, Table: options.Table,
+	prepare := PrepareMember
+	if coldSnapshot {
+		prepare = PrepareSnapshotTarget
+	}
+	prepared, err := prepare(MemberOptions{Root: options.Root, Table: options.Table,
 		CreateTable: options.CreateTable, Identity: options.Identity, Key: options.Key,
 		WAL: options.WAL, Bootstrap: bootstrap, Authority: options.Authority, Apply: options.Apply,
 		SchemaStatements: options.SchemaStatements, GlobalIndexes: options.GlobalIndexes,
@@ -194,7 +196,8 @@ func prepareProcessMember(
 	}
 	return PreparedProcessMember{ManifestPath: manifestPath,
 		WALPath: prepared.WALPath, SQLPath: prepared.SQLPath,
-		RelationManifestDigest: relationDigest, LogicalSchemaDigest: logicalDigest}, nil
+		RelationManifestDigest: relationDigest, LogicalSchemaDigest: logicalDigest,
+		SystemRecoveryJournalBytes: prepared.ApplyIdentity.Sidecars.SystemRecoveryJournalBytes}, nil
 }
 
 func writeProcessJSON(path string, value interface{ MarshalJSON() ([]byte, error) }) error {

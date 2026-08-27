@@ -362,7 +362,10 @@ func decodeReplicatedApplyMetaVibe(
 		return fmt.Errorf("%w: retry window", ErrReplicatedApplyMismatch)
 	}
 	if decoded.SystemLimits != replicatedApplySystemLimitsForLedger(decoded.RetryWindow,
-		decoded.RequestLedgerRangeIdentity != ([sha256.Size]byte{})) {
+		decoded.RequestLedgerRangeIdentity != ([sha256.Size]byte{})) &&
+		(decoded.SystemLimits.MaxBatchDocuments > decoded.TxnMaxDocuments ||
+			decoded.SystemLimits != replicatedApplySystemLimitsForLedger(decoded.RetryWindow,
+				decoded.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), decoded.SystemLimits.MaxBatchDocuments)) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
 	if err := validateReplicatedApplySidecarsForLimits(decoded.Sidecars, decoded.SystemLimits); err != nil {

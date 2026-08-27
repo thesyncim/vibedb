@@ -342,8 +342,9 @@ func (runtime *AuthenticatedPeerRuntime) Run(parent context.Context) error {
 		cause = ErrPeerServerClosed
 	}
 	cancel(cause)
-	_ = runtime.server.Close()
-	_ = runtime.transport.Close()
+	// Both components close their resources when ctx is canceled. Calling
+	// Close as well races that cause with their independent "closed" sentinel
+	// and can turn an ordinary requested shutdown into a spurious failure.
 
 	joined := cause
 	for completed := 1; completed < 3; completed++ {

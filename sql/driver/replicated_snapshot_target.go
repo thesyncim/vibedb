@@ -15,7 +15,8 @@ func (d *Database) PrepareReplicatedSnapshotTarget(
 
 // OpenReplicatedSnapshotTarget opens only the non-serving snapshot installation
 // boundary. Both full identities are checked before namespace recovery. A
-// reserved target must still be empty; an existing checkpoint must be a seeded
+// reserved target must still be empty; a staged image remains non-serving
+// until its artifact is authenticated. An existing checkpoint must be a seeded
 // snapshot transition, whose exact artifact/cursor is checked by the stage.
 // Ordinary initialized Raft stores cannot enter this recovery path.
 func OpenReplicatedSnapshotTarget(

@@ -601,22 +601,37 @@ func (peer *ordinaryPeer) notify() {
 func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 	var connection PeerConnection
 	var stopConnection func() bool
+	var connectionDone <-chan struct{}
 	failures := uint32(0)
-	defer func() {
+	closeConnection := func() {
 		if stopConnection != nil {
 			stopConnection()
+			stopConnection = nil
 		}
 		if connection != nil {
 			_ = connection.Close()
+			// Close interrupts the reader. Join it before replacing the stream,
+			// keeping at most one reader and one writer per peer.
+			<-connectionDone
 			transport.clearConnection(peer)
+			connection, connectionDone = nil, nil
 		}
-	}()
+	}
+	defer closeConnection()
 
 	for {
+		select {
+		case <-connectionDone:
+			closeConnection()
+			failures = saturatingIncrement(failures)
+		default:
+		}
 		if !transport.peerHasFrames(peer) {
 			select {
 			case <-transport.ctx.Done():
 				return
+			case <-connectionDone:
+				continue
 			case <-peer.wake:
 			}
 		}
@@ -657,6 +672,22 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 			stopConnection = context.AfterFunc(
 				transport.ctx, func() { _ = active.Close() },
 			)
+			done := make(chan struct{})
+			connectionDone = done
+			go func() {
+				defer close(done)
+				// Ordinary streams are unidirectional. Read the unused return
+				// lane to observe TLS close_notify/EOF even when buffered TCP
+				// writes still succeed. Any return data is also invalid here.
+				var unexpected [1]byte
+				for {
+					n, err := active.Read(unexpected[:])
+					if n != 0 || err != nil {
+						_ = active.Close()
+						return
+					}
+				}
+			}()
 		}
 
 		if transport.shouldDelayCoalesce(peer) && transport.coalesce.MaxDelay != 0 {
@@ -685,13 +716,7 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 		transport.releasePeerBatch(peer)
 		if writeErr != nil {
 			peer.writeFailures.Add(1)
-			if stopConnection != nil {
-				stopConnection()
-				stopConnection = nil
-			}
-			_ = connection.Close()
-			transport.clearConnection(peer)
-			connection = nil
+			closeConnection()
 			failures = saturatingIncrement(failures)
 			continue
 		}

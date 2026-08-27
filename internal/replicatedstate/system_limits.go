@@ -3,15 +3,17 @@ package replicatedstate
 import (
 	"crypto/sha256"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/executionpin"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 )
 
-// RequiredSystemCollectionLimits returns the sole exact hidden-collection
-// profile for replicated apply. Shipped owners use this instead of copying
-// codec geometry, so adding a bounded control record cannot silently leave a
-// narrower durable collection that fails only after activation.
+// RequiredSystemCollectionLimits returns the minimum hidden-collection profile
+// for session/control apply. Owners serving distributed transactions must also
+// use RequiredTransactionSystemCollectionLimits: staged relation images and
+// their intents do not fit the compact session profile.
 func RequiredSystemCollectionLimits(
 	retryWindow uint16,
 	requestLedger bool,
@@ -79,4 +81,41 @@ func RequiredSystemCollectionLimits(
 		MaxKeyBytes: maxKeyBytes, MaxDocumentBytes: maxDocumentBytes,
 		MaxDistinctMutations: maxDocuments, MaxBatchBytes: maxBatchBytes,
 	}, true
+}
+
+// MaxTransactionSystemDocuments bounds a single transaction staging command:
+// one intent per mutation, one packed payload per relation, two controls, one
+// coordinator payload, a bounded initial manifest pack, and the state row.
+const MaxTransactionSystemDocuments = MaxDistinctMutations*replication.MaxRelationsPerBundle +
+	replication.MaxRelationsPerBundle + distributedtxn.MaxManifestSegmentsPerCommand + 4
+
+// RequiredTransactionSystemCollectionLimits derives the hidden collection from
+// the owner's already-frozen transaction document budget. It does not raise
+// admission quotas. The command carries at most MaxCommandBytes of payload;
+// storing it adds relation/control/page framing and a second copy of each
+// intent key. Reserving only the wire byte count misses this amplification.
+func RequiredTransactionSystemCollectionLimits(
+	retryWindow uint16,
+	requestLedger bool,
+	transactionDocuments int,
+) (CollectionLimits, bool) {
+	limits, ok := RequiredSystemCollectionLimits(retryWindow, requestLedger)
+	if !ok || transactionDocuments < limits.MaxDistinctMutations {
+		return CollectionLimits{}, false
+	}
+	limits.MaxDistinctMutations = min(transactionDocuments, MaxTransactionSystemDocuments)
+	limits.MaxKeyBytes = max(limits.MaxKeyBytes, transactionIntentKeyBytes)
+	// A packed relation omits the larger outer command header, so its retained
+	// header and checksum still fit within the original command byte ceiling.
+	limits.MaxDocumentBytes = max(limits.MaxDocumentBytes, replication.MaxCommandBytes)
+	framing := len(stateKey) + MaxStateEnvelopeBytes +
+		2*(transactionControlStorageKeyBytes+MaxTransactionControlRecordBytes) +
+		transactionPayloadStorageKeyBytes + transactionPayloadHeaderBytes + recordChecksumLen +
+		replication.MaxRelationsPerBundle*(transactionRelationPayloadKeyBytes+transactionRelationPayloadHeaderBytes+recordChecksumLen) +
+		distributedtxn.MaxManifestSegmentsPerCommand*(transactionManifestKeyBytes+transactionManifestHeaderBytes+recordChecksumLen)
+	intents := min(limits.MaxDistinctMutations, MaxDistinctMutations*replication.MaxRelationsPerBundle)
+	limits.MaxBatchBytes = max(limits.MaxBatchBytes,
+		replication.MaxCommandBytes+framing+intents*(transactionIntentKeyBytes+MaxTransactionIntentRecordBytes),
+		limits.MaxDocumentBytes+limits.MaxDistinctMutations*limits.MaxKeyBytes)
+	return limits, true
 }

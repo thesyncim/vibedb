@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -60,6 +61,7 @@ func runBootstrapRF3(args []string) int {
 	} else {
 		err = bootstrapPreparedRF3Groups(ctx, manifest, members)
 	}
+	err = componentShutdownError(err, context.Cause(ctx))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error bootstrap RF3: %v\n", err)
 		return 1
@@ -208,6 +210,10 @@ func bootstrapPreparedRF3(
 		return err
 	}
 	defer clear(key.Material[:])
+	// Serving opens can recover provider metadata from an existing WAL. A cold
+	// target has no WAL yet, so creation must use the provisioned exact bytes.
+	key.Wrapped = bytes.Clone(bootstrap.WALWrappedKey)
+	defer clear(key.Wrapped)
 	opener := rafttransport.TLSSnapshotStreamOpener{
 		TLS: profile,
 		Open: func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
@@ -276,7 +282,9 @@ func bootstrapPreparedRF3(
 			MaxConnections: 8, MaxHandshakes: 4,
 			HandshakeDeadline: func() time.Time { return time.Now().Add(bootstrapRF3NetworkTimeout) },
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			_ = controlMux.Serve(ctx, connection)
+			if err := controlMux.Serve(ctx, connection); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "RF3 cold bootstrap control failed: %v\n", err)
+			}
 		})
 	}()
 	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 cold bootstrap ready member=%d control=%s\n",
@@ -323,7 +331,8 @@ func (handler rf3BootstrapCompletionHandler) Serve(
 func validateBootstrapRF3Topology(bootstrap bootstrapRF3Manifest, member rf3Manifest) error {
 	target := member.EnrolledTarget
 	if target == nil || bootstrap.ControlListener != target.ControlAddress ||
-		profileTargetMember(member) != target.MemberID {
+		profileTargetMember(member) != target.MemberID ||
+		len(bootstrap.WALWrappedKey) == 0 || len(bootstrap.WALWrappedKey) > raftstore.MaxWrappedKeyBytes {
 		return errInvalidBootstrapRF3Manifest
 	}
 	localSource := sourceMemberForBootstrap(bootstrap, member)

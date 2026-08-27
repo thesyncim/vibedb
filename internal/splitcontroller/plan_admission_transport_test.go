@@ -35,13 +35,27 @@ type planAdmissionOutcomeUnknownOpener struct {
 	service *PlanAdmissionService
 	peer    rafttransport.PeerIdentity
 	drop    bool
+	done    <-chan struct{}
 }
 
 func (opener *planAdmissionOutcomeUnknownOpener) OpenShardControl(
 	ctx context.Context, _ rafttransport.NodeID,
 ) (rafttransport.PeerConnection, error) {
+	// Isolate lost-response settlement from the independent one-connection
+	// admission limit. Reading the reply does not imply the server has released
+	// its slot yet; an immediate second dial can legitimately be refused.
+	if opener.done != nil {
+		select {
+		case <-opener.done:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
+	}
 	client, server := net.Pipe()
+	done := make(chan struct{})
+	opener.done = done
 	go func() {
+		defer close(done)
 		_ = opener.service.Serve(ctx, &planObservationTestConnection{
 			Conn: server, peer: opener.peer, class: rafttransport.TrafficShardControl,
 		})

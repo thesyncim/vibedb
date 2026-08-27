@@ -14,11 +14,11 @@ import (
 	"slices"
 	"strconv"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -52,7 +52,7 @@ func init() {
 
 // TestServeRF3WALRetentionCrashQualification drives the shipped, authenticated
 // three-process command rather than an in-memory Store. Each cycle creates a
-// new checkpoint, observes all three logical WAL inodes being replaced by
+// new checkpoint, observes all three immutable WAL identities replaced by
 // compacted generations, SIGKILLs one process, catches it up, and verifies an
 // acknowledged value through a linearizable read. Physical allocation, live
 // data, RSS, file descriptors, waiter reuse, and latency are hard gates.
@@ -76,8 +76,7 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 	sequence := uint64(2)
 	firstCommand := []byte(nil)
 	latencies := make([]time.Duration, 0, walRetentionCycles*walRetentionKeysPerCycle)
-	initialInodes := walRetentionWALInodes(t, fixture.walPaths)
-	previousInodes := initialInodes
+	previousGenerations := walRetentionWALGenerations(t, fixture.walPaths)
 	baselineAllocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
 	baselineRSS := rf3FaultProcessRSSBytes(t, fixture.children)
 	logWALRetentionMemory(t, fixture.children, "baseline")
@@ -112,8 +111,7 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 		}
 
 		fixture.waitAllApplied(t, lastApplied, 30*time.Second)
-		currentInodes := walRetentionWaitGenerationReplacement(t, fixture.walPaths, previousInodes, 45*time.Second)
-		previousInodes = currentInodes
+		previousGenerations = walRetentionWaitGenerationReplacement(t, fixture.walPaths, previousGenerations, 45*time.Second)
 
 		victim := cycle % rf3CommandMembers
 		fixture.kill(t, victim)
@@ -294,29 +292,34 @@ func walRetentionDuplicateWave(t testing.TB, fixture *rf3FaultFixture, member in
 	}
 }
 
-func walRetentionWALInodes(t testing.TB, paths [rf3CommandMembers]string) [rf3CommandMembers]uint64 {
+func walRetentionWALGenerations(t testing.TB, paths [rf3CommandMembers]string) [rf3CommandMembers][sha256.Size]byte {
 	t.Helper()
-	var result [rf3CommandMembers]uint64
+	var result [rf3CommandMembers][sha256.Size]byte
 	for index, path := range paths {
-		info, err := os.Stat(path)
+		file, err := os.Open(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Ino == 0 {
-			t.Fatalf("WAL inode unavailable for %q", path)
+		// Maintenance can replace a WAL more than once between observations,
+		// allowing the filesystem to reuse an old inode (ABA). Each generation
+		// has a fresh immutable static header, independent of that reuse. Read
+		// from one open descriptor so a concurrent rename cannot mix files.
+		var header [raftstore.StaticHeaderBytes]byte
+		_, readErr := file.ReadAt(header[:], 0)
+		if err := errors.Join(readErr, file.Close()); err != nil {
+			t.Fatalf("WAL generation unavailable for %q: %v", path, err)
 		}
-		result[index] = stat.Ino
+		result[index] = sha256.Sum256(header[:])
 	}
 	return result
 }
 
 func walRetentionWaitGenerationReplacement(t testing.TB, paths [rf3CommandMembers]string,
-	previous [rf3CommandMembers]uint64, timeout time.Duration) [rf3CommandMembers]uint64 {
+	previous [rf3CommandMembers][sha256.Size]byte, timeout time.Duration) [rf3CommandMembers][sha256.Size]byte {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		current := walRetentionWALInodes(t, paths)
+		current := walRetentionWALGenerations(t, paths)
 		changed := true
 		for index := range current {
 			changed = changed && current[index] != previous[index]
@@ -326,9 +329,9 @@ func walRetentionWaitGenerationReplacement(t testing.TB, paths [rf3CommandMember
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("all WAL generations did not replace before timeout; previous=%v current=%v",
-		previous, walRetentionWALInodes(t, paths))
-	return [rf3CommandMembers]uint64{}
+	t.Fatalf("all WAL generations did not replace before timeout; previous=%x current=%x",
+		previous, walRetentionWALGenerations(t, paths))
+	return [rf3CommandMembers][sha256.Size]byte{}
 }
 
 func walRetentionProcessFDs(t testing.TB, children [rf3CommandMembers]*rf3CommandChild) uint64 {

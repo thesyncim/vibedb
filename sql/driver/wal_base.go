@@ -579,7 +579,9 @@ func walBaseRequiredWorkspaceBytes(
 		}
 		return capacity, nil
 	}
-	required, err := requiredFor(apply.SystemLimits)
+	required, err := replicatedstate.RequiredSnapshotArtifactSystemPayloadCapacity(
+		replicatedstate.DefaultSnapshotArtifactChunkBytes,
+		apply.SystemLimits.MaxKeyBytes, apply.SystemLimits.MaxDocumentBytes)
 	if err != nil {
 		return 0, err
 	}

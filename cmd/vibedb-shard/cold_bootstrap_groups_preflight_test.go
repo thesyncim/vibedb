@@ -35,7 +35,8 @@ func TestColdTargetBootstrapGroupManifestPreflight(t *testing.T) {
 			Group: raftmember.GroupKey{ClusterID: source.ClusterID, ClusterIncarnation: source.ClusterIncarnation,
 				TopologyRecoveryEpoch: 1, ShardIncarnation: source.ShardIncarnation, GroupID: source.GroupID},
 			Distribution: source.Distribution, Shard: source.Shard, AllocationGeneration: source.AllocationGeneration,
-			Target:    rf3ManifestEnrolledTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{byte(200 + i)}, NodeIncarnation: 9},
+			Key:       raftstore.Key{Wrapped: []byte("test-wrapped-key")},
+			Target:    rf3ManifestEnrolledTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{byte(200 + i)}, NodeIncarnation: 1},
 			Listeners: listeners, SourceNode: nodes[0], SourceSnapshotAddress: "127.0.0.1:33001", MaxArtifactBytes: 1 << 30}
 		identity := rf3ColdTargetIdentity(t, options)
 		memberPath := filepath.Join(groupRoot, "member.vibejson")

@@ -39,7 +39,7 @@ func TestRecoveryJournalLedgerCeilingAppendReopen(t *testing.T) {
 	if got := RecoveryConditionalBatchRecordPaddedSize(RecoveryJournalMinSectorSize, entries); got != wantBytes {
 		t.Fatalf("actual conditional record = %d bytes, want %d", got, wantBytes)
 	}
-	if uint64(wantBytes) != RecoveryJournalMaxCapacityBytes {
+	if uint64(wantBytes) > RecoveryJournalMaxCapacityBytes {
 		t.Fatalf("ledger record = %d, global bound = %d", wantBytes, RecoveryJournalMaxCapacityBytes)
 	}
 	conditional := testConditionalHeader(t)

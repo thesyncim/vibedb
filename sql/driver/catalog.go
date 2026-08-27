@@ -208,6 +208,9 @@ type database struct {
 	// group-owned same-index transition.
 	replicatedSeedRecovery bool
 	replicatedSeedPending  bool
+	// Snapshot recovery can include imported hidden rows before certification,
+	// but must reject ordinary initialized checkpoints before replay begins.
+	replicatedSnapshotRecovery bool
 	// txnLimits is the driver's normalized cross-table commit bound, matching
 	// durable's package defaults. UpdateCollections is fail-closed at zero.
 	txnLimits durable.TxnLimits
@@ -302,16 +305,17 @@ func openDatabaseWithShardStorePolicy(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
-		layoutEpoch:               newCatalogLayoutEpoch(nil, nil),
-		txnLimits:                 defaultDriverTxnLimits(),
-		replicatedSeedRecovery:    shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
-		replicatedSeedPending:     shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
-		schemaTransition:          bytes.Clone(shardPolicy.schemaTransition),
-		schemaMembership:          shardPolicy.schemaMembership,
-		schemaCheckpointAuthority: shardPolicy.schemaCheckpointAuthority,
-		schemaAuthorization:       shardPolicy.schemaAuthorization,
-		schemaCatalogCAS:          shardPolicy.schemaCatalogCAS,
-		schemaSourceRecovery:      shardPolicy.schemaSourceRecovery,
+		layoutEpoch:                newCatalogLayoutEpoch(nil, nil),
+		txnLimits:                  defaultDriverTxnLimits(),
+		replicatedSeedRecovery:     shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		replicatedSeedPending:      shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		replicatedSnapshotRecovery: shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		schemaTransition:           bytes.Clone(shardPolicy.schemaTransition),
+		schemaMembership:           shardPolicy.schemaMembership,
+		schemaCheckpointAuthority:  shardPolicy.schemaCheckpointAuthority,
+		schemaAuthorization:        shardPolicy.schemaAuthorization,
+		schemaCatalogCAS:           shardPolicy.schemaCatalogCAS,
+		schemaSourceRecovery:       shardPolicy.schemaSourceRecovery,
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -865,6 +869,16 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions Repl
 					d.schemaMembership, d.schemaCheckpointAuthority,
 					durable.CheckpointGroupOptions{},
 				)
+		} else if d.replicatedSnapshotRecovery {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithSnapshotCheckpointGroup(
+					d.dataDir, txnOptions, requests, groupNames,
+					replicatedstate.SystemCollectionName,
+					durable.CheckpointGroupOptions{},
+				)
+			if errors.Is(err, durable.ErrCheckpointGroupSeedChanged) {
+				err = errors.Join(ErrReplicatedSnapshotStageProof, err)
+			}
 		} else if d.replicatedSeedRecovery {
 			collections, txnLog, checkpointGroup, err =
 				durable.OpenCollectionsWithSeededCheckpointGroup(

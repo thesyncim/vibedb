@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -353,8 +354,13 @@ func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits 
 	return replicatedApplySystemLimitsForLedger(retryWindow, false)
 }
 
-func replicatedApplySystemLimitsForLedger(retryWindow uint16, ledger bool) ReplicatedShardStoreLimits {
+func replicatedApplySystemLimitsForLedger(retryWindow uint16, ledger bool, transactionDocuments ...int) ReplicatedShardStoreLimits {
 	required, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, ledger)
+	if len(transactionDocuments) == 1 {
+		required, ok = replicatedstate.RequiredTransactionSystemCollectionLimits(retryWindow, ledger, transactionDocuments[0])
+	} else if len(transactionDocuments) != 0 {
+		return ReplicatedShardStoreLimits{}
+	}
 	if !ok {
 		return ReplicatedShardStoreLimits{}
 	}
@@ -363,6 +369,26 @@ func replicatedApplySystemLimitsForLedger(retryWindow uint16, ledger bool) Repli
 		MaxBatchDocuments: required.MaxDistinctMutations,
 		MaxBatchBytes:     required.MaxBatchBytes,
 	}
+}
+
+func replicatedApplyTransactionSystemLimits(
+	identity ReplicatedShardStoreIdentity, retryWindow uint16, ledger bool, transactionDocuments int,
+) ReplicatedShardStoreLimits {
+	documents := 0
+	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
+		documents += identity.Relations[ordinal].Limits.MaxBatchDocuments
+	}
+	// The system participant stores one intent per distinct relation key,
+	// one packed row per relation, two controls, a coordinator payload, an
+	// initial manifest pack, and state. Do not reserve unrelated collections'
+	// transaction slots in every hidden collection.
+	documents += int(identity.RelationCount) + distributedtxn.MaxManifestSegmentsPerCommand + 4
+	minimum, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, ledger)
+	if !ok {
+		return ReplicatedShardStoreLimits{}
+	}
+	documents = min(transactionDocuments, max(documents, minimum.MaxDistinctMutations))
+	return replicatedApplySystemLimitsForLedger(retryWindow, ledger, documents)
 }
 
 func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Options {
@@ -418,6 +444,7 @@ func replicatedApplyTransactionByteFloor(
 	identity ReplicatedShardStoreIdentity,
 	retryWindow uint16,
 	ledger bool,
+	transactionDocuments ...int,
 ) (int64, error) {
 	if retryWindow == 0 || retryWindow > replicatedstate.MaxSessionRetryWindow ||
 		validateReplicatedShardStoreIdentity(identity) != nil {
@@ -431,7 +458,13 @@ func replicatedApplyTransactionByteFloor(
 		}
 		relationBytes = min(int64(replication.MaxCommandBytes), relationBytes+limit)
 	}
-	systemBytes := int64(replicatedApplySystemLimitsForLedger(retryWindow, ledger).MaxBatchBytes)
+	documents := defaultDriverTxnLimits().MaxDocuments
+	if len(transactionDocuments) == 1 {
+		documents = transactionDocuments[0]
+	} else if len(transactionDocuments) != 0 {
+		return 0, ErrReplicatedApplyMismatch
+	}
+	systemBytes := int64(replicatedApplyTransactionSystemLimits(identity, retryWindow, ledger, documents).MaxBatchBytes)
 	capture, err := replicatedCaptureLimits(identity)
 	if err != nil || systemBytes <= 0 || capture.MaxBatchBytes <= 0 ||
 		relationBytes > math.MaxInt64-systemBytes ||
@@ -2171,8 +2204,8 @@ func newReplicatedApplyMeta(
 	options ReplicatedApplyOptions,
 ) replicatedApplyMeta {
 	captureLimits, _ := replicatedCaptureLimits(identity)
-	systemLimits := replicatedApplySystemLimitsForLedger(options.RetryWindow,
-		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}))
+	systemLimits := replicatedApplyTransactionSystemLimits(identity, options.RetryWindow,
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), options.TxnLimits.MaxDocuments)
 	return replicatedApplyMeta{
 		Format:                           ReplicatedApplyFormat,
 		Storage:                          strings.Clone(storage),
@@ -2231,7 +2264,7 @@ func validateReplicatedApplyOptions(
 		return fmt.Errorf("%w: invalid transaction or retention limits", ErrReplicatedApplyMismatch)
 	}
 	requiredBytes, err := replicatedApplyTransactionByteFloor(identity, options.RetryWindow,
-		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}))
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), options.TxnLimits.MaxDocuments)
 	if err != nil || options.TxnLimits.MaxBytes < requiredBytes {
 		return fmt.Errorf("%w: transaction byte limit does not cover apply and capture", ErrReplicatedApplyMismatch)
 	}
@@ -2399,8 +2432,8 @@ func validateReplicatedApplyMeta(
 		m.CaptureStorage == m.Storage {
 		return fmt.Errorf("%w: invalid or aliased capture storage identity", ErrReplicatedApplyMismatch)
 	}
-	if m.SystemLimits != replicatedApplySystemLimitsForLedger(m.RetryWindow,
-		m.RequestLedgerRangeIdentity != ([sha256.Size]byte{})) {
+	if m.SystemLimits != replicatedApplyTransactionSystemLimits(*identity, m.RetryWindow,
+		m.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), m.TxnMaxDocuments) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
 	captureLimits, err := replicatedCaptureLimits(*identity)

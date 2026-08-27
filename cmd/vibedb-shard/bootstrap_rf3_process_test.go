@@ -95,10 +95,9 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 
 	identity := rf3ColdTargetIdentity(t, options)
 	staticBootstrap := options.StaticBootstrap
-	// The transient preparation WAL must contain its local member. Its only job
-	// is binding SQL identities, so prepare it as the learner beside the stable
-	// RF3; the separately retained static bootstrap remains the original voter
-	// cut required by the certified learner installer.
+	// The intended learner membership is retained separately from the original
+	// voter bootstrap. SQL is bound from the planned immutable identity; no
+	// transient WAL family may precede the certified snapshot base.
 	preparationBootstrap := raftstore.Bootstrap{
 		TopologyRecoveryEpoch: staticBootstrap.TopologyRecoveryEpoch,
 		Snapshot:              proto.Clone(staticBootstrap.Snapshot).(*pb.Snapshot),
@@ -130,11 +129,8 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 	if err = prepared.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Only the transient identity-binding WAL is removed. SQL retains an empty
-	// non-serving apply reservation, never an initialized checkpoint to erase.
-	if err = os.Remove(prepared.WALPath); err != nil {
-		t.Fatal(err)
-	}
+	// SQL retains only an empty, non-serving apply reservation. There must be
+	// no WAL or family generation to erase or reinterpret during installation.
 	if _, err = os.Stat(prepared.WALPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cold target WAL still exists: %v", err)
 	}
@@ -183,12 +179,12 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 
 func rf3ColdTargetBootstrapDocument(options rf3ColdTargetOptions, memberPath, staticPath string) []byte {
 	return []byte(fmt.Sprintf(
-		`{"member_manifest":%q,"control_listener":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"max_artifact_bytes":%d}`,
+		`{"member_manifest":%q,"control_listener":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"wal_wrapped_key":"%x","max_artifact_bytes":%d}`,
 		memberPath, options.Listeners.Control, options.SourceNode,
 		options.SourceSnapshotAddress, filepath.Join(options.Root, "target-artifacts"),
 		filepath.Join(options.Root, "snapshot-cursor"),
 		filepath.Join(options.Root, "bootstrap-journal"), staticPath,
-		options.MaxArtifactBytes,
+		options.Key.Wrapped, options.MaxArtifactBytes,
 	))
 }
 
@@ -301,6 +297,8 @@ func (process *rf3ColdTargetProcess) Close(t testing.TB) {
 	process.mu.Unlock()
 	if waitErr != nil {
 		t.Errorf("member %d exit: %v\n%s", process.member, waitErr, process.diagnostic.String())
+	} else if t.Failed() {
+		t.Logf("member %d cold bootstrap diagnostics:\n%s", process.member, process.diagnostic.String())
 	}
 }
 

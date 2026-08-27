@@ -56,8 +56,8 @@ func PrepareMember(options MemberOptions) (*PreparedMember, error) {
 }
 
 // PrepareSnapshotTarget binds an empty target and reserves its exact apply
-// identity, without installing a Raft state or checkpoint. The caller closes
-// and removes only the transient identity-binding WAL before cold bootstrap.
+// identity using the intended immutable WAL identity. No WAL, WAL family,
+// Raft state, or checkpoint is created before certified snapshot installation.
 func PrepareSnapshotTarget(options MemberOptions) (*PreparedMember, error) {
 	return prepareMember(options, true)
 }
@@ -69,11 +69,23 @@ func prepareMember(options MemberOptions, coldSnapshot bool) (*PreparedMember, e
 	}
 	walPath := filepath.Join(options.Root, "member.wal")
 	sqlPath := filepath.Join(options.Root, "member.vdb")
-	wal, err := raftstore.Create(
-		walPath, options.Identity, options.Key, options.Bootstrap, options.WAL,
-	)
+	var wal *raftstore.Store
+	var binding sqldriver.ReplicatedShardStoreBinding
+	var err error
+	if coldSnapshot {
+		binding, err = raftmember.BindingForNewWAL(options.Identity,
+			options.Bootstrap.TopologyRecoveryEpoch, options.Authority)
+	} else {
+		wal, err = raftstore.Create(walPath, options.Identity, options.Key, options.Bootstrap, options.WAL)
+	}
 	if err != nil {
 		return nil, err
+	}
+	closeWAL := func() error {
+		if wal != nil {
+			return wal.Close()
+		}
+		return nil
 	}
 	database, err := sqldriver.InitializeShardStore(sqlPath, sqldriver.ShardStoreBinding{
 		Distribution: distribution.DistributionName(options.Identity.Distribution),
@@ -83,10 +95,10 @@ func prepareMember(options MemberOptions, coldSnapshot bool) (*PreparedMember, e
 		),
 	})
 	if err != nil {
-		return nil, errors.Join(err, wal.Close())
+		return nil, errors.Join(err, closeWAL())
 	}
 	closeBoth := func(cause error) (*PreparedMember, error) {
-		return nil, errors.Join(cause, database.Close(), wal.Close())
+		return nil, errors.Join(cause, database.Close(), closeWAL())
 	}
 	for _, schema := range append([]string{options.CreateTable}, options.SchemaStatements...) {
 		if schema == "" {
@@ -135,14 +147,13 @@ func prepareMember(options MemberOptions, coldSnapshot bool) (*PreparedMember, e
 		}
 	}
 	var base sqldriver.ReplicatedShardStoreIdentity
-	if len(options.GlobalIndexes) == 0 {
-		base, err = raftmember.BindPreparedSQL(
-			wal, database, options.Authority, options.Table,
-		)
-	} else {
-		var binding sqldriver.ReplicatedShardStoreBinding
+	if !coldSnapshot {
 		binding, err = raftmember.BindingFromWAL(wal, options.Authority)
-		if err == nil {
+	}
+	if err == nil {
+		if len(options.GlobalIndexes) == 0 {
+			base, err = database.BindReplicatedShardStore(binding, options.Table)
+		} else {
 			base, err = database.BindReplicatedShardStoreBundle(
 				binding, options.Table, options.GlobalIndexes,
 			)

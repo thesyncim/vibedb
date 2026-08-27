@@ -779,6 +779,15 @@ func TestSnapshotArtifactBoundsAndCallbackFailures(t *testing.T) {
 }
 
 func TestRequiredSnapshotArtifactPayloadCapacity(t *testing.T) {
+	system, err := RequiredSnapshotArtifactSystemPayloadCapacity(0,
+		replication.MaxMutationKeyBytes, replication.MaxCommandBytes)
+	if err != nil || system != DefaultSnapshotArtifactChunkBytes {
+		t.Fatalf("maximum opaque system row grew streaming scratch: %d, %v", system, err)
+	}
+	if _, err := RequiredSnapshotArtifactSystemPayloadCapacity(0, 1,
+		replication.MaxCommandBytes+1); !errors.Is(err, ErrSnapshotArtifactBound) {
+		t.Fatalf("oversized opaque system row accepted: %v", err)
+	}
 	ordinary, err := RequiredSnapshotArtifactPayloadCapacity(0, 32, 4096)
 	if err != nil || ordinary != DefaultSnapshotArtifactChunkBytes {
 		t.Fatalf("ordinary payload capacity = %d, %v", ordinary, err)

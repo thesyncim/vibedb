@@ -1,6 +1,7 @@
 package raftservice
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -9,6 +10,30 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3/raftpb"
 )
+
+type retirementHost struct {
+	ownerHost
+	state   replicatedstate.State
+	status  raftmember.RuntimeStatus
+	removed bool
+}
+
+func (host *retirementHost) Publication(raftmember.GroupKey) (raftmodel.Publication, error) {
+	return raftmodel.Publication{ReplicaSetVersion: host.state.ReplicaSetVersion}, nil
+}
+
+func (host *retirementHost) SnapshotState(raftmember.GroupKey) (replicatedstate.State, error) {
+	return host.state, nil
+}
+
+func (host *retirementHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *retirementHost) Remove(raftmember.GroupKey) error {
+	host.removed = true
+	return nil
+}
 
 func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	group := peerServerTestGroup()
@@ -79,5 +104,40 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	if updated.ReplicaSetVersion != 8 || updated.OwnershipEpoch != 9 ||
 		updated.RoutingVersion != 11 || updated.RouteGeneration != 12 {
 		t.Fatalf("updated command=%+v", updated)
+	}
+
+	// A removed source need not have received an observation RPC since the
+	// ownership and membership changes applied. Retirement must validate the
+	// durable cut, not a command-fence cache refreshed only by such an RPC.
+	state.ConfState.Voters = []uint64{2, 3, 4}
+	retireFence.MemberID = 1
+	probeHost := &retirementHost{state: state}
+	probeOwner := &Owner{host: probeHost, members: map[raftmember.GroupKey]ownerMember{group: member}}
+	reply := make(chan ownerReply, 1)
+	if err := probeOwner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); err != nil {
+		t.Fatal(err)
+	}
+	if observed := <-reply; observed.err != nil || observed.state.Command != retireFence.Command {
+		t.Fatalf("probe returned pre-transition command fence: %+v", observed)
+	}
+	for _, staleRequest := range []bool{false, true} {
+		member.identity.MemberID = 1
+		member.command = fence.Command
+		host := &retirementHost{state: state, status: raftmember.RuntimeStatus{MemberID: 1, LeaderID: 2, Term: retireFence.Term}}
+		owner := &Owner{host: host, groups: []raftmember.GroupKey{group},
+			members: map[raftmember.GroupKey]ownerMember{group: member}}
+		requestFence := retireFence
+		if staleRequest {
+			requestFence.Command = fence.Command
+		}
+		err := owner.retireReplica(ownerRequest{group: group, fence: requestFence,
+			operation: [32]byte{1}, step: [32]byte{2}, sourceMember: 1, targetMember: 2})
+		if staleRequest {
+			if !errors.Is(err, ErrServingFence) || host.removed {
+				t.Fatalf("stale retirement: removed=%t err=%v", host.removed, err)
+			}
+		} else if err != nil || !host.removed || len(owner.members) != 0 {
+			t.Fatalf("current retirement without observation: removed=%t err=%v", host.removed, err)
+		}
 	}
 }

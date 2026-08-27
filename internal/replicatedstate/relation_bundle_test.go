@@ -187,6 +187,19 @@ func newRelationBundleFixtureWithSecondKind(
 	secondKind RelationKind,
 	globalValidation ...MutationValidator,
 ) relationBundleFixture {
+	return newRelationBundleFixtureWithSystemOptions(t, checkpoint, reserveCapture,
+		baseOptions, globalOptions, secondKind,
+		durable.Options{OpaqueValues: true, MaxBatchDocuments: 32}, globalValidation...)
+}
+
+func newRelationBundleFixtureWithSystemOptions(
+	t testing.TB,
+	checkpoint, reserveCapture bool,
+	baseOptions, globalOptions durable.Options,
+	secondKind RelationKind,
+	systemOptions durable.Options,
+	globalValidation ...MutationValidator,
+) relationBundleFixture {
 	t.Helper()
 	dir := t.TempDir()
 	open := func(name string, options durable.Options) CollectionTarget {
@@ -205,9 +218,7 @@ func newRelationBundleFixtureWithSecondKind(
 		return targetOf(collection)
 	}
 	index := store.IndexDefinition{Name: "by_email", Paths: []string{"/email"}}
-	system := open("system", durable.Options{
-		OpaqueValues: true, MaxBatchDocuments: 32,
-	})
+	system := open("system", systemOptions)
 	system = systemTargetOf(system.Collection)
 	baseOptions.Indexes = []store.IndexDefinition{index}
 	base := open("base", baseOptions)

@@ -52,12 +52,12 @@ func replicatedSchemaActivationMatchesCatalog(catalogPath string) (bool, error) 
 	if err != nil || !found {
 		return false, err
 	}
-	image, err := ValidateReplicatedSchemaCatalogImage(raw)
-	if err != nil {
-		return false, err
-	}
 	record, activationFound, err := readReplicatedSchemaActivation(catalogPath + ".tables")
 	if err != nil || !activationFound {
+		return false, err
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil {
 		return false, err
 	}
 	return record.targetDigest == image.Digest, nil
@@ -78,12 +78,15 @@ func PublishedReplicatedSchemaActivationIdentity(
 	if err != nil || !found {
 		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
 	}
-	catalog, image, err := openReplicatedSchemaCatalogImage(raw)
-	if err != nil {
+	// A cold snapshot target has a reserved child apply identity, not an active
+	// schema image. Only an actual activation record authorizes interpreting
+	// the catalog as a published schema transition.
+	record, activationFound, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !activationFound {
 		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
 	}
-	record, activationFound, err := readReplicatedSchemaActivation(absolute + ".tables")
-	if err != nil || !activationFound || record.targetDigest != image.Digest {
+	catalog, image, err := openReplicatedSchemaCatalogImage(raw)
+	if err != nil || record.targetDigest != image.Digest {
 		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
 	}
 	transition, err := replicatedstate.OpenSchemaTransition(record.command)

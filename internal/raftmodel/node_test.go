@@ -1197,6 +1197,9 @@ func TestReadIndexWaitsForOrderedPublication(t *testing.T) {
 
 func TestLeaderTransferRequiresConfiguredVoterAndExposesProgress(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	if progress, found := node.Progress(2); found || progress != (MemberProgress{}) {
+		t.Fatalf("follower exposed leader-only progress: %+v, %t", progress, found)
+	}
 	if err := node.TransferLeader(2); !errors.Is(err, ErrNotLeader) {
 		t.Fatalf("follower TransferLeader = %v", err)
 	}

@@ -83,8 +83,9 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	baselineWAL := durableRF3ExternalAllocatedTotal(baselineWALs)
 	baselineSnapshot := replicaProcessSnapshotPayloadBytes(fixture.root)
 	baselineRSS := fixture.liveRSS()
-	if baselineStorage == 0 || baselineStorage > 2<<30 || baselineWAL == 0 || baselineRSS == 0 {
-		t.Fatalf("invalid baseline storage=%d wal=%d rss=%d", baselineStorage, baselineWAL, baselineRSS)
+	if baselineStorage == 0 || baselineStorage > fixture.baselineStorageBudget || baselineWAL == 0 || baselineRSS == 0 {
+		t.Fatalf("invalid baseline storage=%d limit=%d wal=%d rss=%d", baselineStorage,
+			fixture.baselineStorageBudget, baselineWAL, baselineRSS)
 	}
 	measurements := &durableRF3ExternalMeasurements{peakRSS: baselineRSS}
 	fixture.measurements = measurements
@@ -338,8 +339,9 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 }
 
 type durableRF3ExternalFixture struct {
-	ctx  context.Context
-	root string
+	baselineStorageBudget uint64
+	ctx                   context.Context
+	root                  string
 
 	nodes       [durableRF3ExternalNodes]rafttransport.NodeID
 	credentials []rf3testfixture.Credential
@@ -395,7 +397,7 @@ func newDurableRF3ExternalFixture(
 
 func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Context, peerFaults bool) *durableRF3ExternalFixture {
 	t.Helper()
-	fixture := &durableRF3ExternalFixture{ctx: ctx, root: t.TempDir(),
+	fixture := &durableRF3ExternalFixture{ctx: ctx, root: t.TempDir(), baselineStorageBudget: 2 << 30,
 		gatewayANode: 3, gatewayBNode: 4, userNode: 5, observerNode: 6}
 	cluster, err := rf3testfixture.ReserveProcessCluster()
 	if err != nil {
@@ -482,6 +484,18 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Preserve the original non-journal allowance exactly. Only the
+			// additional sealed transaction journal reservation changes the cold
+			// baseline; foreground storage/WAL/RSS growth budgets do not change.
+			priorJournal := sqldriver.ReplicatedSystemRecoveryJournalBytes
+			if group == durableRF3LedgerGroup {
+				priorJournal = (16 << 20) + 119*storeio.RecoveryJournalMinSectorSize
+			}
+			journal := prepared[group][member].SystemRecoveryJournalBytes
+			if journal < priorJournal || journal > storeio.RecoveryJournalMaxCapacityBytes {
+				t.Fatalf("role %d invalid fixed journal reservation %d", group, journal)
+			}
+			fixture.baselineStorageBudget += journal - priorJournal
 			if member > 0 && prepared[group][member].RelationManifestDigest !=
 				prepared[group][0].RelationManifestDigest {
 				t.Fatalf("role %s relation digest drifted", durableRF3ExternalRoleNames[group])

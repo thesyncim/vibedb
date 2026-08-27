@@ -85,6 +85,7 @@ Create this strict, ordered manifest on the target:
   "cursor_path": "/srv/vibedb/member-4/bootstrap.cursor",
   "journal_path": "/srv/vibedb/member-4/bootstrap-journal",
   "static_bootstrap_path": "/srv/vibedb/member-4/static-bootstrap.pb",
+  "wal_wrapped_key": "6578616d706c652d777261707065642d6b6579",
   "max_artifact_bytes": 1073741824
 }
 ```
@@ -92,6 +93,12 @@ Create this strict, ordered manifest on the target:
 `member_manifest` points to the target's ordinary RF3 manifest. That manifest
 still lists the original three voters and the same enrolled target. Its local
 retained SQL identity must bind member 4 and the target store ID.
+
+`wal_wrapped_key` is the key provider's opaque wrapped-key metadata, encoded as
+lowercase hexadecimal (1–1,024 decoded bytes). Replace the example with the
+metadata for the WAL key in `member_manifest`; do not put the raw key material
+here. A new target without a WAL starts at node incarnation 1. Later
+incarnations must come from its retained WAL, not an arbitrary manifest value.
 
 Start the cold target before the controller reaches snapshot bootstrap:
 

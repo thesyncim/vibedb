@@ -127,6 +127,23 @@ func RequiredSnapshotArtifactPayloadCapacity(
 	maxKeyBytes int,
 	maxDocumentBytes int,
 ) (int, error) {
+	return requiredSnapshotArtifactPayloadCapacity(targetChunkBytes, maxKeyBytes, maxDocumentBytes,
+		replication.MaxMutationValueBytes)
+}
+
+// RequiredSnapshotArtifactSystemPayloadCapacity keeps opaque transaction and
+// request-ledger rows on the same bounded streaming path without applying the
+// narrower user-document ceiling to the hidden collection.
+func RequiredSnapshotArtifactSystemPayloadCapacity(
+	targetChunkBytes, maxKeyBytes, maxDocumentBytes int,
+) (int, error) {
+	return requiredSnapshotArtifactPayloadCapacity(targetChunkBytes, maxKeyBytes, maxDocumentBytes,
+		replication.MaxCommandBytes)
+}
+
+func requiredSnapshotArtifactPayloadCapacity(
+	targetChunkBytes, maxKeyBytes, maxDocumentBytes, documentCeiling int,
+) (int, error) {
 	target, err := normalizeSnapshotArtifactOptions(SnapshotArtifactOptions{
 		TargetChunkBytes: targetChunkBytes,
 	})
@@ -134,7 +151,7 @@ func RequiredSnapshotArtifactPayloadCapacity(
 		return 0, err
 	}
 	if maxKeyBytes <= 0 || maxKeyBytes > replication.MaxMutationKeyBytes ||
-		maxDocumentBytes <= 0 || maxDocumentBytes > replication.MaxMutationValueBytes {
+		maxDocumentBytes <= 0 || maxDocumentBytes > documentCeiling {
 		return 0, fmt.Errorf(
 			"%w: collection row bounds %d/%d",
 			ErrSnapshotArtifactBound,

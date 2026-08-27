@@ -62,7 +62,7 @@ func TestRecoveryJournalReplicatedLedgerConditionalCeiling(t *testing.T) {
 		RecoveryJournalMinSectorSize, entryCount,
 		payloadBytes+RecoveryConditionalHeaderSize,
 	)
-	if uint64(got) != RecoveryJournalMaxCapacityBytes {
+	if got != (16<<20)+119*RecoveryJournalMinSectorSize || uint64(got) > RecoveryJournalMaxCapacityBytes {
 		t.Fatalf("replicated ledger conditional ceiling = %d, journal clamp = %d", got, RecoveryJournalMaxCapacityBytes)
 	}
 }

@@ -87,7 +87,7 @@ func requiredWALBaseWorkspaceBytes(
 	base ReplicatedShardStoreIdentity,
 ) int {
 	t.Helper()
-	systemBytes, err := replicatedstate.RequiredSnapshotArtifactPayloadCapacity(
+	systemBytes, err := replicatedstate.RequiredSnapshotArtifactSystemPayloadCapacity(
 		replicatedstate.DefaultSnapshotArtifactChunkBytes,
 		claim.identity.SystemLimits.MaxKeyBytes,
 		claim.identity.SystemLimits.MaxDocumentBytes,

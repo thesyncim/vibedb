@@ -518,12 +518,44 @@ func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (
 		if !authorized && view.previous != nil {
 			authorized = err == nil && authorizedConfChange(view.previous, change, member, digest)
 		}
+		if !authorized && err == nil && entry.GetIndex() != 0 && entry.GetIndex() <= view.version {
+			authorized = authorizedCommittedConfReplay(view, change, member, digest)
+		}
 		if !authorized {
 			return false, fmt.Errorf("%w: configuration differs from metadata grant", ErrUnauthorized)
 		}
 		found = true
 	}
 	return found, nil
+}
+
+// A restarted/snapshot-installed member has its committed roles but not the
+// previous in-memory authority view. Raft may still probe it with an append
+// containing that already committed transition. The exact retained grant and
+// resulting roles authorize only historical entries; they do not grant a new
+// transition, a past sender role, or an older frame generation.
+func authorizedCommittedConfReplay(
+	view *authorityView,
+	change pb.ConfChangeType,
+	member uint64,
+	digest [raftmember.MembershipTransitionDigestBytes]byte,
+) bool {
+	grant := view.grant
+	if grant == (membershipgrant.Grant{}) || grant.Digest() != digest {
+		return false
+	}
+	targetRole := view.roles[grant.TargetMember]
+	switch change {
+	case pb.ConfChangeAddLearnerNode:
+		return member == grant.TargetMember && (targetRole == MemberLearner || targetRole == MemberVoter)
+	case pb.ConfChangeAddNode:
+		return member == grant.TargetMember && targetRole == MemberVoter
+	case pb.ConfChangeRemoveNode:
+		_, sourcePresent := view.roles[grant.SourceMember]
+		return member == grant.SourceMember && targetRole == MemberVoter && !sourcePresent
+	default:
+		return false
+	}
 }
 
 func openSingleConfChange(

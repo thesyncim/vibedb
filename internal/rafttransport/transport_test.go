@@ -996,7 +996,10 @@ func (connection *transportTestConnection) PeerIdentity() PeerIdentity {
 func (connection *transportTestConnection) TrafficClass() TrafficClass {
 	return connection.class
 }
-func (connection *transportTestConnection) Read([]byte) (int, error) { return 0, io.EOF }
+func (connection *transportTestConnection) Read([]byte) (int, error) {
+	<-connection.closed
+	return 0, io.EOF
+}
 func (connection *transportTestConnection) Write(buffer []byte) (int, error) {
 	if connection.writeGate != nil {
 		select {

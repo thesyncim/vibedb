@@ -31,7 +31,7 @@ func TestReplicatedApplyRequestLedgerCatalogRoundTripAndMachinePlumbing(t *testi
 		t.Fatal(err)
 	}
 	dataFloor, err := ReplicatedApplyTransactionByteFloor(base, options.RetryWindow)
-	if err != nil || ledgerFloor <= dataFloor {
+	if err != nil || ledgerFloor < dataFloor {
 		t.Fatalf("ledger floor=%d data floor=%d err=%v", ledgerFloor, dataFloor, err)
 	}
 	options.TxnLimits.MaxBytes = ledgerFloor
@@ -63,8 +63,8 @@ func TestReplicatedApplyRequestLedgerCatalogRoundTripAndMachinePlumbing(t *testi
 		identity.RequestLedgerRangeIdentity != options.RequestLedgerRangeIdentity {
 		t.Fatalf("request-ledger retained identity = %+v", identity)
 	}
-	if identity.SystemLimits != replicatedApplySystemLimitsForLedger(options.RetryWindow, true) ||
-		identity.Sidecars != canonicalReplicatedLedgerApplySidecars() {
+	if identity.SystemLimits != replicatedApplyTransactionSystemLimits(base, options.RetryWindow, true, options.TxnLimits.MaxDocuments) ||
+		identity.Sidecars != canonicalReplicatedApplySidecarsForLimits(identity.SystemLimits) {
 		t.Fatalf("request-ledger retained geometry = %+v %+v", identity.SystemLimits, identity.Sidecars)
 	}
 	encoded, err := identity.MarshalJSON()
@@ -118,7 +118,8 @@ func TestReplicatedApplyRequestLedgerGeometryIsBoundedAndCanonical(t *testing.T)
 			t.Fatalf("retry=%d ledger geometry=%+v required=%+v", retryWindow, limits, required)
 		}
 		sidecars := canonicalReplicatedApplySidecarsForLimits(limits)
-		if sidecars.SystemRecoveryJournalBytes != storeio.RecoveryJournalMaxCapacityBytes {
+		if sidecars.SystemRecoveryJournalBytes != (16<<20)+119*storeio.RecoveryJournalMinSectorSize ||
+			sidecars.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes {
 			t.Fatalf("maximum ledger profile=%d differs from bounded recovery ceiling=%d",
 				sidecars.SystemRecoveryJournalBytes, storeio.RecoveryJournalMaxCapacityBytes)
 		}

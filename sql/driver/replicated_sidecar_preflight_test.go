@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -38,5 +39,52 @@ func TestReplicatedApplyDurableProfilesPreflightEveryRetryWindow(t *testing.T) {
 	}
 	if ReplicatedSystemRecoveryJournalBytes != 655872 || ReplicatedUserRecoveryJournalBytes != 16794624 {
 		t.Fatal("data-only system or user journal changed with ledger ceiling")
+	}
+}
+
+func TestReplicatedTransactionProfilesPreflightEveryRetryWindow(t *testing.T) {
+	for _, ledger := range []bool{false, true} {
+		for relations := uint16(1); relations <= 2; relations++ {
+			base := ReplicatedShardStoreIdentity{RelationCount: relations,
+				Relations: make([]ReplicatedShardRelationIdentity, relations)}
+			for i := 0; i < int(relations); i++ {
+				base.Relations[i].Limits.MaxBatchDocuments = replicatedstate.MaxDistinctMutations
+			}
+			for retry := uint16(1); retry <= replicatedstate.MaxSessionRetryWindow; retry++ {
+				limits := replicatedApplyTransactionSystemLimits(base, retry, ledger, 2048)
+				options := replicatedApplyDurableOptions(limits)
+				if err := durable.ValidateOptions(options); err != nil {
+					t.Fatalf("ledger=%t relations=%d retry=%d: %v", ledger, relations, retry, err)
+				}
+				if err := validateReplicatedApplySidecarsForLimits(
+					canonicalReplicatedApplySidecarsForLimits(limits), limits); err != nil {
+					t.Fatal(err)
+				}
+				if limits.MaxBatchDocuments >= 2048 || limits.MaxDocumentBytes != replication.MaxCommandBytes {
+					t.Fatalf("profile did not derive relation-local stage geometry: %+v", limits)
+				}
+			}
+		}
+	}
+}
+
+func TestReplicatedTransactionSystemJournalHardCeiling(t *testing.T) {
+	for _, ledger := range []bool{false, true} {
+		limits := replicatedApplySystemLimitsForLedger(replicatedstate.MaxSessionRetryWindow,
+			ledger, replicatedstate.MaxTransactionSystemDocuments)
+		required := storeio.RecoveryBatchRecordPaddedSizeForPayload(storeio.RecoveryJournalMinSectorSize,
+			limits.MaxBatchDocuments, limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize)
+		if uint64(required) != storeio.RecoveryJournalMaxCapacityBytes {
+			t.Fatalf("ledger=%t exact transaction record=%d hard ceiling=%d", ledger,
+				required, storeio.RecoveryJournalMaxCapacityBytes)
+		}
+		profile := canonicalReplicatedApplySidecarsForLimits(limits)
+		if err := validateReplicatedApplySidecarsForLimits(profile, limits); err != nil {
+			t.Fatal(err)
+		}
+		profile.SystemRecoveryJournalBytes -= storeio.RecoveryJournalMinSectorSize
+		if err := validateReplicatedApplySidecarsForLimits(profile, limits); err == nil {
+			t.Fatal("one-sector-short transaction journal accepted")
+		}
 	}
 }

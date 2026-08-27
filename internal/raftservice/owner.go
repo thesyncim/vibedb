@@ -863,6 +863,14 @@ func (owner *Owner) Run(ctx context.Context) error {
 				// remain owned by their existing queues. MeasureOrdinaryMessage
 				// excludes snapshots before Send. Wrapped/mixed faults stay fatal.
 				pending = raftmember.OutboundMessage{}
+			case rafttransport.ErrTransportClosed:
+				// The shared transport may observe shutdown before this owner.
+				// Only that exact cancellation race is expected; an independently
+				// closed transport remains a fatal component failure.
+				if cause := context.Cause(ctx); cause != nil {
+					return owner.stop(cause)
+				}
+				return owner.stop(err)
 			default:
 				return owner.stop(err)
 			}
@@ -1030,9 +1038,17 @@ func (owner *Owner) handle(request ownerRequest) error {
 			if publicationErr != nil {
 				reply.err = publicationErr
 			} else if publication.ReplicaSetVersion != 0 {
-				member.command.ReplicaSetVersion = publication.ReplicaSetVersion
-				owner.members[request.group] = member
-				reply.state.Command = member.command
+				// A probe is the source of the caller's next serving fence. All
+				// mutable fields must come from the applied cut, including on a
+				// follower that has never received a controller observation.
+				state, stateErr := owner.host.SnapshotState(request.group)
+				reply.err = stateErr
+				if stateErr == nil {
+					reply.err = owner.syncCommandFenceFromState(request.group, ReplicaObservation{
+						Publication: publication, State: state,
+					})
+					reply.state.Command = owner.members[request.group].command
+				}
 			}
 		}
 	case requestMembership:
@@ -1545,6 +1561,24 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 	if !found {
 		return multiraft.ErrGroupNotFound
 	}
+	// Applied ownership/membership changes can precede the next observation
+	// RPC. Refresh from the same serialized durable cut used below; requiring
+	// a controller probe to refresh this cache can strand a removed source.
+	publication, err := owner.host.Publication(request.group)
+	if err != nil || publication.ReplicaSetVersion != request.fence.Command.ReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	state, err := owner.host.SnapshotState(request.group)
+	if err != nil || !retirementStateMatches(state, request.fence, request.sourceMember,
+		request.targetMember) {
+		return errors.Join(err, ErrServingFence)
+	}
+	if err = owner.syncCommandFenceFromState(request.group, ReplicaObservation{
+		Publication: publication, State: state,
+	}); err != nil {
+		return err
+	}
+	member = owner.members[request.group]
 	// A retry after ErrGroupBusy remains authorized by the exact latched member
 	// identity, but the retiring bit permanently fences data serving.
 	wasRetiring := member.retiring
@@ -1555,15 +1589,6 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 		request.sourceMember != member.identity.MemberID || request.targetMember == 0 ||
 		request.targetMember == request.sourceMember {
 		return ErrServingFence
-	}
-	publication, err := owner.host.Publication(request.group)
-	if err != nil || publication.ReplicaSetVersion != request.fence.Command.ReplicaSetVersion {
-		return errors.Join(err, ErrServingFence)
-	}
-	state, err := owner.host.SnapshotState(request.group)
-	if err != nil || !retirementStateMatches(state, request.fence, request.sourceMember,
-		request.targetMember) {
-		return errors.Join(err, ErrServingFence)
 	}
 	status, err := owner.host.Status(request.group)
 	if err != nil {

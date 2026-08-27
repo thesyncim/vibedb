@@ -83,17 +83,13 @@ const (
 	// append cannot rewrite an already-synced earlier record.
 	RecoveryJournalMinSectorSize = 512
 	// RecoveryJournalMaxCapacityBytes is the authoritative upper bound for the
-	// preallocated record region and the buffer read by recovery. Its extra bytes
-	// cover the largest replicated system profile: a 16 MiB command budget,
-	// every maximum-size key across 514 records (256 slots, 256 historical
-	// fences, session, and state),
-	// conditional and per-entry framing,
-	// checksum trailer, and sector padding. Keeping the bound here makes a
-	// checksummed hostile header unable to request an unbounded allocation and
-	// keeps durable's creation clamp from drifting.
-	// Compared with the former 258-record bound, the exact additional framing
-	// and keys require 59 sectors (30,208 bytes), not a larger command budget.
-	RecoveryJournalMaxCapacityBytes = (uint64(16) << 20) + 119*RecoveryJournalMinSectorSize
+	// preallocated record region and the buffer read by recovery. The maximum
+	// transaction profile stores a 16 MiB command, 3,776 exact intent rows
+	// (64 per relation), relation/control/manifest framing, and 3,854 entry headers. The cross-
+	// package profile test derives this exact sector count from the codecs.
+	// Individual owners still seal only their configured document budget;
+	// this hard parsing ceiling is not the default allocation size.
+	RecoveryJournalMaxCapacityBytes = uint64(35861) * RecoveryJournalMinSectorSize
 
 	// RecoveryJournalFormat is the sole admitted recovery-journal grammar.
 	RecoveryJournalFormat = uint32(0)

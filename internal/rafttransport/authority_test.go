@@ -18,6 +18,54 @@ type disappearingGrantSource struct {
 	reads int
 }
 
+func TestRestartedLearnerAcceptsCertifiedConfigurationReplay(t *testing.T) {
+	group := testGroup(34)
+	members := []Member{
+		{Group: group, ReplicaSetVersion: 6, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 3, Node: testNode(3), Role: MemberLearner},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 4, Node: testNode(4), Role: MemberVoter},
+	}
+	open := func(local NodeID) *StaticRegistry {
+		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := registry.InstallTransitionGrant(authorityTestGrant(group)); err != nil {
+			t.Fatal(err)
+		}
+		return registry
+	}
+	leader, learner := open(testNode(1)), open(testNode(3))
+	appendMessage := authorizedConfigurationMessage(t, group, pb.ConfChangeAddLearnerNode, 3, 1, 3)
+	appendMessage.Index = proto.Uint64(5)
+	appendMessage.Entries[0].Index = proto.Uint64(6)
+	frame, _, err := leader.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 1, To: 3, Message: appendMessage,
+	})
+	if err != nil {
+		t.Fatalf("restarted sender rejected committed configuration replay: %v", err)
+	}
+	if _, err := learner.DecodeInbound(testPeerIdentity(learner, testNode(1)), frame); err != nil {
+		t.Fatalf("restarted learner rejected committed configuration replay: %v", err)
+	}
+	appendMessage.Index = proto.Uint64(6)
+	appendMessage.Entries[0].Index = proto.Uint64(7)
+	if _, _, err := leader.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 1, To: 3, Message: appendMessage,
+	}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("future learner re-add accepted as historical replay: %v", err)
+	}
+	appendMessage.Index = proto.Uint64(5)
+	appendMessage.Entries[0].Index = proto.Uint64(6)
+	appendMessage.Entries[0].Data[len(appendMessage.Entries[0].Data)-1] ^= 1
+	if _, _, err := leader.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 1, To: 3, Message: appendMessage,
+	}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("foreign historical grant accepted: %v", err)
+	}
+}
+
 func (source *disappearingGrantSource) ReadMembershipGrant(
 	context.Context, raftmember.GroupKey,
 ) (membershipgrant.Grant, bool, error) {

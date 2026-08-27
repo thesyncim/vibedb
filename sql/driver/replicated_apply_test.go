@@ -1061,7 +1061,6 @@ func TestReplicatedApplyMaximumRetryWindowCreatesAndReopens(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "maximum-retry-window")
 	options := testReplicatedApplyOptions()
 	options.RetryWindow = replicatedstate.MaxSessionRetryWindow
-	limits := replicatedApplySystemLimits(options.RetryWindow)
 	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
 		base.UserLimits.MaxBatchDocuments, options.RetryWindow, true,
 	)
@@ -1069,6 +1068,7 @@ func TestReplicatedApplyMaximumRetryWindowCreatesAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	options.TxnLimits.MaxDocuments = maxDocuments
+	limits := replicatedApplyTransactionSystemLimits(base, options.RetryWindow, false, maxDocuments)
 	if limits.MaxBatchDocuments != 2*int(replicatedstate.MaxSessionRetryWindow)+2 ||
 		limits.MaxBatchBytes < limits.MaxDocumentBytes+limits.MaxBatchDocuments*limits.MaxKeyBytes {
 		t.Fatalf("maximum retry-window system limits = %+v", limits)
@@ -1146,7 +1146,7 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) ||
 		identity.TxnLimits != options.TxnLimits || identity.MaxSessions != options.MaxSessions ||
 		identity.RetryWindow != options.RetryWindow ||
-		identity.Sidecars != canonicalReplicatedApplySidecars() {
+		identity.Sidecars != canonicalReplicatedApplySidecarsForLimits(identity.SystemLimits) {
 		t.Fatalf("apply identity = %+v", identity)
 	}
 	if got, err := claim.Identity(); err != nil || got != identity {
@@ -1156,9 +1156,9 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	core.mu.RLock()
 	hiddenPath := core.replicatedApplyPath(core.catalog.ReplicatedApply)
 	if core.catalog.ReplicatedApply == nil || core.replicatedApplyCollection == nil ||
-		core.catalog.ReplicatedApply.Sidecars != canonicalReplicatedApplySidecars() ||
+		core.catalog.ReplicatedApply.Sidecars != canonicalReplicatedApplySidecarsForLimits(identity.SystemLimits) ||
 		core.replicatedApplyCollection.SealedRecoveryJournalBytes() !=
-			ReplicatedSystemRecoveryJournalBytes ||
+			identity.Sidecars.SystemRecoveryJournalBytes ||
 		len(core.catalog.Tables) != 1 || core.tables["docs"] == nil {
 		core.mu.RUnlock()
 		t.Fatal("activation did not retain one visible table plus hidden participant")
@@ -3155,12 +3155,13 @@ func TestReplicatedApplyTransactionByteFloorIsMandatoryAndExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes) +
+	systemLimits := replicatedApplyTransactionSystemLimits(base, options.RetryWindow, false, options.TxnLimits.MaxDocuments)
+	want := int64(systemLimits.MaxBatchBytes) +
 		int64(captureLimits.MaxBatchBytes)
 	for ordinal := 0; ordinal < int(base.RelationCount); ordinal++ {
 		want = min(
 			int64(replication.MaxCommandBytes)+
-				int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes)+
+				int64(systemLimits.MaxBatchBytes)+
 				int64(captureLimits.MaxBatchBytes),
 			want+int64(base.Relations[ordinal].Limits.MaxBatchBytes),
 		)

@@ -259,13 +259,46 @@ func TestOwnerRejectedDestinationDoesNotBlockHealthyRaftQuorum(t *testing.T) {
 }
 
 type outboundErrorSink struct {
-	err   error
-	calls int
+	err    error
+	calls  int
+	before func()
 }
 
 func (sink *outboundErrorSink) Send(raftmember.OutboundMessage) error {
 	sink.calls++
+	if sink.before != nil {
+		sink.before()
+	}
 	return sink.err
+}
+
+func TestOwnerOutboundCloseRacePreservesShutdownCause(t *testing.T) {
+	shutdown := errors.New("requested shutdown")
+	for _, cancelSend := range []bool{false, true} {
+		for _, wrapped := range []bool{false, true} {
+			ctx, cancel := context.WithCancelCause(t.Context())
+			sendErr := rafttransport.ErrTransportClosed
+			if wrapped {
+				sendErr = fmt.Errorf("independent transport failure: %w", sendErr)
+			}
+			sink := &outboundErrorSink{err: sendErr, before: func() {
+				if cancelSend {
+					cancel(shutdown)
+				}
+			}}
+			owner := newTickPressureOwner(&tickPressureHost{outbound: tickPressureMessage()}, nil, sink)
+			err := owner.Run(ctx)
+			cancel(shutdown)
+			want := sendErr
+			if cancelSend && !wrapped {
+				want = shutdown
+			}
+			if !errors.Is(err, want) || sink.calls != 1 ||
+				(cancelSend && !wrapped && errors.Is(err, rafttransport.ErrTransportClosed)) {
+				t.Fatalf("cancel=%t wrapped=%t: result=%v want=%v sends=%d", cancelSend, wrapped, err, want, sink.calls)
+			}
+		}
+	}
 }
 
 func TestOwnerOutboundWrappedBackpressureRemainsFatal(t *testing.T) {

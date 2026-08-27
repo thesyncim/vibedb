@@ -49,7 +49,7 @@ func TestGatewayReadBatchRF3ExternalProcessChaos(t *testing.T) {
 	baselineWALs := fixture.captureWALAllocatedBytes(t)
 	baselineWAL := durableRF3ExternalAllocatedTotal(baselineWALs)
 	baselineRSS := fixture.liveRSS()
-	if baselineStorage == 0 || baselineStorage > 2<<30 || baselineWAL == 0 || baselineRSS == 0 {
+	if baselineStorage == 0 || baselineStorage > fixture.baselineStorageBudget || baselineWAL == 0 || baselineRSS == 0 {
 		t.Fatalf("invalid read_batch baseline storage=%d wal=%d rss=%d",
 			baselineStorage, baselineWAL, baselineRSS)
 	}

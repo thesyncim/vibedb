@@ -483,7 +483,7 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 	}
 }
 
-func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing.T) {
+func TestRuntimeBatchesCommittedCommandsIntoCapturedResultRanges(t *testing.T) {
 	fixture := newRuntimeFixture(t, 182, nil)
 	drainRuntime(t, fixture.runtime, nil)
 	if err := fixture.runtime.Campaign(); err != nil {
@@ -491,7 +491,10 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 	}
 	drainRuntime(t, fixture.runtime, nil)
 
-	const commandCount = 8
+	// The transaction-capable system profile can hold eight commands in one
+	// commit. Use the full user-relation mutation budget so this still proves
+	// multiple bounded commits and exact settlement of every prefix.
+	const commandCount = replicatedstate.MaxDistinctMutations
 	var epochs [commandCount]uint64
 	for index := range commandCount {
 		open := runtimeReplaySessionOpen(fixture.base, byte(index+10))
