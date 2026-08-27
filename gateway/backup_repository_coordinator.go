@@ -90,6 +90,32 @@ func (coordinator *BackupRepositoryCoordinator) Publish(ctx context.Context,
 	return record, nil
 }
 
+// CollectLive drives the complete catalog inventory through the backup-only
+// shard exporters directly into the central repository, then advances the
+// replicated lifecycle. Repository drafts are operation-scoped and no second
+// artifact copy is created.
+func (coordinator *BackupRepositoryCoordinator) CollectLive(ctx context.Context,
+	record ReplicatedOperationRecord, cut clusterbackup.CatalogCut,
+	sources []clusterbackup.LiveArtifactSource,
+) (ReplicatedOperationRecord, clusterbackup.Certificate, error) {
+	if coordinator == nil || ctx == nil || !validBackupRecord(record, backupStageCollecting) ||
+		len(sources) != int(record.Cursor[1]) {
+		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, ErrBackupOperation
+	}
+	certificate, err := coordinator.repository.CollectLive(ctx, record.ID, cut, sources)
+	if err != nil {
+		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, err
+	}
+	// Existing publication is selected before readers are consumed; the exact
+	// arity retains the repository's complete-vector grammar.
+	artifacts := make([]clusterbackup.ArtifactInput, len(certificate.Groups))
+	exported, err := coordinator.Publish(ctx, record, certificate, artifacts...)
+	if err != nil {
+		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, err
+	}
+	return exported, certificate, nil
+}
+
 // StageRestore verifies every artifact from the coordinator-owned immutable
 // export, builds a non-serving root, and only then advances the replicated
 // lifecycle. It never creates databases, members, stores, routes, or grants.

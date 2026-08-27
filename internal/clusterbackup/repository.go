@@ -154,6 +154,9 @@ func artifactName(digest [sha256.Size]byte, index int) string {
 func artifactTempName(digest [sha256.Size]byte, index int) string {
 	return "ta-" + digestText(digest) + "-" + strconv.FormatUint(uint64(index), 16)
 }
+func liveDraftName(operation [sha256.Size]byte, index int) string {
+	return "lb-" + digestText(operation) + "-" + strconv.FormatUint(uint64(index), 16)
+}
 
 func parseDigestName(name string, prefix string) (digest [sha256.Size]byte, ok bool) {
 	if len(name) != len(prefix)+sha256.Size*2 || name[:len(prefix)] != prefix {
@@ -208,6 +211,12 @@ func (r *BackupRepository) recover() error {
 			continue
 		}
 		if _, _, ok := parseArtifactName(entry.Name(), "ta-"); ok {
+			if err := r.root.Remove(entry.Name()); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, _, ok := parseArtifactName(entry.Name(), "lb-"); ok {
 			if err := r.root.Remove(entry.Name()); err != nil {
 				return err
 			}

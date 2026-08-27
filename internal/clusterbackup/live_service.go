@@ -125,6 +125,7 @@ func (client LiveClient) Export(ctx context.Context, request LiveRequest, destin
 	digest := sha256.New()
 	var buffer [32 << 10]byte
 	remaining := cut.ArtifactBytes
+	streamTerminal := false
 	for remaining != 0 {
 		if cause := context.Cause(ctx); cause != nil {
 			return GroupCut{}, cause
@@ -141,21 +142,25 @@ func (client LiveClient) Export(ctx context.Context, request LiveRequest, destin
 			_, _ = digest.Write(chunk[:n])
 			remaining -= uint64(n)
 		}
-		if readErr != nil {
+		if readErr != nil && remaining != 0 {
 			return GroupCut{}, errors.Join(ErrLiveBackup, readErr)
 		}
+		streamTerminal = readErr != nil
 	}
 	var got [sha256.Size]byte
 	copy(got[:], digest.Sum(nil))
 	if got != cut.ArtifactHash {
 		return GroupCut{}, ErrLiveBackup
 	}
-	var trailing [1]byte
-	if err = connection.SetReadDeadline(client.ReadDeadline()); err != nil {
-		return GroupCut{}, err
+	if streamTerminal {
+		return cut, nil
 	}
+	var trailing [1]byte
 	n, trailingErr := connection.Read(trailing[:])
-	if n != 0 || !errors.Is(trailingErr, io.EOF) && !errors.Is(trailingErr, net.ErrClosed) {
+	if n != 0 || trailingErr == nil {
+		return GroupCut{}, errors.Join(ErrLiveBackup, trailingErr)
+	}
+	if networkErr, ok := trailingErr.(net.Error); ok && networkErr.Timeout() {
 		return GroupCut{}, errors.Join(ErrLiveBackup, trailingErr)
 	}
 	return cut, nil

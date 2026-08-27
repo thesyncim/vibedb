@@ -2,14 +2,33 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 )
+
+type gatewayLiveExporter struct {
+	payload []byte
+	cut     clusterbackup.GroupCut
+}
+
+func (exporter gatewayLiveExporter) Export(_ context.Context, request clusterbackup.LiveRequest,
+	destination io.Writer,
+) (clusterbackup.GroupCut, error) {
+	if _, err := destination.Write(exporter.payload); err != nil {
+		return clusterbackup.GroupCut{}, err
+	}
+	cut := exporter.cut
+	cut.Group, cut.SourceMember = request.Group, request.SourceMember
+	cut.ArtifactBytes, cut.ArtifactHash = uint64(len(exporter.payload)), sha256.Sum256(exporter.payload)
+	return cut, nil
+}
 
 func TestBackupRepositoryCoordinatorSettlesAndResumesCatalogPublication(t *testing.T) {
 	payloads := [][]byte{bytes.Repeat([]byte{1}, 8192), bytes.Repeat([]byte{2}, 12288)}
@@ -61,6 +80,42 @@ func TestBackupRepositoryCoordinatorSettlesAndResumesCatalogPublication(t *testi
 	replayed, err := coordinator.Publish(t.Context(), exported, certificate)
 	if err != nil || !replayed.Equal(exported) {
 		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+}
+
+func TestBackupRepositoryCoordinatorCollectsCompleteLiveInventory(t *testing.T) {
+	groups := []raftmember.GroupKey{backupTestGroup(1), backupTestGroup(2)}
+	cut := clusterbackup.CatalogCut{Generation: 7, Digest: backupTest32(8), PolicyGeneration: 9, Groups: groups}
+	record, err := NewBackupOperation(backupTest32(10), cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := clusterbackup.OpenBackupRepository(t.TempDir(), clusterbackup.RepositoryLimits{
+		MaxBackups: 2, MaxArtifacts: 8, MaxArtifactBytes: 1 << 20, MaxDiskBytes: 4 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	authority := new(backupAuthorityStub)
+	lifecycle := backupTestController(t, authority)
+	if err = lifecycle.Submit(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewBackupRepositoryCoordinator(lifecycle, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := make([]clusterbackup.LiveArtifactSource, len(groups))
+	for index, group := range groups {
+		sources[index] = clusterbackup.LiveArtifactSource{Group: group, SourceMember: uint64(index + 1),
+			Exporter: gatewayLiveExporter{payload: bytes.Repeat([]byte{byte(index + 1)}, 8192),
+				cut: backupTestCut(group, byte(index+11))}}
+	}
+	exported, certificate, err := coordinator.CollectLive(t.Context(), record, cut, sources)
+	if err != nil || exported.Cursor[0] != backupStageExported || len(certificate.Groups) != len(groups) ||
+		repository.Stats().Artifacts != len(groups) {
+		t.Fatalf("exported=%+v certificate=%+v stats=%+v err=%v",
+			exported, certificate, repository.Stats(), err)
 	}
 }
 
