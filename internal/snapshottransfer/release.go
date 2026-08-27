@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"os"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -112,6 +113,119 @@ func (r *Repository) finishRelease(rec *record, d Descriptor, deleting string) e
 	}
 	if rec != nil {
 		r.subtractDisk(uint64(DescriptorBytes) + d.ArtifactBytes)
+		delete(r.records, d.ArtifactHash)
+	}
+	return nil
+}
+
+// AbandonArtifact durably retires either a staged or published artifact after
+// the caller has obtained an exact replicated abandonment witness. Rename to
+// the abandoning namespace is the commit point. Recovery completes partial
+// deletion without treating an incomplete stage as a valid publication.
+func (r *Repository) AbandonArtifact(w ArtifactAbandonmentWitness) (uint64, error) {
+	if r == nil || !w.Valid() {
+		return 0, ErrAbandonment
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, ErrRepository
+	}
+	d := w.Descriptor
+	rec := r.records[w.Artifact]
+	abandoning := abandoningArtifactName(w.Artifact)
+	if rec == nil {
+		if _, err := r.root.Lstat(abandoning); err == nil {
+			if err = r.validateAbandoning(abandoning, d); err != nil {
+				return 0, err
+			}
+			return 0, r.finishAbandon(nil, d, abandoning, 0)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		return 0, nil
+	}
+	if rec.descriptor != d {
+		return 0, ErrStaleFence
+	}
+	if rec.readers != 0 {
+		return 0, ErrArtifactBusy
+	}
+	if rec.file != nil {
+		if err := rec.file.Close(); err != nil {
+			return 0, err
+		}
+		rec.file = nil
+	}
+	owned := uint64(DescriptorBytes) + rec.stageBytes
+	live := rec.stage
+	if rec.complete {
+		owned = uint64(DescriptorBytes) + d.ArtifactBytes
+		live = rec.published
+	}
+	if rec.cursorLive {
+		owned += cursorBytes
+	}
+	if _, err := r.root.Lstat(abandoning); errors.Is(err, os.ErrNotExist) {
+		if err = r.root.Rename(live, abandoning); errors.Is(err, os.ErrNotExist) {
+			return 0, r.finishAbandon(rec, d, abandoning, owned)
+		} else if err != nil {
+			return 0, err
+		}
+		if err = r.inject(faultAfterAbandonRename); err != nil {
+			return 0, errors.Join(ErrOutcomeUnknown, err)
+		}
+	} else if err != nil {
+		return 0, err
+	} else if err = r.validateAbandoning(abandoning, d); err != nil {
+		return 0, err
+	}
+	if err := r.finishAbandon(rec, d, abandoning, owned); err != nil {
+		return 0, err
+	}
+	return owned, nil
+}
+
+func (r *Repository) validateAbandoning(name string, expected Descriptor) error {
+	file, err := openRegular(r.root, name, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	var raw [DescriptorBytes]byte
+	_, readErr := io.ReadFull(file, raw[:])
+	actual, descriptorErr := OpenDescriptor(raw[:])
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if readErr != nil || descriptorErr != nil || statErr != nil || closeErr != nil ||
+		actual != expected || info.Size() < DescriptorBytes ||
+		uint64(info.Size()-DescriptorBytes) > actual.ArtifactBytes {
+		return errors.Join(ErrRepository, readErr, descriptorErr, statErr, closeErr)
+	}
+	return nil
+}
+
+func (r *Repository) finishAbandon(rec *record, d Descriptor, abandoning string, owned uint64) error {
+	if err := syncRoot(r.root); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	_, cursor, _, _ := artifactNames(d.ArtifactHash)
+	if err := r.root.Remove(cursor); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := r.root.Remove(abandoning); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := r.inject(faultAfterAbandonUnlink); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	if err := syncRoot(r.root); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	if err := r.inject(faultAfterAbandonSync); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	if rec != nil {
+		r.subtractDisk(owned)
 		delete(r.records, d.ArtifactHash)
 	}
 	return nil

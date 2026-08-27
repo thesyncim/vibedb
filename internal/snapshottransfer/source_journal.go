@@ -171,6 +171,9 @@ func (journal *SourceFileJournal) PublishSourceExport(
 
 func validSourceJournalTransition(current, next SourceControlState) bool {
 	return current == SourceControlRunning && next == SourceControlComplete ||
+		// The collector may tombstone a Running export only after validating an
+		// exact replicated abandonment witness and deleting through Repository.
+		current == SourceControlRunning && next == SourceControlReleased ||
 		current == SourceControlComplete && next == SourceControlReleased
 }
 

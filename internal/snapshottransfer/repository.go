@@ -49,6 +49,9 @@ const (
 	faultAfterReleaseRename
 	faultAfterReleaseUnlink
 	faultAfterReleaseSync
+	faultAfterAbandonRename
+	faultAfterAbandonUnlink
+	faultAfterAbandonSync
 )
 
 type RepositoryStats struct {
@@ -161,9 +164,14 @@ func deletingArtifactName(hash [sha256.Size]byte) string {
 	return "d" + published[1:]
 }
 
+func abandoningArtifactName(hash [sha256.Size]byte) string {
+	_, _, _, published := artifactNames(hash)
+	return "a" + published[1:]
+}
+
 func parseArtifactName(name string) (kind byte, hash [sha256.Size]byte, ok bool) {
 	if len(name) != 2+sha256.Size*2 || name[1] != '-' ||
-		(name[0] != 's' && name[0] != 'c' && name[0] != 't' && name[0] != 'p' && name[0] != 'd') {
+		(name[0] != 's' && name[0] != 'c' && name[0] != 't' && name[0] != 'p' && name[0] != 'd' && name[0] != 'a') {
 		return 0, hash, false
 	}
 	decoded, err := hex.Decode(hash[:], []byte(name[2:]))
@@ -182,6 +190,39 @@ func (r *Repository) recover() error {
 		if ok && kind == 't' {
 			if err := r.root.Remove(entry.Name()); err != nil {
 				return err
+			}
+		}
+	}
+	// The abandoning namespace is the commit point for a replicated
+	// abandonment witness. Unlike release, it may contain a partial stage, so
+	// recovery validates only its exact descriptor and hard size bound before
+	// completing deletion. It can never become visible again.
+	for _, entry := range entries {
+		kind, hash, ok := parseArtifactName(entry.Name())
+		if ok && kind == 'a' {
+			if entry.Type()&fs.ModeType != 0 {
+				return ErrRepository
+			}
+			file, openErr := openRegular(r.root, entry.Name(), os.O_RDONLY, 0)
+			if openErr != nil {
+				return openErr
+			}
+			var raw [DescriptorBytes]byte
+			_, readErr := io.ReadFull(file, raw[:])
+			d, descriptorErr := OpenDescriptor(raw[:])
+			info, statErr := file.Stat()
+			closeErr := file.Close()
+			if readErr != nil || descriptorErr != nil || statErr != nil || closeErr != nil ||
+				d.ArtifactHash != hash || d.ArtifactBytes > r.limits.MaxArtifactBytes ||
+				info.Size() < DescriptorBytes || uint64(info.Size()-DescriptorBytes) > d.ArtifactBytes {
+				return errors.Join(ErrRepository, readErr, descriptorErr, statErr, closeErr)
+			}
+			_, cursor, _, _ := artifactNames(hash)
+			if removeErr := r.root.Remove(cursor); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+			if removeErr := r.root.Remove(entry.Name()); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
 			}
 		}
 	}
