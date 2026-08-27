@@ -48,9 +48,11 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		*target.ReplicatedShardStore, target.ReplicatedApply.Placement,
 	)
 	candidate := &table{meta: target.Tables[target.ReplicatedShardStore.UserTable]}
+	// This fixture's source is empty and owned by the live checkpoint group;
+	// constructing its empty target must not take an independent source snapshot.
 	err = core.buildReplacementStorageLocked(
 		t.Context(), target.ReplicatedShardStore.UserTable,
-		core.tables[target.ReplicatedShardStore.UserTable], candidate, true,
+		core.tables[target.ReplicatedShardStore.UserTable], candidate, false,
 	)
 	core.mu.Unlock()
 	if err != nil {

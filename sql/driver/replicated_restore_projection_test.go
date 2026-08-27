@@ -81,8 +81,20 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 		t.Fatalf("staged ledger contract lost: %+v %v", usage, err)
 	}
 	expected, err := replicatedstate.ProjectionImageDigest(identity.UserTable, activation.ApplyIdentity.ValidationDigest, rows)
-	if err != nil || activation.ArtifactManifest.ImageDigest != expected || activation.ArtifactManifest.ImageDigest == source.ImageDigest || activation.ArtifactManifest.UserRows != 1 || activation.ArtifactManifest.SystemRows != 1 || activation.ArtifactManifest.CaptureRows != 0 {
+	if err != nil || !activation.ArtifactManifest.Seeded || activation.ArtifactManifest.ImageDigest != expected || activation.ArtifactManifest.ImageDigest == source.ImageDigest || activation.ArtifactManifest.UserRows != 1 || activation.ArtifactManifest.SystemRows != 0 || activation.ArtifactManifest.CaptureRows != 0 {
 		t.Fatalf("projection image mismatch: %+v %v", activation.ArtifactManifest, err)
+	}
+	// The compact seeded certificate has no streamed geometry. Verify the
+	// actual target system row separately through a complete streamed export.
+	cut, err := activation.Apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported bytes.Buffer
+	streamed, writeErr := replicatedstate.WriteSnapshotArtifact(&exported, cut, replicatedstate.SnapshotArtifactOptions{})
+	closeErr := cut.Close()
+	if writeErr != nil || closeErr != nil || streamed.SystemRows != 1 || streamed.UserRows != 1 || streamed.ImageDigest != expected {
+		t.Fatalf("streamed projection target: %+v, %v, %v", streamed, writeErr, closeErr)
 	}
 	value, found, err := stage.table.collection.AppendRaw(nil, key)
 	if err != nil || !found || !bytes.Equal(value, document) || stage.table.collection.Len() != 1 {

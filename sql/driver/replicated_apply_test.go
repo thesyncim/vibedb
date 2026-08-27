@@ -150,16 +150,20 @@ func testReplicatedApplyCommandValue(
 }
 
 func testReplicatedApplySessionOpen(identity ReplicatedShardStoreIdentity) []byte {
+	encoded, err := replication.AppendCommand(nil, testReplicatedApplySessionOpenValue(identity))
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func testReplicatedApplySessionOpenValue(identity ReplicatedShardStoreIdentity) replication.Command {
 	command := testReplicatedApplyCommandValue(identity, 0, 1, nil)
 	command.Kind = replication.CommandSessionOpen
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	command.Fingerprint = sha256.Sum256([]byte("driver/test-session-open"))
 	command.Batches = nil
-	encoded, err := replication.AppendCommand(nil, command)
-	if err != nil {
-		panic(err)
-	}
-	return encoded
+	return command
 }
 
 func applyReplicatedApplySessionOpen(
@@ -169,7 +173,11 @@ func applyReplicatedApplySessionOpen(
 	index uint64,
 ) uint64 {
 	t.Helper()
-	command := testReplicatedApplySessionOpen(identity)
+	return applyReplicatedApplySessionOpenCommand(t, claim, testReplicatedApplySessionOpen(identity), index)
+}
+
+func applyReplicatedApplySessionOpenCommand(t *testing.T, claim *ReplicatedApply, command []byte, index uint64) uint64 {
+	t.Helper()
 	if err := claim.AdmitCommand(command); err != nil {
 		t.Fatalf("AdmitCommand session open at %d: %v", index, err)
 	}
@@ -816,19 +824,28 @@ func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *tes
 	advanced.Binding.Authority.OwnershipEpoch = state.Binding.OwnershipEpoch
 	advanced.Binding.Authority.RoutingVersion = state.Binding.RoutingVersion
 	advanced.Binding.Authority.RouteGeneration = state.Binding.RouteGeneration
-	epoch := applyReplicatedApplySessionOpen(t, claim, advanced, 4)
-	outsidePut := testReplicatedApplyCommand(advanced, epoch, 2, replication.Mutation{
+	appendAtCut := func(command replication.Command) []byte {
+		command.ReplicaSetVersion = state.ReplicaSetVersion
+		encoded, err := replication.AppendCommand(nil, command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	epoch := applyReplicatedApplySessionOpenCommand(t, claim,
+		appendAtCut(testReplicatedApplySessionOpenValue(advanced)), 4)
+	outsidePut := appendAtCut(testReplicatedApplyCommandValue(advanced, epoch, 2, []replication.Mutation{{
 		Kind: replication.MutationPut, Key: outside.key, Value: outside.document,
-	})
+	}}))
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), outsidePut); err != nil {
 		t.Fatal(err)
 	}
 	if code := completionResultCode(t, claim, outsidePut); code != replicatedstate.ResultWrongShard {
 		t.Fatalf("post-cutover outside put = %d, want ResultWrongShard", code)
 	}
-	insidePut := testReplicatedApplyCommand(advanced, epoch, 3, replication.Mutation{
+	insidePut := appendAtCut(testReplicatedApplyCommandValue(advanced, epoch, 3, []replication.Mutation{{
 		Kind: replication.MutationPut, Key: below.key, Value: below.document,
-	})
+	}}))
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(6), insidePut); err != nil {
 		t.Fatal(err)
 	}
