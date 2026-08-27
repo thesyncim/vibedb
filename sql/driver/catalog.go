@@ -304,8 +304,8 @@ func openDatabaseWithShardStorePolicy(
 		tables:  make(map[string]*table), syncDir: syncDir,
 		layoutEpoch:               newCatalogLayoutEpoch(nil, nil),
 		txnLimits:                 defaultDriverTxnLimits(),
-		replicatedSeedRecovery:    shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
-		replicatedSeedPending:     shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
+		replicatedSeedRecovery:    shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		replicatedSeedPending:     shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
 		schemaTransition:          bytes.Clone(shardPolicy.schemaTransition),
 		schemaMembership:          shardPolicy.schemaMembership,
 		schemaCheckpointAuthority: shardPolicy.schemaCheckpointAuthority,
@@ -472,6 +472,18 @@ func openDatabaseWithShardStorePolicy(
 		if !d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) ||
 			d.catalog.ReplicatedApply.identity() != shardPolicy.expectedReplicatedApply {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
+		}
+	case shardStoreOpenReplicatedSnapshotTarget:
+		if !exists || d.catalog.ReplicatedShardStore == nil ||
+			!d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) {
+			return nil, ErrReplicatedShardStoreIdentityMismatch
+		}
+		retained := d.catalog.ReplicatedChildApply
+		if d.catalog.ReplicatedApply != nil {
+			retained = d.catalog.ReplicatedApply
+		}
+		if retained == nil || retained.identity() != shardPolicy.expectedReplicatedApply {
+			return nil, ErrReplicatedApplyMismatch
 		}
 	case shardStoreOpenReplicatedApplySettlement, shardStoreOpenReplicatedChildStageResume:
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {

@@ -17,6 +17,14 @@ func (d *Database) ReserveReplicatedChildApply(
 	expected ReplicatedShardStoreIdentity,
 	reserved ReplicatedApplyIdentity,
 ) error {
+	return d.reserveReplicatedChildApply(expected, reserved, false)
+}
+
+func (d *Database) reserveReplicatedChildApply(
+	expected ReplicatedShardStoreIdentity,
+	reserved ReplicatedApplyIdentity,
+	coldSnapshot bool,
+) error {
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return err
 	}
@@ -40,6 +48,20 @@ func (d *Database) ReserveReplicatedChildApply(
 	if core.closed || core.replicatedChildStageClaim != nil || core.replicatedApplyClaim != nil ||
 		core.catalog.ReplicatedShardStore == nil || !core.catalog.ReplicatedShardStore.Equal(expected) {
 		return ErrReplicatedShardStoreIdentityMismatch
+	}
+	if coldSnapshot {
+		if core.checkpointGroup != nil || core.catalog.ReplicatedApply != nil ||
+			core.replicatedSnapshotStageClaim != nil {
+			return ErrReplicatedSnapshotStageProof
+		}
+		for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
+			table := core.tables[expected.Relations[ordinal].Table]
+			if table == nil || table.collection == nil || table.collection.Len() != 0 {
+				return ErrReplicatedSnapshotStageProof
+			}
+		}
+		// Fence this handle even if publication needs an exact retry.
+		core.replicatedSeedPending = true
 	}
 	if core.catalog.ReplicatedApply != nil {
 		if core.catalog.ReplicatedApply.identity() == reserved {

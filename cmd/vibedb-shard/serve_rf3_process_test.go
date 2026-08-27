@@ -279,7 +279,8 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	targetKey := raftstore.Key{ID: "rf3-command-key", Wrapped: []byte("explicit-test-wrapped-key")}
 	copy(targetKey.Material[:], keyMaterial)
 	targetProcess := prepareRF3ColdTarget(t, rf3ColdTargetOptions{
-		Root: filepath.Join(root, "member-4"), Group: group, Authority: authority,
+		StaticBootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+		Root:            filepath.Join(root, "member-4"), Group: group, Authority: authority,
 		WAL: walOptions, Apply: applyOptions, Key: targetKey,
 		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,

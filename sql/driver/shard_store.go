@@ -213,6 +213,7 @@ const (
 	shardStoreOpenReplicatedApplySettlement
 	shardStoreOpenReplicatedChildStageResume
 	shardStoreOpenReplicatedSchemaTransition
+	shardStoreOpenReplicatedSnapshotTarget
 )
 
 type shardStoreOpenPolicy struct {

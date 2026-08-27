@@ -146,7 +146,7 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
-	database, err := sqldriver.OpenReplicatedShardStoreWithApply(member.SQL.Path, base, applyIdentity)
+	database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity)
 	if err != nil {
 		return err
 	}

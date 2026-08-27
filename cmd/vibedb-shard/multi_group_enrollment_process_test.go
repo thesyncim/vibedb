@@ -146,13 +146,14 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		Listeners: rf3testfixture.ProcessListeners{Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t), Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t)}}
 	target2 := target1
 	target2.StoreID[0]++
+	staticBootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
+	staticBootstrap.Snapshot.Metadata.ConfState.Learners = []uint64{4}
 	prepare := func(name string, identity raftstore.Identity, target rf3testfixture.ProcessTarget) rf3testfixture.PreparedProcessMember {
 		key := raftstore.Key{ID: "multi-group-key", Wrapped: []byte("test-wrapped")}
 		for i := range key.Material {
 			key.Material[i] = byte(i + 1)
 		}
-		bootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
-		bootstrap.Snapshot.Metadata.ConfState.Learners = []uint64{4}
+		bootstrap := staticBootstrap
 		prepared, prepareErr := rf3testfixture.PrepareProcessMember(rf3testfixture.ProcessMemberOptions{
 			Root: filepath.Join(root, name), ControlRoot: filepath.Join(root, "control"),
 			Table: gateway.ReplicatedCatalogTable, CreateTable: `CREATE TABLE controlplane (PRIMARY KEY (id))`,
@@ -187,7 +188,8 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 			ShardIncarnation:      identity.ShardIncarnation, GroupID: identity.GroupID}
 	}
 	cold1 := prepareRF3ColdTarget(t, rf3ColdTargetOptions{Root: filepath.Join(root, "target-first"),
-		Group: groupFor(identity1), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
+		StaticBootstrap: staticBootstrap,
+		Group:           groupFor(identity1), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
 		Distribution: identity1.Distribution, Shard: identity1.Shard, AllocationGeneration: identity1.AllocationGeneration,
 		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
@@ -199,7 +201,8 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 			Snapshot: target1.Listeners.Snapshot, Control: target1.Listeners.Control},
 		SourceNode: nodes[0], SourceSnapshotAddress: addresses.Snapshot, MaxArtifactBytes: 1 << 30})
 	cold2 := prepareRF3ColdTarget(t, rf3ColdTargetOptions{Root: filepath.Join(root, "target-second"),
-		Group: groupFor(identity2), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
+		StaticBootstrap: staticBootstrap,
+		Group:           groupFor(identity2), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
 		Distribution: identity2.Distribution, Shard: identity2.Shard, AllocationGeneration: identity2.AllocationGeneration,
 		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
@@ -220,18 +223,17 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Cold targets already have an activated apply participant. The
-		// multigroup opener must present its exact retained identity, just as
-		// singleton bootstrap does; no default-profile reopen is permissible.
+		// Cold targets retain only an exact empty apply reservation. Neither
+		// constructor may substitute a profile or initialize a Raft checkpoint.
 		wrongApply := exactApply
 		wrongApply.MaxSessions++
-		if database, err := sqldriver.OpenReplicatedShardStoreWithApply(member.SQL.Path, base, wrongApply); !errors.Is(err, sqldriver.ErrReplicatedApplyMismatch) {
+		if database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, wrongApply); !errors.Is(err, sqldriver.ErrReplicatedApplyMismatch) {
 			if database != nil {
 				_ = database.Close()
 			}
 			t.Fatalf("cold target accepted foreign apply identity: %v", err)
 		}
-		database, err := sqldriver.OpenReplicatedShardStoreWithApply(member.SQL.Path, base, exactApply)
+		database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, exactApply)
 		if err != nil {
 			t.Fatalf("cold target exact apply reopen: %v", err)
 		}

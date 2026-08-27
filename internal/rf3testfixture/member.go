@@ -4,6 +4,8 @@ package rf3testfixture
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 
@@ -50,8 +52,19 @@ type PreparedMember struct {
 // PrepareMember creates and opens exactly one initial prepared member. It does
 // not adopt a Raft runtime or mint a node incarnation.
 func PrepareMember(options MemberOptions) (*PreparedMember, error) {
+	return prepareMember(options, false)
+}
+
+// PrepareSnapshotTarget binds an empty target and reserves its exact apply
+// identity, without installing a Raft state or checkpoint. The caller closes
+// and removes only the transient identity-binding WAL before cold bootstrap.
+func PrepareSnapshotTarget(options MemberOptions) (*PreparedMember, error) {
+	return prepareMember(options, true)
+}
+
+func prepareMember(options MemberOptions, coldSnapshot bool) (*PreparedMember, error) {
 	if options.Root == "" || options.Table == "" || options.CreateTable == "" ||
-		options.Bootstrap.Snapshot == nil {
+		options.Bootstrap.Snapshot == nil || (coldSnapshot && len(options.SeedDocuments) != 0) {
 		return nil, errors.New("rf3 test fixture: invalid prepared member")
 	}
 	walPath := filepath.Join(options.Root, "member.wal")
@@ -137,6 +150,26 @@ func PrepareMember(options MemberOptions) (*PreparedMember, error) {
 	}
 	if err != nil {
 		return closeBoth(err)
+	}
+	if coldSnapshot {
+		var storage, capture [32]byte
+		if _, err = rand.Read(storage[:]); err != nil {
+			return closeBoth(err)
+		}
+		if _, err = rand.Read(capture[:]); err != nil {
+			return closeBoth(err)
+		}
+		reserved, reserveErr := sqldriver.NewReplicatedChildApplyIdentity(
+			base, hex.EncodeToString(storage[:]), hex.EncodeToString(capture[:]), options.Apply,
+		)
+		if reserveErr == nil {
+			reserveErr = database.PrepareReplicatedSnapshotTarget(base, reserved)
+		}
+		if reserveErr != nil {
+			return closeBoth(reserveErr)
+		}
+		return &PreparedMember{WAL: wal, Database: database, Base: base, ApplyIdentity: reserved,
+			WALPath: walPath, SQLPath: sqlPath}, nil
 	}
 	apply, applyIdentity, err := raftmember.OpenPreparedApply(
 		wal, database, options.Authority, base, options.Apply,

@@ -57,6 +57,7 @@ type rf3ColdTargetOptions struct {
 	SourceNode            rafttransport.NodeID
 	SourceSnapshotAddress string
 	MaxArtifactBytes      uint64
+	StaticBootstrap       raftstore.Bootstrap
 }
 
 // rf3ColdTargetProcess owns the prepared no-WAL target and its child process.
@@ -81,7 +82,8 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 	t.Helper()
 	if options.Root == "" || options.Target.MemberID == 0 || options.Target.NodeID == (rafttransport.NodeID{}) ||
 		options.Target.StoreID == ([16]byte{}) || options.Target.NodeIncarnation == 0 ||
-		options.SourceNode == (rafttransport.NodeID{}) || options.Key.ID != "rf3-command-key" {
+		options.SourceNode == (rafttransport.NodeID{}) || options.Key.ID != "rf3-command-key" ||
+		options.StaticBootstrap.Snapshot == nil || options.StaticBootstrap.TopologyRecoveryEpoch != options.Group.TopologyRecoveryEpoch {
 		t.Fatal("invalid RF3 cold target options")
 	}
 	if options.MaxArtifactBytes == 0 {
@@ -92,8 +94,7 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 	}
 
 	identity := rf3ColdTargetIdentity(t, options)
-	staticBootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
-	staticBootstrap.TopologyRecoveryEpoch = options.Group.TopologyRecoveryEpoch
+	staticBootstrap := options.StaticBootstrap
 	// The transient preparation WAL must contain its local member. Its only job
 	// is binding SQL identities, so prepare it as the learner beside the stable
 	// RF3; the separately retained static bootstrap remains the original voter
@@ -103,7 +104,7 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 		Snapshot:              proto.Clone(staticBootstrap.Snapshot).(*pb.Snapshot),
 	}
 	preparationBootstrap.Snapshot.Metadata.ConfState.Learners = []uint64{options.Target.MemberID}
-	prepared, err := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
+	prepared, err := rf3testfixture.PrepareSnapshotTarget(rf3testfixture.MemberOptions{
 		Root: options.Root, Table: gateway.ReplicatedCatalogTable,
 		CreateTable: `CREATE TABLE controlplane (PRIMARY KEY (id))`,
 		Identity:    identity, Key: options.Key, WAL: options.WAL,
@@ -129,9 +130,8 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 	if err = prepared.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// PrepareMember is used only to bind the exact SQL and retained identities.
-	// Removing its transient WAL is what makes bootstrapPreparedRF3 enter the
-	// non-serving cold-target path in the child process.
+	// Only the transient identity-binding WAL is removed. SQL retains an empty
+	// non-serving apply reservation, never an initialized checkpoint to erase.
 	if err = os.Remove(prepared.WALPath); err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,8 @@ func TestPrepareRF3ColdTargetProcessHarness(t *testing.T) {
 		},
 	}
 	process := prepareRF3ColdTarget(t, rf3ColdTargetOptions{
-		Root: filepath.Join(root, "target"), Group: group, Authority: rf3CommandAuthority(),
+		StaticBootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+		Root:            filepath.Join(root, "target"), Group: group, Authority: rf3CommandAuthority(),
 		WAL: wal, Apply: apply, Key: key, Credential: credentials[3], Roots: roots,
 		AuthorizationPolicy: policyPath, ServingNodes: nodes, ServingPeerAddresses: peers,
 		Target: target, Listeners: rf3ManifestListeners{
