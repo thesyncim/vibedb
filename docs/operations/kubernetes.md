@@ -45,6 +45,12 @@ catalog ordinals 0–2, ledger ordinals 0–2, then data ordinals 0–2.
 The ConfigMaps are bootstrap inputs, not live authority. Changing one does not
 rewrite an existing PVC's sealed identities or durable membership.
 
+Automatic splitting is not enabled by this Kubernetes bootstrap. It emits an
+explicit empty `split_sources` inventory because the init containers have not
+yet prepared their actual SQL storage identities. Enabling it requires enrolling
+the exact prepared source schema and replica identities; the renderer does not
+invent them. The Kind gate qualifies RF3 serving and restart, not hot splitting.
+
 ## Render and apply
 
 For a disposable development or test cluster, generate the complete bootstrap

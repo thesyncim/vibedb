@@ -31,7 +31,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
-	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -202,7 +201,7 @@ type bootstrapControl struct {
 	ShardEndpoints   []bootstrapShardEndpoint `json:"shard_endpoints"`
 	GatewayEndpoints []bootstrapEndpoint      `json:"gateway_endpoints"`
 	Candidates       []bootstrapCandidate     `json:"candidates"`
-	SplitSources     []bootstrapSplitSource   `json:"split_sources"`
+	SplitSources     []struct{}               `json:"split_sources"`
 }
 type bootstrapEndpoint struct {
 	Node           string `json:"node"`
@@ -229,22 +228,6 @@ type bootstrapShardEndpoint struct {
 	ControlAddress       string `json:"control_address"`
 	SplitSnapshotAddress string `json:"split_snapshot_address"`
 }
-type bootstrapSplitSource struct {
-	ClusterID              [16]byte                `json:"cluster_id"`
-	ClusterIncarnation     [16]byte                `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch  uint64                  `json:"topology_recovery_epoch"`
-	ShardIncarnation       [16]byte                `json:"shard_incarnation"`
-	GroupID                [16]byte                `json:"group_id"`
-	SchemaGeneration       uint64                  `json:"schema_generation"`
-	RelationManifestDigest [32]byte                `json:"relation_manifest_digest"`
-	Table                  string                  `json:"table"`
-	Template               bootstrapSplitTemplate  `json:"template"`
-	Replicas               []bootstrapSplitReplica `json:"replicas"`
-}
-type bootstrapSplitReplica struct {
-	Node      string `json:"node"`
-	ChildRoot string `json:"child_root"`
-}
 type bootstrapCandidate struct {
 	Member          uint64 `json:"member"`
 	Node            string `json:"node"`
@@ -252,17 +235,6 @@ type bootstrapCandidate struct {
 	NodeIncarnation uint64 `json:"node_incarnation"`
 	Endpoint        string `json:"endpoint"`
 	Load            uint64 `json:"load"`
-}
-type bootstrapSplitTemplate struct {
-	MaxSessions       uint64            `json:"max_sessions"`
-	RetryWindow       uint16            `json:"retry_window"`
-	TxnLimits         durable.TxnLimits `json:"txn_limits"`
-	Format            uint16            `json:"format"`
-	ShardKey          string            `json:"shard_key"`
-	MaxBatchDocuments int               `json:"max_batch_documents"`
-	MaxBatchBytes     int               `json:"max_batch_bytes"`
-	TupleVersion      uint16            `json:"tuple_version"`
-	MapperVersion     uint16            `json:"mapper_version"`
 }
 
 type bootstrapRole struct {
@@ -811,27 +783,10 @@ func bootstrapReplicaControl(roles [3]bootstrapRole, state bootstrapState) ([]by
 		},
 		Bounds:           bootstrapBounds{64, 16, 8, 100, 2000, 5000},
 		GatewayEndpoints: []bootstrapEndpoint{local},
+		// Init containers have not prepared their actual SQL identities yet.
+		// No split source can be enrolled before that schema is authenticated.
+		SplitSources: []struct{}{},
 	}
-	// Only the user-data group has an explicit split authority. Catalog and
-	// request-ledger endpoints are not implicitly authorized as split sources.
-	data := roles[2]
-	source := bootstrapSplitSource{
-		ClusterID: data.group.ClusterID, ClusterIncarnation: data.group.ClusterIncarnation,
-		TopologyRecoveryEpoch: data.group.TopologyRecoveryEpoch, ShardIncarnation: data.group.ShardIncarnation,
-		GroupID: data.group.GroupID, SchemaGeneration: 1, RelationManifestDigest: data.digest, Table: data.table,
-		Template: bootstrapSplitTemplate{
-			128, 8, durable.TxnLimits{MaxCollections: 16, MaxDocuments: 4096, MaxBytes: 384 << 20},
-			1, data.primary, 64, 16<<20 + 64*replication.MaxMutationKeyBytes,
-			uint16(distribution.CurrentTupleVersion), uint16(distribution.NativeMapperVersion),
-		},
-	}
-	for member := 0; member < 3; member++ {
-		source.Replicas = append(source.Replicas, bootstrapSplitReplica{
-			Node: state.ShardNodeIDs[6+member], ChildRoot: "/var/lib/vibedb/member/split-children",
-		})
-	}
-	sort.Slice(source.Replicas, func(i, j int) bool { return source.Replicas[i].Node < source.Replicas[j].Node })
-	m.SplitSources = []bootstrapSplitSource{source}
 	for roleIndex, role := range roles {
 		for member := 0; member < 3; member++ {
 			host := fmt.Sprintf("vibedb-%s-%d.vibedb-%s-peer", role.name, member, role.name)

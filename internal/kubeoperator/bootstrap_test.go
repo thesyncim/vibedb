@@ -18,7 +18,7 @@ type failingBootstrapReader struct{}
 
 func (failingBootstrapReader) Read([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
 
-func TestBootstrapReplicaControlBindsOnlyDataSplitSource(t *testing.T) {
+func TestBootstrapReplicaControlDoesNotInventUnpreparedSplitSources(t *testing.T) {
 	roles := [3]bootstrapRole{{name: "catalog"}, {name: "ledger"}, {
 		name: "data", table: "documents", primary: "/id", digest: [32]byte{9},
 		group: raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
@@ -40,20 +40,11 @@ func TestBootstrapReplicaControlBindsOnlyDataSplitSource(t *testing.T) {
 	if err := vibejson.Unmarshal(raw, &control); err != nil {
 		t.Fatal(err)
 	}
-	if len(control.SplitSources) != 1 {
-		t.Fatalf("split sources=%d", len(control.SplitSources))
+	if len(control.SplitSources) != 0 || !bytes.Contains(raw, []byte(`"split_sources":[]`)) {
+		t.Fatal("bootstrap enrolled split authority without actual prepared SQL identities")
 	}
-	source, data := control.SplitSources[0], roles[2]
-	if source.ClusterID != data.group.ClusterID || source.ClusterIncarnation != data.group.ClusterIncarnation ||
-		source.TopologyRecoveryEpoch != data.group.TopologyRecoveryEpoch || source.ShardIncarnation != data.group.ShardIncarnation ||
-		source.GroupID != data.group.GroupID || source.SchemaGeneration != 1 || source.RelationManifestDigest != data.digest ||
-		source.Table != data.table || source.Template.ShardKey != data.primary || len(source.Replicas) != 3 {
-		t.Fatalf("source did not bind exact data group/schema: %+v", source)
-	}
-	for i, replica := range source.Replicas {
-		if replica.Node != state.ShardNodeIDs[8-i] || replica.ChildRoot != "/var/lib/vibedb/member/split-children" {
-			t.Fatalf("replica %d is not canonical data-only authority: %+v", i, replica)
-		}
+	if len(control.ShardEndpoints) != 9 || len(control.Candidates) != 9 {
+		t.Fatal("empty split inventory removed serving or replica-control endpoints")
 	}
 }
 
