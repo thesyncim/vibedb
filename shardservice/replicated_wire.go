@@ -27,6 +27,7 @@ const (
 	tagReplicatedTransactionRead   = 'T'
 	tagReplicatedRequestLedgerRead = 'L'
 	tagReplicatedExecutionPinRead  = 'E'
+	tagReplicatedRouteGateRead     = 'G'
 	tagReplicatedResponse          = 'A'
 	// A response with state has a 297-byte body before a completion. The fixed
 	// request digest is zero for nonterminal responses and binds terminal
@@ -54,6 +55,7 @@ const replicatedTransactionReadRequestBodyBytes = 277
 // selector. Digest-only lookups are deliberately not representable.
 const replicatedRequestLedgerReadRequestBodyBytes = 416
 const replicatedExecutionPinReadRequestBodyBytes = 282
+const replicatedRouteGateReadRequestBodyBytes = 250
 
 const (
 	MaxReplicatedTransactionReadBytes = replicatedstate.MaxTransactionRecoveryReadBytes
@@ -78,6 +80,7 @@ const (
 	_ // wire operation 8 is reserved; never reuse a published operation byte.
 	ReplicatedRequestLedgerRead
 	ReplicatedExecutionPinRead
+	ReplicatedRouteGateRead
 )
 
 // ReplicatedTransactionReadKind is the complete RF3 recovery-read surface.
@@ -181,6 +184,7 @@ const (
 	ReplicatedRequestLedgerReadResult
 	ReplicatedReadBatchResult
 	ReplicatedExecutionPinReadResult
+	ReplicatedRouteGateReadResult
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -273,6 +277,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
 	case ReplicatedRequestLedgerRead:
 		encodeReplicatedRequestLedgerRead(&e, request.RequestLedgerRead)
+	case ReplicatedRouteGateRead:
+		e.u64(request.MinimumApplied)
 	case ReplicatedExecutionPinRead:
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 	}
@@ -286,6 +292,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		tag = tagReplicatedTransactionRead
 	} else if request.Operation == ReplicatedRequestLedgerRead {
 		tag = tagReplicatedRequestLedgerRead
+	} else if request.Operation == ReplicatedRouteGateRead {
+		tag = tagReplicatedRouteGateRead
 	} else if request.Operation == ReplicatedExecutionPinRead {
 		tag = tagReplicatedExecutionPinRead
 	}
@@ -339,6 +347,9 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	case ReplicatedRequestLedgerRead:
 		encodeReplicatedRequestLedgerRead(&e, request.RequestLedgerRead)
 		tag = tagReplicatedRequestLedgerRead
+	case ReplicatedRouteGateRead:
+		e.u64(request.MinimumApplied)
+		tag = tagReplicatedRouteGateRead
 	case ReplicatedExecutionPinRead:
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 		tag = tagReplicatedExecutionPinRead
@@ -410,6 +421,8 @@ func decodeReplicatedRequest(
 		request.TransactionRead = decodeReplicatedTransactionRead(&d)
 	case ReplicatedRequestLedgerRead:
 		request.RequestLedgerRead = decodeReplicatedRequestLedgerRead(&d)
+	case ReplicatedRouteGateRead:
+		request.MinimumApplied = d.u64()
 	case ReplicatedExecutionPinRead:
 		request.ExecutionPinRead = decodeReplicatedExecutionPinRead(&d)
 	}
@@ -523,6 +536,31 @@ func readReplicatedRequestFrame(
 			return nil, 0, tag, err
 		}
 		return body, charged, tag, nil
+	case tagReplicatedRouteGateRead:
+		if size != replicatedRouteGateReadRequestBodyBytes {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		var prefix [2]byte
+		if _, err := io.ReadFull(r, prefix[:]); err != nil {
+			return nil, 0, tag, err
+		}
+		if prefix[0] != replicatedWireVersion ||
+			ReplicatedOperation(prefix[1]) != ReplicatedRouteGateRead {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		charged = int64(size)
+		if budget != nil && !budget.reserve(charged) {
+			return nil, 0, tag, errFrameBudget
+		}
+		body = make([]byte, size)
+		copy(body[:2], prefix[:])
+		if _, err := io.ReadFull(r, body[2:]); err != nil {
+			if budget != nil {
+				budget.release(charged)
+			}
+			return nil, 0, tag, err
+		}
+		return body, charged, tag, nil
 	case tagReplicatedExecutionPinRead:
 		if size != replicatedExecutionPinReadRequestBodyBytes {
 			return nil, 0, tag, ErrReplicatedWire
@@ -582,7 +620,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 		response.Kind == ReplicatedReadBatchResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
-		response.Kind == ReplicatedExecutionPinReadResult {
+		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
 		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
 	}
 	e := encbuf{b: make([]byte, 5, 5+bodyHint)}
@@ -604,7 +642,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 		response.Kind == ReplicatedReadBatchResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
-		response.Kind == ReplicatedExecutionPinReadResult {
+		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
 		e.u64(response.ReadApplied)
 		e.bytes(response.Value)
 	}
@@ -651,7 +689,7 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 		response.Kind == ReplicatedReadBatchResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
-		response.Kind == ReplicatedExecutionPinReadResult {
+		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
 		response.ReadApplied = d.u64()
 		response.Value = d.slice()
 		response.Value = response.Value[:len(response.Value):len(response.Value)]
@@ -687,6 +725,8 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 	case ReplicatedRequestLedgerRead:
 		return replicatedReadResponseFixedBodyBytes +
 			replicatedRequestLedgerReadValueHeaderBytes + int(request.RequestLedgerRead.MaxBytes), nil
+	case ReplicatedRouteGateRead:
+		return replicatedReadResponseFixedBodyBytes + routegate.StatusBytes, nil
 	case ReplicatedExecutionPinRead:
 		return replicatedReadResponseFixedBodyBytes + replicatedExecutionPinReadValueBytes, nil
 	default:
@@ -702,6 +742,8 @@ func replicatedRequestTagMatches(operation ReplicatedOperation, tag byte) bool {
 		return tag == tagReplicatedTransactionRead
 	case ReplicatedRequestLedgerRead:
 		return tag == tagReplicatedRequestLedgerRead
+	case ReplicatedRouteGateRead:
+		return tag == tagReplicatedRouteGateRead
 	case ReplicatedExecutionPinRead:
 		return tag == tagReplicatedExecutionPinRead
 	default:
@@ -1006,6 +1048,14 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{}) &&
 			request.ExecutionPinRead.Pin != (executionpin.PinID{}) &&
 			request.ExecutionPinRead.MinimumApplied != 0
+	case ReplicatedRouteGateRead:
+		return request.Capability == serviceauthz.CapabilityDataWrite &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) && request.Relation == 0 &&
+			len(request.Key) == 0 && len(request.BatchRead) == 0 && request.MinimumApplied != 0 &&
+			request.MaxValueBytes == 0 &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
 	default:
 		return false
 	}
@@ -1227,6 +1277,12 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			validReplicatedExecutionPinReadValue(response.Value)
+	case ReplicatedRouteGateReadResult:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+			validReplicatedRouteGateReadValue(response.Value)
 	default:
 		return false
 	}

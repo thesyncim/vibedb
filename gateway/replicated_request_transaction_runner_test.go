@@ -34,7 +34,78 @@ func (ledger *distributedRunnerLedger) ReadRow(_ context.Context, _ DurableReque
 
 type distributedRunnerPayloads struct{}
 
-func (distributedRunnerPayloads) Stage(_ context.Context, _ DurableRequestLedgerHome, _ requestledger.RequestKey, target, command []byte) (DurableRequestDynamicPayload, error) {
+type advancedRecoveryOrderWaves struct {
+	*distributedRunnerWaves
+	calls   int
+	failure error
+}
+
+func (waves *advancedRecoveryOrderWaves) ResumeAdvancedWave(context.Context, DurableRequestTypedExecutionContext) error {
+	waves.calls++
+	if waves.failure != nil {
+		return waves.failure
+	}
+	waves.ledger.head.OutstandingRoutePinDigest = requestledger.Digest{}
+	return nil
+}
+
+type advancedRecoveryOrderCleanup struct {
+	ledger *distributedRunnerLedger
+	calls  int
+}
+
+func (cleanup *advancedRecoveryOrderCleanup) Cleanup(context.Context, DurableRequestLedgerHome, requestledger.RequestKey) (uint64, error) {
+	cleanup.calls++
+	if cleanup.ledger.head.OutstandingRoutePinDigest != (requestledger.Digest{}) {
+		return 0, ErrDurableRequestConflict
+	}
+	// Stop after observing ordering; transaction execution is covered separately.
+	return 0, errDynamicPayloadFault
+}
+
+func TestDurableRequestDistributedRunnerRecoversRouteBeforePayloadCleanup(t *testing.T) {
+	for _, state := range []string{"outstanding", "released", "partly-cleaned", "release-unknown"} {
+		t.Run(state, func(t *testing.T) {
+			execution := typedExecutionFixture(t)
+			_, head, route := lifecycleRunnerFixture(t)
+			head.NextStepOrdinal = 1
+			head.CleanupBuildDigest = requestledger.Digest{1}
+			if state == "outstanding" || state == "release-unknown" {
+				head.OutstandingRoutePinDigest = requestledger.Digest{2}
+			}
+			if state == "partly-cleaned" {
+				head.CleanupNextChunk = 1
+			}
+			ledger := &distributedRunnerLedger{head: head}
+			waves := &advancedRecoveryOrderWaves{distributedRunnerWaves: &distributedRunnerWaves{ledger: ledger}}
+			if state == "release-unknown" {
+				waves.failure = errLifecycleRunnerFault
+			}
+			cleanup := &advancedRecoveryOrderCleanup{ledger: ledger}
+			runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, cleanup,
+				&distributedRunnerTerminal{}, distributedRunnerAuthority{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = runner.RunTyped(t.Context(), execution)
+			if state == "release-unknown" {
+				if !errors.Is(err, errLifecycleRunnerFault) || waves.calls != 1 || cleanup.calls != 0 {
+					t.Fatalf("recovery=%d cleanup=%d err=%v", waves.calls, cleanup.calls, err)
+				}
+				return
+			}
+			wantRecovery := 1
+			if state == "partly-cleaned" {
+				wantRecovery = 0
+			}
+			if !errors.Is(err, errDynamicPayloadFault) || waves.calls != wantRecovery || cleanup.calls != 1 {
+				t.Fatalf("recovery=%d cleanup=%d err=%v", waves.calls, cleanup.calls, err)
+			}
+		})
+	}
+}
+
+func (distributedRunnerPayloads) Stage(_ context.Context, _ DurableRequestLedgerHome, _ requestledger.RequestKey, _ uint64, target, command []byte) (DurableRequestDynamicPayload, error) {
 	step := requestledger.StepRef{TargetSource: requestledger.PayloadSourceDynamic, CommandSource: requestledger.PayloadSourceDynamic,
 		TargetLength: uint64(len(target)), CommandOffset: uint64(len(target)), CommandLength: uint64(len(command)),
 		TargetDigest:  requestledger.Digest(replication.CompletionResultDigest(1, 1, target)),
@@ -73,7 +144,7 @@ func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, 
 	}}}, nil
 }
 
-func (waves *distributedRunnerWaves) RunWave(_ context.Context, wave DurableRequestWave) (DurableRequestWaveResult, error) {
+func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave DurableRequestWave) (DurableRequestWaveResult, error) {
 	command, err := replication.OpenCommand(wave.Command)
 	if err != nil {
 		return DurableRequestWaveResult{}, err

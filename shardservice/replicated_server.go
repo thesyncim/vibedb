@@ -28,6 +28,7 @@ type replicatedOwner interface {
 	ReadTransaction(context.Context, raftservice.TransactionReadRequest) (raftservice.TransactionReadResult, raftservice.TransactionReadLease, error)
 	ReadRequestLedger(context.Context, raftservice.RequestLedgerReadRequest) (raftservice.RequestLedgerReadResult, raftservice.RequestLedgerReadLease, error)
 	ReadExecutionPin(context.Context, raftservice.ExecutionPinReadRequest) (raftservice.ExecutionPinReadResult, raftservice.ExecutionPinReadLease, error)
+	ReadRouteGate(context.Context, raftservice.RouteGateReadRequest) (raftservice.RouteGateReadResult, raftservice.RouteGateReadLease, error)
 }
 
 func replicatedRequestDigest(command []byte) [sha256.Size]byte {
@@ -770,6 +771,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 		}
+	}
+	if request.Operation == ReplicatedRouteGateRead {
+		return server.readRouteGate(ctx, request, wireState)
 	}
 	if request.Operation == ReplicatedExecutionPinRead {
 		wireRead := request.ExecutionPinRead

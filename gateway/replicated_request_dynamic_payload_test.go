@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -177,10 +178,10 @@ func TestDurableRequestDynamicPayloadResumesEveryStageBoundary(t *testing.T) {
 		t.Run(fmt.Sprintf("operation_%d", operation), func(t *testing.T) {
 			store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
 			ledger.fault = operation
-			if _, err := store.Stage(context.Background(), home, key, target, command); !errors.Is(err, errDynamicPayloadFault) {
+			if _, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command); !errors.Is(err, errDynamicPayloadFault) {
 				t.Fatalf("first stage err=%v", err)
 			}
-			payload, err := store.Stage(context.Background(), home, key, target, command)
+			payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -190,6 +191,19 @@ func TestDurableRequestDynamicPayloadResumesEveryStageBoundary(t *testing.T) {
 				t.Fatal("resumed payload differs from exact staged bytes")
 			}
 		})
+	}
+}
+
+func TestDurableRequestDynamicPayloadRejectsDelayedWaveBeforeWrites(t *testing.T) {
+	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
+	ordinal := ledger.head.NextStepOrdinal
+	ledger.head.NextStepOrdinal++
+	before := ledger.head
+	if _, err := store.Stage(t.Context(), home, key, ordinal, target, command); !errors.Is(err, ErrDurableRequestConflict) {
+		t.Fatalf("delayed wave accepted: %v", err)
+	}
+	if !reflect.DeepEqual(ledger.head, before) || ledger.build != (requestledger.PayloadBuildRecord{}) || len(ledger.chunks) != 0 {
+		t.Fatal("delayed wave changed ledger state")
 	}
 }
 
@@ -203,7 +217,7 @@ func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			payload, err := store.Stage(t.Context(), home, key, target, command)
+			payload, err := store.Stage(t.Context(), home, key, ledger.head.NextStepOrdinal, target, command)
 			if err != nil {
 				t.Fatalf("new build encoded against head revision instead of absent build: %v", err)
 			}
@@ -213,7 +227,7 @@ func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T
 				payload.Build.RequestDigest != before.RequestDigest || payload.Build.PlanRoot != before.PlanRoot {
 				t.Fatal("independent build revision changed its sealed head binding")
 			}
-			retry, err := store.Stage(t.Context(), home, key, target, command)
+			retry, err := store.Stage(t.Context(), home, key, ledger.head.NextStepOrdinal, target, command)
 			if err != nil || retry.Build != payload.Build || !bytes.Equal(retry.Bytes, payload.Bytes) {
 				t.Fatalf("exact retry changed winning build: %v", err)
 			}
@@ -223,7 +237,7 @@ func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T
 
 func TestDurableRequestDynamicPayloadReopensExactChunksAndRejectsReplacement(t *testing.T) {
 	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
-	payload, err := store.Stage(context.Background(), home, key, target, command)
+	payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +251,7 @@ func TestDurableRequestDynamicPayloadReopensExactChunksAndRejectsReplacement(t *
 		!bytes.Equal(reopened.Target, target) || !bytes.Equal(reopened.Command, command) {
 		t.Fatal("reopened payload changed exact bytes")
 	}
-	if _, err = store.Stage(context.Background(), home, key, target, append(bytes.Clone(command), 1)); !errors.Is(err, ErrDurableRequestConflict) {
+	if _, err = store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, append(bytes.Clone(command), 1)); !errors.Is(err, ErrDurableRequestConflict) {
 		t.Fatalf("replacement err=%v", err)
 	}
 	chunk := ledger.chunks[1]
@@ -251,7 +265,7 @@ func TestDurableRequestDynamicPayloadReopensExactChunksAndRejectsReplacement(t *
 
 func TestDurableRequestDynamicPayloadCleanupResumesUnknownOutcome(t *testing.T) {
 	store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
-	payload, err := store.Stage(context.Background(), home, key, target, command)
+	payload, err := store.Stage(context.Background(), home, key, ledger.head.NextStepOrdinal, target, command)
 	if err != nil {
 		t.Fatal(err)
 	}

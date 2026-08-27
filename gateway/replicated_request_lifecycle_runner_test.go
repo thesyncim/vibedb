@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -37,6 +38,7 @@ type lifecycleRunnerLedger struct {
 	route        requestledger.RoutePinRecord
 	pending      requestledger.PendingWaveRecord
 	continuation requestledger.ContinuationRecord
+	build        requestledger.PayloadBuildRecord
 	events       *lifecycleRunnerEvents
 	fault        requestledger.Operation
 }
@@ -67,13 +69,13 @@ func (ledger *lifecycleRunnerLedger) ApplyCAS(
 		ledger.route = cas.RoutePin
 	case requestledger.OperationPutPending:
 		ledger.head, err = requestledger.InstallPendingWave(
-			ledger.head, cas.Pending, requestledger.PayloadBuildRecord{}, ledger.route,
+			ledger.head, cas.Pending, ledger.build, ledger.route,
 		)
 		ledger.pending = cas.Pending
 	case requestledger.OperationAdvance:
 		ledger.continuation = cas.Continuation
-		ledger.head, err = requestledger.AdvancePending(
-			ledger.head, ledger.pending, cas.Continuation,
+		ledger.head, err = requestledger.AdvancePendingWithBuild(
+			ledger.head, ledger.pending, cas.Continuation, ledger.build,
 		)
 		ledger.pending = requestledger.PendingWaveRecord{}
 	default:
@@ -467,6 +469,7 @@ func TestDurableRequestLifecycleRunnerScopesPinAuthority(t *testing.T) {
 			proposer := &lifecycleRunnerProposer{t: t, events: events, faultKind: -1,
 				attempts: make(map[replication.CommandKind][][]byte)}
 			runner.proposer, runner.pinFencer = proposer, proposer
+			runner.gateSessions = proposer
 			ctx := t.Context()
 			if caller.Valid() {
 				ctx, err = serviceauthz.WithAuthority(ctx, caller)
@@ -517,6 +520,87 @@ func TestDurableRequestLifecycleRunnerFencesEveryProposal(t *testing.T) {
 	}
 	if proposer.fenceCalls != 1 || proposals != 0 {
 		t.Fatalf("fences=%d proposals=%d, want 1/0", proposer.fenceCalls, proposals)
+	}
+}
+
+type lifecycleWaveStager struct {
+	wave     DurableRequestWave
+	events   *lifecycleRunnerEvents
+	proposer *lifecycleRunnerProposer
+	calls    int
+	fail     bool
+}
+
+func (stager *lifecycleWaveStager) Stage(ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey, ordinal uint64, target, command []byte) (DurableRequestDynamicPayload, error) {
+	stager.calls++
+	stager.events.add("stage")
+	if stager.proposer.fenceCalls != stager.calls || ordinal != stager.wave.Ordinal || key != stager.wave.Key ||
+		home.Identity != stager.wave.Home.Identity || !bytes.Equal(target, stager.wave.Target) || !bytes.Equal(command, stager.wave.Command) {
+		return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
+	}
+	if stager.fail {
+		return DurableRequestDynamicPayload{}, errDynamicPayloadFault
+	}
+	// Model the tiny applied-index lease expiring during staging: a second
+	// fence in the same admitted wave would reject its own staging writes.
+	stager.proposer.fenceFaultAt = stager.proposer.fenceCalls + 1
+	return DurableRequestDynamicPayload{Step: stager.wave.Step, Target: target, Command: command}, nil
+}
+
+func TestDurableRequestLifecycleRunnerFencesBeforeStagingAndRefencesAfterError(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stage_failure_%t", failFirst), func(t *testing.T) {
+			wave, initial, route := lifecycleRunnerFixture(t)
+			events := new(lifecycleRunnerEvents)
+			ledger := &lifecycleRunnerLedger{head: initial, events: events}
+			resolver := &lifecycleRunnerResolver{route: route, events: events}
+			proposer := &lifecycleRunnerProposer{t: t, events: events, faultKind: -1,
+				attempts: make(map[replication.CommandKind][][]byte)}
+			runner, err := newDurableRequestLifecycleRunner(ledger, resolver, proposer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stager := &lifecycleWaveStager{wave: wave, events: events, proposer: proposer, fail: failFirst}
+			runner.payloads = stager
+			wave.Step, wave.Build = requestledger.StepRef{}, requestledger.PayloadBuildRecord{}
+			if failFirst {
+				if _, err := runner.RunStagedWave(t.Context(), wave); !errors.Is(err, errDynamicPayloadFault) {
+					t.Fatalf("stage failure=%v", err)
+				}
+				if len(proposer.attempts) != 0 || stager.calls != 1 || proposer.fenceCalls != 1 {
+					t.Fatal("failed stage submitted work or skipped admission")
+				}
+				stager.fail = false
+			}
+			if _, err := runner.RunStagedWave(t.Context(), wave); err != nil {
+				t.Fatal(err)
+			}
+			if stager.calls != proposer.fenceCalls || len(proposer.attempts[replication.CommandRouteGate]) != 2 || len(proposer.attempts[replication.CommandMutationBatch]) != 1 {
+				t.Fatal("staged wave did not use exactly one fresh admission per invocation")
+			}
+		})
+	}
+}
+
+func TestDurableRequestLifecycleRunnerExpiredFenceDoesNotStage(t *testing.T) {
+	wave, initial, route := lifecycleRunnerFixture(t)
+	events := new(lifecycleRunnerEvents)
+	ledger := &lifecycleRunnerLedger{head: initial, events: events}
+	resolver := &lifecycleRunnerResolver{route: route, events: events}
+	proposer := &lifecycleRunnerProposer{t: t, events: events, faultKind: -1, fenceFaultAt: 1,
+		attempts: make(map[replication.CommandKind][][]byte)}
+	runner, err := newDurableRequestLifecycleRunner(ledger, resolver, proposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stager := &lifecycleWaveStager{wave: wave, events: events, proposer: proposer}
+	runner.payloads = stager
+	wave.Step, wave.Build = requestledger.StepRef{}, requestledger.PayloadBuildRecord{}
+	if _, err := runner.RunStagedWave(t.Context(), wave); !errors.Is(err, ErrDurableRequestConflict) {
+		t.Fatal(err)
+	}
+	if stager.calls != 0 || len(proposer.attempts) != 0 || !reflect.DeepEqual(ledger.head, initial) {
+		t.Fatal("expired wave changed durable state")
 	}
 }
 

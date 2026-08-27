@@ -34,10 +34,9 @@ type DurableRequestDistributedRunner struct {
 }
 
 type durableDistributedWaveRunner interface {
-	RunWave(context.Context, DurableRequestWave) (DurableRequestWaveResult, error)
+	RunStagedWave(context.Context, DurableRequestWave) (DurableRequestWaveResult, error)
 }
 type durableDistributedPayloadStore interface {
-	Stage(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, []byte, []byte) (DurableRequestDynamicPayload, error)
 	Cleanup(context.Context, DurableRequestLedgerHome, requestledger.RequestKey) (uint64, error)
 }
 type durableDistributedTerminal interface {
@@ -116,6 +115,28 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	head, continuation, err := runner.openProgress(ctx, execution)
 	if err != nil {
 		return DurableRequestTerminalResult{}, err
+	}
+	// OperationAdvance moves the cursor before releasing its physical route.
+	// Recover that retained release first; neither payload cleanup nor skipping
+	// to the next ordinal is legal while the old route is still outstanding.
+	// Only Advance installs CleanupBuildDigest and OutstandingRoutePinDigest.
+	// Require its retained payload witness explicitly; an acquired/pending route
+	// without that witness resumes through the current ordinal's staged path.
+	if head.CleanupBuildDigest != (requestledger.Digest{}) &&
+		(head.OutstandingRoutePinDigest != (requestledger.Digest{}) || head.CleanupNextChunk == 0) {
+		recovery, ok := runner.waves.(interface {
+			ResumeAdvancedWave(context.Context, DurableRequestTypedExecutionContext) error
+		})
+		if !ok {
+			return DurableRequestTerminalResult{}, ErrDurableRequestUnresolved
+		}
+		if err = recovery.ResumeAdvancedWave(ctx, execution); err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
+		head, continuation, err = runner.openProgress(ctx, execution)
+		if err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
 	}
 	if head.CleanupBuildDigest != (requestledger.Digest{}) {
 		if _, err = runner.payloads.Cleanup(ctx, execution.Home, execution.Key.RequestKey); err != nil {
@@ -702,12 +723,6 @@ func (progress *durableDistributedProgress) command(
 		return false, err
 	}
 	target := bytes.Clone(route.Group.GroupID[:])
-	payload, err := progress.runner.payloads.Stage(
-		ctx, progress.execution.Home, progress.execution.Key.RequestKey, target, exact,
-	)
-	if err != nil {
-		return false, err
-	}
 	wave := DurableRequestWave{
 		Home: progress.execution.Home, Key: progress.execution.Key.RequestKey,
 		Participant: logical, Identity: progress.execution.Recipe.Identity,
@@ -717,8 +732,7 @@ func (progress *durableDistributedProgress) command(
 		Binding:           requestledger.Digest(progress.execution.Recipe.Contract.PinDigest),
 		ExecutionPinRoute: progress.execution.ExecutionPinRoute,
 		ExecutionPinLease: progress.execution.ExecutionPinLease,
-		Build:             payload.Build, Step: payload.Step, Ordinal: ordinal,
-		Target: payload.Target, Command: payload.Command,
+		Ordinal:           ordinal, Target: target, Command: exact,
 	}
 	wave.Settle = func(observation []byte) (uint32, []byte, error) {
 		code, value, decodeErr := durableDistributedCompletion(exact, control, observation)
@@ -739,7 +753,7 @@ func (progress *durableDistributedProgress) command(
 		cursor := appendDurableDistributedState(nil, progress.state)
 		return progress.execution.Recipe.Contract.CommitTransitionTag, cursor, nil
 	}
-	if _, err = progress.runner.waves.RunWave(ctx, wave); err != nil {
+	if _, err = progress.runner.waves.RunStagedWave(ctx, wave); err != nil {
 		return false, err
 	}
 	if _, err = progress.runner.payloads.Cleanup(ctx, progress.execution.Home, progress.execution.Key.RequestKey); err != nil {

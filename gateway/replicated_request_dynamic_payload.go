@@ -39,12 +39,13 @@ func NewDurableRequestDynamicPayloadStore(
 	return &DurableRequestDynamicPayloadStore{ledger: ledger}, nil
 }
 
-// Stage seals target||command under the current head wave. Repeated calls with
+// Stage seals target||command under the expected head wave. Repeated calls with
 // the same bytes resume the winning build; different bytes lose deterministically.
 func (store *DurableRequestDynamicPayloadStore) Stage(
 	ctx context.Context,
 	home DurableRequestLedgerHome,
 	key requestledger.RequestKey,
+	ordinal uint64,
 	target []byte,
 	command []byte,
 ) (DurableRequestDynamicPayload, error) {
@@ -67,6 +68,9 @@ func (store *DurableRequestDynamicPayloadStore) Stage(
 		return DurableRequestDynamicPayload{}, err
 	}
 	head := headRow.Head
+	if head.NextStepOrdinal != ordinal {
+		return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
+	}
 	buildRow, err := store.ledger.ReadRow(ctx, home, DurableRequestLifecycleRead{
 		Key: key, Kind: replicatedstate.RequestLedgerReadPayloadBuild,
 		MinimumApplied: headRow.Applied,
@@ -193,6 +197,63 @@ func (store *DurableRequestDynamicPayloadStore) Open(
 	if err != nil || keyDigest != build.KeyDigest {
 		return DurableRequestDynamicPayload{}, errors.Join(err, ErrDurableRequestConflict)
 	}
+	exact, err := store.openPayloadBytes(ctx, home, key, build, minimumApplied)
+	if err != nil {
+		return DurableRequestDynamicPayload{}, err
+	}
+	return durableRequestDynamicPayloadWithStep(build, step, exact)
+}
+
+// OpenAdvanced reopens, without staging writes, the payload retained until an
+// advanced wave's physical route has been released. The head cleanup witness
+// and continuation bind the old build even though the head ordinal moved on.
+func (store *DurableRequestDynamicPayloadStore) OpenAdvanced(
+	ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey,
+	head requestledger.HeadRecord, route requestledger.RoutePinRecord,
+	continuation requestledger.ContinuationRecord, targetLength, minimumApplied uint64,
+) (DurableRequestDynamicPayload, error) {
+	if store == nil || store.ledger == nil || ctx == nil || !key.Valid() || minimumApplied == 0 ||
+		targetLength == 0 || targetLength > requestledger.MaxTargetBytes ||
+		head.CleanupBuildDigest == (requestledger.Digest{}) || head.CleanupNextChunk != 0 ||
+		route.WaveOrdinal == math.MaxUint64 || route.WaveOrdinal+1 != head.NextStepOrdinal ||
+		route.KeyDigest != head.KeyDigest || route.RequestDigest != head.RequestDigest || route.PlanRoot != head.PlanRoot ||
+		continuation.KeyDigest != head.KeyDigest || continuation.RequestDigest != head.RequestDigest ||
+		continuation.PlanRoot != head.PlanRoot || continuation.ContinuationDigest != head.ContinuationDigest ||
+		continuation.WaveRevision != head.ContinuationRevision ||
+		continuation.SettledOrdinal != route.WaveOrdinal || continuation.RoutePinDigest != route.AcquiredEvidenceDigest ||
+		continuation.PriorContinuationDigest != route.PriorContinuationDigest {
+		return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
+	}
+	keyDigest, err := requestledger.KeyDigest(key)
+	if err != nil || keyDigest != head.KeyDigest {
+		return DurableRequestDynamicPayload{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	row, err := store.ledger.ReadRow(ctx, home, DurableRequestLifecycleRead{
+		Key: key, Kind: replicatedstate.RequestLedgerReadPayloadBuild, MinimumApplied: minimumApplied,
+	})
+	if err != nil {
+		return DurableRequestDynamicPayload{}, err
+	}
+	build := row.PayloadBuild
+	if !row.Found || row.Kind != replicatedstate.RequestLedgerReadPayloadBuild ||
+		build.Phase != requestledger.PayloadBuildSealed || build.BuildDigest != head.CleanupBuildDigest ||
+		build.KeyDigest != head.KeyDigest || build.RequestDigest != head.RequestDigest || build.PlanRoot != head.PlanRoot ||
+		build.PriorContinuationDigest != route.PriorContinuationDigest || build.WaveOrdinal != route.WaveOrdinal ||
+		build.TotalBytes != head.CleanupTotalDataBytes || build.ChunkCount != head.CleanupChunkCount ||
+		build.TotalBytes > requestledger.MaxDynamicWavePayloadBytes || targetLength >= build.TotalBytes {
+		return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
+	}
+	exact, err := store.openPayloadBytes(ctx, home, key, build, minimumApplied)
+	if err != nil {
+		return DurableRequestDynamicPayload{}, err
+	}
+	return durableRequestDynamicPayload(build, exact, targetLength)
+}
+
+func (store *DurableRequestDynamicPayloadStore) openPayloadBytes(
+	ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey,
+	build requestledger.PayloadBuildRecord, minimumApplied uint64,
+) ([]byte, error) {
 	exact := make([]byte, 0, build.TotalBytes)
 	var previous requestledger.Digest
 	for ordinal := uint64(0); ordinal < build.ChunkCount; ordinal++ {
@@ -202,7 +263,7 @@ func (store *DurableRequestDynamicPayloadStore) Open(
 			MinimumApplied: minimumApplied,
 		})
 		if readErr != nil {
-			return DurableRequestDynamicPayload{}, readErr
+			return nil, readErr
 		}
 		chunk := row.PayloadChunk
 		if !row.Found || row.Kind != replicatedstate.RequestLedgerReadPayloadChunk ||
@@ -210,16 +271,16 @@ func (store *DurableRequestDynamicPayloadStore) Open(
 			chunk.BuildDigest != build.BuildDigest || chunk.ContentRoot != build.ContentRoot ||
 			chunk.Ordinal != ordinal || chunk.Count != build.ChunkCount ||
 			chunk.TotalBytes != build.TotalBytes || chunk.PreviousChain != previous ||
-			chunk.Offset != uint64(len(exact)) {
-			return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
+			chunk.Offset != uint64(len(exact)) || uint64(len(chunk.Data)) > build.TotalBytes-uint64(len(exact)) {
+			return nil, ErrDurableRequestConflict
 		}
 		exact = append(exact, chunk.Data...)
 		previous = chunk.Chain
 	}
 	if uint64(len(exact)) != build.TotalBytes || previous != build.ContentRoot {
-		return DurableRequestDynamicPayload{}, ErrDurableRequestConflict
+		return nil, ErrDurableRequestConflict
 	}
-	return durableRequestDynamicPayloadWithStep(build, step, exact)
+	return exact, nil
 }
 
 // Cleanup retires an advanced wave's dynamic chunks in bounded replicated

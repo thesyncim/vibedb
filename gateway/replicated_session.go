@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -251,6 +252,7 @@ type NativeSession struct {
 	resolver            BundleResolver
 	bundle              RelationBundleBuilder
 	command             []byte
+	gateCommand         [routegate.CommandBytes]byte
 	maxCommand          int
 	pending             bool
 	phase               nativeSessionPhase
@@ -685,6 +687,48 @@ func (session *NativeSession) ExecutionPin(
 	return session.prepareAndExecute(ctx, command, false)
 }
 
+// RouteGate orders one typed shared pin or topology drain through the opened
+// session's exact-retry journal. Gate epochs are participant gate epochs, not
+// session epochs or execution-controller epochs.
+func (session *NativeSession) RouteGate(ctx context.Context, transition routegate.Command) (NativeResult, error) {
+	if ctx == nil {
+		return NativeResult{}, ErrNativeSession
+	}
+	if err := session.prepareRouteGate(transition); err != nil {
+		return NativeResult{}, err
+	}
+	return session.executePending(ctx, false)
+}
+
+// prepareRouteGate persists intent without admitting a proposal. The durable
+// request coordinator must install these exact bytes in its ledger before it
+// calls RetryPending; a local journal cannot substitute for that witness.
+func (session *NativeSession) prepareRouteGate(transition routegate.Command) error {
+	if session == nil || session.phase != nativeSessionActive || session.pending ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
+		return sessionStateError(session)
+	}
+	switch transition.Operation {
+	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
+		if session.proposalCapability != serviceauthz.CapabilityDataWrite {
+			return ErrNativeSession
+		}
+	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive, routegate.OperationCompactReleased:
+		if session.proposalCapability != serviceauthz.CapabilityTopology {
+			return ErrNativeSession
+		}
+	default:
+		return ErrNativeSession
+	}
+	nested, err := routegate.AppendCommand(session.gateCommand[:0], transition)
+	if err != nil {
+		return err
+	}
+	command := session.commandHeader(replication.CommandRouteGate, session.epoch, session.nextSequence, session.ackThrough)
+	command.RouteGate = nested
+	return session.prepareCommand(command, false)
+}
+
 // SplitCaptureActivate proposes one canonical source-capture activation through
 // a durable topology session. The journal owns the exact nested command before
 // admission, so an outcome-unknown retry cannot move the capture cut.
@@ -882,35 +926,45 @@ func (session *NativeSession) prepareAndExecute(
 	command replication.Command,
 	preserveFingerprint bool,
 ) (NativeResult, error) {
-	if ctx == nil || session.pending {
+	if ctx == nil {
 		return NativeResult{}, ErrNativeSessionState
+	}
+	if err := session.prepareCommand(command, preserveFingerprint); err != nil {
+		return NativeResult{}, err
+	}
+	return session.executePending(ctx, false)
+}
+
+func (session *NativeSession) prepareCommand(command replication.Command, preserveFingerprint bool) error {
+	if session == nil || session.pending {
+		return ErrNativeSessionState
 	}
 	if !preserveFingerprint {
 		command.Fingerprint = nativeCommandFingerprint(command)
 	}
 	size, err := replication.CommandSize(command)
 	if err != nil {
-		return NativeResult{}, err
+		return err
 	}
 	if size > session.maxCommand {
-		return NativeResult{}, ErrNativeBundleBound
+		return ErrNativeBundleBound
 	}
 	if cap(session.command) < size {
 		session.command = make([]byte, 0, size)
 	}
 	session.command, err = replication.AppendCommand(session.command[:0], command)
 	if err != nil {
-		return NativeResult{}, err
+		return err
 	}
 	session.pending = true
 	if session.journal != nil {
 		if err = session.journal.store(session.durableState()); err != nil {
 			session.pending = false
 			session.command = session.command[:0]
-			return NativeResult{}, err
+			return err
 		}
 	}
-	return session.executePending(ctx, false)
+	return nil
 }
 
 func (session *NativeSession) executePending(
@@ -1093,6 +1147,16 @@ func nativeCompletionMatches(
 			result.RangeIdentity != identity.RangeIdentity {
 			return false
 		}
+	} else if command.Kind() == replication.CommandRouteGate && completion.ResultFormat == replicatedstate.ResultFormatRouteGate {
+		if completion.ResultCode != replicatedstate.ResultRouteGate || completion.ResultLength != routegate.OutcomeBytes ||
+			len(completion.InlineResult) != routegate.OutcomeBytes {
+			return false
+		}
+		outcome, err := routegate.OpenOutcome(completion.InlineResult)
+		gate, gateErr := routegate.OpenCommand(command.RouteGateBytes())
+		if err != nil || gateErr != nil || !nativeRouteGateOutcomeMatches(gate, outcome) {
+			return false
+		}
 	} else if command.Kind() == replication.CommandExecutionPin {
 		if completion.ResultFormat != replicatedstate.ResultFormatExecutionPin ||
 			completion.ResultLength != executionpin.CompletionBytes ||
@@ -1149,6 +1213,81 @@ func nativeCompletionMatches(
 		completion.Fingerprint == command.Fingerprint && completion.RetryHome == command.RetryHome
 }
 
+// The envelope binds the whole command/session fingerprint; these checks also
+// reject canonical but semantically impossible outcomes. A shared release can
+// legitimately name an older acquisition epoch after compaction, so it must
+// not be compared to the current gate epoch as if it were a fresh acquire.
+func nativeRouteGateOutcomeMatches(command routegate.Command, outcome routegate.Outcome) bool {
+	status := outcome.Status
+	if outcome.Mutated && status.Revision == 0 {
+		return false
+	}
+	if outcome.Reason == routegate.ReasonStaleEpoch {
+		return status.Epoch != command.Epoch
+	}
+	if outcome.Reason == routegate.ReasonExhausted {
+		return status.Revision == math.MaxUint64 || status.Epoch == math.MaxUint64 &&
+			(command.Operation == routegate.OperationReleaseExclusive || command.Operation == routegate.OperationCompactReleased)
+	}
+	sameDrain := status.Drain.Identity == command.Identity &&
+		status.Drain.Binding == command.Binding && status.Drain.Epoch == command.Epoch
+	switch command.Operation {
+	case routegate.OperationAcquireShared:
+		if status.Epoch != command.Epoch {
+			return false
+		}
+		switch outcome.Reason {
+		case routegate.ReasonAcquired, routegate.ReasonIdempotent:
+			return status.ActivePins != 0
+		case routegate.ReasonAlreadyReleased:
+			return status.ReleasedPins != 0
+		case routegate.ReasonBlockedByDrain:
+			return status.Drain.State == routegate.DrainPending || status.Drain.State == routegate.DrainActive
+		case routegate.ReasonIdentityConflict, routegate.ReasonCapacity:
+			return true
+		}
+	case routegate.OperationReleaseShared:
+		switch outcome.Reason {
+		case routegate.ReasonReleased, routegate.ReasonAlreadyReleased:
+			return status.Epoch >= command.Epoch && status.ReleasedPins != 0
+		case routegate.ReasonIdentityConflict:
+			return true
+		case routegate.ReasonCapacity:
+			return status.Epoch == command.Epoch
+		}
+	case routegate.OperationBeginExclusive:
+		if status.Epoch != command.Epoch {
+			return false
+		}
+		switch outcome.Reason {
+		case routegate.ReasonDrainPending:
+			return sameDrain && status.Drain.State == routegate.DrainPending
+		case routegate.ReasonDrainAcquired:
+			return sameDrain && status.Drain.State == routegate.DrainActive
+		case routegate.ReasonIdempotent:
+			return sameDrain && (status.Drain.State == routegate.DrainPending || status.Drain.State == routegate.DrainActive)
+		case routegate.ReasonIdentityConflict:
+			return true
+		}
+	case routegate.OperationReleaseExclusive:
+		switch outcome.Reason {
+		case routegate.ReasonDrainReleased, routegate.ReasonIdempotent:
+			return command.Epoch != math.MaxUint64 && status.Epoch == command.Epoch+1 &&
+				sameDrain && status.Drain.State == routegate.DrainReleased
+		case routegate.ReasonIdentityConflict, routegate.ReasonNotFound, routegate.ReasonDrainBusy:
+			return status.Epoch == command.Epoch
+		}
+	case routegate.OperationCompactReleased:
+		switch outcome.Reason {
+		case routegate.ReasonCompacted:
+			return command.Epoch != math.MaxUint64 && status.Epoch == command.Epoch+1 && status.Drain.State == routegate.DrainNone
+		case routegate.ReasonDrainBusy:
+			return status.Epoch == command.Epoch
+		}
+	}
+	return false
+}
+
 func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) bool {
 	switch kind {
 	case replication.CommandMutationBatch, replication.CommandRetainedPrune:
@@ -1178,6 +1317,8 @@ func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) 
 		return false
 	case replication.CommandExecutionPin:
 		return nativeExecutionPinResultCode(result)
+	case replication.CommandRouteGate:
+		return result == replicatedstate.ResultStaleFence
 	case replication.CommandSplitCaptureActivate:
 		return result == replicatedstate.ResultApplied ||
 			result == replicatedstate.ResultStaleFence ||
@@ -1273,6 +1414,11 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.ExecutionPin)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(command.ExecutionPin)
+	if command.Kind == replication.CommandRouteGate {
+		binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.RouteGate)))
+		_, _ = hasher.Write(scalar[:])
+		_, _ = hasher.Write(command.RouteGate)
+	}
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.SplitCaptureActivation)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(command.SplitCaptureActivation)
@@ -1367,6 +1513,12 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(executionPin)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(executionPin)
+	if command.Kind() == replication.CommandRouteGate {
+		gate := command.RouteGateBytes()
+		binary.LittleEndian.PutUint64(scalar[:], uint64(len(gate)))
+		_, _ = hasher.Write(scalar[:])
+		_, _ = hasher.Write(gate)
+	}
 	splitCapture := command.SplitCaptureActivationBytes()
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(splitCapture)))
 	_, _ = hasher.Write(scalar[:])

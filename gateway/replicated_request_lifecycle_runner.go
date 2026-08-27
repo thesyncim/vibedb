@@ -65,6 +65,10 @@ type durableRequestExecutionPinFencer interface {
 	) (ReplicatedExecutionPinReadResult, error)
 }
 
+type durableRequestWaveStager interface {
+	Stage(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, uint64, []byte, []byte) (DurableRequestDynamicPayload, error)
+}
+
 // DurableRequestLifecycleRunner drives one participant at a time. Width is
 // therefore bounded by bytes and the persisted uint64 wave ordinal, not by an
 // aggregate participant slice or a policy participant cap.
@@ -74,6 +78,8 @@ type DurableRequestLifecycleRunner struct {
 	proposer     durableRequestWaveProposer
 	pinFencer    durableRequestExecutionPinFencer
 	pinAuthority serviceauthz.Authority
+	payloads     durableRequestWaveStager
+	gateSessions durableRequestRouteGateSessions
 }
 
 func NewDurableRequestLifecycleRunner(
@@ -88,6 +94,8 @@ func NewDurableRequestLifecycleRunner(
 	return &DurableRequestLifecycleRunner{
 		ledger: ledger, resolver: resolver, proposer: executor, pinFencer: executor,
 		pinAuthority: pinAuthority,
+		payloads:     &DurableRequestDynamicPayloadStore{ledger: ledger},
+		gateSessions: &nativeDurableRequestRouteGateSessions{executor: executor},
 	}, nil
 }
 
@@ -112,8 +120,14 @@ func newDurableRequestLifecycleRunner(
 	if fencer == nil {
 		return nil, ErrDurableRequest
 	}
+	gateSessions, ok := proposer.(durableRequestRouteGateSessions)
+	if !ok {
+		return nil, ErrDurableRequest
+	}
 	return &DurableRequestLifecycleRunner{
 		ledger: ledger, resolver: resolver, proposer: proposer, pinFencer: fencer,
+		payloads:     &DurableRequestDynamicPayloadStore{ledger: ledger},
+		gateSessions: gateSessions,
 	}, nil
 }
 
@@ -131,7 +145,7 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 	wave DurableRequestWave,
 ) (DurableRequestWaveResult, error) {
 	if runner == nil || runner.ledger == nil || runner.resolver == nil ||
-		runner.proposer == nil || runner.pinFencer == nil || ctx == nil {
+		runner.proposer == nil || runner.pinFencer == nil || runner.gateSessions == nil || ctx == nil {
 		return DurableRequestWaveResult{}, ErrDurableRequest
 	}
 	keyDigest, err := validateDurableRequestWave(wave)
@@ -144,6 +158,69 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 	if err = runner.fenceWaveSideEffect(ctx, wave); err != nil {
 		return DurableRequestWaveResult{}, err
 	}
+	return runner.runAdmittedWave(ctx, wave, keyDigest)
+}
+
+// RunStagedWave admits one invocation before its payload staging writes. The
+// admission is not a reusable token: every return/restart requires a new fence.
+// No service authority is forwarded to staging or participant proposals.
+func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, wave DurableRequestWave) (DurableRequestWaveResult, error) {
+	if runner == nil || runner.ledger == nil || runner.resolver == nil || runner.proposer == nil ||
+		runner.pinFencer == nil || runner.gateSessions == nil || runner.payloads == nil || ctx == nil ||
+		wave.Step != (requestledger.StepRef{}) || wave.Build != (requestledger.PayloadBuildRecord{}) ||
+		len(wave.Target) == 0 || len(wave.Target) > requestledger.MaxTargetBytes ||
+		len(wave.Command) == 0 || len(wave.Command) > replication.MaxCommandBytes {
+		return DurableRequestWaveResult{}, ErrDurableRequest
+	}
+	// Validate immutable identity and bounded bytes before replicated writes.
+	wave.Step.TargetLength, wave.Step.CommandLength = uint64(len(wave.Target)), uint64(len(wave.Command))
+	wave.Step.TargetDigest = requestledger.Digest(sha256.Sum256(wave.Target))
+	wave.Step.CommandDigest = requestledger.Digest(sha256.Sum256(wave.Command))
+	keyDigest, err := validateDurableRequestWave(wave)
+	if err != nil {
+		return DurableRequestWaveResult{}, err
+	}
+	if _, err = runner.resolveWave(ctx, wave); err != nil {
+		return DurableRequestWaveResult{}, err
+	}
+	if err = runner.fenceWaveSideEffect(ctx, wave); err != nil {
+		return DurableRequestWaveResult{}, err
+	}
+	headRow, err := runner.ledger.ReadRow(ctx, wave.Home, DurableRequestLifecycleRead{
+		Key: wave.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
+	})
+	if err != nil || !headRow.Found || headRow.Kind != replicatedstate.RequestLedgerReadHead {
+		return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	if headRow.Head.NextStepOrdinal != wave.Ordinal {
+		if wave.Ordinal == ^uint64(0) || headRow.Head.NextStepOrdinal != wave.Ordinal+1 {
+			return DurableRequestWaveResult{}, ErrDurableRequestConflict
+		}
+		cut, openErr := runner.advancedWaveCut(ctx, wave)
+		if openErr != nil || cut.route.WaveOrdinal != wave.Ordinal {
+			return DurableRequestWaveResult{}, errors.Join(openErr, ErrDurableRequestConflict)
+		}
+		retained, openErr := runner.openAdvancedWave(ctx, wave, cut, uint64(len(wave.Target)))
+		if openErr != nil || !bytes.Equal(retained.Target, wave.Target) || !bytes.Equal(retained.Command, wave.Command) {
+			return DurableRequestWaveResult{}, errors.Join(openErr, ErrDurableRequestConflict)
+		}
+		return runner.runAdmittedWave(ctx, retained, keyDigest)
+	}
+	payload, err := runner.payloads.Stage(ctx, wave.Home, wave.Key, wave.Ordinal, wave.Target, wave.Command)
+	if err != nil {
+		return DurableRequestWaveResult{}, err
+	}
+	if !bytes.Equal(payload.Target, wave.Target) || !bytes.Equal(payload.Command, wave.Command) {
+		return DurableRequestWaveResult{}, ErrDurableRequestConflict
+	}
+	wave.Build, wave.Step, wave.Target, wave.Command = payload.Build, payload.Step, payload.Target, payload.Command
+	if _, err = validateDurableRequestWave(wave); err != nil {
+		return DurableRequestWaveResult{}, err
+	}
+	return runner.runAdmittedWave(ctx, wave, keyDigest)
+}
+
+func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context, wave DurableRequestWave, keyDigest requestledger.Digest) (DurableRequestWaveResult, error) {
 	head, routePin, pending, readApplied, err := runner.openWaveRows(ctx, wave, keyDigest)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
@@ -156,6 +233,9 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 		routePin.WaveOrdinal == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal+1 &&
 		head.OutstandingRoutePinDigest == (requestledger.Digest{}) && pending.Revision == 0
 	if completed {
+		if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
+			return DurableRequestWaveResult{}, err
+		}
 		observation, readErr := runner.readWaveObservation(ctx, wave, routePin, readApplied)
 		return DurableRequestWaveResult{Observation: observation, Revision: head.Revision}, readErr
 	}
@@ -170,6 +250,11 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 	if routePin.Phase == requestledger.RoutePinReleased &&
 		routePin.WaveOrdinal+1 == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal &&
 		head.OutstandingRoutePinDigest == (requestledger.Digest{}) {
+		// The released row remains the exact session-cleanup witness. Never
+		// replace it until a replayable retirement/release has settled.
+		if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
+			return DurableRequestWaveResult{}, err
+		}
 		routePin = requestledger.RoutePinRecord{}
 	}
 	if routePin.Phase != requestledger.RoutePinInvalid && routePin.WaveOrdinal != wave.Ordinal {
@@ -182,10 +267,7 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 		if err != nil {
 			return DurableRequestWaveResult{}, err
 		}
-		acquire, physical, buildErr := appendDurableRequestRouteGateCommand(
-			nil, route, wave, keyDigest, head.RequestDigest, head.PlanRoot,
-			head.ContinuationDigest, head.NextStepOrdinal, routegate.OperationAcquireShared,
-		)
+		acquire, physical, buildErr := runner.gateSessions.prepareAcquire(ctx, route, wave, head)
 		if buildErr != nil {
 			return DurableRequestWaveResult{}, buildErr
 		}
@@ -303,9 +385,10 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 		if result.Ledger.ResultCode != replicatedstate.ResultApplied {
 			return DurableRequestWaveResult{}, ErrDurableRequestConflict
 		}
-		head, err = requestledger.AdvancePending(head, pending, continuation)
 		if wave.Build != (requestledger.PayloadBuildRecord{}) {
 			head, err = requestledger.AdvancePendingWithBuild(head, pending, continuation, wave.Build)
+		} else {
+			head, err = requestledger.AdvancePending(head, pending, continuation)
 		}
 		if err != nil {
 			return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
@@ -319,11 +402,7 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 		if err != nil {
 			return DurableRequestWaveResult{}, err
 		}
-		release, _, buildErr := appendDurableRequestRouteGateCommand(
-			nil, route, wave, keyDigest, routePin.RequestDigest, routePin.PlanRoot,
-			routePin.PriorContinuationDigest, routePin.WaveOrdinal,
-			routegate.OperationReleaseShared,
-		)
+		release, buildErr := runner.gateSessions.prepareRelease(ctx, route, wave, routePin)
 		if buildErr != nil {
 			return DurableRequestWaveResult{}, buildErr
 		}
@@ -370,6 +449,9 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 	if routePin.Phase != requestledger.RoutePinReleased ||
 		head.OutstandingRoutePinDigest != (requestledger.Digest{}) || pending.Revision != 0 {
 		return DurableRequestWaveResult{}, ErrDurableRequestUnresolved
+	}
+	if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
+		return DurableRequestWaveResult{}, err
 	}
 	return DurableRequestWaveResult{
 		Observation: observation, Revision: head.Revision,
@@ -586,6 +668,7 @@ func appendDurableRequestRouteGateCommand(
 	priorContinuation requestledger.Digest,
 	waveOrdinal uint64,
 	operation routegate.Operation,
+	session *NativeSession,
 ) ([]byte, requestledger.Digest, error) {
 	identity, err := requestledger.DeriveRouteGateIdentity(
 		keyDigest, requestDigest, planRoot, priorContinuation,
@@ -593,11 +676,6 @@ func appendDurableRequestRouteGateCommand(
 	)
 	if err != nil {
 		return dst, requestledger.Digest{}, errors.Join(err, ErrDurableRequestConflict)
-	}
-	clientID := replication.ID128(wave.Identity.ID)
-	sequence := uint64(1)
-	if operation == routegate.OperationReleaseShared {
-		sequence = 2
 	}
 	gate := routegate.Command{
 		Operation: operation, Epoch: wave.GateEpoch,
@@ -607,10 +685,7 @@ func appendDurableRequestRouteGateCommand(
 	if err != nil {
 		return dst, requestledger.Digest{}, err
 	}
-	outer := replicatedTransactionCommandHeader(
-		route, wave.Tenant, wave.Identity.RetryHome, clientID,
-		wave.GateEpoch, sequence,
-	)
+	outer := session.commandHeader(replication.CommandRouteGate, session.epoch, session.nextSequence, session.ackThrough)
 	outer.Kind, outer.RouteGate = replication.CommandRouteGate, gateBytes
 	outer.Fingerprint = nativeCommandFingerprint(outer)
 	provisional, err := replication.AppendCommand(nil, outer)

@@ -111,6 +111,7 @@ const (
 	requestReadTransaction
 	requestReadRequestLedger
 	requestReadExecutionPin
+	requestReadRouteGate
 	requestReplicaObservation
 	requestOwnershipTransition
 	requestSchemaTransition
@@ -194,6 +195,7 @@ type readAuthorization struct {
 	recovery       TransactionRecoverySource
 	requestLedger  RequestLedgerSource
 	executionPin   ExecutionPinSource
+	routeGate      RouteGateSource
 	minimumApplied uint64
 	generation     *ownerGeneration
 }
@@ -205,6 +207,7 @@ type readDelivery struct {
 	recovery       TransactionRecoverySource
 	requestLedger  RequestLedgerSource
 	executionPin   ExecutionPinSource
+	routeGate      RouteGateSource
 	minimumApplied uint64
 	generation     *ownerGeneration
 }
@@ -1088,7 +1091,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestInstallSchemaGeneration:
 		reply.err = owner.installSchemaGeneration(request)
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger,
-		requestReadExecutionPin:
+		requestReadExecutionPin, requestReadRouteGate:
 		member, found := owner.members[request.group]
 		if !found ||
 			!servingFenceMatchesIdentity(request.read.fence, member) {
@@ -1107,6 +1110,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 			}
 		} else if request.kind == requestReadExecutionPin {
 			if _, ok := member.recovery.(ExecutionPinSource); !ok {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadRouteGate {
+			if _, ok := member.recovery.(RouteGateSource); !ok {
 				reply.err = ErrServingFence
 				break
 			}
@@ -1157,6 +1165,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.recovery = member.recovery
 		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
 		request.read.delivery.executionPin, _ = member.recovery.(ExecutionPinSource)
+		request.read.delivery.routeGate, _ = member.recovery.(RouteGateSource)
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		request.read.delivery.generation = member.generation
 		owner.pendingReads[context] = request.read.delivery
@@ -1166,7 +1175,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = ErrInvalidOwner
 	}
 	if (request.kind == requestReadLinear || request.kind == requestReadTransaction ||
-		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin) &&
+		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin || request.kind == requestReadRouteGate) &&
 		request.read.delivery != nil {
 		owner.settleReadDelivery(request.read.delivery, reply)
 	} else {
@@ -1401,6 +1410,7 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			reply.read.requestLedger = delivery.requestLedger
 			reply.read.generation = delivery.generation
 			reply.read.executionPin = delivery.executionPin
+			reply.read.routeGate = delivery.routeGate
 		}
 		owner.settleReadDelivery(delivery, reply)
 	}
