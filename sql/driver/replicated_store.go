@@ -109,17 +109,17 @@ const (
 // exact-index image. Relation IDs must be dense from two; no table name or
 // index identity is carried by replicated mutation commands.
 type ReplicatedGlobalIndexRelation struct {
-	Relation      uint16
-	Table         string
-	IndexID       uint64
-	Incarnation   uint64
-	LocatorCount  uint8
-	Unique        bool
-	KeyEncoding   ReplicatedRelationKeyEncoding
-	KeyArity      uint8
-	TupleVersion  distribution.TupleVersion
-	MapperVersion distribution.MapperVersion
-	BucketBits    uint8
+	Relation      uint16                        `json:"relation"`
+	Table         string                        `json:"table"`
+	IndexID       uint64                        `json:"index_id"`
+	Incarnation   uint64                        `json:"incarnation"`
+	LocatorCount  uint8                         `json:"locator_count"`
+	Unique        bool                          `json:"unique"`
+	KeyEncoding   ReplicatedRelationKeyEncoding `json:"key_encoding"`
+	KeyArity      uint8                         `json:"key_arity"`
+	TupleVersion  distribution.TupleVersion     `json:"tuple_version"`
+	MapperVersion distribution.MapperVersion    `json:"mapper_version"`
+	BucketBits    uint8                         `json:"bucket_bits"`
 }
 
 // ReplicatedShardRelationIdentity is one immutable, comparable manifest slot.
@@ -299,10 +299,39 @@ func (d *Database) BindReplicatedShardStoreBundle(
 	return d.bindReplicatedShardStoreBundle(binding, userTable, globalIndexes, nil)
 }
 
+// BindReplicatedShardStoreBundleIdentity provisions a complete bundle using the
+// retained identity of every relation. The identity and catalog schema must
+// agree before any storage is created; an exact retry settles the same binding.
+func (d *Database) BindReplicatedShardStoreBundleIdentity(
+	expected ReplicatedShardStoreIdentity,
+	globalIndexes []ReplicatedGlobalIndexRelation,
+) (ReplicatedShardStoreIdentity, error) {
+	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
+		return ReplicatedShardStoreIdentity{}, err
+	}
+	if !replicatedBundleProvisioningMatches(expected, globalIndexes) {
+		return ReplicatedShardStoreIdentity{}, ErrReplicatedShardStoreIdentityMismatch
+	}
+	expected = ownedReplicatedShardStoreIdentity(expected)
+	return d.bindReplicatedShardStoreBundleExact(
+		expected.Binding, expected.UserTable, globalIndexes, &expected, nil,
+	)
+}
+
 func (d *Database) bindReplicatedShardStoreBundle(
 	binding ReplicatedShardStoreBinding,
 	userTable string,
 	globalIndexes []ReplicatedGlobalIndexRelation,
+	persist func(*database) (bool, error),
+) (ReplicatedShardStoreIdentity, error) {
+	return d.bindReplicatedShardStoreBundleExact(binding, userTable, globalIndexes, nil, persist)
+}
+
+func (d *Database) bindReplicatedShardStoreBundleExact(
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+	globalIndexes []ReplicatedGlobalIndexRelation,
+	expected *ReplicatedShardStoreIdentity,
 	persist func(*database) (bool, error),
 ) (ReplicatedShardStoreIdentity, error) {
 	if err := validateReplicatedShardStoreBinding(binding); err != nil {
@@ -369,6 +398,7 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	if current := core.catalog.ReplicatedShardStore; current != nil {
 		if current.Binding != binding || current.UserTable != userTable ||
 			current.Sidecars != sidecars ||
+			(expected != nil && !current.Equal(*expected)) ||
 			!replicatedBundleProvisioningMatches(*current, ownedGlobals) {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: catalog is already bound", ErrReplicatedShardStoreIdentityMismatch,
@@ -462,6 +492,11 @@ func (d *Database) bindReplicatedShardStoreBundle(
 			return ReplicatedShardStoreIdentity{}, err
 		}
 	}
+	if expected != nil {
+		if err := core.validateReservedReplicatedBundleLocked(*expected, sidecars, local.LogID); err != nil {
+			return ReplicatedShardStoreIdentity{}, err
+		}
+	}
 	if err := core.checkRetirementCapacityLocked(len(pending)); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
@@ -505,9 +540,15 @@ func (d *Database) bindReplicatedShardStoreBundle(
 		return errors.Join(errs...)
 	}
 	for i := range pending {
-		storage, err := core.newStorageIdentityLocked()
-		if err != nil {
-			return ReplicatedShardStoreIdentity{}, rollback(err)
+		var storage string
+		if expected != nil {
+			storage = expected.Relations[i].Storage
+		} else {
+			var err error
+			storage, err = core.newStorageIdentityLocked()
+			if err != nil {
+				return ReplicatedShardStoreIdentity{}, rollback(err)
+			}
 		}
 		meta := cloneTableMeta(pending[i].original.meta)
 		meta.Storage = storage
@@ -577,6 +618,9 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
 		return ReplicatedShardStoreIdentity{}, rollback(err)
 	}
+	if expected != nil && !expected.Equal(identity) {
+		return ReplicatedShardStoreIdentity{}, rollback(ErrReplicatedShardStoreIdentityMismatch)
+	}
 	members := make([]durable.NamedCollection, len(pending))
 	for i := range pending {
 		members[i] = durable.NamedCollection{
@@ -633,6 +677,49 @@ func (d *Database) bindReplicatedShardStoreBundle(
 		)
 	}
 	return ownedReplicatedShardStoreIdentity(identity), nil
+}
+
+// validateReservedReplicatedBundleLocked checks the schema-dependent identity
+// fields and every reserved namespace before materializing the first relation.
+// The public entry point already validates the manifest and global specs.
+func (d *database) validateReservedReplicatedBundleLocked(
+	expected ReplicatedShardStoreIdentity,
+	sidecars ReplicatedShardStoreSidecarProfile,
+	logID [16]byte,
+) error {
+	if expected.LogID != logID || expected.Sidecars != sidecars ||
+		expected.UserPrimaryKey != d.tables[expected.UserTable].meta.PrimaryKey {
+		return ErrReplicatedShardStoreIdentityMismatch
+	}
+	for i, relation := range expected.Relations {
+		t := d.tables[relation.Table]
+		normalized, err := durable.NormalizeOptions(durableOptions(t))
+		if err != nil {
+			return fmt.Errorf("%w: relation options: %v", ErrReplicatedShardStoreProfile, err)
+		}
+		limits := ReplicatedShardStoreLimits{
+			MaxKeyBytes: normalized.MaxKeyBytes, MaxDocumentBytes: normalized.MaxDocumentBytes,
+			MaxBatchDocuments: normalized.MaxBatchDocuments, MaxBatchBytes: normalized.MaxBatchBytes,
+		}
+		if relation.Limits != limits || i == 0 && relation.LocalIndexDigest != replicatedLocalIndexDigest(t.meta.Indexes) {
+			return ErrReplicatedShardStoreIdentityMismatch
+		}
+		for prior := 0; prior < i; prior++ {
+			if expected.Relations[prior].Storage == relation.Storage {
+				return fmt.Errorf("%w: duplicate reserved relation storage", ErrReplicatedShardStoreIdentityMismatch)
+			}
+		}
+		path := filepath.Join(d.dataDir, relation.Storage+".vjc")
+		if d.storagePathInUseLocked(path) {
+			return fmt.Errorf("%w: reserved relation storage is in use", ErrReplicatedShardStoreIdentityMismatch)
+		}
+		for _, candidate := range [...]string{path, durable.RecoveryJournalPath(path)} {
+			if _, err := os.Lstat(candidate); err == nil || !os.IsNotExist(err) {
+				return errors.Join(ErrReplicatedShardStoreIdentityMismatch, err)
+			}
+		}
+	}
+	return nil
 }
 
 func replicatedBundleProvisioningMatches(
