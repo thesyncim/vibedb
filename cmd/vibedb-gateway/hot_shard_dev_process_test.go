@@ -30,6 +30,9 @@ type devHotProcessManifest struct {
 	CatalogPath         string                `json:"catalog_path"`
 	GatewayCertificate  string                `json:"gateway_certificate"`
 	GatewayKey          string                `json:"gateway_key"`
+	ClientCertificate   string                `json:"client_certificate"`
+	ClientKey           string                `json:"client_key"`
+	ClientNode          string                `json:"client_node"`
 	Roots               string                `json:"roots"`
 	AuthorizationPolicy string                `json:"authorization_policy"`
 	HotShardCapacity    string                `json:"hot_shard_capacity"`
@@ -85,6 +88,11 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replicaProcessStop(t, process)
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("development cluster process diagnostics:\n%s", process.Diagnostics())
+		}
+	})
 	if err := process.WaitReady(ctx, "VibeDB development cluster ready:"); err != nil {
 		t.Fatalf("zero-config cluster readiness: %v\n%s", err, process.Diagnostics())
 	}
@@ -102,6 +110,15 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		manifest.Roots, "1.3.6.1.4.1.32473.1.1", time.Now)
 	if err != nil {
 		t.Fatal(err)
+	}
+	clientProfile, err := servicetls.LoadProfile(manifest.ClientCertificate, manifest.ClientKey,
+		manifest.Roots, "1.3.6.1.4.1.32473.1.1", time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientIdentity := clientProfile.LocalIdentity()
+	if idString := hex.EncodeToString(clientIdentity.Node[:]); idString != manifest.ClientNode || idString == manifest.GatewayNode {
+		t.Fatal("dev client credential does not match its distinct manifest identity")
 	}
 	var gatewayNode rafttransport.NodeID
 	if decoded, decodeErr := hex.DecodeString(manifest.GatewayNode); decodeErr != nil ||
@@ -127,7 +144,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	baselineStorage := replicaProcessAllocatedBytes(state, "")
 	baselineWAL := replicaProcessAllocatedBytes(state, ".wal")
 	baselineNetwork := replicaProcessSnapshotPayloadBytes(state)
-	connection := hotMutationDialGateway(t, profile, gatewayNode, manifest.ClientEndpoint)
+	connection := hotMutationDialGateway(t, clientProfile, gatewayNode, manifest.ClientEndpoint)
 	defer connection.Close()
 	client := &hotMutationWireClient{connection: connection, reader: bufio.NewReader(connection)}
 	reference := client.openIssuer(t)

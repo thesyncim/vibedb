@@ -74,6 +74,9 @@ type devClusterManifest struct {
 	CatalogPath         string             `json:"catalog_path"`
 	GatewayCertificate  string             `json:"gateway_certificate"`
 	GatewayKey          string             `json:"gateway_key"`
+	ClientCertificate   string             `json:"client_certificate"`
+	ClientKey           string             `json:"client_key"`
+	ClientNode          string             `json:"client_node"`
 	Roots               string             `json:"roots"`
 	AuthorizationPolicy string             `json:"authorization_policy"`
 	HotShardCapacity    string             `json:"hot_shard_capacity"`
@@ -435,8 +438,10 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	// Each independently serving process owns one physical NodeID. Sharing a
 	// NodeID across role-local control listeners would make authenticated
 	// replica routing ambiguous and cannot be represented by the strict control
-	// manifest. The final identity belongs to the gateway.
-	nodes := make([]rafttransport.NodeID, options.replicas*3+1)
+	// manifest. The final two identities belong to the gateway and its client.
+	// A client must never authenticate to a service using that service's key.
+	nodes := make([]rafttransport.NodeID, options.replicas*3+2)
+	gatewayIndex, clientIndex := options.replicas*3, options.replicas*3+1
 	stores := make([][16]byte, options.replicas*3)
 	for i := range nodes {
 		if _, err := io.ReadFull(cryptorand.Reader, nodes[i][:]); err != nil {
@@ -457,7 +462,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		return devClusterManifest{}, err
 	}
 	policyPath := filepath.Join(options.root, "authorization-policy.vibejson")
-	if err := writeDevPolicy(policyPath, nodes); err != nil {
+	if err := writeDevPolicy(policyPath, nodes[:clientIndex], nodes[clientIndex]); err != nil {
 		return devClusterManifest{}, err
 	}
 	durableAckKeyPath := filepath.Join(options.root, "durable-ack-key")
@@ -482,8 +487,9 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		return devClusterManifest{}, err
 	}
 	clear(keyMaterial)
-	gatewayIndex := options.replicas * 3
 	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), ReplicaControl: filepath.Join(options.root, "replica-control.vibejson"), DurableAckKey: durableAckKeyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), GatewayControl: ports[1+options.replicas*12], Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas), DataMembers: make([]devClusterMember, options.replicas)}
+	m.ClientCertificate, m.ClientKey = credentials[clientIndex][0], credentials[clientIndex][1]
+	m.ClientNode = hex.EncodeToString(nodes[clientIndex][:])
 	catalogPrepareMembers := make([]devPrepareMember, options.replicas)
 	ledgerPrepareMembers := make([]devPrepareMember, options.replicas)
 	dataPrepareMembers := make([]devPrepareMember, options.replicas)
@@ -1437,16 +1443,24 @@ func writeDevCredentials(root string, domain rafttransport.TrustDomain, nodes []
 
 var devIdentityOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1}
 
-func writeDevPolicy(path string, nodes []rafttransport.NodeID) error {
-	encoded := make([]string, len(nodes))
-	for i, n := range nodes {
-		encoded[i] = hex.EncodeToString(n[:])
+func writeDevPolicy(path string, nodes []rafttransport.NodeID, client rafttransport.NodeID) error {
+	if len(nodes) == 0 || client == (rafttransport.NodeID{}) {
+		return errDevCluster
 	}
-	sort.Strings(encoded)
 	caps := []string{"data_read", "data_write", "schema", "delegate", "membership", "topology", "transaction_recovery", "request_ledger", "execution_pin"}
-	policy := devPolicy{Generation: 1, Principals: make([]devPrincipal, len(encoded))}
-	for i, n := range encoded {
-		policy.Principals[i] = devPrincipal{Node: n, Capabilities: caps}
+	policy := devPolicy{Generation: 1, Principals: make([]devPrincipal, len(nodes)+1)}
+	for i, n := range nodes {
+		if n == (rafttransport.NodeID{}) || n == client {
+			return errDevCluster
+		}
+		policy.Principals[i] = devPrincipal{Node: hex.EncodeToString(n[:]), Capabilities: caps}
+	}
+	policy.Principals[len(nodes)] = devPrincipal{Node: hex.EncodeToString(client[:]), Capabilities: []string{"data_read", "data_write"}}
+	sort.Slice(policy.Principals, func(i, j int) bool { return policy.Principals[i].Node < policy.Principals[j].Node })
+	for i := 1; i < len(policy.Principals); i++ {
+		if policy.Principals[i-1].Node == policy.Principals[i].Node {
+			return errDevCluster
+		}
 	}
 	raw, err := vibejson.Marshal(&policy)
 	if err != nil {
@@ -1628,9 +1642,12 @@ func validDevManifest(m devClusterManifest, root string) bool {
 	if _, err := decodeDev16(m.GatewayNode); err != nil {
 		return false
 	}
-	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity, m.ReplicaControl, m.DurableAckKey}
+	if _, err := decodeDev16(m.ClientNode); err != nil || m.ClientNode == m.GatewayNode {
+		return false
+	}
+	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.ClientCertificate, m.ClientKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity, m.ReplicaControl, m.DurableAckKey}
 	addresses := map[string]struct{}{m.ClientEndpoint: {}, m.GatewayControl: {}}
-	nodes := map[string]struct{}{m.GatewayNode: {}}
+	nodes := map[string]struct{}{m.GatewayNode: {}, m.ClientNode: {}}
 	stores := make(map[string]struct{}, len(m.Members)+len(m.LedgerMembers)+len(m.DataMembers))
 	for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers, m.DataMembers} {
 		for index, member := range members {
@@ -1690,7 +1707,7 @@ func decodeDev16(value string) ([16]byte, error) {
 		return out, errDevCluster
 	}
 	_, err := hex.Decode(out[:], []byte(value))
-	if err == nil && out == ([16]byte{}) {
+	if err == nil && (out == ([16]byte{}) || hex.EncodeToString(out[:]) != value) {
 		err = errDevCluster
 	}
 	return out, err

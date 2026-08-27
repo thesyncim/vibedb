@@ -1039,14 +1039,16 @@ func hotMutationDialGateway(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
+	var lastErr error
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
 		connection, dialErr := client.Dial(t.Context(), address)
 		if dialErr == nil {
 			return connection
 		}
+		lastErr = dialErr
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatal("gateway dial timeout")
+	t.Fatalf("gateway dial %s timeout: %v", address, lastErr)
 	return nil
 }
 

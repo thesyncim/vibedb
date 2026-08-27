@@ -33,6 +33,7 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		Format: devClusterFormat, Nodes: devClusterRF3,
 		ClientEndpoint: "127.0.0.1:24000", CatalogPath: filepath.Join(root, "catalog.vibejson"),
 		GatewayCertificate: filepath.Join(root, "gateway-cert.pem"), GatewayKey: filepath.Join(root, "gateway-key.pem"),
+		ClientCertificate: filepath.Join(root, "client-cert.pem"), ClientKey: filepath.Join(root, "client-key.pem"), ClientNode: "02020202020202020202020202020202",
 		Roots: filepath.Join(root, "roots.pem"), AuthorizationPolicy: filepath.Join(root, "policy.vibejson"),
 		HotShardCapacity: filepath.Join(root, "hot-shard-capacity.vibejson"),
 		ReplicaControl:   filepath.Join(root, "replica-control.vibejson"),
@@ -41,7 +42,7 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		GatewayControl:   "127.0.0.1:24001",
 		Members:          make([]devClusterMember, devClusterRF3), LedgerMembers: make([]devClusterMember, devClusterRF3), DataMembers: make([]devClusterMember, devClusterRF3),
 	}
-	paths := []string{manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy, manifest.HotShardCapacity, manifest.ReplicaControl, manifest.DurableAckKey}
+	paths := []string{manifest.GatewayCertificate, manifest.GatewayKey, manifest.ClientCertificate, manifest.ClientKey, manifest.Roots, manifest.AuthorizationPolicy, manifest.HotShardCapacity, manifest.ReplicaControl, manifest.DurableAckKey}
 	for index := range manifest.Members {
 		member := func(role string, nodeBase, storeBase byte, portBase, snapshotBase int) devClusterMember {
 			node := [16]byte{nodeBase + byte(index)}
@@ -159,6 +160,7 @@ func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
 	base := devClusterManifest{
 		Format: devClusterFormat, Nodes: devClusterRF1, ClientEndpoint: "127.0.0.1:24000",
 		CatalogPath: filepath.Join(root, "catalog.vibejson"), GatewayCertificate: filepath.Join(root, "gateway-cert.pem"),
+		ClientCertificate: filepath.Join(root, "client-cert.pem"), ClientKey: filepath.Join(root, "client-key.pem"), ClientNode: "02020202020202020202020202020202",
 		GatewayKey: filepath.Join(root, "gateway-key.pem"), Roots: filepath.Join(root, "roots.pem"),
 		AuthorizationPolicy: filepath.Join(root, "policy.vibejson"), GatewayNode: "01010101010101010101010101010101",
 		HotShardCapacity: filepath.Join(root, "hot-shard-capacity.vibejson"),
@@ -171,6 +173,21 @@ func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
 	}
 	if !validDevManifest(base, root) {
 		t.Fatal("explicit RF1 manifest rejected")
+	}
+	for _, mutate := range []func(*devClusterManifest){
+		func(m *devClusterManifest) { m.ClientNode = "" },
+		func(m *devClusterManifest) { m.ClientNode = m.GatewayNode },
+		func(m *devClusterManifest) { m.ClientNode = m.DataMembers[0].Node },
+		func(m *devClusterManifest) { m.ClientCertificate = m.GatewayCertificate },
+		func(m *devClusterManifest) { m.ClientKey = m.GatewayKey },
+		func(m *devClusterManifest) { m.ClientKey = m.ClientCertificate },
+		func(m *devClusterManifest) { m.ClientCertificate = filepath.Join(root, "..", "client-cert.pem") },
+	} {
+		invalid := base
+		mutate(&invalid)
+		if validDevManifest(invalid, root) {
+			t.Fatal("missing, aliased, or unconfined client credential accepted")
+		}
 	}
 	withoutLedger := base
 	withoutLedger.LedgerMembers = nil
@@ -450,7 +467,7 @@ func TestDevPolicyIsAcceptedByProductionAuthorizationLoader(t *testing.T) {
 	for index := range nodes {
 		nodes[index][0] = byte(index + 1)
 	}
-	if err := writeDevPolicy(path, nodes[:]); err != nil {
+	if err := writeDevPolicy(path, nodes[:3], nodes[3]); err != nil {
 		t.Fatal(err)
 	}
 	policy, err := serviceauthz.LoadFile(path)
