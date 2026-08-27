@@ -146,7 +146,7 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
-	database, err := sqldriver.Open(member.SQL.Path)
+	database, err := sqldriver.OpenReplicatedShardStore(member.SQL.Path, base)
 	if err != nil {
 		return err
 	}

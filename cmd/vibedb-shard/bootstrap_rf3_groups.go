@@ -274,7 +274,7 @@ func prepareColdRF3Group(
 			resultErr = errors.Join(resultErr, prepared.close())
 		}
 	}()
-	prepared.database, err = sqldriver.Open(member.SQL.Path)
+	prepared.database, err = sqldriver.OpenReplicatedShardStore(member.SQL.Path, base)
 	if err != nil {
 		return nil, err
 	}
