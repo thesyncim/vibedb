@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -65,8 +66,6 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	identity2.GroupID[0] ^= 0x40
 	identity2.ShardIncarnation[0] ^= 0x20
 	identity2.StoreID[0] ^= 0x10
-	identity2.Distribution = "process-second"
-	identity2.Shard = "process-second-0001"
 	target1 := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{0xe1}, NodeIncarnation: 9,
 		Listeners: rf3testfixture.ProcessListeners{Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t), Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t)}}
 	target2 := target1
@@ -76,9 +75,11 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		for i := range key.Material {
 			key.Material[i] = byte(i + 1)
 		}
+		bootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
+		bootstrap.Snapshot.Metadata.ConfState.Learners = []uint64{4}
 		prepared, prepareErr := rf3testfixture.PrepareProcessMember(rf3testfixture.ProcessMemberOptions{
 			Root: filepath.Join(root, name), Table: "docs", CreateTable: `CREATE TABLE docs (PRIMARY KEY (id))`,
-			Identity: identity, Key: key, WAL: walOptions, Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+			Identity: identity, Key: key, WAL: walOptions, Bootstrap: bootstrap,
 			Authority: authority, Apply: apply, Listeners: addresses, Credential: credentials[0], Roots: roots,
 			AuthorizationPolicy: policyPath, Nodes: nodes, PeerAddresses: peerAddresses, Target: &target,
 		})
@@ -96,6 +97,44 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	if err = os.WriteFile(manifestPath, combineRF3ProcessGroups(t, first.ManifestPath, second.ManifestPath), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	targetKey := raftstore.Key{ID: "rf3-command-key", Wrapped: []byte("test-wrapped")}
+	for index := range targetKey.Material {
+		targetKey.Material[index] = byte(index + 1)
+	}
+	groupFor := func(identity raftstore.Identity) raftmember.GroupKey {
+		return raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
+			TopologyRecoveryEpoch: rf3CommandGroup().TopologyRecoveryEpoch,
+			ShardIncarnation:      identity.ShardIncarnation, GroupID: identity.GroupID}
+	}
+	cold1 := prepareRF3ColdTarget(t, rf3ColdTargetOptions{Root: filepath.Join(root, "target-first"),
+		Group: groupFor(identity1), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
+		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
+		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
+		Target: rf3ManifestEnrolledTarget{MemberID: target1.MemberID, NodeID: target1.NodeID,
+			StoreID: target1.StoreID, NodeIncarnation: target1.NodeIncarnation,
+			PeerAddress: target1.Listeners.Peer, NativeAddress: target1.Listeners.Native,
+			SnapshotAddress: target1.Listeners.Snapshot, ControlAddress: target1.Listeners.Control},
+		Listeners: rf3ManifestListeners{Peer: target1.Listeners.Peer, Native: target1.Listeners.Native,
+			Snapshot: target1.Listeners.Snapshot, Control: target1.Listeners.Control},
+		SourceNode: nodes[0], SourceSnapshotAddress: addresses.Snapshot, MaxArtifactBytes: 1 << 30})
+	cold2 := prepareRF3ColdTarget(t, rf3ColdTargetOptions{Root: filepath.Join(root, "target-second"),
+		Group: groupFor(identity2), Authority: authority, WAL: walOptions, Apply: apply, Key: targetKey,
+		Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
+		ServingNodes: nodes, ServingPeerAddresses: peerAddresses,
+		Target: rf3ManifestEnrolledTarget{MemberID: target2.MemberID, NodeID: target2.NodeID,
+			StoreID: target2.StoreID, NodeIncarnation: target2.NodeIncarnation,
+			PeerAddress: target2.Listeners.Peer, NativeAddress: target2.Listeners.Native,
+			SnapshotAddress: target2.Listeners.Snapshot, ControlAddress: target2.Listeners.Control},
+		Listeners: rf3ManifestListeners{Peer: target2.Listeners.Peer, Native: target2.Listeners.Native,
+			Snapshot: target2.Listeners.Snapshot, Control: target2.Listeners.Control},
+		SourceNode: nodes[0], SourceSnapshotAddress: addresses.Snapshot, MaxArtifactBytes: 1 << 30})
+	multiBootstrapPath := filepath.Join(root, "target-bootstrap-groups.vibejson")
+	if err = os.WriteFile(multiBootstrapPath, combineBootstrapRF3ProcessGroups(t,
+		cold1.BootstrapManifestPath, cold2.BootstrapManifestPath), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coldTarget := &rf3ColdTargetProcess{BootstrapManifestPath: multiBootstrapPath, member: 4}
+	defer coldTarget.Close(t)
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -131,6 +170,8 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	}()
 	defer closeRF3CommandChildren(t, []*rf3CommandChild{child})
 	waitRF3CommandReady(t, child, 30*time.Second)
+	coldTarget.Start(t)
+	coldTarget.WaitColdReady(t)
 
 	profile, err := servicetls.LoadProfile(credentials[3].Certificate, credentials[3].Key, roots,
 		rf3testfixture.ProcessIdentityOID, time.Now)
@@ -173,6 +214,45 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		descriptors = append(descriptors, descriptor)
 		networkBytes += descriptor.ArtifactBytes
 	}
+	bootstrapClient, err := snapshottransfer.NewBootstrapControlClient(snapshottransfer.BootstrapControlClientOptions{
+		Opener: rf3CommandControlOpener{profile: profile,
+			addresses: map[rafttransport.NodeID]string{targetNode: target1.Listeners.Control}, deadline: deadline},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapStarted := time.Now()
+	if _, err = bootstrapClient.Execute(t.Context(), targetNode, snapshottransfer.BootstrapRequest{
+		Operation: requests[0].Operation, Step: requests[0].Step, Descriptor: descriptors[0]}); err != nil {
+		t.Fatalf("first learner bootstrap: %v", err)
+	}
+	// Crash after one group owns an installed learner WAL while the other is
+	// still cold. Reopen must exclude the completed group from cold ownership,
+	// finish the remaining group on the same address, then atomically transition
+	// the process to ordinary multi-group serving.
+	if err = coldTarget.command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-coldTarget.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cold target did not exit after SIGKILL")
+	}
+	coldTarget.mu.Lock()
+	coldTarget.command, coldTarget.exited, coldTarget.diagnostic = nil, nil, nil
+	coldTarget.waitErr = nil
+	coldTarget.mu.Unlock()
+	coldTarget.Start(t)
+	coldTarget.WaitColdReady(t)
+	if _, err = bootstrapClient.Execute(t.Context(), targetNode, snapshottransfer.BootstrapRequest{
+		Operation: requests[1].Operation, Step: requests[1].Step, Descriptor: descriptors[1]}); err != nil {
+		t.Fatalf("second learner bootstrap after SIGKILL: %v", err)
+	}
+	if elapsed := time.Since(bootstrapStarted); elapsed > 20*time.Second {
+		t.Fatalf("multi-group learner bootstrap latency=%s", elapsed)
+	}
+	coldTarget.WaitServingReady(t)
 	baseRoot := filepath.Join(root, "first")
 	for _, identity := range []raftstore.Identity{identity1, identity2} {
 		group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
@@ -287,6 +367,38 @@ func combineRF3ProcessGroups(t testing.TB, paths ...string) []byte {
 	}
 	result = append(result, ']', '}')
 	return result
+}
+
+func combineBootstrapRF3ProcessGroups(t testing.TB, paths ...string) []byte {
+	t.Helper()
+	if len(paths) < 2 {
+		t.Fatal("multi-group bootstrap requires at least two groups")
+	}
+	groups := make([]bootstrapRF3ManifestGroup, len(paths))
+	var control string
+	for index, path := range paths {
+		manifest, err := loadBootstrapRF3Manifest(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundles := manifest.groupBundles()
+		if len(bundles) != 1 || index != 0 && manifest.ControlListener != control {
+			t.Fatal("incompatible bootstrap group listeners")
+		}
+		control, groups[index] = manifest.ControlListener, bundles[0]
+	}
+	raw := fmt.Appendf(nil, `{"control_listener":%q,"groups":[`, control)
+	for index, group := range groups {
+		if index != 0 {
+			raw = append(raw, ',')
+		}
+		raw = fmt.Appendf(raw,
+			`{"member_manifest":%q,"source_node":"%x","source_snapshot_address":%q,"repository_path":%q,"cursor_path":%q,"journal_path":%q,"static_bootstrap_path":%q,"max_artifact_bytes":%d}`,
+			group.MemberManifest, group.SourceNode, group.SourceSnapshotAddress,
+			group.RepositoryPath, group.CursorPath, group.JournalPath,
+			group.StaticBootstrapPath, group.MaxArtifactBytes)
+	}
+	return append(raw, ']', '}')
 }
 
 func rf3ProcessTreeBytes(t testing.TB, root string) uint64 {
