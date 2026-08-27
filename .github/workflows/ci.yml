@@ -42,16 +42,18 @@ jobs:
         run: |
           set -euo pipefail
           evidence="${RUNNER_TEMP}/durable-sql-rf3"
+          test_root="${RUNNER_TEMP}/durable-sql-rf3-tmp"
           mkdir -p "${evidence}"
+          mkdir -p "${test_root}"
           git rev-parse HEAD > "${evidence}/revision.txt"
           go version > "${evidence}/go-version.txt"
           go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
           uname -a > "${evidence}/uname.txt"
-          df -T -B1 "${RUNNER_TEMP}" > "${evidence}/filesystem.txt"
-          stat -f -c 'filesystem_type=%T block_size=%S' "${RUNNER_TEMP}" >> "${evidence}/filesystem.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${test_root}" >> "${evidence}/filesystem.txt"
           command -v fallocate > "${evidence}/fallocate-path.txt"
           fallocate --version > "${evidence}/fallocate-version.txt"
-          preflight="${evidence}/strict-allocation-preflight"
+          preflight="${test_root}/strict-allocation-preflight"
           fallocate -l 1048576 "${preflight}"
           sync "${preflight}"
           stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
@@ -61,12 +63,13 @@ jobs:
           test_name='TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions'
           go test -list "^${test_name}$" ./internal/raftservice > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
-          printf 'VIBEDB_DURABLE_SQL_RF3_E2E=1 go test -json -count=3 -timeout=8m -run %s ./internal/raftservice\n' \
-            "^${test_name}$" > "${evidence}/command.txt"
+          printf 'TMPDIR=%s VIBEDB_DURABLE_SQL_RF3_E2E=1 go test -json -count=3 -timeout=8m -run %s ./internal/raftservice\n' \
+            "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
       - name: Durable SQL RF3 terminal and ACK recovery qualification
         if: matrix.runner == 'ubuntu-latest'
         shell: bash
         env:
+          TMPDIR: ${{ runner.temp }}/durable-sql-rf3-tmp
           VIBEDB_DURABLE_SQL_RF3_E2E: "1"
         run: |
           set -euo pipefail
