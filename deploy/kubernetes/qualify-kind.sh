@@ -14,6 +14,8 @@ bootstrap_yaml="${work_dir}/bootstrap.yaml"
 topology_yaml="${work_dir}/topology.yaml"
 bootstrap_metadata="${work_dir}/bootstrap-metadata.txt"
 port_forward_pid=
+cluster_created=false
+export KUBECONFIG="${work_dir}/kubeconfig"
 
 start_port_forward() {
   if [[ -n "${port_forward_pid}" ]]; then
@@ -30,7 +32,9 @@ cleanup() {
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
     wait "${port_forward_pid}" >/dev/null 2>&1 || true
   fi
-  kind delete cluster --name "${cluster_name}" >/dev/null 2>&1 || true
+  if [[ "${cluster_created}" == true ]]; then
+    kind delete cluster --name "${cluster_name}" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -56,14 +60,17 @@ mkdir -m 0700 "${state_dir}"
 "${work_dir}/vibedb-operator" render -namespace "${namespace}" -image "${image}" \
   -bootstrap-state-dir "${state_dir}" > "${topology_yaml}"
 "${work_dir}/vibedb-operator" validate -manifest "${topology_yaml}"
-kubectl apply --dry-run=client --validate=false -f "${bootstrap_yaml}" >/dev/null
-kubectl apply --dry-run=client --validate=false -f "${topology_yaml}" >/dev/null
-
 docker build --file "${root_dir}/deploy/kubernetes/Dockerfile" --tag "${image}" "${root_dir}"
+# From this point cleanup owns this newly created test cluster, including a
+# partially failed create. The earlier existence check never grants ownership.
+cluster_created=true
 kind create cluster --name "${cluster_name}" \
   --config "${root_dir}/deploy/kubernetes/kind-3-worker.yaml" --wait 120s
 kind load docker-image --name "${cluster_name}" "${image}"
 
+# Even client dry-run performs resource discovery against an API server.
+kubectl apply --dry-run=client --validate=false -f "${bootstrap_yaml}" >/dev/null
+kubectl apply --dry-run=client --validate=false -f "${topology_yaml}" >/dev/null
 kubectl create namespace "${namespace}"
 kubectl apply -f "${bootstrap_yaml}"
 kubectl apply -f "${topology_yaml}"
