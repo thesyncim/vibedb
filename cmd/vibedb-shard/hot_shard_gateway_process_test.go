@@ -152,6 +152,7 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	}
 	diagnostic := &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
 	arguments := []string{"serve", "-catalog", bootstrapPath, "-catalog-relation", "1",
+		"-catalog-route-seed", filepath.Join(fixture.root, "gateway-route-seed.vibejson"),
 		"-catalog-attempts", "8", "-catalog-attempt-timeout", "500ms",
 		"-catalog-session-journal", filepath.Join(fixture.root, "gateway-session"),
 		"-durable-ack-key", ackKeyPath,
@@ -292,6 +293,14 @@ func gatewayHotShardLiveSnapshot(
 	states []shardservice.ReplicatedMemberState, links []*gatewayHotShardNetworkLink,
 ) *gateway.Snapshot {
 	t.Helper()
+	var base sqldriver.ReplicatedShardStoreIdentity
+	if err := loadRF3IdentityFile(filepath.Join(fixture.root, "member-1", "sql-identity.json"), &base); err != nil {
+		t.Fatal(err)
+	}
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(base)
+	if err != nil {
+		t.Fatal(err)
+	}
 	command := states[0].Fence.Command
 	for index := 1; index < len(states); index++ {
 		if states[index].Fence.Command != command {
@@ -331,7 +340,8 @@ func gatewayHotShardLiveSnapshot(
 		StoreID: fixture.targetStore, NodeIncarnation: fixture.targetIncarnation,
 		Endpoint: "target", NativeEndpoint: "target-native", ControlEndpoint: "target-control"}
 	descriptor := gateway.ReplicatedShardDescriptor{
-		Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard,
+		LogicalSchemaDigest: replication.Digest(logical),
+		Distribution:        gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard,
 		Group: fixture.group,
 		AllocationGeneration: distribution.ShardAllocationGeneration(
 			rf3CommandStoreIdentity(1).AllocationGeneration),
@@ -342,9 +352,9 @@ func gatewayHotShardLiveSnapshot(
 	}
 	profile := gateway.ReplicatedTableProfile{Table: gateway.ReplicatedCatalogTable,
 		Relation: 1, PrimaryKey: gateway.ReplicatedCatalogPrimaryKey,
-		SchemaGeneration:       command.SchemaGeneration,
-		RelationManifestDigest: replication.Digest(command.RelationManifestDigest),
-		MaxKeyBytes:            256, MaxDocumentBytes: 4 << 20}
+		SchemaGeneration:    command.SchemaGeneration,
+		LogicalSchemaDigest: replication.Digest(logical),
+		MaxKeyBytes:         256, MaxDocumentBytes: 4 << 20}
 	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(distribution.ClusterConfig{
 		Distributions: []distribution.DistributionSpec{{Name: gateway.ReplicatedCatalogDistribution,
 			Arity: 1, MapperVersion: distribution.NativeMapperVersion}},

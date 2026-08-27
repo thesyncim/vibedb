@@ -137,7 +137,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		key.Material[index] = byte(index + 1)
 	}
 
-	// Learn the deterministic logical relation digest before creating the
+	// Learn the exact serving machine digest before creating the
 	// catalog document. The probe is never served and is removed immediately.
 	probe, err := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
 		Root: filepath.Join(root, "relation-probe"), Table: gateway.ReplicatedCatalogTable,
@@ -153,7 +153,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relationDigest := probe.Base.RelationManifestDigest
+	relationDigest, err := probe.Apply.RangeSplitRelationManifestDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = probe.Close(); err != nil {
 		t.Fatal(err)
 	}

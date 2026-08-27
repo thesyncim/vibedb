@@ -141,6 +141,7 @@ func newSQLBatchWireFixture(
 		group.GroupID[14], group.GroupID[15] = byte(groupIndex>>8), byte(groupIndex+1)
 		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
 			Distribution: distributionName, Shard: "all", Group: group, AllocationGeneration: 1,
+			LogicalSchemaDigest:  replication.Digest{0x19},
 			RangeIdentity:        replication.Digest{byte(groupIndex + 1), 0x51},
 			LineageDigest:        replication.Digest{byte(groupIndex + 1), 0x52},
 			ForwardingRuleDigest: replication.Digest{byte(groupIndex + 1), 0x53},
@@ -173,7 +174,7 @@ func newSQLBatchWireFixture(
 		}
 		profiles = append(profiles, gateway.ReplicatedTableProfile{
 			Table: table, Relation: relation, PrimaryKey: "/id", SchemaGeneration: 8,
-			RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+			LogicalSchemaDigest: replication.Digest{0x19}, MaxKeyBytes: 256,
 			MaxDocumentBytes: 1 << 20,
 		})
 		request.Statements = append(request.Statements, serveStatement{

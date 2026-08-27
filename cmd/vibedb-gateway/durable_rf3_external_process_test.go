@@ -471,6 +471,7 @@ func newDurableRF3ExternalFixture(
 			fixture.identities[group], fixture.listeners, fixture.nodes,
 			authority, replication.Digest(prepared[group][0].RelationManifestDigest),
 		)
+		fixture.routes[group].LogicalSchemaDigest = replication.Digest(prepared[group][0].LogicalSchemaDigest)
 	}
 	fixture.routes[durableRF3LedgerGroup].RangeIdentity = replication.Digest(ledgerIdentity)
 	fixture.capability = [durableRF3ExternalGroups]serviceauthz.Capability{

@@ -152,10 +152,11 @@ const (
 )
 
 type multiGroupRF3Group struct {
-	key      raftmember.GroupKey
-	runtimes [multiGroupRF3Voters]*raftmember.Runtime
-	bases    [multiGroupRF3Voters]sqldriver.ReplicatedShardStoreIdentity
-	reads    [multiGroupRF3Voters]*sqldriver.ReplicatedApply
+	logicalSchema replication.Digest
+	key           raftmember.GroupKey
+	runtimes      [multiGroupRF3Voters]*raftmember.Runtime
+	bases         [multiGroupRF3Voters]sqldriver.ReplicatedShardStoreIdentity
+	reads         [multiGroupRF3Voters]*sqldriver.ReplicatedApply
 }
 
 type multiGroupRF3Trace struct {
@@ -287,6 +288,7 @@ type multiGroupTransactionRF3Cluster struct {
 func (cluster *multiGroupTransactionRF3Cluster) route(group int) gateway.ReplicatedRoute {
 	base := cluster.groups[group].bases[0]
 	route := gateway.ReplicatedRoute{
+		LogicalSchemaDigest:  cluster.groups[group].logicalSchema,
 		Distribution:         distribution.DistributionName(base.Binding.Distribution),
 		Shard:                distribution.ShardID(base.Binding.Shard),
 		Group:                cluster.groups[group].key,
@@ -496,6 +498,11 @@ func newMultiGroupRF3Cluster(
 			)
 		}
 		cluster.groups[group].key = cluster.groups[group].runtimes[0].Identity().Group
+		logical, err := sqldriver.ReplicatedRelationManifestDigest(cluster.groups[group].bases[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cluster.groups[group].logicalSchema = replication.Digest(logical)
 	}
 	for group := 0; group < cluster.groupCount; group++ {
 		for prior := 0; prior < group; prior++ {
