@@ -63,7 +63,7 @@ func restoreOperationFixture(t *testing.T, groups int) Operation {
 				Node: node, Store: filled16(byte(120 + index*3 + replica))}
 		}
 	}
-	operation, err := NewOperation(permit, certificate, 0, 1, filled32(75), targets)
+	operation, err := NewOperation(permit, certificate, 0, 1, filled32(75), filled32(76), filled32(77), targets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,14 +102,20 @@ func TestOperationRejectsCorruptionPartialAndReusedIdentity(t *testing.T) {
 	targets := cloneTargets(operation.Targets)
 	targets[1].Replicas[0].Node = targets[0].Replicas[0].Node
 	if _, err := NewOperation(operation.Permit, operation.Certificate, 0, 1,
-		operation.BuildGrammarDigest, targets); err == nil {
+		operation.BuildGrammarDigest, operation.TargetPolicyDigest, operation.TargetCatalogDigest, targets); err == nil {
 		t.Fatal("accepted duplicate node identity")
 	}
 	targets = cloneTargets(operation.Targets)
 	targets[0].Group.ClusterID = operation.Certificate.Groups[0].Group.ClusterID
 	targets[0].Group.ClusterIncarnation = operation.Certificate.Groups[0].Group.ClusterIncarnation
 	if _, err := NewOperation(operation.Permit, operation.Certificate, 0, 1,
-		operation.BuildGrammarDigest, targets); err == nil {
+		operation.BuildGrammarDigest, operation.TargetPolicyDigest, operation.TargetCatalogDigest, targets); err == nil {
 		t.Fatal("accepted source trust domain")
+	}
+	targets = cloneTargets(operation.Targets)
+	targets[0].Group.GroupID = operation.Certificate.Groups[1].Group.GroupID
+	if _, err := NewOperation(operation.Permit, operation.Certificate, 0, 1,
+		operation.BuildGrammarDigest, operation.TargetPolicyDigest, operation.TargetCatalogDigest, targets); err == nil {
+		t.Fatal("accepted reused source group identity")
 	}
 }

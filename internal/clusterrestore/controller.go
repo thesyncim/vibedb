@@ -42,10 +42,12 @@ type CatalogPublisher interface {
 }
 
 type CatalogWitness struct {
-	Operation     [sha256.Size]byte
-	CatalogGroup  [72]byte
-	GroupsDigest  [sha256.Size]byte
-	CatalogDigest [sha256.Size]byte
+	Operation           [sha256.Size]byte
+	CatalogGroup        [72]byte
+	GroupsDigest        [sha256.Size]byte
+	TargetPolicyDigest  [sha256.Size]byte
+	TargetCatalogDigest [sha256.Size]byte
+	CatalogDigest       [sha256.Size]byte
 }
 
 type ServingPermit struct {
@@ -230,12 +232,16 @@ func makeCatalogWitness(operation Operation, roots []RootWitness) CatalogWitness
 	copy(groups[:], hasher.Sum(nil))
 	var catalogGroup [72]byte
 	appendGroupKey(catalogGroup[:], operation.Targets[operation.CatalogOrdinal].Group)
-	witness := CatalogWitness{Operation: operation.Digest, CatalogGroup: catalogGroup, GroupsDigest: groups}
+	witness := CatalogWitness{Operation: operation.Digest, CatalogGroup: catalogGroup,
+		GroupsDigest: groups, TargetPolicyDigest: operation.TargetPolicyDigest,
+		TargetCatalogDigest: operation.TargetCatalogDigest}
 	hasher.Reset()
 	hasher.Write([]byte("vibedb/restore/catalog-witness/format-1\x00"))
 	hasher.Write(witness.Operation[:])
 	hasher.Write(witness.CatalogGroup[:])
 	hasher.Write(witness.GroupsDigest[:])
+	hasher.Write(witness.TargetPolicyDigest[:])
+	hasher.Write(witness.TargetCatalogDigest[:])
 	copy(witness.CatalogDigest[:], hasher.Sum(nil))
 	return witness
 }

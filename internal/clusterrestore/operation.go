@@ -18,7 +18,7 @@ import (
 var ErrOperation = errors.New("clusterrestore: invalid activation operation")
 
 const (
-	operationHeaderBytes  = 64 + clusterbackup.RestoreStagingPermitBytes
+	operationHeaderBytes  = 128 + clusterbackup.RestoreStagingPermitBytes
 	targetGroupBytes      = 72 + 3*(8+16+16)
 	operationTrailerBytes = sha256.Size
 )
@@ -41,22 +41,26 @@ type TargetGroup struct {
 // Operation is the canonical replicated bootstrap command. Certificate order
 // is preserved exactly; Targets[index] is the fresh identity for that cut.
 type Operation struct {
-	Permit             clusterbackup.RestoreStagingPermit
-	Certificate        clusterbackup.Certificate
-	CatalogOrdinal     uint32
-	PolicyGeneration   uint64
-	BuildGrammarDigest [sha256.Size]byte
-	Targets            []TargetGroup
-	Digest             [sha256.Size]byte
+	Permit              clusterbackup.RestoreStagingPermit
+	Certificate         clusterbackup.Certificate
+	CatalogOrdinal      uint32
+	PolicyGeneration    uint64
+	BuildGrammarDigest  [sha256.Size]byte
+	TargetPolicyDigest  [sha256.Size]byte
+	TargetCatalogDigest [sha256.Size]byte
+	Targets             []TargetGroup
+	Digest              [sha256.Size]byte
 }
 
 func NewOperation(permit clusterbackup.RestoreStagingPermit,
 	certificate clusterbackup.Certificate, catalogOrdinal uint32, policyGeneration uint64,
-	buildGrammarDigest [sha256.Size]byte, targets []TargetGroup,
+	buildGrammarDigest, targetPolicyDigest, targetCatalogDigest [sha256.Size]byte,
+	targets []TargetGroup,
 ) (Operation, error) {
 	operation := Operation{Permit: permit, Certificate: certificate,
 		CatalogOrdinal: catalogOrdinal, PolicyGeneration: policyGeneration,
-		BuildGrammarDigest: buildGrammarDigest, Targets: cloneTargets(targets)}
+		BuildGrammarDigest: buildGrammarDigest, TargetPolicyDigest: targetPolicyDigest,
+		TargetCatalogDigest: targetCatalogDigest, Targets: cloneTargets(targets)}
 	raw, err := AppendOperation(nil, operation)
 	if err != nil {
 		return Operation{}, err
@@ -84,7 +88,9 @@ func AppendOperation(dst []byte, operation Operation) ([]byte, error) {
 	binary.BigEndian.PutUint32(raw[20:24], uint32(len(certificateRaw)))
 	binary.BigEndian.PutUint64(raw[24:32], operation.PolicyGeneration)
 	copy(raw[32:64], operation.BuildGrammarDigest[:])
-	_, _ = clusterbackup.AppendRestoreStagingPermit(raw[:64], operation.Permit)
+	copy(raw[64:96], operation.TargetPolicyDigest[:])
+	copy(raw[96:128], operation.TargetCatalogDigest[:])
+	_, _ = clusterbackup.AppendRestoreStagingPermit(raw[:128], operation.Permit)
 	copy(raw[operationHeaderBytes:], certificateRaw)
 	offset := operationHeaderBytes + len(certificateRaw)
 	for _, target := range operation.Targets {
@@ -120,7 +126,7 @@ func OpenOperation(raw []byte) (Operation, error) {
 	if digest != [sha256.Size]byte(raw[len(raw)-operationTrailerBytes:]) {
 		return Operation{}, ErrOperation
 	}
-	permit, err := clusterbackup.OpenRestoreStagingPermit(raw[64:operationHeaderBytes])
+	permit, err := clusterbackup.OpenRestoreStagingPermit(raw[128:operationHeaderBytes])
 	certificate, certificateErr := clusterbackup.OpenCertificate(
 		raw[operationHeaderBytes : operationHeaderBytes+certificateBytes])
 	if err != nil || certificateErr != nil {
@@ -142,6 +148,8 @@ func OpenOperation(raw []byte) (Operation, error) {
 		CatalogOrdinal:   binary.BigEndian.Uint32(raw[16:20]),
 		PolicyGeneration: binary.BigEndian.Uint64(raw[24:32]), Targets: targets, Digest: digest}
 	copy(operation.BuildGrammarDigest[:], raw[32:64])
+	copy(operation.TargetPolicyDigest[:], raw[64:96])
+	copy(operation.TargetCatalogDigest[:], raw[96:128])
 	canonical, canonicalErr := AppendOperation(nil, operation)
 	if canonicalErr != nil || !bytes.Equal(canonical, raw) {
 		return Operation{}, errors.Join(ErrOperation, canonicalErr)
@@ -157,7 +165,9 @@ func validOperation(operation Operation, certificateRaw []byte) bool {
 		operation.Permit.CatalogGeneration != operation.Certificate.CatalogGeneration ||
 		operation.Permit.CatalogDigest != operation.Certificate.CatalogDigest ||
 		operation.Permit.Restore == ([sha256.Size]byte{}) || operation.PolicyGeneration == 0 ||
-		operation.BuildGrammarDigest == ([sha256.Size]byte{}) || len(certificateRaw) == 0 {
+		operation.BuildGrammarDigest == ([sha256.Size]byte{}) ||
+		operation.TargetPolicyDigest == ([sha256.Size]byte{}) ||
+		operation.TargetCatalogDigest == ([sha256.Size]byte{}) || len(certificateRaw) == 0 {
 		return false
 	}
 	seenNodes := make(map[rafttransport.NodeID]struct{}, count*3)
@@ -175,6 +185,12 @@ func validOperation(operation Operation, certificateRaw []byte) bool {
 			return false
 		}
 		seenGroups[target.Group] = struct{}{}
+		for _, sourceCut := range operation.Certificate.Groups {
+			if target.Group.ShardIncarnation == sourceCut.Group.ShardIncarnation ||
+				target.Group.GroupID == sourceCut.Group.GroupID {
+				return false
+			}
+		}
 		for ordinal, replica := range target.Replicas {
 			if replica.Member != uint64(ordinal+1) || replica.Node == (rafttransport.NodeID{}) ||
 				replica.Store == ([16]byte{}) {
