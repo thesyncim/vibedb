@@ -34,7 +34,7 @@ func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Dat
 	var seeded []replication.RelationMutationBatch
 	if identity.RelationCount > 1 {
 		epoch := applyReplicatedApplySessionOpen(t, claim, identity, 2)
-		document := []byte(`{"id":"schema-doc","email":"a"}`)
+		document := schemaCatalogBundleSeedDocument(t)
 		seeded = []replication.RelationMutationBatch{
 			{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut,
 				Key: testReplicatedApplyKey(t, database, document), Value: document}}},
@@ -443,7 +443,7 @@ func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Dat
 		for _, batch := range seeded {
 			mutation := batch.Mutations[0]
 			row, readErr := activatedClaim.PointReadInto(batch.Relation, mutation.Key, activatedClaim.Applied(), identity.UserLimits.MaxDocumentBytes, nil)
-			if readErr != nil || !bytes.Equal(row.Value, mutation.Value) {
+			if readErr != nil || !row.Found || !bytes.Equal(row.Value, mutation.Value) {
 				t.Fatalf("relation %d lost row after rollover: %+v err=%v", batch.Relation, row, readErr)
 			}
 		}
