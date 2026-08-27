@@ -101,3 +101,27 @@ func (p *Plan) sourceBindingAuthorityMatches(binding replicatedstate.Binding) bo
 		binding.TopologyRecoveryEpoch == authority.Group.TopologyRecoveryEpoch && binding.ShardIncarnation == authority.Group.ShardIncarnation && binding.GroupID == authority.Group.GroupID &&
 		binding.ActivePolicyGeneration == authority.Command.ActivePolicyGeneration && binding.ProtectionEpoch == authority.Command.ProtectionEpoch && binding.SchemaGeneration == authority.Command.SchemaGeneration
 }
+
+func (p *Plan) validRelationCollection(index int, relation sqldriver.ReplicatedShardRelationIdentity) bool {
+	if p == nil || p.partitioner == nil || index < 0 || relation.Relation == 0 ||
+		int(relation.Relation) != index+1 {
+		return false
+	}
+	if index == 0 {
+		return relation.Kind == sqldriver.ReplicatedShardRelationJSON && relation.Table == p.partitioner.CollectionName()
+	}
+	if relation.Kind != sqldriver.ReplicatedShardRelationGlobalIndex {
+		return false
+	}
+	if p.sourceAuthority == nil {
+		// Preserve the preexisting non-replicated restriction: no unrelated
+		// collection gains authority without an authenticated source schema.
+		return relation.Table == p.partitioner.CollectionName()
+	}
+	// NewPlan has already verified the source machine/logical digests and each
+	// child's matching logical schema. Global slots own their own collections;
+	// bind to that exact source slot, not the base table's collection name.
+	relations := p.sourceAuthority.Schema.SQL.Relations
+	return index < len(relations) && relations[index].Relation == relation.Relation &&
+		relations[index].Kind == relation.Kind && relations[index].Table == relation.Table
+}

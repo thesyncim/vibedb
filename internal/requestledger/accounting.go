@@ -48,14 +48,9 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	payloadChunkFuture, err := checkedMul(head.MaxActivePayloadChunks,
-		uint64(PayloadStorageKeyBytes+payloadChunkHeaderBytes+checksumBytes))
+	payloadFuture, err := payloadReservation(head)
 	if err != nil {
 		return 0, 0, err
-	}
-	var payloadBuildFuture uint64
-	if head.MaxActivePayloadBytes != 0 {
-		payloadBuildFuture = FixedStorageKeyBytes + payloadBuildBytes
 	}
 	var issuerSequenceFuture uint64
 	if head.Key.IssuerEpoch != 0 {
@@ -77,12 +72,35 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 		SchemaPinReleaseReservationBytes,
 		ReadyReservationBytes,
 		FixedStorageKeyBytes, head.MaxTerminalBytes,
-		payloadBuildFuture,
-		head.MaxActivePayloadBytes, payloadChunkFuture,
+		payloadFuture,
 		FixedStorageKeyBytes, AckRecordBytes,
 		issuerSequenceFuture,
 	)
 	return residentNow, future, err
+}
+
+// PayloadReservation returns the immutable admitted budget for one dynamic
+// payload build and its chunks. Materialized rows consume this budget; staging
+// and cleanup do not change it. Validate the actual head, including any cleanup
+// witness, rather than constructing an invalid head with its limits removed.
+func PayloadReservation(head HeadRecord) (uint64, error) {
+	if err := validateHead(head); err != nil {
+		return 0, err
+	}
+	return payloadReservation(head)
+}
+
+func payloadReservation(head HeadRecord) (uint64, error) {
+	chunks, err := checkedMul(head.MaxActivePayloadChunks,
+		uint64(PayloadStorageKeyBytes+payloadChunkHeaderBytes+checksumBytes))
+	if err != nil {
+		return 0, err
+	}
+	var build uint64
+	if head.MaxActivePayloadBytes != 0 {
+		build = FixedStorageKeyBytes + payloadBuildBytes
+	}
+	return checkedSum(build, head.MaxActivePayloadBytes, chunks)
 }
 
 func checkedMul(left, right uint64) (uint64, error) {

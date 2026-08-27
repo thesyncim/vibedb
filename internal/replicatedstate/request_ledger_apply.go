@@ -1430,23 +1430,14 @@ func requestLedgerReservedBytes(head requestledger.HeadRecord, rows requestLedge
 	}
 	reserved += ready
 	if head.MaxActivePayloadBytes != 0 {
-		_, initial, err := requestledger.Reservation(head)
+		payloadMaximum, err := requestledger.PayloadReservation(head)
 		if err != nil {
 			return 0, false
 		}
-		withoutPayload := reserved
-		baseHead := head
-		baseHead.MaxActivePayloadBytes = 0
-		baseHead.MaxActivePayloadChunks = 0
-		_, base, err := requestledger.Reservation(baseHead)
-		if err != nil || initial < base {
+		if rows.payloadResident > payloadMaximum || reserved > math.MaxUint64-(payloadMaximum-rows.payloadResident) {
 			return 0, false
 		}
-		payloadMaximum := initial - base
-		if rows.payloadResident > payloadMaximum || withoutPayload > math.MaxUint64-(payloadMaximum-rows.payloadResident) {
-			return 0, false
-		}
-		reserved = withoutPayload + payloadMaximum - rows.payloadResident
+		reserved += payloadMaximum - rows.payloadResident
 	}
 	return reserved, true
 }

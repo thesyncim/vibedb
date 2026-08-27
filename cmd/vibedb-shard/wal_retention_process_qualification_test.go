@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
@@ -233,6 +234,12 @@ func walRetentionDocument(id string, cycle, size int) []byte {
 func walRetentionWaitValue(t testing.TB, fixture *rf3FaultFixture, member int,
 	state shardservice.ReplicatedMemberState, id string, want []byte, timeout time.Duration) {
 	t.Helper()
+	// Writes deliberately submit noncanonical key order. Reads after restart
+	// must match the durable canonical bytes, not that input ordering.
+	want, canonicalErr := vibejson.AppendCanonicalize(nil, want)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		request := fixture.readRequest(member, state, rf3FaultKey(t, id))

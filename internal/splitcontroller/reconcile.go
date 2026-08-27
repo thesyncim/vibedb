@@ -423,7 +423,7 @@ func newPlan(
 		}
 		for index := range relationTemplate {
 			relation := relationTemplate[index]
-			if relation.Relation != uint16(index+1) || relation.Table != partitioner.CollectionName() {
+			if relation.Relation != uint16(index+1) || !plan.validRelationCollection(index, relation) {
 				return nil, ErrInvalidPlan
 			}
 			if index == 0 && relation.Kind != sqldriver.ReplicatedShardRelationJSON ||

@@ -58,6 +58,11 @@ func rf3ExpectedMembership(before replicacontrol.Observation, request shardservi
 	default:
 		return nil, 0, errRF3MembershipSettlement
 	}
+	// Applied ConfChange results come from Raft's tracker, which explicitly
+	// materializes AutoLeave=false for a non-joint configuration. A bootstrap
+	// may omit this optional protobuf field; preserve exact proof comparison
+	// by predicting the applied spelling, not by ignoring field presence.
+	expected.AutoLeave = new(false)
 	if version == ^uint64(0) {
 		return nil, 0, errRF3MembershipSettlement
 	}

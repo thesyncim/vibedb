@@ -21,12 +21,102 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 )
+
+// The operator contacts both source and learner; it cannot borrow either
+// serving identity because authenticated control streams reject self-peers.
+func rf3EnrolledGroupOperatorCredentials(t testing.TB, root string,
+	nodes [rf3CommandMembers]rafttransport.NodeID, target rafttransport.NodeID,
+) ([]rf3testfixture.Credential, string, string, *rafttransport.PeerTLS) {
+	t.Helper()
+	// Keep this actor after the fixture's 0xd1 learner in canonical policy order.
+	operator := rafttransport.NodeID{0xe1, 1}
+	credentials, roots, err := rf3testfixture.WriteCredentials(root, rf3CommandIdentityOID,
+		rafttransport.TrustDomain{ClusterID: rf3CommandGroup().ClusterID, ClusterIncarnation: rf3CommandGroup().ClusterIncarnation},
+		append(append([]rafttransport.NodeID(nil), nodes[:]...), target, operator))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(root, "policy.vibejson")
+	if err := os.WriteFile(policyPath, rf3CommandPolicyWithTarget(nodes, target, operator), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credential := credentials[rf3CommandMembers+1]
+	profile, err := servicetls.LoadProfile(credential.Certificate, credential.Key, roots,
+		rf3testfixture.ProcessIdentityOID, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.LocalIdentity().Node != operator {
+		t.Fatal("enrollment operator credential names a different actor")
+	}
+	return credentials, roots, policyPath, profile
+}
+
+func TestRF3EnrolledGroupOperatorAuthentication(t *testing.T) {
+	nodes, target := rf3CommandNodes(), rafttransport.NodeID{0xd1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	credentials, roots, policyPath, operator := rf3EnrolledGroupOperatorCredentials(t, t.TempDir(), nodes, target)
+	policy, err := serviceauthz.LoadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Generation() != rf3CommandAuthority().ActivePolicyGeneration ||
+		policy.Check(operator.LocalIdentity().Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow ||
+		policy.Check(rafttransport.NodeID{0xff}, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow {
+		t.Fatal("enrollment policy does not bind the explicit operator")
+	}
+	for _, peer := range []struct {
+		name       string
+		node       rafttransport.NodeID
+		credential int
+	}{{"source", nodes[0], 0}, {"learner", target, rf3CommandMembers}} {
+		t.Run(peer.name, func(t *testing.T) {
+			credential := credentials[peer.credential]
+			profile, err := servicetls.LoadProfile(credential.Certificate, credential.Key, roots,
+				rf3testfixture.ProcessIdentityOID, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if profile.LocalIdentity().Node != peer.node || operator.LocalIdentity().Node == peer.node {
+				t.Fatal("operator aliases a serving identity")
+			}
+			for _, self := range []bool{false, true} {
+				caller := operator
+				if self {
+					caller = profile
+				}
+				left, right := net.Pipe()
+				deadline := func() time.Time { return time.Now().Add(3 * time.Second) }
+				result := make(chan error, 1)
+				go func() {
+					connection, err := profile.Server(t.Context(), right, rafttransport.TrafficShardControl, deadline)
+					if err == nil && (connection.PeerIdentity().Node != caller.LocalIdentity().Node ||
+						policy.Check(connection.PeerIdentity().Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow) {
+						err = errors.New("control peer lacks the exact operator identity or capability")
+					}
+					result <- err
+				}()
+				connection, clientErr := caller.Client(t.Context(), left, peer.node, rafttransport.TrafficShardControl, deadline)
+				serverErr := <-result
+				_ = left.Close()
+				_ = right.Close()
+				if self {
+					if !errors.Is(clientErr, rafttransport.ErrPeerAuthentication) && !errors.Is(serverErr, rafttransport.ErrPeerAuthentication) {
+						t.Fatalf("self-peer accepted: client=%v server=%v", clientErr, serverErr)
+					}
+				} else if clientErr != nil || serverErr != nil || connection.PeerIdentity().Node != peer.node {
+					t.Fatalf("operator control authentication: client=%v server=%v", clientErr, serverErr)
+				}
+			}
+		})
+	}
+}
 
 func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	if os.Getenv(rf3CommandHelperEnvironment) != "" {
@@ -41,16 +131,7 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	}
 	nodes := rf3CommandNodes()
 	targetNode := rafttransport.NodeID{0xd1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	credentials, roots, err := rf3testfixture.WriteCredentials(root, rf3CommandIdentityOID,
-		rafttransport.TrustDomain{ClusterID: rf3CommandGroup().ClusterID, ClusterIncarnation: rf3CommandGroup().ClusterIncarnation},
-		append(append([]rafttransport.NodeID(nil), nodes[:]...), targetNode))
-	if err != nil {
-		t.Fatal(err)
-	}
-	policyPath := filepath.Join(root, "policy.vibejson")
-	if err = os.WriteFile(policyPath, rf3CommandPolicyWithTarget(nodes, targetNode), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	credentials, roots, policyPath, profile := rf3EnrolledGroupOperatorCredentials(t, root, nodes, targetNode)
 	peerAddresses := [3]string{addresses.Peer, rf3CommandUnusedAddress(t), rf3CommandUnusedAddress(t)}
 	walOptions := raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
 		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
@@ -93,7 +174,7 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	first := prepare("first", identity1, target1)
 	second := prepare("second", identity2, target2)
 	manifestPath := filepath.Join(root, "multi-group-serve.vibejson")
-	if err = os.WriteFile(manifestPath, combineRF3ProcessGroups(t, first.ManifestPath, second.ManifestPath), 0o600); err != nil {
+	if err := os.WriteFile(manifestPath, combineRF3ProcessGroups(t, first.ManifestPath, second.ManifestPath), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	targetKey := raftstore.Key{ID: "rf3-command-key", Wrapped: []byte("test-wrapped")}
@@ -158,7 +239,7 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err = os.WriteFile(multiBootstrapPath, combineBootstrapRF3ProcessGroups(t,
+	if err := os.WriteFile(multiBootstrapPath, combineBootstrapRF3ProcessGroups(t,
 		cold1.BootstrapManifestPath, cold2.BootstrapManifestPath), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -202,11 +283,6 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	coldTarget.Start(t)
 	coldTarget.WaitColdReady(t)
 
-	profile, err := servicetls.LoadProfile(credentials[3].Certificate, credentials[3].Key, roots,
-		rf3testfixture.ProcessIdentityOID, time.Now)
-	if err != nil {
-		t.Fatal(err)
-	}
 	deadline := func() time.Time { return time.Now().Add(10 * time.Second) }
 	client, err := snapshottransfer.NewSourceControlClient(snapshottransfer.SourceControlClientOptions{
 		Opener:       rf3CommandControlOpener{profile: profile, addresses: map[rafttransport.NodeID]string{nodes[0]: addresses.Control}, deadline: deadline},
