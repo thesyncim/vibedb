@@ -22,3 +22,7 @@ Record:
 
 Then add a table that links each summary row to its raw artifact. Keep latency,
 throughput, storage, allocation, and residency units explicit.
+
+A full embedded/RF3 publication must also link the immutable `VALIDATED.tsv`
+receipt produced by `cmd/publishcheck`. Do not hand-create that receipt or copy
+selected rows into this file when the complete bundle does not validate.

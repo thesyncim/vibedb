@@ -198,4 +198,34 @@ Put publication-grade results in [RESULTS.md](RESULTS.md). Keep raw rows and
 complete metadata with the summary. Do not publish a number from a dirty tree
 without marking it dirty.
 
+For a complete embedded plus RF3 evidence bundle, use the repository runner on
+a dedicated Linux benchmark host:
+
+```bash
+scripts/bench/run-publishable-evidence.sh \
+  /absolute/path/to/new-evidence-directory OUT_OF_RAM_DOCUMENTS
+```
+
+Choose `OUT_OF_RAM_DOCUMENTS` so the exact overflow-heavy logical corpus is
+larger than physical RAM; the loader verifies that inequality and fails before
+publishing when it is false. The runner requires a clean tree and creates no
+result row itself. It records ten isolated embedded repetitions at the strongest
+common durability contract (`ordinary-sync`), plus a separate matched
+`power-safe` VibeDB/SQLite lane. It also records per-engine
+space/churn/above-RAM cuts, nine isolated RF3 latency/counter matrices, and nine
+external RF3 fault runs. The RF3 matrices cover read, write, and mixed workloads
+at 1, 8, and 32 clients. The fault artifact supplies the independently bounded
+WAL and waiter-RSS evidence that the in-process latency matrix does not claim to
+measure. bbolt, Badger, and Pebble are excluded from the power-safe row because
+their adapters reject that guarantee instead of silently weakening it.
+
+The runner finishes by invoking `cmd/publishcheck`. That validator rejects a
+dirty or revision-mismatched bundle, fewer than nine repetitions, diagnostic
+embedded rows, missing p50/p99/p99.9/maximum latency, absent apparent or
+allocated space, unknown Linux process writes, invalid RF3 counter cuts,
+missing network/device/logical-byte counters, and failed WAL/RSS fault bounds.
+Only then does it create `VALIDATED.tsv`, containing SHA-256 digests of every
+accepted raw artifact. A validation receipt proves evidence completeness; it is
+not a claim that VibeDB won a comparison.
+
 The current replacement documentation publishes no benchmark result.
