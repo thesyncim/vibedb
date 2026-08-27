@@ -76,10 +76,13 @@ func TestReplicatedChildApplyReservationPersistsExactIdentity(t *testing.T) {
 	}
 	options := testReplicatedApplyOptions()
 	options.Placement.Range = distribution.KeyRange{Start: distribution.KeyspacePoint{0x80}, End: distribution.KeyspaceEnd{Max: true}}
-	reserved := newReplicatedApplyMeta(
+	reserved, err := NewReplicatedChildApplyIdentity(
 		base, strings.Repeat("a", storageIdentityBytes*2),
 		strings.Repeat("b", storageIdentityBytes*2), options,
-	).identity()
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = database.ReserveReplicatedChildApply(base, reserved); err != nil {
 		t.Fatal(err)
 	}
