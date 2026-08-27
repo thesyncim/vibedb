@@ -142,6 +142,9 @@ func (provider *LocalPlanObservationProvider) RegisterGroups(groups []LocalObser
 			if !sameLocalObservationGroup(merged[index], group) {
 				return ErrPlanObservation
 			}
+			if merged[index].Children == nil && group.Children != nil {
+				merged[index].Children = group.Children
+			}
 			continue
 		}
 		if len(merged) == provider.limit {
@@ -152,6 +155,32 @@ func (provider *LocalPlanObservationProvider) RegisterGroups(groups []LocalObser
 		merged[index] = group
 	}
 	provider.groups = merged
+	return nil
+}
+
+// RefreshRetainedGroup advances only the command fence of the same exclusive
+// runtime/registry after a caller has checked the serialized owner state.
+func (provider *LocalPlanObservationProvider) RefreshRetainedGroup(group LocalObservationGroup) error {
+	if provider == nil || !validLocalObservationGroup(group) {
+		return ErrPlanObservation
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	index, found := slices.BinarySearchFunc(provider.groups, group.Identity.Group, func(item LocalObservationGroup, key raftmember.GroupKey) int {
+		return compareObservationGroup(item.Identity.Group, key)
+	})
+	if !found {
+		return ErrPlanObservation
+	}
+	prior := provider.groups[index]
+	a, b := prior.Command, group.Command
+	if prior.Identity != group.Identity || prior.Registry != group.Registry || a.RelationManifestDigest != b.RelationManifestDigest ||
+		b.ReplicaSetVersion < a.ReplicaSetVersion || b.ActivePolicyGeneration < a.ActivePolicyGeneration || b.ProtectionEpoch < a.ProtectionEpoch ||
+		b.OwnershipEpoch < a.OwnershipEpoch || b.SchemaGeneration < a.SchemaGeneration || b.RoutingVersion < a.RoutingVersion || b.RouteGeneration < a.RouteGeneration {
+		return ErrPlanObservation
+	}
+	prior.Command = group.Command
+	provider.groups[index] = prior
 	return nil
 }
 

@@ -3,6 +3,8 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -22,12 +24,12 @@ type AdmittedChildExecutorFactory func(
 ) (ShardActionExecutor, error)
 
 type AdmittedSourceRuntime struct {
-	Distribution   distribution.DistributionName
-	Shard          distribution.ShardID
-	Allocation     distribution.ShardAllocationGeneration
-	ManifestDigest [32]byte
-	Target         ShardActionTarget
-	NewExecutor    AdmittedShardExecutorFactory
+	Distribution distribution.DistributionName
+	Shard        distribution.ShardID
+	Allocation   distribution.ShardAllocationGeneration
+	Registry     *RuntimeStoreRegistry
+	Target       ShardActionTarget
+	NewExecutor  AdmittedShardExecutorFactory
 }
 
 type LocalAdmittedGrantFactoryOptions struct {
@@ -38,10 +40,11 @@ type LocalAdmittedGrantFactoryOptions struct {
 
 // LocalAdmittedGrantFactory is the bounded bridge from a durably authenticated
 // admission to executable shard-local capabilities. Source stores are selected
-// by exact retained-manifest digest. Child stores are selected by the exact
+// by exact process-owned registry identity. Child stores are selected by the exact
 // per-replica certificate digest carried in PlanIntent. No path, identity, or
 // network route is derived locally.
 type LocalAdmittedGrantFactory struct {
+	mu      sync.RWMutex
 	options LocalAdmittedGrantFactoryOptions
 }
 
@@ -54,11 +57,11 @@ func NewLocalAdmittedGrantFactory(
 	}
 	for index, source := range options.Sources {
 		if source.Distribution == "" || source.Shard == "" || source.Allocation == 0 ||
-			source.ManifestDigest == ([32]byte{}) || !source.Target.valid() || source.NewExecutor == nil {
+			source.Registry == nil || !source.Target.valid() || source.NewExecutor == nil {
 			return nil, ErrRemoteExecution
 		}
 		for prior := 0; prior < index; prior++ {
-			if options.Sources[prior].ManifestDigest == source.ManifestDigest ||
+			if options.Sources[prior].Registry == source.Registry ||
 				options.Sources[prior].Distribution == source.Distribution &&
 					options.Sources[prior].Shard == source.Shard &&
 					options.Sources[prior].Allocation == source.Allocation {
@@ -66,7 +69,56 @@ func NewLocalAdmittedGrantFactory(
 			}
 		}
 	}
+	options.Sources = slices.Clone(options.Sources)
 	return &LocalAdmittedGrantFactory{options: options}, nil
+}
+
+// RegisterSource installs an already-certified live group's exact registry.
+// Relation/schema digests are deliberately not treated as shard identities.
+func (factory *LocalAdmittedGrantFactory) RegisterSource(source AdmittedSourceRuntime) error {
+	if factory == nil || source.Registry == nil || source.Distribution == "" || source.Shard == "" || source.Allocation == 0 || !source.Target.valid() || source.NewExecutor == nil {
+		return ErrRemoteExecution
+	}
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	for _, prior := range factory.options.Sources {
+		if prior.Registry == source.Registry || prior.Distribution == source.Distribution && prior.Shard == source.Shard && prior.Allocation == source.Allocation {
+			if prior.Registry == source.Registry && prior.Distribution == source.Distribution && prior.Shard == source.Shard && prior.Allocation == source.Allocation && prior.Target == source.Target {
+				return nil
+			}
+			return ErrRemoteExecution
+		}
+	}
+	if len(factory.options.Sources) == AbsoluteMaxLocalPlanAdmissionStores {
+		return ErrRuntimeRegistryCapacity
+	}
+	factory.options.Sources = append(factory.options.Sources, source)
+	return nil
+}
+
+// RefreshSource is used only after the serialized owner has proved the exact
+// new command fence. Immutable group/member/registry identity cannot change.
+func (factory *LocalAdmittedGrantFactory) RefreshSource(source AdmittedSourceRuntime) error {
+	if factory == nil || source.Registry == nil || source.NewExecutor == nil || !source.Target.valid() {
+		return ErrRemoteExecution
+	}
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	for index, prior := range factory.options.Sources {
+		if prior.Distribution != source.Distribution || prior.Shard != source.Shard || prior.Allocation != source.Allocation {
+			continue
+		}
+		a, b := prior.Target, source.Target
+		if prior.Registry != source.Registry || a.Group != b.Group || a.Member != b.Member || a.Allocation != b.Allocation || a.RelationManifestDigest != b.RelationManifestDigest ||
+			b.Authority.ActivePolicyGeneration < a.Authority.ActivePolicyGeneration || b.Authority.ProtectionEpoch < a.Authority.ProtectionEpoch ||
+			b.Authority.OwnershipEpoch < a.Authority.OwnershipEpoch || b.Authority.SchemaGeneration < a.Authority.SchemaGeneration ||
+			b.Authority.RoutingVersion < a.Authority.RoutingVersion || b.Authority.RouteGeneration < a.Authority.RouteGeneration {
+			return ErrRemoteExecution
+		}
+		factory.options.Sources[index] = source
+		return nil
+	}
+	return ErrRemoteExecution
 }
 
 func (factory *LocalAdmittedGrantFactory) BuildAdmittedShardActionGrants(
@@ -81,7 +133,16 @@ func (factory *LocalAdmittedGrantFactory) BuildAdmittedShardActionGrants(
 	used := make([]bool, len(leases))
 	result := make([]ShardActionGrant, 0, len(leases))
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	factory.mu.RLock()
+	var selected AdmittedSourceRuntime
 	for _, source := range factory.options.Sources {
+		if source.Distribution == plan.source.Distribution && source.Shard == plan.source.Shard && source.Allocation == plan.source.AllocationGeneration {
+			selected = source
+			break
+		}
+	}
+	factory.mu.RUnlock()
+	for _, source := range []AdmittedSourceRuntime{selected} {
 		if source.Distribution != plan.source.Distribution || source.Shard != plan.source.Shard ||
 			source.Allocation != plan.source.AllocationGeneration {
 			continue
@@ -91,7 +152,7 @@ func (factory *LocalAdmittedGrantFactory) BuildAdmittedShardActionGrants(
 			!routeMemberOwnedByNode(route, source.Target.Member, factory.options.Node) {
 			return nil, ErrRemoteExecution
 		}
-		lease, index, err := exactAdmissionLease(leases, used, source.ManifestDigest)
+		lease, index, err := exactAdmissionRegistryLease(leases, used, source.Registry)
 		if err != nil {
 			return nil, err
 		}
@@ -143,6 +204,25 @@ func (factory *LocalAdmittedGrantFactory) BuildAdmittedShardActionGrants(
 		}
 	}
 	return result, nil
+}
+
+func exactAdmissionRegistryLease(leases []*RuntimeStoreLease, used []bool, registry *RuntimeStoreRegistry) (*RuntimeStoreLease, int, error) {
+	if registry == nil || len(leases) != len(used) {
+		return nil, -1, ErrRemoteExecution
+	}
+	found := -1
+	for index, lease := range leases {
+		if !used[index] && lease != nil && lease.registry == registry && lease.store != nil && lease.store.manifest == registry.manifest {
+			if found >= 0 {
+				return nil, -1, ErrRemoteExecution
+			}
+			found = index
+		}
+	}
+	if found < 0 {
+		return nil, -1, ErrRemoteExecution
+	}
+	return leases[found], found, nil
 }
 
 func exactAdmissionLease(

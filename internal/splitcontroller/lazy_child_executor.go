@@ -21,13 +21,14 @@ type LazyReplicatedChildExecutorOptions struct {
 	Replica    ChildReplicaTarget
 	Lease      *RuntimeStoreLease
 
-	Registrar       ExecutionGroupRegistrar
-	StaticBootstrap *pb.Snapshot
-	ArtifactOptions replicatedstate.SnapshotArtifactOptions
-	WALKey          raftstore.Key
-	WALOptions      raftstore.Options
-	CheckpointBytes uint64
-	Data            *DynamicSplitData
+	Registrar          ExecutionGroupRegistrar
+	AdoptionCheckpoint ChildAdoptionCheckpoint
+	StaticBootstrap    *pb.Snapshot
+	ArtifactOptions    replicatedstate.SnapshotArtifactOptions
+	WALKey             raftstore.Key
+	WALOptions         raftstore.Options
+	CheckpointBytes    uint64
+	Data               *DynamicSplitData
 
 	Opener        rafttransport.SnapshotStreamOpener
 	ReadDeadline  rafttransport.DeadlineFunc
@@ -112,6 +113,11 @@ func (executor *LazyReplicatedChildExecutor) ExecuteAuthorizedSplitAction(
 		if observed.Certificate == nil {
 			return ErrTopologyConflict
 		}
+		if executor.options.AdoptionCheckpoint != nil {
+			if err := executor.persistAdoptionCertificate(*observed.Certificate); err != nil {
+				return err
+			}
+		}
 		return executor.lifecycle.ExecuteActivateChild(plan, *observed.Certificate)
 	case ActionCreateChildWAL:
 		if observed.Certificate == nil {
@@ -123,6 +129,27 @@ func (executor *LazyReplicatedChildExecutor) ExecuteAuthorizedSplitAction(
 	default:
 		return ErrRemoteExecution
 	}
+}
+
+func (executor *LazyReplicatedChildExecutor) persistAdoptionCertificate(certificate rangesplit.CutoverCertificate) error {
+	if err := executor.options.Plan.partitioner.VerifyCutoverCertificate(certificate); err != nil {
+		return err
+	}
+	store, err := executor.options.Lease.PinnedStore()
+	if err != nil {
+		return err
+	}
+	prior, _, found, err := store.LoadCutoverCertificate(executor.options.Plan.partitioner)
+	if err != nil {
+		return err
+	}
+	if found {
+		if prior.Digest() != certificate.Digest() {
+			return ErrTopologyConflict
+		}
+		return nil
+	}
+	return store.PersistCutoverCertificate(1, certificate)
 }
 
 func (executor *LazyReplicatedChildExecutor) ObserveLocalSplitChild(
@@ -242,6 +269,13 @@ func (executor *LazyReplicatedChildExecutor) open(
 	)
 	if err != nil {
 		return errors.Join(err, stage.Close(), database.Close())
+	}
+	if executor.options.AdoptionCheckpoint != nil {
+		adopter.checkpoint = &childAdoptionCheckpointBinding{
+			plan: executor.options.Plan, digest: executor.options.PlanDigest, child: executor.options.Child,
+			replica: executor.options.Replica, lease: executor.options.Lease,
+			checkpoint: executor.options.AdoptionCheckpoint,
+		}
 	}
 	lifecycle, err := NewLocalChildLifecycle(LocalChildLifecycleOptions{
 		Child: executor.options.Child, Replica: &executor.options.Replica,

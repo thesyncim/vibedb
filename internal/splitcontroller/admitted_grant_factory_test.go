@@ -78,3 +78,34 @@ func TestExactAdmissionLeaseRejectsCertificateSubstitution(t *testing.T) {
 		t.Fatal("unknown certificate digest selected a lease")
 	}
 }
+
+func TestExactSourceAdmissionBindsRegistryNotSharedSchemaDigest(t *testing.T) {
+	digest := [32]byte{3}
+	first, err := OpenRuntimeStoreRegistry(t.TempDir(), digest, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenRuntimeStoreRegistry(t.TempDir(), digest, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	defer second.Close()
+	one, err := first.Acquire(OperationID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Release()
+	two, err := second.Acquire(OperationID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer two.Release()
+	lease, index, err := exactAdmissionRegistryLease([]*RuntimeStoreLease{one, two}, []bool{false, false}, second)
+	if err != nil || lease != two || index != 1 {
+		t.Fatalf("same-schema groups aliased: %p %d %v", lease, index, err)
+	}
+	if _, _, err = exactAdmissionRegistryLease([]*RuntimeStoreLease{one}, []bool{false}, second); err == nil {
+		t.Fatal("foreign same-schema registry authorized source")
+	}
+}

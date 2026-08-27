@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 // RetainedPlanRuntimeRegistry binds one already-open manifest-owned runtime
@@ -17,6 +18,70 @@ type RetainedPlanRuntimeRegistry struct {
 	Shard        distribution.ShardID
 	Allocation   distribution.ShardAllocationGeneration
 	Registry     *RuntimeStoreRegistry
+}
+
+func (plan *Plan) SourceAllocation() (distribution.DistributionName, distribution.ShardID, distribution.ShardAllocationGeneration) {
+	if plan == nil {
+		return "", "", 0
+	}
+	return plan.source.Distribution, plan.source.Shard, plan.source.AllocationGeneration
+}
+
+// SourceAdmissionIsSealed recognizes only this plan's exact durable narrowed
+// ownership. Restart may re-present the pre-publication catalog after sealing;
+// that is not permission to admit a different later ownership epoch.
+func (plan *Plan) SourceAdmissionIsSealed(state replicatedstate.State) bool {
+	return plan != nil && state.Binding.Distribution == string(plan.source.Distribution) &&
+		state.Binding.Shard == string(plan.source.Shard) && state.Binding.AllocationGeneration == uint64(plan.source.AllocationGeneration) &&
+		plan.sourceBindingSealed(state.Binding)
+}
+
+// RegisterRetained publishes a certified adopted child as a future source.
+// Dynamically opened child ownership transfers to the live retained set;
+// caller-supplied startup registries remain owned by the process composition.
+func (registries *LocalPlanAdmissionRegistries) RegisterRetained(item RetainedPlanRuntimeRegistry) error {
+	if registries == nil || item.Registry == nil || item.Distribution == "" || item.Shard == "" || item.Allocation == 0 {
+		return ErrPlanAdmission
+	}
+	registries.mu.Lock()
+	defer registries.mu.Unlock()
+	if registries.closed {
+		return ErrPlanAdmission
+	}
+	for _, prior := range registries.retained {
+		if prior.Registry == item.Registry || prior.Distribution == item.Distribution && prior.Shard == item.Shard && prior.Allocation == item.Allocation {
+			if prior == item {
+				return nil
+			}
+			return ErrPlanAdmission
+		}
+	}
+	if len(registries.retained) == AbsoluteMaxLocalPlanAdmissionStores {
+		return ErrRuntimeRegistryCapacity
+	}
+	registries.retained = append(registries.retained, item)
+	for index, child := range registries.children {
+		if child.value == item.Registry {
+			registries.ownedRetained = append(registries.ownedRetained, item.Registry)
+			registries.children = append(registries.children[:index], registries.children[index+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+// OpenPreparedSource uses a receipt-authenticated exact root, sharing any
+// existing child registry until promotion transfers its process ownership.
+func (registries *LocalPlanAdmissionRegistries) OpenPreparedSource(root string, digest [32]byte) (*RuntimeStoreRegistry, error) {
+	if registries == nil {
+		return nil, ErrPlanAdmission
+	}
+	registries.mu.Lock()
+	defer registries.mu.Unlock()
+	if registries.closed {
+		return nil, ErrPlanAdmission
+	}
+	return registries.openChild(root, digest)
 }
 
 type childPlanRuntimeRegistry struct {
@@ -32,12 +97,13 @@ type childPlanRuntimeRegistry struct {
 type LocalPlanAdmissionRegistries struct {
 	mu sync.Mutex
 
-	node      rafttransport.NodeID
-	retained  []RetainedPlanRuntimeRegistry
-	children  []childPlanRuntimeRegistry
-	limit     int
-	authority RuntimeTerminalAuthority
-	closed    bool
+	node          rafttransport.NodeID
+	retained      []RetainedPlanRuntimeRegistry
+	children      []childPlanRuntimeRegistry
+	ownedRetained []*RuntimeStoreRegistry
+	limit         int
+	authority     RuntimeTerminalAuthority
+	closed        bool
 }
 
 func NewLocalPlanAdmissionRegistries(
@@ -118,6 +184,14 @@ func (registries *LocalPlanAdmissionRegistries) ResolveLocalPlanAdmissionStores(
 func (registries *LocalPlanAdmissionRegistries) openChild(
 	root string, digest [32]byte,
 ) (*RuntimeStoreRegistry, error) {
+	for _, retained := range registries.retained {
+		if retained.Registry.rootPath == root {
+			if retained.Registry.manifest != digest {
+				return nil, ErrPlanAdmission
+			}
+			return retained.Registry, nil
+		}
+	}
 	for _, item := range registries.children {
 		if item.root == root || item.digest == digest {
 			if item.root != root || item.digest != digest {
@@ -155,6 +229,10 @@ func (registries *LocalPlanAdmissionRegistries) Close() error {
 	for _, item := range registries.children {
 		result = errors.Join(result, item.value.Close())
 	}
+	for _, item := range registries.ownedRetained {
+		result = errors.Join(result, item.Close())
+	}
+	registries.ownedRetained = nil
 	registries.children = nil
 	return result
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/splitartifact"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	protocol "github.com/thesyncim/vibedb/shardcontrol"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -38,6 +39,7 @@ type rf3SplitServingRuntime struct {
 }
 
 type rf3SplitServingOptions struct {
+	inventory     *rf3AdoptedGroupInventory
 	childPreparer *rf3GroupChildPreparer
 	manifest      rf3Manifest
 	prepared      []preparedRF3Group
@@ -109,19 +111,16 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	if options.policy.Check(authority.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
 		return closeOnError(errRF3Serving)
 	}
-	sources := make([]splitcontroller.AdmittedSourceRuntime, len(options.prepared))
-	for index := range options.prepared {
-		item, identity, command := &options.prepared[index], options.identities[index], options.commands[index]
+	makeSource := func(identity raftmember.RuntimeIdentity, command raftservice.CommandFence, apply *sqldriver.ReplicatedApply, registry *splitcontroller.RuntimeStoreRegistry) (splitcontroller.AdmittedSourceRuntime, error) {
 		target, targetErr := splitcontroller.ShardActionTargetForServing(identity, command)
 		if targetErr != nil {
-			return closeOnError(targetErr)
+			return splitcontroller.AdmittedSourceRuntime{}, targetErr
 		}
-		apply := item.apply
-		sources[index] = splitcontroller.AdmittedSourceRuntime{
-			Distribution:   distribution.DistributionName(identity.Distribution),
-			Shard:          distribution.ShardID(identity.Shard),
-			Allocation:     distribution.ShardAllocationGeneration(identity.AllocationGeneration),
-			ManifestDigest: item.base.RelationManifestDigest, Target: target,
+		return splitcontroller.AdmittedSourceRuntime{
+			Distribution: distribution.DistributionName(identity.Distribution),
+			Shard:        distribution.ShardID(identity.Shard),
+			Allocation:   distribution.ShardAllocationGeneration(identity.AllocationGeneration),
+			Registry:     registry, Target: target,
 			NewExecutor: func(
 				ctx context.Context, catalog *gateway.Snapshot, plan *splitcontroller.Plan,
 				admission splitcontroller.PlanAdmission, lease *splitcontroller.RuntimeStoreLease,
@@ -183,7 +182,24 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 					return data.RevokeLocal(plan.OperationID(), admission.PlanDigest)
 				}), nil
 			},
+		}, nil
+	}
+	sources := make([]splitcontroller.AdmittedSourceRuntime, len(options.prepared))
+	for index := range options.prepared {
+		sources[index], err = makeSource(options.identities[index], options.commands[index], options.prepared[index].apply, observation.registries[index])
+		if err != nil {
+			return closeOnError(err)
 		}
+	}
+	liveSources := &rf3AdoptedSourceResolver{registries: registries, inventory: options.inventory,
+		observation: observation.provider, owners: options.owners, makeSource: makeSource,
+		live: make(map[raftmember.GroupKey]rf3RetainedSource)}
+	for index, identity := range options.identities {
+		liveSources.live[identity.Group] = rf3RetainedSource{runtime: rf3AdoptedRuntime{identity: identity, apply: options.prepared[index].apply}, registry: observation.registries[index]}
+	}
+	var adoptionCheckpoint splitcontroller.ChildAdoptionCheckpoint
+	if options.inventory != nil {
+		adoptionCheckpoint = options.inventory
 	}
 	childFactory := func(
 		ctx context.Context, catalog *gateway.Snapshot, plan *splitcontroller.Plan,
@@ -195,6 +211,13 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		)
 		if !found {
 			return nil, errRF3Serving
+		}
+		if replay, group, restored, replayErr := liveSources.adoptedChildReplay(plan, admission, child, replica); replayErr != nil {
+			return nil, replayErr
+		} else if restored {
+			return newRF3AdmittedExecutor(replay, func() error {
+				return observation.provider.RegisterGroups([]splitcontroller.LocalObservationGroup{group})
+			}, replay.Close), nil
 		}
 		opener, openErr := newRF3SplitStreamOpener(
 			options.profile, options.deadline,
@@ -217,7 +240,8 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			splitcontroller.LazyReplicatedChildExecutorOptions{
 				Plan: plan, PlanDigest: admission.PlanDigest, Child: child, Replica: replica, Lease: lease,
 				Registrar: options.registrar, StaticBootstrap: proto.Clone(staticBootstraps[registryIndex]).(*pb.Snapshot),
-				ArtifactOptions: replicatedstate.SnapshotArtifactOptions{}, WALKey: key,
+				AdoptionCheckpoint: adoptionCheckpoint,
+				ArtifactOptions:    replicatedstate.SnapshotArtifactOptions{}, WALKey: key,
 				WALOptions:      childRegistry.WAL.Options,
 				CheckpointBytes: childRegistry.StageCheckpointBytes,
 				Data:            data, Opener: opener, ReadDeadline: options.deadline, WriteDeadline: options.deadline,
@@ -252,7 +276,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			return nil
 		}, func() error {
 			var unregister error
-			if registered {
+			if registered && !liveSources.isRetained(group.Identity.Group) {
 				unregister = observation.provider.UnregisterGroups([]splitcontroller.LocalObservationGroup{group})
 			}
 			return errors.Join(unregister, executor.Close())
@@ -264,12 +288,13 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	if err != nil {
 		return closeOnError(err)
 	}
+	liveSources.factory = factory
 	binder, err := splitcontroller.NewBoundPlanAdmissionBinder(factory, grants)
 	if err != nil {
 		return closeOnError(err)
 	}
 	result.binder = binder
-	installer, err := splitcontroller.NewPlanAdmissionInstaller(registries, binder, splitcontroller.AbsoluteMaxLocalPlanAdmissionStores)
+	installer, err := splitcontroller.NewPlanAdmissionInstaller(liveSources, binder, splitcontroller.AbsoluteMaxLocalPlanAdmissionStores)
 	if err != nil {
 		return closeOnError(err)
 	}

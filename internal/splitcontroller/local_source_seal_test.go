@@ -120,6 +120,9 @@ func TestLocalSourceSealAndCutoverCertificateSurviveRestart(t *testing.T) {
 	}, proposer.command); err != nil {
 		t.Fatal(err)
 	}
+	if !plan.SourceAdmissionIsSealed(flowSourceState(t, source.machine)) {
+		t.Fatal("exact sealed source cannot resume pre-publication admission")
+	}
 	tail, advanced, err = actions.ExecuteCatchUpTail(plan, capture, artifacts, sinks)
 	if err != nil || !advanced || !tail.Sealed() || tail.SourceCut().Applied != 3 {
 		t.Fatalf("sealed tail=%+v advanced=%t err=%v", tail, advanced, err)
@@ -134,6 +137,7 @@ func TestLocalSourceSealAndCutoverCertificateSurviveRestart(t *testing.T) {
 	if err != nil || certificate.SourceCut() != tail.SourceCut() {
 		t.Fatalf("certificate=%+v err=%v", certificate, err)
 	}
+	testChildAdoptionCheckpointWithCertificate(t, plan, certificate)
 	if retried, retryErr := actions.ExecuteCertifyCutover(
 		plan, capture, tail, []rangesplit.ChildStageCursor{stage},
 	); retryErr != nil || retried != certificate {

@@ -16,6 +16,12 @@ type PlanAdmissionStoreResolver interface {
 	ResolveLocalPlanAdmissionStores(context.Context, *Plan) ([]*RuntimeStoreRegistry, error)
 }
 
+// CatalogPlanAdmissionStoreResolver may restore retained source capabilities
+// only from the exact catalog image authenticated by admission.Open.
+type CatalogPlanAdmissionStoreResolver interface {
+	ResolveCatalogPlanAdmissionStores(context.Context, *gateway.Snapshot, *Plan) ([]*RuntimeStoreRegistry, error)
+}
+
 // PlanAdmissionBinder exposes action/observation capabilities after every
 // selected local store has durably settled the exact same admission. Bind is
 // idempotent and memory-only; a restart requires the catalog authority to
@@ -61,7 +67,12 @@ func (installer *PlanAdmissionInstaller) Install(
 	if err != nil {
 		return err
 	}
-	registries, err := installer.stores.ResolveLocalPlanAdmissionStores(ctx, plan)
+	var registries []*RuntimeStoreRegistry
+	if resolver, ok := installer.stores.(CatalogPlanAdmissionStoreResolver); ok {
+		registries, err = resolver.ResolveCatalogPlanAdmissionStores(ctx, catalog, plan)
+	} else {
+		registries, err = installer.stores.ResolveLocalPlanAdmissionStores(ctx, plan)
+	}
 	if err != nil || len(registries) == 0 || len(registries) > installer.limit {
 		return errors.Join(ErrPlanAdmission, err)
 	}

@@ -22,6 +22,7 @@ type rf3GroupChildPreparer struct {
 	slots     [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot
 	store     *rf3ChildAdmissionStore
 	inflight  [maxRF3SplitChildOperations]int
+	inventory *rf3AdoptedGroupInventory
 }
 
 type rf3GroupChildPrepareSlot struct {
@@ -202,6 +203,9 @@ func (preparer *rf3GroupChildPreparer) reserve(operation [32]byte, group, child 
 		return 0, splitcontroller.ErrChildPreparation
 	}
 	next[empty].certificates[child], next[empty].requests[child] = certificate, request
+	if err := preparer.inventory.checkCapacity(next); err != nil {
+		return 0, err
+	}
 	if next != preparer.slots {
 		if err := preparer.store.save(next); err != nil {
 			return 0, err

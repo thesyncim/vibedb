@@ -24,12 +24,13 @@ type ExecutionGroupRegistrar interface {
 // apply object itself arrives in PreparedChildRuntime because it is minted by
 // the certified child handoff and cannot be opened independently.
 type PreboundChildRuntimeAdopter struct {
-	registrar ExecutionGroupRegistrar
-	operation OperationID
-	child     uint8
-	target    ChildTarget
-	roster    []rafttransport.Member
-	command   raftservice.CommandFence
+	registrar  ExecutionGroupRegistrar
+	operation  OperationID
+	child      uint8
+	target     ChildTarget
+	roster     []rafttransport.Member
+	command    raftservice.CommandFence
+	checkpoint *childAdoptionCheckpointBinding
 }
 
 // LocalReplicaChildTarget returns the exact process-local identity projection
@@ -90,6 +91,9 @@ func (adopter *PreboundChildRuntimeAdopter) AdoptSplitChild(
 		!runtimeIdentityMatches(adopter.target, identity) ||
 		identity.RelationManifestDigest != adopter.command.RelationManifestDigest {
 		return errors.Join(ErrTopologyConflict, profileErr, publicationErr)
+	}
+	if err := adopter.checkpoint.record(ctx, prepared); err != nil {
+		return err
 	}
 	return adopter.registrar.RegisterExecutionGroup(adopter.roster, raftservice.ExecutionGroup{
 		Runtime: prepared.Runtime, Identity: identity, Command: adopter.command,

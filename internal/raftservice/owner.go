@@ -172,6 +172,9 @@ type ownerReply struct {
 // Status and TargetProgress are transient liveness evidence and never grant
 // serving or membership authority by themselves.
 type ReplicaObservation struct {
+	// Identity binds a local capability to the exact installed incarnation;
+	// member number alone cannot distinguish a failed duplicate adoption.
+	Identity       raftmember.RuntimeIdentity
 	Publication    raftmodel.Publication
 	Status         raftmember.RuntimeStatus
 	TargetProgress raftmodel.MemberProgress
@@ -1018,6 +1021,9 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestMembership:
 		reply.err = owner.applyMembership(request.membership)
 	case requestReplicaObservation:
+		if member, found := owner.members[request.group]; found {
+			reply.observation.Identity = member.identity
+		}
 		if request.targetMember == 0 {
 			reply.err = ErrInvalidOwner
 			break

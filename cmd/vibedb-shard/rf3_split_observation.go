@@ -40,9 +40,13 @@ func newRF3SplitObservationRuntime(
 	groups := make([]splitcontroller.LocalObservationGroup, 0, len(prepared))
 	for index := range prepared {
 		item := &prepared[index]
+		digest := item.splitRuntimeDigest
+		if digest == ([32]byte{}) {
+			digest = item.base.RelationManifestDigest
+		}
 		registry, err := splitcontroller.OpenRuntimeStoreRegistry(
 			item.manifest.Route.SplitRuntimeRoot,
-			item.base.RelationManifestDigest,
+			digest,
 			maxOperations,
 			nil,
 		)

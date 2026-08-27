@@ -66,3 +66,55 @@ func TestLocalPlanAdmissionRegistriesRejectUnrelatedNode(t *testing.T) {
 		t.Fatal("unrelated node accepted an admission without a local participant")
 	}
 }
+
+func TestLocalPlanAdmissionPromotedChildSurvivesOperationAndReleasesOnce(t *testing.T) {
+	root, err := OpenRuntimeStoreRegistry(t.TempDir(), [32]byte{1}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	set, err := NewLocalPlanAdmissionRegistries([16]byte{1}, []RetainedPlanRuntimeRegistry{{Distribution: "d", Shard: "root", Allocation: 1, Registry: root}}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, digest := t.TempDir(), [32]byte{2}
+	child, err := set.OpenPreparedSource(path, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained := RetainedPlanRuntimeRegistry{Distribution: "d", Shard: "child", Allocation: 2, Registry: child}
+	if err = set.RegisterRetained(retained); err != nil {
+		t.Fatal(err)
+	}
+	if err = set.RegisterRetained(retained); err != nil {
+		t.Fatal(err)
+	}
+	if len(set.children) != 0 || len(set.ownedRetained) != 1 {
+		t.Fatal("child did not transfer to bounded live ownership")
+	}
+	if got, err := set.OpenPreparedSource(path, digest); err != nil || got != child {
+		t.Fatal("promotion retry reopened exclusive registry", err)
+	}
+	lease, err := child.Acquire(OperationID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = child.Acquire(OperationID{2})
+	if err != nil {
+		t.Fatal("later source operation lost live registry", err)
+	}
+	if err = lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err = set.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenRuntimeStoreRegistry(path, digest, 1, nil)
+	if err != nil {
+		t.Fatal("live registry leaked writer lease", err)
+	}
+	defer reopened.Close()
+}

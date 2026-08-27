@@ -109,15 +109,16 @@ func servePreparedRF3(parent context.Context, manifest rf3Manifest) error {
 type rf3ListenFunc func(network, address string) (net.Listener, error)
 
 type preparedRF3Group struct {
-	manifest         rf3Manifest
-	base             sqldriver.ReplicatedShardStoreIdentity
-	applyIdentity    sqldriver.ReplicatedApplyIdentity
-	key              raftstore.Key
-	wal              *raftstore.Store
-	database         *sqldriver.Database
-	apply            *sqldriver.ReplicatedApply
-	publication      raftmodel.Publication
-	restoreOperation [32]byte
+	manifest           rf3Manifest
+	base               sqldriver.ReplicatedShardStoreIdentity
+	applyIdentity      sqldriver.ReplicatedApplyIdentity
+	key                raftstore.Key
+	wal                *raftstore.Store
+	database           *sqldriver.Database
+	apply              *sqldriver.ReplicatedApply
+	publication        raftmodel.Publication
+	restoreOperation   [32]byte
+	splitRuntimeDigest [32]byte
 }
 
 type preparedRF3Set struct {
@@ -143,16 +144,42 @@ func closePreparedRF3Groups(groups []preparedRF3Group, cause error) error {
 	return cause
 }
 
-func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (preparedRF3Set, error) {
+func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
 	var result preparedRF3Set
 	bundles := manifest.groupBundles()
+	initialCount := len(bundles)
+	var recovered []rf3AdoptedGroupRecovery
+	if len(inventory) > 1 {
+		return result, errRF3Serving
+	}
+	if len(inventory) == 1 {
+		var err error
+		recovered, err = inventory[0].recoveryGroups(profile.LocalIdentity().Node)
+		if err != nil {
+			return result, err
+		}
+		bundles = slices.Clone(bundles)
+		for _, group := range recovered {
+			bundles = append(bundles, group.bundle)
+		}
+	}
 	result.groups = make([]preparedRF3Group, 0, len(bundles))
 	result.members = make([]rafttransport.Member, 0, len(bundles)*rf3ManifestMembers)
 	seen := make(map[raftmember.GroupKey]struct{}, len(bundles))
 	addresses := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
 	for index, bundle := range bundles {
 		single := manifest.withGroup(bundle)
-		base, applyIdentity, err := loadRF3RetainedIdentities(single)
+		var base sqldriver.ReplicatedShardStoreIdentity
+		var applyIdentity sqldriver.ReplicatedApplyIdentity
+		var err error
+		var runtimeDigest [32]byte
+		if index < initialCount {
+			base, applyIdentity, err = loadRF3RetainedIdentities(single)
+			runtimeDigest = base.RelationManifestDigest
+		} else {
+			entry := recovered[index-initialCount]
+			base, applyIdentity, runtimeDigest = entry.base, entry.apply, entry.runtimeDigest
+		}
 		if err != nil {
 			return result, closePreparedRF3Groups(result.groups, err)
 		}
@@ -189,7 +216,7 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 			clear(key.Material[:])
 			return result, closePreparedRF3Groups(result.groups, errors.Join(err, wal.Close()))
 		}
-		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published()}
+		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
 		item.restoreOperation, err = validateRestoredRF3Bootstrap(wal, bundle.SQL.Path, base.Binding.MemberID)
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
@@ -334,7 +361,12 @@ func servePreparedRF3WithExecutionLanes(
 		return fmt.Errorf("%w: control TLS server: %v", errRF3Serving, err)
 	}
 
-	preparedSet, err := prepareRF3GroupSet(manifest, profile)
+	adoptedInventory, err := openRF3AdoptedGroupInventory(manifest)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, adoptedInventory.Close()) }()
+	preparedSet, err := prepareRF3GroupSet(manifest, profile, adoptedInventory)
 	if err != nil {
 		return err
 	}
@@ -346,7 +378,7 @@ func servePreparedRF3WithExecutionLanes(
 	nativeConfigured := preparedSet.nativeConfigured
 	transportRegistry, err := rafttransport.NewStaticRegistry(
 		profile.LocalIdentity().Node, members,
-		rafttransport.Limits{MaxGroups: len(preparedSet.groups), MaxMembers: len(members)},
+		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers},
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
@@ -473,11 +505,15 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	runtimePublication, _ := runtimes[0].Publication()
 
-	servingRegistry, err := raftserve.NewRegistry(rf3RegistryLimitsForGroups(len(runtimes)))
+	servingLimits := rf3RegistryLimitsForGroups(len(runtimes))
+	// Only fixed group-table capacity grows ahead of enrollment. Proposal,
+	// waiter and completion byte arenas retain the shared startup budget.
+	servingLimits.MaxGroups = maxRF3ManifestGroups
+	servingRegistry, err := raftserve.NewRegistry(servingLimits)
 	if err != nil {
 		return closeAdopted(err)
 	}
-	lanes, err := servingRegistry.NewExecutionLanes(executionLaneCount, rf3HostLimitsForGroups(len(runtimes)))
+	lanes, err := servingRegistry.NewExecutionLanes(executionLaneCount, rf3HostLimitsForGroups(maxRF3ManifestGroups))
 	if err != nil {
 		return errors.Join(closeAdopted(err), servingRegistry.Close())
 	}
@@ -662,23 +698,28 @@ func servePreparedRF3WithExecutionLanes(
 		defer func(journal *snapshottransfer.SourceFileJournal) {
 			resultErr = errors.Join(resultErr, journal.Close())
 		}(sourceJournal)
-		provider, providerErr := snapshottransfer.OpenRetainedSourceExportProvider(
-			snapshottransfer.RetainedSourceExportOptions{
-				DataRoot:       manifest.ReplicaControl.SourceDataRoot,
-				RepositoryPath: rf3SnapshotGroupPath(manifest.ReplicaControl.SourceRepositoryPath, itemGroup, len(preparedSet.groups) > 1),
-				Limits: snapshottransfer.Limits{
-					MaxArtifacts:     manifest.ReplicaControl.MaxSourceArtifacts,
-					MaxArtifactBytes: manifest.ReplicaControl.MaxSourceArtifactBytes,
-					MaxDiskBytes:     manifest.ReplicaControl.MaxSourceDiskBytes,
+		repositoryPath, providerErr := prepareRF3SnapshotRepository(manifest.ReplicaControl.SourceDataRoot,
+			manifest.ReplicaControl.SourceRepositoryPath, itemGroup, len(preparedSet.groups) > 1)
+		var provider *snapshottransfer.RetainedSourceExportProvider
+		if providerErr == nil {
+			provider, providerErr = snapshottransfer.OpenRetainedSourceExportProvider(
+				snapshottransfer.RetainedSourceExportOptions{
+					DataRoot:       manifest.ReplicaControl.SourceDataRoot,
+					RepositoryPath: repositoryPath,
+					Limits: snapshottransfer.Limits{
+						MaxArtifacts:     manifest.ReplicaControl.MaxSourceArtifacts,
+						MaxArtifactBytes: manifest.ReplicaControl.MaxSourceArtifactBytes,
+						MaxDiskBytes:     manifest.ReplicaControl.MaxSourceDiskBytes,
+					},
+					ChunkBytes:      manifest.ReplicaControl.SourceChunkBytes,
+					MaxConcurrent:   manifest.ReplicaControl.MaxSourceConcurrent,
+					RuntimeIdentity: groupIdentity,
+					SourceNode:      profile.LocalIdentity().Node,
+					TargetMember:    target.MemberID, TargetStore: target.StoreID,
+					TargetIncarnation: target.NodeIncarnation, Cut: item.apply,
 				},
-				ChunkBytes:      manifest.ReplicaControl.SourceChunkBytes,
-				MaxConcurrent:   manifest.ReplicaControl.MaxSourceConcurrent,
-				RuntimeIdentity: groupIdentity,
-				SourceNode:      profile.LocalIdentity().Node,
-				TargetMember:    target.MemberID, TargetStore: target.StoreID,
-				TargetIncarnation: target.NodeIncarnation, Cut: item.apply,
-			},
-		)
+			)
+		}
 		if providerErr != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
 			retire(context.Canceled)
@@ -793,6 +834,8 @@ func servePreparedRF3WithExecutionLanes(
 		)
 		if childErr == nil {
 			defer func() { resultErr = errors.Join(resultErr, childPreparer.Close()) }()
+			childPreparer.inventory = adoptedInventory
+			childErr = adoptedInventory.checkCapacity(childPreparer.slots)
 		}
 		if childErr == nil {
 			concurrency := min(manifest.SplitControl.operationLimit(), 8)
@@ -820,6 +863,7 @@ func servePreparedRF3WithExecutionLanes(
 		manifest: manifest, prepared: preparedSet.groups, identities: identities, commands: commands,
 		owners: peer.Owners(), registrar: peer, profile: profile, policy: policy, deadline: deadline,
 		childPreparer: childPreparer,
+		inventory:     adoptedInventory,
 	})
 	if splitRuntimeErr != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
