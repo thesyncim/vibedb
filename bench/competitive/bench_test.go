@@ -44,6 +44,18 @@ func TestCorpusDocumentShapesAreExactAndValid(t *testing.T) {
 	}
 }
 
+func TestOverflowHeavyPublicationCorpusExceedsCommonCache(t *testing.T) {
+	const documents = 10_000
+	corpus := CorpusOfShape(documents, LowCardinality, OverflowHeavyDocuments)
+	logical := int64(0)
+	for _, document := range corpus {
+		logical += int64(len(document.Key) + len(document.JSON))
+	}
+	if logical <= DefaultCacheBytes {
+		t.Fatalf("overflow-heavy logical bytes=%d want > common cache=%d", logical, DefaultCacheBytes)
+	}
+}
+
 func TestStreamingCorpusMatchesResidentCorpus(t *testing.T) {
 	for _, card := range []Cardinality{LowCardinality, HighCardinality} {
 		for _, shape := range []DocumentShape{InlineDocuments, MixedDocuments, OverflowHeavyDocuments} {

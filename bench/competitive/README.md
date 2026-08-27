@@ -37,6 +37,8 @@ The module includes these command harnesses:
 - `cmd/footprint` measures apparent disk, allocated blocks, Go heap, and RSS.
 - `cmd/churndisk` samples storage during a bounded fixed-live-set mutation run.
 - `cmd/saturation` runs a matched, isolated client sweep and applies one fixed throughput-plateau rule.
+- `cmd/snapshotpressure` compares matched unpinned and explicitly pinned durable-snapshot phases.
+- `cmd/sqlsurface` runs one matched SQL workload through database/sql or a real loopback pgwire client.
 - `cmd/lifecycle` measures clean, hot, cold, and crash-recovery opens in isolated children.
 - `cmd/outofram` streams, stores, and scans a logical dataset larger than host RAM under hard memory and write bounds.
 - `cmd/speedprobe` records a focused speed diagnostic.
@@ -135,6 +137,43 @@ are rejected. Linux `/proc/self/io` `write_bytes` is reported as process
 storage-layer write bytes, not filesystem metadata, device, or media bytes.
 The command enforces explicit peak-RSS and physical-write bounds where those
 measurements are available.
+
+`verify` and `repack` are VibeDB-format lifecycle modes. Verify times only
+`durable.Verify` in a fresh child and requires a clean report. Repack times only
+the out-of-place rewrite, verifies its output afterward, then separately times
+the benchmark's primary/journal two-rename cutover and reopens the complete
+corpus. That cutover is explicitly non-atomic and is not a production
+publication protocol. Publication commands require Linux process-write
+accounting and fail closed elsewhere.
+
+## Cache and snapshot pressure
+
+The overflow-heavy 10,000-document mixed corpus has exact logical
+key-plus-document bytes above the common 64 MiB engine cache. This is a matched
+cross-engine cache-pressure shape, but does not imply cold OS caches or a data
+set larger than RAM.
+
+`cmd/snapshotpressure` holds an actual durable snapshot lease across the pinned
+phase. Its control and pinned rows share one image, durability, exact-index
+count, operation count, and checkpoint cadence, and report p99.9/maximum
+acknowledgement latency, allocated bytes, RSS, and process writes. An adapter
+without an explicit snapshot hook is rejected rather than approximated.
+
+## SQL interfaces
+
+`cmd/sqlsurface` uses the same deterministic inline documents and 50/50 point
+read/update trace for each surface. The database/sql lane supports VibeDB and
+SQLite with each engine's strongest synchronous durability (VibeDB
+`DurabilitySync`, SQLite WAL `synchronous=FULL` plus `fullfsync=1`) and one
+physical exact index. Native SQL
+statement spellings differ because VibeDB stores whole documents while SQLite
+uses an explicit document column; output and documentation keep that boundary
+visible.
+
+The pgwire lane starts a real loopback VibeDB server and speaks PostgreSQL
+startup and simple-query messages over TCP. It is matched to the VibeDB
+database/sql lane for corpus, trace, durability, indexing, correctness, and
+resource bounds. It measures interface overhead, not another PostgreSQL server.
 
 ## Larger than RAM
 

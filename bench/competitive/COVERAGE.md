@@ -10,7 +10,7 @@ This table is the executable benchmark-coverage contract. Status describes the h
 
 `implemented` establishes an executable measurement shape, not a comparison. An evidence command selecting `-engine=vibedb` is VibeDB-only; a cross-engine claim additionally requires the repeated isolated `mixedsuite` publication protocol and recorded results.
 
-Current coverage: **32 implemented**, **6 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
+Current coverage: **38 implemented**, **0 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
 
 Evidence commands are rendered to run from the repository root.
 
@@ -26,7 +26,7 @@ Evidence commands are rendered to run from the repository root.
 | document size | mixed | **implemented** | [E11](#e11): mixed inline and overflow corpus<br>[E12](#e12): mixed corpus byte shape | The deterministic mixed corpus alternates inline documents with exact 4 KiB overflow documents across every engine. |
 | document size | overflow-heavy | **implemented** | [E13](#e13): overflow-heavy corpus<br>[E12](#e12): overflow-heavy corpus byte shape | Seven of every eight deterministic documents are exact 16 KiB overflow values under one shared admission bound. |
 | working set | fits cache | **implemented** | [E02](#e02): cache-resident standard corpus | The standard corpus fits beneath the common 64 MiB read-cache budget. |
-| working set | larger than cache | **diagnostic** | [E14](#e14): VibeDB-only cache-pressure diagnostic | The opt-in million-document VibeDB-only churn probe reports cache reads, misses, and evictions; it is not a cross-engine publication lane. |
+| working set | larger than cache | **implemented** | [E13](#e13): cross-engine overflow working set above common cache<br>[E14](#e14): exact logical working-set/cache inequality | The matched overflow-heavy mixed lane has exact logical key-plus-document bytes above the common 64 MiB engine cache: seven of every eight of its 10,000 documents are exactly 16 KiB. Every adapter receives the same cache, durability, index, and workload flags. This proves an engine-cache working set, not a cold OS-cache or larger-than-RAM condition. |
 | working set | larger than RAM | **implemented** | [E15](#e15): bounded-memory out-of-RAM scan | The streaming overflow-heavy loader admits the row only when exact logical key-plus-document bytes exceed measured host physical memory. It enforces hard loader-byte, RSS, disk-space, and Linux physical-write bounds; a cross-engine claim requires one isolated process per engine with identical durability and index flags. |
 | cache state | hot reopen | **implemented** | [E16](#e16): controlled hot reopen | A conditioning child fully scans and closes the populated image, then a fresh child times only Factory.Open and proves the complete corpus after the timed interval. The output calls this full-scan-close, not an in-handle warm cache. |
 | cache state | cold reopen | **implemented** | [E17](#e17): Linux global-cache cold reopen | Cold mode synchronously writes Linux /proc/sys/vm/drop_caches=3 before the isolated timed child and fails closed without that global control. Darwin has no equivalent supported lane and is documented as unsupported rather than approximated with advisory eviction. |
@@ -35,25 +35,25 @@ Evidence commands are rendered to run from the repository root.
 | concurrency | 32 | **implemented** | [E19](#e19): thirty-two-client mixed workload | Thirty-two sessions share one engine handle and own disjoint mutation shards. |
 | concurrency | saturation | **implemented** | [E20](#e20): fixed-rule isolated client saturation sweep | A dedicated isolated-process sweep records seven cyclic-order repetitions at 1, 2, 4, 8, 16, 32, and 64 clients. The machine rule reports the first of two consecutive median-throughput gains at or below 5%; no decision is emitted as passing when the fixed sweep does not plateau. Durability, checkpoint cadence, exact indexes, corpus, and document shape are identical at every level. The result is host-specific saturation evidence, not a universal capacity claim. |
 | snapshot pressure | none | **implemented** | [E02](#e02): unpressured snapshot lane | The mixed harness releases cached read state before final fencing and holds no long-lived snapshot during mutation. |
-| snapshot pressure | long pinned | **diagnostic** | [E21](#e21): held-snapshot backpressure correctness | Durable correctness tests prove bounded backpressure under a held snapshot, but no competitive latency or storage lane holds one. |
+| snapshot pressure | long pinned | **implemented** | [E21](#e21): matched held-snapshot latency/storage pressure<br>[E22](#e22): held-snapshot backpressure correctness | A dedicated VibeDB harness runs matched control and explicitly pinned-snapshot phases over the same image, durability, index count, operation count, and checkpoint cadence. It reports p99.9/maximum acknowledgement latency, allocated storage, RSS, and Linux process writes under hard limits, then verifies every final byte. Engines without an explicit truthful snapshot lease fail closed; this is not yet a cross-engine snapshot comparison. |
 | interfaces | native | **implemented** | [E02](#e02): VibeDB native-adapter workload | This command drives VibeDB through the native Engine/EngineSession adapter. Other adapters implement the same harness interface, but this evidence target does not execute them. |
-| interfaces | database/sql | **diagnostic** | [E22](#e22): prepared point-query microbenchmark | Driver point-query microbenchmarks exist, but the competitive workload, durability, storage, and latency protocol does not run through database/sql. |
-| interfaces | pgwire | **diagnostic** | [E23](#e23): wire transaction functional coverage | Wire functional tests cover transaction semantics, but there is no competitive pgwire performance client. |
-| lifecycle | open | **implemented** | [E24](#e24): isolated clean open | A fresh child times only Factory.Open over a previously checkpointed image; process startup, corpus creation, correctness scan, and Close are outside the interval. Cache state is explicitly uncontrolled in this lane, so hot and cold claims must use their dedicated modes. |
-| lifecycle | recovery | **implemented** | [E25](#e25): isolated acknowledged-mutation recovery<br>[E26](#e26): whole-generation crash-image recovery correctness | An isolated producer opens the checkpointed image, acknowledges one ordinary-sync mutation, and exits without Close. A fresh child times only Factory.Open, verifies the exact recovered canonical value and full row count afterward, and reports Linux process write_bytes when available. This is one controlled acknowledged-mutation crash shape, not an exhaustive crash-point timing claim. |
+| interfaces | database/sql | **implemented** | [E23](#e23): VibeDB database/sql lane<br>[E24](#e24): matched SQLite database/sql lane | The SQL-surface command drives the same inline documents, 50/50 point read/update trace, one exact index, each engine's strongest synchronous durability (VibeDB DurabilitySync and SQLite WAL synchronous=FULL plus fullfsync=1), logical-byte oracle, p99.9/maximum latency, RSS, and Linux process-write bounds through database/sql for VibeDB and SQLite. Statement spellings reflect each engine's native whole-document schema and are disclosed; the workload semantics and durability/index shape are matched. |
+| interfaces | pgwire | **implemented** | [E25](#e25): matched loopback pgwire client lane<br>[E26](#e26): wire transaction functional coverage | The same SQL-surface workload runs through a real loopback PostgreSQL startup and simple-query protocol client into VibeDB, with the same documents, operation trace, synchronous durability, exact index, byte oracle, latency statistics, RSS, and process-write limits as its database/sql companion. It measures transport overhead against that companion, not a cross-engine PostgreSQL-server claim. |
+| lifecycle | open | **implemented** | [E27](#e27): isolated clean open | A fresh child times only Factory.Open over a previously checkpointed image; process startup, corpus creation, correctness scan, and Close are outside the interval. Cache state is explicitly uncontrolled in this lane, so hot and cold claims must use their dedicated modes. |
+| lifecycle | recovery | **implemented** | [E28](#e28): isolated acknowledged-mutation recovery<br>[E29](#e29): whole-generation crash-image recovery correctness | An isolated producer opens the checkpointed image, acknowledges one ordinary-sync mutation, and exits without Close. A fresh child times only Factory.Open, verifies the exact recovered canonical value and full row count afterward, and reports Linux process write_bytes when available. This is one controlled acknowledged-mutation crash shape, not an exhaustive crash-point timing claim. |
 | lifecycle | checkpoint | **implemented** | [E02](#e02): checkpoint latency | The mixed harness reports checkpoint call count and p50/p95/p99/p99.9/maximum acknowledgement latency inside elapsed throughput. |
-| lifecycle | verify | **diagnostic** | [E27](#e27): clean primary verification | Verify has corruption and clean-image correctness tests, but no timed lifecycle lane. |
-| lifecycle | repack | **diagnostic** | [E28](#e28): sustained churn with maintenance-floor phase | Sustained-churn output records pre/post-repack footprint and cumulative elapsed time, not isolated repack latency or cutover cost. |
+| lifecycle | verify | **implemented** | [E30](#e30): isolated timed durable verify<br>[E31](#e31): clean primary verification | A fresh isolated child times only durable.Verify over the clean, closed prepared VibeDB image. Report validation, RSS/process-write bounds, and the zero-findings oracle are outside or checked after the timer. The row records exact durability/index/document configuration; this is VibeDB format verification, not a generic cross-engine check. |
+| lifecycle | repack | **implemented** | [E32](#e32): isolated repack and benchmark cutover timing | A fresh isolated child times durable.Repack into a new file, verifies the output after the repack timer, then separately times the benchmark's primary/journal two-rename cutover and proves the cutover image reopens with the full corpus. Output labels the cutover protocol explicitly; it is not claimed crash-atomic or suitable as a production publication protocol. |
 | latency | p50 | **implemented** | [E02](#e02): p50 latency | Mixed output reports per-operation and checkpoint p50 in microseconds. |
 | latency | p95 | **implemented** | [E02](#e02): p95 latency | Mixed output reports per-operation and checkpoint p95 in microseconds. |
 | latency | p99 | **implemented** | [E02](#e02): p99 latency | Mixed output reports per-operation and checkpoint p99 in microseconds. |
 | latency | p99.9 | **implemented** | [E02](#e02): p99.9 latency | Mixed output reports the deterministic rounded order statistic for per-operation and checkpoint p99.9 in microseconds for every engine. |
 | latency | max | **implemented** | [E02](#e02): maximum latency | Mixed output reports the exact maximum per-operation and checkpoint sample for every engine. |
-| storage | logical | **implemented** | [E29](#e29): logical corpus bytes | The footprint tool reports key bytes, JSON bytes, and their key-inclusive logical sum separately. JSON gzip is an entropy control and explicitly excludes keys. |
-| storage | allocated | **implemented** | [E30](#e30): allocated and apparent bytes | The VibeDB footprint command reports apparent bytes, allocated filesystem blocks, and both ratios to the key-inclusive logical payload after a durability fence. |
-| storage | write amplification | **implemented** | [E31](#e31): bounded Linux process-write amplification<br>[E32](#e32): engine-issued durability payload companion | The qualified churn lane records exact submitted key-plus-document mutation bytes and the measured Linux /proc/self/io write_bytes delta over the mutation/checkpoint interval, then reports their ratio under explicit matched durability and index flags. It fails closed if the counter is absent or regresses and enforces a hard byte ceiling. This is process-attributed storage-layer traffic, not filesystem-metadata, device, or physical-media accounting. |
-| stability | long churn | **implemented** | [E31](#e31): bounded long-churn health qualification | Long is defined here as exactly 200,000 acknowledged state changes over a fixed 100,000-document live set, sampled every 5,000 mutations. The command verifies every final byte, rejects forced checkpoints, and enforces hard peak-RSS, live allocated-byte, and Linux process-write ceilings before marking rows publishable. This is bounded long-churn qualification, not a time-based soak or lifetime guarantee. |
-| stability | periodic crashes | **implemented** | [E33](#e33): bounded external RF3 durability qualification<br>[E34](#e34): exhaustive commit crash sweep | The external RF3 qualification runs bounded kill/response cuts, two asymmetric directional partition/restart/heal loops, four 64-caller result-waiter waves, rolling restarts, and hard WAL/RSS growth bounds. It emits exact canonical TSV counters and fails closed without Linux physical-allocation, /proc RSS, signal, proxy, or synced-result controls. This is bounded qualification, not a time-based soak or failover-latency claim. |
+| storage | logical | **implemented** | [E33](#e33): logical corpus bytes | The footprint tool reports key bytes, JSON bytes, and their key-inclusive logical sum separately. JSON gzip is an entropy control and explicitly excludes keys. |
+| storage | allocated | **implemented** | [E34](#e34): allocated and apparent bytes | The VibeDB footprint command reports apparent bytes, allocated filesystem blocks, and both ratios to the key-inclusive logical payload after a durability fence. |
+| storage | write amplification | **implemented** | [E35](#e35): bounded Linux process-write amplification<br>[E36](#e36): engine-issued durability payload companion | The qualified churn lane records exact submitted key-plus-document mutation bytes and the measured Linux /proc/self/io write_bytes delta over the mutation/checkpoint interval, then reports their ratio under explicit matched durability and index flags. It fails closed if the counter is absent or regresses and enforces a hard byte ceiling. This is process-attributed storage-layer traffic, not filesystem-metadata, device, or physical-media accounting. |
+| stability | long churn | **implemented** | [E35](#e35): bounded long-churn health qualification | Long is defined here as exactly 200,000 acknowledged state changes over a fixed 100,000-document live set, sampled every 5,000 mutations. The command verifies every final byte, rejects forced checkpoints, and enforces hard peak-RSS, live allocated-byte, and Linux process-write ceilings before marking rows publishable. This is bounded long-churn qualification, not a time-based soak or lifetime guarantee. |
+| stability | periodic crashes | **implemented** | [E37](#e37): bounded external RF3 durability qualification<br>[E38](#e38): exhaustive commit crash sweep | The external RF3 qualification runs bounded kill/response cuts, two asymmetric directional partition/restart/heal loops, four 64-caller result-waiter waves, rolling restarts, and hard WAL/RSS growth bounds. It emits exact canonical TSV counters and fails closed without Linux physical-allocation, /proc RSS, signal, proxy, or synced-result controls. This is bounded qualification, not a time-based soak or failover-latency claim. |
 
 ## Executable evidence catalog
 
@@ -138,7 +138,7 @@ Evidence commands are rendered to run from the repository root.
 ### E14
 
 ```sh
-(cd bench/competitive && MASSIVE_CHURN=1 MASSIVE_CORPUS=1000000 MASSIVE_OPERATIONS=250000 MASSIVE_CACHE_MIB=64 go test . -run '^TestMassiveChurnDiag$' -count=1)
+(cd bench/competitive && go test . -run '^TestOverflowHeavyPublicationCorpusExceedsCommonCache$' -count=1)
 ```
 
 ### E15
@@ -180,82 +180,106 @@ Evidence commands are rendered to run from the repository root.
 ### E21
 
 ```sh
-go test ./store/durable -run '^TestFileStoreLongHeldSnapshotCostsBoundedBackpressure$' -count=1
+(cd bench/competitive && go run ./cmd/snapshotpressure -engine=vibedb -durability=buffered-visible -corpus=10000 -operations=20000 -checkpoint-mutations=64 -exact-indexes=0 -require-physical-write=true -max-rss-bytes=2147483648 -max-allocated-bytes=8589934592 -max-physical-write-bytes=17179869184 -max-operation-ns=30000000000)
 ```
 
 ### E22
 
 ```sh
-go test ./sql/driver -run '^$' -bench '^BenchmarkDriverPreparedPointQuery$' -count=1
+go test ./store/durable -run '^TestFileStoreLongHeldSnapshotCostsBoundedBackpressure$' -count=1
 ```
 
 ### E23
 
 ```sh
-go test ./pgwire -run '^TestSQLCatalogTransactionsAndFailedState$' -count=1
+(cd bench/competitive && go run ./cmd/sqlsurface -engine=vibedb -interface=database-sql -corpus=1000 -operations=10000 -require-physical-write=true -max-rss-bytes=1073741824 -max-physical-write-bytes=4294967296)
 ```
 
 ### E24
 
 ```sh
-(cd bench/competitive && go run ./cmd/lifecycle -engine=vibedb -mode=open -corpus=10000 -durability=ordinary-sync -exact-indexes=0 -cardinality=low -document-shape=inline -max-rss-bytes=0 -max-physical-write-bytes=1073741824)
+(cd bench/competitive && go run ./cmd/sqlsurface -engine=sqlite -interface=database-sql -corpus=1000 -operations=10000 -require-physical-write=true -max-rss-bytes=1073741824 -max-physical-write-bytes=4294967296)
 ```
 
 ### E25
 
 ```sh
-(cd bench/competitive && go run ./cmd/lifecycle -engine=vibedb -mode=recovery -corpus=10000 -durability=ordinary-sync -exact-indexes=0 -cardinality=low -document-shape=inline -max-rss-bytes=0 -max-physical-write-bytes=1073741824)
+(cd bench/competitive && go run ./cmd/sqlsurface -engine=vibedb -interface=pgwire -corpus=1000 -operations=10000 -require-physical-write=true -max-rss-bytes=1073741824 -max-physical-write-bytes=4294967296)
 ```
 
 ### E26
 
 ```sh
-go test ./store/durable -run '^TestFileStoreCrashImagesRecoverWholeGeneration$' -count=1
+go test ./pgwire -run '^TestSQLCatalogTransactionsAndFailedState$' -count=1
 ```
 
 ### E27
 
 ```sh
-go test ./store/durable -run '^TestVerifyCleanPrimaryStoreVerifiesClean$' -count=1
+(cd bench/competitive && go run ./cmd/lifecycle -engine=vibedb -mode=open -corpus=10000 -durability=ordinary-sync -exact-indexes=0 -cardinality=low -document-shape=inline -max-rss-bytes=0 -max-physical-write-bytes=1073741824)
 ```
 
 ### E28
 
 ```sh
-(cd bench/competitive && go run ./cmd/churndisk -engine=vibedb -corpus=100000 -mutations=200000 -checkpoint-mutations=64 -sample-mutations=5000 -cardinality=low -storage-profile=intrinsic)
+(cd bench/competitive && go run ./cmd/lifecycle -engine=vibedb -mode=recovery -corpus=10000 -durability=ordinary-sync -exact-indexes=0 -cardinality=low -document-shape=inline -max-rss-bytes=0 -max-physical-write-bytes=1073741824)
 ```
 
 ### E29
 
 ```sh
-(cd bench/competitive && go run ./cmd/footprint -corpus=100000 -cardinality=low -corpus-stats=true)
+go test ./store/durable -run '^TestFileStoreCrashImagesRecoverWholeGeneration$' -count=1
 ```
 
 ### E30
 
 ```sh
-(cd bench/competitive && go run ./cmd/footprint -engine=vibedb -corpus=100000 -cardinality=low -durability=buffered-visible -storage-profile=intrinsic -header=true)
+(cd bench/competitive && go run ./cmd/lifecycle -engine=vibedb -mode=verify -corpus=10000 -durability=ordinary-sync -exact-indexes=0 -cardinality=low -document-shape=inline -max-rss-bytes=1073741824 -max-physical-write-bytes=1073741824 -require-physical-write=true)
 ```
 
 ### E31
 
 ```sh
-(cd bench/competitive && go run ./cmd/churndisk -engine=vibedb -corpus=100000 -mutations=200000 -checkpoint-mutations=64 -sample-mutations=5000 -durability=buffered-visible -exact-indexes=0 -cardinality=low -document-shape=inline -storage-profile=intrinsic -require-physical-write=true -max-rss-bytes=2147483648 -max-allocated-bytes=8589934592 -max-physical-write-bytes=17179869184)
+go test ./store/durable -run '^TestVerifyCleanPrimaryStoreVerifiesClean$' -count=1
 ```
 
 ### E32
 
 ```sh
-(cd bench/competitive && go run ./cmd/mixed -engine=vibedb -workload=churn -corpus=10000 -operations=20000 -warmup=2000 -durability=ordinary-sync -checkpoint-mutations=0 -clients=1 -cardinality=low -header=true)
+(cd bench/competitive && go run ./cmd/lifecycle -engine=vibedb -mode=repack -corpus=10000 -durability=ordinary-sync -exact-indexes=0 -cardinality=low -document-shape=inline -max-rss-bytes=1073741824 -max-physical-write-bytes=4294967296 -require-physical-write=true)
 ```
 
 ### E33
 
 ```sh
-(cd bench/competitive && go run ./bench/rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
+(cd bench/competitive && go run ./cmd/footprint -corpus=100000 -cardinality=low -corpus-stats=true)
 ```
 
 ### E34
+
+```sh
+(cd bench/competitive && go run ./cmd/footprint -engine=vibedb -corpus=100000 -cardinality=low -durability=buffered-visible -storage-profile=intrinsic -header=true)
+```
+
+### E35
+
+```sh
+(cd bench/competitive && go run ./cmd/churndisk -engine=vibedb -corpus=100000 -mutations=200000 -checkpoint-mutations=64 -sample-mutations=5000 -durability=buffered-visible -exact-indexes=0 -cardinality=low -document-shape=inline -storage-profile=intrinsic -require-physical-write=true -max-rss-bytes=2147483648 -max-allocated-bytes=8589934592 -max-physical-write-bytes=17179869184)
+```
+
+### E36
+
+```sh
+(cd bench/competitive && go run ./cmd/mixed -engine=vibedb -workload=churn -corpus=10000 -operations=20000 -warmup=2000 -durability=ordinary-sync -checkpoint-mutations=0 -clients=1 -cardinality=low -header=true)
+```
+
+### E37
+
+```sh
+(cd bench/competitive && go run ./bench/rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
+```
+
+### E38
 
 ```sh
 go test ./store/durable -run '^TestFileStoreExhaustiveCommitCrashSweep$' -count=1

@@ -3,6 +3,7 @@ package competitive
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -521,6 +522,13 @@ type Engine interface {
 type MaintenanceFloorer interface {
 	MaintenanceFloor() error
 	MaintenanceFloorDescription() string
+}
+
+// SnapshotPressureEngine exposes one explicit read lease to the competitive
+// pressure harness. It is optional because engines without a truthful pinned
+// snapshot primitive must fail closed rather than approximate one with a read.
+type SnapshotPressureEngine interface {
+	PinSnapshot() (io.Closer, error)
 }
 
 // touchAll reads every byte of v and folds it into an accumulator. Every

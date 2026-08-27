@@ -235,9 +235,12 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{mixedTarget("cache-resident standard corpus")},
 		},
 		{
-			Dimension: "working set", Case: "larger than cache", Status: CoverageDiagnostic,
-			Boundary: "The opt-in million-document VibeDB-only churn probe reports cache reads, misses, and evictions; it is not a cross-engine publication lane.",
-			Targets:  []CoverageTarget{massiveChurnTarget("VibeDB-only cache-pressure diagnostic")},
+			Dimension: "working set", Case: "larger than cache", Status: CoverageImplemented,
+			Boundary: "The matched overflow-heavy mixed lane has exact logical key-plus-document bytes above the common 64 MiB engine cache: seven of every eight of its 10,000 documents are exactly 16 KiB. Every adapter receives the same cache, durability, index, and workload flags. This proves an engine-cache working set, not a cold OS-cache or larger-than-RAM condition.",
+			Targets: []CoverageTarget{
+				mixedTarget("cross-engine overflow working set above common cache", "-document-shape=overflow-heavy"),
+				testTarget("exact logical working-set/cache inequality", "bench/competitive", "TestOverflowHeavyPublicationCorpusExceedsCommonCache"),
+			},
 		},
 		{
 			Dimension: "working set", Case: "larger than RAM", Status: CoverageImplemented,
@@ -302,12 +305,17 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{mixedTarget("unpressured snapshot lane")},
 		},
 		{
-			Dimension: "snapshot pressure", Case: "long pinned", Status: CoverageDiagnostic,
-			Boundary: "Durable correctness tests prove bounded backpressure under a held snapshot, but no competitive latency or storage lane holds one.",
-			Targets: []CoverageTarget{testTarget(
-				"held-snapshot backpressure correctness",
-				"store/durable", "TestFileStoreLongHeldSnapshotCostsBoundedBackpressure",
-			)},
+			Dimension: "snapshot pressure", Case: "long pinned", Status: CoverageImplemented,
+			Boundary: "A dedicated VibeDB harness runs matched control and explicitly pinned-snapshot phases over the same image, durability, index count, operation count, and checkpoint cadence. It reports p99.9/maximum acknowledgement latency, allocated storage, RSS, and Linux process writes under hard limits, then verifies every final byte. Engines without an explicit truthful snapshot lease fail closed; this is not yet a cross-engine snapshot comparison.",
+			Targets: []CoverageTarget{
+				withOutputTokens(commandTarget("matched held-snapshot latency/storage pressure", "bench/competitive/cmd/snapshotpressure",
+					"-engine=vibedb", "-durability=buffered-visible", "-corpus=10000", "-operations=20000",
+					"-checkpoint-mutations=64", "-exact-indexes=0", "-require-physical-write=true",
+					"-max-rss-bytes=2147483648", "-max-allocated-bytes=8589934592",
+					"-max-physical-write-bytes=17179869184", "-max-operation-ns=30000000000",
+				), "run", "phase", "p99.9-us", "max-us", "allocated-bytes", "physical-write-known", "peak-rss-bytes"),
+				testTarget("held-snapshot backpressure correctness", "store/durable", "TestFileStoreLongHeldSnapshotCostsBoundedBackpressure"),
+			},
 		},
 
 		{
@@ -316,20 +324,20 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{mixedTarget("VibeDB native-adapter workload")},
 		},
 		{
-			Dimension: "interfaces", Case: "database/sql", Status: CoverageDiagnostic,
-			Boundary: "Driver point-query microbenchmarks exist, but the competitive workload, durability, storage, and latency protocol does not run through database/sql.",
-			Targets: []CoverageTarget{benchmarkTarget(
-				"prepared point-query microbenchmark",
-				"sql/driver", "BenchmarkDriverPreparedPointQuery",
-			)},
+			Dimension: "interfaces", Case: "database/sql", Status: CoverageImplemented,
+			Boundary: "The SQL-surface command drives the same inline documents, 50/50 point read/update trace, one exact index, each engine's strongest synchronous durability (VibeDB DurabilitySync and SQLite WAL synchronous=FULL plus fullfsync=1), logical-byte oracle, p99.9/maximum latency, RSS, and Linux process-write bounds through database/sql for VibeDB and SQLite. Statement spellings reflect each engine's native whole-document schema and are disclosed; the workload semantics and durability/index shape are matched.",
+			Targets: []CoverageTarget{
+				withOutputTokens(commandTarget("VibeDB database/sql lane", "bench/competitive/cmd/sqlsurface", "-engine=vibedb", "-interface=database-sql", "-corpus=1000", "-operations=10000", "-require-physical-write=true", "-max-rss-bytes=1073741824", "-max-physical-write-bytes=4294967296"), "run", "interface", "durability", "exact-indexes", "p99.9-us", "max-us", "logical-write-bytes", "physical-write-known"),
+				commandTarget("matched SQLite database/sql lane", "bench/competitive/cmd/sqlsurface", "-engine=sqlite", "-interface=database-sql", "-corpus=1000", "-operations=10000", "-require-physical-write=true", "-max-rss-bytes=1073741824", "-max-physical-write-bytes=4294967296"),
+			},
 		},
 		{
-			Dimension: "interfaces", Case: "pgwire", Status: CoverageDiagnostic,
-			Boundary: "Wire functional tests cover transaction semantics, but there is no competitive pgwire performance client.",
-			Targets: []CoverageTarget{testTarget(
-				"wire transaction functional coverage",
-				"pgwire", "TestSQLCatalogTransactionsAndFailedState",
-			)},
+			Dimension: "interfaces", Case: "pgwire", Status: CoverageImplemented,
+			Boundary: "The same SQL-surface workload runs through a real loopback PostgreSQL startup and simple-query protocol client into VibeDB, with the same documents, operation trace, synchronous durability, exact index, byte oracle, latency statistics, RSS, and process-write limits as its database/sql companion. It measures transport overhead against that companion, not a cross-engine PostgreSQL-server claim.",
+			Targets: []CoverageTarget{
+				withOutputTokens(commandTarget("matched loopback pgwire client lane", "bench/competitive/cmd/sqlsurface", "-engine=vibedb", "-interface=pgwire", "-corpus=1000", "-operations=10000", "-require-physical-write=true", "-max-rss-bytes=1073741824", "-max-physical-write-bytes=4294967296"), "run", "interface", "p99.9-us", "max-us", "physical-write-source"),
+				testTarget("wire transaction functional coverage", "pgwire", "TestSQLCatalogTransactionsAndFailedState"),
+			},
 		},
 
 		{
@@ -351,23 +359,22 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{mixedTarget("checkpoint latency")},
 		},
 		{
-			Dimension: "lifecycle", Case: "verify", Status: CoverageDiagnostic,
-			Boundary: "Verify has corruption and clean-image correctness tests, but no timed lifecycle lane.",
-			Targets: []CoverageTarget{testTarget(
-				"clean primary verification",
-				"store/durable", "TestVerifyCleanPrimaryStoreVerifiesClean",
-			)},
+			Dimension: "lifecycle", Case: "verify", Status: CoverageImplemented,
+			Boundary: "A fresh isolated child times only durable.Verify over the clean, closed prepared VibeDB image. Report validation, RSS/process-write bounds, and the zero-findings oracle are outside or checked after the timer. The row records exact durability/index/document configuration; this is VibeDB format verification, not a generic cross-engine check.",
+			Targets: []CoverageTarget{
+				withOutputTokens(commandTarget("isolated timed durable verify", "bench/competitive/cmd/lifecycle", "-engine=vibedb", "-mode=verify", "-corpus=10000", "-durability=ordinary-sync", "-exact-indexes=0", "-cardinality=low", "-document-shape=inline", "-max-rss-bytes=1073741824", "-max-physical-write-bytes=1073741824", "-require-physical-write=true"), "parentRun", "verify-ns", "findings", "physical-write-known"),
+				testTarget("clean primary verification", "store/durable", "TestVerifyCleanPrimaryStoreVerifiesClean"),
+			},
 		},
 		{
-			Dimension: "lifecycle", Case: "repack", Status: CoverageDiagnostic,
-			Boundary: "Sustained-churn output records pre/post-repack footprint and cumulative elapsed time, not isolated repack latency or cutover cost.",
+			Dimension: "lifecycle", Case: "repack", Status: CoverageImplemented,
+			Boundary: "A fresh isolated child times durable.Repack into a new file, verifies the output after the repack timer, then separately times the benchmark's primary/journal two-rename cutover and proves the cutover image reopens with the full corpus. Output labels the cutover protocol explicitly; it is not claimed crash-atomic or suitable as a production publication protocol.",
 			Targets: []CoverageTarget{withOutputTokens(commandTarget(
-				"sustained churn with maintenance-floor phase",
-				"bench/competitive/cmd/churndisk",
-				"-engine=vibedb", "-corpus=100000", "-mutations=200000",
-				"-checkpoint-mutations=64", "-sample-mutations=5000",
-				"-cardinality=low", "-storage-profile=intrinsic",
-			), "printHeader", "maintenance-floor", "phase", "apparent-bytes", "allocated-bytes", "elapsed-seconds")},
+				"isolated repack and benchmark cutover timing", "bench/competitive/cmd/lifecycle",
+				"-engine=vibedb", "-mode=repack", "-corpus=10000", "-durability=ordinary-sync",
+				"-exact-indexes=0", "-cardinality=low", "-document-shape=inline",
+				"-max-rss-bytes=1073741824", "-max-physical-write-bytes=4294967296", "-require-physical-write=true",
+			), "parentRun", "repack-ns", "cutover-ns", "cutover-protocol", "repacked-documents", "physical-write-known")},
 		},
 
 		{
