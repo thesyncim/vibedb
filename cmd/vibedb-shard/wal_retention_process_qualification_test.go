@@ -229,7 +229,6 @@ func walRetentionWaitValue(t testing.TB, fixture *rf3FaultFixture, member int,
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		request := fixture.readRequest(member, state, rf3FaultKey(t, id))
-		request.MaxValueBytes = walRetentionDocumentBytes + 4096
 		response, err := fixture.roundTrip(t, member, request)
 		if err == nil && response.Kind == shardservice.ReplicatedReadFound && bytes.Equal(response.Value, want) {
 			return

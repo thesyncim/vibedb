@@ -539,6 +539,7 @@ type rf3FaultFixture struct {
 	children             [rf3CommandMembers]*rf3CommandChild
 	listeners            [rf3CommandMembers][4]*net.TCPListener
 	walAllocatedBaseline int64
+	maxReadValueBytes    uint32
 }
 
 func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
@@ -607,6 +608,12 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		if prepareErr != nil {
 			t.Fatal(prepareErr)
 		}
+		maximum := prepared.Base.UserLimits.MaxDocumentBytes
+		if maximum <= 0 || maximum > replication.MaxMutationValueBytes ||
+			member > 0 && fixture.maxReadValueBytes != uint32(maximum) {
+			t.Fatal("inconsistent RF3 fault read response bound")
+		}
+		fixture.maxReadValueBytes = uint32(maximum)
 		prepareRF3CommandSplitRuntime(t, memberRoot, rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}))
 		basePath, applyPath, keyPath := filepath.Join(memberRoot, "sql-identity.vibejson"), filepath.Join(memberRoot, "apply-identity.vibejson"), filepath.Join(memberRoot, "wal-key")
 		writeRF3CommandIdentity(t, basePath, prepared.Base)
@@ -750,24 +757,45 @@ func (fixture *rf3FaultFixture) waitLeader(t testing.TB, members []int, timeout 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		states := make(map[int]shardservice.ReplicatedMemberState, len(members))
-		leader := uint64(0)
 		consistent := true
 		for _, member := range members {
 			state, err := fixture.tryProbe(member, time.Second)
-			if err != nil || state.LeaderID == 0 || leader != 0 && state.LeaderID != leader {
+			if err != nil {
 				consistent = false
 				break
 			}
 			states[member] = state
-			leader = state.LeaderID
 		}
-		if consistent && leader != 0 {
-			return int(leader - 1), states
+		if leader, ok := rf3FaultObservedLeader(members, states); consistent && ok {
+			return leader, states
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("RF3 leader unavailable for members %v", members)
 	return 0, nil
+}
+
+// Followers can retain the stopped leader's ID until an election finishes.
+// A replacement must itself be among the observed live members and agree on
+// both leader and term; stale follower hints alone are not an election proof.
+func rf3FaultObservedLeader(members []int, states map[int]shardservice.ReplicatedMemberState) (int, bool) {
+	if len(members) == 0 {
+		return 0, false
+	}
+	first, ok := states[members[0]]
+	if !ok || first.LeaderID == 0 || first.LeaderID > rf3CommandMembers || first.Fence.Term == 0 {
+		return 0, false
+	}
+	leader := int(first.LeaderID - 1)
+	leaderObserved := false
+	for _, member := range members {
+		state, ok := states[member]
+		if !ok || state.Fence.MemberID != uint64(member+1) || state.LeaderID != first.LeaderID || state.Fence.Term != first.Fence.Term {
+			return 0, false
+		}
+		leaderObserved = leaderObserved || member == leader
+	}
+	return leader, leaderObserved
 }
 
 func (fixture *rf3FaultFixture) waitMemberLeader(t testing.TB, member int, leader uint64, timeout time.Duration) {
@@ -966,7 +994,7 @@ func (fixture *rf3FaultFixture) readRequest(member int, state shardservice.Repli
 	return &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedReadLeader,
 		Authority:  serviceauthz.Authority{Node: fixture.nodes[(member+1)%rf3CommandMembers], Generation: fixture.authority.ActivePolicyGeneration},
 		Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence, Relation: 1, Key: key,
-		MinimumApplied: state.Applied, MaxValueBytes: 1 << 20}
+		MinimumApplied: state.Applied, MaxValueBytes: fixture.maxReadValueBytes}
 }
 
 func rf3FaultKey(t testing.TB, id string) []byte {
