@@ -70,7 +70,8 @@ func validate(directory string) ([]byte, error) {
 		return nil, errors.New("publication requires Linux, a clean tree, and command schema 1")
 	}
 
-	artifacts := make([]string, 0, 64)
+	artifacts := make([]string, 0, 96)
+	artifacts = append(artifacts, "metadata.tsv")
 	for _, item := range []struct {
 		name, durability, shape string
 		engines                 []string
