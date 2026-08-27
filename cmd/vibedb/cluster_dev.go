@@ -579,6 +579,32 @@ func validateExistingDevCatalog(
 	manifest devClusterManifest,
 	catalogGroup, ledgerGroup, dataGroup raftmember.GroupKey,
 ) error {
+	catalogRoute, err := inspectDevPreparedRoute(
+		nil, "catalog", gateway.ReplicatedCatalogDistribution,
+		gateway.ReplicatedCatalogShard, gateway.ReplicatedCatalogTable,
+		gateway.ReplicatedCatalogPrimaryKey, catalogGroup, replication.Digest{},
+		false, manifest.Members,
+	)
+	if err != nil {
+		return err
+	}
+	ledgerHomeIdentity := deriveDevLedgerHomeIdentity(ledgerGroup)
+	ledgerRoute, err := inspectDevPreparedRoute(
+		nil, "ledger", devLedgerDistribution, devLedgerShard, devLedgerTable,
+		devLedgerPrimaryKey, ledgerGroup, ledgerHomeIdentity, false,
+		manifest.LedgerMembers,
+	)
+	if err != nil {
+		return err
+	}
+	dataRoute, err := inspectDevPreparedRoute(
+		nil, "data", devDataDistribution, devDataShard, devDataTable,
+		devDataPrimaryKey, dataGroup, replication.Digest{}, true,
+		manifest.DataMembers,
+	)
+	if err != nil {
+		return err
+	}
 	snapshot, err := gateway.LoadSnapshot(path)
 	if err != nil {
 		return errors.Join(errDevCluster, err)
@@ -592,7 +618,8 @@ func validateExistingDevCatalog(
 	resolved, ok := snapshot.ResolveReplicatedTableKey(
 		[]byte(devDataTable), key, scalarScratch[:0], replicaScratch[:0],
 	)
-	if !ok || resolved.Profile.Table != devDataTable ||
+	if !ok || resolved.Profile != dataRoute.table ||
+		resolved.Profile.Table != devDataTable ||
 		resolved.Profile.PrimaryKey != devDataPrimaryKey || resolved.Profile.Relation != 1 ||
 		len(resolved.Route.Replicas) != gateway.ServingReplicaCount ||
 		resolved.Route.Group != dataGroup ||
@@ -603,13 +630,13 @@ func validateExistingDevCatalog(
 	}
 	if !matchesExistingDevRoute(
 		snapshot, gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard,
-		"catalog", manifest.Members, catalogGroup, replicaScratch[:0],
+		"catalog", manifest.Members, catalogGroup, catalogRoute, replicaScratch[:0],
 	) || !matchesExistingDevRoute(
 		snapshot, devLedgerDistribution, devLedgerShard,
-		"ledger", manifest.LedgerMembers, ledgerGroup, replicaScratch[:0],
+		"ledger", manifest.LedgerMembers, ledgerGroup, ledgerRoute, replicaScratch[:0],
 	) || !matchesExistingDevRoute(
 		snapshot, devDataDistribution, devDataShard,
-		"data", manifest.DataMembers, dataGroup, replicaScratch[:0],
+		"data", manifest.DataMembers, dataGroup, dataRoute, replicaScratch[:0],
 	) {
 		return errDevCluster
 	}
@@ -638,6 +665,7 @@ func matchesExistingDevRoute(
 	role string,
 	members []devClusterMember,
 	group raftmember.GroupKey,
+	prepared devPreparedRoute,
 	scratch []gateway.ReplicatedEndpoint,
 ) bool {
 	route, ok := snapshot.ResolveReplicatedRoute(distributionName, shard, scratch)
@@ -646,8 +674,9 @@ func matchesExistingDevRoute(
 		len(route.Replicas) != len(members) ||
 		route.Command.ReplicaSetVersion != 1 ||
 		route.Command.ActivePolicyGeneration != 1 || route.Command.ProtectionEpoch != 1 ||
-		route.Command.OwnershipEpoch != 1 || route.Command.SchemaGeneration != 1 ||
-		route.Command.RelationManifestDigest == ([sha256.Size]byte{}) ||
+		route.Command.OwnershipEpoch != 1 ||
+		route.Command.SchemaGeneration != prepared.schemaGeneration ||
+		route.Command.RelationManifestDigest != prepared.digest ||
 		route.Command.RoutingVersion != 1 || route.Command.RouteGeneration != 1 {
 		return false
 	}
@@ -1060,7 +1089,7 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 			return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
 		}
 	}
-	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-bootstrap-if-missing", "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-durable-ack-key", m.DurableAckKey, "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
+	args := []string{"serve", "-catalog", m.CatalogPath, "-catalog-bootstrap-marker", filepath.Join(filepath.Dir(m.CatalogPath), "catalog-bootstrap-complete"), "-catalog-relation", "1", "-catalog-session-journal", filepath.Join(filepath.Dir(m.CatalogPath), "gateway-session"), "-catalog-client-id", m.GatewayNode, "-catalog-retry-home", m.GatewayNode[:16], "-durable-ack-key", m.DurableAckKey, "-listen", m.ClientEndpoint, "-tls-certificate", m.GatewayCertificate, "-tls-key", m.GatewayKey, "-tls-roots", m.Roots, "-tls-identity-oid", devClusterOID, "-authorization-policy", m.AuthorizationPolicy, "-hot-shard-capacity", m.HotShardCapacity}
 	for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers, m.DataMembers} {
 		for _, member := range members {
 			args = append(args, "-shard-peer", member.Native+"="+member.Node)

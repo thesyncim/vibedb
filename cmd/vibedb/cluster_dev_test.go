@@ -66,8 +66,41 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	snapshot, _, groups := testDevCatalogSnapshot(t)
-	if err := gateway.SaveSnapshot(manifest.CatalogPath, snapshot); err != nil {
+	clusterID, clusterIncarnation := [16]byte{1}, [16]byte{2}
+	groups := [3]raftmember.GroupKey{
+		{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}},
+		{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{5}, GroupID: [16]byte{6}},
+		{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{7}, GroupID: [16]byte{8}},
+	}
+	for _, role := range []struct {
+		members               []devClusterMember
+		group                 raftmember.GroupKey
+		distributionName      distribution.DistributionName
+		shard                 distribution.ShardID
+		table, primaryKey     string
+		requestLedgerIdentity replication.Digest
+	}{
+		{manifest.Members, groups[0], gateway.ReplicatedCatalogDistribution,
+			gateway.ReplicatedCatalogShard, gateway.ReplicatedCatalogTable,
+			gateway.ReplicatedCatalogPrimaryKey, replication.Digest{}},
+		{manifest.LedgerMembers, groups[1], devLedgerDistribution, devLedgerShard,
+			devLedgerTable, devLedgerPrimaryKey, deriveDevLedgerHomeIdentity(groups[1])},
+		{manifest.DataMembers, groups[2], devDataDistribution, devDataShard,
+			devDataTable, devDataPrimaryKey, replication.Digest{}},
+	} {
+		for _, member := range role.members {
+			prepareDevTestReplica(
+				t, member, role.group, role.distributionName, role.shard,
+				role.table, role.primaryKey, role.requestLedgerIdentity,
+			)
+		}
+	}
+	if err := writeDevCatalog(
+		manifest, clusterID, clusterIncarnation,
+		groups[0].ShardIncarnation, groups[0].GroupID,
+		groups[1].ShardIncarnation, groups[1].GroupID,
+		groups[2].ShardIncarnation, groups[2].GroupID,
+	); err != nil {
 		t.Fatal(err)
 	}
 	for index, role := range []string{"catalog", "ledger", "data"} {
@@ -102,6 +135,19 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 	again, err := vibejson.Marshal(&loaded)
 	if err != nil || !bytes.Equal(raw, again) {
 		t.Fatalf("resume changed manifest: %v", err)
+	}
+	stale, _, _ := testDevCatalogSnapshot(t)
+	stalePath := filepath.Join(root, "stale-catalog.vibejson")
+	if err = gateway.SaveSnapshot(stalePath, stale); err == nil {
+		err = os.Rename(stalePath, manifest.CatalogPath)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ensureDevCluster(devClusterOptions{
+		root: root, replicas: 3, shardBinary: "/does/not/run",
+	}); !errors.Is(err, errDevCluster) {
+		t.Fatalf("restart accepted catalog with stale portable witness: %v", err)
 	}
 }
 
@@ -395,6 +441,90 @@ func TestDevRequestLedgerPrepareProfileMatchesCatalogHomeAndKeepsCatalogDisabled
 		if grant.NodeID != members[index].NodeID || grant.Actions != ^uint16(0) {
 			t.Fatalf("split grant %d=%+v", index, grant)
 		}
+	}
+}
+
+func prepareDevTestReplica(
+	t *testing.T,
+	member devClusterMember,
+	group raftmember.GroupKey,
+	distributionName distribution.DistributionName,
+	shard distribution.ShardID,
+	table, primaryKey string,
+	requestLedgerIdentity replication.Digest,
+) {
+	t.Helper()
+	store, err := decodeDev16(member.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply := sqldriver.ReplicatedApplyOptions{
+		MaxSessions: 128, RetryWindow: 8,
+		TxnLimits: durable.TxnLimits{
+			MaxCollections: 16, MaxDocuments: 4096, MaxBytes: 384 << 20,
+		},
+		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: primaryKey,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+	}
+	if requestLedgerIdentity != (replication.Digest{}) {
+		apply.RequestLedgerCapacityBytes = devLedgerCapacityBytes
+		apply.RequestLedgerCleanupReserveBytes = devLedgerCleanupReserveBytes
+		apply.RequestLedgerRangeIdentity = [32]byte(requestLedgerIdentity)
+	}
+	identity := raftstore.Identity{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		Distribution: string(distributionName), Shard: string(shard),
+		AllocationGeneration: 1, ShardIncarnation: group.ShardIncarnation,
+		GroupID: group.GroupID, MemberID: member.Member, StoreID: store,
+	}
+	key := raftstore.Key{ID: "dev-restart-profile-key", Wrapped: []byte("opaque")}
+	for index := range key.Material {
+		key.Material[index] = group.GroupID[0] + byte(index) + 1
+	}
+	bootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
+	bootstrap.TopologyRecoveryEpoch = group.TopologyRecoveryEpoch
+	prepared, err := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
+		Root: filepath.Dir(member.ServeManifest), Table: table,
+		CreateTable: "CREATE TABLE " + table + " (PRIMARY KEY (id))",
+		Identity:    identity, Key: key,
+		WAL: raftstore.Options{
+			MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+			MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
+		},
+		Bootstrap: bootstrap,
+		Authority: sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1,
+			SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		},
+		Apply: apply,
+	})
+	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) ||
+		errors.Is(err, raftstore.ErrPlatformUnsupported) {
+		t.Skipf("RF3 strict durable allocation unsupported: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRaw, err := vibejson.Marshal(&prepared.Base)
+	if err != nil {
+		_ = prepared.Close()
+		t.Fatal(err)
+	}
+	applyRaw, err := vibejson.Marshal(&prepared.ApplyIdentity)
+	if err != nil {
+		_ = prepared.Close()
+		t.Fatal(err)
+	}
+	root := filepath.Dir(member.ServeManifest)
+	if err = os.WriteFile(filepath.Join(root, "sql-identity.vibejson"), baseRaw, 0o600); err == nil {
+		err = os.WriteFile(filepath.Join(root, "apply-identity.vibejson"), applyRaw, 0o600)
+	}
+	if err = errors.Join(err, prepared.Close()); err != nil {
+		t.Fatal(err)
 	}
 }
 

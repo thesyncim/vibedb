@@ -4,14 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -143,7 +146,7 @@ func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
 	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
-	catalogBootstrapIfMissing := fs.Bool("catalog-bootstrap-if-missing", false, "atomically publish the generation-one catalog file only when replicated authority is empty")
+	catalogBootstrapMarker := fs.String("catalog-bootstrap-marker", "", "absolute durable one-shot marker authorizing an empty replicated catalog bootstrap")
 	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
 	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
 	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
@@ -181,7 +184,7 @@ func runServe(args []string) int {
 		return 2
 	}
 	if *devStaticCatalog {
-		if !*devPlaintext || *catalogBootstrapIfMissing || *catalogRelation != 0 ||
+		if !*devPlaintext || *catalogBootstrapMarker != "" || *catalogRelation != 0 ||
 			*hotShardCapacity != "" || *durableAckKeyPath != "" {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
@@ -189,6 +192,9 @@ func runServe(args []string) int {
 	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
 		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *durableAckKeyPath == "" || *controllerInterval <= 0 ||
 		*catalogSessionLease <= 0 || *hotShardInterval <= 0 ||
+		(*catalogBootstrapMarker != "" && (!filepath.IsAbs(*catalogBootstrapMarker) ||
+			filepath.Clean(*catalogBootstrapMarker) != *catalogBootstrapMarker ||
+			*catalogBootstrapMarker == string(filepath.Separator))) ||
 		len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
 		fmt.Fprintln(os.Stderr, "gateway: replicated catalog relation, identities, journal, and positive bounds are required")
 		return 2
@@ -322,7 +328,7 @@ func runServe(args []string) int {
 		}
 		exec, holder, catalogAuthority, replicated, replicatedPool, err = newReplicatedCatalogGateway(
 			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
-			internalAuthority, *catalogBootstrapIfMissing,
+			internalAuthority, *catalogBootstrapMarker,
 			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
 			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
 			*catalogSessionJournal, clientID, retryHome, *catalogSessionLease,
@@ -650,7 +656,7 @@ func newReplicatedCatalogGateway(
 	tlsProfile *rafttransport.PeerTLS,
 	devPlaintext bool,
 	internalAuthority serviceauthz.Authority,
-	bootstrapIfMissing bool,
+	bootstrapMarkerPath string,
 	relation replication.RelationID,
 	attempts int,
 	attemptTimeout time.Duration,
@@ -673,6 +679,21 @@ func newReplicatedCatalogGateway(
 	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
+	}
+	var bootstrapDigest [sha256.Size]byte
+	bootstrapMarked := false
+	if bootstrapMarkerPath != "" {
+		bootstrapRaw, encodeErr := gateway.AppendSnapshotDocument(nil, bootstrap)
+		if encodeErr != nil {
+			return nil, nil, nil, nil, nil, encodeErr
+		}
+		bootstrapDigest = sha256.Sum256(bootstrapRaw)
+		bootstrapMarked, err = readCatalogBootstrapMarker(
+			bootstrapMarkerPath, bootstrapDigest,
+		)
+		if err != nil {
+			return nil, nil, nil, nil, nil, err
+		}
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 	route, ok := bootstrap.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
@@ -796,8 +817,9 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	if _, err = authority.Read(ctx); err != nil &&
-		(!bootstrapIfMissing || !errors.Is(err, gateway.ErrReplicatedCatalogMissing)) {
+	retained, err := authority.Read(ctx)
+	if err != nil && (bootstrapMarkerPath == "" || bootstrapMarked ||
+		!errors.Is(err, gateway.ErrReplicatedCatalogMissing)) {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
 		}
@@ -821,16 +843,29 @@ func newReplicatedCatalogGateway(
 			}
 			return nil, nil, nil, nil, nil, publishErr
 		}
-		retained, readErr := authority.Read(ctx)
-		want, wantErr := gateway.AppendSnapshotDocument(nil, bootstrap)
-		got, gotErr := gateway.AppendSnapshotDocument(nil, retained)
-		if readErr != nil || wantErr != nil || gotErr != nil || !bytes.Equal(want, got) {
+		retained, err = authority.Read(ctx)
+		if err != nil {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, err
+		}
+	}
+	if bootstrapMarkerPath != "" && !bootstrapMarked {
+		exact, exactErr := exactCatalogSnapshot(retained, bootstrap)
+		if exactErr != nil || !exact {
 			if replicatedPool != nil {
 				_ = replicatedPool.Close()
 			}
 			return nil, nil, nil, nil, nil, errors.Join(
-				readErr, wantErr, gotErr, gateway.ErrReplicatedCatalogConflict,
+				exactErr, gateway.ErrReplicatedCatalogConflict,
 			)
+		}
+		if err = persistCatalogBootstrapMarker(bootstrapMarkerPath, bootstrapDigest); err != nil {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, err
 		}
 	}
 	executor := gateway.NewExecutor(
@@ -842,6 +877,66 @@ func newReplicatedCatalogGateway(
 }
 
 const replicatedCatalogControllerTenant = byte(1)
+
+func exactCatalogSnapshot(left, right *gateway.Snapshot) (bool, error) {
+	leftRaw, leftErr := gateway.AppendSnapshotDocument(nil, left)
+	rightRaw, rightErr := gateway.AppendSnapshotDocument(nil, right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw),
+		errors.Join(leftErr, rightErr)
+}
+
+func readCatalogBootstrapMarker(path string, expected [sha256.Size]byte) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Size() != sha256.Size {
+		return false, errors.Join(err, gateway.ErrReplicatedCatalogConflict)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(raw, expected[:]) {
+		return false, errors.Join(err, gateway.ErrReplicatedCatalogConflict)
+	}
+	return true, nil
+}
+
+func persistCatalogBootstrapMarker(path string, digest [sha256.Size]byte) (resultErr error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		marked, readErr := readCatalogBootstrapMarker(path, digest)
+		if readErr != nil || !marked {
+			return errors.Join(readErr, gateway.ErrReplicatedCatalogConflict)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	published := false
+	defer func() {
+		resultErr = errors.Join(resultErr, file.Close())
+		if !published {
+			resultErr = errors.Join(resultErr, os.Remove(path))
+		}
+	}()
+	if written, writeErr := file.Write(digest[:]); writeErr != nil || written != len(digest) {
+		return errors.Join(writeErr, io.ErrShortWrite)
+	}
+	if err = file.Sync(); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = errors.Join(directory.Sync(), directory.Close())
+	if err != nil {
+		return err
+	}
+	published = true
+	return nil
+}
 
 func decodeFixedHex(encoded string, destination []byte) error {
 	if len(encoded) != hex.EncodedLen(len(destination)) {
