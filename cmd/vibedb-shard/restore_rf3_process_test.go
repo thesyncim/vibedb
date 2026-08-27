@@ -430,6 +430,16 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 			if code := runAdoptRestoredRF3([]string{"-manifest", preparePath}); code != 0 {
 				t.Fatalf("adopt group %d member %d exit=%d", ordinal, member, code)
 			}
+			var restored sqldriver.ReplicatedShardStoreIdentity
+			if err = loadRF3IdentityFile(filepath.Join(memberRoot, "sql-identity.vibejson"), &restored); err != nil {
+				t.Fatal(err)
+			}
+			maximum := restored.UserLimits.MaxDocumentBytes
+			if maximum <= 0 || maximum > replication.MaxMutationValueBytes ||
+				member > 0 && fixture.maxReadValueBytes != uint32(maximum) {
+				t.Fatal("inconsistent restored RF3 read response bound")
+			}
+			fixture.maxReadValueBytes = uint32(maximum)
 			fixture.manifestPaths[member], fixture.walPaths[member] = filepath.Join(memberRoot, "serve-rf3.vibejson"), filepath.Join(memberRoot, "member.wal")
 			fixture.profiles[member], err = servicetls.LoadProfile(fixture.credentials[member].Certificate, fixture.credentials[member].Key, roots, rf3testfixture.ProcessIdentityOID, time.Now)
 			if err != nil {
@@ -816,12 +826,14 @@ func restoreRF3ProposeCommand(t *testing.T, fixture *rf3FaultFixture, leader int
 }
 func restoreRF3ReadRelation(t *testing.T, fixture *rf3FaultFixture, leader int, state shardservice.ReplicatedMemberState, relation replication.RelationID, key, want []byte, found bool) {
 	t.Helper()
-	response, err := fixture.roundTrip(t, leader, &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedReadLeader, Authority: serviceauthz.Authority{Node: fixture.nodes[(leader+1)%3], Generation: 5}, Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence, Relation: relation, Key: key, MaxValueBytes: 4 << 20})
+	request := restoreRF3PointReadRequest(state,
+		serviceauthz.Authority{Node: fixture.nodes[(leader+1)%3], Generation: 5}, relation, key)
+	response, err := fixture.roundTrip(t, leader, request)
 	expected := shardservice.ReplicatedReadMissing
 	if found {
 		expected = shardservice.ReplicatedReadFound
 	}
-	if err != nil || response == nil || response.Kind != expected || response.ReadApplied == 0 || (want != nil && !bytes.Equal(response.Value, want)) {
+	if err != nil || response == nil || response.Kind != expected || response.ReadApplied < request.MinimumApplied || (want != nil && !bytes.Equal(response.Value, want)) {
 		t.Fatalf("ReadIndex relation=%d found=%t: %+v err=%v", relation, found, response, err)
 	}
 }
