@@ -28,6 +28,18 @@ start_port_forward() {
 }
 
 cleanup() {
+  local exit_status=$?
+  if [[ "${exit_status}" -ne 0 && "${cluster_created}" == true ]]; then
+    # Preserve bounded pod/init diagnostics before deleting this test cluster.
+    timeout 10s kubectl --request-timeout=5s get pods -n "${namespace}" -o wide \
+      2>&1 | head -c 1048576 > "${evidence_dir}/failed-pods.txt" || true
+    timeout 10s kubectl --request-timeout=5s get events -n "${namespace}" --sort-by=.lastTimestamp \
+      2>&1 | tail -n 256 | head -c 1048576 > "${evidence_dir}/failed-events.txt" || true
+    timeout 20s kubectl --request-timeout=5s logs -n "${namespace}" \
+      -l 'app.kubernetes.io/name in (vibedb-shard,vibedb-gateway)' \
+      --all-containers=true --tail=100 --limit-bytes=65536 --prefix=true \
+      2>&1 | head -c 1048576 > "${evidence_dir}/failed-containers.txt" || true
+  fi
   if [[ -n "${port_forward_pid}" ]]; then
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
     wait "${port_forward_pid}" >/dev/null 2>&1 || true
@@ -35,10 +47,11 @@ cleanup() {
   if [[ "${cluster_created}" == true ]]; then
     kind delete cluster --name "${cluster_name}" >/dev/null 2>&1 || true
   fi
+  return "${exit_status}"
 }
 trap cleanup EXIT
 
-for command_name in go docker kind kubectl base64; do
+for command_name in go docker kind kubectl base64 timeout; do
   command -v "${command_name}" >/dev/null
 done
 if kind get clusters | grep -Fqx "${cluster_name}"; then

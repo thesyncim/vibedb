@@ -26,4 +26,8 @@ func TestKindQualificationIsolatesDiscoveryAndCleanup(t *testing.T) {
 	if check < 0 || claim <= check || claim >= create || !strings.Contains(script, `if [[ "${cluster_created}" == true ]]; then`+"\n"+`    kind delete cluster --name`) {
 		t.Fatal("cleanup must own the new cluster, never a preexisting one")
 	}
+	if !strings.Contains(script, `local exit_status=$?`) || !strings.Contains(script, `return "${exit_status}"`) ||
+		!strings.Contains(script, "timeout 20s kubectl --request-timeout=5s logs") || !strings.Contains(script, "--tail=100 --limit-bytes=65536") {
+		t.Fatal("failed qualification must retain bounded diagnostics and its failure status")
+	}
 }
