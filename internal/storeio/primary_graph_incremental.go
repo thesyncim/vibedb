@@ -379,6 +379,9 @@ type PrimaryGraphCatalogFolder struct {
 	tablets                []primaryCatalogChild
 	leaves                 []primaryCatalogChild
 	branches               []primaryCatalogChild
+	tabletKeyArena         []byte
+	lastTabletMax          [CommonPrimaryLeafMaxKeyBytes]byte
+	lastTabletMaxLen       int
 	leafPageID             uint32
 	branchPageID           uint32
 	tabletCount            uint32
@@ -537,9 +540,10 @@ func NewPrimaryGraphCatalogFolder(
 	}
 	return &PrimaryGraphCatalogFolder{
 		sink: sink, leafFanout: leafFanout, rootFanout: rootFanout,
-		tablets:  make([]primaryCatalogChild, 0, leafFanout),
-		leaves:   make([]primaryCatalogChild, 0, rootFanout+1),
-		branches: make([]primaryCatalogChild, 0, rootFanout),
+		tablets:        make([]primaryCatalogChild, 0, leafFanout),
+		leaves:         make([]primaryCatalogChild, 0, rootFanout+1),
+		branches:       make([]primaryCatalogChild, 0, rootFanout),
+		tabletKeyArena: make([]byte, 0, leafFanout*CommonPrimaryLeafMaxKeyBytes),
 	}, nil
 }
 
@@ -557,6 +561,39 @@ func (f *PrimaryGraphCatalogFolder) AddTablet(child primaryCatalogChild) error {
 	return nil
 }
 
+// AddTabletRef is the collection-level reconciliation entry point. A caller
+// may replace one tablet repeatedly in its persistent migration vector, then
+// feed only the final witnessed refs into this folder at cutover.
+func (f *PrimaryGraphCatalogFolder) AddTabletRef(
+	tabletID uint32, firstKey, lastKey []byte, ref PageRef,
+) error {
+	if len(firstKey) == 0 || len(lastKey) == 0 ||
+		len(firstKey) > CommonPrimaryLeafMaxKeyBytes ||
+		len(lastKey) > CommonPrimaryLeafMaxKeyBytes ||
+		bytes.Compare(firstKey, lastKey) > 0 {
+		return fmt.Errorf("%w: incremental primary tablet fence", ErrInvalidWrite)
+	}
+	var floorScratch [CommonPrimaryLeafMaxKeyBytes]byte
+	var floor []byte
+	if tabletID != 0 {
+		var err error
+		floor, err = ShortestPrimaryFence(floorScratch[:0], f.lastTabletMax[:f.lastTabletMaxLen], firstKey)
+		if err != nil {
+			return err
+		}
+	}
+	if len(floor) > cap(f.tabletKeyArena)-len(f.tabletKeyArena) {
+		return fmt.Errorf("%w: incremental primary tablet key bound", ErrInvalidWrite)
+	}
+	at := len(f.tabletKeyArena)
+	f.tabletKeyArena = append(f.tabletKeyArena, floor...)
+	err := f.AddTablet(primaryCatalogChild{floor: f.tabletKeyArena[at:len(f.tabletKeyArena):len(f.tabletKeyArena)], id: tabletID, ref: ref})
+	if err == nil {
+		f.lastTabletMaxLen = copy(f.lastTabletMax[:], lastKey)
+	}
+	return err
+}
+
 func (f *PrimaryGraphCatalogFolder) flushCatalogLeaf() error {
 	if len(f.tablets) == 0 {
 		return nil
@@ -569,6 +606,7 @@ func (f *PrimaryGraphCatalogFolder) flushCatalogLeaf() error {
 	}
 	f.leafPageID++
 	f.tablets = f.tablets[:0]
+	f.tabletKeyArena = f.tabletKeyArena[:0]
 	f.leaves = append(f.leaves, child)
 	if !f.branching && len(f.leaves) > f.rootFanout {
 		f.branching = true
