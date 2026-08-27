@@ -1,6 +1,7 @@
 package splitcontroller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardcontrol"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 var (
@@ -111,20 +113,11 @@ func (router *RoutedShardControl) ExecuteShardControl(
 		return shardcontrol.Response{}, errors.Join(ErrShardControlRoute, err)
 	}
 	key := shardControlRouteKey(route)
+	if remoteActionTargetsChild(action.Kind) {
+		return router.executeChildRF3(ctx, route, action, request)
+	}
 	start := router.hintedReplica(key, route.Replicas)
 	attempts := router.attempts
-	if remoteActionTargetsChild(action.Kind) && target.Member != 0 {
-		found := false
-		for index, replica := range route.Replicas {
-			if replica.Member == target.Member {
-				start, attempts, found = index, 1, true
-				break
-			}
-		}
-		if !found {
-			return shardcontrol.Response{}, ErrShardControlRoute
-		}
-	}
 	var joined error
 	sawNotLeader := false
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -157,6 +150,101 @@ func (router *RoutedShardControl) ExecuteShardControl(
 		return shardcontrol.Response{}, errors.Join(ErrShardControlNotLeader, joined)
 	}
 	return shardcontrol.Response{}, errors.Join(ErrShardControlUnavailable, joined)
+}
+
+type childRF3Result struct {
+	response shardcontrol.Response
+	err      error
+}
+
+func (router *RoutedShardControl) executeChildRF3(
+	ctx context.Context,
+	route gateway.ReplicatedRoute,
+	action Action,
+	request shardcontrol.Request,
+) (shardcontrol.Response, error) {
+	results := make(chan childRF3Result, len(route.Replicas))
+	for index := range route.Replicas {
+		endpoint := route.Replicas[index]
+		memberRequest, err := retargetRemoteChildRequest(request, endpoint.Member)
+		if err != nil {
+			return shardcontrol.Response{}, err
+		}
+		go func() {
+			var joined error
+			for attempt := 0; attempt < router.attempts; attempt++ {
+				if cause := context.Cause(ctx); cause != nil {
+					results <- childRF3Result{err: errors.Join(joined, cause)}
+					return
+				}
+				attemptContext, cancel := context.WithTimeout(ctx, router.timeout)
+				response, roundTripErr := router.client.DoShardControl(attemptContext, endpoint, memberRequest)
+				cancel()
+				if roundTripErr != nil {
+					joined = errors.Join(joined, roundTripErr)
+					continue
+				}
+				if response.Operation != memberRequest.Operation || response.Step != memberRequest.Step {
+					results <- childRF3Result{err: errors.Join(ErrShardControlRoute, shardcontrol.ErrWire)}
+					return
+				}
+				if response.Code == shardcontrol.ResultRetry || response.Code == shardcontrol.ResultNotLeader {
+					continue
+				}
+				if response.Code != shardcontrol.ResultAccepted {
+					results <- childRF3Result{response: response}
+					return
+				}
+				results <- childRF3Result{response: response}
+				return
+			}
+			results <- childRF3Result{err: errors.Join(ErrShardControlUnavailable, joined)}
+		}()
+	}
+	var accepted shardcontrol.Response
+	var joined error
+	for range route.Replicas {
+		result := <-results
+		if result.err != nil || result.response.Code != shardcontrol.ResultAccepted {
+			joined = errors.Join(joined, result.err, ErrShardControlUnavailable)
+			continue
+		}
+		if accepted.Code == 0 {
+			accepted = result.response
+		} else if accepted.Operation != result.response.Operation || accepted.Step != result.response.Step ||
+			accepted.ResultDigest != result.response.ResultDigest ||
+			!bytes.Equal(accepted.Payload, result.response.Payload) {
+			joined = errors.Join(joined, ErrShardControlRoute)
+		}
+	}
+	if joined != nil || accepted.Code != shardcontrol.ResultAccepted ||
+		accepted.Operation != request.Operation || accepted.Step != request.Step {
+		return shardcontrol.Response{}, errors.Join(ErrShardControlUnavailable, joined)
+	}
+	return accepted, nil
+}
+
+func retargetRemoteChildRequest(
+	request shardcontrol.Request, member uint64,
+) (shardcontrol.Request, error) {
+	if member == 0 {
+		return shardcontrol.Request{}, ErrShardControlRoute
+	}
+	payload, err := openRemoteStepPayload(request)
+	if err != nil || !remoteActionTargetsChild(ActionKind(request.Action)) {
+		return shardcontrol.Request{}, errors.Join(ErrShardControlRoute, err)
+	}
+	payload.Target.Member = member
+	raw, err := vibejson.Marshal(&payload)
+	if err != nil {
+		return shardcontrol.Request{}, err
+	}
+	raw, err = vibejson.AppendCanonicalize(nil, raw)
+	if err != nil || len(raw) == 0 || len(raw) > MaxRemoteStepPayloadBytes {
+		return shardcontrol.Request{}, errors.Join(ErrShardControlRoute, err)
+	}
+	request.Payload = raw
+	return request, nil
 }
 
 func validShardControlRoute(route gateway.ReplicatedRoute, target ShardActionTarget) bool {
