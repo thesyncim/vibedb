@@ -135,6 +135,62 @@ jobs:
           path: ${{ runner.temp }}/replica-replacement
           if-no-files-found: error
           retention-days: 30
+      - name: Prepare write-driven hot-shard qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/hot-shard-mutation"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          test_name='TestGatewayHotShardMutationProcesses'
+          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+      - name: Write-driven hot-shard process qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          VIBEDB_HOT_SHARD_MUTATION_E2E: "1"
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout=6m \
+            -run '^TestGatewayHotShardMutationProcesses$' \
+            ./cmd/vibedb-gateway \
+            | tee "${RUNNER_TEMP}/hot-shard-mutation/go-test.jsonl"
+      - name: Validate write-driven hot-shard evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/hot-shard-mutation"
+          result="${evidence}/go-test.jsonl"
+          test_name='TestGatewayHotShardMutationProcesses'
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 16777216
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${result}" | wc -l)" -eq 1
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${result}" >/dev/null; then
+            echo "write-driven hot-shard qualification skipped" >&2
+            exit 1
+          fi
+          jq -e --arg test_name "${test_name}" \
+            'select(.Action == "output" and .Test == $test_name and
+              (.Output | contains("write-driven hot move:")))' \
+            "${result}" >/dev/null
+      - name: Upload write-driven hot-shard evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hot-shard-mutation-${{ github.sha }}
+          path: ${{ runner.temp }}/hot-shard-mutation
+          if-no-files-found: error
+          retention-days: 30
       - name: RF3 external-process fault evidence
         if: matrix.runner == 'ubuntu-latest'
         run: |

@@ -40,6 +40,9 @@ import (
 // RF3 shard. It uses two data groups, a distinct request-ledger/catalog group,
 // and an enrolled cold target: ten shard processes plus the real gateway.
 func TestGatewayHotShardMutationProcesses(t *testing.T) {
+	if os.Getenv("VIBEDB_HOT_SHARD_MUTATION_E2E") != "1" {
+		t.Skip("set VIBEDB_HOT_SHARD_MUTATION_E2E=1 for external mutation qualification")
+	}
 	if testing.Short() {
 		t.Skip("external ten-process RF3 mutation qualification")
 	}
