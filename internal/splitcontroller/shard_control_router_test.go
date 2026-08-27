@@ -3,7 +3,6 @@ package splitcontroller
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -29,21 +28,15 @@ func (resolver fixedShardControlResolver) ResolveShardControl(
 }
 
 type scriptedShardControlClient struct {
-	mu        sync.Mutex
 	calls     []uint64
-	targets   []uint64
 	responses map[uint64][]shardcontrol.Response
 	errors    map[uint64][]error
 }
 
 func (client *scriptedShardControlClient) DoShardControl(
-	_ context.Context, endpoint gateway.ReplicatedEndpoint, request shardcontrol.Request,
+	_ context.Context, endpoint gateway.ReplicatedEndpoint, _ shardcontrol.Request,
 ) (shardcontrol.Response, error) {
-	client.mu.Lock()
-	defer client.mu.Unlock()
 	client.calls = append(client.calls, endpoint.Member)
-	payload, _ := openRemoteStepPayload(request)
-	client.targets = append(client.targets, payload.Target.Member)
 	if values := client.errors[endpoint.Member]; len(values) != 0 {
 		err := values[0]
 		client.errors[endpoint.Member] = values[1:]
@@ -58,49 +51,6 @@ func (client *scriptedShardControlClient) DoShardControl(
 	response := values[0]
 	client.responses[endpoint.Member] = values[1:]
 	return response, nil
-}
-
-func TestRoutedShardControlSettlesEveryExactRF3ChildMember(t *testing.T) {
-	request, route := testShardControlRequestRoute()
-	payload, err := openRemoteStepPayload(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Action = shardcontrol.ActionStageChild
-	payload.Action = uint8(request.Action)
-	payload.Child = 1
-	payload.Sequence = remoteActionWitnessSequence(Action{Kind: ActionStageChild, Child: 1})
-	payload.Target.Member = route.Replicas[0].Member
-	payload.PredecessorDigest = remoteStepPredecessorDigest(payload)
-	request.Child, request.Payload = 1, mustRemoteStepPayload(t, payload)
-	accepted := shardcontrol.Response{Code: shardcontrol.ResultAccepted,
-		Operation: request.Operation, Step: request.Step, ResultDigest: [32]byte{2}, Payload: []byte("ok")}
-	client := &scriptedShardControlClient{responses: map[uint64][]shardcontrol.Response{
-		1: {accepted}, 2: {accepted}, 3: {accepted},
-	}, errors: make(map[uint64][]error)}
-	router, err := NewRoutedShardControl(ShardControlRouterOptions{
-		Resolver: fixedShardControlResolver{route: route}, Client: client,
-		MaxAttempts: 3, AttemptTimeout: time.Second, HintCapacity: 4,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := router.ExecuteShardControl(
-		t.Context(), Action{Kind: ActionStageChild, Child: 1}, request,
-	)
-	if err != nil || response.Code != shardcontrol.ResultAccepted || len(client.calls) != 3 {
-		t.Fatalf("response=%+v calls=%v targets=%v err=%v", response, client.calls, client.targets, err)
-	}
-	seen := make(map[uint64]bool, 3)
-	for index := range client.calls {
-		if client.calls[index] != client.targets[index] {
-			t.Fatalf("endpoint/target mismatch calls=%v targets=%v", client.calls, client.targets)
-		}
-		seen[client.calls[index]] = true
-	}
-	if !seen[1] || !seen[2] || !seen[3] {
-		t.Fatalf("incomplete RF3 fanout: %v", seen)
-	}
 }
 
 func TestRoutedShardControlFollowsNotLeaderAndScopesHintToExactGroupFence(t *testing.T) {

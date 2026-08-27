@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/shardcontrol"
@@ -48,25 +49,47 @@ func ExecuteCoordinatedReplicatedStep(
 					if !ok || len(target.Replicas) != gateway.ServingReplicaCount {
 						return ErrRemoteExecution
 					}
-					for _, replica := range target.Replicas {
+					type childRequest struct {
+						request shardcontrol.Request
+						err     error
+					}
+					requests := make([]childRequest, len(target.Replicas))
+					for index, replica := range target.Replicas {
 						destination, targetErr := remoteActionTargetForChildReplica(plan, action.Child, replica)
 						if targetErr != nil {
 							return targetErr
 						}
-						request, requestErr := appendRemoteStepRequestForTarget(
+						requests[index].request, requests[index].err = appendRemoteStepRequestForTarget(
 							nil, plan, observed, action, destination,
 						)
-						if requestErr != nil {
-							return errors.Join(ErrRemoteExecution, requestErr)
+						if requests[index].err != nil {
+							return errors.Join(ErrRemoteExecution, requests[index].err)
 						}
-						response, requestErr := router.ExecuteShardControl(ctx, action, request)
-						if requestErr != nil {
-							return requestErr
-						}
-						if response.Code != shardcontrol.ResultAccepted || response.Operation != request.Operation ||
-							response.Step != request.Step {
-							return ErrRemoteExecution
-						}
+					}
+					var group sync.WaitGroup
+					group.Add(len(requests))
+					for index := range requests {
+						go func(index int) {
+							defer group.Done()
+							request := requests[index].request
+							response, requestErr := router.ExecuteShardControl(ctx, action, request)
+							if requestErr != nil {
+								requests[index].err = requestErr
+								return
+							}
+							if response.Code != shardcontrol.ResultAccepted || response.Operation != request.Operation ||
+								response.Step != request.Step {
+								requests[index].err = ErrRemoteExecution
+							}
+						}(index)
+					}
+					group.Wait()
+					var joined error
+					for index := range requests {
+						joined = errors.Join(joined, requests[index].err)
+					}
+					if joined != nil {
+						return joined
 					}
 					return nil
 				}
