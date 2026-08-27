@@ -39,7 +39,7 @@ type nativeSQLBatchWireResponse struct {
 func buildNativeSQLBatchReadRequest(
 	request serveRequest,
 ) (gateway.ReplicatedSQLBatchReadRequest, error) {
-	if request.Op != "read_batch" || request.SQL != "" || len(request.Params) != 0 ||
+	if request.Op != "read_batch" || request.hasSQL() || len(request.Params) != 0 ||
 		request.RequestID != "" || len(request.Statements) == 0 || request.MaxResultBytes == 0 {
 		return gateway.ReplicatedSQLBatchReadRequest{}, errInvalidNativeDataRequest
 	}
@@ -50,11 +50,11 @@ func buildNativeSQLBatchReadRequest(
 	queries := make([]gateway.Query, len(request.Statements))
 	for index := range request.Statements {
 		params, paramErr := buildParams(request.Statements[index].Params)
-		if paramErr != nil || request.Statements[index].SQL == "" {
+		if paramErr != nil || request.Statements[index].sqlText() == "" {
 			return gateway.ReplicatedSQLBatchReadRequest{}, errInvalidNativeDataRequest
 		}
 		queries[index] = gateway.Query{
-			SQL: request.Statements[index].SQL, Params: params, Class: class,
+			SQL: request.Statements[index].sqlText(), Params: params, Class: class,
 		}
 	}
 	return gateway.ReplicatedSQLBatchReadRequest{

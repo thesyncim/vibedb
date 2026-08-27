@@ -12,7 +12,7 @@ func validGatewayMetricsRequest(request serveRequest) bool {
 	return request.Op == "metrics" && request.RequestID == "" && request.InstallationID == "" &&
 		request.IssuerEpoch == 0 && request.LaneOrdinal == 0 && request.GrantDigest == "" &&
 		request.IssuerSequence == 0 && request.IssuerLane == "" &&
-		request.IssuerAuthenticator == "" && request.SQL == "" && request.Class == "" &&
+		request.IssuerAuthenticator == "" && !request.hasSQL() && request.Class == "" &&
 		request.MaxResultBytes == 0 && len(request.Params) == 0 && len(request.Statements) == 0
 }
 

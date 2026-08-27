@@ -81,18 +81,28 @@ type serveRequest struct {
 	BackupID       string           `json:"backup_id,omitempty"`
 	Params         []serveParam     `json:"params,omitempty"`
 	Statements     []serveStatement `json:"statements,omitempty"`
+
+	// wireIdentity is populated directly into fixed storage by the compiled
+	// ingress decoder. It avoids materializing three hexadecimal identities as
+	// strings and avoids decoding a structured exec_batch twice.
+	wireIdentity    durableExecBatchIdentity
+	wireIdentitySet bool
+	wireSQL         []byte
 }
 
 type serveStatement struct {
-	SQL    string       `json:"sql"`
-	Params []serveParam `json:"params,omitempty"`
+	SQL     string       `json:"sql"`
+	Params  []serveParam `json:"params,omitempty"`
+	wireSQL []byte
 }
 
 // serveParam is one typed bound parameter in placeholder order.
 type serveParam struct {
-	Kind string `json:"kind"`
-	Bool bool   `json:"bool,omitempty"`
-	Text string `json:"text,omitempty"`
+	Kind     string `json:"kind"`
+	Bool     bool   `json:"bool,omitempty"`
+	Text     string `json:"text,omitempty"`
+	wireKind serveParamKind
+	wireText []byte
 }
 
 // serveResponse is the merged reply plus the routing metadata a client reads for
@@ -1335,10 +1345,11 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 	writer := vibejson.NewWriter(conn)
 	var nativeRequest nativeDataWireRequest
 	var nativeResponseScratch nativeDataResponseScratch
+	var req serveRequest
+	var requestScratch serveRequestDecodeScratch
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		structuredExecCandidate := durableExecBatchRequestCandidate(line)
-		structuredExecValid := structuredExecCandidate && validateDurableExecBatchEnvelope(line) == nil
 		backupCandidate := gatewayBackupRequestCandidate(line)
 		backupValid := backupCandidate && validateGatewayBackupEnvelope(line) == nil
 		if issuerOpenRequestCandidate(line) {
@@ -1448,10 +1459,21 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			}
 			continue
 		}
-		var req serveRequest
-		if err := vibejson.Unmarshal(line, &req); err != nil {
+		var decodeErr error
+		if structuredExecCandidate {
+			decodeErr = decodeDurableExecBatchRequest(line, &req, &requestScratch)
+			if decodeErr != nil {
+				// Preserve the public error-response contract for malformed
+				// structured input. Valid exec_batch requests take exactly one
+				// decode pass; only rejected input pays this diagnostic fallback.
+				decodeErr = decodeServeRequest(line, &req, &requestScratch)
+			}
+		} else {
+			decodeErr = decodeServeRequest(line, &req, &requestScratch)
+		}
+		if decodeErr != nil {
 			if ctx.Err() == nil {
-				logf("gateway: decode request: %v", err)
+				logf("gateway: decode request: %v", decodeErr)
 			}
 			return
 		}
@@ -1559,7 +1581,7 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			// presence must never be inferred from decoded nonzero values: an
 			// explicit zero/empty field is malformed structured input, not a
 			// downgrade to the legacy unsequenced executor.
-			if !structuredExecCandidate || !structuredExecValid {
+			if !structuredExecCandidate || !req.wireIdentitySet {
 				if writeServeResponse(writer, &serveResponse{Error: errInvalidDurableExecBatch.Error()}) != nil {
 					return
 				}
@@ -1666,11 +1688,11 @@ func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
 		return serviceauthz.CapabilityBackup
 	}
 	var required serviceauthz.Capability
-	if request.SQL != "" {
-		required = serviceauthz.SQLCapability(request.SQL)
+	if request.hasSQL() {
+		required = serviceauthz.SQLCapability(request.sqlText())
 	}
 	for index := range request.Statements {
-		required |= serviceauthz.SQLCapability(request.Statements[index].SQL)
+		required |= serviceauthz.SQLCapability(request.Statements[index].sqlText())
 	}
 	return required
 }
@@ -1912,7 +1934,7 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 }
 
 func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
-	if req.SQL != "" || len(req.Params) != 0 || req.MaxResultBytes != 0 {
+	if req.hasSQL() || len(req.Params) != 0 || req.MaxResultBytes != 0 {
 		return nil, errors.New("exec_batch uses statements instead of top-level sql or params")
 	}
 	if len(req.Statements) == 0 {
@@ -1928,7 +1950,7 @@ func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
 		if err != nil {
 			return nil, fmt.Errorf("statement %d: %w", i, err)
 		}
-		queries[i] = gateway.Query{SQL: req.Statements[i].SQL, Params: params, Class: class}
+		queries[i] = gateway.Query{SQL: req.Statements[i].sqlText(), Params: params, Class: class}
 	}
 	return queries, nil
 }
@@ -1949,7 +1971,7 @@ func buildQuery(req serveRequest) (gateway.Query, error) {
 		return gateway.Query{}, err
 	}
 	return gateway.Query{
-		SQL:    req.SQL,
+		SQL:    req.sqlText(),
 		Params: params,
 		Class:  class,
 	}, nil
@@ -1963,17 +1985,32 @@ func buildParams(in []serveParam) ([]shardservice.Param, error) {
 	}
 	out := make([]shardservice.Param, len(in))
 	for i, p := range in {
-		switch p.Kind {
-		case "null":
+		kind := p.wireKind
+		if kind == 0 {
+			switch p.Kind {
+			case "null":
+				kind = serveParamNull
+			case "bool":
+				kind = serveParamBool
+			case "number":
+				kind = serveParamNumber
+			case "string":
+				kind = serveParamString
+			case "document":
+				kind = serveParamDocument
+			}
+		}
+		switch kind {
+		case serveParamNull:
 			out[i] = shardservice.NullParam()
-		case "bool":
+		case serveParamBool:
 			out[i] = shardservice.BoolParam(p.Bool)
-		case "number":
-			out[i] = shardservice.NumberParam(p.Text)
-		case "string":
-			out[i] = shardservice.StringParam(p.Text)
-		case "document":
-			out[i] = shardservice.DocumentParam(p.Text)
+		case serveParamNumber:
+			out[i] = shardservice.NumberParam(p.textValue())
+		case serveParamString:
+			out[i] = shardservice.StringParam(p.textValue())
+		case serveParamDocument:
+			out[i] = shardservice.DocumentParam(p.textValue())
 		default:
 			return nil, fmt.Errorf("unknown parameter kind %q", p.Kind)
 		}

@@ -12,6 +12,8 @@ var errInvalidDurableExecBatch = errors.New("gateway: invalid structured exec_ba
 
 type durableExecBatchEnvelope struct {
 	Identity durableExecBatchIdentity
+	Request  *serveRequest
+	Scratch  *serveRequestDecodeScratch
 }
 
 var durableExecBatchFields = vibejson.MakeFieldSet(
@@ -21,7 +23,7 @@ var durableExecBatchFields = vibejson.MakeFieldSet(
 
 var durableExecBatchDecoder = func() vibejson.Decoder[durableExecBatchEnvelope] {
 	decoder, err := vibejson.CompileDecoder[durableExecBatchEnvelope](vibejson.DecoderOptions{
-		MaxDepth: 32, ZeroCopy: true, CaseSensitive: true, Replace: true,
+		MaxDepth: 32, ZeroCopy: true, CaseSensitive: true,
 	})
 	if err != nil {
 		panic(err)
@@ -33,18 +35,41 @@ func validateDurableExecBatchEnvelope(raw []byte) error {
 	if len(raw) == 0 || len(raw) > maxServeRequestBytes {
 		return errInvalidDurableExecBatch
 	}
-	var envelope durableExecBatchEnvelope
-	if durableExecBatchDecoder.Decode(raw, &envelope) != nil ||
-		!validDurableExecBatchIdentity(envelope.Identity) {
+	var request serveRequest
+	var scratch serveRequestDecodeScratch
+	if decodeDurableExecBatchRequest(raw, &request, &scratch) != nil {
 		return errInvalidDurableExecBatch
 	}
+	return nil
+}
+
+func decodeDurableExecBatchRequest(raw []byte, request *serveRequest,
+	scratch *serveRequestDecodeScratch) error {
+	if request == nil || scratch == nil || len(raw) == 0 || len(raw) > maxServeRequestBytes {
+		return errInvalidDurableExecBatch
+	}
+	resetServeRequestScratch(scratch, len(raw))
+	*request = serveRequest{}
+	scratch.durableTarget.Request = request
+	scratch.durableTarget.Scratch = scratch
+	if durableExecBatchDecoder.Decode(raw, &scratch.durableTarget) != nil ||
+		!validDurableExecBatchIdentity(scratch.durableTarget.Identity) || len(request.Statements) == 0 {
+		return errInvalidDurableExecBatch
+	}
+	request.Op = "exec_batch"
+	request.wireIdentity = scratch.durableTarget.Identity
+	request.wireIdentitySet = true
 	return nil
 }
 
 func (envelope *durableExecBatchEnvelope) UnmarshalVibeJSON(
 	cursor vibejson.DecodeCursor,
 ) (vibejson.DecodeCursor, error) {
-	*envelope = durableExecBatchEnvelope{}
+	request, scratch := envelope.Request, envelope.Scratch
+	*envelope = durableExecBatchEnvelope{Request: request, Scratch: scratch}
+	if request == nil || scratch == nil {
+		return cursor, errInvalidDurableExecBatch
+	}
 	if cursor.BeginObject("structured exec_batch") != nil ||
 		!cursor.Field(true, durableExecBatchFields.Field(0)) {
 		return cursor, errInvalidDurableExecBatch
@@ -87,12 +112,13 @@ func (envelope *durableExecBatchEnvelope) UnmarshalVibeJSON(
 			bytes.Equal(class, []byte("batch")) || bytes.Equal(class, []byte("admin"))) {
 			return cursor, errInvalidDurableExecBatch
 		}
+		request.Class = serveBorrowedString(class)
 	}
 	if !cursor.Field(false, durableExecBatchFields.Field(8)) {
 		return cursor, errInvalidDurableExecBatch
 	}
-	statements, err := cursor.Raw()
-	if err != nil || len(statements.Bytes()) == 0 || statements.Bytes()[0] != '[' ||
+	cursor, err = decodeServeStatements(cursor, request, scratch)
+	if err != nil || len(request.Statements) == 0 ||
 		!cursor.ExpectObjectClose() || !validDurableExecBatchIdentity(envelope.Identity) {
 		return cursor, errInvalidDurableExecBatch
 	}

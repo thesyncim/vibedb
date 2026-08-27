@@ -13,6 +13,13 @@ func structuredExecBatchIdentity(request *serveRequest) (durableExecBatchIdentit
 	if request == nil || request.Op != "exec_batch" {
 		return durableExecBatchIdentity{}, false
 	}
+	if request.wireIdentitySet {
+		if request.IssuerLane != "" || request.IssuerAuthenticator != "" ||
+			!validDurableExecBatchIdentity(request.wireIdentity) {
+			return durableExecBatchIdentity{}, false
+		}
+		return request.wireIdentity, true
+	}
 	structured := request.InstallationID != "" || request.IssuerEpoch != 0 ||
 		request.GrantDigest != "" || request.IssuerSequence != 0
 	if !structured {
