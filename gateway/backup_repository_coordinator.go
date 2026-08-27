@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 )
 
 // BackupRepositoryCoordinator composes the replicated catalog lifecycle with
@@ -28,6 +29,10 @@ type RestoreStagingOptions struct {
 	MaxArtifactBytes         uint64
 	MaxTotalBytes            uint64
 	PayloadBuffer            []byte
+}
+
+type BackupLeaderResolver interface {
+	ResolveBackupLeader(context.Context, raftmember.GroupKey) (uint64, clusterbackup.LiveArtifactExporter, error)
 }
 
 func NewBackupRepositoryCoordinator(lifecycle *BackupOperationController,
@@ -114,6 +119,30 @@ func (coordinator *BackupRepositoryCoordinator) CollectLive(ctx context.Context,
 		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, err
 	}
 	return exported, certificate, nil
+}
+
+// CollectFromLeaders resolves every group in the immutable catalog inventory
+// before starting publication. Resolution may perform bounded NotLeader
+// retries, but the returned source member is authenticated again by the shard
+// service and by repository evidence.
+func (coordinator *BackupRepositoryCoordinator) CollectFromLeaders(ctx context.Context,
+	record ReplicatedOperationRecord, cut clusterbackup.CatalogCut, resolver BackupLeaderResolver,
+) (ReplicatedOperationRecord, clusterbackup.Certificate, error) {
+	if ctx == nil || resolver == nil || len(cut.Groups) == 0 || len(cut.Groups) != int(record.Cursor[1]) {
+		return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, ErrBackupOperation
+	}
+	sources := make([]clusterbackup.LiveArtifactSource, len(cut.Groups))
+	for index, group := range cut.Groups {
+		if cause := context.Cause(ctx); cause != nil {
+			return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, cause
+		}
+		member, exporter, err := resolver.ResolveBackupLeader(ctx, group)
+		if err != nil || member == 0 || exporter == nil {
+			return ReplicatedOperationRecord{}, clusterbackup.Certificate{}, errors.Join(ErrBackupOperation, err)
+		}
+		sources[index] = clusterbackup.LiveArtifactSource{Group: group, SourceMember: member, Exporter: exporter}
+	}
+	return coordinator.CollectLive(ctx, record, cut, sources)
 }
 
 // StageRestore verifies every artifact from the coordinator-owned immutable
