@@ -109,23 +109,24 @@ type serveParam struct {
 // observability. Rows carries each cell as raw JSON (a null cell is the JSON
 // literal null); Error is set instead when the operation failed.
 type serveResponse struct {
-	Kind           string                          `json:"kind,omitempty"`
-	Columns        []string                        `json:"columns,omitempty"`
-	Rows           [][]serveRawValue               `json:"rows,omitempty"`
-	RowsAffected   int64                           `json:"rows_affected,omitempty"`
-	Route          string                          `json:"route,omitempty"`
-	Generation     uint64                          `json:"generation,omitempty"`
-	ShardsFanned   int                             `json:"shards_fanned,omitempty"`
-	Retries        int                             `json:"retries,omitempty"`
-	TransactionID  replication.ID128               `json:"-"`
-	Committed      bool                            `json:"committed,omitempty"`
-	OutcomeUnknown bool                            `json:"outcome_unknown,omitempty"`
-	DurableAck     *durableExecBatchAckWireRequest `json:"-"`
-	Metrics        *gateway.MetricsSnapshot        `json:"metrics,omitempty"`
-	BackupID       [32]byte                        `json:"-"`
-	BackupStage    uint64                          `json:"backup_stage,omitempty"`
-	BackupProof    [32]byte                        `json:"-"`
-	Error          string                          `json:"error,omitempty"`
+	Kind               string                          `json:"kind,omitempty"`
+	Columns            []string                        `json:"columns,omitempty"`
+	Rows               [][]serveRawValue               `json:"rows,omitempty"`
+	RowsAffected       int64                           `json:"rows_affected,omitempty"`
+	Route              string                          `json:"route,omitempty"`
+	Generation         uint64                          `json:"generation,omitempty"`
+	ShardsFanned       int                             `json:"shards_fanned,omitempty"`
+	Retries            int                             `json:"retries,omitempty"`
+	TransactionID      replication.ID128               `json:"-"`
+	Committed          bool                            `json:"committed,omitempty"`
+	OutcomeUnknown     bool                            `json:"outcome_unknown,omitempty"`
+	DurableAck         *durableExecBatchAckWireRequest `json:"-"`
+	Metrics            *gateway.MetricsSnapshot        `json:"metrics,omitempty"`
+	DistributedMetrics *gateway.DistributedMetrics     `json:"-"`
+	BackupID           [32]byte                        `json:"-"`
+	BackupStage        uint64                          `json:"backup_stage,omitempty"`
+	BackupProof        [32]byte                        `json:"-"`
+	Error              string                          `json:"error,omitempty"`
 }
 
 var errServeResponseTransactionState = errors.New(
@@ -487,6 +488,8 @@ func runServe(args []string) (exitCode int) {
 	var splitControllerDone <-chan struct{}
 	var splitRuntime *gatewayServingSplitRuntime
 	var backupOperator gatewayBackupOperator
+	var distributedMetrics *gateway.DistributedMetrics
+	var distributedMetricsConcurrency int
 	if replicaControlManifest != nil {
 		manifest := *replicaControlManifest
 		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
@@ -498,6 +501,10 @@ func runServe(args []string) (exitCode int) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 			}, manifest.Shards, int(manifest.Bounds.MaxConnections),
 		)
+		distributedMetrics, metricsErr := newGatewayDistributedMetrics(holder.Current(), shardOpener)
+		if distributedMetrics != nil {
+			distributedMetricsConcurrency = min(distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
+		}
 		trust := tlsProfile.LocalIdentity().TrustDomain
 		drainer, drainErr := newGatewayClusterDrainCertifier(
 			trust, tlsProfile, handshakeDeadline, readDeadline, writeDeadline,
@@ -599,7 +606,7 @@ func runServe(args []string) (exitCode int) {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, childPrepareErr, splitFactoryErr,
+		if joined := errors.Join(openErr, metricsErr, drainErr, splitErr, controlsErr, childPrepareErr, splitFactoryErr,
 			controllerErr, hotShardBindErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr, backupErr); joined != nil {
 			if backupRepository != nil {
@@ -670,6 +677,16 @@ func runServe(args []string) (exitCode int) {
 		return 1
 	}
 	ctx = withGatewayBackupOperator(ctx, backupOperator)
+	ctx = withGatewayDistributedMetrics(ctx, distributedMetrics)
+	if distributedMetrics != nil {
+		go func() {
+			if metricsErr := distributedMetrics.RunRefresh(ctx, *controllerInterval,
+				distributedMetricsConcurrency); metricsErr != nil && ctx.Err() == nil {
+				logf("gateway: distributed metrics refresh: %v", metricsErr)
+				stop()
+			}
+		}()
+	}
 	if hotShardRuntime != nil {
 		hotShardDone = runGatewayHotShardPublisher(
 			ctx, hotShardRuntime, *hotShardInterval, logf,
@@ -1557,7 +1574,8 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 				continue
 			}
 			metrics := exec.Metrics()
-			if writeServeResponse(writer, &serveResponse{Metrics: &metrics}) != nil {
+			if writeServeResponse(writer, &serveResponse{Metrics: &metrics,
+				DistributedMetrics: gatewayDistributedMetricsFromContext(ctx)}) != nil {
 				return
 			}
 			continue
@@ -1860,6 +1878,11 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 	}
 	if resp.Metrics != nil {
 		if err := writeGatewayMetrics(w, *resp.Metrics); err != nil {
+			return err
+		}
+	}
+	if resp.DistributedMetrics != nil {
+		if err := writeGatewayDistributedMetrics(w, resp.DistributedMetrics); err != nil {
 			return err
 		}
 	}
