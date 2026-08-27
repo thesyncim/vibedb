@@ -533,6 +533,18 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 	}
 	fence.ProtectionEpoch, fence.OwnershipEpoch, fence.RoutingVersion, fence.RouteGeneration = 1, 1, 1, 1
 	fence.ReplicaSetVersion = 1
+	// Source artifact validation remains tied to its original binding. The
+	// fresh catalog must instead seal the machine schema digest at the reset
+	// target authority; unchanged SQL definitions do not imply equal digests.
+	freshBinding := prepared.Base.Binding
+	freshBinding.Authority.ProtectionEpoch, freshBinding.Authority.OwnershipEpoch = 1, 1
+	freshBinding.Authority.RoutingVersion, freshBinding.Authority.RouteGeneration = 1, 1
+	fence.RelationManifestDigest, err = prepared.Database.ReplicatedRelationManifestForBinding(
+		prepared.Base, prepared.ApplyIdentity.Placement, freshBinding,
+	)
+	if err != nil {
+		t.Fatalf("fresh target group %d schema: %v", ordinal, err)
+	}
 	cut, err := prepared.Apply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
