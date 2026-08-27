@@ -783,6 +783,36 @@ func (session *NativeSession) Release(ctx context.Context) (NativeResult, error)
 	return session.prepareAndExecute(ctx, command, true)
 }
 
+// RetireReleaseAndDestroy settles the exact durable session lifecycle before a
+// controller abandons its current routing binding. Every outcome-unknown phase
+// remains in the journal for byte-identical retry. The journal is removed only
+// after replicated Release has settled, which makes a fresh session with the
+// same client identity safe on the replacement binding.
+func (session *NativeSession) RetireReleaseAndDestroy(ctx context.Context) error {
+	if session == nil || ctx == nil || session.journal == nil {
+		return ErrNativeSession
+	}
+	if session.pending {
+		if _, err := session.RetryPending(ctx); err != nil {
+			return err
+		}
+	}
+	if session.phase == nativeSessionActive {
+		if _, err := session.Retire(ctx); err != nil {
+			return err
+		}
+	}
+	if session.phase == nativeSessionRetired {
+		if _, err := session.Release(ctx); err != nil {
+			return err
+		}
+	}
+	if session.phase != nativeSessionReleased || session.pending {
+		return ErrNativeSessionState
+	}
+	return session.journal.destroyReleased()
+}
+
 // RetryPending resubmits only the retained byte-identical command. It never
 // reconstructs from mutable session or catalog state.
 func (session *NativeSession) RetryPending(ctx context.Context) (NativeResult, error) {

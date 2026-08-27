@@ -22,6 +22,8 @@ type nativeSessionClient struct {
 	stateAfterUnknown   shardservice.ReplicatedMemberState
 	unknownMutationOnce bool
 	mutationUnknownSeen bool
+	unknownKind         replication.CommandKind
+	unknownKindSeen     bool
 	preAdmissionRetry   bool
 	unknownCommand      []byte
 	retriedCommand      []byte
@@ -71,6 +73,18 @@ func (client *nativeSessionClient) DoReplicated(
 	command, err := replication.OpenCommand(request.Command)
 	if err != nil {
 		return nil, err
+	}
+	if len(client.unknownCommand) != 0 && bytes.Equal(client.unknownCommand, request.Command) {
+		client.retriedCommand = append(client.retriedCommand[:0], request.Command...)
+	}
+	if command.Kind() == client.unknownKind && client.unknownKind != 0 &&
+		!client.unknownKindSeen {
+		client.unknownKindSeen = true
+		client.unknownCommand = append(client.unknownCommand[:0], request.Command...)
+		return nil, errors.New("connection disappeared after exact lifecycle frame")
+	}
+	if command.Kind() == client.unknownKind && client.unknownKindSeen {
+		client.retriedCommand = append(client.retriedCommand[:0], request.Command...)
 	}
 	isMutation := command.Kind() == replication.CommandMutationBatch ||
 		command.Kind() == replication.CommandRetainedPrune
