@@ -262,6 +262,9 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 			if total.SourceFileEnd != 0 {
 				report.SourceFileEnd = total.SourceFileEnd
 			}
+			if cleanupErr := c.retirePublishedOnlineMigration(); cleanupErr != nil {
+				return report, cleanupErr
+			}
 			return report, nil
 		}
 		if !errors.Is(err, storeio.ErrGenerationMigrationStarved) {
@@ -269,6 +272,140 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 		}
 	}
 	return total, storeio.ErrGenerationMigrationStarved
+}
+
+func (c *Collection) retirePublishedOnlineMigration() error {
+	state := c.state.Load()
+	if state == nil || state.root.MigrationManifestOffset == 0 {
+		return nil
+	}
+	manifestStore, err := storeio.OpenGenerationMigrationManifestStore(
+		c.file, int64(state.root.MigrationManifestOffset),
+	)
+	if err != nil {
+		return err
+	}
+	driver := storeio.GenerationMigrationRetirementDriver{
+		Manifest: manifestStore, Cache: c.cache, File: c.file,
+		Scratch:  make([]byte, c.options.MaxPageSize),
+		PageSize: uint32(c.options.PageSize), MaxPageSize: uint32(c.options.MaxPageSize),
+		BatchExtents:  min(4096, cap(c.retireScratch)),
+		RetireDurably: c.retireOnlineMigrationExtents,
+	}
+	for {
+		done, err := driver.Step()
+		if err != nil || done {
+			return err
+		}
+	}
+}
+
+func samePhysicalExtent(a, b storeio.FreeExtent) bool {
+	return a.Offset == b.Offset && a.Length == b.Length
+}
+
+// retireOnlineMigrationExtents persists one bounded visitor batch through the
+// ordinary free-log grammar. Repeated delivery after a crash is idempotent by
+// physical identity; the fresh publication generation is a conservative fence.
+func (c *Collection) retireOnlineMigrationExtents(extents []storeio.FreeExtent) (err error) {
+	c.writer.Lock()
+	defer c.writer.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	state := c.state.Load()
+	if state == nil || len(extents) == 0 || len(extents) > cap(c.retireScratch) {
+		return storeio.ErrRetiredExtentCapacity
+	}
+	existing := c.reclaimer.AppendPending(c.freeFenced[:0])
+	c.retireScratch = c.retireScratch[:0]
+	for _, extent := range extents {
+		known := false
+		for _, held := range existing {
+			if samePhysicalExtent(extent, held) {
+				known = true
+				break
+			}
+		}
+		if !known {
+			for _, held := range c.reusable {
+				if samePhysicalExtent(extent, held) {
+					known = true
+					break
+				}
+			}
+		}
+		if known {
+			continue
+		}
+		extent.RetiredGeneration = state.root.Generation
+		c.retireScratch = append(c.retireScratch, extent)
+	}
+	if len(c.retireScratch) == 0 {
+		return nil
+	}
+	generation := state.root.Generation + 1
+	if err := c.refreshReusableFor(state, c.options.singleDocumentTransactionPages, c.options.freeFoldLimit); err != nil {
+		return err
+	}
+	tx, err := c.beginWriteTransaction(c.options.singleDocumentTransactionPages, storeio.WriteTransactionOptions{
+		StoreID: c.storeID, Generation: generation,
+		PageSize: uint32(c.options.PageSize), FileEnd: state.fileEnd,
+		NextLogicalID: state.root.NextLogicalID, Reusable: c.reusable,
+		ReuseJournal: c.reuseJournal, ReusableIndex: &c.freeExtentIndex,
+		ReusablePromoter: c.reusableExtentPromoter(),
+	})
+	if err != nil {
+		return err
+	}
+	reserved := false
+	defer func() {
+		if err != nil {
+			if reserved {
+				_ = c.reclaimer.CancelRetiredGeneration(state.root.Generation)
+			}
+			err = errors.Join(err, tx.Abort())
+		}
+	}()
+	freeLog, err := c.syncFreeLogFor(tx, state, c.options.freeFoldLimit)
+	if err != nil {
+		return err
+	}
+	descriptor, err := emptyMigrationPublicationDescriptor()
+	if err != nil {
+		return err
+	}
+	if err = tx.SetPublicationDescriptor(descriptor); err != nil {
+		return err
+	}
+	next := &fileStoreState{root: state.root, fileEnd: tx.FileEnd(), freeHead: freeLog.head}
+	next.root.Generation = generation
+	next.root.NextLogicalID = tx.NextLogicalID()
+	nextInline := *freeLog.inline
+	if err = c.reserveFileRetirements(); err != nil {
+		return err
+	}
+	reserved = true
+	c.snapshotGate.Lock()
+	c.beginReaderFence()
+	if err = tx.PublishInline(next.root, nextInline); err == nil {
+		c.primaryRouter.Load().AdvanceGeneration(generation)
+		c.pageValidator.update(next)
+		c.publishFileState(next)
+	}
+	c.endReaderFence()
+	c.snapshotGate.Unlock()
+	if err != nil {
+		return err
+	}
+	reserved = false
+	c.finalizeReusable()
+	c.commitFreeLog(freeLog)
+	c.inlineFree = nextInline
+	if c.deferredCanonicalLane() {
+		return c.flushPublishedPhysicalLocked()
+	}
+	return c.waitPublished(generation)
 }
 
 func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {

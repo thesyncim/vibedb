@@ -107,6 +107,11 @@ func (s *GenerationMigrationChainedSink) EnsureContiguousBuildBytes(minimum uint
 	if s.writer != nil && s.allocatedBytes != s.writer.written {
 		return ErrBatchState
 	}
+	if s.writer != nil {
+		if err := s.sealCurrentExtent(); err != nil {
+			return err
+		}
+	}
 	request := max(minimum, s.nextChunkBytes)
 	request = min(request, uint64(s.maxChunkBytes))
 	request = max(request, minimum)
@@ -136,6 +141,38 @@ func (s *GenerationMigrationChainedSink) EnsureContiguousBuildBytes(minimum uint
 	return nil
 }
 
+func (s *GenerationMigrationChainedSink) sealCurrentExtent() error {
+	if s == nil || s.writer == nil || s.allocatedBytes != s.writer.written {
+		return ErrBatchState
+	}
+	page := s.scratch[:s.pageSize]
+	for s.writer.written < s.writer.reservation.Length {
+		clear(page)
+		ref := PageRef{
+			Offset:    s.writer.reservation.Offset + s.writer.written,
+			LogicalID: s.nextLogicalID, Generation: s.generation,
+			Length: s.pageSize, Kind: PageMigrationPadding,
+		}
+		if _, err := InitPage(page, PageHeader{
+			StoreID: s.storeID, Generation: s.generation,
+			LogicalID: ref.LogicalID, PageSize: s.pageSize,
+			Kind: PageMigrationPadding,
+		}); err != nil {
+			return err
+		}
+		if _, err := SealPage(page); err != nil {
+			return err
+		}
+		if err := s.writer.Append(ref, page); err != nil {
+			return err
+		}
+		s.nextLogicalID++
+	}
+	s.allocatedBytes = s.writer.written
+	s.scratchUsed = 0
+	return nil
+}
+
 func (s *GenerationMigrationChainedSink) StoreIdentity() [16]byte    { return s.storeID }
 func (s *GenerationMigrationChainedSink) BuildGeneration() uint64    { return s.generation }
 func (s *GenerationMigrationChainedSink) BuildFileEnd() uint64       { return s.finalFileEnd }
@@ -147,6 +184,9 @@ func (s *GenerationMigrationChainedSink) Sync() error {
 	}
 	if s.writer == nil {
 		return nil
+	}
+	if err := s.sealCurrentExtent(); err != nil {
+		return err
 	}
 	return s.writer.Sync()
 }

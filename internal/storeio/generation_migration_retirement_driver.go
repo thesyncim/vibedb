@@ -3,6 +3,7 @@ package storeio
 import (
 	"errors"
 	"fmt"
+	"os"
 )
 
 var errGenerationMigrationRetirementBatch = errors.New("vibedb: retirement batch full")
@@ -17,6 +18,8 @@ type DurableGenerationRetirementSink func([]FreeExtent) error
 type GenerationMigrationRetirementDriver struct {
 	Manifest      *GenerationMigrationManifestStore
 	Cache         *PageCache
+	File          *os.File
+	Scratch       []byte
 	PageSize      uint32
 	MaxPageSize   uint32
 	BatchExtents  int
@@ -90,11 +93,19 @@ func (d *GenerationMigrationRetirementDriver) Step() (bool, error) {
 		}
 		complete = true
 	case GenerationMigrationRetireScratch:
+		if m.StagingChainTail != (PageRef{}) &&
+			(d.File == nil || len(d.Scratch) < int(d.MaxPageSize)) {
+			return false, fmt.Errorf("%w: migration scratch retirement", ErrInvalidWrite)
+		}
 		if m.TargetScratchBytes != 0 && m.RetirementOrdinal == 0 {
 			extents = append(extents, FreeExtent{Offset: m.TargetScratchOffset, Length: m.TargetScratchBytes, RetiredGeneration: m.TargetGeneration})
 			ordinal = 1
 		}
-		complete = true
+		if m.StagingChainTail != (PageRef{}) && len(extents) < cap(extents) {
+			err = VisitGenerationMigrationScratch(d.File, m, d.Scratch, func(extent FreeExtent) error {
+				return visit(PageRef{Offset: extent.Offset, Length: uint32(extent.Length), Kind: PageMigrationPadding})
+			})
+		}
 	default:
 		return false, ErrGenerationMigrationManifestCorrupt
 	}

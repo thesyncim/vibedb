@@ -91,6 +91,10 @@ const (
 	// PageMigrationStagingChain is an immutable backward link over the exact
 	// extents incrementally reserved by one online generation migration.
 	PageMigrationStagingChain
+	// PageMigrationPadding authenticates unused tail quanta in a staging
+	// extent. Making slack self-describing lets crash cleanup retire it without
+	// trusting zero-filled or filesystem-specific sparse bytes.
+	PageMigrationPadding
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -240,5 +244,5 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageOverflow && kind <= PageMigrationStagingChain
+	return kind >= PageOverflow && kind <= PageMigrationPadding
 }
