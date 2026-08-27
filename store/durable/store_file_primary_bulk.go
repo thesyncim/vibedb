@@ -1,11 +1,13 @@
 package durable
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"slices"
@@ -254,6 +256,7 @@ func createFromPrimaryGraphRecords(
 	// index term derivation, and every later read observe exactly one spelling.
 	if err := canonicalizePrimaryBulkRecords(
 		records, normalized.Collection.IndexOptions,
+		normalized.MaxDocumentBytes, normalized.InlineValueBytes,
 	); err != nil {
 		return 0, err
 	}
@@ -529,24 +532,26 @@ func createFromPrimaryGraphRecords(
 // canonical form. Already-canonical values — the steady state for
 // engine-generated input — are left borrowed from the
 // bulk snapshot; rewritten spellings live in one arena allocated lazily at the
-// first rewrite and sized for the complete source corpus. The arena never
-// reallocates because canonicalization can only shrink or keep a document's
-// length under the pinned encoder: whitespace is dropped and every escape
-// normalization collapses (raw control bytes are illegal JSON, so a control
-// character's source spelling is never shorter than its canonical one), which
-// the capacity check below still enforces defensively.
+// first rewrite. Only that cold path scans the remaining corpus to reserve raw
+// bytes plus the possible expansion of raw U+2028/U+2029. This extra scan keeps
+// the arena compact without moving earlier rewritten records or reserving each
+// document's configured maximum. The pinned encoder preserves number spellings
+// and otherwise only preserves or shrinks source bytes.
 func canonicalizePrimaryBulkRecords(
 	records []storeio.PrimaryGraphRecord,
 	indexOptions document.IndexOptions,
+	maxDocumentBytes, inlineValueBytes int,
 ) error {
-	total := 0
-	for at := range records {
-		total += len(records[at].Value)
-	}
 	var arena []byte
 	var ws storeio.CanonicalWorkspace
 	entryStore := make([]vibejson.IndexEntry, 0, 128)
 	for at := range records {
+		if len(records[at].Value) == 0 || len(records[at].Value) > maxDocumentBytes {
+			return ErrDocumentTooLarge
+		}
+		if len(records[at].Value) > inlineValueBytes {
+			return ErrPrimaryCutoverUnsupported
+		}
 		var index vibejson.Index
 		for {
 			var err error
@@ -567,6 +572,10 @@ func canonicalizePrimaryBulkRecords(
 			continue
 		}
 		if arena == nil {
+			total, err := primaryBulkCanonicalArenaBytes(records[at:])
+			if err != nil {
+				return err
+			}
 			arena = make([]byte, 0, total)
 		}
 		off := len(arena)
@@ -574,15 +583,39 @@ func canonicalizePrimaryBulkRecords(
 		if err != nil {
 			return err
 		}
-		if cap(out) != cap(arena) && off != 0 {
+		if cap(out) != cap(arena) {
 			return fmt.Errorf(
 				"vibedb: canonical bulk arena grew past its sized capacity",
 			)
+		}
+		if len(out)-off > maxDocumentBytes {
+			return ErrDocumentTooLarge
+		}
+		if len(out)-off > inlineValueBytes {
+			return ErrPrimaryCutoverUnsupported
 		}
 		arena = out
 		records[at].Value = byteview.String(arena[off:len(arena):len(arena)])
 	}
 	return nil
+}
+
+func primaryBulkCanonicalArenaBytes(records []storeio.PrimaryGraphRecord) (int, error) {
+	var total int
+	for _, record := range records {
+		raw := byteview.Bytes(record.Value)
+		separators := bytes.Count(raw, []byte{0xe2, 0x80, 0xa8}) +
+			bytes.Count(raw, []byte{0xe2, 0x80, 0xa9})
+		if separators > (math.MaxInt-len(raw))/3 {
+			return 0, store.ErrTooLarge
+		}
+		bound := len(raw) + 3*separators
+		if bound > math.MaxInt-total {
+			return 0, store.ErrTooLarge
+		}
+		total += bound
+	}
+	return total, nil
 }
 
 // sortPrimaryBulkRecords establishes the exact ordering contract shared by

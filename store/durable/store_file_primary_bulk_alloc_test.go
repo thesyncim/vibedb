@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"math"
 	"runtime"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestCanonicalizePrimaryBulkRecordsBorrowsCanonicalValues(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	if err := canonicalizePrimaryBulkRecords(records, document.IndexOptions{}); err != nil {
+	if err := canonicalizePrimaryBulkRecords(records, document.IndexOptions{}, math.MaxInt, math.MaxInt); err != nil {
 		t.Fatal(err)
 	}
 	runtime.ReadMemStats(&after)
@@ -52,7 +53,7 @@ func TestCanonicalizePrimaryBulkRecordsLazilyRewrites(t *testing.T) {
 		{Value: byteview.String(noncanonical)},
 		{Value: byteview.String(canonical)},
 	}
-	if err := canonicalizePrimaryBulkRecords(records, document.IndexOptions{}); err != nil {
+	if err := canonicalizePrimaryBulkRecords(records, document.IndexOptions{}, math.MaxInt, math.MaxInt); err != nil {
 		t.Fatal(err)
 	}
 	first := byteview.Bytes(records[0].Value)

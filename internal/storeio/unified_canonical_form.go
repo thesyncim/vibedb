@@ -653,8 +653,11 @@ func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *
 		if ke.Start != p {
 			return 0, false
 		}
-		if ke.Flags()&vibejson.TapeFlagEscaped != 0 &&
-			!rawQuotedStringIsCanonical(src[ke.Start:ke.End]) {
+		if ke.Flags()&vibejson.TapeFlagEscaped == 0 {
+			if !scanner.ValidUTF8NoLineSeparator(src[ke.Start+1 : ke.End-1]) {
+				return 0, false
+			}
+		} else if !rawQuotedStringIsCanonical(src[ke.Start:ke.End]) {
 			return 0, false
 		}
 		cur := canonicalMember{keyEntry: int32(key)}
