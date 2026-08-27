@@ -435,11 +435,12 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 		t.Fatal("already-published catalog accepted as a new transition source")
 	}
 	t.Run("certified-source-action-after-session-open", func(t *testing.T) {
-		runtimeStore, err := OpenDurableRuntimeStore(t.TempDir(), plan.OperationID(), testManifestDigest("prune-local"))
+		root := t.TempDir()
+		runtimeStore, err := OpenDurableRuntimeStore(root, plan.OperationID(), testManifestDigest("prune-local"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer runtimeStore.Close()
+		defer func() { _ = runtimeStore.Close() }()
 		if err = runtimeStore.PersistRetainedPrune(1, prune); err != nil {
 			t.Fatal(err)
 		}
@@ -470,9 +471,31 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 			testRetainedPruneProposer{}, rangesplit.RetainedPruneLimits{}); err != nil {
 			t.Fatalf("certified local prune required remote readiness or a stale applied cut: %v", err)
 		}
-		advanced, _, present, err := runtimeStore.LoadRetainedPrune(plan.partitioner, certificate)
+		advanced, revision, present, err := runtimeStore.LoadRetainedPrune(plan.partitioner, certificate)
 		if err != nil || !present || advanced.SourceCut().Applied != state.Applied+1 {
 			t.Fatalf("prune did not verify the intervening entry: present=%t err=%v", present, err)
+		}
+		// Lose the action reply after the cursor commit, then reopen. The
+		// durable gateway replays its original witness, not the new cursor.
+		if err = runtimeStore.Close(); err != nil {
+			t.Fatal(err)
+		}
+		runtimeStore, err = OpenDurableRuntimeStore(root, plan.OperationID(), testManifestDigest("prune-local"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		local, err = NewLocalSourceActions(runtimeStore, source.machine, source.capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local.active = capture
+		if err = local.ExecuteCertifiedPruneRetained(t.Context(), plan, witness, witness.SourceServing,
+			testRetainedPruneProposer{}, rangesplit.RetainedPruneLimits{}); err != nil {
+			t.Fatalf("lost prune reply stranded the exact durable action: %v", err)
+		}
+		_, replayRevision, _, err := runtimeStore.LoadRetainedPrune(plan.partitioner, certificate)
+		if err != nil || replayRevision != revision {
+			t.Fatalf("replayed prune performed another step: revision=%d want=%d err=%v", replayRevision, revision, err)
 		}
 	})
 }

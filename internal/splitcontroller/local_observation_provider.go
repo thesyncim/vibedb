@@ -423,7 +423,11 @@ func loadObservedPrune(lease *RuntimeStoreLease) (*rangesplit.RetainedPruneCurso
 	if err != nil || !present {
 		return nil, err
 	}
-	value, err := rangesplit.OpenRetainedPruneCursor(raw.Payload)
+	cursor, _, err := openRetainedPruneRecord(raw.Payload)
+	if err != nil {
+		return nil, errors.Join(ErrPlanObservation, err)
+	}
+	value, err := rangesplit.OpenRetainedPruneCursor(cursor)
 	if err != nil {
 		return nil, errors.Join(ErrPlanObservation, err)
 	}

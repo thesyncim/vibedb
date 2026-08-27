@@ -241,6 +241,23 @@ func (a *LocalSourceActions) executeCertifiedPruneLocked(
 	if err != nil {
 		return err
 	}
+	receipt, err := retainedPruneStepReceipt(plan, observed)
+	if err != nil {
+		return err
+	}
+	if present {
+		record, found, loadErr := a.store.Load(RuntimeStatePrune, 0)
+		if loadErr != nil || !found || record.Revision != revision {
+			return errors.Join(ErrRuntimeStore, loadErr)
+		}
+		_, committedReceipt, openErr := openRetainedPruneRecord(record.Payload)
+		if openErr != nil {
+			return openErr
+		}
+		if committedReceipt == receipt {
+			return nil
+		}
+	}
 	var persisted []byte
 	if present {
 		persisted, err = rangesplit.AppendRetainedPruneCursor(nil, &cursor)
@@ -274,7 +291,7 @@ func (a *LocalSourceActions) executeCertifiedPruneLocked(
 			return errors.Join(ErrRuntimeStore, openErr)
 		}
 		revision++
-		return a.store.PersistRetainedPrune(revision, *next)
+		return a.store.persistRetainedPruneStep(revision, raw, receipt)
 	}
 	batch, hasBatch, advanceErr := pruner.Advance(
 		cut, a.active, limits, persist, &workspace,

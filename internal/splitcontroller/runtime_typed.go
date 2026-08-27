@@ -260,7 +260,11 @@ func (s *DurableRuntimeStore) LoadRetainedPrune(
 	if err != nil || !ok {
 		return rangesplit.RetainedPruneCursor{}, 0, ok, err
 	}
-	cursor, err := rangesplit.OpenRetainedPruneCursor(state.Payload)
+	raw, _, err := openRetainedPruneRecord(state.Payload)
+	if err != nil {
+		return rangesplit.RetainedPruneCursor{}, 0, false, err
+	}
+	cursor, err := rangesplit.OpenRetainedPruneCursor(raw)
 	if err != nil || cursor == nil || partitioner == nil ||
 		cursor.OperationID() != [32]byte(s.operation) ||
 		partitioner.VerifyRetainedPruneCompletion(certificate, cursor.OperationID(), *cursor) != nil &&
@@ -268,7 +272,7 @@ func (s *DurableRuntimeStore) LoadRetainedPrune(
 		return rangesplit.RetainedPruneCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
 	}
 	canonical, err := rangesplit.AppendRetainedPruneCursor(nil, cursor)
-	if err != nil || !bytes.Equal(canonical, state.Payload) {
+	if err != nil || !bytes.Equal(canonical, raw) {
 		return rangesplit.RetainedPruneCursor{}, 0, false, errors.Join(ErrRuntimeStore, err)
 	}
 	return *cursor, state.Revision, true, nil
