@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	raft "go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -228,6 +229,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 			Catalog: read, Publication: movePublication,
 			LeaderStatus: raftmember.RuntimeStatus{
 				MemberID: 2, LeaderID: 2, Term: 3, Commit: 10, Applied: 10,
+				RaftState: raft.StateLeader,
 			},
 		},
 	}}

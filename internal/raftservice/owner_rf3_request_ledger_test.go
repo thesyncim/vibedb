@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -371,7 +372,7 @@ func newMultiGroupRF3DurableGateway(
 	planner := gateway.NewExecutor(nil, catalog, gateway.Options{})
 	sql, err := gateway.NewDurableSQLRequestExecutor(gateway.DurableSQLRequestExecutorOptions{
 		Planner: planner, ReplicatedData: native, Requests: requests,
-		RecoveryPulseLimit: 4, PlanningLeaseSpan: 128,
+		RecoveryPulseLimit: distributedtxn.MaxRecoveryPulses, PlanningLeaseSpan: 128,
 	})
 	if err != nil {
 		t.Fatal(err)
