@@ -381,7 +381,6 @@ func servePreparedRF3WithExecutionLanes(
 	closePrepared := func(cause error) error { return closePreparedRF3Groups(preparedSet.groups, cause) }
 	first := &preparedSet.groups[0]
 	base := first.base
-	group := groupFromBinding(base.Binding)
 	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
 	nativeConfigured := preparedSet.nativeConfigured
 	transportRegistry, err := rafttransport.NewStaticRegistry(
@@ -924,32 +923,20 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	var server *shardservice.ReplicatedServer
 	if nativeConfigured {
-		baseServing := rf3NativeServingAuthority(transportRegistry, manifest, group, base)
-		server, err = shardservice.NewReplicatedServer(peer.Owners(), 64<<20, rf3RequestTimeout)
+		var authorities *rf3NativeAuthorities
+		authorities, err = newRF3NativeAuthorities(transportRegistry, gate, preparedSet.groups, restoreGates, restoreOperations)
+		if err == nil {
+			authorities.adopted = adoptedInventory
+			server, err = shardservice.NewReplicatedServer(peer.Owners(), 64<<20, rf3RequestTimeout)
+		}
 		if err == nil {
 			err = server.BindAuthorization(gate, nil)
 		}
 		if err == nil {
-			err = server.BindServingAuthority(func(state raftservice.ServingState) bool {
-				if !baseServing(state) {
-					return false
-				}
-				restoreGate, restored := restoreGates[state.Identity.Group]
-				return !restored || restoreGate.Allows(state)
-			})
+			err = server.BindServingAuthority(authorities.serving)
 		}
 		if err == nil {
-			membershipPreparing := rf3NativeMembershipAuthority(transportRegistry, manifest, group, base)
-			restorePreparing := rf3RestoreCatalogPreparingAuthority(
-				gate, restoreOperations[group], group, base, baseServing,
-			)
-			err = server.BindTransitionalServingAuthority(func(state raftservice.ServingState,
-				request *shardservice.ReplicatedRequest,
-			) bool {
-				return restorePreparing(state, request) ||
-					(manifest.EnrolledTarget != nil && base.Binding.MemberID == manifest.EnrolledTarget.MemberID &&
-						membershipPreparing(state, request))
-			})
+			err = server.BindTransitionalServingAuthority(authorities.transitional)
 		}
 		if err != nil {
 			retireCtx, retire := context.WithCancelCause(context.Background())
@@ -1423,6 +1410,7 @@ func rf3NativeServingAuthority(
 	group raftmember.GroupKey,
 	base sqldriver.ReplicatedShardStoreIdentity,
 ) func(raftservice.ServingState) bool {
+	roster := manifest.memberRoster()
 	return func(state raftservice.ServingState) bool {
 		if registry == nil || state.Identity.Group != group ||
 			state.Identity.MemberID != base.Binding.MemberID ||
@@ -1434,7 +1422,7 @@ func rf3NativeServingAuthority(
 			return false
 		}
 		voters := 0
-		for _, member := range manifest.memberRoster() {
+		for _, member := range roster {
 			if role, err := registry.Role(group, member.MemberID); err == nil &&
 				role == rafttransport.MemberVoter {
 				voters++

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -30,13 +31,14 @@ type rf3AdoptedGroupEntry struct {
 }
 
 type rf3AdoptedGroupInventory struct {
-	mu       sync.Mutex
-	manifest rf3Manifest
-	root     *os.Root
-	lock     *os.File
-	entries  [maxRF3ManifestGroups]rf3AdoptedGroupEntry
-	failed   bool
-	runtimes map[raftmember.GroupKey]rf3AdoptedRuntime
+	mu             sync.Mutex
+	manifest       rf3Manifest
+	root           *os.Root
+	lock           *os.File
+	entries        [maxRF3ManifestGroups]rf3AdoptedGroupEntry
+	failed         bool
+	runtimes       map[raftmember.GroupKey]rf3AdoptedRuntime
+	nativeChildren atomic.Pointer[rf3NativeChildren]
 }
 
 type rf3AdoptedRuntime struct {
@@ -194,6 +196,7 @@ func (inventory *rf3AdoptedGroupInventory) Close() error {
 	}
 	inventory.mu.Lock()
 	defer inventory.mu.Unlock()
+	inventory.nativeChildren.Store(nil)
 	var err error
 	if inventory.lock != nil {
 		err = errors.Join(storeio.UnlockWriter(inventory.lock), inventory.lock.Close())
@@ -238,14 +241,7 @@ func (inventory *rf3AdoptedGroupInventory) CheckpointChildAdoption(ctx context.C
 	}
 	entry := rf3AdoptedGroupEntry{operation: [32]byte(proof.OperationID()), receipt: receipt.ReceiptDigest,
 		plan: proof.PlanDigest(), certificate: target.CertificateDigest, cutover: proof.CutoverDigest(), group: uint64(index), child: uint64(proof.Child())}
-	if err = inventory.record(entry); err != nil {
-		return err
-	}
-	if inventory.runtimes == nil {
-		inventory.runtimes = make(map[raftmember.GroupKey]rf3AdoptedRuntime)
-	}
-	inventory.runtimes[identity.Group] = rf3AdoptedRuntime{identity: identity, apply: prepared.Apply}
-	return nil
+	return inventory.recordNativeChild(entry, rf3AdoptedRuntime{identity: identity, apply: prepared.Apply})
 }
 
 // Caller holds mu. An uncertain publication poisons all retries until reopen.
