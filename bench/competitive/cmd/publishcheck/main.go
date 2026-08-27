@@ -222,7 +222,7 @@ func exactPairs(t table, kind string) (map[string]string, error) {
 	for _, fields := range t.lines {
 		if len(fields) == 3 && fields[0] == kind {
 			if fields[1] == "" || fields[2] == "" || result[fields[1]] != "" {
-				return nil, errors.New("duplicate or empty metadata")
+				return nil, fmt.Errorf("duplicate or empty metadata %q", fields[1])
 			}
 			result[fields[1]] = fields[2]
 		}
