@@ -545,9 +545,16 @@ func newRealTransferRuntimeWithLearners(
 	t *testing.T,
 	identity raftstore.Identity,
 	voters, learners []uint64,
+	bootstrapIndex ...uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
 	t.Helper()
 	index, term := uint64(1), uint64(1)
+	if len(bootstrapIndex) > 1 || (len(bootstrapIndex) == 1 && bootstrapIndex[0] == 0) {
+		t.Fatal("invalid real-transfer bootstrap index")
+	}
+	if len(bootstrapIndex) == 1 {
+		index = bootstrapIndex[0]
+	}
 	walPath := filepath.Join(t.TempDir(), "member.wal")
 	sqlPath := filepath.Join(t.TempDir(), "member.vdb")
 	options := raftstore.Options{

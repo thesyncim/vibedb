@@ -104,6 +104,7 @@ func TestExecutionOwnersRouteByGroupAndStartEveryLane(t *testing.T) {
 }
 
 func TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer(t *testing.T) {
+	preflightExecutionFixtureLanes(t)
 	const voters = 3
 	var runtimes [voters][2]*raftmember.Runtime
 	var bases [voters][2]sqldriver.ReplicatedShardStoreIdentity
@@ -263,6 +264,7 @@ func TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer(t *test
 }
 
 func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
+	preflightExecutionFixtureLanes(t)
 	initialRuntime, initialBase, initialRead := newRF3RuntimeForTestGroup(t, 1, 0, false)
 	dynamicRuntime, dynamicBase, dynamicRead := newRF3RuntimeForTestGroup(t, 1, 1, false)
 	initialIdentity := initialRuntime.Identity()
@@ -277,11 +279,7 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serving.Close()
-	lanes, err := serving.NewExecutionLanes(2, multiraft.Limits{
-		MaxGroups: 2, MaxQueueItems: 64, MaxQueueBytes: 16 << 20,
-		MaxGroupItems: 32, MaxGroupBytes: 8 << 20,
-		MaxOutboxItems: 64, MaxOutboxBytes: 16 << 20, MaxPendingTicks: 8,
-	})
+	lanes, err := serving.NewExecutionLanes(2, executionDynamicHostLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,6 +368,42 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 	if err = <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("shutdown: %v", err)
 	}
+}
+
+func executionDynamicHostLimits() multiraft.Limits {
+	// Each lane must admit one maximum legal inbound frame. Item budgets stay
+	// unchanged; the old 8/16 MiB byte caps could not admit the 17 MiB envelope.
+	return multiraft.Limits{
+		MaxGroups: 2, MaxQueueItems: 64, MaxQueueBytes: raftmodel.MaxInboundMessageBytes,
+		MaxGroupItems: 32, MaxGroupBytes: raftmodel.MaxInboundMessageBytes,
+		MaxOutboxItems: 64, MaxOutboxBytes: raftmodel.MaxInboundMessageBytes, MaxPendingTicks: 8,
+	}
+}
+
+func preflightExecutionFixtureLanes(t *testing.T) {
+	t.Helper()
+	lanes, err := multiraft.NewExecutionLanes(2, executionDynamicHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lanes.Close()
+	var assignments [2]int
+	for group := range assignments {
+		identity := rf3RuntimeTestIdentity(1, group)
+		key := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
+			TopologyRecoveryEpoch: 3, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
+		assignments[group], err = lanes.Lane(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if assignments[0] == assignments[1] {
+		t.Fatal("runtime fixture groups must span both owner lanes before opening stores")
+	}
+}
+
+func TestExecutionFixtureHostLimitsAndLaneRouting(t *testing.T) {
+	preflightExecutionFixtureLanes(t)
 }
 
 func executionTestRoster(group raftmember.GroupKey, local rafttransport.NodeID) []rafttransport.Member {

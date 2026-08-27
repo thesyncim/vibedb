@@ -15,6 +15,7 @@ import (
 // catches up as a learner before promotion; the old voter is removed only
 // after transfer, then the remaining RF3 survives loss of the new leader.
 func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
+	preflightRealTransferLearnerGrant(t)
 	identities := realTransferIdentities()
 	voters := []uint64{identities[0].MemberID, identities[1].MemberID, identities[2].MemberID}
 	hosts := make([]*Host, 4)
@@ -23,8 +24,10 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	nodes := [4]rafttransport.NodeID{{1}, {2}, {3}, {4}}
 	members := make([]rafttransport.Member, 4)
 	for index := range hosts {
+		// The grant certifies the original RF3 at version 1. This fixture starts
+		// after learner enrollment, whose snapshot must be a later durable cut.
 		runtime, _, reopenRuntime := newRealTransferRuntimeWithLearners(
-			t, identities[index], voters, []uint64{identities[3].MemberID})
+			t, identities[index], voters, []uint64{identities[3].MemberID}, 2)
 		reopen[index] = reopenRuntime
 		host, err := NewHost(testHostLimits())
 		if err != nil {
@@ -40,7 +43,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 			role = rafttransport.MemberLearner
 		}
 		members[index] = rafttransport.Member{Group: runtime.Identity().Group,
-			ReplicaSetVersion: 1, MemberID: identities[index].MemberID,
+			ReplicaSetVersion: 2, MemberID: identities[index].MemberID,
 			Node: nodes[index], Role: role}
 	}
 	for index := range hosts {
@@ -64,7 +67,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.driveUntil(func() bool {
 		for index := 0; index < 3; index++ {
 			status, err := hosts[index].Status(group)
-			if err != nil || status.LeaderID != 1 || status.Applied < 2 {
+			if err != nil || status.LeaderID != 1 || status.Applied < 3 {
 				return false
 			}
 		}
@@ -76,14 +79,14 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.driveUntilConvergedIdle(func() bool {
 		for _, host := range hosts {
 			publication, err := host.Publication(group)
-			if err != nil || publication.Applied < 2 ||
+			if err != nil || publication.Applied < 3 ||
 				publication.ConfState.Equivalent(learnerConf) != nil {
 				return false
 			}
 		}
 		progress, found, err := hosts[0].Progress(group, target)
 		return err == nil && found && progress.Learner && progress.RecentActive &&
-			progress.Match >= 2 && progress.PendingSnapshot == 0
+			progress.Match >= 3 && progress.PendingSnapshot == 0
 	})
 	if err := hosts[0].ProposeConfChange(group, &pb.ConfChange{
 		Type: pb.ConfChangeAddNode.Enum(), NodeId: &target,
@@ -96,7 +99,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.driveUntilWithLeaderTicks(func() bool {
 		for index := 0; index < 3; index++ {
 			publication, err := hosts[index].Publication(group)
-			if err != nil || publication.Applied < 3 ||
+			if err != nil || publication.Applied < 4 ||
 				publication.ConfState.Equivalent(voterConf) != nil {
 				return false
 			}
@@ -127,7 +130,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	})
 	beforeRestart, err := hosts[3].Publication(group)
 	if err != nil || beforeRestart.ConfState.Equivalent(learnerConf) != nil ||
-		beforeRestart.ReplicaSetVersion >= 3 {
+		beforeRestart.ReplicaSetVersion != 2 {
 		t.Fatalf("target published promotion before crash: %+v, %v", beforeRestart, err)
 	}
 	if err = hosts[3].Close(); err != nil {
@@ -158,7 +161,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	proof, found, err := restartedPromotionHost.DurablePromotion(group, target)
-	if err != nil || !found || proof.Version != 3 {
+	if err != nil || !found || proof.Version != 4 {
 		t.Fatalf("reconstructed promotion proof=%+v found=%t err=%v", proof, found, err)
 	}
 	if err = restartRegistry.PublishDurablePromotion(group, proof); err != nil {
@@ -222,7 +225,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			publication, err := hosts[index].Publication(group)
-			if err != nil || publication.Applied < 4 || publication.ConfState.Equivalent(removedConf) != nil {
+			if err != nil || publication.Applied < 5 || publication.ConfState.Equivalent(removedConf) != nil {
 				return false
 			}
 		}
@@ -269,6 +272,42 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 			publication.ConfState.Equivalent(removedConf) == nil &&
 			publication.ReplicaSetVersion == authorityVersion && authorityFound
 	})
+}
+
+func preflightRealTransferLearnerGrant(t *testing.T) {
+	t.Helper()
+	identity := realTransferIdentities()[0]
+	group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
+		TopologyRecoveryEpoch: 29, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
+	grant := realTransferMembershipGrant(group)
+	for _, version := range []uint64{1, 2} {
+		members := make([]rafttransport.Member, 4)
+		for i := range members {
+			role := rafttransport.MemberVoter
+			if i == 3 {
+				role = rafttransport.MemberLearner
+			}
+			members[i] = rafttransport.Member{Group: group, ReplicaSetVersion: version,
+				MemberID: uint64(i + 1), Node: rafttransport.NodeID{byte(i + 1)}, Role: role}
+		}
+		registry, err := rafttransport.NewStaticRegistry(members[0].Node, members,
+			rafttransport.Limits{MaxGroups: 1, MaxMembers: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = registry.InstallTransitionGrant(grant)
+		if version == grant.InitialReplicaSetVersion {
+			if !errors.Is(err, rafttransport.ErrReplicaSet) {
+				t.Fatalf("learner at original voter-only version accepted: %v", err)
+			}
+		} else if err != nil {
+			t.Fatalf("certified progressed learner cut rejected: %v", err)
+		}
+	}
+}
+
+func TestRealTransferGrantLearnerRequiresProgressedCut(t *testing.T) {
+	preflightRealTransferLearnerGrant(t)
 }
 
 func realTransferMembershipGrant(group raftmember.GroupKey) membershipgrant.Grant {

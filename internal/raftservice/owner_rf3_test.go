@@ -610,6 +610,11 @@ func newRF3RuntimeForTestGroup(
 	globalIndex bool,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
+	identity := rf3RuntimeTestIdentity(memberID, group)
+	return newRF3RuntimeForTestIdentity(t, identity, group, globalIndex)
+}
+
+func rf3RuntimeTestIdentity(memberID uint64, group int) raftstore.Identity {
 	distributionName := "orders"
 	if group != 0 {
 		distributionName = fmt.Sprintf("orders-%d", group)
@@ -625,6 +630,16 @@ func newRF3RuntimeForTestGroup(
 		identity.GroupID[index] = byte(index + 61 + group*17)
 		identity.StoreID[index] = byte(index+81+group*17) ^ byte(memberID)
 	}
+	// Uniform shifts of two complete 16-byte IDs preserve the low hash bit.
+	// Salt one byte so adjacent fixture groups exercise separate owner lanes.
+	identity.GroupID[15] ^= byte(group)
+	return identity
+}
+
+func newRF3RuntimeForTestIdentity(t testing.TB, identity raftstore.Identity, group int,
+	globalIndex bool,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	t.Helper()
 	key := raftstore.Key{ID: "rf3-serving-key", Wrapped: []byte("opaque-wrapped-key")}
 	for index := range key.Material {
 		key.Material[index] = byte(index + 1 + group)
