@@ -298,7 +298,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 
 	capacityPath := hotMutationCapacity(t, root)
 	controlPath := filepath.Join(root, "replica-control.vibejson")
-	if err = os.WriteFile(controlPath, hotMutationControlManifest(t, nodes, identities[0],
+	if err = os.WriteFile(controlPath, hotMutationControlManifest(t, root, nodes, identities[0],
 		listeners[0], credentials[4], roots, policyPath, gatewayAddresses.Addresses[1]), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +672,7 @@ func hotMutationCapacity(t *testing.T, root string) string {
 	return path
 }
 
-func hotMutationControlManifest(t *testing.T, nodes [5]rafttransport.NodeID,
+func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttransport.NodeID,
 	identities [4]raftstore.Identity, listeners [4]rf3testfixture.ProcessListeners,
 	credential rf3testfixture.Credential, roots, policy, gatewayControl string,
 ) []byte {
@@ -693,7 +693,7 @@ func hotMutationControlManifest(t *testing.T, nodes [5]rafttransport.NodeID,
 		manifest.ShardEndpoints = append(manifest.ShardEndpoints, persistedGatewayShardControlEndpoint{
 			Node: fmt.Sprintf("%x", nodes[member]), ControlAddress: listeners[member].Control,
 			SplitSnapshotAddress: listeners[member].Snapshot,
-			SplitChildRoot:       filepath.Join(os.TempDir(), fmt.Sprintf("vibedb-hot-split-%x", nodes[member]))})
+			SplitChildRoot:       filepath.Join(root, fmt.Sprintf("group-0-member-%d", member+1), "split-children")})
 	}
 	raw, err := vibejson.Marshal(&manifest)
 	if err != nil {
