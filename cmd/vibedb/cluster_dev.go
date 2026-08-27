@@ -144,9 +144,20 @@ type devReplicaSplitSource struct {
 	RelationManifestDigest [32]byte                               `json:"relation_manifest_digest"`
 	Table                  string                                 `json:"table"`
 	SQL                    sqldriver.ReplicatedShardStoreIdentity `json:"sql"`
+	Placement              devReplicaSplitPlacement               `json:"placement"`
 	LocalIndexes           []devReplicaSplitIndex                 `json:"local_indexes,omitempty"`
 	Template               devReplicaSplitTemplate                `json:"template"`
 	Replicas               []devReplicaSplitSourceReplica         `json:"replicas"`
+}
+
+type devReplicaSplitPlacement struct {
+	Format        uint16  `json:"format"`
+	ShardKey      string  `json:"shard_key"`
+	TupleVersion  uint16  `json:"tuple_version"`
+	MapperVersion uint16  `json:"mapper_version"`
+	RangeStart    [8]byte `json:"range_start"`
+	RangeEnd      [8]byte `json:"range_end"`
+	RangeEndMax   bool    `json:"range_end_max"`
 }
 
 type devReplicaSplitIndex struct {
@@ -1589,6 +1600,12 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 		return devReplicaSplitSource{}, errors.Join(errDevCluster, err)
 	}
 	entry.RelationManifestDigest = digest
+	entry.Placement = devReplicaSplitPlacement{
+		Format: placement.Format, ShardKey: placement.ShardKey,
+		TupleVersion: uint16(placement.TupleVersion), MapperVersion: uint16(placement.MapperVersion),
+		RangeStart: [8]byte(placement.Range.Start), RangeEnd: [8]byte(placement.Range.End.Point),
+		RangeEndMax: placement.Range.End.Max,
+	}
 	entry.Template = devReplicaSplitTemplate{MaxSessions: prepare.Apply.MaxSessions, RetryWindow: prepare.Apply.RetryWindow,
 		TxnLimits: durable.TxnLimits{MaxCollections: prepare.Apply.MaxCollections, MaxDocuments: prepare.Apply.MaxDocuments, MaxBytes: prepare.Apply.MaxBytes},
 		Format:    placement.Format, ShardKey: placement.ShardKey, TupleVersion: uint16(placement.TupleVersion), MapperVersion: uint16(placement.MapperVersion),

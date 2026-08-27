@@ -359,6 +359,13 @@ func TestInitializeDevRF3BindsHotSplitSourceToDataGroup(t *testing.T) {
 	if source.Table != devDataTable || source.SchemaGeneration != 1 || source.RelationManifestDigest == ([32]byte{}) || len(source.Replicas) != 3 || len(source.LocalIndexes) != 0 {
 		t.Fatalf("source=%+v", source)
 	}
+	if source.Placement != (devReplicaSplitPlacement{
+		Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: devDataPrimaryKey,
+		TupleVersion: uint16(distribution.CurrentTupleVersion), MapperVersion: uint16(distribution.NativeMapperVersion),
+		RangeEndMax: true,
+	}) {
+		t.Fatalf("source lost its immutable prepared full-keyspace placement: %+v", source.Placement)
+	}
 	identityRaw, err := os.ReadFile(filepath.Join(prepare.Root, "sql-identity.vibejson"))
 	if err != nil {
 		t.Fatal(err)
