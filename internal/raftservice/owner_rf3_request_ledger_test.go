@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -280,6 +282,136 @@ func newMultiGroupRF3DurableLedger(
 	return ledger
 }
 
+type multiGroupRF3DurableGateway struct {
+	sql      *gateway.DurableSQLRequestExecutor
+	ledger   *gateway.DurableRequestLedgerRF3
+	topology *gateway.DurableRequestLedgerTopologyHolder
+	client   *multiGroupRequestLedgerRF3RoundTripper
+}
+
+func newMultiGroupRF3DurableGateway(
+	t testing.TB,
+	cluster *multiGroupTransactionRF3Cluster,
+	snapshot *gateway.Snapshot,
+	ackKey gateway.DurableRequestAckDerivationKey,
+	principal serviceauthz.Authority,
+) multiGroupRF3DurableGateway {
+	t.Helper()
+	client := newMultiGroupRequestLedgerRF3RoundTripper(t, cluster)
+	native, err := gateway.NewReplicatedExecutorWithOptions(
+		client, gateway.ReplicatedExecutorOptions{
+			MaxAttempts: 1, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 16,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rf3, err := gateway.NewReplicatedRequestLedgerRF3(
+		gateway.ReplicatedRequestLedgerRF3Options{
+			Executor: native, Service: principal,
+			ServiceTenant: []byte("internal-request-ledger"),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := gateway.NewDurableRequestLedgerRF3(rf3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := gateway.NewCatalogHolder(snapshot)
+	topology, err := gateway.NewCatalogDurableRequestLedgerTopologyHolder(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := gateway.NewCatalogDurableRequestRouteResolver(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := gateway.NewJournaledDurableRequestExecutionPinSessionFactory(
+		native, t.TempDir(), principal,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins, err := gateway.NewNativeDurableRequestExecutionPinAuthority(native, sessions, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waves, err := gateway.NewDurableRequestLifecycleRunner(ledger, resolver, native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := gateway.NewDurableRequestDynamicPayloadStore(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := gateway.NewDurableRequestTerminalCoordinatorWithSessionFactory(
+		ledger, native, sessions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalAuthority, err := gateway.NewNativeDurableRequestTerminalAuthorityProvider(
+		ackKey, principal,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := gateway.NewDurableRequestDistributedRunner(
+		ledger, resolver, waves, payloads, terminal, terminalAuthority,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests, err := gateway.NewDurableRequestService(topology, ledger, runner, pins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := gateway.NewExecutor(nil, catalog, gateway.Options{})
+	sql, err := gateway.NewDurableSQLRequestExecutor(gateway.DurableSQLRequestExecutorOptions{
+		Planner: planner, ReplicatedData: native, Requests: requests,
+		RecoveryPulseLimit: 4, PlanningLeaseSpan: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return multiGroupRF3DurableGateway{
+		sql: sql, ledger: ledger, topology: topology, client: client,
+	}
+}
+
+func multiGroupRF3DurableCatalog(
+	t testing.TB,
+	cluster *multiGroupTransactionRF3Cluster,
+) rf3testfixture.DurableCatalog {
+	t.Helper()
+	groups := make([]rf3testfixture.DurableCatalogGroup, 0, multiGroupRF3MaxGroups)
+	for group := 0; group < multiGroupRF3Groups; group++ {
+		groups = append(groups, rf3testfixture.DurableCatalogGroup{
+			Route: cluster.route(group), Table: "orders_" + string(rune('a'+group)),
+			PrimaryKey: "/id", Relation: 1,
+			MaxKeyBytes:      replication.MaxMutationKeyBytes,
+			MaxDocumentBytes: replication.MaxMutationValueBytes,
+		})
+	}
+	ledgerRoute := cluster.route(multiGroupRF3LedgerGroup)
+	groups = append(groups, rf3testfixture.DurableCatalogGroup{
+		Route: ledgerRoute, Table: "request_ledger_home", PrimaryKey: "/home",
+		LedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{
+			Identity: ledgerRoute.RangeIdentity,
+		}},
+	})
+	fixture, err := rf3testfixture.NewDurableCatalog(rf3testfixture.DurableCatalogOptions{
+		Generation: 31, Groups: groups,
+		AckKey: gateway.DurableRequestAckDerivationKey{0x91},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fixture
+}
+
 // TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition
 // is the real Owner/MultiRaft/WAL/apply boundary. Gateway A loses a committed
 // response as its serving member is partitioned; independently constructed
@@ -416,5 +548,185 @@ func TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition(t 
 		!bytes.Equal(hidden.inner, retry.inner) || hidden.member == retry.member {
 		t.Fatalf("gateway identity or exact inner retry drifted: hidden=%+v retry=%+v",
 			*hidden, *retry)
+	}
+}
+
+// TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions is
+// the full in-process production composition: two user-data RF3 groups, one
+// dedicated request-ledger RF3 group, the shipped SQL planner, execution-pin
+// journals, distributed transaction runner, terminal coordinator, and ACK
+// collector. It uses real Owner/MultiRaft/WAL/apply paths. The net.Pipe native
+// edge is intentionally unauthenticated; native mTLS remains a separate wire
+// gate and this test does not claim a child-process deployment boundary.
+func TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions(t *testing.T) {
+	cluster := newMultiGroupRF3Cluster(t, multiGroupRF3MaxGroups)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	for group := 0; group < cluster.groupCount; group++ {
+		if err := cluster.owners[0].Campaign(ctx, cluster.groups[group].key); err != nil {
+			t.Fatalf("campaign group %d: %v", group, err)
+		}
+		if leader := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[group].key); leader != 0 {
+			t.Fatalf("group %d leader=%d, want deliberately campaigned member 0", group, leader)
+		}
+	}
+	fixture := multiGroupRF3DurableCatalog(t, cluster)
+	principalA := serviceauthz.Authority{Node: [16]byte{0xa2}, Generation: 1}
+	principalB := serviceauthz.Authority{Node: [16]byte{0xb2}, Generation: 1}
+	gatewayA := newMultiGroupRF3DurableGateway(
+		t, cluster, fixture.Snapshot, fixture.AckKey, principalA,
+	)
+	gatewayB := newMultiGroupRF3DurableGateway(
+		t, cluster, fixture.Snapshot, fixture.AckKey, principalB,
+	)
+
+	tenant := []byte("tenant")
+	requestKey := requestledger.RequestKey{
+		Scope:        requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		Principal:    requestledger.PrincipalID{0xc1}, Request: requestledger.RequestID{0xd1},
+		IssuerEpoch: 11, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0xe1},
+	}
+	point, err := requestledger.Home(requestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, _, ok := gatewayA.topology.Lookup(point)
+	if !ok || home.ReplicatedRoute().Group != cluster.groups[multiGroupRF3LedgerGroup].key {
+		t.Fatalf("durable catalog routed request home to %+v", home)
+	}
+	highwater, err := requestledger.NewIssuerHighwater(requestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := gatewayA.ledger.ApplyCAS(ctx, home, requestKey, gateway.DurableRequestLifecycleCAS{
+		Operation: requestledger.OperationOpenIssuerLane, Revision: 1, IssuerOpen: highwater,
+	})
+	if err != nil || opened.Ledger.ResultCode != replicatedstate.ResultApplied {
+		t.Fatalf("open durable issuer=%+v err=%v", opened, err)
+	}
+	waitRF3Applied(t, ctx, cluster.owners[:], nil,
+		cluster.groups[multiGroupRF3LedgerGroup].key, opened.Applied)
+
+	queries := []gateway.Query{
+		{SQL: `INSERT INTO orders_a VALUES (?)`, Class: gateway.ClassInteractive,
+			Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"durable-a","group":0}`)}},
+		{SQL: `INSERT INTO orders_b VALUES (?)`, Class: gateway.ClassInteractive,
+			Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"durable-b","group":1}`)}},
+	}
+	// The terminal result is deliberately retained only as the test oracle: the
+	// simulated caller receives no response and reconnects through gateway B.
+	lost, err := gatewayA.sql.Execute(ctx, requestKey, tenant, queries)
+	if err != nil || lost.Result == nil || lost.Result.RowsAffected != multiGroupRF3Groups ||
+		lost.Result.ShardsFanned != multiGroupRF3Groups || lost.TerminalRevision == 0 ||
+		lost.ResultDigest == (replication.Digest{}) || lost.AckToken == (gateway.DurableRequestAckToken{}) {
+		t.Fatalf("gateway A durable terminal=%+v err=%v", lost, err)
+	}
+
+	terminalLeader := waitRF3Leader(t, ctx, cluster.owners[:], nil,
+		cluster.groups[multiGroupRF3LedgerGroup].key)
+	cluster.network.isolate(terminalLeader)
+	removedTerminal := map[int]bool{terminalLeader: true}
+	terminalCandidate := (terminalLeader + 1) % multiGroupRF3Voters
+	if err := cluster.owners[terminalCandidate].Campaign(
+		ctx, cluster.groups[multiGroupRF3LedgerGroup].key,
+	); err != nil {
+		t.Fatal(err)
+	}
+	terminalReplacement := waitRF3Leader(t, ctx, cluster.owners[:], removedTerminal,
+		cluster.groups[multiGroupRF3LedgerGroup].key)
+	if terminalReplacement == terminalLeader {
+		t.Fatal("terminal recovery retained the partitioned ledger leader")
+	}
+	recovered, found, err := gatewayB.sql.Replay(ctx, lost.Key)
+	if err != nil || !found || recovered.Result == nil ||
+		recovered.Key != lost.Key || recovered.TerminalRevision != lost.TerminalRevision ||
+		recovered.ResultDigest != lost.ResultDigest || recovered.AckToken != lost.AckToken ||
+		recovered.Result.TransactionID != lost.Result.TransactionID ||
+		recovered.Result.RowsAffected != lost.Result.RowsAffected {
+		t.Fatalf("gateway B terminal recovery=%+v found=%v err=%v", recovered, found, err)
+	}
+
+	wrong := recovered.AckToken
+	wrong[0] ^= 0xff
+	if _, err = gatewayB.sql.Acknowledge(ctx, recovered.Key, recovered.TerminalRevision,
+		recovered.ResultDigest, wrong,
+	); !errors.Is(err, gateway.ErrDurableRequestConflict) {
+		t.Fatalf("wrong ACK capability error=%v", err)
+	}
+
+	// Restore the first voter before taking the replacement leader away, so the
+	// ACK fault is another genuine two-of-three failover rather than a quorum-loss
+	// artifact. Waiting on one current applied cut proves the healed voter caught up.
+	cluster.network.heal(terminalLeader)
+	terminalState := mustRF3State(t, ctx, cluster.owners[terminalReplacement],
+		cluster.groups[multiGroupRF3LedgerGroup].key)
+	waitRF3Applied(t, ctx, cluster.owners[:], nil,
+		cluster.groups[multiGroupRF3LedgerGroup].key, terminalState.Status.Applied)
+	ackLeader := waitRF3Leader(t, ctx, cluster.owners[:], nil,
+		cluster.groups[multiGroupRF3LedgerGroup].key)
+	gatewayB.client.armLostResponse(requestledger.OperationAck)
+	_, ackErr := gatewayB.sql.Acknowledge(ctx, recovered.Key, recovered.TerminalRevision,
+		recovered.ResultDigest, recovered.AckToken)
+	if !errors.Is(ackErr, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("lost committed ACK error=%v", ackErr)
+	}
+	if !cluster.network.nodeIsolated(ackLeader) {
+		t.Fatalf("ACK leader %d was not partitioned", ackLeader)
+	}
+	removedAck := map[int]bool{ackLeader: true}
+	ackCandidate := (ackLeader + 1) % multiGroupRF3Voters
+	if ackCandidate == ackLeader {
+		ackCandidate = (ackCandidate + 1) % multiGroupRF3Voters
+	}
+	if err := cluster.owners[ackCandidate].Campaign(
+		ctx, cluster.groups[multiGroupRF3LedgerGroup].key,
+	); err != nil {
+		t.Fatal(err)
+	}
+	ackReplacement := waitRF3Leader(t, ctx, cluster.owners[:], removedAck,
+		cluster.groups[multiGroupRF3LedgerGroup].key)
+	if ackReplacement == ackLeader {
+		t.Fatal("ACK recovery retained the partitioned ledger leader")
+	}
+
+	acknowledged, err := gatewayB.sql.Acknowledge(ctx, recovered.Key,
+		recovered.TerminalRevision, recovered.ResultDigest, recovered.AckToken)
+	if err != nil || acknowledged.Ack.GCPhase != requestledger.AckGCComplete ||
+		acknowledged.Ack.TerminalRevision != recovered.TerminalRevision ||
+		acknowledged.Ack.ResultDigest != requestledger.Digest(recovered.ResultDigest) {
+		t.Fatalf("recovered ACK=%+v err=%v", acknowledged, err)
+	}
+	proposals := len(gatewayB.client.proposalTrace())
+	idempotent, err := gatewayB.sql.Acknowledge(ctx, recovered.Key,
+		recovered.TerminalRevision, recovered.ResultDigest, recovered.AckToken)
+	if err != nil || idempotent.Ack.AckDigest != acknowledged.Ack.AckDigest ||
+		len(gatewayB.client.proposalTrace()) != proposals {
+		t.Fatalf("idempotent ACK=%+v proposals=%d/%d err=%v",
+			idempotent, proposals, len(gatewayB.client.proposalTrace()), err)
+	}
+
+	for group, identifier := range []string{"durable-a", "durable-b"} {
+		key, keyOK := orderedkey.AppendString(nil, []byte(identifier), orderedkey.Ascending)
+		if !keyOK {
+			t.Fatalf("encode durable key %q", identifier)
+		}
+		for member := 0; member < multiGroupRF3Voters; member++ {
+			if cluster.network.nodeIsolated(member) {
+				continue
+			}
+			state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[group].key)
+			row, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
+				Fence: state.Fence(), Relation: 1, Key: key, MinimumApplied: 1,
+				MaxValueBytes: replication.MaxMutationValueBytes,
+			})
+			if lease != nil {
+				lease.Release()
+			}
+			if readErr != nil || !row.Found {
+				t.Fatalf("group %d member %d durable row found=%v err=%v",
+					group, member, row.Found, readErr)
+			}
+		}
 	}
 }
