@@ -390,7 +390,9 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"stateRootExactIndexEnd":           {stateRootExactIndexEnd, 192},
 		"stateRootPhysicalCapacityOffset":  {stateRootPhysicalCapacityOffset, 192},
 		"stateRootPhysicalCapacityEnd":     {stateRootPhysicalCapacityEnd, 200},
-		"stateRootReservedOffset":          {stateRootReservedOffset, 200},
+		"stateRootMigrationManifestOffset": {stateRootMigrationManifestOffset, 200},
+		"stateRootMigrationManifestEnd":    {stateRootMigrationManifestEnd, 208},
+		"stateRootReservedOffset":          {stateRootReservedOffset, 208},
 		"PageRefSize":                      {PageRefSize, 32},
 		"InlineSuperblockSize":             {InlineSuperblockSize, 4096},
 		"InlineFreeDeltaCapacity":          {InlineFreeDeltaCapacity, 106},
@@ -422,8 +424,9 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		PageCatalogSegment: 6, PagePrimaryCatalog: 7, PagePrimaryLocator: 8,
 		PageTabletRoute: 9, PagePrimaryAnchor: 10, PagePrimaryLeaf: 11,
 		PagePrimaryExactRoot: 12, PagePrimaryExactLeaf: 13,
-		PagePrimaryExactCatalog: 14,
-		PageMigrationExactRun:   15,
+		PagePrimaryExactCatalog:   14,
+		PageMigrationExactRun:     15,
+		PageMigrationStagingChain: 16,
 	} {
 		if int(kind) != want {
 			t.Fatalf("PageKind %d has value %d, want %d",
@@ -435,12 +438,11 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		pageSize uint32
 		roots    [2]uint64
 		journals [2]uint64
-		manifest uint64
 		data     uint64
 	}{
-		{4096, [2]uint64{0, 4096}, [2]uint64{8192, 12288}, 16384, 24576},
-		{8192, [2]uint64{0, 8192}, [2]uint64{16384, 20480}, 24576, 32768},
-		{65536, [2]uint64{0, 65536}, [2]uint64{131072, 135168}, 139264, 196608},
+		{4096, [2]uint64{0, 4096}, [2]uint64{8192, 12288}, 16384},
+		{8192, [2]uint64{0, 8192}, [2]uint64{16384, 20480}, 24576},
+		{65536, [2]uint64{0, 65536}, [2]uint64{131072, 135168}, 196608},
 	} {
 		layout, err := MutableStoreLayout(fixture.pageSize)
 		if err != nil {
@@ -448,7 +450,6 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		}
 		if layout.RootOffsets != fixture.roots ||
 			layout.MaterializationJournalOffsets != fixture.journals ||
-			layout.GenerationMigrationManifestOffset != fixture.manifest ||
 			layout.DataStart != fixture.data {
 			t.Fatalf("MutableStoreLayout(%d) = %+v", fixture.pageSize, layout)
 		}
@@ -478,12 +479,6 @@ func TestFormat0GoldenMutablePrefix(t *testing.T) {
 		) {
 			t.Fatalf("empty journal at %#x = %v", offset, err)
 		}
-	}
-	manifestOffset := layout.GenerationMigrationManifestOffset
-	manifestEnd := manifestOffset +
-		generationMigrationManifestCopies*GenerationMigrationManifestBytes
-	if !allZero(prefix[manifestOffset:manifestEnd]) {
-		t.Fatalf("empty generation migration manifest at %#x is non-zero", manifestOffset)
 	}
 }
 

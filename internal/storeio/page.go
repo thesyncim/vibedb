@@ -88,6 +88,9 @@ const (
 	// PageMigrationExactRun is an unreachable, authenticated external-sort run
 	// used only while constructing a replacement exact-index generation.
 	PageMigrationExactRun
+	// PageMigrationStagingChain is an immutable backward link over the exact
+	// extents incrementally reserved by one online generation migration.
+	PageMigrationStagingChain
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -237,5 +240,5 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageOverflow && kind <= PageMigrationExactRun
+	return kind >= PageOverflow && kind <= PageMigrationStagingChain
 }

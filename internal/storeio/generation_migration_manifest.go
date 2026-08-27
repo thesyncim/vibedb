@@ -9,7 +9,7 @@ import (
 
 const (
 	GenerationMigrationManifestBytes = 4096
-	generationMigrationHeaderBytes   = 368
+	generationMigrationHeaderBytes   = 464
 	generationMigrationTrailerAt     = GenerationMigrationManifestBytes - 8
 	generationMigrationMagic         = "SGMIGR00"
 )
@@ -40,26 +40,31 @@ const (
 // Cursor is the last fully copied bytewise key; capture sequences delimit the
 // ordered mutation suffix that must be applied before conditional publication.
 type GenerationMigrationManifest struct {
-	StoreID                                                    [16]byte
-	MigrationID                                                [16]byte
-	Phase                                                      GenerationMigrationPhase
-	SourceGeneration                                           uint64
-	TargetGeneration                                           uint64
-	CapturedSequence                                           uint64
-	AppliedSequence                                            uint64
-	SourceFileEnd                                              uint64
-	TargetFileEnd                                              uint64
-	ReservedOffset                                             uint64
-	ReservedBytes                                              uint64
-	FirstLogicalID                                             uint64
-	LogicalIDCount                                             uint64
-	SourcePrimaryRoot, SourceExactIndexRoot, SourceCatalogHead PageRef
-	TargetPrimaryRoot, TargetExactIndexRoot, TargetCatalogHead PageRef
-	SourceCatalogBytes, SourceIndexCount                       uint32
-	ManifestSequence, RetirementOrdinal                        uint64
-	TargetScratchOffset, TargetScratchBytes                    uint64
-	RetirementPhase                                            GenerationMigrationRetirementPhase
-	Cursor                                                     []byte
+	StoreID                                                     [16]byte
+	MigrationID                                                 [16]byte
+	Phase                                                       GenerationMigrationPhase
+	SourceGeneration                                            uint64
+	TargetGeneration                                            uint64
+	CapturedSequence                                            uint64
+	AppliedSequence                                             uint64
+	SourceFileEnd                                               uint64
+	TargetFileEnd                                               uint64
+	ReservedOffset                                              uint64
+	ReservedBytes                                               uint64
+	FirstLogicalID                                              uint64
+	LogicalIDCount                                              uint64
+	SourcePrimaryRoot, SourceExactIndexRoot, SourceCatalogHead  PageRef
+	TargetPrimaryRoot, TargetExactIndexRoot, TargetCatalogHead  PageRef
+	SourceCatalogBytes, SourceIndexCount                        uint32
+	ManifestSequence, RetirementOrdinal                         uint64
+	TargetScratchOffset, TargetScratchBytes                     uint64
+	StagingChainTail                                            PageRef
+	StagingExtentCount, StagingAllocatedBytes, StagingUsedBytes uint64
+	PendingExtentOffset, PendingExtentBytes                     uint64
+	PendingFirstLogicalID, PendingLogicalIDCount                uint64
+	StagingChainSequence                                        uint64
+	RetirementPhase                                             GenerationMigrationRetirementPhase
+	Cursor                                                      []byte
 }
 
 func validGenerationMigrationRoot(ref PageRef, kind PageKind, required bool) bool {
@@ -77,7 +82,7 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 		m.TargetGeneration <= m.SourceGeneration ||
 		m.AppliedSequence > m.CapturedSequence || len(m.Cursor) >
 		generationMigrationTrailerAt-generationMigrationHeaderBytes ||
-		m.ReservedBytes == 0 || m.LogicalIDCount == 0 ||
+		!validGenerationMigrationLegacyReservation(m) ||
 		m.ReservedOffset > ^uint64(0)-m.ReservedBytes ||
 		m.FirstLogicalID > ^uint64(0)-m.LogicalIDCount ||
 		!validGenerationMigrationRoot(m.SourcePrimaryRoot, PagePrimaryCatalog, true) ||
@@ -93,7 +98,7 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 		(m.TargetScratchOffset == 0) != (m.TargetScratchBytes == 0) ||
 		m.TargetScratchOffset&4095 != 0 || m.TargetScratchBytes&4095 != 0 ||
 		m.TargetScratchOffset > ^uint64(0)-m.TargetScratchBytes ||
-		(m.TargetScratchBytes != 0 && (m.TargetScratchOffset < m.ReservedOffset || m.TargetScratchOffset+m.TargetScratchBytes > m.ReservedOffset+m.ReservedBytes)) ||
+		!validGenerationMigrationStagingState(m) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration {
 		return nil, fmt.Errorf("%w: fields", ErrInvalidWrite)
@@ -129,6 +134,15 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 	binary.LittleEndian.PutUint64(image[344:352], m.RetirementOrdinal)
 	binary.LittleEndian.PutUint64(image[352:360], m.TargetScratchOffset)
 	binary.LittleEndian.PutUint64(image[360:368], m.TargetScratchBytes)
+	encodePageRef(image[368:400], m.StagingChainTail)
+	binary.LittleEndian.PutUint64(image[400:408], m.StagingExtentCount)
+	binary.LittleEndian.PutUint64(image[408:416], m.StagingAllocatedBytes)
+	binary.LittleEndian.PutUint64(image[416:424], m.StagingUsedBytes)
+	binary.LittleEndian.PutUint64(image[424:432], m.PendingExtentOffset)
+	binary.LittleEndian.PutUint64(image[432:440], m.PendingExtentBytes)
+	binary.LittleEndian.PutUint64(image[440:448], m.PendingFirstLogicalID)
+	binary.LittleEndian.PutUint64(image[448:456], m.PendingLogicalIDCount)
+	binary.LittleEndian.PutUint64(image[456:464], m.StagingChainSequence)
 	copy(image[generationMigrationHeaderBytes:], m.Cursor)
 	checksum := PageChecksum(image[:generationMigrationTrailerAt])
 	binary.LittleEndian.PutUint32(image[generationMigrationTrailerAt:], checksum)
@@ -174,12 +188,21 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.RetirementOrdinal = binary.LittleEndian.Uint64(src[344:352])
 	m.TargetScratchOffset = binary.LittleEndian.Uint64(src[352:360])
 	m.TargetScratchBytes = binary.LittleEndian.Uint64(src[360:368])
+	m.StagingChainTail = decodePageRef(src[368:400])
+	m.StagingExtentCount = binary.LittleEndian.Uint64(src[400:408])
+	m.StagingAllocatedBytes = binary.LittleEndian.Uint64(src[408:416])
+	m.StagingUsedBytes = binary.LittleEndian.Uint64(src[416:424])
+	m.PendingExtentOffset = binary.LittleEndian.Uint64(src[424:432])
+	m.PendingExtentBytes = binary.LittleEndian.Uint64(src[432:440])
+	m.PendingFirstLogicalID = binary.LittleEndian.Uint64(src[440:448])
+	m.PendingLogicalIDCount = binary.LittleEndian.Uint64(src[448:456])
+	m.StagingChainSequence = binary.LittleEndian.Uint64(src[456:464])
 	cursorBytes := int(binary.LittleEndian.Uint32(src[320:324]))
 	if m.StoreID == ([16]byte{}) || m.MigrationID == ([16]byte{}) ||
 		m.Phase < GenerationMigrationCopying || m.Phase > GenerationMigrationPublished ||
 		m.SourceGeneration == 0 || m.TargetGeneration <= m.SourceGeneration ||
 		m.AppliedSequence > m.CapturedSequence || cursorBytes < 0 ||
-		m.ReservedBytes == 0 || m.LogicalIDCount == 0 ||
+		!validGenerationMigrationLegacyReservation(m) ||
 		m.ReservedOffset > ^uint64(0)-m.ReservedBytes ||
 		m.FirstLogicalID > ^uint64(0)-m.LogicalIDCount ||
 		!validGenerationMigrationRoot(m.SourcePrimaryRoot, PagePrimaryCatalog, true) ||
@@ -195,7 +218,7 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 		(m.TargetScratchOffset == 0) != (m.TargetScratchBytes == 0) ||
 		m.TargetScratchOffset&4095 != 0 || m.TargetScratchBytes&4095 != 0 ||
 		m.TargetScratchOffset > ^uint64(0)-m.TargetScratchBytes ||
-		(m.TargetScratchBytes != 0 && (m.TargetScratchOffset < m.ReservedOffset || m.TargetScratchOffset+m.TargetScratchBytes > m.ReservedOffset+m.ReservedBytes)) ||
+		!validGenerationMigrationStagingState(m) ||
 		m.SourcePrimaryRoot.Generation > m.SourceGeneration ||
 		m.TargetPrimaryRoot.Generation > m.TargetGeneration ||
 		!allZero(src[333:336]) ||
@@ -205,6 +228,36 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	}
 	m.Cursor = src[generationMigrationHeaderBytes : generationMigrationHeaderBytes+cursorBytes]
 	return m, nil
+}
+
+func validGenerationMigrationLegacyReservation(m GenerationMigrationManifest) bool {
+	absent := m.ReservedOffset == 0 && m.ReservedBytes == 0 &&
+		m.FirstLogicalID == 0 && m.LogicalIDCount == 0
+	if absent {
+		return true
+	}
+	return m.ReservedOffset != 0 && m.ReservedBytes != 0 &&
+		m.FirstLogicalID != 0 && m.LogicalIDCount != 0 &&
+		m.ReservedOffset <= ^uint64(0)-m.ReservedBytes &&
+		m.FirstLogicalID <= ^uint64(0)-m.LogicalIDCount
+}
+
+func validGenerationMigrationStagingState(m GenerationMigrationManifest) bool {
+	tailAbsent := m.StagingChainTail == (PageRef{})
+	countsAbsent := m.StagingExtentCount == 0 && m.StagingAllocatedBytes == 0 && m.StagingUsedBytes == 0 && m.StagingChainSequence == 0
+	if tailAbsent != countsAbsent || m.StagingUsedBytes > m.StagingAllocatedBytes ||
+		(!tailAbsent && !validGenerationMigrationRoot(m.StagingChainTail, PageMigrationStagingChain, true)) ||
+		m.StagingChainTail.Generation > m.TargetGeneration ||
+		(m.PendingExtentOffset == 0) != (m.PendingExtentBytes == 0) ||
+		(m.PendingExtentOffset == 0) != (m.PendingFirstLogicalID == 0) ||
+		(m.PendingExtentOffset == 0) != (m.PendingLogicalIDCount == 0) ||
+		m.PendingExtentOffset&4095 != 0 || m.PendingExtentBytes&4095 != 0 ||
+		m.PendingExtentOffset > ^uint64(0)-m.PendingExtentBytes ||
+		m.PendingFirstLogicalID > ^uint64(0)-m.PendingLogicalIDCount ||
+		(m.PendingExtentBytes != 0 && m.Phase == GenerationMigrationPublished) {
+		return false
+	}
+	return true
 }
 
 // ValidateGenerationMigrationAdvance rejects rollback or identity substitution
@@ -238,6 +291,24 @@ func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManife
 		next.SourcePrimaryRoot.Generation > next.SourceGeneration ||
 		next.TargetPrimaryRoot.Generation > next.TargetGeneration ||
 		next.TargetFileEnd < previous.TargetFileEnd ||
+		next.StagingExtentCount < previous.StagingExtentCount ||
+		next.StagingAllocatedBytes < previous.StagingAllocatedBytes ||
+		next.StagingUsedBytes < previous.StagingUsedBytes ||
+		next.StagingChainSequence < previous.StagingChainSequence ||
+		(previous.StagingChainTail != (PageRef{}) &&
+			next.StagingExtentCount == previous.StagingExtentCount &&
+			next.StagingChainTail != previous.StagingChainTail) ||
+		(next.StagingExtentCount > previous.StagingExtentCount &&
+			(next.StagingChainTail == previous.StagingChainTail ||
+				next.StagingChainSequence <= previous.StagingChainSequence)) ||
+		(previous.PendingExtentBytes != 0 && next.PendingExtentBytes != 0 &&
+			(next.PendingExtentOffset != previous.PendingExtentOffset ||
+				next.PendingExtentBytes != previous.PendingExtentBytes ||
+				next.PendingFirstLogicalID != previous.PendingFirstLogicalID ||
+				next.PendingLogicalIDCount != previous.PendingLogicalIDCount)) ||
+		(previous.PendingExtentBytes != 0 && next.PendingExtentBytes == 0 &&
+			next.StagingExtentCount == previous.StagingExtentCount) ||
+		!validGenerationMigrationStagingState(next) ||
 		(next.Phase == GenerationMigrationCopying &&
 			bytes.Compare(next.Cursor, previous.Cursor) < 0) ||
 		(next.Phase >= GenerationMigrationReady &&

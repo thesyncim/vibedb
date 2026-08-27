@@ -44,9 +44,15 @@ const (
 	// ever publish.
 	stateRootPhysicalCapacityOffset = stateRootExactIndexEnd
 	stateRootPhysicalCapacityEnd    = stateRootPhysicalCapacityOffset + 8
+	// stateRootMigrationManifestOffset locates the two authenticated, fixed-size
+	// online-migration manifest slots allocated from ordinary file space. Zero
+	// means no migration is active. Keeping the locator in both root copies
+	// makes recovery independent of trailing-byte discovery.
+	stateRootMigrationManifestOffset = stateRootPhysicalCapacityEnd
+	stateRootMigrationManifestEnd    = stateRootMigrationManifestOffset + 8
 	// stateRootReservedOffset begins the zero-filled suffix described on
 	// StateRootPayloadSize.
-	stateRootReservedOffset = stateRootPhysicalCapacityEnd
+	stateRootReservedOffset = stateRootMigrationManifestEnd
 )
 
 // State-root option bits are durable equivalents of Store construction
@@ -150,6 +156,10 @@ type StateRoot struct {
 	// after strict platform proof, is the current allocation certificate. Zero
 	// selects elastic allocation.
 	PhysicalCapacityBytes uint64
+	// MigrationManifestOffset names two contiguous 4-KiB authenticated manifest
+	// slots. They remain allocator-owned until the root clears this field and
+	// snapshot/recovery floors permit retirement.
+	MigrationManifestOffset uint64
 }
 
 // encodeStateRootPayload writes the identity-free StateRoot body shared by the
@@ -209,6 +219,10 @@ func encodeStateRootPayload(payload []byte, root StateRoot) {
 		payload[stateRootPhysicalCapacityOffset:stateRootPhysicalCapacityEnd],
 		root.PhysicalCapacityBytes,
 	)
+	binary.LittleEndian.PutUint64(
+		payload[stateRootMigrationManifestOffset:stateRootMigrationManifestEnd],
+		root.MigrationManifestOffset,
+	)
 }
 
 // decodeStateRootPayload decodes the identity-free StateRoot body shared by
@@ -264,6 +278,9 @@ func decodeStateRootPayload(
 		),
 		PhysicalCapacityBytes: binary.LittleEndian.Uint64(
 			payload[stateRootPhysicalCapacityOffset:stateRootPhysicalCapacityEnd],
+		),
+		MigrationManifestOffset: binary.LittleEndian.Uint64(
+			payload[stateRootMigrationManifestOffset:stateRootMigrationManifestEnd],
 		),
 	}
 	copy(root.JournalID[:], payload[stateRootJournalIDOffset:stateRootJournalIDEnd])
@@ -329,6 +346,13 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 			root.PhysicalCapacityBytes > maxSuperblockFileOffset ||
 			root.PhysicalCapacityBytes%pageSize != 0) {
 		return fmt.Errorf("%w: sealed physical capacity", ErrInvalidWrite)
+	}
+	if root.MigrationManifestOffset != 0 &&
+		(root.MigrationManifestOffset < layout.DataStart ||
+			root.MigrationManifestOffset%uint64(GenerationMigrationManifestBytes) != 0 ||
+			root.MigrationManifestOffset > fileEnd-
+				uint64(2*GenerationMigrationManifestBytes)) {
+		return fmt.Errorf("%w: migration manifest locator", ErrInvalidWrite)
 	}
 	if root.PhysicalCapacityBytes != 0 &&
 		(root.JournalID != ([16]byte{}) || materializationEnabled) {

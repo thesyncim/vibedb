@@ -74,3 +74,48 @@ func TestGenerationMigrationManifestCanonicalAndCrashRejecting(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerationMigrationManifestStagesCrashDiscoverableExtent(t *testing.T) {
+	m := GenerationMigrationManifest{
+		StoreID: [16]byte{1}, MigrationID: [16]byte{2},
+		Phase: GenerationMigrationCopying, SourceGeneration: 9, TargetGeneration: 10,
+		SourceFileEnd: 1 << 20, ReservedOffset: 1 << 20, ReservedBytes: 4096,
+		FirstLogicalID: 50, LogicalIDCount: 1,
+		SourcePrimaryRoot: PageRef{Offset: 64 << 10, LogicalID: GlobalTabletCatalogRootLogicalID, Generation: 9, Length: GlobalTabletCatalogRootBytes, Kind: PagePrimaryCatalog},
+	}
+	pending := m
+	pending.PendingExtentOffset = 2 << 20
+	pending.PendingExtentBytes = 1 << 20
+	pending.PendingFirstLogicalID = 51
+	pending.PendingLogicalIDCount = 257
+	if err := ValidateGenerationMigrationAdvance(m, pending); err != nil {
+		t.Fatalf("pending advance: %v", err)
+	}
+	linked := pending
+	linked.PendingExtentOffset, linked.PendingExtentBytes = 0, 0
+	linked.PendingFirstLogicalID, linked.PendingLogicalIDCount = 0, 0
+	linked.StagingChainTail = PageRef{Offset: 2 << 20, LogicalID: 51, Generation: 10, Length: 4096, Kind: PageMigrationStagingChain}
+	linked.StagingExtentCount = 1
+	linked.StagingChainSequence = 1
+	linked.StagingAllocatedBytes = 1 << 20
+	linked.StagingUsedBytes = 4096
+	linked.TargetFileEnd = 3 << 20
+	if err := ValidateGenerationMigrationAdvance(pending, linked); err != nil {
+		t.Fatalf("linked advance: %v", err)
+	}
+	encoded, err := EncodeGenerationMigrationManifest(make([]byte, GenerationMigrationManifestBytes), linked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenGenerationMigrationManifest(encoded)
+	if err != nil || opened.StagingChainTail != linked.StagingChainTail ||
+		opened.StagingAllocatedBytes != linked.StagingAllocatedBytes {
+		t.Fatalf("opened = %+v err=%v", opened, err)
+	}
+	invalid := pending
+	invalid.PendingExtentOffset, invalid.PendingExtentBytes = 0, 0
+	invalid.PendingFirstLogicalID, invalid.PendingLogicalIDCount = 0, 0
+	if err := ValidateGenerationMigrationAdvance(pending, invalid); err == nil {
+		t.Fatal("cleared pending extent without linking it")
+	}
+}
