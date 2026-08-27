@@ -112,7 +112,7 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 	epoch := applyReplicatedApplySessionOpen(t, apply, sourceIdentity, 2)
 	document := []byte(`{"email":"a","id":"bundle-doc"}`)
 	baseKey := testReplicatedApplyKey(t, source, document)
-	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["bundle-doc"]`)
+	globalKey, locator := testReplicatedGlobalIndexKey(t, sourceIdentity.Relations[1], "a"), []byte(`["bundle-doc"]`)
 	commandValue := testReplicatedApplyCommandValue(sourceIdentity, epoch, 2, nil)
 	commandValue.Fingerprint = sha256.Sum256([]byte("snapshot-stage-bundle"))
 	commandValue.Batches = []replication.RelationMutationBatch{
@@ -129,6 +129,9 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 	}
 	if _, err = apply.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
 		t.Fatal(err)
+	}
+	if got := completionResultCode(t, apply, command); got != replicatedstate.ResultApplied {
+		t.Fatalf("snapshot source bundle result = %d", got)
 	}
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {

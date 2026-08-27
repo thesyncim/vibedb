@@ -33,7 +33,7 @@ func TestReplicatedRestoreStageDiscardsAuthorityAndResumesBundle(t *testing.T) {
 	}
 	document := []byte(`{"email":"restore@example","id":"restore-doc"}`)
 	baseKey := testReplicatedApplyKey(t, source, document)
-	globalKey, locator := []byte{0x91, 0x01, 'r'}, []byte(`["restore-doc"]`)
+	globalKey, locator := testReplicatedGlobalIndexKey(t, sourceIdentity.Relations[1], "restore@example"), []byte(`["restore-doc"]`)
 	commandValue := testReplicatedApplyCommandValue(sourceIdentity, epoch, 2, nil)
 	commandValue.Fingerprint = sha256.Sum256([]byte("restore-bundle-source"))
 	commandValue.Batches = []replication.RelationMutationBatch{
@@ -50,6 +50,9 @@ func TestReplicatedRestoreStageDiscardsAuthorityAndResumesBundle(t *testing.T) {
 	}
 	if _, err = apply.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil || capture.Head() != 3 {
 		t.Fatalf("source apply/capture head=%d err=%v", capture.Head(), err)
+	}
+	if got := completionResultCode(t, apply, command); got != replicatedstate.ResultApplied {
+		t.Fatalf("restore source bundle result = %d", got)
 	}
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {

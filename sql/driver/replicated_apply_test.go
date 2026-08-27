@@ -382,6 +382,40 @@ func TestReplicatedApplyAuthenticatesAndMaintainsNativeExactIndexes(t *testing.T
 	}
 }
 
+func testReplicatedGlobalIndexKey(t *testing.T, relation ReplicatedShardRelationIdentity, value string) []byte {
+	t.Helper()
+	key, err := distribution.CurrentTupleCodec.AppendTuple(nil, []distribution.Scalar{distribution.NewString(value)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := relation.GlobalIndexStorageKeyPoint(key); !ok {
+		t.Fatalf("fixture global key is invalid for retained relation: %x", key)
+	}
+	return key
+}
+
+func TestReplicatedGlobalIndexFixtureKeyPreflight(t *testing.T) {
+	relation := ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
+		IndexID: 41, Incarnation: 7, LocatorCount: 1, Unique: true,
+		KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		BucketBits: distribution.DefaultVirtualBucketBits,
+	}
+	validator := replicatedGlobalIndexMutationValidator{
+		relation: relation, placement: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+	}
+	for _, value := range []string{"a", "restore@example"} {
+		key := testReplicatedGlobalIndexKey(t, relation, value)
+		if got := validator.ValidatePut(key, nil); got != replicatedstate.MutationValidationAccept {
+			t.Fatalf("canonical key %x rejected: %v", key, got)
+		}
+	}
+	if got := validator.ValidatePut([]byte{0x91, 0x01, 'a'}, nil); got != replicatedstate.MutationValidationInvalid {
+		t.Fatalf("obsolete handwritten key accepted: %v", got)
+	}
+}
+
 func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testing.T) {
 	path, database, binding, _ := prepareReplicatedTestRoot(t, "global-relation-bundle", false)
 	session, err := database.NewSession(context.Background())
@@ -438,7 +472,7 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	document := []byte(`{"email":"a","id":"doc-1"}`)
 	baseKey := testReplicatedApplyKey(t, database, document)
-	globalKey := []byte{0x91, 0x01, 'a'}
+	globalKey := testReplicatedGlobalIndexKey(t, base.Relations[1], "a")
 	locator := []byte(`["doc-1"]`)
 	commandValue := testReplicatedApplyCommandValue(base, epoch, 2, nil)
 	commandValue.Fingerprint = sha256.Sum256([]byte("sql-global-relation-bundle-put"))
