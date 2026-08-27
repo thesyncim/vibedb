@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -29,6 +31,8 @@ import (
 const (
 	rf3EvidenceSeed          = uint64(0x5649424544425246)
 	rf3EvidenceMaxValueBytes = 128
+	rf3EvidenceRouteAttempts = 8
+	rf3EvidenceReadAttempts  = 8
 )
 
 type rf3EvidenceClient struct {
@@ -156,12 +160,13 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 	leader := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
 	roundTripper := newMultiGroupRF3RoundTripper(t, cluster)
 	executor, err := gateway.NewReplicatedExecutorWithOptions(roundTripper, gateway.ReplicatedExecutorOptions{
-		MaxAttempts: 8, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 8,
+		MaxAttempts: rf3EvidenceRouteAttempts, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	route := cluster.route(0)
+	readLimit := uint32(cluster.groups[0].bases[leader].UserLimits.MaxDocumentBytes)
 	clients := make([]rf3EvidenceClient, config.Clients)
 	var minimumApplied uint64
 	for index := range clients {
@@ -177,7 +182,7 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 	for ordinal := uint64(0); ordinal < config.Warmup; ordinal++ {
 		client := &clients[ordinal%uint64(len(clients))]
 		if evidenceOperation(config.Workload, config.Seed, ordinal) == rf3bench.OperationRead {
-			readRF3Evidence(t, ctx, executor, route, client.key, minimumApplied)
+			readRF3Evidence(t, ctx, executor, route, client.key, minimumApplied, readLimit)
 		} else {
 			result := proposeRF3Evidence(t, ctx, executor, route, cluster.groups[0].bases[leader],
 				client, evidenceValue(uint32(ordinal%uint64(len(clients))), client.sequence))
@@ -207,10 +212,8 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 					ClientSequence: clientOperation, Operation: operation,
 					PayloadBytes: uint32(len(client.key))}
 				if operation == rf3bench.OperationRead {
-					result, readErr := executor.ReadPoint(ctx, route, gateway.ReplicatedPointRead{
-						Relation: 1, Key: client.key, MinimumApplied: minimumApplied,
-						MaxValueBytes: rf3EvidenceMaxValueBytes, Linearizable: true,
-					})
+					result, readErr := readRF3EvidencePoint(ctx, executor, route,
+						evidencePointRead(client.key, minimumApplied, readLimit))
 					if readErr != nil {
 						t.Errorf("read client=%d ordinal=%d: %v", clientIndex, ordinal+1, readErr)
 						return
@@ -263,7 +266,7 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 		}
 	}
 	config.ElapsedNS = uint64(max(elapsed, time.Nanosecond))
-	report := rf3bench.Report{Config: config, Metadata: evidenceMetadata(), Samples: samples,
+	report := rf3bench.Report{Config: config, Metadata: evidenceMetadata(readLimit), Samples: samples,
 		Counters: evidenceCounters(before, after, reads, writes, retries, logicalWriteBytes)}
 	var encoded bytes.Buffer
 	if err := rf3bench.WriteTSV(&encoded, report); err != nil {
@@ -340,15 +343,141 @@ func proposeRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.Rep
 }
 
 func readRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.ReplicatedExecutor,
-	route gateway.ReplicatedRoute, key []byte, minimumApplied uint64,
+	route gateway.ReplicatedRoute, key []byte, minimumApplied uint64, readLimit uint32,
 ) {
 	t.Helper()
-	result, err := executor.ReadPoint(ctx, route, gateway.ReplicatedPointRead{
-		Relation: 1, Key: key, MinimumApplied: minimumApplied,
-		MaxValueBytes: rf3EvidenceMaxValueBytes, Linearizable: true,
-	})
+	result, err := readRF3EvidencePoint(ctx, executor, route, evidencePointRead(key, minimumApplied, readLimit))
 	if err != nil || !result.Found {
 		t.Fatalf("warmup read found=%t err=%v", result.Found, err)
+	}
+}
+
+func evidencePointRead(key []byte, minimumApplied uint64, readLimit uint32) gateway.ReplicatedPointRead {
+	// Point-read admission uses the relation's frozen maximum document size,
+	// not the smaller current evidence value. Keep production admission intact.
+	return gateway.ReplicatedPointRead{Relation: 1, Key: key, MinimumApplied: minimumApplied,
+		MaxValueBytes: readLimit, Linearizable: true}
+}
+
+type rf3EvidencePointReader interface {
+	ReadPoint(context.Context, gateway.ReplicatedRoute, gateway.ReplicatedPointRead) (gateway.ReplicatedPointResult, error)
+}
+
+func readRF3EvidencePoint(ctx context.Context, reader rf3EvidencePointReader,
+	route gateway.ReplicatedRoute, read gateway.ReplicatedPointRead,
+) (gateway.ReplicatedPointResult, error) {
+	// The fixture retains its fixed owner memory budget. At higher client
+	// counts a full-size response reservation can meet backpressure even for a
+	// small value. Bounded client retries include their waiting time in the
+	// caller's measured latency; no owner queue or resource limit is enlarged.
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return gateway.ReplicatedPointResult{}, err
+		}
+		result, err := reader.ReadPoint(ctx, route, read)
+		if err == nil {
+			result.Retries += attempt * rf3EvidenceRouteAttempts
+			return result, nil
+		}
+		// Only an exhausted routing attempt carrying an admission refusal is
+		// retryable here. Fence, schema, response-bound and intent failures stay
+		// visible instead of being turned into a successful benchmark sample.
+		if attempt+1 == rf3EvidenceReadAttempts || !errors.Is(err, gateway.ErrReplicatedLeader) ||
+			!errors.Is(err, raftmodel.ErrAdmissionBound) {
+			return gateway.ReplicatedPointResult{}, err
+		}
+		timer := time.NewTimer(time.Millisecond << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return gateway.ReplicatedPointResult{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+type rf3EvidencePointReadFunc func(context.Context, gateway.ReplicatedRoute, gateway.ReplicatedPointRead) (gateway.ReplicatedPointResult, error)
+
+func (f rf3EvidencePointReadFunc) ReadPoint(ctx context.Context, route gateway.ReplicatedRoute,
+	read gateway.ReplicatedPointRead,
+) (gateway.ReplicatedPointResult, error) {
+	return f(ctx, route, read)
+}
+
+func TestRF3EvidenceReadUsesFrozenRelationBound(t *testing.T) {
+	const frozenLimit = 4 << 20
+	key := []byte("evidence-key")
+	read := evidencePointRead(key, 37, frozenLimit)
+	if read.MaxValueBytes != frozenLimit || read.MaxValueBytes <= rf3EvidenceMaxValueBytes ||
+		read.Relation != 1 || read.MinimumApplied != 37 || !read.Linearizable || !bytes.Equal(read.Key, key) {
+		t.Fatalf("read did not retain frozen response and consistency contract: %+v", read)
+	}
+	metadata := evidenceMetadata(frozenLimit)
+	for i := 1; i < len(metadata); i++ {
+		if bytes.Compare(metadata[i-1].Key, metadata[i].Key) >= 0 {
+			t.Fatal("evidence metadata lost canonical key order")
+		}
+	}
+}
+
+func TestRF3EvidenceReadAdmissionRetryBound(t *testing.T) {
+	pressure := errors.Join(gateway.ErrReplicatedLeader, raftmodel.ErrAdmissionBound)
+	for _, test := range []struct {
+		name     string
+		failures int
+		err      error
+		want     int
+	}{
+		{"pressure-then-success", 2, pressure, 3},
+		{"pressure-exhausted", rf3EvidenceReadAttempts, pressure, rf3EvidenceReadAttempts},
+		{"response-bound", 1, gateway.ErrReplicatedReadBufferBound, 1},
+		{"active-intent", 1, gateway.ErrReplicatedReadIntentActive, 1},
+		{"other-route-failure", 1, gateway.ErrReplicatedLeader, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			read := evidencePointRead([]byte("key"), 7, 4<<20)
+			calls := 0
+			reader := rf3EvidencePointReadFunc(func(_ context.Context, _ gateway.ReplicatedRoute,
+				got gateway.ReplicatedPointRead,
+			) (gateway.ReplicatedPointResult, error) {
+				calls++
+				if got.MinimumApplied != read.MinimumApplied || got.MaxValueBytes != read.MaxValueBytes ||
+					got.Relation != read.Relation || got.Linearizable != read.Linearizable || !bytes.Equal(got.Key, read.Key) {
+					t.Fatal("retry changed read contract")
+				}
+				if calls <= test.failures {
+					return gateway.ReplicatedPointResult{}, test.err
+				}
+				return gateway.ReplicatedPointResult{Found: true, Applied: 9, Retries: 1}, nil
+			})
+			result, err := readRF3EvidencePoint(context.Background(), reader, gateway.ReplicatedRoute{}, read)
+			if calls != test.want {
+				t.Fatalf("attempts=%d want=%d", calls, test.want)
+			}
+			if test.failures < test.want {
+				if err != nil || !result.Found || result.Applied != 9 || result.Retries != 1+test.failures*rf3EvidenceRouteAttempts {
+					t.Fatalf("success result=%+v err=%v", result, err)
+				}
+			} else if err != test.err {
+				t.Fatalf("terminal error=%v want=%v", err, test.err)
+			}
+		})
+	}
+}
+
+func TestRF3EvidenceReadAdmissionRetryCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	reader := rf3EvidencePointReadFunc(func(context.Context, gateway.ReplicatedRoute,
+		gateway.ReplicatedPointRead,
+	) (gateway.ReplicatedPointResult, error) {
+		calls++
+		cancel()
+		return gateway.ReplicatedPointResult{}, errors.Join(gateway.ErrReplicatedLeader, raftmodel.ErrAdmissionBound)
+	})
+	if _, err := readRF3EvidencePoint(ctx, reader, gateway.ReplicatedRoute{}, evidencePointRead([]byte("key"), 7, 4<<20)); !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("cancelled read calls=%d err=%v", calls, err)
 	}
 }
 
@@ -472,12 +601,15 @@ func evidenceCounters(before, after rf3EvidenceCut, reads, writes, retries, logi
 	}
 }
 
-func evidenceMetadata() []rf3bench.Metadata {
+func evidenceMetadata(readLimit uint32) []rf3bench.Metadata {
 	metadata := []rf3bench.Metadata{
 		{Key: []byte("counter_cut"), Value: []byte("followers-applied")},
 		{Key: []byte("go_version"), Value: []byte(runtime.Version())},
 		{Key: []byte("goarch"), Value: []byte(runtime.GOARCH)},
 		{Key: []byte("goos"), Value: []byte(runtime.GOOS)},
+		{Key: []byte("read_admission"), Value: []byte("owner-bounded-retry-wait-in-latency")},
+		{Key: []byte("read_max_value_bytes"), Value: strconv.AppendUint(nil, uint64(readLimit), 10)},
+		{Key: []byte("read_retry_rounds"), Value: strconv.AppendUint(nil, rf3EvidenceReadAttempts, 10)},
 		{Key: []byte("vcs_modified"), Value: []byte("unknown")},
 		{Key: []byte("vcs_revision"), Value: []byte("unknown")},
 	}
@@ -485,9 +617,9 @@ func evidenceMetadata() []rf3bench.Metadata {
 		for _, setting := range info.Settings {
 			switch setting.Key {
 			case "vcs.revision":
-				metadata[5].Value = []byte(setting.Value)
+				metadata[len(metadata)-1].Value = []byte(setting.Value)
 			case "vcs.modified":
-				metadata[4].Value = []byte(setting.Value)
+				metadata[len(metadata)-2].Value = []byte(setting.Value)
 			}
 		}
 	}
