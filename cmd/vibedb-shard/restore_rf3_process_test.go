@@ -237,7 +237,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 			fixture.group.GroupID[0]++
 			fixture.group.ShardIncarnation[0]++
 			for i := range fixture.nodes {
-				fixture.nodes[i][0] += 16
+				fixture.nodes[i][0] += 64
 			}
 		}
 		fixtures[ordinal] = fixture
