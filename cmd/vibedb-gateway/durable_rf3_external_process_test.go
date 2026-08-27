@@ -532,6 +532,7 @@ func newDurableRF3ExternalFixture(
 		t.Fatal(err)
 	}
 
+	shardBinary, gatewayBinary := durableRF3ExternalBinaryPaths(t, fixture.root)
 	for member := 0; member < durableRF3ExternalVoters; member++ {
 		documents := make([][]byte, durableRF3ExternalGroups)
 		for group := range documents {
@@ -549,13 +550,14 @@ func newDurableRF3ExternalFixture(
 		if err = os.WriteFile(manifestPath, bundle, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		fixture.shards[member] = &rf3testfixture.ExternalProcess{Binary: filepath.Join(fixture.root, "vibedb-shard"),
+		fixture.shards[member] = &rf3testfixture.ExternalProcess{Binary: shardBinary,
 			Args: []string{"serve-rf3", "-manifest", manifestPath}}
 	}
-	shardBinary := filepath.Join(fixture.root, "vibedb-shard")
-	gatewayBinary := filepath.Join(fixture.root, "vibedb-gateway")
 	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
 	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
+	t.Logf("external RF3 reserved_wal_bytes=%d build_artifact_allocated_bytes=%d (outside persistent data root)",
+		int64(durableRF3ExternalGroups*durableRF3ExternalVoters)*wal.MaxFileBytes,
+		replicaProcessAllocatedBytes(filepath.Dir(shardBinary), ""))
 	if err = cluster.ReleaseListeners(); err != nil {
 		t.Fatal(err)
 	}

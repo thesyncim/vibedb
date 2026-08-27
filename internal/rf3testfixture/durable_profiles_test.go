@@ -4,6 +4,7 @@ package rf3testfixture
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,10 +19,12 @@ import (
 // Exercise the real durable WAL without requiring Linux-only SQL sidecars.
 func TestDurableGatewayWALRetainsReadyHeadroomAcrossRestart(t *testing.T) {
 	options := DurableGatewayWALOptions()
-	const suffixBytes = 16 << 20
+	const suffixBytes = 8 << 20
 	if options.MaxLiveBytes != raftstore.MinimumReadyLiveBytes+suffixBytes ||
 		options.MaxFileBytes != int64(raftstore.HeaderBytes+raftstore.MaxSnapshotBaseRecordBytes+
-			raftstore.MinimumReadyRecordBytes)+options.MaxLiveBytes {
+			raftstore.MinimumReadyRecordBytes)+options.MaxLiveBytes ||
+		options.MaxRecordBytes != raftstore.MinimumReadyRecordBytes ||
+		options.MaxEntries != raftstore.MaxReadyEntries+(16<<10) {
 		t.Fatal("fixture capacity no longer reserves exactly one Ready beyond its bounded live log")
 	}
 	identity := raftstore.Identity{Distribution: "catalog", Shard: "controlplane",
@@ -36,6 +39,9 @@ func TestDurableGatewayWALRetainsReadyHeadroomAcrossRestart(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 	index := uint64(1)
+	// Four MiB of exact retained payload across 256 separately durable Ready
+	// records exercises useful workload space, not just empty-entry overhead.
+	payload := bytes.Repeat([]byte{0x5a}, 16<<10)
 	for boot := uint64(1); boot <= 2; boot++ {
 		incarnation, err := store.BeginIncarnation()
 		if err != nil || incarnation != boot {
@@ -54,10 +60,11 @@ func TestDurableGatewayWALRetainsReadyHeadroomAcrossRestart(t *testing.T) {
 				t.Fatalf("boot %d ready %d headroom: %v", boot, ready, err)
 			}
 			index++
+			binary.LittleEndian.PutUint64(payload[:8], index)
 			entryType := pb.EntryNormal
 			if err := store.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: ready,
 				HardState: &pb.HardState{Term: &term, Vote: &vote, Commit: &index},
-				Entries:   []*pb.Entry{{Index: &index, Term: &term, Type: &entryType, Data: []byte("retained")}},
+				Entries:   []*pb.Entry{{Index: &index, Term: &term, Type: &entryType, Data: payload}},
 				MustSync:  true}); err != nil {
 				t.Fatalf("boot %d ready %d persist: %v", boot, ready, err)
 			}
@@ -81,8 +88,9 @@ func TestDurableGatewayWALRetainsReadyHeadroomAcrossRestart(t *testing.T) {
 			t.Fatalf("boot %d retained entries=%d: %v", boot, len(entries), err)
 		}
 		for offset, entry := range entries {
+			binary.LittleEndian.PutUint64(payload[:8], uint64(offset)+2)
 			if entry.GetIndex() != uint64(offset)+2 || entry.GetTerm() != uint64(offset/128)+2 ||
-				entry.GetType() != pb.EntryNormal || !bytes.Equal(entry.Data, []byte("retained")) {
+				entry.GetType() != pb.EntryNormal || !bytes.Equal(entry.Data, payload) {
 				t.Fatalf("boot %d retained entry %d changed: %v", boot, offset, entry)
 			}
 		}
@@ -91,4 +99,11 @@ func TestDurableGatewayWALRetainsReadyHeadroomAcrossRestart(t *testing.T) {
 			t.Fatalf("boot %d changed fixed WAL allocation: %v", boot, err)
 		}
 	}
+	const processWALs = 3 * DurableGatewayGroups
+	reserved := int64(processWALs) * options.MaxFileBytes
+	if reserved >= 2<<30 {
+		t.Fatalf("fixed WAL reservation alone exceeds process data budget: %d", reserved)
+	}
+	t.Logf("physical profile: WALs=%d reservation=%d other_data_margin=%d retained_test_payload=%d",
+		processWALs, reserved, (2<<30)-reserved, 256*len(payload))
 }
