@@ -69,10 +69,10 @@ func TestDistributedMetricsAuthenticatedExactGroupRefresh(t *testing.T) {
 	if err != nil || metrics.RefreshOne(t.Context(), 0) != nil {
 		t.Fatalf("new/refresh err=%v", err)
 	}
-	samples, aggregate, err := metrics.SnapshotInto(make([]DistributedMetricsSample, 0, 1))
-	if err != nil || len(samples) != 1 || samples[0].Group != group || samples[0].Member != 7 ||
+	samples, aggregate, err := metrics.SnapshotInto(make([]DistributedMetricsSample, 0, metrics.Len()))
+	if err != nil || len(samples) != 2 || samples[0].Group != group || samples[0].Member != 7 ||
 		samples[0].Node != node || samples[0].Cut != cut || samples[0].Reads != 1 || samples[0].Faults != 0 ||
-		aggregate.Cut != cut || aggregate.Samples != 1 || aggregate.Reads != 1 {
+		!samples[1].NodeAggregate || samples[1].Node != node || aggregate.Cut != cut || aggregate.Samples != 2 || aggregate.Reads != 1 {
 		t.Fatalf("samples=%+v aggregate=%+v err=%v", samples, aggregate, err)
 	}
 }

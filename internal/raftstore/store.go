@@ -57,6 +57,31 @@ type Store struct {
 	pending              *pendingMutation
 }
 
+// Metrics is a detached fixed-width view of live WAL retention and durable
+// synchronization work. It exposes no path or mutable storage authority.
+type Metrics struct {
+	LiveBytes uint64
+	Entries   uint64
+	Syncs     uint64
+}
+
+func (store *Store) Metrics() Metrics {
+	if store == nil {
+		return Metrics{}
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if store.closed {
+		return Metrics{}
+	}
+	entries := uint64(len(store.image.entries))
+	live := store.image.liveBytes
+	if live < 0 {
+		live = 0
+	}
+	return Metrics{LiveBytes: uint64(live), Entries: entries, Syncs: store.syncCount}
+}
+
 type pendingKind uint8
 
 const (

@@ -16,7 +16,7 @@ import (
 
 const (
 	RequestBytes  = 80
-	ResponseBytes = 176
+	ResponseBytes = 312
 )
 
 var (
@@ -42,7 +42,18 @@ type Snapshot struct {
 	Group   raftmember.GroupKey
 	Member  uint64
 	Metrics raftservice.ProgressMetricsSnapshot
+	Stages  StageMetricsSnapshot
 }
+
+type StageMetricsSnapshot struct {
+	CheckpointApplied, Checkpoints, PhysicalCheckpoints, CheckpointBarrierSyncs uint64
+	WALLiveBytes, WALEntries, WALSyncs                                          uint64
+	BackupRequests, BackupFaults, BackupLogicalBytes, BackupScanBytes           uint64
+	SnapshotTransferChunks, SnapshotTransferBytes, SnapshotResidentBytes        uint64
+	ReplicaActionRequests, ReplicaActionCompletions, ReplicaActionFaults        uint64
+}
+
+type StageProvider interface{ StageMetrics() StageMetricsSnapshot }
 
 type AuthorizeFunc func(rafttransport.PeerIdentity) bool
 
@@ -88,6 +99,9 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	snapshot := Snapshot{Group: group}
 	if group == (raftmember.GroupKey{}) {
 		snapshot.Metrics = service.options.Provider.ProgressMetrics()
+		if provider, ok := service.options.Provider.(StageProvider); ok {
+			snapshot.Stages = provider.StageMetrics()
+		}
 	} else {
 		provider, ok := service.options.Provider.(GroupProvider)
 		identity, metrics, found := provider.GroupProgressMetrics(group)
@@ -116,14 +130,23 @@ func appendResponse(snapshot Snapshot) (response [ResponseBytes]byte) {
 	for index, value := range values {
 		binary.BigEndian.PutUint64(response[88+index*8:96+index*8], value)
 	}
-	digest := sha256.Sum256(response[:144])
-	copy(response[144:], digest[:])
+	stages := snapshot.Stages
+	stageValues := [...]uint64{stages.CheckpointApplied, stages.Checkpoints, stages.PhysicalCheckpoints,
+		stages.CheckpointBarrierSyncs, stages.WALLiveBytes, stages.WALEntries, stages.WALSyncs,
+		stages.BackupRequests, stages.BackupFaults, stages.BackupLogicalBytes, stages.BackupScanBytes,
+		stages.SnapshotTransferChunks, stages.SnapshotTransferBytes, stages.SnapshotResidentBytes,
+		stages.ReplicaActionRequests, stages.ReplicaActionCompletions, stages.ReplicaActionFaults}
+	for index, value := range stageValues {
+		binary.BigEndian.PutUint64(response[144+index*8:152+index*8], value)
+	}
+	digest := sha256.Sum256(response[:280])
+	copy(response[280:], digest[:])
 	return response
 }
 
 func OpenResponse(response []byte) (Snapshot, error) {
 	if len(response) != ResponseBytes || responseMagic != [8]byte(response[:8]) ||
-		sha256.Sum256(response[:144]) != [sha256.Size]byte(response[144:]) {
+		sha256.Sum256(response[:280]) != [sha256.Size]byte(response[280:]) {
 		return Snapshot{}, ErrMetrics
 	}
 	group := openGroup(response[8:80])
@@ -135,9 +158,19 @@ func OpenResponse(response []byte) (Snapshot, error) {
 	for index := range values {
 		values[index] = binary.BigEndian.Uint64(response[88+index*8 : 96+index*8])
 	}
+	stageValues := [17]uint64{}
+	for index := range stageValues {
+		stageValues[index] = binary.BigEndian.Uint64(response[144+index*8 : 152+index*8])
+	}
 	return Snapshot{Group: group, Member: member, Metrics: raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1],
 		AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4],
-		ReadCompletions: values[5], Faults: values[6]}}, nil
+		ReadCompletions: values[5], Faults: values[6]}, Stages: StageMetricsSnapshot{
+		CheckpointApplied: stageValues[0], Checkpoints: stageValues[1], PhysicalCheckpoints: stageValues[2],
+		CheckpointBarrierSyncs: stageValues[3], WALLiveBytes: stageValues[4], WALEntries: stageValues[5], WALSyncs: stageValues[6],
+		BackupRequests: stageValues[7], BackupFaults: stageValues[8], BackupLogicalBytes: stageValues[9], BackupScanBytes: stageValues[10],
+		SnapshotTransferChunks: stageValues[11], SnapshotTransferBytes: stageValues[12], SnapshotResidentBytes: stageValues[13],
+		ReplicaActionRequests: stageValues[14], ReplicaActionCompletions: stageValues[15], ReplicaActionFaults: stageValues[16],
+	}}, nil
 }
 
 type Client struct {
@@ -145,8 +178,12 @@ type Client struct {
 }
 
 func (client Client) Read(ctx context.Context) (raftservice.ProgressMetricsSnapshot, error) {
-	snapshot, err := client.ReadGroup(ctx, raftmember.GroupKey{})
+	snapshot, err := client.ReadNode(ctx)
 	return snapshot.Metrics, err
+}
+
+func (client Client) ReadNode(ctx context.Context) (Snapshot, error) {
+	return client.ReadGroup(ctx, raftmember.GroupKey{})
 }
 
 func (client Client) ReadGroup(ctx context.Context, group raftmember.GroupKey) (Snapshot, error) {

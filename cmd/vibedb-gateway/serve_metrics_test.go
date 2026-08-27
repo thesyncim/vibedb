@@ -9,9 +9,29 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	vibejson "github.com/thesyncim/vibejson"
 )
+
+type gatewayMetricsNoopOpener struct{}
+
+func (gatewayMetricsNoopOpener) OpenShardControl(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+	return nil, gateway.ErrDistributedMetrics
+}
+
+func testGatewayDistributedMetrics(t testing.TB) *gateway.DistributedMetrics {
+	t.Helper()
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
+		ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	metrics, err := gateway.NewDistributedMetrics(gatewayMetricsNoopOpener{}, []gateway.ReplicatedRoute{{Group: group,
+		Replicas: []gateway.ReplicatedEndpoint{{Member: 7, Node: rafttransport.NodeID{6}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metrics
+}
 
 func TestGatewayMetricsRequestIsTopologyAuthorizedAndClosed(t *testing.T) {
 	request := serveRequest{Op: "metrics"}
@@ -104,6 +124,20 @@ func BenchmarkWriteGatewayMetrics(b *testing.B) {
 	for b.Loop() {
 		output.Reset()
 		if err := writeServeResponse(writer, &serveResponse{Metrics: &metrics}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteGatewayDistributedMetrics(b *testing.B) {
+	metrics := testGatewayDistributedMetrics(b)
+	var output bytes.Buffer
+	output.Grow(8192)
+	writer := vibejson.NewWriter(&output)
+	b.ReportAllocs()
+	for b.Loop() {
+		output.Reset()
+		if err := writeServeResponse(writer, &serveResponse{DistributedMetrics: metrics}); err != nil {
 			b.Fatal(err)
 		}
 	}

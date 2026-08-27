@@ -505,19 +505,6 @@ func servePreparedRF3WithExecutionLanes(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
-	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
-		Provider: peer.Owners(),
-		Authorize: func(identity rafttransport.PeerIdentity) bool {
-			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
-		},
-		ReadDeadline: deadline, WriteDeadline: deadline,
-	})
-	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
-	}
 	backupControl, err := clusterbackupservice.New(clusterbackupservice.Options{
 		Owner: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request clusterbackup.LiveRequest) bool {
@@ -814,6 +801,20 @@ func servePreparedRF3WithExecutionLanes(
 		return errors.Join(splitRuntimeErr, componentShutdownError(peerErr), servingRegistry.Close())
 	}
 	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
+	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: &rf3MetricsProvider{owners: peer.Owners(), groups: preparedSet.groups,
+			backup: backupControl, action: actionControl, data: dataServices},
+		Authorize: func(identity rafttransport.PeerIdentity) bool {
+			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,

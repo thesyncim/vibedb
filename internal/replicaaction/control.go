@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -98,12 +99,22 @@ type Options struct {
 }
 
 type Service struct {
-	journal                     Journal
-	owner                       Owner
-	authorize                   AuthorizeFunc
-	readDeadline, writeDeadline rafttransport.DeadlineFunc
-	slots                       chan struct{}
-	stripes                     []sync.Mutex
+	journal                       Journal
+	owner                         Owner
+	authorize                     AuthorizeFunc
+	readDeadline, writeDeadline   rafttransport.DeadlineFunc
+	slots                         chan struct{}
+	stripes                       []sync.Mutex
+	requests, completions, faults atomic.Uint64
+}
+
+type Metrics struct{ Requests, Completions, Faults uint64 }
+
+func (service *Service) Metrics() Metrics {
+	if service == nil {
+		return Metrics{}
+	}
+	return Metrics{Requests: service.requests.Load(), Completions: service.completions.Load(), Faults: service.faults.Load()}
 }
 
 func NewService(options Options) (*Service, error) {
@@ -117,7 +128,7 @@ func NewService(options Options) (*Service, error) {
 		slots: make(chan struct{}, options.MaxConcurrent), stripes: make([]sync.Mutex, options.MaxConcurrent)}, nil
 }
 
-func (service *Service) Serve(ctx context.Context, connection rafttransport.PeerConnection) error {
+func (service *Service) Serve(ctx context.Context, connection rafttransport.PeerConnection) (resultErr error) {
 	if service == nil || ctx == nil || connection == nil ||
 		connection.TrafficClass() != rafttransport.TrafficShardControl {
 		if connection != nil {
@@ -126,6 +137,14 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 		return ErrUnauthorized
 	}
 	defer connection.Close()
+	service.requests.Add(1)
+	defer func() {
+		if resultErr != nil {
+			service.faults.Add(1)
+		} else {
+			service.completions.Add(1)
+		}
+	}()
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stop()
 	if deadline := service.readDeadline(); deadline.IsZero() {

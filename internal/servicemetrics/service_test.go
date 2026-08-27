@@ -15,7 +15,10 @@ type testProvider struct {
 	snapshot raftservice.ProgressMetricsSnapshot
 	group    raftmember.GroupKey
 	member   uint64
+	stages   StageMetricsSnapshot
 }
+
+func (provider testProvider) StageMetrics() StageMetricsSnapshot { return provider.stages }
 
 func (provider testProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
 	return provider.snapshot
@@ -133,5 +136,22 @@ func BenchmarkMetricsResponseCodec(b *testing.B) {
 		if _, err := OpenResponse(response[:]); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestMetricsNodeStageSnapshotIsAuthenticatedAndCanonical(t *testing.T) {
+	stages := StageMetricsSnapshot{CheckpointApplied: 1, Checkpoints: 2, PhysicalCheckpoints: 3,
+		CheckpointBarrierSyncs: 4, WALLiveBytes: 5, WALEntries: 6, WALSyncs: 7,
+		BackupRequests: 8, BackupFaults: 9, BackupLogicalBytes: 10, BackupScanBytes: 11,
+		SnapshotTransferChunks: 12, SnapshotTransferBytes: 13, SnapshotResidentBytes: 14,
+		ReplicaActionRequests: 15, ReplicaActionCompletions: 16, ReplicaActionFaults: 17}
+	encoded := appendResponse(Snapshot{Stages: stages})
+	opened, err := OpenResponse(encoded[:])
+	if err != nil || opened.Stages != stages || opened.Group != (raftmember.GroupKey{}) || opened.Member != 0 {
+		t.Fatalf("snapshot=%+v err=%v", opened, err)
+	}
+	encoded[200] ^= 1
+	if _, err = OpenResponse(encoded[:]); err == nil {
+		t.Fatal("corrupt stage frame accepted")
 	}
 }

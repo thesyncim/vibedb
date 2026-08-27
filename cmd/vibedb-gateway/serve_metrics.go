@@ -6,6 +6,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -92,8 +93,7 @@ func writeGatewayDistributedMetrics(writer *vibejson.Writer, metrics *gateway.Di
 	if metrics == nil {
 		return nil
 	}
-	workspace := make([]gateway.DistributedMetricsSample, 0, metrics.Len())
-	samples, aggregate, err := metrics.SnapshotInto(workspace)
+	aggregate, err := metrics.Aggregate()
 	if err != nil {
 		return errors.Join(gateway.ErrDistributedMetrics, err)
 	}
@@ -104,6 +104,9 @@ func writeGatewayDistributedMetrics(writer *vibejson.Writer, metrics *gateway.Di
 		return err
 	}
 	if err = writeGatewayMetricCut(writer, aggregate.Cut); err != nil {
+		return err
+	}
+	if err = writeGatewayStageMetrics(writer, aggregate.Stages); err != nil {
 		return err
 	}
 	for _, field := range [...]struct {
@@ -129,8 +132,18 @@ func writeGatewayDistributedMetrics(writer *vibejson.Writer, metrics *gateway.Di
 	if err = writer.BeginArray(); err != nil {
 		return err
 	}
-	for _, sample := range samples {
+	for index := 0; index < metrics.Len(); index++ {
+		sample, sampleErr := metrics.SnapshotAt(index)
+		if sampleErr != nil {
+			return sampleErr
+		}
 		if err = writer.BeginObject(); err != nil {
+			return err
+		}
+		if err = writer.Key("node_aggregate"); err != nil {
+			return err
+		}
+		if err = writer.Bool(sample.NodeAggregate); err != nil {
 			return err
 		}
 		for _, field := range [...]struct {
@@ -161,6 +174,9 @@ func writeGatewayDistributedMetrics(writer *vibejson.Writer, metrics *gateway.Di
 		if err = writeGatewayMetricCut(writer, sample.Cut); err != nil {
 			return err
 		}
+		if err = writeGatewayStageMetrics(writer, sample.Stages); err != nil {
+			return err
+		}
 		if err = writer.EndObject(); err != nil {
 			return err
 		}
@@ -169,6 +185,30 @@ func writeGatewayDistributedMetrics(writer *vibejson.Writer, metrics *gateway.Di
 		return err
 	}
 	return writer.EndObject()
+}
+
+func writeGatewayStageMetrics(writer *vibejson.Writer, stages servicemetrics.StageMetricsSnapshot) error {
+	for _, field := range [...]struct {
+		name  string
+		value uint64
+	}{
+		{"checkpoint_applied", stages.CheckpointApplied}, {"checkpoints", stages.Checkpoints},
+		{"physical_checkpoints", stages.PhysicalCheckpoints}, {"checkpoint_barrier_syncs", stages.CheckpointBarrierSyncs},
+		{"wal_live_bytes", stages.WALLiveBytes}, {"wal_entries", stages.WALEntries}, {"wal_syncs", stages.WALSyncs},
+		{"backup_requests", stages.BackupRequests}, {"backup_faults", stages.BackupFaults},
+		{"backup_logical_bytes", stages.BackupLogicalBytes}, {"backup_scan_bytes", stages.BackupScanBytes},
+		{"snapshot_transfer_chunks", stages.SnapshotTransferChunks}, {"snapshot_transfer_bytes", stages.SnapshotTransferBytes},
+		{"snapshot_resident_bytes", stages.SnapshotResidentBytes}, {"replica_action_requests", stages.ReplicaActionRequests},
+		{"replica_action_completions", stages.ReplicaActionCompletions}, {"replica_action_faults", stages.ReplicaActionFaults},
+	} {
+		if err := writer.Key(field.name); err != nil {
+			return err
+		}
+		if err := writer.Uint(field.value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeGatewayMetricCut(writer *vibejson.Writer, cut raftservice.ProgressMetricsSnapshot) error {
