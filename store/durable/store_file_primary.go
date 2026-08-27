@@ -726,6 +726,11 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 	}
 	c.primaryNextCatalogLeafID = nextCatalogLeafID
 	c.primaryNextCatalogBranchID = nextCatalogBranchID
+	maxOverflowPages := c.primaryOverflowPageCount(c.options.MaxDocumentBytes)
+	c.overflowChainScratch = make(
+		[]storeio.TransactionPage, 0, maxOverflowPages,
+	)
+	c.overflowOffsetScratch = make([]int, 0, maxOverflowPages)
 	// Both buffered-visible and the journal-backed synchronous lane apply through
 	// the deferred canonical-frame path, so both need the pending parent and
 	// volatile-retire scratch. Async-visible on a primary graph uses the committer
@@ -741,9 +746,7 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		// chain scratch for one worst-case document so a steady-state overflow Put
 		// never grows it, and the durable-retirement queue for one worst-case
 		// checkpoint's superseded chains.
-		maxOverflowPages := c.primaryOverflowPageCount(c.options.MaxDocumentBytes)
 		c.overflowRefScratch = make([]storeio.PageRef, 0, maxOverflowPages)
-		c.overflowOffsetScratch = make([]int, 0, maxOverflowPages)
 		c.overflowValueScratch = make([]byte, 0, c.options.MaxDocumentBytes)
 		c.overflowPageScratch = make([]byte, c.options.MaxPageSize)
 		c.primaryPendingOverflowRetire = make(

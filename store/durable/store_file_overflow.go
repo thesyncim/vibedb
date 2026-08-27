@@ -256,6 +256,86 @@ func (c *Collection) stagePrimaryOverflowChain(
 	return c.overflowChainScratch[0].Ref(), nil
 }
 
+// stagePrimaryOverflowChainToSink is the online-migration counterpart of the
+// transaction builder. A reserved-generation sink is strictly sequential, so
+// every forward reference is derived before the next page is allocated and
+// checked when that allocation arrives. This keeps staging memory to one page
+// without adding interface allocations to the foreground transaction path.
+func (c *Collection) stagePrimaryOverflowChainToSink(
+	sink storeio.PrimaryGraphBuildSink, value []byte, generation uint64,
+) (storeio.PageRef, error) {
+	quantum := uint32(c.options.PageSize)
+	maxExtent := uint32(c.options.MaxPageSize)
+	perPage := int(maxExtent) - primaryOverflowPageOverhead
+	if sink == nil || sink.StoreIdentity() != c.storeID ||
+		generation != sink.BuildGeneration() || perPage <= 0 || len(value) == 0 ||
+		len(value) > c.options.MaxDocumentBytes {
+		return storeio.PageRef{}, fmt.Errorf(
+			"%w: overflow value length", storeio.ErrInvalidWrite,
+		)
+	}
+	pageCount := (len(value) + perPage - 1) / perPage
+	finalNextLogicalID := sink.BuildNextLogicalID() + uint64(pageCount)
+	if finalNextLogicalID < sink.BuildNextLogicalID() {
+		return storeio.PageRef{}, storeio.ErrInvalidWrite
+	}
+	total := uint64(len(value))
+	var head, expected storeio.PageRef
+	for offset := 0; offset < len(value); {
+		n := min(perPage, len(value)-offset)
+		raw := primaryOverflowPageOverhead + n
+		extent := (uint32(raw) + quantum - 1) / quantum * quantum
+		if extent < quantum {
+			extent = quantum
+		}
+		page, err := sink.AllocatePage(storeio.PageOverflow, extent, 0)
+		if err != nil {
+			return storeio.PageRef{}, err
+		}
+		ref := page.Ref()
+		if expected != (storeio.PageRef{}) && ref != expected {
+			return storeio.PageRef{}, fmt.Errorf(
+				"%w: non-sequential overflow sink", storeio.ErrInvalidWrite,
+			)
+		}
+		if head == (storeio.PageRef{}) {
+			head = ref
+		}
+		end := offset + n
+		var next storeio.PageRef
+		if end < len(value) {
+			nextPiece := min(perPage, len(value)-end)
+			nextRaw := primaryOverflowPageOverhead + nextPiece
+			nextExtent := (uint32(nextRaw) + quantum - 1) / quantum * quantum
+			if nextExtent < quantum {
+				nextExtent = quantum
+			}
+			next = storeio.PageRef{
+				Offset:    ref.Offset + uint64(ref.Length),
+				LogicalID: ref.LogicalID + 1, Generation: generation,
+				Length: nextExtent, Kind: storeio.PageOverflow,
+			}
+		}
+		if _, err := storeio.EncodeOverflowPage(
+			page.Bytes(),
+			storeio.OverflowPageHeader{
+				StoreID: c.storeID, Generation: generation,
+				LogicalID: ref.LogicalID, PageSize: ref.Length,
+				Total: total, Offset: uint64(offset), Next: next,
+			},
+			value[offset:end], sink.BuildFileEnd(), finalNextLogicalID, quantum,
+		); err != nil {
+			return storeio.PageRef{}, err
+		}
+		if err := page.Stage(); err != nil {
+			return storeio.PageRef{}, err
+		}
+		expected = next
+		offset = end
+	}
+	return head, nil
+}
+
 // mintBufferedPrimaryOverflowChain stores value out of line as a forward-linked
 // chain of PageOverflow extents admitted as VOLATILE, memory-only buffered-dirty
 // frames — the deferred-canonical lane writes no device bytes at Put. It lays the
