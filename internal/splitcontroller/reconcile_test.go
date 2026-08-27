@@ -552,6 +552,7 @@ func testChildTarget(
 			Endpoint:        distribution.EndpointID(string(leader) + "-peer"),
 			NativeEndpoint:  leader,
 			ControlEndpoint: distribution.EndpointID(string(leader) + "-control"),
+			SnapshotAddress: "127.0.0.1:" + strconv.Itoa(9000+index),
 			WAL:             replicaWAL,
 			RuntimeRoot:     replicaRoot,
 			WALPath:         filepath.Join(replicaRoot, "child.wal"),

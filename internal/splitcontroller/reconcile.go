@@ -11,6 +11,7 @@ import (
 	"errors"
 	"hash"
 	"math"
+	"net"
 	"path/filepath"
 	"strings"
 
@@ -93,6 +94,10 @@ type ChildReplicaTarget struct {
 	Endpoint        distribution.EndpointID
 	NativeEndpoint  distribution.EndpointID
 	ControlEndpoint distribution.EndpointID
+	// SnapshotAddress is the exact authenticated TrafficSnapshot listener for
+	// artifact staging. It is provisioned by the gateway inventory and verified
+	// by the destination before the preparation receipt is issued.
+	SnapshotAddress string
 
 	// The remaining fields are the replica-local prepared runtime authority.
 	// WAL member/store identity, physical roots, SQL storage/log identity, and
@@ -1099,6 +1104,7 @@ func cloneChildTarget(target ChildTarget) ChildTarget {
 		replica.Endpoint = distribution.EndpointID(strings.Clone(string(replica.Endpoint)))
 		replica.NativeEndpoint = distribution.EndpointID(strings.Clone(string(replica.NativeEndpoint)))
 		replica.ControlEndpoint = distribution.EndpointID(strings.Clone(string(replica.ControlEndpoint)))
+		replica.SnapshotAddress = strings.Clone(replica.SnapshotAddress)
 		replica.WAL.Distribution = strings.Clone(replica.WAL.Distribution)
 		replica.WAL.Shard = strings.Clone(replica.WAL.Shard)
 		replica.WALPath = strings.Clone(replica.WALPath)
@@ -1185,19 +1191,21 @@ func validChildReplicaTargets(split *autosplit.SplitPlan, child int, target Chil
 		return false
 	}
 	for index, replica := range target.Replicas {
+		host, port, addressErr := net.SplitHostPort(replica.SnapshotAddress)
 		if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
 			replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
 			replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
 			replica.Endpoint == replica.NativeEndpoint || replica.Endpoint == replica.ControlEndpoint ||
 			replica.NativeEndpoint == replica.ControlEndpoint ||
-			replica.NativeEndpoint != descriptor.Leaders[index] {
+			replica.NativeEndpoint != descriptor.Leaders[index] || addressErr != nil || host == "" || port == "" {
 			return false
 		}
 		for prior := 0; prior < index; prior++ {
 			other := target.Replicas[prior]
 			if other.Member == replica.Member || other.Node == replica.Node ||
 				other.StoreID == replica.StoreID || other.Endpoint == replica.Endpoint ||
-				other.NativeEndpoint == replica.NativeEndpoint || other.ControlEndpoint == replica.ControlEndpoint {
+				other.NativeEndpoint == replica.NativeEndpoint || other.ControlEndpoint == replica.ControlEndpoint ||
+				other.SnapshotAddress == replica.SnapshotAddress {
 				return false
 			}
 		}

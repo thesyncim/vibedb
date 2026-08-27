@@ -97,10 +97,23 @@ func TestPlanIntentAuthenticatesEveryPreparedReplicaAndRejectsIncompleteGrammar(
 	if _, err = OpenPlanIntent(encoded, catalog); !errors.Is(err, ErrPlanIntent) {
 		t.Fatalf("incomplete replica intent error = %v", err)
 	}
+	incomplete.Targets[0].Replicas[0].RuntimeRoot = target.Replicas[0].RuntimeRoot
+	incomplete.Targets[0].Replicas[0].SnapshotAddress = ""
+	encoded, err = vibejson.Marshal(&incomplete)
+	if err == nil {
+		encoded, err = vibejson.AppendCanonicalize(nil, encoded)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = OpenPlanIntent(encoded, catalog); !errors.Is(err, ErrPlanIntent) {
+		t.Fatalf("pre-snapshot-address grammar accepted: %v", err)
+	}
 
 	for _, mutate := range []func(*ChildTarget){
 		func(candidate *ChildTarget) { candidate.Replicas[0].CertificateDigest[0] ^= 1 },
 		func(candidate *ChildTarget) { candidate.RelationManifestDigest[0] ^= 1 },
+		func(candidate *ChildTarget) { candidate.Replicas[0].SnapshotAddress = "127.0.0.1:9999" },
 		func(candidate *ChildTarget) {
 			candidate.Replicas[0].SQLPath = filepath.Join(candidate.Replicas[0].RuntimeRoot, "other.vdb")
 		},

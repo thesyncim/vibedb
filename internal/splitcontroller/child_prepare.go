@@ -318,14 +318,15 @@ func validChildPreparation(preparation ChildPreparation) bool {
 	for index, replica := range preparation.target.Replicas {
 		if replica.Member == 0 || replica.Node == ([16]byte{}) || replica.StoreID == ([16]byte{}) ||
 			replica.NodeIncarnation == 0 || replica.Endpoint == "" || replica.NativeEndpoint == "" ||
-			replica.ControlEndpoint == "" || replica.NativeEndpoint != preparation.descriptor.Leaders[index] {
+			replica.ControlEndpoint == "" || replica.SnapshotAddress == "" ||
+			replica.NativeEndpoint != preparation.descriptor.Leaders[index] {
 			return false
 		}
 		for prior := 0; prior < index; prior++ {
 			other := preparation.target.Replicas[prior]
 			if other.Member == replica.Member || other.Node == replica.Node || other.StoreID == replica.StoreID ||
 				other.Endpoint == replica.Endpoint || other.NativeEndpoint == replica.NativeEndpoint ||
-				other.ControlEndpoint == replica.ControlEndpoint {
+				other.ControlEndpoint == replica.ControlEndpoint || other.SnapshotAddress == replica.SnapshotAddress {
 				return false
 			}
 		}

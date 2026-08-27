@@ -130,7 +130,8 @@ func targetMatchesPreparedReplica(target ChildTarget, replica ChildReplicaTarget
 		if prepared.Member == replica.Member && prepared.Node == replica.Node &&
 			prepared.StoreID == replica.StoreID && prepared.NodeIncarnation == replica.NodeIncarnation &&
 			prepared.Endpoint == replica.Endpoint && prepared.NativeEndpoint == replica.NativeEndpoint &&
-			prepared.ControlEndpoint == replica.ControlEndpoint && prepared.WAL == replica.WAL &&
+			prepared.ControlEndpoint == replica.ControlEndpoint && prepared.SnapshotAddress == replica.SnapshotAddress &&
+			prepared.WAL == replica.WAL &&
 			prepared.WALPath == replica.WALPath && prepared.SQLPath == replica.SQLPath &&
 			prepared.RuntimeRoot == replica.RuntimeRoot && prepared.SQL.Equal(replica.SQL) &&
 			prepared.Apply == replica.Apply && prepared.CertificateDigest == replica.CertificateDigest {
