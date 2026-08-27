@@ -801,8 +801,24 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 			_ = family.close()
 		}
 	}()
-	base = selectedBase
-	absPath = filepath.Join(parentPath, base)
+	store, err := openFamilySelectedStore(root, parentPath, directoryInfo, logicalPath,
+		logicalBase, selectedBase, expected, expectedTopologyRecoveryEpoch, key, normalized, family)
+	if err != nil {
+		return nil, err
+	}
+	keepRoot = true
+	keepFamily = true
+	return store, nil
+}
+
+// openFamilySelectedStore borrows the already locked family and pinned root.
+// Both cold Open and live selection adoption use the identical recovery and
+// family authentication path. On failure only the new WAL file is released.
+func openFamilySelectedStore(root *os.Root, parentPath string, directoryInfo os.FileInfo,
+	logicalPath, logicalBase, base string, expected Identity, expectedTopologyRecoveryEpoch uint64,
+	key Key, normalized normalizedOptions, family *familyManifest,
+) (*Store, error) {
+	absPath := filepath.Join(parentPath, base)
 	entryInfo, err := root.Lstat(base)
 	if err != nil {
 		return nil, err
@@ -914,8 +930,6 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 		current: current, image: image, generation: generation, recoveredTornSlot: recoveredTorn,
 		family: family, activationPending: family != nil && family.state.phase == familyPhaseSelecting,
 	}
-	keepRoot = true
-	keepFamily = true
 	return store, nil
 }
 

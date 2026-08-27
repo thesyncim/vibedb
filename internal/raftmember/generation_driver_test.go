@@ -23,9 +23,11 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	drainRuntime(t, fixture.runtime, nil)
+	var driverErr error
 	if err := fixture.runtime.ConfigureWALGeneration(WALGenerationDriverOptions{
 		IntervalTicks: 1,
 		Key:           fixture.walKey,
+		OnError:       func(err error) { driverErr = err },
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +44,7 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 		drainRuntime(t, fixture.runtime, nil)
 		info, err := awaitWALGeneration(t, fixture.runtime, fixture.wal, sequence-1)
 		if err != nil || info.Generation != sequence-1 {
-			t.Fatalf("generation after sequence %d = %+v, %v", sequence, info, err)
+			t.Fatalf("generation after sequence %d = %+v, %v; driver=%v", sequence, info, err, driverErr)
 		}
 	}
 	before, err := fixture.wal.GenerationInfo()
@@ -196,9 +198,28 @@ func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
 	}
 	// The intervening apply stales the candidate. Owner-lane revalidation must
 	// discard it without selecting or deleting the serving source.
-	fixture.runtime.tickWALGeneration()
-	if _, err := fixture.wal.GenerationInfo(); !errors.Is(err, raftstore.ErrGenerationSource) {
+	sourceFile, err := os.Stat(fixture.walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for fixture.runtime.walGeneration.building && time.Now().Before(deadline) {
+		fixture.runtime.tickWALGeneration()
+		runtime.Gosched()
+	}
+	if fixture.runtime.walGeneration.building || fixture.runtime.walGeneration.activationPending {
+		t.Fatal("stale candidate was not consumed and discarded")
+	}
+	if _, err := fixture.wal.GenerationInfo(); !errors.Is(err, raftstore.ErrGenerationCandidate) {
 		t.Fatalf("stale off-lane build was published: %v", err)
+	}
+	afterFile, err := os.Stat(fixture.walPath)
+	if err != nil || !os.SameFile(sourceFile, afterFile) {
+		t.Fatalf("stale build replaced source inode: %v", err)
+	}
+	hard, _, err := fixture.wal.InitialState()
+	if err != nil || hard.GetCommit() < fixture.apply.Published().Applied {
+		t.Fatalf("source stopped serving acknowledged apply: hard=%v err=%v", hard, err)
 	}
 }
 

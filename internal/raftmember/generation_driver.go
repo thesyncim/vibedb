@@ -182,17 +182,25 @@ func (runtime *Runtime) publishBuiltWALGeneration(
 		runtime.wal, runtime.apply, result.preparation, result.builder,
 	)
 	closeErr := closeBuilder()
+	adoptErr := runtime.wal.AdoptSelectedGeneration()
 	if publishErr != nil {
-		if _, pendingErr := runtime.wal.PendingGenerationActivation(); pendingErr == nil {
+		_, _, servingErr := runtime.wal.InitialState()
+		if adoptErr == nil || errors.Is(servingErr, raftstore.ErrGenerationActivationPending) {
 			driver.activationPending = true
 		}
-		return errors.Join(publishErr, closeErr)
+		return errors.Join(publishErr, closeErr, adoptErr)
 	}
 	driver.activationPending = true
+	if adoptErr != nil {
+		return errors.Join(adoptErr, closeErr)
+	}
 	return errors.Join(runtime.commitWALGeneration(driver), closeErr)
 }
 
 func (runtime *Runtime) commitWALGeneration(driver *walGenerationDriver) error {
+	if err := runtime.wal.AdoptSelectedGeneration(); err != nil {
+		return err
+	}
 	if err := runtime.wal.CommitGenerationSelection(runtime.apply); err != nil {
 		return err
 	}

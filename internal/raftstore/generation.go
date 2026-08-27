@@ -78,6 +78,7 @@ type GenerationInfo struct {
 	HardVote                 uint64
 	HardCommit               uint64
 	SourceCurrentIncarnation uint64
+	SourceReadyID            uint64
 	RetainedEntries          uint64
 	RetainedBytes            uint64
 }
@@ -107,6 +108,7 @@ type GenerationBuilder struct {
 	familyID      [16]byte
 	generation    uint64
 	parentBinding [sha256.Size]byte
+	sourceReadyID uint64
 
 	directoryInfo os.FileInfo
 	sourceInfo    os.FileInfo
@@ -194,6 +196,7 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		logicalPath: store.logicalPath, parentPath: store.parentPath, base: store.base,
 		candidatePath: filepath.Join(store.parentPath, candidateBase), candidateBase: candidateBase,
 		familyID: familyID, generation: generation, parentBinding: parentBinding,
+		sourceReadyID: generationReadyFloor(store.current, store.generation),
 		directoryInfo: store.directoryInfo, sourceInfo: store.fileInfo,
 		header: header, current: current, options: store.options,
 		link: linkGenerationName,
@@ -675,6 +678,7 @@ func generationInfo(
 		BaseIndex: seal.baseIndex, BaseTerm: seal.baseTerm, LastIndex: seal.suffixLast,
 		HardTerm: seal.hard.GetTerm(), HardVote: seal.hard.GetVote(), HardCommit: seal.hard.GetCommit(),
 		SourceCurrentIncarnation: seal.sourceCurrentIncarnation,
+		SourceReadyID:            seal.sourceReadyID,
 		RetainedEntries:          seal.suffixCount, RetainedBytes: seal.suffixBytes,
 	}
 }
