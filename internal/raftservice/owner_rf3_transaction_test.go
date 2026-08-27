@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -278,6 +279,19 @@ func rf3TransactionCoordinatorRecord(
 	return record
 }
 
+func rf3TransactionGlobalKey(t testing.TB, relation sqldriver.ReplicatedShardRelationIdentity) []byte {
+	t.Helper()
+	key, err := distribution.CurrentTupleCodec.AppendTuple(nil,
+		[]distribution.Scalar{distribution.NewString("txn@example.com")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := relation.GlobalIndexStorageKeyPoint(key); !ok {
+		t.Fatalf("fixture global key is invalid for retained relation: %x", key)
+	}
+	return key
+}
+
 // Keep the shared transaction fixtures qualified on hosts where strict
 // allocation prevents starting the physical RF3 cluster.
 func TestRF3TransactionCommandFixturesPreflight(t *testing.T) {
@@ -291,12 +305,23 @@ func TestRF3TransactionCommandFixturesPreflight(t *testing.T) {
 		},
 	}}
 	id := distributedtxn.ID{1, 2, 3}
+	relation := sqldriver.ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: sqldriver.ReplicatedShardRelationGlobalIndex,
+		IndexID: 41, Incarnation: 7, LocatorCount: 1, Unique: true,
+		KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		BucketBits: distribution.DefaultVirtualBucketBits,
+	}
+	globalKey := rf3TransactionGlobalKey(t, relation)
+	if _, ok := relation.GlobalIndexStorageKeyPoint([]byte{0x91, 0x01, 't'}); ok {
+		t.Fatal("obsolete handwritten key unexpectedly accepted")
+	}
 	batches := []replication.RelationMutationBatch{
 		{Relation: 1, Mutations: []replication.Mutation{{
 			Kind: replication.MutationPutAbsentOrEqual, Key: []byte("base"), Value: []byte(`{"id":"base"}`),
 		}}},
 		{Relation: 2, Mutations: []replication.Mutation{{
-			Kind: replication.MutationPutAbsentOrEqual, Key: []byte("index"), Value: []byte(`["base"]`),
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: []byte(`["base"]`),
 		}}},
 	}
 	digest, err := replication.TransactionMutationDigest(batches)
@@ -367,8 +392,8 @@ func submitRF3Transaction(
 		t.Fatal(err)
 	}
 	completion, err := replication.OpenCompletion(result.Completion)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || completion.ResultCode != replicatedstate.ResultApplied {
+		t.Fatalf("transaction completion=%+v err=%v", completion, err)
 	}
 	transaction, err := replicatedstate.OpenTransactionCompletionResult(
 		completion.ResultCode, completion.InlineResult,
@@ -398,8 +423,8 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 		t.Fatal(err)
 	}
 	openCompletion, err := replication.OpenCompletion(openResult.Completion)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || openCompletion.ResultCode != replicatedstate.ResultSessionOpened {
+		t.Fatalf("session completion=%+v err=%v", openCompletion, err)
 	}
 
 	baseKey, ok := orderedkey.AppendJSONString(nil, []byte(`"txn-doc"`), orderedkey.Ascending)
@@ -412,7 +437,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	globalKey := []byte{0x91, 0x01, 't'}
+	globalKey := rf3TransactionGlobalKey(t, cluster.bases[leader].Relations[1])
 	globalValue := []byte(`["txn-doc"]`)
 	batches := []replication.RelationMutationBatch{
 		{Relation: 1, Mutations: []replication.Mutation{{
