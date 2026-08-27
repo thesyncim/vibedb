@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 
@@ -408,8 +409,11 @@ var _ splitcontroller.AuthorizedShardActionExecutor = (*rf3AdmittedExecutor)(nil
 
 func loadRF3SplitStaticBootstrap(registry rf3ManifestSplitChildRegistry) (*pb.Snapshot, error) {
 	raw, err := readRF3BoundedFile(registry.StaticBootstrapPath, replicatedstate.MaxStaticBootstrapEnvelopeBytes)
-	if err != nil || validateRF3SplitChildBootstrap(raw, registry) != nil {
+	if err != nil {
 		return nil, errors.Join(errRF3Serving, err)
+	}
+	if err := validateRF3SplitChildBootstrap(raw, registry); err != nil {
+		return nil, fmt.Errorf("%w: split child static bootstrap: %w", errRF3Serving, err)
 	}
 	result := new(pb.Snapshot)
 	if err = proto.Unmarshal(raw, result); err != nil {

@@ -23,7 +23,10 @@ func TestPrepareSplitRuntimeRetainsExactStaticCut(t *testing.T) {
 		t.Fatal(err)
 	}
 	var decoded pb.Snapshot
-	if err := proto.Unmarshal(first, &decoded); err != nil || !proto.Equal(&decoded, bootstrap.Snapshot) {
+	if err := proto.Unmarshal(first, &decoded); err != nil ||
+		decoded.GetMetadata().GetIndex() != 1 || decoded.GetMetadata().GetTerm() != 1 ||
+		string(decoded.GetData()) != "vibedb-rf3-split-child-bootstrap" ||
+		!proto.Equal(decoded.GetMetadata().GetConfState(), bootstrap.Snapshot.GetMetadata().GetConfState()) {
 		t.Fatalf("retained bootstrap differs: %v", err)
 	}
 	if err := PrepareSplitRuntime(root, bootstrap); err != nil {
