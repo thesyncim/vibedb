@@ -283,6 +283,30 @@ func TestRuntimeStoreRegistryRejectsUnpreparedAndSymlinkRoots(t *testing.T) {
 	}
 }
 
+func TestRuntimeStoreLeaseOwnsExactTopologySessionJournal(t *testing.T) {
+	root := preparedRuntimeRoot(t)
+	operation, manifest := runtimeStoreIdentity()
+	registry, err := OpenRuntimeStoreRegistry(root, manifest, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	lease, err := registry.Acquire(operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, runtimeOperationName(operation), "topology-session")
+	if got, pathErr := lease.TopologySessionJournalPath(); pathErr != nil || got != want {
+		t.Fatalf("path=%q want=%q err=%v", got, want, pathErr)
+	}
+	if err = lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = lease.TopologySessionJournalPath(); !errors.Is(err, ErrRuntimeStore) {
+		t.Fatalf("released lease path err=%v", err)
+	}
+}
+
 func TestRuntimeStoreRegistryTerminalWitnessRejectsWrongManifest(t *testing.T) {
 	root := preparedRuntimeRoot(t)
 	operation, manifest := runtimeStoreIdentity()

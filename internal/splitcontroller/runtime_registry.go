@@ -53,6 +53,7 @@ type RuntimeStoreRegistry struct {
 	mu sync.Mutex
 
 	root       *os.Root
+	rootPath   string
 	lockFile   *os.File
 	manifest   [sha256.Size]byte
 	maxActive  int
@@ -115,11 +116,32 @@ func OpenRuntimeStoreRegistry(
 		return nil, err
 	}
 	return &RuntimeStoreRegistry{
-		root: root, lockFile: lockFile, manifest: manifestDigest,
+		root: root, rootPath: runtimeRoot, lockFile: lockFile, manifest: manifestDigest,
 		maxActive: maxActive, authority: authority,
 		active:     make(map[OperationID]*runtimeRegistryEntry, maxActive),
 		collecting: make(map[OperationID]struct{}),
 	}, nil
+}
+
+// TopologySessionJournalPath returns the sole registry-owned durable session
+// basename for this leased operation. Callers cannot select a sibling path or
+// another operation. The operation directory must still be the exact regular
+// directory opened by the registry; replacement with a symlink fails closed.
+func (l *RuntimeStoreLease) TopologySessionJournalPath() (string, error) {
+	if l == nil {
+		return "", ErrRuntimeStore
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released || l.registry == nil || l.store == nil || l.registry.rootPath == "" {
+		return "", ErrRuntimeStore
+	}
+	operation := runtimeOperationName(l.operation)
+	info, err := l.registry.root.Lstat(operation)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.Join(ErrRuntimeStore, err)
+	}
+	return filepath.Join(l.registry.rootPath, operation, "topology-session"), nil
 }
 
 func bindRuntimeRegistryManifest(root *os.Root, manifest [sha256.Size]byte) error {
