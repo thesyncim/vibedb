@@ -6,6 +6,7 @@ package rf3bench
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"slices"
@@ -83,7 +84,9 @@ type Metadata struct {
 
 // Sample is one completed measured gateway operation. Ordinal is globally
 // unique and fixes output order independently of goroutine completion order.
-// Commit and Checkpoint are the serving member's coherent post-operation cut.
+// Applied is the operation's result index (or read snapshot index). Commit and
+// Checkpoint are the serving member's later coherent response cut; concurrent
+// committed work can advance both beyond this operation's Applied index.
 type Sample struct {
 	Ordinal        uint64
 	Client         uint32
@@ -138,8 +141,9 @@ func (report Report) Validate() error {
 		if sample.Ordinal != uint64(index+1) || sample.Client >= config.Clients ||
 			sample.ClientSequence == 0 || sample.LatencyNS == 0 ||
 			sample.Operation.bytes() == nil || sample.Applied == 0 ||
-			sample.Commit < sample.Applied || sample.Checkpoint > sample.Applied {
-			return ErrInvalidReport
+			sample.Commit < sample.Applied || sample.Checkpoint > sample.Commit {
+			return fmt.Errorf("%w: sample %d operation=%d applied=%d commit=%d checkpoint=%d", ErrInvalidReport,
+				index+1, sample.Operation, sample.Applied, sample.Commit, sample.Checkpoint)
 		}
 	}
 	for index := range report.Counters {

@@ -67,3 +67,25 @@ func TestReportRejectsNoncanonicalAndRegressingEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestReportPreservesCheckpointAheadOfOperationResult(t *testing.T) {
+	report := Report{Config: Config{Clients: 1, Operations: 1, ElapsedNS: 1, Workload: WorkloadWrite},
+		Samples: []Sample{{Ordinal: 1, ClientSequence: 1, LatencyNS: 1,
+			Operation: OperationWrite, Applied: 7, Commit: 11, Checkpoint: 10}}}
+	var encoded bytes.Buffer
+	if err := WriteTSV(&encoded, report); err != nil {
+		t.Fatalf("later checkpoint cut rejected: %v", err)
+	}
+	if !bytes.Contains(encoded.Bytes(), []byte("\t7\t11\t10\t")) {
+		t.Fatal("report changed observed operation or member indexes")
+	}
+	for _, sample := range []Sample{
+		{Applied: 12, Commit: 11, Checkpoint: 10},
+		{Applied: 7, Commit: 11, Checkpoint: 12},
+	} {
+		report.Samples[0].Applied, report.Samples[0].Commit, report.Samples[0].Checkpoint = sample.Applied, sample.Commit, sample.Checkpoint
+		if err := report.Validate(); !errors.Is(err, ErrInvalidReport) {
+			t.Fatalf("impossible member cut accepted: %+v, %v", sample, err)
+		}
+	}
+}

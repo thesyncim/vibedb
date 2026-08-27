@@ -29,10 +29,11 @@ import (
 )
 
 const (
-	rf3EvidenceSeed          = uint64(0x5649424544425246)
-	rf3EvidenceMaxValueBytes = 128
-	rf3EvidenceRouteAttempts = 8
-	rf3EvidenceReadAttempts  = 8
+	rf3EvidenceSeed           = uint64(0x5649424544425246)
+	rf3EvidenceMaxValueBytes  = 128
+	rf3EvidenceRouteAttempts  = 8
+	rf3EvidenceReadAttempts   = 64
+	rf3EvidenceReadBackoffCap = 32 * time.Millisecond
 )
 
 type rf3EvidenceClient struct {
@@ -386,7 +387,10 @@ func readRF3EvidencePoint(ctx context.Context, reader rf3EvidencePointReader,
 			!errors.Is(err, raftmodel.ErrAdmissionBound) {
 			return gateway.ReplicatedPointResult{}, err
 		}
-		timer := time.NewTimer(time.Millisecond << attempt)
+		// A bounded 1.9s pressure window covers the fixed owner budget at 32
+		// clients without exponentially growing waits or enlarging that budget.
+		// Every round and its wait remain part of the sample's measured latency.
+		timer := time.NewTimer(rf3EvidenceReadBackoff(attempt))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -394,6 +398,10 @@ func readRF3EvidencePoint(ctx context.Context, reader rf3EvidencePointReader,
 		case <-timer.C:
 		}
 	}
+}
+
+func rf3EvidenceReadBackoff(attempt int) time.Duration {
+	return min(time.Millisecond<<min(attempt, 5), rf3EvidenceReadBackoffCap)
 }
 
 type rf3EvidencePointReadFunc func(context.Context, gateway.ReplicatedRoute, gateway.ReplicatedPointRead) (gateway.ReplicatedPointResult, error)
@@ -417,6 +425,20 @@ func TestRF3EvidenceReadUsesFrozenRelationBound(t *testing.T) {
 		if bytes.Compare(metadata[i-1].Key, metadata[i].Key) >= 0 {
 			t.Fatal("evidence metadata lost canonical key order")
 		}
+	}
+}
+
+func TestRF3EvidenceAdmissionBackoffIsBounded(t *testing.T) {
+	var total time.Duration
+	for attempt := 0; attempt < rf3EvidenceReadAttempts-1; attempt++ {
+		delay := rf3EvidenceReadBackoff(attempt)
+		if delay <= 0 || delay > rf3EvidenceReadBackoffCap {
+			t.Fatalf("attempt %d delay=%s", attempt, delay)
+		}
+		total += delay
+	}
+	if total != 1887*time.Millisecond || rf3EvidenceReadBackoff(1000) != rf3EvidenceReadBackoffCap {
+		t.Fatalf("unexpected pressure retry window: %s", total)
 	}
 }
 
@@ -609,6 +631,7 @@ func evidenceMetadata(readLimit uint32) []rf3bench.Metadata {
 		{Key: []byte("goos"), Value: []byte(runtime.GOOS)},
 		{Key: []byte("read_admission"), Value: []byte("owner-bounded-retry-wait-in-latency")},
 		{Key: []byte("read_max_value_bytes"), Value: strconv.AppendUint(nil, uint64(readLimit), 10)},
+		{Key: []byte("read_retry_backoff_cap_ns"), Value: strconv.AppendUint(nil, uint64(rf3EvidenceReadBackoffCap), 10)},
 		{Key: []byte("read_retry_rounds"), Value: strconv.AppendUint(nil, rf3EvidenceReadAttempts, 10)},
 		{Key: []byte("vcs_modified"), Value: []byte("unknown")},
 		{Key: []byte("vcs_revision"), Value: []byte("unknown")},
