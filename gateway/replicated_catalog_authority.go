@@ -850,6 +850,9 @@ const (
 	// for one exact relation-manifest rollout. It extends the one current
 	// operation grammar; there is no parallel protocol generation.
 	ReplicatedOperationSchema
+	// ReplicatedOperationBackup is the catalog-RF3 lifecycle witness for one
+	// complete certified group-vector export and non-serving restore boundary.
+	ReplicatedOperationBackup
 )
 
 const (
@@ -875,7 +878,7 @@ type ReplicatedOperationRecord struct {
 
 func validReplicatedOperation(record ReplicatedOperationRecord) bool {
 	return record.ID != ([32]byte{}) &&
-		record.Kind >= ReplicatedOperationSplit && record.Kind <= ReplicatedOperationSchema &&
+		record.Kind >= ReplicatedOperationSplit && record.Kind <= ReplicatedOperationBackup &&
 		record.State >= ReplicatedOperationPlanned && record.State <= ReplicatedOperationCancelled &&
 		record.Revision != 0 && record.CatalogGeneration != 0 && record.Proof != ([32]byte{}) &&
 		record.IntentDigest != ([32]byte{}) && len(record.Intent) != 0 &&
