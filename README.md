@@ -16,12 +16,18 @@ different acknowledgement contract.
 
 The gateway exposes three separate distributed paths: general SQL through
 static shard services, replicated exact-key reads, and strict exact-key
-`exec_batch` mutations over one or more prepared RF3 groups. The
+`exec_batch` mutations over one or more prepared RF3 groups. It also composes
+replicated catalog, request-ledger, replica-move, automatic hot-range split,
+live-backup, and fresh-identity restore control paths. The
 read lane supports all-or-nothing multi-table batches with one `ReadIndex` cut
 per group. The mutation lane supports single- and multi-row whole-document
 insert, exact-primary-key whole-document update, and exact-primary-key delete
 including finite `IN` key sets, with atomic same-group multi-relation batches
 and independently placed global-index maintenance.
+
+These distributed commands are unreleased. The generated feature-state matrix
+distinguishes a present primitive from command integration and from mandatory
+external qualification. It does not turn unexecuted CI gates into evidence.
 
 ## Requirements
 

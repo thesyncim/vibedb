@@ -234,13 +234,26 @@ The static SQL path has no Raft replication, follower read, or endpoint
 failover. The RF3 leader cache and retry logic apply to canonical point reads,
 replicated catalog operations, and the exact-key transaction lane.
 
-Range-split primitives and action services remain internal. The durable runtime
-can reconstruct bounded source and child observations, exact plan admission,
-dynamic action grants, source capture, child lifecycle, publication, and retained
-pruning after restart. The gateway command can scan replicated split-operation
-records and trigger configured shard-control endpoints. `serve-rf3` still passes
-nil split and plan-admission handlers to its control mux. The commands therefore
-do not form an end-to-end split data plane. The internal splitter scans
+Live backup binds a complete replicated catalog inventory to an exact vector
+of per-group ReadIndex cuts. The gateway streams certified artifacts into a
+bounded local repository and publishes the certificate last. This is not a
+global timestamp snapshot. Restore constructs fresh RF3 identities and strips
+source serving authority. Root construction and adoption remain fenced until
+one target-catalog activation witness is durably published, separately
+observed with ReadIndex, and converted to an exact transient grant for every
+target replica. A restored process restart closes its grant again. See
+[Back up and restore distributed data](operations/backup-restore.md) for the
+command and qualification boundary.
+
+Range-split primitives and action services are composed into the authenticated
+RF3 commands. The durable runtime reconstructs bounded source and child
+observations, exact plan admission, dynamic action grants, source capture,
+child lifecycle, publication, and retained pruning after restart. The gateway
+can turn a certified hot-shard cut into a replicated split operation and drive
+it to its terminal catalog and retirement state. `serve-rf3` installs the
+group-scoped split, plan-admission, artifact, tail, child-preparation, and
+retirement handlers. There is no general operator split-intake CLI. The
+internal splitter scans
 one certified source image once and routes each borrowed row to at most three
 children. It uses a compiled `vibejson` placement program and does not use
 `encoding/json`. It can omit the retained child copy.

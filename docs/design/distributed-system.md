@@ -544,12 +544,13 @@ and publish as one bounded successor batch. Every split retains its own data
 proofs; composition only removes repeated catalog cloning and CAS contention.
 The batch accepts distinct source allocations within one distribution as well
 as independent distributions.
-The gateway scans replicated split operation records and can trigger their
-source hosts. The durable controller and local source/child action runtimes can
-reconstruct observations, admit exact plans, bind action grants, and execute
-capture, stage, tail, seal, activation, publication, and prune steps. The
-`serve-rf3` command still passes nil split and plan-admission handlers to the
-control mux. There is also no public split-intake command. Replica movement is
+The gateway scans replicated split operation records and triggers their source
+hosts. The durable controller and local source/child action runtimes reconstruct
+observations, admit exact plans, bind action grants, and execute capture, stage,
+tail, seal, activation, publication, and prune steps. `serve-rf3` installs the
+group-scoped split, plan-admission, artifact, tail, child-preparation, and
+terminal-retirement handlers. Automatic hot-shard policy supplies bounded
+intake. There is no general public operator split command. Replica movement is
 command-composed through its separate resumable controller. A merge planner
 remains absent.
 
@@ -612,8 +613,9 @@ global-index mutation lowering. `serve-rf3` constructs snapshot-source,
 membership, observation, ownership, and retirement control when the retained
 manifest provides the required state. Cold learner bootstrap and the gateway
 replica controller compose member replacement. Certificate enrollment, dynamic
-address discovery, public topology administration, and complete split-control
-composition remain absent.
+address discovery, and a general public topology-administration CLI remain
+absent. Split control is command-composed when the operator supplies the exact
+replica-control and child-storage inventory.
 
 Do not describe this kernel as a turnkey replicated deployment.
 

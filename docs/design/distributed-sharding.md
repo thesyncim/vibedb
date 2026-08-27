@@ -1,7 +1,9 @@
-# Static distributed sharding
+# Distributed sharding
 
-The shipped distributed service uses static shard ownership. It does not start
-Raft replication or automatic movement.
+The shipped gateway retains a static SQL compatibility path and also serves
+RF3 exact-key reads, durable transactions, replica movement, and automatic
+pressure-driven range splits. Static ownership does not start Raft. The RF3
+path uses replicated catalog and shard authority.
 
 ## Components
 
@@ -35,7 +37,7 @@ A targeted route uses a bounded leading placement prefix. A shorter prefix can
 map to the complete keyspace. Admission policy decides whether scatter is
 permitted.
 
-## Non-serving range splits
+## Online range splits
 
 `autosplit.PlanSplit` validates one desired split manifest. The plan has at
 most three child ranges. One child keeps the source allocation. The target
@@ -124,8 +126,9 @@ sequence back into the original source manifest and revalidates the transition.
 It does not require the old catalog snapshot.
 
 The reconciler rejects skipped routing or catalog generations. It also requires
-the cutover route generation to equal the exact catalog successor. It does not
-execute an action or provide a runnable service controller.
+the cutover route generation to equal the exact catalog successor. The serving
+gateway and RF3 shard commands compose its proof-checked actions through the
+replicated operation journal and authenticated control services.
 
 The plan can encode the source ownership seal directly into the existing fixed
 binary transition grammar only when the supplied source state exactly matches
@@ -192,7 +195,7 @@ catalog/node generations and endpoint membership before using the existing
 allocation-lineage-fenced split builder. It does not create Raft membership,
 move bytes, or publish topology.
 
-## Non-serving replica movement
+## Replica movement
 
 `internal/topologyscheduler` also selects capacity-relieving replica moves from
 as many as 1,024 exact allocation candidates and 4,096 node reports. The warm
@@ -211,13 +214,15 @@ No tenant affinity is introduced: the physical range allocation remains the
 unit of evidence, placement, and fencing.
 
 The fixed cut exposes endpoints only after rechecking the complete candidate,
-node, and policy fingerprint. An external membership owner must still attach
-Raft group and member identities. `internal/rebalance` then drives the existing
+node, and policy fingerprint. The command-side membership owner attaches Raft
+group and member identities. `internal/rebalance` then drives the existing
 learner, certified snapshot, catch-up, promotion, leadership, ownership,
 catalog-CAS, drain, and source-removal sequence one proof-checked action at a
 time. Its manifest cutover copies only the shard array and changed leader set;
-the immutable range index and untouched leader storage remain shared. This is
-not a runnable automatic rebalancing controller or snapshot transport.
+the immutable range index and untouched leader storage remain shared. The
+gateway's authenticated replica-control composition runs this controller for
+admitted moves. The hot-shard path can select and submit one idempotent move
+when the operator supplies certified candidate inventory.
 
 ## Security boundary
 

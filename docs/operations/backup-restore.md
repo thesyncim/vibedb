@@ -1,8 +1,10 @@
 # Back up and restore distributed data
 
-VibeDB ships authenticated live RF3 backup export through the gateway. Restore
-activation is not yet shipped. This boundary is not an invitation to copy live
-files or to start a non-serving restore staging root.
+VibeDB ships authenticated live RF3 backup export through the gateway and
+commands to construct, adopt, and activate fresh-identity restore replicas.
+A constructed replica is not serving authority. The activation and qualification boundary
+below still applies. Do not copy live files or start an uncertified staging
+root.
 
 The shipped RF3 shard process now exposes a target-free live snapshot stream
 over its mutually authenticated control listener. Only an independent
@@ -93,32 +95,118 @@ vector of exact per-group Raft cuts through catalog authority. This matches the
 database's clock-free consistency model: Raft order is authoritative inside a
 group, while a catalog-bound vector defines the cross-group recovery cut.
 
-## Offline recovery procedure
+## Construct restore replicas
 
-For disaster-recovery experiments, use an offline copy:
+Restore construction requires a certified backup artifact, an authenticated
+binary restore operation, and an exact canonical `restore-schema.vibejson`
+schema set. The set has one dense ordinal for every operation group. Each
+schema contains ordered DDL, the base relation, explicit global-index
+descriptors, and apply bounds, so catalog, ledger, and data groups may differ.
+The set also embeds the canonical fresh generation-one catalog and exact
+authorization policy bytes. The complete set's digest must match the target
+catalog digest in the operation, and the policy has its own operation-bound
+digest. The importer does not infer schema or indexes from source rows and
+does not migrate between builds.
 
-1. Stop client admission and wait for application-visible requests to reach a
-   terminal acknowledged or explicitly retained outcome.
-2. Stop every gateway and shard process cleanly. Do not copy a member while it
-   is serving.
-3. Copy every complete prepared member root, its WAL generations, SQL/store
-   files and recovery journals, catalog seed/proof, gateway session journals,
-   durable ACK key, WAL key material or recoverable key references,
-   authorization policy, certificates, and exact manifests.
-4. Record the exact build artifact digest. The restore must use the same build
-   grammar; mixed-build restore and migration are unsupported.
-5. Restore into an isolated network with the same cluster and store identities.
-   Validate file inventories and command manifests before starting any member.
-6. Start one quorum at a time, verify leader election and catch-up, then start
-   gateways. Do not regenerate identities or bootstrap over a non-empty root.
+The operation supplies fresh target member, node, store, and group identities.
+Operation assembly plans those identities with `PlanFreshTargets`, constructs
+the exact target catalog and schema set, then seals them with `NewOperation`.
+This avoids a circular identity/catalog hash. These are explicit builder APIs,
+not an automatic certificate provisioner.
 
-This procedure provides no online recovery-point objective and no portable
-cross-build archive. A filesystem copy taken before all processes stop is not a
-backup, even if each individual file appears readable.
+For each operation group ordinal, run:
 
-## Restore activation exit gate
+```text
+vibedb-operator restore-group \
+  -root /absolute/private/restore \
+  -template /absolute/private/restore-schema.vibejson \
+  -operation /absolute/private/restore-operation.bin \
+  -artifact /absolute/private/certified-artifact \
+  -group-ordinal 0
+```
+
+This command streams a certified singleton or base-plus-global-index relation
+bundle into three fresh SQL roots and returns one exact root witness. It
+verifies the source and destination relation-manifest digests, strips source
+serving authority, and retains bounded crash-resumable receipts. In the catalog
+group it discards every source row and installs only the sealed fresh head,
+head witness, genesis proof, and restore-policy projection. Old routes,
+ownership, operation records, and catalog history do not survive that import.
+It does not publish catalog activation or activate any replica.
+
+After provisioning certificates for the operation's fresh target identities,
+adopt each replica with its own exact preparation manifest:
+
+```text
+vibedb-operator adopt-restore \
+  -manifest /absolute/private/prepare-restored-member.vibejson
+```
+
+The operator invokes `vibedb-shard adopt-restored-rf3`. Adoption authenticates
+the retained operation and roster, creates or resumes the certified staged
+WAL, settles the restored SQL/apply checkpoint, and publishes the serving
+manifest last. It retains the `restore_preparing` receipt, but restored-root
+classification comes from the authenticated immutable bootstrap and survives
+later snapshots. Removing the receipt cannot bypass the serving fence.
+Neither a successful command nor the presence of `serve-rf3.vibejson` permits
+client traffic. Retrying construction after adoption verifies the sealed
+live-root binding read-only instead of replacing the active SQL or WAL.
+
+## Activate only through target catalog authority
+
+The gateway activation driver requires independent `restore_activate`
+authority. It installs the complete group vector, conditionally writes one
+immutable `restore/activation` row through the target catalog RF3 group, and
+then performs a separate linearizable observation of that row. A proposal
+response alone is not an activation proof. Before activation, the target
+catalog admits only this exact operation-bound row and its bounded session
+lifecycle under both topology and restore authority. It cannot serve ordinary
+catalog reads, DDL, data, or other topology mutations through that exception.
+
+Only that observed witness can mint the complete, group-major vector of
+per-replica serving grants. The driver installs every grant before reporting
+activation success. Each grant binds the operation, catalog witness, group,
+member, node, store, and process incarnation. A two-phase authenticated
+handshake binds the grant to the target's current restart incarnation.
+`serve-rf3` refuses restored client reads and writes until its exact grant is
+installed over authenticated shard control. Grants are deliberately
+process-local: restarting a restored
+process closes serving until the catalog-observed grant is reinstalled.
+
+After constructing and adopting every replica, start their `serve-rf3`
+processes. They must remain closed to ordinary client traffic. Then run:
+
+```text
+vibedb-gateway restore-activate \
+  -manifest /absolute/private/restore-activation.vibejson
+```
+
+The canonical manifest binds the operation and schema-set files, verified
+staging root, separate activation journal root, target catalog file, exact
+authorization policy and TLS identity, two distinct durable catalog-session
+identities/journals, all group roots and three control endpoints per group,
+repository byte limits, timeout, retry, and connection bounds. The target
+catalog must canonically equal the catalog sealed into the schema set. All
+paths must be canonical and absolute. Input files must be regular files, not
+symlinks.
+See the [manifest definition](../../cmd/vibedb-gateway/restore_activate_manifest.go)
+and [canonical fixture](../../cmd/vibedb-gateway/restore_activate_test.go).
+
+The command revalidates the complete operation-bound inputs, resumes exact
+sealed roots without rewriting live state, publishes and independently
+observes target-catalog activation, and broadcasts the complete grant vector.
+Success emits canonical `operation`, `groups`, and `catalog_witness` fields.
+After failure or a replica restart, rerun the same manifest with the same
+operation and retained journals. Do not mint replacement session identities or
+delete journals to force a retry.
+
+This command activates supplied certified state. It is not a one-command
+backup-to-new-cluster provisioner or a production certificate issuer.
+
+## Restore qualification boundary
 
 A complete backup and restore path requires external kill/partition proof of:
+
 - a replicated backup intent and immutable group inventory;
 - bounded parallel group cuts pinned without stopping foreground traffic;
 - catalog publication only after every exact artifact is durable;
@@ -130,11 +218,44 @@ A complete backup and restore path requires external kill/partition proof of:
 - bounded foreground p99.9 impact, memory, network, WAL retention, and artifact
   space amplification.
 
-The catalog-RF3 operation record, authenticated leader resolution, complete
-live collector, durable bounded repository, gateway request/status API, full
-artifact verifier, and non-serving staging-root builder are composed. External
-process exit before certificate publication and stalled network-stream gates
-prove fail-closed backup recovery. What remains is restore activation: generate
-fresh member/store/node identities, install every staged group, and publish one
-catalog-backed one-time activation witness before any restored process receives
-serving authority. No command claims that activation today.
+The catalog-RF3 backup operation, live collector, bounded repository, public
+request/status API, artifact verifier, fresh-identity root builder, staged-WAL
+adopter, one-time catalog activation, and transient serving gate are composed.
+External process exit before certificate publication and stalled
+network-stream gates cover fail-closed backup recovery. Mandatory Ubuntu gates
+exercise six activation-publication crash cuts and concrete three-root
+installation. A separate external gate boots six restored RF3 processes for
+independent catalog and base/global-index data groups. It runs the actual
+`restore-activate` command, checks refusal before grants and after marker
+removal, verifies fresh catalog projection and restored base/index data,
+preserves a new acknowledged write across leader kill, and requires
+re-observation and regrant after a process restart under hard total, write, and
+failover latency bounds plus aggregate RSS, storage, and WAL bounds. That gate
+uses actual target-catalog RF3 sessions and a separate ReadIndex observation
+before the gateway broadcasts serving
+grants. Qualification remains Partial until mandatory Ubuntu records three
+unskipped runs. This is not a production recovery, key-management, or
+cross-build migration claim.
+
+## Offline same-identity recovery
+
+For disaster-recovery experiments, an offline copy is a separate option:
+
+1. Stop client admission and wait for application-visible requests to reach a
+   terminal acknowledged or explicitly retained outcome.
+2. Stop every gateway and shard process cleanly. Do not copy a member while it
+   is serving.
+3. Copy every complete prepared member root, its WAL generations, SQL/store
+   files and recovery journals, catalog seed/proof, gateway session journals,
+   durable ACK key, WAL key material or recoverable key references,
+   authorization policy, certificates, and exact manifests.
+4. Record the exact build artifact digest. The restore must use the same build
+   grammar. Mixed-build restore and migration are unsupported.
+5. Restore into an isolated network with the same cluster and store identities.
+   Validate file inventories and command manifests before starting any member.
+6. Start one quorum at a time, verify leader election and catch-up, then start
+   gateways. Do not regenerate identities or bootstrap over a non-empty root.
+
+This procedure provides no online recovery-point objective and no portable
+cross-build archive. A filesystem copy taken before all processes stop is not a
+backup, even if each individual file appears readable.

@@ -209,17 +209,21 @@ Never delete a WAL, bootstrap journal, action journal, snapshot cursor, or
 source repository to make a retry succeed. Preserve the first error and inspect
 identity mismatches before changing any artifact.
 
-The current process test restarts the source repository and completes a real
-transfer through the authenticated snapshot listener into the bootstrap
-receiver. The complete replica-replacement sequence does not yet have one
-external multi-process qualification gate across every action above.
+The mandatory Linux replica-replacement gate runs the shipped gateway and RF3
+processes through learner enrollment, group-scoped snapshot transfer, catch-up,
+promotion, leadership handling, catalog publication and drain, source removal,
+retirement, and replacement recovery. It injects leader loss, response loss,
+process restart, and retained-repository cuts. The generated feature state
+remains Partial until CI records the required unskipped runs. This gate is not
+an exhaustive production network, storage-device, or upgrade matrix.
 
 ## Metrics and troubleshooting
 
-The current commands expose bounded internal counters and structured stderr
-messages, but no Prometheus or HTTP metrics endpoint. Process-level resource
-metrics must come from the host or test harness. Do not scrape logs as a stable
-API.
+The gateway exposes authenticated bounded `metrics` responses and each RF3
+member exposes a fixed topology-authorized progress frame. There is no
+Prometheus or HTTP exporter. Process CPU, RSS, filesystem allocation, device
+writes, and total network traffic must still come from the host or test
+harness. Do not scrape logs as a stable API.
 
 Check these symptoms first:
 
@@ -239,9 +243,10 @@ Important operational gaps remain:
 
 - No cold-learner artifact provisioner or RF3 repair command.
 - No public move, leader-transfer, or live-status CLI.
-- No public metrics endpoint or alert bundle.
-- No distributed DDL rollout command.
-- No backup/restore operating contract for a live RF3 cluster.
+- No Prometheus/HTTP exporter or alert bundle.
+- No general distributed DDL endpoint beyond the exact schema-rollout command.
+- Live backup exists. Restore availability is limited to the exact activation
+  and qualification boundary in [Back up and restore distributed data](backup-restore.md).
 - No mixed-build rolling wire- or disk-format upgrade or migration policy.
   The exact same-build pre-release restart boundary is documented in
   [Unreleased compatibility and rolling restarts](unreleased-compatibility.md).

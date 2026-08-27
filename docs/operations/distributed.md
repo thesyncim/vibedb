@@ -1,8 +1,9 @@
 # Operate the distributed runtime
 
-The distributed runtime is experimental and unreleased. It combines a
-routing gateway, static shard services, and prepared RF3 shard
-groups. The generated [distributed feature state](../distributed-feature-state.md)
+The distributed runtime is experimental and unreleased. It combines a routing
+gateway, a compatibility path for static SQL shards, and serving RF3 groups
+for replicated catalog, request-ledger, exact-key data, topology control, and
+live backup. The generated [distributed feature state](../distributed-feature-state.md)
 separates primitives, internal integration, command integration, and test
 evidence.
 
@@ -10,6 +11,8 @@ For a task-oriented setup, start with:
 
 - [Start a local replicated cluster](distributed-quickstart.md)
 - [Operate replica lifecycle](replica-lifecycle.md)
+- [Observe bounded distributed metrics](observability.md)
+- [Back up and restore distributed data](backup-restore.md)
 
 ## Choose a serving path
 
@@ -48,12 +51,13 @@ principal should receive only the data or schema operations it needs.
 
 An operator principal with `topology` capability can read the gateway's
 bounded process counters with `{"op":"metrics"}`. See
-[Observe a distributed cluster](observability.md). This currently covers
-routing, fan-out, result volume, and retries; it is not yet a complete
-proposal/quorum/apply/WAL/snapshot/controller metrics surface.
-Each `serve-rf3` process also exposes a fixed 96-byte topology-authorized
-shard-control counter frame through `internal/servicemetrics.Client`; the
-gateway does not yet aggregate those per-node samples.
+[Observe a distributed cluster](observability.md). This covers routing,
+fan-out, result volume, and retries. Each `serve-rf3` process also exposes a
+fixed topology-authorized shard-control counter frame through
+`internal/servicemetrics.Client`. See the observability guide for the exact
+per-group, per-node, and gateway-controller aggregation boundary. Leadership,
+exact replicated operation phase, total network, and physical device-write
+cuts remain absent rather than inferred from request latency.
 
 ## Catalog authority
 
@@ -162,7 +166,7 @@ operation journal. Without the control manifest, startup fails closed instead
 of inventing topology authority. Scheduling is per physical RF3 allocation;
 tenants are neither pinned to nor used as the unit of shard ownership.
 
-## Range-split status
+## Online range-split status
 
 The repository has durable split intent and runtime records, source capture,
 immutable child artifacts, resumable child staging, tail catch-up, an exact
@@ -173,18 +177,23 @@ scan, while sealing and activation do not rescan or rewrite the child image.
 Before publication, the reconciler requires a coherent voting quorum for each
 child at or beyond the sealed source applied position.
 
-The internal composition now includes durable source and child observation,
-plan admission, exact action grants, and dispatch across the source and child
-lifecycle. This is not yet an operable online-split command. There is no public
-split intake, and `serve-rf3` still passes nil split and plan-admission handlers
-to its control mux. The gateway's replicated-operation scanner cannot complete
-a split until the command constructs those handlers. External split-under-load
-kill, partition, and foreground-latency gates are also absent.
+The serving composition includes durable source and child observation, plan
+admission, exact action grants, authenticated child preparation, and dispatch
+across the source and child lifecycle. `serve-rf3` installs the source,
+artifact, admission, tail, child-preparation, and terminal-retirement services.
+With a strict replica-control manifest and hot-shard policy, the gateway can
+derive one bounded split, persist its replicated operation, run the controller,
+publish the catalog successor, and retire the source after the drain witness.
+This is automatic pressure-driven intake, not a general operator split CLI.
+Mandatory Linux split-under-load fault gates remain Partial until CI records
+their required unskipped runs.
 
 ## Send requests
 
 The gateway accepts one bounded `vibejson` object per line. The maximum request
-line is 1 MiB. Semantic placement comes from SQL and the catalog. A client
+line is 1 MiB, with a separate 8 MiB conservative decode-metadata admission
+budget. There is no additional global statement-count ceiling at ingress.
+Semantic placement comes from SQL and the catalog. A client
 cannot provide a shard ID or serialized plan.
 
 ### General SQL read
@@ -372,16 +381,16 @@ through the host or test harness.
 
 Current operating gaps include:
 
-- Public range-split intake and complete shard-side split action routing
-- External split-under-load kill, partition, and latency qualification
-- Pressure-to-operation controller command composition
+- A general public operator split-intake CLI. Current intake is the bounded
+  automatic hot-shard policy
 - One global MVCC snapshot across RF3 groups
 - A time-based durable request expiry policy. The shipped lifecycle reclaims
   only after an authenticated explicit ACK and contiguous issuer collection.
 - General public DDL beyond the experimental exact schema rollout command
 - A public move, live-status, or leader-transfer CLI
-- Live RF3 backup/restore. Replica bootstrap artifacts are target-bound move
-  state and are not backups; see [Back up and restore distributed data](backup-restore.md).
+- A fully qualified live RF3 restore contract. Live backup export is shipped.
+  See [Back up and restore distributed data](backup-restore.md) for the exact
+  activation and evidence boundary.
 - A mixed-build rolling disk- and wire-format upgrade or migration policy.
   Only the exact same-build pre-release restart boundary is qualified. See
   [Unreleased compatibility and rolling restarts](unreleased-compatibility.md).

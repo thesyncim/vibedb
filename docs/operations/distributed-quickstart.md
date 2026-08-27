@@ -101,7 +101,8 @@ You need:
 - One regular file that contains exactly 32 raw bytes for the durable ACK
   derivation key.
 
-The repository does not provide a certificate-generation or catalog
+The development commands can generate disposable test credentials, but there
+is no production certificate enrollment/rotation or general catalog
 administration command. Test credential fixtures are not an operator API. The
 certificate extension, catalog identities, and preparation manifest must agree
 exactly.
@@ -112,9 +113,12 @@ retained group bundles. Those groups share the process TLS identity, policy,
 listeners, bounded execution lanes, and one authenticated transport per peer.
 Each group retains distinct WAL, SQL, apply, membership, and Raft identities.
 Duplicate retained paths, inconsistent node addresses, and duplicate group
-identities fail before any listener opens. A multi-group process cannot carry
-an enrolled replacement target yet because snapshot listeners and source
-control are still process-scoped rather than group-scoped.
+identities fail before any listener opens. Multi-group serving and cold
+bootstrap route snapshot and replica-control operations by exact group over
+shared physical listeners. Enrolled targets retain distinct group/member/store
+authority even when they share one authenticated node identity and endpoint.
+The 64-group manifest bound is per process, not a transaction participant or
+cluster-wide shard limit.
 
 A manually configured gateway-backed test needs catalog, request-ledger, and
 data groups. Role replicas can share one multi-group process or run as nine

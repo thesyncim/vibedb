@@ -154,6 +154,21 @@ leader or authorizes failover, promotion, removal, or routing.
 See [Operate replica lifecycle](replica-lifecycle.md) for the exact grant,
 snapshot, promotion, removal, and finalization contract.
 
+## Keep restore separate from replacement
+
+Learner bootstrap is a membership operation in the existing cluster. Restore
+creates fresh cluster and replica identities from a certified complete backup.
+Do not point the learner template at a restore staging root or run ordinary
+preparation over that root.
+
+The `restore-group` and `adopt-restore` commands construct and adopt exact
+restore replicas, but retain a closed-serving fence. Target catalog activation
+and transient per-process grants remain database authority, not ConfigMap,
+Pod, PVC, or DNS authority. The renderer does not provision the post-seal
+certificates or drive the complete restore activation lifecycle. See
+[Back up and restore distributed data](backup-restore.md) for the command
+inputs and current qualification boundary.
+
 ## Mandatory three-worker Kind qualification
 
 Linux CI runs the same checked-in command developers can run locally:
