@@ -801,7 +801,7 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 		authority.scratch, next, maxReplicatedCatalogBytes,
 	)
 	if err != nil {
-		return ErrCatalogTooLarge
+		return err
 	}
 	nextWitness, err := appendReplicatedCatalogHeadWitness(nil, next.Generation(), authority.scratch)
 	if err != nil {

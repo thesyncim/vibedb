@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/rebalanceexec"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -415,10 +416,30 @@ func processControlPlaneSnapshot(
 			Command: processCommandFence(dataManifestDigest), RangeIdentity: rangeIdentity,
 			LineageDigest: lineageDigest, ForwardingRuleDigest: forwardingRuleDigest,
 			Replicas: replicas,
+			RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{
+				Identity: replication.Digest(sha256.Sum256([]byte("process-controlplane-ledger-home"))),
+			}},
 		}},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func TestProcessControlPlaneSnapshotCanonicalPreflight(t *testing.T) {
+	cluster := &processRF3Cluster{nativeAddresses: [processVoters]string{
+		"127.0.0.1:20001", "127.0.0.1:20002", "127.0.0.1:20003",
+	}}
+	for _, generation := range []uint64{1, 2} {
+		snapshot := processControlPlaneSnapshot(t, cluster, generation)
+		raw, err := gateway.AppendSnapshotDocument(nil, snapshot)
+		if err != nil {
+			t.Fatalf("generation=%d encode catalog: %v", generation, err)
+		}
+		reopened, err := gateway.OpenSnapshotDocument(raw)
+		if err != nil || reopened.Generation() != generation {
+			t.Fatalf("generation=%d decode catalog: %v", generation, err)
+		}
+	}
 }
