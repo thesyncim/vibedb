@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"strconv"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -23,6 +26,20 @@ func testReplicatedRequestLedgerOptions() ReplicatedApplyOptions {
 func TestReplicatedApplyRequestLedgerCatalogRoundTripAndMachinePlumbing(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "request-ledger-catalog")
 	options := testReplicatedRequestLedgerOptions()
+	ledgerFloor, err := replicatedApplyTransactionByteFloor(base, options.RetryWindow, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataFloor, err := ReplicatedApplyTransactionByteFloor(base, options.RetryWindow)
+	if err != nil || ledgerFloor <= dataFloor {
+		t.Fatalf("ledger floor=%d data floor=%d err=%v", ledgerFloor, dataFloor, err)
+	}
+	options.TxnLimits.MaxBytes = ledgerFloor
+	oneShort := options
+	oneShort.TxnLimits.MaxBytes--
+	if err := validateReplicatedApplyOptions(base, oneShort); !errors.Is(err, ErrReplicatedApplyMismatch) {
+		t.Fatalf("one-byte-short ledger transaction floor=%v", err)
+	}
 	bootstrap := testReplicatedApplyBootstrap()
 	claim, identity, err := database.OpenReplicatedApply(base, bootstrap, options)
 	if err != nil {
@@ -45,6 +62,10 @@ func TestReplicatedApplyRequestLedgerCatalogRoundTripAndMachinePlumbing(t *testi
 		identity.RequestLedgerRangeEnd != options.RequestLedgerRangeEnd ||
 		identity.RequestLedgerRangeIdentity != options.RequestLedgerRangeIdentity {
 		t.Fatalf("request-ledger retained identity = %+v", identity)
+	}
+	if identity.SystemLimits != replicatedApplySystemLimitsForLedger(options.RetryWindow, true) ||
+		identity.Sidecars != canonicalReplicatedLedgerApplySidecars() {
+		t.Fatalf("request-ledger retained geometry = %+v %+v", identity.SystemLimits, identity.Sidecars)
 	}
 	encoded, err := identity.MarshalJSON()
 	if err != nil || vibejson.Validate(encoded) != nil {
@@ -81,6 +102,67 @@ func TestReplicatedApplyRequestLedgerCatalogRoundTripAndMachinePlumbing(t *testi
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReplicatedApplyRequestLedgerGeometryIsBoundedAndCanonical(t *testing.T) {
+	for _, retryWindow := range []uint16{1, 8, replicatedstate.MaxSessionRetryWindow} {
+		options := testReplicatedRequestLedgerOptions()
+		options.RetryWindow = retryWindow
+		limits := replicatedApplySystemLimitsForLedger(retryWindow, true)
+		required, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, true)
+		if !ok || limits != (ReplicatedShardStoreLimits{
+			MaxKeyBytes: required.MaxKeyBytes, MaxDocumentBytes: required.MaxDocumentBytes,
+			MaxBatchDocuments: required.MaxDistinctMutations, MaxBatchBytes: required.MaxBatchBytes,
+		}) {
+			t.Fatalf("retry=%d ledger geometry=%+v required=%+v", retryWindow, limits, required)
+		}
+		sidecars := canonicalReplicatedApplySidecarsForLimits(limits)
+		if err := validateReplicatedApplySidecarsForLimits(sidecars, limits); err != nil ||
+			sidecars.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes {
+			t.Fatalf("retry=%d bounded ledger sidecars=%+v err=%v", retryWindow, sidecars, err)
+		}
+		if options := replicatedApplyDurableOptions(limits); options.SealedRecoveryJournalBytes != sidecars.SystemRecoveryJournalBytes {
+			t.Fatalf("durable ledger journal=%d retained=%d", options.SealedRecoveryJournalBytes,
+				sidecars.SystemRecoveryJournalBytes)
+		}
+		meta := replicatedApplyMeta{
+			Format: ReplicatedApplyFormat, Storage: "system", CaptureStorage: "capture",
+			ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+			RetryWindow:       retryWindow, SystemLimits: limits, Placement: options.Placement,
+			CaptureLimits: ReplicatedShardStoreLimits{
+				MaxKeyBytes: 8, MaxDocumentBytes: 4096, MaxBatchDocuments: 1, MaxBatchBytes: 4104,
+			},
+			Sidecars: sidecars, RequestLedgerCapacityBytes: options.RequestLedgerCapacityBytes,
+			RequestLedgerCleanupReserveBytes: options.RequestLedgerCleanupReserveBytes,
+			RequestLedgerRangeStart:          options.RequestLedgerRangeStart,
+			RequestLedgerRangeEnd:            options.RequestLedgerRangeEnd,
+			RequestLedgerRangeIdentity:       options.RequestLedgerRangeIdentity,
+		}
+		raw, err := meta.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded ReplicatedApplyIdentity
+		if err = decoded.UnmarshalJSON(raw); err != nil || decoded != meta.identity() {
+			t.Fatalf("ledger geometry canonical decode=%+v err=%v", decoded, err)
+		}
+		reencoded, err := decoded.MarshalJSON()
+		if err != nil || !bytes.Equal(raw, reencoded) {
+			t.Fatalf("ledger geometry re-encode err=%v", err)
+		}
+		wrong := bytes.Replace(raw,
+			[]byte(strconv.FormatUint(sidecars.SystemRecoveryJournalBytes, 10)),
+			[]byte(strconv.FormatUint(ReplicatedSystemRecoveryJournalBytes, 10)), 1)
+		if bytes.Equal(wrong, raw) || decoded.UnmarshalJSON(wrong) == nil {
+			t.Fatal("ledger geometry accepted data-only recovery journal")
+		}
+		compact := replicatedApplySystemLimits(retryWindow)
+		if compact.MaxDocumentBytes >= requestledger.MaxCommandBytes ||
+			canonicalReplicatedApplySidecarsForLimits(compact) != canonicalReplicatedApplySidecars() ||
+			validateReplicatedApplySidecarsForLimits(sidecars, compact) == nil {
+			t.Fatal("data-only profile lost its compact exact geometry")
+		}
 	}
 }
 

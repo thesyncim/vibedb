@@ -344,7 +344,11 @@ func (d *database) replicatedCapturePath(meta *replicatedApplyMeta) string {
 }
 
 func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits {
-	required, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, false)
+	return replicatedApplySystemLimitsForLedger(retryWindow, false)
+}
+
+func replicatedApplySystemLimitsForLedger(retryWindow uint16, ledger bool) ReplicatedShardStoreLimits {
+	required, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, ledger)
 	if !ok {
 		return ReplicatedShardStoreLimits{}
 	}
@@ -356,7 +360,7 @@ func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits 
 }
 
 func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Options {
-	sidecars := canonicalReplicatedApplySidecars()
+	sidecars := canonicalReplicatedApplySidecarsForLimits(limits)
 	return durable.Options{
 		Durability:                 durable.DurabilitySync,
 		OpaqueValues:               true,
@@ -394,10 +398,20 @@ func replicatedCaptureDurableOptions(limits ReplicatedShardStoreLimits) durable.
 // byte ceiling required to admit one worst-case base/index apply together with
 // its source-split capture record and replicated system state. Operators use
 // this before first activation; the retained identity cannot grow the limit on
-// a later split attempt.
+// a later split attempt. This preparation helper describes data-only apply;
+// OpenReplicatedApply additionally checks the larger exact control-record floor
+// when the supplied options enable a request ledger.
 func ReplicatedApplyTransactionByteFloor(
 	identity ReplicatedShardStoreIdentity,
 	retryWindow uint16,
+) (int64, error) {
+	return replicatedApplyTransactionByteFloor(identity, retryWindow, false)
+}
+
+func replicatedApplyTransactionByteFloor(
+	identity ReplicatedShardStoreIdentity,
+	retryWindow uint16,
+	ledger bool,
 ) (int64, error) {
 	if retryWindow == 0 || retryWindow > replicatedstate.MaxSessionRetryWindow ||
 		validateReplicatedShardStoreIdentity(identity) != nil {
@@ -411,7 +425,7 @@ func ReplicatedApplyTransactionByteFloor(
 		}
 		relationBytes = min(int64(replication.MaxCommandBytes), relationBytes+limit)
 	}
-	systemBytes := int64(replicatedApplySystemLimits(retryWindow).MaxBatchBytes)
+	systemBytes := int64(replicatedApplySystemLimitsForLedger(retryWindow, ledger).MaxBatchBytes)
 	capture, err := replicatedCaptureLimits(identity)
 	if err != nil || systemBytes <= 0 || capture.MaxBatchBytes <= 0 ||
 		relationBytes > math.MaxInt64-systemBytes ||
@@ -2154,13 +2168,15 @@ func newReplicatedApplyMeta(
 	options ReplicatedApplyOptions,
 ) replicatedApplyMeta {
 	captureLimits, _ := replicatedCaptureLimits(identity)
+	systemLimits := replicatedApplySystemLimitsForLedger(options.RetryWindow,
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}))
 	return replicatedApplyMeta{
 		Format:                           ReplicatedApplyFormat,
 		Storage:                          strings.Clone(storage),
 		CaptureStorage:                   strings.Clone(captureStorage),
 		ValidationProfile:                uint8(replicatedstate.ValidationDeterministicMutation),
 		ValidationDigest:                 replicatedApplyProfileDigest(identity, options.Placement),
-		SystemLimits:                     replicatedApplySystemLimits(options.RetryWindow),
+		SystemLimits:                     systemLimits,
 		CaptureLimits:                    captureLimits,
 		MaxSessions:                      options.MaxSessions,
 		RetryWindow:                      options.RetryWindow,
@@ -2173,7 +2189,7 @@ func newReplicatedApplyMeta(
 		RequestLedgerRangeStart:          options.RequestLedgerRangeStart,
 		RequestLedgerRangeEnd:            options.RequestLedgerRangeEnd,
 		RequestLedgerRangeIdentity:       options.RequestLedgerRangeIdentity,
-		Sidecars:                         canonicalReplicatedApplySidecars(),
+		Sidecars:                         canonicalReplicatedApplySidecarsForLimits(systemLimits),
 	}
 }
 
@@ -2211,7 +2227,8 @@ func validateReplicatedApplyOptions(
 		options.TxnLimits.MaxBytes <= 0 {
 		return fmt.Errorf("%w: invalid transaction or retention limits", ErrReplicatedApplyMismatch)
 	}
-	requiredBytes, err := ReplicatedApplyTransactionByteFloor(identity, options.RetryWindow)
+	requiredBytes, err := replicatedApplyTransactionByteFloor(identity, options.RetryWindow,
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}))
 	if err != nil || options.TxnLimits.MaxBytes < requiredBytes {
 		return fmt.Errorf("%w: transaction byte limit does not cover apply and capture", ErrReplicatedApplyMismatch)
 	}
@@ -2379,7 +2396,8 @@ func validateReplicatedApplyMeta(
 		m.CaptureStorage == m.Storage {
 		return fmt.Errorf("%w: invalid or aliased capture storage identity", ErrReplicatedApplyMismatch)
 	}
-	if m.SystemLimits != replicatedApplySystemLimits(m.RetryWindow) {
+	if m.SystemLimits != replicatedApplySystemLimitsForLedger(m.RetryWindow,
+		m.RequestLedgerRangeIdentity != ([sha256.Size]byte{})) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
 	captureLimits, err := replicatedCaptureLimits(*identity)

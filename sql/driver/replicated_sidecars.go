@@ -3,6 +3,8 @@ package driver
 import (
 	"fmt"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
 )
@@ -63,6 +65,26 @@ func canonicalReplicatedApplySidecars() ReplicatedApplySidecarProfile {
 	}
 }
 
+// The ledger profile is derived from its largest supported retry window,
+// rather than imposing its 16 MiB control-record ceiling on data-only nodes.
+// Both profiles are immutable retained geometry, checked again against the
+// exact collection limits before creating or opening any sidecar.
+func canonicalReplicatedLedgerApplySidecars() ReplicatedApplySidecarProfile {
+	limits := replicatedApplySystemLimitsForLedger(replicatedstate.MaxSessionRetryWindow, true)
+	return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: uint64(
+		storeio.RecoveryBatchRecordPaddedSizeForPayload(
+			storeio.RecoveryJournalMinSectorSize, limits.MaxBatchDocuments,
+			limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+		))}
+}
+
+func canonicalReplicatedApplySidecarsForLimits(limits ReplicatedShardStoreLimits) ReplicatedApplySidecarProfile {
+	if limits.MaxDocumentBytes == requestledger.MaxCommandBytes {
+		return canonicalReplicatedLedgerApplySidecars()
+	}
+	return canonicalReplicatedApplySidecars()
+}
+
 func validateReplicatedShardStoreSidecarGrammar(
 	profile ReplicatedShardStoreSidecarProfile,
 ) error {
@@ -79,7 +101,8 @@ func validateReplicatedShardStoreSidecarGrammar(
 func validateReplicatedApplySidecarGrammar(
 	profile ReplicatedApplySidecarProfile,
 ) error {
-	if profile.SystemRecoveryJournalBytes != ReplicatedSystemRecoveryJournalBytes {
+	if profile != canonicalReplicatedApplySidecars() &&
+		profile != canonicalReplicatedLedgerApplySidecars() {
 		return fmt.Errorf(
 			"%w: invalid sealed system-journal geometry",
 			ErrReplicatedApplyMismatch,
@@ -122,6 +145,10 @@ func validateReplicatedApplySidecarsForLimits(
 ) error {
 	if err := validateReplicatedApplySidecarGrammar(profile); err != nil {
 		return err
+	}
+	if profile != canonicalReplicatedApplySidecarsForLimits(limits) ||
+		profile.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes {
+		return fmt.Errorf("%w: system journal does not match the frozen collection profile", ErrReplicatedApplyMismatch)
 	}
 	required := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		storeio.RecoveryJournalMinSectorSize,

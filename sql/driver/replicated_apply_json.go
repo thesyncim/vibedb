@@ -63,7 +63,7 @@ func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
 	if err := validateReplicatedPlacementProfileGrammar(m.Placement); err != nil {
 		return nil, err
 	}
-	if err := validateReplicatedApplySidecarGrammar(m.Sidecars); err != nil {
+	if err := validateReplicatedApplySidecarsForLimits(m.Sidecars, m.SystemLimits); err != nil {
 		return nil, err
 	}
 	if err := validateReplicatedRequestLedgerOptions(m.options()); err != nil {
@@ -361,8 +361,12 @@ func decodeReplicatedApplyMetaVibe(
 		decoded.RetryWindow > replicatedstate.MaxSessionRetryWindow {
 		return fmt.Errorf("%w: retry window", ErrReplicatedApplyMismatch)
 	}
-	if decoded.SystemLimits != replicatedApplySystemLimits(decoded.RetryWindow) {
+	if decoded.SystemLimits != replicatedApplySystemLimitsForLedger(decoded.RetryWindow,
+		decoded.RequestLedgerRangeIdentity != ([sha256.Size]byte{})) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
+	}
+	if err := validateReplicatedApplySidecarsForLimits(decoded.Sidecars, decoded.SystemLimits); err != nil {
+		return err
 	}
 	if err := validateReplicatedRequestLedgerOptions(decoded.options()); err != nil {
 		return err

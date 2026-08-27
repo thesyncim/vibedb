@@ -295,7 +295,7 @@ func openRF3EvidenceClient(t *testing.T, ctx context.Context, executor *gateway.
 		t.Fatal(err)
 	}
 	completion, err := replication.OpenCompletion(result.Completion)
-	if err != nil || completion.ResultCode != replicatedstate.ResultApplied || completion.ClientEpoch == 0 {
+	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened || completion.ClientEpoch == 0 {
 		t.Fatalf("open completion=%+v err=%v", completion, err)
 	}
 	client.epoch, client.sequence = completion.ClientEpoch, 2
