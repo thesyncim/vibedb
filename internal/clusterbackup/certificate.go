@@ -97,7 +97,7 @@ func validGroup(group raftmember.GroupKey) bool {
 func (cut GroupCut) Valid() bool {
 	return validGroup(cut.Group) && cut.SourceMember != 0 && cut.SchemaGeneration != 0 &&
 		cut.ReplicaSetVersion != 0 && cut.SnapshotIndex != 0 && cut.SnapshotTerm != 0 &&
-		cut.Lineage != ([sha256.Size]byte{}) && cut.RelationManifestDigest != ([sha256.Size]byte{}) &&
+		cut.Lineage != ([sha256.Size]byte{}) &&
 		cut.ArtifactHash != ([sha256.Size]byte{}) && cut.ArtifactBytes != 0 &&
 		cut.ArtifactManifestDigest != ([sha256.Size]byte{})
 }

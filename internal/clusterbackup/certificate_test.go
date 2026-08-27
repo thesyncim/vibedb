@@ -148,6 +148,20 @@ func TestGroupCutComesFromCompleteVerifierManifestNotLearnerDescriptor(t *testin
 	}
 }
 
+func TestGroupCutAcceptsAuthenticatedSingletonWithoutBundleManifestDigest(t *testing.T) {
+	manifest := replicatedstate.SnapshotArtifactManifest{EncodedBytes: 4096,
+		Digest: filled32(5), State: replicatedstate.State{
+			Binding: replicatedstate.Binding{ClusterID: replication.ID128(filled16(1)),
+				ClusterIncarnation: replication.ID128(filled16(2)), TopologyRecoveryEpoch: 3,
+				ShardIncarnation: replication.ID128(filled16(4)), GroupID: replication.ID128(filled16(5)),
+				SchemaGeneration: 6}, Applied: 7, LastTerm: 8, LastEntryDigest: filled32(9),
+			ReplicaSetVersion: 10}}
+	cut, err := GroupCutFromVerifiedArtifact(11, manifest, filled32(12), 4096)
+	if err != nil || !cut.Valid() || cut.RelationManifestDigest != ([32]byte{}) {
+		t.Fatalf("cut=%+v err=%v", cut, err)
+	}
+}
+
 func BenchmarkCertificateOpen64Groups(b *testing.B) {
 	cuts := make([]GroupCut, 64)
 	groups := make([]raftmember.GroupKey, 64)
