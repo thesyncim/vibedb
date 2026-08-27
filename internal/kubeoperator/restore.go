@@ -41,6 +41,73 @@ type RestoreGroupResult struct {
 	Witness clusterrestore.RootWitness
 }
 
+// RestoredReplicaState is the durable non-serving handoff consumed by the
+// shard-side adopter. SnapshotBase contains only fresh target authority and the
+// sanitized relation image certified by the restore operation.
+type RestoredReplicaState struct {
+	Identity        sqldriver.ReplicatedShardStoreIdentity
+	Apply           sqldriver.ReplicatedApplyIdentity
+	SnapshotBase    *pb.Snapshot
+	OperationDigest [sha256.Size]byte
+	GroupOrdinal    uint32
+	ReplicaOrdinal  uint8
+	Targets         [3]RestoredReplicaTarget
+}
+
+type RestoredReplicaTarget struct {
+	Member          uint64
+	Node            [16]byte
+	Store           [16]byte
+	NodeIncarnation uint64
+}
+
+// OpenRestoredReplicaState authenticates the canonical allocation and
+// activation receipts retained beside one restored member.vdb.
+func OpenRestoredReplicaState(root string) (RestoredReplicaState, error) {
+	if !validBootstrapStateDirectory(root) {
+		return RestoredReplicaState{}, ErrBootstrap
+	}
+	var allocation restoreReplicaAllocation
+	found, err := readRestoreVibe(filepath.Join(root, "allocation.vibejson"), &allocation)
+	if err != nil || !found || allocation.Format != 1 || len(allocation.Operation) != 64 ||
+		len(allocation.LogID) != 32 || len(allocation.UserStorage) != 32 {
+		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
+	}
+	var receipt restoreReplicaReceipt
+	found, err = readRestoreVibe(filepath.Join(root, "activation.vibejson"), &receipt)
+	if err != nil || !found || receipt.Format != 1 || receipt.Operation != allocation.Operation ||
+		receipt.GroupOrdinal != allocation.GroupOrdinal || receipt.Replica != allocation.ReplicaOrdinal ||
+		len(receipt.RootDigest) != 64 || receipt.Apply.Format == 0 || receipt.Apply.Storage == "" {
+		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
+	}
+	var logID [16]byte
+	if decodeRestoreHex(logID[:], allocation.LogID) != nil || receipt.Identity.LogID != logID {
+		return RestoredReplicaState{}, ErrBootstrap
+	}
+	var snapshot pb.Snapshot
+	if err := proto.Unmarshal(receipt.SnapshotBase, &snapshot); err != nil {
+		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
+	}
+	if _, err := replicatedstate.OpenSnapshotBase(&snapshot); err != nil {
+		return RestoredReplicaState{}, errors.Join(ErrBootstrap, err)
+	}
+	var operation [sha256.Size]byte
+	if decodeRestoreHex(operation[:], receipt.Operation) != nil {
+		return RestoredReplicaState{}, ErrBootstrap
+	}
+	var targets [3]RestoredReplicaTarget
+	for index, target := range receipt.Targets {
+		if decodeRestoreHex(targets[index].Node[:], target.Node) != nil ||
+			decodeRestoreHex(targets[index].Store[:], target.Store) != nil || target.Member == 0 || target.NodeIncarnation == 0 {
+			return RestoredReplicaState{}, ErrBootstrap
+		}
+		targets[index].Member, targets[index].NodeIncarnation = target.Member, target.NodeIncarnation
+	}
+	return RestoredReplicaState{Identity: receipt.Identity, Apply: receipt.Apply, SnapshotBase: &snapshot,
+		OperationDigest: operation, GroupOrdinal: receipt.GroupOrdinal, ReplicaOrdinal: receipt.Replica,
+		Targets: targets}, nil
+}
+
 // RestoreGroup imports one certified artifact into three fresh non-serving SQL
 // roots. Template is the explicit canonical target-schema projection; its
 // digest must be Operation.TargetCatalogDigest. The current Kubernetes prepare
@@ -94,13 +161,22 @@ type restoreReplicaAllocation struct {
 }
 
 type restoreReplicaReceipt struct {
-	Format       uint16                            `json:"format"`
-	Operation    string                            `json:"operation"`
-	GroupOrdinal uint32                            `json:"group_ordinal"`
-	Replica      uint8                             `json:"replica"`
-	Apply        sqldriver.ReplicatedApplyIdentity `json:"apply"`
-	SnapshotBase []byte                            `json:"snapshot_base"`
-	RootDigest   string                            `json:"root_digest"`
+	Format       uint16                                 `json:"format"`
+	Operation    string                                 `json:"operation"`
+	GroupOrdinal uint32                                 `json:"group_ordinal"`
+	Replica      uint8                                  `json:"replica"`
+	Identity     sqldriver.ReplicatedShardStoreIdentity `json:"identity"`
+	Apply        sqldriver.ReplicatedApplyIdentity      `json:"apply"`
+	Targets      [3]restoreReplicaTarget                `json:"targets"`
+	SnapshotBase []byte                                 `json:"snapshot_base"`
+	RootDigest   string                                 `json:"root_digest"`
+}
+
+type restoreReplicaTarget struct {
+	Member          uint64 `json:"member"`
+	Node            string `json:"node"`
+	Store           string `json:"store"`
+	NodeIncarnation uint64 `json:"node_incarnation"`
 }
 
 type restoreReplicaFactory struct {
@@ -172,7 +248,7 @@ func (f *restoreReplicaFactory) OpenReplica(
 			operation, group, replica, source)
 	}
 	root.Commit = func(ctx context.Context, activation sqldriver.ReplicatedChildActivation) ([sha256.Size]byte, error) {
-		digest, commitErr := commitRestoreReplica(ctx, receiptPath, allocation, activation, operation, group, replica)
+		digest, commitErr := commitRestoreReplica(ctx, receiptPath, allocation, identity, activation, operation, group, replica)
 		if commitErr == nil {
 			commitErr = errors.Join(activation.Apply.Close(), database.Close())
 		}
@@ -286,6 +362,7 @@ func restoreApplyOptions(in bootstrapApply) (sqldriver.ReplicatedApplyOptions, e
 		MaxSessions: in.MaxSessions, RetryWindow: in.RetryWindow,
 		TxnLimits: durable.TxnLimits{MaxCollections: in.MaxCollections, MaxDocuments: in.MaxDocuments, MaxBytes: in.MaxBytes},
 		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format:   sqldriver.ReplicatedPlacementProfileFormat,
 			ShardKey: in.ShardKey, TupleVersion: distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion,
 			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
@@ -353,6 +430,7 @@ func recoverRestoreReplica(
 
 func commitRestoreReplica(
 	ctx context.Context, receiptPath string, allocation restoreReplicaAllocation,
+	identity sqldriver.ReplicatedShardStoreIdentity,
 	activation sqldriver.ReplicatedChildActivation, operation clusterrestore.Operation,
 	group uint32, replica uint8,
 ) ([sha256.Size]byte, error) {
@@ -376,8 +454,13 @@ func commitRestoreReplica(
 	var digest [sha256.Size]byte
 	copy(digest[:], h.Sum(nil))
 	receipt := restoreReplicaReceipt{Format: 1, Operation: hex.EncodeToString(operation.Digest[:]),
-		GroupOrdinal: group, Replica: replica, Apply: activation.ApplyIdentity,
+		GroupOrdinal: group, Replica: replica, Identity: identity, Apply: activation.ApplyIdentity,
 		SnapshotBase: base, RootDigest: hex.EncodeToString(digest[:])}
+	for index, target := range operation.Targets[group].Replicas {
+		receipt.Targets[index] = restoreReplicaTarget{Member: target.Member,
+			Node: hex.EncodeToString(target.Node[:]), Store: hex.EncodeToString(target.Store[:]),
+			NodeIncarnation: target.NodeIncarnation}
+	}
 	if err := writeRestoreVibe(receiptPath, &receipt); err != nil {
 		return [sha256.Size]byte{}, err
 	}

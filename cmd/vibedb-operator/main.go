@@ -19,11 +19,13 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: vibedb-operator bootstrap|render|prepare|restore-group|validate")
+		fmt.Fprintln(os.Stderr, "usage: vibedb-operator adopt-restore|bootstrap|render|prepare|restore-group|validate")
 		os.Exit(2)
 	}
 	var err error
 	switch os.Args[1] {
+	case "adopt-restore":
+		err = adoptRestore(os.Args[2:])
 	case "bootstrap":
 		err = bootstrap(os.Args[2:])
 	case "render":
@@ -41,6 +43,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "vibedb-operator: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+func adoptRestore(arguments []string) error {
+	flags := flag.NewFlagSet("adopt-restore", flag.ContinueOnError)
+	manifest := flags.String("manifest", "", "canonical per-node target preparation manifest")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *manifest == "" || !filepath.IsAbs(*manifest) || filepath.Clean(*manifest) != *manifest {
+		return errors.New("adopt-restore requires one canonical absolute -manifest")
+	}
+	command := exec.Command("vibedb-shard", "adopt-restored-rf3", "-manifest", *manifest)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	return command.Run()
 }
 
 func bootstrap(arguments []string) error {
