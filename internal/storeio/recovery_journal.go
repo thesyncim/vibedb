@@ -1712,8 +1712,8 @@ func (rj *RecoveryJournal) scanTail() error {
 	if binary.LittleEndian.Uint32(rj.scratch[:4]) == 0 {
 		return nil
 	}
-	region := make([]byte, rj.header.Capacity)
-	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
+	var stream recoveryRecordStream
+	if err := stream.open(rj.file, rj.header.Capacity); err != nil {
 		return err
 	}
 	cursor := uint64(0)
@@ -1724,8 +1724,8 @@ func (rj *RecoveryJournal) scanTail() error {
 	var atomicLastKind uint16
 	conditionalChain := recoveryConditionalChain{}
 	for cursor < rj.header.Capacity {
-		rec, padded, err := DecodeRecoveryRecord(
-			region[cursor:], rj.header.SectorSize, sequence,
+		rec, padded, err := stream.record(
+			cursor, rj.header.SectorSize, sequence,
 		)
 		if err != nil {
 			if errors.Is(err, errRecoveryJournalTruncatableTail) {
@@ -2348,8 +2348,8 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 	if rj.header.BaseSequence == ^uint64(0) {
 		return nil
 	}
-	region := make([]byte, rj.header.Capacity)
-	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
+	var stream recoveryRecordStream
+	if err := stream.open(rj.file, rj.header.Capacity); err != nil {
 		return err
 	}
 	cursor := uint64(0)
@@ -2360,8 +2360,8 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 	var atomicLastKind uint16
 	conditionalChain := recoveryConditionalChain{}
 	for cursor < rj.header.Capacity {
-		rec, padded, err := DecodeRecoveryRecord(
-			region[cursor:], rj.header.SectorSize, sequence,
+		rec, padded, err := stream.record(
+			cursor, rj.header.SectorSize, sequence,
 		)
 		if err != nil {
 			if errors.Is(err, errRecoveryJournalTruncatableTail) {
