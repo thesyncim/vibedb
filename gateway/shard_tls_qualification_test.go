@@ -154,7 +154,11 @@ func TestAuthenticatedShardBoundaryRotationAndConfusedDeputyFault(t *testing.T) 
 
 // BenchmarkAuthenticatedGatewayShardStream measures the steady authenticated
 // stream separately from cold TLS handshakes. Every operation performs both
-// service-delegate and forwarded-user authorization checks.
+// service-delegate and forwarded-user authorization checks. The authorization
+// checks themselves are allocation-free (proved above). Go's crypto/tls
+// currently allocates one escaping atLeastReader in Conn.readFromUntil at each
+// endpoint for this strict request/response shape; keeping that standard-library
+// floor visible here prevents attributing it to VibeDB's authority path.
 func BenchmarkAuthenticatedGatewayShardStream(b *testing.B) {
 	authority := newGatewayTLSAuthority(b)
 	shardIdentity := gatewayPeerIdentity(63, 10)
