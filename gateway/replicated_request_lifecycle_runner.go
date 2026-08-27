@@ -377,6 +377,21 @@ func (runner *DurableRequestLifecycleRunner) openWaveRows(
 	wave DurableRequestWave,
 	keyDigest requestledger.Digest,
 ) (requestledger.HeadRecord, requestledger.RoutePinRecord, requestledger.PendingWaveRecord, uint64, error) {
+	if reader, ok := runner.ledger.(durableRequestWaveCutReader); ok {
+		var scratch [requestledger.MaxPendingWaveSteps]requestledger.StepRef
+		cut, err := reader.ReadWaveCut(ctx, wave.Home, wave.Key, scratch[:])
+		if err != nil || cut.Head.KeyDigest != keyDigest ||
+			(cut.Route.Revision != 0 && cut.Route.KeyDigest != keyDigest) ||
+			(cut.Pending.Revision != 0 && (cut.Pending.KeyDigest != keyDigest ||
+				len(cut.Pending.Steps) != 1 || cut.Pending.Steps[0] != wave.Step)) {
+			return requestledger.HeadRecord{}, requestledger.RoutePinRecord{},
+				requestledger.PendingWaveRecord{}, 0, errors.Join(err, ErrDurableRequestConflict)
+		}
+		if cut.Pending.Revision != 0 {
+			cut.Pending.Steps = append([]requestledger.StepRef(nil), cut.Pending.Steps...)
+		}
+		return cut.Head, cut.Route, cut.Pending, cut.Applied, nil
+	}
 	headRow, err := runner.ledger.ReadRow(ctx, wave.Home, DurableRequestLifecycleRead{
 		Key: wave.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
 	})

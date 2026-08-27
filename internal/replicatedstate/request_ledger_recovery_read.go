@@ -1,6 +1,7 @@
 package replicatedstate
 
 import (
+	"encoding/binary"
 	"errors"
 
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -23,10 +24,53 @@ const (
 	RequestLedgerReadRoutePin     RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageRoutePin)
 	RequestLedgerReadPrepared     RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StoragePrepared)
 	RequestLedgerReadSchemaPin    RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageSchemaPin)
+	// RequestLedgerReadWave is the coherent head/route-pin/pending recovery cut
+	// used at wave admission. It avoids three independent leader ReadIndex
+	// rounds while retaining ACK precedence and one applied-index fence.
+	RequestLedgerReadWave RequestLedgerReadKind = 0xe0
 	// Issuer status is a synthetic, fixed-size coherent view rather than one
 	// directly addressable storage row.
 	RequestLedgerReadIssuerStatus RequestLedgerReadKind = 0xf0
 )
+
+const requestLedgerWaveReadHeaderBytes = 13
+
+const MaxRequestLedgerWaveReadBytes = requestLedgerWaveReadHeaderBytes +
+	requestledger.MaxHeadRecordBytes + requestledger.MaxRoutePinRecordBytes +
+	requestledger.MaxPendingWaveRecordBytes
+
+type RequestLedgerWaveReadValue struct {
+	Head         []byte
+	RoutePin     []byte
+	RouteFound   bool
+	Pending      []byte
+	PendingFound bool
+}
+
+func OpenRequestLedgerWaveReadValue(raw []byte) (RequestLedgerWaveReadValue, error) {
+	if len(raw) < requestLedgerWaveReadHeaderBytes || len(raw) > MaxRequestLedgerWaveReadBytes ||
+		raw[0]&^byte(3) != 0 {
+		return RequestLedgerWaveReadValue{}, ErrRequestLedgerRead
+	}
+	headBytes := uint64(binary.LittleEndian.Uint32(raw[1:5]))
+	routeBytes := uint64(binary.LittleEndian.Uint32(raw[5:9]))
+	pendingBytes := uint64(binary.LittleEndian.Uint32(raw[9:13]))
+	total := uint64(requestLedgerWaveReadHeaderBytes) + headBytes + routeBytes + pendingBytes
+	if headBytes == 0 || total != uint64(len(raw)) ||
+		(routeBytes != 0) != (raw[0]&1 != 0) ||
+		(pendingBytes != 0) != (raw[0]&2 != 0) {
+		return RequestLedgerWaveReadValue{}, ErrRequestLedgerRead
+	}
+	offset := uint64(requestLedgerWaveReadHeaderBytes)
+	value := RequestLedgerWaveReadValue{Head: raw[offset : offset+headBytes : offset+headBytes]}
+	offset += headBytes
+	value.RouteFound = routeBytes != 0
+	value.RoutePin = raw[offset : offset+routeBytes : offset+routeBytes]
+	offset += routeBytes
+	value.PendingFound = pendingBytes != 0
+	value.Pending = raw[offset : offset+pendingBytes : offset+pendingBytes]
+	return value, nil
+}
 
 var ErrRequestLedgerRead = errors.New("replicatedstate: invalid request-ledger recovery read")
 
@@ -74,6 +118,8 @@ func RequestLedgerReadMaxBytes(kind RequestLedgerReadKind) int {
 		return requestledger.MaxPreparedTerminalRecordBytes
 	case RequestLedgerReadSchemaPin:
 		return requestledger.MaxSchemaPinReleaseRecordBytes
+	case RequestLedgerReadWave:
+		return MaxRequestLedgerWaveReadBytes
 	case RequestLedgerReadIssuerStatus:
 		return requestledger.IssuerLaneStatusBytes
 	default:
@@ -178,6 +224,12 @@ func (m *Machine) RequestLedgerReadInto(
 				result.Found = true
 				result.AuthoritativeKind = RequestLedgerReadHead
 				result.Value = headRaw
+			} else if request.Kind == RequestLedgerReadWave {
+				result.Value, err = requestLedgerWaveRead(snapshot, dst, headRaw, home, keyDigest)
+				if err == nil {
+					result.Found = true
+					result.AuthoritativeKind = RequestLedgerReadWave
+				}
 			} else {
 				selectedKey := requestLedgerReadStorageKey(request, home, keyDigest)
 				if selectedKey == nil {
@@ -202,6 +254,49 @@ func (m *Machine) RequestLedgerReadInto(
 		return RequestLedgerReadResult{}, m.fail(errors.Join(err, closeErr))
 	}
 	return result, nil
+}
+
+func requestLedgerWaveRead(
+	snapshot *durable.Snapshot,
+	dst, headRaw []byte,
+	home requestledger.LedgerHome,
+	keyDigest requestledger.Digest,
+) ([]byte, error) {
+	if snapshot == nil || len(headRaw) == 0 ||
+		requestLedgerWaveReadHeaderBytes+len(headRaw) > cap(dst) {
+		return nil, ErrReadBufferBound
+	}
+	headBytes := len(headRaw)
+	value := dst[:requestLedgerWaveReadHeaderBytes+headBytes]
+	copy(value[requestLedgerWaveReadHeaderBytes:], headRaw)
+	clear(value[:requestLedgerWaveReadHeaderBytes])
+
+	routeStart := len(value)
+	routeKey := requestledger.AppendRoutePinKey(nil, home, keyDigest)
+	var routeFound bool
+	var err error
+	value, routeFound, err = snapshot.AppendRaw(value, routeKey)
+	if err != nil {
+		return nil, err
+	}
+	if routeFound {
+		value[0] |= 1
+		binary.LittleEndian.PutUint32(value[5:9], uint32(len(value)-routeStart))
+	}
+
+	pendingStart := len(value)
+	pendingKey := requestledger.AppendPendingKey(nil, home, keyDigest)
+	var pendingFound bool
+	value, pendingFound, err = snapshot.AppendRaw(value, pendingKey)
+	if err != nil {
+		return nil, err
+	}
+	if pendingFound {
+		value[0] |= 2
+		binary.LittleEndian.PutUint32(value[9:13], uint32(len(value)-pendingStart))
+	}
+	binary.LittleEndian.PutUint32(value[1:5], uint32(headBytes))
+	return value, nil
 }
 
 func requestLedgerIssuerStatusRead(

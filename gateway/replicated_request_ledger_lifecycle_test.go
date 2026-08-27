@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -15,6 +16,75 @@ import (
 type lifecycleRF3Stub struct {
 	apply func(context.Context, DurableRequestLedgerHome, []byte) (ReplicatedRequestLedgerApplyResult, error)
 	read  func(context.Context, DurableRequestLedgerHome, ReplicatedRequestLedgerRead) (ReplicatedRequestLedgerReadResult, error)
+}
+
+func TestDurableRequestLedgerRF3ReadsWaveCutInOneRequest(t *testing.T) {
+	rows := lifecycleRowFixture(t)
+	homePoint, _ := requestledger.Home(rows.head.Key)
+	home := DurableRequestLedgerHome{
+		Identity: replication.Digest(lifecycleDigest("range")), Point: homePoint,
+	}
+	headRaw, _ := requestledger.AppendHead(nil, rows.head)
+	routeRaw, _ := requestledger.AppendRoutePin(nil, rows.route)
+	pendingRaw, _ := requestledger.AppendPendingWave(nil, rows.pending)
+	raw := make([]byte, 13, 13+len(headRaw)+len(routeRaw)+len(pendingRaw))
+	raw[0] = 3
+	binary.LittleEndian.PutUint32(raw[1:5], uint32(len(headRaw)))
+	binary.LittleEndian.PutUint32(raw[5:9], uint32(len(routeRaw)))
+	binary.LittleEndian.PutUint32(raw[9:13], uint32(len(pendingRaw)))
+	raw = append(raw, headRaw...)
+	raw = append(raw, routeRaw...)
+	raw = append(raw, pendingRaw...)
+	reads := 0
+	stub := lifecycleRF3Stub{read: func(
+		_ context.Context, _ DurableRequestLedgerHome, read ReplicatedRequestLedgerRead,
+	) (ReplicatedRequestLedgerReadResult, error) {
+		reads++
+		if read.Kind != replicatedstate.RequestLedgerReadWave || read.MinimumApplied != 1 ||
+			read.MaxBytes != uint32(replicatedstate.MaxRequestLedgerWaveReadBytes) {
+			t.Fatalf("read=%+v", read)
+		}
+		return ReplicatedRequestLedgerReadResult{Applied: 17, Found: true,
+			AuthoritativeKind: replicatedstate.RequestLedgerReadWave, Value: raw}, nil
+	}}
+	ledger := &DurableRequestLedgerRF3{client: stub}
+	steps := make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps)
+	cut, err := ledger.ReadWaveCut(context.Background(), home, rows.head.Key, steps)
+	if err != nil || reads != 1 || cut.Applied != 17 ||
+		cut.Head.KeyDigest != rows.head.KeyDigest ||
+		cut.Route.RecordDigest != rows.route.RecordDigest ||
+		cut.Pending.WaveDigest != rows.pending.WaveDigest ||
+		len(cut.Pending.Steps) != len(rows.pending.Steps) {
+		t.Fatalf("reads=%d cut=%+v err=%v", reads, cut, err)
+	}
+}
+
+func BenchmarkDurableRequestLedgerRF3ReadWaveCut(b *testing.B) {
+	head, _, _ := lifecycleHead(b)
+	homePoint, _ := requestledger.Home(head.Key)
+	home := DurableRequestLedgerHome{
+		Identity: replication.Digest(lifecycleDigest("range")), Point: homePoint,
+	}
+	headRaw, _ := requestledger.AppendHead(nil, head)
+	raw := make([]byte, 13, 13+len(headRaw))
+	binary.LittleEndian.PutUint32(raw[1:5], uint32(len(headRaw)))
+	raw = append(raw, headRaw...)
+	stub := lifecycleRF3Stub{read: func(
+		context.Context, DurableRequestLedgerHome, ReplicatedRequestLedgerRead,
+	) (ReplicatedRequestLedgerReadResult, error) {
+		return ReplicatedRequestLedgerReadResult{Applied: 17, Found: true,
+			AuthoritativeKind: replicatedstate.RequestLedgerReadWave, Value: raw}, nil
+	}}
+	ledger := &DurableRequestLedgerRF3{client: stub}
+	steps := make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cut, err := ledger.ReadWaveCut(context.Background(), home, head.Key, steps)
+		if err != nil || cut.Head.KeyDigest != head.KeyDigest {
+			b.Fatalf("cut=%+v err=%v", cut, err)
+		}
+	}
 }
 
 func (stub lifecycleRF3Stub) Apply(ctx context.Context, home DurableRequestLedgerHome, raw []byte) (ReplicatedRequestLedgerApplyResult, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -512,13 +513,16 @@ func TestDurableRequestLifecycleRunnerRejectsCommandAfterRouteRefresh(t *testing
 	}
 }
 
-func TestDurableRequestLifecycleRunnerFencesEveryReadThroughRF3Adapter(t *testing.T) {
+func TestDurableRequestLifecycleRunnerUsesOneFencedWaveCutThroughRF3Adapter(t *testing.T) {
 	wave, head, route := lifecycleRunnerFixture(t)
 	headRaw, err := requestledger.AppendHead(nil, head)
 	if err != nil {
 		t.Fatal(err)
 	}
-	minimums := make([]uint64, 0, 3)
+	waveRaw := make([]byte, 13, 13+len(headRaw))
+	binary.LittleEndian.PutUint32(waveRaw[1:5], uint32(len(headRaw)))
+	waveRaw = append(waveRaw, headRaw...)
+	minimums := make([]uint64, 0, 1)
 	stub := lifecycleRF3Stub{
 		apply: func(context.Context, DurableRequestLedgerHome, []byte) (ReplicatedRequestLedgerApplyResult, error) {
 			return ReplicatedRequestLedgerApplyResult{}, errors.New("unexpected apply")
@@ -529,15 +533,13 @@ func TestDurableRequestLifecycleRunnerFencesEveryReadThroughRF3Adapter(t *testin
 			read ReplicatedRequestLedgerRead,
 		) (ReplicatedRequestLedgerReadResult, error) {
 			minimums = append(minimums, read.MinimumApplied)
-			if read.Kind == replicatedstate.RequestLedgerReadHead {
+			if read.Kind == replicatedstate.RequestLedgerReadWave {
 				return ReplicatedRequestLedgerReadResult{
 					Applied: 55, Found: true,
-					AuthoritativeKind: read.Kind, Value: headRaw,
+					AuthoritativeKind: read.Kind, Value: waveRaw,
 				}, nil
 			}
-			return ReplicatedRequestLedgerReadResult{
-				Applied: 55, AuthoritativeKind: read.Kind,
-			}, nil
+			return ReplicatedRequestLedgerReadResult{}, errors.New("unexpected ledger read")
 		},
 	}
 	adapter := &DurableRequestLedgerRF3{client: stub}
@@ -562,7 +564,7 @@ func TestDurableRequestLifecycleRunnerFencesEveryReadThroughRF3Adapter(t *testin
 		routePin.Phase != requestledger.RoutePinInvalid || pending.Revision != 0 {
 		t.Fatalf("rows=%+v/%+v/%+v err=%v", opened, routePin, pending, err)
 	}
-	if len(minimums) != 3 || minimums[0] != 1 || minimums[1] != 55 || minimums[2] != 55 {
-		t.Fatalf("minimum-applied fences = %v, want [1 55 55]", minimums)
+	if len(minimums) != 1 || minimums[0] != 1 {
+		t.Fatalf("minimum-applied fences = %v, want one [1] cut", minimums)
 	}
 }

@@ -126,6 +126,22 @@ type DurableRequestLedgerRF3 struct {
 	client durableRequestLedgerRF3Client
 }
 
+type durableRequestWaveReadCut struct {
+	Head    requestledger.HeadRecord
+	Route   requestledger.RoutePinRecord
+	Pending requestledger.PendingWaveRecord
+	Applied uint64
+}
+
+type durableRequestWaveCutReader interface {
+	ReadWaveCut(
+		context.Context,
+		DurableRequestLedgerHome,
+		requestledger.RequestKey,
+		[]requestledger.StepRef,
+	) (durableRequestWaveReadCut, error)
+}
+
 func NewDurableRequestLedgerRF3(
 	client *ReplicatedRequestLedgerRF3,
 ) (*DurableRequestLedgerRF3, error) {
@@ -326,6 +342,59 @@ func (ledger *DurableRequestLedgerRF3) ReadRow(
 		return DurableRequestLifecycleRow{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	return row, nil
+}
+
+// ReadWaveCut reopens the head, route pin, and pending wave from one state
+// machine snapshot behind one leader ReadIndex. The returned variable fields
+// alias the transferred RF3 response buffer; pendingSteps remains caller-owned.
+func (ledger *DurableRequestLedgerRF3) ReadWaveCut(
+	ctx context.Context,
+	home DurableRequestLedgerHome,
+	key requestledger.RequestKey,
+	pendingSteps []requestledger.StepRef,
+) (durableRequestWaveReadCut, error) {
+	if ledger == nil || ledger.client == nil || ctx == nil || !key.Valid() ||
+		len(pendingSteps) < requestledger.MaxPendingWaveSteps {
+		return durableRequestWaveReadCut{}, ErrDurableRequest
+	}
+	derivedHome, err := requestledger.Home(key)
+	if err != nil || derivedHome != home.Point {
+		return durableRequestWaveReadCut{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	result, err := ledger.client.Read(ctx, home, ReplicatedRequestLedgerRead{
+		Key: key, ExpectedRangeIdentity: requestledger.Digest(home.Identity),
+		Kind: replicatedstate.RequestLedgerReadWave, MinimumApplied: 1,
+		MaxBytes: uint32(replicatedstate.MaxRequestLedgerWaveReadBytes),
+	})
+	if err != nil {
+		return durableRequestWaveReadCut{}, err
+	}
+	if !result.Found || result.AuthoritativeKind != replicatedstate.RequestLedgerReadWave {
+		return durableRequestWaveReadCut{}, ErrDurableRequestConflict
+	}
+	value, err := replicatedstate.OpenRequestLedgerWaveReadValue(result.Value)
+	if err != nil {
+		return durableRequestWaveReadCut{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	head, err := requestledger.OpenHead(value.Head)
+	if err != nil || head.Key != key {
+		return durableRequestWaveReadCut{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	cut := durableRequestWaveReadCut{Head: head, Applied: result.Applied}
+	if value.RouteFound {
+		cut.Route, err = requestledger.OpenRoutePin(value.RoutePin)
+		if err != nil {
+			return durableRequestWaveReadCut{}, errors.Join(err, ErrDurableRequestConflict)
+		}
+	}
+	if value.PendingFound {
+		view, openErr := requestledger.OpenPendingWaveInto(value.Pending, pendingSteps)
+		if openErr != nil {
+			return durableRequestWaveReadCut{}, errors.Join(openErr, ErrDurableRequestConflict)
+		}
+		cut.Pending = view.Record()
+	}
+	return cut, nil
 }
 
 func openDurableRequestLifecycleRow(

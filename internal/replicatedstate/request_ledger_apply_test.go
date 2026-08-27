@@ -59,6 +59,52 @@ func TestRequestLedgerRecoveryReadUsesExactHeadBound(t *testing.T) {
 		t.Fatalf("head read bound = %d, exact=%d command=%d", got,
 			requestledger.MaxHeadRecordBytes, requestledger.MaxCommandBytes)
 	}
+	if got := RequestLedgerReadMaxBytes(RequestLedgerReadWave); got != MaxRequestLedgerWaveReadBytes ||
+		got > requestledger.MaxCommandBytes {
+		t.Fatalf("wave read bound = %d, exact=%d command=%d", got,
+			MaxRequestLedgerWaveReadBytes, requestledger.MaxCommandBytes)
+	}
+}
+
+func TestRequestLedgerWaveRecoveryReadUsesOneCoherentCut(t *testing.T) {
+	fixture := newRequestLedgerMachineFixture(t, 64<<20)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest{0x11}, Principal: requestledger.PrincipalID{0x21},
+		Request: requestledger.RequestID{0x31}}
+	create, wantHead := requestLedgerCreateCommand(t, fixture, key)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), create); err != nil {
+		t.Fatal(err)
+	}
+	read := RequestLedgerReadRequest{
+		Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Kind: RequestLedgerReadWave, MinimumApplied: 2,
+		MaxBytes: uint32(RequestLedgerReadMaxBytes(RequestLedgerReadWave)),
+	}
+	result, err := fixture.machine.RequestLedgerReadInto(
+		read, make([]byte, 0, read.MaxBytes),
+	)
+	if err != nil || !result.Found || result.AuthoritativeKind != RequestLedgerReadWave {
+		t.Fatalf("wave read=%+v err=%v", result, err)
+	}
+	value, err := OpenRequestLedgerWaveReadValue(result.Value)
+	if err != nil || value.RouteFound || value.PendingFound {
+		t.Fatalf("wave value=%+v err=%v", value, err)
+	}
+	head, err := requestledger.OpenHead(value.Head)
+	if err != nil || head.KeyDigest != wantHead.KeyDigest {
+		t.Fatalf("head=%+v err=%v", head, err)
+	}
+	for _, corrupt := range [][]byte{
+		result.Value[:len(result.Value)-1],
+		append(append([]byte(nil), result.Value...), 0),
+	} {
+		if _, openErr := OpenRequestLedgerWaveReadValue(corrupt); openErr == nil {
+			t.Fatal("accepted noncanonical wave value")
+		}
+	}
 }
 
 func requestLedgerCreateCommand(t testing.TB, fixture machineFixture, key requestledger.RequestKey) ([]byte, requestledger.HeadRecord) {
