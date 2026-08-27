@@ -292,8 +292,11 @@ Current operating gaps include:
 - Schema rollout command composition and public DDL
 - A public move, live-status, or leader-transfer CLI
 - Live RF3 backup/restore procedures
-- A rolling disk- and wire-format upgrade policy
-- Production support and a complete qualification matrix
+- A mixed-build rolling disk- and wire-format upgrade or migration policy.
+  Only the exact same-build pre-release restart boundary is qualified; see
+  [Unreleased compatibility and rolling restarts](unreleased-compatibility.md).
+- A released or production-supported distributed contract
+- A complete production qualification matrix
 
 Routing, catalog validation, authorization, membership grants, and shard
 admission fail closed. A distributed read never returns partial documents.

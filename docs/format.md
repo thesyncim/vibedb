@@ -7,6 +7,10 @@ compatibility decoder or migration framework.
 > place. Do not expect a file from another commit to open. Pin the producer and
 > reader to one tested revision.
 
+For the exact same-build restart boundary and the distinction between binary
+compatibility and schema-generation rollout, see
+[Unreleased compatibility and rolling restarts](operations/unreleased-compatibility.md).
+
 ## File layout
 
 The base page is exactly 4096 bytes. The fixed mutable prefix is:

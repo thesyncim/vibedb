@@ -242,7 +242,9 @@ Important operational gaps remain:
 - No public metrics endpoint or alert bundle.
 - No distributed DDL rollout command.
 - No backup/restore operating contract for a live RF3 cluster.
-- No rolling wire- or disk-format upgrade policy.
+- No mixed-build rolling wire- or disk-format upgrade or migration policy.
+  The exact same-build pre-release restart boundary is documented in
+  [Unreleased compatibility and rolling restarts](unreleased-compatibility.md).
 - External multi-process crash and partition coverage is not exhaustive.
 - The runtime has no release or production-support contract.
 
