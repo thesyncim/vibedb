@@ -1,7 +1,8 @@
 # Back up and restore distributed data
 
-VibeDB does not yet ship a safe live RF3 cluster backup or restore command.
-This is an explicit unreleased boundary, not an invitation to copy live files.
+VibeDB ships authenticated live RF3 backup export through the gateway. Restore
+activation is not yet shipped. This boundary is not an invitation to copy live
+files or to start a non-serving restore staging root.
 
 The shipped RF3 shard process now exposes a target-free live snapshot stream
 over its mutually authenticated control listener. Only an independent
@@ -27,6 +28,45 @@ delegation, transaction-recovery, request-ledger, execution-pin, or serving
 authority. The gateway backup controller rechecks backup authority whenever it
 conditionally advances the catalog-RF3 operation record.
 
+## Run and inspect a live backup
+
+Start the gateway with its normal replicated-catalog and replica-control
+configuration plus an absolute, server-local repository and explicit retention
+bounds:
+
+```text
+vibedb-gateway serve ... \
+  -backup-repository /var/lib/vibedb/backups \
+  -backup-max-backups 16 \
+  -backup-max-artifacts 4096 \
+  -backup-max-artifact-bytes 68719476736 \
+  -backup-max-disk-bytes 274877906944
+```
+
+The gateway refuses this mode with plaintext serving, a static catalog, a
+relative or unclean repository path, a missing replica-control manifest, or a
+local identity without `backup` authority. The authenticated gateway endpoint
+accepts exactly these canonical `vibejson` requests:
+
+```json
+{"op":"backup","backup_id":"0101010101010101010101010101010101010101010101010101010101010101"}
+{"op":"backup_status","backup_id":"0101010101010101010101010101010101010101010101010101010101010101"}
+```
+
+The caller also needs `backup` authority. `backup_id` is the caller's stable
+idempotency identity: retry it unchanged after disconnect or gateway restart.
+The response returns the same fixed identity, the replicated numeric lifecycle
+stage, and a fixed 32-byte proof encoded as lowercase hexadecimal. Unknown
+fields, reordered fields, mixed SQL/query fields, noncanonical IDs, and
+oversized requests are rejected.
+
+Before publication, the gateway observes the current leader of every group in
+one immutable catalog inventory over authenticated shard control, streams each
+bounded artifact directly to operation-scoped repository drafts, fsyncs the
+complete artifact set, and publishes the certificate last. A restart resumes
+from the replicated operation plus repository certificate and does not rescan
+or recopy already certified shard artifacts.
+
 ## Why replica snapshots are not backups
 
 Learner bootstrap creates an authenticated snapshot artifact for one exact RF3
@@ -48,12 +88,12 @@ silently omit required cluster properties:
 - bounded retention and garbage collection that cannot delete an artifact
   before the backup manifest is durably complete.
 
-There is no global wall-clock snapshot contract. A future backup must publish a
+There is no global wall-clock snapshot contract. A live backup publishes a
 vector of exact per-group Raft cuts through catalog authority. This matches the
 database's clock-free consistency model: Raft order is authoritative inside a
 group, while a catalog-bound vector defines the cross-group recovery cut.
 
-## Only supported pre-release procedure
+## Offline recovery procedure
 
 For disaster-recovery experiments, use an offline copy:
 
@@ -76,10 +116,9 @@ This procedure provides no online recovery-point objective and no portable
 cross-build archive. A filesystem copy taken before all processes stop is not a
 backup, even if each individual file appears readable.
 
-## Required live-backup exit gate
+## Restore activation exit gate
 
-A live command is complete only when an external kill/partition test proves:
-
+A complete backup and restore path requires external kill/partition proof of:
 - a replicated backup intent and immutable group inventory;
 - bounded parallel group cuts pinned without stopping foreground traffic;
 - catalog publication only after every exact artifact is durable;
@@ -91,12 +130,11 @@ A live command is complete only when an external kill/partition test proves:
 - bounded foreground p99.9 impact, memory, network, WAL retention, and artifact
   space amplification.
 
-The catalog-RF3 operation record, complete live collector, durable repository,
-full artifact verifier, and non-serving staging-root builder are now composed
-internally. External process exit before certificate publication and stalled
-network-stream gates prove fail-closed recovery. What remains is an operator
-command/API that resolves current group leaders and invokes this controller,
-plus restore activation: generate fresh member/store/node identities, install
-every staged group, and publish one catalog-backed one-time activation witness
-before any restored process receives serving authority. No command claims
-that final activation today.
+The catalog-RF3 operation record, authenticated leader resolution, complete
+live collector, durable bounded repository, gateway request/status API, full
+artifact verifier, and non-serving staging-root builder are composed. External
+process exit before certificate publication and stalled network-stream gates
+prove fail-closed backup recovery. What remains is restore activation: generate
+fresh member/store/node identities, install every staged group, and publish one
+catalog-backed one-time activation witness before any restored process receives
+serving authority. No command claims that activation today.
