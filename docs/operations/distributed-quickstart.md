@@ -137,9 +137,20 @@ each registry's limit must fit within it. Relabeling an operation for another
 group does not create a second admission slot. Do not reuse one group's
 registry as a shared template for heterogeneous groups.
 
-These are `serve-rf3` manifests. The singleton `prepare-rf3` input below is
-unchanged. Exact group routing does not by itself provide multi-relation child
-provisioning. See [Online range-split status](distributed.md#online-range-split-status).
+These are `serve-rf3` manifests. `prepare-rf3` accepts optional
+`schema_statements` and `global_indexes` immediately after `create_table`.
+`schema_statements` contains explicit named local exact-index definitions and
+global-index image table definitions; it cannot contain data mutations.
+`global_indexes` binds those image tables to dense relation IDs starting at 2,
+index identities, locator shape, and canonical tuple placement. The complete
+schema is limited to 64 KiB and is retained in the child registry. Child
+preparation validates it against the exact authenticated relation identity
+before creating storage; it does not infer a schema from table names.
+
+The base-only example below omits those optional fields. Full-schema child
+preparation is implemented, but automatic gateway allocation of bundled
+children still needs the authenticated source-schema inventory. See
+[Online range-split status](distributed.md#online-range-split-status).
 
 A manually configured gateway-backed test needs catalog, request-ledger, and
 data groups. Role replicas can share one multi-group process or run as nine
