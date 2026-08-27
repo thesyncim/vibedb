@@ -974,7 +974,8 @@ func hotMutationGatewayProcess(binary, catalog, listen, control, capacity string
 	credential rf3testfixture.Credential, roots, policy, ack, journal string,
 	listeners [3][4]rf3testfixture.ProcessListeners, nodes [5]rafttransport.NodeID,
 ) *rf3testfixture.ExternalProcess {
-	args := []string{"serve", "-catalog", catalog, "-catalog-relation", "1",
+	args := []string{"serve", "-catalog", catalog,
+		"-catalog-route-seed", journal + ".catalog-route-seed", "-catalog-relation", "1",
 		"-catalog-session-journal", journal, "-durable-ack-key", ack,
 		"-catalog-client-id", strings.Repeat("1a", 16), "-catalog-retry-home", strings.Repeat("2b", 8),
 		"-catalog-attempts", "16", "-catalog-attempt-timeout", "2s", "-catalog-session-lease", "1h",
