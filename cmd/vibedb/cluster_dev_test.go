@@ -802,7 +802,8 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 		if err = prepared.Close(); err != nil {
 			t.Fatal(err)
 		}
-		profiles[index], err = readDevReplicatedTableProfile(
+		var readMachine [32]byte
+		profiles[index], readMachine, err = readDevReplicatedTableProfile(
 			devClusterMember{
 				Member: uint64(index + 1), Store: idStringForDev(store[:]),
 				ServeManifest: filepath.Join(root, "serve-rf3.vibejson"),
@@ -812,6 +813,9 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 		)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if readMachine != machine[index] {
+			t.Fatal("prepared command machine digest changed during profile read")
 		}
 	}
 	for index := 1; index < len(profiles); index++ {
@@ -826,8 +830,8 @@ func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *
 	}
 	if profiles[0].Table != devDataTable || profiles[0].PrimaryKey != devDataPrimaryKey ||
 		profiles[0].Relation != 1 || profiles[0].SchemaGeneration != 1 ||
-		profiles[0].RelationManifestDigest != replication.Digest(machine[0]) ||
-		profiles[0].RelationManifestDigest == replication.Digest(portable[0].RelationManifestDigest) {
+		profiles[0].LogicalSchemaDigest == replication.Digest(machine[0]) ||
+		profiles[0].LogicalSchemaDigest != replication.Digest(portable[0].RelationManifestDigest) {
 		t.Fatalf("portable data profile=%+v image=%+v", profiles[0], portable[0])
 	}
 }
@@ -873,7 +877,7 @@ func testDevCatalogSnapshot(
 	dataRoute := newRoute("data", 0x33, 0x61)
 	dataRoute.table = gateway.ReplicatedTableProfile{
 		Table: devDataTable, Relation: 1, PrimaryKey: devDataPrimaryKey,
-		SchemaGeneration: 1, RelationManifestDigest: replication.Digest(dataRoute.digest),
+		SchemaGeneration: 1, LogicalSchemaDigest: replication.Digest{0x73},
 		MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
 	}
 	snapshot, err := newDevCatalogSnapshot(
@@ -907,6 +911,8 @@ func TestDevCatalogPublishesOnlyThePortableDataTableProfile(t *testing.T) {
 	)
 	if !found || resolved.Profile != dataRoute.table || resolved.Route.Group != groups[2] ||
 		resolved.Route.Command.RelationManifestDigest != dataRoute.digest ||
+		resolved.Route.LogicalSchemaDigest != dataRoute.table.LogicalSchemaDigest ||
+		resolved.Route.LogicalSchemaDigest == replication.Digest(resolved.Route.Command.RelationManifestDigest) ||
 		len(resolved.Route.Replicas) != gateway.ServingReplicaCount {
 		t.Fatalf("resolved data route=%+v found=%v", resolved, found)
 	}

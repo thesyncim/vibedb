@@ -738,8 +738,7 @@ func validateExistingDevCatalog(
 		len(resolved.Route.Replicas) != gateway.ServingReplicaCount ||
 		resolved.Route.Group != dataGroup ||
 		resolved.Profile.SchemaGeneration != resolved.Route.Command.SchemaGeneration ||
-		resolved.Profile.RelationManifestDigest !=
-			replication.Digest(resolved.Route.Command.RelationManifestDigest) {
+		resolved.Profile.LogicalSchemaDigest != resolved.Route.LogicalSchemaDigest {
 		return errDevCluster
 	}
 	if !matchesExistingDevRoute(
@@ -791,6 +790,7 @@ func matchesExistingDevRoute(
 		route.Command.OwnershipEpoch != 1 ||
 		route.Command.SchemaGeneration != prepared.schemaGeneration ||
 		route.Command.RelationManifestDigest != prepared.digest ||
+		route.LogicalSchemaDigest != prepared.table.LogicalSchemaDigest ||
 		route.Command.RoutingVersion != 1 || route.Command.RouteGeneration != 1 {
 		return false
 	}
@@ -865,7 +865,7 @@ func inspectDevPreparedRoute(
 		if imageErr != nil {
 			return devPreparedRoute{}, errors.Join(errDevCluster, imageErr)
 		}
-		profile, profileErr := readDevReplicatedTableProfile(
+		profile, machineDigest, profileErr := readDevReplicatedTableProfile(
 			member, distributionName, shard, table, primaryKey, group,
 			requestLedgerIdentity, image,
 		)
@@ -873,13 +873,13 @@ func inspectDevPreparedRoute(
 			return devPreparedRoute{}, profileErr
 		}
 		if index == 0 {
-			result.digest = [32]byte(profile.RelationManifestDigest)
+			result.digest = machineDigest
 			result.applyDigest = image.ApplyProfileDigest
 			result.schemaGeneration = image.SchemaGeneration
 			if publishTable {
 				result.table = profile
 			}
-		} else if result.digest != [32]byte(profile.RelationManifestDigest) ||
+		} else if result.digest != machineDigest ||
 			result.applyDigest != image.ApplyProfileDigest ||
 			result.schemaGeneration != image.SchemaGeneration ||
 			publishTable && result.table != profile {
@@ -976,7 +976,7 @@ func newDevCatalogSnapshot(
 		[]gateway.ReplicatedShardDescriptor{
 			{Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard, Group: catalogGroup, AllocationGeneration: 1, Command: command(catalogRoute), RangeIdentity: catalogRange, LineageDigest: catalogLineage, ForwardingRuleDigest: catalogForwarding, Replicas: catalogRoute.replicas},
 			{Distribution: devLedgerDistribution, Shard: devLedgerShard, Group: ledgerGroup, AllocationGeneration: 1, Command: command(ledgerRoute), RangeIdentity: ledgerRange, LineageDigest: ledgerLineage, ForwardingRuleDigest: ledgerForwarding, RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: ledgerHomeIdentity}}, Replicas: ledgerRoute.replicas},
-			{Distribution: devDataDistribution, Shard: devDataShard, Group: dataGroup, AllocationGeneration: 1, Command: command(dataRoute), RangeIdentity: dataRange, LineageDigest: dataLineage, ForwardingRuleDigest: dataForwarding, Replicas: dataRoute.replicas},
+			{Distribution: devDataDistribution, Shard: devDataShard, Group: dataGroup, AllocationGeneration: 1, Command: command(dataRoute), LogicalSchemaDigest: dataRoute.table.LogicalSchemaDigest, RangeIdentity: dataRange, LineageDigest: dataLineage, ForwardingRuleDigest: dataForwarding, Replicas: dataRoute.replicas},
 		},
 		[]gateway.ReplicatedTableProfile{dataRoute.table},
 	)
@@ -990,27 +990,27 @@ func readDevReplicatedTableProfile(
 	group raftmember.GroupKey,
 	requestLedgerIdentity replication.Digest,
 	image sqldriver.ReplicatedSchemaCatalogImage,
-) (gateway.ReplicatedTableProfile, error) {
+) (gateway.ReplicatedTableProfile, [32]byte, error) {
 	root := filepath.Dir(member.ServeManifest)
 	identityRaw, err := readDevFile(filepath.Join(root, "sql-identity.vibejson"), 1<<20)
 	if err != nil {
-		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	var identity sqldriver.ReplicatedShardStoreIdentity
 	if err := identity.UnmarshalJSON(identityRaw); err != nil {
-		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	applyRaw, err := readDevFile(filepath.Join(root, "apply-identity.vibejson"), 1<<20)
 	if err != nil {
-		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	var apply sqldriver.ReplicatedApplyIdentity
 	if err := apply.UnmarshalJSON(applyRaw); err != nil {
-		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	storeID, err := decodeDev16(member.Store)
 	if err != nil {
-		return gateway.ReplicatedTableProfile{}, err
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, err
 	}
 	expectedBinding := sqldriver.ReplicatedShardStoreBinding{
 		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
@@ -1050,7 +1050,7 @@ func readDevReplicatedTableProfile(
 		apply.TxnLimits.MaxDocuments != 4096 || apply.TxnLimits.MaxBytes != 384<<20 ||
 		apply.Placement != expectedPlacement ||
 		!ledgerMatches {
-		return gateway.ReplicatedTableProfile{}, errDevCluster
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errDevCluster
 	}
 	relation := identity.Relations[0]
 	if relation.Relation != 1 || relation.Kind != sqldriver.ReplicatedShardRelationJSON ||
@@ -1059,25 +1059,29 @@ func readDevReplicatedTableProfile(
 		identity.UserLimits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
 		identity.UserLimits.MaxDocumentBytes <= 0 ||
 		identity.UserLimits.MaxDocumentBytes > replication.MaxMutationValueBytes {
-		return gateway.ReplicatedTableProfile{}, errDevCluster
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errDevCluster
 	}
 	database, err := sqldriver.OpenReplicatedShardStoreWithApply(
 		filepath.Join(root, "member.vdb"), identity, apply,
 	)
 	if err != nil {
-		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	manifestDigest, manifestErr := database.ReplicatedRelationManifestForBinding(identity, apply.Placement, identity.Binding)
 	if err := errors.Join(manifestErr, database.Close()); err != nil {
-		return gateway.ReplicatedTableProfile{}, errors.Join(errDevCluster, err)
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
+	}
+	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(identity)
+	if err != nil || logicalDigest != image.RelationManifestDigest {
+		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
 	}
 	return gateway.ReplicatedTableProfile{
 		Table: table, Relation: replication.RelationID(relation.Relation),
 		PrimaryKey: primaryKey, SchemaGeneration: image.SchemaGeneration,
-		RelationManifestDigest: replication.Digest(manifestDigest),
-		MaxKeyBytes:            uint16(identity.UserLimits.MaxKeyBytes),
-		MaxDocumentBytes:       uint32(identity.UserLimits.MaxDocumentBytes),
-	}, nil
+		LogicalSchemaDigest: replication.Digest(logicalDigest),
+		MaxKeyBytes:         uint16(identity.UserLimits.MaxKeyBytes),
+		MaxDocumentBytes:    uint32(identity.UserLimits.MaxDocumentBytes),
+	}, manifestDigest, nil
 }
 
 // deriveDevLogicalRangeAuthority certifies the three independent logical
