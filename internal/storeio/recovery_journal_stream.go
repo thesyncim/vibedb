@@ -53,11 +53,18 @@ func (s *recoveryRecordStream) record(cursor uint64, sector uint32, sequence uin
 	if len(prefix) >= RecoveryJournalRecordPrefixSize {
 		// The decoder authenticates BOTH current layouts before classifying an
 		// unknown/corrupt kind or magic as a truncatable tail. Read enough for
-		// either CRC; selecting a size from the untrusted kind would lose that
+		// either possible CRC; selecting from the untrusted kind would lose that
 		// fail-closed distinction. Batch count occupies standalone keyLen's word.
-		needed = min(remaining, uint64(len(s.prefix))+
-			uint64(binary.LittleEndian.Uint32(prefix[24:28]))+
-			uint64(binary.LittleEndian.Uint32(prefix[28:32])))
+		// An endpoint beyond the physical region cannot authenticate: clamping
+		// it to remaining would read and allocate the whole unused journal on
+		// arbitrary stale/torn length words, without gaining checksum evidence.
+		batchEnd := uint64(len(s.prefix)) + uint64(binary.LittleEndian.Uint32(prefix[28:32]))
+		standaloneEnd := batchEnd + uint64(binary.LittleEndian.Uint32(prefix[24:28]))
+		for _, end := range [...]uint64{batchEnd, standaloneEnd} {
+			if end <= remaining && end > needed {
+				needed = end
+			}
+		}
 	}
 	if uint64(len(prefix)) >= needed {
 		return DecodeRecoveryRecord(prefix, sector, sequence)
