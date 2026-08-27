@@ -19,11 +19,13 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: vibedb-operator render|prepare|validate")
+		fmt.Fprintln(os.Stderr, "usage: vibedb-operator bootstrap|render|prepare|validate")
 		os.Exit(2)
 	}
 	var err error
 	switch os.Args[1] {
+	case "bootstrap":
+		err = bootstrap(os.Args[2:])
 	case "render":
 		err = render(os.Args[2:])
 	case "prepare":
@@ -37,6 +39,33 @@ func main() {
 		fmt.Fprintf(os.Stderr, "vibedb-operator: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+func bootstrap(arguments []string) error {
+	flags := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
+	namespace := flags.String("namespace", "vibedb", "Kubernetes namespace")
+	stateDirectory := flags.String("state-dir", "", "absolute private directory retaining the generated authority")
+	manifestConfig := flags.String("shard-manifests", "vibedb-rf3-manifests", "shard bootstrap ConfigMap")
+	tlsSecret := flags.String("shard-tls", "vibedb-rf3-tls", "shard TLS and WAL Secret")
+	gatewayConfig := flags.String("gateway-config", "vibedb-gateway-config", "gateway ConfigMap")
+	gatewayTLS := flags.String("gateway-tls", "vibedb-gateway-tls", "gateway TLS Secret")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *stateDirectory == "" {
+		return errors.New("bootstrap requires -state-dir and accepts no positional arguments")
+	}
+	result, err := kubeoperator.Bootstrap(os.Stdout, kubeoperator.BootstrapConfig{
+		Namespace: *namespace, StateDirectory: *stateDirectory,
+		ManifestConfigMap: *manifestConfig, TLSSecret: *tlsSecret,
+		GatewayConfigMap: *gatewayConfig, GatewayTLSSecret: *gatewayTLS,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "shard-node-ids=%s\ngateway-node=%s\nclient-node=%s\n",
+		strings.Join(result.ShardNodeIDs[:], ","), result.GatewayNodeID, result.ClientNodeID)
+	return nil
 }
 
 func validate(arguments []string) error {
