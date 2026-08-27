@@ -44,6 +44,28 @@ type RF3RetainedPruneGlobalIndex struct {
 	IndexTarget distribution.Target
 }
 
+// NewRF3RetainedPruneProposerForPlan binds the destructive proposal to the
+// immutable split geometry. Plans with global indexes fail closed until every
+// index relation has a schema-authenticated extraction program; deleting only
+// base rows would strand globally indexed entries.
+func NewRF3RetainedPruneProposerForPlan(
+	plan *Plan,
+	observed Observation,
+	session *gateway.NativeSession,
+	maxKeys int,
+	maxKeyBytes int,
+) (*RF3RetainedPruneProposer, error) {
+	if plan == nil || observed.Certificate == nil || len(plan.indexRelations) != 0 ||
+		plan.retained >= plan.childCount {
+		return nil, ErrInvalidPlan
+	}
+	return NewRF3RetainedPruneProposer(RF3RetainedPruneProposerOptions{
+		Operation: plan.operation, Session: session, Relation: 1,
+		MaxKeys: maxKeys, MaxKeyBytes: maxKeyBytes,
+		Certificate: *observed.Certificate, RetainedRange: plan.children[plan.retained].Range,
+	})
+}
+
 // RF3RetainedPruneProposer turns one already-authorized retained-range batch
 // into one normal RF3 mutation. Its NativeSession owns exact-byte durable
 // settlement across response loss and restart; this wrapper adds operation,
