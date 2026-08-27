@@ -19,7 +19,7 @@ const (
 	replicatedSchemaStageMarkerTemp    = ".schema-membership-stage.tmp"
 	replicatedSchemaTargetCatalogName  = ".schema-target-catalog"
 	replicatedSchemaTargetCatalogTemp  = ".schema-target-catalog.tmp"
-	replicatedSchemaStageHeaderBytes   = 272
+	replicatedSchemaStageHeaderBytes   = 304
 	replicatedSchemaStageChecksumBytes = sha256.Size
 )
 
@@ -32,6 +32,7 @@ type replicatedSchemaStageMarker struct {
 	membership       durable.CheckpointMembershipWitness
 	catalogDigest    [sha256.Size]byte
 	relationWitness  [sha256.Size]byte
+	placementDigest  [sha256.Size]byte
 	applyContract    [sha256.Size]byte
 	authorization    [sha256.Size]byte
 	targetWitness    [sha256.Size]byte
@@ -67,6 +68,7 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 	copy(raw[200:232], marker.membership.Target[:])
 	copy(raw[232:264], marker.targetWitness[:])
 	binary.LittleEndian.PutUint16(raw[264:266], uint16(len(marker.sourceStorages)))
+	copy(raw[272:304], marker.placementDigest[:])
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		if marker.storages[i] == ([32]byte{}) {
@@ -129,6 +131,7 @@ func decodeReplicatedSchemaStageMarker(raw []byte) (replicatedSchemaStageMarker,
 	copy(marker.membership.Source[:], raw[168:200])
 	copy(marker.membership.Target[:], raw[200:232])
 	copy(marker.targetWitness[:], raw[232:264])
+	copy(marker.placementDigest[:], raw[272:304])
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		copy(marker.storages[i][:], raw[at:at+32])
@@ -189,11 +192,11 @@ func addReplicatedSchemaStageProtection(
 	}
 	for i := range marker.storages {
 		name := hex.EncodeToString(marker.storages[i][:]) + ".vjc"
-		protected[filepath.Join(dataDir, name)] = "prepared schema target"
+		protected[filepath.Join(dataDir, replicatedSchemaTargetsDirectory, name)] = "prepared schema target"
 	}
 	for i := range marker.sourceStorages {
 		name := hex.EncodeToString(marker.sourceStorages[i][:]) + ".vjc"
-		protected[filepath.Join(dataDir, name)] = "draining schema source"
+		protected[filepath.Join(dataDir, replicatedSchemaSourcesDirectory, name)] = "draining schema source"
 	}
 	return nil
 }

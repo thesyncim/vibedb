@@ -310,11 +310,20 @@ func drainPublishedReplicatedSchemaSource(
 	if err != nil || !found || len(marker.sourceStorages) == 0 {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
+	if marker.sourceApplied == ^uint64(0) {
+		return false, ErrReplicatedSchemaCatalogImage
+	}
+	if err := durable.ValidateSelectedCheckpointMembershipTransition(
+		absolute+".tables", marker.membership, marker.authorization,
+		marker.sourceApplied+1, sha256.Sum256(record.command),
+	); err != nil {
+		return false, err
+	}
 	targets := make(map[[32]byte]struct{}, len(marker.storages))
 	for _, storage := range marker.storages {
 		targets[storage] = struct{}{}
 	}
-	root, err := os.OpenRoot(absolute + ".tables")
+	root, err := os.OpenRoot(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory))
 	if err != nil {
 		return false, err
 	}
@@ -343,7 +352,7 @@ func drainPublishedReplicatedSchemaSource(
 		}
 	}
 	if removed {
-		if err = syncDirectory(absolute + ".tables"); err != nil {
+		if err = syncDirectory(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory)); err != nil {
 			return false, errors.Join(durable.ErrCommitOutcomeUnknown, err)
 		}
 	}
@@ -369,6 +378,7 @@ func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err 
 	}
 	marker, markerFound, err := readReplicatedSchemaStageMarker(a.database.dataDir)
 	if err != nil || !markerFound || marker.catalogDigest != record.targetDigest ||
+		marker.placementDigest != transition.ToPlacementDigest ||
 		marker.sourceApplied == ^uint64(0) {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
@@ -402,6 +412,14 @@ func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err 
 	applied, committed, err := a.machine.ObserveSchemaTransition(record.command)
 	if err != nil || !committed || applied != marker.sourceApplied+1 {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if d.checkpointGroup == nil {
+		return false, ErrReplicatedSchemaCatalogImage
+	}
+	if err := d.checkpointGroup.FinalizeMembershipTransition(
+		marker.membership, marker.authorization, applied, sha256.Sum256(record.command),
+	); err != nil {
+		return false, err
 	}
 	bound, err := catalogSizeUpperBound(d.catalog)
 	if err != nil {
@@ -503,8 +521,24 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 		marker.membership.Source != transition.MembershipSource ||
 		marker.membership.Target != transition.MembershipTarget ||
 		marker.authorization != transition.RequestDigest ||
-		marker.applyContract != transition.ToApplyContract {
+		marker.applyContract != transition.ToApplyContract || marker.placementDigest != transition.ToPlacementDigest {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	selected, _, err := openReplicatedSchemaCatalogImage(raw)
+	if err != nil || selected.ReplicatedShardStore == nil || selected.ReplicatedApply == nil ||
+		!selected.ReplicatedShardStore.Equal(expected) || selected.ReplicatedApply.identity() != expectedApply {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if marker.sourceApplied == ^uint64(0) {
+		return nil, ErrReplicatedSchemaCatalogImage
+	}
+	if err := durable.ValidateFinalizedCheckpointMembershipTransition(
+		dataDir, marker.membership, marker.authorization, marker.sourceApplied+1, sha256.Sum256(record.command),
+	); err != nil {
+		return nil, err
+	}
+	if err := activateReplicatedSchemaNamespace(dataDir, marker, expected); err != nil {
+		return nil, err
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                      shardStoreOpenReplicatedSchemaTransition,
@@ -540,6 +574,7 @@ func (a *ReplicatedApply) PersistReplicatedSchemaTransition(command []byte) erro
 		marker.membership.Source != transition.MembershipSource ||
 		marker.membership.Target != transition.MembershipTarget ||
 		marker.catalogDigest == ([32]byte{}) || marker.applyContract != transition.ToApplyContract ||
+		marker.placementDigest != transition.ToPlacementDigest ||
 		marker.authorization != transition.RequestDigest {
 		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}

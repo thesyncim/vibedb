@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -29,7 +30,7 @@ type ReplicatedSchemaTargetProof struct {
 }
 
 // CertifyReplicatedSchemaTarget opens only non-serving target storage names
-// from the current shard's pinned data namespace and computes their bounded
+// from ReplicatedSchemaTargetDirectory and computes their bounded
 // content/cardinality/placement certificate. It does not publish the catalog,
 // change checkpoint membership, or alter serving handles.
 //
@@ -105,6 +106,7 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 			sourceApplied:    expectedApplied, membership: witness,
 			catalogDigest:   proof.Catalog.Digest,
 			relationWitness: proof.Relations.Witness,
+			placementDigest: proof.Relations.PlacementDigest,
 			applyContract:   proof.ApplyContract,
 			authorization:   authorization, targetWitness: proof.Witness,
 			storages: storages, sourceStorages: sourceStorages,
@@ -131,6 +133,7 @@ func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTarget(
 	if err != nil || !found || marker.authorization != requestDigest ||
 		marker.catalogDigest != proof.Catalog.Digest ||
 		marker.relationWitness != proof.Relations.Witness ||
+		marker.placementDigest != proof.Relations.PlacementDigest ||
 		marker.applyContract != proof.ApplyContract {
 		return proof, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
@@ -213,8 +216,12 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	}
 	currentStorages[a.database.catalog.ReplicatedApply.Storage] = struct{}{}
 	currentStorages[a.database.catalog.ReplicatedApply.CaptureStorage] = struct{}{}
-	dataDir := a.database.dataDir
+	dataDir := filepath.Join(a.database.dataDir, replicatedSchemaTargetsDirectory)
 	a.database.mu.RUnlock()
+	directory, err := os.Lstat(dataDir)
+	if err != nil || !directory.IsDir() || directory.Mode()&os.ModeSymlink != 0 {
+		return proof, errors.Join(ErrReplicatedSchemaCatalogImage, err)
+	}
 
 	staged := &database{catalog: targetCatalog, tables: make(map[string]*table, len(targetIdentity.Relations))}
 	opened := make([]*table, 0, len(targetIdentity.Relations))
