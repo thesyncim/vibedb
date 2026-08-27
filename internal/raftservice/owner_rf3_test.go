@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
-	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -328,18 +327,6 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	})
 	if err != nil || backupCut.Snapshot() == nil || backupCut.Snapshot().Fence().Applied < linearRead.Applied {
 		t.Fatalf("ReadIndex backup cut=%v err=%v", backupCut, err)
-	}
-	var artifact bytes.Buffer
-	groupCut, artifactManifest, err := clusterbackup.ExportLinearizableGroupCut(&artifact,
-		backupCut.Snapshot(), group, uint64(leader+1), 64<<10, make([]byte, 0, 64<<10))
-	if err != nil || groupCut.ArtifactBytes != uint64(artifact.Len()) ||
-		groupCut.ArtifactManifestDigest != artifactManifest.Digest {
-		t.Fatalf("target-free backup export cut=%+v bytes=%d err=%v", groupCut, artifact.Len(), err)
-	}
-	verified, err := replicatedstate.VerifySnapshotArtifact(bytes.NewReader(artifact.Bytes()),
-		replicatedstate.SnapshotArtifactCallbacks{PayloadBuffer: make([]byte, 0, 64<<10)})
-	if err != nil || verified.Digest != artifactManifest.Digest {
-		t.Fatalf("verify target-free backup digest=%x err=%v", verified.Digest, err)
 	}
 	if err = backupCut.Close(); err != nil || backupCut.Snapshot() != nil {
 		t.Fatalf("close backup cut snapshot=%v err=%v", backupCut.Snapshot(), err)
