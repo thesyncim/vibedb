@@ -18,6 +18,9 @@ func (failingBootstrapReader) Read([]byte) (int, error) { return 0, errors.New("
 
 func TestBootstrapCreatesCanonicalResumableRF3Authority(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	config := BootstrapConfig{
 		Namespace: "vibedb-test", StateDirectory: root,
 		ManifestConfigMap: "vibedb-rf3-manifests", TLSSecret: "vibedb-rf3-tls",
@@ -88,6 +91,9 @@ func TestBootstrapPropagatesEntropyFailure(t *testing.T) {
 
 func TestBootstrapRecoversEveryPublicationCut(t *testing.T) {
 	source := t.TempDir()
+	if err := os.Chmod(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	config := BootstrapConfig{Namespace: "vibedb-test", StateDirectory: source,
 		ManifestConfigMap: "vibedb-rf3-manifests", TLSSecret: "vibedb-rf3-tls",
 		GatewayConfigMap: "vibedb-gateway-config", GatewayTLSSecret: "vibedb-gateway-tls"}
@@ -109,6 +115,9 @@ func TestBootstrapRecoversEveryPublicationCut(t *testing.T) {
 	} {
 		t.Run(cut.name, func(t *testing.T) {
 			root := t.TempDir()
+			if err := os.Chmod(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			candidate := config
 			candidate.StateDirectory = root
 			if err := os.WriteFile(filepath.Join(root, bootstrapStatePending), state, 0o600); err != nil {
@@ -125,6 +134,9 @@ func TestBootstrapRecoversEveryPublicationCut(t *testing.T) {
 	}
 	t.Run("state pending only", func(t *testing.T) {
 		root := t.TempDir()
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
 		candidate := config
 		candidate.StateDirectory = root
 		if err := os.WriteFile(filepath.Join(root, bootstrapStatePending), state, 0o600); err != nil {
@@ -143,6 +155,9 @@ func TestBootstrapRecoversEveryPublicationCut(t *testing.T) {
 
 func TestBootstrapRejectsNonEmptyAndDriftedState(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "foreign"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
