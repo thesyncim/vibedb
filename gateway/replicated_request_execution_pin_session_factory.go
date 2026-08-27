@@ -199,6 +199,42 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireTerminal
 	return session.journal.destroyReleased()
 }
 
+// RetireAcknowledgedExecutionPinSession durably removes a stale local session
+// after replicated ACK state proves the corresponding global pin release. It
+// is intentionally path-only: ACK collection may already have reclaimed the
+// recipe bytes needed to reopen the native session.
+func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireAcknowledgedExecutionPinSession(
+	ctx context.Context,
+	pin executionpin.PinID,
+	route ReplicatedRoute,
+	releaseCertificate replication.Digest,
+) error {
+	if factory == nil || ctx == nil || ctx.Err() != nil || pin == (executionpin.PinID{}) ||
+		releaseCertificate == (replication.Digest{}) || !validReplicatedRoute(route) ||
+		!factory.principal.Valid() {
+		return ErrDurableRequest
+	}
+	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
+	stripe := &factory.stripes[durableExecutionPinSessionStripe(identity)]
+	stripe.Lock()
+	defer stripe.Unlock()
+	base := filepath.Join(factory.directory, hex.EncodeToString(identity[:]))
+	var joined error
+	for slot := 0; slot < 2; slot++ {
+		if err := os.Remove(base + "." + string(rune('0'+slot))); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			joined = errors.Join(joined, err)
+		}
+	}
+	directory, err := os.Open(factory.directory)
+	if err == nil {
+		joined = errors.Join(joined, directory.Sync(), directory.Close())
+	} else {
+		joined = errors.Join(joined, err)
+	}
+	return joined
+}
+
 func durableExecutionPinSessionStripe(identity replication.ID128) uint16 {
 	return binary.LittleEndian.Uint16(identity[:2]) & (durableExecutionPinSessionStripes - 1)
 }

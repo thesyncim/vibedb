@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -26,6 +27,12 @@ type DurableRequestExecutionPinSessionFactory interface {
 		DurableRequestTypedExecutionContext,
 		ReplicatedRoute,
 	) error
+	RetireAcknowledgedExecutionPinSession(
+		context.Context,
+		executionpin.PinID,
+		ReplicatedRoute,
+		replication.Digest,
+	) error
 }
 
 // RetireTerminal is idempotent and only removes session files after the
@@ -40,6 +47,31 @@ func (authority *NativeDurableRequestExecutionPinAuthority) RetireTerminal(
 	}
 	return authority.sessions.RetireTerminalExecutionPinSession(
 		ctx, execution, execution.Home.borrowedRoute(),
+	)
+}
+
+// RetireAcknowledged is the cross-gateway cleanup path. The replicated ACK
+// permanently binds the pin and release certificate even after plan and
+// terminal rows have been reclaimed, so another gateway can safely delete its
+// stale local exact-retry journal without reconstructing collected recipe
+// bytes.
+func (authority *NativeDurableRequestExecutionPinAuthority) RetireAcknowledged(
+	ctx context.Context,
+	home DurableRequestLedgerHome,
+	ack requestledger.AckRecord,
+) error {
+	if authority == nil || authority.sessions == nil || ctx == nil ||
+		!validReplicatedRoute(home.borrowedRoute()) || ack.PinID == (requestledger.PinID{}) ||
+		ack.PinDigest == (requestledger.Digest{}) ||
+		ack.ReleaseCertificateDigest == (requestledger.Digest{}) {
+		return ErrDurableRequest
+	}
+	pin, err := executionpin.DerivePinIDFromBindingDigest(executionpin.Digest(ack.PinDigest))
+	if err != nil {
+		return errors.Join(err, ErrDurableRequestConflict)
+	}
+	return authority.sessions.RetireAcknowledgedExecutionPinSession(
+		ctx, pin, home.borrowedRoute(), replication.Digest(ack.ReleaseCertificateDigest),
 	)
 }
 

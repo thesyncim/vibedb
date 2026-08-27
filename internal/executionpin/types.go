@@ -54,12 +54,23 @@ func (binding Binding) Valid() bool {
 // lease fields are excluded so a recovery controller can rederive the same
 // identity from the durable logical pin intent.
 func DerivePinID(binding Binding) (PinID, error) {
-	if !binding.Valid() {
+	digest, err := BindingDigest(binding)
+	if err != nil {
+		return PinID{}, err
+	}
+	return DerivePinIDFromBindingDigest(digest)
+}
+
+// DerivePinIDFromBindingDigest reconstructs the exact full pin identity from
+// the authenticated digest retained by request-ledger terminal and ACK rows.
+// This keeps post-GC cleanup bounded without storing a second 32-byte identity.
+func DerivePinIDFromBindingDigest(digest Digest) (PinID, error) {
+	if digest == (Digest{}) {
 		return PinID{}, ErrCorrupt
 	}
-	var material [len("vibedb/logical-execution-pin/identity\x00") + bindingBytes]byte
+	var material [len("vibedb/logical-execution-pin/identity\x00") + len(Digest{})]byte
 	cursor := copy(material[:], pinIdentityDomain)
-	appendBinding(material[cursor:cursor], binding)
+	copy(material[cursor:], digest[:])
 	return PinID(sha256.Sum256(material[:])), nil
 }
 

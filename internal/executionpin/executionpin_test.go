@@ -91,6 +91,17 @@ func TestPinIDBindsEveryLogicalFieldButNotControllerLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bindingDigest, err := BindingDigest(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconstructed, reconstructErr := DerivePinIDFromBindingDigest(bindingDigest); reconstructErr != nil || reconstructed != want {
+		t.Fatalf("persisted binding digest reconstruction = %x,%v want %x",
+			reconstructed, reconstructErr, want)
+	}
+	if _, err = DerivePinIDFromBindingDigest(Digest{}); err == nil {
+		t.Fatal("zero binding digest reconstructed a pin identity")
+	}
 	mutations := []func(*Binding){
 		func(value *Binding) { value.RequestKeyDigest[0]++ },
 		func(value *Binding) { value.RequestDigest[0]++ },

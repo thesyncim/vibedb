@@ -26,6 +26,17 @@ type DurableRequestExecutionPinRetirer interface {
 	RetireTerminal(context.Context, DurableRequestTypedExecutionContext) error
 }
 
+// DurableRequestExecutionPinAckRetirer removes one gateway's local exact-retry
+// session after replicated ACK state proves that the global pin was released.
+// It exists for cross-gateway recovery after terminal plan rows were collected.
+type DurableRequestExecutionPinAckRetirer interface {
+	RetireAcknowledged(
+		context.Context,
+		DurableRequestLedgerHome,
+		requestledger.AckRecord,
+	) error
+}
+
 // DurableRequestService is the shipped typed request boundary. It admits the
 // immutable recipe through RF3 lifecycle CAS, reopens it from authenticated
 // pages, binds the logical execution-pin lease, and runs the distributed
@@ -230,12 +241,23 @@ func (service *DurableRequestService) Acknowledge(
 		return DurableRequestAckResult{}, err
 	}
 	if ack.Revision != 0 {
-		if ack.TerminalRevision != terminalRevision ||
-			ack.ResultDigest != requestledger.Digest(resultDigest) ||
-			ack.AckTokenDigest != requestledger.AckTokenDigest(requestledger.AckToken(token)) {
+		plan := DurableRequestAckPlan{
+			Home: home, Key: key.RequestKey, TerminalRevision: terminalRevision,
+			ResultDigest: requestledger.Digest(resultDigest), AckToken: requestledger.AckToken(token),
+		}
+		if !ackMatchesPlan(ack, plan) || ack.RequestDigest != requestledger.Digest(key.Digest) {
 			return DurableRequestAckResult{}, ErrDurableRequestConflict
 		}
-		return DurableRequestAckResult{Ack: ack, Applied: applied}, nil
+		result, collectErr := service.acks.AcknowledgeAndCollect(ctx, plan)
+		if collectErr != nil {
+			return result, collectErr
+		}
+		if retirer, ok := service.pins.(DurableRequestExecutionPinAckRetirer); ok {
+			if retireErr := retirer.RetireAcknowledged(ctx, home, result.Ack); retireErr != nil {
+				return result, errors.Join(retireErr, ErrDurableRequestUnresolved)
+			}
+		}
+		return result, nil
 	}
 	if head.Phase != requestledger.PhaseTerminal || head.RequestDigest != requestledger.Digest(key.Digest) {
 		return DurableRequestAckResult{}, ErrDurableRequestUnresolved
