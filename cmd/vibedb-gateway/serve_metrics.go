@@ -200,6 +200,8 @@ func writeGatewayStageMetrics(writer *vibejson.Writer, stages servicemetrics.Sta
 		{"snapshot_transfer_chunks", stages.SnapshotTransferChunks}, {"snapshot_transfer_bytes", stages.SnapshotTransferBytes},
 		{"snapshot_resident_bytes", stages.SnapshotResidentBytes}, {"replica_action_requests", stages.ReplicaActionRequests},
 		{"replica_action_completions", stages.ReplicaActionCompletions}, {"replica_action_faults", stages.ReplicaActionFaults},
+		{"split_control_requests", stages.SplitControlRequests}, {"split_control_completions", stages.SplitControlCompletions},
+		{"split_control_faults", stages.SplitControlFaults},
 	} {
 		if err := writer.Key(field.name); err != nil {
 			return err

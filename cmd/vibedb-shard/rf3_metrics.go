@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
 
 type rf3MetricsProvider struct {
@@ -17,6 +18,7 @@ type rf3MetricsProvider struct {
 	backup *clusterbackupservice.Service
 	action *replicaaction.Service
 	data   []snapshottransfer.GroupDataService
+	split  *splitcontroller.ControlService
 }
 
 func (provider *rf3MetricsProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
@@ -56,6 +58,9 @@ func (provider *rf3MetricsProvider) StageMetrics() servicemetrics.StageMetricsSn
 	action := provider.action.Metrics()
 	result.ReplicaActionRequests, result.ReplicaActionCompletions, result.ReplicaActionFaults =
 		action.Requests, action.Completions, action.Faults
+	split := provider.split.Metrics()
+	result.SplitControlRequests, result.SplitControlCompletions, result.SplitControlFaults =
+		split.Requests, split.Completions, split.Faults
 	return result
 }
 

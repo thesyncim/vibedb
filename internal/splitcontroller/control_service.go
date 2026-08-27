@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardcontrol"
@@ -12,8 +13,18 @@ import (
 // shard-control listener. Catalog reconciliation is deliberately absent: the
 // gateway that owns the replicated catalog runs ControllerService directly.
 type ControlService struct {
-	server  *shardcontrol.Server
-	journal *shardcontrol.JournalExecutor
+	server                        *shardcontrol.Server
+	journal                       *shardcontrol.JournalExecutor
+	requests, completions, faults atomic.Uint64
+}
+
+type ControlMetrics struct{ Requests, Completions, Faults uint64 }
+
+func (service *ControlService) Metrics() ControlMetrics {
+	if service == nil {
+		return ControlMetrics{}
+	}
+	return ControlMetrics{Requests: service.requests.Load(), Completions: service.completions.Load(), Faults: service.faults.Load()}
 }
 
 type controlActionDispatcher struct {
@@ -80,13 +91,21 @@ func (dispatcher *controlActionDispatcher) ExecuteAction(
 func (service *ControlService) Serve(
 	ctx context.Context,
 	connection rafttransport.PeerConnection,
-) error {
+) (resultErr error) {
 	if service == nil || service.server == nil {
 		if connection != nil {
 			_ = connection.Close()
 		}
 		return ErrRemoteExecution
 	}
+	service.requests.Add(1)
+	defer func() {
+		if resultErr != nil {
+			service.faults.Add(1)
+		} else {
+			service.completions.Add(1)
+		}
+	}()
 	return service.server.Serve(ctx, connection)
 }
 

@@ -16,7 +16,7 @@ import (
 
 const (
 	RequestBytes  = 80
-	ResponseBytes = 312
+	ResponseBytes = 336
 )
 
 var (
@@ -51,6 +51,7 @@ type StageMetricsSnapshot struct {
 	BackupRequests, BackupFaults, BackupLogicalBytes, BackupScanBytes           uint64
 	SnapshotTransferChunks, SnapshotTransferBytes, SnapshotResidentBytes        uint64
 	ReplicaActionRequests, ReplicaActionCompletions, ReplicaActionFaults        uint64
+	SplitControlRequests, SplitControlCompletions, SplitControlFaults           uint64
 }
 
 type StageProvider interface{ StageMetrics() StageMetricsSnapshot }
@@ -135,18 +136,19 @@ func appendResponse(snapshot Snapshot) (response [ResponseBytes]byte) {
 		stages.CheckpointBarrierSyncs, stages.WALLiveBytes, stages.WALEntries, stages.WALSyncs,
 		stages.BackupRequests, stages.BackupFaults, stages.BackupLogicalBytes, stages.BackupScanBytes,
 		stages.SnapshotTransferChunks, stages.SnapshotTransferBytes, stages.SnapshotResidentBytes,
-		stages.ReplicaActionRequests, stages.ReplicaActionCompletions, stages.ReplicaActionFaults}
+		stages.ReplicaActionRequests, stages.ReplicaActionCompletions, stages.ReplicaActionFaults,
+		stages.SplitControlRequests, stages.SplitControlCompletions, stages.SplitControlFaults}
 	for index, value := range stageValues {
 		binary.BigEndian.PutUint64(response[144+index*8:152+index*8], value)
 	}
-	digest := sha256.Sum256(response[:280])
-	copy(response[280:], digest[:])
+	digest := sha256.Sum256(response[:304])
+	copy(response[304:], digest[:])
 	return response
 }
 
 func OpenResponse(response []byte) (Snapshot, error) {
 	if len(response) != ResponseBytes || responseMagic != [8]byte(response[:8]) ||
-		sha256.Sum256(response[:280]) != [sha256.Size]byte(response[280:]) {
+		sha256.Sum256(response[:304]) != [sha256.Size]byte(response[304:]) {
 		return Snapshot{}, ErrMetrics
 	}
 	group := openGroup(response[8:80])
@@ -158,7 +160,7 @@ func OpenResponse(response []byte) (Snapshot, error) {
 	for index := range values {
 		values[index] = binary.BigEndian.Uint64(response[88+index*8 : 96+index*8])
 	}
-	stageValues := [17]uint64{}
+	stageValues := [20]uint64{}
 	for index := range stageValues {
 		stageValues[index] = binary.BigEndian.Uint64(response[144+index*8 : 152+index*8])
 	}
@@ -170,6 +172,7 @@ func OpenResponse(response []byte) (Snapshot, error) {
 		BackupRequests: stageValues[7], BackupFaults: stageValues[8], BackupLogicalBytes: stageValues[9], BackupScanBytes: stageValues[10],
 		SnapshotTransferChunks: stageValues[11], SnapshotTransferBytes: stageValues[12], SnapshotResidentBytes: stageValues[13],
 		ReplicaActionRequests: stageValues[14], ReplicaActionCompletions: stageValues[15], ReplicaActionFaults: stageValues[16],
+		SplitControlRequests: stageValues[17], SplitControlCompletions: stageValues[18], SplitControlFaults: stageValues[19],
 	}}, nil
 }
 

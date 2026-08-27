@@ -144,7 +144,8 @@ func TestMetricsNodeStageSnapshotIsAuthenticatedAndCanonical(t *testing.T) {
 		CheckpointBarrierSyncs: 4, WALLiveBytes: 5, WALEntries: 6, WALSyncs: 7,
 		BackupRequests: 8, BackupFaults: 9, BackupLogicalBytes: 10, BackupScanBytes: 11,
 		SnapshotTransferChunks: 12, SnapshotTransferBytes: 13, SnapshotResidentBytes: 14,
-		ReplicaActionRequests: 15, ReplicaActionCompletions: 16, ReplicaActionFaults: 17}
+		ReplicaActionRequests: 15, ReplicaActionCompletions: 16, ReplicaActionFaults: 17,
+		SplitControlRequests: 18, SplitControlCompletions: 19, SplitControlFaults: 20}
 	encoded := appendResponse(Snapshot{Stages: stages})
 	opened, err := OpenResponse(encoded[:])
 	if err != nil || opened.Stages != stages || opened.Group != (raftmember.GroupKey{}) || opened.Member != 0 {
