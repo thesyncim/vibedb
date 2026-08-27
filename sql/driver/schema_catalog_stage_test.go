@@ -150,6 +150,13 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	recovered, err := reopenedClaim.RecoverPreparedReplicatedSchemaTarget(
+		targetRaw, [32]byte{0xa5},
+	)
+	if err != nil || recovered != prepared {
+		t.Fatalf("recovered target proof = %+v, want %+v, err=%v",
+			recovered, prepared, err)
+	}
 	if _, err = reopenedClaim.ApplyNormal(
 		testReplicatedApplyMeta(prepared.SourceApplied+1), command,
 	); err != nil {

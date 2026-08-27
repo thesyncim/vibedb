@@ -103,6 +103,34 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 	})
 }
 
+// RecoverPreparedReplicatedSchemaTarget reconstructs the bounded target proof
+// from the exact canonical catalog plus the durable membership marker. The
+// relation images are recertified off the serving path; no row material is
+// retained after return.
+func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTarget(
+	raw []byte,
+	requestDigest [sha256.Size]byte,
+) (ReplicatedSchemaTargetProof, error) {
+	if a == nil || a.database == nil || requestDigest == ([32]byte{}) {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	proof, err := a.CertifyReplicatedSchemaTarget(raw)
+	if err != nil {
+		return proof, err
+	}
+	marker, found, err := readReplicatedSchemaStageMarker(a.database.dataDir)
+	if err != nil || !found || marker.authorization != requestDigest ||
+		marker.catalogDigest != proof.Catalog.Digest ||
+		marker.relationWitness != proof.Relations.Witness ||
+		marker.applyContract != proof.ApplyContract {
+		return proof, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	proof.SourceApplied = marker.sourceApplied
+	proof.Membership = marker.membership
+	proof.Witness = replicatedSchemaTargetProofDigest(proof)
+	return proof, nil
+}
+
 func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	raw []byte,
 	settle func(*database, ReplicatedShardStoreIdentity, *ReplicatedSchemaTargetProof) error,
@@ -244,12 +272,17 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 		}
 		a.database.mu.RUnlock()
 	}
+	proof.Witness = replicatedSchemaTargetProofDigest(proof)
+	return proof, nil
+}
+
+func replicatedSchemaTargetProofDigest(proof ReplicatedSchemaTargetProof) [sha256.Size]byte {
 	h := sha256.New()
 	_, _ = h.Write(replicatedSchemaTargetProofDomain)
-	_, _ = h.Write(image.Digest[:])
-	_, _ = h.Write(image.LocalRelationManifestDigest[:])
-	_, _ = h.Write(image.ApplyProfileDigest[:])
-	_, _ = h.Write(certificate.Witness[:])
+	_, _ = h.Write(proof.Catalog.Digest[:])
+	_, _ = h.Write(proof.Catalog.LocalRelationManifestDigest[:])
+	_, _ = h.Write(proof.Catalog.ApplyProfileDigest[:])
+	_, _ = h.Write(proof.Relations.Witness[:])
 	_, _ = h.Write(proof.ApplyContract[:])
 	var fixed [24]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], proof.SourceApplied)
@@ -257,8 +290,9 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	_, _ = h.Write(fixed[:16])
 	_, _ = h.Write(proof.Membership.Source[:])
 	_, _ = h.Write(proof.Membership.Target[:])
-	_ = h.Sum(proof.Witness[:0])
-	return proof, nil
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
 }
 
 func replicatedGlobalIndexExists(
