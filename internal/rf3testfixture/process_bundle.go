@@ -9,6 +9,11 @@ import (
 
 var ErrProcessManifestBundle = errors.New("rf3 process fixture: invalid manifest bundle")
 
+// maxProcessManifestBundleBytes matches the shipped serve-rf3 manifest read
+// bound. Composition rejects oversized input before indexing it and also caps
+// the aggregate source retained while constructing one canonical bundle.
+const maxProcessManifestBundleBytes = 4 << 20
+
 var processManifestCommonFields = [...]string{
 	"listeners",
 	"tls",
@@ -33,6 +38,14 @@ var processManifestGroupFields = [...]string{
 func CombineProcessManifests(documents ...[]byte) ([]byte, error) {
 	if len(documents) < 2 || len(documents) > 64 {
 		return nil, ErrProcessManifestBundle
+	}
+	totalBytes := 0
+	for _, document := range documents {
+		if len(document) == 0 || len(document) > maxProcessManifestBundleBytes ||
+			totalBytes > maxProcessManifestBundleBytes-len(document) {
+			return nil, ErrProcessManifestBundle
+		}
+		totalBytes += len(document)
 	}
 	groups := make([]processManifestFields, len(documents))
 	var common processManifestFields
@@ -96,6 +109,9 @@ func CombineProcessManifests(documents ...[]byte) ([]byte, error) {
 	}
 	if err := writer.Flush(); err != nil {
 		return nil, err
+	}
+	if output.Len() == 0 || output.Len() > maxProcessManifestBundleBytes {
+		return nil, ErrProcessManifestBundle
 	}
 	return output.Bytes(), nil
 }

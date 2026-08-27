@@ -58,3 +58,18 @@ func TestCombineProcessManifestsRejectsCommonCutDriftAndUnknownFields(t *testing
 		t.Fatalf("unknown field error=%v", err)
 	}
 }
+
+func TestCombineProcessManifestsRejectsInputAndAggregateAboveServingBound(t *testing.T) {
+	base := []byte(`{"wal":{},"sql":{},"route":{},"listeners":{"peer":"one"},"tls":{},"authorization_policy":"policy","replica_control":{},"split_control":{},"members":[]}`)
+	if _, err := CombineProcessManifests(nil, base); !errors.Is(err, ErrProcessManifestBundle) {
+		t.Fatalf("empty input error=%v", err)
+	}
+	oversized := make([]byte, maxProcessManifestBundleBytes+1)
+	if _, err := CombineProcessManifests(oversized, base); !errors.Is(err, ErrProcessManifestBundle) {
+		t.Fatalf("oversized input error=%v", err)
+	}
+	padded := append(bytes.Clone(base), bytes.Repeat([]byte{' '}, maxProcessManifestBundleBytes/2)...)
+	if _, err := CombineProcessManifests(padded, padded); !errors.Is(err, ErrProcessManifestBundle) {
+		t.Fatalf("oversized aggregate error=%v", err)
+	}
+}
