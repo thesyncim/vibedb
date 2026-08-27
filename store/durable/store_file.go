@@ -101,8 +101,29 @@ type Collection struct {
 	// serving publication can pass unobserved.
 	onlineMigrationDirty    *storeio.GenerationMigrationDirtySet
 	onlineMigrationObserver func(uint64, []byte) error
-	durabilityWait          sync.WaitGroup
-	snapshotGate            sync.RWMutex
+	// Automatic compaction owns at most one bounded worker. Admission state is
+	// atomic because publication only samples it after installing a generation;
+	// execution enters the ordinary writer/reader fences in CompactOnline.
+	autoCompactionFlight          atomic.Bool
+	autoCompactionWorker          atomic.Bool
+	autoCompactionArmed           atomic.Bool
+	autoCompactionBaseFileEnd     atomic.Uint64
+	autoCompactionBaseRetired     atomic.Uint64
+	autoCompactionBaseGeneration  atomic.Uint64
+	autoCompactionLastCheck       atomic.Uint64
+	autoCompactionLastAttempt     atomic.Uint64
+	autoCompactionLastAttemptDebt atomic.Uint64
+	autoCompactionDebt            atomic.Uint64
+	autoCompactionChecks          atomic.Uint64
+	autoCompactionStarts          atomic.Uint64
+	autoCompactionSuccesses       atomic.Uint64
+	autoCompactionFailures        atomic.Uint64
+	autoCompactionReaderSkips     atomic.Uint64
+	autoCompactionRecoverySkips   atomic.Uint64
+	autoCompactionOwnerSkips      atomic.Uint64
+	autoCompactionWait            sync.WaitGroup
+	durabilityWait                sync.WaitGroup
+	snapshotGate                  sync.RWMutex
 	// snapshotOrder is a process-local, lazily assigned identity used to
 	// acquire several collections' snapshot gates in one global order. Names
 	// are catalog-local and cannot provide that order when the same handles are
@@ -891,7 +912,10 @@ type Stats struct {
 	PendingRetiredExtents  uint64
 	PendingRetiredBytes    uint64
 	ReusableExtents        uint64
-	ReusableBytes          uint64
-	DocumentCount          uint64
-	FileEnd                uint64
+	// AutomaticCompaction exposes the runtime-only, O(1) scheduler state. It is
+	// disabled by default and never hides debt or failed attempts.
+	AutomaticCompaction AutomaticCompactionStatus
+	ReusableBytes       uint64
+	DocumentCount       uint64
+	FileEnd             uint64
 }

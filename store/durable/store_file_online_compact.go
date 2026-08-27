@@ -259,6 +259,13 @@ func (c *Collection) growOnlineMigrationStaging(
 // collection.
 func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	var total OnlineCompactionReport
+	if c == nil {
+		return total, ErrClosed
+	}
+	if !c.autoCompactionFlight.CompareAndSwap(false, true) {
+		return total, storeio.ErrQueueFull
+	}
+	defer c.autoCompactionFlight.Store(false)
 	if state := c.state.Load(); state != nil && state.root.MigrationManifestOffset != 0 {
 		manifestStore, err := storeio.OpenGenerationMigrationManifestStore(
 			c.file, int64(state.root.MigrationManifestOffset),

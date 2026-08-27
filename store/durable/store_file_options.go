@@ -341,6 +341,31 @@ type Options struct {
 	// maximum-size value when that is smaller. Rewriting one key replaces its
 	// previous bytes in this budget instead of accumulating callback history.
 	MaxBatchBytes int
+	// AutomaticCompaction is runtime-only policy for bounded online generation
+	// migration. The zero value is disabled: opening a collection never creates
+	// background work unless the operator explicitly opts in. The policy is not
+	// persisted because thresholds are deployment resource policy, not format.
+	AutomaticCompaction AutomaticCompactionPolicy
+}
+
+// AutomaticCompactionPolicy bounds when a collection may start one online
+// compaction. Decisions are O(1), generation-rate limited, and single-flight.
+// A held snapshot/direct read or a recovery root lagging beyond the configured
+// bound defers admission; CompactOnline retains the crash-safe execution path.
+type AutomaticCompactionPolicy struct {
+	Enabled bool
+	// TriggerBytes is the high watermark for max(file growth, newly retired
+	// bytes) since the last successful automatic compaction. Zero selects 256 MiB.
+	TriggerBytes uint64
+	// RearmBytes is the low watermark used as retry hysteresis. Zero selects one
+	// quarter of TriggerBytes and must remain below TriggerBytes.
+	RearmBytes uint64
+	// MinGenerationInterval is the minimum number of published generations
+	// between admission checks and between attempts. Zero selects 1024.
+	MinGenerationInterval uint64
+	// MaxRecoveryLagGenerations bounds how far the alternate recovery root may
+	// trail the published generation at admission. Zero selects 2.
+	MaxRecoveryLagGenerations uint64
 }
 
 // TxnLimits bounds one multi-collection commit across participants. Accounting
@@ -906,6 +931,25 @@ const (
 )
 
 func (o Options) normalized() (normalizedFileStoreOptions, error) {
+	if o.AutomaticCompaction.Enabled {
+		if o.AutomaticCompaction.TriggerBytes == 0 {
+			o.AutomaticCompaction.TriggerBytes = 256 << 20
+		}
+		if o.AutomaticCompaction.RearmBytes == 0 {
+			o.AutomaticCompaction.RearmBytes = o.AutomaticCompaction.TriggerBytes / 4
+		}
+		if o.AutomaticCompaction.RearmBytes >= o.AutomaticCompaction.TriggerBytes {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"vibedb: automatic compaction rearm bytes must be below trigger bytes",
+			)
+		}
+		if o.AutomaticCompaction.MinGenerationInterval == 0 {
+			o.AutomaticCompaction.MinGenerationInterval = 1024
+		}
+		if o.AutomaticCompaction.MaxRecoveryLagGenerations == 0 {
+			o.AutomaticCompaction.MaxRecoveryLagGenerations = 2
+		}
+	}
 	storeOptions, err := o.Collection.Normalized()
 	if err != nil {
 		return normalizedFileStoreOptions{}, err
