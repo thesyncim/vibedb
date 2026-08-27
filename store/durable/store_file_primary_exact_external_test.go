@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 )
 
 func TestPrimaryExactExternalRunsEmitReopenableGraph(t *testing.T) {
@@ -29,23 +30,28 @@ func TestPrimaryExactExternalRunsEmitReopenableGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := make(map[uint32]*[storeio.TermPostingTileChunks]uint64)
+	normalized, err := (Options{Indexes: []store.IndexDefinition{{Name: "by_group", Paths: []string{"/group"}}, {Name: "by_group_active", Paths: []string{"/group", "/active"}}}}).normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := make([]storeio.PrimaryGraphRecord, 512)
+	placements := make([]storeio.PrimaryGraphPlacement, len(records))
 	for row := 0; row < 512; row++ {
-		tile := uint32(row >> 6)
-		mask := uint64(1) << uint(row&63)
+		records[row] = storeio.PrimaryGraphRecord{Key: fmt.Sprintf("key-%04d", row), Value: fmt.Sprintf(`{"group":"g%03d","active":%t}`, row%97, row&1 == 0)}
+		placements[row] = storeio.PrimaryGraphPlacement{Bucket: storeio.BucketID(row / 256), Slot: uint8(row % 256)}
+		tile := uint32(placements[row].Bucket)<<2 | uint32(placements[row].Slot>>6)
+		mask := uint64(1) << uint(placements[row].Slot&63)
 		liveMask := live[tile]
 		if liveMask == nil {
 			liveMask = new([storeio.TermPostingTileChunks]uint64)
 			live[tile] = liveMask
 		}
 		liveMask[0] |= mask
-		for indexID := uint32(0); indexID < 2; indexID++ {
-			canonical, ok := storeio.AppendIndexTermKey(nil, []storeio.IndexTermComponent{{Kind: storeio.IndexTermString, Direction: storeio.IndexTermAscending, JSON: []byte(fmt.Sprintf(`"i%d-%03d"`, indexID, row%97))}})
-			if !ok {
-				t.Fatal("canonical term")
-			}
-			if err := builder.Add(indexID, canonical, tile, mask); err != nil {
-				t.Fatal(err)
-			}
+	}
+	for first := 0; first < len(records); first += 73 {
+		last := min(first+73, len(records))
+		if err := stagePrimaryExactRunWindow(builder, records[first:last], placements[first:last], normalized.indexes); err != nil {
+			t.Fatal(err)
 		}
 	}
 	region, err := builder.Finish()

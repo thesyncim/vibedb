@@ -4,7 +4,43 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
+
+// stagePrimaryExactRunWindow lowers one borrowed primary scan window directly
+// into the bounded external sorter. The builder copies canonical binary keys
+// before return; documents and vibejson views remain borrowed and no string
+// identity is created.
+func stagePrimaryExactRunWindow(
+	builder *storeio.GenerationMigrationExactRunBuilder,
+	records []storeio.PrimaryGraphRecord,
+	placements []storeio.PrimaryGraphPlacement,
+	indexes []*store.ExactIndex,
+) error {
+	if builder == nil || len(records) != len(placements) || len(indexes) == 0 || len(indexes) > 64 {
+		return storeio.ErrInvalidWrite
+	}
+	var components [store.MaxIndexColumns]storeio.IndexTermComponent
+	var canonical [storeio.IndexTermMaxKeyBytes]byte
+	for row := range records {
+		placement := placements[row]
+		tileID := uint32(placement.Bucket)<<2 | uint32(placement.Slot>>6)
+		mask := uint64(1) << uint(placement.Slot&63)
+		for indexID, exact := range indexes {
+			key, present, err := appendPrimaryExactDocumentTerm(canonical[:0], components[:], exact, byteview.Bytes(records[row].Value))
+			if err != nil {
+				return err
+			}
+			if present {
+				if err := builder.Add(uint32(indexID), key, tileID, mask); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
 
 // buildPrimaryExactIndexesFromMergedRun stages a complete exact-index graph
 // directly from one externally merged run. Its retained state is one output
