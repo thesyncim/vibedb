@@ -85,6 +85,9 @@ const (
 	PagePrimaryExactRoot
 	PagePrimaryExactLeaf
 	PagePrimaryExactCatalog
+	// PageMigrationExactRun is an unreachable, authenticated external-sort run
+	// used only while constructing a replacement exact-index generation.
+	PageMigrationExactRun
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -234,5 +237,5 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageOverflow && kind <= PagePrimaryExactCatalog
+	return kind >= PageOverflow && kind <= PageMigrationExactRun
 }
