@@ -1069,7 +1069,7 @@ func TestReplicatedApplyMaximumRetryWindowCreatesAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	options.TxnLimits.MaxDocuments = maxDocuments
-	if limits.MaxBatchDocuments != int(replicatedstate.MaxSessionRetryWindow)+2 ||
+	if limits.MaxBatchDocuments != 2*int(replicatedstate.MaxSessionRetryWindow)+2 ||
 		limits.MaxBatchBytes < limits.MaxDocumentBytes+limits.MaxBatchDocuments*limits.MaxKeyBytes {
 		t.Fatalf("maximum retry-window system limits = %+v", limits)
 	}

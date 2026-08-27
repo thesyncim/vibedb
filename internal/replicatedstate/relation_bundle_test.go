@@ -59,12 +59,17 @@ func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 		capture   bool
 		want      int
 	}{
-		{"data_without_capture", 64, 8, false, 67},
-		{"data_with_capture", 64, 8, true, 68},
+		{"data_without_capture", 64, 8, false, 68},
+		{"data_with_capture", 64, 8, true, 69},
 		{"session_open_without_capture", 0, 1, false, 4},
 		{"session_open_with_capture", 0, 1, true, 5},
-		{"release_without_capture", 0, 8, false, 10},
-		{"release_with_capture", 0, 8, true, 11},
+		{"release_without_capture", 0, 8, false, 18},
+		{"release_with_capture", 0, 8, true, 19},
+		{"release_dominates_data", 13, 8, false, 18},
+		{"equal_data_and_release", 14, 8, false, 18},
+		{"data_exceeds_release", 15, 8, false, 19},
+		{"maximum_release", 0, MaxSessionRetryWindow, false, 2*MaxSessionRetryWindow + 2},
+		{"maximum_data", replication.MaxMutations, 1, true, replication.MaxMutations + 5},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := RequiredBundleTransactionDocuments(
@@ -87,6 +92,51 @@ func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 		); !errors.Is(err, ErrInvalidOptions) {
 			t.Fatalf("invalid dimensions %+v err=%v", test, err)
 		}
+	}
+}
+
+func TestBundleTransactionProfileHistoricalFenceBounds(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		relations int
+		retry     uint16
+	}{
+		{"data", 64, 8},
+		{"release", 1, MaxSessionRetryWindow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			relations := []relationCollection{{target: CollectionTarget{Limits: CollectionLimits{
+				MaxDistinctMutations: test.relations, MaxBatchBytes: 1024,
+			}}}}
+			fenceBytes := len(sessionFenceKey(0, 0)) + sessionFenceBytes
+			hotBytes := len(stateKey) + MaxStateEnvelopeBytes +
+				sha256.Size + 1 + MaxAuthorityBindingBytes +
+				sha256.Size + 1 + MaxSessionRecordBytes +
+				sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceBytes
+			releaseBytes := len(stateKey) + MaxStateEnvelopeBytes +
+				sha256.Size + 1 + int(test.retry)*(sha256.Size+3+fenceBytes)
+			options := Options{
+				RetryWindow: test.retry,
+				TxnLimits: durable.TxnLimits{
+					MaxCollections: 2,
+					MaxDocuments:   max(test.relations+4, 2*int(test.retry)+2),
+					MaxBytes:       int64(max(hotBytes+1024, releaseBytes)),
+				},
+			}
+			if err := validateBundleTransactionProfile(CollectionTarget{}, relations, options); err != nil {
+				t.Fatalf("exact fence capacity rejected: %v", err)
+			}
+			short := options
+			short.TxnLimits.MaxDocuments--
+			if err := validateBundleTransactionProfile(CollectionTarget{}, relations, short); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("one-short fence documents accepted: %v", err)
+			}
+			short = options
+			short.TxnLimits.MaxBytes--
+			if err := validateBundleTransactionProfile(CollectionTarget{}, relations, short); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("one-short fence bytes accepted: %v", err)
+			}
+		})
 	}
 }
 
@@ -210,7 +260,7 @@ func newRelationBundleFixtureWithSecondKind(
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDocuments := relationDocuments + 3
+	wantDocuments := max(relationDocuments+4, 2*8+2)
 	if reserveCapture {
 		wantDocuments++
 	}
@@ -1009,10 +1059,12 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 			GlobalIndex: testGlobalIndexProfile(1, 1, 1, true)},
 	}
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
+		sha256.Size + 3 + MaxSessionSlotRecordBytes +
+		len(sessionFenceKey(0, 0)) + sessionFenceBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + 8*(sha256.Size+3)
+		sha256.Size + 1 + 8*(sha256.Size+3+len(sessionFenceKey(0, 0))+sessionFenceBytes)
 	systemBatchBytes := max(hotSystemBytes, releaseSystemBytes)
 	good := Options{
 		TxnLimits: durable.TxnLimits{
@@ -1035,7 +1087,7 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 	}{
 		{"collections", func(o *Options) { o.TxnLimits.MaxCollections-- }},
 		{"mutations", func(o *Options) {
-			o.TxnLimits.MaxDocuments = base.Limits.MaxDistinctMutations + 4
+			o.TxnLimits.MaxDocuments--
 		}},
 		{"bytes", func(o *Options) {
 			o.TxnLimits.MaxBytes = int64(systemBatchBytes + base.Limits.MaxBatchBytes)

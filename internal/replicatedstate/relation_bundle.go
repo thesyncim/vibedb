@@ -181,12 +181,13 @@ func validateBundleTransactionProfile(
 	// capacities sum higher.
 	relationBytes = min(relationBytes, int64(replication.MaxCommandBytes))
 	relationDocuments = min(relationDocuments, replication.MaxMutations)
+	fenceRowBytes := len(sessionFenceKey(0, 0)) + sessionFenceBytes
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
+		sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceRowBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
+		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3+fenceRowBytes)
 	requiredDocuments, err := RequiredBundleTransactionDocuments(
 		relationDocuments, options.RetryWindow, reservedCapture,
 	)
@@ -215,10 +216,12 @@ func validateBundleTransactionProfile(
 
 // RequiredBundleTransactionDocuments returns the exact mutation-slot ceiling
 // for one replicated apply transaction. A data command publishes state,
-// session and slot alongside all relation changes. Session open publishes
+// session and slot alongside all relation changes, and may update or delete
+// one historical fence when overwriting an old slot. Session open publishes
 // state, authority, session and slot but no relation batch. Release deletes one
-// session header plus every retry slot and publishes state. A reserved
-// transition capture contributes one additional private row to every shape.
+// session header and every retry slot, updates or deletes at most one historical
+// fence per slot, and publishes state. A reserved transition capture contributes
+// one additional private row to every shape.
 func RequiredBundleTransactionDocuments(
 	relationDocuments int,
 	retryWindow uint16,
@@ -228,7 +231,7 @@ func RequiredBundleTransactionDocuments(
 		retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
 		return 0, ErrInvalidOptions
 	}
-	required := max(int(retryWindow)+2, relationDocuments+3, 4)
+	required := max(2*int(retryWindow)+2, relationDocuments+4, 4)
 	if reservedCapture {
 		required++
 	}

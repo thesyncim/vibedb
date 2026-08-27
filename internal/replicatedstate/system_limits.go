@@ -23,30 +23,35 @@ func RequiredSystemCollectionLimits(
 		executionPinActiveStorageKeyBytes,
 		routeGatePinKeyBytes,
 		routeGateResultKeyBytes,
+		len(sessionFenceKey(0, 0)),
 	)
 	maxDocumentBytes := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
 		MaxAuthorityBindingBytes, routegate.HeadBytes, routegate.StoredPinBytes,
-		routeGateResultBytes, executionpin.RecordBytes,
+		routeGateResultBytes, executionpin.RecordBytes, sessionFenceBytes,
 	)
+	// Overwriting an old retry slot updates its historical fence. Releasing a
+	// session may update every historical fence rather than delete it when
+	// another session still retains references, so reserve complete values.
+	fenceRowBytes := len(sessionFenceKey(0, 0)) + sessionFenceBytes
 	hotBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
+		sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceRowBytes
 	releaseBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3)
+		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3+fenceRowBytes)
 	executionPinBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes +
 		executionPinRecordStorageKeyBytes + executionpin.RecordBytes +
-		executionPinActiveStorageKeyBytes + executionPinActiveValueBytes
+		executionPinActiveStorageKeyBytes + executionPinActiveValueBytes + fenceRowBytes
 	routeGateBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes +
 		len(routeGateHeadKey) + routegate.HeadBytes +
 		routeGatePinKeyBytes + routegate.StoredPinBytes +
-		routeGateResultKeyBytes + routeGateResultBytes
-	maxDocuments := max(6, int(retryWindow)+2)
+		routeGateResultKeyBytes + routeGateResultBytes + fenceRowBytes
+	maxDocuments := max(7, 2*int(retryWindow)+2)
 	maxBatchBytes := max(
 		hotBatchBytes, releaseBatchBytes, executionPinBatchBytes, routeGateBatchBytes,
 	)
