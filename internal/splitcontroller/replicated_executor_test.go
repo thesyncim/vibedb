@@ -110,7 +110,7 @@ func TestAdmitReplicatedPlanBindsFirstObservedActionAfterRestart(t *testing.T) {
 	journal := &memoryReplicatedOperationJournal{unknownNext: true}
 	record, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
 	if err != nil || !record.Equal(journal.record) || journal.retries != 1 ||
-		record.Cursor != ([8]uint64{}) || record.Proof != ([32]byte{}) {
+		record.Cursor != preparationCursor(preparationPending) || record.Proof != preparationProof(record.ID, record.IntentDigest, preparationPending) {
 		t.Fatalf("admit record=%+v journal=%+v err=%v", record, journal, err)
 	}
 	// A controller restart has no remembered first action. The source binds it
@@ -145,6 +145,14 @@ func TestAdmitReplicatedPlanIsExactAndIdempotent(t *testing.T) {
 	first, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !first.Valid() {
+		t.Fatal("split producer rejected by real catalog record contract")
+	}
+	zeroProof := first
+	zeroProof.Proof = [32]byte{}
+	if zeroProof.Valid() {
+		t.Fatal("catalog admitted a missing preparation proof")
 	}
 	second, err := AdmitReplicatedPlan(context.Background(), journal, catalog, plan)
 	if err != nil || !second.Equal(first) || journal.record.Revision != 1 {

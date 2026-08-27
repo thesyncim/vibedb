@@ -24,23 +24,18 @@ import (
 const gatewayHotSplitPrepareAttempts = 3
 
 type gatewayHotSplitFactory struct {
-	client  *splitcontroller.ChildPrepareClient
 	sources map[raftmember.GroupKey]gatewaySplitSource
 }
 
 func newGatewayHotSplitFactory(
-	client *splitcontroller.ChildPrepareClient,
 	manifest gatewayReplicaControlManifest,
 	catalog *gateway.Snapshot,
 ) (*gatewayHotSplitFactory, error) {
-	if client == nil {
-		return nil, hotshard.ErrInvalidPressureCut
-	}
 	sources, err := gatewayHotSplitSources(manifest, catalog)
 	if err != nil {
 		return nil, err
 	}
-	return &gatewayHotSplitFactory{client: client, sources: sources}, nil
+	return &gatewayHotSplitFactory{sources: sources}, nil
 }
 
 func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
@@ -95,9 +90,6 @@ func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
 	}
 	if plan.OperationID() != operation {
 		return nil, hotshard.ErrInvalidPressureCut
-	}
-	if err = factory.prepareTargets(ctx, [32]byte(operation), split, profile.Table, targets); err != nil {
-		return nil, err
 	}
 	return plan, nil
 }
@@ -274,25 +266,36 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 	}, nil
 }
 
-func (factory *gatewayHotSplitFactory) prepareTargets(
-	ctx context.Context,
-	admission [32]byte,
-	split *autosplit.SplitPlan,
-	collection string,
-	targets []splitcontroller.ChildTarget,
-) error {
+type gatewayChildPreparationClient interface {
+	Prepare(context.Context, rafttransport.NodeID, splitcontroller.ChildPreparation) (splitcontroller.ChildPrepareReceipt, error)
+}
+
+type gatewayCommittedChildPreparer struct{ client gatewayChildPreparationClient }
+
+func (preparer gatewayCommittedChildPreparer) PrepareCommittedPlan(ctx context.Context, plan *splitcontroller.Plan) error {
+	if ctx == nil || plan == nil || preparer.client == nil {
+		return splitcontroller.ErrChildPreparation
+	}
+	admission := [32]byte(plan.OperationID())
 	type job struct {
 		preparation splitcontroller.ChildPreparation
 		node        rafttransport.NodeID
 	}
-	jobs := make([]job, 0, len(targets)*gateway.ServingReplicaCount)
-	for _, target := range targets {
-		descriptor, _ := split.Child(int(target.Child))
+	jobs := make([]job, 0, (autosplit.MaxSplitChildren-1)*gateway.ServingReplicaCount)
+	for child := uint8(0); child < autosplit.MaxSplitChildren; child++ {
+		target, found := plan.Target(child)
+		if !found {
+			continue
+		}
+		descriptor, err := plan.ChildDescriptor(child)
+		if err != nil {
+			return err
+		}
 		allocationDigest := gatewayHotSplitDigest("allocation", admission, target.Child, 0)
 		for replica := range target.Replicas {
 			preparation, err := splitcontroller.NewChildPreparation(
 				splitcontroller.OperationID(admission), allocationDigest,
-				descriptor, collection, target, uint8(replica),
+				descriptor, target.SQL.UserTable, target, uint8(replica),
 			)
 			if err != nil {
 				return err
@@ -308,12 +311,13 @@ func (factory *gatewayHotSplitFactory) prepareTargets(
 			defer wait.Done()
 			item := jobs[index]
 			for attempt := 0; attempt < gatewayHotSplitPrepareAttempts; attempt++ {
-				receipt, err := factory.client.Prepare(ctx, item.node, item.preparation)
+				receipt, err := preparer.client.Prepare(ctx, item.node, item.preparation)
 				if err == nil {
 					expected, expectedErr := splitcontroller.NewChildPrepareReceipt(
 						item.preparation, item.preparation.ReplicaTarget(),
 					)
 					if expectedErr == nil && receipt.ReceiptDigest == expected.ReceiptDigest {
+						errorsByJob[index] = nil
 						return
 					}
 					err = errors.Join(splitcontroller.ErrChildPreparation, expectedErr)

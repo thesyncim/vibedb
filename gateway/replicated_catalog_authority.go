@@ -1016,6 +1016,10 @@ func validReplicatedOperation(record ReplicatedOperationRecord) bool {
 		sha256.Sum256(record.Intent) == record.IntentDigest
 }
 
+// Valid applies the same bounded record contract used by catalog-Raft
+// admission. It grants no authority; callers still need conditional Submit.
+func (record ReplicatedOperationRecord) Valid() bool { return validReplicatedOperation(record) }
+
 // Equal reports exact logical and byte identity without making the record
 // comparable merely for tests or settlement checks.
 func (record ReplicatedOperationRecord) Equal(other ReplicatedOperationRecord) bool {

@@ -26,7 +26,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
-	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -551,15 +550,7 @@ func runServe(args []string) (exitCode int) {
 				}
 			}
 		}
-		prepareConcurrency := min(int(manifest.Bounds.MaxConnections), gatewaySplitAdmissionConcurrency)
-		childPrepareClient, childPrepareErr := splitcontroller.NewChildPrepareClient(
-			splitcontroller.ChildPrepareClientOptions{
-				Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
-				MaxConcurrent:    prepareConcurrency,
-				MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * uint64(prepareConcurrency),
-			},
-		)
-		splitFactory, splitFactoryErr := newGatewayHotSplitFactory(childPrepareClient, manifest, holder.Current())
+		splitFactory, splitFactoryErr := newGatewayHotSplitFactory(manifest, holder.Current())
 		moveController, controllerErr := newGatewayReplicaMoveController(
 			catalogAuthority, replicated, controls,
 		)
@@ -574,7 +565,7 @@ func runServe(args []string) (exitCode int) {
 		}
 		var hotShardBindErr error
 		if hotShardRuntime != nil && (controllerErr != nil || controlsErr != nil ||
-			childPrepareErr != nil || splitFactoryErr != nil ||
+			splitFactoryErr != nil ||
 			!hotShardRuntime.InstallOperationAuthorities(hotAuthorities)) {
 			hotShardBindErr = hotshard.ErrInvalidPressureCut
 		}
@@ -609,7 +600,7 @@ func runServe(args []string) (exitCode int) {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, metricsErr, drainErr, splitErr, controlsErr, childPrepareErr, splitFactoryErr,
+		if joined := errors.Join(openErr, metricsErr, drainErr, splitErr, controlsErr, splitFactoryErr,
 			controllerErr, hotShardBindErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr, backupErr); joined != nil {
 			if backupRepository != nil {

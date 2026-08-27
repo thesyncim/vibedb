@@ -76,6 +76,7 @@ type ControllerService struct {
 	router    ShardControlRouter
 	admission PlanAdmissionCoordinator
 	gateway   GatewaySplitActionExecutor
+	preparer  CommittedPlanPreparer
 }
 
 // ExecuteReplicatedOperation reconstructs and advances one operation directly
@@ -101,6 +102,9 @@ func (service *ControllerService) ExecuteReplicatedOperation(
 	if err != nil || [32]byte(plan.OperationID()) != operation ||
 		record.IntentDigest != sha256.Sum256(record.Intent) {
 		return Action{}, errors.Join(err, ErrControllerTrigger)
+	}
+	if err := service.prepareCommittedPlan(ctx, record, plan, catalog); err != nil {
+		return Action{}, err
 	}
 	if service.admission != nil {
 		admission, admissionErr := NewPlanAdmission(catalog, plan)
@@ -129,13 +133,14 @@ func NewServingControllerService(
 	router ShardControlRouter,
 	admission PlanAdmissionCoordinator,
 	gateway GatewaySplitActionExecutor,
+	preparer CommittedPlanPreparer,
 ) (*ControllerService, error) {
-	if catalog == nil || observer == nil || router == nil || admission == nil || gateway == nil {
+	if catalog == nil || observer == nil || router == nil || admission == nil || gateway == nil || preparer == nil {
 		return nil, ErrControllerTrigger
 	}
 	return &ControllerService{
 		catalog: catalog, observer: observer, router: router,
-		admission: admission, gateway: gateway,
+		admission: admission, gateway: gateway, preparer: preparer,
 	}, nil
 }
 

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -101,9 +102,9 @@ func TestGatewayHotSplitComposedLocalGlobalBundle(t *testing.T) {
 				t.Fatalf("actual public bundle source selection: %v", err)
 			}
 			inventory := gatewayReplicaControlManifest{SplitSources: []gatewaySplitSource{entry}}
-			for _, replica := range source.Replicas {
+			for i, replica := range source.Replicas {
 				inventory.Shards = append(inventory.Shards, gateway.ReplicatedEndpoint{Node: replica.Node})
-				inventory.SplitSnapshots = append(inventory.SplitSnapshots, "127.0.0.1:9301")
+				inventory.SplitSnapshots = append(inventory.SplitSnapshots, "127.0.0.1:"+strconv.Itoa(9301+i))
 			}
 			sources, err := gatewayHotSplitSources(inventory, catalog)
 			if err != nil {

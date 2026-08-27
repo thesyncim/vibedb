@@ -83,6 +83,13 @@ func newGatewayServingSplitRuntime(
 	}
 
 	admissionConcurrency := min(options.connections, gatewaySplitAdmissionConcurrency)
+	prepareClient, err := splitcontroller.NewChildPrepareClient(splitcontroller.ChildPrepareClientOptions{
+		Opener: options.opener, ReadDeadline: options.read, WriteDeadline: options.write, MaxConcurrent: admissionConcurrency,
+		MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * uint64(admissionConcurrency),
+	})
+	if err != nil {
+		return nil, err
+	}
 	admission, err := splitcontroller.NewPlanAdmissionClient(splitcontroller.PlanAdmissionClientOptions{
 		Opener: options.opener, ReadDeadline: options.read, WriteDeadline: options.write,
 		MaxConcurrent:    admissionConcurrency,
@@ -134,6 +141,7 @@ func newGatewayServingSplitRuntime(
 	controller, err := splitcontroller.NewServingControllerService(
 		options.catalog, observer, router, coordinator,
 		splitcontroller.CatalogGatewaySplitActions{Authority: options.catalog, Terminal: terminal},
+		gatewayCommittedChildPreparer{client: prepareClient},
 	)
 	if err != nil {
 		_ = client.Close()

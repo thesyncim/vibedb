@@ -53,6 +53,11 @@ func AdmitReplicatedPlan(
 		CatalogGeneration: catalog.Generation(), IntentDigest: sha256.Sum256(intent),
 		Intent: intent,
 	}
+	record.Cursor = preparationCursor(preparationPending)
+	record.Proof = preparationProof(record.ID, record.IntentDigest, preparationPending)
+	if !record.Valid() {
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedExecution
+	}
 	existing, readErr := journal.ReadOperation(ctx, record.ID)
 	switch {
 	case errors.Is(readErr, gateway.ErrReplicatedOperationMissing):
@@ -125,7 +130,7 @@ func ExecuteReplicatedStep(
 		record.State > gateway.ReplicatedOperationComplete:
 		return Action{}, ErrReplicatedExecution
 	case record.Cursor != wantCursor || record.Proof != wantProof:
-		unbound := record.Cursor == ([8]uint64{}) && record.Proof == ([32]byte{})
+		unbound := record.Cursor == preparationCursor(preparationPending) && record.Proof == preparationProof(id, intentDigest, preparationPending)
 		if record.State != gateway.ReplicatedOperationRunning &&
 			!(record.State == gateway.ReplicatedOperationPlanned && unbound) {
 			return Action{}, ErrReplicatedExecution
