@@ -45,22 +45,22 @@ its finite ceiling rather than compacting them.
 The public RF3 lane deliberately accepts only statement shapes with one exact,
 byte-native meaning:
 
-- one whole-document insert row, lowered to insert-if-absent;
+- one or more whole-document insert rows, each lowered to insert-if-absent;
 - one exact-primary-key whole-document update, lowered to replace-if-present;
-- one exact-primary-key delete.
+- one exact-primary-key delete or one finite primary-key `IN` set.
 
 The update document must preserve the placement key. Returning clauses,
-multi-row inserts, column-list inserts, conflict clauses, residual predicates,
-ordering, limits, repeated relation keys, and mixed static/RF3 tables are
-refused before execution. Multiple statements
+column-list inserts, conflict clauses, residual predicates, ordering, limits,
+repeated relation keys, and mixed static/RF3 tables are refused before
+execution. Multiple statements
 and tables in one group become sorted numeric relation batches on the same
 participant and commit atomically. Ordered keys and document bytes enter Raft;
 SQL and table-name strings do not.
 
-Each dense replicated relation currently admits at most 64 distinct mutations
-in one apply batch. This state-machine bound is independent of participant
-count: a participant can contain several relation batches, and the segmented
-coordinator format can represent more than 64 groups.
+Mutation count, encoded bytes, relation-batch size, and intent-scope count are
+independently bounded before admission. These resource limits are not a
+participant-count contract: a participant can contain several relation
+batches, and the segmented coordinator streams the admitted group set.
 
 Insert and update use replicated conditional mutation kinds rather than a
 gateway pre-read. This keeps the affected-row result and conflict decision in

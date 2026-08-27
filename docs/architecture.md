@@ -143,13 +143,14 @@ An `exec_batch` that resolves every statement to replicated table metadata and
 one or more RF3 groups takes the replicated transaction path. The gateway
 validates the complete batch before shard I/O and lowers supported SQL
 to numeric relation batches over ordered key and document bytes. The supported
-shapes are one whole-document row insert, an exact primary-key whole-document
-update, and an exact primary-key delete. Mutations for co-located tables share
-one group participant; same-group multi-statement and multi-relation batches
-remain atomic. A ready global index becomes one or more independently routed
-relation participants. Update and delete bind index removal to the exact prior
-base value. Mixed static/RF3 batches, repeated relation keys, and residual
-predicates fail closed instead of falling back after partial RF3 execution.
+shapes are single- or multi-row whole-document insert, an exact primary-key
+whole-document update, and exact primary-key delete with equality or a finite
+`IN` key set. Mutations for co-located tables share one group participant;
+same-group multi-statement and multi-relation batches remain atomic. A ready
+global index becomes one or more independently routed relation participants.
+Update and delete bind index removal to the exact prior base value. Mixed
+static/RF3 batches, repeated relation keys, and residual predicates fail closed
+instead of falling back after partial RF3 execution.
 
 The client supplies a nonzero 128-bit request ID. The bounded same-process
 registry keys it by stable request scope: an authenticated request uses the

@@ -152,10 +152,24 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	if replicatedCount != len(statements) {
 		return nil, true, ErrReplicatedSQLTransactionMixed
 	}
+	// Size the hot vectors from the exact, already-bounded base mutation count.
+	// This avoids logarithmic slice growth for one wide VALUES/IN statement
+	// without eagerly reserving its potential global-index side effects.
+	baseMutationCount := 0
+	for statementIndex := range statements {
+		count, countErr := replicatedSQLMutationInputCount(&statements[statementIndex])
+		if countErr != nil {
+			return nil, true, countErr
+		}
+		if uint64(count) > profile.MaxTransactionMutations-uint64(baseMutationCount) {
+			return nil, true, ErrTransactionMutationLimit
+		}
+		baseMutationCount += count
+	}
 
-	builders := make([]replicatedSQLParticipantBuilder, 0, min(len(statements), 8))
-	identities := make([]replicatedSQLMutationIdentity, 0, len(statements))
-	keyArena := make([]byte, 0, min(len(statements), 256)*32)
+	builders := make([]replicatedSQLParticipantBuilder, 0, min(baseMutationCount, 8))
+	identities := make([]replicatedSQLMutationIdentity, 0, min(baseMutationCount, 256))
+	keyArena := make([]byte, 0, min(baseMutationCount, 256)*32)
 	var byGroup map[raftmember.GroupKey]int
 	var documentWorkspace GlobalIndexWorkspace
 	var mutationBytes uint64

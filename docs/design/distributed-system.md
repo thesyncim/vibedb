@@ -48,11 +48,12 @@ injected trusted dialer. The shipped gateway CLI does not supply one.
 
 The canonical RF3 data lane is separate from these SQL lanes. Point reads
 accept one table and one canonical ordered scalar string/number
-primary-placement key. Strict `exec_batch` writes lower whole-document insert,
-exact-primary-key whole-document update, and exact-primary-key delete into one
-or more relation-aware RF3 transaction participants. Same-group mutations use
-one atomic multi-relation apply; multiple groups use the replicated
-transaction protocol. The replicated table profile binds each table to an
+primary-placement key. Strict `exec_batch` writes lower single- or multi-row
+whole-document insert, exact-primary-key whole-document update, and
+exact-primary-key delete with equality or finite `IN` keys into one or more
+relation-aware RF3 transaction participants. Same-group mutations use one
+atomic multi-relation apply; multiple groups use the replicated transaction
+protocol. The replicated table profile binds each table to an
 exact dense relation, schema generation, relation-manifest digest, and
 three-replica route. Composite placement tuples and tenant-path placement are
 not implemented on this public lane.
@@ -87,9 +88,10 @@ The point-read and `read_batch` lanes never fall back to the static SQL service.
 The strict RF3 mutation classifier fails closed to the static path when a
 statement is not in its supported exact-key vocabulary. `read_batch` supports
 ordered multi-table and multi-group exact-primary-key reads with one ReadIndex
-cut per group. Ready global indexes are lowered into independent RF3 relation
-participants. Non-exact RF3 scatter reads and a common distributed read
-timestamp are not implemented.
+cut per group. Its sorted observation vector is an explicit per-group cut, not
+a common MVCC timestamp. Ready global indexes are lowered into independent RF3
+relation participants. Replicated joins, projections, ranges, aggregates, and
+read-write SQL transactions are not implemented.
 
 The merge layer supports global limits, ordered results, aggregates, and
 grouped partial aggregates. It cancels remaining calls after a hard error or a

@@ -713,6 +713,7 @@ func (p *PreparedPlan) bindInsertRowKeys(
 	keys := make([][]distribution.Scalar, len(ins.Rows))
 	var doc, singleDocument []byte
 	var documents [][]byte
+	var indexEntries []vibejson.IndexEntry
 	if len(ins.Columns) == 0 && len(ins.Rows) > 1 {
 		documents = make([][]byte, len(ins.Rows))
 	}
@@ -731,7 +732,7 @@ func (p *PreparedPlan) bindInsertRowKeys(
 			} else {
 				documents[i] = doc
 			}
-			key, err = writeDocShardKey(doc, p.writeKeyPointers)
+			key, indexEntries, err = writeDocShardKeyWorkspace(doc, p.writeKeyPointers, indexEntries)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("row %d: %w", i, err)
 			}
@@ -839,14 +840,31 @@ func writeScalarFromValue(value any) (distribution.Scalar, error) {
 // writeDocShardKey reads every shard-key pointer out of one JSON document,
 // mirroring the driver's primary-key extraction: a missing, null, or
 // non-scalar value is a routing error.
-func writeDocShardKey(doc []byte, pointers []vibejson.CompiledPointer) ([]distribution.Scalar, error) {
+func writeDocShardKey(
+	doc []byte,
+	pointers []vibejson.CompiledPointer,
+) ([]distribution.Scalar, error) {
+	key, _, err := writeDocShardKeyWorkspace(doc, pointers, nil)
+	return key, err
+}
+
+func writeDocShardKeyWorkspace(
+	doc []byte,
+	pointers []vibejson.CompiledPointer,
+	entries []vibejson.IndexEntry,
+) ([]distribution.Scalar, []vibejson.IndexEntry, error) {
 	needed, err := vibejson.RequiredIndexEntries(doc)
 	if err != nil {
-		return nil, fmt.Errorf("invalid JSON document: %w", err)
+		return nil, entries, fmt.Errorf("invalid JSON document: %w", err)
 	}
-	index, err := vibejson.BuildIndex(doc, make([]vibejson.IndexEntry, needed))
+	if cap(entries) < needed {
+		entries = make([]vibejson.IndexEntry, needed)
+	} else {
+		entries = entries[:needed]
+	}
+	index, err := vibejson.BuildIndex(doc, entries)
 	if err != nil {
-		return nil, fmt.Errorf("invalid JSON document: %w", err)
+		return nil, entries, fmt.Errorf("invalid JSON document: %w", err)
 	}
 	root := index.Root()
 	key := make([]distribution.Scalar, 0, len(pointers))
@@ -854,14 +872,14 @@ func writeDocShardKey(doc []byte, pointers []vibejson.CompiledPointer) ([]distri
 	for i, ptr := range pointers {
 		node, found, err := root.PointerCompiled(ptr)
 		if err != nil {
-			return nil, fmt.Errorf("shard-key column %d: %w", i, err)
+			return nil, entries, fmt.Errorf("shard-key column %d: %w", i, err)
 		}
 		if !found {
-			return nil, fmt.Errorf("shard-key column %d is missing", i)
+			return nil, entries, fmt.Errorf("shard-key column %d is missing", i)
 		}
 		value := node.Raw()
 		if value.IsNull() {
-			return nil, fmt.Errorf("shard-key column %d is null", i)
+			return nil, entries, fmt.Errorf("shard-key column %d is null", i)
 		}
 		switch value.Kind() {
 		case jsondoc.String:
@@ -875,25 +893,25 @@ func writeDocShardKey(doc []byte, pointers []vibejson.CompiledPointer) ([]distri
 			start := len(scratch)
 			scratch, ok, err := value.AppendText(scratch)
 			if err != nil {
-				return nil, fmt.Errorf("shard-key column %d has an invalid JSON string: %w", i, err)
+				return nil, entries, fmt.Errorf("shard-key column %d has an invalid JSON string: %w", i, err)
 			}
 			if !ok {
-				return nil, fmt.Errorf("shard-key column %d has an invalid JSON string", i)
+				return nil, entries, fmt.Errorf("shard-key column %d has an invalid JSON string", i)
 			}
 			key = append(key, distribution.NewString(byteview.String(scratch[start:])))
 		case jsondoc.Number:
 			number, ok := value.NumberText()
 			if !ok {
-				return nil, fmt.Errorf("shard-key column %d is not a valid JSON number", i)
+				return nil, entries, fmt.Errorf("shard-key column %d is not a valid JSON number", i)
 			}
 			scalar, err := distribution.NewNumber(number)
 			if err != nil {
-				return nil, fmt.Errorf("shard-key column %d: %w", i, err)
+				return nil, entries, fmt.Errorf("shard-key column %d: %w", i, err)
 			}
 			key = append(key, scalar)
 		default:
-			return nil, fmt.Errorf("shard-key column %d must be a JSON string or number", i)
+			return nil, entries, fmt.Errorf("shard-key column %d must be a JSON string or number", i)
 		}
 	}
-	return key, nil
+	return key, entries, nil
 }

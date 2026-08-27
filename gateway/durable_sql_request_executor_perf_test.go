@@ -19,6 +19,11 @@ var (
 
 const durableSQLWideLoweringMaxAllocations = 1024
 
+const (
+	durableSQLMultiRowInsert64MaxAllocations = 320
+	durableSQLFiniteDelete64MaxAllocations   = 340
+)
+
 func TestDurableSQLRequestExecutorRetainedStateGate(t *testing.T) {
 	// The production executor retains only three shared services and two scalar
 	// protocol bounds. Per-request plans, participants, results, and retry state
@@ -56,6 +61,34 @@ func TestDurableSQLWideLoweringAllocationGate(t *testing.T) {
 	if allocations > durableSQLWideLoweringMaxAllocations {
 		t.Fatalf("wide lowering allocations/run=%v, want <=%d",
 			allocations, durableSQLWideLoweringMaxAllocations)
+	}
+}
+
+func TestDurableSQLSetMutationLoweringAllocationGates(t *testing.T) {
+	snapshot, planner, _ := replicatedSQLSplitTransactionFixture(t)
+	profile := planner.profileFor(ClassInteractive)
+	for _, test := range []struct {
+		name    string
+		query   Query
+		maximum float64
+	}{
+		{"multi-row-insert-64", durableSQLMultiRowInsert(64), durableSQLMultiRowInsert64MaxAllocations},
+		{"finite-delete-64", durableSQLFiniteDelete(64), durableSQLFiniteDelete64MaxAllocations},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			allocations := testing.AllocsPerRun(50, func() {
+				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+					context.Background(), snapshot, []Query{test.query}, profile, nil,
+				)
+				if err != nil || !handled || len(participants) == 0 {
+					panic("set mutation lowering changed semantics")
+				}
+				durableSQLPerfParticipants = participants
+			})
+			if allocations > test.maximum {
+				t.Fatalf("allocations/run=%v want <=%v", allocations, test.maximum)
+			}
+		})
 	}
 }
 

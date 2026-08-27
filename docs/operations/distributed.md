@@ -204,16 +204,24 @@ move the placement key are refused before dispatch.
 ### Multi-table and multi-shard write
 
 `exec_batch` is an atomic, fixed-request distributed transaction. The strict
-RF3 lane supports whole-document single-row insert, exact-primary-key
-whole-document update, and exact-primary-key delete. Co-located relation
-mutations form one participant and apply atomically. The coordinator manifest
-can span more than 64 groups. There is no participant-count contract. Mutation,
-byte, deadline, journal, and concurrency limits provide the bounds.
+RF3 lane supports single- or multi-row whole-document `INSERT`,
+exact-primary-key whole-document `UPDATE`, and exact-primary-key `DELETE` with
+equality or a finite `IN` key set. One statement may fan rows or keys across
+RF3 shards, and an ordered request may touch multiple tables. Every resulting
+base and index mutation belongs to the same persisted transaction. Co-located
+relation mutations form one participant and apply atomically. There is no
+participant-count contract. Mutation, byte, deadline, journal, and concurrency
+limits provide the bounds.
 
 Ready unique and non-unique global indexes are supported on this lane. The
 gateway lowers index maintenance into independently routed relation
 participants. Update and delete use an exact prior-value digest so a stale
 index removal cannot apply to a changed base row.
+
+This lane refuses projections or reads inside the transaction, `RETURNING`,
+column-list inserts, `INSERT ... SELECT`, conflict clauses, partial-document
+updates, replacement documents that move a primary key, and predicates that
+require row discovery. Those shapes never fall back after RF3 admission.
 
 ```vibejson
 {"op":"exec_batch","request_id":"0123456789abcdef0123456789abcdef","class":"interactive","statements":[{"sql":"INSERT INTO orders VALUES (?)","params":[{"kind":"document","text":"{\"id\":\"order-1\"}"}]},{"sql":"DELETE FROM ledger WHERE id = ?","params":[{"kind":"string","text":"ledger-1"}]}]}
