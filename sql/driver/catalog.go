@@ -240,6 +240,9 @@ type database struct {
 	// sole user relation while a certified RF learner snapshot is materialized.
 	// It grants neither SQL sessions nor serving authority.
 	replicatedSnapshotStageClaim *ReplicatedSnapshotStage
+	// replicatedRestoreStageClaim exclusively owns fresh relation files while
+	// an authenticated source artifact is imported without source authority.
+	replicatedRestoreStageClaim *ReplicatedRestoreStage
 	// schemaTransition is populated only by the explicit post-Raft catalog-CAS
 	// recovery opener. It authorizes target checkpoint membership selection and
 	// exact target-machine replay before any serving claim can be minted.

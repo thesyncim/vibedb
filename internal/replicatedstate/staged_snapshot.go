@@ -51,16 +51,20 @@ type CertifiedStagedImage struct {
 // Preparing first lets the checkpoint-group certificate commit to the exact
 // state envelope before that envelope is published.
 type StagedSnapshotPreparation struct {
-	prepared          openInputs
-	staticBootstrap   *pb.Snapshot
-	state             State
-	stateEnvelope     []byte
-	imageDigest       [32]byte
-	userRows          uint64
-	userGeneration    uint64
-	captureGeneration uint64
-	statePresent      bool
-	manifest          SnapshotArtifactManifest
+	prepared            openInputs
+	staticBootstrap     *pb.Snapshot
+	state               State
+	stateEnvelope       []byte
+	imageDigest         [32]byte
+	userRows            uint64
+	userGeneration      uint64
+	relationRows        []uint64
+	relationGenerations []uint64
+	relationImages      [][sha256.Size]byte
+	relationPlacements  []relationPlacementAccumulator
+	captureGeneration   uint64
+	statePresent        bool
+	manifest            SnapshotArtifactManifest
 }
 
 // PrepareStagedSnapshot validates one coherent system/user/empty-capture cut
@@ -405,6 +409,21 @@ func (p *StagedSnapshotPreparation) Finish(
 	if p.prepared.user.Collection.Generation() != p.userGeneration {
 		return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
 	}
+	if len(p.relationGenerations) != 0 {
+		if len(p.relationGenerations) != len(p.prepared.relations) ||
+			len(p.relationRows) != len(p.prepared.relations) ||
+			len(p.relationImages) != len(p.prepared.relations) ||
+			len(p.relationPlacements) != len(p.prepared.relations) {
+			return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
+		}
+		for i := range p.prepared.relations {
+			relation := &p.prepared.relations[i]
+			if relation.target.Collection.Generation() != p.relationGenerations[i] ||
+				relation.target.Collection.Len() != p.relationRows[i] {
+				return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
+			}
+		}
+	}
 	capture := p.prepared.options.TransitionCaptureTarget.Collection
 	captureSnapshot, err := capture.Snapshot()
 	if err != nil {
@@ -428,9 +447,20 @@ func (p *StagedSnapshotPreparation) Finish(
 	machine.openedImageDigest = p.imageDigest
 	machine.openedImageApplied = p.state.Applied
 	machine.openedImageGeneration = p.userGeneration
-	machine.relations[0].openedImage = p.imageDigest
-	machine.relations[0].openedApplied = p.state.Applied
-	machine.relations[0].openedGen = p.userGeneration
+	if len(p.relationGenerations) == 0 {
+		machine.relations[0].openedImage = p.imageDigest
+		machine.relations[0].openedApplied = p.state.Applied
+		machine.relations[0].openedGen = p.userGeneration
+	} else {
+		for i := range machine.relations {
+			machine.relations[i].openedImage = p.relationImages[i]
+			machine.relations[i].openedApplied = p.state.Applied
+			machine.relations[i].openedGen = p.relationGenerations[i]
+			machine.relations[i].placement = p.relationPlacements[i]
+			machine.relations[i].placementApplied = p.state.Applied
+			machine.relations[i].placementGen = p.relationGenerations[i]
+		}
+	}
 	machine.binding = p.state.Binding
 	machine.distribution = []byte(p.state.Binding.Distribution)
 	machine.shard = []byte(p.state.Binding.Shard)
