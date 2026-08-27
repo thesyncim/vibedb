@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"bytes"
 	"fmt"
 
 	vibejson "github.com/thesyncim/vibejson"
@@ -384,6 +385,142 @@ type PrimaryGraphCatalogFolder struct {
 	lastTabletID           uint32
 	branching              bool
 	finished               bool
+}
+
+// PrimaryGraphStreamBuilder emits a complete primary graph one borrowed source
+// window at a time. StageWindow consumes every record before returning, so an
+// online reconciler may immediately release the immutable source-leaf pin.
+// Only one format tablet of compact first/last-key witnesses is retained.
+type PrimaryGraphStreamBuilder struct {
+	sink              PrimaryGraphBuildSink
+	planner           *PrimaryGraphLeafWindowPlanner
+	catalog           *PrimaryGraphCatalogFolder
+	placed            bool
+	tabletID          uint32
+	localID           uint16
+	leaves            []primaryBuiltLeaf
+	keyArena          []byte
+	lastKey           [CommonPrimaryLeafMaxKeyBytes]byte
+	lastKeyLen        int
+	priorTabletMax    [CommonPrimaryLeafMaxKeyBytes]byte
+	priorTabletMaxLen int
+	records           uint64
+	finished          bool
+}
+
+func NewPrimaryGraphStreamBuilder(
+	sink PrimaryGraphBuildSink,
+	placed bool,
+	summaries []vibejson.CompiledPointer,
+) (*PrimaryGraphStreamBuilder, error) {
+	planner, err := NewPrimaryGraphLeafWindowPlanner(placed, summaries)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := NewPrimaryGraphCatalogFolder(sink)
+	if err != nil {
+		return nil, err
+	}
+	return &PrimaryGraphStreamBuilder{
+		sink: sink, planner: planner, catalog: catalog, placed: placed,
+		leaves: make([]primaryBuiltLeaf, 0, TabletLocalIdentityLocalCount),
+		keyArena: make([]byte, 0,
+			2*TabletLocalIdentityLocalCount*CommonPrimaryLeafMaxKeyBytes),
+	}, nil
+}
+
+// StageWindow synchronously consumes one ordered borrowed source window. A
+// non-nil placements slice receives posting-stable positions for exact-index
+// emission and must have exactly one entry per record.
+func (b *PrimaryGraphStreamBuilder) StageWindow(
+	records []PrimaryGraphRecord,
+	placements []PrimaryGraphPlacement,
+) error {
+	if b == nil || b.finished || len(records) == 0 ||
+		(placements != nil && len(placements) != len(records)) ||
+		(placements != nil && !b.placed) {
+		return fmt.Errorf("%w: primary stream window", ErrInvalidWrite)
+	}
+	for consumed := 0; consumed < len(records); {
+		maxRows := CompactPrimaryStripeMaxRows
+		if b.placed {
+			maxRows = CommonPrimaryLeafWideSlots
+		}
+		end := min(consumed+maxRows, len(records))
+		window := records[consumed:end]
+		if b.lastKeyLen != 0 &&
+			bytes.Compare(b.lastKey[:b.lastKeyLen], window[0].keyBytes()) >= 0 {
+			return fmt.Errorf("%w: primary stream order", ErrInvalidWrite)
+		}
+		var windowPlacements []PrimaryGraphPlacement
+		if placements != nil {
+			windowPlacements = placements[consumed:end]
+		}
+		emission, err := b.planner.Stage(
+			b.sink, b.tabletID, b.localID, window,
+			CommonPrimaryLeafMaxExtentBytes, windowPlacements,
+		)
+		if err != nil {
+			return err
+		}
+		first := b.copyTabletKey(emission.FirstKey)
+		last := b.copyTabletKey(emission.LastKey)
+		b.leaves = append(b.leaves, primaryBuiltLeaf{
+			firstKey: first, lastKey: last, ref: emission.Ref,
+		})
+		copy(b.lastKey[:], emission.LastKey)
+		b.lastKeyLen = len(emission.LastKey)
+		b.records += uint64(emission.Count)
+		consumed += emission.Count
+		b.localID++
+		if int(b.localID) == TabletLocalIdentityLocalCount {
+			if err := b.flushTablet(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (b *PrimaryGraphStreamBuilder) copyTabletKey(key []byte) []byte {
+	start := len(b.keyArena)
+	b.keyArena = append(b.keyArena, key...)
+	return b.keyArena[start:len(b.keyArena):len(b.keyArena)]
+}
+
+func (b *PrimaryGraphStreamBuilder) flushTablet() error {
+	if len(b.leaves) == 0 {
+		return nil
+	}
+	child, err := stagePrimaryTabletWindow(
+		b.sink, b.tabletID, b.leaves,
+		b.priorTabletMax[:b.priorTabletMaxLen],
+	)
+	if err != nil {
+		return err
+	}
+	if err := b.catalog.AddTablet(child); err != nil {
+		return err
+	}
+	last := b.leaves[len(b.leaves)-1].lastKey
+	copy(b.priorTabletMax[:], last)
+	b.priorTabletMaxLen = len(last)
+	b.tabletID++
+	b.localID = 0
+	b.leaves = b.leaves[:0]
+	b.keyArena = b.keyArena[:0]
+	return nil
+}
+
+func (b *PrimaryGraphStreamBuilder) Finish() (PageRef, error) {
+	if b == nil || b.finished || b.records == 0 {
+		return PageRef{}, ErrBatchState
+	}
+	b.finished = true
+	if err := b.flushTablet(); err != nil {
+		return PageRef{}, err
+	}
+	return b.catalog.Finish()
 }
 
 func NewPrimaryGraphCatalogFolder(

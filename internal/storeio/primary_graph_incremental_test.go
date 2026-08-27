@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"testing"
 
 	vibejson "github.com/thesyncim/vibejson"
@@ -353,6 +354,127 @@ func TestPrimaryGraphCatalogFolderBoundsDirectAndBranchShapes(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestPrimaryGraphStreamBuilderConsumesPinnedWindowsAndReopens(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "primary-stream-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reservation := UnrootedGenerationReservation{
+		Offset: 64 << 10, Length: 64 << 20,
+		FirstLogicalID: PrimaryFirstDynamicLogicalID,
+		LogicalIDCount: 1 << 20,
+	}
+	writer, err := NewUnrootedGenerationWriter(
+		file, reservation, testStoreID, 11, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := NewUnrootedPrimaryGraphSink(
+		writer, testStoreID, 11, PrimaryFirstDynamicLogicalID,
+		reservation.Offset+reservation.Length, make([]byte, 512<<10),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := NewPrimaryGraphStreamBuilder(sink, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rows = 1024
+	for first := 0; first < rows; {
+		count := min(17+(first%61), rows-first)
+		keys := make([][]byte, count)
+		values := make([][]byte, count)
+		window := make([]PrimaryGraphRecord, count)
+		placements := make([]PrimaryGraphPlacement, count)
+		for row := range count {
+			rank := first + row
+			keys[row] = []byte(fmt.Sprintf("key-%08d", rank))
+			values[row] = []byte(fmt.Sprintf(`{"rank":%d}`, rank))
+			window[row] = BorrowPrimaryGraphRecord(keys[row], values[row])
+		}
+		if err := stream.StageWindow(window, placements); err != nil {
+			t.Fatal(err)
+		}
+		for row := range count {
+			if placements[row].Bucket == 0 && placements[row].Slot == 0 && first+row != 0 {
+				t.Fatalf("placement %d was not populated", first+row)
+			}
+			clear(keys[row])
+			clear(values[row])
+		}
+		first += count
+	}
+	root, err := stream.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if cap(stream.leaves) != TabletLocalIdentityLocalCount ||
+		cap(stream.keyArena) != 2*TabletLocalIdentityLocalCount*CommonPrimaryLeafMaxKeyBytes {
+		t.Fatalf(
+			"stream bounds leaves/keys=%d/%d", cap(stream.leaves), cap(stream.keyArena),
+		)
+	}
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: int(format0PageSize), MaxPageSize: CommonPrimaryLeafMaxExtentBytes,
+		ResidentBytes: 4 << 20, StoreID: testStoreID, ReadConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	bounds := GlobalTabletCatalogBounds{
+		StoreID: testStoreID, SelectedRootGeneration: 11,
+		FileEnd:       reservation.Offset + reservation.Length,
+		NextLogicalID: sink.BuildNextLogicalID(),
+	}
+	router, err := BuildResidentPrimaryRouter(cache, root, bounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if router.Len() == 0 {
+		t.Fatal("streamed graph has no leaves")
+	}
+	for _, rank := range []int{0, rows / 2, rows - 1} {
+		key := []byte(fmt.Sprintf("key-%08d", rank))
+		route, ok := router.Route(key)
+		if !ok {
+			t.Fatalf("route %q", key)
+		}
+		lease, err := cache.Acquire(route.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, err := OpenCompactPrimaryStripe(
+			lease.Page(), testStoreID, route.Bucket, route.Ref, 11,
+			CommonPrimaryLeafBounds{
+				FileEnd: bounds.FileEnd, NextLogicalID: bounds.NextLogicalID,
+				AllocationQuantum: format0PageSize,
+			},
+		)
+		if err != nil {
+			lease.Release()
+			t.Fatal(err)
+		}
+		row, ok := view.FindKey(key)
+		if !ok {
+			lease.Release()
+			t.Fatalf("missing key %q", key)
+		}
+		value, ok := view.AppendValue(nil, row)
+		lease.Release()
+		want := []byte(fmt.Sprintf(`{"rank":%d}`, rank))
+		if !ok || !bytes.Equal(value, want) {
+			t.Fatalf("value %q = %q,%v want %q", key, value, ok, want)
+		}
 	}
 }
 
