@@ -2,12 +2,17 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -17,6 +22,289 @@ const (
 	replicatedCatalogRouteSeedCandidateSuffix   = ".pending"
 	maxReplicatedCatalogRouteSeedCandidateBytes = maxReplicatedCatalogBytes + (64 << 10)
 )
+
+var ErrReplicatedCatalogRouteRestartRequired = errors.New(
+	"gateway: certified catalog route changed; restart required",
+)
+
+type replicatedCatalogRouteSeedTracker struct {
+	mu           sync.Mutex
+	terminal     atomic.Bool
+	immutable    *Snapshot
+	path         string
+	active       *Snapshot
+	activeExists bool
+	shutdown     chan struct{}
+	terminalErr  error
+}
+
+// ReplicatedCatalogRouteSeedControl couples continuous certified catalog reads
+// to one local route seed. ShutdownRequired closes before a binding-changing
+// head can be used for further topology work. The owner must quiesce every
+// authority user, then call CompleteQuiescedHandoff before process restart.
+type ReplicatedCatalogRouteSeedControl struct {
+	authority *ReplicatedCatalogAuthority
+	tracker   *replicatedCatalogRouteSeedTracker
+}
+
+// InstallReplicatedCatalogRouteSeed continuously persists certified catalog
+// heads. Byte-identical current heads do no disk I/O; same-route newer heads are
+// promoted live, while a self-route change is staged and seals the authority.
+func (authority *ReplicatedCatalogAuthority) InstallReplicatedCatalogRouteSeed(
+	ctx context.Context,
+	path string,
+	immutableGenesis *Snapshot,
+) (*ReplicatedCatalogRouteSeedControl, error) {
+	if authority == nil || ctx == nil || path == "" || immutableGenesis == nil ||
+		immutableGenesis.Generation() != 1 || authority.routeSeed.Load() != nil {
+		return nil, ErrReplicatedCatalog
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, pending := state.Pending(); pending {
+		return nil, ErrReplicatedCatalogConflict
+	}
+	active, activeExists := state.Active()
+	if !activeExists {
+		active = immutableGenesis
+	}
+	var scratch [ServingReplicaCount]ReplicatedEndpoint
+	route, ok := active.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, scratch[:0],
+	)
+	if !ok || !sameReplicatedCatalogRoute(route, authority.route) {
+		return nil, ErrReplicatedCatalogConflict
+	}
+	tracker := &replicatedCatalogRouteSeedTracker{
+		immutable: immutableGenesis, path: path, active: active,
+		activeExists: activeExists, shutdown: make(chan struct{}),
+	}
+	if !authority.routeSeed.CompareAndSwap(nil, tracker) {
+		return nil, ErrReplicatedCatalog
+	}
+	_, err = authority.readAttested(ctx, immutableGenesis)
+	control := &ReplicatedCatalogRouteSeedControl{authority: authority, tracker: tracker}
+	if err != nil {
+		if tracker.terminal.Load() {
+			return control, nil
+		}
+		authority.routeSeed.CompareAndSwap(tracker, nil)
+		return nil, err
+	}
+	return control, nil
+}
+
+// ShutdownRequired closes exactly once when continued service could use a
+// stale catalog route or when local certified-seed durability is uncertain.
+func (control *ReplicatedCatalogRouteSeedControl) ShutdownRequired() <-chan struct{} {
+	if control == nil || control.tracker == nil {
+		return nil
+	}
+	return control.tracker.shutdown
+}
+
+// ReplicatedCatalogRouteSeedControl returns the installed continuous seed
+// controller. It is nil until InstallReplicatedCatalogRouteSeed succeeds.
+func (authority *ReplicatedCatalogAuthority) ReplicatedCatalogRouteSeedControl() *ReplicatedCatalogRouteSeedControl {
+	if authority == nil {
+		return nil
+	}
+	tracker := authority.routeSeed.Load()
+	if tracker == nil {
+		return nil
+	}
+	return &ReplicatedCatalogRouteSeedControl{authority: authority, tracker: tracker}
+}
+
+// TerminalError reports why ShutdownRequired closed.
+func (control *ReplicatedCatalogRouteSeedControl) TerminalError() error {
+	if control == nil || control.tracker == nil {
+		return ErrReplicatedCatalog
+	}
+	control.tracker.mu.Lock()
+	defer control.tracker.mu.Unlock()
+	return control.tracker.terminalErr
+}
+
+// CompleteQuiescedHandoff settles and destroys the old durable session before
+// promoting a binding-changing candidate. It is safe to retry after every
+// outcome-unknown Retire, Release, journal removal, candidate rename, or
+// directory fsync; the active seed is never lost or advanced before release.
+func (control *ReplicatedCatalogRouteSeedControl) CompleteQuiescedHandoff(
+	ctx context.Context,
+) error {
+	if control == nil || control.authority == nil || control.tracker == nil || ctx == nil ||
+		!control.tracker.terminal.Load() {
+		return ErrReplicatedCatalog
+	}
+	authority, tracker := control.authority, control.tracker
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	state, err := LoadReplicatedCatalogRouteSeed(tracker.path)
+	if err != nil {
+		return err
+	}
+	pending, pendingExists := state.Pending()
+	active, activeExists := state.Active()
+	candidate := pending
+	if !pendingExists {
+		candidate = active
+	}
+	if candidate == nil || !activeExists && !pendingExists {
+		return errors.Join(tracker.terminalErr, ErrReplicatedCatalogConflict)
+	}
+	var scratch [ServingReplicaCount]ReplicatedEndpoint
+	nextRoute, ok := candidate.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, scratch[:0],
+	)
+	if !ok {
+		return errors.Join(tracker.terminalErr, ErrReplicatedCatalogMissing)
+	}
+	changed := !sameReplicatedCatalogRoute(authority.route, nextRoute)
+	if changed {
+		if authority.session == nil || authority.session.journal == nil {
+			return errors.Join(tracker.terminalErr, ErrNativeSession)
+		}
+		present, presentErr := NativeSessionJournalPresent(authority.session.journal.base)
+		if presentErr != nil {
+			return errors.Join(tracker.terminalErr, presentErr)
+		}
+		if present {
+			authorized, authorizeErr := serviceauthz.WithAuthority(ctx, authority.authority)
+			if authorizeErr != nil {
+				return errors.Join(tracker.terminalErr, authorizeErr)
+			}
+			if err = authority.session.RetireReleaseAndDestroy(authorized); err != nil {
+				return errors.Join(tracker.terminalErr, err)
+			}
+		}
+	}
+	if pendingExists {
+		if err = state.PromotePending(); err != nil {
+			return errors.Join(tracker.terminalErr, err)
+		}
+		tracker.active, tracker.activeExists = pending, true
+	}
+	return tracker.terminalErr
+}
+
+func (tracker *replicatedCatalogRouteSeedTracker) observe(
+	receipt ReplicatedCatalogSeedReceipt,
+) error {
+	if tracker == nil || receipt.authority == nil || receipt.snapshot == nil {
+		return ErrReplicatedCatalog
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.terminal.Load() {
+		return tracker.terminalErr
+	}
+	if receipt.authority.routeSeed.Load() != tracker {
+		return ErrReplicatedCatalog
+	}
+	if tracker.activeExists && receipt.snapshot.Generation() == tracker.active.Generation() {
+		equal, err := equalCatalogSnapshots(tracker.active, receipt.snapshot)
+		if err != nil || !equal {
+			return tracker.terminateLocked(errors.Join(err, ErrReplicatedCatalogConflict))
+		}
+		return nil
+	}
+	if tracker.activeExists && receipt.snapshot.Generation() < tracker.active.Generation() {
+		return tracker.terminateLocked(ErrStaleGeneration)
+	}
+	expected := uint64(0)
+	if tracker.activeExists {
+		expected = tracker.active.Generation()
+	}
+	if err := receipt.authority.StageReplicatedCatalogRouteSeedAfter(
+		tracker.path, expected, receipt,
+	); err != nil {
+		return tracker.terminateLocked(err)
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(tracker.path)
+	if err != nil {
+		return tracker.terminateLocked(err)
+	}
+	pending, found := state.Pending()
+	if !found {
+		return tracker.terminateLocked(ErrReplicatedCatalogConflict)
+	}
+	equal, compareErr := equalCatalogSnapshots(pending, receipt.snapshot)
+	if compareErr != nil || !equal {
+		return tracker.terminateLocked(errors.Join(compareErr, ErrReplicatedCatalogConflict))
+	}
+	var scratch [ServingReplicaCount]ReplicatedEndpoint
+	nextRoute, ok := pending.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, scratch[:0],
+	)
+	if !ok {
+		return tracker.terminateLocked(ErrReplicatedCatalogMissing)
+	}
+	if !sameReplicatedCatalogRoute(receipt.authority.route, nextRoute) {
+		return tracker.terminateLocked(ErrReplicatedCatalogRouteRestartRequired)
+	}
+	if err = state.PromotePending(); err != nil {
+		return tracker.terminateLocked(err)
+	}
+	tracker.active, tracker.activeExists = pending, true
+	return nil
+}
+
+func (tracker *replicatedCatalogRouteSeedTracker) terminateLocked(err error) error {
+	if err == nil {
+		err = ErrReplicatedCatalog
+	}
+	if !tracker.terminal.Load() {
+		tracker.terminalErr = err
+		tracker.terminal.Store(true)
+		close(tracker.shutdown)
+	}
+	return tracker.terminalErr
+}
+
+func (tracker *replicatedCatalogRouteSeedTracker) fail(err error) error {
+	if tracker == nil {
+		return errors.Join(err, ErrReplicatedCatalog)
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.terminateLocked(err)
+}
+
+func (authority *ReplicatedCatalogAuthority) observePublishedCatalog(
+	snapshot *Snapshot,
+) error {
+	tracker := authority.routeSeed.Load()
+	if tracker == nil {
+		return nil
+	}
+	head, err := appendReplicatedCatalogDocument(nil, snapshot, maxReplicatedCatalogBytes)
+	if err != nil {
+		return tracker.fail(err)
+	}
+	canonical, err := openTypedControlPlaneDocument(
+		head, replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		return tracker.fail(err)
+	}
+	// Reopen the exact bytes committed to RF3. In-memory proposal snapshots may
+	// omit derived catalog-lineage scalars that canonical decoding reconstructs;
+	// the sealed route receipt must carry the byte-exact durable head image, not
+	// a caller-owned pre-publication representation.
+	certified, err := OpenSnapshotDocument(canonical)
+	if err != nil {
+		return tracker.fail(err)
+	}
+	return tracker.observe(ReplicatedCatalogSeedReceipt{
+		authority: authority, snapshot: certified, canonical: canonical,
+		headBytes: uint64(len(head)), headDigest: sha256.Sum256(head),
+	})
+}
 
 type persistedReplicatedCatalogRouteSeedCandidate struct {
 	Format             uint8             `json:"format"`
@@ -42,6 +330,63 @@ type ReplicatedCatalogRouteSeedState struct {
 	pendingFileDigest [sha256.Size]byte
 	pendingHeadBytes  uint64
 	pendingHeadDigest [sha256.Size]byte
+}
+
+// ValidateReplicatedCatalogRouteSeedSeparation proves that the immutable
+// generation-one file cannot alias either the active mutable seed or its
+// deterministic pending candidate through path normalization or hard links.
+func ValidateReplicatedCatalogRouteSeedSeparation(immutablePath, routeSeedPath string) error {
+	immutable, err := canonicalCatalogEntryPath(immutablePath)
+	if err != nil {
+		return err
+	}
+	route, err := canonicalCatalogEntryPath(routeSeedPath)
+	if err != nil {
+		return err
+	}
+	pending := route + replicatedCatalogRouteSeedCandidateSuffix
+	if immutable == route || immutable == pending {
+		return ErrReplicatedCatalogConflict
+	}
+	immutableInfo, immutableErr := os.Lstat(immutable)
+	if immutableErr != nil {
+		return immutableErr
+	}
+	if !immutableInfo.Mode().IsRegular() {
+		return ErrReplicatedCatalogConflict
+	}
+	for _, candidate := range []string{route, pending} {
+		info, statErr := os.Lstat(candidate)
+		if errors.Is(statErr, os.ErrNotExist) {
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() || os.SameFile(immutableInfo, info) {
+			return ErrReplicatedCatalogConflict
+		}
+	}
+	return nil
+}
+
+func canonicalCatalogEntryPath(path string) (string, error) {
+	if path == "" {
+		return "", ErrReplicatedCatalog
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	directory, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(absolute)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return "", ErrReplicatedCatalog
+	}
+	return filepath.Join(directory, base), nil
 }
 
 // Active returns the validated durable route seed. An absent seed is reported
@@ -72,6 +417,18 @@ func (state ReplicatedCatalogRouteSeedState) PromotePending() error {
 		state.path, state.pendingExpected, state.pendingFileDigest,
 		state.pendingHeadBytes, state.pendingHeadDigest,
 	)
+}
+
+// PromotePendingAndReload retries the exact sealed promotion and reloads from
+// the same private path captured by LoadReplicatedCatalogRouteSeed. Callers
+// cannot accidentally promote one seed and inspect a different path.
+func (state ReplicatedCatalogRouteSeedState) PromotePendingAndReload() (
+	ReplicatedCatalogRouteSeedState, error,
+) {
+	if err := state.PromotePending(); err != nil {
+		return ReplicatedCatalogRouteSeedState{}, err
+	}
+	return LoadReplicatedCatalogRouteSeed(state.path)
 }
 
 // LoadReplicatedCatalogRouteSeed validates the active seed and its deterministic
@@ -154,18 +511,25 @@ func (authority *ReplicatedCatalogAuthority) StageReplicatedCatalogRouteSeedAfte
 	if receipt.snapshot.Generation() < expectedGeneration {
 		return ErrStaleGeneration
 	}
-	canonical, err := AppendSnapshotDocument(nil, receipt.snapshot)
+	// One valid caller snapshot may omit derived lineage/high-water scalars.
+	// Certify it once at this durability boundary and use that exact state for
+	// every byte/digest comparison and for the persisted candidate.
+	certified, err := initialCatalogState(receipt.snapshot)
+	if err != nil {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	canonical, err := AppendSnapshotDocument(nil, certified)
 	if err != nil || !bytes.Equal(canonical, receipt.canonical) {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
 	head, err := appendReplicatedCatalogDocument(
-		nil, receipt.snapshot, maxReplicatedCatalogBytes,
+		nil, certified, maxReplicatedCatalogBytes,
 	)
 	if err != nil || uint64(len(head)) != receipt.headBytes ||
 		sha256.Sum256(head) != receipt.headDigest {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	if receipt.snapshot.Generation() == expectedGeneration {
+	if certified.Generation() == expectedGeneration {
 		state, loadErr := LoadReplicatedCatalogRouteSeed(path)
 		if loadErr != nil {
 			return loadErr
@@ -174,7 +538,7 @@ func (authority *ReplicatedCatalogAuthority) StageReplicatedCatalogRouteSeedAfte
 		if !found || current.Generation() != expectedGeneration {
 			return ErrCatalogGenerationMismatch
 		}
-		equal, compareErr := equalCatalogSnapshots(current, receipt.snapshot)
+		equal, compareErr := equalCatalogSnapshots(current, certified)
 		if compareErr != nil || !equal {
 			return errors.Join(compareErr, ErrReplicatedCatalogConflict)
 		}
@@ -185,14 +549,14 @@ func (authority *ReplicatedCatalogAuthority) StageReplicatedCatalogRouteSeedAfte
 		ExpectedGeneration: expectedGeneration,
 		HeadBytes:          receipt.headBytes, HeadDigest: receipt.headDigest,
 		SnapshotBytes: uint64(len(canonical)), SnapshotDigest: sha256.Sum256(canonical),
-		Snapshot: toPersisted(receipt.snapshot),
+		Snapshot: toPersisted(certified),
 	}
 	raw, err := appendReplicatedCatalogRouteSeedCandidate(nil, &persisted)
 	if err != nil {
 		return err
 	}
 	return stageReplicatedCatalogRouteSeedAfter(
-		path, expectedGeneration, receipt.snapshot, raw,
+		path, expectedGeneration, certified, raw,
 	)
 }
 

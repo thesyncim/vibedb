@@ -132,6 +132,9 @@ func (authority *ReplicatedCatalogAuthority) PublishPressureRecord(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}

@@ -140,9 +140,10 @@ func (values *repeatedFlag) Set(value string) error {
 }
 
 // runServe loads the catalog, binds the listener, and serves until interrupted.
-func runServe(args []string) int {
+func runServe(args []string) (exitCode int) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
+	catalogRouteSeed := fs.String("catalog-route-seed", "", "path to the last authenticated crash-safe catalog route seed")
 	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
 	catalogBootstrapIfMissing := fs.Bool("catalog-bootstrap-if-missing", false, "atomically publish and attest the immutable generation-one catalog proof when authority is empty")
 	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
@@ -196,11 +197,12 @@ func runServe(args []string) int {
 	}
 	if *devStaticCatalog {
 		if !*devPlaintext || *catalogBootstrapIfMissing || *catalogRelation != 0 ||
-			*hotShardCapacity != "" || *durableAckKeyPath != "" {
+			*catalogRouteSeed != "" || *hotShardCapacity != "" || *durableAckKeyPath != "" {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
 		}
-	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
+	} else if *catalogRouteSeed == "" || *catalogRouteSeed == *catalog ||
+		*catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
 		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *durableAckKeyPath == "" || *controllerInterval <= 0 ||
 		*catalogSessionLease <= 0 || *hotShardInterval <= 0 ||
 		len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
@@ -338,7 +340,7 @@ func runServe(args []string) int {
 			return 2
 		}
 		exec, holder, catalogAuthority, replicated, replicatedPool, err = newReplicatedCatalogGateway(
-			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
+			context.Background(), *catalog, *catalogRouteSeed, shardDial, tlsProfile, *devPlaintext,
 			internalAuthority, *catalogBootstrapIfMissing,
 			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
 			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
@@ -351,6 +353,10 @@ func runServe(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
+	}
+	var routeSeedControl *gateway.ReplicatedCatalogRouteSeedControl
+	if catalogAuthority != nil {
+		routeSeedControl = catalogAuthority.ReplicatedCatalogRouteSeedControl()
 	}
 	var dataReader *gateway.ReplicatedDataReader
 	var durable durableRequestService
@@ -418,6 +424,31 @@ func runServe(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	routeHandoffCompleted := false
+	defer func() {
+		if routeHandoffCompleted {
+			return
+		}
+		required, handoffErr := completeReplicatedCatalogRouteSeedHandoff(
+			routeSeedControl, *catalogAttempts, *catalogAttemptTimeout,
+		)
+		if required && handoffErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: catalog route handoff: %v\n", handoffErr)
+			exitCode = 1
+		}
+	}()
+	if routeSeedControl != nil {
+		go func() {
+			select {
+			case <-routeSeedControl.ShutdownRequired():
+				// The authority closes this before exposing a binding-changing
+				// head. Cancel every public and control-plane user first; the
+				// session is retired only after their done signals are joined.
+				stop()
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	var hotShardDone <-chan struct{}
@@ -630,11 +661,37 @@ func runServe(args []string) int {
 		stop()
 		<-hotShardDone
 	}
-	if serveErr := errors.Join(replicaControlErr, nonCanceledError(err)); serveErr != nil {
+	var routeHandoffErr error
+	routeHandoffCompleted, routeHandoffErr = completeReplicatedCatalogRouteSeedHandoff(
+		routeSeedControl, *catalogAttempts, *catalogAttemptTimeout,
+	)
+	if serveErr := errors.Join(
+		replicaControlErr, nonCanceledError(err), routeHandoffErr,
+	); serveErr != nil {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", serveErr)
 		return 1
 	}
 	return 0
+}
+
+func completeReplicatedCatalogRouteSeedHandoff(
+	control *gateway.ReplicatedCatalogRouteSeedControl,
+	attempts int,
+	attemptTimeout time.Duration,
+) (bool, error) {
+	if control == nil {
+		return false, nil
+	}
+	select {
+	case <-control.ShutdownRequired():
+	default:
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), replicatedCatalogRouteHandoffTimeout(attempts, attemptTimeout),
+	)
+	defer cancel()
+	return true, control.CompleteQuiescedHandoff(ctx)
 }
 
 func nonCanceledError(err error) error {
@@ -683,9 +740,52 @@ func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
 	return exec, holder, nil
 }
 
+func loadReplicatedCatalogSeeds(
+	genesisPath, routeSeedPath string,
+) (*gateway.Snapshot, *gateway.Snapshot, gateway.ReplicatedCatalogRouteSeedState, error) {
+	if err := gateway.ValidateReplicatedCatalogRouteSeedSeparation(
+		genesisPath, routeSeedPath,
+	); err != nil {
+		return nil, nil, gateway.ReplicatedCatalogRouteSeedState{}, err
+	}
+	genesis, err := gateway.LoadSnapshot(genesisPath)
+	if err != nil || genesis.Generation() != 1 {
+		return nil, nil, gateway.ReplicatedCatalogRouteSeedState{},
+			errors.Join(err, gateway.ErrReplicatedCatalog)
+	}
+	state, err := gateway.LoadReplicatedCatalogRouteSeed(routeSeedPath)
+	if err != nil {
+		return nil, nil, gateway.ReplicatedCatalogRouteSeedState{}, err
+	}
+	routeSeed, found := state.Active()
+	if !found {
+		routeSeed = genesis
+	}
+	return genesis, routeSeed, state, nil
+}
+
+func sameReplicatedCatalogRoute(left, right gateway.ReplicatedRoute) bool {
+	if left.Distribution != right.Distribution || left.Shard != right.Shard ||
+		left.Group != right.Group ||
+		left.AllocationGeneration != right.AllocationGeneration ||
+		left.Command != right.Command || left.RangeIdentity != right.RangeIdentity ||
+		left.LineageDigest != right.LineageDigest ||
+		left.ForwardingRuleDigest != right.ForwardingRuleDigest ||
+		len(left.Replicas) != len(right.Replicas) {
+		return false
+	}
+	for index := range left.Replicas {
+		if left.Replicas[index] != right.Replicas[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func newReplicatedCatalogGateway(
 	ctx context.Context,
 	bootstrapPath string,
+	routeSeedPath string,
 	shardDial gateway.DialFunc,
 	tlsProfile *rafttransport.PeerTLS,
 	devPlaintext bool,
@@ -710,12 +810,14 @@ func newReplicatedCatalogGateway(
 	}
 	distributionName := gateway.ReplicatedCatalogDistribution
 	shardID := gateway.ReplicatedCatalogShard
-	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
+	bootstrap, routeSeed, routeSeedState, err := loadReplicatedCatalogSeeds(
+		bootstrapPath, routeSeedPath,
+	)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
-	route, ok := bootstrap.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
+	route, ok := routeSeed.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
 	if !ok {
 		return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalogMissing
 	}
@@ -753,9 +855,53 @@ func newReplicatedCatalogGateway(
 		return nil, nil, nil, nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(nil)
-	binding, err := gateway.NativeSessionJournalBinding(
-		route, string(distributionName), string(shardID),
-		[]byte{replicatedCatalogControllerTenant}, relation, serviceauthz.CapabilityTopology,
+	newSession := func(sessionRoute gateway.ReplicatedRoute) (*gateway.NativeSession, error) {
+		binding, bindingErr := gateway.NativeSessionJournalBinding(
+			sessionRoute, string(distributionName), string(shardID),
+			[]byte{replicatedCatalogControllerTenant}, relation,
+			serviceauthz.CapabilityTopology,
+		)
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+		journal, journalErr := gateway.OpenNativeSessionJournal(
+			gateway.NativeSessionJournalOptions{
+				Path: journalPath, ClientID: clientID, RetryHome: retryHome,
+				MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
+			},
+		)
+		if journalErr != nil {
+			return nil, journalErr
+		}
+		return gateway.NewNativeSession(gateway.NativeSessionOptions{
+			Executor: replicated, Route: sessionRoute,
+			Distribution: string(distributionName), Shard: string(shardID),
+			Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID,
+			RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: relation},
+			Journal: journal, ProposalCapability: serviceauthz.CapabilityTopology,
+			MaxRelationBatches: 1, MaxMutations: 4,
+			InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+		})
+	}
+	routeSeed, route, routeSeedState, err = recoverReplicatedCatalogRouteSeedStartup(
+		ctx, journalPath, routeSeed, route, routeSeedState,
+		replicatedCatalogRouteSeedStartupHooks{
+			journalPresent: gateway.NativeSessionJournalPresent,
+			settleOldSession: func(settleCtx context.Context, oldRoute gateway.ReplicatedRoute) error {
+				recoverySession, recoveryErr := newSession(oldRoute)
+				authorized, authorizeErr := serviceauthz.WithAuthority(
+					settleCtx, internalAuthority,
+				)
+				if recoveryErr != nil || authorizeErr != nil {
+					return errors.Join(recoveryErr, authorizeErr)
+				}
+				status := recoverySession.Status()
+				if !status.Pending && !status.Active && !status.Retired && !status.Released {
+					return gateway.ErrReplicatedCatalogConflict
+				}
+				return recoverySession.RetireReleaseAndDestroy(authorized)
+			},
+		},
 	)
 	if err != nil {
 		if replicatedPool != nil {
@@ -763,24 +909,8 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	journal, err := gateway.OpenNativeSessionJournal(gateway.NativeSessionJournalOptions{
-		Path: journalPath, ClientID: clientID, RetryHome: retryHome,
-		MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
-	})
-	if err != nil {
-		if replicatedPool != nil {
-			_ = replicatedPool.Close()
-		}
-		return nil, nil, nil, nil, nil, err
-	}
-	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{
-		Executor: replicated, Route: route, Distribution: string(distributionName), Shard: string(shardID),
-		Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID, RetryHome: retryHome,
-		Resolver: gateway.BaseRelationResolver{Relation: relation}, Journal: journal,
-		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 4,
-		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
-	})
+	_, routeSeedExists := routeSeedState.Active()
+	session, err := newSession(route)
 	if err != nil {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
@@ -844,11 +974,11 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	} else if err != nil {
-		if bootstrap.Generation() != 1 {
+		if routeSeedExists {
 			if replicatedPool != nil {
 				_ = replicatedPool.Close()
 			}
-			return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalog
+			return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalogConflict
 		}
 		publishErr := authority.Publish(ctx, 0, bootstrap)
 		for retry := 0; retry < attempts && errors.Is(publishErr, gateway.ErrReplicatedCatalogPending); retry++ {
@@ -870,13 +1000,27 @@ func newReplicatedCatalogGateway(
 			return nil, nil, nil, nil, nil, err
 		}
 	}
-	if bootstrapIfMissing {
-		if err = authority.AttestGenesis(ctx, bootstrap); err != nil {
-			if replicatedPool != nil {
-				_ = replicatedPool.Close()
-			}
-			return nil, nil, nil, nil, nil, err
+	control, err := authority.InstallReplicatedCatalogRouteSeed(
+		ctx, routeSeedPath, bootstrap,
+	)
+	if err != nil {
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
+		return nil, nil, nil, nil, nil, err
+	}
+	select {
+	case <-control.ShutdownRequired():
+		handoffCtx, cancel := context.WithTimeout(
+			context.Background(), replicatedCatalogRouteHandoffTimeout(attempts, attemptTimeout),
+		)
+		err = control.CompleteQuiescedHandoff(handoffCtx)
+		cancel()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
+		}
+		return nil, nil, nil, nil, nil, err
+	default:
 	}
 	executor := gateway.NewExecutor(
 		gateway.NewClient(shardDial), holder, gateway.Options{
@@ -884,6 +1028,92 @@ func newReplicatedCatalogGateway(
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil
+}
+
+type replicatedCatalogRouteSeedStartupHooks struct {
+	journalPresent   func(string) (bool, error)
+	settleOldSession func(context.Context, gateway.ReplicatedRoute) error
+}
+
+func recoverReplicatedCatalogRouteSeedStartup(
+	ctx context.Context,
+	journalPath string,
+	active *gateway.Snapshot,
+	activeRoute gateway.ReplicatedRoute,
+	state gateway.ReplicatedCatalogRouteSeedState,
+	hooks replicatedCatalogRouteSeedStartupHooks,
+) (*gateway.Snapshot, gateway.ReplicatedRoute,
+	gateway.ReplicatedCatalogRouteSeedState, error) {
+	if ctx == nil {
+		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{},
+			gateway.ErrReplicatedCatalog
+	}
+	pending, pendingExists := state.Pending()
+	if !pendingExists {
+		return active, activeRoute, state, nil
+	}
+	var pendingReplicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	pendingRoute, ok := pending.ResolveReplicatedRoute(
+		gateway.ReplicatedCatalogDistribution,
+		gateway.ReplicatedCatalogShard,
+		pendingReplicas[:0],
+	)
+	if !ok {
+		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{},
+			gateway.ErrReplicatedCatalogMissing
+	}
+	changed := !sameReplicatedCatalogRoute(activeRoute, pendingRoute)
+	if changed {
+		if hooks.journalPresent == nil || hooks.settleOldSession == nil {
+			return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{},
+				gateway.ErrReplicatedCatalog
+		}
+		present, err := hooks.journalPresent(journalPath)
+		if err != nil {
+			return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
+		}
+		if present {
+			// The callback must reopen the journal under activeRoute—not the
+			// candidate binding—and settle Retire→Release→destroy exactly.
+			if err = hooks.settleOldSession(ctx, activeRoute); err != nil {
+				return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
+			}
+		}
+	}
+	refreshed, err := state.PromotePendingAndReload()
+	if err != nil {
+		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
+	}
+	if changed {
+		return pending, pendingRoute, refreshed,
+			gateway.ErrReplicatedCatalogRouteRestartRequired
+	}
+	return pending, pendingRoute, refreshed, nil
+}
+
+func replicatedCatalogRouteHandoffTimeout(attempts int, attemptTimeout time.Duration) time.Duration {
+	const minimum = 5 * time.Second
+	const maximum = 2 * time.Minute
+	if attempts <= 0 || attemptTimeout <= 0 {
+		return minimum
+	}
+	// A retained outcome-unknown command, Retire, and Release can each execute
+	// one independently bounded proposal. Cap the aggregate shutdown budget: an
+	// interrupted handoff is durable and resumes from the pending seed plus
+	// native-session journal on the next process start.
+	factor := int64(attempts)
+	if factor > math.MaxInt64/3 {
+		return maximum
+	}
+	factor *= 3
+	if attemptTimeout > maximum/time.Duration(factor) {
+		return maximum
+	}
+	timeout := attemptTimeout * time.Duration(factor)
+	if timeout < minimum {
+		return minimum
+	}
+	return timeout
 }
 
 const replicatedCatalogControllerTenant = byte(1)
@@ -924,7 +1154,7 @@ func serveGatewayDurableData(
 	durable durableRequestService,
 	logf func(string, ...any),
 ) error {
-	startGatewayRecovery(ctx, exec, logf)
+	recoveryDone := startGatewayRecovery(ctx, exec, logf)
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
 	go func() {
@@ -938,6 +1168,7 @@ func serveGatewayDurableData(
 		if err != nil {
 			wg.Wait()
 			if ctx.Err() != nil {
+				<-recoveryDone
 				return nil
 			}
 			return err
@@ -950,15 +1181,24 @@ func serveGatewayDurableData(
 	}
 }
 
-func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func(string, ...any)) {
-	go exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
-		if err != nil {
-			logf("gateway: transaction recovery: %v", err)
-		}
-		if len(results) != 0 {
-			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
-		}
-	})
+func startGatewayRecovery(
+	ctx context.Context,
+	exec *gateway.Executor,
+	logf func(string, ...any),
+) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
+			if err != nil {
+				logf("gateway: transaction recovery: %v", err)
+			}
+			if len(results) != 0 {
+				logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
+			}
+		})
+	}()
+	return done
 }
 
 func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
@@ -988,14 +1228,18 @@ func serveAuthenticatedGatewayDurableData(
 	limits gateway.ClientTLSLimits,
 	logf func(string, ...any),
 ) error {
-	startGatewayRecovery(ctx, exec, logf)
-	return capability.ServeAuthorizedClients(ctx, listener, limits,
+	recoveryDone := startGatewayRecovery(ctx, exec, logf)
+	err := capability.ServeAuthorizedClients(ctx, listener, limits,
 		func(ctx context.Context, connection net.Conn) {
 			handleConnPolicyDurable(ctx, connection, exec, data, durable, logf,
 				func(required serviceauthz.Capability) bool {
 					return capability.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
 				})
 		})
+	if ctx.Err() != nil {
+		<-recoveryDone
+	}
+	return err
 }
 
 func handleConnAuthorized(ctx context.Context, conn net.Conn, exec *gateway.Executor,

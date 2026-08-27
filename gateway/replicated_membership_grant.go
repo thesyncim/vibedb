@@ -205,6 +205,9 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -601,6 +604,9 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -778,6 +784,9 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
+	if err = authority.observePublishedCatalog(certified); err != nil {
+		return err
+	}
 	return authority.holder.publishReplicaReplacementAfter(
 		expectedGeneration, certified, expected,
 	)
@@ -809,6 +818,9 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -903,6 +915,9 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
+	if err = authority.observePublishedCatalog(next); err != nil {
+		return err
+	}
 	return authority.holder.publishReplicaReplacementPostRemoveAfter(
 		expectedGeneration, next, expected, observedReplicaSetVersion,
 	)
@@ -926,6 +941,9 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}

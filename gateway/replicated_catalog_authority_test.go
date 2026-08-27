@@ -13,9 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -270,6 +272,187 @@ func TestReplicatedCatalogRouteSeedRejectsActivePendingAlias(t *testing.T) {
 	}
 	if _, err = LoadReplicatedCatalogRouteSeed(path); !errors.Is(err, ErrReplicatedCatalogConflict) {
 		t.Fatalf("active/pending hard-link alias=%v", err)
+	}
+}
+
+func TestReplicatedCatalogRouteSeedTrackerPersistsSameRouteBeforeHolderPublish(t *testing.T) {
+	authority, _, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err := SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := authority.InstallReplicatedCatalogRouteSeed(
+		context.Background(), path, genesis,
+	)
+	if err != nil || control == nil {
+		t.Fatalf("install control=%v err=%v", control, err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("byte-identical install rewrote active seed: %v", err)
+	}
+	select {
+	case <-control.ShutdownRequired():
+		t.Fatalf("byte-identical install sealed authority: %v", control.TerminalError())
+	default:
+	}
+
+	next, err := NewSnapshotWithReplicatedMetadata(
+		current.config, current.endpoints, current.Generation()+1, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.Publish(context.Background(), current.Generation(), next); err != nil {
+		state, loadErr := LoadReplicatedCatalogRouteSeed(path)
+		_, pending := state.Pending()
+		t.Fatalf("publish=%v terminal=%v pending=%v load=%v", err, control.TerminalError(), pending, loadErr)
+	}
+	active, found := mustLoadReplicatedCatalogRouteSeedActive(t, path)
+	equal, compareErr := equalCatalogSnapshots(active, next)
+	if !found || compareErr != nil || !equal {
+		t.Fatalf("active found=%v equal=%v err=%v", found, equal, compareErr)
+	}
+	if authority.holder.Current().Generation() != next.Generation() {
+		t.Fatalf("holder generation=%d want=%d",
+			authority.holder.Current().Generation(), next.Generation())
+	}
+	select {
+	case <-control.ShutdownRequired():
+		t.Fatalf("same-route advance sealed authority: %v", control.TerminalError())
+	default:
+	}
+}
+
+func TestReplicatedCatalogRouteSeedTrackerStagesAndSignalsBeforeChangedHolder(t *testing.T) {
+	authority, _, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err := SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	control, err := authority.InstallReplicatedCatalogRouteSeed(
+		context.Background(), path, genesis,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err = authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, current.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = authority.PublishReplicaReplacement(
+		context.Background(), current.Generation(), next, grant,
+	)
+	if !errors.Is(err, ErrReplicatedCatalogRouteRestartRequired) {
+		t.Fatalf("binding-changing publication=%v", err)
+	}
+	select {
+	case <-control.ShutdownRequired():
+	default:
+		t.Fatal("changed route did not synchronously signal shutdown")
+	}
+	if authority.holder.Current().Generation() != current.Generation() {
+		t.Fatalf("changed head became visible before quiescence: generation=%d",
+			authority.holder.Current().Generation())
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, activeFound := state.Active()
+	pending, pendingFound := state.Pending()
+	activeEqual, activeErr := equalCatalogSnapshots(active, current)
+	pendingEqual, pendingErr := equalCatalogSnapshots(pending, next)
+	if !activeFound || !pendingFound || activeErr != nil || pendingErr != nil ||
+		!activeEqual || !pendingEqual {
+		t.Fatalf("staged handoff active=%v pending=%v equal=%v/%v errors=%v/%v",
+			activeFound, pendingFound, activeEqual, pendingEqual, activeErr, pendingErr)
+	}
+	if _, err = authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogRouteRestartRequired) {
+		t.Fatalf("sealed authority read=%v", err)
+	}
+}
+
+func TestReplicatedCatalogRouteSeedTrackerRefusesHolderPublishOnStageFailure(t *testing.T) {
+	authority, _, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err := SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	control, err := authority.InstallReplicatedCatalogRouteSeed(
+		context.Background(), path, genesis,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(path+replicatedCatalogRouteSeedCandidateSuffix, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewSnapshotWithReplicatedMetadata(
+		current.config, current.endpoints, current.Generation()+1, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.Publish(context.Background(), current.Generation(), next); err == nil {
+		t.Fatal("invalid pending entry did not fail closed")
+	}
+	select {
+	case <-control.ShutdownRequired():
+	default:
+		t.Fatal("route-seed durability failure did not signal shutdown")
+	}
+	if authority.holder.Current().Generation() != current.Generation() {
+		t.Fatal("uncertain local durability advanced holder")
+	}
+}
+
+func TestReplicatedCatalogRouteSeedLockedCheckRejectsPreauthorizedWaiter(t *testing.T) {
+	authority, _, genesis, current, _ := newRouteSeedCatalogAuthorityFixture(t)
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err := SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.InstallReplicatedCatalogRouteSeed(
+		context.Background(), path, genesis,
+	); err != nil {
+		t.Fatal(err)
+	}
+	authority.mu.Lock()
+	authorized := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		if _, err := authority.authorizedContext(context.Background()); err != nil {
+			done <- err
+			return
+		}
+		close(authorized)
+		authority.mu.Lock()
+		defer authority.mu.Unlock()
+		done <- authority.requireRouteSeedServingLocked()
+	}()
+	<-authorized
+	tracker := authority.routeSeed.Load()
+	if err := tracker.fail(ErrReplicatedCatalogRouteRestartRequired); !errors.Is(
+		err, ErrReplicatedCatalogRouteRestartRequired,
+	) {
+		t.Fatal(err)
+	}
+	authority.mu.Unlock()
+	if err := <-done; !errors.Is(err, ErrReplicatedCatalogRouteRestartRequired) {
+		t.Fatalf("preauthorized waiter crossed terminal lock=%v", err)
 	}
 }
 
@@ -1242,6 +1425,160 @@ func (client *catalogAuthorityClient) apply(command replication.CommandView) uin
 		}
 	}
 	return replicatedstate.ResultApplied
+}
+
+func newRouteSeedCatalogAuthorityFixture(t *testing.T) (
+	*ReplicatedCatalogAuthority,
+	*catalogAuthorityClient,
+	*Snapshot,
+	*Snapshot,
+	ReplicatedShardDescriptor,
+) {
+	t.Helper()
+	leaders := []distribution.EndpointID{"ep-a", "ep-c", "ep-d"}
+	manifest, err := distribution.NewManifest(
+		ReplicatedCatalogDistribution, 1, []distribution.Shard{{
+			ID: ReplicatedCatalogShard, AllocationGeneration: 1,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: leaders, Epoch: 1,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{
+			Name: ReplicatedCatalogDistribution, Arity: 1,
+			MapperVersion: distribution.NativeMapperVersion,
+		}},
+		Manifests: []*distribution.Manifest{manifest},
+	}
+	endpoints := map[distribution.EndpointID]string{
+		"ep-a": "127.0.0.1:7001", "ep-a-native": "127.0.0.1:7101",
+		"ep-a-control": "127.0.0.1:7201",
+		"ep-b":         "127.0.0.1:7002", "ep-b-native": "127.0.0.1:7102",
+		"ep-b-control": "127.0.0.1:7202",
+		"ep-c":         "127.0.0.1:7003", "ep-c-native": "127.0.0.1:7103",
+		"ep-c-control": "127.0.0.1:7203",
+		"ep-d":         "127.0.0.1:7004", "ep-d-native": "127.0.0.1:7104",
+		"ep-d-control": "127.0.0.1:7204",
+	}
+	group := raftmember.GroupKey{TopologyRecoveryEpoch: 11}
+	for ordinal := range group.ClusterID {
+		group.ClusterID[ordinal] = byte(ordinal + 1)
+		group.ClusterIncarnation[ordinal] = byte(ordinal + 21)
+		group.ShardIncarnation[ordinal] = byte(ordinal + 41)
+		group.GroupID[ordinal] = byte(ordinal + 61)
+	}
+	descriptor := ReplicatedShardDescriptor{
+		Distribution: ReplicatedCatalogDistribution, Shard: ReplicatedCatalogShard,
+		Group: group, AllocationGeneration: 1,
+		RangeIdentity: replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
+		ForwardingRuleDigest: replication.Digest{0x73},
+		RequestLedgerRanges: []DurableRequestLedgerRangeDescriptor{{
+			Identity: replication.Digest{0x91},
+		}},
+		Command: raftservice.CommandFence{
+			ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
+			OwnershipEpoch: 1, SchemaGeneration: 8,
+			RelationManifestDigest: [32]byte{9}, RoutingVersion: 1, RouteGeneration: 10,
+		},
+		Replicas: []ReplicatedReplicaDescriptor{
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21,
+				Endpoint: "ep-a", NativeEndpoint: "ep-a-native", ControlEndpoint: "ep-a-control"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22,
+				Endpoint: "ep-c", NativeEndpoint: "ep-c-native", ControlEndpoint: "ep-c-control"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23,
+				Endpoint: "ep-d", NativeEndpoint: "ep-d-native", ControlEndpoint: "ep-d-control"},
+		},
+	}
+	genesis, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 1, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err == nil {
+		genesis, err = initialCatalogState(genesis)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err == nil {
+		current, err = initialCatalogState(current)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var routeScratch [ServingReplicaCount]ReplicatedEndpoint
+	route, ok := current.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, routeScratch[:0],
+	)
+	if !ok {
+		t.Fatal("missing catalog self-route")
+	}
+	state := shardservice.ReplicatedMemberState{
+		Fence: shardservice.ReplicatedFence{
+			Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			MemberID: route.Replicas[0].Member, StoreID: route.Replicas[0].StoreID,
+			NodeIncarnation: route.Replicas[0].NodeIncarnation, Term: 1, Command: route.Command,
+		},
+		LeaderID: route.Replicas[0].Member, Commit: 1, Applied: 1, CheckpointApplied: 1,
+	}
+	topologyAuthority := serviceauthz.Authority{Generation: 9}
+	topologyAuthority.Node[0] = 0x71
+	client := &catalogAuthorityClient{
+		state: state, rows: make(map[string][]byte), wantAuthority: topologyAuthority,
+	}
+	currentHead, err := appendReplicatedCatalogDocument(nil, current, maxReplicatedCatalogBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(replicatedCatalogHeadKey[:])] = currentHead
+	witness, err := appendReplicatedCatalogHeadWitness(nil, current.Generation(), currentHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(replicatedCatalogHeadWitnessKey)] = witness
+	genesisHead, err := appendReplicatedCatalogDocument(nil, genesis, maxReplicatedCatalogBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesisProof, err := appendReplicatedCatalogGenesis(nil, genesisHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(replicatedCatalogGenesisKey)] = genesisProof
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: string(ReplicatedCatalogDistribution),
+		Shard: string(ReplicatedCatalogShard), Tenant: []byte("control-plane"),
+		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 4,
+		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(context.Background(), topologyAuthority)
+	if err == nil {
+		_, err = session.Open(ctx, 1<<50)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := NewReplicatedCatalogAuthority(ReplicatedCatalogAuthorityOptions{
+		Executor: executor, Route: route, Relation: 1, Holder: NewCatalogHolder(current),
+		Session: session, Authority: topologyAuthority,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authority, client, genesis, current, descriptor
 }
 
 func newCatalogAuthorityFixture(t *testing.T) (

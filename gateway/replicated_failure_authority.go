@@ -188,6 +188,9 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaHealthRevision(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
@@ -330,6 +333,9 @@ func (authority *ReplicatedCatalogAuthority) DeleteReplicaHealthRecord(
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
