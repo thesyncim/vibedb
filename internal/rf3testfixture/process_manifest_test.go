@@ -6,6 +6,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -21,7 +22,8 @@ func TestProcessMemberManifestIsCanonicalJSONWithColdEnrollment(t *testing.T) {
 		ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}}
 	controlRoot := filepath.Join(root, "shared-control")
 	options := ProcessMemberOptions{Root: root, ControlRoot: controlRoot, Identity: identity,
-		Key: raftstore.Key{ID: "rf3-command-key"},
+		Apply: sqldriver.ReplicatedApplyOptions{Placement: sqldriver.ReplicatedPlacementProfile{ShardKey: "/home"}},
+		Key:   raftstore.Key{ID: "rf3-command-key"},
 		WAL: raftstore.Options{MaxFileBytes: 1, MaxRecordBytes: 2, MaxRecords: 3,
 			MaxEntries: 4, MaxLiveBytes: 5}, Bootstrap: InitialBootstrap([]uint64{1, 2, 3}),
 		Listeners: ProcessListeners{Peer: "127.0.0.1:1", Native: "127.0.0.1:2",
@@ -68,6 +70,16 @@ func TestProcessMemberManifestIsCanonicalJSONWithColdEnrollment(t *testing.T) {
 	}
 	if got := processManifestTestText(t, childWAL, "key_material_path"); got != filepath.Join(controlRoot, "wal-key") {
 		t.Fatalf("split child WAL key=%q", got)
+	}
+	childApply, found := registry.Get("apply")
+	if !found || processManifestTestText(t, childApply, "shard_key") != "/home" {
+		t.Fatal("child apply lost role-specific canonical primary key")
+	}
+	for _, field := range []string{"request_ledger_capacity_bytes", "request_ledger_cleanup_reserve_bytes",
+		"request_ledger_range_start", "request_ledger_range_end", "request_ledger_range_identity"} {
+		if _, found := childApply.Get(field); !found {
+			t.Fatalf("child apply missing current grammar field %q", field)
+		}
 	}
 }
 

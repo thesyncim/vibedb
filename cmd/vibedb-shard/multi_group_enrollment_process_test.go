@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -78,11 +77,15 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 		bootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
 		bootstrap.Snapshot.Metadata.ConfState.Learners = []uint64{4}
 		prepared, prepareErr := rf3testfixture.PrepareProcessMember(rf3testfixture.ProcessMemberOptions{
-			Root: filepath.Join(root, name), Table: "docs", CreateTable: `CREATE TABLE docs (PRIMARY KEY (id))`,
+			Root: filepath.Join(root, name), ControlRoot: filepath.Join(root, "control"),
+			Table: gateway.ReplicatedCatalogTable, CreateTable: `CREATE TABLE controlplane (PRIMARY KEY (id))`,
 			Identity: identity, Key: key, WAL: walOptions, Bootstrap: bootstrap,
 			Authority: authority, Apply: apply, Listeners: addresses, Credential: credentials[0], Roots: roots,
 			AuthorizationPolicy: policyPath, Nodes: nodes, PeerAddresses: peerAddresses, Target: &target,
 		})
+		if info, statErr := os.Stat(filepath.Join(root, name, "split-runtime")); statErr != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Fatalf("private split-runtime namespace: info=%v err=%v", info, statErr)
+		}
 		if errors.Is(prepareErr, storeio.ErrStrictAllocationUnsupported) || errors.Is(prepareErr, raftstore.ErrPlatformUnsupported) {
 			t.Skipf("RF3 strict durable allocation unsupported: %v", prepareErr)
 		}
@@ -332,41 +335,68 @@ func closeRF3ProcessListeners(listeners []*net.TCPListener) {
 
 func combineRF3ProcessGroups(t testing.TB, paths ...string) []byte {
 	t.Helper()
-	groups := make([][]byte, 0, len(paths))
-	var common []byte
-	for index, path := range paths {
+	documents := make([][]byte, 0, len(paths))
+	for _, path := range paths {
 		document, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		listener := bytes.Index(document, []byte(`"listeners":`))
-		members := bytes.Index(document, []byte(`,"members":`))
-		if listener < 2 || members <= listener || document[listener-1] != ',' || document[len(document)-1] != '}' {
-			t.Fatalf("invalid singleton process manifest %q", path)
-		}
-		if index == 0 {
-			common = append([]byte(nil), document[listener:members]...)
-		}
-		group := make([]byte, 0, len(document))
-		group = append(group, '{')
-		group = append(group, document[1:listener-1]...)
-		group = append(group, ',')
-		group = append(group, document[members+1:len(document)-1]...)
-		group = append(group, '}')
-		groups = append(groups, group)
+		documents = append(documents, document)
 	}
-	result := make([]byte, 0, len(common)+len(groups[0])*len(groups)+32)
-	result = append(result, '{')
-	result = append(result, common...)
-	result = append(result, `,"groups":[`...)
-	for index, group := range groups {
-		if index != 0 {
-			result = append(result, ',')
-		}
-		result = append(result, group...)
+	result, err := rf3testfixture.CombineProcessManifests(documents...)
+	if err != nil {
+		t.Fatal(err)
 	}
-	result = append(result, ']', '}')
 	return result
+}
+
+func TestCombineRF3ProcessGroupsPreflightWithNestedMemberRoster(t *testing.T) {
+	// Both input manifests contain a child_registry.members before their
+	// top-level members. This must be structural composition, not byte slicing.
+	options := rf3testfixture.ProcessMemberOptions{
+		Root: "/srv/vibedb/first", ControlRoot: "/srv/vibedb/control",
+		Table: gateway.ReplicatedCatalogTable, CreateTable: `CREATE TABLE controlplane (PRIMARY KEY (id))`,
+		Identity: rf3CommandStoreIdentity(1), Key: raftstore.Key{ID: "fixture-key"},
+		WAL: raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+			MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
+		Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+		Apply: sqldriver.ReplicatedApplyOptions{Placement: sqldriver.ReplicatedPlacementProfile{
+			ShardKey: gateway.ReplicatedCatalogPrimaryKey}},
+		Listeners: rf3testfixture.ProcessListeners{Peer: "127.0.0.1:21001", Native: "127.0.0.1:22001",
+			Snapshot: "127.0.0.1:23001", Control: "127.0.0.1:24001"},
+		Credential: rf3testfixture.Credential{Certificate: "/cert", Key: "/key"},
+		Roots:      "/roots", AuthorizationPolicy: "/policy", Nodes: rf3CommandNodes(),
+		PeerAddresses: [3]string{"127.0.0.1:21001", "127.0.0.1:21002", "127.0.0.1:21003"},
+		Target: &rf3testfixture.ProcessTarget{MemberID: 4, NodeID: rafttransport.NodeID{0xd1},
+			StoreID: [16]byte{0xe1}, NodeIncarnation: 9,
+			Listeners: rf3testfixture.ProcessListeners{Peer: "127.0.0.1:21004", Native: "127.0.0.1:22004",
+				Snapshot: "127.0.0.1:23004", Control: "127.0.0.1:24004"}},
+	}
+	first := rf3testfixture.ProcessMemberManifest(options)
+	options.Root = "/srv/vibedb/second"
+	options.Identity.GroupID[0] ^= 0x40
+	options.Identity.ShardIncarnation[0] ^= 0x20
+	options.Identity.StoreID[0] ^= 0x10
+	options.Target.StoreID[0]++
+	second := rf3testfixture.ProcessMemberManifest(options)
+	paths := []string{filepath.Join(t.TempDir(), "first"), filepath.Join(t.TempDir(), "second")}
+	for index, raw := range [][]byte{first, second} {
+		if err := os.WriteFile(paths[index], raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest, err := parseRF3Manifest(combineRF3ProcessGroups(t, paths...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Groups) != 2 || manifest.SplitControl.ChildRegistry.MemberCount != 3 {
+		t.Fatalf("incomplete composite: groups=%d child members=%d", len(manifest.Groups), manifest.SplitControl.ChildRegistry.MemberCount)
+	}
+	for index, group := range manifest.Groups {
+		if group.EnrolledTarget == nil || group.EnrolledTarget.MemberID != 4 || group.MemberCount != 3 {
+			t.Fatalf("group %d lost enrolled target or voter roster: %+v", index, group)
+		}
+	}
 }
 
 func combineBootstrapRF3ProcessGroups(t testing.TB, paths ...string) []byte {

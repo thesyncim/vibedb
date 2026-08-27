@@ -11,8 +11,29 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	vibesql "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson"
 )
+
+const prepareRF3FixtureShardKey = "/id"
+
+func TestPrepareRF3FixturePlacementPreflight(t *testing.T) {
+	options, err := prepareRF3ApplyOptions(prepareRF3Apply{ShardKey: prepareRF3FixtureShardKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vibejson.Marshal(&options.Placement); err != nil {
+		t.Fatalf("canonical placement grammar: %v", err)
+	}
+	statement, err := vibesql.ParseStatement(`CREATE TABLE docs (PRIMARY KEY (id))`)
+	if err != nil || statement.CreateTable == nil || len(statement.CreateTable.PrimaryKey) != 1 {
+		t.Fatalf("fixture schema: %v", err)
+	}
+	segments := statement.CreateTable.PrimaryKey[0].Segments
+	if len(segments) != 1 || segments[0].IsIndex || options.Placement.ShardKey != "/"+segments[0].Key {
+		t.Fatalf("placement %q disagrees with primary key %+v", options.Placement.ShardKey, segments)
+	}
+}
 
 func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testing.T) {
 	parent := t.TempDir()
@@ -51,7 +72,7 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 		WAL:       prepareRF3WAL{KeyID: "test-key", KeyMaterialPath: keySource, WrappedKey: "opaque-test-key", MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
 		Apply: prepareRF3Apply{
 			MaxSessions: 32, RetryWindow: 8, MaxCollections: 16,
-			MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: "id",
+			MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: prepareRF3FixtureShardKey,
 			RequestLedgerCapacityBytes:       64 << 20,
 			RequestLedgerCleanupReserveBytes: 8 << 20,
 			RequestLedgerRangeStart:          idString(requestLedgerStart[:]),
