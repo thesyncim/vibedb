@@ -53,7 +53,26 @@ type persistedCatalogGenesis struct {
 type replicatedCatalogCut struct {
 	head     []byte
 	witness  []byte
+	genesis  []byte
 	snapshot *Snapshot
+}
+
+// ReplicatedCatalogSeedReceipt is an authority-bound proof that one exact
+// catalog head was obtained through a linearizable RF3 read, validated against
+// its head witness and immutable generation-one proof, and accepted by the
+// grant-aware catalog holder. Its private fields deliberately prevent callers
+// from turning an arbitrary Snapshot into durable route authority.
+type ReplicatedCatalogSeedReceipt struct {
+	authority  *ReplicatedCatalogAuthority
+	snapshot   *Snapshot
+	canonical  []byte
+	headBytes  uint64
+	headDigest [sha256.Size]byte
+}
+
+// Snapshot returns the immutable catalog image certified by this receipt.
+func (receipt ReplicatedCatalogSeedReceipt) Snapshot() *Snapshot {
+	return receipt.snapshot
 }
 
 // ReplicatedCatalogAuthority stores the catalog head and resumable controller
@@ -277,7 +296,45 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 		validateReplicatedCatalogHeadWitness(witnessResult.Value, snapshot.Generation(), result.Value) != nil {
 		return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
 	}
-	return replicatedCatalogCut{head: result.Value, witness: witnessResult.Value, snapshot: snapshot}, nil
+	return replicatedCatalogCut{
+		head: result.Value, witness: witnessResult.Value,
+		genesis: genesisResult.Value, snapshot: snapshot,
+	}, nil
+}
+
+// ReadAttested performs one certified catalog read and binds its exact head to
+// the immutable generation-one bootstrap image. The returned sealed receipt is
+// the only authority accepted by StageReplicatedCatalogRouteSeedAfter.
+func (authority *ReplicatedCatalogAuthority) ReadAttested(
+	ctx context.Context,
+	immutableGenesis *Snapshot,
+) (ReplicatedCatalogSeedReceipt, error) {
+	if authority == nil || ctx == nil || immutableGenesis == nil ||
+		immutableGenesis.Generation() != 1 {
+		return ReplicatedCatalogSeedReceipt{}, ErrReplicatedCatalog
+	}
+	cut, err := authority.readCatalogCut(ctx)
+	if err != nil {
+		return ReplicatedCatalogSeedReceipt{}, err
+	}
+	genesisHead, err := appendReplicatedCatalogDocument(
+		nil, immutableGenesis, maxReplicatedCatalogBytes,
+	)
+	if err != nil || validateReplicatedCatalogGenesis(cut.genesis, genesisHead) != nil {
+		return ReplicatedCatalogSeedReceipt{}, errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	snapshot, err := authority.publishReadCatalogCut(ctx, cut.snapshot, cut.head)
+	if err != nil {
+		return ReplicatedCatalogSeedReceipt{}, err
+	}
+	canonical, err := AppendSnapshotDocument(nil, snapshot)
+	if err != nil {
+		return ReplicatedCatalogSeedReceipt{}, err
+	}
+	return ReplicatedCatalogSeedReceipt{
+		authority: authority, snapshot: snapshot, canonical: canonical,
+		headBytes: uint64(len(cut.head)), headDigest: sha256.Sum256(cut.head),
+	}, nil
 }
 
 func (authority *ReplicatedCatalogAuthority) publishReadCatalogCut(

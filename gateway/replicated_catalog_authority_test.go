@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +35,254 @@ type catalogAuthorityClient struct {
 	wantAuthority     serviceauthz.Authority
 	readMaximums      []uint32
 	onRead            func([]byte)
+}
+
+func TestReplicatedCatalogAttestedRouteSeedReceiptStagesAndPromotes(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	genesis := testCatalogAuthoritySnapshot(t, 1)
+	receipt, err := authority.ReadAttested(context.Background(), genesis)
+	if err != nil || receipt.Snapshot() == nil ||
+		receipt.Snapshot().Generation() != current.Generation() {
+		t.Fatalf("attested receipt snapshot=%v err=%v", receipt.Snapshot(), err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(path, 0, receipt); err != nil {
+		t.Fatal(err)
+	}
+	// Byte-identical staging is the exact retry after an unknown local fsync.
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(path, 0, receipt); err != nil {
+		t.Fatalf("exact staged retry=%v", err)
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := state.Active(); found {
+		t.Fatal("pending candidate became active before promotion")
+	}
+	pending, found := state.Pending()
+	if !found || pending.Generation() != current.Generation() {
+		t.Fatalf("pending=%v found=%v", pending, found)
+	}
+	if err = state.PromotePending(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, found := state.Active()
+	if !found {
+		t.Fatal("promoted route seed is missing")
+	}
+	equal, compareErr := equalCatalogSnapshots(active, current)
+	if compareErr != nil || !equal {
+		t.Fatalf("promoted route seed mismatch equal=%v err=%v", equal, compareErr)
+	}
+	if _, found = state.Pending(); found {
+		t.Fatal("successful promotion retained its pending candidate")
+	}
+	// An exact current-generation retry is a disk-write-free success.
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(
+		path, current.Generation(), receipt,
+	); err != nil {
+		t.Fatalf("exact active retry=%v", err)
+	}
+}
+
+func TestReplicatedCatalogRouteSeedRejectsUnattestedForeignStaleAndDivergentCuts(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	genesis := testCatalogAuthoritySnapshot(t, 1)
+	divergentGenesis := testCatalogAuthoritySnapshot(t, 1)
+	divergentGenesis.endpoints["ep-a-native"] = "127.0.0.1:6553"
+	if _, err := authority.ReadAttested(
+		context.Background(), divergentGenesis,
+	); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("divergent immutable genesis attestation=%v", err)
+	}
+	receipt, err := authority.ReadAttested(context.Background(), genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	foreign := *authority
+	if err = foreign.StageReplicatedCatalogRouteSeedAfter(
+		path, 0, receipt,
+	); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("foreign authority staged receipt=%v", err)
+	}
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(
+		path, 0, ReplicatedCatalogSeedReceipt{},
+	); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("zero receipt staged=%v", err)
+	}
+
+	newer := testCatalogAuthoritySnapshot(t, current.Generation()+1)
+	if err = SaveSnapshot(path, newer); err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(
+		path, newer.Generation(), receipt,
+	); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("stale certified receipt=%v", err)
+	}
+
+	divergent := testCatalogAuthoritySnapshot(t, current.Generation())
+	divergent.endpoints["ep-a-native"] = "127.0.0.1:6554"
+	otherPath := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err = SaveSnapshot(otherPath, divergent); err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(
+		otherPath, current.Generation(), receipt,
+	); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("equal-generation divergent route seed=%v", err)
+	}
+	state, loadErr := LoadReplicatedCatalogRouteSeed(otherPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if _, found := state.Pending(); found {
+		t.Fatal("rejected receipt left a pending candidate")
+	}
+}
+
+func TestReplicatedCatalogRouteSeedPersistsCertifiedReplicaReplacement(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x91)
+	_, _, descriptor := testReplicatedCatalogInput(t)
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, current.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(
+		context.Background(), current.Generation(), next, grant,
+	); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := peer.ReadAttested(
+		context.Background(), testCatalogAuthoritySnapshot(t, 1),
+	)
+	if err != nil || receipt.Snapshot().Generation() != next.Generation() {
+		t.Fatalf("certified replacement receipt=%v err=%v", receipt.Snapshot(), err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err = SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	if err = SaveSnapshotAfter(path, current.Generation(), next); err == nil {
+		t.Fatal("generic local catalog CAS accepted receipt-only roster replacement")
+	}
+	if err = peer.StageReplicatedCatalogRouteSeedAfter(
+		path, current.Generation(), receipt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = state.PromotePending(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, found := state.Active()
+	equal, compareErr := equalCatalogSnapshots(active, next)
+	if !found || compareErr != nil || !equal {
+		t.Fatalf("certified route seed active=%v found=%v equal=%v err=%v",
+			active, found, equal, compareErr)
+	}
+}
+
+func TestReplicatedCatalogRouteSeedStagesNearMaximumCertifiedHead(t *testing.T) {
+	authority, client, _ := newCatalogAuthorityFixture(t)
+	large := testCatalogAuthoritySnapshot(t, 5)
+	baseHead, err := appendReplicatedCatalogDocument(
+		nil, large, maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := maxReplicatedCatalogBytes - len(baseHead) - (8 << 10)
+	if padding <= 0 {
+		t.Fatal("catalog fixture leaves no near-bound padding")
+	}
+	large.endpoints["route-seed-padding"] = strings.Repeat("x", padding)
+	head, err := appendReplicatedCatalogDocument(nil, large, maxReplicatedCatalogBytes)
+	if err != nil || len(head) < maxReplicatedCatalogBytes-(9<<10) {
+		t.Fatalf("near-bound head bytes=%d maximum=%d err=%v",
+			len(head), maxReplicatedCatalogBytes, err)
+	}
+	witness, err := appendReplicatedCatalogHeadWitness(nil, large.Generation(), head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(replicatedCatalogHeadKey[:])] = head
+	client.rows[string(replicatedCatalogHeadWitnessKey)] = witness
+	peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(nil), 0x92)
+	receipt, err := peer.ReadAttested(
+		context.Background(), testCatalogAuthoritySnapshot(t, 1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err = peer.StageReplicatedCatalogRouteSeedAfter(path, 0, receipt); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = state.PromotePending(); err != nil {
+		t.Fatal(err)
+	}
+	active, found := mustLoadReplicatedCatalogRouteSeedActive(t, path)
+	equal, compareErr := equalCatalogSnapshots(active, large)
+	if !found || compareErr != nil || !equal {
+		t.Fatalf("near-bound active found=%v equal=%v err=%v", found, equal, compareErr)
+	}
+}
+
+func TestReplicatedCatalogRouteSeedRejectsActivePendingAlias(t *testing.T) {
+	authority, _, _ := newCatalogAuthorityFixture(t)
+	receipt, err := authority.ReadAttested(
+		context.Background(), testCatalogAuthoritySnapshot(t, 1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err = authority.StageReplicatedCatalogRouteSeedAfter(path, 0, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Link(path+replicatedCatalogRouteSeedCandidateSuffix, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = LoadReplicatedCatalogRouteSeed(path); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("active/pending hard-link alias=%v", err)
+	}
+}
+
+func mustLoadReplicatedCatalogRouteSeedActive(
+	t testing.TB,
+	path string,
+) (*Snapshot, bool) {
+	t.Helper()
+	state, err := LoadReplicatedCatalogRouteSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state.Active()
 }
 
 func TestReplicatedMembershipGrantCatalogWitnessClosesStaleInterleaving(t *testing.T) {
