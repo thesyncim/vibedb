@@ -94,8 +94,58 @@ func TestServeRequestWireBoundsAndMalformedInputs(t *testing.T) {
 	if many.Len() >= maxServeRequestBytes {
 		t.Fatalf("statement-bound fixture unexpectedly exceeds frame: %d", many.Len())
 	}
+	if err := decodeServeRequest([]byte(many.String()), &request, &scratch); err != nil {
+		t.Fatalf("per-participant statement limit leaked into distributed envelope: %v", err)
+	}
+	if len(request.Statements) != shardservice.MaxMutationStatements+1 {
+		t.Fatalf("decoded %d distributed statements", len(request.Statements))
+	}
+
+	many.Reset()
+	many.WriteString(`{"statements":[`)
+	for index := 0; index <= maxServeDecodeMetadataBytes/serveStatementMetadataBytes; index++ {
+		if index != 0 {
+			many.WriteByte(',')
+		}
+		many.WriteString(`{}`)
+	}
+	many.WriteString(`]}`)
+	if many.Len() >= maxServeRequestBytes {
+		t.Fatalf("metadata-bound fixture exceeds frame: %d", many.Len())
+	}
 	if err := decodeServeRequest([]byte(many.String()), &request, &scratch); err == nil {
-		t.Fatal("accepted more than MaxMutationStatements")
+		t.Fatal("accepted decode metadata exceeding request-memory budget")
+	}
+	if scratch.metadataBytes > maxServeDecodeMetadataBytes {
+		t.Fatal("decoder exceeded metadata budget before rejecting request")
+	}
+}
+
+func TestServeRequestWireDuplicateKindUsesLastValue(t *testing.T) {
+	for _, fields := range []string{
+		`"kind":"string","kind":"bogus"`,
+		`"kind":"number","kind":""`,
+	} {
+		var request serveRequest
+		var scratch serveRequestDecodeScratch
+		raw := []byte(`{"params":[{` + fields + `,"text":"7"}]}`)
+		if err := decodeServeRequest(raw, &request, &scratch); err != nil {
+			t.Fatal(err)
+		}
+		if request.Params[0].wireKind != 0 {
+			t.Fatal("duplicate kind retained stale enum")
+		}
+		if _, err := buildParams(request.Params); err == nil {
+			t.Fatal("unknown final kind accepted")
+		}
+	}
+	var request serveRequest
+	var scratch serveRequestDecodeScratch
+	if err := decodeServeRequest([]byte(`{"params":[{"kind":"bogus","kind":"string","text":"ok"}]}`), &request, &scratch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildParams(request.Params); err != nil {
+		t.Fatalf("recognized final kind rejected: %v", err)
 	}
 }
 
@@ -119,6 +169,24 @@ func TestDurableExecBatchWireSinglePassIdentityAndStatements(t *testing.T) {
 	})
 	if allocations != 0 {
 		t.Fatalf("steady structured decode allocations = %.2f, want 0", allocations)
+	}
+	// The public strict path must admit a distributed batch larger than one
+	// participant's mutation limit; participant routing enforces that limit
+	// after the envelope has been decoded.
+	start := bytes.Index(raw, []byte(`"statements":[`)) + len(`"statements":[`)
+	large := append([]byte(nil), raw[:start]...)
+	for index := 0; index <= shardservice.MaxMutationStatements; index++ {
+		if index != 0 {
+			large = append(large, ',')
+		}
+		large = append(large, `{"sql":"DELETE FROM docs WHERE id = 1"}`...)
+	}
+	large = append(large, ']', '}')
+	if err := decodeDurableExecBatchRequest(large, &request, &scratch); err != nil {
+		t.Fatalf("strict distributed batch rejected by participant ceiling: %v", err)
+	}
+	if len(request.Statements) != shardservice.MaxMutationStatements+1 {
+		t.Fatal("lost distributed statements")
 	}
 }
 

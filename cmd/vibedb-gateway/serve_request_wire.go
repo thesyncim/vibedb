@@ -4,13 +4,20 @@ import (
 	"errors"
 	"unsafe"
 
-	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
 var errInvalidServeRequest = errors.New("gateway: invalid serving request")
 
 const maxServeWireParams = 1 << 16
+
+// Metadata admission is a request-memory budget, not a shard/participant or
+// statement-count limit. Charge conservatively for slice growth and the
+// temporary parameter decode slice as well as the retained per-request slices.
+const maxServeDecodeMetadataBytes = 8 << 20
+
+const serveStatementMetadataBytes = 2 * (int(unsafe.Sizeof(serveStatement{})) + 2*4)
+const serveParamMetadataBytes = 4 * int(unsafe.Sizeof(serveParam{}))
 
 type serveParamKind uint8
 
@@ -24,7 +31,7 @@ const (
 
 // serveRequestDecodeScratch is owned by one client connection. Its capacities
 // are reused across requests and are bounded by the one-megabyte frame, the
-// state-machine statement bound, and the shard codec parameter bound. Borrowed
+// explicit decode-metadata budget, and the shard codec parameter bound. Borrowed
 // source spans remain valid until the next Scanner.Scan, after synchronous
 // execution and response emission have completed.
 type serveRequestDecodeScratch struct {
@@ -36,6 +43,7 @@ type serveRequestDecodeScratch struct {
 	paramStarts     []uint32
 	paramCounts     []uint32
 	decodedParams   int
+	metadataBytes   int
 	target          serveRequestDecodeTarget
 	durableTarget   durableExecBatchEnvelope
 }
@@ -90,6 +98,7 @@ func resetServeRequestScratch(scratch *serveRequestDecodeScratch, sourceBytes in
 	scratch.paramStarts = scratch.paramStarts[:0]
 	scratch.paramCounts = scratch.paramCounts[:0]
 	scratch.decodedParams = 0
+	scratch.metadataBytes = 0
 }
 
 func (target *serveRequestDecodeTarget) UnmarshalVibeJSON(
@@ -216,7 +225,7 @@ func decodeServeStatements(cursor vibejson.DecodeCursor, request *serveRequest,
 		if !more {
 			break
 		}
-		if len(scratch.statements) >= shardservice.MaxMutationStatements {
+		if !scratch.reserveMetadata(serveStatementMetadataBytes) {
 			return cursor, errInvalidServeRequest
 		}
 		scratch.statements = append(scratch.statements, serveStatement{})
@@ -288,7 +297,7 @@ func decodeServeParams(cursor vibejson.DecodeCursor, scratch *serveRequestDecode
 		if !more {
 			break
 		}
-		if scratch.decodedParams >= maxServeWireParams {
+		if scratch.decodedParams >= maxServeWireParams || !scratch.reserveMetadata(serveParamMetadataBytes) {
 			return cursor, errInvalidServeRequest
 		}
 		scratch.decodedParams++
@@ -392,6 +401,9 @@ func setServeOperation(request *serveRequest, value []byte) bool {
 }
 
 func setServeParamKind(parameter *serveParam, value []byte) bool {
+	// Generic envelope fields have last-value-wins semantics. A duplicate
+	// unknown kind must clear an earlier recognized enum before buildParams.
+	parameter.wireKind = 0
 	switch string(value) {
 	case "null":
 		parameter.wireKind, parameter.Kind = serveParamNull, "null"
@@ -406,6 +418,14 @@ func setServeParamKind(parameter *serveParam, value []byte) bool {
 	default:
 		parameter.Kind = serveBorrowedString(value)
 	}
+	return true
+}
+
+func (scratch *serveRequestDecodeScratch) reserveMetadata(bytes int) bool {
+	if bytes < 0 || bytes > maxServeDecodeMetadataBytes-scratch.metadataBytes {
+		return false
+	}
+	scratch.metadataBytes += bytes
 	return true
 }
 
