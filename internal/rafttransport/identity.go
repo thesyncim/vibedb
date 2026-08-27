@@ -216,12 +216,28 @@ type PeerTLSOptions struct {
 // PeerTLS constructs mutually authenticated TLS configurations and derives the
 // complete peer identity after a completed handshake.
 type PeerTLS struct {
-	identityOID asn1.ObjectIdentifier
-	identity    PeerIdentity
-	certificate tls.Certificate
-	roots       *x509.CertPool
-	now         func() time.Time
-	build       buildgate.Profile
+	identityOID   asn1.ObjectIdentifier
+	identity      PeerIdentity
+	certificate   tls.Certificate
+	roots         *x509.CertPool
+	now           func() time.Time
+	build         buildgate.Profile
+	localServices bool
+}
+
+// WithLocalServiceConnections returns an immutable profile copy permitting
+// authenticated RPCs to services hosted by this same node. Split controllers
+// and colocated child groups need native, artifact, and control calls to their
+// own listeners. This never permits an ordinary Raft stream to loop back, and
+// does not bypass certificate, exact peer, build, or service authorization.
+// The original profile continues to reject every self connection.
+func (peerTLS *PeerTLS) WithLocalServiceConnections() *PeerTLS {
+	if peerTLS == nil {
+		return nil
+	}
+	clone := *peerTLS
+	clone.localServices = true
+	return &clone
 }
 
 // LocalIdentity returns the exact certificate-bound identity authenticated by
@@ -441,7 +457,9 @@ func (peerTLS *PeerTLS) verifyConnection(
 	if err != nil {
 		return err
 	}
-	if identity.Node == peerTLS.identity.Node {
+	localService := peerTLS.localServices &&
+		(class == TrafficShardNative || class == TrafficSnapshot || class == TrafficShardControl)
+	if identity.Node == peerTLS.identity.Node && !localService {
 		return ErrWrongPeer
 	}
 	if expected != (NodeID{}) && identity.Node != expected {

@@ -163,6 +163,11 @@ func exactPreparedChildRoute(
 		if peerErr != nil || nativeErr != nil || controlErr != nil {
 			return gateway.ReplicatedRoute{}, errors.Join(ErrShardControlRoute, peerErr, nativeErr, controlErr)
 		}
+		if !validChildReplicaAddresses(replica) ||
+			((replica.PeerAddress != "" || replica.NativeAddress != "" || replica.ControlAddress != "") &&
+				(replica.PeerAddress != peerAddress || replica.NativeAddress != nativeAddress || replica.ControlAddress != controlAddress)) {
+			return gateway.ReplicatedRoute{}, ErrShardControlRoute
+		}
 		replicas[index] = gateway.ReplicatedEndpoint{
 			Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
 			NodeIncarnation: replica.NodeIncarnation,

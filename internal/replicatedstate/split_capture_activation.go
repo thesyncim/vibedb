@@ -108,14 +108,18 @@ func (m *Machine) planSplitCaptureActivation(plan commandPlan, command replicati
 			return commandPlan{}, openErr
 		}
 		if existing.Command.Operation != c.Operation || existing.Command.PlanDigest != c.PlanDigest || existing.Command.PartitionerDigest != c.PartitionerDigest || existing.Command.RelationManifestDigest != c.RelationManifestDigest || existing.Command.LineageDigest != c.LineageDigest || !bytes.Equal(existing.Command.Spec, c.Spec) {
-			plan.conflict = true
+			plan.resultCode = ResultIndexConflict
 			return plan, nil
 		}
 		plan.resultCode = ResultApplied
 		return plan, nil
 	}
 	if c.PriorApplied != state.Applied || c.PriorTerm != state.LastTerm || c.PriorEntryDigest != state.LastEntryDigest || c.PriorDataChainDigest != state.DataChainDigest || c.SourceGeneration != state.Binding.RouteGeneration || c.SchemaGeneration != state.Binding.SchemaGeneration || c.BindingDigest != SplitCaptureBindingDigest(state.Binding) {
-		return commandPlan{}, ErrSplitCaptureActivation
+		// Ordinary writes may win the race between observing a cut and ordered
+		// proposal. Settle a retryable refusal without activating capture or
+		// poisoning the state machine; never accept a different prior cut.
+		plan.resultCode = ResultStaleFence
+		return plan, nil
 	}
 	value, err := appendSplitCaptureActivation(nil, applied, command.SplitCaptureActivationBytes())
 	if err != nil {

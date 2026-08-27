@@ -56,11 +56,14 @@ func (a *LocalSourceActions) ExecuteActivateCapture(
 	if placementErr != nil || closeErr != nil {
 		return nil, errors.Join(placementErr, closeErr)
 	}
-	if !sameSplitCut(state, cutState) ||
+	if !captureCutAdvancesWithinAuthority(state, cutState) ||
 		!sourceServingStateMatches(state, serving, manifest) {
 		return nil, ErrTopologyConflict
 	}
-	body, err := plan.AppendSourceCaptureActivation(nil, state)
+	// The control session's Open is itself a Raft entry. Freeze the coherent
+	// cut after it, not the gateway observation that preceded opening it. The
+	// replicated activation still compares every prior-cut digest at apply.
+	body, err := plan.AppendSourceCaptureActivation(nil, cutState)
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +73,14 @@ func (a *LocalSourceActions) ExecuteActivateCapture(
 		return nil, err
 	}
 	return a.ExecuteStartCapture(plan)
+}
+
+func captureCutAdvancesWithinAuthority(observed, current replicatedstate.State) bool {
+	if current.Binding != observed.Binding || current.ReplicaSetVersion != observed.ReplicaSetVersion ||
+		current.Applied < observed.Applied || current.LastTerm < observed.LastTerm {
+		return false
+	}
+	return current.Applied > observed.Applied || sameSplitCut(observed, current)
 }
 
 type splitSourceRuntime interface {

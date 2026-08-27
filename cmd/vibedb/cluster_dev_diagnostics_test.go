@@ -203,7 +203,7 @@ func TestDevSupervisorStopsChildrenAppendedAfterDeferredCleanup(t *testing.T) {
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		result <- serveDevCluster(ctx, m, binary, "unused")
+		result <- serveDevCluster(ctx, m, binary, "unused", nil)
 	}()
 	t.Cleanup(func() {
 		cancel()

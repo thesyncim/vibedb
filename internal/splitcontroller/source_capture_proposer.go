@@ -77,14 +77,18 @@ func (p *RF3SourceCaptureActivationProposer) ProposeSourceCaptureActivation(
 	var err error
 	if p.session.Status().Pending {
 		pending, pendingErr := replication.OpenCommand(p.session.PendingCommand())
+		pendingCapture, captureErr := pending.OpenSplitCaptureActivation()
 		if pendingErr != nil || pending.Kind() != replication.CommandSplitCaptureActivate ||
+			captureErr != nil || !sameSourceCaptureAuthority(pendingCapture.Command, view.Command) ||
 			pending.AuthorityClass != replication.CommandAuthorityTopology ||
 			!gateway.NativeSessionMatchesControlBinding(
 				p.session, fence, p.tenant, p.clientID, 1,
 				serviceauthz.CapabilityTopology,
-			) || !bytes.Equal(pending.SplitCaptureActivationBytes(), body) {
-			return errors.Join(ErrInvalidPlan, pendingErr, gateway.ErrNativeCommandPending)
+			) {
+			return errors.Join(ErrInvalidPlan, pendingErr, captureErr, gateway.ErrNativeCommandPending)
 		}
+		// The journal's exact bytes own an outcome-unknown proposal. A newer
+		// coherent observation must not substitute its cut into that retry.
 		result, err = p.session.RetryPending(ctx)
 	} else {
 		result, err = p.session.SplitCaptureActivate(ctx, body)
@@ -97,6 +101,14 @@ func (p *RF3SourceCaptureActivationProposer) ProposeSourceCaptureActivation(
 		return ErrTopologyConflict
 	}
 	return nil
+}
+
+func sameSourceCaptureAuthority(left, right splitcapture.Command) bool {
+	return left.Operation == right.Operation && left.PlanDigest == right.PlanDigest &&
+		left.PartitionerDigest == right.PartitionerDigest && left.RelationManifestDigest == right.RelationManifestDigest &&
+		left.LineageDigest == right.LineageDigest && left.BindingDigest == right.BindingDigest &&
+		left.SourceGeneration == right.SourceGeneration && left.SchemaGeneration == right.SchemaGeneration &&
+		bytes.Equal(left.Spec, right.Spec)
 }
 
 var _ SourceCaptureActivationProposer = (*RF3SourceCaptureActivationProposer)(nil)

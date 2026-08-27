@@ -353,6 +353,7 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return fmt.Errorf("%w: TLS profile: %v", errRF3Serving, err)
 	}
+	profile = profile.WithLocalServiceConnections()
 	policy, err := serviceauthz.LoadFile(manifest.AuthorizationPolicy)
 	if err != nil {
 		return fmt.Errorf("%w: authorization policy: %v", errRF3Serving, err)

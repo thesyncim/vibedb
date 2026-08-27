@@ -118,11 +118,15 @@ func (preparer *rf3ChildPreparer) PrepareChild(
 func (preparer *rf3ChildPreparer) matchesLocalTarget(
 	target splitcontroller.ChildReplicaTarget, paths rf3SplitChildPaths,
 ) bool {
+	peer, native, control := target.PeerAddress, target.NativeAddress, target.ControlAddress
+	if peer == "" && native == "" && control == "" {
+		peer, native, control = string(target.Endpoint), string(target.NativeEndpoint), string(target.ControlEndpoint)
+	}
 	if target.Node != preparer.local || target.RuntimeRoot != paths.Root ||
 		target.SQLPath != paths.Database || target.WALPath != paths.WAL ||
-		string(target.Endpoint) != preparer.peer || string(target.ControlEndpoint) != preparer.control ||
+		peer != preparer.peer || control != preparer.control ||
 		target.SnapshotAddress != preparer.snapshot ||
-		(preparer.native == "" || string(target.NativeEndpoint) != preparer.native) ||
+		(preparer.native == "" || native != preparer.native) ||
 		target.WAL.MemberID != target.Member || target.WAL.StoreID != target.StoreID ||
 		target.SQL.Binding.MemberID != target.Member || target.SQL.Binding.StoreID != target.StoreID ||
 		!rf3SplitChildTemplateMatchesRetained(preparer.registry.template, target.SQL, target.Apply) {

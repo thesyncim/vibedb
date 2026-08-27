@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"github.com/thesyncim/vibedb/autosplit"
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -12,7 +13,12 @@ import (
 type PressureObservation struct {
 	Source       autosplit.SourceIdentity
 	AccessScopes []distributedtxn.IntentScope
-	Write        bool
+	// Native point reads already resolved their exact placement. Keeping that
+	// fixed-width point avoids allocating a one-element scope slice per sample.
+	// HasPoint and AccessScopes are mutually exclusive.
+	Point    distribution.KeyspacePoint
+	HasPoint bool
+	Write    bool
 }
 
 // PressureObserver receives routed demand after every topology and ownership

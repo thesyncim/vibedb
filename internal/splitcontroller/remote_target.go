@@ -155,6 +155,8 @@ func targetMatchesPreparedReplica(target ChildTarget, replica ChildReplicaTarget
 			prepared.StoreID == replica.StoreID && prepared.NodeIncarnation == replica.NodeIncarnation &&
 			prepared.Endpoint == replica.Endpoint && prepared.NativeEndpoint == replica.NativeEndpoint &&
 			prepared.ControlEndpoint == replica.ControlEndpoint && prepared.SnapshotAddress == replica.SnapshotAddress &&
+			prepared.PeerAddress == replica.PeerAddress && prepared.NativeAddress == replica.NativeAddress &&
+			prepared.ControlAddress == replica.ControlAddress &&
 			prepared.WAL == replica.WAL &&
 			prepared.WALPath == replica.WALPath && prepared.SQLPath == replica.SQLPath &&
 			prepared.RuntimeRoot == replica.RuntimeRoot && prepared.SQL.Equal(replica.SQL) &&

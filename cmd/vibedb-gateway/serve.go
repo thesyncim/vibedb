@@ -519,7 +519,8 @@ func runServe(args []string) (exitCode int) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 			}, manifest.Shards, int(manifest.Bounds.MaxConnections),
 		)
-		distributedMetrics, metricsErr := newGatewayDistributedMetrics(holder.Current(), shardOpener)
+		var metricsErr error
+		distributedMetrics, metricsErr = newGatewayDistributedMetrics(holder.Current(), shardOpener)
 		if distributedMetrics != nil {
 			distributedMetricsConcurrency = min(distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
 		}
@@ -530,7 +531,8 @@ func runServe(args []string) (exitCode int) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 			}, manifest.Gateways, int(manifest.Bounds.MaxConcurrentDrains),
 		)
-		splitRuntime, splitErr := newGatewayServingSplitRuntime(gatewayServingSplitOptions{
+		var splitErr error
+		splitRuntime, splitErr = newGatewayServingSplitRuntime(gatewayServingSplitOptions{
 			catalog: catalogAuthority, drain: drainer, opener: shardOpener, tls: tlsProfile,
 			shards: manifest.Shards,
 			dial: func(ctx context.Context, address string) (net.Conn, error) {
@@ -732,10 +734,7 @@ func runServe(args []string) (exitCode int) {
 	var replicaControlErr error
 	if replicaControlDone != nil {
 		stop()
-		if controlErr := <-replicaControlDone; controlErr != nil &&
-			!errors.Is(controlErr, context.Canceled) {
-			replicaControlErr = controlErr
-		}
+		replicaControlErr = nonCanceledError(<-replicaControlDone, context.Cause(ctx))
 	}
 	if replicaControllersDone != nil {
 		stop()

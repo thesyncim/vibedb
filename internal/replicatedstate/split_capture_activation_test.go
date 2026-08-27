@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -37,6 +38,10 @@ func TestSplitCaptureActivationExactReplayAndDivergence(t *testing.T) {
 	command.Fingerprint = sha256.Sum256([]byte("activate"))
 	if _, err = f.machine.ApplyNormal(normalMeta(4), encodeCommand(t, command)); err != nil {
 		t.Fatal(err)
+	}
+	completion, _, _ := openMutationCompletion(t, f.machine, encodeCommand(t, command))
+	if completion.ResultCode != ResultApplied || completion.AppliedSequence != 4 {
+		t.Fatalf("capture activation did not retain its exact completion: %+v", completion)
 	}
 	witness, ok := f.machine.SplitCaptureActivation()
 	if !ok || witness.Applied != 4 || !bytes.Equal(witness.Command.Spec, nested.Spec) || captures != 1 || active == nil {
@@ -81,5 +86,66 @@ func TestSplitCaptureActivationExactReplayAndDivergence(t *testing.T) {
 	}
 	if _, err = reopened.ApplyNormal(normalMeta(7), nil); err != nil || recovered.current != 7 {
 		t.Fatalf("post-reopen apply capture=%d err=%v", recovered.current, err)
+	}
+}
+
+func TestSplitCaptureActivationStaleCutSettlesWithoutPoisoning(t *testing.T) {
+	f := newCapturedRelationBundleFixture(t)
+	captures := 0
+	f.machine.options.TransitionCaptureFactory = func(SplitCaptureActivation) (TransitionCapture, error) {
+		captures++
+		return &sessionLeaseCapture{target: TransitionCaptureTarget{Name: TransitionCaptureCollectionName, Collection: f.capture.Collection}}, nil
+	}
+	prototype := commandValue(f.binding, 1)
+	prototype.AuthorityClass, prototype.ClientID = replication.CommandAuthorityTopology, id128(99)
+	_, _, epoch := applySessionOpen(t, f.machine, 3, prototype)
+	state := cloneState(f.machine.state)
+	nested := splitcapture.Command{Operation: [32]byte{1}, PlanDigest: [32]byte{2}, PartitionerDigest: [32]byte{3}, RelationManifestDigest: [32]byte{4}, LineageDigest: [32]byte{5}, BindingDigest: SplitCaptureBindingDigest(state.Binding), PriorEntryDigest: state.LastEntryDigest, PriorDataChainDigest: state.DataChainDigest, PriorApplied: state.Applied, PriorTerm: state.LastTerm, SourceGeneration: state.Binding.RouteGeneration, SchemaGeneration: state.Binding.SchemaGeneration, Spec: []byte("portable")}
+	command := prototype
+	command.Kind, command.ClientEpoch, command.ClientSequence = replication.CommandSplitCaptureActivate, epoch, 2
+	command.Batches = nil
+	command.SplitCaptureActivation, _ = splitcapture.AppendCommand(nil, nested)
+	command.Fingerprint = sha256.Sum256([]byte("stale-capture"))
+	raw := encodeCommand(t, command)
+	if err := f.machine.AdmitCommand(raw); err != nil {
+		t.Fatal(err)
+	}
+	// An already-admitted proposal can be overtaken by another committed entry.
+	if _, err := f.machine.ApplyNormal(normalMeta(4), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.machine.AdmitCommand(raw); !errors.Is(err, ErrStaleCommand) {
+		t.Fatalf("stale cut admission=%v", err)
+	}
+	if _, err := f.machine.ApplyNormal(normalMeta(5), raw); err != nil {
+		t.Fatalf("stale capture poisoned apply: %v", err)
+	}
+	completion, _, before := openMutationCompletion(t, f.machine, raw)
+	if completion.ResultCode != ResultStaleFence || completion.AppliedSequence != 5 || captures != 0 {
+		t.Fatalf("stale capture outcome=%+v captures=%d", completion, captures)
+	}
+	if _, found := f.machine.SplitCaptureActivation(); found {
+		t.Fatal("stale cut activated capture")
+	}
+	if _, err := f.machine.ApplyNormal(normalMeta(6), raw); err != nil {
+		t.Fatal(err)
+	}
+	_, _, after := openMutationCompletion(t, f.machine, raw)
+	if !bytes.Equal(before, after) {
+		t.Fatal("stale completion changed on exact retry")
+	}
+	state = cloneState(f.machine.state)
+	nested.PriorApplied, nested.PriorTerm = state.Applied, state.LastTerm
+	nested.PriorEntryDigest, nested.PriorDataChainDigest = state.LastEntryDigest, state.DataChainDigest
+	command.ClientSequence, command.AckThrough = 3, 2
+	command.SplitCaptureActivation, _ = splitcapture.AppendCommand(nil, nested)
+	command.Fingerprint = sha256.Sum256([]byte("fresh-capture"))
+	raw = encodeCommand(t, command)
+	if _, err := f.machine.ApplyNormal(normalMeta(7), raw); err != nil {
+		t.Fatal(err)
+	}
+	completion, _, _ = openMutationCompletion(t, f.machine, raw)
+	if completion.ResultCode != ResultApplied || completion.AppliedSequence != 7 || captures != 1 {
+		t.Fatalf("fresh capture after refusal=%+v captures=%d", completion, captures)
 	}
 }

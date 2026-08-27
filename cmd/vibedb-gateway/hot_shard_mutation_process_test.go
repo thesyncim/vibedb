@@ -679,9 +679,25 @@ func hotMutationWaitSplitComplete(
 ) *gateway.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)
+	var lastGeneration uint64
+	var lastRecord gateway.ReplicatedOperationRecord
+	var lastReadErr, lastOperationErr error
+	progressReports := 0
 	for time.Now().Before(deadline) {
 		snapshot, err := authority.Read(ctx)
-		_, operationErr := authority.ReadOperation(ctx, operation)
+		record, operationErr := authority.ReadOperation(ctx, operation)
+		lastReadErr, lastOperationErr = err, operationErr
+		if snapshot != nil {
+			lastGeneration = snapshot.Generation()
+		}
+		if operationErr == nil {
+			if progressReports < 64 && (lastRecord.State != record.State || lastRecord.Cursor != record.Cursor) {
+				t.Logf("split progress: generation=%d state=%d revision=%d cursor=%v",
+					lastGeneration, record.State, record.Revision, record.Cursor)
+				progressReports++
+			}
+			lastRecord = record
+		}
 		if err == nil && snapshot.Generation() >= generation &&
 			errors.Is(operationErr, gateway.ErrReplicatedOperationMissing) {
 			var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
@@ -697,7 +713,8 @@ func hotMutationWaitSplitComplete(
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatal("split did not publish, prune, retire, and collect its operation")
+	t.Fatalf("split did not publish, prune, retire, and collect its operation: generation=%d state=%d revision=%d cursor=%v read_error=%v operation_error=%v",
+		lastGeneration, lastRecord.State, lastRecord.Revision, lastRecord.Cursor, lastReadErr, lastOperationErr)
 	return nil
 }
 

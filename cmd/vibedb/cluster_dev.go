@@ -315,6 +315,7 @@ func runClusterDev(args []string) int {
 	nodes := fs.Int("nodes", 0, "deprecated alias for --replicas")
 	shardBinary := fs.String("shard-binary", "", "vibedb-shard executable; defaults beside vibedb or PATH")
 	gatewayBinary := fs.String("gateway-binary", "", "vibedb-gateway executable; defaults beside vibedb or PATH")
+	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *root == "" {
 		usage()
 		return 2
@@ -365,7 +366,11 @@ func runClusterDev(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := serveDevCluster(ctx, manifest, shard, gw); err != nil {
+	var diagnostics io.Writer
+	if *diagnosticsOnExit {
+		diagnostics = os.Stderr
+	}
+	if err := serveDevCluster(ctx, manifest, shard, gw, diagnostics); err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
 	}
@@ -525,7 +530,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		if role.requestLedger {
 			apply = devPrepareApplyProfile(role.shardKey, ledgerHomeIdentity)
 		}
-		splitControl := devPrepareSplitControlProfile(role.prepareMembers)
+		splitControl := devPrepareSplitControlProfile(role.prepareMembers, m.GatewayNode)
 		for i := 0; i < options.replicas; i++ {
 			base := 1 + roleIndex*options.replicas*4 + i*4
 			memberRoot := filepath.Join(options.root, fmt.Sprintf("%s-member-%d", role.name, i+1))
@@ -583,15 +588,18 @@ func devPrepareApplyProfile(
 	return result
 }
 
-func devPrepareSplitControlProfile(members []devPrepareMember) devPrepareSplitControl {
+func devPrepareSplitControlProfile(members []devPrepareMember, gatewayNode string) devPrepareSplitControl {
 	result := devPrepareSplitControl{
 		MaxRecords: 4096, MaxFileBytes: 64 << 20,
 		MaxChildOperations: 8, StageCheckpointBytes: 32 << 20,
-		Grants: make([]devPrepareActionGrant, len(members)),
+		Grants: make([]devPrepareActionGrant, len(members)+1),
 	}
 	for index, member := range members {
 		result.Grants[index] = devPrepareActionGrant{NodeID: member.NodeID, Actions: ^uint16(0)}
 	}
+	// The gateway owns reconciliation and submits the fenced actions. TLS and
+	// the broad service policy do not replace this exact node/action grant.
+	result.Grants[len(members)] = devPrepareActionGrant{NodeID: gatewayNode, Actions: ^uint16(0)}
 	return result
 }
 
@@ -1204,11 +1212,19 @@ type devChildExit struct {
 	err  error
 }
 
-func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string) error {
+func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string, diagnostics io.Writer) error {
 	memberCount := len(m.Members) + len(m.LedgerMembers) + len(m.DataMembers)
 	children := make([]*devChild, 0, memberCount+1)
 	exits := make(chan devChildExit, memberCount+1)
-	defer func() { stopDevChildren(children) }()
+	defer func() {
+		stopDevChildren(children)
+		if diagnostics != nil {
+			for index, child := range children {
+				fmt.Fprintf(diagnostics, "development child %d (%s), last %d bytes:\n%s\n",
+					index+1, filepath.Base(child.command.Path), devChildDiagnosticBytes, child.diagnostics.String())
+			}
+		}
+	}()
 	for _, role := range []struct {
 		name    string
 		members []devClusterMember

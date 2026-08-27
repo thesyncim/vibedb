@@ -320,7 +320,7 @@ func validChildPreparation(preparation ChildPreparation) bool {
 	for index, replica := range preparation.target.Replicas {
 		if replica.Member == 0 || replica.Node == ([16]byte{}) || replica.StoreID == ([16]byte{}) ||
 			replica.NodeIncarnation == 0 || replica.Endpoint == "" || replica.NativeEndpoint == "" ||
-			replica.ControlEndpoint == "" || replica.SnapshotAddress == "" ||
+			replica.ControlEndpoint == "" || !validChildReplicaAddresses(replica) ||
 			replica.NativeEndpoint != preparation.descriptor.Leaders[index] {
 			return false
 		}

@@ -260,8 +260,10 @@ func TestInitializeDevClusterEmitsThreeIndependentApplyRoles(t *testing.T) {
 		}
 		prepared[role] = decoded
 		roleMembers := [][]devClusterMember{manifest.Members, manifest.LedgerMembers, manifest.DataMembers}
-		if len(decoded.SplitControl.Grants) != 1 ||
-			decoded.SplitControl.Grants[0].NodeID != roleMembers[roleIndex][0].Node {
+		if len(decoded.SplitControl.Grants) != 2 ||
+			decoded.SplitControl.Grants[0].NodeID != roleMembers[roleIndex][0].Node ||
+			decoded.SplitControl.Grants[1].NodeID != manifest.GatewayNode ||
+			decoded.SplitControl.Grants[1].Actions != ^uint16(0) {
 			t.Fatalf("%s split profile=%+v", role, decoded.SplitControl)
 		}
 	}
@@ -620,16 +622,20 @@ func TestDevRequestLedgerPrepareProfileMatchesCatalogHomeAndKeepsCatalogDisabled
 		{NodeID: "02020202020202020202020202020202"},
 		{NodeID: "03030303030303030303030303030303"},
 	}
-	split := devPrepareSplitControlProfile(members)
+	const gatewayNode = "04040404040404040404040404040404"
+	split := devPrepareSplitControlProfile(members, gatewayNode)
 	if split.MaxRecords != 4096 || split.MaxFileBytes != 64<<20 ||
 		split.MaxChildOperations != 8 || split.StageCheckpointBytes != 32<<20 ||
-		len(split.Grants) != len(members) {
+		len(split.Grants) != len(members)+1 {
 		t.Fatalf("split control profile=%+v", split)
 	}
-	for index, grant := range split.Grants {
+	for index, grant := range split.Grants[:len(members)] {
 		if grant.NodeID != members[index].NodeID || grant.Actions != ^uint16(0) {
 			t.Fatalf("split grant %d=%+v", index, grant)
 		}
+	}
+	if grant := split.Grants[len(members)]; grant.NodeID != gatewayNode || grant.Actions != ^uint16(0) {
+		t.Fatalf("gateway split action grant=%+v", grant)
 	}
 }
 

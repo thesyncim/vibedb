@@ -28,6 +28,9 @@ For a task-oriented setup, start with:
 RF3 means a replication factor of three: one shard has three voters. It is not
 a VibeDB format or API version.
 
+For local reproduction, add `--diagnostics-on-exit` to `cluster dev` to print
+each child's bounded 64 KiB log tail after shutdown.
+
 ## Security boundary
 
 Gateway and shard commands require mutual TLS and a canonical `vibejson`
@@ -191,6 +194,8 @@ With a strict replica-control manifest and hot-shard policy, the gateway can
 derive one bounded split, persist its replicated operation, run the controller,
 publish the catalog successor, and retire the source after the drain witness.
 This is automatic pressure-driven intake, not a general operator split CLI.
+Native point reads and SQL point batches retain each key's exact mapped bucket
+in pressure evidence; they do not turn localized reads into unknown-range load.
 Child SQL preparation supports exact base, local-index, and global-index
 bundles, including restart after partial schema creation. The gateway's
 `split_sources` inventory selects an exact group/schema/machine-digest binding

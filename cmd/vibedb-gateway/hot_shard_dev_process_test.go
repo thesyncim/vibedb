@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -82,6 +83,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	state := filepath.Join(root, "state")
 	process := &rf3testfixture.ExternalProcess{Binary: vibedbBinary, Args: []string{
 		"cluster", "dev", "--replicas", "3", "--root", state,
+		"--diagnostics-on-exit",
 		"--shard-binary", shardBinary, "--gateway-binary", gatewayBinary,
 	}}
 	if err := process.Start(); err != nil {
@@ -149,22 +151,39 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	client := &hotMutationWireClient{connection: connection, reader: bufio.NewReader(connection)}
 	reference := client.openIssuer(t)
 	keySetupStarted := time.Now()
-	keys := devHotStableSplitKeys(t, 4_096)
+	keys := devHotStableSplitKeys(t, 16)
 	keySetup := time.Since(keySetupStarted)
 	if keySetup > 2*time.Second {
 		t.Fatalf("stable split key setup=%s", keySetup)
 	}
 	latencies := make([]time.Duration, 0, 2_048)
+	seed := make([]serveStatement, len(keys))
+	for index, key := range keys {
+		seed[index] = serveStatement{SQL: `INSERT INTO documents VALUES (?)`, Params: []serveParam{{
+			Kind: "document", Text: fmt.Sprintf(`{"id":%q,"value":%d}`, key, index+1),
+		}}}
+	}
+	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 1, seed)))
+	// The shipped window measures operations, not the number of unique rows.
+	// Serial durable INSERTs include the full request-ledger protocol and cannot
+	// reliably produce 64 operations in one second. Drive real, ReadIndex-fenced
+	// SQL point batches across both populated ranges instead. Every returned
+	// value is checked, including again after the split publishes its children.
+	readRequest := devHotReadRequest(t, keys)
 	var operation [32]byte
 	pressureDeadline := time.Now().Add(25 * time.Second)
-	for sequence := uint64(1); sequence <= uint64(len(keys)) &&
-		time.Now().Before(pressureDeadline); sequence++ {
-		key := keys[sequence-1]
-		latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, sequence,
-			[]serveStatement{{SQL: `INSERT INTO documents VALUES (?)`, Params: []serveParam{{
-				Kind: "document", Text: fmt.Sprintf(`{"id":%q,"value":%d}`, key, sequence),
-			}}}})))
-		if sequence%8 != 0 {
+	// Five 16-point batches per second exceed the 64-operation source window
+	// while each balanced child stays below its unchanged 85% capacity limit.
+	pressurePace := time.NewTicker(200 * time.Millisecond)
+	defer pressurePace.Stop()
+	for reads := 1; client.requests < 4_095 && time.Now().Before(pressureDeadline); reads++ {
+		select {
+		case <-ctx.Done():
+			t.Fatal(context.Cause(ctx))
+		case <-pressurePace.C:
+		}
+		latencies = append(latencies, devHotReadDocuments(t, client, readRequest, keys))
+		if reads%8 != 0 {
 			continue
 		}
 		ids, readErr := authority.ReadOperationIDs(ctx)
@@ -177,7 +196,9 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		}
 	}
 	if operation == ([32]byte{}) {
-		t.Fatalf("zero-config pressure admitted no split\n%s", process.Diagnostics())
+		record, pressureErr := authority.ReadPressureRecord(ctx)
+		t.Fatalf("zero-config pressure admitted no split after %d requests; pressure=%s err=%v\n%s",
+			client.requests, record.Payload, pressureErr, process.Diagnostics())
 	}
 	final := hotMutationWaitSplitComplete(t, ctx, authority,
 		snapshot.Generation()+1, operation, source)
@@ -198,6 +219,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	if children == 0 {
 		t.Fatal("terminal operation published no serving data child")
 	}
+	latencies = append(latencies, devHotReadDocuments(t, client, readRequest, keys))
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	p99 := latencies[(len(latencies)*99+99)/100-1]
 	finalRSS := devHotProcessTreeRSS(t, process.PID())
@@ -214,6 +236,45 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	t.Logf("zero-config hot split: children=%d key_setup=%s p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
 		children, keySetup, p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
 		storageGrowth, walGrowth, networkGrowth)
+}
+
+func devHotReadRequest(t *testing.T, keys []string) []byte {
+	t.Helper()
+	statements := make([]serveStatement, len(keys))
+	for index, key := range keys {
+		statements[index] = serveStatement{SQL: "SELECT * FROM documents WHERE id = ?",
+			Params: []serveParam{{Kind: "string", Text: key}}}
+	}
+	raw, err := vibejson.Marshal(&serveRequest{Op: "read_batch", Class: "interactive",
+		Statements: statements, MaxResultBytes: 64 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func devHotReadDocuments(t *testing.T, client *hotMutationWireClient, request []byte, keys []string) time.Duration {
+	t.Helper()
+	response, latency := client.roundTrip(t, request)
+	var decoded struct {
+		OK        bool   `json:"ok"`
+		Found     []bool `json:"found"`
+		Documents []struct {
+			ID    string `json:"id"`
+			Value uint64 `json:"value"`
+		} `json:"documents"`
+	}
+	if err := json.Unmarshal(response, &decoded); err != nil || !decoded.OK ||
+		len(decoded.Found) != len(keys) || len(decoded.Documents) != len(keys) {
+		t.Fatalf("development native SQL read response=%s err=%v", response, err)
+	}
+	for index, key := range keys {
+		if !decoded.Found[index] || decoded.Documents[index].ID != key || decoded.Documents[index].Value != uint64(index+1) {
+			t.Fatalf("development native SQL read position=%d key=%q found=%t document=%+v",
+				index, key, decoded.Found[index], decoded.Documents[index])
+		}
+	}
+	return latency
 }
 
 func devHotProcessTreeRSS(t testing.TB, root int) uint64 {

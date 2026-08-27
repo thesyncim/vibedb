@@ -659,6 +659,64 @@ func TestPeerTLSServerRejectsLocalNodeCertificate(t *testing.T) {
 	}
 }
 
+func TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 6)
+	identity := peerTLSTestIdentity(17, 61)
+	profile := newPeerTLSTestProfile(t, authority, identity)
+	local := profile.WithLocalServiceConnections()
+	if profile.localServices || local == profile || !local.localServices {
+		t.Fatal("local service opt-in mutated the original profile")
+	}
+	for _, class := range []TrafficClass{TrafficShardNative, TrafficSnapshot, TrafficShardControl} {
+		t.Run(fmt.Sprintf("class-%d", class), func(t *testing.T) {
+			for _, enabled := range []bool{false, true} {
+				selected := profile
+				if enabled {
+					selected = local
+				}
+				client, server, clientErr, serverErr := peerTLSTestHandshake(t, selected, selected, identity.Node, class, class)
+				if client != nil {
+					_ = client.Close()
+				}
+				if server != nil {
+					_ = server.Close()
+				}
+				if enabled {
+					if clientErr != nil || serverErr != nil || client == nil || server == nil {
+						t.Fatalf("authenticated local service failed: client=%v server=%v", clientErr, serverErr)
+					}
+				} else if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
+					t.Fatalf("default profile allowed self connection: client=%v server=%v", clientErr, serverErr)
+				}
+			}
+		})
+	}
+	for _, class := range []TrafficClass{TrafficOrdinary, TrafficShardSQL, TrafficGatewayClient, TrafficGatewayControl} {
+		client, server, clientErr, serverErr := peerTLSTestHandshake(t, local, local, identity.Node, class, class)
+		if client != nil {
+			_ = client.Close()
+		}
+		if server != nil {
+			_ = server.Close()
+		}
+		if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
+			t.Fatalf("local opt-in allowed class %d: client=%v server=%v", class, clientErr, serverErr)
+		}
+	}
+	wrongNode := identity.Node
+	wrongNode[0]++
+	client, server, clientErr, serverErr := peerTLSTestHandshake(t, local, local, wrongNode, TrafficShardNative, TrafficShardNative)
+	if client != nil {
+		_ = client.Close()
+	}
+	if server != nil {
+		_ = server.Close()
+	}
+	if !errors.Is(clientErr, ErrWrongPeer) {
+		t.Fatalf("local opt-in bypassed exact expected peer: client=%v server=%v", clientErr, serverErr)
+	}
+}
+
 func TestPeerTLSRechecksCertificateTimeAtHandshake(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 8)
 	clientIdentity := peerTLSTestIdentity(23, 31)

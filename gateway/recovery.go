@@ -138,6 +138,13 @@ func transactionCatalogCalls(snapshot *Snapshot, profile Profile) ([]shardCall, 
 			if !ok || len(shard.Leaders) == 0 {
 				return nil, ErrTransactionConflict
 			}
+			// This scanner speaks only the legacy shard-local journal protocol.
+			// RF3 recovery reads its replicated hidden relations through the native
+			// durable-request runner. A catalog may contain both authorities; never
+			// send a legacy SQL-service request to a native RF3 endpoint.
+			if _, replicated := snapshot.replicatedShardAt(manifest.Distribution(), shard.ID); replicated {
+				continue
+			}
 			address, err := snapshot.Address(shard.Leaders[0])
 			if err != nil {
 				return nil, err
@@ -1009,7 +1016,7 @@ func (e *Executor) retireRecoveredCoordinator(
 	return result, nil
 }
 
-// RecoverAll scans every current shard's bounded coordinator index and redrives
+// RecoverAll scans each legacy shard's bounded coordinator index and redrives
 // each active identity once. The first error is joined after independent work
 // continues; not-yet-expired incomplete transactions are left for a later pass.
 func (e *Executor) RecoverAll(ctx context.Context) ([]RecoveryResult, error) {

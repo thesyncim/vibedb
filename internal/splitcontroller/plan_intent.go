@@ -109,6 +109,9 @@ type persistedChildReplica struct {
 	Endpoint          distribution.EndpointID `json:"endpoint"`
 	NativeEndpoint    distribution.EndpointID `json:"native_endpoint"`
 	ControlEndpoint   distribution.EndpointID `json:"control_endpoint"`
+	PeerAddress       string                  `json:"peer_address,omitempty"`
+	NativeAddress     string                  `json:"native_address,omitempty"`
+	ControlAddress    string                  `json:"control_address,omitempty"`
 	SnapshotAddress   string                  `json:"snapshot_address"`
 	WAL               raftstore.Identity      `json:"wal"`
 	WALPath           string                  `json:"wal_path"`
@@ -275,6 +278,7 @@ func persistChildReplicas(input []ChildReplicaTarget) []persistedChildReplica {
 			Member: replica.Member, Node: [16]byte(replica.Node), StoreID: replica.StoreID,
 			NodeIncarnation: replica.NodeIncarnation, Endpoint: replica.Endpoint,
 			NativeEndpoint: replica.NativeEndpoint, ControlEndpoint: replica.ControlEndpoint,
+			PeerAddress: replica.PeerAddress, NativeAddress: replica.NativeAddress, ControlAddress: replica.ControlAddress,
 			SnapshotAddress: replica.SnapshotAddress,
 			WAL:             replica.WAL, WALPath: replica.WALPath, SQLPath: replica.SQLPath,
 			RuntimeRoot: replica.RuntimeRoot, SQL: persistSQLIdentity(replica.SQL),
@@ -305,6 +309,7 @@ func openPersistedChildReplicas(input []persistedChildReplica) []ChildReplicaTar
 			Member: replica.Member, Node: rafttransport.NodeID(replica.Node), StoreID: replica.StoreID,
 			NodeIncarnation: replica.NodeIncarnation, Endpoint: replica.Endpoint,
 			NativeEndpoint: replica.NativeEndpoint, ControlEndpoint: replica.ControlEndpoint,
+			PeerAddress: replica.PeerAddress, NativeAddress: replica.NativeAddress, ControlAddress: replica.ControlAddress,
 			SnapshotAddress: replica.SnapshotAddress,
 			WAL:             replica.WAL, WALPath: replica.WALPath, SQLPath: replica.SQLPath,
 			RuntimeRoot: replica.RuntimeRoot, SQL: openPersistedSQLIdentity(replica.SQL),

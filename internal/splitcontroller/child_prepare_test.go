@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -11,6 +13,12 @@ import (
 
 func TestChildPreparationCanonicalRF3Receipt(t *testing.T) {
 	plan, _, target, split := testPlanWithChildLeaders(t, []distribution.EndpointID{"node-b", "node-c", "node-d"})
+	for index := range target.Replicas {
+		replica := &target.Replicas[index]
+		replica.PeerAddress = "127.0.0.1:" + strconv.Itoa(1100+index*3)
+		replica.NativeAddress = "127.0.0.1:" + strconv.Itoa(1101+index*3)
+		replica.ControlAddress = "127.0.0.1:" + strconv.Itoa(1102+index*3)
+	}
 	descriptor, ok := split.Child(int(target.Child))
 	if !ok {
 		t.Fatal("missing child")
@@ -34,8 +42,7 @@ func TestChildPreparationCanonicalRF3Receipt(t *testing.T) {
 	if err != nil || !bytes.Equal(raw, again) {
 		t.Fatalf("canonical replay changed: equal=%v err=%v", bytes.Equal(raw, again), err)
 	}
-	if opened.ReplicaTarget().Node != target.Replicas[1].Node ||
-		opened.ReplicaTarget().SQLPath != target.Replicas[1].SQLPath {
+	if !reflect.DeepEqual(opened.ReplicaTarget(), target.Replicas[1]) {
 		t.Fatal("opened preparation changed selected replica")
 	}
 
@@ -49,8 +56,30 @@ func TestChildPreparationCanonicalRF3Receipt(t *testing.T) {
 	}
 	recovered, err := OpenChildPrepareReceipt(receiptRaw)
 	if err != nil || recovered.ReceiptDigest != receipt.ReceiptDigest ||
-		recovered.RequestDigest != receipt.RequestDigest {
-		t.Fatalf("receipt recovery = %+v, %v", recovered, err)
+		recovered.RequestDigest != receipt.RequestDigest ||
+		preparedChildReplicaDigest(recovered.Target) != preparedChildReplicaDigest(receipt.Target) {
+		t.Fatalf("receipt recovery changed canonical identity: %v", err)
+	}
+	for _, mutate := range []func(*ChildReplicaTarget){
+		func(replica *ChildReplicaTarget) { replica.PeerAddress = "127.0.0.1:8888" },
+		func(replica *ChildReplicaTarget) { replica.NativeAddress = "127.0.0.1:8888" },
+		func(replica *ChildReplicaTarget) { replica.ControlAddress = "127.0.0.1:8888" },
+	} {
+		forged := target.Replicas[1]
+		mutate(&forged)
+		if _, receiptErr := NewChildPrepareReceipt(opened, forged); !errors.Is(receiptErr, ErrChildPreparation) {
+			t.Fatalf("receipt accepted substituted transport: %v", receiptErr)
+		}
+		if targetMatchesPreparedReplica(target, forged) {
+			t.Fatal("remote target accepted substituted transport")
+		}
+	}
+	for _, invalid := range []string{"", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:no-port", "127.0.0.1", "bad host:1111", target.Replicas[1].NativeAddress} {
+		candidate := cloneChildTarget(target)
+		candidate.Replicas[1].PeerAddress = invalid
+		if _, prepareErr := NewChildPreparation(plan.OperationID(), allocation, descriptor, "docs", candidate, 1); !errors.Is(prepareErr, ErrChildPreparation) {
+			t.Fatalf("invalid transport address %q accepted: %v", invalid, prepareErr)
+		}
 	}
 
 	for name, mutate := range map[string]func([]byte){

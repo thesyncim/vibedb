@@ -1,6 +1,7 @@
 package hotshard
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -11,6 +12,44 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/topologyscheduler"
 )
+
+func TestCollectorNativePointPreservesExactBucketLocality(t *testing.T) {
+	_, source, nodes := hotCatalog(t)
+	interval, ok := distribution.VirtualBucketRange(17, source.BucketBits)
+	if !ok {
+		t.Fatal("invalid test bucket")
+	}
+	point := interval.Start
+	point[len(point)-1] = 1 // a point inside the bucket, not its start boundary
+	var payloads [2][]byte
+	for kind := range payloads {
+		recorder, err := autosplit.NewRecorder(source, 1, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		collector := &Collector{provider: pulseCapacity{}, sequence: 1, catalogGeneration: 10,
+			policy:   autosplit.Policy{TriggerPressurePPM: 1, MaxChildPressurePPM: 900_000, CelebritySharePPM: 1},
+			entries:  []collectorEntry{{group: hotGroup(1), source: source, leader: "source", recorder: recorder}},
+			bySource: map[autosplit.SourceIdentity]int{source: 0}}
+		observation := gateway.PressureObservation{Source: source,
+			AccessScopes: []distributedtxn.IntentScope{{Start: 17, End: 18}}}
+		if kind == 1 {
+			observation.AccessScopes = nil
+			observation.Point, observation.HasPoint = point, true
+		}
+		for range 16 {
+			collector.ObservePressure(observation)
+		}
+		record, err := collector.Publish(t.Context(), &pressurePublisher{}, nodes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payloads[kind] = record.Payload
+	}
+	if !bytes.Equal(payloads[0], payloads[1]) {
+		t.Fatalf("native point lost bucket locality:\nscoped=%s\nnative=%s", payloads[0], payloads[1])
+	}
+}
 
 type pulseCapacity struct{}
 

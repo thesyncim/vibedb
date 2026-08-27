@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -97,6 +98,12 @@ type ChildReplicaTarget struct {
 	Endpoint        distribution.EndpointID
 	NativeEndpoint  distribution.EndpointID
 	ControlEndpoint distribution.EndpointID
+	// Endpoints are logical catalog names. These addresses freeze their exact
+	// transport destinations into the preparation and receipt. All three may
+	// be absent only for the older literal-endpoint representation.
+	PeerAddress    string
+	NativeAddress  string
+	ControlAddress string
 	// SnapshotAddress is the exact authenticated TrafficSnapshot listener for
 	// artifact staging. It is provisioned by the gateway inventory and verified
 	// by the destination before the preparation receipt is issued.
@@ -1209,6 +1216,9 @@ func cloneChildTarget(target ChildTarget) ChildTarget {
 		replica.Endpoint = distribution.EndpointID(strings.Clone(string(replica.Endpoint)))
 		replica.NativeEndpoint = distribution.EndpointID(strings.Clone(string(replica.NativeEndpoint)))
 		replica.ControlEndpoint = distribution.EndpointID(strings.Clone(string(replica.ControlEndpoint)))
+		replica.PeerAddress = strings.Clone(replica.PeerAddress)
+		replica.NativeAddress = strings.Clone(replica.NativeAddress)
+		replica.ControlAddress = strings.Clone(replica.ControlAddress)
 		replica.SnapshotAddress = strings.Clone(replica.SnapshotAddress)
 		replica.WAL.Distribution = strings.Clone(replica.WAL.Distribution)
 		replica.WAL.Shard = strings.Clone(replica.WAL.Shard)
@@ -1296,13 +1306,12 @@ func validChildReplicaTargets(split *autosplit.SplitPlan, child int, target Chil
 		return false
 	}
 	for index, replica := range target.Replicas {
-		host, port, addressErr := net.SplitHostPort(replica.SnapshotAddress)
 		if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
 			replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
 			replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
 			replica.Endpoint == replica.NativeEndpoint || replica.Endpoint == replica.ControlEndpoint ||
 			replica.NativeEndpoint == replica.ControlEndpoint ||
-			replica.NativeEndpoint != descriptor.Leaders[index] || addressErr != nil || host == "" || port == "" {
+			replica.NativeEndpoint != descriptor.Leaders[index] || !validChildReplicaAddresses(replica) {
 			return false
 		}
 		for prior := 0; prior < index; prior++ {
@@ -1318,6 +1327,33 @@ func validChildReplicaTargets(split *autosplit.SplitPlan, child int, target Chil
 	first := target.Replicas[0]
 	return target.Endpoint == first.NativeEndpoint && target.WAL.MemberID == first.Member &&
 		target.WAL.StoreID == first.StoreID
+}
+
+func validChildReplicaAddresses(replica ChildReplicaTarget) bool {
+	if !validPreparedChildAddress(replica.SnapshotAddress) {
+		return false
+	}
+	if replica.PeerAddress == "" && replica.NativeAddress == "" && replica.ControlAddress == "" {
+		return true
+	}
+	return validPreparedChildAddress(replica.PeerAddress) &&
+		validPreparedChildAddress(replica.NativeAddress) &&
+		validPreparedChildAddress(replica.ControlAddress) &&
+		replica.PeerAddress != replica.NativeAddress && replica.PeerAddress != replica.ControlAddress &&
+		replica.NativeAddress != replica.ControlAddress && replica.PeerAddress != replica.SnapshotAddress &&
+		replica.NativeAddress != replica.SnapshotAddress && replica.ControlAddress != replica.SnapshotAddress
+}
+
+func validPreparedChildAddress(address string) bool {
+	if len(address) > 512 || strings.ContainsAny(address, " \t\r\n") {
+		return false
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return false
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	return err == nil && number != 0
 }
 
 func cloneSourceIdentity(source autosplit.SourceIdentity) autosplit.SourceIdentity {

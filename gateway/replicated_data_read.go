@@ -359,13 +359,23 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 	}
 	defer lease.release()
 
-	points := make([]ReplicatedBatchPointRead, len(request.Points))
 	var route ReplicatedRoute
 	var routeID replication.Digest
 	maximum := uint64(request.MaxResultBytes)
 	if maximum > reader.maxReadBytes {
 		return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedReadAdmission
 	}
+	working := maximum
+	var pressurePoints []distribution.KeyspacePoint
+	if reader.pressure != nil {
+		pressureBytes := uint64(len(request.Points)) * distribution.KeyspaceWidth
+		if pressureBytes > reader.maxReadBytes-maximum {
+			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedReadAdmission
+		}
+		working += pressureBytes
+		pressurePoints = make([]distribution.KeyspacePoint, len(request.Points))
+	}
+	points := make([]ReplicatedBatchPointRead, len(request.Points))
 	for index := range request.Points {
 		var replicas [ServingReplicaCount]ReplicatedEndpoint
 		var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
@@ -384,25 +394,32 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 		points[index] = ReplicatedBatchPointRead{
 			Relation: resolved.Profile.Relation, Key: request.Points[index].Key,
 		}
+		if pressurePoints != nil {
+			pressurePoints[index] = resolved.Point
+		}
 	}
-	reservationSlot, reservationEpoch, err := reader.admitRead(ctx, maximum)
+	reservationSlot, reservationEpoch, err := reader.admitRead(ctx, working)
 	if err != nil {
 		return ReplicatedTableBatchReadResult{}, lease.generation, err
 	}
 	reader.observeReplicatedPressure(
-		replicatedDataPressureSource(lease.snapshot, route), len(points), false,
+		replicatedDataPressureSource(lease.snapshot, route), pressurePoints,
 	)
 	result, err := reader.executor.ReadPointBatch(ctx, route, ReplicatedBatchRead{
 		Points: points, MinimumApplied: 1, MaxResultBytes: uint32(maximum),
 	})
 	if err != nil {
-		reader.releaseRead(reservationSlot, reservationEpoch, maximum)
+		reader.releaseRead(reservationSlot, reservationEpoch, working)
 		return ReplicatedTableBatchReadResult{}, lease.generation, err
 	}
 	view, err := replicatedstate.OpenPointReadBatchValue(result.Packed)
 	if err != nil || view.Count() != len(points) {
-		reader.releaseRead(reservationSlot, reservationEpoch, maximum)
+		reader.releaseRead(reservationSlot, reservationEpoch, working)
 		return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedDataRead
+	}
+	if working != maximum && !reader.shrinkRead(reservationSlot, reservationEpoch, working, maximum) {
+		reader.releaseRead(reservationSlot, reservationEpoch, working)
+		return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedReadAdmission
 	}
 	return ReplicatedTableBatchReadResult{
 		Position: ReplicatedReadPosition{RouteID: routeID, Applied: result.Applied},
@@ -441,7 +458,7 @@ func (reader *ReplicatedDataReader) readPinned(
 		return ReplicatedTableReadResult{}, lease.generation, err
 	}
 	reader.observeReplicatedPressure(
-		replicatedDataPressureSource(lease.snapshot, resolved.Route), 1, false,
+		replicatedDataPressureSource(lease.snapshot, resolved.Route), []distribution.KeyspacePoint{resolved.Point},
 	)
 
 	result, err := reader.executor.ReadPoint(ctx, resolved.Route, ReplicatedPointRead{
@@ -462,14 +479,13 @@ func (reader *ReplicatedDataReader) readPinned(
 }
 
 func (reader *ReplicatedDataReader) observeReplicatedPressure(
-	source autosplit.SourceIdentity, count int, write bool,
+	source autosplit.SourceIdentity, points []distribution.KeyspacePoint,
 ) {
-	if reader == nil || reader.pressure == nil || source == (autosplit.SourceIdentity{}) || count <= 0 {
+	if reader == nil || reader.pressure == nil || source == (autosplit.SourceIdentity{}) {
 		return
 	}
-	observation := PressureObservation{Source: source, Write: write}
-	for range count {
-		reader.pressure.ObservePressure(observation)
+	for _, point := range points {
+		reader.pressure.ObservePressure(PressureObservation{Source: source, Point: point, HasPoint: true})
 	}
 }
 

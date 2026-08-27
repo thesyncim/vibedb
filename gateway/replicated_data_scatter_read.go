@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/autosplit"
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -71,14 +72,15 @@ func (result *ReplicatedTableScatterReadResult) Release() {
 }
 
 type replicatedScatterGroup struct {
-	route    ReplicatedRoute
-	routeID  replication.Digest
-	source   autosplit.SourceIdentity
-	points   []ReplicatedBatchPointRead
-	ordinals []uint32
-	result   ReplicatedBatchPointResult
-	err      error
-	fixed    uint64
+	route          ReplicatedRoute
+	routeID        replication.Digest
+	source         autosplit.SourceIdentity
+	points         []ReplicatedBatchPointRead
+	pressurePoints []distribution.KeyspacePoint
+	ordinals       []uint32
+	result         ReplicatedBatchPointResult
+	err            error
+	fixed          uint64
 }
 
 type replicatedScatterValue struct {
@@ -159,6 +161,9 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 		group.points = append(group.points, ReplicatedBatchPointRead{
 			Relation: resolved.Profile.Relation, Key: point.Key,
 		})
+		if reader.pressure != nil {
+			group.pressurePoints = append(group.pressurePoints, resolved.Point)
+		}
 		group.ordinals = append(group.ordinals, uint32(ordinal))
 		requestBytes += 5 + uint64(len(point.Key))
 	}
@@ -184,6 +189,9 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 	// Point/ordinal partitions are the only cardinality-shaped working state.
 	// Charge their conservative headers plus the exact packed request bytes.
 	metadataBytes := count*40 + uint64(len(groups))*512 + requestBytes + groupFixedBytes
+	for index := range groups {
+		metadataBytes += uint64(cap(groups[index].pressurePoints)) * distribution.KeyspaceWidth
+	}
 	if metadataBytes > reader.maxReadBytes || resultBound > reader.maxReadBytes-metadataBytes {
 		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
 	}
@@ -235,7 +243,7 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 					group.err = context.Cause(scatterCtx)
 					continue
 				}
-				reader.observeReplicatedPressure(group.source, len(group.points), false)
+				reader.observeReplicatedPressure(group.source, group.pressurePoints)
 				result, readErr := reader.executor.ReadPointBatch(
 					scatterCtx, group.route, ReplicatedBatchRead{
 						Points: group.points, MinimumApplied: 1,

@@ -193,6 +193,12 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 		if localReplica.Root == "" || localReplica.Snapshot == "" {
 			return splitcontroller.ChildTarget{}, hotshard.ErrInvalidPressureCut
 		}
+		peerAddress, peerErr := catalog.Address(sourceReplica.Endpoint)
+		nativeAddress, nativeErr := catalog.Address(sourceReplica.NativeEndpoint)
+		controlAddress, controlErr := catalog.Address(sourceReplica.ControlEndpoint)
+		if peerErr != nil || nativeErr != nil || controlErr != nil {
+			return splitcontroller.ChildTarget{}, errors.Join(hotshard.ErrInvalidPressureCut, peerErr, nativeErr, controlErr)
+		}
 		operationName := hex.EncodeToString(admission[:])
 		runtimeRoot := filepath.Join(localReplica.Root, operationName, "child-"+strconv.Itoa(int(child)))
 		storeID := gatewayHotSplitID("store", admission, child, uint8(index))
@@ -246,6 +252,7 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 			NodeIncarnation: sourceReplica.NodeIncarnation,
 			Endpoint:        sourceReplica.Endpoint, NativeEndpoint: sourceReplica.NativeEndpoint,
 			ControlEndpoint: sourceReplica.ControlEndpoint, WAL: wal,
+			PeerAddress: peerAddress, NativeAddress: nativeAddress, ControlAddress: controlAddress,
 			SnapshotAddress: localReplica.Snapshot,
 			WALPath:         filepath.Join(runtimeRoot, "child.wal"),
 			SQLPath:         filepath.Join(runtimeRoot, "stage.vdb"), RuntimeRoot: runtimeRoot,

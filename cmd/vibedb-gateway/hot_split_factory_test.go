@@ -82,6 +82,13 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	operationDirectory := hex.EncodeToString(operation[:])
 	localDigests := make(map[[32]byte]struct{}, gateway.ServingReplicaCount)
 	for index, replica := range target.Replicas {
+		peer, peerErr := catalog.Address(replica.Endpoint)
+		native, nativeErr := catalog.Address(replica.NativeEndpoint)
+		control, controlErr := catalog.Address(replica.ControlEndpoint)
+		if peerErr != nil || nativeErr != nil || controlErr != nil || replica.PeerAddress != peer ||
+			replica.NativeAddress != native || replica.ControlAddress != control {
+			t.Fatalf("replica[%d] lost exact catalog transport destinations", index)
+		}
 		logical, logicalErr := sqldriver.ReplicatedRelationManifestDigest(replica.SQL)
 		if logicalErr != nil || replication.Digest(logical) != profile.LogicalSchemaDigest || logical == target.RelationManifestDigest {
 			t.Fatalf("child logical schema differs from table or collapsed into machine digest: %v", logicalErr)

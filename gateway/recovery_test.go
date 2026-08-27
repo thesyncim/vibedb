@@ -17,6 +17,24 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
+func TestRecoveryCatalogCallsNeverSendLegacyRPCToRF3(t *testing.T) {
+	fixture := newScatterCatalogFixture(t, 2, 5)
+	profile := DefaultProfiles()[ClassAdmin].withDefaults()
+	calls, err := transactionCatalogCalls(fixture.snapshot, profile)
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("RF3-only catalog produced %d legacy recovery calls: %v", len(calls), err)
+	}
+	mixed, err := NewSnapshotWithReplicatedTableMetadata(fixture.config, fixture.endpoints, 5,
+		nil, nil, fixture.descriptors[:1], fixture.profiles[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, err = transactionCatalogCalls(mixed, profile)
+	if err != nil || len(calls) != 1 || calls[0].req.Distribution != fixture.config.Distributions[1].Name {
+		t.Fatalf("mixed catalog legacy recovery calls=%+v err=%v", calls, err)
+	}
+}
+
 func TestRecoveryContextUsesOnlyExplicitInternalAuthority(t *testing.T) {
 	var node rafttransport.NodeID
 	node[0] = 41

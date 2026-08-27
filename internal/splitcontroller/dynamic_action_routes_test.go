@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -168,7 +169,11 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 	}
 	target := testChildTarget(t, split, partitioner)
 	for index := range target.Replicas {
-		target.Replicas[index].Node = descriptor.Replicas[index].Node
+		replica := &target.Replicas[index]
+		replica.Node = descriptor.Replicas[index].Node
+		replica.PeerAddress = endpoints[replica.Endpoint]
+		replica.NativeAddress = endpoints[replica.NativeEndpoint]
+		replica.ControlAddress = endpoints[replica.ControlEndpoint]
 	}
 	schema := bindProjectionSourceAndChildSchemas(t, &descriptor, &target)
 	catalog, err = gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
@@ -180,6 +185,38 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 		t.Fatal(err)
 	}
 	return plan, catalog
+}
+
+func TestPreparedChildRouteBindsLogicalEndpointsToExactTransport(t *testing.T) {
+	plan, catalog := testRF3AdmissionPlan(t)
+	raw, err := AppendPlanIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenPlanIntent(raw, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := plan.Target(1)
+	recovered, _ := reopened.Target(1)
+	if !reflect.DeepEqual(target, recovered) {
+		t.Fatal("plan intent changed prepared transport destinations")
+	}
+	if _, err := exactPreparedChildRoute(catalog, plan, 1, target); err != nil {
+		t.Fatalf("exact target rejected: %v", err)
+	}
+	for _, mutate := range []func(*ChildReplicaTarget){
+		func(replica *ChildReplicaTarget) { replica.PeerAddress = "127.0.0.1:8888" },
+		func(replica *ChildReplicaTarget) { replica.NativeAddress = "127.0.0.1:8888" },
+		func(replica *ChildReplicaTarget) { replica.ControlAddress = "127.0.0.1:8888" },
+		func(replica *ChildReplicaTarget) { replica.ControlAddress = "" },
+	} {
+		candidate := cloneChildTarget(target)
+		mutate(&candidate.Replicas[0])
+		if _, err := exactPreparedChildRoute(catalog, plan, 1, candidate); !errors.Is(err, ErrShardControlRoute) {
+			t.Fatalf("catalog/intent transport mismatch accepted: %v", err)
+		}
+	}
 }
 
 func decimalPort(value int) string {

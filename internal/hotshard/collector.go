@@ -147,6 +147,19 @@ func (collector *Collector) ObservePressure(observation gateway.PressureObservat
 		load[autosplit.ResourceReadCPU] = 1
 	}
 	recorder := collector.entries[index].recorder
+	if observation.HasPoint {
+		// Locality comes from the same native mapper and pinned catalog that
+		// selected the RF3 owner, never from SQL text or a guessed primary key.
+		bucket, valid := distribution.VirtualBucketForPoint(observation.Point, observation.Source.BucketBits)
+		if valid && len(observation.AccessScopes) == 0 {
+			interval, ok := distribution.VirtualBucketRange(bucket, observation.Source.BucketBits)
+			if ok && recorder.ObserveBucket(interval.Start, load, 1, 1) {
+				return
+			}
+		}
+		recorder.ObserveUnknown(load, 1)
+		return
+	}
 	if len(observation.AccessScopes) == 1 &&
 		observation.AccessScopes[0].End == observation.AccessScopes[0].Start+1 {
 		bucket, ok := distribution.VirtualBucketRange(

@@ -65,6 +65,31 @@ func TestRF3ChildPreparerAcceptsOnlyExactLocalManifestSlot(t *testing.T) {
 			}
 		})
 	}
+	// Production catalogs use logical endpoint names, not listener addresses.
+	target.Endpoint, target.NativeEndpoint, target.ControlEndpoint = "data-1-peer", "data-1-native", "data-1-control"
+	target.PeerAddress, target.NativeAddress, target.ControlAddress = "127.0.0.1:1101", "127.0.0.1:1102", "127.0.0.1:1103"
+	if !preparer.matchesLocalTarget(target, paths) {
+		t.Fatal("logical endpoints with exact local transport addresses rejected")
+	}
+	for name, mutate := range map[string]func(*splitcontroller.ChildReplicaTarget){
+		"peer address":    func(candidate *splitcontroller.ChildReplicaTarget) { candidate.PeerAddress = "127.0.0.1:9999" },
+		"native address":  func(candidate *splitcontroller.ChildReplicaTarget) { candidate.NativeAddress = "127.0.0.1:9999" },
+		"control address": func(candidate *splitcontroller.ChildReplicaTarget) { candidate.ControlAddress = "127.0.0.1:9999" },
+		"partial addresses": func(candidate *splitcontroller.ChildReplicaTarget) {
+			candidate.NativeAddress = ""
+		},
+		"unresolved logical endpoints": func(candidate *splitcontroller.ChildReplicaTarget) {
+			candidate.PeerAddress, candidate.NativeAddress, candidate.ControlAddress = "", "", ""
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := target
+			mutate(&candidate)
+			if preparer.matchesLocalTarget(candidate, paths) {
+				t.Fatal("substituted transport destination accepted")
+			}
+		})
+	}
 }
 
 func TestEnsureRF3PreparedChildDirectoriesRejectsSymlink(t *testing.T) {

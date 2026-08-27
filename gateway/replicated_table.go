@@ -39,6 +39,7 @@ type ResolvedReplicatedTableKey struct {
 	Profile ReplicatedTableProfile
 	Route   ReplicatedRoute
 	RouteID replication.Digest
+	Point   distribution.KeyspacePoint
 }
 
 // replicatedCatalogTable is the compact hot directory. The table and primary
@@ -309,7 +310,7 @@ func (snapshot *Snapshot) ResolveReplicatedTableKey(
 		return ResolvedReplicatedTableKey{}, false
 	}
 	return ResolvedReplicatedTableKey{
-		Profile: profile, Route: route, RouteID: replicatedRouteID(route),
+		Profile: profile, Route: route, RouteID: replicatedRouteID(route), Point: point,
 	}, true
 }
 
