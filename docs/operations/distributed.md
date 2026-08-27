@@ -194,6 +194,13 @@ Automatic bundled-child allocation still needs full authenticated source SQL
 metadata. Repeated descendant splits also need certified live-source registry
 and restart integration; unlisted sources fail closed. These remain integration
 gaps, not a completed heterogeneous split path.
+The first automatic split also remains blocked by cross-boundary contract
+mismatches: source-artifact and child-serving digests are conflated, allocation
+and plan preparation use different operation IDs, and plan admission assumes
+per-shard fences equal global catalog versions. These checks currently fail
+closed. Certified child catalog projection alone does not prove a serving
+cutover. Completion requires a composed allocation-through-publication test
+and reconstruction of live adopted groups after process restart.
 Mandatory Linux split-under-load fault gates remain Partial until CI records
 their required unskipped runs.
 
