@@ -4,13 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // ReserveReplicatedChildApply durably freezes the exact hidden apply and
 // capture storage identities before any split artifact is staged. The caller
 // supplies the complete identity authenticated by the allocation authority;
 // this method never mints or substitutes an identity. Exact retries are
-// read-only validation of the retained reservation.
+// read-only validation after any unresolved catalog publication is settled.
 func (d *Database) ReserveReplicatedChildApply(
 	expected ReplicatedShardStoreIdentity,
 	reserved ReplicatedApplyIdentity,
@@ -41,15 +43,18 @@ func (d *Database) ReserveReplicatedChildApply(
 	}
 	if core.catalog.ReplicatedApply != nil {
 		if core.catalog.ReplicatedApply.identity() == reserved {
-			return nil
+			return core.settleCatalogLocked()
 		}
 		return ErrReplicatedApplyMismatch
 	}
 	if current := core.catalog.ReplicatedChildApply; current != nil {
 		if current.identity() == reserved {
-			return nil
+			return core.settleCatalogLocked()
 		}
 		return ErrReplicatedApplyMismatch
+	}
+	if err := core.settleCatalogLocked(); err != nil {
+		return err
 	}
 	for _, path := range [...]string{core.replicatedApplyPath(&meta), core.replicatedCapturePath(&meta)} {
 		if _, err := os.Lstat(path); err == nil || !os.IsNotExist(err) {
@@ -84,6 +89,9 @@ func (d *Database) ReplicatedChildApplyReservation(
 	defer core.mu.RUnlock()
 	if core.catalog.ReplicatedShardStore == nil || !core.catalog.ReplicatedShardStore.Equal(expected) {
 		return ReplicatedApplyIdentity{}, false, ErrReplicatedShardStoreIdentityMismatch
+	}
+	if core.catalogWritePending || core.catalogFencePending {
+		return ReplicatedApplyIdentity{}, false, durable.ErrCommitOutcomeUnknown
 	}
 	if core.catalog.ReplicatedChildApply == nil {
 		return ReplicatedApplyIdentity{}, false, nil

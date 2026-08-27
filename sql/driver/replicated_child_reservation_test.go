@@ -14,7 +14,8 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func TestReplicatedChildReservationCatalogCodec(t *testing.T) {
+func childReservationCatalogFixture(t testing.TB) (catalogFile, ReplicatedApplyIdentity) {
+	t.Helper()
 	binding := testReplicatedBinding(181)
 	meta := &tableMeta{PrimaryKey: "/id", Storage: strings.Repeat("1", storageIdentityBytes*2),
 		Materialized: true, SealedRecoveryJournalBytes: ReplicatedUserRecoveryJournalBytes}
@@ -44,6 +45,12 @@ func TestReplicatedChildReservationCatalogCodec(t *testing.T) {
 		ShardStore: &ShardStoreIdentity{Distribution: distribution.DistributionName(binding.Distribution),
 			Shard: distribution.ShardID(binding.Shard), AllocationGeneration: distribution.ShardAllocationGeneration(binding.AllocationGeneration), LogID: base.LogID},
 		ReplicatedShardStore: &base, ReplicatedChildApply: &reservedMeta}
+	return catalog, reserved
+}
+
+func TestReplicatedChildReservationCatalogCodec(t *testing.T) {
+	catalog, reserved := childReservationCatalogFixture(t)
+	reservedMeta := *catalog.ReplicatedChildApply
 	raw, err := appendCatalogJSON(nil, catalog)
 	if err != nil || !bytes.Contains(raw, []byte(`"replicated_child_apply":`)) {
 		t.Fatalf("reservation omitted from catalog: %s, %v", raw, err)
