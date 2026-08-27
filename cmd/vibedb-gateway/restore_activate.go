@@ -194,6 +194,10 @@ func newGatewayRestoreCatalog(ctx context.Context, manifest gatewayRestoreManife
 		}
 	}
 	timeout := time.Duration(manifest.AttemptTimeoutMS) * time.Millisecond
+	route, err := refreshGatewayRestoreCatalogRoute(ctx, profile, operator, route, manifest.Attempts, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
 	pool, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
 		TLS: profile, Dial: dialGatewayRestore, HandshakeDeadline: servicetls.FixedDeadline(timeout),
 		MaxConnections: manifest.MaxConnections, MaxPerEndpoint: manifest.MaxConnections, MaxIdlePerEndpoint: 2,
