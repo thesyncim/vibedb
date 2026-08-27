@@ -3,6 +3,7 @@ package gateway
 import (
 	"crypto/sha256"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +56,9 @@ func TestDurableSQLRequestExecutorFusesLoweringCreateAndTypedExecution(t *testin
 	}
 	if _, err = executor.Execute(t.Context(), requestKey, tenant, queries); !errors.Is(err, errTypedServicePin) {
 		t.Fatalf("execute error=%v", err)
+	}
+	if !strings.Contains(err.Error(), "durable SQL execution") || strings.Contains(err.Error(), "message-1") {
+		t.Fatalf("execution diagnostic lost stage or included document contents: %v", err)
 	}
 	if ledger.applies != 1 || ledger.reads != 0 || pins.called != 1 || ledger.head.PlanningLeaseSpan != 64 ||
 		ledger.head.PlanningLeaseExpiryIndex != 66 ||

@@ -941,11 +941,13 @@ func (fixture *durableRF3ExternalFixture) probeMember(group, member int, require
 	ctx, cancel := context.WithTimeout(fixture.ctx, time.Second)
 	defer cancel()
 	route := fixture.routes[group]
-	response, err := fixture.probeClient.DoReplicated(ctx, route.Replicas[member],
-		rf3FixtureProbeRequest(route, serviceauthz.Authority{
-			Node: fixture.nodes[fixture.observerNode], Generation: 5,
-		}, fixture.capability[group]),
-	)
+	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
+		Node: fixture.nodes[fixture.observerNode], Generation: 5,
+	})
+	if err != nil {
+		return shardservice.ReplicatedMemberState{}, err
+	}
+	response, err := fixture.probeClient.ProbeReplicated(ctx, route, route.Replicas[member], fixture.capability[group])
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
 	}

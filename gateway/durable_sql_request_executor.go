@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
@@ -101,13 +102,14 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		return DurableSQLRequestResult{}, err
 	}
 	if home.TopologyGeneration != lease.generation {
-		return DurableSQLRequestResult{}, ErrDurableRequestConflict
+		return DurableSQLRequestResult{}, fmt.Errorf("gateway: SQL catalog generation %d differs from ledger topology %d: %w",
+			lease.generation, home.TopologyGeneration, ErrDurableRequestConflict)
 	}
 	participants, handled, err := executor.planner.planReplicatedSQLTransactionWithData(
 		opctx, lease.snapshot, queries, profile, executor.data,
 	)
 	if err != nil || !handled || len(participants) == 0 {
-		return DurableSQLRequestResult{}, errors.Join(err, ErrDurableSQLRequest)
+		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL lowering: %w", errors.Join(err, ErrDurableSQLRequest))
 	}
 	program, err := BuildDurableRequestLogicalProgram(DurableRequestLogicalProgramBuild{
 		Home: home, Key: key, Tenant: tenant, CatalogGeneration: lease.generation,
@@ -117,12 +119,12 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		PinEpoch:                home.TopologyGeneration, Participants: participants,
 	})
 	if err != nil {
-		return DurableSQLRequestResult{}, err
+		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL program construction: %w", err)
 	}
 	request := DurableRequest{Key: key, Program: program}
 	begin, err := executor.requests.Begin(opctx, request)
 	if err != nil {
-		return DurableSQLRequestResult{}, err
+		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL admission: %w", err)
 	}
 	var outcome DurableRequestOutcome
 	if begin.ProgramMatches {
@@ -142,7 +144,7 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		}
 	}
 	if err != nil {
-		return DurableSQLRequestResult{}, err
+		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL execution (matching plan=%t): %w", begin.ProgramMatches, err)
 	}
 	return executor.result(key, outcome)
 }

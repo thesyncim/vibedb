@@ -18,9 +18,10 @@ type replicatedLeaderHintKey struct {
 }
 
 type replicatedLeaderHintEntry struct {
-	endpoint ReplicatedEndpoint
-	state    shardservice.ReplicatedMemberState
-	valid    bool
+	catalogIncarnation uint64
+	endpoint           ReplicatedEndpoint
+	state              shardservice.ReplicatedMemberState
+	valid              bool
 }
 
 func (entry *replicatedLeaderHintEntry) matches(key replicatedLeaderHintKey) bool {
@@ -133,7 +134,11 @@ func (cache *replicatedLeaderHintCache) lookup(
 	}
 	set.mu.RUnlock()
 	current, _, found := replicatedEndpoint(route, entry.endpoint.Member)
-	if !entry.valid || !found || !sameReplicatedEndpoint(current, entry.endpoint) ||
+	if !entry.valid || !found || current.NodeIncarnation != entry.catalogIncarnation {
+		return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, false
+	}
+	current.NodeIncarnation = entry.endpoint.NodeIncarnation
+	if !sameReplicatedEndpoint(current, entry.endpoint) ||
 		!validReplicatedLeaderHint(route, entry.endpoint, entry.state) {
 		return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, false
 	}
@@ -148,6 +153,16 @@ func (cache *replicatedLeaderHintCache) publish(
 	if !validReplicatedLeaderHint(route, endpoint, state) {
 		return
 	}
+	catalogEndpoint, _, found := replicatedEndpoint(route, endpoint.Member)
+	if !found || catalogEndpoint.NodeIncarnation > endpoint.NodeIncarnation {
+		return
+	}
+	physical := endpoint
+	physical.NodeIncarnation = catalogEndpoint.NodeIncarnation
+	if !sameReplicatedEndpoint(catalogEndpoint, physical) {
+		return
+	}
+	next := replicatedLeaderHintEntry{catalogIncarnation: catalogEndpoint.NodeIncarnation, endpoint: endpoint, state: state, valid: true}
 	key := replicatedLeaderKey(route)
 	set := cache.set(key)
 	if set == nil {
@@ -159,8 +174,10 @@ func (cache *replicatedLeaderHintCache) publish(
 		if entry.matches(key) {
 			// Never let a delayed response for the same allocation overwrite a
 			// newer leadership term.
-			if state.Fence.Term >= entry.state.Fence.Term {
-				*entry = replicatedLeaderHintEntry{endpoint: endpoint, state: state, valid: true}
+			if state.Fence.Term >= entry.state.Fence.Term &&
+				(endpoint.Member != entry.endpoint.Member || endpoint.StoreID != entry.endpoint.StoreID ||
+					endpoint.NodeIncarnation >= entry.endpoint.NodeIncarnation) {
+				*entry = next
 			}
 			set.mu.Unlock()
 			return
@@ -173,7 +190,7 @@ func (cache *replicatedLeaderHintCache) publish(
 			break
 		}
 	}
-	set.entries[way] = replicatedLeaderHintEntry{endpoint: endpoint, state: state, valid: true}
+	set.entries[way] = next
 	set.next = (way + 1) % set.ways
 	set.mu.Unlock()
 }

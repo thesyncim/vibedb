@@ -1561,13 +1561,7 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 			}
 		}
 		visited |= uint64(1) << ordinal
-		response, err := executor.doReplicated(ctx, endpoint,
-			&shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedProbe, Capability: capability,
-				Fence: shardservice.ReplicatedFence{
-					Group: route.Group, AllocationGeneration: route.AllocationGeneration,
-				},
-			})
+		response, observedEndpoint, err := executor.probeReplicated(ctx, route, endpoint, capability)
 		if err != nil {
 			joined = errors.Join(joined, err)
 			member = 0
@@ -1589,6 +1583,7 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 			continue
 		}
 		if response.State.LeaderID == response.State.Fence.MemberID {
+			endpoint = observedEndpoint
 			executor.leaderHints.publish(route, endpoint, response.State)
 			return endpoint, response.State, nil
 		}

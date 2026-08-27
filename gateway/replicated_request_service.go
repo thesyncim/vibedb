@@ -125,7 +125,7 @@ func (service *DurableRequestService) Begin(
 		return DurableRequestBeginResult{}, ErrDurableRequest
 	}
 	if !matchesDurableRequestProgramKey(request.Key, request.Program) {
-		return DurableRequestBeginResult{}, ErrDurableRequestConflict
+		return DurableRequestBeginResult{}, fmt.Errorf("gateway: logical program key mismatch: %w", ErrDurableRequestConflict)
 	}
 	measurement, err := measureDurableRequestPlan(request.Key, request.Program)
 	if err != nil {
@@ -141,7 +141,7 @@ func (service *DurableRequestService) Begin(
 	}
 	matches := durableRequestHeadMatchesMeasurement(head, request.Key, measurement)
 	if !matches && (head.Phase == requestledger.PhasePlanning || head.Phase == requestledger.PhaseExpired) {
-		return DurableRequestBeginResult{}, ErrDurableRequestConflict
+		return DurableRequestBeginResult{}, fmt.Errorf("gateway: unfinished planning measurement mismatch (phase=%d): %w", head.Phase, ErrDurableRequestConflict)
 	}
 	return DurableRequestBeginResult{Home: home, Head: head, Applied: applied,
 		PlanningLeaseExpiryIndex: head.PlanningLeaseExpiryIndex,
@@ -419,7 +419,7 @@ func (service *DurableRequestService) create(
 		return requestledger.HeadRecord{}, 0, false, errors.Join(applyErr, readErr, ErrDurableRequestUnresolved)
 	}
 	if head.RequestDigest != requestledger.Digest(key.Digest) {
-		return requestledger.HeadRecord{}, 0, false, ErrDurableRequestConflict
+		return requestledger.HeadRecord{}, 0, false, fmt.Errorf("gateway: retained Create request digest mismatch: %w", ErrDurableRequestConflict)
 	}
 	return head, applied, false, nil
 }
@@ -514,7 +514,7 @@ func (service *DurableRequestService) drive(
 			return DurableRequestOutcome{}, err
 		}
 		if !durableRequestTerminalMatchesKey(terminal, key, head.PlanRoot) {
-			return DurableRequestOutcome{}, ErrDurableRequestConflict
+			return DurableRequestOutcome{}, fmt.Errorf("gateway: retained terminal key/plan mismatch: %w", ErrDurableRequestConflict)
 		}
 		retirer, ok := service.pins.(DurableRequestExecutionPinRetirer)
 		if ok {
