@@ -168,7 +168,11 @@ func TestChildStageTailApplyRetriesAfterCursorOutcomeUnknown(t *testing.T) {
 		func(batch TailBatch) error {
 			captured = batch
 			return stage.ApplyTailBatch(batch, func(raw []byte) error {
-				if failPersist {
+				cursor, err := OpenChildStageCursor(raw)
+				if err != nil {
+					return err
+				}
+				if failPersist && cursor.pendingBatchDigest == ([32]byte{}) {
 					return failed
 				}
 				return persist(raw)

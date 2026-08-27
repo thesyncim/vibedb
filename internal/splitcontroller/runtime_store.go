@@ -86,6 +86,8 @@ type DurableRuntimeStore struct {
 	states        [7 + autosplit.MaxSplitChildren]runtimeStoredState
 	ownsRuntime   bool
 	closed        bool
+	uncertain     bool
+	syncOperation func(*os.Root) error
 }
 
 type runtimeStoredState struct {
@@ -149,6 +151,16 @@ func openDurableRuntimeStoreAtRoot(
 	manifestDigest [sha256.Size]byte,
 	ownsRuntime bool,
 ) (*DurableRuntimeStore, error) {
+	return openDurableRuntimeStoreAtRootWithSync(runtimeRoot, operation, manifestDigest, ownsRuntime, syncRuntimeRoot)
+}
+
+func openDurableRuntimeStoreAtRootWithSync(
+	runtimeRoot *os.Root,
+	operation OperationID,
+	manifestDigest [sha256.Size]byte,
+	ownsRuntime bool,
+	syncOperation func(*os.Root) error,
+) (*DurableRuntimeStore, error) {
 	if runtimeRoot == nil || operation == (OperationID{}) ||
 		manifestDigest == ([sha256.Size]byte{}) {
 		return nil, ErrRuntimeStore
@@ -185,7 +197,7 @@ func openDurableRuntimeStoreAtRoot(
 	store := &DurableRuntimeStore{
 		runtimeRoot: runtimeRoot, operationRoot: operationRoot,
 		lockFile: lockFile, operation: operation, manifest: manifestDigest,
-		ownsRuntime: ownsRuntime,
+		ownsRuntime: ownsRuntime, syncOperation: syncOperation,
 	}
 	if err = store.recover(); err != nil {
 		_ = store.Close()
@@ -206,6 +218,9 @@ func (s *DurableRuntimeStore) Load(kind RuntimeStateKind, child uint8) (RuntimeS
 	index, _, _, err := runtimeStateSlot(kind, child)
 	if err != nil || s.closed {
 		return RuntimeState{}, false, errors.Join(ErrRuntimeStore, err)
+	}
+	if s.uncertain {
+		return RuntimeState{}, false, ErrRuntimeStoreOutcomeUnknown
 	}
 	state := s.states[index]
 	if !state.has {
@@ -233,6 +248,9 @@ func (s *DurableRuntimeStore) Persist(
 	index, name, limit, err := runtimeStateSlot(kind, child)
 	if err != nil || s.closed || revision == 0 || len(payload) == 0 || len(payload) > limit {
 		return errors.Join(ErrRuntimeStore, err)
+	}
+	if s.uncertain {
+		return ErrRuntimeStoreOutcomeUnknown
 	}
 	current := &s.states[index]
 	if current.has && revision == current.revision && bytes.Equal(payload, current.payload) {
@@ -264,10 +282,12 @@ func (s *DurableRuntimeStore) Persist(
 		return err
 	}
 	if err = replaceRuntimeState(s.operationRoot, temporaryName, name); err != nil {
-		return err
+		s.uncertain = true
+		return errors.Join(ErrRuntimeStoreOutcomeUnknown, err)
 	}
 	renamed = true
-	if err = syncRuntimeRoot(s.operationRoot); err != nil {
+	if err = s.syncOperation(s.operationRoot); err != nil {
+		s.uncertain = true
 		return errors.Join(ErrRuntimeStoreOutcomeUnknown, err)
 	}
 	current.revision = revision
@@ -337,6 +357,13 @@ func (s *DurableRuntimeStore) recover() error {
 			return decodeErr
 		}
 		s.states[index] = runtimeStoredState{revision: revision, payload: payload, has: true}
+	}
+	// A recovered state file may be readable after a failed rename-directory
+	// fence. Complete the exact operation directory's fence before publishing
+	// any recovered state, especially a child preimage receipt that authorizes
+	// independently durable data writes.
+	if err := s.syncOperation(s.operationRoot); err != nil {
+		return errors.Join(ErrRuntimeStoreOutcomeUnknown, err)
 	}
 	return nil
 }

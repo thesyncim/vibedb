@@ -9,7 +9,9 @@ import (
 	"math/bits"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 )
 
 var (
@@ -31,17 +33,19 @@ type childStageImageAccumulator struct {
 }
 
 type childStageImageWorkspace struct {
-	snapshot durable.Snapshot
-	document distribution.DocumentPointWorkspace
-	scan     childStageImageScan
-	visit    func(key, document []byte) error
-	bound    *childStageImageScan
-	scratch  []byte
-	hasher   hash.Hash
-	digest   [sha256.Size]byte
-	value    [sha256.Size]byte
-	size     [8]byte
-	fixed    [56]byte
+	snapshot         durable.Snapshot
+	document         distribution.DocumentPointWorkspace
+	scan             childStageImageScan
+	visit            func(key, document []byte) error
+	bound            *childStageImageScan
+	scratch          []byte
+	hasher           hash.Hash
+	digest           [sha256.Size]byte
+	value            [sha256.Size]byte
+	size             [8]byte
+	fixed            [56]byte
+	canonicalEntries []vibejson.IndexEntry
+	canonical        storeio.CanonicalWorkspace
 }
 
 type childStageImageScan struct {
@@ -71,28 +75,31 @@ func (s *ChildStage) accumulateArtifactRows(cursor *ChildStageCursor, rows Child
 }
 
 func (s *ChildStage) accumulateTailBatch(cursor *ChildStageCursor, batch TailBatch) error {
-	if s == nil || cursor == nil || cursor.phase != ChildStageTail ||
-		len(batch.transitions) != len(batch.routes) {
+	if s == nil || cursor == nil || cursor.phase != ChildStageTail {
 		return ErrChildStage
 	}
 	accumulator := childStageImageAccumulator{
 		rows: cursor.imageRows, bytes: cursor.imageBytes, root: cursor.imageDigest,
 	}
-	for ordinal := range batch.transitions {
-		transition, route := &batch.transitions[ordinal], batch.routes[ordinal]
-		if route.before == batch.Child {
-			before, err := s.partitioner.tailBeforeWitness(transition, &s.image.document)
-			if err != nil || !before.Present || accumulator.removeWitness(
-				&s.image, transition.Key, before.DocumentBytes, before.Digest,
-			) != nil {
+	iterator := batch.Iterator()
+	for iterator.Next() {
+		operation := iterator.Operation()
+		before := operation.BeforeWitness
+		if before.Present {
+			if err := accumulator.removeWitness(
+				&s.image, operation.Key, before.DocumentBytes, before.Digest,
+			); err != nil {
 				return errors.Join(ErrChildStage, err)
 			}
 		}
-		if route.after == batch.Child {
-			if accumulator.addRow(&s.image, transition.Key, transition.After) != nil {
+		if operation.Value != nil {
+			if accumulator.addRow(&s.image, operation.Key, operation.Value) != nil {
 				return ErrChildStage
 			}
 		}
+	}
+	if iterator.wireInvalid {
+		return ErrChildStage
 	}
 	cursor.imageRows, cursor.imageBytes = accumulator.rows, accumulator.bytes
 	cursor.imageDigest = accumulator.root

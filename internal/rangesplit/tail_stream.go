@@ -15,9 +15,8 @@ import (
 var ErrTailBatchWire = errors.New("rangesplit: invalid canonical tail batch")
 
 const (
-	tailBatchWireFormat           = uint16(0)
-	tailBatchWireHeaderBytes      = 440
-	tailBatchOperationHeaderBytes = 12
+	tailBatchWireFormat      = uint16(0)
+	tailBatchWireHeaderBytes = 440
 	// MaxTailBatchWireBytes is an exact aggregate ceiling: one admitted source
 	// command, one fixed operation header per maximum mutation, the authenticated
 	// identity header, and the frame digest. Decoders reject the length before
@@ -94,9 +93,7 @@ func AppendTailBatchWithWorkspace(
 	for iterator.Next() {
 		operation := iterator.Operation()
 		header := frame[at : at+tailBatchOperationHeaderBytes]
-		header[0] = byte(operation.Kind)
-		binary.LittleEndian.PutUint32(header[4:8], uint32(len(operation.Key)))
-		binary.LittleEndian.PutUint32(header[8:12], uint32(len(operation.Value)))
+		putTailOperationHeader(header, operation)
 		at += tailBatchOperationHeaderBytes
 		copy(frame[at:], operation.Key)
 		at += len(operation.Key)
@@ -185,23 +182,10 @@ func validTailBatchWireIdentity(batch TailBatch) bool {
 func measureTailBatchOperations(batch TailBatch) (int, error) {
 	iterator := batch.Iterator()
 	count, bytesCount, encoded := uint64(0), uint64(0), uint64(0)
-	var previous []byte
+	var previous TailOperation
 	for iterator.Next() {
 		operation := iterator.Operation()
-		if len(operation.Key) == 0 || len(operation.Key) > replication.MaxMutationKeyBytes ||
-			previous != nil && bytes.Compare(previous, operation.Key) >= 0 {
-			return 0, ErrTailBatchWire
-		}
-		switch operation.Kind {
-		case replication.MutationPut:
-			if len(operation.Value) == 0 || len(operation.Value) > replication.MaxMutationValueBytes {
-				return 0, ErrTailBatchWire
-			}
-		case replication.MutationDelete:
-			if operation.Value != nil {
-				return 0, ErrTailBatchWire
-			}
-		default:
+		if !validTailOperation(operation, previous) {
 			return 0, ErrTailBatchWire
 		}
 		payload := uint64(len(operation.Key) + len(operation.Value))
@@ -212,40 +196,13 @@ func measureTailBatchOperations(batch TailBatch) (int, error) {
 		count++
 		bytesCount += payload
 		encoded += tailBatchOperationHeaderBytes + payload
-		previous = operation.Key
+		previous = operation
 	}
 	if iterator.wireInvalid || count != batch.Operations || bytesCount != batch.Bytes ||
 		encoded > math.MaxInt {
 		return 0, ErrTailBatchWire
 	}
 	return int(encoded), nil
-}
-
-func openTailWireOperation(raw []byte) (TailOperation, []byte, bool) {
-	if len(raw) < tailBatchOperationHeaderBytes || !allChildArtifactZero(raw[1:4]) {
-		return TailOperation{}, nil, false
-	}
-	keyBytes := uint64(binary.LittleEndian.Uint32(raw[4:8]))
-	valueBytes := uint64(binary.LittleEndian.Uint32(raw[8:12]))
-	payload := keyBytes + valueBytes
-	if keyBytes == 0 || keyBytes > replication.MaxMutationKeyBytes ||
-		valueBytes > replication.MaxMutationValueBytes || payload > uint64(len(raw)-tailBatchOperationHeaderBytes) {
-		return TailOperation{}, nil, false
-	}
-	kind := replication.MutationKind(raw[0])
-	if (kind == replication.MutationPut && valueBytes == 0) ||
-		(kind == replication.MutationDelete && valueBytes != 0) ||
-		(kind != replication.MutationPut && kind != replication.MutationDelete) {
-		return TailOperation{}, nil, false
-	}
-	start := tailBatchOperationHeaderBytes
-	keyEnd := start + int(keyBytes)
-	valueEnd := keyEnd + int(valueBytes)
-	operation := TailOperation{Kind: kind, Key: raw[start:keyEnd:keyEnd]}
-	if kind == replication.MutationPut {
-		operation.Value = raw[keyEnd:valueEnd:valueEnd]
-	}
-	return operation, raw[valueEnd:], true
 }
 
 func tailBatchWireDigest(workspace *TailBatchCodecWorkspace, raw []byte) {

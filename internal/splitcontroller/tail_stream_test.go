@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -228,8 +229,8 @@ func TestTailStreamServiceRejectsBeforeVariableAllocation(t *testing.T) {
 	header[10] = 32
 	total := uint32(rangesplit.MaxTailStreamRequestBytes)
 	header[12], header[13], header[14], header[15] = byte(total), byte(total>>8), byte(total>>16), byte(total>>24)
-	header[16], header[17] = 0, 1   // 256
-	header[20], header[21] = 192, 1 // 448
+	header[16], header[17] = 0, 1 // 256
+	binary.LittleEndian.PutUint32(header[20:24], rangesplit.ChildStageCursorEncodedBytes)
 	batch := uint32(rangesplit.MaxTailBatchWireBytes)
 	header[24], header[25], header[26], header[27] = byte(batch), byte(batch>>8), byte(batch>>16), byte(batch>>24)
 	if _, err = clientSide.Write(header); err != nil {

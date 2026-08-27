@@ -14,17 +14,17 @@ import (
 
 var (
 	ErrChildStage = errors.New("rangesplit: invalid child stage")
-	// ErrChildStageOutcomeUnknown means that destination rows are durable but
-	// cursor replacement did not return a definite outcome. Reopen the cursor
-	// store or retry the exact artifact range or tail batch.
+	// ErrChildStageOutcomeUnknown means cursor replacement did not return a
+	// definite outcome. An uncertain preimage receipt requires reopening the
+	// cursor store before any tail writes; later failures allow exact replay.
 	ErrChildStageOutcomeUnknown = errors.New("rangesplit: child stage cursor outcome unknown")
 )
 
 const DefaultChildStageCheckpointBytes = 64 << 20
 
 // ChildStageCursorPersistence must durably replace the cursor before it
-// returns. raw is borrowed for the call. The stage orders destination updates
-// before cursor persistence, so recovery can replay an uncheckpointed prefix.
+// returns. raw is borrowed for the call. Tail preimage receipts precede all
+// destination writes; completed cursors follow synchronous destination writes.
 type ChildStageCursorPersistence func(raw []byte) error
 
 // ChildStageOptions bounds artifact bytes that a crash can replay. Zero uses
@@ -45,6 +45,9 @@ type ChildStage struct {
 	expected    ChildArtifactManifest
 	collection  *durable.Collection
 	cursor      *ChildStageCursor
+	// A receipt-save error requires an actual persisted-cursor reload. A
+	// successful later callback cannot establish what an earlier failure saved.
+	cursorUncertain bool
 	// sealedVerified records either the incremental proof completed at seal or
 	// the full recovery audit performed while reopening a sealed cursor.
 	// Activation reuses that proof instead of scanning the image again.
@@ -262,8 +265,9 @@ func (s *ChildStage) ReceiveArtifact(
 }
 
 // ApplyTailBatch applies one exact child batch and then advances the durable
-// cursor. An exact retry is a no-op. A failed cursor persistence leaves a safe
-// idempotent replay because the collection remains non-serving and serial.
+// cursor. Before changing rows it verifies their preimages and durably records
+// the exact batch receipt. Recovery can replay only that entry's before/after
+// images while the child remains non-serving and serial.
 func (s *ChildStage) ApplyTailBatch(
 	batch TailBatch,
 	persist ChildStageCursorPersistence,
@@ -273,6 +277,9 @@ func (s *ChildStage) ApplyTailBatch(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.cursorUncertain {
+		return ErrChildStageOutcomeUnknown
+	}
 	if s.cursor == nil ||
 		(s.cursor.phase != ChildStageTail && s.cursor.phase != ChildStageSealed) ||
 		s.partitioner.VerifyTailBatch(batch, &s.tailVerify) != nil ||
@@ -282,6 +289,9 @@ func (s *ChildStage) ApplyTailBatch(
 		return ErrChildStage
 	}
 	current := s.cursor
+	if current.pendingBatchDigest != ([sha256.Size]byte{}) && current.pendingBatchDigest != batch.Digest {
+		return ErrChildStage
+	}
 	if batch.Applied == current.applied {
 		if current.lastBatchDigest != ([sha256.Size]byte{}) &&
 			batch.Digest == current.lastBatchDigest && batch.Term == current.term &&
@@ -302,13 +312,25 @@ func (s *ChildStage) ApplyTailBatch(
 		!s.validTailBatchCoordinates(batch, current.routeGeneration) {
 		return ErrChildStage
 	}
-	if err := s.applyTailOperations(batch); err != nil {
+	if err := s.verifyTailPreimages(batch, current.pendingBatchDigest != ([sha256.Size]byte{})); err != nil {
 		return err
 	}
 	next := *current
 	if err := s.accumulateTailBatch(&next, batch); err != nil {
 		return err
 	}
+	if batch.Operations != 0 && current.pendingBatchDigest == ([sha256.Size]byte{}) {
+		receipt := *current
+		receipt.pendingBatchDigest = batch.Digest
+		if err := s.persistCursor(&receipt, persist); err != nil {
+			s.cursorUncertain = true
+			return err
+		}
+	}
+	if err := s.applyTailOperations(batch); err != nil {
+		return err
+	}
+	next.pendingBatchDigest = [sha256.Size]byte{}
 	next.applied = batch.Applied
 	next.term = batch.Term
 	next.entryDigest = batch.EntryDigest

@@ -133,14 +133,17 @@ func (p *Partitioner) ValidateTailCursor(c TailCursor) error {
 // TailOperation is one borrowed child-local mutation. A moved row becomes a
 // delete in its old child and a put in its new child.
 type TailOperation struct {
-	Kind  replication.MutationKind
-	Key   []byte
-	Value []byte
+	Relation      replication.RelationID
+	Kind          replication.MutationKind
+	Key           []byte
+	Value         []byte
+	BeforeWitness TailBeforeWitness
 }
 
 type tailRoute struct {
-	before uint8
-	after  uint8
+	before  uint8
+	after   uint8
+	witness TailBeforeWitness
 }
 
 // TailBatch is one atomic, idempotence-addressable child advance. Even an
@@ -228,17 +231,8 @@ func (i *TailOperationIterator) Next() bool {
 	for i.next < len(i.transitions) {
 		ordinal := i.next
 		i.next++
-		transition, route := &i.transitions[ordinal], i.routes[ordinal]
-		switch {
-		case route.after == i.child:
-			i.current = TailOperation{
-				Kind: replication.MutationPut, Key: transition.Key, Value: transition.After,
-			}
-			return true
-		case route.before == i.child:
-			i.current = TailOperation{
-				Kind: replication.MutationDelete, Key: transition.Key,
-			}
+		if operation, found := tailOperationForChild(&i.transitions[ordinal], i.routes[ordinal], i.child); found {
+			i.current = operation
 			return true
 		}
 	}
@@ -274,9 +268,10 @@ type TailBatchVerifyWorkspace struct {
 	identity [sha256.Size]byte
 	fixed    [320]byte
 	size     [8]byte
+	document distribution.DocumentPointWorkspace
 }
 
-// TailWorkspace owns the compact two-byte route table, reusable vibejson
+// TailWorkspace owns the compact route/before-witness table, reusable vibejson
 // index, and four reusable SHA-256 states. Reuse it serially.
 type TailWorkspace struct {
 	routes    []tailRoute
@@ -394,6 +389,7 @@ func (p *Partitioner) TranslateTailEntry(
 			}
 			route.before = uint8(child)
 		}
+		route.witness = before
 		if transition.After != nil {
 			if transition.Before != nil && bytes.Equal(transition.Before, transition.After) {
 				route.after = route.before
@@ -416,14 +412,16 @@ func (p *Partitioner) TranslateTailEntry(
 			if !addTailOperation(stats, child, transition.Key, transition.After) {
 				return cursor, TailStats{}, ErrTailEntry
 			}
-			workspace.hashTailOperation(child, replication.MutationPut, transition.Key, transition.After)
+			operation, _ := tailOperationForChild(transition, route, uint8(child))
+			workspace.hashTailOperation(child, operation)
 		}
 		if route.before != tailChildMissing && route.before != route.after {
 			child := int(route.before)
 			if !addTailOperation(stats, child, transition.Key, nil) {
 				return cursor, TailStats{}, ErrTailEntry
 			}
-			workspace.hashTailOperation(child, replication.MutationDelete, transition.Key, nil)
+			operation, _ := tailOperationForChild(transition, route, uint8(child))
+			workspace.hashTailOperation(child, operation)
 		}
 		previousKey = transition.Key
 	}
@@ -515,25 +513,19 @@ func (p *Partitioner) VerifyTailBatch(
 	workspace.identity = batch.ChildBaseDigest
 	_, _ = h.Write(workspace.identity[:])
 	iterator := batch.Iterator()
-	var previousKey []byte
+	var previous TailOperation
 	var operations, bytesCount uint64
 	for iterator.Next() {
 		operation := iterator.Operation()
-		if len(operation.Key) == 0 || len(operation.Key) > replication.MaxMutationKeyBytes ||
-			previousKey != nil && bytes.Compare(previousKey, operation.Key) >= 0 {
+		if !validTailOperation(operation, previous) || operation.Relation != 1 ||
+			operation.BeforeWitness.Present && p.childFor(operation.BeforeWitness.Point) != int(batch.Child) {
 			return ErrTailEntry
 		}
-		switch operation.Kind {
-		case replication.MutationPut:
-			if len(operation.Value) == 0 || len(operation.Value) > replication.MaxMutationValueBytes {
+		if operation.Kind == replication.MutationPut {
+			point, err := p.program.Point(operation.Value, &workspace.document)
+			if err != nil || p.childFor(point) != int(batch.Child) {
 				return ErrTailEntry
 			}
-		case replication.MutationDelete:
-			if operation.Value != nil {
-				return ErrTailEntry
-			}
-		default:
-			return ErrTailEntry
 		}
 		if operations == math.MaxUint64 ||
 			bytesCount > math.MaxUint64-uint64(len(operation.Key))-uint64(len(operation.Value)) {
@@ -541,11 +533,8 @@ func (p *Partitioner) VerifyTailBatch(
 		}
 		operations++
 		bytesCount += uint64(len(operation.Key) + len(operation.Value))
-		workspace.fixed[0] = byte(operation.Kind)
-		_, _ = h.Write(workspace.fixed[:1])
-		hashTailFrame(h, &workspace.size, operation.Key)
-		hashTailFrame(h, &workspace.size, operation.Value)
-		previousKey = operation.Key
+		hashWitnessedTailOperation(h, workspace.fixed[:], operation)
+		previous = operation
 	}
 	if iterator.wireInvalid || operations != batch.Operations || bytesCount != batch.Bytes {
 		return ErrTailEntry
@@ -803,14 +792,9 @@ func (w *TailWorkspace) hashBeforeWitness(h hash.Hash, before TailBeforeWitness)
 
 func (w *TailWorkspace) hashTailOperation(
 	child int,
-	kind replication.MutationKind,
-	key, value []byte,
+	operation TailOperation,
 ) {
-	h := w.hashers[child+1]
-	w.fixed[0] = byte(kind)
-	_, _ = h.Write(w.fixed[:1])
-	w.hashFrame(h, key)
-	w.hashFrame(h, value)
+	hashWitnessedTailOperation(w.hashers[child+1], w.fixed[:], operation)
 }
 
 func (w *TailWorkspace) hashOptionalFrame(h hash.Hash, value []byte) {

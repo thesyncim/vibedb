@@ -156,7 +156,7 @@ func (service *TailStreamService) Serve(ctx context.Context, connection rafttran
 	switch {
 	case !ok:
 		return ErrTailStreamConflict
-	case current == request.Before:
+	case current == request.Before || current.ResumesTailBatch(request.Before, request.Batch):
 		if err = resolved.Target.ApplyTail(ctx, request.Batch); err != nil {
 			return err
 		}
@@ -441,16 +441,16 @@ func validateTailStreamRequestHeader(header []byte) (int, error) {
 		binary.LittleEndian.Uint16(header[8:10]) != 0 ||
 		binary.LittleEndian.Uint16(header[10:12]) != 32 ||
 		binary.LittleEndian.Uint32(header[16:20]) != 256 ||
-		binary.LittleEndian.Uint32(header[20:24]) != 448 ||
+		binary.LittleEndian.Uint32(header[20:24]) != rangesplit.ChildStageCursorEncodedBytes ||
 		!allSplitTailZero(header[28:32]) {
 		return 0, ErrTailStreamControl
 	}
 	total := uint64(binary.LittleEndian.Uint32(header[12:16]))
 	batch := uint64(binary.LittleEndian.Uint32(header[24:28]))
-	minimum := uint64(32 + 256 + 448 + 440 + 2*32)
+	minimum := uint64(32 + 256 + rangesplit.ChildStageCursorEncodedBytes + 440 + 2*32)
 	if total < minimum || total > rangesplit.MaxTailStreamRequestBytes ||
 		batch < 440+32 || batch > uint64(rangesplit.MaxTailBatchWireBytes) ||
-		total != 32+256+448+batch+32 || total > math.MaxInt {
+		total != 32+256+rangesplit.ChildStageCursorEncodedBytes+batch+32 || total > math.MaxInt {
 		return 0, ErrTailStreamControl
 	}
 	return int(total), nil
