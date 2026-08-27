@@ -81,7 +81,7 @@ func (gate *RestoreServingGate) Allows(state raftservice.ServingState) bool {
 }
 
 type RestoreServingControlService struct {
-	gate          *RestoreServingGate
+	gates         map[raftmember.GroupKey]*RestoreServingGate
 	policy        *serviceauthz.Policy
 	readDeadline  rafttransport.DeadlineFunc
 	writeDeadline rafttransport.DeadlineFunc
@@ -90,11 +90,32 @@ type RestoreServingControlService struct {
 func NewRestoreServingControlService(gate *RestoreServingGate, policy *serviceauthz.Policy,
 	readDeadline, writeDeadline rafttransport.DeadlineFunc,
 ) (*RestoreServingControlService, error) {
-	if gate == nil || policy == nil || readDeadline == nil || writeDeadline == nil ||
+	return NewRestoreServingControlRegistryService(
+		[]*RestoreServingGate{gate}, policy, readDeadline, writeDeadline,
+	)
+}
+
+// NewRestoreServingControlRegistryService multiplexes transient grants for all
+// restored groups hosted by one process without weakening their exact group
+// and member bindings.
+func NewRestoreServingControlRegistryService(gates []*RestoreServingGate,
+	policy *serviceauthz.Policy, readDeadline, writeDeadline rafttransport.DeadlineFunc,
+) (*RestoreServingControlService, error) {
+	if len(gates) == 0 || policy == nil || readDeadline == nil || writeDeadline == nil ||
 		len(policy.NodesWith(serviceauthz.CapabilityRestoreActivate)) == 0 {
 		return nil, ErrRestoreServingControl
 	}
-	return &RestoreServingControlService{gate: gate, policy: policy,
+	registry := make(map[raftmember.GroupKey]*RestoreServingGate, len(gates))
+	for _, gate := range gates {
+		if gate == nil || gate.group == (raftmember.GroupKey{}) {
+			return nil, ErrRestoreServingControl
+		}
+		if _, duplicate := registry[gate.group]; duplicate {
+			return nil, ErrRestoreServingControl
+		}
+		registry[gate.group] = gate
+	}
+	return &RestoreServingControlService{gates: registry, policy: policy,
 		readDeadline: readDeadline, writeDeadline: writeDeadline}, nil
 }
 
@@ -125,7 +146,11 @@ func (service *RestoreServingControlService) Serve(ctx context.Context,
 		serviceauthz.CapabilityRestoreActivate) != serviceauthz.DecisionAllow {
 		return ErrRestoreServingUnauthorized
 	}
-	if err := service.gate.Install(grant); err != nil {
+	gate, found := service.gates[grant.Group()]
+	if !found {
+		return ErrRestoreServingControl
+	}
+	if err := gate.Install(grant); err != nil {
 		return err
 	}
 	if deadline := boundedMembershipGrantDeadline(ctx, service.writeDeadline()); deadline.IsZero() {

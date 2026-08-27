@@ -101,6 +101,30 @@ func TestRestoreServingControlRejectsOtherCapabilitiesAndStaleReplica(t *testing
 	}
 }
 
+func TestRestoreServingControlRegistryRejectsDuplicateGroups(t *testing.T) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	node := rafttransport.NodeID{6}
+	gate, err := NewRestoreServingGate(raftmember.RuntimeIdentity{
+		Group: group, MemberID: 1, StoreID: [16]byte{7}, NodeIncarnation: 1,
+	}, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{
+		Node: rafttransport.NodeID{9}, Capabilities: serviceauthz.CapabilityRestoreActivate,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	if _, err = NewRestoreServingControlRegistryService(
+		[]*RestoreServingGate{gate, gate}, policy, deadline, deadline,
+	); !errors.Is(err, ErrRestoreServingControl) {
+		t.Fatalf("duplicate group err=%v", err)
+	}
+}
+
 func restoreServingGrantFixture(t *testing.T, group raftmember.GroupKey, member uint64,
 	node rafttransport.NodeID, store [16]byte, incarnation uint64,
 ) clusterrestore.ServingGrant {

@@ -61,10 +61,10 @@ func (rf3ControlTestHandler) Serve(context.Context, rafttransport.PeerConnection
 
 func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
 	handler := rf3ControlTestHandler{}
-	if mux, err := newRF3ControlMux(handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler); err != nil || mux == nil {
+	if mux, err := newRF3ControlMux(handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler); err != nil || mux == nil {
 		t.Fatalf("all-service mux = %v, %v", mux, err)
 	}
-	if _, err := newRF3ControlMux(nil, handler, handler, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil); err == nil {
+	if _, err := newRF3ControlMux(nil, handler, handler, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("missing mandatory membership service accepted")
 	}
 	if mux, err := newRF3SnapshotMux(handler, handler); err != nil || mux == nil {
@@ -72,6 +72,29 @@ func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
 	}
 	if _, err := newRF3SnapshotMux(nil, nil); err == nil {
 		t.Fatal("empty snapshot mux accepted")
+	}
+}
+
+func TestRestoredRF3PreparingMarkerIsExplicitAndBounded(t *testing.T) {
+	root := t.TempDir()
+	sqlPath := filepath.Join(root, "member.vdb")
+	if restored, err := hasRestoredRF3PreparingMarker(sqlPath); err != nil || restored {
+		t.Fatalf("missing marker restored=%t err=%v", restored, err)
+	}
+	marker := make([]byte, 37)
+	marker[0], marker[36] = 1, 2
+	if err := os.WriteFile(filepath.Join(root, "restore_preparing"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := hasRestoredRF3PreparingMarker(sqlPath); err != nil || !restored {
+		t.Fatalf("valid marker restored=%t err=%v", restored, err)
+	}
+	marker[36] = 3
+	if err := os.WriteFile(filepath.Join(root, "restore_preparing"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := hasRestoredRF3PreparingMarker(sqlPath); err == nil || restored {
+		t.Fatalf("invalid marker restored=%t err=%v", restored, err)
 	}
 }
 

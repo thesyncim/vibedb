@@ -70,6 +70,7 @@ func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
 		policy.NodesWith(serviceauthz.CapabilitySchema)...)
 	nodes = append(nodes, policy.NodesWith(serviceauthz.CapabilityTopology)...)
 	nodes = append(nodes, policy.NodesWith(serviceauthz.CapabilityBackup)...)
+	nodes = append(nodes, policy.NodesWith(serviceauthz.CapabilityRestoreActivate)...)
 	slices.SortFunc(nodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
 	return slices.Compact(nodes)
 }
@@ -443,6 +444,27 @@ func servePreparedRF3WithExecutionLanes(
 		readSources = append(readSources, item.apply)
 		recoverySources = append(recoverySources, item.apply)
 	}
+	restoreGates := make(map[raftmember.GroupKey]*shardservice.RestoreServingGate)
+	restoreGateList := make([]*shardservice.RestoreServingGate, 0, len(preparedSet.groups))
+	for index := range preparedSet.groups {
+		item := &preparedSet.groups[index]
+		restored, markerErr := hasRestoredRF3PreparingMarker(item.manifest.SQL.Path)
+		if markerErr != nil {
+			return closeAdopted(markerErr)
+		}
+		if !restored {
+			continue
+		}
+		itemGroup := groupFromBinding(item.base.Binding)
+		restoreGate, gateErr := shardservice.NewRestoreServingGate(
+			identities[index], profile.LocalIdentity().Node,
+		)
+		if gateErr != nil {
+			return closeAdopted(gateErr)
+		}
+		restoreGates[itemGroup] = restoreGate
+		restoreGateList = append(restoreGateList, restoreGate)
+	}
 	runtimePublication, _ := runtimes[0].Publication()
 
 	servingRegistry, err := raftserve.NewRegistry(rf3RegistryLimitsForGroups(len(runtimes)))
@@ -815,10 +837,23 @@ func servePreparedRF3WithExecutionLanes(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
+	var restoreServingControl shardcontrol.Handler
+	if len(restoreGateList) != 0 {
+		restoreServingControl, err = shardservice.NewRestoreServingControlRegistryService(
+			restoreGateList, policy, deadline, deadline,
+		)
+		if err != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+	}
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
 		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
+		restoreServingControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
@@ -837,9 +872,14 @@ func servePreparedRF3WithExecutionLanes(
 			err = server.BindAuthorization(gate, nil)
 		}
 		if err == nil {
-			err = server.BindServingAuthority(rf3NativeServingAuthority(
-				transportRegistry, manifest, group, base,
-			))
+			baseServing := rf3NativeServingAuthority(transportRegistry, manifest, group, base)
+			err = server.BindServingAuthority(func(state raftservice.ServingState) bool {
+				if !baseServing(state) {
+					return false
+				}
+				restoreGate, restored := restoreGates[state.Identity.Group]
+				return !restored || restoreGate.Allows(state)
+			})
 		}
 		if err == nil && manifest.EnrolledTarget != nil &&
 			base.Binding.MemberID == manifest.EnrolledTarget.MemberID {
@@ -970,9 +1010,9 @@ func servePreparedRF3WithExecutionLanes(
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
 	membership, observation, metrics, backup, source, action, split, schema, planObservation, admission, tail,
-	terminal, childPrepare shardcontrol.Handler,
+	terminal, childPrepare, restoreServing shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 13)
+	routes := make([]shardcontrol.Route, 0, 14)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -1046,7 +1086,32 @@ func newRF3ControlMux(
 			Handler:       childPrepare,
 		})
 	}
+	if restoreServing != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: shardservice.RestoreServingRequestDiscriminator(), Handler: restoreServing,
+		})
+	}
 	return shardcontrol.New(routes...)
+}
+
+func hasRestoredRF3PreparingMarker(sqlPath string) (bool, error) {
+	if sqlPath == "" {
+		return false, errRF3Serving
+	}
+	path := filepath.Join(filepath.Dir(sqlPath), "restore_preparing")
+	raw, err := readRF3BoundedFile(path, 37)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || len(raw) != 37 {
+		return false, errors.Join(errRF3Serving, err)
+	}
+	var digest [32]byte
+	copy(digest[:], raw[:32])
+	if digest == ([32]byte{}) || raw[36] >= 3 {
+		return false, errRF3Serving
+	}
+	return true, nil
 }
 
 func newRF3SnapshotMux(source, artifact shardcontrol.Handler) (*shardcontrol.Mux, error) {
