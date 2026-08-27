@@ -457,7 +457,7 @@ func newMultiGroupRF3DurableGateway(
 	if err != nil {
 		t.Fatal(err)
 	}
-	waves, err := gateway.NewDurableRequestLifecycleRunner(ledger, resolver, native)
+	waves, err := gateway.NewDurableRequestLifecycleRunner(ledger, resolver, native, principal)
 	if err != nil {
 		t.Fatal(err)
 	}

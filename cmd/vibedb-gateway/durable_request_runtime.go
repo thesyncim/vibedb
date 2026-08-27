@@ -56,7 +56,7 @@ func newReplicatedDurableRuntime(
 	if err != nil {
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)
 	}
-	waves, err := gateway.NewDurableRequestLifecycleRunner(ledger, resolver, options.Replicated)
+	waves, err := gateway.NewDurableRequestLifecycleRunner(ledger, resolver, options.Replicated, options.Authority)
 	if err != nil {
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 // DurableRequestWave is one already-sealed physical work item. Target and
@@ -68,22 +69,25 @@ type durableRequestExecutionPinFencer interface {
 // therefore bounded by bytes and the persisted uint64 wave ordinal, not by an
 // aggregate participant slice or a policy participant cap.
 type DurableRequestLifecycleRunner struct {
-	ledger    DurableRequestLedger
-	resolver  DurableRequestRouteResolver
-	proposer  durableRequestWaveProposer
-	pinFencer durableRequestExecutionPinFencer
+	ledger       DurableRequestLedger
+	resolver     DurableRequestRouteResolver
+	proposer     durableRequestWaveProposer
+	pinFencer    durableRequestExecutionPinFencer
+	pinAuthority serviceauthz.Authority
 }
 
 func NewDurableRequestLifecycleRunner(
 	ledger DurableRequestLedger,
 	resolver DurableRequestRouteResolver,
 	executor *ReplicatedExecutor,
+	pinAuthority serviceauthz.Authority,
 ) (*DurableRequestLifecycleRunner, error) {
-	if ledger == nil || resolver == nil || executor == nil {
+	if ledger == nil || resolver == nil || executor == nil || !pinAuthority.Valid() {
 		return nil, ErrDurableRequest
 	}
 	return &DurableRequestLifecycleRunner{
 		ledger: ledger, resolver: resolver, proposer: executor, pinFencer: executor,
+		pinAuthority: pinAuthority,
 	}, nil
 }
 
@@ -525,6 +529,16 @@ func (runner *DurableRequestLifecycleRunner) fenceWaveSideEffect(
 	ctx context.Context,
 	wave DurableRequestWave,
 ) error {
+	// The hidden pin belongs to the gateway service, not the data principal.
+	// Scope delegation to this read: participant proposals retain the original
+	// caller context, and no authority is derived from the supplied lease.
+	if runner.pinAuthority.Valid() {
+		var err error
+		ctx, err = serviceauthz.WithAuthority(ctx, runner.pinAuthority)
+		if err != nil {
+			return err
+		}
+	}
 	_, err := runner.pinFencer.ValidateExecutionPinFence(
 		ctx, wave.ExecutionPinRoute, wave.ExecutionPinLease, wave.ExecutionPinLease.Applied,
 	)

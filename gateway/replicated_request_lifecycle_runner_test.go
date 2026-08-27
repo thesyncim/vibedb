@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 var errLifecycleRunnerFault = errors.New("lifecycle runner fault")
@@ -146,21 +147,25 @@ func (resolver *lifecycleRunnerResolver) ResolveDurableRequestParticipant(
 }
 
 type lifecycleRunnerProposer struct {
-	t            testing.TB
-	events       *lifecycleRunnerEvents
-	faultKind    int
-	faultGate    routegate.Operation
-	attempts     map[replication.CommandKind][][]byte
-	fenceCalls   int
-	fenceFaultAt int
+	t                   testing.TB
+	events              *lifecycleRunnerEvents
+	faultKind           int
+	faultGate           routegate.Operation
+	attempts            map[replication.CommandKind][][]byte
+	fenceCalls          int
+	fenceFaultAt        int
+	fenceAuthorities    []serviceauthz.Authority
+	proposalAuthorities []serviceauthz.Authority
 }
 
 func (proposer *lifecycleRunnerProposer) ValidateExecutionPinFence(
-	_ context.Context,
+	ctx context.Context,
 	_ ReplicatedRoute,
 	_ executionpin.LeaseCertificate,
 	_ uint64,
 ) (ReplicatedExecutionPinReadResult, error) {
+	authority, _ := serviceauthz.FromContext(ctx)
+	proposer.fenceAuthorities = append(proposer.fenceAuthorities, authority)
 	proposer.fenceCalls++
 	proposer.events.add("fence")
 	if proposer.fenceFaultAt == proposer.fenceCalls {
@@ -170,10 +175,12 @@ func (proposer *lifecycleRunnerProposer) ValidateExecutionPinFence(
 }
 
 func (proposer *lifecycleRunnerProposer) Propose(
-	_ context.Context,
+	ctx context.Context,
 	_ ReplicatedRoute,
 	exact []byte,
 ) (ReplicatedResult, error) {
+	authority, _ := serviceauthz.FromContext(ctx)
+	proposer.proposalAuthorities = append(proposer.proposalAuthorities, authority)
 	view, err := replication.OpenCommand(exact)
 	if err != nil {
 		return ReplicatedResult{}, err
@@ -433,6 +440,56 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 			}
 			if resolver.calls < 3 {
 				t.Fatalf("route resolutions=%d, want at least acquire/work/release", resolver.calls)
+			}
+		})
+	}
+}
+
+func TestDurableRequestLifecycleRunnerScopesPinAuthority(t *testing.T) {
+	service := serviceauthz.Authority{Node: [16]byte{0x51}, Generation: 7}
+	user := serviceauthz.Authority{Node: [16]byte{0x61}, Generation: 9}
+	for _, caller := range []serviceauthz.Authority{{}, user} {
+		t.Run(fmt.Sprintf("caller-%x", caller.Node[0]), func(t *testing.T) {
+			wave, initial, route := lifecycleRunnerFixture(t)
+			events := new(lifecycleRunnerEvents)
+			ledger := &lifecycleRunnerLedger{head: initial, events: events}
+			resolver := &lifecycleRunnerResolver{route: route, events: events}
+			executor := &ReplicatedExecutor{}
+			for _, invalid := range []serviceauthz.Authority{{}, {Node: service.Node}, {Generation: service.Generation}} {
+				if _, err := NewDurableRequestLifecycleRunner(ledger, resolver, executor, invalid); !errors.Is(err, ErrDurableRequest) {
+					t.Fatalf("invalid service authority accepted: %v", err)
+				}
+			}
+			runner, err := NewDurableRequestLifecycleRunner(ledger, resolver, executor, service)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proposer := &lifecycleRunnerProposer{t: t, events: events, faultKind: -1,
+				attempts: make(map[replication.CommandKind][][]byte)}
+			runner.proposer, runner.pinFencer = proposer, proposer
+			ctx := t.Context()
+			if caller.Valid() {
+				ctx, err = serviceauthz.WithAuthority(ctx, caller)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := runner.RunWave(ctx, wave); err != nil {
+				t.Fatal(err)
+			}
+			if len(proposer.fenceAuthorities) != 1 || len(proposer.proposalAuthorities) != 3 {
+				t.Fatalf("fences=%d proposals=%d", len(proposer.fenceAuthorities), len(proposer.proposalAuthorities))
+			}
+			if proposer.fenceAuthorities[0] != service {
+				t.Fatal("internal pin read did not use configured service authority")
+			}
+			for _, actual := range proposer.proposalAuthorities {
+				if actual != caller {
+					t.Fatal("service authority leaked into participant proposal")
+				}
+			}
+			if actual, _ := serviceauthz.FromContext(ctx); actual != caller {
+				t.Fatal("caller context changed")
 			}
 		})
 	}
