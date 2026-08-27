@@ -6,6 +6,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/clusterrestore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -19,12 +20,17 @@ type RestoreCatalog interface {
 	ObserveRestoreActivation(context.Context, [32]byte) (clusterrestore.CatalogWitness, error)
 }
 
+type RestoreServingInstaller interface {
+	Install(context.Context, rafttransport.NodeID, clusterrestore.ServingGrant) error
+}
+
 type RestoreActivationOptions struct {
 	Root      string
 	Staging   *clusterbackup.RestoreStagingRoot
 	Operation clusterrestore.Operation
 	Installer clusterrestore.GroupInstaller
 	Catalog   RestoreCatalog
+	Serving   RestoreServingInstaller
 	Gate      *serviceauthz.Gate
 	Operator  serviceauthz.Authority
 	Fault     func(clusterrestore.FaultPoint) error
@@ -61,6 +67,18 @@ func ActivateRestore(ctx context.Context, options RestoreActivationOptions) (
 	authority, err := activation.AuthorizeServing(observed)
 	if err != nil {
 		return nil, clusterrestore.ServingPermit{}, errors.Join(ErrRestoreActivation, err)
+	}
+	if options.Serving == nil {
+		return nil, clusterrestore.ServingPermit{}, ErrRestoreActivation
+	}
+	grants, err := authority.Grants()
+	if err != nil {
+		return nil, clusterrestore.ServingPermit{}, errors.Join(ErrRestoreActivation, err)
+	}
+	for _, grant := range grants {
+		if err = options.Serving.Install(bound, grant.Node(), grant); err != nil {
+			return nil, clusterrestore.ServingPermit{}, errors.Join(ErrRestoreActivation, err)
+		}
 	}
 	return authority, activation.Permit, nil
 }

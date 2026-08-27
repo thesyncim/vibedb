@@ -60,6 +60,7 @@ func (activation Activation) AuthorizeServing(observed CatalogWitness) (*Serving
 type ServingAuthority struct {
 	operation [32]byte
 	catalog   [32]byte
+	groups    []raftmember.GroupKey
 	replicas  map[raftmember.GroupKey][3]ReplicaIdentity
 }
 
@@ -91,8 +92,10 @@ func NewServingAuthority(operation Operation, roots []RootWitness, catalog Catal
 		return nil, ErrActivation
 	}
 	authority := &ServingAuthority{operation: opened.Digest, catalog: catalog.CatalogDigest,
+		groups:   make([]raftmember.GroupKey, 0, len(opened.Targets)),
 		replicas: make(map[raftmember.GroupKey][3]ReplicaIdentity, len(opened.Targets))}
 	for _, target := range opened.Targets {
+		authority.groups = append(authority.groups, target.Group)
 		authority.replicas[target.Group] = target.Replicas
 	}
 	return authority, nil

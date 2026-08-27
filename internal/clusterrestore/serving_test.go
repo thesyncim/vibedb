@@ -20,6 +20,18 @@ func TestServingAuthorityRequiresCompleteCatalogObservedActivation(t *testing.T)
 		authority.AllowsReplica(operation.Certificate.Groups[0].Group, first.Member, first.Store, 1) {
 		t.Fatal("stale incarnation or source group admitted")
 	}
+	grants, err := authority.Grants()
+	if err != nil || len(grants) != len(operation.Targets)*3 {
+		t.Fatalf("grants=%d err=%v", len(grants), err)
+	}
+	for index, grant := range grants {
+		group, replica := index/3, index%3
+		want := operation.Targets[group]
+		if grant.Group() != want.Group || grant.Member() != uint64(replica+1) ||
+			grant.Node() != want.Replicas[replica].Node || grant.Store() != want.Replicas[replica].Store {
+			t.Fatalf("grant %d does not preserve canonical target order", index)
+		}
+	}
 
 	for name, mutate := range map[string]func(*[]RootWitness, *CatalogWitness, *ServingPermit){
 		"partial": func(roots *[]RootWitness, _ *CatalogWitness, _ *ServingPermit) {

@@ -48,6 +48,26 @@ func (authority *ServingAuthority) Grant(group raftmember.GroupKey, member uint6
 	return grant, nil
 }
 
+// Grants returns the complete deterministic group-major/member-major grant
+// vector. A coordinator must install every grant before reporting activation
+// success; repeated installation is exact and idempotent.
+func (authority *ServingAuthority) Grants() ([]ServingGrant, error) {
+	if authority == nil || len(authority.groups) == 0 {
+		return nil, ErrActivation
+	}
+	grants := make([]ServingGrant, 0, len(authority.groups)*3)
+	for _, group := range authority.groups {
+		for member := uint64(1); member <= 3; member++ {
+			grant, err := authority.Grant(group, member)
+			if err != nil {
+				return nil, err
+			}
+			grants = append(grants, grant)
+		}
+	}
+	return grants, nil
+}
+
 func (grant ServingGrant) Operation() [32]byte        { return grant.operation }
 func (grant ServingGrant) CatalogWitness() [32]byte   { return grant.catalog }
 func (grant ServingGrant) Group() raftmember.GroupKey { return grant.group }
