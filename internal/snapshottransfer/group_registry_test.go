@@ -70,6 +70,10 @@ func TestGroupDataRegistryRoutesExactGroupAndRejectsCrossGroupArtifact(t *testin
 	if _, serveErr := requestGroupChunk(t, router, target2, d1); !errors.Is(serveErr, ErrStaleFence) {
 		t.Fatalf("wrong target incarnation err=%v", serveErr)
 	}
+	coordinator := rafttransport.PeerIdentity{TrustDomain: registry.TrustDomain(), Node: rafttransport.NodeID{0xf1}}
+	if _, serveErr := requestGroupChunk(t, router, coordinator, d1); !errors.Is(serveErr, ErrStaleFence) {
+		t.Fatalf("non-learner coordinator read artifact bytes: %v", serveErr)
+	}
 	_ = source
 }
 
@@ -91,10 +95,12 @@ func TestGroupSourceControlRegistryRoutesExactGroup(t *testing.T) {
 	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
 	exporter1 := &testSourceExporter{descriptor: descriptor1}
 	exporter2 := &testSourceExporter{descriptor: descriptor2}
-	newService := func(request SourceControlRequest, exporter *testSourceExporter) *SourceControlService {
+	newService := func(request SourceControlRequest, peer rafttransport.PeerIdentity, exporter *testSourceExporter) *SourceControlService {
 		service, err := NewSourceControlService(SourceControlOptions{
 			Journal:  &memorySourceJournal{records: make(map[[32]byte]SourceControlRecord)},
-			Exporter: exporter, Authorize: func(_ rafttransport.PeerIdentity, got SourceControlRequest) bool { return got == request },
+			Exporter: exporter, Authorize: func(gotPeer rafttransport.PeerIdentity, got SourceControlRequest) bool {
+				return gotPeer == peer && got == request
+			},
 			ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 1,
 		})
 		if err != nil {
@@ -104,7 +110,7 @@ func TestGroupSourceControlRegistryRoutesExactGroup(t *testing.T) {
 	}
 	router, err := NewGroupSourceControlRegistry(GroupSourceControlRegistryOptions{
 		Registry: registry, ReadDeadline: deadline, MaxConnections: 2,
-		Services: []GroupSourceControlService{{Group: request1.Group, Service: newService(request1, exporter1)}, {Group: request2.Group, Service: newService(request2, exporter2)}},
+		Services: []GroupSourceControlService{{Group: request1.Group, Service: newService(request1, target1, exporter1)}, {Group: request2.Group, Service: newService(request2, target2, exporter2)}},
 	})
 	if err != nil {
 		t.Fatal(err)

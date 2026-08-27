@@ -209,13 +209,10 @@ func (registry *GroupSourceControlRegistry) Serve(
 	if service == nil {
 		return ErrSourceUnauthorized
 	}
-	peer := connection.PeerIdentity()
-	if command != sourceControlAbandon {
-		targetMember, memberErr := registry.registry.Member(request.Group, peer.Node)
-		if memberErr != nil || targetMember != request.TargetMember {
-			return ErrSourceUnauthorized
-		}
-	}
+	// The control actor may be a policy-authorized coordinator rather than
+	// the learner receiving the artifact. The selected service authenticates
+	// that actor and the exact source/target request before journal access.
+	// Snapshot data access independently remains bound to the target member.
 	localMember, err := registry.registry.LocalMember(request.Group)
 	if err != nil || localMember != request.SourceMember {
 		return ErrSourceUnauthorized
