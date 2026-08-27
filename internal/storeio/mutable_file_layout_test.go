@@ -10,19 +10,20 @@ func TestMutableStoreLayoutGeometry(t *testing.T) {
 		pageSize  uint32
 		roots     [2]uint64
 		journals  [2]uint64
+		manifest  uint64
 		dataStart uint64
 	}{
 		{
 			pageSize: 4096, roots: [2]uint64{0, 4096},
-			journals: [2]uint64{8192, 12288}, dataStart: 16384,
+			journals: [2]uint64{8192, 12288}, manifest: 16384, dataStart: 24576,
 		},
 		{
 			pageSize: 8192, roots: [2]uint64{0, 8192},
-			journals: [2]uint64{16384, 20480}, dataStart: 24576,
+			journals: [2]uint64{16384, 20480}, manifest: 24576, dataStart: 32768,
 		},
 		{
 			pageSize: 65536, roots: [2]uint64{0, 65536},
-			journals: [2]uint64{131072, 135168}, dataStart: 196608,
+			journals: [2]uint64{131072, 135168}, manifest: 139264, dataStart: 196608,
 		},
 	}
 	for _, tc := range tests {
@@ -32,6 +33,7 @@ func TestMutableStoreLayoutGeometry(t *testing.T) {
 		}
 		if layout.RootOffsets != tc.roots ||
 			layout.MaterializationJournalOffsets != tc.journals ||
+			layout.GenerationMigrationManifestOffset != tc.manifest ||
 			layout.DataStart != tc.dataStart {
 			t.Fatalf(
 				"MutableStoreLayout(%d) = %#v, want roots=%v journals=%v data=%d",
@@ -49,6 +51,12 @@ func TestMutableStoreLayoutGeometry(t *testing.T) {
 					tc.pageSize, offset,
 				)
 			}
+		}
+		manifestEnd := layout.GenerationMigrationManifestOffset +
+			generationMigrationManifestCopies*GenerationMigrationManifestBytes
+		if layout.GenerationMigrationManifestOffset%GenerationMigrationManifestBytes != 0 ||
+			manifestEnd > layout.DataStart {
+			t.Fatalf("MutableStoreLayout(%d) migration manifest escapes reserved prefix", tc.pageSize)
 		}
 	}
 }
