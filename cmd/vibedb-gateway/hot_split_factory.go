@@ -68,6 +68,10 @@ func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
 	if err != nil {
 		return nil, err
 	}
+	operation, err := splitcontroller.OperationIDForSplit(catalog.Generation(), split, partitioner)
+	if err != nil {
+		return nil, err
+	}
 	targets := make([]splitcontroller.ChildTarget, 0, int(split.ChildCount)-1)
 	for child := uint8(0); child < split.ChildCount; child++ {
 		descriptor, _ := split.Child(int(child))
@@ -75,17 +79,27 @@ func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
 			continue
 		}
 		target, buildErr := factory.buildChildTarget(
-			catalog, admission, child, descriptor, source, profile,
+			catalog, [32]byte(operation), child, descriptor, source, profile,
 		)
 		if buildErr != nil {
 			return nil, buildErr
 		}
 		targets = append(targets, target)
 	}
-	if err = factory.prepareTargets(ctx, admission, split, profile.Table, targets); err != nil {
+	configuration := factory.sources[source.Group]
+	plan, err := splitcontroller.NewPlan(catalog, split, partitioner, targets, splitcontroller.PlanSourceSchema{
+		SQL: configuration.SQL, Placement: configuration.Placement, LocalIndexes: configuration.LocalIndexes,
+	})
+	if err != nil {
 		return nil, err
 	}
-	return splitcontroller.NewPlan(catalog, split, partitioner, targets)
+	if plan.OperationID() != operation {
+		return nil, hotshard.ErrInvalidPressureCut
+	}
+	if err = factory.prepareTargets(ctx, [32]byte(operation), split, profile.Table, targets); err != nil {
+		return nil, err
+	}
+	return plan, nil
 }
 
 func gatewayHotSplitSource(
@@ -208,15 +222,11 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 			AllocationGeneration: descriptor.AllocationGeneration,
 			LogID:                gatewayHotSplitID("log", admission, child, uint8(index)),
 		}
-		limits := sqldriver.ReplicatedShardStoreLimits{
-			MaxKeyBytes: int(profile.MaxKeyBytes), MaxDocumentBytes: int(profile.MaxDocumentBytes),
-			MaxBatchDocuments: template.MaxBatchDocuments,
-			MaxBatchBytes:     template.MaxBatchBytes,
+		storages := make([]string, configuration.SQL.RelationCount)
+		for relation := range storages {
+			storages[relation] = gatewayHotSplitStorage("relation-"+strconv.Itoa(relation+1), admission, child, uint8(index))
 		}
-		base, baseErr := sqldriver.NewReplicatedChildShardStoreIdentity(
-			local, binding, profile.Table,
-			gatewayHotSplitStorage("user", admission, child, uint8(index)), profile.PrimaryKey, limits,
-		)
+		base, baseErr := sqldriver.NewReplicatedChildShardStoreBundleIdentity(local, binding, configuration.SQL, storages)
 		if baseErr != nil {
 			return splitcontroller.ChildTarget{}, baseErr
 		}
@@ -251,11 +261,15 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 			CertificateDigest: gatewayHotSplitDigest("certificate", admission, child, uint8(index)),
 		}
 	}
+	childDigest, digestErr := sqldriver.ReplicatedSchemaManifest(replicas[0].SQL, replicas[0].Apply.Placement, configuration.LocalIndexes)
+	if digestErr != nil {
+		return splitcontroller.ChildTarget{}, digestErr
+	}
 	return splitcontroller.ChildTarget{
 		Child: child, Endpoint: replicas[0].NativeEndpoint, Replicas: replicas,
 		ReplicaSetVersion:      source.Command.ReplicaSetVersion,
-		RelationManifestDigest: source.Command.RelationManifestDigest,
-		WAL:                    replicas[0].WAL, TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch,
+		RelationManifestDigest: childDigest, LocalIndexes: cloneGatewaySplitIndexes(configuration.LocalIndexes),
+		WAL: replicas[0].WAL, TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch,
 		Authority: authority, SQL: replicas[0].SQL.Clone(),
 	}, nil
 }

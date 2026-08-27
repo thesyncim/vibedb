@@ -2,10 +2,6 @@ package replicatedstate
 
 import (
 	"crypto/sha256"
-	"strings"
-	"unicode/utf8"
-
-	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -16,22 +12,24 @@ func InitialJSONRelationManifest(schemaGeneration uint64, name string,
 	limits CollectionLimits, validationDigest [sha256.Size]byte,
 	indexes []store.IndexDefinition,
 ) ([sha256.Size]byte, error) {
-	if schemaGeneration == 0 || name == "" || len(name) > replication.MaxIdentityBytes ||
-		!utf8.ValidString(name) || strings.IndexByte(name, 0) >= 0 || name == systemCollectionName ||
-		validationDigest == ([sha256.Size]byte{}) || limits.MaxKeyBytes <= 0 ||
-		limits.MaxKeyBytes > replication.MaxMutationKeyBytes || limits.MaxDocumentBytes <= 0 ||
-		limits.MaxDocumentBytes > replication.MaxMutationValueBytes || limits.MaxDistinctMutations <= 0 ||
-		limits.MaxDistinctMutations > MaxDistinctMutations || limits.MaxBatchBytes <= 0 {
+	relations := [1]RelationCollection{{Relation: 1, Kind: RelationJSON, Name: name,
+		Target: CollectionTarget{Validation: ValidationDeterministicMutation,
+			ValidationDigest: validationDigest, Limits: limits},
+		LocalIndexes: indexes,
+	}}
+	return InitialRelationManifest(schemaGeneration, relations[:])
+}
+
+// InitialRelationManifest computes a complete bundle's serving schema before
+// destination storage exists. It shares canonicalization and the digest grammar
+// with OpenBundle but grants no storage, durability or serving authority.
+func InitialRelationManifest(schemaGeneration uint64, input []RelationCollection) ([sha256.Size]byte, error) {
+	if schemaGeneration == 0 {
 		return [sha256.Size]byte{}, ErrInvalidCollection
 	}
-	canonical, err := canonicalLocalIndexes(indexes)
+	relations, err := prepareRelationSchemas(input)
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
-	relations := [1]relationCollection{{id: 1, kind: RelationJSON, name: name,
-		target: CollectionTarget{Validation: ValidationDeterministicMutation,
-			ValidationDigest: validationDigest, Limits: limits},
-		localIndexes: canonical,
-	}}
-	return relationManifestDigest(schemaGeneration, relations[:]), nil
+	return relationManifestDigest(schemaGeneration, relations), nil
 }

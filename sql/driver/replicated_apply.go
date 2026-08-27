@@ -674,16 +674,10 @@ func replicatedApplyRelations(
 	if baseTable == nil || baseTable.collection == nil {
 		return nil, ErrReplicatedApplyMismatch
 	}
-	baseTarget := replicatedstate.CollectionTarget{
-		Collection:             baseTable.collection,
-		Validation:             replicatedstate.ValidationProfile(apply.ValidationProfile),
-		ValidationDigest:       apply.ValidationDigest,
-		Validator:              newReplicatedSQLMutationValidator(base, baseTable, apply.Placement),
-		ObserveMutationAttempt: claim.observeMutationAttempt,
-		Limits:                 replicatedStateCollectionLimits(base.UserLimits),
+	result, err := replicatedRelationSchemas(base, apply, replicatedApplyLocalIndexes(baseTable))
+	if err != nil {
+		return nil, err
 	}
-	logicalManifest := replicatedRelationApplyManifestDigest(base)
-	result := make([]replicatedstate.RelationCollection, int(base.RelationCount))
 	for ordinal := range result {
 		relation := base.Relations[ordinal]
 		table := database.tables[relation.Table]
@@ -692,39 +686,19 @@ func replicatedApplyRelations(
 				"%w: relation %q is unavailable", ErrReplicatedApplyMismatch, relation.Table,
 			)
 		}
-		spec := replicatedstate.RelationCollection{
-			Relation: replication.RelationID(relation.Relation), Name: relation.Table,
-			Target: replicatedstate.CollectionTarget{
-				Collection: table.collection,
-				Validation: replicatedstate.ValidationDeterministicMutation,
-				Limits:     replicatedStateCollectionLimits(relation.Limits),
-			},
-		}
+		spec := &result[ordinal]
+		spec.Target.Collection = table.collection
 		switch relation.Kind {
 		case ReplicatedShardRelationJSON:
-			spec.Kind = replicatedstate.RelationJSON
-			spec.Target = baseTarget
-			spec.LocalIndexes = replicatedApplyLocalIndexes(table)
+			spec.Target.Validator = newReplicatedSQLMutationValidator(base, baseTable, apply.Placement)
+			spec.Target.ObserveMutationAttempt = claim.observeMutationAttempt
 		case ReplicatedShardRelationGlobalIndex:
-			spec.Kind = replicatedstate.RelationGlobalIndex
-			spec.Target.ValidationDigest = replicatedGlobalIndexValidationDigest(
-				base, relation, logicalManifest,
-			)
 			spec.Target.Validator = replicatedGlobalIndexMutationValidator{
 				relation: relation, placement: apply.Placement.Range,
-			}
-			spec.GlobalIndex = replicatedstate.GlobalIndexProfile{
-				IndexID: relation.IndexID, Incarnation: relation.Incarnation,
-				LocatorCount: relation.LocatorCount, Unique: relation.Unique,
-				KeyEncoding:  replicatedstate.GlobalIndexKeyEncoding(relation.KeyEncoding),
-				KeyArity:     relation.KeyArity,
-				TupleVersion: relation.TupleVersion, MapperVersion: relation.MapperVersion,
-				BucketBits: relation.BucketBits,
 			}
 		default:
 			return nil, ErrReplicatedApplyMismatch
 		}
-		result[ordinal] = spec
 	}
 	return result, nil
 }
@@ -1796,23 +1770,45 @@ func (a *ReplicatedApply) ApplyNormal(
 	meta raftmodel.ApplyMeta,
 	data []byte,
 ) (raftmodel.Publication, error) {
+	publication, _, err := a.applyNormal(meta, data, false)
+	return publication, err
+}
+
+// ApplyNormalWithCompletion carries the original durable result to the Raft
+// settlement lane without changing explicit post-apply lookup semantics.
+func (a *ReplicatedApply) ApplyNormalWithCompletion(
+	meta raftmodel.ApplyMeta, data []byte,
+) (raftmodel.Publication, []byte, error) {
+	return a.applyNormal(meta, data, true)
+}
+
+func (a *ReplicatedApply) applyNormal(
+	meta raftmodel.ApplyMeta, data []byte, captureCompletion bool,
+) (raftmodel.Publication, []byte, error) {
 	if a == nil || a.database == nil {
-		return raftmodel.Publication{}, ErrReplicatedApplyClosed
+		return raftmodel.Publication{}, nil, ErrReplicatedApplyClosed
 	}
 	a.database.mu.Lock()
 	defer a.database.mu.Unlock()
 	if err := a.checkLocked(); err != nil {
-		return raftmodel.Publication{}, err
+		return raftmodel.Publication{}, nil, err
 	}
 	if err := a.checkActivationBaseLocked(); err != nil {
-		return raftmodel.Publication{}, err
+		return raftmodel.Publication{}, nil, err
 	}
 	a.attemptGeneration = a.table.collection.Generation()
 	a.attemptActive = true
-	publication, err := a.machine.ApplyNormal(meta, data)
+	var publication raftmodel.Publication
+	var completion []byte
+	var err error
+	if captureCompletion {
+		publication, completion, err = a.machine.ApplyNormalWithCompletion(meta, data)
+	} else {
+		publication, err = a.machine.ApplyNormal(meta, data)
+	}
 	a.attemptActive = false
 	a.attemptGeneration = 0
-	return publication, err
+	return publication, completion, err
 }
 
 // ApplyNormalBatch implements raftmodel.NormalBatchStateMachine under one SQL

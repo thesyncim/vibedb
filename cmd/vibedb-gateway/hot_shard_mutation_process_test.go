@@ -97,7 +97,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	apply := sqldriver.ReplicatedApplyOptions{MaxSessions: 64, RetryWindow: 16,
 		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024,
 			MaxBytes: 384 << 20}, Placement: sqldriver.ReplicatedPlacementProfile{
-			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "id",
+			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 			TupleVersion:  distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion,
 			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
@@ -976,6 +976,14 @@ func hotMutationControlManifest(t *testing.T, root string, nodes [5]rafttranspor
 				TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
 				SchemaGeneration: profile.SchemaGeneration, RelationManifestDigest: source.Command.RelationManifestDigest,
 				Table: profile.Table, Template: gatewaySplitTemplateFixture()}
+			identityRaw, err := os.ReadFile(filepath.Join(root, "group-0-member-1", "sql-identity.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := entry.SQL.UnmarshalJSON(identityRaw); err != nil {
+				t.Fatal(err)
+			}
+			entry.LocalIndexes = []persistedGatewaySplitIndex{{Name: "by_kind", Paths: []string{"/kind"}}}
 			entry.Template.MaxSessions, entry.Template.RetryWindow, entry.Template.TxnLimits = apply.MaxSessions, apply.RetryWindow, apply.TxnLimits
 			entry.Template.Format, entry.Template.ShardKey = apply.Placement.Format, placement.Columns[0]
 			entry.Template.TupleVersion, entry.Template.MapperVersion = uint16(apply.Placement.TupleVersion), uint16(apply.Placement.MapperVersion)

@@ -3,20 +3,24 @@ package main
 import (
 	"encoding/hex"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
 func TestGatewaySplitSourceCanonicalBounds(t *testing.T) {
 	_, persisted := gatewayReplicaManifestFixture(t)
-	entry := persistedGatewaySplitSource{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
-		TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
-		SchemaGeneration: 1, RelationManifestDigest: [32]byte{5}, Table: "messages", Template: gatewaySplitTemplateFixture()}
+	_, source, profile, _ := gatewayHotSplitFactoryFixture(t)
+	entry := persistedGatewaySplitSource{ClusterID: source.Group.ClusterID, ClusterIncarnation: source.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
+		SchemaGeneration: profile.SchemaGeneration, RelationManifestDigest: source.Command.RelationManifestDigest, Table: profile.Table,
+		SQL: gatewaySplitSourceSQLFixture(t, source, profile), Template: gatewaySplitTemplateFixture()}
 	for i := 0; i < 3; i++ {
 		entry.Replicas = append(entry.Replicas, persistedGatewaySplitReplica{
 			Node: persisted.ShardEndpoints[i].Node, ChildRoot: filepath.Join(t.TempDir(), "split-children")})
@@ -76,16 +80,21 @@ func TestGatewaySplitSourceRejectsWrongRoleSchemaAndDescendant(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := gatewayHotSplitSources(manifest, catalog)
-	if err != nil || first[source.Group] != second[source.Group] {
+	if err != nil || !reflect.DeepEqual(first[source.Group], second[source.Group]) {
 		t.Fatal("restart changed authority", err)
 	}
 	for name, mutate := range map[string]func(*gatewaySplitSource){
-		"wrong role":       func(s *gatewaySplitSource) { s.Table = "catalog" },
-		"wrong generation": func(s *gatewaySplitSource) { s.SchemaGeneration++ },
-		"wrong digest":     func(s *gatewaySplitSource) { s.RelationManifestDigest[0]++ },
-		"wrong placement":  func(s *gatewaySplitSource) { s.Template.ShardKey = "/tenant" },
-		"wrong group":      func(s *gatewaySplitSource) { s.Group.GroupID[0]++ },
-		"wrong node":       func(s *gatewaySplitSource) { s.Replicas[0].Node[0]++ },
+		"wrong role":         func(s *gatewaySplitSource) { s.Table = "catalog" },
+		"wrong generation":   func(s *gatewaySplitSource) { s.SchemaGeneration++ },
+		"wrong digest":       func(s *gatewaySplitSource) { s.RelationManifestDigest[0]++ },
+		"wrong placement":    func(s *gatewaySplitSource) { s.Template.ShardKey = "/tenant" },
+		"wrong group":        func(s *gatewaySplitSource) { s.Group.GroupID[0]++ },
+		"wrong node":         func(s *gatewaySplitSource) { s.Replicas[0].Node[0]++ },
+		"missing SQL":        func(s *gatewaySplitSource) { s.SQL.Relations = nil },
+		"foreign SQL member": func(s *gatewaySplitSource) { s.SQL.Binding.MemberID++ },
+		"foreign local indexes": func(s *gatewaySplitSource) {
+			s.LocalIndexes = []store.IndexDefinition{{Name: "foreign", Paths: []string{"/foreign"}}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			copyEntry := entry
@@ -146,6 +155,8 @@ func TestGatewaySplitSourcesSelectSeparateRootsOnSharedHosts(t *testing.T) {
 	other.Distribution = "other"
 	otherProfile := profile
 	otherProfile.Table = "other_messages"
+	other.Command.RelationManifestDigest = gatewaySplitSourceDigestFixture(t, other, otherProfile)
+	otherProfile.RelationManifestDigest = other.Command.RelationManifestDigest
 	oldManifest, _ := initial.Manifest(source.Distribution)
 	otherManifest, err := distribution.NewManifest(other.Distribution, 7, []distribution.Shard{{ID: other.Shard,
 		AllocationGeneration: other.AllocationGeneration, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},

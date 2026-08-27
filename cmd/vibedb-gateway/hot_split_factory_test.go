@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -12,9 +13,11 @@ import (
 	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	"github.com/thesyncim/vibedb/internal/topologyscheduler"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing.T) {
@@ -42,15 +45,41 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	if !ok || descriptor.Retained {
 		t.Fatalf("child=%+v ok=%t", descriptor, ok)
 	}
-	target, err := factory.buildChildTarget(catalog, admission, 1, descriptor, source, profile)
+	partitioner, err := rangesplit.NewPartitioner(split, profile.Table, []string{profile.PrimaryKey}, distribution.DefaultVirtualBucketBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := splitcontroller.OperationIDForSplit(catalog.Generation(), split, partitioner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := factory.buildChildTarget(catalog, [32]byte(operation), 1, descriptor, source, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(target.Replicas) != gateway.ServingReplicaCount ||
-		target.RelationManifestDigest != source.Command.RelationManifestDigest {
+		target.RelationManifestDigest == source.Command.RelationManifestDigest {
 		t.Fatalf("target=%+v", target)
 	}
-	operationDirectory := hex.EncodeToString(admission[:])
+	configuration := sources[source.Group]
+	plan, err := splitcontroller.NewPlan(catalog, split, partitioner, []splitcontroller.ChildTarget{target}, splitcontroller.PlanSourceSchema{
+		SQL: configuration.SQL, Placement: configuration.Placement, LocalIndexes: configuration.LocalIndexes,
+	})
+	if err != nil {
+		t.Fatalf("factory target rejected by production plan: %v", err)
+	}
+	if plan.OperationID() != operation {
+		t.Fatal("planned operation differs from prepared allocation")
+	}
+	raw, err := splitcontroller.AppendPlanIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := splitcontroller.OpenPlanIntent(raw, catalog)
+	if err != nil || reopened.OperationID() != operation {
+		t.Fatalf("reopen exact planned intent: %v", err)
+	}
+	operationDirectory := hex.EncodeToString(operation[:])
 	localDigests := make(map[[32]byte]struct{}, gateway.ServingReplicaCount)
 	for index, replica := range target.Replicas {
 		if replica.Node != source.Replicas[index].Node ||
@@ -62,8 +91,8 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 		}
 		localDigests[replica.SQL.RelationManifestDigest] = struct{}{}
 		preparation, prepareErr := splitcontroller.NewChildPreparation(
-			splitcontroller.OperationID(admission),
-			gatewayHotSplitDigest("allocation", admission, target.Child, 0),
+			operation,
+			gatewayHotSplitDigest("allocation", [32]byte(operation), target.Child, 0),
 			descriptor, profile.Table, target, uint8(index),
 		)
 		if prepareErr != nil || !reflect.DeepEqual(preparation.ReplicaTarget().SQL, replica.SQL) {
@@ -79,10 +108,44 @@ func gatewaySplitSourceFixture(t testing.TB, source gateway.ReplicatedShardDescr
 	t.Helper()
 	entry := gatewaySplitSource{Group: source.Group, SchemaGeneration: profile.SchemaGeneration,
 		RelationManifestDigest: source.Command.RelationManifestDigest, Table: profile.Table, Template: gatewaySplitTemplateFixture()}
+	entry.SQL = gatewaySplitSourceSQLFixture(t, source, profile)
 	for i, replica := range source.Replicas {
 		entry.Replicas[i] = gatewaySplitReplica{Node: replica.Node, Root: t.TempDir()}
 	}
 	return entry
+}
+
+func gatewaySplitSourceSQLFixture(t testing.TB, source gateway.ReplicatedShardDescriptor, profile gateway.ReplicatedTableProfile) sqldriver.ReplicatedShardStoreIdentity {
+	t.Helper()
+	binding := sqldriver.ReplicatedShardStoreBinding{ClusterID: source.Group.ClusterID, ClusterIncarnation: source.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch, Distribution: string(source.Distribution), Shard: string(source.Shard),
+		AllocationGeneration: uint64(source.AllocationGeneration), ShardIncarnation: source.Group.ShardIncarnation, GroupID: source.Group.GroupID,
+		MemberID: source.Replicas[0].Member, StoreID: source.Replicas[0].StoreID,
+		Authority: sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: source.Command.ActivePolicyGeneration,
+			ProtectionEpoch: source.Command.ProtectionEpoch, OwnershipEpoch: source.Command.OwnershipEpoch, SchemaGeneration: source.Command.SchemaGeneration,
+			RoutingVersion: source.Command.RoutingVersion, RouteGeneration: source.Command.RouteGeneration}}
+	template := gatewaySplitTemplateFixture()
+	base, err := sqldriver.NewReplicatedChildShardStoreIdentity(sqldriver.ShardStoreIdentity{Distribution: source.Distribution, Shard: source.Shard,
+		AllocationGeneration: source.AllocationGeneration, LogID: [16]byte{0x81}}, binding, profile.Table, strings.Repeat("91", 32), profile.PrimaryKey,
+		sqldriver.ReplicatedShardStoreLimits{MaxKeyBytes: int(profile.MaxKeyBytes), MaxDocumentBytes: int(profile.MaxDocumentBytes),
+			MaxBatchDocuments: template.MaxBatchDocuments, MaxBatchBytes: template.MaxBatchBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base
+}
+
+func gatewaySplitSourceDigestFixture(t testing.TB, source gateway.ReplicatedShardDescriptor, profile gateway.ReplicatedTableProfile) [32]byte {
+	t.Helper()
+	template := gatewaySplitTemplateFixture()
+	digest, err := sqldriver.ReplicatedSchemaManifest(gatewaySplitSourceSQLFixture(t, source, profile),
+		sqldriver.ReplicatedPlacementProfile{Format: template.Format, ShardKey: template.ShardKey,
+			TupleVersion: distribution.TupleVersion(template.TupleVersion), MapperVersion: distribution.MapperVersion(template.MapperVersion),
+			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
 }
 
 func gatewayHotSplitFactoryFixture(
@@ -119,6 +182,8 @@ func gatewayHotSplitFactoryFixture(
 		RelationManifestDigest: replication.Digest{0x51}, MaxKeyBytes: 256,
 		MaxDocumentBytes: 4 << 20,
 	}
+	source.Command.RelationManifestDigest = gatewaySplitSourceDigestFixture(t, source, profile)
+	profile.RelationManifestDigest = replication.Digest(source.Command.RelationManifestDigest)
 	endpoints := map[distribution.EndpointID]string{
 		"peer-a": "127.0.0.1:1", "peer-b": "127.0.0.1:2", "peer-c": "127.0.0.1:3",
 		"native-a": "127.0.0.1:11", "native-b": "127.0.0.1:12", "native-c": "127.0.0.1:13",

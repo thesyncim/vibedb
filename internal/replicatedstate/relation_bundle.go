@@ -89,8 +89,27 @@ func prepareRelationCollections(
 	binding Binding,
 	input []RelationCollection,
 ) ([]relationCollection, [sha256.Size]byte, error) {
+	relations, err := prepareRelationSchemas(input)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, err
+	}
+	for _, spec := range input {
+		if err := validateRelationTarget(spec); err != nil {
+			return nil, [sha256.Size]byte{}, fmt.Errorf("relation %d: %w", spec.Relation, err)
+		}
+	}
+	manifest := relationManifestDigest(binding.SchemaGeneration, relations)
+	for ordinal := range relations {
+		relations[ordinal].contract = relationContractDigest(manifest, &relations[ordinal])
+	}
+	return relations, manifest, nil
+}
+
+// prepareRelationSchemas is shared by cold allocation and live OpenBundle.
+// It never substitutes a collection or a mutation validator for live serving.
+func prepareRelationSchemas(input []RelationCollection) ([]relationCollection, error) {
 	if len(input) == 0 || len(input) > replication.MaxRelationsPerBundle {
-		return nil, [sha256.Size]byte{}, ErrInvalidCollection
+		return nil, ErrInvalidCollection
 	}
 	relations := make([]relationCollection, len(input))
 	for ordinal := range input {
@@ -100,25 +119,25 @@ func prepareRelationCollections(
 			len(spec.Name) > replication.MaxIdentityBytes ||
 			!utf8.ValidString(spec.Name) || strings.IndexByte(spec.Name, 0) >= 0 ||
 			spec.Name == systemCollectionName {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"%w: relation slot %d identity", ErrInvalidCollection, ordinal+1,
 			)
 		}
 		for prior := 0; prior < ordinal; prior++ {
 			if spec.Name == input[prior].Name {
-				return nil, [sha256.Size]byte{}, fmt.Errorf(
+				return nil, fmt.Errorf(
 					"%w: duplicate relation name", ErrInvalidCollection,
 				)
 			}
 		}
-		if err := validateRelationTarget(*spec); err != nil {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
+		if err := validateRelationSchema(*spec); err != nil {
+			return nil, fmt.Errorf(
 				"relation %d: %w", spec.Relation, err,
 			)
 		}
 		indexes, err := canonicalLocalIndexes(spec.LocalIndexes)
 		if err != nil {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"relation %d: %w", spec.Relation, err,
 			)
 		}
@@ -127,11 +146,7 @@ func prepareRelationCollections(
 			target: spec.Target, localIndexes: indexes, globalIndex: spec.GlobalIndex,
 		}
 	}
-	manifest := relationManifestDigest(binding.SchemaGeneration, relations)
-	for ordinal := range relations {
-		relations[ordinal].contract = relationContractDigest(manifest, &relations[ordinal])
-	}
-	return relations, manifest, nil
+	return relations, nil
 }
 
 func validateBundleTransactionProfile(
@@ -221,21 +236,34 @@ func RequiredBundleTransactionDocuments(
 }
 
 func validateRelationTarget(spec RelationCollection) error {
+	if err := validateRelationSchema(spec); err != nil {
+		return err
+	}
 	t := spec.Target
 	if t.Collection == nil || t.Collection.HasSchema() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() ||
-		t.Collection.HasOpaqueValues() || t.Validation != ValidationDeterministicMutation ||
-		t.ValidationDigest == ([sha256.Size]byte{}) || t.Validator == nil {
+		t.Collection.HasOpaqueValues() || t.Validator == nil {
+		return ErrInvalidCollection
+	}
+	l := t.Limits
+	if l.MaxKeyBytes != t.Collection.MaxKeyBytes() || l.MaxDocumentBytes != t.Collection.MaxDocumentBytes() ||
+		l.MaxDistinctMutations != t.Collection.MaxBatchDocuments() || l.MaxBatchBytes != t.Collection.MaxBatchBytes() ||
+		spec.Kind == RelationGlobalIndex && t.Collection.HasIndexes() {
+		return ErrInvalidCollection
+	}
+	return nil
+}
+
+func validateRelationSchema(spec RelationCollection) error {
+	t := spec.Target
+	if t.Validation != ValidationDeterministicMutation || t.ValidationDigest == ([sha256.Size]byte{}) {
 		return ErrInvalidCollection
 	}
 	l := t.Limits
 	if l.MaxKeyBytes <= 0 || l.MaxKeyBytes > replication.MaxMutationKeyBytes ||
 		l.MaxDocumentBytes <= 0 || l.MaxDocumentBytes > replication.MaxMutationValueBytes ||
 		l.MaxDistinctMutations <= 0 || l.MaxDistinctMutations > MaxDistinctMutations ||
-		l.MaxBatchBytes <= 0 || l.MaxKeyBytes != t.Collection.MaxKeyBytes() ||
-		l.MaxDocumentBytes != t.Collection.MaxDocumentBytes() ||
-		l.MaxDistinctMutations != t.Collection.MaxBatchDocuments() ||
-		l.MaxBatchBytes != t.Collection.MaxBatchBytes() {
+		l.MaxBatchBytes <= 0 {
 		return ErrInvalidCollection
 	}
 	switch spec.Kind {
@@ -252,7 +280,7 @@ func validateRelationTarget(spec RelationCollection) error {
 			profile.TupleVersion != distribution.CurrentTupleVersion ||
 			profile.MapperVersion != distribution.NativeMapperVersion ||
 			!distribution.ValidVirtualBucketBits(profile.BucketBits) ||
-			len(spec.LocalIndexes) != 0 || t.Collection.HasIndexes() {
+			len(spec.LocalIndexes) != 0 {
 			return ErrInvalidCollection
 		}
 	default:
