@@ -22,11 +22,29 @@ type dynamicPayloadLedger struct {
 
 func (ledger *dynamicPayloadLedger) ApplyCAS(
 	_ context.Context,
-	_ DurableRequestLedgerHome,
-	_ requestledger.RequestKey,
+	home DurableRequestLedgerHome,
+	key requestledger.RequestKey,
 	cas DurableRequestLifecycleCAS,
 ) (DurableRequestLifecycleCASResult, error) {
-	var err error
+	// Exercise the production command grammar before applying the fake's
+	// deterministic rows. Otherwise its independent build revision can silently
+	// accept a head revision that real RF3 encoding rejects before submission.
+	keyDigest, err := requestledger.KeyDigest(key)
+	if err != nil {
+		return DurableRequestLifecycleCASResult{}, err
+	}
+	command, err := durableRequestLifecycleCommand(keyDigest, cas)
+	if err != nil {
+		return DurableRequestLifecycleCASResult{}, err
+	}
+	command.Home, command.ExpectedRangeIdentity = home.Point, requestledger.Digest(home.Identity)
+	raw, err := requestledger.AppendCommand(nil, command)
+	if err != nil {
+		return DurableRequestLifecycleCASResult{}, err
+	}
+	if _, err = requestledger.OpenCommandInto(raw, nil); err != nil {
+		return DurableRequestLifecycleCASResult{}, err
+	}
 	switch cas.Operation {
 	case requestledger.OperationBeginPayloadBuild:
 		if ledger.build != (requestledger.PayloadBuildRecord{}) {
@@ -170,6 +188,34 @@ func TestDurableRequestDynamicPayloadResumesEveryStageBoundary(t *testing.T) {
 				!bytes.Equal(payload.Target, target) || !bytes.Equal(payload.Command, command) ||
 				len(ledger.chunks) != 2 {
 				t.Fatal("resumed payload differs from exact staged bytes")
+			}
+		})
+	}
+}
+
+func TestDurableRequestDynamicPayloadStartsIndependentBuildRevision(t *testing.T) {
+	for _, revision := range []uint64{1, 37} {
+		t.Run(fmt.Sprintf("head_revision_%d", revision), func(t *testing.T) {
+			store, ledger, home, key, target, command := newDynamicPayloadFixture(t)
+			ledger.head.Revision = revision
+			before := ledger.head
+			beforeRaw, err := requestledger.AppendHead(nil, before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := store.Stage(t.Context(), home, key, target, command)
+			if err != nil {
+				t.Fatalf("new build encoded against head revision instead of absent build: %v", err)
+			}
+			afterRaw, err := requestledger.AppendHead(nil, ledger.head)
+			if err != nil || !bytes.Equal(afterRaw, beforeRaw) || payload.Build.PriorContinuationDigest != before.ContinuationDigest ||
+				payload.Build.WaveOrdinal != before.NextStepOrdinal || payload.Build.KeyDigest != before.KeyDigest ||
+				payload.Build.RequestDigest != before.RequestDigest || payload.Build.PlanRoot != before.PlanRoot {
+				t.Fatal("independent build revision changed its sealed head binding")
+			}
+			retry, err := store.Stage(t.Context(), home, key, target, command)
+			if err != nil || retry.Build != payload.Build || !bytes.Equal(retry.Bytes, payload.Bytes) {
+				t.Fatalf("exact retry changed winning build: %v", err)
 			}
 		})
 	}

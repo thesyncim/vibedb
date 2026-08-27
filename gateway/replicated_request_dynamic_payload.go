@@ -89,8 +89,11 @@ func (store *DurableRequestDynamicPayloadStore) Stage(
 			return DurableRequestDynamicPayload{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 		result, applyErr := store.ledger.ApplyCAS(ctx, home, key, DurableRequestLifecycleCAS{
-			Operation:        requestledger.OperationBeginPayloadBuild,
-			ExpectedRevision: head.Revision, Revision: build.Revision,
+			Operation: requestledger.OperationBeginPayloadBuild,
+			// The build row has its own revision domain, beginning at absent->1.
+			// Its authenticated head identity, wave and continuation remain bound
+			// inside PayloadBuild; the head's revision is not a build revision.
+			ExpectedRevision: 0, Revision: build.Revision,
 			PayloadBuild: build,
 		})
 		if applyErr != nil {
