@@ -715,8 +715,7 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 			return Action{}, ErrTopologyConflict
 		}
 		if observed.Prune != nil &&
-			observed.Prune.Phase() == rangesplit.RetainedPruneComplete &&
-			plan.sourceStateAheadOfCompletion(observed.SourceState, certificate, *observed.Prune) {
+			plan.sourceStateAheadOfPrune(observed.SourceState, certificate, *observed.Prune) {
 			captureHead, captureOK := observationCaptureHead(observed)
 			if !captureOK || captureHead != observed.SourceState.Applied {
 				return Action{}, ErrTopologyConflict
@@ -832,7 +831,11 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 	return Action{Kind: ActionPublishCatalog, CatalogGeneration: plan.next}, nil
 }
 
-func (p *Plan) sourceStateAheadOfCompletion(
+// The source may apply the dedicated prune session or the pending delete
+// before its cursor is advanced. Reconciliation schedules only a bounded
+// capture-suffix verification; the pruner must prove each intervening entry
+// before it can delete anything else or certify completion.
+func (p *Plan) sourceStateAheadOfPrune(
 	state replicatedstate.State,
 	certificate rangesplit.CutoverCertificate,
 	prune rangesplit.RetainedPruneCursor,

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -335,6 +336,27 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	verifying := pruner.Cursor()
 	observed.Prune = &verifying
 	assertCrashRecovery(observed, ActionPruneRetained)
+	progressRequest, err := appendRemoteStepRequest(nil, plan, observed, Action{Kind: ActionPruneRetained})
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressPayload, err := openRemoteStepPayload(progressRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressObserved, err := openRemoteWitnessObservation(progressPayload)
+	if err != nil || progressObserved.Prune == nil {
+		t.Fatalf("remote prune lost its durable progress cursor: %v", err)
+	}
+	progressRaw, err := rangesplit.AppendRetainedPruneCursor(nil, progressObserved.Prune)
+	if err != nil || !bytes.Equal(progressRaw, pruneRaw) {
+		t.Fatalf("remote prune cursor differs from the observed durable cut: %v", err)
+	}
+	progressPayload.Prune = bytes.Clone(progressPayload.Prune)
+	progressPayload.Prune[len(progressPayload.Prune)-1] ^= 1
+	if remoteStepPredecessorDigest(progressPayload) == progressPayload.PredecessorDigest {
+		t.Fatal("prune cursor was not bound to the exact action predecessor")
+	}
 	pruner, err = rangesplit.NewRetainedPruner(
 		plan.partitioner, certificate, authority, pruneRaw,
 	)
@@ -383,6 +405,9 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	observed.SourceState = state
 	observed.SourceStatus = testLeaderStatus(state)
 	assertCrashRecovery(observed, ActionPruneRetained)
+	lagging := observed
+	lagging.Prune = &verifying
+	assertCrashRecovery(lagging, ActionPruneRetained)
 	lateCut, err := source.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
@@ -409,6 +434,47 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	if _, err := plan.BuildCatalogTransition(next, state, certificate); err == nil {
 		t.Fatal("already-published catalog accepted as a new transition source")
 	}
+	t.Run("certified-source-action-after-session-open", func(t *testing.T) {
+		runtimeStore, err := OpenDurableRuntimeStore(t.TempDir(), plan.OperationID(), testManifestDigest("prune-local"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer runtimeStore.Close()
+		if err = runtimeStore.PersistRetainedPrune(1, prune); err != nil {
+			t.Fatal(err)
+		}
+		local, err := NewLocalSourceActions(runtimeStore, source.machine, source.capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local.active = capture
+		witness := observed
+		witness.Capture, witness.CaptureHead = nil, observed.SourceState.Applied
+		witness.Children = [autosplit.MaxSplitChildren]*ChildObservation{}
+		witness.SourceServing = sourceServingState(t, source.machine, witness.SourceState)
+		// Session admission occurs after the exact remote action was frozen.
+		if _, err := source.machine.ApplyNormal(raftmodel.ApplyMeta{
+			Index: state.Applied + 1, Term: state.LastTerm, Type: pb.EntryNormal,
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if !activeCaptureContainsObservation(capture, witness) {
+			t.Fatal("exact predecessor was not proved from the capture")
+		}
+		forged := witness
+		forged.SourceState.LastEntryDigest[0]++
+		if activeCaptureContainsObservation(capture, forged) {
+			t.Fatal("capture accepted a forged predecessor entry")
+		}
+		if err = local.ExecuteCertifiedPruneRetained(t.Context(), plan, witness, witness.SourceServing,
+			testRetainedPruneProposer{}, rangesplit.RetainedPruneLimits{}); err != nil {
+			t.Fatalf("certified local prune required remote readiness or a stale applied cut: %v", err)
+		}
+		advanced, _, present, err := runtimeStore.LoadRetainedPrune(plan.partitioner, certificate)
+		if err != nil || !present || advanced.SourceCut().Applied != state.Applied+1 {
+			t.Fatalf("prune did not verify the intervening entry: present=%t err=%v", present, err)
+		}
+	})
 }
 
 type flowSource struct {

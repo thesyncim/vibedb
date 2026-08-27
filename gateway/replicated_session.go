@@ -335,9 +335,10 @@ func NativeSessionSupportsMutationBound(
 	if count > maxKeyBytes {
 		count = maxKeyBytes
 	}
-	if count <= 0 || maxKeyBytes > count*replication.MaxMutationKeyBytes {
-		return false
-	}
+	// These are independent upper bounds, not a requirement to fill both.
+	// A loose byte ceiling cannot make a bounded key batch unrepresentable:
+	// each individual key is already capped by the command grammar.
+	maxKeyBytes = min(maxKeyBytes, count*replication.MaxMutationKeyBytes)
 	largest := (maxKeyBytes + count - 1) / count
 	dummy := make([]byte, largest)
 	mutations := make([]replication.Mutation, count)

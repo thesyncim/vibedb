@@ -96,6 +96,7 @@ func TestTopologyMutationJournalsExactCertifiedFingerprintAcrossUnknown(t *testi
 		t.Fatal(err)
 	}
 	if !NativeSessionSupportsMutationBound(session, 1, 4, 1024) ||
+		!NativeSessionSupportsMutationBound(session, 1, 4, 1<<20) ||
 		NativeSessionSupportsMutationBound(session, 1, 5, 1024) {
 		t.Fatal("native session mutation bounds were not enforced exactly")
 	}

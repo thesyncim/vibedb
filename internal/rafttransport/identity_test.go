@@ -717,6 +717,53 @@ func TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity(t *testing
 	}
 }
 
+func TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 6)
+	identity := peerTLSTestIdentity(17, 61)
+	profile := newPeerTLSTestProfile(t, authority, identity)
+	local := profile.WithLocalGatewayControlConnections()
+	if profile.localGatewayControl || local == profile || !local.localGatewayControl || local.localServices {
+		t.Fatal("gateway control opt-in mutated or widened the original profile")
+	}
+	for _, class := range []TrafficClass{TrafficGatewayControl, TrafficGatewayClient, TrafficOrdinary,
+		TrafficShardSQL, TrafficShardNative, TrafficSnapshot, TrafficShardControl} {
+		t.Run(fmt.Sprintf("class-%d", class), func(t *testing.T) {
+			for _, enabled := range []bool{false, true} {
+				selected := profile
+				if enabled {
+					selected = local
+				}
+				client, server, clientErr, serverErr := peerTLSTestHandshake(t, selected, selected, identity.Node, class, class)
+				if client != nil {
+					_ = client.Close()
+				}
+				if server != nil {
+					_ = server.Close()
+				}
+				if enabled && class == TrafficGatewayControl {
+					if clientErr != nil || serverErr != nil || client == nil || server == nil {
+						t.Fatalf("authenticated local drain connection failed: client=%v server=%v", clientErr, serverErr)
+					}
+				} else if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
+					t.Fatalf("unexpected self connection: enabled=%t client=%v server=%v", enabled, clientErr, serverErr)
+				}
+			}
+		})
+	}
+	wrongNode := identity.Node
+	wrongNode[0]++
+	client, server, clientErr, serverErr := peerTLSTestHandshake(t, local, local, wrongNode, TrafficGatewayControl, TrafficGatewayControl)
+	if client != nil {
+		_ = client.Close()
+	}
+	if server != nil {
+		_ = server.Close()
+	}
+	if !errors.Is(clientErr, ErrWrongPeer) {
+		t.Fatalf("gateway control opt-in bypassed exact peer: client=%v server=%v", clientErr, serverErr)
+	}
+}
+
 func TestPeerTLSRechecksCertificateTimeAtHandshake(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 8)
 	clientIdentity := peerTLSTestIdentity(23, 31)

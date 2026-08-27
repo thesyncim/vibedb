@@ -153,13 +153,16 @@ func (a *LocalSourceActions) ExecuteCertifiedPruneRetained(
 		) {
 		return ErrInvalidPlan
 	}
-	action, err := Reconcile(plan, observed)
-	if err != nil || action.Kind != ActionPruneRetained {
+	// Publication and the exact drain certificate already establish the
+	// gateway's child-readiness decision. Do not require remote runtime cuts
+	// again in this source-local, authenticated action.
+	stage, err := plan.catalogStage(observed.Catalog)
+	if err != nil || stage != catalogTarget || plan.validateSourceObservation(observed) != nil {
 		return errors.Join(ErrTopologyConflict, err)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !activeCaptureMatchesObservation(a.active, observed) {
+	if !activeCaptureContainsObservation(a.active, observed) {
 		return ErrTopologyConflict
 	}
 	manifestDigest, err := a.runtime.RangeSplitRelationManifestDigest()
@@ -178,6 +181,36 @@ func (a *LocalSourceActions) ExecuteCertifiedPruneRetained(
 		return errors.Join(ErrTopologyConflict, err)
 	}
 	return a.executeCertifiedPruneLocked(ctx, plan, observed, serving, proposer, limits, certificate, proof)
+}
+
+// A topology-session Open (or a prior unknown prune outcome) can advance the
+// retained source after the gateway freezes its witness. Verify its exact
+// ancestor in the capture, not just a monotonic index. The pruner then consumes
+// the authenticated suffix in bounded steps before planning any more deletes.
+func activeCaptureContainsObservation(active *rangesplit.SourceCapture, observed Observation) bool {
+	if active == nil {
+		return false
+	}
+	head, ok := observationCaptureHead(observed)
+	state := observed.SourceState
+	if !ok || head != state.Applied {
+		return false
+	}
+	descriptor, err := active.Descriptor()
+	if err != nil {
+		return false
+	}
+	descriptor.Head = rangesplit.ChildArtifactSourceCut{
+		Applied: state.Applied, Term: state.LastTerm, EntryDigest: state.LastEntryDigest,
+		DataChainDigest: state.DataChainDigest, BaseDigest: state.SnapshotBaseDigest,
+		RouteGeneration: state.Binding.RouteGeneration,
+	}
+	descriptor.Coordinates = rangesplit.TailSourceCoordinates{
+		OwnershipEpoch: state.Binding.OwnershipEpoch, RoutingVersion: state.Binding.RoutingVersion,
+		RouteGeneration: state.Binding.RouteGeneration,
+	}
+	var workspace rangesplit.SourceCaptureWorkspace
+	return active.ValidateDescriptorAncestor(descriptor, &workspace) == nil
 }
 
 func activeCaptureMatchesObservation(active *rangesplit.SourceCapture, observed Observation) bool {

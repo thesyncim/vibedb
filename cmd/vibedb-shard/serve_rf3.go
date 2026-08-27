@@ -79,6 +79,20 @@ func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
 	return slices.Compact(nodes)
 }
 
+func rf3ReplicaObservationAuthorizer(registry *rafttransport.StaticRegistry, policy *serviceauthz.Policy) replicacontrol.AuthorizeFunc {
+	return func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
+		if registry == nil || policy == nil || identity.TrustDomain != registry.TrustDomain() ||
+			policy.Check(identity.Node, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
+			return false
+		}
+		// The owner publishes adopted groups into this bounded registry. A
+		// startup-only map permanently excludes live split children from health
+		// observations; transport enrollment alone still grants no mutation.
+		member, err := registry.LocalMember(request.Group)
+		return err == nil && member != 0
+	}
+}
+
 func runServeRF3(args []string) int {
 	fs := flag.NewFlagSet("serve-rf3", flag.ContinueOnError)
 	manifestPath := fs.String("manifest", "", "canonical prepared RF3 member manifest")
@@ -577,12 +591,8 @@ func servePreparedRF3WithExecutionLanes(
 		servedGroups[identity.Group] = identity
 	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
-		Observer: peer.Owners(),
-		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
-			_, served := servedGroups[request.Group]
-			return served &&
-				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
-		},
+		Observer:     peer.Owners(),
+		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
 	})
 	if err != nil {

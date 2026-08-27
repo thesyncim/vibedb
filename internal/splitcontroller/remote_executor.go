@@ -45,6 +45,7 @@ type remoteStepPayload struct {
 	Tail              []byte                          `json:"tail,omitempty"`
 	Certificate       []byte                          `json:"certificate,omitempty"`
 	Stages            []remoteWitnessStage            `json:"stages,omitempty"`
+	Prune             []byte                          `json:"prune,omitempty"`
 	RetainedPrune     []byte                          `json:"retained_prune,omitempty"`
 }
 
@@ -127,6 +128,12 @@ func appendRemoteStepRequestForTarget(
 	}
 	if payload.Certificate, err = appendOptionalCertificate(observed.Certificate); err != nil {
 		return shardcontrol.Request{}, err
+	}
+	if observed.Prune != nil {
+		payload.Prune, err = rangesplit.AppendRetainedPruneCursor(nil, observed.Prune)
+		if err != nil {
+			return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
+		}
 	}
 	for child, stage := range observed.Stages {
 		if stage == nil {
@@ -213,6 +220,12 @@ func remoteStepPredecessorDigest(payload remoteStepPayload) [32]byte {
 	for _, stage := range payload.Stages {
 		_, _ = hash.Write([]byte{stage.Child})
 		_, _ = hash.Write(stage.Value)
+	}
+	// Preserve pre-prune and older witness digests while binding every byte
+	// of the durable prune cursor when one is present.
+	if len(payload.Prune) != 0 {
+		_, _ = hash.Write([]byte("\x00retained-prune-cursor\x00"))
+		_, _ = hash.Write(payload.Prune)
 	}
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))

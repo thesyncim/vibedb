@@ -216,13 +216,14 @@ type PeerTLSOptions struct {
 // PeerTLS constructs mutually authenticated TLS configurations and derives the
 // complete peer identity after a completed handshake.
 type PeerTLS struct {
-	identityOID   asn1.ObjectIdentifier
-	identity      PeerIdentity
-	certificate   tls.Certificate
-	roots         *x509.CertPool
-	now           func() time.Time
-	build         buildgate.Profile
-	localServices bool
+	identityOID         asn1.ObjectIdentifier
+	identity            PeerIdentity
+	certificate         tls.Certificate
+	roots               *x509.CertPool
+	now                 func() time.Time
+	build               buildgate.Profile
+	localServices       bool
+	localGatewayControl bool
 }
 
 // WithLocalServiceConnections returns an immutable profile copy permitting
@@ -237,6 +238,21 @@ func (peerTLS *PeerTLS) WithLocalServiceConnections() *PeerTLS {
 	}
 	clone := *peerTLS
 	clone.localServices = true
+	return &clone
+}
+
+// WithLocalGatewayControlConnections permits the gateway to collect its own
+// authenticated catalog-drain acknowledgement through the same listener and
+// authorization checks as every other roster member. The detached profile
+// permits only gateway-control self connections, not public SQL, native shard
+// services, or ordinary Raft streams. Certificate and exact-peer checks remain
+// mandatory on both ends.
+func (peerTLS *PeerTLS) WithLocalGatewayControlConnections() *PeerTLS {
+	if peerTLS == nil {
+		return nil
+	}
+	clone := *peerTLS
+	clone.localGatewayControl = true
 	return &clone
 }
 
@@ -459,6 +475,7 @@ func (peerTLS *PeerTLS) verifyConnection(
 	}
 	localService := peerTLS.localServices &&
 		(class == TrafficShardNative || class == TrafficSnapshot || class == TrafficShardControl)
+	localService = localService || peerTLS.localGatewayControl && class == TrafficGatewayControl
 	if identity.Node == peerTLS.identity.Node && !localService {
 		return ErrWrongPeer
 	}

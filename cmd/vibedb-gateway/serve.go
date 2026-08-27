@@ -604,7 +604,7 @@ func runServe(args []string) (exitCode int) {
 		}
 		authorizer, authorizeErr := servicetls.NewNodeAuthorizer(gatewayNodes)
 		controlTLS, tlsErr := servicetls.NewServer(
-			tlsProfile, rafttransport.TrafficGatewayControl, authorizer,
+			tlsProfile.WithLocalGatewayControlConnections(), rafttransport.TrafficGatewayControl, authorizer,
 		)
 		controlService, serviceErr := gateway.NewClusterCatalogDrainControlService(
 			gateway.ClusterCatalogDrainControlOptions{Holder: holder,

@@ -316,10 +316,16 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 	dynamicGroup := ExecutionGroup{Runtime: dynamicRuntime, Identity: dynamicIdentity,
 		Command: rf3CommandFence(dynamicIdentity, dynamicBase), Read: dynamicRead,
 		Recovery: dynamicRead}
+	lane, err := lanes.Lane(dynamicIdentity.Group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var installedGeneration *ownerGeneration
 	if err = transportRegistry.InstallGroup(
 		executionTestRoster(dynamicIdentity.Group, local),
 		func(publish func()) error {
 			return owners.installGroup(dynamicGroup, func() {
+				installedGeneration = owners.owners[lane].members[dynamicIdentity.Group].generation
 				if _, routeErr := owners.owner(dynamicIdentity.Group); !errors.Is(routeErr, ErrExecutionGroup) {
 					t.Fatalf("owner visible before atomic transport commit: %v", routeErr)
 				}
@@ -334,6 +340,15 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 		},
 	); err != nil {
 		t.Fatalf("install dynamic group: %v", err)
+	}
+	if installedGeneration == nil || !installedGeneration.acquire() {
+		t.Error("adopted group cannot pin its read generation")
+	} else {
+		installedGeneration.release()
+		if !installedGeneration.quiesce() || installedGeneration.acquire() {
+			t.Error("adopted group read generation does not fence quiescence")
+		}
+		installedGeneration.resume()
 	}
 	if _, err = owners.Probe(context.Background(), dynamicIdentity.Group); err != nil {
 		t.Fatalf("dynamic owner route: %v", err)

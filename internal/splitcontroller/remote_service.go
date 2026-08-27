@@ -175,6 +175,13 @@ func openRemoteWitnessObservation(payload remoteStepPayload) (Observation, error
 		}
 		result.Certificate = value
 	}
+	if len(payload.Prune) != 0 {
+		value, openErr := rangesplit.OpenRetainedPruneCursor(payload.Prune)
+		if openErr != nil {
+			return Observation{}, openErr
+		}
+		result.Prune = value
+	}
 	for index, stage := range payload.Stages {
 		if stage.Child >= uint8(len(result.Stages)) || index != 0 && payload.Stages[index-1].Child >= stage.Child {
 			return Observation{}, ErrRemoteExecution

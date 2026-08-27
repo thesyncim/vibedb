@@ -420,7 +420,7 @@ func newGatewayClusterControlOpener(
 		}
 		addresses[endpoint.Member.Node] = endpoint.Address
 	}
-	return &gatewayClusterControlOpener{tls: tls, deadline: deadline, dial: dial,
+	return &gatewayClusterControlOpener{tls: tls.WithLocalGatewayControlConnections(), deadline: deadline, dial: dial,
 		addresses: addresses, slots: make(chan struct{}, maxConnections)}, nil
 }
 

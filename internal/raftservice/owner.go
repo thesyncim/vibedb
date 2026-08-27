@@ -1305,7 +1305,7 @@ func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func(
 	// owner metadata before transport enrollment so an authenticated frame can
 	// never resolve a group without a serving owner.
 	owner.members[key] = ownerMember{identity: group.Identity, command: group.Command,
-		read: group.Read, recovery: group.Recovery}
+		read: group.Read, recovery: group.Recovery, generation: &ownerGeneration{}}
 	owner.groups = append(owner.groups, key)
 	publish()
 	return nil
