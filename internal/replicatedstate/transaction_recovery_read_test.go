@@ -254,7 +254,7 @@ func TestTransactionRecoveryReadManifestBeyondInlineParticipantLimit(t *testing.
 }
 
 func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
-	for _, pageCount := range []int{2, distributedtxn.MaxManifestSegmentsPerCommand} {
+	for _, pageCount := range []int{1, 2, distributedtxn.MaxManifestSegmentsPerCommand, distributedtxn.MaxManifestSegmentsPerCommand + 1} {
 		t.Run("pages_"+strconv.Itoa(pageCount), func(t *testing.T) {
 			fixture := newMachineFixture(t)
 			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -341,7 +341,8 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 				t.Fatal(err)
 			}
 			start := bytes.Clone(coordinator)
-			for _, page := range pages {
+			initialCount := min(pageCount, distributedtxn.MaxManifestSegmentsPerCommand)
+			for _, page := range pages[:initialCount] {
 				start = append(start, page...)
 			}
 			command := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
@@ -358,6 +359,20 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 				},
 			}, batches)
 			applyTransactionCommand(t, fixture.machine, 3, command)
+			assertTransactionManifestSnapshotAndReopen(t, fixture)
+			nextApplied := uint64(4)
+			if initialCount != pageCount {
+				appendCommand := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+					Role:      distributedtxn.ReplicatedRoleCoordinator,
+					Operation: distributedtxn.ReplicatedAppendManifestSegments, ID: id,
+					ExpectedRevision: uint64(initialCount),
+					PayloadKind:      distributedtxn.ReplicatedPayloadManifestSegments,
+					Payload:          appendManifestPageBytes(nil, pages[initialCount:]),
+				}, nil)
+				applyTransactionCommand(t, fixture.machine, nextApplied, appendCommand)
+				nextApplied++
+				assertTransactionManifestSnapshotAndReopen(t, fixture)
+			}
 
 			records := make([]TransactionRecoveryRecord, 0, 1)
 			payload := make([]byte, 0, MaxTransactionRecoveryPayloadArenaBytes)
@@ -386,7 +401,40 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 					t.Fatalf("page %d recovery=%+v err=%v", pageIndex, result, readErr)
 				}
 			}
+			commit := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+				Role:      distributedtxn.ReplicatedRoleCoordinator,
+				Operation: distributedtxn.ReplicatedCommitCoordinator, ID: id,
+				ExpectedRevision: uint64(pageCount), PayloadKind: distributedtxn.ReplicatedPayloadNone,
+			}, nil)
+			applyTransactionCommand(t, fixture.machine, nextApplied, commit)
+			assertTransactionManifestSnapshotAndReopen(t, fixture)
+			if pageCount == 2 || pageCount == distributedtxn.MaxManifestSegmentsPerCommand+1 {
+				assertManifestCreationCorruptionRejected(t, fixture, id, coordinator, pages)
+				assertTransactionManifestSnapshotAndReopen(t, fixture)
+			}
 		})
+	}
+}
+
+func assertTransactionManifestSnapshotAndReopen(t testing.TB, fixture machineFixture) {
+	t.Helper()
+	// Live replica health and WAL/snapshot artifact cuts use this same scanner;
+	// a valid manifest must neither poison the running machine nor block reopen.
+	snapshot, err := fixture.machine.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot manifest: %v", err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+	if err != nil {
+		t.Fatalf("reopen manifest: %v", err)
+	}
+	if reopened.state.Applied != fixture.machine.state.Applied ||
+		uint64(len(reopened.transactionIntents)) != fixture.machine.state.TransactionIntentRows {
+		t.Fatal("reopen lost applied index or transaction intents")
 	}
 }
 

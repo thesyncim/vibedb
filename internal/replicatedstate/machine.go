@@ -786,9 +786,18 @@ type scannedTransactionControl struct {
 	manifestNextParticipant uint64
 	manifestEncodedBytes    uint64
 	manifestChain           distributedtxn.Digest
+	manifestCreation        *scannedManifestCreation
 
 	mutationRows uint64
 	mutationKeys map[transactionIntentIdentity]scannedMutationKey
+}
+
+// Manifest payload rows retain only the fixed coordinator header. Its original
+// creation digest also covers the canonical initial page pack, so retain this
+// small owned header until the ordered page scan authenticates that prefix.
+type scannedManifestCreation struct {
+	coordinator   [distributedtxn.ReplicatedManifestCoordinatorRecordBytes]byte
+	authenticated bool
 }
 
 type scannedTransactions struct {
@@ -842,6 +851,8 @@ func scanSessionSystemSnapshot(
 	var transactionScopeScratch []distributedtxn.IntentScope
 	var manifestParticipantScratch []distributedtxn.ParticipantRef
 	var manifestIdentityScratch []byte
+	var manifestCreationControl *scannedTransactionControl
+	var manifestCreationHash hash.Hash
 	var mutationScanID distributedtxn.ID
 	var mutationScanControl *scannedTransactionControl
 	var mutationScanHash hash.Hash
@@ -1154,8 +1165,7 @@ func scanSessionSystemSnapshot(
 				role: distributedtxn.ReplicatedRoleCoordinator, id: view.ID,
 			}]
 			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
-				summary.payloadSeen || view.Kind != summary.control.PayloadKind ||
-				view.Digest != summary.control.PayloadDigest {
+				summary.payloadSeen || view.Kind != summary.control.PayloadKind {
 				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
 			}
 			summary.payloadSeen = true
@@ -1164,18 +1174,22 @@ func scanSessionSystemSnapshot(
 			if view.Kind == distributedtxn.ReplicatedPayloadCoordinator {
 				var participantScratch [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 				record, recordErr := distributedtxn.OpenCoordinatorInto(view.Payload, participantScratch[:])
-				if recordErr != nil || uint64(len(view.Payload)) != summary.control.PayloadBytes ||
+				if recordErr != nil || view.Digest != summary.control.PayloadDigest ||
+					uint64(len(view.Payload)) != summary.control.PayloadBytes ||
 					uint64(len(record.Participants)) != summary.control.PayloadCount {
 					return errors.Join(recordErr, ErrTransactionStateCorrupt)
 				}
 			} else {
 				record, recordErr := distributedtxn.OpenManifestCoordinator(view.Payload)
-				if recordErr != nil || record.Manifest.EncodedBytes != summary.control.PayloadBytes ||
+				if recordErr != nil || len(view.Payload) != distributedtxn.ReplicatedManifestCoordinatorRecordBytes ||
+					record.Manifest.EncodedBytes != summary.control.PayloadBytes ||
 					record.Manifest.ParticipantCount != summary.control.PayloadCount {
 					return errors.Join(recordErr, ErrTransactionStateCorrupt)
 				}
 				summary.manifestDescriptor = record.Manifest
 				summary.manifestDescriptorSeen = true
+				summary.manifestCreation = &scannedManifestCreation{}
+				copy(summary.manifestCreation.coordinator[:], view.Payload)
 			}
 			transactionPayloadRows++
 			if residentErr := addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value)); residentErr != nil {
@@ -1202,9 +1216,47 @@ func scanSessionSystemSnapshot(
 			}]
 			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
 				summary.control.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
+				summary.manifestCreation == nil ||
 				view.Index != summary.manifestNextPage ||
 				view.FirstParticipant != summary.manifestNextParticipant {
 				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			// Stage starts with exactly one page; fused begin/prepare starts with
+			// exactly min(total pages, MaxManifestSegmentsPerCommand). Later appends
+			// must not change the immutable creation/retry digest. Pages are ordered
+			// by transaction and ordinal, allowing one streaming hash for the scan.
+			initialPages := uint32(1)
+			if summary.control.FusedPath {
+				initialPages = min(summary.manifestDescriptor.SegmentCount,
+					distributedtxn.MaxManifestSegmentsPerCommand)
+			}
+			if view.Index < initialPages {
+				if view.Index == 0 {
+					manifestCreationControl = summary
+					if manifestCreationHash == nil {
+						manifestCreationHash = sha256.New()
+					} else {
+						manifestCreationHash.Reset()
+					}
+					_, _ = manifestCreationHash.Write(summary.manifestCreation.coordinator[:])
+				}
+				if manifestCreationControl != summary {
+					return ErrTransactionStateCorrupt
+				}
+				_, _ = manifestCreationHash.Write(view.Raw)
+				if view.Index == 0 || view.Index+1 == initialPages {
+					var digest distributedtxn.Digest
+					_ = manifestCreationHash.Sum(digest[:0])
+					if view.Index == 0 && digest != summary.control.MutationDigest {
+						return fmt.Errorf("%w: manifest creation seed", ErrTransactionStateCorrupt)
+					}
+					if view.Index+1 == initialPages {
+						if digest != summary.control.PayloadDigest {
+							return fmt.Errorf("%w: manifest creation payload", ErrTransactionStateCorrupt)
+						}
+						summary.manifestCreation.authenticated = true
+					}
+				}
 			}
 			summary.manifestNextPage++
 			summary.manifestNextParticipant += uint64(view.ParticipantCount)
@@ -1541,7 +1593,8 @@ func scanSessionSystemSnapshot(
 					fmt.Errorf("%w: coordinator creation payload", ErrTransactionStateCorrupt)
 			}
 			if control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator {
-				if !summary.manifestDescriptorSeen || summary.manifestNextPage == 0 ||
+				if !summary.manifestDescriptorSeen || summary.manifestCreation == nil ||
+					!summary.manifestCreation.authenticated || summary.manifestNextPage == 0 ||
 					summary.manifestNextParticipant == 0 || summary.manifestEncodedBytes == 0 ||
 					summary.manifestNextPage != control.ManifestNextPage ||
 					summary.manifestNextParticipant != control.ManifestNextParticipant ||
