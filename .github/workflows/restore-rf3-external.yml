@@ -66,6 +66,7 @@ jobs:
               (.Output | contains("restored external RF3:") and
                 contains("shard_processes=3") and contains("certified_artifact=true") and
                 contains("fresh_roots=true") and contains("closed_before_catalog=true") and
+                contains("marker_removal_refused=true") and
                 contains("catalog_witness=replicated_readindex") and
                 contains("catalog_observations=2") and contains("restored_read=true") and
                 contains("acknowledged_write_survived=true") and contains("leader_sigkill=true") and

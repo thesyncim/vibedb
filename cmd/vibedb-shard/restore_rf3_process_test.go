@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -50,6 +51,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	started := time.Now()
 	fixture, options, catalog := newRestoredRF3ProcessFixture(t)
 	defer fixture.close(t)
+	restoreRF3RejectMissingMarker(t, fixture)
 	fixture.startAll(t)
 	for member := range fixture.children {
 		restoreRF3AssertClosed(t, fixture, member)
@@ -67,7 +69,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	catalog.delegate = newRestoredRF3Catalog(t, fixture, operatorProfile, options.Gate, options.Operator)
+	catalog.delegate = newRestoredRF3Catalog(t, fixture, options.Operation, operatorProfile, options.Gate, options.Operator)
 	client, err := shardservice.NewRestoreServingControlClient(rf3CommandControlOpener{
 		profile: operatorProfile, addresses: addresses, deadline: deadline,
 	}, deadline, deadline)
@@ -127,7 +129,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 		storageFinal > 1<<30 || storageFinal > storageBaseline+64<<20 {
 		t.Fatalf("space bound: rss=%d/%d wal=%d/%d storage=%d/%d", rssBaseline, rssFinal, walBaseline, walFinal, storageBaseline, storageFinal)
 	}
-	t.Logf("restored external RF3: shard_processes=3 certified_artifact=true fresh_roots=true closed_before_catalog=true catalog_witness=replicated_readindex catalog_observations=%d restored_read=true acknowledged_write_survived=true leader_sigkill=true restart_closed=true regrant=true total=%s write=%s failover=%s rss_bytes=%d rss_growth=%d storage_growth=%d wal_growth=%d",
+	t.Logf("restored external RF3: shard_processes=3 certified_artifact=true fresh_roots=true marker_removal_refused=true closed_before_catalog=true catalog_witness=replicated_readindex catalog_observations=%d restored_read=true acknowledged_write_survived=true leader_sigkill=true restart_closed=true regrant=true total=%s write=%s failover=%s rss_bytes=%d rss_growth=%d storage_growth=%d wal_growth=%d",
 		catalog.observations, time.Since(started), writeLatency, failoverLatency, rssFinal,
 		max(int64(rssFinal)-int64(rssBaseline), 0), max(storageFinal-storageBaseline, 0), max(walFinal-walBaseline, 0))
 }
@@ -174,7 +176,7 @@ func (catalog *restoreRF3Catalog) ObserveRestoreActivation(ctx context.Context, 
 	return witness, err
 }
 
-func newRestoredRF3Catalog(t *testing.T, fixture *rf3FaultFixture, profile *rafttransport.PeerTLS,
+func newRestoredRF3Catalog(t *testing.T, fixture *rf3FaultFixture, operation clusterrestore.Operation, profile *rafttransport.PeerTLS,
 	gate *serviceauthz.Gate, operator serviceauthz.Authority,
 ) gateway.RestoreCatalog {
 	t.Helper()
@@ -182,11 +184,21 @@ func newRestoredRF3Catalog(t *testing.T, fixture *rf3FaultFixture, profile *raft
 		operator.Node, fixture.group, 23, operator.Generation)
 	route := gateway.ReplicatedRoute{Distribution: gateway.ReplicatedCatalogDistribution,
 		Shard: gateway.ReplicatedCatalogShard, Group: fixture.group, AllocationGeneration: 23,
-		Command: state.Fence.Command}
+		Command:              state.Fence.Command,
+		RangeIdentity:        sha256.Sum256(append([]byte("restored/full-keyspace/"), operation.Digest[:]...)),
+		LineageDigest:        sha256.Sum256(append([]byte("restored/fresh-lineage/"), operation.Digest[:]...)),
+		ForwardingRuleDigest: sha256.Sum256(append([]byte("restored/no-forwarding/"), operation.Digest[:]...))}
 	for member, node := range fixture.nodes {
+		observed, err := probeRF3CommandMember(t.Context(), fixture.nativeAddresses[member], node,
+			profile, operator.Node, fixture.group, 23, operator.Generation)
+		if err != nil || observed.Fence.StoreID != operation.Targets[0].Replicas[member].Store ||
+			observed.Fence.MemberID != operation.Targets[0].Replicas[member].Member {
+			t.Fatalf("restored catalog replica identity: %+v err=%v", observed.Fence, err)
+		}
 		route.Replicas = append(route.Replicas, gateway.ReplicatedEndpoint{Member: uint64(member + 1), Node: node,
-			StoreID: rf3CommandStoreIdentity(uint64(member + 1)).StoreID, NodeIncarnation: 1,
-			Address: fixture.nativeAddresses[member]})
+			StoreID: observed.Fence.StoreID, NodeIncarnation: observed.Fence.NodeIncarnation,
+			NativeEndpoint: fmt.Sprintf("restored-member-%d-native", member+1),
+			Address:        fixture.nativeAddresses[member]})
 	}
 	transport, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
 		TLS: profile, Dial: func(ctx context.Context, address string) (net.Conn, error) {
@@ -233,6 +245,54 @@ func newRestoredRF3Catalog(t *testing.T, fixture *rf3FaultFixture, profile *raft
 		t.Fatal(err)
 	}
 	return catalog
+}
+
+const restoreRF3PreflightEnvironment = "VIBEDB_RESTORE_RF3_PREFLIGHT"
+
+func restoreRF3RejectMissingMarker(t *testing.T, fixture *rf3FaultFixture) {
+	t.Helper()
+	marker := filepath.Join(filepath.Dir(fixture.walPaths[0]), "restore_preparing")
+	held := marker + ".held"
+	if err := os.Rename(marker, held); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Rename(held, marker); err != nil {
+			t.Errorf("restore marker after negative preflight: %v", err)
+		}
+	}()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable, "-test.run=^TestRestoredRF3MissingMarkerProcessHelper$", "-test.v")
+	command.Env = append(os.Environ(), restoreRF3PreflightEnvironment+"="+fixture.manifestPaths[0])
+	diagnostic := &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
+	command.Stdout, command.Stderr = diagnostic, diagnostic
+	if err = command.Run(); err != nil {
+		t.Fatalf("missing-marker external preflight: %v\n%s", err, diagnostic.String())
+	}
+}
+
+func TestRestoredRF3MissingMarkerProcessHelper(t *testing.T) {
+	path := os.Getenv(restoreRF3PreflightEnvironment)
+	if path == "" {
+		return
+	}
+	manifest, err := loadRF3Manifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listened := false
+	err = servePreparedRF3WithListen(t.Context(), manifest, func(string, string) (net.Listener, error) {
+		listened = true
+		return nil, errors.New("missing-marker process reached listener publication")
+	})
+	if listened || !errors.Is(err, errRF3Serving) || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing immutable restore marker was not rejected before listening: listened=%t err=%v", listened, err)
+	}
 }
 
 func newRestoredRF3ProcessFixture(t *testing.T) (*rf3FaultFixture, gateway.RestoreActivationOptions, *restoreRF3Catalog) {
