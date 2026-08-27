@@ -1682,6 +1682,24 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 	return a.machine.Snapshot()
 }
 
+// SnapshotArtifactCutAt is the live-backup source boundary. The floor must be
+// obtained from the serving leader's quorum ReadIndex; a behind local apply is
+// rejected rather than silently weakening the cut.
+func (a *ReplicatedApply) SnapshotArtifactCutAt(minimumApplied uint64) (*replicatedstate.ReadSnapshot, error) {
+	if minimumApplied == 0 {
+		return nil, replicatedstate.ErrReadBehind
+	}
+	cut, err := a.SnapshotArtifactCut()
+	if err != nil {
+		return nil, err
+	}
+	if cut.Fence().Applied < minimumApplied {
+		_ = cut.Close()
+		return nil, replicatedstate.ErrReadBehind
+	}
+	return cut, nil
+}
+
 // RangeSplitSnapshot returns the same coherent full apply cut through the
 // narrow split-source capability consumed by the distributed split runtime.
 func (a *ReplicatedApply) RangeSplitSnapshot() (*replicatedstate.ReadSnapshot, error) {

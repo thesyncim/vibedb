@@ -395,6 +395,15 @@ func (owners *ExecutionOwners) ReadExecutionPin(ctx context.Context, request Exe
 	}
 	return owner.ReadExecutionPin(ctx, request)
 }
+func (owners *ExecutionOwners) ReadLinearizableSnapshot(ctx context.Context,
+	request LinearizableSnapshotRequest,
+) (*LinearizableSnapshotCut, error) {
+	owner, err := owners.owner(request.Fence.Group)
+	if err != nil {
+		return nil, err
+	}
+	return owner.ReadLinearizableSnapshot(ctx, request)
+}
 func (owners *ExecutionOwners) Started() <-chan struct{} {
 	if owners == nil {
 		return nil

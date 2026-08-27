@@ -265,6 +265,13 @@ type BatchReadSource interface {
 	PointReadBatchInto([]byte, uint64, int, []byte) (replicatedstate.PointReadBatchResult, error)
 }
 
+// SnapshotCutSource is the narrow target-free source used by live backup.
+// The applied floor comes from the leader ReadIndex barrier; implementations
+// must return one immutable complete relation cut at or beyond it.
+type SnapshotCutSource interface {
+	SnapshotArtifactCutAt(uint64) (*replicatedstate.ReadSnapshot, error)
+}
+
 // TransactionRecoverySource exposes only the replicated transaction-control
 // reader. It is intentionally separate from ordinary relation reads so
 // installing a data-read source cannot enable coordinator discovery.
@@ -338,6 +345,38 @@ type PointReadBatchResult struct {
 // serving boundary has finished encoding and writing the result.
 type PointReadLease interface {
 	Release()
+}
+
+type LinearizableSnapshotRequest struct {
+	Fence      ServingFence
+	Capability serviceauthz.Capability
+}
+
+// LinearizableSnapshotCut owns the immutable state-machine cut and the owner
+// generation/resource pins. Close is the only release operation.
+type LinearizableSnapshotCut struct {
+	snapshot   *replicatedstate.ReadSnapshot
+	generation *ownerGeneration
+	owner      *Owner
+	released   atomic.Bool
+}
+
+func (cut *LinearizableSnapshotCut) Snapshot() *replicatedstate.ReadSnapshot {
+	if cut == nil || cut.released.Load() {
+		return nil
+	}
+	return cut.snapshot
+}
+
+func (cut *LinearizableSnapshotCut) Close() error {
+	if cut == nil || !cut.released.CompareAndSwap(false, true) {
+		return nil
+	}
+	err := cut.snapshot.Close()
+	cut.snapshot = nil
+	cut.generation.release()
+	cut.owner.releasePendingRead(1)
+	return err
 }
 
 // TransactionReadRequest wraps the exact replicated-state recovery operation
@@ -2066,6 +2105,54 @@ func (owner *Owner) ReadExecutionPin(
 	return ExecutionPinReadResult{
 		Applied: value.Fence.Applied, Found: value.Found, Record: value.Record,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadLinearizableSnapshot obtains one quorum ReadIndex and pins the complete
+// state-machine image reached by that barrier. It is backup-only and never
+// reuses data-read, topology, or membership authority.
+func (owner *Owner) ReadLinearizableSnapshot(ctx context.Context,
+	request LinearizableSnapshotRequest,
+) (*LinearizableSnapshotCut, error) {
+	if owner == nil || ctx == nil || request.Capability != serviceauthz.CapabilityBackup {
+		return nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(1); err != nil {
+		return nil, err
+	}
+	release := true
+	defer func() {
+		if release {
+			owner.releasePendingRead(1)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{fence: request.Fence, delivery: delivery},
+	}, delivery)
+	if err != nil {
+		return nil, err
+	}
+	source, ok := reply.read.source.(SnapshotCutSource)
+	if !ok {
+		reply.read.generation.release()
+		return nil, ErrServingFence
+	}
+	snapshot, err := source.SnapshotArtifactCutAt(reply.read.minimumApplied)
+	if err != nil {
+		reply.read.generation.release()
+		return nil, err
+	}
+	if snapshot == nil || !pointReadFenceMatches(snapshot.Fence(), request.Fence) ||
+		snapshot.Fence().Applied < reply.read.minimumApplied {
+		if snapshot != nil {
+			_ = snapshot.Close()
+		}
+		reply.read.generation.release()
+		return nil, ErrServingFence
+	}
+	release = false
+	return &LinearizableSnapshotCut{snapshot: snapshot, generation: reply.read.generation, owner: owner}, nil
 }
 
 func (owner *Owner) enqueueRead(
