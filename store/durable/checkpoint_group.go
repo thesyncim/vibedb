@@ -311,6 +311,9 @@ type CheckpointGroup struct {
 	closed              bool
 	closeErr            error
 	poison              error
+	// Only successful local publication or an explicit recovery fence may
+	// make a membership retry device-silent. Readable bytes alone do not.
+	membershipDurableSequence uint64
 
 	visibleApplied atomic.Uint64
 	visibleTxn     atomic.Uint64
@@ -3193,6 +3196,10 @@ func validateCheckpointGroupCertificateMembers(
 }
 
 func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCertificate, error) {
+	return openCheckpointGroupCertificateFlags(log, os.O_RDWR)
+}
+
+func openCheckpointGroupCertificateFlags(log *TxnLog, flags int) (*os.File, checkpointGroupCertificate, error) {
 	if log == nil || log.root == nil {
 		return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
@@ -3203,7 +3210,7 @@ func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCerti
 	if !info.Mode().IsRegular() || info.Size() != checkpointGroupFileBytes {
 		return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
-	file, err := log.root.OpenFile(checkpointGroupFilename, os.O_RDWR, 0)
+	file, err := log.root.OpenFile(checkpointGroupFilename, flags, 0)
 	if err != nil {
 		return nil, checkpointGroupCertificate{}, err
 	}

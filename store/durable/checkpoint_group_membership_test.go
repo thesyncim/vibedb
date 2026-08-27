@@ -256,7 +256,7 @@ func TestCheckpointMembershipPrepareSettlesEveryPublicationBoundary(t *testing.T
 	}
 	for _, point := range points {
 		t.Run(string(rune('0'+point)), func(t *testing.T) {
-			_, members, _, group := newCheckpointGroupTestStore(t, 1)
+			dir, members, _, group := newCheckpointGroupTestStore(t, 1)
 			authorization := sha256.Sum256([]byte("boundary"))
 			injected := errors.New("injected membership publication stop")
 			checkpointGroupFaultHook = func(got checkpointGroupFaultPoint) error {
@@ -270,11 +270,25 @@ func TestCheckpointMembershipPrepareSettlesEveryPublicationBoundary(t *testing.T
 			if !errors.Is(err, injected) {
 				t.Fatalf("prepare boundary error = %v", err)
 			}
-			witness, err := group.PrepareMembershipTransition(members, authorization)
-			if err != nil {
-				t.Fatalf("settle prepare: %v", err)
+			if _, err := group.PrepareMembershipTransition(members, authorization); !errors.Is(err, ErrTxnLogPoisoned) {
+				t.Fatalf("uncertain publication remained retryable: %v", err)
 			}
-			if err := group.ObserveMembershipTransition(witness, authorization); err != nil {
+			image := copyCheckpointGroupDirectory(t, dir)
+			collections, _, recovered := openCheckpointGroupTestCopy(t, image)
+			target := []NamedCollection{{Name: "system", Collection: collections[0]}, {Name: "user", Collection: collections[1]}}
+			fences := 0
+			checkpointGroupFaultHook = func(got checkpointGroupFaultPoint) error {
+				if got == checkpointGroupAfterMembershipSync {
+					fences++
+				}
+				return nil
+			}
+			witness, err := recovered.PrepareMembershipTransition(target, authorization)
+			checkpointGroupFaultHook = nil
+			if err != nil || fences != 1 {
+				t.Fatalf("recovery did not fence readable record exactly once: fences=%d err=%v", fences, err)
+			}
+			if err := recovered.ObserveMembershipTransition(witness, authorization); err != nil {
 				t.Fatalf("observe settled prepare: %v", err)
 			}
 		})

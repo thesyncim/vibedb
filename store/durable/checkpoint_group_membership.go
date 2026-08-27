@@ -21,7 +21,7 @@ const (
 	checkpointMembershipSlotBytes             = 8192
 	checkpointMembershipSlots                 = 2
 	checkpointMembershipFileBytes             = checkpointMembershipSlotBytes * checkpointMembershipSlots
-	checkpointMembershipHeaderBytes           = 192
+	checkpointMembershipHeaderBytes           = 304
 	checkpointMembershipMemberBytes           = 104
 	checkpointMembershipChecksumOffset        = checkpointMembershipSlotBytes - sha256.Size
 	checkpointMembershipMaxMembers            = (checkpointMembershipChecksumOffset - checkpointMembershipHeaderBytes) / checkpointMembershipMemberBytes
@@ -63,7 +63,11 @@ type checkpointMembershipCertificate struct {
 	source         [sha256.Size]byte
 	target         [sha256.Size]byte
 	authorization  [sha256.Size]byte
-	members        []checkpointMembershipMember
+	// prepared remains the original Raft-command witness after the exact
+	// committed control entry advances the shared source collections once.
+	prepared      CheckpointMembershipWitness
+	commandDigest [sha256.Size]byte
+	members       []checkpointMembershipMember
 }
 
 type checkpointMembershipRecoveryAuthority struct {
@@ -93,7 +97,7 @@ func (g *CheckpointGroup) ObserveMembershipTransition(
 		record.source != checkpointMembershipSourceDigest(g.certificateLocked()) {
 		return errors.Join(ErrCheckpointMembershipTransition, err)
 	}
-	return nil
+	return g.ensureMembershipDurableLocked(record)
 }
 
 // PrepareMembershipTransition durably stages one exact replacement membership
@@ -132,6 +136,9 @@ func (g *CheckpointGroup) PrepareMembershipTransition(
 			prior.source == fast.source && prior.target == fast.target &&
 			prior.authorization == fast.authorization {
 			unlockCheckpointMembershipCollections(order)
+			if err := g.ensureMembershipDurableLocked(prior); err != nil {
+				return CheckpointMembershipWitness{}, err
+			}
 			return checkpointMembershipWitness(prior), nil
 		}
 	}
@@ -151,7 +158,12 @@ func (g *CheckpointGroup) PrepareMembershipTransition(
 	if err != nil {
 		return CheckpointMembershipWitness{}, err
 	}
-	return writeCheckpointMembershipCertificate(g.log, record)
+	witness, err := writeCheckpointMembershipCertificate(g.log, record)
+	if err != nil {
+		return CheckpointMembershipWitness{}, g.poisonLocked(journalCommitOutcomeUnknown(err))
+	}
+	g.membershipDurableSequence = witness.Sequence
+	return witness, nil
 }
 
 func checkpointMembershipLockOrder(members []checkpointGroupMember) []*Collection {
@@ -321,6 +333,11 @@ func selectCheckpointMembershipForRecovery(
 	if err != nil {
 		return checkpointGroupCertificate{}, errors.Join(ErrCheckpointMembershipTransition, err)
 	}
+	// A process restart may see a complete membership write whose caller
+	// never observed Sync. Fence that authority before publishing its target.
+	if err := syncCheckpointMembershipCertificate(log, record); err != nil {
+		return checkpointGroupCertificate{}, err
+	}
 	if _, err := file.WriteAt(
 		encoded, int64(selected.sequence%checkpointGroupSlots)*checkpointGroupSlotBytes,
 	); err != nil {
@@ -351,14 +368,17 @@ func validateSelectedCheckpointMembership(
 	record, err := openCheckpointMembershipCertificate(log)
 	if err != nil || checkpointMembershipWitness(record) != authority.witness ||
 		record.authorization != authority.authorization ||
-		record.applied != selected.applied ||
-		record.txnHighWater != selected.txnHighWater ||
+		record.applied > selected.applied ||
+		record.txnHighWater > selected.txnHighWater ||
 		record.markerID != selected.markerID {
 		return errors.Join(ErrCheckpointMembershipTransition, err)
 	}
 	target, err := checkpointMembershipMembersFromCollections(members)
-	if err != nil || record.target != checkpointMembershipTargetDigest(target) ||
-		!slices.Equal(record.members, target) {
+	// The checkpoint has already selected this exact membership. Ordinary
+	// target writes may advance its generations and applied cut; they cannot
+	// substitute a different member/path. The source-to-target selection above
+	// still requires the byte-exact prepared/finalized target generations.
+	if err != nil || !checkpointMembershipFinalizedMembers(record.members, target) {
 		return errors.Join(ErrCheckpointMembershipTransition, err)
 	}
 	return nil
@@ -408,6 +428,15 @@ func encodeCheckpointMembershipCertificate(c checkpointMembershipCertificate) ([
 		c.target != checkpointMembershipTargetDigest(c.members) {
 		return nil, ErrCheckpointMembershipTransition
 	}
+	if c.prepared.Sequence == 0 {
+		if c.prepared != (CheckpointMembershipWitness{}) || c.commandDigest != ([sha256.Size]byte{}) {
+			return nil, ErrCheckpointMembershipTransition
+		}
+	} else if c.prepared.Sequence == math.MaxUint64 || c.sequence != c.prepared.Sequence+1 ||
+		c.prepared.Source == ([sha256.Size]byte{}) || c.prepared.Target == ([sha256.Size]byte{}) ||
+		c.commandDigest == ([sha256.Size]byte{}) || c.applied == 0 {
+		return nil, ErrCheckpointMembershipTransition
+	}
 	buf := make([]byte, checkpointMembershipSlotBytes)
 	copy(buf[:8], checkpointMembershipMagic[:])
 	binary.LittleEndian.PutUint16(buf[8:10], checkpointMembershipFormat)
@@ -422,6 +451,10 @@ func encodeCheckpointMembershipCertificate(c checkpointMembershipCertificate) ([
 	copy(buf[72:104], c.source[:])
 	copy(buf[104:136], c.target[:])
 	copy(buf[136:168], c.authorization[:])
+	binary.LittleEndian.PutUint64(buf[168:176], c.prepared.Sequence)
+	copy(buf[176:208], c.prepared.Source[:])
+	copy(buf[208:240], c.prepared.Target[:])
+	copy(buf[240:272], c.commandDigest[:])
 	for i, member := range c.members {
 		off := checkpointMembershipHeaderBytes + i*checkpointMembershipMemberBytes
 		copy(buf[off:off+32], member.nameDigest[:])
@@ -466,6 +499,10 @@ func decodeCheckpointMembershipCertificate(buf []byte) (checkpointMembershipCert
 	copy(c.source[:], buf[72:104])
 	copy(c.target[:], buf[104:136])
 	copy(c.authorization[:], buf[136:168])
+	c.prepared.Sequence = binary.LittleEndian.Uint64(buf[168:176])
+	copy(c.prepared.Source[:], buf[176:208])
+	copy(c.prepared.Target[:], buf[208:240])
+	copy(c.commandDigest[:], buf[240:272])
 	for i := range c.members {
 		off := checkpointMembershipHeaderBytes + i*checkpointMembershipMemberBytes
 		copy(c.members[i].nameDigest[:], buf[off:off+32])
@@ -520,7 +557,8 @@ func writeCheckpointMembershipCertificate(
 			return CheckpointMembershipWitness{}, openErr
 		}
 		if prior.source == c.source && prior.target == c.target &&
-			prior.authorization == c.authorization {
+			prior.authorization == c.authorization && prior.prepared == c.prepared &&
+			prior.commandDigest == c.commandDigest {
 			return checkpointMembershipWitness(prior), nil
 		}
 		c.sequence = prior.sequence + 1
@@ -585,6 +623,9 @@ func openCheckpointMembershipCertificate(log *TxnLog) (checkpointMembershipCerti
 }
 
 func checkpointMembershipWitness(c checkpointMembershipCertificate) CheckpointMembershipWitness {
+	if c.prepared.Sequence != 0 {
+		return c.prepared
+	}
 	return CheckpointMembershipWitness{Sequence: c.sequence, Source: c.source, Target: c.target}
 }
 
@@ -627,6 +668,13 @@ func readCheckpointMembershipFile(file *os.File) (checkpointMembershipCertificat
 			selected.markerEpoch < previous.markerEpoch ||
 			selected.applied < previous.applied ||
 			selected.txnHighWater < previous.txnHighWater {
+			return checkpointMembershipCertificate{}, ErrCheckpointMembershipTransition
+		}
+		if selected.prepared.Sequence != 0 &&
+			(previous.prepared.Sequence != 0 || selected.prepared != checkpointMembershipWitness(previous) ||
+				selected.authorization != previous.authorization || previous.applied == math.MaxUint64 ||
+				selected.applied != previous.applied+1 || previous.txnHighWater == math.MaxUint64 ||
+				selected.txnHighWater != previous.txnHighWater+1 || !checkpointMembershipFinalizedMembers(previous.members, selected.members)) {
 			return checkpointMembershipCertificate{}, ErrCheckpointMembershipTransition
 		}
 	}
