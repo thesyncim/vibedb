@@ -37,6 +37,7 @@ type remoteStepPayload struct {
 	PredecessorDigest [32]byte                        `json:"predecessor_digest"`
 	Target            ShardActionTarget               `json:"target"`
 	SourceNode        rafttransport.NodeID            `json:"source_node"`
+	CaptureHead       uint64                          `json:"capture_head"`
 	State             []byte                          `json:"state"`
 	Serving           planObservationWireServingState `json:"serving"`
 	Artifacts         []byte                          `json:"artifacts,omitempty"`
@@ -117,6 +118,10 @@ func appendRemoteStepRequestForTarget(
 	payload.SourceNode, err = remoteObservationSourceNode(plan, observed)
 	if err != nil {
 		return shardcontrol.Request{}, err
+	}
+	payload.CaptureHead = observed.CaptureHead
+	if observed.Capture != nil {
+		payload.CaptureHead = observed.Capture.Head()
 	}
 	if payload.State, err = replicatedstate.AppendState(nil, observed.SourceState); err != nil {
 		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
@@ -210,6 +215,9 @@ func remoteStepPredecessorDigest(payload remoteStepPayload) [32]byte {
 	serving, _ = vibejson.AppendCanonicalize(nil, serving)
 	_, _ = hash.Write(serving)
 	_, _ = hash.Write(payload.SourceNode[:])
+	var capture [8]byte
+	binary.LittleEndian.PutUint64(capture[:], payload.CaptureHead)
+	_, _ = hash.Write(capture[:])
 	for _, stage := range payload.Stages {
 		_, _ = hash.Write([]byte{stage.Child})
 		_, _ = hash.Write(stage.Value)

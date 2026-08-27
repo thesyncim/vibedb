@@ -109,7 +109,7 @@ func (a *LocalSourceActions) ExecutePruneRetained(
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.active == nil || observed.Capture != a.active {
+	if !activeCaptureMatchesObservation(a.active, observed) {
 		return ErrTopologyConflict
 	}
 	manifest, err := a.runtime.RangeSplitRelationManifestDigest()
@@ -159,7 +159,7 @@ func (a *LocalSourceActions) ExecuteCertifiedPruneRetained(
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.active == nil || observed.Capture != a.active {
+	if !activeCaptureMatchesObservation(a.active, observed) {
 		return ErrTopologyConflict
 	}
 	manifestDigest, err := a.runtime.RangeSplitRelationManifestDigest()
@@ -178,6 +178,18 @@ func (a *LocalSourceActions) ExecuteCertifiedPruneRetained(
 		return errors.Join(ErrTopologyConflict, err)
 	}
 	return a.executeCertifiedPruneLocked(ctx, plan, observed, serving, proposer, limits, certificate, proof)
+}
+
+func activeCaptureMatchesObservation(active *rangesplit.SourceCapture, observed Observation) bool {
+	if active == nil {
+		return false
+	}
+	head, ok := observationCaptureHead(observed)
+	if !ok {
+		return false
+	}
+	descriptor, err := active.Descriptor()
+	return err == nil && descriptor.Head.Applied == head
 }
 
 func (a *LocalSourceActions) executeCertifiedPruneLocked(

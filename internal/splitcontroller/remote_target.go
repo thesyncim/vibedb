@@ -427,6 +427,10 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 	} else if len(payload.RetainedPrune) != 0 {
 		return ErrRemoteExecution
 	}
+	// The catalog image is never accepted from the action payload. Attach only
+	// the exact snapshot authenticated and pinned by PlanAdmission so local
+	// destructive checks can validate publication and drain certificates.
+	observed.Catalog = grant.Catalog
 	witness := ActionWitness{
 		Operation: operation, PlanDigest: request.PlanDigest,
 		CatalogGeneration: payload.Catalog, CatalogDigest: payload.CatalogDigest,

@@ -117,6 +117,28 @@ func TestExactShardActionRouteResolverUsesPreGrantedUnpublishedGroup(t *testing.
 	}
 }
 
+func TestRemoteActionWitnessCarriesDetachedCaptureHead(t *testing.T) {
+	plan, catalog, _, _ := testPlan(t)
+	state := testSourceState(plan)
+	state.ReplicaSetVersion = 1
+	observed := Observation{
+		Catalog: catalog, SourceState: state, SourceNode: rafttransport.NodeID{1}, CaptureHead: 77,
+	}
+	action := Action{Kind: ActionBuildArtifacts}
+	request, err := appendRemoteStepRequest(nil, plan, observed, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := openRemoteStepPayload(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut, err := openRemoteWitnessObservation(payload)
+	if err != nil || cut.CaptureHead != observed.CaptureHead || cut.Capture != nil {
+		t.Fatalf("capture=%d pointer=%p err=%v", cut.CaptureHead, cut.Capture, err)
+	}
+}
+
 func TestPreparedReplicaMatchAuthenticatesEveryLocalRuntimeField(t *testing.T) {
 	plan, _, _, _ := testPlan(t)
 	target, ok := plan.Target(1)

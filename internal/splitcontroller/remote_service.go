@@ -150,7 +150,7 @@ func openRemoteWitnessObservation(payload remoteStepPayload) (Observation, error
 		return Observation{}, err
 	}
 	result := Observation{SourceState: state, SourceStatus: serving.Status,
-		SourceServing: serving, SourceNode: payload.SourceNode}
+		SourceServing: serving, SourceNode: payload.SourceNode, CaptureHead: payload.CaptureHead}
 	if len(payload.Artifacts) != 0 {
 		value, openErr := rangesplit.OpenChildArtifactSet(payload.Artifacts)
 		if openErr != nil {
