@@ -553,10 +553,7 @@ func newRealTransferRuntimeWithLearners(
 	bootstrap := realTransferStaticBootstrap(t, voters, learners)
 	walPath := filepath.Join(t.TempDir(), "member.wal")
 	sqlPath := filepath.Join(t.TempDir(), "member.vdb")
-	options := raftstore.Options{
-		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes,
-	}
+	options := realTransferWALOptions()
 	wal, err := raftstore.Create(walPath, identity, realTransferWALKey(), raftstore.Bootstrap{
 		TopologyRecoveryEpoch: 29,
 		Snapshot:              bootstrap,
@@ -632,13 +629,7 @@ func newRealTransferRuntimeWithLearners(
 		// This fixture starts with an enrolled learner. Publish a real durable
 		// configuration entry before testing its later promotion, not a raw
 		// index-two snapshot masquerading as the index-one static bootstrap.
-		entry := realTransferLearnerCheckpoint(t, identity, learners)
-		incarnation, seedErr := wal.BeginIncarnation()
-		if seedErr == nil {
-			seedErr = wal.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
-				HardState: &pb.HardState{Term: entry.Term, Commit: entry.Index},
-				Entries:   []*pb.Entry{entry}, MustSync: true})
-		}
+		entry, seedErr := persistRealTransferLearnerCheckpoint(t, wal, identity, learners)
 		if seedErr == nil {
 			var publication raftmodel.Publication
 			publication, seedErr = apply.ApplyConfiguration(raftmodel.ApplyMeta{Index: entry.GetIndex(),
@@ -653,6 +644,20 @@ func newRealTransferRuntimeWithLearners(
 			_ = database.Close()
 			_ = wal.Close()
 			t.Fatal(seedErr)
+		}
+		// The setup writer consumed an incarnation. Retire all of its handles
+		// and recover the exact SQL/WAL cut before Runtime claims ownership and
+		// mints the next incarnation. BeginIncarnation is never repeatable on
+		// a live handle, even after its Ready has been durably persisted.
+		if err := errors.Join(apply.Close(), database.Close()); err != nil {
+			_ = wal.Close()
+			t.Fatal(err)
+		}
+		wal = reopenRealTransferWAL(t, wal, walPath, identity, options)
+		database, apply, err = raftmember.OpenBoundSQLWithApply(sqlPath, wal, authority, base, applyID)
+		if err != nil {
+			_ = wal.Close()
+			t.Fatal(err)
 		}
 	}
 	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
@@ -693,6 +698,34 @@ func newRealTransferRuntimeWithLearners(
 		return restarted
 	}
 	return runtime, base, reopen
+}
+
+func realTransferWALOptions() raftstore.Options {
+	return raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes}
+}
+
+func persistRealTransferLearnerCheckpoint(t *testing.T, wal *raftstore.Store, identity raftstore.Identity, learners []uint64) (*pb.Entry, error) {
+	t.Helper()
+	entry := realTransferLearnerCheckpoint(t, identity, learners)
+	incarnation, err := wal.BeginIncarnation()
+	if err == nil {
+		err = wal.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
+			HardState: &pb.HardState{Term: entry.Term, Commit: entry.Index}, Entries: []*pb.Entry{entry}, MustSync: true})
+	}
+	return entry, err
+}
+
+func reopenRealTransferWAL(t *testing.T, wal *raftstore.Store, path string, identity raftstore.Identity, options raftstore.Options) *raftstore.Store {
+	t.Helper()
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := raftstore.Open(path, identity, 29, realTransferWALKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reopened
 }
 
 func realTransferStaticBootstrap(t *testing.T, voters, learners []uint64) *pb.Snapshot {

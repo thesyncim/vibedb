@@ -3,11 +3,13 @@ package multiraft
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -275,6 +277,53 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 			publication.ConfState.Equivalent(removedConf) == nil &&
 			publication.ReplicaSetVersion == authorityVersion && authorityFound
 	})
+}
+
+// This WAL-only gate runs even on hosts that cannot allocate the sealed SQL
+// journals used by the full RF3 fixture. It exercises the same setup/handoff
+// helpers and preserves the production one-Begin-per-handle rule.
+func TestRealTransferLearnerSetupReopensBeforeRuntimeIncarnation(t *testing.T) {
+	identity := realTransferIdentities()[0]
+	path, options := filepath.Join(t.TempDir(), "member.wal"), realTransferWALOptions()
+	wal, err := raftstore.Create(path, identity, realTransferWALKey(), raftstore.Bootstrap{
+		TopologyRecoveryEpoch: 29, Snapshot: realTransferStaticBootstrap(t, []uint64{1, 2, 3}, []uint64{4}),
+	}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	entry, err := persistRealTransferLearnerCheckpoint(t, wal, identity, []uint64{4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := wal.CurrentIncarnation()
+	if _, err := wal.BeginIncarnation(); !errors.Is(err, raftstore.ErrInvalid) {
+		t.Fatalf("setup writer admitted a second incarnation: %v", err)
+	}
+	wal = reopenRealTransferWAL(t, wal, path, identity, options)
+	if wal.CurrentIncarnation() != first {
+		t.Fatal("reopen changed incarnation before runtime admission")
+	}
+	entries, err := wal.Entries(2, 3, ^uint64(0))
+	if err != nil || len(entries) != 1 || !proto.Equal(entries[0], entry) {
+		t.Fatalf("reopen lost exact enrolled learner entry: %v", err)
+	}
+	hard, _, err := wal.InitialState()
+	if err != nil || hard.GetTerm() != entry.GetTerm() || hard.GetCommit() != entry.GetIndex() {
+		t.Fatalf("reopen lost learner durable commit: %v %v", hard, err)
+	}
+	second, err := wal.BeginIncarnation()
+	if err != nil || second != first+1 {
+		t.Fatalf("runtime incarnation=%d after setup=%d: %v", second, first, err)
+	}
+	if err := wal.Persist(raftmodel.PersistBatch{NodeIncarnation: first, ReadyID: 1, Entries: []*pb.Entry{entry}, MustSync: true}); !errors.Is(err, raftstore.ErrInvalid) {
+		t.Fatalf("reopened runtime accepted old setup Ready: %v", err)
+	}
+	next := &pb.Entry{Index: proto.Uint64(3), Term: proto.Uint64(1), Type: pb.EntryNormal.Enum()}
+	if err := wal.Persist(raftmodel.PersistBatch{NodeIncarnation: second, ReadyID: 1,
+		HardState: &pb.HardState{Term: next.Term, Commit: next.Index}, Entries: []*pb.Entry{next}, MustSync: true}); err != nil {
+		t.Fatalf("fresh runtime Ready after setup handoff: %v", err)
+	}
 }
 
 func preflightRealTransferLearnerGrant(t *testing.T) {
