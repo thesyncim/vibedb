@@ -41,6 +41,10 @@ func RestoreCatalogActivationDocumentMatches(raw []byte, operation [sha256.Size]
 const (
 	restoreCatalogDocumentFormat   = 1
 	maxRestoreCatalogDocumentBytes = 1024
+	// RestoreCatalogReadAdmissionBytes is the wire response ceiling used by
+	// the shared catalog relation. It is not the activation document's logical
+	// limit: readRaw and the canonical document parser still enforce 1 KiB.
+	RestoreCatalogReadAdmissionBytes = maxReplicatedCatalogBytes
 )
 
 var (

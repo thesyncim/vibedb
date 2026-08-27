@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -25,8 +26,22 @@ func TestRestoreCatalogPreparingAuthorityIsNarrowAndRestoreOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := sqldriver.ReplicatedShardStoreIdentity{UserTable: gateway.ReplicatedCatalogTable,
-		Binding: sqldriver.ReplicatedShardStoreBinding{Distribution: string(gateway.ReplicatedCatalogDistribution),
-			Shard: string(gateway.ReplicatedCatalogShard)}}
+		Binding: sqldriver.ReplicatedShardStoreBinding{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+			TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, GroupID: group.GroupID, ShardIncarnation: group.ShardIncarnation,
+			Distribution: string(gateway.ReplicatedCatalogDistribution), Shard: string(gateway.ReplicatedCatalogShard),
+			AllocationGeneration: 1, MemberID: 1, StoreID: [16]byte{9},
+			Authority: sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+				OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1}}}
+	// Resolve the actual engine schema defaults instead of inventing a small
+	// fixture relation that conceals the pre-lookup response admission contract.
+	_, base.UserLimits, err = sqldriver.InitialReplicatedRelationManifest(base.Binding,
+		sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
+			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+			Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}},
+		sqldriver.InitialReplicatedRelationSchema{Table: gateway.ReplicatedCatalogTable, PrimaryKey: "/id"})
+	if err != nil || base.UserLimits.MaxDocumentBytes <= 1024 || base.UserLimits.MaxDocumentBytes > gateway.RestoreCatalogReadAdmissionBytes {
+		t.Fatalf("actual catalog schema limits=%+v err=%v", base.UserLimits, err)
+	}
 	state := raftservice.ServingState{Identity: raftmember.RuntimeIdentity{Group: group}}
 	allows := rf3RestoreCatalogPreparingAuthority(gate, [32]byte{2}, group, base,
 		func(raftservice.ServingState) bool { return true })
@@ -36,10 +51,36 @@ func TestRestoreCatalogPreparingAuthorityIsNarrowAndRestoreOnly(t *testing.T) {
 	if !allows(state, &request) {
 		t.Fatal("authenticated restore bootstrap probe rejected")
 	}
-	request.Operation, request.Relation, request.MaxValueBytes = shardservice.ReplicatedReadLeader, 1, 1024
+	request.Operation, request.Relation, request.MaxValueBytes = shardservice.ReplicatedReadLeader, 1, gateway.RestoreCatalogReadAdmissionBytes
 	request.Key, _ = orderedkey.AppendString(nil, []byte("restore/activation"), orderedkey.Ascending)
 	if !allows(state, &request) {
 		t.Fatal("exact activation row read rejected")
+	}
+	for _, maximum := range []uint32{0, 1024, gateway.RestoreCatalogReadAdmissionBytes - 1, gateway.RestoreCatalogReadAdmissionBytes + 1} {
+		candidate := request
+		candidate.MaxValueBytes = maximum
+		if allows(state, &candidate) {
+			t.Fatalf("noncanonical response ceiling %d accepted", maximum)
+		}
+	}
+	for _, limits := range []int{0, gateway.RestoreCatalogReadAdmissionBytes + 1} {
+		candidate := base
+		candidate.UserLimits.MaxDocumentBytes = limits
+		invalid := rf3RestoreCatalogPreparingAuthority(gate, [32]byte{2}, group, candidate,
+			func(raftservice.ServingState) bool { return true })
+		if invalid(state, &request) {
+			t.Fatal("missing or unadmittable catalog schema accepted")
+		}
+	}
+	for _, change := range []func(*shardservice.ReplicatedRequest){
+		func(r *shardservice.ReplicatedRequest) { r.Relation = 2 },
+		func(r *shardservice.ReplicatedRequest) { r.Operation = shardservice.ReplicatedReadFollower },
+	} {
+		candidate := request
+		change(&candidate)
+		if allows(state, &candidate) {
+			t.Fatal("noncanonical activation read accepted")
+		}
 	}
 	request.Key, _ = orderedkey.AppendString(nil, []byte("catalog/head"), orderedkey.Ascending)
 	if allows(state, &request) {

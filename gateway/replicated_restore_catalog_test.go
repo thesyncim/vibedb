@@ -59,6 +59,13 @@ func TestReplicatedRestoreCatalogExactCASAndLinearizableObservation(t *testing.T
 	if err != nil || observed != witness || observedReads.Load() == 0 {
 		t.Fatalf("observe=%+v reads=%d err=%v", observed, observedReads.Load(), err)
 	}
+	client.mu.Lock()
+	for _, maximum := range client.readMaximums {
+		if maximum != RestoreCatalogReadAdmissionBytes {
+			t.Errorf("activation read ceiling=%d want canonical relation ceiling=%d", maximum, RestoreCatalogReadAdmissionBytes)
+		}
+	}
+	client.mu.Unlock()
 
 	conflict := restoreCatalogWitness(authority, 2)
 	conflict.Operation = witness.Operation
@@ -78,13 +85,20 @@ func TestReplicatedRestoreCatalogExactCASAndLinearizableObservation(t *testing.T
 		t.Fatalf("stored witness=%+v err=%v", opened, err)
 	}
 	for _, malformed := range [][]byte{
-		stored[:len(stored)-1], append(append([]byte(nil), stored...), 0),
+		stored[:len(stored)-1], append(append([]byte(nil), stored...), 0), bytes.Repeat([]byte{' '}, maxRestoreCatalogDocumentBytes+1),
 	} {
 		if _, err = openRestoreCatalogDocument(malformed); !errors.Is(
 			err, ErrReplicatedRestoreCatalog,
 		) {
 			t.Fatalf("malformed restore document accepted: %v", err)
 		}
+	}
+	// The larger wire admission budget never broadens the logical row bound.
+	client.mu.Lock()
+	client.rows[string(restoreCatalogDocumentKey)] = bytes.Repeat([]byte{' '}, maxRestoreCatalogDocumentBytes+1)
+	client.mu.Unlock()
+	if _, err = catalog.ObserveRestoreActivation(ctx, witness.Operation); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("oversized activation row escaped logical read bound: %v", err)
 	}
 }
 

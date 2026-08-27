@@ -35,7 +35,12 @@ func rf3RestoreCatalogPreparingAuthority(
 		case shardservice.ReplicatedProbe:
 			return true
 		case shardservice.ReplicatedReadLeader:
-			return request.Relation == 1 && request.MaxValueBytes <= 1024 &&
+			// Read admission reserves the frozen relation maximum before lookup;
+			// the exact activation row still has a separate 1 KiB logical limit.
+			return request.Relation == 1 &&
+				request.MaxValueBytes == gateway.RestoreCatalogReadAdmissionBytes &&
+				base.UserLimits.MaxDocumentBytes > 0 &&
+				base.UserLimits.MaxDocumentBytes <= gateway.RestoreCatalogReadAdmissionBytes &&
 				gateway.RestoreCatalogActivationKeyMatches(request.Key)
 		case shardservice.ReplicatedPropose:
 			command, err := replication.OpenCommand(request.Command)
