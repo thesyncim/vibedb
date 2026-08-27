@@ -1005,6 +1005,11 @@ func (sourceCaptureValidator) ValidateDelete(_, _ []byte, _ bool) replicatedstat
 
 func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptureFixture {
 	t.Helper()
+	return newSourceCaptureFixtureWithValidator(t, partitioner, sourceCaptureValidator{})
+}
+
+func newSourceCaptureFixtureWithValidator(t testing.TB, partitioner *Partitioner, validator replicatedstate.MutationValidator) sourceCaptureFixture {
+	t.Helper()
 	dir := t.TempDir()
 	create := func(name string, options durable.Options) *durable.Collection {
 		file, err := os.OpenFile(
@@ -1034,7 +1039,7 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 			Collection:       collection,
 			Validation:       replicatedstate.ValidationDeterministicMutation,
 			ValidationDigest: sha256.Sum256([]byte("range-split-source-capture-test")),
-			Validator:        sourceCaptureValidator{},
+			Validator:        validator,
 			Limits: replicatedstate.CollectionLimits{
 				MaxKeyBytes:          collection.MaxKeyBytes(),
 				MaxDocumentBytes:     collection.MaxDocumentBytes(),
@@ -1131,13 +1136,19 @@ func (f sourceCaptureFixture) openSession(
 	index uint64,
 	tenant []byte,
 	clientID replication.ID128,
+	authority ...replication.CommandAuthorityClass,
 ) uint64 {
 	t.Helper()
 	seed := make([]byte, 0, len("rangesplit/test-session-open/")+len(tenant)+len(clientID))
 	seed = append(seed, "rangesplit/test-session-open/"...)
 	seed = append(seed, tenant...)
 	seed = append(seed, clientID[:]...)
+	class := replication.CommandAuthorityClass(0)
+	if len(authority) != 0 {
+		class = authority[0]
+	}
 	encoded, err := replication.AppendCommand(nil, replication.Command{
+		AuthorityClass:         class,
 		Kind:                   replication.CommandSessionOpen,
 		ClusterID:              f.binding.ClusterID,
 		ClusterIncarnation:     f.binding.ClusterIncarnation,
