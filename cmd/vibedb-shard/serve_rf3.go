@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -67,6 +69,7 @@ func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
 	nodes := append(policy.NodesWith(serviceauthz.CapabilityMembership),
 		policy.NodesWith(serviceauthz.CapabilitySchema)...)
 	nodes = append(nodes, policy.NodesWith(serviceauthz.CapabilityTopology)...)
+	nodes = append(nodes, policy.NodesWith(serviceauthz.CapabilityBackup)...)
 	slices.SortFunc(nodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
 	return slices.Compact(nodes)
 }
@@ -512,6 +515,23 @@ func servePreparedRF3WithExecutionLanes(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
+	backupControl, err := clusterbackupservice.New(clusterbackupservice.Options{
+		Owner: peer.Owners(),
+		Authorize: func(identity rafttransport.PeerIdentity, request clusterbackup.LiveRequest) bool {
+			local, served := servedGroups[request.Group]
+			return served && local.MemberID == request.SourceMember &&
+				policy.Check(identity.Node, serviceauthz.CapabilityBackup) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+		ChunkBytes:    int(manifest.ReplicaControl.SourceChunkBytes),
+		MaxConcurrent: manifest.ReplicaControl.MaxSourceConcurrent,
+	})
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
 	actionJournal, err := replicaaction.OpenFileJournal(
 		manifest.ReplicaControl.ActionJournalPath,
 		manifest.ReplicaControl.MaxActionRecords,
@@ -792,7 +812,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
 	controlMux, err := newRF3ControlMux(
-		membershipControl, observationControl, metricsControl, sourceControl, actionControl,
+		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
 		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
 	)
@@ -945,10 +965,10 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, metrics, source, action, split, schema, planObservation, admission, tail,
+	membership, observation, metrics, backup, source, action, split, schema, planObservation, admission, tail,
 	terminal, childPrepare shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 12)
+	routes := make([]shardcontrol.Route, 0, 13)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -963,6 +983,12 @@ func newRF3ControlMux(
 			Handler:       metrics,
 		},
 	)
+	if backup != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: clusterbackup.LiveRequestDiscriminator(),
+			Handler:       backup,
+		})
+	}
 	if source != nil {
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: snapshottransfer.SourceControlRequestDiscriminator(),
