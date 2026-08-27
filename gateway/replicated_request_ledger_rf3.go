@@ -10,7 +10,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 const replicatedRequestLedgerProposalDomain = "vibedb/gateway/request-ledger-proposal/format-0\x00"
@@ -150,19 +149,20 @@ func replicatedRequestLedgerProposalIdentity(
 	command requestledger.CommandView,
 	raw []byte,
 ) (replication.Digest, replication.RetryHome, uint64, uint64) {
-	hash := sha256.New()
-	_, _ = hash.Write(byteview.Bytes(replicatedRequestLedgerProposalDomain))
-	_, _ = hash.Write(command.KeyDigest[:])
-	_, _ = hash.Write([]byte{byte(command.Operation)})
-	var fixed [24]byte
-	binary.LittleEndian.PutUint64(fixed[:8], command.ExpectedRevision)
-	binary.LittleEndian.PutUint64(fixed[8:16], command.Revision)
-	binary.LittleEndian.PutUint64(fixed[16:24], uint64(len(raw)))
-	_, _ = hash.Write(fixed[:])
+	const fixedBytes = 32 + 1 + 24 + sha256.Size
+	var preimage [len(replicatedRequestLedgerProposalDomain) + fixedBytes]byte
+	offset := copy(preimage[:], replicatedRequestLedgerProposalDomain)
+	copy(preimage[offset:], command.KeyDigest[:])
+	offset += len(command.KeyDigest)
+	preimage[offset] = byte(command.Operation)
+	offset++
+	binary.LittleEndian.PutUint64(preimage[offset:offset+8], command.ExpectedRevision)
+	binary.LittleEndian.PutUint64(preimage[offset+8:offset+16], command.Revision)
+	binary.LittleEndian.PutUint64(preimage[offset+16:offset+24], uint64(len(raw)))
+	offset += 24
 	body := sha256.Sum256(raw)
-	_, _ = hash.Write(body[:])
-	var digest replication.Digest
-	_ = hash.Sum(digest[:0])
+	copy(preimage[offset:], body[:])
+	digest := replication.Digest(sha256.Sum256(preimage[:]))
 	var retryHome replication.RetryHome
 	copy(retryHome[:], digest[:len(retryHome)])
 	epoch := binary.LittleEndian.Uint64(digest[8:16])

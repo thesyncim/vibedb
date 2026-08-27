@@ -99,6 +99,48 @@ func lifecycleDigest(label string) requestledger.Digest {
 	return requestledger.Digest(sha256.Sum256([]byte(label)))
 }
 
+func TestReplicatedRequestLedgerProposalIdentityPreservesGrammar(t *testing.T) {
+	command := requestledger.CommandView{Command: requestledger.Command{
+		Operation: requestledger.OperationAdvance, KeyDigest: lifecycleDigest("key"),
+		ExpectedRevision: 41, Revision: 42,
+	}}
+	raw := bytes.Repeat([]byte{0xa5}, 4096)
+	got, _, _, _ := replicatedRequestLedgerProposalIdentity(command, raw)
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(replicatedRequestLedgerProposalDomain))
+	_, _ = hash.Write(command.KeyDigest[:])
+	_, _ = hash.Write([]byte{byte(command.Operation)})
+	var fixed [24]byte
+	binary.LittleEndian.PutUint64(fixed[:8], command.ExpectedRevision)
+	binary.LittleEndian.PutUint64(fixed[8:16], command.Revision)
+	binary.LittleEndian.PutUint64(fixed[16:24], uint64(len(raw)))
+	_, _ = hash.Write(fixed[:])
+	body := sha256.Sum256(raw)
+	_, _ = hash.Write(body[:])
+	var want replication.Digest
+	_ = hash.Sum(want[:0])
+	if got != want {
+		t.Fatalf("proposal identity changed: got=%x want=%x", got, want)
+	}
+}
+
+func BenchmarkReplicatedRequestLedgerProposalIdentity(b *testing.B) {
+	command := requestledger.CommandView{Command: requestledger.Command{
+		Operation: requestledger.OperationAdvance, KeyDigest: lifecycleDigest("key"),
+		ExpectedRevision: 41, Revision: 42,
+	}}
+	raw := bytes.Repeat([]byte{0xa5}, 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for range b.N {
+		digest, _, _, _ := replicatedRequestLedgerProposalIdentity(command, raw)
+		if digest == (replication.Digest{}) {
+			b.Fatal("zero digest")
+		}
+	}
+}
+
 func lifecycleKey() requestledger.RequestKey {
 	key := requestledger.RequestKey{
 		Scope: requestledger.ScopeAuthenticated, TenantDigest: lifecycleDigest("tenant"),
