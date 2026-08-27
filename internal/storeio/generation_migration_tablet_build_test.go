@@ -2,6 +2,7 @@ package storeio
 
 import (
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -41,6 +42,50 @@ func TestGenerationMigrationTabletBuilderPublishesThroughFinalVectorFold(t *test
 		t.Fatal(err)
 	}
 	if root.Kind != PagePrimaryCatalog || root.LogicalID != GlobalTabletCatalogRootLogicalID {
+		t.Fatalf("root=%+v", root)
+	}
+}
+
+func TestFoldGenerationMigrationTabletVectorBuildsAuthenticatedCatalog(t *testing.T) {
+	image, _ := buildPrimaryGraphTestImage(t, 1000)
+	cache, err := NewPageCache(image.file, PageCacheOptions{PageSize: int(format0PageSize), MaxPageSize: GlobalTabletCatalogRootBytes, ResidentBytes: 4 << 20, StoreID: image.root.StoreID, ReadConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	var tablets []PageRef
+	if err := VisitPrimaryGraphRefs(cache, image.root.PrimaryRoot, image.bounds, func(ref PageRef) error {
+		if ref.Kind == PageTabletRoute {
+			tablets = append(tablets, ref)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vectorFile, err := os.CreateTemp(t.TempDir(), "tablet-vector-fold-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vectorFile.Close()
+	vector, err := OpenGenerationMigrationTabletVector(vectorFile, 0, uint32(len(tablets)), image.root.StoreID, [16]byte{3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for tabletID, ref := range tablets {
+		if err := vector.Put(uint32(tabletID), GenerationMigrationTabletRef{Source: ref, Target: ref}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sink := &migrationExactMemorySink{storeID: image.root.StoreID, generation: 2, nextID: image.root.NextLogicalID, nextAt: image.bounds.FileEnd + 64<<10, pages: make(map[PageRef][]byte)}
+	folder, err := NewPrimaryGraphCatalogFolder(sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := FoldGenerationMigrationTabletVector(vector, cache, image.bounds, folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Kind != PagePrimaryCatalog || root.Generation != 2 {
 		t.Fatalf("root=%+v", root)
 	}
 }

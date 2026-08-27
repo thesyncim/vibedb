@@ -83,3 +83,41 @@ func (b *GenerationMigrationTabletBuilder) Finish(priorTabletMax []byte) (Genera
 	last := append([]byte(nil), lastKey...)
 	return GenerationMigrationTabletEmission{TabletID: b.tabletID, Ref: child.ref, FirstKey: first, LastKey: last, Records: b.records}, nil
 }
+
+// FoldGenerationMigrationTabletVector authenticates each final target tablet,
+// derives only its boundary keys, and emits the replacement global catalog.
+// Every ordinal must be populated: sparse vectors fail closed before a root is
+// returned.
+func FoldGenerationMigrationTabletVector(
+	vector *GenerationMigrationTabletVector,
+	cache *PageCache,
+	bounds GlobalTabletCatalogBounds,
+	folder *PrimaryGraphCatalogFolder,
+) (PageRef, error) {
+	if vector == nil || cache == nil || folder == nil {
+		return PageRef{}, ErrInvalidWrite
+	}
+	expected := uint32(0)
+	var firstScratch, lastScratch [CommonPrimaryLeafMaxKeyBytes]byte
+	err := vector.Visit(func(tabletID uint32, entry GenerationMigrationTabletRef) error {
+		if tabletID != expected || entry.Target == (PageRef{}) {
+			return ErrGlobalTabletCatalogCorrupt
+		}
+		first, last, err := AppendPrimaryTabletKeyBounds(cache, entry.Target, bounds, firstScratch[:0], lastScratch[:0])
+		if err != nil {
+			return err
+		}
+		if err := folder.AddTabletRef(tabletID, first, last, entry.Target); err != nil {
+			return err
+		}
+		expected++
+		return nil
+	})
+	if err != nil {
+		return PageRef{}, err
+	}
+	if expected != vector.tablets {
+		return PageRef{}, ErrGlobalTabletCatalogCorrupt
+	}
+	return folder.Finish()
+}
