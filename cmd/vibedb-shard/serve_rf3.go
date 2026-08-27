@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
+	"github.com/thesyncim/vibedb/internal/kubeoperator"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -107,14 +109,15 @@ func servePreparedRF3(parent context.Context, manifest rf3Manifest) error {
 type rf3ListenFunc func(network, address string) (net.Listener, error)
 
 type preparedRF3Group struct {
-	manifest      rf3Manifest
-	base          sqldriver.ReplicatedShardStoreIdentity
-	applyIdentity sqldriver.ReplicatedApplyIdentity
-	key           raftstore.Key
-	wal           *raftstore.Store
-	database      *sqldriver.Database
-	apply         *sqldriver.ReplicatedApply
-	publication   raftmodel.Publication
+	manifest         rf3Manifest
+	base             sqldriver.ReplicatedShardStoreIdentity
+	applyIdentity    sqldriver.ReplicatedApplyIdentity
+	key              raftstore.Key
+	wal              *raftstore.Store
+	database         *sqldriver.Database
+	apply            *sqldriver.ReplicatedApply
+	publication      raftmodel.Publication
+	restoreOperation [32]byte
 }
 
 type preparedRF3Set struct {
@@ -187,6 +190,10 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 			return result, closePreparedRF3Groups(result.groups, errors.Join(err, wal.Close()))
 		}
 		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published()}
+		item.restoreOperation, err = validateRestoredRF3Bootstrap(wal, bundle.SQL.Path, base.Binding.MemberID)
+		if err != nil {
+			return result, closePreparedRF3Groups(append(result.groups, item), err)
+		}
 		if err = rejectRF3UnappliedMembership(wal, item.publication.Applied); err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
 		}
@@ -449,11 +456,8 @@ func servePreparedRF3WithExecutionLanes(
 	restoreGateList := make([]*shardservice.RestoreServingGate, 0, len(preparedSet.groups))
 	for index := range preparedSet.groups {
 		item := &preparedSet.groups[index]
-		operation, restored, markerErr := restoredRF3PreparingOperation(item.manifest.SQL.Path)
-		if markerErr != nil {
-			return closeAdopted(markerErr)
-		}
-		if !restored {
+		operation := item.restoreOperation
+		if operation == ([32]byte{}) {
 			continue
 		}
 		itemGroup := groupFromBinding(item.base.Binding)
@@ -1106,6 +1110,30 @@ func newRF3ControlMux(
 func hasRestoredRF3PreparingMarker(sqlPath string) (bool, error) {
 	_, found, err := restoredRF3PreparingOperation(sqlPath)
 	return found, err
+}
+
+func validateRestoredRF3Bootstrap(wal *raftstore.Store, sqlPath string, member uint64) ([32]byte, error) {
+	base, err := wal.Snapshot()
+	if err != nil {
+		return [32]byte{}, err
+	}
+	operation, ordinal, _, restored, err := kubeoperator.RestoreBootstrapOperation(base)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	marker, err := readRF3BoundedFile(filepath.Join(filepath.Dir(sqlPath), "restore_preparing"), 37)
+	if !restored {
+		if errors.Is(err, os.ErrNotExist) {
+			return [32]byte{}, nil
+		}
+		return [32]byte{}, errors.Join(errRF3Serving, err)
+	}
+	if err != nil || len(marker) != 37 || member == 0 || member > 3 ||
+		[32]byte(marker[:32]) != operation || binary.BigEndian.Uint32(marker[32:36]) != ordinal ||
+		uint64(marker[36])+1 != member {
+		return [32]byte{}, errors.Join(errRF3Serving, err)
+	}
+	return operation, nil
 }
 
 func restoredRF3PreparingOperation(sqlPath string) ([32]byte, bool, error) {

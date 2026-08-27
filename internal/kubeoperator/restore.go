@@ -523,7 +523,8 @@ func restoreApplyOptions(in bootstrapApply) (sqldriver.ReplicatedApplyOptions, e
 
 func restoreRF3Bootstrap(operation clusterrestore.Operation, group uint32, template [sha256.Size]byte) *pb.Snapshot {
 	index, term := uint64(1), uint64(1)
-	data := make([]byte, 0, 32+4+32)
+	data := make([]byte, 0, len(restoreBootstrapMagic)+32+4+32)
+	data = append(data, restoreBootstrapMagic[:]...)
 	data = append(data, operation.Digest[:]...)
 	data = append(data, byte(group>>24), byte(group>>16), byte(group>>8), byte(group))
 	data = append(data, template[:]...)
