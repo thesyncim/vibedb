@@ -180,6 +180,19 @@ func TestNativeSessionRetireReleaseAndDestroyConvergesUnknownLifecycle(t *testin
 
 	// Replicated Release reclaimed the identity, so a fresh journal and session
 	// can reuse the same client ID without carrying the old route binding.
+	replacementRoute := route
+	replacementRoute.Command.RouteGeneration++
+	replacementBinding, err := NativeSessionJournalBinding(
+		replacementRoute, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityTopology,
+	)
+	if err != nil || replacementBinding == binding {
+		t.Fatalf("replacement binding=%x original=%x err=%v",
+			replacementBinding, binding, err)
+	}
+	journalOptions.Binding = replacementBinding
+	sessionOptions.Route = replacementRoute
+	client.state.Fence.Command = replacementRoute.Command
 	journal, err = OpenNativeSessionJournal(journalOptions)
 	if err != nil {
 		t.Fatal(err)
