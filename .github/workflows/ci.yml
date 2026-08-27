@@ -252,7 +252,15 @@ jobs:
           fi
           jq -e --arg test_name "${test_name}" \
             'select(.Action == "output" and .Test == $test_name and
-              (.Output | contains("write-driven hot move:")))' \
+              (.Output | contains("write-driven hot move:") and
+                contains("atomic_relation_index_visibility=true") and
+                contains("leader_kill=true") and
+                contains("response_partition=true") and
+                contains("reopen=true") and
+                contains("p99=") and
+                contains("rss_growth=") and
+                contains("storage_growth=") and
+                contains("snapshot_network_growth=")))' \
             "${result}" >/dev/null
       - name: Upload write-driven hot-shard evidence
         if: always() && matrix.runner == 'ubuntu-latest'
