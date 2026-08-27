@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -232,15 +231,8 @@ func (a *rf3SchemaActivator) ObserveActive(
 	if err != nil || !found {
 		return false, err
 	}
-	commandMatches := transition.RequestDigest == request.Operation &&
-		transition.AuthorizationDigest == schemainstall.AuthorizationDigest(authorization) &&
-		transition.From.SchemaGeneration == request.FromSchemaGeneration &&
-		transition.FromManifest == request.FromRelationManifestDigest &&
-		transition.ToSchemaGeneration == request.ToSchemaGeneration &&
-		transition.ToManifest == request.ToRelationManifestDigest &&
-		transition.ToApplyContract == request.ApplyContractDigest
-	if !commandMatches {
-		return false, schemainstall.ErrConflict
+	if err := validateRF3SchemaTransition(request, authorization, transition); err != nil {
+		return false, err
 	}
 	state.mu.Lock()
 	live := state.base.Binding.Authority.SchemaGeneration == request.ToSchemaGeneration &&
@@ -301,40 +293,41 @@ func (a *rf3SchemaActivator) Activate(
 		return err
 	}
 	if published {
-		if transition.RequestDigest != request.Operation ||
-			transition.AuthorizationDigest != authorizationDigest {
-			return schemainstall.ErrConflict
-		}
-		command = bytes.Clone(transition.Bytes())
-	} else {
-		proof, recoverErr := state.apply.RecoverPreparedReplicatedSchemaTarget(raw, request.Operation)
-		if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
-			return errors.Join(recoverErr, schemainstall.ErrConflict)
-		}
-		cas, casErr := state.apply.ReplicatedSchemaCatalogCASDigest(
-			proof, request.Operation, authorizationDigest,
-		)
-		if casErr != nil {
-			return casErr
-		}
-		command, err = state.apply.AppendReplicatedSchemaTransition(nil, proof,
-			sqldriver.ReplicatedSchemaTransitionAuthority{RequestDigest: request.Operation,
-				AuthorizationDigest: authorizationDigest, CatalogCASDigest: cas})
+		command, err = rf3SchemaActivationCommand(request, authorization, transition, true, nil)
 		if err != nil {
 			return err
 		}
-		if err = state.apply.PersistReplicatedSchemaTransition(command); err != nil {
+	} else {
+		persisted, found, readErr := sqldriver.ObservePersistedReplicatedSchemaTransition(state.path)
+		if readErr != nil {
+			return readErr
+		}
+		command, err = rf3SchemaActivationCommand(request, authorization, persisted, found, func() ([]byte, error) {
+			proof, recoverErr := state.apply.RecoverPreparedReplicatedSchemaTarget(raw, request.Operation)
+			if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
+				return nil, errors.Join(recoverErr, schemainstall.ErrConflict)
+			}
+			cas, casErr := state.apply.ReplicatedSchemaCatalogCASDigest(proof, request.Operation, authorizationDigest)
+			if casErr != nil {
+				return nil, casErr
+			}
+			fresh, appendErr := state.apply.AppendReplicatedSchemaTransition(nil, proof,
+				sqldriver.ReplicatedSchemaTransitionAuthority{RequestDigest: request.Operation,
+					AuthorizationDigest: authorizationDigest, CatalogCASDigest: cas})
+			if appendErr != nil {
+				return nil, appendErr
+			}
+			return fresh, nil
+		})
+		if err != nil {
 			return err
 		}
-		serving, probeErr := a.owners.Probe(ctx, request.Group)
-		if probeErr != nil {
-			return probeErr
+		if !found {
+			if err = state.apply.PersistReplicatedSchemaTransition(command); err != nil {
+				return err
+			}
 		}
-		if err = a.owners.ProposeSchemaTransition(ctx, serving.Fence(), command); err != nil &&
-			!errors.Is(err, raftservice.ErrOutcomeUnknown) {
-			return err
-		}
-		if err = waitRF3SchemaCommit(ctx, a.owners, request.Group, command); err != nil {
+		if err = settleRF3SchemaCommit(ctx, a.owners, request.Group, command); err != nil {
 			return err
 		}
 		if _, err = state.apply.PublishReplicatedSchemaCatalog(); err != nil {
