@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -164,7 +165,13 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 // RunStagedWave admits one invocation before its payload staging writes. The
 // admission is not a reusable token: every return/restart requires a new fence.
 // No service authority is forwarded to staging or participant proposals.
-func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, wave DurableRequestWave) (DurableRequestWaveResult, error) {
+func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, wave DurableRequestWave) (_ DurableRequestWaveResult, failure error) {
+	stage := "validate"
+	defer func() {
+		if failure != nil {
+			failure = fmt.Errorf("gateway: wave %d staging %s: %w", wave.Ordinal, stage, failure)
+		}
+	}()
 	if runner == nil || runner.ledger == nil || runner.resolver == nil || runner.proposer == nil ||
 		runner.pinFencer == nil || runner.gateSessions == nil || runner.payloads == nil || ctx == nil ||
 		wave.Step != (requestledger.StepRef{}) || wave.Build != (requestledger.PayloadBuildRecord{}) ||
@@ -180,12 +187,15 @@ func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, 
 	if err != nil {
 		return DurableRequestWaveResult{}, err
 	}
+	stage = "resolve"
 	if _, err = runner.resolveWave(ctx, wave); err != nil {
 		return DurableRequestWaveResult{}, err
 	}
+	stage = "execution fence"
 	if err = runner.fenceWaveSideEffect(ctx, wave); err != nil {
 		return DurableRequestWaveResult{}, err
 	}
+	stage = "head"
 	headRow, err := runner.ledger.ReadRow(ctx, wave.Home, DurableRequestLifecycleRead{
 		Key: wave.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
 	})
@@ -193,6 +203,7 @@ func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, 
 		return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	if headRow.Head.NextStepOrdinal != wave.Ordinal {
+		stage = "advanced recovery"
 		if wave.Ordinal == ^uint64(0) || headRow.Head.NextStepOrdinal != wave.Ordinal+1 {
 			return DurableRequestWaveResult{}, ErrDurableRequestConflict
 		}
@@ -206,6 +217,7 @@ func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, 
 		}
 		return runner.runAdmittedWave(ctx, retained, keyDigest)
 	}
+	stage = "payload"
 	payload, err := runner.payloads.Stage(ctx, wave.Home, wave.Key, wave.Ordinal, wave.Target, wave.Command)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
@@ -217,10 +229,17 @@ func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, 
 	if _, err = validateDurableRequestWave(wave); err != nil {
 		return DurableRequestWaveResult{}, err
 	}
+	stage = "admitted work"
 	return runner.runAdmittedWave(ctx, wave, keyDigest)
 }
 
-func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context, wave DurableRequestWave, keyDigest requestledger.Digest) (DurableRequestWaveResult, error) {
+func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context, wave DurableRequestWave, keyDigest requestledger.Digest) (_ DurableRequestWaveResult, failure error) {
+	stage := "open rows"
+	defer func() {
+		if failure != nil {
+			failure = fmt.Errorf("gateway: wave %d %s: %w", wave.Ordinal, stage, failure)
+		}
+	}()
 	head, routePin, pending, readApplied, err := runner.openWaveRows(ctx, wave, keyDigest)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
@@ -233,6 +252,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 		routePin.WaveOrdinal == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal+1 &&
 		head.OutstandingRoutePinDigest == (requestledger.Digest{}) && pending.Revision == 0
 	if completed {
+		stage = "completed session cleanup"
 		if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
 			return DurableRequestWaveResult{}, err
 		}
@@ -250,6 +270,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	if routePin.Phase == requestledger.RoutePinReleased &&
 		routePin.WaveOrdinal+1 == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal &&
 		head.OutstandingRoutePinDigest == (requestledger.Digest{}) {
+		stage = "prior session cleanup"
 		// The released row remains the exact session-cleanup witness. Never
 		// replace it until a replayable retirement/release has settled.
 		if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
@@ -263,6 +284,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 
 	var route ReplicatedRoute
 	if routePin.Phase == requestledger.RoutePinInvalid {
+		stage = "acquire intent"
 		route, err = runner.resolveWave(ctx, wave)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -285,6 +307,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	}
 
 	if routePin.Phase == requestledger.RoutePinAcquiring {
+		stage = "acquire proposal and proof"
 		route, err = runner.resolvePersistedRoute(ctx, wave, routePin.Command)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -312,6 +335,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 
 	var observation []byte
 	if afterAdvance {
+		stage = "retained observation"
 		observation, err = runner.readWaveObservation(ctx, wave, routePin, readApplied)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -320,6 +344,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	if pending.Revision == 0 &&
 		routePin.Phase == requestledger.RoutePinAcquired &&
 		head.OutstandingRoutePinDigest == (requestledger.Digest{}) {
+		stage = "pending work"
 		pending, err = requestledger.NewPendingWaveWithRoutePin(
 			head, wave.Build, head.Revision+1, routePin,
 			[]requestledger.StepRef{wave.Step},
@@ -346,6 +371,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	}
 
 	if pending.Revision != 0 {
+		stage = "participant work and continuation"
 		route, err = runner.resolvePersistedRoute(ctx, wave, wave.Command)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -398,6 +424,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 
 	if routePin.Phase == requestledger.RoutePinAcquired &&
 		head.OutstandingRoutePinDigest == routePin.AcquiredEvidenceDigest {
+		stage = "release intent"
 		route, err = runner.resolvePersistedRoute(ctx, wave, routePin.Command)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -421,6 +448,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	}
 
 	if routePin.Phase == requestledger.RoutePinReleasing {
+		stage = "release proposal and proof"
 		route, err = runner.resolvePersistedRoute(ctx, wave, routePin.Command)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -450,6 +478,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 		head.OutstandingRoutePinDigest != (requestledger.Digest{}) || pending.Revision != 0 {
 		return DurableRequestWaveResult{}, ErrDurableRequestUnresolved
 	}
+	stage = "session cleanup"
 	if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
 		return DurableRequestWaveResult{}, err
 	}
@@ -555,7 +584,7 @@ func (runner *DurableRequestLifecycleRunner) applyRoutePin(
 		return requestledger.HeadRecord{}, err
 	}
 	if result.Ledger.ResultCode != replicatedstate.ResultApplied {
-		return requestledger.HeadRecord{}, ErrDurableRequestConflict
+		return requestledger.HeadRecord{}, fmt.Errorf("gateway: ledger route transition %d result %d: %w", operation, result.Ledger.ResultCode, ErrDurableRequestConflict)
 	}
 	if operation == requestledger.OperationRecordRoutePinReleased {
 		return requestledger.MarkRoutePinReleased(head, next, head.Revision+1)

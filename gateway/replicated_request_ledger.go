@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -536,6 +537,9 @@ func durableRequestLedgerHome(key DurableRequestLedgerKey) (replication.Digest, 
 
 func cloneDurableRequestRoute(route ReplicatedRoute) ReplicatedRoute {
 	cloned := route
+	// Resolvers may carry names borrowed from the caller's recipe frame.
+	cloned.Distribution = distribution.DistributionName(strings.Clone(string(route.Distribution)))
+	cloned.Shard = distribution.ShardID(strings.Clone(string(route.Shard)))
 	cloned.Replicas = slices.Clone(route.Replicas)
 	return cloned
 }

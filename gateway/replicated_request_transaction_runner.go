@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
+	"strings"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -104,14 +107,22 @@ var durableDistributedCursorMagic = [8]byte{'V', 'D', 'R', 'T', 'X', 'N', 0, 1}
 func (runner *DurableRequestDistributedRunner) RunTyped(
 	ctx context.Context,
 	execution DurableRequestTypedExecutionContext,
-) (DurableRequestTerminalResult, error) {
+) (_ DurableRequestTerminalResult, failure error) {
+	stage := "validate"
+	defer func() {
+		if failure != nil {
+			failure = fmt.Errorf("gateway: distributed request %s: %w", stage, failure)
+		}
+	}()
 	if runner == nil || ctx == nil || execution.Participants == nil {
 		return DurableRequestTerminalResult{}, ErrDurableRequest
 	}
+	stage = "terminal authority"
 	authority, err := runner.authority.TerminalAuthority(ctx, execution)
 	if err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
+	stage = "progress read"
 	head, continuation, err := runner.openProgress(ctx, execution)
 	if err != nil {
 		return DurableRequestTerminalResult{}, err
@@ -124,6 +135,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	// without that witness resumes through the current ordinal's staged path.
 	if head.CleanupBuildDigest != (requestledger.Digest{}) &&
 		(head.OutstandingRoutePinDigest != (requestledger.Digest{}) || head.CleanupNextChunk == 0) {
+		stage = "advanced wave recovery"
 		recovery, ok := runner.waves.(interface {
 			ResumeAdvancedWave(context.Context, DurableRequestTypedExecutionContext) error
 		})
@@ -139,6 +151,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		}
 	}
 	if head.CleanupBuildDigest != (requestledger.Digest{}) {
+		stage = "payload cleanup"
 		if _, err = runner.payloads.Cleanup(ctx, execution.Home, execution.Key.RequestKey); err != nil {
 			return DurableRequestTerminalResult{}, err
 		}
@@ -147,6 +160,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 			return DurableRequestTerminalResult{}, err
 		}
 	}
+	stage = "continuation"
 	state, err := openDurableDistributedState(continuation.Cursor)
 	if err != nil && continuation.Revision != 0 {
 		if bytes.Equal(continuation.Cursor, authority.CommitCursor) {
@@ -173,6 +187,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		finalWaves = execution.Recipe.Contract.AbortFinalWaveCount
 	}
 	if state.branch != durableDistributedUndecided && head.NextStepOrdinal == finalWaves {
+		stage = "terminal completion"
 		return runner.completeTerminal(ctx, execution, authority, state)
 	}
 	progress := &durableDistributedProgress{
@@ -180,11 +195,13 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		next: head.NextStepOrdinal, state: state,
 		encoder: replicatedTransactionCommandEncoder{tenant: bytes.Clone(execution.Recipe.Tenant)},
 	}
+	stage = "manifest measurement"
 	descriptor, coordinator, coordinatorRoute, err := progress.measureManifest(ctx)
 	if err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
 	if head.NextStepOrdinal != 0 {
+		stage = "manifest recovery"
 		descriptor, err = runner.recoverManifestDescriptor(ctx, execution, coordinatorRoute)
 		if err != nil {
 			return DurableRequestTerminalResult{}, err
@@ -202,25 +219,32 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 	}
 	if head.NextStepOrdinal > manifestCommands {
+		stage = "prepared prefix recovery"
 		if err = progress.recoverPreparedPrefix(ctx, manifestCommands); err != nil {
 			return DurableRequestTerminalResult{}, err
 		}
 	}
+	stage = "manifest begin"
 	if err = progress.beginManifest(ctx, descriptor, coordinator, coordinatorRoute); err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
+	stage = "participant prepare"
 	if err = progress.prepare(ctx, coordinator, coordinatorRoute); err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
+	stage = "coordinator decision"
 	if err = progress.decide(ctx, coordinator, coordinatorRoute, uint64(descriptor.SegmentCount)); err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
+	stage = "participant release"
 	if err = progress.finish(ctx, coordinator, coordinatorRoute); err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
+	stage = "coordinator retirement"
 	if err = progress.retire(ctx, coordinator, coordinatorRoute, uint64(descriptor.SegmentCount)); err != nil {
 		return DurableRequestTerminalResult{}, err
 	}
+	stage = "terminal completion"
 	return runner.completeTerminal(ctx, execution, authority, progress.state)
 }
 
@@ -696,8 +720,13 @@ func (progress *durableDistributedProgress) command(
 	batches []replication.RelationMutationBatch,
 	settle func(uint32, replicatedstate.TransactionCompletionResult) error,
 	final bool,
-) (bool, error) {
+) (_ bool, failure error) {
 	ordinal := progress.ordinal
+	defer func() {
+		if failure != nil {
+			failure = fmt.Errorf("gateway: transaction wave %d role %d operation %d: %w", ordinal, control.Role, control.Operation, failure)
+		}
+	}()
 	progress.ordinal++
 	if ordinal < progress.next {
 		return false, nil
@@ -885,6 +914,9 @@ func openDurableDistributedState(raw []byte) (durableDistributedState, error) {
 
 func cloneDurableLogicalParticipant(value DurableRequestLogicalParticipant) DurableRequestLogicalParticipant {
 	cloned := value
+	// The recipe reader lends names from its reusable participant frame too.
+	cloned.Distribution = distribution.DistributionName(strings.Clone(string(value.Distribution)))
+	cloned.Shard = distribution.ShardID(strings.Clone(string(value.Shard)))
 	cloned.IntentScopes = slices.Clone(value.IntentScopes)
 	cloned.Batches = slices.Clone(value.Batches)
 	for batchIndex := range cloned.Batches {
