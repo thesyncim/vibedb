@@ -16,8 +16,8 @@ func gatewaySplitTemplateFixture() persistedGatewaySplitTemplate {
 	return persistedGatewaySplitTemplate{
 		MaxSessions: 32, RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
-		ShardKey:  "id", TupleVersion: uint16(distribution.CurrentTupleVersion),
-		MapperVersion: uint16(distribution.NativeMapperVersion),
+		ShardKey:  "/id", MaxBatchDocuments: 64, MaxBatchBytes: 16<<20 + 64*256,
+		TupleVersion: uint16(distribution.CurrentTupleVersion), MapperVersion: uint16(distribution.NativeMapperVersion),
 	}
 }
 

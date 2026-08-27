@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -24,6 +25,12 @@ import (
 var errGatewayReplicaControlManifest = errors.New("vibedb-gateway: invalid replica control manifest")
 
 const maxGatewayReplicaControlManifestBytes = 4 << 20
+
+const (
+	gatewayMaxSplitBatchDocuments = 64
+	gatewayMaxSplitBatchBytes     = replication.MaxCommandBytes +
+		gatewayMaxSplitBatchDocuments*replication.MaxMutationKeyBytes
+)
 
 type persistedGatewayReplicaControlManifest struct {
 	Generation       uint64                                 `json:"generation"`
@@ -60,13 +67,15 @@ type persistedGatewayShardControlEndpoint struct {
 }
 
 type persistedGatewaySplitTemplate struct {
-	MaxSessions   uint64            `json:"max_sessions"`
-	RetryWindow   uint16            `json:"retry_window"`
-	TxnLimits     durable.TxnLimits `json:"txn_limits"`
-	Format        uint16            `json:"format"`
-	ShardKey      string            `json:"shard_key"`
-	TupleVersion  uint16            `json:"tuple_version"`
-	MapperVersion uint16            `json:"mapper_version"`
+	MaxSessions       uint64            `json:"max_sessions"`
+	RetryWindow       uint16            `json:"retry_window"`
+	TxnLimits         durable.TxnLimits `json:"txn_limits"`
+	Format            uint16            `json:"format"`
+	ShardKey          string            `json:"shard_key"`
+	MaxBatchDocuments int               `json:"max_batch_documents"`
+	MaxBatchBytes     int               `json:"max_batch_bytes"`
+	TupleVersion      uint16            `json:"tuple_version"`
+	MapperVersion     uint16            `json:"mapper_version"`
 }
 
 type persistedGatewayControlEndpoint struct {
@@ -214,9 +223,13 @@ func openGatewayReplicaControlManifest(raw []byte, local rafttransport.NodeID) (
 }
 
 func validGatewaySplitTemplate(template persistedGatewaySplitTemplate) bool {
+	pointer, err := vibejson.CompilePointer(template.ShardKey)
 	return template.MaxSessions != 0 && template.RetryWindow != 0 &&
 		template.TxnLimits.MaxCollections > 0 && template.TxnLimits.MaxDocuments > 0 &&
-		template.TxnLimits.MaxBytes > 0 && template.ShardKey != "" &&
+		template.TxnLimits.MaxBytes > 0 && err == nil && len(pointer.Tokens) == 1 &&
+		pointer.String() == template.ShardKey &&
+		template.MaxBatchDocuments > 0 && template.MaxBatchDocuments <= gatewayMaxSplitBatchDocuments &&
+		template.MaxBatchBytes > 0 && template.MaxBatchBytes <= gatewayMaxSplitBatchBytes &&
 		template.TupleVersion == uint16(distribution.CurrentTupleVersion) &&
 		template.MapperVersion == uint16(distribution.NativeMapperVersion)
 }
