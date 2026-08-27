@@ -59,8 +59,8 @@ func (m *Machine) RouteGatePin(identity routegate.Identity) (routegate.PinRecord
 }
 
 // LookupCompletionInto is LookupCompletion with caller-owned result storage.
-// dst is reused from length zero. It must have capacity for the largest
-// ordinary mutation/session completion so lookup never allocates result bytes.
+// dst is reused from length zero. It must have capacity for the command's
+// completion grammar so lookup never allocates result bytes.
 func (m *Machine) LookupCompletionInto(
 	data []byte,
 	dst []byte,
@@ -69,15 +69,7 @@ func (m *Machine) LookupCompletionInto(
 	if err != nil {
 		return CompletionLookup{}, err
 	}
-	required := MaxMutationCompletionEnvelopeBytes
-	switch command.Kind() {
-	case replication.CommandRouteGate:
-		required = MaxRouteGateCompletionEnvelopeBytes
-	case replication.CommandTransaction:
-		required = MaxTransactionCompletionEnvelopeBytes
-	case replication.CommandRequestLedger:
-		required = MaxCompletionEnvelopeBytes
-	}
+	required := completionEnvelopeLimit(command.Kind())
 	if cap(dst) < required {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
