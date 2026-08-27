@@ -26,7 +26,10 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-const rf3EvidenceSeed = uint64(0x5649424544425246)
+const (
+	rf3EvidenceSeed          = uint64(0x5649424544425246)
+	rf3EvidenceMaxValueBytes = 128
+)
 
 type rf3EvidenceClient struct {
 	id       replication.ID128
@@ -206,7 +209,7 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 				if operation == rf3bench.OperationRead {
 					result, readErr := executor.ReadPoint(ctx, route, gateway.ReplicatedPointRead{
 						Relation: 1, Key: client.key, MinimumApplied: minimumApplied,
-						MaxValueBytes: replication.MaxMutationValueBytes, Linearizable: true,
+						MaxValueBytes: rf3EvidenceMaxValueBytes, Linearizable: true,
 					})
 					if readErr != nil {
 						t.Errorf("read client=%d ordinal=%d: %v", clientIndex, ordinal+1, readErr)
@@ -342,7 +345,7 @@ func readRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.Replic
 	t.Helper()
 	result, err := executor.ReadPoint(ctx, route, gateway.ReplicatedPointRead{
 		Relation: 1, Key: key, MinimumApplied: minimumApplied,
-		MaxValueBytes: replication.MaxMutationValueBytes, Linearizable: true,
+		MaxValueBytes: rf3EvidenceMaxValueBytes, Linearizable: true,
 	})
 	if err != nil || !result.Found {
 		t.Fatalf("warmup read found=%t err=%v", result.Found, err)
@@ -367,6 +370,9 @@ func TestRF3EvidenceValueIncludesMatchingPrimaryKey(t *testing.T) {
 	want := []byte(`{"client":7,"id":"rf3-evidence-7","sequence":11}`)
 	if got := evidenceValue(7, 11); !bytes.Equal(got, want) {
 		t.Fatalf("evidence document = %s, want %s", got, want)
+	}
+	if got := evidenceValue(^uint32(0), ^uint64(0)); len(got) > rf3EvidenceMaxValueBytes {
+		t.Fatalf("maximum evidence document needs %d bytes, bound is %d", len(got), rf3EvidenceMaxValueBytes)
 	}
 }
 
