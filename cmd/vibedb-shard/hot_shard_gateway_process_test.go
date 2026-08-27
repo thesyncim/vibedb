@@ -127,6 +127,7 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		t.Fatal(err)
 	}
 	if err = authority.PublishMembershipGrant(t.Context(), grant); err != nil {
+		gatewayHotShardSeedFailureDiagnostics(t, fixture)
 		t.Fatalf("seed certified membership grant: %v", err)
 	}
 	for _, node := range append(append([]rafttransport.NodeID(nil), fixture.nodes[:]...), fixture.targetNode) {
@@ -289,6 +290,33 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	t.Logf("hot-move live qualification: foreground_reads=%d p99=%s max_operations=%d pressure_bytes=%d control_connections=%d rejected=%d control_bytes=%d peak_connections=%d rss_growth=%d",
 		len(latencies), p99, maximumOperations, len(record.Payload), accepted, rejected, bytes, peak,
 		max(finalRSS, baselineRSS)-baselineRSS)
+}
+
+// Failure-only diagnostics retain the original bounded child output and one
+// authenticated probe per voter. They never retry or alter the seed operation.
+func gatewayHotShardSeedFailureDiagnostics(t testing.TB, fixture gatewayHotShardLiveFixture) {
+	t.Helper()
+	for index, child := range fixture.children {
+		if child == nil || index >= len(fixture.nodes) {
+			continue
+		}
+		exited := false
+		select {
+		case <-child.exited:
+			exited = true
+		default:
+		}
+		child.mu.Lock()
+		waitErr := child.waitErr
+		child.mu.Unlock()
+		t.Logf("seed grant member=%d exited=%t process_error=%v\n%s", child.member, exited, waitErr, child.diagnostic.String())
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		state, err := probeRF3CommandMember(ctx, fixture.nativeAddresses[index], fixture.nodes[index],
+			fixture.clientProfile, fixture.clientNode, fixture.group,
+			rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+		cancel()
+		t.Logf("seed grant member=%d native_probe_error=%v state=%+v", child.member, err, state)
+	}
 }
 
 func gatewayHotShardLiveSnapshot(

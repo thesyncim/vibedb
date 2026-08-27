@@ -130,6 +130,34 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 			Snapshot: target2.Listeners.Snapshot, Control: target2.Listeners.Control},
 		SourceNode: nodes[0], SourceSnapshotAddress: addresses.Snapshot, MaxArtifactBytes: 1 << 30})
 	multiBootstrapPath := filepath.Join(root, "target-bootstrap-groups.vibejson")
+	for _, cold := range []*rf3ColdTargetProcess{cold1, cold2} {
+		member, err := loadRF3Manifest(cold.MemberManifestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base, exactApply, err := loadRF3RetainedIdentities(member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Cold targets already have an activated apply participant. The
+		// multigroup opener must present its exact retained identity, just as
+		// singleton bootstrap does; no default-profile reopen is permissible.
+		wrongApply := exactApply
+		wrongApply.MaxSessions++
+		if database, err := sqldriver.OpenReplicatedShardStoreWithApply(member.SQL.Path, base, wrongApply); !errors.Is(err, sqldriver.ErrReplicatedApplyMismatch) {
+			if database != nil {
+				_ = database.Close()
+			}
+			t.Fatalf("cold target accepted foreign apply identity: %v", err)
+		}
+		database, err := sqldriver.OpenReplicatedShardStoreWithApply(member.SQL.Path, base, exactApply)
+		if err != nil {
+			t.Fatalf("cold target exact apply reopen: %v", err)
+		}
+		if err = database.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err = os.WriteFile(multiBootstrapPath, combineBootstrapRF3ProcessGroups(t,
 		cold1.BootstrapManifestPath, cold2.BootstrapManifestPath), 0o600); err != nil {
 		t.Fatal(err)
