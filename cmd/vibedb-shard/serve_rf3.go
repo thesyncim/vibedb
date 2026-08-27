@@ -461,6 +461,9 @@ func servePreparedRF3WithExecutionLanes(
 
 	pulse := make(chan struct{}, 1)
 	progressMetrics := new(raftservice.ProgressMetrics)
+	if err := progressMetrics.ConfigureGroups(identities); err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
 	peer, err := raftservice.NewAuthenticatedExecutionPeerRuntime(raftservice.AuthenticatedExecutionPeerOptions{
 		Registry: transportRegistry, TLS: profile, Dial: dial, Listener: peerListener,
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,

@@ -150,6 +150,15 @@ func (owners *ExecutionOwners) ProgressMetrics() ProgressMetricsSnapshot {
 	return owners.metrics.Snapshot()
 }
 
+// GroupProgressMetrics returns the local member identity and exact counters
+// for one group without entering an owner lane.
+func (owners *ExecutionOwners) GroupProgressMetrics(group raftmember.GroupKey) (raftmember.RuntimeIdentity, ProgressMetricsSnapshot, bool) {
+	if owners == nil || owners.metrics == nil {
+		return raftmember.RuntimeIdentity{}, ProgressMetricsSnapshot{}, false
+	}
+	return owners.metrics.GroupProgressMetrics(group)
+}
+
 func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) {
 	if owners == nil || group == (raftmember.GroupKey{}) {
 		return nil, ErrExecutionGroup

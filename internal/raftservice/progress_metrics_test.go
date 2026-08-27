@@ -42,3 +42,47 @@ func BenchmarkProgressMetricsObserveProposal(b *testing.B) {
 		metrics.observeProgress(progress, true, nil)
 	}
 }
+
+func TestProgressMetricsGroupDirectoryIsExactAndBounded(t *testing.T) {
+	groupA := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	groupB := groupA
+	groupB.GroupID[0] = 6
+	metrics := new(ProgressMetrics)
+	if err := metrics.ConfigureGroups([]raftmember.RuntimeIdentity{
+		{Group: groupA, MemberID: 7}, {Group: groupB, MemberID: 8},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metrics.observeProgress(multiraft.Progress{Group: groupA, ProposalCount: 2, ProposalBytes: 11}, true, nil)
+	identity, got, found := metrics.GroupProgressMetrics(groupA)
+	if !found || identity.MemberID != 7 || got.ProposalCommands != 2 || got.ProposalBytes != 11 {
+		t.Fatalf("identity=%+v metrics=%+v found=%v", identity, got, found)
+	}
+	if _, got, found = metrics.GroupProgressMetrics(groupB); !found || got != (ProgressMetricsSnapshot{}) {
+		t.Fatalf("unobserved group metrics=%+v found=%v", got, found)
+	}
+	unknown := groupA
+	unknown.GroupID[0] = 9
+	if _, _, found = metrics.GroupProgressMetrics(unknown); found {
+		t.Fatal("unknown group found")
+	}
+	if err := metrics.ConfigureGroups([]raftmember.RuntimeIdentity{{Group: groupA, MemberID: 9}}); err == nil {
+		t.Fatal("reconfiguration accepted")
+	}
+}
+
+func BenchmarkProgressMetricsObserveConfiguredGroup(b *testing.B) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	metrics := new(ProgressMetrics)
+	if err := metrics.ConfigureGroups([]raftmember.RuntimeIdentity{{Group: group, MemberID: 7}}); err != nil {
+		b.Fatal(err)
+	}
+	progress := multiraft.Progress{Group: group, Kind: multiraft.ProgressProposal,
+		ProposalCount: 1, ProposalBytes: 128}
+	b.ReportAllocs()
+	for b.Loop() {
+		metrics.observeProgress(progress, true, nil)
+	}
+}

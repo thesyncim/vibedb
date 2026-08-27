@@ -6,16 +6,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
 type testProvider struct {
 	snapshot raftservice.ProgressMetricsSnapshot
+	group    raftmember.GroupKey
+	member   uint64
 }
 
 func (provider testProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
 	return provider.snapshot
+}
+
+func (provider testProvider) GroupProgressMetrics(group raftmember.GroupKey) (raftmember.RuntimeIdentity, raftservice.ProgressMetricsSnapshot, bool) {
+	return raftmember.RuntimeIdentity{Group: provider.group, MemberID: provider.member}, provider.snapshot,
+		group == provider.group && provider.member != 0
 }
 
 type testConnection struct {
@@ -33,7 +41,7 @@ func TestAuthenticatedMetricsServiceRoundTripAndCorruption(t *testing.T) {
 		AppliedEntries: 3, ReadyPersisted: 4, SnapshotsFinished: 5,
 		ReadCompletions: 6, Faults: 7}
 	identity := rafttransport.PeerIdentity{Node: rafttransport.NodeID{1}}
-	service, err := NewService(ServiceOptions{Provider: testProvider{want},
+	service, err := NewService(ServiceOptions{Provider: testProvider{snapshot: want},
 		Authorize:     func(peer rafttransport.PeerIdentity) bool { return peer == identity },
 		ReadDeadline:  func() time.Time { return time.Now().Add(time.Second) },
 		WriteDeadline: func() time.Time { return time.Now().Add(time.Second) }})
@@ -53,7 +61,7 @@ func TestAuthenticatedMetricsServiceRoundTripAndCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	encoded := appendResponse(want)
+	encoded := appendResponse(Snapshot{Metrics: want})
 	encoded[17] ^= 1
 	if _, err = OpenResponse(encoded[:]); err == nil {
 		t.Fatal("corrupt response accepted")
@@ -79,11 +87,49 @@ func TestMetricsServiceRejectsUnauthorizedBeforeReading(t *testing.T) {
 	_ = client.Close()
 }
 
+func TestAuthenticatedMetricsServiceReturnsOnlyExactLocalGroup(t *testing.T) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	want := raftservice.ProgressMetricsSnapshot{ProposalCommands: 9, AppliedEntries: 8}
+	identity := rafttransport.PeerIdentity{Node: rafttransport.NodeID{1}}
+	service, err := NewService(ServiceOptions{Provider: testProvider{snapshot: want, group: group, member: 7},
+		Authorize:    func(peer rafttransport.PeerIdentity) bool { return peer == identity },
+		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) }, WriteDeadline: func() time.Time { return time.Now().Add(time.Second) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, client := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- service.Serve(t.Context(), &testConnection{Conn: server, peer: identity}) }()
+	snapshot, err := (Client{Open: func(context.Context) (rafttransport.PeerConnection, error) {
+		return &testConnection{Conn: client}, nil
+	}}).ReadGroup(t.Context(), group)
+	if err != nil || snapshot.Group != group || snapshot.Member != 7 || snapshot.Metrics != want {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	unknown := group
+	unknown.GroupID[0]++
+	server, client = net.Pipe()
+	go func() { done <- service.Serve(t.Context(), &testConnection{Conn: server, peer: identity}) }()
+	if _, err = (Client{Open: func(context.Context) (rafttransport.PeerConnection, error) {
+		return &testConnection{Conn: client}, nil
+	}}).ReadGroup(t.Context(), unknown); err == nil {
+		t.Fatal("unknown group accepted")
+	}
+	if err = <-done; err == nil {
+		t.Fatal("server accepted unknown group")
+	}
+}
+
 func BenchmarkMetricsResponseCodec(b *testing.B) {
 	metrics := raftservice.ProgressMetricsSnapshot{ProposalCommands: 1, AppliedEntries: 2}
 	b.ReportAllocs()
 	for b.Loop() {
-		response := appendResponse(metrics)
+		response := appendResponse(Snapshot{Metrics: metrics})
 		if _, err := OpenResponse(response[:]); err != nil {
 			b.Fatal(err)
 		}
