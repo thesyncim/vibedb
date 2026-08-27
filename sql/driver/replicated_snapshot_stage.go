@@ -123,14 +123,14 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		replicatedstate.CollectionTarget{Collection: core.replicatedApplyCollection,
 			Validation: replicatedstate.ValidationOpaqueBinary,
 			Limits:     replicatedStateCollectionLimits(identity.SystemLimits)},
-		relations, core.txnLog, replicatedstate.Options{
+		relations, core.txnLog, replicatedSnapshotLedgerOptions(identity, replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
 			},
-		},
+		}),
 	)
 	if err != nil {
 		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
@@ -428,14 +428,14 @@ func (s *ReplicatedSnapshotStage) Activate(
 		}
 	}
 	if !s.candidateProved && core.checkpointGroup == nil {
-		candidateOptions := replicatedstate.Options{
+		candidateOptions := replicatedSnapshotLedgerOptions(s.identity, replicatedstate.Options{
 			TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 			RetryWindow: s.identity.RetryWindow,
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
 			},
-		}
+		})
 		if s.base.RelationCount == 1 {
 			_, err = s.stage.OpenCandidate(staticBootstrap, core.txnLog, candidateOptions)
 		} else {
@@ -506,14 +506,14 @@ func (s *ReplicatedSnapshotStage) Activate(
 				Limits:     replicatedStateCollectionLimits(s.identity.SystemLimits),
 			},
 			relations,
-			core.txnLog, replicatedstate.Options{
+			core.txnLog, replicatedSnapshotLedgerOptions(s.identity, replicatedstate.Options{
 				TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 				RetryWindow: s.identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 				TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 					Name:       replicatedstate.TransitionCaptureCollectionName,
 					Collection: core.replicatedCaptureCollection,
 				},
-			},
+			}),
 		)
 		if err != nil {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)

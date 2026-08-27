@@ -426,14 +426,14 @@ func (s *ReplicatedRestoreStage) Activate(
 	if err != nil {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedRestoreStageProof, err)
 	}
-	machineOptions := replicatedstate.Options{
+	machineOptions := replicatedSnapshotLedgerOptions(s.identity, replicatedstate.Options{
 		TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 		RetryWindow: s.identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 		TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 			Name:       replicatedstate.TransitionCaptureCollectionName,
 			Collection: core.replicatedCaptureCollection,
 		},
-	}
+	})
 	systemTarget := replicatedstate.CollectionTarget{
 		Collection: core.replicatedApplyCollection,
 		Validation: replicatedstate.ValidationOpaqueBinary,

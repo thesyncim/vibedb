@@ -19,7 +19,11 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 	document := []byte(`{"id":"fresh-catalog"}`)
 	key := testReplicatedApplyKey(t, target, document)
 	rows := []replicatedstate.ProjectionRow{{Key: key, Value: document}}
-	stage, _, err := target.OpenReplicatedRestoreProjection(identity, source, nil, testReplicatedApplyOptions(), rows)
+	options := testReplicatedApplyOptions()
+	options.RequestLedgerCapacityBytes = 64 << 20
+	options.RequestLedgerCleanupReserveBytes = 8 << 20
+	options.RequestLedgerRangeIdentity = [32]byte{91}
+	stage, _, err := target.OpenReplicatedRestoreProjection(identity, source, nil, options, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +40,7 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 	if err = stage.Close(); err != nil {
 		t.Fatal(err)
 	}
-	stage, _, err = target.OpenReplicatedRestoreProjection(identity, source, cursor, testReplicatedApplyOptions(), rows)
+	stage, _, err = target.OpenReplicatedRestoreProjection(identity, source, cursor, options, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,10 +60,10 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	changed := []replicatedstate.ProjectionRow{{Key: key, Value: []byte(`{"id":"different"}`)}}
-	if _, _, err = target.OpenReplicatedRestoreProjection(identity, source, cursor, testReplicatedApplyOptions(), changed); err == nil {
+	if _, _, err = target.OpenReplicatedRestoreProjection(identity, source, cursor, options, changed); err == nil {
 		t.Fatal("changed projection accepted on resume")
 	}
-	stage, _, err = target.OpenReplicatedRestoreProjection(identity, source, cursor, testReplicatedApplyOptions(), rows)
+	stage, _, err = target.OpenReplicatedRestoreProjection(identity, source, cursor, options, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +76,10 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer activation.Apply.Close()
+	usage, err := activation.Apply.machine.RequestLedgerUsage()
+	if err != nil || !usage.Enabled || usage.CapacityBytes != options.RequestLedgerCapacityBytes || usage.CleanupReserveBytes != options.RequestLedgerCleanupReserveBytes || [32]byte(usage.Range.Identity) != options.RequestLedgerRangeIdentity {
+		t.Fatalf("staged ledger contract lost: %+v %v", usage, err)
+	}
 	expected, err := replicatedstate.ProjectionImageDigest(identity.UserTable, activation.ApplyIdentity.ValidationDigest, rows)
 	if err != nil || activation.ArtifactManifest.ImageDigest != expected || activation.ArtifactManifest.ImageDigest == source.ImageDigest || activation.ArtifactManifest.UserRows != 1 || activation.ArtifactManifest.SystemRows != 1 || activation.ArtifactManifest.CaptureRows != 0 {
 		t.Fatalf("projection image mismatch: %+v %v", activation.ArtifactManifest, err)
@@ -79,5 +87,17 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 	value, found, err := stage.table.collection.AppendRaw(nil, key)
 	if err != nil || !found || !bytes.Equal(value, document) || stage.table.collection.Len() != 1 {
 		t.Fatal("fresh projection missing or source authority retained")
+	}
+	if err = activation.Apply.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resumed, ok, err := target.ResumeReplicatedSnapshotActivation(identity, activation.ArtifactManifest, restoreBootstrap(83), options)
+	if err != nil || !ok {
+		t.Fatalf("ledger snapshot resume=%t err=%v", ok, err)
+	}
+	defer resumed.Apply.Close()
+	usage, err = resumed.Apply.machine.RequestLedgerUsage()
+	if err != nil || !usage.Enabled || usage.CapacityBytes != options.RequestLedgerCapacityBytes || [32]byte(usage.Range.Identity) != options.RequestLedgerRangeIdentity {
+		t.Fatalf("resumed ledger contract lost: %+v %v", usage, err)
 	}
 }

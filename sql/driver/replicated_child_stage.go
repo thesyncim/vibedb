@@ -361,14 +361,14 @@ func (s *ReplicatedChildStage) activate(
 				},
 			},
 			TxnLog: core.txnLog,
-			MachineOptions: replicatedstate.Options{
+			MachineOptions: replicatedSnapshotLedgerOptions(identity, replicatedstate.Options{
 				TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 				RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 				TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 					Name:       replicatedstate.TransitionCaptureCollectionName,
 					Collection: core.replicatedCaptureCollection,
 				},
-			},
+			}),
 			ArtifactOptions: artifactOptions,
 		},
 	)
