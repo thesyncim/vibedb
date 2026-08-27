@@ -27,7 +27,7 @@ func TestOnlineCompactionManifestAndChainedExtentSurviveReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data.Length != onlineCompactionStagingChunkBytes || linked.StagingExtentCount != 1 ||
+	if data.Length != uint64(collection.options.MaxPageSize) || linked.StagingExtentCount != 1 ||
 		linked.StagingChainTail == (storeio.PageRef{}) || linked.PendingExtentBytes != 0 {
 		t.Fatalf("data=%+v linked=%+v", data, linked)
 	}
@@ -51,5 +51,70 @@ func TestOnlineCompactionManifestAndChainedExtentSurviveReopen(t *testing.T) {
 	if err != nil || reopenedManifest.StagingChainTail != linked.StagingChainTail ||
 		reopenedManifest.TargetFileEnd != linked.TargetFileEnd {
 		t.Fatalf("reopened manifest=%+v err=%v", reopenedManifest, err)
+	}
+}
+
+func TestCompactOnlineInstallsReopenableServingRoot(t *testing.T) {
+	file, _ := buildPrimaryOpenTestFile(t)
+	collection, err := Open(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := collection.state.Load()
+	report, err := collection.CompactOnline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := collection.state.Load()
+	if report.Documents != 1000 || report.SourceFileEnd < before.fileEnd ||
+		after.root.PrimaryRoot == before.root.PrimaryRoot || after.root.Generation <= before.root.Generation ||
+		report.StagingAllocatedBytes == 0 || report.InstalledFileEnd != after.fileEnd {
+		t.Fatalf("report=%+v before=%+v after=%+v", report, before, after)
+	}
+	rows := 0
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.RangeRaw(func(_, _ []byte) error { rows++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1000 {
+		t.Fatalf("rows=%d", rows)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if verified, verifyErr := Verify(file); verifyErr != nil || !verified.OK() {
+		layout, _ := storeio.MutableStoreLayout(uint32(after.root.PageSize))
+		for slot, offset := range layout.RootOffsets {
+			buf := make([]byte, storeio.InlineSuperblockSize)
+			_, _ = file.ReadAt(buf, int64(offset))
+			inline, decodeErr := storeio.DecodeInlineSuperblock(buf)
+			t.Logf("slot=%d inline=%+v decode=%v", slot, inline, decodeErr)
+		}
+		t.Fatalf("verify before reopen: report=%+v err=%v", verified, verifyErr)
+	}
+	reopened, err := Open(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows = 0
+	snapshot, err = reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.RangeRaw(func(_, _ []byte) error { rows++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1000 {
+		t.Fatalf("reopened rows=%d", rows)
 	}
 }

@@ -9,7 +9,7 @@ import (
 
 const (
 	GenerationMigrationManifestBytes = 4096
-	generationMigrationHeaderBytes   = 464
+	generationMigrationHeaderBytes   = 472
 	generationMigrationTrailerAt     = GenerationMigrationManifestBytes - 8
 	generationMigrationMagic         = "SGMIGR00"
 )
@@ -63,6 +63,7 @@ type GenerationMigrationManifest struct {
 	PendingExtentOffset, PendingExtentBytes                     uint64
 	PendingFirstLogicalID, PendingLogicalIDCount                uint64
 	StagingChainSequence                                        uint64
+	SourceNextLogicalID                                         uint64
 	RetirementPhase                                             GenerationMigrationRetirementPhase
 	Cursor                                                      []byte
 }
@@ -143,6 +144,7 @@ func EncodeGenerationMigrationManifest(dst []byte, m GenerationMigrationManifest
 	binary.LittleEndian.PutUint64(image[440:448], m.PendingFirstLogicalID)
 	binary.LittleEndian.PutUint64(image[448:456], m.PendingLogicalIDCount)
 	binary.LittleEndian.PutUint64(image[456:464], m.StagingChainSequence)
+	binary.LittleEndian.PutUint64(image[464:472], m.SourceNextLogicalID)
 	copy(image[generationMigrationHeaderBytes:], m.Cursor)
 	checksum := PageChecksum(image[:generationMigrationTrailerAt])
 	binary.LittleEndian.PutUint32(image[generationMigrationTrailerAt:], checksum)
@@ -197,6 +199,7 @@ func OpenGenerationMigrationManifest(src []byte) (GenerationMigrationManifest, e
 	m.PendingFirstLogicalID = binary.LittleEndian.Uint64(src[440:448])
 	m.PendingLogicalIDCount = binary.LittleEndian.Uint64(src[448:456])
 	m.StagingChainSequence = binary.LittleEndian.Uint64(src[456:464])
+	m.SourceNextLogicalID = binary.LittleEndian.Uint64(src[464:472])
 	cursorBytes := int(binary.LittleEndian.Uint32(src[320:324]))
 	if m.StoreID == ([16]byte{}) || m.MigrationID == ([16]byte{}) ||
 		m.Phase < GenerationMigrationCopying || m.Phase > GenerationMigrationPublished ||
@@ -270,6 +273,7 @@ func ValidateGenerationMigrationAdvance(previous, next GenerationMigrationManife
 		next.AppliedSequence < previous.AppliedSequence ||
 		next.AppliedSequence > next.CapturedSequence ||
 		next.SourceFileEnd != previous.SourceFileEnd ||
+		next.SourceNextLogicalID != previous.SourceNextLogicalID ||
 		next.ReservedOffset != previous.ReservedOffset ||
 		next.ReservedBytes != previous.ReservedBytes ||
 		next.FirstLogicalID != previous.FirstLogicalID ||

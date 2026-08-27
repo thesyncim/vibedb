@@ -44,6 +44,10 @@ func (d *GenerationMigrationRetirementDriver) Step() (bool, error) {
 		return false, d.Manifest.Advance(m)
 	}
 	extents := make([]FreeExtent, 0, d.BatchExtents)
+	sourceNextLogicalID := m.SourceNextLogicalID
+	if sourceNextLogicalID == 0 {
+		sourceNextLogicalID = m.FirstLogicalID
+	}
 	ordinal := uint64(0)
 	visit := func(ref PageRef) error {
 		if ordinal < m.RetirementOrdinal {
@@ -62,7 +66,7 @@ func (d *GenerationMigrationRetirementDriver) Step() (bool, error) {
 	case GenerationMigrationRetirePrimary:
 		err = VisitPrimaryGraphRefs(d.Cache, m.SourcePrimaryRoot, GlobalTabletCatalogBounds{
 			StoreID: m.StoreID, SelectedRootGeneration: m.SourceGeneration,
-			FileEnd: m.SourceFileEnd, NextLogicalID: m.FirstLogicalID,
+			FileEnd: m.SourceFileEnd, NextLogicalID: sourceNextLogicalID,
 		}, visit)
 	case GenerationMigrationRetireExact:
 		if m.SourceExactIndexRoot == (PageRef{}) {
@@ -71,7 +75,7 @@ func (d *GenerationMigrationRetirementDriver) Step() (bool, error) {
 		}
 		err = VisitPrimaryExactIndexRefs(d.Cache, m.SourceExactIndexRoot, PrimaryExactIndexBounds{
 			StoreID: m.StoreID, Generation: m.SourceGeneration,
-			FileEnd: m.SourceFileEnd, NextLogicalID: m.FirstLogicalID,
+			FileEnd: m.SourceFileEnd, NextLogicalID: sourceNextLogicalID,
 			AllocationQuantum: d.PageSize, MaxPageSize: d.MaxPageSize,
 			IndexCount: m.SourceIndexCount,
 		}, visit)

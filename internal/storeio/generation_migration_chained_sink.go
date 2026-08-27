@@ -22,7 +22,8 @@ type GenerationMigrationChainedSink struct {
 	scratch                     []byte
 	writer                      *UnrootedGenerationWriter
 	nextLogicalID, finalFileEnd uint64
-	pending                     bool
+	allocatedBytes              uint64
+	scratchUsed                 int
 }
 
 func NewGenerationMigrationChainedSink(
@@ -53,43 +54,28 @@ type generationMigrationChainedPage struct {
 func (p *generationMigrationChainedPage) Bytes() []byte { return p.image }
 func (p *generationMigrationChainedPage) Ref() PageRef  { return p.ref }
 func (p *generationMigrationChainedPage) Stage() error {
-	if p == nil || p.owner == nil || !p.owner.pending {
+	if p == nil || p.owner == nil || p.owner.writer == nil ||
+		p.ref.Offset != p.owner.writer.reservation.Offset+p.owner.writer.written {
 		return ErrBatchState
 	}
 	if err := p.owner.writer.Append(p.ref, p.image); err != nil {
 		return err
 	}
-	p.owner.pending = false
+	if p.owner.writer.written == p.owner.allocatedBytes {
+		p.owner.scratchUsed = 0
+	}
 	return nil
 }
 
 func (s *GenerationMigrationChainedSink) AllocatePage(
 	kind PageKind, length uint32, logicalID uint64,
 ) (PrimaryGraphBuildPage, error) {
-	if s == nil || s.pending || length == 0 || length > uint32(len(s.scratch)) ||
+	if s == nil || length == 0 || int(length) > len(s.scratch)-s.scratchUsed ||
 		length%physicalPageQuantum != 0 {
 		return nil, ErrBatchState
 	}
-	if s.writer == nil || uint64(length) > s.writer.reservation.Length-s.writer.written {
-		minimum := uint64(max(length, s.chunkBytes))
-		logicalIDs := max(s.logicalIDsPerChunk, minimum/uint64(s.pageSize))
-		reservation, manifest, err := s.grow(minimum, logicalIDs)
-		if err != nil {
-			return nil, err
-		}
-		if reservation.Length < minimum || reservation.Offset == 0 ||
-			reservation.FirstLogicalID == 0 || reservation.LogicalIDCount < logicalIDs {
-			return nil, fmt.Errorf("%w: migration chained growth witness", ErrInvalidWrite)
-		}
-		writer, err := NewUnrootedGenerationWriter(
-			s.file, reservation, s.storeID, s.generation, 0,
-		)
-		if err != nil {
-			return nil, err
-		}
-		s.writer = writer
-		s.nextLogicalID = reservation.FirstLogicalID
-		s.finalFileEnd = manifest.TargetFileEnd
+	if err := s.EnsureContiguousBuildBytes(uint64(length)); err != nil {
+		return nil, err
 	}
 	if logicalID == 0 {
 		logicalID = s.nextLogicalID
@@ -98,14 +84,49 @@ func (s *GenerationMigrationChainedSink) AllocatePage(
 		return nil, fmt.Errorf("%w: migration replacement logical id", ErrInvalidWrite)
 	}
 	ref := PageRef{
-		Offset:    s.writer.reservation.Offset + s.writer.written,
+		Offset:    s.writer.reservation.Offset + s.allocatedBytes,
 		LogicalID: logicalID, Generation: s.generation,
 		Length: length, Kind: kind,
 	}
-	image := s.scratch[:int(length):int(length)]
+	image := s.scratch[s.scratchUsed : s.scratchUsed+int(length) : s.scratchUsed+int(length)]
 	clear(image)
-	s.pending = true
+	s.scratchUsed += int(length)
+	s.allocatedBytes += uint64(length)
 	return &generationMigrationChainedPage{owner: s, ref: ref, image: image}, nil
+}
+
+func (s *GenerationMigrationChainedSink) EnsureContiguousBuildBytes(minimum uint64) error {
+	if s == nil || minimum == 0 || minimum%uint64(s.pageSize) != 0 {
+		return ErrBatchState
+	}
+	if s.writer != nil && minimum <= s.writer.reservation.Length-s.allocatedBytes {
+		return nil
+	}
+	if s.writer != nil && s.allocatedBytes != s.writer.written {
+		return ErrBatchState
+	}
+	request := max(minimum, uint64(s.chunkBytes))
+	logicalIDs := max(s.logicalIDsPerChunk, request/uint64(s.pageSize))
+	reservation, manifest, err := s.grow(request, logicalIDs)
+	if err != nil {
+		return err
+	}
+	if reservation.Length < request || reservation.Offset == 0 ||
+		reservation.FirstLogicalID == 0 || reservation.LogicalIDCount < logicalIDs {
+		return fmt.Errorf("%w: migration chained growth witness", ErrInvalidWrite)
+	}
+	writer, err := NewUnrootedGenerationWriter(
+		s.file, reservation, s.storeID, s.generation, 0,
+	)
+	if err != nil {
+		return err
+	}
+	s.writer = writer
+	s.allocatedBytes = 0
+	s.scratchUsed = 0
+	s.nextLogicalID = reservation.FirstLogicalID
+	s.finalFileEnd = manifest.TargetFileEnd
+	return nil
 }
 
 func (s *GenerationMigrationChainedSink) StoreIdentity() [16]byte    { return s.storeID }
@@ -114,7 +135,7 @@ func (s *GenerationMigrationChainedSink) BuildFileEnd() uint64       { return s.
 func (s *GenerationMigrationChainedSink) BuildNextLogicalID() uint64 { return s.nextLogicalID }
 func (s *GenerationMigrationChainedSink) MaxBuildPageBytes() int     { return len(s.scratch) }
 func (s *GenerationMigrationChainedSink) Sync() error {
-	if s == nil || s.pending {
+	if s == nil || s.writer != nil && s.allocatedBytes != s.writer.written {
 		return ErrBatchState
 	}
 	if s.writer == nil {

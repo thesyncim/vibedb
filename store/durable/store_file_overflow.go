@@ -275,6 +275,19 @@ func (c *Collection) stagePrimaryOverflowChainToSink(
 		)
 	}
 	pageCount := (len(value) + perPage - 1) / perPage
+	if contiguous, ok := sink.(interface{ EnsureContiguousBuildBytes(uint64) error }); ok {
+		var bytes uint64
+		for offset := 0; offset < len(value); {
+			n := min(perPage, len(value)-offset)
+			raw := primaryOverflowPageOverhead + n
+			extent := (uint32(raw) + quantum - 1) / quantum * quantum
+			bytes += uint64(max(extent, quantum))
+			offset += n
+		}
+		if err := contiguous.EnsureContiguousBuildBytes(bytes); err != nil {
+			return storeio.PageRef{}, err
+		}
+	}
 	finalNextLogicalID := sink.BuildNextLogicalID() + uint64(pageCount)
 	if finalNextLogicalID < sink.BuildNextLogicalID() {
 		return storeio.PageRef{}, storeio.ErrInvalidWrite

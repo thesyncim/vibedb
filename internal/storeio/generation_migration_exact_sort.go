@@ -37,6 +37,19 @@ type GenerationMigrationExactRunBuilder struct {
 	keyArena  []byte
 	region    GenerationMigrationExactRunRegion
 	nextRunID uint64
+	runSink   func(GenerationMigrationExactRunRegion) error
+}
+
+func NewStreamingGenerationMigrationExactRunBuilder(sink PrimaryGraphBuildSink, pageBytes uint32, recordWindow, keyWindowBytes int, runSink func(GenerationMigrationExactRunRegion) error) (*GenerationMigrationExactRunBuilder, error) {
+	if runSink == nil {
+		return nil, fmt.Errorf("%w: exact run sink", ErrInvalidWrite)
+	}
+	b, err := NewGenerationMigrationExactRunBuilder(sink, pageBytes, recordWindow, keyWindowBytes)
+	if err != nil {
+		return nil, err
+	}
+	b.runSink = runSink
+	return b, nil
 }
 
 func NewGenerationMigrationExactRunBuilder(sink PrimaryGraphBuildSink, pageBytes uint32, recordWindow, keyWindowBytes int) (*GenerationMigrationExactRunBuilder, error) {
@@ -71,6 +84,9 @@ func (b *GenerationMigrationExactRunBuilder) Finish() (GenerationMigrationExactR
 	if err := b.flush(); err != nil {
 		return GenerationMigrationExactRunRegion{}, err
 	}
+	if b.runSink != nil {
+		return GenerationMigrationExactRunRegion{}, nil
+	}
 	if b.region.Pages == 0 {
 		return GenerationMigrationExactRunRegion{}, nil
 	}
@@ -92,6 +108,30 @@ func (b *GenerationMigrationExactRunBuilder) flush() error {
 		out++
 	}
 	b.records = b.records[:out]
+	pages := uint64(0)
+	for first := 0; first < len(b.records); {
+		payloadBytes := generationMigrationExactRunHeaderBytes
+		last := first
+		for last < len(b.records) {
+			next := generationMigrationExactRunRecordBytes + len(b.records[last].Key)
+			if payloadBytes+next > int(b.pageBytes)-PageHeaderSize-PageTrailerSize {
+				break
+			}
+			payloadBytes += next
+			last++
+		}
+		if last == first {
+			return fmt.Errorf("%w: exact run page progress", ErrInvalidWrite)
+		}
+		pages++
+		first = last
+	}
+	if contiguous, ok := b.sink.(interface{ EnsureContiguousBuildBytes(uint64) error }); ok {
+		if err := contiguous.EnsureContiguousBuildBytes(pages * uint64(b.pageBytes)); err != nil {
+			return err
+		}
+	}
+	var emitted GenerationMigrationExactRunRegion
 	for first, ordinal := 0, uint32(0); first < len(b.records); ordinal++ {
 		payloadBytes := generationMigrationExactRunHeaderBytes
 		last := first
@@ -111,16 +151,20 @@ func (b *GenerationMigrationExactRunBuilder) flush() error {
 			return err
 		}
 		ref := page.Ref()
-		if b.region.Pages == 0 {
-			b.region.First = ref
+		region := &b.region
+		if b.runSink != nil {
+			region = &emitted
+		}
+		if region.Pages == 0 {
+			region.First = ref
 		} else {
-			want := b.region.First
-			if b.region.Pages > (^uint64(0)-want.Offset)/uint64(want.Length) ||
-				b.region.Pages > ^uint64(0)-want.LogicalID {
+			want := region.First
+			if region.Pages > (^uint64(0)-want.Offset)/uint64(want.Length) ||
+				region.Pages > ^uint64(0)-want.LogicalID {
 				return fmt.Errorf("%w: exact run region overflow", ErrInvalidWrite)
 			}
-			want.Offset += b.region.Pages * uint64(want.Length)
-			want.LogicalID += b.region.Pages
+			want.Offset += region.Pages * uint64(want.Length)
+			want.LogicalID += region.Pages
 			if ref != want {
 				return fmt.Errorf("%w: non-contiguous exact run", ErrInvalidWrite)
 			}
@@ -131,10 +175,17 @@ func (b *GenerationMigrationExactRunBuilder) flush() error {
 		if err := page.Stage(); err != nil {
 			return err
 		}
-		b.region.Pages++
+		region.Pages++
 		first = last
 	}
-	b.region.Runs++
+	if b.runSink != nil {
+		emitted.Runs = 1
+		if err := b.runSink(emitted); err != nil {
+			return err
+		}
+	} else {
+		b.region.Runs++
+	}
 	b.nextRunID++
 	b.records = b.records[:0]
 	b.keyArena = b.keyArena[:0]

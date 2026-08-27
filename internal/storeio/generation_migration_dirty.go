@@ -72,6 +72,21 @@ func (s *GenerationMigrationDirtySet) Mark(id uint64, generation uint64) error {
 	return nil
 }
 
+// MarkTopology conservatively requests a complete rooted revalidation when a
+// publication has no key-local descriptor (or changes routing itself).
+func (s *GenerationMigrationDirtySet) MarkTopology(generation uint64) error {
+	if s == nil || generation == 0 {
+		return fmt.Errorf("%w: migration topology mark", ErrInvalidWrite)
+	}
+	s.mu.Lock()
+	s.topology = true
+	if generation > s.generation {
+		s.generation = generation
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 // ObservePublication returns a required committer observer. route maps each
 // canonical mutation key to its immutable source-leaf identity. A topology-
 // only descriptor conservatively requests root/vector revalidation.

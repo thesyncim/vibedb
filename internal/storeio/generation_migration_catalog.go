@@ -31,6 +31,11 @@ func StageCanonicalPageCatalog(
 	if !ok || count < 1 || count > int(^uint16(0)) {
 		return staged, fmt.Errorf("%w: staged page catalog geometry", ErrInvalidWrite)
 	}
+	if contiguous, ok := sink.(interface{ EnsureContiguousBuildBytes(uint64) error }); ok {
+		if err := contiguous.EnsureContiguousBuildBytes(uint64(count) * uint64(pageSize)); err != nil {
+			return staged, err
+		}
+	}
 	initialNextID := sink.BuildNextLogicalID()
 	var head PageRef
 	for ordinal := 0; ordinal < count; ordinal++ {

@@ -95,8 +95,14 @@ type Collection struct {
 	mutationCombiner *primaryMutationCombiner
 	mutationWait     sync.WaitGroup
 	onlineIndexBuild atomic.Bool
-	durabilityWait   sync.WaitGroup
-	snapshotGate     sync.RWMutex
+	// onlineMigrationDirty/Observer are installed and removed under writer.
+	// Reservation publications temporarily suppress the observer under the same
+	// exclusion, so migration-owned high-water roots do not self-dirty while no
+	// serving publication can pass unobserved.
+	onlineMigrationDirty    *storeio.GenerationMigrationDirtySet
+	onlineMigrationObserver func(uint64, []byte) error
+	durabilityWait          sync.WaitGroup
+	snapshotGate            sync.RWMutex
 	// snapshotOrder is a process-local, lazily assigned identity used to
 	// acquire several collections' snapshot gates in one global order. Names
 	// are catalog-local and cannot provide that order when the same handles are

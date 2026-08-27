@@ -2,11 +2,24 @@ package durable
 
 import (
 	"crypto/rand"
+	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-const onlineCompactionStagingChunkBytes = 4 << 20
+type OnlineCompactionReport struct {
+	Documents, Attempts                     uint64
+	SourceFileEnd, InstalledFileEnd         uint64
+	StagingAllocatedBytes, StagingUsedBytes uint64
+}
+
+type onlineCompactionBuild struct {
+	primary   storeio.PageRef
+	catalog   storeio.StagedPageCatalog
+	router    *storeio.ResidentPrimaryRouter
+	documents uint64
+}
 
 func emptyMigrationPublicationDescriptor() ([]byte, error) {
 	return storeio.EncodePublicationDescriptor(make([]byte, 4096), nil)
@@ -112,6 +125,7 @@ func (c *Collection) beginOnlineGenerationMigrationLocked() (*storeio.Generation
 		SourceGeneration:     nextState.root.Generation,
 		TargetGeneration:     nextState.root.Generation + 1,
 		SourceFileEnd:        nextState.fileEnd,
+		SourceNextLogicalID:  nextState.root.NextLogicalID,
 		SourcePrimaryRoot:    nextState.root.PrimaryRoot,
 		SourceExactIndexRoot: nextState.root.ExactIndexRoot,
 		SourceCatalogHead:    nextState.root.PageCatalogHead,
@@ -156,6 +170,12 @@ func (c *Collection) publishOnlineMigrationReservationLocked(
 	}()
 	reservation, err = tx.ReserveUnrootedGeneration(bytes, logicalIDs)
 	if err != nil {
+		return reservation, 0, err
+	}
+	// Recovery rejects a root whose allocator high-water exceeds the apparent
+	// file size. Materialize the sparse high-water before publishing it; data
+	// pages remain unreachable until the final conditional install.
+	if err := c.file.Truncate(int64(tx.FileEnd())); err != nil {
 		return reservation, 0, err
 	}
 	descriptor, err := emptyMigrationPublicationDescriptor()
@@ -203,12 +223,274 @@ func (c *Collection) growOnlineMigrationStaging(
 	if state == nil {
 		return reservation, storeio.GenerationMigrationManifest{}, storeio.ErrInvalidWrite
 	}
+	if c.onlineMigrationObserver != nil {
+		if err := c.committer.SetPublicationObserver(nil); err != nil {
+			return reservation, storeio.GenerationMigrationManifest{}, err
+		}
+		defer func() {
+			_ = c.committer.SetPublicationObserver(c.onlineMigrationObserver)
+		}()
+	}
 	pageSize := uint64(c.options.PageSize)
-	dataBytes := max(minimumDataBytes, uint64(onlineCompactionStagingChunkBytes))
+	dataBytes := max(minimumDataBytes, uint64(c.options.MaxPageSize))
 	dataBytes = (dataBytes + pageSize - 1) &^ (pageSize - 1)
 	return storeio.AppendGenerationMigrationStagingExtent(
 		c.file, manifestStore, state.fileEnd, state.root.NextLogicalID,
 		uint32(c.options.PageSize), dataBytes, minimumLogicalIDs,
 		c.publishOnlineMigrationReservationLocked,
 	)
+}
+
+// CompactOnline rewrites the live primary graph into bounded same-file staging
+// extents while reads continue. Publications are observed from before the
+// snapshot cut; this first shipped coordinator fails with typed starvation if
+// a concurrent mutation invalidates the full graph and can be retried without
+// risking the serving root.
+func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
+	var report OnlineCompactionReport
+	if c == nil {
+		return report, ErrClosed
+	}
+	if len(c.options.indexes) != 0 || c.options.OpaqueValues {
+		return report, storeio.ErrInvalidWrite
+	}
+	c.writer.Lock()
+	if c.onlineMigrationDirty != nil {
+		c.writer.Unlock()
+		return report, storeio.ErrQueueFull
+	}
+	manifestStore, manifest, err := c.beginOnlineGenerationMigrationLocked()
+	if err != nil {
+		c.writer.Unlock()
+		return report, err
+	}
+	report.SourceFileEnd = manifest.SourceFileEnd
+	dirty, err := storeio.NewGenerationMigrationDirtySet(4096)
+	if err != nil {
+		c.writer.Unlock()
+		return report, err
+	}
+	keyObserver := dirty.ObservePublication(func(key []byte) (uint64, bool) {
+		router := c.primaryRouter.Load()
+		if router == nil {
+			return 0, false
+		}
+		route, ok := router.Route(key)
+		return route.Ref.LogicalID, ok
+	})
+	observer := func(generation uint64, descriptor []byte) error {
+		if len(descriptor) == 0 {
+			return dirty.MarkTopology(generation)
+		}
+		return keyObserver(generation, descriptor)
+	}
+	c.onlineMigrationDirty, c.onlineMigrationObserver = dirty, observer
+	if err := c.committer.SetPublicationObserver(observer); err != nil {
+		c.onlineMigrationDirty, c.onlineMigrationObserver = nil, nil
+		c.writer.Unlock()
+		return report, err
+	}
+	snapshot, err := c.pinSnapshotLocked()
+	c.writer.Unlock()
+	if err != nil {
+		c.clearOnlineMigrationObserver()
+		return report, err
+	}
+	build, err := c.buildOnlineCompactionGeneration(snapshot, manifestStore, manifest)
+	closeErr := snapshot.Close()
+	if err != nil || closeErr != nil {
+		c.clearOnlineMigrationObserver()
+		return report, fmt.Errorf("online compaction build: %w", errors.Join(err, closeErr))
+	}
+	report.Documents, report.Attempts = build.documents, 1
+
+	c.writer.Lock()
+	defer c.writer.Unlock()
+	if err := c.committer.SetPublicationObserver(nil); err != nil {
+		return report, err
+	}
+	c.onlineMigrationDirty, c.onlineMigrationObserver = nil, nil
+	ids, _, topology := dirty.Drain(make([]uint64, 0, dirty.Capacity()))
+	if len(ids) != 0 || topology {
+		return report, storeio.ErrGenerationMigrationStarved
+	}
+	current := c.state.Load()
+	if current == nil {
+		return report, ErrClosed
+	}
+	generation := current.root.Generation + 1
+	tx, err := c.beginWriteTransaction(1, storeio.WriteTransactionOptions{
+		StoreID: c.storeID, Generation: generation,
+		PageSize: uint32(c.options.PageSize), FileEnd: current.fileEnd,
+		NextLogicalID: current.root.NextLogicalID,
+	})
+	if err != nil {
+		return report, err
+	}
+	abort := true
+	defer func() {
+		if abort {
+			_ = tx.Abort()
+		}
+	}()
+	target := current.root
+	target.Generation = generation
+	target.PrimaryRoot = build.primary
+	if build.catalog.Head != (storeio.PageRef{}) {
+		target.PageCatalogHead = build.catalog.Head
+		target.PageCatalogDigest = build.catalog.Digest
+		target.PageCatalogBytes = build.catalog.Bytes
+	}
+	descriptor, err := emptyMigrationPublicationDescriptor()
+	if err != nil {
+		return report, err
+	}
+	ready, err := manifestStore.Load()
+	if err != nil {
+		return report, err
+	}
+	ready.Phase = storeio.GenerationMigrationReady
+	ready.CapturedSequence = current.root.Generation
+	ready.AppliedSequence = ready.CapturedSequence
+	ready.TargetPrimaryRoot = build.primary
+	ready.TargetCatalogHead = build.catalog.Head
+	if err := manifestStore.Advance(ready); err != nil {
+		return report, err
+	}
+
+	nextState := &fileStoreState{root: target, fileEnd: current.fileEnd, freeHead: current.freeHead}
+	c.snapshotGate.Lock()
+	c.beginReaderFence()
+	if err := storeio.PublishStagedStateConditional(tx, current.root, target, c.inlineFree, descriptor); err != nil {
+		c.endReaderFence()
+		c.snapshotGate.Unlock()
+		return report, err
+	}
+	abort = false
+	build.router.AdvanceGeneration(generation)
+	c.primaryRouter.Store(build.router)
+	c.pageValidator.update(nextState)
+	c.publishFileState(nextState)
+	c.endReaderFence()
+	c.snapshotGate.Unlock()
+	published, err := manifestStore.Load()
+	if err != nil {
+		return report, err
+	}
+	published.Phase = storeio.GenerationMigrationPublished
+	if err := manifestStore.Advance(published); err != nil {
+		return report, err
+	}
+	if c.deferredCanonicalLane() {
+		err = c.flushPublishedPhysicalLocked()
+	} else {
+		err = c.waitPublished(generation)
+	}
+	report.InstalledFileEnd = nextState.fileEnd
+	report.StagingAllocatedBytes = published.StagingAllocatedBytes
+	report.StagingUsedBytes = published.StagingUsedBytes
+	return report, err
+}
+
+func (c *Collection) clearOnlineMigrationObserver() {
+	c.writer.Lock()
+	_ = c.committer.SetPublicationObserver(nil)
+	c.onlineMigrationDirty, c.onlineMigrationObserver = nil, nil
+	c.writer.Unlock()
+}
+
+func (c *Collection) buildOnlineCompactionGeneration(
+	snapshot *Snapshot,
+	manifestStore *storeio.GenerationMigrationManifestStore,
+	manifest storeio.GenerationMigrationManifest,
+) (onlineCompactionBuild, error) {
+	var result onlineCompactionBuild
+	sink, err := storeio.NewGenerationMigrationChainedSink(
+		c.file, c.storeID, manifest.TargetGeneration,
+		uint32(c.options.PageSize), uint32(c.options.MaxPageSize),
+		uint64(c.options.MaxPageSize)/uint64(c.options.PageSize),
+		make([]byte, max(c.options.MaxPageSize, 512<<10)),
+		func(bytes, logicalIDs uint64) (storeio.UnrootedGenerationReservation, storeio.GenerationMigrationManifest, error) {
+			return c.growOnlineMigrationStaging(manifestStore, bytes, logicalIDs)
+		},
+	)
+	if err != nil {
+		return result, err
+	}
+	builder, err := storeio.NewPrimaryValueGraphStreamBuilder(sink, c.options.skipIndexes)
+	if err != nil {
+		return result, err
+	}
+	type row struct{ keyAt, keyEnd, valueAt, valueEnd int }
+	rows := make([]row, 0, min(256, c.options.MaxBatchDocuments))
+	arena := make([]byte, 0, min(4<<20, c.options.MaxDocumentBytes+c.options.MaxKeyBytes))
+	records := make([]storeio.CommonPrimaryLeafRecord, cap(rows))
+	flush := func() error {
+		if len(rows) == 0 {
+			return nil
+		}
+		records = records[:len(rows)]
+		for index, source := range rows {
+			key := arena[source.keyAt:source.keyEnd]
+			value := arena[source.valueAt:source.valueEnd]
+			records[index] = storeio.CommonPrimaryLeafRecord{Key: key}
+			if len(value) <= c.options.InlineValueBytes {
+				records[index].Value.Inline = value
+			} else {
+				head, err := c.stagePrimaryOverflowChainToSink(sink, value, manifest.TargetGeneration)
+				if err != nil {
+					return err
+				}
+				records[index].Value.Overflow = head
+			}
+		}
+		if err := builder.StageWindow(records, nil); err != nil {
+			return err
+		}
+		result.documents += uint64(len(rows))
+		rows, arena = rows[:0], arena[:0]
+		return nil
+	}
+	_, err = snapshot.RangeRawBuffer(nil, func(key, value []byte) error {
+		if len(rows) != 0 && (len(rows) == cap(rows) || len(arena)+len(key)+len(value) > 4<<20) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		keyAt := len(arena)
+		arena = append(arena, key...)
+		keyEnd := len(arena)
+		valueAt := len(arena)
+		arena = append(arena, value...)
+		rows = append(rows, row{keyAt, keyEnd, valueAt, len(arena)})
+		return nil
+	})
+	if err != nil {
+		return result, err
+	}
+	if err := flush(); err != nil {
+		return result, err
+	}
+	if result.documents == 0 {
+		return result, storeio.ErrInvalidWrite
+	}
+	result.primary, err = builder.Finish()
+	if err != nil {
+		return result, err
+	}
+	if c.options.pageCatalog != nil && c.options.pageCatalog.CanonicalSize() != 0 {
+		result.catalog, err = storeio.StageCanonicalPageCatalog(sink, c.options.pageCatalog, uint32(c.options.PageSize))
+		if err != nil {
+			return result, err
+		}
+	}
+	if err := sink.Sync(); err != nil {
+		return result, err
+	}
+	state := c.state.Load()
+	result.router, err = storeio.BuildResidentPrimaryRouter(c.cache, result.primary, storeio.GlobalTabletCatalogBounds{
+		StoreID: c.storeID, SelectedRootGeneration: state.root.Generation,
+		FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	return result, err
 }
