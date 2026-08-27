@@ -2,6 +2,84 @@ package storeio
 
 import "fmt"
 
+// AppendPrimaryTabletKeyBounds authenticates one tablet and appends the first
+// and last document keys by opening only its boundary anchor and leaf pages.
+// Caller-owned fixed key buffers keep final vector-to-catalog folding
+// allocation-free.
+func AppendPrimaryTabletKeyBounds(
+	cache *PageCache,
+	ref PageRef,
+	bounds GlobalTabletCatalogBounds,
+	firstDst, lastDst []byte,
+) ([]byte, []byte, error) {
+	if cache == nil || ref.Kind != PageTabletRoute || cap(firstDst)-len(firstDst) < CommonPrimaryLeafMaxKeyBytes || cap(lastDst)-len(lastDst) < CommonPrimaryLeafMaxKeyBytes {
+		return firstDst, lastDst, fmt.Errorf("%w: tablet key bounds", ErrInvalidWrite)
+	}
+	tabletLease, err := cache.Acquire(ref)
+	if err != nil {
+		return firstDst, lastDst, err
+	}
+	tablet, err := OpenGlobalTabletCatalogTabletRoot(tabletLease.Page(), ref, bounds)
+	if err != nil || tablet.AnchorCount() == 0 {
+		tabletLease.Release()
+		if err != nil {
+			return firstDst, lastDst, err
+		}
+		return firstDst, lastDst, ErrGlobalTabletCatalogCorrupt
+	}
+	appendBoundary := func(anchorRank, leafRank, row int, dst []byte) ([]byte, error) {
+		anchorRoute, ok := tablet.AnchorAt(anchorRank)
+		if !ok {
+			return dst, ErrGlobalTabletCatalogCorrupt
+		}
+		anchorLease, err := cache.Acquire(anchorRoute.Ref)
+		if err != nil {
+			return dst, err
+		}
+		if err := ValidateGlobalTabletCatalogAnchor(anchorLease.Page(), anchorRoute.Ref, bounds); err != nil {
+			anchorLease.Release()
+			return dst, err
+		}
+		anchor, err := OpenGlobalTabletCatalogAnchor(anchorLease.Page(), &tablet, anchorRoute.PageID)
+		if err != nil {
+			anchorLease.Release()
+			return dst, err
+		}
+		if leafRank < 0 {
+			leafRank = anchor.Count() - 1
+		}
+		leafRoute, ok := anchor.RouteAt(leafRank, 0)
+		anchorLease.Release()
+		if !ok {
+			return dst, ErrGlobalTabletCatalogCorrupt
+		}
+		leafLease, err := cache.Acquire(leafRoute.Ref)
+		if err != nil {
+			return dst, err
+		}
+		leaf, err := OpenCompactPrimaryStripe(leafLease.Page(), bounds.StoreID, leafRoute.Bucket, leafRoute.Ref, bounds.SelectedRootGeneration, CommonPrimaryLeafBounds{FileEnd: bounds.FileEnd, NextLogicalID: bounds.NextLogicalID, AllocationQuantum: uint32(cache.options.PageSize)})
+		if err != nil {
+			leafLease.Release()
+			return dst, err
+		}
+		if row < 0 {
+			row = leaf.Len() - 1
+		}
+		dst, ok = leaf.AppendKey(dst, row)
+		leafLease.Release()
+		if !ok {
+			return dst, ErrGlobalTabletCatalogCorrupt
+		}
+		return dst, nil
+	}
+	firstDst, err = appendBoundary(0, 0, 0, firstDst)
+	if err == nil {
+		lastDst, err = appendBoundary(tablet.AnchorCount()-1, -1, -1, lastDst)
+	}
+	tabletLease.Release()
+	return firstDst, lastDst, err
+}
+
 // VisitPrimaryGraphRefs authenticates and visits every page reachable from one
 // primary root, including overflow chains, in deterministic depth-first order.
 // It retains at most the catalog depth plus one tablet/anchor/leaf lease, so a
