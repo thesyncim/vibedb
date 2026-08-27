@@ -30,6 +30,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	"github.com/thesyncim/vibedb/internal/topologyscheduler"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -384,6 +386,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	hotMutationAssertMessage(t, client, "final", "final@example.com", 7)
 	hotMutationAssertSelectorEmpty(t, client, "kind", "steady")
 	hotMutationAssertSelectorEmpty(t, client, "email", "steady@example.com")
+
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	p99 := latencies[(len(latencies)*99+99)/100-1]
 	if p99 > 5*time.Second {
@@ -481,6 +484,58 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	hotMutationAssertSelectorEmpty(t, client, "kind", "steady")
 	hotMutationAssertSelectorEmpty(t, client, "email", "steady@example.com")
 
+	// Admit a real binary range split through the same prepared-child RPC and
+	// replicated operation journal used by the shipped hot-shard controller.
+	// The pressure planner is tested independently; this phase fixes the exact
+	// topology cut so the external fault gate is deterministic.
+	splitPlan := hotMutationAdmitExactSplit(
+		t, ctx, controlPath, profile, nodes[4], catalogAuthority, final, routes[0],
+	)
+	if splitPlan == nil {
+		t.Fatal("exact split admission returned no plan")
+	}
+	hotMutationWaitSplitRevision(t, ctx, catalogAuthority, [32]byte(splitPlan.OperationID()), 4)
+	servingRoute, found := final.ResolveReplicatedRoute(
+		routes[0].Distribution, routes[0].Shard, make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+	)
+	if !found {
+		t.Fatal("published source route missing before split fault")
+	}
+	splitLeader := hotMutationLeader(t, profile, servingRoute)
+	var splitLeaderProcess *rf3testfixture.ExternalProcess
+	switch splitLeader {
+	case 1, 2, 3:
+		splitLeaderProcess = processes[int(splitLeader)-1]
+	case 4:
+		splitLeaderProcess = coldProcess
+	default:
+		t.Fatalf("split source leader=%d", splitLeader)
+	}
+	if err = splitLeaderProcess.Kill(ctx); err != nil {
+		t.Fatalf("kill split source leader %d: %v", splitLeader, err)
+	}
+	if err = splitLeaderProcess.Start(); err != nil {
+		t.Fatalf("restart split source leader %d: %v", splitLeader, err)
+	}
+	if err = splitLeaderProcess.WaitReady(ctx, "vibedb-shard RF3"); err != nil {
+		t.Fatalf("restarted split source leader %d: %v\n%s", splitLeader, err, splitLeaderProcess.Diagnostics())
+	}
+	splitCatalog := hotMutationWaitSplitComplete(
+		t, ctx, catalogAuthority, final.Generation()+1, [32]byte(splitPlan.OperationID()), routes[0],
+	)
+	for _, descriptor := range splitCatalog.ReplicatedShardDescriptors() {
+		if descriptor.Distribution != routes[0].Distribution || descriptor.Shard == routes[0].Shard {
+			continue
+		}
+		childRoute, ok := splitCatalog.ResolveReplicatedRoute(
+			descriptor.Distribution, descriptor.Shard,
+			make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+		)
+		if !ok || hotMutationLeader(t, profile, childRoute) == 0 {
+			t.Fatalf("split child %q did not serve RF3", descriptor.Shard)
+		}
+	}
+
 	finalRSS := replicaProcessRSS(gatewayProcess.PID())
 	finalStorage := replicaProcessAllocatedBytes(root, "")
 	finalSnapshotNetwork := replicaProcessSnapshotPayloadBytes(root)
@@ -504,6 +559,124 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	t.Logf("write-driven hot move: atomic_relation_index_visibility=true leader_kill=true response_partition=true reopen=true p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d snapshot_network_growth=%d",
 		p99, maximumOperations, len(record.Payload), client.requests, client.bytes,
 		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, snapshotNetworkGrowth)
+}
+
+func hotMutationWaitSplitRevision(
+	t *testing.T, ctx context.Context, authority *gateway.ReplicatedCatalogAuthority,
+	operation [32]byte, revision uint64,
+) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		record, err := authority.ReadOperation(ctx, operation)
+		if err == nil && record.Revision >= revision {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("split operation did not reach capture/artifact execution")
+}
+
+func hotMutationWaitSplitComplete(
+	t *testing.T, ctx context.Context, authority *gateway.ReplicatedCatalogAuthority,
+	generation uint64, operation [32]byte, source gateway.ReplicatedRoute,
+) *gateway.Snapshot {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := authority.Read(ctx)
+		_, operationErr := authority.ReadOperation(ctx, operation)
+		if err == nil && snapshot.Generation() >= generation &&
+			errors.Is(operationErr, gateway.ErrReplicatedOperationMissing) {
+			var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+			if _, found := snapshot.ResolveReplicatedRoute(
+				source.Distribution, source.Shard, replicas[:0],
+			); found {
+				t.Fatal("stale parent route remained published after terminal split")
+			}
+			return snapshot
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("split did not publish, prune, retire, and collect its operation")
+	return nil
+}
+
+func hotMutationAdmitExactSplit(
+	t *testing.T,
+	ctx context.Context,
+	controlPath string,
+	profile *rafttransport.PeerTLS,
+	local rafttransport.NodeID,
+	authority *gateway.ReplicatedCatalogAuthority,
+	catalog *gateway.Snapshot,
+	route gateway.ReplicatedRoute,
+) *splitcontroller.Plan {
+	t.Helper()
+	manifest, err := loadGatewayReplicaControlManifest(controlPath, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := servicetls.FixedDeadline(5 * time.Second)
+	opener, err := newGatewayShardControlOpener(
+		profile, deadline, func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, manifest.Shards, 16,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepare, err := splitcontroller.NewChildPrepareClient(splitcontroller.ChildPrepareClientOptions{
+		Opener: opener, ReadDeadline: deadline, WriteDeadline: deadline,
+		MaxConcurrent:    8,
+		MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory, err := newGatewayHotSplitFactory(prepare, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, ok := catalog.Manifest(route.Distribution)
+	if !ok {
+		t.Fatal("split source manifest missing")
+	}
+	var source distribution.Shard
+	for index := 0; index < current.ShardCount(); index++ {
+		candidate, found := current.ShardInfo(index)
+		if found && candidate.ID == route.Shard {
+			source = candidate
+			break
+		}
+	}
+	if source.ID == "" {
+		t.Fatal("split source shard missing")
+	}
+	operation := [32]byte{0x91, 0x53, 0x50, 0x4c, 0x49, 0x54}
+	work := hotshard.SplitWork{Group: route.Group, Candidate: topologyscheduler.SplitCandidate{
+		CatalogGeneration: catalog.Generation(), MigrationBytes: 1,
+		Recommendation: autosplit.Recommendation{
+			Source: autosplit.SourceIdentity{
+				Distribution: route.Distribution, Shard: route.Shard,
+				AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration), Range: source.Range,
+				BucketBits:     distribution.DefaultVirtualBucketBits,
+				RoutingVersion: current.Version(), OwnershipEpoch: source.Epoch,
+			},
+			WindowSequence: 1, Kind: autosplit.RecommendationBinarySplit,
+			Boundaries: [2]distribution.KeyspacePoint{{0x80}}, BoundaryCount: 1,
+			CandidateBin: 32, CurrentPressurePPM: 1_100_000,
+			PredictedPressurePPM: 600_000, BenefitPPM: 500_000,
+		},
+	}}
+	plan, err := factory.BuildHotSplitPlan(ctx, catalog, operation, work)
+	if err != nil {
+		t.Fatalf("prepare exact split: %v", err)
+	}
+	if _, err = splitcontroller.AdmitReplicatedPlan(ctx, authority, catalog, plan); err != nil {
+		t.Fatalf("admit exact split: %v", err)
+	}
+	return plan
 }
 
 func hotMutationIdentities(ordinal byte, distributionName, shard string) (identities [4]raftstore.Identity) {
