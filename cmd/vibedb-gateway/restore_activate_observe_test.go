@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -25,17 +27,20 @@ func TestRestoreCatalogObservationAdvancesOnlyExactRuntimeIncarnation(t *testing
 		t.Fatal("observation altered stable target identity")
 	}
 	for name, change := range map[string]func(*shardservice.ReplicatedMemberState){
-		"incarnation-regression":    func(s *shardservice.ReplicatedMemberState) { s.Fence.NodeIncarnation = 1 },
-		"foreign-store":             func(s *shardservice.ReplicatedMemberState) { s.Fence.StoreID[0]++ },
-		"foreign-member":            func(s *shardservice.ReplicatedMemberState) { s.Fence.MemberID++ },
-		"foreign-group":             func(s *shardservice.ReplicatedMemberState) { s.Fence.Group.GroupID[0]++ },
-		"changed-command-authority": func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.SchemaGeneration++ },
+		"node incarnation":      func(s *shardservice.ReplicatedMemberState) { s.Fence.NodeIncarnation = 1 },
+		"store":                 func(s *shardservice.ReplicatedMemberState) { s.Fence.StoreID[0]++ },
+		"member":                func(s *shardservice.ReplicatedMemberState) { s.Fence.MemberID++ },
+		"group":                 func(s *shardservice.ReplicatedMemberState) { s.Fence.Group.GroupID[0]++ },
+		"allocation generation": func(s *shardservice.ReplicatedMemberState) { s.Fence.AllocationGeneration++ },
+		"zero term":             func(s *shardservice.ReplicatedMemberState) { s.Fence.Term = 0 },
+		"command fence":         func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.SchemaGeneration++ },
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := state
 			change(&candidate)
-			if _, err := bindGatewayRestoreCatalogObservation(route, endpoint, candidate); err == nil {
-				t.Fatal("divergent observed target accepted")
+			if _, err := bindGatewayRestoreCatalogObservation(route, endpoint, candidate); !errors.Is(err, gateway.ErrRestoreActivation) ||
+				!strings.Contains(err.Error(), name+" mismatch") || len(err.Error()) > 160 {
+				t.Fatalf("expected bounded field diagnostic preserving activation refusal: %v", err)
 			}
 		})
 	}

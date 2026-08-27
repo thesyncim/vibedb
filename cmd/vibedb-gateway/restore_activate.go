@@ -74,7 +74,7 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	}
 	operation, err := clusterrestore.OpenOperation(operationRaw)
 	if err != nil || len(operation.Targets) != len(manifest.Groups) {
-		return clusterrestore.ServingPermit{}, errors.Join(gateway.ErrRestoreActivation, err)
+		return clusterrestore.ServingPermit{}, fmt.Errorf("operation group vector: %w", errors.Join(gateway.ErrRestoreActivation, err))
 	}
 	schemas, err := readGatewayRestoreInput(manifest.SchemaSet, kubeoperator.RestoreTemplateMaxBytes)
 	if err != nil {
@@ -85,11 +85,11 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	}
 	policyRaw, err := readGatewayRestoreInput(manifest.Policy, serviceauthz.AbsoluteMaxPolicyBytes)
 	if err != nil || sha256.Sum256(policyRaw) != operation.TargetPolicyDigest {
-		return clusterrestore.ServingPermit{}, errors.Join(gateway.ErrRestoreActivation, err)
+		return clusterrestore.ServingPermit{}, fmt.Errorf("sealed policy digest: %w", errors.Join(gateway.ErrRestoreActivation, err))
 	}
 	policy, err := serviceauthz.Load(policyRaw)
 	if err != nil || policy.Generation() != operation.PolicyGeneration {
-		return clusterrestore.ServingPermit{}, errors.Join(gateway.ErrRestoreActivation, err)
+		return clusterrestore.ServingPermit{}, fmt.Errorf("sealed policy generation: %w", errors.Join(gateway.ErrRestoreActivation, err))
 	}
 	profile, err := servicetls.LoadProfile(manifest.TLS.Certificate, manifest.TLS.Key, manifest.TLS.Roots, manifest.TLS.IdentityOID, time.Now)
 	if err != nil {
@@ -97,7 +97,7 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	}
 	target := operation.Targets[operation.CatalogOrdinal].Group
 	if profile.LocalIdentity().TrustDomain != (rafttransport.TrustDomain{ClusterID: target.ClusterID, ClusterIncarnation: target.ClusterIncarnation}) {
-		return clusterrestore.ServingPermit{}, gateway.ErrRestoreActivation
+		return clusterrestore.ServingPermit{}, fmt.Errorf("target trust domain: %w", gateway.ErrRestoreActivation)
 	}
 	gate, err := serviceauthz.NewGate(policy)
 	if err != nil {
@@ -106,7 +106,7 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	operator := serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: policy.Generation()}
 	if gate.CheckAuthority(operator, serviceauthz.CapabilityRestoreActivate) != serviceauthz.DecisionAllow ||
 		gate.CheckAuthority(operator, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
-		return clusterrestore.ServingPermit{}, gateway.ErrRestoreActivation
+		return clusterrestore.ServingPermit{}, fmt.Errorf("operator capabilities: %w", gateway.ErrRestoreActivation)
 	}
 	snapshot, err := gateway.LoadSnapshot(manifest.TargetCatalog)
 	if err != nil {
@@ -119,7 +119,7 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	actualCatalog, err := gateway.AppendSnapshotDocument(nil, snapshot)
 	sealedCatalog, sealedErr := gateway.AppendSnapshotDocument(nil, sealedSnapshot)
 	if err != nil || sealedErr != nil || !bytes.Equal(actualCatalog, sealedCatalog) {
-		return clusterrestore.ServingPermit{}, gateway.ErrRestoreActivation
+		return clusterrestore.ServingPermit{}, fmt.Errorf("sealed target catalog: %w", errors.Join(gateway.ErrRestoreActivation, err, sealedErr))
 	}
 	for _, path := range []string{manifest.ActivationRoot, filepath.Dir(manifest.Sessions[0].Journal), filepath.Dir(manifest.Sessions[1].Journal)} {
 		if err = ensureGatewayRestoreDirectory(path); err != nil {
@@ -140,11 +140,11 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 	}
 	defer staging.Close()
 	if staging.Permit != operation.Permit {
-		return clusterrestore.ServingPermit{}, gateway.ErrRestoreActivation
+		return clusterrestore.ServingPermit{}, fmt.Errorf("verified staging permit: %w", gateway.ErrRestoreActivation)
 	}
 	catalog, pool, err := newGatewayRestoreCatalog(ctx, manifest, operation, snapshot, profile, gate, operator)
 	if err != nil {
-		return clusterrestore.ServingPermit{}, err
+		return clusterrestore.ServingPermit{}, fmt.Errorf("target catalog connection: %w", err)
 	}
 	defer pool.Close()
 	endpoints := make([]gateway.ReplicatedEndpoint, 0, len(operation.Targets)*3)
@@ -169,7 +169,10 @@ func executeGatewayRestore(ctx context.Context, manifest gatewayRestoreManifest)
 		Installer: gatewayRestoreGroupInstaller{schemas: schemas, groups: manifest.Groups},
 		Catalog:   catalog, Serving: serving, Gate: gate, Operator: operator,
 	})
-	return permit, err
+	if err != nil {
+		return permit, fmt.Errorf("complete activation: %w", err)
+	}
+	return permit, nil
 }
 
 type gatewayRestoreGroupInstaller struct {

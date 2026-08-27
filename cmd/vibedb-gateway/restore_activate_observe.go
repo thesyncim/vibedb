@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -36,7 +37,7 @@ func refreshGatewayRestoreCatalogRoute(ctx context.Context, profile *rafttranspo
 			}
 		}
 		if observed != nil {
-			return gateway.ReplicatedRoute{}, observed
+			return gateway.ReplicatedRoute{}, fmt.Errorf("restore catalog replica %d observation: %w", index, observed)
 		}
 	}
 	return route, nil
@@ -62,8 +63,11 @@ func probeGatewayRestoreCatalogReplica(parent context.Context, profile *rafttran
 		Operation: shardservice.ReplicatedProbe, Authority: operator, Capability: serviceauthz.CapabilityTopology,
 		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
 	})
-	if err != nil || response == nil || response.Kind != shardservice.ReplicatedHandshake || !response.HasState {
-		return gateway.ReplicatedEndpoint{}, errors.Join(gateway.ErrRestoreActivation, err)
+	if err != nil || response == nil {
+		return gateway.ReplicatedEndpoint{}, fmt.Errorf("restore catalog probe transport: %w", errors.Join(gateway.ErrRestoreActivation, err))
+	}
+	if response.Kind != shardservice.ReplicatedHandshake || !response.HasState {
+		return gateway.ReplicatedEndpoint{}, fmt.Errorf("restore catalog probe kind=%d refusal=%d state=%t: %w", response.Kind, response.Refusal, response.HasState, gateway.ErrRestoreActivation)
 	}
 	return bindGatewayRestoreCatalogObservation(route, endpoint, response.State)
 }
@@ -72,11 +76,25 @@ func bindGatewayRestoreCatalogObservation(route gateway.ReplicatedRoute,
 	endpoint gateway.ReplicatedEndpoint, state shardservice.ReplicatedMemberState,
 ) (gateway.ReplicatedEndpoint, error) {
 	fence := state.Fence
-	if fence.Group != route.Group || fence.AllocationGeneration != route.AllocationGeneration ||
-		fence.MemberID != endpoint.Member || fence.StoreID != endpoint.StoreID ||
-		fence.NodeIncarnation < endpoint.NodeIncarnation || endpoint.NodeIncarnation == 0 ||
-		fence.Term == 0 || fence.Command != route.Command {
-		return gateway.ReplicatedEndpoint{}, gateway.ErrRestoreActivation
+	var mismatch string
+	switch {
+	case fence.Group != route.Group:
+		mismatch = "group"
+	case fence.AllocationGeneration != route.AllocationGeneration:
+		mismatch = "allocation generation"
+	case fence.MemberID != endpoint.Member:
+		mismatch = "member"
+	case fence.StoreID != endpoint.StoreID:
+		mismatch = "store"
+	case fence.NodeIncarnation < endpoint.NodeIncarnation || endpoint.NodeIncarnation == 0:
+		mismatch = "node incarnation"
+	case fence.Term == 0:
+		mismatch = "zero term"
+	case fence.Command != route.Command:
+		mismatch = "command fence"
+	}
+	if mismatch != "" {
+		return gateway.ReplicatedEndpoint{}, fmt.Errorf("restore catalog observation %s mismatch: %w", mismatch, gateway.ErrRestoreActivation)
 	}
 	endpoint.NodeIncarnation = fence.NodeIncarnation
 	return endpoint, nil
