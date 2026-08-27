@@ -626,7 +626,7 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 			listeners[index].Native, listeners[index].Control
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{Member: uint64(index + 1),
 			Node: nodes[index], StoreID: identities[index].StoreID,
-			NodeIncarnation: uint64(41 + index), Endpoint: peer,
+			NodeIncarnation: 1, Endpoint: peer,
 			NativeEndpoint: native, ControlEndpoint: control}
 	}
 	targetPeer, targetNative, targetControl := distribution.EndpointID("member-4-peer"),
@@ -671,6 +671,41 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func TestReplicaProcessCatalogUsesFreshWALIncarnation(t *testing.T) {
+	// PrepareMember creates a WAL but does not mint a runtime incarnation.
+	// Each member's first serving claim is 1, not an ordinal-dependent value.
+	primary := replicaProcessIdentities()
+	secondary := replicaProcessSecondaryIdentities(primary)
+	var nodes [5]rafttransport.NodeID
+	for i := range nodes {
+		nodes[i][0] = byte(i + 1)
+	}
+	var listeners [4]rf3testfixture.ProcessListeners
+	for i := range listeners {
+		listeners[i] = rf3testfixture.ProcessListeners{
+			Peer:    fmt.Sprintf("127.0.0.1:%d", 11000+i),
+			Native:  fmt.Sprintf("127.0.0.1:%d", 12000+i),
+			Control: fmt.Sprintf("127.0.0.1:%d", 13000+i),
+		}
+	}
+	authority := sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RoutingVersion: 1, RouteGeneration: 1}
+	snapshot := replicaProcessCatalog(t, nodes, primary, secondary, listeners,
+		[2]raftmember.GroupKey{replicaProcessGroup(primary[0]), replicaProcessGroup(secondary[0])},
+		authority, [32]byte{1})
+	for _, shard := range snapshot.ReplicatedShardDescriptors() {
+		for _, member := range shard.Replicas {
+			if member.NodeIncarnation != 1 || member.StoreID != primary[member.Member-1].StoreID {
+				t.Fatalf("fresh member advertises an unminted identity: %+v", member)
+			}
+		}
+		if shard.EnrolledTarget == nil || shard.EnrolledTarget.NodeIncarnation != 44 {
+			t.Fatal("fresh voter correction changed explicitly enrolled target authority")
+		}
+	}
 }
 
 func replicaProcessCatalogSeed(t testing.TB, snapshot *gateway.Snapshot) [][]byte {

@@ -679,7 +679,7 @@ func durableRF3ExternalRoute(
 	for member := 0; member < durableRF3ExternalVoters; member++ {
 		route.Replicas = append(route.Replicas, gateway.ReplicatedEndpoint{
 			Member: uint64(member + 1), Node: nodes[member], StoreID: identities[member].StoreID,
-			NodeIncarnation: uint64(41 + member), Endpoint: listeners[member].Peer,
+			NodeIncarnation: 1, Endpoint: listeners[member].Peer,
 			DataAddress: listeners[member].Peer, NativeEndpoint: listeners[member].Native,
 			Address: listeners[member].Native, ControlEndpoint: listeners[member].Control,
 			ControlAddress: listeners[member].Control,

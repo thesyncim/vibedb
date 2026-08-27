@@ -500,7 +500,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	// The pressure planner is tested independently; this phase fixes the exact
 	// topology cut so the external fault gate is deterministic.
 	splitPlan := hotMutationAdmitExactSplit(
-		t, ctx, controlPath, profile, nodes[4], catalogAuthority, final, routes[0],
+		t, ctx, controlPath, nodes[4], catalogAuthority, final, routes[0],
 	)
 	if splitPlan == nil {
 		t.Fatal("exact split admission returned no plan")
@@ -705,7 +705,6 @@ func hotMutationAdmitExactSplit(
 	t *testing.T,
 	ctx context.Context,
 	controlPath string,
-	profile *rafttransport.PeerTLS,
 	local rafttransport.NodeID,
 	authority *gateway.ReplicatedCatalogAuthority,
 	catalog *gateway.Snapshot,
@@ -716,24 +715,7 @@ func hotMutationAdmitExactSplit(
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := servicetls.FixedDeadline(5 * time.Second)
-	opener, err := newGatewayShardControlOpener(
-		profile, deadline, func(ctx context.Context, address string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-		}, manifest.Shards, 16,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prepare, err := splitcontroller.NewChildPrepareClient(splitcontroller.ChildPrepareClientOptions{
-		Opener: opener, ReadDeadline: deadline, WriteDeadline: deadline,
-		MaxConcurrent:    8,
-		MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * 8,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	factory, err := newGatewayHotSplitFactory(prepare, manifest, catalog)
+	factory, err := newGatewayHotSplitFactory(manifest, catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,7 +790,7 @@ func hotMutationRoute(identities [4]raftstore.Identity,
 		ForwardingRuleDigest: replication.Digest{0x73, byte(identities[0].GroupID[0])}}
 	for member := 0; member < 3; member++ {
 		route.Replicas = append(route.Replicas, gateway.ReplicatedEndpoint{Member: uint64(member + 1),
-			Node: nodes[member], StoreID: identities[member].StoreID, NodeIncarnation: uint64(41 + member),
+			Node: nodes[member], StoreID: identities[member].StoreID, NodeIncarnation: 1,
 			Endpoint: listeners[member].Peer, DataAddress: listeners[member].Peer,
 			NativeEndpoint: listeners[member].Native, Address: listeners[member].Native,
 			ControlEndpoint: listeners[member].Control, ControlAddress: listeners[member].Control})
