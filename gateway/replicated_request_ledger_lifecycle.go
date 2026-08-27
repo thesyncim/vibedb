@@ -226,11 +226,28 @@ func (ledger *DurableRequestLedgerRF3) ApplyCAS(
 		result.Native.Outcome.AppliedIndex == 0 {
 		return DurableRequestLifecycleCASResult{}, ErrDurableRequestConflict
 	}
+	if result.Ledger.ResultCode == replicatedstate.ResultRequestLedgerConflict &&
+		cas.ExpectedRevision != 0 && result.Ledger.Revision > cas.ExpectedRevision {
+		// A competing exact retry may already have installed the next wave.
+		// Do not turn a proven advancing CAS loss into a terminal client error.
+		// The service must reopen the sealed recipe at this applied fence; this
+		// signal never authorizes replaying stale command construction in place.
+		return DurableRequestLifecycleCASResult{}, &durableRequestAdvancedError{
+			revision: result.Ledger.Revision, applied: result.Native.Outcome.AppliedIndex,
+		}
+	}
 	return DurableRequestLifecycleCASResult{
 		Ledger: result.Ledger, Applied: result.Native.Outcome.AppliedIndex,
 		Retries: result.Native.Retries,
 	}, nil
 }
+
+type durableRequestAdvancedError struct{ revision, applied uint64 }
+
+func (err *durableRequestAdvancedError) Error() string {
+	return "gateway: durable request advanced during exact retry"
+}
+func (err *durableRequestAdvancedError) Unwrap() error { return ErrDurableRequestConflict }
 
 func durableRequestLifecycleCommand(
 	keyDigest requestledger.Digest,

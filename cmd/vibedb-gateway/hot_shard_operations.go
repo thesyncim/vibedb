@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -40,7 +41,8 @@ func (factory gatewayHotReplicaMoveFactory) BuildHotReplicaMove(
 	)
 	if !ok || route.Serving.Group != work.Group || !route.HasEnrolledTarget ||
 		distribution.EndpointID(route.EnrolledTarget.Endpoint) != work.Selection.TargetEndpoint {
-		return nil, hotshard.ErrInvalidPressureCut
+		return nil, fmt.Errorf("move %s/%s to %s requires its exact enrolled target: %w",
+			work.Selection.Source.Distribution, work.Selection.Source.Shard, work.Selection.TargetEndpoint, hotshard.ErrInvalidPressureCut)
 	}
 
 	var retiring, donor gateway.ReplicatedEndpoint
@@ -64,7 +66,8 @@ func (factory gatewayHotReplicaMoveFactory) BuildHotReplicaMove(
 		grant.InitialReplicaSetVersion != route.Serving.Command.ReplicaSetVersion ||
 		grant.SourceMember != retiring.Member || grant.TargetMember != route.EnrolledTarget.Member ||
 		grant.TargetNode != [16]byte(route.EnrolledTarget.Node) {
-		return nil, errors.Join(err, hotshard.ErrInvalidPressureCut)
+		return nil, fmt.Errorf("move %s/%s retiring member %d requires its exact membership grant: %w",
+			work.Selection.Source.Distribution, work.Selection.Source.Shard, retiring.Member, errors.Join(err, hotshard.ErrInvalidPressureCut))
 	}
 
 	request := replicacontrol.Request{

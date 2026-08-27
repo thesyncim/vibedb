@@ -507,7 +507,7 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		manifest.RelationManifestDigest == ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
-		!systemRowsOK || manifest.SystemRows != wantSystemRows ||
+		!systemRowsOK || !snapshotSystemRowsBounded(manifest.State, manifest.SystemRows, wantSystemRows) ||
 		len(manifest.UserCollection) == 0 ||
 		len(manifest.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(manifest.UserCollection) ||

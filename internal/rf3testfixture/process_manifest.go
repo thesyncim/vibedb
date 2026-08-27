@@ -183,9 +183,14 @@ func prepareProcessMember(
 	if err = os.WriteFile(manifestPath, document, 0o600); err != nil {
 		return PreparedProcessMember{}, err
 	}
-	relationDigest, err := prepared.Apply.RangeSplitRelationManifestDigest()
-	if err != nil {
-		return PreparedProcessMember{}, err
+	// A cold target has no live apply machine until certified installation.
+	// Do not try to read (or invent) its serving machine digest at reservation.
+	var relationDigest [32]byte
+	if !coldSnapshot {
+		relationDigest, err = prepared.Apply.RangeSplitRelationManifestDigest()
+		if err != nil {
+			return PreparedProcessMember{}, err
+		}
 	}
 	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(prepared.Base)
 	if err != nil {

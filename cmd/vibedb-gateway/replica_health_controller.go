@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -120,6 +121,23 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 		return errors.Join(err, errGatewayReplicaHealth)
 	}
 	err = sink.grants.PublishMembershipGrant(ctx, grant)
+	if errors.Is(err, gateway.ErrReplicatedCatalogConflict) {
+		// A process can die after publishing a grant but before admitting the
+		// move set. A newer failure certificate changes the proposed grant ID,
+		// not the already-authorized replacement. Resume only if every catalog,
+		// roster, source, target, and descriptor field still matches exactly.
+		stored, found, readErr := sink.grants.ReadMembershipGrant(ctx, grant.Group)
+		if readErr != nil || !found || !stored.Valid() {
+			return errors.Join(err, readErr)
+		}
+		expected, buildErr := gateway.BuildReplicaReplacementMembershipGrant(catalog,
+			intent.Plan.Group(), stored.TransitionID, stored.MetadataEpoch,
+			intent.Plan.RetiringMember(), intent.Plan.TargetMember())
+		if buildErr != nil || expected != stored {
+			return errors.Join(err, buildErr)
+		}
+		grant, err = stored, nil
+	}
 	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
 		if retryErr := sink.grants.RetryPending(ctx); retryErr != nil {
 			return errors.Join(err, retryErr)
@@ -127,7 +145,7 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 		err = nil
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("publish failed-replica grant for %s/%s: %w", identity.Request.Distribution, identity.Request.Shard, err)
 	}
 	stored, found, err := sink.grants.ReadMembershipGrant(ctx, grant.Group)
 	if err != nil || !found || stored != grant {
@@ -141,7 +159,7 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 		return errGatewayReplicaHealth
 	}
 	if err = installGatewayMembershipGrant(ctx, route, grant, sink.installer); err != nil {
-		return err
+		return fmt.Errorf("install failed-replica grant for %s/%s: %w", identity.Request.Distribution, identity.Request.Shard, err)
 	}
 	_, err = sink.controller.Submit(ctx, intent.Plan)
 	return err
@@ -167,7 +185,10 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMoves(
 		}
 	}
 	_, err := controller.SubmitSet(ctx, capture.plans)
-	return err
+	if err != nil {
+		return fmt.Errorf("admit failed-replica move set: %w", err)
+	}
+	return nil
 }
 
 type gatewayReplicaMovePlanCapture struct{ plans []*rebalance.Plan }

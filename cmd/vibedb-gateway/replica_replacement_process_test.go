@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -117,12 +118,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = os.WriteFile(policyPath, replicaProcessPolicy(nodes), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	wal := raftstore.Options{MaxFileBytes: 256 << 20,
-		MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096,
-		MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
+	wal := rf3testfixture.DurableGatewayWALOptions()
 	authority := sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 5,
 		ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13,
-		RoutingVersion: 17, RouteGeneration: 19}
+		RoutingVersion: 17, RouteGeneration: 1}
 	apply := sqldriver.ReplicatedApplyOptions{MaxSessions: 64, RetryWindow: 16,
 		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024,
 			MaxBytes: 384 << 20}, Placement: sqldriver.ReplicatedPlacementProfile{
@@ -138,9 +137,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 
 	// Learn the exact serving machine digest before creating the
-	// catalog document. The probe is never served and is removed immediately.
+	// catalog document. The probe has its own existing temporary root and is
+	// closed before serving; it is excluded from the cluster resource evidence.
 	probe, err := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
-		Root: filepath.Join(root, "relation-probe"), Table: gateway.ReplicatedCatalogTable,
+		Root: t.TempDir(), Table: gateway.ReplicatedCatalogTable,
 		CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))",
 		Identity:    identities[0], Key: key, WAL: wal,
 		Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
@@ -157,12 +157,40 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(probe.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The second colocated group owns the durable request-home topology. Its
+	// apply identity must actually include that ledger, not merely advertise it
+	// in a catalog descriptor.
+	secondaryApply := apply
+	secondaryApply.RequestLedgerCapacityBytes = 64 << 20
+	secondaryApply.RequestLedgerCleanupReserveBytes = 8 << 20
+	secondaryApply.RequestLedgerRangeIdentity = replication.Digest{0x91}
+	secondaryProbe, err := rf3testfixture.PrepareMember(rf3testfixture.MemberOptions{
+		Root: t.TempDir(), Table: gateway.ReplicatedCatalogTable,
+		CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))",
+		Identity:    secondaryIdentities[0], Key: key, WAL: wal,
+		Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
+		Authority: authority, Apply: secondaryApply,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryDigest, err := secondaryProbe.Apply.RangeSplitRelationManifestDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = secondaryProbe.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	snapshot := replicaProcessCatalog(t, nodes, identities, secondaryIdentities, listeners, groups,
-		authority, relationDigest)
+		authority, [2][32]byte{relationDigest, secondaryDigest}, logicalDigest)
 	catalogPath := filepath.Join(root, "catalog.vibejson")
 	if err = gateway.SaveSnapshot(catalogPath, snapshot); err != nil {
 		t.Fatal(err)
@@ -178,7 +206,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		servingPeers[index] = listeners[index].Peer
 	}
 	target := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: nodes[3],
-		StoreID: identities[3].StoreID, NodeIncarnation: 44, Listeners: listeners[3]}
+		StoreID: identities[3].StoreID, NodeIncarnation: 1, Listeners: listeners[3]}
 	prepared := make([]rf3testfixture.PreparedProcessMember, 3)
 	secondaryPrepared := make([]rf3testfixture.PreparedProcessMember, 3)
 	for index := range prepared {
@@ -192,7 +220,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 				Authority: authority, Apply: apply, Listeners: listeners[index],
 				Credential: credentials[index], Roots: roots,
 				AuthorizationPolicy: policyPath, Nodes: servingNodes,
-				PeerAddresses: servingPeers, Target: &target, SeedDocuments: seed,
+				PeerAddresses: servingPeers, Target: &target,
 			})
 		if err != nil {
 			t.Fatal(err)
@@ -200,14 +228,15 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		secondaryPrepared[index], err = rf3testfixture.PrepareProcessMember(
 			rf3testfixture.ProcessMemberOptions{
 				Root:        filepath.Join(root, fmt.Sprintf("member-%d-secondary", index+1)),
+				ControlRoot: filepath.Join(root, fmt.Sprintf("member-%d", index+1)),
 				Table:       gateway.ReplicatedCatalogTable,
 				CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))",
 				Identity:    secondaryIdentities[index], Key: key, WAL: wal,
 				Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-				Authority: authority, Apply: apply, Listeners: listeners[index],
+				Authority: authority, Apply: secondaryApply, Listeners: listeners[index],
 				Credential: credentials[index], Roots: roots,
 				AuthorizationPolicy: policyPath, Nodes: servingNodes,
-				PeerAddresses: servingPeers, Target: &target, SeedDocuments: seed,
+				PeerAddresses: servingPeers, Target: &target,
 			})
 		if err != nil {
 			t.Fatal(err)
@@ -230,7 +259,6 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			Authority: authority, Apply: apply, Listeners: listeners[3],
 			Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 			Nodes: servingNodes, PeerAddresses: servingPeers, Target: &target,
-			SeedDocuments: seed,
 		}, nodes[1], listeners[1].Snapshot, 1<<30,
 	)
 	if err != nil {
@@ -239,13 +267,13 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	secondaryCold, err := rf3testfixture.PrepareColdProcessTarget(
 		rf3testfixture.ProcessMemberOptions{
 			Root: filepath.Join(root, "member-4-secondary"), Table: gateway.ReplicatedCatalogTable,
+			ControlRoot: filepath.Join(root, "member-4"),
 			CreateTable: "CREATE TABLE controlplane (PRIMARY KEY (id))",
 			Identity:    secondaryIdentities[3], Key: key, WAL: wal,
 			Bootstrap: rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}),
-			Authority: authority, Apply: apply, Listeners: listeners[3],
+			Authority: authority, Apply: secondaryApply, Listeners: listeners[3],
 			Credential: credentials[3], Roots: roots, AuthorizationPolicy: policyPath,
 			Nodes: servingNodes, PeerAddresses: servingPeers, Target: &target,
-			SeedDocuments: seed,
 		}, nodes[1], listeners[1].Snapshot, 1<<30,
 	)
 	if err != nil {
@@ -276,6 +304,15 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 
 	voters := [3]*rf3testfixture.ExternalProcess{}
+	defer func() {
+		if t.Failed() {
+			for index, voter := range voters {
+				if voter != nil {
+					t.Logf("voter %d diagnostics:\n%s", index+1, voter.Diagnostics())
+				}
+			}
+		}
+	}()
 	for index := range voters {
 		voters[index] = &rf3testfixture.ExternalProcess{Binary: shardBinary,
 			Args: []string{"serve-rf3", "-manifest", prepared[index].ManifestPath}}
@@ -312,6 +349,9 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	catalogAuthority, closeCatalogAuthority := replicaProcessCatalogAuthority(t, profile, snapshot,
 		filepath.Join(root, "abandonment-catalog-session"))
 	defer closeCatalogAuthority()
+	if err = catalogAuthority.Publish(ctx, 0, snapshot); err != nil {
+		t.Fatalf("publish immutable catalog genesis through RF3: %v", err)
+	}
 	replicaProcessPublishAbandonment(t, ctx, catalogAuthority, snapshot.Generation(), firstAbandonment)
 	gatewayProcess := replicaProcessGateway(gatewayBinary, catalogPath, gatewayNative,
 		replicaManifestPath, credentials[4], roots, policyPath, ackPath,
@@ -386,6 +426,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	// Restart the controller once while the failure window or move journal is
 	// live. No process-local queue may be needed for eventual completion.
 	time.Sleep(150 * time.Millisecond)
+	t.Logf("controller before admission restart:\n%s", gatewayProcess.Diagnostics())
 	if err = gatewayProcess.Kill(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -405,10 +446,23 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	sourceReady := false
 	var sourceRestarted time.Time
 	groupCompletion := make(map[raftmember.GroupKey]time.Duration, 2)
+	routeRestarts := 0
 	for {
 		if err = ctx.Err(); err != nil {
 			t.Fatalf("replacement timeout: %v\ngateway:\n%s\ntarget:\n%s",
 				err, gatewayProcess.Diagnostics(), coldTarget.Diagnostics())
+		}
+		if gatewayProcess.PID() == 0 {
+			if routeRestarts >= 2 || !strings.Contains(gatewayProcess.Diagnostics(), gateway.ErrReplicatedCatalogRouteRestartRequired.Error()) {
+				t.Fatalf("unexpected controller exit: %v\n%s", gatewayProcess.WaitError(), gatewayProcess.Diagnostics())
+			}
+			routeRestarts++
+			if err = gatewayProcess.Start(); err != nil {
+				t.Fatal(err)
+			}
+			if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
+				t.Fatalf("catalog self-move supervisor restart: %v\n%s", err, gatewayProcess.Diagnostics())
+			}
 		}
 		current, loadErr := catalogAuthority.Read(ctx)
 		if measurements.admissionMillis == 0 {
@@ -442,8 +496,9 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 				if !sourceReady && strings.Contains(voters[0].Diagnostics(), "vibedb-shard RF3 ready") {
 					sourceReady = true
 				}
+				operations, operationErr := catalogAuthority.ReadOperationIDs(ctx)
 				if strings.Contains(coldTarget.Diagnostics(), "vibedb-shard RF3 ready") &&
-					sourceReady && strings.Contains(gatewayProcess.Diagnostics(), "completed 2") &&
+					sourceReady && operationErr == nil && len(operations) == 0 &&
 					replicaProcessAllArtifactsEmpty(root) &&
 					time.Since(started) < 90*time.Second {
 					break
@@ -454,6 +509,9 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	if !restartedSource {
 		t.Fatal("retired source was not reopened for cleanup")
+	}
+	if routeRestarts != 2 {
+		t.Fatalf("catalog self-move route handoffs=%d want=2", routeRestarts)
 	}
 	if measurements.admissionMillis == 0 {
 		t.Fatal("two-group move set was never atomically discoverable")
@@ -521,7 +579,7 @@ func TestReplicaProcessCatalogCarriesTwoPhysicalNodeGroups(t *testing.T) {
 		RoutingVersion: 17, RouteGeneration: 19}
 	snapshot := replicaProcessCatalog(t, nodes, primary, secondary, listeners,
 		[2]raftmember.GroupKey{replicaProcessGroup(primary[0]), replicaProcessGroup(secondary[0])},
-		authority, [32]byte{1})
+		authority, [2][32]byte{{1}, {2}}, [32]byte{3})
 	descriptors := snapshot.ReplicatedShardDescriptors()
 	if len(descriptors) != 2 || descriptors[0].Group == descriptors[1].Group {
 		t.Fatalf("descriptors=%+v", descriptors)
@@ -593,7 +651,7 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 	identities, secondaryIdentities [4]raftstore.Identity,
 	listeners [4]rf3testfixture.ProcessListeners, groups [2]raftmember.GroupKey,
 	authority sqldriver.ReplicatedAuthorityProfile,
-	relationDigest [32]byte,
+	relationDigests [2][32]byte, logicalDigest [32]byte,
 ) *gateway.Snapshot {
 	t.Helper()
 	leaders := []distribution.EndpointID{"member-1-peer", "member-2-peer", "member-3-peer"}
@@ -634,27 +692,33 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 	endpoints[targetPeer], endpoints[targetNative], endpoints[targetControl] = listeners[3].Peer,
 		listeners[3].Native, listeners[3].Control
 	descriptor := gateway.ReplicatedShardDescriptor{
-		Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard,
+		LogicalSchemaDigest: replication.Digest(logicalDigest),
+		Distribution:        gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard,
 		Group: groups[0], AllocationGeneration: distribution.ShardAllocationGeneration(identities[0].AllocationGeneration),
 		Command: raftservice.CommandFence{ReplicaSetVersion: 1,
 			ActivePolicyGeneration: authority.ActivePolicyGeneration,
 			ProtectionEpoch:        authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
-			SchemaGeneration: authority.SchemaGeneration, RelationManifestDigest: relationDigest,
+			SchemaGeneration: authority.SchemaGeneration, RelationManifestDigest: relationDigests[0],
 			RoutingVersion: authority.RoutingVersion, RouteGeneration: authority.RouteGeneration},
 		RangeIdentity: replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
 		ForwardingRuleDigest: replication.Digest{0x73}, Replicas: replicas,
 		EnrolledTarget: &gateway.ReplicatedReplicaDescriptor{Member: 4, Node: nodes[3],
-			StoreID: identities[3].StoreID, NodeIncarnation: 44, Endpoint: targetPeer,
+			StoreID: identities[3].StoreID, NodeIncarnation: 1, Endpoint: targetPeer,
 			NativeEndpoint: targetNative, ControlEndpoint: targetControl},
 	}
 	secondaryDescriptor := descriptor
 	secondaryDescriptor.Distribution = "replica-secondary"
 	secondaryDescriptor.Shard = "all"
 	secondaryDescriptor.Group = groups[1]
+	secondaryDescriptor.Command.RelationManifestDigest = relationDigests[1]
+	secondaryDescriptor.RequestLedgerRanges = []gateway.DurableRequestLedgerRangeDescriptor{{Identity: replication.Digest{0x91}}}
 	secondaryDescriptor.AllocationGeneration = distribution.ShardAllocationGeneration(secondaryIdentities[0].AllocationGeneration)
 	secondaryDescriptor.RangeIdentity = replication.Digest{0x81}
 	secondaryDescriptor.LineageDigest = replication.Digest{0x82}
 	secondaryDescriptor.ForwardingRuleDigest = replication.Digest{0x83}
+	secondaryDescriptor.Replicas = slices.Clone(descriptor.Replicas)
+	secondaryTarget := *descriptor.EnrolledTarget
+	secondaryDescriptor.EnrolledTarget = &secondaryTarget
 	for index := range secondaryDescriptor.Replicas {
 		secondaryDescriptor.Replicas[index].StoreID = secondaryIdentities[index].StoreID
 	}
@@ -665,8 +729,11 @@ func replicaProcessCatalog(t testing.TB, nodes [5]rafttransport.NodeID,
 		MapperVersion: distribution.NativeMapperVersion}}, Placements: []distribution.TablePlacement{{
 		Table: gateway.ReplicatedCatalogTable, Distribution: gateway.ReplicatedCatalogDistribution,
 		Columns: []string{gateway.ReplicatedCatalogPrimaryKey}}}, Manifests: []*distribution.Manifest{manifest, secondaryManifest}}
-	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 1, nil, nil,
-		[]gateway.ReplicatedShardDescriptor{descriptor, secondaryDescriptor})
+	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(config, endpoints, 1, nil, nil,
+		[]gateway.ReplicatedShardDescriptor{descriptor, secondaryDescriptor},
+		[]gateway.ReplicatedTableProfile{{Table: gateway.ReplicatedCatalogTable, Relation: 1,
+			PrimaryKey: gateway.ReplicatedCatalogPrimaryKey, SchemaGeneration: authority.SchemaGeneration,
+			LogicalSchemaDigest: replication.Digest(logicalDigest), MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,15 +762,15 @@ func TestReplicaProcessCatalogUsesFreshWALIncarnation(t *testing.T) {
 		RoutingVersion: 1, RouteGeneration: 1}
 	snapshot := replicaProcessCatalog(t, nodes, primary, secondary, listeners,
 		[2]raftmember.GroupKey{replicaProcessGroup(primary[0]), replicaProcessGroup(secondary[0])},
-		authority, [32]byte{1})
+		authority, [2][32]byte{{1}, {2}}, [32]byte{3})
 	for _, shard := range snapshot.ReplicatedShardDescriptors() {
 		for _, member := range shard.Replicas {
 			if member.NodeIncarnation != 1 || member.StoreID != primary[member.Member-1].StoreID {
 				t.Fatalf("fresh member advertises an unminted identity: %+v", member)
 			}
 		}
-		if shard.EnrolledTarget == nil || shard.EnrolledTarget.NodeIncarnation != 44 {
-			t.Fatal("fresh voter correction changed explicitly enrolled target authority")
+		if shard.EnrolledTarget == nil || shard.EnrolledTarget.NodeIncarnation != 1 {
+			t.Fatal("cold target advertises an unminted incarnation")
 		}
 	}
 }
@@ -748,7 +815,7 @@ func replicaProcessControlManifest(t testing.TB, nodes [5]rafttransport.NodeID,
 			Incarnation: 1, ControlAddress: gatewayControl}},
 		Candidates: []persistedGatewayReplacementCandidate{{Member: 4,
 			Node: fmt.Sprintf("%x", nodes[3]), Store: fmt.Sprintf("%x", identities[3].StoreID),
-			NodeIncarnation: 44, Endpoint: "member-4-peer", Load: 0}},
+			NodeIncarnation: 1, Endpoint: "member-4-peer", Load: 0}},
 	}
 	for index := 0; index < 4; index++ {
 		manifest.ShardEndpoints = append(manifest.ShardEndpoints,
@@ -851,38 +918,19 @@ func replicaProcessGroupLatencyQuantiles(completed map[raftmember.GroupKey]time.
 
 func replicaProcessCombineServingGroups(t testing.TB, paths ...string) []byte {
 	t.Helper()
-	groups := make([][]byte, 0, len(paths))
-	var common []byte
-	for index, path := range paths {
+	documents := make([][]byte, 0, len(paths))
+	for _, path := range paths {
 		document, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		listener := bytes.Index(document, []byte(`"listeners":`))
-		members := bytes.Index(document, []byte(`,"members":`))
-		if listener < 2 || members <= listener || document[listener-1] != ',' ||
-			len(document) == 0 || document[len(document)-1] != '}' {
-			t.Fatalf("invalid singleton serving manifest %q", path)
-		}
-		if index == 0 {
-			common = append([]byte(nil), document[listener:members]...)
-		}
-		group := make([]byte, 0, len(document))
-		group = append(group, '{')
-		group = append(group, document[1:listener-1]...)
-		group = append(group, ',')
-		group = append(group, document[members+1:len(document)-1]...)
-		groups = append(groups, append(group, '}'))
+		documents = append(documents, document)
 	}
-	result := append([]byte{'{'}, common...)
-	result = append(result, `,"groups":[`...)
-	for index, group := range groups {
-		if index != 0 {
-			result = append(result, ',')
-		}
-		result = append(result, group...)
+	result, err := rf3testfixture.CombineProcessManifests(documents...)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return append(result, ']', '}')
+	return result
 }
 
 func replicaProcessCombineBootstrapGroups(t testing.TB, paths ...string) []byte {
@@ -957,7 +1005,8 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
+		CatalogBootstrap: snapshot,
+		Route:            route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xc1}, RetryHome: replication.RetryHome{0xd1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology})
@@ -973,7 +1022,7 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 		t.Fatal(err)
 	}
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
-		Executor: executor, Route: route, Relation: 1, Holder: gateway.NewCatalogHolder(snapshot),
+		Executor: executor, Route: route, Relation: 1, Holder: gateway.NewCatalogHolder(nil),
 		Session: session, Authority: identity})
 	if err != nil {
 		t.Fatal(err)
@@ -983,19 +1032,71 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 
 func replicaProcessArtifactsEmpty(path string) bool {
 	entries, err := os.ReadDir(path)
-	return errors.Is(err, os.ErrNotExist) || err == nil && len(entries) == 0
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		// An open repository retains its empty writer-lock inode. It is not
+		// an artifact; payloads, cursors, tombstones, and unknown files are.
+		info, err := entry.Info()
+		if err != nil || entry.Name() != "repository.lock" || !info.Mode().IsRegular() || info.Size() != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestReplicaProcessArtifactCleanupIgnoresOnlyEmptyWriterLock(t *testing.T) {
+	root := t.TempDir()
+	lock := filepath.Join(root, "repository.lock")
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !replicaProcessArtifactsEmpty(root) {
+		t.Fatal("empty writer lock was counted as a retained artifact")
+	}
+	if err := os.WriteFile(filepath.Join(root, "retained.cursor"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if replicaProcessArtifactsEmpty(root) {
+		t.Fatal("retained cursor was ignored")
+	}
+	other := t.TempDir()
+	if err := os.WriteFile(filepath.Join(other, "repository.lock"), []byte{1}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if replicaProcessArtifactsEmpty(other) {
+		t.Fatal("nonempty lock file was ignored")
+	}
 }
 
 func replicaProcessAllArtifactsEmpty(root string) bool {
 	for member := 1; member <= 3; member++ {
-		for _, suffix := range []string{"", "-secondary"} {
+		for _, identity := range []raftstore.Identity{replicaProcessIdentities()[0], replicaProcessSecondaryIdentities(replicaProcessIdentities())[0]} {
 			if !replicaProcessArtifactsEmpty(filepath.Join(root,
-				fmt.Sprintf("member-%d%s", member, suffix), "source-artifacts")) {
+				fmt.Sprintf("member-%d", member), "source-artifacts", replicaProcessSourceScope(replicaProcessGroup(identity)))) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+// Match the shipped multi-group source namespace using the complete group
+// identity; seeding the singleton root never reaches a multi-group provider.
+func replicaProcessSourceScope(group raftmember.GroupKey) string {
+	var canonical [72]byte
+	offset := copy(canonical[:], group.ClusterID[:])
+	offset += copy(canonical[offset:], group.ClusterIncarnation[:])
+	binary.BigEndian.PutUint64(canonical[offset:offset+8], group.TopologyRecoveryEpoch)
+	offset += 8
+	offset += copy(canonical[offset:], group.ShardIncarnation[:])
+	copy(canonical[offset:], group.GroupID[:])
+	digest := sha256.Sum256(canonical[:])
+	return fmt.Sprintf("%x", digest[:16])
 }
 
 func replicaProcessSeedAbandonment(t testing.TB, root string, group raftmember.GroupKey,
@@ -1018,7 +1119,12 @@ func replicaProcessSeedAbandonment(t testing.TB, root string, group raftmember.G
 		TargetMember: target.MemberID, TargetStore: target.StoreID,
 		TargetIncarnation: target.NodeIncarnation, ReplicaSetVersion: 1, SourceNode: source}
 	memberRoot := filepath.Join(root, "member-1")
-	repository, err := snapshottransfer.OpenRepository(filepath.Join(memberRoot, "source-artifacts"),
+	scope := replicaProcessSourceScope(group)
+	repositoryRoot := filepath.Join(memberRoot, "source-artifacts", scope)
+	if err := os.MkdirAll(repositoryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := snapshottransfer.OpenRepository(repositoryRoot,
 		snapshottransfer.Limits{MaxArtifacts: 8, MaxArtifactBytes: 1 << 30, MaxDiskBytes: 4 << 30})
 	if err != nil {
 		t.Fatal(err)
@@ -1031,7 +1137,7 @@ func replicaProcessSeedAbandonment(t testing.TB, root string, group raftmember.G
 	if err = repository.Close(); err != nil {
 		t.Fatal(err)
 	}
-	journal, err := snapshottransfer.OpenSourceFileJournal(filepath.Join(memberRoot, "source-exports"), 4096)
+	journal, err := snapshottransfer.OpenSourceFileJournal(filepath.Join(memberRoot, "source-exports", scope), 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1072,7 +1178,8 @@ func replicaProcessPublishAbandonment(t testing.TB, ctx context.Context,
 
 func replicaProcessRetainedAbandonmentBytes(root string) uint64 {
 	var total uint64
-	entries, _ := os.ReadDir(filepath.Join(root, "member-1", "source-artifacts"))
+	artifactRoot := filepath.Join(root, "member-1", "source-artifacts", replicaProcessSourceScope(replicaProcessGroup(replicaProcessIdentities()[0])))
+	entries, _ := os.ReadDir(artifactRoot)
 	for _, entry := range entries {
 		name := entry.Name()
 		if len(name) < 2 || name[1] != '-' || !strings.Contains("scptda", name[:1]) {

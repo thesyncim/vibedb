@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -41,6 +42,27 @@ func TestNativeLedgerCompletionBindsFixedIdentityWithoutAllocation(t *testing.T)
 	command, err := replication.OpenCommand(encoded)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Separate callers must not share the outer proposal waiter: only the
+	// inner replicated Create can determine which caller created the row.
+	first, err := client.appendOuterAttempt(nil, route, inner, innerBytes, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := client.appendOuterAttempt(nil, route, inner, innerBytes, [32]byte{1})
+	if err != nil || !bytes.Equal(first, retry) {
+		t.Fatalf("transport retry changed envelope: %v", err)
+	}
+	second, err := client.appendOuterAttempt(nil, route, inner, innerBytes, [32]byte{2})
+	if err != nil || bytes.Equal(first, second) {
+		t.Fatalf("independent Create callers shared envelope: %v", err)
+	}
+	for _, raw := range [][]byte{first, second} {
+		outer, err := replication.OpenCommand(raw)
+		if err != nil || !bytes.Equal(outer.RequestLedgerBytes(), innerBytes) || outer.ClientID != command.ClientID ||
+			outer.Kind() != command.Kind() || outer.AuthorityClass != command.AuthorityClass {
+			t.Fatalf("attempt changed inner Create or authority: %v", err)
+		}
 	}
 	result := replicatedstate.RequestLedgerCompletionResult{
 		Operation: inner.Operation, Phase: requestledger.PhasePlanning,

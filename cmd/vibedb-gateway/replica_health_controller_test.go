@@ -255,6 +255,25 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 		t.Fatalf("replay grant=%+v events=%v nodes=%x",
 			grantAuthority.grant, grantAuthority.events, installer.nodes)
 	}
+	// Reproduce a crash after grant publication but before set admission: the
+	// next confirmation window proposes a different ID for the same exact cut.
+	retained, err := gateway.BuildReplicaReplacementMembershipGrant(snapshot, intent.Plan.Group(),
+		[16]byte{0xee}, firstGrant.MetadataEpoch+1, intent.Plan.RetiringMember(), intent.Plan.TargetMember())
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantAuthority.grant = retained
+	grantAuthority.events, installer.nodes = nil, nil
+	if err := durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil || grantAuthority.grant != retained || len(installer.nodes) != 4 {
+		t.Fatalf("retained pre-admission grant did not resume: %v events=%v", err, grantAuthority.events)
+	}
+	// A grant for another descriptor must never be reused just because its
+	// source and target member numbers happen to match.
+	grantAuthority.grant.InitialDescriptorDigest[0] ^= 1
+	grantAuthority.events, installer.nodes = nil, nil
+	if err := durableSink.SubmitFailedReplicaMove(t.Context(), intent); !errors.Is(err, gateway.ErrReplicatedCatalogConflict) || len(installer.nodes) != 0 {
+		t.Fatalf("foreign retained grant accepted: %v nodes=%x", err, installer.nodes)
+	}
 }
 
 func TestReplicaHealthControllerStreamsIndependentCertifiedFailures(t *testing.T) {

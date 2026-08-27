@@ -76,6 +76,27 @@ type ReplicatedMoveExecution struct {
 	Proof                 [32]byte
 }
 
+// OpenReplicatedMoveExecution verifies the already-journaled execution cut.
+// A move-set publisher may combine siblings only after each one has frozen
+// its own exact publication action; a fresh observation alone is not enough.
+func OpenReplicatedMoveExecution(record gateway.ReplicatedOperationRecord, plan *Plan) (ReplicatedMoveExecution, bool) {
+	if plan == nil || !validReplicaMoveRecord(record, plan.OperationID()) || record.State != gateway.ReplicatedOperationRunning || record.Cursor[3] != replicaMoveCursorExecuting {
+		return ReplicatedMoveExecution{}, false
+	}
+	base := [32]byte{}
+	if plan.baseBound {
+		base = plan.baseDigest
+	}
+	if record.Proof != replicaMoveActionProof(plan.OperationID(), record.IntentDigest, base, record.Cursor) {
+		return ReplicatedMoveExecution{}, false
+	}
+	action := Action{Kind: ActionKind(record.Cursor[0]), Member: record.Cursor[1], CatalogGeneration: record.Cursor[2]}
+	if action.Kind == ActionRefreshCatalogFence {
+		action.ReplicaSetVersion = record.Cursor[4]
+	}
+	return ReplicatedMoveExecution{Action: action, PublicationApplied: record.Cursor[5], PublicationReplicaSet: record.Cursor[4], LeaderTerm: record.Cursor[6], SnapshotBaseDigest: base, Proof: record.Proof}, true
+}
+
 // ExecuteReplicatedMoveStep recovers one immutable move intent, derives exactly
 // one action from current durable evidence, journals it before execution, and
 // journals successful completion afterwards. The optional initial plan is used
@@ -188,7 +209,19 @@ func ExecuteReplicatedMoveStep(
 			sameReplicaMoveAction(record.Cursor, wanted) {
 			return action, nil
 		}
-		if record.State != gateway.ReplicatedOperationRunning {
+		// Atomic set admission can itself advance the catalog RF3 log. A
+		// still-planned action has never been dispatched, so its observation
+		// may advance at the same exact action/placement cut. Verify the old
+		// witness before publishing the replacement; an executing action must
+		// retain its original external idempotency tuple instead.
+		refreshPlanned := record.State == gateway.ReplicatedOperationPlanned &&
+			record.Cursor[3] == replicaMoveCursorReady &&
+			sameReplicaMoveAction(record.Cursor, wanted) &&
+			record.CatalogGeneration == cut.Catalog.Generation() &&
+			record.Cursor[4] == cut.Publication.ReplicaSetVersion &&
+			record.Cursor[5] <= cut.Publication.Applied && record.Cursor[6] <= cut.LeaderStatus.Term &&
+			record.Proof == replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor)
+		if record.State != gateway.ReplicatedOperationRunning && !refreshPlanned {
 			return Action{}, ErrReplicatedMove
 		}
 		next := record

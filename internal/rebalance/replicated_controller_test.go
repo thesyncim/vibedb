@@ -101,6 +101,63 @@ type fixedMoveObserver struct {
 	calls int
 }
 
+func TestReplicatedMoveSetAdmissionSurvivesCatalogAppliedAdvance(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	observer := &fixedMoveObserver{cut: ReplicatedMoveCut{Observation: Observation{
+		Catalog: catalog, Publication: raftmodel.Publication{Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf},
+		LeaderStatus: leaderStatus(1, 5),
+	}}}
+	record, err := PrepareReplicatedMoveRecord(t.Context(), plan, observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := &memoryMoveJournal{record: record, present: true}
+	// The atomic move-set admission itself advances the catalog group's
+	// applied index before Resume can execute its first planned action.
+	observer.cut.Publication.Applied++
+	observer.cut.LeaderStatus.Applied++
+	observer.cut.LeaderStatus.Commit++
+	executor := &moveActionExecutor{journal: journal}
+	action, err := ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor)
+	if err != nil || action.Kind != ActionAddLearner || len(executor.calls) != 1 || journal.record.Cursor[5] != observer.cut.Publication.Applied {
+		t.Fatalf("catalog admission stranded unexecuted move: action=%+v calls=%d cursor=%v err=%v", action, len(executor.calls), journal.record.Cursor, err)
+	}
+}
+
+func TestReplicatedMovePlannedRefreshRejectsUntrustedObservation(t *testing.T) {
+	for _, kind := range []string{"proof", "applied", "term", "replica-set", "action"} {
+		t.Run(kind, func(t *testing.T) {
+			plan, catalog := moveTestPlan(t)
+			observer := &fixedMoveObserver{cut: ReplicatedMoveCut{Observation: Observation{
+				Catalog: catalog, Publication: raftmodel.Publication{Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf},
+				LeaderStatus: leaderStatus(1, 5),
+			}}}
+			record, err := PrepareReplicatedMoveRecord(t.Context(), plan, observer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observer.cut.Publication.Applied++
+			switch kind {
+			case "proof":
+				record.Proof[0]++
+			case "applied":
+				observer.cut.Publication.Applied = 4
+			case "term":
+				observer.cut.LeaderStatus.Term--
+			case "replica-set":
+				observer.cut.Publication.ReplicaSetVersion++
+			case "action":
+				record.Cursor[0]++
+			}
+			journal := &memoryMoveJournal{record: record, present: true}
+			executor := &moveActionExecutor{journal: journal}
+			if _, err = ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor); err == nil || len(executor.calls) != 0 || journal.record.Revision != record.Revision {
+				t.Fatalf("invalid planned cut was refreshed: calls=%d revision=%d err=%v", len(executor.calls), journal.record.Revision, err)
+			}
+		})
+	}
+}
+
 func (observer *fixedMoveObserver) ObserveReplicaMove(
 	_ context.Context, _ OperationID, _ gateway.ReplicatedOperationRecord, _ *Plan,
 ) (ReplicatedMoveCut, error) {
@@ -361,6 +418,38 @@ func TestReplicatedMoveExecutionProofBindsEveryCommandFence(t *testing.T) {
 	assertChanged("member", plan, cut, nextAction)
 	bound := bindMoveTestPlan(plan)
 	assertChanged("snapshot base", bound, cut, action)
+}
+
+func TestOpenReplicatedMoveExecutionRequiresJournaledProof(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	intent, err := AppendReplicaMoveIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := ReplicatedMoveCut{Observation: Observation{Catalog: catalog,
+		Publication:  raftmodel.Publication{Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf},
+		LeaderStatus: leaderStatus(1, 5)}}
+	action := Action{Kind: ActionAddLearner, Member: plan.TargetMember()}
+	record := newReplicaMoveRecord(plan.OperationID(), catalog.Generation(), intent, plan, cut, action)
+	if _, ok := OpenReplicatedMoveExecution(record, plan); ok {
+		t.Fatal("planned action accepted")
+	}
+	record.State = gateway.ReplicatedOperationRunning
+	record.Cursor, record.Proof = replicaMoveActionWitness(plan.OperationID(), record.IntentDigest, plan, cut, action, replicaMoveCursorExecuting)
+	if execution, ok := OpenReplicatedMoveExecution(record, plan); !ok || execution.Action != action || execution.PublicationApplied != 5 {
+		t.Fatalf("journaled execution=%+v accepted=%t", execution, ok)
+	}
+	for index := range record.Cursor {
+		changed := record
+		changed.Cursor[index]++
+		if _, ok := OpenReplicatedMoveExecution(changed, plan); ok {
+			t.Fatalf("changed cursor %d accepted", index)
+		}
+	}
+	record.Proof[0]++
+	if _, ok := OpenReplicatedMoveExecution(record, plan); ok {
+		t.Fatal("forged proof accepted")
+	}
 }
 
 func TestReplicatedMoveControllerJournalsPostRemoveFenceRefresh(t *testing.T) {

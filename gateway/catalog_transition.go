@@ -214,7 +214,7 @@ func (s *Snapshot) indexDescriptors() []IndexDescriptor {
 			metadata := s.indexMetadata(table, ordinal)
 			descriptor := IndexDescriptor{
 				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
-				Table: metadata.Table, Name: metadata.Name, Relation: metadata.Relation,
+				Table: metadata.Table, Name: metadata.Name,
 				Paths:        make([]string, metadata.PathCount),
 				LocatorPaths: make([]string, metadata.LocatorCount),
 				Flags:        metadata.Flags, Lifecycle: metadata.Lifecycle,
@@ -222,6 +222,7 @@ func (s *Snapshot) indexDescriptors() []IndexDescriptor {
 			copy(descriptor.Paths, metadata.Paths[:metadata.PathCount])
 			copy(descriptor.LocatorPaths, metadata.LocatorPaths[:metadata.LocatorCount])
 			if metadata.Global() {
+				descriptor.Relation = metadata.Relation
 				program, _ := s.globalIndexPointerProgram(ordinal)
 				descriptor.PrimaryPath = metadata.LocatorPaths[program.primary]
 			}

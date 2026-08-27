@@ -8,6 +8,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/routegate"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 func TestRouteGateApplySettlementReopenAndExactRetry(t *testing.T) {
@@ -69,11 +70,44 @@ func TestRouteGateApplySettlementReopenAndExactRetry(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	var artifact bytes.Buffer
-	if _, err = WriteSnapshotArtifact(&artifact, readSnapshot, SnapshotArtifactOptions{}); err != nil {
+	manifest, err := WriteSnapshotArtifact(&artifact, readSnapshot, SnapshotArtifactOptions{})
+	if err != nil {
 		t.Fatalf("WriteSnapshotArtifact: %v", err)
+	}
+	base, err := BuildSnapshotBase(manifest, fixture.bootstrap)
+	if err != nil {
+		t.Fatalf("BuildSnapshotBase with retained route-gate rows: %v", err)
+	}
+	if _, err := OpenSnapshotBase(base); err != nil {
+		t.Fatalf("OpenSnapshotBase with retained route-gate rows: %v", err)
 	}
 	if err = readSnapshot.Close(); err != nil {
 		t.Fatal(err)
+	}
+	stageRoot := t.TempDir()
+	system := systemTargetOf(createTargetAt(t, stageRoot, "system", durable.Options{}).Collection)
+	user := createTargetAt(t, stageRoot, "user", durable.Options{})
+	stage, err := NewSnapshotArtifactStage(manifest, system, user, nil)
+	if err != nil {
+		t.Fatalf("stage with retained route-gate rows: %v", err)
+	}
+	if _, err := stage.Receive(bytes.NewReader(artifact.Bytes()), func([]byte) error { return nil }); err != nil {
+		t.Fatalf("receive route-gate artifact: %v", err)
+	}
+	stageLog, err := durable.NewTxnLog(stageRoot, durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stageLog.Close() })
+	staged, err := stage.OpenCandidate(fixture.bootstrap, stageLog, machineOptionsFor(user))
+	if err != nil {
+		t.Fatalf("reopen staged route-gate state: %v", err)
+	}
+	if status, err := staged.RouteGateStatus(); err != nil || status != outcome.Status {
+		t.Fatalf("staged gate status=%+v err=%v", status, err)
+	}
+	if pin, found, err := staged.RouteGatePin(identity); err != nil || !found || pin.Binding != binding {
+		t.Fatalf("staged gate pin=%+v found=%t err=%v", pin, found, err)
 	}
 	var headRows, pinRows, resultRows int
 	if _, err = VerifySnapshotArtifact(bytes.NewReader(artifact.Bytes()), SnapshotArtifactCallbacks{

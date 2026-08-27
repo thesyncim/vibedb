@@ -320,12 +320,29 @@ func TestSnapshotArtifactLiveCaptureRejectsCorruptionAndNoncanonicalFrames(t *te
 	}
 }
 
-func newReplicatedSnapshotStageFixture(t *testing.T) (
+func newReplicatedSnapshotStageFixture(t *testing.T, schema ...string) (
 	*ReplicatedSnapshotStage, *Database, *pb.Snapshot, []byte, []byte,
 ) {
 	t.Helper()
 	_, source, sourceBinding, _ := prepareReplicatedTestRoot(t, "snapshot-source", false)
 	t.Cleanup(func() { _ = source.Close() })
+	addSchema := func(database *Database) {
+		t.Helper()
+		if len(schema) == 0 {
+			return
+		}
+		session, err := database.NewSession(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		for _, statement := range schema {
+			if err := testRuntimeExec(session, statement, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	addSchema(source)
 	sourceIdentity := requireReplicatedShardStoreBind(t, source, sourceBinding, "docs")
 	bootstrap := snapshotStageBootstrap()
 	apply, _, err := source.OpenReplicatedApply(sourceIdentity, bootstrap, testReplicatedApplyOptions())
@@ -362,6 +379,7 @@ func newReplicatedSnapshotStageFixture(t *testing.T) (
 	}
 
 	_, target, targetBinding, _ := prepareReplicatedTestRoot(t, "snapshot-target", false)
+	addSchema(target)
 	targetBinding.MemberID = 10
 	targetBinding.StoreID[0]++
 	targetIdentity := requireReplicatedShardStoreBind(t, target, targetBinding, "docs")
@@ -378,6 +396,20 @@ func newReplicatedSnapshotStageFixture(t *testing.T) (
 		t.Fatalf("receive digest=%x cursor=%d err=%v", got.Digest, len(cursor), err)
 	}
 	return stage, target, bootstrap, bytes.Clone(artifact.Bytes()), bytes.Clone(cursor)
+}
+
+func TestReplicatedSnapshotStageRetainsSingletonLocalIndexProfile(t *testing.T) {
+	stage, target, bootstrap, _, _ := newReplicatedSnapshotStageFixture(t,
+		`CREATE INDEX by_value ON docs (value)`)
+	defer target.Close()
+	defer stage.Close()
+	activation, err := stage.Activate(bootstrap)
+	if err != nil || activation.Apply == nil {
+		t.Fatalf("activate indexed singleton snapshot: %v", err)
+	}
+	if _, err := stage.Activate(bootstrap); err != nil {
+		t.Fatalf("retry indexed singleton activation: %v", err)
+	}
 }
 
 func TestReplicatedSnapshotStageSameHandleFaultSettlement(t *testing.T) {

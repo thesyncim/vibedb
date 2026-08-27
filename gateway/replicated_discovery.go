@@ -120,6 +120,10 @@ func (executor *ReplicatedExecutor) discoverResponsiveLeader(
 			if result.response.State.LeaderID == endpoint.Member {
 				return endpoint, result.response.State, nil
 			}
+			// An authenticated follower without an observed leader is a
+			// retryable election cut even when another candidate is offline
+			// (including a not-yet-serving enrolled catalog target).
+			joined = errors.Join(joined, errReplicatedLeaderUnobserved)
 			startNext(result.response.State.LeaderID)
 		}
 	}

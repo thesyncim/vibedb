@@ -587,7 +587,7 @@ func (runner *DurableRequestLifecycleRunner) applyRoutePin(
 		return requestledger.HeadRecord{}, err
 	}
 	if result.Ledger.ResultCode != replicatedstate.ResultApplied {
-		return requestledger.HeadRecord{}, fmt.Errorf("gateway: ledger route transition %d result %d: %w", operation, result.Ledger.ResultCode, ErrDurableRequestConflict)
+		return requestledger.HeadRecord{}, fmt.Errorf("gateway: ledger route transition %d result %d (expected revision %d, observed %d, phase %d): %w", operation, result.Ledger.ResultCode, head.Revision, result.Ledger.Revision, result.Ledger.Phase, ErrDurableRequestConflict)
 	}
 	if operation == requestledger.OperationRecordRoutePinReleased {
 		return requestledger.MarkRoutePinReleased(head, next, head.Revision+1)

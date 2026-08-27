@@ -93,6 +93,8 @@ type ReplicatedCatalogAuthority struct {
 	pendingCatalog                     *Snapshot
 	pendingExpected                    uint64
 	pendingGrant                       membershipgrant.Grant
+	pendingReplacementSet              []membershipgrant.Grant
+	pendingReplacementSetPostRemove    bool
 	pendingPostRemoveReplicaSetVersion uint64
 	issuerGrants                       *replicatedIssuerGrantCache
 	routeSeed                          atomic.Pointer[replicatedCatalogRouteSeedTracker]
@@ -502,7 +504,7 @@ func (authority *ReplicatedCatalogAuthority) prepareCertifiedReplicaReplacementR
 	}
 	group, ok := replicaReplacementCandidateGroup(current, next)
 	if !ok {
-		return nil, nil, ErrReplicatedCatalogConflict
+		return authority.prepareCertifiedReplicaReplacementSetRead(ctx, current, next, nextRaw)
 	}
 	key, _ := replicatedReplicaReplacementReceiptKeys(group)
 	result, err := authority.readRaw(
@@ -945,6 +947,8 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 	}
 	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
 		authority.pendingCatalog = nil
+		authority.pendingReplacementSet = nil
+		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
@@ -952,6 +956,8 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 	}
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		authority.pendingCatalog = nil
+		authority.pendingReplacementSet = nil
+		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
@@ -961,18 +967,23 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		published := authority.pendingCatalog
 		expected := authority.pendingExpected
 		grant := authority.pendingGrant
+		set, setPostRemove := authority.pendingReplacementSet, authority.pendingReplacementSetPostRemove
 		postRemoveReplicaSetVersion := authority.pendingPostRemoveReplicaSetVersion
 		// RetryPending has now settled the durable command. Clear the local
 		// retry witness even when route-seed durability seals this authority;
 		// CompleteQuiescedHandoff must be able to retire a non-pending session.
 		authority.pendingCatalog = nil
+		authority.pendingReplacementSet = nil
+		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
 		if err = authority.observePublishedCatalog(published); err != nil {
 			return err
 		}
-		if postRemoveReplicaSetVersion != 0 && grant.Valid() {
+		if len(set) != 0 {
+			err = authority.holder.publishReplicaReplacementSetAfter(expected, published, set, setPostRemove)
+		} else if postRemoveReplicaSetVersion != 0 && grant.Valid() {
 			err = authority.holder.publishReplicaReplacementPostRemoveAfter(
 				expected, published, grant, postRemoveReplicaSetVersion,
 			)

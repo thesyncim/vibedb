@@ -42,6 +42,7 @@ func newGatewayReplicaMoveController(
 		return nil, rebalanceexec.ErrControllerConfig
 	}
 	executor, err := rebalanceexec.New(rebalanceexec.Options{
+		Directory: authority, Observer: controls.Observer,
 		Routes: controls.Routes, Grants: authority, Membership: controls.Membership,
 		Snapshots: controls.Snapshots, Bootstrap: controls.Bootstrap,
 		Awaiter: controls.Awaiter, Ownership: controls.Ownership,

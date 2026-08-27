@@ -7,6 +7,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
+	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,6 +22,46 @@ type routeGateReadClient struct {
 }
 
 type stalledRouteGateClient struct{ *routeGateReadClient }
+
+type electingRouteGateClient struct {
+	*routeGateReadClient
+	electionAt time.Time
+	probes     atomic.Int64
+}
+
+func (*electingRouteGateClient) parallelReplicatedDiscovery() {}
+
+func (client *electingRouteGateClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	if endpoint.Member == 1 {
+		return nil, io.EOF
+	}
+	if request.Operation == shardservice.ReplicatedProbe {
+		client.probes.Add(1)
+		state := client.states[endpoint.Address]
+		if time.Now().Before(client.electionAt) {
+			state.LeaderID = 0
+		}
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
+	}
+	return client.routeGateReadClient.DoReplicated(ctx, endpoint, request)
+}
+
+func TestReplicatedRouteGateWaitsForReplacementElection(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	for address, state := range states {
+		state.Applied, state.Commit = 11, 11
+		states[address] = state
+	}
+	client := &electingRouteGateClient{routeGateReadClient: &routeGateReadClient{states: states, status: routegate.Status{Epoch: 29}}, electionAt: time.Now().Add(80 * time.Millisecond)}
+	executor, err := NewReplicatedExecutor(client, 5, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ReadRouteGate(t.Context(), route, 7)
+	if err != nil || result.Status.Epoch != 29 || client.calls != 1 || result.Retries == 0 || client.probes.Load() > 10 {
+		t.Fatalf("gate read burned retries before election: result=%+v probes=%d calls=%d err=%v", result, client.probes.Load(), client.calls, err)
+	}
+}
 
 func (*stalledRouteGateClient) parallelReplicatedDiscovery() {}
 

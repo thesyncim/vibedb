@@ -113,6 +113,54 @@ func (pins *typedServicePinStop) AcquireOrRecover(
 
 type typedServiceRunnerStop struct{}
 
+type typedServiceAdvancePins struct {
+	ledger  *typedServiceLedger
+	calls   int
+	corrupt string
+}
+
+func (pins *typedServiceAdvancePins) AcquireOrRecover(_ context.Context, _ DurableRequestTypedExecutionContext) (ReplicatedRoute, executionpin.AcquireCertificate, executionpin.LeaseCertificate, error) {
+	pins.calls++
+	err := errTypedServicePin
+	if pins.calls == 1 {
+		previous := pins.ledger.head.Revision
+		pins.ledger.head.Revision += 2
+		switch pins.corrupt {
+		case "no-progress":
+			pins.ledger.head.Revision = previous
+		case "request":
+			pins.ledger.head.RequestDigest[0] ^= 1
+		case "plan":
+			pins.ledger.head.PlanRoot[0] ^= 1
+		}
+		err = &durableRequestAdvancedError{revision: previous + 2, applied: 2}
+	}
+	return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
+}
+
+func TestDurableRequestServiceResumesOnlyProvenExactRetryProgress(t *testing.T) {
+	for _, corrupt := range []string{"", "no-progress", "request", "plan"} {
+		t.Run(corrupt, func(t *testing.T) {
+			participants := durableFaultParticipants(t)
+			request := durableFaultRequest(t, participants)
+			ledger := new(typedServiceLedger)
+			pins := &typedServiceAdvancePins{ledger: ledger, corrupt: corrupt}
+			service, err := newDurableRequestService(durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, pins)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.Execute(t.Context(), request)
+			if corrupt == "" {
+				if !errors.Is(err, errTypedServicePin) || pins.calls != 2 {
+					t.Fatalf("exact advanced head did not resume: calls=%d err=%v", pins.calls, err)
+				}
+			} else if !errors.Is(err, ErrDurableRequestUnresolved) || pins.calls != 1 {
+				t.Fatalf("unproven retry progress accepted: calls=%d err=%v", pins.calls, err)
+			}
+		})
+	}
+}
+
 func (typedServiceRunnerStop) RunTyped(
 	context.Context,
 	DurableRequestTypedExecutionContext,

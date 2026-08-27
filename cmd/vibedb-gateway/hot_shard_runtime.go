@@ -244,6 +244,7 @@ func (runtime *gatewayHotShardRuntime) rebuild(ctx context.Context) error {
 		return err
 	}
 	policy := hotshard.DefaultPolicy()
+	policy.Move.RequireEnrolledTarget = true
 	if runtime.operationsBound && runtime.operations.splits != nil && runtime.operations.moveRun == nil {
 		policy.DisableMoves = true
 	}

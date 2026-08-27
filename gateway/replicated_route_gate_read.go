@@ -45,6 +45,11 @@ func (executor *ReplicatedExecutor) ReadRouteGate(
 		if err != nil {
 			joined = errors.Join(joined, err)
 			preferred = 0
+			if errors.Is(err, errReplicatedLeaderUnobserved) && attempt+1 < executor.maxAttempts {
+				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+					return ReplicatedRouteGateReadResult{}, errors.Join(ErrReplicatedLeader, joined, waitErr)
+				}
+			}
 			continue
 		}
 		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{

@@ -508,6 +508,38 @@ func (service *DurableRequestService) drive(
 	head requestledger.HeadRecord,
 	applied uint64,
 ) (DurableRequestOutcome, error) {
+	for {
+		outcome, err := service.driveOnce(ctx, home, key, head, applied)
+		var advanced *durableRequestAdvancedError
+		if !errors.As(err, &advanced) {
+			return outcome, err
+		}
+		if ctx.Err() != nil {
+			return DurableRequestOutcome{}, errors.Join(err, ctx.Err())
+		}
+		next, ack, nextApplied, readErr := service.openHead(ctx, home, key.RequestKey, max(applied, advanced.applied))
+		if readErr == nil && ack.Revision != 0 {
+			return DurableRequestOutcome{Acknowledged: true}, ErrDurableRequestAcknowledged
+		}
+		if readErr != nil || next.Key != head.Key || next.KeyDigest != head.KeyDigest ||
+			next.RequestDigest != head.RequestDigest || next.PlanRoot != head.PlanRoot ||
+			next.Revision < advanced.revision || next.Revision <= head.Revision {
+			return DurableRequestOutcome{}, errors.Join(err, readErr, ErrDurableRequestUnresolved)
+		}
+		// Strict durable revision progress and the caller's deadline bound this
+		// loop. Rebuild all execution state from the retained recipe, never from
+		// the losing invocation's route pin or partially staged payload.
+		head, applied = next, nextApplied
+	}
+}
+
+func (service *DurableRequestService) driveOnce(
+	ctx context.Context,
+	home DurableRequestLedgerHome,
+	key DurableRequestLedgerKey,
+	head requestledger.HeadRecord,
+	applied uint64,
+) (DurableRequestOutcome, error) {
 	if head.Phase == requestledger.PhaseTerminal {
 		terminal, _, err := service.readTerminal(ctx, home, key.RequestKey, applied)
 		if err != nil {
@@ -604,6 +636,10 @@ func (service *DurableRequestService) drive(
 			return DurableRequestOutcome{}, errors.Join(retireErr, ErrDurableRequestUnresolved)
 		}
 		return durableRequestTypedOutcome(terminal.Terminal)
+	}
+	var advanced *durableRequestAdvancedError
+	if errors.As(runErr, &advanced) {
+		return DurableRequestOutcome{}, runErr
 	}
 	after, ack, nextApplied, readErr := service.openHead(ctx, home, key.RequestKey, applied)
 	if readErr == nil && ack.Revision != 0 {

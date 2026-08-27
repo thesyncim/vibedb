@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -63,7 +64,16 @@ func (client *ReplicatedRequestLedgerRF3) Apply(
 		return ReplicatedRequestLedgerApplyResult{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	route := home.borrowedRoute()
-	outer, err := client.appendOuter(nil, route, view, inner)
+	var attempt [32]byte
+	if view.Operation == requestledger.OperationCreate {
+		// A new caller must reach the inner Create CAS, not join a previous
+		// caller's outer proposal waiter and inherit its Created=true result.
+		// Transport retries below retain this same envelope byte-for-byte.
+		if _, err := rand.Read(attempt[:]); err != nil {
+			return ReplicatedRequestLedgerApplyResult{}, err
+		}
+	}
+	outer, err := client.appendOuterAttempt(nil, route, view, inner, attempt)
 	if err != nil {
 		return ReplicatedRequestLedgerApplyResult{}, err
 	}
@@ -119,11 +129,24 @@ func (client *ReplicatedRequestLedgerRF3) appendOuter(
 	inner requestledger.CommandView,
 	raw []byte,
 ) ([]byte, error) {
+	return client.appendOuterAttempt(dst, route, inner, raw, [32]byte{})
+}
+
+func (client *ReplicatedRequestLedgerRF3) appendOuterAttempt(dst []byte, route ReplicatedRoute, inner requestledger.CommandView, raw []byte, attempt [32]byte) ([]byte, error) {
 	if client == nil || !validReplicatedRoute(route) || len(raw) == 0 ||
 		len(raw) > requestledger.MaxCommandBytes {
 		return dst, ErrDurableRequest
 	}
 	fingerprint, retryHome, epoch, sequence := replicatedRequestLedgerProposalIdentity(inner, raw)
+	if attempt != ([32]byte{}) {
+		var identity [64]byte
+		copy(identity[:32], fingerprint[:])
+		copy(identity[32:], attempt[:])
+		fingerprint = sha256.Sum256(identity[:])
+		copy(retryHome[:], fingerprint[:len(retryHome)])
+		epoch = max(uint64(1), binary.LittleEndian.Uint64(fingerprint[8:16]))
+		sequence = max(uint64(1), binary.LittleEndian.Uint64(fingerprint[16:24]))
+	}
 	command := replication.Command{
 		Kind:           replication.CommandRequestLedger,
 		AuthorityClass: replication.CommandAuthorityRequestLedger,

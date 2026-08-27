@@ -140,6 +140,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		observed, bindErr := bindReplicatedObservation(route, endpoint, response)
 		if bindErr != nil || response.State.LeaderID != endpoint.Member {
 			joined = errors.Join(joined, bindErr)
+			if bindErr == nil {
+				joined = errors.Join(joined, errReplicatedLeaderUnobserved)
+			}
 			continue
 		}
 		// This is an ephemeral control reachability set, never a published

@@ -964,7 +964,7 @@ func newReplicatedCatalogGateway(
 			Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID,
 			RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: relation},
 			Journal: journal, ProposalCapability: serviceauthz.CapabilityTopology,
-			MaxRelationBatches: 1, MaxMutations: 4,
+			MaxRelationBatches: 1, MaxMutations: gateway.MaxReplicatedCatalogBatchMutations,
 			InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 		})
 	}

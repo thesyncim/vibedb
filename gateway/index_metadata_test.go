@@ -46,6 +46,13 @@ func TestIndexMetadataRoundTripAndDefensiveCopy(t *testing.T) {
 	if metadata.Paths[2] != "" || metadata.Paths[3] != "" {
 		t.Fatalf("unused fixed paths = %q/%q, want empty", metadata.Paths[2], metadata.Paths[3])
 	}
+	rebuilt, err := NewSnapshotWithIndexes(snapshot.config, snapshot.endpoints, 12, snapshot.indexDescriptors())
+	if err != nil {
+		t.Fatalf("rebuild local index metadata for catalog transition: %v", err)
+	}
+	if got, ok := rebuilt.Index(metadata.Table, metadata.Name); !ok || got != metadata {
+		t.Fatalf("catalog transition changed local index: %+v", got)
+	}
 
 	path := filepath.Join(t.TempDir(), "catalog.json")
 	if err := SaveSnapshot(path, snapshot); err != nil {

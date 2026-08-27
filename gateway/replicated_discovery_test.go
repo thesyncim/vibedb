@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -12,6 +13,45 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+type electionWithOfflinePeerClient struct {
+	states map[string]shardservice.ReplicatedMemberState
+	probes atomic.Int64
+}
+
+func (*electionWithOfflinePeerClient) parallelReplicatedDiscovery() {}
+
+func (client *electionWithOfflinePeerClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint,
+	_ *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if endpoint.Member != 2 {
+		return nil, io.EOF
+	}
+	state := client.states[endpoint.Address]
+	if client.probes.Add(1) == 1 {
+		state.LeaderID = 0
+	}
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
+}
+
+func TestCatalogDiscoveryRetriesElectionWithOfflinePeer(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	route.Distribution, route.Shard = ReplicatedCatalogDistribution, ReplicatedCatalogShard
+	client := &electionWithOfflinePeerClient{states: states}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := executor.catalogOperationalRoute(t.Context(), route, nil)
+	if err != nil || observed.Command != route.Command || client.probes.Load() != 2 {
+		t.Fatalf("one offline peer suppressed a bounded election retry: route=%+v probes=%d err=%v", observed, client.probes.Load(), err)
+	}
+	client.probes.Store(0)
+	executor.maxAttempts = 1
+	if _, err = executor.catalogOperationalRoute(t.Context(), route, nil); !errors.Is(err, errReplicatedLeaderUnobserved) || !errors.Is(err, io.EOF) {
+		t.Fatalf("exhausted sweep lost election/transport causes: %v", err)
+	}
+}
 
 func TestAuthenticatedReplicatedColdDiscoveryCancelsStalledProbe(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)

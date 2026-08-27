@@ -146,6 +146,8 @@ type SourceRetirer interface {
 }
 
 type Options struct {
+	Directory  MoveDirectory
+	Observer   rebalance.ReplicatedMoveObserver
 	Routes     MoveRouteResolver
 	Grants     membershipgrant.Source
 	Membership MembershipClient
@@ -356,6 +358,9 @@ func (executor *Executor) executeCatalog(
 	plan *rebalance.Plan,
 	execution rebalance.ReplicatedMoveExecution,
 ) error {
+	if handled, err := executor.executeCatalogSet(ctx, operation, plan, false); handled {
+		return err
+	}
 	grant, found, err := executor.options.Grants.ReadMembershipGrant(ctx, plan.Group())
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
@@ -405,6 +410,9 @@ func (executor *Executor) executeCatalogRefresh(
 	plan *rebalance.Plan,
 	execution rebalance.ReplicatedMoveExecution,
 ) error {
+	if handled, err := executor.executeCatalogSet(ctx, operation, plan, true); handled {
+		return err
+	}
 	grant, found, err := executor.options.Grants.ReadMembershipGrant(ctx, plan.Group())
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)

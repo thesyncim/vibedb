@@ -308,6 +308,7 @@ func (d *Database) OpenReplicatedSnapshotStage(
 	}
 	var stage *replicatedstate.SnapshotArtifactStage
 	if expected.RelationCount == 1 {
+		stageOptions.LocalIndexes = relations[0].LocalIndexes
 		stage, err = replicatedstate.NewSnapshotArtifactStageWithOptions(
 			manifest, systemTarget, relations[0].Target, persistedCursor, stageOptions,
 		)

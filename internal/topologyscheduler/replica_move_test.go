@@ -102,6 +102,33 @@ func TestSelectReplicaMovesAccountsForSiblingReservations(t *testing.T) {
 	}
 }
 
+func TestReplicaMoveRequiresExactEnrolledTarget(t *testing.T) {
+	endpoints := replicaMoveEndpoints("source", "follower", "node-c", "node-d")
+	catalog, sources := replicaMoveCatalog(t, 1, []distribution.EndpointID{"source", "follower"}, endpoints)
+	candidates := []ReplicaMoveCandidate{replicaMoveCandidate(sources[0], 300, 100)}
+	nodes := []NodeCapacity{replicaMoveNode("source", 1, 900), replicaMoveNode("follower", 2, 300),
+		replicaMoveNode("node-c", 3, 100), replicaMoveNode("node-d", 4, 200)}
+	policy := DefaultReplicaMovePolicy()
+	var workspace ReplicaMoveWorkspace
+	advisory, err := SelectReplicaMoves(catalog, candidates, nodes, policy, &workspace)
+	if err != nil || advisory.Count() != 1 {
+		t.Fatalf("advisory selection: %+v %v", advisory, err)
+	}
+	policy.RequireEnrolledTarget = true
+	if _, err := ResolveReplicaMove(catalog, candidates, nodes, policy, advisory, 0); err == nil {
+		t.Fatal("changed enrollment policy reused an advisory cut")
+	}
+	strict, err := SelectReplicaMoves(catalog, candidates, nodes, policy, &workspace)
+	if err != nil || strict.Count() != 0 || strict.Invalid != 1 {
+		t.Fatalf("unenrolled group admitted: %+v %v", strict, err)
+	}
+	manifest, _ := catalog.Manifest(sources[0].Distribution)
+	target, found := chooseReplicaMoveTarget(manifest, 0, 0, 900_000, 600_000, &candidates[0], nodes, policy, &workspace, "node-d")
+	if !found || nodes[target].Endpoint != "node-d" {
+		t.Fatalf("selected foreign spare: %d %t", target, found)
+	}
+}
+
 func TestSelectReplicaMovesRejectsRemainingFailureDomainCollision(t *testing.T) {
 	endpoints := replicaMoveEndpoints("source", "follower-a", "follower-b", "node-c")
 	catalog, sources := replicaMoveCatalog(
