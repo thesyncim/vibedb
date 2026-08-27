@@ -27,6 +27,8 @@ Start with the page that matches your task.
 - [Offline verification, salvage, and repack](operations/verification.md)
 - [Start a local replicated cluster](operations/distributed-quickstart.md)
 - [Distributed runtime](operations/distributed.md)
+- [Observe a distributed cluster](operations/observability.md)
+- [Back up and restore distributed data](operations/backup-restore.md)
 - [Roll out a replicated schema](operations/schema-rollouts.md)
 - [Replica lifecycle](operations/replica-lifecycle.md)
 - [Kubernetes RF3 test lane](operations/kubernetes.md)

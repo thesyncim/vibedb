@@ -46,6 +46,12 @@ service for replicated-catalog mode and fails startup if its catalog,
 request-ledger, execution-pin, or ACK authority is incomplete. An application
 principal should receive only the data or schema operations it needs.
 
+An operator principal with `topology` capability can read the gateway's
+bounded process counters with `{"op":"metrics"}`. See
+[Observe a distributed cluster](observability.md). This currently covers
+routing, fan-out, result volume, and retries; it is not yet a complete
+proposal/quorum/apply/WAL/snapshot/controller metrics surface.
+
 ## Catalog authority
 
 The bootstrap catalog contains the distribution definitions, table placement,
@@ -320,7 +326,8 @@ Current operating gaps include:
   only after an authenticated explicit ACK and contiguous issuer collection.
 - General public DDL beyond the experimental exact schema rollout command
 - A public move, live-status, or leader-transfer CLI
-- Live RF3 backup/restore procedures
+- Live RF3 backup/restore. Replica bootstrap artifacts are target-bound move
+  state and are not backups; see [Back up and restore distributed data](backup-restore.md).
 - A mixed-build rolling disk- and wire-format upgrade or migration policy.
   Only the exact same-build pre-release restart boundary is qualified. See
   [Unreleased compatibility and rolling restarts](unreleased-compatibility.md).

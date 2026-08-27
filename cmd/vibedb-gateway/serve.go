@@ -108,6 +108,7 @@ type serveResponse struct {
 	Committed      bool                            `json:"committed,omitempty"`
 	OutcomeUnknown bool                            `json:"outcome_unknown,omitempty"`
 	DurableAck     *durableExecBatchAckWireRequest `json:"-"`
+	Metrics        *gateway.MetricsSnapshot        `json:"metrics,omitempty"`
 	Error          string                          `json:"error,omitempty"`
 }
 
@@ -1219,6 +1220,19 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			}
 			continue
 		}
+		if req.Op == "metrics" {
+			if !validGatewayMetricsRequest(req) {
+				if writeServeResponse(writer, &serveResponse{Error: "invalid metrics request"}) != nil {
+					return
+				}
+				continue
+			}
+			metrics := exec.Metrics()
+			if writeServeResponse(writer, &serveResponse{Metrics: &metrics}) != nil {
+				return
+			}
+			continue
+		}
 		if req.Op == "exec_batch" {
 			// The public RF3 batch endpoint is durable-only. Raw identity-field
 			// presence must never be inferred from decoded nonzero values: an
@@ -1323,6 +1337,9 @@ func skipNativeJSONSpace(source []byte, index int) int {
 func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
 	if request == nil {
 		return 0
+	}
+	if request.Op == "metrics" {
+		return serviceauthz.CapabilityTopology
 	}
 	var required serviceauthz.Capability
 	if request.SQL != "" {
@@ -1492,6 +1509,11 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 			return err
 		}
 		if err := writeDurableExecBatchAckHexField(w, "ack_token", ack.AckToken[:]); err != nil {
+			return err
+		}
+	}
+	if resp.Metrics != nil {
+		if err := writeGatewayMetrics(w, *resp.Metrics); err != nil {
 			return err
 		}
 	}
