@@ -81,7 +81,8 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	}
 	leader, states := data.waitLeader(t, []int{0, 1, 2}, 15*time.Second)
 	data.waitDocument(t, leader, states[leader], "restored-row", 5*time.Second)
-	restoreRF3ReadRelation(t, data, leader, states[leader], 2, []byte{0x91, 0x01, 'r'}, []byte("[\"restored-row\"]"), true)
+	restoredIndexKey, restoredLocator := restoreRF3IndexEntry(t, "restored-email", "restored-row")
+	restoreRF3ReadRelation(t, data, leader, states[leader], 2, restoredIndexKey, restoredLocator, true)
 	command := data.command(states[leader], 0, 1, sha256.Sum256([]byte("restored-data-session")), nil)
 	command.Distribution, command.Shard = "items", "items-0"
 	command.Kind = replication.CommandSessionOpen
@@ -95,7 +96,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	states[leader] = data.probe(t, leader)
 	command = data.command(states[leader], completion.ClientEpoch, 2, sha256.Sum256([]byte("acknowledged-after-restore")), []replication.Mutation{{Kind: replication.MutationPut, Key: rf3FaultKey(t, "acknowledged-after-restore"), Value: []byte("{\"id\":\"acknowledged-after-restore\"}")}})
 	command.Distribution, command.Shard = "items", "items-0"
-	newIndexKey, newLocator := []byte{0x91, 0x01, 'a'}, []byte(`["acknowledged-after-restore"]`)
+	newIndexKey, newLocator := restoreRF3IndexEntry(t, "new-email", "acknowledged-after-restore")
 	command.Batches = append(command.Batches, replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
 		Kind: replication.MutationPutAbsentOrEqual, Key: newIndexKey, Value: newLocator,
 	}}})
@@ -117,7 +118,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	data.waitDocument(t, newLeader, liveStates[newLeader], "restored-row", 5*time.Second)
 	data.waitDocument(t, newLeader, liveStates[newLeader], "acknowledged-after-restore", 5*time.Second)
 	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, newIndexKey, newLocator, true)
-	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, []byte{0x91, 0x01, 'r'}, []byte("[\"restored-row\"]"), true)
+	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, restoredIndexKey, restoredLocator, true)
 	failoverLatency := time.Since(failoverStarted)
 	data.restart(t, leader)
 	restoreRF3AssertClosed(t, data, leader)
@@ -130,7 +131,7 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 	newLeader, liveStates = data.waitLeader(t, []int{0, 1, 2}, 15*time.Second)
 	data.waitDocument(t, newLeader, liveStates[newLeader], "acknowledged-after-restore", 5*time.Second)
 	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, newIndexKey, newLocator, true)
-	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, []byte{0x91, 0x01, 'r'}, []byte("[\"restored-row\"]"), true)
+	restoreRF3ReadRelation(t, data, newLeader, liveStates[newLeader], 2, restoredIndexKey, restoredLocator, true)
 	rssFinal, walFinal := restoreRF3Resources(t, fixtures)
 	storageFinal := restoreRF3AllocatedBytes(t, options.Installer.(*restoreRF3Installer).root)
 	if time.Since(started) > 120*time.Second || writeLatency > 5*time.Second || failoverLatency > 20*time.Second {
@@ -509,9 +510,10 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 				Kind: replication.MutationPut, Key: rf3FaultKey(t, "source-catalog-sentinel"), Value: []byte(`{"id":"source-catalog-sentinel"}`),
 			}}}}
 		} else {
+			indexKey, locator := restoreRF3IndexEntry(t, "restored-email", "restored-row")
 			cmd.Batches = []replication.RelationMutationBatch{
 				{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: rf3FaultKey(t, "restored-row"), Value: []byte("{\"id\":\"restored-row\"}")}}},
-				{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{0x91, 0x01, 'r'}, Value: []byte("[\"restored-row\"]")}}}}
+				{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual, Key: indexKey, Value: locator}}}}
 		}
 		encoded, err = replication.AppendCommand(nil, cmd)
 		if err != nil {
@@ -541,6 +543,20 @@ func restoreRF3SourceArtifact(t *testing.T, root string, ordinal int, schema res
 		t.Fatal(err)
 	}
 	return artifact.Bytes(), manifest, fence
+}
+
+func restoreRF3IndexEntry(t *testing.T, indexValue, locator string) ([]byte, []byte) {
+	t.Helper()
+	key, err := distribution.CurrentTupleCodec.AppendTuple(nil, []distribution.Scalar{distribution.NewString(indexValue)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locatorValues := []string{locator}
+	value, err := vibejson.Marshal(&locatorValues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, value
 }
 
 func restoreRF3AssertClosed(t *testing.T, fixture *rf3FaultFixture, member int) {
