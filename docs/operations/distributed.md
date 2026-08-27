@@ -202,6 +202,14 @@ operation identity. A narrower retained range does not rewrite its original
 machine validation profile. Co-located global-index relations do not count as
 additional base tables when selecting a source.
 
+Schema-bundle preparation does not yet enable online splitting of a shard
+containing global-index relations. Plan validation rejects distinct global-index
+tables; child artifact export still reads only the base collection, tail
+records lack relation IDs, and retained pruning rejects index relations.
+Relation-aware snapshot partitioning, tail replay, and pruning must be composed
+before that guard can safely change. Global-index writes and atomic relation
+apply are separate supported paths, not evidence that this split path is complete.
+
 Serving startup can reconstruct certified adopted groups from a fixed-size live
 inventory and exact receipt references, without scanning operation history.
 An unfinished split reuses an already adopted child instead of reopening its

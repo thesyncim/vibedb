@@ -181,6 +181,9 @@ preparation uses the gateway's explicit `split_sources` inventory, including
 the actual prepared SQL identity, local-index definitions, and immutable
 placement profile. The composed Linux serving-split gate remains unqualified. See
 [Online range-split status](distributed.md#online-range-split-status).
+In particular, preparing a global-index schema does not enable its online
+split: relation-aware artifact export, tail replay, and retained pruning are
+not yet integrated, and those plans fail closed.
 
 A manually configured gateway-backed test needs catalog, request-ledger, and
 data groups. Role replicas can share one multi-group process or run as nine

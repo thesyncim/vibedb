@@ -555,10 +555,18 @@ command-composed through its separate resumable controller. A merge planner
 remains absent.
 
 The serving manifest carries a private child registry per group and one shared
-operation-admission ceiling. This does not complete child schema provisioning:
-the command still provisions singleton base relations, and hot admission still
-has one split template rather than a per-source-group template. Multi-relation
-and heterogeneous multi-group split qualification remains incomplete.
+operation-admission ceiling. Child preparation accepts exact base/local/global
+schema bundles, and hot admission selects an explicit per-source template.
+This is not a completed globally indexed split path: plan validation rejects
+distinct global-index relation tables, artifacts export the base collection,
+tail transitions have no relation ID, and retained pruning rejects index
+relations. The missing composition must partition one coherent snapshot cut,
+retain exact relation IDs and kinds through replay, and prune every relation
+under the same certified cut. Global-index rows use their canonical storage
+keys for placement, not the base row's point or locator. Existing bundle
+snapshot primitives do not by themselves provide this lifecycle. First serving
+split, repeated descendant capture, and multi-relation Linux qualification
+remain incomplete.
 
 ## Replication kernel
 
