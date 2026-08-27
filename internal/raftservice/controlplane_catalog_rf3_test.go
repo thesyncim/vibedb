@@ -405,11 +405,16 @@ func processControlPlaneSnapshot(
 		}
 	}
 	dataManifestDigest := sha256.Sum256([]byte("rf3-process-data-relation-manifest"))
+	rangeIdentity, lineageDigest, forwardingRuleDigest := processRF3DescriptorIdentity(
+		processGroup(), shardID, 7,
+	)
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
 		config, endpoints, generation, nil, nil, []gateway.ReplicatedShardDescriptor{{
 			Distribution: distributionName, Shard: shardID,
 			Group: processGroup(), AllocationGeneration: 7,
-			Command: processCommandFence(dataManifestDigest), Replicas: replicas,
+			Command: processCommandFence(dataManifestDigest), RangeIdentity: rangeIdentity,
+			LineageDigest: lineageDigest, ForwardingRuleDigest: forwardingRuleDigest,
+			Replicas: replicas,
 		}},
 	)
 	if err != nil {
