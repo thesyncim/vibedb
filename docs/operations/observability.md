@@ -35,6 +35,7 @@ build maps, strings, or a generic JSON tree.
 | Snapshot transfer | RF3 owner reports completed snapshot application; transfer service and repository expose connection, resident/in-flight byte, chunk, artifact, and disk-byte cuts | Snapshot-apply count is in the shard-control frame; transfer/repository gauges are not yet exported |
 | Checkpoint and WAL | durable publications, state certificates, WAL bounds, and retention witnesses exist | No general metrics endpoint |
 | Split and move | replicated operation records and controller observations expose durable phase progress | Used by controllers; no general metrics endpoint |
+| Live backup | backup service reports requests, faults, logical artifact bytes, and snapshot scan bytes | Internal fixed atomics; not yet included in the operator metrics frame |
 
 `internal/servicemetrics.Client` retrieves the fixed 96-byte RF3 owner snapshot
 over the mutually authenticated shard-control traffic class. The peer must
@@ -63,3 +64,10 @@ Observability must remain downstream of correctness and off the hot path:
 - collectors bound concurrency, response bytes, and scrape time;
 - telemetry failure never authorizes routing, membership, split, move, cleanup,
   or acknowledgement.
+
+Live backup reports logical artifact bytes separately from snapshot scan bytes.
+The current deterministic hash-before-stream design reads the pinned image
+twice, so the scan counter advances by exactly 2× encoded artifact bytes. This
+is explicit read amplification; the repository does not create a second
+artifact disk copy. Any future one-pass framing change must preserve the exact
+header/hash contract and update this evidence rather than hiding the scan.

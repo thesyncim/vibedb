@@ -3,20 +3,29 @@
 VibeDB does not yet ship a safe live RF3 cluster backup or restore command.
 This is an explicit unreleased boundary, not an invitation to copy live files.
 
-The `internal/clusterbackup` boundary now certifies one complete catalog group
+The shipped RF3 shard process now exposes a target-free live snapshot stream
+over its mutually authenticated control listener. Only an independent
+`backup` principal is admitted. The serving leader obtains a quorum
+`ReadIndex`, pins the reached apply cut, scans it once to derive artifact
+geometry and hash, then scans the same immutable cut again while streaming.
+It never invents learner member/store/incarnation identity.
+
+The `internal/clusterbackup` boundary certifies one complete catalog group
 inventory against exact per-group snapshot index/term, lineage, relation
 manifest, artifact hash/bytes, and artifact-manifest digest. The canonical
 certificate has a 16 MiB total byte bound; group count is derived from that
 bound rather than an arbitrary participant limit. Restore admission requires
 the complete ordered verified-artifact vector and returns only a non-serving
-staging permit for a new cluster identity. It cannot mint a member, store,
+staging permit for a new cluster identity. Its repository streams leader
+exports into operation-scoped drafts without a second artifact copy and
+publishes the certificate last. It cannot mint a member, store,
 ownership epoch, route generation, or membership grant.
 
 Authorization uses the independent `backup` policy capability. A backup
 principal does not acquire data read/write, schema, topology, membership,
 delegation, transaction-recovery, request-ledger, execution-pin, or serving
-authority. The internal gateway controller still uses its separate topology
-identity when it conditionally advances the catalog-RF3 operation record.
+authority. The gateway backup controller rechecks backup authority whenever it
+conditionally advances the catalog-RF3 operation record.
 
 ## Why replica snapshots are not backups
 
@@ -82,8 +91,12 @@ A live command is complete only when an external kill/partition test proves:
 - bounded foreground p99.9 impact, memory, network, WAL retention, and artifact
   space amplification.
 
-The exact remaining composition is a catalog-RF3 operation record and
-controller that drives artifact export/retention for every certified group,
-persists the certificate before release, transfers it to backup storage, and
-uses the staging permit to build new roots before a separate catalog bootstrap
-grants serving authority. No existing command performs those steps yet.
+The catalog-RF3 operation record, complete live collector, durable repository,
+full artifact verifier, and non-serving staging-root builder are now composed
+internally. External process exit before certificate publication and stalled
+network-stream gates prove fail-closed recovery. What remains is an operator
+command/API that resolves current group leaders and invokes this controller,
+plus restore activation: generate fresh member/store/node identities, install
+every staged group, and publish one catalog-backed one-time activation witness
+before any restored process receives serving authority. No command claims
+that final activation today.
