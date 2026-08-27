@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"math"
 	"net"
 	"time"
 
@@ -17,8 +18,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
-
-const rf3SplitPruneLease = 5 * time.Minute
 
 type rf3RetainedPruneFactory struct {
 	tls       *rafttransport.PeerTLS
@@ -34,8 +33,11 @@ func (factory *rf3RetainedPruneFactory) OpenSourceCaptureActivationProposer(
 		return nil, nil, errRF3Serving
 	}
 	session, release, err := openRF3SplitTopologySession(
-		ctx, plan, observed.Catalog, observed.SourceState.Binding,
+		ctx, observed.Catalog, observed.SourceState.Binding,
 		factory.tls, factory.authority, factory.lease,
+		splitcontroller.SourceCaptureClientID(plan.OperationID()),
+		splitcontroller.SourceCaptureTenant(plan.OperationID()),
+		[]byte("vibedb/split-capture/retry-home\x00"), true,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -59,8 +61,11 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 		return nil, nil, errRF3Serving
 	}
 	session, release, err := openRF3SplitTopologySession(
-		ctx, plan, observed.Catalog, observed.SourceState.Binding,
+		ctx, observed.Catalog, observed.SourceState.Binding,
 		factory.tls, factory.authority, factory.lease,
+		splitcontroller.RetainedPruneClientID(plan.OperationID()),
+		splitcontroller.RetainedPruneTenant(plan.OperationID()),
+		[]byte("vibedb/split-prune/retry-home\x00"), false,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -77,14 +82,18 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 
 func openRF3SplitTopologySession(
 	ctx context.Context,
-	plan *splitcontroller.Plan,
 	catalog *gateway.Snapshot,
 	binding replicatedstate.Binding,
 	tls *rafttransport.PeerTLS,
 	authority serviceauthz.Authority,
 	lease *splitcontroller.RuntimeStoreLease,
+	clientID replication.ID128,
+	tenant []byte,
+	retryDomain []byte,
+	capture bool,
 ) (*gateway.NativeSession, func() error, error) {
-	if ctx == nil || plan == nil || catalog == nil || tls == nil || lease == nil {
+	if ctx == nil || catalog == nil || tls == nil || lease == nil ||
+		clientID == (replication.ID128{}) || len(tenant) == 0 || len(retryDomain) == 0 {
 		return nil, nil, errRF3Serving
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
@@ -95,6 +104,9 @@ func openRF3SplitTopologySession(
 		return nil, nil, errRF3Serving
 	}
 	journalPath, err := lease.TopologySessionJournalPath()
+	if capture {
+		journalPath, err = lease.CaptureSessionJournalPath()
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,12 +127,12 @@ func openRF3SplitTopologySession(
 	if err != nil {
 		return nil, release, errors.Join(err, release())
 	}
-	operation := plan.OperationID()
-	clientID := splitcontroller.RetainedPruneClientID(operation)
-	retryDigest := sha256.Sum256(append([]byte("vibedb/split-prune/retry-home\x00"), operation[:]...))
+	retryInput := make([]byte, 0, len(retryDomain)+len(clientID))
+	retryInput = append(retryInput, retryDomain...)
+	retryInput = append(retryInput, clientID[:]...)
+	retryDigest := sha256.Sum256(retryInput)
 	var retryHome replication.RetryHome
 	copy(retryHome[:], retryDigest[:len(retryHome)])
-	tenant := splitcontroller.RetainedPruneTenant(operation)
 	journalBinding, err := gateway.NativeSessionJournalBinding(
 		route, string(binding.Distribution), string(binding.Shard), tenant, 1,
 		serviceauthz.CapabilityTopology,
@@ -155,7 +167,7 @@ func openRF3SplitTopologySession(
 		_, err = session.RetryPending(authorized)
 	}
 	if err == nil && !session.Status().Active {
-		_, err = session.Open(authorized, time.Now().Add(rf3SplitPruneLease).UnixNano())
+		_, err = session.Open(authorized, math.MaxInt64)
 	}
 	if err != nil {
 		return nil, release, errors.Join(err, release())

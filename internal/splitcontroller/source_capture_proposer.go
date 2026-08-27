@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -12,6 +13,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcapture"
 )
+
+var sourceCaptureClientDomain = []byte("vibedb/split-controller/source-capture-client\x00")
 
 // SourceCaptureActivationProposer durably settles one canonical activation on
 // the source RF3 group. Implementations must retain the exact bytes across an
@@ -44,8 +47,8 @@ func NewRF3SourceCaptureActivationProposer(
 	operation OperationID,
 	session *gateway.NativeSession,
 ) (*RF3SourceCaptureActivationProposer, error) {
-	clientID := RetainedPruneClientID(operation)
-	tenant := RetainedPruneTenant(operation)
+	clientID := SourceCaptureClientID(operation)
+	tenant := SourceCaptureTenant(operation)
 	if operation == (OperationID{}) || session == nil || clientID == (replication.ID128{}) ||
 		!session.Status().Active {
 		return nil, ErrInvalidPlan
@@ -97,3 +100,30 @@ func (p *RF3SourceCaptureActivationProposer) ProposeSourceCaptureActivation(
 }
 
 var _ SourceCaptureActivationProposer = (*RF3SourceCaptureActivationProposer)(nil)
+
+// SourceCaptureClientID is distinct from retained-prune authority because
+// capture is admitted on the parent route while prune runs after cutover on the
+// retained child's advanced route generation.
+func SourceCaptureClientID(operation OperationID) replication.ID128 {
+	var input [len("vibedb/split-controller/source-capture-client\x00") + sha256.Size]byte
+	copy(input[:], sourceCaptureClientDomain)
+	copy(input[len(sourceCaptureClientDomain):], operation[:])
+	sum := sha256.Sum256(input[:])
+	var id replication.ID128
+	copy(id[:], sum[:len(id)])
+	return id
+}
+
+// SourceCaptureTenant returns the printable operation-scoped activation
+// authority. It is stable across source leader replacement.
+func SourceCaptureTenant(operation OperationID) []byte {
+	const prefix = "split-capture:"
+	const hex = "0123456789abcdef"
+	var tenant [len(prefix) + 2*sha256.Size]byte
+	copy(tenant[:], prefix)
+	for index, value := range operation {
+		tenant[len(prefix)+2*index] = hex[value>>4]
+		tenant[len(prefix)+2*index+1] = hex[value&15]
+	}
+	return tenant[:]
+}

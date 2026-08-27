@@ -299,11 +299,18 @@ func TestRuntimeStoreLeaseOwnsExactTopologySessionJournal(t *testing.T) {
 	if got, pathErr := lease.TopologySessionJournalPath(); pathErr != nil || got != want {
 		t.Fatalf("path=%q want=%q err=%v", got, want, pathErr)
 	}
+	captureWant := filepath.Join(root, runtimeOperationName(operation), "capture-session")
+	if got, pathErr := lease.CaptureSessionJournalPath(); pathErr != nil || got != captureWant || got == want {
+		t.Fatalf("capture path=%q want=%q topology=%q err=%v", got, captureWant, want, pathErr)
+	}
 	if err = lease.Release(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = lease.TopologySessionJournalPath(); !errors.Is(err, ErrRuntimeStore) {
 		t.Fatalf("released lease path err=%v", err)
+	}
+	if _, err = lease.CaptureSessionJournalPath(); !errors.Is(err, ErrRuntimeStore) {
+		t.Fatalf("released capture path err=%v", err)
 	}
 }
 

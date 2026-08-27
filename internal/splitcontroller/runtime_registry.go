@@ -128,6 +128,17 @@ func OpenRuntimeStoreRegistry(
 // another operation. The operation directory must still be the exact regular
 // directory opened by the registry; replacement with a symlink fails closed.
 func (l *RuntimeStoreLease) TopologySessionJournalPath() (string, error) {
+	return l.sessionJournalPath("topology-session")
+}
+
+// CaptureSessionJournalPath returns the distinct pre-cutover capture-session
+// basename. It must not alias the post-cutover retained-prune session because
+// those authorities bind different route generations.
+func (l *RuntimeStoreLease) CaptureSessionJournalPath() (string, error) {
+	return l.sessionJournalPath("capture-session")
+}
+
+func (l *RuntimeStoreLease) sessionJournalPath(name string) (string, error) {
 	if l == nil {
 		return "", ErrRuntimeStore
 	}
@@ -141,7 +152,7 @@ func (l *RuntimeStoreLease) TopologySessionJournalPath() (string, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.Join(ErrRuntimeStore, err)
 	}
-	return filepath.Join(l.registry.rootPath, operation, "topology-session"), nil
+	return filepath.Join(l.registry.rootPath, operation, name), nil
 }
 
 func bindRuntimeRegistryManifest(root *os.Root, manifest [sha256.Size]byte) error {
