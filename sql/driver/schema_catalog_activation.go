@@ -93,6 +93,9 @@ func PublishedReplicatedSchemaActivationIdentity(
 		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false,
 			errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
+	if err := fencePublishedReplicatedSchemaCatalog(absolute); err != nil {
+		return ReplicatedShardStoreIdentity{}, ReplicatedApplyIdentity{}, false, err
+	}
 	return catalog.ReplicatedShardStore.Clone(), catalog.ReplicatedApply.identity(), true, nil
 }
 
@@ -185,7 +188,7 @@ func writeReplicatedSchemaActivation(dataDir string, record replicatedSchemaActi
 	} else if found {
 		existingRaw, encodeErr := encodeReplicatedSchemaActivation(existing)
 		if encodeErr == nil && bytes.Equal(existingRaw, raw) {
-			return nil
+			return fenceReplicatedSchemaFiles(dataDir, replicatedSchemaActivationName)
 		}
 		return ErrReplicatedSchemaCatalogImage
 	}
@@ -211,7 +214,7 @@ func writeReplicatedSchemaActivation(dataDir string, record replicatedSchemaActi
 		err = root.Rename(replicatedSchemaActivationTemp, replicatedSchemaActivationName)
 	}
 	if err == nil {
-		err = syncDirectory(dataDir)
+		err = syncReplicatedSchemaDirectory(dataDir)
 	}
 	return err
 }
@@ -268,11 +271,81 @@ func ObservePublishedReplicatedSchemaTransition(
 		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
 	image, err := ValidateReplicatedSchemaCatalogImage(raw)
-	if err != nil || image.Digest != record.targetDigest ||
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	if image.SchemaGeneration == transition.From.SchemaGeneration &&
+		image.RelationManifestDigest == transition.FromManifest &&
+		replicatedSchemaCatalogCASDigest(image.Digest, record.targetDigest,
+			transition.RequestDigest, transition.AuthorizationDigest) == transition.CatalogCASDigest {
+		// Persist-before-proposal is a normal restart cut. Only the exact CAS
+		// source is an unpublished rollout; an unrelated catalog remains an error.
+		return replicatedstate.SchemaTransitionView{}, false, nil
+	}
+	if image.Digest != record.targetDigest ||
 		image.SchemaGeneration != transition.ToSchemaGeneration ||
 		image.RelationManifestDigest != transition.ToManifest {
 		return replicatedstate.SchemaTransitionView{}, false,
 			errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if err := fencePublishedReplicatedSchemaCatalog(absolute); err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	return transition, true, nil
+}
+
+// ObservePersistedReplicatedSchemaTransition returns the exact prepared
+// command, including at the crash cut after its Raft commit but before catalog
+// publication. Recovery must observe/propose these original bytes instead of
+// rebuilding a command against an already advanced source applied index.
+func ObservePersistedReplicatedSchemaTransition(
+	path string,
+) (replicatedstate.SchemaTransitionView, bool, error) {
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !found {
+		return replicatedstate.SchemaTransitionView{}, found, err
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(record.command)
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
+	if err != nil || !found || marker.catalogDigest != record.targetDigest ||
+		marker.schemaGeneration != transition.ToSchemaGeneration ||
+		marker.membership.Sequence != transition.MembershipSequence ||
+		marker.membership.Source != transition.MembershipSource ||
+		marker.membership.Target != transition.MembershipTarget ||
+		marker.authorization != transition.RequestDigest ||
+		marker.applyContract != transition.ToApplyContract ||
+		marker.placementDigest != transition.ToPlacementDigest {
+		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	root, err := os.OpenRoot(absolute + ".tables")
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	file, err := root.Open(replicatedSchemaTargetCatalogName)
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, root.Close())
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
+	err = errors.Join(err, file.Close(), root.Close())
+	if err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil || image.Digest != record.targetDigest ||
+		image.SchemaGeneration != transition.ToSchemaGeneration ||
+		image.RelationManifestDigest != transition.ToManifest {
+		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if err := fenceReplicatedSchemaFiles(absolute+".tables", replicatedSchemaActivationName,
+		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
+		return replicatedstate.SchemaTransitionView{}, false, err
 	}
 	return transition, true, nil
 }
@@ -328,7 +401,6 @@ func drainPublishedReplicatedSchemaSource(
 		return false, err
 	}
 	defer root.Close()
-	removed := false
 	for _, storage := range marker.sourceStorages {
 		if _, target := targets[storage]; target {
 			return false, ErrReplicatedSchemaCatalogImage
@@ -348,13 +420,12 @@ func drainPublishedReplicatedSchemaSource(
 			if err = root.Remove(name); err != nil && !os.IsNotExist(err) {
 				return false, err
 			}
-			removed = removed || err == nil
 		}
 	}
-	if removed {
-		if err = syncDirectory(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory)); err != nil {
-			return false, errors.Join(durable.ErrCommitOutcomeUnknown, err)
-		}
+	// Absence on a retry can be the readable result of an unfenced deletion.
+	// Fence even when this attempt removed nothing before authorizing GC.
+	if err = syncReplicatedSchemaDirectory(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory)); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -381,6 +452,10 @@ func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err 
 		marker.placementDigest != transition.ToPlacementDigest ||
 		marker.sourceApplied == ^uint64(0) {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if err := fenceReplicatedSchemaFiles(a.database.dataDir, replicatedSchemaActivationName,
+		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
+		return false, err
 	}
 	root, err := os.OpenRoot(a.database.dataDir)
 	if err != nil {
@@ -430,16 +505,25 @@ func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err 
 		return false, err
 	}
 	currentDisk, exists, err := readCatalogFile(d.path)
-	if err != nil || !exists || !bytes.Equal(currentMemory, currentDisk) {
+	if err != nil || !exists ||
+		!bytes.Equal(currentMemory, currentDisk) && !bytes.Equal(targetRaw, currentDisk) {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
-	currentDigest := sha256.Sum256(currentDisk)
+	currentDigest := sha256.Sum256(currentMemory)
 	wantCAS := replicatedSchemaCatalogCASDigest(
 		currentDigest, targetImage.Digest, transition.RequestDigest,
 		transition.AuthorizationDigest,
 	)
 	if wantCAS != transition.CatalogCASDigest {
 		return false, ErrReplicatedSchemaCatalogImage
+	}
+	if bytes.Equal(targetRaw, currentDisk) {
+		// A previous rename may be visible despite a failed directory fence.
+		// Retain the source in-memory CAS witness and settle that exact rename.
+		if err := d.directorySync(filepath.Dir(d.path)); err != nil {
+			return true, errors.Join(durable.ErrCommitOutcomeUnknown, err)
+		}
+		return true, nil
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(d.path), "."+filepath.Base(d.path)+".schema-*")
 	if err != nil {
@@ -532,6 +616,9 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 	if marker.sourceApplied == ^uint64(0) {
 		return nil, ErrReplicatedSchemaCatalogImage
 	}
+	if err := fencePublishedReplicatedSchemaCatalog(absolute); err != nil {
+		return nil, err
+	}
 	if err := durable.ValidateFinalizedCheckpointMembershipTransition(
 		dataDir, marker.membership, marker.authorization, marker.sourceApplied+1, sha256.Sum256(record.command),
 	); err != nil {
@@ -597,6 +684,10 @@ func (a *ReplicatedApply) PersistReplicatedSchemaTransition(command []byte) erro
 		image.SchemaGeneration != marker.schemaGeneration ||
 		image.RelationManifestDigest != transition.ToManifest {
 		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if err := fenceReplicatedSchemaFiles(a.database.dataDir,
+		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
+		return err
 	}
 	return writeReplicatedSchemaActivation(a.database.dataDir, replicatedSchemaActivation{
 		targetDigest: marker.catalogDigest, command: command,

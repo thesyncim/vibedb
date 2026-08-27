@@ -211,7 +211,7 @@ func writeReplicatedSchemaStageMarker(dataDir string, marker replicatedSchemaSta
 	} else if found {
 		existingRaw, encodeErr := encodeReplicatedSchemaStageMarker(existing)
 		if encodeErr == nil && bytes.Equal(existingRaw, raw) {
-			return nil
+			return fenceReplicatedSchemaFiles(dataDir, replicatedSchemaStageMarkerName)
 		}
 		return ErrReplicatedSchemaCatalogImage
 	}
@@ -237,15 +237,7 @@ func writeReplicatedSchemaStageMarker(dataDir string, marker replicatedSchemaSta
 		err = root.Rename(replicatedSchemaStageMarkerTemp, replicatedSchemaStageMarkerName)
 	}
 	if err == nil {
-		err = syncDirectory(dataDir)
-	}
-	if err != nil {
-		if existing, found, readErr := readReplicatedSchemaStageMarker(dataDir); readErr == nil && found {
-			existingRaw, encodeErr := encodeReplicatedSchemaStageMarker(existing)
-			if encodeErr == nil && bytes.Equal(existingRaw, raw) {
-				return nil
-			}
-		}
+		err = syncReplicatedSchemaDirectory(dataDir)
 	}
 	return err
 }
@@ -290,7 +282,7 @@ func writeReplicatedSchemaTargetCatalog(
 	}
 	if existing, readErr := readReplicatedSchemaTargetCatalog(dataDir, expected); readErr == nil {
 		if bytes.Equal(existing, raw) {
-			return nil
+			return fenceReplicatedSchemaFiles(dataDir, replicatedSchemaTargetCatalogName)
 		}
 		return ErrReplicatedSchemaCatalogImage
 	} else if !os.IsNotExist(readErr) {
@@ -318,13 +310,7 @@ func writeReplicatedSchemaTargetCatalog(
 		err = root.Rename(replicatedSchemaTargetCatalogTemp, replicatedSchemaTargetCatalogName)
 	}
 	if err == nil {
-		err = syncDirectory(dataDir)
-	}
-	if err != nil {
-		if existing, readErr := readReplicatedSchemaTargetCatalog(dataDir, expected); readErr == nil &&
-			bytes.Equal(existing, raw) {
-			return nil
-		}
+		err = syncReplicatedSchemaDirectory(dataDir)
 	}
 	return err
 }

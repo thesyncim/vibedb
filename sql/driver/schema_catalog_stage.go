@@ -143,6 +143,13 @@ func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTarget(
 	if proof.Witness != marker.targetWitness {
 		return proof, ErrReplicatedSchemaCatalogImage
 	}
+	if _, err := readReplicatedSchemaTargetCatalog(a.database.dataDir, proof.Catalog); err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	if err := fenceReplicatedSchemaFiles(a.database.dataDir,
+		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
 	return proof, nil
 }
 
@@ -170,6 +177,13 @@ func ObservePreparedReplicatedSchemaTarget(
 	if marker.authorization != requestDigest || marker.catalogDigest != image.Digest ||
 		marker.schemaGeneration != image.SchemaGeneration || marker.targetWitness == ([32]byte{}) {
 		return [sha256.Size]byte{}, false, ErrReplicatedSchemaCatalogImage
+	}
+	if _, err := readReplicatedSchemaTargetCatalog(absolute+".tables", image); err != nil {
+		return [sha256.Size]byte{}, false, err
+	}
+	if err := fenceReplicatedSchemaFiles(absolute+".tables",
+		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
+		return [sha256.Size]byte{}, false, err
 	}
 	return marker.targetWitness, true, nil
 }

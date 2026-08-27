@@ -291,6 +291,7 @@ func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Dat
 		t.Fatal(err)
 	}
 	assertUnselected()
+	testPublishSchemaCatalogFence(t, reopenedClaim, reopened.connector.db)
 	published, err := reopenedClaim.PublishReplicatedSchemaCatalog()
 	if err != nil || !published {
 		t.Fatalf("catalog publish=%t err=%v", published, err)
@@ -315,6 +316,7 @@ func testReplicatedSchemaTargetRollover(t *testing.T, path string, database *Dat
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
+	testSchemaTargetSelectionFence(t, path, identity, targetIdentity, targetApplyIdentity)
 	// Crash at each actual link/unlink in turn. Every reopening must resume
 	// from the durable target catalog without selecting an incomplete image.
 	injected := errors.New("schema publication interrupted")
