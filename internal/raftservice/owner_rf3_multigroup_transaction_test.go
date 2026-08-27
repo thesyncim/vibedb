@@ -143,10 +143,12 @@ func newPeerServerTestTLS(
 }
 
 const (
-	multiGroupRF3Groups      = 2
-	multiGroupRF3MaxGroups   = 3
-	multiGroupRF3LedgerGroup = 2
-	multiGroupRF3Voters      = 3
+	multiGroupRF3Groups                              = 2
+	multiGroupRF3MaxGroups                           = 3
+	multiGroupRF3LedgerGroup                         = 2
+	multiGroupRF3Voters                              = 3
+	multiGroupRF3DurableSQLRequiredEnvironment       = "VIBEDB_DURABLE_SQL_RF3_E2E"
+	multiGroupRF3DurableSQLRequiredEnvironmentEnable = "1"
 )
 
 type multiGroupRF3Group struct {
@@ -988,6 +990,10 @@ func newMultiGroupRF3Runtime(
 		_ = wal.Close()
 		if os.Getenv("VIBEDB_RF3_QUORUM_QUALIFICATION") == "1" {
 			t.Fatalf("strict allocation required by RF3 quorum qualification: %v", err)
+		}
+		if os.Getenv(multiGroupRF3DurableSQLRequiredEnvironment) ==
+			multiGroupRF3DurableSQLRequiredEnvironmentEnable {
+			t.Fatalf("required strict allocation unsupported: %v", err)
 		}
 		t.Skipf("strict allocation unsupported: %v", err)
 	}

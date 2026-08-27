@@ -36,6 +36,74 @@ jobs:
         # package binaries keeps the aggregate virtual-memory reservation
         # deterministic without reducing test coverage or per-package timeouts.
         run: go test -p=1 -timeout=25m ./...
+      - name: Prepare durable SQL RF3 recovery qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/durable-sql-rf3"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${RUNNER_TEMP}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${RUNNER_TEMP}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${evidence}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions'
+          go test -list "^${test_name}$" ./internal/raftservice > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'VIBEDB_DURABLE_SQL_RF3_E2E=1 go test -json -count=3 -timeout=8m -run %s ./internal/raftservice\n' \
+            "^${test_name}$" > "${evidence}/command.txt"
+      - name: Durable SQL RF3 terminal and ACK recovery qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          VIBEDB_DURABLE_SQL_RF3_E2E: "1"
+        run: |
+          set -euo pipefail
+          go test -json -count=3 -timeout=8m \
+            -run '^TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions$' \
+            ./internal/raftservice \
+            | tee "${RUNNER_TEMP}/durable-sql-rf3/go-test.jsonl"
+      - name: Validate durable SQL RF3 recovery evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/durable-sql-rf3"
+          test_name='TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions'
+          test -s "${evidence}/go-test.jsonl"
+          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 50331648
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "durable SQL RF3 recovery qualification skipped" >&2
+            exit 1
+          fi
+          summary="${evidence}/summary.tsv"
+          printf 'schema\tvibedb.durable-sql-rf3-recovery\t1\nresult\tpass\nrevision\t%s\nruns\t3\n' \
+            "$(cat "${evidence}/revision.txt")" > "${summary}"
+          test "$(stat -c %s "${summary}")" -le 65536
+      - name: Upload durable SQL RF3 recovery evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-sql-rf3-${{ github.sha }}
+          path: ${{ runner.temp }}/durable-sql-rf3
+          if-no-files-found: error
+          retention-days: 30
       - name: Prepare replica-replacement qualification
         if: matrix.runner == 'ubuntu-latest'
         shell: bash
