@@ -19,7 +19,7 @@ const (
 	replicatedSchemaStageMarkerTemp    = ".schema-membership-stage.tmp"
 	replicatedSchemaTargetCatalogName  = ".schema-target-catalog"
 	replicatedSchemaTargetCatalogTemp  = ".schema-target-catalog.tmp"
-	replicatedSchemaStageHeaderBytes   = 264
+	replicatedSchemaStageHeaderBytes   = 272
 	replicatedSchemaStageChecksumBytes = sha256.Size
 )
 
@@ -36,6 +36,7 @@ type replicatedSchemaStageMarker struct {
 	authorization    [sha256.Size]byte
 	targetWitness    [sha256.Size]byte
 	storages         [][32]byte
+	sourceStorages   [][32]byte
 }
 
 func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]byte, error) {
@@ -44,10 +45,11 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 		marker.membership.Target == ([32]byte{}) || marker.catalogDigest == ([32]byte{}) ||
 		marker.relationWitness == ([32]byte{}) || marker.applyContract == ([32]byte{}) ||
 		marker.authorization == ([32]byte{}) || marker.targetWitness == ([32]byte{}) ||
-		len(marker.storages) == 0 || len(marker.storages) > replication.MaxRelationsPerBundle {
+		len(marker.storages) == 0 || len(marker.storages) > replication.MaxRelationsPerBundle ||
+		len(marker.sourceStorages) == 0 || len(marker.sourceStorages) > replication.MaxRelationsPerBundle {
 		return nil, ErrReplicatedSchemaCatalogImage
 	}
-	total := replicatedSchemaStageHeaderBytes + 32*len(marker.storages) +
+	total := replicatedSchemaStageHeaderBytes + 32*(len(marker.storages)+len(marker.sourceStorages)) +
 		replicatedSchemaStageChecksumBytes
 	raw := make([]byte, total)
 	copy(raw[0:8], replicatedSchemaStageMagic[:])
@@ -64,12 +66,20 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 	copy(raw[168:200], marker.membership.Source[:])
 	copy(raw[200:232], marker.membership.Target[:])
 	copy(raw[232:264], marker.targetWitness[:])
+	binary.LittleEndian.PutUint16(raw[264:266], uint16(len(marker.sourceStorages)))
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		if marker.storages[i] == ([32]byte{}) {
 			return nil, ErrReplicatedSchemaCatalogImage
 		}
 		copy(raw[at:at+32], marker.storages[i][:])
+		at += 32
+	}
+	for i := range marker.sourceStorages {
+		if marker.sourceStorages[i] == ([32]byte{}) {
+			return nil, ErrReplicatedSchemaCatalogImage
+		}
+		copy(raw[at:at+32], marker.sourceStorages[i][:])
 		at += 32
 	}
 	h := sha256.New()
@@ -87,8 +97,12 @@ func decodeReplicatedSchemaStageMarker(raw []byte) (replicatedSchemaStageMarker,
 		return replicatedSchemaStageMarker{}, ErrReplicatedSchemaCatalogImage
 	}
 	count := int(binary.LittleEndian.Uint16(raw[10:12]))
-	if count == 0 || count > replication.MaxRelationsPerBundle ||
-		replicatedSchemaStageHeaderBytes+32*count+replicatedSchemaStageChecksumBytes != len(raw) {
+	sourceCount := int(binary.LittleEndian.Uint16(raw[264:266]))
+	if count == 0 || count > replication.MaxRelationsPerBundle || sourceCount == 0 ||
+		sourceCount > replication.MaxRelationsPerBundle ||
+		binary.LittleEndian.Uint16(raw[266:268]) != 0 ||
+		binary.LittleEndian.Uint32(raw[268:272]) != 0 ||
+		replicatedSchemaStageHeaderBytes+32*(count+sourceCount)+replicatedSchemaStageChecksumBytes != len(raw) {
 		return replicatedSchemaStageMarker{}, ErrReplicatedSchemaCatalogImage
 	}
 	checksumAt := len(raw) - replicatedSchemaStageChecksumBytes
@@ -106,7 +120,7 @@ func decodeReplicatedSchemaStageMarker(raw []byte) (replicatedSchemaStageMarker,
 		membership: durable.CheckpointMembershipWitness{
 			Sequence: binary.LittleEndian.Uint64(raw[32:40]),
 		},
-		storages: make([][32]byte, count),
+		storages: make([][32]byte, count), sourceStorages: make([][32]byte, sourceCount),
 	}
 	copy(marker.catalogDigest[:], raw[40:72])
 	copy(marker.relationWitness[:], raw[72:104])
@@ -118,6 +132,10 @@ func decodeReplicatedSchemaStageMarker(raw []byte) (replicatedSchemaStageMarker,
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		copy(marker.storages[i][:], raw[at:at+32])
+		at += 32
+	}
+	for i := range marker.sourceStorages {
+		copy(marker.sourceStorages[i][:], raw[at:at+32])
 		at += 32
 	}
 	canonical, err := encodeReplicatedSchemaStageMarker(marker)
@@ -152,7 +170,7 @@ func readReplicatedSchemaStageMarker(dataDir string) (replicatedSchemaStageMarke
 		return replicatedSchemaStageMarker{}, false, err
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, int64(replicatedSchemaStageHeaderBytes+
-		32*replication.MaxRelationsPerBundle+replicatedSchemaStageChecksumBytes+1)))
+		64*replication.MaxRelationsPerBundle+replicatedSchemaStageChecksumBytes+1)))
 	err = errors.Join(err, file.Close())
 	if err != nil {
 		return replicatedSchemaStageMarker{}, false, err
@@ -172,6 +190,10 @@ func addReplicatedSchemaStageProtection(
 	for i := range marker.storages {
 		name := hex.EncodeToString(marker.storages[i][:]) + ".vjc"
 		protected[filepath.Join(dataDir, name)] = "prepared schema target"
+	}
+	for i := range marker.sourceStorages {
+		name := hex.EncodeToString(marker.sourceStorages[i][:]) + ".vjc"
+		protected[filepath.Join(dataDir, name)] = "draining schema source"
 	}
 	return nil
 }

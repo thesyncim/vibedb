@@ -93,13 +93,21 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 		if err != nil {
 			return err
 		}
+		if a.database.catalog.ReplicatedShardStore == nil {
+			return ErrReplicatedSchemaCatalogImage
+		}
+		sourceStorages, err := schemaStageStorageIDs(*a.database.catalog.ReplicatedShardStore)
+		if err != nil {
+			return err
+		}
 		return writeReplicatedSchemaStageMarker(a.database.dataDir, replicatedSchemaStageMarker{
 			schemaGeneration: target.RelationSchemaGeneration,
 			sourceApplied:    expectedApplied, membership: witness,
 			catalogDigest:   proof.Catalog.Digest,
 			relationWitness: proof.Relations.Witness,
 			applyContract:   proof.ApplyContract,
-			authorization:   authorization, targetWitness: proof.Witness, storages: storages,
+			authorization:   authorization, targetWitness: proof.Witness,
+			storages: storages, sourceStorages: sourceStorages,
 		})
 	})
 }
