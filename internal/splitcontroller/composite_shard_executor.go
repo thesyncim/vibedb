@@ -15,17 +15,28 @@ type SplitTailSinkResolver interface {
 	ResolveSplitTailSinks(context.Context, *Plan, Observation) ([]rangesplit.TailSink, error)
 }
 
+// RetainedPruneProposerFactory opens the exact operation-scoped proposal
+// session only after the gateway has supplied a verified cutover certificate.
+// The returned release function must settle all transport and journal handles;
+// it is invoked on every proposal outcome, including outcome-unknown errors.
+type RetainedPruneProposerFactory interface {
+	OpenRetainedPruneProposer(
+		context.Context, *Plan, Observation,
+	) (RetainedPruneProposer, func() error, error)
+}
+
 type CompositeShardActionExecutorOptions struct {
 	Operation OperationID
 	Actions   uint16
 
-	Source      *LocalSourceActions
-	Stage       RemoteChildStageExecutor
-	TailSinks   SplitTailSinkResolver
-	Seal        SourceSealProposer
-	PruneSource RetainedPruneAuthoritySource
-	Prune       RetainedPruneProposer
-	PruneLimits rangesplit.RetainedPruneLimits
+	Source       *LocalSourceActions
+	Stage        RemoteChildStageExecutor
+	TailSinks    SplitTailSinkResolver
+	Seal         SourceSealProposer
+	PruneSource  RetainedPruneAuthoritySource
+	Prune        RetainedPruneProposer
+	PruneFactory RetainedPruneProposerFactory
+	PruneLimits  rangesplit.RetainedPruneLimits
 
 	Child     uint8
 	Lifecycle *LocalChildLifecycle
@@ -63,7 +74,7 @@ func NewCompositeShardActionExecutor(
 			return nil, ErrRemoteExecution
 		}
 		if options.Actions&actionBit(ActionPruneRetained) != 0 &&
-			options.Prune == nil {
+			(options.Prune == nil) == (options.PruneFactory == nil) {
 			return nil, ErrRemoteExecution
 		}
 	}
@@ -174,8 +185,18 @@ func (executor *CompositeShardActionExecutor) ExecuteAuthorizedSplitAction(
 		}
 		return options.Lifecycle.ExecuteAdoptChildRuntime(ctx, plan)
 	case ActionPruneRetained:
+		proposer := options.Prune
+		release := func() error { return nil }
+		if options.PruneFactory != nil {
+			var openErr error
+			proposer, release, openErr = options.PruneFactory.OpenRetainedPruneProposer(ctx, plan, observed)
+			if openErr != nil || proposer == nil || release == nil {
+				return errors.Join(ErrRemoteExecution, openErr)
+			}
+		}
+		defer func() { _ = release() }()
 		return options.Source.ExecuteCertifiedPruneRetained(
-			ctx, plan, observed, observed.SourceServing, options.Prune, options.PruneLimits,
+			ctx, plan, observed, observed.SourceServing, proposer, options.PruneLimits,
 		)
 	default:
 		return ErrRemoteExecution
