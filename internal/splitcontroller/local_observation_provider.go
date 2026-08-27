@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 )
 
@@ -33,6 +34,44 @@ type LocalObservationGroup struct {
 	Command  raftservice.CommandFence
 	Registry *RuntimeStoreRegistry
 	Children LocalChildRuntimeObserver
+}
+
+// PreparedChildObservationGroup projects one authenticated local replica
+// target into the exact pre-adoption observation identity. Keeping this
+// construction beside Plan validation prevents command composition from
+// re-deriving group or command fences from filesystem names.
+func PreparedChildObservationGroup(
+	target ChildTarget,
+	replica ChildReplicaTarget,
+	registry *RuntimeStoreRegistry,
+	children LocalChildRuntimeObserver,
+) (LocalObservationGroup, error) {
+	local, err := LocalReplicaChildTarget(target, replica)
+	if err != nil || registry == nil || children == nil {
+		return LocalObservationGroup{}, errors.Join(ErrPlanObservation, err)
+	}
+	roster := make([]rafttransport.Member, len(target.Replicas))
+	for index, item := range target.Replicas {
+		roster[index] = rafttransport.Member{
+			Group: groupFromChildTarget(target), MemberID: item.Member, Node: item.Node,
+			Role: rafttransport.MemberVoter, ReplicaSetVersion: target.ReplicaSetVersion,
+		}
+	}
+	command, err := validateChildExecutionRoster(local, roster)
+	if err != nil {
+		return LocalObservationGroup{}, errors.Join(ErrPlanObservation, err)
+	}
+	return LocalObservationGroup{
+		Identity: raftmember.RuntimeIdentity{
+			Group: groupFromChildTarget(target), Distribution: string(local.SQL.Binding.Distribution),
+			Shard:                string(local.SQL.Binding.Shard),
+			AllocationGeneration: uint64(local.SQL.Binding.AllocationGeneration),
+			MemberID:             replica.Member, StoreID: replica.WAL.StoreID,
+			NodeIncarnation:        replica.NodeIncarnation,
+			RelationManifestDigest: target.RelationManifestDigest,
+		},
+		Command: command, Registry: registry, Children: children,
+	}, nil
 }
 
 // LocalPlanObservationProvider is the shipped shard-side provider. It reads a

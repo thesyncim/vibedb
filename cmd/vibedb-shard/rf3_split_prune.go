@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -33,7 +34,9 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 	}
 	binding := observed.SourceState.Binding
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
-	route, ok := observed.Catalog.ResolveReplicatedRoute(binding.Distribution, binding.Shard, replicas[:0])
+	route, ok := observed.Catalog.ResolveReplicatedRoute(
+		distribution.DistributionName(binding.Distribution), distribution.ShardID(binding.Shard), replicas[:0],
+	)
 	if !ok {
 		return nil, nil, errRF3Serving
 	}
