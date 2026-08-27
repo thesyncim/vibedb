@@ -8,26 +8,39 @@ routing authorities.
 
 ## Build the image contract
 
-The image must contain `vibedb-shard`, `vibedb-gateway`, and
-`vibedb-operator` on `PATH`. Supply these objects before applying the rendered
+Build the repository's static, non-root image, or provide an equivalent image
+containing `vibedb-shard`, `vibedb-gateway`, and `vibedb-operator` on `PATH`:
+
+```bash
+docker build -f deploy/kubernetes/Dockerfile -t registry.example/vibedb:commit-sha .
+docker push registry.example/vibedb:commit-sha
+```
+
+Use a Kubernetes cluster with at least three
+failure-domain nodes. Supply these objects before applying the rendered
 workloads:
 
-- `vibedb-rf3-manifests`, with `prepare-0.vibejson`,
-  `prepare-1.vibejson`, and `prepare-2.vibejson`;
-- `vibedb-rf3-tls`, with the three members' keys and certificates, cluster
-  roots, and WAL key source referenced by those manifests;
+- `vibedb-rf3-manifests`, with `catalog-{0,1,2}.vibejson`,
+  `ledger-{0,1,2}.vibejson`, and `data-{0,1,2}.vibejson`;
+- `vibedb-rf3-tls`, with the nine members' keys and certificates, cluster
+  roots, and WAL key sources referenced by those manifests;
 - `vibedb-gateway-config`, with `cluster.vibejson`,
   `authorization-policy.vibejson`, and `replica-control.vibejson`;
 - `vibedb-gateway-tls`, with the gateway key, certificate, and cluster roots.
 
 Each preparation manifest must use `/var/lib/vibedb/member` as its exact root,
-bind its listener ports to `0.0.0.0`, and use these stable peer addresses:
+bind its listener ports to `0.0.0.0`, and use its role's stable peer addresses.
+For example, the catalog group uses:
 
 ```text
-vibedb-shard-0.vibedb-shard-peer:7411
-vibedb-shard-1.vibedb-shard-peer:7411
-vibedb-shard-2.vibedb-shard-peer:7411
+vibedb-catalog-0.vibedb-catalog-peer:7411
+vibedb-catalog-1.vibedb-catalog-peer:7411
+vibedb-catalog-2.vibedb-catalog-peer:7411
 ```
+
+Replace `catalog` with `ledger` and `data` for the other two groups. Every pod
+has a distinct TLS node identity. The nine IDs passed below are role-major:
+catalog ordinals 0–2, ledger ordinals 0–2, then data ordinals 0–2.
 
 The ConfigMaps are bootstrap inputs, not live authority. Changing one does not
 rewrite an existing PVC's sealed identities or durable membership.
@@ -40,26 +53,43 @@ Pass the exact TLS node IDs in StatefulSet ordinal order:
 go run ./cmd/vibedb-operator render \
   -image registry.example/vibedb:commit-sha \
   -namespace vibedb-test \
-  -shard-node-ids 11000000000000000000000000000000,12000000000000000000000000000000,13000000000000000000000000000000 \
+  -shard-node-ids 11000000000000000000000000000000,12000000000000000000000000000000,13000000000000000000000000000000,21000000000000000000000000000000,22000000000000000000000000000000,23000000000000000000000000000000,31000000000000000000000000000000,32000000000000000000000000000000,33000000000000000000000000000000 \
   > ./vibedb-kubernetes.yaml
 
+go run ./cmd/vibedb-operator validate -manifest ./vibedb-kubernetes.yaml
+kubectl apply --dry-run=server -f ./vibedb-kubernetes.yaml
 kubectl apply -f ./vibedb-kubernetes.yaml
 ```
 
+`validate` is bounded to 2 MiB and checks the VibeDB-specific topology contract:
+the exact object set, three independent RF3 groups, unique role endpoints,
+retained PVCs, one-at-a-time voluntary disruption, failure-domain spread,
+probes, and container hardening. Server-side dry-run additionally checks the
+Kubernetes version's resource schemas and admission policy.
+
 The rendered lane contains:
 
-- one three-replica shard StatefulSet with stable ordinals and one PVC per
-  member;
-- a headless Service publishing peer, native, snapshot, and control DNS;
-- a shard PodDisruptionBudget with `maxUnavailable: 1`;
+- independent three-replica catalog, request-ledger, and data StatefulSets,
+  each with stable ordinals and one retained PVC per member;
+- one headless peer Service and one `maxUnavailable: 1` PodDisruptionBudget per
+  Raft group;
+- hard hostname spreading, parallel initial Raft process creation, and
+  five-second minimum readiness before Kubernetes advances a rolling update;
+- non-root processes, the runtime-default seccomp profile, no service-account
+  token, and no CPU limit on latency-sensitive database processes;
 - a durable single-gateway StatefulSet, a headless governing Service, and a
   separate client-facing ClusterIP Service;
 - a scale-zero replacement StatefulSet template that runs the shipped
   `bootstrap-rf3` command against an empty target PVC.
 
-The startup and readiness probes check TCP reachability only. They do not
-claim leadership, linearizability, catch-up, or catalog authority. The gateway
-still performs authenticated leader discovery and exact fence validation.
+The single gateway is test tooling, not gateway HA. Running multiple gateways
+requires distinct durable session/issuer identities and journals per ordinal;
+the renderer intentionally does not manufacture those authorities.
+
+The startup, readiness, and liveness probes check TCP reachability only. They
+do not claim leadership, linearizability, catch-up, or catalog authority. The
+gateway still performs authenticated leader discovery and exact fence
+validation.
 
 ## Stop, restart, and disrupt
 
@@ -68,9 +98,9 @@ drain within the configured 120-second termination window. The PDB protects a
 voluntary single-member disruption, but it cannot make simultaneous node loss,
 forced deletion, or an unavailable storage backend safe.
 
-For tests, delete one follower Pod and verify that its StatefulSet ordinal
-reopens the same PVC and catches up. Do not delete its PVC unless testing
-permanent replica loss and the replacement protocol.
+For tests, delete one follower Pod from one role and verify that its StatefulSet
+ordinal reopens the same PVC and catches up. Do not delete its PVC unless
+testing permanent replica loss and the replacement protocol.
 
 ## Bootstrap a replacement
 

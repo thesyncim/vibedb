@@ -9,10 +9,16 @@ import (
 
 func testConfig() Config {
 	return Config{Namespace: "vibedb-test", Image: "registry.example/vibedb:test",
-		ShardNodeIDs: [3]string{
+		ShardNodeIDs: [9]string{
 			"11000000000000000000000000000000",
 			"12000000000000000000000000000000",
 			"13000000000000000000000000000000",
+			"21000000000000000000000000000000",
+			"22000000000000000000000000000000",
+			"23000000000000000000000000000000",
+			"31000000000000000000000000000000",
+			"32000000000000000000000000000000",
+			"33000000000000000000000000000000",
 		},
 		ManifestConfigMap: "rf3-manifests", TLSSecret: "rf3-tls",
 		GatewayConfigMap: "gateway-config", GatewayTLSSecret: "gateway-tls",
@@ -29,9 +35,12 @@ func TestRenderRF3GoldenAndSafetyContract(t *testing.T) {
 		"clusterIP: None", "publishNotReadyAddresses: true", "replicas: 3",
 		"podManagementPolicy: Parallel", "maxUnavailable: 1",
 		"terminationGracePeriodSeconds: 120", "volumeClaimTemplates:",
-		"vibedb-shard-0.vibedb-shard-peer:7511=11000000000000000000000000000000",
+		"vibedb-catalog-0.vibedb-catalog-peer:7511=11000000000000000000000000000000",
+		"vibedb-ledger-1.vibedb-ledger-peer:7511=22000000000000000000000000000000",
+		"vibedb-data-2.vibedb-data-peer:7511=33000000000000000000000000000000",
 		"type: ClusterIP", "replicas: 0", "replace-with-target-config",
-		"app.kubernetes.io/component: serving",
+		"persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}",
+		"whenUnsatisfiable: DoNotSchedule", "livenessProbe:",
 	} {
 		if !strings.Contains(raw, required) {
 			t.Fatalf("render missing %q", required)
@@ -42,15 +51,33 @@ func TestRenderRF3GoldenAndSafetyContract(t *testing.T) {
 			t.Fatalf("render contains forbidden authority/storage shortcut %q", forbidden)
 		}
 	}
-	if strings.Count(raw, "app.kubernetes.io/component: serving") != 4 {
-		t.Fatal("serving shard selector is not isolated from replacement learners")
+	if err := ValidateRendered(output.Bytes()); err != nil {
+		t.Fatalf("rendered contract: %v", err)
 	}
-	want := [sha256.Size]byte{0x6e, 0x4a, 0x0c, 0x17, 0x55, 0x63, 0xec, 0x4a,
-		0x57, 0xcb, 0xa1, 0x98, 0x7a, 0xed, 0xa3, 0x79,
-		0x0c, 0xe4, 0x10, 0xc5, 0x0c, 0x3a, 0x54, 0x28,
-		0xfd, 0x84, 0x4e, 0x79, 0x8a, 0xf2, 0x67, 0x6c}
+	want := [sha256.Size]byte{0xbb, 0x56, 0xac, 0x57, 0x1c, 0x6f, 0x08, 0x8d,
+		0x29, 0x1f, 0xac, 0x0a, 0x5e, 0x92, 0x35, 0x44,
+		0x64, 0x05, 0x92, 0x3c, 0x83, 0x8d, 0x43, 0xa0,
+		0x15, 0x29, 0x73, 0x2e, 0x38, 0xcc, 0x0a, 0xc9}
 	if got := sha256.Sum256(output.Bytes()); got != want {
 		t.Fatalf("golden digest = %x; update want only after reviewing the complete manifest", got)
+	}
+}
+
+func TestValidateRenderedRejectsLostDurabilityAndTopologyControls(t *testing.T) {
+	var output bytes.Buffer
+	if err := Render(&output, testConfig()); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range []struct{ old, replacement string }{
+		{"whenDeleted: Retain", "whenDeleted: Delete"},
+		{"whenUnsatisfiable: DoNotSchedule", "whenUnsatisfiable: ScheduleAnyway"},
+		{"  replicas: 3\n", "  replicas: 2\n"},
+		{"livenessProbe:", "lostProbe:"},
+	} {
+		raw := strings.Replace(output.String(), mutation.old, mutation.replacement, 1)
+		if err := ValidateRendered([]byte(raw)); err != ErrManifest {
+			t.Fatalf("mutation %q err=%v", mutation.old, err)
+		}
 	}
 }
 

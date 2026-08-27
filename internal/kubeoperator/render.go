@@ -18,9 +18,10 @@ var (
 // Config is the deliberately small deployment surface for an unreleased RF3
 // test cluster. Security identities and VibeDB manifests remain caller-owned.
 type Config struct {
-	Namespace         string
-	Image             string
-	ShardNodeIDs      [3]string
+	Namespace string
+	Image     string
+	// ShardNodeIDs are role-major: catalog 0..2, ledger 0..2, data 0..2.
+	ShardNodeIDs      [9]string
 	ManifestConfigMap string
 	TLSSecret         string
 	GatewayConfigMap  string
@@ -65,8 +66,11 @@ func (config Config) validate() error {
 	return nil
 }
 
-// Render writes one deterministic, Helm-free multi-document manifest. DNS is
-// used only for endpoint discovery; no Kubernetes object asserts leadership.
+var rf3Roles = [...]string{"catalog", "ledger", "data"}
+
+// Render writes one deterministic, Helm-free multi-document manifest. Every
+// role is an independent RF3 group. DNS is endpoint discovery only; no
+// Kubernetes object asserts leadership, membership, or catalog authority.
 func Render(writer io.Writer, config Config) error {
 	if writer == nil || config.validate() != nil {
 		return ErrConfig
@@ -75,35 +79,46 @@ func Render(writer io.Writer, config Config) error {
 	if config.StorageClass != "" {
 		storageClass = fmt.Sprintf("\n      storageClassName: %s", config.StorageClass)
 	}
-	_, err := fmt.Fprintf(writer, manifestTemplate,
-		config.Namespace,
-		config.Namespace,
-		config.Namespace, config.Image, config.Image, config.ManifestConfigMap, config.TLSSecret,
-		config.ShardStorage, storageClass,
-		config.Namespace,
-		config.Namespace,
-		config.Namespace,
-		config.Namespace, config.Image,
+	if _, err := fmt.Fprintf(writer, kubeNamespaceTemplate, config.Namespace); err != nil {
+		return err
+	}
+	for _, role := range rf3Roles {
+		if _, err := fmt.Fprintf(writer, kubeRoleTemplate,
+			role, config.Namespace, role, role, config.Namespace, role,
+			role, config.Namespace, role, role, role, role, role, role,
+			config.Image, config.Image, config.ManifestConfigMap, config.TLSSecret,
+			config.ShardStorage, storageClass,
+		); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(writer, kubeGatewayTemplate,
+		config.Namespace, config.Namespace, config.Namespace, config.Namespace, config.Image,
 		config.ShardNodeIDs[0], config.ShardNodeIDs[1], config.ShardNodeIDs[2],
+		config.ShardNodeIDs[3], config.ShardNodeIDs[4], config.ShardNodeIDs[5],
+		config.ShardNodeIDs[6], config.ShardNodeIDs[7], config.ShardNodeIDs[8],
 		config.GatewayConfigMap, config.GatewayTLSSecret,
 		config.GatewayStorage, storageClass,
-		config.Namespace, config.Image,
-		config.ShardStorage, storageClass,
+		config.Namespace, config.Namespace, config.Image, config.ShardStorage, storageClass,
 	)
 	return err
 }
 
-const manifestTemplate = `apiVersion: v1
-kind: Service
+const kubeNamespaceTemplate = `apiVersion: v1
+kind: Namespace
 metadata:
-  name: vibedb-shard-peer
-  namespace: %s
+  name: %s
+  labels: {app.kubernetes.io/part-of: vibedb}
+---
+`
+
+const kubeRoleTemplate = `apiVersion: v1
+kind: Service
+metadata: {name: vibedb-%s-peer, namespace: %s}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector:
-    app.kubernetes.io/name: vibedb-shard
-    app.kubernetes.io/component: serving
+  selector: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: %s}
   ports:
     - {name: peer, port: 7411, targetPort: peer}
     - {name: native, port: 7511, targetPort: native}
@@ -112,45 +127,57 @@ spec:
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
-metadata:
-  name: vibedb-shard
-  namespace: %s
+metadata: {name: vibedb-%s, namespace: %s}
 spec:
   maxUnavailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: vibedb-shard
-      app.kubernetes.io/component: serving
+  selector: {matchLabels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: %s}}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: vibedb-shard
+  name: vibedb-%s
   namespace: %s
+  annotations: {vibedb.io/raft-role: %s}
 spec:
-  serviceName: vibedb-shard-peer
+  serviceName: vibedb-%s-peer
   replicas: 3
+  minReadySeconds: 5
+  revisionHistoryLimit: 2
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
   podManagementPolicy: Parallel
   updateStrategy: {type: RollingUpdate}
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: vibedb-shard
-      app.kubernetes.io/component: serving
+  selector: {matchLabels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: %s}}
   template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: vibedb-shard
-        app.kubernetes.io/component: serving
+    metadata: {labels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: %s}}
     spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
       terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: %s}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: %s}
       initContainers:
         - name: prepare
           image: %s
           command: [vibedb-operator]
-          args:
-            - prepare
-            - -manifest-dir=/bootstrap
-            - -data-dir=/var/lib/vibedb/member
+          args: [prepare, -manifest-dir=/bootstrap, -data-dir=/var/lib/vibedb/member]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
           volumeMounts:
             - {name: data, mountPath: /var/lib/vibedb}
             - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
@@ -160,21 +187,16 @@ spec:
           image: %s
           command: [vibedb-shard]
           args: [serve-rf3, -manifest, /var/lib/vibedb/member/serve-rf3.vibejson]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
           ports:
             - {name: peer, containerPort: 7411}
             - {name: native, containerPort: 7511}
             - {name: snapshot, containerPort: 7611}
             - {name: control, containerPort: 7711}
-          startupProbe:
-            tcpSocket: {port: native}
-            failureThreshold: 60
-            periodSeconds: 2
-          readinessProbe:
-            tcpSocket: {port: native}
-            periodSeconds: 2
-            failureThreshold: 2
-          resources:
-            requests: {cpu: "1", memory: 1Gi}
+          startupProbe: {tcpSocket: {port: native}, failureThreshold: 60, periodSeconds: 2}
+          readinessProbe: {tcpSocket: {port: native}, periodSeconds: 2, failureThreshold: 2}
+          livenessProbe: {tcpSocket: {port: native}, periodSeconds: 10, failureThreshold: 6}
+          resources: {requests: {cpu: "1", memory: 1Gi}}
           volumeMounts:
             - {name: data, mountPath: /var/lib/vibedb}
             - {name: tls, mountPath: /run/secrets/vibedb, readOnly: true}
@@ -190,58 +212,52 @@ spec:
         resources:
           requests: {storage: %s}%s
 ---
-apiVersion: v1
+`
+
+const kubeGatewayTemplate = `apiVersion: v1
 kind: Service
-metadata:
-  name: vibedb-gateway-peer
-  namespace: %s
+metadata: {name: vibedb-gateway-peer, namespace: %s}
 spec:
   clusterIP: None
-  selector:
-    app.kubernetes.io/name: vibedb-gateway
-  ports:
-    - {name: client, port: 7400, targetPort: client}
+  selector: {app.kubernetes.io/name: vibedb-gateway}
+  ports: [{name: client, port: 7400, targetPort: client}]
 ---
 apiVersion: v1
 kind: Service
-metadata:
-  name: vibedb-gateway
-  namespace: %s
+metadata: {name: vibedb-gateway, namespace: %s}
 spec:
   type: ClusterIP
-  selector:
-    app.kubernetes.io/name: vibedb-gateway
-  ports:
-    - {name: client, port: 7400, targetPort: client}
+  selector: {app.kubernetes.io/name: vibedb-gateway}
+  ports: [{name: client, port: 7400, targetPort: client}]
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
-metadata:
-  name: vibedb-gateway
-  namespace: %s
+metadata: {name: vibedb-gateway, namespace: %s}
 spec:
   minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: vibedb-gateway
+  selector: {matchLabels: {app.kubernetes.io/name: vibedb-gateway}}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
-metadata:
-  name: vibedb-gateway
-  namespace: %s
+metadata: {name: vibedb-gateway, namespace: %s}
 spec:
   serviceName: vibedb-gateway-peer
   replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: vibedb-gateway
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app.kubernetes.io/name: vibedb-gateway}}
   template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: vibedb-gateway
+    metadata: {labels: {app.kubernetes.io/name: vibedb-gateway}}
     spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
       terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: gateway
           image: %s
@@ -260,19 +276,21 @@ spec:
             - -tls-identity-oid=1.3.6.1.4.1.32473.1.1
             - -authorization-policy=/etc/vibedb/authorization-policy.vibejson
             - -replica-control-manifest=/etc/vibedb/replica-control.vibejson
-            - -shard-peer=vibedb-shard-0.vibedb-shard-peer:7511=%s
-            - -shard-peer=vibedb-shard-1.vibedb-shard-peer:7511=%s
-            - -shard-peer=vibedb-shard-2.vibedb-shard-peer:7511=%s
-          ports:
-            - {name: client, containerPort: 7400}
-          startupProbe:
-            tcpSocket: {port: client}
-            failureThreshold: 60
-            periodSeconds: 2
-          readinessProbe:
-            tcpSocket: {port: client}
-            periodSeconds: 2
-            failureThreshold: 2
+            - -shard-peer=vibedb-catalog-0.vibedb-catalog-peer:7511=%s
+            - -shard-peer=vibedb-catalog-1.vibedb-catalog-peer:7511=%s
+            - -shard-peer=vibedb-catalog-2.vibedb-catalog-peer:7511=%s
+            - -shard-peer=vibedb-ledger-0.vibedb-ledger-peer:7511=%s
+            - -shard-peer=vibedb-ledger-1.vibedb-ledger-peer:7511=%s
+            - -shard-peer=vibedb-ledger-2.vibedb-ledger-peer:7511=%s
+            - -shard-peer=vibedb-data-0.vibedb-data-peer:7511=%s
+            - -shard-peer=vibedb-data-1.vibedb-data-peer:7511=%s
+            - -shard-peer=vibedb-data-2.vibedb-data-peer:7511=%s
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          ports: [{name: client, containerPort: 7400}]
+          startupProbe: {tcpSocket: {port: client}, failureThreshold: 60, periodSeconds: 2}
+          readinessProbe: {tcpSocket: {port: client}, periodSeconds: 2, failureThreshold: 2}
+          livenessProbe: {tcpSocket: {port: client}, periodSeconds: 10, failureThreshold: 6}
+          resources: {requests: {cpu: "1", memory: 1Gi}}
           volumeMounts:
             - {name: data, mountPath: /var/lib/vibedb}
             - {name: config, mountPath: /etc/vibedb, readOnly: true}
@@ -289,32 +307,49 @@ spec:
         resources:
           requests: {storage: %s}%s
 ---
+apiVersion: v1
+kind: Service
+metadata: {name: vibedb-replacement-peer, namespace: %s}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app.kubernetes.io/component: replacement}
+  ports:
+    - {name: peer, port: 7411, targetPort: peer}
+    - {name: native, port: 7511, targetPort: native}
+    - {name: snapshot, port: 7611, targetPort: snapshot}
+    - {name: control, port: 7711, targetPort: control}
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: vibedb-learner-bootstrap-template
   namespace: %s
-  annotations:
-    vibedb.io/template: "true"
+  annotations: {vibedb.io/template: "true"}
 spec:
-  serviceName: vibedb-shard-peer
+  serviceName: vibedb-replacement-peer
   replicas: 0
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: vibedb-shard
-      app.kubernetes.io/component: replacement
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: replacement}}
   template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: vibedb-shard
-        app.kubernetes.io/component: replacement
+    metadata: {labels: {app.kubernetes.io/name: vibedb-shard, app.kubernetes.io/component: replacement}}
     spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
       terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: bootstrap
           image: %s
           command: [vibedb-shard]
           args: [bootstrap-rf3, -manifest, /etc/vibedb/bootstrap-rf3.vibejson]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
           volumeMounts:
             - {name: target-data, mountPath: /var/lib/vibedb}
             - {name: target-config, mountPath: /etc/vibedb, readOnly: true}

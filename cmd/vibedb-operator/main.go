@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: vibedb-operator render|prepare")
+		fmt.Fprintln(os.Stderr, "usage: vibedb-operator render|prepare|validate")
 		os.Exit(2)
 	}
 	var err error
@@ -27,6 +28,8 @@ func main() {
 		err = render(os.Args[2:])
 	case "prepare":
 		err = prepare(os.Args[2:])
+	case "validate":
+		err = validate(os.Args[2:])
 	default:
 		err = errors.New("unknown command")
 	}
@@ -36,12 +39,39 @@ func main() {
 	}
 }
 
+func validate(arguments []string) error {
+	flags := flag.NewFlagSet("validate", flag.ContinueOnError)
+	path := flags.String("manifest", "", "rendered Kubernetes manifest, or - for stdin")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *path == "" {
+		return errors.New("validate requires -manifest")
+	}
+	var reader io.Reader = os.Stdin
+	var file *os.File
+	var err error
+	if *path != "-" {
+		file, err = os.Open(*path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		reader = file
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, kubeoperator.MaxManifestBytes+1))
+	if err != nil {
+		return err
+	}
+	return kubeoperator.ValidateRendered(raw)
+}
+
 func render(arguments []string) error {
 	flags := flag.NewFlagSet("render", flag.ContinueOnError)
 	namespace := flags.String("namespace", "vibedb", "Kubernetes namespace")
 	image := flags.String("image", "", "VibeDB image reference")
-	nodes := flags.String("shard-node-ids", "", "three comma-separated TLS node IDs in StatefulSet ordinal order")
-	manifestConfig := flags.String("shard-manifests", "vibedb-rf3-manifests", "ConfigMap containing prepare-{0,1,2}.vibejson")
+	nodes := flags.String("shard-node-ids", "", "nine comma-separated TLS node IDs: catalog, ledger, then data ordinal order")
+	manifestConfig := flags.String("shard-manifests", "vibedb-rf3-manifests", "ConfigMap containing catalog-, ledger-, and data-{0,1,2}.vibejson")
 	tlsSecret := flags.String("shard-tls", "vibedb-rf3-tls", "Secret containing shard TLS material and WAL key source")
 	gatewayConfig := flags.String("gateway-config", "vibedb-gateway-config", "ConfigMap containing catalog, policy, and replica-control manifests")
 	gatewayTLS := flags.String("gateway-tls", "vibedb-gateway-tls", "Secret containing gateway TLS material")
@@ -55,11 +85,11 @@ func render(arguments []string) error {
 		return errors.New("render accepts no positional arguments")
 	}
 	parts := strings.Split(*nodes, ",")
-	if len(parts) != 3 {
-		return errors.New("-shard-node-ids requires exactly three values")
+	if len(parts) != 9 {
+		return errors.New("-shard-node-ids requires exactly nine values")
 	}
 	return kubeoperator.Render(os.Stdout, kubeoperator.Config{Namespace: *namespace, Image: *image,
-		ShardNodeIDs:      [3]string{parts[0], parts[1], parts[2]},
+		ShardNodeIDs:      [9]string(parts),
 		ManifestConfigMap: *manifestConfig, TLSSecret: *tlsSecret,
 		GatewayConfigMap: *gatewayConfig, GatewayTLSSecret: *gatewayTLS,
 		StorageClass: *storageClass, ShardStorage: *shardStorage, GatewayStorage: *gatewayStorage})
@@ -77,7 +107,7 @@ func prepare(arguments []string) error {
 		!validOperatorDirectory(*dataDirectory) {
 		return errors.New("prepare requires canonical absolute manifest and data directories")
 	}
-	ordinal, err := podOrdinal(*hostname)
+	role, ordinal, err := podIdentity(*hostname)
 	if err != nil {
 		return err
 	}
@@ -89,7 +119,7 @@ func prepare(arguments []string) error {
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	manifest := filepath.Join(*manifestDirectory, "prepare-"+strconv.Itoa(ordinal)+".vibejson")
+	manifest := filepath.Join(*manifestDirectory, role+"-"+strconv.Itoa(ordinal)+".vibejson")
 	command := exec.Command("vibedb-shard", "prepare-rf3", "-manifest", manifest)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	if err = command.Run(); err != nil {
@@ -107,17 +137,22 @@ func validOperatorDirectory(path string) bool {
 }
 
 func podOrdinal(hostname string) (int, error) {
-	const prefix = "vibedb-shard-"
-	if !strings.HasPrefix(hostname, prefix) {
-		return 0, errors.New("hostname is not a vibedb-shard StatefulSet pod")
-	}
+	_, ordinal, err := podIdentity(hostname)
+	return ordinal, err
+}
+
+func podIdentity(hostname string) (string, int, error) {
 	cut := strings.LastIndexByte(hostname, '-')
 	if cut <= 0 || cut == len(hostname)-1 {
-		return 0, errors.New("hostname has no StatefulSet ordinal")
+		return "", 0, errors.New("hostname has no StatefulSet ordinal")
+	}
+	role := strings.TrimPrefix(hostname[:cut], "vibedb-")
+	if role != "catalog" && role != "ledger" && role != "data" {
+		return "", 0, errors.New("hostname is not a VibeDB RF3 role StatefulSet pod")
 	}
 	ordinal, err := strconv.Atoi(hostname[cut+1:])
 	if err != nil || ordinal < 0 || ordinal > 2 || strconv.Itoa(ordinal) != hostname[cut+1:] {
-		return 0, errors.New("hostname ordinal is outside the RF3 roster")
+		return "", 0, errors.New("hostname ordinal is outside the RF3 roster")
 	}
-	return ordinal, nil
+	return role, ordinal, nil
 }

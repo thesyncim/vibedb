@@ -31,7 +31,18 @@ jobs:
             bench/competitive/COVERAGE.md
       - name: Require complete competitive evidence matrix
         working-directory: bench/competitive
-        run: go test -count=1 ./internal/coverage
+        run: go test -count=1 ./internal/coverage ./cmd/publishcheck
+      - name: Validate deterministic Kubernetes RF3 topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          ids='11000000000000000000000000000000,12000000000000000000000000000000,13000000000000000000000000000000,21000000000000000000000000000000,22000000000000000000000000000000,23000000000000000000000000000000,31000000000000000000000000000000,32000000000000000000000000000000,33000000000000000000000000000000'
+          first="${RUNNER_TEMP}/vibedb-kubernetes-first.yaml"
+          second="${RUNNER_TEMP}/vibedb-kubernetes-second.yaml"
+          go run ./cmd/vibedb-operator render -image vibedb:${GITHUB_SHA} -namespace vibedb-test -shard-node-ids "${ids}" > "${first}"
+          go run ./cmd/vibedb-operator render -image vibedb:${GITHUB_SHA} -namespace vibedb-test -shard-node-ids "${ids}" > "${second}"
+          cmp "${first}" "${second}"
+          go run ./cmd/vibedb-operator validate -manifest "${first}"
   test:
     name: test (${{ matrix.runner }})
     strategy:
