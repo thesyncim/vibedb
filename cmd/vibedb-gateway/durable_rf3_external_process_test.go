@@ -145,8 +145,8 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	// readback. This exercises the shipped path on two-voter quorums for every
 	// role rather than proving only adjacent read availability.
 	terminalRequest := hotMutationRequest(t, reference, 1, []serveStatement{
-		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-a","value":101}`}}},
-		{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-b","value":202}`}}},
+		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-a","kind":"terminal","email":"terminal-a@example.test","value":101}`}}},
+		{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-b","kind":"terminal","email":"terminal-b@example.test","value":202}`}}},
 	})
 	terminalLossLatency := clientA.loseResponseAfterFirstByte(t, terminalRequest)
 	latencies = append(latencies, terminalLossLatency)
@@ -458,10 +458,36 @@ func newDurableRF3ExternalFixture(
 		"CREATE TABLE orders_a (PRIMARY KEY (id))",
 		"CREATE TABLE orders_b (PRIMARY KEY (id))",
 	}
+	schemas := [durableRF3ExternalGroups][]string{
+		nil, nil,
+		{`CREATE INDEX by_kind_a ON orders_a (kind)`,
+			`CREATE TABLE orders_b_email (PRIMARY KEY (key))`},
+		{`CREATE INDEX by_kind_b ON orders_b (kind)`,
+			`CREATE TABLE orders_a_email (PRIMARY KEY (key))`},
+	}
+	// Each base shard owns its local exact index and the other table's global
+	// exact-index relation. Consequently every orders_a/orders_b mutation batch
+	// crosses both independently led RF3 groups while each group applies one
+	// base/local bundle and one remote global-index relation atomically.
+	globalIndexes := [durableRF3ExternalGroups][]sqldriver.ReplicatedGlobalIndexRelation{
+		nil, nil,
+		{{Relation: 2, Table: "orders_b_email", IndexID: 42, Incarnation: 1,
+			LocatorCount: 1, Unique: true,
+			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits}},
+		{{Relation: 2, Table: "orders_a_email", IndexID: 41, Incarnation: 1,
+			LocatorCount: 1, Unique: true,
+			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits}},
+	}
 	seed := [durableRF3ExternalGroups][][]byte{
 		nil, nil,
-		{[]byte(`{"id":"seed-a","value":1}`)},
-		{[]byte(`{"id":"seed-b","value":2}`)},
+		{[]byte(`{"id":"seed-a","kind":"seed","email":"seed-a@example.test","value":1}`)},
+		{[]byte(`{"id":"seed-b","kind":"seed","email":"seed-b@example.test","value":2}`)},
 	}
 	var prepared [durableRF3ExternalGroups][durableRF3ExternalVoters]rf3testfixture.PreparedProcessMember
 	var memberNodes [3]rafttransport.NodeID
@@ -488,6 +514,7 @@ func newDurableRF3ExternalFixture(
 					Credential: fixture.credentials[member], Roots: fixture.roots,
 					AuthorizationPolicy: fixture.policy, Nodes: memberNodes,
 					PeerAddresses: peerAddresses, SeedDocuments: seed[group],
+					SchemaStatements: schemas[group], GlobalIndexes: globalIndexes[group],
 				},
 			)
 			if errors.Is(err, storeio.ErrStrictAllocationUnsupported) ||
@@ -526,9 +553,31 @@ func newDurableRF3ExternalFixture(
 					Identity: replication.Digest(ledgerIdentity),
 				}}},
 			{Route: fixture.routes[durableRF3DataAGroup], Table: tables[durableRF3DataAGroup],
-				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20},
+				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+				AdditionalTables: []rf3testfixture.DurableCatalogTable{{Table: "orders_b_email",
+					PrimaryKey: "/email", Relation: 2, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20}}},
 			{Route: fixture.routes[durableRF3DataBGroup], Table: tables[durableRF3DataBGroup],
-				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20},
+				PrimaryKey: "/id", Relation: 1, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+				AdditionalTables: []rf3testfixture.DurableCatalogTable{{Table: "orders_a_email",
+					PrimaryKey: "/email", Relation: 2, MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20}}},
+		},
+		Indexes: []gateway.IndexDescriptor{
+			{IndexID: 31, Incarnation: 1, Table: "orders_a", Name: "by_kind_a",
+				Paths: []string{"/kind"}, Flags: gateway.IndexLocal | gateway.IndexOrdered,
+				Lifecycle: gateway.IndexReady},
+			{IndexID: 32, Incarnation: 1, Table: "orders_b", Name: "by_kind_b",
+				Paths: []string{"/kind"}, Flags: gateway.IndexLocal | gateway.IndexOrdered,
+				Lifecycle: gateway.IndexReady},
+			{IndexID: 41, Incarnation: 1, Table: "orders_a", Name: "by_email_a",
+				Relation: "orders_a_email", Paths: []string{"/email"},
+				LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+				Flags:     gateway.IndexGlobal | gateway.IndexUnique | gateway.IndexOrdered,
+				Lifecycle: gateway.IndexReady},
+			{IndexID: 42, Incarnation: 1, Table: "orders_b", Name: "by_email_b",
+				Relation: "orders_b_email", Paths: []string{"/email"},
+				LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+				Flags:     gateway.IndexGlobal | gateway.IndexUnique | gateway.IndexOrdered,
+				Lifecycle: gateway.IndexReady},
 		},
 	})
 	if err != nil {
