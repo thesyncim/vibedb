@@ -692,7 +692,6 @@ func servePreparedRF3WithExecutionLanes(
 		item := &preparedSet.groups[index]
 		target := item.manifest.EnrolledTarget
 		groupIdentity := identities[index]
-		publication := publications[index]
 		itemGroup := groupIdentity.Group
 		if target == nil || groupIdentity.MemberID == target.MemberID {
 			continue
@@ -779,16 +778,8 @@ func servePreparedRF3WithExecutionLanes(
 			Group: itemGroup, Service: sourceService,
 		})
 		dataService, serviceErr := provider.NewDataService(snapshottransfer.ServiceOptions{
-			Registry: transportRegistry,
-			Authorize: func(descriptor snapshottransfer.Descriptor) bool {
-				return descriptor.Group == itemGroup &&
-					descriptor.SourceMember == groupIdentity.MemberID &&
-					descriptor.TargetMember == target.MemberID &&
-					descriptor.TargetStore == target.StoreID &&
-					descriptor.TargetIncarnation == target.NodeIncarnation &&
-					descriptor.SchemaGeneration == item.base.Binding.Authority.SchemaGeneration &&
-					descriptor.ReplicaSetVersion == publication.ReplicaSetVersion
-			},
+			Registry:     transportRegistry,
+			Authorize:    rf3SnapshotDataAuthorizer(item.apply, groupIdentity, *target),
 			ReadDeadline: deadline, WriteDeadline: deadline,
 			MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
 			MaxChunkBytes:  manifest.ReplicaControl.SourceChunkBytes,
