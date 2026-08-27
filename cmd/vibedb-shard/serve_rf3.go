@@ -769,7 +769,7 @@ func servePreparedRF3WithExecutionLanes(
 	// advertise a partial or memory-only executor.
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, sourceControl, actionControl,
-		nil, schemaControl, nil, nil, childPrepareControl,
+		nil, schemaControl, nil, nil, nil, childPrepareControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
@@ -921,10 +921,10 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action, split, schema, admission, tail,
+	membership, observation, source, action, split, schema, planObservation, admission, tail,
 	childPrepare shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 9)
+	routes := make([]shardcontrol.Route, 0, 10)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -957,6 +957,12 @@ func newRF3ControlMux(
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: schemainstall.RequestDiscriminator(),
 			Handler:       schema,
+		})
+	}
+	if planObservation != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: splitcontroller.PlanObservationRequestDiscriminator(),
+			Handler:       planObservation,
 		})
 	}
 	if admission != nil {
