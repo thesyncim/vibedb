@@ -39,7 +39,7 @@ func TestGatewayReadBatchRF3ExternalProcessChaos(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
-	fixture := newDurableRF3ExternalFixture(t, ctx)
+	fixture := newDurableRF3ExternalFixtureWithPeerFaults(t, ctx, true)
 	defer fixture.close(t)
 	fixture.startShards(t)
 	fixture.startGateway(t, fixture.gatewayA)
@@ -83,35 +83,34 @@ func TestGatewayReadBatchRF3ExternalProcessChaos(t *testing.T) {
 	latencies = append(latencies, delayedLatency)
 	assertReadBatchRF3ExternalResponse(t, fixture, delayedRaw)
 
-	// Partition the current data-a leader while keeping its sockets open. The
+	// Partition only the current data-a leader's Raft peer links. Its native
+	// listener and process stay live, so refusal is tested while isolated. The
 	// gateway must discover the elected quorum leader with bounded attempts and
 	// return one complete vector; partial per-group results are forbidden.
 	oldLeader, _ := fixture.waitRouteLeader(t, durableRF3DataAGroup, -1, 30*time.Second)
 	partitioned := durableRF3ExternalLeaderMember(t, oldLeader)
 	partitionStarted := time.Now()
-	if err := syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGSTOP); err != nil {
-		t.Fatal(err)
-	}
-	partitionActive := true
-	defer func() {
-		if partitionActive {
-			_ = syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT)
+	setPartition := func(blocked bool) {
+		for source := range fixture.peerLinks {
+			for target, link := range fixture.peerLinks[source] {
+				if link != nil && (source == partitioned || target == partitioned) {
+					link.setBlocked(blocked)
+				}
+			}
 		}
-	}()
+	}
+	setPartition(true)
+	defer setPartition(false)
 	fixture.waitAllRoleLeaders(t, partitioned, 30*time.Second)
 	partitionFailover := time.Since(partitionStarted)
 	partitionRaw, partitionLatency := client.roundTrip(t, request)
 	latencies = append(latencies, partitionLatency)
 	partitionResult := assertReadBatchRF3ExternalResponse(t, fixture, partitionRaw)
 	assertReadBatchRF3RetriesBounded(t, partitionResult, 15)
-	if err := syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT); err != nil {
-		t.Fatal(err)
-	}
-	partitionActive = false
-
-	// A resumed former leader is addressed directly with the production native
-	// batch frame. It must refuse rather than serve a linearizable cut locally.
+	// Address the still-isolated former leader with the production native
+	// frame, before healing. It must refuse a local linearizable cut.
 	assertReadBatchRF3FormerLeaderRefuses(t, fixture, partitioned)
+	setPartition(false)
 	fixture.waitMemberCaughtUpAllRoles(t, partitioned, 45*time.Second)
 
 	// Kill the current leader of the other data group, read through the new
@@ -333,9 +332,6 @@ func assertReadBatchRF3FormerLeaderRefuses(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.LeaderID == uint64(member+1) {
-		t.Fatalf("partitioned member %d regained leadership before refusal proof", member+1)
-	}
 	key, ok := orderedkey.AppendString(nil, []byte("seed-a"), orderedkey.Ascending)
 	if !ok {
 		t.Fatal("encode read_batch primary key")
@@ -352,6 +348,7 @@ func assertReadBatchRF3FormerLeaderRefuses(
 		fixture.routes[durableRF3DataAGroup].Replicas[member],
 		&shardservice.ReplicatedRequest{
 			Operation:  shardservice.ReplicatedReadBatchLeader,
+			Authority:  serviceauthz.Authority{Node: fixture.nodes[fixture.observerNode], Generation: 5},
 			Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
 			BatchRead: packed, MinimumApplied: 1, MaxValueBytes: 1 << 20,
 		},

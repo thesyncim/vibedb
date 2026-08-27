@@ -377,6 +377,7 @@ type durableRF3ExternalFixture struct {
 
 	measurements *durableRF3ExternalMeasurements
 	seeded       bool
+	peerLinks    [durableRF3ExternalVoters][durableRF3ExternalVoters]*rf3PeerProxy
 }
 
 type durableRF3ExternalMeasurements struct {
@@ -389,6 +390,10 @@ func newDurableRF3ExternalFixture(
 	t *testing.T,
 	ctx context.Context,
 ) *durableRF3ExternalFixture {
+	return newDurableRF3ExternalFixtureWithPeerFaults(t, ctx, false)
+}
+
+func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Context, peerFaults bool) *durableRF3ExternalFixture {
 	t.Helper()
 	fixture := &durableRF3ExternalFixture{ctx: ctx, root: t.TempDir(),
 		gatewayANode: 3, gatewayBNode: 4, userNode: 5, observerNode: 6}
@@ -439,9 +444,24 @@ func newDurableRF3ExternalFixture(
 	for member := range peerAddresses {
 		peerAddresses[member] = fixture.listeners[member].Peer
 	}
+	if peerFaults {
+		for source := range fixture.peerLinks {
+			for target := range fixture.peerLinks[source] {
+				if source != target {
+					fixture.peerLinks[source][target] = newRF3PeerProxy(t, peerAddresses[target])
+				}
+			}
+		}
+	}
 	for group := 0; group < durableRF3ExternalGroups; group++ {
 		profile := profiles[group]
 		for member := 0; member < durableRF3ExternalVoters; member++ {
+			memberPeerAddresses := peerAddresses
+			for target, link := range fixture.peerLinks[member] {
+				if link != nil {
+					memberPeerAddresses[target] = link.listener.Addr().String()
+				}
+			}
 			prepared[group][member], err = rf3testfixture.PrepareProcessMember(
 				rf3testfixture.ProcessMemberOptions{
 					Root:        filepath.Join(fixture.root, fmt.Sprintf("role-%d-member-%d", group, member+1)),
@@ -451,7 +471,7 @@ func newDurableRF3ExternalFixture(
 					Authority: profile.Authority, Apply: profile.Apply, Listeners: fixture.listeners[member],
 					Credential: fixture.credentials[member], Roots: fixture.roots,
 					AuthorizationPolicy: fixture.policy, Nodes: memberNodes,
-					PeerAddresses: peerAddresses, SeedDocuments: profile.SeedDocuments,
+					PeerAddresses: memberPeerAddresses, SeedDocuments: profile.SeedDocuments,
 					SchemaStatements: profile.SchemaStatements, GlobalIndexes: profile.GlobalIndexes,
 				},
 			)
@@ -1304,39 +1324,14 @@ func (client *durableRF3ExternalWireClient) assertPoint(
 	table, identifier string,
 ) time.Duration {
 	t.Helper()
-	raw, err := vibejson.Marshal(&serveRequest{Op: "query",
-		SQL: "SELECT id, value FROM " + table + " WHERE id = ?", Class: "interactive",
-		Params: []serveParam{{Kind: "string", Text: identifier}},
-	})
+	request := rf3FixturePointRequest(table, identifier)
+	raw, err := vibejson.Marshal(&request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	response, latency := client.roundTrip(t, raw)
-	document, err := vibejson.Parse(response)
-	if err != nil {
-		t.Fatalf("point response=%s err=%v", response, err)
-	}
-	if failure, found := document.Get("error"); found {
-		message, _ := failure.Text()
-		if message != "" {
-			t.Fatalf("point response=%s", response)
-		}
-	}
-	rows, found := document.Get("rows")
-	if !found {
-		t.Fatalf("point response has no rows: %s", response)
-	}
-	rowValues, ok := rows.Array()
-	if !ok || len(rowValues) != 1 {
-		t.Fatalf("point rows=%s", response)
-	}
-	cells, ok := rowValues[0].Array()
-	if !ok || len(cells) != 2 {
-		t.Fatalf("point cells=%s", response)
-	}
-	got, ok := cells[0].Text()
-	if !ok || got != identifier {
-		t.Fatalf("point id=%q want=%q response=%s", got, identifier, response)
+	if !rf3FixturePointResponseMatches(response, identifier) {
+		t.Fatalf("replicated point id=%q response=%s", identifier, response)
 	}
 	return latency
 }
