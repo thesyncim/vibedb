@@ -23,16 +23,20 @@ func TestReplicatedSchemaCatalogImageCanonicalWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	machineManifest, err := claim.RangeSplitRelationManifestDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if witness.Bytes != uint64(len(raw)) || witness.Digest == ([32]byte{}) ||
 		witness.SchemaGeneration != identity.RelationSchemaGeneration ||
-		witness.RelationManifestDigest != replicatedRelationApplyManifestDigest(identity) ||
+		witness.RelationManifestDigest != machineManifest ||
 		witness.LocalRelationManifestDigest != identity.RelationManifestDigest ||
 		witness.ApplyProfileDigest == ([32]byte{}) {
 		t.Fatalf("catalog image witness = %+v", witness)
 	}
 	if !witness.MatchesRolloutTarget(
 		uint64(len(raw)), witness.Digest, identity.RelationSchemaGeneration,
-		replicatedRelationApplyManifestDigest(identity),
+		machineManifest,
 	) {
 		t.Fatal("exact rollout target did not match")
 	}

@@ -16,7 +16,8 @@ var ErrReplicatedSchemaCatalogImage = errors.New("vibedb: invalid replicated sch
 
 // ReplicatedSchemaCatalogImage is the bounded public witness returned for an
 // opaque rollout bundle. It deliberately exposes no mutable catalog metadata.
-// RelationManifestDigest is the portable logical manifest used by Raft; the
+// RelationManifestDigest is the exact serving-machine schema used by Raft,
+// including placement and authenticated index validation; the
 // LocalRelationManifestDigest additionally authenticates this replica's exact
 // storage identities.
 type ReplicatedSchemaCatalogImage struct {
@@ -84,10 +85,15 @@ func openReplicatedSchemaCatalogImage(
 		)
 	}
 	identity := *catalog.ReplicatedShardStore
+	manifest, err := ReplicatedSchemaManifest(identity, catalog.ReplicatedApply.Placement,
+		replicatedApplyLocalIndexes(&table{meta: catalog.Tables[identity.UserTable]}))
+	if err != nil {
+		return catalogFile{}, ReplicatedSchemaCatalogImage{}, errors.Join(ErrReplicatedSchemaCatalogImage, err)
+	}
 	return catalog, ReplicatedSchemaCatalogImage{
 		Bytes: uint64(len(raw)), Digest: sha256.Sum256(raw),
 		SchemaGeneration:            identity.RelationSchemaGeneration,
-		RelationManifestDigest:      replicatedRelationApplyManifestDigest(identity),
+		RelationManifestDigest:      manifest,
 		LocalRelationManifestDigest: identity.RelationManifestDigest,
 		ApplyProfileDigest:          catalog.ReplicatedApply.ValidationDigest,
 	}, nil
