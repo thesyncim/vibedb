@@ -36,6 +36,7 @@ type restoreServingPublication struct{ digest [32]byte }
 // RestoreServingGate is process-local by design. A restart closes serving and
 // requires the gateway to repeat its linearizable catalog observation.
 type RestoreServingGate struct {
+	operation       [32]byte
 	group           raftmember.GroupKey
 	member          uint64
 	node            rafttransport.NodeID
@@ -45,19 +46,19 @@ type RestoreServingGate struct {
 }
 
 func NewRestoreServingGate(identity raftmember.RuntimeIdentity,
-	node rafttransport.NodeID,
+	node rafttransport.NodeID, operation [32]byte,
 ) (*RestoreServingGate, error) {
-	if identity.Group == (raftmember.GroupKey{}) || identity.MemberID == 0 ||
+	if operation == ([32]byte{}) || identity.Group == (raftmember.GroupKey{}) || identity.MemberID == 0 ||
 		identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 ||
 		node == (rafttransport.NodeID{}) {
 		return nil, ErrRestoreServingControl
 	}
-	return &RestoreServingGate{group: identity.Group, member: identity.MemberID, node: node,
+	return &RestoreServingGate{operation: operation, group: identity.Group, member: identity.MemberID, node: node,
 		store: identity.StoreID, nodeIncarnation: identity.NodeIncarnation}, nil
 }
 
 func (gate *RestoreServingGate) Install(grant clusterrestore.ServingGrant) error {
-	if gate == nil || grant.Group() != gate.group || grant.Member() != gate.member ||
+	if gate == nil || grant.Operation() != gate.operation || grant.Group() != gate.group || grant.Member() != gate.member ||
 		grant.Node() != gate.node || grant.Store() != gate.store ||
 		grant.NodeIncarnation() != gate.nodeIncarnation || grant.Digest() == ([32]byte{}) {
 		return ErrRestoreServingControl
@@ -153,7 +154,7 @@ func (service *RestoreServingControlService) Serve(ctx context.Context,
 	if !found {
 		return ErrRestoreServingControl
 	}
-	if grant.Member() != gate.member || grant.Node() != gate.node || grant.Store() != gate.store {
+	if grant.Operation() != gate.operation || grant.Member() != gate.member || grant.Node() != gate.node || grant.Store() != gate.store {
 		return ErrRestoreServingControl
 	}
 	expected, err := grant.ForObservedIncarnation(gate.nodeIncarnation)

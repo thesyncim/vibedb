@@ -22,7 +22,7 @@ func TestRestoreServingControlRequiresLiveDedicatedAuthorityAndExactReplica(t *t
 		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
 	node, store := rafttransport.NodeID{6}, [16]byte{7}
 	identity := raftmember.RuntimeIdentity{Group: group, MemberID: 2, StoreID: store, NodeIncarnation: 1}
-	gate, err := NewRestoreServingGate(identity, node)
+	gate, err := NewRestoreServingGate(identity, node, [32]byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestRestoreServingControlRequiresLiveDedicatedAuthorityAndExactReplica(t *t
 	}
 	// A new process-local gate starts closed even beside the same durable root.
 	identity.NodeIncarnation++
-	restarted, err := NewRestoreServingGate(identity, node)
+	restarted, err := NewRestoreServingGate(identity, node, [32]byte{1})
 	restartedState := raftservice.ServingState{Identity: identity}
 	if err != nil || restarted.Allows(restartedState) {
 		t.Fatalf("restarted gate open=%t err=%v", restarted.Allows(restartedState), err)
@@ -94,7 +94,7 @@ func TestRestoreServingControlRejectsDelayedFinalGrantAfterRestart(t *testing.T)
 		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
 	node, store := rafttransport.NodeID{6}, [16]byte{7}
 	identity := raftmember.RuntimeIdentity{Group: group, MemberID: 1, StoreID: store, NodeIncarnation: 2}
-	gate, err := NewRestoreServingGate(identity, node)
+	gate, err := NewRestoreServingGate(identity, node, [32]byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,10 +143,18 @@ func TestRestoreServingControlRejectsOtherCapabilitiesAndStaleReplica(t *testing
 		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
 	node, store := rafttransport.NodeID{6}, [16]byte{7}
 	identity := raftmember.RuntimeIdentity{Group: group, MemberID: 2, StoreID: store, NodeIncarnation: 1}
-	gate, _ := NewRestoreServingGate(identity, node)
+	gate, _ := NewRestoreServingGate(identity, node, [32]byte{1})
 	stale := restoreServingGrantFixture(t, group, 2, node, store, 2)
 	if err := gate.Install(stale); !errors.Is(err, ErrRestoreServingControl) {
 		t.Fatalf("stale incarnation err=%v", err)
+	}
+	foreignOperation, err := NewRestoreServingGate(identity, node, [32]byte{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := restoreServingGrantFixture(t, group, 2, node, store, 1)
+	if err := foreignOperation.Install(current); !errors.Is(err, ErrRestoreServingControl) {
+		t.Fatalf("foreign restore operation err=%v", err)
 	}
 	for _, capability := range []serviceauthz.Capability{serviceauthz.CapabilityBackup,
 		serviceauthz.CapabilityTopology, serviceauthz.CapabilityMembership} {
@@ -169,7 +177,7 @@ func TestRestoreServingControlRegistryRejectsDuplicateGroups(t *testing.T) {
 	node := rafttransport.NodeID{6}
 	gate, err := NewRestoreServingGate(raftmember.RuntimeIdentity{
 		Group: group, MemberID: 1, StoreID: [16]byte{7}, NodeIncarnation: 1,
-	}, node)
+	}, node, [32]byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -462,7 +462,7 @@ func servePreparedRF3WithExecutionLanes(
 		}
 		itemGroup := groupFromBinding(item.base.Binding)
 		restoreGate, gateErr := shardservice.NewRestoreServingGate(
-			identities[index], profile.LocalIdentity().Node,
+			identities[index], profile.LocalIdentity().Node, operation,
 		)
 		if gateErr != nil {
 			return closeAdopted(gateErr)
