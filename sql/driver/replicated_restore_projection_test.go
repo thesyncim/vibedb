@@ -3,6 +3,7 @@ package driver
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -86,6 +87,12 @@ func TestReplicatedRestoreProjectionDropsSourceRowsAndResumes(t *testing.T) {
 	}
 	// The compact seeded certificate has no streamed geometry. Verify the
 	// actual target system row separately through a complete streamed export.
+	if cut, err := activation.Apply.SnapshotArtifactCut(); cut != nil || !errors.Is(err, ErrReplicatedApplyBasePending) {
+		t.Fatalf("export before exact Raft snapshot-base installation: cut=%v err=%v", cut, err)
+	}
+	if _, err := activation.Apply.InstallSnapshot(activation.SnapshotBase); err != nil {
+		t.Fatalf("install exact activated snapshot base: %v", err)
+	}
 	cut, err := activation.Apply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
