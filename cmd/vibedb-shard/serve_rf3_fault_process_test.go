@@ -77,7 +77,6 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	// Isolate the elected process without closing its established peer sockets.
 	// The remaining quorum must elect, and the resumed former leader must reject
 	// a linearizable read carrying its pre-isolation serving fence.
-	oldFence := states[leader].Fence
 	if err := fixture.children[leader].command.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatal(err)
 	}
@@ -87,13 +86,9 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.waitMemberLeader(t, leader, uint64(newLeader+1), 30*time.Second)
-	response, err := fixture.roundTrip(t, leader, &shardservice.ReplicatedRequest{
-		Operation:  shardservice.ReplicatedReadLeader,
-		Authority:  serviceauthz.Authority{Node: fixture.nodes[(leader+1)%rf3CommandMembers], Generation: fixture.authority.ActivePolicyGeneration},
-		Capability: serviceauthz.CapabilityDataRead,
-		Fence:      oldFence, Relation: 1, Key: rf3FaultKey(t, "isolated-former-leader"),
-		MaxValueBytes: 1 << 20,
-	})
+	response, err := fixture.roundTrip(t, leader, fixture.readRequest(
+		leader, states[leader], rf3FaultKey(t, "isolated-former-leader"),
+	))
 	if err != nil {
 		t.Fatalf("resumed former leader read: %v", err)
 	}
@@ -956,16 +951,7 @@ func (fixture *rf3FaultFixture) waitDocument(
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		response, err := fixture.roundTrip(t, member, &shardservice.ReplicatedRequest{
-			Operation: shardservice.ReplicatedReadLeader,
-			Authority: serviceauthz.Authority{
-				Node:       fixture.nodes[(member+1)%rf3CommandMembers],
-				Generation: fixture.authority.ActivePolicyGeneration,
-			},
-			Capability: serviceauthz.CapabilityDataRead,
-			Fence:      state.Fence, Relation: 1, Key: rf3FaultKey(t, id),
-			MaxValueBytes: 1 << 20,
-		})
+		response, err := fixture.roundTrip(t, member, fixture.readRequest(member, state, rf3FaultKey(t, id)))
 		if err == nil && response.Kind == shardservice.ReplicatedReadFound &&
 			string(response.Value) == fmt.Sprintf(`{"id":%q}`, id) {
 			return response.ReadApplied
@@ -974,6 +960,13 @@ func (fixture *rf3FaultFixture) waitDocument(
 	}
 	t.Fatalf("member %d did not make document %q visible", member+1, id)
 	return 0
+}
+
+func (fixture *rf3FaultFixture) readRequest(member int, state shardservice.ReplicatedMemberState, key []byte) *shardservice.ReplicatedRequest {
+	return &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedReadLeader,
+		Authority:  serviceauthz.Authority{Node: fixture.nodes[(member+1)%rf3CommandMembers], Generation: fixture.authority.ActivePolicyGeneration},
+		Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence, Relation: 1, Key: key,
+		MinimumApplied: state.Applied, MaxValueBytes: 1 << 20}
 }
 
 func rf3FaultKey(t testing.TB, id string) []byte {
