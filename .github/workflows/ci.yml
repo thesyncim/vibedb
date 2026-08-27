@@ -188,8 +188,12 @@ jobs:
               "${metric}" "${p50}" "${p99}" "${max_value}" "${maximum}" >> "${summary}"
           done <<'EOF'
           failover_millis 30000
+          move_set_admission_millis 30000
           controller_restart_millis 15000
           replacement_millis 90000
+          group_replacement_p50_millis 90000
+          group_replacement_p99_millis 90000
+          group_replacement_max_millis 90000
           cleanup_millis 60000
           abandonment_rename_restart_millis 15000
           abandonment_unlink_restart_millis 15000
