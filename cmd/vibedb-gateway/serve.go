@@ -24,6 +24,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -441,12 +442,23 @@ func runServe(args []string) int {
 			Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
 			Authority: catalogAuthority, Replicated: replicated, Drainer: drainer,
 		})
+		prepareConcurrency := min(int(manifest.Bounds.MaxConnections), gatewaySplitAdmissionConcurrency)
+		childPrepareClient, childPrepareErr := splitcontroller.NewChildPrepareClient(
+			splitcontroller.ChildPrepareClientOptions{
+				Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
+				MaxConcurrent:    prepareConcurrency,
+				MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * uint64(prepareConcurrency),
+			},
+		)
+		splitFactory, splitFactoryErr := newGatewayHotSplitFactory(childPrepareClient, manifest)
 		moveController, controllerErr := newGatewayReplicaMoveController(
 			catalogAuthority, replicated, controls,
 		)
 		var hotShardBindErr error
 		if hotShardRuntime != nil && (controllerErr != nil || controlsErr != nil ||
+			childPrepareErr != nil || splitFactoryErr != nil ||
 			!hotShardRuntime.InstallOperationAuthorities(gatewayHotShardOperationAuthorities{
+				splits: splitFactory, journal: catalogAuthority,
 				moves: gatewayHotReplicaMoveFactory{observations: controls.HealthObservations,
 					grants: catalogAuthority},
 				moveRun: moveController,
@@ -484,7 +496,8 @@ func runServe(args []string) int {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, controllerErr, hotShardBindErr, healthErr, revisionErr,
+		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, childPrepareErr, splitFactoryErr,
+			controllerErr, hotShardBindErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
 			if splitRuntime != nil {
 				_ = splitRuntime.Close()
