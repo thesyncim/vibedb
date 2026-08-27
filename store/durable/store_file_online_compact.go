@@ -150,6 +150,9 @@ func (c *Collection) publishOnlineMigrationReservationLocked(
 	bytes, logicalIDs uint64,
 ) (storeio.UnrootedGenerationReservation, uint64, error) {
 	var reservation storeio.UnrootedGenerationReservation
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return reservation, 0, err
+	}
 	state := c.state.Load()
 	if state == nil || state.root.MigrationManifestOffset == 0 {
 		return reservation, 0, storeio.ErrInvalidWrite
@@ -223,6 +226,9 @@ func (c *Collection) growOnlineMigrationStaging(
 	if c.closed {
 		return reservation, storeio.GenerationMigrationManifest{}, ErrClosed
 	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return reservation, storeio.GenerationMigrationManifest{}, err
+	}
 	// Foreground packed publications can accumulate between staging grows.
 	// Materialize them while the observer is still attached before the allocator
 	// root advances the physical generation; otherwise a later grow could leap
@@ -262,10 +268,25 @@ func (c *Collection) CompactOnline() (OnlineCompactionReport, error) {
 	if c == nil {
 		return total, ErrClosed
 	}
-	if !c.autoCompactionFlight.CompareAndSwap(false, true) {
+	if !c.onlineCompactionFlight.CompareAndSwap(false, true) {
 		return total, storeio.ErrQueueFull
 	}
-	defer c.autoCompactionFlight.Store(false)
+	defer c.onlineCompactionFlight.Store(false)
+	// The flight is reserved before taking writer. Group activation checks the
+	// same token while holding writer; whichever wins excludes the other for
+	// the complete unlocked scan, install, and retirement lifecycle.
+	c.writer.Lock()
+	if c.closed {
+		c.writer.Unlock()
+		return total, ErrClosed
+	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		c.writer.Unlock()
+		return total, err
+	}
+	c.onlineCompactionWait.Add(1)
+	defer c.onlineCompactionWait.Done()
+	c.writer.Unlock()
 	if state := c.state.Load(); state != nil && state.root.MigrationManifestOffset != 0 {
 		manifestStore, err := storeio.OpenGenerationMigrationManifestStore(
 			c.file, int64(state.root.MigrationManifestOffset),
@@ -432,6 +453,9 @@ func (c *Collection) retireOnlineMigrationExtentsAndMaybeClear(
 	defer c.writer.Unlock()
 	if c.closed {
 		return ErrClosed
+	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
 	}
 	if err := c.flushPendingForStructural(); err != nil {
 		return err
@@ -604,6 +628,12 @@ func (c *Collection) compactOnlineAttempt() (OnlineCompactionReport, error) {
 
 	c.writer.Lock()
 	defer c.writer.Unlock()
+	if c.closed {
+		return report, ErrClosed
+	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return report, err
+	}
 	// A packed/overlay mutation may have advanced the logical root without a
 	// physical committer publication while the scan ran. Materialize it while
 	// the observer is still attached so the attempt is invalidated, and so a

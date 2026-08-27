@@ -94,11 +94,6 @@ func (c *Collection) initializeFileState(state *fileStoreState) {
 	c.durableState.Store(state)
 	c.visibleState.Store(state)
 	c.resetPackedLogicalCut(state)
-	if c.options.AutomaticCompaction.Enabled && state != nil {
-		c.autoCompactionBaseFileEnd.Store(state.fileEnd)
-		c.autoCompactionBaseGeneration.Store(state.root.Generation)
-		c.autoCompactionArmed.Store(true)
-	}
 }
 
 // publishFileState records the writer's applied state after the committer has
@@ -123,7 +118,6 @@ func (c *Collection) publishFileState(state *fileStoreState) {
 		fileLogicalCutBeforeResetHook(state)
 	}
 	c.resetPackedLogicalCut(state)
-	c.considerAutomaticCompaction(state)
 }
 
 // recordPendingFileStateLocked installs state in the fixed visibility ring

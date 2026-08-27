@@ -756,7 +756,7 @@ func newCheckpointGroup(
 	}()
 	for _, collection := range order {
 		if collection.closed || collection.checkpointGroup.Load() != nil ||
-			collection.checkpointGroupRetired.Load() {
+			collection.checkpointGroupRetired.Load() || collection.onlineCompactionFlight.Load() {
 			return nil, ErrCheckpointGroupOwned
 		}
 	}
@@ -1092,7 +1092,8 @@ func (g *CheckpointGroup) attachLocked() error {
 		}
 	}()
 	for _, c := range order {
-		if c.closed || c.checkpointGroup.Load() != nil || c.checkpointGroupRetired.Load() {
+		if c.closed || c.checkpointGroup.Load() != nil || c.checkpointGroupRetired.Load() ||
+			c.onlineCompactionFlight.Load() {
 			return ErrCheckpointGroupOwned
 		}
 	}

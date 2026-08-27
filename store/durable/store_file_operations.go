@@ -950,7 +950,6 @@ func (c *Collection) Stats() Stats {
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
 		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(c.reusable)),
-		AutomaticCompaction: c.AutomaticCompactionStatus(),
 	}
 	if leases.Active != 0 && current > leases.MinimumGeneration {
 		stats.OldestSnapshotAgeGenerations = current - leases.MinimumGeneration
