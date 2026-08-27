@@ -28,6 +28,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
@@ -41,16 +42,21 @@ import (
 )
 
 const (
-	rf3IdentityFileBytes          = 256 << 10
-	rf3TickInterval               = 50 * time.Millisecond
-	rf3WALGenerationIntervalTicks = uint64((10 * time.Minute) / rf3TickInterval)
-	rf3NetworkTimeout             = 10 * time.Second
-	rf3RequestTimeout             = 15 * time.Second
-	rf3DefaultExecutionLanes      = 8
-	rf3SchemaInstallRecords       = 256
-	rf3SchemaInstallArtifacts     = 16
-	rf3SchemaInstallDiskBytes     = 1 << 30
+	rf3IdentityFileBytes                 = 256 << 10
+	rf3TickInterval                      = 50 * time.Millisecond
+	rf3DefaultWALGenerationIntervalTicks = uint64((10 * time.Minute) / rf3TickInterval)
+	rf3NetworkTimeout                    = 10 * time.Second
+	rf3RequestTimeout                    = 15 * time.Second
+	rf3DefaultExecutionLanes             = 8
+	rf3SchemaInstallRecords              = 256
+	rf3SchemaInstallArtifacts            = 16
+	rf3SchemaInstallDiskBytes            = 1 << 30
 )
+
+// A variable keeps the production default immutable in behavior while letting
+// the external command qualification compress ten-minute maintenance windows
+// without adding a serving flag or environment-controlled production path.
+var rf3WALGenerationIntervalTicks = rf3DefaultWALGenerationIntervalTicks
 
 var errRF3Serving = errors.New("vibedb-shard: invalid RF3 serving configuration")
 
@@ -60,6 +66,7 @@ func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
 	}
 	nodes := append(policy.NodesWith(serviceauthz.CapabilityMembership),
 		policy.NodesWith(serviceauthz.CapabilitySchema)...)
+	nodes = append(nodes, policy.NodesWith(serviceauthz.CapabilityTopology)...)
 	slices.SortFunc(nodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
 	return slices.Compact(nodes)
 }
@@ -492,6 +499,19 @@ func servePreparedRF3WithExecutionLanes(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
+	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: peer.Owners(),
+		Authorize: func(identity rafttransport.PeerIdentity) bool {
+			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		retireCtx, retire := context.WithCancelCause(context.Background())
+		retire(context.Canceled)
+		peerErr := peer.Run(retireCtx)
+		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+	}
 	actionJournal, err := replicaaction.OpenFileJournal(
 		manifest.ReplicaControl.ActionJournalPath,
 		manifest.ReplicaControl.MaxActionRecords,
@@ -772,7 +792,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
 	controlMux, err := newRF3ControlMux(
-		membershipControl, observationControl, sourceControl, actionControl,
+		membershipControl, observationControl, metricsControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
 		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
 	)
@@ -925,10 +945,10 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action, split, schema, planObservation, admission, tail,
+	membership, observation, metrics, source, action, split, schema, planObservation, admission, tail,
 	terminal, childPrepare shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 11)
+	routes := make([]shardcontrol.Route, 0, 12)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -937,6 +957,10 @@ func newRF3ControlMux(
 		shardcontrol.Route{
 			Discriminator: replicacontrol.RequestDiscriminator(),
 			Handler:       observation,
+		},
+		shardcontrol.Route{
+			Discriminator: servicemetrics.RequestDiscriminator(),
+			Handler:       metrics,
 		},
 	)
 	if source != nil {

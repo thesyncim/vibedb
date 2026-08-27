@@ -51,6 +51,9 @@ bounded process counters with `{"op":"metrics"}`. See
 [Observe a distributed cluster](observability.md). This currently covers
 routing, fan-out, result volume, and retries; it is not yet a complete
 proposal/quorum/apply/WAL/snapshot/controller metrics surface.
+Each `serve-rf3` process also exposes a fixed 96-byte topology-authorized
+shard-control counter frame through `internal/servicemetrics.Client`; the
+gateway does not yet aggregate those per-node samples.
 
 ## Catalog authority
 

@@ -30,18 +30,26 @@ build maps, strings, or a generic JSON tree.
 | Stage | Available evidence | Shipped operator surface |
 | --- | --- | --- |
 | Routing and fan-out | route class, shards fanned, scatter reason, returned rows/bytes, stale-route retries | `{"op":"metrics"}` |
-| Proposal and apply | `multiraft.Progress` reports proposal count/bytes and applied index spans | Not exported by a command |
+| Proposal and apply | `multiraft.Progress` reports proposal count/bytes and applied index spans | Fixed authenticated shard-control metrics frame |
 | Quorum and leadership | `raftmember.RuntimeStatus` and RF3 replica observation report leader, term, and progress | Used by authenticated replica control; no general metrics endpoint |
-| Snapshot transfer | snapshot service and repository expose connection, resident/in-flight byte, chunk, artifact, and disk-byte cuts | Used by qualification; no general metrics endpoint |
+| Snapshot transfer | RF3 owner reports completed snapshot application; transfer service and repository expose connection, resident/in-flight byte, chunk, artifact, and disk-byte cuts | Snapshot-apply count is in the shard-control frame; transfer/repository gauges are not yet exported |
 | Checkpoint and WAL | durable publications, state certificates, WAL bounds, and retention witnesses exist | No general metrics endpoint |
 | Split and move | replicated operation records and controller observations expose durable phase progress | Used by controllers; no general metrics endpoint |
 
-Do not infer the absent stage counters from request latency. In particular, a
+`internal/servicemetrics.Client` retrieves the fixed 96-byte RF3 owner snapshot
+over the mutually authenticated shard-control traffic class. The peer must
+have `topology` capability. Its response carries proposal commands/bytes,
+applied entries, durably persisted Ready steps, finished snapshot applies,
+completed `ReadIndex` outcomes, and owner-loop faults, followed by a digest.
+The service has no string labels and no unbounded response.
+
+The gateway endpoint does not yet aggregate these per-shard frames; an operator
+must preserve the endpoint/node identity beside each sample. Do not infer the
+remaining stage counters from request latency. In particular, a
 gateway completion cannot distinguish quorum, durable apply, and response
 settlement time without a shard-origin observation. The next safe extension is
-an authenticated, bounded shard metrics frame that snapshots the existing
-fixed-width seams and a gateway collector that preserves group identity. It
-must not add synchronous formatting, labels, or locks to proposal/apply paths.
+a bounded gateway collector that preserves group identity and separately
+exports checkpoint, WAL-retention, transfer-repository, split, and move cuts.
 
 ## Performance contract
 
