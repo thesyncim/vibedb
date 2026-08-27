@@ -124,22 +124,10 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	if err != nil {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
-	headerBytes := stateHeaderBytes
-	if stateHasFence(state) {
-		headerBytes = stateFenceHeaderBytes
-	} else if stateHasRelationPlacement(state) {
-		headerBytes = stateRelationPlacementHeaderBytes
-	} else if stateHasExecutionPins(state) {
-		headerBytes = stateExecutionPinHeaderBytes
-	} else if stateHasRequestLedger(state) {
-		headerBytes = stateRequestLedgerHeaderBytes
-	} else if stateHasTransactions(state) {
-		headerBytes = stateTransactionHeaderBytes
-	}
-	total := headerBytes + len(state.Binding.Distribution) +
-		len(state.Binding.Shard) + len(conf) + recordChecksumLen
-	if total > MaxStateEnvelopeBytes {
-		return dst, fmt.Errorf("%w: state envelope %d", ErrAdmissionBound, total)
+	headerBytes := stateEncodingHeader(state)
+	total, err := stateEncodingSize(state, len(conf))
+	if err != nil {
+		return dst, err
 	}
 	region := writableAppendRegion(dst, total)
 	if byteStringOverlap(region, state.Binding.Distribution) ||

@@ -2532,8 +2532,8 @@ func (m *Machine) persistTransitionRows(
 	if err != nil {
 		return err
 	}
-	if err := m.checkTransitionCapacityWithCaptureRows(
-		next, changes, plan, len(captureRecord), transactionRows,
+	if err := m.checkTransitionCapacityWithStateBytes(
+		len(stateEnvelope), changes, plan, len(captureRecord), transactionRows,
 	); err != nil {
 		return err
 	}
@@ -2796,11 +2796,27 @@ func (m *Machine) checkTransitionCapacityWithCaptureRows(
 	captureBytes int,
 	transactionRows []transactionRowMutation,
 ) error {
-	stateEnvelope, err := AppendState(nil, next)
+	stateEnvelopeBytes, err := validatedStateSize(next)
 	if err != nil {
 		return err
 	}
-	stateBytes := len(stateKey) + len(stateEnvelope)
+	return m.checkTransitionCapacityWithStateBytes(stateEnvelopeBytes, changes, plan, captureBytes, transactionRows)
+}
+
+// checkTransitionCapacityWithStateBytes consumes only an exact size from
+// validatedStateSize or AppendState. Singleton persistence already encoded and
+// fully validated the state; it must not repeat that work just to count bytes.
+func (m *Machine) checkTransitionCapacityWithStateBytes(
+	stateEnvelopeBytes int,
+	changes []finalMutation,
+	plan commandPlan,
+	captureBytes int,
+	transactionRows []transactionRowMutation,
+) error {
+	if stateEnvelopeBytes < stateHeaderBytes+recordChecksumLen || stateEnvelopeBytes > MaxStateEnvelopeBytes {
+		return ErrAdmissionBound
+	}
+	stateBytes := len(stateKey) + stateEnvelopeBytes
 	systemDocs := 1
 	if plan.writeAuthority {
 		if len(plan.authorityRecord) < authorityBindingHeaderBytes+1+recordChecksumLen ||
@@ -2866,7 +2882,7 @@ func (m *Machine) checkTransitionCapacityWithCaptureRows(
 		stateBytes += len(plan.routeGateResultKey) + len(plan.routeGateResult)
 		systemDocs++
 	}
-	if len(stateEnvelope) > m.system.Limits.MaxDocumentBytes ||
+	if stateEnvelopeBytes > m.system.Limits.MaxDocumentBytes ||
 		systemDocs > m.system.Limits.MaxDistinctMutations ||
 		stateBytes > m.system.Limits.MaxBatchBytes {
 		return ErrAdmissionBound
