@@ -76,13 +76,15 @@ type Limits struct {
 
 // OutboundSink accepts one detached Host message into a bounded transport
 // queue. Success transfers no protobuf ownership: the sink must detach before
-// returning. OrdinaryTransport satisfies this contract.
+// returning. Exact rafttransport.ErrBackpressure means no frame was accepted;
+// the owner may discard that ordinary packet. OrdinaryTransport satisfies this
+// contract.
 type OutboundSink interface {
 	Send(raftmember.OutboundMessage) error
 }
 
 // Options fixes one serialized serving lane. Pulse supplies logical Raft ticks
-// and also retries a retained outbound message after transport backpressure.
+// and also retries a blocked durable Ready phase.
 // Core never samples wall-clock time.
 type Options struct {
 	Registry                   *raftserve.Registry
@@ -845,19 +847,22 @@ func (owner *Owner) Run(ctx context.Context) error {
 	var pending raftmember.OutboundMessage
 	readyBlocked := false
 	for {
-		transportBlocked := false
 		if pending.Message != nil {
 			if owner.outbound == nil {
 				return owner.stop(errors.New("raftservice: outbound message has no transport"))
 			}
 			err := owner.outbound.Send(pending)
-			switch {
-			case err == nil:
+			switch err {
+			case nil:
 				pending = raftmember.OutboundMessage{}
-			case errors.Is(err, rafttransport.ErrBackpressure):
-				// Retain exact ownership and continue serving bounded ingress. A
-				// later pulse or request retries before another Host pop.
-				transportBlocked = true
+			case rafttransport.ErrBackpressure:
+				// Send refused ownership of this ordinary network packet. Raft
+				// repairs packet loss; retaining it here would block unrelated
+				// peers and all Host progress behind one isolated destination.
+				// Accepted transport frames, durable Ready, ingress and results
+				// remain owned by their existing queues. MeasureOrdinaryMessage
+				// excludes snapshots before Send. Wrapped/mixed faults stay fatal.
+				pending = raftmember.OutboundMessage{}
 			default:
 				return owner.stop(err)
 			}
@@ -874,7 +879,7 @@ func (owner *Owner) Run(ctx context.Context) error {
 			}
 		}
 
-		if !transportBlocked && !readyBlocked {
+		if !readyBlocked {
 			progress, done, err := owner.host.RunOne()
 			owner.metrics.observeProgress(progress, done, err)
 			switch {

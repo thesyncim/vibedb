@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +24,7 @@ type tickPressureHost struct {
 	ticks, appliedTicks int
 	appliedMessage      *pb.Message
 	tickErr             error
+	runBlocked          bool
 	busyGroup           raftmember.GroupKey
 	attempts            chan error
 	drained             chan struct{}
@@ -68,6 +68,9 @@ func (host *tickPressureHost) PopOutbound() (raftmember.OutboundMessage, bool) {
 func (host *tickPressureHost) RunOne() (multiraft.Progress, bool, error) {
 	host.mu.Lock()
 	defer host.mu.Unlock()
+	if host.runBlocked {
+		return multiraft.Progress{}, false, errors.New("test retryable durable Ready pressure")
+	}
 	if host.ticks == 0 && host.message == nil {
 		return multiraft.Progress{}, false, nil
 	}
@@ -81,26 +84,6 @@ func (host *tickPressureHost) RunOne() (multiraft.Progress, bool, error) {
 }
 
 func (*tickPressureHost) Close() error { return nil }
-
-type tickPressureSink struct {
-	blocked  atomic.Bool
-	started  chan struct{}
-	once     sync.Once
-	expected *pb.Message
-	accepted chan *pb.Message
-}
-
-func (sink *tickPressureSink) Send(message raftmember.OutboundMessage) error {
-	if message.Message != sink.expected {
-		return errors.New("outbound ownership changed")
-	}
-	sink.once.Do(func() { close(sink.started) })
-	if sink.blocked.Load() {
-		return rafttransport.ErrBackpressure
-	}
-	sink.accepted <- message.Message
-	return nil
-}
 
 func newTickPressureOwner(host *tickPressureHost, pulse <-chan struct{}, sink OutboundSink) *Owner {
 	return &Owner{host: host, groups: []raftmember.GroupKey{peerServerTestGroup()},
@@ -117,12 +100,9 @@ func tickPressureMessage() *pb.Message {
 func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	outbound := tickPressureMessage()
-	host := &tickPressureHost{outbound: outbound, attempts: make(chan error, 1), drained: make(chan struct{}, 2)}
-	sink := &tickPressureSink{expected: outbound, started: make(chan struct{}), accepted: make(chan *pb.Message, 1)}
-	sink.blocked.Store(true)
+	host := &tickPressureHost{runBlocked: true, attempts: make(chan error, 1), drained: make(chan struct{}, 2)}
 	pulse := make(chan struct{})
-	owner := newTickPressureOwner(host, pulse, sink)
+	owner := newTickPressureOwner(host, pulse, nil)
 	done := make(chan error, 1)
 	go func() { done <- owner.Run(ctx) }()
 	t.Cleanup(func() {
@@ -134,7 +114,7 @@ func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) 
 		}
 	})
 	select {
-	case <-sink.started:
+	case <-owner.ready:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
@@ -169,7 +149,9 @@ func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) 
 	if !preserved {
 		t.Fatal("rejected pulse changed already-admitted input ownership")
 	}
-	sink.blocked.Store(false)
+	host.mu.Lock()
+	host.runBlocked = false
+	host.mu.Unlock()
 	select {
 	case pulse <- struct{}{}:
 	case <-ctx.Done():
@@ -177,14 +159,6 @@ func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) 
 	}
 	select {
 	case <-host.attempts:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	select {
-	case got := <-sink.accepted:
-		if got != outbound {
-			t.Fatal("wrong outbound delivered")
-		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
