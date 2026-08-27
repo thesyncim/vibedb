@@ -200,6 +200,18 @@ jobs:
           grep -F $'schema\tvibedb.rf3.chaos-evidence\t2' "${rf3_evidence_path}"
           grep -F $'summary\tpassed\t1\tfailed\t0' "${rf3_evidence_path}"
           sed -n '1,50p' "${rf3_evidence_path}"
+      - name: Authenticated transport fault and throughput evidence
+        if: matrix.runner == 'ubuntu-latest'
+        run: |
+          go test ./gateway -run '^TestAuthorizedClientTLSNetworkChaosAndThroughputGate$' -count=1 -v
+          go test ./gateway -run '^$' -bench '^BenchmarkAuthorizedClientTLSRequest$' -benchtime=2000x -count=1
+      - name: RF3 exhaustive quorum and multi-group scaling evidence
+        if: matrix.runner == 'ubuntu-latest'
+        env:
+          VIBEDB_RF3_QUORUM_QUALIFICATION: "1"
+        run: |
+          go test ./internal/raftservice -run '^TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit$' -count=1 -v
+          go test ./internal/multiraft -run '^$' -bench '^BenchmarkExecutionLanes(Scaling|SixtyFourGroups|HotShardIsolation)$' -benchtime=1000x -count=1
       - name: PostgreSQL client integration
         if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient

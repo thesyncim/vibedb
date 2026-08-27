@@ -665,6 +665,56 @@ func BenchmarkExecutionLanesScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkExecutionLanesSixtyFourGroups(b *testing.B) {
+	const laneCount, groupCount = 8, 64
+	limits := testHostLimits()
+	set, err := NewExecutionLanes(laneCount, limits)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer set.Close()
+	members := make([]*fakeRuntime, 0, groupCount)
+	for seed := 0; seed < groupCount; seed++ {
+		member := newFakeRuntime(byte(seed))
+		if err := set.addRuntime(member); err != nil {
+			b.Fatal(err)
+		}
+		members = append(members, member)
+	}
+	for _, member := range members {
+		if err := set.RequestTick(member.identity.Group); err != nil {
+			b.Fatal(err)
+		}
+		lane, err := set.Lane(member.identity.Group)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, done, err := set.RunOne(lane); err != nil || !done {
+			b.Fatalf("warm group=%+v done=%t err=%v", member.identity.Group, done, err)
+		}
+		member.inputs = member.inputs[:0]
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for operation := 0; operation < b.N; operation++ {
+		member := members[operation&(groupCount-1)]
+		if err := set.RequestTick(member.identity.Group); err != nil {
+			b.Fatal(err)
+		}
+		lane, err := set.Lane(member.identity.Group)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if progress, done, err := set.RunOne(lane); err != nil || !done || progress.Kind != ProgressTick {
+			b.Fatalf("progress=%+v done=%t err=%v", progress, done, err)
+		}
+		member.inputs = member.inputs[:0]
+	}
+	b.StopTimer()
+	b.ReportMetric(groupCount, "groups")
+	b.ReportMetric(laneCount, "lanes")
+}
+
 func BenchmarkExecutionLanesHotShardIsolation(b *testing.B) {
 	set, err := NewExecutionLanes(2, testHostLimits())
 	if err != nil {

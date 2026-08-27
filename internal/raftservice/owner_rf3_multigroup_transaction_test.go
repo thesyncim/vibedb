@@ -12,9 +12,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
+	"math/bits"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -983,6 +986,9 @@ func newMultiGroupRF3Runtime(
 	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
 		_ = database.Close()
 		_ = wal.Close()
+		if os.Getenv("VIBEDB_RF3_QUORUM_QUALIFICATION") == "1" {
+			t.Fatalf("strict allocation required by RF3 quorum qualification: %v", err)
+		}
 		t.Skipf("strict allocation unsupported: %v", err)
 	}
 	if err != nil {
@@ -1268,6 +1274,56 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 		}
 	}
 	assertMultiGroupRF3Trace(t, cluster, commit, hiddenResult.Completion)
+}
+
+// TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit enumerates the complete
+// three-voter reachability mask. Every majority cut must elect and commit; each
+// one-voter cut must return only a safe refusal or outcome-unknown timeout.
+// This is an in-process authenticated-transport fault gate. The external
+// shipped-process matrix remains separately disclosed in feature state.
+func TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit(t *testing.T) {
+	for activeMask := uint8(0); activeMask < 1<<multiGroupRF3Voters; activeMask++ {
+		t.Run(fmt.Sprintf("active_%03b", activeMask), func(t *testing.T) {
+			cluster := newMultiGroupRF3Cluster(t, 1)
+			active := make([]int, 0, multiGroupRF3Voters)
+			removed := make(map[int]bool, multiGroupRF3Voters)
+			for member := 0; member < multiGroupRF3Voters; member++ {
+				if activeMask&(1<<member) != 0 {
+					active = append(active, member)
+					continue
+				}
+				removed[member] = true
+				cluster.network.isolate(member)
+			}
+			if len(active) == 0 {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			candidate := active[0]
+			if err := cluster.owners[candidate].Campaign(ctx, cluster.groups[0].key); err != nil {
+				t.Fatal(err)
+			}
+			command := appendRF3Command(t, rf3Command(cluster.groups[0].bases[candidate],
+				replication.CommandSessionOpen, 1, 1, nil))
+			if bits.OnesCount8(activeMask) >= 2 {
+				leader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[0].key)
+				result, err := cluster.submit(ctx, 0, leader, command, multiGroupRF3NoFault)
+				if err != nil || result.Outcome.AppliedIndex == 0 {
+					t.Fatalf("majority cut result=%+v err=%v", result.Outcome, err)
+				}
+				waitRF3Applied(t, ctx, cluster.owners[:], removed, cluster.groups[0].key,
+					result.Outcome.AppliedIndex)
+				return
+			}
+			minorityCtx, minorityCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			_, err := cluster.submit(minorityCtx, 0, candidate, command, multiGroupRF3NoFault)
+			minorityCancel()
+			if !multiGroupRF3SafeProposalIsolationError(err) {
+				t.Fatalf("minority cut error=%v", err)
+			}
+		})
+	}
 }
 
 func multiGroupRF3SafeIsolationError(err error) bool {
