@@ -178,6 +178,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	}
 	gatewayReplacementStarted := time.Now()
 	fixture.startGateway(t, fixture.gatewayB)
+	fixture.assertRouteSeedFilesDistinct(t)
 	clientB := fixture.dialGateway(t, fixture.gatewayBNode, fixture.gatewayBAddress)
 	recoveredRaw, recoveredLatency := clientB.roundTrip(t, terminalRequest)
 	latencies = append(latencies, recoveredLatency)
@@ -343,7 +344,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	// The public wire counter is exact for every test-owned gateway request and
 	// response. No shipped external Raft byte counter exists, so the gate names
 	// that boundary honestly and separately proves zero snapshot payload growth.
-	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s gateway_replacement_recovery=%s max_voter_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
+	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true route_seeds_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s gateway_replacement_recovery=%s max_voter_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
 		partitionFailover, terminalFailover, ackFailover, gatewayReplacement, maxVoterFailover,
 		p99, rssGrowth, storageGrowth, walGrowth, clientBytes, snapshotGrowth)
 }
@@ -361,17 +362,20 @@ type durableRF3ExternalFixture struct {
 	routes      [durableRF3ExternalGroups]gateway.ReplicatedRoute
 	capability  [durableRF3ExternalGroups]serviceauthz.Capability
 
-	shards          [durableRF3ExternalVoters]*rf3testfixture.ExternalProcess
-	gatewayA        *rf3testfixture.ExternalProcess
-	gatewayB        *rf3testfixture.ExternalProcess
-	gatewayANode    int
-	gatewayBNode    int
-	userNode        int
-	observerNode    int
-	gatewayAAddress string
-	gatewayBAddress string
-	gatewayAJournal string
-	gatewayBJournal string
+	shards            [durableRF3ExternalVoters]*rf3testfixture.ExternalProcess
+	gatewayA          *rf3testfixture.ExternalProcess
+	gatewayB          *rf3testfixture.ExternalProcess
+	gatewayANode      int
+	gatewayBNode      int
+	userNode          int
+	observerNode      int
+	gatewayAAddress   string
+	gatewayBAddress   string
+	gatewayAJournal   string
+	gatewayBJournal   string
+	gatewayARouteSeed string
+	gatewayBRouteSeed string
+	catalogPath       string
 
 	userProfile      *rafttransport.PeerTLS
 	observerProfile  *rafttransport.PeerTLS
@@ -534,6 +538,7 @@ func newDurableRF3ExternalFixture(
 	if err = gateway.SaveSnapshot(catalogPath, built.Snapshot); err != nil {
 		t.Fatal(err)
 	}
+	fixture.catalogPath = catalogPath
 	ackPath := filepath.Join(fixture.root, "durable-ack-key")
 	if err = os.WriteFile(ackPath, []byte(strings.Repeat("3a", 32)), 0o600); err != nil {
 		t.Fatal(err)
@@ -571,11 +576,23 @@ func newDurableRF3ExternalFixture(
 	}
 	fixture.gatewayAJournal = filepath.Join(fixture.root, "gateway-a-session")
 	fixture.gatewayBJournal = filepath.Join(fixture.root, "gateway-b-session")
+	fixture.gatewayARouteSeed = filepath.Join(fixture.root, "gateway-a-catalog-route-seed.vibejson")
+	fixture.gatewayBRouteSeed = filepath.Join(fixture.root, "gateway-b-catalog-route-seed.vibejson")
+	if filepath.Clean(fixture.gatewayARouteSeed) == filepath.Clean(fixture.gatewayBRouteSeed) {
+		t.Fatal("gateway route-seed paths alias")
+	}
+	for _, routeSeed := range []string{fixture.gatewayARouteSeed, fixture.gatewayBRouteSeed} {
+		if err = gateway.ValidateReplicatedCatalogRouteSeedSeparation(catalogPath, routeSeed); err != nil {
+			t.Fatalf("catalog genesis/route-seed separation: %v", err)
+		}
+	}
 	fixture.gatewayA = durableRF3ExternalGatewayProcess(gatewayBinary, catalogPath,
+		fixture.gatewayARouteSeed,
 		fixture.gatewayAAddress, fixture.credentials[fixture.gatewayANode], fixture.roots,
 		fixture.policy, ackPath, fixture.gatewayAJournal, "1a", "2b", fixture.listeners,
 		fixture.nodes, true)
 	fixture.gatewayB = durableRF3ExternalGatewayProcess(gatewayBinary, catalogPath,
+		fixture.gatewayBRouteSeed,
 		fixture.gatewayBAddress, fixture.credentials[fixture.gatewayBNode], fixture.roots,
 		fixture.policy, ackPath, fixture.gatewayBJournal, "3c", "4d", fixture.listeners,
 		fixture.nodes, true)
@@ -693,14 +710,15 @@ func durableRF3ExternalRoute(
 }
 
 func durableRF3ExternalGatewayProcess(
-	binary, catalog, listen string,
+	binary, catalog, routeSeed, listen string,
 	credential rf3testfixture.Credential,
 	roots, policy, ack, journal, clientByte, retryByte string,
 	listeners [4]rf3testfixture.ProcessListeners,
 	nodes [durableRF3ExternalNodes]rafttransport.NodeID,
 	bootstrap bool,
 ) *rf3testfixture.ExternalProcess {
-	args := []string{"serve", "-catalog", catalog, "-catalog-relation", "1",
+	args := []string{"serve", "-catalog", catalog, "-catalog-route-seed", routeSeed,
+		"-catalog-relation", "1",
 		"-catalog-session-journal", journal, "-durable-ack-key", ack,
 		"-catalog-client-id", strings.Repeat(clientByte, 16),
 		"-catalog-retry-home", strings.Repeat(retryByte, 8),
@@ -850,6 +868,42 @@ func (fixture *durableRF3ExternalFixture) close(t testing.TB) {
 	replicaProcessStop(t, fixture.gatewayB)
 	for _, process := range fixture.shards {
 		replicaProcessStop(t, process)
+	}
+}
+
+func (fixture *durableRF3ExternalFixture) assertRouteSeedFilesDistinct(t testing.TB) {
+	t.Helper()
+	genesis, err := os.Lstat(fixture.catalogPath)
+	if err != nil || !genesis.Mode().IsRegular() {
+		t.Fatalf("immutable catalog genesis info=%v err=%v", genesis, err)
+	}
+	var routeSeedInfo [2]os.FileInfo
+	for index, path := range []string{fixture.gatewayARouteSeed, fixture.gatewayBRouteSeed} {
+		if err = gateway.ValidateReplicatedCatalogRouteSeedSeparation(fixture.catalogPath, path); err != nil {
+			t.Fatalf("gateway %d route-seed separation: %v", index+1, err)
+		}
+		routeSeedInfo[index], err = os.Lstat(path)
+		if err != nil || !routeSeedInfo[index].Mode().IsRegular() || os.SameFile(genesis, routeSeedInfo[index]) {
+			t.Fatalf("gateway %d route-seed info=%v err=%v", index+1, routeSeedInfo[index], err)
+		}
+		state, loadErr := gateway.LoadReplicatedCatalogRouteSeed(path)
+		active, found := state.Active()
+		var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		var route gateway.ReplicatedRoute
+		resolved := false
+		if loadErr == nil && found && active != nil {
+			route, resolved = active.ResolveReplicatedRoute(
+				gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard, replicas[:0],
+			)
+		}
+		if loadErr != nil || !found || active == nil || !resolved ||
+			route.Group != fixture.routes[durableRF3CatalogGroup].Group {
+			t.Fatalf("gateway %d route-seed active=%v found=%v resolved=%v err=%v",
+				index+1, active, found, resolved, loadErr)
+		}
+	}
+	if os.SameFile(routeSeedInfo[0], routeSeedInfo[1]) {
+		t.Fatal("gateway route-seed files alias")
 	}
 }
 
