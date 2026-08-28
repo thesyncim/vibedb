@@ -25,9 +25,19 @@ type LinearizableDataReadRequest struct {
 // LinearizableDataReadCut pins both the storage cut and the serving generation.
 // It is single-consumer, must not be copied, and can be reused after Close.
 type LinearizableDataReadCut struct {
+	source     DataReadSource
 	data       replicatedstate.DataReadCut
 	generation *ownerGeneration
 	owner      *Owner
+}
+
+// Source borrows the exact generation's data source for shard-local SQL
+// execution. It is valid only while this cut retains its generation lease.
+func (cut *LinearizableDataReadCut) Source() DataReadSource {
+	if cut == nil || cut.owner == nil {
+		return nil
+	}
+	return cut.source
 }
 
 // Data borrows the admitted cut. Its physical rows still require the ownership
@@ -47,6 +57,7 @@ func (cut *LinearizableDataReadCut) Close() error {
 	cut.generation.release()
 	cut.owner.releasePendingRead(1)
 	cut.generation, cut.owner = nil, nil
+	cut.source = nil
 	return err
 }
 
@@ -58,7 +69,7 @@ func (owner *Owner) ReadLinearizableDataInto(
 	ctx context.Context, request LinearizableDataReadRequest, dst *LinearizableDataReadCut,
 ) error {
 	if owner == nil || ctx == nil || dst == nil || request.Capability != serviceauthz.CapabilityDataRead ||
-		len(request.Relations) == 0 || len(request.Relations) > replication.MaxRelationsPerBundle {
+		request.Relations != nil && len(request.Relations) == 0 || len(request.Relations) > replication.MaxRelationsPerBundle {
 		return ErrInvalidOwner
 	}
 	if dst.owner != nil {
@@ -104,6 +115,7 @@ func (owner *Owner) ReadLinearizableDataInto(
 		return errors.Join(ErrServingFence, dst.data.Close())
 	}
 	dst.generation, dst.owner = reply.read.generation, owner
+	dst.source = source
 	admitted = true
 	return nil
 }

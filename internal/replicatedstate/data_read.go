@@ -19,6 +19,7 @@ var ErrDataReadOpen = errors.New("replicatedstate: data read cut is still open")
 // A cut is single-consumer, must not be copied, and must outlive every borrowed
 // relation and executor. Close releases leases but retains capture workspace.
 type DataReadCut struct {
+	owner      *Machine
 	cut        durable.DatabaseSnapshot
 	fence      SnapshotFence
 	relations  [replication.MaxRelationsPerBundle]*durable.Snapshot
@@ -69,6 +70,7 @@ func (cut *DataReadCut) Close() error {
 		return nil
 	}
 	cut.open = false
+	cut.owner = nil
 	cut.selected, cut.fence = 0, SnapshotFence{}
 	clear(cut.relations[:])
 	clear(cut.validators[:])
@@ -80,11 +82,12 @@ func (cut *DataReadCut) Close() error {
 // lock. Intent refusal is conservative at group granularity. The durable
 // intent-row count is maintained on every apply; the reopen-only intent map
 // is not a live read authority. Exact point reads retain their narrower check.
+// Nil ids selects every data relation, never private system/capture state.
 // Reusing a closed destination is allocation-free after capture warmup.
 func (m *Machine) DataReadCutInto(
 	ids []replication.RelationID, minimumApplied uint64, dst *DataReadCut,
 ) error {
-	if m == nil || dst == nil || len(ids) == 0 || len(ids) > replication.MaxRelationsPerBundle {
+	if m == nil || dst == nil || ids != nil && len(ids) == 0 || len(ids) > replication.MaxRelationsPerBundle {
 		return ErrInvalidCollection
 	}
 	if dst.open {
@@ -100,6 +103,13 @@ func (m *Machine) DataReadCutInto(
 	}
 	if m.publication.Applied < minimumApplied {
 		return ErrReadBehind
+	}
+	var all [replication.MaxRelationsPerBundle]replication.RelationID
+	if ids == nil {
+		for i := range m.relations {
+			all[i] = m.relations[i].id
+		}
+		ids = all[:len(m.relations)]
 	}
 	var selected uint64
 	full := completeOwnershipRange(m.state.Binding.OwnedRange)
@@ -143,5 +153,12 @@ func (m *Machine) DataReadCutInto(
 		SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 	}
 	dst.selected, dst.open = selected, true
+	dst.owner = m
 	return nil
+}
+
+// OwnsDataReadCut prevents binding a physical cut to a different SQL owner.
+// It checks provenance only; serving and catalog fences remain mandatory.
+func (m *Machine) OwnsDataReadCut(cut *DataReadCut) bool {
+	return m != nil && cut != nil && cut.open && cut.owner == m
 }

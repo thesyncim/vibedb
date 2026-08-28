@@ -35,7 +35,7 @@ func replicatedRequestDigest(command []byte) [sha256.Size]byte {
 	return sha256.Sum256(command)
 }
 
-// ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
+// ReplicatedServer is the native RF3 shard endpoint, including fenced SQL reads. Serve owns bounded
 // connection admission; connection authentication remains an explicit outer
 // listener capability.
 type ReplicatedServer struct {
@@ -503,6 +503,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		default:
 			return membershipRefusal(wireState, ReplicatedRefusalUnavailable)
 		}
+	}
+	if request.Operation == ReplicatedQueryLeader {
+		return server.executeReplicatedQuery(ctx, request, state)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {

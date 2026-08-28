@@ -184,6 +184,7 @@ func runServe(args []string) (exitCode int) {
 	schemaRolloutPlan := fs.String("schema-rollout-plan", "", "strict canonical vibejson per-replica schema rollout plan")
 	schemaRolloutOnce := fs.Bool("schema-rollout-once", false, "execute the authenticated schema rollout and exit")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
+	pgDevListen := fs.String("pg-dev-listen", "", "optional loopback-only, trust-authenticated PostgreSQL read endpoint for local development")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
 	tlsKey := fs.String("tls-key", "", "PEM gateway private key")
@@ -206,6 +207,12 @@ func runServe(args []string) (exitCode int) {
 	if *catalog == "" {
 		usage()
 		return 2
+	}
+	if *pgDevListen != "" {
+		if err := requireLoopbackListen(*pgDevListen); err != nil || *devStaticCatalog {
+			fmt.Fprintln(os.Stderr, "gateway: pg-dev-listen requires a loopback address and RF3 catalog")
+			return 2
+		}
 	}
 	if *schemaRolloutOnce && *schemaRolloutPlan == "" ||
 		*schemaRolloutPlan != "" && (*devStaticCatalog || *devPlaintext || *replicaControlManifestPath == "") {
@@ -715,6 +722,15 @@ func runServe(args []string) (exitCode int) {
 			)
 		}()
 	}
+	if *pgDevListen != "" {
+		pg, pgErr := startGatewayPostgreSQL(ctx, *pgDevListen, exec, internalAuthority, logf)
+		if pgErr != nil {
+			_ = listener.Close()
+			fmt.Fprintln(os.Stderr, pgErr)
+			return 1
+		}
+		defer pg.Close()
+	}
 	if clientTLS != nil {
 		err = serveAuthenticatedGatewayDurableData(ctx, listener, exec, dataReader, durable, clientTLS, gateway.ClientTLSLimits{
 			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,
@@ -1108,7 +1124,7 @@ func newReplicatedCatalogGateway(
 	default:
 	}
 	executor := gateway.NewExecutor(
-		gateway.NewClient(shardDial), holder, gateway.Options{
+		&gateway.ReplicatedSQLTransport{Executor: replicated}, holder, gateway.Options{
 			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
 		},
 	)

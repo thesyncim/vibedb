@@ -100,6 +100,9 @@ func (c *conn) materializeTransactionJoinSource(
 					if _, shadowed := state.pending[string(key)]; shadowed {
 						return nil
 					}
+					if !state.Keep(key) {
+						return nil
+					}
 					return visit(dependency.name, key, document)
 				}); err != nil {
 					return err

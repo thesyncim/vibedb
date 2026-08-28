@@ -529,7 +529,17 @@ func newMultiGroupRF3DurableGateway(
 	if err != nil {
 		t.Fatal(err)
 	}
-	planner := gateway.NewExecutor(nil, catalog, gateway.Options{})
+	// This fixture qualifies durable recovery across many real quorum rounds,
+	// not the production interactive latency SLO. The default five-second
+	// whole-operation deadline can expire during terminal proof persistence on
+	// a loaded Docker host, before the test injects its intended partition.
+	// Keep admission/row/byte policies unchanged and bound the whole fixture
+	// operation independently of that unrelated latency profile.
+	profile := gateway.DefaultProfiles()[gateway.ClassInteractive]
+	profile.GlobalDeadline = 30 * time.Second
+	planner := gateway.NewExecutor(nil, catalog, gateway.Options{Profiles: map[gateway.OperationClass]gateway.Profile{
+		gateway.ClassInteractive: profile,
+	}})
 	sql, err := gateway.NewDurableSQLRequestExecutor(gateway.DurableSQLRequestExecutorOptions{
 		Planner: planner, ReplicatedData: native, Requests: requests,
 		RecoveryPulseLimit: distributedtxn.MaxRecoveryPulses, PlanningLeaseSpan: 128,

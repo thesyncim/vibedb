@@ -65,8 +65,8 @@ const (
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
 
-// ReplicatedOperation is the closed byte-native serving operation set. SQL is
-// deliberately absent: replicated mode accepts only canonical commands.
+// ReplicatedOperation is the closed byte-native serving operation set. Writes
+// remain canonical commands; SQL queries execute only on quorum-fenced cuts.
 type ReplicatedOperation uint8
 
 const (
@@ -81,6 +81,7 @@ const (
 	ReplicatedRequestLedgerRead
 	ReplicatedExecutionPinRead
 	ReplicatedRouteGateRead
+	ReplicatedQueryLeader
 )
 
 // ReplicatedTransactionReadKind is the complete RF3 recovery-read surface.
@@ -149,6 +150,7 @@ type ReplicatedRequest struct {
 	MinimumApplied    uint64
 	MaxValueBytes     uint32
 	BatchRead         []byte
+	Query             []byte
 	TransactionRead   ReplicatedTransactionReadRequest
 	RequestLedgerRead ReplicatedRequestLedgerReadRequest
 	ExecutionPinRead  ReplicatedExecutionPinReadRequest
@@ -185,6 +187,7 @@ const (
 	ReplicatedReadBatchResult
 	ReplicatedExecutionPinReadResult
 	ReplicatedRouteGateReadResult
+	ReplicatedQueryResult
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -247,7 +250,7 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	payloadHint := len(request.Command) + len(request.Key) + len(request.BatchRead) + 16
+	payloadHint := len(request.Command) + len(request.Key) + len(request.BatchRead) + len(request.Query) + 16
 	if request.Operation == ReplicatedMembership {
 		payloadHint += 65
 	}
@@ -273,6 +276,9 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
 		e.bytes(request.BatchRead)
+	case ReplicatedQueryLeader:
+		e.u32(request.MaxValueBytes)
+		e.bytes(request.Query)
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
 	case ReplicatedRequestLedgerRead:
@@ -340,6 +346,10 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
 		payload = request.BatchRead
+		e.u32(uint32(len(payload)))
+	case ReplicatedQueryLeader:
+		e.u32(request.MaxValueBytes)
+		payload = request.Query
 		e.u32(uint32(len(payload)))
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
@@ -417,6 +427,9 @@ func decodeReplicatedRequest(
 		request.MinimumApplied = d.u64()
 		request.MaxValueBytes = d.u32()
 		request.BatchRead = d.slice()
+	case ReplicatedQueryLeader:
+		request.MaxValueBytes = d.u32()
+		request.Query = d.slice()
 	case ReplicatedTransactionRead:
 		request.TransactionRead = decodeReplicatedTransactionRead(&d)
 	case ReplicatedRequestLedgerRead:
@@ -435,6 +448,7 @@ func decodeReplicatedRequest(
 	request.Command = request.Command[:len(request.Command):len(request.Command)]
 	request.Key = request.Key[:len(request.Key):len(request.Key)]
 	request.BatchRead = request.BatchRead[:len(request.BatchRead):len(request.BatchRead)]
+	request.Query = request.Query[:len(request.Query):len(request.Query)]
 	if !validReplicatedRequest(request) {
 		if budget != nil {
 			budget.release(charged)
@@ -617,7 +631,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	}
 	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
-		response.Kind == ReplicatedReadBatchResult ||
+		response.Kind == ReplicatedReadBatchResult || response.Kind == ReplicatedQueryResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
 		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
@@ -639,7 +653,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	encodeReplicatedDigest(&e, response.RequestDigest)
 	e.bytes(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
-		response.Kind == ReplicatedReadBatchResult ||
+		response.Kind == ReplicatedReadBatchResult || response.Kind == ReplicatedQueryResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
 		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
@@ -686,7 +700,7 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
-		response.Kind == ReplicatedReadBatchResult ||
+		response.Kind == ReplicatedReadBatchResult || response.Kind == ReplicatedQueryResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
 		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
@@ -717,7 +731,7 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 		return replicatedResponseFixedBodyBytes, nil
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
-	case ReplicatedReadBatchLeader:
+	case ReplicatedReadBatchLeader, ReplicatedQueryLeader:
 		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
 	case ReplicatedTransactionRead:
 		return replicatedReadResponseFixedBodyBytes +
@@ -939,6 +953,9 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
 	}
+	if request.Operation != ReplicatedQueryLeader && len(request.Query) != 0 {
+		return false
+	}
 	if request.Operation != ReplicatedReadBatchLeader && len(request.BatchRead) != 0 {
 		return false
 	}
@@ -1034,6 +1051,15 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			len(request.Key) == 0 && request.MinimumApplied != 0 &&
 			request.MaxValueBytes != 0 &&
 			request.MaxValueBytes <= replicatedstate.MaxPointReadBatchBytes && batchErr == nil &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
+	case ReplicatedQueryLeader:
+		return request.Capability == serviceauthz.CapabilityDataRead &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) && request.Relation == 0 &&
+			len(request.Key) == 0 && request.MinimumApplied == 0 && len(request.BatchRead) == 0 &&
+			request.MaxValueBytes > 0 && request.MaxValueBytes <= MaxReplicatedSQLResultBytes &&
+			len(request.Query) > 0 && len(request.Query) <= MaxReplicatedSQLRequestBytes &&
 			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
 			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
 	case ReplicatedTransactionRead:
@@ -1271,6 +1297,12 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied
+	case ReplicatedQueryResult:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+			len(response.Value) >= 5 && len(response.Value) <= MaxReplicatedSQLResultBytes
 	case ReplicatedTransactionReadResult:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&

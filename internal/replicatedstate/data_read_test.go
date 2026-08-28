@@ -83,7 +83,7 @@ func TestDataReadCutAdmission(t *testing.T) {
 		floor uint64
 		want  error
 	}{
-		{nil, 1, ErrInvalidCollection},
+		{[]replication.RelationID{}, 1, ErrInvalidCollection},
 		{[]replication.RelationID{0}, 1, ErrInvalidCollection},
 		{[]replication.RelationID{3}, 1, ErrInvalidCollection},
 		{[]replication.RelationID{1, 1}, 1, ErrInvalidCollection},

@@ -8,6 +8,8 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
@@ -45,6 +47,9 @@ type primaryMutationGuard struct {
 }
 
 type txTable struct {
+	readCut            *replicatedstate.DataReadCut
+	readRelation       replication.RelationID
+	filterSource       query.FileFilterSource
 	name               string
 	incarnation        *table
 	snapshot           *durable.Snapshot
@@ -85,6 +90,7 @@ type txTable struct {
 // dirty set is every table with a non-empty overlay; COMMIT validates each
 // participant and publishes through Collection.Update or UpdateCollections.
 type tx struct {
+	borrowedSnapshots      bool
 	conn                   *conn
 	tables                 map[string]*txTable
 	views                  map[string]*viewMeta
@@ -839,6 +845,9 @@ func (t *tx) querySource(tableName string) (query.Source, error) {
 			ErrTableNotFound, tableName)
 	}
 	if state.snapshot != nil {
+		if state.readCut != nil && !state.readCut.FullOwnership() {
+			return query.FromFileFiltered(state.snapshot, &state.filterSource), nil
+		}
 		if len(state.pending) == 0 {
 			return query.FromFile(state.snapshot), nil
 		}
@@ -919,6 +928,9 @@ func (s *txTable) LenDelta() int64 {
 
 // appendRaw appends the transaction-visible document for key into dst.
 func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
+	if !s.Keep(byteview.Bytes(key)) {
+		return dst, false, nil
+	}
 	if mutation, ok := s.pending[key]; ok {
 		if mutation.remove {
 			return dst, false, nil
@@ -2280,7 +2292,9 @@ func (t *tx) finish() {
 func (t *tx) releaseSnapshots() {
 	for _, table := range t.tables {
 		if table.snapshot != nil {
-			_ = table.snapshot.Close()
+			if !t.borrowedSnapshots {
+				_ = table.snapshot.Close()
+			}
 			table.snapshot = nil
 		}
 		if table.refreshSnapshot != nil {
@@ -2292,4 +2306,10 @@ func (t *tx) releaseSnapshots() {
 	clear(t.refreshStates)
 	t.refreshStates = t.refreshStates[:0]
 	clear(t.refreshStaged)
+}
+
+// Keep implements visibility filtering for the RF3 read cut. Ordinary local
+// transactions have no cut and preserve their existing source fast paths.
+func (s *txTable) Keep(key []byte) bool {
+	return s.readCut == nil || s.readCut.OwnsKey(s.readRelation, key)
 }

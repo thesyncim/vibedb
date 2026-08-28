@@ -84,6 +84,15 @@ func newWALGenerationDriver(options WALGenerationDriverOptions) *walGenerationDr
 // retention fence or a larger WAL; normal periodic builds remain asynchronous.
 func (runtime *Runtime) reserveReadyWithWALMaintenance() error {
 	err := runtime.wal.ReserveReady()
+	if err == nil {
+		return nil
+	}
+	return runtime.maintainWALAdmission(err)
+}
+
+// Keep the generation builder and error traversal off the ordinary Raft
+// input stack. Healthy admission must retain ReserveReady's nil fast path.
+func (runtime *Runtime) maintainWALAdmission(err error) error {
 	if !errors.Is(err, raftstore.ErrFull) || runtime.walGeneration == nil {
 		return err
 	}

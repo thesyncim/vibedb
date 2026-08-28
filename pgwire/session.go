@@ -67,6 +67,7 @@ type session struct {
 	cancelMu       sync.Mutex
 	cancelActive   bool
 	cancelShutdown bool
+	cancelBackend  func()
 
 	// implicitExtended records the transaction opened for an extended-query
 	// batch. An explicit BEGIN leaves it false and therefore survives Sync.
@@ -313,6 +314,9 @@ func (s *session) cancel() {
 		return
 	}
 	s.queryCancel.Cancel()
+	if s.cancelBackend != nil {
+		s.cancelBackend()
+	}
 }
 
 // shutdownCancel is stronger than a protocol CancelRequest: Close must also
@@ -323,6 +327,9 @@ func (s *session) shutdownCancel() {
 	s.cancelMu.Lock()
 	s.cancelShutdown = true
 	s.queryCancel.Cancel()
+	if s.cancelBackend != nil {
+		s.cancelBackend()
+	}
 	s.cancelMu.Unlock()
 }
 
@@ -606,6 +613,11 @@ func (s *session) negotiate(body []byte) error {
 			"could not configure this connection's intermediate limit: "+err.Error())
 	}
 	s.sql = runtime
+	if remote, ok := runtime.(interface{ Cancel() }); ok {
+		s.cancelMu.Lock()
+		s.cancelBackend = remote.Cancel
+		s.cancelMu.Unlock()
+	}
 	s.w.authenticationOK()
 
 	s.reportParameters()

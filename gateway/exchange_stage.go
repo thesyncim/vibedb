@@ -16,7 +16,7 @@ import (
 // is only the lifecycle coordinator: producers can use the sink directly and
 // mailbox backpressure remains enforced by the destination worker.
 type exchangeStage struct {
-	client      *Client
+	client      ShardTransport
 	targets     []shardCall
 	key         exchange.Key
 	spec        exchange.Spec
@@ -48,7 +48,7 @@ func (s *exchangeStage) repartitionRequest(
 }
 
 func newExchangeStage(
-	client *Client,
+	client ShardTransport,
 	targets []shardCall,
 	key exchange.Key,
 	spec exchange.Spec,
