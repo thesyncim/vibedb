@@ -29,6 +29,12 @@ type hotMutationExecEnvelope struct {
 func hotMutationRequest(t *testing.T, reference gateway.ReplicatedIssuerReference,
 	sequence uint64, statements []serveStatement,
 ) []byte {
+	return hotMutationRequestClass(t, reference, sequence, statements, "interactive")
+}
+
+func hotMutationRequestClass(t *testing.T, reference gateway.ReplicatedIssuerReference,
+	sequence uint64, statements []serveStatement, class string,
+) []byte {
 	t.Helper()
 	var requestID replication.ID128
 	binary.LittleEndian.PutUint64(requestID[:8], sequence)
@@ -36,7 +42,7 @@ func hotMutationRequest(t *testing.T, reference gateway.ReplicatedIssuerReferenc
 	raw, err := vibejson.Marshal(&hotMutationExecEnvelope{Op: "exec_batch", RequestID: hex.EncodeToString(requestID[:]),
 		InstallationID: hex.EncodeToString(reference.Installation[:]), IssuerEpoch: reference.Epoch,
 		LaneOrdinal: reference.LaneOrdinal, GrantDigest: hex.EncodeToString(reference.GrantDigest[:]),
-		IssuerSequence: sequence, Class: "interactive", Statements: statements})
+		IssuerSequence: sequence, Class: class, Statements: statements})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +77,35 @@ func TestHotMutationRequestUsesStrictExecBatchGrammar(t *testing.T) {
 				t.Fatalf("ACK lane=%d err=%v", decodedAck.Identity.Reference.LaneOrdinal, err)
 			}
 		})
+	}
+}
+
+func TestHotMutationSeedClassPreservesIdentityAndMeasuredDefault(t *testing.T) {
+	reference := gateway.ReplicatedIssuerReference{Installation: replication.ID128{1},
+		Epoch: 1, LaneOrdinal: 0, GrantDigest: replication.Digest{2}}
+	statements := []serveStatement{{SQL: "DELETE FROM orders_a WHERE id='seed-a'"}}
+	var identity durableExecBatchIdentity
+	for _, class := range []string{"interactive", "batch"} {
+		raw := hotMutationRequest(t, reference, 1, statements)
+		if class == "batch" {
+			raw = hotMutationRequestClass(t, reference, 1, statements, class)
+		}
+		if err := validateDurableExecBatchEnvelope(raw); err != nil {
+			t.Fatal(err)
+		}
+		var request serveRequest
+		var scratch serveRequestDecodeScratch
+		if err := decodeDurableExecBatchRequest(raw, &request, &scratch); err != nil {
+			t.Fatal(err)
+		}
+		if request.Class != class || len(request.Statements) != 1 || string(request.Statements[0].wireSQL) != statements[0].SQL {
+			t.Fatalf("class/statement changed: %+v", request)
+		}
+		if class == "interactive" {
+			identity = request.wireIdentity
+		} else if identity != request.wireIdentity {
+			t.Fatal("setup class changed the durable request identity")
+		}
 	}
 }
 
