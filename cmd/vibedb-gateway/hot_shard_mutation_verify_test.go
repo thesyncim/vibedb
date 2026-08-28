@@ -5,7 +5,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -160,17 +162,7 @@ func (verifier *hotMutationVerifier) syncFinalVoters(t *testing.T, catalog *gate
 		wants[descriptor.Shard] = ownsRow
 		for _, replica := range route.Replicas {
 			ctx, cancel := context.WithTimeout(verifier.ctx, 5*time.Second)
-			probe, err := verifier.client.ProbeReplicated(ctx, route, replica, serviceauthz.CapabilityDataRead)
-			if err != nil || probe == nil || !probe.HasState {
-				cancel()
-				t.Fatalf("final voter probe: %v", err)
-			}
-			replica.NodeIncarnation = probe.State.Fence.NodeIncarnation
-			authority, _ := serviceauthz.FromContext(ctx)
-			response, err := verifier.client.DoReplicated(ctx, replica, &shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedReadFollower, Capability: serviceauthz.CapabilityDataRead, Authority: authority,
-				Fence:    probe.State.Fence,
-				Relation: 1, Key: key, MinimumApplied: result.Applied, MaxValueBytes: 4 << 20})
+			response, err := hotMutationReadFinalVoter(ctx, verifier.client, route, replica, key, result.Applied)
 			cancel()
 			wantKind := shardservice.ReplicatedReadMissing
 			if result.Found {
@@ -182,6 +174,52 @@ func (verifier *hotMutationVerifier) syncFinalVoters(t *testing.T, catalog *gate
 		}
 	}
 	return wants
+}
+
+type hotMutationFinalVoterClient interface {
+	ProbeReplicated(context.Context, gateway.ReplicatedRoute, gateway.ReplicatedEndpoint, serviceauthz.Capability) (*shardservice.ReplicatedResponse, error)
+	DoReplicated(context.Context, gateway.ReplicatedEndpoint, *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error)
+}
+
+// A post-split read fence is a catch-up condition, not a one-shot transport
+// assertion. The pool may discover a closed pre-restart socket on the first
+// probe. Retry only closed streams and explicit read-behind within the same
+// deadline; never retry malformed authority or treat a probe as row evidence.
+func hotMutationReadFinalVoter(ctx context.Context, client hotMutationFinalVoterClient, route gateway.ReplicatedRoute, replica gateway.ReplicatedEndpoint, key []byte, applied uint64) (*shardservice.ReplicatedResponse, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		probe, err := client.ProbeReplicated(ctx, route, replica, serviceauthz.CapabilityDataRead)
+		if err == nil {
+			if probe == nil || !probe.HasState {
+				return nil, errors.New("final voter probe has no serving state")
+			}
+			replica.NodeIncarnation = probe.State.Fence.NodeIncarnation
+			authority, _ := serviceauthz.FromContext(ctx)
+			var response *shardservice.ReplicatedResponse
+			response, err = client.DoReplicated(ctx, replica, &shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedReadFollower, Capability: serviceauthz.CapabilityDataRead, Authority: authority,
+				Fence: probe.State.Fence, Relation: 1, Key: key, MinimumApplied: applied, MaxValueBytes: 4 << 20})
+			if err == nil {
+				if response != nil && response.Kind == shardservice.ReplicatedRefusal && response.Refusal == shardservice.ReplicatedRefusalReadBehind {
+					err = gateway.ErrReplicatedReadBehind
+				} else {
+					return response, nil
+				}
+			}
+		}
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, gateway.ErrReplicatedReadBehind) {
+			return nil, err
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Join(ctx.Err(), err)
+		case <-timer.C:
+		}
+	}
 }
 
 // Query persisted indexes only after every final voter has crossed the final

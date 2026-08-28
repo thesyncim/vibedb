@@ -71,32 +71,26 @@ func (s *Session) Tables(ctx context.Context) ([]TableInfo, error) {
 	}
 	out := make([]TableInfo, 0, len(d.catalog.Tables))
 	for name, meta := range d.catalog.Tables {
-		info := TableInfo{Name: name, PrimaryKey: meta.PrimaryKey}
-		if meta.Schema != nil {
-			info.Columns = make([]ColumnInfo, 0, len(meta.Schema.Fields))
-			for _, field := range meta.Schema.Fields {
-				info.Columns = append(info.Columns, ColumnInfo{
-					Path:     field.Path,
-					Types:    jsonTypeFromStore(store.SchemaType(field.Types)),
-					Required: field.Required,
-				})
-			}
-		}
-		if len(meta.Indexes) != 0 {
-			info.Indexes = make([]IndexInfo, 0, len(meta.Indexes))
-			for _, index := range meta.Indexes {
-				info.Indexes = append(info.Indexes, IndexInfo{
-					Name:  index.Name,
-					Paths: slices.Clone(index.Paths),
-				})
-			}
-		}
-		out = append(out, info)
+		out = append(out, tableInfoFromMeta(name, meta))
 	}
 	slices.SortFunc(out, func(a, b TableInfo) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 	return out, nil
+}
+
+func tableInfoFromMeta(name string, meta *tableMeta) TableInfo {
+	info := TableInfo{Name: name, PrimaryKey: meta.PrimaryKey}
+	if meta.Schema != nil {
+		info.Columns = make([]ColumnInfo, 0, len(meta.Schema.Fields))
+		for _, field := range meta.Schema.Fields {
+			info.Columns = append(info.Columns, ColumnInfo{Path: field.Path, Types: jsonTypeFromStore(store.SchemaType(field.Types)), Required: field.Required})
+		}
+	}
+	for _, index := range meta.Indexes {
+		info.Indexes = append(info.Indexes, IndexInfo{Name: index.Name, Paths: slices.Clone(index.Paths)})
+	}
+	return info
 }
 
 // jsonTypeFromStore maps the persisted store type set back onto the SQL
