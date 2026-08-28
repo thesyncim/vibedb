@@ -34,6 +34,51 @@ type nativeSessionClient struct {
 	proposalMembers     []uint64
 }
 
+func TestNativeSessionUsesNewerSharedLeaderWithoutProbing(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	client := &nativeSessionClient{state: states["m2"]}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("tenant"), ClientID: replication.ID128{9}, RetryHome: replication.RetryHome{7},
+		ProposalCapability: serviceauthz.CapabilityDataWrite, Resolver: BaseRelationResolver{Relation: 1},
+		MaxRelationBatches: 4, MaxMutations: 8, InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(t.Context(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	probes := client.probes
+	// Another operation has already authenticated the replacement. A dormant
+	// session must not spend its next proposal attempt on its former leader.
+	replacement := states["m3"]
+	replacement.LeaderID = replacement.Fence.MemberID
+	replacement.Fence.Term++
+	client.state = replacement
+	executor.leaderHints.publish(route, route.Replicas[2], replacement)
+	if _, err = session.Put(t.Context(), []byte{1}, []byte(`{"id":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if client.probes != probes || len(client.proposalMembers) != 1 || client.proposalMembers[0] != 3 {
+		t.Fatalf("stale session leader won over shared observation: probes=%d (was %d), members=%v", client.probes, probes, client.proposalMembers)
+	}
+	// Cache eviction followed by a delayed older observation must not move the
+	// now-current session backwards. Its private hint still avoids a probe.
+	executor.leaderHints.invalidate(route, route.Replicas[2], client.state)
+	executor.leaderHints.publish(route, route.Replicas[1], states["m2"])
+	if _, err = session.Put(t.Context(), []byte{2}, []byte(`{"id":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	if client.probes != probes || len(client.proposalMembers) != 2 || client.proposalMembers[1] != 3 {
+		t.Fatalf("older shared observation replaced the session leader: probes=%d, members=%v", client.probes, client.proposalMembers)
+	}
+}
+
 func TestExactRelationResolverRejectsUnboundRelationAndEmitsDenseIDs(t *testing.T) {
 	resolver := ExactRelationResolver{Base: 1, Relations: []replication.RelationID{3}}
 	builder := newRelationBundleBuilder(2, 2)
