@@ -27,6 +27,9 @@ public class Discovery {
   }
   public static void main(String[] args) throws Exception {
     if (args.length == 0) throw new IllegalArgumentException("JDBC URL required; optionally --writes");
+    int writeCycles=1;
+    for(String arg:args) if(arg.startsWith("--write-cycles=")) writeCycles=Integer.parseInt(arg.substring(15));
+    if(writeCycles<1||writeCycles>128) throw new IllegalArgumentException("write cycles must be 1..128");
     try (Connection c=DriverManager.getConnection(args[0])) {
       DatabaseMetaData m=c.getMetaData();
       probe("driver", () -> m.getDriverName()+" "+m.getDriverVersion());
@@ -102,7 +105,7 @@ public class Discovery {
         }
         return "text metadata, bound filter, SQL NULL";
       });
-      if (Arrays.asList(args).contains("--writes")) probe("prepared public CRUD", () -> {
+      if (Arrays.asList(args).contains("--writes")) for(int cycle=0;cycle<writeCycles&&failed==0;cycle++) probe("prepared public CRUD "+(cycle+1), () -> {
         String id="jdbc-discovery-"+UUID.randomUUID();
         try {
           try(PreparedStatement p=c.prepareStatement("INSERT INTO public.documents (id,value) VALUES (?,?)")) {

@@ -3,7 +3,6 @@ package driver
 import (
 	"fmt"
 
-	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
@@ -72,12 +71,11 @@ func canonicalReplicatedApplySidecars() ReplicatedApplySidecarProfile {
 // journal additionally includes the bounded intent and control rows. Every
 // profile is checked against its collection limits before opening a sidecar.
 func canonicalReplicatedLedgerApplySidecars() ReplicatedApplySidecarProfile {
-	limits := replicatedApplySystemLimitsForLedger(replicatedstate.MaxSessionRetryWindow, true)
-	return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: uint64(
-		storeio.RecoveryBatchRecordPaddedSizeForPayload(
-			storeio.RecoveryJournalMinSectorSize, limits.MaxBatchDocuments,
-			limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
-		))}
+	// This is an on-disk compatibility floor, not a derivation from today's
+	// maximum retry window. Raising session cleanup geometry must not change
+	// the expected journal of an already sealed, sufficiently sized root.
+	// Larger profiles are derived separately from their actual frozen limits.
+	return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: 16838144}
 }
 
 func canonicalReplicatedApplySidecarsForLimits(limits ReplicatedShardStoreLimits) ReplicatedApplySidecarProfile {

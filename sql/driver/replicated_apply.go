@@ -393,7 +393,7 @@ func replicatedApplyTransactionSystemLimits(
 
 func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Options {
 	sidecars := canonicalReplicatedApplySidecarsForLimits(limits)
-	return durable.Options{
+	options := durable.Options{
 		Durability:                 durable.DurabilitySync,
 		OpaqueValues:               true,
 		MaxKeyBytes:                limits.MaxKeyBytes,
@@ -402,6 +402,15 @@ func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Op
 		MaxBatchBytes:              limits.MaxBatchBytes,
 		SealedRecoveryJournalBytes: sidecars.SystemRecoveryJournalBytes,
 	}
+	// Large configured retry windows can retain more cleanup keys than the
+	// default 64 MiB cache admits. Derive only the exact dirty-transaction
+	// minimum, without changing any frozen document or journal limits. This
+	// preflight is cold construction work, never a per-command adjustment.
+	var residency *durable.ResidentCapacityError
+	if _, err := durable.NormalizeOptions(options); errors.As(err, &residency) && residency.Required <= math.MaxInt64 {
+		options.ResidentBytes = int64(residency.Required)
+	}
+	return options
 }
 
 func replicatedCaptureLimits(base ReplicatedShardStoreIdentity) (ReplicatedShardStoreLimits, error) {

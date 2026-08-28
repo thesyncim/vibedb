@@ -14,6 +14,9 @@ UPDATE, read-after-write, DELETE, and absence. It creates a UUID-prefixed test
 key and deletes only that key in `finally`; existing records are not changed.
 The process exits unsuccessfully on any failed check. Use only a disposable
 development database, not a production connection.
+Add `--write-cycles=48` with `--writes` for 144 distinct durable writes across
+48 isolated INSERT/UPDATE/DELETE cycles. The bounded loop stops on its first
+failure and does not automatically resubmit an unknown result.
 
 The probe checks driver metadata, GoLand's search-path array, its data-grid
 SELECT, `SELECT id, documents."$doc" FROM documents`, missing-field NULLs, and

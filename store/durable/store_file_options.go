@@ -67,6 +67,17 @@ var (
 	ErrSealedJournalCapacity = storeio.ErrSealedCapacityMismatch
 )
 
+// ResidentCapacityError reports the exact dirty-transaction residency needed
+// by a validated collection geometry. It does not change the caller's budget.
+type ResidentCapacityError struct {
+	Required   uint64
+	Configured int64
+}
+
+func (e *ResidentCapacityError) Error() string {
+	return fmt.Sprintf("vibedb: collection ResidentBytes cannot retain one worst-case dirty transaction: need=%d configured=%d", e.Required, e.Configured)
+}
+
 // Backend selects the durable commit and speculative-read engines.
 type Backend uint8
 
@@ -1569,10 +1580,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection BufferCount must exceed worst-case %d-page transaction", maxTransactionPages)
 	}
 	if o.ResidentBytes < 0 || uint64(o.ResidentBytes) < maxTransactionBytes {
-		return normalizedFileStoreOptions{}, fmt.Errorf(
-			"vibedb: collection ResidentBytes cannot retain one worst-case dirty transaction: need=%d configured=%d",
-			maxTransactionBytes, o.ResidentBytes,
-		)
+		return normalizedFileStoreOptions{}, &ResidentCapacityError{Required: maxTransactionBytes, Configured: o.ResidentBytes}
 	}
 	primaryUnifiedOverlayBytes := int(primaryOverlayTargetBytes)
 	normalized := normalizedFileStoreOptions{

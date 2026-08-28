@@ -21,14 +21,28 @@ func TestReplicatedApplyDurableProfilesPreflightEveryRetryWindow(t *testing.T) {
 			if err := durable.ValidateOptions(options); err != nil {
 				t.Fatalf("ledger=%t retry=%d actual durable profile=%+v: %v", ledger, retry, limits, err)
 			}
+			if options.ResidentBytes != 0 {
+				short := options
+				short.ResidentBytes--
+				var capacity *durable.ResidentCapacityError
+				if err := durable.ValidateOptions(short); !errors.As(err, &capacity) || capacity.Required != uint64(options.ResidentBytes) {
+					t.Fatalf("residency was not the exact minimum: %v", err)
+				}
+			}
+			if retry == 8 && options.ResidentBytes != 0 {
+				t.Fatal("ordinary retry window changed the default resident budget")
+			}
 			if err := validateReplicatedApplySidecarsForLimits(canonicalReplicatedApplySidecarsForLimits(limits), limits); err != nil {
 				t.Fatalf("ledger=%t retry=%d retained sidecars: %v", ledger, retry, err)
 			}
 			if !ledger && options.SealedRecoveryJournalBytes != ReplicatedSystemRecoveryJournalBytes {
 				t.Fatalf("data-only journal changed: %d", options.SealedRecoveryJournalBytes)
 			}
-			if ledger && options.SealedRecoveryJournalBytes != 16838144 {
-				t.Fatalf("ledger journal lost exact 514-record bound: %d", options.SealedRecoveryJournalBytes)
+			required := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
+				storeio.RecoveryJournalMinSectorSize, limits.MaxBatchDocuments,
+				limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize))
+			if ledger && options.SealedRecoveryJournalBytes != max(uint64(16838144), required) {
+				t.Fatalf("ledger journal differs from legacy floor and actual frozen limits: %d", options.SealedRecoveryJournalBytes)
 			}
 			oversized := options
 			oversized.SealedRecoveryJournalBytes = storeio.RecoveryJournalMaxCapacityBytes + storeio.RecoveryJournalMinSectorSize
@@ -39,6 +53,26 @@ func TestReplicatedApplyDurableProfilesPreflightEveryRetryWindow(t *testing.T) {
 	}
 	if ReplicatedSystemRecoveryJournalBytes != 655872 || ReplicatedUserRecoveryJournalBytes != 16794624 {
 		t.Fatal("data-only system or user journal changed with ledger ceiling")
+	}
+}
+
+func TestReplicatedLegacyJournalGeometrySurvivesScopedSessionUpgrade(t *testing.T) {
+	legacy := ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: 16838144}
+	if canonicalReplicatedLedgerApplySidecars() != legacy {
+		t.Fatal("legacy journal floor changed")
+	}
+	// Existing RF3 development roots have eight retry slots and transaction
+	// capacity independent of the expanded scoped-session cleanup bound.
+	for _, ledger := range []bool{false, true} {
+		limits := replicatedApplySystemLimitsForLedger(8, ledger, 68)
+		if err := validateReplicatedApplySidecarsForLimits(legacy, limits); err != nil {
+			t.Fatalf("existing ledger=%t root rejected: %v", ledger, err)
+		}
+	}
+	tooSmall := legacy
+	tooSmall.SystemRecoveryJournalBytes -= storeio.RecoveryJournalMinSectorSize
+	if err := validateReplicatedApplySidecarGrammar(tooSmall); err == nil {
+		t.Fatal("undersized legacy geometry accepted")
 	}
 }
 
