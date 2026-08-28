@@ -249,33 +249,34 @@ const (
 // use: serialization is part of its request-identity and acknowledgement
 // contract, not an incidental implementation restriction.
 type NativeSession struct {
-	executor            *ReplicatedExecutor
-	route               ReplicatedRoute
-	distribution        string
-	shard               string
-	tenant              []byte
-	clientID            replication.ID128
-	retryHome           replication.RetryHome
-	resolver            BundleResolver
-	bundle              RelationBundleBuilder
-	command             []byte
-	gateCommand         [routegate.CommandBytes]byte
-	maxCommand          int
-	pending             bool
-	phase               nativeSessionPhase
-	epoch               uint64
-	nextSequence        uint64
-	ackThrough          uint64
-	leaseDeadline       int64
-	terminalSequence    uint64
-	terminalFingerprint replication.Digest
-	leader              shardservice.ReplicatedMemberState
-	journal             *NativeSessionJournal
-	proposalCapability  serviceauthz.Capability
-	scopedCoordination  bool
-	catalogControl      bool
-	catalogBootstrap    *Snapshot
-	catalogHolder       *CatalogHolder
+	executor                     *ReplicatedExecutor
+	route                        ReplicatedRoute
+	distribution                 string
+	shard                        string
+	tenant                       []byte
+	clientID                     replication.ID128
+	retryHome                    replication.RetryHome
+	resolver                     BundleResolver
+	bundle                       RelationBundleBuilder
+	command                      []byte
+	gateCommand                  [routegate.CommandBytes]byte
+	maxCommand                   int
+	pending                      bool
+	phase                        nativeSessionPhase
+	epoch                        uint64
+	nextSequence                 uint64
+	ackThrough                   uint64
+	leaseDeadline                int64
+	terminalSequence             uint64
+	terminalFingerprint          replication.Digest
+	leader                       shardservice.ReplicatedMemberState
+	journal                      *NativeSessionJournal
+	proposalCapability           serviceauthz.Capability
+	scopedCoordination           bool
+	membershipStableCoordination bool
+	catalogControl               bool
+	catalogBootstrap             *Snapshot
+	catalogHolder                *CatalogHolder
 }
 
 // NativeSessionStatus is a detached fixed-width view. Pending means callers
@@ -927,6 +928,9 @@ func (session *NativeSession) commandHeader(
 			authorityClass = replication.CommandAuthorityExecutionSession
 		} else {
 			authorityClass = replication.CommandAuthorityRouteSession
+			if session.membershipStableCoordination {
+				authorityClass = replication.CommandAuthorityMembershipStableRouteSession
+			}
 		}
 	}
 	return replication.Command{

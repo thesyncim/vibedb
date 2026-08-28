@@ -548,7 +548,7 @@ func validateSessionSlotView(view SessionSlotView) error {
 }
 
 func validSessionAuthorityClass(class replication.CommandAuthorityClass) bool {
-	return class == replication.CommandAuthorityData ||
+	return replication.IsDataAuthority(class) ||
 		class == replication.CommandAuthorityTopology ||
 		class == replication.CommandAuthorityExecutionPin || replication.IsScopedSessionAuthority(class)
 }

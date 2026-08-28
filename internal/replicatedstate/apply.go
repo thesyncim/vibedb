@@ -1851,7 +1851,7 @@ func (m *Machine) planSessionRelease(
 	plan.deleteSession = true
 	plan.deleteAuthority = replication.IsScopedSessionAuthority(command.AuthorityClass)
 	plan.deleteSlots = session.PhysicalSlotCount
-	if command.AuthorityClass == replication.CommandAuthorityRouteSession {
+	if replication.IsRouteSessionAuthority(command.AuthorityClass) {
 		// Route outcomes live beside the retry ring. They are no longer
 		// reachable after exact release and must not outlive its scoped binding.
 		for slot := uint16(0); slot < session.RetryWindow; slot++ {
@@ -2409,6 +2409,7 @@ func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
 	for _, class := range [...]replication.CommandAuthorityClass{
 		replication.CommandAuthorityData, replication.CommandAuthorityTopology,
 		replication.CommandAuthorityExecutionPin,
+		replication.CommandAuthorityMembershipStableData,
 	} {
 		digest := SessionKey(class, tenant, clientID)
 		key := SessionStorageKey(digest)

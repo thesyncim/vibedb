@@ -51,7 +51,7 @@ func (driver *nativeDurableRequestRouteGateSessions) session(route ReplicatedRou
 	if err != nil {
 		return nil, err
 	}
-	return NewNativeSession(NativeSessionOptions{
+	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: driver.executor, Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: wave.Tenant, ClientID: id, RetryHome: wave.Identity.RetryHome,
 		ScopedCoordination: true,
@@ -60,6 +60,10 @@ func (driver *nativeDurableRequestRouteGateSessions) session(route ReplicatedRou
 		InitialCommandBytes: requestledger.MaxRouteGatePinCommandBytes,
 		MaxCommandBytes:     requestledger.MaxRouteGatePinCommandBytes,
 	})
+	if session != nil {
+		session.membershipStableCoordination = true
+	}
+	return session, err
 }
 
 func (driver *nativeDurableRequestRouteGateSessions) prepareAcquire(ctx context.Context, route ReplicatedRoute, wave DurableRequestWave, head requestledger.HeadRecord) ([]byte, requestledger.Digest, error) {
@@ -67,7 +71,9 @@ func (driver *nativeDurableRequestRouteGateSessions) prepareAcquire(ctx context.
 	if err != nil {
 		return nil, requestledger.Digest{}, err
 	}
-	read, err := driver.executor.ReadRouteGate(ctx, route, 1)
+	readRoute := route
+	readRoute.membershipStable = true
+	read, err := driver.executor.ReadRouteGate(ctx, readRoute, 1)
 	if err != nil {
 		return nil, requestledger.Digest{}, err
 	}
@@ -104,12 +110,17 @@ func (driver *nativeDurableRequestRouteGateSessions) settledSession(route Replic
 	if err != nil || identityErr != nil || gate.Identity != routegate.Identity(identity) {
 		return nil, replication.CommandView{}, errors.Join(err, identityErr, ErrDurableRequestConflict)
 	}
-	session, err := driver.session(route, wave, identity)
+	sessionRoute := route
+	// The retained command binds the original physical session identity.
+	// Catalog membership may advance, but release must retain that identity.
+	sessionRoute.Command.ReplicaSetVersion = outer.ReplicaSetVersion
+	session, err := driver.session(sessionRoute, wave, identity)
 	if session != nil {
-		session.scopedCoordination = outer.AuthorityClass == replication.CommandAuthorityRouteSession
+		session.scopedCoordination = replication.IsRouteSessionAuthority(outer.AuthorityClass)
+		session.membershipStableCoordination = replication.IsMembershipStableAuthority(outer.AuthorityClass)
 	}
 	if err != nil || session.clientID != outer.ClientID || outer.ClientEpoch == 0 ||
-		(outer.AuthorityClass != replication.CommandAuthorityData && outer.AuthorityClass != replication.CommandAuthorityRouteSession) ||
+		(!replication.IsDataAuthority(outer.AuthorityClass) && !replication.IsRouteSessionAuthority(outer.AuthorityClass)) ||
 		(pin.Phase == requestledger.RoutePinAcquired && (gate.Operation != routegate.OperationAcquireShared || outer.ClientSequence != 2 || outer.AckThrough != 1)) ||
 		(pin.Phase == requestledger.RoutePinReleased && (gate.Operation != routegate.OperationReleaseShared || outer.ClientSequence != 3 || outer.AckThrough != 2)) ||
 		(pin.Phase != requestledger.RoutePinAcquired && pin.Phase != requestledger.RoutePinReleased) {
