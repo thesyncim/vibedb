@@ -47,12 +47,12 @@ const (
 		sha256.Size + replication.MaxRelationsPerBundle*(snapshotArtifactRelationFixedBytes+replication.MaxIdentityBytes)
 )
 
-// MaxTransitionCaptureRecordBytes is the global bound for one compact capture
-// record: a replicated command payload plus one fixed 56-byte before witness
-// per mutation and the 248-byte record envelope. Collection-specific limits
-// are normally much smaller and remain enforced by their durable target.
+// MaxTransitionCaptureRecordBytes covers both the legacy base-only split log
+// and the all-relation schema log. The latter has a 48-byte witness per changed
+// row and a 296-byte envelope. Collection-specific limits remain enforced by
+// their durable target; this is the hostile snapshot-transfer ceiling.
 const MaxTransitionCaptureRecordBytes = replication.MaxCommandBytes +
-	MaxDistinctMutations*56 + 248
+	replication.MaxRelationsPerBundle*MaxDistinctMutations*48 + 296
 
 const (
 	// SnapshotArtifactSystem identifies raw hidden system rows.

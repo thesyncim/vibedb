@@ -48,19 +48,21 @@ type TransitionMutation struct {
 // strictly ordered by relation then key. Empty transitions remain required for
 // no-op, configuration, and ownership entries.
 type CapturedTransition struct {
-	Applied               uint64
-	Term                  uint64
-	BeforeOwnershipEpoch  uint64
-	AfterOwnershipEpoch   uint64
-	BeforeRoutingVersion  uint64
-	AfterRoutingVersion   uint64
-	BeforeRouteGeneration uint64
-	AfterRouteGeneration  uint64
-	PreviousEntryDigest   [32]byte
-	EntryDigest           [32]byte
-	BeforeDataChainDigest [32]byte
-	AfterDataChainDigest  [32]byte
-	mutations             []capturedMutation
+	Applied                uint64
+	Term                   uint64
+	BeforeOwnershipEpoch   uint64
+	AfterOwnershipEpoch    uint64
+	BeforeRoutingVersion   uint64
+	AfterRoutingVersion    uint64
+	BeforeRouteGeneration  uint64
+	AfterRouteGeneration   uint64
+	BeforeSchemaGeneration uint64
+	AfterSchemaGeneration  uint64
+	PreviousEntryDigest    [32]byte
+	EntryDigest            [32]byte
+	BeforeDataChainDigest  [32]byte
+	AfterDataChainDigest   [32]byte
+	mutations              []capturedMutation
 }
 
 // Only active capture workspace carries a relation tag. The ordinary apply
@@ -132,6 +134,80 @@ type RelationTransitionCapture interface {
 	CaptureAllRelations() bool
 }
 
+// StoppableTransitionCapture may stop recording only after publishing a durable
+// terminal record. A recovered terminal capture reports the same state from
+// Begin. Stopping capture does not certify a schema target: consumers must
+// distinguish successful closure from an aborted build in their own grammar.
+type StoppableTransitionCapture interface {
+	TransitionCapture
+	CaptureStopped() bool
+}
+
+// FinishingTransitionCapture seals a private build stream at an exact source
+// cut. This is replica-local artifact metadata, not a schema activation or a
+// distributed write fence. The coordinator must fence new writes separately
+// and certify/activate the target at the same expected applied index.
+type FinishingTransitionCapture interface {
+	StoppableTransitionCapture
+	Finish(State, func(key, value []byte) error) error
+}
+
+func (m *Machine) FinishTransitionCapture(capture FinishingTransitionCapture, expectedApplied uint64) error {
+	if m == nil || capture == nil || expectedApplied == 0 {
+		return ErrTransitionCapture
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.checkUsable(); err != nil {
+		return err
+	}
+	if m.capture != capture || m.state.Applied != expectedApplied || capture.Target() != m.captureTarget {
+		return ErrTransitionCapture
+	}
+	published := false
+	finishErr := capture.Finish(cloneState(m.state), func(key, value []byte) error {
+		if published || len(key) == 0 || len(value) == 0 {
+			return ErrTransitionCapture
+		}
+		published = true
+		write := func(batch *durable.DatabaseBatch) error {
+			collection, err := batch.CollectionHandle(m.captureTarget.Collection)
+			if err != nil {
+				return err
+			}
+			return collection.Put(key, value)
+		}
+		members := []durable.NamedCollection{{Name: m.captureTarget.Name, Collection: m.captureTarget.Collection, BatchDocumentsHint: 1}}
+		var err error
+		if m.checkpointGroup != nil {
+			err = m.checkpointGroup.Update(m.state.Applied, members, m.options.TxnLimits, write)
+		} else {
+			err = durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, write)
+		}
+		if err != nil {
+			m.poison = err
+		}
+		return err
+	})
+	if finishErr != nil {
+		if published {
+			m.poison = finishErr
+		}
+		return errors.Join(ErrTransitionCapture, finishErr)
+	}
+	if !published || !capture.CaptureStopped() {
+		m.poison = ErrTransitionCapture
+		return ErrTransitionCapture
+	}
+	m.capture, m.captureBuffer, m.captureChanges = nil, nil, nil
+	return nil
+}
+
+func captureStopped(capture TransitionCapture) bool {
+	stoppable, ok := capture.(StoppableTransitionCapture)
+	return ok && stoppable.CaptureStopped()
+}
+
 func capturesAllRelations(capture TransitionCapture) bool {
 	all, ok := capture.(RelationTransitionCapture)
 	return ok && all.CaptureAllRelations()
@@ -182,6 +258,11 @@ func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
 	}
 	m.capture = capture
 	m.captureTarget = target
+	if captureStopped(capture) {
+		m.capture = nil
+		m.captureBuffer = nil
+		m.captureChanges = nil
+	}
 	return nil
 }
 
@@ -348,17 +429,19 @@ func (m *Machine) capturedTransition(next State, changes []finalMutation, spans 
 	}
 	return CapturedTransition{
 		Applied: next.Applied, Term: next.LastTerm,
-		BeforeOwnershipEpoch:  m.state.Binding.OwnershipEpoch,
-		AfterOwnershipEpoch:   next.Binding.OwnershipEpoch,
-		BeforeRoutingVersion:  m.state.Binding.RoutingVersion,
-		AfterRoutingVersion:   next.Binding.RoutingVersion,
-		BeforeRouteGeneration: m.state.Binding.RouteGeneration,
-		AfterRouteGeneration:  next.Binding.RouteGeneration,
-		PreviousEntryDigest:   m.state.LastEntryDigest,
-		EntryDigest:           next.LastEntryDigest,
-		BeforeDataChainDigest: m.state.DataChainDigest,
-		AfterDataChainDigest:  next.DataChainDigest,
-		mutations:             m.captureChanges,
+		BeforeOwnershipEpoch:   m.state.Binding.OwnershipEpoch,
+		AfterOwnershipEpoch:    next.Binding.OwnershipEpoch,
+		BeforeRoutingVersion:   m.state.Binding.RoutingVersion,
+		AfterRoutingVersion:    next.Binding.RoutingVersion,
+		BeforeRouteGeneration:  m.state.Binding.RouteGeneration,
+		AfterRouteGeneration:   next.Binding.RouteGeneration,
+		BeforeSchemaGeneration: m.state.Binding.SchemaGeneration,
+		AfterSchemaGeneration:  next.Binding.SchemaGeneration,
+		PreviousEntryDigest:    m.state.LastEntryDigest,
+		EntryDigest:            next.LastEntryDigest,
+		BeforeDataChainDigest:  m.state.DataChainDigest,
+		AfterDataChainDigest:   next.DataChainDigest,
+		mutations:              m.captureChanges,
 	}
 }
 
