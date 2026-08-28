@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // One connection: startup, the message loop, and the simple query protocol.
@@ -990,6 +991,13 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 			txCount++
 		}
 	}
+	if dml && autocommitWrites(s.sql) {
+		if count != 1 || s.sql.State() != sqldriver.SessionIdle {
+			return false, newError(sqlstateFeatureNotSupported,
+				"distributed writes require one statement in auto-commit mode")
+		}
+		return false, nil
+	}
 	if count <= 1 {
 		// A simple DML Query is an implicit transaction even when it carries
 		// one statement. Wrapping that mutation matters for
@@ -1502,13 +1510,13 @@ func (s *session) executeRuntimeExec(p *portal) error {
 	result, err := p.stmt.runtime.Exec(context.Background(), p.args)
 	if err != nil {
 		_ = s.takeCancel()
-		if errors.Is(err, query.ErrCanceled) {
+		if errors.Is(err, query.ErrCanceled) && !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 			return queryCanceled()
 		}
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	if s.takeCancel() {
-		if !runtimeKindIsDDL(kind) {
+		if !runtimeKindIsDDL(kind) && !autocommitWrites(s.sql) {
 			return queryCanceled()
 		}
 		// DDL's atomic catalog publication is the commit point and cannot

@@ -68,10 +68,13 @@ func (authority *ReplicatedIssuerAuthority) OpenIssuerLane(
 	})
 	minimum := uint64(1)
 	if applyErr == nil {
-		if result.Ledger.ResultCode != replicatedstate.ResultApplied {
+		if result.Ledger.ResultCode != replicatedstate.ResultApplied && result.Ledger.ResultCode != replicatedstate.ResultRequestLedgerConflict {
 			return ReplicatedIssuerLaneGrant{}, ErrDurableRequestConflict
 		}
-		minimum = result.Applied
+		// An already-used lane has advanced past the initial highwater CAS.
+		// Its exact authenticated identity, not byte equality with revision one,
+		// is the reopen authority. The following ReadIndex proves that identity.
+		minimum = max(uint64(1), result.Applied)
 	}
 	_, readErr := authority.readLane(ctx, home, key, minimum)
 	if readErr != nil {

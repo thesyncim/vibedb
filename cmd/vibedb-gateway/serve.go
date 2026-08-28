@@ -184,7 +184,7 @@ func runServe(args []string) (exitCode int) {
 	schemaRolloutPlan := fs.String("schema-rollout-plan", "", "strict canonical vibejson per-replica schema rollout plan")
 	schemaRolloutOnce := fs.Bool("schema-rollout-once", false, "execute the authenticated schema rollout and exit")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
-	pgDevListen := fs.String("pg-dev-listen", "", "optional loopback-only, trust-authenticated PostgreSQL read endpoint for local development")
+	pgDevListen := fs.String("pg-dev-listen", "", "optional loopback-only, trust-authenticated PostgreSQL endpoint with durable auto-commit writes")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
 	tlsKey := fs.String("tls-key", "", "PEM gateway private key")
@@ -723,7 +723,20 @@ func runServe(args []string) (exitCode int) {
 		}()
 	}
 	if *pgDevListen != "" {
-		pg, pgErr := startGatewayPostgreSQL(ctx, *pgDevListen, exec, internalAuthority, logf)
+		writeService, ok := durable.(postgresDurableService)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "gateway: PostgreSQL requires durable write service")
+			return 1
+		}
+		writer, writeErr := openPostgresDurableWriter(*catalogSessionJournal+".pg-writes", internalAuthority, writeService)
+		if writeErr != nil {
+			fmt.Fprintln(os.Stderr, writeErr)
+			return 1
+		}
+		writeCtx, stopWrites := context.WithCancel(ctx)
+		defer func() { stopWrites(); _ = writer.Close() }()
+		go writer.Run(writeCtx)
+		pg, pgErr := startGatewayPostgreSQL(ctx, *pgDevListen, exec, internalAuthority, writer.Write, logf)
 		if pgErr != nil {
 			_ = listener.Close()
 			fmt.Fprintln(os.Stderr, pgErr)

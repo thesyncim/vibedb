@@ -15,13 +15,12 @@ import (
 	driver "github.com/thesyncim/vibedb/sql/driver"
 )
 
-// PostgreSQLBackend exposes the distributed read executor, not an embedded
-// database. Authorize maps the authenticated PostgreSQL identity to the exact
-// forwarded service principal. SQL writes are refused before mutation; durable
-// writes continue to use the native request-ledger API.
+// PostgreSQLBackend exposes distributed reads and optional durable autocommit
+// writes, never an embedded database or a replica-local mutation path.
 type PostgreSQLBackend struct {
 	Executor  *Executor
 	Authorize func(pgwire.SessionIdentity) (serviceauthz.Authority, error)
+	Write     func(context.Context, serviceauthz.Authority, Query) (*Result, error)
 }
 
 func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.SessionIdentity) (pgwire.BackendSession, error) {
@@ -35,7 +34,7 @@ func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.Sess
 	if _, err := serviceauthz.WithAuthority(ctx, authority); err != nil {
 		return nil, err
 	}
-	return &postgresSession{backend: b, authority: authority, state: driver.SessionIdle, statements: make(map[*postgresStatement]struct{}), rows: 100000, bytes: shardservice.MaxReplicatedSQLResultBytes}, nil
+	return &postgresSession{backend: b, authority: authority, state: driver.SessionIdle, statements: make(map[pgwire.BackendStatement]struct{}), rows: 100000, bytes: shardservice.MaxReplicatedSQLResultBytes}, nil
 }
 
 type postgresSession struct {
@@ -46,12 +45,13 @@ type postgresSession struct {
 	rows         int
 	bytes        int64
 	intermediate int64
-	statements   map[*postgresStatement]struct{}
+	statements   map[pgwire.BackendStatement]struct{}
 	cancelMu     sync.Mutex
 	cancel       context.CancelFunc
 }
 
 func (s *postgresSession) State() driver.SessionState { return s.state }
+func (s *postgresSession) AutocommitWrites() bool     { return s.backend.Write != nil }
 func (s *postgresSession) MarkFailed() {
 	if s.state == driver.SessionInTransaction {
 		s.state = driver.SessionFailedTransaction
@@ -156,7 +156,7 @@ func (s *postgresSession) Prepare(ctx context.Context, text string) (pgwire.Back
 		return nil, err
 	}
 	if parsed.Kind != sqlast.KindSelect {
-		return nil, driver.ErrReadOnlyTransaction
+		return s.prepareWrite(ctx, text, &parsed)
 	}
 	tree := parsed.Select
 	compiled, err := query.PrepareParsedStatement(text, tree)
@@ -195,9 +195,6 @@ func (p *postgresStatement) ParamPosition(int) int { return 0 }
 func (p *postgresStatement) Columns() []string     { return p.compiled.Columns() }
 func (p *postgresStatement) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
 	return p.compiled.AppendSchema(dst)
-}
-func (p *postgresStatement) Exec(context.Context, []any) (driver.Result, error) {
-	return driver.Result{}, driver.ErrReadOnlyTransaction
 }
 func (p *postgresStatement) Close() error {
 	if p.compiled != nil {

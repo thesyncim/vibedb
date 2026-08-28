@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -710,7 +711,12 @@ func (s *session) beforeExtendedExecute(stmt *prepared) error {
 			withHint("send Sync after the session command before executing stored-row SQL")
 	}
 	kind := stmt.runtime.Kind()
-	ddl := runtimeKindIsDDL(kind)
+	atomicWrite := autocommitWrites(s.sql) && kind != sqlast.KindSelect
+	if atomicWrite && s.sql.State() != sqldriver.SessionIdle {
+		return newError(sqlstateFeatureNotSupported,
+			"distributed writes require auto-commit mode")
+	}
+	ddl := runtimeKindIsDDL(kind) || atomicWrite
 	if ddl {
 		if s.extendedSQL {
 			return newError(sqlstateFeatureNotSupported,

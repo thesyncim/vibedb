@@ -316,7 +316,7 @@ func runClusterDev(args []string) int {
 	shardBinary := fs.String("shard-binary", "", "vibedb-shard executable; defaults beside vibedb or PATH")
 	gatewayBinary := fs.String("gateway-binary", "", "vibedb-gateway executable; defaults beside vibedb or PATH")
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
-	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL read endpoint (RF3 only)")
+	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *root == "" {
 		usage()
 		return 2

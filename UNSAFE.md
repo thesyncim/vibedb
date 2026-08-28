@@ -66,7 +66,7 @@ The test parses Go imports. It excludes tests, testdata, vendor content, the
 Git directory, and nested Go modules.
 
 <!-- unsafe-file-list:start -->
-The root module contains 69 non-test Go files that import `unsafe`:
+The root module contains 70 non-test Go files that import `unsafe`:
 
 ```text
 autosplit/recorder.go
@@ -117,6 +117,7 @@ query/relation_spool.go
 query/result_budget.go
 query/set_kernel.go
 query/set_tree.go
+query/source_filter.go
 query/sql_scalar_statement.go
 query/window_kernel.go
 sql/driver/tx.go

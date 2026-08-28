@@ -1,8 +1,9 @@
 # PostgreSQL access to distributed RF3 SQL
 
-Status: available as an opt-in, loopback-only RF3 **read-only** development
-endpoint. SQL writes, DDL, savepoints, repeatable-read/serializable transactions,
-global-index lookup plans, and repartition exchange plans are refused.
+Status: opt-in, loopback-only RF3 development endpoint with distributed reads
+and durable single-statement auto-commit writes. DDL, write transaction blocks,
+savepoints, repeatable-read/serializable transactions, global-index lookup plans,
+and repartition exchange plans are refused.
 
 ## Local use
 
@@ -24,7 +25,18 @@ The seeded table is `documents`, with primary key `/id`. Try:
 ```sql
 SELECT id, value FROM documents ORDER BY id;
 SELECT COUNT(*) FROM documents;
+INSERT INTO documents (id, value) VALUES ('example', 'hello');
+UPDATE documents SET "$doc" = '{"id":"example","value":"updated"}' WHERE id = 'example';
+DELETE FROM documents WHERE id = 'example';
 ```
+
+Keep GoLand's console in **Auto** transaction mode. INSERT supports whole JSON
+documents or flat column/value tuples, including multiple rows. UPDATE replaces
+the whole document and requires primary-key equality; DELETE requires primary-key
+equality or a finite IN list. RETURNING, ON CONFLICT, arbitrary UPDATE field
+assignments, and multi-statement write batches are not supported. Execute each
+write independently, with its own Query message or Execute/Sync batch. This is
+not a complete PostgreSQL transactional SQL implementation.
 
 The launcher starts three replicas each for catalog, ledger, and data, plus a
 gateway. This is three-way replication, not three physical data shards. The
@@ -41,8 +53,9 @@ a regression, alongside the existing psql catalog shims.
 
 The PostgreSQL listener is a protocol adapter, not a second SQL authority.
 Authenticated sessions use the same catalog, distributed planner, RF3
-read barriers, and authorization as native gateway clients. Writes continue
-through the native durable request-ledger API, not this PostgreSQL adapter.
+read barriers, and authorization as native gateway clients. PostgreSQL writes
+call the same native durable request-ledger service. They never mutate a replica
+directly. Flat INSERT documents use the existing SQL runtime's canonical encoder.
 The existing embedded PostgreSQL backend remains supported independently.
 
 The execution path is PostgreSQL session -> gateway planner -> catalog-selected
@@ -83,6 +96,17 @@ and 4 MiB result ceilings; each shard also bounds working/intermediate/aggregate
 memory and charges the shared native frame admission budget. PostgreSQL row
 materialization has an additional retained-memory preflight. These finite
 bounds are not a claim of allocation-free or zero-cost distributed execution.
+
+Writes use one serialized issuer lane for this local-development endpoint and
+a checksummed, fsynced outbox beside the catalog-session journal (`.pg-writes`).
+It retains at most one request and its terminal ACK, with a 4 MiB record limit.
+The issuer identity and exact SQL/parameter bytes are durable before admission.
+Recovery replays the retained ledger result before replanning; terminal ACK
+cleanup never executes the SQL again. Unknown outcomes return SQLSTATE 40003;
+do not blindly resubmit them. The server resolves its retained request, but a
+new PostgreSQL connection supplies no application retry identity. Committed
+success cannot be changed into cancellation merely because a late cancel arrives.
+No write outbox or recovery worker is created unless this endpoint is enabled.
 
 ## Required contracts
 
@@ -130,6 +154,9 @@ global ordering/limit and count merge, independent observation vectors, failed
 shard refusal, ownership filtering, read-only transaction state, result bounds,
 and cancellation. Real psql and the installed GoLand PostgreSQL JDBC 42.7.3
 driver exercise prepared reads, scans, counts, co-located joins, table discovery,
-and SQL write rejection. Local three-voter reads also succeed while each data
+and single-statement DML. Journal regressions cover exact-byte recovery after
+unknown execution, retained ACK recovery without re-execution, sequence reuse
+after pre-admission refusal, exclusive ownership, and corrupt-state rejection.
+Local three-voter reads also succeed while each data
 replica is paused in turn and resumed. Broader SQL writes, exchange, full IDE
 introspection, and global transaction isolation remain explicitly unsupported.

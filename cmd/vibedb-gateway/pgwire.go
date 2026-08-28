@@ -10,12 +10,12 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-func startGatewayPostgreSQL(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, logf func(string, ...any)) (*pgwire.Server, error) {
+func startGatewayPostgreSQL(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, write func(context.Context, serviceauthz.Authority, gateway.Query) (*gateway.Result, error), logf func(string, ...any)) (*pgwire.Server, error) {
 	if err := requireLoopbackListen(address); err != nil {
 		return nil, err
 	}
 	server, err := pgwire.NewServerWithBackend(&gateway.PostgreSQLBackend{
-		Executor: executor, Authorize: func(identity pgwire.SessionIdentity) (serviceauthz.Authority, error) {
+		Executor: executor, Write: write, Authorize: func(identity pgwire.SessionIdentity) (serviceauthz.Authority, error) {
 			if identity.User != "local" || identity.Database != "vibedb" {
 				return serviceauthz.Authority{}, gateway.ErrReplicatedUnauthorized
 			}
@@ -36,6 +36,6 @@ func startGatewayPostgreSQL(ctx context.Context, address string, executor *gatew
 			logf("gateway: PostgreSQL stopped: %v", err)
 		}
 	}()
-	logf("gateway: local PostgreSQL RF3 read endpoint %s (user local, database vibedb; no SQL writes)", listener.Addr())
+	logf("gateway: local PostgreSQL RF3 endpoint %s (user local, database vibedb; durable auto-commit writes)", listener.Addr())
 	return server, nil
 }

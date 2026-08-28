@@ -23,6 +23,20 @@ type Backend interface {
 	NewSession(context.Context, SessionIdentity) (BackendSession, error)
 }
 
+// BackendAutocommitWrites marks an adapter whose mutations are indivisible
+// durable requests, not writes staged in BackendSession's read transaction.
+// Such writes require a standalone Query or Execute/Sync batch. They cannot
+// participate in explicit transactions, and cancellation after success cannot
+// undo them. Embedded backends retain their normal transactional behavior.
+type BackendAutocommitWrites interface {
+	AutocommitWrites() bool
+}
+
+func autocommitWrites(s BackendSession) bool {
+	b, ok := s.(BackendAutocommitWrites)
+	return ok && b.AutocommitWrites()
+}
+
 // BackendSession is the execution boundary beneath the PostgreSQL protocol.
 // Implementations must provide the transaction semantics they report. An
 // unsupported transaction mode must be rejected before executing mutations.
