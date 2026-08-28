@@ -100,6 +100,29 @@ func (a *rf3SchemaActivator) generation(
 	return state, nil
 }
 
+func (a *rf3SchemaActivator) BuildSchema(ctx context.Context, request schemainstall.BuildRequest, sql string) (sqldriver.ReplicatedSchemaDDLTarget, error) {
+	var target sqldriver.ReplicatedSchemaDDLTarget
+	digest, err := schemainstall.BuildRequestDigest(request)
+	if err != nil || uint64(len(sql)) != request.SQLBytes || sha256.Sum256([]byte(sql)) != request.SQLDigest {
+		return target, errors.Join(err, schemainstall.ErrInvalid)
+	}
+	state, err := a.generation(schemainstall.Request{Group: request.Group})
+	if err != nil {
+		return target, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.quiesced || state.apply == nil {
+		return target, schemainstall.ErrConflict
+	}
+	manifest, err := state.apply.RangeSplitRelationManifestDigest()
+	if err != nil || state.base.Binding.AllocationGeneration != uint64(request.AllocationGeneration) ||
+		state.base.Binding.Authority.SchemaGeneration != request.FromSchemaGeneration || manifest != request.FromRelationManifestDigest {
+		return target, errors.Join(err, schemainstall.ErrConflict)
+	}
+	return state.apply.BuildJournaledReplicatedSchemaDDLTarget(ctx, digest, request.SourceApplied, sql)
+}
+
 func (a *rf3SchemaActivator) artifact(
 	request schemainstall.Request, digest [sha256.Size]byte,
 ) ([]byte, error) {
@@ -181,9 +204,14 @@ func (a *rf3SchemaActivator) Stage(
 		manifest != request.FromRelationManifestDigest {
 		return [32]byte{}, errors.Join(err, schemainstall.ErrConflict)
 	}
-	proof, err := state.apply.PrepareReplicatedSchemaTarget(
-		raw, state.apply.Applied(), request.Operation,
-	)
+	applied, built, err := state.apply.ReplicatedSchemaDDLSourceApplied(raw)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	if !built {
+		applied = state.apply.Applied()
+	}
+	proof, err := state.apply.PrepareReplicatedSchemaTarget(raw, applied, request.Operation)
 	if err != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
 		return [32]byte{}, errors.Join(err, schemainstall.ErrConflict)
 	}

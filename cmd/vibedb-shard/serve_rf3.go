@@ -700,6 +700,17 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return err
 	}
+	schemaBuildControl, err := schemainstall.NewBuildControlService(schemainstall.BuildControlOptions{
+		Builder: schemaActivator,
+		Authorize: func(identity rafttransport.PeerIdentity, request schemainstall.BuildRequest) bool {
+			_, err := transportRegistry.LocalMember(request.Group)
+			return err == nil && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 2, BuildTimeout: 2 * time.Minute,
+	})
+	if err != nil {
+		return err
+	}
 	var sourceControl shardcontrol.Handler
 	var sourceData shardcontrol.Handler
 	var snapshotTLS *servicetls.Server
@@ -930,7 +941,7 @@ func servePreparedRF3WithExecutionLanes(
 		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
 		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
-		restoreServingControl,
+		restoreServingControl, schemaBuildControl,
 	)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
@@ -1092,9 +1103,9 @@ func servePreparedRF3WithExecutionLanes(
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
 	membership, observation, metrics, backup, source, action, split, schema, planObservation, admission, tail,
-	terminal, childPrepare, restoreServing shardcontrol.Handler,
+	terminal, childPrepare, restoreServing, schemaBuild shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 14)
+	routes := make([]shardcontrol.Route, 0, 15)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -1138,6 +1149,9 @@ func newRF3ControlMux(
 			Discriminator: schemainstall.RequestDiscriminator(),
 			Handler:       schema,
 		})
+	}
+	if schemaBuild != nil {
+		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildRequestDiscriminator(), Handler: schemaBuild})
 	}
 	if planObservation != nil {
 		routes = append(routes, shardcontrol.Route{

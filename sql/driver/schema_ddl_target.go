@@ -25,6 +25,29 @@ type ReplicatedSchemaDDLTarget struct {
 	NoOp    bool
 }
 
+// ValidateReplicatedSchemaDDLTarget checks a detached build receipt. It does
+// not open images or grant serving authority; prepare still verifies the files.
+func ValidateReplicatedSchemaDDLTarget(target ReplicatedSchemaDDLTarget, applied, sourceSchema uint64) error {
+	if applied == 0 || sourceSchema == 0 || sourceSchema == ^uint64(0) {
+		return ErrReplicatedSchemaCatalogImage
+	}
+	if target.NoOp {
+		if len(target.Catalog) != 0 || target.Proof != (ReplicatedSchemaTargetProof{}) {
+			return ErrReplicatedSchemaCatalogImage
+		}
+		return nil
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(target.Catalog)
+	proof := target.Proof
+	if err != nil || image.SchemaGeneration != sourceSchema+1 || proof.Catalog != image ||
+		proof.SourceApplied != applied || proof.Membership != (durable.CheckpointMembershipWitness{}) ||
+		proof.ApplyContract == ([32]byte{}) || proof.Relations.Witness == ([32]byte{}) ||
+		proof.Witness != replicatedSchemaTargetProofDigest(proof) {
+		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return nil
+}
+
 // BuildReplicatedSchemaDDLTarget builds CREATE/DROP INDEX and TRUNCATE images
 // from one exact data cut. The caller must first fence new distributed writes
 // and obtain expectedApplied from a quorum barrier. A concurrent publication
@@ -37,6 +60,12 @@ type ReplicatedSchemaDDLTarget struct {
 // DDL commit. ALTER and DROP TABLE require their own schema/namespace lowering.
 func (a *ReplicatedApply) BuildReplicatedSchemaDDLTarget(
 	ctx context.Context, expectedApplied uint64, text string,
+) (ReplicatedSchemaDDLTarget, error) {
+	return a.buildReplicatedSchemaDDLTarget(ctx, expectedApplied, text, nil)
+}
+
+func (a *ReplicatedApply) buildReplicatedSchemaDDLTarget(
+	ctx context.Context, expectedApplied uint64, text string, reserve func(*catalogFile) error,
 ) (result ReplicatedSchemaDDLTarget, resultErr error) {
 	if ctx == nil || expectedApplied == 0 || a == nil || a.database == nil ||
 		len(text) == 0 || len(text) > ReplicatedChildSchemaMaxBytes {
@@ -96,6 +125,21 @@ func (a *ReplicatedApply) BuildReplicatedSchemaDDLTarget(
 	}
 	// This private catalog is only an identity allocator; it is never serving.
 	staged := &database{dataDir: directory, catalog: target}
+	for ordinal := range identity.Relations {
+		relation := &identity.Relations[ordinal]
+		storage, err := staged.newStorageIdentityLocked()
+		if err != nil {
+			return result, err
+		}
+		meta := target.Tables[relation.Table]
+		meta.Storage, relation.Storage, meta.Materialized = storage, storage, true
+	}
+	refreshSchemaDDLTargetIdentity(&target)
+	if reserve != nil {
+		if err := reserve(&target); err != nil {
+			return result, err
+		}
+	}
 	created := make([]string, 0, len(identity.Relations))
 	defer func() {
 		if resultErr == nil {
@@ -122,17 +166,12 @@ func (a *ReplicatedApply) BuildReplicatedSchemaDDLTarget(
 		}
 		relation := &identity.Relations[ordinal]
 		meta := target.Tables[relation.Table]
-		storage, err := staged.newStorageIdentityLocked()
-		if err != nil {
-			return result, err
-		}
-		meta.Storage, relation.Storage, meta.Materialized = storage, storage, true
 		candidate := &table{meta: meta}
 		candidate.schema, err = compileSchemaMeta(meta.Schema)
 		if err != nil {
 			return result, err
 		}
-		path := filepath.Join(directory, storage+".vjc")
+		path := filepath.Join(directory, relation.Storage+".vjc")
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
 			return result, err
@@ -150,10 +189,6 @@ func (a *ReplicatedApply) BuildReplicatedSchemaDDLTarget(
 			return result, err
 		}
 	}
-	identity.UserStorage = identity.Relations[0].Storage
-	identity.Relations[0].LocalIndexDigest = replicatedLocalIndexDigest(target.Tables[identity.UserTable].Indexes)
-	identity.RelationManifestDigest = replicatedRelationManifestDigest(*identity)
-	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(*identity, target.ReplicatedApply.Placement)
 	raw, err = appendCatalogJSON(nil, target)
 	if err != nil {
 		return result, err
@@ -182,6 +217,14 @@ func (a *ReplicatedApply) BuildReplicatedSchemaDDLTarget(
 		return result, err
 	}
 	return ReplicatedSchemaDDLTarget{Catalog: raw, Proof: proof}, nil
+}
+
+func refreshSchemaDDLTargetIdentity(target *catalogFile) {
+	identity := target.ReplicatedShardStore
+	identity.UserStorage = identity.Relations[0].Storage
+	identity.Relations[0].LocalIndexDigest = replicatedLocalIndexDigest(target.Tables[identity.UserTable].Indexes)
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(*identity)
+	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(*identity, target.ReplicatedApply.Placement)
 }
 
 func lowerReplicatedSchemaDDL(target *catalogFile, statement *query.DMLStatement) (truncate, noOp bool, err error) {

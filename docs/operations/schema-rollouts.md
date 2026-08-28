@@ -36,6 +36,38 @@ from the replica-local catalog image.
 
 ## Create the rollout plan
 
+### Build local-index and TRUNCATE images
+
+The shard-control listener also exposes an authenticated build operation for
+`CREATE INDEX`, `DROP INDEX`, and `TRUNCATE`. It is an internal coordinator API,
+not yet a PostgreSQL DDL endpoint. It does not add ALTER/DROP TABLE support or
+complete the repeated-rollout lifecycle described below.
+
+The caller first fences new writes with the exclusive route gate and obtains
+an exact applied cut from the shard quorum. The build request binds that cut,
+the source allocation/schema/manifest, the operation ID, and exact SQL bytes.
+Each replica reserves fresh physical storage identities in `.schema-ddl-build`
+before materializing files, then persists its certified receipt before replying.
+Retries reuse those identities, including after process replacement or an
+incomplete image write. Neither a successful build nor its receipt authorizes
+activation. Keep the gate held and retain all receipts in the coordinator's
+operation record before preparing the existing rollout.
+
+Installation uses the journaled source applied cut, not the replica's current
+position. If that position advanced, preparation refuses the stale image. A
+pending build or an unselected ready target prevents a different operation from
+replacing the journal slot; there is no automatic abandon/overwrite policy.
+Do not delete the journal or target images to bypass that refusal.
+
+This cold path uses a 208-byte request header, at most 64 KiB of SQL, and a
+bounded 32 MiB canonical receipt. Authentication and admission happen before
+reading SQL. Each node admits at most two builds, each with a two-minute
+execution deadline. Ordinary query and write execution do not access this
+journal. These bounds are not a guarantee that an arbitrarily large index will
+finish within the deadline.
+
+### Supply the exact target plan
+
 The plan is strict canonical `vibejson`. Whitespace, reordered object members,
 duplicate fields, malformed hexadecimal identities, and trailing bytes are
 rejected. `operation` is a nonzero 32-byte identifier encoded as 64 lowercase
