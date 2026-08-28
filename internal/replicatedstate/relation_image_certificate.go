@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -77,9 +78,23 @@ func CertifyRelationImages(
 	binding Binding,
 	specs []RelationCollection,
 ) (RelationImageCertificate, error) {
+	return certifyRelationImages(binding, specs, nil)
+}
+
+func certifyRelationImages(binding Binding, specs []RelationCollection, audit *SchemaImageAudit) (RelationImageCertificate, error) {
 	relations, manifest, err := prepareRelationCollections(binding, specs)
 	if err != nil {
 		return RelationImageCertificate{}, err
+	}
+	if audit != nil {
+		audit.images = make([]auditedSchemaImage, len(relations))
+		for i := range relations {
+			identity, ok := relations[i].target.Collection.DurableImageIdentity()
+			if !ok {
+				return RelationImageCertificate{}, fmt.Errorf("%w: relation %d has no durable image identity", ErrSchemaTransition, relations[i].id)
+			}
+			audit.images[i].identity = identity
+		}
 	}
 	cardinality := sha256.New()
 	_, _ = cardinality.Write(relationImageCertificateDomain)
@@ -114,6 +129,10 @@ func CertifyRelationImages(
 		}
 		relations[ordinal].openedImage = image
 		relations[ordinal].placement = placement
+		if audit != nil {
+			audit.images[ordinal].root = image
+			audit.images[ordinal].placement = placement
+		}
 		total += rows
 		if rows != 0 {
 			nonEmpty |= uint64(1) << uint(ordinal)
@@ -138,6 +157,14 @@ func CertifyRelationImages(
 		CardinalityRoot: cardinalityRoot, PlacementDigest: placement,
 	}
 	certificate.Witness = relationImageCertificateWitness(certificate)
+	if audit != nil {
+		for i := range relations {
+			if !relations[i].target.Collection.MatchesDurableImage(audit.images[i].identity) {
+				return RelationImageCertificate{}, fmt.Errorf("%w: relation %d changed during audit", ErrSchemaTransition, relations[i].id)
+			}
+		}
+		audit.binding, audit.certificate = binding, certificate
+	}
 	return certificate, nil
 }
 

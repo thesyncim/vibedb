@@ -7,8 +7,10 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/schemachange"
 	"github.com/thesyncim/vibedb/store/durable"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 // VerifiedReplicatedSchemaTarget owns opened, audited target files at exact
@@ -29,6 +31,7 @@ type VerifiedReplicatedSchemaTarget struct {
 	proof           ReplicatedSchemaTargetProof
 	opened          []*table
 	images          []durable.ImageIdentity
+	audit           *replicatedstate.SchemaImageAudit
 	unlock          func()
 	closed          bool
 }
@@ -155,9 +158,29 @@ func (v *VerifiedReplicatedSchemaTarget) Close() error {
 	}
 	clear(v.opened)
 	v.opened, v.images, v.staged = nil, nil, nil
+	v.owner, v.shadow, v.raw = nil, nil, nil
 	if v.unlock != nil {
 		v.unlock()
 		v.unlock = nil
 	}
 	return result
+}
+
+// OpenActivatedApply reuses this target's row audit after its files have been
+// closed and the exact committed schema has been published and selected. It
+// does not publish, select or quiesce a generation. The ordinary open path still
+// validates checkpoint membership, committed transition and all session state.
+// A different image fails rather than rescanning under the caller's fence.
+func (v *VerifiedReplicatedSchemaTarget) OpenActivatedApply(d *Database, expected ReplicatedShardStoreIdentity,
+	bootstrap *pb.Snapshot, options ReplicatedApplyOptions,
+) (*ReplicatedApply, ReplicatedApplyIdentity, error) {
+	if v == nil {
+		return nil, ReplicatedApplyIdentity{}, ErrReplicatedSchemaCatalogImage
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.closed || v.audit == nil || v.proof.Membership.Sequence == 0 || !v.target.Equal(expected) {
+		return nil, ReplicatedApplyIdentity{}, ErrReplicatedSchemaCatalogImage
+	}
+	return d.openReplicatedApplyWithSchemaAudit(expected, bootstrap, options, nil, v.audit)
 }

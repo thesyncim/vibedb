@@ -382,6 +382,11 @@ type Options struct {
 	// SchemaSourceRecovery permits only authenticated recovery of a retired
 	// source bundle. It never grants serving authority or selects target files.
 	SchemaSourceRecovery *SchemaSourceRecoveryProof
+	// SchemaImageAudit optionally reuses an opaque preflight row audit for the
+	// first target open at RecordSchema. System/session validation and all
+	// transition, checkpoint and catalog proofs remain mandatory. A mismatch
+	// fails closed instead of performing a surprise scan under the write fence.
+	SchemaImageAudit *SchemaImageAudit
 }
 
 // SchemaSourceRecoveryProof binds the original catalog preparation to its
@@ -426,6 +431,9 @@ func (r RequestLedgerRange) contains(home requestledger.LedgerHome) bool {
 }
 
 func (o Options) validate() error {
+	if o.SchemaImageAudit != nil && (len(o.SchemaTransition) == 0 || o.SchemaSourceRecovery != nil) {
+		return ErrSchemaTransition
+	}
 	if o.MaxSessions == 0 || o.MaxSessions > MaxRetainedSessions ||
 		o.RetryWindow == 0 || o.RetryWindow > MaxSessionRetryWindow ||
 		o.TxnLimits.MaxCollections < 2 ||

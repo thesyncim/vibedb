@@ -31,12 +31,15 @@ type rf3SchemaArtifactSource interface {
 }
 
 type rf3SchemaGeneration struct {
-	mu       sync.Mutex
-	path     string
-	wal      *raftstore.Store
-	base     sqldriver.ReplicatedShardStoreIdentity
-	applyID  sqldriver.ReplicatedApplyIdentity
-	apply    *sqldriver.ReplicatedApply
+	mu      sync.Mutex
+	path    string
+	wal     *raftstore.Store
+	base    sqldriver.ReplicatedShardStoreIdentity
+	applyID sqldriver.ReplicatedApplyIdentity
+	apply   *sqldriver.ReplicatedApply
+	// Closed after staging: retains only the opaque image audit/target proof,
+	// never open files. Process recovery may reconstruct it by auditing again.
+	verified *sqldriver.VerifiedReplicatedSchemaTarget
 	quiesced bool
 }
 
@@ -211,10 +214,16 @@ func (a *rf3SchemaActivator) Stage(
 	if !built {
 		applied = state.apply.Applied()
 	}
-	proof, err := state.apply.PrepareReplicatedSchemaTarget(raw, applied, request.Operation)
+	verified, err := state.apply.PreflightReplicatedSchemaTarget(ctx, raw, applied)
+	if err != nil {
+		return [32]byte{}, errors.Join(err, schemainstall.ErrConflict)
+	}
+	proof, prepareErr := verified.Prepare(ctx, request.Operation)
+	err = errors.Join(prepareErr, verified.Close())
 	if err != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
 		return [32]byte{}, errors.Join(err, schemainstall.ErrConflict)
 	}
+	state.verified = verified
 	return proof.Witness, nil
 }
 
@@ -385,9 +394,15 @@ func (a *rf3SchemaActivator) Activate(
 		_ = database.Close()
 		return err
 	}
-	apply, got, err := database.OpenReplicatedApply(
-		targetBase, bootstrap, replicatedApplyOptions(targetApply),
-	)
+	var apply *sqldriver.ReplicatedApply
+	var got sqldriver.ReplicatedApplyIdentity
+	if state.verified != nil {
+		apply, got, err = state.verified.OpenActivatedApply(database, targetBase, bootstrap, replicatedApplyOptions(targetApply))
+	} else {
+		// A replacement process has no retained audit. Its existing cold
+		// recovery path must validate the full target, never manufacture proof.
+		apply, got, err = database.OpenReplicatedApply(targetBase, bootstrap, replicatedApplyOptions(targetApply))
+	}
 	if err != nil || got != targetApply {
 		_ = database.Close()
 		return errors.Join(err, schemainstall.ErrOutcomeUnknown)
@@ -400,6 +415,7 @@ func (a *rf3SchemaActivator) Activate(
 		return err
 	}
 	state.base, state.applyID, state.apply = targetBase, targetApply, apply
+	state.verified = nil
 	state.quiesced = false
 	return nil
 }

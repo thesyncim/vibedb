@@ -218,6 +218,13 @@ func TestRF3SchemaBuildReplicasAndExactPrepareCut(t *testing.T) {
 					}
 				} else if err != nil || witness == ([32]byte{}) {
 					t.Fatalf("prepare exact source: %v", err)
+				} else {
+					if state.verified == nil {
+						t.Fatal("stage did not retain its activation audit")
+					}
+					if _, err := state.verified.Prepare(t.Context(), install.Operation); err == nil {
+						t.Fatal("stage retained open target files")
+					}
 				}
 			}
 		})

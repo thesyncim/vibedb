@@ -60,8 +60,22 @@ primitive alone does not guarantee cutover progress under sustained load.
 Prepared target files cannot be removed or replayed into. A caught-up cursor
 or audited handle is only historical evidence; neither establishes a current
 distributed write fence. After process replacement the target must be audited
-again outside that fence. The activation/reopen path still has full-image work
-and is not yet an end-to-end bounded online cutover.
+again outside that fence. After closing the target files, `OpenActivatedApply`
+can pass the retained opaque image audit into first target activation. It
+compares the reopened files' exact durable identities before reusing their
+canonical content and global-placement roots, without scanning user or index
+rows again. A changed image, foreign binding, zero proof, or non-schema state
+fails instead of falling back to a scan. The committed command, checkpoint
+membership, catalog CAS, index declarations, and system/session rows still
+undergo their ordinary checks.
+
+This audit is process-local, contains no open files or row buffers, and does
+not authorize activation by itself. File reopen and full system/session
+validation remain. The RF3 shard installer retains this closed audit after
+staging and uses it during activation; a replacement process without an audit
+uses the existing full-validation recovery path. Command construction can
+still re-audit prepared targets, and the PostgreSQL online coordinator is not
+yet wired. This is not yet an end-to-end bounded online cutover.
 
 ## Costs and remaining work
 
