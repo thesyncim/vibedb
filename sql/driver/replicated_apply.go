@@ -243,12 +243,26 @@ func OpenReplicatedShardStoreWithApply(
 		}
 		return nil, err
 	}
-	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
+	policy := shardStoreOpenPolicy{
 		mode:                    shardStoreOpenReplicatedApplyExisting,
 		openOptions:             openOptions,
 		expectedReplicated:      ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply: expectedApply,
-	})
+	}
+	if lineage, selected, err := selectedSchemaLineage(absolute); err != nil {
+		return nil, err
+	} else if selected {
+		transition, err := replicatedstate.OpenSchemaTransition(lineage.activation.command)
+		if err != nil {
+			return nil, err
+		}
+		policy.schemaMembershipSelected = true
+		policy.schemaTransition = lineage.activation.command
+		policy.schemaMembership = lineage.marker.membership
+		policy.schemaAuthorization = transition.AuthorizationDigest
+		policy.schemaCatalogCAS = transition.CatalogCASDigest
+	}
+	core, err := openDatabaseWithShardStorePolicy(path, nil, policy)
 	if err != nil {
 		return nil, err
 	}

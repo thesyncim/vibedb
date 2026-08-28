@@ -55,6 +55,9 @@ func fenceReplicatedSchemaFiles(directory string, names ...string) error {
 }
 
 func fencePublishedReplicatedSchemaCatalog(path string) error {
+	if _, selected, err := selectedSchemaLineage(path); err != nil || selected {
+		return err
+	}
 	if err := fenceReplicatedSchemaFiles(path+".tables", replicatedSchemaActivationName,
 		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
 		return err

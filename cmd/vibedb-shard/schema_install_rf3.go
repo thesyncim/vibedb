@@ -408,13 +408,22 @@ func (a *rf3SchemaActivator) ObserveDrained(
 	ctx context.Context, request schemainstall.Request, authorization schemainstall.Authorization,
 	proof schemainstall.DrainProof, installation [32]byte,
 ) (bool, error) {
-	state, raw, err := a.exactInstallation(ctx, request, authorization, installation)
+	state, err := a.generation(request)
+	if err != nil {
+		return false, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	_, raw, err := a.exactInstallation(ctx, request, authorization, installation)
 	clear(raw)
 	if err != nil || proof.ActivationAuthorizationDigest != schemainstall.AuthorizationDigest(authorization) {
 		return false, errors.Join(err, schemainstall.ErrConflict)
 	}
 	transition, found, err := sqldriver.ObservePublishedReplicatedSchemaTransition(state.path)
 	if err != nil || !found {
+		return false, err
+	}
+	if err := validateRF3SchemaTransition(request, authorization, transition); err != nil {
 		return false, err
 	}
 	return sqldriver.ObserveDrainedReplicatedSchemaSource(state.path, transition.Bytes())
@@ -424,7 +433,13 @@ func (a *rf3SchemaActivator) DrainOld(
 	ctx context.Context, request schemainstall.Request, authorization schemainstall.Authorization,
 	proof schemainstall.DrainProof, installation [32]byte,
 ) error {
-	state, raw, err := a.exactInstallation(ctx, request, authorization, installation)
+	state, err := a.generation(request)
+	if err != nil {
+		return err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	_, raw, err := a.exactInstallation(ctx, request, authorization, installation)
 	clear(raw)
 	if err != nil || proof.ActivationAuthorizationDigest != schemainstall.AuthorizationDigest(authorization) {
 		return errors.Join(err, schemainstall.ErrConflict)
@@ -432,6 +447,9 @@ func (a *rf3SchemaActivator) DrainOld(
 	transition, found, err := sqldriver.ObservePublishedReplicatedSchemaTransition(state.path)
 	if err != nil || !found {
 		return errors.Join(err, schemainstall.ErrConflict)
+	}
+	if err := validateRF3SchemaTransition(request, authorization, transition); err != nil {
+		return err
 	}
 	_, err = sqldriver.DrainPublishedReplicatedSchemaSource(state.path, transition.Bytes())
 	return err

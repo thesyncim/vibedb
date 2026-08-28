@@ -41,7 +41,7 @@ from the replica-local catalog image.
 The shard-control listener also exposes an authenticated build operation for
 `CREATE INDEX`, `DROP INDEX`, and `TRUNCATE`. It is an internal coordinator API,
 not yet a PostgreSQL DDL endpoint. It does not add ALTER/DROP TABLE support or
-complete the repeated-rollout lifecycle described below.
+complete the durable SQL coordinator described below.
 
 The caller first fences new writes with the exclusive route gate and obtains
 an exact applied cut from the shard quorum. The build request binds that cut,
@@ -163,12 +163,27 @@ The shard retains both generations until an exact drain proof establishes that
 old catalog leases and execution pins are gone. Draining is separate from
 catalog publication; never delete old relation files manually.
 
-Repeated DDL is not complete. The write-once `.schema-target-catalog`,
-`.schema-membership-stage`, and `.schema-activation` proofs do not yet have an
-authorized post-drain replacement lifecycle. Retained startup identity accepts
-one exact successor, not an arbitrary later generation. Advancing that trusted
-identity and retiring superseded proofs remain required before another rollout;
-deleting these files is not a supported workaround.
+After exact source drain, the shard retains a bounded `.schema-lineage` record
+containing the selected catalog and its activation/membership proofs. The
+immutable `.schema-origin` binds it to the original startup identity. Only this
+durably selected, drained generation authorizes replacement of the old
+`.schema-target-catalog`, `.schema-membership-stage`, and `.schema-activation`
+slots. Every replacement must be its exact successor; a newer generation number
+alone is insufficient. Restart authenticates the original identity before
+adopting the retained lineage, and still requires an exact one-generation
+transition for an undrained successor. Do not delete these files.
+
+The local repeated-generation lifecycle is covered by a 1,000-row test with two
+index creations, index removal, TRUNCATE, another index removal, and restarts at
+prepared, pre-proposal, and drained boundaries. It also tests an interrupted
+lineage directory fence and refusal to replace undrained proofs. This does not
+by itself qualify a live quorum. A separate three-member physical SQL/WAL test
+seeds 1,000 typed rows per member, recovers committed-source interruptions before
+catalog publication across three successive DDL operations, and adopts each
+recovered generation into the Raft runtime. This still does not complete the
+PostgreSQL coordinator: durable gateway operation records, route
+gate acquisition/recovery, catalog publication, and multi-replica drain must be
+wired and qualified together before exposing these statements through SQL.
 
 ## Resource bounds
 

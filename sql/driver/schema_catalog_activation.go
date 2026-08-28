@@ -48,6 +48,9 @@ type replicatedSchemaActivation struct {
 }
 
 func replicatedSchemaActivationMatchesCatalog(catalogPath string) (bool, error) {
+	if _, selected, err := selectedSchemaLineage(catalogPath); err != nil || selected {
+		return false, err
+	}
 	raw, found, err := readCatalogFile(catalogPath)
 	if err != nil || !found {
 		return false, err
@@ -193,7 +196,15 @@ func writeReplicatedSchemaActivation(dataDir string, record replicatedSchemaActi
 		if encodeErr == nil && bytes.Equal(existingRaw, raw) {
 			return fenceReplicatedSchemaFiles(dataDir, replicatedSchemaActivationName)
 		}
-		return ErrReplicatedSchemaCatalogImage
+		old, err := replicatedstate.OpenSchemaTransition(existing.command)
+		if err != nil {
+			return err
+		}
+		retired, err := schemaProofRetired(dataDir, existing.targetDigest, old.ToSchemaGeneration)
+		next, openErr := replicatedstate.OpenSchemaTransition(record.command)
+		if err != nil || openErr != nil || !retired || next.From.SchemaGeneration != old.ToSchemaGeneration {
+			return errors.Join(err, openErr, ErrReplicatedSchemaCatalogImage)
+		}
 	}
 	root, err := os.OpenRoot(dataDir)
 	if err != nil {
@@ -375,6 +386,11 @@ func drainPublishedReplicatedSchemaSource(
 	if err != nil || len(command) == 0 || len(command) > replicatedstate.MaxSchemaTransitionBytes {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
+	if lineage, selected, err := selectedSchemaLineage(absolute); err != nil {
+		return false, err
+	} else if selected && bytes.Equal(lineage.activation.command, command) {
+		return true, nil
+	}
 	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
 	if err != nil || !found || !bytes.Equal(record.command, command) {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
@@ -428,6 +444,15 @@ func drainPublishedReplicatedSchemaSource(
 	// Absence on a retry can be the readable result of an unfenced deletion.
 	// Fence even when this attempt removed nothing before authorizing GC.
 	if err = syncReplicatedSchemaDirectory(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory)); err != nil {
+		return false, err
+	}
+	// Absence of old files is not yet completed drain authority: the prior
+	// attempt may have failed before retaining the restart lineage. Observe
+	// must force the authorized Drain caller to finish that publication.
+	if !remove {
+		return false, nil
+	}
+	if err := retainDrainedSchemaLineage(absolute, marker, record); err != nil {
 		return false, err
 	}
 	return true, nil

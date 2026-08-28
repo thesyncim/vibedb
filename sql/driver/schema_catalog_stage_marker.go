@@ -213,7 +213,10 @@ func writeReplicatedSchemaStageMarker(dataDir string, marker replicatedSchemaSta
 		if encodeErr == nil && bytes.Equal(existingRaw, raw) {
 			return fenceReplicatedSchemaFiles(dataDir, replicatedSchemaStageMarkerName)
 		}
-		return ErrReplicatedSchemaCatalogImage
+		retired, err := schemaProofRetired(dataDir, existing.catalogDigest, existing.schemaGeneration)
+		if err != nil || !retired || marker.schemaGeneration != existing.schemaGeneration+1 {
+			return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		}
 	}
 	root, err := os.OpenRoot(dataDir)
 	if err != nil {
@@ -286,7 +289,18 @@ func writeReplicatedSchemaTargetCatalog(
 		}
 		return ErrReplicatedSchemaCatalogImage
 	} else if !os.IsNotExist(readErr) {
-		return readErr
+		prior, found, err := readSchemaLineageFile(dataDir, replicatedSchemaTargetCatalogName, maxCatalogBytes)
+		if err != nil || !found {
+			return errors.Join(err, readErr)
+		}
+		old, err := ValidateReplicatedSchemaCatalogImage(prior)
+		if err != nil {
+			return err
+		}
+		retired, err := schemaProofRetired(dataDir, old.Digest, old.SchemaGeneration)
+		if err != nil || !retired || expected.SchemaGeneration != old.SchemaGeneration+1 {
+			return errors.Join(err, readErr)
+		}
 	}
 	root, err := os.OpenRoot(dataDir)
 	if err != nil {

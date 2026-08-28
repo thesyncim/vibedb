@@ -70,6 +70,21 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 			a.database.checkpointGroup == nil {
 			return errors.Join(err, ErrReplicatedSchemaCatalogImage)
 		}
+		if prior, found, err := readReplicatedSchemaStageMarker(a.database.dataDir); err != nil {
+			return err
+		} else if found && prior.catalogDigest == proof.Catalog.Digest {
+			if prior.authorization != authorization || prior.sourceApplied != expectedApplied {
+				return ErrReplicatedSchemaCatalogImage
+			}
+		} else if found && prior.catalogDigest != proof.Catalog.Digest {
+			retired, err := schemaProofRetired(a.database.dataDir, prior.catalogDigest, prior.schemaGeneration)
+			if err != nil || !retired {
+				return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+			}
+		}
+		if err := ensureReplicatedSchemaOrigin(a.database.path); err != nil {
+			return err
+		}
 		staged.replicatedApplyCollection = a.database.replicatedApplyCollection
 		staged.replicatedCaptureCollection = a.database.replicatedCaptureCollection
 		members, err := replicatedApplyCheckpointMembers(target, staged)
@@ -173,6 +188,12 @@ func ObservePreparedReplicatedSchemaTarget(
 	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
 	if err != nil || !found {
 		return [sha256.Size]byte{}, found, err
+	}
+	if marker.catalogDigest != image.Digest {
+		retired, err := schemaProofRetired(absolute+".tables", marker.catalogDigest, marker.schemaGeneration)
+		if err != nil || retired {
+			return [sha256.Size]byte{}, false, err
+		}
 	}
 	if marker.authorization != requestDigest || marker.catalogDigest != image.Digest ||
 		marker.schemaGeneration != image.SchemaGeneration || marker.targetWitness == ([32]byte{}) {
