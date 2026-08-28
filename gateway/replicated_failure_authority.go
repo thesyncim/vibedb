@@ -108,6 +108,26 @@ type ReplicaHealthRevisionAuthority interface {
 	ReadReplicaHealthRevision(context.Context, raftmember.GroupKey, uint64) (uint64, error)
 }
 
+// ReplicaHealthRevisionStatusSource lets a collector avoid rewriting an
+// already healthy identity. Failure confirmations still advance every round;
+// a healthy observation must durably clear any preceding failure window.
+type ReplicaHealthRevisionStatusSource interface {
+	ReadReplicaHealthRevisionStatus(context.Context, raftmember.GroupKey, uint64) (ReplicaHealthRevisionStatus, error)
+}
+
+type ReplicaHealthRevisionStatus struct {
+	Revision, CatalogGeneration, ReplicaSetVersion uint64
+	SuspectNode                                    rafttransport.NodeID
+	SuspectIncarnation                             uint64
+	Healthy                                        bool
+}
+
+func (status ReplicaHealthRevisionStatus) AlreadyHealthy(revision ReplicaHealthRevision) bool {
+	return status.Revision != 0 && status.Healthy && len(revision.Attestations) != 0 && !revision.Attestations[0].Failed &&
+		status.CatalogGeneration == revision.CatalogGeneration && status.ReplicaSetVersion == revision.ReplicaSetVersion &&
+		status.SuspectNode == revision.SuspectNode && status.SuspectIncarnation == revision.SuspectIncarnation
+}
+
 type ReplicaFailureCertificateSource interface {
 	VisitReplicaFailureCertificates(context.Context, *Snapshot,
 		func(ReplicatedFailureCertificate) error) error
@@ -120,20 +140,29 @@ type ReplicaFailureCertificateSource interface {
 func (authority *ReplicatedCatalogAuthority) ReadReplicaHealthRevision(
 	ctx context.Context, group raftmember.GroupKey, suspect uint64,
 ) (uint64, error) {
+	status, err := authority.ReadReplicaHealthRevisionStatus(ctx, group, suspect)
+	return status.Revision, err
+}
+
+func (authority *ReplicatedCatalogAuthority) ReadReplicaHealthRevisionStatus(
+	ctx context.Context, group raftmember.GroupKey, suspect uint64,
+) (ReplicaHealthRevisionStatus, error) {
 	if authority == nil || ctx == nil || !validMembershipGrantGroup(group) || suspect == 0 {
-		return 0, ErrReplicatedFailureAuthority
+		return ReplicaHealthRevisionStatus{}, ErrReplicatedFailureAuthority
 	}
 	key, _ := replicatedFailureKeys(group, suspect)
 	result, err := authority.readRaw(ctx, key[:], maxReplicatedFailureRecordBytes)
 	if err != nil || !result.Found {
-		return 0, err
+		return ReplicaHealthRevisionStatus{}, err
 	}
 	record, err := openReplicatedFailureRecord(result.Value)
 	if err != nil || openPersistedMembershipGrantGroup(record.Group) != group ||
 		record.SuspectMember != suspect {
-		return 0, errors.Join(err, ErrReplicatedFailureAuthority)
+		return ReplicaHealthRevisionStatus{}, errors.Join(err, ErrReplicatedFailureAuthority)
 	}
-	return record.Revision, nil
+	return ReplicaHealthRevisionStatus{Revision: record.Revision, CatalogGeneration: record.CatalogGeneration,
+		ReplicaSetVersion: record.ReplicaSetVersion, SuspectNode: record.SuspectNode,
+		SuspectIncarnation: record.SuspectIncarnation, Healthy: record.FirstRevision == 0}, nil
 }
 
 type replicatedFailureRecord struct {

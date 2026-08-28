@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -26,6 +28,41 @@ type postgresWriteServiceStub struct {
 type postgresLeaderChangeStub struct{ postgresWriteServiceStub }
 
 type postgresAckLeaderChangeStub struct{ postgresWriteServiceStub }
+
+func TestPostgreSQLWriteUnknownRecoversWithoutReopen(t *testing.T) {
+	authority := serviceauthz.Authority{Node: [16]byte{1}, Generation: 1}
+	s := &postgresWriteServiceStub{unknown: true}
+	w, err := openPostgresDurableWriter(filepath.Join(t.TempDir(), "writes"), authority, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	_, err = w.Write(t.Context(), authority, gateway.Query{SQL: "INSERT INTO employees (id) VALUES ('1')"})
+	id := s.identity
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || !errors.Is(err, gateway.ErrDurableRequestUnresolved) ||
+		!strings.Contains(err.Error(), fmt.Sprintf("%x", id.RequestID)) ||
+		!strings.Contains(err.Error(), "automatic recovery") || strings.Contains(err.Error(), "reopen required") {
+		t.Fatalf("incorrect recovery instruction or lost cause: %v", err)
+	}
+	// The same writer, not a reopened storage handle or client connection,
+	// resolves exactly the retained request before accepting another write.
+	s.unknown = false
+	result, err := w.Write(t.Context(), authority, gateway.Query{SQL: "INSERT INTO employees (id) VALUES ('2')"})
+	if err != nil || result == nil || s.replays != 1 || s.writes != 2 || s.acks != 2 ||
+		w.record.Query != nil || w.record.Sequence != 3 || s.identity.RequestID == id.RequestID {
+		t.Fatalf("same-writer recovery: result=%+v err=%v writes=%d replays=%d acks=%d", result, err, s.writes, s.replays, s.acks)
+	}
+}
+
+func TestPostgreSQLWriteOutcomeMessageDistinguishesStorageRecovery(t *testing.T) {
+	root := errors.New("journal sync failed")
+	w := &postgresDurableWriter{poison: root}
+	err := w.outcomeError(replication.ID128{7}, root, false)
+	if !errors.Is(err, root) || !errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
+		!strings.Contains(err.Error(), "server-side storage recovery") || strings.Contains(err.Error(), "automatic recovery") {
+		t.Fatalf("poisoned outbox misreported: %v", err)
+	}
+}
 
 func (s *postgresAckLeaderChangeStub) AckExecBatch(ctx context.Context, authority serviceauthz.Authority, ack durableExecBatchAckWireRequest) (durableExecBatchAckWireResponse, error) {
 	if s.acks < 2 {

@@ -156,7 +156,7 @@ func newSessionReleaseCrashFixture(
 		filepath.Join(fixture.dir, "user.vdb"),
 	}
 	fixture.options = []durable.Options{
-		{OpaqueValues: true, MaxBatchDocuments: 2*int(sessionCrashRetryWindow) + 2},
+		{OpaqueValues: true, MaxBatchDocuments: 3*int(sessionCrashRetryWindow) + 3},
 		{},
 	}
 	if withCapture {
@@ -272,7 +272,7 @@ func assertSessionReleaseCrashImage(
 		filepath.Join(dir, "user.vdb"),
 	}
 	options := []durable.Options{
-		{OpaqueValues: true, MaxBatchDocuments: 2*int(sessionCrashRetryWindow) + 2},
+		{OpaqueValues: true, MaxBatchDocuments: 3*int(sessionCrashRetryWindow) + 3},
 		{},
 	}
 	if withCapture {

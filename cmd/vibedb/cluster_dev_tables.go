@@ -180,7 +180,9 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		}
 		endpoints := make(map[distribution.EndpointID]string)
 		dist := distribution.DistributionName("table-" + name)
-		route, err := inspectDevPreparedRoute(endpoints, "table-"+name, dist, "all", name, primary, group, replication.Digest{}, true, members)
+		// Endpoint names identify physical nodes, not tables. Reuse the data
+		// nodes' provisioned capacity and topology identity for every group.
+		route, err := inspectDevPreparedRoute(endpoints, "data", dist, "all", name, primary, group, replication.Digest{}, true, members)
 		if err != nil {
 			return err
 		}

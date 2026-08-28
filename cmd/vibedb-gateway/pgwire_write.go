@@ -55,6 +55,37 @@ type postgresDurableWriter struct {
 	poison  error
 }
 
+// The storage sentinel is also used to classify unresolved distributed work.
+// Its "reopen required" text is not a PostgreSQL client recovery instruction:
+// a healthy outbox can resolve the original identity without either handle
+// being reopened. Keep the complete typed cause, but report the actual owner
+// and recovery state at the SQL boundary.
+type postgresWriteOutcomeError struct {
+	request  replication.ID128
+	previous bool
+	poisoned bool
+	cause    error
+}
+
+func (e *postgresWriteOutcomeError) Error() string {
+	state := "server retains the request for automatic recovery"
+	if e.poisoned {
+		state = "server-side storage recovery is required"
+	}
+	if e.previous {
+		return fmt.Sprintf("previous PostgreSQL write %x is awaiting recovery; this statement was not executed; %s; reconnecting does not resolve or cancel the previous write", e.request, state)
+	}
+	return fmt.Sprintf("PostgreSQL write outcome unknown for request %x; %s; do not resubmit the write without verifying its outcome; reconnecting does not resolve or cancel it", e.request, state)
+}
+
+func (e *postgresWriteOutcomeError) Unwrap() error { return e.cause }
+
+func (w *postgresDurableWriter) outcomeError(id replication.ID128, err error, previous bool) error {
+	return &postgresWriteOutcomeError{request: id,
+		previous: previous, poisoned: w.poison != nil,
+		cause: errors.Join(durable.ErrCommitOutcomeUnknown, err)}
+}
+
 func openPostgresDurableWriter(path string, authority serviceauthz.Authority, service postgresDurableService, table ...string) (*postgresDurableWriter, error) {
 	if len(table) > 1 || len(table) == 1 && table[0] == "" {
 		return nil, errInvalidDurableRequestAdapter
@@ -312,8 +343,9 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	if w.poison != nil {
 		return nil, w.poison
 	}
+	previousID := w.record.Identity.RequestID
 	if _, err := w.resolveLeaderChanges(ctx, false); err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) || w.record.Query != nil {
-		return nil, errors.Join(durable.ErrCommitOutcomeUnknown, err)
+		return nil, w.outcomeError(previousID, err, true)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -346,7 +378,7 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	}
 	w.record.Query, w.record.Identity = &owned, identity
 	if err = w.save(); err != nil {
-		return nil, errors.Join(durable.ErrCommitOutcomeUnknown, err)
+		return nil, w.outcomeError(identity.RequestID, err, false)
 	}
 	// A leader transition is not a new application request. Resolve the exact
 	// fsynced identity before reporting an unknown outcome to PostgreSQL. This
@@ -354,7 +386,7 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	// nonce, reorders the table lane, or retries a final refusal/abort.
 	result, err := w.resolveLeaderChanges(ctx, true)
 	if err != nil && !errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && !errors.Is(err, gateway.ErrDurableSQLAborted) {
-		return nil, fmt.Errorf("PostgreSQL write outcome unknown; recovery retains request %x; do not blindly resubmit: %w", identity.RequestID, errors.Join(durable.ErrCommitOutcomeUnknown, err))
+		return nil, w.outcomeError(identity.RequestID, err, false)
 	}
 	return result, err
 }

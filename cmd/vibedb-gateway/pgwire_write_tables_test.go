@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +28,28 @@ type postgresTableServiceStub struct {
 type postgresBlockingTableService struct {
 	postgresTableServiceStub
 	entered, release chan struct{}
+}
+
+func TestPostgreSQLPendingWriteDoesNotClaimNewStatementExecuted(t *testing.T) {
+	authority := serviceauthz.Authority{Node: [16]byte{1}, Generation: 1}
+	s := &postgresTableServiceStub{blocked: "employees"}
+	w, err := openPostgresDurableWriter(filepath.Join(t.TempDir(), "writes"), authority, s, "employees")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	_, err = w.Write(t.Context(), authority, gateway.Query{SQL: "INSERT INTO employees (id) VALUES ('1')"})
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		t.Fatal(err)
+	}
+	id := w.record.Identity
+	_, err = w.Write(t.Context(), authority, gateway.Query{SQL: "INSERT INTO employees (id) VALUES ('2')"})
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || !errors.Is(err, gateway.ErrDurableRequestUnresolved) ||
+		!strings.Contains(err.Error(), "this statement was not executed") ||
+		!strings.Contains(err.Error(), fmt.Sprintf("%x", id.RequestID)) || strings.Contains(err.Error(), "reopen required") ||
+		s.writesByTable["employees"] != 1 || w.record.Identity != id {
+		t.Fatalf("pending request misclassified or replaced: %v", err)
+	}
 }
 
 func (s *postgresBlockingTableService) ExecBatch(ctx context.Context, authority serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query) (durableExecBatchExecuteResult, error) {

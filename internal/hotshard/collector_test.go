@@ -10,8 +10,33 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/topologyscheduler"
 )
+
+func TestCollectorTableAliasesShareOnePhysicalNodeCapacity(t *testing.T) {
+	collector := &Collector{endpointNodes: map[distribution.EndpointID]rafttransport.NodeID{
+		"data-1": {1}, "employees-1": {1}, "orders-1": {1}, "foreign-1": {2},
+	}}
+	nodes := []topologyscheduler.NodeCapacity{{Endpoint: "data-1"}}
+	for _, endpoint := range []distribution.EndpointID{"data-1", "employees-1", "orders-1"} {
+		if !collector.addNodeDemand(nodes, endpoint, autosplit.CapacityVector{autosplit.ResourceRequests: 7}) {
+			t.Fatalf("alias %s did not resolve to its enrolled node", endpoint)
+		}
+	}
+	if len(nodes) != 1 || nodes[0].Used[autosplit.ResourceRequests] != 21 {
+		t.Fatalf("capacity duplicated or pressure lost: %+v", nodes)
+	}
+	for _, endpoint := range []distribution.EndpointID{"unknown", "foreign-1"} {
+		if collector.addNodeDemand(nodes, endpoint, autosplit.CapacityVector{autosplit.ResourceRequests: 7}) {
+			t.Fatalf("unprovisioned alias accepted: %s", endpoint)
+		}
+	}
+	nodes = append(nodes, topologyscheduler.NodeCapacity{Endpoint: "orders-1"})
+	if collector.addNodeDemand(nodes, "employees-1", autosplit.CapacityVector{}) {
+		t.Fatal("ambiguous duplicate physical capacity accepted")
+	}
+}
 
 func TestCollectorNativePointPreservesExactBucketLocality(t *testing.T) {
 	_, source, nodes := hotCatalog(t)

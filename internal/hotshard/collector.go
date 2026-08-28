@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/topologyscheduler"
 )
 
@@ -40,11 +41,12 @@ type collectorEntry struct {
 // striped recorder is retained per physical RF3 allocation in the catalog cut;
 // neither requests nor tenants can increase its cardinality.
 type Collector struct {
-	mu       sync.Mutex
-	provider CapacityProvider
-	policy   autosplit.Policy
-	entries  []collectorEntry
-	bySource map[autosplit.SourceIdentity]int
+	mu            sync.Mutex
+	provider      CapacityProvider
+	policy        autosplit.Policy
+	entries       []collectorEntry
+	bySource      map[autosplit.SourceIdentity]int
+	endpointNodes map[distribution.EndpointID]rafttransport.NodeID
 
 	catalogGeneration uint64
 	sequence          uint64
@@ -67,8 +69,15 @@ func NewCollector(
 	collector := &Collector{provider: provider, policy: policy, sequence: firstSequence,
 		catalogGeneration: catalog.Generation(),
 		entries:           make([]collectorEntry, 0, len(descriptors)),
-		bySource:          make(map[autosplit.SourceIdentity]int, len(descriptors))}
+		bySource:          make(map[autosplit.SourceIdentity]int, len(descriptors)),
+		endpointNodes:     make(map[distribution.EndpointID]rafttransport.NodeID, len(descriptors)*gateway.ServingReplicaCount)}
 	for _, descriptor := range descriptors {
+		for _, replica := range descriptor.Replicas {
+			if prior, found := collector.endpointNodes[replica.Endpoint]; found && prior != replica.Node {
+				return nil, ErrInvalidPressureCut
+			}
+			collector.endpointNodes[replica.Endpoint] = replica.Node
+		}
 		source, leader, ok := sourceForDescriptor(catalog, descriptor)
 		if !ok {
 			return nil, ErrInvalidPressureCut
@@ -268,12 +277,38 @@ func (collector *Collector) rotate(nodes []topologyscheduler.NodeCapacity) (View
 		view.Reports[index] = Report{Group: entry.group,
 			Recommendation: autosplit.Recommend(window, capacities, collector.policy),
 			Demand:         demand, MigrationBytes: migration}
-		if !addNodeDemand(view.Nodes, entry.leader, demand) {
+		if !collector.addNodeDemand(view.Nodes, entry.leader, demand) {
 			return View{}, ErrInvalidPressureCut
 		}
 	}
 	collector.sequence++
 	return view, nil
+}
+
+// Multiple Raft groups may name different endpoint aliases on the same
+// enrolled node. Charge its single provisioned capacity entry, never invent
+// another node or duplicate capacity merely because a new table was created.
+func (collector *Collector) addNodeDemand(nodes []topologyscheduler.NodeCapacity, endpoint distribution.EndpointID,
+	demand autosplit.CapacityVector,
+) bool {
+	if addNodeDemand(nodes, endpoint, demand) {
+		return true
+	}
+	identity, found := collector.endpointNodes[endpoint]
+	if !found || identity == (rafttransport.NodeID{}) {
+		return false
+	}
+	var canonical distribution.EndpointID
+	for _, node := range nodes {
+		if collector.endpointNodes[node.Endpoint] != identity {
+			continue
+		}
+		if canonical != "" {
+			return false // Ambiguous provisioning must not multiply capacity.
+		}
+		canonical = node.Endpoint
+	}
+	return canonical != "" && addNodeDemand(nodes, canonical, demand)
 }
 
 func addNodeDemand(

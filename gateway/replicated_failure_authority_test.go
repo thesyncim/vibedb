@@ -226,4 +226,22 @@ func TestReplicatedFailureAuthorityAcceptsFullAgreementLeaderClear(t *testing.T)
 	if err := authority.PublishReplicaHealthRevision(context.Background(), revision); err != nil {
 		t.Fatal(err)
 	}
+	status, err := authority.ReadReplicaHealthRevisionStatus(t.Context(), revision.Group, revision.SuspectMember)
+	if err != nil || status.Revision != 1 || !status.AlreadyHealthy(revision) {
+		t.Fatalf("retained healthy state=%+v err=%v", status, err)
+	}
+	revision.CatalogGeneration++
+	if status.AlreadyHealthy(revision) {
+		t.Fatal("suppressed new catalog generation")
+	}
+	revision.CatalogGeneration--
+	revision.SuspectIncarnation++
+	if status.AlreadyHealthy(revision) {
+		t.Fatal("suppressed new incarnation")
+	}
+	revision.SuspectIncarnation--
+	revision.Attestations[0].Failed = true
+	if status.AlreadyHealthy(revision) {
+		t.Fatal("suppressed failed observation")
+	}
 }

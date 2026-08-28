@@ -19,6 +19,56 @@ type testHealthRevisionAuthority struct {
 	published []gateway.ReplicaHealthRevision
 }
 
+type testHealthStatusAuthority struct{ *testHealthRevisionAuthority }
+
+func (authority testHealthStatusAuthority) ReadReplicaHealthRevisionStatus(_ context.Context, _ raftmember.GroupKey, suspect uint64) (gateway.ReplicaHealthRevisionStatus, error) {
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	for i := len(authority.published) - 1; i >= 0; i-- {
+		r := authority.published[i]
+		if r.SuspectMember == suspect {
+			return gateway.ReplicaHealthRevisionStatus{Revision: r.Revision, CatalogGeneration: r.CatalogGeneration,
+				ReplicaSetVersion: r.ReplicaSetVersion, SuspectNode: r.SuspectNode, SuspectIncarnation: r.SuspectIncarnation,
+				Healthy: !r.Attestations[0].Failed}, nil
+		}
+	}
+	return gateway.ReplicaHealthRevisionStatus{}, nil
+}
+
+func TestReplicaHealthRevisionSkipsUnchangedHealthyStateAcrossRestart(t *testing.T) {
+	snapshot, _ := testReplicatedHealthSnapshot(t)
+	client := testHealthRoundClient{status: map[uint64]raftmember.RuntimeStatus{
+		1: {MemberID: 1, LeaderID: 2, Term: 4, Commit: 30, Applied: 30},
+		2: {MemberID: 2, LeaderID: 2, Term: 4, Commit: 30, Applied: 30},
+		3: {MemberID: 3, LeaderID: 2, Term: 4, Commit: 30, Applied: 30},
+	}, failed: make(map[uint64]error)}
+	authority := testHealthStatusAuthority{&testHealthRevisionAuthority{revisions: make(map[uint64]uint64)}}
+	run := func(published, unchanged, suspects uint64) {
+		t.Helper()
+		// Reconstruct every time: suppression must rely on durable state, not a
+		// process-local cache that can forget a failed observation on restart.
+		controller, err := newGatewayReplicaHealthRevisionController(testReplicaHealthCatalog{snapshot}, client, authority)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pass, err := controller.RunPass(t.Context())
+		if err != nil || pass.Published != published || pass.Unchanged != unchanged || pass.Suspects != suspects {
+			t.Fatalf("pass=%+v err=%v", pass, err)
+		}
+	}
+	run(3, 0, 0)
+	for range 3 {
+		run(0, 3, 0)
+	}
+	client.failed[1] = errors.New("isolated member")
+	for range 3 {
+		run(1, 0, 1)
+	}
+	delete(client.failed, 1)
+	run(1, 2, 0) // Recovery must persist the clear for the failed member.
+	run(0, 3, 0)
+}
+
 func (authority *testHealthRevisionAuthority) ReadReplicaHealthRevision(
 	_ context.Context, _ raftmember.GroupKey, suspect uint64,
 ) (uint64, error) {
