@@ -1,0 +1,163 @@
+package driver
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"sync"
+
+	"github.com/thesyncim/vibedb/internal/schemachange"
+	"github.com/thesyncim/vibedb/store/durable"
+)
+
+// VerifiedReplicatedSchemaTarget owns opened, audited target files at exact
+// durable generations. Construct it before taking the final write fence; its
+// Prepare method performs no row scan or target open. Call Close on every
+// outcome. It holds only shard-local DDL ownership, never a source write lock.
+// The zero value cannot authorize preparation, and the handle is not durable
+// across process replacement: restart must re-audit outside the write fence.
+type VerifiedReplicatedSchemaTarget struct {
+	mu              sync.Mutex
+	owner           *ReplicatedApply
+	raw             []byte
+	expectedApplied uint64
+	sourceDigest    [32]byte
+	shadow          *schemaDDLShadowRecord
+	staged          *database
+	target          ReplicatedShardStoreIdentity
+	proof           ReplicatedSchemaTargetProof
+	opened          []*table
+	images          []durable.ImageIdentity
+	unlock          func()
+	closed          bool
+}
+
+// PreflightReplicatedSchemaTarget opens and audits the complete target before
+// a write fence is acquired. expectedApplied is the cut that produced the
+// target, never a current-index substitute. Mutable shadow targets are accepted
+// only under their exact ready journal/capture cursor and remain exclusively
+// owned until this handle closes. Source writes may continue during the audit;
+// Prepare refuses the stale handle if any publication overtakes its cut.
+func (a *ReplicatedApply) PreflightReplicatedSchemaTarget(ctx context.Context, raw []byte, expectedApplied uint64) (result *VerifiedReplicatedSchemaTarget, resultErr error) {
+	if expectedApplied == 0 {
+		return nil, ErrReplicatedSchemaCatalogImage
+	}
+	root, unlock, err := a.lockSchemaDDLShadow(ctx)
+	if err != nil {
+		return nil, err
+	}
+	verified := &VerifiedReplicatedSchemaTarget{owner: a, raw: bytes.Clone(raw), expectedApplied: expectedApplied, unlock: unlock}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, verified.Close())
+		}
+	}()
+	source, generation, err := a.schemaDDLShadowSource()
+	if err != nil {
+		return nil, err
+	}
+	verified.sourceDigest = sha256.Sum256(source)
+	shadow, found, err := readSchemaDDLShadowRecord(root)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		if !shadow.Ready || !bytes.Equal(shadow.Shadow.Catalog, raw) || shadow.SourceGeneration != generation ||
+			shadow.SourceDigest != verified.sourceDigest || shadow.Shadow.Cursor.Publication.Applied != expectedApplied {
+			return nil, ErrReplicatedSchemaDDLConflict
+		}
+		verified.shadow = &shadow
+		if err := verified.checkCapture(); err != nil {
+			return nil, err
+		}
+	} else if record, found, err := readSchemaDDLBuildRecord(root); err != nil {
+		return nil, err
+	} else if found && bytes.Equal(record.Target.Catalog, raw) && (!record.Ready || record.Applied != expectedApplied) {
+		return nil, ErrReplicatedSchemaDDLConflict
+	}
+	if a.Applied() != expectedApplied {
+		return nil, ErrTransactionConflict
+	}
+	if _, err := a.certifyReplicatedSchemaTargetWithHandoff(verified.raw, nil, verified); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return verified, nil
+}
+
+func (v *VerifiedReplicatedSchemaTarget) checkCapture() error {
+	if v.shadow == nil {
+		return nil
+	}
+	d, err := v.owner.ReplicatedSchemaCaptureDescriptor(v.shadow.Shadow.Operation)
+	if err != nil || d.Config != v.shadow.Capture || d.Abort != schemachange.NotAborted || d.Head != v.shadow.Shadow.Cursor {
+		return errors.Join(err, ErrReplicatedSchemaDDLConflict)
+	}
+	return nil
+}
+
+// Prepare rechecks source/capture and every opaque durable target identity
+// before publishing checkpoint membership. Its work is bounded by catalog and
+// relation count, not row count. The caller must acquire its distributed write
+// fence after Preflight and hold it through the schema transition. This method
+// does not itself provide that cross-replica fence or activate serving handles.
+func (v *VerifiedReplicatedSchemaTarget) Prepare(ctx context.Context, authorization [32]byte) (ReplicatedSchemaTargetProof, error) {
+	if v == nil || ctx == nil || authorization == [32]byte{} {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	if err := ctx.Err(); err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed || v.owner == nil || v.staged == nil || len(v.opened) == 0 || len(v.opened) != len(v.images) {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	if v.shadow != nil && authorization != v.shadow.Shadow.Operation {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaDDLConflict
+	}
+	if err := v.checkCapture(); err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	source, _, err := v.owner.schemaDDLShadowSource()
+	if err != nil || sha256.Sum256(source) != v.sourceDigest {
+		return ReplicatedSchemaTargetProof{}, errors.Join(err, ErrTransactionConflict)
+	}
+	for i, candidate := range v.opened {
+		if !candidate.collection.MatchesDurableImage(v.images[i]) {
+			return ReplicatedSchemaTargetProof{}, ErrTransactionConflict
+		}
+	}
+	proof := v.proof
+	if err := v.owner.prepareVerifiedSchemaMembership(v.raw, v.expectedApplied, authorization, v.staged, v.target, &proof); err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	v.proof = proof
+	return proof, nil
+}
+
+func (v *VerifiedReplicatedSchemaTarget) Close() error {
+	if v == nil {
+		return nil
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return nil
+	}
+	v.closed = true
+	var result error
+	for i := len(v.opened) - 1; i >= 0; i-- {
+		result = errors.Join(result, v.opened[i].collection.Close(), v.opened[i].file.Close())
+	}
+	clear(v.opened)
+	v.opened, v.images, v.staged = nil, nil, nil
+	if v.unlock != nil {
+		v.unlock()
+		v.unlock = nil
+	}
+	return result
+}

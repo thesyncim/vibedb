@@ -64,68 +64,74 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 		target ReplicatedShardStoreIdentity,
 		proof *ReplicatedSchemaTargetProof,
 	) error {
-		a.database.mu.Lock()
-		defer a.database.mu.Unlock()
-		if err := a.checkLocked(); err != nil || a.machine.Applied() != expectedApplied ||
-			a.database.checkpointGroup == nil {
-			return errors.Join(err, ErrReplicatedSchemaCatalogImage)
-		}
-		if prior, found, err := readReplicatedSchemaStageMarker(a.database.dataDir); err != nil {
-			return err
-		} else if found && prior.catalogDigest == proof.Catalog.Digest {
-			if prior.authorization != authorization || prior.sourceApplied != expectedApplied {
-				return ErrReplicatedSchemaCatalogImage
-			}
-		} else if found && prior.catalogDigest != proof.Catalog.Digest {
-			retired, err := schemaProofRetired(a.database.dataDir, prior.catalogDigest, prior.schemaGeneration)
-			if err != nil || !retired {
-				return errors.Join(err, ErrReplicatedSchemaCatalogImage)
-			}
-		}
-		if err := ensureReplicatedSchemaOrigin(a.database.path); err != nil {
-			return err
-		}
-		staged.replicatedApplyCollection = a.database.replicatedApplyCollection
-		staged.replicatedCaptureCollection = a.database.replicatedCaptureCollection
-		members, err := replicatedApplyCheckpointMembers(target, staged)
-		if err != nil {
-			return err
-		}
-		witness, err := a.database.checkpointGroup.PrepareMembershipTransition(
-			members, authorization,
-		)
-		if err != nil {
-			return err
-		}
-		proof.SourceApplied = expectedApplied
-		proof.Membership = witness
-		proof.Witness = replicatedSchemaTargetProofDigest(*proof)
-		if err := writeReplicatedSchemaTargetCatalog(
-			a.database.dataDir, raw, proof.Catalog,
-		); err != nil {
-			return err
-		}
-		storages, err := schemaStageStorageIDs(target)
-		if err != nil {
-			return err
-		}
-		if a.database.catalog.ReplicatedShardStore == nil {
+		return a.prepareVerifiedSchemaMembership(raw, expectedApplied, authorization, staged, target, proof)
+	})
+}
+
+func (a *ReplicatedApply) prepareVerifiedSchemaMembership(raw []byte, expectedApplied uint64, authorization [32]byte,
+	staged *database, target ReplicatedShardStoreIdentity, proof *ReplicatedSchemaTargetProof,
+) error {
+	a.database.mu.Lock()
+	defer a.database.mu.Unlock()
+	if err := a.checkLocked(); err != nil || a.machine.Applied() != expectedApplied ||
+		a.database.checkpointGroup == nil {
+		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if prior, found, err := readReplicatedSchemaStageMarker(a.database.dataDir); err != nil {
+		return err
+	} else if found && prior.catalogDigest == proof.Catalog.Digest {
+		if prior.authorization != authorization || prior.sourceApplied != expectedApplied {
 			return ErrReplicatedSchemaCatalogImage
 		}
-		sourceStorages, err := schemaStageStorageIDs(*a.database.catalog.ReplicatedShardStore)
-		if err != nil {
-			return err
+	} else if found && prior.catalogDigest != proof.Catalog.Digest {
+		retired, err := schemaProofRetired(a.database.dataDir, prior.catalogDigest, prior.schemaGeneration)
+		if err != nil || !retired {
+			return errors.Join(err, ErrReplicatedSchemaCatalogImage)
 		}
-		return writeReplicatedSchemaStageMarker(a.database.dataDir, replicatedSchemaStageMarker{
-			schemaGeneration: target.RelationSchemaGeneration,
-			sourceApplied:    expectedApplied, membership: witness,
-			catalogDigest:   proof.Catalog.Digest,
-			relationWitness: proof.Relations.Witness,
-			placementDigest: proof.Relations.PlacementDigest,
-			applyContract:   proof.ApplyContract,
-			authorization:   authorization, targetWitness: proof.Witness,
-			storages: storages, sourceStorages: sourceStorages,
-		})
+	}
+	if err := ensureReplicatedSchemaOrigin(a.database.path); err != nil {
+		return err
+	}
+	staged.replicatedApplyCollection = a.database.replicatedApplyCollection
+	staged.replicatedCaptureCollection = a.database.replicatedCaptureCollection
+	members, err := replicatedApplyCheckpointMembers(target, staged)
+	if err != nil {
+		return err
+	}
+	witness, err := a.database.checkpointGroup.PrepareMembershipTransition(
+		members, authorization,
+	)
+	if err != nil {
+		return err
+	}
+	proof.SourceApplied = expectedApplied
+	proof.Membership = witness
+	proof.Witness = replicatedSchemaTargetProofDigest(*proof)
+	if err := writeReplicatedSchemaTargetCatalog(
+		a.database.dataDir, raw, proof.Catalog,
+	); err != nil {
+		return err
+	}
+	storages, err := schemaStageStorageIDs(target)
+	if err != nil {
+		return err
+	}
+	if a.database.catalog.ReplicatedShardStore == nil {
+		return ErrReplicatedSchemaCatalogImage
+	}
+	sourceStorages, err := schemaStageStorageIDs(*a.database.catalog.ReplicatedShardStore)
+	if err != nil {
+		return err
+	}
+	return writeReplicatedSchemaStageMarker(a.database.dataDir, replicatedSchemaStageMarker{
+		schemaGeneration: target.RelationSchemaGeneration,
+		sourceApplied:    expectedApplied, membership: witness,
+		catalogDigest:   proof.Catalog.Digest,
+		relationWitness: proof.Relations.Witness,
+		placementDigest: proof.Relations.PlacementDigest,
+		applyContract:   proof.ApplyContract,
+		authorization:   authorization, targetWitness: proof.Witness,
+		storages: storages, sourceStorages: sourceStorages,
 	})
 }
 
@@ -213,13 +219,23 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	raw []byte,
 	settle func(*database, ReplicatedShardStoreIdentity, *ReplicatedSchemaTargetProof) error,
 ) (proof ReplicatedSchemaTargetProof, resultErr error) {
+	return a.certifyReplicatedSchemaTargetWithHandoff(raw, settle, nil)
+}
+
+func (a *ReplicatedApply) certifyReplicatedSchemaTargetWithHandoff(
+	raw []byte,
+	settle func(*database, ReplicatedShardStoreIdentity, *ReplicatedSchemaTargetProof) error,
+	handoff *VerifiedReplicatedSchemaTarget,
+) (proof ReplicatedSchemaTargetProof, resultErr error) {
 	if a == nil || a.database == nil || a.owner == nil {
 		return proof, ErrReplicatedApplyClosed
 	}
 	// Mutable online targets cannot enter the immutable rollout path. The
 	// online coordinator must first freeze/certify them at its exact cut.
-	if err := rejectMutableSchemaShadow(a.database.dataDir); err != nil {
-		return proof, err
+	if handoff == nil {
+		if err := rejectMutableSchemaShadow(a.database.dataDir); err != nil {
+			return proof, err
+		}
 	}
 	targetCatalog, image, err := openReplicatedSchemaCatalogImage(raw)
 	if err != nil {
@@ -266,6 +282,9 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	staged := &database{catalog: targetCatalog, tables: make(map[string]*table, len(targetIdentity.Relations))}
 	opened := make([]*table, 0, len(targetIdentity.Relations))
 	defer func() {
+		if handoff != nil && handoff.staged == staged && resultErr == nil {
+			return // ownership transferred only after the complete audit
+		}
 		for i := len(opened) - 1; i >= 0; i-- {
 			resultErr = errors.Join(resultErr, opened[i].collection.Close(), opened[i].file.Close())
 		}
@@ -318,9 +337,25 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 		return proof, err
 	}
 	binding := replicatedStateBindingAt(targetIdentity, applyIdentity.Placement.Range)
+	var identities []durable.ImageIdentity
+	if handoff != nil {
+		identities = make([]durable.ImageIdentity, len(opened))
+		for i, candidate := range opened {
+			var ok bool
+			identities[i], ok = candidate.collection.DurableImageIdentity()
+			if !ok {
+				return proof, ErrReplicatedSchemaCatalogImage
+			}
+		}
+	}
 	certificate, err := replicatedstate.CertifyRelationImages(binding, relations)
 	if err != nil || certificate.ManifestDigest != image.RelationManifestDigest {
 		return proof, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	for i := range identities {
+		if !opened[i].collection.MatchesDurableImage(identities[i]) {
+			return proof, ErrTransactionConflict
+		}
 	}
 	for ordinal := 1; ordinal < len(targetIdentity.Relations); ordinal++ {
 		relation := targetIdentity.Relations[ordinal]
@@ -357,6 +392,8 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 		if err := settle(staged, targetIdentity, &proof); err != nil {
 			return proof, err
 		}
+	} else if handoff != nil {
+		proof.SourceApplied = handoff.expectedApplied
 	} else {
 		a.database.mu.RLock()
 		if err := a.checkLocked(); err == nil {
@@ -365,6 +402,10 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 		a.database.mu.RUnlock()
 	}
 	proof.Witness = replicatedSchemaTargetProofDigest(proof)
+	if handoff != nil {
+		handoff.staged, handoff.target, handoff.proof = staged, targetIdentity, proof
+		handoff.opened, handoff.images = opened, identities
+	}
 	return proof, nil
 }
 
