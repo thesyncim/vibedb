@@ -851,10 +851,14 @@ func (fixture *durableRF3ExternalFixture) startGateway(
 		client := fixture.dialGateway(t, node, address)
 		defer client.close()
 		reference, _ := client.openIssuerInstallation(t, 0x92)
-		request := hotMutationRequest(t, reference, 1, []serveStatement{
+		// This cold provisioning step is outside every latency measurement. It
+		// initializes all base/index relations and coordination sidecars; use
+		// the batch budget rather than consuming the interactive five-second
+		// SLO before the actual fault/read workload has even started.
+		request := hotMutationRequestClass(t, reference, 1, []serveStatement{
 			{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-a","kind":"seed","email":"seed-a@example.test","value":1}`}}},
 			{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-b","kind":"seed","email":"seed-b@example.test","value":2}`}}},
-		})
+		}, "batch")
 		response, _ := client.roundTrip(t, request)
 		// Seeding is a durable request too. A definite outcome-unknown reply
 		// must be resolved by one bounded retry of the identical issuer key and
@@ -902,6 +906,24 @@ func (fixture *durableRF3ExternalFixture) restartShard(t testing.TB, member int)
 
 func (fixture *durableRF3ExternalFixture) close(t testing.TB) {
 	t.Helper()
+	defer func() {
+		if !t.Failed() {
+			return
+		}
+		// A missing terminal proof can be an election, admission or storage
+		// failure. Preserve bounded child evidence instead of reporting only
+		// the client's final timeout after every process has been stopped.
+		processes := append([]*rf3testfixture.ExternalProcess{fixture.gatewayA, fixture.gatewayB}, fixture.shards[:]...)
+		for index, process := range processes {
+			if process != nil {
+				diagnostics := process.Diagnostics()
+				if len(diagnostics) > 64<<10 {
+					diagnostics = diagnostics[len(diagnostics)-(64<<10):]
+				}
+				t.Logf("RF3 child %d final diagnostics:\n%s", index, diagnostics)
+			}
+		}
+	}()
 	if fixture.catalogClose != nil {
 		fixture.catalogClose()
 	}
