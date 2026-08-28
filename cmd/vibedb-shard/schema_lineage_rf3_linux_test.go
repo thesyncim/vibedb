@@ -21,6 +21,14 @@ import (
 // Three independent physical members qualify retained SQL/WAL recovery across
 // consecutive schema generations. This is not a network quorum qualification.
 func TestRF3SchemaLineageRepeatedCommittedSourceRecovery(t *testing.T) {
+	testRF3SchemaLineageRepeatedCommittedSourceRecovery(t, false)
+}
+
+func TestRF3SchemaShadowLineageRepeatedCommittedSourceRecovery(t *testing.T) {
+	testRF3SchemaLineageRepeatedCommittedSourceRecovery(t, true)
+}
+
+func testRF3SchemaLineageRepeatedCommittedSourceRecovery(t *testing.T, online bool) {
 	for replica := 1; replica <= 3; replica++ {
 		t.Run(fmt.Sprintf("member-%d", replica), func(t *testing.T) {
 			options := rf3testfixture.DurableGatewayMemberProfiles()[rf3testfixture.DurableGatewayDataAGroup]
@@ -68,12 +76,26 @@ func TestRF3SchemaLineageRepeatedCommittedSourceRecovery(t *testing.T) {
 			}
 			for step, sql := range []string{"CREATE INDEX by_city ON employees (city)", "DROP INDEX by_city", "TRUNCATE TABLE employees"} {
 				before := apply.Applied()
-				target, err := apply.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), [32]byte{byte(step + 1)}, before, sql)
-				if err != nil {
-					t.Fatal(err)
-				}
 				request, authorization := [32]byte{byte(step + 1), 41}, [32]byte{byte(step + 1), 42}
-				proof, err := apply.PrepareReplicatedSchemaTarget(target.Catalog, before, request)
+				var proof sqldriver.ReplicatedSchemaTargetProof
+				if online {
+					shadow, buildErr := apply.BuildReplicatedSchemaDDLShadow(t.Context(), request, sql, 100, 1<<20)
+					if buildErr != nil {
+						t.Fatal(buildErr)
+					}
+					verified, auditErr := apply.PreflightReplicatedSchemaTarget(t.Context(), shadow.Catalog, before)
+					if auditErr != nil {
+						t.Fatal(auditErr)
+					}
+					proof, err = verified.Prepare(t.Context(), request)
+					err = errors.Join(err, verified.Close())
+				} else {
+					target, buildErr := apply.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), [32]byte{byte(step + 1)}, before, sql)
+					if buildErr != nil {
+						t.Fatal(buildErr)
+					}
+					proof, err = apply.PrepareReplicatedSchemaTarget(target.Catalog, before, request)
+				}
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -140,6 +162,18 @@ func TestRF3SchemaLineageRepeatedCommittedSourceRecovery(t *testing.T) {
 				}
 				if drained, err := sqldriver.DrainPublishedReplicatedSchemaSource(member.SQLPath, command); err != nil || !drained {
 					t.Fatalf("drain=%v: %v", drained, err)
+				}
+				for {
+					done, err := apply.ReclaimReplicatedSchemaCapture(t.Context(), command, 1)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if done {
+						break
+					}
+				}
+				if done, err := apply.ObserveReclaimedReplicatedSchemaCapture(t.Context(), command); err != nil || !done {
+					t.Fatalf("capture drain=%v: %v", done, err)
 				}
 				runtime, err := raftmember.AdoptRuntime(wal, database, apply)
 				if err != nil {

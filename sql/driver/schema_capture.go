@@ -30,6 +30,19 @@ func (a *ReplicatedApply) restoreSchemaCaptureLocked() error {
 	if err != nil || !found {
 		return errors.Join(err, schemachange.ErrCapture)
 	}
+	if recovery := a.database.schemaSourceRecovery; recovery != nil {
+		// OpenBundle has authenticated the committed schema entry and keeps
+		// this source handle permanently fenced from serving. Its only job is
+		// to finish catalog publication; attaching a capture would incorrectly
+		// invoke normal admission on that deliberately fenced machine.
+		if !schemaCaptureMatchesTransition(capture.Configuration(), recovery.Command) {
+			return schemachange.ErrCapture
+		}
+		return nil
+	}
+	if retired, err := a.schemaCaptureIsRetired(capture.Configuration()); retired || err != nil {
+		return err
+	}
 	if err := a.machine.BeginTransitionCapture(capture); err != nil {
 		return err
 	}

@@ -448,7 +448,11 @@ func (a *rf3SchemaActivator) ObserveDrained(
 	if err := validateRF3SchemaTransition(request, authorization, transition); err != nil {
 		return false, err
 	}
-	return sqldriver.ObserveDrainedReplicatedSchemaSource(state.path, transition.Bytes())
+	drained, err := sqldriver.ObserveDrainedReplicatedSchemaSource(state.path, transition.Bytes())
+	if err != nil || !drained {
+		return false, err
+	}
+	return state.apply.ObserveReclaimedReplicatedSchemaCapture(ctx, transition.Bytes())
 }
 
 func (a *rf3SchemaActivator) DrainOld(
@@ -473,8 +477,15 @@ func (a *rf3SchemaActivator) DrainOld(
 	if err := validateRF3SchemaTransition(request, authorization, transition); err != nil {
 		return err
 	}
-	_, err = sqldriver.DrainPublishedReplicatedSchemaSource(state.path, transition.Bytes())
-	return err
+	if _, err = sqldriver.DrainPublishedReplicatedSchemaSource(state.path, transition.Bytes()); err != nil {
+		return err
+	}
+	for {
+		done, err := state.apply.ReclaimReplicatedSchemaCapture(ctx, transition.Bytes(), 1024)
+		if err != nil || done {
+			return err
+		}
+	}
 }
 
 var _ schemainstall.Activator = (*rf3SchemaActivator)(nil)

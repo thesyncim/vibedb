@@ -52,7 +52,10 @@ func NewSourceCapture(config CaptureConfig, target replicatedstate.TransitionCap
 }
 
 func (c *SourceCapture) Target() replicatedstate.TransitionCaptureTarget { return c.target }
-func (*SourceCapture) CaptureAllRelations() bool                         { return true }
+
+// Configuration is immutable, including before Begin validates the retained stream.
+func (c *SourceCapture) Configuration() CaptureConfig { return c.config }
+func (*SourceCapture) CaptureAllRelations() bool      { return true }
 func (c *SourceCapture) MaxEncodedBytes(b replicatedstate.TransitionCaptureBounds) (int, error) {
 	size, err := recordBytes(b)
 	if err != nil {
