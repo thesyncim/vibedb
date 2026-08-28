@@ -1260,6 +1260,15 @@ func (executor *ReplicatedExecutor) propose(
 			if !validReplicatedLeaderHint(route, endpoint, state) {
 				state = shardservice.ReplicatedMemberState{}
 			}
+			// A dormant session's private hint must not override a newer
+			// authenticated observation from another operation on this route.
+			// This is a bounded local lookup, not an extra network preflight.
+			if sharedEndpoint, shared, ok := executor.leaderHints.lookup(route); ok &&
+				(state == (shardservice.ReplicatedMemberState{}) || shared.Fence.Term > state.Fence.Term ||
+					shared.Fence.Term == state.Fence.Term && shared.Fence.MemberID == state.Fence.MemberID &&
+						shared.Fence.NodeIncarnation > state.Fence.NodeIncarnation) {
+				endpoint, state = sharedEndpoint, shared
+			}
 		}
 		if state == (shardservice.ReplicatedMemberState{}) {
 			if lastUnknown != nil {
