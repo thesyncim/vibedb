@@ -48,6 +48,16 @@ const (
 
 var sourceCaptureMagic = [8]byte{'V', 'D', 'B', 'C', 'A', 'P', 0, 0}
 
+// RecognizesSourceCaptureHeader identifies this private capture grammar for
+// startup dispatch. It is not an authorization or a replacement for Begin's
+// complete recipe and chain validation.
+func RecognizesSourceCaptureHeader(raw []byte) bool {
+	return validSourceCaptureEnvelope(raw, sourceCaptureHeaderKind, sourceCaptureHeaderFixedBytes) &&
+		binary.LittleEndian.Uint32(raw[20:24]) == 0 && len(raw) > sourceCaptureHeaderFixedBytes &&
+		len(raw)-sourceCaptureHeaderFixedBytes <= replication.MaxCollectionBytes &&
+		uint64(binary.LittleEndian.Uint32(raw[16:20])) == uint64(len(raw)-sourceCaptureHeaderFixedBytes)
+}
+
 // Both record kinds start with magic[8], format[2], kind[1], reserved[1], and
 // totalBytes[4]. Bytes 16:20 are the collection length or transition count;
 // bytes 20:24 are reserved. Header metadata occupies bytes 24:264 before the

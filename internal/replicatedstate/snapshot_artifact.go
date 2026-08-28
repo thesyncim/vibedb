@@ -54,6 +54,15 @@ const (
 const MaxTransitionCaptureRecordBytes = replication.MaxCommandBytes +
 	replication.MaxRelationsPerBundle*MaxDistinctMutations*48 + 296
 
+// This bound is embedded in historical artifact headers and cursor hashes.
+// Expanding the supported capture ceiling must not rewrite those identities.
+const legacySnapshotArtifactChunkBytes = replication.MaxMutationKeyBytes +
+	replication.MaxCommandBytes + MaxDistinctMutations*56 + 248 + snapshotArtifactRowHeaderBytes
+
+func validSnapshotArtifactChunkLimit(limit uint32) bool {
+	return limit == legacySnapshotArtifactChunkBytes || limit == MaxSnapshotArtifactChunkBytes
+}
+
 const (
 	// SnapshotArtifactSystem identifies raw hidden system rows.
 	SnapshotArtifactSystem SnapshotArtifactCollection = 1
@@ -422,8 +431,12 @@ func WriteSnapshotArtifact(
 		headerRelations = nil
 		headerManifestDigest = [sha256.Size]byte{}
 	}
-	header, headerDigest, err := makeSnapshotArtifactHeaderForRelations(
-		stateEnvelope, snapshot.userName, target, headerManifestDigest, headerRelations, bundle,
+	chunkLimit := uint32(legacySnapshotArtifactChunkBytes)
+	if snapshot.captureName != "" || target > legacySnapshotArtifactChunkBytes {
+		chunkLimit = MaxSnapshotArtifactChunkBytes
+	}
+	header, headerDigest, err := makeSnapshotArtifactHeaderWithLimit(
+		stateEnvelope, snapshot.userName, target, headerManifestDigest, headerRelations, bundle, chunkLimit,
 	)
 	if err != nil {
 		return SnapshotArtifactManifest{}, err
@@ -534,6 +547,32 @@ func makeSnapshotArtifactHeaderForRelations(
 	relations []SnapshotArtifactRelation,
 	bundle bool,
 ) ([]byte, [sha256.Size]byte, error) {
+	return makeSnapshotArtifactHeaderWithLimit(stateEnvelope, userName, target, manifestDigest, relations, bundle, legacySnapshotArtifactChunkBytes)
+}
+
+// The declared ceiling is already authenticated by the header digest. Accept
+// exactly the two supported profiles, retaining old artifacts and cursors byte
+// for byte rather than changing a global constant in their identity grammar.
+func matchSnapshotArtifactHeaderForRelations(
+	stateEnvelope []byte, userName string, target int, manifestDigest [sha256.Size]byte,
+	relations []SnapshotArtifactRelation, bundle bool, expected [sha256.Size]byte,
+) ([]byte, [sha256.Size]byte, error) {
+	for _, limit := range []uint32{legacySnapshotArtifactChunkBytes, MaxSnapshotArtifactChunkBytes} {
+		header, digest, err := makeSnapshotArtifactHeaderWithLimit(stateEnvelope, userName, target, manifestDigest, relations, bundle, limit)
+		if err == nil && digest == expected {
+			return header, digest, nil
+		}
+	}
+	return nil, [sha256.Size]byte{}, fmt.Errorf("%w: header identity", ErrSnapshotArtifact)
+}
+
+func makeSnapshotArtifactHeaderWithLimit(
+	stateEnvelope []byte, userName string, target int, manifestDigest [sha256.Size]byte,
+	relations []SnapshotArtifactRelation, bundle bool, chunkLimit uint32,
+) ([]byte, [sha256.Size]byte, error) {
+	if !validSnapshotArtifactChunkLimit(chunkLimit) || target < MinSnapshotArtifactChunkBytes || uint64(target) > uint64(chunkLimit) {
+		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: header chunk limit", ErrSnapshotArtifactBound)
+	}
 	if len(stateEnvelope) == 0 || len(stateEnvelope) > MaxStateEnvelopeBytes ||
 		len(userName) == 0 || len(userName) > replication.MaxCollectionBytes {
 		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: header fields", ErrSnapshotArtifactBound)
@@ -586,7 +625,7 @@ func makeSnapshotArtifactHeaderForRelations(
 		binary.LittleEndian.PutUint32(header[36:40], uint32(descriptorBytes))
 	}
 	binary.LittleEndian.PutUint32(header[24:28], uint32(target))
-	binary.LittleEndian.PutUint32(header[28:32], MaxSnapshotArtifactChunkBytes)
+	binary.LittleEndian.PutUint32(header[28:32], chunkLimit)
 	cursor := snapshotArtifactHeaderFixedBytes
 	cursor += copy(header[cursor:], stateEnvelope)
 	cursor += copy(header[cursor:], userName)
@@ -990,6 +1029,10 @@ func ContinueSnapshotArtifact(
 			[]SnapshotArtifactRelation(nil), cursor.manifest.Relations...,
 		)
 	}
+	chunkLimit, err := snapshotArtifactCursorChunkLimit(&current)
+	if err != nil {
+		return SnapshotArtifactManifest{}, &current, err
+	}
 	payload := callbacks.PayloadBuffer[:0]
 	if payload == nil {
 		payload = make([]byte, 0, min(int(current.manifest.TargetChunkBytes), 64<<10))
@@ -1014,6 +1057,9 @@ func ContinueSnapshotArtifact(
 			)
 			if err != nil {
 				return SnapshotArtifactManifest{}, &current, err
+			}
+			if uint64(payloadBytes) > uint64(chunkLimit) {
+				return SnapshotArtifactManifest{}, &current, fmt.Errorf("%w: declared chunk limit", ErrSnapshotArtifactBound)
 			}
 			if chunk.Collection != SnapshotArtifactSystem && !current.stateRowSeen {
 				return SnapshotArtifactManifest{}, &current,
@@ -1222,6 +1268,22 @@ func ContinueSnapshotArtifact(
 	}
 }
 
+// Recover the exact authenticated ceiling after cursor decode without changing
+// the persisted cursor layout. HeaderDigest already distinguishes the profiles.
+func snapshotArtifactCursorChunkLimit(cursor *SnapshotArtifactCursor) (uint32, error) {
+	relations := make([]SnapshotArtifactRelation, len(cursor.manifest.Relations))
+	for i, relation := range cursor.manifest.Relations {
+		relations[i] = SnapshotArtifactRelation{Relation: relation.Relation, Kind: relation.Kind, Collection: relation.Collection}
+	}
+	header, _, err := matchSnapshotArtifactHeaderForRelations(cursor.expectedStateDocument,
+		string(cursor.manifest.UserCollection), int(cursor.manifest.TargetChunkBytes),
+		cursor.manifest.RelationManifestDigest, relations, cursor.manifest.Bundle, cursor.manifest.HeaderDigest)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(header[28:32]), nil
+}
+
 func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	if cursor == nil || cursor.encodedBytes == 0 ||
 		cursor.nextSequence != cursor.manifest.Chunks ||
@@ -1299,10 +1361,10 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		bytes.IndexByte(cursor.manifest.UserCollection, 0) >= 0 {
 		return fmt.Errorf("%w: resume collection", ErrSnapshotArtifact)
 	}
-	header, headerDigest, err := makeSnapshotArtifactHeaderForRelations(
+	header, headerDigest, err := matchSnapshotArtifactHeaderForRelations(
 		stateEnvelope, string(cursor.manifest.UserCollection),
 		int(cursor.manifest.TargetChunkBytes), headerManifestDigest,
-		headerRelations, cursor.manifest.Bundle,
+		headerRelations, cursor.manifest.Bundle, cursor.manifest.HeaderDigest,
 	)
 	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytesWithRelations(
 		uint64(len(header)), cursor.manifest.Chunks, cursor.manifest.PayloadBytes,
@@ -1402,12 +1464,13 @@ func readSnapshotArtifactHeader(
 	stateBytes := uint64(binary.LittleEndian.Uint32(fixed[16:20]))
 	nameBytes := uint64(binary.LittleEndian.Uint16(fixed[20:22]))
 	target := uint64(binary.LittleEndian.Uint32(fixed[24:28]))
+	chunkLimit := binary.LittleEndian.Uint32(fixed[28:32])
 	if total != snapshotArtifactHeaderFixedBytes+stateBytes+nameBytes+descriptorBytes+sha256.Size ||
 		total > maxSnapshotArtifactHeaderBytes || stateBytes == 0 ||
 		stateBytes > MaxStateEnvelopeBytes || nameBytes == 0 ||
 		nameBytes > replication.MaxCollectionBytes ||
-		target < MinSnapshotArtifactChunkBytes || target > MaxSnapshotArtifactChunkBytes ||
-		binary.LittleEndian.Uint32(fixed[28:32]) != MaxSnapshotArtifactChunkBytes {
+		target < MinSnapshotArtifactChunkBytes || target > uint64(chunkLimit) ||
+		!validSnapshotArtifactChunkLimit(chunkLimit) {
 		return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: header bounds", ErrSnapshotArtifactBound)
 	}
 	header := make([]byte, int(total))

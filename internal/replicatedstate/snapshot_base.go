@@ -589,9 +589,9 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 				Collection: manifest.Relations[i].Collection,
 			}
 		}
-		header, headerDigest, headerErr := makeSnapshotArtifactHeaderForRelations(
+		header, headerDigest, headerErr := matchSnapshotArtifactHeaderForRelations(
 			stateEnvelope, string(manifest.UserCollection), int(manifest.TargetChunkBytes),
-			manifest.RelationManifestDigest, headerRelations, true,
+			manifest.RelationManifestDigest, headerRelations, true, manifest.HeaderDigest,
 		)
 		encoded, encodedOK := snapshotArtifactEncodedBytesWithRelations(
 			uint64(len(header)), manifest.Chunks, manifest.PayloadBytes,
