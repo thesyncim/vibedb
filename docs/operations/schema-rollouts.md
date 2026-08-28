@@ -66,6 +66,15 @@ execution deadline. Ordinary query and write execution do not access this
 journal. These bounds are not a guarantee that an arbitrarily large index will
 finish within the deadline.
 
+`gateway.BuildReplicatedSchemaDDLPlan` assembles the target global catalog and
+installation plans from the authenticated build receipts. It requires one
+receipt per replica of every affected shard and validates source fences, exact
+SQL, portable schema, declared columns, placement, and local-index metadata.
+Replicas are identified by group plus node/member: a multigroup node can reuse
+the same member number in several groups. Response arrival order does not change
+the resulting plan. This is a cold planning API, not PostgreSQL execution or a
+durable coordinator journal.
+
 ### Supply the exact target plan
 
 The plan is strict canonical `vibejson`. Whitespace, reordered object members,
@@ -183,9 +192,12 @@ generation bytes, and recovery duration before increasing cluster concurrency.
 
 The logical SQL relation digest is not the exact replicated machine-schema
 digest used in command fences. Initial routing and restore now compute those
-domains separately. The schema-rollout caller audit for that distinction is
-still pending, so the gates below are not a claim that every logical-to-machine
-digest caller is qualified.
+domains separately. Rollout validation requires a common logical schema cut
+across a distribution while retaining each shard's exact machine manifest;
+different shard ranges legitimately have different machine digests. Targeted
+normal and race tests cover the DDL planner with two shards on the same three
+nodes, including index creation/removal and TRUNCATE. These gates are not a
+claim that every logical-to-machine digest caller is qualified.
 
 Schema-directory publication and retry paths now sync their directory entries
 before exposing authority. Local normal and race tests cover exact committed

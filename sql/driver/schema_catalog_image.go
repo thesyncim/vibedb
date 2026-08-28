@@ -56,6 +56,30 @@ func ValidateReplicatedSchemaCatalogImage(raw []byte) (ReplicatedSchemaCatalogIm
 	return image, err
 }
 
+// ReplicatedSchemaCatalogDescription is detached cold metadata from the exact
+// canonical bundle. It lets a coordinator derive routing and discovery from
+// certified SQL bytes rather than inventing another schema hash grammar.
+type ReplicatedSchemaCatalogDescription struct {
+	Store               ReplicatedShardStoreIdentity
+	Placement           ReplicatedPlacementProfile
+	LogicalSchemaDigest [sha256.Size]byte
+	Table               TableInfo
+}
+
+func DescribeReplicatedSchemaCatalogImage(raw []byte) (ReplicatedSchemaCatalogDescription, error) {
+	catalog, _, err := openReplicatedSchemaCatalogImage(raw)
+	if err != nil {
+		return ReplicatedSchemaCatalogDescription{}, err
+	}
+	identity := catalog.ReplicatedShardStore.Clone()
+	logical, err := ReplicatedRelationManifestDigest(identity)
+	if err != nil {
+		return ReplicatedSchemaCatalogDescription{}, err
+	}
+	return ReplicatedSchemaCatalogDescription{Store: identity, Placement: catalog.ReplicatedApply.Placement,
+		LogicalSchemaDigest: logical, Table: tableInfoFromMeta(identity.UserTable, catalog.Tables[identity.UserTable])}, nil
+}
+
 func openReplicatedSchemaCatalogImage(
 	raw []byte,
 ) (catalogFile, ReplicatedSchemaCatalogImage, error) {

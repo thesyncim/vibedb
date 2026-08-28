@@ -74,10 +74,10 @@ type schemaRolloutChange struct {
 }
 
 type schemaRolloutDistributionCut struct {
-	fromSchemaGeneration       uint64
-	fromRelationManifestDigest replication.Digest
-	toSchemaGeneration         uint64
-	toRelationManifestDigest   replication.Digest
+	fromSchemaGeneration uint64
+	fromLogicalSchema    replication.Digest
+	toSchemaGeneration   uint64
+	toLogicalSchema      replication.Digest
 }
 
 type schemaRolloutIntent struct {
@@ -205,7 +205,14 @@ func schemaRolloutChanges(base, target *Snapshot) ([]schemaRolloutChange, error)
 	if base == nil || target == nil || target.Generation() <= base.Generation() {
 		return nil, ErrSchemaRollout
 	}
-	if _, err := advanceCatalogState(base, target); err != nil {
+	// Public plan constructors also accept newly built snapshots, before a
+	// holder has initialized their lineage. Preserve persisted high-waters;
+	// never index an absent per-distribution lineage directory.
+	state, err := initialCatalogState(base)
+	if err != nil {
+		return nil, errors.Join(err, ErrSchemaRollout)
+	}
+	if _, err := advanceCatalogState(state, target); err != nil {
 		return nil, errors.Join(err, ErrSchemaRollout)
 	}
 	baseDescriptors := base.replicatedDescriptors()
@@ -227,36 +234,33 @@ func schemaRolloutChanges(base, target *Snapshot) ([]schemaRolloutChange, error)
 		}
 		cut := schemaRolloutDistributionCut{
 			fromSchemaGeneration: before.Command.SchemaGeneration,
-			fromRelationManifestDigest: replication.Digest(
-				before.Command.RelationManifestDigest,
-			),
-			toSchemaGeneration: after.Command.SchemaGeneration,
-			toRelationManifestDigest: replication.Digest(
-				after.Command.RelationManifestDigest,
-			),
+			fromLogicalSchema:    before.LogicalSchemaDigest,
+			toSchemaGeneration:   after.Command.SchemaGeneration,
+			toLogicalSchema:      after.LogicalSchemaDigest,
 		}
 		if prior, exists := distributionCuts[before.Distribution]; exists && prior != cut {
-			// One relation bundle cannot be partly old and partly new within a
-			// distribution cut. This also rejects an already mixed base fleet.
+			// Logical schema is shared across a distribution. Machine manifests
+			// bind each shard's placement and may legitimately differ. Requiring
+			// those to match would reject every range-partitioned table rollout.
 			return nil, ErrSchemaRollout
 		}
 		distributionCuts[before.Distribution] = cut
 		if cut.fromSchemaGeneration == cut.toSchemaGeneration {
-			if cut.fromRelationManifestDigest != cut.toRelationManifestDigest {
+			if before.Command.RelationManifestDigest != after.Command.RelationManifestDigest {
 				return nil, ErrSchemaRollout
 			}
 			continue
 		}
 		if cut.toSchemaGeneration < cut.fromSchemaGeneration ||
-			cut.fromRelationManifestDigest == cut.toRelationManifestDigest {
+			before.Command.RelationManifestDigest == after.Command.RelationManifestDigest {
 			return nil, ErrSchemaRollout
 		}
 		changes = append(changes, schemaRolloutChange{
 			group: before.Group, allocation: before.AllocationGeneration,
 			fromSchemaGeneration:       cut.fromSchemaGeneration,
-			fromRelationManifestDigest: cut.fromRelationManifestDigest,
+			fromRelationManifestDigest: replication.Digest(before.Command.RelationManifestDigest),
 			toSchemaGeneration:         cut.toSchemaGeneration,
-			toRelationManifestDigest:   cut.toRelationManifestDigest,
+			toRelationManifestDigest:   replication.Digest(after.Command.RelationManifestDigest),
 		})
 	}
 	if len(changes) == 0 {
