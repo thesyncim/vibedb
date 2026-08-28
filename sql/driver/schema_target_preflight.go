@@ -166,6 +166,34 @@ func (v *VerifiedReplicatedSchemaTarget) Close() error {
 	return result
 }
 
+// ResumePrepared reuses the audit of a closed, successfully prepared target
+// for command construction. The durable stage marker prevents shadow replay;
+// the exact source catalog/applied cut and preparation witness are rechecked.
+// This does not acquire the distributed write fence or publish a transition.
+func (v *VerifiedReplicatedSchemaTarget) ResumePrepared(ctx context.Context, a *ReplicatedApply, raw []byte, request [32]byte) (ReplicatedSchemaTargetProof, error) {
+	if v == nil || ctx == nil || a == nil || a.database == nil || request == ([32]byte{}) {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	if err := ctx.Err(); err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.closed || v.audit == nil || v.proof.Membership.Sequence == 0 ||
+		v.proof.Relations != v.audit.Certificate() || v.proof.Catalog.Digest != sha256.Sum256(raw) {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	source, _, err := a.schemaDDLShadowSource()
+	if err != nil || sha256.Sum256(source) != v.sourceDigest || a.Applied() != v.expectedApplied {
+		return ReplicatedSchemaTargetProof{}, errors.Join(err, ErrTransactionConflict)
+	}
+	proof, err := a.recoverPreparedSchemaTargetProof(raw, request, v.proof)
+	if err != nil || proof != v.proof {
+		return ReplicatedSchemaTargetProof{}, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return proof, nil
+}
+
 // OpenActivatedApply reuses this target's row audit after its files have been
 // closed and the exact committed schema has been published and selected. It
 // does not publish, select or quiesce a generation. The ordinary open path still
