@@ -128,7 +128,7 @@ func (authority *ReplicatedCatalogAuthority) RegisterProvisionedTable(ctx contex
 		return err
 	}
 	next, err := BuildReplicatedTableAddition(current, addition)
-	if err != nil || next == current {
+	if err != nil {
 		return err
 	}
 	authorized, err := authority.authorizedContext(ctx)
@@ -150,6 +150,12 @@ func (authority *ReplicatedCatalogAuthority) RegisterProvisionedTable(ctx contex
 	})
 	if err != nil {
 		return err
+	}
+	// A catalog entry survives a process restart, but its Raft leader does not.
+	// Idempotent registration must still prove the live serving fence before
+	// the supervisor advertises this table as ready.
+	if next == current {
+		return nil
 	}
 	err = authority.Publish(ctx, current.generation, next)
 	for retry := 0; retry < 3 && errors.Is(err, ErrReplicatedCatalogPending); retry++ {

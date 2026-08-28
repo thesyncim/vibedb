@@ -421,7 +421,9 @@ func runServe(args []string) (exitCode int) {
 		}
 		if registerErr == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			registerErr = catalogAuthority.RegisterProvisionedTable(ctx, addition)
+			registerErr = registerGatewayDevTable(ctx, func(ctx context.Context) error {
+				return catalogAuthority.RegisterProvisionedTable(ctx, addition)
+			})
 			cancel()
 		}
 		if registerErr != nil {

@@ -72,21 +72,33 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 		if len(declarations) != 1 || declarations[0].Table != tree.CreateTable.Table {
 			return gateway.ErrInvalidCatalog
 		}
-		for {
-			err := authority.RegisterProvisionedTable(ctx, addition)
-			if err == nil {
-				return nil
-			}
-			if !errors.Is(err, gateway.ErrReplicatedLeader) && !errors.Is(err, gateway.ErrReplicatedReadBehind) {
-				return err
-			}
-			timer := time.NewTimer(100 * time.Millisecond)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				return errors.Join(err, ctx.Err())
-			}
+		return registerGatewayDevTable(ctx, func(ctx context.Context) error {
+			return authority.RegisterProvisionedTable(ctx, addition)
+		})
+	}
+}
+
+// Both online CREATE and restart wait for an authenticated serving fence.
+// Retry only election/read-index transients, within the caller's deadline;
+// malformed schemas and deterministic refusals must never become busy loops.
+func registerGatewayDevTable(ctx context.Context, register func(context.Context) error) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := register(ctx)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gateway.ErrReplicatedLeader) && !errors.Is(err, gateway.ErrReplicatedReadBehind) {
+			return err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
 		}
 	}
 }
