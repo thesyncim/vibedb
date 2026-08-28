@@ -102,6 +102,43 @@ func (c *SourceCapture) Descriptor() (CaptureDescriptor, error) {
 	return c.descriptor, nil
 }
 
+// CursorAt joins an immutable source snapshot to this capture without walking
+// the prefix already represented by that snapshot. The operation's validated
+// retained stream supplies the chain root; the snapshot supplies the exact
+// publication, schema, binding and relation manifest. No publication lock is
+// held during storage I/O. An aborted stream cannot supply a usable build cut.
+func (c *SourceCapture) CursorAt(fence replicatedstate.SnapshotFence) (Cursor, error) {
+	c.mu.Lock()
+	d, begun := c.descriptor, c.begun
+	c.mu.Unlock()
+	p := Publication{fence.Applied, fence.LastTerm, fence.Binding.OwnershipEpoch,
+		fence.Binding.RoutingVersion, fence.Binding.RouteGeneration, fence.LastEntryDigest, fence.DataChainDigest}
+	if !begun || d.Abort != NotAborted || fence.Binding.SchemaGeneration != d.Config.SchemaGeneration ||
+		replicatedstate.SplitCaptureBindingDigest(fence.Binding) != d.Config.BindingDigest ||
+		fence.RelationManifestDigest != d.Config.ManifestDigest ||
+		p.Applied < d.Base.Publication.Applied || p.Applied > d.Head.Publication.Applied {
+		return Cursor{}, ErrCapture
+	}
+	if p == d.Base.Publication {
+		return d.Base, nil
+	}
+	if p == d.Head.Publication {
+		return d.Head, nil
+	}
+	var key [8]byte
+	binary.BigEndian.PutUint64(key[:], p.Applied)
+	raw, found, err := c.target.Collection.AppendRaw(nil, key[:])
+	if err != nil || !found {
+		return Cursor{}, errors.Join(err, ErrCapture)
+	}
+	var workspace CaptureWorkspace
+	entry, err := openEntry(raw, &workspace)
+	if err != nil || entry.After != p || entry.Abort != NotAborted {
+		return Cursor{}, errors.Join(err, ErrCapture)
+	}
+	return Cursor{entry.After, entry.Digest}, nil
+}
+
 func (c *SourceCapture) Begin(state replicatedstate.State, publish func(key, value []byte) error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

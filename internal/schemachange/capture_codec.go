@@ -53,6 +53,15 @@ func (c CaptureConfig) valid() bool {
 		c.MaxBytes >= headerBytes+entryBytes && c.MaxBytes <= MaxCaptureBytes
 }
 
+// Validate checks the canonical operation identity and bounded retention
+// configuration without opening storage or granting capture authority.
+func (c CaptureConfig) Validate() error {
+	if !c.valid() {
+		return ErrCapture
+	}
+	return nil
+}
+
 // Publication is the exact source cut on one side of a change record.
 type Publication struct {
 	Applied, Term, Ownership, Routing, Route uint64
