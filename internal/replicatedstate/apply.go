@@ -1528,7 +1528,10 @@ func (m *Machine) planBundleCommandUnaccounted(
 		next.PhysicalSlotCount++
 		plan.newPhysicalSlot = true
 	}
-	if command.Kind() == replication.CommandRouteGate {
+	// A stale route-gate command has a normal stale-fence completion, not a
+	// gate outcome. Encoding its zero outcome would turn a deterministic
+	// refusal into session corruption during admission and WAL replay.
+	if plan.resultCode == ResultRouteGate {
 		plan.routeGateResultKey, err = routeGateResultStorageKey(plan.sessionDigest, slot)
 		if err != nil {
 			return commandPlan{}, err

@@ -3,13 +3,105 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+func TestRouteGateStaleMembershipSettlesWithoutCorruptingSession(t *testing.T) {
+	for _, wrap := range []bool{false, true} {
+		name := "first-gate"
+		if wrap {
+			name = "overwrite-retained-outcome"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newMachineFixture(t)
+			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+				t.Fatal(err)
+			}
+			prototype := commandValue(fixture.binding, 1)
+			_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
+			gate := routegate.Command{
+				Operation: routegate.OperationAcquireShared, Epoch: 1,
+				Identity: routegate.Identity(sha256.Sum256([]byte("stale-gate"))),
+				Binding:  routegate.Binding(sha256.Sum256([]byte("stale-binding"))),
+			}
+			sequence, applied := uint64(1), uint64(3)
+			if wrap {
+				// Reuse one pin while filling the ring. The stale command then
+				// replaces a slot that has an auxiliary RouteGate outcome.
+				for i := uint16(0); i < fixture.machine.options.RetryWindow; i++ {
+					request := commandValue(fixture.binding, sequence)
+					request.ClientEpoch = epoch
+					reason := routegate.ReasonAcquired
+					if i > 0 {
+						reason = routegate.ReasonIdempotent
+					}
+					applyRouteGateAndReason(t, fixture.machine, applied, request, gate, reason)
+					sequence++
+					applied++
+				}
+			}
+			before, err := fixture.machine.RouteGateStatus()
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := commandValue(fixture.binding, sequence)
+			request.Kind, request.Batches, request.ClientEpoch = replication.CommandRouteGate, nil, epoch
+			request.RouteGate, err = routegate.AppendCommand(nil, gate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded := encodeCommand(t, request)
+			if err = fixture.machine.AdmitCommand(encoded); err != nil {
+				t.Fatalf("admit before membership change: %v", err)
+			}
+			if _, err = fixture.machine.ApplyConfiguration(raftmodel.ApplyMeta{
+				Index: applied, Term: 2, Type: pb.EntryConfChange,
+			}, &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}); err != nil {
+				t.Fatal(err)
+			}
+			applied++
+			if err = fixture.machine.AdmitCommand(encoded); !errors.Is(err, ErrStaleCommand) {
+				t.Fatalf("stale gate admission must refuse without poisoning the machine: %v", err)
+			}
+			// A command admitted before configuration may already be in the
+			// Raft log. Its deterministic refusal must survive apply and replay.
+			if _, err = fixture.machine.ApplyNormal(normalMeta(applied), encoded); err != nil {
+				t.Fatal(err)
+			}
+			first, err := fixture.machine.LookupCompletion(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			completion, err := replication.OpenCompletion(first.Bytes)
+			if err != nil || completion.ResultCode != ResultStaleFence || completion.AppliedSequence != applied {
+				t.Fatalf("stale completion=%+v err=%v", completion, err)
+			}
+			reopened, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+				UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+			if err != nil {
+				t.Fatalf("reopen stale gate: %v", err)
+			}
+			if _, err = reopened.ApplyNormal(normalMeta(applied+1), encoded); err != nil {
+				t.Fatal(err)
+			}
+			retry, err := reopened.LookupCompletion(encoded)
+			if err != nil || !bytes.Equal(first.Bytes, retry.Bytes) {
+				t.Fatalf("exact retry changed completion: %v", err)
+			}
+			after, err := reopened.RouteGateStatus()
+			if err != nil || after != before {
+				t.Fatalf("stale command mutated gate: before=%+v after=%+v err=%v", before, after, err)
+			}
+		})
+	}
+}
 
 func TestRouteGateApplySettlementReopenAndExactRetry(t *testing.T) {
 	fixture := newMachineFixture(t)
