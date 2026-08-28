@@ -2802,6 +2802,11 @@ func (m *Machine) persistTransitionRows(
 		if err := m.capture.Published(transition); err != nil {
 			return errors.Join(ErrTransitionCapture, err)
 		}
+		if captureStopped(m.capture) {
+			m.capture = nil
+			m.captureBuffer = nil
+			m.captureChanges = nil
+		}
 	}
 	return nil
 }

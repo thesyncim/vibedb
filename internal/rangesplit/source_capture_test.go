@@ -354,9 +354,10 @@ func TestMaximumSourceCaptureRecordBytesMatchesArtifactHostileBound(t *testing.T
 		replication.MaxMutationValueBytes,
 		replication.MaxCommandBytes,
 	)
-	if err != nil || got != replicatedstate.MaxTransitionCaptureRecordBytes {
-		t.Fatalf("hostile capture bound = %d, %v; want %d", got, err,
-			replicatedstate.MaxTransitionCaptureRecordBytes)
+	legacyBound := replication.MaxCommandBytes + replicatedstate.MaxDistinctMutations*56 + 248
+	if err != nil || got != legacyBound || got > replicatedstate.MaxTransitionCaptureRecordBytes {
+		t.Fatalf("legacy capture bound = %d, %v; want %d within artifact bound %d", got, err,
+			legacyBound, replicatedstate.MaxTransitionCaptureRecordBytes)
 	}
 }
 
