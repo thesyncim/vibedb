@@ -27,6 +27,7 @@ type gatewayReplicaHealthRevisionPass struct {
 	Certified uint64
 	Suspects  uint64
 	Published uint64
+	Unchanged uint64
 }
 
 func newGatewayReplicaHealthRevisionController(
@@ -70,9 +71,19 @@ func (controller *gatewayReplicaHealthRevisionController) RunPass(
 		pass.Certified++
 		for revisionIndex := range revisions {
 			revision := &revisions[revisionIndex]
-			current, readErr := controller.authority.ReadReplicaHealthRevision(
-				ctx, revision.Group, revision.SuspectMember,
-			)
+			var current uint64
+			var readErr error
+			if source, ok := controller.authority.(gateway.ReplicaHealthRevisionStatusSource); ok {
+				var status gateway.ReplicaHealthRevisionStatus
+				status, readErr = source.ReadReplicaHealthRevisionStatus(ctx, revision.Group, revision.SuspectMember)
+				current = status.Revision
+				if readErr == nil && status.AlreadyHealthy(*revision) {
+					pass.Unchanged++
+					continue
+				}
+			} else {
+				current, readErr = controller.authority.ReadReplicaHealthRevision(ctx, revision.Group, revision.SuspectMember)
+			}
 			if readErr != nil || current == ^uint64(0) {
 				failures = errors.Join(failures, readErr, errGatewayReplicaHealth)
 				continue

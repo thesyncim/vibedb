@@ -206,7 +206,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := 2*int(sourceCaptureRetryWindow) + 3; maxDocuments != want {
+	if want := 3*int(sourceCaptureRetryWindow) + 4; maxDocuments != want {
 		t.Fatalf("activation transaction documents = %d, want %d", maxDocuments, want)
 	}
 	target := ChildActivationTarget{

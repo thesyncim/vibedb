@@ -1049,16 +1049,10 @@ func (fixture *durableRF3ExternalFixture) waitMemberCaughtUpAllRoles(
 	t.Helper()
 	for group := 0; group < durableRF3ExternalGroups; group++ {
 		_, required := fixture.waitRouteLeader(t, group, member, timeout)
-		deadline := time.Now().Add(timeout)
-		for time.Now().Before(deadline) {
-			state, err := fixture.tryProbe(group, member)
-			if err == nil && state.Applied >= required && state.LeaderID != 0 {
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		state, err := fixture.tryProbe(group, member)
-		if err != nil || state.Applied < required {
+		state, err := rf3FixtureWaitApplied(fixture.ctx, timeout, required, func() (shardservice.ReplicatedMemberState, error) {
+			return fixture.tryProbe(group, member)
+		})
+		if err != nil {
 			t.Fatalf("member %d role %s did not catch up through %d: state=%+v err=%v",
 				member+1, durableRF3ExternalRoleNames[group], required, state, err)
 		}

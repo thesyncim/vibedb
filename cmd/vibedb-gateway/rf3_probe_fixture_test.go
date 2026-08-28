@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -11,6 +13,72 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+// Preserve the authenticated catch-up observation. A second probe after
+// success can race the next election and turn proven catch-up into a failure.
+func rf3FixtureWaitApplied(ctx context.Context, timeout time.Duration, required uint64,
+	probe func() (shardservice.ReplicatedMemberState, error),
+) (shardservice.ReplicatedMemberState, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	var state shardservice.ReplicatedMemberState
+	var err error
+	for ctx.Err() == nil {
+		state, err = probe()
+		if err == nil && state.Applied >= required && state.LeaderID != 0 {
+			return state, nil
+		}
+		select {
+		case <-ctx.Done():
+			return state, errors.Join(ctx.Err(), err)
+		case <-ticker.C:
+		}
+	}
+	return state, errors.Join(ctx.Err(), err)
+}
+
+func TestRF3FixtureCatchUpRetainsSuccessfulObservation(t *testing.T) {
+	calls := 0
+	state, err := rf3FixtureWaitApplied(t.Context(), time.Second, 81, func() (shardservice.ReplicatedMemberState, error) {
+		calls++
+		if calls == 1 {
+			return shardservice.ReplicatedMemberState{Applied: 81, LeaderID: 2}, nil
+		}
+		return shardservice.ReplicatedMemberState{}, errors.New("subsequent election")
+	})
+	if err != nil || state.Applied != 81 || calls != 1 {
+		t.Fatalf("lost catch-up proof: state=%+v calls=%d err=%v", state, calls, err)
+	}
+}
+
+func TestRF3FixtureCatchUpRejectsLagAndLeaderlessState(t *testing.T) {
+	calls := 0
+	state, err := rf3FixtureWaitApplied(t.Context(), time.Second, 81, func() (shardservice.ReplicatedMemberState, error) {
+		calls++
+		switch calls {
+		case 1:
+			return shardservice.ReplicatedMemberState{Applied: 80, LeaderID: 2}, nil
+		case 2:
+			return shardservice.ReplicatedMemberState{Applied: 81}, nil
+		default:
+			return shardservice.ReplicatedMemberState{Applied: 81, LeaderID: 2}, nil
+		}
+	})
+	if err != nil || state.Applied != 81 || calls != 3 {
+		t.Fatalf("invalid catch-up admission: state=%+v calls=%d err=%v", state, calls, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = rf3FixtureWaitApplied(ctx, time.Second, 81, func() (shardservice.ReplicatedMemberState, error) {
+		t.Fatal("probe after cancellation")
+		return shardservice.ReplicatedMemberState{}, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation=%v", err)
+	}
+}
 
 // Raw round trippers do not inject executor authority. Process probes must
 // name the actual authenticated observer and its configured policy generation.
