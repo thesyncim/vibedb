@@ -21,6 +21,9 @@ type PostgreSQLBackend struct {
 	Executor  *Executor
 	Authorize func(pgwire.SessionIdentity) (serviceauthz.Authority, error)
 	Write     func(context.Context, serviceauthz.Authority, Query) (*Result, error)
+	// DDL is a cold, coordinated schema operation. It must return success only
+	// after the serving catalog is durable; it is never a replica-local Exec.
+	DDL func(context.Context, serviceauthz.Authority, string) error
 }
 
 func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.SessionIdentity) (pgwire.BackendSession, error) {
@@ -51,7 +54,9 @@ type postgresSession struct {
 }
 
 func (s *postgresSession) State() driver.SessionState { return s.state }
-func (s *postgresSession) AutocommitWrites() bool     { return s.backend.Write != nil }
+func (s *postgresSession) AutocommitWrites() bool {
+	return s.backend.Write != nil || s.backend.DDL != nil
+}
 func (s *postgresSession) MarkFailed() {
 	if s.state == driver.SessionInTransaction {
 		s.state = driver.SessionFailedTransaction
@@ -136,6 +141,9 @@ func (s *postgresSession) Tables(ctx context.Context) ([]driver.TableInfo, error
 	tables := make([]driver.TableInfo, len(profiles))
 	for i, p := range profiles {
 		tables[i] = driver.TableInfo{Name: p.Table, PrimaryKey: p.PrimaryKey}
+		if declared, ok := snapshot.declaredTableInfo(p.Table); ok {
+			tables[i] = declared
+		}
 	}
 	return tables, nil
 }
@@ -330,7 +338,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 			return ErrMergeSchema
 		}
 		for c, cell := range row {
-			if !cell.Null {
+			if cell.Null {
+				materialized.Columns[c].Cells[r] = query.NullCell()
+			} else {
 				value, err := query.ParseJSONCell(cell.Bytes)
 				if err != nil {
 					return err

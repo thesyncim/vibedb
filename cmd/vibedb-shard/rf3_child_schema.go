@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -19,7 +20,7 @@ func parseRF3ChildSchemaStatements(node vibejson.Node, used int) ([]string, erro
 		if !present || used >= sqldriver.ReplicatedChildSchemaMaxBytes {
 			return nil, errInvalidRF3Manifest
 		}
-		statement, err := rf3ManifestString(value, sqldriver.ReplicatedChildSchemaMaxBytes-used)
+		statement, err := rf3ManifestSQLText(value, sqldriver.ReplicatedChildSchemaMaxBytes-used)
 		if err != nil {
 			return nil, err
 		}
@@ -27,6 +28,26 @@ func parseRF3ChildSchemaStatements(node vibejson.Node, used int) ([]string, erro
 		statements = append(statements, statement)
 	}
 	return statements, nil
+}
+
+// SQL declarations may contain quoted identifiers and line breaks. Identity
+// strings retain their stricter unescaped grammar; only bounded DDL decodes
+// JSON escapes, off the serving path.
+func rf3ManifestSQLText(node vibejson.Node, maximum int) (string, error) {
+	if value, ok := node.StringBytes(); ok {
+		if len(value) == 0 || len(value) > maximum || bytes.IndexByte(value, 0) >= 0 {
+			return "", errInvalidRF3Manifest
+		}
+		return string(value), nil
+	}
+	if len(node.Raw().Bytes()) > maximum*6+2 {
+		return "", errInvalidRF3Manifest
+	}
+	value, ok := node.AppendText(nil)
+	if !ok || len(value) == 0 || len(value) > maximum || bytes.IndexByte(value, 0) >= 0 {
+		return "", errInvalidRF3Manifest
+	}
+	return string(value), nil
 }
 
 func parseRF3ChildGlobalIndexes(node vibejson.Node) ([]sqldriver.ReplicatedGlobalIndexRelation, error) {

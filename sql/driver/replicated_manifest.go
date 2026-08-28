@@ -28,6 +28,7 @@ type InitialReplicatedRelationSchema struct {
 	PrimaryKey   string
 	Limits       ReplicatedShardStoreLimits
 	LocalIndexes []store.IndexDefinition
+	Schema       *store.Schema
 }
 
 // InitialReplicatedRelationManifest computes the exact machine-schema digest
@@ -99,6 +100,7 @@ func initialReplicatedSchemaIdentity(binding ReplicatedShardStoreBinding,
 		Relations: []ReplicatedShardRelationIdentity{{
 			Relation: 1, Kind: ReplicatedShardRelationJSON, Table: schema.Table, Limits: limits,
 			LocalIndexDigest: replicatedLocalIndexDigest(indexes),
+			SchemaDigest:     replicatedSchemaDigest(schemaMetaFrom(schema.Schema)),
 		}},
 	}
 	if err := validateReplicatedPlacementProfile(placement, identity); err != nil {

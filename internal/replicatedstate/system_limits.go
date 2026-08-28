@@ -41,7 +41,7 @@ func RequiredSystemCollectionLimits(
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceRowBytes
 	releaseBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3+fenceRowBytes)
+		2*(sha256.Size+1) + int(retryWindow)*(sha256.Size+3+fenceRowBytes+routeGateResultKeyBytes)
 	executionPinBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes +
@@ -53,7 +53,7 @@ func RequiredSystemCollectionLimits(
 		len(routeGateHeadKey) + routegate.HeadBytes +
 		routeGatePinKeyBytes + routegate.StoredPinBytes +
 		routeGateResultKeyBytes + routeGateResultBytes + fenceRowBytes
-	maxDocuments := max(7, 2*int(retryWindow)+2)
+	maxDocuments := max(7, 3*int(retryWindow)+3)
 	maxBatchBytes := max(
 		hotBatchBytes, releaseBatchBytes, executionPinBatchBytes, routeGateBatchBytes,
 	)

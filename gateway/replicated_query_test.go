@@ -16,12 +16,13 @@ import (
 )
 
 type sqlRF3TestTransport struct {
-	mu       sync.Mutex
-	routes   map[raftmember.GroupKey]ReplicatedRoute
-	queries  int
-	fail     bool
-	sqlError bool
-	started  chan struct{}
+	mu         sync.Mutex
+	routes     map[raftmember.GroupKey]ReplicatedRoute
+	queries    int
+	fail       bool
+	sqlError   bool
+	nullResult bool
+	started    chan struct{}
 }
 
 func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, req *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
@@ -66,6 +67,9 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 	}
 	var encoded bytes.Buffer
 	response := shardservice.RowsResponse([]shardservice.Column{{Name: name, TypeOID: 114}}, [][]shardservice.Cell{{{Bytes: []byte(value)}}})
+	if c.nullResult {
+		response = shardservice.RowsResponse([]shardservice.Column{{Name: name, TypeOID: 114}}, [][]shardservice.Cell{{{Null: true}}})
+	}
 	if c.sqlError {
 		response = shardservice.NewErrorResponse(shardservice.ErrorMalformedRequest, "SQL refused")
 	}

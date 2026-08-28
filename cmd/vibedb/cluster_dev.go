@@ -70,6 +70,8 @@ const (
 var errDevCluster = errors.New("vibedb: invalid local development cluster")
 
 type devClusterManifest struct {
+	additionalCatalogs  []string
+	dataServeManifests  []string
 	Format              uint16             `json:"format"`
 	Nodes               uint8              `json:"nodes"`
 	ClientEndpoint      string             `json:"client_endpoint"`
@@ -317,6 +319,7 @@ func runClusterDev(args []string) int {
 	gatewayBinary := fs.String("gateway-binary", "", "vibedb-gateway executable; defaults beside vibedb or PATH")
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
 	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
+	tableSchema := fs.String("table-schema", "", "CREATE TABLE file to provision as an additional group on the existing three data nodes; retained on restart")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *root == "" {
 		usage()
 		return 2
@@ -372,6 +375,10 @@ func runClusterDev(args []string) int {
 	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
+		return 1
+	}
+	if err := ensureDevTables(abs, shard, &manifest, *tableSchema); err != nil {
+		fmt.Fprintf(os.Stderr, "cluster dev: prepare additional tables: %v\n", err)
 		return 1
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1225,6 +1232,7 @@ type devChildExit struct {
 func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string, diagnostics io.Writer, pgListen ...string) error {
 	memberCount := len(m.Members) + len(m.LedgerMembers) + len(m.DataMembers)
 	children := make([]*devChild, 0, memberCount+1)
+	var dataChildren []*devChild
 	exits := make(chan devChildExit, memberCount+1)
 	defer func() {
 		stopDevChildren(children)
@@ -1239,16 +1247,27 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 		name    string
 		members []devClusterMember
 	}{{"catalog", m.Members}, {"request-ledger", m.LedgerMembers}, {"data", m.DataMembers}} {
-		for _, member := range role.members {
+		for index, member := range role.members {
 			marker := "vibedb-shard RF3 ready"
 			if m.Nodes == devClusterRF1 {
 				marker = "vibedb-shard RF1-development-only-no-HA ready"
 			}
-			child, err := startDevChild(shardBinary, []string{"serve-rf3", "-manifest", member.ServeManifest}, marker)
+			serveManifest := member.ServeManifest
+			if role.name == "data" && len(m.dataServeManifests) != 0 {
+				serveManifest = m.dataServeManifests[index]
+			}
+			childArgs := []string{"serve-rf3", "-manifest", serveManifest}
+			if role.name == "data" && m.Nodes == devClusterRF3 && len(m.dataServeManifests) != 0 {
+				childArgs = append(childArgs, "-reload-prepared-groups")
+			}
+			child, err := startDevChild(shardBinary, childArgs, marker)
 			if err != nil {
 				return err
 			}
 			children = append(children, child)
+			if role.name == "data" {
+				dataChildren = append(dataChildren, child)
+			}
 			watchDevChildExit(exits, fmt.Sprintf("%s shard member %d", role.name, member.Member), child)
 		}
 	}
@@ -1274,6 +1293,17 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 	}
 	if len(pgListen) != 0 && pgListen[0] != "" {
 		args = append(args, "-pg-dev-listen", pgListen[0])
+		if len(m.dataServeManifests) == devClusterRF3 {
+			socket, stopDDL, err := startDevDDL(ctx, m, shardBinary, dataChildren)
+			if err != nil {
+				return err
+			}
+			defer stopDDL()
+			args = append(args, "-pg-dev-ddl-socket", socket)
+		}
+	}
+	for _, catalog := range m.additionalCatalogs {
+		args = append(args, "-register-table-catalog", catalog)
 	}
 	gatewayChild, err := startDevChild(gatewayBinary, args, "vibedb-gateway serving")
 	if err != nil {

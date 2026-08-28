@@ -205,10 +205,10 @@ func newPersistentSessionLifecycleStore(
 	window uint16,
 ) *persistentSessionLifecycleStore {
 	t.Helper()
-	systemDocuments := max(7, 2*int(window)+2)
+	systemDocuments := max(7, 3*int(window)+3)
 	store := &persistentSessionLifecycleStore{
 		dir:           t.TempDir(),
-		systemOptions: durable.Options{OpaqueValues: true, MaxBatchDocuments: systemDocuments},
+		systemOptions: durable.Options{OpaqueValues: true, MaxBatchDocuments: systemDocuments, MaxDocumentBytes: MaxStateEnvelopeBytes},
 		userOptions:   durable.Options{},
 		binding:       testBinding(),
 		bootstrap:     testBootstrap(),

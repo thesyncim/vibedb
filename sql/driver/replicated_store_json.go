@@ -44,6 +44,7 @@ var (
 		"relation", "kind", "table", "storage", "limits", "local_index_digest",
 		"index_id", "incarnation", "locator_count", "unique", "key_encoding",
 		"key_arity", "tuple_version", "mapper_version", "bucket_bits",
+		"schema_digest",
 	)
 	replicatedStoreFields = vibejson.MakeFieldSet(
 		"format", "binding", "log_id", "user_table", "user_storage",
@@ -98,7 +99,7 @@ func validateReplicatedRelationGrammar(r ReplicatedShardRelationIdentity) error 
 			return fmt.Errorf("%w: invalid JSON relation identity", ErrReplicatedShardStoreProfile)
 		}
 	case ReplicatedShardRelationGlobalIndex:
-		if r.LocalIndexDigest != ([sha256.Size]byte{}) || r.IndexID == 0 ||
+		if r.LocalIndexDigest != ([sha256.Size]byte{}) || r.SchemaDigest != ([sha256.Size]byte{}) || r.IndexID == 0 ||
 			r.Incarnation == 0 || r.LocatorCount == 0 || r.LocatorCount > 8 ||
 			!validReplicatedGlobalIndexPlacement(
 				r.KeyEncoding, r.KeyArity, r.TupleVersion, r.MapperVersion, r.BucketBits,
@@ -316,6 +317,10 @@ func appendReplicatedRelation(
 	w = w.RawUnchecked(`,"tuple_version":`).Uint(uint64(r.TupleVersion))
 	w = w.RawUnchecked(`,"mapper_version":`).Uint(uint64(r.MapperVersion))
 	w = w.RawUnchecked(`,"bucket_bits":`).Uint(uint64(r.BucketBits))
+	if r.SchemaDigest != ([sha256.Size]byte{}) {
+		w = w.RawUnchecked(`,"schema_digest":`)
+		w = appendReplicatedHexString(w, r.SchemaDigest[:])
+	}
 	return w.RawByteUnchecked('}')
 }
 
@@ -602,6 +607,10 @@ func decodeReplicatedRelationVibe(
 			decoded.MapperVersion = distribution.MapperVersion(version)
 		case 14:
 			err = c.Uint8(&decoded.BucketBits)
+		case 15:
+			err = decodeReplicatedLowerHex(c, decoded.SchemaDigest[:],
+				"vibedb: replicated schema_digest must be lowercase SHA-256 hexadecimal",
+				"vibedb: replicated schema_digest")
 		}
 		if err != nil {
 			return err

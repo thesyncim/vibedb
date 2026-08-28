@@ -192,8 +192,45 @@ Recognition does not mean full catalog exposure. `\dv`, `\df`, and `\du`
 return empty results. The current shim does not expose VibeDB SQL views through
 `\dv`. Bare `\d` lists tables only.
 
-No claim exists for other `psql` versions, JDBC, an ORM, or general
-`pg_catalog` queries.
+GoLand 2026.2 PostgreSQL discovery and PostgreSQL JDBC 42.7.3 metadata requests
+are covered by captured full, fragment, and refresh query contracts. They expose
+the current database, `public`, real tables, declared columns, primary keys, and
+exact indexes. Schemaless tables expose their key and `"$doc"`; discovery never
+scans documents to guess a schema. All document/path projections remain JSON.
+`SELECT id, documents."$doc" FROM documents` returns the key and whole document;
+an explicit `AS` can rename the document column.
+
+Constant JSON accessors are supported: `"$doc"->'address'->>'city'` extracts
+text using the native compiled field path. `->>` yields PostgreSQL TEXT, with
+SQL NULL for absent paths or JSON null. For example:
+
+```sql
+SELECT * FROM documents WHERE "$doc"->>'city' = 'Lisbon';
+SELECT id, documents."$doc"->>'city' AS city FROM documents;
+```
+
+Keys must be non-numeric quoted constants. Array indexes and numeric object keys
+are refused because the native JSON Pointer path cannot distinguish their types.
+Traversing an array with an object key is also refused at execution, not treated
+as PostgreSQL's null-on-type-mismatch array lookup. Array values may be returned
+as text, but traversing their elements is outside this object-access subset.
+Text extraction terminates the accessor chain. No dynamic paths or JSON reparse
+are added. Safe text equality uses the same native predicate as direct field
+equality; numeric/boolean/container text comparisons keep their conversion.
+
+Only `public` qualification resolves to the stored catalog. Unknown schemas
+are not aliases. Object identities are stable across connections for the server
+lifetime. Discovery has bounded SQL, object, identity, result, and portal memory;
+prepared metadata reads a fresh snapshot on Bind/Execute and keeps that snapshot
+while its portal is suspended. Recognition runs after normal SQL preparation
+refuses a query; it adds no catalog lookup or per-row work to ordinary queries.
+
+PostgreSQL-only object classes return empty metadata. PostgreSQL XIDs are not
+invented: refresh requests return complete bounded snapshots with NULL state
+numbers. This is a client protocol adapter, not a general `pg_catalog` SQL API
+or PostgreSQL feature promise. PgJDBC itself lists PostgreSQL table types and
+synthesizes an `xmin` version column; neither implies those features exist here.
+Other JDBC versions and ORMs are not qualified by this gate.
 
 ## Session settings
 
@@ -202,7 +239,11 @@ The server accepts a limited compatibility set. It includes
 `extra_float_digits`, and `standard_conforming_strings`.
 
 It supports related `SHOW`, `RESET`, and `DISCARD ALL` operations. Unsupported
-settings such as `search_path` and `statement_timeout` return `0A000`.
+settings such as `statement_timeout` return `0A000`. `search_path` accepts only
+`public` (including the default `"$user", public` spelling, with no user schema);
+other values return `22023`. `SHOW TRANSACTION ISOLATION LEVEL` reports the
+active isolation level, or READ COMMITTED outside a transaction. The fixed
+GoLand search-path probe also emits the one-element `text[]` `{public}`.
 
 ## Implementation references
 
@@ -210,4 +251,6 @@ settings such as `search_path` and `statement_timeout` return `0A000`.
 - `pgwire/session.go`, `command.go`, and `pgerror.go`
 - `pgwire/scram.go` and `tls_test.go`
 - `pgwire/catalog_shim.go`
+- `pgwire/catalog_discovery.go`, `catalog_discovery_jdbc.go`, and captured JSON contracts
+- `integration/jdbc/Discovery.java` (optional installed-driver/live-RF3 gate)
 - `integration/pgclient/pgclient_test.go` and `psql_test.go`

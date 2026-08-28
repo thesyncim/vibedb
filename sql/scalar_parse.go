@@ -80,7 +80,7 @@ func scalarStarts(tok token) bool {
 
 func scalarContinues(tok token) bool {
 	switch tok.kind {
-	case tokPlus, tokMinus, tokStar, tokSlash, tokPercent, tokConcat, tokDoubleColon:
+	case tokPlus, tokMinus, tokStar, tokSlash, tokPercent, tokConcat, tokDoubleColon, tokJSONText:
 		return true
 	case tokNumber:
 		// The legacy lexer keeps a directly adjacent negative sign in a JSON
@@ -129,6 +129,27 @@ func (p *Parser) parseScalarBinary(
 		}
 	}
 	for {
+		if p.tok.kind == tokJSONText {
+			if left.Kind != ScalarPath || left.Path == nil {
+				return nil, newFeatureNotSupportedError(p.lx.src, p.tok.pos,
+					"JSON ->> requires a stored JSON path; text extraction must end the accessor chain")
+			}
+			pos := p.tok.pos
+			p.advance()
+			seg, err := p.parseJSONAccessor()
+			if err != nil {
+				return nil, err
+			}
+			path := left.Path
+			segments := p.segs.allocDirty(len(path.Segments) + 1)
+			copy(segments, path.Segments)
+			segments[len(path.Segments)] = seg
+			path.Segments = segments
+			node := p.newScalar(ScalarCast, pos)
+			node.Cast, node.Left, node.TargetPos = ScalarCastText, left, pos
+			left = node
+			continue
+		}
 		if p.tok.kind == tokDoubleColon {
 			return nil, newFeatureNotSupportedError(
 				p.lx.src, p.tok.pos,

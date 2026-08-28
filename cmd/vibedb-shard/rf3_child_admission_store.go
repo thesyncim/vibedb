@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -25,7 +27,7 @@ type rf3ChildAdmissionStore struct {
 	failed   bool
 }
 
-func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int) (*rf3ChildAdmissionStore, [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot, error) {
+func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int, successor ...rf3Manifest) (*rf3ChildAdmissionStore, [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot, error) {
 	var slots [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot
 	if manifest == ([32]byte{}) || limit < 1 || limit > maxRF3SplitChildOperations {
 		return nil, slots, errRF3Serving
@@ -72,9 +74,19 @@ func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int) (*rf3
 		return closeError(err)
 	}
 	if string(raw[:8]) != "VDBCHADM" || binary.LittleEndian.Uint64(raw[8:16]) != uint64(limit) ||
-		!bytes.Equal(raw[16:48], manifest[:]) || !bytes.Equal(raw[48:64], make([]byte, 16)) ||
+		!bytes.Equal(raw[48:64], make([]byte, 16)) ||
 		sha256.Sum256(raw[:len(raw)-32]) != [32]byte(raw[len(raw)-32:]) {
 		return closeError(errRF3Serving)
+	}
+	rebind := !bytes.Equal(raw[16:48], manifest[:])
+	previousGroups := maxRF3ManifestGroups
+	if rebind {
+		previous, err := loadRF3Manifest(filepath.Join(path, "prepared-manifests", hex.EncodeToString(raw[16:48])+".vibejson"))
+		if err != nil || len(successor) != 1 || successor[0].Digest != manifest ||
+			!bytes.Equal(previous.Digest[:], raw[16:48]) || validateRF3GroupAppend(previous, successor[0]) != nil || previous.SplitControl.operationLimit() != limit {
+			return closeError(errors.Join(errRF3Serving, err))
+		}
+		previousGroups = len(previous.groupBundles())
 	}
 	position := 64
 	for index := range slots {
@@ -103,13 +115,18 @@ func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int) (*rf3
 				children++
 			}
 		}
-		if slot.operation != ([32]byte{}) && (children == 0 || slot.group < 0 || slot.group >= maxRF3ManifestGroups) {
+		if slot.operation != ([32]byte{}) && (children == 0 || slot.group < 0 || slot.group >= previousGroups) {
 			return closeError(errRF3Serving)
 		}
 		for prior := 0; prior < index; prior++ {
 			if slot.operation != ([32]byte{}) && slots[prior].operation == slot.operation {
 				return closeError(errRF3Serving)
 			}
+		}
+	}
+	if rebind {
+		if err := store.save(slots); err != nil {
+			return closeError(err)
 		}
 	}
 	return store, slots, nil

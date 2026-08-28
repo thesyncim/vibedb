@@ -355,7 +355,7 @@ func validateState(state State) error {
 		state.SessionEpochHighWater > state.Applied ||
 		state.AuthorityBindingCount > state.Applied-1 ||
 		state.SessionCount > MaxRetainedSessions ||
-		state.AuthorityBindingCount > MaxRetainedSessions ||
+		state.AuthorityBindingCount > 2*MaxRetainedSessions ||
 		state.SessionCount > state.AuthorityBindingCount ||
 		state.SessionSlotCount > state.SessionCount*MaxSessionRetryWindow ||
 		state.DataChainDigest == ([32]byte{}) || state.ApplyContractDigest == ([32]byte{}) ||

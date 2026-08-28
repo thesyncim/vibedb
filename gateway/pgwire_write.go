@@ -30,6 +30,9 @@ type postgresWriteStatement struct {
 }
 
 func (s *postgresSession) prepareWrite(ctx context.Context, text string, parsed *sqlast.Statement) (pgwire.BackendStatement, error) {
+	if postgresDDLKind(parsed.Kind) {
+		return s.prepareDDL(text, parsed)
+	}
 	if s.backend.Write == nil {
 		return nil, driver.ErrReadOnlyTransaction
 	}

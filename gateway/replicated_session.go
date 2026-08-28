@@ -171,6 +171,9 @@ type NativeSessionOptions struct {
 	// ProposalCapability is the exact authorization class placed on every
 	// probe and proposal. DataWrite, Topology, and ExecutionPin are admitted.
 	ProposalCapability serviceauthz.Capability
+	// ScopedCoordination admits only route-pin or execution-pin operations and
+	// their session lifecycle, never data mutations or topology changes.
+	ScopedCoordination bool
 
 	MaxRelationBatches  int
 	MaxMutations        int
@@ -269,6 +272,7 @@ type NativeSession struct {
 	leader              shardservice.ReplicatedMemberState
 	journal             *NativeSessionJournal
 	proposalCapability  serviceauthz.Capability
+	scopedCoordination  bool
 	catalogControl      bool
 	catalogBootstrap    *Snapshot
 	catalogHolder       *CatalogHolder
@@ -437,6 +441,9 @@ type NativeResult struct {
 }
 
 func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
+	if options.ScopedCoordination && options.ProposalCapability != serviceauthz.CapabilityDataWrite && options.ProposalCapability != serviceauthz.CapabilityExecutionPin {
+		return nil, ErrNativeSession
+	}
 	if options.MaxRelationBatches == 0 {
 		options.MaxRelationBatches = 16
 	}
@@ -483,6 +490,7 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		nextSequence:       1,
 		journal:            options.Journal,
 		proposalCapability: options.ProposalCapability,
+		scopedCoordination: options.ScopedCoordination,
 		catalogControl:     options.CatalogBootstrap != nil, catalogBootstrap: options.CatalogBootstrap,
 	}
 	if options.Journal != nil {
@@ -492,6 +500,9 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 			relation, options.ProposalCapability,
 		)
 		state, loadErr := options.Journal.load()
+		if options.ScopedCoordination {
+			expectedBinding = scopedNativeSessionJournalBinding(expectedBinding)
+		}
 		if bindingErr != nil || loadErr != nil ||
 			options.Journal.maxCommand != options.MaxCommandBytes ||
 			options.Journal.binding != expectedBinding ||
@@ -910,6 +921,13 @@ func (session *NativeSession) commandHeader(
 		authorityClass = replication.CommandAuthorityTopology
 	} else if session.proposalCapability == serviceauthz.CapabilityExecutionPin {
 		authorityClass = replication.CommandAuthorityExecutionPin
+	}
+	if session.scopedCoordination {
+		if session.proposalCapability == serviceauthz.CapabilityExecutionPin {
+			authorityClass = replication.CommandAuthorityExecutionSession
+		} else {
+			authorityClass = replication.CommandAuthorityRouteSession
+		}
 	}
 	return replication.Command{
 		Kind:                  kind,
@@ -1401,6 +1419,10 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	} else if command.AuthorityClass == replication.CommandAuthorityExecutionPin {
 		_, _ = hasher.Write(nativeExecutionPinAuthorityMarker)
 	}
+	if replication.IsScopedSessionAuthority(command.AuthorityClass) {
+		scalar[0] = byte(command.AuthorityClass)
+		_, _ = hasher.Write(scalar[:1])
+	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
 	binary.LittleEndian.PutUint64(scalar[:], command.TopologyRecoveryEpoch)
@@ -1497,6 +1519,10 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
 	} else if command.AuthorityClass == replication.CommandAuthorityExecutionPin {
 		_, _ = hasher.Write(nativeExecutionPinAuthorityMarker)
+	}
+	if replication.IsScopedSessionAuthority(command.AuthorityClass) {
+		scalar[0] = byte(command.AuthorityClass)
+		_, _ = hasher.Write(scalar[:1])
 	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])

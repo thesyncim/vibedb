@@ -32,6 +32,7 @@ type postgresDurableService interface {
 type postgresStoredAck durableExecBatchAckWireRequest
 type postgresWriteRecord struct {
 	Version      uint32
+	Table        string `json:",omitempty"`
 	Authority    serviceauthz.Authority
 	Installation replication.ID128
 	Sequence     uint64
@@ -54,7 +55,10 @@ type postgresDurableWriter struct {
 	poison  error
 }
 
-func openPostgresDurableWriter(path string, authority serviceauthz.Authority, service postgresDurableService) (*postgresDurableWriter, error) {
+func openPostgresDurableWriter(path string, authority serviceauthz.Authority, service postgresDurableService, table ...string) (*postgresDurableWriter, error) {
+	if len(table) > 1 || len(table) == 1 && table[0] == "" {
+		return nil, errInvalidDurableRequestAdapter
+	}
 	if path == "" || !authority.Valid() || service == nil {
 		return nil, errInvalidDurableRequestAdapter
 	}
@@ -101,6 +105,9 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 		if w.record.Version != 1 || w.record.Authority != authority || w.record.Installation == (replication.ID128{}) || w.record.Sequence == 0 {
 			return fail(errInvalidDurableRequestAdapter)
 		}
+		if len(table) == 1 && w.record.Table != table[0] {
+			return fail(errInvalidDurableRequestAdapter)
+		}
 		if ref := w.record.Reference; ref.GrantDigest != (replication.Digest{}) && (ref.Installation != w.record.Installation || ref.Epoch != 1 || ref.LaneOrdinal != 0) {
 			return fail(errInvalidDurableRequestAdapter)
 		}
@@ -120,6 +127,9 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 		return fail(err)
 	}
 	w.record = postgresWriteRecord{Version: 1, Authority: authority, Sequence: 1}
+	if len(table) == 1 {
+		w.record.Table = table[0]
+	}
 	if _, err = rand.Read(w.record.Installation[:]); err != nil {
 		return fail(err)
 	}
@@ -271,6 +281,24 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 	return result.Result, err
 }
 
+func (w *postgresDurableWriter) resolveLeaderChanges(ctx context.Context, fresh bool) (*gateway.Result, error) {
+	result, err := w.resolve(ctx, fresh)
+	// Both unresolved execution and terminal ACK cleanup retain the exact
+	// durable identity. A new statement cannot overtake either one.
+	for retry := 0; retry < 3 && w.poison == nil && w.record.Query != nil && ctx.Err() == nil &&
+		!errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && !errors.Is(err, gateway.ErrDurableSQLAborted) &&
+		(errors.Is(err, gateway.ErrReplicatedLeader) || errors.Is(err, gateway.ErrReplicatedReadBehind)); retry++ {
+		timer := time.NewTimer(time.Duration(retry+1) * 100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+			result, err = w.resolve(ctx, false)
+		}
+	}
+	return result, err
+}
+
 func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauthz.Authority, q gateway.Query) (*gateway.Result, error) {
 	if authority != w.record.Authority {
 		return nil, gateway.ErrReplicatedUnauthorized
@@ -284,7 +312,7 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	if w.poison != nil {
 		return nil, w.poison
 	}
-	if _, err := w.resolve(ctx, false); err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) || w.record.Query != nil {
+	if _, err := w.resolveLeaderChanges(ctx, false); err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) || w.record.Query != nil {
 		return nil, errors.Join(durable.ErrCommitOutcomeUnknown, err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -320,7 +348,11 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	if err = w.save(); err != nil {
 		return nil, errors.Join(durable.ErrCommitOutcomeUnknown, err)
 	}
-	result, err := w.resolve(ctx, true)
+	// A leader transition is not a new application request. Resolve the exact
+	// fsynced identity before reporting an unknown outcome to PostgreSQL. This
+	// bounded slow path adds no work to successful writes and never mints a new
+	// nonce, reorders the table lane, or retries a final refusal/abort.
+	result, err := w.resolveLeaderChanges(ctx, true)
 	if err != nil && !errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 		return nil, fmt.Errorf("PostgreSQL write outcome unknown; recovery retains request %x; do not blindly resubmit: %w", identity.RequestID, errors.Join(durable.ErrCommitOutcomeUnknown, err))
 	}

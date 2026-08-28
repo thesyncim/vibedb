@@ -394,8 +394,10 @@ func TestUnrecognizedCatalogQueryKeepsOriginalParseError(t *testing.T) {
 	withShim := collect(connectIntrospectionCatalog(t))
 
 	saved := catalogShapes
+	savedDiscovery := discoveryShapes
 	catalogShapes = nil
-	defer func() { catalogShapes = saved }()
+	discoveryShapes = nil
+	defer func() { catalogShapes = saved; discoveryShapes = savedDiscovery }()
 	withoutShim := collect(connectIntrospectionCatalog(t))
 
 	for i := range nearMisses {

@@ -61,14 +61,14 @@ func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 	}{
 		{"data_without_capture", 64, 8, false, 68},
 		{"data_with_capture", 64, 8, true, 69},
-		{"session_open_without_capture", 0, 1, false, 4},
-		{"session_open_with_capture", 0, 1, true, 5},
-		{"release_without_capture", 0, 8, false, 18},
-		{"release_with_capture", 0, 8, true, 19},
-		{"release_dominates_data", 13, 8, false, 18},
-		{"equal_data_and_release", 14, 8, false, 18},
-		{"data_exceeds_release", 15, 8, false, 19},
-		{"maximum_release", 0, MaxSessionRetryWindow, false, 2*MaxSessionRetryWindow + 2},
+		{"session_without_capture", 0, 1, false, 6},
+		{"session_with_capture", 0, 1, true, 7},
+		{"release_without_capture", 0, 8, false, 27},
+		{"release_with_capture", 0, 8, true, 28},
+		{"release_dominates_data", 22, 8, false, 27},
+		{"equal_data_and_release", 23, 8, false, 27},
+		{"data_exceeds_release", 24, 8, false, 28},
+		{"maximum_release", 0, MaxSessionRetryWindow, false, 3*MaxSessionRetryWindow + 3},
 		{"maximum_data", replication.MaxMutations, 1, true, replication.MaxMutations + 5},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -114,12 +114,12 @@ func TestBundleTransactionProfileHistoricalFenceBounds(t *testing.T) {
 				sha256.Size + 1 + MaxSessionRecordBytes +
 				sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceBytes
 			releaseBytes := len(stateKey) + MaxStateEnvelopeBytes +
-				sha256.Size + 1 + int(test.retry)*(sha256.Size+3+fenceBytes)
+				2*(sha256.Size+1) + int(test.retry)*(sha256.Size+3+fenceBytes+routeGateResultKeyBytes)
 			options := Options{
 				RetryWindow: test.retry,
 				TxnLimits: durable.TxnLimits{
 					MaxCollections: 2,
-					MaxDocuments:   max(test.relations+4, 2*int(test.retry)+2),
+					MaxDocuments:   max(test.relations+4, 3*int(test.retry)+3),
 					MaxBytes:       int64(max(hotBytes+1024, releaseBytes)),
 				},
 			}

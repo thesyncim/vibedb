@@ -23,6 +23,55 @@ type postgresWriteServiceStub struct {
 	unknown, ackUnknown, refuse bool
 }
 
+type postgresLeaderChangeStub struct{ postgresWriteServiceStub }
+
+type postgresAckLeaderChangeStub struct{ postgresWriteServiceStub }
+
+func (s *postgresAckLeaderChangeStub) AckExecBatch(ctx context.Context, authority serviceauthz.Authority, ack durableExecBatchAckWireRequest) (durableExecBatchAckWireResponse, error) {
+	if s.acks < 2 {
+		s.acks++
+		return durableExecBatchAckWireResponse{}, gateway.ErrReplicatedLeader
+	}
+	return s.postgresWriteServiceStub.AckExecBatch(ctx, authority, ack)
+}
+
+func TestPostgreSQLWriteRecoversPreviousACKBeforeNextInsert(t *testing.T) {
+	authority := serviceauthz.Authority{Node: [16]byte{1}, Generation: 1}
+	s := &postgresAckLeaderChangeStub{}
+	w, err := openPostgresDurableWriter(filepath.Join(t.TempDir(), "writes"), authority, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, sql := range []string{"INSERT INTO employees (id) VALUES ('1')", "INSERT INTO employees (id) VALUES ('2')"} {
+		if r, err := w.Write(t.Context(), authority, gateway.Query{SQL: sql}); err != nil || r == nil || r.RowsAffected != 2 {
+			t.Fatalf("insert=%+v err=%v", r, err)
+		}
+	}
+	if s.writes != 2 || s.replays != 0 || s.acks != 4 || w.record.Query != nil || w.record.Sequence != 3 {
+		t.Fatalf("ACK recovery repeated execution: writes=%d replays=%d acks=%d record=%+v", s.writes, s.replays, s.acks, w.record)
+	}
+}
+
+func (s *postgresLeaderChangeStub) ExecBatch(ctx context.Context, authority serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query) (durableExecBatchExecuteResult, error) {
+	_, _ = s.postgresWriteServiceStub.ExecBatch(ctx, authority, id, q)
+	return durableExecBatchExecuteResult{}, gateway.ErrReplicatedLeader
+}
+
+func TestPostgreSQLWriteLeaderChangeResolvesSameIdentity(t *testing.T) {
+	authority := serviceauthz.Authority{Node: [16]byte{1}, Generation: 1}
+	s := &postgresLeaderChangeStub{}
+	w, err := openPostgresDurableWriter(filepath.Join(t.TempDir(), "writes"), authority, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	r, err := w.Write(t.Context(), authority, gateway.Query{SQL: "INSERT INTO employees (id) VALUES ('1')"})
+	if err != nil || r == nil || r.RowsAffected != 2 || s.writes != 1 || s.replays != 1 || s.acks != 1 || w.record.Query != nil {
+		t.Fatalf("leader change did not resolve exact write: result=%+v err=%v writes=%d replays=%d acks=%d", r, err, s.writes, s.replays, s.acks)
+	}
+}
+
 func (s *postgresWriteServiceStub) OpenIssuer(_ context.Context, _ serviceauthz.Authority, open gateway.ReplicatedIssuerOpen) (gateway.ReplicatedIssuerLaneGrant, error) {
 	return gateway.ReplicatedIssuerLaneGrant{Installation: open.Installation, Epoch: open.Epoch, LaneOrdinal: open.LaneOrdinal, GrantDigest: replication.Digest{9}}, nil
 }

@@ -1077,7 +1077,7 @@ func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
 }
 
 func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
-	t.Run("schemaful_preflight_has_no_materialization_side_effect", func(t *testing.T) {
+	t.Run("mismatched_schema_preflight_has_no_materialization_side_effect", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "schema.vdb")
 		binding := testReplicatedBinding(41)
 		database, err := InitializeShardStore(path, ShardStoreBinding{
@@ -1097,6 +1097,9 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 		if database.connector.db.tables["docs"].collection != nil {
 			t.Fatal("test table unexpectedly materialized")
 		}
+		// A declaration is supported, but its compiled and retained profiles
+		// must agree before any durable materialization.
+		database.connector.db.tables["docs"].schema = nil
 		if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreProfile) {
 			t.Fatalf("schemaful bind = %v", err)
 		}

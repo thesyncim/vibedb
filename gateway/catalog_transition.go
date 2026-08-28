@@ -125,6 +125,7 @@ func BuildReplicaReplacementTransition(
 	next, err := NewSnapshotWithReplicatedTableMetadata(
 		config, current.endpoints, nextGeneration, current.indexDescriptors(),
 		current.statistics.Descriptors(), descriptors, current.replicatedTableProfiles(),
+		current.ReplicatedTableDeclarations(),
 	)
 	if err != nil {
 		return nil, err
@@ -187,6 +188,7 @@ func buildManifestTransitions(
 	next, err := NewSnapshotWithReplicatedTableMetadata(
 		config, current.endpoints, nextGeneration, indexes, statistics,
 		replicated, current.replicatedTableProfiles(),
+		current.ReplicatedTableDeclarations(),
 	)
 	if err != nil {
 		return nil, err
@@ -448,6 +450,7 @@ func snapshotWithCatalogLineage(
 		replicatedShards:               snapshot.replicatedShards,
 		replicatedReplicas:             snapshot.replicatedReplicas,
 		replicatedTables:               snapshot.replicatedTables,
+		replicatedTableDeclarations:    snapshot.replicatedTableDeclarations,
 		durableRequestLedgerTopology:   snapshot.durableRequestLedgerTopology,
 		indexLineage:                   snapshot.indexLineage,
 		shardLineage:                   snapshot.shardLineage,

@@ -68,6 +68,20 @@ func AuthorityIdentityKey(tenant []byte, clientID replication.ID128) [sha256.Siz
 	return digest
 }
 
+// Ordinary clients retain the original cross-class fence forever. Internal
+// coordination sessions occupy a separate, class-bound namespace; no scoped
+// identity can authorize a data mutation or topology command after release.
+func sessionAuthorityIdentityKey(class replication.CommandAuthorityClass, tenant []byte, clientID replication.ID128) [sha256.Size]byte {
+	digest := AuthorityIdentityKey(tenant, clientID)
+	if !replication.IsScopedSessionAuthority(class) {
+		return digest
+	}
+	var raw [33]byte
+	raw[0] = byte(class)
+	copy(raw[1:], digest[:])
+	return sha256.Sum256(raw[:])
+}
+
 // AuthorityBindingStorageKey returns {3} || stable identity digest.
 func AuthorityBindingStorageKey(digest [sha256.Size]byte) [1 + sha256.Size]byte {
 	var key [1 + sha256.Size]byte
@@ -129,7 +143,7 @@ func OpenAuthorityBinding(src []byte) (AuthorityBindingView, error) {
 	}
 	tenant := src[32 : 32+tenantLen : 32+tenantLen]
 	return AuthorityBindingView{
-		Digest: AuthorityIdentityKey(tenant, clientID), Tenant: tenant,
+		Digest: sessionAuthorityIdentityKey(class, tenant, clientID), Tenant: tenant,
 		ClientID: clientID, AuthorityClass: class,
 	}, nil
 }
@@ -536,7 +550,7 @@ func validateSessionSlotView(view SessionSlotView) error {
 func validSessionAuthorityClass(class replication.CommandAuthorityClass) bool {
 	return class == replication.CommandAuthorityData ||
 		class == replication.CommandAuthorityTopology ||
-		class == replication.CommandAuthorityExecutionPin
+		class == replication.CommandAuthorityExecutionPin || replication.IsScopedSessionAuthority(class)
 }
 
 // verifySessionChecksum is verifyRecord's allocation-free borrowed-decode

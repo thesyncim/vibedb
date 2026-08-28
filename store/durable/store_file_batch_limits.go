@@ -1,5 +1,7 @@
 package durable
 
+import "github.com/thesyncim/vibedb/store"
+
 // NormalizeOptions applies every zero-value default and validates the result.
 // The returned Options are the exact logical bounds and modes a new collection
 // will freeze into its catalog. Callers that stage work before a Collection
@@ -71,6 +73,16 @@ func (c *Collection) SealedRecoveryJournalBytes() uint64 {
 // could make committed input fail only at apply time.
 func (c *Collection) HasSchema() bool {
 	return c != nil && c.options.Collection.Schema != nil
+}
+
+// Schema returns the immutable compiled declaration, or nil for a schema-free
+// collection. Construction-time adapters use it to authenticate their exact
+// mutation-validation contract; callers cannot mutate a compiled Schema.
+func (c *Collection) Schema() *store.Schema {
+	if c == nil {
+		return nil
+	}
+	return c.options.Collection.Schema
 }
 
 // HasOpaqueValues reports whether the collection stores uninterpreted primary

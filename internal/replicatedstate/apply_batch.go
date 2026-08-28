@@ -333,7 +333,7 @@ func (m *Machine) ApplyNormalBatch(
 				command.Kind() == replication.CommandSplitCaptureActivate {
 				break
 			}
-			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
+			sessionDigest := sessionAuthorityIdentityKey(command.AuthorityClass, command.Tenant, command.ClientID)
 			seen := false
 			for selected := 0; selected < selectedSessions; selected++ {
 				if selectedSessionDigests[selected] == sessionDigest {
@@ -604,6 +604,11 @@ func (m *Machine) recordBatchPlan(
 			return err
 		}
 	}
+	for _, row := range plan.routeGateRows {
+		if err := batch.system.record(row.key, row.value, row.delete); err != nil {
+			return err
+		}
+	}
 	if plan.writeSession {
 		if err := batch.system.record(plan.sessionKey[:], plan.sessionRecord, false); err != nil {
 			return err
@@ -611,6 +616,11 @@ func (m *Machine) recordBatchPlan(
 	}
 	if plan.writeAuthority {
 		if err := batch.system.record(plan.authorityKey[:], plan.authorityRecord, false); err != nil {
+			return err
+		}
+	}
+	if plan.deleteAuthority {
+		if err := batch.system.record(plan.authorityKey[:], nil, true); err != nil {
 			return err
 		}
 	}

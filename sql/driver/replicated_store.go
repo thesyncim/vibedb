@@ -132,15 +132,18 @@ type ReplicatedShardRelationIdentity struct {
 	Storage          string
 	Limits           ReplicatedShardStoreLimits
 	LocalIndexDigest [sha256.Size]byte
-	IndexID          uint64
-	Incarnation      uint64
-	LocatorCount     uint8
-	Unique           bool
-	KeyEncoding      ReplicatedRelationKeyEncoding
-	KeyArity         uint8
-	TupleVersion     distribution.TupleVersion
-	MapperVersion    distribution.MapperVersion
-	BucketBits       uint8
+	// SchemaDigest commits declared field types and requiredness. Zero retains
+	// the original schema-free descriptor and on-disk encoding.
+	SchemaDigest  [sha256.Size]byte
+	IndexID       uint64
+	Incarnation   uint64
+	LocatorCount  uint8
+	Unique        bool
+	KeyEncoding   ReplicatedRelationKeyEncoding
+	KeyArity      uint8
+	TupleVersion  distribution.TupleVersion
+	MapperVersion distribution.MapperVersion
+	BucketBits    uint8
 }
 
 // GlobalIndexStorageKeyPoint validates one stored global-index key against the
@@ -461,7 +464,7 @@ func (d *Database) bindReplicatedShardStoreBundleExact(
 		if err := validateReplicatedTableCatalogProfile(name, t); err != nil {
 			return err
 		}
-		if global != nil && len(t.meta.Indexes) != 0 {
+		if global != nil && (len(t.meta.Indexes) != 0 || t.meta.Schema != nil) {
 			return fmt.Errorf(
 				"%w: global relation %q must be locally unindexed",
 				ErrReplicatedShardStoreProfile, name,
@@ -592,6 +595,7 @@ func (d *Database) bindReplicatedShardStoreBundleExact(
 		if pending[i].global == nil {
 			relation.Kind = ReplicatedShardRelationJSON
 			relation.LocalIndexDigest = replicatedLocalIndexDigest(candidate.meta.Indexes)
+			relation.SchemaDigest = replicatedSchemaDigest(candidate.meta.Schema)
 		} else {
 			relation.Kind = ReplicatedShardRelationGlobalIndex
 			relation.IndexID = pending[i].global.IndexID
@@ -693,7 +697,8 @@ func (d *database) validateReservedReplicatedBundleLocked(
 			MaxKeyBytes: normalized.MaxKeyBytes, MaxDocumentBytes: normalized.MaxDocumentBytes,
 			MaxBatchDocuments: normalized.MaxBatchDocuments, MaxBatchBytes: normalized.MaxBatchBytes,
 		}
-		if relation.Limits != limits || i == 0 && relation.LocalIndexDigest != replicatedLocalIndexDigest(t.meta.Indexes) {
+		if relation.Limits != limits || relation.SchemaDigest != replicatedSchemaDigest(t.meta.Schema) ||
+			i == 0 && relation.LocalIndexDigest != replicatedLocalIndexDigest(t.meta.Indexes) {
 			return ErrReplicatedShardStoreIdentityMismatch
 		}
 		for prior := 0; prior < i; prior++ {
@@ -1029,10 +1034,10 @@ func (d *Database) bindReplicatedShardStoreExact(
 }
 
 func validateReplicatedTableCatalogProfile(name string, t *table) error {
-	if t == nil || t.meta == nil || t.schema != nil || t.meta.Schema != nil ||
+	if t == nil || t.meta == nil || !replicatedTableSchemaMatches(t) ||
 		t.meta.Storage == "" {
 		return fmt.Errorf(
-			"%w: table %q catalog metadata must be schema-free with an explicit storage identity",
+			"%w: table %q catalog metadata must match its schema and have an explicit storage identity",
 			ErrReplicatedShardStoreProfile, name,
 		)
 	}
@@ -1194,13 +1199,13 @@ func replicatedIdentityForTable(
 	requireEmpty bool,
 ) (ReplicatedShardStoreIdentity, error) {
 	if t == nil || t.meta == nil || t.collection == nil ||
-		t.schema != nil || t.meta.Schema != nil || t.collection.HasSchema() ||
+		!replicatedTableSchemaMatches(t) || t.collection.HasSchema() != (t.schema != nil) ||
 		t.collection.HasIndexes() != (len(t.meta.Indexes) != 0) ||
 		!t.collection.HasSynchronousDurability() || !t.collection.SupportsUpdate() ||
 		t.collection.SealedRecoveryJournalBytes() != sidecars.UserRecoveryJournalBytes ||
 		!t.meta.Materialized || t.meta.Storage == "" {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
-			"%w: table %q must be materialized, schema-free, synchronously indexed, and exactly sealed",
+			"%w: table %q must be materialized, schema-matched, synchronously indexed, and exactly sealed",
 			ErrReplicatedShardStoreProfile, name,
 		)
 	}
@@ -1232,6 +1237,7 @@ func replicatedIdentityForTable(
 		Relation: 1, Kind: ReplicatedShardRelationJSON,
 		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
 		LocalIndexDigest: replicatedLocalIndexDigest(t.meta.Indexes),
+		SchemaDigest:     replicatedSchemaDigest(t.meta.Schema),
 	}
 	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
@@ -1280,7 +1286,8 @@ func validateReplicatedCatalog(catalog catalogFile) error {
 	}
 	validateRelation := func(relation ReplicatedShardRelationIdentity) error {
 		meta := catalog.Tables[relation.Table]
-		if meta == nil || meta.Schema != nil || !meta.Materialized ||
+		if meta == nil || !meta.Materialized ||
+			replicatedSchemaDigest(meta.Schema) != relation.SchemaDigest ||
 			meta.Storage == "" || meta.Storage != relation.Storage ||
 			meta.SealedRecoveryJournalBytes != r.Sidecars.UserRecoveryJournalBytes ||
 			relation.Kind == ReplicatedShardRelationGlobalIndex && len(meta.Indexes) != 0 {
@@ -1401,8 +1408,9 @@ func openedReplicatedRelationMatches(
 	relation ReplicatedShardRelationIdentity,
 	sidecars ReplicatedShardStoreSidecarProfile,
 ) bool {
-	if t == nil || t.meta == nil || t.collection == nil || t.schema != nil ||
-		t.meta.Schema != nil || t.collection.HasSchema() ||
+	if t == nil || t.meta == nil || t.collection == nil || !replicatedTableSchemaMatches(t) ||
+		t.collection.HasSchema() != (t.schema != nil) ||
+		replicatedSchemaDigest(t.meta.Schema) != relation.SchemaDigest ||
 		!t.collection.HasSynchronousDurability() || !t.collection.SupportsUpdate() ||
 		t.collection.SealedRecoveryJournalBytes() != sidecars.UserRecoveryJournalBytes ||
 		!t.meta.Materialized || t.meta.Storage != relation.Storage ||
@@ -1553,6 +1561,7 @@ func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) e
 			}
 		case ReplicatedShardRelationGlobalIndex:
 			if ordinal == 0 || relation.LocalIndexDigest != ([sha256.Size]byte{}) ||
+				relation.SchemaDigest != ([sha256.Size]byte{}) ||
 				relation.IndexID == 0 || relation.Incarnation == 0 ||
 				relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
 				!validReplicatedGlobalIndexPlacement(
@@ -1621,6 +1630,50 @@ func writeReplicatedRelationDescriptors(
 		}
 		_, _ = h.Write(relation.LocalIndexDigest[:])
 	}
+	// Append an explicitly tagged extension only for typed relations. Existing
+	// schema-free identities retain their exact historical digest bytes.
+	for ordinal := range identity.Relations {
+		relation := &identity.Relations[ordinal]
+		if relation.SchemaDigest != ([sha256.Size]byte{}) {
+			_, _ = h.Write([]byte("vibedb/sql/declared-schema/v1\x00"))
+			binary.LittleEndian.PutUint16(fixed[:2], relation.Relation)
+			_, _ = h.Write(fixed[:2])
+			_, _ = h.Write(relation.SchemaDigest[:])
+		}
+	}
+}
+
+// Cold identity validation only: never called from a query or mutation loop.
+func replicatedTableSchemaMatches(t *table) bool {
+	return (t.schema == nil) == (t.meta.Schema == nil) &&
+		replicatedSchemaDigest(schemaMetaFrom(t.schema)) == replicatedSchemaDigest(t.meta.Schema)
+}
+
+func replicatedSchemaDigest(meta *schemaMeta) [sha256.Size]byte {
+	if meta == nil {
+		return [sha256.Size]byte{}
+	}
+	fields := slices.Clone(meta.Fields)
+	slices.SortFunc(fields, func(a, b schemaFieldMeta) int { return strings.Compare(a.Path, b.Path) })
+	h := sha256.New()
+	_, _ = h.Write([]byte("vibedb/sql/declared-schema-definition/v1\x00"))
+	var fixed [8]byte
+	binary.LittleEndian.PutUint16(fixed[:2], meta.Root)
+	_, _ = h.Write(fixed[:2])
+	binary.LittleEndian.PutUint64(fixed[:], uint64(len(fields)))
+	_, _ = h.Write(fixed[:])
+	for _, field := range fields {
+		writeReplicatedRelationFrame(h, []byte(field.Path))
+		binary.LittleEndian.PutUint16(fixed[:2], field.Types)
+		fixed[2] = 0
+		if field.Required {
+			fixed[2] = 1
+		}
+		_, _ = h.Write(fixed[:3])
+	}
+	var digest [sha256.Size]byte
+	h.Sum(digest[:0])
+	return digest
 }
 
 func replicatedLocalIndexDigest(indexes []indexMeta) [sha256.Size]byte {

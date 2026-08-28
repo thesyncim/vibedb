@@ -234,7 +234,7 @@ var routeGatePhysicalWitnessDomain = []byte(
 // stable witness; those logical fields are bound by the nested gate command.
 func RouteGatePhysicalWitness(command CommandView) (Digest, bool) {
 	if command.Kind() != CommandRouteGate ||
-		command.AuthorityClass != CommandAuthorityData {
+		(command.AuthorityClass != CommandAuthorityData && command.AuthorityClass != CommandAuthorityRouteSession) {
 		return Digest{}, false
 	}
 	var storage [2*MaxIdentityBytes + 256]byte
@@ -325,7 +325,7 @@ func (v CommandView) RetainedPruneProof() (RetainedPruneProof, bool) {
 // principal to the exact catalog route fences observed by replicated apply.
 func ExecutionPinAuthorityDigest(command CommandView) (Digest, bool) {
 	if command.Kind() != CommandExecutionPin ||
-		command.AuthorityClass != CommandAuthorityExecutionPin {
+		!IsExecutionPinAuthority(command.AuthorityClass) {
 		return Digest{}, false
 	}
 	nested, err := command.OpenExecutionPin()
@@ -882,11 +882,14 @@ func validateCommandHeader(command Command) error {
 		return semantic("request ledger authority class")
 	}
 	if (command.Kind == CommandExecutionPin &&
-		command.AuthorityClass != CommandAuthorityExecutionPin) ||
+		!IsExecutionPinAuthority(command.AuthorityClass)) ||
 		(command.Kind != CommandExecutionPin &&
-			command.AuthorityClass == CommandAuthorityExecutionPin &&
+			IsExecutionPinAuthority(command.AuthorityClass) &&
 			!commandKindIsSessionLifecycle(command.Kind)) {
 		return semantic("execution-pin authority class")
+	}
+	if command.AuthorityClass == CommandAuthorityRouteSession && command.Kind != CommandRouteGate && !commandKindIsSessionLifecycle(command.Kind) {
+		return semantic("route-session authority class")
 	}
 	switch command.Kind {
 	case CommandMutationBatch, CommandRetainedPrune:
@@ -965,7 +968,7 @@ func validateCommandHeader(command Command) error {
 			return semantic("route-gate command")
 		}
 	case CommandExecutionPin:
-		if command.AuthorityClass != CommandAuthorityExecutionPin || len(command.Batches) != 0 ||
+		if !IsExecutionPinAuthority(command.AuthorityClass) || len(command.Batches) != 0 ||
 			len(command.Transaction) != 0 || len(command.RequestLedger) != 0 ||
 			len(command.RouteGate) != 0 ||
 			len(command.ExecutionPin) != executionpin.CommandBytes {
@@ -1496,10 +1499,13 @@ func OpenCommand(src []byte) (CommandView, error) {
 		(authorityClass == CommandAuthorityRequestLedger) {
 		return CommandView{}, semantic("request ledger authority class")
 	}
-	if (kind == CommandExecutionPin && authorityClass != CommandAuthorityExecutionPin) ||
-		(kind != CommandExecutionPin && authorityClass == CommandAuthorityExecutionPin &&
+	if (kind == CommandExecutionPin && !IsExecutionPinAuthority(authorityClass)) ||
+		(kind != CommandExecutionPin && IsExecutionPinAuthority(authorityClass) &&
 			!commandKindIsSessionLifecycle(kind)) {
 		return CommandView{}, semantic("execution-pin authority class")
+	}
+	if authorityClass == CommandAuthorityRouteSession && kind != CommandRouteGate && !commandKindIsSessionLifecycle(kind) {
+		return CommandView{}, semantic("route-session authority class")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
 	relationCount := binary.LittleEndian.Uint16(src[28:30])
@@ -1537,7 +1543,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 			return CommandView{}, semantic("route-gate command header")
 		}
 	case CommandExecutionPin:
-		if authorityClass != CommandAuthorityExecutionPin || count != 0 || relationCount != 0 ||
+		if !IsExecutionPinAuthority(authorityClass) || count != 0 || relationCount != 0 ||
 			inlineRelationID != 0 {
 			return CommandView{}, semantic("execution-pin command header")
 		}
@@ -1732,7 +1738,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 func routeGateAuthorityMatches(class CommandAuthorityClass, operation routegate.Operation) bool {
 	switch operation {
 	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
-		return class == CommandAuthorityData
+		return class == CommandAuthorityData || class == CommandAuthorityRouteSession
 	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive,
 		routegate.OperationCompactReleased:
 		return class == CommandAuthorityTopology

@@ -30,6 +30,8 @@ const (
 var errInvalidRF3Manifest = errors.New("vibedb-shard: invalid RF3 manifest")
 
 type rf3Manifest struct {
+	reloadPath          string
+	reloadSignals       <-chan os.Signal
 	Digest              [sha256.Size]byte
 	WAL                 rf3ManifestWAL
 	SQL                 rf3ManifestSQL

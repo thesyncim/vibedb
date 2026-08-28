@@ -241,7 +241,8 @@ func (s *Statement) prepareScalar() error {
 	}
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
-		if column.Scalar == nil && column.Path != nil && len(column.Path.Segments) == 0 {
+		if column.Scalar == nil && column.Path != nil && len(column.Path.Segments) == 0 &&
+			(s.hasRelationBinding() || s.relationJoin() != nil) {
 			return sqlast.NewFeatureNotSupportedError(s.text, column.Pos,
 				"a relation wildcard cannot be mixed with the cold scalar output stage yet; name its columns explicitly")
 		}

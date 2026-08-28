@@ -86,7 +86,7 @@ func RestoreCatalogProjection(operation clusterrestore.Operation, snapshot *Snap
 	}
 	// Reconstructing from the explicit current inventory resets historical
 	// lineage/high-water metadata. Exact equality rejects any retained history.
-	fresh, err := NewSnapshotWithReplicatedTableMetadata(snapshot.config, snapshot.endpoints, 1, snapshot.indexDescriptors(), snapshot.statistics.Descriptors(), descriptors, snapshot.replicatedTableProfiles())
+	fresh, err := NewSnapshotWithReplicatedTableMetadata(snapshot.config, snapshot.endpoints, 1, snapshot.indexDescriptors(), snapshot.statistics.Descriptors(), descriptors, snapshot.replicatedTableProfiles(), snapshot.ReplicatedTableDeclarations())
 	if err != nil {
 		return nil, err
 	}

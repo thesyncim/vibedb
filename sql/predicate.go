@@ -318,6 +318,7 @@ func (p *Parser) parseScalarCondition(
 		Kind: ExprScalarCompare, Op: op, Column: -1,
 		ScalarLeft: left, ScalarRight: right, Pos: pos,
 	}
+	lowerTextPathEquality(node)
 	return node, nil
 }
 

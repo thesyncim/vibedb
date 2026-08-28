@@ -52,7 +52,7 @@ func machineOptionsFor(user CollectionTarget) Options {
 			MaxCollections: 2,
 			MaxDocuments: max(
 				user.Limits.MaxDistinctMutations+4,
-				2*int(constructionRetryWindow)+2,
+				3*int(constructionRetryWindow)+3,
 			),
 			MaxBytes: 64 << 20,
 		},
@@ -185,7 +185,7 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 		MaxCollections: 2,
 		MaxDocuments: max(
 			user.Limits.MaxDistinctMutations+4,
-			2*int(constructionRetryWindow)+2,
+			3*int(constructionRetryWindow)+3,
 		),
 		MaxBytes: required,
 	}, MaxSessions: 128, RetryWindow: constructionRetryWindow}

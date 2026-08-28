@@ -27,6 +27,21 @@ func TestGrammarShapes(t *testing.T) {
 			want: `select path(0:) from docs/u`,
 		},
 		{
+			name: "key and named whole document",
+			src:  `SELECT id,docs."$doc" FROM docs`,
+			want: `select path(0:id) path(0:) as $doc from docs`,
+		},
+		{
+			name: "unqualified named document",
+			src:  `SELECT "$doc" FROM docs`,
+			want: `select path(0:) as $doc from docs`,
+		},
+		{
+			name: "named document alias",
+			src:  `SELECT d."$doc" AS payload FROM docs d`,
+			want: `select path(0:) as payload from docs/d`,
+		},
+		{
 			name: "several projections",
 			src:  `SELECT team, score FROM docs`,
 			want: `select path(0:team) path(0:score) from docs`,

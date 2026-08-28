@@ -161,11 +161,24 @@ const (
 	// controller may retain/release one logical execution contract but cannot
 	// publish a catalog or operate physical route drains.
 	CommandAuthorityExecutionPin
+	// Scoped coordination sessions have class-separated identities and no
+	// authority beyond their narrow command family. Exact release reclaims
+	// their binding together with the retry ring; epochs still fence replay.
+	CommandAuthorityRouteSession
+	CommandAuthorityExecutionSession
 )
+
+func IsScopedSessionAuthority(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityRouteSession || class == CommandAuthorityExecutionSession
+}
+
+func IsExecutionPinAuthority(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityExecutionPin || class == CommandAuthorityExecutionSession
+}
 
 func validCommandAuthorityClass(class CommandAuthorityClass) bool {
 	return class == CommandAuthorityData || class == CommandAuthorityTopology ||
-		class == CommandAuthorityRequestLedger || class == CommandAuthorityExecutionPin
+		class == CommandAuthorityRequestLedger || class == CommandAuthorityExecutionPin || IsScopedSessionAuthority(class)
 }
 
 // CommandKind selects the command's state-machine operation. The zero value is

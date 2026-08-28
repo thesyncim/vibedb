@@ -98,3 +98,36 @@ func TestPostgreSQLRF3ReadOnlyStateLimitsAndCancellation(t *testing.T) {
 		t.Fatal("canceled query exposed rows")
 	}
 }
+
+func TestPostgreSQLRF3MaterializesNull(t *testing.T) {
+	executor, transport := newSQLRF3TestExecutor(t)
+	transport.nullResult = true
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	backend := &PostgreSQLBackend{Executor: executor, Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) { return authority, nil }}
+	s, err := backend.NewSession(context.Background(), pgwire.SessionIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p, err := s.Prepare(context.Background(), `SELECT id FROM messages`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	var rows pgwire.BackendRows
+	defer rows.Close()
+	if err := p.QueryInto(context.Background(), nil, &rows); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+		if !rows.Cell(0).IsNull() {
+			t.Fatalf("native NULL became invalid cell: %+v", rows.Cell(0))
+		}
+	}
+	if n != 2 {
+		t.Fatalf("scatter NULL rows=%d", n)
+	}
+}

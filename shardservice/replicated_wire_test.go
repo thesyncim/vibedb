@@ -560,9 +560,20 @@ func TestReplicatedProposalRequestLedgerCapabilityIsNarrow(t *testing.T) {
 }
 
 func TestReplicatedProposalExecutionPinCapabilityIsClosedAndIndependent(t *testing.T) {
+	for _, class := range []replication.CommandAuthorityClass{
+		replication.CommandAuthorityExecutionPin, replication.CommandAuthorityExecutionSession,
+	} {
+		t.Run(string(rune('0'+class)), func(t *testing.T) {
+			testExecutionPinCapability(t, class)
+		})
+	}
+}
+
+func testExecutionPinCapability(t *testing.T, class replication.CommandAuthorityClass) {
+	t.Helper()
 	fence := testReplicatedFence()
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{12}, Generation: 1}
-	execution := testReplicatedExecutionPinCommand(t, fence)
+	execution := testReplicatedExecutionPinCommand(t, fence, class)
 	request := &ReplicatedRequest{
 		Operation: ReplicatedPropose, Authority: authority,
 		Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution,
@@ -577,7 +588,7 @@ func TestReplicatedProposalExecutionPinCapabilityIsClosedAndIndependent(t *testi
 	}
 	command, err := replication.OpenCommand(decoded.Command)
 	if err != nil || command.Kind() != replication.CommandExecutionPin ||
-		command.AuthorityClass != replication.CommandAuthorityExecutionPin {
+		command.AuthorityClass != class {
 		t.Fatalf("decoded execution pin = %+v, %v", command, err)
 	}
 	for _, rejected := range []*ReplicatedRequest{
@@ -1136,8 +1147,12 @@ func testReplicatedTransactionCommandClass(
 	return encoded
 }
 
-func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence) []byte {
+func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence, classes ...replication.CommandAuthorityClass) []byte {
 	t.Helper()
+	class := replication.CommandAuthorityExecutionPin
+	if len(classes) != 0 {
+		class = classes[0]
+	}
 	digest := func(seed byte) executionpin.Digest {
 		var value executionpin.Digest
 		value[0], value[31] = seed, seed^0xff
@@ -1169,7 +1184,7 @@ func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence) []by
 	}
 	encoded, err := replication.AppendCommand(nil, replication.Command{
 		Kind:           replication.CommandExecutionPin,
-		AuthorityClass: replication.CommandAuthorityExecutionPin,
+		AuthorityClass: class,
 		ClusterID:      fence.Group.ClusterID, ClusterIncarnation: fence.Group.ClusterIncarnation,
 		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,
 		Distribution:          "orders", Shard: "catalog",

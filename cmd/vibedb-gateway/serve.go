@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -161,6 +162,8 @@ func (values *repeatedFlag) Set(value string) error {
 func runServe(args []string) (exitCode int) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
+	var tableCatalogs repeatedFlag
+	fs.Var(&tableCatalogs, "register-table-catalog", "authenticated provisioned single-table catalog to register before serving (repeatable)")
 	catalogRouteSeed := fs.String("catalog-route-seed", "", "path to the last authenticated crash-safe catalog route seed")
 	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
 	catalogBootstrapIfMissing := fs.Bool("catalog-bootstrap-if-missing", false, "atomically publish and attest the immutable generation-one catalog proof when authority is empty")
@@ -185,6 +188,7 @@ func runServe(args []string) (exitCode int) {
 	schemaRolloutOnce := fs.Bool("schema-rollout-once", false, "execute the authenticated schema rollout and exit")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	pgDevListen := fs.String("pg-dev-listen", "", "optional loopback-only, trust-authenticated PostgreSQL endpoint with durable auto-commit writes")
+	pgDevDDLSocket := fs.String("pg-dev-ddl-socket", "", "private Unix socket of the local development provisioning supervisor")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
 	tlsKey := fs.String("tls-key", "", "PEM gateway private key")
@@ -206,6 +210,10 @@ func runServe(args []string) (exitCode int) {
 	}
 	if *catalog == "" {
 		usage()
+		return 2
+	}
+	if *pgDevDDLSocket != "" && (*pgDevListen == "" || !filepath.IsAbs(*pgDevDDLSocket) || *devStaticCatalog) {
+		fmt.Fprintln(os.Stderr, "gateway: local DDL requires RF3 PostgreSQL and an absolute private Unix socket")
 		return 2
 	}
 	if *pgDevListen != "" {
@@ -397,6 +405,30 @@ func runServe(args []string) (exitCode int) {
 		return 1
 	}
 	var routeSeedControl *gateway.ReplicatedCatalogRouteSeedControl
+	for _, path := range tableCatalogs {
+		if catalogAuthority == nil {
+			fmt.Fprintln(os.Stderr, "gateway: table registration requires replicated catalog authority")
+			return 2
+		}
+		file, registerErr := os.Open(path)
+		var addition *gateway.Snapshot
+		if registerErr == nil {
+			raw, readErr := io.ReadAll(io.LimitReader(file, (4<<20)+1))
+			registerErr = errors.Join(readErr, file.Close())
+			if registerErr == nil {
+				addition, registerErr = gateway.OpenReplicatedTableProvision(raw)
+			}
+		}
+		if registerErr == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			registerErr = catalogAuthority.RegisterProvisionedTable(ctx, addition)
+			cancel()
+		}
+		if registerErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: register provisioned table %q: %v\n", path, registerErr)
+			return 1
+		}
+	}
 	if catalogAuthority != nil {
 		routeSeedControl = catalogAuthority.ReplicatedCatalogRouteSeedControl()
 	}
@@ -461,9 +493,6 @@ func runServe(args []string) (exitCode int) {
 		fmt.Fprintf(os.Stderr, "gateway: listen %q: %v\n", *listen, err)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "vibedb-gateway serving catalog generation %d on %s\n",
-		holder.Current().Generation(), listener.Addr())
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	controllerMetrics := new(gatewayControllerMetrics)
@@ -728,7 +757,7 @@ func runServe(args []string) (exitCode int) {
 			fmt.Fprintln(os.Stderr, "gateway: PostgreSQL requires durable write service")
 			return 1
 		}
-		writer, writeErr := openPostgresDurableWriter(*catalogSessionJournal+".pg-writes", internalAuthority, writeService)
+		writer, writeErr := openPostgresTableWriters(*catalogSessionJournal+".pg-writes", internalAuthority, writeService)
 		if writeErr != nil {
 			fmt.Fprintln(os.Stderr, writeErr)
 			return 1
@@ -736,7 +765,11 @@ func runServe(args []string) (exitCode int) {
 		writeCtx, stopWrites := context.WithCancel(ctx)
 		defer func() { stopWrites(); _ = writer.Close() }()
 		go writer.Run(writeCtx)
-		pg, pgErr := startGatewayPostgreSQL(ctx, *pgDevListen, exec, internalAuthority, writer.Write, logf)
+		var ddl func(context.Context, serviceauthz.Authority, string) error
+		if *pgDevDDLSocket != "" {
+			ddl = newGatewayDevDDL(*pgDevDDLSocket, catalogAuthority)
+		}
+		pg, pgErr := startGatewayPostgreSQL(ctx, *pgDevListen, exec, internalAuthority, writer.Write, logf, ddl)
 		if pgErr != nil {
 			_ = listener.Close()
 			fmt.Fprintln(os.Stderr, pgErr)
@@ -744,6 +777,11 @@ func runServe(args []string) (exitCode int) {
 		}
 		defer pg.Close()
 	}
+	// The supervisor treats this as readiness for every configured listener,
+	// including PostgreSQL. Publishing it before pg-dev-listen binds races
+	// reconnecting IDEs and restart probes with a connection-refused error.
+	fmt.Fprintf(os.Stderr, "vibedb-gateway serving catalog generation %d on %s\n",
+		holder.Current().Generation(), listener.Addr())
 	if clientTLS != nil {
 		err = serveAuthenticatedGatewayDurableData(ctx, listener, exec, dataReader, durable, clientTLS, gateway.ClientTLSLimits{
 			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,

@@ -53,6 +53,7 @@ type commandPlan struct {
 	refusal            error
 	writeSession       bool
 	writeAuthority     bool
+	deleteAuthority    bool
 	writeSlot          bool
 	newSession         bool
 	newAuthority       bool
@@ -951,6 +952,12 @@ func applyCommandPlanToState(next *State, plan commandPlan) error {
 	if plan.newAuthority {
 		next.AuthorityBindingCount++
 	}
+	if plan.deleteAuthority {
+		if !plan.deleteSession || next.AuthorityBindingCount == 0 {
+			return ErrSessionCorrupt
+		}
+		next.AuthorityBindingCount--
+	}
 	if plan.newPhysicalSlot {
 		next.SessionSlotCount++
 	}
@@ -1157,7 +1164,7 @@ func (m *Machine) planBundleCommandUnaccounted(
 	scratch.begin()
 	m.canonicalMutations.begin(command, nil)
 	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
-	plan.authorityDigest = AuthorityIdentityKey(command.Tenant, command.ClientID)
+	plan.authorityDigest = sessionAuthorityIdentityKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	plan.authorityKey = AuthorityBindingStorageKey(plan.authorityDigest)
 	bound, authorityFound, err := authorityBindingAt(
 		systemSnapshot, plan.authorityKey, scratch,
@@ -1174,7 +1181,7 @@ func (m *Machine) planBundleCommandUnaccounted(
 	}
 	if !authorityFound {
 		if err := ensureNoAuthoritySessionRows(
-			systemSnapshot, command.Tenant, command.ClientID, m.options.RetryWindow,
+			systemSnapshot, command.Tenant, command.ClientID, m.options.RetryWindow, command.AuthorityClass,
 		); err != nil {
 			return commandPlan{}, err
 		}
@@ -1194,7 +1201,7 @@ func (m *Machine) planBundleCommandUnaccounted(
 		return plan, nil
 	}
 	if command.Kind() == replication.CommandSessionOpen {
-		if !authorityFound && state.AuthorityBindingCount >= m.options.MaxSessions {
+		if !authorityFound && !replication.IsScopedSessionAuthority(command.AuthorityClass) && state.AuthorityBindingCount >= m.options.MaxSessions {
 			plan.refusal = ErrAdmissionBound
 			return plan, nil
 		}
@@ -1839,7 +1846,31 @@ func (m *Machine) planSessionRelease(
 		return plan, nil
 	}
 	plan.deleteSession = true
+	plan.deleteAuthority = replication.IsScopedSessionAuthority(command.AuthorityClass)
 	plan.deleteSlots = session.PhysicalSlotCount
+	if command.AuthorityClass == replication.CommandAuthorityRouteSession {
+		// Route outcomes live beside the retry ring. They are no longer
+		// reachable after exact release and must not outlive its scoped binding.
+		for slot := uint16(0); slot < session.RetryWindow; slot++ {
+			key, err := routeGateResultStorageKey(plan.sessionDigest, slot)
+			if err != nil {
+				return commandPlan{}, err
+			}
+			var buffer [routeGateResultBytes]byte
+			raw, found, err := systemSnapshot.appendRaw(buffer[:0], key[:])
+			if err != nil {
+				return commandPlan{}, err
+			}
+			if !found {
+				continue
+			}
+			record, err := openRouteGateResult(raw)
+			if err != nil || record.SessionDigest != plan.sessionDigest || record.Slot != slot || record.ClientEpoch > session.ClientEpoch || record.ClientSequence > session.HighSequence {
+				return commandPlan{}, errors.Join(err, ErrSessionCorrupt)
+			}
+			plan.routeGateRows = append(plan.routeGateRows, routeGateRowMutation{key: bytes.Clone(key[:]), delete: true})
+		}
+	}
 	return plan, nil
 }
 
@@ -2359,7 +2390,19 @@ func (s pointSnapshot) rangeSessionSlots(
 }
 
 func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
-	clientID replication.ID128, retryWindow uint16) error {
+	clientID replication.ID128, retryWindow uint16, scope ...replication.CommandAuthorityClass) error {
+	if len(scope) == 1 && replication.IsScopedSessionAuthority(scope[0]) {
+		digest := SessionKey(scope[0], tenant, clientID)
+		key := SessionStorageKey(digest)
+		_, found, err := snapshot.appendRaw(nil, key[:])
+		if err != nil {
+			return err
+		}
+		if found {
+			return fmt.Errorf("%w: scoped session without binding", ErrSessionCorrupt)
+		}
+		return ensureNoSessionSlots(snapshot, digest, retryWindow)
+	}
 	for _, class := range [...]replication.CommandAuthorityClass{
 		replication.CommandAuthorityData, replication.CommandAuthorityTopology,
 		replication.CommandAuthorityExecutionPin,
@@ -2553,6 +2596,9 @@ func (m *Machine) persistTransitionRows(
 		return err
 	}
 	systemDocuments := 1
+	if plan.deleteAuthority {
+		systemDocuments++
+	}
 	if plan.writeAuthority {
 		systemDocuments++
 	}
@@ -2599,6 +2645,11 @@ func (m *Machine) persistTransitionRows(
 		}
 		if plan.writeAuthority {
 			if err := systemBatch.Put(plan.authorityKey[:], plan.authorityRecord); err != nil {
+				return err
+			}
+		}
+		if plan.deleteAuthority {
+			if err := systemBatch.Delete(plan.authorityKey[:]); err != nil {
 				return err
 			}
 		}
@@ -2833,6 +2884,13 @@ func (m *Machine) checkTransitionCapacityWithStateBytes(
 	}
 	stateBytes := len(stateKey) + stateEnvelopeBytes
 	systemDocs := 1
+	if plan.deleteAuthority {
+		if plan.writeAuthority || !plan.deleteSession {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(plan.authorityKey)
+		systemDocs++
+	}
 	if plan.writeAuthority {
 		if len(plan.authorityRecord) < authorityBindingHeaderBytes+1+recordChecksumLen ||
 			len(plan.authorityRecord) > MaxAuthorityBindingBytes ||

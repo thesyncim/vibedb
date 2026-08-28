@@ -1,7 +1,10 @@
 # PostgreSQL access to distributed RF3 SQL
 
 Status: opt-in, loopback-only RF3 development endpoint with distributed reads
-and durable single-statement auto-commit writes. DDL, write transaction blocks,
+and durable single-statement auto-commit writes. The development supervisor also
+supports CREATE TABLE, including IF NOT EXISTS, by preparing independent RF3
+groups in the existing three data processes and publishing their catalog entry
+only after a quorum read succeeds. Other DDL, write transaction blocks,
 savepoints, repeatable-read/serializable transactions, global-index lookup plans,
 and repartition exchange plans are refused.
 
@@ -24,11 +27,44 @@ The seeded table is `documents`, with primary key `/id`. Try:
 
 ```sql
 SELECT id, value FROM documents ORDER BY id;
+SELECT id, documents."$doc" FROM documents;
 SELECT COUNT(*) FROM documents;
 INSERT INTO documents (id, value) VALUES ('example', 'hello');
 UPDATE documents SET "$doc" = '{"id":"example","value":"updated"}' WHERE id = 'example';
 DELETE FROM documents WHERE id = 'example';
 ```
+
+For a real six-column table with declared types and constraints, see
+[`multi-column-table.sql`](../examples/multi-column-table.sql), or
+[`employees-1000.sql`](../examples/employees-1000.sql) for 1,000 rows in sixteen
+bounded INSERT statements. Online CREATE and restart persistence are covered
+by the three-node PostgreSQL process test. Extra fields in `documents` are not
+declared columns, and discovery does not scan rows to infer them. Declared types
+and NOT NULL constraints are enforced, but projected cells still use the
+existing JSON wire type rather than claiming native PostgreSQL scalar typing.
+
+JSON object field access accepts constant non-numeric keys:
+
+```sql
+SELECT * FROM documents WHERE "$doc"->>'city' = 'Lisbon';
+SELECT id, documents."$doc"->>'city' AS city FROM documents;
+SELECT * FROM documents WHERE "$doc"->>'city' IS NOT NULL;
+SELECT "$doc"->'address'->>'city' AS city FROM documents;
+```
+
+`->>` returns text; missing paths and JSON null return SQL NULL. A bare text
+expression is not a WHERE condition: supply a comparison or IS [NOT] NULL.
+Accessors use compiled native paths, not whole-document JSON reparsing. Equality
+against text that cannot represent a non-string JSON value (such as `'Lisbon'`)
+lowers to the ordinary field predicate, preserving indexing and distribution.
+Ambiguous values such as `'92'` retain text conversion so both JSON `92` and
+JSON `"92"` match. Prepared execution is allocation-free once warmed in the
+query-engine regression; network and storage still have costs. Dynamic or numeric
+keys, array indexes, arbitrary JSON expressions, and further access after `->>`
+are not supported.
+An intermediate array is rejected at execution rather than silently using JSON
+Pointer's array-index coercion. This is bounded object access, not full PostgreSQL
+JSON-operator parity.
 
 Keep GoLand's console in **Auto** transaction mode. INSERT supports whole JSON
 documents or flat column/value tuples, including multiple rows. UPDATE replaces
@@ -44,10 +80,16 @@ same gateway planner supports targeted and bounded scatter reads when the
 catalog contains multiple data shards. Reads go to each group's current leader;
 replicas are not interchangeable load-balanced read targets.
 
-Automatic GoLand synchronization is disabled: table discovery is supported,
-but complete PostgreSQL system-catalog/column/index introspection is not.
-The exact PostgreSQL JDBC 42.7.3 public-table discovery request is covered by
-a regression, alongside the existing psql catalog shims.
+GoLand 2026.2 synchronization supports the current database's `public` schema:
+tables, declared columns, whole-document projection, keys, and exact indexes.
+Use the normal PostgreSQL driver and select only `public`. Full, fragment, and
+incremental-form requests are recognized; without PostgreSQL XIDs, refreshes
+return bounded full snapshots. PostgreSQL-only objects remain absent.
+`public.documents` and `documents` address the same table. This does not add
+general PostgreSQL SQL support or lift the write restrictions above. The
+console supports the documented DML; arbitrary data-grid-generated field
+UPDATEs are not supported. See `integration/jdbc/README.md` for the live-driver
+discovery and isolated CRUD gate.
 
 ## Ownership boundaries
 
@@ -97,9 +139,29 @@ memory and charges the shared native frame admission budget. PostgreSQL row
 materialization has an additional retained-memory preflight. These finite
 bounds are not a claim of allocation-free or zero-cost distributed execution.
 
-Writes use one serialized issuer lane for this local-development endpoint and
-a checksummed, fsynced outbox beside the catalog-session journal (`.pg-writes`).
-It retains at most one request and its terminal ACK, with a 4 MiB record limit.
+Writes use a serialized issuer lane per table (at most 64) and checksummed,
+fsynced outboxes beside the catalog-session journal. The original `.pg-writes`
+outbox retains its identity and pending request; additional tables use the
+`.pg-writes.tables` directory. A pending write blocks subsequent writes to its
+own table, not unrelated tables. Every retained outbox is reopened and recovered
+at startup, including when no client reconnects to that table.
+
+New internal route and execution coordination sessions use narrowly authorized,
+class-scoped identities. Exact release reclaims their binding and retry ring;
+route-session result sidecars are reclaimed in the same atomic transition.
+Ordinary client identities retain their permanent authority fences. The active
+session limit is unchanged, while retained legacy bindings and active scoped
+bindings have separate bounded namespaces. Regression coverage includes a full
+legacy binding budget, concurrent scoped sessions, and reopen after release.
+Retained legacy command bytes and execution-session journals remain legacy;
+pending requests must be resolved under their original identities, never by
+deleting an outbox or inventing a new request identity. This introduces new
+replicated command classes: upgrade all replica binaries before enabling the
+new gateway; mixed-version rolling upgrades and downgrade after new-class writes
+are not supported. Released physical route-pin records still require the
+existing authorized compaction protocol; session cleanup is not pin compaction.
+
+Each outbox retains at most one request and its terminal ACK, with a 4 MiB record limit.
 The issuer identity and exact SQL/parameter bytes are durable before admission.
 Recovery replays the retained ledger result before replanning; terminal ACK
 cleanup never executes the SQL again. Unknown outcomes return SQLSTATE 40003;

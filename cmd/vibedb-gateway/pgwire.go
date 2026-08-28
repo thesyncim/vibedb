@@ -10,18 +10,22 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-func startGatewayPostgreSQL(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, write func(context.Context, serviceauthz.Authority, gateway.Query) (*gateway.Result, error), logf func(string, ...any)) (*pgwire.Server, error) {
+func startGatewayPostgreSQL(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, write func(context.Context, serviceauthz.Authority, gateway.Query) (*gateway.Result, error), logf func(string, ...any), ddl ...func(context.Context, serviceauthz.Authority, string) error) (*pgwire.Server, error) {
 	if err := requireLoopbackListen(address); err != nil {
 		return nil, err
 	}
-	server, err := pgwire.NewServerWithBackend(&gateway.PostgreSQLBackend{
+	backend := &gateway.PostgreSQLBackend{
 		Executor: executor, Write: write, Authorize: func(identity pgwire.SessionIdentity) (serviceauthz.Authority, error) {
 			if identity.User != "local" || identity.Database != "vibedb" {
 				return serviceauthz.Authority{}, gateway.ErrReplicatedUnauthorized
 			}
 			return authority, nil
 		},
-	}, pgwire.Options{Auth: pgwire.Trust(), Database: "vibedb", MaxConnections: 16, MaxResultRows: 100000, MaxResultBytes: shardservice.MaxReplicatedSQLResultBytes})
+	}
+	if len(ddl) == 1 {
+		backend.DDL = ddl[0]
+	}
+	server, err := pgwire.NewServerWithBackend(backend, pgwire.Options{Auth: pgwire.Trust(), Database: "vibedb", MaxConnections: 16, MaxResultRows: 100000, MaxResultBytes: shardservice.MaxReplicatedSQLResultBytes})
 	if err != nil {
 		return nil, err
 	}

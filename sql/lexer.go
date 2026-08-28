@@ -116,6 +116,12 @@ func (lx *lexer) next() token {
 	case '+':
 		return token{kind: tokPlus, pos: start}
 	case '-':
+		if lx.accept('>') {
+			if lx.accept('>') {
+				return token{kind: tokJSONText, pos: start}
+			}
+			return token{kind: tokJSONArrow, pos: start}
+		}
 		return token{kind: tokMinus, pos: start}
 	case '/':
 		return token{kind: tokSlash, pos: start}

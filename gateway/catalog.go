@@ -108,6 +108,7 @@ type Snapshot struct {
 	replicatedShards               []replicatedCatalogShard
 	replicatedReplicas             []ReplicatedEndpoint
 	replicatedTables               []replicatedCatalogTable
+	replicatedTableDeclarations    []replicatedTableDeclaration
 	durableRequestLedgerTopology   *DurableRequestLedgerTopology
 	indexLineage                   []plannerIndexLineageRef
 	shardLineage                   []plannerShardLineageRef
@@ -1153,6 +1154,13 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	pc.Statistics = s.statistics.Descriptors()
 	pc.ReplicatedShards = persistedReplicatedDescriptors(s.replicatedDescriptors())
 	pc.ReplicatedTables = persistedReplicatedTableProfiles(s.replicatedTableProfiles())
+	for i := range pc.ReplicatedTables {
+		for _, declaration := range s.replicatedTableDeclarations {
+			if pc.ReplicatedTables[i].Table == declaration.declaration.Table {
+				pc.ReplicatedTables[i].CreateTable = declaration.declaration.CreateTable
+			}
+		}
+	}
 	pc.RequestLedger = persistedDurableRequestLedgerTopologyFromSnapshot(s)
 	for _, m := range s.config.Manifests {
 		pm := persistedManifest{Distribution: string(m.Distribution()), Version: uint64(m.Version())}
@@ -1526,6 +1534,7 @@ func decodeSnapshotBytes(raw []byte) (*Snapshot, error) {
 	}
 	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
 		config, endpoints, pc.Generation, indexes, statistics, replicated, replicatedTables,
+		pc.replicatedTableDeclarations(),
 	)
 	if err != nil {
 		return nil, err
