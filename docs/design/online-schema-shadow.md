@@ -42,9 +42,26 @@ copy is reused across reopening. Corrupt journals, mismatched operations/SQL,
 changed source catalogs, aborted capture, and before-witness mismatches fail
 the build without modifying serving data.
 
-The immutable target-certification path refuses retained mutable shadows.
+The ordinary target-certification path refuses retained mutable shadows.
+`PreflightReplicatedSchemaTarget` can instead audit a ready shadow under its
+exclusive shard-local DDL lock. It binds the exact source catalog and applied
+cut, capture cursor, and opaque durable identities of the opened target files.
+The returned handle owns those files until `Close`; it holds no source write
+lock. Source writes can continue, but any advance makes the handle stale.
+
+After acquiring the distributed write fence, the coordinator can call the
+handle's `Prepare`. It rechecks the source cut and target identities and
+prepares checkpoint membership without reopening or rescanning target rows.
+A stale handle must be closed before catch-up and a fresh audit. Preparation
+still performs checkpoint/journal and metadata I/O: it is not a zero-cost or
+zero-pause operation. Continuous writes can invalidate each audit, so this
+primitive alone does not guarantee cutover progress under sustained load.
+
 Prepared target files cannot be removed or replayed into. A caught-up cursor
-is only historical evidence; it does not establish a current write fence.
+or audited handle is only historical evidence; neither establishes a current
+distributed write fence. After process replacement the target must be audited
+again outside that fence. The activation/reopen path still has full-image work
+and is not yet an end-to-end bounded online cutover.
 
 ## Costs and remaining work
 
