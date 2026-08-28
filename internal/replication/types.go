@@ -135,6 +135,17 @@ func RouteAuthorityDigest(authority RouteAuthority) Digest {
 	return Digest(sha256.Sum256(value))
 }
 
+// MembershipStableRouteAuthorityDigest domain-separates a route digest whose
+// membership coordinate has been normalized to zero. Only explicitly stable
+// data commands use this identity; legacy transaction witnesses stay exact.
+func MembershipStableRouteAuthorityDigest(normalized Digest) Digest {
+	const domain = "vibedb/replication/membership-stable-route/1\x00"
+	var raw [len(domain) + sha256.Size]byte
+	copy(raw[:], domain)
+	copy(raw[len(domain):], normalized[:])
+	return Digest(sha256.Sum256(raw[:]))
+}
+
 // RetryHome is the stable, fixed-width keyspace point that owns completion
 // state across route changes and range movement. Zero is a valid keyspace point.
 type RetryHome [8]byte

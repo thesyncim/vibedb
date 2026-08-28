@@ -173,6 +173,11 @@ func bindTypedExecutionPin(
 	route ReplicatedRoute,
 ) (DurableRequestTypedExecutionContext, executionpin.Command) {
 	t.Helper()
+	// Runner fixtures customize wave counts and terminal cursors before
+	// binding. Seal those changes instead of retaining a stale protocol hash.
+	if !validDurableRequestProtocolProgram(execution.Recipe.Contract) {
+		execution.Recipe.Contract.ProtocolProgramDigest = durableRequestProtocolProgramDigest(execution.Recipe.Contract)
+	}
 	execution.Home.route = cloneDurableRequestRoute(route)
 	binding, err := BuildDurableRequestExecutionPinBinding(execution)
 	if err != nil {
@@ -183,6 +188,7 @@ func bindTypedExecutionPin(
 		t.Fatal(err)
 	}
 	execution.Recipe.Contract.PinDigest = replication.Digest(bindingDigest)
+	execution.Recipe.Contract.TerminalContractDigest = durableRequestTerminalContractDigest(execution.Recipe.Contract)
 	release := terminalAuthorityRelease(t, execution)
 	acquire := executionpin.AcquireCertificate{
 		PinID: release.PinID, Binding: release.Binding, AuthorityDigest: executionpin.Digest{4},

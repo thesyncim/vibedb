@@ -82,7 +82,7 @@ func (executor *ReplicatedExecutor) ReadTransactionRecovery(
 			preferred = 0
 			continue
 		}
-		if response.State.Fence.Command != route.Command {
+		if !replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			if validReplicatedReadRefusal(response, shardservice.ReplicatedRefusalStaleFence) {
 				return ReplicatedTransactionRecoveryResult{},

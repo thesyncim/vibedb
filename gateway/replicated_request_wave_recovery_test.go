@@ -131,8 +131,8 @@ func TestDurableRequestDistributedRunnerResumesPreAdvanceRoute(t *testing.T) {
 				t.Fatal(err)
 			}
 			execution := typedExecutionFixture(t)
-			execution, _ = bindTypedExecutionPin(t, execution, route)
 			execution.Recipe.Contract.CommitFinalWaveCount, execution.Recipe.Contract.AbortFinalWaveCount = 8, 11
+			execution, _ = bindTypedExecutionPin(t, execution, route)
 			_, err = outer.RunTyped(t.Context(), execution)
 			if !errors.Is(err, errDynamicPayloadFault) || waves.advancedCalls != 0 || waves.normalCalls != 1 {
 				t.Fatalf("advanced=%d normal=%d err=%v", waves.advancedCalls, waves.normalCalls, err)

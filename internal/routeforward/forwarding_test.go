@@ -51,9 +51,13 @@ func testTarget(seed byte) TargetRoute {
 }
 
 func testExactCommand(t testing.TB, old RouteAuthority) []byte {
+	return testExactCommandAuthority(t, old, replication.CommandAuthorityData)
+}
+
+func testExactCommandAuthority(t testing.TB, old RouteAuthority, class replication.CommandAuthorityClass) []byte {
 	t.Helper()
 	command := replication.Command{
-		Kind: replication.CommandMutationBatch, AuthorityClass: replication.CommandAuthorityData,
+		Kind: replication.CommandMutationBatch, AuthorityClass: class,
 		ClusterID:             replication.ID128(old.Group.ClusterID),
 		ClusterIncarnation:    replication.ID128(old.Group.ClusterIncarnation),
 		TopologyRecoveryEpoch: old.Group.TopologyRecoveryEpoch,
@@ -81,6 +85,22 @@ func testExactCommand(t testing.TB, old RouteAuthority) []byte {
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+func TestMembershipStableForwardingRetainsExactSourceAuthority(t *testing.T) {
+	entry, legacy := testEntry(t, TopologySplit, 2)
+	exact := testExactCommandAuthority(t, entry.Old, replication.CommandAuthorityMembershipStableData)
+	stable, err := BuildEntry(exact, entry.Kind, entry.Old, entry.PlanDigest, entry.Target, entry.Validity)
+	if err != nil || stable.CommandDigest == entry.CommandDigest || bytes.Equal(exact, legacy) {
+		t.Fatalf("stable command must have distinct, valid forwarding identity: %v", err)
+	}
+	// Forwarding certifies an exact old command, not a current serving fence.
+	// Stable membership must not loosen the certificate's source identity.
+	old := entry.Old
+	old.Command.ReplicaSetVersion++
+	if _, err = BuildEntry(exact, entry.Kind, old, entry.PlanDigest, entry.Target, entry.Validity); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("changed source membership accepted: %v", err)
+	}
 }
 
 func testEntry(t testing.TB, kind TopologyKind, targetSeed byte) (Entry, []byte) {

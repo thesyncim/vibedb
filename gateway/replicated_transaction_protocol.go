@@ -32,8 +32,9 @@ type ReplicatedTransactionResult struct {
 }
 
 type replicatedTransactionCommandEncoder struct {
-	tenant         []byte
-	controlScratch []byte
+	tenant           []byte
+	controlScratch   []byte
+	membershipStable bool
 }
 
 // replicatedTransactionRetainedControlBytes keeps the ordinary transaction
@@ -74,6 +75,9 @@ func (encoder *replicatedTransactionCommandEncoder) appendExact(
 		uint64(control.Role), sequence,
 	)
 	command.Kind = replication.CommandTransaction
+	if encoder.membershipStable {
+		command.AuthorityClass = replication.CommandAuthorityMembershipStableData
+	}
 	command.Transaction = controlBytes
 	command.Batches = batches
 	command.Fingerprint = nativeCommandFingerprint(command)
@@ -132,6 +136,19 @@ func replicatedTransactionCommandHeader(
 
 func replicatedRouteAuthorityWitness(route ReplicatedRoute) distributedtxn.AuthorityWitness {
 	digest := replicatedRouteAuthorityDigest(route)
+	var witness distributedtxn.AuthorityWitness
+	copy(witness[:], digest[:])
+	return witness
+}
+
+func replicatedTransactionRouteAuthorityWitness(route ReplicatedRoute, stableMembership bool) distributedtxn.AuthorityWitness {
+	if !stableMembership {
+		return replicatedRouteAuthorityWitness(route)
+	}
+	// Normalize only membership. All logical authority, including the exact
+	// schema/manifest and ownership generation, remains in the witness.
+	route.Command.ReplicaSetVersion = 0
+	digest := replication.MembershipStableRouteAuthorityDigest(replicatedRouteAuthorityDigest(route))
 	var witness distributedtxn.AuthorityWitness
 	copy(witness[:], digest[:])
 	return witness

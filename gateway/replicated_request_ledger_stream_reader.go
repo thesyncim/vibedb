@@ -278,7 +278,7 @@ func validDurableRequestStreamFixedContract(reader durableRequestRecipeStreamRea
 	}
 	return contract.RetryHomeDerivationDigest == durableRequestRetryHomeContractDigest(program) &&
 		contract.ClockContractDigest == durableRequestClockContractDigest(program) &&
-		contract.ProtocolProgramDigest == durableRequestProtocolProgramDigest(contract) &&
+		validDurableRequestProtocolProgram(contract) &&
 		contract.TerminalContractDigest == durableRequestTerminalContractDigest(contract)
 }
 

@@ -19,6 +19,7 @@ type transactionRecoveryReadClient struct {
 	operation  shardservice.ReplicatedOperation
 	capability serviceauthz.Capability
 	member     uint64
+	fence      shardservice.ReplicatedFence
 }
 
 func (client *transactionRecoveryReadClient) DoReplicated(
@@ -34,11 +35,67 @@ func (client *transactionRecoveryReadClient) DoReplicated(
 	}
 	client.operation, client.capability, client.member =
 		request.Operation, request.Capability, endpoint.Member
+	client.fence = request.Fence
 	return &shardservice.ReplicatedResponse{
 		Kind:     shardservice.ReplicatedTransactionReadResult,
 		HasState: true, State: state, ReadApplied: state.Applied,
 		Value: client.value,
 	}, nil
+}
+
+func TestMembershipStableTransactionRecoveryRetainsLogicalAndServingFences(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		stable  bool
+		mutate  func(*shardservice.ReplicatedMemberState)
+		allowed bool
+	}{
+		{"legacy-membership", false, func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.ReplicaSetVersion++ }, false},
+		{"stable-membership", true, func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.ReplicaSetVersion++ }, true},
+		{"schema", true, func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.SchemaGeneration++ }, false},
+		{"ownership", true, func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.OwnershipEpoch++ }, false},
+		{"protection", true, func(s *shardservice.ReplicatedMemberState) { s.Fence.Command.ProtectionEpoch++ }, false},
+		{"allocation", true, func(s *shardservice.ReplicatedMemberState) { s.Fence.AllocationGeneration++ }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			route, _, states := testReplicatedRouteCommand(t)
+			route.membershipStable = test.stable
+			for address, state := range states {
+				state.Commit, state.Applied, state.CheckpointApplied = 11, 11, 10
+				test.mutate(&state)
+				states[address] = state
+			}
+			record := replicatedTransactionParticipantRecord()
+			value, err := shardservice.AppendReplicatedTransactionReadValue(nil, shardservice.ReplicatedTransactionReadValue{
+				Kind: shardservice.ReplicatedTransactionLookupParticipant, Complete: true,
+				Records: []replicatedstate.TransactionRecoveryRecord{record},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &transactionRecoveryReadClient{states: states, value: value}
+			executor, err := NewReplicatedExecutor(client, 1, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := executor.ReadTransactionRecovery(t.Context(), route, replicatedstate.TransactionRecoveryReadRequest{
+				Kind: replicatedstate.TransactionRecoveryLookupParticipant, ID: record.ID, MinimumApplied: 10,
+				MaxRows: 1, MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
+			})
+			if !test.allowed {
+				if err == nil {
+					t.Fatal("changed authority accepted")
+				}
+				return
+			}
+			if err != nil || !result.Complete || len(result.Records) != 1 || !reflect.DeepEqual(result.Records[0], record) {
+				t.Fatalf("recovery=%+v err=%v", result, err)
+			}
+			if client.member != 2 || client.fence != states["m2"].Fence {
+				t.Fatal("read did not bind the current leader's exact physical serving fence")
+			}
+		})
+	}
 }
 
 func TestReplicatedExecutorTransactionRecoveryIsLeaderOnlyAndCanonical(t *testing.T) {

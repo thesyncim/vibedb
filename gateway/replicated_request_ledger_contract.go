@@ -33,6 +33,7 @@ const (
 func SealDurableRequestLogicalProgram(
 	program DurableRequestLogicalProgram,
 ) (DurableRequestLogicalProgram, error) {
+	stableMembership := durableRequestMembershipStableProgram(program.Contract)
 	expectedTransaction := durableRequestTransactionID(program.KeyDigest, program.RequestDigest)
 	if program.Identity.ID != (distributedtxn.ID{}) && program.Identity.ID != expectedTransaction {
 		return DurableRequestLogicalProgram{}, ErrDurableRequestConflict
@@ -86,6 +87,9 @@ func SealDurableRequestLogicalProgram(
 	contract.SchemaManifestDigest = durableRequestSchemaManifestDigest(program.Participants)
 	contract.LineageForwardingDigest = durableRequestLineageForwardingDigest(program.Participants)
 	contract.ProtocolProgramDigest = durableRequestProtocolProgramDigest(*contract)
+	if stableMembership {
+		contract.ProtocolProgramDigest = durableRequestMembershipStableProgramDigest(*contract)
+	}
 	contract.TerminalContractDigest = durableRequestTerminalContractDigest(*contract)
 	if !validDurableRequestLogicalProgram(program) {
 		return DurableRequestLogicalProgram{}, ErrDurableRequestConflict
@@ -143,7 +147,7 @@ func validDurableRequestLogicalProgram(program DurableRequestLogicalProgram) boo
 		contract.SchemaManifestDigest != durableRequestSchemaManifestDigest(program.Participants) ||
 		contract.LineageForwardingDigest != durableRequestLineageForwardingDigest(program.Participants) ||
 		contract.ResultGrammarDigest != durableRequestResultGrammarDigest() ||
-		contract.ProtocolProgramDigest != durableRequestProtocolProgramDigest(contract) ||
+		!validDurableRequestProtocolProgram(contract) ||
 		contract.TerminalContractDigest != durableRequestTerminalContractDigest(contract) {
 		return false
 	}
@@ -340,6 +344,27 @@ func durableRequestProtocolProgramDigest(contract DurableRequestExecutionContrac
 	writeDurableRequestU64(hash, &scratch, contract.PlanningLeaseSpan)
 	writeDurableRequestU64(hash, &scratch, contract.PlanningLeaseGeneration)
 	return sumDurableRequestDigest(hash)
+}
+
+// The command mode is sealed in the existing program digest: no new plan
+// fields or larger per-request records are needed. Legacy digests remain
+// valid and continue to select legacy command bytes during recovery.
+func durableRequestMembershipStableProgramDigest(contract DurableRequestExecutionContract) replication.Digest {
+	const domain = "vibedb/durable-request/membership-stable-program/1\x00"
+	base := durableRequestProtocolProgramDigest(contract)
+	var raw [len(domain) + sha256.Size]byte
+	copy(raw[:], domain)
+	copy(raw[len(domain):], base[:])
+	return replication.Digest(sha256.Sum256(raw[:]))
+}
+
+func durableRequestMembershipStableProgram(contract DurableRequestExecutionContract) bool {
+	return contract.ProtocolProgramDigest == durableRequestMembershipStableProgramDigest(contract)
+}
+
+func validDurableRequestProtocolProgram(contract DurableRequestExecutionContract) bool {
+	return contract.ProtocolProgramDigest == durableRequestProtocolProgramDigest(contract) ||
+		durableRequestMembershipStableProgram(contract)
 }
 
 func durableRequestTerminalContractDigest(contract DurableRequestExecutionContract) replication.Digest {
