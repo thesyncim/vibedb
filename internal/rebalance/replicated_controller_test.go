@@ -158,6 +158,29 @@ func TestReplicatedMovePlannedRefreshRejectsUntrustedObservation(t *testing.T) {
 	}
 }
 
+func TestReplicatedMovePlannedLeaderWaitResumesAfterElection(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	status := leaderStatus(1, 5)
+	status.LeaderID = 0
+	observer := &fixedMoveObserver{cut: ReplicatedMoveCut{Observation: Observation{
+		Catalog: catalog, Publication: raftmodel.Publication{Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf},
+		LeaderStatus: status,
+	}}}
+	record, err := PrepareReplicatedMoveRecord(t.Context(), plan, observer)
+	if err != nil || ActionKind(record.Cursor[0]) != ActionAwaitLeader {
+		t.Fatalf("prepare leader wait: cursor=%v err=%v", record.Cursor, err)
+	}
+	journal := &memoryMoveJournal{record: record, present: true}
+	observer.cut.LeaderStatus = leaderStatus(1, 6)
+	observer.cut.LeaderStatus.Term++
+	observer.cut.Publication.Applied = 6
+	executor := &moveActionExecutor{journal: journal}
+	action, err := ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor)
+	if err != nil || action.Kind != ActionAddLearner || len(executor.calls) != 1 {
+		t.Fatalf("election stranded unexecuted wait: action=%+v calls=%d err=%v", action, len(executor.calls), err)
+	}
+}
+
 func (observer *fixedMoveObserver) ObserveReplicaMove(
 	_ context.Context, _ OperationID, _ gateway.ReplicatedOperationRecord, _ *Plan,
 ) (ReplicatedMoveCut, error) {

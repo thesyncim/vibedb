@@ -1253,6 +1253,21 @@ func (authority *ReplicatedCatalogAuthority) SubmitOperation(
 func (authority *ReplicatedCatalogAuthority) SubmitOperations(
 	ctx context.Context, records []ReplicatedOperationRecord,
 ) error {
+	return authority.submitOperations(ctx, records, nil, false)
+}
+
+// SubmitOperationsIfDirectory admits records only against the directory used
+// to check for overlapping work. The directory CAS also fences concurrent
+// admissions between that check and replicated application.
+func (authority *ReplicatedCatalogAuthority) SubmitOperationsIfDirectory(
+	ctx context.Context, records []ReplicatedOperationRecord, expected [][32]byte,
+) error {
+	return authority.submitOperations(ctx, records, expected, true)
+}
+
+func (authority *ReplicatedCatalogAuthority) submitOperations(
+	ctx context.Context, records []ReplicatedOperationRecord, expected [][32]byte, checkDirectory bool,
+) error {
 	if authority == nil || authority.session == nil || ctx == nil || len(records) == 0 ||
 		len(records) > maxReplicatedOperations {
 		return ErrReplicatedCatalog
@@ -1297,6 +1312,9 @@ func (authority *ReplicatedCatalogAuthority) SubmitOperations(
 		if err != nil {
 			return err
 		}
+	}
+	if checkDirectory && !slices.Equal(ids, expected) {
+		return ErrReplicatedCatalogConflict
 	}
 	for _, record := range ordered {
 		position := 0

@@ -35,7 +35,7 @@ type ReplicatedOperationJournal interface {
 // records into the catalog RF3 work directory. Execution remains a per-group
 // saga; only admission is cross-group atomic.
 type ReplicatedOperationSetJournal interface {
-	SubmitOperations(context.Context, []gateway.ReplicatedOperationRecord) error
+	SubmitOperationsIfDirectory(context.Context, []gateway.ReplicatedOperationRecord, [][32]byte) error
 }
 
 // ReplicatedMoveCut is one detached observation. SnapshotBase is the verified
@@ -166,7 +166,7 @@ func ExecuteReplicatedMoveStep(
 		if action.Kind != ActionComplete || !replicaMoveRecordMatches(
 			record, operation, plan, cut, action, replicaMoveCursorApplied,
 		) {
-			return Action{}, ErrReplicatedMove
+			return Action{}, fmt.Errorf("%w: completed record differs from current action %d", ErrReplicatedMove, action.Kind)
 		}
 		if err = settleReplicaMoveDelete(ctx, journal, record); err != nil {
 			return Action{}, err
@@ -187,7 +187,7 @@ func ExecuteReplicatedMoveStep(
 			record.Cursor[4] != cut.Publication.ReplicaSetVersion ||
 			record.Cursor[5] > cut.Publication.Applied || record.Cursor[6] > cut.LeaderStatus.Term ||
 			record.Proof != replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor) {
-			return Action{}, ErrReplicatedMove
+			return Action{}, fmt.Errorf("%w: snapshot witness cursor=%v catalog=%d/%d publication=%d/%d term=%d", ErrReplicatedMove, record.Cursor, record.CatalogGeneration, cut.Catalog.Generation(), cut.Publication.ReplicaSetVersion, cut.Publication.Applied, cut.LeaderStatus.Term)
 		}
 		cut.Publication.Applied = record.Cursor[5]
 		cut.LeaderStatus.Term = record.Cursor[6]
@@ -201,7 +201,7 @@ func ExecuteReplicatedMoveStep(
 		operation, record.IntentDigest, plan.baseDigest, currentCursor,
 	)
 	if record.Cursor == currentCursor && record.Proof != currentProof {
-		return Action{}, ErrReplicatedMove
+		return Action{}, fmt.Errorf("%w: action witness digest differs at cursor %v", ErrReplicatedMove, record.Cursor)
 	}
 	if record.Cursor != currentCursor || record.Proof != currentProof {
 		if record.State == gateway.ReplicatedOperationRunning &&
@@ -211,18 +211,20 @@ func ExecuteReplicatedMoveStep(
 		}
 		// Atomic set admission can itself advance the catalog RF3 log. A
 		// still-planned action has never been dispatched, so its observation
-		// may advance at the same exact action/placement cut. Verify the old
+		// may advance at the same placement cut. A passive wait can also be
+		// satisfied while the controller is down (election/catchup/drain).
+		// Reconcile has authenticated its successor above. Verify the old
 		// witness before publishing the replacement; an executing action must
 		// retain its original external idempotency tuple instead.
 		refreshPlanned := record.State == gateway.ReplicatedOperationPlanned &&
 			record.Cursor[3] == replicaMoveCursorReady &&
-			sameReplicaMoveAction(record.Cursor, wanted) &&
+			(sameReplicaMoveAction(record.Cursor, wanted) || passiveReplicaMoveAction(ActionKind(record.Cursor[0]))) &&
 			record.CatalogGeneration == cut.Catalog.Generation() &&
 			record.Cursor[4] == cut.Publication.ReplicaSetVersion &&
 			record.Cursor[5] <= cut.Publication.Applied && record.Cursor[6] <= cut.LeaderStatus.Term &&
 			record.Proof == replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor)
 		if record.State != gateway.ReplicatedOperationRunning && !refreshPlanned {
-			return Action{}, ErrReplicatedMove
+			return Action{}, fmt.Errorf("%w: cannot refresh planned action: state=%d cursor=%v wanted=%v catalog=%d/%d", ErrReplicatedMove, record.State, record.Cursor, wanted, record.CatalogGeneration, cut.Catalog.Generation())
 		}
 		next := record
 		next.State = gateway.ReplicatedOperationPlanned
@@ -383,6 +385,15 @@ func replicaMoveActionCursor(
 
 func sameReplicaMoveAction(left, right [8]uint64) bool {
 	return left[0] == right[0] && left[1] == right[1] && left[2] == right[2]
+}
+
+func passiveReplicaMoveAction(kind ActionKind) bool {
+	switch kind {
+	case ActionAwaitLeader, ActionAwaitSnapshotInstall, ActionAwaitCatchUp, ActionAwaitCatalogDrain:
+		return true
+	default:
+		return false
+	}
 }
 
 func replicaMoveActionProof(

@@ -82,6 +82,42 @@ func (controller *Controller) SubmitSet(
 	if !ok {
 		return nil, ErrControllerConfig
 	}
+	ids, err := controller.directory.ReadOperationIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index, plan := range plans {
+		if plan == nil {
+			return nil, ErrControllerConfig
+		}
+		for _, prior := range plans[:index] {
+			if prior.Group() == plan.Group() {
+				return nil, ErrControllerConfig
+			}
+		}
+	}
+	for _, id := range ids {
+		record, readErr := controller.directory.ReadOperation(ctx, id)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if record.Kind != gateway.ReplicatedOperationMove || record.State == gateway.ReplicatedOperationCancelled {
+			continue
+		}
+		identity, inspectErr := rebalance.InspectReplicaMoveIntent(record.Intent)
+		if inspectErr != nil {
+			return nil, inspectErr
+		}
+		for _, plan := range plans {
+			if identity.Request.Group == plan.Group() &&
+				(record.State != gateway.ReplicatedOperationComplete || identity.SourceGeneration == plan.CatalogGeneration()) {
+				// A newer failure certificate can assign a different operation ID
+				// to the same physical replacement. RunPass must resume the original
+				// immutable intent; never admit a competing saga for that group.
+				return nil, ErrAwaitMoveSet
+			}
+		}
+	}
 	records := make([]gateway.ReplicatedOperationRecord, len(plans))
 	for index, plan := range plans {
 		if plan == nil {
@@ -93,7 +129,7 @@ func (controller *Controller) SubmitSet(
 		}
 		records[index] = record
 	}
-	if err := journal.SubmitOperations(ctx, records); err != nil {
+	if err := journal.SubmitOperationsIfDirectory(ctx, records, ids); err != nil {
 		if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
 			return nil, err
 		}

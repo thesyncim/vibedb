@@ -3,6 +3,7 @@ package rebalanceexec
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 
@@ -85,6 +86,57 @@ func (journal *moveControllerJournal) DeleteOperation(
 }
 
 func (*moveControllerJournal) RetryPending(context.Context) error { return nil }
+
+func (journal *moveControllerJournal) SubmitOperationsIfDirectory(
+	ctx context.Context, records []gateway.ReplicatedOperationRecord, expected [][32]byte,
+) error {
+	if !slices.Equal(journal.ids(), expected) {
+		return gateway.ErrReplicatedCatalogConflict
+	}
+	for _, record := range records {
+		if err := journal.SubmitOperation(ctx, record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestControllerSubmitSetRefusesSecondOperationForMovingGroup(t *testing.T) {
+	plan, fixture := newExecutorFixture(t)
+	executor, err := New(Options{
+		Routes: fixture, Grants: fixture, Membership: fixture, Snapshots: fixture,
+		Bootstrap: fixture, Awaiter: fixture, Ownership: fixture, Catalog: fixture,
+		Drainer: fixture, Retirer: fixture,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := raftmodel.Publication{Applied: 5, ReplicaSetVersion: 4,
+		ConfState: &pb.ConfState{Voters: []uint64{1, 3, 4}}}
+	observer := &controllerObserver{cut: rebalance.ReplicatedMoveCut{Observation: rebalance.Observation{
+		Catalog: fixture.cut.Catalog, Publication: publication, LeaderStatus: leaderStatusForController(1, 5),
+	}}}
+	journal := &moveControllerJournal{records: make(map[[32]byte]gateway.ReplicatedOperationRecord)}
+	controller, err := NewController(journal, journal, observer, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = controller.SubmitSet(context.Background(), []*rebalance.Plan{plan}); err != nil {
+		t.Fatal(err)
+	}
+	request := plan.Request()
+	request.SnapshotSourceMember = 4
+	newPlan, err := rebalance.PlanReplicaMove(fixture.cut.Catalog, publication, request)
+	if err != nil || newPlan.OperationID() == plan.OperationID() {
+		t.Fatalf("expected distinct replacement intent: %v", err)
+	}
+	if _, err = controller.SubmitSet(context.Background(), []*rebalance.Plan{newPlan}); !errors.Is(err, ErrAwaitMoveSet) {
+		t.Fatalf("overlapping admission: %v", err)
+	}
+	if len(journal.records) != 1 || len(fixture.membershipRequests) != 1 {
+		t.Fatalf("competing replacement admitted: records=%d membership=%d", len(journal.records), len(fixture.membershipRequests))
+	}
+}
 
 func TestControllerDiscoversOnlyMovesAndResumesFromJournal(t *testing.T) {
 	plan, fixture := newExecutorFixture(t)

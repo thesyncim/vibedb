@@ -73,3 +73,27 @@ func TestSubmitOperationsConflictPublishesNoneOfNewMoveSet(t *testing.T) {
 		t.Fatalf("directory after conflict=%x err=%v", ids, err)
 	}
 }
+
+func TestSubmitOperationsFencesStaleOverlapObservation(t *testing.T) {
+	authority, _, _ := newCatalogAuthorityFixture(t)
+	ctx := context.Background()
+	first := testReplicatedOperation(ReplicatedOperationRecord{ID: [32]byte{0x71},
+		Kind: ReplicatedOperationMove, State: ReplicatedOperationPlanned, Revision: 1,
+		CatalogGeneration: 5, Cursor: [8]uint64{1}, Proof: [32]byte{0x81}})
+	second := first
+	second.ID = [32]byte{0x72}
+	// Two controllers both observed an empty directory. Only one may admit
+	// work without rechecking the winner's immutable intents for overlap.
+	if err := authority.SubmitOperationsIfDirectory(ctx, []ReplicatedOperationRecord{first}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.SubmitOperationsIfDirectory(ctx, []ReplicatedOperationRecord{second}, nil); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("stale admission: %v", err)
+	}
+	if _, err := authority.ReadOperation(ctx, second.ID); !errors.Is(err, ErrReplicatedOperationMissing) {
+		t.Fatalf("stale admission exposed record: %v", err)
+	}
+	if err := authority.SubmitOperationsIfDirectory(ctx, []ReplicatedOperationRecord{second}, [][32]byte{first.ID}); err != nil {
+		t.Fatalf("fresh directory admission: %v", err)
+	}
+}
