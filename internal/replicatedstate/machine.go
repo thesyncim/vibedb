@@ -75,7 +75,7 @@ type Machine struct {
 	captureTarget          TransitionCaptureTarget
 	reservedCaptureTarget  TransitionCaptureTarget
 	captureBuffer          []byte
-	captureChanges         []finalMutation
+	captureChanges         []capturedMutation
 	captureKey             [8]byte
 	requestLedgerSteps     [requestledger.MaxPendingWaveSteps]requestledger.StepRef
 
