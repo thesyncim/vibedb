@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/schemachange"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
@@ -71,6 +73,18 @@ func (a *ReplicatedApply) BuildReplicatedSchemaDDLTarget(
 func (a *ReplicatedApply) buildReplicatedSchemaDDLTarget(
 	ctx context.Context, expectedApplied uint64, text string, reserve func(*catalogFile) error,
 ) (result ReplicatedSchemaDDLTarget, resultErr error) {
+	return a.buildReplicatedSchemaDDLImage(ctx, expectedApplied, text, reserve, nil)
+}
+
+type schemaDDLOnlineCopy struct {
+	capture *schemachange.SourceCapture
+	source  []byte
+	cursor  schemachange.Cursor
+}
+
+func (a *ReplicatedApply) buildReplicatedSchemaDDLImage(
+	ctx context.Context, expectedApplied uint64, text string, reserve func(*catalogFile) error, online *schemaDDLOnlineCopy,
+) (result ReplicatedSchemaDDLTarget, resultErr error) {
 	if ctx == nil || expectedApplied == 0 || a == nil || a.database == nil ||
 		len(text) == 0 || len(text) > ReplicatedChildSchemaMaxBytes {
 		return result, ErrReplicatedSchemaCatalogImage
@@ -90,7 +104,7 @@ func (a *ReplicatedApply) buildReplicatedSchemaDDLTarget(
 	if err == nil {
 		err = a.checkActivationBaseLocked()
 	}
-	if err == nil && a.machine.Applied() != expectedApplied {
+	if err == nil && online == nil && a.machine.Applied() != expectedApplied {
 		err = ErrTransactionConflict
 	}
 	var raw []byte
@@ -105,8 +119,14 @@ func (a *ReplicatedApply) buildReplicatedSchemaDDLTarget(
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, cut.Close()) }()
-	if cut.Fence().Applied != expectedApplied {
+	if online == nil && cut.Fence().Applied != expectedApplied {
 		return result, ErrTransactionConflict
+	}
+	if online != nil {
+		online.cursor, err = online.capture.CursorAt(cut.Fence())
+		if err != nil || !bytes.Equal(raw, online.source) {
+			return result, errors.Join(err, ErrTransactionConflict)
+		}
 	}
 	var decoded catalogFileVibe
 	if err := decodeCatalogJSON(raw, &decoded); err != nil {
@@ -196,6 +216,19 @@ func (a *ReplicatedApply) buildReplicatedSchemaDDLTarget(
 	raw, err = appendCatalogJSON(nil, target)
 	if err != nil {
 		return result, err
+	}
+	if online != nil {
+		// A mutable shadow is not a certified rollout target. Its distinct
+		// public receipt carries the snapshot cursor, never a target proof.
+		d, err := online.capture.Descriptor()
+		if err != nil || d.Abort != schemachange.NotAborted {
+			return result, errors.Join(err, ErrTransactionConflict)
+		}
+		file, err := os.Open(directory)
+		if err == nil {
+			err = errors.Join(file.Sync(), file.Close())
+		}
+		return ReplicatedSchemaDDLTarget{Catalog: raw}, err
 	}
 	proof, err := a.CertifyReplicatedSchemaTarget(raw)
 	if err != nil {

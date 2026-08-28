@@ -1,0 +1,57 @@
+# Online schema shadow build and replay
+
+`BuildReplicatedSchemaDDLShadow` and `ReplayReplicatedSchemaDDLShadow` are
+replica-local background build primitives. They are not SQL completion or
+activation APIs. The PostgreSQL coordinator must not expose them as completed
+online DDL until bounded cutover, immutable certification, and cleanup are wired.
+
+## Copy and catch-up
+
+A build first validates its SQL against the current catalog, starts the durable
+capture stream, and pins one immutable data cut. Capture may have started at an
+earlier cut: `SourceCapture.CursorAt` resolves the exact snapshot publication to
+its capture-chain position using at most one retained-record read. It checks
+binding, schema, manifest, term, entry digest, and data-chain digest.
+
+The `.schema-ddl-shadow` journal reserves fresh target storage identities before
+any target files are created. Copying streams bounded row batches outside the
+serving lock. CREATE/DROP INDEX builds new physical indexes using the target
+collection's normal storage machinery. A completed copy records its snapshot
+and replay cursors durably. Neither the serving catalog nor source WAL/session
+identities change.
+
+Replay consumes a caller-bounded number of entries, stopping no later than the
+head observed at call entry. Each relation uses one bounded mutation batch.
+Each target row must match either the authenticated before witness or the exact
+after value from a prior partially completed attempt. Target updates maintain
+the new local indexes. The journal cursor advances only after all relation
+effects of that entry are durable. This ordering allows restart between base
+and global-index commits without losing or duplicating effects.
+
+TRUNCATE builds empty target relations. Catch-up advances the source cursor but
+does not copy intervening writes into those empty targets: all source writes
+before the eventual truncate cut belong to the generation being truncated.
+Activation must still fence and compare that exact cut.
+
+## Recovery and ownership
+
+One nonblocking shard-local file lock serializes build/replay with the offline
+DDL builder. It is not a source write lock. An incomplete copy restarts from a
+fresh captured snapshot, reusing only its reserved, unprepared files. A ready
+copy is reused across reopening. Corrupt journals, mismatched operations/SQL,
+changed source catalogs, aborted capture, and before-witness mismatches fail
+the build without modifying serving data.
+
+The immutable target-certification path refuses retained mutable shadows.
+Prepared target files cannot be removed or replayed into. A caught-up cursor
+is only historical evidence; it does not establish a current write fence.
+
+## Costs and remaining work
+
+Copying is proportional to source rows, and capture/replay is proportional to
+intervening mutations. Replay currently persists one cursor per source entry;
+this is not a zero-cost or measured throughput claim. Source writes retain
+their existing bounded capture-abort behavior when storage/retention budgets
+are exhausted. Target opening and certification costs must remain outside the
+final write fence. Bounded cutover, successful/aborted artifact reclamation,
+and PostgreSQL coordinator integration remain required.

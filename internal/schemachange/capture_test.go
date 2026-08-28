@@ -306,6 +306,55 @@ func TestCaptureExhaustionDoesNotStopWritesOrReopen(t *testing.T) {
 	}
 }
 
+func TestCaptureCursorAtMatchesExactSnapshotAndRejectsForeignCuts(t *testing.T) {
+	f := newCaptureFixture(t, true)
+	c := f.begin(t)
+	d, _ := c.Descriptor()
+	base, err := f.machine.SnapshotAuthorizationFence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.CursorAt(base); err != nil || got != d.Base {
+		t.Fatalf("base cursor=%+v err=%v", got, err)
+	}
+	f.apply(t, 3, f.command(2, singlePut(2)))
+	cut, err := f.machine.SnapshotAuthorizationFence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := c.CursorAt(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.apply(t, 4, f.command(3, singlePut(3)))
+	for _, current := range []*SourceCapture{c, f.reopen(t)} {
+		if got, err := current.CursorAt(cut); err != nil || got != want {
+			t.Fatalf("intermediate snapshot cursor changed: %+v %v", got, err)
+		}
+		var workspace CaptureWorkspace
+		entry, found, err := current.Next(want, &workspace)
+		if err != nil || !found || entry.Before.Applied != 3 || entry.After.Applied != 4 {
+			t.Fatalf("snapshot did not join exact capture suffix: %+v %v", entry, err)
+		}
+		for _, mutate := range []func(*replicatedstate.SnapshotFence){
+			func(f *replicatedstate.SnapshotFence) { f.Applied = 1 },
+			func(f *replicatedstate.SnapshotFence) { f.Applied = 5 },
+			func(f *replicatedstate.SnapshotFence) { f.DataChainDigest[0] ^= 1 },
+			func(f *replicatedstate.SnapshotFence) { f.LastEntryDigest[0] ^= 1 },
+			func(f *replicatedstate.SnapshotFence) { f.LastTerm++ },
+			func(f *replicatedstate.SnapshotFence) { f.RelationManifestDigest[0] ^= 1 },
+			func(f *replicatedstate.SnapshotFence) { f.Binding.SchemaGeneration++ },
+			func(f *replicatedstate.SnapshotFence) { f.Binding.Shard = "foreign" },
+		} {
+			foreign := cut
+			mutate(&foreign)
+			if _, err := current.CursorAt(foreign); err == nil {
+				t.Fatalf("foreign snapshot accepted: %+v", foreign)
+			}
+		}
+	}
+}
+
 func TestCaptureFrozenStorageLimitsAbortBuildNotSource(t *testing.T) {
 	for _, checkpoint := range []bool{false, true} {
 		for _, bound := range []string{"compact_batch", "wide_batch"} {

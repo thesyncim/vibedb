@@ -216,6 +216,11 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	if a == nil || a.database == nil || a.owner == nil {
 		return proof, ErrReplicatedApplyClosed
 	}
+	// Mutable online targets cannot enter the immutable rollout path. The
+	// online coordinator must first freeze/certify them at its exact cut.
+	if err := rejectMutableSchemaShadow(a.database.dataDir); err != nil {
+		return proof, err
+	}
 	targetCatalog, image, err := openReplicatedSchemaCatalogImage(raw)
 	if err != nil {
 		return proof, err

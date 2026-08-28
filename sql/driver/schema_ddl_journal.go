@@ -111,6 +111,9 @@ func (a *ReplicatedApply) BuildJournaledReplicatedSchemaDDLTarget(
 		return ReplicatedSchemaDDLTarget{}, err
 	}
 	defer storeio.UnlockWriter(lock)
+	if err := rejectMutableSchemaShadow(directory); err != nil {
+		return ReplicatedSchemaDDLTarget{}, err
+	}
 	previous, found, err := readSchemaDDLBuildRecord(root)
 	if err != nil {
 		return ReplicatedSchemaDDLTarget{}, err
