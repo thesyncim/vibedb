@@ -340,7 +340,13 @@ func (a *rf3SchemaActivator) Activate(
 			return readErr
 		}
 		command, err = rf3SchemaActivationCommand(request, authorization, persisted, found, func() ([]byte, error) {
-			proof, recoverErr := state.apply.RecoverPreparedReplicatedSchemaTarget(raw, request.Operation)
+			var proof sqldriver.ReplicatedSchemaTargetProof
+			var recoverErr error
+			if state.verified != nil {
+				proof, recoverErr = state.verified.ResumePrepared(ctx, state.apply, raw, request.Operation)
+			} else {
+				proof, recoverErr = state.apply.RecoverPreparedReplicatedSchemaTarget(raw, request.Operation)
+			}
 			if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
 				return nil, errors.Join(recoverErr, schemainstall.ErrConflict)
 			}

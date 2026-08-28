@@ -53,6 +53,106 @@ func TestVerifiedSchemaTargetPreparesThousandRowsWithoutRescanning(t *testing.T)
 	if _, err := verified.Prepare(t.Context(), op); err == nil {
 		t.Fatal("closed image handle authorized preparation")
 	}
+	if recovered, err := verified.ResumePrepared(t.Context(), claim, shadow.Catalog, op); err != nil || recovered != proof {
+		t.Fatalf("closed audit could not resume exact preparation: %v", err)
+	}
+	if _, err := claim.ReplayReplicatedSchemaDDLShadow(t.Context(), op, 1); err == nil {
+		t.Fatal("prepared target was still mutable")
+	}
+}
+
+func TestPreparedSchemaShadowRecoveryAfterSourceReopen(t *testing.T) {
+	path, db, base, applyID, claim := schemaDDLJournalFixture(t)
+	op := [32]byte{128}
+	shadow, err := claim.BuildReplicatedSchemaDDLShadow(t.Context(), op, "CREATE INDEX by_city ON docs (city)", 100, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.RecoverPreparedReplicatedSchemaTarget(shadow.Catalog, op); err == nil {
+		t.Fatal("unprepared mutable shadow recovered as immutable")
+	}
+	v, err := claim.PreflightReplicatedSchemaTarget(t.Context(), shadow.Catalog, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	proof, err := v.Prepare(t.Context(), op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.ResumePrepared(t.Context(), claim, shadow.Catalog, op); err == nil {
+		t.Fatal("open handle admitted closed preparation resume")
+	}
+	if err := errors.Join(v.Close(), claim.Close(), db.Close()); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReplicatedShardStoreWithApply(path, base, applyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	active, _, err := reopened.OpenReplicatedApply(base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	// No process-local audit is supplied: recovery must re-audit the exact
+	// durably prepared shadow, not blanket-refuse the retained build journal.
+	got, err := active.RecoverPreparedReplicatedSchemaTarget(shadow.Catalog, op)
+	if err != nil || got != proof {
+		t.Fatalf("prepared shadow recovery: %v", err)
+	}
+	if _, err := active.RecoverPreparedReplicatedSchemaTarget(shadow.Catalog, [32]byte{129}); err == nil {
+		t.Fatal("foreign operation recovered prepared shadow")
+	}
+	if _, err := v.ResumePrepared(t.Context(), active, shadow.Catalog, [32]byte{129}); err == nil {
+		t.Fatal("foreign operation reused closed audit")
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := v.ResumePrepared(canceled, active, shadow.Catalog, op); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled resume: %v", err)
+	}
+	// Recovery did not move or expose the target, and writes remain fenced
+	// from the prepared image even after process replacement.
+	if _, err := active.ReplayReplicatedSchemaDDLShadow(t.Context(), op, 1); err == nil {
+		t.Fatal("reopened preparation allowed replay")
+	}
+}
+
+func TestPreparedSchemaShadowResumeRejectsAdvancedSourceAndChangedCatalog(t *testing.T) {
+	_, _, _, _, claim := schemaDDLJournalFixture(t)
+	op := [32]byte{130}
+	shadow, err := claim.BuildReplicatedSchemaDDLShadow(t.Context(), op, "CREATE INDEX by_city ON docs (city)", 100, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := claim.PreflightReplicatedSchemaTarget(t.Context(), shadow.Catalog, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	if _, err := v.Prepare(t.Context(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.ResumePrepared(t.Context(), claim, append(shadow.Catalog[:len(shadow.Catalog):len(shadow.Catalog)], ' '), op); err == nil {
+		t.Fatal("changed catalog reused closed audit")
+	}
+	if _, err := (&VerifiedReplicatedSchemaTarget{}).ResumePrepared(t.Context(), claim, shadow.Catalog, op); err == nil {
+		t.Fatal("zero audit supplied a prepared proof")
+	}
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(4), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.ResumePrepared(t.Context(), claim, shadow.Catalog, op); !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("advanced source resumed stale proof: %v", err)
+	}
+	if _, err := claim.RecoverPreparedReplicatedSchemaTarget(shadow.Catalog, op); err == nil {
+		t.Fatal("cold recovery substituted the current source cut")
+	}
 }
 
 func TestVerifiedSchemaTargetRefusesSourceAdvanceAndChangedTarget(t *testing.T) {
@@ -195,6 +295,13 @@ func TestVerifiedSchemaTargetPublishesCapturedShadowAndReopens(t *testing.T) {
 	}
 	defer verified.Close()
 	proof, err := verified.Prepare(t.Context(), op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verified.Close(); err != nil {
+		t.Fatal(err)
+	}
+	proof, err = verified.ResumePrepared(t.Context(), claim, shadow.Catalog, op)
 	if err != nil {
 		t.Fatal(err)
 	}

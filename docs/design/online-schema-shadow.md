@@ -73,9 +73,13 @@ This audit is process-local, contains no open files or row buffers, and does
 not authorize activation by itself. File reopen and full system/session
 validation remain. The RF3 shard installer retains this closed audit after
 staging and uses it during activation; a replacement process without an audit
-uses the existing full-validation recovery path. Command construction can
-still re-audit prepared targets, and the PostgreSQL online coordinator is not
-yet wired. This is not yet an end-to-end bounded online cutover.
+uses the full-validation recovery path. Command construction reuses a closed
+prepared audit through `ResumePrepared`, rechecking its exact source catalog,
+applied cut and durable stage witness without reopening target collections.
+After process replacement, target recovery requires the stage marker before
+re-auditing a retained shadow; unprepared shadows remain ineligible. The stage
+marker prevents further replay into the prepared files. The PostgreSQL online
+coordinator is not yet wired. This is not yet an end-to-end bounded online cutover.
 
 ## Costs and remaining work
 
