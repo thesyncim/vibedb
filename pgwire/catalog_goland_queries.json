@@ -1,0 +1,1428 @@
+[
+  {
+    "name": "ServerStartupTime",
+    "sql": "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time",
+    "columns": [
+      "startup_time"
+    ]
+  },
+  {
+    "name": "IsSuperUser",
+    "sql": "select usesuper\nfrom pg_user\nwhere usename = current_user\n",
+    "columns": [
+      "usesuper"
+    ]
+  },
+  {
+    "name": "ListDatabases",
+    "sql": "select N.oid::bigint as id,\n       datname as name,\n       D.description,\n       datistemplate as is_template,\n       datallowconn as allow_connections,\n       pg_catalog.pg_get_userbyid(N.datdba) as \"owner\"\nfrom pg_catalog.pg_database N\n  left join pg_catalog.pg_shdescription D on N.oid = D.objoid\norder by case when datname = pg_catalog.current_database() then -1::bigint else N.oid::bigint end\n",
+    "columns": [
+      "id",
+      "name",
+      "description",
+      "is_template",
+      "allow_connections",
+      "owner"
+    ]
+  },
+  {
+    "name": "ListExistentLanguages",
+    "sql": "select oid from pg_catalog.pg_language\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "ListLanguages",
+    "sql": "select l.oid as id, l.xmin state_number, lanname as name, lanpltrusted as trusted,\n       h.proname as handler, hs.nspname as handlerSchema,\n       i.proname as inline, isc.nspname as inlineSchema,\n       v.proname as validator, vs.nspname as validatorSchema\nfrom pg_catalog.pg_language l\n    left join pg_catalog.pg_proc h on h.oid = lanplcallfoid\n    left join pg_catalog.pg_namespace hs on hs.oid = h.pronamespace\n    left join pg_catalog.pg_proc i on i.oid = laninline\n    left join pg_catalog.pg_namespace isc on isc.oid = i.pronamespace\n    left join pg_catalog.pg_proc v on v.oid = lanvalidator\n    left join pg_catalog.pg_namespace vs on vs.oid = v.pronamespace\n\norder by lanname\n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "trusted",
+      "handler",
+      "handlerschema",
+      "inline",
+      "inlineschema",
+      "validator",
+      "validatorschema"
+    ]
+  },
+  {
+    "name": "RetrieveExistentEventTriggers",
+    "sql": "select oid from pg_catalog.pg_event_trigger\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveEventTriggers",
+    "sql": "select t.oid as id,\n       t.xmin as state_number,\n       t.evtname as name,\n       t.evtevent as event,\n       t.evtfoid as routine_id,\n       pg_catalog.pg_get_userbyid(t.evtowner) as owner,\n       t.evttags as tags,\n       case when t.evtenabled = 'D' then 1 else 0 end as is_disabled\nfrom pg_catalog.pg_event_trigger t\n\n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "event",
+      "routine_id",
+      "owner",
+      "tags",
+      "is_disabled"
+    ]
+  },
+  {
+    "name": "ListSchemas",
+    "sql": "select N.oid::bigint as id,\n       N.xmin as state_number,\n       nspname as name,\n       D.description,\n       pg_catalog.pg_get_userbyid(N.nspowner) as \"owner\"\nfrom pg_catalog.pg_namespace N\n  left join pg_catalog.pg_description D on N.oid = D.objoid\norder by case when nspname = pg_catalog.current_schema() then -1::bigint else N.oid::bigint end\n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "description",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveRoles",
+    "sql": "select R.oid::bigint as role_id, rolname as role_name,\n  rolsuper is_super, rolinherit is_inherit,\n  rolcreaterole can_createrole, rolcreatedb can_createdb,\n  rolcanlogin can_login,  rolreplication  is_replication,\n  rolconnlimit conn_limit, rolvaliduntil valid_until,\n   rolbypassrls  bypass_rls, rolconfig config,\n  D.description\nfrom pg_catalog.pg_roles R\n  left join pg_catalog.pg_shdescription D on D.objoid = R.oid\n",
+    "columns": [
+      "role_id",
+      "role_name",
+      "is_super",
+      "is_inherit",
+      "can_createrole",
+      "can_createdb",
+      "can_login",
+      "is_replication",
+      "conn_limit",
+      "valid_until",
+      "bypass_rls",
+      "config",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveExistentTablespaces",
+    "sql": "select oid::bigint from pg_catalog.pg_tablespace\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveTablespaces",
+    "sql": "select T.oid::bigint as id, T.spcname as name,\n       T.xmin as state_number, pg_catalog.pg_get_userbyid(T.spcowner) as owner,\n        pg_catalog.pg_tablespace_location(T.oid)  as location,\n        T.spcoptions  as options,\n       D.description as comment\nfrom pg_catalog.pg_tablespace T\n  left join pg_catalog.pg_shdescription D on D.objoid = T.oid\n\n",
+    "columns": [
+      "id",
+      "name",
+      "state_number",
+      "owner",
+      "location",
+      "options",
+      "comment"
+    ]
+  },
+  {
+    "name": "StateNumber",
+    "sql": "select L.transactionid::varchar::bigint as transaction_id\nfrom pg_catalog.pg_locks L\nwhere L.transactionid is not null\norder by pg_catalog.age(L.transactionid) desc\nlimit 1\n",
+    "columns": [
+      "transaction_id"
+    ]
+  },
+  {
+    "name": "CurrentXid",
+    "sql": "select case\n  when pg_catalog.pg_is_in_recovery()\n    then null\n  else\n    (pg_catalog.txid_current() % 4294967296)::varchar::bigint\n  end as current_txid\n",
+    "columns": [
+      "current_txid"
+    ]
+  },
+  {
+    "name": "ListExistentSchemaComments",
+    "sql": "select D.objoid id, pg_catalog.array_agg(D.objsubid) sub_ids\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_class C on D.objoid = C.oid\nwhere C.relnamespace = :schema_id::oid and C.relkind != 'c' and D.classoid = 'pg_catalog.pg_class'::regclass\ngroup by D.objoid\nunion all\nselect T.oid id, pg_catalog.array_agg(D.objsubid)\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_type T on T.oid = D.objoid or T.typrelid = D.objoid\n  left join pg_catalog.pg_class C on T.typrelid = C.oid\nwhere T.typnamespace = :schema_id::oid and (C.relkind = 'c' or C.relkind is null)\ngroup by T.oid\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_constraint C on D.objoid = C.oid\nwhere C.connamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_constraint'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_trigger T on T.oid = D.objoid\n  join pg_catalog.pg_class C on C.oid = T.tgrelid\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_trigger'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_rewrite R on R.oid = D.objoid\n  join pg_catalog.pg_class C on C.oid = R.ev_class\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_rewrite'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_proc P on P.oid = D.objoid\nwhere P.pronamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_proc'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_operator O on O.oid = D.objoid\nwhere O.oprnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_operator'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_opclass O on O.oid = D.objoid\nwhere O.opcnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_opclass'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_opfamily O on O.oid = D.objoid\nwhere O.opfnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_opfamily'::regclass\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_collation C on C.oid = D.objoid\nwhere C.collnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_collation'::regclass\n\nunion all\nselect D.objoid id, array[D.objsubid]\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_policy P on P.oid = D.objoid\n  join pg_catalog.pg_class C on P.polrelid = C.oid\nwhere C.relnamespace = :schema_id::oid  and D.classoid = 'pg_catalog.pg_policy'::regclass\n\n",
+    "columns": [
+      "id",
+      "sub_ids"
+    ]
+  },
+  {
+    "name": "ListExistentServerComments",
+    "sql": "select D.objoid id\nfrom pg_catalog.pg_description D\nwhere D.classoid in (\n    'pg_catalog.pg_tablespace'::regclass\n    )\n",
+    "columns": [
+      "id"
+    ]
+  },
+  {
+    "name": "ListExistentDatabaseComments",
+    "sql": "select D.objoid id\nfrom pg_catalog.pg_description D\nwhere D.classoid in (\n  'pg_catalog.pg_event_trigger'::regclass,\n  'pg_catalog.pg_am'::regclass,\n  'pg_catalog.pg_cast'::regclass,\n  'pg_catalog.pg_foreign_data_wrapper'::regclass,\n  'pg_catalog.pg_foreign_server'::regclass,\n  'pg_catalog.pg_language'::regclass\n  ,\n  'pg_catalog.pg_extension'::regclass\n  \n)\n",
+    "columns": [
+      "id"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaComments",
+    "sql": "select D.objoid id, C.relkind::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_class C on D.objoid = C.oid\nwhere C.relnamespace = :schema_id::oid and C.relkind != 'c' and D.classoid = 'pg_catalog.pg_class'::regclass\n\n-- all table-like things + seqs + iets anders?\nunion all\nselect T.oid id, 'T'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_type T on T.oid = D.objoid or T.typrelid = D.objoid\n  left join pg_catalog.pg_class C on T.typrelid = C.oid\nwhere T.typnamespace = :schema_id::oid and (C.relkind = 'c' or C.relkind is null)\n\n-- relkind = c (composite types?)\nunion all\nselect D.objoid id, pg_catalog.translate(C.contype, 'pufc', 'kkxz')::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_constraint C on D.objoid = C.oid\nwhere C.connamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_constraint'::regclass\n\n-- table constraints\nunion all\nselect D.objoid id, 't'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_trigger T on T.oid = D.objoid\n  join pg_catalog.pg_class C on C.oid = T.tgrelid\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_trigger'::regclass\n\n-- triggers\nunion all\nselect D.objoid id, 'R'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_rewrite R on R.oid = D.objoid\n  join pg_catalog.pg_class C on C.oid = R.ev_class\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_rewrite'::regclass\n\n-- rules\nunion all\nselect D.objoid id, 'F'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_proc P on P.oid = D.objoid\nwhere P.pronamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_proc'::regclass\n\n-- more routines\nunion all\nselect D.objoid id, 'O'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_operator O on O.oid = D.objoid\nwhere O.oprnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_operator'::regclass\n\n-- operators\nunion all\nselect D.objoid id, 'f'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_opfamily O on O.oid = D.objoid\nwhere O.opfnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_opfamily'::regclass\n\n-- op families\nunion all\nselect D.objoid id, 'c'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_opclass O on O.oid = D.objoid\nwhere O.opcnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_opclass'::regclass\n\n-- op class\n  union all\nselect D.objoid id, 'C'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n  join pg_catalog.pg_collation C on C.oid = D.objoid\nwhere C.collnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_collation'::regclass\n\n\n-- collations\n  union all\nselect D.objoid id, 'P'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_policy P on P.oid = D.objoid\n       join pg_catalog.pg_class C on P.polrelid = C.oid\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_policy'::regclass\n\n\n-- security policies (also by table name...)",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragPgClassRels",
+    "sql": "select D.objoid id, C.relkind::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_class C on D.objoid = C.oid\nwhere C.relnamespace = :schema_id::oid and (C.relkind != 'c' and C.relkind != 'i' and C.relkind != 'I') and D.classoid = 'pg_catalog.pg_class'::regclass\nand C.relname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragConstraints",
+    "sql": "select D.objoid id, pg_catalog.translate(C.contype, 'pufc', 'kkxz')::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_constraint C on D.objoid = C.oid\n       left join pg_catalog.pg_class CLS on CLS.oid = C.conrelid\n       left join pg_catalog.pg_type TYP on TYP.oid = C.contypid\nwhere C.connamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_constraint'::regclass\nand CLS.relname in ( :[*f_names] ) or TYP.typname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragObjTypes",
+    "sql": "select T.oid id, 'T'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_type T on T.oid = D.objoid or T.typrelid = D.objoid\n       left join pg_catalog.pg_class C on T.typrelid = C.oid\nwhere T.typnamespace = :schema_id::oid and (C.relkind = 'c' or C.relkind is null)\nand T.typname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragTableTriggers",
+    "sql": "select D.objoid id, 't'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_trigger T on T.oid = D.objoid\n       join pg_catalog.pg_class C on C.oid = T.tgrelid\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_trigger'::regclass\nand C.relname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragTableRules",
+    "sql": "select D.objoid id, 'R'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_rewrite R on R.oid = D.objoid\n       join pg_catalog.pg_class C on C.oid = R.ev_class\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_rewrite'::regclass\nand C.relname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragTableIndices",
+    "sql": "select D.objoid id, ind_store.relkind::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_class ind_store\n       join pg_catalog.pg_index ind_head on ind_store.oid = ind_head.indexrelid\n       join pg_catalog.pg_class tab on tab.relnamespace = ind_store.relnamespace\n       join pg_catalog.pg_description D on ind_store.oid = D.objoid\nwhere ind_store.relkind in ('i', 'I')\n  and tab.relkind in ('r', 'm', 'v', 'p')\n  and D.classoid = 'pg_catalog.pg_class'::regclass\n  and tab.relnamespace = :schema_id::oid\n  and tab.relname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragProcs",
+    "sql": "select D.objoid id, 'F'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_proc P on P.oid = D.objoid\nwhere P.pronamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_proc'::regclass\nand P.proname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragOperators",
+    "sql": "select D.objoid id, 'O'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_operator O on O.oid = D.objoid\nwhere O.oprnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_operator'::regclass\nand O.oprname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragOpClasses",
+    "sql": "select D.objoid id, 'c'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_opclass O on O.oid = D.objoid\nwhere O.opcnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_opclass'::regclass\nand O.opcname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragOpFamilies",
+    "sql": "select D.objoid id, 'f'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_opfamily O on O.oid = D.objoid\nwhere O.opfnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_opfamily'::regclass\nand O.opfname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragCollations",
+    "sql": "select D.objoid id, 'C'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_collation C on C.oid = D.objoid\nwhere C.collnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_collation'::regclass\nand C.collname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveSchemaCommentsFragSecPolicies",
+    "sql": "select D.objoid id, 'P'::char as kind, D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\n       join pg_catalog.pg_policy P on P.oid = D.objoid\n       join pg_catalog.pg_class C on P.polrelid = C.oid\nwhere C.relnamespace = :schema_id::oid and D.classoid = 'pg_catalog.pg_policy'::regclass\nand C.relname in ( :[*f_names] )",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveDatabaseComments",
+    "sql": "select D.objoid id, case\n    when 'pg_catalog.pg_event_trigger'::regclass = classoid then 'T'\n    when 'pg_catalog.pg_am'::regclass = classoid then 'A'\n    when 'pg_catalog.pg_cast'::regclass = classoid then 'C'\n    when 'pg_catalog.pg_foreign_data_wrapper'::regclass = classoid then 'W'\n    when 'pg_catalog.pg_foreign_server'::regclass = classoid then 'S'\n    when 'pg_catalog.pg_language'::regclass = classoid then 'L'\n    \n    when 'pg_catalog.pg_extension'::regclass = classoid then 'E'\n    \n  end as kind,\n  D.objsubid sub_id, D.description\nfrom pg_catalog.pg_description D\nwhere classoid in (\n  'pg_catalog.pg_event_trigger'::regclass,\n  'pg_catalog.pg_am'::regclass,\n  'pg_catalog.pg_cast'::regclass,\n  'pg_catalog.pg_foreign_data_wrapper'::regclass,\n  'pg_catalog.pg_foreign_server'::regclass,\n  'pg_catalog.pg_language'::regclass\n  ,\n  'pg_catalog.pg_extension'::regclass\n  \n)",
+    "columns": [
+      "id",
+      "kind",
+      "sub_id",
+      "description"
+    ]
+  },
+  {
+    "name": "RetrieveExistentSequences",
+    "sql": "select oid\nfrom pg_catalog.pg_class\nwhere relkind = 'S'\n  and relnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveSequences10",
+    "sql": "select cls.xmin as sequence_state_number,\n       sq.seqrelid as sequence_id,\n       cls.relname as sequence_name,\n       pg_catalog.format_type(sq.seqtypid, null) as data_type,\n       sq.seqstart as start_value,\n       sq.seqincrement as inc_value,\n       sq.seqmin as min_value,\n       sq.seqmax as max_value,\n       sq.seqcache as cache_size,\n       sq.seqcycle as cycle_option,\n       pg_catalog.pg_get_userbyid(cls.relowner) as \"owner\"\nfrom pg_catalog.pg_sequence sq\n    join pg_class cls on sq.seqrelid = cls.oid\n    where cls.relnamespace = :schema_id::oid\n\n\n",
+    "columns": [
+      "sequence_state_number",
+      "sequence_id",
+      "sequence_name",
+      "data_type",
+      "start_value",
+      "inc_value",
+      "min_value",
+      "max_value",
+      "cache_size",
+      "cycle_option",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveSequences10",
+    "sql": "select cls.xmin as sequence_state_number,\n       sq.seqrelid as sequence_id,\n       cls.relname as sequence_name,\n       pg_catalog.format_type(sq.seqtypid, null) as data_type,\n       sq.seqstart as start_value,\n       sq.seqincrement as inc_value,\n       sq.seqmin as min_value,\n       sq.seqmax as max_value,\n       sq.seqcache as cache_size,\n       sq.seqcycle as cycle_option,\n       pg_catalog.pg_get_userbyid(cls.relowner) as \"owner\"\nfrom pg_catalog.pg_sequence sq\n    join pg_class cls on sq.seqrelid = cls.oid\n    where cls.relnamespace = :schema_id::oid\n\n and cls.relname in ( :[*f_names] )\n",
+    "columns": [
+      "sequence_state_number",
+      "sequence_id",
+      "sequence_name",
+      "data_type",
+      "start_value",
+      "inc_value",
+      "min_value",
+      "max_value",
+      "cache_size",
+      "cycle_option",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveSequences",
+    "sql": "with T as (\n                select oid as sequence_id,\n                       relname as sequence_name,\n                       pg_catalog.pg_get_userbyid(relowner) as \"owner\",\n                       \n                       case when has_sequence_privilege(oid, 'SELECT, UPDATE, USAGE') then trim(both '()' from pg_catalog.pg_sequence_parameters(oid)::varchar)\n                       else null::varchar\n                       end as sequence_params,\n                       \n                       xmin as sequence_state_number\n                       from pg_catalog.pg_class\n                         where relnamespace = :schema_id::oid\n                         and relkind = 'S'\n                         \n                         \n                )\nselect sequence_id,\n       sequence_name,\n       \n       pg_catalog.split_part(sequence_params, ',', 1)::bigint as start_value,\n       pg_catalog.split_part(sequence_params, ',', 2)::bigint as min_value,\n       pg_catalog.split_part(sequence_params, ',', 3)::bigint as max_value,\n       pg_catalog.split_part(sequence_params, ',', 4)::bigint as inc_value,\n       pg_catalog.lower(pg_catalog.split_part(sequence_params, ',', 5)) LIKE '%t%' as cycle_option,\n       \n       sequence_state_number,\n       \"owner\"\nfrom T\n",
+    "columns": [
+      "sequence_id",
+      "sequence_name",
+      "start_value",
+      "min_value",
+      "max_value",
+      "inc_value",
+      "cycle_option",
+      "sequence_state_number",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveSequences",
+    "sql": "with T as (\n                select oid as sequence_id,\n                       relname as sequence_name,\n                       pg_catalog.pg_get_userbyid(relowner) as \"owner\",\n                       \n                       case when has_sequence_privilege(oid, 'SELECT, UPDATE, USAGE') then trim(both '()' from pg_catalog.pg_sequence_parameters(oid)::varchar)\n                       else null::varchar\n                       end as sequence_params,\n                       \n                       xmin as sequence_state_number\n                       from pg_catalog.pg_class\n                         where relnamespace = :schema_id::oid\n                         and relkind = 'S'\n                         \n                          and relname in ( :[*f_names] )\n                )\nselect sequence_id,\n       sequence_name,\n       \n       pg_catalog.split_part(sequence_params, ',', 1)::bigint as start_value,\n       pg_catalog.split_part(sequence_params, ',', 2)::bigint as min_value,\n       pg_catalog.split_part(sequence_params, ',', 3)::bigint as max_value,\n       pg_catalog.split_part(sequence_params, ',', 4)::bigint as inc_value,\n       pg_catalog.lower(pg_catalog.split_part(sequence_params, ',', 5)) LIKE '%t%' as cycle_option,\n       \n       sequence_state_number,\n       \"owner\"\nfrom T\n",
+    "columns": [
+      "sequence_id",
+      "sequence_name",
+      "start_value",
+      "min_value",
+      "max_value",
+      "inc_value",
+      "cycle_option",
+      "sequence_state_number",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentDataTypes",
+    "sql": "select oid\nfrom pg_catalog.pg_type\nwhere typnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveDataTypes",
+    "sql": "select T.oid as type_id,\n       T.xmin as type_state_number,\n       T.typname as type_name,\n       T.typtype as type_sub_kind,\n       T.typcategory as type_category,\n       T.typrelid as class_id,\n       T.typbasetype as base_type_id,\n       case when T.typtype in ('c','e') then null\n            else pg_catalog.format_type(T.typbasetype, T.typtypmod) end as type_def,\n       T.typndims as dimensions_number,\n       T.typdefault as default_expression,\n       T.typnotnull as mandatory,\n       pg_catalog.pg_get_userbyid(T.typowner) as \"owner\"\nfrom pg_catalog.pg_type T\n         left outer join pg_catalog.pg_class C\n             on T.typrelid = C.oid\nwhere T.typnamespace = :schema_id::oid\n  \n  \n  and (T.typtype in ('d','e') or\n       C.relkind = 'c'::\"char\" or\n       (T.typtype = 'b' and (T.typelem = 0 OR T.typcategory <> 'A')) or\n       T.typtype = 'p' and not T.typisdefined)\norder by 1\n",
+    "columns": [
+      "type_id",
+      "type_state_number",
+      "type_name",
+      "type_sub_kind",
+      "type_category",
+      "class_id",
+      "base_type_id",
+      "type_def",
+      "dimensions_number",
+      "default_expression",
+      "mandatory",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveDataTypes",
+    "sql": "select T.oid as type_id,\n       T.xmin as type_state_number,\n       T.typname as type_name,\n       T.typtype as type_sub_kind,\n       T.typcategory as type_category,\n       T.typrelid as class_id,\n       T.typbasetype as base_type_id,\n       case when T.typtype in ('c','e') then null\n            else pg_catalog.format_type(T.typbasetype, T.typtypmod) end as type_def,\n       T.typndims as dimensions_number,\n       T.typdefault as default_expression,\n       T.typnotnull as mandatory,\n       pg_catalog.pg_get_userbyid(T.typowner) as \"owner\"\nfrom pg_catalog.pg_type T\n         left outer join pg_catalog.pg_class C\n             on T.typrelid = C.oid\nwhere T.typnamespace = :schema_id::oid\n   and T.typname in ( :[*f_names] )\n  \n  and (T.typtype in ('d','e') or\n       C.relkind = 'c'::\"char\" or\n       (T.typtype = 'b' and (T.typelem = 0 OR T.typcategory <> 'A')) or\n       T.typtype = 'p' and not T.typisdefined)\norder by 1\n",
+    "columns": [
+      "type_id",
+      "type_state_number",
+      "type_name",
+      "type_sub_kind",
+      "type_category",
+      "class_id",
+      "base_type_id",
+      "type_def",
+      "dimensions_number",
+      "default_expression",
+      "mandatory",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentDataTypeChecks",
+    "sql": "select oid\nfrom pg_catalog.pg_constraint\nwhere contypid != 0 and connamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveDataTypeChecks",
+    "sql": "select T.oid::bigint as type_id,\n       C.oid::bigint as constraint_id,\n       C.xmin as constraint_state_number,\n       C.conname as constraint_name,\n        pg_catalog.pg_get_expr(C.conbin, C.conrelid)  as predicate\nfrom pg_catalog.pg_type T,\n     pg_catalog.pg_constraint C\nwhere T.typnamespace = :schema_id::oid\n  and T.typtype = 'd'::\"char\"\n  and T.oid = C.contypid\n  and  pg_catalog.pg_get_expr(C.conbin, C.conrelid)  is not null\n  \norder by constraint_name\n-- todo think abt frag?\n",
+    "columns": [
+      "type_id",
+      "constraint_id",
+      "constraint_state_number",
+      "constraint_name",
+      "predicate"
+    ]
+  },
+  {
+    "name": "RetrieveExistentTables",
+    "sql": "select oid from pg_catalog.pg_class C\nwhere relkind in ('r', 'm', 'v', 'p', 'f')\n  and relnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveTables",
+    "sql": "select T.relkind as table_kind,\n       T.relname as table_name,\n       T.oid as table_id,\n       T.xmin as table_state_number,\n        false  as table_with_oids,\n       T.reltablespace as tablespace_id,\n       T.reloptions as options,\n       T.relpersistence as persistence,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where T.oid = inhrelid) as ancestors,\n       (select pg_catalog.array_agg(inhrelid::bigint order by inhrelid)::varchar from pg_catalog.pg_inherits where T.oid = inhparent) as successors,\n        T.relispartition  as is_partition,\n        pg_catalog.pg_get_partkeydef(T.oid)  as partition_key,\n        pg_catalog.pg_get_expr(T.relpartbound, T.oid)  as partition_expression,\n       T.relam am_id,\n       pg_catalog.pg_get_userbyid(T.relowner) as \"owner\"\nfrom pg_catalog.pg_class T\nwhere relnamespace = :schema_id::oid\n       and relkind in ('r', 'm', 'v', 'f', 'p')\n\n\norder by table_kind, table_id\n",
+    "columns": [
+      "table_kind",
+      "table_name",
+      "table_id",
+      "table_state_number",
+      "table_with_oids",
+      "tablespace_id",
+      "options",
+      "persistence",
+      "ancestors",
+      "successors",
+      "is_partition",
+      "partition_key",
+      "partition_expression",
+      "am_id",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveTables",
+    "sql": "select T.relkind as table_kind,\n       T.relname as table_name,\n       T.oid as table_id,\n       T.xmin as table_state_number,\n        false  as table_with_oids,\n       T.reltablespace as tablespace_id,\n       T.reloptions as options,\n       T.relpersistence as persistence,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where T.oid = inhrelid) as ancestors,\n       (select pg_catalog.array_agg(inhrelid::bigint order by inhrelid)::varchar from pg_catalog.pg_inherits where T.oid = inhparent) as successors,\n        T.relispartition  as is_partition,\n        pg_catalog.pg_get_partkeydef(T.oid)  as partition_key,\n        pg_catalog.pg_get_expr(T.relpartbound, T.oid)  as partition_expression,\n       T.relam am_id,\n       pg_catalog.pg_get_userbyid(T.relowner) as \"owner\"\nfrom pg_catalog.pg_class T\nwhere relnamespace = :schema_id::oid\n       and relkind in ('r', 'm', 'v', 'f', 'p')\n\n and T.relname in ( :[*f_names] )\norder by table_kind, table_id\n",
+    "columns": [
+      "table_kind",
+      "table_name",
+      "table_id",
+      "table_state_number",
+      "table_with_oids",
+      "tablespace_id",
+      "options",
+      "persistence",
+      "ancestors",
+      "successors",
+      "is_partition",
+      "partition_key",
+      "partition_expression",
+      "am_id",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveForeignTables",
+    "sql": "select ft.ftrelid as table_id,\n       srv.srvname as table_server,\n       ft.ftoptions as table_options,\n       pg_catalog.pg_get_userbyid(cls.relowner) as \"owner\"\nfrom pg_catalog.pg_foreign_table ft\n     left outer join pg_catalog.pg_foreign_server srv on ft.ftserver = srv.oid\n     join pg_catalog.pg_class cls on ft.ftrelid = cls.oid\nwhere cls.relnamespace = :schema_id::oid\n  \n  \norder by table_id\n",
+    "columns": [
+      "table_id",
+      "table_server",
+      "table_options",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveForeignTables",
+    "sql": "select ft.ftrelid as table_id,\n       srv.srvname as table_server,\n       ft.ftoptions as table_options,\n       pg_catalog.pg_get_userbyid(cls.relowner) as \"owner\"\nfrom pg_catalog.pg_foreign_table ft\n     left outer join pg_catalog.pg_foreign_server srv on ft.ftserver = srv.oid\n     join pg_catalog.pg_class cls on ft.ftrelid = cls.oid\nwhere cls.relnamespace = :schema_id::oid\n  \n   and cls.relname in ( :[*f_names] )\norder by table_id\n",
+    "columns": [
+      "table_id",
+      "table_server",
+      "table_options",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveStructAttributes",
+    "sql": "select T.oid as type_id,\n       A.attnum as att_position,\n       A.attname as att_name,\n       pg_catalog.format_type(A.atttypid, A.atttypmod) as att_type,\n       A.attndims as dimensions_number,\n       A.attisdropped as att_dropped\n\nfrom pg_catalog.pg_type T\n  join pg_catalog.pg_class C\n    on T.typrelid = C.oid\n  join pg_catalog.pg_attribute A\n    on A.attrelid = C.oid\nwhere T.typnamespace = :schema_id::oid\n  and T.typtype = 'c'::\"char\"\n  and C.relkind = 'c'::\"char\"\n\n\norder by T.oid::bigint, A.attnum\n",
+    "columns": [
+      "type_id",
+      "att_position",
+      "att_name",
+      "att_type",
+      "dimensions_number",
+      "att_dropped"
+    ]
+  },
+  {
+    "name": "RetrieveStructAttributes",
+    "sql": "select T.oid as type_id,\n       A.attnum as att_position,\n       A.attname as att_name,\n       pg_catalog.format_type(A.atttypid, A.atttypmod) as att_type,\n       A.attndims as dimensions_number,\n       A.attisdropped as att_dropped\n\nfrom pg_catalog.pg_type T\n  join pg_catalog.pg_class C\n    on T.typrelid = C.oid\n  join pg_catalog.pg_attribute A\n    on A.attrelid = C.oid\nwhere T.typnamespace = :schema_id::oid\n  and T.typtype = 'c'::\"char\"\n  and C.relkind = 'c'::\"char\"\n and T.typname in ( :[*f_names] )\n\norder by T.oid::bigint, A.attnum\n",
+    "columns": [
+      "type_id",
+      "att_position",
+      "att_name",
+      "att_type",
+      "dimensions_number",
+      "att_dropped"
+    ]
+  },
+  {
+    "name": "RetrieveEnumLabels",
+    "sql": "with types as (select distinct T.oid as type_id\n               from pg_catalog.pg_type T\n               join pg_catalog.pg_enum E\n                 on T.oid = E.enumtypid\n               where T.typnamespace = :schema_id::oid\n                 and T.typtype = 'e'::\"char\"\n               \n               \n               )\nselect T.type_id as enum_id,\n       pg_catalog.array_agg(E.enumlabel::varchar  order by E.enumsortorder ) as enum_labels\nfrom types T\njoin pg_catalog.pg_enum E\n  on T.type_id = E.enumtypid\ngroup by T.type_id\n",
+    "columns": [
+      "enum_id",
+      "enum_labels"
+    ]
+  },
+  {
+    "name": "RetrieveEnumLabels",
+    "sql": "with types as (select distinct T.oid as type_id\n               from pg_catalog.pg_type T\n               join pg_catalog.pg_enum E\n                 on T.oid = E.enumtypid\n               where T.typnamespace = :schema_id::oid\n                 and T.typtype = 'e'::\"char\"\n                and T.typname in ( :[*f_names] )\n               \n               )\nselect T.type_id as enum_id,\n       pg_catalog.array_agg(E.enumlabel::varchar  order by E.enumsortorder ) as enum_labels\nfrom types T\njoin pg_catalog.pg_enum E\n  on T.type_id = E.enumtypid\ngroup by T.type_id\n",
+    "columns": [
+      "enum_id",
+      "enum_labels"
+    ]
+  },
+  {
+    "name": "RetrieveColumns",
+    "sql": "with T as ( select \n                  T.oid as table_id, T.relname as table_name\n            from pg_catalog.pg_class T\n                 \n            where T.relnamespace = :schema_id::oid\n              and T.relkind in ('r', 'm', 'v', 'f', 'p')\n              \n              \n             \n            )\nselect T.table_id,\n       C.attnum as column_position,\n       C.attname as column_name,\n       C.xmin as column_state_number,\n       C.atttypmod as type_mod,\n       C.attndims as dimensions_number,\n       pg_catalog.format_type(C.atttypid, C.atttypmod) as type_spec,\n       C.atttypid as type_id,\n       C.attnotnull as mandatory,\n        pg_catalog.pg_get_expr(D.adbin, T.table_id)  as column_default_expression,\n       not C.attislocal as column_is_inherited,\n        C.attfdwoptions as options,\n       C.attisdropped as column_is_dropped,\n        C.attidentity  as identity_kind,\n        C.attgenerated  as generated\nfrom T\n  join pg_catalog.pg_attribute C on T.table_id = C.attrelid\n  left join pg_catalog.pg_attrdef D on (C.attrelid, C.attnum) = (D.adrelid, D.adnum)\nwhere attnum > 0\norder by table_id, attnum\n",
+    "columns": [
+      "table_id",
+      "column_position",
+      "column_name",
+      "column_state_number",
+      "type_mod",
+      "dimensions_number",
+      "type_spec",
+      "type_id",
+      "mandatory",
+      "column_default_expression",
+      "column_is_inherited",
+      "options",
+      "column_is_dropped",
+      "identity_kind",
+      "generated"
+    ]
+  },
+  {
+    "name": "RetrieveColumns",
+    "sql": "with T as ( select \n                  T.oid as table_id, T.relname as table_name\n            from pg_catalog.pg_class T\n                 \n            where T.relnamespace = :schema_id::oid\n              and T.relkind in ('r', 'm', 'v', 'f', 'p')\n              \n              \n              and T.relname in ( :[*f_names] )\n            )\nselect T.table_id,\n       C.attnum as column_position,\n       C.attname as column_name,\n       C.xmin as column_state_number,\n       C.atttypmod as type_mod,\n       C.attndims as dimensions_number,\n       pg_catalog.format_type(C.atttypid, C.atttypmod) as type_spec,\n       C.atttypid as type_id,\n       C.attnotnull as mandatory,\n        pg_catalog.pg_get_expr(D.adbin, T.table_id)  as column_default_expression,\n       not C.attislocal as column_is_inherited,\n        C.attfdwoptions as options,\n       C.attisdropped as column_is_dropped,\n        C.attidentity  as identity_kind,\n        C.attgenerated  as generated\nfrom T\n  join pg_catalog.pg_attribute C on T.table_id = C.attrelid\n  left join pg_catalog.pg_attrdef D on (C.attrelid, C.attnum) = (D.adrelid, D.adnum)\nwhere attnum > 0\norder by table_id, attnum\n",
+    "columns": [
+      "table_id",
+      "column_position",
+      "column_name",
+      "column_state_number",
+      "type_mod",
+      "dimensions_number",
+      "type_spec",
+      "type_id",
+      "mandatory",
+      "column_default_expression",
+      "column_is_inherited",
+      "options",
+      "column_is_dropped",
+      "identity_kind",
+      "generated"
+    ]
+  },
+  {
+    "name": "RetrieveExistentIndices",
+    "sql": "select IX.indexrelid\nfrom pg_catalog.pg_index IX,\n     pg_catalog.pg_class IC\nwhere IC.oid = IX.indrelid\n  and IC.relnamespace = :schema_id::oid\n",
+    "columns": [
+      "indexrelid"
+    ]
+  },
+  {
+    "name": "RetrieveIndices",
+    "sql": "select tab.oid               table_id,\n       tab.relkind           table_kind,\n       ind_stor.relname      index_name,\n       ind_head.indexrelid   index_id,\n       ind_stor.xmin         state_number,\n       ind_head.indisunique  is_unique,\n       ind_head.indisprimary is_primary,\n        ind_head.indnullsnotdistinct  nulls_not_distinct,\n       pg_catalog.pg_get_expr(ind_head.indpred, ind_head.indrelid) as condition,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where ind_stor.oid = inhrelid) as ancestors,\n       ind_stor.reltablespace tablespace_id,\n       opcmethod as access_method_id\nfrom pg_catalog.pg_class tab\n         join pg_catalog.pg_index ind_head\n              on ind_head.indrelid = tab.oid\n         join pg_catalog.pg_class ind_stor\n              on tab.relnamespace = ind_stor.relnamespace and ind_stor.oid = ind_head.indexrelid\n         left join pg_catalog.pg_opclass on pg_opclass.oid = ANY(indclass)\nwhere tab.relnamespace = :schema_id::oid\n        and tab.relkind in ('r', 'm', 'v', 'p')\n        and ind_stor.relkind in ('i', 'I')",
+    "columns": [
+      "table_id",
+      "table_kind",
+      "index_name",
+      "index_id",
+      "state_number",
+      "is_unique",
+      "is_primary",
+      "nulls_not_distinct",
+      "condition",
+      "ancestors",
+      "tablespace_id",
+      "access_method_id"
+    ]
+  },
+  {
+    "name": "RetrieveIndices",
+    "sql": "select tab.oid               table_id,\n       tab.relkind           table_kind,\n       ind_stor.relname      index_name,\n       ind_head.indexrelid   index_id,\n       ind_stor.xmin         state_number,\n       ind_head.indisunique  is_unique,\n       ind_head.indisprimary is_primary,\n        ind_head.indnullsnotdistinct  nulls_not_distinct,\n       pg_catalog.pg_get_expr(ind_head.indpred, ind_head.indrelid) as condition,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where ind_stor.oid = inhrelid) as ancestors,\n       ind_stor.reltablespace tablespace_id,\n       opcmethod as access_method_id\nfrom pg_catalog.pg_class tab\n         join pg_catalog.pg_index ind_head\n              on ind_head.indrelid = tab.oid\n         join pg_catalog.pg_class ind_stor\n              on tab.relnamespace = ind_stor.relnamespace and ind_stor.oid = ind_head.indexrelid\n         left join pg_catalog.pg_opclass on pg_opclass.oid = ANY(indclass)\nwhere tab.relnamespace = :schema_id::oid\n        and tab.relkind in ('r', 'm', 'v', 'p')\n        and ind_stor.relkind in ('i', 'I')\n  and tab.relname in ( :[*f_names] )",
+    "columns": [
+      "table_id",
+      "table_kind",
+      "index_name",
+      "index_id",
+      "state_number",
+      "is_unique",
+      "is_primary",
+      "nulls_not_distinct",
+      "condition",
+      "ancestors",
+      "tablespace_id",
+      "access_method_id"
+    ]
+  },
+  {
+    "name": "RetrieveIndexColumns",
+    "sql": "select ind_head.indexrelid index_id,\n       k col_idx,\n        k <= indnkeyatts  in_key,\n       ind_head.indkey[k-1] column_position,\n       ind_head.indoption[k-1] column_options,\n        ind_head.indcollation[k-1]  as collation,\n        colln.nspname  as collation_schema,\n        collname  as collation_str,\n       ind_head.indclass[k-1] as opclass,\n       case when opcdefault then null else opcn.nspname end as opclass_schema,\n       case when opcdefault then null else opcname end as opclass_str,\n       case\n           when indexprs is null then null\n           when ind_head.indkey[k-1] = 0 then chr(27) || pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n           else pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n       end as expression,\n       amcanorder can_order\nfrom  pg_catalog.pg_index  ind_head\n         join pg_catalog.pg_class ind_stor\n              on ind_stor.oid = ind_head.indexrelid\n    cross join unnest(ind_head.indkey) with ordinality u(u, k)\n         left join pg_catalog.pg_collation\n                   on pg_collation.oid = ind_head.indcollation[k-1]\n         left join pg_catalog.pg_namespace colln on collnamespace = colln.oid\n  cross join pg_catalog.pg_indexam_has_property(ind_stor.relam, 'can_order') amcanorder \n         left join pg_catalog.pg_opclass\n                   on pg_opclass.oid = ind_head.indclass[k-1]\n         left join pg_catalog.pg_namespace opcn on opcnamespace = opcn.oid\n  \nwhere ind_stor.relnamespace = :schema_id::oid\n  and ind_stor.relkind in ('i', 'I')\n\norder by index_id, k",
+    "columns": [
+      "index_id",
+      "col_idx",
+      "in_key",
+      "column_position",
+      "column_options",
+      "collation",
+      "collation_schema",
+      "collation_str",
+      "opclass",
+      "opclass_schema",
+      "opclass_str",
+      "expression",
+      "can_order"
+    ]
+  },
+  {
+    "name": "RetrieveIndexColumns",
+    "sql": "with T as (\n  select T.oid as oid\n  from pg_catalog.pg_class T\n  where T.relnamespace = :schema_id::oid\n    and T.relkind in ('r', 'm', 'v', 'p', 'f')\n    and T.relname in ( :[*f_names] )\n)\n\nselect ind_head.indexrelid index_id,\n       k col_idx,\n        k <= indnkeyatts  in_key,\n       ind_head.indkey[k-1] column_position,\n       ind_head.indoption[k-1] column_options,\n        ind_head.indcollation[k-1]  as collation,\n        colln.nspname  as collation_schema,\n        collname  as collation_str,\n       ind_head.indclass[k-1] as opclass,\n       case when opcdefault then null else opcn.nspname end as opclass_schema,\n       case when opcdefault then null else opcname end as opclass_str,\n       case\n           when indexprs is null then null\n           when ind_head.indkey[k-1] = 0 then chr(27) || pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n           else pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n       end as expression,\n       amcanorder can_order\nfrom  pg_catalog.pg_index  ind_head\n         join pg_catalog.pg_class ind_stor\n              on ind_stor.oid = ind_head.indexrelid\n    cross join unnest(ind_head.indkey) with ordinality u(u, k)\n         left join pg_catalog.pg_collation\n                   on pg_collation.oid = ind_head.indcollation[k-1]\n         left join pg_catalog.pg_namespace colln on collnamespace = colln.oid\n  cross join pg_catalog.pg_indexam_has_property(ind_stor.relam, 'can_order') amcanorder \n         left join pg_catalog.pg_opclass\n                   on pg_opclass.oid = ind_head.indclass[k-1]\n         left join pg_catalog.pg_namespace opcn on opcnamespace = opcn.oid\n   join T on ind_head.indrelid = T.oid\nwhere ind_stor.relnamespace = :schema_id::oid\n  and ind_stor.relkind in ('i', 'I')\n\norder by index_id, k",
+    "columns": [
+      "index_id",
+      "col_idx",
+      "in_key",
+      "column_position",
+      "column_options",
+      "collation",
+      "collation_schema",
+      "collation_str",
+      "opclass",
+      "opclass_schema",
+      "opclass_str",
+      "expression",
+      "can_order"
+    ]
+  },
+  {
+    "name": "RetrieveExistentConstraints",
+    "sql": "select oid\nfrom pg_catalog.pg_constraint\nwhere conrelid != 0 and connamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveConstraints",
+    "sql": "select T.oid table_id,\n       relkind table_kind,\n       C.oid::bigint con_id,\n       C.xmin::varchar::bigint con_state_id,\n       conname con_name,\n       contype con_kind,\n       conkey con_columns,\n       conindid index_id,\n       confrelid ref_table_id,\n       condeferrable is_deferrable,\n       condeferred is_init_deferred,\n        false  is_not_enforced,\n        false  is_not_validated,\n        false  is_defined_with_period,\n       confupdtype on_update,\n       confdeltype on_delete,\n       confmatchtype match_type,\n        connoinherit no_inherit,\n        pg_catalog.pg_get_expr(conbin, T.oid)  con_expression,\n       confkey ref_columns,\n       conexclop::int[] excl_operators,\n       array(select unnest::regoper::varchar from unnest(conexclop)) excl_operators_str\nfrom pg_catalog.pg_constraint C\n         join pg_catalog.pg_class T\n              on C.conrelid = T.oid\nwhere relkind in ('r', 'v', 'f', 'p')\n  and relnamespace = :schema_id::oid\n  and contype in ('p', 'u', 'f', 'c', 'x')\n  and connamespace = :schema_id::oid\n  \n",
+    "columns": [
+      "table_id",
+      "table_kind",
+      "con_id",
+      "con_state_id",
+      "con_name",
+      "con_kind",
+      "con_columns",
+      "index_id",
+      "ref_table_id",
+      "is_deferrable",
+      "is_init_deferred",
+      "is_not_enforced",
+      "is_not_validated",
+      "is_defined_with_period",
+      "on_update",
+      "on_delete",
+      "match_type",
+      "no_inherit",
+      "con_expression",
+      "ref_columns",
+      "excl_operators",
+      "excl_operators_str"
+    ]
+  },
+  {
+    "name": "RetrieveUsedArgumentTypes",
+    "sql": "with schema_procs as (select prorettype, proargtypes, proallargtypes\n                      from pg_catalog.pg_proc\n                      where pronamespace = :schema_id::oid\n                         ),\n     schema_opers as (select oprleft, oprright, oprresult\n                      from pg_catalog.pg_operator\n                      where oprnamespace = :schema_id::oid\n                         ),\n     schema_aggregates as (select A.aggtranstype , A.aggmtranstype \n                           from pg_catalog.pg_aggregate A\n                           join pg_catalog.pg_proc P\n                             on A.aggfnoid = P.oid\n                           where P.pronamespace = :schema_id::oid\n                           ),\n     schema_arg_types as ( select prorettype as type_id\n                           from schema_procs\n                           union\n                           select distinct unnest(proargtypes) as type_id\n                           from schema_procs\n                           union\n                           select distinct unnest(proallargtypes) as type_id\n                           from schema_procs\n                           union\n                           select oprleft as type_id\n                           from schema_opers\n                           where oprleft is not null\n                           union\n                           select oprright as type_id\n                           from schema_opers\n                           where oprright is not null\n                           union\n                           select oprresult as type_id\n                           from schema_opers\n                           where oprresult is not null\n                           union\n                           select aggtranstype::oid as type_id\n                           from schema_aggregates\n                           \n                           union\n                           select aggmtranstype::oid as type_id\n                           from schema_aggregates\n                           \n                           )\nselect type_id, pg_catalog.format_type(type_id, null) as type_spec\nfrom schema_arg_types\nwhere type_id <> 0 -- todo unclear how to frag\n",
+    "columns": [
+      "type_id",
+      "type_spec"
+    ]
+  },
+  {
+    "name": "RetrieveExistentRoutines",
+    "sql": "select oid\nfrom pg_catalog.pg_proc\nwhere  prokind != 'a' and pronamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveRoutines",
+    "sql": "with languages as (select oid as lang_oid, lanname as lang\n                   from pg_catalog.pg_language),\n     routines as (select proname as r_name,\n                         prolang as lang_oid,\n                         oid as r_id,\n                         xmin as r_state_number,\n                         proargnames as arg_names,\n                         proargmodes as arg_modes,\n                         proargtypes::int[] as in_arg_types,\n                         proallargtypes::int[] as all_arg_types,\n                         pg_catalog.pg_get_expr(proargdefaults, 0) as arg_defaults,\n                         provariadic as arg_variadic_id,\n                         prorettype as ret_type_id,\n                         proretset as ret_set,\n                          prokind  as kind,\n                         provolatile as volatile_kind,\n                         proisstrict as is_strict,\n                         prosecdef as is_security_definer,\n                         proconfig as configuration_parameters,\n                         procost as cost,\n                         pg_catalog.pg_get_userbyid(proowner) as \"owner\",\n                         prorows as rows ,\n                         proleakproof as is_leakproof  ,\n                         proparallel as concurrency_kind \n                  from pg_catalog.pg_proc\n                  where pronamespace = :schema_id::oid\n                    \n                    and not  (prokind = 'a') \n                    )\nselect *\nfrom routines natural join languages\n",
+    "columns": [
+      "*"
+    ]
+  },
+  {
+    "name": "RetrieveRoutines",
+    "sql": "with languages as (select oid as lang_oid, lanname as lang\n                   from pg_catalog.pg_language),\n     routines as (select proname as r_name,\n                         prolang as lang_oid,\n                         oid as r_id,\n                         xmin as r_state_number,\n                         proargnames as arg_names,\n                         proargmodes as arg_modes,\n                         proargtypes::int[] as in_arg_types,\n                         proallargtypes::int[] as all_arg_types,\n                         pg_catalog.pg_get_expr(proargdefaults, 0) as arg_defaults,\n                         provariadic as arg_variadic_id,\n                         prorettype as ret_type_id,\n                         proretset as ret_set,\n                          prokind  as kind,\n                         provolatile as volatile_kind,\n                         proisstrict as is_strict,\n                         prosecdef as is_security_definer,\n                         proconfig as configuration_parameters,\n                         procost as cost,\n                         pg_catalog.pg_get_userbyid(proowner) as \"owner\",\n                         prorows as rows ,\n                         proleakproof as is_leakproof  ,\n                         proparallel as concurrency_kind \n                  from pg_catalog.pg_proc\n                  where pronamespace = :schema_id::oid\n                     and proname in ( :[*f_names] )\n                    and not  (prokind = 'a') \n                    )\nselect *\nfrom routines natural join languages\n",
+    "columns": [
+      "*"
+    ]
+  },
+  {
+    "name": "RetrieveExistentAggregates",
+    "sql": "select oid\nfrom pg_catalog.pg_proc\nwhere  prokind = 'a' and pronamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveAggregates",
+    "sql": "select P.oid as aggregate_id,\n       P.xmin as state_number,\n       P.proname as aggregate_name,\n       P.proargnames as arg_names,\n       P.proargmodes as arg_modes,\n       P.proargtypes::int[] as in_arg_types,\n       P.proallargtypes::int[] as all_arg_types,\n       A.aggtransfn::oid as transition_function_id,\n       A.aggtransfn::regproc::text as transition_function_name,\n       A.aggtranstype as transition_type,\n       A.aggfinalfn::oid as final_function_id,\n       case when A.aggfinalfn::oid = 0 then null else A.aggfinalfn::regproc::varchar end as final_function_name,\n       case when A.aggfinalfn::oid = 0 then 0 else P.prorettype end as final_return_type,\n       A.agginitval as initial_value,\n       A.aggsortop as sort_operator_id,\n       case when A.aggsortop = 0 then null else A.aggsortop::regoper::varchar end as sort_operator_name,\n       pg_catalog.pg_get_userbyid(P.proowner) as \"owner\"\n       ,\n       A.aggfinalextra as final_extra,\n       A.aggtransspace as state_size,\n       A.aggmtransfn::oid as moving_transition_id,\n       case when A.aggmtransfn::oid = 0 then null else A.aggmtransfn::regproc::varchar end as moving_transition_name,\n       A.aggminvtransfn::oid as inverse_transition_id,\n       case when A.aggminvtransfn::oid = 0 then null else A.aggminvtransfn::regproc::varchar end as inverse_transition_name,\n       A.aggmtranstype::oid as moving_state_type,\n       A.aggmtransspace as moving_state_size,\n       A.aggmfinalfn::oid as moving_final_id,\n       case when A.aggmfinalfn::oid = 0 then null else A.aggmfinalfn::regproc::varchar end as moving_final_name,\n       A.aggmfinalextra as moving_final_extra,\n       A.aggminitval as moving_initial_value,\n       A.aggkind as aggregate_kind,\n       A.aggnumdirectargs as direct_args\n       \n       ,\n       A.aggcombinefn::oid as combine_function_id,\n       case when A.aggcombinefn::oid = 0 then null else A.aggcombinefn::regproc::varchar end as combine_function_name,\n       A.aggserialfn::oid as serialization_function_id,\n       case when A.aggserialfn::oid = 0 then null else A.aggserialfn::regproc::varchar end as serialization_function_name,\n       A.aggdeserialfn::oid as deserialization_function_id,\n       case when A.aggdeserialfn::oid = 0 then null else A.aggdeserialfn::regproc::varchar end as deserialization_function_name,\n       P.proparallel as concurrency_kind\n       \nfrom pg_catalog.pg_aggregate A\n     join pg_catalog.pg_proc P\n       on A.aggfnoid = P.oid\nwhere P.pronamespace = :schema_id::oid\n  \n  \norder by P.oid\n",
+    "columns": [
+      "aggregate_id",
+      "state_number",
+      "aggregate_name",
+      "arg_names",
+      "arg_modes",
+      "in_arg_types",
+      "all_arg_types",
+      "transition_function_id",
+      "transition_function_name",
+      "transition_type",
+      "final_function_id",
+      "final_function_name",
+      "final_return_type",
+      "initial_value",
+      "sort_operator_id",
+      "sort_operator_name",
+      "owner",
+      "final_extra",
+      "state_size",
+      "moving_transition_id",
+      "moving_transition_name",
+      "inverse_transition_id",
+      "inverse_transition_name",
+      "moving_state_type",
+      "moving_state_size",
+      "moving_final_id",
+      "moving_final_name",
+      "moving_final_extra",
+      "moving_initial_value",
+      "aggregate_kind",
+      "direct_args",
+      "combine_function_id",
+      "combine_function_name",
+      "serialization_function_id",
+      "serialization_function_name",
+      "deserialization_function_id",
+      "deserialization_function_name",
+      "concurrency_kind"
+    ]
+  },
+  {
+    "name": "RetrieveAggregates",
+    "sql": "select P.oid as aggregate_id,\n       P.xmin as state_number,\n       P.proname as aggregate_name,\n       P.proargnames as arg_names,\n       P.proargmodes as arg_modes,\n       P.proargtypes::int[] as in_arg_types,\n       P.proallargtypes::int[] as all_arg_types,\n       A.aggtransfn::oid as transition_function_id,\n       A.aggtransfn::regproc::text as transition_function_name,\n       A.aggtranstype as transition_type,\n       A.aggfinalfn::oid as final_function_id,\n       case when A.aggfinalfn::oid = 0 then null else A.aggfinalfn::regproc::varchar end as final_function_name,\n       case when A.aggfinalfn::oid = 0 then 0 else P.prorettype end as final_return_type,\n       A.agginitval as initial_value,\n       A.aggsortop as sort_operator_id,\n       case when A.aggsortop = 0 then null else A.aggsortop::regoper::varchar end as sort_operator_name,\n       pg_catalog.pg_get_userbyid(P.proowner) as \"owner\"\n       ,\n       A.aggfinalextra as final_extra,\n       A.aggtransspace as state_size,\n       A.aggmtransfn::oid as moving_transition_id,\n       case when A.aggmtransfn::oid = 0 then null else A.aggmtransfn::regproc::varchar end as moving_transition_name,\n       A.aggminvtransfn::oid as inverse_transition_id,\n       case when A.aggminvtransfn::oid = 0 then null else A.aggminvtransfn::regproc::varchar end as inverse_transition_name,\n       A.aggmtranstype::oid as moving_state_type,\n       A.aggmtransspace as moving_state_size,\n       A.aggmfinalfn::oid as moving_final_id,\n       case when A.aggmfinalfn::oid = 0 then null else A.aggmfinalfn::regproc::varchar end as moving_final_name,\n       A.aggmfinalextra as moving_final_extra,\n       A.aggminitval as moving_initial_value,\n       A.aggkind as aggregate_kind,\n       A.aggnumdirectargs as direct_args\n       \n       ,\n       A.aggcombinefn::oid as combine_function_id,\n       case when A.aggcombinefn::oid = 0 then null else A.aggcombinefn::regproc::varchar end as combine_function_name,\n       A.aggserialfn::oid as serialization_function_id,\n       case when A.aggserialfn::oid = 0 then null else A.aggserialfn::regproc::varchar end as serialization_function_name,\n       A.aggdeserialfn::oid as deserialization_function_id,\n       case when A.aggdeserialfn::oid = 0 then null else A.aggdeserialfn::regproc::varchar end as deserialization_function_name,\n       P.proparallel as concurrency_kind\n       \nfrom pg_catalog.pg_aggregate A\n     join pg_catalog.pg_proc P\n       on A.aggfnoid = P.oid\nwhere P.pronamespace = :schema_id::oid\n   and P.proname in ( :[*f_names] )\n  \norder by P.oid\n",
+    "columns": [
+      "aggregate_id",
+      "state_number",
+      "aggregate_name",
+      "arg_names",
+      "arg_modes",
+      "in_arg_types",
+      "all_arg_types",
+      "transition_function_id",
+      "transition_function_name",
+      "transition_type",
+      "final_function_id",
+      "final_function_name",
+      "final_return_type",
+      "initial_value",
+      "sort_operator_id",
+      "sort_operator_name",
+      "owner",
+      "final_extra",
+      "state_size",
+      "moving_transition_id",
+      "moving_transition_name",
+      "inverse_transition_id",
+      "inverse_transition_name",
+      "moving_state_type",
+      "moving_state_size",
+      "moving_final_id",
+      "moving_final_name",
+      "moving_final_extra",
+      "moving_initial_value",
+      "aggregate_kind",
+      "direct_args",
+      "combine_function_id",
+      "combine_function_name",
+      "serialization_function_id",
+      "serialization_function_name",
+      "deserialization_function_id",
+      "deserialization_function_name",
+      "concurrency_kind"
+    ]
+  },
+  {
+    "name": "RetrieveExistentExtensions",
+    "sql": "select oid\nfrom pg_catalog.pg_extension\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveExtensions",
+    "sql": "select E.oid        as id,\n       E.xmin       as state_number,\n       extname      as name,\n       extversion   as version,\n       extnamespace as schema_id,\n       nspname      as schema_name\n       \n       ,\n       array(select unnest\n             from unnest(available_versions)\n             where unnest > extversion) as available_updates\n       \nfrom pg_catalog.pg_extension E\n       join pg_namespace N on E.extnamespace = N.oid\n       \n       left join (select name, array_agg(version) as available_versions\n                  from pg_available_extension_versions()\n                  group by name) V on E.extname = V.name\n       \n\n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "version",
+      "schema_id",
+      "schema_name",
+      "available_updates"
+    ]
+  },
+  {
+    "name": "RetrieveExtensionMembers",
+    "sql": "select E.oid   as extension_id,\n       D.objid as member_id\nfrom pg_extension E\n     join pg_depend D on E.oid = D.refobjid and\n                         D.refclassid = 'pg_extension'::regclass::oid\nwhere D.deptype = 'e'\norder by extension_id\n",
+    "columns": [
+      "extension_id",
+      "member_id"
+    ]
+  },
+  {
+    "name": "RetrieveExistentOperators",
+    "sql": "select oid\nfrom pg_catalog.pg_operator\nwhere oprnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveOperators",
+    "sql": "select O.oid as op_id,\n       O.xmin as state_number,\n       oprname as op_name,\n       oprkind as op_kind,\n       oprleft as arg_left_type_id,\n       oprright as arg_right_type_id,\n       oprresult as arg_result_type_id,\n       oprcode::oid as main_id,\n       oprcode::varchar as main_name,\n       oprrest::oid as restrict_id,\n       oprrest::varchar as restrict_name,\n       oprjoin::oid as join_id,\n       oprjoin::varchar as join_name,\n       oprcom::oid as com_id,\n       oprcom::regoper::varchar as com_name,\n       oprnegate::oid as neg_id,\n       oprnegate::regoper::varchar as neg_name,\n       oprcanmerge as merges,\n       oprcanhash as hashes,\n       pg_catalog.pg_get_userbyid(O.oprowner) as \"owner\"\nfrom pg_catalog.pg_operator O\nwhere oprnamespace = :schema_id::oid\n  \n  \n",
+    "columns": [
+      "op_id",
+      "state_number",
+      "op_name",
+      "op_kind",
+      "arg_left_type_id",
+      "arg_right_type_id",
+      "arg_result_type_id",
+      "main_id",
+      "main_name",
+      "restrict_id",
+      "restrict_name",
+      "join_id",
+      "join_name",
+      "com_id",
+      "com_name",
+      "neg_id",
+      "neg_name",
+      "merges",
+      "hashes",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveOperators",
+    "sql": "select O.oid as op_id,\n       O.xmin as state_number,\n       oprname as op_name,\n       oprkind as op_kind,\n       oprleft as arg_left_type_id,\n       oprright as arg_right_type_id,\n       oprresult as arg_result_type_id,\n       oprcode::oid as main_id,\n       oprcode::varchar as main_name,\n       oprrest::oid as restrict_id,\n       oprrest::varchar as restrict_name,\n       oprjoin::oid as join_id,\n       oprjoin::varchar as join_name,\n       oprcom::oid as com_id,\n       oprcom::regoper::varchar as com_name,\n       oprnegate::oid as neg_id,\n       oprnegate::regoper::varchar as neg_name,\n       oprcanmerge as merges,\n       oprcanhash as hashes,\n       pg_catalog.pg_get_userbyid(O.oprowner) as \"owner\"\nfrom pg_catalog.pg_operator O\nwhere oprnamespace = :schema_id::oid\n   and oprname in ( :[*f_names] )\n  \n",
+    "columns": [
+      "op_id",
+      "state_number",
+      "op_name",
+      "op_kind",
+      "arg_left_type_id",
+      "arg_right_type_id",
+      "arg_result_type_id",
+      "main_id",
+      "main_name",
+      "restrict_id",
+      "restrict_name",
+      "join_id",
+      "join_name",
+      "com_id",
+      "com_name",
+      "neg_id",
+      "neg_name",
+      "merges",
+      "hashes",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentOperatorClasses",
+    "sql": "select oid\nfrom pg_catalog.pg_opclass\nwhere opcnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveOperatorClasses",
+    "sql": "select O.oid as id,\n       O.xmin as state_number,\n       opcname as name,\n       opcintype::regtype::varchar as in_type,\n       case when opckeytype = 0 then null else opckeytype::regtype::varchar end as key_type,\n       opcdefault as is_default,\n       opcfamily as family_id,\n       opfname as family,\n       opcmethod as access_method_id,\n       pg_catalog.pg_get_userbyid(O.opcowner) as \"owner\"\nfrom pg_catalog.pg_opclass O\n     join pg_catalog.pg_opfamily F on F.oid = opcfamily\nwhere opcnamespace = :schema_id::oid\n  \n  \n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "in_type",
+      "key_type",
+      "is_default",
+      "family_id",
+      "family",
+      "access_method_id",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveOperatorClasses",
+    "sql": "select O.oid as id,\n       O.xmin as state_number,\n       opcname as name,\n       opcintype::regtype::varchar as in_type,\n       case when opckeytype = 0 then null else opckeytype::regtype::varchar end as key_type,\n       opcdefault as is_default,\n       opcfamily as family_id,\n       opfname as family,\n       opcmethod as access_method_id,\n       pg_catalog.pg_get_userbyid(O.opcowner) as \"owner\"\nfrom pg_catalog.pg_opclass O\n     join pg_catalog.pg_opfamily F on F.oid = opcfamily\nwhere opcnamespace = :schema_id::oid\n   and opcname in ( :[*f_names] )\n  \n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "in_type",
+      "key_type",
+      "is_default",
+      "family_id",
+      "family",
+      "access_method_id",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentAmOps",
+    "sql": "select pg_amop.oid\nfrom pg_catalog.pg_amop\n         join pg_catalog.pg_opfamily on pg_opfamily.oid = amopfamily\nwhere opfnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveAmOps",
+    "sql": "select O.oid as id,\n       O.amopstrategy as strategy,\n       O.amopopr as op_id,\n       O.amopopr::regoperator::varchar as op_sig,\n        O.amopsortfamily  as sort_family_id,\n        SF.opfname  as sort_family,\n       O.amopfamily as family_id,\n       C.oid as class_id\nfrom pg_catalog.pg_amop O\n     left join pg_opfamily F on O.amopfamily = F.oid\n     left join pg_opfamily SF on O.amopsortfamily = SF.oid\n     left join pg_depend D on D.classid = 'pg_amop'::regclass and O.oid = D.objid and D.objsubid = 0\n     left join pg_opclass C on D.refclassid = 'pg_opclass'::regclass and C.oid = D.refobjid and D.refobjsubid = 0\nwhere C.opcnamespace = :schema_id::oid or C.opcnamespace is null and F.opfnamespace = :schema_id::oid\n  \norder by C.oid, F.oid\n",
+    "columns": [
+      "id",
+      "strategy",
+      "op_id",
+      "op_sig",
+      "sort_family_id",
+      "sort_family",
+      "family_id",
+      "class_id"
+    ]
+  },
+  {
+    "name": "RetrieveExistentAmProcs",
+    "sql": "select pg_amproc.oid\nfrom pg_catalog.pg_amproc\n         join pg_catalog.pg_opfamily on pg_opfamily.oid = amprocfamily\nwhere opfnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveAmProcs",
+    "sql": "select P.oid as id,\n       P.amprocnum as num,\n       P.amproc::oid as proc_id,\n       P.amproc::regprocedure::varchar as proc_sig,\n       P.amproclefttype::regtype::varchar as left_type,\n       P.amprocrighttype::regtype::varchar as right_type,\n       P.amprocfamily as family_id,\n       C.oid as class_id\nfrom pg_catalog.pg_amproc P\n     left join pg_opfamily F on P.amprocfamily = F.oid\n     left join pg_depend D on D.classid = 'pg_amproc'::regclass and P.oid = D.objid and D.objsubid = 0\n     left join pg_opclass C on D.refclassid = 'pg_opclass'::regclass and C.oid = D.refobjid and D.refobjsubid = 0\nwhere C.opcnamespace = :schema_id::oid or C.opcnamespace is null and F.opfnamespace = :schema_id::oid\n  \norder by C.oid, F.oid\n",
+    "columns": [
+      "id",
+      "num",
+      "proc_id",
+      "proc_sig",
+      "left_type",
+      "right_type",
+      "family_id",
+      "class_id"
+    ]
+  },
+  {
+    "name": "RetrieveExistentOperatorFamilies",
+    "sql": "select oid\nfrom pg_catalog.pg_opfamily\nwhere opfnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveOperatorFamilies",
+    "sql": "select O.oid as id,\n       O.xmin as state_number,\n       opfname as name,\n       opfmethod as access_method_id,\n       pg_catalog.pg_get_userbyid(O.opfowner) as \"owner\"\nfrom pg_catalog.pg_opfamily O\nwhere opfnamespace = :schema_id::oid\n  \n  \n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "access_method_id",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveOperatorFamilies",
+    "sql": "select O.oid as id,\n       O.xmin as state_number,\n       opfname as name,\n       opfmethod as access_method_id,\n       pg_catalog.pg_get_userbyid(O.opfowner) as \"owner\"\nfrom pg_catalog.pg_opfamily O\nwhere opfnamespace = :schema_id::oid\n   and opfname in ( :[*f_names] )\n  \n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "access_method_id",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentRules",
+    "sql": "select RU.oid\nfrom pg_catalog.pg_rewrite RU,\n     pg_catalog.pg_class RC\nwhere RC.oid = RU.ev_class\n  and RC.relnamespace = :schema_id::oid\n  and not RU.rulename = '_RETURN'\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveRules",
+    "sql": "select R.ev_class as table_id,\n       R.oid as rule_id,\n       R.xmin as rule_state_number,\n       R.rulename as rule_name,\n       pg_catalog.translate(ev_type,'1234','SUID') as rule_event_code,\n       R.ev_enabled as rule_fire_mode,\n       R.is_instead as rule_is_instead\nfrom pg_catalog.pg_rewrite R\nwhere R.ev_class in ( select oid\n                      from pg_catalog.pg_class\n                      where relnamespace = :schema_id::oid\n                      \n                    )\n  \n  and R.rulename != '_RETURN'::name\norder by R.ev_class::bigint, ev_type\n",
+    "columns": [
+      "table_id",
+      "rule_id",
+      "rule_state_number",
+      "rule_name",
+      "rule_event_code",
+      "rule_fire_mode",
+      "rule_is_instead"
+    ]
+  },
+  {
+    "name": "RetrieveRules",
+    "sql": "select R.ev_class as table_id,\n       R.oid as rule_id,\n       R.xmin as rule_state_number,\n       R.rulename as rule_name,\n       pg_catalog.translate(ev_type,'1234','SUID') as rule_event_code,\n       R.ev_enabled as rule_fire_mode,\n       R.is_instead as rule_is_instead\nfrom pg_catalog.pg_rewrite R\nwhere R.ev_class in ( select oid\n                      from pg_catalog.pg_class\n                      where relnamespace = :schema_id::oid\n                       and relname in ( :[*f_names] )\n                    )\n  \n  and R.rulename != '_RETURN'::name\norder by R.ev_class::bigint, ev_type\n",
+    "columns": [
+      "table_id",
+      "rule_id",
+      "rule_state_number",
+      "rule_name",
+      "rule_event_code",
+      "rule_fire_mode",
+      "rule_is_instead"
+    ]
+  },
+  {
+    "name": "RetrieveExistentTriggers",
+    "sql": "select TG.oid\nfrom pg_catalog.pg_trigger TG,\n     pg_catalog.pg_class TC\nwhere TC.oid = TG.tgrelid\n  and TC.relnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveTriggers",
+    "sql": "select T.tgrelid as table_id,\n       T.oid as trigger_id,\n       T.xmin as trigger_state_number,\n       T.tgname as trigger_name,\n       T.tgfoid as function_id,\n       pg_catalog.encode(T.tgargs, 'escape') as function_args,\n       T.tgtype as bits,\n       T.tgdeferrable as is_deferrable,\n       T.tginitdeferred as is_init_deferred,\n       T.tgenabled as trigger_fire_mode,\n       T.tgattr as columns,\n       T.tgconstraint != 0 as is_constraint,\n        T.tgoldtable  as old_table_name,\n        T.tgnewtable  as new_table_name,\n       pg_catalog.pg_get_triggerdef(T.oid, true) as source_code\nfrom pg_catalog.pg_trigger T\n     join pg_catalog.pg_class TAB on TAB.oid = T.tgrelid and TAB.relnamespace = :schema_id::oid\nwhere true\n  \n  \n  and not T.tgisinternal\n",
+    "columns": [
+      "table_id",
+      "trigger_id",
+      "trigger_state_number",
+      "trigger_name",
+      "function_id",
+      "function_args",
+      "bits",
+      "is_deferrable",
+      "is_init_deferred",
+      "trigger_fire_mode",
+      "columns",
+      "is_constraint",
+      "old_table_name",
+      "new_table_name",
+      "source_code"
+    ]
+  },
+  {
+    "name": "RetrieveTriggers",
+    "sql": "select T.tgrelid as table_id,\n       T.oid as trigger_id,\n       T.xmin as trigger_state_number,\n       T.tgname as trigger_name,\n       T.tgfoid as function_id,\n       pg_catalog.encode(T.tgargs, 'escape') as function_args,\n       T.tgtype as bits,\n       T.tgdeferrable as is_deferrable,\n       T.tginitdeferred as is_init_deferred,\n       T.tgenabled as trigger_fire_mode,\n       T.tgattr as columns,\n       T.tgconstraint != 0 as is_constraint,\n        T.tgoldtable  as old_table_name,\n        T.tgnewtable  as new_table_name,\n       pg_catalog.pg_get_triggerdef(T.oid, true) as source_code\nfrom pg_catalog.pg_trigger T\n     join pg_catalog.pg_class TAB on TAB.oid = T.tgrelid and TAB.relnamespace = :schema_id::oid\nwhere true\n   and TAB.relname in ( :[*f_names] )\n  \n  and not T.tgisinternal\n",
+    "columns": [
+      "table_id",
+      "trigger_id",
+      "trigger_state_number",
+      "trigger_name",
+      "function_id",
+      "function_args",
+      "bits",
+      "is_deferrable",
+      "is_init_deferred",
+      "trigger_fire_mode",
+      "columns",
+      "is_constraint",
+      "old_table_name",
+      "new_table_name",
+      "source_code"
+    ]
+  },
+  {
+    "name": "RetrieveViewSources",
+    "sql": "select T.relkind as view_kind,\n       T.oid as view_id,\n       pg_catalog.pg_get_viewdef(T.oid, true) as source_text\nfrom pg_catalog.pg_class T\n     join pg_catalog.pg_namespace N on T.relnamespace = N.oid\nwhere N.oid = :schema_id::oid\n  and T.relkind in ('m','v')\n  \n  \n  \n",
+    "columns": [
+      "view_kind",
+      "view_id",
+      "source_text"
+    ]
+  },
+  {
+    "name": "RetrieveViewSources",
+    "sql": "select T.relkind as view_kind,\n       T.oid as view_id,\n       pg_catalog.pg_get_viewdef(T.oid, true) as source_text\nfrom pg_catalog.pg_class T\n     join pg_catalog.pg_namespace N on T.relnamespace = N.oid\nwhere N.oid = :schema_id::oid\n  and T.relkind in ('m','v')\n   and T.relname in ( :[*f_names] )\n  \n  \n",
+    "columns": [
+      "view_kind",
+      "view_id",
+      "source_text"
+    ]
+  },
+  {
+    "name": "RetrieveRuleSources",
+    "sql": "with A as ( select oid as table_id,\n                   pg_catalog.upper(relkind) as table_kind\n            from pg_catalog.pg_class\n            where relnamespace = :schema_id::oid\n              and relkind in ('r', 'm', 'v', 'f', 'p')\n              \n          )\nselect table_kind,\n       table_id,\n       R.oid as rule_id,\n       pg_catalog.pg_get_ruledef(R.oid, true) as source_text\nfrom A\n     join pg_catalog.pg_rewrite R\n       on A.table_id = R.ev_class\nwhere R.rulename != '_RETURN'::name\n  \n",
+    "columns": [
+      "table_kind",
+      "table_id",
+      "rule_id",
+      "source_text"
+    ]
+  },
+  {
+    "name": "RetrieveRuleSources",
+    "sql": "with A as ( select oid as table_id,\n                   pg_catalog.upper(relkind) as table_kind\n            from pg_catalog.pg_class\n            where relnamespace = :schema_id::oid\n              and relkind in ('r', 'm', 'v', 'f', 'p')\n               and relname in ( :[*f_names] )\n          )\nselect table_kind,\n       table_id,\n       R.oid as rule_id,\n       pg_catalog.pg_get_ruledef(R.oid, true) as source_text\nfrom A\n     join pg_catalog.pg_rewrite R\n       on A.table_id = R.ev_class\nwhere R.rulename != '_RETURN'::name\n  \n",
+    "columns": [
+      "table_kind",
+      "table_id",
+      "rule_id",
+      "source_text"
+    ]
+  },
+  {
+    "name": "RetrieveFunctionSources",
+    "sql": "with system_languages as ( select oid as lang\n                           from pg_catalog.pg_language\n                           where lanname in ('c','internal') )\nselect oid as id,\n       pg_catalog.pg_get_function_arguments(oid) as arguments_def,\n       pg_catalog.pg_get_function_result(oid) as result_def,\n        pg_catalog.pg_get_function_sqlbody(oid)  as sqlbody_def,\n       prosrc as source_text\nfrom pg_catalog.pg_proc\nwhere pronamespace = :schema_id::oid\n  \n  \n  and not  (prokind = 'a') \n  and prolang not in (select lang from system_languages)\n  and prosrc is not null\n",
+    "columns": [
+      "id",
+      "arguments_def",
+      "result_def",
+      "sqlbody_def",
+      "source_text"
+    ]
+  },
+  {
+    "name": "RetrieveFunctionSources",
+    "sql": "with system_languages as ( select oid as lang\n                           from pg_catalog.pg_language\n                           where lanname in ('c','internal') )\nselect oid as id,\n       pg_catalog.pg_get_function_arguments(oid) as arguments_def,\n       pg_catalog.pg_get_function_result(oid) as result_def,\n        pg_catalog.pg_get_function_sqlbody(oid)  as sqlbody_def,\n       prosrc as source_text\nfrom pg_catalog.pg_proc\nwhere pronamespace = :schema_id::oid\n   and pg_proc.proname in ( :[*f_names] )\n  \n  and not  (prokind = 'a') \n  and prolang not in (select lang from system_languages)\n  and prosrc is not null\n",
+    "columns": [
+      "id",
+      "arguments_def",
+      "result_def",
+      "sqlbody_def",
+      "source_text"
+    ]
+  },
+  {
+    "name": "RetrieveExistentAccessMethods",
+    "sql": "select oid from pg_catalog.pg_am\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveAccessMethods",
+    "sql": "select A.oid as access_method_id,\n       A.xmin as state_number,\n       A.amname as access_method_name\n       \n       ,\n       A.amhandler::oid as handler_id,\n       pg_catalog.quote_ident(N.nspname) || '.' || pg_catalog.quote_ident(P.proname) as handler_name,\n       A.amtype as access_method_type\n       \nfrom pg_am A\n     \n     join pg_proc P on A.amhandler::oid = P.oid\n     join pg_namespace N on P.pronamespace = N.oid\n     \n\n",
+    "columns": [
+      "access_method_id",
+      "state_number",
+      "access_method_name",
+      "handler_id",
+      "handler_name",
+      "access_method_type"
+    ]
+  },
+  {
+    "name": "ListExistentCasts",
+    "sql": "select oid\nfrom pg_catalog.pg_cast\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "ListCasts",
+    "sql": "select C.oid,\n       C.xmin as state_number,\n       C.castsource as castsource_id,\n       pg_catalog.quote_ident(SN.nspname) || '.' || pg_catalog.quote_ident(S.typname) as castsource_name,\n       C.casttarget as casttarget_id,\n       pg_catalog.quote_ident(TN.nspname) || '.' || pg_catalog.quote_ident(T.typname) as casttarget_name,\n       C.castfunc as castfunc_id,\n       pg_catalog.quote_ident(FN.nspname) || '.' || pg_catalog.quote_ident(F.proname) as castfunc_name,\n       C.castcontext,\n       C.castmethod\nfrom pg_cast C\n     left outer join pg_proc F on C.castfunc::oid = F.oid\n     left outer join pg_namespace FN on F.pronamespace = FN.oid\n     join pg_type S on C.castsource::oid = S.oid\n     join pg_namespace SN on S.typnamespace = SN.oid\n     join pg_type T on C.casttarget::oid = T.oid\n     join pg_namespace TN on T.typnamespace = TN.oid\n\n",
+    "columns": [
+      "oid",
+      "state_number",
+      "castsource_id",
+      "castsource_name",
+      "casttarget_id",
+      "casttarget_name",
+      "castfunc_id",
+      "castfunc_name",
+      "castcontext",
+      "castmethod"
+    ]
+  },
+  {
+    "name": "RetrieveExistentCollations",
+    "sql": "select oid\nfrom pg_catalog.pg_collation\nwhere collnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveCollations",
+    "sql": "select oid as id,\n       xmin as state_number,\n       collname as name,\n       collcollate as lc_collate,\n       collctype as lc_ctype,\n       pg_catalog.pg_get_userbyid(collowner) as \"owner\"\nfrom pg_catalog.pg_collation\nwhere collnamespace = :schema_id::oid\n  \n  \n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "lc_collate",
+      "lc_ctype",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveCollations",
+    "sql": "select oid as id,\n       xmin as state_number,\n       collname as name,\n       collcollate as lc_collate,\n       collctype as lc_ctype,\n       pg_catalog.pg_get_userbyid(collowner) as \"owner\"\nfrom pg_catalog.pg_collation\nwhere collnamespace = :schema_id::oid\n   and collname in ( :[*f_names] )\n  \n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "lc_collate",
+      "lc_ctype",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentForeignDataWrappers",
+    "sql": "select oid\nfrom pg_catalog.pg_foreign_data_wrapper\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveForeignDataWrappers",
+    "sql": "select fdw.oid as id,\n       fdw.xmin as state_number,\n       fdw.fdwname as name,\n       pr.proname as handler,\n       nspc.nspname as handler_schema,\n       pr2.proname as validator,\n       nspc2.nspname as validator_schema,\n       fdw.fdwoptions as options,\n       pg_catalog.pg_get_userbyid(fdw.fdwowner) as \"owner\"\nfrom pg_catalog.pg_foreign_data_wrapper fdw\n     left outer join pg_catalog.pg_proc pr on fdw.fdwhandler = pr.oid\n     left outer join pg_catalog.pg_namespace nspc on pr.pronamespace = nspc.oid\n     left outer join pg_catalog.pg_proc pr2 on fdw.fdwvalidator = pr2.oid\n     left outer join pg_catalog.pg_namespace nspc2 on pr2.pronamespace = nspc2.oid\n\n",
+    "columns": [
+      "id",
+      "state_number",
+      "name",
+      "handler",
+      "handler_schema",
+      "validator",
+      "validator_schema",
+      "options",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentForeignServers",
+    "sql": "select oid from pg_catalog.pg_foreign_server\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveForeignServers",
+    "sql": "select srv.oid as id,\n       srv.srvfdw as fdw_id,\n       srv.xmin as state_number,\n       srv.srvname as name,\n       srv.srvtype as type,\n       srv.srvversion as version,\n       srv.srvoptions as options,\n       pg_catalog.pg_get_userbyid(srv.srvowner) as \"owner\"\nfrom pg_catalog.pg_foreign_server srv\n\n",
+    "columns": [
+      "id",
+      "fdw_id",
+      "state_number",
+      "name",
+      "type",
+      "version",
+      "options",
+      "owner"
+    ]
+  },
+  {
+    "name": "RetrieveExistentUserMappingsSuperUser",
+    "sql": "select oid\nfrom pg_catalog.pg_user_mapping\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveUserMappingsSuperUser",
+    "sql": "select oid as id,\n       umserver as server_id,\n       case when umuser = 0 then null else pg_catalog.pg_get_userbyid(umuser) end as user,\n       umoptions as options\nfrom pg_catalog.pg_user_mapping\n\norder by server_id\n",
+    "columns": [
+      "id",
+      "server_id",
+      "user",
+      "options"
+    ]
+  },
+  {
+    "name": "RetrieveUserMappings",
+    "sql": "select umid as id,\n       srvid as server_id,\n       usename as user,\n       umoptions as options\nfrom pg_catalog.pg_user_mappings\norder by server_id\n",
+    "columns": [
+      "id",
+      "server_id",
+      "user",
+      "options"
+    ]
+  },
+  {
+    "name": "ListReferencingSchemas",
+    "sql": "select distinct connamespace as schema_id\nfrom pg_catalog.pg_constraint F,\n     pg_catalog.pg_class O\nwhere F.contype = 'f'\n  and F.confrelid = O.oid\n  and O.relnamespace in (SCHEMAIDS)\n",
+    "columns": [
+      "schema_id"
+    ]
+  },
+  {
+    "name": "RetrieveRelations",
+    "sql": "select D.objid as dependent_id,\n       D.refobjid as owner_id,\n       D.refobjsubid as owner_subobject_id\nfrom pg_depend D\n  join pg_class C_SEQ on D.objid    = C_SEQ.oid and D.classid    = 'pg_class'::regclass::oid\n  join pg_class C_TAB on D.refobjid = C_TAB.oid and D.refclassid = 'pg_class'::regclass::oid\nwhere C_SEQ.relkind = 'S'\n  and C_TAB.relkind = 'r'\n  and D.refobjsubid <> 0\n  and (D.deptype = 'a' or D.deptype = 'i')\n  and C_TAB.relnamespace = :schema_id::oid\norder by owner_id\n",
+    "columns": [
+      "dependent_id",
+      "owner_id",
+      "owner_subobject_id"
+    ]
+  },
+  {
+    "name": "RetrieveTimeZones",
+    "sql": "select name, is_dst from pg_catalog.pg_timezone_names\nunion distinct\nselect abbrev as name, is_dst from pg_catalog.pg_timezone_abbrevs\n",
+    "columns": [
+      "name",
+      "is_dst"
+    ]
+  },
+  {
+    "name": "RetrieveDateStyle",
+    "sql": "show DateStyle\n",
+    "columns": [
+      null
+    ]
+  },
+  {
+    "name": "RetrieveExistentSecurityPolicies",
+    "sql": "select P.oid\nfrom pg_catalog.pg_policy P\n     join pg_catalog.pg_class C on polrelid = C.oid\nwhere relnamespace = :schema_id::oid\n",
+    "columns": [
+      "oid"
+    ]
+  },
+  {
+    "name": "RetrieveSecurityPolicies",
+    "sql": "select\n       P.oid id,\n       P.xmin as state_number,\n       polname policyname,\n       polrelid table_id,\n        polpermissive  as permissive,\n       polroles roles,\n       polcmd cmd,\n       pg_get_expr(polqual, polrelid) qual,\n       pg_get_expr(polwithcheck, polrelid) with_check\nfrom pg_catalog.pg_policy P\n       join pg_catalog.pg_class C on polrelid = C.oid\nwhere relnamespace = :schema_id::oid\n  \n  \norder by polrelid\n",
+    "columns": [
+      "id",
+      "state_number",
+      "policyname",
+      "table_id",
+      "permissive",
+      "roles",
+      "cmd",
+      "qual",
+      "with_check"
+    ]
+  },
+  {
+    "name": "RetrieveSecurityPolicies",
+    "sql": "select\n       P.oid id,\n       P.xmin as state_number,\n       polname policyname,\n       polrelid table_id,\n        polpermissive  as permissive,\n       polroles roles,\n       polcmd cmd,\n       pg_get_expr(polqual, polrelid) qual,\n       pg_get_expr(polwithcheck, polrelid) with_check\nfrom pg_catalog.pg_policy P\n       join pg_catalog.pg_class C on polrelid = C.oid\nwhere relnamespace = :schema_id::oid\n   and C.relname in ( :[*f_names] )\n  \norder by polrelid\n",
+    "columns": [
+      "id",
+      "state_number",
+      "policyname",
+      "table_id",
+      "permissive",
+      "roles",
+      "cmd",
+      "qual",
+      "with_check"
+    ]
+  },
+  {
+    "name": "RetrieveDependentTableNames",
+    "sql": "select T.relname\nfrom pg_catalog.pg_class PAR\n     join pg_catalog.pg_inherits I on I.inhparent = PAR.oid\n     join pg_catalog.pg_class T on T.oid = I.inhrelid\nwhere PAR.relkind in ('r', 'm', 'v', 'p', 'f') and\n      PAR.relnamespace = :schema_id::oid and\n      T.relkind in ('r', 'm', 'v', 'p', 'f') and\n      T.relnamespace = :schema_id::oid and\n      PAR.relname in ( :[*f_names] )\n",
+    "columns": [
+      "relname"
+    ]
+  },
+  {
+    "name": "L1_ListAllExistentObjects",
+    "sql": "select T.oid as oid,\n       relnamespace as schemaId,\n       pg_catalog.translate(relkind, 'rmvpfS', 'rmvrfS') as kind\nfrom pg_catalog.pg_class T\nwhere relnamespace in ( :[*schema_ids] )\n  and relkind in ('r', 'm', 'v', 'p', 'f', 'S')\n--\nunion all\n-- begin objectType\nselect T.oid,\n       T.typnamespace,\n       'T' as kind\nfrom pg_catalog.pg_type T\n     left outer join pg_catalog.pg_class C on T.typrelid = C.oid\nwhere T.typnamespace in ( :[*schema_ids] )\n  and ( T.typtype in ('d','e') or\n        C.relkind = 'c'::\"char\" or\n        (T.typtype = 'b' and (T.typelem = 0 OR T.typcategory <> 'A')) or\n        T.typtype = 'p' and not T.typisdefined )\n--\nunion all\n-- begin collation\nselect oid,\n       collnamespace,\n       'C' as kind\nfrom pg_catalog.pg_collation\nwhere collnamespace in ( :[*schema_ids] )\n--\nunion all\n-- begin ops\nselect oid,\n       oprnamespace,\n       'O' as kind\nfrom pg_catalog.pg_operator\nwhere oprnamespace in ( :[*schema_ids] )\n--\nunion all\n-- begin opClasses\nselect oid,\n       opcnamespace,\n       'c' as kind\nfrom pg_catalog.pg_opclass\nwhere opcnamespace in ( :[*schema_ids] )\n--\nunion all\n-- begin opFams\nselect oid,\n       opfnamespace,\n       'F' as kind\nfrom pg_catalog.pg_opfamily\nwhere opfnamespace in ( :[*schema_ids] )\n--\nunion all\n-- begin agg & routine\nselect oid,\n       pronamespace,\n       case when  prokind != 'a'  then 'R'\n            else 'a'\n            end as kind\nfrom pg_catalog.pg_proc\nwhere pronamespace in ( :[*schema_ids] )\n",
+    "columns": [
+      "oid",
+      "schemaid",
+      "kind"
+    ]
+  },
+  {
+    "name": "L1_ListAllMajorNames",
+    "sql": "select T.oid as oid,\n       relnamespace as schemaId,\n       pg_catalog.translate(relkind, 'rmvpfS', 'rmvrfS') as kind,\n       relname as name\nfrom pg_catalog.pg_class T\nwhere relnamespace in ( :[*schema_ids] )\n  and relkind in ('r', 'm', 'v', 'p', 'f', 'S')\n  \n-- end relations (table like stuff & seq)\nunion all\n-- begin objectType\nselect T.oid,\n       T.typnamespace,\n       'T',\n       T.typname\nfrom pg_catalog.pg_type T\n     left outer join pg_catalog.pg_class C on T.typrelid = C.oid\nwhere T.typnamespace in ( :[*schema_ids] )\n  and ( T.typtype in ('d','e') or\n        C.relkind = 'c'::\"char\" or\n        (T.typtype = 'b' and (T.typelem = 0 OR T.typcategory <> 'A')) or\n        T.typtype = 'p' and not T.typisdefined )\n  \n--\nunion all\n-- begin collation\nselect oid,\n       collnamespace,\n       'C',\n       collname\nfrom pg_catalog.pg_collation\nwhere collnamespace in ( :[*schema_ids] )\n  \n--\nunion all\n-- begin ops\nselect oid,\n       oprnamespace,\n       'O',\n       oprname\nfrom pg_catalog.pg_operator\nwhere oprnamespace in ( :[*schema_ids] )\n  \n--\nunion all\n-- begin opClasses\nselect oid,\n       opcnamespace,\n       'c',\n       opcname\nfrom pg_catalog.pg_opclass\nwhere opcnamespace in ( :[*schema_ids] )\n  \n--\nunion all\n-- begin opFams\nselect oid,\n       opfnamespace,\n       'F',\n       opfname\nfrom pg_catalog.pg_opfamily\nwhere opfnamespace in ( :[*schema_ids] )\n  \n--\nunion all\n-- begin agg & routine\nselect oid,\n       pronamespace,\n       case when  prokind != 'a' then 'R'\n            else 'a'\n            end,\n       proname\nfrom pg_catalog.pg_proc\nwhere pronamespace in ( :[*schema_ids] )\n  \n--\norder by schemaId\n",
+    "columns": [
+      "oid",
+      "schemaid",
+      "kind",
+      "name"
+    ]
+  },
+  {
+    "name": "L1_RetrieveColumnNames",
+    "sql": "with T as ( select  T.oid as oid,\n                                     T.relkind as kind,\n                                     T.relnamespace as schemaId\n            from pg_catalog.pg_class T\n              \n            where T.relnamespace in ( :[*schema_ids] )\n              and T.relkind in ('r', 'm', 'v', 'f', 'p')\n              \n              \n          )\nselect T.schemaId as schemaId,\n       T.oid as majorOid,\n       pg_catalog.translate(T.kind, 'rmvpf', 'rmvrf') as kind,\n       C.attnum as position,\n       C.attname as name\nfrom T\n     join pg_catalog.pg_attribute C on T.oid = C.attrelid\nwhere C.attnum > 0\n  and not C.attisdropped\norder by schemaId, majorOid\n",
+    "columns": [
+      "schemaid",
+      "majoroid",
+      "kind",
+      "position",
+      "name"
+    ]
+  },
+  {
+    "name": "L1_RetrieveRoutineArgNames",
+    "sql": "select pronamespace as schemaId,\n       oid as majorOid,\n       proargnames as argNames,\n       proargmodes as argModes,\n       array_length(proargtypes, 1) as nArgs\nfrom pg_catalog.pg_proc\nwhere pronamespace in ( :[*schema_ids] )\n  \norder by schemaId\n",
+    "columns": [
+      "schemaid",
+      "majoroid",
+      "argnames",
+      "argmodes",
+      "nargs"
+    ]
+  },
+  {
+    "name": "RoleMembership",
+    "sql": "select member id, roleid role_id, admin_option from pg_catalog.pg_auth_members order by id, roleid::text",
+    "columns": [
+      "id",
+      "role_id",
+      "admin_option"
+    ]
+  }
+]

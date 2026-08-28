@@ -156,9 +156,15 @@ type Options struct {
 
 // A Server is an experimental PostgreSQL wire-protocol endpoint supporting a documented SQL subset over one database.
 type Server struct {
-	db      *sqldriver.Database
-	backend Backend
-	opts    Options
+	// Cold-path metadata identities are shared by IDE discovery connections.
+	catalogMu        sync.Mutex
+	catalogIDs       map[string]uint32
+	catalogNext      uint32
+	catalogNameBytes int
+	started          time.Time
+	db               *sqldriver.Database
+	backend          Backend
+	opts             Options
 
 	mu        sync.Mutex
 	sessions  map[int32]*session
@@ -260,6 +266,7 @@ func NewServerWithBackend(backend Backend, opts Options) (*Server, error) {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
 	return &Server{
+		started:   time.Now(),
 		backend:   backend,
 		opts:      opts,
 		sessions:  map[int32]*session{},

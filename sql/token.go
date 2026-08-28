@@ -37,6 +37,8 @@ const (
 	tokPercent
 	tokConcat      // ||
 	tokDoubleColon // ::, retained so the unsupported shorthand is typed 0A000
+	tokJSONArrow   // ->, constant JSON path segment
+	tokJSONText    // ->>, terminal JSON path segment returned as text
 )
 
 // A token is one lexeme. text is a slice of the source for identifiers,

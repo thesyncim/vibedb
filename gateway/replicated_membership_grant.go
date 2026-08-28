@@ -510,6 +510,7 @@ func buildReplicaReplacementPostRemoveTransition(
 		cloneConfig(current.config), current.endpoints, nextGeneration,
 		current.indexDescriptors(), current.statistics.Descriptors(), descriptors,
 		current.replicatedTableProfiles(),
+		current.ReplicatedTableDeclarations(),
 	)
 	if err != nil {
 		return nil, err

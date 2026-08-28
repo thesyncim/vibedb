@@ -98,6 +98,7 @@ func rf3ReplicaObservationAuthorizer(registry *rafttransport.StaticRegistry, pol
 func runServeRF3(args []string) int {
 	fs := flag.NewFlagSet("serve-rf3", flag.ContinueOnError)
 	manifestPath := fs.String("manifest", "", "canonical prepared RF3 member manifest")
+	reload := fs.Bool("reload-prepared-groups", false, "allow SIGHUP to append durably prepared groups from the same manifest")
 	executionLanes := fs.Int("execution-lanes", rf3DefaultExecutionLanes, "power-of-two Raft execution lanes")
 	if err := fs.Parse(args); err != nil || *manifestPath == "" || fs.NArg() != 0 ||
 		!validRF3ExecutionLanes(*executionLanes) {
@@ -111,6 +112,12 @@ func runServeRF3(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if *reload {
+		changes := make(chan os.Signal, 1)
+		signal.Notify(changes, syscall.SIGHUP)
+		defer signal.Stop(changes)
+		manifest.reloadPath, manifest.reloadSignals = *manifestPath, changes
+	}
 	err = servePreparedRF3WithExecutionLanes(ctx, manifest, *executionLanes, net.Listen)
 	if err = componentShutdownError(err, context.Cause(ctx)); err != nil {
 		fmt.Fprintf(os.Stderr, "error serve RF3: %v\n", err)
@@ -588,10 +595,6 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
-	servedGroups := make(map[raftmember.GroupKey]raftmember.RuntimeIdentity, len(identities))
-	for _, identity := range identities {
-		servedGroups[identity.Group] = identity
-	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
 		Observer:     peer.Owners(),
 		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
@@ -606,8 +609,8 @@ func servePreparedRF3WithExecutionLanes(
 	backupControl, err := clusterbackupservice.New(clusterbackupservice.Options{
 		Owner: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request clusterbackup.LiveRequest) bool {
-			local, served := servedGroups[request.Group]
-			return served && local.MemberID == request.SourceMember &&
+			local, err := transportRegistry.LocalMember(request.Group)
+			return err == nil && local == request.SourceMember &&
 				policy.Check(identity.Node, serviceauthz.CapabilityBackup) == serviceauthz.DecisionAllow
 		},
 		ReadDeadline: deadline, WriteDeadline: deadline,
@@ -634,8 +637,8 @@ func servePreparedRF3WithExecutionLanes(
 	actionControl, err := replicaaction.NewService(replicaaction.Options{
 		Journal: actionJournal, Owner: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request replicaaction.Request) bool {
-			local, served := servedGroups[request.Fence.Group]
-			return served && request.Fence.MemberID == local.MemberID &&
+			local, err := transportRegistry.LocalMember(request.Fence.Group)
+			return err == nil && request.Fence.MemberID == local &&
 				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
 		},
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
@@ -688,8 +691,8 @@ func servePreparedRF3WithExecutionLanes(
 	schemaControl, err := schemainstall.NewControlService(schemainstall.ControlOptions{
 		Installer: schemaInstaller,
 		Authorize: func(identity rafttransport.PeerIdentity, request schemainstall.Request, _ schemainstall.Command) bool {
-			_, served := servedGroups[request.Group]
-			return served && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
+			_, err := transportRegistry.LocalMember(request.Group)
+			return err == nil && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
 		},
 		ReadDeadline: deadline, WriteDeadline: deadline,
 		MaxBundleBytes: schemainstall.AbsoluteMaxBundleBytes,
@@ -1038,18 +1041,26 @@ func servePreparedRF3WithExecutionLanes(
 
 	var primary error
 	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
-	select {
-	case <-parent.Done():
-		// A requested shutdown is not an error. Component failures observed below
-		// remain visible unless they are the expected cancellation result.
-	case err := <-peerDone:
-		primary, peerFinished = fmt.Errorf("RF3 peer stopped: %w", err), true
-	case err := <-controlDone:
-		primary, controlFinished = fmt.Errorf("RF3 control listener stopped: %w", err), true
-	case err := <-snapshotDone:
-		primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped: %w", err), true
-	case err := <-nativeDone:
-		primary, nativeFinished = fmt.Errorf("RF3 native listener stopped: %w", err), true
+	for {
+		select {
+		case <-manifest.reloadSignals:
+			if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator); err != nil {
+				fmt.Fprintf(os.Stderr, "RF3 prepared group reload refused: %v\n", err)
+			}
+			continue
+		case <-parent.Done():
+			// A requested shutdown is not an error. Component failures observed below
+			// remain visible unless they are the expected cancellation result.
+		case err := <-peerDone:
+			primary, peerFinished = fmt.Errorf("RF3 peer stopped: %w", err), true
+		case err := <-controlDone:
+			primary, controlFinished = fmt.Errorf("RF3 control listener stopped: %w", err), true
+		case err := <-snapshotDone:
+			primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped: %w", err), true
+		case err := <-nativeDone:
+			primary, nativeFinished = fmt.Errorf("RF3 native listener stopped: %w", err), true
+		}
+		break
 	}
 
 	// Fence and join client ingress before retiring Owner/Host/runtime.

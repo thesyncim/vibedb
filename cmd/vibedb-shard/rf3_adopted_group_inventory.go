@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -90,9 +92,19 @@ func openRF3AdoptedGroupInventory(manifest rf3Manifest) (*rf3AdoptedGroupInvento
 	if err = errors.Join(err, file.Close()); err != nil {
 		return fail(err)
 	}
-	if !bytes.Equal(raw[:8], []byte("VDBLIVEG")) || !bytes.Equal(raw[8:40], manifest.Digest[:]) ||
-		binary.LittleEndian.Uint64(raw[40:48]) != uint64(len(manifest.groupBundles())) ||
+	if !bytes.Equal(raw[:8], []byte("VDBLIVEG")) ||
 		!bytes.Equal(raw[48:64], make([]byte, 16)) || sha256.Sum256(raw[:len(raw)-32]) != [32]byte(raw[len(raw)-32:]) {
+		return fail(errRF3Serving)
+	}
+	rebind := !bytes.Equal(raw[8:40], manifest.Digest[:])
+	if rebind {
+		previous, err := loadRF3Manifest(filepath.Join(path, "prepared-manifests", hex.EncodeToString(raw[8:40])+".vibejson"))
+		if err != nil || !bytes.Equal(previous.Digest[:], raw[8:40]) || validateRF3GroupAppend(previous, manifest) != nil {
+			return fail(errors.Join(errRF3Serving, err))
+		}
+		result.manifest = previous
+	}
+	if binary.LittleEndian.Uint64(raw[40:48]) != uint64(len(result.manifest.groupBundles())) {
 		return fail(errRF3Serving)
 	}
 	for index := range result.entries {
@@ -116,6 +128,12 @@ func openRF3AdoptedGroupInventory(manifest rf3Manifest) (*rf3AdoptedGroupInvento
 	}
 	if result.liveCount()+len(manifest.groupBundles()) > maxRF3ManifestGroups {
 		return fail(errRF3Serving)
+	}
+	if rebind {
+		result.manifest = manifest
+		if err := result.save(result.entries); err != nil {
+			return fail(err)
+		}
 	}
 	return result, nil
 }

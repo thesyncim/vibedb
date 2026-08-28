@@ -56,7 +56,7 @@ func newRF3GroupChildPreparer(
 		}
 	}
 	var err error
-	result.store, result.slots, err = openRF3ChildAdmissionStore(manifest.ReplicaControl.SourceDataRoot, manifest.Digest, limit)
+	result.store, result.slots, err = openRF3ChildAdmissionStore(manifest.ReplicaControl.SourceDataRoot, manifest.Digest, limit, manifest)
 	if err != nil {
 		return nil, err
 	}

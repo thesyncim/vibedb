@@ -54,7 +54,8 @@ func (driver *nativeDurableRequestRouteGateSessions) session(route ReplicatedRou
 	return NewNativeSession(NativeSessionOptions{
 		Executor: driver.executor, Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: wave.Tenant, ClientID: id, RetryHome: wave.Identity.RetryHome,
-		Resolver: BaseRelationResolver{Relation: 1}, ProposalCapability: serviceauthz.CapabilityDataWrite,
+		ScopedCoordination: true,
+		Resolver:           BaseRelationResolver{Relation: 1}, ProposalCapability: serviceauthz.CapabilityDataWrite,
 		MaxRelationBatches: 1, MaxMutations: 1,
 		InitialCommandBytes: requestledger.MaxRouteGatePinCommandBytes,
 		MaxCommandBytes:     requestledger.MaxRouteGatePinCommandBytes,
@@ -104,7 +105,11 @@ func (driver *nativeDurableRequestRouteGateSessions) settledSession(route Replic
 		return nil, replication.CommandView{}, errors.Join(err, identityErr, ErrDurableRequestConflict)
 	}
 	session, err := driver.session(route, wave, identity)
+	if session != nil {
+		session.scopedCoordination = outer.AuthorityClass == replication.CommandAuthorityRouteSession
+	}
 	if err != nil || session.clientID != outer.ClientID || outer.ClientEpoch == 0 ||
+		(outer.AuthorityClass != replication.CommandAuthorityData && outer.AuthorityClass != replication.CommandAuthorityRouteSession) ||
 		(pin.Phase == requestledger.RoutePinAcquired && (gate.Operation != routegate.OperationAcquireShared || outer.ClientSequence != 2 || outer.AckThrough != 1)) ||
 		(pin.Phase == requestledger.RoutePinReleased && (gate.Operation != routegate.OperationReleaseShared || outer.ClientSequence != 3 || outer.AckThrough != 2)) ||
 		(pin.Phase != requestledger.RoutePinAcquired && pin.Phase != requestledger.RoutePinReleased) {

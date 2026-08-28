@@ -35,10 +35,11 @@ func newSessionReleaseFixture(
 		return targetOf(collection)
 	}
 
-	systemDocuments := max(7, 2*int(retryWindow)+2)
+	systemDocuments := max(7, 3*int(retryWindow)+3)
 	system := openCollection("system", durable.Options{
 		OpaqueValues:      true,
 		MaxBatchDocuments: systemDocuments,
+		MaxDocumentBytes:  MaxStateEnvelopeBytes,
 	})
 	system = systemTargetOf(system.Collection)
 	user := openCollection("user", durable.Options{})

@@ -63,7 +63,7 @@ func (m *Machine) planExecutionPinCommand(
 	systemSnapshot pointSnapshot,
 ) (commandPlan, error) {
 	if command.Kind() != replication.CommandExecutionPin ||
-		command.AuthorityClass != replication.CommandAuthorityExecutionPin {
+		!replication.IsExecutionPinAuthority(command.AuthorityClass) {
 		return commandPlan{}, ErrExecutionPinStateCorrupt
 	}
 	nested, err := command.OpenExecutionPin()

@@ -828,7 +828,7 @@ func scanSessionSystemSnapshot(
 ) (State, bool, uint64, uint64, uint64, *routegate.Machine, error) {
 	var state State
 	var statePresent bool
-	var sessionCount, slotCount, authorityCount uint64
+	var sessionCount, slotCount, authorityCount, permanentAuthorityCount uint64
 	var sessions map[[sha256.Size]byte]scannedSession
 	var authorities map[[sha256.Size]byte]replication.CommandAuthorityClass
 	var knownSessionDigests map[[sha256.Size]byte]struct{}
@@ -901,7 +901,7 @@ func scanSessionSystemSnapshot(
 			if err != nil {
 				return err
 			}
-			if state.SessionCount > maxSessions || state.AuthorityBindingCount > maxSessions ||
+			if state.SessionCount > maxSessions || state.AuthorityBindingCount > 2*maxSessions ||
 				retryWindow == 0 ||
 				state.SessionSlotCount > state.SessionCount*uint64(retryWindow) {
 				return fmt.Errorf("%w: bounded session counts", ErrStateCorrupt)
@@ -972,7 +972,7 @@ func scanSessionSystemSnapshot(
 			if sessionCount >= maxSessions {
 				return fmt.Errorf("%w: session count exceeds configured bound", ErrSessionCorrupt)
 			}
-			stableDigest := AuthorityIdentityKey(view.Tenant, view.ClientID)
+			stableDigest := sessionAuthorityIdentityKey(view.AuthorityClass, view.Tenant, view.ClientID)
 			if _, duplicate := activeIdentities[stableDigest]; duplicate ||
 				len(tenantArena) > math.MaxInt32-len(view.Tenant) {
 				return fmt.Errorf("%w: duplicate or excessive stable identity", ErrSessionCorrupt)
@@ -1060,8 +1060,18 @@ func scanSessionSystemSnapshot(
 			if err != nil || !bytes.Equal(key, want[:]) {
 				return errors.Join(err, fmt.Errorf("%w: authority binding key", ErrSessionCorrupt))
 			}
-			if _, duplicate := authorities[view.Digest]; duplicate || authorityCount >= maxSessions {
+			if _, duplicate := authorities[view.Digest]; duplicate || authorityCount >= 2*maxSessions {
 				return fmt.Errorf("%w: duplicate or excessive authority binding", ErrSessionCorrupt)
+			}
+			if replication.IsScopedSessionAuthority(view.AuthorityClass) {
+				if _, active := activeIdentities[view.Digest]; !active {
+					return fmt.Errorf("%w: scoped binding without session", ErrSessionCorrupt)
+				}
+			} else {
+				permanentAuthorityCount++
+				if permanentAuthorityCount > maxSessions {
+					return fmt.Errorf("%w: permanent authority bound", ErrSessionCorrupt)
+				}
 			}
 			if sessionDigest, active := activeIdentities[view.Digest]; active {
 				summary := sessions[sessionDigest]

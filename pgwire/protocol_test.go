@@ -186,7 +186,7 @@ func TestStartupRefusesAnUnknownProtocolVersion(t *testing.T) {
 
 func TestStartupRefusesAnUnsupportedRuntimeParameter(t *testing.T) {
 	c := dial(t, newTestServer(t, Options{}))
-	c.sendStartup(map[string]string{"user": "tester", "search_path": "public"})
+	c.sendStartup(map[string]string{"user": "tester", "role": "admin"})
 	m := c.recv()
 	if m.tag != msgErrorResponse {
 		t.Fatalf("expected the connection to be refused, got %q", string(rune(m.tag)))
@@ -195,8 +195,8 @@ func TestStartupRefusesAnUnsupportedRuntimeParameter(t *testing.T) {
 	if fs['C'] != sqlstateFeatureNotSupported {
 		t.Fatalf("wrong SQLSTATE for an unsupported startup parameter: %s", formatError(m.body))
 	}
-	if !strings.Contains(fs['H'], "no schemas") {
-		t.Errorf("the refusal does not explain why search_path cannot work: %q", fs['H'])
+	if !strings.Contains(fs['H'], "no role") {
+		t.Errorf("the refusal does not explain why role cannot work: %q", fs['H'])
 	}
 }
 
@@ -1096,7 +1096,7 @@ func TestErrorClassification(t *testing.T) {
 			`) SEARCH DEPTH FIRST BY id SET ord SELECT id FROM x`, sqlstateFeatureNotSupported},
 		{`banana`, sqlstateSyntaxError},
 		{`SET statement_timeout = 100`, sqlstateFeatureNotSupported},
-		{`SET search_path = public`, sqlstateFeatureNotSupported},
+		{`SET search_path = private`, sqlstateInvalidParameterValue},
 		{`SHOW nonexistent_setting`, sqlstateUndefinedObject},
 	}
 	for _, tc := range cases {

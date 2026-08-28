@@ -1153,7 +1153,7 @@ func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
 		return class == replication.CommandAuthorityTopology
 	}
 	if capability == serviceauthz.CapabilityExecutionPin {
-		return class == replication.CommandAuthorityExecutionPin &&
+		return replication.IsExecutionPinAuthority(class) &&
 			(kind == replication.CommandExecutionPin || kind == replication.CommandSessionOpen ||
 				kind == replication.CommandSessionRenew || kind == replication.CommandSessionRevoke ||
 				kind == replication.CommandSessionRetire || kind == replication.CommandSessionRelease)
@@ -1167,7 +1167,7 @@ func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
 			class == replication.CommandAuthorityRequestLedger
 	}
 	return (capability == 0 || capability == serviceauthz.CapabilityDataWrite) &&
-		class == replication.CommandAuthorityData
+		(class == replication.CommandAuthorityData || class == replication.CommandAuthorityRouteSession)
 }
 
 func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {

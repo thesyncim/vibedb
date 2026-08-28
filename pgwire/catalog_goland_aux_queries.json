@@ -1,0 +1,76 @@
+[
+  {
+    "name": "GoLand server ACLs",
+    "sql": "select T.oid as object_id,T.spcacl as acl from pg_catalog.pg_tablespace T union all select T.oid as object_id,T.datacl as acl from pg_catalog.pg_database T",
+    "columns": [
+      "object_id",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand database ACLs",
+    "sql": "select T.oid as object_id,T.fdwacl as acl from pg_catalog.pg_foreign_data_wrapper T union all select T.oid as object_id,T.lanacl as acl from pg_catalog.pg_language T union all select T.oid as object_id,T.nspacl as acl from pg_catalog.pg_namespace T union all select T.oid as object_id,T.srvacl as acl from pg_catalog.pg_foreign_server T",
+    "columns": [
+      "object_id",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand schema ACLs",
+    "sql": "select T.oid as object_id,T.relacl as acl from pg_catalog.pg_class T where relnamespace = :schema_id::oid union all select T.oid as object_id,T.proacl as acl from pg_catalog.pg_proc T where pronamespace = :schema_id::oid union all select T.oid as object_id,T.typacl as acl from pg_catalog.pg_type T where typnamespace = :schema_id::oid order by object_id",
+    "columns": [
+      "object_id",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand column ACLs",
+    "sql": "select T.oid as object_id,A.attnum as attr_position,A.attacl as acl from pg_catalog.pg_attribute A join pg_catalog.pg_class T on T.oid = A.attrelid where relnamespace = :schema_id::oid and attnum > 0 order by object_id,attr_position",
+    "columns": [
+      "object_id",
+      "attr_position",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand search path",
+    "sql": "select current_database() as a, current_schemas(false) as b",
+    "columns": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "name": "GoLand server ACLs",
+    "sql": "select T.oid as object_id,T.spcacl as acl from pg_catalog.pg_tablespace T where pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) union all select T.oid as object_id,T.datacl as acl from pg_catalog.pg_database T where pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid)",
+    "columns": [
+      "object_id",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand database ACLs",
+    "sql": "select T.oid as object_id,T.fdwacl as acl from pg_catalog.pg_foreign_data_wrapper T where pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) union all select T.oid as object_id,T.lanacl as acl from pg_catalog.pg_language T where pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) union all select T.oid as object_id,T.nspacl as acl from pg_catalog.pg_namespace T where pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) union all select T.oid as object_id,T.srvacl as acl from pg_catalog.pg_foreign_server T where pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid)",
+    "columns": [
+      "object_id",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand schema ACLs",
+    "sql": "select T.oid as object_id,T.relacl as acl from pg_catalog.pg_class T where relnamespace = :schema_id::oid and pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) union all select T.oid as object_id,T.proacl as acl from pg_catalog.pg_proc T where pronamespace = :schema_id::oid and pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) union all select T.oid as object_id,T.typacl as acl from pg_catalog.pg_type T where typnamespace = :schema_id::oid and pg_catalog.age(T.xmin) <= pg_catalog.age(:state::varchar::xid) order by object_id",
+    "columns": [
+      "object_id",
+      "acl"
+    ]
+  },
+  {
+    "name": "GoLand column ACLs",
+    "sql": "select T.oid as object_id,A.attnum as attr_position,A.attacl as acl from pg_catalog.pg_attribute A join pg_catalog.pg_class T on T.oid = A.attrelid where relnamespace = :schema_id::oid and attnum > 0 and pg_catalog.age(A.xmin) <= pg_catalog.age(:state::varchar::xid) order by object_id,attr_position",
+    "columns": [
+      "object_id",
+      "attr_position",
+      "acl"
+    ]
+  }
+]

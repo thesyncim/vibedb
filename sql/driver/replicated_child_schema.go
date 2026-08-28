@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/query"
 	vibesql "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 )
@@ -13,7 +14,7 @@ import (
 const ReplicatedChildSchemaMaxBytes = 64 << 10
 
 // ValidateReplicatedChildSchema authenticates explicit provisioning DDL against
-// the retained relation manifest. Only schema-free table definitions and named
+// the retained relation manifest. Only exact table definitions and named
 // exact indexes are accepted: provisioning cannot infer names or run data DML.
 func ValidateReplicatedChildSchema(expected ReplicatedShardStoreIdentity, createTable string,
 	statements []string, globals []ReplicatedGlobalIndexRelation,
@@ -22,7 +23,7 @@ func ValidateReplicatedChildSchema(expected ReplicatedShardStoreIdentity, create
 		return ErrReplicatedShardStoreProfile
 	}
 	return validateReplicatedChildSchemaDefinition(expected.UserTable, expected.UserPrimaryKey,
-		createTable, statements, globals, &expected.Relations[0].LocalIndexDigest)
+		createTable, statements, globals, &expected.Relations[0])
 }
 
 // ValidateReplicatedChildSchemaDefinition checks an initial schema before any
@@ -35,7 +36,7 @@ func ValidateReplicatedChildSchemaDefinition(table, primaryKey, createTable stri
 }
 
 func validateReplicatedChildSchemaDefinition(table, primaryKey, createTable string,
-	statements []string, globals []ReplicatedGlobalIndexRelation, localDigest *[32]byte,
+	statements []string, globals []ReplicatedGlobalIndexRelation, expected *ReplicatedShardRelationIdentity,
 ) error {
 	fail := func() error {
 		return fmt.Errorf("%w: child schema differs from retained relation manifest", ErrReplicatedShardStoreProfile)
@@ -71,6 +72,18 @@ func validateReplicatedChildSchemaDefinition(table, primaryKey, createTable stri
 	if err != nil || !replicatedChildTableMatches(base, table, primaryKey) {
 		return fail()
 	}
+	prepared, err := query.PrepareParsedDML(createTable, base)
+	if err != nil {
+		return fail()
+	}
+	definition, err := prepared.LowerTable()
+	prepared.Release()
+	if err != nil || validatePrimarySchema(primaryKey, definition.Schema) != nil {
+		return fail()
+	}
+	if expected != nil && replicatedSchemaDigest(schemaMetaFrom(definition.Schema)) != expected.SchemaDigest {
+		return fail()
+	}
 	created := make([]bool, len(globals))
 	indexes := make([]indexMeta, 0, len(statements))
 	names := make(map[string]struct{}, len(statements))
@@ -86,7 +99,7 @@ func validateReplicatedChildSchemaDefinition(table, primaryKey, createTable stri
 				if statement.CreateTable.Table != global.Table {
 					continue
 				}
-				if created[i] || !replicatedChildTableMatches(statement, global.Table, "/key") {
+				if created[i] || len(statement.CreateTable.Columns) != 0 || !replicatedChildTableMatches(statement, global.Table, "/key") {
 					return fail()
 				}
 				created[i], found = true, true
@@ -122,7 +135,7 @@ func validateReplicatedChildSchemaDefinition(table, primaryKey, createTable stri
 			return fail()
 		}
 	}
-	if localDigest != nil && replicatedLocalIndexDigest(indexes) != *localDigest {
+	if expected != nil && replicatedLocalIndexDigest(indexes) != expected.LocalIndexDigest {
 		return fail()
 	}
 	return nil
@@ -133,6 +146,6 @@ func replicatedChildTableMatches(statement *vibesql.Statement, table, primaryKey
 		return false
 	}
 	definition := statement.CreateTable
-	return definition.Table == table && !definition.IfNotExists && len(definition.Columns) == 0 &&
+	return definition.Table == table && !definition.IfNotExists &&
 		len(definition.PrimaryKey) == 1 && string(definition.PrimaryKey[0].AppendPointer(nil)) == primaryKey
 }

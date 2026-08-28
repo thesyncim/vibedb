@@ -18,6 +18,28 @@ import (
 
 const durableExecutionPinSessionStripes = 4096
 
+func scopedNativeSessionJournalBinding(binding replication.Digest) replication.Digest {
+	var raw [33]byte
+	raw[0] = 1
+	copy(raw[1:], binding[:])
+	return sha256.Sum256(raw[:])
+}
+
+func executionPinJournalPath(base string) (path string, scoped, present bool, err error) {
+	legacy, err := NativeSessionJournalPresent(base)
+	if err != nil {
+		return "", false, false, err
+	}
+	modern, err := NativeSessionJournalPresent(base + ".scoped")
+	if err != nil || legacy && modern {
+		return "", false, false, errors.Join(err, ErrNativeSessionJournal)
+	}
+	if legacy {
+		return base, false, true, nil
+	}
+	return base + ".scoped", true, modern, nil
+}
+
 // JournaledDurableRequestExecutionPinSessionFactory opens one compact exact-
 // retry journal per request/controller principal. A fixed striped latch keeps
 // memory constant while preventing two goroutines in one gateway from driving
@@ -79,8 +101,16 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 		release()
 		return nil, serviceauthz.Authority{}, nil, err
 	}
+	journalPath, scoped, _, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
+	if err != nil {
+		release()
+		return nil, serviceauthz.Authority{}, nil, err
+	}
+	if scoped {
+		journalBinding = scopedNativeSessionJournalBinding(journalBinding)
+	}
 	journal, err := OpenNativeSessionJournal(NativeSessionJournalOptions{
-		Path:     filepath.Join(factory.directory, hex.EncodeToString(identity[:])),
+		Path:     journalPath,
 		ClientID: identity, RetryHome: execution.Recipe.Identity.RetryHome,
 		MaxCommandBytes: replication.MaxCommandBytes, Binding: journalBinding,
 	})
@@ -94,6 +124,7 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 		Tenant: execution.Recipe.Tenant, ClientID: identity,
 		RetryHome: execution.Recipe.Identity.RetryHome, Resolver: resolver,
 		Journal: journal, ProposalCapability: serviceauthz.CapabilityExecutionPin,
+		ScopedCoordination: scoped,
 		MaxRelationBatches: 1, MaxMutations: 1,
 		InitialCommandBytes: replication.MaxExecutionPinCommandBytes,
 		MaxCommandBytes:     replication.MaxCommandBytes,
@@ -152,17 +183,9 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireTerminal
 		return errors.Join(err, pinErr, ErrDurableRequestConflict)
 	}
 	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
-	base := filepath.Join(factory.directory, hex.EncodeToString(identity[:]))
-	found := false
-	for slot := 0; slot < 2; slot++ {
-		_, statErr := os.Stat(base + "." + string(rune('0'+slot)))
-		if statErr == nil {
-			found = true
-			break
-		}
-		if !errors.Is(statErr, os.ErrNotExist) {
-			return statErr
-		}
+	_, _, found, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
+	if err != nil {
+		return err
 	}
 	if !found {
 		return nil
@@ -218,7 +241,10 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireAcknowle
 	stripe := &factory.stripes[durableExecutionPinSessionStripe(identity)]
 	stripe.Lock()
 	defer stripe.Unlock()
-	base := filepath.Join(factory.directory, hex.EncodeToString(identity[:]))
+	base, _, _, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
+	if err != nil {
+		return err
+	}
 	var joined error
 	for slot := 0; slot < 2; slot++ {
 		if err := os.Remove(base + "." + string(rune('0'+slot))); err != nil &&

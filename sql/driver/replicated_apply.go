@@ -1190,18 +1190,26 @@ type replicatedSQLMutationValidator struct {
 	// Machine apply is serial, but detached snapshot audits may share this
 	// validator concurrently. The mutex gives the reusable owned scratch one
 	// caller at a time; request-backed placement Scalars remain stack-local.
-	mu            sync.Mutex
-	primaryKey    string
-	primary       vibejson.CompiledPointer
-	maxKeyBytes   int
-	placement     replicatedSQLPlacementValidator
-	keyScratch    []byte
-	decodeScratch []byte
+	mu               sync.Mutex
+	primaryKey       string
+	primary          vibejson.CompiledPointer
+	maxKeyBytes      int
+	placement        replicatedSQLPlacementValidator
+	keyScratch       []byte
+	decodeScratch    []byte
+	schema           *store.Schema
+	schemaTape       []vibejson.IndexEntry
+	maxDocumentBytes int
 }
 
 type replicatedSQLPlacementValidator struct {
 	mapper *distribution.NativeMapper
 	target distribution.KeyRange
+}
+
+func (v *replicatedSQLMutationValidator) ValidateCollectionSchema(schema *store.Schema) bool {
+	return v.schema != nil && schema != nil &&
+		replicatedSchemaDigest(schemaMetaFrom(v.schema)) == replicatedSchemaDigest(schemaMetaFrom(schema))
 }
 
 func newReplicatedSQLMutationValidator(
@@ -1212,6 +1220,7 @@ func newReplicatedSQLMutationValidator(
 	validator := &replicatedSQLMutationValidator{
 		primaryKey: identity.UserPrimaryKey, primary: table.primary,
 		maxKeyBytes: identity.UserLimits.MaxKeyBytes,
+		schema:      table.schema, maxDocumentBytes: identity.UserLimits.MaxDocumentBytes,
 	}
 	mapper := distribution.NewNativeMapper(1)
 	validator.placement = replicatedSQLPlacementValidator{
@@ -1226,6 +1235,9 @@ func (v *replicatedSQLMutationValidator) ValidatePut(
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	if v.schema != nil && validateDocument(v.schema, value, v.maxDocumentBytes, &v.schemaTape) != nil {
+		return replicatedstate.MutationValidationInvalid
+	}
 	encoded, _, err := appendDocumentKey(
 		v.keyScratch[:0], value, v.primaryKey, v.primary, v.maxKeyBytes,
 	)
@@ -1273,6 +1285,9 @@ func (v *replicatedSQLMutationValidator) ValidatePutOwnership(
 ) replicatedstate.MutationValidation {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.schema != nil && validateDocument(v.schema, value, v.maxDocumentBytes, &v.schemaTape) != nil {
+		return replicatedstate.MutationValidationInvalid
+	}
 	encoded, _, err := appendDocumentKey(
 		v.keyScratch[:0], value, v.primaryKey, v.primary, v.maxKeyBytes,
 	)

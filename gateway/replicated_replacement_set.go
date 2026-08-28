@@ -88,7 +88,7 @@ func BuildReplicaReplacementSetTransition(current *Snapshot, changes []ReplicaRe
 		}
 	}
 	next, err := NewSnapshotWithReplicatedTableMetadata(config, current.endpoints, current.Generation()+1,
-		current.indexDescriptors(), current.statistics.Descriptors(), descriptors, current.replicatedTableProfiles())
+		current.indexDescriptors(), current.statistics.Descriptors(), descriptors, current.replicatedTableProfiles(), current.ReplicatedTableDeclarations())
 	if err != nil {
 		return nil, err
 	}

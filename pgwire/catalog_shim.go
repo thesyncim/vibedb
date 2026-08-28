@@ -271,9 +271,14 @@ type catalogAnswer struct {
 	user     string
 	tables   []sqldriver.TableInfo
 	oids     []catalogOIDEntry
+	oidMap   map[string]uint32
 }
 
 func (a *catalogAnswer) oidByName(name string) (uint32, bool) {
+	if a.oidMap != nil {
+		oid, ok := a.oidMap[name]
+		return oid, ok
+	}
 	for i := range a.oids {
 		if a.oids[i].name == name {
 			return a.oids[i].oid, true
@@ -332,7 +337,7 @@ func (s *session) catalogShim(
 		return nil, false, err
 	}
 	if !ok {
-		return nil, false, nil
+		return s.discoveryShim(text, check)
 	}
 	tables, err := s.sql.Tables(context.Background())
 	if err != nil {
@@ -377,6 +382,13 @@ func (s *session) ensureCatalogOIDs(tables []sqldriver.TableInfo) bool {
 		s.catalogOIDs = append(s.catalogOIDs, catalogOIDEntry{
 			oid: s.nextCatalogOID, name: strings.Clone(tables[i].Name),
 		})
+		if s.server != nil {
+			oid := s.server.discoveryOID(tables[i].Name)
+			if oid == 0 {
+				return false
+			}
+			s.catalogOIDs[len(s.catalogOIDs)-1].oid = oid
+		}
 		s.nextCatalogOID++
 	}
 	return true

@@ -263,6 +263,11 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 			return proof, openErr
 		}
 		candidate := &table{meta: meta, file: file}
+		candidate.schema, openErr = compileSchemaMeta(meta.Schema)
+		if openErr != nil {
+			_ = file.Close()
+			return proof, openErr
+		}
 		options := durableOptions(candidate)
 		options.Indexes = nil
 		candidate.collection, openErr = durable.Open(file, options)

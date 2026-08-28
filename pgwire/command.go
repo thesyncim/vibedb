@@ -33,13 +33,11 @@ import (
 // accepted, and each entry in the table below records which of those arguments
 // makes it safe.
 //
-// Everything else is refused with 0A000. search_path is the clearest case: this
-// dialect's FROM names a collection directly and there are no schemas at all,
-// so a client that set a search_path and had it accepted would believe its
-// unqualified names were being resolved through it. statement_timeout is the
-// second clearest: CancelRequest is supported, but the server has no
+// Other namespaces are refused: public is the only wire namespace, resolving
+// directly to the stored catalog. statement_timeout is also refused:
+// CancelRequest is supported, but the server has no
 // per-statement timer policy, so accepting a timeout would promise a deadline
-// it did not schedule. Both would produce a client that misreads its own
+// it did not schedule. Silent acceptance would make a client misread its own
 // configuration, which is exactly the outcome a silent accept is worse than an
 // error for.
 
@@ -107,8 +105,6 @@ var unsupportedStatements = map[string]string{
 	"LOCK": "there is no lock manager: readers never block and there is nothing to lock against",
 	"CALL": "there are no stored procedures",
 	"DO":   "there is no procedural language",
-
-	"WITH": "common table expressions are not supported: the engine executes one plan and has no nested execution",
 }
 
 // classify reports what kind of statement src is, from its leading keyword.
@@ -143,7 +139,8 @@ func classifyCancelable(
 	case word == "":
 		return kindEmpty, "", nil
 	case strings.EqualFold(word, "SELECT"), strings.EqualFold(word, "EXPLAIN"),
-		strings.EqualFold(word, "VALUES"), strings.EqualFold(word, "TABLE"):
+		strings.EqualFold(word, "VALUES"), strings.EqualFold(word, "TABLE"),
+		strings.EqualFold(word, "WITH"):
 		return kindSelect, "", nil
 	case strings.EqualFold(word, "INSERT"), strings.EqualFold(word, "UPDATE"),
 		strings.EqualFold(word, "DELETE"), strings.EqualFold(word, "CREATE"),
@@ -958,6 +955,7 @@ type parameter struct {
 // parameters is the complete set of run-time settings this server accepts.
 // Anything absent is refused with 0A000; see the file comment.
 var parameters = map[string]*parameter{
+	"search_path": {initial: "public", check: requirePublicSearchPath, why: "public is the only namespace; qualification resolves to the same catalog"},
 	"application_name": {
 		report: true, initial: "",
 		why: "a label carried for the client's own logs; nothing here reads it",
@@ -995,7 +993,6 @@ var parameters = map[string]*parameter{
 // refusalHints gives a longer answer for the parameters clients most often try
 // to set and this server refuses.
 var refusalHints = map[string]string{
-	"search_path":                         "this dialect has no schemas: a FROM clause names a collection directly, so a search path would silently not apply",
 	"statement_timeout":                   "CancelRequest is supported, but this server has no SQL-configurable per-statement timer",
 	"lock_timeout":                        "there is no SQL lock manager; internal catalog ownership is not governed by PostgreSQL lock_timeout",
 	"idle_in_transaction_session_timeout": "there is no autonomous session timer for expiring an idle transaction",
@@ -1206,6 +1203,8 @@ func parseShowCancelable(
 	case strings.EqualFold(name, "TIME") && strings.EqualFold(s.peekWord(), "ZONE"):
 		s.word()
 		result = "TimeZone"
+	case strings.EqualFold(name, "TRANSACTION") && strings.EqualFold(s.word(), "ISOLATION") && strings.EqualFold(s.word(), "LEVEL"):
+		result = "transaction_isolation"
 	default:
 		result = name
 	}
@@ -1286,8 +1285,9 @@ func unquoteCancelable(v string, check func() error) (string, error) {
 // executing: SHOW, and the handful of niladic expressions a driver's handshake
 // asks for.
 type fixedResult struct {
-	cols []column
-	rows [][]*string
+	discovery *discoveryQuery
+	cols      []column
+	rows      [][]*string
 	// tag is the CommandComplete tag, which for a fixed result is always one of
 	// PostgreSQL's own command tags so a client's tag parsing keeps working.
 	tag string

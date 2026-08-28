@@ -297,6 +297,7 @@ type pendingPath struct {
 	path     *PathExpr
 	eligible bool // the head identifier was immediately followed by '.'
 	star     bool // the path ended in '*' and names the whole document
+	document bool // SELECT "$doc" spelling, preserving its default output name
 }
 
 // Parse parses one SELECT statement into dst, reusing p's storage. See
@@ -1008,6 +1009,12 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		return col, err
 	}
 	col.Alias = alias
+	if alias == "" && col.Path != nil && len(p.pending) > 0 {
+		last := p.pending[len(p.pending)-1]
+		if last.path == col.Path && last.document {
+			col.Alias = DocumentColumn
+		}
+	}
 	return col, nil
 }
 
@@ -2733,7 +2740,7 @@ func (p *Parser) parsePath(allowStar bool) (*PathExpr, error) {
 	}
 	head := p.tok
 	p.advance()
-	if !head.esc && head.text == DocumentColumn {
+	if head.kind != tokQuotedIdent && !head.esc && head.text == DocumentColumn {
 		return nil, p.errfAt(
 			head.pos,
 			"%q names the whole replacement document only as UPDATE's SET target; "+
@@ -2754,12 +2761,22 @@ func (p *Parser) continuePath(head token, allowStar bool) (*PathExpr, error) {
 	// variable's name is still addressable.
 	eligible := p.tok.kind == tokDot
 	star := false
+	document := false
+	if head.kind == tokQuotedIdent && !head.esc && head.text == DocumentColumn {
+		segs = segs[:0]
+		eligible, document = false, true
+	}
 
 loop:
 	for {
 		switch p.tok.kind {
 		case tokDot:
 			p.advance()
+			if len(segs) == 1 && eligible && !document && p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == DocumentColumn {
+				p.advance()
+				star, document = true, true
+				continue
+			}
 			if p.tok.kind == tokStar {
 				if !allowStar {
 					return nil, p.errHere("'*' is only allowed in the SELECT list")
@@ -2782,6 +2799,13 @@ loop:
 			}
 			segs = append(segs, Segment{Key: p.internToken(p.tok)})
 			p.advance()
+		case tokJSONArrow:
+			p.advance()
+			seg, err := p.parseJSONAccessor()
+			if err != nil {
+				return nil, err
+			}
+			segs = append(segs, seg)
 		case tokLBracket:
 			p.advance()
 			seg, err := p.parseSubscript()
@@ -2806,10 +2830,29 @@ loop:
 			head.text)
 	}
 	p.segScratch = segs
-	if star {
-		segs = segs[:1] // the head is the range variable; resolution drops it
+	path := p.newPath(head.pos, segs, eligible, star)
+	p.pending[len(p.pending)-1].document = document && ((!eligible && len(segs) == 0) || (eligible && len(segs) == 1))
+	return path, nil
+}
+
+// JSON object accessors are compiled exactly like native path segments.
+// Numeric keys and array indexes are refused: RFC 6901 paths intentionally
+// unify those spellings, whereas PostgreSQL distinguishes ->'0' from ->0.
+// Silently accepting them would return an array element for an object key.
+func (p *Parser) parseJSONAccessor() (Segment, error) {
+	if p.tok.kind == tokString {
+		key := p.internToken(p.tok)
+		numeric := len(key) != 0
+		for i := 0; i < len(key) && numeric; i++ {
+			numeric = key[i] >= '0' && key[i] <= '9'
+		}
+		if !numeric {
+			p.advance()
+			return Segment{Key: key}, nil
+		}
 	}
-	return p.newPath(head.pos, segs, eligible, star), nil
+	return Segment{}, newFeatureNotSupportedError(p.lx.src, p.tok.pos,
+		"JSON -> and ->> require a constant non-numeric object key; array indexes, numeric keys, and dynamic keys are not supported")
 }
 
 // parseSubscript parses the content of a '[...]' accessor: a non-negative

@@ -113,6 +113,7 @@ func NewSnapshotWithReplicatedTableMetadata(
 	statistics []queryplanner.TableStatistics,
 	replicated []ReplicatedShardDescriptor,
 	tables []ReplicatedTableProfile,
+	declarations ...[]ReplicatedTableDeclaration,
 ) (*Snapshot, error) {
 	snapshot, err := NewSnapshotWithPlannerMetadata(
 		config, endpoints, generation, indexes, statistics,
@@ -125,6 +126,14 @@ func NewSnapshotWithReplicatedTableMetadata(
 	}
 	if err := snapshot.attachReplicatedTableProfiles(tables); err != nil {
 		return nil, err
+	}
+	if len(declarations) > 1 {
+		return nil, &CatalogError{Reason: "multiple table declaration sets"}
+	}
+	if len(declarations) == 1 {
+		if err := snapshot.attachReplicatedTableDeclarations(declarations[0]); err != nil {
+			return nil, err
+		}
 	}
 	if err := snapshot.attachDurableRequestLedgerRangesFromDescriptors(replicated); err != nil {
 		return nil, err

@@ -736,6 +736,7 @@ func (s *session) beforeExtendedExecute(stmt *prepared) error {
 		if err := s.sql.Begin(context.Background(), sqldriver.TxOptions{}); err != nil {
 			return asPGErrorIn(err, stmt.sql)
 		}
+		s.transactionIsolation = sqldriver.IsolationDefault
 		s.implicitExtended = true
 	}
 	s.extendedSQL = true

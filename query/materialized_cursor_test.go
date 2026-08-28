@@ -2,7 +2,39 @@ package query
 
 import "testing"
 
+func TestMaterializedWholeDocumentBorrowsPayloadWithoutAllocations(t *testing.T) {
+	raw := []byte(`{"id":"example","name":"Alex","team":"Engineering","score":92,"active":true}`)
+	var cell Cell
+	allocs := testing.AllocsPerRun(100, func() {
+		var err error
+		cell, err = ParseJSONCell(raw)
+		if err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("whole-document materialization: %g allocations", allocs)
+	}
+	if payload := cell.Payload(); len(payload) != len(raw) || &payload[0] != &raw[0] {
+		t.Fatal("whole-document payload was copied or rewritten")
+	}
+}
+
+func BenchmarkMaterializedWholeDocument(b *testing.B) {
+	raw := []byte(`{"id":"example","name":"Alex","team":"Engineering","score":92,"active":true}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if _, err := ParseJSONCell(raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestMaterializedNativeCellsPreservePrecisionAndCursorOrder(t *testing.T) {
+	if c := NullCell(); !c.IsNull() || string(c.JSON()) != "null" {
+		t.Fatalf("materialized NULL: %+v", c)
+	}
 	number, err := ParseJSONCell([]byte(`9007199254740993`))
 	if err != nil {
 		t.Fatal(err)

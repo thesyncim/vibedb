@@ -6,6 +6,10 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
+// NullCell constructs a SQL NULL for materialized native results. Cell's zero
+// value is invalid, not NULL; adapters must preserve this distinction.
+func NullCell() Cell { return nullCell() }
+
 // ParseJSONCell validates one native wire value and borrows its exact JSON.
 // Escaped strings own their decoded spelling. The caller retains raw until
 // every result/cursor referencing the cell has been released.

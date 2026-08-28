@@ -529,6 +529,9 @@ func (p *Parser) parseInsertColumns() error {
 	p.advance() // '('
 	paths := p.idxPaths[:0]
 	for {
+		if p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == DocumentColumn {
+			return p.errHere("INSERT one complete document with VALUES (document); a column list names ordinary document fields, not the whole-document pseudo-column")
+		}
 		path, err := p.parsePath(false)
 		if err != nil {
 			return err

@@ -341,7 +341,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 		)
 	}
 	scratch := &workspace.scratch
-	authorityDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
+	authorityDigest := sessionAuthorityIdentityKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	authorityKey := AuthorityBindingStorageKey(authorityDigest)
 	bound, authorityFound, authorityErr := authorityBindingAt(
 		pointSnapshot{value: snapshot}, authorityKey, scratch,
@@ -657,7 +657,7 @@ func (m *Machine) LookupSessionLease(
 	if !ok || snapshot == nil {
 		return SessionLeaseLookup{}, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
 	}
-	authorityDigest := AuthorityIdentityKey(tenant, clientID)
+	authorityDigest := sessionAuthorityIdentityKey(authorityClass, tenant, clientID)
 	authorityKey := AuthorityBindingStorageKey(authorityDigest)
 	bound, authorityFound, authorityErr := authorityBindingAt(
 		pointSnapshot{value: snapshot}, authorityKey, nil,

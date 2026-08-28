@@ -380,6 +380,22 @@ func validateReplicatedTableTransition(current, next *Snapshot) error {
 			)}
 		}
 		candidate, _ := next.replicatedTableProfileAt(next.replicatedTables[nextOrdinal])
+		if candidate.SchemaGeneration == old.SchemaGeneration {
+			var oldDDL, newDDL string
+			for _, d := range current.replicatedTableDeclarations {
+				if d.declaration.Table == old.Table {
+					oldDDL = d.declaration.CreateTable
+				}
+			}
+			for _, d := range next.replicatedTableDeclarations {
+				if d.declaration.Table == old.Table {
+					newDDL = d.declaration.CreateTable
+				}
+			}
+			if oldDDL != newDDL {
+				return &CatalogError{Reason: "replicated table declaration changed within one schema generation"}
+			}
+		}
 		sameGenerationChanged := candidate.SchemaGeneration == old.SchemaGeneration &&
 			(candidate.Relation != old.Relation || candidate.PrimaryKey != old.PrimaryKey ||
 				candidate.MaxKeyBytes != old.MaxKeyBytes ||
@@ -398,6 +414,7 @@ func validateReplicatedTableTransition(current, next *Snapshot) error {
 }
 
 type persistedReplicatedTable struct {
+	CreateTable         string `json:"create_table,omitempty"`
 	Table               string `json:"table"`
 	Relation            uint16 `json:"relation"`
 	PrimaryKey          string `json:"primary_key"`
@@ -405,6 +422,16 @@ type persistedReplicatedTable struct {
 	LogicalSchemaDigest string `json:"logical_schema_digest"`
 	MaxKeyBytes         uint16 `json:"max_key_bytes"`
 	MaxDocumentBytes    uint32 `json:"max_document_bytes"`
+}
+
+func (catalog persistedCatalog) replicatedTableDeclarations() []ReplicatedTableDeclaration {
+	var declarations []ReplicatedTableDeclaration
+	for _, table := range catalog.ReplicatedTables {
+		if table.CreateTable != "" {
+			declarations = append(declarations, ReplicatedTableDeclaration{Table: table.Table, CreateTable: table.CreateTable})
+		}
+	}
+	return declarations
 }
 
 func persistedReplicatedTableProfiles(

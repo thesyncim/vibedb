@@ -100,8 +100,9 @@ type session struct {
 	// catalogOIDs are session-local continuation tokens for psql's multi-query
 	// \d exchange. They are assigned monotonically and never reused, so a table
 	// created between name resolution and detail lookup cannot retarget an oid.
-	catalogOIDs    []catalogOIDEntry
-	nextCatalogOID uint32
+	catalogOIDs          []catalogOIDEntry
+	nextCatalogOID       uint32
+	transactionIsolation sqldriver.IsolationLevel
 
 	// msg is the decoded frontend message, reused so a session that serves a
 	// million messages allocates one set of parameter slices.
@@ -126,9 +127,10 @@ type session struct {
 // SQL statement, a fixed protocol result, a session parameter command, or
 // transaction control. All variants have explicit ownership in release.
 type prepared struct {
-	name string
-	sql  string
-	kind statementKind
+	showIsolation bool
+	name          string
+	sql           string
+	kind          statementKind
 	// retainedBytes is this statement's charge against the session-wide
 	// prepared-input bound: its statement name, SQL text, parameter OIDs,
 	// PostgreSQL placeholder mappings/roles, and conservative retained
@@ -224,12 +226,13 @@ type portal struct {
 
 	// started marks a portal that has begun executing; row is the next fixed
 	// row to send.
-	started     bool
-	exhausted   bool
-	row         int
-	runtime     BackendRows
-	runtimeOpen bool
-	invalidated bool
+	started       bool
+	exhausted     bool
+	row           int
+	runtime       BackendRows
+	runtimeOpen   bool
+	invalidated   bool
+	discoveryRows *fixedResult
 }
 
 // boundValueSlot has one stable address for every scalar representation the
@@ -245,6 +248,7 @@ type boundValueSlot struct {
 }
 
 func (p *portal) release() {
+	p.discoveryRows = nil
 	if p.runtimeOpen {
 		_ = p.runtime.Close()
 		p.runtimeOpen = false
@@ -844,6 +848,7 @@ func (s *session) simpleQuery(sql string) error {
 			s.w.readyForQuery(s.transactionStatus())
 			return s.flush()
 		}
+		s.transactionIsolation = sqldriver.IsolationDefault
 	}
 
 	iter := statementIterator{src: sql, check: s.cancelCheck}
@@ -1186,6 +1191,7 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 			return nil, err
 		}
 		p.fixed, p.cols, p.tag = fixed, fixed.cols, fixed.tag
+		p.showIsolation = strings.EqualFold(name, "transaction_isolation")
 		return p, nil
 
 	case kindDiscard:
@@ -1220,6 +1226,17 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	if err != nil {
 		return nil, asPGErrorIn(err, text)
 	}
+	// Resolve the one wire namespace before Prepare: a failed Prepare can
+	// poison an embedded transaction and must never be retried in that state.
+	if strings.Contains(lowered, ".") {
+		publicSQL, changed, lowerErr := lowerPublicRelations(lowered, s.cancelCheck)
+		if lowerErr != nil {
+			return nil, asPGErrorIn(lowerErr, text)
+		}
+		if changed {
+			lowered = publicSQL
+		}
+	}
 	runtime, err := s.sql.Prepare(context.Background(), lowered)
 	if err != nil {
 		// The catalog shim engages only here, behind the front end's own
@@ -1234,6 +1251,9 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 		}
 		if ok {
 			p.fixed, p.cols, p.tag = fixed, fixed.cols, fixed.tag
+			if fixed.discovery != nil {
+				p.wireParams = highest
+			}
 			return p, nil
 		}
 		return nil, asPGErrorIn(err, text)
@@ -1315,6 +1335,18 @@ func configureRuntimeParamKinds(p *prepared) error {
 
 // showResult builds the one-row, one-column result SHOW returns.
 func (s *session) showResult(name string) (*fixedResult, error) {
+	if strings.EqualFold(name, "transaction_isolation") {
+		value := "read committed"
+		if s.sql != nil && s.sql.State() != sqldriver.SessionIdle {
+			switch s.transactionIsolation {
+			case sqldriver.IsolationRepeatableRead:
+				value = "repeatable read"
+			case sqldriver.IsolationSerializable:
+				value = "serializable"
+			}
+		}
+		return &fixedResult{cols: textCols("transaction_isolation"), rows: [][]*string{{strPtr(value)}}, tag: "SHOW"}, nil
+	}
 	if strings.EqualFold(name, "ALL") {
 		result := &fixedResult{
 			cols: []column{
@@ -1433,6 +1465,9 @@ func (s *session) executeTransaction(stmt *prepared) error {
 	switch stmt.kind {
 	case kindBegin:
 		err = s.sql.Begin(context.Background(), stmt.txOptions)
+		if err == nil {
+			s.transactionIsolation = stmt.txOptions.Isolation
+		}
 	case kindCommit:
 		s.closeRuntimePortals()
 		err = s.sql.Commit(context.Background())
@@ -1753,6 +1788,35 @@ func (s *session) setParameter(name string, p *parameter, value string) {
 // executeFixed serves rows from a result this package produced itself.
 func (s *session) executeFixed(p *portal, limit int32) error {
 	fixed := p.stmt.fixed
+	if p.stmt.showIsolation {
+		fixed, _ = s.showResult("transaction_isolation")
+	}
+	if fixed.discovery != nil {
+		if p.discoveryRows == nil {
+			result, err := s.executeDiscovery(fixed.discovery, p.args)
+			if err != nil {
+				return err
+			}
+			charge := 24 * cap(result.rows)
+			for _, row := range result.rows {
+				charge += 24 * cap(row)
+				for _, v := range row {
+					if v != nil {
+						charge += len(*v)
+					}
+				}
+			}
+			if charge > maxPortalBytes-s.portalBytes {
+				return newError(sqlstateProgramLimitExceeded, "catalog discovery exceeds the session portal budget")
+			}
+			if s.portals[p.name] == p {
+				p.retainedBytes += charge
+				s.portalBytes += charge
+			}
+			p.discoveryRows = result
+		}
+		fixed = p.discoveryRows
+	}
 	sent := 0
 	for p.row < len(fixed.rows) {
 		if s.takeCancel() {

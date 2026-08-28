@@ -110,7 +110,7 @@ var (
 	ErrApplyPoisoned               = errors.New("replicatedstate: machine is poisoned; reopen required")
 	ErrStaticSnapshotOnly          = errors.New("replicatedstate: only the exact static bootstrap snapshot is supported")
 	ErrAdmissionBound              = errors.New("replicatedstate: command exceeds the frozen apply profile")
-	ErrSchemaProfile               = errors.New("replicatedstate: requires an exact schema-free collection profile")
+	ErrSchemaProfile               = errors.New("replicatedstate: requires an exact authenticated collection validation profile")
 	ErrInconsistentSnapshot        = errors.New("replicatedstate: coherent snapshot disagrees with publication")
 	ErrCodecAlias                  = errors.New("replicatedstate: codec input aliases destination append region")
 	ErrSnapshotArtifact            = errors.New("replicatedstate: corrupt snapshot artifact")
@@ -211,6 +211,23 @@ type MutationValidator interface {
 	ValidateDelete(key, current []byte, found bool) MutationValidation
 }
 
+// DeclaredSchemaValidator is a cold construction-time contract. A typed
+// collection is admissible only when its deterministic validator authenticates
+// the exact immutable durable schema and commits it in ValidationDigest.
+// ValidatePut must enforce that same declaration before any durable mutation.
+type DeclaredSchemaValidator interface {
+	MutationValidator
+	ValidateCollectionSchema(*store.Schema) bool
+}
+
+func (t CollectionTarget) schemaMatches() bool {
+	if !t.Collection.HasSchema() {
+		return true
+	}
+	validator, ok := t.Validator.(DeclaredSchemaValidator)
+	return t.Validation == ValidationDeterministicMutation && ok && validator.ValidateCollectionSchema(t.Collection.Schema())
+}
+
 // OwnershipMutationValidator proves the actual placement point encoded by a
 // mutation key against the current durable ownership range. It is deliberately
 // separate from MutationValidator: reopen and snapshot auditing must continue
@@ -291,7 +308,7 @@ type UserCollection struct {
 }
 
 func (t CollectionTarget) validate() error {
-	if t.Collection == nil || t.Collection.HasSchema() ||
+	if t.Collection == nil || !t.schemaMatches() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() {
 		return ErrSchemaProfile
 	}

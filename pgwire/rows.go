@@ -480,6 +480,11 @@ func (w *writer) fixedRow(cols []column, values []*string, formats []int16) erro
 		n := len(*v)
 		if formatFor(formats, i) == formatBinary {
 			switch cols[i].typ.oid {
+			case 1009: // the sole fixed text[] value: public search path
+				if *v != "{public}" {
+					return newError(sqlstateInternalError, "invalid fixed search path")
+				}
+				n = 30 // array header, one dimension, one six-byte text element
 			case oidInt8:
 				n = 8
 				if _, err := strconv.ParseInt(*v, 10, 64); err != nil {
@@ -509,6 +514,16 @@ func (w *writer) fixedRow(cols []column, values []*string, formats []int16) erro
 		}
 		if formatFor(formats, i) == formatBinary {
 			switch cols[i].typ.oid {
+			case 1009:
+				w.int32(30)
+				w.int32(1) // dimensions
+				w.int32(0) // no nulls
+				w.int32(oidText)
+				w.int32(1) // dimension length
+				w.int32(1) // lower bound
+				w.int32(6)
+				w.rawString("public")
+				continue
 			case oidInt8:
 				n, _ := strconv.ParseInt(*v, 10, 64)
 				w.int32(8)

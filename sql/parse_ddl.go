@@ -202,7 +202,7 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		return column, err
 	}
 	if len(path.Segments) == 0 {
-		return column, p.errAt(path.Pos, "a column names a path inside the document")
+		return column, p.errAt(path.Pos, "a column names a path inside the document; \"$doc\" denotes the whole replacement document")
 	}
 	column.Path = path
 	kind, err := p.parseColumnType()
@@ -490,7 +490,7 @@ func (p *Parser) parseIndexPath() (*PathExpr, error) {
 		return nil, err
 	}
 	if len(path.Segments) == 0 {
-		return nil, p.errAt(path.Pos, "an index names a path inside the document, not the whole document")
+		return nil, p.errAt(path.Pos, "an index names a path inside the document; \"$doc\" denotes the whole replacement document")
 	}
 	switch {
 	case p.atKeyword(kwAsc), p.atKeyword(kwDesc):

@@ -187,7 +187,7 @@ func validateBundleTransactionProfile(
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceRowBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3+fenceRowBytes)
+		2*(sha256.Size+1) + int(options.RetryWindow)*(sha256.Size+3+fenceRowBytes+routeGateResultKeyBytes)
 	requiredDocuments, err := RequiredBundleTransactionDocuments(
 		relationDocuments, options.RetryWindow, reservedCapture,
 	)
@@ -231,7 +231,7 @@ func RequiredBundleTransactionDocuments(
 		retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
 		return 0, ErrInvalidOptions
 	}
-	required := max(2*int(retryWindow)+2, relationDocuments+4, 4)
+	required := max(3*int(retryWindow)+3, relationDocuments+4, 4)
 	if reservedCapture {
 		required++
 	}
@@ -243,7 +243,7 @@ func validateRelationTarget(spec RelationCollection) error {
 		return err
 	}
 	t := spec.Target
-	if t.Collection == nil || t.Collection.HasSchema() ||
+	if t.Collection == nil || !t.schemaMatches() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() ||
 		t.Collection.HasOpaqueValues() || t.Validator == nil {
 		return ErrInvalidCollection
@@ -251,7 +251,7 @@ func validateRelationTarget(spec RelationCollection) error {
 	l := t.Limits
 	if l.MaxKeyBytes != t.Collection.MaxKeyBytes() || l.MaxDocumentBytes != t.Collection.MaxDocumentBytes() ||
 		l.MaxDistinctMutations != t.Collection.MaxBatchDocuments() || l.MaxBatchBytes != t.Collection.MaxBatchBytes() ||
-		spec.Kind == RelationGlobalIndex && t.Collection.HasIndexes() {
+		spec.Kind == RelationGlobalIndex && (t.Collection.HasIndexes() || t.Collection.HasSchema()) {
 		return ErrInvalidCollection
 	}
 	return nil

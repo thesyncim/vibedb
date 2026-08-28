@@ -202,7 +202,7 @@ func parseRF3ManifestSplitChildRegistry(node vibejson.Node) (rf3ManifestSplitChi
 	if err != nil {
 		return result, err
 	}
-	if result.CreateTable, err = rf3ManifestString(value, maxRF3SplitChildDDLBytes); err != nil {
+	if result.CreateTable, err = rf3ManifestSQLText(value, maxRF3SplitChildDDLBytes); err != nil {
 		return result, err
 	}
 	name, value, present := fields.Next()
