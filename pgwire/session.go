@@ -52,7 +52,7 @@ type session struct {
 
 	// sql is the shared typed SQL runtime used by both database/sql and this
 	// protocol adapter.
-	sql         *sqldriver.Session
+	sql         BackendSession
 	queryCancel query.CancelFlag
 	// cancelCheck is the session-bound method value passed through protocol-side
 	// scanners and the SQL runtime. Binding it once avoids rebuilding an escaping
@@ -138,7 +138,7 @@ type prepared struct {
 	bindBytes int
 
 	// runtime is the shared typed SQL runtime statement for a writable catalog.
-	runtime *sqldriver.Prepared
+	runtime BackendStatement
 	// paramKinds consolidates the scalar/document role of every wire parameter,
 	// including repeated $n occurrences.
 	paramKinds []sqldriver.ParamKind
@@ -225,7 +225,7 @@ type portal struct {
 	started     bool
 	exhausted   bool
 	row         int
-	runtime     sqldriver.Cursor
+	runtime     BackendRows
 	runtimeOpen bool
 	invalidated bool
 }
@@ -577,10 +577,13 @@ func (s *session) negotiate(body []byte) error {
 	if err := s.server.opts.Auth.authenticate(s, s.user); err != nil {
 		return err
 	}
-	runtime, err := s.server.db.NewSession(context.Background())
+	runtime, err := s.server.backend.NewSession(context.Background(), SessionIdentity{User: s.user, Database: s.database})
 	if err != nil {
 		return fatal(sqlstateInternalError,
 			"could not open this connection's SQL session: "+err.Error())
+	}
+	if runtime == nil {
+		return fatal(sqlstateInternalError, "execution backend returned a nil session")
 	}
 	if err := runtime.SetCancelFlag(&s.queryCancel); err != nil {
 		_ = runtime.Close()
@@ -1665,7 +1668,7 @@ func invalidatedPortalError() *pgError {
 			"the statement without a row limit")
 }
 
-func (s *session) rowCellsRuntime(c *sqldriver.Cursor, n int) []query.Cell {
+func (s *session) rowCellsRuntime(c *BackendRows, n int) []query.Cell {
 	if cap(s.cells) < n {
 		s.cells = make([]query.Cell, n)
 	}

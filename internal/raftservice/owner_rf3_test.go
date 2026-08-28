@@ -322,6 +322,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
+	testRF3DataReadCut(t, ctx, owners[leader], leaderState.Fence(), linearRead.Applied, key, linearRead.Value)
 	backupCut, err := owners[leader].ReadLinearizableSnapshot(ctx, LinearizableSnapshotRequest{
 		Fence: leaderState.Fence(), Capability: serviceauthz.CapabilityBackup,
 	})

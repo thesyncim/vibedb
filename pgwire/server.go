@@ -156,8 +156,9 @@ type Options struct {
 
 // A Server is an experimental PostgreSQL wire-protocol endpoint supporting a documented SQL subset over one database.
 type Server struct {
-	db   *sqldriver.Database
-	opts Options
+	db      *sqldriver.Database
+	backend Backend
+	opts    Options
 
 	mu        sync.Mutex
 	sessions  map[int32]*session
@@ -181,6 +182,20 @@ type Server struct {
 func NewServer(db *sqldriver.Database, opts Options) (*Server, error) {
 	if db == nil {
 		return nil, errors.New("pgwire: a non-nil SQL database is required")
+	}
+	server, err := NewServerWithBackend(embeddedBackend{database: db}, opts)
+	if server != nil {
+		server.db = db
+	}
+	return server, err
+}
+
+// NewServerWithBackend uses an authenticated execution backend instead of an
+// embedded database. All protocol, authentication, cancellation, and resource
+// admission rules are identical to NewServer. The backend remains caller-owned.
+func NewServerWithBackend(backend Backend, opts Options) (*Server, error) {
+	if backend == nil {
+		return nil, errors.New("pgwire: a non-nil execution backend is required")
 	}
 	if opts.Auth == nil {
 		return nil, errors.New(
@@ -245,7 +260,7 @@ func NewServer(db *sqldriver.Database, opts Options) (*Server, error) {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
 	return &Server{
-		db:        db,
+		backend:   backend,
 		opts:      opts,
 		sessions:  map[int32]*session{},
 		conns:     map[net.Conn]struct{}{},

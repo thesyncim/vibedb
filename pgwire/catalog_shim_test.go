@@ -554,7 +554,7 @@ func TestCatalogShimPresenceDoesNotChangeSuccessfulQueryAllocations(t *testing.T
 		params:     map[string]string{},
 		statements: map[string]*prepared{},
 		portals:    map[string]*portal{},
-		sql:        runtime,
+		sql:        &embeddedSession{runtime},
 	}
 	s.w = newWriter(io.Discard, 16<<10)
 	t.Cleanup(s.release)

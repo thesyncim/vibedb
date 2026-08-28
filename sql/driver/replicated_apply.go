@@ -1721,6 +1721,26 @@ func (a *ReplicatedApply) RequestLedgerReadInto(
 	return a.machine.RequestLedgerReadInto(request, dst)
 }
 
+// DataReadCutInto captures a data-only cut under the live apply and catalog
+// activation fences. The caller supplies a quorum-derived floor and reusable
+// storage, and must enforce the captured ownership range before SQL evaluation.
+func (a *ReplicatedApply) DataReadCutInto(
+	relations []replication.RelationID, minimumApplied uint64, dst *replicatedstate.DataReadCut,
+) error {
+	if a == nil || a.database == nil {
+		return ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return err
+	}
+	return a.machine.DataReadCutInto(relations, minimumApplied, dst)
+}
+
 // SnapshotArtifactCut captures one coherent, read-only system/relation/capture
 // cut for streaming snapshot export. The returned handle owns every durable
 // collection snapshot until Close; it carries no SQL session or serving authority.
