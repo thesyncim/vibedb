@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,11 @@ func fixtureTarget(collection *durable.Collection, system bool) replicatedstate.
 
 func newCaptureFixture(t testing.TB, checkpoint bool) *captureFixture {
 	t.Helper()
+	return newCaptureFixtureWithLimits(t, checkpoint, replicatedstate.MaxTransitionCaptureRecordBytes, replicatedstate.MaxTransitionCaptureRecordBytes+8)
+}
+
+func newCaptureFixtureWithLimits(t testing.TB, checkpoint bool, documentBytes, batchBytes int) *captureFixture {
+	t.Helper()
 	dir := t.TempDir()
 	create := func(name string, options durable.Options) *durable.Collection {
 		file, err := os.OpenFile(filepath.Join(dir, name+".vdb"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
@@ -72,8 +78,8 @@ func newCaptureFixture(t testing.TB, checkpoint bool) *captureFixture {
 	f := &captureFixture{dir: dir}
 	f.system = fixtureTarget(create("system", durable.Options{OpaqueValues: true, MaxBatchDocuments: 32}), true)
 	f.target = replicatedstate.TransitionCaptureTarget{Name: "capture", Collection: create("capture", durable.Options{
-		OpaqueValues: true, MaxKeyBytes: 8, MaxDocumentBytes: replicatedstate.MaxTransitionCaptureRecordBytes,
-		MaxBatchDocuments: 1, MaxBatchBytes: replicatedstate.MaxTransitionCaptureRecordBytes + 8,
+		OpaqueValues: true, MaxKeyBytes: 8, MaxDocumentBytes: documentBytes,
+		MaxBatchDocuments: 1, MaxBatchBytes: batchBytes,
 	})}
 	members := []durable.NamedCollection{{Name: replicatedstate.SystemCollectionName, Collection: f.system.Collection}}
 	for i, name := range []string{"base", "other"} {
@@ -297,6 +303,89 @@ func TestCaptureExhaustionDoesNotStopWritesOrReopen(t *testing.T) {
 				t.Fatalf("write after capture abort=%q found=%v err=%v", value, found, err)
 			}
 		})
+	}
+}
+
+func TestCaptureFrozenStorageLimitsAbortBuildNotSource(t *testing.T) {
+	for _, checkpoint := range []bool{false, true} {
+		for _, bound := range []string{"compact_batch", "wide_batch"} {
+			t.Run(fmt.Sprintf("%s/checkpoint_%t", bound, checkpoint), func(t *testing.T) {
+				documentBytes, batchBytes := 1024, 1032
+				if bound == "wide_batch" {
+					batchBytes = 4096
+				}
+				f := newCaptureFixtureWithLimits(t, checkpoint, documentBytes, batchBytes)
+				c := f.begin(t)
+				value := []byte(`{"value":"` + strings.Repeat("x", 800) + `"}`)
+				batches := []replication.RelationMutationBatch{
+					{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: []byte("row"), Value: value}}},
+					{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: []byte("row"), Value: value}}},
+				}
+				f.apply(t, 3, f.command(2, batches))
+				d, err := c.Descriptor()
+				if err != nil || d.Abort != AbortCapacity || d.Head.Publication.Applied != 3 || f.target.Collection.Len() != 2 {
+					t.Fatalf("oversized capture did not abort safely: %+v err=%v", d, err)
+				}
+				for _, relation := range f.relations {
+					got, found, err := relation.Target.Collection.AppendRaw(nil, []byte("row"))
+					if err != nil || !found || !bytes.Equal(got, value) {
+						t.Fatalf("source write lost: %q found=%v err=%v", got, found, err)
+					}
+				}
+				c = f.reopen(t)
+				f.apply(t, 4, f.command(3, singlePut(3)))
+				if got, err := c.Descriptor(); err != nil || got != d || !c.CaptureStopped() {
+					t.Fatal("reopen changed the terminal capture")
+				}
+				if f.target.Collection.MaxDocumentBytes() != documentBytes || f.target.Collection.MaxBatchBytes() != batchBytes {
+					t.Fatal("frozen storage limits changed")
+				}
+			})
+		}
+	}
+}
+
+type failingBeginCapture struct {
+	*SourceCapture
+	afterPublish bool
+	failure      error
+}
+
+func (c *failingBeginCapture) Begin(state replicatedstate.State, publish func([]byte, []byte) error) error {
+	if c.afterPublish {
+		if err := c.SourceCapture.Begin(state, publish); err != nil {
+			return err
+		}
+	}
+	return c.failure
+}
+
+func TestCaptureBeginFailureCannotAdvancePastPublishedHeader(t *testing.T) {
+	for _, checkpoint := range []bool{false, true} {
+		for _, published := range []bool{false, true} {
+			t.Run(fmt.Sprintf("checkpoint_%t/published_%t", checkpoint, published), func(t *testing.T) {
+				f := newCaptureFixture(t, checkpoint)
+				capture, err := NewSourceCapture(f.config, f.target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				failure := errors.New("injected capture startup failure")
+				err = f.machine.BeginTransitionCapture(&failingBeginCapture{capture, published, failure})
+				if !errors.Is(err, failure) || !errors.Is(err, replicatedstate.ErrTransitionCapture) {
+					t.Fatalf("startup lost error identity: %v", err)
+				}
+				_, err = f.machine.ApplyNormal(raftmodel.ApplyMeta{Index: 3, Term: 1, Type: pb.EntryNormal}, nil)
+				if published {
+					if err == nil || f.machine.Applied() != 2 {
+						t.Fatal("source advanced without retaining its published capture")
+					}
+					f.reopen(t)
+					f.apply(t, 3, f.command(2, singlePut(2)))
+				} else if err != nil || f.machine.Applied() != 3 {
+					t.Fatalf("pre-publication error disabled usable source: %v", err)
+				}
+			})
+		}
 	}
 }
 

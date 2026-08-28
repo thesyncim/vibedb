@@ -661,9 +661,9 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 			Collection: expected.Relations[index].Collection,
 		}
 	}
-	header, headerDigest, err := makeSnapshotArtifactHeaderForRelations(
+	header, headerDigest, err := matchSnapshotArtifactHeaderForRelations(
 		stateEnvelope, string(expected.UserCollection), int(expected.TargetChunkBytes),
-		expected.RelationManifestDigest, headerRelations, expected.Bundle,
+		expected.RelationManifestDigest, headerRelations, expected.Bundle, expected.HeaderDigest,
 	)
 	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
 		uint64(len(header)), expected.Chunks, expected.PayloadBytes, true,

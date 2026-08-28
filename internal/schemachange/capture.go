@@ -45,7 +45,7 @@ type SourceCapture struct {
 
 func NewSourceCapture(config CaptureConfig, target replicatedstate.TransitionCaptureTarget) (*SourceCapture, error) {
 	if !config.valid() || target.Name == "" || target.Collection == nil || !target.Collection.HasOpaqueValues() ||
-		target.Collection.MaxDocumentBytes() < headerBytes || target.Collection.MaxKeyBytes() < 8 {
+		target.Collection.MaxDocumentBytes() < headerBytes || target.Collection.MaxKeyBytes() < 8 || target.Collection.MaxBatchBytes() < headerBytes+8 {
 		return nil, ErrCapture
 	}
 	return &SourceCapture{config: config, target: target}, nil
@@ -53,8 +53,38 @@ func NewSourceCapture(config CaptureConfig, target replicatedstate.TransitionCap
 
 func (c *SourceCapture) Target() replicatedstate.TransitionCaptureTarget { return c.target }
 func (*SourceCapture) CaptureAllRelations() bool                         { return true }
-func (*SourceCapture) MaxEncodedBytes(b replicatedstate.TransitionCaptureBounds) (int, error) {
-	return recordBytes(b)
+func (c *SourceCapture) MaxEncodedBytes(b replicatedstate.TransitionCaptureBounds) (int, error) {
+	size, err := recordBytes(b)
+	if err != nil {
+		return 0, err
+	}
+	// Existing shards retain their exact provisioning profile. A transition
+	// larger than that profile aborts the build stream, never the source write.
+	return min(size, c.target.Collection.MaxDocumentBytes(), c.target.Collection.MaxBatchBytes()-8), nil
+}
+
+// RestoreSourceCapture reads the immutable operation header. Begin still has
+// to validate the entire retained stream against the recovered source state
+// before the owner permits serving. Empty storage is the only absent result;
+// foreign/corrupt records fail closed instead of disabling capture silently.
+func RestoreSourceCapture(target replicatedstate.TransitionCaptureTarget) (*SourceCapture, bool, error) {
+	if target.Collection == nil {
+		return nil, false, ErrCapture
+	}
+	if target.Collection.Len() == 0 {
+		return nil, false, nil
+	}
+	var key [8]byte
+	raw, found, err := target.Collection.AppendRaw(nil, key[:])
+	if err != nil || !found {
+		return nil, false, errors.Join(err, ErrCapture)
+	}
+	config, _, _, err := openHeader(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	c, err := NewSourceCapture(config, target)
+	return c, err == nil, err
 }
 
 func (c *SourceCapture) CaptureStopped() bool {
@@ -189,7 +219,8 @@ func (c *SourceCapture) AppendTransition(dst []byte, t replicatedstate.CapturedT
 	abort := NotAborted
 	if after.Ownership != before.Ownership || after.Routing != before.Routing || after.Route != before.Route || t.AfterSchemaGeneration != c.config.SchemaGeneration {
 		abort = AbortSourceChanged
-	} else if c.descriptor.Records+1 >= c.config.MaxRecords || uint64(size) > c.config.MaxBytes-c.descriptor.Bytes-entryBytes {
+	} else if c.descriptor.Records+1 >= c.config.MaxRecords || uint64(size) > c.config.MaxBytes-c.descriptor.Bytes-entryBytes ||
+		size > c.target.Collection.MaxDocumentBytes() || size > c.target.Collection.MaxBatchBytes()-8 {
 		abort = AbortCapacity
 	}
 	count := t.MutationCount()

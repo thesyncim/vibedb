@@ -22,6 +22,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/schemachange"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -143,6 +144,7 @@ type ReplicatedApply struct {
 	table                *table
 	identity             ReplicatedApplyIdentity
 	rangeSplitCapture    *rangesplit.SourceCapture
+	schemaCapture        *schemachange.SourceCapture
 	closed               bool
 	attemptGeneration    uint64
 	attemptActive        bool
@@ -703,6 +705,12 @@ func (d *Database) openReplicatedApply(
 		return nil, identity, fmt.Errorf("vibedb: open replicated state machine: %w", err)
 	}
 	claim.machine = machine
+	// Recover the replica-local schema stream before publishing the claim.
+	// Unlike a serving mutation, installing a private artifact capture does
+	// not require all replicas to start from the same applied cut.
+	if err := claim.restoreSchemaCaptureLocked(); err != nil {
+		return nil, identity, fmt.Errorf("vibedb: recover schema capture: %w", err)
+	}
 	core.replicatedApplyClaim = claim
 	d.connector.refs++
 	return claim, identity, nil
