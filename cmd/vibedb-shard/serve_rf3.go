@@ -1269,6 +1269,13 @@ func loadRF3RetainedIdentities(manifest rf3Manifest) (
 	if err := loadRF3IdentityFile(manifest.SQL.ApplyIdentityPath, &apply); err != nil {
 		return base, apply, fmt.Errorf("%w: apply identity: %v", errRF3Serving, err)
 	}
+	lineageBase, lineageApply, retained, err := sqldriver.RetainedReplicatedSchemaLineageIdentity(manifest.SQL.Path, base, apply)
+	if err != nil {
+		return base, apply, fmt.Errorf("%w: retained schema lineage: %v", errRF3Serving, err)
+	}
+	if retained {
+		base, apply = lineageBase, lineageApply
+	}
 	publishedBase, publishedApply, published, err :=
 		sqldriver.PublishedReplicatedSchemaActivationIdentity(manifest.SQL.Path)
 	if err != nil {

@@ -85,7 +85,7 @@ func buildSchemaThroughControl(t *testing.T, activator *rf3SchemaActivator, requ
 	return target
 }
 
-func seedSchemaBuildReplica(t *testing.T, member *rf3testfixture.PreparedMember) {
+func seedSchemaBuildReplica(t *testing.T, member *rf3testfixture.PreparedMember, persist ...func(uint64, []byte)) {
 	t.Helper()
 	b := member.Base.Binding
 	command := replication.Command{ClusterID: replication.ID128(b.ClusterID), ClusterIncarnation: replication.ID128(b.ClusterIncarnation),
@@ -102,6 +102,9 @@ func seedSchemaBuildReplica(t *testing.T, member *rf3testfixture.PreparedMember)
 		}
 		if err := member.Apply.AdmitCommand(raw); err != nil {
 			t.Fatal(err)
+		}
+		for _, beforeApply := range persist {
+			beforeApply(member.Apply.Applied()+1, raw)
 		}
 		if _, err := member.Apply.ApplyNormal(raftmodel.ApplyMeta{Index: member.Apply.Applied() + 1, Term: 2}, raw); err != nil {
 			t.Fatal(err)

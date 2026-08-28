@@ -250,6 +250,7 @@ type database struct {
 	// recovery opener. It authorizes target checkpoint membership selection and
 	// exact target-machine replay before any serving claim can be minted.
 	schemaTransition          []byte
+	schemaMembershipSelected  bool
 	schemaMembership          durable.CheckpointMembershipWitness
 	schemaCheckpointAuthority [32]byte
 	schemaAuthorization       [32]byte
@@ -311,6 +312,7 @@ func openDatabaseWithShardStorePolicy(
 		replicatedSeedPending:      shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
 		replicatedSnapshotRecovery: shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
 		schemaTransition:           bytes.Clone(shardPolicy.schemaTransition),
+		schemaMembershipSelected:   shardPolicy.schemaMembershipSelected,
 		schemaMembership:           shardPolicy.schemaMembership,
 		schemaCheckpointAuthority:  shardPolicy.schemaCheckpointAuthority,
 		schemaAuthorization:        shardPolicy.schemaAuthorization,
@@ -862,7 +864,7 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions Repl
 				))
 			}
 		}
-		if len(d.schemaTransition) != 0 {
+		if len(d.schemaTransition) != 0 && !d.schemaMembershipSelected {
 			collections, txnLog, checkpointGroup, err =
 				durable.OpenCollectionsWithCheckpointMembershipTransition(
 					d.dataDir, txnOptions, requests, groupNames,

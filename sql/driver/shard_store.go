@@ -228,6 +228,7 @@ type shardStoreOpenPolicy struct {
 	expectedReplicatedOptions   ReplicatedApplyOptions
 	persistIdentity             func(*database) (bool, error)
 	schemaTransition            []byte
+	schemaMembershipSelected    bool
 	schemaMembership            durable.CheckpointMembershipWitness
 	schemaCheckpointAuthority   [32]byte
 	schemaAuthorization         [32]byte
