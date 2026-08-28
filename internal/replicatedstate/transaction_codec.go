@@ -16,7 +16,7 @@ import (
 const (
 	transactionCodecSentinel = uint16(0)
 
-	transactionControlHeaderBytes     = 320
+	transactionControlHeaderBytes     = 360
 	transactionPayloadHeaderBytes     = 96
 	transactionManifestHeaderBytes    = 112
 	transactionMutationHeaderBytes    = 160
@@ -93,11 +93,13 @@ type TransactionControl struct {
 	Role  distributedtxn.ReplicatedRole
 	State uint8
 
-	Revision      uint64
-	PayloadKind   distributedtxn.ReplicatedPayloadKind
-	PayloadDigest distributedtxn.Digest
-	PayloadBytes  uint64
-	PayloadCount  uint64
+	Revision           uint64
+	ControllerEpoch    uint64
+	ExecutionPinDigest distributedtxn.Digest
+	PayloadKind        distributedtxn.ReplicatedPayloadKind
+	PayloadDigest      distributedtxn.Digest
+	PayloadBytes       uint64
+	PayloadCount       uint64
 	// PayloadRelationCount is zero for coordinators and the exact number of
 	// packed native relation rows for a participant stage.
 	PayloadRelationCount uint16
@@ -107,7 +109,10 @@ type TransactionControl struct {
 	CoordinatorAllocation       uint64
 	MutationDigest              distributedtxn.Digest
 	BucketBits                  uint8
-	IntentScopes                []distributedtxn.IntentScope
+	// RecoveryPulse role-overlays BucketBits for coordinators. It is advanced
+	// only by replicated recovery-pulse commands and never by local time.
+	RecoveryPulse uint8
+	IntentScopes  []distributedtxn.IntentScope
 
 	AffectedRows      int64
 	AffectedRowsValid bool
@@ -122,8 +127,8 @@ type TransactionControl struct {
 	ParticipantOrdinal uint32
 	// PrepareResultCode is the immutable vote produced by an atomic
 	// stage+prepare. Zero denotes a legacy split-stage control which has not yet
-	// recorded a vote; the only durable nonzero values are ResultApplied and
-	// ResultIndexConflict.
+	// recorded a vote; the durable nonzero values are ResultApplied,
+	// ResultIndexConflict, and ResultWrongShard.
 	PrepareResultCode uint32
 	// FusedPath permanently distinguishes controls created by atomic prepare
 	// operations from legacy split controls. The bit survives finish/retire so
@@ -311,7 +316,11 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	frame[11] = control.State
 	frame[12] = byte(control.PayloadKind)
 	frame[13] = byte(control.LastOperation)
-	frame[14] = control.BucketBits
+	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
+		frame[14] = control.RecoveryPulse
+	} else {
+		frame[14] = control.BucketBits
+	}
 	frame[15] = byte(control.CoordinatorDecision) << 1
 	if control.AffectedRowsValid {
 		frame[15] |= 1
@@ -328,6 +337,8 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 		frame[15] |= 1 << 4
 	case ResultIndexConflict:
 		frame[15] |= 2 << 4
+	case ResultWrongShard:
+		frame[15] |= 3 << 4
 	default:
 		return dst[:start], ErrTransactionStateCorrupt
 	}
@@ -372,6 +383,8 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	} else {
 		copy(frame[288:320], control.PrepareCommandDigest[:])
 	}
+	binary.LittleEndian.PutUint64(frame[320:328], control.ControllerEpoch)
+	copy(frame[328:360], control.ExecutionPinDigest[:])
 	cursor := transactionControlHeaderBytes
 	for _, scope := range control.IntentScopes {
 		binary.LittleEndian.PutUint32(frame[cursor:cursor+4], scope.Start)
@@ -416,7 +429,11 @@ func OpenTransactionControlInto(
 	view.State = src[11]
 	view.PayloadKind = distributedtxn.ReplicatedPayloadKind(src[12])
 	view.LastOperation = distributedtxn.ReplicatedOperation(src[13])
-	view.BucketBits = src[14]
+	if view.Role == distributedtxn.ReplicatedRoleCoordinator {
+		view.RecoveryPulse = src[14]
+	} else {
+		view.BucketBits = src[14]
+	}
 	view.AffectedRowsValid = src[15]&1 != 0
 	view.FusedPath = src[15]&(1<<6) != 0
 	view.CancellationWitness = src[15]&(1<<7) != 0
@@ -427,8 +444,8 @@ func OpenTransactionControlInto(
 		view.PrepareResultCode = ResultApplied
 	case 2:
 		view.PrepareResultCode = ResultIndexConflict
-	default:
-		return TransactionControlView{}, ErrTransactionStateCorrupt
+	case 3:
+		view.PrepareResultCode = ResultWrongShard
 	}
 	copy(view.ID[:], src[24:40])
 	view.Revision = binary.LittleEndian.Uint64(src[40:48])
@@ -465,6 +482,8 @@ func OpenTransactionControlInto(
 	view.ManifestNextPage = binary.LittleEndian.Uint32(src[268:272])
 	view.ManifestNextParticipant = binary.LittleEndian.Uint64(src[272:280])
 	view.ManifestEncodedBytes = binary.LittleEndian.Uint64(src[280:288])
+	view.ControllerEpoch = binary.LittleEndian.Uint64(src[320:328])
+	copy(view.ExecutionPinDigest[:], src[328:360])
 	if view.Role == distributedtxn.ReplicatedRoleCoordinator {
 		copy(view.ManifestChainDigest[:], src[288:320])
 	} else {
@@ -887,6 +906,8 @@ func OpenTransactionIntentForKey(
 func transactionControlValid(control TransactionControl) bool {
 	cancellation := transactionCancellationWitnessValid(control)
 	if control.ID.IsZero() || !transactionRoleValid(control.Role) || control.Revision == 0 ||
+		control.ControllerEpoch == 0 || control.ExecutionPinDigest == (distributedtxn.Digest{}) ||
+		control.Role == distributedtxn.ReplicatedRoleParticipant && control.RecoveryPulse != 0 ||
 		control.PayloadDigest == (distributedtxn.Digest{}) ||
 		(!cancellation && (control.PayloadBytes == 0 || control.PayloadCount == 0)) ||
 		control.CoordinatorGroup == (replication.ID128{}) ||
@@ -945,7 +966,8 @@ func transactionControlValid(control TransactionControl) bool {
 		}
 		if control.PrepareResultCode != 0 &&
 			control.PrepareResultCode != ResultApplied &&
-			control.PrepareResultCode != ResultIndexConflict {
+			control.PrepareResultCode != ResultIndexConflict &&
+			control.PrepareResultCode != ResultWrongShard {
 			return false
 		}
 		if !control.FusedPath && control.PrepareResultCode != 0 {
@@ -989,7 +1011,8 @@ func transactionControlValid(control TransactionControl) bool {
 		control.CoordinatorDecision != distributedtxn.CoordinatorInvalid ||
 		control.CoordinatorParticipantOrdinal != 0 ||
 		(control.PrepareResultCode != 0 && control.PrepareResultCode != ResultApplied &&
-			control.PrepareResultCode != ResultIndexConflict) {
+			control.PrepareResultCode != ResultIndexConflict &&
+			control.PrepareResultCode != ResultWrongShard) {
 		return false
 	}
 	if (control.PrepareResultCode != 0) !=
@@ -1087,7 +1110,8 @@ func transactionFailedPrepareWitness(control TransactionControl) bool {
 		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantStaged &&
 		control.LastOperation == distributedtxn.ReplicatedPrepareParticipant &&
 		control.LastExpectedRevision == control.Revision &&
-		control.LastResultCode == ResultIndexConflict
+		(control.LastResultCode == ResultIndexConflict ||
+			control.LastResultCode == ResultWrongShard)
 }
 
 func transactionFailedFusedPrepareWitness(control TransactionControl) bool {
@@ -1095,8 +1119,9 @@ func transactionFailedFusedPrepareWitness(control TransactionControl) bool {
 		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
 		control.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant &&
 		control.LastExpectedRevision == 0 &&
-		control.LastResultCode == ResultIndexConflict &&
-		control.PrepareResultCode == ResultIndexConflict &&
+		(control.LastResultCode == ResultIndexConflict ||
+			control.LastResultCode == ResultWrongShard) &&
+		control.PrepareResultCode == control.LastResultCode &&
 		!control.AffectedRowsValid && control.AffectedRows == 0 &&
 		control.ResidentMutationBytes == 0 && control.ResidentIntentBytes == 0
 }
@@ -1262,6 +1287,8 @@ func transactionOperationRole(
 		distributedtxn.ReplicatedAbortCoordinator,
 		distributedtxn.ReplicatedRetireCoordinator:
 		return role == distributedtxn.ReplicatedRoleCoordinator
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return role == distributedtxn.ReplicatedRoleCoordinator
 	case distributedtxn.ReplicatedStageParticipant,
 		distributedtxn.ReplicatedStagePrepareParticipant,
 		distributedtxn.ReplicatedPrepareParticipant,
@@ -1289,7 +1316,8 @@ func transactionStateOperationCompatible(
 				operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 				operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator ||
 				operation == distributedtxn.ReplicatedStageManifestSegment ||
-				operation == distributedtxn.ReplicatedAppendManifestSegments
+				operation == distributedtxn.ReplicatedAppendManifestSegments ||
+				operation == distributedtxn.ReplicatedPulseCoordinator
 		case distributedtxn.CoordinatorCommitted:
 			return operation == distributedtxn.ReplicatedCommitCoordinator
 		case distributedtxn.CoordinatorAborted:

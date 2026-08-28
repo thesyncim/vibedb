@@ -256,6 +256,10 @@ func (c *Collection) Close() error {
 	// durability wait so independent writers can share one device commit.
 	// Closed prevents any new waiter from registering before this drain.
 	c.durabilityWait.Wait()
+	// A compaction registers while holding writer before Close can stop new
+	// admission. Retain cache/committer resources through its unlocked scan and
+	// retirement phase, including explicit caller-owned compactions.
+	c.onlineCompactionWait.Wait()
 	c.writer.Lock()
 	defer c.writer.Unlock()
 	// Concurrent Close calls may both have observed closeDone before waiting

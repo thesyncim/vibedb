@@ -3,41 +3,51 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
-	"net"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
-	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-type replicatedSQLTransactionCapture struct {
-	calls        int
-	generation   uint64
-	participants []ReplicatedTransactionParticipant
+type replicatedSQLIndexedReadClient struct {
+	states  map[string]shardservice.ReplicatedMemberState
+	value   []byte
+	reads   int
+	refusal shardservice.ReplicatedRefusalCode
 }
 
-func (capture *replicatedSQLTransactionCapture) Execute(
+func (client *replicatedSQLIndexedReadClient) DoReplicated(
 	_ context.Context,
-	generation uint64,
-	participants []ReplicatedTransactionParticipant,
-) (ReplicatedTransactionResult, error) {
-	capture.calls++
-	capture.generation = generation
-	capture.participants = append(capture.participants[:0], participants...)
-	return ReplicatedTransactionResult{
-		ID: distributedtxn.ID{1}, Committed: true, AffectedRows: 2,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state, ok := client.states[endpoint.Address]
+	if !ok {
+		return nil, ErrReplicatedRoute
+	}
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+		}, nil
+	}
+	if request.Operation != shardservice.ReplicatedReadLeader {
+		return nil, ErrReplicatedRoute
+	}
+	client.reads++
+	if client.refusal != shardservice.ReplicatedRefusalNone {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
+			Refusal: client.refusal, HasState: true, State: state}, nil
+	}
+	return &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedReadFound, HasState: true, State: state,
+		ReadApplied: state.Applied, Value: client.value,
 	}, nil
-}
-
-func (*replicatedSQLTransactionCapture) Recover(
-	context.Context,
-	*ReplicatedTransactionRecoveryHandle,
-) (ReplicatedTransactionResult, error) {
-	return ReplicatedTransactionResult{}, errors.New("unexpected recovery")
 }
 
 func TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelation(t *testing.T) {
@@ -107,215 +117,6 @@ func TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelatio
 			len(participant.IntentScopes) == 0 {
 			t.Fatalf("participant %d route/scope = %+v", index, participant)
 		}
-	}
-}
-
-func TestReplicatedSQLTransactionExecBatchRequestUsesBoundedRequestRegistry(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: capture, MaxEntries: 4,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	queries := []Query{
-		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("message-1"),
-		}},
-		{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("log-1"),
-		}},
-	}
-	requestID := replication.ID128{9}
-	result, err := executor.ExecBatchRequest(t.Context(), requestID, queries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.RowsAffected != 2 || result.TransactionID != (replication.ID128{1}) ||
-		result.ShardsFanned != 2 || capture.calls != 1 ||
-		capture.generation != snapshot.Generation() || len(capture.participants) != 2 {
-		t.Fatalf("result=%+v capture=%+v", result, capture)
-	}
-	result, err = executor.ExecBatchRequest(t.Context(), requestID, queries)
-	if err != nil || result.RowsAffected != 2 || capture.calls != 1 {
-		t.Fatalf("cached result=%+v err=%v calls=%d", result, err, capture.calls)
-	}
-	conflict := append([]Query(nil), queries...)
-	conflict[1].Params = []shardservice.Param{shardservice.StringParam("log-2")}
-	if _, err = executor.ExecBatchRequest(t.Context(), requestID, conflict); !errors.Is(
-		err, ErrReplicatedTransactionRequestConflict,
-	) || capture.calls != 1 {
-		t.Fatalf("conflict err=%v calls=%d", err, capture.calls)
-	}
-}
-
-func TestReplicatedSQLTransactionExecBatchRequestServesSingletonRF3(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{Orchestrator: capture, MaxEntries: 1},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	query := []Query{{
-		SQL:    `DELETE FROM messages WHERE id = ?`,
-		Params: []shardservice.Param{shardservice.StringParam("singleton")},
-	}}
-	if _, err := executor.ExecBatchRequest(t.Context(), replication.ID128{}, query); !errors.Is(err, ErrReplicatedTransactionRequestRegistry) || capture.calls != 0 {
-		t.Fatalf("zero identity error=%v calls=%d", err, capture.calls)
-	}
-	result, err := executor.ExecBatchRequest(t.Context(), replication.ID128{27}, query)
-	if err != nil || result == nil || result.RowsAffected != 2 ||
-		result.Generation != snapshot.Generation() || result.ShardsFanned != 1 ||
-		capture.calls != 1 || len(capture.participants) != 1 {
-		t.Fatalf("singleton result=%+v err=%v capture=%+v", result, err, capture)
-	}
-	executor.catalog = NewCatalogHolder(nil)
-	replayed, err := executor.ExecBatchRequest(t.Context(), replication.ID128{27}, query)
-	if err != nil || replayed == nil || replayed.Generation != snapshot.Generation() ||
-		replayed.ShardsFanned != 1 || capture.calls != 1 {
-		t.Fatalf("singleton replay=%+v err=%v calls=%d", replayed, err, capture.calls)
-	}
-	conflict := []Query{{
-		SQL:    `DELETE FROM messages WHERE id = ?`,
-		Params: []shardservice.Param{shardservice.StringParam("different")},
-	}}
-	if _, err := executor.ExecBatchRequest(t.Context(), replication.ID128{27}, conflict); !errors.Is(err, ErrReplicatedTransactionRequestConflict) || capture.calls != 1 {
-		t.Fatalf("singleton conflict error=%v calls=%d", err, capture.calls)
-	}
-}
-
-func TestReplicatedSQLTransactionRequestIdentityFailsClosedForStaticBatch(t *testing.T) {
-	_, executor := replicatedSQLTransactionFixture(t, false)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{Orchestrator: capture, MaxEntries: 2},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	for _, queries := range [][]Query{
-		{{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("one"),
-		}}},
-		{
-			{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-				shardservice.StringParam("one"),
-			}},
-			{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-				shardservice.StringParam("two"),
-			}},
-		},
-	} {
-		if _, err := executor.ExecBatchRequest(t.Context(), replication.ID128{28}, queries); !errors.Is(err, ErrBatchRequestIdentityUnsupported) {
-			t.Fatalf("static request identity error=%v", err)
-		}
-	}
-	if capture.calls != 0 {
-		t.Fatalf("static request reached RF3 orchestrator %d times", capture.calls)
-	}
-}
-
-func TestReplicatedSQLTransactionStaticSingletonZeroIdentityFallsBack(t *testing.T) {
-	_, executor := replicatedSQLTransactionFixture(t, false)
-	fallbackErr := errors.New("static singleton fallback dial")
-	executor.client = NewClient(func(context.Context, string) (net.Conn, error) {
-		return nil, fallbackErr
-	})
-	t.Cleanup(func() { _ = executor.client.Close() })
-
-	_, err := executor.ExecBatchRequest(t.Context(), replication.ID128{}, []Query{{
-		SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("one"),
-		},
-	}})
-	if !errors.Is(err, fallbackErr) {
-		t.Fatalf("static singleton fallback error=%v", err)
-	}
-}
-
-func TestReplicatedSQLTransactionIdentityRequiresRequestRegistry(t *testing.T) {
-	_, executor := replicatedSQLTransactionFixture(t, true)
-	_, err := executor.ExecBatchRequest(t.Context(), replication.ID128{29}, []Query{{
-		SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("one"),
-		},
-	}})
-	if !errors.Is(err, ErrBatchRequestIdentityUnsupported) {
-		t.Fatalf("missing request registry error=%v", err)
-	}
-}
-
-func TestReplicatedSQLTransactionReplayPrecedesCatalogPinAndPreservesMetadata(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{Orchestrator: capture, MaxEntries: 2},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	queries := []Query{
-		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("message-replay"),
-		}},
-		{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("log-replay"),
-		}},
-	}
-	id := replication.ID128{31}
-	first, err := executor.ExecBatchRequest(t.Context(), id, queries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Generation != snapshot.Generation() || first.ShardsFanned != 2 {
-		t.Fatalf("first metadata=%+v", first)
-	}
-
-	// Publish a later catalog with changed replica routing metadata. An exact
-	// retry must retain the original response rather than replanning against it.
-	endpoints := make(map[distribution.EndpointID]string, len(snapshot.endpoints))
-	for endpoint, address := range snapshot.endpoints {
-		endpoints[endpoint] = address
-	}
-	descriptors := snapshot.replicatedDescriptors()
-	endpoints[descriptors[0].Replicas[0].NativeEndpoint] = "127.0.0.1:65534"
-	profiles := make([]ReplicatedTableProfile, len(snapshot.replicatedTables))
-	for index, entry := range snapshot.replicatedTables {
-		profile, ok := snapshot.replicatedTableProfileAt(entry)
-		if !ok {
-			t.Fatalf("profile %d unavailable", index)
-		}
-		profiles[index] = profile
-	}
-	advanced, err := NewSnapshotWithReplicatedTableMetadata(
-		snapshot.config, endpoints, snapshot.Generation()+1, nil, nil,
-		descriptors, profiles,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.catalog = NewCatalogHolder(advanced)
-	second, err := executor.ExecBatchRequest(t.Context(), id, queries)
-	if err != nil || second.Generation != snapshot.Generation() || second.ShardsFanned != 2 {
-		t.Fatalf("changed-catalog replay=%+v err=%v", second, err)
-	}
-
-	// Removing the catalog altogether makes any attempted pin or SQL planning
-	// fail. The retained request must still replay without touching either.
-	executor.catalog = NewCatalogHolder(nil)
-	third, err := executor.ExecBatchRequest(t.Context(), id, queries)
-	if err != nil || third.Generation != snapshot.Generation() || third.ShardsFanned != 2 ||
-		capture.calls != 1 {
-		t.Fatalf("catalog-free replay=%+v err=%v calls=%d", third, err, capture.calls)
 	}
 }
 
@@ -415,17 +216,17 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 			want: ErrReplicatedSQLTransactionUnsupported,
 		},
 		{
-			name: "multi row insert",
+			name: "duplicate rows within multi row insert",
 			queries: []Query{
 				{SQL: `INSERT INTO messages VALUES (?),(?)`, Params: []shardservice.Param{
 					shardservice.DocumentParam(`{"id":"message-1"}`),
-					shardservice.DocumentParam(`{"id":"message-2"}`),
+					shardservice.DocumentParam(`{"id":"message-1"}`),
 				}},
 				{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
 					shardservice.StringParam("log-1"),
 				}},
 			},
-			want: ErrReplicatedSQLTransactionUnsupported,
+			want: ErrReplicatedSQLTransactionDuplicate,
 		},
 		{
 			name: "returning",
@@ -452,46 +253,214 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 	}
 }
 
-func TestReplicatedSQLTransactionExecutesSameGroupMultiRelationAtomically(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: capture, MaxEntries: 1,
-		},
+func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
+	documents := [][]byte{
+		[]byte(`{"id":"` + keys[0] + `","n":1}`),
+		[]byte(`{"id":"` + keys[1] + `","n":2}`),
+	}
+	participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, []Query{{
+			SQL: `INSERT INTO messages VALUES (?),(?)`,
+			Params: []shardservice.Param{
+				shardservice.DocumentBytesParam(documents[0]),
+				shardservice.DocumentBytesParam(documents[1]),
+			},
+		}}, executor.profileFor(ClassInteractive),
+	)
+	if err != nil || !handled {
+		t.Fatalf("plan handled=%v err=%v", handled, err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
+	}
+	if participants[0].Route.Command.RelationManifestDigest == participants[1].Route.Command.RelationManifestDigest ||
+		participants[0].Route.LogicalSchemaDigest != participants[1].Route.LogicalSchemaDigest {
+		t.Fatal("shared logical table did not preserve distinct shard machine fences")
+	}
+	seen := make(map[string][]byte, len(documents))
+	borrowed := make(map[string]bool, len(documents))
+	for participantIndex := range participants {
+		participant := &participants[participantIndex]
+		if len(participant.IntentScopes) != 1 {
+			t.Fatalf("participant %d intent scopes=%v want one exact bucket", participantIndex, participant.IntentScopes)
+		}
+		for batchIndex := range participant.Batches {
+			batch := &participant.Batches[batchIndex]
+			if batch.Relation != 1 {
+				t.Fatalf("participant %d relation=%d want messages relation 1", participantIndex, batch.Relation)
+			}
+			for mutationIndex := range batch.Mutations {
+				mutation := &batch.Mutations[mutationIndex]
+				if mutation.Kind != replication.MutationPutAbsent {
+					t.Fatalf("mutation kind=%d want put-absent", mutation.Kind)
+				}
+				seen[string(mutation.Value)] = mutation.Key
+				for _, document := range documents {
+					if bytes.Equal(mutation.Value, document) {
+						borrowed[string(document)] = &mutation.Value[0] == &document[0]
+					}
+				}
+			}
+		}
+	}
+	for _, document := range documents {
+		if len(seen[string(document)]) == 0 {
+			t.Fatalf("document %s was not lowered", document)
+		}
+		if !borrowed[string(document)] {
+			t.Fatalf("document %s was copied during byte-native lowering", document)
+		}
+	}
+}
+
+func TestReplicatedSQLTransactionLowersFiniteDeleteAcrossRF3Shards(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
+	participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, []Query{{
+			SQL: `DELETE FROM messages WHERE id IN (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(keys[0]), shardservice.StringParam(keys[1]),
+			},
+		}}, executor.profileFor(ClassInteractive),
+	)
+	if err != nil || !handled {
+		t.Fatalf("plan handled=%v err=%v", handled, err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
+	}
+	mutations := 0
+	for participantIndex := range participants {
+		participant := &participants[participantIndex]
+		if len(participant.IntentScopes) != 1 || len(participant.Batches) != 1 ||
+			participant.Batches[0].Relation != 1 {
+			t.Fatalf("participant %d=%+v", participantIndex, participant)
+		}
+		for mutationIndex := range participant.Batches[0].Mutations {
+			if participant.Batches[0].Mutations[mutationIndex].Kind != replication.MutationDelete {
+				t.Fatalf("participant %d mutation %d kind=%d", participantIndex, mutationIndex,
+					participant.Batches[0].Mutations[mutationIndex].Kind)
+			}
+			mutations++
+		}
+	}
+	if mutations != 2 {
+		t.Fatalf("mutations=%d want=2", mutations)
+	}
+}
+
+func replicatedSQLSplitTransactionFixture(
+	t testing.TB,
+) (*Snapshot, *Executor, [2]string) {
+	t.Helper()
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	cut := point(0x80)
+	manifest, err := distribution.NewManifest("data", 4, []distribution.Shard{
+		{ID: "left", AllocationGeneration: 1,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Point: cut}},
+			Leaders: []distribution.EndpointID{"peer-a", "peer-b", "peer-c"}, Epoch: 7},
+		{ID: "right", AllocationGeneration: 2,
+			Range:   distribution.KeyRange{Start: cut, End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: []distribution.EndpointID{"right-a", "right-b", "right-c"}, Epoch: 7},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Manifests = []*distribution.Manifest{manifest}
+	descriptor.Shard = "left"
+	descriptor.Command.RoutingVersion = 4
+	descriptor.RangeIdentity[0]++
+	left := descriptor
+	right := descriptor
+	right.Command.RelationManifestDigest[0]++
+	right.Replicas = append([]ReplicatedReplicaDescriptor(nil), descriptor.Replicas...)
+	right.Shard = "right"
+	right.AllocationGeneration = 2
+	right.Group.ShardIncarnation[0]++
+	right.Group.GroupID[0]++
+	right.RangeIdentity[0]++
+	right.LineageDigest[0]++
+	right.ForwardingRuleDigest[0]++
+	for ordinal := range right.Replicas {
+		letter := string(rune('a' + ordinal))
+		right.Replicas[ordinal].Endpoint = distribution.EndpointID("right-" + letter)
+		right.Replicas[ordinal].NativeEndpoint = distribution.EndpointID("right-native-" + letter)
+		right.Replicas[ordinal].ControlEndpoint = distribution.EndpointID("right-control-" + letter)
+		endpoints[right.Replicas[ordinal].Endpoint] = "127.0.0.1:" + string(rune('1'+ordinal)) + "401"
+		endpoints[right.Replicas[ordinal].NativeEndpoint] = "127.0.0.1:" + string(rune('1'+ordinal)) + "411"
+		endpoints[right.Replicas[ordinal].ControlEndpoint] = "127.0.0.1:" + string(rune('1'+ordinal)) + "421"
+	}
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 7, nil, nil, []ReplicatedShardDescriptor{left, right},
+		[]ReplicatedTableProfile{profile},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor.replicatedTransactionRequests = registry
-	queries := []Query{
-		{SQL: `DELETE FROM accounts WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("account-1"),
-		}},
-		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("message-1"),
-		}},
+	mapper := distribution.NewNativeMapper(1)
+	var keys [2]string
+	for candidate := 0; candidate < 10_000 && (keys[0] == "" || keys[1] == ""); candidate++ {
+		key := fmt.Sprintf("multi-row-%d", candidate)
+		point, pointErr := mapper.PointFor([]distribution.Scalar{distribution.NewString(key)})
+		if pointErr != nil {
+			t.Fatal(pointErr)
+		}
+		ordinal := 0
+		if bytes.Compare(point[:], cut[:]) >= 0 {
+			ordinal = 1
+		}
+		if keys[ordinal] == "" {
+			keys[ordinal] = key
+		}
 	}
-	result, handled, err := executor.executeReplicatedSQLTransaction(
-		t.Context(), snapshot, replication.ID128{1},
-		replicatedSQLTransactionRequestDigest(queries), queries,
-		executor.profileFor(ClassInteractive),
+	if keys[0] == "" || keys[1] == "" {
+		t.Fatal("could not find keys on both sides of split")
+	}
+	return snapshot, NewExecutor(nil, NewCatalogHolder(snapshot), Options{}), keys
+}
+
+func TestReplicatedSQLTransactionMultiRowInsertMaintainsGlobalIndexAtomically(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
+	participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, []Query{{
+			SQL: `INSERT INTO messages VALUES (?),(?)`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(`{"id":"message-1","email":"one@example.test"}`),
+				shardservice.DocumentParam(`{"id":"message-2","email":"two@example.test"}`),
+			},
+		}}, executor.profileFor(ClassInteractive),
 	)
-	if err != nil || !handled || result == nil || result.RowsAffected != 2 ||
-		result.ShardsFanned != 1 || capture.calls != 1 ||
-		capture.generation != snapshot.Generation() || len(capture.participants) != 1 {
-		t.Fatalf("execute = result %+v handled %v err %v", result, handled, err)
+	if err != nil || !handled {
+		t.Fatalf("plan handled=%v err=%v", handled, err)
 	}
-	participant := &capture.participants[0]
-	if participant.Route.Distribution != "data" || len(participant.Batches) != 2 ||
-		participant.Batches[0].Relation != 1 || participant.Batches[1].Relation != 2 ||
-		len(participant.Batches[0].Mutations) != 1 ||
-		len(participant.Batches[1].Mutations) != 1 {
-		t.Fatalf("participant = %+v", participant)
+	baseMutations, indexMutations := 0, 0
+	locators := make(map[string]bool, 2)
+	for participantIndex := range participants {
+		participant := &participants[participantIndex]
+		for batchIndex := range participant.Batches {
+			batch := &participant.Batches[batchIndex]
+			if participant.Route.Distribution == "messages-email" {
+				for mutationIndex := range batch.Mutations {
+					mutation := &batch.Mutations[mutationIndex]
+					if mutation.Kind != replication.MutationPutAbsentOrEqual {
+						t.Fatalf("index mutation kind=%d", mutation.Kind)
+					}
+					locators[string(mutation.Value)] = true
+					indexMutations++
+				}
+			} else if participant.Route.Distribution == "data" && batch.Relation == 2 {
+				baseMutations += len(batch.Mutations)
+			}
+		}
+	}
+	if baseMutations != 2 || indexMutations != 2 ||
+		!locators[`["message-1"]`] || !locators[`["message-2"]`] {
+		t.Fatalf("base=%d index=%d locators=%v", baseMutations, indexMutations, locators)
 	}
 }
 
-func TestReplicatedSQLTransactionRejectsReadyGlobalIndexBeforeExecution(t *testing.T) {
+func TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Participant(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
 	participants, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, []Query{
@@ -503,10 +472,223 @@ func TestReplicatedSQLTransactionRejectsReadyGlobalIndexBeforeExecution(t *testi
 			}},
 		}, executor.profileFor(ClassInteractive),
 	)
-	if len(participants) != 0 || !handled ||
-		!errors.Is(err, ErrReplicatedSQLTransactionUnsupported) {
+	if len(participants) != 3 || !handled || err != nil {
 		t.Fatalf("plan = %d handled %v err %v", len(participants), handled, err)
 	}
+	var index *ReplicatedTransactionParticipant
+	for ordinal := range participants {
+		if participants[ordinal].Route.Distribution == "messages-email" {
+			index = &participants[ordinal]
+		}
+	}
+	if index == nil || len(index.Batches) != 1 || index.Batches[0].Relation != 1 ||
+		len(index.Batches[0].Mutations) != 1 ||
+		index.Batches[0].Mutations[0].Kind != replication.MutationPutAbsentOrEqual ||
+		!bytes.Equal(index.Batches[0].Mutations[0].Value, []byte(`["message-1"]`)) {
+		t.Fatalf("global index participant = %+v", index)
+	}
+}
+
+func TestReplicatedSQLTransactionGlobalIndexMutationsConsumeAdmissionBudget(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
+	query := []Query{{
+		SQL: `INSERT INTO messages VALUES (?)`, Params: []shardservice.Param{
+			shardservice.DocumentParam(`{"id":"message-1","email":"m@example.test"}`),
+		},
+	}}
+	profile := executor.profileFor(ClassInteractive)
+	profile.MaxTransactionMutations = 1
+	if participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, query, profile,
+	); len(participants) != 0 || !handled || !errors.Is(err, ErrTransactionMutationLimit) {
+		t.Fatalf("mutation bound participants=%d handled=%v err=%v", len(participants), handled, err)
+	}
+	profile = executor.profileFor(ClassInteractive)
+	profile.MaxTransactionBytes = uint64(len(`{"id":"message-1","email":"m@example.test"}`)) + 32
+	if participants, handled, err := executor.planReplicatedSQLTransaction(
+		t.Context(), snapshot, query, profile,
+	); len(participants) != 0 || !handled || !errors.Is(err, ErrTransactionByteLimit) {
+		t.Fatalf("byte bound participants=%d handled=%v err=%v", len(participants), handled, err)
+	}
+}
+
+func TestReplicatedSQLTransactionGlobalIndexRejectsStaleSplitFence(t *testing.T) {
+	snapshot, _ := replicatedSQLTransactionFixture(t, true, true)
+	query := Query{
+		SQL: `INSERT INTO messages VALUES (?)`, Params: []shardservice.Param{
+			shardservice.DocumentParam(`{"id":"message-1","email":"m@example.test"}`),
+		},
+	}
+	prepared, err := snapshot.Prepare(t.Context(), query.SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := queryRuntimeArgs(query.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.BindWrite(args)
+	if err != nil || len(bound.globalIndexes) != 1 {
+		t.Fatalf("bound global indexes=%d err=%v", len(bound.globalIndexes), err)
+	}
+	stale := bound.globalIndexes[0]
+	stale.target.OwnershipEpoch++
+	if _, _, err := snapshot.resolveReplicatedSQLGlobalIndex(&stale); !errors.Is(
+		err, ErrReplicatedSQLWriteUnavailable,
+	) {
+		t.Fatalf("stale split ownership fence error=%v", err)
+	}
+	stale = bound.globalIndexes[0]
+	stale.routingVersion++
+	if _, _, err := snapshot.resolveReplicatedSQLGlobalIndex(&stale); !errors.Is(
+		err, ErrReplicatedSQLWriteUnavailable,
+	) {
+		t.Fatalf("stale split routing fence error=%v", err)
+	}
+}
+
+func TestReplicatedSQLTransactionGlobalIndexUpdateAndDeleteBindExactOldValue(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		query      Query
+		baseKind   replication.MutationKind
+		indexKinds []replication.MutationKind
+	}{{
+		name: "update", query: Query{
+			SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(`{"id":"message-1","email":"new@example.test"}`),
+				shardservice.StringParam("message-1"),
+			},
+		}, baseKind: replication.MutationPutDigestEqual,
+		indexKinds: []replication.MutationKind{
+			replication.MutationDeleteDigestEqual, replication.MutationPutAbsentOrEqual,
+		},
+	}, {
+		name: "delete", query: Query{
+			SQL:    `DELETE FROM messages WHERE id = ?`,
+			Params: []shardservice.Param{shardservice.StringParam("message-1")},
+		}, baseKind: replication.MutationDeleteDigestEqual,
+		indexKinds: []replication.MutationKind{replication.MutationDeleteDigestEqual},
+	}} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
+			old := []byte(`{"id":"message-1","email":"old@example.test"}`)
+			client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+				t.Context(), snapshot, []Query{test.query}, executor.profileFor(ClassInteractive), data,
+			)
+			if err != nil || !handled || client.reads != 1 || len(participants) != 2 {
+				t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+			}
+			var base, index *ReplicatedTransactionParticipant
+			for ordinal := range participants {
+				switch participants[ordinal].Route.Distribution {
+				case "data":
+					base = &participants[ordinal]
+				case "messages-email":
+					index = &participants[ordinal]
+				}
+			}
+			if base == nil || len(base.Batches) != 1 || len(base.Batches[0].Mutations) != 1 {
+				t.Fatalf("base participant=%+v", base)
+			}
+			baseMutation := base.Batches[0].Mutations[0]
+			if baseMutation.Kind != test.baseKind ||
+				baseMutation.ExpectedValueLength != uint64(len(old)) ||
+				baseMutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
+				t.Fatalf("base mutation=%+v", baseMutation)
+			}
+			if index == nil || len(index.Batches) != 1 ||
+				len(index.Batches[0].Mutations) != len(test.indexKinds) {
+				t.Fatalf("index participant=%+v", index)
+			}
+			for ordinal, want := range test.indexKinds {
+				mutation := index.Batches[0].Mutations[ordinal]
+				if mutation.Kind != want {
+					t.Fatalf("index mutation %d kind=%d want=%d", ordinal, mutation.Kind, want)
+				}
+				if want == replication.MutationDeleteDigestEqual &&
+					(mutation.ExpectedValueLength == 0 ||
+						mutation.ExpectedValueDigest == (replication.Digest{})) {
+					t.Fatalf("index delete lacks exact old-value fence: %+v", mutation)
+				}
+			}
+		})
+	}
+}
+
+func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true, true, true)
+	old := []byte(`{"id":"message-1","email":"same@example.test","region":"old"}`)
+	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+		t.Context(), snapshot, []Query{{
+			SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(`{"id":"message-1","email":"same@example.test","region":"new"}`),
+				shardservice.StringParam("message-1"),
+			},
+		}}, executor.profileFor(ClassInteractive), data,
+	)
+	if err != nil || !handled || len(participants) != 2 {
+		t.Fatalf("plan=%d handled=%v err=%v", len(participants), handled, err)
+	}
+	for ordinal := range participants {
+		participant := &participants[ordinal]
+		if participant.Route.Distribution != "messages-email" {
+			continue
+		}
+		if len(participant.Batches) != 1 || len(participant.Batches[0].Mutations) != 1 {
+			t.Fatalf("same-key index participant=%+v", participant)
+		}
+		mutation := participant.Batches[0].Mutations[0]
+		if mutation.Kind != replication.MutationPutDigestEqual ||
+			mutation.ExpectedValueLength == 0 ||
+			mutation.ExpectedValueDigest == (replication.Digest{}) || len(mutation.Value) == 0 {
+			t.Fatalf("same-key exact replacement=%+v", mutation)
+		}
+		return
+	}
+	t.Fatal("same-key index participant missing")
+}
+
+func attachReplicatedSQLIndexedReadClient(
+	t testing.TB,
+	snapshot *Snapshot,
+	value []byte,
+) (*replicatedSQLIndexedReadClient, *ReplicatedExecutor) {
+	t.Helper()
+	key, ok := orderedkey.AppendString(nil, []byte("message-1"), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode indexed read key")
+	}
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scalar [replication.MaxMutationKeyBytes + 16]byte
+	resolved, ok := snapshot.ResolveReplicatedTableKey(
+		[]byte("messages"), key, scalar[:0], replicas[:0],
+	)
+	if !ok {
+		t.Fatal("resolve indexed base route")
+	}
+	states := make(map[string]shardservice.ReplicatedMemberState, len(resolved.Route.Replicas))
+	leader := resolved.Route.Replicas[0].Member
+	for _, endpoint := range resolved.Route.Replicas {
+		fence := shardservice.ReplicatedFence{
+			Group: resolved.Route.Group, AllocationGeneration: resolved.Route.AllocationGeneration,
+			Command: resolved.Route.Command, MemberID: endpoint.Member,
+			StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation, Term: 1,
+		}
+		states[endpoint.Address] = shardservice.ReplicatedMemberState{
+			Fence: fence, LeaderID: leader, Commit: 1, Applied: 1, CheckpointApplied: 1,
+		}
+	}
+	client := &replicatedSQLIndexedReadClient{states: states, value: value}
+	replicated, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, replicated
 }
 
 func TestReplicatedSQLTransactionRejectsMixedAuthorityAndLeavesStaticBatchUnclaimed(t *testing.T) {
@@ -547,12 +729,12 @@ func replicatedSQLTransactionFixture(
 	profiles := []ReplicatedTableProfile{
 		{
 			Table: "accounts", Relation: 1, PrimaryKey: "/id", SchemaGeneration: 8,
-			RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+			LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 			MaxDocumentBytes: 4 << 20,
 		},
 		{
 			Table: "messages", Relation: 2, PrimaryKey: "/id", SchemaGeneration: 8,
-			RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+			LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 			MaxDocumentBytes: 4 << 20,
 		},
 	}
@@ -576,7 +758,7 @@ func replicatedSQLTransactionFixture(
 	})
 	profiles = append(profiles, ReplicatedTableProfile{
 		Table: "logs", Relation: 1, PrimaryKey: "/id", SchemaGeneration: 8,
-		RelationManifestDigest: replication.Digest{9}, MaxKeyBytes: 256,
+		LogicalSchemaDigest: replication.Digest{10}, MaxKeyBytes: 256,
 		MaxDocumentBytes: 4 << 20,
 	})
 	endpoints["logs-a"], endpoints["logs-b"], endpoints["logs-c"] =
@@ -586,14 +768,21 @@ func replicatedSQLTransactionFixture(
 	endpoints["logs-control-a"], endpoints["logs-control-b"], endpoints["logs-control-c"] =
 		"127.0.0.1:8201", "127.0.0.1:8202", "127.0.0.1:8203"
 	var indexes []IndexDescriptor
+	descriptors := []ReplicatedShardDescriptor{descriptor}
 	if len(withReadyIndex) != 0 && withReadyIndex[0] {
+		locatorPaths := []string{"/id"}
+		if len(withReadyIndex) > 1 && withReadyIndex[1] {
+			locatorPaths = append(locatorPaths, "/region")
+		}
 		indexManifest, indexErr := distribution.NewManifest(
 			"messages-email", 1, []distribution.Shard{{
 				ID: "messages-email-all", AllocationGeneration: 1,
 				Range: distribution.KeyRange{
 					Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Max: true},
 				},
-				Leaders: []distribution.EndpointID{"messages-email-a"}, Epoch: 1,
+				Leaders: []distribution.EndpointID{
+					"messages-email-a", "messages-email-b", "messages-email-c",
+				}, Epoch: 1,
 			}},
 		)
 		if indexErr != nil {
@@ -606,13 +795,46 @@ func replicatedSQLTransactionFixture(
 		config.Placements = append(config.Placements, distribution.TablePlacement{
 			Table: "messages_email", Distribution: "messages-email", Columns: []string{"/email"},
 		})
-		endpoints["messages-email-a"] = "127.0.0.1:8301"
+		for ordinal, letter := range []string{"a", "b", "c"} {
+			endpoints[distribution.EndpointID("messages-email-"+letter)] =
+				"127.0.0.1:" + string(rune('1'+ordinal)) + "301"
+			endpoints[distribution.EndpointID("messages-email-native-"+letter)] =
+				"127.0.0.1:" + string(rune('1'+ordinal)) + "311"
+			endpoints[distribution.EndpointID("messages-email-control-"+letter)] =
+				"127.0.0.1:" + string(rune('1'+ordinal)) + "321"
+		}
 		indexes = []IndexDescriptor{{
 			IndexID: 19, Incarnation: 1, Table: "messages", Name: "by_email",
 			Relation: "messages_email", Paths: []string{"/email"},
-			LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+			LocatorPaths: locatorPaths, PrimaryPath: "/id",
 			Flags: IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexReady,
 		}}
+		indexDescriptor := descriptor
+		indexDescriptor.Replicas = append(
+			[]ReplicatedReplicaDescriptor(nil), descriptor.Replicas...,
+		)
+		indexDescriptor.Distribution, indexDescriptor.Shard =
+			"messages-email", "messages-email-all"
+		indexDescriptor.Group.ShardIncarnation[0] += 2
+		indexDescriptor.Group.GroupID[0] += 2
+		indexDescriptor.Command.OwnershipEpoch = 1
+		indexDescriptor.Command.RoutingVersion = 1
+		for ordinal := range indexDescriptor.Replicas {
+			letter := string(rune('a' + ordinal))
+			indexDescriptor.Replicas[ordinal].Endpoint =
+				distribution.EndpointID("messages-email-" + letter)
+			indexDescriptor.Replicas[ordinal].NativeEndpoint =
+				distribution.EndpointID("messages-email-native-" + letter)
+			indexDescriptor.Replicas[ordinal].ControlEndpoint =
+				distribution.EndpointID("messages-email-control-" + letter)
+			indexDescriptor.Replicas[ordinal].StoreID[0] += 80
+		}
+		descriptors = append(descriptors, indexDescriptor)
+		profiles = append(profiles, ReplicatedTableProfile{
+			Table: "messages_email", Relation: 1, PrimaryKey: "/email",
+			SchemaGeneration: 8, LogicalSchemaDigest: replication.Digest{10},
+			MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+		})
 	}
 	logsDescriptor := descriptor
 	logsDescriptor.Replicas = append(
@@ -652,13 +874,11 @@ func replicatedSQLTransactionFixture(
 
 	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
 		config, endpoints, 7, indexes, nil,
-		[]ReplicatedShardDescriptor{descriptor, logsDescriptor}, profiles,
+		append(descriptors, logsDescriptor), profiles,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{
-		ReplicatedTransactions: &ReplicatedTransactionOrchestrator{},
-	})
+	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	return snapshot, executor
 }

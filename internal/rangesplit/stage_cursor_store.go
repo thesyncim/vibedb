@@ -19,19 +19,25 @@ import (
 type ChildStageCursorStore struct {
 	mu sync.Mutex
 
-	root     *os.Root
-	base     string
-	lockFile *os.File
-	raw      [childStageCursorBytes]byte
-	cursor   ChildStageCursor
-	codec    ChildStageCursorWorkspace
-	has      bool
-	closed   bool
+	root      *os.Root
+	base      string
+	lockFile  *os.File
+	raw       [childStageCursorBytes]byte
+	cursor    ChildStageCursor
+	codec     ChildStageCursorWorkspace
+	has       bool
+	closed    bool
+	uncertain bool
+	syncRoot  func(*os.Root) error
 }
 
 // OpenChildStageCursorStore opens or creates the writer lease for path and
 // strictly recovers its current fixed-size cursor when present.
 func OpenChildStageCursorStore(path string) (*ChildStageCursorStore, error) {
+	return openChildStageCursorStore(path, syncChildStageCursorRoot)
+}
+
+func openChildStageCursorStore(path string, syncRoot func(*os.Root) error) (*ChildStageCursorStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("%w: empty cursor path", ErrChildStage)
 	}
@@ -56,7 +62,7 @@ func OpenChildStageCursorStore(path string) (*ChildStageCursorStore, error) {
 		_ = root.Close()
 		return nil, fmt.Errorf("%w: cursor writer: %v", ErrChildStage, err)
 	}
-	store := &ChildStageCursorStore{root: root, base: base, lockFile: lockFile}
+	store := &ChildStageCursorStore{root: root, base: base, lockFile: lockFile, syncRoot: syncRoot}
 	if err := store.readCurrent(); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -75,6 +81,9 @@ func (s *ChildStageCursorStore) Load(dst []byte) ([]byte, bool, error) {
 	if s.closed {
 		return dst, false, ErrChildStage
 	}
+	if s.uncertain {
+		return dst, false, ErrChildStageOutcomeUnknown
+	}
 	if !s.has {
 		return dst, false, nil
 	}
@@ -91,6 +100,9 @@ func (s *ChildStageCursorStore) Persist(raw []byte) error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return ErrChildStage
+	}
+	if s.uncertain {
+		return ErrChildStageOutcomeUnknown
 	}
 	next, err := decodeChildStageCursor(raw, &s.codec)
 	if err != nil {
@@ -125,10 +137,12 @@ func (s *ChildStageCursorStore) Persist(raw []byte) error {
 		return err
 	}
 	if err := replaceChildStageCursorEntry(s.root, temporaryBase, s.base); err != nil {
-		return err
+		s.uncertain = true
+		return errors.Join(ErrChildStageOutcomeUnknown, err)
 	}
 	renamed = true
-	if err := syncChildStageCursorRoot(s.root); err != nil {
+	if err := s.syncRoot(s.root); err != nil {
+		s.uncertain = true
 		return errors.Join(ErrChildStageOutcomeUnknown, err)
 	}
 	copy(s.raw[:], raw)
@@ -159,6 +173,12 @@ func (s *ChildStageCursorStore) readCurrent() error {
 	cursor, err := decodeChildStageCursor(s.raw[:], &s.codec)
 	if err != nil {
 		return err
+	}
+	// A readable rename is not proof of a durable namespace publication.
+	// Complete the directory fence before a recovered pending receipt can
+	// authorize row writes, including after a prior failed directory sync.
+	if err := s.syncRoot(s.root); err != nil {
+		return errors.Join(ErrChildStageOutcomeUnknown, err)
 	}
 	s.cursor = cursor
 	s.has = true
@@ -272,6 +292,15 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 			next.artifactPayload >= current.artifactPayload &&
 			next.artifactOffset > current.artifactOffset
 	case ChildStageTail:
+		if next.applied == current.applied {
+			// The only same-entry advance is recording the preimage receipt;
+			// no counters, roots, source fences, or completed identity may move.
+			if current.pendingBatchDigest != ([32]byte{}) || next.pendingBatchDigest == ([32]byte{}) {
+				return false
+			}
+			next.pendingBatchDigest = [32]byte{}
+			return next == current
+		}
 		if current.applied == ^uint64(0) ||
 			(next.phase != ChildStageTail && next.phase != ChildStageSealed) ||
 			next.applied != current.applied+1 || next.term < current.term ||
@@ -280,13 +309,12 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 			next.artifactPayload != current.artifactPayload ||
 			next.artifactOffset != current.artifactOffset ||
 			next.lastChunkDigest != current.lastChunkDigest ||
-			next.lastBatchDigest == ([32]byte{}) {
+			next.lastBatchDigest == ([32]byte{}) || next.pendingBatchDigest != ([32]byte{}) ||
+			current.pendingBatchDigest != ([32]byte{}) && next.lastBatchDigest != current.pendingBatchDigest {
 			return false
 		}
 		if next.phase == ChildStageTail {
-			return next.routeGeneration == current.routeGeneration &&
-				next.imageRows == 0 && next.imageBytes == 0 &&
-				next.imageDigest == ([32]byte{})
+			return next.routeGeneration == current.routeGeneration
 		}
 		return current.routeGeneration != ^uint64(0) &&
 			next.routeGeneration == current.routeGeneration+1 &&

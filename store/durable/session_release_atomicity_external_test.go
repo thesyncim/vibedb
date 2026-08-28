@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -155,7 +156,7 @@ func newSessionReleaseCrashFixture(
 		filepath.Join(fixture.dir, "user.vdb"),
 	}
 	fixture.options = []durable.Options{
-		{OpaqueValues: true, MaxBatchDocuments: int(sessionCrashRetryWindow) + 2},
+		{OpaqueValues: true, MaxBatchDocuments: 2*int(sessionCrashRetryWindow) + 2},
 		{},
 	}
 	if withCapture {
@@ -271,7 +272,7 @@ func assertSessionReleaseCrashImage(
 		filepath.Join(dir, "user.vdb"),
 	}
 	options := []durable.Options{
-		{OpaqueValues: true, MaxBatchDocuments: int(sessionCrashRetryWindow) + 2},
+		{OpaqueValues: true, MaxBatchDocuments: 2*int(sessionCrashRetryWindow) + 2},
 		{},
 	}
 	if withCapture {
@@ -401,13 +402,15 @@ func assertSessionReleaseCrashImage(
 
 func sessionCrashMachineOptions(withCapture bool) replicatedstate.Options {
 	collections := 2
+	documents := replicatedstate.MaxDistinctMutations + 4
 	if withCapture {
 		collections = 3
+		documents++
 	}
 	return replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: collections,
-			MaxDocuments:   68,
+			MaxDocuments:   documents,
 			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 1,
@@ -518,6 +521,7 @@ func sessionCrashBinding() replicatedstate.Binding {
 		GroupID: sessionCrashID(6), ActivePolicyGeneration: 7,
 		ProtectionEpoch: 8, OwnershipEpoch: 9, SchemaGeneration: 10,
 		RoutingVersion: 11, RouteGeneration: 12,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 	}
 }
 

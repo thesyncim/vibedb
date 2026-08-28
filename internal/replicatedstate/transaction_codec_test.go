@@ -81,6 +81,7 @@ func transactionCodecControl(t testing.TB) TransactionControl {
 	return TransactionControl{
 		ID: transactionCodecID(1), Role: distributedtxn.ReplicatedRoleParticipant,
 		State: uint8(distributedtxn.ParticipantPrepared), Revision: 2,
+		ControllerEpoch: 7, ExecutionPinDigest: transactionCodecDigest(19),
 		PayloadKind:   distributedtxn.ReplicatedPayloadParticipantStage,
 		PayloadDigest: transactionCodecDigest(20), PayloadBytes: 4096, PayloadCount: 1,
 		PayloadRelationCount:        1,
@@ -94,6 +95,16 @@ func transactionCodecControl(t testing.TB) TransactionControl {
 		LastExpectedRevision: 1, LastCommandDigest: transactionCodecCommandDigest(110),
 		LastResultCode: 1, LastAppliedIndex: 91,
 	}
+}
+
+func fencedTransactionTestControl(control TransactionControl) TransactionControl {
+	if control.ControllerEpoch == 0 {
+		control.ControllerEpoch = 7
+	}
+	if control.ExecutionPinDigest == (distributedtxn.Digest{}) {
+		control.ExecutionPinDigest = transactionCodecDigest(19)
+	}
+	return control
 }
 
 func transactionCodecCoordinatorPayload(t testing.TB) (distributedtxn.ID, []byte) {
@@ -188,6 +199,7 @@ func TestTransactionSystemStorageKeysAreExactAndOrdered(t *testing.T) {
 
 func TestTransactionControlRoundTripRetryWitnessAndTombstone(t *testing.T) {
 	control := transactionCodecControl(t)
+	control = fencedTransactionTestControl(control)
 	encoded, err := AppendTransactionControl(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +330,7 @@ func TestTransactionControlCancellationWitnessIsExplicitCompactAndOrdinalBound(t
 		LastResultCode:       ResultApplied,
 		LastAppliedIndex:     97,
 	}
+	control = fencedTransactionTestControl(control)
 	encoded, err := AppendTransactionControl(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -406,6 +419,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 	); got != descriptor.Root {
 		t.Fatalf("incremental manifest root=%x want=%x", got, descriptor.Root)
 	}
+	control = fencedTransactionTestControl(control)
 	encoded, err := AppendTransactionControl(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -482,6 +496,7 @@ func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
 			distributedtxn.Digest{}, segment.Index, segment.Digest,
 		),
 	}
+	control = fencedTransactionTestControl(control)
 	encoded, err := AppendTransactionControl(nil, control)
 	if err != nil {
 		t.Fatal(err)

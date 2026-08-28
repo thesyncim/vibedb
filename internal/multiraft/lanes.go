@@ -8,6 +8,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -104,6 +105,12 @@ func (lane *ExecutionLane) EnqueueTrackedProposal(key raftmember.GroupKey, data 
 	}
 	return lane.set.EnqueueTrackedProposal(key, data, token)
 }
+func (lane *ExecutionLane) EnqueueProposal(key raftmember.GroupKey, data []byte) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.EnqueueProposal(key, data)
+}
 func (lane *ExecutionLane) ProposeConfChange(key raftmember.GroupKey, change pb.ConfChangeI) error {
 	if err := lane.accepts(key); err != nil {
 		return err
@@ -157,6 +164,62 @@ func (lane *ExecutionLane) DurablePromotion(key raftmember.GroupKey, memberID ui
 		return raftmember.DurablePromotionProof{}, false, err
 	}
 	return lane.set.DurablePromotion(key, memberID)
+}
+func (lane *ExecutionLane) SnapshotState(key raftmember.GroupKey) (replicatedstate.State, error) {
+	if err := lane.accepts(key); err != nil {
+		return replicatedstate.State{}, err
+	}
+	return lane.set.SnapshotState(key)
+}
+func (lane *ExecutionLane) SnapshotBaseCertificate(key raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error) {
+	if err := lane.accepts(key); err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	return lane.set.SnapshotBaseCertificate(key)
+}
+func (lane *ExecutionLane) Remove(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.Remove(key)
+}
+func (lane *ExecutionLane) QuiesceSQLGeneration(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.QuiesceSQLGeneration(key)
+}
+func (lane *ExecutionLane) ObserveSchemaTransition(
+	key raftmember.GroupKey, command []byte,
+) (uint64, bool, error) {
+	if err := lane.accepts(key); err != nil {
+		return 0, false, err
+	}
+	return lane.set.ObserveSchemaTransition(key, command)
+}
+func (lane *ExecutionLane) InstallSQLGeneration(
+	key raftmember.GroupKey, database *sqldriver.Database, apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.InstallSQLGeneration(key, database, apply, expectedSQL, expectedApply)
+}
+
+// Add transfers a Runtime to this exact deterministic lane. It exists for
+// serialized live group adoption; callers cannot use a lane handle to place a
+// group on a different owner.
+func (lane *ExecutionLane) Add(runtime *raftmember.Runtime) error {
+	if lane == nil || lane.set == nil || runtime == nil {
+		return ErrGroupNotFound
+	}
+	index, err := lane.set.Lane(runtime.Identity().Group)
+	if err != nil || index != lane.index {
+		return errors.Join(ErrGroupNotFound, err)
+	}
+	return lane.set.Add(runtime)
 }
 func (lane *ExecutionLane) RunOne() (Progress, bool, error) {
 	if lane == nil || lane.set == nil {
@@ -350,6 +413,36 @@ func (set *ExecutionLanes) Remove(key raftmember.GroupKey) error {
 	return set.withGroup(key, func(host *Host) error { return host.Remove(key) })
 }
 
+func (set *ExecutionLanes) QuiesceSQLGeneration(key raftmember.GroupKey) error {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return err
+	}
+	return lane.host.QuiesceSQLGeneration(key)
+}
+
+func (set *ExecutionLanes) ObserveSchemaTransition(
+	key raftmember.GroupKey, command []byte,
+) (uint64, bool, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return 0, false, err
+	}
+	return lane.host.ObserveSchemaTransition(key, command)
+}
+
+func (set *ExecutionLanes) InstallSQLGeneration(
+	key raftmember.GroupKey, database *sqldriver.Database, apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return err
+	}
+	return lane.host.InstallSQLGeneration(key, database, apply, expectedSQL, expectedApply)
+}
+
 func (set *ExecutionLanes) EnqueueMessage(key raftmember.GroupKey, message *pb.Message) error {
 	return set.withGroup(key, func(host *Host) error { return host.EnqueueMessage(key, message) })
 }
@@ -424,6 +517,27 @@ func (set *ExecutionLanes) SnapshotState(key raftmember.GroupKey) (replicatedsta
 		return replicatedstate.State{}, ErrHostClosed
 	}
 	result, err := lane.host.SnapshotState(key)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return result, err
+}
+
+func (set *ExecutionLanes) SnapshotBaseCertificate(
+	key raftmember.GroupKey,
+) (replicatedstate.SnapshotBaseCertificate, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return replicatedstate.SnapshotBaseCertificate{}, ErrHostClosed
+	}
+	result, err := lane.host.SnapshotBaseCertificate(key)
 	if err != nil {
 		lane.counters.rejected++
 	}

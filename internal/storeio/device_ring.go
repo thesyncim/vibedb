@@ -23,8 +23,6 @@ type ringDevice struct {
 	seen       []uint64
 	frameArena []byte
 	frameSize  int
-	frameFixed bool
-	frameTried bool
 	dsyncOff   bool
 	closed     bool
 }
@@ -69,14 +67,10 @@ func (d *ringDevice) bindFrameArena(arena []byte, frameSize int) error {
 	}
 	d.frameArena = arena
 	d.frameSize = frameSize
-	if !d.frameTried {
-		d.frameTried = true
-		if err := d.ring.registerFrameArena(arena); err == nil {
-			d.frameFixed = true
-		} else if d.ring.bufferRegistrationBroken {
-			return err
-		}
-	}
+	// Keep the fixed staging/root buffers, but do not register the whole cold
+	// cache. Stable-address frame writes pin only their submitted spans. This
+	// trades per-I/O pinning work for avoiding eager cache-capacity residency;
+	// ownership remains held through the ordinary completion/durability fence.
 	return nil
 }
 
@@ -360,11 +354,6 @@ func (d *ringDevice) prepareWrite(
 		)
 		if err != nil {
 			return err
-		}
-		if d.frameFixed {
-			return d.ring.prepareWriteFrame(
-				0, data, write.Offset, userData, linked,
-			)
 		}
 		return d.ring.prepareWriteBytes(
 			0, data, write.Offset, userData, linked,

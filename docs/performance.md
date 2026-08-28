@@ -181,6 +181,30 @@ a time-based soak test.
 Injected crash sweeps test recovery cuts. They do not measure real power-loss
 frequency, storage-controller behavior, restart latency, or availability.
 
+The RF3 external fault runner executes the shipped three-process shard command,
+including process isolation, leader kill, deliberately unread response,
+byte-identical outcome recovery, replica restart, durable acknowledgement
+survival, bounded result-waiter reuse, and catch-up. It writes canonical raw TSV
+evidence and treats a skipped test as a failed qualification:
+
+```bash
+go run ./bench/rf3chaos \
+  -output "$(pwd)/rf3-chaos.tsv" \
+  -runs 9 \
+  -timeout 3m
+```
+
+Its per-run elapsed value covers the complete harness. It is not a failover or
+recovery latency measurement. Publish those latency claims only after the
+shipped protocol exposes and records the individual fault, election, routing,
+settlement, and catch-up cuts.
+
+Strict physical allocation for the recovery journal is Linux-only. On Darwin,
+the external harness skips and the runner records a failed row and exits
+nonzero; that local result is not qualification. Linux CI invokes the runner
+explicitly so lack of allocation support cannot silently become a passing
+gate.
+
 ## Implementation references
 
 - `bench/gate/main.go`
@@ -188,6 +212,7 @@ frequency, storage-controller behavior, restart latency, or availability.
 - `bench/competitive/cmd/mixedsuite/main.go`
 - `bench/competitive/cmd/footprint/main.go`
 - `bench/competitive/cmd/churndisk/main.go`
+- `bench/rf3chaos/main.go`
 - `bench/competitive/internal/coverage/manifest.go`
 - `internal/replicatedstate/apply.go` and `digest.go`
 - `internal/replicatedstate/read.go` and `snapshot_artifact.go`

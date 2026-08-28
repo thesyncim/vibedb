@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +52,7 @@ type catalogFile struct {
 	ShardStore           *ShardStoreIdentity           `json:"shard_store,omitempty"`
 	ShardStoreFence      *ShardStoreFence              `json:"shard_store_fence,omitempty"`
 	ReplicatedShardStore *ReplicatedShardStoreIdentity `json:"replicated_shard_store,omitempty"`
+	ReplicatedChildApply *replicatedApplyMeta          `json:"replicated_child_apply,omitempty"`
 	ReplicatedApply      *replicatedApplyMeta          `json:"replicated_apply,omitempty"`
 }
 
@@ -206,6 +208,9 @@ type database struct {
 	// group-owned same-index transition.
 	replicatedSeedRecovery bool
 	replicatedSeedPending  bool
+	// Snapshot recovery can include imported hidden rows before certification,
+	// but must reject ordinary initialized checkpoints before replay begins.
+	replicatedSnapshotRecovery bool
 	// txnLimits is the driver's normalized cross-table commit bound, matching
 	// durable's package defaults. UpdateCollections is fail-closed at zero.
 	txnLimits durable.TxnLimits
@@ -238,6 +243,18 @@ type database struct {
 	// sole user relation while a certified RF learner snapshot is materialized.
 	// It grants neither SQL sessions nor serving authority.
 	replicatedSnapshotStageClaim *ReplicatedSnapshotStage
+	// replicatedRestoreStageClaim exclusively owns fresh relation files while
+	// an authenticated source artifact is imported without source authority.
+	replicatedRestoreStageClaim *ReplicatedRestoreStage
+	// schemaTransition is populated only by the explicit post-Raft catalog-CAS
+	// recovery opener. It authorizes target checkpoint membership selection and
+	// exact target-machine replay before any serving claim can be minted.
+	schemaTransition          []byte
+	schemaMembership          durable.CheckpointMembershipWitness
+	schemaCheckpointAuthority [32]byte
+	schemaAuthorization       [32]byte
+	schemaCatalogCAS          [32]byte
+	schemaSourceRecovery      *replicatedstate.SchemaSourceRecoveryProof
 	// distributedTxnCollection is the raw-ID keyed, SQL-invisible participant
 	// state joined atomically with user-table publication. The larger staged
 	// mutation remains in the append-only transaction journal.
@@ -280,7 +297,7 @@ func openDatabaseWithShardStorePolicy(
 	if err != nil {
 		return nil, err
 	}
-	if err := storeio.LockWriter(lockFile); err != nil {
+	if err := shardPolicy.openOptions.lockWriter(lockFile); err != nil {
 		_ = lockFile.Close()
 		return nil, fmt.Errorf("vibedb: lock SQL catalog %s: %w", absolute, err)
 	}
@@ -288,10 +305,17 @@ func openDatabaseWithShardStorePolicy(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
-		layoutEpoch:            newCatalogLayoutEpoch(nil, nil),
-		txnLimits:              defaultDriverTxnLimits(),
-		replicatedSeedRecovery: shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
-		replicatedSeedPending:  shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
+		layoutEpoch:                newCatalogLayoutEpoch(nil, nil),
+		txnLimits:                  defaultDriverTxnLimits(),
+		replicatedSeedRecovery:     shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		replicatedSeedPending:      shardPolicy.mode == shardStoreOpenReplicatedChildStageResume || shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		replicatedSnapshotRecovery: shardPolicy.mode == shardStoreOpenReplicatedSnapshotTarget,
+		schemaTransition:           bytes.Clone(shardPolicy.schemaTransition),
+		schemaMembership:           shardPolicy.schemaMembership,
+		schemaCheckpointAuthority:  shardPolicy.schemaCheckpointAuthority,
+		schemaAuthorization:        shardPolicy.schemaAuthorization,
+		schemaCatalogCAS:           shardPolicy.schemaCatalogCAS,
+		schemaSourceRecovery:       shardPolicy.schemaSourceRecovery,
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -339,6 +363,11 @@ func openDatabaseWithShardStorePolicy(
 			}
 		}
 	case shardStoreOpenInitialize:
+		if shardPolicy.expectedIdentity != (ShardStoreIdentity{}) &&
+			(shardPolicy.expectedIdentity.Binding() != shardPolicy.expected ||
+				validateShardStoreIdentity(shardPolicy.expectedIdentity) != nil) {
+			return nil, ErrShardStoreIdentityMismatch
+		}
 		if d.catalog.ReplicatedShardStore != nil {
 			return nil, fmt.Errorf(
 				"vibedb: initialize local shard store %s: %w",
@@ -346,7 +375,9 @@ func openDatabaseWithShardStorePolicy(
 			)
 		}
 		if d.catalog.ShardStore != nil &&
-			d.catalog.ShardStore.Binding() != shardPolicy.expected {
+			(d.catalog.ShardStore.Binding() != shardPolicy.expected ||
+				shardPolicy.expectedIdentity != (ShardStoreIdentity{}) &&
+					*d.catalog.ShardStore != shardPolicy.expectedIdentity) {
 			return nil, &ShardStoreError{
 				Op: "initialize", Path: absolute, Expected: shardPolicy.expected,
 				Actual: *d.catalog.ShardStore,
@@ -370,9 +401,13 @@ func openDatabaseWithShardStorePolicy(
 			} else if !os.IsNotExist(statErr) {
 				return nil, statErr
 			}
-			identity, identityErr := randomShardStoreIdentity(shardPolicy.expected)
-			if identityErr != nil {
-				return nil, identityErr
+			identity := shardPolicy.expectedIdentity
+			if identity == (ShardStoreIdentity{}) {
+				var identityErr error
+				identity, identityErr = randomShardStoreIdentity(shardPolicy.expected)
+				if identityErr != nil {
+					return nil, identityErr
+				}
 			}
 			initializeIdentity = &identity
 		}
@@ -434,13 +469,25 @@ func openDatabaseWithShardStorePolicy(
 				ErrReplicatedApplyMismatch,
 			)
 		}
-	case shardStoreOpenReplicatedApplyExisting:
+	case shardStoreOpenReplicatedApplyExisting, shardStoreOpenReplicatedSchemaTransition:
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
 		}
 		if !d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) ||
 			d.catalog.ReplicatedApply.identity() != shardPolicy.expectedReplicatedApply {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
+		}
+	case shardStoreOpenReplicatedSnapshotTarget:
+		if !exists || d.catalog.ReplicatedShardStore == nil ||
+			!d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) {
+			return nil, ErrReplicatedShardStoreIdentityMismatch
+		}
+		retained := d.catalog.ReplicatedChildApply
+		if d.catalog.ReplicatedApply != nil {
+			retained = d.catalog.ReplicatedApply
+		}
+		if retained == nil || retained.identity() != shardPolicy.expectedReplicatedApply {
+			return nil, ErrReplicatedApplyMismatch
 		}
 	case shardStoreOpenReplicatedApplySettlement, shardStoreOpenReplicatedChildStageResume:
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
@@ -574,6 +621,24 @@ func openDatabaseWithShardStorePolicy(
 		}
 		paths[capturePath] = "replicated capture"
 	}
+	if reserved := d.catalog.ReplicatedChildApply; reserved != nil {
+		if d.catalog.ReplicatedApply != nil {
+			return nil, ErrReplicatedApplyMismatch
+		}
+		if err := validateReplicatedApplyMeta(reserved, d.catalog.ReplicatedShardStore); err != nil {
+			return nil, err
+		}
+		path := d.replicatedApplyPath(reserved)
+		if previous, duplicate := paths[path]; duplicate {
+			return nil, fmt.Errorf("vibedb: SQL catalog storage %q aliases reserved apply storage %q", previous, filepath.Base(path))
+		}
+		paths[path] = "reserved replicated apply"
+		capturePath := d.replicatedCapturePath(reserved)
+		if previous, duplicate := paths[capturePath]; duplicate {
+			return nil, fmt.Errorf("vibedb: SQL catalog storage %q aliases reserved capture storage %q", previous, filepath.Base(capturePath))
+		}
+		paths[capturePath] = "reserved replicated capture"
+	}
 	for name, meta := range d.catalog.Views {
 		if err := validateCatalogViewMeta(name, meta); err != nil {
 			return nil, err
@@ -588,8 +653,11 @@ func openDatabaseWithShardStorePolicy(
 	if err := d.validateViewCatalog(); err != nil {
 		return nil, err
 	}
-	if err := d.openCatalogCollectionsWithTransactionsLocked(); err != nil {
+	if err := d.openCatalogCollectionsWithTransactionsLocked(shardPolicy.openOptions); err != nil {
 		return nil, err
+	}
+	if err := addReplicatedSchemaStageProtection(d.dataDir, paths); err != nil {
+		return nil, fmt.Errorf("vibedb: recover prepared schema target: %w", err)
 	}
 	// Namespace cleanup follows complete transaction membership validation and
 	// recovery. Before that proof, a catalog-omitted path may still be an
@@ -678,7 +746,7 @@ type catalogCollectionOpen struct {
 	distributed bool
 }
 
-func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
+func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions ReplicatedOpenOptions) error {
 	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+3)
 	opened := make([]catalogCollectionOpen, 0, len(d.tables)+3)
 	abortFiles := func(cause error) error {
@@ -762,6 +830,10 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 			File: file, Options: options,
 		})
 	}
+	for i := range requests {
+		requests[i].Options.OpenWriterLockContext = openOptions.WriterLockContext
+		requests[i].Options.OpenWriterLockDeadline = openOptions.WriterLockDeadline
+	}
 	txnOptions := durable.TxnLogOptions{}
 	if replicated := d.catalog.ReplicatedShardStore; replicated != nil {
 		txnOptions = durable.TxnLogOptions{
@@ -790,7 +862,24 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 				))
 			}
 		}
-		if d.replicatedSeedRecovery {
+		if len(d.schemaTransition) != 0 {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithCheckpointMembershipTransition(
+					d.dataDir, txnOptions, requests, groupNames,
+					d.schemaMembership, d.schemaCheckpointAuthority,
+					durable.CheckpointGroupOptions{},
+				)
+		} else if d.replicatedSnapshotRecovery {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithSnapshotCheckpointGroup(
+					d.dataDir, txnOptions, requests, groupNames,
+					replicatedstate.SystemCollectionName,
+					durable.CheckpointGroupOptions{},
+				)
+			if errors.Is(err, durable.ErrCheckpointGroupSeedChanged) {
+				err = errors.Join(ErrReplicatedSnapshotStageProof, err)
+			}
+		} else if d.replicatedSeedRecovery {
 			collections, txnLog, checkpointGroup, err =
 				durable.OpenCollectionsWithSeededCheckpointGroup(
 					d.dataDir, txnOptions, requests, groupNames,
@@ -1610,6 +1699,14 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	}
 	if catalog.ReplicatedApply != nil {
 		apply := catalog.ReplicatedApply
+		placementBytes := encodedJSONStringBytes(apply.Placement.ShardKey)
+		if !add(encodedJSONStringBytes(apply.Storage) +
+			encodedJSONStringBytes(apply.CaptureStorage) + placementBytes + 3072) {
+			return size, catalogSizeError(size)
+		}
+	}
+	if catalog.ReplicatedChildApply != nil {
+		apply := catalog.ReplicatedChildApply
 		placementBytes := encodedJSONStringBytes(apply.Placement.ShardKey)
 		if !add(encodedJSONStringBytes(apply.Storage) +
 			encodedJSONStringBytes(apply.CaptureStorage) + placementBytes + 3072) {

@@ -183,6 +183,14 @@ func OpenSnapshotArtifactCursor(src []byte) (*SnapshotArtifactCursor, error) {
 	copy(cursor.previousDigest[:], src[120:152])
 	copy(cursor.previousKey[:], src[152:152+int(previousKeyBytes)])
 	copy(cursor.captureImageDigest[:], src[408:440])
+	if cursor.currentCollection != SnapshotArtifactSystem ||
+		cursor.previousKeyBytes != 0 && cursor.previousKey[0] >= routeGateHeadPrefix {
+		baseRows, ok := stateSystemRowCount(cursor.manifest.State)
+		if !ok || cursor.manifest.SystemRows < baseRows {
+			return nil, fmt.Errorf("%w: cursor route-gate rows", ErrSnapshotArtifact)
+		}
+		cursor.routeGateRows = cursor.manifest.SystemRows - baseRows
+	}
 	if nextRelation == 0 {
 		if relationStart != relationEnd {
 			return nil, fmt.Errorf("%w: singleton cursor geometry", ErrSnapshotArtifact)

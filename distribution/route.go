@@ -60,9 +60,13 @@ func (r Role) String() string {
 type Target struct {
 	Shard                ShardID
 	AllocationGeneration ShardAllocationGeneration
-	Endpoint             EndpointID
-	OwnershipEpoch       OwnershipEpoch
-	Role                 Role
+	// ManifestOrdinal is the allocation's position in the immutable manifest
+	// named by Route.RoutingVersion. It recovers exact range geometry in O(1)
+	// without retaining another key range per target.
+	ManifestOrdinal int
+	Endpoint        EndpointID
+	OwnershipEpoch  OwnershipEpoch
+	Role            Role
 }
 
 // Route is an immutable routing result pinned to one routing version. Targets

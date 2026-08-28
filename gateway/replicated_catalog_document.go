@@ -37,6 +37,12 @@ var (
 	replicatedCatalogHeadDocumentID = [...]byte{
 		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'h', 'e', 'a', 'd',
 	}
+	replicatedCatalogHeadWitnessDocumentID = [...]byte{
+		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'w', 'i', 't', 'n', 'e', 's', 's',
+	}
+	replicatedCatalogGenesisDocumentID = [...]byte{
+		'c', 'a', 't', 'a', 'l', 'o', 'g', '/', 'g', 'e', 'n', 'e', 's', 'i', 's',
+	}
 	replicatedOperationDirectoryDocumentID = [...]byte{
 		'o', 'p', 'e', 'r', 'a', 't', 'i', 'o', 'n', '/',
 		'd', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y',
@@ -48,6 +54,8 @@ var (
 	controlPlanePayloadMarker  = [...]byte{'"', ',', '"', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '"', ':'}
 
 	replicatedCatalogHeadKey        = fixedControlPlaneKey(replicatedCatalogHeadDocumentID[:])
+	replicatedCatalogHeadWitnessKey = fixedControlPlaneKey(replicatedCatalogHeadWitnessDocumentID[:])
+	replicatedCatalogGenesisKey     = fixedControlPlaneKey(replicatedCatalogGenesisDocumentID[:])
 	replicatedOperationDirectoryKey = fixedControlPlaneKey(
 		replicatedOperationDirectoryDocumentID[:],
 	)

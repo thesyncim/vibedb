@@ -229,7 +229,8 @@ func resolveBackfillBaseTarget(
 		}
 		return distribution.Target{
 			Shard: shard.ID, AllocationGeneration: shard.AllocationGeneration,
-			Endpoint: shard.Leaders[0], OwnershipEpoch: shard.Epoch, Role: distribution.RoleLeader,
+			ManifestOrdinal: i,
+			Endpoint:        shard.Leaders[0], OwnershipEpoch: shard.Epoch, Role: distribution.RoleLeader,
 		}, address, nil
 	}
 	return distribution.Target{}, "", ErrIndexBackfillTask

@@ -52,7 +52,7 @@ var catalogVibeEncoder = func() vibejson.Encoder[catalogFileVibe] {
 }()
 
 var (
-	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply")
+	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply", "replicated_child_apply")
 	tableMetaFields          = vibejson.MakeFieldSet("primary_key", "schema", "indexes", "storage", "materialized", "sealed_recovery_journal_bytes")
 	viewMetaFields           = vibejson.MakeFieldSet("query", "columns", "outputs", "view_dependencies", "table_dependencies")
 	schemaMetaFields         = vibejson.MakeFieldSet("root", "fields")
@@ -306,6 +306,11 @@ func (c *catalogFileVibe) MarshalVibeJSON(w vibejson.TrustedAppender) vibejson.T
 		encoded := replicatedApplyMetaVibe(*catalog.ReplicatedApply)
 		w = encoded.MarshalVibeJSON(w)
 	}
+	if catalog.ReplicatedChildApply != nil {
+		w = w.RawUnchecked(`,"replicated_child_apply":`)
+		encoded := replicatedApplyMetaVibe(*catalog.ReplicatedChildApply)
+		w = encoded.MarshalVibeJSON(w)
+	}
 	return w.RawByteUnchecked('}')
 }
 
@@ -504,6 +509,9 @@ func decodeCatalogFile(c *vibejson.DecodeCursor, dst *catalogFile) error {
 		case 6:
 			decoded.ReplicatedApply = new(replicatedApplyMeta)
 			err = decodeReplicatedApplyMetaVibe(c, decoded.ReplicatedApply)
+		case 7:
+			decoded.ReplicatedChildApply = new(replicatedApplyMeta)
+			err = decodeReplicatedApplyMetaVibe(c, decoded.ReplicatedChildApply)
 		}
 		if err != nil {
 			return err

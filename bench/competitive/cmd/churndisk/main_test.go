@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +18,9 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				"-mutations=2000",
 				"-sample-mutations=500",
 				"-checkpoint-mutations=64",
+				"-max-rss-bytes=1073741824",
+				"-max-allocated-bytes=1073741824",
+				"-max-physical-write-bytes=1073741824",
 				"-allow-diagnostic",
 			}
 			wantProfile := "intrinsic"
@@ -42,6 +46,10 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				"git-commit", "vcs-modified", "engine", "mutation-index", "phase", "apparent-bytes",
 				"allocated-bytes", "forced-cp", "publishable", "storage-profile",
 				"compression", "compression-provenance", "maintenance-floor",
+				"durability", "exact-indexes", "document-shape", "peak-rss-bytes",
+				"max-rss-bytes", "max-allocated-bytes", "logical-write-bytes",
+				"physical-write-known", "physical-write-source", "physical-write-bytes",
+				"max-physical-write-bytes", "physical-write/logical",
 			} {
 				if _, ok := index[required]; !ok {
 					t.Fatalf("header omits %q: %q", required, lines[0])
@@ -80,6 +88,10 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 				if fields[index["publishable"]] != "false" {
 					t.Fatalf("diagnostic line %d marked publishable: %q", lineNo+2, line)
 				}
+				logical, err := strconv.ParseUint(fields[index["logical-write-bytes"]], 10, 64)
+				if err != nil || logical == 0 {
+					t.Fatalf("line %d logical write bytes = %q: %v", lineNo+2, fields[index["logical-write-bytes"]], err)
+				}
 				if fields[index["storage-profile"]] != wantProfile {
 					t.Fatalf("line %d storage profile = %q, want %q", lineNo+2, fields[index["storage-profile"]], wantProfile)
 				}
@@ -116,12 +128,20 @@ func TestSmokeFixedLiveSetTSV(t *testing.T) {
 
 func TestPublicationShape(t *testing.T) {
 	cfg := config{
-		corpusSize:          100_000,
-		mutationBudget:      200_000,
-		replacePercent:      80,
-		sampleMutations:     5_000,
-		checkpointMutations: 64,
-		seed:                defaultSeed,
+		corpusSize:           100_000,
+		mutationBudget:       200_000,
+		replacePercent:       80,
+		sampleMutations:      5_000,
+		checkpointMutations:  64,
+		durabilityName:       "buffered-visible",
+		documentShapeName:    "inline",
+		cardinalityName:      "low",
+		storageProfileName:   "intrinsic",
+		requirePhysicalWrite: true,
+		maxRSSBytes:          1 << 30,
+		maxAllocatedBytes:    1 << 30,
+		maxPhysicalWrites:    1 << 30,
+		seed:                 defaultSeed,
 	}
 	if !publicationShape(cfg) {
 		t.Fatal("default publication shape rejected")
@@ -129,5 +149,44 @@ func TestPublicationShape(t *testing.T) {
 	cfg.corpusSize--
 	if publicationShape(cfg) {
 		t.Fatal("custom corpus accepted as a publication shape")
+	}
+}
+
+func TestQualifiedPhysicalWritesFailClosedOffLinux(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux supplies the required process write counter")
+	}
+	err := run([]string{
+		"-engine=vibedb", "-corpus=16", "-mutations=32", "-sample-mutations=8",
+		"-checkpoint-mutations=8", "-require-physical-write=true",
+		"-max-rss-bytes=1073741824", "-max-allocated-bytes=1073741824",
+		"-max-physical-write-bytes=1073741824", "-allow-diagnostic",
+	}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "write_bytes is required") {
+		t.Fatalf("off-Linux qualified run error=%v", err)
+	}
+}
+
+func TestChurnVerifiesConfiguredExactIndexes(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{
+		"-engine=vibedb", "-corpus=128", "-mutations=256", "-sample-mutations=64",
+		"-checkpoint-mutations=64", "-exact-indexes=3", "-allow-diagnostic",
+	}, &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	header, row := strings.Split(lines[0], "\t"), strings.Split(lines[1], "\t")
+	found := false
+	for i, name := range header {
+		if name == "exact-indexes" {
+			found = true
+			if row[i] != "3" {
+				t.Fatalf("exact-indexes=%q want 3", row[i])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("output omitted exact-indexes")
 	}
 }

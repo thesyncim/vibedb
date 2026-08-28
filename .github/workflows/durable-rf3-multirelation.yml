@@ -1,0 +1,140 @@
+name: durable RF3 multi-relation chaos
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: durable-rf3-multirelation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  qualify:
+    name: Ubuntu multi-relation RF3 chaos (count=3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Prepare strict bounded evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/durable-rf3-multirelation"
+          test_root="${RUNNER_TEMP}/durable-rf3-multirelation-tmp"
+          mkdir -p "${evidence}" "${test_root}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${test_root}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${test_root}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestGatewayDurableRF3MultiRelationChaosProcess'
+          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'TMPDIR=%s VIBEDB_DURABLE_RF3_MULTIRELATION_E2E=1 go test -json -count=3 -timeout=18m -run %s ./cmd/vibedb-gateway\n' \
+            "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Run shipped multi-relation RF3 chaos
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/durable-rf3-multirelation-tmp
+          VIBEDB_DURABLE_RF3_MULTIRELATION_E2E: "1"
+        run: |
+          set -euo pipefail
+          go test -json -count=3 -timeout=18m \
+            -run '^TestGatewayDurableRF3MultiRelationChaosProcess$' \
+            ./cmd/vibedb-gateway \
+            | tee "${RUNNER_TEMP}/durable-rf3-multirelation/go-test.jsonl"
+      - name: Require default-pin unfinished-request recovery
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/durable-rf3-multirelation-tmp
+          VIBEDB_DURABLE_SQL_RF3_E2E: "1"
+        run: |
+          set -euo pipefail
+          test_name='TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan'
+          result="${RUNNER_TEMP}/durable-rf3-multirelation/unfinished-pin.jsonl"
+          go test -json -count=3 -timeout=8m -run "^${test_name}$" ./internal/raftservice | tee "${result}"
+          test "$(stat -c %s "${result}")" -le 50331648
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' "${result}" | wc -l)" -eq 3
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' "${result}" >/dev/null; then
+            echo "unfinished-request recovery qualification skipped" >&2
+            exit 1
+          fi
+      - name: Validate exact no-skip evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/durable-rf3-multirelation"
+          result="${evidence}/go-test.jsonl"
+          test_name='TestGatewayDurableRF3MultiRelationChaosProcess'
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 67108864
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${result}" | wc -l)" -eq 3
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${result}" >/dev/null; then
+            echo "multi-relation RF3 qualification skipped" >&2
+            exit 1
+          fi
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "output" and .Test == $test_name and
+              (.Output | contains("durable RF3 multi-relation chaos:") and
+                contains("shipped_gateway=true") and
+                contains("tables=2") and
+                contains("data_groups=2") and
+                contains("base_relations=2") and
+                contains("local_exact_indexes=2") and
+                contains("global_exact_indexes=2") and
+                contains("insert_update_delete=true") and
+                contains("sustained_churn_mutations=60") and
+                contains("persisted_transaction_recovery=true") and
+                contains("gateway_replacement=true") and
+                contains("leader_kill=true") and
+                contains("process_partition=true") and
+                contains("outcome_unknown_retry=true") and
+                contains("exact_terminal_replay=true") and
+                contains("exact_index_visibility=true") and
+                contains("stale_index_visibility=false") and
+                contains("final_cardinality_exact=true") and
+                contains("all_voters_reopened=true") and
+                contains("p99=") and
+                contains("rss_growth=") and
+                contains("storage_growth=") and
+                contains("wal_growth=") and
+                contains("public_client_wire_bytes=") and
+                contains("snapshot_payload_bytes="))) | .Test' \
+            "${result}" | wc -l)" -eq 3
+          printf 'schema\tvibedb.durable-rf3-multirelation-chaos\t1\nresult\tpass\nrevision\t%s\nruns\t3\n' \
+            "$(cat "${evidence}/revision.txt")" > "${evidence}/summary.tsv"
+          test "$(stat -c %s "${evidence}/summary.tsv")" -le 65536
+      - name: Upload bounded multi-relation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-rf3-multirelation-${{ github.sha }}
+          path: ${{ runner.temp }}/durable-rf3-multirelation
+          if-no-files-found: error
+          retention-days: 30

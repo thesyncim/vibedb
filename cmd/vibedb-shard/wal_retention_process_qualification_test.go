@@ -1,0 +1,481 @@
+//go:build darwin || linux
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/shardservice"
+	vibejson "github.com/thesyncim/vibejson"
+)
+
+const (
+	walRetentionQualificationEnvironment = "VIBEDB_WAL_RETENTION_E2E"
+	walRetentionEvidenceEnvironment      = "VIBEDB_WAL_RETENTION_EVIDENCE"
+	walRetentionCycles                   = 3
+	walRetentionGenerationIntervalTicks  = 8
+	walRetentionKeysPerCycle             = 24
+	walRetentionDocumentBytes            = 64 << 10
+	walRetentionMaximumGrowthBytes       = 1 << 20
+	walRetentionMaximumRatioPermille     = 250
+	walRetentionMaximumRSSGrowthBytes    = 128 << 20
+	walRetentionMaximumFDGrowth          = 24
+	walRetentionP99Bound                 = 5 * time.Second
+	walRetentionMaxBound                 = 15 * time.Second
+)
+
+var walRetentionEvidenceRun atomic.Uint32
+
+// init is inherited only by the test binary. Production binaries retain the
+// ten-minute cadence; a qualification child explicitly opts into eight ticks
+// so three complete maintenance and crash cycles fit in a bounded CI job.
+func init() {
+	if os.Getenv(walRetentionQualificationEnvironment) == "1" {
+		rf3WALGenerationIntervalTicks = walRetentionGenerationIntervalTicks
+	}
+}
+
+// TestServeRF3WALRetentionCrashQualification drives the shipped, authenticated
+// three-process command rather than an in-memory Store. Each cycle creates a
+// new checkpoint, observes all three immutable WAL identities replaced by
+// compacted generations, SIGKILLs one process, catches it up, and verifies an
+// acknowledged value through a linearizable read. Physical allocation, live
+// data, RSS, file descriptors, waiter reuse, and latency are hard gates.
+func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
+	if os.Getenv(rf3CommandHelperEnvironment) != "" {
+		return
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("external WAL-retention qualification requires Linux /proc and physical block accounting")
+	}
+	if os.Getenv(walRetentionQualificationEnvironment) != "1" {
+		t.Skip("set VIBEDB_WAL_RETENTION_E2E=1; mandatory Linux CI rejects this skip")
+	}
+
+	memoryDirectory := prepareWALRetentionMemoryDiagnostics(t)
+	fixture := newRF3FaultFixture(t)
+	defer fixture.close(t)
+	fixture.startAll(t)
+	leader, states := fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+	epoch, lastApplied := fixture.openSession(t, leader, states[leader])
+	sequence := uint64(2)
+	firstCommand := []byte(nil)
+	latencies := make([]time.Duration, 0, walRetentionCycles*walRetentionKeysPerCycle)
+	previousGenerations := walRetentionWALGenerations(t, fixture.walPaths)
+	baselineAllocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
+	baselineRSS := rf3FaultProcessRSSBytes(t, fixture.children)
+	logWALRetentionMemory(t, fixture.children, "baseline")
+	baselineFDs := walRetentionProcessFDs(t, fixture.children)
+	peakRSS, peakFDs := baselineRSS, baselineFDs
+
+	var finalValue []byte
+	for cycle := 0; cycle < walRetentionCycles; cycle++ {
+		for key := 0; key < walRetentionKeysPerCycle; key++ {
+			leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+			id := fmt.Sprintf("retained-%02d", key)
+			value := walRetentionDocument(id, cycle, walRetentionDocumentBytes)
+			command := walRetentionMutationCommand(t, fixture, states[leader], epoch, sequence, id, value)
+			if firstCommand == nil {
+				firstCommand = append([]byte(nil), command...)
+			}
+			started := time.Now()
+			response := fixture.propose(t, leader, states[leader], command)
+			elapsed := time.Since(started)
+			if response.Kind != shardservice.ReplicatedCompletion {
+				t.Fatalf("cycle %d key %d completion = %+v", cycle+1, key+1, response)
+			}
+			if elapsed > walRetentionMaxBound {
+				t.Fatalf("cycle %d key %d latency %s exceeds %s", cycle+1, key+1, elapsed, walRetentionMaxBound)
+			}
+			latencies = append(latencies, elapsed)
+			lastApplied = response.Outcome.AppliedIndex
+			sequence++
+			if key == walRetentionKeysPerCycle-1 {
+				finalValue = value
+			}
+		}
+
+		fixture.waitAllApplied(t, lastApplied, 30*time.Second)
+		previousGenerations = walRetentionWaitGenerationReplacement(t, fixture.walPaths, previousGenerations, 45*time.Second)
+
+		victim := cycle % rf3CommandMembers
+		fixture.kill(t, victim)
+		live := rf3FaultOtherMembers(victim)
+		fixture.waitLeader(t, live, 30*time.Second)
+		fixture.restart(t, victim)
+		fixture.waitCaughtUp(t, victim, lastApplied, 30*time.Second)
+		leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+		walRetentionWaitValue(t, fixture, leader, states[leader],
+			fmt.Sprintf("retained-%02d", walRetentionKeysPerCycle-1), finalValue, 30*time.Second)
+
+		// A duplicate wave exercises the bounded settlement registry after every
+		// process replacement; the next fresh command proves capacity is reusable.
+		walRetentionDuplicateWave(t, fixture, leader, states[leader],
+			walRetentionMutationCommand(t, fixture, states[leader], epoch, sequence,
+				fmt.Sprintf("reuse-%d", cycle+1), walRetentionDocument(fmt.Sprintf("reuse-%d", cycle+1), cycle, 4096)))
+		sequence++
+		states[leader] = fixture.probe(t, leader)
+		freshID := fmt.Sprintf("capacity-%d", cycle+1)
+		fresh := fixture.propose(t, leader, states[leader], walRetentionMutationCommand(
+			t, fixture, states[leader], epoch, sequence, freshID, walRetentionDocument(freshID, cycle, 4096)))
+		if fresh.Kind != shardservice.ReplicatedCompletion {
+			t.Fatalf("cycle %d did not return waiter capacity: %+v", cycle+1, fresh)
+		}
+		lastApplied = fresh.Outcome.AppliedIndex
+		sequence++
+		fixture.waitAllApplied(t, lastApplied, 30*time.Second)
+		if rss := rf3FaultProcessRSSBytes(t, fixture.children); rss > peakRSS {
+			peakRSS = rss
+		}
+		logWALRetentionMemory(t, fixture.children, fmt.Sprintf("cycle-%d", cycle+1))
+		if fds := walRetentionProcessFDs(t, fixture.children); fds > peakFDs {
+			peakFDs = fds
+		}
+	}
+
+	// All three process lifetimes have changed. The first acknowledged command
+	// must remain retired, never re-execute or regress to outcome-unknown.
+	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+	retired := fixture.propose(t, leader, states[leader], firstCommand)
+	if retired.Kind != shardservice.ReplicatedRefusal ||
+		retired.Refusal != shardservice.ReplicatedRefusalRetryRetired ||
+		retired.Outcome != (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}) ||
+		retired.RequestDigest != sha256.Sum256(firstCommand) || retired.State.Fence != states[leader].Fence {
+		t.Fatalf("acknowledged command was not durably retired after crash loops: %+v", retired)
+	}
+
+	// The last generation replacement above precedes the duplicate wave and
+	// fresh command. Let their asynchronous maintenance settle before measuring
+	// retained space; every private candidate/stage inode remains counted.
+	settleContext, cancelSettlement := context.WithTimeout(t.Context(), 45*time.Second)
+	finalAllocated, settleErr := waitWALRetentionSettlement(settleContext,
+		baselineAllocated+walRetentionMaximumGrowthBytes, 2*walRetentionGenerationIntervalTicks*rf3TickInterval,
+		func() (int64, error) { return rf3FaultWALDirectoryAllocatedBytes(fixture.walPaths[:]) })
+	cancelSettlement()
+	if settleErr != nil {
+		logWALRetentionInventory(t, fixture.walPaths[:])
+		t.Fatalf("retained WAL did not settle within 45s: allocated=%d baseline=%d bound=%d: %v",
+			finalAllocated, baselineAllocated, walRetentionMaximumGrowthBytes, settleErr)
+	}
+	if finalAllocated <= 0 {
+		t.Fatal("final WAL allocation has no physical blocks")
+	}
+	growth := uint64(max(int64(0), finalAllocated-baselineAllocated))
+	if growth > walRetentionMaximumGrowthBytes {
+		t.Fatalf("retained WAL allocation grew %d bytes, bound %d", growth, walRetentionMaximumGrowthBytes)
+	}
+	// The final key set is identical on every replica. This denominator excludes
+	// overwritten historical bytes, so the ratio catches retained churn rather
+	// than rewarding the test for issuing more writes.
+	liveBytes := uint64(walRetentionKeysPerCycle * walRetentionDocumentBytes * rf3CommandMembers)
+	ratioPermille := uint64(0)
+	if liveBytes != 0 {
+		ratioPermille = (growth*1000 + liveBytes - 1) / liveBytes
+	}
+	if ratioPermille > walRetentionMaximumRatioPermille {
+		t.Fatalf("retained WAL/live ratio %d permille exceeds %d; growth=%d live=%d",
+			ratioPermille, walRetentionMaximumRatioPermille, growth, liveBytes)
+	}
+	if peakRSS-baselineRSS > walRetentionMaximumRSSGrowthBytes {
+		// Capture only after recording the unchanged gate. Profiling never
+		// collects garbage or changes the baseline/peak used for the verdict.
+		captureWALRetentionMemory(t, fixture.children, memoryDirectory)
+		t.Fatalf("RSS grew %d bytes, bound %d", peakRSS-baselineRSS, walRetentionMaximumRSSGrowthBytes)
+	}
+	if peakFDs > baselineFDs+walRetentionMaximumFDGrowth {
+		t.Fatalf("file descriptors grew from %d to %d, bound +%d", baselineFDs, peakFDs, walRetentionMaximumFDGrowth)
+	}
+	slices.Sort(latencies)
+	p99 := latencies[(99*len(latencies)+99)/100-1]
+	maximum := latencies[len(latencies)-1]
+	if p99 > walRetentionP99Bound || maximum > walRetentionMaxBound {
+		t.Fatalf("foreground latency p99=%s max=%s bounds=%s/%s", p99, maximum, walRetentionP99Bound, walRetentionMaxBound)
+	}
+	walRetentionWriteEvidence(t, walRetentionEvidence{
+		Cycles: walRetentionCycles, Writes: len(latencies), Restarts: walRetentionCycles,
+		GenerationChanges: walRetentionCycles * rf3CommandMembers,
+		LiveBytes:         liveBytes, WALBaselineBytes: uint64(baselineAllocated), WALFinalBytes: uint64(finalAllocated),
+		WALGrowthBytes: growth, WALRatioPermille: ratioPermille,
+		RSSGrowthBytes: peakRSS - baselineRSS, FDGrowth: peakFDs - baselineFDs,
+		P99NS: uint64(p99), MaxNS: uint64(maximum), RetiredOutcome: uint64(retired.Outcome.Code),
+	})
+}
+
+func walRetentionMutationCommand(t testing.TB, fixture *rf3FaultFixture, state shardservice.ReplicatedMemberState,
+	epoch, sequence uint64, id string, value []byte) []byte {
+	t.Helper()
+	mutation := replication.Mutation{Kind: replication.MutationPut, Key: rf3FaultKey(t, id), Value: value}
+	command := fixture.command(state, epoch, sequence, sha256.Sum256(value), []replication.Mutation{mutation})
+	if sequence > 1 {
+		command.AckThrough = sequence - 1
+	}
+	raw, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func walRetentionDocument(id string, cycle, size int) []byte {
+	prefix := []byte(fmt.Sprintf(`{"id":%q,"cycle":%d,"payload":"`, id, cycle))
+	result := make([]byte, 0, size)
+	result = append(result, prefix...)
+	for len(result) < size-2 {
+		result = append(result, byte('a'+cycle%26))
+	}
+	result = append(result, '"', '}')
+	return result
+}
+
+func walRetentionWaitValue(t testing.TB, fixture *rf3FaultFixture, member int,
+	state shardservice.ReplicatedMemberState, id string, want []byte, timeout time.Duration) {
+	t.Helper()
+	// Writes deliberately submit noncanonical key order. Reads after restart
+	// must match the durable canonical bytes, not that input ordering.
+	want, canonicalErr := vibejson.AppendCanonicalize(nil, want)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		request := fixture.readRequest(member, state, rf3FaultKey(t, id))
+		response, err := fixture.roundTrip(t, member, request)
+		if err == nil && response.Kind == shardservice.ReplicatedReadFound && bytes.Equal(response.Value, want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("member %d did not return acknowledged value %q", member+1, id)
+}
+
+func walRetentionDuplicateWave(t testing.TB, fixture *rf3FaultFixture, member int,
+	state shardservice.ReplicatedMemberState, command []byte) {
+	t.Helper()
+	const callers = 32
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	results, err := fixture.roundTripWave(ctx, member, fixture.proposalRequest(member, state, command), callers)
+	if err != nil {
+		t.Fatalf("duplicate wave preparation: %v", err)
+	}
+	completed := 0
+	for _, result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.response.Kind == shardservice.ReplicatedCompletion {
+			completed++
+			continue
+		}
+		if result.response.Kind != shardservice.ReplicatedRefusal ||
+			result.response.Refusal != shardservice.ReplicatedRefusalAdmissionBound {
+			t.Fatalf("duplicate waiter result = %+v", result.response)
+		}
+	}
+	if completed == 0 {
+		t.Fatal("duplicate waiter wave had no completion")
+	}
+}
+
+func walRetentionWALGenerations(t testing.TB, paths [rf3CommandMembers]string) [rf3CommandMembers][sha256.Size]byte {
+	t.Helper()
+	var result [rf3CommandMembers][sha256.Size]byte
+	for index, path := range paths {
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Maintenance can replace a WAL more than once between observations,
+		// allowing the filesystem to reuse an old inode (ABA). Each generation
+		// has a fresh immutable static header, independent of that reuse. Read
+		// from one open descriptor so a concurrent rename cannot mix files.
+		var header [raftstore.StaticHeaderBytes]byte
+		_, readErr := file.ReadAt(header[:], 0)
+		if err := errors.Join(readErr, file.Close()); err != nil {
+			t.Fatalf("WAL generation unavailable for %q: %v", path, err)
+		}
+		result[index] = sha256.Sum256(header[:])
+	}
+	return result
+}
+
+func walRetentionWaitGenerationReplacement(t testing.TB, paths [rf3CommandMembers]string,
+	previous [rf3CommandMembers][sha256.Size]byte, timeout time.Duration) [rf3CommandMembers][sha256.Size]byte {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		current := walRetentionWALGenerations(t, paths)
+		changed := true
+		for index := range current {
+			changed = changed && current[index] != previous[index]
+		}
+		if changed {
+			return current
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("all WAL generations did not replace before timeout; previous=%x current=%x",
+		previous, walRetentionWALGenerations(t, paths))
+	return [rf3CommandMembers][sha256.Size]byte{}
+}
+
+func walRetentionProcessFDs(t testing.TB, children [rf3CommandMembers]*rf3CommandChild) uint64 {
+	t.Helper()
+	var total uint64
+	for member, child := range children {
+		if child == nil || child.command == nil || child.command.Process == nil {
+			t.Fatalf("member %d has no process for FD evidence", member+1)
+		}
+		entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", child.command.Process.Pid))
+		if err != nil {
+			t.Fatalf("read member %d descriptors: %v", member+1, err)
+		}
+		total += uint64(len(entries))
+	}
+	return total
+}
+
+type walRetentionEvidence struct {
+	Cycles, Writes, Restarts, GenerationChanges                                  int
+	LiveBytes, WALBaselineBytes, WALFinalBytes, WALGrowthBytes, WALRatioPermille uint64
+	RSSGrowthBytes, FDGrowth, P99NS, MaxNS, RetiredOutcome                       uint64
+}
+
+func (e walRetentionEvidence) validate() error {
+	expectedGrowth := uint64(0)
+	if e.WALFinalBytes > e.WALBaselineBytes {
+		expectedGrowth = e.WALFinalBytes - e.WALBaselineBytes
+	}
+	if e.Cycles != walRetentionCycles || e.Writes != walRetentionCycles*walRetentionKeysPerCycle ||
+		e.Restarts != walRetentionCycles || e.GenerationChanges != walRetentionCycles*rf3CommandMembers ||
+		e.LiveBytes == 0 || e.WALBaselineBytes == 0 || e.WALFinalBytes == 0 ||
+		e.WALGrowthBytes != expectedGrowth ||
+		e.WALGrowthBytes > walRetentionMaximumGrowthBytes || e.WALRatioPermille > walRetentionMaximumRatioPermille ||
+		e.RSSGrowthBytes > walRetentionMaximumRSSGrowthBytes || e.FDGrowth > walRetentionMaximumFDGrowth ||
+		e.P99NS == 0 || e.P99NS > uint64(walRetentionP99Bound) || e.MaxNS < e.P99NS ||
+		e.MaxNS > uint64(walRetentionMaxBound) || e.RetiredOutcome != uint64(raftserve.OutcomeRetryRetired) {
+		return errors.New("invalid WAL-retention evidence")
+	}
+	return nil
+}
+
+func walRetentionWriteEvidence(t testing.TB, evidence walRetentionEvidence) {
+	t.Helper()
+	if err := evidence.validate(); err != nil {
+		t.Fatal(err)
+	}
+	directory := os.Getenv(walRetentionEvidenceEnvironment)
+	if directory == "" {
+		return
+	}
+	if !filepath.IsAbs(directory) {
+		t.Fatalf("WAL-retention evidence directory must be absolute: %q", directory)
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, fmt.Sprintf("run-%d.tsv", walRetentionEvidenceRun.Add(1)))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := []struct {
+		name  string
+		value uint64
+	}{
+		{"cycles", uint64(evidence.Cycles)}, {"writes", uint64(evidence.Writes)},
+		{"restarts", uint64(evidence.Restarts)}, {"generation_changes", uint64(evidence.GenerationChanges)},
+		{"live_bytes", evidence.LiveBytes}, {"wal_baseline_bytes", evidence.WALBaselineBytes},
+		{"wal_final_bytes", evidence.WALFinalBytes}, {"wal_growth_bytes", evidence.WALGrowthBytes},
+		{"wal_live_ratio_permille", evidence.WALRatioPermille}, {"rss_growth_bytes", evidence.RSSGrowthBytes},
+		{"fd_growth", evidence.FDGrowth}, {"p99_ns", evidence.P99NS}, {"max_ns", evidence.MaxNS},
+		{"retired_outcome", evidence.RetiredOutcome},
+	}
+	write := func(parts ...string) {
+		line := []byte(nil)
+		for index, part := range parts {
+			if index != 0 {
+				line = append(line, '\t')
+			}
+			line = append(line, part...)
+		}
+		line = append(line, '\n')
+		if _, writeErr := file.Write(line); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	write("schema", "vibedb.wal-retention-process", "1")
+	write("result", "pass")
+	for _, field := range fields {
+		write("metric", field.name, strconv.FormatUint(field.value, 10))
+	}
+	if err = file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWALRetentionEvidenceRejectsInvalidBounds(t *testing.T) {
+	valid := walRetentionEvidence{Cycles: walRetentionCycles, Writes: walRetentionCycles * walRetentionKeysPerCycle,
+		Restarts: walRetentionCycles, GenerationChanges: walRetentionCycles * rf3CommandMembers,
+		LiveBytes: 1, WALBaselineBytes: 1, WALFinalBytes: 1, P99NS: 1, MaxNS: 1,
+		RetiredOutcome: uint64(raftserve.OutcomeRetryRetired)}
+	if err := valid.validate(); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed := valid
+	reclaimed.WALBaselineBytes = 2
+	if err := reclaimed.validate(); err != nil {
+		t.Fatalf("reclaimed WAL allocation rejected: %v", err)
+	}
+	invalid := reclaimed
+	invalid.WALGrowthBytes = 1
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted invented WAL growth after reclamation")
+	}
+	invalid = reclaimed
+	invalid.WALFinalBytes = 0
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted absent final WAL allocation")
+	}
+	invalid = valid
+	invalid.WALBaselineBytes = 0
+	invalid.WALGrowthBytes = invalid.WALFinalBytes
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted absent baseline WAL allocation")
+	}
+	invalid = valid
+	invalid.WALGrowthBytes = walRetentionMaximumGrowthBytes + 1
+	invalid.WALFinalBytes = invalid.WALBaselineBytes + invalid.WALGrowthBytes
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted excessive WAL growth")
+	}
+	invalid = valid
+	invalid.WALRatioPermille = walRetentionMaximumRatioPermille + 1
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted excessive retained/live ratio")
+	}
+	invalid = valid
+	invalid.Restarts--
+	if err := invalid.validate(); err == nil {
+		t.Fatal("accepted missing crash loop")
+	}
+}

@@ -9,10 +9,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -1851,6 +1853,43 @@ func processHostLimits() multiraft.Limits {
 	}
 }
 
+func processRF3DescriptorDigest(
+	domain string,
+	group raftmember.GroupKey,
+	shard distribution.ShardID,
+	allocation distribution.ShardAllocationGeneration,
+) replication.Digest {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(domain))
+	_, _ = hash.Write(group.ClusterID[:])
+	_, _ = hash.Write(group.ClusterIncarnation[:])
+	_, _ = hash.Write(group.ShardIncarnation[:])
+	_, _ = hash.Write(group.GroupID[:])
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], group.TopologyRecoveryEpoch)
+	_, _ = hash.Write(encoded[:])
+	_, _ = hash.Write([]byte(shard))
+	binary.BigEndian.PutUint64(encoded[:], uint64(allocation))
+	_, _ = hash.Write(encoded[:])
+	var digest replication.Digest
+	_ = hash.Sum(digest[:0])
+	return digest
+}
+
+func processRF3DescriptorIdentity(
+	group raftmember.GroupKey,
+	shard distribution.ShardID,
+	allocation distribution.ShardAllocationGeneration,
+) (replication.Digest, replication.Digest, replication.Digest) {
+	return processRF3DescriptorDigest(
+			"vibedb/test/process-rf3-range/format-0\x00", group, shard, allocation,
+		), processRF3DescriptorDigest(
+			"vibedb/test/process-rf3-lineage/format-0\x00", group, shard, allocation,
+		), processRF3DescriptorDigest(
+			"vibedb/test/process-rf3-forwarding/format-0\x00", group, shard, allocation,
+		)
+}
+
 func processRoleRoute(
 	role processRuntimeRole,
 	addresses [processVoters]string,
@@ -1915,11 +1954,15 @@ func processRoleRoute(
 			ControlEndpoint: controlEndpointIDs[index],
 		}
 	}
+	rangeIdentity, lineageDigest, forwardingRuleDigest := processRF3DescriptorIdentity(
+		group, shardID, allocationGeneration,
+	)
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
 		config, endpoints, 1, nil, nil, []gateway.ReplicatedShardDescriptor{{
 			Distribution: distributionName, Shard: shardID,
 			Group: group, AllocationGeneration: allocationGeneration,
-			Command: command, Replicas: replicas,
+			Command: command, RangeIdentity: rangeIdentity, LineageDigest: lineageDigest,
+			ForwardingRuleDigest: forwardingRuleDigest, Replicas: replicas,
 		}},
 	)
 	if err != nil {

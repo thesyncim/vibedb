@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -23,27 +24,48 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	drainRuntime(t, fixture.runtime, nil)
+	var driverErr error
 	if err := fixture.runtime.ConfigureWALGeneration(WALGenerationDriverOptions{
 		IntervalTicks: 1,
 		Key:           fixture.walKey,
+		OnError:       func(err error) { driverErr = err },
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
 	for sequence := uint64(2); sequence <= 3; sequence++ {
-		key, _ := orderedkey.AppendJSONString(nil, []byte{byte('a' + sequence - 2)}, orderedkey.Ascending)
+		beforeApplied := fixture.apply.Applied()
+		key, document := generationDriverMutation(t, sequence)
 		command := testApplyCommand(
-			fixture.base, epoch, sequence, key,
-			[]byte(`{"id":"generation-driver","value":1}`),
+			fixture.base, epoch, sequence, key, document,
 		)
 		if err := fixture.runtime.Propose(command); err != nil {
 			t.Fatal(err)
 		}
 		drainRuntime(t, fixture.runtime, nil)
+		if fixture.apply.Applied() != beforeApplied+1 {
+			t.Fatalf("sequence %d apply index=%d, want %d", sequence, fixture.apply.Applied(), beforeApplied+1)
+		}
+		// Inspect the journal-only cut before any completion snapshot. A lookup
+		// can materialize system parents and legitimately checkpoint the group,
+		// which would erase the exact compaction-stall precondition under test.
+		if sequence == 3 && fixture.apply.CheckpointAppliedIndex() != beforeApplied {
+			t.Fatalf("test requires a journal-durable suffix above the previous generation: checkpoint=%d previous=%d applied=%d",
+				fixture.apply.CheckpointAppliedIndex(), beforeApplied, fixture.apply.Applied())
+		}
 		info, err := awaitWALGeneration(t, fixture.runtime, fixture.wal, sequence-1)
-		if err != nil || info.Generation != sequence-1 {
-			t.Fatalf("generation after sequence %d = %+v, %v", sequence, info, err)
+		if err != nil || info.Generation != sequence-1 || info.BaseIndex != beforeApplied+1 {
+			t.Fatalf("generation after sequence %d = %+v, %v; driver=%v", sequence, info, err, driverErr)
+		}
+		lookup, lookupErr := fixture.apply.LookupCompletion(command)
+		if lookupErr != nil {
+			t.Fatal(lookupErr)
+		}
+		completion, completionErr := replication.OpenCompletion(lookup.Bytes)
+		if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
+			completion.AppliedSequence != beforeApplied+1 || fixture.apply.Applied() != beforeApplied+1 {
+			t.Fatalf("sequence %d did not durably apply: %+v err=%v applied=%d", sequence, completion, completionErr, fixture.apply.Applied())
 		}
 	}
 	before, err := fixture.wal.GenerationInfo()
@@ -87,6 +109,27 @@ func TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart(t *testing.T) {
 	}
 	if err := reopenedWAL.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func generationDriverMutation(t testing.TB, sequence uint64) ([]byte, []byte) {
+	t.Helper()
+	id := byte('a' + sequence - 2)
+	key, ok := orderedkey.AppendJSONString(nil, []byte{'"', id, '"'}, orderedkey.Ascending)
+	if !ok {
+		t.Fatal("invalid JSON primary key")
+	}
+	document := []byte(`{"id":"a","value":1}`)
+	document[7] = id
+	return key, document
+}
+
+func TestGenerationDriverMutationPreflight(t *testing.T) {
+	for sequence := uint64(2); sequence <= 3; sequence++ {
+		key, document := generationDriverMutation(t, sequence)
+		if len(key) == 0 || document[7] != byte('a'+sequence-2) {
+			t.Fatalf("invalid generation fixture: key=%x document=%s", key, document)
+		}
 	}
 }
 
@@ -176,9 +219,28 @@ func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
 	}
 	// The intervening apply stales the candidate. Owner-lane revalidation must
 	// discard it without selecting or deleting the serving source.
-	fixture.runtime.tickWALGeneration()
-	if _, err := fixture.wal.GenerationInfo(); !errors.Is(err, raftstore.ErrGenerationSource) {
+	sourceFile, err := os.Stat(fixture.walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for fixture.runtime.walGeneration.building && time.Now().Before(deadline) {
+		fixture.runtime.tickWALGeneration()
+		runtime.Gosched()
+	}
+	if fixture.runtime.walGeneration.building || fixture.runtime.walGeneration.activationPending {
+		t.Fatal("stale candidate was not consumed and discarded")
+	}
+	if _, err := fixture.wal.GenerationInfo(); !errors.Is(err, raftstore.ErrGenerationCandidate) {
 		t.Fatalf("stale off-lane build was published: %v", err)
+	}
+	afterFile, err := os.Stat(fixture.walPath)
+	if err != nil || !os.SameFile(sourceFile, afterFile) {
+		t.Fatalf("stale build replaced source inode: %v", err)
+	}
+	hard, _, err := fixture.wal.InitialState()
+	if err != nil || hard.GetCommit() < fixture.apply.Published().Applied {
+		t.Fatalf("source stopped serving acknowledged apply: hard=%v err=%v", hard, err)
 	}
 }
 

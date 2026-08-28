@@ -95,8 +95,18 @@ type Collection struct {
 	mutationCombiner *primaryMutationCombiner
 	mutationWait     sync.WaitGroup
 	onlineIndexBuild atomic.Bool
-	durabilityWait   sync.WaitGroup
-	snapshotGate     sync.RWMutex
+	// onlineMigrationDirty/Observer are installed and removed under writer.
+	// Reservation publications temporarily suppress the observer under the same
+	// exclusion, so migration-owned high-water roots do not self-dirty while no
+	// serving publication can pass unobserved.
+	onlineMigrationDirty    *storeio.GenerationMigrationDirtySet
+	onlineMigrationObserver func(uint64, []byte) error
+	// onlineCompactionFlight excludes both a second migration and checkpoint
+	// group activation throughout the unlocked scan/install/retirement lifecycle.
+	onlineCompactionFlight atomic.Bool
+	onlineCompactionWait   sync.WaitGroup
+	durabilityWait         sync.WaitGroup
+	snapshotGate           sync.RWMutex
 	// snapshotOrder is a process-local, lazily assigned identity used to
 	// acquire several collections' snapshot gates in one global order. Names
 	// are catalog-local and cannot provide that order when the same handles are
@@ -344,11 +354,21 @@ type Collection struct {
 	// harness can gate p-max without a full histogram allocation.
 	primaryLeafSplits               atomic.Uint64
 	primaryEmptyReclaims            atomic.Uint64
+	primaryMacroSplits              atomic.Uint64
+	primaryTabletRoutingRebuilds    atomic.Uint64
+	primaryCatalogLeafSplits        atomic.Uint64
+	primaryCatalogBranchSplits      atomic.Uint64
 	primaryMacroSplitRequired       atomic.Uint64
 	primarySplitMaxNS               atomic.Uint64
 	primaryEmptyReclaimMaxNS        atomic.Uint64
 	primaryStructuralRoutingStaged  atomic.Uint64
 	primaryStructuralRoutingRetired atomic.Uint64
+	// primaryNextTabletID is the writer-owned monotonic identity high-water.
+	// Open reconstructs it from the authenticated resident graph; structural
+	// publication advances it only after the sibling tablet is durable.
+	primaryNextTabletID        uint32
+	primaryNextCatalogLeafID   uint32
+	primaryNextCatalogBranchID uint32
 	// Hole punching is a foreground, post-durability space optimization. The
 	// source cursors, physical-generation guard, and disabled flag are
 	// writer-owned; atomic counters keep the optional filesystem results
@@ -778,9 +798,18 @@ type Stats struct {
 	// transactions performed this session.
 	PrimaryLeafSplits    uint64
 	PrimaryEmptyReclaims uint64
-	// PrimaryMacroSplitRequired counts structural transactions that could not
-	// proceed because a tablet's 4096 local IDs or 16 anchor pages are exhausted
-	// and a macro-tablet split (the next phase) is required.
+	// PrimaryMacroSplits counts bounded sibling-tablet publications performed
+	// after exhausting one tablet's 4096 stable local identities.
+	PrimaryMacroSplits uint64
+	// PrimaryTabletRoutingRebuilds counts bounded whole-tablet routing rewrites
+	// used when all stable anchor IDs exist but dense repacking still has room.
+	PrimaryTabletRoutingRebuilds uint64
+	// PrimaryCatalog*Splits count recursive node splits that let sibling-tablet
+	// publication continue past one catalog leaf or branch fanout.
+	PrimaryCatalogLeafSplits   uint64
+	PrimaryCatalogBranchSplits uint64
+	// PrimaryMacroSplitRequired counts sibling publications that could not
+	// proceed because the tablet identity namespace or catalog node is full.
 	PrimaryMacroSplitRequired uint64
 	// PrimarySplitMaxNS and PrimaryEmptyReclaimMaxNS report the high-water
 	// bounded-transaction latency in nanoseconds for each structural kind.

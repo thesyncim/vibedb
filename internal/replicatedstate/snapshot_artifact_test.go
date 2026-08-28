@@ -63,7 +63,9 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
 	// The artifact authenticates the apply contract; changing conditional
 	// mutations or JSON-relation affected-row semantics changes this vector.
-	const golden = "cb3587dce54d821f2350729cda5e9206717cede1e3db2b2ef3be472f4b008664"
+	// The source data-chain hashes canonical persisted afterimages, including
+	// this fixture's originally reverse-ordered sequence/payload command fields.
+	const golden = "31510b28f41696bbf28867d57d3d8d2b4243da505f8f43f560e3b27719834a10"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -596,7 +598,7 @@ func TestSnapshotArtifactHiddenSystemKeyGrammar(t *testing.T) {
 		previousKeyBytes := 0
 		_, err := consumeSnapshotArtifactRows(
 			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
-			payload(key), nil, previousKey, &previousKeyBytes, nil, true, nil,
+			payload(key), nil, previousKey, &previousKeyBytes, nil, true, nil, nil,
 		)
 		return err
 	}
@@ -639,7 +641,7 @@ func TestSnapshotArtifactValidatesExactTransactionRows(t *testing.T) {
 		previousKeyBytes := 0
 		_, err := consumeSnapshotArtifactRows(
 			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
-			rowPayload(key, value), nil, previousKey, &previousKeyBytes, nil, true, scratch,
+			rowPayload(key, value), nil, previousKey, &previousKeyBytes, nil, true, nil, scratch,
 		)
 		return err
 	}
@@ -777,6 +779,15 @@ func TestSnapshotArtifactBoundsAndCallbackFailures(t *testing.T) {
 }
 
 func TestRequiredSnapshotArtifactPayloadCapacity(t *testing.T) {
+	system, err := RequiredSnapshotArtifactSystemPayloadCapacity(0,
+		replication.MaxMutationKeyBytes, replication.MaxCommandBytes)
+	if err != nil || system != DefaultSnapshotArtifactChunkBytes {
+		t.Fatalf("maximum opaque system row grew streaming scratch: %d, %v", system, err)
+	}
+	if _, err := RequiredSnapshotArtifactSystemPayloadCapacity(0, 1,
+		replication.MaxCommandBytes+1); !errors.Is(err, ErrSnapshotArtifactBound) {
+		t.Fatalf("oversized opaque system row accepted: %v", err)
+	}
 	ordinary, err := RequiredSnapshotArtifactPayloadCapacity(0, 32, 4096)
 	if err != nil || ordinary != DefaultSnapshotArtifactChunkBytes {
 		t.Fatalf("ordinary payload capacity = %d, %v", ordinary, err)

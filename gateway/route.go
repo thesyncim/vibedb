@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -20,9 +21,10 @@ import (
 // address its endpoint resolves to in the pinned generation, and the fully
 // populated request that admits against that shard's ownership coordinates.
 type shardCall struct {
-	target  distribution.Target
-	address string
-	req     *shardservice.ShardRequest
+	target         distribution.Target
+	pressureSource autosplit.SourceIdentity
+	address        string
+	req            *shardservice.ShardRequest
 }
 
 // plan is the routed result for one pinned generation: the physical route kind,
@@ -100,7 +102,9 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 			return nil, err
 		}
 		calls[i] = shardCall{
-			target:  t,
+			target: t, pressureSource: pressureSourceForTarget(
+				bound.manifest, bound.spec.EffectiveBucketBits(), t,
+			),
 			address: addr,
 			req: &shardservice.ShardRequest{
 				SQL:                  q.SQL,
@@ -144,6 +148,24 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		physical:     physical,
 		planning:     planning,
 	}, nil
+}
+
+func pressureSourceForTarget(
+	manifest *distribution.Manifest, bucketBits uint8, target distribution.Target,
+) autosplit.SourceIdentity {
+	if manifest == nil || bucketBits == 0 {
+		return autosplit.SourceIdentity{}
+	}
+	metadata, ok := manifest.ShardMetadataAt(target.ManifestOrdinal)
+	if ok && metadata.ID == target.Shard &&
+		metadata.AllocationGeneration == target.AllocationGeneration &&
+		metadata.Epoch == target.OwnershipEpoch {
+		return autosplit.SourceIdentity{Distribution: manifest.Distribution(),
+			Shard: metadata.ID, AllocationGeneration: metadata.AllocationGeneration,
+			Range: metadata.Range, BucketBits: bucketBits,
+			RoutingVersion: manifest.Version(), OwnershipEpoch: metadata.Epoch}
+	}
+	return autosplit.SourceIdentity{}
 }
 
 func physicalPlanContains(plan *queryplanner.Plan, operation queryplanner.Operator) bool {

@@ -40,14 +40,28 @@ type Node struct {
 	readBytes    int
 	readSeq      uint64
 
-	settlementReadyID uint64
-	settlementStart   int
-	settlementCount   int
+	settlementReadyID    uint64
+	settlementStart      int
+	settlementCount      int
+	settlementCompletion []byte
 
 	readyFromInput    bool
 	pendingInputCalls int
 	pendingInputUnits int
 	pendingInputBytes int64
+
+	commitIndex        uint64
+	commitAdvancements uint64
+	committedEntries   uint64
+}
+
+// CommitMetrics is the allocation-free cumulative observation produced at the
+// RawNode mutation boundary. An advancement counts one core transition of the
+// commit index; entries is the exact index distance crossed by those
+// transitions. Recovery state is the baseline and is intentionally excluded.
+type CommitMetrics struct {
+	Advancements uint64
+	Entries      uint64
 }
 
 // MembershipTransitionContextBytes is the sole configuration context shape
@@ -228,6 +242,7 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 		phase:       PhaseIdle,
 		published:   pub,
 		issuedReads: make(map[readContextKey]readIssue),
+		commitIndex: raw.BasicStatus().GetCommit(),
 	}
 	return n, nil
 }
@@ -244,6 +259,27 @@ func newRawNodeChecked(config *raft.Config) (raw *raft.RawNode, err error) {
 
 // Phase returns the current synchronous Ready lifecycle phase.
 func (n *Node) Phase() Phase { return n.phase }
+
+// ReplaceStateMachine atomically changes only the local apply handle at one
+// completely quiescent publication cut. Raft identity, log, term, progress,
+// and read contexts remain untouched. The replacement must expose the exact
+// publication already owned by Node; a merely equal applied index is
+// insufficient.
+func (n *Node) ReplaceStateMachine(machine StateMachine) error {
+	if n == nil || machine == nil || n.failure != nil || n.phase != PhaseIdle ||
+		n.pendingInputCalls != 0 || n.settlementCount != 0 ||
+		len(n.issuedReads) != 0 || len(n.pendingReads) != 0 || n.raw == nil ||
+		n.raw.HasReady() {
+		return ErrReadyPending
+	}
+	publication := machine.Published()
+	if machine.Applied() != publication.Applied ||
+		!equalPublication(publication, n.published) {
+		return ErrPublicationMismatch
+	}
+	n.machine = machine
+	return nil
+}
 
 // BindMembershipTransitionContext enables the one fixed-width membership
 // authorization digest before any proposal or Ready replay. Raw Nodes remain
@@ -297,10 +333,33 @@ func (n *Node) PublishedApplied() uint64 {
 // Node's single-owner contract.
 func (n *Node) Status() raft.BasicStatus { return n.raw.BasicStatus() }
 
+// CommitMetrics returns counters recorded where RawNode actually changed its
+// commit index. Node's single-owner contract makes this a plain fixed-width
+// load; callers that need concurrent visibility publish it outside raftmodel.
+func (n *Node) CommitMetrics() CommitMetrics {
+	if n == nil {
+		return CommitMetrics{}
+	}
+	return CommitMetrics{Advancements: n.commitAdvancements, Entries: n.committedEntries}
+}
+
+func (n *Node) observeCommitAdvancement() {
+	commit := n.raw.BasicStatus().GetCommit()
+	if commit <= n.commitIndex {
+		return
+	}
+	n.commitAdvancements++
+	n.committedEntries += commit - n.commitIndex
+	n.commitIndex = commit
+}
+
 // Progress returns one detached tracker record without allocating a map. It is
 // available only when the local member is leader and the member is configured.
 func (n *Node) Progress(memberID uint64) (MemberProgress, bool) {
-	if memberID == raft.None || raft.IsLocalMsgTarget(memberID) {
+	// RawNode.WithProgress visits the tracker even on followers. Those entries
+	// are not replication evidence and must never be published as a leader cut.
+	if n == nil || n.raw.BasicStatus().RaftState != raft.StateLeader ||
+		memberID == raft.None || raft.IsLocalMsgTarget(memberID) {
 		return MemberProgress{}, false
 	}
 	var result MemberProgress
@@ -654,6 +713,7 @@ func (n *Node) pendingAppliedNormalBatch() AppliedNormalBatch {
 		owner: n, readyID: n.settlementReadyID,
 		entries:     n.ready.CommittedEntries[n.settlementStart:end],
 		publication: n.published,
+		completion:  n.settlementCompletion,
 	}
 }
 
@@ -691,6 +751,7 @@ func (n *Node) SettleAppliedNormalBatch(batch AppliedNormalBatch) error {
 	n.settlementReadyID = 0
 	n.settlementStart = 0
 	n.settlementCount = 0
+	n.settlementCompletion = nil
 	if n.entryPos == len(n.ready.CommittedEntries) {
 		n.phase = PhaseEntriesApplied
 	}
@@ -814,6 +875,7 @@ func (n *Node) AdvanceReady() error {
 		return err
 	}
 	n.raw.Advance(n.ready)
+	n.observeCommitAdvancement()
 	n.ready = raft.Ready{}
 	n.readyID = 0
 	n.messagePos = 0
@@ -848,6 +910,7 @@ func (n *Node) Step(message *pb.Message) error {
 	// Step. The transport owns its message and is free to recycle it as soon as
 	// this call returns, so the integration boundary must detach the full graph.
 	err := n.raw.Step(proto.Clone(message).(*pb.Message))
+	n.observeCommitAdvancement()
 	if err == nil {
 		n.recordProtocolInput(units, inputBytes)
 	}
@@ -958,6 +1021,7 @@ func (n *Node) Tick() error {
 		return err
 	}
 	n.raw.Tick()
+	n.observeCommitAdvancement()
 	n.recordProtocolInput(1, 0)
 	return nil
 }
@@ -968,6 +1032,7 @@ func (n *Node) Campaign() error {
 		return err
 	}
 	err := n.raw.Campaign()
+	n.observeCommitAdvancement()
 	if err == nil {
 		n.recordProtocolInput(1, 0)
 	}
@@ -996,6 +1061,7 @@ func (n *Node) TransferLeader(transferee uint64) error {
 		return err
 	}
 	n.raw.TransferLeader(transferee)
+	n.observeCommitAdvancement()
 	n.recordProtocolInput(1, 0)
 	return nil
 }
@@ -1010,6 +1076,7 @@ func (n *Node) Propose(data []byte) error {
 		return err
 	}
 	err := n.raw.Propose(append([]byte(nil), data...))
+	n.observeCommitAdvancement()
 	if err == nil {
 		n.recordProtocolInput(1, int64(len(data)))
 	}
@@ -1056,6 +1123,7 @@ func (n *Node) ProposeConfChange(change pb.ConfChangeI) error {
 		return err
 	}
 	err = n.raw.ProposeConfChange(change)
+	n.observeCommitAdvancement()
 	if err == nil {
 		n.recordProtocolInput(1, int64(len(encoded)))
 	}
@@ -1086,13 +1154,25 @@ func (n *Node) applyEntry(entry *pb.Entry) error {
 	meta := ApplyMeta{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType()}
 	switch entry.GetType() {
 	case pb.EntryType_EntryNormal:
-		pub, err := n.machine.ApplyNormal(meta, entry.GetData())
+		var pub Publication
+		var completion []byte
+		var err error
+		if machine, ok := n.machine.(NormalCompletionStateMachine); ok {
+			pub, completion, err = machine.ApplyNormalWithCompletion(meta, entry.GetData())
+		} else {
+			pub, err = n.machine.ApplyNormal(meta, entry.GetData())
+		}
 		if err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
+		}
+		if len(completion) > MaxNormalApplyCompletionBytes || cap(completion) > MaxNormalApplyCompletionBytes ||
+			(len(entry.GetData()) == 0 && len(completion) != 0) {
+			return n.fail(PhaseEntriesApplied, meta.Index, errors.New("invalid normal apply completion bound"))
 		}
 		if err := n.acceptNormalPublication(meta, len(entry.GetData()) == 0, pub); err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
 		}
+		n.settlementCompletion = completion
 	case pb.EntryType_EntryConfChange, pb.EntryType_EntryConfChangeV2:
 		change, err := decodeConfChange(entry)
 		if err != nil {
@@ -1106,6 +1186,7 @@ func (n *Node) applyEntry(entry *pb.Entry) error {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
 		}
 		confState, err := applyConfChangeChecked(n.raw, change)
+		n.observeCommitAdvancement()
 		if err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
 		}

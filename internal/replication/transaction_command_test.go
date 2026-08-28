@@ -18,6 +18,12 @@ func encodeTransactionControl(
 	command distributedtxn.ReplicatedCommand,
 ) []byte {
 	t.Helper()
+	if command.ControllerEpoch == 0 {
+		command.ControllerEpoch = 7
+	}
+	if command.ExecutionPinDigest == (distributedtxn.Digest{}) {
+		command.ExecutionPinDigest = distributedtxn.Digest(sha256.Sum256([]byte("test-execution-pin")))
+	}
 	encoded, err := distributedtxn.AppendReplicatedCommand(nil, command)
 	if err != nil {
 		t.Fatal(err)

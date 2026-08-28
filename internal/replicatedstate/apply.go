@@ -9,8 +9,10 @@ import (
 	"math"
 	"slices"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
@@ -25,33 +27,104 @@ var (
 )
 
 type commandPlan struct {
-	command         replication.CommandView
-	authorityDigest [32]byte
-	authorityKey    [33]byte
-	authorityRecord []byte
-	sessionDigest   [32]byte
-	sessionKey      [33]byte
-	slotKey         [35]byte
-	sessionRecord   []byte
-	slotRecord      []byte
-	changes         []finalMutation
-	relations       []plannedRelationChanges
-	dataChainDigest [32]byte
-	resultCode      uint32
-	affectedRows    int64
-	refusal         error
-	writeSession    bool
-	writeAuthority  bool
-	writeSlot       bool
-	newSession      bool
-	newAuthority    bool
-	newPhysicalSlot bool
-	advanceEpoch    uint64
-	deleteSession   bool
-	deleteSlots     uint16
-	release         bool
-	exactDuplicate  bool
-	conflict        bool
+	command            replication.CommandView
+	authorityDigest    [32]byte
+	authorityKey       [33]byte
+	authorityRecord    []byte
+	sessionDigest      [32]byte
+	sessionKey         [33]byte
+	slotKey            [35]byte
+	sessionRecord      []byte
+	slotRecord         []byte
+	routeGateResultKey [routeGateResultKeyBytes]byte
+	routeGateResult    []byte
+	routeGateCommand   routegate.Command
+	routeGateApply     bool
+	routeGateRows      []routeGateRowMutation
+	routeGateOutcome   routegate.Outcome
+	changes            []finalMutation
+	systemRows         []transactionRowMutation
+	executionPinDelta  executionPinStateDelta
+	fenceDelta         sessionFenceDelta
+	relations          []plannedRelationChanges
+	dataChainDigest    [32]byte
+	resultCode         uint32
+	affectedRows       int64
+	refusal            error
+	writeSession       bool
+	writeAuthority     bool
+	writeSlot          bool
+	newSession         bool
+	newAuthority       bool
+	newPhysicalSlot    bool
+	advanceEpoch       uint64
+	deleteSession      bool
+	deleteSlots        uint16
+	release            bool
+	exactDuplicate     bool
+	conflict           bool
+}
+
+type routeGateRowMutation struct {
+	key    []byte
+	value  []byte
+	delete bool
+}
+
+func planRouteGateRows(
+	current *routegate.Machine,
+	command routegate.Command,
+	outcome routegate.Outcome,
+) ([]routeGateRowMutation, error) {
+	if current == nil || !outcome.Mutated {
+		return nil, ErrStateCorrupt
+	}
+	head, err := routegate.AppendHead(make([]byte, 0, routegate.HeadBytes), outcome.Status)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]routeGateRowMutation, 0, 2)
+	rows = append(rows, routeGateRowMutation{key: routeGateHeadKey, value: head})
+	switch command.Operation {
+	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
+		state := routegate.PinHeld
+		if command.Operation == routegate.OperationReleaseShared {
+			state = routegate.PinReleased
+		}
+		record := routegate.PinRecord{
+			Identity: command.Identity, Binding: command.Binding,
+			Epoch: command.Epoch, State: state,
+		}
+		key, keyErr := routeGatePinStorageKey(command.Identity)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		value, valueErr := routegate.AppendStoredPin(
+			make([]byte, 0, routegate.StoredPinBytes), record,
+		)
+		if valueErr != nil {
+			return nil, valueErr
+		}
+		rows = append(rows, routeGateRowMutation{
+			key: append([]byte(nil), key[:]...), value: value,
+		})
+	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive:
+	case routegate.OperationCompactReleased:
+		identity, found := current.CompactCandidate()
+		if !found {
+			break
+		}
+		key, keyErr := routeGatePinStorageKey(identity)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		rows = append(rows, routeGateRowMutation{
+			key: append([]byte(nil), key[:]...), delete: true,
+		})
+	default:
+		return nil, ErrStateCorrupt
+	}
+	return rows, nil
 }
 
 type plannedRelationChanges struct {
@@ -198,9 +271,46 @@ func (s *commandPlanScratch) appendSessionSlot(
 
 // ApplyNormal implements raftmodel.StateMachine.
 func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, error) {
+	return m.applyNormal(meta, data, nil)
+}
+
+// ApplyNormalWithCompletion preserves an operation's original completion when
+// durable lookup would instead describe a retry. The result is owned by the
+// caller and exists only for synchronous settlement, never as a retained log.
+// A nil completion requests the ordinary durable lookup path.
+func (m *Machine) ApplyNormalWithCompletion(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, []byte, error) {
+	var completion []byte
+	publication, err := m.applyNormal(meta, data, &completion)
+	if err != nil {
+		return publication, nil, err
+	}
+	return publication, completion, err
+}
+
+func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion *[]byte) (raftmodel.Publication, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer m.releaseMutationPlan()
+	schema := IsSchemaTransition(data)
+	if m.schemaTransitioned {
+		if !schema || meta.Type != pb.EntryNormal || meta.Term == 0 || meta.Term == math.MaxUint64 {
+			return raftmodel.Publication{}, ErrSchemaTransitionPending
+		}
+		if len(data) > replication.MaxCommandBytes {
+			return raftmodel.Publication{}, ErrAdmissionBound
+		}
+		digest := normalEntryDigest(meta, data)
+		replay, err := m.checkTransition(meta, RecordSchema, digest)
+		if err != nil || !replay {
+			return raftmodel.Publication{}, errors.Join(ErrSchemaTransitionPending, err)
+		}
+		transition, err := OpenSchemaTransition(data)
+		if err != nil || m.state.Binding != schemaTransitionBinding(transition) ||
+			m.state.ApplyContractDigest != transition.ToApplyContract || m.state.RelationPlacementDigest != transition.ToPlacementDigest {
+			return raftmodel.Publication{}, errors.Join(ErrSchemaTransition, err)
+		}
+		return clonePublication(m.publication), nil
+	}
 	if err := m.checkUsable(); err != nil {
 		return raftmodel.Publication{}, err
 	}
@@ -213,6 +323,8 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	kind := RecordNormal
 	if IsOwnershipTransition(data) {
 		kind = RecordOwnership
+	} else if schema {
+		kind = RecordSchema
 	}
 	digest := normalEntryDigest(meta, data)
 	replay, err := m.checkTransition(meta, kind, digest)
@@ -228,6 +340,12 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 				m.state.Binding.OwnedRange != transition.ToOwnedRange {
 				return raftmodel.Publication{}, m.fail(ErrOwnershipTransition)
 			}
+		} else if kind == RecordSchema {
+			transition, openErr := OpenSchemaTransition(data)
+			if openErr != nil || m.state.Binding != schemaTransitionBinding(transition) ||
+				m.state.ApplyContractDigest != transition.ToApplyContract || m.state.RelationPlacementDigest != transition.ToPlacementDigest {
+				return raftmodel.Publication{}, m.fail(ErrSchemaTransition)
+			}
 		}
 		return clonePublication(m.publication), nil
 	}
@@ -242,9 +360,36 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 		}
 		next := m.nextState(meta, RecordOwnership, digest)
 		next.Binding = binding
+		rows, fenceErr := archiveSessionFence(m.state, &next)
+		if fenceErr != nil {
+			return raftmodel.Publication{}, m.fail(fenceErr)
+		}
+		if err := m.persistTransitionRows(next, nil, commandPlan{}, rows); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		return clonePublication(m.publication), nil
+	}
+	if kind == RecordSchema {
+		transition, openErr := OpenSchemaTransition(data)
+		if openErr != nil {
+			return raftmodel.Publication{}, m.fail(openErr)
+		}
+		if transition.From != m.binding ||
+			transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion ||
+			transition.FromManifest != m.manifestDigest ||
+			transition.FromApplyContract != m.applyContract || transition.FromPlacementDigest != m.state.RelationPlacementDigest {
+			return raftmodel.Publication{}, m.fail(ErrSchemaTransition)
+		}
+		next := m.nextState(meta, RecordSchema, digest)
+		next.Binding = schemaTransitionBinding(transition)
+		next.ApplyContractDigest = transition.ToApplyContract
+		next.RelationPlacementDigest = transition.ToPlacementDigest
+		next.DataChainDigest = schemaTransitionDataChain(m.state.DataChainDigest, transition)
 		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
+		m.applyContract = transition.ToApplyContract
+		m.schemaTransitioned = true
 		return clonePublication(m.publication), nil
 	}
 	if len(data) == 0 {
@@ -264,6 +409,36 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
+	}
+	if command.Kind() == replication.CommandRequestLedger {
+		ledgerPlan, planErr := m.planRequestLedgerCommand(
+			command, m.state, pointSnapshot{value: systemSnapshot},
+		)
+		err = errors.Join(planErr, m.applyCut.Close())
+		if err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		next := m.nextState(meta, RecordNormal, digest)
+		if err := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		if err := m.persistTransitionRows(
+			next, nil, commandPlan{dataChainDigest: next.DataChainDigest}, ledgerPlan.rows,
+		); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		if completion != nil {
+			var result [RequestLedgerCompletionResultBytes]byte
+			resultBytes, err := AppendRequestLedgerCompletionResult(result[:0], ledgerPlan.completion)
+			if err != nil {
+				return raftmodel.Publication{}, m.fail(err)
+			}
+			*completion, err = m.appendRequestLedgerCompletion(nil, command, ledgerPlan.completion, resultBytes)
+			if err != nil {
+				return raftmodel.Publication{}, m.fail(err)
+			}
+		}
+		return clonePublication(m.publication), nil
 	}
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
@@ -301,8 +476,16 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err := applyCommandPlanToState(&next, plan); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
-	if err := m.persistTransition(next, plan.changes, plan); err != nil {
+	if err := applyExecutionPinStateDelta(&next, plan.executionPinDelta); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
+	}
+	if err := m.persistTransitionRows(next, plan.changes, plan, plan.systemRows); err != nil {
+		return raftmodel.Publication{}, m.fail(err)
+	}
+	if command.Kind() == replication.CommandSplitCaptureActivate && plan.resultCode == ResultApplied && !plan.conflict && !plan.exactDuplicate && m.capture == nil {
+		if err := m.activateAppliedSplitCapture(command, meta.Index); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
 	}
 	return clonePublication(m.publication), nil
 }
@@ -555,6 +738,32 @@ func (m *Machine) bundleSnapshotManifestMatches(manifest SnapshotArtifactManifes
 // Serving remains forbidden because a successful return does not reserve the
 // proved storage for the future committed entry.
 func (m *Machine) AdmitCommand(data []byte) error {
+	if IsSchemaTransition(data) {
+		transition, err := OpenSchemaTransition(data)
+		if err != nil {
+			return err
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		defer m.releaseMutationPlan()
+		if err := m.checkUsable(); err != nil {
+			return err
+		}
+		if !m.initialized || m.state.Applied == math.MaxUint64-1 ||
+			transition.From != m.binding ||
+			transition.ExpectedReplicaSetVersion != m.state.ReplicaSetVersion ||
+			transition.FromManifest != m.manifestDigest ||
+			transition.FromApplyContract != m.applyContract || transition.FromPlacementDigest != m.state.RelationPlacementDigest {
+			return ErrSchemaTransition
+		}
+		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
+		next := m.nextState(meta, RecordSchema, normalEntryDigest(meta, transition.Bytes()))
+		next.Binding = schemaTransitionBinding(transition)
+		next.ApplyContractDigest = transition.ToApplyContract
+		next.RelationPlacementDigest = transition.ToPlacementDigest
+		next.DataChainDigest = schemaTransitionDataChain(m.state.DataChainDigest, transition)
+		return m.checkTransitionCapacity(next, nil, commandPlan{})
+	}
 	if IsOwnershipTransition(data) {
 		transition, err := OpenOwnershipTransition(data)
 		if err != nil {
@@ -576,7 +785,11 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 		next := m.nextState(meta, RecordOwnership, normalEntryDigest(meta, transition.Bytes()))
 		next.Binding = binding
-		return m.checkTransitionCapacity(next, nil, commandPlan{})
+		rows, err := archiveSessionFence(m.state, &next)
+		if err != nil {
+			return err
+		}
+		return m.checkTransitionCapacity(next, nil, commandPlan{systemRows: rows})
 	}
 	command, err := replication.OpenCommand(data)
 	if err != nil {
@@ -597,6 +810,32 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
 	if err != nil {
 		return m.fail(err)
+	}
+	if command.Kind() == replication.CommandRequestLedger {
+		ledgerPlan, planErr := m.planRequestLedgerCommand(
+			command, m.state, pointSnapshot{value: systemSnapshot},
+		)
+		closeErr := m.applyCut.Close()
+		if planErr != nil || closeErr != nil {
+			joined := errors.Join(planErr, closeErr)
+			if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
+				return planErr
+			}
+			return m.fail(joined)
+		}
+		next := m.nextState(
+			raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal},
+			RecordNormal, normalEntryDigest(
+				raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal},
+				command.Bytes(),
+			),
+		)
+		if stateErr := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); stateErr != nil {
+			return m.fail(stateErr)
+		}
+		return m.checkTransitionCapacityWithCaptureRows(
+			next, nil, commandPlan{dataChainDigest: next.DataChainDigest}, 0, ledgerPlan.rows,
+		)
 	}
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
@@ -665,6 +904,8 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultIntentBusy:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.resultCode == ResultRouteGate:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode != ResultApplied:
 		return ErrAdmissionBound
 	default:
@@ -691,6 +932,9 @@ func (m *Machine) hypotheticalState(command replication.CommandView, plan comman
 	meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 	next := m.nextState(meta, RecordNormal, normalEntryDigest(meta, command.Bytes()))
 	if err := applyCommandPlanToState(&next, plan); err != nil {
+		return State{}
+	}
+	if err := applyExecutionPinStateDelta(&next, plan.executionPinDelta); err != nil {
 		return State{}
 	}
 	return next
@@ -720,7 +964,7 @@ func applyCommandPlanToState(next *State, plan commandPlan) error {
 		next.SessionCount--
 		next.SessionSlotCount -= uint64(plan.deleteSlots)
 	}
-	return nil
+	return applySessionFenceDelta(next, plan.fenceDelta)
 }
 
 func (m *Machine) checkTransition(meta raftmodel.ApplyMeta, kind RecordKind, digest [32]byte) (bool, error) {
@@ -750,13 +994,25 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ReplicaSetVersion:   m.state.ReplicaSetVersion,
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
-		SessionEpochHighWater:    m.state.SessionEpochHighWater,
-		AuthorityBindingCount:    m.state.AuthorityBindingCount,
-		TransactionControlCount:  m.state.TransactionControlCount,
-		ActiveTransactionCount:   m.state.ActiveTransactionCount,
-		TransactionPayloadRows:   m.state.TransactionPayloadRows,
-		TransactionIntentRows:    m.state.TransactionIntentRows,
-		TransactionResidentBytes: m.state.TransactionResidentBytes,
+		SessionEpochHighWater:      m.state.SessionEpochHighWater,
+		AuthorityBindingCount:      m.state.AuthorityBindingCount,
+		TransactionControlCount:    m.state.TransactionControlCount,
+		ActiveTransactionCount:     m.state.ActiveTransactionCount,
+		TransactionPayloadRows:     m.state.TransactionPayloadRows,
+		TransactionIntentRows:      m.state.TransactionIntentRows,
+		TransactionResidentBytes:   m.state.TransactionResidentBytes,
+		RequestLedgerRows:          m.state.RequestLedgerRows,
+		RequestLedgerResidentBytes: m.state.RequestLedgerResidentBytes,
+		RequestLedgerReservedBytes: m.state.RequestLedgerReservedBytes,
+		RequestLedgerAckRows:       m.state.RequestLedgerAckRows,
+		RequestLedgerAckBytes:      m.state.RequestLedgerAckBytes,
+		ExecutionPinRecordCount:    m.state.ExecutionPinRecordCount,
+		ActiveExecutionPinCount:    m.state.ActiveExecutionPinCount,
+		ExecutionPinResidentBytes:  m.state.ExecutionPinResidentBytes,
+		RelationPlacementDigest:    m.state.RelationPlacementDigest,
+		FenceOriginDigest:          m.state.FenceOriginDigest, FenceApplied: m.state.FenceApplied,
+		HistoricalFenceCount: m.state.HistoricalFenceCount, HistoricalFenceSlots: m.state.HistoricalFenceSlots,
+		UnfencedSessionSlots: m.state.UnfencedSessionSlots,
 	}
 }
 
@@ -883,7 +1139,23 @@ func (m *Machine) planBundleCommand(
 	relationSnapshots relationPointSnapshots,
 	scratch *commandPlanScratch,
 ) (commandPlan, error) {
+	plan, err := m.planBundleCommandUnaccounted(command, applied, state, systemSnapshot, relationSnapshots, scratch)
+	if err != nil {
+		return plan, err
+	}
+	return accountSessionFencePlan(state, systemSnapshot, plan)
+}
+
+func (m *Machine) planBundleCommandUnaccounted(
+	command replication.CommandView,
+	applied uint64,
+	state State,
+	systemSnapshot pointSnapshot,
+	relationSnapshots relationPointSnapshots,
+	scratch *commandPlanScratch,
+) (commandPlan, error) {
 	scratch.begin()
+	m.canonicalMutations.begin(command, nil)
 	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
 	plan.authorityDigest = AuthorityIdentityKey(command.Tenant, command.ClientID)
 	plan.authorityKey = AuthorityBindingStorageKey(plan.authorityDigest)
@@ -996,7 +1268,7 @@ func (m *Machine) planBundleCommand(
 					existing.ClientSequence != command.ClientSequence {
 					return commandPlan{}, fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
 				}
-				if err := validateStoredSessionSlot(state, existing); err != nil {
+				if err := validateStoredSessionSlot(state, existing, sessionFenceLookup{snapshot: systemSnapshot}); err != nil {
 					return commandPlan{}, err
 				}
 				if err := validateSessionSlotAgainstHeader(session, existing); err != nil {
@@ -1100,9 +1372,64 @@ func (m *Machine) planBundleCommand(
 			plan.resultCode = ResultSessionRevoked
 			next.LeaseDeadlineUnixNano = 0
 		}
+	case replication.CommandRouteGate:
+		if !m.mutableBindingMatchesState(command, state) {
+			plan.resultCode = ResultStaleFence
+			break
+		}
+		gateCommand, openErr := command.OpenRouteGate()
+		if openErr != nil || m.routeGate == nil {
+			return commandPlan{}, errors.Join(openErr, ErrStateCorrupt)
+		}
+		outcome := m.routeGate.Preview(gateCommand)
+		if outcome.Reason == routegate.ReasonInvalid {
+			return commandPlan{}, ErrStateCorrupt
+		}
+		plan.resultCode = ResultRouteGate
+		plan.routeGateCommand = gateCommand
+		plan.routeGateApply = true
+		plan.routeGateOutcome = outcome
+		if outcome.Mutated {
+			plan.routeGateRows, err = planRouteGateRows(m.routeGate, gateCommand, outcome)
+			if err != nil {
+				return commandPlan{}, err
+			}
+		}
+	case replication.CommandSplitCaptureActivate:
+		if !m.mutableBindingMatchesState(command, state) {
+			plan.resultCode = ResultStaleFence
+			break
+		}
+		plan, err = m.planSplitCaptureActivation(plan, command, applied, state, systemSnapshot)
+		if err != nil {
+			return commandPlan{}, err
+		}
 	default:
 		if !m.mutableBindingMatchesState(command, state) {
 			plan.resultCode = ResultStaleFence
+			break
+		}
+		retainedPrune := false
+		if command.Kind() == replication.CommandRetainedPrune {
+			proof, ok := command.RetainedPruneProof()
+			binding := state.Binding
+			if !ok || proof.RetainedRange != binding.OwnedRange ||
+				proof.OwnershipEpoch != binding.OwnershipEpoch ||
+				proof.RoutingVersion != binding.RoutingVersion ||
+				proof.RouteGeneration != binding.RouteGeneration {
+				plan.resultCode = ResultStaleFence
+				break
+			}
+			retainedPrune = true
+		}
+		if command.Kind() == replication.CommandExecutionPin {
+			var executionErr error
+			plan, executionErr = m.planExecutionPinCommand(
+				plan, command, applied, state, systemSnapshot,
+			)
+			if executionErr != nil {
+				return commandPlan{}, executionErr
+			}
 			break
 		}
 		if relationSnapshots.count != uint16(len(m.relations)) {
@@ -1131,7 +1458,7 @@ func (m *Machine) planBundleCommand(
 			}
 			relation := &m.relations[ordinal]
 			changes, affectedRows, code, planErr := m.planMutations(
-				relation, batch, relationSnapshots.values[ordinal], scratch,
+				relation, batch, relationSnapshots.values[ordinal], scratch, retainedPrune,
 			)
 			if planErr != nil {
 				return commandPlan{}, planErr
@@ -1193,6 +1520,20 @@ func (m *Machine) planBundleCommand(
 		}
 		next.PhysicalSlotCount++
 		plan.newPhysicalSlot = true
+	}
+	if command.Kind() == replication.CommandRouteGate {
+		plan.routeGateResultKey, err = routeGateResultStorageKey(plan.sessionDigest, slot)
+		if err != nil {
+			return commandPlan{}, err
+		}
+		plan.routeGateResult, err = appendRouteGateResult(plan.routeGateResult[:0], routeGateResultRecord{
+			SessionDigest: plan.sessionDigest, Slot: slot,
+			ClientEpoch: command.ClientEpoch, ClientSequence: command.ClientSequence,
+			Outcome: plan.routeGateOutcome,
+		})
+		if err != nil {
+			return commandPlan{}, err
+		}
 	}
 	next.HighSequence = command.ClientSequence
 	next.AckThrough = command.AckThrough
@@ -1263,7 +1604,7 @@ func (m *Machine) planSessionOpen(
 			record.ClientEpoch != session.ClientEpoch {
 			return commandPlan{}, fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
 		}
-		if err := validateStoredSessionSlot(state, record); err != nil {
+		if err := validateStoredSessionSlot(state, record, sessionFenceLookup{snapshot: systemSnapshot}); err != nil {
 			return commandPlan{}, err
 		}
 		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
@@ -1457,7 +1798,7 @@ func (m *Machine) planSessionRelease(
 			record.ClientEpoch != session.ClientEpoch {
 			return fmt.Errorf("%w: release slot mismatch", ErrSessionCorrupt)
 		}
-		if err := validateStoredSessionSlot(state, record); err != nil {
+		if err := validateStoredSessionSlot(state, record, sessionFenceLookup{snapshot: systemSnapshot}); err != nil {
 			return err
 		}
 		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
@@ -1527,6 +1868,7 @@ func (m *Machine) planMutations(
 	batch replication.RelationBatchView,
 	snapshot pointSnapshot,
 	scratch *commandPlanScratch,
+	retainedPrune bool,
 ) ([]finalMutation, int64, uint32, error) {
 	if relation == nil || relation.target.Collection == nil {
 		return nil, 0, 0, ErrInvalidCollection
@@ -1621,7 +1963,16 @@ func (m *Machine) planMutations(
 			return nil, 0, ResultTargetBound, nil
 		}
 		if !mutation.delete {
-			if err := vibejson.Validate(mutation.value); err != nil {
+			if relation.kind == RelationJSON {
+				value, code := m.canonicalMutationValue(mutation.value)
+				if code != ResultApplied {
+					return nil, 0, code, nil
+				}
+				mutation.value = value
+				if len(value) > target.Limits.MaxDocumentBytes {
+					return nil, 0, ResultTargetBound, nil
+				}
+			} else if err := vibejson.Validate(mutation.value); err != nil {
 				return nil, 0, ResultInvalidDocument, nil
 			}
 			if relation.kind == RelationGlobalIndex &&
@@ -1646,16 +1997,28 @@ func (m *Machine) planMutations(
 				validation = target.Validator.ValidatePut(mutation.key, mutation.value)
 			}
 			if validation == MutationValidationAccept {
-				if ownership, ok := target.Validator.(OwnershipMutationValidator); ok {
-					if mutation.delete {
-						validation = ownership.ValidateDeleteOwnership(
-							mutation.key, current, found, m.state.Binding.OwnedRange,
+				ownership := validateRelationMutationOwnership(
+					target.Validator, mutation, current, found, m.state.Binding.OwnedRange,
+				)
+				if retainedPrune {
+					switch {
+					case !mutation.delete:
+						validation = MutationValidationInvalid
+					case relation.kind == RelationGlobalIndex:
+						// Global rows move by their own authenticated key
+						// profile, independently of the base row's placement.
+						validation = validateGlobalRetainedPrune(
+							relation.globalIndex, mutation.key, m.state.Binding.OwnedRange,
 						)
-					} else {
-						validation = ownership.ValidatePutOwnership(
-							mutation.key, mutation.value, m.state.Binding.OwnedRange,
-						)
+					case !found, ownership == MutationValidationWrongShard:
+						validation = MutationValidationAccept
+					case ownership == MutationValidationAccept:
+						validation = MutationValidationWrongShard
+					default:
+						validation = ownership
 					}
+				} else {
+					validation = ownership
 				}
 			}
 			switch validation {
@@ -1765,6 +2128,31 @@ func (m *Machine) planMutations(
 		return bytes.Compare(left.key, right.key)
 	})
 	return changes, affectedRows, ResultApplied, nil
+}
+
+// validateRelationMutationOwnership applies the mutable placement fence after
+// the immutable row/schema validator. A validator that cannot decode the
+// relation's physical key grammar is compatible only while the group owns the
+// complete keyspace. Once ownership narrows, accepting such a mutation would
+// guess which split owns it; refuse instead. This covers independently keyed
+// global-index relations while preserving pre-split bundle compatibility.
+func validateRelationMutationOwnership(
+	validator MutationValidator,
+	mutation finalMutation,
+	current []byte,
+	found bool,
+	owned distribution.KeyRange,
+) MutationValidation {
+	if ownership, ok := validator.(OwnershipMutationValidator); ok {
+		if mutation.delete {
+			return ownership.ValidateDeleteOwnership(mutation.key, current, found, owned)
+		}
+		return ownership.ValidatePutOwnership(mutation.key, mutation.value, owned)
+	}
+	if completeOwnershipRange(owned) {
+		return MutationValidationAccept
+	}
+	return MutationValidationWrongShard
 }
 
 func finalMutationCondition(kind replication.MutationKind) mutationCondition {
@@ -1892,6 +2280,7 @@ func (m *Machine) releaseMutationPlan() {
 	m.bundlePlan = m.bundlePlan[:0]
 	clear(m.bundleRelations)
 	m.bundleRelations = m.bundleRelations[:0]
+	m.canonicalMutations.release()
 }
 
 // pointSnapshot is the planning capability. It exposes point reads plus one
@@ -1973,6 +2362,7 @@ func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
 	clientID replication.ID128, retryWindow uint16) error {
 	for _, class := range [...]replication.CommandAuthorityClass{
 		replication.CommandAuthorityData, replication.CommandAuthorityTopology,
+		replication.CommandAuthorityExecutionPin,
 	} {
 		digest := SessionKey(class, tenant, clientID)
 		key := SessionStorageKey(digest)
@@ -2126,6 +2516,15 @@ func (m *Machine) persistTransitionRows(
 	transactionRows []transactionRowMutation,
 ) error {
 	defer m.releaseCaptureChanges()
+	nextPlacements, err := m.nextRelationPlacements(changes, plan)
+	if err != nil {
+		return err
+	}
+	if next.LastKind != RecordSchema {
+		next.RelationPlacementDigest = relationPlacementStateDigestWith(
+			next.Binding.SchemaGeneration, m.manifestDigest, m.relations, &nextPlacements,
+		)
+	}
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
@@ -2148,8 +2547,8 @@ func (m *Machine) persistTransitionRows(
 	if err != nil {
 		return err
 	}
-	if err := m.checkTransitionCapacityWithCaptureRows(
-		next, changes, plan, len(captureRecord), transactionRows,
+	if err := m.checkTransitionCapacityWithStateBytes(
+		len(stateEnvelope), changes, plan, len(captureRecord), transactionRows,
 	); err != nil {
 		return err
 	}
@@ -2167,6 +2566,10 @@ func (m *Machine) persistTransitionRows(
 		systemDocuments += 1 + int(plan.deleteSlots)
 	}
 	systemDocuments += len(transactionRows)
+	systemDocuments += len(plan.routeGateRows)
+	if len(plan.routeGateResult) != 0 {
+		systemDocuments++
+	}
 	m.transitionMembers = m.transitionMembers[:0]
 	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
@@ -2234,6 +2637,22 @@ func (m *Machine) persistTransitionRows(
 				return err
 			}
 		}
+		for i := range plan.routeGateRows {
+			row := &plan.routeGateRows[i]
+			if row.delete {
+				err = systemBatch.Delete(row.key)
+			} else {
+				err = systemBatch.Put(row.key, row.value)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if len(plan.routeGateResult) != 0 {
+			if err = systemBatch.Put(plan.routeGateResultKey[:], plan.routeGateResult); err != nil {
+				return err
+			}
+		}
 		if len(captureRecord) != 0 {
 			captureBatch, captureErr := batch.CollectionHandle(m.captureTarget.Collection)
 			if captureErr != nil {
@@ -2286,6 +2705,11 @@ func (m *Machine) persistTransitionRows(
 	if err != nil {
 		return err
 	}
+	if plan.routeGateApply {
+		if outcome := m.routeGate.Apply(plan.routeGateCommand); outcome != plan.routeGateOutcome {
+			return ErrStateCorrupt
+		}
+	}
 	if len(changes) == 0 && m.openedBundleImageCurrent() {
 		m.openedImageApplied = next.Applied
 		for i := range m.relations {
@@ -2300,6 +2724,14 @@ func (m *Machine) persistTransitionRows(
 			relation.openedGen = 0
 			relation.openedImage = [sha256.Size]byte{}
 		}
+	}
+	for i := range m.relations {
+		if m.relations[i].kind != RelationGlobalIndex {
+			continue
+		}
+		m.relations[i].placement = nextPlacements[i]
+		m.relations[i].placementApplied = next.Applied
+		m.relations[i].placementGen = m.relations[i].target.Collection.Generation()
 	}
 	m.state = next
 	if m.binding.Distribution != next.Binding.Distribution {
@@ -2338,8 +2770,8 @@ func (m *Machine) checkTransitionCapacity(
 			return errors.Join(ErrTransitionCapture, err)
 		}
 	}
-	return m.checkTransitionCapacityWithCapture(
-		next, changes, plan, captureBytes,
+	return m.checkTransitionCapacityWithCaptureRows(
+		next, changes, plan, captureBytes, plan.systemRows,
 	)
 }
 
@@ -2379,11 +2811,27 @@ func (m *Machine) checkTransitionCapacityWithCaptureRows(
 	captureBytes int,
 	transactionRows []transactionRowMutation,
 ) error {
-	stateEnvelope, err := AppendState(nil, next)
+	stateEnvelopeBytes, err := validatedStateSize(next)
 	if err != nil {
 		return err
 	}
-	stateBytes := len(stateKey) + len(stateEnvelope)
+	return m.checkTransitionCapacityWithStateBytes(stateEnvelopeBytes, changes, plan, captureBytes, transactionRows)
+}
+
+// checkTransitionCapacityWithStateBytes consumes only an exact size from
+// validatedStateSize or AppendState. Singleton persistence already encoded and
+// fully validated the state; it must not repeat that work just to count bytes.
+func (m *Machine) checkTransitionCapacityWithStateBytes(
+	stateEnvelopeBytes int,
+	changes []finalMutation,
+	plan commandPlan,
+	captureBytes int,
+	transactionRows []transactionRowMutation,
+) error {
+	if stateEnvelopeBytes < stateHeaderBytes+recordChecksumLen || stateEnvelopeBytes > MaxStateEnvelopeBytes {
+		return ErrAdmissionBound
+	}
+	stateBytes := len(stateKey) + stateEnvelopeBytes
 	systemDocs := 1
 	if plan.writeAuthority {
 		if len(plan.authorityRecord) < authorityBindingHeaderBytes+1+recordChecksumLen ||
@@ -2430,7 +2878,26 @@ func (m *Machine) checkTransitionCapacityWithCaptureRows(
 		stateBytes += len(row.key) + len(row.value)
 		systemDocs++
 	}
-	if len(stateEnvelope) > m.system.Limits.MaxDocumentBytes ||
+	for i := range plan.routeGateRows {
+		row := &plan.routeGateRows[i]
+		if len(row.key) == 0 || (!row.delete && (len(row.value) == 0 ||
+			len(row.value) > m.system.Limits.MaxDocumentBytes)) ||
+			stateBytes > math.MaxInt-len(row.key)-len(row.value) {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(row.key) + len(row.value)
+		systemDocs++
+	}
+	if len(plan.routeGateResult) != 0 {
+		if plan.resultCode != ResultRouteGate ||
+			len(plan.routeGateResult) != routeGateResultBytes ||
+			stateBytes > math.MaxInt-len(plan.routeGateResultKey)-len(plan.routeGateResult) {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(plan.routeGateResultKey) + len(plan.routeGateResult)
+		systemDocs++
+	}
+	if stateEnvelopeBytes > m.system.Limits.MaxDocumentBytes ||
 		systemDocs > m.system.Limits.MaxDistinctMutations ||
 		stateBytes > m.system.Limits.MaxBatchBytes {
 		return ErrAdmissionBound

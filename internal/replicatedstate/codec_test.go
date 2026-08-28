@@ -348,12 +348,12 @@ func openCodecLogicalCommand(t testing.TB, command replication.Command) replicat
 
 func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 	if ValidationOpaqueBinary != 1 || ValidationDeterministicMutation != 2 ||
-		ResultFormatMutation != 1 ||
+		ResultFormatMutation != 1 || ResultFormatRouteGate != 3 ||
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownRelation != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
 		ResultSessionRetired != 7 || ResultSessionOpened != 8 ||
 		ResultSessionRenewed != 9 || ResultSessionRevoked != 10 ||
-		ResultIndexConflict != 11 || ResultIntentBusy != 12 {
+		ResultIndexConflict != 11 || ResultIntentBusy != 12 || ResultRouteGate != 13 {
 		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,

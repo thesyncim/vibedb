@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/splitcapture"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -22,6 +23,8 @@ type nativeSessionClient struct {
 	stateAfterUnknown   shardservice.ReplicatedMemberState
 	unknownMutationOnce bool
 	mutationUnknownSeen bool
+	unknownKind         replication.CommandKind
+	unknownKindSeen     bool
 	preAdmissionRetry   bool
 	unknownCommand      []byte
 	retriedCommand      []byte
@@ -29,6 +32,32 @@ type nativeSessionClient struct {
 	probes              int
 	lastMutationCount   int
 	proposalMembers     []uint64
+}
+
+func TestExactRelationResolverRejectsUnboundRelationAndEmitsDenseIDs(t *testing.T) {
+	resolver := ExactRelationResolver{Base: 1, Relations: []replication.RelationID{3}}
+	builder := newRelationBundleBuilder(2, 2)
+	if err := resolver.ResolveNative(&builder, NativeMutation{
+		Relation: 1, Kind: replication.MutationDeleteDigestEqual, Key: []byte("base"),
+		ExpectedValueLength: 4, ExpectedValueDigest: replication.Digest{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolver.ResolveNative(&builder, NativeMutation{
+		Relation: 3, Kind: replication.MutationDeleteDigestEqual, Key: []byte("index"),
+		ExpectedValueLength: 5, ExpectedValueDigest: replication.Digest{2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(builder.batches) != 2 || builder.batches[0].Relation != 1 || builder.batches[1].Relation != 3 {
+		t.Fatalf("relation batches = %+v", builder.batches)
+	}
+	builder.reset()
+	if err := resolver.ResolveNative(&builder, NativeMutation{
+		Relation: 2, Kind: replication.MutationDelete, Key: []byte("foreign"),
+	}); !errors.Is(err, ErrNativeBundleBound) {
+		t.Fatalf("unbound relation error = %v", err)
+	}
 }
 
 func (client *nativeSessionClient) DoReplicated(
@@ -46,11 +75,25 @@ func (client *nativeSessionClient) DoReplicated(
 	if err != nil {
 		return nil, err
 	}
-	if command.Kind() == replication.CommandMutationBatch {
+	if len(client.unknownCommand) != 0 && bytes.Equal(client.unknownCommand, request.Command) {
+		client.retriedCommand = append(client.retriedCommand[:0], request.Command...)
+	}
+	if command.Kind() == client.unknownKind && client.unknownKind != 0 &&
+		!client.unknownKindSeen {
+		client.unknownKindSeen = true
+		client.unknownCommand = append(client.unknownCommand[:0], request.Command...)
+		return nil, errors.New("connection disappeared after exact lifecycle frame")
+	}
+	if command.Kind() == client.unknownKind && client.unknownKindSeen {
+		client.retriedCommand = append(client.retriedCommand[:0], request.Command...)
+	}
+	isMutation := command.Kind() == replication.CommandMutationBatch ||
+		command.Kind() == replication.CommandRetainedPrune
+	if isMutation {
 		client.lastMutationCount = command.MutationCount()
 		client.proposalMembers = append(client.proposalMembers, endpoint.Member)
 	}
-	if command.Kind() == replication.CommandMutationBatch && client.unknownMutationOnce &&
+	if isMutation && client.unknownMutationOnce &&
 		!client.mutationUnknownSeen {
 		client.mutationUnknownSeen = true
 		client.unknownCommand = append([]byte(nil), request.Command...)
@@ -59,11 +102,11 @@ func (client *nativeSessionClient) DoReplicated(
 		}
 		return nil, errors.New("connection disappeared after exact frame")
 	}
-	if command.Kind() == replication.CommandMutationBatch && client.mutationUnknownSeen &&
+	if isMutation && client.mutationUnknownSeen &&
 		len(client.retriedCommand) == 0 {
 		client.retriedCommand = append([]byte(nil), request.Command...)
 	}
-	if command.Kind() == replication.CommandMutationBatch && client.mutationUnknownSeen &&
+	if isMutation && client.mutationUnknownSeen &&
 		client.preAdmissionRetry {
 		return &shardservice.ReplicatedResponse{
 			Kind:     shardservice.ReplicatedRefusal,
@@ -210,6 +253,60 @@ func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	}
 	if client.probes != retryProbes {
 		t.Fatalf("steady native session added probes: after-retry=%d final=%d", retryProbes, client.probes)
+	}
+}
+
+func TestNativeSessionSplitCaptureActivationRetainsExactUnknownCommand(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	client := &nativeSessionClient{
+		state: states["m2"], unknownKind: replication.CommandSplitCaptureActivate,
+	}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("split:test"), ClientID: replication.ID128{19},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		RetryHome:          replication.RetryHome{7},
+		Resolver:           BaseRelationResolver{Relation: 1},
+		MaxRelationBatches: 1, MaxMutations: 1,
+		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(t.Context(), time.Now().Add(time.Minute).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	body, err := splitcapture.AppendCommand(nil, splitcapture.Command{
+		Operation: [32]byte{1}, PlanDigest: [32]byte{2},
+		PartitionerDigest: [32]byte{3}, RelationManifestDigest: [32]byte{4},
+		LineageDigest: [32]byte{5}, BindingDigest: [32]byte{6},
+		PriorEntryDigest: [32]byte{7}, PriorDataChainDigest: [32]byte{8},
+		PriorApplied: 9, PriorTerm: 10, SourceGeneration: 11, SchemaGeneration: 12,
+		Spec: []byte("portable"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.SplitCaptureActivate(t.Context(), body); !errors.Is(err, raftservice.ErrOutcomeUnknown) ||
+		!session.Status().Pending {
+		t.Fatalf("activation unknown=%v status=%+v", err, session.Status())
+	}
+	pending := session.PendingCommand()
+	view, err := replication.OpenCommand(pending)
+	if err != nil || view.Kind() != replication.CommandSplitCaptureActivate ||
+		!bytes.Equal(view.SplitCaptureActivationBytes(), body) ||
+		nativeCommandViewFingerprint(view) != view.Fingerprint {
+		t.Fatalf("pending activation view=%+v err=%v", view, err)
+	}
+	result, err := session.RetryPending(t.Context())
+	if err != nil || result.Completion.ResultCode != replicatedstate.ResultApplied ||
+		!bytes.Equal(client.unknownCommand, client.retriedCommand) {
+		t.Fatalf("retry result=%+v err=%v exact=%v", result, err,
+			bytes.Equal(client.unknownCommand, client.retriedCommand))
 	}
 }
 
@@ -641,7 +738,8 @@ func TestNativeTransactionCompletionBindsValidatedRoleOperationAndFixedResult(t 
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedCommitCoordinator,
 		ID:        id, ExpectedRevision: 1,
-		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		PayloadKind:     distributedtxn.ReplicatedPayloadNone,
+		ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{1},
 	})
 	if err != nil {
 		t.Fatal(err)

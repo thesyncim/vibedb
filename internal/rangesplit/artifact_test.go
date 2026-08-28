@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibejson"
 )
 
 type childArtifactTestRow struct {
@@ -398,7 +399,7 @@ func documentsForChild(t testing.TB, partitioner *Partitioner, child, count int)
 	documents := make([][]byte, 0, count)
 	var workspace distribution.DocumentPointWorkspace
 	for sequence := 0; sequence < 1_000_000 && len(documents) < count; sequence++ {
-		document := []byte(fmt.Sprintf(`{"tenant":"acme","sequence":%d}`, sequence))
+		document := []byte(fmt.Sprintf(`{"sequence":%d,"tenant":"acme"}`, sequence))
 		point, err := partitioner.program.Point(document, &workspace)
 		if err != nil {
 			t.Fatal(err)
@@ -448,5 +449,9 @@ func childArtifactDocumentPayload(document []byte, payloadBytes int) []byte {
 	result = append(result, `,"payload":"`...)
 	result = append(result, bytes.Repeat([]byte{'x'}, payloadBytes)...)
 	result = append(result, '"', '}')
-	return result
+	canonical, err := vibejson.Canonicalize(result)
+	if err != nil {
+		panic(err)
+	}
+	return canonical
 }

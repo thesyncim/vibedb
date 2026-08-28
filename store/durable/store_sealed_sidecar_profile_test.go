@@ -46,7 +46,16 @@ func TestSealedRecoveryJournalAdmitsReplicatedSQLCeiling(t *testing.T) {
 	options := syncPrimaryJournalTestOptions()
 	options.MaxBatchDocuments = 64
 	options.MaxBatchBytes = (16 << 20) + options.MaxBatchDocuments*256
-	options.SealedRecoveryJournalBytes = storeio.RecoveryJournalMaxCapacityBytes
+	// Data-only shards keep their exact original budget even when the ledger
+	// profile requires a larger global maximum.
+	options.SealedRecoveryJournalBytes = uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		storeio.RecoveryJournalMinSectorSize, options.MaxBatchDocuments,
+		options.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+	))
+	if options.SealedRecoveryJournalBytes != 16794624 ||
+		options.SealedRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes {
+		t.Fatalf("data-only journal budget changed: %d", options.SealedRecoveryJournalBytes)
+	}
 	if _, err := options.normalized(); err != nil {
 		t.Fatalf("replicated SQL ceiling profile: %v", err)
 	}

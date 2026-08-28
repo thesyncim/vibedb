@@ -9,8 +9,10 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -34,6 +36,9 @@ func TestReplicatedCatalogExactRF3RoundTripAndAllocationFreeRoute(t *testing.T) 
 		if !ok || route.Group != descriptor.Group ||
 			route.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
 			route.Command != descriptor.Command ||
+			route.RangeIdentity != descriptor.RangeIdentity ||
+			route.LineageDigest != descriptor.LineageDigest ||
+			route.ForwardingRuleDigest != descriptor.ForwardingRuleDigest ||
 			len(route.Replicas) != ServingReplicaCount {
 			t.Fatalf("resolved route = %+v,%v", route, ok)
 		}
@@ -63,6 +68,70 @@ func TestReplicatedCatalogExactRF3RoundTripAndAllocationFreeRoute(t *testing.T) 
 		t.Fatal(err)
 	}
 	assertRoute(loaded)
+}
+
+func TestReplicatedCatalogRejectsMissingLogicalRangeAuthority(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	for name, clear := range map[string]func(*ReplicatedShardDescriptor){
+		"range identity": func(value *ReplicatedShardDescriptor) {
+			value.RangeIdentity = replication.Digest{}
+		},
+		"lineage digest": func(value *ReplicatedShardDescriptor) {
+			value.LineageDigest = replication.Digest{}
+		},
+		"forwarding rule digest": func(value *ReplicatedShardDescriptor) {
+			value.ForwardingRuleDigest = replication.Digest{}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := descriptor
+			clear(&invalid)
+			if _, err := NewSnapshotWithReplicatedMetadata(
+				config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{invalid},
+			); err == nil {
+				t.Fatal("catalog accepted missing logical range authority")
+			}
+		})
+	}
+}
+
+func TestReplicatedCatalogFreezesLogicalRangeAuthorityWithinAllocation(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	current, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = initialCatalogState(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*ReplicatedShardDescriptor){
+		"range identity": func(value *ReplicatedShardDescriptor) {
+			value.RangeIdentity[1]++
+		},
+		"lineage digest": func(value *ReplicatedShardDescriptor) {
+			value.LineageDigest[1]++
+		},
+		"forwarding rule digest": func(value *ReplicatedShardDescriptor) {
+			value.ForwardingRuleDigest[1]++
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := descriptor
+			change(&changed)
+			next, err := NewSnapshotWithReplicatedMetadata(
+				config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{changed},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := advanceCatalogState(current, next); err == nil {
+				t.Fatal("catalog accepted changed logical range authority within one allocation")
+			}
+		})
+	}
 }
 
 func TestReplicatedCatalogSeparatesEnrolledTargetFromServingRF3(t *testing.T) {
@@ -126,6 +195,46 @@ func TestReplicatedCatalogSeparatesEnrolledTargetFromServingRF3(t *testing.T) {
 		config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{duplicate},
 	); err == nil {
 		t.Fatal("catalog accepted an enrolled target that repeats a serving member")
+	}
+}
+
+func TestBuildReplicaReplacementMembershipGrantBindsCompleteEnrolledIdentity(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	testReplicatedCatalogEnrollTarget(&descriptor)
+	snapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := BuildReplicaReplacementMembershipGrant(
+		snapshot, descriptor.Group, [16]byte{0x91}, 7,
+		descriptor.Replicas[0].Member, descriptor.EnrolledTarget.Member,
+	)
+	if err != nil || !grant.Valid() || grant.CatalogGeneration != snapshot.Generation() ||
+		grant.InitialReplicaSetVersion != descriptor.Command.ReplicaSetVersion ||
+		grant.TargetNode != [16]byte(descriptor.EnrolledTarget.Node) ||
+		!replicatedCatalogCertifiesInitialGrant(snapshot, grant) {
+		t.Fatalf("grant=%+v err=%v", grant, err)
+	}
+	changed := descriptor
+	target := *descriptor.EnrolledTarget
+	target.StoreID[0]++
+	changed.EnrolledTarget = &target
+	changedSnapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{changed},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedGrant, err := BuildReplicaReplacementMembershipGrant(
+		changedSnapshot, changed.Group, grant.TransitionID, grant.MetadataEpoch,
+		grant.SourceMember, grant.TargetMember,
+	)
+	if err != nil || changedGrant.InitialDescriptorDigest == grant.InitialDescriptorDigest ||
+		replicatedCatalogCertifiesInitialGrant(changedSnapshot, grant) {
+		t.Fatalf("target identity was not bound: original=%x changed=%x err=%v",
+			grant.InitialDescriptorDigest, changedGrant.InitialDescriptorDigest, err)
 	}
 }
 
@@ -295,6 +404,93 @@ func TestManifestTransitionConsumesExplicitInstalledRF3Fence(t *testing.T) {
 	}
 }
 
+func TestBuildReplicaReplacementTransitionRequiresExactCertifiedRF3Successor(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	current, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = initialCatalogState(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, 6, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace [ServingReplicaCount]ReplicatedEndpoint
+	route, ok := next.ResolveReplicatedRoute(
+		descriptor.Distribution, descriptor.Shard, workspace[:0],
+	)
+	if !ok || route.Command != command || route.Replicas[0].Member != grant.TargetMember ||
+		route.Replicas[0].Node != target.Node || route.Replicas[1].Member != 2 ||
+		route.Replicas[2].Member != 3 {
+		t.Fatalf("replacement route=%+v ok=%v", route, ok)
+	}
+	if _, err = advanceCatalogState(current, next); err == nil {
+		t.Fatal("ordinary catalog transition accepted a certified roster change without its grant")
+	}
+
+	wrongTarget := target
+	wrongTarget.Member++
+	if _, err = BuildReplicaReplacementTransition(
+		current, manifest, 6, grant, wrongTarget, command,
+	); err == nil {
+		t.Fatal("replacement accepted a target outside the grant")
+	}
+	wrongCommand := command
+	wrongCommand.SchemaGeneration++
+	wrongCommand.RelationManifestDigest[0]++
+	if _, err = BuildReplicaReplacementTransition(
+		current, manifest, 6, grant, target, wrongCommand,
+	); err == nil {
+		t.Fatal("replacement accepted an unrelated serving-fence change")
+	}
+}
+
+func testCertifiedReplicaReplacement(
+	t testing.TB,
+	current *Snapshot,
+	descriptor ReplicatedShardDescriptor,
+) (membershipgrant.Grant, *distribution.Manifest, ReplicatedReplicaDescriptor, raftservice.CommandFence) {
+	t.Helper()
+	grant := testReplicatedMembershipGrant(descriptor.Group)
+	grant.CatalogGeneration = current.Generation()
+	grant.InitialReplicaSetVersion = descriptor.Command.ReplicaSetVersion
+	grant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(current, 0)
+	grant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(current, 0)
+	manifest, ok := current.Manifest(descriptor.Distribution)
+	if !ok {
+		t.Fatal("replacement manifest missing")
+	}
+	ordinal, metadata := manifestShardOrdinal(manifest, descriptor.Shard)
+	if ordinal < 0 {
+		t.Fatal("replacement shard missing")
+	}
+	nextManifest, err := manifest.ReplaceShardLeader(
+		ordinal, manifest.Version()+1, 0, "ep-b", metadata.Epoch+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := ReplicatedReplicaDescriptor{
+		Member: grant.TargetMember, Node: grant.TargetNode, StoreID: [16]byte{14},
+		NodeIncarnation: 24, Endpoint: "ep-b", NativeEndpoint: "ep-b-native",
+		ControlEndpoint: "ep-b-control",
+	}
+	command := descriptor.Command
+	command.ReplicaSetVersion += 3
+	command.OwnershipEpoch++
+	command.RoutingVersion++
+	command.RouteGeneration++
+	return grant, nextManifest, target, command
+}
+
 func TestReplicatedCatalogRejectsManifestReplicaMismatch(t *testing.T) {
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
 	descriptor.Replicas[0].Endpoint, descriptor.Replicas[1].Endpoint =
@@ -352,9 +548,11 @@ func testReplicatedCatalogInput(
 	endpoints := testEndpoints()
 	endpoints["ep-c"] = "127.0.0.1:7003"
 	endpoints["ep-d"] = "127.0.0.1:7004"
+	endpoints["ep-b-native"] = "127.0.0.1:7102"
 	endpoints["ep-a-native"] = "127.0.0.1:7101"
 	endpoints["ep-c-native"] = "127.0.0.1:7103"
 	endpoints["ep-d-native"] = "127.0.0.1:7104"
+	endpoints["ep-b-control"] = "127.0.0.1:7202"
 	endpoints["ep-a-control"] = "127.0.0.1:7201"
 	endpoints["ep-c-control"] = "127.0.0.1:7203"
 	endpoints["ep-d-control"] = "127.0.0.1:7204"
@@ -368,6 +566,11 @@ func testReplicatedCatalogInput(
 	descriptor := ReplicatedShardDescriptor{
 		Distribution: manifest.Distribution(), Shard: first.ID, Group: group,
 		AllocationGeneration: first.AllocationGeneration,
+		RangeIdentity:        replication.Digest{0x71}, LineageDigest: replication.Digest{0x72},
+		ForwardingRuleDigest: replication.Digest{0x73},
+		RequestLedgerRanges: []DurableRequestLedgerRangeDescriptor{{
+			Identity: replication.Digest{0x91},
+		}},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
 			OwnershipEpoch: uint64(first.Epoch), SchemaGeneration: 8,
@@ -381,6 +584,16 @@ func testReplicatedCatalogInput(
 		},
 	}
 	return config, endpoints, descriptor
+}
+
+func testReplicatedCatalogEnrollTarget(descriptor *ReplicatedShardDescriptor) {
+	if descriptor == nil {
+		return
+	}
+	descriptor.EnrolledTarget = &ReplicatedReplicaDescriptor{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+		Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control",
+	}
 }
 
 func TestDecodeFixed16HexRejectsNonCanonicalWidth(t *testing.T) {

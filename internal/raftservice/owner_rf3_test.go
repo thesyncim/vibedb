@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -320,6 +322,20 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
+	backupCut, err := owners[leader].ReadLinearizableSnapshot(ctx, LinearizableSnapshotRequest{
+		Fence: leaderState.Fence(), Capability: serviceauthz.CapabilityBackup,
+	})
+	if err != nil || backupCut.Snapshot() == nil || backupCut.Snapshot().Fence().Applied < linearRead.Applied {
+		t.Fatalf("ReadIndex backup cut=%v err=%v", backupCut, err)
+	}
+	if err = backupCut.Close(); err != nil || backupCut.Snapshot() != nil {
+		t.Fatalf("close backup cut snapshot=%v err=%v", backupCut.Snapshot(), err)
+	}
+	if denied, deniedErr := owners[leader].ReadLinearizableSnapshot(ctx, LinearizableSnapshotRequest{
+		Fence: leaderState.Fence(), Capability: serviceauthz.CapabilityTopology,
+	}); denied != nil || !errors.Is(deniedErr, ErrInvalidOwner) {
+		t.Fatalf("topology backup cut=%v err=%v", denied, deniedErr)
+	}
 	staleTerm := leaderState.Fence()
 	staleTerm.Term--
 	if _, lease, err := owners[leader].ReadPoint(ctx, PointReadRequest{
@@ -584,21 +600,49 @@ func newRF3RuntimeWithGlobalIndex(
 	memberID uint64,
 	globalIndex bool,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	return newRF3RuntimeForTestGroup(t, memberID, 0, globalIndex)
+}
+
+func newRF3RuntimeForTestGroup(
+	t testing.TB,
+	memberID uint64,
+	group int,
+	globalIndex bool,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
+	identity := rf3RuntimeTestIdentity(memberID, group)
+	return newRF3RuntimeForTestIdentity(t, identity, group, globalIndex)
+}
+
+func rf3RuntimeTestIdentity(memberID uint64, group int) raftstore.Identity {
+	distributionName := "orders"
+	if group != 0 {
+		distributionName = fmt.Sprintf("orders-%d", group)
+	}
 	identity := raftstore.Identity{
-		Distribution: "orders", Shard: "0000-ffff",
-		AllocationGeneration: 7, MemberID: memberID,
+		Distribution: distributionName, Shard: "0000-ffff",
+		AllocationGeneration: uint64(7 + group), MemberID: memberID,
 	}
 	for index := range identity.ClusterID {
 		identity.ClusterID[index] = byte(index + 1)
 		identity.ClusterIncarnation[index] = byte(index + 21)
-		identity.ShardIncarnation[index] = byte(index + 41)
-		identity.GroupID[index] = byte(index + 61)
-		identity.StoreID[index] = byte(index+81) ^ byte(memberID)
+		identity.ShardIncarnation[index] = byte(index + 41 + group*17)
+		identity.GroupID[index] = byte(index + 61 + group*17)
+		identity.StoreID[index] = byte(index+81+group*17) ^ byte(memberID)
 	}
+	// Uniform shifts of two complete 16-byte IDs preserve the low hash bit.
+	// Salt one byte so adjacent fixture groups exercise separate owner lanes.
+	identity.GroupID[15] ^= byte(group)
+	return identity
+}
+
+func newRF3RuntimeForTestIdentity(t testing.TB, identity raftstore.Identity, group int,
+	globalIndex bool,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	t.Helper()
 	key := raftstore.Key{ID: "rf3-serving-key", Wrapped: []byte("opaque-wrapped-key")}
 	for index := range key.Material {
-		key.Material[index] = byte(index + 1)
+		key.Material[index] = byte(index + 1 + group)
 	}
 	baseIndex, baseTerm := uint64(1), uint64(1)
 	wal, err := raftstore.Create(
@@ -662,6 +706,10 @@ func newRF3RuntimeWithGlobalIndex(
 			binding, "docs", []sqldriver.ReplicatedGlobalIndexRelation{{
 				Relation: 2, Table: "email_claims", IndexID: 41,
 				Incarnation: 7, LocatorCount: 1, Unique: true,
+				KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+				TupleVersion:  distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion,
+				BucketBits:    distribution.DefaultVirtualBucketBits,
 			}},
 		)
 	} else {

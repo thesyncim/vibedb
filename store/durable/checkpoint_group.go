@@ -311,6 +311,9 @@ type CheckpointGroup struct {
 	closed              bool
 	closeErr            error
 	poison              error
+	// Only successful local publication or an explicit recovery fence may
+	// make a membership retry device-silent. Readable bytes alone do not.
+	membershipDurableSequence uint64
 
 	visibleApplied atomic.Uint64
 	visibleTxn     atomic.Uint64
@@ -339,6 +342,9 @@ const (
 	checkpointGroupAfterCertificateRename
 	checkpointGroupAfterPrepareAppend
 	checkpointGroupAfterDecisionAppend
+	checkpointGroupAfterMembershipWrite
+	checkpointGroupAfterMembershipSync
+	checkpointGroupAfterMembershipDirectorySync
 )
 
 var (
@@ -753,7 +759,7 @@ func newCheckpointGroup(
 	}()
 	for _, collection := range order {
 		if collection.closed || collection.checkpointGroup.Load() != nil ||
-			collection.checkpointGroupRetired.Load() {
+			collection.checkpointGroupRetired.Load() || collection.onlineCompactionFlight.Load() {
 			return nil, ErrCheckpointGroupOwned
 		}
 	}
@@ -1089,7 +1095,8 @@ func (g *CheckpointGroup) attachLocked() error {
 		}
 	}()
 	for _, c := range order {
-		if c.closed || c.checkpointGroup.Load() != nil || c.checkpointGroupRetired.Load() {
+		if c.closed || c.checkpointGroup.Load() != nil || c.checkpointGroupRetired.Load() ||
+			c.onlineCompactionFlight.Load() {
 			return ErrCheckpointGroupOwned
 		}
 	}
@@ -1435,7 +1442,7 @@ func (g *CheckpointGroup) Seed(
 			}
 			continue
 		}
-		err = g.commitTransitionLocked(1, applied, dirty, byName)
+		err = g.commitTransitionLocked(1, applied, dirty, byName, limits)
 		if errors.Is(err, ErrCheckpointGroupPressure) {
 			if err := g.checkpointLocked(); err != nil {
 				return err
@@ -1692,7 +1699,7 @@ func (g *CheckpointGroup) updateLocked(
 				return ErrTxnTooLarge
 			}
 		}
-		err = g.commitTransitionLocked(g.txn+1, update.lastApplied, dirty, batch.byName)
+		err = g.commitTransitionLocked(g.txn+1, update.lastApplied, dirty, batch.byName, limits)
 		if !errors.Is(err, ErrCheckpointGroupPressure) {
 			if err == nil {
 				if update.consecutive {
@@ -1731,6 +1738,7 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	applied uint64,
 	dirty []NamedCollection,
 	byName map[string]*WriteBatch,
+	limits TxnLimits,
 ) (err error) {
 	log := g.log
 	log.commitMu.Lock()
@@ -1769,6 +1777,14 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		}
 	}()
 
+	for _, c := range order {
+		if c.checkpointGroup.Load() != g || c.closed {
+			return ErrCheckpointGroupOwned
+		}
+	}
+	if err := canonicalizePrimaryTransactionBatches(dirty, byName, limits); err != nil {
+		return err
+	}
 	staged := make([]stagedPrimaryBatch, len(order))
 	stagedLive := 0
 	defer func() {
@@ -1780,9 +1796,6 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		}
 	}()
 	for i, c := range order {
-		if c.checkpointGroup.Load() != g || c.closed {
-			return ErrCheckpointGroupOwned
-		}
 		st, stageErr := c.stagePrimaryBatchConditionalLocked(byName[nameOf[c]])
 		if stageErr != nil {
 			return stageErr
@@ -3189,6 +3202,10 @@ func validateCheckpointGroupCertificateMembers(
 }
 
 func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCertificate, error) {
+	return openCheckpointGroupCertificateFlags(log, os.O_RDWR)
+}
+
+func openCheckpointGroupCertificateFlags(log *TxnLog, flags int) (*os.File, checkpointGroupCertificate, error) {
 	if log == nil || log.root == nil {
 		return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
@@ -3199,7 +3216,7 @@ func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCerti
 	if !info.Mode().IsRegular() || info.Size() != checkpointGroupFileBytes {
 		return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
-	file, err := log.root.OpenFile(checkpointGroupFilename, os.O_RDWR, 0)
+	file, err := log.root.OpenFile(checkpointGroupFilename, flags, 0)
 	if err != nil {
 		return nil, checkpointGroupCertificate{}, err
 	}
@@ -3253,7 +3270,8 @@ func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCerti
 	selected := valid[len(valid)-1].certificate
 	if len(valid) > 1 {
 		previous := valid[len(valid)-2].certificate
-		if !validCheckpointGroupCertificateSuccessor(previous, selected) {
+		if !validCheckpointGroupCertificateSuccessor(previous, selected) &&
+			!validCheckpointMembershipCertificateSuccessor(log, previous, selected) {
 			_ = file.Close()
 			return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 		}

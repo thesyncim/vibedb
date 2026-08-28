@@ -352,6 +352,7 @@ func (s *ReplicatedChildStage) activate(
 			},
 			User: replicatedstate.UserCollection{
 				Name: s.base.UserTable,
+				LocalIndexes: replicatedApplyLocalIndexes(s.table),
 				Target: replicatedstate.CollectionTarget{
 					Collection:       s.table.collection,
 					Validation:       replicatedstate.ValidationProfile(identity.ValidationProfile),
@@ -361,14 +362,14 @@ func (s *ReplicatedChildStage) activate(
 				},
 			},
 			TxnLog: core.txnLog,
-			MachineOptions: replicatedstate.Options{
+			MachineOptions: replicatedSnapshotLedgerOptions(identity, replicatedstate.Options{
 				TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 				RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 				TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 					Name:       replicatedstate.TransitionCaptureCollectionName,
 					Collection: core.replicatedCaptureCollection,
 				},
-			},
+			}),
 			ArtifactOptions: artifactOptions,
 		},
 	)

@@ -1,6 +1,7 @@
 package replicatedstate
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -32,21 +33,38 @@ type StagedSnapshotImageAudit struct {
 	Finish func() error
 }
 
-// StagedSnapshotPreparation is the immutable result of the sole complete
-// staged-image audit. The image must remain exclusively owned and non-serving
-// until Finish returns. Preparing first lets the checkpoint-group certificate
-// commit to the exact state envelope before that envelope is published.
+// CertifiedStagedImage is an already audited, constant-space logical image
+// proof bound to one exact fully durable collection generation. It is accepted
+// only by PrepareStagedSnapshotFromCertifiedImage, which revalidates the opaque
+// durable identity before constructing any replicated state. The digest is an
+// order-independent SHA-256 multiset root so a split receiver can maintain it
+// through exact before/after witnesses without an auxiliary index.
+type CertifiedStagedImage struct {
+	Rows        uint64
+	ImageDigest [sha256.Size]byte
+	Identity    durable.ImageIdentity
+}
+
+// StagedSnapshotPreparation is the immutable result of either the sole
+// complete staged-image audit or an exact certified-image handoff. The image
+// must remain exclusively owned and non-serving until Finish returns.
+// Preparing first lets the checkpoint-group certificate commit to the exact
+// state envelope before that envelope is published.
 type StagedSnapshotPreparation struct {
-	prepared          openInputs
-	staticBootstrap   *pb.Snapshot
-	state             State
-	stateEnvelope     []byte
-	imageDigest       [32]byte
-	userRows          uint64
-	userGeneration    uint64
-	captureGeneration uint64
-	statePresent      bool
-	manifest          SnapshotArtifactManifest
+	prepared            openInputs
+	staticBootstrap     *pb.Snapshot
+	state               State
+	stateEnvelope       []byte
+	imageDigest         [32]byte
+	userRows            uint64
+	userGeneration      uint64
+	relationRows        []uint64
+	relationGenerations []uint64
+	relationImages      [][sha256.Size]byte
+	relationPlacements  []relationPlacementAccumulator
+	captureGeneration   uint64
+	statePresent        bool
+	manifest            SnapshotArtifactManifest
 }
 
 // PrepareStagedSnapshot validates one coherent system/user/empty-capture cut
@@ -62,6 +80,45 @@ func PrepareStagedSnapshot(
 	cut StagedSnapshotCut,
 	artifactOptions SnapshotArtifactOptions,
 ) (*StagedSnapshotPreparation, error) {
+	return prepareStagedSnapshot(
+		binding, bootstrap, system, user, txnLog, options, cut, artifactOptions, nil,
+	)
+}
+
+// PrepareStagedSnapshotFromCertifiedImage performs the same fail-closed
+// initialization as PrepareStagedSnapshot while consuming a previously
+// authenticated image proof. It replaces the O(rows) canonical pass with an
+// O(1) durable store/generation/checkpoint/root identity comparison. This is an
+// internal activation boundary; ordinary snapshot imports must use the scanned
+// API above.
+func PrepareStagedSnapshotFromCertifiedImage(
+	binding Binding,
+	bootstrap *pb.Snapshot,
+	system CollectionTarget,
+	user UserCollection,
+	txnLog *durable.TxnLog,
+	options Options,
+	cut StagedSnapshotCut,
+	artifactOptions SnapshotArtifactOptions,
+	certified CertifiedStagedImage,
+) (*StagedSnapshotPreparation, error) {
+	return prepareStagedSnapshot(
+		binding, bootstrap, system, user, txnLog, options, cut, artifactOptions,
+		&certified,
+	)
+}
+
+func prepareStagedSnapshot(
+	binding Binding,
+	bootstrap *pb.Snapshot,
+	system CollectionTarget,
+	user UserCollection,
+	txnLog *durable.TxnLog,
+	options Options,
+	cut StagedSnapshotCut,
+	artifactOptions SnapshotArtifactOptions,
+	certified *CertifiedStagedImage,
+) (*StagedSnapshotPreparation, error) {
 	prepared, err := prepareOpenInputs(
 		binding, bootstrap, system, user, txnLog, options, false,
 	)
@@ -74,7 +131,7 @@ func PrepareStagedSnapshot(
 		cut.Applied == math.MaxUint64 || cut.Term == 0 || cut.Term == math.MaxUint64 ||
 		cut.EntryDigest == ([32]byte{}) ||
 		len(bootstrap.GetMetadata().GetConfState().GetVoters()) == 0 || artifactErr != nil ||
-		!auditValid {
+		!auditValid || certified != nil && cut.ImageAudit.Visit != nil {
 		return nil, errors.Join(ErrStagedSnapshot, err, artifactErr)
 	}
 
@@ -100,35 +157,47 @@ func PrepareStagedSnapshot(
 		return nil, errors.Join(ErrStagedSnapshot, err, cutSnapshot.Close())
 	}
 
-	imageHasher, err := newCanonicalImageHasher(
-		prepared.userName, prepared.user.Validation,
-		prepared.user.ValidationDigest, prepared.user.Validator,
-	)
+	var imageDigest [sha256.Size]byte
 	var userRows uint64
-	if err == nil {
-		err = userSnapshot.RangeRaw(func(key, value []byte) error {
-			if userRows == math.MaxUint64 {
-				return ErrStagedSnapshot
-			}
-			if err := imageHasher.add(key, value); err != nil {
-				return err
-			}
-			if cut.ImageAudit.Visit != nil {
-				if err := cut.ImageAudit.Visit(key, value); err != nil {
+	if certified != nil {
+		userRows, imageDigest = certified.Rows, certified.ImageDigest
+		if imageDigest == ([sha256.Size]byte{}) || userRows != userSnapshot.Len() ||
+			!prepared.user.Collection.MatchesDurableImage(certified.Identity) {
+			err = ErrStagedSnapshot
+		}
+	} else {
+		imageHasher, hasherErr := newCanonicalImageHasher(
+			prepared.userName, prepared.user.Validation,
+			prepared.user.ValidationDigest, prepared.user.Validator,
+		)
+		err = hasherErr
+		if err == nil {
+			err = userSnapshot.RangeRaw(func(key, value []byte) error {
+				if userRows == math.MaxUint64 {
+					return ErrStagedSnapshot
+				}
+				if err := imageHasher.add(key, value); err != nil {
 					return err
 				}
-			}
-			userRows++
-			return nil
-		})
-	}
-	if err == nil && cut.ImageAudit.Finish != nil {
-		err = cut.ImageAudit.Finish()
+				if cut.ImageAudit.Visit != nil {
+					if err := cut.ImageAudit.Visit(key, value); err != nil {
+						return err
+					}
+				}
+				userRows++
+				return nil
+			})
+		}
+		if err == nil && cut.ImageAudit.Finish != nil {
+			err = cut.ImageAudit.Finish()
+		}
+		if err == nil {
+			imageDigest = imageHasher.sum()
+		}
 	}
 	if err != nil {
 		return nil, errors.Join(err, cutSnapshot.Close())
 	}
-	imageDigest := imageHasher.sum()
 	dataChainDigest, err := dataChainSeedDigest(prepared.applyContract, imageDigest)
 	if err != nil {
 		return nil, errors.Join(err, cutSnapshot.Close())
@@ -151,8 +220,11 @@ func PrepareStagedSnapshot(
 			fmt.Errorf("%w: %v", ErrStagedSnapshot, err), cutSnapshot.Close(),
 		)
 	}
-	current, present, sessions, slots, authorities, scanErr := scanSessionSystemSnapshot(
+	current, present, sessions, slots, authorities, _, scanErr := scanSessionSystemSnapshot(
 		systemSnapshot, options.MaxSessions, options.RetryWindow,
+		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+		options.RequestLedgerRange,
+		routeGateRecordLimit(),
 	)
 	closeErr := cutSnapshot.Close()
 	if scanErr != nil || closeErr != nil || sessions != 0 || slots != 0 || authorities != 0 ||
@@ -319,8 +391,12 @@ func (p *StagedSnapshotPreparation) Finish(
 	if err != nil {
 		return nil, nil, SnapshotArtifactManifest{}, err
 	}
-	current, present, sessions, slots, authorities, scanErr := scanSessionSystemSnapshot(
+	current, present, sessions, slots, authorities, _, scanErr := scanSessionSystemSnapshot(
 		systemSnapshot, p.prepared.options.MaxSessions, p.prepared.options.RetryWindow,
+		p.prepared.options.RequestLedgerCapacityBytes,
+		p.prepared.options.RequestLedgerCleanupReserveBytes,
+		p.prepared.options.RequestLedgerRange,
+		routeGateRecordLimit(),
 	)
 	closeErr := systemSnapshot.Close()
 	if scanErr != nil || closeErr != nil || !present || sessions != 0 || slots != 0 ||
@@ -332,6 +408,21 @@ func (p *StagedSnapshotPreparation) Finish(
 	}
 	if p.prepared.user.Collection.Generation() != p.userGeneration {
 		return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
+	}
+	if len(p.relationGenerations) != 0 {
+		if len(p.relationGenerations) != len(p.prepared.relations) ||
+			len(p.relationRows) != len(p.prepared.relations) ||
+			len(p.relationImages) != len(p.prepared.relations) ||
+			len(p.relationPlacements) != len(p.prepared.relations) {
+			return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
+		}
+		for i := range p.prepared.relations {
+			relation := &p.prepared.relations[i]
+			if relation.target.Collection.Generation() != p.relationGenerations[i] ||
+				relation.target.Collection.Len() != p.relationRows[i] {
+				return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
+			}
+		}
 	}
 	capture := p.prepared.options.TransitionCaptureTarget.Collection
 	captureSnapshot, err := capture.Snapshot()
@@ -356,9 +447,20 @@ func (p *StagedSnapshotPreparation) Finish(
 	machine.openedImageDigest = p.imageDigest
 	machine.openedImageApplied = p.state.Applied
 	machine.openedImageGeneration = p.userGeneration
-	machine.relations[0].openedImage = p.imageDigest
-	machine.relations[0].openedApplied = p.state.Applied
-	machine.relations[0].openedGen = p.userGeneration
+	if len(p.relationGenerations) == 0 {
+		machine.relations[0].openedImage = p.imageDigest
+		machine.relations[0].openedApplied = p.state.Applied
+		machine.relations[0].openedGen = p.userGeneration
+	} else {
+		for i := range machine.relations {
+			machine.relations[i].openedImage = p.relationImages[i]
+			machine.relations[i].openedApplied = p.state.Applied
+			machine.relations[i].openedGen = p.relationGenerations[i]
+			machine.relations[i].placement = p.relationPlacements[i]
+			machine.relations[i].placementApplied = p.state.Applied
+			machine.relations[i].placementGen = p.relationGenerations[i]
+		}
+	}
 	machine.binding = p.state.Binding
 	machine.distribution = []byte(p.state.Binding.Distribution)
 	machine.shard = []byte(p.state.Binding.Shard)

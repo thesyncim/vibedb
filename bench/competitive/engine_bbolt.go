@@ -2,6 +2,7 @@ package competitive
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	bolt "go.etcd.io/bbolt"
@@ -32,6 +33,18 @@ type bboltSession struct {
 }
 
 func newBbolt(cfg Config) (Engine, error) {
+	return openBboltMode(cfg, true)
+}
+
+func openBbolt(cfg Config) (Engine, error) {
+	path := filepath.Join(cfg.Dir, "bolt.db")
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return openBboltMode(cfg, false)
+}
+
+func openBboltMode(cfg Config, create bool) (Engine, error) {
 	if err := validateEngineExactIndexes("bbolt", cfg.ExactIndexes); err != nil {
 		return nil, err
 	}
@@ -65,10 +78,19 @@ func newBbolt(cfg Config) (Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(boltBucket)
-		return err
-	}); err != nil {
+	err = db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(boltBucket) == nil && !create {
+			return fmt.Errorf("bbolt image has no docs bucket")
+		}
+		return nil
+	})
+	if err == nil && create {
+		err = db.Update(func(tx *bolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists(boltBucket)
+			return err
+		})
+	}
+	if err != nil {
 		db.Close()
 		return nil, err
 	}

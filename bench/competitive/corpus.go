@@ -184,19 +184,33 @@ func CorpusOf(n int, card Cardinality) []Doc {
 // vibejson validates every constructed value, keeping stdlib JSON entirely out
 // of corpus construction.
 func CorpusOfShape(n int, card Cardinality, shape DocumentShape) []Doc {
-	docs := benchcorpus.Corpus(n, card == HighCardinality)
-	for i := range docs {
-		target := shapedDocumentBytes(shape, i)
-		if target == 0 || len(docs[i].JSON) >= target {
-			continue
-		}
-		docs[i].JSON = appendDeterministicPayload(docs[i].JSON, target, uint64(i)+1)
-		if len(docs[i].JSON) != target || len(docs[i].JSON) > maxShapedDocumentBytes ||
-			!vibejson.Valid(docs[i].JSON) {
-			panic("competitive shaped corpus invariant violated")
-		}
+	docs := make([]Doc, 0, n)
+	if err := GenerateCorpus(n, card, shape, func(doc Doc) error {
+		docs = append(docs, Doc{Key: doc.Key, JSON: append([]byte(nil), doc.JSON...)})
+		return nil
+	}); err != nil {
+		panic(err)
 	}
 	return docs
+}
+
+// GenerateCorpus visits the exact canonical competitive corpus one document at
+// a time. JSON is borrowed until visit returns. This is the bounded-memory
+// source used by the out-of-RAM lane; CorpusOfShape is implemented through it
+// so the resident and streaming paths remain byte-identical.
+func GenerateCorpus(n int, card Cardinality, shape DocumentShape, visit func(Doc) error) error {
+	ordinal := 0
+	return benchcorpus.Generate(n, card == HighCardinality, func(doc benchcorpus.Document) error {
+		target := shapedDocumentBytes(shape, ordinal)
+		if target != 0 && len(doc.JSON) < target {
+			doc.JSON = appendDeterministicPayload(doc.JSON, target, uint64(ordinal)+1)
+		}
+		if len(doc.JSON) > maxShapedDocumentBytes || !vibejson.Valid(doc.JSON) {
+			return fmt.Errorf("competitive shaped corpus invariant violated at document %d", ordinal)
+		}
+		ordinal++
+		return visit(doc)
+	})
 }
 
 func shapedDocumentBytes(shape DocumentShape, ordinal int) int {

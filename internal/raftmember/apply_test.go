@@ -131,8 +131,14 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BindPreparedSQL: %v", err)
 	}
+	options := testApplyOptions()
+	options.RequestLedgerCapacityBytes = 8 << 20
+	options.RequestLedgerCleanupReserveBytes = 1 << 20
+	options.RequestLedgerRangeStart = [32]byte{0x10}
+	options.RequestLedgerRangeEnd = [32]byte{0x90}
+	options.RequestLedgerRangeIdentity = [32]byte{0x51}
 	claim, applyIdentity, err := OpenPreparedApply(
-		wal, database, authority, base, testApplyOptions(),
+		wal, database, authority, base, options,
 	)
 	skipIfStrictAllocationUnsupported(t, "open prepared apply", err)
 	if err != nil {

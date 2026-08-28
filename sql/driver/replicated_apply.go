@@ -14,12 +14,14 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -70,6 +72,20 @@ type ReplicatedApplyOptions struct {
 	RetryWindow uint16
 	TxnLimits   durable.TxnLimits
 	Placement   ReplicatedPlacementProfile
+	// RequestLedgerCapacityBytes is the exact resident-plus-future byte budget
+	// for a dedicated request-ledger group. All request-ledger fields must be
+	// zero to keep the ordinary data-group path disabled.
+	RequestLedgerCapacityBytes uint64
+	// RequestLedgerCleanupReserveBytes prevents new requests from consuming the
+	// bytes required for ACK, recovery, and bounded garbage collection.
+	RequestLedgerCleanupReserveBytes uint64
+	// RequestLedgerRangeStart and RequestLedgerRangeEnd are a half-open SHA-256
+	// key interval. An all-zero end is the canonical unbounded upper endpoint.
+	RequestLedgerRangeStart [sha256.Size]byte
+	RequestLedgerRangeEnd   [sha256.Size]byte
+	// RequestLedgerRangeIdentity fences stale routing against a different
+	// immutable ledger-range generation.
+	RequestLedgerRangeIdentity [sha256.Size]byte
 }
 
 // ReplicatedApplyIdentity is the complete retained identity of the private
@@ -77,18 +93,23 @@ type ReplicatedApplyOptions struct {
 // remaining fields freeze the portable validation and bounded apply profile.
 // Exact restart must retain this value separately from the base SQL/WAL binding.
 type ReplicatedApplyIdentity struct {
-	Format            uint16
-	Storage           string
-	CaptureStorage    string
-	ValidationProfile uint8
-	ValidationDigest  [32]byte
-	SystemLimits      ReplicatedShardStoreLimits
-	CaptureLimits     ReplicatedShardStoreLimits
-	MaxSessions       uint64
-	RetryWindow       uint16
-	TxnLimits         durable.TxnLimits
-	Placement         ReplicatedPlacementProfile
-	Sidecars          ReplicatedApplySidecarProfile
+	Format                           uint16
+	Storage                          string
+	CaptureStorage                   string
+	ValidationProfile                uint8
+	ValidationDigest                 [32]byte
+	SystemLimits                     ReplicatedShardStoreLimits
+	CaptureLimits                    ReplicatedShardStoreLimits
+	MaxSessions                      uint64
+	RetryWindow                      uint16
+	TxnLimits                        durable.TxnLimits
+	Placement                        ReplicatedPlacementProfile
+	RequestLedgerCapacityBytes       uint64
+	RequestLedgerCleanupReserveBytes uint64
+	RequestLedgerRangeStart          [sha256.Size]byte
+	RequestLedgerRangeEnd            [sha256.Size]byte
+	RequestLedgerRangeIdentity       [sha256.Size]byte
+	Sidecars                         ReplicatedApplySidecarProfile
 }
 
 // ReplicatedApplyCapacityProfile is the detached, constant-size apply cut used
@@ -121,6 +142,7 @@ type ReplicatedApply struct {
 	machine              *replicatedstate.Machine
 	table                *table
 	identity             ReplicatedApplyIdentity
+	rangeSplitCapture    *rangesplit.SourceCapture
 	closed               bool
 	attemptGeneration    uint64
 	attemptActive        bool
@@ -166,20 +188,25 @@ var _ raftmodel.StateMachine = (*ReplicatedApply)(nil)
 var _ raftmodel.NormalBatchStateMachine = (*ReplicatedApply)(nil)
 
 type replicatedApplyMeta struct {
-	Format            uint16
-	Storage           string
-	CaptureStorage    string
-	ValidationProfile uint8
-	ValidationDigest  [32]byte
-	SystemLimits      ReplicatedShardStoreLimits
-	CaptureLimits     ReplicatedShardStoreLimits
-	MaxSessions       uint64
-	RetryWindow       uint16
-	TxnMaxCollections int
-	TxnMaxDocuments   int
-	TxnMaxBytes       int64
-	Placement         ReplicatedPlacementProfile
-	Sidecars          ReplicatedApplySidecarProfile
+	Format                           uint16
+	Storage                          string
+	CaptureStorage                   string
+	ValidationProfile                uint8
+	ValidationDigest                 [32]byte
+	SystemLimits                     ReplicatedShardStoreLimits
+	CaptureLimits                    ReplicatedShardStoreLimits
+	MaxSessions                      uint64
+	RetryWindow                      uint16
+	TxnMaxCollections                int
+	TxnMaxDocuments                  int
+	TxnMaxBytes                      int64
+	Placement                        ReplicatedPlacementProfile
+	RequestLedgerCapacityBytes       uint64
+	RequestLedgerCleanupReserveBytes uint64
+	RequestLedgerRangeStart          [sha256.Size]byte
+	RequestLedgerRangeEnd            [sha256.Size]byte
+	RequestLedgerRangeIdentity       [sha256.Size]byte
+	Sidecars                         ReplicatedApplySidecarProfile
 }
 
 // OpenReplicatedShardStoreWithApply opens an activated root only when both the
@@ -189,7 +216,12 @@ func OpenReplicatedShardStoreWithApply(
 	path string,
 	expected ReplicatedShardStoreIdentity,
 	expectedApply ReplicatedApplyIdentity,
+	opening ...ReplicatedOpenOptions,
 ) (*Database, error) {
+	openOptions, err := replicatedOpeningOptions(opening)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, err
 	}
@@ -200,6 +232,11 @@ func OpenReplicatedShardStoreWithApply(
 	if err != nil {
 		return nil, err
 	}
+	if schemaRecovery, recoveryErr := replicatedSchemaActivationMatchesCatalog(absolute); recoveryErr != nil {
+		return nil, recoveryErr
+	} else if schemaRecovery {
+		return OpenReplicatedShardStoreWithSchemaTransition(path, expected, expectedApply, openOptions)
+	}
 	if _, err := os.Stat(absolute); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
@@ -208,6 +245,7 @@ func OpenReplicatedShardStoreWithApply(
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                    shardStoreOpenReplicatedApplyExisting,
+		openOptions:             openOptions,
 		expectedReplicated:      ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply: expectedApply,
 	})
@@ -313,39 +351,48 @@ func (d *database) replicatedCapturePath(meta *replicatedApplyMeta) string {
 }
 
 func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits {
-	const (
-		stateKeyBytes   = 1
-		sessionKeyBytes = sha256.Size + 1
-		slotKeyBytes    = sha256.Size + 3
-	)
-	maxValueBytes := max(
-		replicatedstate.MaxStateEnvelopeBytes,
-		replicatedstate.MaxSessionRecordBytes,
-		replicatedstate.MaxSessionSlotRecordBytes,
-		replicatedstate.MaxAuthorityBindingBytes,
-	)
-	hotApplyBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
-		sessionKeyBytes + replicatedstate.MaxAuthorityBindingBytes +
-		sessionKeyBytes + replicatedstate.MaxSessionRecordBytes +
-		slotKeyBytes + replicatedstate.MaxSessionSlotRecordBytes
-	releaseBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
-		sessionKeyBytes + int(retryWindow)*slotKeyBytes
-	// durable.Options requires the batch byte bound to admit one maximum
-	// document plus a maximum-sized key for every possible batch member. The
-	// exact release image can be smaller than that structural floor at wider
-	// retry windows, so bind both independently.
-	maxDocuments := max(4, int(retryWindow)+2)
-	storageMinimumBytes := maxValueBytes + maxDocuments*slotKeyBytes
+	return replicatedApplySystemLimitsForLedger(retryWindow, false)
+}
+
+func replicatedApplySystemLimitsForLedger(retryWindow uint16, ledger bool, transactionDocuments ...int) ReplicatedShardStoreLimits {
+	required, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, ledger)
+	if len(transactionDocuments) == 1 {
+		required, ok = replicatedstate.RequiredTransactionSystemCollectionLimits(retryWindow, ledger, transactionDocuments[0])
+	} else if len(transactionDocuments) != 0 {
+		return ReplicatedShardStoreLimits{}
+	}
+	if !ok {
+		return ReplicatedShardStoreLimits{}
+	}
 	return ReplicatedShardStoreLimits{
-		MaxKeyBytes:       slotKeyBytes,
-		MaxDocumentBytes:  maxValueBytes,
-		MaxBatchDocuments: maxDocuments,
-		MaxBatchBytes:     max(hotApplyBytes, releaseBytes, storageMinimumBytes),
+		MaxKeyBytes: required.MaxKeyBytes, MaxDocumentBytes: required.MaxDocumentBytes,
+		MaxBatchDocuments: required.MaxDistinctMutations,
+		MaxBatchBytes:     required.MaxBatchBytes,
 	}
 }
 
+func replicatedApplyTransactionSystemLimits(
+	identity ReplicatedShardStoreIdentity, retryWindow uint16, ledger bool, transactionDocuments int,
+) ReplicatedShardStoreLimits {
+	documents := 0
+	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
+		documents += identity.Relations[ordinal].Limits.MaxBatchDocuments
+	}
+	// The system participant stores one intent per distinct relation key,
+	// one packed row per relation, two controls, a coordinator payload, an
+	// initial manifest pack, and state. Do not reserve unrelated collections'
+	// transaction slots in every hidden collection.
+	documents += int(identity.RelationCount) + distributedtxn.MaxManifestSegmentsPerCommand + 4
+	minimum, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, ledger)
+	if !ok {
+		return ReplicatedShardStoreLimits{}
+	}
+	documents = min(transactionDocuments, max(documents, minimum.MaxDistinctMutations))
+	return replicatedApplySystemLimitsForLedger(retryWindow, ledger, documents)
+}
+
 func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Options {
-	sidecars := canonicalReplicatedApplySidecars()
+	sidecars := canonicalReplicatedApplySidecarsForLimits(limits)
 	return durable.Options{
 		Durability:                 durable.DurabilitySync,
 		OpaqueValues:               true,
@@ -383,10 +430,21 @@ func replicatedCaptureDurableOptions(limits ReplicatedShardStoreLimits) durable.
 // byte ceiling required to admit one worst-case base/index apply together with
 // its source-split capture record and replicated system state. Operators use
 // this before first activation; the retained identity cannot grow the limit on
-// a later split attempt.
+// a later split attempt. This preparation helper describes data-only apply;
+// OpenReplicatedApply additionally checks the larger exact control-record floor
+// when the supplied options enable a request ledger.
 func ReplicatedApplyTransactionByteFloor(
 	identity ReplicatedShardStoreIdentity,
 	retryWindow uint16,
+) (int64, error) {
+	return replicatedApplyTransactionByteFloor(identity, retryWindow, false)
+}
+
+func replicatedApplyTransactionByteFloor(
+	identity ReplicatedShardStoreIdentity,
+	retryWindow uint16,
+	ledger bool,
+	transactionDocuments ...int,
 ) (int64, error) {
 	if retryWindow == 0 || retryWindow > replicatedstate.MaxSessionRetryWindow ||
 		validateReplicatedShardStoreIdentity(identity) != nil {
@@ -400,7 +458,13 @@ func ReplicatedApplyTransactionByteFloor(
 		}
 		relationBytes = min(int64(replication.MaxCommandBytes), relationBytes+limit)
 	}
-	systemBytes := int64(replicatedApplySystemLimits(retryWindow).MaxBatchBytes)
+	documents := defaultDriverTxnLimits().MaxDocuments
+	if len(transactionDocuments) == 1 {
+		documents = transactionDocuments[0]
+	} else if len(transactionDocuments) != 0 {
+		return 0, ErrReplicatedApplyMismatch
+	}
+	systemBytes := int64(replicatedApplyTransactionSystemLimits(identity, retryWindow, ledger, documents).MaxBatchBytes)
 	capture, err := replicatedCaptureLimits(identity)
 	if err != nil || systemBytes <= 0 || capture.MaxBatchBytes <= 0 ||
 		relationBytes > math.MaxInt64-systemBytes ||
@@ -580,10 +644,36 @@ func (d *Database) openReplicatedApply(
 		replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+			RequestLedgerCapacityBytes:       identity.RequestLedgerCapacityBytes,
+			RequestLedgerCleanupReserveBytes: identity.RequestLedgerCleanupReserveBytes,
+			RequestLedgerRange: replicatedstate.RequestLedgerRange{
+				Start:    requestledger.LedgerHome(identity.RequestLedgerRangeStart),
+				End:      requestledger.LedgerHome(identity.RequestLedgerRangeEnd),
+				Identity: requestledger.Digest(identity.RequestLedgerRangeIdentity),
+			},
 			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
 			},
+			TransitionCaptureFactory: func(activation replicatedstate.SplitCaptureActivation) (replicatedstate.TransitionCapture, error) {
+				partitioner, openErr := rangesplit.OpenPortablePartitioner(activation.Command.Spec)
+				if openErr != nil || partitioner.Digest() != activation.Command.PartitionerDigest {
+					return nil, errors.Join(openErr, replicatedstate.ErrSplitCaptureActivation)
+				}
+				capture, captureErr := rangesplit.NewSourceCapture(
+					partitioner, replicatedstate.TransitionCaptureCollectionName,
+					core.replicatedCaptureCollection,
+				)
+				if captureErr == nil {
+					claim.rangeSplitCapture = capture
+				}
+				return capture, captureErr
+			},
+			SchemaTransition:          core.schemaTransition,
+			SchemaMembershipWitness:   core.schemaMembership,
+			SchemaAuthorizationDigest: core.schemaAuthorization,
+			SchemaCatalogCASDigest:    core.schemaCatalogCAS,
+			SchemaSourceRecovery:      core.schemaSourceRecovery,
 		},
 	)
 	if err != nil {
@@ -624,16 +714,10 @@ func replicatedApplyRelations(
 	if baseTable == nil || baseTable.collection == nil {
 		return nil, ErrReplicatedApplyMismatch
 	}
-	baseTarget := replicatedstate.CollectionTarget{
-		Collection:             baseTable.collection,
-		Validation:             replicatedstate.ValidationProfile(apply.ValidationProfile),
-		ValidationDigest:       apply.ValidationDigest,
-		Validator:              newReplicatedSQLMutationValidator(base, baseTable, apply.Placement),
-		ObserveMutationAttempt: claim.observeMutationAttempt,
-		Limits:                 replicatedStateCollectionLimits(base.UserLimits),
+	result, err := replicatedRelationSchemas(base, apply, replicatedApplyLocalIndexes(baseTable))
+	if err != nil {
+		return nil, err
 	}
-	logicalManifest := replicatedRelationApplyManifestDigest(base)
-	result := make([]replicatedstate.RelationCollection, int(base.RelationCount))
 	for ordinal := range result {
 		relation := base.Relations[ordinal]
 		table := database.tables[relation.Table]
@@ -642,33 +726,19 @@ func replicatedApplyRelations(
 				"%w: relation %q is unavailable", ErrReplicatedApplyMismatch, relation.Table,
 			)
 		}
-		spec := replicatedstate.RelationCollection{
-			Relation: replication.RelationID(relation.Relation), Name: relation.Table,
-			Target: replicatedstate.CollectionTarget{
-				Collection: table.collection,
-				Validation: replicatedstate.ValidationDeterministicMutation,
-				Limits:     replicatedStateCollectionLimits(relation.Limits),
-			},
-		}
+		spec := &result[ordinal]
+		spec.Target.Collection = table.collection
 		switch relation.Kind {
 		case ReplicatedShardRelationJSON:
-			spec.Kind = replicatedstate.RelationJSON
-			spec.Target = baseTarget
-			spec.LocalIndexes = replicatedApplyLocalIndexes(table)
+			spec.Target.Validator = newReplicatedSQLMutationValidator(base, baseTable, apply.Placement)
+			spec.Target.ObserveMutationAttempt = claim.observeMutationAttempt
 		case ReplicatedShardRelationGlobalIndex:
-			spec.Kind = replicatedstate.RelationGlobalIndex
-			spec.Target.ValidationDigest = replicatedGlobalIndexValidationDigest(
-				base, relation, logicalManifest,
-			)
-			spec.Target.Validator = replicatedGlobalIndexMutationValidator{}
-			spec.GlobalIndex = replicatedstate.GlobalIndexProfile{
-				IndexID: relation.IndexID, Incarnation: relation.Incarnation,
-				LocatorCount: relation.LocatorCount, Unique: relation.Unique,
+			spec.Target.Validator = replicatedGlobalIndexMutationValidator{
+				relation: relation, placement: apply.Placement.Range,
 			}
 		default:
 			return nil, ErrReplicatedApplyMismatch
 		}
-		result[ordinal] = spec
 	}
 	return result, nil
 }
@@ -740,39 +810,87 @@ func replicatedGlobalIndexValidationDigest(
 	h := sha256.New()
 	_, _ = h.Write(replicatedGlobalIndexValidationDomain)
 	_, _ = h.Write(logicalManifest[:])
-	var fixed [32]byte
+	var fixed [40]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], base.RelationSchemaGeneration)
 	binary.LittleEndian.PutUint16(fixed[8:10], relation.Relation)
 	fixed[10] = relation.LocatorCount
 	if relation.Unique {
 		fixed[11] = 1
 	}
+	fixed[12] = byte(relation.KeyEncoding)
+	fixed[13] = relation.KeyArity
+	fixed[14] = relation.BucketBits
 	binary.LittleEndian.PutUint64(fixed[16:24], relation.IndexID)
 	binary.LittleEndian.PutUint64(fixed[24:32], relation.Incarnation)
+	binary.LittleEndian.PutUint32(fixed[32:36], uint32(relation.TupleVersion))
+	binary.LittleEndian.PutUint32(fixed[36:40], uint32(relation.MapperVersion))
 	_, _ = h.Write(fixed[:])
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result
 }
 
-type replicatedGlobalIndexMutationValidator struct{}
+type replicatedGlobalIndexMutationValidator struct {
+	relation  ReplicatedShardRelationIdentity
+	placement distribution.KeyRange
+}
 
-func (replicatedGlobalIndexMutationValidator) ValidatePut(
+func (v replicatedGlobalIndexMutationValidator) ValidatePut(
 	key, _ []byte,
 ) replicatedstate.MutationValidation {
-	if len(key) == 0 || key[0] == 0 {
+	point, ok := v.relation.GlobalIndexStorageKeyPoint(key)
+	if !ok {
 		return replicatedstate.MutationValidationInvalid
+	}
+	if !v.placement.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
 	}
 	return replicatedstate.MutationValidationAccept
 }
 
-func (replicatedGlobalIndexMutationValidator) ValidateDelete(
+func (v replicatedGlobalIndexMutationValidator) ValidateDelete(
 	key, _ []byte, _ bool,
 ) replicatedstate.MutationValidation {
-	if len(key) == 0 || key[0] == 0 {
+	return v.ValidatePut(key, nil)
+}
+
+func (v replicatedGlobalIndexMutationValidator) ValidatePutOwnership(
+	key, _ []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	point, ok := v.relation.GlobalIndexStorageKeyPoint(key)
+	if !ok {
 		return replicatedstate.MutationValidationInvalid
 	}
+	if !owned.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
+	}
 	return replicatedstate.MutationValidationAccept
+}
+
+func (v replicatedGlobalIndexMutationValidator) ValidateDeleteOwnership(
+	key, _ []byte,
+	_ bool,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	return v.ValidatePutOwnership(key, nil, owned)
+}
+
+func (v replicatedGlobalIndexMutationValidator) ValidatePointOwnership(
+	key []byte,
+	owned distribution.KeyRange,
+) replicatedstate.MutationValidation {
+	return v.ValidatePutOwnership(key, nil, owned)
+}
+
+func (v replicatedGlobalIndexMutationValidator) GlobalIndexPlacementPoint(
+	key []byte,
+) (distribution.KeyspacePoint, bool) {
+	return v.relation.GlobalIndexStorageKeyPoint(key)
+}
+
+func (v replicatedGlobalIndexMutationValidator) GlobalIndexPlacementRange() distribution.KeyRange {
+	return v.placement
 }
 
 // prepareReplicatedApplyStorageLocked makes the hidden participant and its
@@ -845,13 +963,21 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 		)
 	}
 
-	identity, err := d.createReplicatedApplyStorageLocked(expected, options)
+	reserved := d.catalog.ReplicatedChildApply
+	if reserved != nil && !replicatedApplyMetaMatchesOptions(reserved, expected, options) {
+		return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
+	}
+	identity, err := d.createReplicatedApplyStorageLocked(expected, options, reserved)
 	if err != nil {
 		return ReplicatedApplyIdentity{}, err
+	}
+	if reserved != nil && identity != reserved.identity() {
+		return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
 	}
 	previousPending := d.catalogWritePending
 	stored := replicatedApplyMetaFromIdentity(identity)
 	d.catalog.ReplicatedApply = &stored
+	d.catalog.ReplicatedChildApply = nil
 	d.catalogWritePending = true
 	var published bool
 	if persist != nil {
@@ -871,6 +997,10 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 		return identity, publicationErr
 	}
 	d.catalog.ReplicatedApply = nil
+	if reserved != nil {
+		owned := *reserved
+		d.catalog.ReplicatedChildApply = &owned
+	}
 	d.catalogWritePending = previousPending
 	path := d.replicatedApplyPath(&stored)
 	capturePath := d.replicatedCapturePath(&stored)
@@ -904,6 +1034,7 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 func (d *database) createReplicatedApplyStorageLocked(
 	base ReplicatedShardStoreIdentity,
 	options ReplicatedApplyOptions,
+	reserved *replicatedApplyMeta,
 ) (ReplicatedApplyIdentity, error) {
 	if err := d.checkRetirementCapacityLocked(2); err != nil {
 		return ReplicatedApplyIdentity{}, err
@@ -911,13 +1042,23 @@ func (d *database) createReplicatedApplyStorageLocked(
 	if err := d.ensureDataDir(); err != nil {
 		return ReplicatedApplyIdentity{}, err
 	}
-	storage, err := d.newStorageIdentityLocked()
-	if err != nil {
-		return ReplicatedApplyIdentity{}, err
-	}
-	captureStorage, err := d.newStorageIdentityLocked()
-	if err != nil || captureStorage == storage {
-		return ReplicatedApplyIdentity{}, errors.Join(err, ErrReplicatedApplyMismatch)
+	var storage, captureStorage string
+	if reserved != nil {
+		storage, captureStorage = reserved.Storage, reserved.CaptureStorage
+		if validateReplicatedApplyMeta(reserved, &base) != nil ||
+			!replicatedApplyMetaMatchesOptions(reserved, base, options) {
+			return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
+		}
+	} else {
+		var err error
+		storage, err = d.newStorageIdentityLocked()
+		if err != nil {
+			return ReplicatedApplyIdentity{}, err
+		}
+		captureStorage, err = d.newStorageIdentityLocked()
+		if err != nil || captureStorage == storage {
+			return ReplicatedApplyIdentity{}, errors.Join(err, ErrReplicatedApplyMismatch)
+		}
 	}
 	meta := newReplicatedApplyMeta(base, storage, captureStorage, options)
 	path := d.replicatedApplyPath(&meta)
@@ -1432,6 +1573,12 @@ func (a *ReplicatedApply) BeginRangeSplitCapture(
 	if err := a.checkLocked(); err != nil || a.database.replicatedCaptureCollection == nil {
 		return nil, errors.Join(err, ErrReplicatedApplyMismatch)
 	}
+	if a.rangeSplitCapture != nil {
+		if a.rangeSplitCapture.PartitionerDigest() != partitioner.Digest() {
+			return nil, replicatedstate.ErrSplitCaptureActivation
+		}
+		return a.rangeSplitCapture, nil
+	}
 	capture, err := rangesplit.NewSourceCapture(
 		partitioner, replicatedstate.TransitionCaptureCollectionName,
 		a.database.replicatedCaptureCollection,
@@ -1442,6 +1589,7 @@ func (a *ReplicatedApply) BeginRangeSplitCapture(
 	if err = a.machine.BeginTransitionCapture(capture); err != nil {
 		return nil, err
 	}
+	a.rangeSplitCapture = capture
 	return capture, nil
 }
 
@@ -1458,6 +1606,39 @@ func (a *ReplicatedApply) CheckpointAppliedIndex() uint64 {
 		return 0
 	}
 	return a.machine.CheckpointAppliedIndex()
+}
+
+// RangeSplitCaptureHeadAt proves a retained descriptor is an ancestor of the
+// exact observed source publication. Controller files can lag committed Raft
+// entries (including the terminal seal); they are not the live capture head.
+func (a *ReplicatedApply) RangeSplitCaptureHeadAt(state replicatedstate.State, ancestor rangesplit.SourceCaptureDescriptor) (uint64, error) {
+	if a == nil || a.database == nil {
+		return 0, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return 0, err
+	}
+	if a.rangeSplitCapture == nil {
+		return 0, rangesplit.ErrSourceCapture
+	}
+	current, err := a.rangeSplitCapture.Descriptor()
+	if err != nil {
+		return 0, err
+	}
+	if current.Head.Applied != state.Applied || current.Head.Term != state.LastTerm ||
+		current.Head.EntryDigest != state.LastEntryDigest || current.Head.DataChainDigest != state.DataChainDigest ||
+		current.Head.BaseDigest != state.SnapshotBaseDigest || current.Head.RouteGeneration != state.Binding.RouteGeneration ||
+		current.Coordinates.OwnershipEpoch != state.Binding.OwnershipEpoch ||
+		current.Coordinates.RoutingVersion != state.Binding.RoutingVersion || current.Coordinates.RouteGeneration != state.Binding.RouteGeneration {
+		return 0, rangesplit.ErrSourceCapture
+	}
+	var workspace rangesplit.SourceCaptureWorkspace
+	if err := a.rangeSplitCapture.ValidateDescriptorAncestor(ancestor, &workspace); err != nil {
+		return 0, err
+	}
+	return current.Head.Applied, nil
 }
 
 // Published implements raftmodel.StateMachine.
@@ -1519,6 +1700,27 @@ func (a *ReplicatedApply) TransactionRecoveryReadInto(
 	return a.machine.TransactionRecoveryReadInto(request, records, payload)
 }
 
+// RequestLedgerReadInto forwards one full-key hidden request-ledger read under
+// the same live apply/activation fence as transaction recovery. The result
+// aliases dst and never exposes the private system collection or relation ID.
+func (a *ReplicatedApply) RequestLedgerReadInto(
+	request replicatedstate.RequestLedgerReadRequest,
+	dst []byte,
+) (replicatedstate.RequestLedgerReadResult, error) {
+	if a == nil || a.database == nil {
+		return replicatedstate.RequestLedgerReadResult{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedstate.RequestLedgerReadResult{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return replicatedstate.RequestLedgerReadResult{}, err
+	}
+	return a.machine.RequestLedgerReadInto(request, dst)
+}
+
 // SnapshotArtifactCut captures one coherent, read-only system/relation/capture
 // cut for streaming snapshot export. The returned handle owns every durable
 // collection snapshot until Close; it carries no SQL session or serving authority.
@@ -1539,6 +1741,73 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 		return nil, ErrReplicatedApplyMismatch
 	}
 	return a.machine.Snapshot()
+}
+
+// SnapshotArtifactCutAt is the live-backup source boundary. The floor must be
+// obtained from the serving leader's quorum ReadIndex; a behind local apply is
+// rejected rather than silently weakening the cut.
+func (a *ReplicatedApply) SnapshotArtifactCutAt(minimumApplied uint64) (*replicatedstate.ReadSnapshot, error) {
+	if minimumApplied == 0 {
+		return nil, replicatedstate.ErrReadBehind
+	}
+	cut, err := a.SnapshotArtifactCut()
+	if err != nil {
+		return nil, err
+	}
+	if cut.Fence().Applied < minimumApplied {
+		_ = cut.Close()
+		return nil, replicatedstate.ErrReadBehind
+	}
+	return cut, nil
+}
+
+// RangeSplitSnapshot returns the same coherent full apply cut through the
+// narrow split-source capability consumed by the distributed split runtime.
+func (a *ReplicatedApply) RangeSplitSnapshot() (*replicatedstate.ReadSnapshot, error) {
+	return a.SnapshotArtifactCut()
+}
+
+// RangeSplitRelationManifestDigest returns the machine-authenticated logical
+// relation bundle identity without exposing the machine itself.
+func (a *ReplicatedApply) RangeSplitRelationManifestDigest() ([sha256.Size]byte, error) {
+	if a == nil || a.database == nil {
+		return [sha256.Size]byte{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return a.machine.RelationManifestDigest()
+}
+
+// SchemaApplyContractDigest returns the exact replicated command/result
+// contract for schema rollout fencing. It never exposes the underlying state
+// machine and fails once an ordered schema transition has fenced this bundle.
+func (a *ReplicatedApply) SchemaApplyContractDigest() ([sha256.Size]byte, error) {
+	if a == nil || a.database == nil {
+		return [sha256.Size]byte{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return a.machine.ApplyContractDigest()
+}
+
+// RangeSplitCaptureCount is an O(1) recovery guard for a persisted capture
+// descriptor. Zero proves that no matching capture participant exists locally.
+func (a *ReplicatedApply) RangeSplitCaptureCount() (uint64, error) {
+	if a == nil || a.database == nil {
+		return 0, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil || a.database.replicatedCaptureCollection == nil {
+		return 0, errors.Join(err, ErrReplicatedApplyMismatch)
+	}
+	return a.database.replicatedCaptureCollection.Len(), nil
 }
 
 // BuildBundleSnapshotBase captures and certifies the hidden apply image plus
@@ -1574,23 +1843,45 @@ func (a *ReplicatedApply) ApplyNormal(
 	meta raftmodel.ApplyMeta,
 	data []byte,
 ) (raftmodel.Publication, error) {
+	publication, _, err := a.applyNormal(meta, data, false)
+	return publication, err
+}
+
+// ApplyNormalWithCompletion carries the original durable result to the Raft
+// settlement lane without changing explicit post-apply lookup semantics.
+func (a *ReplicatedApply) ApplyNormalWithCompletion(
+	meta raftmodel.ApplyMeta, data []byte,
+) (raftmodel.Publication, []byte, error) {
+	return a.applyNormal(meta, data, true)
+}
+
+func (a *ReplicatedApply) applyNormal(
+	meta raftmodel.ApplyMeta, data []byte, captureCompletion bool,
+) (raftmodel.Publication, []byte, error) {
 	if a == nil || a.database == nil {
-		return raftmodel.Publication{}, ErrReplicatedApplyClosed
+		return raftmodel.Publication{}, nil, ErrReplicatedApplyClosed
 	}
 	a.database.mu.Lock()
 	defer a.database.mu.Unlock()
 	if err := a.checkLocked(); err != nil {
-		return raftmodel.Publication{}, err
+		return raftmodel.Publication{}, nil, err
 	}
 	if err := a.checkActivationBaseLocked(); err != nil {
-		return raftmodel.Publication{}, err
+		return raftmodel.Publication{}, nil, err
 	}
 	a.attemptGeneration = a.table.collection.Generation()
 	a.attemptActive = true
-	publication, err := a.machine.ApplyNormal(meta, data)
+	var publication raftmodel.Publication
+	var completion []byte
+	var err error
+	if captureCompletion {
+		publication, completion, err = a.machine.ApplyNormalWithCompletion(meta, data)
+	} else {
+		publication, err = a.machine.ApplyNormal(meta, data)
+	}
 	a.attemptActive = false
 	a.attemptGeneration = 0
-	return publication, err
+	return publication, completion, err
 }
 
 // ApplyNormalBatch implements raftmodel.NormalBatchStateMachine under one SQL
@@ -1836,6 +2127,53 @@ func (a *ReplicatedApply) DurabilityStats() (durable.CheckpointGroupStats, error
 	return a.database.checkpointGroup.Stats(), nil
 }
 
+// ReplicatedApplyResourceStats is one detached, fixed-space storage snapshot
+// for a serving replicated bundle. Relations are dense in authenticated
+// relation-ID order. The hidden system and split-capture participants are
+// reported separately so benchmark tooling can account for every physical
+// byte without acquiring a collection or database capability.
+type ReplicatedApplyResourceStats struct {
+	System        durable.Stats
+	Capture       durable.Stats
+	Relations     [replication.MaxRelationsPerBundle]durable.Stats
+	RelationCount uint16
+}
+
+// ResourceStats returns exact collection I/O and space counters without
+// exposing storage handles. The database catalog lock keeps the relation
+// manifest and collection pointers on one coherent cut.
+func (a *ReplicatedApply) ResourceStats() (ReplicatedApplyResourceStats, error) {
+	if a == nil || a.database == nil {
+		return ReplicatedApplyResourceStats{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return ReplicatedApplyResourceStats{}, err
+	}
+	identity := a.database.catalog.ReplicatedShardStore
+	if identity == nil || identity.RelationCount == 0 ||
+		identity.RelationCount > uint16(len((ReplicatedApplyResourceStats{}).Relations)) ||
+		a.database.replicatedApplyCollection == nil ||
+		a.database.replicatedCaptureCollection == nil {
+		return ReplicatedApplyResourceStats{}, ErrReplicatedApplyMismatch
+	}
+	result := ReplicatedApplyResourceStats{
+		System:        a.database.replicatedApplyCollection.Stats(),
+		Capture:       a.database.replicatedCaptureCollection.Stats(),
+		RelationCount: identity.RelationCount,
+	}
+	for ordinal := uint16(0); ordinal < identity.RelationCount; ordinal++ {
+		relation := identity.Relations[ordinal]
+		table := a.database.tables[relation.Table]
+		if table == nil || table.collection == nil {
+			return ReplicatedApplyResourceStats{}, ErrReplicatedApplyMismatch
+		}
+		result.Relations[ordinal] = table.collection.Stats()
+	}
+	return result, nil
+}
+
 func replicatedApplyProfileDigest(
 	identity ReplicatedShardStoreIdentity,
 	placement ReplicatedPlacementProfile,
@@ -1899,21 +2237,28 @@ func newReplicatedApplyMeta(
 	options ReplicatedApplyOptions,
 ) replicatedApplyMeta {
 	captureLimits, _ := replicatedCaptureLimits(identity)
+	systemLimits := replicatedApplyTransactionSystemLimits(identity, options.RetryWindow,
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), options.TxnLimits.MaxDocuments)
 	return replicatedApplyMeta{
-		Format:            ReplicatedApplyFormat,
-		Storage:           strings.Clone(storage),
-		CaptureStorage:    strings.Clone(captureStorage),
-		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
-		ValidationDigest:  replicatedApplyProfileDigest(identity, options.Placement),
-		SystemLimits:      replicatedApplySystemLimits(options.RetryWindow),
-		CaptureLimits:     captureLimits,
-		MaxSessions:       options.MaxSessions,
-		RetryWindow:       options.RetryWindow,
-		TxnMaxCollections: options.TxnLimits.MaxCollections,
-		TxnMaxDocuments:   options.TxnLimits.MaxDocuments,
-		TxnMaxBytes:       options.TxnLimits.MaxBytes,
-		Placement:         ownedReplicatedPlacementProfile(options.Placement),
-		Sidecars:          canonicalReplicatedApplySidecars(),
+		Format:                           ReplicatedApplyFormat,
+		Storage:                          strings.Clone(storage),
+		CaptureStorage:                   strings.Clone(captureStorage),
+		ValidationProfile:                uint8(replicatedstate.ValidationDeterministicMutation),
+		ValidationDigest:                 replicatedApplyProfileDigest(identity, options.Placement),
+		SystemLimits:                     systemLimits,
+		CaptureLimits:                    captureLimits,
+		MaxSessions:                      options.MaxSessions,
+		RetryWindow:                      options.RetryWindow,
+		TxnMaxCollections:                options.TxnLimits.MaxCollections,
+		TxnMaxDocuments:                  options.TxnLimits.MaxDocuments,
+		TxnMaxBytes:                      options.TxnLimits.MaxBytes,
+		Placement:                        ownedReplicatedPlacementProfile(options.Placement),
+		RequestLedgerCapacityBytes:       options.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: options.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          options.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            options.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       options.RequestLedgerRangeIdentity,
+		Sidecars:                         canonicalReplicatedApplySidecarsForLimits(systemLimits),
 	}
 }
 
@@ -1951,12 +2296,37 @@ func validateReplicatedApplyOptions(
 		options.TxnLimits.MaxBytes <= 0 {
 		return fmt.Errorf("%w: invalid transaction or retention limits", ErrReplicatedApplyMismatch)
 	}
-	requiredBytes, err := ReplicatedApplyTransactionByteFloor(identity, options.RetryWindow)
+	requiredBytes, err := replicatedApplyTransactionByteFloor(identity, options.RetryWindow,
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), options.TxnLimits.MaxDocuments)
 	if err != nil || options.TxnLimits.MaxBytes < requiredBytes {
 		return fmt.Errorf("%w: transaction byte limit does not cover apply and capture", ErrReplicatedApplyMismatch)
 	}
 	if err := validateReplicatedPlacementProfile(options.Placement, identity); err != nil {
 		return err
+	}
+	if err := validateReplicatedRequestLedgerOptions(options); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateReplicatedRequestLedgerOptions(options ReplicatedApplyOptions) error {
+	enabled := options.RequestLedgerCapacityBytes != 0 ||
+		options.RequestLedgerCleanupReserveBytes != 0 ||
+		options.RequestLedgerRangeStart != ([sha256.Size]byte{}) ||
+		options.RequestLedgerRangeEnd != ([sha256.Size]byte{}) ||
+		options.RequestLedgerRangeIdentity != ([sha256.Size]byte{})
+	if !enabled {
+		return nil
+	}
+	if options.RequestLedgerCapacityBytes == 0 ||
+		options.RequestLedgerCapacityBytes > math.MaxInt64 ||
+		options.RequestLedgerCleanupReserveBytes == 0 ||
+		options.RequestLedgerCleanupReserveBytes >= options.RequestLedgerCapacityBytes ||
+		options.RequestLedgerRangeIdentity == ([sha256.Size]byte{}) ||
+		(options.RequestLedgerRangeEnd != ([sha256.Size]byte{}) &&
+			bytes.Compare(options.RequestLedgerRangeStart[:], options.RequestLedgerRangeEnd[:]) >= 0) {
+		return fmt.Errorf("%w: invalid request-ledger capacity or range", ErrReplicatedApplyMismatch)
 	}
 	return nil
 }
@@ -2016,7 +2386,12 @@ func (m replicatedApplyMeta) options() ReplicatedApplyOptions {
 			MaxDocuments:   m.TxnMaxDocuments,
 			MaxBytes:       m.TxnMaxBytes,
 		},
-		Placement: ownedReplicatedPlacementProfile(m.Placement),
+		Placement:                        ownedReplicatedPlacementProfile(m.Placement),
+		RequestLedgerCapacityBytes:       m.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: m.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          m.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            m.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       m.RequestLedgerRangeIdentity,
 	}
 }
 
@@ -2027,7 +2402,12 @@ func (m replicatedApplyMeta) identity() ReplicatedApplyIdentity {
 		SystemLimits: m.SystemLimits, CaptureLimits: m.CaptureLimits, MaxSessions: m.MaxSessions,
 		RetryWindow: m.RetryWindow,
 		TxnLimits:   m.options().TxnLimits, Placement: ownedReplicatedPlacementProfile(m.Placement),
-		Sidecars: m.Sidecars,
+		RequestLedgerCapacityBytes:       m.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: m.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          m.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            m.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       m.RequestLedgerRangeIdentity,
+		Sidecars:                         m.Sidecars,
 	}
 }
 
@@ -2036,14 +2416,19 @@ func replicatedApplyMetaFromIdentity(identity ReplicatedApplyIdentity) replicate
 		Format: identity.Format, Storage: strings.Clone(identity.Storage), CaptureStorage: strings.Clone(identity.CaptureStorage),
 		ValidationProfile: identity.ValidationProfile,
 		ValidationDigest:  identity.ValidationDigest, SystemLimits: identity.SystemLimits,
-		CaptureLimits:     identity.CaptureLimits,
-		MaxSessions:       identity.MaxSessions,
-		RetryWindow:       identity.RetryWindow,
-		TxnMaxCollections: identity.TxnLimits.MaxCollections,
-		TxnMaxDocuments:   identity.TxnLimits.MaxDocuments,
-		TxnMaxBytes:       identity.TxnLimits.MaxBytes,
-		Placement:         ownedReplicatedPlacementProfile(identity.Placement),
-		Sidecars:          identity.Sidecars,
+		CaptureLimits:                    identity.CaptureLimits,
+		MaxSessions:                      identity.MaxSessions,
+		RetryWindow:                      identity.RetryWindow,
+		TxnMaxCollections:                identity.TxnLimits.MaxCollections,
+		TxnMaxDocuments:                  identity.TxnLimits.MaxDocuments,
+		TxnMaxBytes:                      identity.TxnLimits.MaxBytes,
+		Placement:                        ownedReplicatedPlacementProfile(identity.Placement),
+		RequestLedgerCapacityBytes:       identity.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: identity.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          identity.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            identity.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       identity.RequestLedgerRangeIdentity,
+		Sidecars:                         identity.Sidecars,
 	}
 }
 
@@ -2080,7 +2465,8 @@ func validateReplicatedApplyMeta(
 		m.CaptureStorage == m.Storage {
 		return fmt.Errorf("%w: invalid or aliased capture storage identity", ErrReplicatedApplyMismatch)
 	}
-	if m.SystemLimits != replicatedApplySystemLimits(m.RetryWindow) {
+	if m.SystemLimits != replicatedApplyTransactionSystemLimits(*identity, m.RetryWindow,
+		m.RequestLedgerRangeIdentity != ([sha256.Size]byte{}), m.TxnMaxDocuments) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
 	captureLimits, err := replicatedCaptureLimits(*identity)

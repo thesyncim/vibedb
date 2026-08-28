@@ -90,7 +90,7 @@ func TestSQLCapabilityWarmPathAllocationFree(t *testing.T) {
 		if SQLCapability(sql) != CapabilityDataRead {
 			panic("classification changed")
 		}
-	}); allocations != 0 {
+	}); !raceDetectorEnabled && allocations != 0 {
 		t.Fatalf("SQLCapability allocations=%v", allocations)
 	}
 }

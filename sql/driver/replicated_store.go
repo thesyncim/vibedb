@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -95,16 +96,30 @@ const (
 	ReplicatedShardRelationGlobalIndex
 )
 
+// ReplicatedRelationKeyEncoding freezes the byte grammar used by one relation
+// storage key. Global-index rows use the canonical placement tuple followed by
+// a locator tuple only when the index is non-unique.
+type ReplicatedRelationKeyEncoding uint8
+
+const (
+	ReplicatedRelationKeyCanonicalTuple ReplicatedRelationKeyEncoding = iota + 1
+)
+
 // ReplicatedGlobalIndexRelation is the cold provisioning input for one global
 // exact-index image. Relation IDs must be dense from two; no table name or
 // index identity is carried by replicated mutation commands.
 type ReplicatedGlobalIndexRelation struct {
-	Relation     uint16
-	Table        string
-	IndexID      uint64
-	Incarnation  uint64
-	LocatorCount uint8
-	Unique       bool
+	Relation      uint16                        `json:"relation"`
+	Table         string                        `json:"table"`
+	IndexID       uint64                        `json:"index_id"`
+	Incarnation   uint64                        `json:"incarnation"`
+	LocatorCount  uint8                         `json:"locator_count"`
+	Unique        bool                          `json:"unique"`
+	KeyEncoding   ReplicatedRelationKeyEncoding `json:"key_encoding"`
+	KeyArity      uint8                         `json:"key_arity"`
+	TupleVersion  distribution.TupleVersion     `json:"tuple_version"`
+	MapperVersion distribution.MapperVersion    `json:"mapper_version"`
+	BucketBits    uint8                         `json:"bucket_bits"`
 }
 
 // ReplicatedShardRelationIdentity is one immutable, comparable manifest slot.
@@ -121,6 +136,45 @@ type ReplicatedShardRelationIdentity struct {
 	Incarnation      uint64
 	LocatorCount     uint8
 	Unique           bool
+	KeyEncoding      ReplicatedRelationKeyEncoding
+	KeyArity         uint8
+	TupleVersion     distribution.TupleVersion
+	MapperVersion    distribution.MapperVersion
+	BucketBits       uint8
+}
+
+// GlobalIndexStorageKeyPoint validates one stored global-index key against the
+// retained schema-generation contract and maps its index tuple to an ownership
+// point. For a non-unique index the appended locator tuple is validated too,
+// but only the leading index tuple participates in placement. The operation is
+// allocation-free and returns false for every non-global, stale-format, or
+// malformed key.
+func (r ReplicatedShardRelationIdentity) GlobalIndexStorageKeyPoint(
+	key []byte,
+) (distribution.KeyspacePoint, bool) {
+	if r.Kind != ReplicatedShardRelationGlobalIndex {
+		return distribution.KeyspacePoint{}, false
+	}
+	return (replicatedstate.GlobalIndexProfile{
+		IndexID: r.IndexID, Incarnation: r.Incarnation, LocatorCount: r.LocatorCount,
+		Unique: r.Unique, KeyEncoding: replicatedstate.GlobalIndexKeyEncoding(r.KeyEncoding),
+		KeyArity: r.KeyArity, TupleVersion: r.TupleVersion, MapperVersion: r.MapperVersion,
+		BucketBits: r.BucketBits,
+	}).GlobalIndexStorageKeyPoint(key)
+}
+
+func validReplicatedGlobalIndexPlacement(
+	encoding ReplicatedRelationKeyEncoding,
+	arity uint8,
+	tuple distribution.TupleVersion,
+	mapper distribution.MapperVersion,
+	bucketBits uint8,
+) bool {
+	return encoding == ReplicatedRelationKeyCanonicalTuple &&
+		arity >= 1 && arity <= distribution.KeyspaceWidth &&
+		tuple == distribution.CurrentTupleVersion &&
+		mapper == distribution.NativeMapperVersion &&
+		distribution.ValidVirtualBucketBits(bucketBits)
 }
 
 // ReplicatedShardStoreIdentity is the complete reopen identity. LogID is the
@@ -205,6 +259,23 @@ func (d *Database) BindReplicatedShardStore(
 	return d.bindReplicatedShardStore(binding, userTable, nil)
 }
 
+// BindReplicatedShardStoreStorageIdentity is the topology-preparation form of
+// BindReplicatedShardStore. The allocation authority supplies the exact user
+// storage namespace before a split plan is published; this method never mints
+// or substitutes that identity. An exact retry returns the durable binding.
+func (d *Database) BindReplicatedShardStoreStorageIdentity(
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+	userStorage string,
+) (ReplicatedShardStoreIdentity, error) {
+	if err := validateStorageIdentity(userStorage); err != nil {
+		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
+			"%w: user storage identity: %v", ErrReplicatedShardStoreProfile, err,
+		)
+	}
+	return d.bindReplicatedShardStoreExact(binding, userTable, strings.Clone(userStorage), nil)
+}
+
 // BindReplicatedShardStoreBundle permanently binds one base JSON table and a
 // dense list of independently stored global-index relations to one replicated
 // shard group. All named tables must be the complete, unmaterialized catalog;
@@ -218,10 +289,41 @@ func (d *Database) BindReplicatedShardStoreBundle(
 	return d.bindReplicatedShardStoreBundle(binding, userTable, globalIndexes, nil)
 }
 
+// BindReplicatedShardStoreBundleIdentity provisions a complete bundle using the
+// retained identity of every relation. The identity and catalog schema must
+// agree before any storage is created; an exact retry settles the same binding.
+// An empty globalIndexes list provisions the base relation alone, including its
+// exact local-index manifest.
+func (d *Database) BindReplicatedShardStoreBundleIdentity(
+	expected ReplicatedShardStoreIdentity,
+	globalIndexes []ReplicatedGlobalIndexRelation,
+) (ReplicatedShardStoreIdentity, error) {
+	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
+		return ReplicatedShardStoreIdentity{}, err
+	}
+	if !replicatedBundleProvisioningMatches(expected, globalIndexes) {
+		return ReplicatedShardStoreIdentity{}, ErrReplicatedShardStoreIdentityMismatch
+	}
+	expected = ownedReplicatedShardStoreIdentity(expected)
+	return d.bindReplicatedShardStoreBundleExact(
+		expected.Binding, expected.UserTable, globalIndexes, &expected, nil,
+	)
+}
+
 func (d *Database) bindReplicatedShardStoreBundle(
 	binding ReplicatedShardStoreBinding,
 	userTable string,
 	globalIndexes []ReplicatedGlobalIndexRelation,
+	persist func(*database) (bool, error),
+) (ReplicatedShardStoreIdentity, error) {
+	return d.bindReplicatedShardStoreBundleExact(binding, userTable, globalIndexes, nil, persist)
+}
+
+func (d *Database) bindReplicatedShardStoreBundleExact(
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+	globalIndexes []ReplicatedGlobalIndexRelation,
+	expected *ReplicatedShardStoreIdentity,
 	persist func(*database) (bool, error),
 ) (ReplicatedShardStoreIdentity, error) {
 	if err := validateReplicatedShardStoreBinding(binding); err != nil {
@@ -230,7 +332,7 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	if err := validateReplicatedBundleRelationName(userTable); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if len(globalIndexes) == 0 || len(globalIndexes)+1 > replication.MaxRelationsPerBundle {
+	if (len(globalIndexes) == 0 && expected == nil) || len(globalIndexes)+1 > replication.MaxRelationsPerBundle {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 			"%w: global relation count", ErrReplicatedShardStoreProfile,
 		)
@@ -241,7 +343,11 @@ func (d *Database) bindReplicatedShardStoreBundle(
 		if relation.Relation != uint16(i+2) ||
 			validateReplicatedBundleRelationName(relation.Table) != nil ||
 			relation.IndexID == 0 || relation.Incarnation == 0 ||
-			relation.LocatorCount == 0 || relation.LocatorCount > 8 {
+			relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
+			!validReplicatedGlobalIndexPlacement(
+				relation.KeyEncoding, relation.KeyArity, relation.TupleVersion,
+				relation.MapperVersion, relation.BucketBits,
+			) {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: invalid global relation slot %d", ErrReplicatedShardStoreProfile, i+2,
 			)
@@ -284,6 +390,7 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	if current := core.catalog.ReplicatedShardStore; current != nil {
 		if current.Binding != binding || current.UserTable != userTable ||
 			current.Sidecars != sidecars ||
+			(expected != nil && !current.Equal(*expected)) ||
 			!replicatedBundleProvisioningMatches(*current, ownedGlobals) {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: catalog is already bound", ErrReplicatedShardStoreIdentityMismatch,
@@ -377,6 +484,11 @@ func (d *Database) bindReplicatedShardStoreBundle(
 			return ReplicatedShardStoreIdentity{}, err
 		}
 	}
+	if expected != nil {
+		if err := core.validateReservedReplicatedBundleLocked(*expected, sidecars, local.LogID); err != nil {
+			return ReplicatedShardStoreIdentity{}, err
+		}
+	}
 	if err := core.checkRetirementCapacityLocked(len(pending)); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
@@ -420,9 +532,15 @@ func (d *Database) bindReplicatedShardStoreBundle(
 		return errors.Join(errs...)
 	}
 	for i := range pending {
-		storage, err := core.newStorageIdentityLocked()
-		if err != nil {
-			return ReplicatedShardStoreIdentity{}, rollback(err)
+		var storage string
+		if expected != nil {
+			storage = expected.Relations[i].Storage
+		} else {
+			var err error
+			storage, err = core.newStorageIdentityLocked()
+			if err != nil {
+				return ReplicatedShardStoreIdentity{}, rollback(err)
+			}
 		}
 		meta := cloneTableMeta(pending[i].original.meta)
 		meta.Storage = storage
@@ -480,12 +598,20 @@ func (d *Database) bindReplicatedShardStoreBundle(
 			relation.Incarnation = pending[i].global.Incarnation
 			relation.LocatorCount = pending[i].global.LocatorCount
 			relation.Unique = pending[i].global.Unique
+			relation.KeyEncoding = pending[i].global.KeyEncoding
+			relation.KeyArity = pending[i].global.KeyArity
+			relation.TupleVersion = pending[i].global.TupleVersion
+			relation.MapperVersion = pending[i].global.MapperVersion
+			relation.BucketBits = pending[i].global.BucketBits
 		}
 		identity.Relations[i] = relation
 	}
 	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
 		return ReplicatedShardStoreIdentity{}, rollback(err)
+	}
+	if expected != nil && !expected.Equal(identity) {
+		return ReplicatedShardStoreIdentity{}, rollback(ErrReplicatedShardStoreIdentityMismatch)
 	}
 	members := make([]durable.NamedCollection, len(pending))
 	for i := range pending {
@@ -545,6 +671,49 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	return ownedReplicatedShardStoreIdentity(identity), nil
 }
 
+// validateReservedReplicatedBundleLocked checks the schema-dependent identity
+// fields and every reserved namespace before materializing the first relation.
+// The public entry point already validates the manifest and global specs.
+func (d *database) validateReservedReplicatedBundleLocked(
+	expected ReplicatedShardStoreIdentity,
+	sidecars ReplicatedShardStoreSidecarProfile,
+	logID [16]byte,
+) error {
+	if expected.LogID != logID || expected.Sidecars != sidecars ||
+		expected.UserPrimaryKey != d.tables[expected.UserTable].meta.PrimaryKey {
+		return ErrReplicatedShardStoreIdentityMismatch
+	}
+	for i, relation := range expected.Relations {
+		t := d.tables[relation.Table]
+		normalized, err := durable.NormalizeOptions(durableOptions(t))
+		if err != nil {
+			return fmt.Errorf("%w: relation options: %v", ErrReplicatedShardStoreProfile, err)
+		}
+		limits := ReplicatedShardStoreLimits{
+			MaxKeyBytes: normalized.MaxKeyBytes, MaxDocumentBytes: normalized.MaxDocumentBytes,
+			MaxBatchDocuments: normalized.MaxBatchDocuments, MaxBatchBytes: normalized.MaxBatchBytes,
+		}
+		if relation.Limits != limits || i == 0 && relation.LocalIndexDigest != replicatedLocalIndexDigest(t.meta.Indexes) {
+			return ErrReplicatedShardStoreIdentityMismatch
+		}
+		for prior := 0; prior < i; prior++ {
+			if expected.Relations[prior].Storage == relation.Storage {
+				return fmt.Errorf("%w: duplicate reserved relation storage", ErrReplicatedShardStoreIdentityMismatch)
+			}
+		}
+		path := filepath.Join(d.dataDir, relation.Storage+".vjc")
+		if d.storagePathInUseLocked(path) {
+			return fmt.Errorf("%w: reserved relation storage is in use", ErrReplicatedShardStoreIdentityMismatch)
+		}
+		for _, candidate := range [...]string{path, durable.RecoveryJournalPath(path)} {
+			if _, err := os.Lstat(candidate); err == nil || !os.IsNotExist(err) {
+				return errors.Join(ErrReplicatedShardStoreIdentityMismatch, err)
+			}
+		}
+	}
+	return nil
+}
+
 func replicatedBundleProvisioningMatches(
 	identity ReplicatedShardStoreIdentity,
 	globalIndexes []ReplicatedGlobalIndexRelation,
@@ -558,7 +727,10 @@ func replicatedBundleProvisioningMatches(
 		if got.Relation != want.Relation ||
 			got.Kind != ReplicatedShardRelationGlobalIndex || got.Table != want.Table ||
 			got.IndexID != want.IndexID || got.Incarnation != want.Incarnation ||
-			got.LocatorCount != want.LocatorCount || got.Unique != want.Unique {
+			got.LocatorCount != want.LocatorCount || got.Unique != want.Unique ||
+			got.KeyEncoding != want.KeyEncoding || got.KeyArity != want.KeyArity ||
+			got.TupleVersion != want.TupleVersion ||
+			got.MapperVersion != want.MapperVersion || got.BucketBits != want.BucketBits {
 			return false
 		}
 	}
@@ -568,6 +740,15 @@ func replicatedBundleProvisioningMatches(
 func (d *Database) bindReplicatedShardStore(
 	binding ReplicatedShardStoreBinding,
 	userTable string,
+	persist func(*database) (bool, error),
+) (ReplicatedShardStoreIdentity, error) {
+	return d.bindReplicatedShardStoreExact(binding, userTable, "", persist)
+}
+
+func (d *Database) bindReplicatedShardStoreExact(
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+	reservedUserStorage string,
 	persist func(*database) (bool, error),
 ) (ReplicatedShardStoreIdentity, error) {
 	if err := validateReplicatedShardStoreBinding(binding); err != nil {
@@ -604,7 +785,8 @@ func (d *Database) bindReplicatedShardStore(
 	}
 	if current := core.catalog.ReplicatedShardStore; current != nil {
 		if current.Binding != binding || current.UserTable != userTable ||
-			current.Sidecars != sidecars {
+			current.Sidecars != sidecars ||
+			(reservedUserStorage != "" && current.UserStorage != reservedUserStorage) {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: catalog is already bound", ErrReplicatedShardStoreIdentityMismatch,
 			)
@@ -692,11 +874,32 @@ func (d *Database) bindReplicatedShardStore(
 			ErrReplicatedShardStoreProfile, err,
 		)
 	}
-	storage, err := core.newStorageIdentityLocked()
-	if err != nil {
-		return ReplicatedShardStoreIdentity{}, errors.Join(
-			err, core.txnLog.ReconfigureUnminted(previousTxnOptions),
-		)
+	storage := reservedUserStorage
+	if storage == "" {
+		var err error
+		storage, err = core.newStorageIdentityLocked()
+		if err != nil {
+			return ReplicatedShardStoreIdentity{}, errors.Join(
+				err, core.txnLog.ReconfigureUnminted(previousTxnOptions),
+			)
+		}
+	} else {
+		path := filepath.Join(core.dataDir, storage+".vjc")
+		journal := durable.RecoveryJournalPath(path)
+		if core.storagePathInUseLocked(path) {
+			return ReplicatedShardStoreIdentity{}, errors.Join(
+				ErrReplicatedShardStoreProfile,
+				core.txnLog.ReconfigureUnminted(previousTxnOptions),
+			)
+		}
+		for _, candidate := range [...]string{path, journal} {
+			if _, statErr := os.Lstat(candidate); statErr == nil || !os.IsNotExist(statErr) {
+				return ReplicatedShardStoreIdentity{}, errors.Join(
+					ErrReplicatedShardStoreProfile, statErr,
+					core.txnLog.ReconfigureUnminted(previousTxnOptions),
+				)
+			}
+		}
 	}
 	meta := cloneTableMeta(t.meta)
 	meta.Storage = storage
@@ -1042,12 +1245,18 @@ func replicatedIdentityForTable(
 func validateReplicatedCatalog(catalog catalogFile) error {
 	r := catalog.ReplicatedShardStore
 	if r == nil {
-		if catalog.ReplicatedApply != nil {
+		if catalog.ReplicatedApply != nil || catalog.ReplicatedChildApply != nil {
 			return fmt.Errorf("%w: replicated apply requires a replicated shard binding", ErrReplicatedApplyMismatch)
 		}
 		return nil
 	}
 	if err := validateReplicatedShardStoreIdentity(*r); err != nil {
+		return err
+	}
+	if catalog.ReplicatedApply != nil && catalog.ReplicatedChildApply != nil {
+		return ErrReplicatedApplyMismatch
+	}
+	if err := validateReplicatedApplyMeta(catalog.ReplicatedChildApply, r); err != nil {
 		return err
 	}
 	if catalog.ShardStore == nil {
@@ -1337,13 +1546,19 @@ func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) e
 			if ordinal != 0 || relation.Table != identity.UserTable ||
 				relation.Storage != identity.UserStorage || relation.Limits != identity.UserLimits ||
 				relation.IndexID != 0 || relation.Incarnation != 0 ||
-				relation.LocatorCount != 0 || relation.Unique {
+				relation.LocatorCount != 0 || relation.Unique || relation.KeyEncoding != 0 ||
+				relation.KeyArity != 0 || relation.TupleVersion != 0 ||
+				relation.MapperVersion != 0 || relation.BucketBits != 0 {
 				return fmt.Errorf("%w: invalid base relation", ErrReplicatedShardStoreProfile)
 			}
 		case ReplicatedShardRelationGlobalIndex:
 			if ordinal == 0 || relation.LocalIndexDigest != ([sha256.Size]byte{}) ||
 				relation.IndexID == 0 || relation.Incarnation == 0 ||
-				relation.LocatorCount == 0 || relation.LocatorCount > 8 {
+				relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
+				!validReplicatedGlobalIndexPlacement(
+					relation.KeyEncoding, relation.KeyArity, relation.TupleVersion,
+					relation.MapperVersion, relation.BucketBits,
+				) {
 				return fmt.Errorf("%w: invalid global-index relation", ErrReplicatedShardStoreProfile)
 			}
 		default:
@@ -1374,7 +1589,7 @@ func writeReplicatedRelationDescriptors(
 	identity ReplicatedShardStoreIdentity,
 	includeStorage bool,
 ) {
-	var fixed [48]byte
+	var fixed [56]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], identity.RelationSchemaGeneration)
 	binary.LittleEndian.PutUint64(fixed[8:16], uint64(identity.RelationCount))
 	_, _ = h.Write(fixed[:16])
@@ -1388,13 +1603,17 @@ func writeReplicatedRelationDescriptors(
 		} else {
 			fixed[4] = 0
 		}
-		clear(fixed[5:8])
+		fixed[5] = byte(relation.KeyEncoding)
+		fixed[6] = relation.KeyArity
+		fixed[7] = relation.BucketBits
 		binary.LittleEndian.PutUint64(fixed[8:16], relation.IndexID)
 		binary.LittleEndian.PutUint64(fixed[16:24], relation.Incarnation)
 		binary.LittleEndian.PutUint64(fixed[24:32], uint64(relation.Limits.MaxKeyBytes))
 		binary.LittleEndian.PutUint64(fixed[32:40], uint64(relation.Limits.MaxDocumentBytes))
 		binary.LittleEndian.PutUint32(fixed[40:44], uint32(relation.Limits.MaxBatchDocuments))
 		binary.LittleEndian.PutUint32(fixed[44:48], uint32(relation.Limits.MaxBatchBytes))
+		binary.LittleEndian.PutUint32(fixed[48:52], uint32(relation.TupleVersion))
+		binary.LittleEndian.PutUint32(fixed[52:56], uint32(relation.MapperVersion))
 		_, _ = h.Write(fixed[:])
 		writeReplicatedRelationFrame(h, []byte(relation.Table))
 		if includeStorage {

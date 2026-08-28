@@ -119,6 +119,33 @@ func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) err
 
 func settleTestApplied(AppliedBatch) error { return nil }
 
+func TestRuntimeQuiesceSQLGenerationRetainsRaftAndWAL(t *testing.T) {
+	fixture := newRuntimeFixture(t, 248, nil)
+	runtime := fixture.runtime
+	if err := runtime.ConfigureWALGeneration(WALGenerationDriverOptions{
+		IntervalTicks: 10, Key: fixture.walKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.InstallSQLGeneration(
+		fixture.database, fixture.apply, fixture.base, fixture.applyID,
+	); !errors.Is(err, ErrSchemaGenerationSwap) {
+		t.Fatalf("install before quiesce error=%v", err)
+	}
+	if err := runtime.QuiesceSQLGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.schemaGenerationQuiesced || runtime.apply != nil || runtime.database != nil ||
+		runtime.node == nil || runtime.wal == nil || runtime.walGeneration != nil ||
+		runtime.schemaWALResume == nil {
+		t.Fatalf("quiesced runtime apply=%p database=%p node=%p wal=%p",
+			runtime.apply, runtime.database, runtime.node, runtime.wal)
+	}
+	if err := runtime.Propose([]byte{1}); !errors.Is(err, ErrRuntimeClosed) {
+		t.Fatalf("proposal after quiesce error=%v", err)
+	}
+}
+
 func TestRuntimeIdentityPublishesPortableMachineManifest(t *testing.T) {
 	fixture := newRuntimeFixture(t, 209, nil)
 	profile, err := fixture.apply.CapacityQualificationProfile()
@@ -629,6 +656,16 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 		after.ReplicaSetVersion != before.ReplicaSetVersion ||
 		after.ConfState.Equivalent(before.ConfState) != nil {
 		t.Fatalf("restarted publication = %+v, %v; before %+v", after, err, before)
+	}
+	retained, err := restarted.SnapshotBaseCertificate()
+	if err != nil || retained.Digest == ([32]byte{}) ||
+		retained.Manifest.State.Applied != before.Applied {
+		t.Fatalf("retained snapshot-base certificate = %+v, %v", retained, err)
+	}
+	retainedState, err := restarted.SnapshotState()
+	if err != nil || retainedState.SnapshotBaseDigest != retained.Digest {
+		t.Fatalf("retained snapshot-base/state mismatch = %x/%x, %v",
+			retained.Digest, retainedState.SnapshotBaseDigest, err)
 	}
 	drainRuntime(t, restarted, nil)
 	if err := restarted.Campaign(); err != nil {

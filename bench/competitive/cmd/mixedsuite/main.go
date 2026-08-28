@@ -831,7 +831,12 @@ func collectMetadata(cfg config, args []string, started time.Time) map[string]st
 			"git", "-C", root, "status", "--porcelain", "--untracked-files=normal",
 		)
 		metadata["git-dirty"] = strconv.FormatBool(status != "")
-		metadata["git-status"] = status
+		// A clean checkout has no status details. Preserve its explicit
+		// git-dirty=false proof without emitting an empty optional record,
+		// which the evidence validator correctly refuses.
+		if status != "" {
+			metadata["git-status"] = status
+		}
 		diff, err := exec.Command(
 			"git", "-C", root, "diff", "--binary", "HEAD", "--",
 		).Output()

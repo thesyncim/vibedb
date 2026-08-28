@@ -15,6 +15,42 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+func TestRetainedPrunePendingRowsRoundTripExactOldDocuments(t *testing.T) {
+	keys := [][]byte{[]byte("a"), []byte("z")}
+	documents := [][]byte{[]byte(`{"id":"a","v":1}`), []byte(`{"id":"z","v":2}`)}
+	raw := appendPendingPruneRows(nil, 1, keys, documents)
+	pruner := &RetainedPruner{cursor: RetainedPruneCursor{
+		relation: 1, relationCount: 1,
+		pendingCount: 2, pendingKeyBytes: 2, pendingKeys: raw,
+	}}
+	if !validPendingPruneKeys(&pruner.cursor) {
+		t.Fatal("canonical pending rows rejected")
+	}
+	var workspace RetainedPruneWorkspace
+	batch, err := pruner.openPendingBatch(&workspace)
+	if err != nil || batch.Count != 2 || batch.KeyBytes != 2 ||
+		batch.DocumentBytes != uint64(len(documents[0])+len(documents[1])) {
+		t.Fatalf("batch=%+v err=%v", batch, err)
+	}
+	iterator := batch.Iterator()
+	for index := range keys {
+		if !iterator.Next() || !bytes.Equal(iterator.Key(), keys[index]) ||
+			!bytes.Equal(iterator.Document(), documents[index]) {
+			t.Fatalf("row %d was not byte exact", index)
+		}
+	}
+	corrupt := bytes.Clone(raw)
+	corrupt[len(corrupt)-1] ^= 1
+	pruner.cursor.pendingKeys = corrupt
+	changed, err := pruner.openPendingBatch(&workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Digest == batch.Digest {
+		t.Fatal("old-document change retained the same canonical digest")
+	}
+}
+
 func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(t)
 	pruner, err := newTestRetainedPruner(t, partitioner, certificate, nil)
@@ -53,6 +89,10 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatalf("plan batch=%+v has=%v err=%v close=%v", batch, hasBatch, err, closeErr)
 	}
 	firstKey := bytes.Clone(firstRetainedPruneKey(batch))
+	firstDocument := bytes.Clone(firstRetainedPruneDocument(batch))
+	if len(firstDocument) == 0 || batch.DocumentBytes < uint64(len(firstDocument)) {
+		t.Fatalf("batch lost exact old document: bytes=%d document=%q", batch.DocumentBytes, firstDocument)
+	}
 
 	// Crash before proposal: the persisted awaiting cursor deterministically
 	// replans the same exact batch from the unchanged source publication.
@@ -66,7 +106,8 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 	retry, hasBatch, err := pruner.Advance(snapshot, capture, limits, persist, &workspace)
 	if closeErr := snapshot.Close(); err != nil || closeErr != nil || !hasBatch ||
-		retry.Digest != batch.Digest || !bytes.Equal(firstRetainedPruneKey(retry), firstKey) {
+		retry.Digest != batch.Digest || !bytes.Equal(firstRetainedPruneKey(retry), firstKey) ||
+		!bytes.Equal(firstRetainedPruneDocument(retry), firstDocument) {
 		t.Fatalf("retry batch=%+v has=%v err=%v close=%v", retry, hasBatch, err, closeErr)
 	}
 
@@ -74,14 +115,11 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	binding.OwnershipEpoch++
 	binding.RoutingVersion++
 	binding.RouteGeneration++
+	binding.OwnedRange = partitioner.children[partitioner.retained].Range
 	// The prune controller owns an independent bounded session opened before
 	// capture. Sequence one is its Open, so pruning starts at sequence two.
 	sequence, applied := uint64(2), uint64(7)
-	if _, err := fixture.machine.ApplyNormal(
-		sourceCaptureMeta(applied), retainedPruneCommand(t, fixture, binding, 5, sequence, retry),
-	); err != nil {
-		t.Fatal(err)
-	}
+	applyRetainedMutation(t, fixture, applied, retainedPruneCommand(t, fixture, binding, 5, sequence, retry, certificate))
 
 	// Crash after apply but before cursor confirmation: recovery consumes and
 	// verifies the already durable capture entry, then advances the scan floor.
@@ -102,7 +140,12 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for pruner.Cursor().Phase() != RetainedPruneComplete {
+	// Four rows need only bounded scan, apply confirmation, and verification
+	// turns. A rejected command must never turn this fixture into a retry soak.
+	for turns := 0; pruner.Cursor().Phase() != RetainedPruneComplete; turns++ {
+		if turns == 16 {
+			t.Fatalf("four-row prune exceeded bounded progress: cursor=%+v", pruner.Cursor())
+		}
 		snapshot, err = fixture.machine.Snapshot("docs")
 		if err != nil {
 			t.Fatal(err)
@@ -119,12 +162,7 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		}
 		sequence++
 		applied++
-		if _, err := fixture.machine.ApplyNormal(
-			sourceCaptureMeta(applied),
-			retainedPruneCommand(t, fixture, binding, 5, sequence, batch),
-		); err != nil {
-			t.Fatal(err)
-		}
+		applyRetainedMutation(t, fixture, applied, retainedPruneCommand(t, fixture, binding, 5, sequence, batch, certificate))
 	}
 	cursor := pruner.Cursor()
 	rows, baseBytes, generation, digest, ok := cursor.RetainedProof()
@@ -145,12 +183,10 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), retainedMutationCommand(
+	applyRetainedMutation(t, fixture, applied, retainedMutationCommand(
 		t, fixture, binding, 5, sequence,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("late-retained"), Value: retained},
-	)); err != nil {
-		t.Fatal(err)
-	}
+	))
 	snapshot, err = fixture.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
@@ -182,12 +218,10 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 	sequence++
 	applied++
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), retainedMutationCommand(
+	applyRetainedMutation(t, fixture, applied, retainedMutationCommand(
 		t, fixture, binding, 5, sequence,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("late-retained"), Value: updated},
-	)); err != nil {
-		t.Fatal(err)
-	}
+	))
 	snapshot, err = fixture.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
@@ -211,12 +245,10 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 	sequence++
 	applied++
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), retainedMutationCommand(
+	applyRetainedMutation(t, fixture, applied, retainedMutationCommand(
 		t, fixture, binding, 5, sequence,
 		replication.Mutation{Kind: replication.MutationDelete, Key: []byte("late-retained")},
-	)); err != nil {
-		t.Fatal(err)
-	}
+	))
 	snapshot, err = fixture.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
@@ -301,15 +333,9 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatalf("unpublished prune authority=%v", err)
 	}
 	if _, err := NewRetainedPruner(
-		partitioner, certificate, nil, nil,
+		partitioner, certificate, RetainedPruneAuthorityProof{}, nil,
 	); !errors.Is(err, ErrRetainedPrune) {
 		t.Fatalf("pruner accepted unpublished source authority=%v", err)
-	}
-	if _, err := NewRetainedPruner(partitioner, certificate, forgedPruneAuthority{
-		manifest: nextManifest, generation: 20, operation: [sha256.Size]byte{1},
-		certificate: certificate.Digest(),
-	}, nil); !errors.Is(err, ErrRetainedPrune) {
-		t.Fatalf("pruner accepted structurally compatible forged authority=%v", err)
 	}
 	corrupt := bytes.Clone(persisted)
 	corrupt[len(corrupt)-1] ^= 1
@@ -318,16 +344,40 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 }
 
-type forgedPruneAuthority struct {
-	manifest               *distribution.Manifest
-	generation             uint64
-	operation, certificate [sha256.Size]byte
+func TestRetainedPruneRequiresProofBoundCommandAfterOwnershipSeal(t *testing.T) {
+	partitioner, fixture, capture, certificate := newRetainedPruneFixture(t)
+	pruner, err := newTestRetainedPruner(t, partitioner, certificate, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace RetainedPruneWorkspace
+	batch, has, advanceErr := pruner.Advance(snapshot, capture,
+		RetainedPruneLimits{MaxKeys: 1, MaxKeyBytes: 128, MaxScanRows: 2},
+		func([]byte) error { return nil }, &workspace)
+	if closeErr := snapshot.Close(); advanceErr != nil || closeErr != nil || !has {
+		t.Fatalf("plan has=%t err=%v close=%v", has, advanceErr, closeErr)
+	}
+	binding := fixture.binding
+	binding.OwnershipEpoch++
+	binding.RoutingVersion++
+	binding.RouteGeneration++
+	binding.OwnedRange = partitioner.children[partitioner.retained].Range
+	key := bytes.Clone(firstRetainedPruneKey(batch))
+	ordinary := retainedMutationCommand(t, fixture, binding, 5, 2,
+		replication.Mutation{Kind: replication.MutationDelete, Key: key})
+	applyRetainedMutationResult(t, fixture, 7, ordinary, replicatedstate.ResultWrongShard)
+	if _, found, err := fixture.user.Collection.AppendRaw(nil, key); err != nil || !found {
+		t.Fatalf("ordinary delete changed sealed-away row: found=%t err=%v", found, err)
+	}
+	applyRetainedMutation(t, fixture, 8, retainedPruneCommand(t, fixture, binding, 5, 3, batch, certificate))
+	if _, found, err := fixture.user.Collection.AppendRaw(nil, key); err != nil || found {
+		t.Fatalf("proof-bound prune retained sealed-away row: found=%t err=%v", found, err)
+	}
 }
-
-func (a forgedPruneAuthority) Manifest() *distribution.Manifest { return a.manifest }
-func (a forgedPruneAuthority) Generation() uint64               { return a.generation }
-func (a forgedPruneAuthority) Operation() [sha256.Size]byte     { return a.operation }
-func (a forgedPruneAuthority) Certificate() [sha256.Size]byte   { return a.certificate }
 
 func BenchmarkRetainedPrunerPendingRetry(b *testing.B) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(b)
@@ -463,16 +513,15 @@ func TestRetainedPrunerAdvancesRetainedWritesAndRejectsOutOfRangeWrites(t *testi
 	binding.OwnershipEpoch++
 	binding.RoutingVersion++
 	binding.RouteGeneration++
+	binding.OwnedRange = partitioner.children[partitioner.retained].Range
 	retained, err := vibejson.AppendCanonicalize(nil, documentForChild(t, partitioner, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(7), retainedMutationCommand(
+	applyRetainedMutation(t, fixture, 7, retainedMutationCommand(
 		t, fixture, binding, 5, 2,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("e-retained"), Value: retained},
-	)); err != nil {
-		t.Fatal(err)
-	}
+	))
 	snapshot, err = fixture.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
@@ -502,20 +551,21 @@ func TestRetainedPrunerAdvancesRetainedWritesAndRejectsOutOfRangeWrites(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(8), retainedMutationCommand(
+	applyRetainedMutationResult(t, fixture, 8, retainedMutationCommand(
 		t, fixture, binding, 5, 3,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("f-out-of-range"), Value: outOfRange},
-	)); err != nil {
-		t.Fatal(err)
-	}
+	), replicatedstate.ResultWrongShard)
 	snapshot, err = fixture.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _, advanceErr = pruner.Advance(snapshot, capture, limits, persist, &workspace)
 	closeErr = snapshot.Close()
-	if !errors.Is(advanceErr, ErrRetainedPrune) || closeErr != nil {
-		t.Fatalf("out-of-range source entry err=%v close=%v", advanceErr, closeErr)
+	if advanceErr != nil || closeErr != nil || pruner.Cursor().SourceCut().Applied != 8 {
+		t.Fatalf("rejected out-of-range entry did not advance as a no-op: err=%v close=%v cursor=%+v", advanceErr, closeErr, pruner.Cursor())
+	}
+	if _, found, err := fixture.user.Collection.AppendRaw(nil, []byte("f-out-of-range")); err != nil || found {
+		t.Fatalf("rejected out-of-range document persisted: found=%t err=%v", found, err)
 	}
 }
 
@@ -530,7 +580,7 @@ func newRetainedPruneFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := newSourceCaptureFixture(t, partitioner)
+	fixture := newSourceCaptureFixtureWithValidator(t, partitioner, retainedPruneValidator{partitioner: partitioner})
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -543,16 +593,15 @@ func newRetainedPruneFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(3), fixture.command(2,
+	applyRetainedMutation(t, fixture, 3, fixture.command(2,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("a-left"), Value: left},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("b-right"), Value: right},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("c-left"), Value: left},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("d-right"), Value: right},
-	)); err != nil {
-		t.Fatal(err)
-	}
+	))
 	fixture.retainedPruneEpoch = fixture.openSession(
 		t, 4, []byte("split-controller"), sourceCaptureID(30),
+		replication.CommandAuthorityTopology,
 	)
 	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
 	if err != nil {
@@ -670,6 +719,7 @@ func retainedPruneCommand(
 	replicaSetVersion uint64,
 	sequence uint64,
 	batch RetainedPruneBatch,
+	certificate CutoverCertificate,
 ) []byte {
 	t.Helper()
 	mutations := make([]replication.Mutation, 0, batch.Count)
@@ -679,7 +729,24 @@ func retainedPruneCommand(
 			Kind: replication.MutationDelete, Key: bytes.Clone(iterator.Key()),
 		})
 	}
-	return retainedMutationCommand(t, fixture, binding, replicaSetVersion, sequence, mutations...)
+	command := retainedCommand(fixture, binding, replicaSetVersion, sequence, mutations)
+	cut := certificate.SourceCut()
+	command.Kind = replication.CommandRetainedPrune
+	command.Fingerprint = batch.Digest
+	command.RetainedPrune = replication.RetainedPruneProof{
+		OperationDigest: replication.Digest{1}, CertificateDigest: certificate.Digest(),
+		BatchDigest: batch.Digest, DataChainDigest: cut.DataChainDigest,
+		EntryDigest: cut.EntryDigest, BaseDigest: cut.BaseDigest,
+		CutApplied: cut.Applied, CutTerm: cut.Term,
+		OwnershipEpoch: binding.OwnershipEpoch, RoutingVersion: binding.RoutingVersion,
+		RouteGeneration: binding.RouteGeneration,
+		RetainedRange:   binding.OwnedRange,
+	}
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func retainedMutationCommand(
@@ -691,9 +758,17 @@ func retainedMutationCommand(
 	mutations ...replication.Mutation,
 ) []byte {
 	t.Helper()
-	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x70})
-	encoded, err := replication.AppendCommand(nil, replication.Command{
-		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
+	encoded, err := replication.AppendCommand(nil, retainedCommand(fixture, binding, replicaSetVersion, sequence, mutations))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func retainedCommand(fixture sourceCaptureFixture, binding replicatedstate.Binding, replicaSetVersion, sequence uint64, mutations []replication.Mutation) replication.Command {
+	return replication.Command{
+		AuthorityClass: replication.CommandAuthorityTopology,
+		ClusterID:      binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		Distribution:          binding.Distribution, Shard: binding.Shard,
 		AllocationGeneration: binding.AllocationGeneration,
@@ -704,14 +779,54 @@ func retainedMutationCommand(
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("split-controller"),
 		ClientID: sourceCaptureID(30), ClientEpoch: fixture.retainedPruneEpoch,
-		ClientSequence: sequence,
-		Fingerprint:    fingerprint,
-		Batches:        []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
-	})
+		ClientSequence: sequence, AckThrough: sequence - 1,
+		Fingerprint: sha256.Sum256([]byte{byte(sequence), 0x70}),
+		Batches:     []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
+	}
+}
+
+type retainedPruneValidator struct {
+	sourceCaptureValidator
+	partitioner *Partitioner
+}
+
+func (v retainedPruneValidator) ValidatePutOwnership(_, value []byte, owned distribution.KeyRange) replicatedstate.MutationValidation {
+	var workspace distribution.DocumentPointWorkspace
+	point, err := v.partitioner.program.Point(value, &workspace)
+	if err != nil {
+		return replicatedstate.MutationValidationInvalid
+	}
+	if !owned.Contains(point) {
+		return replicatedstate.MutationValidationWrongShard
+	}
+	return replicatedstate.MutationValidationAccept
+}
+
+func (v retainedPruneValidator) ValidateDeleteOwnership(key, current []byte, found bool, owned distribution.KeyRange) replicatedstate.MutationValidation {
+	if !found {
+		return replicatedstate.MutationValidationAccept
+	}
+	return v.ValidatePutOwnership(key, current, owned)
+}
+
+func applyRetainedMutation(t testing.TB, fixture sourceCaptureFixture, applied uint64, command []byte) {
+	t.Helper()
+	applyRetainedMutationResult(t, fixture, applied, command, replicatedstate.ResultApplied)
+}
+
+func applyRetainedMutationResult(t testing.TB, fixture sourceCaptureFixture, applied uint64, command []byte, want uint32) {
+	t.Helper()
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), command); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := fixture.machine.LookupCompletion(command)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return encoded
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != want {
+		t.Fatalf("mutation at %d result=%d want=%d err=%v", applied, completion.ResultCode, want, err)
+	}
 }
 
 func firstRetainedPruneKey(b RetainedPruneBatch) []byte {
@@ -720,4 +835,12 @@ func firstRetainedPruneKey(b RetainedPruneBatch) []byte {
 		return nil
 	}
 	return iterator.Key()
+}
+
+func firstRetainedPruneDocument(b RetainedPruneBatch) []byte {
+	iterator := b.Iterator()
+	if !iterator.Next() {
+		return nil
+	}
+	return iterator.Document()
 }

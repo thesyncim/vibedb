@@ -396,6 +396,7 @@ func (m *Manifest) ResolvePointTarget(p KeyspacePoint) (Target, bool) {
 	return Target{
 		Shard:                shard.ID,
 		AllocationGeneration: shard.AllocationGeneration,
+		ManifestOrdinal:      i,
 		Endpoint:             shard.Leaders[0],
 		OwnershipEpoch:       shard.Epoch,
 		Role:                 RoleLeader,

@@ -37,7 +37,29 @@ func OpenCollectionsWithCheckpointGroup(
 	options CheckpointGroupOptions,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	return openCollectionsWithCheckpointGroup(
-		dir, txnOptions, requests, names, "", options,
+		dir, txnOptions, requests, names, "", false, options, nil,
+	)
+}
+
+// OpenCollectionsWithCheckpointMembershipTransition is the catalog-authorized
+// recovery entry point for a prepared membership replacement. The ordinary
+// opener never selects a staged target. This call selects it only when the
+// supplied receipt, authorization, opened target files, and current source
+// checkpoint all match the durable two-slot transition certificate exactly.
+func OpenCollectionsWithCheckpointMembershipTransition(
+	dir string,
+	txnOptions TxnLogOptions,
+	requests []TransactionCollectionOpen,
+	names []string,
+	witness CheckpointMembershipWitness,
+	authorization [32]byte,
+	options CheckpointGroupOptions,
+) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
+	authority := checkpointMembershipRecoveryAuthority{
+		witness: witness, authorization: authorization,
+	}
+	return openCollectionsWithCheckpointGroup(
+		dir, txnOptions, requests, names, "", false, options, &authority,
 	)
 }
 
@@ -59,7 +81,30 @@ func OpenCollectionsWithSeededCheckpointGroup(
 		return nil, nil, nil, fmt.Errorf("%w: empty seed member", ErrTxnParticipant)
 	}
 	return openCollectionsWithCheckpointGroup(
-		dir, txnOptions, requests, names, seedMember, options,
+		dir, txnOptions, requests, names, seedMember, false, options, nil,
+	)
+}
+
+// OpenCollectionsWithSnapshotCheckpointGroup is the non-serving recovery
+// boundary for a streamed snapshot, which can already contain hidden rows
+// before its seed certificate is created. Without a certificate, every member
+// and the marker must have clean journals; no pending transaction is replayed.
+// An existing certificate must describe a seeded image, and is checked before
+// recovery can mutate any member or checkpoint. The caller must authenticate
+// the complete artifact and cursor before granting serving authority.
+func OpenCollectionsWithSnapshotCheckpointGroup(
+	dir string,
+	txnOptions TxnLogOptions,
+	requests []TransactionCollectionOpen,
+	names []string,
+	seedMember string,
+	options CheckpointGroupOptions,
+) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
+	if seedMember == "" {
+		return nil, nil, nil, fmt.Errorf("%w: empty snapshot seed member", ErrTxnParticipant)
+	}
+	return openCollectionsWithCheckpointGroup(
+		dir, txnOptions, requests, names, seedMember, true, options, nil,
 	)
 }
 
@@ -69,7 +114,9 @@ func openCollectionsWithCheckpointGroup(
 	requests []TransactionCollectionOpen,
 	names []string,
 	seedPendingMember string,
+	snapshotTarget bool,
 	options CheckpointGroupOptions,
+	membershipAuthority *checkpointMembershipRecoveryAuthority,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	if len(requests) != len(names) || len(requests) == 0 ||
 		len(requests) > checkpointGroupMaxMembers {
@@ -100,7 +147,7 @@ func openCollectionsWithCheckpointGroup(
 	certificateFile, certificate, err := openCheckpointGroupCertificate(log)
 	if errors.Is(err, os.ErrNotExist) {
 		if cleanErr := validateMissingCheckpointGroupActivation(
-			log, requests, names, seedPendingMember,
+			log, requests, names, seedPendingMember, snapshotTarget,
 		); cleanErr != nil {
 			return nil, nil, nil, errors.Join(cleanErr, log.Close())
 		}
@@ -108,6 +155,11 @@ func openCollectionsWithCheckpointGroup(
 	}
 	if err != nil {
 		return nil, nil, nil, errors.Join(err, log.Close())
+	}
+	if snapshotTarget && certificate.seedApplied <= 1 {
+		return nil, nil, nil, errors.Join(
+			ErrCheckpointGroupSeedChanged, certificateFile.Close(), log.Close(),
+		)
 	}
 	recovery, err := loadDatabaseTxnRecoveryFromLog(log, requests)
 	if err != nil {
@@ -230,11 +282,28 @@ func openCollectionsWithCheckpointGroup(
 	if err != nil {
 		return abort(collections, err)
 	}
-	if err := validateCheckpointGroupCertificateMembers(certificate, members); err != nil {
-		return abort(collections, err)
-	}
+	// Prove the exact catalog-selected namespace before a transition-aware open
+	// can publish the target checkpoint certificate. A later namespace error
+	// must never turn a definitely unselected target into durable authority.
 	if err := validateCheckpointGroupDirectoryMembership(recovery.log, members); err != nil {
 		return abort(collections, err)
+	}
+	if err := validateCheckpointGroupCertificateMembers(certificate, members); err != nil {
+		if membershipAuthority == nil {
+			return abort(collections, err)
+		}
+		certificate, err = selectCheckpointMembershipForRecovery(
+			recovery.log, certificateFile, certificate, members, *membershipAuthority,
+		)
+		if err != nil {
+			return abort(collections, err)
+		}
+	} else if membershipAuthority != nil {
+		if err := validateSelectedCheckpointMembership(
+			recovery.log, certificate, members, *membershipAuthority,
+		); err != nil {
+			return abort(collections, err)
+		}
 	}
 	if checkpointGroupBeforeMemberReplayHook != nil {
 		checkpointGroupBeforeMemberReplayHook(collections)
@@ -384,6 +453,7 @@ func validateMissingCheckpointGroupActivation(
 	requests []TransactionCollectionOpen,
 	names []string,
 	seedPendingMember string,
+	snapshotTarget bool,
 ) error {
 	if len(requests) != len(names) {
 		return fmt.Errorf("%w: missing-certificate membership", ErrCheckpointGroupCorrupt)
@@ -464,7 +534,7 @@ func validateMissingCheckpointGroupActivation(
 			)
 		}
 		collections = append(collections, collection)
-		if (seedPendingMember == "" || i == seedIndex) && collection.Len() != 0 ||
+		if !snapshotTarget && (seedPendingMember == "" || i == seedIndex) && collection.Len() != 0 ||
 			collection.journal == nil || collection.journal.Cursor() != 0 {
 			return errors.Join(
 				fmt.Errorf("%w: missing certificate beside non-empty member %d", ErrCheckpointGroupCorrupt, i),

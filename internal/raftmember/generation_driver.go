@@ -55,9 +55,14 @@ func (runtime *Runtime) ConfigureWALGeneration(options WALGenerationDriverOption
 		options.Key.Material == ([32]byte{}) || runtime.walGeneration != nil {
 		return ErrRuntimeOwnership
 	}
+	runtime.walGeneration = newWALGenerationDriver(options)
+	return nil
+}
+
+func newWALGenerationDriver(options WALGenerationDriverOptions) *walGenerationDriver {
 	key := options.Key
 	key.Wrapped = append([]byte(nil), options.Key.Wrapped...)
-	runtime.walGeneration = &walGenerationDriver{
+	return &walGenerationDriver{
 		interval:  options.IntervalTicks,
 		key:       key,
 		workspace: make([]byte, 0, replicatedstate.DefaultSnapshotArtifactChunkBytes),
@@ -65,7 +70,6 @@ func (runtime *Runtime) ConfigureWALGeneration(options WALGenerationDriverOption
 		stop:      make(chan struct{}),
 		result:    make(chan walGenerationBuildResult, 1),
 	}
-	return nil
 }
 
 func (runtime *Runtime) tickWALGeneration() {
@@ -102,7 +106,7 @@ func (runtime *Runtime) tickWALGeneration() {
 }
 
 func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) error {
-	checkpoint, err := runtime.WALRetentionInput()
+	_, err := runtime.WALRetentionInput()
 	if err != nil {
 		return err
 	}
@@ -112,7 +116,10 @@ func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) e
 	}
 	// A generation which cannot advance the retained base has no deletion
 	// benefit. This also prevents idle runtimes from manufacturing generations.
-	if base.GetMetadata() == nil || checkpoint <= base.GetMetadata().GetIndex() {
+	// A journal-durable apply can advance beyond the last folded certificate.
+	// CaptureWALBase seals that exact settled apply before creating a candidate;
+	// requiring the old certificate to advance first would strand compaction.
+	if base.GetMetadata() == nil || runtime.apply.Applied() <= base.GetMetadata().GetIndex() {
 		return nil
 	}
 	preparation, err := runtime.apply.CaptureWALBase(sqldriver.WALBaseCaptureOptions{
@@ -128,6 +135,14 @@ func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) e
 	if input.Snapshot.GetMetadata() == nil ||
 		input.Snapshot.GetMetadata().GetIndex() <= base.GetMetadata().GetIndex() {
 		return nil
+	}
+	checkpoint := input.Snapshot.GetMetadata().GetIndex()
+	sealed, err := runtime.WALRetentionInput()
+	if err != nil {
+		return err
+	}
+	if sealed != checkpoint {
+		return sqldriver.ErrWALBasePreparation
 	}
 	builder, err := PrepareWALGeneration(runtime.wal, runtime.apply, preparation, driver.key)
 	if err != nil {
@@ -178,17 +193,25 @@ func (runtime *Runtime) publishBuiltWALGeneration(
 		runtime.wal, runtime.apply, result.preparation, result.builder,
 	)
 	closeErr := closeBuilder()
+	adoptErr := runtime.wal.AdoptSelectedGeneration()
 	if publishErr != nil {
-		if _, pendingErr := runtime.wal.PendingGenerationActivation(); pendingErr == nil {
+		_, _, servingErr := runtime.wal.InitialState()
+		if adoptErr == nil || errors.Is(servingErr, raftstore.ErrGenerationActivationPending) {
 			driver.activationPending = true
 		}
-		return errors.Join(publishErr, closeErr)
+		return errors.Join(publishErr, closeErr, adoptErr)
 	}
 	driver.activationPending = true
+	if adoptErr != nil {
+		return errors.Join(adoptErr, closeErr)
+	}
 	return errors.Join(runtime.commitWALGeneration(driver), closeErr)
 }
 
 func (runtime *Runtime) commitWALGeneration(driver *walGenerationDriver) error {
+	if err := runtime.wal.AdoptSelectedGeneration(); err != nil {
+		return err
+	}
 	if err := runtime.wal.CommitGenerationSelection(runtime.apply); err != nil {
 		return err
 	}
@@ -220,18 +243,19 @@ func OpenBoundSQLWithApplyRecoveringGeneration(
 	authority sqldriver.ReplicatedAuthorityProfile,
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	if wal == nil {
 		return nil, nil, ErrWALUnavailable
 	}
 	if _, err := wal.PendingGenerationActivation(); err != nil {
 		if errors.Is(err, raftstore.ErrGenerationActivationPending) {
-			return OpenBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply)
+			return OpenBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, opening...)
 		}
 		return nil, nil, err
 	}
 	database, apply, err := OpenBoundSQLWithApplyForGenerationActivation(
-		path, wal, authority, expectedSQL, expectedApply,
+		path, wal, authority, expectedSQL, expectedApply, opening...,
 	)
 	if err != nil {
 		return nil, nil, err

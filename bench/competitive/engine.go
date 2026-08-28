@@ -3,6 +3,7 @@ package competitive
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -523,6 +524,13 @@ type MaintenanceFloorer interface {
 	MaintenanceFloorDescription() string
 }
 
+// SnapshotPressureEngine exposes one explicit read lease to the competitive
+// pressure harness. It is optional because engines without a truthful pinned
+// snapshot primitive must fail closed rather than approximate one with a read.
+type SnapshotPressureEngine interface {
+	PinSnapshot() (io.Closer, error)
+}
+
 // touchAll reads every byte of v and folds it into an accumulator. Every
 // engine's ScanAllBytes goes through this one function, so the per-byte cost is
 // identical across the table and the differences between rows are storage
@@ -542,20 +550,24 @@ func touchAll(v []byte) byte {
 	return acc
 }
 
-// Factory constructs a fresh engine over an empty directory.
+// Factory constructs a fresh engine over an empty directory or reopens the
+// populated image in that directory. Open never creates a missing image: a
+// lifecycle measurement that points at the wrong path must fail closed rather
+// than time creation and label it recovery.
 type Factory struct {
 	Name string
 	New  func(Config) (Engine, error)
+	Open func(Config) (Engine, error)
 }
 
 // Factories is the registry, in report order.
 func Factories() []Factory {
 	return []Factory{
-		{Name: "vibedb", New: newVibeDB},
-		{Name: "bbolt", New: newBbolt},
-		{Name: "badger", New: newBadger},
-		{Name: "pebble", New: newPebble},
-		{Name: "sqlite", New: newSQLite},
+		{Name: "vibedb", New: newVibeDB, Open: openVibeDB},
+		{Name: "bbolt", New: newBbolt, Open: openBbolt},
+		{Name: "badger", New: newBadger, Open: openBadger},
+		{Name: "pebble", New: newPebble, Open: openPebble},
+		{Name: "sqlite", New: newSQLite, Open: openSQLite},
 	}
 }
 

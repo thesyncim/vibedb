@@ -21,6 +21,9 @@ var (
 	// ErrReadyPending identifies protocol input refused because RawNode already
 	// exposes Ready work that must be captured and advanced first.
 	ErrReadyPending = errors.New("raftmodel: Ready work pending capture")
+	// ErrPublicationMismatch rejects a local state-machine replacement whose
+	// durable publication is not byte-semantically identical to Node's cut.
+	ErrPublicationMismatch = errors.New("raftmodel: replacement publication mismatch")
 	// ErrAppliedSettlementRequired reports use of a legacy apply operation that
 	// cannot expose a normal-entry range for result settlement.
 	ErrAppliedSettlementRequired = errors.New("raftmodel: applied result settlement is required")

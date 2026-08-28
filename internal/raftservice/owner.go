@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -19,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -51,6 +54,12 @@ var (
 	ErrTransactionRecoveryUnauthorized = errors.New(
 		"raftservice: transaction recovery is not authorized",
 	)
+	ErrRequestLedgerUnauthorized = errors.New(
+		"raftservice: request ledger recovery is not authorized",
+	)
+	ErrExecutionPinUnauthorized = errors.New(
+		"raftservice: execution-pin read is not authorized",
+	)
 )
 
 // Limits bounds every object retained outside Host and rafttransport. Host and
@@ -67,13 +76,15 @@ type Limits struct {
 
 // OutboundSink accepts one detached Host message into a bounded transport
 // queue. Success transfers no protobuf ownership: the sink must detach before
-// returning. OrdinaryTransport satisfies this contract.
+// returning. Exact rafttransport.ErrBackpressure means no frame was accepted;
+// the owner may discard that ordinary packet. OrdinaryTransport satisfies this
+// contract.
 type OutboundSink interface {
 	Send(raftmember.OutboundMessage) error
 }
 
 // Options fixes one serialized serving lane. Pulse supplies logical Raft ticks
-// and also retries a retained outbound message after transport backpressure.
+// and also retries a blocked durable Ready phase.
 // Core never samples wall-clock time.
 type Options struct {
 	Registry                   *raftserve.Registry
@@ -82,11 +93,11 @@ type Options struct {
 	CommandFences              []CommandFence
 	ReadSources                []ReadSource
 	TransactionRecoverySources []TransactionRecoverySource
-	MembershipAuthorizations   []MembershipAuthorization
-	MembershipAuthority        MembershipAuthoritySink
+	MembershipAuthority        MembershipAuthority
 	Outbound                   OutboundSink
 	Pulse                      <-chan struct{}
 	Limits                     Limits
+	ProgressMetrics            *ProgressMetrics
 }
 
 type requestKind uint8
@@ -100,6 +111,19 @@ const (
 	requestReadLinear
 	requestReadFollower
 	requestReadTransaction
+	requestReadRequestLedger
+	requestReadExecutionPin
+	requestReadRouteGate
+	requestReplicaObservation
+	requestOwnershipTransition
+	requestSchemaTransition
+	requestReplicaRetirement
+	requestInstallExecutionGroup
+	requestRemoveExecutionGroup
+	requestObserveSchemaTransition
+	requestQuiesceSchemaGeneration
+	requestInstallSchemaGeneration
+	requestSplitSourceLeadership
 )
 
 const (
@@ -115,24 +139,52 @@ type proposalDelivery struct {
 }
 
 type ownerRequest struct {
-	kind       requestKind
-	group      raftmember.GroupKey
-	data       []byte
-	fence      ServingFence
-	inbound    rafttransport.Inbound
-	reply      chan ownerReply
-	bytes      int64
-	async      bool
-	delivery   *proposalDelivery
-	membership MembershipRequest
-	read       readRequest
+	kind         requestKind
+	group        raftmember.GroupKey
+	data         []byte
+	fence        ServingFence
+	inbound      rafttransport.Inbound
+	reply        chan ownerReply
+	bytes        int64
+	async        bool
+	delivery     *proposalDelivery
+	membership   MembershipRequest
+	read         readRequest
+	targetMember uint64
+	operation    [32]byte
+	step         [32]byte
+	sourceMember uint64
+	install      ExecutionGroup
+	publish      func()
+	database     *sqldriver.Database
+	apply        *sqldriver.ReplicatedApply
+	schemaSQL    sqldriver.ReplicatedShardStoreIdentity
+	schemaApply  sqldriver.ReplicatedApplyIdentity
 }
 
 type ownerReply struct {
-	waiter raftserve.Waiter
-	state  ServingState
-	err    error
-	read   readAuthorization
+	waiter      raftserve.Waiter
+	state       ServingState
+	err         error
+	read        readAuthorization
+	observation ReplicaObservation
+	committed   bool
+}
+
+// ReplicaObservation is one coherent control-plane cut collected by the sole
+// serialized Host owner. Publication and State are durable apply evidence;
+// Status and TargetProgress are transient liveness evidence and never grant
+// serving or membership authority by themselves.
+type ReplicaObservation struct {
+	// Identity binds a local capability to the exact installed incarnation;
+	// member number alone cannot distinguish a failed duplicate adoption.
+	Identity       raftmember.RuntimeIdentity
+	Publication    raftmodel.Publication
+	Status         raftmember.RuntimeStatus
+	TargetProgress raftmodel.MemberProgress
+	ProgressFound  bool
+	State          replicatedstate.State
+	SnapshotBase   *replicatedstate.SnapshotBaseCertificate
 }
 
 type readRequest struct {
@@ -144,7 +196,11 @@ type readRequest struct {
 type readAuthorization struct {
 	source         ReadSource
 	recovery       TransactionRecoverySource
+	requestLedger  RequestLedgerSource
+	executionPin   ExecutionPinSource
+	routeGate      RouteGateSource
 	minimumApplied uint64
+	generation     *ownerGeneration
 }
 
 type readDelivery struct {
@@ -152,7 +208,51 @@ type readDelivery struct {
 	reply          chan ownerReply
 	source         ReadSource
 	recovery       TransactionRecoverySource
+	requestLedger  RequestLedgerSource
+	executionPin   ExecutionPinSource
+	routeGate      RouteGateSource
 	minimumApplied uint64
+	generation     *ownerGeneration
+}
+
+type ownerGeneration struct {
+	pins      atomic.Int64
+	quiescing atomic.Bool
+}
+
+func (generation *ownerGeneration) acquire() bool {
+	if generation == nil || generation.quiescing.Load() {
+		return false
+	}
+	generation.pins.Add(1)
+	if generation.quiescing.Load() {
+		generation.pins.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (generation *ownerGeneration) release() {
+	if generation != nil {
+		generation.pins.Add(-1)
+	}
+}
+
+func (generation *ownerGeneration) quiesce() bool {
+	if generation == nil || !generation.quiescing.CompareAndSwap(false, true) {
+		return false
+	}
+	if generation.pins.Load() != 0 {
+		generation.quiescing.Store(false)
+		return false
+	}
+	return true
+}
+
+func (generation *ownerGeneration) resume() {
+	if generation != nil {
+		generation.quiescing.Store(false)
+	}
 }
 
 const (
@@ -167,6 +267,20 @@ type ReadSource interface {
 	PointReadInto(replication.RelationID, []byte, uint64, int, []byte) (replicatedstate.PointReadResult, error)
 }
 
+// BatchReadSource is the optional packed multi-relation extension. Keeping it
+// separate preserves narrow test and recovery sources while shipped replicated
+// machines expose one coherent all-relation cut.
+type BatchReadSource interface {
+	PointReadBatchInto([]byte, uint64, int, []byte) (replicatedstate.PointReadBatchResult, error)
+}
+
+// SnapshotCutSource is the narrow target-free source used by live backup.
+// The applied floor comes from the leader ReadIndex barrier; implementations
+// must return one immutable complete relation cut at or beyond it.
+type SnapshotCutSource interface {
+	SnapshotArtifactCutAt(uint64) (*replicatedstate.ReadSnapshot, error)
+}
+
 // TransactionRecoverySource exposes only the replicated transaction-control
 // reader. It is intentionally separate from ordinary relation reads so
 // installing a data-read source cannot enable coordinator discovery.
@@ -176,6 +290,22 @@ type TransactionRecoverySource interface {
 		[]replicatedstate.TransactionRecoveryRecord,
 		[]byte,
 	) (replicatedstate.TransactionRecoveryReadResult, error)
+}
+
+// RequestLedgerSource exposes one exact full-key hidden-ledger row read. It is
+// intentionally a separate narrow interface so transaction recovery or data
+// read authority cannot name the private request-ledger collection.
+type RequestLedgerSource interface {
+	RequestLedgerReadInto(
+		replicatedstate.RequestLedgerReadRequest,
+		[]byte,
+	) (replicatedstate.RequestLedgerReadResult, error)
+}
+
+// ExecutionPinSource exposes only the exact hidden execution-pin point read.
+// It cannot name ordinary data or request-ledger rows.
+type ExecutionPinSource interface {
+	ExecutionPinRead(executionpin.PinID, uint64) (replicatedstate.ExecutionPinReadResult, error)
 }
 
 // Result is one terminal deterministic apply result. Completion is the exact
@@ -205,10 +335,57 @@ type PointReadResult struct {
 	Value   []byte
 }
 
+// PointReadBatchRequest selects one leader ReadIndex for a packed positional
+// multi-relation request. Packed is the canonical replicatedstate grammar and
+// MaxResultBytes bounds its complete bitmap/length/value response.
+type PointReadBatchRequest struct {
+	Fence          ServingFence
+	Packed         []byte
+	MinimumApplied uint64
+	MaxResultBytes int
+}
+
+type PointReadBatchResult struct {
+	Applied uint64
+	Data    []byte
+}
+
 // PointReadLease holds the conservative response-memory reservation until the
 // serving boundary has finished encoding and writing the result.
 type PointReadLease interface {
 	Release()
+}
+
+type LinearizableSnapshotRequest struct {
+	Fence      ServingFence
+	Capability serviceauthz.Capability
+}
+
+// LinearizableSnapshotCut owns the immutable state-machine cut and the owner
+// generation/resource pins. Close is the only release operation.
+type LinearizableSnapshotCut struct {
+	snapshot   *replicatedstate.ReadSnapshot
+	generation *ownerGeneration
+	owner      *Owner
+	released   atomic.Bool
+}
+
+func (cut *LinearizableSnapshotCut) Snapshot() *replicatedstate.ReadSnapshot {
+	if cut == nil || cut.released.Load() {
+		return nil
+	}
+	return cut.snapshot
+}
+
+func (cut *LinearizableSnapshotCut) Close() error {
+	if cut == nil || !cut.released.CompareAndSwap(false, true) {
+		return nil
+	}
+	err := cut.snapshot.Close()
+	cut.snapshot = nil
+	cut.generation.release()
+	cut.owner.releasePendingRead(1)
+	return err
 }
 
 // TransactionReadRequest wraps the exact replicated-state recovery operation
@@ -231,6 +408,43 @@ type TransactionReadResult struct {
 // TransactionReadLease holds the conservative response and scratch-memory
 // reservation until the native serving boundary finishes encoding the result.
 type TransactionReadLease interface {
+	Release()
+}
+
+// RequestLedgerReadRequest wraps the full-key replicated-state read with the
+// exact live RF3 serving fence. Only the dedicated service capability may use
+// this path.
+type RequestLedgerReadRequest struct {
+	Fence      ServingFence
+	Capability serviceauthz.Capability
+	Read       replicatedstate.RequestLedgerReadRequest
+}
+
+type RequestLedgerReadResult struct {
+	Applied           uint64
+	Found             bool
+	AuthoritativeKind replicatedstate.RequestLedgerReadKind
+	Value             []byte
+}
+
+type RequestLedgerReadLease interface {
+	Release()
+}
+
+type ExecutionPinReadRequest struct {
+	Fence          ServingFence
+	Capability     serviceauthz.Capability
+	Pin            executionpin.PinID
+	MinimumApplied uint64
+}
+
+type ExecutionPinReadResult struct {
+	Applied uint64
+	Found   bool
+	Record  executionpin.Record
+}
+
+type ExecutionPinReadLease interface {
 	Release()
 }
 
@@ -257,6 +471,28 @@ func pointReadResponseCharge(maximum int) (int64, bool) {
 }
 
 const transactionRecoveryRecordRetainedBytes int64 = 256
+
+const (
+	requestLedgerReadEncodedFrameFixedBytes int64 = 5 + 309 + 12
+	requestLedgerReadAllocatorSlopBytes     int64 = 3 * ((8 << 10) - 1)
+)
+
+// requestLedgerReadResponseCharge covers all three simultaneously live
+// payload-sized buffers: state-machine row arena, typed native value, and the
+// final encoded response frame. The lease is released only after the serving
+// boundary writes the frame.
+func requestLedgerReadResponseCharge(maximum int) (int64, bool) {
+	if maximum <= 0 {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	fixed := requestLedgerReadEncodedFrameFixedBytes + requestLedgerReadAllocatorSlopBytes
+	payload := int64(maximum)
+	if payload > (maxInt64-fixed)/3 {
+		return 0, false
+	}
+	return payload*3 + fixed, true
+}
 
 func transactionReadResponseCharge(
 	request replicatedstate.TransactionRecoveryReadRequest,
@@ -393,7 +629,8 @@ type Owner struct {
 	outbound  OutboundSink
 	pulse     <-chan struct{}
 	limits    Limits
-	authority MembershipAuthoritySink
+	authority MembershipAuthority
+	metrics   *ProgressMetrics
 
 	ingress chan ownerRequest
 	ready   chan struct{}
@@ -417,6 +654,7 @@ type Owner struct {
 // Both a standalone Host and a lane-scoped ExecutionLanes view satisfy it.
 type ownerHost interface {
 	AdoptMessage(raftmember.GroupKey, *pb.Message) error
+	EnqueueProposal(raftmember.GroupKey, []byte) error
 	EnqueueTrackedProposal(raftmember.GroupKey, []byte, multiraft.ProposalToken) error
 	ProposeConfChange(raftmember.GroupKey, pb.ConfChangeI) error
 	ReadIndex(raftmember.GroupKey, []byte) error
@@ -427,23 +665,49 @@ type ownerHost interface {
 	Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error)
 	Progress(raftmember.GroupKey, uint64) (raftmodel.MemberProgress, bool, error)
 	DurablePromotion(raftmember.GroupKey, uint64) (raftmember.DurablePromotionProof, bool, error)
+	SnapshotState(raftmember.GroupKey) (replicatedstate.State, error)
+	SnapshotBaseCertificate(raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error)
+	Add(*raftmember.Runtime) error
+	Remove(raftmember.GroupKey) error
+	QuiesceSQLGeneration(raftmember.GroupKey) error
+	ObserveSchemaTransition(raftmember.GroupKey, []byte) (uint64, bool, error)
+	InstallSQLGeneration(
+		raftmember.GroupKey, *sqldriver.Database, *sqldriver.ReplicatedApply,
+		sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity,
+	) error
 	RunOne() (multiraft.Progress, bool, error)
 	PopOutbound() (raftmember.OutboundMessage, bool)
 	Close() error
 }
 
-type MembershipAuthoritySink interface {
+type MembershipAuthority interface {
+	CurrentTransitionGrant(raftmember.GroupKey) (membershipgrant.Grant, bool, error)
 	PublishCommittedAuthority(raftmember.GroupKey, uint64, *pb.ConfState) error
 	PublishDurablePromotion(raftmember.GroupKey, raftmember.DurablePromotionProof) error
 	ClearDurablePromotion(raftmember.GroupKey) error
 }
 
 type ownerMember struct {
-	identity  raftmember.RuntimeIdentity
-	command   CommandFence
-	authority MembershipAuthorization
-	read      ReadSource
-	recovery  TransactionRecoverySource
+	identity   raftmember.RuntimeIdentity
+	command    CommandFence
+	read       ReadSource
+	recovery   TransactionRecoverySource
+	retiring   bool
+	generation *ownerGeneration
+}
+
+// ReplicaRetirementRequest is the exact final local-source fence for one
+// replicated replica move. Operation and Step bind the call to its durable
+// controller journal; the Owner independently proves that SourceMember is no
+// longer a voter and no longer the current leader before closing the Runtime.
+// TargetMember remains the replacement identity bound by the grant. No caller
+// receives raw Host access.
+type ReplicaRetirementRequest struct {
+	Operation    [32]byte
+	Step         [32]byte
+	Fence        ServingFence
+	SourceMember uint64
+	TargetMember uint64
 }
 
 type MembershipKind uint8
@@ -454,23 +718,6 @@ const (
 	MembershipRemoveVoter
 	MembershipTransferLeader
 )
-
-// MembershipAuthorization is the fixed metadata grant for one replica move.
-// It is configured locally from the authenticated metadata cut and cannot be
-// widened by a network request.
-type MembershipAuthorization struct {
-	TransitionID      [16]byte
-	MetadataEpoch     uint64
-	CatalogGeneration uint64
-	SourceMember      uint64
-	TargetMember      uint64
-}
-
-func (a MembershipAuthorization) Valid() bool {
-	return a.TransitionID != ([16]byte{}) && a.MetadataEpoch != 0 &&
-		a.CatalogGeneration != 0 && a.SourceMember != 0 && a.TargetMember != 0 &&
-		a.SourceMember != a.TargetMember
-}
 
 // MembershipRequest carries no variable-sized data and is retained by value.
 type MembershipRequest struct {
@@ -516,9 +763,6 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 	limits := options.Limits
 	if options.Registry == nil || host == nil || (!allowEmpty && len(options.Members) == 0) ||
 		len(options.CommandFences) != len(options.Members) ||
-		(len(options.MembershipAuthorizations) != 0 &&
-			len(options.MembershipAuthorizations) != len(options.Members)) ||
-		(len(options.MembershipAuthorizations) != 0 && options.MembershipAuthority == nil) ||
 		limits.MaxIngressItems <= 0 || limits.MaxIngressItems > multiraft.AbsoluteMaxQueueItems ||
 		limits.MaxIngressBytes <= 0 || limits.MaxIngressBytes > multiraft.AbsoluteMaxQueueBytes ||
 		limits.MaxPendingProposalItems <= 0 ||
@@ -560,13 +804,6 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 		}
 		seen[group] = struct{}{}
 		groups[index] = group
-		var authority MembershipAuthorization
-		if len(options.MembershipAuthorizations) != 0 {
-			authority = options.MembershipAuthorizations[index]
-			if !authority.Valid() {
-				return nil, ErrInvalidOwner
-			}
-		}
 		var source ReadSource
 		if len(options.ReadSources) != 0 {
 			source = options.ReadSources[index]
@@ -576,12 +813,13 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 			recovery = options.TransactionRecoverySources[index]
 		}
 		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
-			authority: authority, read: source, recovery: recovery}
+			read: source, recovery: recovery, generation: &ownerGeneration{}}
 	}
 	return &Owner{
 		registry: options.Registry, host: host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
 		authority:    options.MembershipAuthority,
+		metrics:      options.ProgressMetrics,
 		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
 		ready:        make(chan struct{}),
 		done:         make(chan struct{}),
@@ -610,19 +848,30 @@ func (owner *Owner) Run(ctx context.Context) error {
 	var pending raftmember.OutboundMessage
 	readyBlocked := false
 	for {
-		transportBlocked := false
 		if pending.Message != nil {
 			if owner.outbound == nil {
 				return owner.stop(errors.New("raftservice: outbound message has no transport"))
 			}
 			err := owner.outbound.Send(pending)
-			switch {
-			case err == nil:
+			switch err {
+			case nil:
 				pending = raftmember.OutboundMessage{}
-			case errors.Is(err, rafttransport.ErrBackpressure):
-				// Retain exact ownership and continue serving bounded ingress. A
-				// later pulse or request retries before another Host pop.
-				transportBlocked = true
+			case rafttransport.ErrBackpressure:
+				// Send refused ownership of this ordinary network packet. Raft
+				// repairs packet loss; retaining it here would block unrelated
+				// peers and all Host progress behind one isolated destination.
+				// Accepted transport frames, durable Ready, ingress and results
+				// remain owned by their existing queues. MeasureOrdinaryMessage
+				// excludes snapshots before Send. Wrapped/mixed faults stay fatal.
+				pending = raftmember.OutboundMessage{}
+			case rafttransport.ErrTransportClosed:
+				// The shared transport may observe shutdown before this owner.
+				// Only that exact cancellation race is expected; an independently
+				// closed transport remains a fatal component failure.
+				if cause := context.Cause(ctx); cause != nil {
+					return owner.stop(cause)
+				}
+				return owner.stop(err)
 			default:
 				return owner.stop(err)
 			}
@@ -639,8 +888,9 @@ func (owner *Owner) Run(ctx context.Context) error {
 			}
 		}
 
-		if !transportBlocked && !readyBlocked {
+		if !readyBlocked {
 			progress, done, err := owner.host.RunOne()
+			owner.metrics.observeProgress(progress, done, err)
 			switch {
 			case errors.Is(err, multiraft.ErrOutboxFull):
 				// The next loop transfers one Host-owned message into the retained
@@ -681,7 +931,16 @@ func (owner *Owner) Run(ctx context.Context) error {
 				continue
 			}
 			for _, group := range owner.groups {
-				if err := owner.host.RequestTick(group); err != nil {
+				switch err := owner.host.RequestTick(group); err {
+				case nil:
+				case multiraft.ErrQueueFull, multiraft.ErrGroupBusy:
+					// A timer pulse is an offer, not an admitted protocol input.
+					// Like the bounded upstream pulse channels, omit this offer
+					// when full or intentionally quiesced/retiring. Never accrue
+					// catch-up debt or discard a tick/message already in Host.
+					// Match exact sentinels: a group fault wrapping either error
+					// remains fatal, as do missing groups and closed runtimes.
+				default:
 					return owner.stop(err)
 				}
 			}
@@ -703,12 +962,15 @@ func (owner *Owner) syncMembershipAuthorities() error {
 		); err != nil {
 			return err
 		}
-		member := owner.members[group]
-		if member.authority.TargetMember == 0 {
+		grant, grantFound, err := owner.authority.CurrentTransitionGrant(group)
+		if err != nil {
+			return err
+		}
+		if !grantFound {
 			continue
 		}
 		proof, found, err := owner.host.DurablePromotion(group,
-			member.authority.TargetMember)
+			grant.TargetMember)
 		if err != nil {
 			return err
 		}
@@ -737,7 +999,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = err
 			break
 		}
-		if !commandMatchesFence(command, request.fence) {
+		if !commandMatchesFence(command, request.fence) && !CatalogCommandReplayMatchesFence(command, request.fence) {
 			reply.err = ErrServingFence
 			break
 		}
@@ -777,14 +1039,83 @@ func (owner *Owner) handle(request ownerRequest) error {
 			if publicationErr != nil {
 				reply.err = publicationErr
 			} else if publication.ReplicaSetVersion != 0 {
-				member.command.ReplicaSetVersion = publication.ReplicaSetVersion
-				owner.members[request.group] = member
-				reply.state.Command = member.command
+				// A probe is the source of the caller's next serving fence. All
+				// mutable fields must come from the applied cut, including on a
+				// follower that has never received a controller observation.
+				state, stateErr := owner.host.SnapshotState(request.group)
+				reply.err = stateErr
+				if stateErr == nil {
+					reply.err = owner.syncCommandFenceFromState(request.group, ReplicaObservation{
+						Publication: publication, State: state,
+					})
+					reply.state.Command = owner.members[request.group].command
+				}
 			}
 		}
 	case requestMembership:
 		reply.err = owner.applyMembership(request.membership)
-	case requestReadLinear, requestReadFollower, requestReadTransaction:
+	case requestReplicaObservation:
+		if member, found := owner.members[request.group]; found {
+			reply.observation.Identity = member.identity
+		}
+		if request.targetMember == 0 {
+			reply.err = ErrInvalidOwner
+			break
+		}
+		if _, found := owner.members[request.group]; !found {
+			reply.err = multiraft.ErrGroupNotFound
+			break
+		}
+		reply.observation.Status, reply.err = owner.host.Status(request.group)
+		if reply.err == nil {
+			reply.observation.Publication, reply.err = owner.host.Publication(request.group)
+		}
+		if reply.err == nil {
+			reply.observation.TargetProgress, reply.observation.ProgressFound, reply.err =
+				owner.host.Progress(request.group, request.targetMember)
+		}
+		if reply.err == nil {
+			reply.observation.State, reply.err = owner.host.SnapshotState(request.group)
+		}
+		if reply.err == nil {
+			certificate, certificateErr := owner.host.SnapshotBaseCertificate(request.group)
+			if certificateErr != nil && !errors.Is(certificateErr, replicatedstate.ErrSnapshotBase) {
+				reply.err = certificateErr
+			} else if certificate.Digest == reply.observation.State.SnapshotBaseDigest &&
+				stateMatchesReplicaGroup(certificate.Manifest.State, request.group) &&
+				certificate.Manifest.State.ConfState != nil &&
+				containsSorted(certificate.Manifest.State.ConfState.GetLearners(), request.targetMember) &&
+				!containsSorted(certificate.Manifest.State.ConfState.GetVoters(), request.targetMember) {
+				reply.observation.SnapshotBase = &certificate
+			}
+		}
+		if reply.err == nil {
+			reply.err = owner.syncCommandFenceFromState(request.group, reply.observation)
+		}
+	case requestOwnershipTransition:
+		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
+	case requestSplitSourceLeadership:
+		reply.err = owner.transferSplitSourceLeadership(request.fence, request.targetMember)
+	case requestSchemaTransition:
+		reply.err = owner.applySchemaTransition(request.fence, request.data)
+	case requestReplicaRetirement:
+		reply.err = owner.retireReplica(request)
+	case requestInstallExecutionGroup:
+		reply.err = owner.installExecutionGroupNow(request.install, request.publish)
+	case requestRemoveExecutionGroup:
+		reply.err = owner.removeExecutionGroupNow(
+			request.group, request.install.Identity, request.publish,
+		)
+	case requestObserveSchemaTransition:
+		_, reply.committed, reply.err = owner.host.ObserveSchemaTransition(
+			request.group, request.data,
+		)
+	case requestQuiesceSchemaGeneration:
+		reply.err = owner.quiesceSchemaGeneration(request)
+	case requestInstallSchemaGeneration:
+		reply.err = owner.installSchemaGeneration(request)
+	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger,
+		requestReadExecutionPin, requestReadRouteGate:
 		member, found := owner.members[request.group]
 		if !found ||
 			!servingFenceMatchesIdentity(request.read.fence, member) {
@@ -793,6 +1124,21 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 		if request.kind == requestReadTransaction {
 			if member.recovery == nil {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadRequestLedger {
+			if _, ok := member.recovery.(RequestLedgerSource); !ok {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadExecutionPin {
+			if _, ok := member.recovery.(ExecutionPinSource); !ok {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadRouteGate {
+			if _, ok := member.recovery.(RouteGateSource); !ok {
 				reply.err = ErrServingFence
 				break
 			}
@@ -818,7 +1164,12 @@ func (owner *Owner) handle(request ownerRequest) error {
 				reply.err = replicatedstate.ErrReadBehind
 				break
 			}
-			reply.read = readAuthorization{source: member.read, minimumApplied: request.read.minimumApplied}
+			if !member.generation.acquire() {
+				reply.err = ErrServingFence
+				break
+			}
+			reply.read = readAuthorization{source: member.read,
+				minimumApplied: request.read.minimumApplied, generation: member.generation}
 			break
 		}
 		if status.LeaderID != member.identity.MemberID {
@@ -836,20 +1187,209 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 		request.read.delivery.source = member.read
 		request.read.delivery.recovery = member.recovery
+		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
+		request.read.delivery.executionPin, _ = member.recovery.(ExecutionPinSource)
+		request.read.delivery.routeGate, _ = member.recovery.(RouteGateSource)
 		request.read.delivery.minimumApplied = request.read.minimumApplied
+		request.read.delivery.generation = member.generation
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
 		return nil
 	default:
 		reply.err = ErrInvalidOwner
 	}
-	if (request.kind == requestReadLinear || request.kind == requestReadTransaction) &&
+	if (request.kind == requestReadLinear || request.kind == requestReadTransaction ||
+		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin || request.kind == requestReadRouteGate) &&
 		request.read.delivery != nil {
 		owner.settleReadDelivery(request.read.delivery, reply)
 	} else {
 		request.reply <- reply
 	}
 	return reply.err
+}
+
+func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found || !servingFenceMatchesIdentity(request.fence, member) ||
+		len(owner.pendingReads) != 0 || !member.generation.quiesce() {
+		return ErrServingFence
+	}
+	transition, openErr := replicatedstate.OpenSchemaTransition(request.data)
+	applied, committed, err := owner.host.ObserveSchemaTransition(request.group, request.data)
+	if openErr != nil || err != nil || !committed || applied == 0 ||
+		transition.From.SchemaGeneration != member.command.SchemaGeneration ||
+		transition.ToSchemaGeneration != member.command.SchemaGeneration+1 {
+		member.generation.resume()
+		return errors.Join(openErr, err, ErrServingFence)
+	}
+	if err := owner.host.QuiesceSQLGeneration(request.group); err != nil {
+		member.generation.resume()
+		return err
+	}
+	owner.members[request.group] = member
+	return nil
+}
+
+func (owner *Owner) installSchemaGeneration(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found || request.database == nil || request.apply == nil ||
+		!member.generation.quiescing.Load() || member.generation.pins.Load() != 0 {
+		return ErrServingFence
+	}
+	binding := request.schemaSQL.Binding
+	manifest, manifestErr := request.apply.RangeSplitRelationManifestDigest()
+	if binding.ClusterID != request.group.ClusterID ||
+		binding.ClusterIncarnation != request.group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != request.group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != request.group.ShardIncarnation ||
+		binding.GroupID != request.group.GroupID ||
+		binding.AllocationGeneration != member.identity.AllocationGeneration ||
+		binding.MemberID != member.identity.MemberID || binding.StoreID != member.identity.StoreID ||
+		binding.Authority.SchemaGeneration != member.command.SchemaGeneration+1 ||
+		manifestErr != nil || manifest == ([32]byte{}) {
+		return errors.Join(manifestErr, ErrServingFence)
+	}
+	if err := owner.host.InstallSQLGeneration(
+		request.group, request.database, request.apply, request.schemaSQL, request.schemaApply,
+	); err != nil {
+		return err
+	}
+	member.read = request.apply
+	member.recovery = request.apply
+	member.identity.RelationManifestDigest = manifest
+	member.command.SchemaGeneration = binding.Authority.SchemaGeneration
+	member.command.RelationManifestDigest = manifest
+	member.generation = &ownerGeneration{}
+	owner.members[request.group] = member
+	return nil
+}
+
+func validExecutionGroup(group ExecutionGroup) bool {
+	identity := group.Identity
+	return group.Runtime != nil && identity == group.Runtime.Identity() &&
+		identity.Group != (raftmember.GroupKey{}) && identity.AllocationGeneration != 0 &&
+		identity.MemberID != 0 && identity.StoreID != ([16]byte{}) &&
+		identity.NodeIncarnation != 0 && identity.RelationManifestDigest != ([32]byte{}) &&
+		group.Command.Valid() &&
+		group.Command.RelationManifestDigest == identity.RelationManifestDigest
+}
+
+// installExecutionGroup is a definite-outcome cold control operation. Once
+// enqueued it waits for the serialized owner even if a caller would otherwise
+// abandon its context; returning outcome-unknown here could leak an adopted
+// Runtime whose ownership the caller still believes it retains.
+func (owner *Owner) installExecutionGroup(group ExecutionGroup, publish func()) error {
+	if owner == nil || publish == nil || !validExecutionGroup(group) {
+		return ErrInvalidOwner
+	}
+	reply := make(chan ownerReply, 1)
+	if err := owner.publish(ownerRequest{
+		kind: requestInstallExecutionGroup, group: group.Identity.Group,
+		install: group, publish: publish, reply: reply,
+	}); err != nil {
+		return err
+	}
+	result := <-reply
+	return result.err
+}
+
+func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func()) error {
+	if !validExecutionGroup(group) || publish == nil || len(owner.groups) >= multiraft.AbsoluteMaxGroups {
+		return ErrInvalidOwner
+	}
+	key := group.Identity.Group
+	if _, exists := owner.members[key]; exists {
+		return multiraft.ErrGroupExists
+	}
+	if err := owner.host.Add(group.Runtime); err != nil {
+		return err
+	}
+	// All following operations are in-memory no-fail publications. Publish the
+	// owner metadata before transport enrollment so an authenticated frame can
+	// never resolve a group without a serving owner.
+	owner.members[key] = ownerMember{identity: group.Identity, command: group.Command,
+		read: group.Read, recovery: group.Recovery, generation: &ownerGeneration{}}
+	owner.groups = append(owner.groups, key)
+	publish()
+	return nil
+}
+
+func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, withdraw func()) error {
+	group := identity.Group
+	if owner == nil || group == (raftmember.GroupKey{}) || withdraw == nil {
+		return ErrInvalidOwner
+	}
+	reply := make(chan ownerReply, 1)
+	if err := owner.publish(ownerRequest{
+		kind: requestRemoveExecutionGroup, group: group,
+		install: ExecutionGroup{Identity: identity}, publish: withdraw, reply: reply,
+	}); err != nil {
+		return err
+	}
+	result := <-reply
+	return result.err
+}
+
+func (owner *Owner) removeExecutionGroupNow(
+	group raftmember.GroupKey, expected raftmember.RuntimeIdentity, withdraw func(),
+) error {
+	if withdraw == nil {
+		return ErrInvalidOwner
+	}
+	member, exists := owner.members[group]
+	if !exists {
+		return multiraft.ErrGroupNotFound
+	}
+	if member.identity != expected {
+		return ErrServingFence
+	}
+	if err := owner.host.Remove(group); err != nil {
+		return err
+	}
+	// Host has closed the Runtime and released its applied-source ownership.
+	// Withdraw transport admission before deleting serving metadata.
+	withdraw()
+	delete(owner.members, group)
+	for index, key := range owner.groups {
+		if key == group {
+			copy(owner.groups[index:], owner.groups[index+1:])
+			owner.groups[len(owner.groups)-1] = raftmember.GroupKey{}
+			owner.groups = owner.groups[:len(owner.groups)-1]
+			break
+		}
+	}
+	return nil
+}
+
+func (owner *Owner) syncCommandFenceFromState(
+	group raftmember.GroupKey,
+	observation ReplicaObservation,
+) error {
+	member, found := owner.members[group]
+	if !found {
+		return multiraft.ErrGroupNotFound
+	}
+	binding := observation.State.Binding
+	if binding.ClusterID != group.ClusterID || binding.ClusterIncarnation != group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != group.ShardIncarnation || binding.GroupID != group.GroupID ||
+		binding.AllocationGeneration != member.identity.AllocationGeneration ||
+		observation.Publication.ReplicaSetVersion == 0 ||
+		observation.State.ReplicaSetVersion != observation.Publication.ReplicaSetVersion ||
+		binding.ActivePolicyGeneration == 0 || binding.ProtectionEpoch == 0 ||
+		binding.OwnershipEpoch == 0 || binding.SchemaGeneration == 0 ||
+		binding.RoutingVersion == 0 || binding.RouteGeneration == 0 {
+		return ErrServingFence
+	}
+	member.command.ReplicaSetVersion = observation.Publication.ReplicaSetVersion
+	member.command.ActivePolicyGeneration = binding.ActivePolicyGeneration
+	member.command.ProtectionEpoch = binding.ProtectionEpoch
+	member.command.OwnershipEpoch = binding.OwnershipEpoch
+	member.command.SchemaGeneration = binding.SchemaGeneration
+	member.command.RoutingVersion = binding.RoutingVersion
+	member.command.RouteGeneration = binding.RouteGeneration
+	owner.members[group] = member
+	return nil
 }
 
 func (owner *Owner) nextReadContext(incarnation uint64) ([16]byte, error) {
@@ -876,13 +1416,25 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			continue
 		}
 		delete(owner.pendingReads, key)
+		if delivery.state.Load() != readDeliveryPending {
+			continue
+		}
 		reply := ownerReply{err: outcome.Err}
 		if outcome.Err == nil {
+			if !delivery.generation.acquire() {
+				reply.err = ErrServingFence
+				owner.settleReadDelivery(delivery, reply)
+				continue
+			}
 			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
 			// Source was authenticated at admission and remains bound to the
 			// immutable owner member for this allocation.
 			reply.read.source = delivery.source
 			reply.read.recovery = delivery.recovery
+			reply.read.requestLedger = delivery.requestLedger
+			reply.read.generation = delivery.generation
+			reply.read.executionPin = delivery.executionPin
+			reply.read.routeGate = delivery.routeGate
 		}
 		owner.settleReadDelivery(delivery, reply)
 	}
@@ -912,11 +1464,184 @@ func servingFenceMatchesIdentity(
 	member ownerMember,
 ) bool {
 	identity := member.identity
-	return fence.Group == identity.Group &&
+	return !member.retiring && fence.Group == identity.Group &&
 		fence.AllocationGeneration == identity.AllocationGeneration &&
 		fence.Command == member.command &&
 		fence.MemberID == identity.MemberID && fence.StoreID == identity.StoreID &&
 		fence.NodeIncarnation == identity.NodeIncarnation && fence.Term != 0
+}
+
+func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte) error {
+	member, found := owner.members[fence.Group]
+	if !found || !servingFenceMatchesIdentity(fence, member) {
+		return ErrServingFence
+	}
+	transition, err := replicatedstate.OpenOwnershipTransition(command)
+	if err != nil || !ownershipTransitionMatchesFence(transition, fence) {
+		return errors.Join(err, ErrServingFence)
+	}
+	publication, err := owner.host.Publication(fence.Group)
+	if err != nil || publication.ReplicaSetVersion != transition.ExpectedReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	status, err := owner.host.Status(fence.Group)
+	if err != nil {
+		return err
+	}
+	if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+		status.Term != fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	return owner.host.EnqueueProposal(fence.Group, command)
+}
+
+func ownershipTransitionMatchesFence(
+	transition replicatedstate.OwnershipTransitionView,
+	fence ServingFence,
+) bool {
+	return transition.ClusterID == fence.Group.ClusterID &&
+		transition.ClusterIncarnation == fence.Group.ClusterIncarnation &&
+		transition.TopologyRecoveryEpoch == fence.Group.TopologyRecoveryEpoch &&
+		transition.ShardIncarnation == fence.Group.ShardIncarnation &&
+		transition.GroupID == fence.Group.GroupID &&
+		transition.AllocationGeneration == fence.AllocationGeneration &&
+		transition.ExpectedReplicaSetVersion == fence.Command.ReplicaSetVersion &&
+		transition.ActivePolicyGeneration == fence.Command.ActivePolicyGeneration &&
+		transition.ProtectionEpoch == fence.Command.ProtectionEpoch &&
+		transition.OwnershipEpoch == fence.Command.OwnershipEpoch &&
+		transition.SchemaGeneration == fence.Command.SchemaGeneration &&
+		transition.RoutingVersion == fence.Command.RoutingVersion &&
+		transition.RouteGeneration == fence.Command.RouteGeneration
+}
+
+func (owner *Owner) applySchemaTransition(fence ServingFence, command []byte) error {
+	member, found := owner.members[fence.Group]
+	if !found || !servingFenceMatchesIdentity(fence, member) {
+		return ErrServingFence
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(command)
+	if err != nil || !schemaTransitionMatchesFence(transition, fence) {
+		return errors.Join(err, ErrServingFence)
+	}
+	publication, err := owner.host.Publication(fence.Group)
+	if err != nil || publication.ReplicaSetVersion != transition.ExpectedReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	status, err := owner.host.Status(fence.Group)
+	if err != nil {
+		return err
+	}
+	if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+		status.Term != fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	return owner.host.EnqueueProposal(fence.Group, command)
+}
+
+func schemaTransitionMatchesFence(
+	transition replicatedstate.SchemaTransitionView,
+	fence ServingFence,
+) bool {
+	from := transition.From
+	return from.ClusterID == fence.Group.ClusterID &&
+		from.ClusterIncarnation == fence.Group.ClusterIncarnation &&
+		from.TopologyRecoveryEpoch == fence.Group.TopologyRecoveryEpoch &&
+		from.ShardIncarnation == fence.Group.ShardIncarnation &&
+		from.GroupID == fence.Group.GroupID &&
+		from.AllocationGeneration == fence.AllocationGeneration &&
+		transition.ExpectedReplicaSetVersion == fence.Command.ReplicaSetVersion &&
+		from.ActivePolicyGeneration == fence.Command.ActivePolicyGeneration &&
+		from.ProtectionEpoch == fence.Command.ProtectionEpoch &&
+		from.OwnershipEpoch == fence.Command.OwnershipEpoch &&
+		from.SchemaGeneration == fence.Command.SchemaGeneration &&
+		transition.FromManifest == fence.Command.RelationManifestDigest &&
+		from.RoutingVersion == fence.Command.RoutingVersion &&
+		from.RouteGeneration == fence.Command.RouteGeneration
+}
+
+func (owner *Owner) retireReplica(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found {
+		return multiraft.ErrGroupNotFound
+	}
+	// Applied ownership/membership changes can precede the next observation
+	// RPC. Refresh from the same serialized durable cut used below; requiring
+	// a controller probe to refresh this cache can strand a removed source.
+	publication, err := owner.host.Publication(request.group)
+	if err != nil || publication.ReplicaSetVersion != request.fence.Command.ReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	state, err := owner.host.SnapshotState(request.group)
+	if err != nil || !retirementStateMatches(state, request.fence, request.sourceMember,
+		request.targetMember) {
+		return errors.Join(err, ErrServingFence)
+	}
+	if err = owner.syncCommandFenceFromState(request.group, ReplicaObservation{
+		Publication: publication, State: state,
+	}); err != nil {
+		return err
+	}
+	member = owner.members[request.group]
+	// A retry after ErrGroupBusy remains authorized by the exact latched member
+	// identity, but the retiring bit permanently fences data serving.
+	wasRetiring := member.retiring
+	member.retiring = false
+	validFence := servingFenceMatchesIdentity(request.fence, member)
+	member.retiring = wasRetiring
+	if !validFence || request.operation == ([32]byte{}) || request.step == ([32]byte{}) ||
+		request.sourceMember != member.identity.MemberID || request.targetMember == 0 ||
+		request.targetMember == request.sourceMember {
+		return ErrServingFence
+	}
+	status, err := owner.host.Status(request.group)
+	if err != nil {
+		return err
+	}
+	if status.LeaderID == request.sourceMember || status.Term != request.fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	member.retiring = true
+	owner.members[request.group] = member
+	if err = owner.host.Remove(request.group); err != nil {
+		return err
+	}
+	delete(owner.members, request.group)
+	for index, group := range owner.groups {
+		if group != request.group {
+			continue
+		}
+		copy(owner.groups[index:], owner.groups[index+1:])
+		owner.groups = owner.groups[:len(owner.groups)-1]
+		break
+	}
+	return nil
+}
+
+func retirementStateMatches(
+	state replicatedstate.State,
+	fence ServingFence,
+	sourceMember, targetMember uint64,
+) bool {
+	binding := state.Binding
+	if binding.ClusterID != fence.Group.ClusterID ||
+		binding.ClusterIncarnation != fence.Group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != fence.Group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != fence.Group.ShardIncarnation ||
+		binding.GroupID != fence.Group.GroupID ||
+		binding.AllocationGeneration != fence.AllocationGeneration ||
+		binding.ActivePolicyGeneration != fence.Command.ActivePolicyGeneration ||
+		binding.ProtectionEpoch != fence.Command.ProtectionEpoch ||
+		binding.OwnershipEpoch != fence.Command.OwnershipEpoch ||
+		binding.SchemaGeneration != fence.Command.SchemaGeneration ||
+		binding.RoutingVersion != fence.Command.RoutingVersion ||
+		binding.RouteGeneration != fence.Command.RouteGeneration ||
+		state.ReplicaSetVersion != fence.Command.ReplicaSetVersion ||
+		len(state.ConfState.GetVotersOutgoing()) != 0 ||
+		len(state.ConfState.GetLearnersNext()) != 0 || state.ConfState.GetAutoLeave() {
+		return false
+	}
+	voters := state.ConfState.GetVoters()
+	return !containsSorted(voters, sourceMember) && containsSorted(voters, targetMember)
 }
 
 func commandMatchesFence(command replication.CommandView, fence ServingFence) bool {
@@ -937,10 +1662,13 @@ func commandMatchesFence(command replication.CommandView, fence ServingFence) bo
 
 func (owner *Owner) applyMembership(request MembershipRequest) error {
 	member, found := owner.members[request.Fence.Group]
-	if !found || !member.authority.Valid() {
+	if !found || owner.authority == nil {
 		return ErrMembershipUnauthorized
 	}
-	authority := member.authority
+	authority, authorityFound, err := owner.authority.CurrentTransitionGrant(request.Fence.Group)
+	if err != nil || !authorityFound {
+		return errors.Join(err, ErrMembershipUnauthorized)
+	}
 	if err := validateMembershipIdentity(request, authority); err != nil {
 		return err
 	}
@@ -964,7 +1692,8 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 	}
 	var progress raftmodel.MemberProgress
 	var progressFound bool
-	if request.Kind == MembershipPromoteVoter || request.Kind == MembershipTransferLeader {
+	if request.Kind == MembershipPromoteVoter || request.Kind == MembershipTransferLeader ||
+		request.Kind == MembershipRemoveVoter {
 		progress, progressFound, err = owner.host.Progress(request.Fence.Group, request.TargetMember)
 		if err != nil {
 			return err
@@ -974,9 +1703,7 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		progress, progressFound); err != nil {
 		return err
 	}
-	authorizationDigest := raftmember.MembershipTransitionDigest(request.Fence.Group,
-		authority.TransitionID, authority.MetadataEpoch, authority.CatalogGeneration,
-		authority.SourceMember, authority.TargetMember)
+	authorizationDigest := authority.Digest()
 	context := append([]byte(nil), authorizationDigest[:]...)
 	switch request.Kind {
 	case MembershipAddLearner:
@@ -990,8 +1717,9 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 	case MembershipTransferLeader:
 		return owner.host.TransferLeader(request.Fence.Group, request.TargetMember)
 	case MembershipRemoveVoter:
-		// Removal is authorized only after the target is the observed leader.
-		// This makes deleting the active leader unrepresentable on this wire.
+		// The serialized owner is necessarily the live leader. Validation proves
+		// it is not the retiring source and that the replacement is a caught-up
+		// voter, without needlessly forcing leadership onto that replacement.
 		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
 			Type: pb.ConfChangeRemoveNode.Enum(), NodeId: &request.SourceMember, Context: context,
 		})
@@ -1002,7 +1730,7 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 
 func validateMembershipTransition(
 	request MembershipRequest,
-	authority MembershipAuthorization,
+	authority membershipgrant.Grant,
 	publication raftmodel.Publication,
 	status raftmember.RuntimeStatus,
 	progress raftmodel.MemberProgress,
@@ -1037,9 +1765,13 @@ func validateMembershipTransition(
 			return ErrMembershipNotCaughtUp
 		}
 	case MembershipRemoveVoter:
-		if status.LeaderID != request.TargetMember || status.MemberID != request.TargetMember ||
-			status.Term != request.TransferTerm ||
-			!containsSorted(voters, request.TargetMember) {
+		if status.LeaderID == request.SourceMember || status.Term != request.TransferTerm ||
+			len(voters) != len(authority.InitialVoters)+1 || len(learners) != 0 ||
+			len(publication.ConfState.GetVotersOutgoing()) != 0 ||
+			len(publication.ConfState.GetLearnersNext()) != 0 ||
+			publication.ConfState.GetAutoLeave() ||
+			!containsSorted(voters, request.TargetMember) ||
+			!caughtUp(progress, progressFound, status.Commit, false) {
 			return ErrMembershipStale
 		}
 	}
@@ -1048,7 +1780,7 @@ func validateMembershipTransition(
 
 func validateMembershipIdentity(
 	request MembershipRequest,
-	authority MembershipAuthorization,
+	authority membershipgrant.Grant,
 ) error {
 	if err := ValidateMembershipFields(
 		request.Kind, request.TransitionID, request.MetadataEpoch, request.CatalogGeneration,
@@ -1057,7 +1789,8 @@ func validateMembershipIdentity(
 	); err != nil {
 		return err
 	}
-	if request.TransitionID != authority.TransitionID ||
+	if request.Fence.Group != authority.Group ||
+		request.TransitionID != authority.TransitionID ||
 		request.MetadataEpoch != authority.MetadataEpoch ||
 		request.CatalogGeneration != authority.CatalogGeneration ||
 		request.SourceMember != authority.SourceMember ||
@@ -1171,6 +1904,7 @@ func (owner *Owner) ReadPoint(
 	if err != nil {
 		return PointReadResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	value, err := reply.read.source.PointReadInto(
 		request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes,
 		nil,
@@ -1184,6 +1918,68 @@ func (owner *Owner) ReadPoint(
 	}
 	releaseReservation = false
 	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value},
+		&pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadPointBatch authorizes exactly one leader ReadIndex and then reads one
+// coherent all-relation snapshot outside the serialized Raft lane. The source
+// performs a complete intent pass before returning any value bytes.
+func (owner *Owner) ReadPointBatch(
+	ctx context.Context,
+	request PointReadBatchRequest,
+) (PointReadBatchResult, PointReadLease, error) {
+	packed, packedErr := replicatedstate.OpenPointReadBatch(request.Packed)
+	if owner == nil || ctx == nil || packedErr != nil || packed.Count() == 0 ||
+		request.MinimumApplied == 0 || request.MaxResultBytes <= 0 ||
+		request.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
+		return PointReadBatchResult{}, nil, ErrInvalidOwner
+	}
+	responseCharge, ok := pointReadResponseCharge(request.MaxResultBytes)
+	if !ok {
+		return PointReadBatchResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return PointReadBatchResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	owned := append([]byte(nil), request.Packed...)
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
+		bytes: int64(cap(owned)), read: readRequest{
+			fence: request.Fence, minimumApplied: request.MinimumApplied,
+			delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return PointReadBatchResult{}, nil, err
+	}
+	defer reply.read.generation.release()
+	source, ok := reply.read.source.(BatchReadSource)
+	if !ok {
+		return PointReadBatchResult{}, nil, ErrInvalidOwner
+	}
+	value, err := source.PointReadBatchInto(
+		owned, reply.read.minimumApplied, request.MaxResultBytes, nil,
+	)
+	if err != nil {
+		return PointReadBatchResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		len(value.Data) > request.MaxResultBytes {
+		return PointReadBatchResult{}, nil, ErrServingFence
+	}
+	if _, err := replicatedstate.OpenPointReadBatchValue(value.Data); err != nil {
+		return PointReadBatchResult{}, nil, ErrServingFence
+	}
+	releaseReservation = false
+	return PointReadBatchResult{Applied: value.Fence.Applied, Data: value.Data},
 		&pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
@@ -1225,6 +2021,7 @@ func (owner *Owner) ReadTransaction(
 	if err != nil {
 		return TransactionReadResult{}, nil, err
 	}
+	defer reply.read.generation.release()
 	records := make([]replicatedstate.TransactionRecoveryRecord, 0, maxRecords)
 	payload := make([]byte, 0, scratchBytes)
 	value, err := reply.read.recovery.TransactionRecoveryReadInto(
@@ -1253,6 +2050,167 @@ func (owner *Owner) ReadTransaction(
 	return TransactionReadResult{
 		Applied: value.Fence.Applied, Complete: value.Complete, Records: value.Records,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadRequestLedger serves one bounded hidden-ledger row after the same
+// leader-only quorum ReadIndex barrier used by transaction recovery. The full
+// RequestKey and immutable range identity are revalidated inside the state
+// machine after the barrier; digest-only reads are impossible.
+func (owner *Owner) ReadRequestLedger(
+	ctx context.Context,
+	request RequestLedgerReadRequest,
+) (RequestLedgerReadResult, RequestLedgerReadLease, error) {
+	if owner == nil || ctx == nil {
+		return RequestLedgerReadResult{}, nil, ErrInvalidOwner
+	}
+	if request.Capability != serviceauthz.CapabilityRequestLedger {
+		return RequestLedgerReadResult{}, nil, ErrRequestLedgerUnauthorized
+	}
+	if replicatedstate.ValidateRequestLedgerReadRequest(request.Read) != nil {
+		return RequestLedgerReadResult{}, nil, ErrInvalidOwner
+	}
+	responseCharge, ok := requestLedgerReadResponseCharge(int(request.Read.MaxBytes))
+	if !ok {
+		return RequestLedgerReadResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return RequestLedgerReadResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadRequestLedger, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{
+			fence: request.Fence, minimumApplied: request.Read.MinimumApplied,
+			delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return RequestLedgerReadResult{}, nil, err
+	}
+	defer reply.read.generation.release()
+	dst := make([]byte, 0, request.Read.MaxBytes)
+	value, err := reply.read.requestLedger.RequestLedgerReadInto(request.Read, dst)
+	if err != nil {
+		return RequestLedgerReadResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		len(value.Value) > int(request.Read.MaxBytes) {
+		return RequestLedgerReadResult{}, nil, ErrServingFence
+	}
+	value.Value = value.Value[:len(value.Value):len(value.Value)]
+	releaseReservation = false
+	return RequestLedgerReadResult{
+		Applied: value.Fence.Applied, Found: value.Found,
+		AuthoritativeKind: value.AuthoritativeKind, Value: value.Value,
+	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadExecutionPin serves one exact hidden pin row after a leader-only quorum
+// ReadIndex barrier. The returned applied position is the logical clock used
+// by executionpin.ValidateSideEffectFence.
+func (owner *Owner) ReadExecutionPin(
+	ctx context.Context,
+	request ExecutionPinReadRequest,
+) (ExecutionPinReadResult, ExecutionPinReadLease, error) {
+	if owner == nil || ctx == nil || request.Pin == (executionpin.PinID{}) ||
+		request.MinimumApplied == 0 {
+		return ExecutionPinReadResult{}, nil, ErrInvalidOwner
+	}
+	if request.Capability != serviceauthz.CapabilityExecutionPin {
+		return ExecutionPinReadResult{}, nil, ErrExecutionPinUnauthorized
+	}
+	responseCharge, ok := pointReadResponseCharge(executionpin.RecordBytes + 1)
+	if !ok {
+		return ExecutionPinReadResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadExecutionPin, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{
+			fence: request.Fence, minimumApplied: request.MinimumApplied, delivery: delivery,
+		},
+	}, delivery)
+	if err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	defer reply.read.generation.release()
+	value, err := reply.read.executionPin.ExecutionPinRead(request.Pin, reply.read.minimumApplied)
+	if err != nil {
+		return ExecutionPinReadResult{}, nil, err
+	}
+	if !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied ||
+		value.Found && value.Record.PinID != request.Pin {
+		return ExecutionPinReadResult{}, nil, ErrServingFence
+	}
+	releaseReservation = false
+	return ExecutionPinReadResult{
+		Applied: value.Fence.Applied, Found: value.Found, Record: value.Record,
+	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+// ReadLinearizableSnapshot obtains one quorum ReadIndex and pins the complete
+// state-machine image reached by that barrier. It is backup-only and never
+// reuses data-read, topology, or membership authority.
+func (owner *Owner) ReadLinearizableSnapshot(ctx context.Context,
+	request LinearizableSnapshotRequest,
+) (*LinearizableSnapshotCut, error) {
+	if owner == nil || ctx == nil || request.Capability != serviceauthz.CapabilityBackup {
+		return nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(1); err != nil {
+		return nil, err
+	}
+	release := true
+	defer func() {
+		if release {
+			owner.releasePendingRead(1)
+		}
+	}()
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	reply, err := owner.enqueueRead(ctx, ownerRequest{
+		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
+		read: readRequest{fence: request.Fence, delivery: delivery},
+	}, delivery)
+	if err != nil {
+		return nil, err
+	}
+	source, ok := reply.read.source.(SnapshotCutSource)
+	if !ok {
+		reply.read.generation.release()
+		return nil, ErrServingFence
+	}
+	snapshot, err := source.SnapshotArtifactCutAt(reply.read.minimumApplied)
+	if err != nil {
+		reply.read.generation.release()
+		return nil, err
+	}
+	if snapshot == nil || !pointReadFenceMatches(snapshot.Fence(), request.Fence) ||
+		snapshot.Fence().Applied < reply.read.minimumApplied {
+		if snapshot != nil {
+			_ = snapshot.Close()
+		}
+		reply.read.generation.release()
+		return nil, ErrServingFence
+	}
+	release = false
+	return &LinearizableSnapshotCut{snapshot: snapshot, generation: reply.read.generation, owner: owner}, nil
 }
 
 func (owner *Owner) enqueueRead(
@@ -1578,12 +2536,188 @@ func (owner *Owner) ApplyMembership(ctx context.Context, request MembershipReque
 	return err
 }
 
+// ProposeOwnershipTransition admits one canonical ownership transition through
+// the serialized Owner lane. A nil result means the exact bytes entered the
+// bounded Host queue, not that they applied. Callers settle the outcome from
+// ObserveReplica and must replay the same operation/step on uncertainty.
+func (owner *Owner) ProposeOwnershipTransition(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) error {
+	if owner == nil || ctx == nil || len(command) == 0 ||
+		len(command) > replicatedstate.MaxOwnershipTransitionBytes {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	owned := make([]byte, len(command))
+	copy(owned, command)
+	reply := make(chan ownerReply, 1)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestOwnershipTransition, group: fence.Group, fence: fence,
+		data: owned, reply: reply, bytes: int64(len(owned)),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	return err
+}
+
+// ProposeSchemaTransition admits one canonical schema transition through the
+// serialized Owner lane. A nil result means the exact authenticated bytes
+// entered the bounded Host queue, not that they applied. The caller settles
+// uncertainty by observing the target generation and apply contract before
+// publishing the prepared catalog.
+func (owner *Owner) ProposeSchemaTransition(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) error {
+	if owner == nil || ctx == nil || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	owned := make([]byte, len(command))
+	copy(owned, command)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestSchemaTransition, group: fence.Group, fence: fence,
+		data: owned, reply: make(chan ownerReply, 1), bytes: int64(len(owned)),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	return err
+}
+
+// ObserveSchemaTransition settles the exact replicated schema command without
+// changing admissions or SQL handles. Callers use this boundary before the
+// catalog CAS; the later quiesce repeats the observation defensively.
+func (owner *Owner) ObserveSchemaTransition(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	command []byte,
+) (bool, error) {
+	if owner == nil || ctx == nil || group == (raftmember.GroupKey{}) || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return false, ErrInvalidOwner
+	}
+	owned := make([]byte, len(command))
+	copy(owned, command)
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestObserveSchemaTransition, group: group, data: owned,
+		bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+	})
+	return reply.committed, err
+}
+
+// QuiesceSchemaGeneration fences new reads and proposals after the ordered
+// schema transition has settled, drains every escaped read pin, and releases
+// only this group's SQL generation while retaining its live Raft member.
+func (owner *Owner) QuiesceSchemaGeneration(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) error {
+	if owner == nil || ctx == nil || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return ErrInvalidOwner
+	}
+	owned := append([]byte(nil), command...)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestQuiesceSchemaGeneration, group: fence.Group, fence: fence,
+		data: owned, bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+	})
+	return err
+}
+
+// InstallSchemaGeneration publishes target SQL handles into one already
+// quiesced group. Success resumes the same Raft member with a new serving
+// generation; failure transfers no ownership and leaves the group fenced.
+func (owner *Owner) InstallSchemaGeneration(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	if owner == nil || ctx == nil || group == (raftmember.GroupKey{}) ||
+		database == nil || apply == nil {
+		return ErrInvalidOwner
+	}
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestInstallSchemaGeneration, group: group,
+		database: database, apply: apply, schemaSQL: expectedSQL, schemaApply: expectedApply,
+		reply: make(chan ownerReply, 1),
+	})
+	return err
+}
+
+// RetireReplicaSource permanently fences the local member before removing its
+// quiescent Runtime through the sole Host owner. ErrGroupBusy is retryable; the
+// serving fence remains latched while the lane drains. ErrGroupNotFound is
+// settled only by a caller that already durably journaled this exact request.
+func (owner *Owner) RetireReplicaSource(
+	ctx context.Context,
+	request ReplicaRetirementRequest,
+) error {
+	if owner == nil || ctx == nil || request.Operation == ([32]byte{}) ||
+		request.Step == ([32]byte{}) || request.SourceMember == 0 ||
+		request.TargetMember == 0 || request.SourceMember == request.TargetMember {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestReplicaRetirement, group: request.Fence.Group, fence: request.Fence,
+		operation: request.Operation, step: request.Step, sourceMember: request.SourceMember,
+		targetMember: request.TargetMember, reply: make(chan ownerReply, 1),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	return err
+}
+
 // Status reads detached Raft status through the serialized lane.
 func (owner *Owner) Probe(ctx context.Context, group raftmember.GroupKey) (ServingState, error) {
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestStatus, group: group, reply: make(chan ownerReply, 1),
 	})
 	return reply.state, err
+}
+
+// ObserveReplica collects the applied membership, local durable state, leader
+// status, transfer fields, and target replication progress in one serialized
+// Host turn. A follower returns ProgressFound=false because it has no
+// authoritative leader progress tracker.
+func (owner *Owner) ObserveReplica(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	targetMember uint64,
+) (ReplicaObservation, error) {
+	if ctx == nil || targetMember == 0 {
+		return ReplicaObservation{}, ErrInvalidOwner
+	}
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestReplicaObservation, group: group, targetMember: targetMember,
+		reply: make(chan ownerReply, 1),
+	})
+	return reply.observation, err
+}
+
+func stateMatchesReplicaGroup(state replicatedstate.State, group raftmember.GroupKey) bool {
+	return [16]byte(state.Binding.ClusterID) == group.ClusterID &&
+		[16]byte(state.Binding.ClusterIncarnation) == group.ClusterIncarnation &&
+		state.Binding.TopologyRecoveryEpoch == group.TopologyRecoveryEpoch &&
+		[16]byte(state.Binding.ShardIncarnation) == group.ShardIncarnation &&
+		[16]byte(state.Binding.GroupID) == group.GroupID
 }
 
 // Done closes when the lane stops.

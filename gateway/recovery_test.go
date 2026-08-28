@@ -17,6 +17,24 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
+func TestRecoveryCatalogCallsNeverSendLegacyRPCToRF3(t *testing.T) {
+	fixture := newScatterCatalogFixture(t, 2, 5)
+	profile := DefaultProfiles()[ClassAdmin].withDefaults()
+	calls, err := transactionCatalogCalls(fixture.snapshot, profile)
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("RF3-only catalog produced %d legacy recovery calls: %v", len(calls), err)
+	}
+	mixed, err := NewSnapshotWithReplicatedTableMetadata(fixture.config, fixture.endpoints, 5,
+		nil, nil, fixture.descriptors[:1], fixture.profiles[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, err = transactionCatalogCalls(mixed, profile)
+	if err != nil || len(calls) != 1 || calls[0].req.Distribution != fixture.config.Distributions[1].Name {
+		t.Fatalf("mixed catalog legacy recovery calls=%+v err=%v", calls, err)
+	}
+}
+
 func TestRecoveryContextUsesOnlyExplicitInternalAuthority(t *testing.T) {
 	var node rafttransport.NodeID
 	node[0] = 41
@@ -84,7 +102,7 @@ func stageRecoveryTransaction(
 	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: snapshot.Generation(),
-		RecoveryDeadline:  time.Now().Add(-time.Second).UnixNano(), Participants: refs,
+		RecoveryDeadline:  1, Participants: refs,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -325,6 +343,7 @@ type manifestRecoveryScript struct {
 	fixture              manifestRecoveryFixture
 	state                distributedtxn.CoordinatorState
 	revision             uint64
+	recoveryPulse        uint8
 	missingPage          int
 	reorderFirst         bool
 	dropCommitOnce       bool
@@ -459,9 +478,25 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 		return manifestCoordinatorStatus(s.fixture, distributedtxn.CoordinatorCommitted, 2, false)
 	case shardservice.TransactionLookupCoordinator:
 		s.mu.Lock()
-		state, revision = s.state, s.revision
+		state, revision, pulse := s.state, s.revision, s.recoveryPulse
 		s.mu.Unlock()
-		return manifestCoordinatorStatus(s.fixture, state, revision, true)
+		response := manifestCoordinatorStatus(s.fixture, state, revision, true)
+		response.Transaction.RecoveryPulse = pulse
+		return response
+	case shardservice.TransactionPulseCoordinator:
+		s.mu.Lock()
+		if tx.Revision != s.revision || tx.RecoveryPulse != s.recoveryPulse+1 {
+			s.mu.Unlock()
+			return shardservice.NewErrorResponse(
+				shardservice.ErrorTransactionConflict, "invalid recovery pulse",
+			)
+		}
+		s.recoveryPulse = tx.RecoveryPulse
+		state, revision, pulse := s.state, s.revision, s.recoveryPulse
+		s.mu.Unlock()
+		response := manifestCoordinatorStatus(s.fixture, state, revision, false)
+		response.Transaction.RecoveryPulse = pulse
+		return response
 	case shardservice.TransactionAbortCoordinator:
 		s.mu.Lock()
 		if s.commitWinsAbort {
@@ -558,6 +593,7 @@ func (s *manifestRecoveryScript) coordinatorResponse() recoveryCoordinator {
 	defer s.mu.Unlock()
 	coordinator := s.fixture.coordinator
 	coordinator.response = manifestCoordinatorStatus(s.fixture, s.state, s.revision, true)
+	coordinator.response.Transaction.RecoveryPulse = s.recoveryPulse
 	return coordinator
 }
 
@@ -578,7 +614,7 @@ func (s *manifestRecoveryScript) check(t *testing.T) {
 
 func TestRecoveryManifestWalk4097UsesBoundedPagedArena(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 4097, distributedtxn.CoordinatorCommitted, time.Now().Add(-time.Second).UnixNano(),
+		t, 4097, distributedtxn.CoordinatorCommitted, 3,
 	)
 	if fixture.descriptor.SegmentCount <= 1 {
 		t.Fatalf("segment count=%d", fixture.descriptor.SegmentCount)
@@ -617,9 +653,8 @@ func TestRecoveryManifestWalk4097UsesBoundedPagedArena(t *testing.T) {
 	script.check(t)
 }
 
-func TestRecoveryManifestMissingPageWaitsThenAbortsAfterRestart(t *testing.T) {
-	deadline := time.Now().Add(100 * time.Millisecond)
-	fixture := newManifestRecoveryFixture(t, 4097, distributedtxn.CoordinatorStaging, deadline.UnixNano())
+func TestRecoveryManifestMissingPageRequiresLogicalPulsesAcrossRestart(t *testing.T) {
+	fixture := newManifestRecoveryFixture(t, 4097, distributedtxn.CoordinatorStaging, 3)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
 	script.missingPage = 1
 	executor := script.executor()
@@ -632,7 +667,12 @@ func TestRecoveryManifestMissingPageWaitsThenAbortsAfterRestart(t *testing.T) {
 	if got := script.operationCount(shardservice.TransactionReadParticipant); got != 0 {
 		t.Fatalf("incomplete manifest fanned out %d participant reads", got)
 	}
-	time.Sleep(time.Until(deadline) + 20*time.Millisecond)
+	result, err = executor.recoverManifestCoordinator(
+		t.Context(), fixture.snapshot, script.coordinatorResponse(), executor.profileFor(ClassAdmin),
+	)
+	if !errors.Is(err, ErrRecoveryNotReady) || result.ID != fixture.id {
+		t.Fatalf("second logical pulse result=%+v err=%v", result, err)
+	}
 	script.mu.Lock()
 	script.dropRetireOnce = true
 	script.mu.Unlock()
@@ -659,7 +699,7 @@ func TestRecoveryManifestMissingPageWaitsThenAbortsAfterRestart(t *testing.T) {
 
 func TestRecoveryManifestCommittedMissingAndReorderedPagesFailClosed(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 4097, distributedtxn.CoordinatorCommitted, time.Now().Add(-time.Second).UnixNano(),
+		t, 4097, distributedtxn.CoordinatorCommitted, 3,
 	)
 	for _, test := range []struct {
 		name      string
@@ -688,7 +728,7 @@ func TestRecoveryManifestCommittedMissingAndReorderedPagesFailClosed(t *testing.
 
 func TestRecoveryManifest65CommittedParticipants(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 65, distributedtxn.CoordinatorCommitted, time.Now().Add(-time.Second).UnixNano(),
+		t, 65, distributedtxn.CoordinatorCommitted, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorCommitted)
 	executor := script.executor()
@@ -714,7 +754,7 @@ func TestRecoveryManifest65CommittedParticipants(t *testing.T) {
 
 func TestLiveInlineAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 1, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+		t, 1, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
 	script.commitWinsAbort = true
@@ -736,7 +776,7 @@ func TestLiveInlineAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
 
 func TestLiveAbortCleanupUsesBoundedConcurrency(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 1, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+		t, 1, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
 	script.participantDelay = 10 * time.Millisecond
@@ -766,7 +806,7 @@ func TestLiveAbortCleanupUsesBoundedConcurrency(t *testing.T) {
 
 func TestRecoveryManifestAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 65, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+		t, 65, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
 	script.participantAborted = true
@@ -788,7 +828,7 @@ func TestRecoveryManifestAbortLosesToCommitBeforeParticipantMutation(t *testing.
 
 func TestRecoveryManifestRetiredDoesNotReadPrunedPages(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 65, distributedtxn.CoordinatorRetired, time.Now().Add(-time.Second).UnixNano(),
+		t, 65, distributedtxn.CoordinatorRetired, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorRetired)
 	// Retired coordinators may have reclaimed every VTM1 page. Any page read
@@ -810,7 +850,7 @@ func TestRecoveryManifestRetiredDoesNotReadPrunedPages(t *testing.T) {
 
 func TestRecoveryManifestOutcomeUnknownResumesCommittedDecision(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 65, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+		t, 65, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
 	script.dropCommitOnce, script.dropLookupOnce = true, true
@@ -837,7 +877,7 @@ func TestRecoveryManifestOutcomeUnknownResumesCommittedDecision(t *testing.T) {
 
 func TestRecoveryManifestRouteIndexFencesCatalogCoordinates(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
-		t, 4097, distributedtxn.CoordinatorCommitted, time.Now().Add(-time.Second).UnixNano(),
+		t, 4097, distributedtxn.CoordinatorCommitted, 3,
 	)
 	profile := DefaultProfiles()[ClassAdmin].withDefaults()
 	routes, err := buildRecoveryRouteIndex(fixture.snapshot, profile)

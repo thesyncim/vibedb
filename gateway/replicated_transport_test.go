@@ -87,6 +87,7 @@ func TestReplicatedCapabilityControlReserveClassification(t *testing.T) {
 		serviceauthz.CapabilityMembership,
 		serviceauthz.CapabilityTopology,
 		serviceauthz.CapabilityTransactionRecovery,
+		serviceauthz.CapabilityRequestLedger,
 		serviceauthz.CapabilityDataRead | serviceauthz.CapabilityTransactionRecovery,
 	} {
 		if !replicatedCapabilityUsesControlReserve(capability) {

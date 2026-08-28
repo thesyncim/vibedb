@@ -3,6 +3,7 @@ package distributedtxn
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"slices"
 	"testing"
@@ -32,6 +33,7 @@ func replicatedTestParticipant() ReplicatedCommand {
 	return ReplicatedCommand{
 		Role: ReplicatedRoleParticipant, Operation: ReplicatedStageParticipant,
 		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		ControllerEpoch: 7, ExecutionPinDigest: digest("execution-pin"),
 		Participant: ParticipantStage{
 			CoordinatorGroup: group, CoordinatorShardIncarnation: incarnation,
 			CoordinatorAllocation: 11, BucketBits: 8,
@@ -39,6 +41,12 @@ func replicatedTestParticipant() ReplicatedCommand {
 			MutationDigest: digest("canonical-relation-batches"),
 		},
 	}
+}
+
+func fencedReplicatedTestCommand(command ReplicatedCommand) ReplicatedCommand {
+	command.ControllerEpoch = 7
+	command.ExecutionPinDigest = digest("execution-pin")
+	return command
 }
 
 func TestReplicatedParticipantStageRoundTripCanonicalAndCompact(t *testing.T) {
@@ -61,6 +69,8 @@ func TestReplicatedParticipantStageRoundTripCanonicalAndCompact(t *testing.T) {
 		t.Fatalf("allocation-free validation: %v", err)
 	}
 	if !bytes.Equal(view.Bytes(), encoded) || view.ID != command.ID ||
+		view.ControllerEpoch != command.ControllerEpoch ||
+		view.ExecutionPinDigest != command.ExecutionPinDigest ||
 		view.Participant.MutationDigest != command.Participant.MutationDigest ||
 		!slices.Equal(view.Participant.IntentScopes, command.Participant.IntentScopes) ||
 		len(view.Payload) != 0 {
@@ -103,6 +113,7 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 			ID: testID(), ExpectedRevision: 1, PayloadKind: ReplicatedPayloadNone},
 	}
 	for i, command := range cases {
+		command = fencedReplicatedTestCommand(command)
 		encoded, appendErr := AppendReplicatedCommand(nil, command)
 		if appendErr != nil {
 			t.Fatalf("case %d append: %v", i, appendErr)
@@ -133,6 +144,39 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 	}
 }
 
+func TestReplicatedCoordinatorRecoveryPulseUsesReservedByteCanonically(t *testing.T) {
+	id := testID()
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedPulseCoordinator,
+		ID: id, ExpectedRevision: 9, PayloadKind: ReplicatedPayloadNone,
+		RecoveryPulse: 2,
+	}
+	command = fencedReplicatedTestCommand(command)
+	raw, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != replicatedCommandHeaderBytes+replicatedCommandChecksumBytes || raw[121] != 2 {
+		t.Fatalf("pulse command bytes=%d pulse=%d", len(raw), raw[121])
+	}
+	opened, err := OpenReplicatedCommand(raw)
+	if err != nil || opened.Role != command.Role || opened.Operation != command.Operation ||
+		opened.ID != command.ID || opened.ExpectedRevision != command.ExpectedRevision ||
+		opened.PayloadKind != command.PayloadKind || opened.RecoveryPulse != command.RecoveryPulse {
+		t.Fatalf("opened=%+v err=%v", opened.Command(), err)
+	}
+	invalid := command
+	invalid.RecoveryPulse = 0
+	if _, err = AppendReplicatedCommand(nil, invalid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("zero pulse err=%v", err)
+	}
+	invalid = command
+	invalid.Operation = ReplicatedAbortCoordinator
+	if _, err = AppendReplicatedCommand(nil, invalid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("pulse on abort err=%v", err)
+	}
+}
+
 func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
 	valid, err := AppendReplicatedCommand(nil, replicatedTestParticipant())
 	if err != nil {
@@ -147,6 +191,7 @@ func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
 	for _, bad := range [][]byte{
 		append(bytes.Clone(valid), 0),
 		mutate(10, 1), mutate(20, 1), mutate(121, 1), mutate(124, 1),
+		mutate(128, 0),
 		mutate(5, byte(ReplicatedRoleCoordinator)),
 		mutate(7, byte(ReplicatedPayloadNone)),
 	} {
@@ -250,6 +295,7 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 		ID: testID(), ExpectedRevision: 1,
 		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[1],
 	}
+	segment = fencedReplicatedTestCommand(segment)
 	segmentDst := make([]byte, 0, replicatedCommandHeaderBytes+len(pages[1])+4)
 	if got := testing.AllocsPerRun(1000, func() {
 		var err error
@@ -273,6 +319,7 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator, Payload: manifestPayload,
 	}
+	manifestStart = fencedReplicatedTestCommand(manifestStart)
 	manifestDst := make([]byte, 0, replicatedCommandHeaderBytes+len(manifestPayload)+4)
 	if got := testing.AllocsPerRun(1000, func() {
 		var appendErr error
@@ -317,6 +364,7 @@ func TestAppendReplicatedCommandRejectsPayloadAppendRegionOverlapWithoutMutation
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
 	}
+	base = fencedReplicatedTestCommand(base)
 	total := replicatedCommandHeaderBytes + len(payload) + replicatedCommandChecksumBytes
 	tests := []struct {
 		name  string
@@ -363,20 +411,20 @@ func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inline, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+	inline, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
 		Payload: replicatedTestCoordinator(t),
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	descriptor, pages := buildManifest(t, 2048)
-	segment, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+	segment, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestSegment,
 		ID: testID(), ExpectedRevision: 1,
 		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[1],
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,11 +435,11 @@ func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifestStart, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+	manifestStart, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
 		Payload: append(manifestCoordinator, pages[0]...),
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,6 +493,7 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 			ReplicatedStagePrepareParticipant, 4096, digest("fused-participant"),
 		),
 	}
+	participant = fencedReplicatedTestCommand(participant)
 	encoded, err := AppendReplicatedCommand(nil, participant)
 	if err != nil {
 		t.Fatal(err)
@@ -461,6 +510,7 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 			Role: ReplicatedRoleParticipant, Operation: operation, ID: testID(),
 			ExpectedRevision: 2, PayloadKind: ReplicatedPayloadNone,
 		}
+		command = fencedReplicatedTestCommand(command)
 		if _, err := AppendReplicatedCommand(nil, command); err != nil {
 			t.Fatalf("operation %d: %v", operation, err)
 		}
@@ -483,6 +533,7 @@ func TestReplicatedParticipantAbortFenceIsCanonicalAndCompact(t *testing.T) {
 		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
 		Participant: stage,
 	}
+	command = fencedReplicatedTestCommand(command)
 	encoded, err := AppendReplicatedCommand(nil, command)
 	if err != nil {
 		t.Fatal(err)
@@ -522,6 +573,7 @@ func TestReplicatedParticipantAbortFenceRejectsAmbiguousShapes(t *testing.T) {
 		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
 		Participant: stage,
 	}
+	valid = fencedReplicatedTestCommand(valid)
 	tests := []func(*ReplicatedCommand){
 		func(c *ReplicatedCommand) { c.PayloadKind = ReplicatedPayloadNone },
 		func(c *ReplicatedCommand) { c.ExpectedRevision = 2 },
@@ -561,6 +613,7 @@ func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
 		Payload: payload, Participant: stage,
 	}
+	command = fencedReplicatedTestCommand(command)
 	encoded, err := AppendReplicatedCommand(nil, command)
 	if err != nil {
 		t.Fatal(err)
@@ -628,6 +681,7 @@ func TestManifestSegmentSequenceFusedPackingAndOrdinalBinding(t *testing.T) {
 			ReplicatedBeginPrepareManifestCoordinator, ordinal, want.MutationDigest,
 		),
 	}
+	command = fencedReplicatedTestCommand(command)
 	encoded, err := AppendReplicatedCommand(nil, command)
 	if err != nil {
 		t.Fatal(err)
@@ -654,6 +708,7 @@ func TestManifestSegmentSequenceFusedPackingAndOrdinalBinding(t *testing.T) {
 		ID: testID(), ExpectedRevision: 1,
 		PayloadKind: ReplicatedPayloadManifestSegments, Payload: laterBytes,
 	}
+	later = fencedReplicatedTestCommand(later)
 	if _, err := AppendReplicatedCommand(nil, later); err != nil {
 		t.Fatal(err)
 	}
@@ -779,7 +834,7 @@ func TestManifestSegmentSequenceFollowsStrictIdentityBoundary(t *testing.T) {
 }
 
 func TestFusedReplicatedCommandExactMaximum(t *testing.T) {
-	const want = 985336
+	const want = 985376
 	if MaxReplicatedCommandBytes != want {
 		t.Fatalf("max replicated command=%d want=%d", MaxReplicatedCommandBytes, want)
 	}
@@ -846,6 +901,7 @@ func TestReplicatedRetireCoordinatorRequiresRetirementSummary(t *testing.T) {
 		ID: testID(), ExpectedRevision: 2,
 		PayloadKind: ReplicatedPayloadRetirement, Payload: payload,
 	}
+	command = fencedReplicatedTestCommand(command)
 	encoded, err := AppendReplicatedCommand(nil, command)
 	if err != nil {
 		t.Fatal(err)

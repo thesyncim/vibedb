@@ -15,13 +15,19 @@ different acknowledgement contract.
 > only on loopback listeners.
 
 The gateway exposes three separate distributed paths: general SQL through
-static shard services, canonical RF3 point reads, and strict exact-key
-`exec_batch` mutations over one or more externally prepared RF3 groups. The
-RF3 mutation lane supports whole-document insert, exact-primary-key
-whole-document update, and exact-primary-key delete, including atomic
-same-group multi-relation batches. RF3 scatter or multi-table reads, RF3
-global-index mutation lowering, distributed DDL, and automatic replica
-lifecycle remain absent.
+static shard services, replicated exact-key reads, and strict exact-key
+`exec_batch` mutations over one or more prepared RF3 groups. It also composes
+replicated catalog, request-ledger, replica-move, automatic hot-range split,
+live-backup, and fresh-identity restore control paths. The
+read lane supports all-or-nothing multi-table batches with one `ReadIndex` cut
+per group. The mutation lane supports single- and multi-row whole-document
+insert, exact-primary-key whole-document update, and exact-primary-key delete
+including finite `IN` key sets, with atomic same-group multi-relation batches
+and independently placed global-index maintenance.
+
+These distributed commands are unreleased. The generated feature-state matrix
+distinguishes a present primitive from command integration and from mandatory
+external qualification. It does not turn unexecuted CI gates into evidence.
 
 ## Requirements
 
@@ -96,7 +102,9 @@ each collection when the first mutation needs that collection.
 - [Durability and recovery](docs/durability.md)
 - [Current capability matrix](docs/capabilities.md)
 - [Distributed feature state](docs/distributed-feature-state.md)
+- [RF3 quickstart](docs/operations/distributed-quickstart.md)
 - [Distributed runtime](docs/operations/distributed.md)
+- [Replica lifecycle operations](docs/operations/replica-lifecycle.md)
 - [Security policy](SECURITY.md)
 
 The documentation uses an STE-informed technical style. It keeps standard

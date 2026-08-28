@@ -10,10 +10,12 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -31,11 +33,45 @@ var (
 // index relations are resolved. Key is already the engine's canonical ordered
 // key; Value is exact vibejson for Put and empty for Delete.
 type NativeMutation struct {
+	// Relation optionally names an exact dense relation. Zero selects the base.
+	Relation            replication.RelationID
 	Kind                replication.MutationKind
 	Key                 []byte
 	Value               []byte
 	ExpectedValueLength uint64
 	ExpectedValueDigest replication.Digest
+}
+
+// ExactRelationResolver admits an immutable schema-generation-bound set of
+// dense relation IDs. Relation names never enter the command or Raft log.
+type ExactRelationResolver struct {
+	Base      replication.RelationID
+	Relations []replication.RelationID
+}
+
+func (resolver ExactRelationResolver) ResolveNative(
+	builder *RelationBundleBuilder,
+	mutation NativeMutation,
+) error {
+	relation := mutation.Relation
+	if relation == 0 {
+		relation = resolver.Base
+	}
+	allowed := relation == resolver.Base
+	for index := range resolver.Relations {
+		if resolver.Relations[index] == relation {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return ErrNativeBundleBound
+	}
+	return builder.Add(relation, replication.Mutation{
+		Kind: mutation.Kind, Key: mutation.Key, Value: mutation.Value,
+		ExpectedValueLength: mutation.ExpectedValueLength,
+		ExpectedValueDigest: mutation.ExpectedValueDigest,
+	})
 }
 
 // BundleResolver emits dense, strictly increasing relation IDs for one native
@@ -128,8 +164,12 @@ type NativeSessionOptions struct {
 	RetryHome    replication.RetryHome
 	Resolver     BundleResolver
 	Journal      *NativeSessionJournal
+	// CatalogBootstrap enables placement discovery for the reserved catalog
+	// control session before its first Open. It does not alter the durable
+	// journal binding or permit a data session to follow stale routes.
+	CatalogBootstrap *Snapshot
 	// ProposalCapability is the exact authorization class placed on every
-	// probe and proposal. Only DataWrite and Topology are admitted.
+	// probe and proposal. DataWrite, Topology, and ExecutionPin are admitted.
 	ProposalCapability serviceauthz.Capability
 
 	MaxRelationBatches  int
@@ -154,7 +194,8 @@ func NativeSessionJournalBinding(
 		!validNativeSessionIdentity(distribution, shard, tenant) ||
 		relation == 0 || relation > replication.MaxRelationID ||
 		(capability != serviceauthz.CapabilityDataWrite &&
-			capability != serviceauthz.CapabilityTopology) {
+			capability != serviceauthz.CapabilityTopology &&
+			capability != serviceauthz.CapabilityExecutionPin) {
 		return replication.Digest{}, ErrNativeSession
 	}
 	hash := sha256.New()
@@ -215,6 +256,7 @@ type NativeSession struct {
 	resolver            BundleResolver
 	bundle              RelationBundleBuilder
 	command             []byte
+	gateCommand         [routegate.CommandBytes]byte
 	maxCommand          int
 	pending             bool
 	phase               nativeSessionPhase
@@ -227,6 +269,9 @@ type NativeSession struct {
 	leader              shardservice.ReplicatedMemberState
 	journal             *NativeSessionJournal
 	proposalCapability  serviceauthz.Capability
+	catalogControl      bool
+	catalogBootstrap    *Snapshot
+	catalogHolder       *CatalogHolder
 }
 
 // NativeSessionStatus is a detached fixed-width view. Pending means callers
@@ -240,6 +285,146 @@ type NativeSessionStatus struct {
 	Active        bool
 	Retired       bool
 	Released      bool
+}
+
+// NativeSessionMatchesControlBinding reports whether session is the dedicated
+// durable controller session for one exact live serving fence. It deliberately
+// checks the member/store incarnation against the route's authenticated replica
+// set as well as every apply-visible command generation. A controller can use
+// this before handing destructive work to NativeSession without exposing or
+// copying the session's private route and journal state.
+func NativeSessionMatchesControlBinding(
+	session *NativeSession,
+	fence raftservice.ServingFence,
+	tenant []byte,
+	clientID replication.ID128,
+	relation replication.RelationID,
+	capability serviceauthz.Capability,
+) bool {
+	if session == nil || session.journal == nil || clientID == (replication.ID128{}) ||
+		relation == 0 || !fence.Command.Valid() || fence.MemberID == 0 ||
+		fence.StoreID == ([16]byte{}) || fence.NodeIncarnation == 0 || fence.Term == 0 ||
+		session.clientID != clientID || !bytes.Equal(session.tenant, tenant) ||
+		session.proposalCapability != capability ||
+		nativeSessionBaseRelation(session) != relation ||
+		session.route.Group != fence.Group ||
+		session.route.AllocationGeneration != fence.AllocationGeneration ||
+		session.route.Command != fence.Command {
+		return false
+	}
+	for index := range session.route.Replicas {
+		replica := session.route.Replicas[index]
+		if replica.Member == fence.MemberID && replica.StoreID == fence.StoreID &&
+			replica.NodeIncarnation == fence.NodeIncarnation {
+			return true
+		}
+	}
+	return false
+}
+
+// NativeSessionSupportsMutationBound proves that a worst-case conditional
+// delete batch inside the supplied independent key-count/key-byte ceilings fits
+// the session's configured mutation, relation, and canonical command bounds.
+// It is a cold controller-construction check; the serving hot path remains
+// allocation-free apart from its preallocated command workspace.
+func NativeSessionSupportsMutationBound(
+	session *NativeSession,
+	relation replication.RelationID,
+	maxKeys, maxKeyBytes int,
+) bool {
+	if session == nil || relation == 0 || relation > replication.MaxRelationID ||
+		maxKeys <= 0 || maxKeys > session.bundle.maxMutations ||
+		maxKeyBytes <= 0 || maxKeyBytes > replication.MaxCommandBytes ||
+		nativeSessionBaseRelation(session) != relation {
+		return false
+	}
+	count := maxKeys
+	if count > maxKeyBytes {
+		count = maxKeyBytes
+	}
+	// These are independent upper bounds, not a requirement to fill both.
+	// A loose byte ceiling cannot make a bounded key batch unrepresentable:
+	// each individual key is already capped by the command grammar.
+	maxKeyBytes = min(maxKeyBytes, count*replication.MaxMutationKeyBytes)
+	largest := (maxKeyBytes + count - 1) / count
+	dummy := make([]byte, largest)
+	mutations := make([]replication.Mutation, count)
+	digest := replication.Digest{1}
+	remaining := maxKeyBytes
+	for index := range mutations {
+		left := count - index
+		size := (remaining + left - 1) / left
+		mutations[index] = replication.Mutation{
+			Kind: replication.MutationDeleteDigestEqual, Key: dummy[:size],
+			ExpectedValueLength: 1, ExpectedValueDigest: digest,
+		}
+		remaining -= size
+	}
+	command := session.commandHeader(
+		replication.CommandMutationBatch, session.epoch, session.nextSequence, session.ackThrough,
+	)
+	command.Fingerprint = replication.Digest{1}
+	relationCount := min(count, session.bundle.maxRelations)
+	command.Batches = make([]replication.RelationMutationBatch, relationCount)
+	for index := 0; index < relationCount; index++ {
+		start := index * count / relationCount
+		end := (index + 1) * count / relationCount
+		command.Batches[index] = replication.RelationMutationBatch{
+			Relation: replication.RelationID(index + 1), Mutations: mutations[start:end],
+		}
+	}
+	size, err := replication.CommandSize(command)
+	return err == nil && size <= session.maxCommand-replication.RetainedPruneProofBytes
+}
+
+// NativeSessionSupportsExactRelations proves that the session resolver is
+// pinned to precisely the expected schema-generation relation set.
+func NativeSessionSupportsExactRelations(
+	session *NativeSession,
+	base replication.RelationID,
+	relations []replication.RelationID,
+) bool {
+	if session == nil || nativeSessionBaseRelation(session) != base {
+		return false
+	}
+	if len(relations)+1 > session.bundle.maxRelations {
+		return false
+	}
+	if len(relations) == 0 {
+		switch resolver := session.resolver.(type) {
+		case BaseRelationResolver:
+			return resolver.Relation == base
+		case *BaseRelationResolver:
+			return resolver != nil && resolver.Relation == base
+		case ExactRelationResolver:
+			return resolver.Base == base && len(resolver.Relations) == 0
+		case *ExactRelationResolver:
+			return resolver != nil && resolver.Base == base && len(resolver.Relations) == 0
+		default:
+			return false
+		}
+	}
+	var exact ExactRelationResolver
+	switch resolver := session.resolver.(type) {
+	case ExactRelationResolver:
+		exact = resolver
+	case *ExactRelationResolver:
+		if resolver == nil {
+			return false
+		}
+		exact = *resolver
+	default:
+		return false
+	}
+	if exact.Base != base || len(exact.Relations) != len(relations) {
+		return false
+	}
+	for index := range relations {
+		if exact.Relations[index] != relations[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // NativeResult carries a canonical completion. Release is the one lifecycle
@@ -276,7 +461,12 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		return nil, ErrNativeSession
 	}
 	if options.ProposalCapability != serviceauthz.CapabilityDataWrite &&
-		options.ProposalCapability != serviceauthz.CapabilityTopology {
+		options.ProposalCapability != serviceauthz.CapabilityTopology &&
+		options.ProposalCapability != serviceauthz.CapabilityExecutionPin {
+		return nil, ErrNativeSession
+	}
+	if options.CatalogBootstrap != nil && (!catalogBootstrapRoute(options.Route) ||
+		options.ProposalCapability != serviceauthz.CapabilityTopology) {
 		return nil, ErrNativeSession
 	}
 	route := options.Route
@@ -293,6 +483,7 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		nextSequence:       1,
 		journal:            options.Journal,
 		proposalCapability: options.ProposalCapability,
+		catalogControl:     options.CatalogBootstrap != nil, catalogBootstrap: options.CatalogBootstrap,
 	}
 	if options.Journal != nil {
 		relation := nativeResolverBaseRelation(options.Resolver)
@@ -420,7 +611,33 @@ func (session *NativeSession) MutateBatch(
 	ctx context.Context,
 	mutations []NativeMutation,
 ) (NativeResult, error) {
+	return session.mutateBatch(ctx, mutations, replication.Digest{}, false)
+}
+
+// RetainedPruneBatch proposes the dedicated topology-only physical cleanup
+// command. Ordinary data and topology mutations cannot opt into its sealed-away
+// ownership semantics.
+func (session *NativeSession) RetainedPruneBatch(
+	ctx context.Context,
+	mutations []NativeMutation,
+	proof replication.RetainedPruneProof,
+) (NativeResult, error) {
+	if session == nil || session.proposalCapability != serviceauthz.CapabilityTopology ||
+		!proof.Valid() {
+		return NativeResult{}, sessionStateError(session)
+	}
+	return session.mutateBatch(ctx, mutations, proof.BatchDigest, true, &proof)
+}
+
+func (session *NativeSession) mutateBatch(
+	ctx context.Context,
+	mutations []NativeMutation,
+	fingerprint replication.Digest,
+	preserveFingerprint bool,
+	prune ...*replication.RetainedPruneProof,
+) (NativeResult, error) {
 	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.proposalCapability == serviceauthz.CapabilityExecutionPin ||
 		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
 		return NativeResult{}, sessionStateError(session)
 	}
@@ -445,10 +662,105 @@ func (session *NativeSession) MutateBatch(
 	command := session.commandHeader(
 		replication.CommandMutationBatch, session.epoch, session.nextSequence, session.ackThrough,
 	)
+	if len(prune) == 1 && prune[0] != nil {
+		command.Kind = replication.CommandRetainedPrune
+		command.RetainedPrune = *prune[0]
+	} else if len(prune) != 0 {
+		session.bundle.reset()
+		return NativeResult{}, ErrNativeSession
+	}
+	command.Fingerprint = fingerprint
 	command.Batches = session.bundle.batches
-	result, err := session.prepareAndExecute(ctx, command, false)
+	result, err := session.prepareAndExecute(ctx, command, preserveFingerprint)
 	session.bundle.reset()
 	return result, err
+}
+
+// ExecutionPin proposes one canonical logical catalog/schema pin transition.
+// The typed fixed-width kernel is encoded inside the session's exact durable
+// retry command; callers cannot inject raw replicated command bytes.
+func (session *NativeSession) ExecutionPin(
+	ctx context.Context,
+	transition executionpin.Command,
+) (NativeResult, error) {
+	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.proposalCapability != serviceauthz.CapabilityExecutionPin ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
+		return NativeResult{}, sessionStateError(session)
+	}
+	var storage [executionpin.CommandBytes]byte
+	nested, err := executionpin.AppendCommand(storage[:0], transition)
+	if err != nil {
+		return NativeResult{}, ErrNativeSession
+	}
+	command := session.commandHeader(
+		replication.CommandExecutionPin, session.epoch, session.nextSequence, session.ackThrough,
+	)
+	command.ExecutionPin = nested
+	return session.prepareAndExecute(ctx, command, false)
+}
+
+// RouteGate orders one typed shared pin or topology drain through the opened
+// session's exact-retry journal. Gate epochs are participant gate epochs, not
+// session epochs or execution-controller epochs.
+func (session *NativeSession) RouteGate(ctx context.Context, transition routegate.Command) (NativeResult, error) {
+	if ctx == nil {
+		return NativeResult{}, ErrNativeSession
+	}
+	if err := session.prepareRouteGate(transition); err != nil {
+		return NativeResult{}, err
+	}
+	return session.executePending(ctx, false)
+}
+
+// prepareRouteGate persists intent without admitting a proposal. The durable
+// request coordinator must install these exact bytes in its ledger before it
+// calls RetryPending; a local journal cannot substitute for that witness.
+func (session *NativeSession) prepareRouteGate(transition routegate.Command) error {
+	if session == nil || session.phase != nativeSessionActive || session.pending ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
+		return sessionStateError(session)
+	}
+	switch transition.Operation {
+	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
+		if session.proposalCapability != serviceauthz.CapabilityDataWrite {
+			return ErrNativeSession
+		}
+	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive, routegate.OperationCompactReleased:
+		if session.proposalCapability != serviceauthz.CapabilityTopology {
+			return ErrNativeSession
+		}
+	default:
+		return ErrNativeSession
+	}
+	nested, err := routegate.AppendCommand(session.gateCommand[:0], transition)
+	if err != nil {
+		return err
+	}
+	command := session.commandHeader(replication.CommandRouteGate, session.epoch, session.nextSequence, session.ackThrough)
+	command.RouteGate = nested
+	return session.prepareCommand(command, false)
+}
+
+// SplitCaptureActivate proposes one canonical source-capture activation through
+// a durable topology session. The journal owns the exact nested command before
+// admission, so an outcome-unknown retry cannot move the capture cut.
+func (session *NativeSession) SplitCaptureActivate(
+	ctx context.Context,
+	activation []byte,
+) (NativeResult, error) {
+	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.proposalCapability != serviceauthz.CapabilityTopology ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 ||
+		len(activation) == 0 || len(activation) > replication.MaxCommandBytes {
+		return NativeResult{}, sessionStateError(session)
+	}
+	command := session.commandHeader(
+		replication.CommandSplitCaptureActivate,
+		session.epoch, session.nextSequence, session.ackThrough,
+	)
+	command.SplitCaptureActivation = activation
+	return session.prepareAndExecute(ctx, command, false)
 }
 
 func (session *NativeSession) validateNativeMutation(mutation NativeMutation) error {
@@ -549,6 +861,36 @@ func (session *NativeSession) Release(ctx context.Context) (NativeResult, error)
 	return session.prepareAndExecute(ctx, command, true)
 }
 
+// RetireReleaseAndDestroy settles the exact durable session lifecycle before a
+// controller abandons its current routing binding. Every outcome-unknown phase
+// remains in the journal for byte-identical retry. The journal is removed only
+// after replicated Release has settled, which makes a fresh session with the
+// same client identity safe on the replacement binding.
+func (session *NativeSession) RetireReleaseAndDestroy(ctx context.Context) error {
+	if session == nil || ctx == nil || session.journal == nil {
+		return ErrNativeSession
+	}
+	if session.pending {
+		if _, err := session.RetryPending(ctx); err != nil {
+			return err
+		}
+	}
+	if session.phase == nativeSessionActive {
+		if _, err := session.Retire(ctx); err != nil {
+			return err
+		}
+	}
+	if session.phase == nativeSessionRetired {
+		if _, err := session.Release(ctx); err != nil {
+			return err
+		}
+	}
+	if session.phase != nativeSessionReleased || session.pending {
+		return ErrNativeSessionState
+	}
+	return session.journal.destroyReleased()
+}
+
 // RetryPending resubmits only the retained byte-identical command. It never
 // reconstructs from mutable session or catalog state.
 func (session *NativeSession) RetryPending(ctx context.Context) (NativeResult, error) {
@@ -566,6 +908,8 @@ func (session *NativeSession) commandHeader(
 	authorityClass := replication.CommandAuthorityData
 	if session.proposalCapability == serviceauthz.CapabilityTopology {
 		authorityClass = replication.CommandAuthorityTopology
+	} else if session.proposalCapability == serviceauthz.CapabilityExecutionPin {
+		authorityClass = replication.CommandAuthorityExecutionPin
 	}
 	return replication.Command{
 		Kind:                  kind,
@@ -595,50 +939,83 @@ func (session *NativeSession) prepareAndExecute(
 	command replication.Command,
 	preserveFingerprint bool,
 ) (NativeResult, error) {
-	if ctx == nil || session.pending {
+	if ctx == nil {
 		return NativeResult{}, ErrNativeSessionState
+	}
+	if session.catalogControl {
+		route, err := session.catalogOperationalRoute(ctx)
+		if err != nil {
+			return NativeResult{}, err
+		}
+		command.ReplicaSetVersion = route.Command.ReplicaSetVersion
+		command.OwnershipEpoch = route.Command.OwnershipEpoch
+		command.RoutingVersion = route.Command.RoutingVersion
+		command.RouteGeneration = route.Command.RouteGeneration
+	}
+	if err := session.prepareCommand(command, preserveFingerprint); err != nil {
+		return NativeResult{}, err
+	}
+	return session.executePending(ctx, false)
+}
+
+func (session *NativeSession) prepareCommand(command replication.Command, preserveFingerprint bool) error {
+	if session == nil || session.pending {
+		return ErrNativeSessionState
 	}
 	if !preserveFingerprint {
 		command.Fingerprint = nativeCommandFingerprint(command)
 	}
 	size, err := replication.CommandSize(command)
 	if err != nil {
-		return NativeResult{}, err
+		return err
 	}
 	if size > session.maxCommand {
-		return NativeResult{}, ErrNativeBundleBound
+		return ErrNativeBundleBound
 	}
 	if cap(session.command) < size {
 		session.command = make([]byte, 0, size)
 	}
 	session.command, err = replication.AppendCommand(session.command[:0], command)
 	if err != nil {
-		return NativeResult{}, err
+		return err
 	}
 	session.pending = true
 	if session.journal != nil {
 		if err = session.journal.store(session.durableState()); err != nil {
 			session.pending = false
 			session.command = session.command[:0]
-			return NativeResult{}, err
+			return err
 		}
 	}
-	return session.executePending(ctx, false)
+	return nil
 }
 
 func (session *NativeSession) executePending(
 	ctx context.Context,
 	priorUnknown bool,
 ) (NativeResult, error) {
+	route := session.route
+	if session.catalogControl {
+		var err error
+		route, err = session.catalogOperationalRoute(ctx)
+		if err != nil {
+			return NativeResult{}, &raftservice.UnknownOutcomeError{
+				Command: append([]byte(nil), session.command...), Cause: err,
+			}
+		}
+	}
 	var hint *shardservice.ReplicatedMemberState
 	// A cached leader is a latency hint only while no admitted outcome is in
 	// doubt. RetryPending may follow that leader's failure; discover the current
 	// leader before spending a bounded proposal attempt on the retained bytes.
-	if !priorUnknown && session.leader != (shardservice.ReplicatedMemberState{}) {
+	// Catalog discovery above just published a fresh authenticated leader to
+	// the executor. A session-local hint from before failover must not replace
+	// that observation and spend another full timeout on the stopped voter.
+	if !priorUnknown && !session.catalogControl && session.leader != (shardservice.ReplicatedMemberState{}) {
 		hint = &session.leader
 	}
 	result, err := session.executor.propose(
-		ctx, session.route, session.command, hint, priorUnknown, session.proposalCapability,
+		ctx, route, session.command, hint, priorUnknown, session.proposalCapability,
 		replicatedUnknownCommandClone,
 	)
 	if err != nil {
@@ -793,6 +1170,41 @@ func nativeCompletionMatches(
 			result.Role != role || result.Operation != operation {
 			return false
 		}
+	} else if command.Kind() == replication.CommandRequestLedger {
+		identity, ok := command.RequestLedgerIdentity()
+		result, err := replicatedstate.OpenRequestLedgerCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		if !ok || err != nil ||
+			completion.ResultFormat != replicatedstate.ResultFormatRequestLedger ||
+			completion.ResultLength != replicatedstate.RequestLedgerCompletionResultBytes ||
+			result.Operation != identity.Operation || result.KeyDigest != identity.KeyDigest ||
+			result.RequestDigest != identity.RequestDigest || result.PlanRoot != identity.PlanRoot ||
+			result.RangeIdentity != identity.RangeIdentity {
+			return false
+		}
+	} else if command.Kind() == replication.CommandRouteGate && completion.ResultFormat == replicatedstate.ResultFormatRouteGate {
+		if completion.ResultCode != replicatedstate.ResultRouteGate || completion.ResultLength != routegate.OutcomeBytes ||
+			len(completion.InlineResult) != routegate.OutcomeBytes {
+			return false
+		}
+		outcome, err := routegate.OpenOutcome(completion.InlineResult)
+		gate, gateErr := routegate.OpenCommand(command.RouteGateBytes())
+		if err != nil || gateErr != nil || !nativeRouteGateOutcomeMatches(gate, outcome) {
+			return false
+		}
+	} else if command.Kind() == replication.CommandExecutionPin {
+		if completion.ResultFormat != replicatedstate.ResultFormatExecutionPin ||
+			completion.ResultLength != executionpin.CompletionBytes ||
+			len(completion.InlineResult) != executionpin.CompletionBytes {
+			return false
+		}
+		proof, err := executionpin.OpenCompletion(completion.InlineResult)
+		nested, nestedErr := command.OpenExecutionPin()
+		if err != nil || nestedErr != nil || proof.Operation != nested.Operation ||
+			!nativeExecutionPinResultCode(completion.ResultCode) {
+			return false
+		}
 	} else {
 		if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
 			completion.ResultLength != uint64(len(completion.InlineResult)) ||
@@ -811,7 +1223,7 @@ func nativeCompletionMatches(
 		if completion.AppliedSequence != completion.ClientEpoch {
 			return false
 		}
-	} else if command.Kind() == replication.CommandTransaction {
+	} else if command.Kind() == replication.CommandTransaction || command.Kind() == replication.CommandRequestLedger {
 		if completion.AppliedSequence == 0 {
 			return false
 		}
@@ -837,9 +1249,84 @@ func nativeCompletionMatches(
 		completion.Fingerprint == command.Fingerprint && completion.RetryHome == command.RetryHome
 }
 
+// The envelope binds the whole command/session fingerprint; these checks also
+// reject canonical but semantically impossible outcomes. A shared release can
+// legitimately name an older acquisition epoch after compaction, so it must
+// not be compared to the current gate epoch as if it were a fresh acquire.
+func nativeRouteGateOutcomeMatches(command routegate.Command, outcome routegate.Outcome) bool {
+	status := outcome.Status
+	if outcome.Mutated && status.Revision == 0 {
+		return false
+	}
+	if outcome.Reason == routegate.ReasonStaleEpoch {
+		return status.Epoch != command.Epoch
+	}
+	if outcome.Reason == routegate.ReasonExhausted {
+		return status.Revision == math.MaxUint64 || status.Epoch == math.MaxUint64 &&
+			(command.Operation == routegate.OperationReleaseExclusive || command.Operation == routegate.OperationCompactReleased)
+	}
+	sameDrain := status.Drain.Identity == command.Identity &&
+		status.Drain.Binding == command.Binding && status.Drain.Epoch == command.Epoch
+	switch command.Operation {
+	case routegate.OperationAcquireShared:
+		if status.Epoch != command.Epoch {
+			return false
+		}
+		switch outcome.Reason {
+		case routegate.ReasonAcquired, routegate.ReasonIdempotent:
+			return status.ActivePins != 0
+		case routegate.ReasonAlreadyReleased:
+			return status.ReleasedPins != 0
+		case routegate.ReasonBlockedByDrain:
+			return status.Drain.State == routegate.DrainPending || status.Drain.State == routegate.DrainActive
+		case routegate.ReasonIdentityConflict, routegate.ReasonCapacity:
+			return true
+		}
+	case routegate.OperationReleaseShared:
+		switch outcome.Reason {
+		case routegate.ReasonReleased, routegate.ReasonAlreadyReleased:
+			return status.Epoch >= command.Epoch && status.ReleasedPins != 0
+		case routegate.ReasonIdentityConflict:
+			return true
+		case routegate.ReasonCapacity:
+			return status.Epoch == command.Epoch
+		}
+	case routegate.OperationBeginExclusive:
+		if status.Epoch != command.Epoch {
+			return false
+		}
+		switch outcome.Reason {
+		case routegate.ReasonDrainPending:
+			return sameDrain && status.Drain.State == routegate.DrainPending
+		case routegate.ReasonDrainAcquired:
+			return sameDrain && status.Drain.State == routegate.DrainActive
+		case routegate.ReasonIdempotent:
+			return sameDrain && (status.Drain.State == routegate.DrainPending || status.Drain.State == routegate.DrainActive)
+		case routegate.ReasonIdentityConflict:
+			return true
+		}
+	case routegate.OperationReleaseExclusive:
+		switch outcome.Reason {
+		case routegate.ReasonDrainReleased, routegate.ReasonIdempotent:
+			return command.Epoch != math.MaxUint64 && status.Epoch == command.Epoch+1 &&
+				sameDrain && status.Drain.State == routegate.DrainReleased
+		case routegate.ReasonIdentityConflict, routegate.ReasonNotFound, routegate.ReasonDrainBusy:
+			return status.Epoch == command.Epoch
+		}
+	case routegate.OperationCompactReleased:
+		switch outcome.Reason {
+		case routegate.ReasonCompacted:
+			return command.Epoch != math.MaxUint64 && status.Epoch == command.Epoch+1 && status.Drain.State == routegate.DrainNone
+		case routegate.ReasonDrainBusy:
+			return status.Epoch == command.Epoch
+		}
+	}
+	return false
+}
+
 func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) bool {
 	switch kind {
-	case replication.CommandMutationBatch:
+	case replication.CommandMutationBatch, replication.CommandRetainedPrune:
 		switch result {
 		case replicatedstate.ResultApplied,
 			replicatedstate.ResultStaleFence,
@@ -864,8 +1351,27 @@ func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) 
 			result == replicatedstate.ResultStaleFence
 	case replication.CommandSessionRelease:
 		return false
+	case replication.CommandExecutionPin:
+		return nativeExecutionPinResultCode(result)
+	case replication.CommandRouteGate:
+		return result == replicatedstate.ResultStaleFence
+	case replication.CommandSplitCaptureActivate:
+		return result == replicatedstate.ResultApplied ||
+			result == replicatedstate.ResultStaleFence ||
+			result == replicatedstate.ResultIndexConflict
 	}
 	return false
+}
+
+func nativeExecutionPinResultCode(result uint32) bool {
+	switch result {
+	case replicatedstate.ResultApplied, replicatedstate.ResultStaleFence,
+		replicatedstate.ResultIndexConflict, replicatedstate.ResultIntentBusy,
+		replicatedstate.ResultTargetBound:
+		return true
+	default:
+		return false
+	}
 }
 
 func validNativeSessionIdentity(distribution, shard string, tenant []byte) bool {
@@ -879,8 +1385,9 @@ func validNativeTextIdentity(value string) bool {
 }
 
 var (
-	nativeFingerprintDomain       = []byte("vibedb/gateway/native-command\x00")
-	nativeTopologyAuthorityMarker = []byte{byte(replication.CommandAuthorityTopology)}
+	nativeFingerprintDomain           = []byte("vibedb/gateway/native-command\x00")
+	nativeTopologyAuthorityMarker     = []byte{byte(replication.CommandAuthorityTopology)}
+	nativeExecutionPinAuthorityMarker = []byte{byte(replication.CommandAuthorityExecutionPin)}
 )
 
 func nativeCommandFingerprint(command replication.Command) replication.Digest {
@@ -891,6 +1398,8 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	_, _ = hasher.Write(scalar[:])
 	if command.AuthorityClass == replication.CommandAuthorityTopology {
 		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	} else if command.AuthorityClass == replication.CommandAuthorityExecutionPin {
+		_, _ = hasher.Write(nativeExecutionPinAuthorityMarker)
 	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
@@ -938,6 +1447,17 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Transaction)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(command.Transaction)
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.ExecutionPin)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.ExecutionPin)
+	if command.Kind == replication.CommandRouteGate {
+		binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.RouteGate)))
+		_, _ = hasher.Write(scalar[:])
+		_, _ = hasher.Write(command.RouteGate)
+	}
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.SplitCaptureActivation)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.SplitCaptureActivation)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Batches)))
 	_, _ = hasher.Write(scalar[:])
 	for _, batch := range command.Batches {
@@ -975,6 +1495,8 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 	_, _ = hasher.Write(scalar[:])
 	if command.AuthorityClass == replication.CommandAuthorityTopology {
 		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	} else if command.AuthorityClass == replication.CommandAuthorityExecutionPin {
+		_, _ = hasher.Write(nativeExecutionPinAuthorityMarker)
 	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
@@ -1023,6 +1545,20 @@ func nativeCommandViewFingerprint(command replication.CommandView) replication.D
 	binary.LittleEndian.PutUint64(scalar[:], uint64(len(transaction)))
 	_, _ = hasher.Write(scalar[:])
 	_, _ = hasher.Write(transaction)
+	executionPin := command.ExecutionPinBytes()
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(executionPin)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(executionPin)
+	if command.Kind() == replication.CommandRouteGate {
+		gate := command.RouteGateBytes()
+		binary.LittleEndian.PutUint64(scalar[:], uint64(len(gate)))
+		_, _ = hasher.Write(scalar[:])
+		_, _ = hasher.Write(gate)
+	}
+	splitCapture := command.SplitCaptureActivationBytes()
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(splitCapture)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(splitCapture)
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = hasher.Write(scalar[:])
 	relations := command.RelationBatches()

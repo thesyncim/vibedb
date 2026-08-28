@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -24,6 +25,9 @@ var (
 	// ErrRuntimeOwnership reports a WAL, database, or apply claim that cannot be
 	// transferred into one exclusive Runtime owner.
 	ErrRuntimeOwnership = errors.New("raftmember: runtime ownership mismatch")
+	// ErrSchemaGenerationSwap reports an invalid or non-quiescent live SQL
+	// generation replacement attempt.
+	ErrSchemaGenerationSwap = errors.New("raftmember: schema generation swap refused")
 	// ErrResultSettlementRequired reports a result-bearing apply that cannot
 	// begin because no synchronous settlement sink was provided.
 	ErrResultSettlementRequired = errors.New("raftmember: applied result settlement sink is required")
@@ -211,6 +215,10 @@ func (batch AppliedBatch) LookupCompletion(
 	if batch.apply == nil {
 		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
 	}
+	if completion, ok := batch.normal.Completion(index); ok {
+		lookup, err = lookupOriginalCompletion(entry, completion, nil, false)
+		return lookup, true, err
+	}
 	lookup, err = batch.apply.LookupCompletion(entry.Data)
 	return lookup, true, err
 }
@@ -229,6 +237,10 @@ func (batch AppliedBatch) LookupCompletionInto(
 	}
 	if batch.apply == nil {
 		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
+	}
+	if completion, ok := batch.normal.Completion(index); ok {
+		lookup, err = lookupOriginalCompletion(entry, completion, dst, true)
+		return lookup, true, err
 	}
 	lookup, err = batch.apply.LookupCompletionInto(entry.Data, dst)
 	return lookup, true, err
@@ -272,8 +284,30 @@ func (batch AppliedBatch) LookupCompletionIntoWorkspace(
 	if len(entry.Data) == 0 {
 		return replicatedstate.CompletionLookup{}, false, nil
 	}
+	if completion, ok := batch.normal.Completion(index); ok {
+		lookup, err = lookupOriginalCompletion(entry, completion, dst, true)
+		return lookup, true, err
+	}
 	lookup, err = batch.apply.LookupCompletionIntoWorkspace(&workspace.apply, entry.Data, dst)
 	return lookup, true, err
+}
+
+// Original results belong to the pending settlement token, not the current
+// storage cut. Copy out so sinks cannot mutate a later settlement retry.
+func lookupOriginalCompletion(
+	entry raftmodel.NormalApply, completion, dst []byte, into bool,
+) (replicatedstate.CompletionLookup, error) {
+	command, err := replication.OpenCommand(entry.Data)
+	if err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	if into && (cap(dst) < replicatedstate.MaxCompletionEnvelopeBytes || cap(dst) < len(completion)) {
+		return replicatedstate.CompletionLookup{}, replicatedstate.ErrCompletionBufferSmall
+	}
+	return replicatedstate.CompletionLookup{
+		Key:   replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
+		Bytes: append(dst[:0], completion...), AppliedSequence: entry.Meta.Index,
+	}, nil
 }
 
 // EndCompletionLookup releases the exact durable cut. The workspace remains
@@ -381,19 +415,21 @@ func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 // Runtime is a non-serving kernel. Proposal success means only local core
 // admission. It does not certify leadership, commit, apply, or a client result.
 type Runtime struct {
-	wal           *raftstore.Store
-	database      *sqldriver.Database
-	apply         *sqldriver.ReplicatedApply
-	node          *raftmodel.Node
-	identity      RuntimeIdentity
-	walGeneration *walGenerationDriver
+	wal             *raftstore.Store
+	database        *sqldriver.Database
+	apply           *sqldriver.ReplicatedApply
+	node            *raftmodel.Node
+	identity        RuntimeIdentity
+	walGeneration   *walGenerationDriver
+	schemaWALResume *WALGenerationDriverOptions
 
-	proposalBatchEntries int
-	proposalBatchBytes   int64
-	promotionScan        durablePromotionScan
-	failure              error
-	stopping             bool
-	closed               bool
+	proposalBatchEntries     int
+	proposalBatchBytes       int64
+	promotionScan            durablePromotionScan
+	failure                  error
+	stopping                 bool
+	closed                   bool
+	schemaGenerationQuiesced bool
 }
 
 type durablePromotionScan struct {
@@ -554,6 +590,93 @@ func (runtime *Runtime) checkUsable() error {
 	}
 	if runtime.node.Phase() == raftmodel.PhaseFailed {
 		return runtime.fail(runtime.node.Failure())
+	}
+	return nil
+}
+
+// QuiesceSQLGeneration fences every later Runtime operation, proves the Raft
+// node has no pending Ready/read/settlement work, and releases only the SQL
+// generation. WAL, RawNode, member incarnation, and replication progress stay
+// owned by Runtime for an exact target-generation install.
+func (runtime *Runtime) QuiesceSQLGeneration() error {
+	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
+		runtime.node == nil || runtime.wal == nil || runtime.database == nil ||
+		runtime.schemaGenerationQuiesced {
+		return ErrSchemaGenerationSwap
+	}
+	if runtime.apply != nil {
+		if err := runtime.node.ReplaceStateMachine(runtime.apply); err != nil {
+			return errors.Join(ErrSchemaGenerationSwap, err)
+		}
+		if driver := runtime.walGeneration; driver != nil {
+			driver.stopAndWait()
+			resume := &WALGenerationDriverOptions{
+				IntervalTicks: driver.interval, Key: driver.key, OnError: driver.onError,
+			}
+			resume.Key.Wrapped = append([]byte(nil), driver.key.Wrapped...)
+			runtime.schemaWALResume = resume
+			clear(driver.key.Material[:])
+			clear(driver.key.Wrapped)
+			runtime.walGeneration = nil
+		}
+		if err := runtime.apply.Close(); err != nil {
+			return errors.Join(ErrSchemaGenerationSwap, err)
+		}
+		runtime.apply = nil
+	}
+	if err := runtime.database.Close(); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	runtime.database = nil
+	runtime.schemaGenerationQuiesced = true
+	return nil
+}
+
+func (runtime *Runtime) ObserveSchemaTransition(command []byte) (uint64, bool, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return 0, false, err
+	}
+	return runtime.apply.ObserveReplicatedSchemaTransition(command)
+}
+
+// InstallSQLGeneration atomically replaces the quiesced local state-machine
+// handle at the identical durable Raft publication. The exact catalog and
+// apply identities are checked before Node publication; failure leaves Runtime
+// quiesced and serving-fenced for a retry or process recovery.
+func (runtime *Runtime) InstallSQLGeneration(
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
+		!runtime.schemaGenerationQuiesced || runtime.node == nil || runtime.wal == nil ||
+		runtime.apply != nil || runtime.database != nil || database == nil || apply == nil {
+		return ErrSchemaGenerationSwap
+	}
+	if _, err := database.RequireReplicatedShardStore(expectedSQL); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	actualApply, err := apply.Identity()
+	if err != nil || actualApply != expectedApply {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	manifest, err := apply.RangeSplitRelationManifestDigest()
+	if err != nil || manifest == ([32]byte{}) {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	if err = runtime.node.ReplaceStateMachine(apply); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	runtime.database = database
+	runtime.apply = apply
+	runtime.identity.RelationManifestDigest = manifest
+	runtime.schemaGenerationQuiesced = false
+	if runtime.schemaWALResume != nil {
+		runtime.walGeneration = newWALGenerationDriver(*runtime.schemaWALResume)
+		clear(runtime.schemaWALResume.Key.Material[:])
+		clear(runtime.schemaWALResume.Key.Wrapped)
+		runtime.schemaWALResume = nil
 	}
 	return nil
 }
@@ -802,6 +925,21 @@ func (runtime *Runtime) SnapshotState() (replicatedstate.State, error) {
 	return state, nil
 }
 
+// SnapshotBaseCertificate returns the exact immutable snapshot-base
+// certificate sealed into the current WAL generation. It never synthesizes a
+// certificate from live state: callers use the returned digest together with
+// SnapshotState to reject a stale generation or unrelated base.
+func (runtime *Runtime) SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error) {
+	if err := runtime.checkNoPendingSettlement(); err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	snapshot, err := runtime.wal.Snapshot()
+	if err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	return replicatedstate.OpenSnapshotBase(snapshot)
+}
+
 // Status returns detached local Raft status without allocating the leader's
 // complete progress map.
 func (runtime *Runtime) Status() (RuntimeStatus, error) {
@@ -824,6 +962,16 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 		CheckpointApplied: checkpointApplied,
 		LeadTransferee:    status.LeadTransferee, RaftState: status.RaftState,
 	}, nil
+}
+
+// CommitMetrics returns the cumulative core-authority counters. Runtime and
+// Node share the same serialized owner, so this adds no synchronization or
+// allocation to the Raft hot path.
+func (runtime *Runtime) CommitMetrics() raftmodel.CommitMetrics {
+	if runtime == nil {
+		return raftmodel.CommitMetrics{}
+	}
+	return runtime.node.CommitMetrics()
 }
 
 // WALRetentionInput returns the certificate-backed contiguous apply cut. The
@@ -1274,6 +1422,11 @@ func (runtime *Runtime) Close() error {
 		clear(runtime.walGeneration.key.Material[:])
 		clear(runtime.walGeneration.key.Wrapped)
 		runtime.walGeneration = nil
+	}
+	if runtime.schemaWALResume != nil {
+		clear(runtime.schemaWALResume.Key.Material[:])
+		clear(runtime.schemaWALResume.Key.Wrapped)
+		runtime.schemaWALResume = nil
 	}
 	runtime.node = nil
 	if runtime.apply != nil {

@@ -9,22 +9,29 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/resultformat"
 )
 
 const (
 	// ResultFormatTransaction is the sole fixed transaction result grammar. It
 	// is a grammar selector, not a version ladder.
-	ResultFormatTransaction uint16 = 2
+	ResultFormatTransaction uint16 = resultformat.Transaction
 	// ResultTransactionConflict is a transaction-control CAS loss. It is
 	// intentionally distinct from ResultIndexConflict, which is a user-data
 	// mutation precondition failure.
 	ResultTransactionConflict uint32 = 13
 
-	transactionCompletionResultBytes = 24
-	// MaxCompletionEnvelopeBytes is the sole shipped completion-envelope bound.
-	// A transaction carries the largest fixed result (24 bytes); ordinary
-	// mutation/session completions use the smaller mutation envelope bound.
-	MaxCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + transactionCompletionResultBytes
+	transactionCompletionResultBytes      = 24
+	MaxTransactionCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes +
+		transactionCompletionResultBytes
+	// MaxCompletionEnvelopeBytes is the largest fixed result across every frozen
+	// completion grammar.
+	MaxCompletionEnvelopeBytes = max(
+		MaxTransactionCompletionEnvelopeBytes,
+		MaxRouteGateCompletionEnvelopeBytes,
+		replication.MaxEmptyResultCompletionEnvelopeBytes+RequestLedgerCompletionResultBytes,
+		MaxExecutionPinCompletionEnvelopeBytes,
+	)
 )
 
 const (
@@ -80,13 +87,15 @@ func OpenTransactionCompletionResult(
 			return TransactionCompletionResult{}, ErrCompletionCorrupt
 		}
 	} else if (resultCode != ResultApplied && resultCode != ResultIndexConflict &&
+		resultCode != ResultWrongShard &&
 		resultCode != ResultTransactionConflict) ||
 		!result.RevisionValid {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
-	if resultCode == ResultIndexConflict && !transactionOperationCanRejectPrepare(
-		result.Role, result.Operation,
-	) {
+	if (resultCode == ResultIndexConflict || resultCode == ResultWrongShard) &&
+		!transactionOperationCanRejectPrepare(
+			result.Role, result.Operation,
+		) {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
 	apply := result.Operation == distributedtxn.ReplicatedApplyParticipant ||
@@ -95,7 +104,8 @@ func OpenTransactionCompletionResult(
 		(apply && !result.AffectedRowsValid ||
 			!apply && result.Operation != distributedtxn.ReplicatedRetireCoordinator &&
 				result.AffectedRowsValid) ||
-		(resultCode == ResultIndexConflict || resultCode == ResultTransactionConflict) &&
+		(resultCode == ResultIndexConflict || resultCode == ResultWrongShard ||
+			resultCode == ResultTransactionConflict) &&
 			result.AffectedRowsValid {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
@@ -212,6 +222,11 @@ func transactionCompletionDisposition(
 				return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
 			}
 			return transactionRetryExact, ResultIndexConflict, nil
+		case ResultWrongShard:
+			if !transactionOperationCanRejectPrepare(command.Role, command.Operation) {
+				return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
+			}
+			return transactionRetryExact, ResultWrongShard, nil
 		default:
 			return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
 		}
@@ -288,13 +303,16 @@ func transactionHistoricalRetryExact(
 		return control.FusedPath && transactionParticipantStageRetryExact(command, control) &&
 			control.PrepareCommandDigest == commandDigest &&
 			(control.PrepareResultCode == ResultApplied ||
-				control.PrepareResultCode == ResultIndexConflict), control.PrepareResultCode, nil
+				control.PrepareResultCode == ResultIndexConflict ||
+				control.PrepareResultCode == ResultWrongShard), control.PrepareResultCode, nil
 	case distributedtxn.ReplicatedCommitCoordinator:
 		return control.CoordinatorDecision == distributedtxn.CoordinatorCommitted &&
 			transactionCoordinatorDecisionExpected(control) == command.ExpectedRevision, ResultApplied, nil
 	case distributedtxn.ReplicatedAbortCoordinator:
 		return control.CoordinatorDecision == distributedtxn.CoordinatorAborted &&
 			transactionCoordinatorDecisionExpected(control) == command.ExpectedRevision, ResultApplied, nil
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return control.RecoveryPulse >= command.RecoveryPulse, ResultApplied, nil
 	case distributedtxn.ReplicatedRetireCoordinator:
 		summary, err := distributedtxn.OpenReplicatedRetirementSummary(command.Payload)
 		if err != nil {
@@ -440,7 +458,8 @@ func transactionCoordinatorBeginRetryExact(
 		distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired &&
 			control.CoordinatorParticipantOrdinal != uint64(command.Participant.ParticipantOrdinal) ||
 		(control.PrepareResultCode != ResultApplied &&
-			control.PrepareResultCode != ResultIndexConflict) {
+			control.PrepareResultCode != ResultIndexConflict &&
+			control.PrepareResultCode != ResultWrongShard) {
 		return false, 0, nil
 	}
 	key, err := TransactionControlStorageKey(
@@ -546,6 +565,7 @@ func (m *Machine) appendTransactionCompletion(
 	exact bool,
 ) ([]byte, error) {
 	if resultCode != ResultApplied && resultCode != ResultIndexConflict &&
+		resultCode != ResultWrongShard &&
 		resultCode != ResultTransactionConflict &&
 		resultCode != ResultStaleFence {
 		return dst, ErrCompletionCorrupt

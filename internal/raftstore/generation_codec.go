@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	generationSealPayloadBytes = 504
+	generationSealPayloadBytes = 512
 	retainedPayloadHeaderBytes = 24
 )
 
@@ -70,6 +70,7 @@ type generationSeal struct {
 	suffixDigest             [sha256.Size]byte
 	sourceFirst              uint64
 	sourceLast               uint64
+	sourceReadyID            uint64
 	bindingDigest            [sha256.Size]byte
 }
 
@@ -113,6 +114,7 @@ func marshalGenerationSeal(seal generationSeal) ([]byte, error) {
 	result = append(result, seal.suffixDigest[:]...)
 	result = appendUint64(result, seal.sourceFirst)
 	result = appendUint64(result, seal.sourceLast)
+	result = appendUint64(result, seal.sourceReadyID)
 	result = append(result, seal.bindingDigest[:]...)
 	result = appendUint32(result, 0)
 	if len(result) != generationSealPayloadBytes {
@@ -239,6 +241,10 @@ func unmarshalGenerationSeal(data []byte) (generationSeal, error) {
 	if err != nil {
 		return generationSeal{}, err
 	}
+	seal.sourceReadyID, err = reader.u64()
+	if err != nil {
+		return generationSeal{}, err
+	}
 	if err := readGenerationFixed(&reader, seal.bindingDigest[:]); err != nil {
 		return generationSeal{}, err
 	}
@@ -329,6 +335,7 @@ func generationBindingDigest(seal generationSeal) [sha256.Size]byte {
 	_, _ = h.Write(seal.suffixDigest[:])
 	writeGenerationU64(h, seal.sourceFirst)
 	writeGenerationU64(h, seal.sourceLast)
+	writeGenerationU64(h, seal.sourceReadyID)
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result

@@ -9,11 +9,14 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
 
 const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;" +
+	"json-canonical-afterimage-before-validation-condition-capture-hash-persistence;" +
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
 	"strict-put-absent-conflict;put-present-missing-zero-rows;" +
 	"json-relation-affected-rows;global-index-results-excluded;fixed-mutation-result-int64;" +
@@ -23,6 +26,8 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"fixed-retry-ring;explicit-session-open;raft-index-session-epoch;" +
 	"shard-epoch-high-water;explicit-session-retirement;terminal-retire-only;" +
 	"exact-retired-session-release;terminal-stale-retire-unstored;" +
+	"data-shard-raft-ordered-route-gate;shared-data-authority;exclusive-topology-authority;" +
+	"fixed-route-gate-command-outcome;epoch-fenced-release-tombstones;" +
 	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
 	"stable-logical-command-digest;data-chain-value-descriptor-sha256"
 
@@ -30,9 +35,10 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 // mutation behavior shared by compact singleton and multi-relation commands.
 const deterministicBundleApplySemantics = "ordered-dense-relation-batches;" +
 	"one-checkpoint-group-publication;all-relations-or-none;" +
+	"mutable-owned-range-proof-or-complete-keyspace;wrong-shard-prepare-vote;" +
 	"global-put-absent-or-vibejson-semantic-equal;" +
 	"global-delete-raw-length-and-sha256-equal;" +
-	"json-put-absent-or-raw-equal;json-put-raw-length-and-sha256-equal;" +
+	"json-put-absent-or-canonical-equal;json-put-raw-length-and-sha256-equal;" +
 	"json-delete-raw-length-and-sha256-equal;" +
 	"global-duplicate-key-conflict;byte-native-global-locator-array"
 
@@ -347,9 +353,13 @@ func bundleApplyContractDigest(
 	relations []relationCollection,
 	maxSessions uint64,
 	retryWindow uint16,
+	requestLedgerCapacity uint64,
+	requestLedgerCleanupReserve uint64,
+	requestLedgerRange RequestLedgerRange,
+	routeGateMaxRecords uint64,
 ) ([sha256.Size]byte, error) {
 	if manifest == ([sha256.Size]byte{}) || len(relations) == 0 ||
-		maxSessions == 0 || retryWindow == 0 {
+		maxSessions == 0 || retryWindow == 0 || routeGateMaxRecords == 0 {
 		return [sha256.Size]byte{}, ErrInvalidCollection
 	}
 	h := sha256.New()
@@ -357,8 +367,9 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [2 + 21*4]byte
+	var grammar [4 + 35*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
+	binary.LittleEndian.PutUint16(grammar[2:4], ResultFormatRouteGate)
 	for index, code := range [...]uint32{
 		ResultApplied,
 		ResultStaleFence,
@@ -381,15 +392,54 @@ func bundleApplyContractDigest(
 		uint32(replication.MutationPutAbsent),
 		uint32(replication.MutationPutPresent),
 		replication.MutationDigestCompareBytes,
+		ResultRouteGate,
+		uint32(replication.CommandRouteGate),
+		routegate.CommandBytes,
+		routegate.OutcomeBytes,
+		routegate.HeadBytes,
+		routegate.StoredPinBytes,
+		uint32(routegate.OperationAcquireShared),
+		uint32(routegate.OperationReleaseShared),
+		uint32(routegate.OperationBeginExclusive),
+		uint32(routegate.OperationReleaseExclusive),
+		uint32(routegate.OperationCompactReleased),
+		uint32(routegate.ReasonExhausted),
+		uint32(routegate.PinReleased),
+		uint32(routegate.DrainReleased),
 	} {
-		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)
+		binary.LittleEndian.PutUint32(grammar[4+index*4:4+(index+1)*4], code)
 	}
 	_, _ = h.Write(grammar[:])
-	var fixed [18]byte
+	var fixed [26]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], maxSessions)
 	binary.LittleEndian.PutUint16(fixed[8:10], retryWindow)
 	binary.LittleEndian.PutUint64(fixed[10:18], MaxSessionRetryWindow)
+	binary.LittleEndian.PutUint64(fixed[18:26], routeGateMaxRecords)
 	_, _ = h.Write(fixed[:])
+	if requestLedgerCapacity != 0 || requestLedgerCleanupReserve != 0 {
+		if !requestLedgerRange.valid() {
+			return [sha256.Size]byte{}, ErrInvalidCollection
+		}
+		var ledger [16]byte
+		binary.LittleEndian.PutUint64(ledger[0:8], requestLedgerCapacity)
+		binary.LittleEndian.PutUint64(ledger[8:16], requestLedgerCleanupReserve)
+		_, _ = h.Write(ledger[:])
+		_, _ = h.Write(requestLedgerRange.Start[:])
+		_, _ = h.Write(requestLedgerRange.End[:])
+		_, _ = h.Write(requestLedgerRange.Identity[:])
+		semantics := requestledger.SemanticsDigest()
+		_, _ = h.Write(semantics[:])
+		var resultGrammar [22]byte
+		binary.LittleEndian.PutUint16(resultGrammar[0:2], ResultFormatRequestLedger)
+		binary.LittleEndian.PutUint32(resultGrammar[2:6], ResultRequestLedgerConflict)
+		binary.LittleEndian.PutUint32(resultGrammar[6:10], ResultRequestLedgerCapacity)
+		binary.LittleEndian.PutUint32(resultGrammar[10:14], ResultRequestLedgerNotFound)
+		binary.LittleEndian.PutUint32(resultGrammar[14:18], ResultRequestLedgerWrongRange)
+		binary.LittleEndian.PutUint32(resultGrammar[18:22], RequestLedgerCompletionResultBytes)
+		_, _ = h.Write(resultGrammar[:])
+	} else if requestLedgerRange.enabled() {
+		return [sha256.Size]byte{}, ErrInvalidCollection
+	}
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result, nil

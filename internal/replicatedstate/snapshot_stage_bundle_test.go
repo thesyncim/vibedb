@@ -21,9 +21,7 @@ func snapshotStageBundleSpecs(
 		},
 		{
 			Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: global,
-			GlobalIndex: GlobalIndexProfile{
-				IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-			},
+			GlobalIndex: testGlobalIndexProfile(91, 7, 1, true),
 		},
 	}
 }

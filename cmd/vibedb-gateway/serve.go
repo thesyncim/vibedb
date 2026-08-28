@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -13,19 +12,21 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
-	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/serviceerrors"
 	"github.com/thesyncim/vibedb/internal/servicetls"
-	"github.com/thesyncim/vibedb/internal/splitcontroller"
-	"github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -36,12 +37,6 @@ import (
 const (
 	maxServeRequestBytes              = 1 << 20
 	defaultNativeResponseWriteTimeout = 5 * time.Second
-	defaultRF3TransactionConcurrency  = 64
-	defaultRF3TransactionInFlight     = uint64(64 << 20)
-	defaultRF3TransactionRequests     = 65_536
-	defaultRF3TransactionRecovery     = 24 * time.Hour
-	defaultRF3TransactionMutations    = uint64(10_000_000)
-	defaultRF3TransactionBytes        = uint64(1 << 30)
 )
 
 // The serve subcommand is a routing front-end. It loads an immutable
@@ -61,47 +56,78 @@ const (
 // merge metadata independently of the statement.
 type serveRequest struct {
 	// Op selects the gateway operation: the empty value and "query" are the
-	// read path; "exec" is the single-shard write path; "exec_batch" uses
-	// Statements and applies one Class to the complete atomic batch.
+	// read path; "read_batch" is the RF3 exact-point SQL vector; "exec" is the
+	// single-shard write path; "exec_batch" uses Statements and applies one
+	// Class to the complete atomic batch.
 	Op string `json:"op,omitempty"`
 	// RequestID is the caller's fixed 128-bit hexadecimal idempotency key for
 	// an RF3 exec_batch. It remains ingress metadata and never enters Raft as a
 	// table or SQL string.
-	RequestID  string           `json:"request_id,omitempty"`
-	SQL        string           `json:"sql"`
-	Class      string           `json:"class,omitempty"`
-	Params     []serveParam     `json:"params,omitempty"`
-	Statements []serveStatement `json:"statements,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	InstallationID string `json:"installation_id,omitempty"`
+	IssuerEpoch    uint64 `json:"issuer_epoch,omitempty"`
+	LaneOrdinal    uint16 `json:"lane_ordinal,omitempty"`
+	GrantDigest    string `json:"grant_digest,omitempty"`
+	IssuerSequence uint64 `json:"issuer_sequence,omitempty"`
+	// Legacy fields remain decode-only; the strict raw exec_batch decoder rejects
+	// them and public dispatch has no unsequenced fallback.
+	IssuerLane          string `json:"issuer_lane,omitempty"`
+	IssuerAuthenticator string `json:"issuer_authenticator,omitempty"`
+	SQL                 string `json:"sql"`
+	Class               string `json:"class,omitempty"`
+	// MaxResultBytes is required by read_batch and bounds its complete JSON
+	// success response, including documents and the per-group observation vector.
+	MaxResultBytes uint32           `json:"max_result_bytes,omitempty"`
+	BackupID       string           `json:"backup_id,omitempty"`
+	Params         []serveParam     `json:"params,omitempty"`
+	Statements     []serveStatement `json:"statements,omitempty"`
+
+	// wireIdentity is populated directly into fixed storage by the compiled
+	// ingress decoder. It avoids materializing three hexadecimal identities as
+	// strings and avoids decoding a structured exec_batch twice.
+	wireIdentity    durableExecBatchIdentity
+	wireIdentitySet bool
+	wireSQL         []byte
 }
 
 type serveStatement struct {
-	SQL    string       `json:"sql"`
-	Params []serveParam `json:"params,omitempty"`
+	SQL     string       `json:"sql"`
+	Params  []serveParam `json:"params,omitempty"`
+	wireSQL []byte
 }
 
 // serveParam is one typed bound parameter in placeholder order.
 type serveParam struct {
-	Kind string `json:"kind"`
-	Bool bool   `json:"bool,omitempty"`
-	Text string `json:"text,omitempty"`
+	Kind     string `json:"kind"`
+	Bool     bool   `json:"bool,omitempty"`
+	Text     string `json:"text,omitempty"`
+	wireKind serveParamKind
+	wireText []byte
 }
 
 // serveResponse is the merged reply plus the routing metadata a client reads for
 // observability. Rows carries each cell as raw JSON (a null cell is the JSON
 // literal null); Error is set instead when the operation failed.
 type serveResponse struct {
-	Kind           string            `json:"kind,omitempty"`
-	Columns        []string          `json:"columns,omitempty"`
-	Rows           [][]serveRawValue `json:"rows,omitempty"`
-	RowsAffected   int64             `json:"rows_affected,omitempty"`
-	Route          string            `json:"route,omitempty"`
-	Generation     uint64            `json:"generation,omitempty"`
-	ShardsFanned   int               `json:"shards_fanned,omitempty"`
-	Retries        int               `json:"retries,omitempty"`
-	TransactionID  replication.ID128 `json:"-"`
-	Committed      bool              `json:"committed,omitempty"`
-	OutcomeUnknown bool              `json:"outcome_unknown,omitempty"`
-	Error          string            `json:"error,omitempty"`
+	Kind               string                          `json:"kind,omitempty"`
+	Columns            []string                        `json:"columns,omitempty"`
+	Rows               [][]serveRawValue               `json:"rows,omitempty"`
+	RowsAffected       int64                           `json:"rows_affected,omitempty"`
+	Route              string                          `json:"route,omitempty"`
+	Generation         uint64                          `json:"generation,omitempty"`
+	ShardsFanned       int                             `json:"shards_fanned,omitempty"`
+	Retries            int                             `json:"retries,omitempty"`
+	TransactionID      replication.ID128               `json:"-"`
+	Committed          bool                            `json:"committed,omitempty"`
+	OutcomeUnknown     bool                            `json:"outcome_unknown,omitempty"`
+	DurableAck         *durableExecBatchAckWireRequest `json:"-"`
+	Metrics            *gateway.MetricsSnapshot        `json:"metrics,omitempty"`
+	DistributedMetrics *gateway.DistributedMetrics     `json:"-"`
+	ControllerMetrics  *gatewayControllerMetrics       `json:"-"`
+	BackupID           [32]byte                        `json:"-"`
+	BackupStage        uint64                          `json:"backup_stage,omitempty"`
+	BackupProof        [32]byte                        `json:"-"`
+	Error              string                          `json:"error,omitempty"`
 }
 
 var errServeResponseTransactionState = errors.New(
@@ -132,18 +158,31 @@ func (values *repeatedFlag) Set(value string) error {
 }
 
 // runServe loads the catalog, binds the listener, and serves until interrupted.
-func runServe(args []string) int {
+func runServe(args []string) (exitCode int) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
+	catalogRouteSeed := fs.String("catalog-route-seed", "", "path to the last authenticated crash-safe catalog route seed")
 	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
+	catalogBootstrapIfMissing := fs.Bool("catalog-bootstrap-if-missing", false, "atomically publish and attest the immutable generation-one catalog proof when authority is empty")
 	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
 	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
 	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
 	catalogSessionJournal := fs.String("catalog-session-journal", "", "durable native controller session journal base path")
+	durableAckKeyPath := fs.String("durable-ack-key", "", "cluster-shared 64-character lowercase hexadecimal durable ACK key file")
 	catalogClientID := fs.String("catalog-client-id", "", "stable 32-hex-character controller client identity")
 	catalogRetryHome := fs.String("catalog-retry-home", "", "stable 16-hex-character controller retry-home identity")
 	catalogSessionLease := fs.Duration("catalog-session-lease", 24*time.Hour, "monotonic controller session renewal interval")
 	controllerInterval := fs.Duration("controller-interval", time.Second, "bounded replicated split reconciliation interval")
+	hotShardCapacity := fs.String("hot-shard-capacity", "", "strict canonical vibejson provisioned pressure capacities")
+	hotShardInterval := fs.Duration("hot-shard-interval", time.Second, "pressure-window publication cadence; not correctness authority")
+	replicaControlManifestPath := fs.String("replica-control-manifest", "", "strict canonical vibejson replica-control topology and bounds")
+	backupRepositoryPath := fs.String("backup-repository", "", "absolute server-local durable backup repository directory")
+	backupMaxBackups := fs.Int("backup-max-backups", 16, "hard retained certified backup bound")
+	backupMaxArtifacts := fs.Int("backup-max-artifacts", 4096, "hard retained backup artifact bound")
+	backupMaxArtifactBytes := fs.Uint64("backup-max-artifact-bytes", 64<<30, "hard bytes per backup artifact")
+	backupMaxDiskBytes := fs.Uint64("backup-max-disk-bytes", 256<<30, "hard aggregate backup repository bytes")
+	schemaRolloutPlan := fs.String("schema-rollout-plan", "", "strict canonical vibejson per-replica schema rollout plan")
+	schemaRolloutOnce := fs.Bool("schema-rollout-once", false, "execute the authenticated schema rollout and exit")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
@@ -160,6 +199,7 @@ func runServe(args []string) int {
 	maxShardHandshakes := fs.Int("max-shard-handshakes-per-pool", 64, "hard concurrent TLS handshake bound for each authenticated SQL and RF3 shard pool; transient control pools cap this at 8")
 	maxNativeReadConcurrency := fs.Int("max-native-read-concurrency", gateway.DefaultReplicatedReadConcurrency, "hard concurrent public RF3 point-read bound")
 	maxNativeReadBytes := fs.Uint64("max-native-read-bytes", gateway.DefaultReplicatedReadInFlight, "hard aggregate schema-bounded public RF3 response-byte reservation")
+	maxNativeScatterConcurrency := fs.Int("max-native-scatter-concurrency", gateway.DefaultReplicatedScatterConcurrency, "hard concurrent RF3 shard-group reads; requests may contain more groups and drain through this bound")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -167,14 +207,34 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
+	if *schemaRolloutOnce && *schemaRolloutPlan == "" ||
+		*schemaRolloutPlan != "" && (*devStaticCatalog || *devPlaintext || *replicaControlManifestPath == "") {
+		fmt.Fprintln(os.Stderr, "gateway: schema rollout requires replicated catalog and authenticated replica-control manifest")
+		return 2
+	}
+	if *backupRepositoryPath != "" && (!filepath.IsAbs(*backupRepositoryPath) ||
+		filepath.Clean(*backupRepositoryPath) != *backupRepositoryPath || *devStaticCatalog ||
+		*devPlaintext || *replicaControlManifestPath == "") {
+		fmt.Fprintln(os.Stderr, "gateway: backup repository requires an absolute clean path, replicated catalog, TLS, and replica-control manifest")
+		return 2
+	}
+	if err := validateGatewayHotShardServeMode(
+		*hotShardCapacity, *replicaControlManifestPath, *devStaticCatalog, *devPlaintext,
+	); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	if *devStaticCatalog {
-		if !*devPlaintext || *catalogRelation != 0 {
+		if !*devPlaintext || *catalogBootstrapIfMissing || *catalogRelation != 0 ||
+			*catalogRouteSeed != "" || *hotShardCapacity != "" || *durableAckKeyPath != "" {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
 		}
-	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
-		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *controllerInterval <= 0 ||
-		*catalogSessionLease <= 0 || len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
+	} else if *catalogRouteSeed == "" || *catalogRouteSeed == *catalog ||
+		*catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
+		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *durableAckKeyPath == "" || *controllerInterval <= 0 ||
+		*catalogSessionLease <= 0 || *hotShardInterval <= 0 ||
+		len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
 		fmt.Fprintln(os.Stderr, "gateway: replicated catalog relation, identities, journal, and positive bounds are required")
 		return 2
 	}
@@ -182,6 +242,8 @@ func runServe(args []string) int {
 	var shardTLS *servicetls.Client
 	var tlsProfile *rafttransport.PeerTLS
 	var internalAuthority serviceauthz.Authority
+	var authorization *serviceauthz.Policy
+	var replicaControlManifest *gatewayReplicaControlManifest
 	if *devPlaintext {
 		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
 			*authorizationPolicy != "" || len(shardPeers) != 0 {
@@ -211,11 +273,22 @@ func runServe(args []string) int {
 		internalAuthority = serviceauthz.Authority{
 			Node: profile.LocalIdentity().Node, Generation: policy.Generation(),
 		}
-		if policy.Check(internalAuthority.Node,
-			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
-				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology|
-				serviceauthz.CapabilityTransactionRecovery) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, topology, and transaction_recovery authority")
+		authorization = policy
+		required := serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite |
+			serviceauthz.CapabilityDelegate | serviceauthz.CapabilityTopology |
+			serviceauthz.CapabilityTransactionRecovery |
+			serviceauthz.CapabilityRequestLedger | serviceauthz.CapabilityExecutionPin
+		if *schemaRolloutPlan != "" {
+			required |= serviceauthz.CapabilitySchema
+		}
+		if *backupRepositoryPath != "" {
+			required |= serviceauthz.CapabilityBackup
+		}
+		if *replicaControlManifestPath != "" {
+			required |= serviceauthz.CapabilityMembership
+		}
+		if policy.Check(internalAuthority.Node, required) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks required data, schema, delegation, topology, recovery, ledger, or execution-pin authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -252,6 +325,33 @@ func runServe(args []string) int {
 			return 2
 		}
 		defer shardTLS.Close()
+		if *replicaControlManifestPath != "" {
+			manifest, manifestErr := loadGatewayReplicaControlManifest(
+				*replicaControlManifestPath, profile.LocalIdentity().Node,
+			)
+			if manifestErr != nil || manifest.TLS != (gatewayReplicaTLSReferences{
+				Certificate: *tlsCertificate, Key: *tlsKey, Roots: *tlsRoots,
+				IdentityOID: *tlsIdentityOID, AuthorizationPolicy: *authorizationPolicy,
+			}) {
+				fmt.Fprintf(os.Stderr, "gateway: load replica control manifest: %v\n",
+					errors.Join(manifestErr, errGatewayReplicaControlManifest))
+				return 2
+			}
+			if policy.Check(profile.LocalIdentity().Node,
+				serviceauthz.CapabilityTopology|serviceauthz.CapabilityMembership,
+			) != serviceauthz.DecisionAllow {
+				fmt.Fprintln(os.Stderr, "gateway: replica controller identity lacks topology and membership authority")
+				return 2
+			}
+			for _, endpoint := range manifest.Gateways {
+				if policy.Check(endpoint.Member.Node, serviceauthz.CapabilityTopology) !=
+					serviceauthz.DecisionAllow {
+					fmt.Fprintln(os.Stderr, "gateway: replica control roster contains a gateway without topology authority")
+					return 2
+				}
+			}
+			replicaControlManifest = &manifest
+		}
 	}
 
 	var shardDial gateway.DialFunc
@@ -275,8 +375,8 @@ func runServe(args []string) int {
 			return 2
 		}
 		exec, holder, catalogAuthority, replicated, replicatedPool, err = newReplicatedCatalogGateway(
-			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
-			internalAuthority,
+			context.Background(), *catalog, *catalogRouteSeed, shardDial, tlsProfile, *devPlaintext,
+			internalAuthority, *catalogBootstrapIfMissing,
 			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
 			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
 			*catalogSessionJournal, clientID, retryHome, *catalogSessionLease,
@@ -289,17 +389,63 @@ func runServe(args []string) int {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
 	}
+	var routeSeedControl *gateway.ReplicatedCatalogRouteSeedControl
+	if catalogAuthority != nil {
+		routeSeedControl = catalogAuthority.ReplicatedCatalogRouteSeedControl()
+	}
 	var dataReader *gateway.ReplicatedDataReader
+	var durable durableRequestService
 	if replicated != nil {
 		dataReader, err = gateway.NewReplicatedDataReaderWithOptions(
 			gateway.ReplicatedDataReaderOptions{
 				Catalog: holder, Executor: replicated, Refresh: catalogAuthority.Refresh,
-				MaxConcurrentReads:   *maxNativeReadConcurrency,
-				MaxInFlightReadBytes: *maxNativeReadBytes,
+				MaxConcurrentReads:    *maxNativeReadConcurrency,
+				MaxInFlightReadBytes:  *maxNativeReadBytes,
+				MaxScatterConcurrency: *maxNativeScatterConcurrency,
 			},
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gateway: initialize replicated data reader: %v\n", err)
+			return 1
+		}
+		ackKey, keyErr := loadDurableAckKey(*durableAckKeyPath)
+		if keyErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: load durable ACK key: %v\n", keyErr)
+			return 1
+		}
+		durable, err = newReplicatedDurableRuntime(replicatedDurableRuntimeOptions{
+			Planner: exec, Catalog: holder, CatalogControl: catalogAuthority,
+			Replicated: replicated, Authority: internalAuthority,
+			AckKey: ackKey, JournalBase: *catalogSessionJournal,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: initialize durable RF3 request service: %v\n", err)
+			return 1
+		}
+	}
+	if *replicaControlManifestPath != "" && (*devPlaintext || replicaControlManifest == nil) {
+		fmt.Fprintln(os.Stderr, "gateway: replica control requires a complete authenticated manifest")
+		return 2
+	}
+	if replicaControlManifest != nil {
+		if err = replicaControlManifest.ValidateCatalog(holder.Current()); err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: replica control catalog endpoints: %v\n", err)
+			return 2
+		}
+	}
+	var hotShardRuntime *gatewayHotShardRuntime
+	if *hotShardCapacity != "" {
+		capacity, capacityErr := loadGatewayHotShardCapacity(*hotShardCapacity)
+		if capacityErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: load hot-shard capacity: %v\n", capacityErr)
+			return 2
+		}
+		hotShardRuntime, err = newGatewayHotShardRuntime(
+			context.Background(), holder, catalogAuthority, capacity,
+		)
+		if err != nil || !exec.InstallPressureObserver(hotShardRuntime) ||
+			dataReader != nil && !dataReader.InstallPressureObserver(hotShardRuntime) {
+			fmt.Fprintf(os.Stderr, "gateway: initialize hot-shard pressure: %v\n", err)
 			return 1
 		}
 	}
@@ -313,22 +459,269 @@ func runServe(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	controllerMetrics := new(gatewayControllerMetrics)
+	ctx = withGatewayControllerMetrics(ctx, controllerMetrics)
+	// Controller-initiated native operations must carry the gateway service
+	// authority, just as catalog sessions do. Keep it off the public listener
+	// context: authenticated clients must continue to supply their own identity.
+	controllerCtx := ctx
+	if internalAuthority.Valid() {
+		controllerCtx, err = serviceauthz.WithAuthority(ctx, internalAuthority)
+		if err != nil {
+			_ = listener.Close()
+			fmt.Fprintf(os.Stderr, "gateway: establish controller authority: %v\n", err)
+			return 1
+		}
+	}
+	routeHandoffCompleted := false
+	defer func() {
+		if routeHandoffCompleted {
+			return
+		}
+		required, handoffErr := completeReplicatedCatalogRouteSeedHandoff(
+			routeSeedControl, *catalogAttempts, *catalogAttemptTimeout,
+		)
+		if required && handoffErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: catalog route handoff: %v\n", handoffErr)
+			exitCode = 1
+		}
+	}()
+	if routeSeedControl != nil {
+		go func() {
+			select {
+			case <-routeSeedControl.ShutdownRequired():
+				// The authority closes this before exposing a binding-changing
+				// head. Cancel every public and control-plane user first; the
+				// session is retired only after their done signals are joined.
+				stop()
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
-	if catalogAuthority != nil {
-		trigger := &gatewayControllerTriggerClient{
-			tls: tlsProfile, plaintext: *devPlaintext, handshake: *tlsHandshakeTimeout,
-			maxConnections: *maxShardConnections, maxHandshakes: *maxShardHandshakes,
+	var hotShardDone <-chan struct{}
+	var replicaControlDone <-chan error
+	var replicaControllersDone <-chan struct{}
+	var splitControllerDone <-chan struct{}
+	var splitRuntime *gatewayServingSplitRuntime
+	var backupOperator gatewayBackupOperator
+	var distributedMetrics *gateway.DistributedMetrics
+	var distributedMetricsConcurrency int
+	if replicaControlManifest != nil {
+		manifest := *replicaControlManifest
+		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
+		writeDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.WriteTimeout) * time.Millisecond)
+		handshakeDeadline := servicetls.FixedDeadline(*tlsHandshakeTimeout)
+		shardOpener, openErr := newGatewayShardControlOpener(
+			tlsProfile, handshakeDeadline,
+			func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			}, manifest.Shards, int(manifest.Bounds.MaxConnections),
+		)
+		var metricsErr error
+		distributedMetrics, metricsErr = newGatewayDistributedMetrics(holder.Current(), shardOpener)
+		if distributedMetrics != nil {
+			distributedMetricsConcurrency = min(distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
 		}
-		go runSplitController(ctx, catalogAuthority, trigger, *controllerInterval, logf)
+		trust := tlsProfile.LocalIdentity().TrustDomain
+		drainer, drainErr := newGatewayClusterDrainCertifier(
+			trust, tlsProfile, handshakeDeadline, readDeadline, writeDeadline,
+			func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			}, manifest.Gateways, int(manifest.Bounds.MaxConcurrentDrains),
+		)
+		var splitErr error
+		splitRuntime, splitErr = newGatewayServingSplitRuntime(gatewayServingSplitOptions{
+			catalog: catalogAuthority, drain: drainer, opener: shardOpener, tls: tlsProfile,
+			shards: manifest.Shards,
+			dial: func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			},
+			handshake: handshakeDeadline, read: readDeadline, write: writeDeadline,
+			protocol: max(
+				time.Duration(manifest.Bounds.ReadTimeout)*time.Millisecond,
+				time.Duration(manifest.Bounds.WriteTimeout)*time.Millisecond,
+			),
+			connections: int(manifest.Bounds.MaxConnections),
+			handshakes:  int(manifest.Bounds.MaxHandshakes),
+		})
+		controls, controlsErr := newGatewayReplicaRemoteClients(gatewayReplicaRemoteClientOptions{
+			Opener: shardOpener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
+			Authority: catalogAuthority, Replicated: replicated, Drainer: drainer,
+		})
+		var backupRepository *clusterbackup.BackupRepository
+		var backupErr error
+		if *backupRepositoryPath != "" {
+			backupRepository, backupErr = clusterbackup.OpenBackupRepository(*backupRepositoryPath,
+				clusterbackup.RepositoryLimits{MaxBackups: *backupMaxBackups,
+					MaxArtifacts: *backupMaxArtifacts, MaxArtifactBytes: *backupMaxArtifactBytes,
+					MaxDiskBytes: *backupMaxDiskBytes})
+			if backupErr == nil {
+				var gate *serviceauthz.Gate
+				gate, backupErr = serviceauthz.NewGate(authorization)
+				if backupErr == nil {
+					backupOperator = &gatewayBackupOperatorRuntime{authority: catalogAuthority,
+						gate: gate, principal: internalAuthority, repository: backupRepository,
+						opener: shardOpener, observer: controls.HealthObservations,
+						read: readDeadline, write: writeDeadline}
+				}
+			}
+		}
+		splitFactory, splitFactoryErr := newGatewayHotSplitFactory(manifest, holder.Current())
+		moveController, controllerErr := newGatewayReplicaMoveController(
+			catalogAuthority, replicated, controls,
+		)
+		hotAuthorities := gatewayHotShardOperationAuthorities{
+			splits: splitFactory, journal: catalogAuthority,
+		}
+		if len(manifest.Candidates) != 0 {
+			hotAuthorities.moves = gatewayHotReplicaMoveFactory{
+				observations: controls.HealthObservations, grants: catalogAuthority,
+			}
+			hotAuthorities.moveRun = moveController
+		}
+		var hotShardBindErr error
+		if hotShardRuntime != nil && (controllerErr != nil || controlsErr != nil ||
+			splitFactoryErr != nil ||
+			!hotShardRuntime.InstallOperationAuthorities(hotAuthorities)) {
+			hotShardBindErr = hotshard.ErrInvalidPressureCut
+		}
+		healthController, healthErr := newGatewayReplicaHealthRuntime(
+			catalogAuthority,
+			rebalance.ReplicatedFailureAuthority{Source: catalogAuthority},
+			controls.HealthObservations, manifest, moveController,
+			catalogAuthority, controls.GrantInstaller,
+		)
+		healthRevisions, revisionErr := newGatewayReplicaHealthRevisionController(
+			catalogAuthority, controls.HealthObservations, catalogAuthority,
+		)
+		gatewayNodes := make([]rafttransport.NodeID, len(manifest.Gateways))
+		gatewayRoster := make(map[rafttransport.NodeID]uint64, len(manifest.Gateways))
+		for index, endpoint := range manifest.Gateways {
+			gatewayNodes[index] = endpoint.Member.Node
+			gatewayRoster[endpoint.Member.Node] = endpoint.Member.Incarnation
+		}
+		authorizer, authorizeErr := servicetls.NewNodeAuthorizer(gatewayNodes)
+		controlTLS, tlsErr := servicetls.NewServer(
+			tlsProfile.WithLocalGatewayControlConnections(), rafttransport.TrafficGatewayControl, authorizer,
+		)
+		controlService, serviceErr := gateway.NewClusterCatalogDrainControlService(
+			gateway.ClusterCatalogDrainControlOptions{Holder: holder,
+				Catalog: gatewayCatalogDigestVerifier{catalog: catalogAuthority},
+				Member:  manifest.Local.Member,
+				Authorize: func(identity rafttransport.PeerIdentity, _ gateway.ClusterCatalogDrainRequest) bool {
+					incarnation, found := gatewayRoster[identity.Node]
+					return found && incarnation != 0 && authorization.Check(
+						identity.Node, serviceauthz.CapabilityTopology,
+					) == serviceauthz.DecisionAllow
+				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
+		)
+		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
+		if joined := errors.Join(openErr, metricsErr, drainErr, splitErr, controlsErr, splitFactoryErr,
+			controllerErr, hotShardBindErr, healthErr, revisionErr,
+			authorizeErr, tlsErr, serviceErr, listenErr, backupErr); joined != nil {
+			if backupRepository != nil {
+				_ = backupRepository.Close()
+			}
+			if splitRuntime != nil {
+				_ = splitRuntime.Close()
+			}
+			if controlListener != nil {
+				_ = controlListener.Close()
+			}
+			_ = listener.Close()
+			fmt.Fprintf(os.Stderr, "gateway: initialize replica control: %v\n", joined)
+			return 1
+		}
+		if backupRepository != nil {
+			defer backupRepository.Close()
+		}
+		if *schemaRolloutPlan != "" {
+			started := time.Now()
+			result, rolloutErr := executeGatewaySchemaRollout(
+				ctx, *schemaRolloutPlan, catalogAuthority, shardOpener,
+				readDeadline, writeDeadline, min(int(manifest.Bounds.MaxConnections), 64),
+			)
+			if rolloutErr != nil {
+				_ = controlListener.Close()
+				_ = listener.Close()
+				fmt.Fprintf(os.Stderr, "gateway: schema rollout: %v\n", rolloutErr)
+				return 1
+			}
+			printGatewaySchemaRolloutResult(result, time.Since(started))
+			if *schemaRolloutOnce {
+				_ = controlListener.Close()
+				_ = listener.Close()
+				return 0
+			}
+		}
+		replicaControllersDone, err = startGatewayReplicaControllers(
+			controllerCtx, healthRevisions, moveController, healthController,
+			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, logf,
+		)
+		if err != nil {
+			_ = controlListener.Close()
+			_ = listener.Close()
+			fmt.Fprintf(os.Stderr, "gateway: start replica controllers: %v\n", err)
+			return 1
+		}
+		controlDone := make(chan error, 1)
+		replicaControlDone = controlDone
+		go func() {
+			serveErr := controlTLS.Serve(ctx, controlListener, servicetls.Limits{
+				MaxConnections:    int(manifest.Bounds.MaxConnections),
+				MaxHandshakes:     int(manifest.Bounds.MaxHandshakes),
+				HandshakeDeadline: handshakeDeadline,
+			}, func(connectionContext context.Context, connection rafttransport.PeerConnection) {
+				if serveErr := controlService.Serve(connectionContext, connection); serveErr != nil &&
+					!errors.Is(serveErr, context.Canceled) {
+					logf("gateway: catalog drain control: %v", serveErr)
+				}
+			})
+			controlDone <- serveErr
+			stop()
+		}()
+	}
+	if *backupRepositoryPath != "" && backupOperator == nil {
+		_ = listener.Close()
+		fmt.Fprintln(os.Stderr, "gateway: backup operator unavailable")
+		return 1
+	}
+	ctx = withGatewayBackupOperator(ctx, backupOperator)
+	ctx = withGatewayDistributedMetrics(ctx, distributedMetrics)
+	if distributedMetrics != nil {
+		go func() {
+			if metricsErr := distributedMetrics.RunRefresh(ctx, *controllerInterval,
+				distributedMetricsConcurrency); metricsErr != nil && ctx.Err() == nil {
+				logf("gateway: distributed metrics refresh: %v", metricsErr)
+				stop()
+			}
+		}()
+	}
+	if hotShardRuntime != nil {
+		hotShardDone = runGatewayHotShardPublisher(
+			controllerCtx, hotShardRuntime, *hotShardInterval, logf,
+		)
+	}
+	if splitRuntime != nil {
+		defer splitRuntime.Close()
+		done := make(chan struct{})
+		splitControllerDone = done
+		go func() {
+			defer close(done)
+			runServingSplitController(
+				controllerCtx, catalogAuthority, splitRuntime.controller, *controllerInterval, logf,
+			)
+		}()
 	}
 	if clientTLS != nil {
-		err = serveAuthenticatedGatewayData(ctx, listener, exec, dataReader, clientTLS, gateway.ClientTLSLimits{
+		err = serveAuthenticatedGatewayDurableData(ctx, listener, exec, dataReader, durable, clientTLS, gateway.ClientTLSLimits{
 			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,
 			HandshakeDeadline: servicetls.FixedDeadline(*tlsHandshakeTimeout),
 		}, logf)
 	} else {
-		serveContext := gateway.WithLocalReplicatedTransactionRequestScope(ctx)
+		serveContext := ctx
 		if dataReader != nil {
 			serveContext, err = serviceauthz.WithAuthority(serveContext, internalAuthority)
 			if err != nil {
@@ -336,13 +729,60 @@ func runServe(args []string) int {
 				return 1
 			}
 		}
-		err = serveGatewayData(serveContext, listener, exec, dataReader, logf)
+		err = serveGatewayDurableData(serveContext, listener, exec, dataReader, durable, logf)
 	}
-	if err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", err)
+	var replicaControlErr error
+	if replicaControlDone != nil {
+		stop()
+		replicaControlErr = nonCanceledError(<-replicaControlDone, context.Cause(ctx))
+	}
+	if replicaControllersDone != nil {
+		stop()
+		<-replicaControllersDone
+	}
+	if splitControllerDone != nil {
+		stop()
+		<-splitControllerDone
+	}
+	if hotShardDone != nil {
+		stop()
+		<-hotShardDone
+	}
+	var routeHandoffErr error
+	routeHandoffCompleted, routeHandoffErr = completeReplicatedCatalogRouteSeedHandoff(
+		routeSeedControl, *catalogAttempts, *catalogAttemptTimeout,
+	)
+	if serveErr := errors.Join(
+		replicaControlErr, nonCanceledError(err, context.Cause(ctx)), routeHandoffErr,
+	); serveErr != nil {
+		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", serveErr)
 		return 1
 	}
 	return 0
+}
+
+func completeReplicatedCatalogRouteSeedHandoff(
+	control *gateway.ReplicatedCatalogRouteSeedControl,
+	attempts int,
+	attemptTimeout time.Duration,
+) (bool, error) {
+	if control == nil {
+		return false, nil
+	}
+	select {
+	case <-control.ShutdownRequired():
+	default:
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), replicatedCatalogRouteHandoffTimeout(attempts, attemptTimeout),
+	)
+	defer cancel()
+	return true, control.CompleteQuiescedHandoff(ctx)
+}
+
+func nonCanceledError(err error, shutdownCause ...error) error {
+	return serviceerrors.Without(err, append(shutdownCause, context.Canceled)...)
 }
 
 // requireLoopbackListen keeps the explicitly selected unauthenticated
@@ -384,13 +824,57 @@ func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
 	return exec, holder, nil
 }
 
+func loadReplicatedCatalogSeeds(
+	genesisPath, routeSeedPath string,
+) (*gateway.Snapshot, *gateway.Snapshot, gateway.ReplicatedCatalogRouteSeedState, error) {
+	if err := gateway.ValidateReplicatedCatalogRouteSeedSeparation(
+		genesisPath, routeSeedPath,
+	); err != nil {
+		return nil, nil, gateway.ReplicatedCatalogRouteSeedState{}, err
+	}
+	genesis, err := gateway.LoadSnapshot(genesisPath)
+	if err != nil || genesis.Generation() != 1 {
+		return nil, nil, gateway.ReplicatedCatalogRouteSeedState{},
+			errors.Join(err, gateway.ErrReplicatedCatalog)
+	}
+	state, err := gateway.LoadReplicatedCatalogRouteSeed(routeSeedPath)
+	if err != nil {
+		return nil, nil, gateway.ReplicatedCatalogRouteSeedState{}, err
+	}
+	routeSeed, found := state.Active()
+	if !found {
+		routeSeed = genesis
+	}
+	return genesis, routeSeed, state, nil
+}
+
+func sameReplicatedCatalogRoute(left, right gateway.ReplicatedRoute) bool {
+	if left.Distribution != right.Distribution || left.Shard != right.Shard ||
+		left.Group != right.Group ||
+		left.AllocationGeneration != right.AllocationGeneration ||
+		left.Command != right.Command || left.RangeIdentity != right.RangeIdentity ||
+		left.LineageDigest != right.LineageDigest ||
+		left.ForwardingRuleDigest != right.ForwardingRuleDigest ||
+		len(left.Replicas) != len(right.Replicas) {
+		return false
+	}
+	for index := range left.Replicas {
+		if left.Replicas[index] != right.Replicas[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func newReplicatedCatalogGateway(
 	ctx context.Context,
 	bootstrapPath string,
+	routeSeedPath string,
 	shardDial gateway.DialFunc,
 	tlsProfile *rafttransport.PeerTLS,
 	devPlaintext bool,
 	internalAuthority serviceauthz.Authority,
+	bootstrapIfMissing bool,
 	relation replication.RelationID,
 	attempts int,
 	attemptTimeout time.Duration,
@@ -410,12 +894,14 @@ func newReplicatedCatalogGateway(
 	}
 	distributionName := gateway.ReplicatedCatalogDistribution
 	shardID := gateway.ReplicatedCatalogShard
-	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
+	bootstrap, routeSeed, routeSeedState, err := loadReplicatedCatalogSeeds(
+		bootstrapPath, routeSeedPath,
+	)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
-	route, ok := bootstrap.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
+	route, ok := routeSeed.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
 	if !ok {
 		return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalogMissing
 	}
@@ -453,9 +939,54 @@ func newReplicatedCatalogGateway(
 		return nil, nil, nil, nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(nil)
-	binding, err := gateway.NativeSessionJournalBinding(
-		route, string(distributionName), string(shardID),
-		[]byte{replicatedCatalogControllerTenant}, relation, serviceauthz.CapabilityTopology,
+	newSession := func(sessionRoute gateway.ReplicatedRoute) (*gateway.NativeSession, error) {
+		binding, bindingErr := gateway.NativeSessionJournalBinding(
+			sessionRoute, string(distributionName), string(shardID),
+			[]byte{replicatedCatalogControllerTenant}, relation,
+			serviceauthz.CapabilityTopology,
+		)
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+		journal, journalErr := gateway.OpenNativeSessionJournal(
+			gateway.NativeSessionJournalOptions{
+				Path: journalPath, ClientID: clientID, RetryHome: retryHome,
+				MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
+			},
+		)
+		if journalErr != nil {
+			return nil, journalErr
+		}
+		return gateway.NewNativeSession(gateway.NativeSessionOptions{
+			Executor: replicated, Route: sessionRoute,
+			CatalogBootstrap: routeSeed,
+			Distribution:     string(distributionName), Shard: string(shardID),
+			Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID,
+			RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: relation},
+			Journal: journal, ProposalCapability: serviceauthz.CapabilityTopology,
+			MaxRelationBatches: 1, MaxMutations: gateway.MaxReplicatedCatalogBatchMutations,
+			InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+		})
+	}
+	routeSeed, route, routeSeedState, err = recoverReplicatedCatalogRouteSeedStartup(
+		ctx, journalPath, routeSeed, route, routeSeedState,
+		replicatedCatalogRouteSeedStartupHooks{
+			journalPresent: gateway.NativeSessionJournalPresent,
+			settleOldSession: func(settleCtx context.Context, oldRoute gateway.ReplicatedRoute) error {
+				recoverySession, recoveryErr := newSession(oldRoute)
+				authorized, authorizeErr := serviceauthz.WithAuthority(
+					settleCtx, internalAuthority,
+				)
+				if recoveryErr != nil || authorizeErr != nil {
+					return errors.Join(recoveryErr, authorizeErr)
+				}
+				status := recoverySession.Status()
+				if !status.Pending && !status.Active && !status.Retired && !status.Released {
+					return gateway.ErrReplicatedCatalogConflict
+				}
+				return recoverySession.RetireReleaseAndDestroy(authorized)
+			},
+		},
 	)
 	if err != nil {
 		if replicatedPool != nil {
@@ -463,24 +994,8 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	journal, err := gateway.OpenNativeSessionJournal(gateway.NativeSessionJournalOptions{
-		Path: journalPath, ClientID: clientID, RetryHome: retryHome,
-		MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
-	})
-	if err != nil {
-		if replicatedPool != nil {
-			_ = replicatedPool.Close()
-		}
-		return nil, nil, nil, nil, nil, err
-	}
-	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{
-		Executor: replicated, Route: route, Distribution: string(distributionName), Shard: string(shardID),
-		Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID, RetryHome: retryHome,
-		Resolver: gateway.BaseRelationResolver{Relation: relation}, Journal: journal,
-		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 2,
-		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
-	})
+	_, routeSeedExists := routeSeedState.Active()
+	session, err := newSession(route)
 	if err != nil {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
@@ -536,25 +1051,42 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	if _, err = authority.Read(ctx); err != nil {
+	_, err = authority.Read(ctx)
+	if err != nil && (!bootstrapIfMissing ||
+		!errors.Is(err, gateway.ErrReplicatedCatalogMissing)) {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
 		}
 		return nil, nil, nil, nil, nil, err
+	} else if err != nil {
+		if routeSeedExists {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalogConflict
+		}
+		publishErr := authority.Publish(ctx, 0, bootstrap)
+		for retry := 0; retry < attempts && errors.Is(publishErr, gateway.ErrReplicatedCatalogPending); retry++ {
+			publishErr = authority.RetryPending(ctx)
+		}
+		if publishErr != nil &&
+			!errors.Is(publishErr, gateway.ErrCatalogGenerationMismatch) &&
+			!errors.Is(publishErr, gateway.ErrReplicatedCatalogConflict) {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, publishErr
+		}
+		_, err = authority.Read(ctx)
+		if err != nil {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, err
+		}
 	}
-	transactionTenant, transactionRetryHome := replicatedDataTransactionIdentity(
-		clientID, retryHome,
-	)
-	transactions, err := gateway.NewReplicatedTransactionOrchestrator(
-		gateway.ReplicatedTransactionOrchestratorOptions{
-			Executor: replicated, Tenant: transactionTenant, RetryHome: transactionRetryHome,
-			MaxConcurrency:    defaultRF3TransactionConcurrency,
-			MaxInFlightBytes:  defaultRF3TransactionInFlight,
-			MaxMutations:      defaultRF3TransactionMutations,
-			MaxMutationBytes:  defaultRF3TransactionBytes,
-			RecoveryTimeout:   defaultRF3TransactionRecovery,
-			RecoveryAuthority: internalAuthority,
-		},
+	control, err := authority.InstallReplicatedCatalogRouteSeed(
+		ctx, routeSeedPath, bootstrap,
 	)
 	if err != nil {
 		if replicatedPool != nil {
@@ -562,46 +1094,114 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	transactionRequests, err := gateway.NewReplicatedTransactionRequestRegistry(
-		gateway.ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: transactions, MaxEntries: defaultRF3TransactionRequests,
-		},
-	)
-	if err != nil {
+	select {
+	case <-control.ShutdownRequired():
+		handoffCtx, cancel := context.WithTimeout(
+			context.Background(), replicatedCatalogRouteHandoffTimeout(attempts, attemptTimeout),
+		)
+		err = control.CompleteQuiescedHandoff(handoffCtx)
+		cancel()
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
 		}
 		return nil, nil, nil, nil, nil, err
+	default:
 	}
 	executor := gateway.NewExecutor(
 		gateway.NewClient(shardDial), holder, gateway.Options{
 			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
-			ReplicatedTransactions:        transactions,
-			ReplicatedTransactionRequests: transactionRequests,
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil
 }
 
-const replicatedCatalogControllerTenant = byte(1)
-
-func replicatedDataTransactionIdentity(
-	clientID replication.ID128,
-	retryHome replication.RetryHome,
-) ([]byte, replication.RetryHome) {
-	var material [1 + len(clientID) + len(retryHome)]byte
-	material[0] = 2
-	copy(material[1:1+len(clientID)], clientID[:])
-	copy(material[1+len(clientID):], retryHome[:])
-	tenantDigest := sha256.Sum256(material[:])
-	material[0] = 3
-	retryDigest := sha256.Sum256(material[:])
-	tenant := make([]byte, len(clientID))
-	copy(tenant, tenantDigest[:len(tenant)])
-	var dataRetryHome replication.RetryHome
-	copy(dataRetryHome[:], retryDigest[:len(dataRetryHome)])
-	return tenant, dataRetryHome
+type replicatedCatalogRouteSeedStartupHooks struct {
+	journalPresent   func(string) (bool, error)
+	settleOldSession func(context.Context, gateway.ReplicatedRoute) error
 }
+
+func recoverReplicatedCatalogRouteSeedStartup(
+	ctx context.Context,
+	journalPath string,
+	active *gateway.Snapshot,
+	activeRoute gateway.ReplicatedRoute,
+	state gateway.ReplicatedCatalogRouteSeedState,
+	hooks replicatedCatalogRouteSeedStartupHooks,
+) (*gateway.Snapshot, gateway.ReplicatedRoute,
+	gateway.ReplicatedCatalogRouteSeedState, error) {
+	if ctx == nil {
+		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{},
+			gateway.ErrReplicatedCatalog
+	}
+	pending, pendingExists := state.Pending()
+	if !pendingExists {
+		return active, activeRoute, state, nil
+	}
+	var pendingReplicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	pendingRoute, ok := pending.ResolveReplicatedRoute(
+		gateway.ReplicatedCatalogDistribution,
+		gateway.ReplicatedCatalogShard,
+		pendingReplicas[:0],
+	)
+	if !ok {
+		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{},
+			gateway.ErrReplicatedCatalogMissing
+	}
+	changed := !sameReplicatedCatalogRoute(activeRoute, pendingRoute)
+	if changed {
+		if hooks.journalPresent == nil || hooks.settleOldSession == nil {
+			return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{},
+				gateway.ErrReplicatedCatalog
+		}
+		present, err := hooks.journalPresent(journalPath)
+		if err != nil {
+			return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
+		}
+		if present {
+			// The callback must reopen the journal under activeRoute—not the
+			// candidate binding—and settle Retire→Release→destroy exactly.
+			if err = hooks.settleOldSession(ctx, activeRoute); err != nil {
+				return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
+			}
+		}
+	}
+	refreshed, err := state.PromotePendingAndReload()
+	if err != nil {
+		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
+	}
+	if changed {
+		return pending, pendingRoute, refreshed,
+			gateway.ErrReplicatedCatalogRouteRestartRequired
+	}
+	return pending, pendingRoute, refreshed, nil
+}
+
+func replicatedCatalogRouteHandoffTimeout(attempts int, attemptTimeout time.Duration) time.Duration {
+	const minimum = 5 * time.Second
+	const maximum = 2 * time.Minute
+	if attempts <= 0 || attemptTimeout <= 0 {
+		return minimum
+	}
+	// A retained outcome-unknown command, Retire, and Release can each execute
+	// one independently bounded proposal. Cap the aggregate shutdown budget: an
+	// interrupted handoff is durable and resumes from the pending seed plus
+	// native-session journal on the next process start.
+	factor := int64(attempts)
+	if factor > math.MaxInt64/3 {
+		return maximum
+	}
+	factor *= 3
+	if attemptTimeout > maximum/time.Duration(factor) {
+		return maximum
+	}
+	timeout := attemptTimeout * time.Duration(factor)
+	if timeout < minimum {
+		return minimum
+	}
+	return timeout
+}
+
+const replicatedCatalogControllerTenant = byte(1)
 
 func decodeFixedHex(encoded string, destination []byte) error {
 	if len(encoded) != hex.EncodedLen(len(destination)) {
@@ -612,85 +1212,6 @@ func decodeFixedHex(encoded string, destination []byte) error {
 		return gateway.ErrReplicatedCatalog
 	}
 	return nil
-}
-
-type gatewayControllerTriggerClient struct {
-	tls            *rafttransport.PeerTLS
-	plaintext      bool
-	handshake      time.Duration
-	maxConnections int
-	maxHandshakes  int
-}
-
-func (client *gatewayControllerTriggerClient) TriggerSplitController(
-	ctx context.Context, route gateway.ReplicatedRoute, request shardcontrol.Request,
-) (shardcontrol.Response, error) {
-	if client == nil || ctx == nil {
-		return shardcontrol.Response{}, splitcontroller.ErrControllerTrigger
-	}
-	var last error
-	for _, replica := range route.Replicas {
-		var dial shardcontrol.Dial
-		var secure *servicetls.Client
-		if client.plaintext {
-			dial = func(ctx context.Context, address string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-			}
-		} else {
-			var err error
-			secure, err = servicetls.NewClient(servicetls.ClientOptions{
-				TLS: client.tls, Class: rafttransport.TrafficShardControl,
-				Endpoints: []servicetls.Endpoint{{Address: replica.ControlAddress, Node: replica.Node}},
-				Dial: func(ctx context.Context, address string) (net.Conn, error) {
-					return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-				},
-				HandshakeDeadline: servicetls.FixedDeadline(client.handshake),
-				MaxConnections:    min(client.maxConnections, 8),
-				MaxHandshakes:     min(client.maxHandshakes, 8),
-			})
-			if err != nil {
-				return shardcontrol.Response{}, err
-			}
-			dial = secure.Dial
-		}
-		protocol, err := shardcontrol.NewClient(dial, replica.ControlAddress, client.handshake)
-		if err == nil {
-			var response shardcontrol.Response
-			response, err = protocol.Execute(ctx, request)
-			if secure != nil {
-				_ = secure.Close()
-			}
-			if err == nil {
-				return response, nil
-			}
-		} else if secure != nil {
-			_ = secure.Close()
-		}
-		last = errors.Join(last, err)
-	}
-	return shardcontrol.Response{}, errors.Join(last, splitcontroller.ErrControllerTrigger)
-}
-
-func runSplitController(
-	ctx context.Context, directory splitcontroller.ControllerDirectory,
-	client splitcontroller.ControllerTriggerClient, interval time.Duration,
-	logf func(string, ...any),
-) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		pass, err := splitcontroller.RunControllerPass(ctx, directory, client)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logf("gateway: split controller: %v", err)
-		} else if pass.Triggered != 0 {
-			logf("gateway: split controller triggered %d/%d operation(s)", pass.Triggered, pass.Discovered)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
 }
 
 // serveGateway accepts connections until ctx is canceled, then closes the
@@ -707,7 +1228,18 @@ func serveGatewayData(
 	data nativeDataReader,
 	logf func(string, ...any),
 ) error {
-	startGatewayRecovery(ctx, exec, logf)
+	return serveGatewayDurableData(ctx, listener, exec, data, nil, logf)
+}
+
+func serveGatewayDurableData(
+	ctx context.Context,
+	listener net.Listener,
+	exec *gateway.Executor,
+	data nativeDataReader,
+	durable durableRequestService,
+	logf func(string, ...any),
+) error {
+	recoveryDone := startGatewayRecovery(ctx, exec, logf)
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
 	go func() {
@@ -721,6 +1253,7 @@ func serveGatewayData(
 		if err != nil {
 			wg.Wait()
 			if ctx.Err() != nil {
+				<-recoveryDone
 				return nil
 			}
 			return err
@@ -728,38 +1261,29 @@ func serveGatewayData(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConnData(ctx, conn, exec, data, logf)
+			handleConnPolicyDurable(ctx, conn, exec, data, durable, logf, nil)
 		}()
 	}
 }
 
-func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func(string, ...any)) {
-	go exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
-		if err != nil {
-			logf("gateway: transaction recovery: %v", err)
-		}
-		if len(results) != 0 {
-			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
-		}
-	})
+func startGatewayRecovery(
+	ctx context.Context,
+	exec *gateway.Executor,
+	logf func(string, ...any),
+) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			resolved, err := exec.RecoverReplicatedTransactionRequests(ctx)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				logf("gateway: RF3 transaction recovery: %v", err)
+		defer close(done)
+		exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
+			if err != nil {
+				logf("gateway: transaction recovery: %v", err)
 			}
-			if resolved != 0 {
-				logf("gateway: RF3 transaction recovery attempted %d request(s)", resolved)
+			if len(results) != 0 {
+				logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
+		})
 	}()
+	return done
 }
 
 func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
@@ -776,11 +1300,31 @@ func serveAuthenticatedGatewayData(
 	limits gateway.ClientTLSLimits,
 	logf func(string, ...any),
 ) error {
-	startGatewayRecovery(ctx, exec, logf)
-	return capability.ServeAuthorizedClients(ctx, listener, limits,
+	return serveAuthenticatedGatewayDurableData(ctx, listener, exec, data, nil, capability, limits, logf)
+}
+
+func serveAuthenticatedGatewayDurableData(
+	ctx context.Context,
+	listener net.Listener,
+	exec *gateway.Executor,
+	data nativeDataReader,
+	durable durableRequestService,
+	capability *gateway.ClientTLS,
+	limits gateway.ClientTLSLimits,
+	logf func(string, ...any),
+) error {
+	recoveryDone := startGatewayRecovery(ctx, exec, logf)
+	err := capability.ServeAuthorizedClients(ctx, listener, limits,
 		func(ctx context.Context, connection net.Conn) {
-			handleConnAuthorizedData(ctx, connection, exec, data, capability, logf)
+			handleConnPolicyDurable(ctx, connection, exec, data, durable, logf,
+				func(required serviceauthz.Capability) bool {
+					return capability.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
+				})
 		})
+	if ctx.Err() != nil {
+		<-recoveryDone
+	}
+	return err
 }
 
 func handleConnAuthorized(ctx context.Context, conn net.Conn, exec *gateway.Executor,
@@ -809,6 +1353,13 @@ func handleConnData(ctx context.Context, conn net.Conn, exec *gateway.Executor,
 
 func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor,
 	data nativeDataReader, logf func(string, ...any), authorize func(serviceauthz.Capability) bool) {
+	handleConnPolicyDurable(ctx, conn, exec, data, nil, logf, authorize)
+}
+
+func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.Executor,
+	data nativeDataReader, durable durableRequestService, logf func(string, ...any),
+	authorize func(serviceauthz.Capability) bool,
+) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
@@ -818,8 +1369,85 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 	writer := vibejson.NewWriter(conn)
 	var nativeRequest nativeDataWireRequest
 	var nativeResponseScratch nativeDataResponseScratch
+	var req serveRequest
+	var requestScratch serveRequestDecodeScratch
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		structuredExecCandidate := durableExecBatchRequestCandidate(line)
+		backupCandidate := gatewayBackupRequestCandidate(line)
+		backupValid := backupCandidate && validateGatewayBackupEnvelope(line) == nil
+		if issuerOpenRequestCandidate(line) {
+			var request issuerOpenWireRequest
+			authority, authenticated := serviceauthz.FromContext(ctx)
+			if decodeIssuerOpenRequest(line, &request) != nil || !authenticated {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidIssuerOpen.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if authorize != nil && !authorize(serviceauthz.CapabilityDataWrite) {
+				if writeServeResponse(writer, &serveResponse{Error: "authorization denied"}) != nil {
+					return
+				}
+				continue
+			}
+			if durable == nil {
+				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			result, openErr := durable.OpenIssuer(ctx, authority, request.Open)
+			if openErr != nil || result.Installation != request.Open.Installation ||
+				result.Epoch != request.Open.Epoch || result.LaneOrdinal != request.Open.LaneOrdinal ||
+				result.GrantDigest == (replication.Digest{}) {
+				message := errDurableExecBatchUnavailable.Error()
+				if openErr != nil {
+					message = openErr.Error()
+				}
+				if writeServeResponse(writer, &serveResponse{Error: message}) != nil {
+					return
+				}
+				continue
+			}
+			if writeIssuerOpenResponse(writer, result) != nil {
+				return
+			}
+			continue
+		}
+		if durableExecBatchAckRequestCandidate(line) {
+			var request durableExecBatchAckWireRequest
+			authority, authenticated := serviceauthz.FromContext(ctx)
+			if decodeDurableExecBatchAckRequest(line, &request) != nil || !authenticated {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidDurableExecBatchAckRequest.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if authorize != nil && !authorize(serviceauthz.CapabilityDataWrite) {
+				if writeServeResponse(writer, &serveResponse{Error: "authorization denied"}) != nil {
+					return
+				}
+				continue
+			}
+			if durable == nil {
+				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			response, ackErr := durable.AckExecBatch(ctx, authority, request)
+			if ackErr != nil {
+				if writeServeResponse(writer, &serveResponse{Error: ackErr.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if writeDurableExecBatchAckResponse(writer, &response) != nil {
+				return
+			}
+			continue
+		}
 		if nativeDataRequestCandidate(line) {
 			if err := decodeNativeDataRequest(line, &nativeRequest); err != nil {
 				response := nativeDataError(nativeDataResponseInvalidRequest, false)
@@ -855,10 +1483,21 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 			}
 			continue
 		}
-		var req serveRequest
-		if err := vibejson.Unmarshal(line, &req); err != nil {
+		var decodeErr error
+		if structuredExecCandidate {
+			decodeErr = decodeDurableExecBatchRequest(line, &req, &requestScratch)
+			if decodeErr != nil {
+				// Preserve the public error-response contract for malformed
+				// structured input. Valid exec_batch requests take exactly one
+				// decode pass; only rejected input pays this diagnostic fallback.
+				decodeErr = decodeServeRequest(line, &req, &requestScratch)
+			}
+		} else {
+			decodeErr = decodeServeRequest(line, &req, &requestScratch)
+		}
+		if decodeErr != nil {
 			if ctx.Err() == nil {
-				logf("gateway: decode request: %v", err)
+				logf("gateway: decode request: %v", decodeErr)
 			}
 			return
 		}
@@ -872,8 +1511,116 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 			}
 			continue
 		}
+		if req.Op == "read_batch" {
+			batchRequest, buildErr := buildNativeSQLBatchReadRequest(req)
+			if buildErr != nil {
+				response := nativeDataError(nativeDataResponseInvalidRequest, false)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			if authorize != nil && !authorize(serviceauthz.CapabilityDataRead) {
+				response := nativeDataError(nativeDataResponseUnauthorized, false)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			batchReader, available := data.(nativeSQLBatchReader)
+			if !available {
+				response := nativeDataError(nativeDataResponseUnavailable, true)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			result, readErr := batchReader.ReadSQLBatch(ctx, batchRequest)
+			if readErr != nil {
+				response := nativeDataResponseForError(readErr)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			response := nativeSQLBatchWireResponse{
+				Result: &result, Expected: len(batchRequest.Queries), Maximum: batchRequest.MaxResultBytes,
+			}
+			validationErr := validateNativeSQLBatchResponse(&response)
+			if validationErr != nil {
+				result.Release()
+				encoded := nativeDataResponseForError(validationErr)
+				if writeNativeDataConnResponse(conn, &encoded, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			writeErr := writeNativeSQLBatchConnResponse(
+				conn, writer, &response, defaultNativeResponseWriteTimeout,
+			)
+			result.Release()
+			if writeErr != nil {
+				if ctx.Err() == nil {
+					logf("gateway: encode replicated SQL batch response: %v", writeErr)
+				}
+				return
+			}
+			continue
+		}
 		if authorize != nil && !authorize(serveRequestCapability(&req)) {
 			if err := writeServeResponse(writer, &serveResponse{Error: "authorization denied"}); err != nil {
+				return
+			}
+			continue
+		}
+		if req.Op == "metrics" {
+			if !validGatewayMetricsRequest(req) {
+				if writeServeResponse(writer, &serveResponse{Error: "invalid metrics request"}) != nil {
+					return
+				}
+				continue
+			}
+			metrics := exec.Metrics()
+			if writeServeResponse(writer, &serveResponse{Metrics: &metrics,
+				DistributedMetrics: gatewayDistributedMetricsFromContext(ctx),
+				ControllerMetrics:  gatewayControllerMetricsFromContext(ctx)}) != nil {
+				return
+			}
+			continue
+		}
+		if req.Op == "backup" || req.Op == "backup_status" {
+			if !backupCandidate || !backupValid {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidGatewayBackupRequest.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if writeServeResponse(writer, executeGatewayBackup(
+				ctx, gatewayBackupOperatorFromContext(ctx), req,
+			)) != nil {
+				return
+			}
+			continue
+		}
+		if req.Op == "exec_batch" {
+			// The public RF3 batch endpoint is durable-only. Raw identity-field
+			// presence must never be inferred from decoded nonzero values: an
+			// explicit zero/empty field is malformed structured input, not a
+			// downgrade to the legacy unsequenced executor.
+			if !structuredExecCandidate || !req.wireIdentitySet {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidDurableExecBatch.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			authority, authenticated := serviceauthz.FromContext(ctx)
+			if !authenticated {
+				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if err := writeServeResponse(writer, executeDurableExecBatch(ctx, durable, authority, req)); err != nil {
 				return
 			}
 			continue
@@ -960,12 +1707,18 @@ func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
 	if request == nil {
 		return 0
 	}
+	if request.Op == "metrics" {
+		return serviceauthz.CapabilityTopology
+	}
+	if request.Op == "backup" || request.Op == "backup_status" {
+		return serviceauthz.CapabilityBackup
+	}
 	var required serviceauthz.Capability
-	if request.SQL != "" {
-		required = serviceauthz.SQLCapability(request.SQL)
+	if request.hasSQL() {
+		required = serviceauthz.SQLCapability(request.sqlText())
 	}
 	for index := range request.Statements {
-		required |= serviceauthz.SQLCapability(request.Statements[index].SQL)
+		required |= serviceauthz.SQLCapability(request.Statements[index].sqlText())
 	}
 	return required
 }
@@ -979,6 +1732,9 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 	hasTransaction := resp.TransactionID != (replication.ID128{})
 	hasOutcome := resp.Committed || resp.OutcomeUnknown
 	if hasTransaction != hasOutcome || resp.Committed && resp.OutcomeUnknown {
+		return errServeResponseTransactionState
+	}
+	if resp.DurableAck != nil && (!resp.Committed || !validDurableExecBatchAckRequest(resp.DurableAck)) {
 		return errServeResponseTransactionState
 	}
 	if err := w.BeginObject(); err != nil {
@@ -1095,6 +1851,78 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 			return err
 		}
 	}
+	if resp.DurableAck != nil {
+		ack := resp.DurableAck
+		if err := writeDurableExecBatchAckHexField(w, "request_id", ack.Identity.RequestID[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "request_digest", ack.Identity.RequestDigest[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "installation_id", ack.Identity.Reference.Installation[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "issuer_epoch", ack.Identity.Reference.Epoch); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "lane_ordinal", uint64(ack.Identity.Reference.LaneOrdinal)); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "grant_digest", ack.Identity.Reference.GrantDigest[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "issuer_sequence", ack.Identity.IssuerSequence); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "terminal_revision", ack.TerminalRevision); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "result_digest", ack.ResultDigest[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "ack_token", ack.AckToken[:]); err != nil {
+			return err
+		}
+	}
+	if resp.Metrics != nil {
+		if err := writeGatewayMetrics(w, *resp.Metrics); err != nil {
+			return err
+		}
+	}
+	if resp.DistributedMetrics != nil {
+		if err := writeGatewayDistributedMetrics(w, resp.DistributedMetrics); err != nil {
+			return err
+		}
+	}
+	if resp.ControllerMetrics != nil {
+		if err := writeGatewayControllerMetrics(w, resp.ControllerMetrics.Snapshot()); err != nil {
+			return err
+		}
+	}
+	if resp.BackupID != ([32]byte{}) {
+		if err := w.Key("backup_id"); err != nil {
+			return err
+		}
+		if err := writeNativeHex(w, resp.BackupID[:]); err != nil {
+			return err
+		}
+	}
+	if resp.BackupStage != 0 {
+		if err := w.Key("backup_stage"); err != nil {
+			return err
+		}
+		if err := w.Uint(resp.BackupStage); err != nil {
+			return err
+		}
+	}
+	if resp.BackupProof != ([32]byte{}) {
+		if err := w.Key("backup_proof"); err != nil {
+			return err
+		}
+		if err := writeNativeHex(w, resp.BackupProof[:]); err != nil {
+			return err
+		}
+	}
 	if err := stringField("error", resp.Error); err != nil {
 		return err
 	}
@@ -1114,18 +1942,10 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 	var err error
 	switch req.Op {
 	case "exec_batch":
-		queries, buildErr := buildBatchQueries(req)
-		if buildErr != nil {
-			return &serveResponse{Error: buildErr.Error()}
-		}
-		var requestID replication.ID128
-		if req.RequestID != "" {
-			if decodeFixedHex(req.RequestID, requestID[:]) != nil ||
-				requestID == (replication.ID128{}) {
-				return &serveResponse{Error: gateway.ErrReplicatedTransactionRequestRegistry.Error()}
-			}
-		}
-		res, err = exec.ExecBatchRequest(ctx, requestID, queries)
+		// Public exec_batch is admitted only by handleConnPolicyDurable after
+		// strict raw GrantReference validation. No decoded request can enter an
+		// unsequenced fallback through this helper.
+		return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
 	case "exec":
 		// The write path routes the statement to its single owning shard and
 		// refuses every scatter before any dispatch.
@@ -1144,20 +1964,13 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 		return &serveResponse{Error: fmt.Sprintf("unknown operation %q", req.Op)}
 	}
 	if err != nil {
-		response := &serveResponse{Error: err.Error()}
-		var transactionErr *gateway.ReplicatedTransactionError
-		if errors.As(err, &transactionErr) && transactionErr.ID != (distributedtxn.ID{}) {
-			response.TransactionID = replication.ID128(transactionErr.ID)
-			response.Committed = transactionErr.Committed
-			response.OutcomeUnknown = !transactionErr.Committed
-		}
-		return response
+		return &serveResponse{Error: err.Error()}
 	}
 	return encodeResult(res)
 }
 
 func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
-	if req.SQL != "" || len(req.Params) != 0 {
+	if req.hasSQL() || len(req.Params) != 0 || req.MaxResultBytes != 0 {
 		return nil, errors.New("exec_batch uses statements instead of top-level sql or params")
 	}
 	if len(req.Statements) == 0 {
@@ -1173,7 +1986,7 @@ func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
 		if err != nil {
 			return nil, fmt.Errorf("statement %d: %w", i, err)
 		}
-		queries[i] = gateway.Query{SQL: req.Statements[i].SQL, Params: params, Class: class}
+		queries[i] = gateway.Query{SQL: req.Statements[i].sqlText(), Params: params, Class: class}
 	}
 	return queries, nil
 }
@@ -1182,6 +1995,9 @@ func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
 // ordering, and limiting are deliberately absent here: the executor derives
 // them from SQL against its pinned catalog generation.
 func buildQuery(req serveRequest) (gateway.Query, error) {
+	if req.MaxResultBytes != 0 {
+		return gateway.Query{}, errors.New("max_result_bytes is only valid for read_batch")
+	}
 	params, err := buildParams(req.Params)
 	if err != nil {
 		return gateway.Query{}, err
@@ -1191,7 +2007,7 @@ func buildQuery(req serveRequest) (gateway.Query, error) {
 		return gateway.Query{}, err
 	}
 	return gateway.Query{
-		SQL:    req.SQL,
+		SQL:    req.sqlText(),
 		Params: params,
 		Class:  class,
 	}, nil
@@ -1205,17 +2021,32 @@ func buildParams(in []serveParam) ([]shardservice.Param, error) {
 	}
 	out := make([]shardservice.Param, len(in))
 	for i, p := range in {
-		switch p.Kind {
-		case "null":
+		kind := p.wireKind
+		if kind == 0 {
+			switch p.Kind {
+			case "null":
+				kind = serveParamNull
+			case "bool":
+				kind = serveParamBool
+			case "number":
+				kind = serveParamNumber
+			case "string":
+				kind = serveParamString
+			case "document":
+				kind = serveParamDocument
+			}
+		}
+		switch kind {
+		case serveParamNull:
 			out[i] = shardservice.NullParam()
-		case "bool":
+		case serveParamBool:
 			out[i] = shardservice.BoolParam(p.Bool)
-		case "number":
-			out[i] = shardservice.NumberParam(p.Text)
-		case "string":
-			out[i] = shardservice.StringParam(p.Text)
-		case "document":
-			out[i] = shardservice.DocumentParam(p.Text)
+		case serveParamNumber:
+			out[i] = shardservice.NumberParam(p.textValue())
+		case serveParamString:
+			out[i] = shardservice.StringParam(p.textValue())
+		case serveParamDocument:
+			out[i] = shardservice.DocumentParam(p.textValue())
 		default:
 			return nil, fmt.Errorf("unknown parameter kind %q", p.Kind)
 		}

@@ -28,10 +28,61 @@ type ReplicatedOperationJournal interface {
 // stable split OperationID and fixed action tuple are its complete retry key.
 type ReplicatedActionExecutor func(context.Context, OperationID, Action) error
 
+// AdmitReplicatedPlan publishes the immutable split intent into catalog RF3
+// without guessing its first data-plane action. The source that owns the
+// range binds Cursor and Proof from one coherent observation before execution.
+// Repeating admission for the same exact plan is idempotent; any conflicting
+// record for the operation identity fails closed.
+func AdmitReplicatedPlan(
+	ctx context.Context,
+	journal ReplicatedOperationJournal,
+	catalog *gateway.Snapshot,
+	plan *Plan,
+) (gateway.ReplicatedOperationRecord, error) {
+	if ctx == nil || journal == nil || catalog == nil || plan == nil ||
+		catalog.Generation() != plan.current {
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedExecution
+	}
+	intent, err := AppendPlanIntent(nil, catalog, plan)
+	if err != nil {
+		return gateway.ReplicatedOperationRecord{}, errors.Join(ErrReplicatedExecution, err)
+	}
+	record := gateway.ReplicatedOperationRecord{
+		ID: [32]byte(plan.OperationID()), Kind: gateway.ReplicatedOperationSplit,
+		State: gateway.ReplicatedOperationPlanned, Revision: 1,
+		CatalogGeneration: catalog.Generation(), IntentDigest: sha256.Sum256(intent),
+		Intent: intent,
+	}
+	record.Cursor = preparationCursor(preparationPending)
+	record.Proof = preparationProof(record.ID, record.IntentDigest, preparationPending)
+	if !record.Valid() {
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedExecution
+	}
+	existing, readErr := journal.ReadOperation(ctx, record.ID)
+	switch {
+	case errors.Is(readErr, gateway.ErrReplicatedOperationMissing):
+		if err := settleReplicatedOperationSubmit(ctx, journal, record); err != nil {
+			return gateway.ReplicatedOperationRecord{}, err
+		}
+		return record, nil
+	case readErr != nil:
+		return gateway.ReplicatedOperationRecord{}, readErr
+	case existing.ID == record.ID && existing.Kind == record.Kind &&
+		existing.Revision >= record.Revision &&
+		existing.CatalogGeneration >= record.CatalogGeneration &&
+		existing.CatalogGeneration <= record.CatalogGeneration+1 &&
+		existing.IntentDigest == record.IntentDigest && bytes.Equal(existing.Intent, record.Intent) &&
+		existing.State >= gateway.ReplicatedOperationPlanned &&
+		existing.State <= gateway.ReplicatedOperationComplete:
+		return existing, nil
+	default:
+		return gateway.ReplicatedOperationRecord{}, ErrReplicatedExecution
+	}
+}
+
 // ExecuteReplicatedStep records intent in the catalog RF3 group before invoking
-// one reconciled action. On restart, a Running record is re-executed only when
-// observation still requests the same action; when durable observation has
-// advanced, the record itself advances to the next planned action.
+// one reconciled action. On restart, an outcome-unknown remote wave settles
+// before observation may advance the operation to the next planned action.
 func ExecuteReplicatedStep(
 	ctx context.Context,
 	journal ReplicatedOperationJournal,
@@ -78,7 +129,16 @@ func ExecuteReplicatedStep(
 		record.State > gateway.ReplicatedOperationComplete:
 		return Action{}, ErrReplicatedExecution
 	case record.Cursor != wantCursor || record.Proof != wantProof:
-		if record.State != gateway.ReplicatedOperationRunning {
+		if len(record.Execution) != 0 && !record.ExecutionSettled {
+			prior, err := pendingRemoteAction(record)
+			if err != nil {
+				return Action{}, err
+			}
+			return prior, execute(ctx, plan.OperationID(), prior)
+		}
+		unbound := record.Cursor == preparationCursor(preparationPending) && record.Proof == preparationProof(id, intentDigest, preparationPending)
+		if record.State != gateway.ReplicatedOperationRunning &&
+			!(record.State == gateway.ReplicatedOperationPlanned && unbound) {
 			return Action{}, ErrReplicatedExecution
 		}
 		next := record
@@ -86,6 +146,7 @@ func ExecuteReplicatedStep(
 		next.Revision++
 		next.CatalogGeneration = observed.Catalog.Generation()
 		next.Cursor, next.Proof = wantCursor, wantProof
+		next.Execution, next.ExecutionRevision, next.ExecutionSettled = nil, 0, false
 		if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 			return Action{}, err
 		}
@@ -95,11 +156,15 @@ func ExecuteReplicatedStep(
 		if record.State != gateway.ReplicatedOperationComplete {
 			next := record
 			next.State = gateway.ReplicatedOperationComplete
+			next.Execution, next.ExecutionRevision, next.ExecutionSettled = nil, 0, false
 			next.Revision++
 			if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 				return Action{}, err
 			}
 			record = next
+		}
+		if err := execute(ctx, plan.OperationID(), action); err != nil {
+			return Action{}, err
 		}
 		if err := settleReplicatedOperationDelete(ctx, journal, record); err != nil {
 			return Action{}, err

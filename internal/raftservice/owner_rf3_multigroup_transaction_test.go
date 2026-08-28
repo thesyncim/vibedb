@@ -11,11 +11,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
+	"math/bits"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -141,15 +143,20 @@ func newPeerServerTestTLS(
 }
 
 const (
-	multiGroupRF3Groups = 2
-	multiGroupRF3Voters = 3
+	multiGroupRF3Groups                              = 2
+	multiGroupRF3MaxGroups                           = 3
+	multiGroupRF3LedgerGroup                         = 2
+	multiGroupRF3Voters                              = 3
+	multiGroupRF3DurableSQLRequiredEnvironment       = "VIBEDB_DURABLE_SQL_RF3_E2E"
+	multiGroupRF3DurableSQLRequiredEnvironmentEnable = "1"
 )
 
 type multiGroupRF3Group struct {
-	key      raftmember.GroupKey
-	runtimes [multiGroupRF3Voters]*raftmember.Runtime
-	bases    [multiGroupRF3Voters]sqldriver.ReplicatedShardStoreIdentity
-	reads    [multiGroupRF3Voters]*sqldriver.ReplicatedApply
+	logicalSchema replication.Digest
+	key           raftmember.GroupKey
+	runtimes      [multiGroupRF3Voters]*raftmember.Runtime
+	bases         [multiGroupRF3Voters]sqldriver.ReplicatedShardStoreIdentity
+	reads         [multiGroupRF3Voters]*sqldriver.ReplicatedApply
 }
 
 type multiGroupRF3Trace struct {
@@ -262,7 +269,8 @@ func (network *multiGroupRF3Network) close() {
 }
 
 type multiGroupTransactionRF3Cluster struct {
-	groups     [multiGroupRF3Groups]multiGroupRF3Group
+	groups     [multiGroupRF3MaxGroups]multiGroupRF3Group
+	groupCount int
 	owners     [multiGroupRF3Voters]*Owner
 	peers      [multiGroupRF3Voters]*AuthenticatedPeerRuntime
 	contexts   [multiGroupRF3Voters]context.Context
@@ -280,6 +288,7 @@ type multiGroupTransactionRF3Cluster struct {
 func (cluster *multiGroupTransactionRF3Cluster) route(group int) gateway.ReplicatedRoute {
 	base := cluster.groups[group].bases[0]
 	route := gateway.ReplicatedRoute{
+		LogicalSchemaDigest:  cluster.groups[group].logicalSchema,
 		Distribution:         distribution.DistributionName(base.Binding.Distribution),
 		Shard:                distribution.ShardID(base.Binding.Shard),
 		Group:                cluster.groups[group].key,
@@ -287,6 +296,13 @@ func (cluster *multiGroupTransactionRF3Cluster) route(group int) gateway.Replica
 		Command:              rf3CommandFence(cluster.groups[group].runtimes[0].Identity(), base),
 		Replicas:             make([]gateway.ReplicatedEndpoint, 0, multiGroupRF3Voters),
 	}
+	route.RangeIdentity = multiGroupRF3RangeIdentity(group)
+	route.LineageDigest = multiGroupRF3RouteDigest(
+		"vibedb/test/multiraft-route-lineage/format-0\x00", route.RangeIdentity,
+	)
+	route.ForwardingRuleDigest = multiGroupRF3RouteDigest(
+		"vibedb/test/multiraft-route-forwarding/format-0\x00", route.RangeIdentity,
+	)
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		identity := cluster.groups[group].runtimes[member].Identity()
 		address := "rf3-owner-" + string(rune('1'+member))
@@ -341,7 +357,7 @@ type multiGroupRF3RoundTripper struct {
 	hiddenMember  int
 	hiddenCommand []byte
 	trace         []multiGroupRF3GatewayTrace
-	recoveryReads [multiGroupRF3Groups]int
+	recoveryReads [multiGroupRF3MaxGroups]int
 }
 
 func newMultiGroupRF3RoundTripper(
@@ -370,7 +386,7 @@ func (client *multiGroupRF3RoundTripper) DoReplicated(
 		return nil, errors.New("RF3 gateway test endpoint member is outside the cluster")
 	}
 	group := -1
-	for candidate := 0; candidate < multiGroupRF3Groups; candidate++ {
+	for candidate := 0; candidate < client.cluster.groupCount; candidate++ {
 		if request.Fence.Group == client.cluster.groups[candidate].key {
 			group = candidate
 			break
@@ -392,11 +408,13 @@ func (client *multiGroupRF3RoundTripper) DoReplicated(
 		if err != nil {
 			return nil, err
 		}
-		control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
-		if err != nil {
-			return nil, err
+		if command.Kind() == replication.CommandTransaction {
+			control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
+			if err != nil {
+				return nil, err
+			}
+			operation = control.Operation
 		}
-		operation = control.Operation
 		client.mu.Lock()
 		client.trace = append(client.trace, multiGroupRF3GatewayTrace{
 			group: group, member: member, operation: operation,
@@ -457,10 +475,22 @@ func (client *multiGroupRF3RoundTripper) gatewayTrace() []multiGroupRF3GatewayTr
 }
 
 func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3Cluster {
+	return newMultiGroupRF3Cluster(t, multiGroupRF3Groups)
+}
+
+func newMultiGroupRF3Cluster(
+	t testing.TB,
+	groupCount int,
+) *multiGroupTransactionRF3Cluster {
 	t.Helper()
-	cluster := &multiGroupTransactionRF3Cluster{stopPulses: make(chan struct{})}
+	if groupCount <= 0 || groupCount > multiGroupRF3MaxGroups {
+		t.Fatalf("RF3 group count %d is outside [1,%d]", groupCount, multiGroupRF3MaxGroups)
+	}
+	cluster := &multiGroupTransactionRF3Cluster{
+		groupCount: groupCount, stopPulses: make(chan struct{}),
+	}
 	cluster.network.conns = make(map[*multiGroupRF3Conn]struct{})
-	for group := 0; group < multiGroupRF3Groups; group++ {
+	for group := 0; group < cluster.groupCount; group++ {
 		for member := 0; member < multiGroupRF3Voters; member++ {
 			cluster.groups[group].runtimes[member], cluster.groups[group].bases[member],
 				cluster.groups[group].reads[member] = newMultiGroupRF3Runtime(
@@ -468,16 +498,25 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 			)
 		}
 		cluster.groups[group].key = cluster.groups[group].runtimes[0].Identity().Group
+		logical, err := sqldriver.ReplicatedRelationManifestDigest(cluster.groups[group].bases[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cluster.groups[group].logicalSchema = replication.Digest(logical)
 	}
-	if cluster.groups[0].key == cluster.groups[1].key {
-		t.Fatal("two RF3 groups share one logical identity")
+	for group := 0; group < cluster.groupCount; group++ {
+		for prior := 0; prior < group; prior++ {
+			if cluster.groups[group].key == cluster.groups[prior].key {
+				t.Fatalf("RF3 groups %d and %d share one logical identity", prior, group)
+			}
+		}
 	}
 
 	var nodes [multiGroupRF3Voters]rafttransport.NodeID
-	members := make([]rafttransport.Member, 0, multiGroupRF3Groups*multiGroupRF3Voters)
+	members := make([]rafttransport.Member, 0, cluster.groupCount*multiGroupRF3Voters)
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		nodes[member][0] = byte(member + 1)
-		for group := 0; group < multiGroupRF3Groups; group++ {
+		for group := 0; group < cluster.groupCount; group++ {
 			members = append(members, rafttransport.Member{
 				Group: cluster.groups[group].key, ReplicaSetVersion: 1,
 				MemberID: uint64(member + 1), Node: nodes[member],
@@ -489,7 +528,7 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		registry, err := rafttransport.NewStaticRegistry(
 			nodes[member], members,
-			rafttransport.Limits{MaxGroups: multiGroupRF3Groups, MaxMembers: len(members)},
+			rafttransport.Limits{MaxGroups: cluster.groupCount, MaxMembers: len(members)},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -514,7 +553,7 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		serving, err := raftserve.NewRegistry(raftserve.Limits{
-			MaxGroups: 2, MaxOutstandingIdentities: 64,
+			MaxGroups: multiGroupRF3MaxGroups, MaxOutstandingIdentities: 64,
 			MaxOutstandingAttempts: 128, MaxWaiters: 128,
 			MaxAttemptsPerIdentity:     4,
 			MaxRetainedCompletionBytes: 64 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
@@ -526,11 +565,11 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 		if err != nil {
 			t.Fatal(err)
 		}
-		identities := make([]raftmember.RuntimeIdentity, 0, multiGroupRF3Groups)
-		fences := make([]CommandFence, 0, multiGroupRF3Groups)
-		reads := make([]ReadSource, 0, multiGroupRF3Groups)
-		recovery := make([]TransactionRecoverySource, 0, multiGroupRF3Groups)
-		for group := 0; group < multiGroupRF3Groups; group++ {
+		identities := make([]raftmember.RuntimeIdentity, 0, cluster.groupCount)
+		fences := make([]CommandFence, 0, cluster.groupCount)
+		reads := make([]ReadSource, 0, cluster.groupCount)
+		recovery := make([]TransactionRecoverySource, 0, cluster.groupCount)
+		for group := 0; group < cluster.groupCount; group++ {
 			runtime := cluster.groups[group].runtimes[member]
 			if err := host.Add(runtime); err != nil {
 				t.Fatal(err)
@@ -625,7 +664,10 @@ func (cluster *multiGroupTransactionRF3Cluster) close(t testing.TB) {
 	}
 	for member, done := range cluster.runErrors {
 		select {
-		case <-done:
+		case err := <-done:
+			if t.Failed() {
+				t.Logf("multi-group RF3 peer %d terminal error: %v", member, err)
+			}
 		case <-time.After(10 * time.Second):
 			t.Errorf("multi-group RF3 owner %d did not stop", member)
 		}
@@ -680,7 +722,7 @@ func (cluster *multiGroupTransactionRF3Cluster) proposalTrace() []multiGroupRF3T
 
 func multiGroupRF3HostLimits() multiraft.Limits {
 	return multiraft.Limits{
-		MaxGroups: 2, MaxQueueItems: 512, MaxQueueBytes: 256 << 20,
+		MaxGroups: multiGroupRF3MaxGroups, MaxQueueItems: 512, MaxQueueBytes: 256 << 20,
 		MaxGroupItems: 256, MaxGroupBytes: 128 << 20,
 		MaxOutboxItems: 512, MaxOutboxBytes: 256 << 20,
 		MaxPendingTicks: 16,
@@ -835,6 +877,12 @@ func rf3Command(
 	return command
 }
 
+func rf3SessionOpenCommand(base sqldriver.ReplicatedShardStoreIdentity) replication.Command {
+	command := rf3Command(base, replication.CommandSessionOpen, 0, 1, nil)
+	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+	return command
+}
+
 func rf3TransactionCommand(
 	t testing.TB,
 	base sqldriver.ReplicatedShardStoreIdentity,
@@ -842,6 +890,10 @@ func rf3TransactionCommand(
 	batches []replication.RelationMutationBatch,
 ) []byte {
 	t.Helper()
+	// This direct-kernel fixture has one fixed controller tenure. Every
+	// transition binds the same immutable execution witness for its transaction.
+	control.ControllerEpoch = 1
+	control.ExecutionPinDigest = distributedtxn.Digest(sha256.Sum256(control.ID[:]))
 	transaction, err := distributedtxn.AppendReplicatedCommand(nil, control)
 	if err != nil {
 		t.Fatal(err)
@@ -892,8 +944,8 @@ func newMultiGroupRF3Runtime(
 	memberID uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
-	shards := [...]string{"0000-7fff", "8000-ffff"}
-	distributions := [...]string{"orders-a", "orders-b"}
+	shards := [...]string{"0000-7fff", "8000-ffff", "request-ledger"}
+	distributions := [...]string{"orders-a", "orders-b", "durable-requests"}
 	identity := raftstore.Identity{
 		Distribution: distributions[group], Shard: shards[group],
 		AllocationGeneration: uint64(7 + group), MemberID: memberID,
@@ -958,22 +1010,35 @@ func newMultiGroupRF3Runtime(
 	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
 		_ = database.Close()
 		_ = wal.Close()
+		if os.Getenv("VIBEDB_RF3_QUORUM_QUALIFICATION") == "1" {
+			t.Fatalf("strict allocation required by RF3 quorum qualification: %v", err)
+		}
+		if os.Getenv(multiGroupRF3DurableSQLRequiredEnvironment) ==
+			multiGroupRF3DurableSQLRequiredEnvironmentEnable {
+			t.Fatalf("required strict allocation unsupported: %v", err)
+		}
 		t.Skipf("strict allocation unsupported: %v", err)
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	apply, _, err := raftmember.OpenPreparedApply(
-		wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
-			MaxSessions: 32, RetryWindow: 8,
-			TxnLimits: durable.TxnLimits{MaxCollections: 8, MaxDocuments: 1024, MaxBytes: 256 << 20},
-			Placement: sqldriver.ReplicatedPlacementProfile{
-				Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
-				TupleVersion:  distribution.CurrentTupleVersion,
-				MapperVersion: distribution.NativeMapperVersion,
-				Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
-			},
+	applyOptions := sqldriver.ReplicatedApplyOptions{
+		MaxSessions: 32, RetryWindow: 8,
+		TxnLimits: durable.TxnLimits{MaxCollections: 8, MaxDocuments: 1024, MaxBytes: 256 << 20},
+		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
+	}
+	if group == multiGroupRF3LedgerGroup {
+		applyOptions.RequestLedgerCapacityBytes = multiGroupRF3LedgerCapacityBytes
+		applyOptions.RequestLedgerCleanupReserveBytes = multiGroupRF3LedgerCleanupReserveBytes
+		applyOptions.RequestLedgerRangeIdentity = multiGroupRF3RequestLedgerRangeIdentity(group)
+	}
+	apply, _, err := raftmember.OpenPreparedApply(
+		wal, database, authority, base, applyOptions,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1010,8 +1075,7 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	}
 
 	for group, leader := range []int{leader0, leader1} {
-		open := rf3Command(cluster.groups[group].bases[leader], replication.CommandSessionOpen, 0, 1, nil)
-		open.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+		open := rf3SessionOpenCommand(cluster.groups[group].bases[leader])
 		result, err := cluster.submit(ctx, group, leader, appendRF3Command(t, open), multiGroupRF3NoFault)
 		if err != nil {
 			t.Fatalf("group %d session open: %v", group, err)
@@ -1064,7 +1128,7 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: uint64(cluster.groups[0].bases[leader0].Binding.Authority.SchemaGeneration),
-		RecoveryDeadline:  time.Now().Add(time.Minute).UnixNano(), Participants: participants,
+		RecoveryDeadline:  int64(distributedtxn.MaxRecoveryPulses), Participants: participants,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1239,501 +1303,134 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	assertMultiGroupRF3Trace(t, cluster, commit, hiddenResult.Completion)
 }
 
-func TestPublicReplicatedTransactionOrchestratorRecoversHiddenRF3CommitAcrossTwoGroups(t *testing.T) {
-	cluster := newMultiGroupTransactionRF3Cluster(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	recoveryAuthority := serviceauthz.Authority{
-		Node: rafttransport.NodeID{0xee}, Generation: 1,
+// TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit enumerates the complete
+// three-voter reachability mask. Every majority cut must elect and commit; each
+// one-voter cut must return only a safe refusal or outcome-unknown timeout.
+// This is an in-process authenticated-transport fault gate. The external
+// shipped-process matrix remains separately disclosed in feature state.
+func TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit(t *testing.T) {
+	for activeMask := uint8(0); activeMask < 1<<multiGroupRF3Voters; activeMask++ {
+		t.Run(fmt.Sprintf("active_%03b", activeMask), func(t *testing.T) {
+			cluster := newMultiGroupRF3Cluster(t, 1)
+			active := make([]int, 0, multiGroupRF3Voters)
+			removed := make(map[int]bool, multiGroupRF3Voters)
+			for member := 0; member < multiGroupRF3Voters; member++ {
+				if activeMask&(1<<member) != 0 {
+					active = append(active, member)
+					continue
+				}
+				removed[member] = true
+				cluster.network.isolate(member)
+			}
+			if len(active) == 0 {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			candidate := active[0]
+			if err := cluster.owners[candidate].Campaign(ctx, cluster.groups[0].key); err != nil {
+				t.Fatal(err)
+			}
+			command := appendRF3Command(t, rf3SessionOpenCommand(cluster.groups[0].bases[candidate]))
+			if bits.OnesCount8(activeMask) >= 2 {
+				leader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[0].key)
+				result, err := cluster.submit(ctx, 0, leader, command, multiGroupRF3NoFault)
+				if err != nil || result.Outcome.AppliedIndex == 0 {
+					t.Fatalf("majority cut result=%+v err=%v", result.Outcome, err)
+				}
+				waitRF3Applied(t, ctx, cluster.owners[:], removed, cluster.groups[0].key,
+					result.Outcome.AppliedIndex)
+				return
+			}
+			minorityCtx, minorityCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			result, err := cluster.submit(minorityCtx, 0, candidate, command, multiGroupRF3NoFault)
+			minorityCancel()
+			// Cancellation may win before owner ingress. That is a definite
+			// non-admission, not an outcome-unknown proposal. Neither path may
+			// return a completion from the isolated minority.
+			preAdmissionTimeout := errors.Is(err, context.DeadlineExceeded) &&
+				!errors.Is(err, ErrOutcomeUnknown) && result.Outcome == (raftserve.Outcome{}) &&
+				len(result.Completion) == 0
+			if !multiGroupRF3SafeProposalIsolationError(err) && !preAdmissionTimeout {
+				t.Fatalf("minority cut error=%v", err)
+			}
+			if result.Outcome.AppliedIndex != 0 || len(result.Completion) != 0 {
+				t.Fatalf("minority cut returned an applied result: %+v", result.Outcome)
+			}
+		})
 	}
-	ctx, err := serviceauthz.WithAuthority(ctx, recoveryAuthority)
+}
+
+// This host-only preflight exercises the exact fixture constructors before any
+// strict-allocation setup can skip the RF3 fault tests on unsupported hosts.
+func TestMultiGroupRF3CommandFixturesPreflight(t *testing.T) {
+	base := sqldriver.ReplicatedShardStoreIdentity{Binding: sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
+		Distribution: "orders-a", Shard: "0000-7fff", AllocationGeneration: 7,
+		ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
+		Authority: sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11,
+			SchemaGeneration: 13, RoutingVersion: 17, RouteGeneration: 19,
+		},
+	}}
+	open, err := replication.OpenCommand(appendRF3Command(t, rf3SessionOpenCommand(base)))
+	if err != nil || open.Kind() != replication.CommandSessionOpen || open.ClientEpoch != 0 ||
+		open.ClientSequence != 1 || open.NextDeadlineUnixNano == 0 {
+		t.Fatalf("canonical session-open fixture: %+v, %v", open, err)
+	}
+	id := distributedtxn.ID{0x70, 0x32, 1}
+	key, ok := orderedkey.AppendJSONString(nil, []byte(`"fixture"`), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode fixture key")
+	}
+	batches := []replication.RelationMutationBatch{{Relation: 1,
+		Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual,
+			Key: key, Value: []byte(`{"id":"fixture"}`)}}}}
+	digest, err := replication.TransactionMutationDigest(batches)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cluster.owners[0].Campaign(ctx, cluster.groups[0].key); err != nil {
-		t.Fatal(err)
-	}
-	leader0 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
-	if err := cluster.owners[1].Campaign(ctx, cluster.groups[1].key); err != nil {
-		t.Fatal(err)
-	}
-	leader1 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[1].key)
-	leader0 = waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
-	if leader0 == leader1 {
-		t.Fatalf("two groups elected the same deliberately separated leader %d", leader0)
-	}
-
-	client := newMultiGroupRF3RoundTripper(t, cluster)
-	client.hideCommit = true
-	executor, err := gateway.NewReplicatedExecutorWithOptions(client, gateway.ReplicatedExecutorOptions{
-		MaxAttempts: 1, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 8,
+	coordinator, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 13, RecoveryDeadline: int64(distributedtxn.MaxRecoveryPulses),
+		Participants: []distributedtxn.ParticipantRef{{Distribution: []byte("orders-a"),
+			Shard: []byte("0000-7fff"), RoutingVersion: 17, AllocationGeneration: 7,
+			OwnershipEpoch: 11, AuthorityWitness: distributedtxn.AuthorityWitness{1},
+			MutationDigest: digest, State: distributedtxn.ParticipantStaged}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator, err := gateway.NewReplicatedTransactionOrchestrator(
-		gateway.ReplicatedTransactionOrchestratorOptions{
-			Executor: executor, Tenant: []byte("tenant"), MaxConcurrency: 2,
-			MaxInFlightBytes: 64 << 20,
-			MaxMutations:     2, MaxMutationBytes: 1 << 20, RecoveryTimeout: time.Minute,
-			IDSource:          bytes.NewReader(bytes.Repeat([]byte{0xa7}, len(distributedtxn.ID{}))),
-			RecoveryAuthority: recoveryAuthority,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
+	participant := distributedtxn.ParticipantStage{
+		CoordinatorGroup:            distributedtxn.ID(base.Binding.GroupID),
+		CoordinatorShardIncarnation: distributedtxn.ID(base.Binding.ShardIncarnation),
+		CoordinatorAllocation:       7, BucketBits: 8,
+		IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}}, MutationDigest: digest,
 	}
-
-	participants := make([]gateway.ReplicatedTransactionParticipant, multiGroupRF3Groups)
-	keys := make([][]byte, multiGroupRF3Groups)
-	values := make([][]byte, multiGroupRF3Groups)
-	for group := 0; group < multiGroupRF3Groups; group++ {
-		identifier := "rf3-public-" + string(rune('a'+group))
-		var ok bool
-		keys[group], ok = orderedkey.AppendJSONString(nil, []byte(`"`+identifier+`"`), orderedkey.Ascending)
-		if !ok {
-			t.Fatalf("encode group %d key", group)
+	for _, control := range []distributedtxn.ReplicatedCommand{
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinator, Participant: participant},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStagePrepareParticipant,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage, Participant: participant},
+		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedCommitCoordinator,
+			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
+			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+	} {
+		var mutations []replication.RelationMutationBatch
+		if control.PayloadKind != distributedtxn.ReplicatedPayloadNone {
+			mutations = batches
 		}
-		values[group], err = vibejson.AppendCanonicalize(
-			nil, []byte(`{"id":"`+identifier+`","group":`+string(rune('0'+group))+`}`),
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-		participants[group] = gateway.ReplicatedTransactionParticipant{
-			Route: cluster.route(group),
-			Batches: []replication.RelationMutationBatch{{Relation: 1,
-				Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual,
-					Key: keys[group], Value: values[group]}},
-			}},
-		}
-	}
-
-	_, executeErr := orchestrator.Execute(ctx, 13, participants)
-	var transactionErr *gateway.ReplicatedTransactionError
-	if !errors.As(executeErr, &transactionErr) || transactionErr.Recovery == nil ||
-		transactionErr.Committed || transactionErr.Recovery.Phase != gateway.ReplicatedTransactionPhaseDeciding ||
-		len(transactionErr.Recovery.Pending) != 1 {
-		t.Fatalf("hidden commit Execute err=%v transaction=%+v", executeErr, transactionErr)
-	}
-	client.mu.Lock()
-	hiddenGroup, hiddenMember := client.hiddenGroup, client.hiddenMember
-	hiddenCommand := bytes.Clone(client.hiddenCommand)
-	client.mu.Unlock()
-	if hiddenGroup < 0 || hiddenMember < 0 || len(hiddenCommand) == 0 {
-		t.Fatalf("hidden response was not bound: group=%d member=%d bytes=%d",
-			hiddenGroup, hiddenMember, len(hiddenCommand))
-	}
-	if !bytes.Equal(transactionErr.Recovery.Pending[0].Command, hiddenCommand) {
-		t.Fatal("recovery handle did not retain the exact hidden commit bytes")
-	}
-
-	removed := map[int]bool{hiddenMember: true}
-	candidate := (hiddenMember + 1) % multiGroupRF3Voters
-	if err := cluster.owners[candidate].Campaign(ctx, cluster.groups[hiddenGroup].key); err != nil {
-		t.Fatal(err)
-	}
-	newLeader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[hiddenGroup].key)
-	if newLeader == hiddenMember {
-		t.Fatal("isolated coordinator leader retained leadership")
-	}
-
-	recovered, err := orchestrator.Recover(ctx, transactionErr.Recovery)
-	if err != nil || !recovered.Committed || recovered.AffectedRows != multiGroupRF3Groups ||
-		recovered.Recovery != nil {
-		t.Fatalf("Recover result=%+v err=%v", recovered, err)
-	}
-	trace := client.gatewayTrace()
-	hiddenRetries := 0
-	for _, entry := range trace {
-		command, openErr := replication.OpenCommand(entry.command)
+		outer, openErr := replication.OpenCommand(rf3TransactionCommand(t, base, control, mutations))
 		if openErr != nil {
 			t.Fatal(openErr)
 		}
-		group := cluster.groups[entry.group].key
-		if command.ClusterID != group.ClusterID || command.ClusterIncarnation != group.ClusterIncarnation ||
-			command.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch ||
-			command.ShardIncarnation != group.ShardIncarnation || command.GroupID != group.GroupID {
-			t.Fatalf("gateway routed operation %d to the wrong RF3 group %d", entry.operation, entry.group)
-		}
-		if bytes.Equal(entry.command, hiddenCommand) {
-			hiddenRetries++
+		inner, openErr := distributedtxn.OpenReplicatedCommand(outer.TransactionBytes())
+		if openErr != nil || inner.ControllerEpoch != 1 ||
+			inner.ExecutionPinDigest != distributedtxn.Digest(sha256.Sum256(id[:])) {
+			t.Fatalf("fenced transaction operation %d: %+v, %v", control.Operation, inner, openErr)
 		}
 	}
-	client.mu.Lock()
-	recoveryReads := client.recoveryReads
-	client.mu.Unlock()
-	if hiddenRetries != 2 || recoveryReads[0] == 0 || recoveryReads[1] == 0 {
-		t.Fatalf("exact hidden retries=%d recovery reads=%v", hiddenRetries, recoveryReads)
-	}
-
-	for group := 0; group < multiGroupRF3Groups; group++ {
-		for member := 0; member < multiGroupRF3Voters; member++ {
-			if member == hiddenMember {
-				continue
-			}
-			state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[group].key)
-			got, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
-				Fence: state.Fence(), Relation: 1, Key: keys[group], MinimumApplied: 1,
-				MaxValueBytes: replication.MaxMutationValueBytes,
-			})
-			if lease != nil {
-				lease.Release()
-			}
-			if readErr != nil || !got.Found || !bytes.Equal(got.Value, values[group]) {
-				t.Fatalf("group %d member %d intended value=%q found=%v err=%v",
-					group, member, got.Value, got.Found, readErr)
-			}
-			wrong, wrongLease, wrongErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
-				Fence: state.Fence(), Relation: 1, Key: keys[1-group], MinimumApplied: 1,
-				MaxValueBytes: replication.MaxMutationValueBytes,
-			})
-			if wrongLease != nil {
-				wrongLease.Release()
-			}
-			if wrongErr != nil || wrong.Found {
-				t.Fatalf("group %d member %d wrong-group found=%v err=%v",
-					group, member, wrong.Found, wrongErr)
-			}
-		}
-	}
-}
-
-func TestShippedExecBatchLowersAndRecoversAcrossTwoRealRF3Groups(t *testing.T) {
-	cluster := newMultiGroupTransactionRF3Cluster(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	recoveryAuthority := serviceauthz.Authority{
-		Node: rafttransport.NodeID{0xed}, Generation: 1,
-	}
-	ctx, err := serviceauthz.WithAuthority(ctx, recoveryAuthority)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cluster.owners[0].Campaign(ctx, cluster.groups[0].key); err != nil {
-		t.Fatal(err)
-	}
-	leader0 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
-	if err := cluster.owners[1].Campaign(ctx, cluster.groups[1].key); err != nil {
-		t.Fatal(err)
-	}
-	leader1 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[1].key)
-	leader0 = waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
-	if leader0 == leader1 {
-		t.Fatalf("two groups elected the same deliberately separated leader %d", leader0)
-	}
-
-	client := newMultiGroupRF3RoundTripper(t, cluster)
-	client.hideCommit = true
-	replicatedExecutor, err := gateway.NewReplicatedExecutorWithOptions(
-		client,
-		gateway.ReplicatedExecutorOptions{
-			MaxAttempts: 1, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 8,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	orchestrator, err := gateway.NewReplicatedTransactionOrchestrator(
-		gateway.ReplicatedTransactionOrchestratorOptions{
-			Executor: replicatedExecutor, Tenant: []byte("tenant"), MaxConcurrency: 2,
-			MaxInFlightBytes: 64 << 20, MaxMutations: 2, MaxMutationBytes: 1 << 20,
-			RecoveryTimeout:   time.Minute,
-			IDSource:          multiGroupRF3TransactionIDs(5),
-			RecoveryAuthority: recoveryAuthority,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	requests, err := gateway.NewReplicatedTransactionRequestRegistry(
-		gateway.ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: orchestrator, MaxEntries: 8,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot := multiGroupRF3SQLSnapshot(t, cluster)
-	executor := gateway.NewExecutor(nil, gateway.NewCatalogHolder(snapshot), gateway.Options{
-		ReplicatedTransactions:        orchestrator,
-		ReplicatedTransactionRequests: requests,
-	})
-	queries := []gateway.Query{
-		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-a","group":0}`),
-		}},
-		{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-b","group":1}`),
-		}},
-	}
-	requestID := replication.ID128{0x91}
-	_, executeErr := executor.ExecBatchRequest(ctx, requestID, queries)
-	var transactionErr *gateway.ReplicatedTransactionError
-	if !errors.As(executeErr, &transactionErr) || transactionErr.Recovery != nil {
-		t.Fatalf("hidden shipped execution error=%v transaction=%+v", executeErr, transactionErr)
-	}
-	if stats := requests.Stats(); stats.PendingRecovery != 1 || stats.Entries != 1 {
-		t.Fatalf("hidden request registry stats=%+v", stats)
-	}
-
-	client.mu.Lock()
-	hiddenGroup, hiddenMember := client.hiddenGroup, client.hiddenMember
-	client.mu.Unlock()
-	if hiddenGroup < 0 || hiddenMember < 0 {
-		t.Fatalf("hidden response was not bound: group=%d member=%d", hiddenGroup, hiddenMember)
-	}
-	removed := map[int]bool{hiddenMember: true}
-	candidate := (hiddenMember + 1) % multiGroupRF3Voters
-	if err := cluster.owners[candidate].Campaign(ctx, cluster.groups[hiddenGroup].key); err != nil {
-		t.Fatal(err)
-	}
-	if leader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[hiddenGroup].key); leader == hiddenMember {
-		t.Fatal("isolated coordinator leader retained leadership")
-	}
-
-	result, err := executor.ExecBatchRequest(ctx, requestID, queries)
-	if err != nil || result.RowsAffected != multiGroupRF3Groups || result.ShardsFanned != multiGroupRF3Groups ||
-		result.TransactionID == (replication.ID128{}) {
-		t.Fatalf("recovered shipped result=%+v err=%v", result, err)
-	}
-	traceCount := len(client.gatewayTrace())
-	cached, err := executor.ExecBatchRequest(ctx, requestID, queries)
-	if err != nil || cached.TransactionID != result.TransactionID || cached.RowsAffected != result.RowsAffected ||
-		len(client.gatewayTrace()) != traceCount {
-		t.Fatalf("cached shipped result=%+v err=%v trace=%d/%d", cached, err,
-			len(client.gatewayTrace()), traceCount)
-	}
-	if stats := requests.Stats(); stats.Terminal != 1 || stats.PendingRecovery != 0 {
-		t.Fatalf("settled request registry stats=%+v", stats)
-	}
-
-	updateDelete := []gateway.Query{
-		{SQL: `UPDATE orders_a SET "$doc" = ? WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-a","group":2}`),
-			shardservice.StringParam("exec-batch-a"),
-		}},
-		{SQL: `DELETE FROM orders_b WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("exec-batch-b"),
-		}},
-	}
-	updated, err := executor.ExecBatchRequest(ctx, replication.ID128{0x92}, updateDelete)
-	if err != nil || updated.RowsAffected != multiGroupRF3Groups ||
-		updated.TransactionID == (replication.ID128{}) {
-		t.Fatalf("shipped update/delete result=%+v err=%v", updated, err)
-	}
-
-	conflict := []gateway.Query{
-		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-a","group":3}`),
-		}},
-		{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-c","group":3}`),
-		}},
-	}
-	if conflicting, conflictErr := executor.ExecBatchRequest(
-		ctx, replication.ID128{0x93}, conflict,
-	); conflictErr == nil || conflicting != nil {
-		t.Fatalf("strict insert conflict result=%+v err=%v", conflicting, conflictErr)
-	}
-	singleGroup := []gateway.Query{
-		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-d","group":4}`),
-		}},
-		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-e","group":4}`),
-		}},
-	}
-	singleResult, err := executor.ExecBatchRequest(
-		ctx, replication.ID128{0x94}, singleGroup,
-	)
-	if err != nil || singleResult.RowsAffected != 2 || singleResult.ShardsFanned != 1 ||
-		singleResult.TransactionID == (replication.ID128{}) {
-		t.Fatalf("single-group atomic result=%+v err=%v", singleResult, err)
-	}
-	singleStatement := []gateway.Query{{
-		SQL: `INSERT INTO orders_a VALUES (?)`, Params: []shardservice.Param{
-			shardservice.DocumentParam(`{"id":"exec-batch-f","group":4}`),
-		},
-	}}
-	singleStatementID := replication.ID128{0x95}
-	singleStatementResult, err := executor.ExecBatchRequest(ctx, singleStatementID, singleStatement)
-	if err != nil || singleStatementResult.RowsAffected != 1 ||
-		singleStatementResult.ShardsFanned != 1 ||
-		singleStatementResult.TransactionID == (replication.ID128{}) {
-		t.Fatalf("single-statement RF3 result=%+v err=%v", singleStatementResult, err)
-	}
-	singleStatementTrace := len(client.gatewayTrace())
-	singleStatementReplay, err := executor.ExecBatchRequest(ctx, singleStatementID, singleStatement)
-	if err != nil || singleStatementReplay.TransactionID != singleStatementResult.TransactionID ||
-		singleStatementReplay.RowsAffected != 1 || len(client.gatewayTrace()) != singleStatementTrace {
-		t.Fatalf("single-statement RF3 replay=%+v err=%v trace=%d/%d",
-			singleStatementReplay, err, len(client.gatewayTrace()), singleStatementTrace)
-	}
-
-	for group := 0; group < multiGroupRF3Groups; group++ {
-		key, ok := orderedkey.AppendString(nil, []byte("exec-batch-"+string(rune('a'+group))), orderedkey.Ascending)
-		if !ok {
-			t.Fatalf("encode group %d key", group)
-		}
-		for member := 0; member < multiGroupRF3Voters; member++ {
-			if member == hiddenMember {
-				continue
-			}
-			state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[group].key)
-			got, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
-				Fence: state.Fence(), Relation: 1, Key: key, MinimumApplied: 1,
-				MaxValueBytes: replication.MaxMutationValueBytes,
-			})
-			if lease != nil {
-				lease.Release()
-			}
-			if readErr != nil || got.Found != (group == 0) {
-				t.Fatalf("group %d member %d shipped row found=%v err=%v", group, member, got.Found, readErr)
-			}
-			if group == 0 {
-				want, canonicalErr := vibejson.AppendCanonicalize(
-					nil, []byte(`{"id":"exec-batch-a","group":2}`),
-				)
-				if canonicalErr != nil || !bytes.Equal(got.Value, want) {
-					t.Fatalf("group %d member %d updated value=%q canonical=%q err=%v",
-						group, member, got.Value, want, canonicalErr)
-				}
-			}
-		}
-	}
-	conflictKey, ok := orderedkey.AppendString(nil, []byte("exec-batch-c"), orderedkey.Ascending)
-	if !ok {
-		t.Fatal("encode conflict key")
-	}
-	for member := 0; member < multiGroupRF3Voters; member++ {
-		if member == hiddenMember {
-			continue
-		}
-		state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[1].key)
-		got, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
-			Fence: state.Fence(), Relation: 1, Key: conflictKey, MinimumApplied: 1,
-			MaxValueBytes: replication.MaxMutationValueBytes,
-		})
-		if lease != nil {
-			lease.Release()
-		}
-		if readErr != nil || got.Found {
-			t.Fatalf("member %d conflict leaked peer-shard row found=%v err=%v", member, got.Found, readErr)
-		}
-	}
-	for _, identifier := range []string{"exec-batch-d", "exec-batch-e", "exec-batch-f"} {
-		key, keyOK := orderedkey.AppendString(nil, []byte(identifier), orderedkey.Ascending)
-		if !keyOK {
-			t.Fatalf("encode single-group key %q", identifier)
-		}
-		for member := 0; member < multiGroupRF3Voters; member++ {
-			if member == hiddenMember {
-				continue
-			}
-			state := mustRF3State(t, ctx, cluster.owners[member], cluster.groups[0].key)
-			got, lease, readErr := cluster.owners[member].ReadPoint(ctx, PointReadRequest{
-				Fence: state.Fence(), Relation: 1, Key: key, MinimumApplied: 1,
-				MaxValueBytes: replication.MaxMutationValueBytes,
-			})
-			if lease != nil {
-				lease.Release()
-			}
-			if readErr != nil || !got.Found {
-				t.Fatalf("member %d single-group key %q found=%v err=%v",
-					member, identifier, got.Found, readErr)
-			}
-		}
-	}
-}
-
-func multiGroupRF3TransactionIDs(count int) io.Reader {
-	encoded := make([]byte, 0, count*len(distributedtxn.ID{}))
-	for ordinal := 1; ordinal <= count; ordinal++ {
-		var id distributedtxn.ID
-		id[0] = 0xa6
-		binary.BigEndian.PutUint64(id[len(id)-8:], uint64(ordinal))
-		encoded = append(encoded, id[:]...)
-	}
-	return bytes.NewReader(encoded)
-}
-
-func multiGroupRF3SQLSnapshot(
-	t testing.TB,
-	cluster *multiGroupTransactionRF3Cluster,
-) *gateway.Snapshot {
-	t.Helper()
-	config := distribution.ClusterConfig{}
-	endpoints := make(map[distribution.EndpointID]string, multiGroupRF3Groups*multiGroupRF3Voters*3)
-	descriptors := make([]gateway.ReplicatedShardDescriptor, 0, multiGroupRF3Groups)
-	profiles := make([]gateway.ReplicatedTableProfile, 0, multiGroupRF3Groups)
-	for group := 0; group < multiGroupRF3Groups; group++ {
-		route := cluster.route(group)
-		table := "orders_" + string(rune('a'+group))
-		leaders := make([]distribution.EndpointID, 0, multiGroupRF3Voters)
-		replicas := make([]gateway.ReplicatedReplicaDescriptor, 0, multiGroupRF3Voters)
-		for member := range route.Replicas {
-			replica := route.Replicas[member]
-			sqlEndpoint := distribution.EndpointID("sql-" + replica.Address)
-			nativeEndpoint := distribution.EndpointID(replica.NativeEndpoint)
-			controlEndpoint := distribution.EndpointID("control-" + replica.Address)
-			leaders = append(leaders, sqlEndpoint)
-			// The catalog intentionally requires the SQL, native, and control
-			// planes to resolve to distinct addresses. This in-process transport
-			// dispatches by endpoint identity, so plane-qualified addresses keep
-			// the fixture faithful without opening three additional listeners.
-			endpoints[sqlEndpoint] = string(sqlEndpoint)
-			endpoints[nativeEndpoint] = replica.NativeEndpoint
-			endpoints[controlEndpoint] = string(controlEndpoint)
-			if endpoints[sqlEndpoint] == endpoints[nativeEndpoint] ||
-				endpoints[sqlEndpoint] == endpoints[controlEndpoint] ||
-				endpoints[nativeEndpoint] == endpoints[controlEndpoint] {
-				t.Fatalf("replica %d test endpoint planes share an address", member)
-			}
-			replicas = append(replicas, gateway.ReplicatedReplicaDescriptor{
-				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
-				NodeIncarnation: replica.NodeIncarnation, Endpoint: sqlEndpoint,
-				NativeEndpoint: nativeEndpoint, ControlEndpoint: controlEndpoint,
-			})
-		}
-		manifest, err := distribution.NewManifest(route.Distribution,
-			distribution.RoutingVersion(route.Command.RoutingVersion), []distribution.Shard{{
-				ID:                   route.Shard,
-				AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration),
-				Range:                distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
-				Leaders:              leaders, Epoch: distribution.OwnershipEpoch(route.Command.OwnershipEpoch),
-			}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		config.Distributions = append(config.Distributions, distribution.DistributionSpec{
-			Name: route.Distribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion,
-		})
-		config.Manifests = append(config.Manifests, manifest)
-		config.Placements = append(config.Placements, distribution.TablePlacement{
-			Table: table, Distribution: route.Distribution, Columns: []string{"/id"},
-		})
-		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
-			Distribution: route.Distribution, Shard: route.Shard, Group: route.Group,
-			AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration),
-			Command:              route.Command,
-			Replicas:             replicas,
-		})
-		profiles = append(profiles, gateway.ReplicatedTableProfile{
-			Table: table, Relation: 1, PrimaryKey: "/id",
-			SchemaGeneration:       route.Command.SchemaGeneration,
-			RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
-			MaxKeyBytes:            replication.MaxMutationKeyBytes,
-			MaxDocumentBytes:       replication.MaxMutationValueBytes,
-		})
-	}
-	snapshot, err := gateway.NewSnapshotWithReplicatedTableMetadata(
-		config, endpoints, 31, nil, nil, descriptors, profiles,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return snapshot
 }
 
 func multiGroupRF3SafeIsolationError(err error) bool {

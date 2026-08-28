@@ -13,6 +13,11 @@ import (
 )
 
 func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T) {
+	t.Run("local", func(t *testing.T) { testCapturedCutover(t, false) })
+	t.Run("durable-lagged-fence", func(t *testing.T) { testCapturedCutover(t, true) })
+}
+
+func testCapturedCutover(t *testing.T, lagged bool) {
 	partitioner, err := NewPartitioner(
 		testSplitPlan(t, "node-b"), "docs", []string{"/tenant", "/sequence"},
 		distribution.DefaultVirtualBucketBits,
@@ -21,16 +26,23 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 		t.Fatal(err)
 	}
 	fixture := newSourceCaptureFixture(t, partitioner)
-	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
-		t.Fatal(err)
-	}
-	fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
-	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.machine.BeginTransitionCapture(capture); err != nil {
-		t.Fatal(err)
+	var capture *SourceCapture
+	configurationIndex := uint64(3)
+	if lagged {
+		partitioner, fixture, capture = activateLaggedCapture(t, partitioner, fixture)
+		configurationIndex = 4
+	} else {
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
+		capture, err = NewSourceCapture(partitioner, "split-capture", fixture.capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.machine.BeginTransitionCapture(capture); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	cut, err := fixture.machine.Snapshot("docs")
@@ -75,7 +87,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	}
 
 	if _, err := fixture.machine.ApplyConfiguration(raftmodel.ApplyMeta{
-		Index: 3, Term: 2, Type: pb.EntryConfChange,
+		Index: configurationIndex, Term: 2, Type: pb.EntryConfChange,
 	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
 		t.Fatal(err)
 	}
@@ -93,19 +105,42 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
-		From: fixture.binding, ExpectedReplicaSetVersion: 3,
+	seal := partitioner.sealCoordinates(partitioner.initialCoordinates(fixture.binding.RouteGeneration))
+	transition := replicatedstate.OwnershipTransition{
+		From: fixture.binding, ExpectedReplicaSetVersion: configurationIndex,
 		SourceMember: 1, TargetMember: 2,
-		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
-		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
-		ToRouteGeneration: fixture.binding.RouteGeneration + 1,
+		ToOwnershipEpoch:  seal.OwnershipEpoch,
+		ToRoutingVersion:  seal.RoutingVersion,
+		ToRouteGeneration: seal.RouteGeneration,
 		ToOwnedRange:      partitioner.children[partitioner.retained].Range,
-	})
+	}
+	if lagged {
+		for _, mutate := range []func(*replicatedstate.OwnershipTransition){
+			func(v *replicatedstate.OwnershipTransition) { v.ToRoutingVersion++ },
+			func(v *replicatedstate.OwnershipTransition) { v.ToRouteGeneration++ },
+			func(v *replicatedstate.OwnershipTransition) { v.ToOwnedRange = v.From.OwnedRange },
+		} {
+			wrong := transition
+			mutate(&wrong)
+			raw, encodeErr := replicatedstate.AppendOwnershipTransition(nil, wrong)
+			if encodeErr != nil {
+				t.Fatal(encodeErr)
+			}
+			if _, applyErr := fixture.machine.ApplyNormal(sourceCaptureMeta(configurationIndex+1), raw); !errors.Is(applyErr, replicatedstate.ErrOwnershipTransition) {
+				t.Fatalf("unauthorized jump accepted: %v", applyErr)
+			}
+			capture = reopenLaggedCapture(t, &fixture)
+		}
+	}
+	ownership, err := replicatedstate.AppendOwnershipTransition(nil, transition)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(4), ownership); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(configurationIndex+1), ownership); err != nil {
 		t.Fatal(err)
+	}
+	if lagged {
+		capture = reopenLaggedCapture(t, &fixture)
 	}
 	entry, ok, err = capture.NextTailEntry(cursor, &captureWorkspace)
 	if err != nil || !ok || !tailEntrySeals(entry) {
@@ -119,6 +154,9 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	if !ok || stageCursor.Phase() != ChildStageSealed {
 		t.Fatalf("stage cursor=%+v ok=%v", stageCursor, ok)
 	}
+	if _, err := NewChildStage(partitioner, set.Children[1], child, persisted); err != nil {
+		t.Fatalf("reopen sealed stage: %v", err)
+	}
 
 	var cutoverWorkspace CutoverWorkspace
 	certificate, err := partitioner.CertifyCutover(
@@ -131,6 +169,14 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	}
 	if err := partitioner.VerifyCutoverCertificate(certificate); err != nil {
 		t.Fatal(err)
+	}
+	if lagged {
+		wrong := certificate
+		wrong.coordinates.RouteGeneration++
+		wrong.digest = cutoverDigest(&wrong, &CutoverVerifyWorkspace{})
+		if err := partitioner.VerifyCutoverCertificate(wrong); !errors.Is(err, ErrCutoverCertificate) {
+			t.Fatalf("resealed unauthorized target generation accepted: %v", err)
+		}
 	}
 	imageDigest, imageOK := certificate.ChildImageDigest(1)
 	_, _, wantImageDigest, wantImageOK := stageCursor.ImageProof()
@@ -172,7 +218,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 		t.Fatalf("corrupt error=%v", err)
 	}
 
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(5), nil); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(configurationIndex+2), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := partitioner.CertifyCutover(

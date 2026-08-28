@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -19,6 +20,28 @@ func newDeliveryTestOwner() *Owner {
 	return &Owner{
 		limits:  Limits{MaxIngressItems: 1, MaxIngressBytes: 1},
 		ingress: make(chan ownerRequest, 1), started: true,
+	}
+}
+
+func TestOwnerGenerationPinsFenceQuiesceRace(t *testing.T) {
+	generation := &ownerGeneration{}
+	if !generation.acquire() || generation.pins.Load() != 1 {
+		t.Fatal("first generation pin refused")
+	}
+	if generation.quiesce() {
+		t.Fatal("generation quiesced with a live pin")
+	}
+	generation.quiescing.Store(true)
+	if generation.acquire() || generation.pins.Load() != 1 {
+		t.Fatal("quiescing generation admitted a new pin")
+	}
+	generation.release()
+	if generation.pins.Load() != 0 {
+		t.Fatalf("pins after release=%d", generation.pins.Load())
+	}
+	generation.resume()
+	if !generation.quiesce() || generation.pins.Load() != 0 {
+		t.Fatal("drained generation did not quiesce")
 	}
 }
 
@@ -52,12 +75,121 @@ func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
 	owner.release(request.bytes)
 }
 
+func TestSchemaTransitionFenceAuthenticatesExactServingGeneration(t *testing.T) {
+	group := peerServerTestGroup()
+	fence := ServingFence{Group: group, AllocationGeneration: 3,
+		Command: CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+			ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 9,
+			RelationManifestDigest: [32]byte{4}, RoutingVersion: 10, RouteGeneration: 11},
+		MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4, Term: 5}
+	transition := replicatedstate.SchemaTransition{
+		From: replicatedstate.Binding{
+			ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+			TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+			Distribution:          "docs", Shard: "0000-ffff",
+			AllocationGeneration: fence.AllocationGeneration,
+			ShardIncarnation:     group.ShardIncarnation, GroupID: group.GroupID,
+			ActivePolicyGeneration: fence.Command.ActivePolicyGeneration,
+			ProtectionEpoch:        fence.Command.ProtectionEpoch,
+			OwnershipEpoch:         fence.Command.OwnershipEpoch,
+			SchemaGeneration:       fence.Command.SchemaGeneration,
+			RoutingVersion:         fence.Command.RoutingVersion,
+			RouteGeneration:        fence.Command.RouteGeneration,
+			OwnedRange:             distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+		ToSchemaGeneration: 10, ExpectedReplicaSetVersion: 7, MembershipSequence: 1,
+		MembershipSource: [32]byte{1}, MembershipTarget: [32]byte{2},
+		FromManifest: [32]byte{4}, FromApplyContract: [32]byte{5},
+		ToManifest: [32]byte{6}, ToApplyContract: [32]byte{7},
+		RequestDigest: [32]byte{8}, AuthorizationDigest: [32]byte{9},
+		CatalogCASDigest: [32]byte{10},
+	}
+	encoded, err := replicatedstate.AppendSchemaTransition(nil, transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := replicatedstate.OpenSchemaTransition(encoded)
+	if err != nil || !schemaTransitionMatchesFence(opened, fence) {
+		t.Fatalf("exact transition rejected: %v", err)
+	}
+	transition.FromManifest[0]++
+	encoded, err = replicatedstate.AppendSchemaTransition(encoded[:0], transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err = replicatedstate.OpenSchemaTransition(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schemaTransitionMatchesFence(opened, fence) {
+		t.Fatal("substituted source manifest accepted")
+	}
+}
+
+func TestProposeSchemaTransitionDetachesBoundedCommand(t *testing.T) {
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: replicatedstate.MaxSchemaTransitionBytes,
+	}}
+	command := []byte{1, 2, 3}
+	done := make(chan error, 1)
+	go func() {
+		done <- owner.ProposeSchemaTransition(context.Background(), ServingFence{}, command)
+	}()
+	request := <-owner.ingress
+	command[0] = 9
+	if request.kind != requestSchemaTransition || request.data[0] != 1 ||
+		cap(request.data) != len(request.data) {
+		t.Fatalf("request kind=%d data=%v len/cap=%d/%d",
+			request.kind, request.data, len(request.data), cap(request.data))
+	}
+	request.reply <- ownerReply{}
+	owner.release(request.bytes)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.ProposeSchemaTransition(context.Background(), ServingFence{},
+		make([]byte, replicatedstate.MaxSchemaTransitionBytes+1)); !errors.Is(err, ErrInvalidOwner) {
+		t.Fatalf("oversized command error=%v", err)
+	}
+}
+
+func TestObserveSchemaTransitionDetachesBoundedCommand(t *testing.T) {
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: replicatedstate.MaxSchemaTransitionBytes,
+	}}
+	group := peerServerTestGroup()
+	command := []byte{1, 2, 3}
+	type result struct {
+		committed bool
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		committed, err := owner.ObserveSchemaTransition(context.Background(), group, command)
+		done <- result{committed: committed, err: err}
+	}()
+	request := <-owner.ingress
+	command[0] = 9
+	if request.kind != requestObserveSchemaTransition || request.group != group ||
+		request.data[0] != 1 || cap(request.data) != len(request.data) {
+		t.Fatalf("request kind=%d group=%+v data=%v len/cap=%d/%d",
+			request.kind, request.group, request.data, len(request.data), cap(request.data))
+	}
+	request.reply <- ownerReply{committed: true}
+	owner.release(request.bytes)
+	got := <-done
+	if got.err != nil || !got.committed {
+		t.Fatalf("observation committed=%t err=%v", got.committed, got.err)
+	}
+}
+
 func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *testing.T) {
 	owner := &Owner{pendingReads: make(map[[16]byte]*readDelivery)}
 	var contextKey [16]byte
 	contextKey[0], contextKey[15] = 3, 9
 	source := &ownerTestReadSource{}
-	delivery := &readDelivery{reply: make(chan ownerReply, 1), source: source, minimumApplied: 23}
+	delivery := &readDelivery{reply: make(chan ownerReply, 1), source: source,
+		minimumApplied: 23, generation: &ownerGeneration{}}
 	owner.pendingReads[contextKey] = delivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 17,
@@ -74,7 +206,8 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 		t.Fatal("settled read retained")
 	}
 
-	barrierDelivery := &readDelivery{reply: make(chan ownerReply, 1), source: source, minimumApplied: 11}
+	barrierDelivery := &readDelivery{reply: make(chan ownerReply, 1), source: source,
+		minimumApplied: 11, generation: &ownerGeneration{}}
 	owner.pendingReads[contextKey] = barrierDelivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 19,
@@ -96,8 +229,78 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 }
 
 type ownerTestReadSource struct {
-	result replicatedstate.PointReadResult
-	err    error
+	result      replicatedstate.PointReadResult
+	batchResult replicatedstate.PointReadBatchResult
+	batchCalls  int
+	err         error
+}
+
+func (source *ownerTestReadSource) PointReadBatchInto(
+	_ []byte, _ uint64, _ int, _ []byte,
+) (replicatedstate.PointReadBatchResult, error) {
+	source.batchCalls++
+	return source.batchResult, source.err
+}
+
+func TestOwnerPointReadBatchUsesOneLinearAuthorization(t *testing.T) {
+	group := peerServerTestGroup()
+	serving := ServingFence{Group: group, AllocationGeneration: 3,
+		Command: CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+			ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 9,
+			RelationManifestDigest: [32]byte{4}, RoutingVersion: 10, RouteGeneration: 11},
+		MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4, Term: 5}
+	packed, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{
+		{Relation: 1, Key: []byte("a")}, {Relation: 2, Key: []byte("b")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	fence := replicatedstate.SnapshotFence{Binding: replicatedstate.Binding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		AllocationGeneration:  serving.AllocationGeneration,
+		ShardIncarnation:      group.ShardIncarnation, GroupID: group.GroupID,
+		ActivePolicyGeneration: serving.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        serving.Command.ProtectionEpoch,
+		OwnershipEpoch:         serving.Command.OwnershipEpoch,
+		SchemaGeneration:       serving.Command.SchemaGeneration,
+		RoutingVersion:         serving.Command.RoutingVersion,
+		RouteGeneration:        serving.Command.RouteGeneration,
+	}, RelationManifestDigest: serving.Command.RelationManifestDigest,
+		ReplicaSetVersion: serving.Command.ReplicaSetVersion, Applied: 19}
+	source := &ownerTestReadSource{batchResult: replicatedstate.PointReadBatchResult{
+		Fence: fence, Data: value,
+	}}
+	charge, ok := pointReadResponseCharge(4096)
+	if !ok {
+		t.Fatal("charge")
+	}
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: int64(len(packed)),
+		MaxPendingReadItems: 1, MaxPendingReadBytes: charge,
+	}}
+	authorizations := 0
+	go func() {
+		request := <-owner.ingress
+		authorizations++
+		if request.kind != requestReadLinear {
+			t.Errorf("request kind=%d", request.kind)
+		}
+		request.reply <- ownerReply{read: readAuthorization{
+			source: source, minimumApplied: 19,
+		}}
+		owner.release(request.bytes)
+	}()
+	result, lease, err := owner.ReadPointBatch(context.Background(), PointReadBatchRequest{
+		Fence: serving, Packed: packed, MinimumApplied: 7, MaxResultBytes: 4096,
+	})
+	if err != nil || result.Applied != 19 || len(result.Data) != len(value) ||
+		authorizations != 1 || source.batchCalls != 1 || lease == nil {
+		t.Fatalf("result=%+v authorizations=%d sourceCalls=%d lease=%T err=%v",
+			result, authorizations, source.batchCalls, lease, err)
+	}
+	lease.Release()
 }
 
 func (source *ownerTestReadSource) PointReadInto(

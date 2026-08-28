@@ -7,6 +7,45 @@ concurrency:
   group: bench-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
+  competitive-evidence:
+    name: competitive lifecycle evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'bench/competitive/go.mod'
+      - name: Competitive contract and adapter reopen tests
+        working-directory: bench/competitive
+        run: go test ./...
+      - name: Build lifecycle harness
+        working-directory: bench/competitive
+        run: go build -o /tmp/vibedb-lifecycle ./cmd/lifecycle
+      - name: Isolated hot and recovery smoke
+        run: |
+          /tmp/vibedb-lifecycle -engine=bbolt -mode=hot -corpus=64 -durability=ordinary-sync -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
+          /tmp/vibedb-lifecycle -engine=vibedb -mode=recovery -corpus=64 -durability=ordinary-sync -exact-indexes=1 -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
+      - name: Linux controlled cold-reopen smoke
+        # The lane intentionally fails closed unless the runner can perform a
+        # real global cache drop. GitHub-hosted Linux runners provide sudo;
+        # Darwin is documented unsupported rather than approximated.
+        run: sudo /tmp/vibedb-lifecycle -engine=bbolt -mode=cold -corpus=64 -durability=ordinary-sync -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
+      - name: Linux bounded churn and process-write smoke
+        working-directory: bench/competitive
+        run: |
+          go run ./cmd/churndisk -engine=vibedb -corpus=1000 -mutations=2000 -sample-mutations=500 -checkpoint-mutations=64 -durability=buffered-visible -exact-indexes=0 -document-shape=inline -cardinality=low -storage-profile=intrinsic -require-physical-write=true -max-rss-bytes=1073741824 -max-allocated-bytes=1073741824 -max-physical-write-bytes=1073741824 -allow-diagnostic > "${RUNNER_TEMP}/churn-smoke.tsv"
+          test -s "${RUNNER_TEMP}/churn-smoke.tsv"
+          grep -F $'physical-write-known\tphysical-write-source\tphysical-write-bytes' "${RUNNER_TEMP}/churn-smoke.tsv"
+          grep -F $'linux-proc-self-io-write_bytes' "${RUNNER_TEMP}/churn-smoke.tsv"
+      - name: Linux maintenance and interface evidence smoke
+        working-directory: bench/competitive
+        run: |
+          /tmp/vibedb-lifecycle -engine=vibedb -mode=verify -corpus=64 -durability=ordinary-sync -exact-indexes=1 -max-rss-bytes=1073741824 -max-physical-write-bytes=1073741824 -require-physical-write=true
+          /tmp/vibedb-lifecycle -engine=vibedb -mode=repack -corpus=64 -durability=ordinary-sync -exact-indexes=1 -max-rss-bytes=1073741824 -max-physical-write-bytes=1073741824 -require-physical-write=true
+          go run ./cmd/snapshotpressure -engine=vibedb -corpus=128 -operations=256 -checkpoint-mutations=32 -exact-indexes=1 -require-physical-write=true -max-rss-bytes=1073741824 -max-allocated-bytes=1073741824 -max-physical-write-bytes=1073741824
+          go run ./cmd/sqlsurface -engine=vibedb -interface=database-sql -corpus=20 -operations=40 -require-physical-write=true -max-rss-bytes=1073741824 -max-physical-write-bytes=1073741824
+          go run ./cmd/sqlsurface -engine=sqlite -interface=database-sql -corpus=20 -operations=40 -require-physical-write=true -max-rss-bytes=1073741824 -max-physical-write-bytes=1073741824
+          go run ./cmd/sqlsurface -engine=vibedb -interface=pgwire -corpus=20 -operations=40 -require-physical-write=true -max-rss-bytes=1073741824 -max-physical-write-bytes=1073741824
   allocation-gate:
     name: allocation gate
     runs-on: ubuntu-latest

@@ -9,12 +9,11 @@ VibeDB has four main layers:
    point reads and a strict exact-key transaction path.
 
 The internal Raft, replicated-state, and Raft-service packages form the RF3
-serving composition. `vibedb-shard serve-rf3` constructs it for one externally
-prepared stable three-voter group. It does not provision or repair the group,
-and the public gateway uses it for canonical point `get` requests and
-multi-table `exec_batch` mutations over one or more RF3 groups. General
-SQL, scatter reads, and multi-table reads remain on or are limited by the static
-path.
+serving composition. `vibedb-shard serve-rf3` constructs it from one or more
+externally prepared stable three-voter group bundles. The public gateway uses
+it for canonical point `get` requests and
+multi-table `read_batch` and `exec_batch` operations over one or more RF3
+groups. General SQL and non-exact scatter reads remain on the static path.
 
 ## Product facade
 
@@ -113,11 +112,12 @@ repartition, and global-index paths.
 
 ## Distributed path
 
-The gateway has three distinct public data paths:
+The gateway has four distinct public data paths:
 
 ```text
 general SQL request       -> gateway -> static shard service -> local SQL catalog
 canonical point get      -> gateway -> replicated catalog route -> RF3 native relation
+exact-key read_batch     -> gateway -> pinned catalog -> one RF3 read cut per group
 exact-key exec_batch     -> gateway -> RF3 transaction orchestrator -> RF3 native relations
 ```
 
@@ -131,45 +131,57 @@ schema generation, relation-manifest digest, and key and document limits. A
 point read pins one catalog generation and resolves the ordered key without a
 SQL or string conversion.
 
+The replicated catalog also has an exact schema rollout protocol. Shards can
+prepare immutable relation bundles under a crash-safe journal and return
+contract-bound receipts. Catalog authority can record one prepared rollout,
+activate the exact target generation, or abort before activation. The shard
+installer supports authorization, activation, old-generation drain, and reopen.
+The experimental `vibedb-gateway schema-rollout` command composes the
+authenticated control client and bounded controller. It consumes an exact
+target catalog and per-replica bundles. It does not expose general SQL DDL.
+
 An `exec_batch` that resolves every statement to replicated table metadata and
 one or more RF3 groups takes the replicated transaction path. The gateway
 validates the complete batch before shard I/O and lowers supported SQL
 to numeric relation batches over ordered key and document bytes. The supported
-shapes are one whole-document row insert, an exact primary-key whole-document
-update, and an exact primary-key delete. Mutations for co-located tables share
-one group participant; same-group multi-statement and multi-relation batches
-remain atomic. Mixed static/RF3 batches, repeated relation keys,
-residual predicates, and ready global-index write programs fail closed instead
-of falling back after partial RF3 execution.
+shapes are single- or multi-row whole-document insert, an exact-primary-key
+whole-document update, and exact-primary-key delete with equality or a finite
+`IN` key set. Mutations for co-located tables share one group participant.
+Same-group multi-statement and multi-relation batches remain atomic. A ready
+global index becomes one or more independently routed relation participants.
+Update and delete bind index removal to the exact prior base value. Mixed
+static/RF3 batches, repeated relation keys, and residual predicates fail closed
+instead of falling back after partial RF3 execution.
 
-The client supplies a nonzero 128-bit request ID. The bounded same-process
-registry keys it by stable request scope: an authenticated request uses the
-certificate's node identity without the authorization-policy generation, while
-local/plaintext requests use a distinct scope that cannot alias an
-authenticated node. Its route-independent digest covers the exact ordered SQL,
-operation class, parameter kinds, boolean values, and parameter bytes.
+The RF3 write boundary is durable and sequenced. An authenticated client first
+opens a fixed lane for its persisted installation ID. Replicated catalog
+authority returns a grant digest. Each `exec_batch` then carries that exact
+grant reference, one strictly monotonic lane sequence, and a nonzero 128-bit
+request ID. The transport supplies the principal and tenant. The client cannot
+substitute them in the request.
 
-Replay runs before a catalog pin or SQL lowering. An executing duplicate joins
-the original call, an outcome-unknown duplicate recovers its retained handle,
-and a terminal duplicate returns the cached outcome. None is replanned against
-a newer catalog after a generation change, split, or move; the result retains
-the original catalog generation and shard count, and recovery uses the original
-generation and shard metadata. An unproved pre-admission or transient failure
-with no transaction identity, commit proof, or recovery handle is shared with
-current waiters and then removed, so a later retry may plan normally.
+One fused home-group transition advances the contiguous issuer high-water and
+creates the request head. The request digest covers the exact ordered SQL,
+operation class, parameter kinds, boolean values, and parameter bytes. A gap,
+rewind, forged grant, or reuse with different bytes fails closed. There is no
+unsequenced or process-local RF3 fallback.
 
-The periodic recovery sweep uses replicated ReadIndex witnesses to settle a
-hidden commit.
-The shipped command performs no automatic terminal expiry and exposes no
-client ACK or expiry operation. Terminal results remain cached, with no silent
-eviction. The command never calls the registry's scoped `Forget` API. An
-embedding may call `Forget` only after it has an application-level
-acknowledgement that the terminal result no longer needs retry protection.
-Once 65,536 entries are retained, new RF3 writes backpressure.
-This is not yet a durable cross-gateway request ledger: a gateway process loss
-discards request identity, cached results, and live recovery ownership. A
-durable replicated ledger or safe explicit client ACK is required before the
-command can reclaim terminal entries.
+The request ledger stores adjacent immutable home ranges with exact route
+authority. Its replicated grammar retains streamed plans, pending command
+waves, terminal results, ACKs, bounded collection state, issuer lanes, and
+contiguous issuer high-water. One logical execution pin fences the complete
+transaction program by controller epoch and catalog-group applied index.
+
+Replay reads replicated state before it plans new work. An outcome-unknown
+duplicate resumes the sealed program and a terminal duplicate returns the same
+result. A replacement gateway can perform both operations through the shared
+catalog and ledger authority. The result carries an authenticated ACK
+capability. An exact `ack_exec_batch` retry resumes bounded collection after a
+lost response. A completed ACK retry performs no new write.
+
+`vibedb-gateway serve` constructs the catalog-bound ledger topology, RF3 ledger
+client, execution-pin sessions, distributed runner, issuer authority, terminal
+authority, and ACK collector. Any missing durable authority fails startup.
 
 The gateway shares one bounded authenticated native connection pool across
 catalog, point-read, proposal, and transaction-recovery traffic. A bounded
@@ -188,12 +200,28 @@ stale serving fence, unavailable quorum, or mismatched position returns a typed
 refusal.
 
 `vibedb-shard serve-rf3` opens exact retained WAL, SQL, and apply artifacts,
-constructs one bounded Multi-Raft host plus authenticated peer transport, and
-serves the authenticated native replicated protocol. There is no RF3
-initializer, membership or snapshot orchestrator. Public RF3 writes are
-limited to the exact-key `exec_batch` lane above. Scatter and
-multi-table RF3 reads, a common cross-group RF3 read snapshot, and RF3
-global-index mutation lowering are absent.
+runs retained groups on bounded execution lanes with shared authenticated peer
+transport, and serves the authenticated native replicated protocol. The local
+`vibedb cluster dev` command can prepare and supervise an explicitly no-HA RF1
+member or an RF3 development topology plus gateway. Learner bootstrap and a
+resumable replica-move controller exist. They are not a general topology
+operator. RF3 development assigns a distinct authenticated NodeID to every
+role process and generates the strict replica-control inventory consumed by
+automatic hot-shard split admission; a NodeID never ambiguously names multiple
+control listeners. The dev inventory intentionally contains no replica-move
+candidates because it provisions no certified cold target host. Public RF3
+exact-key reads include bounded multi-table and multi-group batches with one
+ReadIndex cut per group. Exact-key `exec_batch` supplies multi-table and
+multi-group writes, including ready global-index maintenance. A common
+cross-group MVCC timestamp remains absent.
+
+RF3 safety authority does not use elapsed wall time for log order, reads, or
+transaction recovery. Static and RF3 transaction recovery advance bounded
+replicated pulses. Execution pins use controller epochs and applied-index lease
+fences. Hot-shard evidence uses catalog generations and replicated authority
+revisions. Local time still controls TLS validity, network and context
+deadlines, retry scheduling, catalog-session deadline construction, and static
+read-fence leases.
 
 The static shard service accepts only its `ReadStrong` policy and serves a
 statement-level snapshot from a statically configured leader endpoint. This
@@ -206,11 +234,30 @@ The static SQL path has no Raft replication, follower read, or endpoint
 failover. The RF3 leader cache and retry logic apply to canonical point reads,
 replicated catalog operations, and the exact-key transaction lane.
 
-Range-split primitives and action services remain internal. The gateway command
-can scan replicated split-operation records and trigger configured shard-control
-endpoints, but no shipped shard command constructs `ControllerService` or
-`RemoteActionService`. The commands therefore do not form an end-to-end split
-data plane. The internal splitter scans
+Live backup binds a complete replicated catalog inventory to an exact vector
+of per-group ReadIndex cuts. The gateway streams certified artifacts into a
+bounded local repository and publishes the certificate last. This is not a
+global timestamp snapshot. Restore constructs fresh RF3 identities and strips
+source serving authority. Root construction and adoption remain fenced until
+one target-catalog activation witness is durably published, separately
+observed with ReadIndex, and converted to an exact transient grant for every
+target replica. A restored process restart closes its grant again. See
+[Back up and restore distributed data](operations/backup-restore.md) for the
+command and qualification boundary.
+
+Range-split primitives and action services are composed into the authenticated
+RF3 commands. The durable runtime reconstructs bounded source and child
+observations, exact plan admission, dynamic action grants, source capture,
+child lifecycle, publication, and retained pruning after restart. The gateway
+can turn a certified hot-shard cut into a replicated split operation and drive
+it to its terminal catalog and retirement state. `serve-rf3` installs the
+group-scoped split, plan-admission, artifact, tail, child-preparation, and
+retirement handlers. There is no general operator split-intake CLI. The
+command-side child SQL provisioner remains singleton-only, and gateway hot
+admission does not yet select a split template per source group. Per-group
+registries therefore provide exact routing, not complete multi-relation split
+provisioning. The
+internal splitter scans
 one certified source image once and routes each borrowed row to at most three
 children. It uses a compiled `vibejson` placement program and does not use
 `encoding/json`. It can omit the retained child copy.
@@ -219,47 +266,62 @@ The same package writes deterministic hash-chained child artifacts. A verifier
 checks framing, key order, and document placement before it exposes a chunk.
 An ordered tail translator derives one exact batch for every child, including
 empty advances and shard-key moves. A non-serving child stage applies verified
-rows and tail batches to one durable collection. It validates the complete
-artifact image before tail catch-up and persists a fixed-size cursor through an
-atomic file replacement on Unix. An optional replicated-state capture writes
+rows and tail batches to one durable collection. It updates a constant-space
+authenticated image accumulator with those durable effects and persists a
+fixed-size cursor through an atomic file replacement on Unix. An optional replicated-state capture writes
 each exact before-and-after transition in the same durable
 transaction as its source publication. A terminal ownership-fence entry must
 advance all mutable serving coordinates together. Every child durably records
-its empty seal batch, scans and hashes its complete ordered final image, and
-rechecks that image on reopen before a fixed-size cutover certificate can be
-issued. The certificate binds every non-retained child image. A sealed stage
+its empty seal batch and seals its accumulated image in O(1) before a fixed-size
+cutover certificate can be issued. Recovery can explicitly audit the physical
+image once. The certificate binds every non-retained child image. Global-index
+relations maintain a canonical placement accumulator so their range ownership
+can also be certified without a cutover scan. A sealed stage
 can initialize the standard replicated-state snapshot base in place without a
 second durable user-row copy. The SQL driver holds an exclusive non-serving
 claim while it receives the child. Activation converts that claim to a
 base-pending replicated apply owner without changing the user collection
 incarnation. That owner rejects proposal, apply, lookup, export, and SQL
-serving; it accepts only the exact authenticated snapshot base. Transaction 2
+serving. It accepts only the exact authenticated snapshot base. Transaction 2
 certifies the base binding before the ordinary replicated apply owner is
 exposed. A planned WAL identity breaks the bootstrap cycle. The final WAL is
 allocated once from the newer snapshot base and is rechecked against the SQL
 binding before the existing Raft runtime can adopt it.
 
 The certificate is evidence, not topology authority. It authorizes only the
-conditional catalog successor after every child is ready. The catalog CAS is
-published durably before destructive cleanup; older catalog leases must then drain.
+conditional catalog successor after a coherent voting quorum for every child
+has applied at least the sealed source cut under the exact relation manifest.
+The catalog CAS is published durably before destructive cleanup. Older catalog
+leases must then drain.
 An unforgeable sealed catalog capability binds the durable CAS receipt, drained serving generation,
 operation identity, manifest, and cutover certificate. Only that witness authorizes retained cleanup, which plans bounded
 ordered key batches, checkpoints each batch before proposal, and confirms exact
 atomically captured replicated deletes. Concurrent retained-range writes are
 advanced one captured entry at a time. The current serving path can apply and
-capture an out-of-range post-publication write; cleanup then detects that entry
+capture an out-of-range post-publication write. Cleanup then detects that entry
 and halts before further pruning or completion. A final persisted, bounded incremental scan certifies the retained
 image without an unbounded controller turn. A crash may leave
 duplicate physical bytes, but never a routing gap or overlapping authority.
 
-The internal topology scheduler has a second non-serving path for replica
-movement. It consumes fixed-width, exact-generation capacity reports, nets
-source releases against target reservations in seven resource dimensions, and
-selects endpoints only when the maximum projected dominant pressure improves.
+The hot-shard path records routed request pressure in bounded per-allocation
+lanes and publishes canonical cuts through catalog RF3 when the gateway receives
+`-hot-shard-capacity`. An internal clockless controller consumes those cuts,
+qualifies sustained pressure, selects one split or replica move, and hands an
+idempotent admission to the existing journals. The gateway command publishes
+the pressure cut and, when an authenticated replica-control manifest supplies
+the exact split and move authorities, runs the replicated pass and its
+operation sink. Admission is fenced by catalog generation and replicated
+pressure revision; tenant identity and wall time are not placement authority.
+
+The topology scheduler consumes fixed-width, exact-generation capacity reports.
+It nets source releases against target reservations in seven resource dimensions
+and selects endpoints only when the maximum projected dominant pressure improves.
 Current replicas, failure domains, receive concurrency, migration ingress, and
 per-node concentration are hard bounds. The warm scheduler is fixed-memory and
-allocation-free. Its result is still advisory: an external owner attaches Raft
-member identities and drives the stateless `internal/rebalance` proof sequence.
+allocation-free. The independent replica-control command path attaches Raft
+member identities and drives the resumable `internal/rebalanceexec` sequence
+when the operator supplies a strict control manifest. Pressure-selected
+admission uses that same command path and catalog operation journal.
 Leader-only manifest cutover shares the immutable range index and untouched
 leader storage instead of rebuilding every shard.
 
@@ -294,9 +356,15 @@ review rules.
 - `store/engine.go` and `store/durable/store_file.go`
 - `query/exec.go` and `sql/driver/runtime.go`
 - `gateway/executor.go`, `gateway/replicated_data_read.go`,
-  `gateway/replicated_sql_transaction.go`,
-  `gateway/replicated_request_registry.go`, `gateway/replicated_table.go`, and
-  `shardservice/server.go`
+  `gateway/replicated_sql_read.go`, `gateway/replicated_sql_transaction.go`,
+  `gateway/durable_sql_request_executor.go`,
+  `gateway/replicated_request_service.go`,
+  `gateway/replicated_request_issuer_collector.go`,
+  `gateway/replicated_request_ledger_catalog.go`, `gateway/replicated_table.go`,
+  and `shardservice/server.go`
+- `cmd/vibedb-gateway/durable_request_runtime.go`,
+  `durable_exec_batch_wire.go`, `issuer_open_wire.go`, and
+  `exec_batch_ack_wire.go`
 - `internal/raftmember/runtime.go`
 - `autosplit/action.go`
 - `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`,
@@ -309,4 +377,7 @@ review rules.
 - `internal/raftmember/staged_child.go`
 - `internal/splitcontroller/reconcile.go`
 - `internal/splitcontroller/execute.go`
-- `internal/rebalance/plan.go` and `reconcile.go`
+- `internal/splitcontroller/local_observation_provider.go` and
+  `composite_shard_executor.go`
+- `internal/hotshard/collector.go`, `controller.go`, and `operation_sink.go`
+- `internal/rebalance/plan.go` and `internal/rebalanceexec/controller.go`

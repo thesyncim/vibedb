@@ -66,15 +66,23 @@ type partitionScan struct {
 // Partitioner is an immutable child geometry plus one compiled vibejson
 // placement program. It is safe for concurrent use with distinct workspaces.
 type Partitioner struct {
-	source     autosplit.SourceIdentity
-	ranges     [autosplit.MaxSplitChildren]distribution.KeyRange
-	children   [autosplit.MaxSplitChildren]autosplit.SplitChild
-	childCount uint8
-	retained   uint8
-	collection string
-	program    *distribution.DocumentPointProgram
-	target     distribution.RoutingVersion
-	digest     [sha256.Size]byte
+	source             autosplit.SourceIdentity
+	ranges             [autosplit.MaxSplitChildren]distribution.KeyRange
+	children           [autosplit.MaxSplitChildren]autosplit.SplitChild
+	childCount         uint8
+	retained           uint8
+	collection         string
+	columns            []string
+	program            *distribution.DocumentPointProgram
+	target             distribution.RoutingVersion
+	targetDistribution distribution.DistributionName
+	manifest           []distribution.Shard
+	digest             [sha256.Size]byte
+	geometryDigest     [sha256.Size]byte
+	sourceCoordinates  TailSourceCoordinates
+	targetGeneration   uint64
+	bundle             *BundleProfile
+	relationDigest     [sha256.Size]byte
 }
 
 // NewPartitioner binds one desired split to the collection's compiled shard
@@ -97,8 +105,13 @@ func NewPartitioner(
 	}
 	p := &Partitioner{
 		source: plan.Source, childCount: plan.ChildCount,
-		retained: plan.RetainedChild, collection: strings.Clone(collection), program: program,
-		target: plan.Manifest().Version(),
+		retained: plan.RetainedChild, collection: strings.Clone(collection), columns: slices.Clone(columns), program: program,
+		target:             plan.Manifest().Version(),
+		targetDistribution: plan.Manifest().Distribution(),
+	}
+	for ordinal := 0; ordinal < plan.Manifest().ShardCount(); ordinal++ {
+		shard, _ := plan.Manifest().ShardInfo(ordinal)
+		p.manifest = append(p.manifest, shard)
 	}
 	p.source.Distribution = distribution.DistributionName(strings.Clone(string(p.source.Distribution)))
 	p.source.Shard = distribution.ShardID(strings.Clone(string(p.source.Shard)))
@@ -157,8 +170,14 @@ func (p *Partitioner) PartitionSnapshot(
 	sinks []RowSink,
 	workspace *PartitionWorkspace,
 ) (PartitionStats, error) {
-	if p == nil || snapshot == nil {
+	if p == nil || snapshot == nil || p.RelationCount() != 1 {
 		return PartitionStats{}, ErrInvalidPartition
+	}
+	if p.bundle != nil {
+		fence := snapshot.Fence()
+		if !p.MatchesSourceSchema(fence.Binding.SchemaGeneration, fence.RelationManifestDigest) {
+			return PartitionStats{}, ErrSourceFence
+		}
 	}
 	user, ok := snapshot.Collection(p.collection)
 	if !ok || user == nil {
@@ -173,7 +192,7 @@ func (p *Partitioner) partitionRows(
 	sinks []RowSink,
 	workspace *PartitionWorkspace,
 ) (PartitionStats, error) {
-	if p == nil || rangeRows == nil || workspace == nil ||
+	if p == nil || p.RelationCount() != 1 || rangeRows == nil || workspace == nil ||
 		len(sinks) != int(p.childCount) || !p.matchesSource(state) {
 		if p != nil && rangeRows != nil && workspace != nil &&
 			len(sinks) == int(p.childCount) {
@@ -248,7 +267,8 @@ func (p *Partitioner) matchesSource(state replicatedstate.State) bool {
 		binding.Shard == string(p.source.Shard) &&
 		binding.AllocationGeneration == uint64(p.source.AllocationGeneration) &&
 		binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
-		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
+		binding.RoutingVersion == p.initialCoordinates(binding.RouteGeneration).RoutingVersion &&
+		(p.sourceCoordinates == (TailSourceCoordinates{}) || binding.RouteGeneration == p.sourceCoordinates.RouteGeneration) &&
 		binding.OwnedRange == p.source.Range
 }
 

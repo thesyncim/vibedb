@@ -63,7 +63,8 @@ func globalIndexExplainRoute(
 		}
 		route.Targets = append(route.Targets, distribution.Target{
 			Shard: shard.ID, AllocationGeneration: shard.AllocationGeneration,
-			Endpoint: shard.Leaders[0], OwnershipEpoch: shard.Epoch,
+			ManifestOrdinal: i,
+			Endpoint:        shard.Leaders[0], OwnershipEpoch: shard.Epoch,
 			Role: distribution.RoleLeader,
 		})
 	}

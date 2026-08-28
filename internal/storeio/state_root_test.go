@@ -141,6 +141,32 @@ func TestStateRootPhysicalCapacityValidation(t *testing.T) {
 	}
 }
 
+func TestStateRootMigrationManifestLocatorRoundTrip(t *testing.T) {
+	root, fileEnd := testStateRoot(11)
+	manifestOffset := fileEnd
+	fileEnd += 2 * GenerationMigrationManifestBytes
+	root.MigrationManifestOffset = manifestOffset
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := encodeTestStateRootPayload(page, root, fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeTestStateRootPayload(encoded, root, fileEnd)
+	if err != nil || decoded.MigrationManifestOffset != manifestOffset {
+		t.Fatalf("manifest locator = (%d,%v), want %d", decoded.MigrationManifestOffset, err, manifestOffset)
+	}
+	for _, invalidOffset := range []uint64{
+		manifestOffset + 1,
+		fileEnd - GenerationMigrationManifestBytes,
+	} {
+		invalid := root
+		invalid.MigrationManifestOffset = invalidOffset
+		if _, err := encodeTestStateRootPayload(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
+			t.Fatalf("manifest offset %d error = %v, want %v", invalidOffset, err, ErrInvalidWrite)
+		}
+	}
+}
+
 func TestStateRootPrimaryRootRoundTrip(t *testing.T) {
 	want, fileEnd := testStateRoot(11)
 	page := make([]byte, testSuperblockPageSize)

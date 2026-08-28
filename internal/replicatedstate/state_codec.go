@@ -7,16 +7,21 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	stateCodecFormat            = uint16(2)
-	stateHeaderBytes            = 400
-	stateTransactionHeaderBytes = 440
-	recordChecksumLen           = sha256.Size
+	stateCodecFormat                  = uint16(2)
+	stateHeaderBytes                  = 400
+	stateTransactionHeaderBytes       = 440
+	stateRequestLedgerHeaderBytes     = 480
+	stateExecutionPinHeaderBytes      = 504
+	stateRelationPlacementHeaderBytes = 536
+	stateFenceHeaderBytes             = 600
+	recordChecksumLen                 = sha256.Size
 )
 
 var (
@@ -36,6 +41,9 @@ const (
 	// certified staged image. Its synthetic entry digest becomes the prefix for
 	// every later local Raft apply.
 	RecordImportedSnapshot RecordKind = 5
+	// RecordSchema retires one live relation bundle after durably binding the
+	// exact prepared replacement and catalog authorization.
+	RecordSchema RecordKind = 6
 )
 
 // State is the exact durable publication stored at the fixed state key.
@@ -74,6 +82,34 @@ type State struct {
 	TransactionPayloadRows   uint64
 	TransactionIntentRows    uint64
 	TransactionResidentBytes uint64
+	// RequestLedgerRows and RequestLedgerResidentBytes authenticate every
+	// request-ledger row in the hidden collection. Resident bytes are exact
+	// key+value bytes, independent of allocator or storage-page accounting.
+	RequestLedgerRows          uint64
+	RequestLedgerResidentBytes uint64
+	RequestLedgerReservedBytes uint64
+	RequestLedgerAckRows       uint64
+	RequestLedgerAckBytes      uint64
+	// Execution-pin counters authenticate both the durable lifecycle rows and
+	// the active logical-scope index. Terminal tombstones remain retained to
+	// fence delayed acquire commands; only the active index is reclaimed.
+	ExecutionPinRecordCount   uint64
+	ActiveExecutionPinCount   uint64
+	ExecutionPinResidentBytes uint64
+	// RelationPlacementDigest authenticates the fixed-size incremental image
+	// accumulators for every placement-capable global-index relation. Zero means
+	// the opened bundle exposes no such relation contract.
+	RelationPlacementDigest [sha256.Size]byte
+	// FenceOriginDigest binds the original command fence. FenceApplied is the
+	// first apply index of the current fence, or zero for the initial fence.
+	FenceOriginDigest [sha256.Size]byte
+	FenceApplied      uint64
+	// HistoricalFenceCount and HistoricalFenceSlots authenticate retained
+	// historical fences and their retry slots. UnfencedSessionSlots counts
+	// retained ResultStaleFence slots, which do not belong to a command fence.
+	HistoricalFenceCount uint64
+	HistoricalFenceSlots uint64
+	UnfencedSessionSlots uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -88,14 +124,10 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	if err != nil {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
-	headerBytes := stateHeaderBytes
-	if stateHasTransactions(state) {
-		headerBytes = stateTransactionHeaderBytes
-	}
-	total := headerBytes + len(state.Binding.Distribution) +
-		len(state.Binding.Shard) + len(conf) + recordChecksumLen
-	if total > MaxStateEnvelopeBytes {
-		return dst, fmt.Errorf("%w: state envelope %d", ErrAdmissionBound, total)
+	headerBytes := stateEncodingHeader(state)
+	total, err := stateEncodingSize(state, len(conf))
+	if err != nil {
+		return dst, err
 	}
 	region := writableAppendRegion(dst, total)
 	if byteStringOverlap(region, state.Binding.Distribution) ||
@@ -144,12 +176,34 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	if state.Binding.OwnedRange.End.Max {
 		frame[392] = 1
 	}
-	if headerBytes == stateTransactionHeaderBytes {
+	if headerBytes >= stateTransactionHeaderBytes {
 		binary.LittleEndian.PutUint64(frame[400:408], state.TransactionControlCount)
 		binary.LittleEndian.PutUint64(frame[408:416], state.ActiveTransactionCount)
 		binary.LittleEndian.PutUint64(frame[416:424], state.TransactionPayloadRows)
 		binary.LittleEndian.PutUint64(frame[424:432], state.TransactionIntentRows)
 		binary.LittleEndian.PutUint64(frame[432:440], state.TransactionResidentBytes)
+	}
+	if headerBytes >= stateRequestLedgerHeaderBytes {
+		binary.LittleEndian.PutUint64(frame[440:448], state.RequestLedgerRows)
+		binary.LittleEndian.PutUint64(frame[448:456], state.RequestLedgerResidentBytes)
+		binary.LittleEndian.PutUint64(frame[456:464], state.RequestLedgerReservedBytes)
+		binary.LittleEndian.PutUint64(frame[464:472], state.RequestLedgerAckRows)
+		binary.LittleEndian.PutUint64(frame[472:480], state.RequestLedgerAckBytes)
+	}
+	if headerBytes >= stateExecutionPinHeaderBytes {
+		binary.LittleEndian.PutUint64(frame[480:488], state.ExecutionPinRecordCount)
+		binary.LittleEndian.PutUint64(frame[488:496], state.ActiveExecutionPinCount)
+		binary.LittleEndian.PutUint64(frame[496:504], state.ExecutionPinResidentBytes)
+	}
+	if headerBytes >= stateRelationPlacementHeaderBytes {
+		copy(frame[504:536], state.RelationPlacementDigest[:])
+	}
+	if headerBytes == stateFenceHeaderBytes {
+		copy(frame[536:568], state.FenceOriginDigest[:])
+		binary.LittleEndian.PutUint64(frame[568:576], state.FenceApplied)
+		binary.LittleEndian.PutUint64(frame[576:584], state.HistoricalFenceCount)
+		binary.LittleEndian.PutUint64(frame[584:592], state.HistoricalFenceSlots)
+		binary.LittleEndian.PutUint64(frame[592:600], state.UnfencedSessionSlots)
 	}
 	cursor := headerBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
@@ -167,7 +221,11 @@ func OpenState(src []byte) (State, error) {
 	headerBytes := int(binary.LittleEndian.Uint16(src[12:14]))
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
-		(headerBytes != stateHeaderBytes && headerBytes != stateTransactionHeaderBytes) ||
+		(headerBytes != stateHeaderBytes && headerBytes != stateTransactionHeaderBytes &&
+			headerBytes != stateRequestLedgerHeaderBytes &&
+			headerBytes != stateExecutionPinHeaderBytes &&
+			headerBytes != stateRelationPlacementHeaderBytes &&
+			headerBytes != stateFenceHeaderBytes) ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
@@ -220,14 +278,48 @@ func OpenState(src []byte) (State, error) {
 		return State{}, fmt.Errorf("%w: ownership range", ErrStateCorrupt)
 	}
 	state.Binding.OwnedRange.End.Max = src[392] == 1
-	if headerBytes == stateTransactionHeaderBytes {
+	if headerBytes >= stateTransactionHeaderBytes {
 		state.TransactionControlCount = binary.LittleEndian.Uint64(src[400:408])
 		state.ActiveTransactionCount = binary.LittleEndian.Uint64(src[408:416])
 		state.TransactionPayloadRows = binary.LittleEndian.Uint64(src[416:424])
 		state.TransactionIntentRows = binary.LittleEndian.Uint64(src[424:432])
 		state.TransactionResidentBytes = binary.LittleEndian.Uint64(src[432:440])
-		if !stateHasTransactions(state) {
+		if headerBytes == stateTransactionHeaderBytes && !stateHasTransactions(state) {
 			return State{}, fmt.Errorf("%w: noncanonical empty transaction extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes >= stateRequestLedgerHeaderBytes {
+		state.RequestLedgerRows = binary.LittleEndian.Uint64(src[440:448])
+		state.RequestLedgerResidentBytes = binary.LittleEndian.Uint64(src[448:456])
+		state.RequestLedgerReservedBytes = binary.LittleEndian.Uint64(src[456:464])
+		state.RequestLedgerAckRows = binary.LittleEndian.Uint64(src[464:472])
+		state.RequestLedgerAckBytes = binary.LittleEndian.Uint64(src[472:480])
+		if headerBytes == stateRequestLedgerHeaderBytes && !stateHasRequestLedger(state) {
+			return State{}, fmt.Errorf("%w: noncanonical empty request-ledger extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes >= stateExecutionPinHeaderBytes {
+		state.ExecutionPinRecordCount = binary.LittleEndian.Uint64(src[480:488])
+		state.ActiveExecutionPinCount = binary.LittleEndian.Uint64(src[488:496])
+		state.ExecutionPinResidentBytes = binary.LittleEndian.Uint64(src[496:504])
+		if headerBytes == stateExecutionPinHeaderBytes && !stateHasExecutionPins(state) {
+			return State{}, fmt.Errorf("%w: noncanonical empty execution-pin extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes >= stateRelationPlacementHeaderBytes {
+		copy(state.RelationPlacementDigest[:], src[504:536])
+		if headerBytes == stateRelationPlacementHeaderBytes && !stateHasRelationPlacement(state) {
+			return State{}, fmt.Errorf("%w: empty relation placement extension", ErrStateCorrupt)
+		}
+	}
+	if headerBytes == stateFenceHeaderBytes {
+		copy(state.FenceOriginDigest[:], src[536:568])
+		state.FenceApplied = binary.LittleEndian.Uint64(src[568:576])
+		state.HistoricalFenceCount = binary.LittleEndian.Uint64(src[576:584])
+		state.HistoricalFenceSlots = binary.LittleEndian.Uint64(src[584:592])
+		state.UnfencedSessionSlots = binary.LittleEndian.Uint64(src[592:600])
+		if !stateHasFence(state) {
+			return State{}, fmt.Errorf("%w: noncanonical empty fence extension", ErrStateCorrupt)
 		}
 	}
 	cursor := headerBytes
@@ -273,6 +365,15 @@ func validateState(state State) error {
 	if !validStateTransactionCounters(state) {
 		return fmt.Errorf("%w: invalid transaction counters", ErrStateCorrupt)
 	}
+	if !validStateRequestLedgerCounters(state) {
+		return fmt.Errorf("%w: invalid request-ledger counters", ErrStateCorrupt)
+	}
+	if !validStateExecutionPinCounters(state) {
+		return fmt.Errorf("%w: invalid execution-pin counters", ErrStateCorrupt)
+	}
+	if !validStateFenceCounters(state) {
+		return fmt.Errorf("%w: invalid fence counters", ErrStateCorrupt)
+	}
 	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
 		return fmt.Errorf("%w: unknown ConfState fields", ErrStateCorrupt)
 	}
@@ -285,6 +386,8 @@ func validateState(state State) error {
 			state.LastTerm != 1 || state.ReplicaSetVersion != 1 || state.SessionCount != 0 ||
 			state.SessionSlotCount != 0 || state.SessionEpochHighWater != 0 ||
 			state.AuthorityBindingCount != 0 || stateHasTransactions(state) ||
+			stateHasRequestLedger(state) ||
+			stateHasExecutionPins(state) ||
 			state.LastEntryDigest != state.BootstrapDigest {
 			return fmt.Errorf("%w: invalid static snapshot state", ErrStateCorrupt)
 		}
@@ -309,6 +412,11 @@ func validateState(state State) error {
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
 			state.ReplicaSetVersion >= state.Applied {
 			return fmt.Errorf("%w: ownership entry type", ErrStateCorrupt)
+		}
+	case RecordSchema:
+		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
+			state.ReplicaSetVersion >= state.Applied {
+			return fmt.Errorf("%w: schema entry type", ErrStateCorrupt)
 		}
 	case RecordImportedSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
@@ -388,7 +496,74 @@ func equalState(left, right State) bool {
 		left.TransactionPayloadRows == right.TransactionPayloadRows &&
 		left.TransactionIntentRows == right.TransactionIntentRows &&
 		left.TransactionResidentBytes == right.TransactionResidentBytes &&
+		left.RequestLedgerRows == right.RequestLedgerRows &&
+		left.RequestLedgerResidentBytes == right.RequestLedgerResidentBytes &&
+		left.RequestLedgerReservedBytes == right.RequestLedgerReservedBytes &&
+		left.RequestLedgerAckRows == right.RequestLedgerAckRows &&
+		left.RequestLedgerAckBytes == right.RequestLedgerAckBytes &&
+		left.ExecutionPinRecordCount == right.ExecutionPinRecordCount &&
+		left.ActiveExecutionPinCount == right.ActiveExecutionPinCount &&
+		left.ExecutionPinResidentBytes == right.ExecutionPinResidentBytes &&
+		left.RelationPlacementDigest == right.RelationPlacementDigest &&
+		left.FenceOriginDigest == right.FenceOriginDigest &&
+		left.FenceApplied == right.FenceApplied &&
+		left.HistoricalFenceCount == right.HistoricalFenceCount &&
+		left.HistoricalFenceSlots == right.HistoricalFenceSlots &&
+		left.UnfencedSessionSlots == right.UnfencedSessionSlots &&
 		proto.Equal(left.ConfState, right.ConfState)
+}
+
+func stateHasFence(state State) bool {
+	return state.FenceOriginDigest != ([sha256.Size]byte{}) || state.FenceApplied != 0 ||
+		state.HistoricalFenceCount != 0 || state.HistoricalFenceSlots != 0 ||
+		state.UnfencedSessionSlots != 0
+}
+
+func validStateFenceCounters(state State) bool {
+	if state.FenceApplied > state.Applied ||
+		state.HistoricalFenceCount > state.HistoricalFenceSlots ||
+		state.HistoricalFenceSlots > state.SessionSlotCount ||
+		state.UnfencedSessionSlots > state.SessionSlotCount-state.HistoricalFenceSlots {
+		return false
+	}
+	if state.FenceOriginDigest == ([sha256.Size]byte{}) &&
+		(state.FenceApplied != 0 || state.HistoricalFenceSlots != 0) {
+		return false
+	}
+	return state.HistoricalFenceSlots == 0 || state.FenceApplied != 0
+}
+
+func stateHasRelationPlacement(state State) bool {
+	return state.RelationPlacementDigest != ([sha256.Size]byte{})
+}
+
+func stateHasRequestLedger(state State) bool {
+	return state.RequestLedgerRows != 0 || state.RequestLedgerResidentBytes != 0 ||
+		state.RequestLedgerReservedBytes != 0 || state.RequestLedgerAckRows != 0 ||
+		state.RequestLedgerAckBytes != 0
+}
+
+func validStateRequestLedgerCounters(state State) bool {
+	if !stateHasRequestLedger(state) {
+		return true
+	}
+	// Every row has at least the fixed 34-byte request-ledger key and a
+	// checksummed value. Exact key+value accounting is verified at reopen.
+	const minimumResidentBytes = uint64(34 + 4)
+	if state.RequestLedgerRows == 0 || state.RequestLedgerResidentBytes == 0 ||
+		state.RequestLedgerRows > math.MaxUint64/minimumResidentBytes ||
+		state.RequestLedgerResidentBytes < state.RequestLedgerRows*minimumResidentBytes ||
+		state.RequestLedgerResidentBytes > math.MaxUint64-state.RequestLedgerReservedBytes {
+		return false
+	}
+	if state.RequestLedgerAckRows > state.RequestLedgerRows ||
+		state.RequestLedgerAckBytes > state.RequestLedgerResidentBytes ||
+		(state.RequestLedgerAckRows == 0) != (state.RequestLedgerAckBytes == 0) {
+		return false
+	}
+	return state.RequestLedgerRows != 0 && state.RequestLedgerResidentBytes != 0 &&
+		state.RequestLedgerRows <= math.MaxUint64/minimumResidentBytes &&
+		state.RequestLedgerResidentBytes >= state.RequestLedgerRows*minimumResidentBytes
 }
 
 func stateHasTransactions(state State) bool {
@@ -420,10 +595,40 @@ func validStateTransactionCounters(state State) bool {
 		state.TransactionResidentBytes <= state.TransactionControlCount*MaxTransactionResidentBytes
 }
 
+func stateHasExecutionPins(state State) bool {
+	return state.ExecutionPinRecordCount != 0 || state.ActiveExecutionPinCount != 0 ||
+		state.ExecutionPinResidentBytes != 0
+}
+
+func validStateExecutionPinCounters(state State) bool {
+	if !stateHasExecutionPins(state) {
+		return true
+	}
+	if state.ExecutionPinRecordCount == 0 ||
+		state.ExecutionPinRecordCount > state.Applied-1 ||
+		state.ExecutionPinRecordCount > MaxRetainedExecutionPins ||
+		state.ActiveExecutionPinCount > state.ExecutionPinRecordCount {
+		return false
+	}
+	const recordResident = uint64(executionPinRecordStorageKeyBytes + executionpin.RecordBytes)
+	const activeResident = uint64(executionPinActiveStorageKeyBytes + executionPinActiveValueBytes)
+	if state.ExecutionPinRecordCount > math.MaxUint64/recordResident ||
+		state.ActiveExecutionPinCount > math.MaxUint64/activeResident {
+		return false
+	}
+	recordBytes := state.ExecutionPinRecordCount * recordResident
+	activeBytes := state.ActiveExecutionPinCount * activeResident
+	return recordBytes <= math.MaxUint64-activeBytes &&
+		state.ExecutionPinResidentBytes == recordBytes+activeBytes
+}
+
 func stateSystemRowCount(state State) (uint64, bool) {
 	values := [...]uint64{
 		1, state.SessionCount, state.SessionSlotCount, state.AuthorityBindingCount,
+		state.HistoricalFenceCount,
 		state.TransactionControlCount, state.TransactionPayloadRows, state.TransactionIntentRows,
+		state.RequestLedgerRows,
+		state.ExecutionPinRecordCount, state.ActiveExecutionPinCount,
 	}
 	var total uint64
 	for _, value := range values {

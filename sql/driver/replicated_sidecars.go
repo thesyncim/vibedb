@@ -3,6 +3,8 @@ package driver
 import (
 	"fmt"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
 )
@@ -11,7 +13,9 @@ const (
 	// ReplicatedUserRecoveryJournalBytes is the exact record region required by
 	// the current replicated SQL user limits. The file also contains two
 	// storeio header sectors.
-	ReplicatedUserRecoveryJournalBytes = storeio.RecoveryJournalMaxCapacityBytes
+	// Retain the data-only geometry independently of the larger optional
+	// request-ledger system journal ceiling.
+	ReplicatedUserRecoveryJournalBytes = (uint64(16) << 20) + 34*storeio.RecoveryJournalMinSectorSize
 	// ReplicatedTransactionMarkerBytes is the exact fixed decision-log window.
 	// Replicated SQL has exactly the user and system participants; one MiB holds
 	// 2,048 current two-participant decisions so recycle is pressure handling,
@@ -63,6 +67,33 @@ func canonicalReplicatedApplySidecars() ReplicatedApplySidecarProfile {
 	}
 }
 
+// Retain the legacy ledger geometry as a compatibility floor. Transaction-
+// capable data members also need the 16 MiB payload ceiling; their exact
+// journal additionally includes the bounded intent and control rows. Every
+// profile is checked against its collection limits before opening a sidecar.
+func canonicalReplicatedLedgerApplySidecars() ReplicatedApplySidecarProfile {
+	limits := replicatedApplySystemLimitsForLedger(replicatedstate.MaxSessionRetryWindow, true)
+	return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: uint64(
+		storeio.RecoveryBatchRecordPaddedSizeForPayload(
+			storeio.RecoveryJournalMinSectorSize, limits.MaxBatchDocuments,
+			limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+		))}
+}
+
+func canonicalReplicatedApplySidecarsForLimits(limits ReplicatedShardStoreLimits) ReplicatedApplySidecarProfile {
+	if limits.MaxDocumentBytes == requestledger.MaxCommandBytes {
+		legacy := canonicalReplicatedLedgerApplySidecars()
+		required := uint64(
+			storeio.RecoveryBatchRecordPaddedSizeForPayload(storeio.RecoveryJournalMinSectorSize,
+				limits.MaxBatchDocuments, limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize))
+		if required > legacy.SystemRecoveryJournalBytes {
+			return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: required}
+		}
+		return legacy
+	}
+	return canonicalReplicatedApplySidecars()
+}
+
 func validateReplicatedShardStoreSidecarGrammar(
 	profile ReplicatedShardStoreSidecarProfile,
 ) error {
@@ -79,7 +110,11 @@ func validateReplicatedShardStoreSidecarGrammar(
 func validateReplicatedApplySidecarGrammar(
 	profile ReplicatedApplySidecarProfile,
 ) error {
-	if profile.SystemRecoveryJournalBytes != ReplicatedSystemRecoveryJournalBytes {
+	if profile != canonicalReplicatedApplySidecars() &&
+		profile != canonicalReplicatedLedgerApplySidecars() &&
+		(profile.SystemRecoveryJournalBytes < canonicalReplicatedLedgerApplySidecars().SystemRecoveryJournalBytes ||
+			profile.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes ||
+			profile.SystemRecoveryJournalBytes%storeio.RecoveryJournalMinSectorSize != 0) {
 		return fmt.Errorf(
 			"%w: invalid sealed system-journal geometry",
 			ErrReplicatedApplyMismatch,
@@ -122,6 +157,10 @@ func validateReplicatedApplySidecarsForLimits(
 ) error {
 	if err := validateReplicatedApplySidecarGrammar(profile); err != nil {
 		return err
+	}
+	if profile != canonicalReplicatedApplySidecarsForLimits(limits) ||
+		profile.SystemRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes {
+		return fmt.Errorf("%w: system journal does not match the frozen collection profile", ErrReplicatedApplyMismatch)
 	}
 	required := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		storeio.RecoveryJournalMinSectorSize,

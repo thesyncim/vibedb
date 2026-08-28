@@ -242,22 +242,6 @@ func NewAuthenticatedPeerRuntime(options AuthenticatedPeerOptions) (*Authenticat
 		identity.TrustDomain != options.Registry.TrustDomain() {
 		return nil, ErrInvalidPeerServer
 	}
-	for index, authorization := range options.Owner.MembershipAuthorizations {
-		if index >= len(options.Owner.Members) {
-			return nil, ErrInvalidPeerServer
-		}
-		if err := options.Registry.AuthorizeTransition(rafttransport.TransitionGrant{
-			Group:             options.Owner.Members[index].Group,
-			TransitionID:      authorization.TransitionID,
-			MetadataEpoch:     authorization.MetadataEpoch,
-			CatalogGeneration: authorization.CatalogGeneration,
-			SourceMember:      authorization.SourceMember,
-			TargetMember:      authorization.TargetMember,
-		}); err != nil {
-			return nil, err
-		}
-	}
-
 	transportOptions := options.Transport
 	transportOptions.Registry = options.Registry
 	transportOptions.Dialer = rafttransport.TLSOrdinaryDialer{
@@ -271,9 +255,7 @@ func NewAuthenticatedPeerRuntime(options AuthenticatedPeerOptions) (*Authenticat
 
 	ownerOptions := options.Owner
 	ownerOptions.Outbound = transport
-	if len(ownerOptions.MembershipAuthorizations) != 0 {
-		ownerOptions.MembershipAuthority = options.Registry
-	}
+	ownerOptions.MembershipAuthority = options.Registry
 	owner, err := NewOwner(ownerOptions)
 	if err != nil {
 		_ = transport.Close()
@@ -360,8 +342,9 @@ func (runtime *AuthenticatedPeerRuntime) Run(parent context.Context) error {
 		cause = ErrPeerServerClosed
 	}
 	cancel(cause)
-	_ = runtime.server.Close()
-	_ = runtime.transport.Close()
+	// Both components close their resources when ctx is canceled. Calling
+	// Close as well races that cause with their independent "closed" sentinel
+	// and can turn an ordinary requested shutdown into a spurious failure.
 
 	joined := cause
 	for completed := 1; completed < 3; completed++ {
@@ -380,6 +363,28 @@ func (runtime *AuthenticatedPeerRuntime) Owner() *Owner {
 		return nil
 	}
 	return runtime.owner
+}
+
+// TransportStats returns one detached outbound-peer counter snapshot. It is an
+// observability capability only: the caller cannot enqueue, drain, or otherwise
+// influence transport work through the returned value. SentBytes counts exact
+// encoded Raft frame bytes and excludes the four-byte stream record prefix.
+func (runtime *AuthenticatedPeerRuntime) TransportStats(
+	node rafttransport.NodeID,
+) (rafttransport.PeerStats, error) {
+	if runtime == nil || runtime.transport == nil {
+		return rafttransport.PeerStats{}, rafttransport.ErrNodeNotFound
+	}
+	return runtime.transport.Stats(node)
+}
+
+// InboundStats returns a detached snapshot of the authenticated peer listener.
+// It exposes no listener or receiver authority.
+func (runtime *AuthenticatedPeerRuntime) InboundStats() PeerServerStats {
+	if runtime == nil || runtime.server == nil {
+		return PeerServerStats{}
+	}
+	return runtime.server.Stats()
 }
 
 // Started closes when the complete runtime has either published all three

@@ -87,9 +87,9 @@ type GenerationActivationSettler interface {
 
 // PublishGenerationSelection durably records a validated candidate as the
 // sole next family generation. It does not replace the logical WAL leaf. On
-// success this source handle becomes non-serving and must be closed; Open of
-// its logical path then returns the selected candidate in activation-pending
-// state.
+// success this source handle becomes non-serving. AdoptSelectedGeneration may
+// recover the exact candidate in place for its live owner; alternatively close
+// it and Open its logical path to recover the candidate activation-pending.
 func (store *Store) PublishGenerationSelection(
 	builder *GenerationBuilder,
 ) (identity GenerationActivationIdentity, resultErr error) {
@@ -126,6 +126,7 @@ func (store *Store) PublishGenerationSelection(
 		seal.sourceRecordSequence != store.current.recordSequence ||
 		seal.sourceChainDigest != store.current.chainDigest ||
 		seal.sourceCurrentIncarnation != store.current.currentIncarnation ||
+		seal.sourceReadyID != generationReadyFloor(store.current, store.generation) ||
 		seal.sourceFirst != store.current.first || seal.sourceLast != store.current.last ||
 		candidate.Info.FileID == ([16]byte{}) ||
 		candidate.Info.HeaderDigest == ([32]byte{}) ||
@@ -482,6 +483,12 @@ func (store *Store) validateRetiringSourceLocked(state familyState) error {
 	if current.currentIncarnation != seal.sourceCurrentIncarnation {
 		return fmt.Errorf("%w: retiring source incarnation", ErrGenerationSource)
 	}
+	if current.retryPresent && (current.retry.incarnation != current.currentIncarnation || current.retry.readyID != seal.sourceReadyID) {
+		return fmt.Errorf("%w: retiring source Ready cursor", ErrGenerationSource)
+	}
+	// With no new durable Ready, the cursor can be inherited from a previous
+	// generation seal. Its exact source chain is authenticated above; selection
+	// and live adoption also check that inherited cursor without rescanning WAL.
 	if current.topologyRecoveryEpoch != seal.topologyRecoveryEpoch {
 		return fmt.Errorf("%w: retiring source topology epoch", ErrGenerationSource)
 	}

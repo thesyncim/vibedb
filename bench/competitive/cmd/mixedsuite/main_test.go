@@ -3,14 +3,43 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
 )
+
+func TestCleanCheckoutMetadataHasNoEmptyStatusRecord(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{
+		{"init", "--quiet"},
+		{"-c", "user.name=metadata-test", "-c", "user.email=metadata@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "fixture"},
+	} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+	}
+	cfg := config{mixedBin: "unavailable-test-binary", engines: []string{"vibedb", "sqlite"}}
+	meta := collectMetadata(cfg, nil, time.Unix(1, 0))
+	if meta["git-dirty"] != "false" || len(meta["git-commit"]) != 40 {
+		t.Fatalf("clean source provenance: dirty=%q revision=%q", meta["git-dirty"], meta["git-commit"])
+	}
+	if status, present := meta["git-status"]; present {
+		t.Fatalf("clean checkout emitted an empty optional status record: %q", status)
+	}
+	if err := os.WriteFile("untracked.txt", []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirty := collectMetadata(cfg, nil, time.Unix(1, 0))
+	if dirty["git-dirty"] != "true" || !strings.Contains(dirty["git-status"], "untracked.txt") {
+		t.Fatalf("dirty source provenance was lost: dirty=%q status=%q", dirty["git-dirty"], dirty["git-status"])
+	}
+}
 
 func TestLatinSquareScheduleIsDeterministicAndPositionBalanced(t *testing.T) {
 	engines := []string{"a", "b", "c", "d", "e"}

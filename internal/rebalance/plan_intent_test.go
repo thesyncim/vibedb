@@ -5,7 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -95,5 +97,97 @@ func TestReplicaMoveOperationIdentityStableAndExact(t *testing.T) {
 	second := replicaMoveOperationID(&many)
 	if first == (OperationID{}) || second == (OperationID{}) || first == second {
 		t.Fatalf("full participant identity not retained: first=%x second=%x", first, second)
+	}
+}
+
+func TestReplicaMoveJournalIntentRemainsSmallAndImmutableAfterSnapshotBinding(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	bound := bindMoveTestPlan(plan)
+	unboundIntent, err := AppendReplicaMoveIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundIntent, err := AppendReplicaMoveIntent(nil, catalog, bound)
+	if err != nil || !bytes.Equal(unboundIntent, boundIntent) {
+		t.Fatalf("journal intent changed after binding: bytes=%d equal=%v err=%v",
+			len(boundIntent), bytes.Equal(unboundIntent, boundIntent), err)
+	}
+	if len(boundIntent) >= 40<<10 {
+		t.Fatalf("immutable move intent exceeds replicated operation cell: %d", len(boundIntent))
+	}
+	identity, err := InspectReplicaMoveIntent(boundIntent)
+	if err != nil || identity.Operation != plan.OperationID() ||
+		identity.SourceGeneration != plan.CatalogGeneration() ||
+		identity.Request.RetiringReplica != plan.RetiringReplica() {
+		t.Fatalf("inspected identity=%+v err=%v", identity, err)
+	}
+	certificate := &replicatedstate.SnapshotBaseCertificate{
+		Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState},
+		Digest:   bound.baseDigest,
+	}
+	recovered, err := OpenReplicaMoveIntent(boundIntent, catalog, raftmodel.Publication{
+		Applied: 9, ReplicaSetVersion: 9, ConfState: plan.voterConf,
+	}, certificate)
+	if err != nil || !recovered.SnapshotBaseBound() ||
+		recovered.OperationID() != plan.OperationID() {
+		t.Fatalf("bound journal recovery=%+v err=%v", recovered, err)
+	}
+}
+
+func TestReplicaMoveJournalRetainsRetiringReplicaAcrossBothCatalogCuts(t *testing.T) {
+	plan, sourceCatalog := moveTestPlan(t)
+	bound := bindMoveTestPlan(plan)
+	intent, err := AppendReplicaMoveIntent(nil, sourceCatalog, bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetCatalog, err := bound.CatalogSnapshot(sourceCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postRemoveCatalog := moveTestPostRemoveCatalog(t, bound, 11)
+	certificate := &replicatedstate.SnapshotBaseCertificate{
+		Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState},
+		Digest:   bound.baseDigest,
+	}
+	for _, catalog := range []*gateway.Snapshot{targetCatalog, postRemoveCatalog} {
+		recovered, openErr := OpenReplicaMoveIntent(intent, catalog, raftmodel.Publication{
+			Applied: 11, ReplicaSetVersion: 11, ConfState: bound.removedConf,
+		}, certificate)
+		if openErr != nil || recovered.RetiringReplica() != plan.RetiringReplica() {
+			t.Fatalf("generation=%d retiring=%+v want=%+v err=%v", catalog.Generation(),
+				recovered.RetiringReplica(), plan.RetiringReplica(), openErr)
+		}
+		reencoded, appendErr := AppendReplicaMoveIntent(nil, catalog, recovered)
+		if appendErr != nil || !bytes.Equal(intent, reencoded) {
+			t.Fatalf("generation=%d canonical replay equal=%v err=%v",
+				catalog.Generation(), bytes.Equal(intent, reencoded), appendErr)
+		}
+	}
+
+	persisted, _, err := openPersistedPlanIntent(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, corrupt := range map[string]func(*persistedMoveRequest){
+		"old missing node":             func(request *persistedMoveRequest) { request.RetiringNode = [16]byte{} },
+		"old missing store":            func(request *persistedMoveRequest) { request.RetiringStore = [16]byte{} },
+		"old missing incarnation":      func(request *persistedMoveRequest) { request.RetiringIncarnation = 0 },
+		"old missing control endpoint": func(request *persistedMoveRequest) { request.RetiringControl = "" },
+		"wrong member binding":         func(request *persistedMoveRequest) { request.RetiringMember++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := persisted
+			corrupt(&changed.Request)
+			raw, appendErr := appendPersistedPlanIntent(nil, changed)
+			if appendErr != nil {
+				t.Fatal(appendErr)
+			}
+			if _, openErr := OpenReplicaMoveIntent(raw, postRemoveCatalog,
+				raftmodel.Publication{Applied: 11, ReplicaSetVersion: 11, ConfState: bound.removedConf},
+				certificate); !errors.Is(openErr, ErrPlanIntent) {
+				t.Fatalf("invalid old/forged identity error = %v", openErr)
+			}
+		})
 	}
 }

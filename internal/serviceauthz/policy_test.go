@@ -109,6 +109,113 @@ func TestTransactionRecoveryCapabilityIsIndependent(t *testing.T) {
 	}
 }
 
+func TestRequestLedgerCapabilityIsIndependent(t *testing.T) {
+	ledger, writer, topology, recovery := authzNode(30), authzNode(31),
+		authzNode(32), authzNode(33)
+	policy, err := NewPolicy(12, []Entry{
+		{Node: ledger, Capabilities: CapabilityRequestLedger},
+		{Node: writer, Capabilities: CapabilityDataWrite},
+		{Node: topology, Capabilities: CapabilityTopology},
+		{Node: recovery, Capabilities: CapabilityTransactionRecovery},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Check(ledger, CapabilityRequestLedger); got != DecisionAllow {
+		t.Fatalf("request ledger denied: %d", got)
+	}
+	for _, node := range []rafttransport.NodeID{writer, topology, recovery} {
+		if got := policy.Check(node, CapabilityRequestLedger); got != DecisionDenyCapability {
+			t.Fatalf("ordinary capability %x implied request ledger: %d", node, got)
+		}
+	}
+	for _, capability := range []Capability{
+		CapabilityDataRead, CapabilityDataWrite, CapabilitySchema,
+		CapabilityMembership, CapabilityTopology, CapabilityTransactionRecovery,
+	} {
+		if got := policy.Check(ledger, capability); got != DecisionDenyCapability {
+			t.Fatalf("request ledger implied capability %x: %d", capability, got)
+		}
+	}
+}
+
+func TestExecutionPinCapabilityIsIndependentFromTopology(t *testing.T) {
+	pin, topology, writer := authzNode(40), authzNode(41), authzNode(42)
+	policy, err := NewPolicy(12, []Entry{
+		{Node: pin, Capabilities: CapabilityExecutionPin},
+		{Node: topology, Capabilities: CapabilityTopology},
+		{Node: writer, Capabilities: CapabilityDataWrite},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Check(pin, CapabilityExecutionPin); got != DecisionAllow {
+		t.Fatalf("execution-pin operator denied: %d", got)
+	}
+	for _, capability := range []Capability{
+		CapabilityTopology, CapabilityDataRead, CapabilityDataWrite,
+		CapabilitySchema, CapabilityMembership, CapabilityTransactionRecovery,
+	} {
+		if got := policy.Check(pin, capability); got != DecisionDenyCapability {
+			t.Fatalf("execution-pin implied capability %x: %d", capability, got)
+		}
+	}
+	for _, node := range []rafttransport.NodeID{topology, writer} {
+		if got := policy.Check(node, CapabilityExecutionPin); got != DecisionDenyCapability {
+			t.Fatalf("ordinary authority %x implied execution-pin: %d", node, got)
+		}
+	}
+}
+
+func TestBackupCapabilityCannotAcquireServingOrTopologyAuthority(t *testing.T) {
+	backup := authzNode(31)
+	policy, err := NewPolicy(9, []Entry{{Node: backup, Capabilities: CapabilityBackup}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Check(backup, CapabilityBackup) != DecisionAllow {
+		t.Fatal("backup authority denied")
+	}
+	for _, capability := range []Capability{CapabilityDataRead, CapabilityDataWrite, CapabilitySchema,
+		CapabilityDelegate, CapabilityMembership, CapabilityTopology, CapabilityTransactionRecovery,
+		CapabilityRequestLedger, CapabilityExecutionPin} {
+		if policy.Check(backup, capability) != DecisionDenyCapability {
+			t.Fatalf("backup principal acquired capability %x", capability)
+		}
+	}
+}
+
+func TestRestoreActivationCapabilityIsIndependent(t *testing.T) {
+	restore, backup, topology, membership := authzNode(51), authzNode(52),
+		authzNode(53), authzNode(54)
+	policy, err := NewPolicy(13, []Entry{
+		{Node: restore, Capabilities: CapabilityRestoreActivate},
+		{Node: backup, Capabilities: CapabilityBackup},
+		{Node: topology, Capabilities: CapabilityTopology},
+		{Node: membership, Capabilities: CapabilityMembership},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Check(restore, CapabilityRestoreActivate); got != DecisionAllow {
+		t.Fatalf("restore activation denied: %d", got)
+	}
+	for _, node := range []rafttransport.NodeID{backup, topology, membership} {
+		if got := policy.Check(node, CapabilityRestoreActivate); got != DecisionDenyCapability {
+			t.Fatalf("ordinary control authority %x implied restore activation: %d", node, got)
+		}
+	}
+	for _, capability := range []Capability{
+		CapabilityDataRead, CapabilityDataWrite, CapabilitySchema, CapabilityDelegate,
+		CapabilityMembership, CapabilityTopology, CapabilityTransactionRecovery,
+		CapabilityRequestLedger, CapabilityExecutionPin, CapabilityBackup,
+	} {
+		if got := policy.Check(restore, capability); got != DecisionDenyCapability {
+			t.Fatalf("restore activation implied capability %x: %d", capability, got)
+		}
+	}
+}
+
 func TestAuthorityContextIsExactAndAllocationFreeOnRead(t *testing.T) {
 	authority := Authority{Node: authzNode(11), Generation: 19}
 	ctx, err := WithAuthority(context.Background(), authority)

@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"math"
+	"math/bits"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -25,13 +28,24 @@ const (
 	RelationGlobalIndex
 )
 
+// GlobalIndexKeyEncoding identifies the physical row-key grammar authenticated
+// by a relation manifest.
+type GlobalIndexKeyEncoding uint8
+
+const GlobalIndexKeyCanonicalTuple GlobalIndexKeyEncoding = 1
+
 // GlobalIndexProfile is the schema-generation-bound identity and value shape
 // for one independently stored exact/global index relation.
 type GlobalIndexProfile struct {
-	IndexID      uint64
-	Incarnation  uint64
-	LocatorCount uint8
-	Unique       bool
+	IndexID       uint64
+	Incarnation   uint64
+	LocatorCount  uint8
+	Unique        bool
+	KeyEncoding   GlobalIndexKeyEncoding
+	KeyArity      uint8
+	TupleVersion  distribution.TupleVersion
+	MapperVersion distribution.MapperVersion
+	BucketBits    uint8
 }
 
 // RelationCollection binds one dense bundle-local slot to its already-opened
@@ -48,16 +62,19 @@ type RelationCollection struct {
 }
 
 type relationCollection struct {
-	id            replication.RelationID
-	kind          RelationKind
-	name          string
-	target        CollectionTarget
-	localIndexes  []store.IndexDefinition
-	globalIndex   GlobalIndexProfile
-	contract      [sha256.Size]byte
-	openedImage   [sha256.Size]byte
-	openedApplied uint64
-	openedGen     uint64
+	id               replication.RelationID
+	kind             RelationKind
+	name             string
+	target           CollectionTarget
+	localIndexes     []store.IndexDefinition
+	globalIndex      GlobalIndexProfile
+	contract         [sha256.Size]byte
+	openedImage      [sha256.Size]byte
+	openedApplied    uint64
+	openedGen        uint64
+	placement        relationPlacementAccumulator
+	placementApplied uint64
+	placementGen     uint64
 }
 
 var relationManifestDigestDomain = []byte(
@@ -72,8 +89,27 @@ func prepareRelationCollections(
 	binding Binding,
 	input []RelationCollection,
 ) ([]relationCollection, [sha256.Size]byte, error) {
+	relations, err := prepareRelationSchemas(input)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, err
+	}
+	for _, spec := range input {
+		if err := validateRelationTarget(spec); err != nil {
+			return nil, [sha256.Size]byte{}, fmt.Errorf("relation %d: %w", spec.Relation, err)
+		}
+	}
+	manifest := relationManifestDigest(binding.SchemaGeneration, relations)
+	for ordinal := range relations {
+		relations[ordinal].contract = relationContractDigest(manifest, &relations[ordinal])
+	}
+	return relations, manifest, nil
+}
+
+// prepareRelationSchemas is shared by cold allocation and live OpenBundle.
+// It never substitutes a collection or a mutation validator for live serving.
+func prepareRelationSchemas(input []RelationCollection) ([]relationCollection, error) {
 	if len(input) == 0 || len(input) > replication.MaxRelationsPerBundle {
-		return nil, [sha256.Size]byte{}, ErrInvalidCollection
+		return nil, ErrInvalidCollection
 	}
 	relations := make([]relationCollection, len(input))
 	for ordinal := range input {
@@ -83,25 +119,25 @@ func prepareRelationCollections(
 			len(spec.Name) > replication.MaxIdentityBytes ||
 			!utf8.ValidString(spec.Name) || strings.IndexByte(spec.Name, 0) >= 0 ||
 			spec.Name == systemCollectionName {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"%w: relation slot %d identity", ErrInvalidCollection, ordinal+1,
 			)
 		}
 		for prior := 0; prior < ordinal; prior++ {
 			if spec.Name == input[prior].Name {
-				return nil, [sha256.Size]byte{}, fmt.Errorf(
+				return nil, fmt.Errorf(
 					"%w: duplicate relation name", ErrInvalidCollection,
 				)
 			}
 		}
-		if err := validateRelationTarget(*spec); err != nil {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
+		if err := validateRelationSchema(*spec); err != nil {
+			return nil, fmt.Errorf(
 				"relation %d: %w", spec.Relation, err,
 			)
 		}
 		indexes, err := canonicalLocalIndexes(spec.LocalIndexes)
 		if err != nil {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"relation %d: %w", spec.Relation, err,
 			)
 		}
@@ -110,11 +146,7 @@ func prepareRelationCollections(
 			target: spec.Target, localIndexes: indexes, globalIndex: spec.GlobalIndex,
 		}
 	}
-	manifest := relationManifestDigest(binding.SchemaGeneration, relations)
-	for ordinal := range relations {
-		relations[ordinal].contract = relationContractDigest(manifest, &relations[ordinal])
-	}
-	return relations, manifest, nil
+	return relations, nil
 }
 
 func validateBundleTransactionProfile(
@@ -149,12 +181,13 @@ func validateBundleTransactionProfile(
 	// capacities sum higher.
 	relationBytes = min(relationBytes, int64(replication.MaxCommandBytes))
 	relationDocuments = min(relationDocuments, replication.MaxMutations)
+	fenceRowBytes := len(sessionFenceKey(0, 0)) + sessionFenceBytes
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
+		sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceRowBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
+		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3+fenceRowBytes)
 	requiredDocuments, err := RequiredBundleTransactionDocuments(
 		relationDocuments, options.RetryWindow, reservedCapture,
 	)
@@ -183,10 +216,12 @@ func validateBundleTransactionProfile(
 
 // RequiredBundleTransactionDocuments returns the exact mutation-slot ceiling
 // for one replicated apply transaction. A data command publishes state,
-// session and slot alongside all relation changes. Session open publishes
+// session and slot alongside all relation changes, and may update or delete
+// one historical fence when overwriting an old slot. Session open publishes
 // state, authority, session and slot but no relation batch. Release deletes one
-// session header plus every retry slot and publishes state. A reserved
-// transition capture contributes one additional private row to every shape.
+// session header and every retry slot, updates or deletes at most one historical
+// fence per slot, and publishes state. A reserved transition capture contributes
+// one additional private row to every shape.
 func RequiredBundleTransactionDocuments(
 	relationDocuments int,
 	retryWindow uint16,
@@ -196,7 +231,7 @@ func RequiredBundleTransactionDocuments(
 		retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
 		return 0, ErrInvalidOptions
 	}
-	required := max(int(retryWindow)+2, relationDocuments+3, 4)
+	required := max(2*int(retryWindow)+2, relationDocuments+4, 4)
 	if reservedCapture {
 		required++
 	}
@@ -204,21 +239,34 @@ func RequiredBundleTransactionDocuments(
 }
 
 func validateRelationTarget(spec RelationCollection) error {
+	if err := validateRelationSchema(spec); err != nil {
+		return err
+	}
 	t := spec.Target
 	if t.Collection == nil || t.Collection.HasSchema() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() ||
-		t.Collection.HasOpaqueValues() || t.Validation != ValidationDeterministicMutation ||
-		t.ValidationDigest == ([sha256.Size]byte{}) || t.Validator == nil {
+		t.Collection.HasOpaqueValues() || t.Validator == nil {
+		return ErrInvalidCollection
+	}
+	l := t.Limits
+	if l.MaxKeyBytes != t.Collection.MaxKeyBytes() || l.MaxDocumentBytes != t.Collection.MaxDocumentBytes() ||
+		l.MaxDistinctMutations != t.Collection.MaxBatchDocuments() || l.MaxBatchBytes != t.Collection.MaxBatchBytes() ||
+		spec.Kind == RelationGlobalIndex && t.Collection.HasIndexes() {
+		return ErrInvalidCollection
+	}
+	return nil
+}
+
+func validateRelationSchema(spec RelationCollection) error {
+	t := spec.Target
+	if t.Validation != ValidationDeterministicMutation || t.ValidationDigest == ([sha256.Size]byte{}) {
 		return ErrInvalidCollection
 	}
 	l := t.Limits
 	if l.MaxKeyBytes <= 0 || l.MaxKeyBytes > replication.MaxMutationKeyBytes ||
 		l.MaxDocumentBytes <= 0 || l.MaxDocumentBytes > replication.MaxMutationValueBytes ||
 		l.MaxDistinctMutations <= 0 || l.MaxDistinctMutations > MaxDistinctMutations ||
-		l.MaxBatchBytes <= 0 || l.MaxKeyBytes != t.Collection.MaxKeyBytes() ||
-		l.MaxDocumentBytes != t.Collection.MaxDocumentBytes() ||
-		l.MaxDistinctMutations != t.Collection.MaxBatchDocuments() ||
-		l.MaxBatchBytes != t.Collection.MaxBatchBytes() {
+		l.MaxBatchBytes <= 0 {
 		return ErrInvalidCollection
 	}
 	switch spec.Kind {
@@ -230,7 +278,12 @@ func validateRelationTarget(spec RelationCollection) error {
 		profile := spec.GlobalIndex
 		if profile.IndexID == 0 || profile.Incarnation == 0 ||
 			profile.LocatorCount == 0 || profile.LocatorCount > 8 ||
-			len(spec.LocalIndexes) != 0 || t.Collection.HasIndexes() {
+			profile.KeyEncoding != GlobalIndexKeyCanonicalTuple || profile.KeyArity == 0 ||
+			profile.KeyArity > distribution.KeyspaceWidth ||
+			profile.TupleVersion != distribution.CurrentTupleVersion ||
+			profile.MapperVersion != distribution.NativeMapperVersion ||
+			!distribution.ValidVirtualBucketBits(profile.BucketBits) ||
+			len(spec.LocalIndexes) != 0 {
 			return ErrInvalidCollection
 		}
 	default:
@@ -294,27 +347,137 @@ func validateRelationIndexCatalog(
 func openedRelationImageDigest(
 	relation *relationCollection,
 	snapshot *durable.Snapshot,
-) ([sha256.Size]byte, error) {
+	owned distribution.KeyRange,
+) ([sha256.Size]byte, relationPlacementAccumulator, error) {
 	if relation == nil || snapshot == nil {
-		return [sha256.Size]byte{}, ErrInvalidCollection
+		return [sha256.Size]byte{}, relationPlacementAccumulator{}, ErrInvalidCollection
 	}
 	h, err := newCanonicalImageHasher(
 		relation.name, relation.target.Validation,
 		relation.target.ValidationDigest, relation.target.Validator,
 	)
 	if err != nil {
-		return [sha256.Size]byte{}, err
+		return [sha256.Size]byte{}, relationPlacementAccumulator{}, err
 	}
+	placementValidator, placementEnabled :=
+		relation.target.Validator.(GlobalIndexPlacementValidator)
+	placementRange := owned
+	if placementEnabled {
+		placementRange = placementValidator.GlobalIndexPlacementRange()
+		if !placementRange.Valid() {
+			return [sha256.Size]byte{}, relationPlacementAccumulator{}, ErrSchemaProfile
+		}
+	}
+	placement := newRelationPlacementAccumulator(placementRange, placementEnabled)
 	if err := snapshot.RangeRaw(func(key, value []byte) error {
 		if relation.kind == RelationGlobalIndex &&
 			!validGlobalIndexLocator(value, relation.globalIndex.LocatorCount) {
 			return ErrSchemaProfile
 		}
+		if relation.kind == RelationGlobalIndex && placementEnabled {
+			point, ok := placementValidator.GlobalIndexPlacementPoint(key)
+			if !ok {
+				return ErrSchemaProfile
+			}
+			placement.addRaw(point, key, value)
+		}
 		return h.add(key, value)
 	}); err != nil {
-		return [sha256.Size]byte{}, err
+		return [sha256.Size]byte{}, relationPlacementAccumulator{}, err
 	}
-	return h.sum(), nil
+	return h.sum(), placement, nil
+}
+
+var certifiedIncrementalRowDomain = []byte("vibedb/range-split/child-stage-row\x00")
+var certifiedIncrementalEmptyDomain = []byte("vibedb/range-split/child-stage-empty\x00")
+
+// openedRelationImageDigests validates each row once while deriving both the
+// ordinary ordered digest and the constant-space split-import root. The latter
+// is used only to authenticate an untouched imported split child at reopen.
+func openedRelationImageDigests(
+	relation *relationCollection,
+	snapshot *durable.Snapshot,
+	owned distribution.KeyRange,
+) (
+	ordered, incremental [sha256.Size]byte,
+	placement relationPlacementAccumulator,
+	err error,
+) {
+	if relation == nil || snapshot == nil {
+		return ordered, incremental, placement, ErrInvalidCollection
+	}
+	canonical, err := newCanonicalImageHasher(
+		relation.name, relation.target.Validation,
+		relation.target.ValidationDigest, relation.target.Validator,
+	)
+	if err != nil {
+		return ordered, incremental, placement, err
+	}
+	placementValidator, placementEnabled :=
+		relation.target.Validator.(GlobalIndexPlacementValidator)
+	placementRange := owned
+	if placementEnabled {
+		placementRange = placementValidator.GlobalIndexPlacementRange()
+		if !placementRange.Valid() {
+			return ordered, incremental, placement, ErrSchemaProfile
+		}
+	}
+	placement = newRelationPlacementAccumulator(placementRange, placementEnabled)
+	rowHasher := sha256.New()
+	var size [8]byte
+	err = snapshot.RangeRaw(func(key, value []byte) error {
+		if relation.kind == RelationGlobalIndex &&
+			!validGlobalIndexLocator(value, relation.globalIndex.LocatorCount) {
+			return ErrSchemaProfile
+		}
+		if relation.kind == RelationGlobalIndex && placementEnabled {
+			point, ok := placementValidator.GlobalIndexPlacementPoint(key)
+			if !ok {
+				return ErrSchemaProfile
+			}
+			placement.addRaw(point, key, value)
+		}
+		if err := canonical.add(key, value); err != nil {
+			return err
+		}
+		row := certifiedIncrementalRowDigest(rowHasher, &size, key, value)
+		addCertifiedIncrementalDigest(&incremental, row)
+		return nil
+	})
+	if err != nil {
+		return ordered, [sha256.Size]byte{}, relationPlacementAccumulator{}, err
+	}
+	if snapshot.Len() == 0 {
+		incremental = sha256.Sum256(certifiedIncrementalEmptyDomain)
+	}
+	return canonical.sum(), incremental, placement, nil
+}
+
+func certifiedIncrementalRowDigest(
+	h hash.Hash, size *[8]byte, key, value []byte,
+) [sha256.Size]byte {
+	h.Reset()
+	_, _ = h.Write(certifiedIncrementalRowDomain)
+	writeHashFrame(h, key)
+	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = h.Write(size[:])
+	valueDigest := sha256.Sum256(value)
+	_, _ = h.Write(valueDigest[:])
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
+
+func addCertifiedIncrementalDigest(target *[sha256.Size]byte, value [sha256.Size]byte) {
+	carry := uint64(0)
+	for offset := 0; offset < sha256.Size; offset += 8 {
+		next, nextCarry := bits.Add64(
+			binary.LittleEndian.Uint64(target[offset:offset+8]),
+			binary.LittleEndian.Uint64(value[offset:offset+8]), carry,
+		)
+		binary.LittleEndian.PutUint64(target[offset:offset+8], next)
+		carry = nextCarry
+	}
 }
 
 func canonicalRelationImageDigest(
@@ -354,7 +517,7 @@ func relationManifestDigest(
 ) [sha256.Size]byte {
 	h := sha256.New()
 	_, _ = h.Write(relationManifestDigestDomain)
-	var fixed [24]byte
+	var fixed [32]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], schemaGeneration)
 	binary.LittleEndian.PutUint64(fixed[8:16], uint64(len(relations)))
 	_, _ = h.Write(fixed[:16])
@@ -368,9 +531,13 @@ func relationManifestDigest(
 			fixed[3] = 0
 		}
 		fixed[4] = relation.globalIndex.LocatorCount
-		clear(fixed[5:8])
+		fixed[5] = byte(relation.globalIndex.KeyEncoding)
+		fixed[6] = relation.globalIndex.KeyArity
+		fixed[7] = relation.globalIndex.BucketBits
 		binary.LittleEndian.PutUint64(fixed[8:16], relation.globalIndex.IndexID)
 		binary.LittleEndian.PutUint64(fixed[16:24], relation.globalIndex.Incarnation)
+		binary.LittleEndian.PutUint32(fixed[24:28], uint32(relation.globalIndex.TupleVersion))
+		binary.LittleEndian.PutUint32(fixed[28:32], uint32(relation.globalIndex.MapperVersion))
 		_, _ = h.Write(fixed[:])
 		writeHashFrame(h, []byte(relation.name))
 		_, _ = h.Write([]byte{byte(relation.target.Validation)})

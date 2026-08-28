@@ -11,14 +11,17 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply(t *testing.T) {
@@ -547,23 +550,13 @@ func newRealTransferRuntimeWithLearners(
 	voters, learners []uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
 	t.Helper()
-	index, term := uint64(1), uint64(1)
+	bootstrap := realTransferStaticBootstrap(t, voters, learners)
 	walPath := filepath.Join(t.TempDir(), "member.wal")
 	sqlPath := filepath.Join(t.TempDir(), "member.vdb")
-	options := raftstore.Options{
-		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes,
-	}
+	options := realTransferWALOptions()
 	wal, err := raftstore.Create(walPath, identity, realTransferWALKey(), raftstore.Bootstrap{
 		TopologyRecoveryEpoch: 29,
-		Snapshot: &pb.Snapshot{
-			Data: []byte("multiraft-real-transfer-bootstrap"),
-			Metadata: &pb.SnapshotMetadata{
-				Index: &index, Term: &term, ConfState: &pb.ConfState{
-					Voters: append([]uint64(nil), voters...), Learners: append([]uint64(nil), learners...),
-				},
-			},
-		},
+		Snapshot:              bootstrap,
 	}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -622,7 +615,7 @@ func newRealTransferRuntimeWithLearners(
 		_ = wal.Close()
 		t.Fatal(err)
 	}
-	bootstrap, err := wal.Snapshot()
+	bootstrap, err = wal.Snapshot()
 	if err == nil {
 		_, err = apply.InstallSnapshot(bootstrap)
 	}
@@ -631,6 +624,41 @@ func newRealTransferRuntimeWithLearners(
 		_ = database.Close()
 		_ = wal.Close()
 		t.Fatal(err)
+	}
+	if len(learners) != 0 {
+		// This fixture starts with an enrolled learner. Publish a real durable
+		// configuration entry before testing its later promotion, not a raw
+		// index-two snapshot masquerading as the index-one static bootstrap.
+		entry, seedErr := persistRealTransferLearnerCheckpoint(t, wal, identity, learners)
+		if seedErr == nil {
+			var publication raftmodel.Publication
+			publication, seedErr = apply.ApplyConfiguration(raftmodel.ApplyMeta{Index: entry.GetIndex(),
+				Term: entry.GetTerm(), Type: entry.GetType()}, bootstrap.GetMetadata().GetConfState())
+			if seedErr == nil && (publication.Applied != entry.GetIndex() || publication.ReplicaSetVersion != entry.GetIndex() ||
+				publication.ConfState.Equivalent(bootstrap.GetMetadata().GetConfState()) != nil) {
+				seedErr = errors.New("learner checkpoint did not publish its exact durable configuration")
+			}
+		}
+		if seedErr != nil {
+			_ = apply.Close()
+			_ = database.Close()
+			_ = wal.Close()
+			t.Fatal(seedErr)
+		}
+		// The setup writer consumed an incarnation. Retire all of its handles
+		// and recover the exact SQL/WAL cut before Runtime claims ownership and
+		// mints the next incarnation. BeginIncarnation is never repeatable on
+		// a live handle, even after its Ready has been durably persisted.
+		if err := errors.Join(apply.Close(), database.Close()); err != nil {
+			_ = wal.Close()
+			t.Fatal(err)
+		}
+		wal = reopenRealTransferWAL(t, wal, walPath, identity, options)
+		database, apply, err = raftmember.OpenBoundSQLWithApply(sqlPath, wal, authority, base, applyID)
+		if err != nil {
+			_ = wal.Close()
+			t.Fatal(err)
+		}
 	}
 	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
 	if err != nil {
@@ -670,6 +698,64 @@ func newRealTransferRuntimeWithLearners(
 		return restarted
 	}
 	return runtime, base, reopen
+}
+
+func realTransferWALOptions() raftstore.Options {
+	return raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes}
+}
+
+func persistRealTransferLearnerCheckpoint(t *testing.T, wal *raftstore.Store, identity raftstore.Identity, learners []uint64) (*pb.Entry, error) {
+	t.Helper()
+	entry := realTransferLearnerCheckpoint(t, identity, learners)
+	incarnation, err := wal.BeginIncarnation()
+	if err == nil {
+		err = wal.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
+			HardState: &pb.HardState{Term: entry.Term, Commit: entry.Index}, Entries: []*pb.Entry{entry}, MustSync: true})
+	}
+	return entry, err
+}
+
+func reopenRealTransferWAL(t *testing.T, wal *raftstore.Store, path string, identity raftstore.Identity, options raftstore.Options) *raftstore.Store {
+	t.Helper()
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := raftstore.Open(path, identity, 29, realTransferWALKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reopened
+}
+
+func realTransferStaticBootstrap(t *testing.T, voters, learners []uint64) *pb.Snapshot {
+	t.Helper()
+	index, term := uint64(1), uint64(1)
+	bootstrap := &pb.Snapshot{Data: []byte("multiraft-real-transfer-bootstrap"),
+		Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{
+			Voters: append([]uint64(nil), voters...), Learners: append([]uint64(nil), learners...),
+		}}}
+	if _, err := replicatedstate.StaticBootstrapForSnapshot(bootstrap); err != nil {
+		t.Fatalf("invalid real-transfer static bootstrap: %v", err)
+	}
+	return bootstrap
+}
+
+func realTransferLearnerCheckpoint(t *testing.T, identity raftstore.Identity, learners []uint64) *pb.Entry {
+	t.Helper()
+	if len(learners) != 1 {
+		t.Fatal("real-transfer checkpoint requires exactly one enrolled learner")
+	}
+	group := raftmember.GroupKey{ClusterID: identity.ClusterID, ClusterIncarnation: identity.ClusterIncarnation,
+		TopologyRecoveryEpoch: 29, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}
+	digest := realTransferMembershipGrant(group).Digest()
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(&pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &learners[0], Context: digest[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, term := uint64(2), uint64(1)
+	return &pb.Entry{Index: &index, Term: &term, Type: pb.EntryConfChange.Enum(), Data: data}
 }
 
 func realTransferIdentities() [4]raftstore.Identity {

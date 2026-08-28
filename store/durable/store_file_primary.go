@@ -707,6 +707,30 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		return fmt.Errorf("vibedb: build resident primary router: %w", err)
 	}
 	c.primaryRouter.Store(builtRouter)
+	nextTabletID, ok := builtRouter.NextTabletID()
+	if !ok {
+		nextTabletID = storeio.TabletLocalIdentityTabletCount
+	}
+	c.primaryNextTabletID = nextTabletID
+	nextCatalogLeafID, nextCatalogBranchID, err :=
+		storeio.GlobalTabletCatalogNextNodeIDs(
+			c.cache, state.root.PrimaryRoot,
+			storeio.GlobalTabletCatalogBounds{
+				StoreID:                state.root.StoreID,
+				SelectedRootGeneration: state.root.Generation,
+				FileEnd:                state.fileEnd, NextLogicalID: state.root.NextLogicalID,
+			},
+		)
+	if err != nil {
+		return fmt.Errorf("vibedb: recover primary catalog identities: %w", err)
+	}
+	c.primaryNextCatalogLeafID = nextCatalogLeafID
+	c.primaryNextCatalogBranchID = nextCatalogBranchID
+	maxOverflowPages := c.primaryOverflowPageCount(c.options.MaxDocumentBytes)
+	c.overflowChainScratch = make(
+		[]storeio.TransactionPage, 0, maxOverflowPages,
+	)
+	c.overflowOffsetScratch = make([]int, 0, maxOverflowPages)
 	// Both buffered-visible and the journal-backed synchronous lane apply through
 	// the deferred canonical-frame path, so both need the pending parent and
 	// volatile-retire scratch. Async-visible on a primary graph uses the committer
@@ -719,13 +743,15 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		c.primaryVolatileRetired = make([]storeio.PageRef, 0, pendingCapacity)
 		// The deferred-canonical lane mints out-of-line values as volatile chains and
 		// resolves them at read, checkpoint, and exact-index maintenance. Size the
-		// chain scratch for one worst-case document so a steady-state overflow Put
-		// never grows it, and the durable-retirement queue for one worst-case
-		// checkpoint's superseded chains.
-		maxOverflowPages := c.primaryOverflowPageCount(c.options.MaxDocumentBytes)
+		// chain scratch for one worst-case document and the durable-retirement
+		// queue for one worst-case checkpoint's superseded chains. Value bytes
+		// start at the inline/leaf working set; the authenticated overflow reader
+		// grows them once to the observed value length and reuses that storage.
+		// Opening a shard must not reserve MaxDocumentBytes for every cold table.
 		c.overflowRefScratch = make([]storeio.PageRef, 0, maxOverflowPages)
-		c.overflowOffsetScratch = make([]int, 0, maxOverflowPages)
-		c.overflowValueScratch = make([]byte, 0, c.options.MaxDocumentBytes)
+		valueScratchBytes := min(c.options.MaxDocumentBytes,
+			max(c.options.InlineValueBytes, storeio.CommonPrimaryLeafMaxExtentBytes))
+		c.overflowValueScratch = make([]byte, 0, valueScratchBytes)
 		c.overflowPageScratch = make([]byte, c.options.MaxPageSize)
 		c.primaryPendingOverflowRetire = make(
 			[]storeio.PageRef, 0, c.options.MaxRetiredExtents,

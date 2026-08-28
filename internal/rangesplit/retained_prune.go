@@ -7,7 +7,6 @@ import (
 	"errors"
 	"hash"
 	"math"
-	"reflect"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -28,9 +27,10 @@ var (
 )
 
 const (
-	DefaultRetainedPruneKeys     = 256
-	DefaultRetainedPruneKeyBytes = 1 << 20
-	DefaultRetainedPruneScanRows = 64 << 10
+	DefaultRetainedPruneKeys       = 256
+	DefaultRetainedPruneKeyBytes   = 1 << 20
+	DefaultRetainedPruneBatchBytes = replication.MaxCommandBytes
+	DefaultRetainedPruneScanRows   = 64 << 10
 	// MaxRetainedPruneScanRows is the hard per-advance work ceiling. Callers
 	// may lower it, but cannot turn one controller step into an unbounded scan.
 	MaxRetainedPruneScanRows = 1 << 20
@@ -39,29 +39,51 @@ const (
 type RetainedPruneLimits struct {
 	MaxKeys     int
 	MaxKeyBytes int
-	MaxScanRows uint64
+	// MaxBatchBytes bounds persisted relation+key+old-value frames used for
+	// exact conditional deletion after restart.
+	MaxBatchBytes int
+	MaxScanRows   uint64
 }
 
 type RetainedPruneCursorPersistence func(raw []byte) error
 
-// RetainedPruneBatch is one exact ordered set of out-of-range source keys. The
+// RetainedPruneBatch is one exact ordered set of out-of-range source keys in
+// one immutable physical relation. The
 // controller must encode these keys as deletes in one normal replicated
 // command at the certificate's post-seal serving fences. Keys are borrowed
 // from the workspace until its next use.
 type RetainedPruneBatch struct {
-	Digest   [sha256.Size]byte
-	Count    uint64
-	KeyBytes uint64
-	keys     [][]byte
+	relation      replication.RelationID
+	Digest        [sha256.Size]byte
+	Count         uint64
+	KeyBytes      uint64
+	DocumentBytes uint64
+	keys          [][]byte
+	documents     [][]byte
 }
 
 func (b RetainedPruneBatch) Iterator() RetainedPruneKeyIterator {
-	return RetainedPruneKeyIterator{keys: b.keys}
+	return RetainedPruneKeyIterator{relation: b.relation, keys: b.keys, documents: b.documents}
 }
 
+// Relation is the package-bound physical relation of every row in this batch.
+// Callers cannot relabel a certified batch to delete a same-key index row.
+func (b RetainedPruneBatch) Relation() replication.RelationID { return b.relation }
+
 type RetainedPruneKeyIterator struct {
-	keys [][]byte
-	next int
+	relation  replication.RelationID
+	keys      [][]byte
+	documents [][]byte
+	next      int
+}
+
+// Document returns the exact old stored value captured with Key. Global-index
+// values are opaque bytes, not JSON or derived locators. It aliases workspace.
+func (i *RetainedPruneKeyIterator) Document() []byte {
+	if i == nil || i.next == 0 || i.next > len(i.documents) {
+		return nil
+	}
+	return i.documents[i.next-1]
 }
 
 func (i *RetainedPruneKeyIterator) Next() bool {
@@ -79,11 +101,18 @@ func (i *RetainedPruneKeyIterator) Key() []byte {
 	return i.keys[i.next-1]
 }
 
+func (i *RetainedPruneKeyIterator) Relation() replication.RelationID {
+	if i == nil || i.next == 0 || i.next > len(i.keys) {
+		return 0
+	}
+	return i.relation
+}
+
 // RetainedPruner plans bounded replicated deletes and confirms their exact
 // atomically captured transitions. It never mutates the user collection
 // directly, so every intermediate source data-chain digest remains reopen-safe.
 // Concurrent published writes are advanced one captured entry per call and are
-// accepted only when every changed document remains inside the retained child.
+// accepted only when every changed row remains inside its retained child.
 type RetainedPruner struct {
 	mu sync.Mutex
 
@@ -97,11 +126,63 @@ type RetainedPruner struct {
 	cursorCodec RetainedPruneCursorWorkspace
 }
 
+// RetainedPruneAuthorityProof is an immutable, package-issued proof that the
+// exact target manifest and cutover certificate authorize destructive cleanup.
+// External control-plane certificates are verified before callers request this
+// proof; unlike the legacy gateway capability, no concrete-type reflection or
+// fabricated sealed interface is involved.
+type RetainedPruneAuthorityProof struct {
+	operation  [sha256.Size]byte
+	generation uint64
+	manifest   *distribution.Manifest
+	cutover    [sha256.Size]byte
+}
+
+func NewRetainedPruneAuthorityProof(
+	partitioner *Partitioner,
+	certificate CutoverCertificate,
+	manifest *distribution.Manifest,
+	generation uint64,
+	operation [sha256.Size]byte,
+) (RetainedPruneAuthorityProof, error) {
+	if partitioner == nil || manifest == nil || operation == ([sha256.Size]byte{}) ||
+		partitioner.ValidateRetainedPruneAuthority(manifest, generation, certificate) != nil {
+		return RetainedPruneAuthorityProof{}, ErrRetainedPrune
+	}
+	return RetainedPruneAuthorityProof{
+		operation: operation, generation: generation, manifest: manifest,
+		cutover: certificate.Digest(),
+	}, nil
+}
+
+// NewCertifiedRetainedPruner consumes only a proof constructed by this
+// package's exact manifest validator.
+func NewCertifiedRetainedPruner(
+	partitioner *Partitioner,
+	certificate CutoverCertificate,
+	authority RetainedPruneAuthorityProof,
+	persistedCursor []byte,
+) (*RetainedPruner, error) {
+	if partitioner == nil || authority.manifest == nil ||
+		// Bundle cleanup remains fenced until cutover verification certifies
+		// every relation image and captured transitions carry explicit IDs.
+		partitioner.RelationCount() != 1 ||
+		authority.operation == ([sha256.Size]byte{}) || authority.cutover != certificate.Digest() ||
+		partitioner.ValidateRetainedPruneAuthority(
+			authority.manifest, authority.generation, certificate,
+		) != nil {
+		return nil, ErrRetainedPrune
+	}
+	return newRetainedPruner(partitioner, certificate, authority.operation, persistedCursor)
+}
+
 type RetainedPruneWorkspace struct {
 	document   distribution.DocumentPointWorkspace
 	capture    SourceCaptureWorkspace
 	keys       [][]byte
+	documents  [][]byte
 	arena      []byte
+	docArena   []byte
 	resume     []byte
 	pendingRaw []byte
 	scanRaw    []byte
@@ -117,35 +198,10 @@ type RetainedPruneWorkspace struct {
 func NewRetainedPruner(
 	partitioner *Partitioner,
 	certificate CutoverCertificate,
-	authority any,
+	authority RetainedPruneAuthorityProof,
 	persistedCursor []byte,
 ) (*RetainedPruner, error) {
-	view, ok := sealedRetainedPruneAuthority(authority)
-	if !ok || partitioner == nil || partitioner.ValidateRetainedPruneAuthority(
-		view.Manifest(), view.Generation(), certificate,
-	) != nil || view.Operation() == ([sha256.Size]byte{}) ||
-		view.Certificate() != certificate.Digest() {
-		return nil, ErrRetainedPrune
-	}
-	return newRetainedPruner(partitioner, certificate, view.Operation(), persistedCursor)
-}
-
-type retainedPruneAuthorityView interface {
-	Manifest() *distribution.Manifest
-	Generation() uint64
-	Operation() [sha256.Size]byte
-	Certificate() [sha256.Size]byte
-}
-
-func sealedRetainedPruneAuthority(authority any) (retainedPruneAuthorityView, bool) {
-	view, ok := authority.(retainedPruneAuthorityView)
-	if !ok || view == nil {
-		return nil, false
-	}
-	typeOf := reflect.TypeOf(authority)
-	return view, typeOf.Kind() == reflect.Struct &&
-		typeOf.PkgPath() == "github.com/thesyncim/vibedb/gateway" &&
-		typeOf.Name() == "retainedPruneAuthority"
+	return NewCertifiedRetainedPruner(partitioner, certificate, authority, persistedCursor)
 }
 
 func newRetainedPruner(
@@ -163,6 +219,7 @@ func newRetainedPruner(
 		coordinates := certificate.SourceCoordinates()
 		pruner.cursor = RetainedPruneCursor{
 			phase: RetainedPruneScan, retained: partitioner.retained, operation: operation,
+			relation: 1, relationCount: uint16(partitioner.RelationCount()),
 			applied: cut.Applied, term: cut.Term, ownershipEpoch: coordinates.OwnershipEpoch,
 			routingVersion: coordinates.RoutingVersion, routeGeneration: coordinates.RouteGeneration,
 			plan: certificate.plan, placement: certificate.placement, cutover: certificate.digest,
@@ -218,6 +275,11 @@ func (p *RetainedPruner) Advance(
 	workspace *RetainedPruneWorkspace,
 ) (batch RetainedPruneBatch, hasBatch bool, err error) {
 	if p == nil || snapshot == nil || capture == nil || persist == nil || workspace == nil {
+		return RetainedPruneBatch{}, false, ErrRetainedPrune
+	}
+	if snapshot.RelationCount() != p.partitioner.RelationCount() ||
+		(p.partitioner.SourceManifest() != ([sha256.Size]byte{}) &&
+			!p.partitioner.MatchesSourceSchema(snapshot.Fence().Binding.SchemaGeneration, snapshot.Fence().RelationManifestDigest)) {
 		return RetainedPruneBatch{}, false, ErrRetainedPrune
 	}
 	limits, err = normalizeRetainedPruneLimits(limits)
@@ -291,7 +353,9 @@ func (p *RetainedPruner) Advance(
 		next.pendingApplied = p.cursor.applied
 		next.pendingEntry = p.cursor.entry
 		next.resumeAfter = workspace.resume
-		next.pendingKeys = appendPendingKeys(workspace.pendingRaw[:0], workspace.keys)
+		next.pendingKeys = appendPendingPruneRows(
+			workspace.pendingRaw[:0], p.cursor.relation, workspace.keys, workspace.documents,
+		)
 		if len(next.pendingKeys) > replication.MaxCommandBytes {
 			return RetainedPruneBatch{}, false, ErrRetainedPrune
 		}
@@ -307,11 +371,17 @@ func (p *RetainedPruner) Advance(
 		}
 		return RetainedPruneBatch{}, false, nil
 	}
-	collection, ok := snapshot.Collection(p.partitioner.collection)
+	if uint16(next.relation) < next.relationCount {
+		next.relation++
+		next.scanAfter = nil
+		return RetainedPruneBatch{}, false, p.persistCursor(next, persist)
+	}
+	collection, ok := snapshot.Relation(1)
 	if !ok || collection == nil || !captureMatchesRetainedCursor(capture, &p.cursor) {
 		return RetainedPruneBatch{}, false, ErrRetainedPrune
 	}
 	next.phase = RetainedPruneVerify
+	next.relation = 1
 	next.scanAfter = nil
 	next.snapshotGeneration = collection.Generation()
 	h := retainedPruneHasher(workspace)
@@ -331,7 +401,7 @@ func (p *RetainedPruner) advanceRetainedVerification(
 	persist RetainedPruneCursorPersistence,
 	workspace *RetainedPruneWorkspace,
 ) (RetainedPruneBatch, bool, error) {
-	collection, ok := snapshot.Collection(p.partitioner.collection)
+	collection, ok := snapshot.Relation(p.cursor.relation)
 	if !ok || collection == nil || !fenceMatchesRetainedCursor(snapshot.Fence(), &p.cursor) ||
 		!captureMatchesRetainedCursor(capture, &p.cursor) {
 		return RetainedPruneBatch{}, false, ErrRetainedPrune
@@ -348,7 +418,7 @@ func (p *RetainedPruner) advanceRetainedVerification(
 				stopped = true
 				return errRetainedPruneScanStop
 			}
-			point, pointErr := p.partitioner.program.Point(document, &workspace.document)
+			point, pointErr := p.partitioner.RelationPoint(p.cursor.relation, key, document, &workspace.document)
 			if pointErr != nil || p.partitioner.childFor(point) != int(p.partitioner.retained) {
 				return errors.Join(ErrRetainedPrune, pointErr)
 			}
@@ -359,6 +429,8 @@ func (p *RetainedPruner) advanceRetainedVerification(
 			rows++
 			byteCount += rowBytes
 			workspace.resume = append(workspace.resume[:0], key...)
+			binary.LittleEndian.PutUint16(workspace.fixed[:2], uint16(p.cursor.relation))
+			_, _ = h.Write(workspace.fixed[:2])
 			hashTailFrame(h, &workspace.size, key)
 			hashTailFrame(h, &workspace.size, document)
 			return nil
@@ -374,10 +446,17 @@ func (p *RetainedPruner) advanceRetainedVerification(
 		return RetainedPruneBatch{}, false, ErrRetainedPrune
 	}
 	next.scanAfter = workspace.resume
-	next.snapshotGeneration = collection.Generation()
+	if p.cursor.relation == 1 {
+		next.snapshotGeneration = collection.Generation()
+	}
 	_ = h.Sum(next.retainedDigest[:0])
 	if !stopped && scanErr == nil {
-		next.phase = RetainedPruneComplete
+		if uint16(next.relation) < next.relationCount {
+			next.relation++
+			next.scanAfter = nil
+		} else {
+			next.phase = RetainedPruneComplete
+		}
 	}
 	if err := p.persistCursor(next, persist); err != nil {
 		return RetainedPruneBatch{}, false, err
@@ -392,6 +471,7 @@ type retainedPruneScanned struct {
 
 type retainedPruneScan struct {
 	partitioner *Partitioner
+	relation    replication.RelationID
 	workspace   *RetainedPruneWorkspace
 	limits      RetainedPruneLimits
 	scanned     retainedPruneScanned
@@ -404,23 +484,26 @@ func (p *RetainedPruner) scan(
 	limits RetainedPruneLimits,
 	workspace *RetainedPruneWorkspace,
 ) (RetainedPruneBatch, retainedPruneScanned, bool, error) {
-	collection, ok := snapshot.Collection(p.partitioner.collection)
+	collection, ok := snapshot.Relation(p.cursor.relation)
 	if !ok || collection == nil {
 		return RetainedPruneBatch{}, retainedPruneScanned{}, false, ErrRetainedPrune
 	}
 	if cap(workspace.keys) < limits.MaxKeys {
 		workspace.keys = make([][]byte, 0, limits.MaxKeys)
+		workspace.documents = make([][]byte, 0, limits.MaxKeys)
 	} else {
 		workspace.keys = workspace.keys[:0]
+		workspace.documents = workspace.documents[:0]
 	}
 	if cap(workspace.arena) < limits.MaxKeyBytes {
 		workspace.arena = make([]byte, 0, limits.MaxKeyBytes)
 	} else {
 		workspace.arena = workspace.arena[:0]
 	}
+	workspace.docArena = workspace.docArena[:0]
 	workspace.resume = append(workspace.resume[:0], p.cursor.scanAfter...)
 	workspace.scan = retainedPruneScan{
-		partitioner: p.partitioner, workspace: workspace, limits: limits,
+		partitioner: p.partitioner, relation: p.cursor.relation, workspace: workspace, limits: limits,
 	}
 	if workspace.visit == nil || workspace.bound != &workspace.scan {
 		workspace.visit = workspace.scan.visitRow
@@ -438,12 +521,14 @@ func (p *RetainedPruner) scan(
 		return RetainedPruneBatch{}, retainedPruneScanned{}, false, scanErr
 	}
 	batch := RetainedPruneBatch{
-		Count: uint64(len(workspace.keys)), KeyBytes: keyBytes,
-		keys: workspace.keys,
+		relation: p.cursor.relation,
+		Count:    uint64(len(workspace.keys)), KeyBytes: keyBytes,
+		DocumentBytes: uint64(len(workspace.docArena)),
+		keys:          workspace.keys, documents: workspace.documents,
 	}
 	if batch.Count != 0 {
 		batch.Digest = p.hashPruneBatch(
-			&p.cursor, workspace.resume, workspace.keys, workspace,
+			&p.cursor, workspace.resume, workspace.keys, workspace.documents, workspace,
 		)
 	}
 	return batch, scanned, !stopped && scanErr == nil, nil
@@ -458,7 +543,7 @@ func (s *retainedPruneScan) visitRow(key, document []byte) error {
 		s.stopped = true
 		return errRetainedPruneScanStop
 	}
-	point, err := s.partitioner.program.Point(document, &workspace.document)
+	point, err := s.partitioner.RelationPoint(s.relation, key, document, &workspace.document)
 	if err != nil {
 		return errors.Join(ErrRetainedPrune, err)
 	}
@@ -466,9 +551,10 @@ func (s *retainedPruneScan) visitRow(key, document []byte) error {
 	if child < 0 {
 		return ErrRetainedPrune
 	}
+	used := len(workspace.arena) + len(workspace.docArena) + 10*len(workspace.keys)
 	if child != int(s.partitioner.retained) &&
-		(len(workspace.keys) >= s.limits.MaxKeys ||
-			len(key) > s.limits.MaxKeyBytes-len(workspace.arena)) {
+		(len(workspace.keys) >= s.limits.MaxKeys || len(key) > s.limits.MaxKeyBytes-len(workspace.arena) ||
+			used > s.limits.MaxBatchBytes || len(key)+len(document)+10 > s.limits.MaxBatchBytes-used) {
 		if len(workspace.keys) == 0 {
 			return ErrRetainedPrune
 		}
@@ -488,9 +574,15 @@ func (s *retainedPruneScan) visitRow(key, document []byte) error {
 	start := len(workspace.arena)
 	workspace.arena = append(workspace.arena, key...)
 	workspace.keys = append(workspace.keys, workspace.arena[start:len(workspace.arena)])
+	documentStart := len(workspace.docArena)
+	workspace.docArena = append(workspace.docArena, document...)
+	workspace.documents = append(
+		workspace.documents, workspace.docArena[documentStart:len(workspace.docArena)],
+	)
 	s.keyBytes += uint64(len(key))
 	if len(workspace.keys) == s.limits.MaxKeys ||
-		len(workspace.arena) == s.limits.MaxKeyBytes {
+		len(workspace.arena) == s.limits.MaxKeyBytes ||
+		len(workspace.arena)+len(workspace.docArena)+10*len(workspace.keys) >= s.limits.MaxBatchBytes {
 		s.stopped = true
 		return errRetainedPruneScanStop
 	}
@@ -506,10 +598,13 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 	if err != nil || !ok {
 		return errors.Join(ErrRetainedPrune, err)
 	}
-	workspace.keys = workspace.keys[:0]
 	keyBytes := uint64(0)
 	pruneEntry := uint64(len(entry.Transitions)) == p.cursor.pendingCount
 	if pruneEntry {
+		pending, pendingErr := p.openPendingBatch(workspace)
+		if pendingErr != nil {
+			return pendingErr
+		}
 		for index := range entry.Transitions {
 			transition := &entry.Transitions[index]
 			if !transition.BeforeWitness.Present || transition.After != nil {
@@ -520,13 +615,19 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 				pruneEntry = false
 				break
 			}
-			workspace.keys = append(workspace.keys, transition.Key)
+			if index >= len(pending.keys) || index >= len(pending.documents) ||
+				!bytes.Equal(transition.Key, pending.keys[index]) ||
+				transition.BeforeWitness.DocumentBytes != uint32(len(pending.documents[index])) ||
+				transition.BeforeWitness.Digest != sha256.Sum256(pending.documents[index]) {
+				pruneEntry = false
+				break
+			}
 			keyBytes += uint64(len(transition.Key))
 		}
 		if pruneEntry && (keyBytes != p.cursor.pendingKeyBytes ||
 			p.hashPruneBatchAt(
 				p.cursor.pendingApplied, p.cursor.pendingEntry,
-				p.cursor.resumeAfter, workspace.keys, workspace,
+				p.cursor.resumeAfter, pending.keys, pending.documents, workspace,
 			) != p.cursor.pending) {
 			pruneEntry = false
 		}
@@ -556,24 +657,37 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 	return p.persistCursor(next, persist)
 }
 
-func appendPendingKeys(dst []byte, keys [][]byte) []byte {
+func appendPendingPruneRows(dst []byte, relation replication.RelationID, keys, documents [][]byte) []byte {
+	if relation == 0 || relation > replication.MaxRelationsPerBundle || len(keys) != len(documents) {
+		return nil
+	}
 	var size [4]byte
-	for _, key := range keys {
+	for index, key := range keys {
+		binary.LittleEndian.PutUint16(size[:2], uint16(relation))
+		dst = append(dst, size[:2]...)
 		binary.LittleEndian.PutUint32(size[:], uint32(len(key)))
 		dst = append(dst, size[:]...)
 		dst = append(dst, key...)
+		binary.LittleEndian.PutUint32(size[:], uint32(len(documents[index])))
+		dst = append(dst, size[:]...)
+		dst = append(dst, documents[index]...)
 	}
 	return dst
 }
 
 func (p *RetainedPruner) openPendingBatch(workspace *RetainedPruneWorkspace) (RetainedPruneBatch, error) {
 	workspace.keys = workspace.keys[:0]
+	workspace.documents = workspace.documents[:0]
 	raw := p.cursor.pendingKeys
-	var keyBytes uint64
+	var keyBytes, documentBytes uint64
+	if !validPendingPruneKeys(&p.cursor) {
+		return RetainedPruneBatch{}, ErrRetainedPrune
+	}
 	for len(raw) != 0 {
-		if len(raw) < 4 {
+		if len(raw) < 6 || replication.RelationID(binary.LittleEndian.Uint16(raw[:2])) != p.cursor.relation {
 			return RetainedPruneBatch{}, ErrRetainedPrune
 		}
+		raw = raw[2:]
 		size := int(binary.LittleEndian.Uint32(raw[:4]))
 		raw = raw[4:]
 		if size == 0 || size > len(raw) {
@@ -582,11 +696,26 @@ func (p *RetainedPruner) openPendingBatch(workspace *RetainedPruneWorkspace) (Re
 		workspace.keys = append(workspace.keys, raw[:size])
 		keyBytes += uint64(size)
 		raw = raw[size:]
+		if len(raw) < 4 {
+			return RetainedPruneBatch{}, ErrRetainedPrune
+		}
+		documentSize := int(binary.LittleEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if documentSize == 0 || documentSize > len(raw) {
+			return RetainedPruneBatch{}, ErrRetainedPrune
+		}
+		workspace.documents = append(workspace.documents, raw[:documentSize])
+		documentBytes += uint64(documentSize)
+		raw = raw[documentSize:]
 	}
-	batch := RetainedPruneBatch{Count: uint64(len(workspace.keys)), KeyBytes: keyBytes, keys: workspace.keys}
+	batch := RetainedPruneBatch{
+		relation: p.cursor.relation,
+		Count:    uint64(len(workspace.keys)), KeyBytes: keyBytes,
+		DocumentBytes: documentBytes, keys: workspace.keys, documents: workspace.documents,
+	}
 	batch.Digest = p.hashPruneBatchAt(
 		p.cursor.pendingApplied, p.cursor.pendingEntry,
-		p.cursor.resumeAfter, workspace.keys, workspace,
+		p.cursor.resumeAfter, workspace.keys, workspace.documents, workspace,
 	)
 	return batch, nil
 }
@@ -612,7 +741,7 @@ func (p *RetainedPruner) advanceCompletedRetainedEntry(
 	workspace *RetainedPruneWorkspace,
 ) error {
 	entry, ok, err := p.nextCapturedEntry(capture, workspace)
-	collection, collectionOK := snapshot.Collection(p.partitioner.collection)
+	collection, collectionOK := snapshot.Relation(1)
 	if err != nil || !ok || !collectionOK || collection == nil ||
 		!p.retainedEntry(entry, workspace) {
 		return errors.Join(ErrRetainedPrune, err)
@@ -738,10 +867,11 @@ func (p *RetainedPruner) hashPruneBatch(
 	cursor *RetainedPruneCursor,
 	resumeAfter []byte,
 	keys [][]byte,
+	documents [][]byte,
 	workspace *RetainedPruneWorkspace,
 ) [sha256.Size]byte {
 	return p.hashPruneBatchAt(
-		cursor.applied, cursor.entry, resumeAfter, keys, workspace,
+		cursor.applied, cursor.entry, resumeAfter, keys, documents, workspace,
 	)
 }
 
@@ -750,8 +880,12 @@ func (p *RetainedPruner) hashPruneBatchAt(
 	entry [sha256.Size]byte,
 	resumeAfter []byte,
 	keys [][]byte,
+	documents [][]byte,
 	workspace *RetainedPruneWorkspace,
 ) [sha256.Size]byte {
+	if len(keys) != len(documents) {
+		return [sha256.Size]byte{}
+	}
 	h := retainedPruneHasher(workspace)
 	_, _ = h.Write(retainedPruneBatchDomain)
 	_, _ = h.Write(p.cursor.plan[:])
@@ -759,11 +893,13 @@ func (p *RetainedPruner) hashPruneBatchAt(
 	workspace.fixed = [40]byte{}
 	binary.LittleEndian.PutUint64(workspace.fixed[0:8], applied)
 	binary.LittleEndian.PutUint64(workspace.fixed[8:16], uint64(len(keys)))
-	_, _ = h.Write(workspace.fixed[:16])
+	binary.LittleEndian.PutUint16(workspace.fixed[16:18], uint16(p.cursor.relation))
+	_, _ = h.Write(workspace.fixed[:18])
 	_, _ = h.Write(entry[:])
 	hashTailFrame(h, &workspace.size, resumeAfter)
-	for _, key := range keys {
+	for index, key := range keys {
 		hashTailFrame(h, &workspace.size, key)
+		hashTailFrame(h, &workspace.size, documents[index])
 	}
 	_ = h.Sum(workspace.digest[:0])
 	return workspace.digest
@@ -812,12 +948,16 @@ func normalizeRetainedPruneLimits(limits RetainedPruneLimits) (RetainedPruneLimi
 	if limits.MaxKeyBytes == 0 {
 		limits.MaxKeyBytes = DefaultRetainedPruneKeyBytes
 	}
+	if limits.MaxBatchBytes == 0 {
+		limits.MaxBatchBytes = DefaultRetainedPruneBatchBytes
+	}
 	if limits.MaxScanRows == 0 {
 		limits.MaxScanRows = DefaultRetainedPruneScanRows
 	}
 	if limits.MaxKeys < 1 || limits.MaxKeys > replication.MaxMutations ||
 		limits.MaxKeyBytes < 1 || limits.MaxKeyBytes > replication.MaxCommandBytes ||
-		limits.MaxKeyBytes > replication.MaxCommandBytes-4*limits.MaxKeys ||
+		limits.MaxBatchBytes < 1 || limits.MaxBatchBytes > replication.MaxCommandBytes ||
+		limits.MaxKeyBytes > limits.MaxBatchBytes-10*limits.MaxKeys ||
 		limits.MaxScanRows == 0 || limits.MaxScanRows > MaxRetainedPruneScanRows {
 		return RetainedPruneLimits{}, ErrRetainedPrune
 	}
@@ -860,6 +1000,7 @@ func retainedPruneCursorMatches(
 	cut := certificate.SourceCut()
 	coordinates := certificate.SourceCoordinates()
 	return cursor != nil && cursor.retained == partitioner.retained &&
+		int(cursor.relationCount) == partitioner.RelationCount() &&
 		cursor.plan == certificate.plan && cursor.placement == certificate.placement &&
 		cursor.cutover == certificate.digest && cursor.base == cut.BaseDigest &&
 		cursor.applied >= cut.Applied && cursor.ownershipEpoch == coordinates.OwnershipEpoch &&

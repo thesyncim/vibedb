@@ -46,6 +46,19 @@ func OpenBoundSQLWithApply(
 	authority sqldriver.ReplicatedAuthorityProfile,
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
+) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
+	return openBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, sqldriver.OpenReplicatedShardStoreWithApply, opening...)
+}
+
+func openBoundSQLWithApply(
+	path string,
+	wal *raftstore.Store,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+	open func(string, sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity, ...sqldriver.ReplicatedOpenOptions) (*sqldriver.Database, error),
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
 	binding, bootstrap, err := applyPrerequisites(wal, authority)
 	if err != nil {
@@ -54,18 +67,21 @@ func OpenBoundSQLWithApply(
 	if expectedSQL.Binding != binding {
 		return nil, nil, ErrBindingMismatch
 	}
-	database, err := sqldriver.OpenReplicatedShardStoreWithApply(
-		path, expectedSQL, expectedApply,
+	database, err := open(
+		path, expectedSQL, expectedApply, opening...,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 	claim, actual, err := database.OpenReplicatedApply(
 		expectedSQL, bootstrap, sqldriver.ReplicatedApplyOptions{
-			MaxSessions: expectedApply.MaxSessions,
-			RetryWindow: expectedApply.RetryWindow,
-			TxnLimits:   expectedApply.TxnLimits,
-			Placement:   expectedApply.Placement,
+			MaxSessions: expectedApply.MaxSessions, RetryWindow: expectedApply.RetryWindow,
+			TxnLimits: expectedApply.TxnLimits, Placement: expectedApply.Placement,
+			RequestLedgerCapacityBytes:       expectedApply.RequestLedgerCapacityBytes,
+			RequestLedgerCleanupReserveBytes: expectedApply.RequestLedgerCleanupReserveBytes,
+			RequestLedgerRangeStart:          expectedApply.RequestLedgerRangeStart,
+			RequestLedgerRangeEnd:            expectedApply.RequestLedgerRangeEnd,
+			RequestLedgerRangeIdentity:       expectedApply.RequestLedgerRangeIdentity,
 		},
 	)
 	if err != nil || actual != expectedApply {
@@ -73,6 +89,12 @@ func OpenBoundSQLWithApply(
 			_ = claim.Close()
 		}
 		closeErr := database.Close()
+		// A source-not-committed proof permits an ordinary reopen only after
+		// this recovery handle closed cleanly. Never hide cleanup uncertainty
+		// behind the otherwise retryable exact-cut sentinel.
+		if closeErr != nil && errors.Is(err, sqldriver.ErrSchemaSourceNotCommitted) {
+			err = fmt.Errorf("%w: schema source cleanup: %v", ErrRuntimeOwnership, err)
+		}
 		if err == nil {
 			err = sqldriver.ErrReplicatedApplyMismatch
 		}

@@ -77,13 +77,9 @@ type Options struct {
 	// autonomous transaction-recovery loop. It must be explicitly configured
 	// by authenticated production startup; the zero value cannot forward.
 	InternalAuthority serviceauthz.Authority
-	// ReplicatedTransactions enables the byte-native RF3 multi-group write lane.
-	// The orchestrator is process-scoped and owns its admission/recovery budget;
-	// Executor never constructs one per request.
-	ReplicatedTransactions *ReplicatedTransactionOrchestrator
-	// ReplicatedTransactionRequests owns caller request identities and every
-	// outcome-unknown recovery handle used by the shipped RF3 write lane.
-	ReplicatedTransactionRequests *ReplicatedTransactionRequestRegistry
+	// Pressure receives bounded, catalog-fenced routing samples for autonomous
+	// hot-shard scheduling. It is advisory and never grants serving authority.
+	Pressure PressureObserver
 }
 
 // defaultMaxRetries bounds stale-generation retries when Options leaves it zero.
@@ -92,16 +88,15 @@ const defaultMaxRetries = 2
 // Executor routes and dispatches bounded distributed reads over a pinned catalog
 // generation. It is safe for concurrent use.
 type Executor struct {
-	client                        *Client
-	catalog                       *CatalogHolder
-	profiles                      map[OperationClass]Profile
-	refresh                       RefreshFunc
-	maxRetry                      int
-	routers                       *routerPool
-	metrics                       Metrics
-	internalAuthority             serviceauthz.Authority
-	replicatedTransactions        *ReplicatedTransactionOrchestrator
-	replicatedTransactionRequests *ReplicatedTransactionRequestRegistry
+	client            *Client
+	catalog           *CatalogHolder
+	profiles          map[OperationClass]Profile
+	refresh           RefreshFunc
+	maxRetry          int
+	routers           *routerPool
+	metrics           Metrics
+	internalAuthority serviceauthz.Authority
+	pressure          PressureObserver
 }
 
 // NewExecutor returns an executor that dispatches through client and pins
@@ -122,15 +117,14 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 		maxRetry = 0
 	}
 	return &Executor{
-		client:                        client,
-		catalog:                       catalog,
-		profiles:                      profiles,
-		refresh:                       opts.Refresh,
-		maxRetry:                      maxRetry,
-		routers:                       newRouterPool(),
-		internalAuthority:             opts.InternalAuthority,
-		replicatedTransactions:        opts.ReplicatedTransactions,
-		replicatedTransactionRequests: opts.ReplicatedTransactionRequests,
+		client:            client,
+		catalog:           catalog,
+		profiles:          profiles,
+		refresh:           opts.Refresh,
+		maxRetry:          maxRetry,
+		routers:           newRouterPool(),
+		internalAuthority: opts.InternalAuthority,
+		pressure:          opts.Pressure,
 	}
 }
 
@@ -272,6 +266,7 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
 		res, err := e.dispatch(opctx, pl, profile)
@@ -366,6 +361,9 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		}
 
 		var res *Result
+		if call != nil {
+			e.observePressureCall(*call)
+		}
 		if call != nil && bound.requiresIndexTransaction() {
 			participants, participantErr := appendBoundWriteParticipants(
 				nil, *call, &q, bound, profile,
@@ -474,7 +472,9 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 	}
 	bucketBits, accessScopes := writeAccessScopes(bound, targets[0])
 	call := &shardCall{
-		target:  targets[0],
+		target: targets[0], pressureSource: pressureSourceForTarget(
+			bound.manifest, bound.spec.EffectiveBucketBits(), targets[0],
+		),
 		address: addr,
 		req: &shardservice.ShardRequest{
 			SQL:                  q.SQL,

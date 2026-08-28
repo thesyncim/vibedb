@@ -24,6 +24,10 @@ var (
 	responseMagic = [8]byte{'V', 'B', 'S', 'R', 'E', 'S', 0, 0}
 )
 
+// RequestDiscriminator identifies replica snapshot data streams on the shared
+// mutually authenticated snapshot listener.
+func RequestDiscriminator() [8]byte { return requestMagic }
+
 // AuthorizeFunc compares the descriptor against the caller's current durable
 // store/incarnation/schema/replica-set and snapshot lineage fence.
 type AuthorizeFunc func(Descriptor) bool
@@ -105,6 +109,32 @@ func (s *Service) Serve(ctx context.Context, conn rafttransport.PeerConnection) 
 		}
 		return ErrRepository
 	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	var request [requestBytes]byte
+	if deadline := s.readDeadline(); deadline.IsZero() {
+		_ = conn.Close()
+		return ErrBound
+	} else if err := conn.SetReadDeadline(deadline); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	if _, err := io.ReadFull(conn, request[:]); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	return s.serveRequest(ctx, conn, request)
+}
+
+func (s *Service) serveRequest(
+	ctx context.Context, conn rafttransport.PeerConnection, request [requestBytes]byte,
+) error {
+	if s == nil || ctx == nil || conn == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return ErrRepository
+	}
 	var slot *serviceSlot
 	select {
 	case slot = <-s.slots:
@@ -120,15 +150,6 @@ func (s *Service) Serve(ctx context.Context, conn rafttransport.PeerConnection) 
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
-	if deadline := s.readDeadline(); deadline.IsZero() {
-		return ErrBound
-	} else if err := conn.SetReadDeadline(deadline); err != nil {
-		return err
-	}
-	var request [requestBytes]byte
-	if _, err := io.ReadFull(conn, request[:]); err != nil {
-		return err
-	}
 	if !bytes.Equal(request[:8], requestMagic[:]) {
 		return ErrDescriptor
 	}
@@ -234,6 +255,8 @@ type Receiver struct {
 	ReadDeadline  rafttransport.DeadlineFunc
 	WriteDeadline rafttransport.DeadlineFunc
 	Workspace     []byte
+	chunks        atomic.Uint64
+	bytes         atomic.Uint64
 }
 
 // Receive resumes until the exact descriptor is atomically published locally.
@@ -322,5 +345,9 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 		return ErrChunk
 	}
 	_, _, err := r.Repository.Append(d, offset, chunk, digest)
+	if err == nil {
+		r.chunks.Add(1)
+		r.bytes.Add(uint64(len(chunk)))
+	}
 	return err
 }

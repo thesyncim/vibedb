@@ -227,7 +227,9 @@ func TestJournalControlReserveCompletesCleanupAtAdmissionEdge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserved retire = %v", err)
 	}
-	if retired.Revision != 3 || j.retainedBytes != MaxRetainedJournalBytes ||
+	const unusedRecoveryPulseReserve = uint64(3 * (journalEntryHeaderBytes + 4))
+	if retired.Revision != 3 ||
+		j.retainedBytes != MaxRetainedJournalBytes-unusedRecoveryPulseReserve ||
 		j.controlReserve != 0 || j.manifestBytes != 0 || j.manifests[id] != nil {
 		t.Fatalf("retired edge accounting = %+v usage=%+v", retired, j.Usage())
 	}

@@ -82,6 +82,11 @@ func (d *database) storagePathInUseLocked(path string) bool {
 			d.replicatedCapturePath(d.catalog.ReplicatedApply) == path) {
 		return true
 	}
+	if d.catalog.ReplicatedChildApply != nil &&
+		(d.replicatedApplyPath(d.catalog.ReplicatedChildApply) == path ||
+			d.replicatedCapturePath(d.catalog.ReplicatedChildApply) == path) {
+		return true
+	}
 	for _, meta := range d.catalog.Tables {
 		if d.tablePathForMeta(meta) == path {
 			return true

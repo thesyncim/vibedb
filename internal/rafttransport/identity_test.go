@@ -11,10 +11,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/thesyncim/vibedb/internal/buildgate"
 )
 
 var peerTLSTestNow = time.Date(2031, 4, 5, 6, 7, 8, 0, time.UTC)
@@ -190,8 +193,14 @@ func uncheckedPeerTLSTestProfile(
 	return &PeerTLS{
 		identityOID: append(asn1.ObjectIdentifier(nil), peerTLSTestIdentityOID...),
 		identity:    identity, certificate: cloneTLSCertificate(certificate),
-		roots: authority.roots.Clone(), now: now,
+		roots: authority.roots.Clone(), now: now, build: buildgate.CurrentProfile(),
 	}
+}
+
+func peerTLSTestBuildProfile(source *PeerTLS, profile buildgate.Profile) *PeerTLS {
+	clone := *source
+	clone.build = profile
+	return &clone
 }
 
 func TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed(t *testing.T) {
@@ -364,6 +373,196 @@ func TestPeerTLSMutualAuthenticationDerivesExactNode(t *testing.T) {
 	}
 }
 
+func TestPeerTLSInternalBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 81)
+	clientIdentity := peerTLSTestIdentity(82, 83)
+	serverIdentity := peerTLSTestIdentity(82, 103)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	serverBuild := buildgate.CurrentProfile()
+	var ok bool
+	serverBuild.Provided, ok = serverBuild.Provided.With(127)
+	if !ok {
+		t.Fatal("test capability is outside current bitmap")
+	}
+	serverTLS = peerTLSTestBuildProfile(serverTLS, serverBuild)
+
+	for _, class := range []TrafficClass{
+		TrafficOrdinary, TrafficSnapshot,
+		TrafficShardNative, TrafficShardSQL, TrafficShardControl,
+	} {
+		client, server, clientErr, serverErr := peerTLSTestHandshake(
+			t, clientTLS, serverTLS, serverIdentity.Node, class, class,
+		)
+		if clientErr != nil || serverErr != nil {
+			t.Fatalf("class %d handshake errors = client %v server %v", class, clientErr, serverErr)
+		}
+		want := buildgate.CurrentProfile().Provided
+		for side, connection := range map[string]PeerConnection{"client": client, "server": server} {
+			proved, ok := connection.(interface {
+				BuildCapabilities() buildgate.CapabilitySet
+			})
+			if !ok {
+				t.Fatalf("class %d %s connection omits build capabilities", class, side)
+			}
+			if proved.BuildCapabilities() != want {
+				t.Fatalf("class %d %s capabilities = %#v, want %#v", class, side, proved.BuildCapabilities(), want)
+			}
+			if err := connection.Close(); err != nil {
+				t.Fatalf("class %d %s close: %v", class, side, err)
+			}
+		}
+	}
+}
+
+func TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 111)
+	clientIdentity := peerTLSTestIdentity(112, 113)
+	serverIdentity := peerTLSTestIdentity(112, 133)
+	baseClient := newPeerTLSTestProfile(t, authority, clientIdentity)
+	baseServer := newPeerTLSTestProfile(t, authority, serverIdentity)
+
+	tests := []struct {
+		name      string
+		server    buildgate.Profile
+		serverErr error
+	}{
+		{
+			name: "wire grammar",
+			server: func() buildgate.Profile {
+				profile := buildgate.CurrentProfile()
+				profile.WireGrammar[0] ^= 0xff
+				return profile
+			}(),
+			serverErr: buildgate.ErrWireGrammar,
+		},
+		{
+			name: "disk grammar",
+			server: func() buildgate.Profile {
+				profile := buildgate.CurrentProfile()
+				profile.DiskGrammar[0] ^= 0xff
+				return profile
+			}(),
+			serverErr: buildgate.ErrDiskGrammar,
+		},
+		{
+			name: "required capability",
+			server: func() buildgate.Profile {
+				profile := buildgate.CurrentProfile()
+				profile.Provided, _ = profile.Provided.With(191)
+				profile.Required, _ = profile.Required.With(191)
+				return profile
+			}(),
+			serverErr: buildgate.ErrRequiredCapabilities,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serverTLS := peerTLSTestBuildProfile(baseServer, test.server)
+			client, server, clientErr, serverErr := peerTLSTestHandshake(
+				t, baseClient, serverTLS, serverIdentity.Node,
+				TrafficOrdinary, TrafficOrdinary,
+			)
+			if client != nil || server != nil {
+				t.Fatalf("incompatible build returned connections %v/%v", client, server)
+			}
+			if !errors.Is(clientErr, ErrPeerBuild) || !errors.Is(serverErr, ErrPeerBuild) ||
+				!errors.Is(serverErr, test.serverErr) {
+				t.Fatalf("errors = client %v server %v, want ErrPeerBuild/%v", clientErr, serverErr, test.serverErr)
+			}
+		})
+	}
+}
+
+func TestPeerTLSExternalGatewayTrafficDoesNotConsumeInternalBuildPreface(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 141)
+	clientIdentity := peerTLSTestIdentity(142, 143)
+	serverIdentity := peerTLSTestIdentity(142, 163)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	mismatch := buildgate.CurrentProfile()
+	mismatch.WireGrammar[0] ^= 0xff
+	serverTLS = peerTLSTestBuildProfile(serverTLS, mismatch)
+
+	client, server, clientErr, serverErr := peerTLSTestHandshake(
+		t, clientTLS, serverTLS, serverIdentity.Node,
+		TrafficGatewayClient, TrafficGatewayClient,
+	)
+	if clientErr != nil || serverErr != nil {
+		t.Fatalf("non-Raft handshake errors = client %v server %v", clientErr, serverErr)
+	}
+	for _, connection := range []PeerConnection{client, server} {
+		proved := connection.(interface {
+			BuildCapabilities() buildgate.CapabilitySet
+		})
+		if proved.BuildCapabilities() != (buildgate.CapabilitySet{}) {
+			t.Fatalf("external gateway traffic proved internal capabilities: %#v", proved.BuildCapabilities())
+		}
+		_ = connection.Close()
+	}
+}
+
+func TestPeerTLSInternalBuildPrefaceRetainsBoundedHandshakeDeadline(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 171)
+	clientIdentity := peerTLSTestIdentity(172, 173)
+	serverIdentity := peerTLSTestIdentity(172, 193)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	type result struct {
+		err     error
+		elapsed time.Duration
+	}
+	serverResult := make(chan result, 1)
+	go func() {
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverResult <- result{err: acceptErr}
+			return
+		}
+		started := time.Now()
+		_, serveErr := serverTLS.Server(
+			context.Background(), raw, TrafficOrdinary,
+			func() time.Time { return started.Add(time.Second) },
+		)
+		serverResult <- result{err: serveErr, elapsed: time.Since(started)}
+	}()
+
+	raw, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := clientTLS.ClientConfig(serverIdentity.Node, TrafficOrdinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := tls.Client(raw, config)
+	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.HandshakeContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Do not send the mandatory build preface. The server must retain the
+	// original handshake deadline through this post-certificate admission step.
+	server := <-serverResult
+	_ = connection.Close()
+	if !errors.Is(server.err, ErrPeerBuild) {
+		t.Fatalf("stalled preface error = %v, want ErrPeerBuild", server.err)
+	}
+	var networkError net.Error
+	if !errors.As(server.err, &networkError) || !networkError.Timeout() {
+		t.Fatalf("stalled preface error is not a timeout: %v", server.err)
+	}
+	if server.elapsed < 500*time.Millisecond || server.elapsed > 3*time.Second {
+		t.Fatalf("bounded preface elapsed = %v", server.elapsed)
+	}
+}
+
 func TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 44)
 	clientIdentity := peerTLSTestIdentity(49, 21)
@@ -382,6 +581,14 @@ func TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated(t *testi
 	if client.TrafficClass() != TrafficShardNative || server.TrafficClass() != TrafficShardNative {
 		t.Fatalf("traffic classes = %d/%d", client.TrafficClass(), server.TrafficClass())
 	}
+	for side, connection := range map[string]PeerConnection{"client": client, "server": server} {
+		proved := connection.(interface {
+			BuildCapabilities() buildgate.CapabilitySet
+		})
+		if !proved.BuildCapabilities().Has(buildgate.CapabilityGatewayShardTransport) {
+			t.Fatalf("%s omitted authenticated gateway-shard capability", side)
+		}
+	}
 
 	wrongClient, wrongServer, wrongClientErr, wrongServerErr := peerTLSTestHandshake(
 		t, clientTLS, serverTLS, serverIdentity.Node,
@@ -395,6 +602,41 @@ func TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated(t *testi
 	}
 	if !errors.Is(wrongClientErr, ErrPeerAuthentication) && !errors.Is(wrongServerErr, ErrPeerAuthentication) {
 		t.Fatalf("cross-capability errors = client %v server %v", wrongClientErr, wrongServerErr)
+	}
+}
+
+func TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 214)
+	clientIdentity := peerTLSTestIdentity(215, 216)
+	serverIdentity := peerTLSTestIdentity(215, 236)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	legacy := buildgate.CurrentProfile()
+	legacy.WireGrammar = buildgate.GrammarID{
+		0xb6, 0x92, 0x36, 0x3d, 0x9c, 0x0b, 0x49, 0x22,
+		0x9e, 0xb4, 0x35, 0xe5, 0x0d, 0xba, 0xb8, 0xdd,
+	}
+	legacy.DiskGrammar = buildgate.GrammarID{
+		0x71, 0xe5, 0xf4, 0x45, 0xb2, 0x45, 0x4a, 0x66,
+		0x8e, 0x68, 0xd4, 0x47, 0x2e, 0x26, 0xe1, 0x49,
+	}
+	serverTLS := peerTLSTestBuildProfile(
+		newPeerTLSTestProfile(t, authority, serverIdentity), legacy,
+	)
+	for _, class := range []TrafficClass{
+		TrafficShardSQL, TrafficShardNative, TrafficShardControl,
+	} {
+		t.Run(fmt.Sprintf("class-%d", class), func(t *testing.T) {
+			client, server, clientErr, serverErr := peerTLSTestHandshake(
+				t, clientTLS, serverTLS, serverIdentity.Node, class, class,
+			)
+			if client != nil || server != nil {
+				t.Fatalf("legacy/current build returned application streams %v/%v", client, server)
+			}
+			if !errors.Is(clientErr, ErrPeerBuild) || !errors.Is(serverErr, ErrPeerBuild) ||
+				!errors.Is(serverErr, buildgate.ErrWireGrammar) {
+				t.Fatalf("legacy/current errors = client %v server %v", clientErr, serverErr)
+			}
+		})
 	}
 }
 
@@ -414,6 +656,111 @@ func TestPeerTLSServerRejectsLocalNodeCertificate(t *testing.T) {
 	}
 	if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
 		t.Fatalf("self-authentication errors = client %v, server %v", clientErr, serverErr)
+	}
+}
+
+func TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 6)
+	identity := peerTLSTestIdentity(17, 61)
+	profile := newPeerTLSTestProfile(t, authority, identity)
+	local := profile.WithLocalServiceConnections()
+	if profile.localServices || local == profile || !local.localServices {
+		t.Fatal("local service opt-in mutated the original profile")
+	}
+	for _, class := range []TrafficClass{TrafficShardNative, TrafficSnapshot, TrafficShardControl} {
+		t.Run(fmt.Sprintf("class-%d", class), func(t *testing.T) {
+			for _, enabled := range []bool{false, true} {
+				selected := profile
+				if enabled {
+					selected = local
+				}
+				client, server, clientErr, serverErr := peerTLSTestHandshake(t, selected, selected, identity.Node, class, class)
+				if client != nil {
+					_ = client.Close()
+				}
+				if server != nil {
+					_ = server.Close()
+				}
+				if enabled {
+					if clientErr != nil || serverErr != nil || client == nil || server == nil {
+						t.Fatalf("authenticated local service failed: client=%v server=%v", clientErr, serverErr)
+					}
+				} else if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
+					t.Fatalf("default profile allowed self connection: client=%v server=%v", clientErr, serverErr)
+				}
+			}
+		})
+	}
+	for _, class := range []TrafficClass{TrafficOrdinary, TrafficShardSQL, TrafficGatewayClient, TrafficGatewayControl} {
+		client, server, clientErr, serverErr := peerTLSTestHandshake(t, local, local, identity.Node, class, class)
+		if client != nil {
+			_ = client.Close()
+		}
+		if server != nil {
+			_ = server.Close()
+		}
+		if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
+			t.Fatalf("local opt-in allowed class %d: client=%v server=%v", class, clientErr, serverErr)
+		}
+	}
+	wrongNode := identity.Node
+	wrongNode[0]++
+	client, server, clientErr, serverErr := peerTLSTestHandshake(t, local, local, wrongNode, TrafficShardNative, TrafficShardNative)
+	if client != nil {
+		_ = client.Close()
+	}
+	if server != nil {
+		_ = server.Close()
+	}
+	if !errors.Is(clientErr, ErrWrongPeer) {
+		t.Fatalf("local opt-in bypassed exact expected peer: client=%v server=%v", clientErr, serverErr)
+	}
+}
+
+func TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 6)
+	identity := peerTLSTestIdentity(17, 61)
+	profile := newPeerTLSTestProfile(t, authority, identity)
+	local := profile.WithLocalGatewayControlConnections()
+	if profile.localGatewayControl || local == profile || !local.localGatewayControl || local.localServices {
+		t.Fatal("gateway control opt-in mutated or widened the original profile")
+	}
+	for _, class := range []TrafficClass{TrafficGatewayControl, TrafficGatewayClient, TrafficOrdinary,
+		TrafficShardSQL, TrafficShardNative, TrafficSnapshot, TrafficShardControl} {
+		t.Run(fmt.Sprintf("class-%d", class), func(t *testing.T) {
+			for _, enabled := range []bool{false, true} {
+				selected := profile
+				if enabled {
+					selected = local
+				}
+				client, server, clientErr, serverErr := peerTLSTestHandshake(t, selected, selected, identity.Node, class, class)
+				if client != nil {
+					_ = client.Close()
+				}
+				if server != nil {
+					_ = server.Close()
+				}
+				if enabled && class == TrafficGatewayControl {
+					if clientErr != nil || serverErr != nil || client == nil || server == nil {
+						t.Fatalf("authenticated local drain connection failed: client=%v server=%v", clientErr, serverErr)
+					}
+				} else if !errors.Is(clientErr, ErrWrongPeer) && !errors.Is(serverErr, ErrWrongPeer) {
+					t.Fatalf("unexpected self connection: enabled=%t client=%v server=%v", enabled, clientErr, serverErr)
+				}
+			}
+		})
+	}
+	wrongNode := identity.Node
+	wrongNode[0]++
+	client, server, clientErr, serverErr := peerTLSTestHandshake(t, local, local, wrongNode, TrafficGatewayControl, TrafficGatewayControl)
+	if client != nil {
+		_ = client.Close()
+	}
+	if server != nil {
+		_ = server.Close()
+	}
+	if !errors.Is(clientErr, ErrWrongPeer) {
+		t.Fatalf("gateway control opt-in bypassed exact peer: client=%v server=%v", clientErr, serverErr)
 	}
 }
 

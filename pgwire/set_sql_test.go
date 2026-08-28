@@ -214,12 +214,13 @@ func TestSQLSetIntermediateBudgetNoPartialRowsAndRecovery(t *testing.T) {
 
 func TestSQLSetCancellationNoPartialRowsAndRecovery(t *testing.T) {
 	c, server := connectSQLCatalogWithServer(t)
+	seedProtocolSetTables(t, c)
 	var statement strings.Builder
 	for leaf := 0; leaf < 256; leaf++ {
 		if leaf != 0 {
 			statement.WriteString(" UNION ALL ")
 		}
-		statement.WriteString("SELECT id FROM users")
+		statement.WriteString("SELECT id FROM set_a")
 	}
 	server.mu.Lock()
 	session := server.sessions[c.pid]
@@ -227,8 +228,23 @@ func TestSQLSetCancellationNoPartialRowsAndRecovery(t *testing.T) {
 	if session == nil {
 		t.Fatal("set cancellation session is not registered")
 	}
-	c.send(msgQuery, append([]byte(statement.String()), 0))
+	// ReadyForQuery can reach the client just before the seed command's
+	// deferred endCancelable. Do not mistake that old window for this query.
 	deadline := time.Now().Add(2 * time.Second)
+	for {
+		session.cancelMu.Lock()
+		active := session.cancelActive
+		session.cancelMu.Unlock()
+		if !active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed command did not leave its cancellation window")
+		}
+		runtime.Gosched()
+	}
+	c.send(msgQuery, append([]byte(statement.String()), 0))
+	deadline = time.Now().Add(2 * time.Second)
 	for {
 		session.cancelMu.Lock()
 		active := session.cancelActive

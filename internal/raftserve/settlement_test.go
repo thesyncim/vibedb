@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -198,6 +199,21 @@ func testCompletionResultBytes(
 	resultCode uint32,
 	resultBytes []byte,
 ) replicatedstate.CompletionLookup {
+	return testCompletionResultBytesFormat(
+		t, group, commandBytes, applied, resultCode,
+		replicatedstate.ResultFormatMutation, resultBytes,
+	)
+}
+
+func testCompletionResultBytesFormat(
+	t testing.TB,
+	group raftmember.GroupKey,
+	commandBytes []byte,
+	applied uint64,
+	resultCode uint32,
+	resultFormat uint16,
+	resultBytes []byte,
+) replicatedstate.CompletionLookup {
 	t.Helper()
 	command, err := replication.OpenCommand(commandBytes)
 	if err != nil {
@@ -207,7 +223,6 @@ func testCompletionResultBytes(
 	if command.Kind() == replication.CommandSessionOpen {
 		epoch = 17
 	}
-	const resultFormat = replicatedstate.ResultFormatMutation
 	encoded, err := replication.AppendCompletion(nil, replication.Completion{
 		ClusterID:             replication.ID128(group.ClusterID),
 		ClusterIncarnation:    replication.ID128(group.ClusterIncarnation),
@@ -236,6 +251,56 @@ func testCompletionResultBytes(
 	}
 }
 
+func TestRegistrySettlementValidatesRouteGateResultWithoutAllocations(t *testing.T) {
+	group := testGroup(21)
+	gate, ok := routegate.NewMachine(1, routegate.MaxRetainedRecords)
+	if !ok {
+		t.Fatal("construct route gate")
+	}
+	gateCommand := routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1,
+		Identity: routegate.Identity{1}, Binding: routegate.Binding{2},
+	}
+	gateBytes, err := routegate.AppendCommand(nil, gateCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandValue := testCommand(group, 1, 2)
+	commandValue.Kind = replication.CommandRouteGate
+	commandValue.Batches = nil
+	commandValue.RouteGate = gateBytes
+	commandValue.Fingerprint = sha256.Sum256(gateBytes)
+	command := encodeTestCommand(t, commandValue)
+	var result [routegate.OutcomeBytes]byte
+	resultBytes, err := routegate.AppendOutcome(result[:0], gate.Apply(gateCommand))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const applied = uint64(30)
+	lookup := testCompletionResultBytesFormat(
+		t, group, command, applied, replicatedstate.ResultRouteGate,
+		replicatedstate.ResultFormatRouteGate, resultBytes,
+	)
+	identity, err := openCommandIdentity(group, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if validateErr := validateCompletionLookup(identity, lookup); validateErr != nil {
+			panic(validateErr)
+		}
+	}); allocations != 0 {
+		t.Fatalf("route-gate completion validation allocations = %v, want 0", allocations)
+	}
+	wrongFormat := testCompletionResultBytesFormat(
+		t, group, command, applied, replicatedstate.ResultRouteGate,
+		replicatedstate.ResultFormatMutation, resultBytes,
+	)
+	if err := validateCompletionLookup(identity, wrongFormat); !errors.Is(err, ErrSettlementResult) {
+		t.Fatalf("wrong route-gate result format error = %v", err)
+	}
+}
+
 func testTransactionCommand(
 	t testing.TB,
 	group raftmember.GroupKey,
@@ -243,10 +308,13 @@ func testTransactionCommand(
 	t.Helper()
 	id := distributedtxn.ID{0xc1, 0x55, 0x81}
 	control, err := distributedtxn.AppendReplicatedCommand(nil, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant,
-		ID:        id, ExpectedRevision: 1,
-		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		Role:               distributedtxn.ReplicatedRoleParticipant,
+		Operation:          distributedtxn.ReplicatedPrepareParticipant,
+		ID:                 id,
+		ExpectedRevision:   1,
+		PayloadKind:        distributedtxn.ReplicatedPayloadNone,
+		ControllerEpoch:    7,
+		ExecutionPinDigest: distributedtxn.Digest(sha256.Sum256([]byte("raftserve/test-execution-pin"))),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -348,6 +416,16 @@ func TestRegistrySettlementValidatesMutationResultWithoutAllocations(t *testing.
 func TestRegistrySettlementValidatesTransactionResultIdentityWithoutAllocations(t *testing.T) {
 	group := testGroup(20)
 	command := testTransactionCommand(t, group)
+	outer, err := replication.OpenCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := outer.OpenTransactionInto(nil)
+	if err != nil || control.ControllerEpoch != 7 ||
+		control.ExecutionPinDigest == (distributedtxn.Digest{}) {
+		t.Fatalf("transaction controller fence = epoch:%d pin:%x err:%v",
+			control.ControllerEpoch, control.ExecutionPinDigest, err)
+	}
 	const applied = uint64(29)
 	lookup := testTransactionCompletion(
 		t, group, command, applied,

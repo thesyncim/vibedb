@@ -3,10 +3,11 @@
 VibeDB has a runnable static-shard command layer and a fixed-RF3 serving
 composition. `vibedb-shard serve-rf3` constructs the latter for externally
 prepared exact member artifacts. The public gateway connects canonical point
-`get` requests and strict exact-key `exec_batch` mutations to the native RF3
-endpoint when its catalog authority is RF3. General SQL, scatter reads, and
-multi-table reads remain on the static path. No command initializes or changes
-the RF3 topology.
+`get`, exact-key `read_batch`, and strict exact-key `exec_batch` requests to the
+native RF3 endpoint when its catalog authority is RF3. General SQL and
+non-exact scatter reads remain on the static path. Preparation and development
+commands initialize fixed topologies. The replica-control path can replace a
+failed member, but there is no general topology administration command.
 
 ## Runnable static layer
 
@@ -47,11 +48,12 @@ injected trusted dialer. The shipped gateway CLI does not supply one.
 
 The canonical RF3 data lane is separate from these SQL lanes. Point reads
 accept one table and one canonical ordered scalar string/number
-primary-placement key. Strict `exec_batch` writes lower whole-document insert,
-exact-primary-key whole-document update, and exact-primary-key delete into one
-or more relation-aware RF3 transaction participants. Same-group mutations use
-one atomic multi-relation apply; multiple groups use the replicated
-transaction protocol. The replicated table profile binds each table to an
+primary-placement key. Strict `exec_batch` writes lower single- or multi-row
+whole-document insert, exact-primary-key whole-document update, and
+exact-primary-key delete with equality or finite `IN` keys into one or more
+relation-aware RF3 transaction participants. Same-group mutations use one
+atomic multi-relation apply; multiple groups use the replicated transaction
+protocol. The replicated table profile binds each table to an
 exact dense relation, schema generation, relation-manifest digest, and
 three-replica route. Composite placement tuples and tenant-path placement are
 not implemented on this public lane.
@@ -82,11 +84,14 @@ definite serving fence coalesces one authenticated catalog refresh and one
 re-resolved retry; an ambiguous transport outcome never enters that replay
 path.
 
-The point-read lane never falls back to the static SQL service. The strict RF3
-mutation classifier fails closed to the static path when a statement is not in
-its supported exact-key vocabulary. RF3 scatter reads, multi-table reads,
-global-index mutation lowering, and a common distributed read timestamp are
-not implemented.
+The point-read and `read_batch` lanes never fall back to the static SQL service.
+The strict RF3 mutation classifier fails closed to the static path when a
+statement is not in its supported exact-key vocabulary. `read_batch` supports
+ordered multi-table and multi-group exact-primary-key reads with one ReadIndex
+cut per group. Its sorted observation vector is an explicit per-group cut, not
+a common MVCC timestamp. Ready global indexes are lowered into independent RF3
+relation participants. Replicated joins, projections, ranges, aggregates, and
+read-write SQL transactions are not implemented.
 
 The merge layer supports global limits, ordered results, aggregates, and
 grouped partial aggregates. It cancels remaining calls after a hard error or a
@@ -124,6 +129,11 @@ fence ahead of that writer. Disjoint bucket scopes can proceed concurrently.
 The fence is not durable. It expires if a gateway abandons it. This protocol
 establishes a scoped vector cut. It does not assign a distributed MVCC
 timestamp or prove one wall-clock snapshot instant.
+
+The RF3 ordering path and the remaining wall-time obligations are separated in
+[Distributed clock contract](distributed-clock-model.md). That page specifies
+the skew and suspend qualification contract. It is not evidence that those
+fault gates currently pass.
 
 ## Global indexes
 
@@ -216,9 +226,30 @@ Reopen validates the hidden image in one ordered pass, including exact epoch,
 slot-count, modulo-position, applied-order, and retirement invariants. Scratch
 state is proportional to retained session identities. Persistent dedupe rows
 and the dedupe portion of reopen are bounded by
-`1 + MaxSessions + MaxSessions * RetryWindow`, not by total operations.
+`1 + 2 * MaxSessions + MaxSessions * RetryWindow`, including the separate
+class-independent authority-binding rows, not by total operations on reused
+stable identities.
 Release makes `SessionCount` and `SessionSlotCount` reusable; a new Open is
 refused at `MaxSessions` while that many images remain retained.
+Release does not delete authority bindings or decrement
+`AuthorityBindingCount`: a new distinct client identity is also refused once
+that independent bound reaches `MaxSessions`, even with no active sessions.
+This preserves the binding that prevents an identity from being reused under
+a different command-authority class.
+
+The current durable route-session factory derives a fresh client identity
+from each request wave. That integration therefore exhausts the lifetime
+authority budget under sustained churn; reclaiming its retry slots does not
+solve the problem. The same risk must be audited in per-request execution-pin
+sessions. A serving fix must provide bounded reusable identities, uniquely
+bind each Open to its logical operation, and durably recover an Open admitted
+before route-intent publication. Hashing operations into reusable slots alone
+is insufficient: collisions and delayed retries must not share an active
+session or strand a slot. Raising the limit or deleting authority bindings
+would not establish this contract. The capacity regression is
+`TestNativeDurableRouteSessionAuthorityCapacityIsNotReclaimedByRelease`;
+passing it proves the refusal boundary, not sustained-serving completion.
+
 `LookupSessionLease` recovers the retained deadline and sequence fence with
 point reads. This kernel does not run timers, attest elapsed time, authenticate
 the proposer, or expose serving authority; RF3 serving still owns those
@@ -437,8 +468,10 @@ a delete and a put.
 A non-serving child stage applies verified artifact chunks and tail batches to
 one durable collection. It persists a fixed-size cursor after durable row
 effects. Recovery revalidates an artifact prefix before it skips that prefix.
-The stage reconstructs the deterministic artifact from the completed
-destination and requires the exact expected digest before tail catch-up.
+Artifact receipt and every tail mutation also update a constant-space
+authenticated multiset of the child image. The initial source partition remains
+one bounded scan, but sealing the caught-up child is O(1) and does not rescan
+its rows. Recovery may explicitly audit a sealed physical image once.
 
 An optional capture collection receives each exact before-and-after source
 transition atomically with its replicated source publication. Its compact raw
@@ -448,18 +481,21 @@ mutable ownership coordinates. Recovery verifies the full retained chain.
 The source closes the final write gap with a terminal ownership-fence entry.
 All mutable serving coordinates advance together, every child persists the
 corresponding empty batch, and certification reconstructs that capture entry
-and matches every durable child cursor. Each destination also scans and hashes
-its complete ordered final image. Reopen verifies the same proof. A fixed-size
-checksum-protected certificate binds those non-retained child images and the
-exact cut but deliberately grants no serving authority.
+and matches every durable child cursor. A fixed-size checksum-protected
+certificate binds each child's accumulated image and the exact cut but
+deliberately grants no serving authority. Global-index relations carry
+canonical placement metadata and a separately authenticated constant-size
+ownership proof, so cutover does not need to decode or rescan an index relation.
 
 A sealed destination can be converted in place into the standard
-replicated-state snapshot base. The conversion reuses the sealed image proof,
-binds the exact state envelope in a cut-zero checkpoint-group certificate,
-then certifies and folds the one-row hidden-state seed. It does not rewrite,
-rescan, or serialize the user image again after the canonical preparation
-pass. The independent child Raft runtime must install that small base before
-the child is eligible to serve.
+replicated-state snapshot base. The conversion reuses the sealed image proof
+and an opaque durable image identity, binds the exact state envelope in a
+cut-zero checkpoint-group certificate, then certifies and folds the one-row
+hidden-state seed. It does not rewrite, rescan, or serialize the user image
+again after the canonical preparation pass. The independent child Raft
+runtime must install that small base, and a coherent voting quorum must report
+the exact relation manifest and at least the sealed source applied position,
+before the child is eligible for catalog publication.
 
 The SQL driver owns this conversion. It prevents SQL sessions while the child
 image is incomplete and while the activated claim still lacks its exact base.
@@ -529,9 +565,29 @@ and publish as one bounded successor batch. Every split retains its own data
 proofs; composition only removes repeated catalog cloning and CAS contention.
 The batch accepts distinct source allocations within one distribution as well
 as independent distributions.
-The gateway can run the replicated publish-before-prune split controller when
-the replicated catalog authority is configured. The repository still has no
-replica-move executor or merge planner.
+The gateway scans replicated split operation records and triggers their source
+hosts. The durable controller and local source/child action runtimes reconstruct
+observations, admit exact plans, bind action grants, and execute capture, stage,
+tail, seal, activation, publication, and prune steps. `serve-rf3` installs the
+group-scoped split, plan-admission, artifact, tail, child-preparation, and
+terminal-retirement handlers. Automatic hot-shard policy supplies bounded
+intake. There is no general public operator split command. Replica movement is
+command-composed through its separate resumable controller. A merge planner
+remains absent.
+
+The serving manifest carries a private child registry per group and one shared
+operation-admission ceiling. Child preparation accepts exact base/local/global
+schema bundles, and hot admission selects an explicit per-source template.
+This is not a completed globally indexed split path: plan validation rejects
+distinct global-index relation tables, artifacts export the base collection,
+tail transitions have no relation ID, and retained pruning rejects index
+relations. The missing composition must partition one coherent snapshot cut,
+retain exact relation IDs and kinds through replay, and prune every relation
+under the same certified cut. Global-index rows use their canonical storage
+keys for placement, not the base row's point or locator. Existing bundle
+snapshot primitives do not by themselves provide this lifecycle. First serving
+split, repeated descendant capture, and multi-relation Linux qualification
+remain incomplete.
 
 ## Replication kernel
 
@@ -587,10 +643,14 @@ separate authenticated snapshot-artifact service. `serve-rf3` constructs the
 peer and replicated shard services from one fixed manifest. The public gateway
 uses the executor for catalog-bound point reads, exact-key mutation proposals,
 and transaction recovery through a shared authenticated pool and an exact
-leader-hint cache. It does not expose RF3 scatter/multi-table query execution or
-RF3 global-index mutation lowering. `serve-rf3` does not construct the snapshot
-service and does not provide certificate enrollment, dynamic address discovery,
-member changes, or empty-learner snapshot activation.
+leader-hint cache. It also exposes multi-table exact-key `read_batch` and RF3
+global-index mutation lowering. `serve-rf3` constructs snapshot-source,
+membership, observation, ownership, and retirement control when the retained
+manifest provides the required state. Cold learner bootstrap and the gateway
+replica controller compose member replacement. Certificate enrollment, dynamic
+address discovery, and a general public topology-administration CLI remain
+absent. Split control is command-composed when the operator supplies the exact
+replica-control and child-storage inventory.
 
 Do not describe this kernel as a turnkey replicated deployment.
 

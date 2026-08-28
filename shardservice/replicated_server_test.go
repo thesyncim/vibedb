@@ -18,22 +18,30 @@ import (
 )
 
 type fakeReplicatedOwner struct {
-	state              raftservice.ServingState
-	result             raftservice.Result
-	err                error
-	blockSubmit        bool
-	membershipErr      error
-	membership         raftservice.MembershipRequest
-	readResult         raftservice.PointReadResult
-	readErr            error
-	readLease          raftservice.PointReadLease
-	readCalled         chan struct{}
-	transactionResult  raftservice.TransactionReadResult
-	transactionErr     error
-	transactionLease   raftservice.TransactionReadLease
-	transactionRequest raftservice.TransactionReadRequest
-	transactionCalled  chan struct{}
-	probeCalls         atomic.Uint64
+	state                raftservice.ServingState
+	result               raftservice.Result
+	err                  error
+	blockSubmit          bool
+	membershipErr        error
+	membership           raftservice.MembershipRequest
+	readResult           raftservice.PointReadResult
+	readErr              error
+	readLease            raftservice.PointReadLease
+	readCalled           chan struct{}
+	transactionResult    raftservice.TransactionReadResult
+	transactionErr       error
+	transactionLease     raftservice.TransactionReadLease
+	transactionRequest   raftservice.TransactionReadRequest
+	transactionCalled    chan struct{}
+	requestLedgerResult  raftservice.RequestLedgerReadResult
+	requestLedgerErr     error
+	requestLedgerLease   raftservice.RequestLedgerReadLease
+	requestLedgerRequest raftservice.RequestLedgerReadRequest
+	executionPinResult   raftservice.ExecutionPinReadResult
+	executionPinErr      error
+	executionPinLease    raftservice.ExecutionPinReadLease
+	executionPinRequest  raftservice.ExecutionPinReadRequest
+	probeCalls           atomic.Uint64
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -42,6 +50,76 @@ func (owner *fakeReplicatedOwner) ApplyMembership(
 ) error {
 	owner.membership = request
 	return owner.membershipErr
+}
+
+func TestReplicatedServerLiveServingAuthorityGatesEveryRequest(t *testing.T) {
+	owner := &fakeReplicatedOwner{state: testReplicatedServingState()}
+	server := testReplicatedServer(owner)
+	active := false
+	if err := server.BindServingAuthority(func(state raftservice.ServingState) bool {
+		return active && state == owner.state
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedProbe,
+		Fence: ReplicatedFence{Group: owner.state.Identity.Group,
+			AllocationGeneration: owner.state.Identity.AllocationGeneration},
+	}
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable ||
+		!response.HasState {
+		t.Fatalf("inactive response = %+v", response)
+	}
+	active = true
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedHandshake || !response.HasState {
+		t.Fatalf("active response = %+v", response)
+	}
+	active = false
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable {
+		t.Fatalf("revoked response = %+v", response)
+	}
+}
+
+func TestReplicatedServerTransitionalAuthorityRequiresAuthenticatedExactOperation(t *testing.T) {
+	owner := &fakeReplicatedOwner{state: testReplicatedServingState()}
+	server := testReplicatedServer(owner)
+	if err := server.BindServingAuthority(func(raftservice.ServingState) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.BindTransitionalServingAuthority(func(
+		state raftservice.ServingState, request *ReplicatedRequest,
+	) bool {
+		return state == owner.state && request != nil && request.Operation == ReplicatedMembership
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedMembership,
+		Fence: ReplicatedFence{Group: owner.state.Identity.Group,
+			AllocationGeneration: owner.state.Identity.AllocationGeneration,
+			Command:              owner.state.Command, MemberID: owner.state.Identity.MemberID,
+			StoreID:         owner.state.Identity.StoreID,
+			NodeIncarnation: owner.state.Identity.NodeIncarnation, Term: owner.state.Status.Term},
+		Membership: ReplicatedMembershipRequest{Kind: raftservice.MembershipAddLearner,
+			TransitionID: [16]byte{1}, MetadataEpoch: 2, CatalogGeneration: 3,
+			ExpectedReplicaSetVersion: owner.state.Command.ReplicaSetVersion,
+			SourceMember:              1, TargetMember: 2},
+	}
+	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal ||
+		response.Refusal != ReplicatedRefusalUnavailable {
+		t.Fatalf("unauthenticated transition response = %+v", response)
+	}
+	if response := server.executeReplicatedAuthenticated(
+		t.Context(), request, true,
+	); response.Kind != ReplicatedMembershipAccepted {
+		t.Fatalf("authenticated membership response = %+v", response)
+	}
+	probe := *request
+	probe.Operation = ReplicatedProbe
+	if response := server.executeReplicatedAuthenticated(
+		t.Context(), &probe, true,
+	); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable {
+		t.Fatalf("authenticated data-plane response = %+v", response)
+	}
 }
 
 func (owner *fakeReplicatedOwner) Probe(
@@ -93,6 +171,22 @@ func (owner *fakeReplicatedOwner) ReadTransaction(
 	return owner.transactionResult, owner.transactionLease, owner.transactionErr
 }
 
+func (owner *fakeReplicatedOwner) ReadRequestLedger(
+	_ context.Context,
+	request raftservice.RequestLedgerReadRequest,
+) (raftservice.RequestLedgerReadResult, raftservice.RequestLedgerReadLease, error) {
+	owner.requestLedgerRequest = request
+	return owner.requestLedgerResult, owner.requestLedgerLease, owner.requestLedgerErr
+}
+
+func (owner *fakeReplicatedOwner) ReadExecutionPin(
+	_ context.Context,
+	request raftservice.ExecutionPinReadRequest,
+) (raftservice.ExecutionPinReadResult, raftservice.ExecutionPinReadLease, error) {
+	owner.executionPinRequest = request
+	return owner.executionPinResult, owner.executionPinLease, owner.executionPinErr
+}
+
 type testPointReadLease struct{ released atomic.Bool }
 
 func (lease *testPointReadLease) Release() { lease.released.Store(true) }
@@ -138,7 +232,8 @@ func TestReplicatedServerPreservesTypedPointReadBounds(t *testing.T) {
 		err     error
 		refusal ReplicatedRefusalCode
 	}{{"future-applied-floor", replicatedstate.ErrReadBehind, ReplicatedRefusalReadBehind},
-		{"response-buffer", replicatedstate.ErrReadBufferBound, ReplicatedRefusalReadBufferBound}} {
+		{"response-buffer", replicatedstate.ErrReadBufferBound, ReplicatedRefusalReadBufferBound},
+		{"active-intent", replicatedstate.ErrTransactionIntentActive, ReplicatedRefusalReadIntentActive}} {
 		t.Run(test.name, func(t *testing.T) {
 			owner := &fakeReplicatedOwner{state: state, readErr: test.err}
 			server := &ReplicatedServer{owner: owner}

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
@@ -35,6 +36,21 @@ type relationBundleFixture struct {
 	options Options
 }
 
+func testGlobalIndexProfile(
+	indexID, incarnation uint64,
+	locatorCount uint8,
+	unique bool,
+) GlobalIndexProfile {
+	return GlobalIndexProfile{
+		IndexID: indexID, Incarnation: incarnation,
+		LocatorCount: locatorCount, Unique: unique,
+		KeyEncoding: GlobalIndexKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion:  distribution.CurrentTupleVersion,
+		MapperVersion: distribution.NativeMapperVersion,
+		BucketBits:    distribution.DefaultVirtualBucketBits,
+	}
+}
+
 func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -43,12 +59,17 @@ func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 		capture   bool
 		want      int
 	}{
-		{"data_without_capture", 64, 8, false, 67},
-		{"data_with_capture", 64, 8, true, 68},
+		{"data_without_capture", 64, 8, false, 68},
+		{"data_with_capture", 64, 8, true, 69},
 		{"session_open_without_capture", 0, 1, false, 4},
 		{"session_open_with_capture", 0, 1, true, 5},
-		{"release_without_capture", 0, 8, false, 10},
-		{"release_with_capture", 0, 8, true, 11},
+		{"release_without_capture", 0, 8, false, 18},
+		{"release_with_capture", 0, 8, true, 19},
+		{"release_dominates_data", 13, 8, false, 18},
+		{"equal_data_and_release", 14, 8, false, 18},
+		{"data_exceeds_release", 15, 8, false, 19},
+		{"maximum_release", 0, MaxSessionRetryWindow, false, 2*MaxSessionRetryWindow + 2},
+		{"maximum_data", replication.MaxMutations, 1, true, replication.MaxMutations + 5},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := RequiredBundleTransactionDocuments(
@@ -71,6 +92,51 @@ func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 		); !errors.Is(err, ErrInvalidOptions) {
 			t.Fatalf("invalid dimensions %+v err=%v", test, err)
 		}
+	}
+}
+
+func TestBundleTransactionProfileHistoricalFenceBounds(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		relations int
+		retry     uint16
+	}{
+		{"data", 64, 8},
+		{"release", 1, MaxSessionRetryWindow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			relations := []relationCollection{{target: CollectionTarget{Limits: CollectionLimits{
+				MaxDistinctMutations: test.relations, MaxBatchBytes: 1024,
+			}}}}
+			fenceBytes := len(sessionFenceKey(0, 0)) + sessionFenceBytes
+			hotBytes := len(stateKey) + MaxStateEnvelopeBytes +
+				sha256.Size + 1 + MaxAuthorityBindingBytes +
+				sha256.Size + 1 + MaxSessionRecordBytes +
+				sha256.Size + 3 + MaxSessionSlotRecordBytes + fenceBytes
+			releaseBytes := len(stateKey) + MaxStateEnvelopeBytes +
+				sha256.Size + 1 + int(test.retry)*(sha256.Size+3+fenceBytes)
+			options := Options{
+				RetryWindow: test.retry,
+				TxnLimits: durable.TxnLimits{
+					MaxCollections: 2,
+					MaxDocuments:   max(test.relations+4, 2*int(test.retry)+2),
+					MaxBytes:       int64(max(hotBytes+1024, releaseBytes)),
+				},
+			}
+			if err := validateBundleTransactionProfile(CollectionTarget{}, relations, options); err != nil {
+				t.Fatalf("exact fence capacity rejected: %v", err)
+			}
+			short := options
+			short.TxnLimits.MaxDocuments--
+			if err := validateBundleTransactionProfile(CollectionTarget{}, relations, short); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("one-short fence documents accepted: %v", err)
+			}
+			short = options
+			short.TxnLimits.MaxBytes--
+			if err := validateBundleTransactionProfile(CollectionTarget{}, relations, short); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("one-short fence bytes accepted: %v", err)
+			}
+		})
 	}
 }
 
@@ -119,6 +185,20 @@ func newRelationBundleFixtureWithSecondKind(
 	reserveCapture bool,
 	baseOptions, globalOptions durable.Options,
 	secondKind RelationKind,
+	globalValidation ...MutationValidator,
+) relationBundleFixture {
+	return newRelationBundleFixtureWithSystemOptions(t, checkpoint, reserveCapture,
+		baseOptions, globalOptions, secondKind,
+		durable.Options{OpaqueValues: true, MaxBatchDocuments: 32}, globalValidation...)
+}
+
+func newRelationBundleFixtureWithSystemOptions(
+	t testing.TB,
+	checkpoint, reserveCapture bool,
+	baseOptions, globalOptions durable.Options,
+	secondKind RelationKind,
+	systemOptions durable.Options,
+	globalValidation ...MutationValidator,
 ) relationBundleFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -138,13 +218,16 @@ func newRelationBundleFixtureWithSecondKind(
 		return targetOf(collection)
 	}
 	index := store.IndexDefinition{Name: "by_email", Paths: []string{"/email"}}
-	system := open("system", durable.Options{
-		OpaqueValues: true, MaxBatchDocuments: 32,
-	})
+	system := open("system", systemOptions)
 	system = systemTargetOf(system.Collection)
 	baseOptions.Indexes = []store.IndexDefinition{index}
 	base := open("base", baseOptions)
 	global := open("global", globalOptions)
+	if len(globalValidation) != 0 {
+		global.Validation = ValidationDeterministicMutation
+		global.ValidationDigest = sha256.Sum256([]byte("canonical-global-placement/full-range"))
+		global.Validator = globalValidation[0]
+	}
 	var capture CollectionTarget
 	if reserveCapture {
 		capture = open(TransitionCaptureCollectionName, durable.Options{
@@ -188,7 +271,7 @@ func newRelationBundleFixtureWithSecondKind(
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDocuments := relationDocuments + 3
+	wantDocuments := max(relationDocuments+4, 2*8+2)
 	if reserveCapture {
 		wantDocuments++
 	}
@@ -244,9 +327,7 @@ func relationBundleCollections(
 		{Relation: 2, Kind: secondKind, Name: "global", Target: second},
 	}
 	if secondKind == RelationGlobalIndex {
-		relations[1].GlobalIndex = GlobalIndexProfile{
-			IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-		}
+		relations[1].GlobalIndex = testGlobalIndexProfile(91, 7, 1, true)
 	}
 	return relations
 }
@@ -395,6 +476,7 @@ func TestSingletonApplyContractAuthenticatesNativeExactIndexes(t *testing.T) {
 		}}
 		contract, digestErr := bundleApplyContractDigest(
 			relationManifestDigest(7, relations), relations, 128, 8,
+			0, 0, RequestLedgerRange{}, 59,
 		)
 		if digestErr != nil || contract == ([sha256.Size]byte{}) {
 			t.Fatalf("singleton contract indexes=%v = %x, %v", indexes, contract, digestErr)
@@ -985,13 +1067,15 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 	relations := []RelationCollection{
 		{Relation: 1, Kind: RelationJSON, Name: "bounded-base", Target: base},
 		{Relation: 2, Kind: RelationGlobalIndex, Name: "bounded-global", Target: global,
-			GlobalIndex: GlobalIndexProfile{IndexID: 1, Incarnation: 1, LocatorCount: 1, Unique: true}},
+			GlobalIndex: testGlobalIndexProfile(1, 1, 1, true)},
 	}
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
+		sha256.Size + 3 + MaxSessionSlotRecordBytes +
+		len(sessionFenceKey(0, 0)) + sessionFenceBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + 8*(sha256.Size+3)
+		sha256.Size + 1 + 8*(sha256.Size+3+len(sessionFenceKey(0, 0))+sessionFenceBytes)
 	systemBatchBytes := max(hotSystemBytes, releaseSystemBytes)
 	good := Options{
 		TxnLimits: durable.TxnLimits{
@@ -1014,7 +1098,7 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 	}{
 		{"collections", func(o *Options) { o.TxnLimits.MaxCollections-- }},
 		{"mutations", func(o *Options) {
-			o.TxnLimits.MaxDocuments = base.Limits.MaxDistinctMutations + 4
+			o.TxnLimits.MaxDocuments--
 		}},
 		{"bytes", func(o *Options) {
 			o.TxnLimits.MaxBytes = int64(systemBatchBytes + base.Limits.MaxBatchBytes)
@@ -1092,9 +1176,7 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 			},
 			{
 				Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
-				GlobalIndex: GlobalIndexProfile{
-					IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-				},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true),
 			},
 		},
 		fixture.log, fixture.machine.options,
@@ -1151,7 +1233,7 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 			{Relation: 1, Kind: RelationJSON, Name: "base", Target: fixture.base,
 				LocalIndexes: []store.IndexDefinition{fixture.index}},
 			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
-				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true)},
 		}, fixture.log, fixture.machine.options,
 	); err == nil {
 		t.Fatal("reopen accepted an unknown schema generation")
@@ -1251,7 +1333,7 @@ func TestRelationBundleSnapshotBindsActiveCaptureAndRejectsSelfConsistentForgeri
 			{Relation: 1, Kind: RelationJSON, Name: "base", Target: fixture.base,
 				LocalIndexes: []store.IndexDefinition{fixture.index}},
 			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
-				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true)},
 		}, fixture.log, fixture.options,
 	)
 	if err != nil {
@@ -1473,7 +1555,7 @@ func assertRecoveredRelationBundleCut(
 			{Relation: 1, Kind: RelationJSON, Name: "base", Target: base,
 				LocalIndexes: []store.IndexDefinition{index}},
 			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: global,
-				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true)},
 		},
 		log, options,
 	)

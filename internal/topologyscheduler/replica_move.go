@@ -36,6 +36,9 @@ type ReplicaMovePolicy struct {
 	MaxProjectedPressurePPM   uint64
 	MaxPhysicalMigrationBytes uint64
 	DistinctFailureDomains    bool
+	// RequireEnrolledTarget restricts the shipped RF3 controller to the exact
+	// pre-provisioned learner; advisory callers may still consider spare nodes.
+	RequireEnrolledTarget bool
 }
 
 // DefaultReplicaMovePolicy returns conservative hot-node relief bounds.
@@ -207,9 +210,19 @@ func SelectReplicaMoves(
 		}
 		manifest, _ := catalog.Manifest(candidate.Source.Distribution)
 		shard, _ := manifest.ShardOrdinalForRange(candidate.Source.Range)
+		var enrolled distribution.EndpointID
+		if policy.RequireEnrolledTarget {
+			var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+			route, found := catalog.ResolveReplicatedMembershipRoute(candidate.Source.Distribution, candidate.Source.Shard, replicas[:0])
+			if !found || !route.HasEnrolledTarget {
+				cut.Invalid++
+				continue
+			}
+			enrolled = distribution.EndpointID(route.EnrolledTarget.Endpoint)
+		}
 		target, found := chooseReplicaMoveTarget(
 			manifest, shard, int(work.sourceNode), sourceCurrent, sourceAfter,
-			candidate, nodes, policy, workspace,
+			candidate, nodes, policy, workspace, enrolled,
 		)
 		if !found {
 			cut.Saturated++
@@ -280,6 +293,13 @@ func ResolveReplicaMove(
 		return ReplicaMoveSelection{}, ErrInvalidReplicaMove
 	}
 	target := nodes[move.targetNode].Endpoint
+	if policy.RequireEnrolledTarget {
+		var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		route, found := catalog.ResolveReplicatedMembershipRoute(candidate.Source.Distribution, candidate.Source.Shard, replicas[:0])
+		if !found || !route.HasEnrolledTarget || distribution.EndpointID(route.EnrolledTarget.Endpoint) != target {
+			return ReplicaMoveSelection{}, ErrInvalidReplicaMove
+		}
+	}
 	if _, err := catalog.Address(target); err != nil {
 		return ReplicaMoveSelection{}, ErrInvalidReplicaMove
 	}
@@ -537,11 +557,15 @@ func chooseReplicaMoveTarget(
 	nodes []NodeCapacity,
 	policy ReplicaMovePolicy,
 	workspace *ReplicaMoveWorkspace,
+	enrolled distribution.EndpointID,
 ) (int, bool) {
 	bestNode := -1
 	best := placementScore{pressure: ^uint64(0)}
 	for nodeIndex := range nodes {
 		node := &nodes[nodeIndex]
+		if enrolled != "" && node.Endpoint != enrolled {
+			continue
+		}
 		if nodeIndex == sourceNode || node.Flags&NodePlacementReady == 0 ||
 			workspace.placement.replicas[nodeIndex] >= uint16(policy.MaxMovesPerTargetNode) ||
 			uint32(node.ActiveReceives)+uint32(workspace.placement.receives[nodeIndex]) >=
@@ -725,5 +749,6 @@ func replicaMoveFingerprint(
 	mix(policy.MaxProjectedPressurePPM)
 	mix(policy.MaxPhysicalMigrationBytes)
 	mix(boolPlacementValue(policy.DistinctFailureDomains))
+	mix(boolPlacementValue(policy.RequireEnrolledTarget))
 	return fingerprint
 }

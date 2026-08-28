@@ -25,6 +25,7 @@ var (
 	ErrChunk          = errors.New("snapshottransfer: invalid chunk")
 	ErrRepository     = errors.New("snapshottransfer: repository failure")
 	ErrOutcomeUnknown = errors.New("snapshottransfer: durability outcome unknown")
+	ErrArtifactBusy   = errors.New("snapshottransfer: artifact has active readers")
 )
 
 var descriptorMagic = [8]byte{'V', 'B', 'S', 'N', 'A', 'P', 0, 0}

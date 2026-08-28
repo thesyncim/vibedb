@@ -2,15 +2,21 @@ package splitcontroller
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"slices"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -23,20 +29,51 @@ var ErrPlanIntent = errors.New("splitcontroller: invalid persisted plan intent")
 // revisions. No controller-local file or remembered recommendation is needed
 // to reconstruct the exact plan after a process loss.
 type persistedPlanIntent struct {
-	Operation        [32]byte                 `json:"operation"`
-	SourceGeneration uint64                   `json:"source_generation"`
-	Collection       string                   `json:"collection"`
-	Columns          []string                 `json:"columns"`
-	Source           autosplit.SourceIdentity `json:"source"`
-	Retained         uint8                    `json:"retained"`
-	Children         []autosplit.SplitChild   `json:"children"`
-	Targets          []persistedChildTarget   `json:"targets"`
+	Operation        [32]byte                      `json:"operation"`
+	SourceGeneration uint64                        `json:"source_generation"`
+	Collection       string                        `json:"collection"`
+	Columns          []string                      `json:"columns"`
+	Source           autosplit.SourceIdentity      `json:"source"`
+	Retained         uint8                         `json:"retained"`
+	Children         []autosplit.SplitChild        `json:"children"`
+	Targets          []persistedChildTarget        `json:"targets"`
+	SourceAuthority  *persistedPlanSourceAuthority `json:"source_authority"`
+}
+
+type persistedPlanSourceAuthority struct {
+	LogicalSchemaDigest [32]byte                 `json:"logical_schema_digest"`
+	Group               raftmember.GroupKey      `json:"group"`
+	Command             raftservice.CommandFence `json:"command"`
+	SQL                 persistedSQLIdentity     `json:"sql"`
+	Placement           persistedPlacement       `json:"placement"`
+	LocalIndexes        []store.IndexDefinition  `json:"local_indexes"`
 }
 
 type persistedLimits sqldriver.ReplicatedShardStoreLimits
 type persistedBinding sqldriver.ReplicatedShardStoreBinding
 type persistedSidecars sqldriver.ReplicatedShardStoreSidecarProfile
 type persistedRelation sqldriver.ReplicatedShardRelationIdentity
+type persistedPlacement sqldriver.ReplicatedPlacementProfile
+type persistedApplySidecars sqldriver.ReplicatedApplySidecarProfile
+type persistedApplyIdentity struct {
+	Format                           uint16                 `json:"format"`
+	Storage                          string                 `json:"storage"`
+	CaptureStorage                   string                 `json:"capture_storage"`
+	ValidationProfile                uint8                  `json:"validation_profile"`
+	ValidationDigest                 [32]byte               `json:"validation_digest"`
+	SystemLimits                     persistedLimits        `json:"system_limits"`
+	CaptureLimits                    persistedLimits        `json:"capture_limits"`
+	MaxSessions                      uint64                 `json:"max_sessions"`
+	RetryWindow                      uint16                 `json:"retry_window"`
+	TxnLimits                        durable.TxnLimits      `json:"txn_limits"`
+	Placement                        persistedPlacement     `json:"placement"`
+	RequestLedgerCapacityBytes       uint64                 `json:"request_ledger_capacity_bytes"`
+	RequestLedgerCleanupReserveBytes uint64                 `json:"request_ledger_cleanup_reserve_bytes"`
+	RequestLedgerRangeStart          [32]byte               `json:"request_ledger_range_start"`
+	RequestLedgerRangeEnd            [32]byte               `json:"request_ledger_range_end"`
+	RequestLedgerRangeIdentity       [32]byte               `json:"request_ledger_range_identity"`
+	Sidecars                         persistedApplySidecars `json:"sidecars"`
+}
 
 type persistedSQLIdentity struct {
 	Format                   uint16              `json:"format"`
@@ -54,12 +91,35 @@ type persistedSQLIdentity struct {
 }
 
 type persistedChildTarget struct {
-	Child                 uint8                                `json:"child"`
-	Endpoint              distribution.EndpointID              `json:"endpoint"`
-	WAL                   raftstore.Identity                   `json:"wal"`
-	TopologyRecoveryEpoch uint64                               `json:"topology_recovery_epoch"`
-	Authority             sqldriver.ReplicatedAuthorityProfile `json:"authority"`
-	SQL                   persistedSQLIdentity                 `json:"sql"`
+	Child                  uint8                                `json:"child"`
+	Endpoint               distribution.EndpointID              `json:"endpoint"`
+	Replicas               []persistedChildReplica              `json:"replicas"`
+	ReplicaSetVersion      uint64                               `json:"replica_set_version"`
+	RelationManifestDigest [32]byte                             `json:"relation_manifest_digest"`
+	TopologyRecoveryEpoch  uint64                               `json:"topology_recovery_epoch"`
+	Authority              sqldriver.ReplicatedAuthorityProfile `json:"authority"`
+	LocalIndexes           []store.IndexDefinition              `json:"local_indexes"`
+}
+
+type persistedChildReplica struct {
+	Member            uint64                  `json:"member"`
+	Node              [16]byte                `json:"node"`
+	StoreID           [16]byte                `json:"store_id"`
+	NodeIncarnation   uint64                  `json:"node_incarnation"`
+	Endpoint          distribution.EndpointID `json:"endpoint"`
+	NativeEndpoint    distribution.EndpointID `json:"native_endpoint"`
+	ControlEndpoint   distribution.EndpointID `json:"control_endpoint"`
+	PeerAddress       string                  `json:"peer_address,omitempty"`
+	NativeAddress     string                  `json:"native_address,omitempty"`
+	ControlAddress    string                  `json:"control_address,omitempty"`
+	SnapshotAddress   string                  `json:"snapshot_address"`
+	WAL               raftstore.Identity      `json:"wal"`
+	WALPath           string                  `json:"wal_path"`
+	SQLPath           string                  `json:"sql_path"`
+	RuntimeRoot       string                  `json:"runtime_root"`
+	SQL               persistedSQLIdentity    `json:"sql"`
+	Apply             persistedApplyIdentity  `json:"apply"`
+	CertificateDigest [32]byte                `json:"certificate_digest"`
 }
 
 // AppendPlanIntent appends the one canonical byte image used as replicated
@@ -80,6 +140,10 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 		Source: plan.source, Retained: plan.retained,
 		Children: make([]autosplit.SplitChild, plan.childCount),
 		Targets:  make([]persistedChildTarget, 0, int(plan.childCount)-1),
+	}
+	if source := plan.sourceAuthority; source != nil {
+		intent.SourceAuthority = &persistedPlanSourceAuthority{Group: source.Group, Command: source.Command, LogicalSchemaDigest: source.LogicalSchemaDigest,
+			SQL: persistSQLIdentity(source.Schema.SQL), Placement: persistedPlacement(source.Schema.Placement), LocalIndexes: cloneSplitLocalIndexes(source.Schema.LocalIndexes)}
 	}
 	for child := 0; child < int(plan.childCount); child++ {
 		descriptor := plan.children[child]
@@ -103,9 +167,13 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 		}
 		if target, targetOK := plan.Target(uint8(child)); targetOK {
 			intent.Targets = append(intent.Targets, persistedChildTarget{
-				Child: target.Child, Endpoint: target.Endpoint, WAL: target.WAL,
-				TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
-				Authority:             target.Authority, SQL: persistSQLIdentity(target.SQL),
+				Child: target.Child, Endpoint: target.Endpoint,
+				Replicas:               persistChildReplicas(target.Replicas),
+				ReplicaSetVersion:      target.ReplicaSetVersion,
+				RelationManifestDigest: target.RelationManifestDigest,
+				TopologyRecoveryEpoch:  target.TopologyRecoveryEpoch,
+				Authority:              target.Authority,
+				LocalIndexes:           cloneSplitLocalIndexes(target.LocalIndexes),
 			})
 		}
 	}
@@ -175,20 +243,116 @@ func OpenPlanIntent(raw []byte, catalog *gateway.Snapshot) (*Plan, error) {
 	targets := make([]ChildTarget, len(intent.Targets))
 	for index := range intent.Targets {
 		target := &intent.Targets[index]
+		replicas := openPersistedChildReplicas(target.Replicas)
+		if len(replicas) == 0 {
+			return nil, ErrPlanIntent
+		}
 		targets[index] = ChildTarget{
-			Child: target.Child, Endpoint: target.Endpoint, WAL: target.WAL,
-			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
-			Authority:             target.Authority,
-			SQL:                   openPersistedSQLIdentity(target.SQL),
+			Child: target.Child, Endpoint: target.Endpoint,
+			Replicas:               replicas,
+			ReplicaSetVersion:      target.ReplicaSetVersion,
+			RelationManifestDigest: target.RelationManifestDigest,
+			TopologyRecoveryEpoch:  target.TopologyRecoveryEpoch,
+			Authority:              target.Authority,
+			WAL:                    replicas[0].WAL,
+			SQL:                    replicas[0].SQL.Clone(),
+			LocalIndexes:           cloneSplitLocalIndexes(target.LocalIndexes),
 		}
 	}
-	plan, err := RecoverPlan(
-		catalog, intent.SourceGeneration, split, partitioner, targets,
-	)
+	var source []PlanSourceAuthority
+	if authority := intent.SourceAuthority; authority != nil {
+		source = []PlanSourceAuthority{{Group: authority.Group, Command: authority.Command, LogicalSchemaDigest: authority.LogicalSchemaDigest, Schema: PlanSourceSchema{
+			SQL: openPersistedSQLIdentity(authority.SQL), Placement: sqldriver.ReplicatedPlacementProfile(authority.Placement), LocalIndexes: cloneSplitLocalIndexes(authority.LocalIndexes)}}}
+	}
+	plan, err := RecoverPlan(catalog, intent.SourceGeneration, split, partitioner, targets, source...)
 	if err != nil || [32]byte(plan.OperationID()) != intent.Operation {
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
 	return plan, nil
+}
+
+func persistChildReplicas(input []ChildReplicaTarget) []persistedChildReplica {
+	result := make([]persistedChildReplica, len(input))
+	for index, replica := range input {
+		result[index] = persistedChildReplica{
+			Member: replica.Member, Node: [16]byte(replica.Node), StoreID: replica.StoreID,
+			NodeIncarnation: replica.NodeIncarnation, Endpoint: replica.Endpoint,
+			NativeEndpoint: replica.NativeEndpoint, ControlEndpoint: replica.ControlEndpoint,
+			PeerAddress: replica.PeerAddress, NativeAddress: replica.NativeAddress, ControlAddress: replica.ControlAddress,
+			SnapshotAddress: replica.SnapshotAddress,
+			WAL:             replica.WAL, WALPath: replica.WALPath, SQLPath: replica.SQLPath,
+			RuntimeRoot: replica.RuntimeRoot, SQL: persistSQLIdentity(replica.SQL),
+			Apply:             persistApplyIdentity(replica.Apply),
+			CertificateDigest: replica.CertificateDigest,
+		}
+	}
+	return result
+}
+
+func preparedChildReplicaDigest(replica ChildReplicaTarget) [sha256.Size]byte {
+	persisted := persistChildReplicas([]ChildReplicaTarget{replica})[0]
+	raw, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		return [sha256.Size]byte{}
+	}
+	raw, err = vibejson.AppendCanonicalize(nil, raw)
+	if err != nil {
+		return [sha256.Size]byte{}
+	}
+	return sha256.Sum256(raw)
+}
+
+func openPersistedChildReplicas(input []persistedChildReplica) []ChildReplicaTarget {
+	result := make([]ChildReplicaTarget, len(input))
+	for index, replica := range input {
+		result[index] = ChildReplicaTarget{
+			Member: replica.Member, Node: rafttransport.NodeID(replica.Node), StoreID: replica.StoreID,
+			NodeIncarnation: replica.NodeIncarnation, Endpoint: replica.Endpoint,
+			NativeEndpoint: replica.NativeEndpoint, ControlEndpoint: replica.ControlEndpoint,
+			PeerAddress: replica.PeerAddress, NativeAddress: replica.NativeAddress, ControlAddress: replica.ControlAddress,
+			SnapshotAddress: replica.SnapshotAddress,
+			WAL:             replica.WAL, WALPath: replica.WALPath, SQLPath: replica.SQLPath,
+			RuntimeRoot: replica.RuntimeRoot, SQL: openPersistedSQLIdentity(replica.SQL),
+			Apply:             openPersistedApplyIdentity(replica.Apply),
+			CertificateDigest: replica.CertificateDigest,
+		}
+	}
+	return result
+}
+
+func persistApplyIdentity(identity sqldriver.ReplicatedApplyIdentity) persistedApplyIdentity {
+	return persistedApplyIdentity{
+		Format: identity.Format, Storage: identity.Storage, CaptureStorage: identity.CaptureStorage,
+		ValidationProfile: identity.ValidationProfile, ValidationDigest: identity.ValidationDigest,
+		SystemLimits:  persistedLimits(identity.SystemLimits),
+		CaptureLimits: persistedLimits(identity.CaptureLimits), MaxSessions: identity.MaxSessions,
+		RetryWindow: identity.RetryWindow, TxnLimits: identity.TxnLimits,
+		Placement:                        persistedPlacement(identity.Placement),
+		RequestLedgerCapacityBytes:       identity.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: identity.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          identity.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            identity.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       identity.RequestLedgerRangeIdentity,
+		Sidecars:                         persistedApplySidecars(identity.Sidecars),
+	}
+}
+
+func openPersistedApplyIdentity(identity persistedApplyIdentity) sqldriver.ReplicatedApplyIdentity {
+	return sqldriver.ReplicatedApplyIdentity{
+		Format: identity.Format, Storage: identity.Storage, CaptureStorage: identity.CaptureStorage,
+		ValidationProfile: identity.ValidationProfile, ValidationDigest: identity.ValidationDigest,
+		SystemLimits:  sqldriver.ReplicatedShardStoreLimits(identity.SystemLimits),
+		CaptureLimits: sqldriver.ReplicatedShardStoreLimits(identity.CaptureLimits),
+		MaxSessions:   identity.MaxSessions, RetryWindow: identity.RetryWindow,
+		TxnLimits:                        identity.TxnLimits,
+		Placement:                        sqldriver.ReplicatedPlacementProfile(identity.Placement),
+		RequestLedgerCapacityBytes:       identity.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: identity.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          identity.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            identity.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       identity.RequestLedgerRangeIdentity,
+		Sidecars:                         sqldriver.ReplicatedApplySidecarProfile(identity.Sidecars),
+	}
 }
 
 func persistSQLIdentity(identity sqldriver.ReplicatedShardStoreIdentity) persistedSQLIdentity {

@@ -45,7 +45,7 @@ func journalCoordinator(t testing.TB, id ID) []byte {
 	t.Helper()
 	raw, err := AppendCoordinator(nil, CoordinatorRecord{
 		ID: id, State: CoordinatorStaging, Revision: 1, CatalogGeneration: 9,
-		RecoveryDeadline: 1234,
+		RecoveryDeadline: 3,
 		Participants: []ParticipantRef{
 			{Distribution: []byte("docs"), Shard: []byte("-40"), RoutingVersion: 9, AllocationGeneration: 4, OwnershipEpoch: 7,
 				MutationDigest: journalDigest(40), State: ParticipantStaged},
@@ -57,6 +57,50 @@ func journalCoordinator(t testing.TB, id ID) []byte {
 		t.Fatalf("AppendCoordinator: %v", err)
 	}
 	return raw
+}
+
+func TestJournalCoordinatorRecoveryPulseIsDurableBoundedAndRevisionNeutral(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transactions.vtj")
+	j, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := journalID(91)
+	if _, err = j.StageCoordinator(journalCoordinator(t, id)); err != nil {
+		t.Fatal(err)
+	}
+	initialReserve := j.Usage().ControlReserveBytes
+	for pulse := uint8(1); pulse <= 3; pulse++ {
+		status, pulseErr := j.PulseCoordinator(id, 1, pulse)
+		if pulseErr != nil || status.Revision != 1 || status.RecoveryPulse != pulse ||
+			status.CoordinatorState != CoordinatorStaging {
+			t.Fatalf("pulse %d status=%+v err=%v", pulse, status, pulseErr)
+		}
+		duplicate, duplicateErr := j.PulseCoordinator(id, 1, pulse)
+		if duplicateErr != nil || duplicate != status {
+			t.Fatalf("duplicate pulse %d status=%+v err=%v", pulse, duplicate, duplicateErr)
+		}
+		wantReserve := initialReserve - uint64(pulse)*uint64(journalEntryHeaderBytes+4)
+		if got := j.Usage().ControlReserveBytes; got != wantReserve {
+			t.Fatalf("pulse %d reserve=%d want=%d", pulse, got, wantReserve)
+		}
+	}
+	if _, err = j.PulseCoordinator(id, 1, 4); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("pulse beyond immutable limit err=%v", err)
+	}
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	status, found := j.CoordinatorStatus(id)
+	if !found || status.Revision != 1 || status.RecoveryPulse != 3 ||
+		status.CoordinatorState != CoordinatorStaging {
+		t.Fatalf("reopened pulse status=%+v found=%v", status, found)
+	}
 }
 
 func TestJournalIdempotentStageTransitionAndRecovery(t *testing.T) {
@@ -159,7 +203,7 @@ func TestJournalSegmentedManifestSealPagedRecovery(t *testing.T) {
 	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
 	coordinatorRaw, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
 		ID: id, State: CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 9, RecoveryDeadline: 1234, Manifest: descriptor,
+		CatalogGeneration: 9, RecoveryDeadline: 3, Manifest: descriptor,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +311,7 @@ func TestJournalSegmentedManifestIncompleteBeginRecoversAndAborts(t *testing.T) 
 	id := journalID(121)
 	coordinatorRaw, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
 		ID: id, State: CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 9, RecoveryDeadline: 1234, Manifest: descriptor,
+		CatalogGeneration: 9, RecoveryDeadline: 3, Manifest: descriptor,
 	})
 	if err != nil {
 		t.Fatal(err)

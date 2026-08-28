@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
@@ -93,26 +95,27 @@ type nodeKey struct {
 type StaticRegistry struct {
 	local        NodeID
 	trustDomain  TrustDomain
+	limits       Limits
 	nodes        map[memberKey]memberRecord
 	members      map[nodeKey]uint64
 	localMembers map[raftmember.GroupKey]uint64
 	digests      map[raftmember.GroupKey][sha256.Size]byte
 	authorities  map[raftmember.GroupKey]*authoritySlot
+	dynamicMu    sync.Mutex
+	dynamic      atomic.Pointer[dynamicEnrollment]
 	canonical    frameBufferPool
 }
 
-type TransitionGrant struct {
-	Group             raftmember.GroupKey
-	TransitionID      [16]byte
-	MetadataEpoch     uint64
-	CatalogGeneration uint64
-	SourceMember      uint64
-	TargetMember      uint64
-}
-
-func (grant TransitionGrant) digest() [raftmember.MembershipTransitionDigestBytes]byte {
-	return raftmember.MembershipTransitionDigest(grant.Group, grant.TransitionID,
-		grant.MetadataEpoch, grant.CatalogGeneration, grant.SourceMember, grant.TargetMember)
+// dynamicEnrollment is a copy-on-write overlay for groups adopted after
+// process start. Ordinary frame admission remains lock-free: mutations are
+// cold control-plane operations and publish one immutable overlay pointer.
+type dynamicEnrollment struct {
+	nodes        map[memberKey]memberRecord
+	members      map[nodeKey]uint64
+	localMembers map[raftmember.GroupKey]uint64
+	digests      map[raftmember.GroupKey][sha256.Size]byte
+	authorities  map[raftmember.GroupKey]*authoritySlot
+	memberCount  int
 }
 
 type authorityView struct {
@@ -123,7 +126,8 @@ type authorityView struct {
 	// retiredVersion records only the exact authority revoked by source
 	// removal. Its roles are deliberately not retained or accepted.
 	retiredVersion uint64
-	grant          TransitionGrant
+	grant          membershipgrant.Grant
+	revokedGrant   membershipgrant.Grant
 	promotion      *raftmember.DurablePromotionProof
 }
 
@@ -149,6 +153,7 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 
 	registry := &StaticRegistry{
 		local:        local,
+		limits:       limits,
 		nodes:        make(map[memberKey]memberRecord, len(members)),
 		members:      make(map[nodeKey]uint64, len(members)),
 		localMembers: make(map[raftmember.GroupKey]uint64),
@@ -156,6 +161,7 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		authorities:  make(map[raftmember.GroupKey]*authoritySlot),
 		canonical:    frameBufferPool{retain: DefaultRetainedFrameBytes},
 	}
+	registry.dynamic.Store(&dynamicEnrollment{})
 	groups := make(map[raftmember.GroupKey]struct{})
 	groupMembers := make(map[raftmember.GroupKey]int)
 	groupVoters := make(map[raftmember.GroupKey]int)
@@ -276,30 +282,392 @@ func validateMember(member Member) error {
 	return nil
 }
 
-func (registry *StaticRegistry) AuthorizeTransition(grant TransitionGrant) error {
-	if registry == nil || grant.Group == (raftmember.GroupKey{}) ||
-		grant.TransitionID == ([16]byte{}) || grant.MetadataEpoch == 0 ||
-		grant.CatalogGeneration == 0 || grant.SourceMember == 0 || grant.TargetMember == 0 ||
-		grant.SourceMember == grant.TargetMember {
+// InstallGroup publishes one complete new group only after install has bound
+// its local Runtime to the execution owner. publish is a no-fail closure: the
+// caller must invoke it from the serialized owner before that owner can run
+// the new Runtime. Returning without invoking publish rolls back enrollment
+// and leaves the registry byte-identical.
+func (registry *StaticRegistry) InstallGroup(
+	members []Member,
+	install func(publish func()) error,
+) error {
+	if registry == nil || len(members) == 0 || install == nil {
+		return ErrInvalidGroup
+	}
+	registry.dynamicMu.Lock()
+	defer registry.dynamicMu.Unlock()
+
+	group := members[0].Group
+	version := members[0].ReplicaSetVersion
+	if group == (raftmember.GroupKey{}) || registry.staticAuthority(group) != nil ||
+		registry.dynamicAuthority(group) != nil {
+		return ErrDuplicateMember
+	}
+	current := registry.dynamic.Load()
+	if current == nil || len(registry.authorities)+len(current.authorities) >= registry.limits.MaxGroups ||
+		registry.staticMemberCount()+current.memberCount+len(members) > registry.limits.MaxMembers ||
+		len(members) > raftmodel.MaxConfStateMembers {
+		return ErrRegistryBound
+	}
+	detached := slices.Clone(members)
+	seenMembers := make(map[uint64]struct{}, len(detached))
+	seenNodes := make(map[NodeID]struct{}, len(detached))
+	roles := make(map[uint64]MemberRole, len(detached))
+	localMember := uint64(0)
+	voters := 0
+	for index := range detached {
+		member := detached[index]
+		if err := validateMember(member); err != nil || member.Group != group ||
+			member.ReplicaSetVersion != version ||
+			member.Group.ClusterID != registry.trustDomain.ClusterID ||
+			member.Group.ClusterIncarnation != registry.trustDomain.ClusterIncarnation {
+			return errors.Join(ErrInvalidGroup, err)
+		}
+		if !registry.knownNode(current, member.Node) {
+			// OrdinaryTransport owns a fixed per-node queue/dial set. Dynamic
+			// groups may reuse those authenticated nodes, but cannot silently
+			// introduce a node the shared transport cannot reach.
+			return ErrNodeNotFound
+		}
+		if _, duplicate := seenMembers[member.MemberID]; duplicate {
+			return ErrDuplicateMember
+		}
+		if _, duplicate := seenNodes[member.Node]; duplicate {
+			return ErrDuplicateNode
+		}
+		seenMembers[member.MemberID] = struct{}{}
+		seenNodes[member.Node] = struct{}{}
+		if member.Node == registry.local {
+			if localMember != 0 {
+				return ErrLocalMember
+			}
+			localMember = member.MemberID
+		}
+		if member.Role == MemberVoter {
+			voters++
+		}
+		if member.Role != MemberEnrolled {
+			roles[member.MemberID] = member.Role
+		}
+	}
+	if localMember == 0 {
+		return ErrLocalMember
+	}
+	if voters == 0 {
+		return ErrInvalidRole
+	}
+	slices.SortFunc(detached, compareMembers)
+	next := cloneDynamicEnrollment(current)
+	for _, member := range detached {
+		next.nodes[memberKey{group: group, memberID: member.MemberID}] = memberRecord{node: member.Node}
+		next.members[nodeKey{group: group, node: member.Node}] = member.MemberID
+	}
+	next.localMembers[group] = localMember
+	next.digests[group] = rosterDigest(detached)
+	slot := &authoritySlot{}
+	slot.view.Store(&authorityView{version: version, roles: roles})
+	next.authorities[group] = slot
+	next.memberCount += len(detached)
+	published := false
+	publish := func() {
+		if !published {
+			registry.dynamic.Store(next)
+			published = true
+		}
+	}
+	if err := install(publish); err != nil {
+		return err
+	}
+	if !published {
+		return ErrInvalidGroup
+	}
+	return nil
+}
+
+func (registry *StaticRegistry) knownNode(dynamic *dynamicEnrollment, node NodeID) bool {
+	for key := range registry.members {
+		if key.node == node {
+			return true
+		}
+	}
+	if dynamic != nil {
+		for key := range dynamic.members {
+			if key.node == node {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RemoveGroup withdraws one dynamically installed group at the exact point
+// chosen by its serialized execution owner. Static bootstrap enrollment is
+// immutable. A failed uninstall leaves transport authority untouched.
+func (registry *StaticRegistry) RemoveGroup(
+	group raftmember.GroupKey,
+	uninstall func(withdraw func()) error,
+) error {
+	if registry == nil || group == (raftmember.GroupKey{}) || uninstall == nil {
+		return ErrInvalidGroup
+	}
+	registry.dynamicMu.Lock()
+	defer registry.dynamicMu.Unlock()
+	if registry.staticAuthority(group) != nil {
+		return ErrInvalidGroup
+	}
+	current := registry.dynamic.Load()
+	if current == nil || current.authorities[group] == nil {
+		return ErrGroupNotFound
+	}
+	next := cloneDynamicEnrollment(current)
+	removed := 0
+	for key := range next.nodes {
+		if key.group == group {
+			delete(next.nodes, key)
+			removed++
+		}
+	}
+	for key := range next.members {
+		if key.group == group {
+			delete(next.members, key)
+		}
+	}
+	delete(next.localMembers, group)
+	delete(next.digests, group)
+	delete(next.authorities, group)
+	next.memberCount -= removed
+	withdrawn := false
+	withdraw := func() {
+		if !withdrawn {
+			registry.dynamic.Store(next)
+			withdrawn = true
+		}
+	}
+	if err := uninstall(withdraw); err != nil {
+		return err
+	}
+	if !withdrawn {
+		return ErrInvalidGroup
+	}
+	return nil
+}
+
+func (registry *StaticRegistry) staticMemberCount() int { return len(registry.nodes) }
+
+func cloneDynamicEnrollment(current *dynamicEnrollment) *dynamicEnrollment {
+	next := &dynamicEnrollment{
+		nodes: make(map[memberKey]memberRecord), members: make(map[nodeKey]uint64),
+		localMembers: make(map[raftmember.GroupKey]uint64),
+		digests:      make(map[raftmember.GroupKey][sha256.Size]byte),
+		authorities:  make(map[raftmember.GroupKey]*authoritySlot),
+	}
+	if current == nil {
+		return next
+	}
+	next.memberCount = current.memberCount
+	for key, value := range current.nodes {
+		next.nodes[key] = value
+	}
+	for key, value := range current.members {
+		next.members[key] = value
+	}
+	for key, value := range current.localMembers {
+		next.localMembers[key] = value
+	}
+	for key, value := range current.digests {
+		next.digests[key] = value
+	}
+	for key, value := range current.authorities {
+		next.authorities[key] = value
+	}
+	return next
+}
+
+func (registry *StaticRegistry) staticAuthority(group raftmember.GroupKey) *authoritySlot {
+	if registry == nil {
+		return nil
+	}
+	return registry.authorities[group]
+}
+
+func (registry *StaticRegistry) dynamicAuthority(group raftmember.GroupKey) *authoritySlot {
+	if registry == nil {
+		return nil
+	}
+	view := registry.dynamic.Load()
+	if view == nil {
+		return nil
+	}
+	return view.authorities[group]
+}
+
+func (registry *StaticRegistry) authoritySlot(group raftmember.GroupKey) *authoritySlot {
+	if slot := registry.staticAuthority(group); slot != nil {
+		return slot
+	}
+	return registry.dynamicAuthority(group)
+}
+
+// InstallTransitionGrant installs an exact catalog-replicated grant at a legal
+// committed lifecycle cut. Both identities must already be enrolled. Exact
+// reinstall is idempotent; a different live grant always conflicts.
+func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Grant) error {
+	if registry == nil || !grant.Valid() {
 		return ErrInvalidMember
 	}
-	slot := registry.authorities[grant.Group]
+	slot := registry.authoritySlot(grant.Group)
 	if slot == nil {
 		return ErrGroupNotFound
 	}
 	if _, err := registry.Node(grant.Group, grant.SourceMember); err != nil {
 		return err
 	}
-	if _, err := registry.Node(grant.Group, grant.TargetMember); err != nil {
+	targetNode, err := registry.Node(grant.Group, grant.TargetMember)
+	if err != nil {
 		return err
+	}
+	if [16]byte(targetNode) != grant.TargetNode {
+		return ErrReplicaSet
+	}
+	var initial [3]membershipgrant.RosterMember
+	for index, memberID := range grant.InitialVoters {
+		node, err := registry.Node(grant.Group, memberID)
+		if err != nil {
+			return err
+		}
+		initial[index] = membershipgrant.RosterMember{Member: memberID, Node: [16]byte(node)}
+	}
+	if membershipgrant.CertifiedRosterDigest(
+		grant.Group, grant.InitialReplicaSetVersion, initial,
+	) != grant.InitialRosterDigest {
+		return ErrReplicaSet
 	}
 	for {
 		current := slot.view.Load()
-		if current.grant != (TransitionGrant{}) && current.grant != grant {
+		if current.grant == grant {
+			return nil
+		}
+		if current.grant != (membershipgrant.Grant{}) ||
+			!grantFitsCommittedCut(current, grant) || current.promotion != nil {
 			return ErrReplicaSet
 		}
 		next := *current
 		next.grant = grant
+		next.revokedGrant = membershipgrant.Grant{}
+		if slot.view.CompareAndSwap(current, &next) {
+			return nil
+		}
+	}
+}
+
+func grantFitsCommittedCut(current *authorityView, grant membershipgrant.Grant) bool {
+	if current == nil || current.version < grant.InitialReplicaSetVersion {
+		return false
+	}
+	if current.version == grant.InitialReplicaSetVersion {
+		return exactInitialGrantCut(current.roles, grant)
+	}
+	return exactLearnerGrantCut(current.roles, grant) ||
+		exactPromotedGrantCut(current.roles, grant) ||
+		exactCompletedGrantCut(current.roles, grant)
+}
+
+func exactInitialGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	if len(roles) != len(grant.InitialVoters) || roles[grant.TargetMember] != MemberEnrolled {
+		return false
+	}
+	for _, voter := range grant.InitialVoters {
+		if roles[voter] != MemberVoter {
+			return false
+		}
+	}
+	return true
+}
+
+func exactLearnerGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	return exactProgressedGrantCut(roles, grant, MemberLearner)
+}
+
+func exactPromotedGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	return exactProgressedGrantCut(roles, grant, MemberVoter)
+}
+
+func exactProgressedGrantCut(
+	roles map[uint64]MemberRole,
+	grant membershipgrant.Grant,
+	targetRole MemberRole,
+) bool {
+	if len(roles) != len(grant.InitialVoters)+1 || roles[grant.TargetMember] != targetRole {
+		return false
+	}
+	for _, voter := range grant.InitialVoters {
+		if roles[voter] != MemberVoter {
+			return false
+		}
+	}
+	return true
+}
+
+func exactCompletedGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	if len(roles) != len(grant.InitialVoters) || roles[grant.SourceMember] != MemberEnrolled ||
+		roles[grant.TargetMember] != MemberVoter {
+		return false
+	}
+	for _, voter := range grant.InitialVoters {
+		if voter != grant.SourceMember && roles[voter] != MemberVoter {
+			return false
+		}
+	}
+	return true
+}
+
+// CurrentTransitionGrant returns one allocation-free detached grant snapshot.
+func (registry *StaticRegistry) CurrentTransitionGrant(
+	group raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	if registry == nil || group == (raftmember.GroupKey{}) {
+		return membershipgrant.Grant{}, false, ErrInvalidGroup
+	}
+	slot := registry.authoritySlot(group)
+	if slot == nil {
+		return membershipgrant.Grant{}, false, ErrGroupNotFound
+	}
+	grant := slot.view.Load().grant
+	return grant, grant != (membershipgrant.Grant{}), nil
+}
+
+// RevokeTransitionGrant clears only the exact untouched or completed
+// transition. Intermediate learner/RF4 cuts remain non-revocable so recovery
+// cannot strand a partially changed Raft configuration without its authority.
+func (registry *StaticRegistry) RevokeTransitionGrant(expected membershipgrant.Grant) error {
+	if registry == nil || !expected.Valid() {
+		return ErrInvalidMember
+	}
+	slot := registry.authoritySlot(expected.Group)
+	if slot == nil {
+		return ErrGroupNotFound
+	}
+	for {
+		current := slot.view.Load()
+		untouched := current.version == expected.InitialReplicaSetVersion &&
+			grantFitsCommittedCut(current, expected)
+		completed := current.version > expected.InitialReplicaSetVersion &&
+			exactCompletedGrantCut(current.roles, expected)
+		if (!untouched && !completed) || current.promotion != nil {
+			return ErrReplicaSet
+		}
+		if current.grant == (membershipgrant.Grant{}) {
+			if current.revokedGrant == expected {
+				return nil
+			}
+			return ErrReplicaSet
+		}
+		if current.grant != expected {
+			return ErrReplicaSet
+		}
+		next := *current
+		next.grant = membershipgrant.Grant{}
+		next.revokedGrant = expected
 		if slot.view.CompareAndSwap(current, &next) {
 			return nil
 		}
@@ -314,7 +682,7 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 	if registry == nil || version == 0 || conf == nil {
 		return ErrReplicaSet
 	}
-	slot := registry.authorities[group]
+	slot := registry.authoritySlot(group)
 	if slot == nil {
 		return ErrGroupNotFound
 	}
@@ -344,7 +712,8 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 			retiredVersion = current.version
 		}
 		next := &authorityView{version: version, roles: roles, grant: current.grant,
-			previous: previous, allowPrevious: !removed, retiredVersion: retiredVersion}
+			revokedGrant: current.revokedGrant,
+			previous:     previous, allowPrevious: !removed, retiredVersion: retiredVersion}
 		if slot.view.CompareAndSwap(current, next) {
 			return nil
 		}
@@ -361,14 +730,14 @@ func (registry *StaticRegistry) PublishDurablePromotion(
 	if registry == nil || proof.Version == 0 || proof.TargetMember == 0 {
 		return ErrReplicaSet
 	}
-	slot := registry.authorities[group]
+	slot := registry.authoritySlot(group)
 	if slot == nil {
 		return ErrGroupNotFound
 	}
 	for {
 		current := slot.view.Load()
 		if current.grant.TargetMember != proof.TargetMember ||
-			current.grant.digest() != proof.AuthorizationDigest ||
+			current.grant.Digest() != proof.AuthorizationDigest ||
 			current.roles[proof.TargetMember] != MemberLearner ||
 			proof.Version <= current.version {
 			return ErrReplicaSet
@@ -394,7 +763,7 @@ func (registry *StaticRegistry) ClearDurablePromotion(group raftmember.GroupKey)
 	if registry == nil {
 		return ErrReplicaSet
 	}
-	slot := registry.authorities[group]
+	slot := registry.authoritySlot(group)
 	if slot == nil {
 		return ErrGroupNotFound
 	}
@@ -436,7 +805,7 @@ func (registry *StaticRegistry) rolesFromConf(
 
 func validAdjacentRoles(current *authorityView, next map[uint64]MemberRole) bool {
 	grant := current.grant
-	if grant == (TransitionGrant{}) {
+	if grant == (membershipgrant.Grant{}) {
 		return false
 	}
 	sourceCurrent, sourceNext := current.roles[grant.SourceMember], next[grant.SourceMember]
@@ -501,6 +870,12 @@ func (registry *StaticRegistry) LocalMember(group raftmember.GroupKey) (uint64, 
 	}
 	memberID, ok := registry.localMembers[group]
 	if !ok {
+		view := registry.dynamic.Load()
+		if view != nil {
+			memberID, ok = view.localMembers[group]
+		}
+	}
+	if !ok {
 		return 0, ErrGroupNotFound
 	}
 	return memberID, nil
@@ -511,7 +886,14 @@ func (registry *StaticRegistry) Node(group raftmember.GroupKey, memberID uint64)
 	if registry == nil {
 		return NodeID{}, ErrMemberNotFound
 	}
-	record, ok := registry.nodes[memberKey{group: group, memberID: memberID}]
+	key := memberKey{group: group, memberID: memberID}
+	record, ok := registry.nodes[key]
+	if !ok {
+		view := registry.dynamic.Load()
+		if view != nil {
+			record, ok = view.nodes[key]
+		}
+	}
 	if !ok {
 		return NodeID{}, ErrMemberNotFound
 	}
@@ -548,7 +930,14 @@ func (registry *StaticRegistry) Member(group raftmember.GroupKey, node NodeID) (
 	if registry == nil {
 		return 0, ErrNodeNotFound
 	}
-	memberID, ok := registry.members[nodeKey{group: group, node: node}]
+	key := nodeKey{group: group, node: node}
+	memberID, ok := registry.members[key]
+	if !ok {
+		view := registry.dynamic.Load()
+		if view != nil {
+			memberID, ok = view.members[key]
+		}
+	}
 	if !ok {
 		return 0, ErrNodeNotFound
 	}
@@ -560,6 +949,12 @@ func (registry *StaticRegistry) rosterDigest(group raftmember.GroupKey) ([sha256
 		return [sha256.Size]byte{}, false
 	}
 	digest, ok := registry.digests[group]
+	if !ok {
+		view := registry.dynamic.Load()
+		if view != nil {
+			digest, ok = view.digests[group]
+		}
+	}
 	return digest, ok
 }
 
@@ -567,7 +962,7 @@ func (registry *StaticRegistry) currentAuthority(group raftmember.GroupKey) (*au
 	if registry == nil {
 		return nil, false
 	}
-	slot := registry.authorities[group]
+	slot := registry.authoritySlot(group)
 	if slot == nil {
 		return nil, false
 	}

@@ -14,8 +14,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -39,37 +42,42 @@ var (
 type Machine struct {
 	mu sync.RWMutex
 
-	binding               Binding
-	bootstrap             []byte
-	bootstrapDigest       [32]byte
-	system                CollectionTarget
-	userName              string
-	user                  CollectionTarget
-	relations             []relationCollection
-	manifestDigest        [sha256.Size]byte
-	members               []durable.NamedCollection
-	distribution          []byte
-	shard                 []byte
-	applyContract         [32]byte
-	dataChainHash         *dataChainHasher
-	mutationPlan          []finalMutation
-	mutationInline        [8]finalMutation
-	bundlePlan            []finalMutation
-	bundleRelations       []plannedRelationChanges
-	transitionMembers     []durable.NamedCollection
-	batchTelemetry        normalBatchTelemetry
-	txnLog                *durable.TxnLog
-	checkpointGroup       *durable.CheckpointGroup
-	options               Options
-	transactionIntents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
-	transactionIntentKeys []byte
-	applyCut              durable.DatabaseSnapshot
-	capture               TransitionCapture
-	captureTarget         TransitionCaptureTarget
-	reservedCaptureTarget TransitionCaptureTarget
-	captureBuffer         []byte
-	captureChanges        []finalMutation
-	captureKey            [8]byte
+	binding                Binding
+	bootstrap              []byte
+	bootstrapDigest        [32]byte
+	system                 CollectionTarget
+	userName               string
+	user                   CollectionTarget
+	relations              []relationCollection
+	manifestDigest         [sha256.Size]byte
+	members                []durable.NamedCollection
+	distribution           []byte
+	shard                  []byte
+	applyContract          [32]byte
+	dataChainHash          *dataChainHasher
+	mutationPlan           []finalMutation
+	canonicalMutations     canonicalMutationScratch
+	mutationInline         [8]finalMutation
+	bundlePlan             []finalMutation
+	bundleRelations        []plannedRelationChanges
+	transitionMembers      []durable.NamedCollection
+	batchTelemetry         normalBatchTelemetry
+	txnLog                 *durable.TxnLog
+	checkpointGroup        *durable.CheckpointGroup
+	options                Options
+	transactionIntents     map[transactionIntentIdentity]reopenedTransactionIntentOwner
+	transactionIntentKeys  []byte
+	routeGate              *routegate.Machine
+	routeGateMaxRecords    uint64
+	applyCut               durable.DatabaseSnapshot
+	capture                TransitionCapture
+	splitCaptureActivation *SplitCaptureActivation
+	captureTarget          TransitionCaptureTarget
+	reservedCaptureTarget  TransitionCaptureTarget
+	captureBuffer          []byte
+	captureChanges         []finalMutation
+	captureKey             [8]byte
+	requestLedgerSteps     [requestledger.MaxPendingWaveSteps]requestledger.StepRef
 
 	state                 State
 	publication           raftmodel.Publication
@@ -77,6 +85,7 @@ type Machine struct {
 	openedImageApplied    uint64
 	openedImageGeneration uint64
 	initialized           bool
+	schemaTransitioned    bool
 	poison                error
 }
 
@@ -158,6 +167,9 @@ func OpenBundle(
 	}
 	contract, err := bundleApplyContractDigest(
 		manifest, relations, options.MaxSessions, options.RetryWindow,
+		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+		options.RequestLedgerRange,
+		routeGateRecordLimit(),
 	)
 	if err != nil {
 		return nil, err
@@ -213,6 +225,7 @@ func OpenBundle(
 	if imageGeneration == 0 {
 		return nil, fmt.Errorf("%w: missing user image generation", ErrInconsistentSnapshot)
 	}
+	var importedIncrementalImage [sha256.Size]byte
 	for i := range m.relations {
 		snapshot, exists := cut.Collection(m.relations[i].name)
 		if !exists || snapshot == nil || snapshot.Generation() == 0 {
@@ -221,12 +234,24 @@ func OpenBundle(
 		if err := validateRelationIndexCatalog(snapshot, m.relations[i].localIndexes); err != nil {
 			return nil, fmt.Errorf("relation %d index catalog: %w", m.relations[i].id, err)
 		}
-		relationImage, relationErr := openedRelationImageDigest(&m.relations[i], snapshot)
+		var relationImage [sha256.Size]byte
+		var placement relationPlacementAccumulator
+		var relationErr error
+		if len(m.relations) == 1 {
+			relationImage, importedIncrementalImage, placement, relationErr =
+				openedRelationImageDigests(&m.relations[i], snapshot, binding.OwnedRange)
+		} else {
+			relationImage, placement, relationErr = openedRelationImageDigest(
+				&m.relations[i], snapshot, binding.OwnedRange,
+			)
+		}
 		if relationErr != nil {
 			return nil, fmt.Errorf("relation %d image: %w", m.relations[i].id, relationErr)
 		}
 		m.relations[i].openedImage = relationImage
 		m.relations[i].openedGen = snapshot.Generation()
+		m.relations[i].placement = placement
+		m.relations[i].placementGen = snapshot.Generation()
 	}
 	imageDigest, err := canonicalRelationImageDigest(m.relations)
 	if err != nil {
@@ -241,13 +266,18 @@ func OpenBundle(
 		return nil, fmt.Errorf("%w: missing system snapshot", ErrInconsistentSnapshot)
 	}
 	var openedTransactions scannedTransactions
-	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
-		systemSnapshot, options.MaxSessions, options.RetryWindow, &openedTransactions,
+	state, present, sessionCount, slotCount, authorityCount, openedRouteGate, err := scanSessionSystemSnapshot(
+		systemSnapshot, options.MaxSessions, options.RetryWindow,
+		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+		options.RequestLedgerRange, m.routeGateMaxRecords, &openedTransactions,
 	)
 	if err != nil {
 		return nil, err
 	}
 	if !present {
+		if options.SchemaSourceRecovery != nil {
+			return nil, ErrSchemaTransition
+		}
 		if m.checkpointGroup != nil && m.checkpointGroup.CheckpointAppliedIndex() != 0 {
 			return nil, fmt.Errorf(
 				"%w: empty system at checkpoint cut %d",
@@ -270,12 +300,17 @@ func OpenBundle(
 			ApplyContractDigest: prepared.applyContract,
 			ConfState:           new(pb.ConfState), BootstrapDigest: bootstrapDigest,
 		}
+		m.state.RelationPlacementDigest = relationPlacementStateDigest(
+			binding.SchemaGeneration, m.manifestDigest, m.relations,
+		)
 		m.publication = raftmodel.Publication{DataChainDigest: seedDigest, ConfState: new(pb.ConfState)}
 		m.openedImageDigest = imageDigest
 		m.openedImageGeneration = imageGeneration
 		for i := range m.relations {
 			m.relations[i].openedApplied = 0
+			m.relations[i].placementApplied = 0
 		}
+		m.routeGate = openedRouteGate
 		return m, nil
 	}
 	if m.checkpointGroup != nil && m.checkpointGroup.SeedStateAuthoritative() {
@@ -310,16 +345,43 @@ func OpenBundle(
 			m.checkpointGroup.CheckpointAppliedIndex(),
 		)
 	}
-	if !bindingAdvancesFrom(binding, state.Binding) || state.BootstrapDigest != bootstrapDigest ||
-		state.ApplyContractDigest != prepared.applyContract ||
-		state.SessionCount != sessionCount || state.SessionSlotCount != slotCount ||
-		state.AuthorityBindingCount != authorityCount ||
+	sourceRecovery := options.SchemaSourceRecovery != nil
+	if state.BootstrapDigest != bootstrapDigest || state.SessionCount != sessionCount ||
+		state.SessionSlotCount != slotCount || state.AuthorityBindingCount != authorityCount ||
 		state.SessionCount > options.MaxSessions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
 	}
-	if (state.LastKind == RecordStaticSnapshot || state.LastKind == RecordImportedSnapshot) &&
-		state.DataChainDigest != seedDigest {
+	if sourceRecovery {
+		if err := m.validateOpenedSchemaSource(state, prepared); err != nil {
+			return nil, err
+		}
+	}
+	if !sourceRecovery && (!bindingMatchesFenceOrigin(binding, state) ||
+		state.ApplyContractDigest != prepared.applyContract ||
+		state.RelationPlacementDigest != relationPlacementStateDigest(
+			state.Binding.SchemaGeneration, m.manifestDigest, m.relations,
+		)) {
+		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+	}
+	if state.LastKind == RecordSchema && !sourceRecovery {
+		if err := validateOpenedSchemaTransition(
+			state, binding, prepared.manifestDigest, prepared.applyContract, options,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if state.LastKind == RecordStaticSnapshot && state.DataChainDigest != seedDigest {
 		return nil, fmt.Errorf("%w: persisted base data-chain seed", ErrStateCorrupt)
+	}
+	if state.LastKind == RecordImportedSnapshot && state.DataChainDigest != seedDigest {
+		incrementalSeed, incrementalErr := dataChainSeedDigest(
+			prepared.applyContract, importedIncrementalImage,
+		)
+		if incrementalErr != nil || state.DataChainDigest != incrementalSeed {
+			return nil, fmt.Errorf("%w: persisted imported data-chain seed", ErrStateCorrupt)
+		}
+		imageDigest = importedIncrementalImage
+		m.relations[0].openedImage = importedIncrementalImage
 	}
 	if state.LastKind == RecordStaticSnapshot &&
 		(state.LastEntryDigest != bootstrapDigest ||
@@ -332,6 +394,7 @@ func OpenBundle(
 	m.openedImageGeneration = imageGeneration
 	for i := range m.relations {
 		m.relations[i].openedApplied = state.Applied
+		m.relations[i].placementApplied = state.Applied
 	}
 	m.binding = state.Binding
 	m.distribution = []byte(state.Binding.Distribution)
@@ -340,7 +403,24 @@ func OpenBundle(
 	m.publication = publicationFromState(state)
 	m.transactionIntents = openedTransactions.intents
 	m.transactionIntentKeys = openedTransactions.intentKeys
-	if options.TransitionCapture != nil {
+	m.splitCaptureActivation = openedTransactions.activation
+	m.routeGate = openedRouteGate
+	if sourceRecovery {
+		m.schemaTransitioned = true
+		return m, nil
+	}
+	if openedTransactions.activation != nil {
+		if options.TransitionCaptureFactory == nil || options.TransitionCapture != nil {
+			return nil, ErrSplitCaptureActivation
+		}
+		capture, captureErr := options.TransitionCaptureFactory(*openedTransactions.activation)
+		if captureErr != nil || capture == nil {
+			return nil, errors.Join(captureErr, ErrSplitCaptureActivation)
+		}
+		if err := m.beginTransitionCapture(capture); err != nil {
+			return nil, err
+		}
+	} else if options.TransitionCapture != nil {
 		if err := m.beginTransitionCapture(options.TransitionCapture); err != nil {
 			return nil, err
 		}
@@ -348,8 +428,35 @@ func OpenBundle(
 	return m, nil
 }
 
+func validateOpenedSchemaTransition(
+	state State,
+	binding Binding,
+	manifest, contract [sha256.Size]byte,
+	options Options,
+) error {
+	transition, err := OpenSchemaTransition(options.SchemaTransition)
+	witness := options.SchemaMembershipWitness
+	meta := raftmodel.ApplyMeta{
+		Index: state.Applied, Term: state.LastTerm, Type: state.LastEntryType,
+	}
+	if err != nil || normalEntryDigest(meta, options.SchemaTransition) != state.LastEntryDigest ||
+		schemaTransitionBinding(transition) != binding ||
+		transition.ToManifest != manifest || transition.ToApplyContract != contract ||
+		transition.ToPlacementDigest != state.RelationPlacementDigest ||
+		transition.MembershipSequence != witness.Sequence ||
+		transition.MembershipSource != witness.Source ||
+		transition.MembershipTarget != witness.Target ||
+		transition.AuthorizationDigest != options.SchemaAuthorizationDigest ||
+		transition.CatalogCASDigest != options.SchemaCatalogCASDigest {
+		return errors.Join(ErrSchemaTransition, err)
+	}
+	return nil
+}
+
 func newMachineFromOpenInputs(prepared openInputs) *Machine {
 	binding := prepared.binding
+	routeGateMax := routeGateRecordLimit()
+	gate, _ := routegate.NewMachine(1, routeGateMax)
 	return &Machine{
 		binding: binding, bootstrap: prepared.bootstrap,
 		bootstrapDigest: prepared.bootstrapDigest, system: prepared.system,
@@ -360,10 +467,18 @@ func newMachineFromOpenInputs(prepared openInputs) *Machine {
 		applyContract: prepared.applyContract,
 		dataChainHash: newDataChainHasher(),
 		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
-		options:               prepared.options,
+		options:   prepared.options,
+		routeGate: gate, routeGateMaxRecords: routeGateMax,
 		reservedCaptureTarget: prepared.options.TransitionCaptureTarget,
 		transitionMembers:     make([]durable.NamedCollection, 0, len(prepared.relations)+2),
 	}
+}
+
+func routeGateRecordLimit() uint64 {
+	// Every command mutates at most one pin row, so physical transaction
+	// geometry does not constrain concurrent participants. The only retained
+	// bound is the exact 64 MiB canonical gate-image ceiling.
+	return routegate.MaxRetainedRecords
 }
 
 func prepareOpenInputs(
@@ -427,36 +542,27 @@ func prepareOpenInputs(
 			"%w: checkpoint-group capture startup", ErrInvalidOptions,
 		)
 	}
-	maxSystemDocument := max(
-		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
-		MaxAuthorityBindingBytes,
+	requiredSystem, limitsOK := RequiredSystemCollectionLimits(
+		options.RetryWindow, options.RequestLedgerRange.enabled(),
 	)
-	hotSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxAuthorityBindingBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
-	releaseSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
-	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes)
-	maxSystemDocuments := max(4, int(options.RetryWindow)+2)
-	if system.Limits.MaxKeyBytes < sha256.Size+3 ||
-		system.Limits.MaxDocumentBytes < maxSystemDocument ||
-		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
-		system.Limits.MaxBatchBytes < maxSystemBatchBytes {
+	if !limitsOK || system.Limits.MaxKeyBytes < requiredSystem.MaxKeyBytes ||
+		system.Limits.MaxDocumentBytes < requiredSystem.MaxDocumentBytes ||
+		system.Limits.MaxDistinctMutations < requiredSystem.MaxDistinctMutations ||
+		system.Limits.MaxBatchBytes < requiredSystem.MaxBatchBytes {
 		return openInputs{}, fmt.Errorf(
 			"%w: system collection cannot hold bounded records", ErrInvalidCollection,
 		)
 	}
 	maxUserBatchBytes := min(user.Limits.MaxBatchBytes, replication.MaxCommandBytes)
-	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, maxSystemBatchBytes)
+	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, requiredSystem.MaxBatchBytes)
 	if !ok {
 		return openInputs{}, fmt.Errorf(
 			"%w: transaction byte proof overflows", ErrInvalidOptions,
 		)
 	}
 	if options.TxnLimits.MaxDocuments < max(
-		user.Limits.MaxDistinctMutations+3,
-		maxSystemDocuments,
+		user.Limits.MaxDistinctMutations+4,
+		requiredSystem.MaxDistinctMutations,
 	) ||
 		options.TxnLimits.MaxBytes < requiredTxnBytes {
 		return openInputs{}, fmt.Errorf(
@@ -486,6 +592,9 @@ func prepareOpenInputs(
 		prepared.manifestDigest = manifest
 		prepared.applyContract, relationErr = bundleApplyContractDigest(
 			manifest, relations, options.MaxSessions, options.RetryWindow,
+			options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+			options.RequestLedgerRange,
+			routeGateRecordLimit(),
 		)
 		if relationErr != nil {
 			return openInputs{}, relationErr
@@ -677,14 +786,30 @@ type scannedTransactionControl struct {
 	manifestNextParticipant uint64
 	manifestEncodedBytes    uint64
 	manifestChain           distributedtxn.Digest
+	manifestCreation        *scannedManifestCreation
 
 	mutationRows uint64
 	mutationKeys map[transactionIntentIdentity]scannedMutationKey
 }
 
+// Manifest payload rows retain only the fixed coordinator header. Its original
+// creation digest also covers the canonical initial page pack, so retain this
+// small owned header until the ordered page scan authenticates that prefix.
+type scannedManifestCreation struct {
+	coordinator   [distributedtxn.ReplicatedManifestCoordinatorRecordBytes]byte
+	authenticated bool
+}
+
 type scannedTransactions struct {
 	intents    map[transactionIntentIdentity]reopenedTransactionIntentOwner
 	intentKeys []byte
+	activation *SplitCaptureActivation
+}
+
+type scannedExecutionPin struct {
+	record     executionpin.Record
+	digest     [sha256.Size]byte
+	activeSeen bool
 }
 
 // scanSessionSystemSnapshot performs one ordered, bounded pass over the hidden
@@ -695,13 +820,22 @@ func scanSessionSystemSnapshot(
 	snapshot *durable.Snapshot,
 	maxSessions uint64,
 	retryWindow uint16,
+	requestLedgerCapacity uint64,
+	requestLedgerCleanup uint64,
+	requestLedgerRange RequestLedgerRange,
+	routeGateMaxRecords uint64,
 	transactionResult ...*scannedTransactions,
-) (State, bool, uint64, uint64, uint64, error) {
+) (State, bool, uint64, uint64, uint64, *routegate.Machine, error) {
 	var state State
 	var statePresent bool
 	var sessionCount, slotCount, authorityCount uint64
 	var sessions map[[sha256.Size]byte]scannedSession
 	var authorities map[[sha256.Size]byte]replication.CommandAuthorityClass
+	var knownSessionDigests map[[sha256.Size]byte]struct{}
+	var routeGateStatus routegate.Status
+	var routeGateHeadPresent bool
+	var routeGateRecords []routegate.PinRecord
+	var routeGateResultCount uint64
 	var activeIdentities map[[sha256.Size]byte][sha256.Size]byte
 	var tenantArena []byte
 	var sessionEpochs []uint64
@@ -710,15 +844,26 @@ func scanSessionSystemSnapshot(
 	var transactionPayloadRows, transactionIntentRows, transactionResidentBytes uint64
 	var activeTransactionIntents map[transactionIntentIdentity]reopenedTransactionIntentOwner
 	var transactionIntentKeys []byte
+	var splitActivation *SplitCaptureActivation
+	var historicalFences map[[18]byte]sessionFence
+	var historicalSeen map[[18]byte]uint64
+	var unfencedSlots uint64
 	var transactionScopeScratch []distributedtxn.IntentScope
 	var manifestParticipantScratch []distributedtxn.ParticipantRef
 	var manifestIdentityScratch []byte
+	var manifestCreationControl *scannedTransactionControl
+	var manifestCreationHash hash.Hash
 	var mutationScanID distributedtxn.ID
 	var mutationScanControl *scannedTransactionControl
 	var mutationScanHash hash.Hash
 	var mutationScanRelations uint16
 	var mutationScanMutations uint64
 	var mutationScanLastRelation replication.RelationID
+	ledgerScan := newRequestLedgerImageScanner(
+		requestLedgerCapacity, requestLedgerCleanup, requestLedgerRange,
+	)
+	var executionPinRecordCount, activeExecutionPinCount, executionPinResidentBytes uint64
+	var activeExecutionPins map[executionpin.PinID]*scannedExecutionPin
 	finishMutationScan := func() error {
 		if mutationScanControl == nil {
 			return nil
@@ -762,11 +907,15 @@ func scanSessionSystemSnapshot(
 				return fmt.Errorf("%w: bounded session counts", ErrStateCorrupt)
 			}
 			statePresent = true
+			historicalFences = make(map[[18]byte]sessionFence, int(state.HistoricalFenceCount))
+			historicalSeen = make(map[[18]byte]uint64, int(state.HistoricalFenceCount))
 			if state.TransactionControlCount > MaxRetainedTransactions {
 				return fmt.Errorf("%w: bounded transaction count", ErrStateCorrupt)
 			}
 			sessions = make(map[[sha256.Size]byte]scannedSession, int(state.SessionCount))
 			authorities = make(map[[sha256.Size]byte]replication.CommandAuthorityClass,
+				int(state.AuthorityBindingCount))
+			knownSessionDigests = make(map[[sha256.Size]byte]struct{},
 				int(state.AuthorityBindingCount))
 			activeIdentities = make(map[[sha256.Size]byte][sha256.Size]byte, int(state.SessionCount))
 			if state.SessionCount > math.MaxInt32/16 {
@@ -779,10 +928,27 @@ func scanSessionSystemSnapshot(
 				int(state.ActiveTransactionCount))
 			activeTransactionIntents = make(map[transactionIntentIdentity]reopenedTransactionIntentOwner,
 				int(state.TransactionIntentRows))
+			activeExecutionPins = make(map[executionpin.PinID]*scannedExecutionPin,
+				int(state.ActiveExecutionPinCount))
 			if state.TransactionResidentBytes > math.MaxInt32 {
 				return fmt.Errorf("%w: transaction resident reopen arena", ErrTransactionStateCorrupt)
 			}
 			transactionIntentKeys = make([]byte, 0, min(int(state.TransactionResidentBytes), 1<<20))
+			return nil
+
+		case len(key) == 18 && bytes.Equal(key[:2], sessionFencePrefix[:]):
+			if !statePresent || uint64(len(historicalFences)) >= state.HistoricalFenceCount {
+				return ErrSessionCorrupt
+			}
+			f, err := openSessionFence(value)
+			if err != nil || !validHistoricalSessionFence(state, f) {
+				return ErrSessionCorrupt
+			}
+			want := sessionFenceKey(f.routing, f.generation)
+			if !bytes.Equal(key, want[:]) {
+				return ErrSessionCorrupt
+			}
+			historicalFences[want] = f
 			return nil
 
 		case len(key) == 1+sha256.Size && key[0] == 1:
@@ -848,8 +1014,13 @@ func scanSessionSystemSnapshot(
 			// physicalSlots, the exact count checked after the scan proves the
 			// complete [0, physicalSlots) set without a per-session bitmap.
 			summary.seenSlots++
-			if err := validateStoredSessionSlot(state, view); err != nil {
+			if err := validateStoredSessionSlot(state, view, sessionFenceLookup{fences: historicalFences}); err != nil {
 				return err
+			}
+			if view.ResultCode == ResultStaleFence {
+				unfencedSlots++
+			} else if view.RoutingVersion != state.Binding.RoutingVersion || view.RouteGeneration != state.Binding.RouteGeneration {
+				historicalSeen[sessionFenceKey(view.RoutingVersion, view.RouteGeneration)]++
 			}
 			if err := validateSessionSlotAgainstHeader(SessionView{
 				Digest: view.SessionDigest, ClientEpoch: summary.epoch,
@@ -901,7 +1072,52 @@ func scanSessionSystemSnapshot(
 				}
 			}
 			authorities[view.Digest] = view.AuthorityClass
+			knownSessionDigests[SessionKey(view.AuthorityClass, view.Tenant, view.ClientID)] = struct{}{}
 			authorityCount++
+			return nil
+
+		case bytes.Equal(key, routeGateHeadKey):
+			if !statePresent || routeGateHeadPresent || routeGateMaxRecords == 0 {
+				return fmt.Errorf("%w: route-gate head", ErrStateCorrupt)
+			}
+			var headErr error
+			routeGateStatus, headErr = routegate.OpenHead(value)
+			if headErr != nil || routeGateStatus.RetainedRecords > routeGateMaxRecords ||
+				routeGateStatus.RetainedRecords > math.MaxInt32 {
+				return errors.Join(headErr, fmt.Errorf("%w: route-gate head", ErrStateCorrupt))
+			}
+			routeGateRecords = make([]routegate.PinRecord, 0, int(routeGateStatus.RetainedRecords))
+			routeGateHeadPresent = true
+			return nil
+
+		case len(key) == routeGatePinKeyBytes && key[0] == routeGatePinPrefix:
+			if !statePresent || !routeGateHeadPresent ||
+				uint64(len(routeGateRecords)) >= routeGateStatus.RetainedRecords {
+				return fmt.Errorf("%w: route-gate pin", ErrStateCorrupt)
+			}
+			var identity routegate.Identity
+			copy(identity[:], key[1:])
+			record, pinErr := routegate.OpenStoredPin(identity, value)
+			want, keyErr := routeGatePinStorageKey(identity)
+			if pinErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+				return errors.Join(pinErr, keyErr, fmt.Errorf("%w: route-gate pin", ErrStateCorrupt))
+			}
+			routeGateRecords = append(routeGateRecords, record)
+			return nil
+
+		case len(key) == routeGateResultKeyBytes && key[0] == routeGateResultPrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: route-gate result", ErrStateCorrupt)
+			}
+			record, resultErr := openRouteGateResult(value)
+			want, keyErr := routeGateResultStorageKey(record.SessionDigest, record.Slot)
+			if resultErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) {
+				return errors.Join(resultErr, keyErr, fmt.Errorf("%w: route-gate result", ErrStateCorrupt))
+			}
+			if _, known := knownSessionDigests[record.SessionDigest]; !known {
+				return fmt.Errorf("%w: unbound route-gate result", ErrStateCorrupt)
+			}
+			routeGateResultCount++
 			return nil
 
 		case len(key) == transactionControlStorageKeyBytes && key[0] == transactionControlPrefix:
@@ -949,8 +1165,7 @@ func scanSessionSystemSnapshot(
 				role: distributedtxn.ReplicatedRoleCoordinator, id: view.ID,
 			}]
 			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
-				summary.payloadSeen || view.Kind != summary.control.PayloadKind ||
-				view.Digest != summary.control.PayloadDigest {
+				summary.payloadSeen || view.Kind != summary.control.PayloadKind {
 				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
 			}
 			summary.payloadSeen = true
@@ -959,18 +1174,22 @@ func scanSessionSystemSnapshot(
 			if view.Kind == distributedtxn.ReplicatedPayloadCoordinator {
 				var participantScratch [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 				record, recordErr := distributedtxn.OpenCoordinatorInto(view.Payload, participantScratch[:])
-				if recordErr != nil || uint64(len(view.Payload)) != summary.control.PayloadBytes ||
+				if recordErr != nil || view.Digest != summary.control.PayloadDigest ||
+					uint64(len(view.Payload)) != summary.control.PayloadBytes ||
 					uint64(len(record.Participants)) != summary.control.PayloadCount {
 					return errors.Join(recordErr, ErrTransactionStateCorrupt)
 				}
 			} else {
 				record, recordErr := distributedtxn.OpenManifestCoordinator(view.Payload)
-				if recordErr != nil || record.Manifest.EncodedBytes != summary.control.PayloadBytes ||
+				if recordErr != nil || len(view.Payload) != distributedtxn.ReplicatedManifestCoordinatorRecordBytes ||
+					record.Manifest.EncodedBytes != summary.control.PayloadBytes ||
 					record.Manifest.ParticipantCount != summary.control.PayloadCount {
 					return errors.Join(recordErr, ErrTransactionStateCorrupt)
 				}
 				summary.manifestDescriptor = record.Manifest
 				summary.manifestDescriptorSeen = true
+				summary.manifestCreation = &scannedManifestCreation{}
+				copy(summary.manifestCreation.coordinator[:], view.Payload)
 			}
 			transactionPayloadRows++
 			if residentErr := addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value)); residentErr != nil {
@@ -997,9 +1216,47 @@ func scanSessionSystemSnapshot(
 			}]
 			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil ||
 				summary.control.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
+				summary.manifestCreation == nil ||
 				view.Index != summary.manifestNextPage ||
 				view.FirstParticipant != summary.manifestNextParticipant {
 				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
+			}
+			// Stage starts with exactly one page; fused begin/prepare starts with
+			// exactly min(total pages, MaxManifestSegmentsPerCommand). Later appends
+			// must not change the immutable creation/retry digest. Pages are ordered
+			// by transaction and ordinal, allowing one streaming hash for the scan.
+			initialPages := uint32(1)
+			if summary.control.FusedPath {
+				initialPages = min(summary.manifestDescriptor.SegmentCount,
+					distributedtxn.MaxManifestSegmentsPerCommand)
+			}
+			if view.Index < initialPages {
+				if view.Index == 0 {
+					manifestCreationControl = summary
+					if manifestCreationHash == nil {
+						manifestCreationHash = sha256.New()
+					} else {
+						manifestCreationHash.Reset()
+					}
+					_, _ = manifestCreationHash.Write(summary.manifestCreation.coordinator[:])
+				}
+				if manifestCreationControl != summary {
+					return ErrTransactionStateCorrupt
+				}
+				_, _ = manifestCreationHash.Write(view.Raw)
+				if view.Index == 0 || view.Index+1 == initialPages {
+					var digest distributedtxn.Digest
+					_ = manifestCreationHash.Sum(digest[:0])
+					if view.Index == 0 && digest != summary.control.MutationDigest {
+						return fmt.Errorf("%w: manifest creation seed", ErrTransactionStateCorrupt)
+					}
+					if view.Index+1 == initialPages {
+						if digest != summary.control.PayloadDigest {
+							return fmt.Errorf("%w: manifest creation payload", ErrTransactionStateCorrupt)
+						}
+						summary.manifestCreation.authenticated = true
+					}
+				}
 			}
 			summary.manifestNextPage++
 			summary.manifestNextParticipant += uint64(view.ParticipantCount)
@@ -1125,25 +1382,140 @@ func scanSessionSystemSnapshot(
 			transactionIntentRows++
 			return addTransactionResidentBytes(&transactionResidentBytes, len(key), len(value))
 
+		case len(key) >= requestledger.FixedStorageKeyBytes && key[0] == requestledger.StoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger row before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observe(key, value)
+
+		case len(key) == requestledger.PlanningExpiryKeyBytes && key[0] == requestledger.PlanningExpiryStoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger planning expiry before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observePlanningExpiry(key, value)
+
+		case len(key) == requestledger.IssuerHighwaterKeyBytes && key[0] == requestledger.IssuerHighwaterStoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger issuer high-water before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observeIssuerHighwater(key, value)
+
+		case len(key) == requestledger.IssuerSequenceKeyBytes && key[0] == requestledger.IssuerSequenceStoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger issuer sequence before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observeIssuerSequence(key, value)
+
+		case len(key) == executionPinRecordStorageKeyBytes && key[0] == executionPinRecordPrefix:
+			if !statePresent {
+				return ErrExecutionPinStateCorrupt
+			}
+			record, openErr := executionpin.OpenRecord(value)
+			want := executionPinRecordStorageKey(record.PinID)
+			if openErr != nil || !bytes.Equal(key, want[:]) ||
+				record.LastApplied > state.Applied || record.AcquireApplied > state.Applied ||
+				record.LeaseApplied > state.Applied || record.TerminalApplied > state.Applied ||
+				executionPinRecordCount >= state.ExecutionPinRecordCount {
+				return errors.Join(openErr, ErrExecutionPinStateCorrupt)
+			}
+			executionPinRecordCount++
+			executionPinResidentBytes += uint64(len(key) + len(value))
+			if record.Status == executionpin.StatusActive {
+				if _, duplicate := activeExecutionPins[record.PinID]; duplicate {
+					return ErrExecutionPinStateCorrupt
+				}
+				activeExecutionPins[record.PinID] = &scannedExecutionPin{
+					record: record, digest: sha256.Sum256(value),
+				}
+			}
+			return nil
+
+		case len(key) == executionPinActiveStorageKeyBytes && key[0] == executionPinActivePrefix:
+			if !statePresent || len(value) != executionPinActiveValueBytes {
+				return ErrExecutionPinStateCorrupt
+			}
+			var pin executionpin.PinID
+			copy(pin[:], key[executionPinActiveStorageKeyBytes-len(pin):])
+			summary := activeExecutionPins[pin]
+			if summary == nil || summary.activeSeen {
+				return ErrExecutionPinStateCorrupt
+			}
+			want := executionPinActiveStorageKey(summary.record)
+			if !bytes.Equal(key, want[:]) || !bytes.Equal(value, summary.digest[:]) {
+				return ErrExecutionPinStateCorrupt
+			}
+			summary.activeSeen = true
+			activeExecutionPinCount++
+			executionPinResidentBytes += uint64(len(key) + len(value))
+			return nil
+
+		case bytes.Equal(key, splitCaptureActivationKey[:]):
+			if !statePresent || splitActivation != nil {
+				return ErrSplitCaptureActivation
+			}
+			activation, openErr := openSplitCaptureActivation(value)
+			if openErr != nil || activation.Applied > state.Applied {
+				return errors.Join(openErr, ErrSplitCaptureActivation)
+			}
+			splitActivation = &activation
+			return nil
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}
 	})
 	if err != nil {
-		return State{}, false, 0, 0, 0, err
+		return State{}, false, 0, 0, 0, nil, err
 	}
 	if err := finishMutationScan(); err != nil {
-		return State{}, false, 0, 0, 0, err
+		return State{}, false, 0, 0, 0, nil, err
+	}
+	if err := ledgerScan.finish(state); err != nil {
+		return State{}, false, 0, 0, 0, nil, err
 	}
 	if !statePresent {
-		if sessionCount != 0 || slotCount != 0 || authorityCount != 0 {
-			return State{}, false, 0, 0, 0, fmt.Errorf("%w: rows without state", ErrStateCorrupt)
+		if sessionCount != 0 || slotCount != 0 || authorityCount != 0 || routeGateHeadPresent ||
+			len(routeGateRecords) != 0 || routeGateResultCount != 0 {
+			return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: rows without state", ErrStateCorrupt)
 		}
-		return State{}, false, 0, 0, 0, nil
+		gate, gateOK := routegate.NewMachine(1, routeGateMaxRecords)
+		if !gateOK {
+			return State{}, false, 0, 0, 0, nil, ErrInvalidOptions
+		}
+		return State{}, false, 0, 0, 0, gate, nil
 	}
 	if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount ||
 		authorityCount != state.AuthorityBindingCount {
-		return State{}, false, 0, 0, 0, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
+		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
+	}
+	var historicalSlots uint64
+	for key, f := range historicalFences {
+		if historicalSeen[key] != f.refs || historicalSlots > math.MaxUint64-f.refs {
+			return State{}, false, 0, 0, 0, nil, ErrSessionCorrupt
+		}
+		historicalSlots += f.refs
+	}
+	if uint64(len(historicalFences)) != state.HistoricalFenceCount || historicalSlots != state.HistoricalFenceSlots || unfencedSlots != state.UnfencedSessionSlots {
+		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: fence reference counts", ErrSessionCorrupt)
+	}
+	if routeGateResultCount > authorityCount*uint64(retryWindow) {
+		return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: route-gate result bound", ErrStateCorrupt)
+	}
+	var openedRouteGate *routegate.Machine
+	if routeGateHeadPresent {
+		var restoreErr error
+		openedRouteGate, restoreErr = routegate.RestoreMachine(
+			routeGateStatus, routeGateMaxRecords, routeGateRecords,
+		)
+		if restoreErr != nil {
+			return State{}, false, 0, 0, 0, nil, errors.Join(restoreErr, ErrStateCorrupt)
+		}
+	} else {
+		var ok bool
+		openedRouteGate, ok = routegate.NewMachine(1, routeGateMaxRecords)
+		if !ok || len(routeGateRecords) != 0 || routeGateResultCount != 0 {
+			return State{}, false, 0, 0, 0, nil, ErrStateCorrupt
+		}
 	}
 	// Session tokens are Raft apply indices and therefore shard-wide unique. A
 	// compact sorted vector costs eight bytes per active session—materially less
@@ -1152,13 +1524,13 @@ func scanSessionSystemSnapshot(
 	slices.Sort(sessionEpochs)
 	for i := 1; i < len(sessionEpochs); i++ {
 		if sessionEpochs[i-1] == sessionEpochs[i] {
-			return State{}, false, 0, 0, 0, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
+			return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
 		}
 	}
 	for authorityDigest, sessionDigest := range activeIdentities {
 		summary := sessions[sessionDigest]
 		if class, ok := authorities[authorityDigest]; !ok || class != summary.authorityClass {
-			return State{}, false, 0, 0, 0,
+			return State{}, false, 0, 0, 0, nil,
 				fmt.Errorf("%w: session authority binding digest=%x class=%d",
 					ErrSessionCorrupt, authorityDigest, summary.authorityClass)
 		}
@@ -1180,7 +1552,7 @@ func scanSessionSystemSnapshot(
 			summary.status == SessionActive && isSessionTerminalResult(summary.latestResult) ||
 			summary.latestResult == ResultSessionRevoked && summary.leaseDeadline != 0 ||
 			summary.latestResult == ResultSessionRetired && summary.leaseDeadline == 0 {
-			return State{}, false, 0, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
+			return State{}, false, 0, 0, 0, nil, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
 		}
 	}
 	if transactionControlCount != state.TransactionControlCount ||
@@ -1189,8 +1561,21 @@ func scanSessionSystemSnapshot(
 		transactionIntentRows != state.TransactionIntentRows ||
 		transactionResidentBytes != state.TransactionResidentBytes ||
 		uint64(len(activeTransactionIntents)) != state.TransactionIntentRows {
-		return State{}, false, 0, 0, 0,
+		return State{}, false, 0, 0, 0, nil,
 			fmt.Errorf("%w: transaction image accounting", ErrTransactionStateCorrupt)
+	}
+	if executionPinRecordCount != state.ExecutionPinRecordCount ||
+		activeExecutionPinCount != state.ActiveExecutionPinCount ||
+		executionPinResidentBytes != state.ExecutionPinResidentBytes ||
+		uint64(len(activeExecutionPins)) != state.ActiveExecutionPinCount {
+		return State{}, false, 0, 0, 0, nil,
+			fmt.Errorf("%w: execution-pin image accounting", ErrExecutionPinStateCorrupt)
+	}
+	for _, summary := range activeExecutionPins {
+		if !summary.activeSeen {
+			return State{}, false, 0, 0, 0, nil,
+				fmt.Errorf("%w: missing active-scope row", ErrExecutionPinStateCorrupt)
+		}
 	}
 	for _, summary := range transactionControls {
 		control := summary.control
@@ -1199,22 +1584,23 @@ func scanSessionSystemSnapshot(
 			summary.residentManifest != control.ResidentManifestBytes ||
 			summary.residentMutation != control.ResidentMutationBytes ||
 			summary.residentIntent != control.ResidentIntentBytes {
-			return State{}, false, 0, 0, 0,
+			return State{}, false, 0, 0, 0, nil,
 				fmt.Errorf("%w: transaction resident counters", ErrTransactionStateCorrupt)
 		}
 		if control.Role == distributedtxn.ReplicatedRoleCoordinator {
 			if !summary.payloadSeen || summary.residentPayload == 0 || summary.payloadRows == 0 {
-				return State{}, false, 0, 0, 0,
+				return State{}, false, 0, 0, 0, nil,
 					fmt.Errorf("%w: coordinator creation payload", ErrTransactionStateCorrupt)
 			}
 			if control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator {
-				if !summary.manifestDescriptorSeen || summary.manifestNextPage == 0 ||
+				if !summary.manifestDescriptorSeen || summary.manifestCreation == nil ||
+					!summary.manifestCreation.authenticated || summary.manifestNextPage == 0 ||
 					summary.manifestNextParticipant == 0 || summary.manifestEncodedBytes == 0 ||
 					summary.manifestNextPage != control.ManifestNextPage ||
 					summary.manifestNextParticipant != control.ManifestNextParticipant ||
 					summary.manifestEncodedBytes != control.ManifestEncodedBytes ||
 					summary.manifestChain != control.ManifestChainDigest {
-					return State{}, false, 0, 0, 0,
+					return State{}, false, 0, 0, 0, nil,
 						fmt.Errorf("%w: manifest progress witness", ErrTransactionStateCorrupt)
 				}
 				descriptor := summary.manifestDescriptor
@@ -1225,12 +1611,12 @@ func scanSessionSystemSnapshot(
 					summary.manifestChain, descriptor.ParticipantCount,
 					descriptor.EncodedBytes, descriptor.SegmentCount,
 				) != descriptor.Root {
-					return State{}, false, 0, 0, 0,
+					return State{}, false, 0, 0, 0, nil,
 						fmt.Errorf("%w: manifest root", ErrTransactionStateCorrupt)
 				}
 				if distributedtxn.CoordinatorState(control.State) == distributedtxn.CoordinatorCommitted &&
 					!complete {
-					return State{}, false, 0, 0, 0,
+					return State{}, false, 0, 0, 0, nil,
 						fmt.Errorf("%w: committed incomplete manifest", ErrTransactionStateCorrupt)
 				}
 			}
@@ -1239,12 +1625,12 @@ func scanSessionSystemSnapshot(
 		if summary.mutationRows != control.PayloadCount ||
 			uint64(len(summary.mutationKeys)) != summary.intentRows ||
 			summary.intentRows == 0 {
-			return State{}, false, 0, 0, 0,
+			return State{}, false, 0, 0, 0, nil,
 				fmt.Errorf("%w: participant child row counts", ErrTransactionStateCorrupt)
 		}
 		for _, mutationKey := range summary.mutationKeys {
 			if !mutationKey.intentSeen {
-				return State{}, false, 0, 0, 0,
+				return State{}, false, 0, 0, 0, nil,
 					fmt.Errorf("%w: participant mutation lacks intent", ErrTransactionStateCorrupt)
 			}
 		}
@@ -1252,8 +1638,9 @@ func scanSessionSystemSnapshot(
 	if len(transactionResult) != 0 && transactionResult[0] != nil {
 		transactionResult[0].intents = activeTransactionIntents
 		transactionResult[0].intentKeys = transactionIntentKeys
+		transactionResult[0].activation = splitActivation
 	}
-	return state, true, sessionCount, slotCount, authorityCount, nil
+	return state, true, sessionCount, slotCount, authorityCount, openedRouteGate, nil
 }
 
 func transactionControlActive(control TransactionControl) bool {
@@ -1277,7 +1664,7 @@ var scannedTransactionMutationDigestDomain = [...]byte{
 	'V', 'i', 'b', 'e', 'D', 'B', '/', 't', 'x', 'n', '/', 'r', 'e', 'l', '/', '1', 0,
 }
 
-func validateStoredSessionSlot(state State, slot SessionSlotView) error {
+func validateStoredSessionSlot(state State, slot SessionSlotView, lookup ...sessionFenceLookup) error {
 	if !isSessionResultCode(slot.ResultCode) {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrSessionCorrupt)
 	}
@@ -1291,10 +1678,21 @@ func validateStoredSessionSlot(state State, slot SessionSlotView) error {
 			slot.ActivePolicyGeneration != state.Binding.ActivePolicyGeneration ||
 			slot.ProtectionEpoch != state.Binding.ProtectionEpoch ||
 			slot.RoutingVersion > state.Binding.RoutingVersion ||
-			slot.RouteGeneration > state.Binding.RouteGeneration ||
-			state.Binding.RoutingVersion-slot.RoutingVersion !=
-				state.Binding.RouteGeneration-slot.RouteGeneration {
+			slot.RouteGeneration > state.Binding.RouteGeneration {
 			return fmt.Errorf("%w: retained session result mutable binding", ErrSessionCorrupt)
+		}
+		if slot.RoutingVersion == state.Binding.RoutingVersion && slot.RouteGeneration == state.Binding.RouteGeneration {
+			if slot.AppliedSequence <= state.FenceApplied {
+				return ErrSessionCorrupt
+			}
+		} else {
+			if len(lookup) != 1 {
+				return ErrSessionCorrupt
+			}
+			f, err := lookup[0].get(state, slot.RoutingVersion, slot.RouteGeneration)
+			if err != nil || slot.AppliedSequence <= f.start || slot.AppliedSequence >= f.end {
+				return ErrSessionCorrupt
+			}
 		}
 	}
 	return nil
@@ -1375,14 +1773,24 @@ func (o sessionAppliedOrder) finish(high uint64, window uint16) error {
 }
 
 func (m *Machine) validateCompletionResult(completion replication.CompletionView) error {
-	if completion.ResultFormat != ResultFormatMutation ||
-		!isSessionResultCode(completion.ResultCode) {
+	switch completion.ResultFormat {
+	case ResultFormatMutation:
+		if !isMutationResultCode(completion.ResultCode) {
+			return fmt.Errorf("%w: unsupported mutation result grammar", ErrCompletionCorrupt)
+		}
+		_, err := OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult)
+		return err
+	case ResultFormatRouteGate:
+		if completion.ResultCode != ResultRouteGate {
+			return fmt.Errorf("%w: unsupported route-gate result grammar", ErrCompletionCorrupt)
+		}
+		if _, err := routegate.OpenOutcome(completion.InlineResult); err != nil {
+			return fmt.Errorf("%w: route-gate outcome", ErrCompletionCorrupt)
+		}
+		return nil
+	default:
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
-	if _, err := OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult); err != nil {
-		return err
-	}
-	return nil
 }
 
 func publicationFromState(state State) raftmodel.Publication {
@@ -1443,6 +1851,59 @@ func (m *Machine) RelationManifestDigest() ([sha256.Size]byte, error) {
 	return m.manifestDigest, nil
 }
 
+// ApplyContractDigest returns the immutable command/result semantics opened
+// with the current relation bundle. Schema rollout preparation uses it to bind
+// the exact old contract before proposing the ordered transition; a machine
+// already fenced by a committed transition fails closed.
+func (m *Machine) ApplyContractDigest() ([sha256.Size]byte, error) {
+	if m == nil {
+		return [sha256.Size]byte{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	if m.applyContract == ([sha256.Size]byte{}) {
+		return [sha256.Size]byte{}, ErrStateCorrupt
+	}
+	return m.applyContract, nil
+}
+
+// ObserveSchemaTransition proves that command is the exact final durable Raft
+// entry which fenced this source bundle. It recomputes the authenticated entry
+// digest from the persisted term and index, so matching only a target schema
+// generation or apply contract can never authorize catalog publication.
+//
+// A later entry cannot hide the transition: a committed schema transition
+// permanently fences the old bundle, leaving RecordSchema as its final kind
+// until the exact target bundle is activated.
+func (m *Machine) ObserveSchemaTransition(command []byte) (uint64, bool, error) {
+	if m == nil {
+		return 0, false, ErrApplyPoisoned
+	}
+	transition, err := OpenSchemaTransition(command)
+	if err != nil {
+		return 0, false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.poison != nil {
+		return 0, false, fmt.Errorf("%w: %v", ErrApplyPoisoned, m.poison)
+	}
+	state := m.state
+	if !m.schemaTransitioned || state.LastKind != RecordSchema ||
+		state.LastEntryType != pb.EntryNormal || state.LastTerm == 0 ||
+		state.Binding != schemaTransitionBinding(transition) ||
+		state.ApplyContractDigest != transition.ToApplyContract || state.RelationPlacementDigest != transition.ToPlacementDigest {
+		return state.Applied, false, nil
+	}
+	digest := normalEntryDigest(raftmodel.ApplyMeta{
+		Index: state.Applied, Term: state.LastTerm, Type: state.LastEntryType,
+	}, command)
+	return state.Applied, digest == state.LastEntryDigest, nil
+}
+
 // SessionCapacityState returns a read-only, constant-size view of the machine
 // state needed by Raft integration checks. A poisoned
 // machine fails closed instead of advertising its last publication as usable.
@@ -1460,6 +1921,31 @@ func (m *Machine) SessionCapacityState() (SessionCapacityState, error) {
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
 		SessionEpochHighWater: m.state.SessionEpochHighWater,
 		AuthorityBindingCount: m.state.AuthorityBindingCount,
+	}, nil
+}
+
+// RequestLedgerUsage returns the exact replicated ledger counters and the
+// immutable range authority used by this machine. It performs no row scan and
+// therefore remains constant-time under large retained ledgers.
+func (m *Machine) RequestLedgerUsage() (RequestLedgerUsage, error) {
+	if m == nil {
+		return RequestLedgerUsage{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return RequestLedgerUsage{}, err
+	}
+	return RequestLedgerUsage{
+		Enabled:             m.options.RequestLedgerRange.enabled(),
+		Rows:                m.state.RequestLedgerRows,
+		ResidentBytes:       m.state.RequestLedgerResidentBytes,
+		ReservedBytes:       m.state.RequestLedgerReservedBytes,
+		AckRows:             m.state.RequestLedgerAckRows,
+		AckBytes:            m.state.RequestLedgerAckBytes,
+		CapacityBytes:       m.options.RequestLedgerCapacityBytes,
+		CleanupReserveBytes: m.options.RequestLedgerCleanupReserveBytes,
+		Range:               m.options.RequestLedgerRange,
 	}, nil
 }
 
@@ -1483,6 +1969,9 @@ func (m *Machine) fail(err error) error {
 func (m *Machine) checkUsable() error {
 	if m.poison != nil {
 		return fmt.Errorf("%w: %v", ErrApplyPoisoned, m.poison)
+	}
+	if m.schemaTransitioned {
+		return ErrSchemaTransitionPending
 	}
 	return nil
 }

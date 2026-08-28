@@ -15,8 +15,8 @@ import (
 )
 
 func primaryBatchOverflowDocument(tag string, fill byte, size int) []byte {
-	return fmt.Appendf(nil, `{"tag":%q,"pad":%q}`,
-		tag, strings.Repeat(string(fill), size))
+	return fmt.Appendf(nil, `{"pad":%q,"tag":%q}`,
+		strings.Repeat(string(fill), size), tag)
 }
 
 func requirePrimaryBatchRaw(t testing.TB, collection *Collection, key string, want []byte) {
@@ -188,10 +188,14 @@ func TestCollectionUpdateOverflowJournalCrashReopen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			values := map[string]string{
-				"inline":     string([]byte(`{"tag":"inline"}`)),
-				"overflow-a": string(primaryBatchOverflowDocument("a", 'A', 10<<10)),
-				"overflow-b": string(primaryBatchOverflowDocument("b", 'B', 14<<10)),
+			inputs := map[string]string{
+				"inline":     "{\"tag\":\"inline\",\"a\":\"\u2028\u2029\"}",
+				"overflow-a": fmt.Sprintf(` { "tag":"a", "pad":%q } `, strings.Repeat("A", 10<<10)),
+				"overflow-b": fmt.Sprintf(` { "tag":"b", "pad":%q } `, strings.Repeat("B", 14<<10)),
+			}
+			values := make(map[string]string, len(inputs))
+			for key, input := range inputs {
+				values[key] = string(canonicalBatchOracle(t, []byte(input)))
 			}
 			var image journalCrashImage
 			captured := false
@@ -207,7 +211,7 @@ func TestCollectionUpdateOverflowJournalCrashReopen(t *testing.T) {
 			}
 			if err := collection.Update(func(batch *WriteBatch) error {
 				for _, key := range []string{"inline", "overflow-a", "overflow-b"} {
-					if err := batch.Put([]byte(key), []byte(values[key])); err != nil {
+					if err := batch.Put([]byte(key), []byte(inputs[key])); err != nil {
 						return err
 					}
 				}

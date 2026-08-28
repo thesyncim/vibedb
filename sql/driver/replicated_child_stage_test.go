@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -101,6 +102,18 @@ func TestReplicatedChildSourceFixtureSealsCertifiedImage(t *testing.T) {
 }
 
 func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *testing.T) {
+	for _, unknownPublication := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown_publication=%t", unknownPublication), func(t *testing.T) {
+			testReplicatedChildStageNoCopyApplyHandoff(t, unknownPublication, false)
+		})
+	}
+}
+
+func TestReplicatedChildStagePreservesLocalIndexProfile(t *testing.T) {
+	testReplicatedChildStageNoCopyApplyHandoff(t, false, true)
+}
+
+func testReplicatedChildStageNoCopyApplyHandoff(t *testing.T, unknownPublication, indexed bool) {
 	fixture := newReplicatedChildSourceFixture(t)
 	targetBinding := testReplicatedBinding(91)
 	targetBinding.Distribution = string(fixture.partitioner.SourceDistribution())
@@ -129,6 +142,11 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	if err := testRuntimeExec(session, `CREATE TABLE docs (PRIMARY KEY (id))`, nil); err != nil {
 		t.Fatal(err)
 	}
+	if indexed {
+		if err := testRuntimeExec(session, `CREATE INDEX by_id ON docs (id)`, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +159,13 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	}
 	applyOptions := testReplicatedApplyOptions()
 	applyOptions.Placement.Range = fixture.childRange
+	reservedApply := newReplicatedApplyMeta(
+		base, strings.Repeat("c", storageIdentityBytes*2),
+		strings.Repeat("d", storageIdentityBytes*2), applyOptions,
+	).identity()
+	if err = db.ReserveReplicatedChildApply(base, reservedApply); err != nil {
+		t.Fatal(err)
+	}
 
 	core := db.connector.db
 	core.mu.RLock()
@@ -196,20 +221,32 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	}
 	core.mu.RUnlock()
 
-	unknown, err := stage.activate(
-		certificate, fixture.targetBootstrap,
-		replicatedstate.SnapshotArtifactOptions{},
-		func(database *database) (bool, error) {
+	var publication func(*database) (bool, error)
+	if unknownPublication {
+		publication = func(database *database) (bool, error) {
 			published, persistErr := database.persistCatalogLocked()
 			if persistErr != nil {
 				return published, persistErr
 			}
 			return true, durable.ErrCommitOutcomeUnknown
-		},
+		}
+	}
+	unknown, err := stage.activate(
+		certificate, fixture.targetBootstrap,
+		replicatedstate.SnapshotArtifactOptions{}, publication,
 	)
-	if unknown.Apply != nil || unknown.ApplyIdentity == (ReplicatedApplyIdentity{}) ||
-		!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+	if unknown.ApplyIdentity != reservedApply || (unknownPublication &&
+		(unknown.Apply != nil || !errors.Is(err, durable.ErrCommitOutcomeUnknown))) ||
+		(!unknownPublication && (unknown.Apply == nil || err != nil)) {
 		t.Fatalf("unknown descriptor publication = %+v, %v", unknown, err)
+	}
+	if unknown.Apply != nil {
+		if unknown.Apply.table.collection != finalCollection {
+			t.Fatal("fresh activation copied the sealed user collection")
+		}
+		if err := unknown.Apply.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if opened, err := db.NewSession(context.Background()); opened != nil ||
 		!errors.Is(err, ErrReplicatedChildStageBusy) {
@@ -225,13 +262,15 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if ordinary, _, err := OpenReplicatedShardStoreWithApplyForSettlement(
-		path, base, applyOptions,
-	); ordinary != nil || !errors.Is(err, durable.ErrCheckpointGroupCorrupt) {
-		if ordinary != nil {
-			_ = ordinary.Close()
+	if unknownPublication {
+		if ordinary, _, err := OpenReplicatedShardStoreWithApplyForSettlement(
+			path, base, applyOptions,
+		); ordinary != nil || !errors.Is(err, durable.ErrCheckpointGroupCorrupt) {
+			if ordinary != nil {
+				_ = ordinary.Close()
+			}
+			t.Fatalf("ordinary open of seed-pending image = %v, %v", ordinary, err)
 		}
-		t.Fatalf("ordinary open of seed-pending image = %v, %v", ordinary, err)
 	}
 	resumed, resumedIdentity, err := OpenReplicatedShardStoreForChildStageResume(
 		path, base, applyOptions,
@@ -325,6 +364,15 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		activated.SnapshotBase == nil || activated.ArtifactManifest.UserRows != 1 ||
 		activated.ArtifactManifest.State.Applied != certificate.SourceCut().Applied {
 		t.Fatalf("activation = %+v", activated)
+	}
+	expectedDigest, err := replicatedstate.InitialJSONRelationManifest(
+		base.Binding.Authority.SchemaGeneration, base.UserTable,
+		replicatedStateCollectionLimits(base.UserLimits), activated.ApplyIdentity.ValidationDigest,
+		replicatedApplyLocalIndexes(stage.table),
+	)
+	actualDigest, actualErr := activated.Apply.machine.RelationManifestDigest()
+	if err != nil || actualErr != nil || actualDigest != expectedDigest {
+		t.Fatalf("child activation changed the declared relation/index profile: %v %v", err, actualErr)
 	}
 	if err := activated.Apply.AdmitCommand(nil); !errors.Is(err, ErrReplicatedApplyBasePending) {
 		t.Fatalf("AdmitCommand before base install = %v", err)

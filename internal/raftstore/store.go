@@ -57,6 +57,31 @@ type Store struct {
 	pending              *pendingMutation
 }
 
+// Metrics is a detached fixed-width view of live WAL retention and durable
+// synchronization work. It exposes no path or mutable storage authority.
+type Metrics struct {
+	LiveBytes uint64
+	Entries   uint64
+	Syncs     uint64
+}
+
+func (store *Store) Metrics() Metrics {
+	if store == nil {
+		return Metrics{}
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if store.closed {
+		return Metrics{}
+	}
+	entries := uint64(len(store.image.entries))
+	live := store.image.liveBytes
+	if live < 0 {
+		live = 0
+	}
+	return Metrics{LiveBytes: uint64(live), Entries: entries, Syncs: store.syncCount}
+}
+
 type pendingKind uint8
 
 const (
@@ -776,8 +801,24 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 			_ = family.close()
 		}
 	}()
-	base = selectedBase
-	absPath = filepath.Join(parentPath, base)
+	store, err := openFamilySelectedStore(root, parentPath, directoryInfo, logicalPath,
+		logicalBase, selectedBase, expected, expectedTopologyRecoveryEpoch, key, normalized, family)
+	if err != nil {
+		return nil, err
+	}
+	keepRoot = true
+	keepFamily = true
+	return store, nil
+}
+
+// openFamilySelectedStore borrows the already locked family and pinned root.
+// Both cold Open and live selection adoption use the identical recovery and
+// family authentication path. On failure only the new WAL file is released.
+func openFamilySelectedStore(root *os.Root, parentPath string, directoryInfo os.FileInfo,
+	logicalPath, logicalBase, base string, expected Identity, expectedTopologyRecoveryEpoch uint64,
+	key Key, normalized normalizedOptions, family *familyManifest,
+) (*Store, error) {
+	absPath := filepath.Join(parentPath, base)
 	entryInfo, err := root.Lstat(base)
 	if err != nil {
 		return nil, err
@@ -889,8 +930,6 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 		current: current, image: image, generation: generation, recoveredTornSlot: recoveredTorn,
 		family: family, activationPending: family != nil && family.state.phase == familyPhaseSelecting,
 	}
-	keepRoot = true
-	keepFamily = true
 	return store, nil
 }
 
@@ -1471,6 +1510,25 @@ func (store *Store) WrappedKeyMetadata() []byte {
 		return nil
 	}
 	return append([]byte(nil), store.header.wrapped...)
+}
+
+// AuthenticatedWrappedKeyMetadata returns the retained provider metadata only
+// when key opens this exact live WAL. This is the same constant-time key proof
+// used by generation rollover. A child WAL can reuse an existing provider key
+// without inventing wrapped metadata or retaining another plaintext key copy.
+func (store *Store) AuthenticatedWrappedKeyMetadata(key Key) ([]byte, error) {
+	if store == nil {
+		return nil, ErrClosed
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if err := store.checkLocked(); err != nil {
+		return nil, err
+	}
+	if err := validateGenerationKey(key, store.header); err != nil {
+		return nil, err
+	}
+	return bytes.Clone(store.header.wrapped), nil
 }
 
 func (store *Store) TopologyRecoveryEpoch() uint64 {

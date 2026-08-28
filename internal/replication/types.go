@@ -68,8 +68,15 @@ const (
 	commandWireSessionRenew    = uint8(5)
 	commandWireSessionRevoke   = uint8(6)
 	commandWireTransaction     = uint8(7)
-	sessionLeaseBodyBytes      = 16
-	transactionLengthBytes     = 4
+	// Wire kind 8 is owned by the route-gate command family. Request-ledger is
+	// fixed at 9 and execution-pin at 10 in the cross-package command registry.
+	commandWireRouteGate            = uint8(8)
+	commandWireRequestLedger        = uint8(9)
+	commandWireExecutionPin         = uint8(10)
+	commandWireRetainedPrune        = uint8(11)
+	commandWireSplitCaptureActivate = uint8(12)
+	sessionLeaseBodyBytes           = 16
+	transactionLengthBytes          = 4
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -140,13 +147,26 @@ type RelationID uint16
 
 // CommandAuthorityClass is authenticated command identity, not a transport
 // hint. Data is the zero value so the sole unreleased grammar keeps ordinary
-// command bytes compact; topology commands carry the one nonzero class bit.
+// command bytes compact; control surfaces use distinct nonzero classes.
 type CommandAuthorityClass uint8
 
 const (
 	CommandAuthorityData CommandAuthorityClass = iota
 	CommandAuthorityTopology
+	// CommandAuthorityRequestLedger is the narrow internal gateway-service
+	// authority for durable request lifecycle commands. It grants neither data
+	// writes nor topology mutation.
+	CommandAuthorityRequestLedger
+	// CommandAuthorityExecutionPin is isolated from topology mutation. A pin
+	// controller may retain/release one logical execution contract but cannot
+	// publish a catalog or operate physical route drains.
+	CommandAuthorityExecutionPin
 )
+
+func validCommandAuthorityClass(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityData || class == CommandAuthorityTopology ||
+		class == CommandAuthorityRequestLedger || class == CommandAuthorityExecutionPin
+}
 
 // CommandKind selects the command's state-machine operation. The zero value is
 // the ordinary mutation batch so command producers remain explicit for session
@@ -177,6 +197,23 @@ const (
 	// CommandTransaction applies one canonical distributed transaction control
 	// transition. Only participant staging carries native relation batches.
 	CommandTransaction
+	// CommandRequestLedger applies one hidden, durable cross-shard request
+	// lifecycle transition. Its byte-native body is interpreted by the request
+	// ledger state machine and never carries user relation mutations.
+	CommandRequestLedger
+	// CommandRouteGate orders one durable request pin or topology drain on this
+	// data shard's own Raft log. It carries exactly one canonical routegate
+	// command. Shared pin operations require data authority; exclusive drains
+	// and compaction require topology authority.
+	CommandRouteGate
+	// CommandExecutionPin orders one long-lived logical catalog/schema pin in
+	// the dedicated catalog RF3 group. It never carries user relation writes.
+	CommandExecutionPin CommandKind = 10
+	// CommandRetainedPrune deletes only rows proven to be outside the source's
+	// already-narrowed owned range. It is topology-only and carries one exact
+	// split/cut/batch proof plus ordinary relation delete frames.
+	CommandRetainedPrune        CommandKind = 11
+	CommandSplitCaptureActivate CommandKind = 12
 )
 
 // MutationKind selects one logical relation mutation.

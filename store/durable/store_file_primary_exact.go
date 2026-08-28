@@ -106,7 +106,12 @@ func (c *Collection) primaryExactActive() bool {
 func (c *Collection) derivePrimaryLive(
 	state *fileStoreState,
 ) (map[uint32]*[storeio.TermPostingTileChunks]uint64, error) {
-	router := c.primaryRouter.Load()
+	return c.derivePrimaryLiveFromRouter(c.primaryRouter.Load(), state)
+}
+
+func (c *Collection) derivePrimaryLiveFromRouter(
+	router *storeio.ResidentPrimaryRouter, state *fileStoreState,
+) (map[uint32]*[storeio.TermPostingTileChunks]uint64, error) {
 	if router == nil {
 		return nil, storeio.ErrPrimaryExactIndexCorrupt
 	}
@@ -240,26 +245,41 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	if state.root.ExactIndexRoot == (storeio.PageRef{}) {
 		return nil
 	}
+	epoch, err := c.buildPrimaryExactEpoch(state, c.primaryRouter.Load())
+	if err != nil {
+		return err
+	}
+	c.primaryEpoch = epoch
+	// Retire/pool lists are bounded by fold cadence against the reclaim
+	// floor; pre-sizing them keeps the publish-gate append allocation-free.
+	c.primaryEpochRetired = make([]retiredPrimaryExactEpoch, 0, 8)
+	c.primaryEpochPool = make([]*primaryExactEpoch, 0, 8)
+	return nil
+}
+
+func (c *Collection) buildPrimaryExactEpoch(
+	state *fileStoreState, router *storeio.ResidentPrimaryRouter,
+) (*primaryExactEpoch, error) {
 	bounds := storeio.PrimaryExactIndexBounds{
 		StoreID: state.root.StoreID, Generation: state.root.Generation,
 		FileEnd: state.fileEnd, NextLogicalID: state.root.NextLogicalID,
 		AllocationQuantum: state.root.PageSize,
 		MaxPageSize:       state.root.MaxPageSize, IndexCount: state.root.IndexCount,
 	}
-	live, err := c.derivePrimaryLive(state)
+	live, err := c.derivePrimaryLiveFromRouter(router, state)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rootLease, err := c.cache.Acquire(state.root.ExactIndexRoot)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	root, err := storeio.OpenPrimaryExactRootPage(
 		rootLease.Page(), state.root.ExactIndexRoot, bounds,
 	)
 	rootLease.Release()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	epoch := newPrimaryExactEpoch(root.Len())
 	epoch.live = newPrimaryLiveTable(live)
@@ -274,7 +294,7 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 	for indexID := 0; indexID < root.Len(); indexID++ {
 		rootEntry, ok := root.Entry(uint32(indexID))
 		if !ok {
-			return storeio.ErrPrimaryExactIndexCorrupt
+			return nil, storeio.ErrPrimaryExactIndexCorrupt
 		}
 		if rootEntry.LeafCount == 0 {
 			continue
@@ -284,10 +304,10 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 			&epoch.exact[indexID].catalog,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if uint32(len(entries)) != rootEntry.LeafCount {
-			return storeio.ErrPrimaryExactIndexCorrupt
+			return nil, storeio.ErrPrimaryExactIndexCorrupt
 		}
 		resident := &epoch.exact[indexID]
 		resident.leaves = make([]primaryExactLeaf, 0, len(entries))
@@ -296,24 +316,19 @@ func (c *Collection) openPrimaryExactIndexes(state *fileStoreState) error {
 				entries[at], bounds, liveLookup,
 			)
 			if leafErr != nil {
-				return leafErr
+				return nil, leafErr
 			}
 			if n := len(resident.leaves); n != 0 {
 				previous := &resident.leaves[n-1]
 				cmp := bytes.Compare(previous.firstKey, leaf.firstKey)
 				if cmp > 0 || cmp == 0 && previous.firstTile >= leaf.firstTile {
-					return storeio.ErrPrimaryExactIndexCorrupt
+					return nil, storeio.ErrPrimaryExactIndexCorrupt
 				}
 			}
 			resident.leaves = append(resident.leaves, leaf)
 		}
 	}
-	c.primaryEpoch = epoch
-	// Retire/pool lists are bounded by fold cadence against the reclaim
-	// floor; pre-sizing them keeps the publish-gate append allocation-free.
-	c.primaryEpochRetired = make([]retiredPrimaryExactEpoch, 0, 8)
-	c.primaryEpochPool = make([]*primaryExactEpoch, 0, 8)
-	return nil
+	return epoch, nil
 }
 
 // collectPrimaryExactCatalog walks one physical index's catalog (depth ≤ 2)
@@ -1000,7 +1015,7 @@ type primaryExactStagedLeaf struct {
 // tree depth ≤ 2). It returns the root-entry reference and appends every
 // written catalog page to pages.
 func stagePrimaryExactCatalog(
-	tx *storeio.WriteTransaction,
+	sink storeio.PrimaryGraphBuildSink,
 	pageSize, maxPageSize uint32,
 	staged []primaryExactStagedLeaf,
 	pages []storeio.PageRef,
@@ -1037,7 +1052,7 @@ func stagePrimaryExactCatalog(
 		if !ok {
 			return storeio.PageRef{}, storeio.ErrPrimaryExactIndexCorrupt
 		}
-		page, err := tx.Allocate(storeio.PagePrimaryExactCatalog, extent, 0)
+		page, err := sink.AllocatePage(storeio.PagePrimaryExactCatalog, extent, 0)
 		if err != nil {
 			return storeio.PageRef{}, err
 		}
@@ -1053,7 +1068,7 @@ func stagePrimaryExactCatalog(
 	if single+storeio.PageHeaderSize+storeio.PageTrailerSize <= int(maxPageSize) {
 		ref, err := stagePage(func(dst []byte, logicalID uint64) ([]byte, error) {
 			return storeio.EncodePrimaryExactCatalogLeafPage(
-				dst, tx.StoreID(), tx.Generation(), logicalID, entries,
+				dst, sink.StoreIdentity(), sink.BuildGeneration(), logicalID, entries,
 			)
 		}, single)
 		if err != nil {
@@ -1083,7 +1098,7 @@ func stagePrimaryExactCatalog(
 		child := entries[start:end]
 		ref, err := stagePage(func(dst []byte, logicalID uint64) ([]byte, error) {
 			return storeio.EncodePrimaryExactCatalogLeafPage(
-				dst, tx.StoreID(), tx.Generation(), logicalID, child,
+				dst, sink.StoreIdentity(), sink.BuildGeneration(), logicalID, child,
 			)
 		}, bytesUsed)
 		if err != nil {
@@ -1104,7 +1119,7 @@ func stagePrimaryExactCatalog(
 	}
 	ref, err := stagePage(func(dst []byte, logicalID uint64) ([]byte, error) {
 		return storeio.EncodePrimaryExactCatalogIndexPage(
-			dst, tx.StoreID(), tx.Generation(), logicalID, children,
+			dst, sink.StoreIdentity(), sink.BuildGeneration(), logicalID, children,
 		)
 	}, indexBytes)
 	if err != nil {
@@ -1357,7 +1372,7 @@ func primaryExactIndexPageBound(
 // root. Bulk build, checkpoint fold, and journal replay share the cutter, so
 // identical final graphs produce byte-identical leaf sets regardless of path.
 func buildPrimaryExactIndexes(
-	tx *storeio.WriteTransaction,
+	sink storeio.PrimaryGraphBuildSink,
 	records []storeio.PrimaryGraphRecord,
 	placements []storeio.PrimaryGraphPlacement,
 	indexes []*store.ExactIndex,
@@ -1416,7 +1431,7 @@ func buildPrimaryExactIndexes(
 		for key, postings := range byIndex[indexID] {
 			terms[key] = postings
 		}
-		ordered, err := buildPrimaryExactTerms(tx.StoreID(), terms, live)
+		ordered, err := buildPrimaryExactTerms(sink.StoreIdentity(), terms, live)
 		if err != nil {
 			return storeio.PageRef{}, err
 		}
@@ -1428,7 +1443,7 @@ func buildPrimaryExactIndexes(
 			ordered, budget,
 			func(leafTerms []storeio.IndexTermLeafTerm, piece bool) error {
 				encoded, encErr := storeio.AppendIndexTermLeaf(
-					nil, tx.StoreID(), leafTerms,
+					nil, sink.StoreIdentity(), leafTerms,
 				)
 				if encErr != nil {
 					return fmt.Errorf(
@@ -1437,7 +1452,7 @@ func buildPrimaryExactIndexes(
 					)
 				}
 				ref, stageErr := stagePrimaryExactLeafPage(
-					tx, encoded, pageSize, maxPageSize,
+					sink, encoded, pageSize, maxPageSize,
 				)
 				if stageErr != nil {
 					return stageErr
@@ -1459,7 +1474,7 @@ func buildPrimaryExactIndexes(
 			return storeio.PageRef{}, err
 		}
 		catalogRef, pages, err := stagePrimaryExactCatalog(
-			tx, pageSize, maxPageSize, staged, catalogPages,
+			sink, pageSize, maxPageSize, staged, catalogPages,
 		)
 		if err != nil {
 			return storeio.PageRef{}, err
@@ -1469,14 +1484,14 @@ func buildPrimaryExactIndexes(
 			Catalog: catalogRef, LeafCount: uint32(len(staged)),
 		}
 	}
-	rootPage, err := tx.Allocate(storeio.PagePrimaryExactRoot, pageSize, 0)
+	rootPage, err := sink.AllocatePage(storeio.PagePrimaryExactRoot, pageSize, 0)
 	if err != nil {
 		return storeio.PageRef{}, fmt.Errorf(
 			"vibedb: allocate ordered-primary exact root: %w", err,
 		)
 	}
 	if _, err := storeio.EncodePrimaryExactRootPage(
-		rootPage.Bytes(), tx.StoreID(), tx.Generation(),
+		rootPage.Bytes(), sink.StoreIdentity(), sink.BuildGeneration(),
 		rootPage.Ref().LogicalID, rootEntries,
 	); err != nil {
 		return storeio.PageRef{}, err
@@ -1492,7 +1507,7 @@ func buildPrimaryExactIndexes(
 // 9: the cutter's budget is derived from MaxPageSize), so a failure here is
 // corruption-class, not a capacity condition.
 func stagePrimaryExactLeafPage(
-	tx *storeio.WriteTransaction,
+	sink storeio.PrimaryGraphBuildSink,
 	encoded []byte,
 	pageSize, maxPageSize uint32,
 ) (storeio.PageRef, error) {
@@ -1506,12 +1521,12 @@ func stagePrimaryExactLeafPage(
 			storeio.ErrPrimaryExactIndexCorrupt,
 		)
 	}
-	page, err := tx.Allocate(storeio.PagePrimaryExactLeaf, extent, 0)
+	page, err := sink.AllocatePage(storeio.PagePrimaryExactLeaf, extent, 0)
 	if err != nil {
 		return storeio.PageRef{}, err
 	}
 	if _, err := storeio.EncodePrimaryExactLeafPage(
-		page.Bytes(), tx.StoreID(), tx.Generation(),
+		page.Bytes(), sink.StoreIdentity(), sink.BuildGeneration(),
 		page.Ref().LogicalID, encoded,
 	); err != nil {
 		return storeio.PageRef{}, err

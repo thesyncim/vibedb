@@ -1,0 +1,291 @@
+package shardservice
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"sync/atomic"
+
+	"github.com/thesyncim/vibedb/internal/clusterrestore"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
+)
+
+var (
+	ErrRestoreServingControl      = errors.New("shardservice: invalid restore serving grant")
+	ErrRestoreServingUnauthorized = errors.New("shardservice: restore serving grant unauthorized")
+	ErrRestoreServingUnknown      = errors.New("shardservice: restore serving grant outcome unknown")
+)
+
+const restoreServingResponseBytes = 8 + 32
+const restoreServingObservationBytes = 8 + 8 + 32
+
+var restoreServingResponseMagic = [8]byte{'V', 'B', 'R', 'S', 'G', 'A', 'C', 'K'}
+var restoreServingObservationMagic = [8]byte{'V', 'B', 'R', 'S', 'G', 'O', 'B', 'S'}
+
+func RestoreServingRequestDiscriminator() [8]byte {
+	return clusterrestore.ServingGrantDiscriminator()
+}
+
+type restoreServingPublication struct{ digest [32]byte }
+
+// RestoreServingGate is process-local by design. A restart closes serving and
+// requires the gateway to repeat its linearizable catalog observation.
+type RestoreServingGate struct {
+	operation       [32]byte
+	group           raftmember.GroupKey
+	member          uint64
+	node            rafttransport.NodeID
+	store           [16]byte
+	nodeIncarnation uint64
+	active          atomic.Pointer[restoreServingPublication]
+}
+
+func NewRestoreServingGate(identity raftmember.RuntimeIdentity,
+	node rafttransport.NodeID, operation [32]byte,
+) (*RestoreServingGate, error) {
+	if operation == ([32]byte{}) || identity.Group == (raftmember.GroupKey{}) || identity.MemberID == 0 ||
+		identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 ||
+		node == (rafttransport.NodeID{}) {
+		return nil, ErrRestoreServingControl
+	}
+	return &RestoreServingGate{operation: operation, group: identity.Group, member: identity.MemberID, node: node,
+		store: identity.StoreID, nodeIncarnation: identity.NodeIncarnation}, nil
+}
+
+func (gate *RestoreServingGate) Install(grant clusterrestore.ServingGrant) error {
+	if gate == nil || grant.Operation() != gate.operation || grant.Group() != gate.group || grant.Member() != gate.member ||
+		grant.Node() != gate.node || grant.Store() != gate.store ||
+		grant.NodeIncarnation() != gate.nodeIncarnation || grant.Digest() == ([32]byte{}) {
+		return ErrRestoreServingControl
+	}
+	next := &restoreServingPublication{digest: grant.Digest()}
+	for {
+		current := gate.active.Load()
+		if current != nil {
+			if current.digest == next.digest {
+				return nil
+			}
+			return ErrRestoreServingControl
+		}
+		if gate.active.CompareAndSwap(nil, next) {
+			return nil
+		}
+	}
+}
+
+func (gate *RestoreServingGate) Allows(state raftservice.ServingState) bool {
+	return gate != nil && gate.active.Load() != nil && state.Identity.Group == gate.group &&
+		state.Identity.MemberID == gate.member && state.Identity.StoreID == gate.store &&
+		state.Identity.NodeIncarnation == gate.nodeIncarnation
+}
+
+type RestoreServingControlService struct {
+	gates         map[raftmember.GroupKey]*RestoreServingGate
+	policy        *serviceauthz.Policy
+	readDeadline  rafttransport.DeadlineFunc
+	writeDeadline rafttransport.DeadlineFunc
+}
+
+func NewRestoreServingControlService(gate *RestoreServingGate, policy *serviceauthz.Policy,
+	readDeadline, writeDeadline rafttransport.DeadlineFunc,
+) (*RestoreServingControlService, error) {
+	return NewRestoreServingControlRegistryService(
+		[]*RestoreServingGate{gate}, policy, readDeadline, writeDeadline,
+	)
+}
+
+// NewRestoreServingControlRegistryService multiplexes transient grants for all
+// restored groups hosted by one process without weakening their exact group
+// and member bindings.
+func NewRestoreServingControlRegistryService(gates []*RestoreServingGate,
+	policy *serviceauthz.Policy, readDeadline, writeDeadline rafttransport.DeadlineFunc,
+) (*RestoreServingControlService, error) {
+	if len(gates) == 0 || policy == nil || readDeadline == nil || writeDeadline == nil ||
+		len(policy.NodesWith(serviceauthz.CapabilityRestoreActivate)) == 0 {
+		return nil, ErrRestoreServingControl
+	}
+	registry := make(map[raftmember.GroupKey]*RestoreServingGate, len(gates))
+	for _, gate := range gates {
+		if gate == nil || gate.group == (raftmember.GroupKey{}) {
+			return nil, ErrRestoreServingControl
+		}
+		if _, duplicate := registry[gate.group]; duplicate {
+			return nil, ErrRestoreServingControl
+		}
+		registry[gate.group] = gate
+	}
+	return &RestoreServingControlService{gates: registry, policy: policy,
+		readDeadline: readDeadline, writeDeadline: writeDeadline}, nil
+}
+
+func (service *RestoreServingControlService) Serve(ctx context.Context,
+	connection rafttransport.PeerConnection,
+) error {
+	if service == nil || ctx == nil || connection == nil ||
+		connection.TrafficClass() != rafttransport.TrafficShardControl {
+		return ErrRestoreServingUnauthorized
+	}
+	if deadline := boundedMembershipGrantDeadline(ctx, service.readDeadline()); deadline.IsZero() {
+		return ErrRestoreServingControl
+	} else if err := connection.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	var raw [clusterrestore.ServingGrantBytes]byte
+	if _, err := io.ReadFull(connection, raw[:]); err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	grant, err := clusterrestore.OpenServingGrant(raw[:])
+	if err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	peer := connection.PeerIdentity()
+	wantDomain := rafttransport.TrustDomain{ClusterID: grant.Group().ClusterID,
+		ClusterIncarnation: grant.Group().ClusterIncarnation}
+	if peer.TrustDomain != wantDomain || service.policy.Check(peer.Node,
+		serviceauthz.CapabilityRestoreActivate) != serviceauthz.DecisionAllow {
+		return ErrRestoreServingUnauthorized
+	}
+	gate, found := service.gates[grant.Group()]
+	if !found {
+		return ErrRestoreServingControl
+	}
+	if grant.Operation() != gate.operation || grant.Member() != gate.member || grant.Node() != gate.node || grant.Store() != gate.store {
+		return ErrRestoreServingControl
+	}
+	expected, err := grant.ForObservedIncarnation(gate.nodeIncarnation)
+	if err != nil {
+		return ErrRestoreServingControl
+	}
+	// The first message grants nothing. Observe the exact durable process
+	// incarnation, then require a second message bound to that incarnation.
+	// A delayed final message from a prior process can never open this gate.
+	if deadline := boundedMembershipGrantDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
+		return ErrRestoreServingControl
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	var observation [restoreServingObservationBytes]byte
+	copy(observation[:8], restoreServingObservationMagic[:])
+	binary.BigEndian.PutUint64(observation[8:16], gate.nodeIncarnation)
+	initialDigest := grant.Digest()
+	copy(observation[16:], initialDigest[:])
+	if err := writeMembershipGrantFull(connection, observation[:]); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(connection, raw[:]); err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	grant, err = clusterrestore.OpenServingGrant(raw[:])
+	if err != nil || grant.Digest() != expected.Digest() {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	if err := gate.Install(grant); err != nil {
+		return err
+	}
+	if deadline := boundedMembershipGrantDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
+		return ErrRestoreServingUnknown
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	var response [restoreServingResponseBytes]byte
+	copy(response[:8], restoreServingResponseMagic[:])
+	digest := grant.Digest()
+	copy(response[8:], digest[:])
+	if err := writeMembershipGrantFull(connection, response[:]); err != nil {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	return nil
+}
+
+type RestoreServingControlClient struct {
+	opener        MembershipGrantControlStreamOpener
+	readDeadline  rafttransport.DeadlineFunc
+	writeDeadline rafttransport.DeadlineFunc
+}
+
+func NewRestoreServingControlClient(opener MembershipGrantControlStreamOpener,
+	readDeadline, writeDeadline rafttransport.DeadlineFunc,
+) (*RestoreServingControlClient, error) {
+	if opener == nil || readDeadline == nil || writeDeadline == nil {
+		return nil, ErrRestoreServingControl
+	}
+	return &RestoreServingControlClient{opener: opener,
+		readDeadline: readDeadline, writeDeadline: writeDeadline}, nil
+}
+
+func (client *RestoreServingControlClient) Install(ctx context.Context,
+	target rafttransport.NodeID, grant clusterrestore.ServingGrant,
+) error {
+	if client == nil || ctx == nil || target == (rafttransport.NodeID{}) || target != grant.Node() {
+		return ErrRestoreServingControl
+	}
+	connection, err := client.opener.OpenShardControl(ctx, target)
+	if err != nil || connection == nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
+	peer := connection.PeerIdentity()
+	wantDomain := rafttransport.TrustDomain{ClusterID: grant.Group().ClusterID,
+		ClusterIncarnation: grant.Group().ClusterIncarnation}
+	if connection.TrafficClass() != rafttransport.TrafficShardControl ||
+		peer.Node != target || peer.TrustDomain != wantDomain {
+		return ErrRestoreServingUnauthorized
+	}
+	if deadline := boundedMembershipGrantDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
+		return ErrRestoreServingControl
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	raw, err := clusterrestore.AppendServingGrant(nil, grant)
+	if err != nil {
+		return err
+	}
+	if err = writeMembershipGrantFull(connection, raw); err != nil {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	if deadline := boundedMembershipGrantDeadline(ctx, client.readDeadline()); deadline.IsZero() {
+		return ErrRestoreServingUnknown
+	} else if err := connection.SetReadDeadline(deadline); err != nil {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	var observation [restoreServingObservationBytes]byte
+	initialDigest := grant.Digest()
+	if _, err = io.ReadFull(connection, observation[:]); err != nil ||
+		!bytes.Equal(observation[:8], restoreServingObservationMagic[:]) ||
+		[32]byte(observation[16:]) != initialDigest {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	grant, err = grant.ForObservedIncarnation(binary.BigEndian.Uint64(observation[8:16]))
+	if err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	raw, err = clusterrestore.AppendServingGrant(raw[:0], grant)
+	if err != nil {
+		return errors.Join(ErrRestoreServingControl, err)
+	}
+	if deadline := boundedMembershipGrantDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
+		return ErrRestoreServingControl
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	if err := writeMembershipGrantFull(connection, raw); err != nil {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	var response [restoreServingResponseBytes]byte
+	if _, err = io.ReadFull(connection, response[:]); err != nil ||
+		!bytes.Equal(response[:8], restoreServingResponseMagic[:]) ||
+		[32]byte(response[8:]) != grant.Digest() {
+		return errors.Join(ErrRestoreServingUnknown, err)
+	}
+	return nil
+}

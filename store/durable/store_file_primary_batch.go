@@ -8,7 +8,6 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
-	vibejson "github.com/thesyncim/vibejson"
 )
 
 // ErrPrimaryBatchUnsupportedLane reports an Update on an ordered-primary
@@ -452,6 +451,9 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 	c.batchPrimaryLeaves = c.batchPrimaryLeaves[:0]
 	c.batchPrimaryMutations = c.batchPrimaryMutations[:0]
 	c.batchJournalEntries = c.batchJournalEntries[:0]
+	if err := c.canonicalizePrimaryBatchValues(batch); err != nil {
+		return err
+	}
 	for ei := range batch.entries {
 		entry := batch.entries[ei]
 		key := batch.key(entry)
@@ -464,14 +466,6 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 			value = batch.value(entry)
 			if len(value) == 0 || len(value) > c.options.MaxDocumentBytes {
 				return ErrDocumentTooLarge
-			}
-			if !c.options.OpaqueValues {
-				if err := vibejson.Validate(value); err != nil {
-					return err
-				}
-				if err := c.validatePrimarySchema(value); err != nil {
-					return err
-				}
 			}
 		}
 		resident, err := c.currentPrimaryResidentRoute(state, key)

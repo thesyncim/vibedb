@@ -150,16 +150,20 @@ func testReplicatedApplyCommandValue(
 }
 
 func testReplicatedApplySessionOpen(identity ReplicatedShardStoreIdentity) []byte {
+	encoded, err := replication.AppendCommand(nil, testReplicatedApplySessionOpenValue(identity))
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func testReplicatedApplySessionOpenValue(identity ReplicatedShardStoreIdentity) replication.Command {
 	command := testReplicatedApplyCommandValue(identity, 0, 1, nil)
 	command.Kind = replication.CommandSessionOpen
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	command.Fingerprint = sha256.Sum256([]byte("driver/test-session-open"))
 	command.Batches = nil
-	encoded, err := replication.AppendCommand(nil, command)
-	if err != nil {
-		panic(err)
-	}
-	return encoded
+	return command
 }
 
 func applyReplicatedApplySessionOpen(
@@ -169,7 +173,11 @@ func applyReplicatedApplySessionOpen(
 	index uint64,
 ) uint64 {
 	t.Helper()
-	command := testReplicatedApplySessionOpen(identity)
+	return applyReplicatedApplySessionOpenCommand(t, claim, testReplicatedApplySessionOpen(identity), index)
+}
+
+func applyReplicatedApplySessionOpenCommand(t *testing.T, claim *ReplicatedApply, command []byte, index uint64) uint64 {
+	t.Helper()
 	if err := claim.AdmitCommand(command); err != nil {
 		t.Fatalf("AdmitCommand session open at %d: %v", index, err)
 	}
@@ -382,6 +390,40 @@ func TestReplicatedApplyAuthenticatesAndMaintainsNativeExactIndexes(t *testing.T
 	}
 }
 
+func testReplicatedGlobalIndexKey(t *testing.T, relation ReplicatedShardRelationIdentity, value string) []byte {
+	t.Helper()
+	key, err := distribution.CurrentTupleCodec.AppendTuple(nil, []distribution.Scalar{distribution.NewString(value)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := relation.GlobalIndexStorageKeyPoint(key); !ok {
+		t.Fatalf("fixture global key is invalid for retained relation: %x", key)
+	}
+	return key
+}
+
+func TestReplicatedGlobalIndexFixtureKeyPreflight(t *testing.T) {
+	relation := ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
+		IndexID: 41, Incarnation: 7, LocatorCount: 1, Unique: true,
+		KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		BucketBits: distribution.DefaultVirtualBucketBits,
+	}
+	validator := replicatedGlobalIndexMutationValidator{
+		relation: relation, placement: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+	}
+	for _, value := range []string{"a", "restore@example"} {
+		key := testReplicatedGlobalIndexKey(t, relation, value)
+		if got := validator.ValidatePut(key, nil); got != replicatedstate.MutationValidationAccept {
+			t.Fatalf("canonical key %x rejected: %v", key, got)
+		}
+	}
+	if got := validator.ValidatePut([]byte{0x91, 0x01, 'a'}, nil); got != replicatedstate.MutationValidationInvalid {
+		t.Fatalf("obsolete handwritten key accepted: %v", got)
+	}
+}
+
 func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testing.T) {
 	path, database, binding, _ := prepareReplicatedTestRoot(t, "global-relation-bundle", false)
 	session, err := database.NewSession(context.Background())
@@ -403,6 +445,10 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		binding, "docs", []ReplicatedGlobalIndexRelation{{
 			Relation: 2, Table: "email_claims", IndexID: 41,
 			Incarnation: 7, LocatorCount: 1, Unique: true,
+			KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
 	skipReplicatedStrictAllocationUnsupported(t, database, base, err)
@@ -434,7 +480,7 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	document := []byte(`{"email":"a","id":"doc-1"}`)
 	baseKey := testReplicatedApplyKey(t, database, document)
-	globalKey := []byte{0x91, 0x01, 'a'}
+	globalKey := testReplicatedGlobalIndexKey(t, base.Relations[1], "a")
 	locator := []byte(`["doc-1"]`)
 	commandValue := testReplicatedApplyCommandValue(base, epoch, 2, nil)
 	commandValue.Fingerprint = sha256.Sum256([]byte("sql-global-relation-bundle-put"))
@@ -483,6 +529,31 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		!bytes.Equal(value, locator) {
 		t.Fatalf("global value = %q,%v,%v", value, found, err)
 	}
+	splitPlan := [sha256.Size]byte{1}
+	placementCut, err := claim.machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPlacementState := placementCut.State().RelationPlacementDigest
+	firstPlacementProof, proofErr := placementCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, splitPlan,
+	)
+	badRange := options.Placement.Range
+	badRange.Start[7]++
+	_, badRangeErr := placementCut.GlobalIndexPlacementProof(2, badRange, splitPlan)
+	_, zeroPlanErr := placementCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, [sha256.Size]byte{},
+	)
+	placementCloseErr := placementCut.Close()
+	if proofErr != nil || firstPlacementState == ([sha256.Size]byte{}) ||
+		firstPlacementProof == ([sha256.Size]byte{}) || badRangeErr == nil ||
+		zeroPlanErr == nil || placementCloseErr != nil {
+		t.Fatalf(
+			"global placement proof=%x state=%x proofErr=%v badRange=%v zeroPlan=%v close=%v",
+			firstPlacementProof, firstPlacementState, proofErr, badRangeErr, zeroPlanErr,
+			placementCloseErr,
+		)
+	}
 
 	conflictDocument := []byte(`{"email":"a","id":"doc-2"}`)
 	conflictKey := testReplicatedApplyKey(t, database, conflictDocument)
@@ -506,6 +577,23 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	if got := completionResultCode(t, claim, conflict); got != replicatedstate.ResultIndexConflict {
 		t.Fatalf("conflict result = %d", got)
+	}
+	conflictCut, err := claim.machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPlacementState := conflictCut.State().RelationPlacementDigest
+	secondPlacementProof, proofErr := conflictCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, splitPlan,
+	)
+	conflictCloseErr := conflictCut.Close()
+	if proofErr != nil || conflictCloseErr != nil ||
+		secondPlacementState != firstPlacementState ||
+		secondPlacementProof == firstPlacementProof {
+		t.Fatalf(
+			"conflict placement proof=%x state=%x proofErr=%v close=%v",
+			secondPlacementProof, secondPlacementState, proofErr, conflictCloseErr,
+		)
 	}
 	if _, found, err := baseCollection.AppendRaw(nil, conflictKey); err != nil || found {
 		t.Fatalf("conflicting base row escaped atomic bundle: found=%v err=%v", found, err)
@@ -622,6 +710,20 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	if reopenedGroup == nil || reopenedGroup.CheckpointAppliedIndex() != 4 {
 		t.Fatalf("reopened checkpoint cut = %v", reopenedGroup)
 	}
+	reopenedCut, err := reopenedClaim.machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedProof, proofErr := reopenedCut.GlobalIndexPlacementProof(
+		2, options.Placement.Range, splitPlan,
+	)
+	reopenedCloseErr := reopenedCut.Close()
+	if proofErr != nil || reopenedCloseErr != nil || reopenedProof != secondPlacementProof {
+		t.Fatalf(
+			"reopened placement proof=%x want=%x proofErr=%v close=%v",
+			reopenedProof, secondPlacementProof, proofErr, reopenedCloseErr,
+		)
+	}
 	recoveredCapture, err := reopenedClaim.BeginRangeSplitCapture(
 		replicatedApplyCapturePartitioner(t, base),
 	)
@@ -722,19 +824,28 @@ func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *tes
 	advanced.Binding.Authority.OwnershipEpoch = state.Binding.OwnershipEpoch
 	advanced.Binding.Authority.RoutingVersion = state.Binding.RoutingVersion
 	advanced.Binding.Authority.RouteGeneration = state.Binding.RouteGeneration
-	epoch := applyReplicatedApplySessionOpen(t, claim, advanced, 4)
-	outsidePut := testReplicatedApplyCommand(advanced, epoch, 2, replication.Mutation{
+	appendAtCut := func(command replication.Command) []byte {
+		command.ReplicaSetVersion = state.ReplicaSetVersion
+		encoded, err := replication.AppendCommand(nil, command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	epoch := applyReplicatedApplySessionOpenCommand(t, claim,
+		appendAtCut(testReplicatedApplySessionOpenValue(advanced)), 4)
+	outsidePut := appendAtCut(testReplicatedApplyCommandValue(advanced, epoch, 2, []replication.Mutation{{
 		Kind: replication.MutationPut, Key: outside.key, Value: outside.document,
-	})
+	}}))
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), outsidePut); err != nil {
 		t.Fatal(err)
 	}
 	if code := completionResultCode(t, claim, outsidePut); code != replicatedstate.ResultWrongShard {
 		t.Fatalf("post-cutover outside put = %d, want ResultWrongShard", code)
 	}
-	insidePut := testReplicatedApplyCommand(advanced, epoch, 3, replication.Mutation{
+	insidePut := appendAtCut(testReplicatedApplyCommandValue(advanced, epoch, 3, []replication.Mutation{{
 		Kind: replication.MutationPut, Key: below.key, Value: below.document,
-	})
+	}}))
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(6), insidePut); err != nil {
 		t.Fatal(err)
 	}
@@ -950,7 +1061,6 @@ func TestReplicatedApplyMaximumRetryWindowCreatesAndReopens(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "maximum-retry-window")
 	options := testReplicatedApplyOptions()
 	options.RetryWindow = replicatedstate.MaxSessionRetryWindow
-	limits := replicatedApplySystemLimits(options.RetryWindow)
 	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
 		base.UserLimits.MaxBatchDocuments, options.RetryWindow, true,
 	)
@@ -958,7 +1068,8 @@ func TestReplicatedApplyMaximumRetryWindowCreatesAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	options.TxnLimits.MaxDocuments = maxDocuments
-	if limits.MaxBatchDocuments != int(replicatedstate.MaxSessionRetryWindow)+2 ||
+	limits := replicatedApplyTransactionSystemLimits(base, options.RetryWindow, false, maxDocuments)
+	if limits.MaxBatchDocuments != 2*int(replicatedstate.MaxSessionRetryWindow)+2 ||
 		limits.MaxBatchBytes < limits.MaxDocumentBytes+limits.MaxBatchDocuments*limits.MaxKeyBytes {
 		t.Fatalf("maximum retry-window system limits = %+v", limits)
 	}
@@ -1035,7 +1146,7 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) ||
 		identity.TxnLimits != options.TxnLimits || identity.MaxSessions != options.MaxSessions ||
 		identity.RetryWindow != options.RetryWindow ||
-		identity.Sidecars != canonicalReplicatedApplySidecars() {
+		identity.Sidecars != canonicalReplicatedApplySidecarsForLimits(identity.SystemLimits) {
 		t.Fatalf("apply identity = %+v", identity)
 	}
 	if got, err := claim.Identity(); err != nil || got != identity {
@@ -1045,9 +1156,9 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	core.mu.RLock()
 	hiddenPath := core.replicatedApplyPath(core.catalog.ReplicatedApply)
 	if core.catalog.ReplicatedApply == nil || core.replicatedApplyCollection == nil ||
-		core.catalog.ReplicatedApply.Sidecars != canonicalReplicatedApplySidecars() ||
+		core.catalog.ReplicatedApply.Sidecars != canonicalReplicatedApplySidecarsForLimits(identity.SystemLimits) ||
 		core.replicatedApplyCollection.SealedRecoveryJournalBytes() !=
-			ReplicatedSystemRecoveryJournalBytes ||
+			identity.Sidecars.SystemRecoveryJournalBytes ||
 		len(core.catalog.Tables) != 1 || core.tables["docs"] == nil {
 		core.mu.RUnlock()
 		t.Fatal("activation did not retain one visible table plus hidden participant")
@@ -2690,7 +2801,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		},
 	}
 	got := replicatedApplyProfileDigest(identity, placement)
-	const wantDigest = "885cdd7ffa5c04b7d2f1d8872b1a163be260c71038ea66ecf62b7b43a8be25b7"
+	const wantDigest = "e73ccecc7f49f4d42b76efe9cc3be63f5bd3c55fd2307dc36ff4f97bf1ef7c32"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
 		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
@@ -2773,7 +2884,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"format":0,"storage":"storage","capture_storage":"capture","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":35,"max_document_bytes":2048,"max_batch_documents":10,"max_batch_bytes":3108},"capture_limits":{"max_key_bytes":8,"max_document_bytes":4096,"max_batch_documents":1,"max_batch_bytes":4104},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
+	const want = `{"format":0,"storage":"storage","capture_storage":"capture","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":49,"max_document_bytes":2048,"max_batch_documents":18,"max_batch_bytes":3592},"capture_limits":{"max_key_bytes":8,"max_document_bytes":4096,"max_batch_documents":1,"max_batch_bytes":4104},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"request_ledger_capacity_bytes":0,"request_ledger_cleanup_reserve_bytes":0,"request_ledger_range_start":"0000000000000000000000000000000000000000000000000000000000000000","request_ledger_range_end":"0000000000000000000000000000000000000000000000000000000000000000","request_ledger_range_identity":"0000000000000000000000000000000000000000000000000000000000000000","placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
 	if string(encoded) != want {
 		t.Fatalf("identity JSON = %s, want %s", encoded, want)
 	}
@@ -2797,8 +2908,8 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	}
 	invalidMaximum := bytes.Replace(
 		maximumEncoded,
-		[]byte(`"max_batch_documents":258`),
-		[]byte(`"max_batch_documents":257`),
+		[]byte(`"max_batch_documents":514`),
+		[]byte(`"max_batch_documents":513`),
 		1,
 	)
 	if bytes.Equal(invalidMaximum, maximumEncoded) {
@@ -2904,6 +3015,10 @@ func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(
 	if err != nil || capture.Head() != 2 {
 		t.Fatalf("recovered header-only capture head=%d err=%v", capture.Head(), err)
 	}
+	ancestor, err := capture.Descriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
 	document := []byte(`{"id":"capture","value":1}`)
 	key := testReplicatedApplyKey(t, database, document)
 	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
@@ -2933,6 +3048,32 @@ func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(
 	recovered, err := reopenedClaim.BeginRangeSplitCapture(partitioner)
 	if err != nil || recovered.Head() != 3 {
 		t.Fatalf("recovered capture head=%d err=%v", recovered.Head(), err)
+	}
+	cut, err := reopenedClaim.RangeSplitSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := cut.State()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if head, err := reopenedClaim.RangeSplitCaptureHeadAt(state, ancestor); err != nil || head != 3 {
+		t.Fatalf("lagging controller descriptor did not recover the exact live head: head=%d err=%v", head, err)
+	}
+	for _, mutate := range []func(*replicatedstate.State){
+		func(s *replicatedstate.State) { s.Applied-- },
+		func(s *replicatedstate.State) { s.LastEntryDigest[0]++ },
+		func(s *replicatedstate.State) { s.Binding.OwnershipEpoch++ },
+	} {
+		forged := state
+		mutate(&forged)
+		if _, err := reopenedClaim.RangeSplitCaptureHeadAt(forged, ancestor); err == nil {
+			t.Fatal("mixed source/capture cut was accepted")
+		}
+	}
+	ancestor.Head.EntryDigest[0]++
+	if _, err := reopenedClaim.RangeSplitCaptureHeadAt(state, ancestor); err == nil {
+		t.Fatal("forged controller descriptor was accepted")
 	}
 }
 
@@ -3025,6 +3166,10 @@ func TestReplicatedApplyTransactionByteFloorIsMandatoryAndExact(t *testing.T) {
 		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
 		Table: "email_index", Storage: base.UserStorage, Limits: base.UserLimits,
 		IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
+		KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion:  distribution.CurrentTupleVersion,
+		MapperVersion: distribution.NativeMapperVersion,
+		BucketBits:    distribution.DefaultVirtualBucketBits,
 	}
 	core.mu.RUnlock()
 	base.RelationManifestDigest = replicatedRelationManifestDigest(base)
@@ -3040,12 +3185,13 @@ func TestReplicatedApplyTransactionByteFloorIsMandatoryAndExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes) +
+	systemLimits := replicatedApplyTransactionSystemLimits(base, options.RetryWindow, false, options.TxnLimits.MaxDocuments)
+	want := int64(systemLimits.MaxBatchBytes) +
 		int64(captureLimits.MaxBatchBytes)
 	for ordinal := 0; ordinal < int(base.RelationCount); ordinal++ {
 		want = min(
 			int64(replication.MaxCommandBytes)+
-				int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes)+
+				int64(systemLimits.MaxBatchBytes)+
 				int64(captureLimits.MaxBatchBytes),
 			want+int64(base.Relations[ordinal].Limits.MaxBatchBytes),
 		)

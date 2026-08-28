@@ -370,10 +370,12 @@ type BoundWritePlan struct {
 	constraints distribution.BoundConstraints
 	rowKeys     [][]distribution.Scalar
 	// insertDoc borrows the exact whole-document operand for a single-row INSERT.
-	// It is nil for flat and multi-row INSERTs. Keeping one slice header in the
-	// bound plan avoids adding an allocation to the ordinary write lane while the
-	// RF3 lowering consumes the document without another JSON representation.
-	insertDoc []byte
+	// insertDocs borrows every operand for a multi-row whole-document INSERT.
+	// Keeping the singleton inline avoids another allocation on the ordinary
+	// write lane; the multi-row lane allocates only its already-bounded slice of
+	// byte views and never creates a second JSON representation.
+	insertDoc  []byte
+	insertDocs [][]byte
 	// keyPointers holds one compiled shard-key pointer per ordinal for a
 	// whole-document insert or UPDATE; it is nil otherwise.
 	keyPointers []vibejson.CompiledPointer
@@ -437,12 +439,13 @@ func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
 	}
 	switch p.statement.Kind {
 	case sqlast.KindInsert:
-		keys, document, err := p.bindInsertRowKeys(args)
+		keys, document, documents, err := p.bindInsertRowKeys(args)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
 		}
 		bound.rowKeys = keys
 		bound.insertDoc = document
+		bound.insertDocs = documents
 		if err := p.bindGlobalIndexInserts(bound, args); err != nil {
 			return nil, err
 		}
@@ -702,13 +705,18 @@ func sameWriteTarget(a, b distribution.Target) bool {
 // error: the row cannot be proven single-shard.
 func (p *PreparedPlan) bindInsertRowKeys(
 	args []any,
-) ([][]distribution.Scalar, []byte, error) {
+) ([][]distribution.Scalar, []byte, [][]byte, error) {
 	ins := p.statement.Insert
 	if ins == nil {
-		return nil, nil, errors.New("insert has no statement body")
+		return nil, nil, nil, errors.New("insert has no statement body")
 	}
 	keys := make([][]distribution.Scalar, len(ins.Rows))
 	var doc, singleDocument []byte
+	var documents [][]byte
+	var indexEntries []vibejson.IndexEntry
+	if len(ins.Columns) == 0 && len(ins.Rows) > 1 {
+		documents = make([][]byte, len(ins.Rows))
+	}
 	for i, row := range ins.Rows {
 		var (
 			key []distribution.Scalar
@@ -717,14 +725,16 @@ func (p *PreparedPlan) bindInsertRowKeys(
 		if len(ins.Columns) == 0 {
 			doc, err = writeOperandDocument(row.Values[0], args)
 			if err != nil {
-				return nil, nil, fmt.Errorf("row %d: %w", i, err)
+				return nil, nil, nil, fmt.Errorf("row %d: %w", i, err)
 			}
 			if len(ins.Rows) == 1 {
 				singleDocument = doc
+			} else {
+				documents[i] = doc
 			}
-			key, err = writeDocShardKey(doc, p.writeKeyPointers)
+			key, indexEntries, err = writeDocShardKeyWorkspace(doc, p.writeKeyPointers, indexEntries)
 			if err != nil {
-				return nil, nil, fmt.Errorf("row %d: %w", i, err)
+				return nil, nil, nil, fmt.Errorf("row %d: %w", i, err)
 			}
 		} else {
 			key = make([]distribution.Scalar, 0, len(p.writeKeyColumns))
@@ -732,14 +742,14 @@ func (p *PreparedPlan) bindInsertRowKeys(
 				value := writeOperandValue(row.Values[colIdx], args)
 				scalar, err := writeScalarFromValue(value)
 				if err != nil {
-					return nil, nil, fmt.Errorf("row %d: shard-key column ordinal %d: %w", i, ordinal, err)
+					return nil, nil, nil, fmt.Errorf("row %d: shard-key column ordinal %d: %w", i, ordinal, err)
 				}
 				key = append(key, scalar)
 			}
 		}
 		keys[i] = key
 	}
-	return keys, singleDocument, nil
+	return keys, singleDocument, documents, nil
 }
 
 // writeOperandDocument returns the JSON document bytes an insert operand
@@ -830,14 +840,31 @@ func writeScalarFromValue(value any) (distribution.Scalar, error) {
 // writeDocShardKey reads every shard-key pointer out of one JSON document,
 // mirroring the driver's primary-key extraction: a missing, null, or
 // non-scalar value is a routing error.
-func writeDocShardKey(doc []byte, pointers []vibejson.CompiledPointer) ([]distribution.Scalar, error) {
+func writeDocShardKey(
+	doc []byte,
+	pointers []vibejson.CompiledPointer,
+) ([]distribution.Scalar, error) {
+	key, _, err := writeDocShardKeyWorkspace(doc, pointers, nil)
+	return key, err
+}
+
+func writeDocShardKeyWorkspace(
+	doc []byte,
+	pointers []vibejson.CompiledPointer,
+	entries []vibejson.IndexEntry,
+) ([]distribution.Scalar, []vibejson.IndexEntry, error) {
 	needed, err := vibejson.RequiredIndexEntries(doc)
 	if err != nil {
-		return nil, fmt.Errorf("invalid JSON document: %w", err)
+		return nil, entries, fmt.Errorf("invalid JSON document: %w", err)
 	}
-	index, err := vibejson.BuildIndex(doc, make([]vibejson.IndexEntry, needed))
+	if cap(entries) < needed {
+		entries = make([]vibejson.IndexEntry, needed)
+	} else {
+		entries = entries[:needed]
+	}
+	index, err := vibejson.BuildIndex(doc, entries)
 	if err != nil {
-		return nil, fmt.Errorf("invalid JSON document: %w", err)
+		return nil, entries, fmt.Errorf("invalid JSON document: %w", err)
 	}
 	root := index.Root()
 	key := make([]distribution.Scalar, 0, len(pointers))
@@ -845,14 +872,14 @@ func writeDocShardKey(doc []byte, pointers []vibejson.CompiledPointer) ([]distri
 	for i, ptr := range pointers {
 		node, found, err := root.PointerCompiled(ptr)
 		if err != nil {
-			return nil, fmt.Errorf("shard-key column %d: %w", i, err)
+			return nil, entries, fmt.Errorf("shard-key column %d: %w", i, err)
 		}
 		if !found {
-			return nil, fmt.Errorf("shard-key column %d is missing", i)
+			return nil, entries, fmt.Errorf("shard-key column %d is missing", i)
 		}
 		value := node.Raw()
 		if value.IsNull() {
-			return nil, fmt.Errorf("shard-key column %d is null", i)
+			return nil, entries, fmt.Errorf("shard-key column %d is null", i)
 		}
 		switch value.Kind() {
 		case jsondoc.String:
@@ -866,25 +893,25 @@ func writeDocShardKey(doc []byte, pointers []vibejson.CompiledPointer) ([]distri
 			start := len(scratch)
 			scratch, ok, err := value.AppendText(scratch)
 			if err != nil {
-				return nil, fmt.Errorf("shard-key column %d has an invalid JSON string: %w", i, err)
+				return nil, entries, fmt.Errorf("shard-key column %d has an invalid JSON string: %w", i, err)
 			}
 			if !ok {
-				return nil, fmt.Errorf("shard-key column %d has an invalid JSON string", i)
+				return nil, entries, fmt.Errorf("shard-key column %d has an invalid JSON string", i)
 			}
 			key = append(key, distribution.NewString(byteview.String(scratch[start:])))
 		case jsondoc.Number:
 			number, ok := value.NumberText()
 			if !ok {
-				return nil, fmt.Errorf("shard-key column %d is not a valid JSON number", i)
+				return nil, entries, fmt.Errorf("shard-key column %d is not a valid JSON number", i)
 			}
 			scalar, err := distribution.NewNumber(number)
 			if err != nil {
-				return nil, fmt.Errorf("shard-key column %d: %w", i, err)
+				return nil, entries, fmt.Errorf("shard-key column %d: %w", i, err)
 			}
 			key = append(key, scalar)
 		default:
-			return nil, fmt.Errorf("shard-key column %d must be a JSON string or number", i)
+			return nil, entries, fmt.Errorf("shard-key column %d must be a JSON string or number", i)
 		}
 	}
-	return key, nil
+	return key, entries, nil
 }

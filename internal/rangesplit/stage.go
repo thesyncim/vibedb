@@ -14,17 +14,17 @@ import (
 
 var (
 	ErrChildStage = errors.New("rangesplit: invalid child stage")
-	// ErrChildStageOutcomeUnknown means that destination rows are durable but
-	// cursor replacement did not return a definite outcome. Reopen the cursor
-	// store or retry the exact artifact range or tail batch.
+	// ErrChildStageOutcomeUnknown means cursor replacement did not return a
+	// definite outcome. An uncertain preimage receipt requires reopening the
+	// cursor store before any tail writes; later failures allow exact replay.
 	ErrChildStageOutcomeUnknown = errors.New("rangesplit: child stage cursor outcome unknown")
 )
 
 const DefaultChildStageCheckpointBytes = 64 << 20
 
 // ChildStageCursorPersistence must durably replace the cursor before it
-// returns. raw is borrowed for the call. The stage orders destination updates
-// before cursor persistence, so recovery can replay an uncheckpointed prefix.
+// returns. raw is borrowed for the call. Tail preimage receipts precede all
+// destination writes; completed cursors follow synchronous destination writes.
 type ChildStageCursorPersistence func(raw []byte) error
 
 // ChildStageOptions bounds artifact bytes that a crash can replay. Zero uses
@@ -45,11 +45,18 @@ type ChildStage struct {
 	expected    ChildArtifactManifest
 	collection  *durable.Collection
 	cursor      *ChildStageCursor
-	// sealedVerified records the full image proof performed either while the
-	// sealed cursor was reopened or immediately before that cursor was durably
-	// published. Activation reuses this authenticated proof instead of scanning
-	// the same child-stage image a second time.
+	// A receipt-save error requires an actual persisted-cursor reload. A
+	// successful later callback cannot establish what an earlier failure saved.
+	cursorUncertain bool
+	// sealedVerified records either the incremental proof completed at seal or
+	// the full recovery audit performed while reopening a sealed cursor.
+	// Activation reuses that proof instead of scanning the image again.
 	sealedVerified bool
+	// sealedRoot is the order-independent logical image root authenticated by
+	// imageDigest. sealedIdentity fences that proof to the exact durable store
+	// generation and rooted physical graph through activation.
+	sealedRoot     [sha256.Size]byte
+	sealedIdentity durable.ImageIdentity
 
 	checkpointBytes uint64
 	persistedOffset uint64
@@ -97,7 +104,7 @@ func NewChildStageWithOptions(
 	var err error
 	if len(persistedCursor) != 0 {
 		cursor, err = OpenChildStageCursor(persistedCursor)
-		if err != nil || !childStageCursorMatchesExpected(cursor, expected) {
+		if err != nil || !childStageCursorMatchesExpected(partitioner, cursor, expected) {
 			return nil, ErrChildStage
 		}
 	}
@@ -116,7 +123,14 @@ func NewChildStageWithOptions(
 		if cursor.phase == ChildStageSealed && stage.verifySealedImage(cursor) != nil {
 			return nil, ErrChildStage
 		}
-		stage.sealedVerified = cursor.phase == ChildStageSealed
+		if cursor.phase == ChildStageSealed {
+			identity, ok := collection.DurableImageIdentity()
+			if !ok {
+				return nil, ErrChildStage
+			}
+			stage.sealedIdentity = identity
+			stage.sealedVerified = true
+		}
 	}
 	return stage, nil
 }
@@ -201,6 +215,9 @@ func (s *ChildStage) ReceiveArtifact(
 			if err := s.applyArtifactRows(rows); err != nil {
 				return err
 			}
+			if err := s.accumulateArtifactRows(&working, rows); err != nil {
+				return err
+			}
 			working.artifactChunks++
 			working.artifactRows = verifiedRows
 			working.artifactPayload = verifiedPayload
@@ -238,6 +255,9 @@ func (s *ChildStage) ReceiveArtifact(
 	tail.artifactPayload = s.expected.PayloadBytes
 	tail.artifactOffset = s.expected.EncodedBytes
 	tail.lastChunkDigest = s.expected.LastChunkDigest
+	tail.imageRows = working.imageRows
+	tail.imageBytes = working.imageBytes
+	tail.imageDigest = working.imageDigest
 	if err := s.persistCursor(&tail, persist); err != nil {
 		return ChildArtifactManifest{}, err
 	}
@@ -245,8 +265,9 @@ func (s *ChildStage) ReceiveArtifact(
 }
 
 // ApplyTailBatch applies one exact child batch and then advances the durable
-// cursor. An exact retry is a no-op. A failed cursor persistence leaves a safe
-// idempotent replay because the collection remains non-serving and serial.
+// cursor. Before changing rows it verifies their preimages and durably records
+// the exact batch receipt. Recovery can replay only that entry's before/after
+// images while the child remains non-serving and serial.
 func (s *ChildStage) ApplyTailBatch(
 	batch TailBatch,
 	persist ChildStageCursorPersistence,
@@ -256,6 +277,9 @@ func (s *ChildStage) ApplyTailBatch(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.cursorUncertain {
+		return ErrChildStageOutcomeUnknown
+	}
 	if s.cursor == nil ||
 		(s.cursor.phase != ChildStageTail && s.cursor.phase != ChildStageSealed) ||
 		s.partitioner.VerifyTailBatch(batch, &s.tailVerify) != nil ||
@@ -265,6 +289,9 @@ func (s *ChildStage) ApplyTailBatch(
 		return ErrChildStage
 	}
 	current := s.cursor
+	if current.pendingBatchDigest != ([sha256.Size]byte{}) && current.pendingBatchDigest != batch.Digest {
+		return ErrChildStage
+	}
 	if batch.Applied == current.applied {
 		if current.lastBatchDigest != ([sha256.Size]byte{}) &&
 			batch.Digest == current.lastBatchDigest && batch.Term == current.term &&
@@ -285,10 +312,25 @@ func (s *ChildStage) ApplyTailBatch(
 		!s.validTailBatchCoordinates(batch, current.routeGeneration) {
 		return ErrChildStage
 	}
-	if err := s.applyTailOperations(batch); err != nil {
+	if err := s.verifyTailPreimages(batch, current.pendingBatchDigest != ([sha256.Size]byte{})); err != nil {
 		return err
 	}
 	next := *current
+	if err := s.accumulateTailBatch(&next, batch); err != nil {
+		return err
+	}
+	if batch.Operations != 0 && current.pendingBatchDigest == ([sha256.Size]byte{}) {
+		receipt := *current
+		receipt.pendingBatchDigest = batch.Digest
+		if err := s.persistCursor(&receipt, persist); err != nil {
+			s.cursorUncertain = true
+			return err
+		}
+	}
+	if err := s.applyTailOperations(batch); err != nil {
+		return err
+	}
+	next.pendingBatchDigest = [sha256.Size]byte{}
 	next.applied = batch.Applied
 	next.term = batch.Term
 	next.entryDigest = batch.EntryDigest
@@ -298,7 +340,15 @@ func (s *ChildStage) ApplyTailBatch(
 	sealed := batch.beforeCoordinates() != batch.afterCoordinates()
 	if sealed {
 		next.phase = ChildStageSealed
-		if err := s.certifySealedImage(&next); err != nil {
+		if err := s.sealAccumulatedImage(&next); err != nil {
+			return err
+		}
+		// Bind the seal to the final physical root, not a durable redo overlay.
+		// Checkpoint-group activation must discharge that overlay before it
+		// publishes its descriptor; folding it later would invalidate the exact
+		// image identity retained below. This folds only the bounded journal,
+		// without rescanning the child rows or weakening the image fence.
+		if err := s.collection.Flush(); err != nil {
 			return err
 		}
 	}
@@ -306,6 +356,11 @@ func (s *ChildStage) ApplyTailBatch(
 		return err
 	}
 	if sealed {
+		identity, ok := s.collection.DurableImageIdentity()
+		if !ok {
+			return ErrChildStage
+		}
+		s.sealedIdentity = identity
 		s.sealedVerified = true
 	}
 	return nil
@@ -316,8 +371,7 @@ func (s *ChildStage) validTailBatchCoordinates(
 	currentRouteGeneration uint64,
 ) bool {
 	before, after := batch.beforeCoordinates(), batch.afterCoordinates()
-	if before.OwnershipEpoch != uint64(s.partitioner.source.OwnershipEpoch) ||
-		before.RoutingVersion != uint64(s.partitioner.source.RoutingVersion) ||
+	if before != s.partitioner.initialCoordinates(currentRouteGeneration) ||
 		before.RouteGeneration != currentRouteGeneration {
 		return false
 	}
@@ -325,7 +379,7 @@ func (s *ChildStage) validTailBatchCoordinates(
 		return true
 	}
 	retained := s.partitioner.children[s.partitioner.retained]
-	return before.incremented() == after && batch.TransitionCount == 0 &&
+	return s.partitioner.sealCoordinates(before) == after && batch.TransitionCount == 0 &&
 		after.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
 		after.RoutingVersion == uint64(s.partitioner.target)
 }
@@ -542,11 +596,26 @@ func validateExpectedChildArtifact(
 	return nil
 }
 
+// ValidateChildStageCursor binds recovered destination progress to one exact
+// child artifact and this immutable partition plan. It performs no I/O and
+// grants neither serving nor cutover authority.
+func (p *Partitioner) ValidateChildStageCursor(
+	expected ChildArtifactManifest,
+	cursor ChildStageCursor,
+) error {
+	if validateExpectedChildArtifact(p, expected) != nil ||
+		!childStageCursorMatchesExpected(p, &cursor, expected) {
+		return ErrChildStage
+	}
+	return nil
+}
+
 func childStageCursorMatchesExpected(
+	p *Partitioner,
 	cursor *ChildStageCursor,
 	expected ChildArtifactManifest,
 ) bool {
-	if cursor == nil || cursor.child != expected.Child ||
+	if p == nil || cursor == nil || cursor.child != expected.Child ||
 		cursor.planDigest != expected.PlanDigest ||
 		cursor.placementDigest != expected.PlacementDigest ||
 		cursor.artifactDigest != expected.Digest ||
@@ -559,6 +628,8 @@ func childStageCursorMatchesExpected(
 	}
 	if cursor.phase == ChildStageArtifact {
 		return cursor.routeGeneration == expected.Source.RouteGeneration &&
+			cursor.imageRows == cursor.artifactRows &&
+			cursor.imageRows <= expected.Rows && cursor.imageBytes <= expected.RowBytes &&
 			cursor.applied == expected.Source.Applied &&
 			cursor.term == expected.Source.Term &&
 			cursor.dataChainDigest == expected.Source.DataChainDigest &&
@@ -582,7 +653,7 @@ func childStageCursorMatchesExpected(
 	}
 	if cursor.phase == ChildStageSealed &&
 		(expected.Source.RouteGeneration == math.MaxUint64 ||
-			cursor.routeGeneration != expected.Source.RouteGeneration+1) {
+			cursor.routeGeneration != p.sealCoordinates(p.initialCoordinates(expected.Source.RouteGeneration)).RouteGeneration) {
 		return false
 	}
 	if cursor.applied == expected.Source.Applied {

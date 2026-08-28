@@ -36,6 +36,7 @@ type record struct {
 	file       *os.File
 	cursorLive bool
 	tempLive   bool
+	readers    uint32
 }
 
 type repositoryFault uint8
@@ -45,6 +46,12 @@ const (
 	faultAfterPublishRename
 	faultAfterCursorRemove
 	faultAfterPublishSync
+	faultAfterReleaseRename
+	faultAfterReleaseUnlink
+	faultAfterReleaseSync
+	faultAfterAbandonRename
+	faultAfterAbandonUnlink
+	faultAfterAbandonSync
 )
 
 type RepositoryStats struct {
@@ -62,6 +69,8 @@ type RepositoryStats struct {
 type PublishedArtifact struct {
 	file    *os.File
 	section *io.SectionReader
+	owner   *Repository
+	hash    [sha256.Size]byte
 }
 
 func (a *PublishedArtifact) Read(p []byte) (int, error) {
@@ -76,7 +85,12 @@ func (a *PublishedArtifact) Close() error {
 		return nil
 	}
 	err := a.file.Close()
+	owner, hash := a.owner, a.hash
 	a.file, a.section = nil, nil
+	a.owner = nil
+	if owner != nil {
+		owner.releaseReader(hash)
+	}
 	return err
 }
 
@@ -145,9 +159,19 @@ func artifactNames(hash [sha256.Size]byte) (stage, cursor, temporary, published 
 	return "s-" + tail, "c-" + tail, "t-" + tail, "p-" + tail
 }
 
+func deletingArtifactName(hash [sha256.Size]byte) string {
+	_, _, _, published := artifactNames(hash)
+	return "d" + published[1:]
+}
+
+func abandoningArtifactName(hash [sha256.Size]byte) string {
+	_, _, _, published := artifactNames(hash)
+	return "a" + published[1:]
+}
+
 func parseArtifactName(name string) (kind byte, hash [sha256.Size]byte, ok bool) {
 	if len(name) != 2+sha256.Size*2 || name[1] != '-' ||
-		(name[0] != 's' && name[0] != 'c' && name[0] != 't' && name[0] != 'p') {
+		(name[0] != 's' && name[0] != 'c' && name[0] != 't' && name[0] != 'p' && name[0] != 'd' && name[0] != 'a') {
 		return 0, hash, false
 	}
 	decoded, err := hex.Decode(hash[:], []byte(name[2:]))
@@ -168,6 +192,77 @@ func (r *Repository) recover() error {
 				return err
 			}
 		}
+	}
+	// The abandoning namespace is the commit point for a replicated
+	// abandonment witness. Unlike release, it may contain a partial stage, so
+	// recovery validates only its exact descriptor and hard size bound before
+	// completing deletion. It can never become visible again.
+	for _, entry := range entries {
+		kind, hash, ok := parseArtifactName(entry.Name())
+		if ok && kind == 'a' {
+			if entry.Type()&fs.ModeType != 0 {
+				return ErrRepository
+			}
+			file, openErr := openRegular(r.root, entry.Name(), os.O_RDONLY, 0)
+			if openErr != nil {
+				return openErr
+			}
+			var raw [DescriptorBytes]byte
+			_, readErr := io.ReadFull(file, raw[:])
+			d, descriptorErr := OpenDescriptor(raw[:])
+			info, statErr := file.Stat()
+			closeErr := file.Close()
+			if readErr != nil || descriptorErr != nil || statErr != nil || closeErr != nil ||
+				d.ArtifactHash != hash || d.ArtifactBytes > r.limits.MaxArtifactBytes ||
+				info.Size() < DescriptorBytes || uint64(info.Size()-DescriptorBytes) > d.ArtifactBytes {
+				return errors.Join(ErrRepository, readErr, descriptorErr, statErr, closeErr)
+			}
+			_, cursor, _, _ := artifactNames(hash)
+			if removeErr := r.root.Remove(cursor); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+			if removeErr := r.root.Remove(entry.Name()); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+		}
+	}
+	// The deleting namespace is a durable release commit point. Once a
+	// publication has been renamed here, recovery must finish reclamation and
+	// must never make it visible again.
+	for _, entry := range entries {
+		kind, hash, ok := parseArtifactName(entry.Name())
+		if ok && kind == 'd' {
+			if entry.Type()&fs.ModeType != 0 {
+				return ErrRepository
+			}
+			file, err := openRegular(r.root, entry.Name(), os.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			var raw [DescriptorBytes]byte
+			_, readErr := io.ReadFull(file, raw[:])
+			d, descriptorErr := OpenDescriptor(raw[:])
+			info, statErr := file.Stat()
+			verifyErr := error(nil)
+			if readErr == nil && descriptorErr == nil && statErr == nil && d.ArtifactBytes <= r.limits.MaxArtifactBytes &&
+				d.ArtifactHash == hash && info.Size() == int64(DescriptorBytes)+int64(d.ArtifactBytes) {
+				verifyErr = verifyFileHash(file, d)
+				if verifyErr == nil {
+					verifyErr = r.verify(file, d)
+				}
+			} else {
+				verifyErr = ErrRepository
+			}
+			if closeErr := file.Close(); readErr != nil || descriptorErr != nil || statErr != nil || verifyErr != nil || closeErr != nil {
+				return errors.Join(ErrRepository, readErr, descriptorErr, statErr, verifyErr, closeErr)
+			}
+			if err := r.root.Remove(entry.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	if err := syncRoot(r.root); err != nil {
+		return err
 	}
 	entries, err = fs.ReadDir(r.root.FS(), ".")
 	if err != nil {
@@ -696,9 +791,18 @@ func (r *Repository) OpenPublished(d Descriptor, offset uint64) (*PublishedArtif
 	if err != nil {
 		return nil, err
 	}
+	rec.readers++
 	return &PublishedArtifact{file: f, section: io.NewSectionReader(
 		f, int64(DescriptorBytes)+int64(offset), int64(d.ArtifactBytes-offset),
-	)}, nil
+	), owner: r, hash: d.ArtifactHash}, nil
+}
+
+func (r *Repository) releaseReader(hash [sha256.Size]byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec := r.records[hash]; rec != nil && rec.readers != 0 {
+		rec.readers--
+	}
 }
 
 // Manifest re-authenticates a published artifact and returns its detached

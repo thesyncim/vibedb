@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 // The shard-service codec: a big-endian length-prefixed framing mirroring
@@ -53,10 +54,13 @@ const (
 // bound caps the whole message; the element counts bound the per-collection
 // slices before they are grown against bytes that may not be present.
 const (
-	// maxFrameBody is the largest request or response body this codec reads. It
-	// is generous for a large statement or document parameter and small enough
-	// that a frame cannot request an arbitrary allocation.
-	maxFrameBody = distributedtxn.MaxMutationBytes + (64 << 10)
+	// The envelope must contain the largest admitted canonical result, including
+	// the terminal cut's head, continuation, prepared result and release proof.
+	// Per-operation limits and the shared byte budget still apply before any
+	// peer-sized allocation; a caller-supplied limit cannot enlarge this ceiling.
+	maxFrameBody = max(distributedtxn.MaxMutationBytes+(64<<10),
+		replicatedReadResponseFixedBodyBytes+replicatedRequestLedgerReadValueHeaderBytes+
+			replicatedstate.MaxRequestLedgerTerminalReadBytes)
 
 	// maxParams, maxColumns, and maxRows bound the three repeated collections.
 	// The frame-body bound already limits total bytes; these keep a small frame
@@ -258,6 +262,28 @@ func (d *deccur) u64() uint64 {
 // fixed16 consumes one fixed-width log identity.
 func (d *deccur) fixed16() [16]byte {
 	var v [16]byte
+	if len(d.b) < len(v) {
+		d.fail(errTruncated)
+		return v
+	}
+	copy(v[:], d.b[:len(v)])
+	d.b = d.b[len(v):]
+	return v
+}
+
+func (d *deccur) fixed8() [8]byte {
+	var v [8]byte
+	if len(d.b) < len(v) {
+		d.fail(errTruncated)
+		return v
+	}
+	copy(v[:], d.b[:len(v)])
+	d.b = d.b[len(v):]
+	return v
+}
+
+func (d *deccur) fixed32() [32]byte {
+	var v [32]byte
 	if len(d.b) < len(v) {
 		d.fail(errTruncated)
 		return v
@@ -478,7 +504,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 		return errBadTransaction
 	}
 	if tx.Operation == TransactionNone {
-		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 ||
+		if !tx.ID.IsZero() || tx.Revision != 0 || tx.RecoveryPulse != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 ||
 			len(tx.ManifestSegment) != 0 {
 			return errBadTransaction
 		}
@@ -486,6 +512,10 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 	}
 	if !tx.Operation.valid() {
 		return errBadEnum
+	}
+	if (tx.Operation == TransactionPulseCoordinator) != (tx.RecoveryPulse != 0) ||
+		tx.RecoveryPulse > distributedtxn.MaxRecoveryPulses {
+		return errBadTransaction
 	}
 	if tx.Operation.stages() {
 		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) == 0 ||
@@ -563,6 +593,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 func validateTransactionReply(tx TransactionReply) error {
 	if tx.Role == TransactionRoleNone {
 		if !tx.ID.IsZero() || tx.Revision != 0 ||
+			tx.RecoveryPulse != 0 ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
 			tx.ParticipantState != distributedtxn.ParticipantInvalid ||
 			tx.RecordKind != TransactionRecordNone || tx.SegmentIndex != 0 || len(tx.Record) != 0 {
@@ -614,7 +645,7 @@ func validateTransactionReply(tx TransactionReply) error {
 			return errBadTransaction
 		}
 	case TransactionRoleParticipant:
-		if tx.ParticipantState < distributedtxn.ParticipantStaged ||
+		if tx.RecoveryPulse != 0 || tx.ParticipantState < distributedtxn.ParticipantStaged ||
 			tx.ParticipantState > distributedtxn.ParticipantReleased ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
 			return errBadTransaction
@@ -1072,6 +1103,9 @@ func encodeTransactionRequest(e *encbuf, tx TransactionRequest) {
 	}
 	e.fixed16(tx.ID)
 	e.u64(tx.Revision)
+	if tx.Operation == TransactionPulseCoordinator {
+		e.u8(tx.RecoveryPulse)
+	}
 }
 
 func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
@@ -1096,6 +1130,9 @@ func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
 	} else {
 		tx.ID = distributedtxn.ID(d.fixed16())
 		tx.Revision = d.u64()
+		if tx.Operation == TransactionPulseCoordinator {
+			tx.RecoveryPulse = d.u8()
+		}
 	}
 	if d.bad() {
 		return TransactionRequest{}, d.why
@@ -1110,6 +1147,7 @@ func encodeTransactionReply(e *encbuf, tx TransactionReply) {
 	e.u8(uint8(tx.Role))
 	e.fixed16(tx.ID)
 	e.u64(tx.Revision)
+	e.u8(tx.RecoveryPulse)
 	if tx.Role == TransactionRoleCoordinator {
 		e.u8(uint8(tx.CoordinatorState))
 	} else {
@@ -1127,6 +1165,7 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 	}
 	tx.ID = distributedtxn.ID(d.fixed16())
 	tx.Revision = d.u64()
+	tx.RecoveryPulse = d.u8()
 	state := d.u8()
 	if tx.Role == TransactionRoleCoordinator {
 		tx.CoordinatorState = distributedtxn.CoordinatorState(state)

@@ -1,7 +1,6 @@
 package replicatedstate
 
 import (
-	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,31 +12,16 @@ import (
 
 const constructionRetryWindow = uint16(8)
 
-func constructionSystemBatchBytes(retryWindow uint16) int {
-	hot := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxAuthorityBindingBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
-	release := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3)
-	return max(hot, release)
-}
-
 func constructionSystemOptions(options durable.Options) durable.Options {
+	required, ok := RequiredSystemCollectionLimits(constructionRetryWindow, false)
+	if !ok {
+		panic("invalid construction retry window")
+	}
 	options.OpaqueValues = true
-	options.MaxKeyBytes = sha256.Size + 3
-	options.MaxDocumentBytes = max(
-		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
-		MaxAuthorityBindingBytes,
-	)
-	options.MaxBatchDocuments = max(4, int(constructionRetryWindow)+2)
-	// Durable collection profiles reserve room for every key at the collection
-	// maximum, even though the state key itself is only one byte.
-	collectionBound := MaxStateEnvelopeBytes +
-		(int(constructionRetryWindow)+2)*(sha256.Size+3)
-	options.MaxBatchBytes = max(
-		constructionSystemBatchBytes(constructionRetryWindow), collectionBound,
-	)
+	options.MaxKeyBytes = required.MaxKeyBytes
+	options.MaxDocumentBytes = required.MaxDocumentBytes
+	options.MaxBatchDocuments = required.MaxDistinctMutations
+	options.MaxBatchBytes = required.MaxBatchBytes
 	return options
 }
 
@@ -68,7 +52,7 @@ func machineOptionsFor(user CollectionTarget) Options {
 			MaxCollections: 2,
 			MaxDocuments: max(
 				user.Limits.MaxDistinctMutations+4,
-				int(constructionRetryWindow)+2,
+				2*int(constructionRetryWindow)+2,
 			),
 			MaxBytes: 64 << 20,
 		},
@@ -188,7 +172,11 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	maxSystem := constructionSystemBatchBytes(constructionRetryWindow)
+	systemLimits, limitsOK := RequiredSystemCollectionLimits(constructionRetryWindow, false)
+	if !limitsOK {
+		t.Fatal("invalid construction retry window")
+	}
+	maxSystem := systemLimits.MaxBatchBytes
 	required, ok := checkedTxnBytes(replication.MaxCommandBytes, maxSystem)
 	if !ok {
 		t.Fatal("test byte proof overflowed")
@@ -197,7 +185,7 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 		MaxCollections: 2,
 		MaxDocuments: max(
 			user.Limits.MaxDistinctMutations+4,
-			int(constructionRetryWindow)+2,
+			2*int(constructionRetryWindow)+2,
 		),
 		MaxBytes: required,
 	}, MaxSessions: 128, RetryWindow: constructionRetryWindow}

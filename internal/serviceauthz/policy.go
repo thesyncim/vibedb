@@ -44,11 +44,30 @@ const (
 	// separate from ordinary data reads, writes, and topology authority: none of
 	// those capabilities can discover transaction participants or decisions.
 	CapabilityTransactionRecovery
+	// CapabilityRequestLedger permits only the internal durable request-result
+	// ledger grammar. It is separate from data, topology, and transaction
+	// recovery so an ordinary writer cannot forge or acknowledge idempotency
+	// state and a ledger principal cannot mutate user relations.
+	CapabilityRequestLedger
+	// CapabilityExecutionPin owns only the closed logical pin lifecycle in the
+	// catalog RF3 group. It grants no catalog publication or physical route-gate
+	// authority.
+	CapabilityExecutionPin
+	// CapabilityBackup permits catalog-authorized backup export and non-serving
+	// restore staging. It grants no data, topology, membership, schema, or
+	// serving authority by itself.
+	CapabilityBackup
+	// CapabilityRestoreActivate permits only the one-time target-catalog
+	// transition from a completely prepared restore inventory to its replicated
+	// activation witness. Backup staging, topology, membership, schema, and data
+	// authorities do not imply it, and it grants none of them in return.
+	CapabilityRestoreActivate
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
 	CapabilityDelegate | CapabilityMembership | CapabilityTopology |
-	CapabilityTransactionRecovery
+	CapabilityTransactionRecovery | CapabilityRequestLedger | CapabilityExecutionPin |
+	CapabilityBackup | CapabilityRestoreActivate
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

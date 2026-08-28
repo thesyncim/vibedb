@@ -276,11 +276,12 @@ func BuildEmptyPrimaryGraphSummarized(
 	if err := page.Stage(); err != nil {
 		return PageRef{}, err
 	}
-	tablets, err := buildPrimaryTablets(tx, []primaryBuiltLeaf{{ref: page.Ref()}})
+	sink := transactionPrimaryGraphSink{tx: tx}
+	tablets, err := buildPrimaryTablets(sink, []primaryBuiltLeaf{{ref: page.Ref()}})
 	if err != nil {
 		return PageRef{}, err
 	}
-	return buildPrimaryCatalog(tx, tablets)
+	return buildPrimaryCatalog(sink, tablets)
 }
 
 func buildPrimaryGraphPlaced(
@@ -326,17 +327,40 @@ func BuildPlannedPrimaryGraph(
 			return PageRef{}, fmt.Errorf("%w: planned primary graph extent", ErrInvalidWrite)
 		}
 	}
+	sink := transactionPrimaryGraphSink{tx: tx}
+	return BuildPlannedPrimaryGraphToSink(sink, plan, placements)
+}
+
+// BuildPlannedPrimaryGraphToSink emits an already planned graph through a
+// bounded allocation sink. Online compaction uses the incremental planner and
+// reserved sink; creation uses the transaction adapter above.
+func BuildPlannedPrimaryGraphToSink(
+	sink PrimaryGraphBuildSink,
+	plan *PrimaryGraphPlan,
+	placements []PrimaryGraphPlacement,
+) (PageRef, error) {
+	if sink == nil || plan == nil || sink.StoreIdentity() != plan.storeID ||
+		sink.BuildGeneration() == 0 || sink.BuildNextLogicalID() < PrimaryFirstDynamicLogicalID ||
+		len(plan.records) == 0 || plan.pages == 0 || plan.placed != (placements != nil) ||
+		placements != nil && len(placements) != len(plan.records) {
+		return PageRef{}, fmt.Errorf("%w: planned primary graph sink", ErrInvalidWrite)
+	}
+	for i := range plan.leaves {
+		if plan.leaves[i].extent > sink.MaxBuildPageBytes() {
+			return PageRef{}, fmt.Errorf("%w: planned sink extent", ErrInvalidWrite)
+		}
+	}
 	built, err := buildPrimaryLeaves(
-		tx, plan.records, plan.leaves, placements, plan.summaries,
+		sink, plan.records, plan.leaves, placements, plan.summaries,
 	)
 	if err != nil {
 		return PageRef{}, err
 	}
-	tablets, err := buildPrimaryTablets(tx, built)
+	tablets, err := buildPrimaryTablets(sink, built)
 	if err != nil {
 		return PageRef{}, err
 	}
-	return buildPrimaryCatalog(tx, tablets)
+	return buildPrimaryCatalog(sink, tablets)
 }
 
 // PrimaryGraphPageCount returns the exact number of transaction pages
@@ -612,7 +636,7 @@ func planCompactPrimaryLeavesSummarized(
 }
 
 func buildPrimaryLeaves(
-	tx *WriteTransaction,
+	sink PrimaryGraphBuildSink,
 	input []PrimaryGraphRecord,
 	plans []primaryLeafPlan,
 	placements []PrimaryGraphPlacement,
@@ -635,12 +659,12 @@ func buildPrimaryLeaves(
 			return nil, fmt.Errorf("%w: non-unified primary plan", ErrInvalidWrite)
 		}
 		pageSize := uint32(plans[rank].extent)
-		page, err := tx.Allocate(PagePrimaryLeaf, pageSize, logicalID)
+		page, err := sink.AllocatePage(PagePrimaryLeaf, pageSize, logicalID)
 		if err != nil {
 			return nil, err
 		}
 		leafHeader := CommonPrimaryLeafHeader{
-			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+			StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
 			Bucket: BucketID(bucket), PageSize: pageSize,
 		}
 		var encodeErr error
@@ -704,7 +728,7 @@ func recordPrimaryPlacements(
 }
 
 func buildPrimaryTablets(
-	tx *WriteTransaction,
+	sink PrimaryGraphBuildSink,
 	leaves []primaryBuiltLeaf,
 ) ([]primaryCatalogChild, error) {
 	tabletCount := (len(leaves) + TabletLocalIdentityLocalCount - 1) /
@@ -749,13 +773,13 @@ func buildPrimaryTablets(
 
 		pageCount := (len(tabletLeaves) + SegmentedTabletRouterRowsPerPage - 1) /
 			SegmentedTabletRouterRowsPerPage
-		anchorPages := make([]TransactionPage, pageCount)
+		anchorPages := make([]PrimaryGraphBuildPage, pageCount)
 		anchorRefs := make([]PageRef, pageCount)
 		for pageID := range pageCount {
 			logicalID, _ := GlobalTabletCatalogAnchorLogicalID(
 				tabletID, uint8(pageID),
 			)
-			page, err := tx.Allocate(
+			page, err := sink.AllocatePage(
 				PagePrimaryAnchor, SegmentedTabletRouterAnchorPageBytes,
 				logicalID,
 			)
@@ -766,14 +790,14 @@ func buildPrimaryTablets(
 			anchorRefs[pageID] = page.Ref()
 		}
 		locatorLogical, _ := GlobalTabletCatalogLocatorLogicalID(tabletID)
-		locatorPage, err := tx.Allocate(
+		locatorPage, err := sink.AllocatePage(
 			PagePrimaryLocator, GlobalTabletCatalogLocatorBytes, locatorLogical,
 		)
 		if err != nil {
 			return nil, err
 		}
 		routeLogical, _ := GlobalTabletCatalogTabletRootLogicalID(tabletID)
-		routePage, err := tx.Allocate(
+		routePage, err := sink.AllocatePage(
 			PageTabletRoute, GlobalTabletCatalogTabletBytes, routeLogical,
 		)
 		if err != nil {
@@ -786,8 +810,8 @@ func buildPrimaryTablets(
 			[]byte, pageCount*SegmentedTabletRouterAnchorPageBytes,
 		)
 		header := SegmentedTabletRouterHeader{
-			StoreID: tx.options.StoreID, TabletID: tabletID,
-			Generation: tx.options.Generation,
+			StoreID: sink.StoreIdentity(), TabletID: tabletID,
+			Generation: sink.BuildGeneration(),
 			AnchorKind: PagePrimaryAnchor, LeafKind: PagePrimaryLeaf,
 		}
 		if _, _, _, _, err := EncodeSegmentedTabletRouter(
@@ -806,18 +830,18 @@ func buildPrimaryTablets(
 			}
 		}
 
-		bounds := primaryCatalogBounds(tx)
+		bounds := primaryCatalogBounds(sink)
 		if _, err := EncodeGlobalTabletCatalogLocator(
 			locatorPage.Bytes(),
 			PageHeader{
-				StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+				StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
 				LogicalID: locatorLogical,
 				PageSize:  GlobalTabletCatalogLocatorBytes,
 				PayloadLength: GlobalTabletCatalogLocatorHeader +
 					globalTabletCatalogPackedBytes,
 				Kind: PagePrimaryLocator,
 			},
-			bounds, tabletID, tx.options.Generation, locatorEntries,
+			bounds, tabletID, sink.BuildGeneration(), locatorEntries,
 		); err != nil {
 			return nil, err
 		}
@@ -827,7 +851,7 @@ func buildPrimaryTablets(
 		if _, err := EncodeGlobalTabletCatalogTabletRoot(
 			routePage.Bytes(),
 			PageHeader{
-				StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+				StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
 				LogicalID: routeLogical, PageSize: GlobalTabletCatalogTabletBytes,
 				PayloadLength: GlobalTabletCatalogRootHeader +
 					SegmentedTabletRouterRootBytes,
@@ -860,7 +884,7 @@ func buildPrimaryTablets(
 }
 
 func buildPrimaryCatalog(
-	tx *WriteTransaction,
+	sink PrimaryGraphBuildSink,
 	tablets []primaryCatalogChild,
 ) (PageRef, error) {
 	leafFanout := GlobalTabletCatalogWorstCaseFanout(
@@ -873,7 +897,7 @@ func buildPrimaryCatalog(
 		return PageRef{}, fmt.Errorf("%w: primary catalog geometry", ErrInvalidWrite)
 	}
 	leaves, err := buildPrimaryCatalogLevel(
-		tx, GlobalTabletCatalogLeaf, tablets, leafFanout,
+		sink, GlobalTabletCatalogLeaf, tablets, leafFanout,
 	)
 	if err != nil {
 		return PageRef{}, err
@@ -882,7 +906,7 @@ func buildPrimaryCatalog(
 	rootChildLevel := GlobalTabletCatalogLeaf
 	if len(leaves) > rootFanout {
 		rootChildren, err = buildPrimaryCatalogLevel(
-			tx, GlobalTabletCatalogBranch, leaves, leafFanout,
+			sink, GlobalTabletCatalogBranch, leaves, leafFanout,
 		)
 		if err != nil {
 			return PageRef{}, err
@@ -892,7 +916,7 @@ func buildPrimaryCatalog(
 	if len(rootChildren) > rootFanout {
 		return PageRef{}, fmt.Errorf("%w: primary catalog root capacity", ErrInvalidWrite)
 	}
-	rootPage, err := tx.Allocate(
+	rootPage, err := sink.AllocatePage(
 		PagePrimaryCatalog, GlobalTabletCatalogRootBytes,
 		GlobalTabletCatalogRootLogicalID,
 	)
@@ -903,12 +927,12 @@ func buildPrimaryCatalog(
 	if _, err := EncodeGlobalTabletCatalogNode(
 		rootPage.Bytes(),
 		GlobalTabletCatalogNodeHeader{
-			StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+			StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
 			LogicalID: GlobalTabletCatalogRootLogicalID,
 			Level:     GlobalTabletCatalogRoot, RootChildLevel: rootChildLevel,
 			Kind: PagePrimaryCatalog, ChildKind: PagePrimaryCatalog,
 			ChildLength: GlobalTabletCatalogNodeBytes,
-			Bounds:      primaryCatalogBounds(tx),
+			Bounds:      primaryCatalogBounds(sink),
 		},
 		entries,
 	); err != nil {
@@ -921,7 +945,7 @@ func buildPrimaryCatalog(
 }
 
 func buildPrimaryCatalogLevel(
-	tx *WriteTransaction,
+	sink PrimaryGraphBuildSink,
 	level GlobalTabletCatalogNodeLevel,
 	children []primaryCatalogChild,
 	fanout int,
@@ -945,7 +969,7 @@ func buildPrimaryCatalogLevel(
 		if !ok {
 			return nil, fmt.Errorf("%w: primary catalog logical ID", ErrInvalidWrite)
 		}
-		page, err := tx.Allocate(
+		page, err := sink.AllocatePage(
 			PagePrimaryCatalog, GlobalTabletCatalogNodeBytes, logicalID,
 		)
 		if err != nil {
@@ -960,10 +984,10 @@ func buildPrimaryCatalogLevel(
 		if _, err := EncodeGlobalTabletCatalogNode(
 			page.Bytes(),
 			GlobalTabletCatalogNodeHeader{
-				StoreID: tx.options.StoreID, Generation: tx.options.Generation,
+				StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
 				LogicalID: logicalID, PageID: uint32(pageID), Level: level,
 				Kind: PagePrimaryCatalog, ChildKind: childKind,
-				ChildLength: childLength, Bounds: primaryCatalogBounds(tx),
+				ChildLength: childLength, Bounds: primaryCatalogBounds(sink),
 			},
 			primaryCatalogEntries(children[first:last]),
 		); err != nil {
@@ -994,16 +1018,16 @@ func primaryCatalogEntries(
 	return entries
 }
 
-func primaryCatalogBounds(tx *WriteTransaction) GlobalTabletCatalogBounds {
+func primaryCatalogBounds(sink PrimaryGraphBuildSink) GlobalTabletCatalogBounds {
 	// The catalog codec's admission context reserves room for the eventual
 	// 64 KiB root. Tiny graphs can stage their tablet pages before physical
 	// FileEnd reaches that size; the bottom-up build always allocates the root
 	// before publication, so this is the exact prospective lower bound.
-	fileEnd := max(tx.fileEnd, uint64(GlobalTabletCatalogRootBytes))
+	fileEnd := max(sink.BuildFileEnd(), uint64(GlobalTabletCatalogRootBytes))
 	return GlobalTabletCatalogBounds{
-		StoreID:                tx.options.StoreID,
-		SelectedRootGeneration: tx.options.Generation,
+		StoreID:                sink.StoreIdentity(),
+		SelectedRootGeneration: sink.BuildGeneration(),
 		FileEnd:                fileEnd,
-		NextLogicalID:          tx.nextID,
+		NextLogicalID:          sink.BuildNextLogicalID(),
 	}
 }

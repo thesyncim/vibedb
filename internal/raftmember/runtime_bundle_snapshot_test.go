@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -62,6 +63,10 @@ func TestRuntimeSnapshotStateCoversCompleteRelationBundle(t *testing.T) {
 		binding, "docs", []sqldriver.ReplicatedGlobalIndexRelation{{
 			Relation: 2, Table: "email_claims", IndexID: 41,
 			Incarnation: 7, LocatorCount: 1, Unique: true,
+			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
 	skipIfStrictAllocationUnsupported(t, "bind runtime bundle SQL", err)
@@ -96,7 +101,14 @@ func TestRuntimeSnapshotStateCoversCompleteRelationBundle(t *testing.T) {
 		t.Fatal("encode bundle base key")
 	}
 	document := []byte(`{"id":"bundle-doc","email":"a"}`)
-	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["bundle-doc"]`)
+	globalKey, err := distribution.CurrentTupleCodec.AppendTuple(nil, []distribution.Scalar{distribution.NewString("a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := base.Relations[1].GlobalIndexStorageKeyPoint(globalKey); !ok {
+		t.Fatal("canonical global-index key rejected by retained relation")
+	}
+	locator := []byte(`["bundle-doc"]`)
 	commandValue := testApplyCommandValue(base, epoch, 2, baseKey, document)
 	commandValue.Batches = append(commandValue.Batches, replication.RelationMutationBatch{
 		Relation: 2,

@@ -9,17 +9,26 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash"
 	"math"
+	"net"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
 	"go.etcd.io/raft/v3"
 )
 
@@ -64,34 +73,95 @@ type Action struct {
 // non-retained child. SQL must already be bound to the exact final WAL identity
 // derived by BindingForNewWAL. None of these fields grants serving authority.
 type ChildTarget struct {
-	Child                 uint8
-	Endpoint              distribution.EndpointID
-	WAL                   raftstore.Identity
-	TopologyRecoveryEpoch uint64
-	Authority             sqldriver.ReplicatedAuthorityProfile
-	SQL                   sqldriver.ReplicatedShardStoreIdentity
+	Child             uint8
+	Endpoint          distribution.EndpointID
+	Replicas          []ChildReplicaTarget
+	ReplicaSetVersion uint64
+	// RelationManifestDigest is the portable validated schema-image digest
+	// shared by every replica. Replica.SQL.RelationManifestDigest remains the
+	// exact replica-local storage/catalog digest and is allowed to differ.
+	RelationManifestDigest [sha256.Size]byte
+	WAL                    raftstore.Identity
+	TopologyRecoveryEpoch  uint64
+	Authority              sqldriver.ReplicatedAuthorityProfile
+	SQL                    sqldriver.ReplicatedShardStoreIdentity
+	LocalIndexes           []store.IndexDefinition
+}
+
+// ChildReplicaTarget is one exact pre-published RF3 member route. A split plan
+// carries the complete voter set because DNS and an uncommitted catalog cannot
+// establish member, node, store, or certificate identity.
+type ChildReplicaTarget struct {
+	Member          uint64
+	Node            rafttransport.NodeID
+	StoreID         [16]byte
+	NodeIncarnation uint64
+	Endpoint        distribution.EndpointID
+	NativeEndpoint  distribution.EndpointID
+	ControlEndpoint distribution.EndpointID
+	// Endpoints are logical catalog names. These addresses freeze their exact
+	// transport destinations into the preparation and receipt. All three may
+	// be absent only for the older literal-endpoint representation.
+	PeerAddress    string
+	NativeAddress  string
+	ControlAddress string
+	// SnapshotAddress is the exact authenticated TrafficSnapshot listener for
+	// artifact staging. It is provisioned by the gateway inventory and verified
+	// by the destination before the preparation receipt is issued.
+	SnapshotAddress string
+
+	// The remaining fields are the replica-local prepared runtime authority.
+	// WAL member/store identity, physical roots, SQL storage/log identity, and
+	// the apply participant are deliberately distinct on every RF3 member.
+	WAL               raftstore.Identity
+	WALPath           string
+	SQLPath           string
+	RuntimeRoot       string
+	SQL               sqldriver.ReplicatedShardStoreIdentity
+	Apply             sqldriver.ReplicatedApplyIdentity
+	CertificateDigest [sha256.Size]byte
 }
 
 // Plan binds one source catalog generation, exact split geometry, and every
 // non-retained child to its final SQL/Raft identity. It is immutable after
 // construction.
 type Plan struct {
-	partitioner    *rangesplit.Partitioner
-	sourceManifest *distribution.Manifest
-	targetManifest *distribution.Manifest
-	source         autosplit.SourceIdentity
-	children       [autosplit.MaxSplitChildren]autosplit.SplitChildIdentity
-	leaderCounts   [autosplit.MaxSplitChildren]uint16
-	childCount     uint8
-	retained       uint8
-	current        uint64
-	next           uint64
-	targets        [autosplit.MaxSplitChildren]ChildTarget
-	operation      OperationID
+	partitioner     *rangesplit.Partitioner
+	sourceManifest  *distribution.Manifest
+	targetManifest  *distribution.Manifest
+	source          autosplit.SourceIdentity
+	children        [autosplit.MaxSplitChildren]autosplit.SplitChildIdentity
+	leaderCounts    [autosplit.MaxSplitChildren]uint16
+	childCount      uint8
+	retained        uint8
+	current         uint64
+	next            uint64
+	targets         [autosplit.MaxSplitChildren]ChildTarget
+	indexRelations  []sqldriver.ReplicatedShardRelationIdentity
+	relationDigest  [sha256.Size]byte
+	operation       OperationID
+	sourceAuthority *PlanSourceAuthority
+}
+
+// PlanSourceAuthority separates the source's applied Raft fence from the
+// catalog CAS generation. Schema retains the original immutable validation
+// profile; later applied ownership fences do not rewrite that profile.
+type PlanSourceAuthority struct {
+	Group               raftmember.GroupKey      `json:"group"`
+	Command             raftservice.CommandFence `json:"command"`
+	LogicalSchemaDigest replication.Digest       `json:"logical_schema_digest"`
+	Schema              PlanSourceSchema         `json:"schema"`
+}
+
+type PlanSourceSchema struct {
+	SQL          sqldriver.ReplicatedShardStoreIdentity
+	Placement    sqldriver.ReplicatedPlacementProfile
+	LocalIndexes []store.IndexDefinition
 }
 
 // OperationID is the fixed byte-native idempotency identity of one exact split
-// geometry, catalog CAS, and prepared child runtime set.
+// geometry and catalog CAS. The immutable plan digest separately binds the
+// prepared runtime set, preventing a retry from changing those coordinates.
 type OperationID [sha256.Size]byte
 
 // NewPlan validates the complete cold control-plane intent before any source
@@ -101,6 +171,7 @@ func NewPlan(
 	split *autosplit.SplitPlan,
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
+	sourceSchema ...PlanSourceSchema,
 ) (*Plan, error) {
 	if current == nil || split == nil {
 		return nil, ErrInvalidPlan
@@ -109,8 +180,31 @@ func NewPlan(
 	if !ok {
 		return nil, ErrInvalidPlan
 	}
+	var authority *PlanSourceAuthority
+	if sourceRoute, replicated := current.ResolveReplicatedRoute(
+		split.Source.Distribution, split.Source.Shard,
+		make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+	); replicated {
+		if len(sourceRoute.Replicas) != gateway.ServingReplicaCount {
+			return nil, ErrInvalidPlan
+		}
+		if len(sourceSchema) != 1 {
+			return nil, ErrInvalidPlan
+		}
+		authority = &PlanSourceAuthority{Group: sourceRoute.Group, Command: sourceRoute.Command, LogicalSchemaDigest: sourceRoute.LogicalSchemaDigest, Schema: clonePlanSourceSchema(sourceSchema[0])}
+		for index := range targets {
+			target := &targets[index]
+			if target.Authority.ActivePolicyGeneration != sourceRoute.Command.ActivePolicyGeneration ||
+				target.Authority.ProtectionEpoch != sourceRoute.Command.ProtectionEpoch ||
+				target.Authority.SchemaGeneration != sourceRoute.Command.SchemaGeneration {
+				return nil, ErrInvalidPlan
+			}
+		}
+	} else if len(sourceSchema) != 0 {
+		return nil, ErrInvalidPlan
+	}
 	return newPlan(
-		sourceManifest, current.Generation(), split, partitioner, targets,
+		sourceManifest, current.Generation(), split, partitioner, targets, authority,
 	)
 }
 
@@ -125,13 +219,25 @@ func RecoverPlan(
 	split *autosplit.SplitPlan,
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
+	retainedAuthority ...PlanSourceAuthority,
 ) (*Plan, error) {
 	if current == nil || split == nil || sourceGeneration == math.MaxUint64 {
 		return nil, ErrInvalidPlan
 	}
 	switch current.Generation() {
 	case sourceGeneration:
-		return NewPlan(current, split, partitioner, targets)
+		var schema []PlanSourceSchema
+		if len(retainedAuthority) == 1 {
+			schema = []PlanSourceSchema{retainedAuthority[0].Schema}
+		}
+		plan, err := NewPlan(current, split, partitioner, targets, schema...)
+		if err != nil {
+			return nil, err
+		}
+		if len(retainedAuthority) > 1 || len(retainedAuthority) == 1 && (plan.sourceAuthority == nil || !samePlanSourceAuthority(*plan.sourceAuthority, retainedAuthority[0])) {
+			return nil, ErrTopologyConflict
+		}
+		return plan, nil
 	case sourceGeneration + 1:
 		target, ok := current.Manifest(split.Source.Distribution)
 		if !ok || split.Manifest() == nil {
@@ -145,7 +251,28 @@ func RecoverPlan(
 			partitioner.ValidatePublishedManifestTransition(source, target) != nil {
 			return nil, ErrTopologyConflict
 		}
-		return newPlan(source, sourceGeneration, split, partitioner, targets)
+		var authority *PlanSourceAuthority
+		if len(retainedAuthority) > 1 {
+			return nil, ErrInvalidPlan
+		}
+		if len(retainedAuthority) == 1 {
+			value := retainedAuthority[0]
+			authority = &value
+		}
+		var endpoints [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		retained, retainedOK := split.ChildIdentity(int(split.RetainedChild))
+		if route, replicated := current.ResolveReplicatedRoute(split.Source.Distribution, split.Source.Shard, endpoints[:0]); replicated {
+			if !retainedOK || authority == nil || route.Group != authority.Group || route.LogicalSchemaDigest != authority.LogicalSchemaDigest || route.Command.ReplicaSetVersion != authority.Command.ReplicaSetVersion ||
+				route.Command.ActivePolicyGeneration != authority.Command.ActivePolicyGeneration || route.Command.ProtectionEpoch != authority.Command.ProtectionEpoch ||
+				route.Command.SchemaGeneration != authority.Command.SchemaGeneration || route.Command.RelationManifestDigest != authority.Command.RelationManifestDigest ||
+				route.Command.OwnershipEpoch != uint64(retained.OwnershipEpoch) ||
+				route.Command.RouteGeneration != sourceGeneration+1 || route.Command.RoutingVersion != uint64(split.Manifest().Version()) {
+				return nil, ErrTopologyConflict
+			}
+		} else if authority != nil {
+			return nil, ErrTopologyConflict
+		}
+		return newPlan(source, sourceGeneration, split, partitioner, targets, authority)
 	default:
 		return nil, ErrTopologyConflict
 	}
@@ -157,6 +284,7 @@ func newPlan(
 	split *autosplit.SplitPlan,
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
+	authority *PlanSourceAuthority,
 ) (*Plan, error) {
 	if sourceManifest == nil || split == nil || split.Manifest() == nil || partitioner == nil ||
 		sourceGeneration == math.MaxUint64 || split.ChildCount < 2 ||
@@ -171,9 +299,19 @@ func newPlan(
 		return nil, ErrInvalidPlan
 	}
 	digest, err := rangesplit.SplitPlanDigest(split)
-	if err != nil || digest != partitioner.Digest() ||
+	if err != nil || digest != partitioner.GeometryDigest() ||
 		partitioner.ValidateManifestTransition(sourceManifest, split.Manifest()) != nil {
 		return nil, errors.Join(ErrInvalidPlan, err)
+	}
+	if authority != nil {
+		partitioner, err = partitioner.BindSourceFence(rangesplit.TailSourceCoordinates{
+			OwnershipEpoch:  authority.Command.OwnershipEpoch,
+			RoutingVersion:  authority.Command.RoutingVersion,
+			RouteGeneration: authority.Command.RouteGeneration,
+		}, sourceGeneration+1)
+		if err != nil {
+			return nil, errors.Join(ErrInvalidPlan, err)
+		}
 	}
 
 	plan := &Plan{
@@ -182,6 +320,11 @@ func newPlan(
 		source:     cloneSourceIdentity(split.Source),
 		childCount: split.ChildCount, retained: split.RetainedChild,
 		current: sourceGeneration, next: sourceGeneration + 1,
+	}
+	if authority != nil {
+		copy := *authority
+		copy.Schema = clonePlanSourceSchema(authority.Schema)
+		plan.sourceAuthority = &copy
 	}
 	for child := 0; child < int(split.ChildCount); child++ {
 		identity, identityOK := split.ChildIdentity(child)
@@ -195,13 +338,16 @@ func newPlan(
 		plan.leaderCounts[child] = uint16(len(descriptor.Leaders))
 	}
 	var seen [autosplit.MaxSplitChildren]bool
+	var relationTemplate []sqldriver.ReplicatedShardRelationIdentity
 	for index := range targets {
 		target := cloneChildTarget(targets[index])
 		child := int(target.Child)
 		descriptor, childOK := split.ChildIdentity(child)
 		leader, leaderOK := split.ChildLeader(child, 0)
-		if !childOK || descriptor.Retained || seen[child] ||
+		if !childOK || descriptor.Retained || seen[child] || target.ReplicaSetVersion == 0 ||
+			target.RelationManifestDigest == ([sha256.Size]byte{}) ||
 			!leaderOK || target.Endpoint != leader ||
+			!validChildReplicaTargets(split, child, target) ||
 			target.WAL.Distribution != string(split.Source.Distribution) ||
 			target.WAL.Shard != string(descriptor.Shard) ||
 			target.WAL.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
@@ -213,10 +359,20 @@ func newPlan(
 			target.WAL, target.TopologyRecoveryEpoch, target.Authority,
 		)
 		if bindingErr != nil || planned != target.SQL.Binding ||
+			!validPreparedChildReplicas(descriptor, partitioner.CollectionName(), target) ||
 			target.Authority.OwnershipEpoch != uint64(descriptor.OwnershipEpoch) ||
 			target.Authority.RoutingVersion != uint64(split.Manifest().Version()) ||
 			target.Authority.RouteGeneration != plan.next {
 			return nil, errors.Join(ErrInvalidPlan, bindingErr)
+		}
+		if len(target.SQL.Relations) != 0 {
+			if relationTemplate == nil {
+				relationTemplate = cloneSplitRelations(target.SQL.Relations)
+			} else if !sameSplitRelationPlacement(relationTemplate, target.SQL.Relations) {
+				return nil, ErrInvalidPlan
+			}
+		} else if relationTemplate != nil {
+			return nil, ErrInvalidPlan
 		}
 		seen[child] = true
 		plan.targets[child] = target
@@ -227,8 +383,104 @@ func newPlan(
 			return nil, ErrInvalidPlan
 		}
 	}
+	var portableRelationDigest [sha256.Size]byte
+	for child := 0; child < int(split.ChildCount); child++ {
+		if child == int(split.RetainedChild) {
+			continue
+		}
+		target := &plan.targets[child]
+		if authority == nil && portableRelationDigest != ([sha256.Size]byte{}) &&
+			target.RelationManifestDigest != portableRelationDigest {
+			return nil, ErrInvalidPlan
+		}
+		portableRelationDigest = target.RelationManifestDigest
+	}
+	plan.relationDigest = portableRelationDigest
+	if authority != nil {
+		if !authority.Command.Valid() ||
+			authority.Command.OwnershipEpoch != uint64(split.Source.OwnershipEpoch) || authority.Command.RoutingVersion > uint64(split.Source.RoutingVersion) {
+			return nil, ErrInvalidPlan
+		}
+		plan.relationDigest = authority.Command.RelationManifestDigest
+		if err := plan.validateReplicatedSourceSchema(); err != nil {
+			return nil, err
+		}
+		for child := uint8(0); child < plan.childCount; child++ {
+			if child != plan.retained {
+				if err := plan.validateReplicatedChildSchema(plan.targets[child]); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	hasGlobalIndex := false
+	for index := range relationTemplate {
+		hasGlobalIndex = hasGlobalIndex ||
+			relationTemplate[index].Kind == sqldriver.ReplicatedShardRelationGlobalIndex
+	}
+	if hasGlobalIndex {
+		for child := 0; child < int(split.ChildCount); child++ {
+			if child == int(split.RetainedChild) {
+				continue
+			}
+			target := &plan.targets[child]
+			if !sameSplitRelationPlacement(relationTemplate, target.SQL.Relations) ||
+				target.SQL.RelationManifestDigest == ([sha256.Size]byte{}) {
+				return nil, ErrInvalidPlan
+			}
+		}
+		for index := range relationTemplate {
+			relation := relationTemplate[index]
+			if relation.Relation != uint16(index+1) || !plan.validRelationCollection(index, relation) {
+				return nil, ErrInvalidPlan
+			}
+			if index == 0 && relation.Kind != sqldriver.ReplicatedShardRelationJSON ||
+				index != 0 && relation.Kind != sqldriver.ReplicatedShardRelationGlobalIndex {
+				return nil, ErrInvalidPlan
+			}
+			if relation.Kind == sqldriver.ReplicatedShardRelationGlobalIndex {
+				if relation.IndexID == 0 || relation.Incarnation == 0 ||
+					relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
+					relation.KeyEncoding != sqldriver.ReplicatedRelationKeyCanonicalTuple ||
+					relation.KeyArity == 0 || relation.KeyArity > distribution.KeyspaceWidth ||
+					relation.TupleVersion != distribution.CurrentTupleVersion ||
+					relation.MapperVersion != distribution.NativeMapperVersion ||
+					relation.BucketBits != split.Source.BucketBits ||
+					!distribution.ValidVirtualBucketBits(relation.BucketBits) {
+					return nil, ErrInvalidPlan
+				}
+				plan.indexRelations = append(plan.indexRelations, relation)
+			}
+		}
+	}
 	plan.operation = splitOperationID(plan)
 	return plan, nil
+}
+
+func cloneSplitRelations(
+	input []sqldriver.ReplicatedShardRelationIdentity,
+) []sqldriver.ReplicatedShardRelationIdentity {
+	return append([]sqldriver.ReplicatedShardRelationIdentity(nil), input...)
+}
+
+func sameSplitRelationPlacement(
+	left, right []sqldriver.ReplicatedShardRelationIdentity,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		a, b := left[index], right[index]
+		if a.Relation != b.Relation || a.Kind != b.Kind || a.Table != b.Table ||
+			a.IndexID != b.IndexID || a.Incarnation != b.Incarnation ||
+			a.LocatorCount != b.LocatorCount || a.Unique != b.Unique ||
+			a.KeyEncoding != b.KeyEncoding || a.KeyArity != b.KeyArity ||
+			a.TupleVersion != b.TupleVersion || a.MapperVersion != b.MapperVersion ||
+			a.BucketBits != b.BucketBits {
+			return false
+		}
+	}
+	return true
 }
 
 // OperationID returns the exact stable identity reconstructed on controller
@@ -241,41 +493,39 @@ func (p *Plan) OperationID() OperationID {
 }
 
 func splitOperationID(plan *Plan) OperationID {
-	var raw [768]byte
-	at := copy(raw[:], "vibedb/splitcontroller/operation\x00")
-	digest := plan.partitioner.Digest()
-	at += copy(raw[at:], digest[:])
-	binary.LittleEndian.PutUint64(raw[at:at+8], plan.current)
-	binary.LittleEndian.PutUint64(raw[at+8:at+16], plan.next)
-	raw[at+16], raw[at+17] = plan.childCount, plan.retained
-	at += 24
-	for child := 0; child < int(plan.childCount); child++ {
-		target := &plan.targets[child]
-		raw[at] = uint8(child)
-		at++
-		if target.Endpoint == "" {
-			continue
-		}
-		for _, id := range [...][16]byte{
-			target.WAL.ClusterID, target.WAL.ClusterIncarnation,
-			target.WAL.ShardIncarnation, target.WAL.GroupID,
-			target.WAL.StoreID, target.SQL.LogID,
-		} {
-			at += copy(raw[at:], id[:])
-		}
-		values := [...]uint64{
-			target.WAL.AllocationGeneration, target.WAL.MemberID,
-			target.TopologyRecoveryEpoch,
-			target.Authority.ActivePolicyGeneration, target.Authority.ProtectionEpoch,
-			target.Authority.OwnershipEpoch, target.Authority.SchemaGeneration,
-			target.Authority.RoutingVersion, target.Authority.RouteGeneration,
-		}
-		for _, value := range values {
-			binary.LittleEndian.PutUint64(raw[at:at+8], value)
-			at += 8
-		}
+	digestWriter := sha256.New()
+	_, _ = digestWriter.Write([]byte("vibedb/splitcontroller/operation\x00"))
+	digest := plan.partitioner.GeometryDigest()
+	_, _ = digestWriter.Write(digest[:])
+	writeSplitOperationUint64(digestWriter, plan.current)
+	writeSplitOperationUint64(digestWriter, plan.next)
+	_, _ = digestWriter.Write([]byte{plan.childCount, plan.retained})
+	var result OperationID
+	copy(result[:], digestWriter.Sum(nil))
+	return result
+}
+
+// OperationIDForSplit fixes the operation namespace before preparing child
+// paths, WAL identities or SQL stores. It cannot depend on those derived
+// coordinates without introducing a hash/path cycle. Admission binds their
+// full immutable plan digest before any split action is executed.
+func OperationIDForSplit(sourceGeneration uint64, split *autosplit.SplitPlan, partitioner *rangesplit.Partitioner) (OperationID, error) {
+	if sourceGeneration == 0 || sourceGeneration == math.MaxUint64 || split == nil || partitioner == nil ||
+		split.ChildCount < 2 || split.ChildCount > autosplit.MaxSplitChildren || split.RetainedChild >= split.ChildCount {
+		return OperationID{}, ErrInvalidPlan
 	}
-	return OperationID(sha256.Sum256(raw[:at]))
+	digest, err := rangesplit.SplitPlanDigest(split)
+	if err != nil || digest != partitioner.GeometryDigest() {
+		return OperationID{}, errors.Join(err, ErrInvalidPlan)
+	}
+	return splitOperationID(&Plan{partitioner: partitioner, current: sourceGeneration, next: sourceGeneration + 1,
+		childCount: split.ChildCount, retained: split.RetainedChild}), nil
+}
+
+func writeSplitOperationUint64(target hash.Hash, value uint64) {
+	var raw [8]byte
+	binary.LittleEndian.PutUint64(raw[:], value)
+	_, _ = target.Write(raw[:])
 }
 
 func reconstructSourceManifest(split *autosplit.SplitPlan) (*distribution.Manifest, error) {
@@ -378,7 +628,27 @@ type ChildObservation struct {
 	WALBinding sqldriver.ReplicatedShardStoreBinding
 
 	RuntimeIdentity raftmember.RuntimeIdentity
-	RuntimeStatus   raftmember.RuntimeStatus
+
+	// ReadyReplicas is a cold control-plane proof assembled from independent
+	// raftservice.Owner probes. Publication requires a majority of the exact
+	// manifest replica count to report the same live term and leader after
+	// applying the certified cut. A leader's progress tracker alone is not an
+	// apply proof for followers, so every slot is one member-local ServingState.
+	ReadyReplicas []raftservice.ServingState
+
+	// Members retains independently authenticated local lifecycle evidence.
+	// Store IDs, apply storage and WAL bindings differ across RF3 replicas;
+	// they must be checked against each prepared member, never equated.
+	Members []ChildReplicaObservation `json:"members,omitempty"`
+}
+
+type ChildReplicaObservation struct {
+	Member          uint64
+	Phase           ChildPhase
+	ApplyIdentity   sqldriver.ReplicatedApplyIdentity
+	ApplyProfile    sqldriver.ReplicatedApplyCapacityProfile
+	WALBinding      sqldriver.ReplicatedShardStoreBinding
+	RuntimeIdentity raftmember.RuntimeIdentity
 }
 
 // Observation is one detached control-loop cut. Pointers distinguish absent
@@ -388,7 +658,15 @@ type Observation struct {
 	Catalog      *gateway.Snapshot
 	SourceState  replicatedstate.State
 	SourceStatus raftmember.RuntimeStatus
-	Capture      *rangesplit.SourceCapture
+	// SourceServing is the authenticated full serving fence used by mutating
+	// source actions. SourceStatus remains the compact reconciliation view.
+	SourceServing raftservice.ServingState
+	SourceNode    rafttransport.NodeID
+	// CaptureHead is the detached, wire-safe source-capture publication head.
+	// Local runtimes may also provide Capture for execution; reconciliation
+	// accepts either representation but requires them to agree when both exist.
+	CaptureHead uint64
+	Capture     *rangesplit.SourceCapture
 
 	Artifacts   *rangesplit.ChildArtifactSet
 	Tail        *rangesplit.TailCursor
@@ -397,7 +675,20 @@ type Observation struct {
 	Children    [autosplit.MaxSplitChildren]*ChildObservation
 	Prune       *rangesplit.RetainedPruneCursor
 
-	OlderCatalogDrained bool
+	OlderCatalogDrained      bool
+	CatalogDrainCertificate  gateway.ClusterCatalogDrainCertificate
+	RetainedPruneCertificate gateway.RetainedPruneCertificate
+}
+
+func observationCaptureHead(observed Observation) (uint64, bool) {
+	if observed.Capture == nil {
+		return observed.CaptureHead, observed.CaptureHead != 0
+	}
+	head := observed.Capture.Head()
+	if observed.CaptureHead != 0 && observed.CaptureHead != head {
+		return 0, false
+	}
+	return head, head != 0
 }
 
 // Reconcile proves the one safe next step from independently durable state.
@@ -425,9 +716,9 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 			return Action{}, ErrTopologyConflict
 		}
 		if observed.Prune != nil &&
-			observed.Prune.Phase() == rangesplit.RetainedPruneComplete &&
-			plan.sourceStateAheadOfCompletion(observed.SourceState, certificate, *observed.Prune) {
-			if observed.Capture == nil || observed.Capture.Head() != observed.SourceState.Applied {
+			plan.sourceStateAheadOfPrune(observed.SourceState, certificate, *observed.Prune) {
+			captureHead, captureOK := observationCaptureHead(observed)
+			if !captureOK || captureHead != observed.SourceState.Applied {
 				return Action{}, ErrTopologyConflict
 			}
 			if !sourceLeader(observed.SourceStatus, observed.SourceState) {
@@ -458,21 +749,26 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 	if err := plan.validateSourceObservation(observed); err != nil {
 		return Action{}, err
 	}
-	if observed.Capture == nil || observed.Capture.Head() == 0 {
+	captureHead, hasCapture := observationCaptureHead(observed)
+	if !hasCapture {
 		if !sourceLeader(observed.SourceStatus, observed.SourceState) {
 			return Action{Kind: ActionAwaitSourceLeader}, nil
 		}
 		return Action{Kind: ActionStartCapture}, nil
 	}
-	if observed.Capture.Head() != observed.SourceState.Applied {
-		return Action{}, ErrTopologyConflict
+	if captureHead != observed.SourceState.Applied {
+		return Action{}, fmt.Errorf("%w: capture head %d differs from source applied %d", ErrTopologyConflict, captureHead, observed.SourceState.Applied)
 	}
 	if observed.Artifacts == nil {
 		return Action{Kind: ActionBuildArtifacts}, nil
 	}
 	initial, err := plan.partitioner.InitialTailCursor(*observed.Artifacts)
-	if err != nil || initial.SourceCoordinates().RouteGeneration != plan.current {
-		return Action{}, errors.Join(ErrTopologyConflict, err)
+	sourceGeneration := plan.current
+	if plan.sourceAuthority != nil {
+		sourceGeneration = plan.sourceAuthority.Command.RouteGeneration
+	}
+	if err != nil || initial.SourceCoordinates().RouteGeneration != sourceGeneration {
+		return Action{}, fmt.Errorf("%w: artifact source generation=%d expected=%d: %w", ErrTopologyConflict, initial.SourceCoordinates().RouteGeneration, sourceGeneration, err)
 	}
 	if action, ok, err := plan.stageAction(observed, initial); ok || err != nil {
 		return action, err
@@ -486,10 +782,10 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{}, ErrTopologyConflict
 	}
 	if !tail.Sealed() {
-		if observed.Capture.Head() < tail.SourceCut().Applied {
+		if captureHead < tail.SourceCut().Applied {
 			return Action{}, ErrTopologyConflict
 		}
-		if observed.Capture.Head() > tail.SourceCut().Applied {
+		if captureHead > tail.SourceCut().Applied {
 			return Action{Kind: ActionCatchUpTail}, nil
 		}
 		if !plan.sourceStateMatchesCut(observed.SourceState, tail) {
@@ -510,7 +806,7 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{Kind: ActionCatchUpTail}, nil
 	}
 	if observed.Certificate == nil {
-		if observed.Capture.Head() != tail.SourceCut().Applied ||
+		if captureHead != tail.SourceCut().Applied ||
 			!plan.sourceStateMatchesCut(observed.SourceState, tail) {
 			return Action{}, ErrTopologyConflict
 		}
@@ -540,7 +836,11 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 	return Action{Kind: ActionPublishCatalog, CatalogGeneration: plan.next}, nil
 }
 
-func (p *Plan) sourceStateAheadOfCompletion(
+// The source may apply the dedicated prune session or the pending delete
+// before its cursor is advanced. Reconciliation schedules only a bounded
+// capture-suffix verification; the pruner must prove each intervening entry
+// before it can delete anything else or certify completion.
+func (p *Plan) sourceStateAheadOfPrune(
 	state replicatedstate.State,
 	certificate rangesplit.CutoverCertificate,
 	prune rangesplit.RetainedPruneCursor,
@@ -602,7 +902,7 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 	initial := p.sourceBindingInitial(binding)
 	sealed := p.sourceBindingSealed(binding)
 	if !initial && !sealed {
-		return ErrTopologyConflict
+		return fmt.Errorf("%w: source binding is neither initial nor sealed: %+v", ErrTopologyConflict, binding)
 	}
 	proofSealed := observed.Certificate != nil || observed.Tail != nil && observed.Tail.Sealed()
 	if proofSealed && !sealed {
@@ -612,13 +912,25 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 }
 
 func (p *Plan) sourceBindingInitial(binding replicatedstate.Binding) bool {
-	return p != nil && binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
-		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
-		binding.RouteGeneration == p.current && binding.OwnedRange == p.source.Range
+	if p == nil {
+		return false
+	}
+	routing, generation := uint64(p.source.RoutingVersion), p.current
+	if p.sourceAuthority != nil {
+		if !p.sourceBindingAuthorityMatches(binding) {
+			return false
+		}
+		routing, generation = p.sourceAuthority.Command.RoutingVersion, p.sourceAuthority.Command.RouteGeneration
+	}
+	return binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) && binding.RoutingVersion == routing &&
+		binding.RouteGeneration == generation && binding.OwnedRange == p.source.Range
 }
 
 func (p *Plan) sourceBindingSealed(binding replicatedstate.Binding) bool {
 	if p == nil {
+		return false
+	}
+	if p.sourceAuthority != nil && !p.sourceBindingAuthorityMatches(binding) {
 		return false
 	}
 	retained := p.children[p.retained]
@@ -701,7 +1013,7 @@ func (p *Plan) stageAction(
 		if cursor.Child() != uint8(child) || cursor.PlanDigest() != p.partitioner.Digest() ||
 			cursor.PlacementDigest() != placement || cursor.ArtifactDigest() != artifact.Digest ||
 			cursor.SourceCut().Applied < artifact.Source.Applied {
-			return Action{}, false, ErrTopologyConflict
+			return Action{}, false, fmt.Errorf("%w: child %d staged artifact=%x applied=%d source artifact=%x applied=%d", ErrTopologyConflict, child, cursor.ArtifactDigest(), cursor.SourceCut().Applied, artifact.Digest, artifact.Source.Applied)
 		}
 		switch cursor.Phase() {
 		case rangesplit.ChildStageArtifact:
@@ -758,6 +1070,13 @@ func (p *Plan) childAction(
 		if status == nil {
 			return Action{Kind: ActionActivateChild, Child: uint8(child)}, true, nil
 		}
+		if len(status.Members) != 0 {
+			action, needed, err := replicatedChildAction(target, *status, certificate)
+			if needed || err != nil {
+				return action, needed, err
+			}
+			continue
+		}
 		if status.Child != uint8(child) ||
 			status.Phase < ChildPhaseActivated || status.Phase > ChildPhaseRuntimeAdopted ||
 			status.ApplyIdentity.Storage == "" ||
@@ -773,7 +1092,7 @@ func (p *Plan) childAction(
 		if status.Phase == ChildPhaseActivated {
 			if status.WALBinding != (sqldriver.ReplicatedShardStoreBinding{}) ||
 				status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
-				status.RuntimeStatus != (raftmember.RuntimeStatus{}) ||
+				len(status.ReadyReplicas) != 0 ||
 				status.ApplyProfile.Applied != certificate.SourceCut().Applied ||
 				status.ApplyProfile.SessionCount != 0 ||
 				status.ApplyProfile.SessionSlotCount != 0 {
@@ -786,7 +1105,7 @@ func (p *Plan) childAction(
 		}
 		if status.Phase == ChildPhaseWALCreated {
 			if status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
-				status.RuntimeStatus != (raftmember.RuntimeStatus{}) {
+				len(status.ReadyReplicas) != 0 {
 				return Action{}, false, ErrTopologyConflict
 			}
 			return Action{Kind: ActionAdoptChildRuntime, Child: uint8(child)}, true, nil
@@ -794,17 +1113,184 @@ func (p *Plan) childAction(
 		if !runtimeIdentityMatches(target, status.RuntimeIdentity) {
 			return Action{}, false, ErrTopologyConflict
 		}
-		runtime := status.RuntimeStatus
-		if runtime.MemberID != target.WAL.MemberID || runtime.Term == 0 ||
-			runtime.Applied > runtime.Commit {
+		ready, valid := childQuorumReady(
+			target, status.ApplyProfile, status.ReadyReplicas,
+			int(p.leaderCounts[child]), certificate.SourceCut().Applied,
+		)
+		if !valid {
 			return Action{}, false, ErrTopologyConflict
 		}
-		if runtime.LeaderID != runtime.MemberID || runtime.RaftState != raft.StateLeader ||
-			runtime.Applied < certificate.SourceCut().Applied {
+		if !ready {
 			return Action{Kind: ActionAwaitChildReady, Child: uint8(child)}, true, nil
 		}
 	}
 	return Action{}, false, nil
+}
+
+func replicatedChildAction(target ChildTarget, status ChildObservation, certificate rangesplit.CutoverCertificate) (Action, bool, error) {
+	if status.Child != target.Child || len(status.Members) > len(target.Replicas) || len(target.Replicas) != gateway.ServingReplicaCount {
+		return Action{}, false, ErrTopologyConflict
+	}
+	minimumPhase := ChildPhaseRuntimeAdopted
+	var profile sqldriver.ReplicatedApplyCapacityProfile
+	for index, member := range status.Members {
+		var replica *ChildReplicaTarget
+		for candidate := range target.Replicas {
+			if target.Replicas[candidate].Member == member.Member {
+				replica = &target.Replicas[candidate]
+				break
+			}
+		}
+		if replica == nil || member.Phase < ChildPhaseActivated || member.Phase > ChildPhaseRuntimeAdopted ||
+			member.ApplyIdentity != replica.Apply || member.ApplyProfile.Binding != replica.SQL.Binding ||
+			member.ApplyProfile.RelationManifestDigest != target.RelationManifestDigest ||
+			!member.ApplyProfile.Initialized || member.ApplyProfile.Applied < certificate.SourceCut().Applied ||
+			member.ApplyProfile.SessionEpochHighWater != certificate.SourceCut().Applied ||
+			member.ApplyProfile.MaxSessions != member.ApplyIdentity.MaxSessions || member.ApplyProfile.RetryWindow != member.ApplyIdentity.RetryWindow {
+			if replica != nil {
+				return Action{}, false, fmt.Errorf("%w: child member=%d phase=%d applied=%d epoch=%d cut=%d identity=%t binding=%t digest=%t sessions=%d/%d retry=%d/%d", ErrTopologyConflict, member.Member, member.Phase, member.ApplyProfile.Applied, member.ApplyProfile.SessionEpochHighWater, certificate.SourceCut().Applied, member.ApplyIdentity == replica.Apply, member.ApplyProfile.Binding == replica.SQL.Binding, member.ApplyProfile.RelationManifestDigest == target.RelationManifestDigest, member.ApplyProfile.MaxSessions, member.ApplyIdentity.MaxSessions, member.ApplyProfile.RetryWindow, member.ApplyIdentity.RetryWindow)
+			}
+			return Action{}, false, ErrTopologyConflict
+		}
+		for prior := 0; prior < index; prior++ {
+			if status.Members[prior].Member == member.Member {
+				return Action{}, false, ErrTopologyConflict
+			}
+		}
+		if member.Phase == ChildPhaseActivated {
+			if member.WALBinding != (sqldriver.ReplicatedShardStoreBinding{}) || member.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
+				member.ApplyProfile.Applied != certificate.SourceCut().Applied || member.ApplyProfile.SessionCount != 0 || member.ApplyProfile.SessionSlotCount != 0 {
+				return Action{}, false, ErrTopologyConflict
+			}
+		} else if member.WALBinding != replica.SQL.Binding {
+			return Action{}, false, ErrTopologyConflict
+		}
+		if member.Phase == ChildPhaseWALCreated && member.RuntimeIdentity != (raftmember.RuntimeIdentity{}) {
+			return Action{}, false, ErrTopologyConflict
+		}
+		if member.Phase == ChildPhaseRuntimeAdopted {
+			local := target
+			local.WAL, local.SQL = replica.WAL, replica.SQL
+			if !runtimeIdentityMatches(local, member.RuntimeIdentity) {
+				return Action{}, false, ErrTopologyConflict
+			}
+		}
+		minimumPhase = min(minimumPhase, member.Phase)
+		profile = member.ApplyProfile
+	}
+	action := Action{Child: target.Child}
+	if minimumPhase != ChildPhaseRuntimeAdopted && len(status.Members) != len(target.Replicas) {
+		action.Kind = ActionActivateChild
+		return action, true, nil
+	}
+	switch minimumPhase {
+	case ChildPhaseActivated:
+		action.Kind = ActionCreateChildWAL
+	case ChildPhaseWALCreated:
+		action.Kind = ActionAdoptChildRuntime
+	case ChildPhaseRuntimeAdopted:
+		for _, ready := range status.ReadyReplicas {
+			found := false
+			for _, member := range status.Members {
+				found = found || member.RuntimeIdentity == ready.Identity
+			}
+			if !found {
+				return Action{}, false, ErrTopologyConflict
+			}
+		}
+		// RF3 may elect any prepared voter. The first target owns no special
+		// publication authority; bind the quorum check to the independently
+		// observed leader, whose exact local identity was validated above.
+		quorumTarget := target
+		if len(status.ReadyReplicas) != 0 {
+			for _, replica := range target.Replicas {
+				if replica.Member == status.ReadyReplicas[0].Status.LeaderID {
+					quorumTarget.WAL, quorumTarget.SQL = replica.WAL, replica.SQL
+					break
+				}
+			}
+		}
+		ready, valid := childQuorumReady(quorumTarget, profile, status.ReadyReplicas, len(target.Replicas), certificate.SourceCut().Applied)
+		if !valid {
+			return Action{}, false, ErrTopologyConflict
+		}
+		if ready {
+			return Action{}, false, nil
+		}
+		action.Kind = ActionAwaitChildReady
+	}
+	return action, true, nil
+}
+
+func childQuorumReady(
+	target ChildTarget,
+	profile sqldriver.ReplicatedApplyCapacityProfile,
+	replicas []raftservice.ServingState,
+	replicaCount int,
+	minimumApplied uint64,
+) (ready bool, valid bool) {
+	if replicaCount <= 0 || len(replicas) > replicaCount {
+		return false, false
+	}
+	quorum := replicaCount/2 + 1
+	var leader, term, replicaSet uint64
+	for index := range replicas {
+		candidate := replicas[index]
+		identity, status, command := candidate.Identity, candidate.Status, candidate.Command
+		if !runtimeGroupMatches(target, identity) || status.MemberID != identity.MemberID ||
+			status.MemberID == 0 || status.LeaderID == 0 || status.Term == 0 ||
+			status.Applied > status.Commit || !command.Valid() ||
+			command.ActivePolicyGeneration != target.Authority.ActivePolicyGeneration ||
+			command.ProtectionEpoch != target.Authority.ProtectionEpoch ||
+			command.OwnershipEpoch != target.Authority.OwnershipEpoch ||
+			command.SchemaGeneration != target.Authority.SchemaGeneration ||
+			command.RoutingVersion != target.Authority.RoutingVersion ||
+			command.RouteGeneration != target.Authority.RouteGeneration ||
+			command.RelationManifestDigest != profile.RelationManifestDigest {
+			return false, false
+		}
+		if index == 0 {
+			leader, term, replicaSet = status.LeaderID, status.Term, command.ReplicaSetVersion
+		} else if status.LeaderID != leader || status.Term != term ||
+			command.ReplicaSetVersion != replicaSet {
+			return false, true
+		}
+		for prior := 0; prior < index; prior++ {
+			other := replicas[prior].Identity
+			if identity.MemberID == other.MemberID || identity.StoreID == other.StoreID {
+				return false, false
+			}
+		}
+		if status.Applied < minimumApplied {
+			return false, true
+		}
+	}
+	if len(replicas) < quorum {
+		return false, true
+	}
+	if leader != target.WAL.MemberID {
+		return false, true
+	}
+	for index := range replicas {
+		status := replicas[index].Status
+		if status.MemberID == leader {
+			return status.RaftState == raft.StateLeader, true
+		}
+	}
+	return false, true
+}
+
+func runtimeGroupMatches(target ChildTarget, identity raftmember.RuntimeIdentity) bool {
+	return identity.Group.ClusterID == target.WAL.ClusterID &&
+		identity.Group.ClusterIncarnation == target.WAL.ClusterIncarnation &&
+		identity.Group.TopologyRecoveryEpoch == target.TopologyRecoveryEpoch &&
+		identity.Group.ShardIncarnation == target.WAL.ShardIncarnation &&
+		identity.Group.GroupID == target.WAL.GroupID &&
+		identity.Distribution == target.WAL.Distribution &&
+		identity.Shard == target.WAL.Shard &&
+		identity.AllocationGeneration == target.WAL.AllocationGeneration &&
+		identity.MemberID != 0 && identity.StoreID != ([16]byte{}) &&
+		identity.NodeIncarnation != 0
 }
 
 func (p *Plan) validatePublishedPreparation(observed Observation) error {
@@ -846,11 +1332,152 @@ func runtimeIdentityMatches(target ChildTarget, identity raftmember.RuntimeIdent
 }
 
 func cloneChildTarget(target ChildTarget) ChildTarget {
+	target.LocalIndexes = cloneSplitLocalIndexes(target.LocalIndexes)
 	target.Endpoint = distribution.EndpointID(strings.Clone(string(target.Endpoint)))
+	target.Replicas = append([]ChildReplicaTarget(nil), target.Replicas...)
+	for index := range target.Replicas {
+		replica := &target.Replicas[index]
+		replica.Endpoint = distribution.EndpointID(strings.Clone(string(replica.Endpoint)))
+		replica.NativeEndpoint = distribution.EndpointID(strings.Clone(string(replica.NativeEndpoint)))
+		replica.ControlEndpoint = distribution.EndpointID(strings.Clone(string(replica.ControlEndpoint)))
+		replica.PeerAddress = strings.Clone(replica.PeerAddress)
+		replica.NativeAddress = strings.Clone(replica.NativeAddress)
+		replica.ControlAddress = strings.Clone(replica.ControlAddress)
+		replica.SnapshotAddress = strings.Clone(replica.SnapshotAddress)
+		replica.WAL.Distribution = strings.Clone(replica.WAL.Distribution)
+		replica.WAL.Shard = strings.Clone(replica.WAL.Shard)
+		replica.WALPath = strings.Clone(replica.WALPath)
+		replica.SQLPath = strings.Clone(replica.SQLPath)
+		replica.RuntimeRoot = strings.Clone(replica.RuntimeRoot)
+		replica.SQL = replica.SQL.Clone()
+		replica.Apply.Storage = strings.Clone(replica.Apply.Storage)
+		replica.Apply.CaptureStorage = strings.Clone(replica.Apply.CaptureStorage)
+		replica.Apply.Placement.ShardKey = strings.Clone(replica.Apply.Placement.ShardKey)
+	}
 	target.WAL.Distribution = strings.Clone(target.WAL.Distribution)
 	target.WAL.Shard = strings.Clone(target.WAL.Shard)
 	target.SQL = target.SQL.Clone()
 	return target
+}
+
+const maxPreparedChildPathBytes = 4096
+
+func validPreparedChildReplicas(
+	descriptor autosplit.SplitChildIdentity,
+	collection string,
+	target ChildTarget,
+) bool {
+	if len(target.Replicas) == 0 {
+		return false
+	}
+	for index := range target.Replicas {
+		replica := target.Replicas[index]
+		if !canonicalPreparedChildPath(replica.RuntimeRoot) ||
+			!canonicalPreparedChildPath(replica.WALPath) ||
+			!canonicalPreparedChildPath(replica.SQLPath) ||
+			replica.WALPath == replica.SQLPath || replica.WALPath == replica.RuntimeRoot ||
+			replica.SQLPath == replica.RuntimeRoot ||
+			!pathWithinPreparedRoot(replica.RuntimeRoot, replica.WALPath) ||
+			!pathWithinPreparedRoot(replica.RuntimeRoot, replica.SQLPath) ||
+			replica.CertificateDigest == ([sha256.Size]byte{}) ||
+			replica.WAL.MemberID != replica.Member || replica.WAL.StoreID != replica.StoreID ||
+			replica.WAL.Distribution != target.WAL.Distribution ||
+			replica.WAL.Shard != target.WAL.Shard ||
+			replica.WAL.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
+			replica.WAL.ClusterID != target.WAL.ClusterID ||
+			replica.WAL.ClusterIncarnation != target.WAL.ClusterIncarnation ||
+			replica.WAL.ShardIncarnation != target.WAL.ShardIncarnation ||
+			replica.WAL.GroupID != target.WAL.GroupID || replica.SQL.UserTable != collection ||
+			replica.SQL.LogID == ([16]byte{}) ||
+			!sameSplitRelationPlacement(replica.SQL.Relations, target.SQL.Relations) ||
+			replica.Apply.Storage == "" || replica.Apply.CaptureStorage == "" ||
+			replica.Apply.Storage == replica.Apply.CaptureStorage ||
+			replica.Apply.ValidationDigest == ([sha256.Size]byte{}) ||
+			replica.Apply.MaxSessions == 0 || replica.Apply.RetryWindow == 0 ||
+			replica.Apply.Placement.Range != descriptor.Range ||
+			preparedChildReplicaDigest(replica) == ([sha256.Size]byte{}) {
+			return false
+		}
+		binding, err := raftmember.BindingForNewWAL(
+			replica.WAL, target.TopologyRecoveryEpoch, target.Authority,
+		)
+		if err != nil || replica.SQL.Binding != binding {
+			return false
+		}
+	}
+	return target.WAL == target.Replicas[0].WAL &&
+		target.SQL.Binding == target.Replicas[0].SQL.Binding &&
+		target.SQL.LogID == target.Replicas[0].SQL.LogID
+}
+
+func canonicalPreparedChildPath(path string) bool {
+	return path != "" && len(path) <= maxPreparedChildPathBytes && filepath.IsAbs(path) &&
+		filepath.Clean(path) == path && path != string(filepath.Separator)
+}
+
+func pathWithinPreparedRoot(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != "." && relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+func validChildReplicaTargets(split *autosplit.SplitPlan, child int, target ChildTarget) bool {
+	if split == nil || child < 0 || len(target.Replicas) == 0 {
+		return false
+	}
+	descriptor, ok := split.Child(child)
+	if !ok || len(target.Replicas) != len(descriptor.Leaders) {
+		return false
+	}
+	for index, replica := range target.Replicas {
+		if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
+			replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
+			replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
+			replica.Endpoint == replica.NativeEndpoint || replica.Endpoint == replica.ControlEndpoint ||
+			replica.NativeEndpoint == replica.ControlEndpoint ||
+			replica.NativeEndpoint != descriptor.Leaders[index] || !validChildReplicaAddresses(replica) {
+			return false
+		}
+		for prior := 0; prior < index; prior++ {
+			other := target.Replicas[prior]
+			if other.Member == replica.Member || other.Node == replica.Node ||
+				other.StoreID == replica.StoreID || other.Endpoint == replica.Endpoint ||
+				other.NativeEndpoint == replica.NativeEndpoint || other.ControlEndpoint == replica.ControlEndpoint ||
+				other.SnapshotAddress == replica.SnapshotAddress {
+				return false
+			}
+		}
+	}
+	first := target.Replicas[0]
+	return target.Endpoint == first.NativeEndpoint && target.WAL.MemberID == first.Member &&
+		target.WAL.StoreID == first.StoreID
+}
+
+func validChildReplicaAddresses(replica ChildReplicaTarget) bool {
+	if !validPreparedChildAddress(replica.SnapshotAddress) {
+		return false
+	}
+	if replica.PeerAddress == "" && replica.NativeAddress == "" && replica.ControlAddress == "" {
+		return true
+	}
+	return validPreparedChildAddress(replica.PeerAddress) &&
+		validPreparedChildAddress(replica.NativeAddress) &&
+		validPreparedChildAddress(replica.ControlAddress) &&
+		replica.PeerAddress != replica.NativeAddress && replica.PeerAddress != replica.ControlAddress &&
+		replica.NativeAddress != replica.ControlAddress && replica.PeerAddress != replica.SnapshotAddress &&
+		replica.NativeAddress != replica.SnapshotAddress && replica.ControlAddress != replica.SnapshotAddress
+}
+
+func validPreparedChildAddress(address string) bool {
+	if len(address) > 512 || strings.ContainsAny(address, " \t\r\n") {
+		return false
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return false
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	return err == nil && number != 0
 }
 
 func cloneSourceIdentity(source autosplit.SourceIdentity) autosplit.SourceIdentity {

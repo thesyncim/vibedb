@@ -136,7 +136,7 @@ func openCollection(
 		}
 		defer releaseNamespace()
 	}
-	if err := storeio.LockWriter(file); err != nil {
+	if err := storeio.LockWriterUntil(file, options.OpenWriterLockContext, options.OpenWriterLockDeadline); err != nil {
 		return nil, err
 	}
 	locked := true

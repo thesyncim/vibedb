@@ -10,11 +10,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -23,12 +27,7 @@ import (
 func TestRunServeRF3ArgumentExitClasses(t *testing.T) {
 	directory := t.TempDir()
 	manifestPath := filepath.Join(directory, "rf3.json")
-	manifestDocument := strings.Replace(
-		canonicalRF3Manifest,
-		"/srv/vibedb/member-sql-identity.json",
-		filepath.Join(directory, "missing-sql-identity.json"),
-		1,
-	)
+	manifestDocument := canonicalRF3Manifest
 	if err := os.WriteFile(manifestPath, []byte(manifestDocument), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +56,75 @@ func TestRunServeRF3ArgumentExitClasses(t *testing.T) {
 	}
 }
 
+type rf3ControlTestHandler struct{}
+
+func (rf3ControlTestHandler) Serve(context.Context, rafttransport.PeerConnection) error { return nil }
+
+func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
+	handler := rf3ControlTestHandler{}
+	if mux, err := newRF3ControlMux(handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler, handler); err != nil || mux == nil {
+		t.Fatalf("all-service mux = %v, %v", mux, err)
+	}
+	if _, err := newRF3ControlMux(nil, handler, handler, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil); err == nil {
+		t.Fatal("missing mandatory membership service accepted")
+	}
+	if mux, err := newRF3SnapshotMux(handler, handler); err != nil || mux == nil {
+		t.Fatalf("snapshot mux = %v, %v", mux, err)
+	}
+	if _, err := newRF3SnapshotMux(nil, nil); err == nil {
+		t.Fatal("empty snapshot mux accepted")
+	}
+}
+
+func TestRestoredRF3PreparingMarkerIsExplicitAndBounded(t *testing.T) {
+	root := t.TempDir()
+	sqlPath := filepath.Join(root, "member.vdb")
+	if restored, err := hasRestoredRF3PreparingMarker(sqlPath); err != nil || restored {
+		t.Fatalf("missing marker restored=%t err=%v", restored, err)
+	}
+	marker := make([]byte, 37)
+	marker[0], marker[36] = 1, 2
+	if err := os.WriteFile(filepath.Join(root, "restore_preparing"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := hasRestoredRF3PreparingMarker(sqlPath); err != nil || !restored {
+		t.Fatalf("valid marker restored=%t err=%v", restored, err)
+	}
+	marker[36] = 3
+	if err := os.WriteFile(filepath.Join(root, "restore_preparing"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := hasRestoredRF3PreparingMarker(sqlPath); err == nil || restored {
+		t.Fatalf("invalid marker restored=%t err=%v", restored, err)
+	}
+}
+
+func TestRF3PublishedSchemaIdentityAdvancesOnlySchemaContract(t *testing.T) {
+	retained := sqldriver.ReplicatedShardStoreIdentity{
+		LogID: [16]byte{1}, UserTable: "docs",
+		Binding: sqldriver.ReplicatedShardStoreBinding{
+			Authority: sqldriver.ReplicatedAuthorityProfile{SchemaGeneration: 7},
+		},
+	}
+	retainedApply := sqldriver.ReplicatedApplyIdentity{ValidationDigest: [32]byte{2}}
+	published := retained.Clone()
+	published.Binding.Authority.SchemaGeneration++
+	publishedApply := retainedApply
+	publishedApply.ValidationDigest = [32]byte{3}
+	if !rf3SchemaSuccessorMatchesRetained(retained, retainedApply, published, publishedApply) {
+		t.Fatal("exact schema successor rejected")
+	}
+	diverged := published.Clone()
+	diverged.LogID[0]++
+	if rf3SchemaSuccessorMatchesRetained(retained, retainedApply, diverged, publishedApply) {
+		t.Fatal("schema activation replaced immutable log identity")
+	}
+	publishedApply.MaxSessions++
+	if rf3SchemaSuccessorMatchesRetained(retained, retainedApply, published, publishedApply) {
+		t.Fatal("schema activation replaced apply capacity contract")
+	}
+}
+
 func TestRF3ExecutionLaneCountIsExplicitPowerOfTwo(t *testing.T) {
 	if rf3DefaultExecutionLanes != 8 || !validRF3ExecutionLanes(rf3DefaultExecutionLanes) {
 		t.Fatalf("default execution lanes = %d", rf3DefaultExecutionLanes)
@@ -73,6 +141,25 @@ func TestRF3ExecutionLaneCountIsExplicitPowerOfTwo(t *testing.T) {
 	}
 }
 
+func TestRF3MultiGroupServingLimitsCoverManifestBound(t *testing.T) {
+	for _, groups := range []int{1, 2, maxRF3ManifestGroups} {
+		registry, err := raftserve.NewRegistry(rf3RegistryLimitsForGroups(groups))
+		if err != nil {
+			t.Fatalf("groups=%d registry limits: %v", groups, err)
+		}
+		lanes, err := registry.NewExecutionLanes(rf3DefaultExecutionLanes, rf3HostLimitsForGroups(groups))
+		if err != nil {
+			t.Fatalf("groups=%d lane limits: %v", groups, err)
+		}
+		if err := lanes.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := registry.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestValidateRF3Addresses(t *testing.T) {
 	valid := serveRF3TestManifest()
 	if err := validateRF3Addresses(valid); err != nil {
@@ -81,12 +168,13 @@ func TestValidateRF3Addresses(t *testing.T) {
 	wildcard := valid
 	wildcard.Listeners.Peer = ":17400"
 	wildcard.Listeners.Native = "[::]:17500"
+	wildcard.Listeners.Control = ":17700"
 	if err := validateRF3Addresses(wildcard); err != nil {
 		t.Fatalf("valid wildcard listeners: %v", err)
 	}
 	withTarget := valid
 	withTarget.EnrolledTarget = &rf3ManifestEnrolledTarget{
-		MemberID: 4, NodeID: rafttransport.NodeID{4},
+		MemberID: 4, NodeID: rafttransport.NodeID{4}, StoreID: [16]byte{5}, NodeIncarnation: 6,
 		PeerAddress: "member-4.internal:17400", NativeAddress: "member-4.internal:17500",
 		SnapshotAddress: "member-4.internal:17600", ControlAddress: "member-4.internal:17700",
 	}
@@ -99,8 +187,10 @@ func TestValidateRF3Addresses(t *testing.T) {
 		mutate func(*rf3Manifest)
 	}{
 		{"same_listeners", func(manifest *rf3Manifest) { manifest.Listeners.Native = manifest.Listeners.Peer }},
+		{"same_control_listener", func(manifest *rf3Manifest) { manifest.Listeners.Control = manifest.Listeners.Peer }},
 		{"peer_listener_missing_port", func(manifest *rf3Manifest) { manifest.Listeners.Peer = "127.0.0.1" }},
 		{"native_listener_zero_port", func(manifest *rf3Manifest) { manifest.Listeners.Native = "127.0.0.1:0" }},
+		{"control_listener_zero_port", func(manifest *rf3Manifest) { manifest.Listeners.Control = "127.0.0.1:0" }},
 		{"listener_port_overflow", func(manifest *rf3Manifest) { manifest.Listeners.Peer = "127.0.0.1:65536" }},
 		{"listener_nonnumeric_port", func(manifest *rf3Manifest) { manifest.Listeners.Peer = "127.0.0.1:http" }},
 		{"member_missing_host", func(manifest *rf3Manifest) { manifest.Members[1].PeerAddress = ":17401" }},
@@ -146,9 +236,9 @@ func TestBuildRF3RosterReconstructsEnrolledTransitionCuts(t *testing.T) {
 		{"stable", &pb.ConfState{Voters: []uint64{1, 2, 3}}, 2,
 			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberEnrolled}, true},
 		{"learner", &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}, 4,
-			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberLearner}, false},
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberLearner}, true},
 		{"promoted_rf4", &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}, 4,
-			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, false},
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, true},
 		{"promoted_rf4_original", &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}, 2,
 			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, true},
 		{"final_rf3", &pb.ConfState{Voters: []uint64{2, 3, 4}}, 4,
@@ -187,6 +277,174 @@ func TestBuildRF3RosterReconstructsEnrolledTransitionCuts(t *testing.T) {
 				t.Fatalf("unknown-node dial error = %v, want ErrNodeNotFound", err)
 			}
 		})
+	}
+}
+
+func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.T) {
+	manifest := serveRF3TestManifest()
+	manifest.EnrolledTarget = serveRF3TestEnrolledTarget()
+	group := serveRF3TestGroup()
+	grant := rf3MembershipGrantFixture(manifest, group, 9)
+	members := rf3GrantTransportMembers(
+		manifest, group, 10, rafttransport.MemberLearner,
+	)
+	registry, err := rafttransport.NewStaticRegistry(
+		manifest.EnrolledTarget.NodeID, members,
+		rafttransport.Limits{MaxGroups: 1, MaxMembers: len(members)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.InstallTransitionGrant(grant); err != nil {
+		t.Fatal(err)
+	}
+	authority := rf3CommandAuthority()
+	base := sqldriver.ReplicatedShardStoreIdentity{Binding: sqldriver.ReplicatedShardStoreBinding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		Distribution:          string(gateway.ReplicatedCatalogDistribution), Shard: string(gateway.ReplicatedCatalogShard), AllocationGeneration: 23,
+		ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
+		MemberID: manifest.EnrolledTarget.MemberID, StoreID: manifest.EnrolledTarget.StoreID,
+		Authority: authority,
+	}}
+	base.UserTable = gateway.ReplicatedCatalogTable
+	state := raftservice.ServingState{
+		Identity: raftmember.RuntimeIdentity{
+			Group: group, Distribution: base.Binding.Distribution, Shard: base.Binding.Shard,
+			AllocationGeneration: base.Binding.AllocationGeneration,
+			MemberID:             base.Binding.MemberID, StoreID: base.Binding.StoreID,
+			NodeIncarnation: 1, RelationManifestDigest: [32]byte{1},
+		},
+		Command: raftservice.CommandFence{
+			ReplicaSetVersion: 10, ActivePolicyGeneration: authority.ActivePolicyGeneration,
+			ProtectionEpoch: authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
+			SchemaGeneration: authority.SchemaGeneration, RelationManifestDigest: [32]byte{1},
+			RoutingVersion: authority.RoutingVersion, RouteGeneration: authority.RouteGeneration,
+		},
+	}
+	serving := rf3NativeServingAuthority(registry, manifest, group, base)
+	if serving(state) {
+		t.Fatal("learner served native traffic")
+	}
+	membershipServing := rf3NativeMoveAuthority(registry, manifest, group, base)
+	catalogProbe := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
+		Capability: serviceauthz.CapabilityTopology, Fence: shardservice.ReplicatedFence{Group: group,
+			AllocationGeneration: base.Binding.AllocationGeneration}}
+	if membershipServing(state, &catalogProbe) {
+		t.Fatal("unpromoted learner served catalog control")
+	}
+	if err = registry.PublishCommittedAuthority(group, 11,
+		&pb.ConfState{Voters: []uint64{1, 2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	state.Command.ReplicaSetVersion = 11
+	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedMembership,
+		Capability: serviceauthz.CapabilityMembership,
+		Fence: shardservice.ReplicatedFence{Group: group,
+			AllocationGeneration: base.Binding.AllocationGeneration},
+		Membership: shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipRemoveVoter, TransitionID: grant.TransitionID,
+			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
+			ExpectedReplicaSetVersion: 11, SourceMember: grant.SourceMember,
+			TargetMember: grant.TargetMember, TransferTerm: 3,
+		}}
+	if !membershipServing(state, &request) {
+		t.Fatal("exact authenticated RF4 membership request rejected")
+	}
+	if !membershipServing(state, &catalogProbe) {
+		t.Fatal("promoted catalog target cannot discover its own move journal")
+	}
+	membershipProbe := catalogProbe
+	membershipProbe.Capability = serviceauthz.CapabilityMembership
+	if !membershipServing(state, &membershipProbe) {
+		t.Fatal("promoted target cannot discover its exact membership authority")
+	}
+	catalogRead := catalogProbe
+	catalogRead.Operation, catalogRead.Relation = shardservice.ReplicatedReadLeader, 1
+	if !membershipServing(state, &catalogRead) {
+		t.Fatal("promoted target cannot read its catalog move journal")
+	}
+	for name, mutate := range map[string]func(*shardservice.ReplicatedRequest){
+		"public read":    func(r *shardservice.ReplicatedRequest) { r.Capability = serviceauthz.CapabilityDataRead },
+		"public write":   func(r *shardservice.ReplicatedRequest) { r.Capability = serviceauthz.CapabilityDataWrite },
+		"other relation": func(r *shardservice.ReplicatedRequest) { r.Relation = 2 },
+		"follower read":  func(r *shardservice.ReplicatedRequest) { r.Operation = shardservice.ReplicatedReadFollower },
+		"group":          func(r *shardservice.ReplicatedRequest) { r.Fence.Group.GroupID[0]++ },
+		"allocation":     func(r *shardservice.ReplicatedRequest) { r.Fence.AllocationGeneration++ },
+		"invalid proposal": func(r *shardservice.ReplicatedRequest) {
+			r.Operation, r.Command = shardservice.ReplicatedPropose, []byte("not a catalog command")
+		},
+	} {
+		t.Run("catalog/"+name, func(t *testing.T) {
+			candidate := catalogRead
+			mutate(&candidate)
+			if membershipServing(state, &candidate) {
+				t.Fatal("move authority admitted unrelated catalog/data access")
+			}
+		})
+	}
+	for name, mutate := range map[string]func(*sqldriver.ReplicatedShardStoreIdentity){
+		"distribution": func(b *sqldriver.ReplicatedShardStoreIdentity) { b.Binding.Distribution = "data" },
+		"shard":        func(b *sqldriver.ReplicatedShardStoreIdentity) { b.Binding.Shard = "other" },
+		"table":        func(b *sqldriver.ReplicatedShardStoreIdentity) { b.UserTable = "orders" },
+	} {
+		t.Run("noncatalog/"+name, func(t *testing.T) {
+			candidate := base
+			mutate(&candidate)
+			if rf3NativeMoveAuthority(registry, manifest, group, candidate)(state, &catalogProbe) {
+				t.Fatal("catalog exception admitted a different relation identity")
+			}
+		})
+	}
+	missingGrant, err := rafttransport.NewStaticRegistry(manifest.EnrolledTarget.NodeID,
+		rf3GrantTransportMembers(manifest, group, 11, rafttransport.MemberVoter),
+		rafttransport.Limits{MaxGroups: 1, MaxMembers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf3NativeMoveAuthority(missingGrant, manifest, group, base)(state, &catalogProbe) {
+		t.Fatal("catalog exception admitted a target without its exact move grant")
+	}
+	for name, mutate := range map[string]func(*shardservice.ReplicatedRequest){
+		"data operation":  func(r *shardservice.ReplicatedRequest) { r.Operation = shardservice.ReplicatedProbe },
+		"data capability": func(r *shardservice.ReplicatedRequest) { r.Capability = serviceauthz.CapabilityDataWrite },
+		"stale rsv": func(r *shardservice.ReplicatedRequest) {
+			r.Membership.ExpectedReplicaSetVersion--
+		},
+		"wrong transition": func(r *shardservice.ReplicatedRequest) { r.Membership.TransitionID[0]++ },
+		"wrong metadata":   func(r *shardservice.ReplicatedRequest) { r.Membership.MetadataEpoch++ },
+		"wrong catalog":    func(r *shardservice.ReplicatedRequest) { r.Membership.CatalogGeneration++ },
+		"wrong source":     func(r *shardservice.ReplicatedRequest) { r.Membership.SourceMember++ },
+		"wrong target":     func(r *shardservice.ReplicatedRequest) { r.Membership.TargetMember++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := request
+			mutate(&candidate)
+			if membershipServing(state, &candidate) {
+				t.Fatal("mismatched RF4 membership request admitted")
+			}
+		})
+	}
+	state.Command.OwnershipEpoch++
+	state.Command.RoutingVersion++
+	state.Command.RouteGeneration++
+	if serving(state) {
+		t.Fatal("target served during RF4 despite owned routing cut")
+	}
+	if err = registry.PublishCommittedAuthority(group, 12,
+		&pb.ConfState{Voters: []uint64{2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	state.Command.ReplicaSetVersion = 12
+	if membershipServing(state, &catalogProbe) {
+		t.Fatal("move exception remained active after final RF3")
+	}
+	if !serving(state) {
+		t.Fatal("target did not activate at final owned RF3")
+	}
+	state.Command.ReplicaSetVersion = 11
+	if serving(state) {
+		t.Fatal("stale pre-remove fence reactivated target")
 	}
 }
 
@@ -371,7 +629,10 @@ func serveRF3Publication(voters ...uint64) raftmodel.Publication {
 
 func serveRF3TestManifest() rf3Manifest {
 	return rf3Manifest{
-		Listeners: rf3ManifestListeners{Peer: "127.0.0.1:17400", Native: "127.0.0.1:17500"},
+		Listeners: rf3ManifestListeners{
+			Peer: "127.0.0.1:17400", Native: "127.0.0.1:17500",
+			Snapshot: "127.0.0.1:17600", Control: "127.0.0.1:17700",
+		},
 		Members: [rf3ManifestMembers]rf3ManifestMember{
 			{MemberID: 1, NodeID: rafttransport.NodeID{1}, PeerAddress: "member-1.internal:17400"},
 			{MemberID: 2, NodeID: rafttransport.NodeID{2}, PeerAddress: "member-2.internal:17400"},
@@ -380,9 +641,25 @@ func serveRF3TestManifest() rf3Manifest {
 	}
 }
 
+func TestBuildRF1RosterIsExplicitlyDevelopmentOnly(t *testing.T) {
+	manifest := serveRF3TestManifest()
+	manifest.DevelopmentOnly = true
+	manifest.MemberCount = 1
+	group := serveRF3TestGroup()
+	roster, remote, _, native, err := buildRF3Roster(manifest, group, 1, serveRF3Publication(1))
+	if err != nil || len(roster) != 1 || len(remote) != 0 || !native {
+		t.Fatalf("RF1 roster=%+v remote=%+v native=%v err=%v", roster, remote, native, err)
+	}
+	manifest.DevelopmentOnly = false
+	if _, _, _, _, err = buildRF3Roster(manifest, group, 1, serveRF3Publication(1)); !errors.Is(err, errRF3Serving) {
+		t.Fatalf("unmarked RF1 error = %v", err)
+	}
+}
+
 func serveRF3TestEnrolledTarget() *rf3ManifestEnrolledTarget {
 	return &rf3ManifestEnrolledTarget{
-		MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: "member-4.internal:17400",
+		MemberID: 4, NodeID: rafttransport.NodeID{4}, StoreID: [16]byte{5}, NodeIncarnation: 6,
+		PeerAddress:   "member-4.internal:17400",
 		NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
 		ControlAddress: "member-4.internal:17700",
 	}

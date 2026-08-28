@@ -308,6 +308,7 @@ func (builder *GenerationBuilder) candidateSealMatches(
 		seal.sourceRecordSequence == builder.current.recordSequence &&
 		seal.sourceChainDigest == builder.current.chainDigest &&
 		seal.sourceCurrentIncarnation == builder.current.currentIncarnation &&
+		seal.sourceReadyID == builder.sourceReadyID &&
 		seal.topologyRecoveryEpoch == builder.header.topologyRecoveryEpoch &&
 		seal.baseIndex == baseIndex && seal.baseTerm == baseTerm &&
 		seal.bootstrapDigest == sha256.Sum256(bootstrapPayload) &&

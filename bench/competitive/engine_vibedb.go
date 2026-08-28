@@ -1,7 +1,9 @@
 package competitive
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -135,6 +137,39 @@ func newVibeDB(cfg Config) (Engine, error) {
 	}
 	cfg.StorageProfile = profile.Profile
 	return &vibeDBEngine{cfg: cfg, scan: newVibeDBScanState()}, nil
+}
+
+// VibeDBMaintenanceOptions returns the exact durable geometry selected by the
+// benchmark adapter so isolated verify/repack children cannot drift from the
+// image they were given.
+func VibeDBMaintenanceOptions(cfg Config) (durable.Options, error) {
+	engine, err := newVibeDB(cfg)
+	if err != nil {
+		return durable.Options{}, err
+	}
+	return engine.(*vibeDBEngine).primaryBulkOptions(), nil
+}
+
+func openVibeDB(cfg Config) (Engine, error) {
+	engine, err := newVibeDB(cfg)
+	if err != nil {
+		return nil, err
+	}
+	v := engine.(*vibeDBEngine)
+	v.path = filepath.Join(v.cfg.Dir, "vibedb.db")
+	f, err := os.OpenFile(v.path, os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	v.file = f
+	db, err := durable.Open(f, v.options())
+	if err != nil {
+		_ = f.Close()
+		v.file = nil
+		return nil, err
+	}
+	v.coll = db
+	return v, nil
 }
 
 func (v *vibeDBEngine) Name() string { return "vibedb" }
@@ -572,6 +607,13 @@ func (v *vibeDBEngine) MaintenanceFloor() error {
 
 func (v *vibeDBEngine) MaintenanceFloorDescription() string {
 	return "offline out-of-place durable.Repack (vacuum-into), then remove the benchmark source pair; cutover protocol excluded"
+}
+
+func (v *vibeDBEngine) PinSnapshot() (io.Closer, error) {
+	if v.coll == nil {
+		return nil, errors.New("vibedb benchmark engine is closed")
+	}
+	return v.coll.Snapshot()
 }
 
 // AutomaticCheckpoints reports persistence boundaries forced by bounded

@@ -1,0 +1,120 @@
+name: RF3 WAL retention qualification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wal-retention-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  external-crash-loop:
+    name: external crash loop and retained/live bound
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Prepare strict physical-allocation evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/wal-retention"
+          test_root="${RUNNER_TEMP}/wal-retention-tmp"
+          mkdir -p "${evidence}/runs" "${test_root}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${test_root}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${test_root}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestServeRF3WALRetentionCrashQualification'
+          go test -list "^${test_name}$" ./cmd/vibedb-shard > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'TMPDIR=%s VIBEDB_WAL_RETENTION_E2E=1 VIBEDB_WAL_RETENTION_EVIDENCE=%s go test -json -count=3 -timeout=24m -run %s ./cmd/vibedb-shard\n' \
+            "${test_root}" "${evidence}/runs" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Run shipped RF3 retention qualification three times
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/wal-retention-tmp
+          VIBEDB_WAL_RETENTION_E2E: "1"
+          VIBEDB_WAL_RETENTION_EVIDENCE: ${{ runner.temp }}/wal-retention/runs
+        run: |
+          set -euo pipefail
+          go test -json -count=3 -timeout=24m \
+            -run '^TestServeRF3WALRetentionCrashQualification$' \
+            ./cmd/vibedb-shard \
+            | tee "${RUNNER_TEMP}/wal-retention/go-test.jsonl"
+      - name: Reject skips, missing runs, and out-of-bound evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/wal-retention"
+          test_name='TestServeRF3WALRetentionCrashQualification'
+          test -s "${evidence}/go-test.jsonl"
+          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 50331648
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "WAL-retention qualification skipped" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          runs=("${evidence}"/runs/run-*.tsv)
+          test "${#runs[@]}" -eq 3
+          for result in "${runs[@]}"; do
+            test -s "${result}"
+            test "$(stat -c %s "${result}")" -le 65536
+            test "$(wc -l < "${result}")" -eq 16
+            grep -Fqx $'schema\tvibedb.wal-retention-process\t1' "${result}"
+            grep -Fqx $'result\tpass' "${result}"
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "cycles" {print $3}' "${result}")" -eq 3
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "writes" {print $3}' "${result}")" -eq 72
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "restarts" {print $3}' "${result}")" -eq 3
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "generation_changes" {print $3}' "${result}")" -eq 9
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "live_bytes" {print $3}' "${result}")" -eq 4718592
+            baseline="$(awk -F $'\t' '$1 == "metric" && $2 == "wal_baseline_bytes" {print $3}' "${result}")"
+            final="$(awk -F $'\t' '$1 == "metric" && $2 == "wal_final_bytes" {print $3}' "${result}")"
+            growth="$(awk -F $'\t' '$1 == "metric" && $2 == "wal_growth_bytes" {print $3}' "${result}")"
+            test "${baseline}" -gt 0
+            # Successful reclamation may finish below the baseline. Growth
+            # is the nonnegative delta, as recorded by the process test.
+            test "${final}" -gt 0
+            expected_growth=$(( final > baseline ? final - baseline : 0 ))
+            test "${expected_growth}" -eq "${growth}"
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "wal_growth_bytes" {print $3}' "${result}")" -le 1048576
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "wal_live_ratio_permille" {print $3}' "${result}")" -le 250
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "rss_growth_bytes" {print $3}' "${result}")" -le 134217728
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "fd_growth" {print $3}' "${result}")" -le 24
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "p99_ns" {print $3}' "${result}")" -le 5000000000
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "max_ns" {print $3}' "${result}")" -le 15000000000
+            test "$(awk -F $'\t' '$1 == "metric" && $2 == "retired_outcome" {print $3}' "${result}")" -eq 4
+          done
+      - name: Upload immutable raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wal-retention-${{ github.sha }}
+          path: ${{ runner.temp }}/wal-retention
+          if-no-files-found: error
+          retention-days: 30

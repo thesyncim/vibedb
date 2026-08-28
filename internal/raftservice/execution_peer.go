@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
@@ -26,6 +27,7 @@ type AuthenticatedExecutionPeerOptions struct {
 
 type AuthenticatedExecutionPeerRuntime struct {
 	owners    *ExecutionOwners
+	registry  *rafttransport.StaticRegistry
 	transport *rafttransport.OrdinaryTransport
 	server    *PeerServer
 	state     atomic.Uint32
@@ -46,18 +48,6 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 		identity.TrustDomain != options.Registry.TrustDomain() {
 		return nil, ErrInvalidPeerServer
 	}
-	for index, authorization := range options.Execution.MembershipAuthorizations {
-		if index >= len(options.Execution.Members) {
-			return nil, ErrInvalidPeerServer
-		}
-		if err := options.Registry.AuthorizeTransition(rafttransport.TransitionGrant{
-			Group: options.Execution.Members[index].Group, TransitionID: authorization.TransitionID,
-			MetadataEpoch: authorization.MetadataEpoch, CatalogGeneration: authorization.CatalogGeneration,
-			SourceMember: authorization.SourceMember, TargetMember: authorization.TargetMember,
-		}); err != nil {
-			return nil, err
-		}
-	}
 	transportOptions := options.Transport
 	transportOptions.Registry = options.Registry
 	transportOptions.Dialer = rafttransport.TLSOrdinaryDialer{TLS: options.TLS, Dial: options.Dial, HandshakeDeadline: options.HandshakeDeadline}
@@ -67,9 +57,7 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 	}
 	executionOptions := options.Execution
 	executionOptions.Outbound = transport
-	if len(executionOptions.MembershipAuthorizations) != 0 {
-		executionOptions.MembershipAuthority = options.Registry
-	}
+	executionOptions.MembershipAuthority = options.Registry
 	owners, err := NewExecutionOwners(executionOptions)
 	if err != nil {
 		_ = transport.Close()
@@ -94,9 +82,59 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 		return nil, err
 	}
 	return &AuthenticatedExecutionPeerRuntime{
-		owners: owners, transport: transport, server: server,
+		owners: owners, registry: options.Registry, transport: transport, server: server,
 		started: make(chan struct{}), done: make(chan struct{}),
 	}, nil
+}
+
+// RegisterExecutionGroup atomically makes one adopted Runtime visible to the
+// deterministic execution lane and ordinary transport. The transport roster
+// is published from inside the serialized lane after Host ownership and
+// serving metadata are installed, so no authenticated request can observe a
+// transport-only or owner-only group. Failure leaves Runtime with the caller.
+func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
+	roster []rafttransport.Member,
+	group ExecutionGroup,
+) error {
+	if runtime == nil || runtime.registry == nil || runtime.owners == nil ||
+		!validExecutionGroup(group) || len(roster) == 0 {
+		return ErrInvalidOwner
+	}
+	local := runtime.registry.LocalNode()
+	found := false
+	for index := range roster {
+		member := roster[index]
+		if member.Group != group.Identity.Group {
+			return ErrInvalidOwner
+		}
+		if member.Node == local {
+			if found || member.MemberID != group.Identity.MemberID {
+				return ErrInvalidOwner
+			}
+			found = true
+		}
+	}
+	if !found {
+		return ErrInvalidOwner
+	}
+	return runtime.registry.InstallGroup(roster, func(publish func()) error {
+		return runtime.owners.installGroup(group, publish)
+	})
+}
+
+// UnregisterExecutionGroup closes one quiescent dynamically adopted Runtime
+// and withdraws its transport identity in the same serialized owner step.
+// The full RuntimeIdentity fences stale child-lifecycle retries.
+func (runtime *AuthenticatedExecutionPeerRuntime) UnregisterExecutionGroup(
+	identity raftmember.RuntimeIdentity,
+) error {
+	if runtime == nil || runtime.registry == nil || runtime.owners == nil ||
+		identity.Group == (raftmember.GroupKey{}) {
+		return ErrInvalidOwner
+	}
+	return runtime.registry.RemoveGroup(identity.Group, func(withdraw func()) error {
+		return runtime.owners.removeGroup(identity, withdraw)
+	})
 }
 
 // Run starts the one shared transport before every owner loop and the shared
@@ -142,8 +180,8 @@ func (runtime *AuthenticatedExecutionPeerRuntime) Run(parent context.Context) er
 		cause = ErrPeerServerClosed
 	}
 	cancel(cause)
-	_ = runtime.server.Close()
-	_ = runtime.transport.Close()
+	// Cancellation closes both components with this exact cause. A concurrent
+	// explicit Close would race it with an unrelated "closed" sentinel.
 	joined := cause
 	for completed := 1; completed < 3; completed++ {
 		result := <-results
@@ -160,6 +198,28 @@ func (runtime *AuthenticatedExecutionPeerRuntime) Owners() *ExecutionOwners {
 	}
 	return runtime.owners
 }
+
+// TransportStats returns one detached outbound-peer counter snapshot from the
+// shared execution transport. It is observability only and cannot enqueue or
+// drain traffic.
+func (runtime *AuthenticatedExecutionPeerRuntime) TransportStats(
+	node rafttransport.NodeID,
+) (rafttransport.PeerStats, error) {
+	if runtime == nil || runtime.transport == nil {
+		return rafttransport.PeerStats{}, rafttransport.ErrNodeNotFound
+	}
+	return runtime.transport.Stats(node)
+}
+
+// InboundStats returns a detached snapshot of the shared authenticated
+// execution listener.
+func (runtime *AuthenticatedExecutionPeerRuntime) InboundStats() PeerServerStats {
+	if runtime == nil || runtime.server == nil {
+		return PeerServerStats{}
+	}
+	return runtime.server.Stats()
+}
+
 func (runtime *AuthenticatedExecutionPeerRuntime) Started() <-chan struct{} {
 	if runtime == nil {
 		return nil

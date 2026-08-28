@@ -45,6 +45,37 @@ func testKey() Key {
 	return key
 }
 
+func TestAuthenticatedWrappedKeyMetadataRequiresExactLiveKey(t *testing.T) {
+	_, store, _ := createTestStore(t)
+	key := testKey()
+	key.Wrapped = nil
+	wrapped, err := store.AuthenticatedWrappedKeyMetadata(key)
+	if err != nil || !bytes.Equal(wrapped, testKey().Wrapped) {
+		t.Fatalf("existing provider key metadata was not retained: %v", err)
+	}
+	wrapped[0]++
+	if bytes.Equal(wrapped, store.WrappedKeyMetadata()) {
+		t.Fatal("returned metadata aliases the live WAL header")
+	}
+	for _, mutate := range []func(*Key){
+		func(k *Key) { k.Material[0]++ },
+		func(k *Key) { k.ID += "-other" },
+		func(k *Key) { k.Wrapped = []byte("substituted") },
+	} {
+		wrong := key
+		mutate(&wrong)
+		if metadata, err := store.AuthenticatedWrappedKeyMetadata(wrong); metadata != nil || !errors.Is(err, ErrKeyMismatch) {
+			t.Fatalf("substituted key accepted: %v", err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if metadata, err := store.AuthenticatedWrappedKeyMetadata(key); metadata != nil || !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed WAL supplied new-file metadata: %v", err)
+	}
+}
+
 func testBootstrap() Bootstrap {
 	index, term := uint64(1), uint64(1)
 	return Bootstrap{TopologyRecoveryEpoch: 11, Snapshot: &pb.Snapshot{

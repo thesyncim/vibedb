@@ -238,8 +238,10 @@ func (m *Machine) BuildBundleSnapshotBase() (
 	if !ok || system == nil {
 		return nil, SnapshotArtifactManifest{}, m.fail(ErrInconsistentSnapshot)
 	}
-	state, present, sessions, slots, authorities, err := scanSessionSystemSnapshot(
+	state, present, sessions, slots, authorities, _, err := scanSessionSystemSnapshot(
 		system, m.options.MaxSessions, m.options.RetryWindow,
+		m.options.RequestLedgerCapacityBytes, m.options.RequestLedgerCleanupReserveBytes,
+		m.options.RequestLedgerRange, m.routeGateMaxRecords,
 	)
 	if err != nil || !present || sessions != state.SessionCount ||
 		slots != state.SessionSlotCount || authorities != state.AuthorityBindingCount ||
@@ -257,7 +259,9 @@ func (m *Machine) BuildBundleSnapshotBase() (
 		if !exists || snapshot == nil || snapshot.Generation() == 0 {
 			return nil, SnapshotArtifactManifest{}, m.fail(ErrInconsistentSnapshot)
 		}
-		digest, digestErr := openedRelationImageDigest(relation, snapshot)
+		digest, _, digestErr := openedRelationImageDigest(
+			relation, snapshot, state.Binding.OwnedRange,
+		)
 		if digestErr != nil {
 			return nil, SnapshotArtifactManifest{}, m.fail(digestErr)
 		}
@@ -503,7 +507,7 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		manifest.RelationManifestDigest == ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
-		!systemRowsOK || manifest.SystemRows != wantSystemRows ||
+		!systemRowsOK || !snapshotSystemRowsBounded(manifest.State, manifest.SystemRows, wantSystemRows) ||
 		len(manifest.UserCollection) == 0 ||
 		len(manifest.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(manifest.UserCollection) ||

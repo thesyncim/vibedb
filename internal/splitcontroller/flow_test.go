@@ -8,16 +8,16 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
-	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
-	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -43,6 +43,7 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	state := flowSourceState(t, source.machine)
 	observed := Observation{
 		Catalog: catalog, SourceState: state, SourceStatus: testLeaderStatus(state),
+		SourceNode: rafttransport.NodeID{1},
 	}
 	assertCrashRecovery(observed, ActionStartCapture)
 
@@ -193,9 +194,10 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 		},
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true,
-			Applied:               certificate.SourceCut().Applied,
-			SessionEpochHighWater: certificate.SourceCut().Applied,
-			MaxSessions:           8, RetryWindow: 8,
+			RelationManifestDigest: target.RelationManifestDigest,
+			Applied:                certificate.SourceCut().Applied,
+			SessionEpochHighWater:  certificate.SourceCut().Applied,
+			MaxSessions:            8, RetryWindow: 8,
 		},
 	}
 	observed.Children[1] = child
@@ -216,7 +218,9 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	assertCrashRecovery(observed, ActionAdoptChildRuntime)
 	child.Phase = ChildPhaseRuntimeAdopted
 	child.RuntimeIdentity = testRuntimeIdentity(target)
-	child.RuntimeStatus = raftmemberReadyStatus(target, certificate.SourceCut().Applied)
+	child.ReadyReplicas = testReadyServingStates(
+		target, child.ApplyProfile, int(plan.leaderCounts[1]), certificate.SourceCut().Applied,
+	)
 	sessionState = observed.SourceState
 	sessionState.SessionCount = 1
 	sessionState.SessionSlotCount = 1
@@ -254,22 +258,37 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	observed.Catalog = next
 	assertCrashRecovery(observed, ActionAwaitCatalogDrain)
 	observed.OlderCatalogDrained = true
+	observed.RetainedPruneCertificate = testRetainedPruneCertificate(t, plan, next, certificate)
 	assertCrashRecovery(observed, ActionPruneRetained)
-	receipt, err := gateway.SaveSnapshotAfterWithReceipt(t.TempDir()+"/catalog", 0, next)
+	pruneRequest, err := appendRemoteStepRequest(
+		nil, plan, observed, Action{Kind: ActionPruneRetained},
+	)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("certified remote prune request: %v", err)
 	}
-	holder := gateway.NewCatalogHolder(next)
-	authority, err := holder.AuthorizeRetainedPrune(
-		receipt, split.Source.Distribution, [32]byte(plan.OperationID()), certificate.Digest(),
+	prunePayload, err := openRemoteStepPayload(pruneRequest)
+	if err != nil || len(prunePayload.RetainedPrune) != gateway.RetainedPruneCertificateBytes {
+		t.Fatalf("remote prune certificate bytes=%d err=%v", len(prunePayload.RetainedPrune), err)
+	}
+	forgedPrune := append([]byte(nil), prunePayload.RetainedPrune...)
+	forgedPrune[24] ^= 1
+	if _, err = gateway.OpenRetainedPruneCertificate(forgedPrune); err == nil {
+		t.Fatal("remote prune accepted forged operation certificate")
+	}
+	publishedManifest, ok := next.Manifest(split.Source.Distribution)
+	if !ok {
+		t.Fatal("published manifest absent")
+	}
+	authority, err := rangesplit.NewRetainedPruneAuthorityProof(
+		plan.partitioner, certificate, publishedManifest, next.Generation(), [32]byte(plan.OperationID()),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrongOperation := [32]byte(plan.OperationID())
 	wrongOperation[0] ^= 0xff
-	wrongAuthority, err := holder.AuthorizeRetainedPrune(
-		receipt, split.Source.Distribution, wrongOperation, certificate.Digest(),
+	wrongAuthority, err := rangesplit.NewRetainedPruneAuthorityProof(
+		plan.partitioner, certificate, publishedManifest, next.Generation(), wrongOperation,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +336,27 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	verifying := pruner.Cursor()
 	observed.Prune = &verifying
 	assertCrashRecovery(observed, ActionPruneRetained)
+	progressRequest, err := appendRemoteStepRequest(nil, plan, observed, Action{Kind: ActionPruneRetained})
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressPayload, err := openRemoteStepPayload(progressRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressObserved, err := openRemoteWitnessObservation(progressPayload)
+	if err != nil || progressObserved.Prune == nil {
+		t.Fatalf("remote prune lost its durable progress cursor: %v", err)
+	}
+	progressRaw, err := rangesplit.AppendRetainedPruneCursor(nil, progressObserved.Prune)
+	if err != nil || !bytes.Equal(progressRaw, pruneRaw) {
+		t.Fatalf("remote prune cursor differs from the observed durable cut: %v", err)
+	}
+	progressPayload.Prune = bytes.Clone(progressPayload.Prune)
+	progressPayload.Prune[len(progressPayload.Prune)-1] ^= 1
+	if remoteStepPredecessorDigest(progressPayload) == progressPayload.PredecessorDigest {
+		t.Fatal("prune cursor was not bound to the exact action predecessor")
+	}
 	pruner, err = rangesplit.NewRetainedPruner(
 		plan.partitioner, certificate, authority, pruneRaw,
 	)
@@ -365,6 +405,9 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	observed.SourceState = state
 	observed.SourceStatus = testLeaderStatus(state)
 	assertCrashRecovery(observed, ActionPruneRetained)
+	lagging := observed
+	lagging.Prune = &verifying
+	assertCrashRecovery(lagging, ActionPruneRetained)
 	lateCut, err := source.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
@@ -391,6 +434,70 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	if _, err := plan.BuildCatalogTransition(next, state, certificate); err == nil {
 		t.Fatal("already-published catalog accepted as a new transition source")
 	}
+	t.Run("certified-source-action-after-session-open", func(t *testing.T) {
+		root := t.TempDir()
+		runtimeStore, err := OpenDurableRuntimeStore(root, plan.OperationID(), testManifestDigest("prune-local"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = runtimeStore.Close() }()
+		if err = runtimeStore.PersistRetainedPrune(1, prune); err != nil {
+			t.Fatal(err)
+		}
+		local, err := NewLocalSourceActions(runtimeStore, source.machine, source.capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local.active = capture
+		witness := observed
+		witness.Capture, witness.CaptureHead = nil, observed.SourceState.Applied
+		witness.Children = [autosplit.MaxSplitChildren]*ChildObservation{}
+		witness.SourceServing = sourceServingState(t, source.machine, witness.SourceState)
+		// Session admission occurs after the exact remote action was frozen.
+		if _, err := source.machine.ApplyNormal(raftmodel.ApplyMeta{
+			Index: state.Applied + 1, Term: state.LastTerm, Type: pb.EntryNormal,
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if !activeCaptureContainsObservation(capture, witness) {
+			t.Fatal("exact predecessor was not proved from the capture")
+		}
+		forged := witness
+		forged.SourceState.LastEntryDigest[0]++
+		if activeCaptureContainsObservation(capture, forged) {
+			t.Fatal("capture accepted a forged predecessor entry")
+		}
+		if err = local.ExecuteCertifiedPruneRetained(t.Context(), plan, witness, witness.SourceServing,
+			testRetainedPruneProposer{}, rangesplit.RetainedPruneLimits{}); err != nil {
+			t.Fatalf("certified local prune required remote readiness or a stale applied cut: %v", err)
+		}
+		advanced, revision, present, err := runtimeStore.LoadRetainedPrune(plan.partitioner, certificate)
+		if err != nil || !present || advanced.SourceCut().Applied != state.Applied+1 {
+			t.Fatalf("prune did not verify the intervening entry: present=%t err=%v", present, err)
+		}
+		// Lose the action reply after the cursor commit, then reopen. The
+		// durable gateway replays its original witness, not the new cursor.
+		if err = runtimeStore.Close(); err != nil {
+			t.Fatal(err)
+		}
+		runtimeStore, err = OpenDurableRuntimeStore(root, plan.OperationID(), testManifestDigest("prune-local"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		local, err = NewLocalSourceActions(runtimeStore, source.machine, source.capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local.active = capture
+		if err = local.ExecuteCertifiedPruneRetained(t.Context(), plan, witness, witness.SourceServing,
+			testRetainedPruneProposer{}, rangesplit.RetainedPruneLimits{}); err != nil {
+			t.Fatalf("lost prune reply stranded the exact durable action: %v", err)
+		}
+		_, replayRevision, _, err := runtimeStore.LoadRetainedPrune(plan.partitioner, certificate)
+		if err != nil || replayRevision != revision {
+			t.Fatalf("replayed prune performed another step: revision=%d want=%d err=%v", replayRevision, revision, err)
+		}
+	})
 }
 
 type flowSource struct {
@@ -554,13 +661,6 @@ func assertFlowAction(
 		t.Fatalf("action = %+v, want %v, err = %v", action, want, err)
 	}
 	return action
-}
-
-func raftmemberReadyStatus(target ChildTarget, applied uint64) raftmember.RuntimeStatus {
-	return raftmember.RuntimeStatus{
-		MemberID: target.WAL.MemberID, LeaderID: target.WAL.MemberID,
-		Term: 1, Commit: applied, Applied: applied, RaftState: raft.StateLeader,
-	}
 }
 
 func flowTargetBinding(

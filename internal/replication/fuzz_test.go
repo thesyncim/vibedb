@@ -2,8 +2,11 @@ package replication
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/routegate"
 )
 
 func FuzzOpenCommand(f *testing.F) {
@@ -26,6 +29,14 @@ func FuzzOpenCommand(f *testing.F) {
 	f.Add(encodeCommand(f, renew))
 	f.Add(encodeCommand(f, revoke))
 	f.Add(encodeCommand(f, ordered))
+	route := testCommand()
+	route.Kind, route.Batches = CommandRouteGate, nil
+	route.RouteGate, _ = routegate.AppendCommand(nil, routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1,
+		Identity: routegate.Identity(sha256.Sum256([]byte("fuzz-route-request"))),
+		Binding:  routegate.Binding(sha256.Sum256([]byte("fuzz-route-binding"))),
+	})
+	f.Add(encodeCommand(f, route))
 	conditionalWrites := testCommand()
 	conditionalWrites.Batches[0].Mutations = []Mutation{
 		{Kind: MutationPutAbsent, Key: []byte("insert"), Value: []byte("new")},
@@ -201,6 +212,16 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 		}
 		if view.RelationCount() != 0 || view.MutationCount() != 0 {
 			t.Fatal("accepted session revoke carries mutations")
+		}
+	case CommandRouteGate:
+		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
+			view.AckThrough >= view.ClientSequence || view.RelationCount() != 0 ||
+			view.MutationCount() != 0 {
+			t.Fatal("accepted route-gate command has invalid tuple")
+		}
+		gate, err := view.OpenRouteGate()
+		if err != nil || !routeGateAuthorityMatches(view.AuthorityClass, gate.Operation) {
+			t.Fatal("accepted route-gate command has invalid body or authority")
 		}
 	default:
 		t.Fatal("accepted unknown command kind")

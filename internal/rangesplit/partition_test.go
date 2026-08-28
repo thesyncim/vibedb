@@ -324,8 +324,8 @@ func documentForChild(t testing.TB, partitioner *Partitioner, want int) []byte {
 	t.Helper()
 	var workspace distribution.DocumentPointWorkspace
 	for sequence := 0; sequence < 100_000; sequence++ {
-		document := append([]byte(`{"tenant":"acme","sequence":`), strconv.Itoa(sequence)...)
-		document = append(document, '}')
+		document := append([]byte(`{"sequence":`), strconv.Itoa(sequence)...)
+		document = append(document, `,"tenant":"acme"}`...)
 		point, err := partitioner.program.Point(document, &workspace)
 		if err != nil {
 			t.Fatal(err)

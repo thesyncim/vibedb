@@ -175,6 +175,319 @@ func TestGlobalTabletCatalogExactRouteCursorAndCOW(t *testing.T) {
 	}
 }
 
+func TestGlobalTabletCatalogInsertChildCanonicalCOW(t *testing.T) {
+	view, image, ref, entries := globalTabletCatalogTestNode(t)
+	const generation = uint64(102)
+	logicalID, ok := GlobalTabletCatalogTabletRootLogicalID(23)
+	if !ok {
+		t.Fatal("derive inserted tablet logical ID")
+	}
+	inserted := globalTabletCatalogTestRef(
+		6*GlobalTabletCatalogTabletBytes, logicalID, generation,
+		GlobalTabletCatalogTabletBytes, PageTabletRoute,
+	)
+	dst := make([]byte, len(image))
+	next, err := view.InsertChild(
+		dst, generation, globalTabletCatalogTestBounds,
+		[]byte("t"), 23, inserted,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRef := ref
+	nextRef.Generation = generation
+	nextView, err := OpenGlobalTabletCatalogNode(
+		next, nextRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextView.Count() != len(entries)+1 {
+		t.Fatalf("inserted count = %d, want %d", nextView.Count(), len(entries)+1)
+	}
+	for _, test := range []struct {
+		key  string
+		want uint32
+	}{
+		{"", 7}, {"m", 19}, {"s", 19}, {"t", 23}, {"y", 23}, {"z", 11},
+	} {
+		if got := nextView.Route([]byte(test.key)); got.ID != test.want {
+			t.Fatalf("route %q = %d, want %d", test.key, got.ID, test.want)
+		}
+	}
+	if got := view.Route([]byte("t")); got.ID != 19 {
+		t.Fatalf("insert changed old snapshot route = %d, want 19", got.ID)
+	}
+	replacement := entries[1].Ref
+	replacement.Offset += 256 << 10
+	replacement.Generation = generation
+	combined, err := view.InsertChildReplacing(
+		make([]byte, len(image)), generation, globalTabletCatalogTestBounds,
+		[]byte("t"), 23, inserted,
+		[]GlobalTabletCatalogNodeHandleRewrite{{ID: entries[1].ID, Ref: replacement}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinedView, err := OpenGlobalTabletCatalogNode(
+		combined, nextRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := combinedView.Route([]byte("m")); got.Ref != replacement {
+		t.Fatalf("combined left replacement = %+v, want %+v", got.Ref, replacement)
+	}
+	if got := combinedView.Route([]byte("t")); got.Ref != inserted {
+		t.Fatalf("combined sibling insertion = %+v, want %+v", got.Ref, inserted)
+	}
+
+	// The same logical source encoded at a different ancestor generation must
+	// produce the byte-identical canonical insertion image.
+	newerSource, err := EncodeGlobalTabletCatalogNode(
+		make([]byte, GlobalTabletCatalogNodeBytes),
+		GlobalTabletCatalogNodeHeader{
+			StoreID: globalTabletCatalogTestStoreID, Bounds: globalTabletCatalogTestBounds,
+			Generation: 101, LogicalID: ref.LogicalID, PageID: 3,
+			Level: GlobalTabletCatalogLeaf, Kind: PagePrimaryCatalog,
+			ChildKind: PageTabletRoute, ChildLength: GlobalTabletCatalogTabletBytes,
+		}, entries,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerRef := ref
+	newerRef.Generation = 101
+	newerView, err := OpenGlobalTabletCatalogNode(
+		newerSource, newerRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromNewer, err := newerView.InsertChild(
+		make([]byte, len(image)), generation, globalTabletCatalogTestBounds,
+		[]byte("t"), 23, inserted,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(next, fromNewer) {
+		t.Fatal("catalog insertion depends on ancestor node generation")
+	}
+
+	for _, invalid := range []struct {
+		name  string
+		floor []byte
+		id    uint32
+	}{
+		{"empty-floor", nil, 23},
+		{"duplicate-floor", []byte("m"), 23},
+		{"duplicate-id", []byte("t"), entries[1].ID},
+	} {
+		t.Run(invalid.name, func(t *testing.T) {
+			rejected := bytes.Repeat([]byte{0xa5}, len(image))
+			before := bytes.Clone(rejected)
+			if _, err := view.InsertChild(
+				rejected, generation, globalTabletCatalogTestBounds,
+				invalid.floor, invalid.id, inserted,
+			); err == nil {
+				t.Fatal("invalid insertion accepted")
+			}
+			if !bytes.Equal(rejected, before) {
+				t.Fatal("rejected insertion changed destination")
+			}
+		})
+	}
+}
+
+func TestGlobalTabletCatalogInsertChildFullNodeBackpressuresWithoutMutation(
+	t *testing.T,
+) {
+	const generation = uint64(100)
+	logicalID, _ := GlobalTabletCatalogCatalogLeafLogicalID(0)
+	var last []byte
+	var entries []GlobalTabletCatalogNodeEntry
+	for tabletID := uint32(0); ; tabletID++ {
+		childLogical, ok := GlobalTabletCatalogTabletRootLogicalID(tabletID)
+		if !ok {
+			t.Fatal("tablet namespace exhausted before catalog page")
+		}
+		floor := []byte(nil)
+		if tabletID != 0 {
+			floor = fmt.Appendf(nil, "%0255d", tabletID)
+		}
+		candidate := append(entries, GlobalTabletCatalogNodeEntry{
+			Floor: floor, ID: tabletID,
+			Ref: globalTabletCatalogTestRef(
+				uint64(tabletID+1)*GlobalTabletCatalogTabletBytes,
+				childLogical, generation, GlobalTabletCatalogTabletBytes,
+				PageTabletRoute,
+			),
+		})
+		image, err := EncodeGlobalTabletCatalogNode(
+			make([]byte, GlobalTabletCatalogNodeBytes),
+			GlobalTabletCatalogNodeHeader{
+				StoreID: globalTabletCatalogTestStoreID,
+				Bounds:  globalTabletCatalogTestBounds, Generation: generation,
+				LogicalID: logicalID, PageID: 0, Level: GlobalTabletCatalogLeaf,
+				Kind: PagePrimaryCatalog, ChildKind: PageTabletRoute,
+				ChildLength: GlobalTabletCatalogTabletBytes,
+			}, candidate,
+		)
+		if errors.Is(err, ErrGlobalTabletCatalogNoSpace) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, last = candidate, image
+	}
+	ref := globalTabletCatalogTestRef(
+		128<<10, logicalID, generation,
+		GlobalTabletCatalogNodeBytes, PagePrimaryCatalog,
+	)
+	view, err := OpenGlobalTabletCatalogNode(last, ref, globalTabletCatalogTestBounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newID := uint32(len(entries))
+	newLogical, _ := GlobalTabletCatalogTabletRootLogicalID(newID)
+	newRef := globalTabletCatalogTestRef(
+		uint64(newID+1)*GlobalTabletCatalogTabletBytes,
+		newLogical, generation+1, GlobalTabletCatalogTabletBytes,
+		PageTabletRoute,
+	)
+	dst := bytes.Repeat([]byte{0xa5}, GlobalTabletCatalogNodeBytes)
+	before := bytes.Clone(dst)
+	_, err = view.InsertChildReplacing(
+		dst, generation+1, globalTabletCatalogTestBounds,
+		fmt.Appendf(nil, "%0255d", newID), newID, newRef,
+		[]GlobalTabletCatalogNodeHandleRewrite{{ID: entries[0].ID, Ref: entries[0].Ref}},
+	)
+	if !errors.Is(err, ErrGlobalTabletCatalogNoSpace) {
+		t.Fatalf("full-node insertion error = %v, want %v", err, ErrGlobalTabletCatalogNoSpace)
+	}
+	if !bytes.Equal(dst, before) {
+		t.Fatal("full-node backpressure changed destination")
+	}
+}
+
+func TestGlobalTabletCatalogPromoteRootPreservesEveryLeafRoute(t *testing.T) {
+	const generation = uint64(100)
+	entries := make([]GlobalTabletCatalogNodeEntry, 16)
+	for id := range entries {
+		logical, _ := GlobalTabletCatalogCatalogLeafLogicalID(uint32(id))
+		var floor []byte
+		if id != 0 {
+			floor = fmt.Appendf(nil, "%03d", id*2)
+		}
+		entries[id] = GlobalTabletCatalogNodeEntry{
+			Floor: floor, ID: uint32(id),
+			Ref: globalTabletCatalogTestRef(
+				uint64(id+1)*GlobalTabletCatalogNodeBytes,
+				logical, generation, GlobalTabletCatalogNodeBytes,
+				PagePrimaryCatalog,
+			),
+		}
+	}
+	image, err := EncodeGlobalTabletCatalogNode(
+		make([]byte, GlobalTabletCatalogRootBytes),
+		GlobalTabletCatalogNodeHeader{
+			StoreID: globalTabletCatalogTestStoreID, Bounds: globalTabletCatalogTestBounds,
+			Generation: generation, LogicalID: GlobalTabletCatalogRootLogicalID,
+			Level: GlobalTabletCatalogRoot, RootChildLevel: GlobalTabletCatalogLeaf,
+			Kind: PagePrimaryCatalog, ChildKind: PagePrimaryCatalog,
+			ChildLength: GlobalTabletCatalogNodeBytes,
+		},
+		entries,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef := globalTabletCatalogTestRef(
+		512<<10, GlobalTabletCatalogRootLogicalID, generation,
+		GlobalTabletCatalogRootBytes, PagePrimaryCatalog,
+	)
+	view, err := OpenGlobalTabletCatalogNode(image, rootRef, globalTabletCatalogTestBounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertID := uint32(len(entries))
+	insertLogical, _ := GlobalTabletCatalogCatalogLeafLogicalID(insertID)
+	insertRef := globalTabletCatalogTestRef(
+		768<<10, insertLogical, generation+1,
+		GlobalTabletCatalogNodeBytes, PagePrimaryCatalog,
+	)
+	leftLogical, _ := GlobalTabletCatalogCatalogBranchLogicalID(0)
+	rightLogical, _ := GlobalTabletCatalogCatalogBranchLogicalID(1)
+	leftRef := globalTabletCatalogTestRef(
+		896<<10, leftLogical, generation+1,
+		GlobalTabletCatalogNodeBytes, PagePrimaryCatalog,
+	)
+	rightRef := globalTabletCatalogTestRef(
+		904<<10, rightLogical, generation+1,
+		GlobalTabletCatalogNodeBytes, PagePrimaryCatalog,
+	)
+	rewritten := entries[0].Ref
+	rewritten.Offset = 912 << 10
+	rewritten.Generation = generation + 1
+	promoted, err := view.PromoteRootInsertChildReplacing(
+		make([]byte, GlobalTabletCatalogRootBytes),
+		make([]byte, GlobalTabletCatalogNodeBytes),
+		make([]byte, GlobalTabletCatalogNodeBytes),
+		generation+1, globalTabletCatalogTestBounds,
+		[]byte("031"), insertID, insertRef,
+		[]GlobalTabletCatalogNodeHandleRewrite{{ID: 0, Ref: rewritten}},
+		0, leftRef, 1, rightRef,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRootRef := rootRef
+	nextRootRef.Generation = generation + 1
+	nextRoot, err := OpenGlobalTabletCatalogNode(
+		promoted.Root, nextRootRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextRoot.ChildLevel() != GlobalTabletCatalogBranch || nextRoot.Count() != 2 {
+		t.Fatalf("promoted root child level/count = %d/%d", nextRoot.ChildLevel(), nextRoot.Count())
+	}
+	left, err := OpenGlobalTabletCatalogNode(
+		promoted.LeftBranch, leftRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := OpenGlobalTabletCatalogNode(
+		promoted.RightBranch, rightRef, globalTabletCatalogTestBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left.Count()+right.Count() != len(entries)+1 {
+		t.Fatalf("promoted branch counts = %d+%d", left.Count(), right.Count())
+	}
+	for id := uint32(0); id <= insertID; id++ {
+		floor := fmt.Appendf(nil, "%03d", id*2)
+		if id == insertID {
+			floor = []byte("031")
+		}
+		branchRoute := nextRoot.Route(floor)
+		branch := &left
+		if branchRoute.ID == 1 {
+			branch = &right
+		}
+		if got := branch.Route(floor); got.ID != id {
+			t.Fatalf("promoted route %q = %d, want %d", floor, got.ID, id)
+		}
+	}
+	if got := left.Route(nil); got.Ref != rewritten {
+		t.Fatalf("promoted rewrite = %+v, want %+v", got.Ref, rewritten)
+	}
+}
+
 func TestGlobalTabletCatalogCOWIsCanonicalAcrossHistories(t *testing.T) {
 	view100, _, ref100, entries := globalTabletCatalogTestNode(t)
 	replacement := entries[1].Ref
@@ -912,6 +1225,239 @@ func TestGlobalTabletCatalogCacheableTabletReadPaths(t *testing.T) {
 	rightRoute, routeOK := nextTablet.RouteAnchor(rightFence)
 	if !routeOK || pageID != rightRoute.PageID || state != GlobalTabletCatalogLocatorLive {
 		t.Fatalf("right locator = page %d state %d", pageID, state)
+	}
+}
+
+type globalTabletCatalogRemoveFixture struct {
+	header     SegmentedTabletRouterHeader
+	leaves     []SegmentedTabletRouterLeaf
+	anchorRefs []PageRef
+	anchors    []byte
+	bounds     GlobalTabletCatalogBounds
+	locatorRef PageRef
+	tabletRef  PageRef
+	locator    GlobalTabletCatalogLocatorView
+	tablet     GlobalTabletCatalogTabletRootView
+}
+
+func newGlobalTabletCatalogRemoveFixture(
+	t testing.TB, leafCount int,
+) globalTabletCatalogRemoveFixture {
+	t.Helper()
+	header, leaves, anchorRefs := segmentedTabletRouterTestInputs(t, leafCount)
+	header.StoreID = globalTabletCatalogTestStoreID
+	bounds := globalTabletCatalogTestBounds
+	bounds.SelectedRootGeneration = header.Generation
+	root, rawLocator, anchors, _, err := EncodeSegmentedTabletRouter(
+		make([]byte, SegmentedTabletRouterRootBytes),
+		make([]byte, SegmentedTabletRouterLocatorBytes),
+		make([]byte, len(anchorRefs)*SegmentedTabletRouterAnchorPageBytes),
+		header, anchorRefs, leaves,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entriesByID := make([]GlobalTabletCatalogLocatorEntry, TabletLocalIdentityLocalCount)
+	live := make([]bool, TabletLocalIdentityLocalCount)
+	for _, leaf := range leaves {
+		code := binary.LittleEndian.Uint16(rawLocator[int(leaf.LocalID)*2:])
+		entriesByID[leaf.LocalID] = GlobalTabletCatalogLocatorEntry{
+			LocalID: leaf.LocalID, PageID: uint8(code >> 8),
+			RowSlot: uint8(code), State: GlobalTabletCatalogLocatorLive,
+		}
+		live[leaf.LocalID] = true
+	}
+	entries := make([]GlobalTabletCatalogLocatorEntry, 0, len(leaves))
+	for localID := range TabletLocalIdentityLocalCount {
+		if live[localID] {
+			entries = append(entries, entriesByID[localID])
+		}
+	}
+	locatorLogical, _ := GlobalTabletCatalogLocatorLogicalID(header.TabletID)
+	locatorRef := globalTabletCatalogTestRef(
+		7<<20, locatorLogical, header.Generation,
+		GlobalTabletCatalogLocatorBytes, PagePrimaryLocator,
+	)
+	locatorImage, err := EncodeGlobalTabletCatalogLocator(
+		make([]byte, GlobalTabletCatalogLocatorBytes),
+		PageHeader{StoreID: header.StoreID, Generation: header.Generation,
+			LogicalID: locatorLogical, PageSize: GlobalTabletCatalogLocatorBytes,
+			PayloadLength: GlobalTabletCatalogLocatorHeader + globalTabletCatalogPackedBytes,
+			Kind:          PagePrimaryLocator},
+		bounds, header.TabletID, header.Generation, entries,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locator, err := OpenGlobalTabletCatalogLocator(locatorImage, locatorRef, bounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tabletLogical, _ := GlobalTabletCatalogTabletRootLogicalID(header.TabletID)
+	tabletRef := globalTabletCatalogTestRef(
+		8<<20, tabletLogical, header.Generation,
+		GlobalTabletCatalogTabletBytes, PageTabletRoute,
+	)
+	tabletImage, err := EncodeGlobalTabletCatalogTabletRoot(
+		make([]byte, GlobalTabletCatalogTabletBytes),
+		PageHeader{StoreID: header.StoreID, Generation: header.Generation,
+			LogicalID: tabletLogical, PageSize: GlobalTabletCatalogTabletBytes,
+			PayloadLength: GlobalTabletCatalogRootHeader + SegmentedTabletRouterRootBytes,
+			Kind:          PageTabletRoute},
+		bounds, locatorRef, root,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tablet, err := OpenGlobalTabletCatalogTabletRoot(tabletImage, tabletRef, bounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return globalTabletCatalogRemoveFixture{
+		header: header, leaves: leaves, anchorRefs: anchorRefs,
+		anchors: anchors, bounds: bounds, locatorRef: locatorRef,
+		tabletRef: tabletRef, locator: locator, tablet: tablet,
+	}
+}
+
+func TestGlobalTabletCatalogRemoveLeafLocalizedPersistentRewrite(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		leafCount int
+		target    int
+	}{
+		{name: "middle anchor first row", leafCount: 513, target: 256},
+		{name: "global first floor", leafCount: 3, target: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGlobalTabletCatalogRemoveFixture(t, test.leafCount)
+			selected, ok := fixture.tablet.RouteAnchor(fixture.leaves[test.target].Fence)
+			if !ok {
+				t.Fatal("select source anchor")
+			}
+			start := int(selected.PageID) * SegmentedTabletRouterAnchorPageBytes
+			anchor, err := OpenGlobalTabletCatalogAnchor(
+				fixture.anchors[start:start+SegmentedTabletRouterAnchorPageBytes],
+				&fixture.tablet, selected.PageID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			route, ok := anchor.RouteHashed(
+				KeyHashBytes(segmentedTabletRouterTestSeed, fixture.leaves[test.target].Fence),
+				fixture.leaves[test.target].Fence,
+			)
+			if !ok || route.Ref != fixture.leaves[test.target].Ref {
+				t.Fatalf("source route = %+v,%v", route, ok)
+			}
+			nextGeneration := fixture.header.Generation + 1
+			anchorLogical, _ := GlobalTabletCatalogAnchorLogicalID(
+				fixture.header.TabletID, selected.PageID,
+			)
+			nextAnchorRef := globalTabletCatalogTestRef(
+				12<<20+uint64(selected.PageID)*SegmentedTabletRouterAnchorPageBytes,
+				anchorLogical, nextGeneration,
+				SegmentedTabletRouterAnchorPageBytes, PagePrimaryAnchor,
+			)
+			removed, err := fixture.tablet.RemoveLeaf(
+				make([]byte, SegmentedTabletRouterRootBytes),
+				make([]byte, GlobalTabletCatalogLocatorBytes),
+				make([]byte, SegmentedTabletRouterAnchorPageBytes),
+				nextGeneration, route, nextAnchorRef,
+				&fixture.locator, &anchor,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBytes := SegmentedTabletRouterRootBytes +
+				GlobalTabletCatalogLocatorBytes + SegmentedTabletRouterAnchorPageBytes
+			if removed.PageID != selected.PageID || removed.LocalID != fixture.leaves[test.target].LocalID ||
+				removed.PageCount != uint8(len(fixture.anchorRefs)) || removed.Bytes != wantBytes {
+				t.Fatalf("remove geometry = %+v", removed)
+			}
+
+			nextBounds := fixture.bounds
+			nextBounds.SelectedRootGeneration = nextGeneration
+			nextLocatorRef := fixture.locatorRef
+			nextLocatorRef.Offset = 16 << 20
+			nextLocatorRef.Generation = nextGeneration
+			nextTabletRef := fixture.tabletRef
+			nextTabletRef.Offset = 17 << 20
+			nextTabletRef.Generation = nextGeneration
+			tabletLogical, _ := GlobalTabletCatalogTabletRootLogicalID(fixture.header.TabletID)
+			nextTabletImage, err := EncodeGlobalTabletCatalogTabletRoot(
+				make([]byte, GlobalTabletCatalogTabletBytes),
+				PageHeader{StoreID: fixture.header.StoreID, Generation: nextGeneration,
+					LogicalID: tabletLogical, PageSize: GlobalTabletCatalogTabletBytes,
+					PayloadLength: GlobalTabletCatalogRootHeader + SegmentedTabletRouterRootBytes,
+					Kind:          PageTabletRoute},
+				nextBounds, nextLocatorRef, removed.Root,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nextTablet, err := OpenGlobalTabletCatalogTabletRoot(
+				nextTabletImage, nextTabletRef, nextBounds,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nextLocator, err := OpenGlobalTabletCatalogLocator(
+				removed.Locator, nextLocatorRef, nextBounds,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, state := nextLocator.Resolve(fixture.leaves[test.target].LocalID); state != GlobalTabletCatalogLocatorEmpty {
+				t.Fatalf("removed locator state = %d", state)
+			}
+			nextAnchor, err := OpenGlobalTabletCatalogAnchor(
+				removed.Page, &nextTablet, selected.PageID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if int(nextAnchor.page.count) != int(anchor.page.count)-1 {
+				t.Fatalf("anchor rows = %d, want %d", nextAnchor.page.count, anchor.page.count-1)
+			}
+			for rank := 0; rank < fixture.tablet.AnchorCount(); rank++ {
+				before, _ := fixture.tablet.AnchorAt(rank)
+				after, _ := nextTablet.AnchorAt(rank)
+				if before.PageID != after.PageID ||
+					before.PageID != selected.PageID && before.Ref != after.Ref ||
+					before.PageID == selected.PageID && after.Ref != nextAnchorRef {
+					t.Fatalf("anchor rank %d changed from %+v to %+v", rank, before, after)
+				}
+			}
+			for rank := 0; rank < int(nextAnchor.page.count); rank++ {
+				slot := nextAnchor.page.ranks[rank]
+				localID := binary.LittleEndian.Uint16(nextAnchor.page.localIDs[int(slot)*2:])
+				bucketU, _ := MakeTabletLocalIdentityBucket(fixture.header.TabletID, uint32(localID))
+				ref, zone, resolveOK := nextAnchor.ResolveBucket(&nextLocator, BucketID(bucketU))
+				wantRef, wantZone, handleOK := nextAnchor.page.handleAt(slot, BucketID(bucketU))
+				if !resolveOK || !handleOK || ref != wantRef || zone != wantZone {
+					t.Fatalf("remaining locator %d = %+v/%x/%v", localID, ref, zone, resolveOK)
+				}
+			}
+			if test.target == 0 {
+				if nextAnchor.page.fenceAt(0).length() != 0 {
+					t.Fatalf("promoted first floor = %q", nextAnchor.page.fenceAt(0).a)
+				}
+				got, routeOK := nextAnchor.RouteHashed(0, nil)
+				if !routeOK || got.Ref != fixture.leaves[1].Ref {
+					t.Fatalf("promoted first route = %+v,%v", got, routeOK)
+				}
+			} else {
+				prior, routeOK := nextTablet.RouteAnchor(fixture.leaves[test.target].Fence)
+				if !routeOK || prior.PageID == selected.PageID {
+					t.Fatalf("removed floor still selects page %d", prior.PageID)
+				}
+				successor, routeOK := nextTablet.RouteAnchor(fixture.leaves[test.target+1].Fence)
+				if !routeOK || successor.PageID != selected.PageID {
+					t.Fatalf("successor floor selects page %d", successor.PageID)
+				}
+			}
+		})
 	}
 }
 

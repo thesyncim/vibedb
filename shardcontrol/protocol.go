@@ -16,13 +16,22 @@ var ErrWire = errors.New("shardcontrol: invalid control frame")
 
 const (
 	wireFormat             = 1
-	requestTag             = byte('C')
-	responseTag            = byte('R')
+	frameHeaderBytes       = 8 + 4
 	MaxPayloadBytes        = 1 << 20
 	requestFixedBodyBytes  = 1 + 1 + 1 + 1 + 32 + 32 + 32 + 8*8 + 4
 	responseFixedBodyBytes = 1 + 1 + 2 + 32 + 32 + 32 + 4
 	maxFrameBodyBytes      = requestFixedBodyBytes + MaxPayloadBytes
 )
+
+var (
+	requestMagic  = [8]byte{'V', 'B', 'S', 'P', 'L', 'I', 'T', 0}
+	responseMagic = [8]byte{'V', 'B', 'S', 'D', 'O', 'N', 'E', 0}
+)
+
+// RequestDiscriminator identifies the split grammar on the shared mutually
+// authenticated shard-control listener. It is part of every request frame so
+// the mux can inspect and replay it without translating the signed byte stream.
+func RequestDiscriminator() [8]byte { return requestMagic }
 
 // Action is the closed split step set. Values intentionally equal the current
 // splitcontroller ActionKind values, but the wire package remains independent.
@@ -62,6 +71,10 @@ const (
 	ResultConflict
 	ResultBound
 	ResultUnauthorized
+	// ResultNotLeader is a transient, non-journaled response emitted by the
+	// authenticated server boundary. It is never a durable action result: the
+	// same exact request may be retried at another replica.
+	ResultNotLeader
 )
 
 // Fence binds the request to exact catalog and replicated-state authorities.
@@ -104,7 +117,7 @@ func validAction(action Action) bool {
 }
 
 func validResult(code ResultCode) bool {
-	return code >= ResultAccepted && code <= ResultUnauthorized
+	return code >= ResultAccepted && code <= ResultNotLeader
 }
 
 func validFence(fence Fence) bool {
@@ -148,10 +161,10 @@ func AppendRequest(dst []byte, request *Request) ([]byte, error) {
 		return dst, ErrWire
 	}
 	start := len(dst)
-	dst = append(dst, make([]byte, 5+requestFixedBodyBytes+len(request.Payload))...)
-	dst[start] = requestTag
-	binary.LittleEndian.PutUint32(dst[start+1:start+5], uint32(requestFixedBodyBytes+len(request.Payload)))
-	body := dst[start+5:]
+	dst = append(dst, make([]byte, frameHeaderBytes+requestFixedBodyBytes+len(request.Payload))...)
+	copy(dst[start:start+8], requestMagic[:])
+	binary.LittleEndian.PutUint32(dst[start+8:start+frameHeaderBytes], uint32(requestFixedBodyBytes+len(request.Payload)))
+	body := dst[start+frameHeaderBytes:]
 	body[0], body[1], body[2] = wireFormat, byte(request.Action), request.Child
 	copy(body[4:36], request.Operation[:])
 	copy(body[36:68], request.Step[:])
@@ -163,7 +176,7 @@ func AppendRequest(dst []byte, request *Request) ([]byte, error) {
 }
 
 func OpenRequest(frame []byte) (Request, error) {
-	body, err := openFrame(frame, requestTag, requestFixedBodyBytes)
+	body, err := openFrame(frame, requestMagic, requestFixedBodyBytes)
 	if err != nil || len(body) < requestFixedBodyBytes || body[0] != wireFormat || body[3] != 0 {
 		return Request{}, ErrWire
 	}
@@ -187,10 +200,10 @@ func AppendResponse(dst []byte, response *Response) ([]byte, error) {
 		return dst, ErrWire
 	}
 	start := len(dst)
-	dst = append(dst, make([]byte, 5+responseFixedBodyBytes+len(response.Payload))...)
-	dst[start] = responseTag
-	binary.LittleEndian.PutUint32(dst[start+1:start+5], uint32(responseFixedBodyBytes+len(response.Payload)))
-	body := dst[start+5:]
+	dst = append(dst, make([]byte, frameHeaderBytes+responseFixedBodyBytes+len(response.Payload))...)
+	copy(dst[start:start+8], responseMagic[:])
+	binary.LittleEndian.PutUint32(dst[start+8:start+frameHeaderBytes], uint32(responseFixedBodyBytes+len(response.Payload)))
+	body := dst[start+frameHeaderBytes:]
 	body[0], body[1] = wireFormat, byte(response.Code)
 	copy(body[4:36], response.Operation[:])
 	copy(body[36:68], response.Step[:])
@@ -201,7 +214,7 @@ func AppendResponse(dst []byte, response *Response) ([]byte, error) {
 }
 
 func OpenResponse(frame []byte) (Response, error) {
-	body, err := openFrame(frame, responseTag, responseFixedBodyBytes)
+	body, err := openFrame(frame, responseMagic, responseFixedBodyBytes)
 	if err != nil || len(body) < responseFixedBodyBytes || body[0] != wireFormat || body[2] != 0 || body[3] != 0 {
 		return Response{}, ErrWire
 	}
@@ -229,7 +242,7 @@ func WriteRequest(writer io.Writer, request *Request) error {
 }
 
 func ReadRequest(reader io.Reader) (Request, error) {
-	frame, err := readFrame(reader, requestTag, requestFixedBodyBytes+MaxPayloadBytes)
+	frame, err := readFrame(reader, requestMagic, requestFixedBodyBytes+MaxPayloadBytes)
 	if err != nil {
 		return Request{}, err
 	}
@@ -245,39 +258,39 @@ func WriteResponse(writer io.Writer, response *Response) error {
 }
 
 func ReadResponse(reader io.Reader) (Response, error) {
-	frame, err := readFrame(reader, responseTag, responseFixedBodyBytes+MaxPayloadBytes)
+	frame, err := readFrame(reader, responseMagic, responseFixedBodyBytes+MaxPayloadBytes)
 	if err != nil {
 		return Response{}, err
 	}
 	return OpenResponse(frame)
 }
 
-func openFrame(frame []byte, tag byte, minimum int) ([]byte, error) {
-	if len(frame) < 5 || frame[0] != tag {
+func openFrame(frame []byte, magic [8]byte, minimum int) ([]byte, error) {
+	if len(frame) < frameHeaderBytes || !bytes.Equal(frame[:8], magic[:]) {
 		return nil, ErrWire
 	}
-	length := uint64(binary.LittleEndian.Uint32(frame[1:5]))
-	if length < uint64(minimum) || length > uint64(maxFrameBodyBytes) || length != uint64(len(frame)-5) {
+	length := uint64(binary.LittleEndian.Uint32(frame[8:frameHeaderBytes]))
+	if length < uint64(minimum) || length > uint64(maxFrameBodyBytes) || length != uint64(len(frame)-frameHeaderBytes) {
 		return nil, ErrWire
 	}
-	return frame[5:len(frame):len(frame)], nil
+	return frame[frameHeaderBytes:len(frame):len(frame)], nil
 }
 
-func readFrame(reader io.Reader, tag byte, maximum int) ([]byte, error) {
+func readFrame(reader io.Reader, magic [8]byte, maximum int) ([]byte, error) {
 	if reader == nil {
 		return nil, ErrWire
 	}
-	var header [5]byte
-	if _, err := io.ReadFull(reader, header[:]); err != nil || header[0] != tag {
+	var header [frameHeaderBytes]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil || !bytes.Equal(header[:8], magic[:]) {
 		return nil, errors.Join(ErrWire, err)
 	}
-	length := uint64(binary.LittleEndian.Uint32(header[1:]))
+	length := uint64(binary.LittleEndian.Uint32(header[8:]))
 	if length == 0 || length > uint64(maximum) {
 		return nil, ErrWire
 	}
-	frame := make([]byte, 5+int(length))
+	frame := make([]byte, frameHeaderBytes+int(length))
 	copy(frame, header[:])
-	if _, err := io.ReadFull(reader, frame[5:]); err != nil {
+	if _, err := io.ReadFull(reader, frame[frameHeaderBytes:]); err != nil {
 		return nil, errors.Join(ErrWire, err)
 	}
 	return frame, nil

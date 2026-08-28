@@ -51,7 +51,7 @@ func TestTransactionImageReopenAccountingIntentOwnershipAndTopologyFence(t *test
 		LastExpectedRevision: 1, LastCommandDigest: transactionCodecCommandDigest(110),
 		LastResultCode: ResultApplied, LastAppliedIndex: 2,
 	}
-	controlValue, err := AppendTransactionControl(nil, control)
+	controlValue, err := AppendTransactionControl(nil, fencedTransactionTestControl(control))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestFusedCoordinatorZeroVoteCannotReopenOrCommit(t *testing.T) {
 		LastResultCode:                ResultApplied,
 		LastAppliedIndex:              2,
 	}
-	controlValue, err := AppendTransactionControl(nil, control)
+	controlValue, err := AppendTransactionControl(nil, fencedTransactionTestControl(control))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
 		LastResultCode:       ResultApplied,
 		LastAppliedIndex:     2,
 	}
-	controlValue, err := AppendTransactionControl(nil, control)
+	controlValue, err := AppendTransactionControl(nil, fencedTransactionTestControl(control))
 	if err != nil {
 		t.Fatal(err)
 	}

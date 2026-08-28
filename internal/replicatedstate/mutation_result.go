@@ -30,7 +30,7 @@ const MaxMutationAffectedRows = int64(MaxDistinctMutations) *
 // mutation result grammar. On error dst is unchanged. With enough capacity it
 // allocates zero.
 func AppendMutationCompletionResult(dst []byte, resultCode uint32, affectedRows int64) ([]byte, error) {
-	if !isSessionResultCode(resultCode) || affectedRows < 0 ||
+	if !isMutationResultCode(resultCode) || affectedRows < 0 ||
 		affectedRows > MaxMutationAffectedRows ||
 		resultCode != ResultApplied && affectedRows != 0 {
 		return dst, fmt.Errorf("%w: invalid mutation result", ErrCompletionCorrupt)
@@ -45,7 +45,7 @@ func AppendMutationCompletionResult(dst []byte, resultCode uint32, affectedRows 
 // mutation result. An applied result is always the fixed eight-byte affected
 // row count; every refusal is canonically empty.
 func OpenMutationCompletionResult(resultCode uint32, src []byte) (int64, error) {
-	if !isSessionResultCode(resultCode) {
+	if !isMutationResultCode(resultCode) {
 		return 0, fmt.Errorf("%w: invalid mutation result code", ErrCompletionCorrupt)
 	}
 	if resultCode != ResultApplied {

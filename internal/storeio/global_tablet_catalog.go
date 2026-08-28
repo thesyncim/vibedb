@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"unsafe"
 )
 
@@ -35,6 +36,9 @@ const (
 
 	GlobalTabletCatalogMaxLeafPages   = 1 << 13
 	GlobalTabletCatalogMaxBranchPages = 1 << 9
+	// GlobalTabletCatalogMinimumNodeFanout is the exact lower bound for an
+	// 8 KiB catalog node with adversarial 255-byte separators.
+	GlobalTabletCatalogMinimumNodeFanout = 28
 
 	GlobalTabletCatalogLeafLogicalIDBase        = PrimaryLeafLogicalIDBase
 	GlobalTabletCatalogLeafLogicalIDLimit       = PrimaryLeafLogicalIDLimit
@@ -142,6 +146,22 @@ type GlobalTabletCatalogNodeRoute struct {
 type GlobalTabletCatalogNodeHandleRewrite struct {
 	ID  uint32
 	Ref PageRef
+}
+
+// GlobalTabletCatalogNodeSplitResult is the canonical two-node image and the
+// exact floor its parent must insert for Right.
+type GlobalTabletCatalogNodeSplitResult struct {
+	Left          []byte
+	Right         []byte
+	PromotedFloor []byte
+}
+
+// GlobalTabletCatalogRootPromotion is the canonical three-level image created
+// when a two-level root can no longer name another catalog leaf directly.
+type GlobalTabletCatalogRootPromotion struct {
+	Root        []byte
+	LeftBranch  []byte
+	RightBranch []byte
 }
 
 // GlobalTabletCatalogNodeCursor walks the tablet entries of one catalog node in
@@ -679,6 +699,86 @@ func (v *GlobalTabletCatalogNodeView) Count() int {
 	return v.floors.BucketCount()
 }
 
+// GlobalTabletCatalogNextNodeIDs reconstructs the monotonic catalog leaf and
+// branch identity high-waters from one authenticated root. It touches catalog
+// metadata only (never tablet anchors or data leaves), so Open can recover
+// allocator state without another durable counter or a data-cardinality scan.
+func GlobalTabletCatalogNextNodeIDs(
+	cache *PageCache,
+	root PageRef,
+	bounds GlobalTabletCatalogBounds,
+) (nextLeaf, nextBranch uint32, err error) {
+	if cache == nil || root == (PageRef{}) || !bounds.valid() {
+		return 0, 0, fmt.Errorf("%w: catalog identity high-water", ErrInvalidWrite)
+	}
+	var highLeaf, highBranch uint32
+	var sawLeaf, sawBranch bool
+	var walk func(PageRef, GlobalTabletCatalogNodeLevel) error
+	walk = func(ref PageRef, want GlobalTabletCatalogNodeLevel) error {
+		lease, acquireErr := cache.Acquire(ref)
+		if acquireErr != nil {
+			return acquireErr
+		}
+		node := AdmittedGlobalTabletCatalogNode(lease.Page(), bounds)
+		if node.Level() != want || node.Count() == 0 {
+			lease.Release()
+			return ErrGlobalTabletCatalogCorrupt
+		}
+		switch want {
+		case GlobalTabletCatalogLeaf:
+			if !sawLeaf || node.PageID() > highLeaf {
+				highLeaf = node.PageID()
+			}
+			sawLeaf = true
+			lease.Release()
+			return nil
+		case GlobalTabletCatalogBranch:
+			if !sawBranch || node.PageID() > highBranch {
+				highBranch = node.PageID()
+			}
+			sawBranch = true
+		}
+		childLevel := node.ChildLevel()
+		children := make([]PageRef, 0, node.Count())
+		cursor := node.LowerBound(nil)
+		for {
+			route, ok := cursor.Route()
+			if !ok {
+				lease.Release()
+				return ErrGlobalTabletCatalogCorrupt
+			}
+			children = append(children, route.Ref)
+			if !cursor.Next() {
+				break
+			}
+		}
+		lease.Release()
+		for _, child := range children {
+			if walkErr := walk(child, childLevel); walkErr != nil {
+				return walkErr
+			}
+		}
+		return nil
+	}
+	if err := walk(root, GlobalTabletCatalogRoot); err != nil {
+		return 0, 0, err
+	}
+	if !sawLeaf {
+		return 0, 0, ErrGlobalTabletCatalogCorrupt
+	}
+	nextLeaf = highLeaf + 1
+	if nextLeaf >= GlobalTabletCatalogMaxLeafPages {
+		nextLeaf = GlobalTabletCatalogMaxLeafPages
+	}
+	if sawBranch {
+		nextBranch = highBranch + 1
+	}
+	if nextBranch >= GlobalTabletCatalogMaxBranchPages {
+		nextBranch = GlobalTabletCatalogMaxBranchPages
+	}
+	return nextLeaf, nextBranch, nil
+}
+
 func (v *GlobalTabletCatalogNodeView) upperBound(key []byte) int {
 	if v == nil {
 		return 0
@@ -795,6 +895,338 @@ func (v *GlobalTabletCatalogNodeView) RewriteHandle(
 			ID: id, Ref: replacement,
 		}},
 	)
+}
+
+// InsertChild performs one immutable structural insertion into a catalog node.
+// Existing stable child IDs, floors, and handles remain byte-equivalent; the
+// caller supplies the exact new lexical floor and a previously unused stable
+// ID. The operation is canonical across source generations because it rebuilds
+// the node from its admitted logical entries rather than patching encoded
+// offsets. A full node reports ErrGlobalTabletCatalogNoSpace without changing
+// dst so its caller can split the catalog level first.
+func (v *GlobalTabletCatalogNodeView) InsertChild(
+	dst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+) ([]byte, error) {
+	return v.insertChild(dst, generation, bounds, floor, id, ref, nil)
+}
+
+// InsertChildReplacing is InsertChild plus a bounded set of existing child
+// handle replacements in the same canonical node image. Macro-tablet split
+// uses this to publish the left replacement and right sibling without an
+// intermediate catalog generation.
+func (v *GlobalTabletCatalogNodeView) InsertChildReplacing(
+	dst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+) ([]byte, error) {
+	if len(rewrites) == 0 || len(rewrites) > v.Count() {
+		return nil, fmt.Errorf("%w: catalog insert rewrites", ErrInvalidWrite)
+	}
+	return v.insertChild(dst, generation, bounds, floor, id, ref, rewrites)
+}
+
+func (v *GlobalTabletCatalogNodeView) insertChild(
+	dst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+) ([]byte, error) {
+	if v == nil || len(v.image) == 0 || len(floor) == 0 ||
+		generation <= v.header.Generation || generation >= uint64(1)<<48 ||
+		len(dst) < len(v.image) || !bounds.extends(v.bounds) ||
+		globalTabletCatalogSlicesOverlap(dst[:len(v.image)], v.image) {
+		return nil, fmt.Errorf("%w: catalog insert generation or destination", ErrInvalidWrite)
+	}
+	entries, err := v.entriesWithInsertedChild(floor, id, ref, rewrites)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeGlobalTabletCatalogNode(
+		dst,
+		GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: v.header.LogicalID, PageID: v.pageID,
+			Level: v.level, RootChildLevel: v.childLevel,
+			Bounds: bounds, Kind: PagePrimaryCatalog,
+			ChildKind: v.childKind, ChildLength: v.childLength,
+		},
+		entries,
+	)
+}
+
+func (v *GlobalTabletCatalogNodeView) entriesWithInsertedChild(
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+) ([]GlobalTabletCatalogNodeEntry, error) {
+	for at := range rewrites {
+		for prior := 0; prior < at; prior++ {
+			if rewrites[prior].ID == rewrites[at].ID {
+				return nil, fmt.Errorf("%w: duplicate catalog insert rewrite", ErrInvalidWrite)
+			}
+		}
+	}
+	type floorSpan struct{ start, end int }
+	spans := make([]floorSpan, v.Count())
+	arena := make([]byte, 0, len(v.floors.image)+len(floor))
+	for ordinal := 1; ordinal < v.Count(); ordinal++ {
+		common, restart, suffix, ok := v.floors.FenceAt(ordinal - 1)
+		if !ok {
+			return nil, fmt.Errorf("%w: catalog insert source floor", ErrInvalidWrite)
+		}
+		start := len(arena)
+		arena = append(arena, common...)
+		arena = append(arena, restart...)
+		arena = append(arena, suffix...)
+		spans[ordinal] = floorSpan{start: start, end: len(arena)}
+	}
+	insertAt := sort.Search(v.Count(), func(ordinal int) bool {
+		if ordinal == 0 {
+			return false
+		}
+		span := spans[ordinal]
+		return bytes.Compare(arena[span.start:span.end], floor) >= 0
+	})
+	if insertAt < v.Count() {
+		span := spans[insertAt]
+		if bytes.Equal(arena[span.start:span.end], floor) {
+			return nil, fmt.Errorf("%w: duplicate catalog insert floor", ErrInvalidWrite)
+		}
+	}
+	entries := make([]GlobalTabletCatalogNodeEntry, 0, v.Count()+1)
+	matched := make([]bool, len(rewrites))
+	for ordinal := 0; ordinal <= v.Count(); ordinal++ {
+		if ordinal == insertAt {
+			entries = append(entries, GlobalTabletCatalogNodeEntry{Floor: floor, ID: id, Ref: ref})
+		}
+		if ordinal == v.Count() {
+			break
+		}
+		route, ok := v.RouteAt(ordinal)
+		if !ok {
+			return nil, fmt.Errorf("%w: catalog insert source route", ErrInvalidWrite)
+		}
+		var oldFloor []byte
+		if ordinal != 0 {
+			span := spans[ordinal]
+			oldFloor = arena[span.start:span.end]
+		}
+		oldRef := route.Ref
+		for at, rewrite := range rewrites {
+			if rewrite.ID == route.ID {
+				matched[at], oldRef = true, rewrite.Ref
+			}
+		}
+		entries = append(entries, GlobalTabletCatalogNodeEntry{Floor: oldFloor, ID: route.ID, Ref: oldRef})
+	}
+	for _, ok := range matched {
+		if !ok {
+			return nil, fmt.Errorf("%w: missing catalog insert rewrite", ErrInvalidWrite)
+		}
+	}
+	return entries, nil
+}
+
+// SplitInsertChildReplacing applies one structural insertion plus handle
+// rewrites while splitting a full leaf or branch into two canonical nodes.
+// The source keeps its stable ID; Right receives the caller-authorized ID.
+func (v *GlobalTabletCatalogNodeView) SplitInsertChildReplacing(
+	leftDst, rightDst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+	rightPageID uint32,
+) (GlobalTabletCatalogNodeSplitResult, error) {
+	var result GlobalTabletCatalogNodeSplitResult
+	if v == nil || len(v.image) == 0 || v.level == GlobalTabletCatalogRoot ||
+		len(floor) == 0 || generation <= v.header.Generation ||
+		generation >= uint64(1)<<48 || len(leftDst) < len(v.image) ||
+		len(rightDst) < len(v.image) || !bounds.extends(v.bounds) ||
+		globalTabletCatalogSlicesOverlap(leftDst[:len(v.image)], v.image) ||
+		globalTabletCatalogSlicesOverlap(rightDst[:len(v.image)], v.image) ||
+		globalTabletCatalogSlicesOverlap(leftDst[:len(v.image)], rightDst[:len(v.image)]) {
+		return result, fmt.Errorf("%w: catalog split destination", ErrInvalidWrite)
+	}
+	rightLogicalID, rightBytes, ok := globalTabletCatalogNodeIdentity(v.level, rightPageID)
+	if !ok || int(rightBytes) != len(v.image) || rightPageID == v.pageID {
+		return result, fmt.Errorf("%w: catalog split right identity", ErrInvalidWrite)
+	}
+	entries, err := v.entriesWithInsertedChild(floor, id, ref, rewrites)
+	if err != nil || len(entries) < 2 {
+		return result, errors.Join(err, fmt.Errorf("%w: catalog split entries", ErrInvalidWrite))
+	}
+	header := func(pageID uint32, logicalID uint64) GlobalTabletCatalogNodeHeader {
+		return GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: logicalID, PageID: pageID,
+			Level: v.level, RootChildLevel: v.childLevel,
+			Bounds: bounds, Kind: PagePrimaryCatalog,
+			ChildKind: v.childKind, ChildLength: v.childLength,
+		}
+	}
+	leftScratch := make([]byte, len(v.image))
+	rightScratch := make([]byte, len(v.image))
+	middle := len(entries) / 2
+	for distance := 0; distance < len(entries); distance++ {
+		cuts := [...]int{middle - distance, middle + distance}
+		for side, cut := range cuts {
+			if side == 1 && cuts[0] == cuts[1] || cut <= 0 || cut >= len(entries) {
+				continue
+			}
+			rightEntries := append([]GlobalTabletCatalogNodeEntry(nil), entries[cut:]...)
+			promoted := bytes.Clone(rightEntries[0].Floor)
+			rightEntries[0].Floor = nil
+			left, leftErr := EncodeGlobalTabletCatalogNode(
+				leftScratch, header(v.pageID, v.header.LogicalID), entries[:cut],
+			)
+			if errors.Is(leftErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if leftErr != nil {
+				return result, leftErr
+			}
+			right, rightErr := EncodeGlobalTabletCatalogNode(
+				rightScratch, header(rightPageID, rightLogicalID), rightEntries,
+			)
+			if errors.Is(rightErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if rightErr != nil {
+				return result, rightErr
+			}
+			copy(leftDst, left)
+			copy(rightDst, right)
+			return GlobalTabletCatalogNodeSplitResult{
+				Left: leftDst[:len(left)], Right: rightDst[:len(right)],
+				PromotedFloor: promoted,
+			}, nil
+		}
+	}
+	return result, ErrGlobalTabletCatalogNoSpace
+}
+
+// PromoteRootInsertChildReplacing converts a full root->leaf catalog into a
+// root->branch->leaf catalog while applying the triggering leaf insertion and
+// handle rewrites. The old leaf pages remain untouched. All three destinations
+// remain unchanged unless both branches and the new root encode canonically.
+func (v *GlobalTabletCatalogNodeView) PromoteRootInsertChildReplacing(
+	rootDst, leftBranchDst, rightBranchDst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+	leftBranchID uint32,
+	leftBranchRef PageRef,
+	rightBranchID uint32,
+	rightBranchRef PageRef,
+) (GlobalTabletCatalogRootPromotion, error) {
+	var result GlobalTabletCatalogRootPromotion
+	if v == nil || len(v.image) == 0 || v.level != GlobalTabletCatalogRoot ||
+		v.childLevel != GlobalTabletCatalogLeaf || len(floor) == 0 ||
+		generation <= v.header.Generation || generation >= uint64(1)<<48 ||
+		len(rootDst) < len(v.image) ||
+		len(leftBranchDst) < GlobalTabletCatalogNodeBytes ||
+		len(rightBranchDst) < GlobalTabletCatalogNodeBytes ||
+		!bounds.extends(v.bounds) || leftBranchID == rightBranchID {
+		return result, fmt.Errorf("%w: catalog root promotion", ErrInvalidWrite)
+	}
+	leftLogical, leftOK := GlobalTabletCatalogCatalogBranchLogicalID(leftBranchID)
+	rightLogical, rightOK := GlobalTabletCatalogCatalogBranchLogicalID(rightBranchID)
+	if !leftOK || !rightOK || leftBranchRef.LogicalID != leftLogical ||
+		rightBranchRef.LogicalID != rightLogical {
+		return result, fmt.Errorf("%w: catalog root promotion identities", ErrInvalidWrite)
+	}
+	entries, err := v.entriesWithInsertedChild(floor, id, ref, rewrites)
+	if err != nil || len(entries) < 2 {
+		return result, errors.Join(err, fmt.Errorf("%w: catalog root promotion entries", ErrInvalidWrite))
+	}
+	branchHeader := func(pageID uint32, logicalID uint64) GlobalTabletCatalogNodeHeader {
+		return GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: logicalID, PageID: pageID,
+			Level: GlobalTabletCatalogBranch, Bounds: bounds,
+			Kind: PagePrimaryCatalog, ChildKind: PagePrimaryCatalog,
+			ChildLength: GlobalTabletCatalogNodeBytes,
+		}
+	}
+	leftScratch := make([]byte, GlobalTabletCatalogNodeBytes)
+	rightScratch := make([]byte, GlobalTabletCatalogNodeBytes)
+	rootScratch := make([]byte, len(v.image))
+	middle := len(entries) / 2
+	for distance := 0; distance < len(entries); distance++ {
+		cuts := [...]int{middle - distance, middle + distance}
+		for side, cut := range cuts {
+			if side == 1 && cuts[0] == cuts[1] || cut <= 0 || cut >= len(entries) {
+				continue
+			}
+			rightEntries := append([]GlobalTabletCatalogNodeEntry(nil), entries[cut:]...)
+			promoted := bytes.Clone(rightEntries[0].Floor)
+			rightEntries[0].Floor = nil
+			left, leftErr := EncodeGlobalTabletCatalogNode(
+				leftScratch, branchHeader(leftBranchID, leftLogical), entries[:cut],
+			)
+			if errors.Is(leftErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if leftErr != nil {
+				return result, leftErr
+			}
+			right, rightErr := EncodeGlobalTabletCatalogNode(
+				rightScratch, branchHeader(rightBranchID, rightLogical), rightEntries,
+			)
+			if errors.Is(rightErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if rightErr != nil {
+				return result, rightErr
+			}
+			root, rootErr := EncodeGlobalTabletCatalogNode(
+				rootScratch,
+				GlobalTabletCatalogNodeHeader{
+					StoreID: v.bounds.StoreID, Generation: generation,
+					LogicalID: v.header.LogicalID, PageID: v.pageID,
+					Level:          GlobalTabletCatalogRoot,
+					RootChildLevel: GlobalTabletCatalogBranch,
+					Bounds:         bounds, Kind: PagePrimaryCatalog,
+					ChildKind:   PagePrimaryCatalog,
+					ChildLength: GlobalTabletCatalogNodeBytes,
+				},
+				[]GlobalTabletCatalogNodeEntry{
+					{ID: leftBranchID, Ref: leftBranchRef},
+					{Floor: promoted, ID: rightBranchID, Ref: rightBranchRef},
+				},
+			)
+			if rootErr != nil {
+				return result, rootErr
+			}
+			copy(leftBranchDst, left)
+			copy(rightBranchDst, right)
+			copy(rootDst, root)
+			result.LeftBranch = leftBranchDst[:GlobalTabletCatalogNodeBytes]
+			result.RightBranch = rightBranchDst[:GlobalTabletCatalogNodeBytes]
+			result.Root = rootDst[:len(v.image)]
+			return result, nil
+		}
+	}
+	return result, ErrGlobalTabletCatalogNoSpace
 }
 
 // RewriteHandles performs one immutable node rewrite containing every listed
@@ -1589,6 +2021,175 @@ func (v *GlobalTabletCatalogTabletRootView) InsertSplitLeaf(
 	return result, nil
 }
 
+// RemoveLeaf performs the localized structural edit for one primary-leaf
+// removal. The selected anchor must retain at least one row, so stable anchor
+// identity and page cardinality do not change. Every unaffected anchor
+// reference is preserved, the removed LocalID becomes immediately empty in
+// the new generation's locator, and deleting the global first row promotes
+// its successor to the canonical empty negative-infinity floor.
+func (v *GlobalTabletCatalogTabletRootView) RemoveLeaf(
+	rootDst, locatorDst, pageDst []byte,
+	generation uint64,
+	route SegmentedTabletRouterRoute,
+	anchorRef PageRef,
+	locator *GlobalTabletCatalogLocatorView,
+	anchor *GlobalTabletCatalogAnchorView,
+) (SegmentedTabletRouterLeafRemoveResult, error) {
+	var result SegmentedTabletRouterLeafRemoveResult
+	if v == nil || locator == nil || anchor == nil || len(v.image) == 0 ||
+		len(locator.image) != GlobalTabletCatalogLocatorBytes ||
+		len(anchor.page.image) != SegmentedTabletRouterAnchorPageBytes ||
+		len(rootDst) < SegmentedTabletRouterRootBytes ||
+		len(locatorDst) < GlobalTabletCatalogLocatorBytes ||
+		len(pageDst) < SegmentedTabletRouterAnchorPageBytes ||
+		generation <= v.inner.generation || generation >= uint64(1)<<48 ||
+		locator.ref != v.locator || locator.tabletID != v.inner.tabletID ||
+		anchor.tabletID != v.inner.tabletID || anchor.locator != v.locator ||
+		anchor.page.pageID != route.PageID || anchor.page.count <= 1 {
+		return result, fmt.Errorf("%w: localized leaf remove selection", ErrInvalidWrite)
+	}
+	currentRef, _, ok := anchor.page.handleAt(route.RowSlot, route.Bucket)
+	tabletID, localID, bucketOK := SplitTabletLocalIdentityBucket(uint32(route.Bucket))
+	pageID, rowSlot, state := locator.Resolve(uint16(localID))
+	if !ok || currentRef != route.Ref || !bucketOK || tabletID != v.inner.tabletID ||
+		pageID != route.PageID || rowSlot != route.RowSlot ||
+		state != GlobalTabletCatalogLocatorLive ||
+		anchorRef.Generation != generation ||
+		segmentedTabletRouterValidateAnchorRefIdentity(
+			anchorRef, tabletID, generation, route.PageID,
+		) != nil {
+		return result, fmt.Errorf("%w: localized leaf remove identity", ErrInvalidWrite)
+	}
+	sourceRank := -1
+	for rank := 0; rank < int(anchor.page.count); rank++ {
+		if anchor.page.ranks[rank] == route.RowSlot {
+			sourceRank = rank
+			break
+		}
+	}
+	rootRank := -1
+	for rank := 0; rank < int(v.inner.pageCount); rank++ {
+		if v.inner.rootRanks[rank] == route.PageID {
+			rootRank = rank
+			break
+		}
+	}
+	if sourceRank < 0 || rootRank < 0 {
+		return result, fmt.Errorf("%w: localized leaf remove rank", ErrInvalidWrite)
+	}
+
+	type removeRow struct {
+		fence segmentedTabletRouterFence
+		local uint16
+		ref   PageRef
+		zone  BucketZone
+	}
+	count := int(anchor.page.count) - 1
+	rowAt := func(rank int) removeRow {
+		oldRank := rank
+		if rank >= sourceRank {
+			oldRank++
+		}
+		slot := anchor.page.ranks[oldRank]
+		rowLocalID := binary.LittleEndian.Uint16(anchor.page.localIDs[int(slot)*2:])
+		bucketU, _ := MakeTabletLocalIdentityBucket(tabletID, uint32(rowLocalID))
+		ref, zone, _ := anchor.page.handleAt(slot, BucketID(bucketU))
+		fence := anchor.page.fenceAt(oldRank)
+		if rootRank == 0 && sourceRank == 0 && rank == 0 {
+			fence = segmentedTabletRouterFence{}
+		}
+		return removeRow{fence: fence, local: rowLocalID, ref: ref, zone: zone}
+	}
+	header := SegmentedTabletRouterHeader{
+		StoreID: v.inner.storeID, TabletID: tabletID, Generation: generation,
+		AnchorKind: v.inner.anchorKind, LeafKind: v.inner.leafKind,
+	}
+	if _, err := segmentedTabletRouterEncodeAnchor(
+		pageDst, header, route.PageID, count,
+		func(rank int) segmentedTabletRouterFence { return rowAt(rank).fence },
+		func(rank int) (uint8, uint16, PageRef, BucketZone) {
+			row := rowAt(rank)
+			return uint8(rank), row.local, row.ref, row.zone
+		},
+	); err != nil {
+		return result, err
+	}
+
+	locatorImage := locatorDst[:GlobalTabletCatalogLocatorBytes]
+	copy(locatorImage, locator.image)
+	binary.LittleEndian.PutUint64(locatorImage[24:32], generation)
+	payload := locatorImage[PageHeaderSize:]
+	if locator.live == 0 {
+		return result, fmt.Errorf("%w: localized leaf remove locator", ErrInvalidWrite)
+	}
+	binary.LittleEndian.PutUint16(payload[8:10], locator.live-1)
+	packed := payload[GlobalTabletCatalogLocatorHeader:]
+	globalTabletCatalogPut14(packed, uint16(localID), 0)
+	for rank := 0; rank < count; rank++ {
+		row := rowAt(rank)
+		globalTabletCatalogPut14(
+			packed, row.local,
+			uint16(GlobalTabletCatalogLocatorLive)<<12|
+				uint16(route.PageID)<<8|uint16(rank),
+		)
+	}
+	if _, err := sealInitializedPage(locatorImage); err != nil {
+		return result, err
+	}
+
+	root := rootDst[:SegmentedTabletRouterRootBytes]
+	clear(root)
+	copy(root[:segmentedTabletRouterRootHeaderBytes],
+		v.inner.root[:segmentedTabletRouterRootHeaderBytes])
+	binary.LittleEndian.PutUint64(root[24:32], generation)
+	binary.LittleEndian.PutUint32(root[36:40], PageChecksum(locatorImage))
+	for stableID := range uint8(SegmentedTabletRouterMaxPages) {
+		ref, refOK := v.inner.anchorRef(stableID)
+		if stableID == route.PageID {
+			ref, refOK = anchorRef, true
+		}
+		if !refOK {
+			continue
+		}
+		segmentedTabletRouterEncodeAnchorRef(
+			root[segmentedTabletRouterRootRefsAt+
+				int(stableID)*segmentedTabletRouterRootRefBytes:], ref,
+		)
+	}
+	keyAt := 0
+	for rank := 0; rank < int(v.inner.pageCount); rank++ {
+		stableID := v.inner.rootRanks[rank]
+		root[segmentedTabletRouterRootRanksAt+rank] = stableID
+		binary.LittleEndian.PutUint16(
+			root[segmentedTabletRouterRootOffsetsAt+rank*2:], uint16(keyAt),
+		)
+		fence := v.inner.rootFence(rank)
+		if rank == rootRank {
+			fence = rowAt(0).fence
+		}
+		if keyAt+fence.length() > segmentedTabletRouterRootTrailerAt-
+			segmentedTabletRouterRootKeysAt {
+			return result, ErrSegmentedTabletRouterNoSpace
+		}
+		keyAt += fence.copyTo(root[segmentedTabletRouterRootKeysAt+keyAt:], 0)
+	}
+	binary.LittleEndian.PutUint16(
+		root[segmentedTabletRouterRootOffsetsAt+int(v.inner.pageCount)*2:],
+		uint16(keyAt),
+	)
+	binary.LittleEndian.PutUint16(root[32:34], uint16(keyAt))
+	segmentedTabletRouterSeal(root, segmentedTabletRouterRootTrailerAt)
+
+	return SegmentedTabletRouterLeafRemoveResult{
+		Root: root, Locator: locatorImage,
+		Page:   pageDst[:SegmentedTabletRouterAnchorPageBytes],
+		PageID: route.PageID, LocalID: uint16(localID),
+		PageCount: v.inner.pageCount,
+		Bytes: SegmentedTabletRouterRootBytes + GlobalTabletCatalogLocatorBytes +
+			SegmentedTabletRouterAnchorPageBytes,
+	}, nil
+}
+
 // RewriteAnchorHandles writes one anchor after-image containing every listed
 // stable-row leaf replacement. All rewrites must select the supplied anchor;
 // the tablet root itself is rewritten separately by RewriteAnchorRefs.
@@ -2056,11 +2657,16 @@ func (b GlobalTabletCatalogBounds) extends(previous GlobalTabletCatalogBounds) b
 func globalTabletCatalogPut14(dst []byte, localID uint16, code uint16) {
 	bit := int(localID) * globalTabletCatalogPackedBits
 	at, shift := bit>>3, uint(bit&7)
-	word := uint32(code&0x3fff) << shift
-	dst[at] |= byte(word)
-	dst[at+1] |= byte(word >> 8)
+	word := uint32(dst[at]) | uint32(dst[at+1])<<8
 	if at+2 < len(dst) {
-		dst[at+2] |= byte(word >> 16)
+		word |= uint32(dst[at+2]) << 16
+	}
+	mask := uint32(0x3fff) << shift
+	word = word&^mask | uint32(code&0x3fff)<<shift
+	dst[at] = byte(word)
+	dst[at+1] = byte(word >> 8)
+	if at+2 < len(dst) {
+		dst[at+2] = byte(word >> 16)
 	}
 }
 

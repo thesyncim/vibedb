@@ -4,6 +4,8 @@ package rf3testfixture
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 
@@ -16,15 +18,22 @@ import (
 
 // MemberOptions is the complete prepared-member input retained by serve-rf3.
 type MemberOptions struct {
-	Root        string
-	Table       string
-	CreateTable string
-	Identity    raftstore.Identity
-	Key         raftstore.Key
-	WAL         raftstore.Options
-	Bootstrap   raftstore.Bootstrap
-	Authority   sqldriver.ReplicatedAuthorityProfile
-	Apply       sqldriver.ReplicatedApplyOptions
+	Root             string
+	Table            string
+	CreateTable      string
+	SchemaStatements []string
+	GlobalIndexes    []sqldriver.ReplicatedGlobalIndexRelation
+	Identity         raftstore.Identity
+	Key              raftstore.Key
+	WAL              raftstore.Options
+	Bootstrap        raftstore.Bootstrap
+	Authority        sqldriver.ReplicatedAuthorityProfile
+	Apply            sqldriver.ReplicatedApplyOptions
+	// SeedDocuments are inserted before the store is bound to replicated apply.
+	// They let an external control-plane process start from an authenticated
+	// catalog head without issuing an unsafe direct write after Raft ownership
+	// has been installed.
+	SeedDocuments [][]byte
 }
 
 // PreparedMember owns one open WAL/SQL/apply triple. Tests may either close it
@@ -43,17 +52,40 @@ type PreparedMember struct {
 // PrepareMember creates and opens exactly one initial prepared member. It does
 // not adopt a Raft runtime or mint a node incarnation.
 func PrepareMember(options MemberOptions) (*PreparedMember, error) {
+	return prepareMember(options, false)
+}
+
+// PrepareSnapshotTarget binds an empty target and reserves its exact apply
+// identity using the intended immutable WAL identity. No WAL, WAL family,
+// Raft state, or checkpoint is created before certified snapshot installation.
+func PrepareSnapshotTarget(options MemberOptions) (*PreparedMember, error) {
+	return prepareMember(options, true)
+}
+
+func prepareMember(options MemberOptions, coldSnapshot bool) (*PreparedMember, error) {
 	if options.Root == "" || options.Table == "" || options.CreateTable == "" ||
-		options.Bootstrap.Snapshot == nil {
+		options.Bootstrap.Snapshot == nil || (coldSnapshot && len(options.SeedDocuments) != 0) {
 		return nil, errors.New("rf3 test fixture: invalid prepared member")
 	}
 	walPath := filepath.Join(options.Root, "member.wal")
 	sqlPath := filepath.Join(options.Root, "member.vdb")
-	wal, err := raftstore.Create(
-		walPath, options.Identity, options.Key, options.Bootstrap, options.WAL,
-	)
+	var wal *raftstore.Store
+	var binding sqldriver.ReplicatedShardStoreBinding
+	var err error
+	if coldSnapshot {
+		binding, err = raftmember.BindingForNewWAL(options.Identity,
+			options.Bootstrap.TopologyRecoveryEpoch, options.Authority)
+	} else {
+		wal, err = raftstore.Create(walPath, options.Identity, options.Key, options.Bootstrap, options.WAL)
+	}
 	if err != nil {
 		return nil, err
+	}
+	closeWAL := func() error {
+		if wal != nil {
+			return wal.Close()
+		}
+		return nil
 	}
 	database, err := sqldriver.InitializeShardStore(sqlPath, sqldriver.ShardStoreBinding{
 		Distribution: distribution.DistributionName(options.Identity.Distribution),
@@ -63,31 +95,92 @@ func PrepareMember(options MemberOptions) (*PreparedMember, error) {
 		),
 	})
 	if err != nil {
-		return nil, errors.Join(err, wal.Close())
+		return nil, errors.Join(err, closeWAL())
 	}
 	closeBoth := func(cause error) (*PreparedMember, error) {
-		return nil, errors.Join(cause, database.Close(), wal.Close())
+		return nil, errors.Join(cause, database.Close(), closeWAL())
 	}
-	session, err := database.NewSession(context.Background())
-	if err != nil {
-		return closeBoth(err)
+	for _, schema := range append([]string{options.CreateTable}, options.SchemaStatements...) {
+		if schema == "" {
+			return closeBoth(errors.New("rf3 test fixture: empty schema statement"))
+		}
+		session, sessionErr := database.NewSession(context.Background())
+		if sessionErr != nil {
+			return closeBoth(sessionErr)
+		}
+		statement, statementErr := session.Prepare(context.Background(), schema)
+		if statementErr == nil {
+			_, statementErr = statement.Exec(context.Background(), nil)
+		}
+		if statement != nil {
+			statementErr = errors.Join(statementErr, statement.Close())
+		}
+		statementErr = errors.Join(statementErr, session.Close())
+		if statementErr != nil {
+			return closeBoth(statementErr)
+		}
 	}
-	statement, err := session.Prepare(context.Background(), options.CreateTable)
+	if len(options.SeedDocuments) != 0 {
+		session, err := database.NewSession(context.Background())
+		if err != nil {
+			return closeBoth(err)
+		}
+		statement, prepareErr := session.Prepare(context.Background(),
+			"INSERT INTO "+options.Table+" VALUES (?)")
+		if prepareErr == nil {
+			for _, document := range options.SeedDocuments {
+				if len(document) == 0 {
+					prepareErr = errors.New("rf3 test fixture: empty seed document")
+					break
+				}
+				if _, prepareErr = statement.Exec(context.Background(), []any{document}); prepareErr != nil {
+					break
+				}
+			}
+		}
+		if statement != nil {
+			prepareErr = errors.Join(prepareErr, statement.Close())
+		}
+		prepareErr = errors.Join(prepareErr, session.Close())
+		if prepareErr != nil {
+			return closeBoth(prepareErr)
+		}
+	}
+	var base sqldriver.ReplicatedShardStoreIdentity
+	if !coldSnapshot {
+		binding, err = raftmember.BindingFromWAL(wal, options.Authority)
+	}
 	if err == nil {
-		_, err = statement.Exec(context.Background(), nil)
+		if len(options.GlobalIndexes) == 0 {
+			base, err = database.BindReplicatedShardStore(binding, options.Table)
+		} else {
+			base, err = database.BindReplicatedShardStoreBundle(
+				binding, options.Table, options.GlobalIndexes,
+			)
+		}
 	}
-	if statement != nil {
-		err = errors.Join(err, statement.Close())
-	}
-	err = errors.Join(err, session.Close())
 	if err != nil {
 		return closeBoth(err)
 	}
-	base, err := raftmember.BindPreparedSQL(
-		wal, database, options.Authority, options.Table,
-	)
-	if err != nil {
-		return closeBoth(err)
+	if coldSnapshot {
+		var storage, capture [32]byte
+		if _, err = rand.Read(storage[:]); err != nil {
+			return closeBoth(err)
+		}
+		if _, err = rand.Read(capture[:]); err != nil {
+			return closeBoth(err)
+		}
+		reserved, reserveErr := sqldriver.NewReplicatedChildApplyIdentity(
+			base, hex.EncodeToString(storage[:]), hex.EncodeToString(capture[:]), options.Apply,
+		)
+		if reserveErr == nil {
+			reserveErr = database.PrepareReplicatedSnapshotTarget(base, reserved)
+		}
+		if reserveErr != nil {
+			return closeBoth(reserveErr)
+		}
+		return &PreparedMember{WAL: wal, Database: database, Base: base, ApplyIdentity: reserved,
+			WALPath: walPath, SQLPath: sqlPath}, nil
 	}
 	apply, applyIdentity, err := raftmember.OpenPreparedApply(
 		wal, database, options.Authority, base, options.Apply,

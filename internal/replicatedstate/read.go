@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -22,14 +23,54 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	return m.lookupCompletion(data, nil)
 }
 
+// RouteGateStatus returns the durable shard-local request-pin/topology-drain
+// cut installed by committed apply. Linearizable callers fence it with this
+// data group's ReadIndex.
+func (m *Machine) RouteGateStatus() (routegate.Status, error) {
+	if m == nil {
+		return routegate.Status{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return routegate.Status{}, err
+	}
+	if !m.initialized || m.routeGate == nil {
+		return routegate.Status{}, ErrWrongBinding
+	}
+	return m.routeGate.Status(), nil
+}
+
+// RouteGatePin returns one durable retained pin from the committed state cut.
+func (m *Machine) RouteGatePin(identity routegate.Identity) (routegate.PinRecord, bool, error) {
+	if m == nil || identity == (routegate.Identity{}) {
+		return routegate.PinRecord{}, false, ErrSessionCorrupt
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return routegate.PinRecord{}, false, err
+	}
+	if !m.initialized || m.routeGate == nil {
+		return routegate.PinRecord{}, false, ErrWrongBinding
+	}
+	record, found := m.routeGate.Pin(identity)
+	return record, found, nil
+}
+
 // LookupCompletionInto is LookupCompletion with caller-owned result storage.
-// dst is reused from length zero. It must have capacity for the largest
-// ordinary mutation/session completion so lookup never allocates result bytes.
+// dst is reused from length zero. It must have capacity for the command's
+// completion grammar so lookup never allocates result bytes.
 func (m *Machine) LookupCompletionInto(
 	data []byte,
 	dst []byte,
 ) (CompletionLookup, error) {
-	if cap(dst) < MaxMutationCompletionEnvelopeBytes {
+	command, err := replication.OpenCommand(data)
+	if err != nil {
+		return CompletionLookup{}, err
+	}
+	required := completionEnvelopeLimit(command.Kind())
+	if cap(dst) < required {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
 	result, err := m.lookupCompletion(
@@ -147,6 +188,21 @@ func equalCompletionConfState(left, right *pb.ConfState) bool {
 		slices.Equal(left.ProtoReflect().GetUnknown(), right.ProtoReflect().GetUnknown())
 }
 
+func completionEnvelopeLimit(kind replication.CommandKind) int {
+	switch kind {
+	case replication.CommandTransaction:
+		return MaxTransactionCompletionEnvelopeBytes
+	case replication.CommandRequestLedger:
+		return replication.MaxEmptyResultCompletionEnvelopeBytes + RequestLedgerCompletionResultBytes
+	case replication.CommandRouteGate:
+		return MaxRouteGateCompletionEnvelopeBytes
+	case replication.CommandExecutionPin:
+		return MaxExecutionPinCompletionEnvelopeBytes
+	default:
+		return MaxMutationCompletionEnvelopeBytes
+	}
+}
+
 // LookupCompletionIntoWorkspace resolves one command through the exact cut
 // held by BeginCompletionLookupBatch. Result bytes are detached into dst.
 func (m *Machine) LookupCompletionIntoWorkspace(
@@ -167,24 +223,13 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 	if !m.immutableBindingMatches(command) {
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	if command.Kind() == replication.CommandTransaction &&
-		cap(dst) < MaxCompletionEnvelopeBytes {
+	limit := completionEnvelopeLimit(command.Kind())
+	if cap(dst) < limit {
 		return CompletionLookup{}, ErrCompletionBufferSmall
-	}
-	if command.Kind() != replication.CommandTransaction {
-		result, err := m.lookupCompletionAtSnapshot(
-			command,
-			dst[:0:MaxMutationCompletionEnvelopeBytes],
-			workspace,
-		)
-		if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
-			return CompletionLookup{}, ErrCompletionCorrupt
-		}
-		return result, err
 	}
 	result, err := m.lookupCompletionAtSnapshot(
 		command,
-		dst[:0:MaxCompletionEnvelopeBytes],
+		dst[:0:limit],
 		workspace,
 	)
 	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
@@ -256,8 +301,8 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	if command.Kind() == replication.CommandTransaction && completionScratch != nil &&
-		cap(completionScratch) < MaxCompletionEnvelopeBytes {
+	limit := completionEnvelopeLimit(command.Kind())
+	if completionScratch != nil && cap(completionScratch) < limit {
 		endErr := m.EndCompletionLookupBatch(&workspace)
 		_ = workspace.Release()
 		if endErr != nil {
@@ -265,10 +310,8 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
-	if command.Kind() == replication.CommandTransaction && completionScratch != nil {
-		completionScratch = completionScratch[:0:MaxCompletionEnvelopeBytes]
-	} else if completionScratch != nil {
-		completionScratch = completionScratch[:0:MaxMutationCompletionEnvelopeBytes]
+	if completionScratch != nil {
+		completionScratch = completionScratch[:0:limit]
 	}
 	result, lookupErr := m.lookupCompletionAtSnapshot(
 		command, completionScratch, &workspace,
@@ -287,6 +330,11 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	workspace *CompletionLookupWorkspace,
 ) (CompletionLookup, error) {
 	snapshot := workspace.snapshot
+	if command.Kind() == replication.CommandRequestLedger {
+		return m.lookupRequestLedgerCompletionAtSnapshot(
+			command, completionScratch, workspace,
+		)
+	}
 	if command.Kind() == replication.CommandTransaction {
 		return m.lookupTransactionCompletionAtSnapshot(
 			command, completionScratch, workspace,
@@ -350,7 +398,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 			slotErr = fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
 		}
 		if slotErr == nil {
-			slotErr = validateStoredSessionSlot(m.state, record)
+			slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 		}
 		if slotErr == nil {
 			slotErr = validateSessionSlotAgainstHeader(session, record)
@@ -427,7 +475,7 @@ func (m *Machine) lookupCompletionAtSnapshot(
 			slotErr = fmt.Errorf("%w: retirement slot mismatch", ErrSessionCorrupt)
 		}
 		if slotErr == nil {
-			slotErr = validateStoredSessionSlot(m.state, record)
+			slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 		}
 		if slotErr == nil {
 			slotErr = validateSessionSlotAgainstHeader(session, record)
@@ -470,33 +518,110 @@ func (m *Machine) lookupCompletionAtSnapshot(
 		slotErr = fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
 	}
 	if slotErr == nil {
-		slotErr = validateStoredSessionSlot(m.state, record)
+		slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 	}
 	if slotErr == nil {
 		slotErr = validateSessionSlotAgainstHeader(session, record)
 	}
+	matches := session.RetryHome == command.RetryHome &&
+		record.Fingerprint == command.Fingerprint &&
+		record.LogicalCommandDigest == LogicalCommandDigest(command)
 	var completionBytes []byte
 	if slotErr == nil {
-		completionBytes, slotErr = m.appendSessionCompletion(
-			completionScratch[:0], session, record,
-		)
+		if record.ResultCode == ResultRouteGate {
+			if completionScratch != nil && cap(completionScratch) < MaxRouteGateCompletionEnvelopeBytes {
+				slotErr = ErrCompletionBufferSmall
+			} else {
+				completionBytes, slotErr = m.appendRouteGateCompletionAt(
+					pointSnapshot{value: snapshot}, completionScratch[:0], session, record,
+					workspace.decodeRead[:0],
+				)
+			}
+		} else if command.Kind() == replication.CommandExecutionPin && matches {
+			completionBytes, slotErr = m.appendExecutionPinCompletion(
+				completionScratch[:0], command, record, pointSnapshot{value: snapshot},
+			)
+		} else if command.Kind() != replication.CommandExecutionPin {
+			completionBytes, slotErr = m.appendSessionCompletion(
+				completionScratch[:0], session, record,
+			)
+		}
+		if command.Kind() == replication.CommandExecutionPin && !matches {
+			// A conflicting command cannot reconstruct a transferable pin proof.
+			completionBytes = nil
+		}
 		if slotErr != nil {
 			slotErr = fmt.Errorf("%w: reconstruct completion: %v", ErrSessionCorrupt, slotErr)
 		}
 	}
 	if slotErr != nil {
+		if errors.Is(slotErr, ErrCompletionBufferSmall) {
+			return CompletionLookup{}, slotErr
+		}
 		return CompletionLookup{}, m.fail(slotErr)
 	}
 	result := CompletionLookup{
 		Key: digest, Bytes: completionBytes,
 		AppliedSequence: record.AppliedSequence,
 	}
-	if session.RetryHome != command.RetryHome ||
-		record.Fingerprint != command.Fingerprint ||
-		record.LogicalCommandDigest != LogicalCommandDigest(command) {
+	if !matches {
 		return result, &RequestConflictError{Key: digest}
 	}
 	return result, nil
+}
+
+func (m *Machine) appendRouteGateCompletionAt(
+	snapshot pointSnapshot,
+	dst []byte,
+	session SessionView,
+	slot SessionSlotView,
+	readScratch []byte,
+) ([]byte, error) {
+	if slot.ResultCode != ResultRouteGate || session.Digest != slot.SessionDigest ||
+		session.ClientEpoch != slot.ClientEpoch {
+		return dst, ErrSessionCorrupt
+	}
+	key, err := routeGateResultStorageKey(slot.SessionDigest, slot.Slot)
+	if err != nil {
+		return dst, err
+	}
+	raw, found, err := snapshot.appendRaw(readScratch[:0], key[:])
+	if err != nil || !found {
+		if err == nil {
+			err = ErrSessionCorrupt
+		}
+		return dst, err
+	}
+	record, err := openRouteGateResult(raw)
+	if err != nil || record.SessionDigest != slot.SessionDigest || record.Slot != slot.Slot ||
+		record.ClientEpoch != slot.ClientEpoch || record.ClientSequence != slot.ClientSequence {
+		return dst, errors.Join(err, ErrSessionCorrupt)
+	}
+	var result [routegate.OutcomeBytes]byte
+	resultBytes, err := routegate.AppendOutcome(result[:0], record.Outcome)
+	if err != nil {
+		return dst, ErrSessionCorrupt
+	}
+	resultDigest := replication.CompletionResultDigest(
+		ResultRouteGate, ResultFormatRouteGate, resultBytes,
+	)
+	return replication.AppendCompletionBytes(dst, replication.CompletionBytes{
+		ClusterID: m.binding.ClusterID, ClusterIncarnation: m.binding.ClusterIncarnation,
+		TopologyRecoveryEpoch: m.binding.TopologyRecoveryEpoch,
+		Distribution:          m.distribution, Shard: m.shard,
+		AllocationGeneration: m.binding.AllocationGeneration,
+		ShardIncarnation:     m.binding.ShardIncarnation, GroupID: m.binding.GroupID,
+		ReplicaSetVersion:      slot.ReplicaSetVersion,
+		ActivePolicyGeneration: slot.ActivePolicyGeneration,
+		ProtectionEpoch:        slot.ProtectionEpoch, RoutingVersion: slot.RoutingVersion,
+		RouteGeneration: slot.RouteGeneration, Tenant: session.Tenant,
+		ClientID: session.ClientID, ClientEpoch: slot.ClientEpoch,
+		ClientSequence: slot.ClientSequence, Fingerprint: slot.Fingerprint,
+		RetryHome: session.RetryHome, AppliedSequence: slot.AppliedSequence,
+		ResultCode: ResultRouteGate, ResultFormat: ResultFormatRouteGate,
+		Storage: replication.CompletionInline, ResultLength: uint64(len(resultBytes)),
+		ResultDigest: resultDigest, InlineResult: resultBytes,
+	})
 }
 
 // LookupSessionLease returns the exact retained lease and sequence fence for
@@ -509,8 +634,7 @@ func (m *Machine) LookupSessionLease(
 	clientID replication.ID128,
 	clientEpoch uint64,
 ) (SessionLeaseLookup, error) {
-	if (authorityClass != replication.CommandAuthorityData &&
-		authorityClass != replication.CommandAuthorityTopology) ||
+	if !validSessionAuthorityClass(authorityClass) ||
 		len(tenant) == 0 || len(tenant) > replication.MaxIdentityBytes ||
 		clientID == (replication.ID128{}) || clientEpoch == 0 {
 		return SessionLeaseLookup{}, ErrSessionEpoch
@@ -602,7 +726,7 @@ func (m *Machine) LookupSessionLease(
 		slotErr = fmt.Errorf("%w: latest lease slot mismatch", ErrSessionCorrupt)
 	}
 	if slotErr == nil {
-		slotErr = validateStoredSessionSlot(m.state, record)
+		slotErr = validateStoredSessionSlot(m.state, record, sessionFenceLookup{snapshot: pointSnapshot{value: snapshot}})
 	}
 	if slotErr == nil {
 		slotErr = validateSessionSlotAgainstHeader(session, record)
@@ -811,7 +935,7 @@ func (s *ReadSnapshot) CanonicalImageDigest() ([32]byte, error) {
 		if !ok || image == nil {
 			return [32]byte{}, ErrInconsistentSnapshot
 		}
-		digest, err := openedRelationImageDigest(relation, image)
+		digest, _, err := openedRelationImageDigest(relation, image, s.state.Binding.OwnedRange)
 		if err != nil {
 			return [32]byte{}, err
 		}
@@ -850,8 +974,10 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	if err != nil {
 		return nil, m.fail(err)
 	}
-	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
+	state, present, sessionCount, slotCount, authorityCount, _, err := scanSessionSystemSnapshot(
 		systemSnapshot, m.options.MaxSessions, m.options.RetryWindow,
+		m.options.RequestLedgerCapacityBytes, m.options.RequestLedgerCleanupReserveBytes,
+		m.options.RequestLedgerRange, m.routeGateMaxRecords,
 	)
 	if err != nil || present != m.initialized {
 		closeErr := cut.Close()

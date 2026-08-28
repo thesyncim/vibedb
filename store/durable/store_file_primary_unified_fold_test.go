@@ -407,7 +407,9 @@ func TestFilePrimaryBatchCheckpointFitsPhysicalExtentReservation(t *testing.T) {
 	}
 	defer reopened.Close()
 	for _, row := range selected {
-		assertPrimaryRaw(t, reopened, string(row.key), row.after, true)
+		// Keep the submitted noncanonical input above; durable JSON stores its
+		// canonical bytes across checkpoint/reopen, not the caller's key order.
+		assertPrimaryRaw(t, reopened, string(row.key), canonicalDurableTestDocument(t, row.after), true)
 	}
 }
 

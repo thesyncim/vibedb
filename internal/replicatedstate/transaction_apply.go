@@ -71,6 +71,15 @@ func (m *Machine) planTransactionCommand(
 	if err != nil {
 		return transactionCommandPlan{}, err
 	}
+	if found && (control.ExecutionPinDigest != existing.ExecutionPinDigest ||
+		control.ControllerEpoch < existing.ControllerEpoch) {
+		plan.command.resultCode = ResultTransactionConflict
+		plan.command.conflict = true
+		return plan, nil
+	}
+	if found && control.ControllerEpoch > existing.ControllerEpoch {
+		existing.ControllerEpoch = control.ControllerEpoch
+	}
 	if found && existing.LastOperation == control.Operation &&
 		existing.LastExpectedRevision == control.ExpectedRevision &&
 		existing.LastCommandDigest == commandDigest {
@@ -136,6 +145,10 @@ func (m *Machine) planTransactionCommand(
 			plan, control, existing.TransactionControl, applied, commandDigest,
 			storageKey, systemSnapshot,
 		)
+	case distributedtxn.ReplicatedPulseCoordinator:
+		return m.planCoordinatorRecoveryPulse(
+			plan, control, existing.TransactionControl, applied, commandDigest, storageKey,
+		)
 	case distributedtxn.ReplicatedStageParticipant:
 		return m.planParticipantStage(
 			plan, command, control, applied, commandDigest, storageKey, systemSnapshot,
@@ -169,6 +182,30 @@ func (m *Machine) planTransactionCommand(
 	}
 }
 
+func (m *Machine) planCoordinatorRecoveryPulse(
+	plan transactionCommandPlan,
+	control distributedtxn.ReplicatedCommand,
+	existing TransactionControl,
+	applied uint64,
+	commandDigest replication.Digest,
+	controlKey [transactionControlStorageKeyBytes]byte,
+) (transactionCommandPlan, error) {
+	if distributedtxn.CoordinatorState(existing.State) != distributedtxn.CoordinatorStaging ||
+		existing.RecoveryPulse == math.MaxUint8 ||
+		control.RecoveryPulse != existing.RecoveryPulse+1 {
+		return transactionConflict(plan), nil
+	}
+	existing.RecoveryPulse = control.RecoveryPulse
+	stampTransactionWitness(&existing, control, commandDigest, applied, ResultApplied)
+	encoded, err := AppendTransactionControl(nil, existing)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	plan.rows = append(plan.rows, newTransactionPut(controlKey[:], encoded))
+	plan.command.resultCode = ResultApplied
+	return plan, nil
+}
+
 func (m *Machine) planParticipantAbortFence(
 	plan transactionCommandPlan,
 	control distributedtxn.ReplicatedCommand,
@@ -183,6 +220,7 @@ func (m *Machine) planParticipantAbortFence(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: distributedtxn.ReplicatedRoleParticipant,
 		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadKind:      control.PayloadKind,
 		PayloadDigest:    control.Participant.MutationDigest,
 		CoordinatorGroup: replication.ID128(control.Participant.CoordinatorGroup),
@@ -310,11 +348,13 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	}
 
 	participantControl := distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedStagePrepareParticipant,
-		ID:          control.ID,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: control.Participant,
+		Role:               distributedtxn.ReplicatedRoleParticipant,
+		Operation:          distributedtxn.ReplicatedStagePrepareParticipant,
+		ID:                 control.ID,
+		PayloadKind:        distributedtxn.ReplicatedPayloadParticipantStage,
+		Participant:        control.Participant,
+		ControllerEpoch:    control.ControllerEpoch,
+		ExecutionPinDigest: control.ExecutionPinDigest,
 	}
 	participantControl.Participant.ParticipantOrdinal = 0
 	participantPlan, err := m.planParticipantStagePrepared(
@@ -329,7 +369,8 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		return transactionConflict(plan), nil
 	}
 	if participantPlan.command.resultCode != ResultApplied &&
-		participantPlan.command.resultCode != ResultIndexConflict {
+		participantPlan.command.resultCode != ResultIndexConflict &&
+		participantPlan.command.resultCode != ResultWrongShard {
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
 	participantOrdinal := uint64(control.Participant.ParticipantOrdinal)
@@ -397,6 +438,7 @@ func (m *Machine) planInlineCoordinatorStage(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role, State: uint8(distributedtxn.CoordinatorStaging),
 		Revision: 1, PayloadKind: control.PayloadKind,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: payloadDigest, PayloadBytes: uint64(len(control.Payload)),
 		PayloadCount:     uint64(len(record.Participants)),
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
@@ -480,6 +522,7 @@ func (m *Machine) planManifestCoordinatorStage(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role, State: uint8(distributedtxn.CoordinatorStaging),
 		Revision: uint64(pages.Count()), PayloadKind: control.PayloadKind,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: payloadDigest, PayloadBytes: record.Manifest.EncodedBytes,
 		PayloadCount:     record.Manifest.ParticipantCount,
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
@@ -814,7 +857,8 @@ func (m *Machine) planCoordinatorTransition(
 		return transactionConflict(plan), nil
 	}
 	if next == distributedtxn.CoordinatorCommitted &&
-		existing.PrepareResultCode == ResultIndexConflict {
+		(existing.PrepareResultCode == ResultIndexConflict ||
+			existing.PrepareResultCode == ResultWrongShard) {
 		return transactionConflict(plan), nil
 	}
 	if next == distributedtxn.CoordinatorCommitted &&
@@ -1015,14 +1059,15 @@ func (m *Machine) planParticipantStageWithVote(
 	}
 	resultCode := uint32(ResultApplied)
 	state, revision := distributedtxn.ParticipantStaged, uint64(1)
+	var finishPlan commandPlan
 	if prepare {
-		_, _, _, _, code, err := m.planStoredTransactionMutations(
+		changes, spans, digest, _, code, err := m.planStoredTransactionMutations(
 			command, payloads, plan.command.dataChainDigest, relationSnapshots,
 		)
 		if err != nil {
 			return transactionCommandPlan{}, err
 		}
-		if code != ResultApplied && code != ResultIndexConflict {
+		if code != ResultApplied && code != ResultIndexConflict && code != ResultWrongShard {
 			return transactionCommandPlan{}, fmt.Errorf(
 				"%w: fused participant prepare result %d", ErrTransactionStateCorrupt, code,
 			)
@@ -1030,6 +1075,7 @@ func (m *Machine) planParticipantStageWithVote(
 		resultCode = code
 		if code == ResultApplied {
 			state, revision = distributedtxn.ParticipantPrepared, 2
+			finishPlan = commandPlan{changes: changes, relations: spans, dataChainDigest: digest}
 		} else {
 			// A rejected vote retains only the compact control witness. No intent
 			// or mutation row becomes durable, so cleanup needs no proposal.
@@ -1042,6 +1088,7 @@ func (m *Machine) planParticipantStageWithVote(
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role, State: uint8(state),
 		Revision: revision, PayloadKind: control.PayloadKind,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: control.Participant.MutationDigest,
 		PayloadBytes:  transactionCanonicalRelationBytes(command), PayloadCount: uint64(command.MutationCount()),
 		PayloadRelationCount:        uint16(command.RelationCount()),
@@ -1085,6 +1132,26 @@ func (m *Machine) planParticipantStageWithVote(
 		residentByte: int64(uint64(controlBytes) + residentMutation + residentIntent),
 	}
 	plan.command.resultCode = resultCode
+	if prepare && resultCode == ResultApplied {
+		// Finishing publishes the user mutations and deletes their durable
+		// intents/payloads atomically. A prepare that fits by itself can still
+		// exceed the frozen transaction budget at finish. Refuse before storing
+		// any prepared intent, while retaining the same exact apply limits.
+		finishPlan.systemRows = make([]transactionRowMutation, len(plan.rows))
+		for index, row := range plan.rows[:len(plan.rows)-1] {
+			finishPlan.systemRows[index] = newTransactionDelete(row.key)
+		}
+		// Control encoding is fixed-width apart from the unchanged scope list.
+		finishPlan.systemRows[len(plan.rows)-1] = plan.rows[len(plan.rows)-1]
+		next, stateErr := m.hypotheticalTransactionState(command, plan)
+		if stateErr != nil {
+			return transactionCommandPlan{}, stateErr
+		}
+		next.DataChainDigest = finishPlan.dataChainDigest
+		if err := m.checkTransitionCapacity(next, finishPlan.changes, finishPlan); err != nil {
+			return transactionCommandPlan{}, err
+		}
+	}
 	return plan, nil
 }
 
@@ -1273,6 +1340,7 @@ func (m *Machine) planStoredTransactionMutations(
 	dataChain [sha256.Size]byte,
 	snapshots relationPointSnapshots,
 ) ([]finalMutation, []plannedRelationChanges, [sha256.Size]byte, int64, uint32, error) {
+	m.canonicalMutations.begin(command, rows)
 	if snapshots.count != uint16(len(m.relations)) {
 		return nil, nil, dataChain, 0, 0, ErrInconsistentSnapshot
 	}
@@ -1288,7 +1356,7 @@ func (m *Machine) planStoredTransactionMutations(
 			return nil, nil, dataChain, 0, ResultUnknownRelation, nil
 		}
 		changes, batchAffectedRows, code, err := m.planMutations(
-			&m.relations[ordinal], batch, snapshots.values[ordinal], nil,
+			&m.relations[ordinal], batch, snapshots.values[ordinal], nil, false,
 		)
 		if err != nil {
 			return nil, nil, dataChain, 0, 0, err

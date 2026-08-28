@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	vibejson "github.com/thesyncim/vibejson"
@@ -107,6 +108,7 @@ type Snapshot struct {
 	replicatedShards               []replicatedCatalogShard
 	replicatedReplicas             []ReplicatedEndpoint
 	replicatedTables               []replicatedCatalogTable
+	durableRequestLedgerTopology   *DurableRequestLedgerTopology
 	indexLineage                   []plannerIndexLineageRef
 	shardLineage                   []plannerShardLineageRef
 	indexIDHighWater               uint64
@@ -334,7 +336,10 @@ func (s *Snapshot) Validate() error {
 	if s == nil {
 		return &CatalogError{Reason: "snapshot is nil"}
 	}
-	return s.config.Validate()
+	if err := s.config.Validate(); err != nil {
+		return err
+	}
+	return validateDurableRequestLedgerCatalogPresence(s)
 }
 
 // PlannerMetadataBytes reports the retained bytes in the compact table
@@ -365,6 +370,11 @@ func retainedReplicatedMetadataBytes(
 	retained := uint64(cap(shards))*uint64(unsafe.Sizeof(replicatedCatalogShard{})) +
 		uint64(cap(replicas))*uint64(unsafe.Sizeof(ReplicatedEndpoint{}))
 	retained += replicatedTableMetadataBytes(tables)
+	for _, shard := range shards {
+		if shard.splitOrigin != nil {
+			retained += uint64(unsafe.Sizeof(ReplicatedSplitOrigin{}))
+		}
+	}
 	return retained
 }
 
@@ -670,6 +680,70 @@ func (h *CatalogHolder) PublishAfter(expectedGeneration uint64, s *Snapshot) err
 	return nil
 }
 
+func (h *CatalogHolder) publishReplicaReplacementAfter(
+	expectedGeneration uint64,
+	s *Snapshot,
+	grant membershipgrant.Grant,
+) error {
+	if s == nil || !grant.Valid() {
+		return &CatalogError{Reason: "invalid certified replica replacement"}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	current := h.ptr.Load()
+	currentGeneration := uint64(0)
+	if current != nil {
+		currentGeneration = current.generation
+	}
+	if currentGeneration != expectedGeneration {
+		return fmt.Errorf(
+			"%w: expected=%d current=%d",
+			ErrCatalogGenerationMismatch, expectedGeneration, currentGeneration,
+		)
+	}
+	next, err := advanceCatalogStateReplicaReplacement(current, s, grant)
+	if err != nil {
+		return err
+	}
+	h.ptr.Store(next)
+	h.signalLeaseChangeLocked()
+	return nil
+}
+
+func (h *CatalogHolder) publishReplicaReplacementPostRemoveAfter(
+	expectedGeneration uint64,
+	s *Snapshot,
+	grant membershipgrant.Grant,
+	observedReplicaSetVersion uint64,
+) error {
+	if s == nil || !grant.Valid() || observedReplicaSetVersion == 0 {
+		return &CatalogError{Reason: "invalid certified post-remove fence"}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	current := h.ptr.Load()
+	currentGeneration := uint64(0)
+	if current != nil {
+		currentGeneration = current.generation
+	}
+	if currentGeneration != expectedGeneration {
+		return fmt.Errorf(
+			"%w: expected=%d current=%d",
+			ErrCatalogGenerationMismatch, expectedGeneration, currentGeneration,
+		)
+	}
+	if err := validateReplicaReplacementPostRemoveTransition(
+		current, s, grant, observedReplicaSetVersion,
+	); err != nil {
+		return err
+	}
+	h.ptr.Store(s)
+	h.signalLeaseChangeLocked()
+	return nil
+}
+
 // publishNewerChecked is the diagnostic publication path used by catalog
 // refresh. The bool API remains convenient for optimistic callers, while a
 // topology loader must distinguish an ordinary stale generation from a newer
@@ -957,17 +1031,18 @@ func (h *CatalogHolder) WaitOlderDrained(ctx context.Context, generation uint64)
 // to identical bytes.
 
 type persistedCatalog struct {
-	Version          int                            `json:"version"`
-	Generation       uint64                         `json:"generation"`
-	Distributions    []persistedDistribution        `json:"distributions"`
-	Placements       []persistedPlacement           `json:"placements,omitempty"`
-	Indexes          []persistedIndex               `json:"indexes,omitempty"`
-	Statistics       []queryplanner.TableStatistics `json:"statistics,omitempty"`
-	Manifests        []persistedManifest            `json:"manifests"`
-	Endpoints        []persistedEndpoint            `json:"endpoints"`
-	ReplicatedShards []persistedReplicatedShard     `json:"replicated_shards,omitempty"`
-	ReplicatedTables []persistedReplicatedTable     `json:"replicated_tables,omitempty"`
-	Lineage          *persistedCatalogLineage       `json:"lineage,omitempty"`
+	Version          int                                    `json:"version"`
+	Generation       uint64                                 `json:"generation"`
+	Distributions    []persistedDistribution                `json:"distributions"`
+	Placements       []persistedPlacement                   `json:"placements,omitempty"`
+	Indexes          []persistedIndex                       `json:"indexes,omitempty"`
+	Statistics       []queryplanner.TableStatistics         `json:"statistics,omitempty"`
+	Manifests        []persistedManifest                    `json:"manifests"`
+	Endpoints        []persistedEndpoint                    `json:"endpoints"`
+	ReplicatedShards []persistedReplicatedShard             `json:"replicated_shards,omitempty"`
+	ReplicatedTables []persistedReplicatedTable             `json:"replicated_tables,omitempty"`
+	RequestLedger    *persistedDurableRequestLedgerTopology `json:"request_ledger,omitempty"`
+	Lineage          *persistedCatalogLineage               `json:"lineage,omitempty"`
 }
 
 type persistedDistribution struct {
@@ -1078,6 +1153,7 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	pc.Statistics = s.statistics.Descriptors()
 	pc.ReplicatedShards = persistedReplicatedDescriptors(s.replicatedDescriptors())
 	pc.ReplicatedTables = persistedReplicatedTableProfiles(s.replicatedTableProfiles())
+	pc.RequestLedger = persistedDurableRequestLedgerTopologyFromSnapshot(s)
 	for _, m := range s.config.Manifests {
 		pm := persistedManifest{Distribution: string(m.Distribution()), Version: uint64(m.Version())}
 		for i := 0; i < m.ShardCount(); i++ {
@@ -1137,6 +1213,9 @@ func SaveSnapshotAfter(path string, expectedGeneration uint64, s *Snapshot) erro
 }
 
 func saveSnapshot(path string, s *Snapshot, expectedGeneration *uint64) (err error) {
+	if err := validateDurableRequestLedgerCatalogPresence(s); err != nil {
+		return err
+	}
 	if s == nil {
 		return errors.New("gateway: SaveSnapshot requires a non-nil snapshot")
 	}
@@ -1356,6 +1435,9 @@ func appendSnapshotDocumentBounded(
 	if snapshot == nil {
 		return dst, ErrInvalidCatalog
 	}
+	if err := validateDurableRequestLedgerCatalogPresence(snapshot); err != nil {
+		return dst, err
+	}
 	if maximum <= 0 || maximum > maxCatalogBytes {
 		return dst, ErrCatalogTooLarge
 	}
@@ -1446,6 +1528,12 @@ func decodeSnapshotBytes(raw []byte) (*Snapshot, error) {
 		config, endpoints, pc.Generation, indexes, statistics, replicated, replicatedTables,
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := snapshot.attachPersistedDurableRequestLedgerTopology(pc.RequestLedger); err != nil {
+		return nil, err
+	}
+	if err := validateDurableRequestLedgerCatalogPresence(snapshot); err != nil {
 		return nil, err
 	}
 	if pc.Lineage == nil {

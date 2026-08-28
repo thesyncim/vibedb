@@ -71,9 +71,7 @@ func (p *Plan) BuildCatalogTransition(
 	if !sourceSessionsEmpty(sourceState) {
 		return nil, ErrSessionTransferRequired
 	}
-	next, err := BuildCertifiedRangeSplitTransition(
-		current, p.targetManifest, p.next, p.partitioner, certificate,
-	)
+	next, err := p.buildCertifiedReplicatedCatalogTransition(current, certificate)
 	if err != nil {
 		return nil, errors.Join(ErrTopologyConflict, err)
 	}

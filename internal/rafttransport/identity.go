@@ -10,10 +10,13 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"slices"
 	"time"
+
+	"github.com/thesyncim/vibedb/internal/buildgate"
 )
 
 var (
@@ -22,6 +25,7 @@ var (
 	ErrWrongTrustDomain    = errors.New("rafttransport: peer trust domain differs")
 	ErrWrongPeer           = errors.New("rafttransport: authenticated peer differs")
 	ErrWrongTrafficClass   = errors.New("rafttransport: peer traffic class differs")
+	ErrPeerBuild           = errors.New("rafttransport: peer build is incompatible")
 )
 
 const peerIdentityExtensionBytes = 48
@@ -76,15 +80,21 @@ const (
 	// isolated from data, native proposal, and Raft streams so a certificate
 	// capability cannot be replayed across protocol boundaries.
 	TrafficShardControl TrafficClass = 6
+	// TrafficGatewayControl authenticates gateway-to-gateway topology fences.
+	// It is separate from public client and shard-control capabilities so a
+	// certificate admitted on either plane cannot manufacture catalog-drain
+	// evidence for a gateway incarnation.
+	TrafficGatewayControl TrafficClass = 7
 )
 
 const (
-	ordinaryALPN      = "vibedb-raft-ordinary"
-	snapshotALPN      = "vibedb-raft-snapshot"
-	shardNativeALPN   = "vibedb-shard-native"
-	gatewayClientALPN = "vibedb-gateway-client"
-	shardSQLALPN      = "vibedb-shard-sql"
-	shardControlALPN  = "vibedb-shard-control"
+	ordinaryALPN       = "vibedb-raft-ordinary"
+	snapshotALPN       = "vibedb-raft-snapshot"
+	shardNativeALPN    = "vibedb-shard-native"
+	gatewayClientALPN  = "vibedb-gateway-client"
+	shardSQLALPN       = "vibedb-shard-sql"
+	shardControlALPN   = "vibedb-shard-control"
+	gatewayControlALPN = "vibedb-gateway-control"
 )
 
 func (class TrafficClass) alpn() (string, error) {
@@ -101,6 +111,8 @@ func (class TrafficClass) alpn() (string, error) {
 		return shardSQLALPN, nil
 	case TrafficShardControl:
 		return shardControlALPN, nil
+	case TrafficGatewayControl:
+		return gatewayControlALPN, nil
 	default:
 		return "", ErrWrongTrafficClass
 	}
@@ -204,11 +216,44 @@ type PeerTLSOptions struct {
 // PeerTLS constructs mutually authenticated TLS configurations and derives the
 // complete peer identity after a completed handshake.
 type PeerTLS struct {
-	identityOID asn1.ObjectIdentifier
-	identity    PeerIdentity
-	certificate tls.Certificate
-	roots       *x509.CertPool
-	now         func() time.Time
+	identityOID         asn1.ObjectIdentifier
+	identity            PeerIdentity
+	certificate         tls.Certificate
+	roots               *x509.CertPool
+	now                 func() time.Time
+	build               buildgate.Profile
+	localServices       bool
+	localGatewayControl bool
+}
+
+// WithLocalServiceConnections returns an immutable profile copy permitting
+// authenticated RPCs to services hosted by this same node. Split controllers
+// and colocated child groups need native, artifact, and control calls to their
+// own listeners. This never permits an ordinary Raft stream to loop back, and
+// does not bypass certificate, exact peer, build, or service authorization.
+// The original profile continues to reject every self connection.
+func (peerTLS *PeerTLS) WithLocalServiceConnections() *PeerTLS {
+	if peerTLS == nil {
+		return nil
+	}
+	clone := *peerTLS
+	clone.localServices = true
+	return &clone
+}
+
+// WithLocalGatewayControlConnections permits the gateway to collect its own
+// authenticated catalog-drain acknowledgement through the same listener and
+// authorization checks as every other roster member. The detached profile
+// permits only gateway-control self connections, not public SQL, native shard
+// services, or ordinary Raft streams. Certificate and exact-peer checks remain
+// mandatory on both ends.
+func (peerTLS *PeerTLS) WithLocalGatewayControlConnections() *PeerTLS {
+	if peerTLS == nil {
+		return nil
+	}
+	clone := *peerTLS
+	clone.localGatewayControl = true
+	return &clone
 }
 
 // LocalIdentity returns the exact certificate-bound identity authenticated by
@@ -248,6 +293,7 @@ func NewPeerTLS(options PeerTLSOptions) (*PeerTLS, error) {
 		identityOID: slices.Clone(options.IdentityOID),
 		identity:    options.Identity, certificate: certificate,
 		roots: options.Roots.Clone(), now: options.Now,
+		build: buildgate.CurrentProfile(),
 	}
 	for _, usage := range []x509.ExtKeyUsage{
 		x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth,
@@ -427,7 +473,10 @@ func (peerTLS *PeerTLS) verifyConnection(
 	if err != nil {
 		return err
 	}
-	if identity.Node == peerTLS.identity.Node {
+	localService := peerTLS.localServices &&
+		(class == TrafficShardNative || class == TrafficSnapshot || class == TrafficShardControl)
+	localService = localService || peerTLS.localGatewayControl && class == TrafficGatewayControl
+	if identity.Node == peerTLS.identity.Node && !localService {
 		return ErrWrongPeer
 	}
 	if expected != (NodeID{}) && identity.Node != expected {
@@ -496,8 +545,9 @@ type PeerConnection interface {
 
 type authenticatedPeerConnection struct {
 	net.Conn
-	identity PeerIdentity
-	class    TrafficClass
+	identity     PeerIdentity
+	class        TrafficClass
+	capabilities buildgate.CapabilitySet
 }
 
 func (connection *authenticatedPeerConnection) PeerIdentity() PeerIdentity {
@@ -512,6 +562,16 @@ func (connection *authenticatedPeerConnection) TrafficClass() TrafficClass {
 		return 0
 	}
 	return connection.class
+}
+
+// BuildCapabilities returns the capabilities proved by the authenticated
+// compatibility exchange. Non-Raft traffic has an empty set because it does
+// not consume the internal Raft preface.
+func (connection *authenticatedPeerConnection) BuildCapabilities() buildgate.CapabilitySet {
+	if connection == nil {
+		return buildgate.CapabilitySet{}
+	}
+	return connection.capabilities
 }
 
 // Client authenticates an owned raw connection as expected. The method closes
@@ -536,7 +596,9 @@ func (peerTLS *PeerTLS) Client(
 		}
 		return nil, err
 	}
-	return peerTLS.handshake(ctx, raw, tls.Client, config, expected, class, handshakeDeadline)
+	return peerTLS.handshake(
+		ctx, raw, tls.Client, config, expected, class, handshakeDeadline, buildPrefaceClient,
+	)
 }
 
 // Server authenticates an owned raw connection as one peer in the local trust
@@ -561,10 +623,19 @@ func (peerTLS *PeerTLS) Server(
 		}
 		return nil, err
 	}
-	return peerTLS.handshake(ctx, raw, tls.Server, config, NodeID{}, class, handshakeDeadline)
+	return peerTLS.handshake(
+		ctx, raw, tls.Server, config, NodeID{}, class, handshakeDeadline, buildPrefaceServer,
+	)
 }
 
 type tlsConstructor func(net.Conn, *tls.Config) *tls.Conn
+
+type buildPrefaceRole uint8
+
+const (
+	buildPrefaceClient buildPrefaceRole = iota + 1
+	buildPrefaceServer
+)
 
 func (peerTLS *PeerTLS) handshake(
 	ctx context.Context,
@@ -574,6 +645,7 @@ func (peerTLS *PeerTLS) handshake(
 	expected NodeID,
 	class TrafficClass,
 	handshakeDeadline DeadlineFunc,
+	role buildPrefaceRole,
 ) (PeerConnection, error) {
 	if raw == nil || handshakeDeadline == nil {
 		if raw != nil {
@@ -595,10 +667,6 @@ func (peerTLS *PeerTLS) handshake(
 		_ = connection.Close()
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
-	if err := connection.SetDeadline(time.Time{}); err != nil {
-		_ = connection.Close()
-		return nil, errors.Join(ErrPeerAuthentication, err)
-	}
 	state := connection.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		_ = connection.Close()
@@ -610,7 +678,74 @@ func (peerTLS *PeerTLS) handshake(
 		_ = connection.Close()
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
+	capabilities := buildgate.CapabilitySet{}
+	if internalBuildPrefaceRequired(class) {
+		capabilities, err = exchangeBuildPreface(connection, role, peerTLS.build)
+		if err != nil {
+			_ = connection.Close()
+			return nil, errors.Join(ErrPeerBuild, err)
+		}
+	}
+	if err := connection.SetDeadline(time.Time{}); err != nil {
+		_ = connection.Close()
+		return nil, errors.Join(ErrPeerAuthentication, err)
+	}
 	return &authenticatedPeerConnection{
-		Conn: connection, identity: identity, class: class,
+		Conn: connection, identity: identity, class: class, capabilities: capabilities,
 	}, nil
+}
+
+func internalBuildPrefaceRequired(class TrafficClass) bool {
+	switch class {
+	case TrafficOrdinary, TrafficSnapshot,
+		TrafficShardNative, TrafficShardSQL, TrafficShardControl, TrafficGatewayControl:
+		return true
+	default:
+		return false
+	}
+}
+
+func exchangeBuildPreface(
+	connection net.Conn,
+	role buildPrefaceRole,
+	local buildgate.Profile,
+) (buildgate.CapabilitySet, error) {
+	if connection == nil || !local.Valid() {
+		return buildgate.CapabilitySet{}, buildgate.ErrInvalidProfile
+	}
+	var localBytes [buildgate.PrefaceBytes]byte
+	encoded, err := buildgate.AppendPreface(localBytes[:0], local)
+	if err != nil {
+		return buildgate.CapabilitySet{}, err
+	}
+	var remoteBytes [buildgate.PrefaceBytes]byte
+	switch role {
+	case buildPrefaceClient:
+		if err := writeFull(connection, encoded); err != nil {
+			return buildgate.CapabilitySet{}, err
+		}
+		if _, err := io.ReadFull(connection, remoteBytes[:]); err != nil {
+			return buildgate.CapabilitySet{}, err
+		}
+	case buildPrefaceServer:
+		if _, err := io.ReadFull(connection, remoteBytes[:]); err != nil {
+			return buildgate.CapabilitySet{}, err
+		}
+	default:
+		return buildgate.CapabilitySet{}, buildgate.ErrInvalidPreface
+	}
+	remote, err := buildgate.OpenPreface(remoteBytes[:])
+	if err != nil {
+		return buildgate.CapabilitySet{}, err
+	}
+	capabilities, err := buildgate.CheckCompatibility(local, remote)
+	if err != nil {
+		return buildgate.CapabilitySet{}, err
+	}
+	if role == buildPrefaceServer {
+		if err := writeFull(connection, encoded); err != nil {
+			return buildgate.CapabilitySet{}, err
+		}
+	}
+	return capabilities, nil
 }

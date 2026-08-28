@@ -230,8 +230,8 @@ func recoverRecords(file *os.File, header *headerState, current currentState, op
 					(record.envelope.incarnation == lastReady.incarnation && record.envelope.readyID <= lastReady.readyID))) {
 				return logImage{}, generationRecovery{}, fmt.Errorf("%w: Ready identity regression", ErrCorrupt)
 			}
-			if generation.present && record.envelope.incarnation <= generation.seal.sourceCurrentIncarnation {
-				return logImage{}, generationRecovery{}, fmt.Errorf("%w: generation Ready reused source incarnation", ErrCorrupt)
+			if generation.present && !generationReadyAfterSource(generation.seal, record.envelope.incarnation, record.envelope.readyID) {
+				return logImage{}, generationRecovery{}, fmt.Errorf("%w: generation Ready regressed source cursor", ErrCorrupt)
 			}
 			payload, decodeErr := unmarshalReadyPayload(record.payload, options)
 			if decodeErr != nil {

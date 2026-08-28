@@ -7,6 +7,55 @@ import (
 	"testing"
 )
 
+func TestWriteTransactionDurablyReservesUnrootedGenerationNamespace(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "unrooted-reservation-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	pageSize := uint32(os.Getpagesize())
+	c, err := NewCommitter(f, DeviceOptions{Backend: BackendPortable, BufferCount: 4, BufferSize: int(pageSize)}, CommitterOptions{QueueSlots: 2, MaxPagesPerBatch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewPageCache(f, PageCacheOptions{PageSize: int(pageSize), ResidentBytes: int64(2 * pageSize), StoreID: testStoreID, ReadConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := testMutableStoreDataStart(pageSize)
+	tx, err := BeginWriteTransaction(c, cache, 1, WriteTransactionOptions{StoreID: testStoreID, Generation: 1, PageSize: pageSize, FileEnd: base, NextLogicalID: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := tx.ReserveUnrootedGeneration(uint64(8*pageSize), 19)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Offset != base || r.Length != uint64(8*pageSize) || r.FirstLogicalID != 7 || tx.NextLogicalID() != 26 {
+		t.Fatalf("reservation = %+v next=%d", r, tx.NextLogicalID())
+	}
+	state := StateRoot{StoreID: testStoreID, Generation: 1, PageSize: pageSize, MaxPageSize: 64 << 10, NextLogicalID: tx.NextLogicalID()}
+	if err = tx.PublishInline(state, InlineFreeDelta{}); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Wait(1); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first, second := make([]byte, pageSize), make([]byte, pageSize)
+	_, _ = f.ReadAt(first, 0)
+	_, _ = f.ReadAt(second, int64(pageSize))
+	root, _, err := SelectInlineSuperblock(first, second)
+	if err != nil || root.FileEnd != r.Offset+r.Length || root.State.NextLogicalID != 26 {
+		t.Fatalf("durable reservation root = %+v,%v", root, err)
+	}
+	if err = cache.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWriteTransactionPublishesRecoverableStateAndDirtyPage(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "write-transaction-*")
 	if err != nil {

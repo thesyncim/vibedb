@@ -4,6 +4,8 @@
 package replicatedstate
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +13,9 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/resultformat"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -19,7 +24,13 @@ const (
 	// ResultFormatMutation is the fixed affected-row result grammar used by this
 	// low-level mutation adapter. ResultApplied carries one canonical eight-byte
 	// nonnegative count; every refusal and session-lifecycle result is empty.
-	ResultFormatMutation uint16 = 1
+	ResultFormatMutation uint16 = resultformat.Mutation
+	// ResultFormatRouteGate carries exactly one canonical fixed routegate
+	// Outcome in the completion envelope.
+	ResultFormatRouteGate uint16 = resultformat.RouteGate
+	// ResultFormatExecutionPin is the fixed transferable logical-pin proof
+	// grammar. Values 3 and 4 are frozen for route-gate and request-ledger.
+	ResultFormatExecutionPin uint16 = resultformat.ExecutionPin
 
 	// Zero and unknown result codes are invalid.
 	ResultApplied         uint32 = 1
@@ -38,6 +49,21 @@ const (
 	// Result codes are local to their ResultFormat: transaction format code 12
 	// independently denotes a transaction-control CAS loss.
 	ResultIntentBusy uint32 = 12
+	// ResultRequestLedgerConflict is a deterministic request identity,
+	// revision, or byte-CAS conflict. The retained state remains authoritative.
+	ResultRequestLedgerConflict uint32 = 13
+	// ResultRequestLedgerCapacity is a deterministic upfront reservation
+	// refusal; no partial builder state is published.
+	ResultRequestLedgerCapacity uint32 = 14
+	// ResultRequestLedgerNotFound is a stateless non-creation CAS refusal.
+	ResultRequestLedgerNotFound uint32 = 15
+	// ResultRequestLedgerWrongRange is a stateless stale-route/range-authority
+	// refusal. No ledger row was mutated on that group.
+	ResultRequestLedgerWrongRange uint32 = 16
+	// ResultRouteGate identifies the fixed route-gate outcome grammar.
+	ResultRouteGate uint32 = 13
+
+	MaxRouteGateCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + routegate.OutcomeBytes
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its compact
 	// 376-byte header (416 bytes when transaction accounting is present), two
@@ -51,6 +77,7 @@ const (
 	MaxStateEnvelopeBytes           = 2 << 10
 	MaxRetainedSessions             = 1 << 20
 	MaxRetainedTransactions         = 1 << 20
+	MaxRetainedExecutionPins        = 1 << 20
 	MaxSessionRetryWindow           = 256
 	MaxStaticBootstrapBytes         = 1 << 20
 	MaxStaticBootstrapEnvelopeBytes = MaxStaticBootstrapBytes + MaxStateEnvelopeBytes
@@ -94,6 +121,8 @@ var (
 	ErrSnapshotBase                = errors.New("replicatedstate: invalid snapshot base certificate")
 	ErrStagedSnapshot              = errors.New("replicatedstate: invalid staged snapshot initialization")
 	ErrOwnershipTransition         = errors.New("replicatedstate: invalid ownership transition")
+	ErrSchemaTransition            = errors.New("replicatedstate: invalid schema transition")
+	ErrSchemaTransitionPending     = errors.New("replicatedstate: schema transition requires target activation")
 )
 
 // Binding is the exact shard and recovery lineage owned by one Machine.
@@ -198,6 +227,14 @@ type OwnershipPointValidator interface {
 	ValidatePointOwnership(key []byte, owned distribution.KeyRange) MutationValidation
 }
 
+// GlobalIndexPlacementValidator exposes the canonical point parser and
+// immutable physical range authenticated by a relation's ValidationDigest.
+// Relations without it remain usable but cannot issue O(1) split proofs.
+type GlobalIndexPlacementValidator interface {
+	GlobalIndexPlacementPoint(key []byte) (distribution.KeyspacePoint, bool)
+	GlobalIndexPlacementRange() distribution.KeyRange
+}
+
 // AttemptedMutationKeys is an opaque view of the exact distinct user keys in
 // one planned durable transition. Key bytes are borrowed and remain valid only
 // for the synchronous observer call.
@@ -288,10 +325,26 @@ func (t CollectionTarget) validate() error {
 // Options fixes the cross-collection and bounded-session admission profile.
 // Zero values fail closed.
 type Options struct {
-	TxnLimits         durable.TxnLimits
-	MaxSessions       uint64
-	RetryWindow       uint16
-	TransitionCapture TransitionCapture
+	TxnLimits   durable.TxnLimits
+	MaxSessions uint64
+	RetryWindow uint16
+	// RequestLedgerCapacityBytes is the exact replicated resident+future-byte
+	// budget for this dedicated ledger group. Zero, together with a zero cleanup
+	// reserve, disables request-ledger commands on ordinary data groups.
+	RequestLedgerCapacityBytes uint64
+	// RequestLedgerCleanupReserveBytes is carved out from capacity so Create
+	// cannot starve ACK, recovery, or bounded tombstone-authorized GC.
+	RequestLedgerCleanupReserveBytes uint64
+	// RequestLedgerRange is immutable authority for one dedicated ledger Raft
+	// group. End is exclusive; an all-zero End denotes the 2^256 upper bound so
+	// the last range can cover the complete digest space without a sentinel key.
+	// Identity is carried by every ledger command and prevents a stale router
+	// from treating a different group/range generation as authoritative.
+	RequestLedgerRange RequestLedgerRange
+	TransitionCapture  TransitionCapture
+	// TransitionCaptureFactory deterministically reconstructs a capture from a
+	// Raft-applied activation witness before Open permits subsequent apply.
+	TransitionCaptureFactory func(SplitCaptureActivation) (TransitionCapture, error)
 	// TransitionCaptureTarget reserves an authenticated participant in the
 	// fixed checkpoint membership before capture begins. A non-nil capture must
 	// name this exact target. It may be installed later under the Machine lock.
@@ -301,6 +354,58 @@ type Options struct {
 	// Open. Ordinary callers leave it nil and retain per-transition synchronous
 	// UpdateCollections semantics.
 	CheckpointGroup *durable.CheckpointGroup
+	// SchemaTransition is required only when the durable state's last record is
+	// RecordSchema. It lets first target-generation reopen authenticate the full
+	// Raft entry commitment against the independently selected checkpoint
+	// membership and catalog CAS. Later ordinary entries no longer need it.
+	SchemaTransition          []byte
+	SchemaMembershipWitness   durable.CheckpointMembershipWitness
+	SchemaAuthorizationDigest [sha256.Size]byte
+	SchemaCatalogCASDigest    [sha256.Size]byte
+	// SchemaSourceRecovery permits only authenticated recovery of a retired
+	// source bundle. It never grants serving authority or selects target files.
+	SchemaSourceRecovery *SchemaSourceRecoveryProof
+}
+
+// SchemaSourceRecoveryProof binds the original catalog preparation to its
+// exact durable Raft entry and source checkpoint membership.
+type SchemaSourceRecoveryProof struct {
+	Command             []byte
+	Membership          durable.CheckpointMembershipWitness
+	AuthorizationDigest [sha256.Size]byte
+	CatalogCASDigest    [sha256.Size]byte
+	SourceApplied       uint64
+}
+
+// RequestLedgerRange is the immutable, apply-contract-bound authority interval
+// for a dedicated request-ledger group. It is deliberately not topology state:
+// this safe point refuses online range changes and requires a fresh certified
+// group for a different interval.
+type RequestLedgerRange struct {
+	Start    requestledger.LedgerHome
+	End      requestledger.LedgerHome
+	Identity requestledger.Digest
+}
+
+func (r RequestLedgerRange) enabled() bool {
+	return r.Start != (requestledger.LedgerHome{}) ||
+		r.End != (requestledger.LedgerHome{}) || r.Identity != (requestledger.Digest{})
+}
+
+func (r RequestLedgerRange) valid() bool {
+	if r.Identity == (requestledger.Digest{}) {
+		return false
+	}
+	// Zero End is the canonical unbounded upper endpoint. A bounded interval
+	// must be nonempty under bytewise digest order.
+	return r.End == (requestledger.LedgerHome{}) || bytes.Compare(r.Start[:], r.End[:]) < 0
+}
+
+func (r RequestLedgerRange) contains(home requestledger.LedgerHome) bool {
+	if !r.valid() || bytes.Compare(home[:], r.Start[:]) < 0 {
+		return false
+	}
+	return r.End == (requestledger.LedgerHome{}) || bytes.Compare(home[:], r.End[:]) < 0
 }
 
 func (o Options) validate() error {
@@ -308,6 +413,15 @@ func (o Options) validate() error {
 		o.RetryWindow == 0 || o.RetryWindow > MaxSessionRetryWindow ||
 		o.TxnLimits.MaxCollections < 2 ||
 		o.TxnLimits.MaxDocuments < 4 || o.TxnLimits.MaxBytes <= 0 {
+		return ErrInvalidOptions
+	}
+	ledgerEnabled := o.RequestLedgerCapacityBytes != 0 ||
+		o.RequestLedgerCleanupReserveBytes != 0 || o.RequestLedgerRange.enabled()
+	if ledgerEnabled && (o.RequestLedgerCapacityBytes == 0 ||
+		o.RequestLedgerCleanupReserveBytes == 0 ||
+		o.RequestLedgerCleanupReserveBytes >= o.RequestLedgerCapacityBytes ||
+		o.RequestLedgerCapacityBytes > uint64(^uint64(0)>>1) ||
+		!o.RequestLedgerRange.valid()) {
 		return ErrInvalidOptions
 	}
 	return nil
@@ -332,6 +446,22 @@ type CompletionLookup struct {
 	AppliedSequence uint64
 }
 
+// RequestLedgerUsage is the constant-size, replicated admission/accounting
+// witness for one dedicated ledger group. Resident and Reserved are disjoint;
+// their checked sum is the exact capacity consumption. ACK tombstones are a
+// permanent subset of Rows/ResidentBytes and are never hidden by compaction.
+type RequestLedgerUsage struct {
+	Enabled             bool
+	Rows                uint64
+	ResidentBytes       uint64
+	ReservedBytes       uint64
+	AckRows             uint64
+	AckBytes            uint64
+	CapacityBytes       uint64
+	CleanupReserveBytes uint64
+	Range               RequestLedgerRange
+}
+
 // SessionLeaseLookup is the exact retained lease state for one issued client
 // epoch. TerminalResult is zero for an active session and is the retained
 // retirement or revocation result for a retired session.
@@ -349,5 +479,9 @@ func isSessionTerminalResult(code uint32) bool {
 }
 
 func isSessionResultCode(code uint32) bool {
+	return code >= ResultApplied && code <= ResultRouteGate
+}
+
+func isMutationResultCode(code uint32) bool {
 	return code >= ResultApplied && code <= ResultIntentBusy
 }

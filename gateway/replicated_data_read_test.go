@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -28,6 +30,38 @@ type publicPointReadClient struct {
 	wantRelation  replication.RelationID
 	wantMaxValue  uint32
 	wantMinimum   uint64
+}
+
+type publicBatchReadClient struct {
+	states   map[string]shardservice.ReplicatedMemberState
+	response []byte
+	probes   int
+	reads    int
+	wantMax  uint32
+}
+
+func (client *publicBatchReadClient) DoReplicated(
+	_ context.Context,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state := client.states[endpoint.Address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		client.probes++
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: state}, nil
+	}
+	client.reads++
+	batch, err := replicatedstate.OpenPointReadBatch(request.BatchRead)
+	if err != nil || batch.Count() != 2 ||
+		request.Operation != shardservice.ReplicatedReadBatchLeader ||
+		request.Capability != serviceauthz.CapabilityDataRead ||
+		request.MinimumApplied != 1 || request.MaxValueBytes != client.wantMax {
+		return nil, ErrReplicatedRoute
+	}
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedReadBatchResult,
+		HasState: true, State: state, ReadApplied: state.Applied,
+		Value: client.response}, nil
 }
 
 type signalingReadContext struct {
@@ -155,6 +189,80 @@ func TestReplicatedDataReaderLinearizableRefreshesNotLeader(t *testing.T) {
 		client.reads[0] == client.reads[1] ||
 		len(client.probes) < 3 || client.probes[len(client.probes)-1] != client.reads[1] {
 		t.Fatalf("probes=%v reads=%v operations=%v", client.probes, client.reads, client.operations)
+	}
+}
+
+func TestReplicatedDataReaderBatchUsesOneReadForTwoTables(t *testing.T) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	config.Placements = append(config.Placements, config.Placements[0])
+	config.Placements[1].Table = "profiles"
+	second := profile
+	second.Table, second.Relation = "profiles", 2
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{profile, second},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyA, ok := orderedkey.AppendString(nil, []byte("a"), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("first key")
+	}
+	keyB, ok := orderedkey.AppendString(nil, []byte("b"), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("second key")
+	}
+	// count=2, both found (the second is intentionally empty), lengths 5,0.
+	packed := binary.LittleEndian.AppendUint32(nil, 2)
+	packed = append(packed, 0b00000011)
+	packed = binary.LittleEndian.AppendUint32(packed, 5)
+	packed = binary.LittleEndian.AppendUint32(packed, 0)
+	packed = append(packed, "alpha"...)
+	client := &publicBatchReadClient{response: packed, wantMax: 1 << 20}
+	client.states = make(map[string]shardservice.ReplicatedMemberState)
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scratch [replication.MaxMutationKeyBytes + 16]byte
+	resolved, ok := snapshot.ResolveReplicatedTableKey(
+		[]byte("messages"), keyA, scratch[:0], replicas[:0],
+	)
+	if !ok {
+		t.Fatal("resolve")
+	}
+	for _, endpoint := range resolved.Route.Replicas {
+		client.states[endpoint.Address] = shardservice.ReplicatedMemberState{
+			Fence: shardservice.ReplicatedFence{Group: resolved.Route.Group,
+				AllocationGeneration: resolved.Route.AllocationGeneration,
+				Command:              resolved.Route.Command, MemberID: endpoint.Member,
+				StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation, Term: 7},
+			LeaderID: 2, Commit: 12, Applied: 12, CheckpointApplied: 11,
+		}
+	}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewReplicatedDataReader(NewCatalogHolder(snapshot), executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := reader.ReadBatch(context.Background(), ReplicatedTableBatchReadRequest{
+		MaxResultBytes: 1 << 20,
+		Points: []ReplicatedTableBatchPoint{
+			{Table: []byte("messages"), Key: keyA},
+			{Table: []byte("profiles"), Key: keyB},
+		},
+	})
+	defer result.Release()
+	if err != nil || result.Count() != 2 || result.Position.RouteID != resolved.RouteID ||
+		result.Position.Applied != 12 || client.reads != 1 || client.probes == 0 {
+		t.Fatalf("result=%+v probes=%d reads=%d err=%v", result, client.probes, client.reads, err)
+	}
+	if raw, found, ok := result.Lookup(0); !ok || !found || string(raw) != "alpha" {
+		t.Fatalf("first raw=%q found=%v ok=%v", raw, found, ok)
+	}
+	if raw, found, ok := result.Lookup(1); !ok || !found || len(raw) != 0 {
+		t.Fatalf("second raw=%q found=%v ok=%v", raw, found, ok)
 	}
 }
 

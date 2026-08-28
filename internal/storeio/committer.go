@@ -37,7 +37,8 @@ var (
 	// ErrCheckpointRequired reports bounded buffered-visible staging pressure.
 	// The caller must checkpoint the generations it has already published
 	// before retrying. No rejected batch has been accepted or made visible.
-	ErrCheckpointRequired = errors.New("vibedb: Store buffered checkpoint required")
+	ErrCheckpointRequired  = errors.New("vibedb: Store buffered checkpoint required")
+	ErrPublicationConflict = errors.New("vibedb: Store conditional publication conflict")
 )
 
 // CommitterOptions fixes automatic persistence queue memory. Descriptor
@@ -68,6 +69,10 @@ type CommitterOptions struct {
 	// because that caller's acknowledgement is what the delay would be charged
 	// to and it cannot produce the neighbour being waited for.
 	CoalesceDelay time.Duration
+	// PublicationObserver runs synchronously at the single successful root-
+	// publication boundary, after admission/capacity checks and before the
+	// generation becomes visible. Descriptor is borrowed for the callback.
+	PublicationObserver func(generation uint64, descriptor []byte) error
 	// MaterializationDamageGranule explicitly qualifies the largest complete
 	// sector a power loss may damage. Zero disables canonical in-place
 	// materialization. A non-zero value must be supported by the journal codec;
@@ -185,6 +190,28 @@ type Batch struct {
 	generation                    uint64
 	index                         uint32
 	state                         atomic.Uint32
+	publicationDescriptor         []byte
+	expectedPreviousGeneration    uint64
+	conditionalPublication        bool
+}
+
+// SetPublicationDescriptor attaches a canonical logical mutation batch to the
+// next publication. The slice is borrowed until Publish or Abort.
+func (b *Batch) SetPublicationDescriptor(descriptor []byte) error {
+	if b == nil || b.state.Load() != batchOwned || len(descriptor) == 0 {
+		return ErrBatchState
+	}
+	b.publicationDescriptor = descriptor
+	return nil
+}
+
+func (b *Batch) SetExpectedPreviousGeneration(generation uint64) error {
+	if b == nil || b.state.Load() != batchOwned || generation == 0 {
+		return ErrBatchState
+	}
+	b.expectedPreviousGeneration = generation
+	b.conditionalPublication = true
+	return nil
 }
 
 // ResizePages returns unused trailing page buffers before publication. It is
@@ -281,16 +308,19 @@ type Committer struct {
 	device        Device
 	backend       Backend
 
-	buffers        [][]byte
-	bufferSize     int
-	bufferCount    int
-	freeBuffers    *indexPool
-	freeBatches    *indexPool
-	batches        []Batch
-	writeStorage   []Write
-	indexStorage   []uint32
-	descriptorOnce sync.Once
-	producerSeen   []uint64
+	buffers                    [][]byte
+	bufferSize                 int
+	bufferCount                int
+	freeBuffers                *indexPool
+	freeBatches                *indexPool
+	batches                    []Batch
+	writeStorage               []Write
+	indexStorage               []uint32
+	descriptorOnce             sync.Once
+	observerMu                 sync.RWMutex
+	observer                   func(uint64, []byte) error
+	observerRequiresDescriptor bool
+	producerSeen               []uint64
 
 	pending     []*Batch
 	pendingMask uint64
@@ -430,6 +460,7 @@ func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 		failureNotified: make(chan struct{}),
 		commitScratch:   make([]Write, 0, normalizedDevice.BufferCount),
 	}
+	c.observer = normalizedCommitter.PublicationObserver
 	groupCapacity := normalizedCommitter.GroupLimit
 	if normalizedCommitter.ManualCheckpoint {
 		// A manual checkpoint is one exact root cut. Buffered alternate-root
@@ -684,6 +715,9 @@ func (c *Committer) publishRetiring(
 	if generation == 0 || generation <= c.published.Load() {
 		return superseded, ErrGenerationOrder
 	}
+	if batch.conditionalPublication && c.published.Load() != batch.expectedPreviousGeneration {
+		return superseded, ErrPublicationConflict
+	}
 	if batch.rootGeneration != 0 && batch.rootGeneration != generation {
 		return superseded, ErrGenerationOrder
 	}
@@ -712,6 +746,24 @@ func (c *Committer) publishRetiring(
 		}
 		return superseded, ErrQueueFull
 	}
+	c.observerMu.RLock()
+	observer := c.observer
+	requiresDescriptor := c.observerRequiresDescriptor
+	if requiresDescriptor && len(batch.publicationDescriptor) == 0 {
+		c.observerMu.RUnlock()
+		return superseded, fmt.Errorf("%w: publication descriptor required", ErrInvalidWrite)
+	}
+	if observer != nil {
+		if err := observer(generation, batch.publicationDescriptor); err != nil {
+			c.observerMu.RUnlock()
+			return superseded, err
+		}
+	}
+	c.observerMu.RUnlock()
+	if batch.conditionalPublication &&
+		!c.published.CompareAndSwap(batch.expectedPreviousGeneration, generation) {
+		return superseded, ErrPublicationConflict
+	}
 	if batch.materialized {
 		batch.journalSlot = c.materializationNextSlot.Load()
 		c.materializationNextSequence.Store(batch.journalSequence + 1)
@@ -727,7 +779,9 @@ func (c *Committer) publishRetiring(
 	}
 	batch.state.Store(batchPublished)
 	c.pending[tail&c.pendingMask] = batch
-	c.published.Store(generation)
+	if !batch.conditionalPublication {
+		c.published.Store(generation)
+	}
 	c.tail.Store(tail + 1)
 	// A normal publication wakes the automatic worker. A manual publication
 	// wakes it only when a concurrent Flush already captured this generation;
@@ -786,6 +840,37 @@ func (c *Committer) PublishedGeneration() uint64 {
 		return 0
 	}
 	return c.published.Load()
+}
+
+// SetPublicationObserver changes the pre-visibility observer. Callers must
+// externally exclude producers while installing or removing it; publication
+// holds the read side through the callback so removal waits for an in-flight
+// capture to finish.
+func (c *Committer) SetPublicationObserver(observer func(uint64, []byte) error) error {
+	if c == nil || c.closing.Load() {
+		return ErrClosed
+	}
+	c.observerMu.Lock()
+	c.observer = observer
+	c.observerRequiresDescriptor = false
+	c.observerMu.Unlock()
+	return nil
+}
+
+// SetRequiredPublicationObserver is the migration-capture form: every root
+// source must attach a canonical descriptor or publication fails closed.
+func (c *Committer) SetRequiredPublicationObserver(observer func(uint64, []byte) error) error {
+	if observer == nil {
+		return fmt.Errorf("%w: required publication observer", ErrInvalidWrite)
+	}
+	if c == nil || c.closing.Load() {
+		return ErrClosed
+	}
+	c.observerMu.Lock()
+	c.observer = observer
+	c.observerRequiresDescriptor = true
+	c.observerMu.Unlock()
+	return nil
 }
 
 // DurableGeneration returns the newest generation whose root passed the final

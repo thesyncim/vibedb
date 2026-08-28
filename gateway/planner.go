@@ -163,6 +163,8 @@ func (s *Snapshot) cachedPreparedPlan(sqlText string) (*PreparedPlan, uint64) {
 	return nil, hash
 }
 
+// sqlText must be the bounded owned source passed to this plan's parser. Share
+// that same allocation with the cache key rather than cloning a second copy.
 func (s *Snapshot) cachePreparedPlan(sqlText string, hash uint64, plan *PreparedPlan) *PreparedPlan {
 	cache := s.planCache.Load()
 	if cache == nil {
@@ -177,7 +179,7 @@ func (s *Snapshot) cachePreparedPlan(sqlText string, hash uint64, plan *Prepared
 	if current := slot.Load(); current != nil && current.hash == hash && current.sql == sqlText {
 		return current.plan
 	}
-	entry := &cachedPreparedPlan{hash: hash, sql: strings.Clone(sqlText), plan: plan}
+	entry := &cachedPreparedPlan{hash: hash, sql: sqlText, plan: plan}
 	slot.Store(entry)
 	return plan
 }
@@ -202,6 +204,10 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 		if cached != nil {
 			return cached, nil
 		}
+		// Ingress SQL may alias a much larger Scanner buffer or escape arena.
+		// The parser retains its source as well as AST spans, so detach once on
+		// a cacheable miss, before parsing. Cache hits remain allocation-free.
+		sqlText = strings.Clone(sqlText)
 	}
 	plan := &PreparedPlan{generation: s.Generation()}
 	if ctx != nil {

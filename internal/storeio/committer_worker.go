@@ -643,6 +643,9 @@ func (c *Committer) release(batch *Batch) {
 	batch.materializationPatchChecksums = [MaterializationJournalMaxPatches]uint32{}
 	batch.materialized = false
 	batch.dataBufferCount = 0
+	batch.publicationDescriptor = nil
+	batch.expectedPreviousGeneration = 0
+	batch.conditionalPublication = false
 	batch.generation = 0
 	batch.state.Store(batchFree)
 	c.freeBatches.push(batch.index)

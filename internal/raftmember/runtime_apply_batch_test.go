@@ -20,8 +20,9 @@ import (
 )
 
 type runtimeMemoryBatchMachine struct {
-	publication raftmodel.Publication
-	batchCalls  int
+	publication        raftmodel.Publication
+	batchCalls         int
+	originalCompletion []byte
 }
 
 func newRuntimeMemoryBatchMachine(t *testing.T, stable *raftsim.MemoryStore) *runtimeMemoryBatchMachine {
@@ -70,6 +71,9 @@ func (machine *runtimeMemoryBatchMachine) ApplyNormalBatch(
 ) (int, raftmodel.Publication, error) {
 	machine.batchCalls++
 	clear(witnesses)
+	if machine.originalCompletion != nil {
+		return 0, raftmodel.Publication{}, nil
+	}
 	for index := range entries {
 		publication, err := machine.ApplyNormal(entries[index].Meta, entries[index].Data)
 		if err != nil {
@@ -479,7 +483,7 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 	}
 }
 
-func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing.T) {
+func TestRuntimeBatchesCommittedCommandsIntoCapturedResultRanges(t *testing.T) {
 	fixture := newRuntimeFixture(t, 182, nil)
 	drainRuntime(t, fixture.runtime, nil)
 	if err := fixture.runtime.Campaign(); err != nil {
@@ -487,10 +491,10 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 	}
 	drainRuntime(t, fixture.runtime, nil)
 
-	const commandCount = 8
-	// RetryWindow=8 freezes ten system documents. The state row plus two
-	// records per distinct command makes four the exact legal prefix.
-	const expectedPrefixEntries = 4
+	// The transaction-capable system profile can hold eight commands in one
+	// commit. Use the full user-relation mutation budget so this still proves
+	// multiple bounded commits and exact settlement of every prefix.
+	const commandCount = replicatedstate.MaxDistinctMutations
 	var epochs [commandCount]uint64
 	for index := range commandCount {
 		open := runtimeReplaySessionOpen(fixture.base, byte(index+10))
@@ -526,6 +530,13 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 		}
 		commands[index] = encoded
 	}
+	// Every command updates one same-sized session header and adds one fixed
+	// retry slot. Derive the exact legal prefix from that durable geometry and
+	// the authenticated system profile, whose control-row bounds can evolve.
+	expectedPrefixEntries := runtimeBatchExpectedPrefix(t, fixture, commands)
+	if expectedPrefixEntries < 2 || expectedPrefixEntries >= commandCount {
+		t.Fatalf("fixture must exercise multiple non-singleton prefixes, got maximum %d", expectedPrefixEntries)
+	}
 	beforeApplied := fixture.apply.Applied()
 	beforeStats, err := fixture.apply.DurabilityStats()
 	if err != nil {
@@ -551,7 +562,7 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 			func(OutboundMessage) error { return nil },
 			func(batch AppliedBatch) error {
 				settlementRanges++
-				if batch.Len() != expectedPrefixEntries ||
+				if batch.Len() != min(expectedPrefixEntries, commandCount-settledCommands) ||
 					batch.LastIndex()-batch.FirstIndex()+1 != uint64(batch.Len()) ||
 					batch.FirstIndex() != nextApplied ||
 					batch.FinalPublication().Applied != batch.LastIndex() ||
@@ -596,7 +607,7 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 			if statsErr != nil {
 				t.Fatal(statsErr)
 			}
-			if result.Applied.Len() != expectedPrefixEntries ||
+			if result.Applied.Len() != min(expectedPrefixEntries, int(beforeApplied+commandCount-result.Applied.FirstIndex()+1)) ||
 				afterStepStats.Updates != stepStats.Updates+1 ||
 				afterStepStats.TransactionHighWater != stepStats.TransactionHighWater+1 ||
 				afterStepStats.LargestUpdateSpan < uint64(result.Applied.Len()) {
@@ -612,16 +623,13 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 		}
 	}
 	if settledCommands != commandCount ||
-		settlementRanges != commandCount/expectedPrefixEntries ||
+		settlementRanges != (commandCount+expectedPrefixEntries-1)/expectedPrefixEntries ||
 		settlementRanges >= commandCount || nextApplied != beforeApplied+commandCount+1 {
 		t.Fatalf("settled commands = %d ranges %d next applied %d",
 			settledCommands, settlementRanges, nextApplied)
 	}
-	if fixture.apply.Applied() != beforeApplied+commandCount ||
-		fixture.apply.CheckpointAppliedIndex() != beforeApplied+commandCount {
-		t.Fatalf("apply/certificate = %d/%d, want %d",
-			fixture.apply.Applied(), fixture.apply.CheckpointAppliedIndex(),
-			beforeApplied+commandCount)
+	if fixture.apply.Applied() != beforeApplied+commandCount {
+		t.Fatalf("journal-durable apply = %d, want %d", fixture.apply.Applied(), beforeApplied+commandCount)
 	}
 	afterStats, err := fixture.apply.DurabilityStats()
 	if err != nil {
@@ -633,6 +641,96 @@ func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing
 		t.Fatalf("one transaction per captured prefix = ranges %d before %+v after %+v",
 			settlementRanges, beforeStats, afterStats)
 	}
-	t.Logf("settled %d commands as %d exact %d-entry committed prefixes",
+	// Settlement follows each journal-durable group commit, not a checkpoint
+	// fold. Only after checking those exact commits, seal their final cut and
+	// require the resulting certificate to cover every settled command.
+	drainRuntime(t, fixture.runtime, nil)
+	preparation, err := fixture.apply.CaptureWALBase(sqldriver.WALBaseCaptureOptions{
+		Workspace: make([]byte, 0, replicatedstate.MaxSnapshotArtifactChunkBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := preparation.GenerationInput()
+	if err != nil || input.Snapshot.GetMetadata().GetIndex() != beforeApplied+commandCount ||
+		fixture.apply.Applied() != beforeApplied+commandCount ||
+		fixture.apply.CheckpointAppliedIndex() != beforeApplied+commandCount {
+		t.Fatalf("sealed apply/certificate = %d/%d, want %d: %v",
+			fixture.apply.Applied(), fixture.apply.CheckpointAppliedIndex(), beforeApplied+commandCount, err)
+	}
+	t.Logf("settled %d commands as %d exact committed prefixes of at most %d entries",
 		settledCommands, settlementRanges, expectedPrefixEntries)
+}
+
+func runtimeBatchExpectedPrefix(t testing.TB, fixture runtimeFixture, commands [][]byte) int {
+	t.Helper()
+	cut, err := fixture.apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cut.Close()
+	type rowBytes struct{ session, slot int }
+	rows := make(map[[32]byte]rowBytes, len(commands))
+	stateBytes := 0
+	err = cut.RangeSystem(func(key, value []byte) error {
+		if _, err := replicatedstate.OpenState(value); err == nil {
+			stateBytes = len(key) + len(value)
+		} else if record, err := replicatedstate.OpenSessionRecord(value); err == nil {
+			row := rows[record.Digest]
+			row.session = len(key) + len(value)
+			rows[record.Digest] = row
+		} else if slot, err := replicatedstate.OpenSessionSlot(value); err == nil {
+			row := rows[slot.SessionDigest]
+			if row.slot != 0 {
+				return errors.New("batch fixture has more than its opening retry slot")
+			}
+			row.slot = len(key) + len(value)
+			rows[slot.SessionDigest] = row
+		}
+		return nil
+	})
+	if err != nil || stateBytes == 0 {
+		t.Fatalf("read exact system geometry: state=%d err=%v", stateBytes, err)
+	}
+	commandBytes := 0
+	userBytes := 0
+	for _, raw := range commands {
+		command, err := replication.OpenCommand(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := rows[replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)]
+		if row.session == 0 || row.slot == 0 || commandBytes != 0 && commandBytes != row.session+row.slot {
+			t.Fatalf("fixture command system geometry differs: %+v want %d", row, commandBytes)
+		}
+		commandBytes = row.session + row.slot
+		// Canonical command bytes include every user key/value, making their sum
+		// a conservative upper bound for proving other profiles non-limiting.
+		userBytes += len(raw)
+	}
+	count := len(commands)
+	if fixture.base.UserLimits.MaxBatchDocuments < count || fixture.base.UserLimits.MaxBatchBytes < userBytes ||
+		fixture.applyID.TxnLimits.MaxCollections < 2 || fixture.applyID.TxnLimits.MaxDocuments < 1+3*count ||
+		fixture.applyID.TxnLimits.MaxBytes < int64(stateBytes+commandBytes*count+userBytes) {
+		t.Fatal("fixture has another tighter bound than the system profile")
+	}
+	return runtimeBatchSystemPrefix(fixture.applyID.SystemLimits, stateBytes, commandBytes, count)
+}
+
+func runtimeBatchSystemPrefix(limits sqldriver.ReplicatedShardStoreLimits, stateBytes, commandBytes, count int) int {
+	if stateBytes <= 0 || commandBytes <= 0 || limits.MaxBatchDocuments < 1 || limits.MaxBatchBytes < stateBytes {
+		return 0
+	}
+	return min(count, (limits.MaxBatchDocuments-1)/2, (limits.MaxBatchBytes-stateBytes)/commandBytes)
+}
+
+func TestRuntimeBatchSystemPrefixRespectsExactProfile(t *testing.T) {
+	for _, test := range []struct{ documents, bytes, want int }{
+		{10, 1000, 4}, {18, 350, 6}, {18, 450, 8}, {18, 349, 5}, {18, 49, 0}, {1, 1000, 0},
+	} {
+		limits := sqldriver.ReplicatedShardStoreLimits{MaxBatchDocuments: test.documents, MaxBatchBytes: test.bytes}
+		if got := runtimeBatchSystemPrefix(limits, 50, 50, 8); got != test.want {
+			t.Fatalf("limits=%+v prefix=%d want%d", limits, got, test.want)
+		}
+	}
 }

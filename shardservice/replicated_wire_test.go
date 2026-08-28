@@ -14,12 +14,15 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -104,6 +107,12 @@ func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
+	batch, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{
+		{Relation: 1, Key: []byte("a")}, {Relation: 2, Key: []byte("b")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
 		{Operation: ReplicatedProbe, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{
@@ -119,6 +128,9 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
 		{Operation: ReplicatedReadFollower, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: fence, Relation: 2,
 			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
+		{Operation: ReplicatedReadBatchLeader, Authority: authority,
+			Capability: serviceauthz.CapabilityDataRead, Fence: fence,
+			BatchRead: batch, MinimumApplied: 11, MaxValueBytes: 16384},
 	} {
 		var encoded bytes.Buffer
 		if err := EncodeReplicatedRequest(&encoded, request); err != nil {
@@ -139,6 +151,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			decoded.Capability != request.Capability || decoded.Fence != request.Fence ||
 			!bytes.Equal(decoded.Command, request.Command) || decoded.Membership != request.Membership ||
 			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
+			!bytes.Equal(decoded.BatchRead, request.BatchRead) ||
 			decoded.MinimumApplied != request.MinimumApplied ||
 			decoded.MaxValueBytes != request.MaxValueBytes {
 			t.Fatalf("request round trip = %+v", decoded)
@@ -169,6 +182,8 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
 			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadIntentActive,
+			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: state, RequestDigest: [32]byte{1}, Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8}},
@@ -189,6 +204,62 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			!bytes.Equal(decoded.Completion, response.Completion) {
 			t.Fatalf("response round trip = %+v, want %+v", decoded, response)
 		}
+	}
+}
+
+func TestReplicatedBatchReadWirePreservesBitmapLengthsAndEmptyFound(t *testing.T) {
+	packedRequest, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{
+		{Relation: 1, Key: []byte("a")}, {Relation: 2, Key: []byte("b")},
+		{Relation: 1, Key: []byte("c")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedReadBatchLeader,
+		Fence: testReplicatedFence(), BatchRead: packedRequest,
+		MinimumApplied: 7, MaxValueBytes: 4096}
+	var frame bytes.Buffer
+	if err := EncodeReplicatedRequestBorrowed(&frame, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReplicatedRequest(&frame)
+	if err != nil || !bytes.Equal(decoded.BatchRead, packedRequest) {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+
+	// count=3, bitmap positions 0 and 1 found, lengths 5,0,0, payload alpha.
+	value := binary.LittleEndian.AppendUint32(nil, 3)
+	value = append(value, 0b00000011)
+	value = binary.LittleEndian.AppendUint32(value, 5)
+	value = binary.LittleEndian.AppendUint32(value, 0)
+	value = binary.LittleEndian.AppendUint32(value, 0)
+	value = append(value, "alpha"...)
+	fence := request.Fence
+	response := &ReplicatedResponse{Kind: ReplicatedReadBatchResult, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: value}
+	frame.Reset()
+	if err := EncodeReplicatedResponse(&frame, response); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := DecodeReplicatedResponse(&frame)
+	if err != nil || opened.Kind != ReplicatedReadBatchResult ||
+		!bytes.Equal(opened.Value, value) {
+		t.Fatalf("opened=%+v err=%v", opened, err)
+	}
+	view, err := replicatedstate.OpenPointReadBatchValue(opened.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, found, ok := view.Lookup(0); !ok || !found || string(raw) != "alpha" {
+		t.Fatalf("first raw=%q found=%v ok=%v", raw, found, ok)
+	}
+	if raw, found, ok := view.Lookup(1); !ok || !found || len(raw) != 0 {
+		t.Fatalf("empty raw=%q found=%v ok=%v", raw, found, ok)
+	}
+	if _, found, ok := view.Lookup(2); !ok || found {
+		t.Fatalf("miss found=%v ok=%v", found, ok)
 	}
 }
 
@@ -441,6 +512,96 @@ func TestReplicatedProposalRecoveryCapabilityRequiresDataTransactionCommand(t *t
 	}
 }
 
+func TestReplicatedProposalRequestLedgerCapabilityIsNarrow(t *testing.T) {
+	fence := testReplicatedFence()
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 1}
+	ledger := testReplicatedRequestLedgerCommand(t, fence)
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose, Authority: authority,
+		Capability: serviceauthz.CapabilityRequestLedger, Fence: fence, Command: ledger,
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatalf("request-ledger proposal: %v", err)
+	}
+	for _, capability := range []serviceauthz.Capability{
+		0, serviceauthz.CapabilityDataWrite, serviceauthz.CapabilityTopology,
+		serviceauthz.CapabilityTransactionRecovery,
+	} {
+		candidate := *request
+		candidate.Capability = capability
+		if capability == 0 {
+			candidate.Authority = serviceauthz.Authority{}
+		}
+		encoded.Reset()
+		if err := EncodeReplicatedRequest(&encoded, &candidate); !errors.Is(err, ErrReplicatedWire) {
+			t.Fatalf("capability %d admitted ledger command: %v", capability, err)
+		}
+	}
+	request.Command = testReplicatedCommand(t, fence)
+	encoded.Reset()
+	if err := EncodeReplicatedRequest(&encoded, request); !errors.Is(err, ErrReplicatedWire) {
+		t.Fatalf("request-ledger capability admitted data command: %v", err)
+	}
+
+	request.Command = testReplicatedRequestLedgerCommandForPrincipal(
+		t, fence, rafttransport.NodeID{8},
+	)
+	encoded.Reset()
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatalf("gateway service could not carry a distinct inner subject: %v", err)
+	}
+	wrongService := *request
+	wrongService.Authority.Node = rafttransport.NodeID{8}
+	encoded.Reset()
+	if err := EncodeReplicatedRequest(&encoded, &wrongService); !errors.Is(err, ErrReplicatedWire) {
+		t.Fatalf("mismatched outer service client identity admitted: %v", err)
+	}
+}
+
+func TestReplicatedProposalExecutionPinCapabilityIsClosedAndIndependent(t *testing.T) {
+	fence := testReplicatedFence()
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{12}, Generation: 1}
+	execution := testReplicatedExecutionPinCommand(t, fence)
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose, Authority: authority,
+		Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution,
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := replication.OpenCommand(decoded.Command)
+	if err != nil || command.Kind() != replication.CommandExecutionPin ||
+		command.AuthorityClass != replication.CommandAuthorityExecutionPin {
+		t.Fatalf("decoded execution pin = %+v, %v", command, err)
+	}
+	for _, rejected := range []*ReplicatedRequest{
+		{Operation: ReplicatedPropose,
+			Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{13}, Generation: 1},
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose,
+			Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{12}, Generation: 2},
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityTopology, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityDataWrite, Fence: fence, Command: execution},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityExecutionPin, Fence: fence,
+			Command: testReplicatedTopologyCommand(t, fence)},
+	} {
+		encoded.Reset()
+		if err := EncodeReplicatedRequest(&encoded, rejected); !errors.Is(err, ErrReplicatedWire) {
+			t.Fatalf("cross-authority command encoded: %v", err)
+		}
+	}
+}
+
 func TestReplicatedPointReadWirePreservesFoundEmptyAndMiss(t *testing.T) {
 	fence := testReplicatedFence()
 	request := &ReplicatedRequest{
@@ -634,6 +795,26 @@ func TestReplicatedCompletionWireValidatesFixedResultGrammar(t *testing.T) {
 	}); allocations != 0 {
 		t.Fatalf("canonical completion validation allocations = %.1f, want 0", allocations)
 	}
+	gate, ok := routegate.NewMachine(1, routegate.MaxRetainedRecords)
+	if !ok {
+		t.Fatal("construct route gate")
+	}
+	gateCommand := routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1,
+		Identity: routegate.Identity{1}, Binding: routegate.Binding{2},
+	}
+	var gateResult [routegate.OutcomeBytes]byte
+	gateBytes, err := routegate.AppendOutcome(gateResult[:0], gate.Apply(gateCommand))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validGate := responseFor(testReplicatedCompletionWithResult(
+		t, fence, 9, replicatedstate.ResultRouteGate,
+		replicatedstate.ResultFormatRouteGate, gateBytes,
+	))
+	if !validReplicatedResponse(validGate) {
+		t.Fatal("canonical route-gate result was rejected")
+	}
 
 	invalid := [][]byte{
 		testReplicatedCompletionWithResult(
@@ -650,6 +831,10 @@ func TestReplicatedCompletionWireValidatesFixedResultGrammar(t *testing.T) {
 		),
 		testReplicatedCompletionWithResult(
 			t, fence, 9, replicatedstate.ResultApplied, 77, nil,
+		),
+		testReplicatedCompletionWithResult(
+			t, fence, 9, replicatedstate.ResultApplied,
+			replicatedstate.ResultFormatRouteGate, gateBytes,
 		),
 	}
 	for index, completion := range invalid {
@@ -771,6 +956,8 @@ func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
 			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadIntentActive,
+			HasState: true, State: state},
 	} {
 		var seed bytes.Buffer
 		if err := EncodeReplicatedResponse(&seed, response); err != nil {
@@ -831,6 +1018,70 @@ func testReplicatedTopologyCommand(t testing.TB, fence ReplicatedFence) []byte {
 		replication.CommandAuthorityTopology)
 }
 
+func testReplicatedRequestLedgerCommand(t testing.TB, fence ReplicatedFence) []byte {
+	return testReplicatedRequestLedgerCommandForPrincipal(t, fence, rafttransport.NodeID{9})
+}
+
+func testReplicatedRequestLedgerCommandForPrincipal(
+	t testing.TB,
+	fence ReplicatedFence,
+	principal rafttransport.NodeID,
+) []byte {
+	t.Helper()
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID(principal),
+		Request: requestledger.RequestID{1}, TenantDigest: requestledger.Digest{1},
+	}
+	plan, err := requestledger.AppendPlan(nil, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDigest := requestledger.Digest(sha256.Sum256([]byte("request-ledger-wire")))
+	head, err := requestledger.NewHeadWithContract(key, requestDigest, requestDigest, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headBytes, err := requestledger.AppendHead(nil, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := requestledger.Home(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation: requestledger.OperationCreate, Revision: head.Revision,
+		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest,
+		PlanRoot: head.PlanRoot, SubjectDigest: head.TerminalContractDigest,
+		Home: home, ExpectedRangeIdentity: requestledger.Digest{2}, Payload: headBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := replication.Command{
+		Kind:           replication.CommandRequestLedger,
+		AuthorityClass: replication.CommandAuthorityRequestLedger,
+		ClusterID:      fence.Group.ClusterID, ClusterIncarnation: fence.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,
+		Distribution:          "request-ledger", Shard: "0000-ffff",
+		AllocationGeneration: fence.AllocationGeneration,
+		ShardIncarnation:     fence.Group.ShardIncarnation, GroupID: fence.Group.GroupID,
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+		OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		// Proposal retry identity belongs to the internal gateway service and is
+		// intentionally distinct from the forwarded end-user subject in key.
+		Tenant: []byte("request-ledger"), ClientID: replication.ID128{9},
+		ClientEpoch: 1, ClientSequence: 1,
+		Fingerprint:   sha256.Sum256([]byte("request-ledger-wire")),
+		RequestLedger: inner,
+	}
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
 func testReplicatedTransactionCommandClass(
 	t testing.TB,
 	fence ReplicatedFence,
@@ -842,7 +1093,9 @@ func testReplicatedTransactionCommandClass(
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedCommitCoordinator,
 		ID:        id, ExpectedRevision: 1,
-		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		PayloadKind:        distributedtxn.ReplicatedPayloadNone,
+		ControllerEpoch:    1,
+		ExecutionPinDigest: distributedtxn.Digest{1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -877,6 +1130,58 @@ func testReplicatedTransactionCommandClass(
 		Transaction:            control,
 	}
 	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence) []byte {
+	t.Helper()
+	digest := func(seed byte) executionpin.Digest {
+		var value executionpin.Digest
+		value[0], value[31] = seed, seed^0xff
+		return value
+	}
+	id := func(seed byte) executionpin.ID {
+		var value executionpin.ID
+		value[0], value[15] = seed, seed^0xff
+		return value
+	}
+	binding := executionpin.Binding{
+		RequestKeyDigest: digest(1), RequestDigest: digest(2),
+		CatalogGeneration:    3,
+		SchemaManifestDigest: digest(5), TransactionManifestDigest: digest(6),
+		ParticipantAuthorityRoot: digest(7), ParticipantCount: 8,
+		ExecutionContractDigest: digest(9), LedgerHomeGroup: id(10),
+	}
+	pin, err := executionpin.DerivePinID(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested, err := executionpin.AppendCommand(nil, executionpin.Command{
+		Operation: executionpin.OperationAcquire, Binding: binding, PinID: pin,
+		AuthorityNode: executionpin.ID(rafttransport.NodeID{12}), AuthorityGeneration: 1,
+		NextController: id(10), NextControllerEpoch: 1, NextLeaseSpan: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := replication.AppendCommand(nil, replication.Command{
+		Kind:           replication.CommandExecutionPin,
+		AuthorityClass: replication.CommandAuthorityExecutionPin,
+		ClusterID:      fence.Group.ClusterID, ClusterIncarnation: fence.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,
+		Distribution:          "orders", Shard: "catalog",
+		AllocationGeneration: fence.AllocationGeneration,
+		ShardIncarnation:     fence.Group.ShardIncarnation, GroupID: fence.Group.GroupID,
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+		OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		Tenant: []byte("pin-controller"), ClientID: replication.ID128{3},
+		ClientEpoch: 2, ClientSequence: 2,
+		Fingerprint:  sha256.Sum256([]byte("native-wire-execution-pin")),
+		ExecutionPin: nested,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -20,14 +20,16 @@ import (
 // catalog placement into native RF3 reads and writes. It deliberately carries
 // no executor tuning: these fields are durable schema identity, while batching
 // and command capacities remain admission policy.
+// LogicalSchemaDigest is shared across shard allocations of one schema;
+// the per-shard machine validation digest stays in the route's Command.
 type ReplicatedTableProfile struct {
-	Table                  string
-	Relation               replication.RelationID
-	PrimaryKey             string
-	SchemaGeneration       uint64
-	RelationManifestDigest replication.Digest
-	MaxKeyBytes            uint16
-	MaxDocumentBytes       uint32
+	Table               string
+	Relation            replication.RelationID
+	PrimaryKey          string
+	SchemaGeneration    uint64
+	LogicalSchemaDigest replication.Digest
+	MaxKeyBytes         uint16
+	MaxDocumentBytes    uint32
 }
 
 // ResolvedReplicatedTableKey is one exact, fenced base-table destination.
@@ -37,6 +39,7 @@ type ResolvedReplicatedTableKey struct {
 	Profile ReplicatedTableProfile
 	Route   ReplicatedRoute
 	RouteID replication.Digest
+	Point   distribution.KeyspacePoint
 }
 
 // replicatedCatalogTable is the compact hot directory. The table and primary
@@ -91,7 +94,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 			err != nil || len(primary.Tokens) == 0 || primary.String() != profile.PrimaryKey ||
 			len(placement.Columns) != 1 || placement.Columns[0] != profile.PrimaryKey ||
 			profile.SchemaGeneration == 0 ||
-			profile.RelationManifestDigest == (replication.Digest{}) ||
+			profile.LogicalSchemaDigest == (replication.Digest{}) ||
 			profile.MaxKeyBytes == 0 || int(profile.MaxKeyBytes) > replication.MaxMutationKeyBytes ||
 			profile.MaxDocumentBytes == 0 ||
 			uint64(profile.MaxDocumentBytes) > uint64(replication.MaxMutationValueBytes) {
@@ -116,7 +119,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 			metadata, _ := manifest.ShardMetadataAt(shardOrdinal)
 			route, ok := snapshot.replicatedShardAt(placement.Distribution, metadata.ID)
 			if !ok || route.command.SchemaGeneration != profile.SchemaGeneration ||
-				replication.Digest(route.command.RelationManifestDigest) != profile.RelationManifestDigest {
+				route.logicalSchema != profile.LogicalSchemaDigest {
 				return &CatalogError{Reason: fmt.Sprintf(
 					"replicated table %q does not match RF3 shard %q/%q",
 					profile.Table, placement.Distribution, metadata.ID,
@@ -148,7 +151,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 		planner := snapshot.planner[unresolved[ordinal].planner]
 		spec := snapshot.config.Distributions[planner.spec]
 		tables[ordinal] = replicatedCatalogTable{
-			digest: profile.RelationManifestDigest, schema: profile.SchemaGeneration,
+			digest: profile.LogicalSchemaDigest, schema: profile.SchemaGeneration,
 			planner: unresolved[ordinal].planner, maxDocument: profile.MaxDocumentBytes,
 			maxKey: profile.MaxKeyBytes, relation: profile.Relation,
 			mapper: distribution.NewNativeMapperWithBucketBits(1, spec.EffectiveBucketBits()),
@@ -174,7 +177,7 @@ func (snapshot *Snapshot) replicatedTableProfileAt(
 	}
 	return ReplicatedTableProfile{
 		Table: placement.Table, Relation: entry.relation, PrimaryKey: placement.Columns[0],
-		SchemaGeneration: entry.schema, RelationManifestDigest: entry.digest,
+		SchemaGeneration: entry.schema, LogicalSchemaDigest: entry.digest,
 		MaxKeyBytes: entry.maxKey, MaxDocumentBytes: entry.maxDocument,
 	}, true
 }
@@ -301,13 +304,13 @@ func (snapshot *Snapshot) ResolveReplicatedTableKey(
 	)
 	if !ok || route.AllocationGeneration != uint64(target.AllocationGeneration) ||
 		route.Command.OwnershipEpoch != uint64(target.OwnershipEpoch) ||
-		route.Command.RoutingVersion != uint64(manifest.Version()) ||
+		route.Command.RoutingVersion > uint64(manifest.Version()) ||
 		route.Command.SchemaGeneration != profile.SchemaGeneration ||
-		replication.Digest(route.Command.RelationManifestDigest) != profile.RelationManifestDigest {
+		route.LogicalSchemaDigest != profile.LogicalSchemaDigest {
 		return ResolvedReplicatedTableKey{}, false
 	}
 	return ResolvedReplicatedTableKey{
-		Profile: profile, Route: route, RouteID: replicatedRouteID(route),
+		Profile: profile, Route: route, RouteID: replicatedRouteID(route), Point: point,
 	}, true
 }
 
@@ -344,6 +347,13 @@ func (snapshot *Snapshot) replicatedTableProfiles() []ReplicatedTableProfile {
 	return profiles
 }
 
+// ReplicatedTableProfiles returns the detached portable table/schema directory
+// used by cold topology allocation. Replica-local SQL storage names and LogIDs
+// are intentionally absent.
+func (snapshot *Snapshot) ReplicatedTableProfiles() []ReplicatedTableProfile {
+	return snapshot.replicatedTableProfiles()
+}
+
 func validateReplicatedTableTransition(current, next *Snapshot) error {
 	if current == nil || len(current.replicatedTables) == 0 {
 		return nil
@@ -374,11 +384,11 @@ func validateReplicatedTableTransition(current, next *Snapshot) error {
 			(candidate.Relation != old.Relation || candidate.PrimaryKey != old.PrimaryKey ||
 				candidate.MaxKeyBytes != old.MaxKeyBytes ||
 				candidate.MaxDocumentBytes != old.MaxDocumentBytes ||
-				candidate.RelationManifestDigest != old.RelationManifestDigest)
+				candidate.LogicalSchemaDigest != old.LogicalSchemaDigest)
 		if candidate.Table != old.Table || candidate.SchemaGeneration < old.SchemaGeneration ||
 			sameGenerationChanged ||
 			(candidate.SchemaGeneration != old.SchemaGeneration &&
-				candidate.RelationManifestDigest == old.RelationManifestDigest) {
+				candidate.LogicalSchemaDigest == old.LogicalSchemaDigest) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated table %q changed or regressed its base-relation profile", old.Table,
 			)}
@@ -388,13 +398,13 @@ func validateReplicatedTableTransition(current, next *Snapshot) error {
 }
 
 type persistedReplicatedTable struct {
-	Table                  string `json:"table"`
-	Relation               uint16 `json:"relation"`
-	PrimaryKey             string `json:"primary_key"`
-	SchemaGeneration       uint64 `json:"schema_generation"`
-	RelationManifestDigest string `json:"relation_manifest_digest"`
-	MaxKeyBytes            uint16 `json:"max_key_bytes"`
-	MaxDocumentBytes       uint32 `json:"max_document_bytes"`
+	Table               string `json:"table"`
+	Relation            uint16 `json:"relation"`
+	PrimaryKey          string `json:"primary_key"`
+	SchemaGeneration    uint64 `json:"schema_generation"`
+	LogicalSchemaDigest string `json:"logical_schema_digest"`
+	MaxKeyBytes         uint16 `json:"max_key_bytes"`
+	MaxDocumentBytes    uint32 `json:"max_document_bytes"`
 }
 
 func persistedReplicatedTableProfiles(
@@ -408,8 +418,8 @@ func persistedReplicatedTableProfiles(
 		persisted[ordinal] = persistedReplicatedTable{
 			Table: profile.Table, Relation: uint16(profile.Relation),
 			PrimaryKey: profile.PrimaryKey, SchemaGeneration: profile.SchemaGeneration,
-			RelationManifestDigest: hex.EncodeToString(profile.RelationManifestDigest[:]),
-			MaxKeyBytes:            profile.MaxKeyBytes, MaxDocumentBytes: profile.MaxDocumentBytes,
+			LogicalSchemaDigest: hex.EncodeToString(profile.LogicalSchemaDigest[:]),
+			MaxKeyBytes:         profile.MaxKeyBytes, MaxDocumentBytes: profile.MaxDocumentBytes,
 		}
 	}
 	return persisted
@@ -422,13 +432,13 @@ func (catalog persistedCatalog) replicatedTableProfiles() ([]ReplicatedTableProf
 	profiles := make([]ReplicatedTableProfile, len(catalog.ReplicatedTables))
 	for ordinal, persisted := range catalog.ReplicatedTables {
 		var digest replication.Digest
-		if err := decodeFixed32Hex(persisted.RelationManifestDigest, (*[32]byte)(&digest)); err != nil {
+		if err := decodeFixed32Hex(persisted.LogicalSchemaDigest, (*[32]byte)(&digest)); err != nil {
 			return nil, &CatalogError{Reason: "replicated table relation manifest digest: " + err.Error()}
 		}
 		profiles[ordinal] = ReplicatedTableProfile{
 			Table: persisted.Table, Relation: replication.RelationID(persisted.Relation),
 			PrimaryKey: persisted.PrimaryKey, SchemaGeneration: persisted.SchemaGeneration,
-			RelationManifestDigest: digest, MaxKeyBytes: persisted.MaxKeyBytes,
+			LogicalSchemaDigest: digest, MaxKeyBytes: persisted.MaxKeyBytes,
 			MaxDocumentBytes: persisted.MaxDocumentBytes,
 		}
 	}

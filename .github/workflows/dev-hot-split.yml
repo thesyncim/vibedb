@@ -1,0 +1,35 @@
+name: Dev hot-shard split qualification
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dev-hot-split:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      VIBEDB_DEV_HOT_SPLIT_COUNT: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Require three unskipped zero-config terminal splits
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          go test ./cmd/vibedb-gateway \
+            -run '^TestGatewayZeroConfigDevPressureCompletesReplicatedSplit$' \
+            -count=3 -timeout=15m -v | tee "$output"
+          count="$(grep -c -- '^--- PASS: TestGatewayZeroConfigDevPressureCompletesReplicatedSplit' "$output")"
+          test "$count" -eq 3
+          if grep -q -- '^--- SKIP: TestGatewayZeroConfigDevPressureCompletesReplicatedSplit' "$output"; then
+            exit 1
+          fi

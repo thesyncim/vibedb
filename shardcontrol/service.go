@@ -3,11 +3,13 @@ package shardcontrol
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"net"
 	"slices"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
@@ -67,6 +69,15 @@ type Server struct {
 	executor   Executor
 }
 
+// Serve implements the shared shard-control Handler contract. Ownership of
+// the authenticated stream transfers to the selected service.
+func (server *Server) Serve(ctx context.Context, connection rafttransport.PeerConnection) error {
+	if connection != nil {
+		defer connection.Close()
+	}
+	return server.ServeConnection(ctx, connection)
+}
+
 func NewServer(authorizer *Authorizer, executor Executor) (*Server, error) {
 	if authorizer == nil || executor == nil {
 		return nil, ErrUnauthorized
@@ -89,12 +100,30 @@ func (server *Server) ServeConnection(ctx context.Context, connection rafttransp
 	}
 	response, err := server.executor.ExecuteControl(ctx, identity, request)
 	if err != nil {
+		// Leadership is observed outside JournalExecutor's durable result path.
+		// Persisting this transient refusal would poison an exact replay after
+		// this member subsequently became leader.
+		if errors.Is(err, raftmodel.ErrNotLeader) {
+			response = transientResponse(request, ResultNotLeader)
+			return WriteResponse(connection, &response)
+		}
 		return err
 	}
 	if response.Operation != request.Operation || response.Step != request.Step || !validResponse(&response) {
 		return ErrWire
 	}
 	return WriteResponse(connection, &response)
+}
+
+func transientResponse(request Request, code ResultCode) Response {
+	var material [1 + 32 + 32]byte
+	material[0] = byte(code)
+	copy(material[1:33], request.Operation[:])
+	copy(material[33:], request.Step[:])
+	return Response{
+		Code: code, Operation: request.Operation, Step: request.Step,
+		ResultDigest: sha256.Sum256(material[:]),
+	}
 }
 
 // Dial opens one authenticated control stream. The caller supplies the

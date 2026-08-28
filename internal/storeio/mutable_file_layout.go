@@ -2,7 +2,9 @@ package storeio
 
 import "fmt"
 
-const materializationJournalCopies = 2
+const (
+	materializationJournalCopies = 2
+)
 
 // MutableStoreFileLayout is the allocator-excluded prefix of a mutable Store
 // page file. The two root copies each own a complete Store page. The two

@@ -472,6 +472,8 @@ type ManifestCoordinatorRecord struct {
 	State             CoordinatorState
 	Revision          uint64
 	CatalogGeneration uint64
+	// RecoveryDeadline is the legacy field name for the bounded logical pulse
+	// limit. It is never compared with wall time.
 	RecoveryDeadline  int64
 	Manifest          ManifestDescriptor
 }

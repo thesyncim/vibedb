@@ -1,0 +1,33 @@
+name: distributed-clock-fault-matrix
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: clock-fault-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Qualify distributed clock and suspend fault matrix
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/clock-fault-tmp
+          VIBEDB_CLOCK_FAULT_EVIDENCE: ${{ runner.temp }}/clock-fault-evidence
+        run: ./scripts/ci/clock-fault-matrix.sh
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clock-fault-matrix-${{ github.sha }}
+          path: ${{ runner.temp }}/clock-fault-evidence
+          if-no-files-found: error
+          retention-days: 30
+

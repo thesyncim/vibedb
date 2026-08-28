@@ -69,6 +69,75 @@ func TestStaticRegistryAcceptsUnsortedMultipleGroups(t *testing.T) {
 	}
 }
 
+func TestStaticRegistryDynamicGroupPublishesAtomicallyAndRollsBack(t *testing.T) {
+	local := testNode(1)
+	base := testGroup(1)
+	dynamic := testGroupInDomain(base, 2)
+	baseMembers := []Member{
+		{Group: base, ReplicaSetVersion: 1, MemberID: 1, Node: local, Role: MemberVoter},
+		{Group: base, ReplicaSetVersion: 1, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: base, ReplicaSetVersion: 1, MemberID: 3, Node: testNode(3), Role: MemberVoter},
+	}
+	registry, err := NewStaticRegistry(local, baseMembers, Limits{MaxGroups: 2, MaxMembers: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster := []Member{
+		{Group: dynamic, ReplicaSetVersion: 7, MemberID: 3, Node: testNode(3), Role: MemberVoter},
+		{Group: dynamic, ReplicaSetVersion: 7, MemberID: 1, Node: local, Role: MemberVoter},
+		{Group: dynamic, ReplicaSetVersion: 7, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+	}
+	injected := errors.New("install failed")
+	if err = registry.InstallGroup(roster, func(publish func()) error {
+		if _, lookupErr := registry.LocalMember(dynamic); !errors.Is(lookupErr, ErrGroupNotFound) {
+			t.Fatalf("group visible before publish: %v", lookupErr)
+		}
+		return injected
+	}); !errors.Is(err, injected) {
+		t.Fatalf("rollback err=%v", err)
+	}
+	if _, err = registry.LocalMember(dynamic); !errors.Is(err, ErrGroupNotFound) {
+		t.Fatalf("rolled-back group visible: %v", err)
+	}
+	if err = registry.InstallGroup(roster, func(publish func()) error {
+		publish()
+		member, lookupErr := registry.LocalMember(dynamic)
+		if lookupErr != nil || member != 1 {
+			t.Fatalf("published local member=%d err=%v", member, lookupErr)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if version, ok := registry.ReplicaSetVersion(dynamic); !ok || version != 7 {
+		t.Fatalf("version=%d ok=%v", version, ok)
+	}
+	if node, lookupErr := registry.Node(dynamic, 3); lookupErr != nil || node != testNode(3) {
+		t.Fatalf("member node=%x err=%v", node, lookupErr)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		_, _ = registry.LocalMember(dynamic)
+		_, _ = registry.Node(dynamic, 2)
+		_, _ = registry.Member(dynamic, testNode(3))
+		_, _ = registry.Role(dynamic, 1)
+		_, _ = registry.ReplicaSetVersion(dynamic)
+	}); allocations != 0 {
+		t.Fatalf("dynamic hot lookups allocate: %.2f", allocations)
+	}
+	if err = registry.RemoveGroup(dynamic, func(withdraw func()) error {
+		if _, ok := registry.ReplicaSetVersion(dynamic); !ok {
+			t.Fatal("group absent before withdrawal")
+		}
+		withdraw()
+		return nil
+	}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, ok := registry.ReplicaSetVersion(dynamic); ok {
+		t.Fatal("removed group retained authority")
+	}
+}
+
 func TestStaticRegistryRequiresOneNonemptyTrustDomain(t *testing.T) {
 	limits := Limits{MaxGroups: 2, MaxMembers: 2}
 	if _, err := NewStaticRegistry(testNode(1), nil, limits); !errors.Is(err, ErrInvalidGroup) {

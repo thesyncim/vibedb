@@ -308,10 +308,10 @@ func TestResolvePointTargetBoundariesAndFence(t *testing.T) {
 		p    KeyspacePoint
 		want Target
 	}{
-		{"minimum", KeyspacePoint{}, Target{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
-		{"left of boundary", pt(hb(0x80) - 1), Target{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
-		{"boundary belongs right", mid, Target{Shard: "s1", AllocationGeneration: 2, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
-		{"maximum", pt(^uint64(0)), Target{Shard: "s1", AllocationGeneration: 2, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
+		{"minimum", KeyspacePoint{}, Target{Shard: "s0", AllocationGeneration: 1, ManifestOrdinal: 0, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
+		{"left of boundary", pt(hb(0x80) - 1), Target{Shard: "s0", AllocationGeneration: 1, ManifestOrdinal: 0, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}},
+		{"boundary belongs right", mid, Target{Shard: "s1", AllocationGeneration: 2, ManifestOrdinal: 1, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
+		{"maximum", pt(^uint64(0)), Target{Shard: "s1", AllocationGeneration: 2, ManifestOrdinal: 1, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

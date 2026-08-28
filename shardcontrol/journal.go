@@ -42,7 +42,7 @@ type JournalLimits struct {
 
 func (limits JournalLimits) valid() bool {
 	return limits.MaxRecords > 0 && limits.MaxRecords <= 1<<20 &&
-		limits.MaxFileBytes >= int64(journalHeaderBytes+5+requestFixedBodyBytes) &&
+		limits.MaxFileBytes >= int64(journalHeaderBytes+frameHeaderBytes+requestFixedBodyBytes) &&
 		limits.MaxFileBytes <= 1<<40
 }
 
@@ -128,7 +128,7 @@ func (executor *JournalExecutor) recover() error {
 		}
 		payloadBytes := int64(binary.LittleEndian.Uint32(header[8:12]))
 		entryBytes := int64(journalHeaderBytes) + payloadBytes + 4
-		if payloadBytes <= 0 || payloadBytes > int64(5+maxFrameBodyBytes) || entryBytes > remaining {
+		if payloadBytes <= 0 || payloadBytes > int64(frameHeaderBytes+maxFrameBodyBytes) || entryBytes > remaining {
 			if entryBytes > remaining {
 				return executor.truncateTail(offset)
 			}

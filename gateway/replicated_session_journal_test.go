@@ -90,6 +90,196 @@ func TestNativeSessionJournalRestartsAndRetriesExactPendingCommand(t *testing.T)
 	}
 }
 
+func TestNativeSessionRetireReleaseAndDestroyConvergesUnknownLifecycle(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	binding, err := NativeSessionJournalBinding(
+		route, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityTopology,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &nativeSessionClient{
+		state: states["m2"], unknownKind: replication.CommandSessionRetire,
+	}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journalOptions := NativeSessionJournalOptions{
+		Path: t.TempDir() + "/controller.session", ClientID: replication.ID128{0xa2},
+		RetryHome: replication.RetryHome{0xb2}, MaxCommandBytes: 1 << 20, Binding: binding,
+	}
+	sessionOptions := NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("controller"), ClientID: journalOptions.ClientID,
+		RetryHome: journalOptions.RetryHome, Resolver: BaseRelationResolver{Relation: 1},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 4,
+		InitialCommandBytes: 512, MaxCommandBytes: journalOptions.MaxCommandBytes,
+	}
+	journal, err := OpenNativeSessionJournal(journalOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionOptions.Journal = journal
+	session, err := NewNativeSession(sessionOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err = session.RetireReleaseAndDestroy(context.Background()); !errors.Is(err, raftservice.ErrOutcomeUnknown) || !session.Status().Pending {
+		t.Fatalf("unknown retire=%v status=%+v", err, session.Status())
+	}
+	wantRetire := session.PendingCommand()
+	present, err := NativeSessionJournalPresent(journalOptions.Path)
+	if err != nil || !present {
+		t.Fatalf("retire journal present=%v err=%v", present, err)
+	}
+
+	journal, err = OpenNativeSessionJournal(journalOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionOptions.Journal = journal
+	session, err = NewNativeSession(sessionOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unknownKind = replication.CommandSessionRelease
+	client.unknownKindSeen = false
+	client.retriedCommand = client.retriedCommand[:0]
+	if err = session.RetireReleaseAndDestroy(context.Background()); !errors.Is(err, raftservice.ErrOutcomeUnknown) || !session.Status().Pending ||
+		!bytes.Equal(client.retriedCommand, wantRetire) {
+		t.Fatalf("unknown release=%v status=%+v exact retire=%v",
+			err, session.Status(), bytes.Equal(client.retriedCommand, wantRetire))
+	}
+	wantRelease := session.PendingCommand()
+	journal, err = OpenNativeSessionJournal(journalOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionOptions.Journal = journal
+	session, err = NewNativeSession(sessionOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retriedCommand = client.retriedCommand[:0]
+	if err = session.RetireReleaseAndDestroy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(client.retriedCommand, wantRelease) {
+		t.Fatal("release retry changed its exact durable command")
+	}
+	present, err = NativeSessionJournalPresent(journalOptions.Path)
+	if err != nil || present {
+		t.Fatalf("released journal present=%v err=%v", present, err)
+	}
+
+	// Replicated Release reclaimed the identity, so a fresh journal and session
+	// can reuse the same client ID without carrying the old route binding.
+	replacementRoute := route
+	replacementRoute.Command.RouteGeneration++
+	replacementBinding, err := NativeSessionJournalBinding(
+		replacementRoute, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityTopology,
+	)
+	if err != nil || replacementBinding == binding {
+		t.Fatalf("replacement binding=%x original=%x err=%v",
+			replacementBinding, binding, err)
+	}
+	journalOptions.Binding = replacementBinding
+	sessionOptions.Route = replacementRoute
+	client.state.Fence.Command = replacementRoute.Command
+	journal, err = OpenNativeSessionJournal(journalOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionOptions.Journal = journal
+	fresh, err := NewNativeSession(sessionOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unknownKind = 0
+	if _, err = fresh.Open(context.Background(), 2000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeSessionRetireReleaseAndDestroyRetriesJournalRemoval(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	binding, err := NativeSessionJournalBinding(
+		route, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityTopology,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &nativeSessionClient{state: states["m2"]}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journalOptions := NativeSessionJournalOptions{
+		Path: t.TempDir() + "/controller.session", ClientID: replication.ID128{0xa3},
+		RetryHome: replication.RetryHome{0xb3}, MaxCommandBytes: 1 << 20, Binding: binding,
+	}
+	journal, err := OpenNativeSessionJournal(journalOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("controller"), ClientID: journalOptions.ClientID,
+		RetryHome: journalOptions.RetryHome, Resolver: BaseRelationResolver{Relation: 1},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 4,
+		InitialCommandBytes: 512, MaxCommandBytes: journalOptions.MaxCommandBytes,
+		Journal: journal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Retire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	blocked := journal.slotPath(0)
+	if err = os.Remove(blocked); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child := blocked + "/retained"
+	if err = os.WriteFile(child, []byte{1}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = session.RetireReleaseAndDestroy(context.Background()); err == nil {
+		t.Fatal("non-empty journal slot directory was silently removed")
+	}
+	if err = os.Remove(child); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Remove(blocked); err != nil {
+		t.Fatal(err)
+	}
+	if err = session.RetireReleaseAndDestroy(context.Background()); err != nil {
+		t.Fatalf("journal removal retry=%v", err)
+	}
+	present, err := NativeSessionJournalPresent(journalOptions.Path)
+	if err != nil || present {
+		t.Fatalf("journal present=%v err=%v", present, err)
+	}
+}
+
 func TestNativeSessionJournalCodecRejectsEveryTornOrCorruptRecord(t *testing.T) {
 	binding := replication.Digest{3}
 	state := durableNativeSessionState{

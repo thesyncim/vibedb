@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -481,6 +483,41 @@ func TestPreparedPlanCacheSkipsLargeSQL(t *testing.T) {
 	}
 	if snap.planCache.Load() != nil {
 		t.Fatal("oversized SQL allocated the lazy plan-cache directory")
+	}
+}
+
+func TestPreparedPlanCacheOwnsBoundedSQLBeforeParsing(t *testing.T) {
+	const text = `SELECT n FROM messages WHERE tenant_id = ? ORDER BY n LIMIT 5`
+	for _, offset := range []int{0, 64 << 10} {
+		snap := testSnapshot(t, 1)
+		input := make([]byte, 1<<20)
+		copy(input[offset:], text)
+		borrowed := unsafe.String(unsafe.SliceData(input[offset:]), len(text))
+		plan, err := snap.Prepare(t.Context(), borrowed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, hash := snap.cachedPreparedPlan(text)
+		entry := snap.planCache.Load().entries[hash&(preparedPlanCacheSlots-1)].Load()
+		// Inspect the parser's actual retained lexer source: checking only the
+		// cloned cache key would miss a full ingress buffer retained by lx.src.
+		source := reflect.ValueOf(&plan.parser).Elem().FieldByName("lx").FieldByName("src").String()
+		if source != text || entry.sql != text {
+			t.Fatal("cache/parser SQL mismatch")
+		}
+		if unsafe.StringData(source) == unsafe.StringData(borrowed) {
+			t.Fatal("cached parser retained borrowed ingress source")
+		}
+		if unsafe.StringData(source) != unsafe.StringData(entry.sql) {
+			t.Fatal("parser source and cache key do not share one owned SQL allocation")
+		}
+		clear(input)
+		if source != text || entry.sql != text {
+			t.Fatal("input reuse mutated cached SQL")
+		}
+		if _, err := plan.Bind([]any{"tenant"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

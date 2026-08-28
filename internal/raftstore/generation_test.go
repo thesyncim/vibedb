@@ -1207,10 +1207,10 @@ func TestGenerationSealCodecBindsEveryByte(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0x55, 0x73, 0x46, 0x2b, 0x7e, 0x07, 0x28, 0xe8,
-		0x54, 0x96, 0x5d, 0x2c, 0xc1, 0x51, 0x79, 0x84,
-		0xf0, 0x93, 0x60, 0x7a, 0xf7, 0x28, 0x7a, 0x1e,
-		0x68, 0xf4, 0x3b, 0x28, 0x99, 0xd0, 0x2a, 0x30,
+		0xf9, 0x89, 0xad, 0xe0, 0xc0, 0x42, 0x25, 0xf7,
+		0xf6, 0x76, 0x91, 0x3b, 0xfb, 0x4f, 0xaa, 0x0e,
+		0xf4, 0x90, 0x05, 0xd4, 0xb8, 0x97, 0x0f, 0x50,
+		0x62, 0x6a, 0x94, 0xcb, 0x26, 0x91, 0x9a, 0x3c,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
 		t.Fatalf("generation seal golden SHA-256 = %x, want %x", got, wantGolden)
@@ -1220,11 +1220,17 @@ func TestGenerationSealCodecBindsEveryByte(t *testing.T) {
 		t.Fatalf("generation seal round trip = %+v, %v", decoded, err)
 	}
 	for offset := range encoded {
+		if _, err := unmarshalGenerationSeal(encoded[:offset]); err == nil {
+			t.Fatalf("generation seal accepted truncation at byte %d", offset)
+		}
 		damaged := append([]byte(nil), encoded...)
 		damaged[offset] ^= 0x80
 		if _, err := unmarshalGenerationSeal(damaged); err == nil {
 			t.Fatalf("generation seal accepted damage at byte %d", offset)
 		}
+	}
+	if _, err := unmarshalGenerationSeal(append(encoded, 0)); err == nil {
+		t.Fatal("generation seal accepted trailing byte")
 	}
 }
 

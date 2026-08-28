@@ -57,6 +57,35 @@ type NativeSessionJournal struct {
 	binding    replication.Digest
 }
 
+// NativeSessionJournalPresent reports whether either durable slot exists. It
+// rejects symlinks, non-regular entries, and two names aliased to one inode so
+// startup recovery cannot mistake corrupt local authority for a clean release.
+func NativeSessionJournalPresent(path string) (bool, error) {
+	if path == "" {
+		return false, ErrNativeSessionJournal
+	}
+	var entries [2]os.FileInfo
+	found := false
+	for slot := 0; slot < len(entries); slot++ {
+		info, err := os.Lstat(path + "." + string(rune('0'+slot)))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.Mode().IsRegular() {
+			return false, ErrNativeSessionJournal
+		}
+		entries[slot] = info
+		found = true
+	}
+	if entries[0] != nil && entries[1] != nil && os.SameFile(entries[0], entries[1]) {
+		return false, ErrNativeSessionJournal
+	}
+	return found, nil
+}
+
 func OpenNativeSessionJournal(options NativeSessionJournalOptions) (*NativeSessionJournal, error) {
 	if options.Path == "" || options.ClientID == (replication.ID128{}) ||
 		options.Binding == (replication.Digest{}) ||
@@ -116,6 +145,39 @@ func (journal *NativeSessionJournal) slotPath(slot int) string {
 		return journal.base + ".0"
 	}
 	return journal.base + ".1"
+}
+
+// destroyReleased removes a fully retired session journal only after its
+// replicated release settled. Directory fsync makes the absence durable; an
+// outcome-unknown or active session can never enter this path.
+func (journal *NativeSessionJournal) destroyReleased() error {
+	if journal == nil {
+		return ErrNativeSessionJournal
+	}
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	if journal.state.phase != nativeSessionReleased || journal.state.pending {
+		return ErrNativeSessionJournal
+	}
+	var joined error
+	for slot := 0; slot < 2; slot++ {
+		if err := os.Remove(journal.slotPath(slot)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			joined = errors.Join(joined, err)
+		}
+	}
+	directory, err := os.Open(filepath.Dir(journal.base))
+	if err == nil {
+		err = directory.Sync()
+		joined = errors.Join(joined, err, directory.Close())
+	} else {
+		joined = errors.Join(joined, err)
+	}
+	if joined == nil {
+		journal.active = -1
+		journal.generation = 0
+		journal.state = durableNativeSessionState{}
+	}
+	return joined
 }
 
 func (journal *NativeSessionJournal) load() (durableNativeSessionState, error) {

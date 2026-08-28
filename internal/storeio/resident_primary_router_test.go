@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -102,6 +103,29 @@ func TestResidentPrimaryRouterAdvanceGenerationLeavesRoutesUnchanged(
 	}
 }
 
+func TestResidentPrimaryRouterNextTabletIDFromAuthenticatedRoutes(t *testing.T) {
+	router := residentPrimaryRouterGenerationTestFixture(t)
+	for rank, tabletID := range []uint32{2, 0, 1} {
+		bucket, ok := MakeTabletLocalIdentityBucket(tabletID, uint32(100+rank))
+		if !ok {
+			t.Fatal("make routed tablet bucket")
+		}
+		at := rank * residentPrimaryRouterWords
+		router.rows[at+3] = uint64(uint32(router.rows[at+3])) |
+			uint64(bucket)<<32
+	}
+	if got, ok := router.NextTabletID(); !ok || got != 3 {
+		t.Fatalf("next tablet ID = %d,%v, want 3,true", got, ok)
+	}
+	last, _ := MakeTabletLocalIdentityBucket(
+		TabletLocalIdentityTabletCount-1, 7,
+	)
+	router.rows[3] = uint64(uint32(router.rows[3])) | uint64(last)<<32
+	if got, ok := router.NextTabletID(); ok || got != 0 {
+		t.Fatalf("exhausted next tablet ID = %d,%v, want 0,false", got, ok)
+	}
+}
+
 func TestResidentPrimaryRouterSplitLeafSplicesWithoutGraphWalk(t *testing.T) {
 	router := residentPrimaryRouterGenerationTestFixture(t)
 	route, ok := router.Route([]byte("mango"))
@@ -154,6 +178,71 @@ func TestResidentPrimaryRouterSplitLeafSplicesWithoutGraphWalk(t *testing.T) {
 		}
 	}) > 8 {
 		t.Fatal("split splice exceeded fixed array allocation count")
+	}
+}
+
+func TestResidentPrimaryRouterRemoveLeafSplicesWithoutGraphWalk(t *testing.T) {
+	router := residentPrimaryRouterGenerationTestFixture(t)
+	middle, ok := router.Route([]byte("mango"))
+	if !ok || middle.Bucket != 101 {
+		t.Fatalf("middle route = %+v,%v", middle, ok)
+	}
+	next, err := router.RemoveLeaf(middle, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Len() != 2 || next.Generation() != 101 ||
+		router.Len() != 3 || router.Generation() != 100 {
+		t.Fatalf("router cardinality/generation = %d/%d old=%d/%d",
+			next.Len(), next.Generation(), router.Len(), router.Generation())
+	}
+	for _, test := range []struct {
+		key    string
+		bucket BucketID
+	}{{"alpha", 100}, {"mango", 100}, {"zulu", 102}} {
+		got, routeOK := next.Route([]byte(test.key))
+		if !routeOK || got.Bucket != test.bucket {
+			t.Fatalf("route %q = %+v,%v", test.key, got, routeOK)
+		}
+	}
+	if _, err := router.RemoveLeaf(middle, 100); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("stale generation error = %v", err)
+	}
+	if got := testing.AllocsPerRun(100, func() {
+		spliced, removeErr := router.RemoveLeaf(middle, 101)
+		if removeErr != nil || spliced.Len() != 2 {
+			panic("remove splice")
+		}
+	}); got > 8 {
+		t.Fatalf("remove splice allocations = %v, want <= 8", got)
+	}
+}
+
+func TestResidentPrimaryRouterRemoveFirstLeafPromotesEmptyFloor(t *testing.T) {
+	router := residentPrimaryRouterGenerationTestFixture(t)
+	first := mustResidentRoute(t, router, 0)
+	next, err := router.RemoveLeaf(first, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Len() != 2 || len(next.fence(0)) != 0 {
+		t.Fatalf("next first floor/cardinality = %q/%d", next.fence(0), next.Len())
+	}
+	for _, key := range []string{"alpha", "mango"} {
+		got, ok := next.Route([]byte(key))
+		if !ok || got.Bucket != 101 {
+			t.Fatalf("route %q = %+v,%v", key, got, ok)
+		}
+	}
+	one := &ResidentPrimaryRouter{
+		storeID: router.storeID,
+		rows:    slices.Clone(router.rows[:residentPrimaryRouterWords]),
+		hints:   make([]pageCacheFrameHint, 1),
+		empty:   make([]atomic.Uint32, 1),
+	}
+	one.generation.Store(100)
+	if _, err := one.RemoveLeaf(mustResidentRoute(t, one, 0), 101); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("singleton removal error = %v", err)
 	}
 }
 

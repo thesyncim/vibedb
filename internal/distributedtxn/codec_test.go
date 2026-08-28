@@ -24,7 +24,7 @@ func authorityWitness(value string) AuthorityWitness {
 func TestCoordinatorRoundTripAndBorrowing(t *testing.T) {
 	record := CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 9,
-		RecoveryDeadline: 1234,
+		RecoveryDeadline: 3,
 		Participants: []ParticipantRef{
 			{Distribution: []byte("docs"), Shard: []byte("-80"), RoutingVersion: 7, AllocationGeneration: 2, OwnershipEpoch: 3, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: ParticipantStaged},
 			{Distribution: []byte("docs"), Shard: []byte("80-"), RoutingVersion: 7, AllocationGeneration: 4, OwnershipEpoch: 5, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: ParticipantStaged},

@@ -76,6 +76,21 @@ An unresolved conditional transaction record makes a standalone collection
 return `ErrCollectionInDoubt`. Open the complete database directory so the
 decision log and all participants can be reconciled.
 
+Replicated SQL seals role-specific recovery record regions:
+
+| Role | Sealed record-region capacity |
+| --- | --- |
+| User relation | 16 MiB + 34 × 512 bytes = 16,794,624 bytes |
+| Request-ledger system relation | 16 MiB + 60 × 512 bytes = 16,807,936 bytes |
+
+The shared recovery allocation ceiling is 16,807,936 bytes. It accounts for
+the ledger's 258-record profile, maximum key widths, conditional-record
+framing, checksum, and sector padding. It does not enlarge the user-relation
+journal: that sidecar contract remains fixed at 16,794,624 bytes. Recovery
+rejects a header requesting more than the shared ceiling before allocating
+its record buffer. These capacities describe the record region, not total
+sidecar file size or a transaction participant limit.
+
 ## Root publication
 
 The file has two alternate roots. The selected root is the canonical physical
@@ -134,6 +149,26 @@ before it refuses a mutation. A refused mutation is not published.
 
 Active snapshots can also make close retryable.
 
+## Online compaction and space bounds
+
+`store/durable.Collection.CompactOnline` migrates one selected generation into
+authenticated adaptive staging extents, rebuilds exact indexes, conditionally
+publishes the new root, and retires the old source, catalog, scratch, chain,
+and manifest extents. A crash reopens either the old serving root or the exact
+resumable staging chain. It does not expose a partly migrated generation.
+
+Compaction is explicit and single-flight. It rejects checkpoint-group-owned
+collections, and checkpoint-group activation cannot attach while a compaction
+is in flight. Reservation, growth, and retirement recheck that ownership.
+The shipped RF3 path does not enable whole-file compaction automatically.
+
+The qualification test jointly bounds peak apparent growth, newly allocated
+filesystem blocks, accounted staging payload, extent count, and foreground
+write latency for mixed inline/overflow documents with an exact index. Its
+device-byte counter does not include direct 4 KiB manifest-slot rewrites, so it
+must not be presented as exact physical device write amplification. Measure
+physical writes at the host/device boundary for competitive claims.
+
 ## Platform barriers
 
 The power-safe checkpoint uses the strongest implemented platform primitive.
@@ -165,6 +200,7 @@ The public API does not define a safe live raw-file backup procedure.
 - `store/durable/store_file_durability.go`
 - `store/durable/store_file_lifecycle.go`
 - `store/durable/store_file_open.go`
+- `store/durable/store_file_online_compact.go`
 - `internal/storeio/recovery_journal.go`
 - `store/durable/store_database_txn.go`
 - `internal/storeio/txn_marker.go`

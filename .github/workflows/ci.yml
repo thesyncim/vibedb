@@ -9,6 +9,120 @@ concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  repository-contracts:
+    name: repository contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Reject stale generated contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go generate ./internal/buildgate ./internal/featurestate
+          (cd bench/competitive && go generate .)
+          git diff --exit-code -- \
+            internal/buildgate/manifest_generated.go \
+            docs/distributed-feature-state.md \
+            bench/competitive/COVERAGE.md
+      - name: Require complete competitive evidence matrix
+        working-directory: bench/competitive
+        run: go test -count=1 ./internal/coverage ./cmd/publishcheck
+      - name: Validate deterministic Kubernetes RF3 topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          ids='11000000000000000000000000000000,12000000000000000000000000000000,13000000000000000000000000000000,21000000000000000000000000000000,22000000000000000000000000000000,23000000000000000000000000000000,31000000000000000000000000000000,32000000000000000000000000000000,33000000000000000000000000000000'
+          first="${RUNNER_TEMP}/vibedb-kubernetes-first.yaml"
+          second="${RUNNER_TEMP}/vibedb-kubernetes-second.yaml"
+          go run ./cmd/vibedb-operator render -image "vibedb:${GITHUB_SHA}" -namespace vibedb-test -shard-node-ids "${ids}" > "${first}"
+          go run ./cmd/vibedb-operator render -image "vibedb:${GITHUB_SHA}" -namespace vibedb-test -shard-node-ids "${ids}" > "${second}"
+          cmp "${first}" "${second}"
+          go run ./cmd/vibedb-operator validate -manifest "${first}"
+  kubernetes-rf3:
+    name: Kubernetes RF3 serving and restart qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Install pinned Kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Qualify three-worker RF3 topology
+        env:
+          VIBEDB_KUBE_EVIDENCE_DIR: ${{ runner.temp }}/vibedb-kube-rf3-evidence
+        run: deploy/kubernetes/qualify-kind.sh
+      - name: Upload Kubernetes RF3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-rf3-${{ github.sha }}
+          path: ${{ runner.temp }}/vibedb-kube-rf3-evidence
+          if-no-files-found: error
+          retention-days: 30
+  restore-activation:
+    name: Fresh RF3 restore activation crash qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Run every external activation publication cut
+        shell: bash
+        env:
+          VIBEDB_RESTORE_ACTIVATION_E2E: "1"
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/restore-activation"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          test_name='TestActivationExternalProcessRecoversEveryPublicationCutWithinBounds'
+          go test -json -count=3 -timeout=3m -run "^${test_name}$" ./internal/clusterrestore \
+            | tee "${evidence}/go-test.jsonl"
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
+          if jq -se --arg test_name "${test_name}" \
+            'any(.[]; .Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "restore activation qualification skipped" >&2
+            exit 1
+          fi
+          grep -F 'restore_activation_evidence cuts=6' "${evidence}/go-test.jsonl" >/dev/null
+      - name: Build three authority-free SQL roots per restored group
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/restore-activation"
+          test_name='TestGroupInstallerBuildsAndRecoversThreeAuthorityFreeRoots'
+          go test -json -count=3 -timeout=3m -run "^${test_name}$" ./internal/restoreservice \
+            | tee "${evidence}/group-installer.jsonl"
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/group-installer.jsonl" | wc -l)" -eq 3
+          if jq -se --arg test_name "${test_name}" \
+            'any(.[]; .Action == "skip" and .Test == $test_name)' \
+            "${evidence}/group-installer.jsonl" >/dev/null; then
+            echo "restore group installer qualification skipped" >&2
+            exit 1
+          fi
+      - name: Upload restore activation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-activation-${{ github.sha }}
+          path: ${{ runner.temp }}/restore-activation
+          if-no-files-found: error
+          retention-days: 30
   test:
     name: test (${{ matrix.runner }})
     strategy:
@@ -31,11 +145,286 @@ jobs:
           GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...
           (cd integration/pgclient && GOOS=linux GOARCH=386 go test -run '^$' -exec=true ./...)
           (cd integration/pgclient && GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...)
+      - name: Cross-compile Windows 64-bit packages and tests
+        if: matrix.runner == 'ubuntu-latest'
+        env:
+          CGO_ENABLED: 0
+        run: |
+          GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./...
+          GOOS=windows GOARCH=arm64 go test -run '^$' -exec=true ./...
+          (cd integration/pgclient && GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./...)
+          (cd integration/pgclient && GOOS=windows GOARCH=arm64 go test -run '^$' -exec=true ./...)
       - name: Tests
         # Durable-backed package tests reserve large mmap arenas. Serializing
         # package binaries keeps the aggregate virtual-memory reservation
         # deterministic without reducing test coverage or per-package timeouts.
         run: go test -p=1 -timeout=25m ./...
+      - name: Prepare durable SQL RF3 recovery qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/durable-sql-rf3"
+          test_root="${RUNNER_TEMP}/durable-sql-rf3-tmp"
+          mkdir -p "${evidence}"
+          mkdir -p "${test_root}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${test_root}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${test_root}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions'
+          go test -list "^${test_name}$" ./internal/raftservice > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'TMPDIR=%s VIBEDB_DURABLE_SQL_RF3_E2E=1 go test -json -count=3 -timeout=8m -run %s ./internal/raftservice\n' \
+            "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Durable SQL RF3 terminal and ACK recovery qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/durable-sql-rf3-tmp
+          VIBEDB_DURABLE_SQL_RF3_E2E: "1"
+        run: |
+          set -euo pipefail
+          go test -json -count=3 -timeout=8m \
+            -run '^TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions$' \
+            ./internal/raftservice \
+            | tee "${RUNNER_TEMP}/durable-sql-rf3/go-test.jsonl"
+      - name: Validate durable SQL RF3 recovery evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/durable-sql-rf3"
+          test_name='TestTwoGatewayDurableSQLRF3RecoversTerminalAndAckAcrossLeaderPartitions'
+          test -s "${evidence}/go-test.jsonl"
+          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 50331648
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
+          if jq -se --arg test_name "${test_name}" \
+            'any(.[]; .Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "durable SQL RF3 recovery qualification skipped" >&2
+            exit 1
+          fi
+          summary="${evidence}/summary.tsv"
+          printf 'schema\tvibedb.durable-sql-rf3-recovery\t1\nresult\tpass\nrevision\t%s\nruns\t3\n' \
+            "$(cat "${evidence}/revision.txt")" > "${summary}"
+          test "$(stat -c %s "${summary}")" -le 65536
+      - name: Upload durable SQL RF3 recovery evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-sql-rf3-${{ github.sha }}
+          path: ${{ runner.temp }}/durable-sql-rf3
+          if-no-files-found: error
+          retention-days: 30
+      - name: Prepare replica-replacement qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/replica-replacement"
+          mkdir -p "${evidence}/runs"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${RUNNER_TEMP}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${RUNNER_TEMP}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${evidence}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestGatewayAutomaticReplicaReplacementProcesses'
+          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=3 -timeout=8m -run %s ./cmd/vibedb-gateway\n' \
+            "${evidence}/runs" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Automatic replica-replacement process qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          VIBEDB_REPLICA_REPLACEMENT_E2E: "1"
+          VIBEDB_REPLICA_REPLACEMENT_EVIDENCE: ${{ runner.temp }}/replica-replacement/runs
+        run: |
+          set -euo pipefail
+          go test -json -count=3 -timeout=8m \
+            -run '^TestGatewayAutomaticReplicaReplacementProcesses$' \
+            ./cmd/vibedb-gateway \
+            | tee "${RUNNER_TEMP}/replica-replacement/go-test.jsonl"
+      - name: Validate replica-replacement evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/replica-replacement"
+          test_name='TestGatewayAutomaticReplicaReplacementProcesses'
+          test -s "${evidence}/go-test.jsonl"
+          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 50331648
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
+          if jq -se --arg test_name "${test_name}" \
+            'any(.[]; .Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "replica replacement qualification skipped" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          runs=("${evidence}"/runs/run-*.tsv)
+          test "${#runs[@]}" -eq 3
+          for result in "${runs[@]}"; do
+            test -s "${result}"
+            test "$(stat -c %s "${result}")" -le 65536
+            grep -Fqx $'schema\tvibedb.replica-replacement-process\t2' "${result}"
+            grep -Fqx $'result\tpass' "${result}"
+            grep -Fqx $'phase\tterminal_reopen_verified' "${result}"
+          done
+          summary="${evidence}/summary.tsv"
+          printf 'schema\tvibedb.replica-replacement-summary\t1\nmetric\tp50\tp99\tmax\tmaximum\n' > "${summary}"
+          while read -r metric maximum; do
+            mapfile -t values < <(awk -F $'\t' -v metric="${metric}" \
+              '$1 == "metric" && $2 == metric {print $3}' "${runs[@]}" | sort -n)
+            test "${#values[@]}" -eq 3
+            p50="${values[1]}"
+            p99="${values[2]}"
+            max_value="${values[2]}"
+            test "${max_value}" -le "${maximum}"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "${metric}" "${p50}" "${p99}" "${max_value}" "${maximum}" >> "${summary}"
+          done <<'EOF'
+          failover_millis 30000
+          move_set_admission_millis 30000
+          controller_restart_millis 15000
+          replacement_millis 90000
+          group_replacement_p50_millis 90000
+          group_replacement_p99_millis 90000
+          group_replacement_max_millis 90000
+          cleanup_millis 60000
+          abandonment_rename_restart_millis 15000
+          abandonment_unlink_restart_millis 15000
+          abandonment_control_payload_bytes 4096
+          abandonment_retained_bytes 0
+          snapshot_network_payload_bytes 1073741824
+          max_rss_bytes 8589934592
+          storage_growth_bytes 2147483648
+          wal_growth_bytes 536870912
+          non_wal_storage_growth_bytes 67108864
+          EOF
+          test "$(stat -c %s "${summary}")" -le 65536
+      - name: Upload replica-replacement evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-replacement-${{ github.sha }}
+          path: ${{ runner.temp }}/replica-replacement
+          if-no-files-found: error
+          retention-days: 30
+      - name: Prepare write-driven hot-shard qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/hot-shard-mutation"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          test_name='TestGatewayHotShardMutationProcesses'
+          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+      - name: Write-driven hot-shard process qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          VIBEDB_HOT_SHARD_MUTATION_E2E: "1"
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout=6m \
+            -run '^TestGatewayHotShardMutationProcesses$' \
+            ./cmd/vibedb-gateway \
+            | tee "${RUNNER_TEMP}/hot-shard-mutation/go-test.jsonl"
+      - name: Validate write-driven hot-shard evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/hot-shard-mutation"
+          result="${evidence}/go-test.jsonl"
+          test_name='TestGatewayHotShardMutationProcesses'
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 16777216
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${result}" | wc -l)" -eq 1
+          if jq -se --arg test_name "${test_name}" \
+            'any(.[]; .Action == "skip" and .Test == $test_name)' \
+            "${result}" >/dev/null; then
+            echo "write-driven hot-shard qualification skipped" >&2
+            exit 1
+          fi
+          jq -se --arg test_name "${test_name}" \
+            'any(.[]; .Action == "output" and .Test == $test_name and
+              (.Output | contains("write-driven hot move:") and
+                contains("atomic_relation_index_visibility=true") and
+                contains("leader_kill=true") and
+                contains("response_partition=true") and
+                contains("reopen=true") and
+                contains("p99=") and
+                contains("rss_growth=") and
+                contains("storage_growth=") and
+                contains("snapshot_network_growth=")))' \
+            "${result}" >/dev/null
+      - name: Upload write-driven hot-shard evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hot-shard-mutation-${{ github.sha }}
+          path: ${{ runner.temp }}/hot-shard-mutation
+          if-no-files-found: error
+          retention-days: 30
+      - name: RF3 external-process fault evidence
+        if: matrix.runner == 'ubuntu-latest'
+        run: |
+          rf3_evidence_path="${RUNNER_TEMP}/rf3-chaos.tsv"
+          go run ./bench/rf3chaos -output "${rf3_evidence_path}" -runs 1 -timeout 5m
+          test -s "${rf3_evidence_path}"
+          grep -F $'schema\tvibedb.rf3.chaos-evidence\t2' "${rf3_evidence_path}"
+          grep -F $'summary\tpassed\t1\tfailed\t0' "${rf3_evidence_path}"
+          sed -n '1,50p' "${rf3_evidence_path}"
+      - name: Authenticated transport fault and throughput evidence
+        if: matrix.runner == 'ubuntu-latest'
+        run: |
+          go test ./gateway -run '^TestAuthorizedClientTLSNetworkChaosAndThroughputGate$' -count=1 -v
+          go test ./gateway -run '^TestAuthenticated(GatewayShardHotAuthorizationAllocationFree|ShardBoundaryRotationAndConfusedDeputyFault)$' -count=1 -v
+          VIBEDB_AUTH_TRANSPORT_PROCESS_E2E=1 go test ./gateway -run '^TestAuthenticatedGatewayShardProcessPartitionRotationAndDeputyFaults$' -count=3 -v
+          go test ./gateway -run '^$' -bench '^BenchmarkAuthorizedClientTLSRequest$' -benchtime=2000x -count=1
+          go test ./gateway -run '^$' -bench '^BenchmarkAuthenticatedGatewayShardStream$' -benchtime=2000x -count=1
+      - name: RF3 exhaustive quorum and multi-group scaling evidence
+        if: matrix.runner == 'ubuntu-latest'
+        env:
+          VIBEDB_RF3_QUORUM_QUALIFICATION: "1"
+        run: |
+          go test ./internal/raftservice -run '^TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit$' -count=1 -v
+          go test ./internal/multiraft -run '^$' -bench '^BenchmarkExecutionLanes(Scaling|SixtyFourGroups|HotShardIsolation)$' -benchtime=1000x -count=1
       - name: PostgreSQL client integration
         if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient
@@ -60,3 +449,24 @@ jobs:
           go-version: '1.26'
       - name: Focused LATERAL race tests
         run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
+  distributed-race:
+    name: race (distributed serving)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Distributed serving race tests
+        # External qualification corpora have dedicated no-skip Linux jobs in
+        # the test matrix. This lane instruments the serving, quorum, durable
+        # ledger, and snapshot concurrency paths without duplicating those
+        # multi-process resource gates under race overhead.
+        run: >-
+          go test -race -p=1 -count=1 -timeout=30m
+          ./gateway
+          ./internal/multiraft
+          ./internal/raftservice
+          ./internal/replicatedstate
+          ./internal/snapshottransfer

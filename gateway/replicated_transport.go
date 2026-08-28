@@ -508,7 +508,8 @@ func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, e
 
 func replicatedCapabilityUsesControlReserve(capability serviceauthz.Capability) bool {
 	return capability&(serviceauthz.CapabilitySchema|serviceauthz.CapabilityMembership|
-		serviceauthz.CapabilityTopology|serviceauthz.CapabilityTransactionRecovery) != 0
+		serviceauthz.CapabilityTopology|serviceauthz.CapabilityTransactionRecovery|
+		serviceauthz.CapabilityRequestLedger|serviceauthz.CapabilityExecutionPin) != 0
 }
 
 // RotateTLS atomically publishes a new profile and drains every idle stream.

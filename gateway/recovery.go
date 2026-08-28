@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	ErrRecoveryNotReady           = errors.New("gateway: distributed transaction recovery deadline has not elapsed")
+	ErrRecoveryNotReady           = errors.New("gateway: distributed transaction logical recovery lease has not advanced")
 	errRecoveryManifestIncomplete = errors.New("gateway: distributed transaction manifest is incomplete")
 )
 
@@ -37,7 +37,8 @@ type recoveryCoordinator struct {
 
 // RecoverTransaction locates id's coordinator in the pinned catalog and
 // redrives its monotone state machine. A missing participant may force abort
-// only after the coordinator's recovery deadline and before a commit decision.
+// only after the coordinator's bounded replicated pulse lease and before a
+// commit decision.
 func (e *Executor) RecoverTransaction(ctx context.Context, id distributedtxn.ID) (RecoveryResult, error) {
 	if id.IsZero() {
 		return RecoveryResult{}, ErrTransactionNotFound
@@ -137,6 +138,13 @@ func transactionCatalogCalls(snapshot *Snapshot, profile Profile) ([]shardCall, 
 			if !ok || len(shard.Leaders) == 0 {
 				return nil, ErrTransactionConflict
 			}
+			// This scanner speaks only the legacy shard-local journal protocol.
+			// RF3 recovery reads its replicated hidden relations through the native
+			// durable-request runner. A catalog may contain both authorities; never
+			// send a legacy SQL-service request to a native RF3 endpoint.
+			if _, replicated := snapshot.replicatedShardAt(manifest.Distribution(), shard.ID); replicated {
+				continue
+			}
 			address, err := snapshot.Address(shard.Leaders[0])
 			if err != nil {
 				return nil, err
@@ -200,8 +208,12 @@ func (e *Executor) recoverInlineCoordinator(
 	switch reply.CoordinatorState {
 	case distributedtxn.CoordinatorStaging:
 		if missing != 0 {
-			if time.Now().UnixNano() < record.RecoveryDeadline {
-				return result, ErrRecoveryNotReady
+			ready, pulseErr := e.advanceRecoveryPulse(
+				ctx, coordinator, record.ID, reply.Revision, reply.RecoveryPulse,
+				record.RecoveryDeadline, profile,
+			)
+			if pulseErr != nil || !ready {
+				return result, errors.Join(pulseErr, ErrRecoveryNotReady)
 			}
 			if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
 				return result, transactionAbortFailure(record.ID, nil, err)
@@ -350,8 +362,12 @@ func (e *Executor) recoverManifestCoordinator(
 	if err != nil {
 		if errors.Is(err, errRecoveryManifestIncomplete) &&
 			reply.CoordinatorState == distributedtxn.CoordinatorStaging {
-			if time.Now().UnixNano() < record.RecoveryDeadline {
-				return result, ErrRecoveryNotReady
+			ready, pulseErr := e.advanceRecoveryPulse(
+				ctx, coordinator, record.ID, reply.Revision, reply.RecoveryPulse,
+				record.RecoveryDeadline, profile,
+			)
+			if pulseErr != nil || !ready {
+				return result, errors.Join(pulseErr, ErrRecoveryNotReady)
 			}
 			if abortErr := e.abortIncompleteRecoveryManifest(
 				ctx, coordinator, record.ID, profile,
@@ -396,8 +412,14 @@ func (e *Executor) recoverManifestCoordinator(
 	switch reply.CoordinatorState {
 	case distributedtxn.CoordinatorStaging:
 		if readSummary.missing != 0 || readSummary.aborted {
-			if readSummary.missing != 0 && time.Now().UnixNano() < record.RecoveryDeadline {
-				return result, ErrRecoveryNotReady
+			if readSummary.missing != 0 {
+				ready, pulseErr := e.advanceRecoveryPulse(
+					ctx, coordinator, record.ID, reply.Revision, reply.RecoveryPulse,
+					record.RecoveryDeadline, profile,
+				)
+				if pulseErr != nil || !ready {
+					return result, errors.Join(pulseErr, ErrRecoveryNotReady)
+				}
 			}
 			if err := e.abortRecoveryManifest(
 				ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
@@ -459,6 +481,41 @@ func (e *Executor) recoverManifestCoordinator(
 		return result, &CommittedTransactionError{ID: record.ID, Cause: err}
 	}
 	return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, 2, result, profile)
+}
+
+func (e *Executor) advanceRecoveryPulse(
+	ctx context.Context,
+	coordinator recoveryCoordinator,
+	id distributedtxn.ID,
+	revision uint64,
+	observed uint8,
+	limitValue int64,
+	profile Profile,
+) (bool, error) {
+	if limitValue <= 0 || limitValue > int64(distributedtxn.MaxRecoveryPulses) ||
+		observed > uint8(limitValue) {
+		return false, ErrTransactionConflict
+	}
+	limit := uint8(limitValue)
+	if observed >= limit {
+		return true, nil
+	}
+	next := observed + 1
+	request := transactionRequest(
+		coordinator.call.req, profile, shardservice.TransactionPulseCoordinator,
+		id, revision, nil,
+	)
+	request.Transaction.RecoveryPulse = next
+	response, err := e.transactionRoundTrip(ctx, coordinator.call.address, request, profile)
+	if err != nil {
+		return false, err
+	}
+	if response.Transaction.ID != id || response.Transaction.Revision != revision ||
+		response.Transaction.CoordinatorState != distributedtxn.CoordinatorStaging ||
+		response.Transaction.RecoveryPulse < next || response.Transaction.RecoveryPulse > limit {
+		return false, ErrTransactionConflict
+	}
+	return response.Transaction.RecoveryPulse >= limit, nil
 }
 
 func manifestParticipantCount(descriptor distributedtxn.ManifestDescriptor) int {
@@ -959,7 +1016,7 @@ func (e *Executor) retireRecoveredCoordinator(
 	return result, nil
 }
 
-// RecoverAll scans every current shard's bounded coordinator index and redrives
+// RecoverAll scans each legacy shard's bounded coordinator index and redrives
 // each active identity once. The first error is joined after independent work
 // continues; not-yet-expired incomplete transactions are left for a later pass.
 func (e *Executor) RecoverAll(ctx context.Context) ([]RecoveryResult, error) {

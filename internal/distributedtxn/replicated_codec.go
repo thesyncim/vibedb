@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	replicatedCommandHeaderBytes   = 128
+	replicatedCommandHeaderBytes   = 168
 	replicatedCommandChecksumBytes = 4
 	// ReplicatedManifestCoordinatorRecordBytes is the exact VTCM prefix length
 	// in a manifest-start payload. A canonical sequence of one through
@@ -34,6 +34,9 @@ const (
 	MaxReplicatedCommandBytes = replicatedCommandHeaderBytes +
 		MaxIntentScopes*8 + ReplicatedManifestCoordinatorRecordBytes +
 		MaxManifestSegmentSequenceBytes + replicatedCommandChecksumBytes
+	// MaxRecoveryPulses bounds both replicated work and journal retention for
+	// one abandoned coordinator. The shipped protocol uses this exact limit.
+	MaxRecoveryPulses = uint8(3)
 )
 
 var replicatedCommandMagic = [4]byte{'V', 'T', 'R', 'C'}
@@ -72,6 +75,11 @@ const (
 	ReplicatedStagePrepareParticipant
 	ReplicatedApplyReleaseParticipant
 	ReplicatedAbortReleaseParticipant
+	// ReplicatedPulseCoordinator advances the bounded logical recovery lease.
+	// It never changes the transaction revision or decision; a later abort is
+	// authorized only after the durable pulse reaches the coordinator record's
+	// recovery limit.
+	ReplicatedPulseCoordinator
 )
 
 // ReplicatedPayloadKind binds the control body to one existing canonical
@@ -124,6 +132,15 @@ type ReplicatedCommand struct {
 	PayloadKind      ReplicatedPayloadKind
 	Payload          []byte
 	Participant      ParticipantStage
+	// RecoveryPulse is populated only by ReplicatedPulseCoordinator and is the
+	// exact next durable pulse value. It occupies a previously reserved header
+	// byte, so the bounded command size is unchanged.
+	RecoveryPulse uint8
+	// ControllerEpoch is the monotonic logical execution-pin lease epoch. Every
+	// transaction transition carries it together with the immutable aggregate
+	// pin digest so participant apply can reject a stale controller locally.
+	ControllerEpoch    uint64
+	ExecutionPinDigest Digest
 }
 
 // ReplicatedCommandView is checksum- and semantics-validated. Payload aliases
@@ -439,8 +456,11 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	binary.LittleEndian.PutUint64(out[80:88], command.Participant.CoordinatorAllocation)
 	copy(out[88:120], command.Participant.MutationDigest[:])
 	out[120] = command.Participant.BucketBits
+	out[121] = command.RecoveryPulse
 	binary.LittleEndian.PutUint16(out[122:124], uint16(len(command.Participant.IntentScopes)))
 	binary.LittleEndian.PutUint32(out[124:128], command.Participant.ParticipantOrdinal)
+	binary.LittleEndian.PutUint64(out[128:136], command.ControllerEpoch)
+	copy(out[136:168], command.ExecutionPinDigest[:])
 	cursor := replicatedCommandHeaderBytes
 	for i := range command.Participant.IntentScopes {
 		binary.LittleEndian.PutUint32(out[cursor:cursor+4], command.Participant.IntentScopes[i].Start)
@@ -509,7 +529,7 @@ func ValidateReplicatedCommand(src []byte) error {
 	}
 	if binary.LittleEndian.Uint16(src[8:10]) != replicatedCommandHeaderBytes ||
 		src[10] != 0 || src[11] != 0 || binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 {
+		binary.LittleEndian.Uint32(src[20:24]) != 0 {
 		return ErrCorrupt
 	}
 	payloadLength := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -522,6 +542,10 @@ func ValidateReplicatedCommand(src []byte) error {
 	operation := ReplicatedOperation(src[6])
 	payloadKind := ReplicatedPayloadKind(src[7])
 	expectedRevision := binary.LittleEndian.Uint64(src[24:32])
+	recoveryPulse := src[121]
+	controllerEpoch := binary.LittleEndian.Uint64(src[128:136])
+	var executionPinDigest Digest
+	copy(executionPinDigest[:], src[136:168])
 	var id ID
 	copy(id[:], src[32:48])
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(operation)
@@ -529,8 +553,13 @@ func ValidateReplicatedCommand(src []byte) error {
 	if abortFence {
 		wantPayload, creation = ReplicatedPayloadParticipantStage, true
 	}
-	if id.IsZero() || !ok || role != wantRole || payloadKind != wantPayload ||
+	if id.IsZero() || controllerEpoch == 0 || executionPinDigest == (Digest{}) ||
+		!ok || role != wantRole || payloadKind != wantPayload ||
 		(creation && expectedRevision != 0) || (!creation && expectedRevision == 0) {
+		return ErrCorrupt
+	}
+	if (operation == ReplicatedPulseCoordinator) != (recoveryPulse != 0) ||
+		recoveryPulse > MaxRecoveryPulses {
 		return ErrCorrupt
 	}
 	scopeEnd := replicatedCommandHeaderBytes + int(scopeCount)*8
@@ -561,7 +590,7 @@ func ValidateReplicatedCommand(src []byte) error {
 			binary.LittleEndian.Uint32(src[124:128]), mutationDigest,
 		)
 	}
-	if !allZero(src[48:122]) || scopeCount != 0 ||
+	if !allZero(src[48:121]) || scopeCount != 0 ||
 		binary.LittleEndian.Uint32(src[124:128]) != 0 {
 		return ErrCorrupt
 	}
@@ -581,7 +610,7 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 	}
 	if binary.LittleEndian.Uint16(src[8:10]) != replicatedCommandHeaderBytes ||
 		src[10] != 0 || src[11] != 0 || binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		binary.LittleEndian.Uint32(src[20:24]) != 0 || src[121] != 0 {
+		binary.LittleEndian.Uint32(src[20:24]) != 0 {
 		return ReplicatedCommandView{}, ErrCorrupt
 	}
 	payloadLength := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -601,7 +630,10 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 	view.Participant.CoordinatorAllocation = binary.LittleEndian.Uint64(src[80:88])
 	copy(view.Participant.MutationDigest[:], src[88:120])
 	view.Participant.BucketBits = src[120]
+	view.RecoveryPulse = src[121]
 	view.Participant.ParticipantOrdinal = binary.LittleEndian.Uint32(src[124:128])
+	view.ControllerEpoch = binary.LittleEndian.Uint64(src[128:136])
+	copy(view.ExecutionPinDigest[:], src[136:168])
 	cursor := replicatedCommandHeaderBytes
 	if scopeCount != 0 {
 		view.Participant.IntentScopes = scopes[:scopeCount]
@@ -625,7 +657,8 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 }
 
 func validateReplicatedCommand(command ReplicatedCommand) error {
-	if command.ID.IsZero() {
+	if command.ID.IsZero() || command.ControllerEpoch == 0 ||
+		command.ExecutionPinDigest == (Digest{}) {
 		return ErrCorrupt
 	}
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(command.Operation)
@@ -636,6 +669,10 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 	}
 	if !ok || command.Role != wantRole || command.PayloadKind != wantPayload ||
 		(creation && command.ExpectedRevision != 0) || (!creation && command.ExpectedRevision == 0) {
+		return ErrCorrupt
+	}
+	if (command.Operation == ReplicatedPulseCoordinator) != (command.RecoveryPulse != 0) ||
+		command.RecoveryPulse > MaxRecoveryPulses {
 		return ErrCorrupt
 	}
 	carriesParticipant := replicatedCommandCarriesParticipant(
@@ -863,6 +900,8 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 	case ReplicatedStageManifestSegment:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestSegment, false, true
 	case ReplicatedCommitCoordinator, ReplicatedAbortCoordinator:
+		return ReplicatedRoleCoordinator, ReplicatedPayloadNone, false, true
+	case ReplicatedPulseCoordinator:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadNone, false, true
 	case ReplicatedRetireCoordinator:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadRetirement, false, true

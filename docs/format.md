@@ -7,6 +7,10 @@ compatibility decoder or migration framework.
 > place. Do not expect a file from another commit to open. Pin the producer and
 > reader to one tested revision.
 
+For the exact same-build restart boundary and the distinction between binary
+compatibility and schema-generation rollout, see
+[Unreleased compatibility and rolling restarts](operations/unreleased-compatibility.md).
+
 ## File layout
 
 The base page is exactly 4096 bytes. The fixed mutable prefix is:
@@ -417,12 +421,13 @@ ciphertext/plaintext pair, one retained chunk and encoding, one encrypted
 target record, and `O(MaxReadyEntries)` scalar descriptors. There is no
 source-sized entry arena or second scratch file.
 
-One fixed 504-byte generation seal terminates the candidate. Its authenticated
+One fixed 512-byte generation seal terminates the candidate. Its authenticated
 record chain binds:
 
 - family, generation, parent-generation binding, and complete member identity;
 - source file and static-header identity, selected current generation, WAL end,
-  record count, record-chain digest, node incarnation, and topology epoch;
+  record count, record-chain digest, node incarnation, exact source Ready ID,
+  and topology epoch;
 - snapshot-base index and term, the WAL bootstrap-record digest, the distinct
   state-machine snapshot-certificate identity, and stable ConfState digest;
 - the exact checkpoint-retention witness commitment and HardState;
@@ -431,8 +436,9 @@ record chain binds:
 - source first/last index and the resulting generation binding digest.
 
 Decode requires canonical record order: bootstrap, retained-entry records,
-seal, then only Ready records from a strictly newer node incarnation. A missing,
-repeated, or late seal, source-incarnation reuse, broken parent binding, or any
+seal, then Ready records from a newer node incarnation or the same incarnation
+with a Ready ID strictly above the authenticated source cursor. A missing,
+repeated, or late seal, regressed incarnation or Ready cursor, broken parent binding, or any
 mismatch with the authenticated current cut is corruption. Exact candidate
 rebuild is idempotent only while the seal remains terminal; an independently
 advanced candidate is not the same build.
@@ -443,6 +449,12 @@ the selecting family slot while holding both authorities. That immediately
 fences the source WAL and its bound SQL apply claim. Recovery opens the selected
 candidate only through the logical family manifest and exposes just its
 activation evidence.
+
+The live driver adopts that exact selected candidate into the retained Store
+handle before completing activation. It preserves the owner incarnation and
+Ready sequence, allowing compaction without restarting the Raft node. The
+sealed cursor authenticates this handoff; it is not permission to replay an
+older Ready batch under the new generation.
 
 Activation validates the exact SQL preparation, schema/shard binding, applied
 cut, and retention witness. It installs the certified snapshot base and

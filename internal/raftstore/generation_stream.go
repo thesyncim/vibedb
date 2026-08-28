@@ -700,8 +700,7 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 			}
 			if builder.current.currentIncarnation == 0 ||
 				record.envelope.incarnation > builder.current.currentIncarnation ||
-				(sourceGenerationSeen &&
-					record.envelope.incarnation <= sourceGeneration.sourceCurrentIncarnation) ||
+				(sourceGenerationSeen && !generationReadyAfterSource(sourceGeneration, record.envelope.incarnation, record.envelope.readyID)) ||
 				(lastReady.incarnation != 0 &&
 					(record.envelope.incarnation < lastReady.incarnation ||
 						(record.envelope.incarnation == lastReady.incarnation &&
@@ -892,6 +891,7 @@ func (builder *GenerationBuilder) finishGenerationScratch(
 		sourceRecordSequence:     builder.current.recordSequence,
 		sourceChainDigest:        builder.current.chainDigest,
 		sourceCurrentIncarnation: builder.current.currentIncarnation,
+		sourceReadyID:            builder.sourceReadyID,
 		topologyRecoveryEpoch:    sourceHeader.topologyRecoveryEpoch,
 		baseIndex:                baseIndex, baseTerm: baseTerm,
 		bootstrapDigest:     sha256.Sum256(bootstrapPayload),

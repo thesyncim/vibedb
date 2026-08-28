@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -30,6 +31,9 @@ type SnapshotArtifactStageOptions struct {
 	// Capture is the private opaque transition-capture destination authenticated
 	// by the third artifact collection.
 	Capture CollectionTarget
+	// LocalIndexes is the exact singleton relation profile. Bundle stages
+	// carry this profile in each RelationCollection instead.
+	LocalIndexes []store.IndexDefinition
 }
 
 // SnapshotArtifactStage applies verified chunks only to caller-owned,
@@ -39,12 +43,13 @@ type SnapshotArtifactStageOptions struct {
 type SnapshotArtifactStage struct {
 	mu sync.Mutex
 
-	expected  SnapshotArtifactManifest
-	system    CollectionTarget
-	user      CollectionTarget
-	relations []relationCollection
-	capture   CollectionTarget
-	cursor    *SnapshotArtifactCursor
+	expected     SnapshotArtifactManifest
+	system       CollectionTarget
+	user         CollectionTarget
+	localIndexes []store.IndexDefinition
+	relations    []relationCollection
+	capture      CollectionTarget
+	cursor       *SnapshotArtifactCursor
 
 	payloadBuffer   []byte
 	cursorBuffer    []byte
@@ -147,6 +152,13 @@ func newSnapshotArtifactStage(
 	options SnapshotArtifactStageOptions,
 ) (*SnapshotArtifactStage, error) {
 	checkpointBytes := options.CheckpointBytes
+	if len(relations) != 0 && len(options.LocalIndexes) != 0 {
+		return nil, fmt.Errorf("%w: singleton indexes on bundle stage", ErrSnapshotStage)
+	}
+	indexes, indexErr := canonicalLocalIndexes(options.LocalIndexes)
+	if indexErr != nil {
+		return nil, errors.Join(ErrSnapshotStage, indexErr)
+	}
 	if checkpointBytes == 0 {
 		checkpointBytes = DefaultSnapshotStageCheckpointBytes
 	}
@@ -240,8 +252,9 @@ func newSnapshotArtifactStage(
 	}
 	stage := &SnapshotArtifactStage{
 		expected: cloneSnapshotArtifactManifest(expected), system: system, user: user, capture: capture,
-		relations: relations,
-		cursor:    cursor, payloadBuffer: make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
+		localIndexes: indexes,
+		relations:    relations,
+		cursor:       cursor, payloadBuffer: make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
 		checkpointBytes: checkpointBytes,
 	}
 	if cursor != nil {
@@ -478,7 +491,7 @@ func (s *SnapshotArtifactStage) openCandidate(
 	} else {
 		machine, err = Open(
 			s.expected.State.Binding, bootstrap, s.system,
-			UserCollection{Name: string(s.expected.UserCollection), Target: s.user},
+			UserCollection{Name: string(s.expected.UserCollection), Target: s.user, LocalIndexes: s.localIndexes},
 			txnLog, options,
 		)
 	}
@@ -594,7 +607,7 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		bytes.Equal(expected.UserCollection, []byte(systemCollectionName)) ||
 		expected.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
 		expected.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
-		expected.Chunks == 0 || !systemRowsOK || expected.SystemRows != wantSystemRows ||
+		expected.Chunks == 0 || !systemRowsOK || !snapshotSystemRowsBounded(expected.State, expected.SystemRows, wantSystemRows) ||
 		expected.PayloadBytes == 0 || expected.EncodedBytes == 0 ||
 		expected.HeaderDigest == ([32]byte{}) ||
 		expected.LastChunkDigest == ([32]byte{}) || expected.ImageDigest == ([32]byte{}) ||
@@ -675,6 +688,19 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		return fmt.Errorf("%w: expected artifact identity", ErrSnapshotStage)
 	}
 	return nil
+}
+
+// Route-gate heads, pins, and result slots are authenticated in the streamed
+// system image, but are not included in State's ordinary row counters. Each
+// applied command can create at most one pin and one result, plus the single
+// head. The artifact decoder still requires the exact base + decoded gate row
+// count, validates every key/value, and checks the footer digest before staging
+// can complete; this manifest-only check must not reject those valid rows.
+func snapshotSystemRowsBounded(state State, rows, base uint64) bool {
+	if rows < base {
+		return false
+	}
+	return (rows-base)/2 <= state.Applied
 }
 
 func snapshotArtifactPrefixMatchesExpected(

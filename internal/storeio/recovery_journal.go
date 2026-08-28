@@ -83,13 +83,13 @@ const (
 	// append cannot rewrite an already-synced earlier record.
 	RecoveryJournalMinSectorSize = 512
 	// RecoveryJournalMaxCapacityBytes is the authoritative upper bound for the
-	// preallocated record region and the buffer read by recovery. Its extra bytes
-	// cover the current replicated SQL ceiling: a 16 MiB command budget, every
-	// maximum-size key across 64 mutations, conditional and per-entry framing,
-	// checksum trailer, and sector padding. Keeping the bound here makes a
-	// checksummed hostile header unable to request an unbounded allocation and
-	// keeps durable's creation clamp from drifting.
-	RecoveryJournalMaxCapacityBytes = (uint64(16) << 20) + 34*RecoveryJournalMinSectorSize
+	// preallocated record region and the buffer read by recovery. The maximum
+	// transaction profile stores a 16 MiB command, 3,776 exact intent rows
+	// (64 per relation), relation/control/manifest framing, and 3,854 entry headers. The cross-
+	// package profile test derives this exact sector count from the codecs.
+	// Individual owners still seal only their configured document budget;
+	// this hard parsing ceiling is not the default allocation size.
+	RecoveryJournalMaxCapacityBytes = uint64(35861) * RecoveryJournalMinSectorSize
 
 	// RecoveryJournalFormat is the sole admitted recovery-journal grammar.
 	RecoveryJournalFormat = uint32(0)
@@ -1311,8 +1311,9 @@ type RecoveryJournal struct {
 	nextSequence uint64
 	// headerSlot is the alternating slot the live header occupies. Recycle and
 	// GrowCapacity write the opposite slot and flip this after sync succeeds.
-	headerSlot uint32
-	scratch    []byte
+	headerSlot    uint32
+	scratch       []byte
+	replayScratch recoveryReplayScratch
 	// journalSync and journalDataSync are injected so a fault seam can wrap the
 	// real barriers; production wires the platform sync helpers.
 	journalSync     func(*os.File) error
@@ -1708,8 +1709,8 @@ func (rj *RecoveryJournal) scanTail() error {
 	if binary.LittleEndian.Uint32(rj.scratch[:4]) == 0 {
 		return nil
 	}
-	region := make([]byte, rj.header.Capacity)
-	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
+	var stream recoveryRecordStream
+	if err := stream.open(rj.file, rj.header.Capacity); err != nil {
 		return err
 	}
 	cursor := uint64(0)
@@ -1720,8 +1721,8 @@ func (rj *RecoveryJournal) scanTail() error {
 	var atomicLastKind uint16
 	conditionalChain := recoveryConditionalChain{}
 	for cursor < rj.header.Capacity {
-		rec, padded, err := DecodeRecoveryRecord(
-			region[cursor:], rj.header.SectorSize, sequence,
+		rec, padded, err := stream.record(
+			cursor, rj.header.SectorSize, sequence,
 		)
 		if err != nil {
 			if errors.Is(err, errRecoveryJournalTruncatableTail) {
@@ -2344,8 +2345,9 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 	if rj.header.BaseSequence == ^uint64(0) {
 		return nil
 	}
-	region := make([]byte, rj.header.Capacity)
-	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
+	stream := recoveryRecordStream{buffer: rj.replayScratch.take()}
+	defer func() { rj.replayScratch.put(stream.buffer) }()
+	if err := stream.open(rj.file, rj.header.Capacity); err != nil {
 		return err
 	}
 	cursor := uint64(0)
@@ -2356,8 +2358,8 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 	var atomicLastKind uint16
 	conditionalChain := recoveryConditionalChain{}
 	for cursor < rj.header.Capacity {
-		rec, padded, err := DecodeRecoveryRecord(
-			region[cursor:], rj.header.SectorSize, sequence,
+		rec, padded, err := stream.record(
+			cursor, rj.header.SectorSize, sequence,
 		)
 		if err != nil {
 			if errors.Is(err, errRecoveryJournalTruncatableTail) {
@@ -2404,6 +2406,7 @@ func (rj *RecoveryJournal) Close() error {
 	if rj == nil || rj.file == nil {
 		return nil
 	}
+	rj.replayScratch.close()
 	return rj.file.Close()
 }
 

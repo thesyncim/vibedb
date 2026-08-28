@@ -1,0 +1,88 @@
+name: restored RF3 external process
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restore-rf3-external-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  qualify:
+    name: Ubuntu restored catalog and data RF3 serving (count=3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Prepare bounded evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/restore-rf3-evidence"
+          test_root="${RUNNER_TEMP}/restore-rf3-tmp"
+          mkdir -p "${evidence}" "${test_root}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          test_name='TestRestoredRF3ExternalProcessServingAndFailover'
+          go test -list "^${test_name}$" ./cmd/vibedb-shard > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          go build -o "${RUNNER_TEMP}/vibedb-gateway" ./cmd/vibedb-gateway
+      - name: Qualify real restored shard processes
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/restore-rf3-tmp
+          VIBEDB_RESTORE_RF3_PROCESS_E2E: '1'
+          VIBEDB_RESTORE_GATEWAY_BINARY: ${{ runner.temp }}/vibedb-gateway
+        run: |
+          set -euo pipefail
+          go test -json -count=3 -timeout=8m \
+            -run '^TestRestoredRF3ExternalProcessServingAndFailover$' \
+            ./cmd/vibedb-shard | tee "${RUNNER_TEMP}/restore-rf3-evidence/go-test.jsonl"
+      - name: Require three complete unskipped runs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="${RUNNER_TEMP}/restore-rf3-evidence/go-test.jsonl"
+          test_name='TestRestoredRF3ExternalProcessServingAndFailover'
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 16777216
+          test "$(jq -r --arg name "${test_name}" 'select(.Action == "pass" and .Test == $name) | .Test' "${result}" | wc -l)" -eq 3
+          if jq -e 'select(.Action == "skip" or .Action == "fail")' "${result}" >/dev/null; then
+            echo 'restore RF3 gate failed or skipped' >&2
+            exit 1
+          fi
+          test "$(jq -r --arg name "${test_name}" '
+            select(.Action == "output" and .Test == $name and
+              (.Output | contains("restored external RF3:") and
+                contains("shard_processes=6") and contains("certified_groups=2") and
+                contains("certified_artifact=true") and contains("activation_cli=true") and
+                contains("source_catalog_discarded=true") and contains("fresh_catalog=true") and
+                contains("fresh_roots=true") and contains("closed_before_catalog=true") and
+                contains("marker_removal_refused=true") and
+                contains("catalog_witness=replicated_readindex") and
+                contains("catalog_observations=2") and contains("restored_read=true") and
+                contains("restored_global_index=true") and
+                contains("acknowledged_write_survived=true") and contains("leader_sigkill=true") and
+                contains("restart_closed=true") and contains("regrant=true") and
+                contains("write=") and contains("failover=") and contains("rss_bytes=") and
+                contains("rss_growth=") and contains("storage_growth=") and contains("wal_growth="))) | .Test
+            ' "${result}" | wc -l)" -eq 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: restore-rf3-external-${{ github.sha }}
+          path: ${{ runner.temp }}/restore-rf3-evidence
+          if-no-files-found: error
+          retention-days: 30

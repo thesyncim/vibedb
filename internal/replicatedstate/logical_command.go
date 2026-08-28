@@ -48,6 +48,51 @@ func LogicalCommandDigest(command replication.CommandView) [32]byte {
 		_, _ = h.Write(length[:])
 		_, _ = h.Write(transaction)
 	}
+	if command.Kind() == replication.CommandRequestLedger {
+		ledger := command.RequestLedgerBytes()
+		binary.LittleEndian.PutUint64(length[:], uint64(len(ledger)))
+		_, _ = h.Write(length[:])
+		_, _ = h.Write(ledger)
+	}
+	if command.Kind() == replication.CommandRouteGate {
+		routeGate := command.RouteGateBytes()
+		binary.LittleEndian.PutUint64(length[:], uint64(len(routeGate)))
+		_, _ = h.Write(length[:])
+		_, _ = h.Write(routeGate)
+	}
+	if command.Kind() == replication.CommandExecutionPin {
+		executionPin := command.ExecutionPinBytes()
+		binary.LittleEndian.PutUint64(length[:], uint64(len(executionPin)))
+		_, _ = h.Write(length[:])
+		_, _ = h.Write(executionPin)
+	}
+	if command.Kind() == replication.CommandRetainedPrune {
+		proof, ok := command.RetainedPruneProof()
+		if !ok {
+			panic("replicatedstate: validated retained prune lost proof")
+		}
+		for _, digest := range [...]replication.Digest{
+			proof.OperationDigest, proof.CertificateDigest, proof.BatchDigest,
+			proof.DataChainDigest, proof.EntryDigest, proof.BaseDigest,
+		} {
+			_, _ = h.Write(digest[:])
+		}
+		for _, value := range [...]uint64{
+			proof.CutApplied, proof.CutTerm, proof.OwnershipEpoch,
+			proof.RoutingVersion, proof.RouteGeneration,
+		} {
+			binary.LittleEndian.PutUint64(scalar[:], value)
+			_, _ = h.Write(scalar[:])
+		}
+		_, _ = h.Write(proof.RetainedRange.Start[:])
+		_, _ = h.Write(proof.RetainedRange.End.Point[:])
+		if proof.RetainedRange.End.Max {
+			marker[0] = 1
+		} else {
+			marker[0] = 0
+		}
+		_, _ = h.Write(marker[:])
+	}
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
 	_, _ = h.Write(scalar[:])
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.MutationCount()))

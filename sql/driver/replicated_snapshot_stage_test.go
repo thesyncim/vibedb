@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -82,6 +83,10 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 			binding, "docs", []ReplicatedGlobalIndexRelation{{
 				Relation: 2, Table: "email_claims", IndexID: 41,
 				Incarnation: 7, LocatorCount: 1, Unique: true,
+				KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+				TupleVersion:  distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion,
+				BucketBits:    distribution.DefaultVirtualBucketBits,
 			}},
 		)
 		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
@@ -107,7 +112,7 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 	epoch := applyReplicatedApplySessionOpen(t, apply, sourceIdentity, 2)
 	document := []byte(`{"email":"a","id":"bundle-doc"}`)
 	baseKey := testReplicatedApplyKey(t, source, document)
-	globalKey, locator := []byte{0x91, 0x01, 'a'}, []byte(`["bundle-doc"]`)
+	globalKey, locator := testReplicatedGlobalIndexKey(t, sourceIdentity.Relations[1], "a"), []byte(`["bundle-doc"]`)
 	commandValue := testReplicatedApplyCommandValue(sourceIdentity, epoch, 2, nil)
 	commandValue.Fingerprint = sha256.Sum256([]byte("snapshot-stage-bundle"))
 	commandValue.Batches = []replication.RelationMutationBatch{
@@ -124,6 +129,9 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 	}
 	if _, err = apply.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
 		t.Fatal(err)
+	}
+	if got := completionResultCode(t, apply, command); got != replicatedstate.ResultApplied {
+		t.Fatalf("snapshot source bundle result = %d", got)
 	}
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {
@@ -312,12 +320,29 @@ func TestSnapshotArtifactLiveCaptureRejectsCorruptionAndNoncanonicalFrames(t *te
 	}
 }
 
-func newReplicatedSnapshotStageFixture(t *testing.T) (
+func newReplicatedSnapshotStageFixture(t *testing.T, schema ...string) (
 	*ReplicatedSnapshotStage, *Database, *pb.Snapshot, []byte, []byte,
 ) {
 	t.Helper()
 	_, source, sourceBinding, _ := prepareReplicatedTestRoot(t, "snapshot-source", false)
 	t.Cleanup(func() { _ = source.Close() })
+	addSchema := func(database *Database) {
+		t.Helper()
+		if len(schema) == 0 {
+			return
+		}
+		session, err := database.NewSession(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		for _, statement := range schema {
+			if err := testRuntimeExec(session, statement, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	addSchema(source)
 	sourceIdentity := requireReplicatedShardStoreBind(t, source, sourceBinding, "docs")
 	bootstrap := snapshotStageBootstrap()
 	apply, _, err := source.OpenReplicatedApply(sourceIdentity, bootstrap, testReplicatedApplyOptions())
@@ -354,6 +379,7 @@ func newReplicatedSnapshotStageFixture(t *testing.T) (
 	}
 
 	_, target, targetBinding, _ := prepareReplicatedTestRoot(t, "snapshot-target", false)
+	addSchema(target)
 	targetBinding.MemberID = 10
 	targetBinding.StoreID[0]++
 	targetIdentity := requireReplicatedShardStoreBind(t, target, targetBinding, "docs")
@@ -370,6 +396,20 @@ func newReplicatedSnapshotStageFixture(t *testing.T) (
 		t.Fatalf("receive digest=%x cursor=%d err=%v", got.Digest, len(cursor), err)
 	}
 	return stage, target, bootstrap, bytes.Clone(artifact.Bytes()), bytes.Clone(cursor)
+}
+
+func TestReplicatedSnapshotStageRetainsSingletonLocalIndexProfile(t *testing.T) {
+	stage, target, bootstrap, _, _ := newReplicatedSnapshotStageFixture(t,
+		`CREATE INDEX by_value ON docs (value)`)
+	defer target.Close()
+	defer stage.Close()
+	activation, err := stage.Activate(bootstrap)
+	if err != nil || activation.Apply == nil {
+		t.Fatalf("activate indexed singleton snapshot: %v", err)
+	}
+	if _, err := stage.Activate(bootstrap); err != nil {
+		t.Fatalf("retry indexed singleton activation: %v", err)
+	}
 }
 
 func TestReplicatedSnapshotStageSameHandleFaultSettlement(t *testing.T) {

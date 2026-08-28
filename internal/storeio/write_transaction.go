@@ -72,6 +72,33 @@ type WriteTransaction struct {
 	active       bool
 }
 
+// UnrootedGenerationReservation is an append-only physical/logical namespace
+// made collision-proof by publishing its advanced high-waters before any
+// background staging write enters the region.
+type UnrootedGenerationReservation struct {
+	Offset, Length uint64
+	FirstLogicalID uint64
+	LogicalIDCount uint64
+}
+
+// ReserveUnrootedGeneration advances this transaction's authoritative file
+// and logical-ID high-waters without staging a referenced page. The caller must
+// publish the transaction before writing into the returned range. Until a later
+// conditional install names those pages, the range is intentionally unreachable
+// and must not enter the reusable allocator.
+func (t *WriteTransaction) ReserveUnrootedGeneration(bytes, logicalIDs uint64) (UnrootedGenerationReservation, error) {
+	var reservation UnrootedGenerationReservation
+	if t == nil || !t.active || t.batch == nil || bytes == 0 ||
+		bytes%uint64(t.options.PageSize) != 0 || logicalIDs == 0 ||
+		t.fileEnd > maxSuperblockFileOffset-bytes || t.nextID > ^uint64(0)-logicalIDs {
+		return reservation, fmt.Errorf("%w: unrooted generation reservation", ErrInvalidWrite)
+	}
+	reservation = UnrootedGenerationReservation{Offset: t.fileEnd, Length: bytes, FirstLogicalID: t.nextID, LogicalIDCount: logicalIDs}
+	t.fileEnd += bytes
+	t.nextID += logicalIDs
+	return reservation, nil
+}
+
 // TransactionPage is one cache-frame staging span and its prospective durable
 // reference. Transactions without a cache use the committer buffer.
 // The value borrows its transaction and is invalid after Publish or Abort.
@@ -250,6 +277,16 @@ func (t *WriteTransaction) Reset(
 		reuseEdits: options.ReuseJournal[:0], reuseEnabled: true, active: true,
 	}
 	return nil
+}
+
+// SetPublicationDescriptor attaches the canonical logical mutation batch that
+// produced this transaction. The committer borrows descriptor until Publish or
+// Abort; no copy or string conversion occurs on the publication hot path.
+func (t *WriteTransaction) SetPublicationDescriptor(descriptor []byte) error {
+	if t == nil || !t.active || t.batch == nil || len(descriptor) == 0 {
+		return ErrBatchState
+	}
+	return t.batch.SetPublicationDescriptor(descriptor)
 }
 
 // BeginHybridWriteTransaction acquires one copy-on-write transaction whose
@@ -496,7 +533,8 @@ func variableTransactionExtent(kind PageKind) bool {
 	switch kind {
 	case PageOverflow, PagePrimaryCatalog, PagePrimaryLocator, PageTabletRoute,
 		PagePrimaryAnchor, PagePrimaryLeaf,
-		PagePrimaryExactRoot, PagePrimaryExactLeaf, PagePrimaryExactCatalog:
+		PagePrimaryExactRoot, PagePrimaryExactLeaf, PagePrimaryExactCatalog,
+		PageMigrationExactRun, PageMigrationStagingChain, PageMigrationPadding:
 		return true
 	default:
 		return false

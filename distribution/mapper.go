@@ -198,6 +198,27 @@ func (m *NativeMapper) PointFor(values []Scalar) (KeyspacePoint, error) {
 	return m.mapFullKey(values)
 }
 
+// NativePointForEncodedTuplePrefix maps the first arity canonical tuple
+// frames in raw without materializing Scalars. consumed is the exact prefix
+// length, allowing callers to validate an appended locator tuple separately.
+// The operation allocates nothing and fails closed on malformed tuple bytes or
+// an unsupported bucket width.
+func NativePointForEncodedTuplePrefix(
+	raw []byte,
+	arity int,
+	bucketBits uint8,
+) (point KeyspacePoint, consumed int, ok bool) {
+	if !ValidVirtualBucketBits(bucketBits) {
+		return KeyspacePoint{}, 0, false
+	}
+	consumed, ok = CanonicalTuplePrefixLen(raw, arity)
+	if !ok {
+		return KeyspacePoint{}, 0, false
+	}
+	_, point, ok = VirtualBucketForHash(xxhash.Sum64(raw[:consumed]), bucketBits)
+	return point, consumed, ok
+}
+
 // PrefixRangeFor returns the keyspace range a supported shorter leading prefix
 // (1..Arity-1) maps to. It reports a *MapperError for a full-length or
 // unsupported prefix.

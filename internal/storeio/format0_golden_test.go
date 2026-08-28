@@ -390,7 +390,9 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"stateRootExactIndexEnd":           {stateRootExactIndexEnd, 192},
 		"stateRootPhysicalCapacityOffset":  {stateRootPhysicalCapacityOffset, 192},
 		"stateRootPhysicalCapacityEnd":     {stateRootPhysicalCapacityEnd, 200},
-		"stateRootReservedOffset":          {stateRootReservedOffset, 200},
+		"stateRootMigrationManifestOffset": {stateRootMigrationManifestOffset, 200},
+		"stateRootMigrationManifestEnd":    {stateRootMigrationManifestEnd, 208},
+		"stateRootReservedOffset":          {stateRootReservedOffset, 208},
 		"PageRefSize":                      {PageRefSize, 32},
 		"InlineSuperblockSize":             {InlineSuperblockSize, 4096},
 		"InlineFreeDeltaCapacity":          {InlineFreeDeltaCapacity, 106},
@@ -422,7 +424,10 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		PageCatalogSegment: 6, PagePrimaryCatalog: 7, PagePrimaryLocator: 8,
 		PageTabletRoute: 9, PagePrimaryAnchor: 10, PagePrimaryLeaf: 11,
 		PagePrimaryExactRoot: 12, PagePrimaryExactLeaf: 13,
-		PagePrimaryExactCatalog: 14,
+		PagePrimaryExactCatalog:   14,
+		PageMigrationExactRun:     15,
+		PageMigrationStagingChain: 16,
+		PageMigrationPadding:      17,
 	} {
 		if int(kind) != want {
 			t.Fatalf("PageKind %d has value %d, want %d",

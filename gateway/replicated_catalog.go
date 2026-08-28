@@ -6,9 +6,11 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 )
 
@@ -38,22 +40,43 @@ type ReplicatedShardDescriptor struct {
 	Group                raftmember.GroupKey
 	AllocationGeneration distribution.ShardAllocationGeneration
 	Command              raftservice.CommandFence
-	Replicas             []ReplicatedReplicaDescriptor
+	// LogicalSchemaDigest binds the portable relation schema independently of
+	// Command.RelationManifestDigest, which includes this shard's validation
+	// profile. Authenticated producers derive both from the exact SQL schema.
+	LogicalSchemaDigest replication.Digest
+	// RangeIdentity is the immutable logical range named by durable requests.
+	// LineageDigest and ForwardingRuleDigest authenticate how that logical
+	// range may be resolved after split or movement without allowing a retry to
+	// substitute an unrelated allocation.
+	RangeIdentity        replication.Digest
+	LineageDigest        replication.Digest
+	ForwardingRuleDigest replication.Digest
+	// RequestLedgerRanges explicitly assigns authenticated request-home ranges
+	// to this shard. Empty means this shard carries no ledger range; identities
+	// and boundaries are provisioned control-plane input, never synthesized.
+	RequestLedgerRanges []DurableRequestLedgerRangeDescriptor
+	Replicas            []ReplicatedReplicaDescriptor
 	// EnrolledTarget is the one authenticated replacement endpoint that may
 	// participate in membership control. It is never included in the public
 	// data route until a later catalog cut makes it one of Replicas.
 	EnrolledTarget *ReplicatedReplicaDescriptor
+	SplitOrigin    *ReplicatedSplitOrigin
 }
 
 type replicatedCatalogShard struct {
 	group             raftmember.GroupKey
 	allocation        distribution.ShardAllocationGeneration
 	command           raftservice.CommandFence
+	logicalSchema     replication.Digest
+	rangeIdentity     replication.Digest
+	lineageDigest     replication.Digest
+	forwardingDigest  replication.Digest
 	replicaBase       uint32
 	manifest          uint32
 	shard             uint32
 	replicaCount      uint8
 	hasEnrolledTarget bool
+	splitOrigin       *ReplicatedSplitOrigin
 }
 
 type unresolvedReplicatedCatalogShard struct {
@@ -103,6 +126,9 @@ func NewSnapshotWithReplicatedTableMetadata(
 	if err := snapshot.attachReplicatedTableProfiles(tables); err != nil {
 		return nil, err
 	}
+	if err := snapshot.attachDurableRequestLedgerRangesFromDescriptors(replicated); err != nil {
+		return nil, err
+	}
 	return snapshot, nil
 }
 
@@ -124,7 +150,10 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		if !validReplicatedCatalogGroup(descriptor.Group) ||
 			descriptor.Distribution == "" || descriptor.Shard == "" ||
 			descriptor.AllocationGeneration == 0 || !descriptor.Command.Valid() ||
-			len(descriptor.Replicas) != ServingReplicaCount {
+			descriptor.RangeIdentity == (replication.Digest{}) ||
+			descriptor.LineageDigest == (replication.Digest{}) ||
+			descriptor.ForwardingRuleDigest == (replication.Digest{}) ||
+			len(descriptor.Replicas) != ServingReplicaCount || !validReplicatedSplitOrigin(descriptor.SplitOrigin, descriptor) {
 			return &CatalogError{Reason: "replicated shard has an invalid RF3 identity"}
 		}
 		manifestOrdinal, manifest := snapshot.manifestOrdinal(descriptor.Distribution)
@@ -134,10 +163,13 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			)}
 		}
 		shardOrdinal, metadata := manifestShardOrdinal(manifest, descriptor.Shard)
+		// A routing manifest can advance for a different shard. Keep this
+		// allocation's actually applied command fence; never fabricate a
+		// cluster-wide Raft transition from a catalog version increment.
 		if shardOrdinal < 0 || metadata.AllocationGeneration != descriptor.AllocationGeneration ||
 			metadata.LeaderCount != ServingReplicaCount ||
 			descriptor.Command.OwnershipEpoch != uint64(metadata.Epoch) ||
-			descriptor.Command.RoutingVersion != uint64(manifest.Version()) {
+			descriptor.Command.RoutingVersion > uint64(manifest.Version()) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated shard %q/%q does not match one RF3 manifest allocation",
 				descriptor.Distribution, descriptor.Shard,
@@ -159,6 +191,9 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			address, endpointExists := snapshot.endpoints[replica.Endpoint]
 			nativeAddress, nativeExists := snapshot.endpoints[replica.NativeEndpoint]
 			controlAddress, controlExists := snapshot.endpoints[replica.ControlEndpoint]
+			// Static RF3 manifests name peer endpoints; certified split
+			// manifests name native endpoints. Both must resolve to this
+			// exact replica, whose transport roles remain stored separately.
 			if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
 				replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
 				replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
@@ -166,7 +201,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 				replica.ControlEndpoint == replica.NativeEndpoint || !endpointExists || !nativeExists ||
 				!controlExists || address == "" || nativeAddress == "" || controlAddress == "" ||
 				address == nativeAddress || address == controlAddress || nativeAddress == controlAddress ||
-				replica.Endpoint != manifestEndpoint {
+				(replica.Endpoint != manifestEndpoint && replica.NativeEndpoint != manifestEndpoint) {
 				return &CatalogError{Reason: fmt.Sprintf(
 					"replicated shard %q/%q replica %d does not match its manifest endpoint",
 					descriptor.Distribution, descriptor.Shard, replicaOrdinal,
@@ -247,10 +282,15 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		}
 		shards[ordinal] = replicatedCatalogShard{
 			group: entry.descriptor.Group, allocation: entry.descriptor.AllocationGeneration,
-			command:     entry.descriptor.Command,
-			replicaBase: uint32(base), manifest: entry.manifest, shard: entry.shard,
+			command:          entry.descriptor.Command,
+			logicalSchema:    entry.descriptor.LogicalSchemaDigest,
+			rangeIdentity:    entry.descriptor.RangeIdentity,
+			lineageDigest:    entry.descriptor.LineageDigest,
+			forwardingDigest: entry.descriptor.ForwardingRuleDigest,
+			replicaBase:      uint32(base), manifest: entry.manifest, shard: entry.shard,
 			replicaCount:      uint8(len(entry.descriptor.Replicas)),
 			hasEnrolledTarget: entry.descriptor.EnrolledTarget != nil,
+			splitOrigin:       cloneReplicatedSplitOrigin(entry.descriptor.SplitOrigin),
 		}
 	}
 	snapshot.replicatedShards = shards
@@ -342,8 +382,45 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	return ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
-		Command: entry.command, Replicas: dst,
+		Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
+		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
+		Replicas: dst,
 	}, true
+}
+
+// ReplicatedRouteCount reports the complete catalog RF3 inventory, including
+// reserved control relations that need not appear in a user routing manifest.
+func (snapshot *Snapshot) ReplicatedRouteCount() int {
+	if snapshot == nil {
+		return 0
+	}
+	return len(snapshot.replicatedShards)
+}
+
+// ReplicatedRouteAt returns route i into caller-owned replica workspace. It is
+// the bounded inventory seam used by cluster backup; callers must consume
+// every ordinal rather than selecting user-visible tables.
+func (snapshot *Snapshot) ReplicatedRouteAt(index int, dst []ReplicatedEndpoint) (ReplicatedRoute, bool) {
+	if snapshot == nil || index < 0 || index >= len(snapshot.replicatedShards) {
+		return ReplicatedRoute{}, false
+	}
+	entry := snapshot.replicatedShards[index]
+	if int(entry.manifest) >= len(snapshot.config.Manifests) ||
+		int(entry.replicaCount) != ServingReplicaCount ||
+		int(entry.replicaBase)+int(entry.replicaCount) > len(snapshot.replicatedReplicas) {
+		return ReplicatedRoute{}, false
+	}
+	manifest := snapshot.config.Manifests[entry.manifest]
+	metadata, ok := manifest.ShardMetadataAt(int(entry.shard))
+	if !ok {
+		return ReplicatedRoute{}, false
+	}
+	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
+	dst = dst[:len(dst):len(dst)]
+	return ReplicatedRoute{Distribution: manifest.Distribution(), Shard: metadata.ID, Group: entry.group,
+		AllocationGeneration: uint64(entry.allocation), Command: entry.command, LogicalSchemaDigest: entry.logicalSchema,
+		RangeIdentity: entry.rangeIdentity, LineageDigest: entry.lineageDigest,
+		ForwardingRuleDigest: entry.forwardingDigest, Replicas: dst}, true
 }
 
 // ResolveReplicatedMembershipRoute resolves the active serving RF3 together
@@ -373,7 +450,9 @@ func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
 	result := ReplicatedMembershipRoute{Serving: ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
-		Command: entry.command, Replicas: dst,
+		Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
+		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
+		Replicas: dst,
 	}}
 	if targets != 0 {
 		result.EnrolledTarget = snapshot.replicatedReplicas[end]
@@ -410,17 +489,18 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 		descriptor := ReplicatedShardDescriptor{
 			Distribution: manifest.Distribution(), Shard: metadata.ID,
 			Group: entry.group, AllocationGeneration: entry.allocation,
-			Command:  entry.command,
-			Replicas: make([]ReplicatedReplicaDescriptor, entry.replicaCount),
+			Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
+			LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
+			Replicas:    make([]ReplicatedReplicaDescriptor, entry.replicaCount),
+			SplitOrigin: cloneReplicatedSplitOrigin(entry.splitOrigin),
 		}
 		for replicaOrdinal := range descriptor.Replicas {
-			endpoint, _ := manifest.ShardLeaderAt(int(entry.shard), replicaOrdinal)
 			descriptor.Replicas[replicaOrdinal] = ReplicatedReplicaDescriptor{
 				Member:          snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Member,
 				Node:            snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Node,
 				StoreID:         snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].StoreID,
 				NodeIncarnation: snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NodeIncarnation,
-				Endpoint:        endpoint,
+				Endpoint:        distribution.EndpointID(snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Endpoint),
 				NativeEndpoint: distribution.EndpointID(
 					snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NativeEndpoint,
 				),
@@ -445,11 +525,39 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 		}
 		descriptors[ordinal] = descriptor
 	}
+	if snapshot.durableRequestLedgerTopology != nil {
+		for _, value := range snapshot.durableRequestLedgerTopology.Ranges {
+			for ordinal := range descriptors {
+				if descriptors[ordinal].Distribution == value.Route.Distribution &&
+					descriptors[ordinal].Shard == value.Route.Shard {
+					descriptors[ordinal].RequestLedgerRanges = append(
+						descriptors[ordinal].RequestLedgerRanges,
+						DurableRequestLedgerRangeDescriptor{
+							Start: value.Start, End: value.End, Identity: value.Identity,
+						},
+					)
+					break
+				}
+			}
+		}
+	}
 	return descriptors
+}
+
+// ReplicatedShardDescriptors returns a detached cold control-plane directory.
+// It is intended for startup/configuration certification, never hot routing.
+func (snapshot *Snapshot) ReplicatedShardDescriptors() []ReplicatedShardDescriptor {
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.replicatedDescriptors()
 }
 
 func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 	if err := validateReplicatedTableTransition(current, next); err != nil {
+		return err
+	}
+	if err := validateDurableRequestLedgerCatalogTransition(current, next); err != nil {
 		return err
 	}
 	if current == nil || len(current.replicatedShards) == 0 {
@@ -479,11 +587,23 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 				oldManifest.Distribution(), oldMetadata.ID,
 			)}
 		}
+		if !sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) || candidate.rangeIdentity != old.rangeIdentity ||
+			candidate.lineageDigest != old.lineageDigest ||
+			candidate.forwardingDigest != old.forwardingDigest {
+			return &CatalogError{Reason: fmt.Sprintf(
+				"replicated shard %q/%q changed logical range authority within one allocation",
+				oldManifest.Distribution(), oldMetadata.ID,
+			)}
+		}
 		if replicatedCommandFenceRegresses(old.command, candidate.command) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated shard %q/%q regressed a serving generation",
 				oldManifest.Distribution(), oldMetadata.ID,
 			)}
+		}
+		if old.command.SchemaGeneration == candidate.command.SchemaGeneration && old.logicalSchema != candidate.logicalSchema ||
+			old.command.SchemaGeneration != candidate.command.SchemaGeneration && old.logicalSchema != (replication.Digest{}) && old.logicalSchema == candidate.logicalSchema {
+			return &CatalogError{Reason: "replicated shard changed or reused its logical schema without an exact schema transition"}
 		}
 		// Enrolling a non-serving target does not authorize a serving-roster
 		// change. Do not let a catalog reload imply that membership completed:
@@ -497,6 +617,125 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 		}
 	}
 	return nil
+}
+
+func advanceCatalogStateReplicaReplacement(
+	current, next *Snapshot, grant membershipgrant.Grant,
+) (*Snapshot, error) {
+	if current == nil || next == nil || !grant.Valid() ||
+		grant.CatalogGeneration != current.Generation() ||
+		next.Generation() != current.Generation()+1 {
+		return nil, &CatalogError{Reason: "invalid certified replica replacement cut"}
+	}
+	if err := validateRoutingTransition(current, next); err != nil {
+		return nil, err
+	}
+	if err := validateCertifiedReplicaReplacement(current, next, grant); err != nil {
+		return nil, err
+	}
+	indexHighWater, err := advanceIndexIDHighWater(current, next)
+	if err != nil {
+		return nil, err
+	}
+	shardHighWaters, err := advanceShardGenerationHighWaters(current, next)
+	if err != nil {
+		return nil, err
+	}
+	return snapshotWithCatalogLineage(next, indexHighWater, shardHighWaters), nil
+}
+
+func validateCertifiedReplicaReplacement(
+	current, next *Snapshot, grant membershipgrant.Grant,
+) error {
+	if err := validateReplicatedTableTransition(current, next); err != nil {
+		return err
+	}
+	if current == nil || next == nil || !grant.Valid() ||
+		len(current.replicatedShards) != len(next.replicatedShards) ||
+		!replicatedCatalogCertifiesInitialGrant(current, grant) {
+		return &CatalogError{Reason: "membership grant does not certify the current RF3 catalog"}
+	}
+	replaced := false
+	for _, old := range current.replicatedShards {
+		oldManifest := current.config.Manifests[old.manifest]
+		oldMetadata, _ := oldManifest.ShardMetadataAt(int(old.shard))
+		candidate, found := next.replicatedShardAt(oldManifest.Distribution(), oldMetadata.ID)
+		if !found || candidate.group != old.group || candidate.allocation != old.allocation || candidate.logicalSchema != old.logicalSchema || !sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) {
+			return &CatalogError{Reason: "replica replacement changed allocation identity"}
+		}
+		if old.group != grant.Group {
+			if candidate.command != old.command ||
+				!sameReplicatedCatalogRoster(current, old, next, candidate) {
+				return &CatalogError{Reason: "replica replacement changed an unrelated RF3 group"}
+			}
+			continue
+		}
+		if replaced || !exactCertifiedReplicaReplacement(current, old, next, candidate, grant) {
+			return &CatalogError{Reason: "replica replacement final roster is not exact"}
+		}
+		replaced = true
+	}
+	if !replaced {
+		return &CatalogError{Reason: "replica replacement group is absent"}
+	}
+	return nil
+}
+
+func exactCertifiedReplicaReplacement(
+	current *Snapshot,
+	old replicatedCatalogShard,
+	next *Snapshot,
+	candidate replicatedCatalogShard,
+	grant membershipgrant.Grant,
+) bool {
+	if old.replicaCount != ServingReplicaCount || candidate.replicaCount != ServingReplicaCount ||
+		old.command.ReplicaSetVersion != grant.InitialReplicaSetVersion ||
+		candidate.command.ReplicaSetVersion <= old.command.ReplicaSetVersion ||
+		candidate.command.ActivePolicyGeneration != old.command.ActivePolicyGeneration ||
+		candidate.command.ProtectionEpoch != old.command.ProtectionEpoch ||
+		candidate.command.OwnershipEpoch != old.command.OwnershipEpoch+1 ||
+		candidate.command.SchemaGeneration != old.command.SchemaGeneration ||
+		candidate.command.RelationManifestDigest != old.command.RelationManifestDigest ||
+		candidate.command.RoutingVersion != old.command.RoutingVersion+1 ||
+		candidate.command.RouteGeneration != old.command.RouteGeneration+1 ||
+		int(old.replicaBase)+ServingReplicaCount > len(current.replicatedReplicas) ||
+		int(candidate.replicaBase)+ServingReplicaCount > len(next.replicatedReplicas) {
+		return false
+	}
+	changes := 0
+	changedOrdinal := -1
+	for ordinal := 0; ordinal < ServingReplicaCount; ordinal++ {
+		before := current.replicatedReplicas[int(old.replicaBase)+ordinal]
+		after := next.replicatedReplicas[int(candidate.replicaBase)+ordinal]
+		if before == after {
+			continue
+		}
+		if before.Member != grant.SourceMember || after.Member != grant.TargetMember ||
+			[16]byte(after.Node) != grant.TargetNode {
+			return false
+		}
+		changes++
+		changedOrdinal = ordinal
+	}
+	if changes != 1 {
+		return false
+	}
+	oldManifest := current.config.Manifests[old.manifest]
+	nextManifest := next.config.Manifests[candidate.manifest]
+	oldMetadata, ok := oldManifest.ShardMetadataAt(int(old.shard))
+	if !ok || oldMetadata.Epoch == ^distribution.OwnershipEpoch(0) ||
+		oldManifest.Version() == ^distribution.RoutingVersion(0) {
+		return false
+	}
+	targetEndpoint, ok := nextManifest.ShardLeaderAt(int(candidate.shard), changedOrdinal)
+	if !ok {
+		return false
+	}
+	expectedManifest, err := oldManifest.ReplaceShardLeader(
+		int(old.shard), oldManifest.Version()+1, changedOrdinal,
+		targetEndpoint, oldMetadata.Epoch+1,
+	)
+	return err == nil && nextManifest.Equal(expectedManifest)
 }
 
 func replicatedCommandFenceRegresses(old, next raftservice.CommandFence) bool {
@@ -535,24 +774,29 @@ func sameReplicatedCatalogRoster(
 }
 
 type persistedReplicatedShard struct {
-	Distribution           string                       `json:"distribution"`
-	Shard                  string                       `json:"shard"`
-	AllocationGeneration   uint64                       `json:"allocation_generation"`
-	ClusterID              string                       `json:"cluster_id"`
-	ClusterIncarnation     string                       `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch  uint64                       `json:"topology_recovery_epoch"`
-	ShardIncarnation       string                       `json:"shard_incarnation"`
-	GroupID                string                       `json:"group_id"`
-	ReplicaSetVersion      uint64                       `json:"replica_set_version"`
-	ActivePolicyGeneration uint64                       `json:"active_policy_generation"`
-	ProtectionEpoch        uint64                       `json:"protection_epoch"`
-	OwnershipEpoch         uint64                       `json:"ownership_epoch"`
-	SchemaGeneration       uint64                       `json:"schema_generation"`
-	RelationManifestDigest string                       `json:"relation_manifest_digest"`
-	RoutingVersion         uint64                       `json:"routing_version"`
-	RouteGeneration        uint64                       `json:"route_generation"`
-	Replicas               []persistedReplicatedReplica `json:"replicas"`
-	EnrolledTarget         *persistedReplicatedReplica  `json:"enrolled_target,omitempty"`
+	Distribution           string                          `json:"distribution"`
+	Shard                  string                          `json:"shard"`
+	AllocationGeneration   uint64                          `json:"allocation_generation"`
+	ClusterID              string                          `json:"cluster_id"`
+	ClusterIncarnation     string                          `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch  uint64                          `json:"topology_recovery_epoch"`
+	ShardIncarnation       string                          `json:"shard_incarnation"`
+	GroupID                string                          `json:"group_id"`
+	ReplicaSetVersion      uint64                          `json:"replica_set_version"`
+	ActivePolicyGeneration uint64                          `json:"active_policy_generation"`
+	ProtectionEpoch        uint64                          `json:"protection_epoch"`
+	OwnershipEpoch         uint64                          `json:"ownership_epoch"`
+	SchemaGeneration       uint64                          `json:"schema_generation"`
+	RelationManifestDigest string                          `json:"relation_manifest_digest"`
+	LogicalSchemaDigest    string                          `json:"logical_schema_digest"`
+	RangeIdentity          string                          `json:"range_identity"`
+	LineageDigest          string                          `json:"lineage_digest"`
+	ForwardingRuleDigest   string                          `json:"forwarding_rule_digest"`
+	RoutingVersion         uint64                          `json:"routing_version"`
+	RouteGeneration        uint64                          `json:"route_generation"`
+	Replicas               []persistedReplicatedReplica    `json:"replicas"`
+	EnrolledTarget         *persistedReplicatedReplica     `json:"enrolled_target,omitempty"`
+	SplitOrigin            *persistedReplicatedSplitOrigin `json:"split_origin,omitempty"`
 }
 
 type persistedReplicatedReplica struct {
@@ -589,9 +833,14 @@ func persistedReplicatedDescriptors(
 			RelationManifestDigest: hex.EncodeToString(
 				descriptor.Command.RelationManifestDigest[:],
 			),
-			RoutingVersion:  descriptor.Command.RoutingVersion,
-			RouteGeneration: descriptor.Command.RouteGeneration,
-			Replicas:        make([]persistedReplicatedReplica, len(descriptor.Replicas)),
+			LogicalSchemaDigest:  hex.EncodeToString(descriptor.LogicalSchemaDigest[:]),
+			RangeIdentity:        hex.EncodeToString(descriptor.RangeIdentity[:]),
+			LineageDigest:        hex.EncodeToString(descriptor.LineageDigest[:]),
+			ForwardingRuleDigest: hex.EncodeToString(descriptor.ForwardingRuleDigest[:]),
+			RoutingVersion:       descriptor.Command.RoutingVersion,
+			RouteGeneration:      descriptor.Command.RouteGeneration,
+			Replicas:             make([]persistedReplicatedReplica, len(descriptor.Replicas)),
+			SplitOrigin:          persistReplicatedSplitOrigin(descriptor.SplitOrigin),
 		}
 		for replicaOrdinal, replica := range descriptor.Replicas {
 			entry.Replicas[replicaOrdinal] = persistReplicatedReplica(replica)
@@ -642,10 +891,29 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				Reason: "replicated shard relation manifest digest: " + err.Error(),
 			}
 		}
+		var rangeIdentity, lineageDigest, forwardingRuleDigest, logicalSchemaDigest [32]byte
+		for _, item := range []struct {
+			name string
+			raw  string
+			dst  *[32]byte
+		}{
+			{"range identity", persisted.RangeIdentity, &rangeIdentity},
+			{"logical schema digest", persisted.LogicalSchemaDigest, &logicalSchemaDigest},
+			{"lineage digest", persisted.LineageDigest, &lineageDigest},
+			{"forwarding rule digest", persisted.ForwardingRuleDigest, &forwardingRuleDigest},
+		} {
+			if err := decodeFixed32Hex(item.raw, item.dst); err != nil {
+				return nil, &CatalogError{Reason: "replicated shard " + item.name + ": " + err.Error()}
+			}
+		}
 		descriptor := ReplicatedShardDescriptor{
 			Distribution: distribution.DistributionName(persisted.Distribution),
 			Shard:        distribution.ShardID(persisted.Shard), Group: group,
 			AllocationGeneration: distribution.ShardAllocationGeneration(persisted.AllocationGeneration),
+			RangeIdentity:        replication.Digest(rangeIdentity),
+			LogicalSchemaDigest:  replication.Digest(logicalSchemaDigest),
+			LineageDigest:        replication.Digest(lineageDigest),
+			ForwardingRuleDigest: replication.Digest(forwardingRuleDigest),
 			Command: raftservice.CommandFence{
 				ReplicaSetVersion:      persisted.ReplicaSetVersion,
 				ActivePolicyGeneration: persisted.ActivePolicyGeneration,
@@ -656,7 +924,8 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				RoutingVersion:         persisted.RoutingVersion,
 				RouteGeneration:        persisted.RouteGeneration,
 			},
-			Replicas: make([]ReplicatedReplicaDescriptor, len(persisted.Replicas)),
+			Replicas:    make([]ReplicatedReplicaDescriptor, len(persisted.Replicas)),
+			SplitOrigin: openReplicatedSplitOrigin(persisted.SplitOrigin),
 		}
 		for replicaOrdinal, replica := range persisted.Replicas {
 			decoded, err := openPersistedReplicatedReplica(replica)

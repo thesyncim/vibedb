@@ -55,7 +55,8 @@ func moveTestSnapshot(t testing.TB) *gateway.Snapshot {
 		"donor": "127.0.0.1:7003", "other": "127.0.0.1:7004",
 		"target-native": "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
 		"other-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7202",
-		"donor-control": "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
+		"source-control": "127.0.0.1:7201",
+		"donor-control":  "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
 	}, 9)
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +82,10 @@ func moveTestRequest() MoveRequest {
 		Distribution: "data", Shard: "all", Group: moveTestGroup(),
 		RetiringMember: 1, SnapshotSourceMember: 3, TargetMember: 2,
 		Source: "source", Target: "target",
+		RetiringReplica: ReplicaIdentity{
+			Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11},
+			NodeIncarnation: 21, ControlEndpoint: "source-control",
+		},
 	}
 }
 
@@ -117,13 +122,16 @@ func moveTestPostRemoveCatalog(t testing.TB, plan *Plan, replicaSetVersion uint6
 	endpoints := map[distribution.EndpointID]string{
 		"source": "127.0.0.1:7001", "target": "127.0.0.1:7002",
 		"donor": "127.0.0.1:7003", "other": "127.0.0.1:7004",
-		"target-native": "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
+		"source-control": "127.0.0.1:7201",
+		"target-native":  "127.0.0.1:7102", "donor-native": "127.0.0.1:7103",
 		"other-native": "127.0.0.1:7104", "target-control": "127.0.0.1:7202",
 		"donor-control": "127.0.0.1:7203", "other-control": "127.0.0.1:7204",
 	}
 	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: "data", Shard: "all", Group: plan.request.Group,
 		AllocationGeneration: 11,
+		RangeIdentity:        [32]byte{0x71}, LineageDigest: [32]byte{0x72},
+		ForwardingRuleDigest: [32]byte{0x73},
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: replicaSetVersion, ActivePolicyGeneration: 2,
 			ProtectionEpoch: 3, OwnershipEpoch: 14, SchemaGeneration: 4,
@@ -206,9 +214,13 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	observed.TargetState.ConfState = plan.voterConf
 	observed.TargetState.ReplicaSetVersion = 9
 	observed.TargetProgress.Learner = false
+	observed.TargetProgress.Match = 9
+	observed.TargetProgress.Next = 10
+	observed.TargetStatus.Applied = 9
+	observed.LeaderStatus = leaderStatus(1, 9)
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionTransferLeader || action.Member != 2 {
-		t.Fatalf("voter action = %+v, %v", action, err)
+		t.Fatalf("retiring leader action = %+v, %v", action, err)
 	}
 	observed.LeaderStatus = leaderStatus(2, 9)
 	observed.TargetStatus = observed.LeaderStatus
@@ -250,11 +262,10 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 		Match: 10, Next: 11, RecentActive: true,
 	}
 	action, err = Reconcile(plan, observed)
-	if err != nil || action.Kind != ActionTransferLeader || action.Member != 2 {
+	if err != nil || action.Kind != ActionAwaitCatalogDrain ||
+		action.CatalogGeneration != plan.nextCatalogGeneration {
 		t.Fatalf("post-publication leader loss action = %+v, %v", action, err)
 	}
-	observed.LeaderStatus = leaderStatus(2, 10)
-	observed.TargetStatus = observed.LeaderStatus
 	observed.DrainedCatalogGeneration = 10
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionRemoveSource ||
@@ -286,6 +297,57 @@ func TestReplicaMoveReconcileRequiresEverySafetyFence(t *testing.T) {
 	action, err = Reconcile(plan, observed)
 	if err != nil || action.Kind != ActionComplete {
 		t.Fatalf("complete action = %+v, %v", action, err)
+	}
+}
+
+func TestReplicaMoveTransfersOnlyRetiringSourceLeadership(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	plan = bindMoveTestPlan(plan)
+	state := plan.baseState
+	state.Applied = 9
+	state.ReplicaSetVersion = 9
+	state.ConfState = plan.voterConf
+	ready := Observation{
+		Catalog: catalog,
+		Publication: raftmodel.Publication{
+			Applied: 9, ReplicaSetVersion: 9, ConfState: plan.voterConf,
+		},
+		LeaderStatus: leaderStatus(plan.request.RetiringMember, 9),
+		TargetStatus: raftmember.RuntimeStatus{MemberID: plan.request.TargetMember, Applied: 9},
+		TargetState:  state,
+		TargetProgress: raftmodel.MemberProgress{
+			Match: 9, Next: 10, RecentActive: true,
+		},
+		ProgressFound: true,
+	}
+
+	lagging := ready
+	lagging.TargetProgress.Match = 8
+	if action, err := Reconcile(plan, lagging); err != nil ||
+		action.Kind != ActionAwaitCatchUp || action.Member != plan.request.TargetMember {
+		t.Fatalf("source leader with lagging target action = %+v, %v", action, err)
+	}
+	if action, err := Reconcile(plan, ready); err != nil ||
+		action.Kind != ActionTransferLeader || action.Member != plan.request.TargetMember {
+		t.Fatalf("source leader with ready target action = %+v, %v", action, err)
+	}
+
+	otherLeader := ready
+	otherLeader.LeaderStatus = leaderStatus(plan.request.SnapshotSourceMember, 9)
+	// Once a live observation proves leadership has left the retiring source,
+	// stale per-target progress cannot force an unnecessary second transfer.
+	otherLeader.ProgressFound = false
+	otherLeader.TargetProgress = raftmodel.MemberProgress{}
+	otherLeader.TargetStatus = raftmember.RuntimeStatus{}
+	if action, err := Reconcile(plan, otherLeader); err != nil ||
+		action.Kind != ActionAdvanceOwnership || action.Member != plan.request.TargetMember {
+		t.Fatalf("other leader action = %+v, %v", action, err)
+	}
+
+	staleLeader := ready
+	staleLeader.LeaderStatus.Term = 0
+	if action, err := Reconcile(plan, staleLeader); err != nil || action.Kind != ActionAwaitLeader {
+		t.Fatalf("stale leader observation action = %+v, %v", action, err)
 	}
 }
 

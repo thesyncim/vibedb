@@ -2,6 +2,8 @@ package competitive
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 
 	badger "github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/options"
@@ -47,6 +49,17 @@ func badgerScanOptions(cfg Config) badger.IteratorOptions {
 }
 
 func newBadger(cfg Config) (Engine, error) {
+	return openBadgerMode(cfg, true)
+}
+
+func openBadger(cfg Config) (Engine, error) {
+	if _, err := os.Stat(filepath.Join(cfg.Dir, "MANIFEST")); err != nil {
+		return nil, err
+	}
+	return openBadgerMode(cfg, false)
+}
+
+func openBadgerMode(cfg Config, _ bool) (Engine, error) {
 	if err := validateEngineExactIndexes("badger", cfg.ExactIndexes); err != nil {
 		return nil, err
 	}

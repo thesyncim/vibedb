@@ -224,8 +224,14 @@ func (p *Partitioner) WriteChildArtifacts(
 	options ChildArtifactOptions,
 	workspace *ChildArtifactWorkspace,
 ) (ChildArtifactSet, error) {
-	if p == nil || snapshot == nil || workspace == nil {
+	if p == nil || p.RelationCount() != 1 || snapshot == nil || workspace == nil {
 		return ChildArtifactSet{}, ErrInvalidPartition
+	}
+	if p.bundle != nil {
+		fence := snapshot.Fence()
+		if !p.MatchesSourceSchema(fence.Binding.SchemaGeneration, fence.RelationManifestDigest) {
+			return ChildArtifactSet{}, ErrSourceFence
+		}
 	}
 	user, ok := snapshot.Collection(p.collection)
 	if !ok || user == nil {
@@ -240,7 +246,7 @@ func (p *Partitioner) writeChildArtifacts(
 	options ChildArtifactOptions,
 	workspace *ChildArtifactWorkspace,
 ) (ChildArtifactSet, error) {
-	if p == nil || rangeRows == nil || workspace == nil || !p.matchesSource(state) {
+	if p == nil || p.RelationCount() != 1 || rangeRows == nil || workspace == nil || !p.matchesSource(state) {
 		return ChildArtifactSet{}, ErrSourceFence
 	}
 	target, err := normalizeChildArtifactTarget(options.TargetChunkBytes)
@@ -616,7 +622,7 @@ func (p *Partitioner) VerifyChildArtifact(
 	callbacks ChildArtifactCallbacks,
 	workspace *ChildArtifactVerifyWorkspace,
 ) (ChildArtifactManifest, error) {
-	if p == nil || r == nil || int(child) >= int(p.childCount) || child == p.retained {
+	if p == nil || p.RelationCount() != 1 || r == nil || int(child) >= int(p.childCount) || child == p.retained {
 		return ChildArtifactManifest{}, ErrInvalidPartition
 	}
 	if workspace == nil {

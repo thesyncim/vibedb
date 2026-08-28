@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 var _ raftmodel.NormalBatchStateMachine = (*Machine)(nil)
@@ -221,7 +222,8 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, nil
 	}
 	first := entries[0]
-	if first.Meta.Type != pb.EntryNormal || IsOwnershipTransition(first.Data) {
+	if first.Meta.Type != pb.EntryNormal || IsOwnershipTransition(first.Data) ||
+		IsSchemaTransition(first.Data) {
 		return 0, raftmodel.Publication{}, nil
 	}
 	if !m.initialized {
@@ -273,6 +275,7 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, m.fail(errors.Join(stateErr, m.applyCut.Close()))
 	}
 	stateEnvelopeBytes := len(batch.state)
+	confBytes := proto.Size(m.state.ConfState)
 	batch.state = batch.state[:0]
 	working := m.state
 	planned := 0
@@ -290,7 +293,8 @@ func (m *Machine) ApplyNormalBatch(
 	for index := range entries {
 		entry := entries[index]
 		meta, data := entry.Meta, entry.Data
-		if meta.Type != pb.EntryNormal || IsOwnershipTransition(data) {
+		if meta.Type != pb.EntryNormal || IsOwnershipTransition(data) ||
+			IsSchemaTransition(data) {
 			break
 		}
 		if meta.Term == 0 || meta.Term == math.MaxUint64 {
@@ -322,7 +326,11 @@ func (m *Machine) ApplyNormalBatch(
 				deferredErr = ErrWrongBinding
 				break
 			}
-			if command.Kind() == replication.CommandTransaction {
+			if command.Kind() == replication.CommandTransaction ||
+				command.Kind() == replication.CommandRequestLedger ||
+				command.Kind() == replication.CommandRouteGate ||
+				command.Kind() == replication.CommandExecutionPin ||
+				command.Kind() == replication.CommandSplitCaptureActivate {
 				break
 			}
 			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
@@ -352,6 +360,15 @@ func (m *Machine) ApplyNormalBatch(
 			}
 		}
 
+		// A stale result can create the first unfenced retry slot, and replacing
+		// the last such slot can remove that extension again. Normal batches do
+		// not change ConfState, but their canonical state header is not constant.
+		// Charge the exact prospective envelope before admitting each prefix.
+		nextEnvelopeBytes, sizeErr := stateEncodingSize(next, confBytes)
+		if sizeErr != nil {
+			deferredErr = sizeErr
+			break
+		}
 		systemMark := batch.system.mark()
 		for ordinal := range m.relations {
 			batch.relationMarks[ordinal] = batch.relationOverlay(ordinal).mark()
@@ -365,7 +382,7 @@ func (m *Machine) ApplyNormalBatch(
 			}
 			break
 		}
-		if !m.batchFits(batch, 1, len(stateKey)+stateEnvelopeBytes) {
+		if !m.batchFits(batch, 1, len(stateKey)+nextEnvelopeBytes) {
 			batch.system.rollback(systemMark)
 			for ordinal := range m.relations {
 				batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
@@ -380,12 +397,39 @@ func (m *Machine) ApplyNormalBatch(
 			batch.attemptedOverlay(ordinal).commit(batch.attemptedMarks[ordinal])
 		}
 		working = next
+		stateEnvelopeBytes = nextEnvelopeBytes
 		dataChainWitnesses[planned] = working.DataChainDigest
 		planned++
 	}
 	var finalizeErr error
+	var nextPlacements [replication.MaxRelationsPerBundle]relationPlacementAccumulator
 	if planned != 0 {
-		batch.state, finalizeErr = AppendState(batch.state[:0], working)
+		for ordinal := range m.relations {
+			nextPlacements[ordinal] = m.relations[ordinal].placement
+			if m.relations[ordinal].kind != RelationGlobalIndex ||
+				!m.relations[ordinal].placement.enabled {
+				continue
+			}
+			validator, ok := m.relations[ordinal].target.Validator.(GlobalIndexPlacementValidator)
+			if !ok {
+				finalizeErr = ErrSchemaProfile
+				break
+			}
+			if err := batch.relationOverlay(ordinal).updateRelationPlacement(
+				validator, &nextPlacements[ordinal],
+			); err != nil {
+				finalizeErr = err
+				break
+			}
+		}
+		if finalizeErr == nil {
+			working.RelationPlacementDigest = relationPlacementStateDigestWith(
+				working.Binding.SchemaGeneration, m.manifestDigest, m.relations, &nextPlacements,
+			)
+		}
+		if finalizeErr == nil {
+			batch.state, finalizeErr = AppendState(batch.state[:0], working)
+		}
 		if finalizeErr == nil && len(batch.state) != stateEnvelopeBytes {
 			finalizeErr = fmt.Errorf(
 				"%w: normal state envelope changed size", ErrStateCorrupt,
@@ -409,7 +453,6 @@ func (m *Machine) ApplyNormalBatch(
 		}
 		return 0, raftmodel.Publication{}, m.fail(deferredErr)
 	}
-
 	m.transitionMembers = m.transitionMembers[:0]
 	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
@@ -497,6 +540,15 @@ func (m *Machine) ApplyNormalBatch(
 			m.relations[ordinal].openedGen = 0
 		}
 	}
+	for ordinal := range m.relations {
+		if m.relations[ordinal].kind != RelationGlobalIndex {
+			continue
+		}
+		m.relations[ordinal].placement = nextPlacements[ordinal]
+		m.relations[ordinal].placementApplied = working.Applied
+		m.relations[ordinal].placementGen =
+			m.relations[ordinal].target.Collection.Generation()
+	}
 	m.state = working
 	m.initialized = true
 	m.publication = publicationFromState(working)
@@ -512,19 +564,31 @@ func (m *Machine) nextBatchState(
 		Binding: current.Binding, Applied: meta.Index, LastTerm: meta.Term,
 		LastKind: RecordNormal, LastEntryType: meta.Type, LastEntryDigest: digest,
 		DataChainDigest: current.DataChainDigest, ConfState: current.ConfState,
-		ApplyContractDigest:      current.ApplyContractDigest,
-		ReplicaSetVersion:        current.ReplicaSetVersion,
-		BootstrapDigest:          current.BootstrapDigest,
-		SnapshotBaseDigest:       current.SnapshotBaseDigest,
-		SessionCount:             current.SessionCount,
-		SessionSlotCount:         current.SessionSlotCount,
-		SessionEpochHighWater:    current.SessionEpochHighWater,
-		AuthorityBindingCount:    current.AuthorityBindingCount,
-		TransactionControlCount:  current.TransactionControlCount,
-		ActiveTransactionCount:   current.ActiveTransactionCount,
-		TransactionPayloadRows:   current.TransactionPayloadRows,
-		TransactionIntentRows:    current.TransactionIntentRows,
-		TransactionResidentBytes: current.TransactionResidentBytes,
+		ApplyContractDigest:        current.ApplyContractDigest,
+		ReplicaSetVersion:          current.ReplicaSetVersion,
+		BootstrapDigest:            current.BootstrapDigest,
+		SnapshotBaseDigest:         current.SnapshotBaseDigest,
+		SessionCount:               current.SessionCount,
+		SessionSlotCount:           current.SessionSlotCount,
+		SessionEpochHighWater:      current.SessionEpochHighWater,
+		AuthorityBindingCount:      current.AuthorityBindingCount,
+		TransactionControlCount:    current.TransactionControlCount,
+		ActiveTransactionCount:     current.ActiveTransactionCount,
+		TransactionPayloadRows:     current.TransactionPayloadRows,
+		TransactionIntentRows:      current.TransactionIntentRows,
+		TransactionResidentBytes:   current.TransactionResidentBytes,
+		RequestLedgerRows:          current.RequestLedgerRows,
+		RequestLedgerResidentBytes: current.RequestLedgerResidentBytes,
+		RequestLedgerReservedBytes: current.RequestLedgerReservedBytes,
+		RequestLedgerAckRows:       current.RequestLedgerAckRows,
+		RequestLedgerAckBytes:      current.RequestLedgerAckBytes,
+		ExecutionPinRecordCount:    current.ExecutionPinRecordCount,
+		ActiveExecutionPinCount:    current.ActiveExecutionPinCount,
+		ExecutionPinResidentBytes:  current.ExecutionPinResidentBytes,
+		RelationPlacementDigest:    current.RelationPlacementDigest,
+		FenceOriginDigest:          current.FenceOriginDigest, FenceApplied: current.FenceApplied,
+		HistoricalFenceCount: current.HistoricalFenceCount, HistoricalFenceSlots: current.HistoricalFenceSlots,
+		UnfencedSessionSlots: current.UnfencedSessionSlots,
 	}
 }
 
@@ -534,6 +598,11 @@ func (m *Machine) recordBatchPlan(
 ) error {
 	if batch == nil {
 		return ErrInvalidCollection
+	}
+	for _, row := range plan.systemRows {
+		if err := batch.system.record(row.key, row.value, row.delete); err != nil {
+			return err
+		}
 	}
 	if plan.writeSession {
 		if err := batch.system.record(plan.sessionKey[:], plan.sessionRecord, false); err != nil {

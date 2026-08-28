@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -169,17 +170,25 @@ const (
 // promotes Kind to ProgressFault, and are zero for all other work. When RunOne
 // also returns an error, Done is still true if input was consumed or a group
 // was newly latched faulted. ReadOutcomes is owned by the caller and present
-// only on the corresponding Ready completion step.
+// only on the corresponding Ready completion step. CommitAdvancements and
+// CommittedEntries are deltas from counters recorded at the RawNode mutation
+// authority, not deductions from Ready persistence or application.
 type Progress struct {
-	Group         raftmember.GroupKey
-	Kind          ProgressKind
-	ReadyKind     raftmember.DriveKind
-	ProposalCount int
-	ProposalBytes int64
-	AppliedCount  int
-	AppliedFirst  uint64
-	AppliedLast   uint64
-	ReadOutcomes  []raftmodel.ReadOutcome
+	Group              raftmember.GroupKey
+	Kind               ProgressKind
+	ReadyKind          raftmember.DriveKind
+	ProposalCount      int
+	ProposalBytes      int64
+	AppliedCount       int
+	AppliedFirst       uint64
+	AppliedLast        uint64
+	CommitAdvancements uint64
+	CommittedEntries   uint64
+	ReadOutcomes       []raftmodel.ReadOutcome
+}
+
+type commitMetricsRuntime interface {
+	CommitMetrics() raftmodel.CommitMetrics
 }
 
 type memberRuntime interface {
@@ -204,6 +213,24 @@ type memberRuntime interface {
 	) (raftmember.DriveResult, error)
 	HasPendingResultSettlement() bool
 	Close() error
+}
+
+type snapshotBaseRuntime interface {
+	SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error)
+}
+
+type schemaGenerationRuntime interface {
+	QuiesceSQLGeneration() error
+	InstallSQLGeneration(
+		*sqldriver.Database,
+		*sqldriver.ReplicatedApply,
+		sqldriver.ReplicatedShardStoreIdentity,
+		sqldriver.ReplicatedApplyIdentity,
+	) error
+}
+
+type schemaTransitionObserver interface {
+	ObserveSchemaTransition([]byte) (uint64, bool, error)
 }
 
 type queuedMessage struct {
@@ -350,7 +377,9 @@ type groupState struct {
 	nextClass         inputClass
 	failure           error
 	retiring          bool
+	schemaQuiesced    bool
 	trackedLeaderTerm uint64
+	commitMetrics     raftmodel.CommitMetrics
 }
 
 type outboundItem struct {
@@ -562,6 +591,9 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 		key: key, memberID: identity.MemberID, runtime: runtime,
 		sourceOwner: owner, sourceToken: sourceToken,
 		sourceClaimed: host.serving.ClaimSource != nil,
+	}
+	if provider, ok := runtime.(commitMetricsRuntime); ok {
+		group.commitMetrics = provider.CommitMetrics()
 	}
 	host.groups[key] = group
 	host.order = append(host.order, group)
@@ -818,6 +850,22 @@ func (host *Host) SnapshotState(key raftmember.GroupKey) (replicatedstate.State,
 	return group.runtime.SnapshotState()
 }
 
+// SnapshotBaseCertificate returns the exact immutable certificate retained by
+// one member's current WAL generation.
+func (host *Host) SnapshotBaseCertificate(
+	key raftmember.GroupKey,
+) (replicatedstate.SnapshotBaseCertificate, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	source, ok := group.runtime.(snapshotBaseRuntime)
+	if !ok {
+		return replicatedstate.SnapshotBaseCertificate{}, nil
+	}
+	return source.SnapshotBaseCertificate()
+}
+
 // Status returns one group's detached local Raft status.
 func (host *Host) Status(key raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
 	group, err := host.lookup(key)
@@ -894,6 +942,66 @@ func (host *Host) RequestTick(key raftmember.GroupKey) error {
 	return nil
 }
 
+// QuiesceSQLGeneration removes one idle group from scheduling while retaining
+// its WAL, RawNode, member incarnation, and replication progress.
+func (host *Host) QuiesceSQLGeneration(key raftmember.GroupKey) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	runtime, ok := group.runtime.(schemaGenerationRuntime)
+	if !ok || group.schemaQuiesced || group.retiring || group.items != 0 ||
+		group.messages.len() != 0 || group.proposals.len() != 0 || group.ticks != 0 ||
+		group.campaigns != 0 || group.runtime.HasPendingResultSettlement() {
+		return ErrGroupBusy
+	}
+	if err = runtime.QuiesceSQLGeneration(); err != nil {
+		return errors.Join(ErrGroupBusy, err)
+	}
+	group.schemaQuiesced = true
+	group.runnable = false
+	return nil
+}
+
+func (host *Host) ObserveSchemaTransition(
+	key raftmember.GroupKey, command []byte,
+) (uint64, bool, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return 0, false, err
+	}
+	observer, ok := group.runtime.(schemaTransitionObserver)
+	if !ok || group.schemaQuiesced {
+		return 0, false, ErrGroupBusy
+	}
+	return observer.ObserveSchemaTransition(command)
+}
+
+// InstallSQLGeneration publishes the exact target SQL handles into a quiesced
+// group and resumes its existing Raft runtime without reconstructing RawNode.
+func (host *Host) InstallSQLGeneration(
+	key raftmember.GroupKey,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	runtime, ok := group.runtime.(schemaGenerationRuntime)
+	if !ok || !group.schemaQuiesced || database == nil || apply == nil {
+		return ErrGroupBusy
+	}
+	if err = runtime.InstallSQLGeneration(database, apply, expectedSQL, expectedApply); err != nil {
+		return err
+	}
+	group.schemaQuiesced = false
+	host.wake(group)
+	return nil
+}
+
 // RequestCampaign retains one exact campaign request. Requests are not
 // coalesced because doing so would change protocol input semantics.
 func (host *Host) RequestCampaign(key raftmember.GroupKey) error {
@@ -911,6 +1019,9 @@ func (host *Host) RequestCampaign(key raftmember.GroupKey) error {
 }
 
 func (host *Host) admitInput(group *groupState, size int64) error {
+	if group.schemaQuiesced {
+		return ErrGroupBusy
+	}
 	if size < 0 || group.items >= host.limits.MaxGroupItems || host.queueItems >= host.limits.MaxQueueItems ||
 		size > host.limits.MaxGroupBytes-group.bytes || size > host.limits.MaxQueueBytes-host.queueBytes {
 		return ErrQueueFull
@@ -993,7 +1104,8 @@ func (host *Host) RunOne() (Progress, bool, error) {
 	blockedOutbox := false
 	for range count {
 		group := host.popRunnable()
-		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
+		if group == nil || group.runtime == nil || group.failure != nil || group.retiring ||
+			group.schemaQuiesced {
 			continue
 		}
 		host.readyGroup = group
@@ -1013,7 +1125,9 @@ func (host *Host) RunOne() (Progress, bool, error) {
 					group.failure = err
 				}
 				host.purgeGroup(group)
-				return Progress{Group: group.key, Kind: ProgressFault}, true, err
+				progress := Progress{Group: group.key, Kind: ProgressFault}
+				host.observeCommitProgress(group, &progress)
+				return progress, true, err
 			}
 			// Persistence and other nonterminal boundary errors retain their exact
 			// Runtime phase. Re-wake the group so an explicit later RunOne can retry.
@@ -1024,12 +1138,14 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		host.observeTrackedLeadership(group)
 		if ready.Progressed() {
 			host.wake(group)
-			return Progress{
+			progress := Progress{
 				Group: group.key, Kind: ProgressReady, ReadyKind: ready.Kind,
 				AppliedCount: ready.Applied.Len(), AppliedFirst: ready.Applied.FirstIndex(),
 				AppliedLast:  ready.Applied.LastIndex(),
 				ReadOutcomes: ready.ReadOutcomes,
-			}, true, nil
+			}
+			host.observeCommitProgress(group, &progress)
+			return progress, true, nil
 		}
 
 		progress, consumed, inputErr := host.runInput(group)
@@ -1185,7 +1301,12 @@ func (host *Host) purgeGroup(group *groupState) {
 	group.runnable = false
 }
 
-func (host *Host) runInput(group *groupState) (Progress, bool, error) {
+func (host *Host) runInput(group *groupState) (result Progress, consumed bool, resultErr error) {
+	defer func() {
+		if consumed {
+			host.observeCommitProgress(group, &result)
+		}
+	}()
 	for checked := inputClass(0); checked < inputClassCount; checked++ {
 		class := (group.nextClass + checked) % inputClassCount
 		progress := Progress{Group: group.key}
@@ -1288,6 +1409,24 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 		}
 	}
 	return Progress{}, false, nil
+}
+
+func (host *Host) observeCommitProgress(group *groupState, progress *Progress) {
+	if group == nil || progress == nil || group.runtime == nil {
+		return
+	}
+	provider, ok := group.runtime.(commitMetricsRuntime)
+	if !ok {
+		return
+	}
+	current := provider.CommitMetrics()
+	if current.Advancements >= group.commitMetrics.Advancements {
+		progress.CommitAdvancements = current.Advancements - group.commitMetrics.Advancements
+	}
+	if current.Entries >= group.commitMetrics.Entries {
+		progress.CommittedEntries = current.Entries - group.commitMetrics.Entries
+	}
+	group.commitMetrics = current
 }
 
 func (host *Host) enqueueReadyOutbound(outbound raftmember.OutboundMessage) error {
