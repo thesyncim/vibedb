@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 )
@@ -52,11 +53,11 @@ func (binding *childAdoptionCheckpointBinding) record(ctx context.Context, prepa
 	}
 	stored, found, err := binding.lease.Load(RuntimeStateCertificate, 0)
 	if err != nil || !found {
-		return errors.Join(ErrTopologyConflict, err)
+		return errors.Join(fmt.Errorf("%w: adoption certificate found=%t", ErrTopologyConflict, found), err)
 	}
 	certificate, err := rangesplit.OpenCutoverCertificate(stored.Payload)
 	if err != nil || certificate == nil || binding.plan.partitioner.VerifyCutoverCertificate(*certificate) != nil {
-		return errors.Join(ErrTopologyConflict, err)
+		return errors.Join(fmt.Errorf("%w: adoption certificate does not match plan", ErrTopologyConflict), err)
 	}
 	proof := CertifiedChildAdoption{operation: binding.plan.operation,
 		child: binding.child, plan: binding.digest, cutover: certificate.Digest(), replica: binding.replica}

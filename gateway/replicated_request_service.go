@@ -511,19 +511,23 @@ func (service *DurableRequestService) drive(
 	for {
 		outcome, err := service.driveOnce(ctx, home, key, head, applied)
 		var advanced *durableRequestAdvancedError
-		if !errors.As(err, &advanced) {
+		if !errors.As(err, &advanced) && !errors.Is(err, ErrDurableRequestConflict) {
 			return outcome, err
+		}
+		minimumApplied, minimumRevision := applied, head.Revision
+		if advanced != nil {
+			minimumApplied, minimumRevision = max(applied, advanced.applied), advanced.revision
 		}
 		if ctx.Err() != nil {
 			return DurableRequestOutcome{}, errors.Join(err, ctx.Err())
 		}
-		next, ack, nextApplied, readErr := service.openHead(ctx, home, key.RequestKey, max(applied, advanced.applied))
+		next, ack, nextApplied, readErr := service.openHead(ctx, home, key.RequestKey, minimumApplied)
 		if readErr == nil && ack.Revision != 0 {
 			return DurableRequestOutcome{Acknowledged: true}, ErrDurableRequestAcknowledged
 		}
 		if readErr != nil || next.Key != head.Key || next.KeyDigest != head.KeyDigest ||
 			next.RequestDigest != head.RequestDigest || next.PlanRoot != head.PlanRoot ||
-			next.Revision < advanced.revision || next.Revision <= head.Revision {
+			next.Revision < minimumRevision || next.Revision <= head.Revision {
 			return DurableRequestOutcome{}, errors.Join(err, readErr, ErrDurableRequestUnresolved)
 		}
 		// Strict durable revision progress and the caller's deadline bound this

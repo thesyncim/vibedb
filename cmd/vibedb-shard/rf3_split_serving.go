@@ -172,6 +172,9 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 					PruneFactory:       topologyFactory,
 					PruneLimits:        rangesplit.RetainedPruneLimits{},
 					ArtifactChunkBytes: rangesplit.DefaultChildArtifactChunkBytes,
+					RecoverArtifacts: func(ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation) (bool, error) {
+						return splitcontroller.RecoverSourceArtifactOwner(ctx, plan, observed, opener, options.deadline, options.owners)
+					},
 				})
 				if openErr != nil {
 					return nil, openErr

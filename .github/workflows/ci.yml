@@ -326,7 +326,7 @@ jobs:
           max_rss_bytes 8589934592
           storage_growth_bytes 2147483648
           wal_growth_bytes 536870912
-          storage_amplification_milli 5000000
+          non_wal_storage_growth_bytes 67108864
           EOF
           test "$(stat -c %s "${summary}")" -le 65536
       - name: Upload replica-replacement evidence

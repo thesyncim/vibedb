@@ -1273,6 +1273,7 @@ func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
 		[]byte("metric\tgroup_replacement_p99_millis\t19\n"),
 		[]byte("metric\tstorage_growth_bytes\t1000\n"),
 		[]byte("metric\twal_growth_bytes\t200\n"),
+		[]byte("metric\tnon_wal_storage_growth_bytes\t800\n"),
 		[]byte("metric\tstorage_amplification_milli\t10000\n"),
 	} {
 		if !strings.Contains(string(raw), string(exact)) {
@@ -1282,6 +1283,11 @@ func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
 	measurements.failoverMillis = 30_001
 	if err := measurements.validate(); err == nil {
 		t.Fatal("measurement accepted failover above the hard bound")
+	}
+	measurements.failoverMillis = 10
+	measurements.finalStorageBytes = measurements.initialStorageBytes + 200 + (64 << 20) + 1
+	if err := measurements.validate(); err == nil {
+		t.Fatal("measurement accepted excess non-WAL storage growth")
 	}
 }
 
@@ -1311,6 +1317,10 @@ func (measurements *replicaProcessMeasurements) appendTSV(raw []byte) []byte {
 		{"max_rss_bytes", measurements.maxRSSBytes},
 		{"storage_growth_bytes", storageGrowth},
 		{"wal_growth_bytes", walGrowth},
+		// WAL files reserve their full serving capacity before the first
+		// write. Keep the raw tiny-catalog ratio as evidence, but qualify
+		// actual non-WAL growth separately from that fixed reservation.
+		{"non_wal_storage_growth_bytes", positiveDifference(storageGrowth, walGrowth)},
 		{"storage_amplification_milli", amplification},
 		{"logical_catalog_bytes", measurements.logicalBytes},
 		{"abandonment_rename_restart_millis", measurements.abandonRenameMillis},
@@ -1344,7 +1354,8 @@ func (measurements *replicaProcessMeasurements) validate() error {
 		measurements.abandonUnlinkMillis == 0 || measurements.abandonUnlinkMillis > 15_000 ||
 		measurements.abandonmentControlBytes == 0 || measurements.abandonmentControlBytes > 4096 ||
 		measurements.abandonmentRetainedBytes != 0 ||
-		storageGrowth > 2<<30 || walGrowth > 512<<20 || measurements.logicalBytes == 0 {
+		storageGrowth > 2<<30 || walGrowth > 512<<20 ||
+		positiveDifference(storageGrowth, walGrowth) > 64<<20 || measurements.logicalBytes == 0 {
 		return fmt.Errorf("replica process performance bounds: failover=%dms admission=%dms restart=%dms replacement=%dms cleanup=%dms snapshot=%d rss=%d storage-growth=%d wal-growth=%d logical=%d",
 			measurements.failoverMillis, measurements.admissionMillis, measurements.controllerRestartMillis,
 			measurements.replacementMillis, measurements.cleanupMillis,

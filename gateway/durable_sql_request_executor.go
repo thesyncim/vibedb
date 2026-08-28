@@ -109,6 +109,17 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		opctx, lease.snapshot, queries, profile, executor.data,
 	)
 	if err != nil || !handled || len(participants) == 0 {
+		if errors.Is(err, ErrReplicatedReadIntentActive) {
+			// An exact retry may encounter its own already-prepared writes.
+			// Recover the authenticated retained recipe instead of requiring
+			// a new row image through that intent. No record means this is
+			// another request's intent and the original refusal still stands.
+			result, found, replayErr := executor.Replay(opctx, key)
+			if found {
+				return result, replayErr
+			}
+			err = errors.Join(err, replayErr)
+		}
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL lowering: %w", errors.Join(err, ErrDurableSQLRequest))
 	}
 	program, err := BuildDurableRequestLogicalProgram(DurableRequestLogicalProgramBuild{

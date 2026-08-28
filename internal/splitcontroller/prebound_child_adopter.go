@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -90,10 +91,10 @@ func (adopter *PreboundChildRuntimeAdopter) AdoptSplitChild(
 	) ||
 		!runtimeIdentityMatches(adopter.target, identity) ||
 		identity.RelationManifestDigest != adopter.command.RelationManifestDigest {
-		return errors.Join(ErrTopologyConflict, profileErr, publicationErr)
+		return errors.Join(fmt.Errorf("%w: child adoption member=%d initialized=%t binding=%t profile=%t identity=%t digest=%t roster=%t version=%d conf=%v", ErrTopologyConflict, identity.MemberID, profile.Initialized, profile.Binding == adopter.target.SQL.Binding, profile.RelationManifestDigest == adopter.command.RelationManifestDigest, runtimeIdentityMatches(adopter.target, identity), identity.RelationManifestDigest == adopter.command.RelationManifestDigest, childPublicationMatchesRoster(publication.ReplicaSetVersion, publication.ConfState, adopter.roster), publication.ReplicaSetVersion, publication.ConfState), profileErr, publicationErr)
 	}
 	if err := adopter.checkpoint.record(ctx, prepared); err != nil {
-		return err
+		return fmt.Errorf("checkpoint child adoption: %w", err)
 	}
 	return adopter.registrar.RegisterExecutionGroup(adopter.roster, raftservice.ExecutionGroup{
 		Runtime: prepared.Runtime, Identity: identity, Command: adopter.command,

@@ -123,6 +123,7 @@ const (
 	requestObserveSchemaTransition
 	requestQuiesceSchemaGeneration
 	requestInstallSchemaGeneration
+	requestSplitSourceLeadership
 )
 
 const (
@@ -1093,6 +1094,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 	case requestOwnershipTransition:
 		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
+	case requestSplitSourceLeadership:
+		reply.err = owner.transferSplitSourceLeadership(request.fence, request.targetMember)
 	case requestSchemaTransition:
 		reply.err = owner.applySchemaTransition(request.fence, request.data)
 	case requestReplicaRetirement:

@@ -1147,6 +1147,9 @@ func replicatedChildAction(target ChildTarget, status ChildObservation, certific
 			!member.ApplyProfile.Initialized || member.ApplyProfile.Applied < certificate.SourceCut().Applied ||
 			member.ApplyProfile.SessionEpochHighWater != certificate.SourceCut().Applied ||
 			member.ApplyProfile.MaxSessions != member.ApplyIdentity.MaxSessions || member.ApplyProfile.RetryWindow != member.ApplyIdentity.RetryWindow {
+			if replica != nil {
+				return Action{}, false, fmt.Errorf("%w: child member=%d phase=%d applied=%d epoch=%d cut=%d identity=%t binding=%t digest=%t sessions=%d/%d retry=%d/%d", ErrTopologyConflict, member.Member, member.Phase, member.ApplyProfile.Applied, member.ApplyProfile.SessionEpochHighWater, certificate.SourceCut().Applied, member.ApplyIdentity == replica.Apply, member.ApplyProfile.Binding == replica.SQL.Binding, member.ApplyProfile.RelationManifestDigest == target.RelationManifestDigest, member.ApplyProfile.MaxSessions, member.ApplyIdentity.MaxSessions, member.ApplyProfile.RetryWindow, member.ApplyIdentity.RetryWindow)
+			}
 			return Action{}, false, ErrTopologyConflict
 		}
 		for prior := 0; prior < index; prior++ {

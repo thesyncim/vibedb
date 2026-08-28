@@ -16,9 +16,10 @@ import (
 )
 
 type replicatedSQLIndexedReadClient struct {
-	states map[string]shardservice.ReplicatedMemberState
-	value  []byte
-	reads  int
+	states  map[string]shardservice.ReplicatedMemberState
+	value   []byte
+	reads   int
+	refusal shardservice.ReplicatedRefusalCode
 }
 
 func (client *replicatedSQLIndexedReadClient) DoReplicated(
@@ -39,6 +40,10 @@ func (client *replicatedSQLIndexedReadClient) DoReplicated(
 		return nil, ErrReplicatedRoute
 	}
 	client.reads++
+	if client.refusal != shardservice.ReplicatedRefusalNone {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
+			Refusal: client.refusal, HasState: true, State: state}, nil
+	}
 	return &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedReadFound, HasState: true, State: state,
 		ReadApplied: state.Applied, Value: client.value,

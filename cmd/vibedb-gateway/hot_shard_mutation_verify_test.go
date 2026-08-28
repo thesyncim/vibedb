@@ -52,6 +52,9 @@ func (client *hotMutationWireClient) getMessage(t *testing.T) (hotMutationDocume
 		if descriptor.Distribution != verifier.baseRoute.Distribution {
 			continue
 		}
+		if hotMutationKeyShard(t, catalog, descriptor.Distribution, "m-0") != descriptor.Shard {
+			continue // Narrowed groups must refuse points outside their range.
+		}
 		route, ok := catalog.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount))
 		if !ok {
 			t.Fatal("current base route missing")
@@ -84,6 +87,23 @@ type hotMutationVerifier struct {
 	indexRoute gateway.ReplicatedRoute
 }
 
+func hotMutationKeyShard(t *testing.T, catalog *gateway.Snapshot, name distribution.DistributionName, id string) distribution.ShardID {
+	t.Helper()
+	manifest, ok := catalog.Manifest(name)
+	if !ok {
+		t.Fatal("verification manifest missing")
+	}
+	point, err := distribution.NewNativeMapper(1).PointFor([]distribution.Scalar{distribution.NewString(id)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, ok := manifest.ResolvePoint(point)
+	if !ok {
+		t.Fatal("verification point is not covered")
+	}
+	return shard
+}
+
 func newHotMutationVerifier(t *testing.T, profile *rafttransport.PeerTLS, snapshot *gateway.Snapshot, catalog *gateway.ReplicatedCatalogAuthority, baseRoute, indexRoute gateway.ReplicatedRoute) *hotMutationVerifier {
 	t.Helper()
 	client := durableRF3ExternalReplicatedClient(t, profile)
@@ -114,13 +134,30 @@ func (verifier *hotMutationVerifier) syncFinalVoters(t *testing.T, catalog *gate
 		if descriptor.Distribution == verifier.indexRoute.Distribution {
 			id = "l-1"
 		}
+		ownsRow := hotMutationKeyShard(t, catalog, descriptor.Distribution, id) == descriptor.Shard
+		if !ownsRow {
+			// Fence every non-owning voter using an absent key in its own
+			// range. Offline SQL below still proves m-0 was pruned there.
+			for candidate := 0; candidate < 10_000; candidate++ {
+				id = fmt.Sprintf("absent-verification-%d", candidate)
+				if hotMutationKeyShard(t, catalog, descriptor.Distribution, id) == descriptor.Shard {
+					break
+				}
+			}
+			if hotMutationKeyShard(t, catalog, descriptor.Distribution, id) != descriptor.Shard {
+				t.Fatal("no in-range verification key")
+			}
+		}
 		key, _ := orderedkey.AppendString(nil, []byte(id), orderedkey.Ascending)
 		result, err := verifier.executor.ReadPoint(verifier.ctx, route, gateway.ReplicatedPointRead{
 			Relation: 1, Key: key, MinimumApplied: 1, MaxValueBytes: 4 << 20, Linearizable: true})
 		if err != nil {
 			t.Fatal(err)
 		}
-		wants[descriptor.Shard] = result.Found
+		if result.Found != ownsRow {
+			t.Fatalf("final in-range row presence: shard=%s found=%t expected=%t", descriptor.Shard, result.Found, ownsRow)
+		}
+		wants[descriptor.Shard] = ownsRow
 		for _, replica := range route.Replicas {
 			ctx, cancel := context.WithTimeout(verifier.ctx, 5*time.Second)
 			probe, err := verifier.client.ProbeReplicated(ctx, route, replica, serviceauthz.CapabilityDataRead)

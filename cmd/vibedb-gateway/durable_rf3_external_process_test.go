@@ -856,6 +856,12 @@ func (fixture *durableRF3ExternalFixture) startGateway(
 			{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-b","kind":"seed","email":"seed-b@example.test","value":2}`}}},
 		})
 		response, _ := client.roundTrip(t, request)
+		// Seeding is a durable request too. A definite outcome-unknown reply
+		// must be resolved by one bounded retry of the identical issuer key and
+		// command, not treated as proof that the seed was rolled back.
+		if reply := durableRF3ExternalExecResponse(t, response); strings.Contains(reply.Error, gateway.ErrDurableRequestUnresolved.Error()) {
+			response, _ = client.roundTrip(t, request)
+		}
 		durableRF3ExternalAssertCommitted(t, response, 2, 2)
 		client.ackTerminal(t, response)
 		fixture.seeded = true

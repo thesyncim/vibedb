@@ -44,6 +44,7 @@ type CompositeShardActionExecutorOptions struct {
 	Lifecycle *LocalChildLifecycle
 
 	ArtifactChunkBytes int
+	RecoverArtifacts   func(context.Context, *Plan, Observation) (bool, error)
 }
 
 // CompositeShardActionExecutor is one admitted operation's concrete data-plane
@@ -151,6 +152,12 @@ func (executor *CompositeShardActionExecutor) ExecuteAuthorizedSplitAction(
 		)
 		return err
 	case ActionBuildArtifacts:
+		if options.RecoverArtifacts != nil {
+			recovering, err := options.RecoverArtifacts(ctx, plan, observed)
+			if err != nil || recovering {
+				return err
+			}
+		}
 		if options.CaptureFactory != nil {
 			if err := options.CaptureFactory.RetireSourceCaptureActivationSession(ctx, plan, observed); err != nil {
 				return err

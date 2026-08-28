@@ -61,6 +61,9 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 		target.RelationManifestDigest == source.Command.RelationManifestDigest {
 		t.Fatalf("target=%+v", target)
 	}
+	if source.Command.ReplicaSetVersion == 1 || target.ReplicaSetVersion != 1 {
+		t.Fatalf("child inherited parent membership version: parent=%d child=%d", source.Command.ReplicaSetVersion, target.ReplicaSetVersion)
+	}
 	configuration := sources[source.Group]
 	plan, err := splitcontroller.NewPlan(catalog, split, partitioner, []splitcontroller.ChildTarget{target}, splitcontroller.PlanSourceSchema{
 		SQL: configuration.SQL, Placement: configuration.Placement, LocalIndexes: configuration.LocalIndexes,
@@ -82,6 +85,9 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	operationDirectory := hex.EncodeToString(operation[:])
 	localDigests := make(map[[32]byte]struct{}, gateway.ServingReplicaCount)
 	for index, replica := range target.Replicas {
+		if replica.NodeIncarnation != 1 {
+			t.Fatalf("fresh child incarnation = %d", replica.NodeIncarnation)
+		}
 		peer, peerErr := catalog.Address(replica.Endpoint)
 		native, nativeErr := catalog.Address(replica.NativeEndpoint)
 		control, controlErr := catalog.Address(replica.ControlEndpoint)

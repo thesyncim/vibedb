@@ -249,7 +249,8 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 		}
 		replicas[index] = splitcontroller.ChildReplicaTarget{
 			Member: sourceReplica.Member, Node: sourceReplica.Node, StoreID: storeID,
-			NodeIncarnation: sourceReplica.NodeIncarnation,
+			// A child has a new WAL and mints its own first incarnation.
+			NodeIncarnation: 1,
 			Endpoint:        sourceReplica.Endpoint, NativeEndpoint: sourceReplica.NativeEndpoint,
 			ControlEndpoint: sourceReplica.ControlEndpoint, WAL: wal,
 			PeerAddress: peerAddress, NativeAddress: nativeAddress, ControlAddress: controlAddress,
@@ -266,7 +267,9 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 	}
 	return splitcontroller.ChildTarget{
 		Child: child, Endpoint: replicas[0].NativeEndpoint, Replicas: replicas,
-		ReplicaSetVersion:      source.Command.ReplicaSetVersion,
+		// Child membership starts at its independent static bootstrap, not
+		// the parent's latest membership-change index.
+		ReplicaSetVersion:      1,
 		RelationManifestDigest: childDigest, LocalIndexes: cloneGatewaySplitIndexes(configuration.LocalIndexes),
 		WAL: replicas[0].WAL, TopologyRecoveryEpoch: source.Group.TopologyRecoveryEpoch,
 		Authority: authority, SQL: replicas[0].SQL.Clone(),

@@ -678,16 +678,21 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if finalSnapshotNetwork > baselineSnapshotNetwork {
 		snapshotNetworkGrowth = finalSnapshotNetwork - baselineSnapshotNetwork
 	}
-	if client.requests > 48 || client.bytes > 1<<20 || storageGrowth > 512<<20 ||
+	// The cold replacement and the three independent child replicas each
+	// allocate one strictly reserved WAL and one 32 MiB checkpoint. These
+	// admitted fixed costs alone exceed the old move-only 512 MiB budget.
+	// Bound all additional growth separately, including artifacts/journals.
+	plannedStorageGrowth := uint64(gateway.ServingReplicaCount+1) * (uint64(wal.MaxFileBytes) + 32<<20)
+	if client.requests > 48 || client.bytes > 1<<20 || storageGrowth > plannedStorageGrowth+64<<20 ||
 		snapshotNetworkGrowth > 1<<30 ||
 		!replicaProcessTreeBounded(t, root, "gateway-session", 64, 64<<20) {
-		t.Fatalf("foreground/state amplification requests=%d bytes=%d storage_growth=%d snapshot_network_growth=%d",
-			client.requests, client.bytes, storageGrowth, snapshotNetworkGrowth)
+		t.Fatalf("foreground/state amplification requests=%d bytes=%d storage_growth=%d planned_storage_growth=%d snapshot_network_growth=%d",
+			client.requests, client.bytes, storageGrowth, plannedStorageGrowth, snapshotNetworkGrowth)
 	}
 	hotMutationVerifyFinalStores(t, root, splitCatalog, splitPlan, client, processes, coldProcess, gatewayProcess)
-	t.Logf("write-driven hot move: split=true atomic_relation_index_visibility=true leader_kill=true source_partition=true response_partition=true reopen=true p99=%s split_p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d snapshot_network_growth=%d",
+	t.Logf("write-driven hot move: split=true atomic_relation_index_visibility=true leader_kill=true source_partition=true response_partition=true reopen=true p99=%s split_p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d planned_storage_growth=%d snapshot_network_growth=%d",
 		p99, splitP99, maximumOperations, len(record.Payload), client.requests, client.bytes,
-		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, snapshotNetworkGrowth)
+		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, plannedStorageGrowth, snapshotNetworkGrowth)
 }
 
 // The split phase provisions new children on the replacement roster. Preserve
@@ -1371,7 +1376,15 @@ func (client *hotMutationWireClient) openIssuer(t *testing.T) gateway.Replicated
 
 func (client *hotMutationWireClient) execute(t *testing.T, request []byte) time.Duration {
 	t.Helper()
+	started := time.Now()
 	response, latency := client.roundTrip(t, request)
+	// A leader handoff may explicitly leave this durable request unresolved.
+	// Resolve it with one exact public retry; include both attempts in the
+	// existing latency, request-count, and byte bounds.
+	if strings.Contains(string(response), gateway.ErrDurableRequestUnresolved.Error()) {
+		response, _ = client.roundTrip(t, request)
+		latency = time.Since(started)
+	}
 	if !strings.Contains(string(response), `"committed":true`) ||
 		strings.Contains(string(response), `"error"`) {
 		t.Fatalf("exec_batch response=%s", response)

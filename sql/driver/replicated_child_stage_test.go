@@ -104,12 +104,16 @@ func TestReplicatedChildSourceFixtureSealsCertifiedImage(t *testing.T) {
 func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *testing.T) {
 	for _, unknownPublication := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unknown_publication=%t", unknownPublication), func(t *testing.T) {
-			testReplicatedChildStageNoCopyApplyHandoff(t, unknownPublication)
+			testReplicatedChildStageNoCopyApplyHandoff(t, unknownPublication, false)
 		})
 	}
 }
 
-func testReplicatedChildStageNoCopyApplyHandoff(t *testing.T, unknownPublication bool) {
+func TestReplicatedChildStagePreservesLocalIndexProfile(t *testing.T) {
+	testReplicatedChildStageNoCopyApplyHandoff(t, false, true)
+}
+
+func testReplicatedChildStageNoCopyApplyHandoff(t *testing.T, unknownPublication, indexed bool) {
 	fixture := newReplicatedChildSourceFixture(t)
 	targetBinding := testReplicatedBinding(91)
 	targetBinding.Distribution = string(fixture.partitioner.SourceDistribution())
@@ -137,6 +141,11 @@ func testReplicatedChildStageNoCopyApplyHandoff(t *testing.T, unknownPublication
 	}
 	if err := testRuntimeExec(session, `CREATE TABLE docs (PRIMARY KEY (id))`, nil); err != nil {
 		t.Fatal(err)
+	}
+	if indexed {
+		if err := testRuntimeExec(session, `CREATE INDEX by_id ON docs (id)`, nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
@@ -355,6 +364,15 @@ func testReplicatedChildStageNoCopyApplyHandoff(t *testing.T, unknownPublication
 		activated.SnapshotBase == nil || activated.ArtifactManifest.UserRows != 1 ||
 		activated.ArtifactManifest.State.Applied != certificate.SourceCut().Applied {
 		t.Fatalf("activation = %+v", activated)
+	}
+	expectedDigest, err := replicatedstate.InitialJSONRelationManifest(
+		base.Binding.Authority.SchemaGeneration, base.UserTable,
+		replicatedStateCollectionLimits(base.UserLimits), activated.ApplyIdentity.ValidationDigest,
+		replicatedApplyLocalIndexes(stage.table),
+	)
+	actualDigest, actualErr := activated.Apply.machine.RelationManifestDigest()
+	if err != nil || actualErr != nil || actualDigest != expectedDigest {
+		t.Fatalf("child activation changed the declared relation/index profile: %v %v", err, actualErr)
 	}
 	if err := activated.Apply.AdmitCommand(nil); !errors.Is(err, ErrReplicatedApplyBasePending) {
 		t.Fatalf("AdmitCommand before base install = %v", err)

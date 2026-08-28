@@ -117,6 +117,51 @@ func TestDurableSQLRequestExecutorAdmitsAtomicMultiRowCrossShardInsert(t *testin
 	}
 }
 
+func TestDurableSQLRequestExecutorReplaysOwnPreparedIntent(t *testing.T) {
+	snapshot, planner := replicatedSQLTransactionFixture(t, true, true, true)
+	client, data := attachReplicatedSQLIndexedReadClient(t, snapshot,
+		[]byte(`{"id":"message-1","email":"old@example.test","region":"old"}`))
+	queries := []Query{{SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Class: ClassInteractive,
+		Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"message-1","email":"new@example.test","region":"new"}`), shardservice.StringParam("message-1")}}}
+	tenant := []byte("prepared-intent-retry")
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated,
+		Principal: requestledger.PrincipalID{1}, Request: requestledger.RequestID{2},
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)), IssuerEpoch: 7,
+		IssuerLane: requestledger.IssuerLane{3}, IssuerSequence: 1}
+	ledger, pins := new(typedServiceLedger), new(typedServicePinStop)
+	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	current := topology.Current()
+	current.Generation = 7
+	if err := topology.Publish(*current); err != nil {
+		t.Fatal(err)
+	}
+	service, err := newDurableRequestService(topology, ledger, typedServiceRunnerStop{}, pins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewDurableSQLRequestExecutor(DurableSQLRequestExecutorOptions{
+		Planner: planner, ReplicatedData: data, Requests: service, RecoveryPulseLimit: 3, PlanningLeaseSpan: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, errTypedServicePin) {
+		t.Fatalf("initial admission: %v", err)
+	}
+	client.refusal = shardservice.ReplicatedRefusalReadIntentActive
+	if _, err = executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, errTypedServicePin) || pins.called != 2 || ledger.applies != 1 {
+		t.Fatalf("own intent did not resume exact recipe: pins=%d creates=%d err=%v", pins.called, ledger.applies, err)
+	}
+	queries[0].Params[0] = shardservice.DocumentParam(`{"id":"message-1","email":"changed@example.test","region":"new"}`)
+	if _, err = executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, ErrDurableRequestConflict) || pins.called != 2 {
+		t.Fatalf("different request bytes resumed the retained recipe: %v", err)
+	}
+	key.IssuerSequence++
+	ledger.head = requestledger.HeadRecord{}
+	if _, err = executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, ErrReplicatedReadIntentActive) || pins.called != 2 {
+		t.Fatalf("foreign intent was treated as our continuation: %v", err)
+	}
+}
+
 func TestDurableSQLRequestExecutorAdmitsAtomicFiniteCrossShardDelete(t *testing.T) {
 	_, planner, keys := replicatedSQLSplitTransactionFixture(t)
 	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 3, time.Second)

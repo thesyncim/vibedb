@@ -352,6 +352,7 @@ func (s *ReplicatedChildStage) activate(
 			},
 			User: replicatedstate.UserCollection{
 				Name: s.base.UserTable,
+				LocalIndexes: replicatedApplyLocalIndexes(s.table),
 				Target: replicatedstate.CollectionTarget{
 					Collection:       s.table.collection,
 					Validation:       replicatedstate.ValidationProfile(identity.ValidationProfile),

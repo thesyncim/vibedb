@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -232,7 +233,7 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 	}
 	identity := runtime.Identity()
 	if !l.runtimeIdentityMatches(target, identity) {
-		return errors.Join(ErrTopologyConflict, runtime.Close())
+		return errors.Join(fmt.Errorf("%w: adopted runtime identity does not match child %d member %d", ErrTopologyConflict, l.options.Child, identity.MemberID), runtime.Close())
 	}
 	if err = l.options.Adopter.AdoptSplitChild(
 		ctx, plan.OperationID(), l.options.Child, PreparedChildRuntime{

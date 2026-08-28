@@ -126,20 +126,23 @@ func (pins *typedServiceAdvancePins) AcquireOrRecover(_ context.Context, _ Durab
 		previous := pins.ledger.head.Revision
 		pins.ledger.head.Revision += 2
 		switch pins.corrupt {
-		case "no-progress":
+		case "no-progress", "conflict-no-progress":
 			pins.ledger.head.Revision = previous
-		case "request":
+		case "request", "conflict-request":
 			pins.ledger.head.RequestDigest[0] ^= 1
-		case "plan":
+		case "plan", "conflict-plan":
 			pins.ledger.head.PlanRoot[0] ^= 1
 		}
 		err = &durableRequestAdvancedError{revision: previous + 2, applied: 2}
+		if pins.corrupt == "conflict" || pins.corrupt == "conflict-no-progress" || pins.corrupt == "conflict-request" || pins.corrupt == "conflict-plan" {
+			err = ErrDurableRequestConflict
+		}
 	}
 	return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
 }
 
 func TestDurableRequestServiceResumesOnlyProvenExactRetryProgress(t *testing.T) {
-	for _, corrupt := range []string{"", "no-progress", "request", "plan"} {
+	for _, corrupt := range []string{"", "no-progress", "request", "plan", "conflict", "conflict-no-progress", "conflict-request", "conflict-plan"} {
 		t.Run(corrupt, func(t *testing.T) {
 			participants := durableFaultParticipants(t)
 			request := durableFaultRequest(t, participants)
@@ -150,7 +153,7 @@ func TestDurableRequestServiceResumesOnlyProvenExactRetryProgress(t *testing.T) 
 				t.Fatal(err)
 			}
 			_, err = service.Execute(t.Context(), request)
-			if corrupt == "" {
+			if corrupt == "" || corrupt == "conflict" {
 				if !errors.Is(err, errTypedServicePin) || pins.calls != 2 {
 					t.Fatalf("exact advanced head did not resume: calls=%d err=%v", pins.calls, err)
 				}
