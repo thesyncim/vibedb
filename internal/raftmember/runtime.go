@@ -752,7 +752,7 @@ func (runtime *Runtime) Propose(data []byte) error {
 		return err
 	}
 	if !continuing {
-		if err := runtime.wal.ReserveReady(); err != nil {
+		if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
 			if deterministicPersistFailure(err) {
 				return runtime.fail(err)
 			}
@@ -774,7 +774,7 @@ func (runtime *Runtime) ProposeConfChange(change pb.ConfChangeI) error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	if err := runtime.wal.ReserveReady(); err != nil {
+	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -1025,7 +1025,7 @@ func (runtime *Runtime) StepMessage(message *pb.Message) error {
 	if message.GetTo() != runtime.identity.MemberID {
 		return errors.New("raftmember: ordinary message targets another member")
 	}
-	if err := runtime.wal.ReserveReady(); err != nil {
+	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -1040,7 +1040,7 @@ func (runtime *Runtime) Tick() error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	if err := runtime.wal.ReserveReady(); err != nil {
+	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -1055,7 +1055,7 @@ func (runtime *Runtime) Campaign() error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	if err := runtime.wal.ReserveReady(); err != nil {
+	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}

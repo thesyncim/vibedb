@@ -32,7 +32,17 @@ The production maintenance cadence remains ten minutes. Only the test binary,
 when launched with the qualification environment, compresses that cadence to
 eight logical ticks. This keeps CI finite without exposing a serving flag that
 could accidentally trade write amplification for an unrealistically aggressive
-compaction schedule.
+compaction schedule. Separately, hard WAL admission pressure triggers a
+certified generation replacement in an empty Raft input window, before more
+input is accepted. This also recovers a full reopened WAL before its first
+maintenance tick. The owner waits for the bounded generation worker only on
+this pressure path; it does not increase the authenticated WAL bounds or
+relax SQL retention checks.
+
+`TestServeRF3WALPressureBeforeMaintenance` keeps the production cadence and
+uses small authenticated record limits to exercise pressure in three actual
+processes. It verifies replacement on all replicas, then leader kill/restart
+and a linearizable read of the acknowledged value.
 
 Run the exact Linux test locally with:
 

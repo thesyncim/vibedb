@@ -547,6 +547,11 @@ type rf3FaultFixture struct {
 
 func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 	t.Helper()
+	return newRF3FaultFixtureWithWALRecords(t, 4096)
+}
+
+func newRF3FaultFixtureWithWALRecords(t testing.TB, maxRecords uint64) *rf3FaultFixture {
+	t.Helper()
 	fixture := &rf3FaultFixture{root: t.TempDir(), group: rf3CommandGroup(), nodes: rf3CommandNodes(), authority: rf3CommandAuthority()}
 	for member := 0; member < rf3CommandMembers; member++ {
 		for lane := 0; lane < 4; lane++ {
@@ -587,7 +592,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		keyMaterial[index] = byte(index + 1)
 	}
 	walOptions := raftstore.Options{MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
+		MaxRecords: maxRecords, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
 	for member := 0; member < rf3CommandMembers; member++ {
 		memberRoot := filepath.Join(fixture.root, fmt.Sprintf("member-%d", member+1))
 		if err = os.MkdirAll(memberRoot, 0o700); err != nil {
