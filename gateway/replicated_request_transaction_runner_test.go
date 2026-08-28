@@ -164,17 +164,21 @@ func (distributedRunnerPayloads) Cleanup(context.Context, DurableRequestLedgerHo
 }
 
 type distributedRunnerWaves struct {
-	ledger            *distributedRunnerLedger
-	fault             distributedtxn.ReplicatedOperation
-	prepareConflict   bool
-	manifestPayload   []byte
-	decisionSettled   bool
-	admissionFailures int
-	admissionError    error
-	admissionCommands [][]byte
+	ledger               *distributedRunnerLedger
+	fault                distributedtxn.ReplicatedOperation
+	prepareConflict      bool
+	manifestPayload      []byte
+	decisionSettled      bool
+	admissionFailures    int
+	admissionError       error
+	admissionCommands    [][]byte
+	wantMembershipStable bool
 }
 
-func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, _ ReplicatedRoute, read replicatedstate.TransactionRecoveryReadRequest) (ReplicatedTransactionRecoveryResult, error) {
+func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, route ReplicatedRoute, read replicatedstate.TransactionRecoveryReadRequest) (ReplicatedTransactionRecoveryResult, error) {
+	if route.membershipStable != waves.wantMembershipStable {
+		return ReplicatedTransactionRecoveryResult{}, errors.New("recovery lost sealed membership mode")
+	}
 	if read.Kind == replicatedstate.TransactionRecoveryLookupParticipant {
 		if waves.decisionSettled {
 			// Once the decision is durable, participants may already have
@@ -211,6 +215,9 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 	command, err := replication.OpenCommand(wave.Command)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
+	}
+	if replication.IsMembershipStableAuthority(command.AuthorityClass) != waves.wantMembershipStable {
+		return DurableRequestWaveResult{}, errors.New("wave lost sealed membership mode")
 	}
 	controlView, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
 	if err != nil {
@@ -462,6 +469,14 @@ func (resolver distributedRunnerResolver) ResolveDurableRequestParticipant(_ con
 }
 
 func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
+	for _, stable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("membership_stable_%t", stable), func(t *testing.T) {
+			testDurableRequestDistributedRunnerResumesProtocolCuts(t, stable)
+		})
+	}
+}
+
+func testDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T, stable bool) {
 	for _, fault := range []distributedtxn.ReplicatedOperation{
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		distributedtxn.ReplicatedStagePrepareParticipant,
@@ -481,11 +496,14 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 			abortCursor := appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedAborted})
 			execution.Recipe.Contract.CommitTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.CommitTransitionTag, commitCursor))
 			execution.Recipe.Contract.AbortTerminalStateDigest = replication.Digest(requestledger.NextStateDigest(execution.Recipe.Contract.AbortTransitionTag, abortCursor))
+			if stable {
+				execution.Recipe.Contract.ProtocolProgramDigest = durableRequestMembershipStableProgramDigest(execution.Recipe.Contract)
+			}
 			wave, head, route := lifecycleRunnerFixture(t)
 			execution, release := bindTypedExecutionPin(t, execution, route)
 			head.NextStepOrdinal, head.Revision = 0, 1
 			ledger := &distributedRunnerLedger{head: head}
-			waves := &distributedRunnerWaves{ledger: ledger, fault: fault, prepareConflict: aborted}
+			waves := &distributedRunnerWaves{ledger: ledger, fault: fault, prepareConflict: aborted, wantMembershipStable: stable}
 			terminal := &distributedRunnerTerminal{}
 			authority := DurableRequestTerminalAuthority{CommitCursor: commitCursor, AbortCursor: abortCursor, AckToken: requestledger.AckToken{1}, Release: release}
 			runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, distributedRunnerPayloads{}, terminal, distributedRunnerAuthority{value: authority})

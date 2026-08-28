@@ -2003,7 +2003,7 @@ func (m *Machine) mutableBindingMatches(command replication.CommandView) bool {
 
 func (m *Machine) mutableBindingMatchesState(command replication.CommandView, state State) bool {
 	b := m.binding
-	return command.ReplicaSetVersion == state.ReplicaSetVersion &&
+	return replication.CommandMembershipMatches(command.AuthorityClass, command.ReplicaSetVersion, state.ReplicaSetVersion) &&
 		command.ActivePolicyGeneration == b.ActivePolicyGeneration &&
 		command.ProtectionEpoch == b.ProtectionEpoch && command.OwnershipEpoch == b.OwnershipEpoch &&
 		command.SchemaGeneration == b.SchemaGeneration && command.RoutingVersion == b.RoutingVersion &&

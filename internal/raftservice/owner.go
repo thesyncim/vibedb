@@ -1651,7 +1651,7 @@ func commandMatchesFence(command replication.CommandView, fence ServingFence) bo
 		command.ShardIncarnation == fence.Group.ShardIncarnation &&
 		command.GroupID == fence.Group.GroupID &&
 		command.AllocationGeneration == fence.AllocationGeneration &&
-		command.ReplicaSetVersion == fence.Command.ReplicaSetVersion &&
+		replication.CommandMembershipMatches(command.AuthorityClass, command.ReplicaSetVersion, fence.Command.ReplicaSetVersion) &&
 		command.ActivePolicyGeneration == fence.Command.ActivePolicyGeneration &&
 		command.ProtectionEpoch == fence.Command.ProtectionEpoch &&
 		command.OwnershipEpoch == fence.Command.OwnershipEpoch &&

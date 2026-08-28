@@ -42,6 +42,9 @@ type DurableRequestLogicalProgramBuild struct {
 	PlanningLeaseGeneration uint64
 	PinEpoch                uint64
 	Participants            []ReplicatedTransactionParticipant
+	// New SQL requests opt in. Retained programs select their original mode
+	// from the sealed protocol digest, never from a process-local default.
+	MembershipStable bool
 }
 
 // BuildDurableRequestLogicalProgram lowers physical catalog routes to one
@@ -187,6 +190,9 @@ func BuildDurableRequestLogicalProgram(
 	contract.CommitFinalWaveCount = manifestCommands + 2*contract.ParticipantCount + 1
 	contract.AbortFinalWaveCount = manifestCommands + 3*contract.ParticipantCount + 1
 	contract.ProtocolProgramDigest = durableRequestProtocolProgramDigest(*contract)
+	if build.MembershipStable {
+		contract.ProtocolProgramDigest = durableRequestMembershipStableProgramDigest(*contract)
+	}
 
 	binding := executionpin.Binding{
 		RequestKeyDigest:          executionpin.Digest(program.KeyDigest),

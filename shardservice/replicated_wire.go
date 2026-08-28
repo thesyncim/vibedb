@@ -1017,7 +1017,7 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			command.ShardIncarnation == request.Fence.Group.ShardIncarnation &&
 			command.GroupID == request.Fence.Group.GroupID &&
 			command.AllocationGeneration == request.Fence.AllocationGeneration &&
-			command.ReplicaSetVersion == request.Fence.Command.ReplicaSetVersion &&
+			replication.CommandMembershipMatches(command.AuthorityClass, command.ReplicaSetVersion, request.Fence.Command.ReplicaSetVersion) &&
 			command.ActivePolicyGeneration == request.Fence.Command.ActivePolicyGeneration &&
 			command.ProtectionEpoch == request.Fence.Command.ProtectionEpoch &&
 			command.OwnershipEpoch == request.Fence.Command.OwnershipEpoch &&
@@ -1160,14 +1160,14 @@ func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
 	}
 	if capability == serviceauthz.CapabilityTransactionRecovery {
 		return kind == replication.CommandTransaction &&
-			class == replication.CommandAuthorityData
+			replication.IsDataAuthority(class)
 	}
 	if capability == serviceauthz.CapabilityRequestLedger {
 		return kind == replication.CommandRequestLedger &&
 			class == replication.CommandAuthorityRequestLedger
 	}
 	return (capability == 0 || capability == serviceauthz.CapabilityDataWrite) &&
-		(class == replication.CommandAuthorityData || class == replication.CommandAuthorityRouteSession)
+		(replication.IsDataAuthority(class) || replication.IsRouteSessionAuthority(class))
 }
 
 func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
@@ -1237,7 +1237,11 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			completion.ShardIncarnation == response.State.Fence.Group.ShardIncarnation &&
 			completion.GroupID == response.State.Fence.Group.GroupID &&
 			completion.AllocationGeneration == response.State.Fence.AllocationGeneration &&
-			completion.ReplicaSetVersion == response.State.Fence.Command.ReplicaSetVersion &&
+			// Completion metadata belongs to the original command, not the
+			// current serving membership. Consumers still require an exact
+			// request digest and command/completion identity match. This permits
+			// retained outcomes, never a future membership or a stale proposal.
+			completion.ReplicaSetVersion <= response.State.Fence.Command.ReplicaSetVersion &&
 			completion.ActivePolicyGeneration == response.State.Fence.Command.ActivePolicyGeneration &&
 			completion.ProtectionEpoch == response.State.Fence.Command.ProtectionEpoch &&
 			completion.RoutingVersion == response.State.Fence.Command.RoutingVersion &&

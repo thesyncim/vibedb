@@ -593,6 +593,12 @@ func (m *Machine) appendTransactionCompletion(
 	resultDigest := replication.CompletionResultDigest(
 		resultCode, ResultFormatTransaction, result[:],
 	)
+	membership := m.state.ReplicaSetVersion
+	if command.AuthorityClass == replication.CommandAuthorityMembershipStableData {
+		// The exact retained request, not a later membership observation,
+		// owns its completion metadata. Keep legacy reconstruction unchanged.
+		membership = command.ReplicaSetVersion
+	}
 	return replication.AppendCompletionBytes(dst, replication.CompletionBytes{
 		ClusterID:              m.binding.ClusterID,
 		ClusterIncarnation:     m.binding.ClusterIncarnation,
@@ -602,7 +608,7 @@ func (m *Machine) appendTransactionCompletion(
 		AllocationGeneration:   m.binding.AllocationGeneration,
 		ShardIncarnation:       m.binding.ShardIncarnation,
 		GroupID:                m.binding.GroupID,
-		ReplicaSetVersion:      m.state.ReplicaSetVersion,
+		ReplicaSetVersion:      membership,
 		ActivePolicyGeneration: m.state.Binding.ActivePolicyGeneration,
 		ProtectionEpoch:        m.state.Binding.ProtectionEpoch,
 		RoutingVersion:         m.state.Binding.RoutingVersion,

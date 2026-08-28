@@ -69,6 +69,9 @@ type ReplicatedRoute struct {
 	LineageDigest        replication.Digest
 	ForwardingRuleDigest replication.Digest
 	Replicas             []ReplicatedEndpoint
+	// Enabled only by an explicitly membership-stable command or its gate
+	// read. This is not catalog authority and never changes command bytes.
+	membershipStable bool
 }
 
 // ReplicatedMembershipRoute keeps membership reachability separate from the
@@ -1222,9 +1225,14 @@ func (executor *ReplicatedExecutor) propose(
 ) (ReplicatedResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
 		!validReplicatedRoute(route) || len(command) == 0 ||
-		len(command) > replication.MaxCommandBytes || !commandMatchesRoute(command, route) {
+		len(command) > replication.MaxCommandBytes {
 		return ReplicatedResult{}, ErrReplicatedRoute
 	}
+	view, err := replication.OpenCommand(command)
+	if err != nil || !commandViewMatchesRoute(view, route) {
+		return ReplicatedResult{}, ErrReplicatedRoute
+	}
+	route.membershipStable = replication.IsMembershipStableAuthority(view.AuthorityClass)
 	original := command[:len(command):len(command)]
 	requestDigest := replicatedRequestDigest(original)
 	preferred := route.Replicas[0].Member
@@ -1344,7 +1352,7 @@ func (executor *ReplicatedExecutor) propose(
 			lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 			continue
 		}
-		if response.State.Fence.Command != route.Command {
+		if !replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			// A typed stale-fence refusal is definite pre-admission and may
 			// legitimately carry the newly installed command contract. Every
@@ -1589,7 +1597,7 @@ func validReplicatedLeaderHint(
 		state.LeaderID == state.Fence.MemberID &&
 		state.Fence.Group == route.Group &&
 		state.Fence.AllocationGeneration == route.AllocationGeneration &&
-		state.Fence.Command == route.Command && state.Fence.Term != 0
+		replicatedObservedCommandMatches(route, state.Fence.Command) && state.Fence.Term != 0
 }
 
 func (executor *ReplicatedExecutor) discoverLeader(
@@ -1647,7 +1655,7 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 			!validReplicatedNonterminalResponse(response) ||
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
-			response.State.Fence.Command != route.Command ||
+			!replicatedObservedCommandMatches(route, response.State.Fence.Command) ||
 			response.State.Fence.MemberID != endpoint.Member {
 			joined = errors.Join(joined, ErrReplicatedRoute)
 			member = 0
@@ -1898,11 +1906,15 @@ func validReplicatedEndpoint(endpoint ReplicatedEndpoint) bool {
 
 func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
 	view, err := replication.OpenCommand(command)
-	if err == nil && catalogBootstrapRoute(route) && raftservice.CatalogCommandReplayMatchesFence(view,
+	return err == nil && commandViewMatchesRoute(view, route)
+}
+
+func commandViewMatchesRoute(view replication.CommandView, route ReplicatedRoute) bool {
+	if catalogBootstrapRoute(route) && raftservice.CatalogCommandReplayMatchesFence(view,
 		raftservice.ServingFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration, Command: route.Command}) {
 		return true
 	}
-	return err == nil && view.ClusterID == route.Group.ClusterID &&
+	return view.ClusterID == route.Group.ClusterID &&
 		view.ClusterIncarnation == route.Group.ClusterIncarnation &&
 		view.TopologyRecoveryEpoch == route.Group.TopologyRecoveryEpoch &&
 		vibejson.BytesEqualString(view.Distribution, string(route.Distribution)) &&
@@ -1910,7 +1922,7 @@ func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
 		view.ShardIncarnation == route.Group.ShardIncarnation &&
 		view.GroupID == route.Group.GroupID &&
 		view.AllocationGeneration == route.AllocationGeneration &&
-		view.ReplicaSetVersion == route.Command.ReplicaSetVersion &&
+		replication.CommandMembershipMatches(view.AuthorityClass, view.ReplicaSetVersion, route.Command.ReplicaSetVersion) &&
 		view.ActivePolicyGeneration == route.Command.ActivePolicyGeneration &&
 		view.ProtectionEpoch == route.Command.ProtectionEpoch &&
 		view.OwnershipEpoch == route.Command.OwnershipEpoch &&

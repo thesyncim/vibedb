@@ -15,6 +15,80 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
+func TestTerminalExecutionPinSessionCleanupResumesRetiredAndReleasedJournals(t *testing.T) {
+	for _, phase := range []string{"retired", "released", "release-response-lost"} {
+		t.Run(phase, func(t *testing.T) {
+			route, machine, reopen := newRouteSessionMachine(t)
+			client := &routeSessionDropClient{base: machine}
+			executor, err := NewReplicatedExecutor(client, 1, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			principal := serviceauthz.Authority{Node: [16]byte{7}, Generation: 1}
+			factory, err := NewJournaledDurableRequestExecutionPinSessionFactory(executor, t.TempDir(), principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, _ := bindTypedExecutionPin(t, typedExecutionFixture(t), route)
+			session, _, unlock, err := factory.OpenExecutionPinSession(t.Context(), execution, route)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unlock()
+			ctx, err := serviceauthz.WithAuthority(t.Context(), principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = session.Retire(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if phase != "retired" {
+				if phase == "release-response-lost" {
+					client.drop = replication.CommandSessionRelease
+				}
+				_, err = session.Release(ctx)
+				if (err != nil) != (phase == "release-response-lost") {
+					t.Fatalf("release: %v", err)
+				}
+			}
+			unlock()
+			reopen()
+			// A new gateway object must finish the exact retained lifecycle,
+			// even after retirement or release was already persisted locally.
+			fresh, err := NewJournaledDurableRequestExecutionPinSessionFactory(executor, factory.directory, principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if phase != "release-response-lost" {
+				_, _, release, openErr := fresh.OpenExecutionPinSession(t.Context(), execution, route)
+				if release != nil {
+					release()
+				}
+				if !errors.Is(openErr, ErrDurableRequestConflict) {
+					t.Fatalf("ordinary open accepted terminal session: %v", openErr)
+				}
+			}
+			results := make(chan error, 8)
+			for range cap(results) {
+				go func() { results <- fresh.RetireTerminalExecutionPinSession(t.Context(), execution, route) }()
+			}
+			for range cap(results) {
+				if err = <-results; err != nil {
+					t.Fatalf("terminal cleanup after %s: %v", phase, err)
+				}
+			}
+			entries, err := os.ReadDir(factory.directory)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("retained journals=%v err=%v", entries, err)
+			}
+			applied := machine.state.Applied
+			if err = fresh.RetireTerminalExecutionPinSession(t.Context(), execution, route); err != nil || machine.state.Applied != applied {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDurableExecutionPinSessionIdentityBindsPinAndPrincipalGeneration(t *testing.T) {
 	pin := executionpin.PinID{1, 2, 3}
 	principal := serviceauthz.Authority{Node: rafttransport.NodeID{4}, Generation: 5}

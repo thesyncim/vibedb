@@ -136,6 +136,9 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	if runner == nil || ctx == nil || execution.Participants == nil {
 		return DurableRequestTerminalResult{}, ErrDurableRequest
 	}
+	if !validDurableRequestProtocolProgram(execution.Recipe.Contract) {
+		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+	}
 	stage = "terminal authority"
 	authority, err := runner.authority.TerminalAuthority(ctx, execution)
 	if err != nil {
@@ -218,7 +221,8 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	progress := &durableDistributedProgress{
 		runner: runner, execution: execution, authority: authority,
 		next: head.NextStepOrdinal, state: state,
-		encoder: replicatedTransactionCommandEncoder{tenant: bytes.Clone(execution.Recipe.Tenant)},
+		encoder: replicatedTransactionCommandEncoder{tenant: bytes.Clone(execution.Recipe.Tenant),
+			membershipStable: durableRequestMembershipStableProgram(execution.Recipe.Contract)},
 	}
 	stage = "manifest measurement"
 	descriptor, coordinator, coordinatorRoute, err := progress.measureManifest(ctx)
@@ -927,13 +931,14 @@ func (progress *durableDistributedProgress) resolve(
 		logical.MutationDigest == (distributedtxn.Digest{}) {
 		return ReplicatedRoute{}, distributedtxn.ParticipantRef{}, ErrDurableRequestConflict
 	}
+	route.membershipStable = progress.encoder.membershipStable
 	return route, distributedtxn.ParticipantRef{
 		Distribution:         byteview.Bytes(string(route.Distribution)),
 		Shard:                byteview.Bytes(string(route.Shard)),
 		RoutingVersion:       route.Command.RoutingVersion,
 		AllocationGeneration: route.AllocationGeneration,
 		OwnershipEpoch:       route.Command.OwnershipEpoch,
-		AuthorityWitness:     replicatedRouteAuthorityWitness(route),
+		AuthorityWitness:     replicatedTransactionRouteAuthorityWitness(route, progress.encoder.membershipStable),
 		MutationDigest:       logical.MutationDigest,
 		State:                distributedtxn.ParticipantStaged,
 	}, nil

@@ -119,7 +119,7 @@ func commandMatchesAuthority(command replication.CommandView, authority RouteAut
 		GroupID:               [16]byte(command.GroupID),
 	}
 	fence := authority.Command
-	return command.AuthorityClass == replication.CommandAuthorityData &&
+	return replication.IsDataAuthority(command.AuthorityClass) &&
 		authority.Group == group && authority.AllocationGeneration == command.AllocationGeneration &&
 		fence.ReplicaSetVersion == command.ReplicaSetVersion &&
 		fence.ActivePolicyGeneration == command.ActivePolicyGeneration &&

@@ -67,6 +67,46 @@ func TestAuthenticatedReplicatedDiscoveryRebindsRestartButOperationsRemainExact(
 	}
 }
 
+func TestMembershipStableObservationRejectsOtherFenceChanges(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	endpoint := route.Replicas[1]
+	response := shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+		HasState: true, State: states[endpoint.Address]}
+	response.State.Fence.Command.ReplicaSetVersion++
+	if _, err := bindReplicatedObservation(route, endpoint, &response); !errors.Is(err, ErrReplicatedRoute) {
+		t.Fatalf("legacy route accepted changed membership: %v", err)
+	}
+	route.membershipStable = true
+	if _, err := bindReplicatedObservation(route, endpoint, &response); err != nil {
+		t.Fatalf("stable route rejected membership advancement: %v", err)
+	}
+	for name, change := range map[string]func(*shardservice.ReplicatedResponse){
+		"group":       func(r *shardservice.ReplicatedResponse) { r.State.Fence.Group.GroupID[0]++ },
+		"allocation":  func(r *shardservice.ReplicatedResponse) { r.State.Fence.AllocationGeneration++ },
+		"member":      func(r *shardservice.ReplicatedResponse) { r.State.Fence.MemberID++ },
+		"store":       func(r *shardservice.ReplicatedResponse) { r.State.Fence.StoreID[0]++ },
+		"incarnation": func(r *shardservice.ReplicatedResponse) { r.State.Fence.NodeIncarnation = 0 },
+		"membership-rollback": func(r *shardservice.ReplicatedResponse) {
+			r.State.Fence.Command.ReplicaSetVersion = route.Command.ReplicaSetVersion - 1
+		},
+		"schema":     func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.SchemaGeneration++ },
+		"manifest":   func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.RelationManifestDigest[0]++ },
+		"policy":     func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.ActivePolicyGeneration++ },
+		"protection": func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.ProtectionEpoch++ },
+		"ownership":  func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.OwnershipEpoch++ },
+		"routing":    func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.RoutingVersion++ },
+		"generation": func(r *shardservice.ReplicatedResponse) { r.State.Fence.Command.RouteGeneration++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			wrong := response
+			change(&wrong)
+			if _, err := bindReplicatedObservation(route, endpoint, &wrong); !errors.Is(err, ErrReplicatedRoute) {
+				t.Fatalf("accepted substituted observation: %v", err)
+			}
+		})
+	}
+}
+
 func TestReplicatedIncarnationObservationRejectsSubstitutionAndRollback(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
 	endpoint := route.Replicas[1]

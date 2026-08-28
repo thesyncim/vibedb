@@ -72,6 +72,15 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 	execution DurableRequestTypedExecutionContext,
 	route ReplicatedRoute,
 ) (*NativeSession, serviceauthz.Authority, func(), error) {
+	return factory.openExecutionPinSession(ctx, execution, route, false)
+}
+
+func (factory *JournaledDurableRequestExecutionPinSessionFactory) openExecutionPinSession(
+	ctx context.Context,
+	execution DurableRequestTypedExecutionContext,
+	route ReplicatedRoute,
+	terminal bool,
+) (*NativeSession, serviceauthz.Authority, func(), error) {
 	if factory == nil || factory.executor == nil || ctx == nil || !validReplicatedRoute(route) ||
 		!factory.principal.Valid() || !sameReplicatedCatalogRoute(route, execution.Home.borrowedRoute()) {
 		return nil, serviceauthz.Authority{}, nil, ErrDurableRequest
@@ -101,10 +110,16 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 		release()
 		return nil, serviceauthz.Authority{}, nil, err
 	}
-	journalPath, scoped, _, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
+	journalPath, scoped, present, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
 	if err != nil {
 		release()
 		return nil, serviceauthz.Authority{}, nil, err
+	}
+	if terminal && !present {
+		// Check under the same identity latch as deletion. Concurrent terminal
+		// replay must not recreate a session that another cleanup just removed.
+		release()
+		return nil, factory.principal, nil, nil
 	}
 	if scoped {
 		journalBinding = scopedNativeSessionJournalBinding(journalBinding)
@@ -162,7 +177,8 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) OpenExecutionP
 			}
 		}
 	}
-	if session.phase != nativeSessionActive && !session.pending {
+	terminalPhase := terminal && (session.phase == nativeSessionRetired || session.phase == nativeSessionReleased)
+	if session.phase != nativeSessionActive && !session.pending && !terminalPhase {
 		release()
 		return nil, serviceauthz.Authority{}, nil, ErrDurableRequestConflict
 	}
@@ -177,25 +193,15 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireTerminal
 	if factory == nil || ctx == nil {
 		return ErrDurableRequest
 	}
-	binding, err := BuildDurableRequestExecutionPinBinding(execution)
-	pin, pinErr := executionpin.DerivePinID(binding)
-	if err != nil || pinErr != nil {
-		return errors.Join(err, pinErr, ErrDurableRequestConflict)
-	}
-	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
-	_, _, found, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
-	if err != nil {
-		return err
-	}
-	if !found {
-		return nil
-	}
-	session, principal, release, err := factory.OpenExecutionPinSession(ctx, execution, route)
+	session, principal, release, err := factory.openExecutionPinSession(ctx, execution, route, true)
 	if release != nil {
 		defer release()
 	}
 	if err != nil {
 		return err
+	}
+	if session == nil {
+		return nil
 	}
 	authorized, err := serviceauthz.WithAuthority(ctx, principal)
 	if err != nil {

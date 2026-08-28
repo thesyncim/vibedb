@@ -141,6 +141,7 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		PlanningLeaseSpan:       executor.planningLeaseSpan,
 		PlanningLeaseGeneration: home.TopologyGeneration,
 		PinEpoch:                home.TopologyGeneration, Participants: participants,
+		MembershipStable: true,
 	})
 	if err != nil {
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL program construction: %w", err)

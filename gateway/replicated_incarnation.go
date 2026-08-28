@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -75,13 +76,20 @@ func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoin
 	}
 	fence := response.State.Fence
 	if fence.Group != route.Group || fence.AllocationGeneration != route.AllocationGeneration ||
-		fence.Command != route.Command || fence.MemberID != endpoint.Member ||
+		!replicatedObservedCommandMatches(route, fence.Command) || fence.MemberID != endpoint.Member ||
 		fence.StoreID != endpoint.StoreID || endpoint.NodeIncarnation == 0 ||
 		fence.NodeIncarnation < endpoint.NodeIncarnation {
 		return ReplicatedEndpoint{}, ErrReplicatedRoute
 	}
 	endpoint.NodeIncarnation = fence.NodeIncarnation
 	return endpoint, nil
+}
+
+func replicatedObservedCommandMatches(route ReplicatedRoute, observed raftservice.CommandFence) bool {
+	if route.membershipStable && observed.ReplicaSetVersion >= route.Command.ReplicaSetVersion {
+		observed.ReplicaSetVersion = route.Command.ReplicaSetVersion
+	}
+	return observed == route.Command
 }
 
 func (executor *ReplicatedExecutor) probeReplicated(ctx context.Context, route ReplicatedRoute,

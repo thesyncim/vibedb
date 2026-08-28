@@ -135,6 +135,17 @@ func RouteAuthorityDigest(authority RouteAuthority) Digest {
 	return Digest(sha256.Sum256(value))
 }
 
+// MembershipStableRouteAuthorityDigest domain-separates a route digest whose
+// membership coordinate has been normalized to zero. Only explicitly stable
+// data commands use this identity; legacy transaction witnesses stay exact.
+func MembershipStableRouteAuthorityDigest(normalized Digest) Digest {
+	const domain = "vibedb/replication/membership-stable-route/1\x00"
+	var raw [len(domain) + sha256.Size]byte
+	copy(raw[:], domain)
+	copy(raw[len(domain):], normalized[:])
+	return Digest(sha256.Sum256(raw[:]))
+}
+
 // RetryHome is the stable, fixed-width keyspace point that owns completion
 // state across route changes and range movement. Zero is a valid keyspace point.
 type RetryHome [8]byte
@@ -166,10 +177,38 @@ const (
 	// their binding together with the retry ring; epochs still fence replay.
 	CommandAuthorityRouteSession
 	CommandAuthorityExecutionSession
+	// Membership-stable commands bind logical ownership separately from the
+	// live Raft membership. These distinct wire identities preserve the exact
+	// interpretation of legacy commands during WAL replay. They grant no
+	// additional operation capability: data remains data, and route sessions
+	// remain limited to shared gates and their session lifecycle.
+	CommandAuthorityMembershipStableData
+	CommandAuthorityMembershipStableRouteSession
 )
 
+func IsDataAuthority(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityData || class == CommandAuthorityMembershipStableData
+}
+
+func IsRouteSessionAuthority(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityRouteSession || class == CommandAuthorityMembershipStableRouteSession
+}
+
+func IsMembershipStableAuthority(class CommandAuthorityClass) bool {
+	return class == CommandAuthorityMembershipStableData || class == CommandAuthorityMembershipStableRouteSession
+}
+
+// CommandMembershipMatches compares only the membership coordinate. Callers
+// must still compare every ownership, schema, policy, protection, allocation,
+// and group fence, and authenticate the current physical serving member.
+// A future membership is never accepted, including for stable commands.
+func CommandMembershipMatches(class CommandAuthorityClass, command, current uint64) bool {
+	return command != 0 && current != 0 && (command == current ||
+		IsMembershipStableAuthority(class) && command < current)
+}
+
 func IsScopedSessionAuthority(class CommandAuthorityClass) bool {
-	return class == CommandAuthorityRouteSession || class == CommandAuthorityExecutionSession
+	return IsRouteSessionAuthority(class) || class == CommandAuthorityExecutionSession
 }
 
 func IsExecutionPinAuthority(class CommandAuthorityClass) bool {
@@ -177,7 +216,7 @@ func IsExecutionPinAuthority(class CommandAuthorityClass) bool {
 }
 
 func validCommandAuthorityClass(class CommandAuthorityClass) bool {
-	return class == CommandAuthorityData || class == CommandAuthorityTopology ||
+	return IsDataAuthority(class) || class == CommandAuthorityTopology ||
 		class == CommandAuthorityRequestLedger || class == CommandAuthorityExecutionPin || IsScopedSessionAuthority(class)
 }
 

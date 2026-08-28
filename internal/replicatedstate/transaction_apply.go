@@ -775,18 +775,25 @@ func (m *Machine) planManifestSegmentsStage(
 func (m *Machine) transactionRouteAuthorityWitness(
 	command replication.CommandView,
 ) distributedtxn.AuthorityWitness {
+	membership := command.ReplicaSetVersion
+	if command.AuthorityClass == replication.CommandAuthorityMembershipStableData {
+		membership = 0
+	}
 	digest := replication.RouteAuthorityDigest(replication.RouteAuthority{
 		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
 		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
 		ShardIncarnation:      command.ShardIncarnation, GroupID: command.GroupID,
 		AllocationGeneration:   command.AllocationGeneration,
-		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ReplicaSetVersion:      membership,
 		ActivePolicyGeneration: command.ActivePolicyGeneration,
 		ProtectionEpoch:        command.ProtectionEpoch, OwnershipEpoch: command.OwnershipEpoch,
 		SchemaGeneration:       command.SchemaGeneration,
 		RelationManifestDigest: replication.Digest(m.manifestDigest),
 		RoutingVersion:         command.RoutingVersion, RouteGeneration: command.RouteGeneration,
 	})
+	if command.AuthorityClass == replication.CommandAuthorityMembershipStableData {
+		digest = replication.MembershipStableRouteAuthorityDigest(digest)
+	}
 	var witness distributedtxn.AuthorityWitness
 	copy(witness[:], digest[:len(witness)])
 	return witness

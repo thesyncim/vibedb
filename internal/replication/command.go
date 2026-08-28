@@ -234,7 +234,7 @@ var routeGatePhysicalWitnessDomain = []byte(
 // stable witness; those logical fields are bound by the nested gate command.
 func RouteGatePhysicalWitness(command CommandView) (Digest, bool) {
 	if command.Kind() != CommandRouteGate ||
-		(command.AuthorityClass != CommandAuthorityData && command.AuthorityClass != CommandAuthorityRouteSession) {
+		(!IsDataAuthority(command.AuthorityClass) && !IsRouteSessionAuthority(command.AuthorityClass)) {
 		return Digest{}, false
 	}
 	var storage [2*MaxIdentityBytes + 256]byte
@@ -888,7 +888,7 @@ func validateCommandHeader(command Command) error {
 			!commandKindIsSessionLifecycle(command.Kind)) {
 		return semantic("execution-pin authority class")
 	}
-	if command.AuthorityClass == CommandAuthorityRouteSession && command.Kind != CommandRouteGate && !commandKindIsSessionLifecycle(command.Kind) {
+	if IsRouteSessionAuthority(command.AuthorityClass) && command.Kind != CommandRouteGate && !commandKindIsSessionLifecycle(command.Kind) {
 		return semantic("route-session authority class")
 	}
 	switch command.Kind {
@@ -1504,7 +1504,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 			!commandKindIsSessionLifecycle(kind)) {
 		return CommandView{}, semantic("execution-pin authority class")
 	}
-	if authorityClass == CommandAuthorityRouteSession && kind != CommandRouteGate && !commandKindIsSessionLifecycle(kind) {
+	if IsRouteSessionAuthority(authorityClass) && kind != CommandRouteGate && !commandKindIsSessionLifecycle(kind) {
 		return CommandView{}, semantic("route-session authority class")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
@@ -1738,7 +1738,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 func routeGateAuthorityMatches(class CommandAuthorityClass, operation routegate.Operation) bool {
 	switch operation {
 	case routegate.OperationAcquireShared, routegate.OperationReleaseShared:
-		return class == CommandAuthorityData || class == CommandAuthorityRouteSession
+		return IsDataAuthority(class) || IsRouteSessionAuthority(class)
 	case routegate.OperationBeginExclusive, routegate.OperationReleaseExclusive,
 		routegate.OperationCompactReleased:
 		return class == CommandAuthorityTopology

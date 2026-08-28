@@ -69,7 +69,7 @@ func (executor *ReplicatedExecutor) ReadRouteGate(
 		if !validReplicatedResponseState(response) || response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
 			response.State.Fence.MemberID != endpoint.Member ||
-			response.State.Fence.Command != route.Command {
+			!replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			joined = errors.Join(joined, ErrReplicatedRoute)
 			preferred = 0
