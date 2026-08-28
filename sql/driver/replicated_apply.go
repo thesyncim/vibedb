@@ -537,6 +537,16 @@ func (d *Database) openReplicatedApply(
 	options ReplicatedApplyOptions,
 	persist func(*database) (bool, error),
 ) (*ReplicatedApply, ReplicatedApplyIdentity, error) {
+	return d.openReplicatedApplyWithSchemaAudit(expected, bootstrap, options, persist, nil)
+}
+
+func (d *Database) openReplicatedApplyWithSchemaAudit(
+	expected ReplicatedShardStoreIdentity,
+	bootstrap *pb.Snapshot,
+	options ReplicatedApplyOptions,
+	persist func(*database) (bool, error),
+	audit *replicatedstate.SchemaImageAudit,
+) (*ReplicatedApply, ReplicatedApplyIdentity, error) {
 	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
 		return nil, ReplicatedApplyIdentity{}, err
 	}
@@ -699,6 +709,7 @@ func (d *Database) openReplicatedApply(
 			SchemaAuthorizationDigest: core.schemaAuthorization,
 			SchemaCatalogCASDigest:    core.schemaCatalogCAS,
 			SchemaSourceRecovery:      core.schemaSourceRecovery,
+			SchemaImageAudit:          audit,
 		},
 	)
 	if err != nil {

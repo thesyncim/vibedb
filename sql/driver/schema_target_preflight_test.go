@@ -235,11 +235,15 @@ func TestVerifiedSchemaTargetPublishesCapturedShadowAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	active, _, err := reopened.OpenReplicatedApply(target, testReplicatedApplyBootstrap(), testReplicatedApplyOptions())
+	before := reopened.connector.db.tables[target.UserTable].collection.Stats().SnapshotFullScanCalls
+	active, _, err := verified.OpenActivatedApply(reopened, target, testReplicatedApplyBootstrap(), testReplicatedApplyOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer active.Close()
+	if after := reopened.connector.db.tables[target.UserTable].collection.Stats().SnapshotFullScanCalls; after != before {
+		t.Fatalf("activation rescanned audited target: before=%d after=%d", before, after)
+	}
 	var cut replicatedstate.DataReadCut
 	if err := active.DataReadCutInto(nil, 5, &cut); err != nil {
 		t.Fatal(err)

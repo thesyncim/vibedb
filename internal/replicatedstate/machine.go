@@ -226,6 +226,9 @@ func OpenBundle(
 		return nil, fmt.Errorf("%w: missing user image generation", ErrInconsistentSnapshot)
 	}
 	var importedIncrementalImage [sha256.Size]byte
+	if options.SchemaImageAudit != nil && !options.SchemaImageAudit.matches(binding, m.manifestDigest, m.relations) {
+		return nil, ErrSchemaTransition
+	}
 	for i := range m.relations {
 		snapshot, exists := cut.Collection(m.relations[i].name)
 		if !exists || snapshot == nil || snapshot.Generation() == 0 {
@@ -237,7 +240,10 @@ func OpenBundle(
 		var relationImage [sha256.Size]byte
 		var placement relationPlacementAccumulator
 		var relationErr error
-		if len(m.relations) == 1 {
+		if options.SchemaImageAudit != nil {
+			relationImage = options.SchemaImageAudit.images[i].root
+			placement = options.SchemaImageAudit.images[i].placement
+		} else if len(m.relations) == 1 {
 			relationImage, importedIncrementalImage, placement, relationErr =
 				openedRelationImageDigests(&m.relations[i], snapshot, binding.OwnedRange)
 		} else {
@@ -273,6 +279,10 @@ func OpenBundle(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if options.SchemaImageAudit != nil && (!present || state.LastKind != RecordSchema ||
+		!options.SchemaImageAudit.matches(binding, m.manifestDigest, m.relations)) {
+		return nil, ErrSchemaTransition
 	}
 	if !present {
 		if options.SchemaSourceRecovery != nil {

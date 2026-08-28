@@ -50,7 +50,14 @@ func TestSchemaTransitionPreservesCertifiedBaseLocalGlobalPlacement(t *testing.T
 	toBinding := fixture.binding
 	toBinding.SchemaGeneration++
 	specs := relationBundleCollections(fixture.base, fixture.global, fixture.index, RelationGlobalIndex)
-	proof, err := CertifyRelationImages(toBinding, specs)
+	if err := fixture.base.Collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.global.Collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := AuditSchemaImages(toBinding, specs)
+	proof := audit.Certificate()
 	if err != nil || !proof.Valid() || proof.TotalRows != 2 || proof.PlacementDigest == ([32]byte{}) {
 		t.Fatalf("target certificate=%+v err=%v", proof, err)
 	}
@@ -120,6 +127,19 @@ func TestSchemaTransitionPreservesCertifiedBaseLocalGlobalPlacement(t *testing.T
 	if keys := exactIndexKeys(t, fixture.base.Collection, fixture.index.Name, []byte(`"a"`)); len(keys) != 1 || !bytes.Equal(keys[0], []byte("doc")) {
 		t.Fatalf("local exact index lost after schema reopen: %q", keys)
 	}
+	baseScans := fixture.base.Collection.Stats().SnapshotFullScanCalls
+	globalScans := fixture.global.Collection.Stats().SnapshotFullScanCalls
+	options.SchemaImageAudit = audit
+	audited, err := OpenBundle(toBinding, testBootstrap(), fixture.system, specs, fixture.log, options)
+	if err != nil || audited.openedImageDigest != target.openedImageDigest ||
+		audited.state.RelationPlacementDigest != target.state.RelationPlacementDigest {
+		t.Fatalf("audited bundle changed image or placement: %v", err)
+	}
+	if fixture.base.Collection.Stats().SnapshotFullScanCalls != baseScans ||
+		fixture.global.Collection.Stats().SnapshotFullScanCalls != globalScans {
+		t.Fatal("audited bundle activation rescanned base/global rows")
+	}
+	target = audited
 	if _, err := target.ApplyNormal(normalMeta(5), nil); err != nil {
 		t.Fatalf("new schema cannot continue apply: %v", err)
 	}

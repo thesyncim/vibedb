@@ -348,7 +348,14 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTargetWithHandoff(
 			}
 		}
 	}
-	certificate, err := replicatedstate.CertifyRelationImages(binding, relations)
+	var certificate replicatedstate.RelationImageCertificate
+	var audit *replicatedstate.SchemaImageAudit
+	if handoff != nil {
+		audit, err = replicatedstate.AuditSchemaImages(binding, relations)
+		certificate = audit.Certificate()
+	} else {
+		certificate, err = replicatedstate.CertifyRelationImages(binding, relations)
+	}
 	if err != nil || certificate.ManifestDigest != image.RelationManifestDigest {
 		return proof, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
@@ -405,6 +412,7 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTargetWithHandoff(
 	if handoff != nil {
 		handoff.staged, handoff.target, handoff.proof = staged, targetIdentity, proof
 		handoff.opened, handoff.images = opened, identities
+		handoff.audit = audit
 	}
 	return proof, nil
 }
