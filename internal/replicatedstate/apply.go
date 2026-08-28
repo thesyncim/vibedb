@@ -2575,7 +2575,7 @@ func (m *Machine) persistTransitionRows(
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
-		transition = m.capturedTransition(next, baseRelationChanges(changes, plan.relations))
+		transition = m.capturedTransition(next, changes, plan.relations)
 		if !validCapturedTransition(transition) {
 			return ErrTransitionCapture
 		}
@@ -2814,7 +2814,7 @@ func (m *Machine) checkTransitionCapacity(
 	defer m.releaseCaptureChanges()
 	captureBytes := 0
 	if m.shouldCaptureTransition(next) {
-		transition := m.capturedTransition(next, baseRelationChanges(changes, plan.relations))
+		transition := m.capturedTransition(next, changes, plan.relations)
 		if !validCapturedTransition(transition) {
 			return ErrTransitionCapture
 		}

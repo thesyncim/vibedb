@@ -38,14 +38,15 @@ type TransitionCaptureBounds struct {
 // After are read-only borrowed apply-plan bytes. Nil means that the row is
 // absent on that side.
 type TransitionMutation struct {
-	Key    []byte
-	Before []byte
-	After  []byte
+	Relation replication.RelationID
+	Key      []byte
+	Before   []byte
+	After    []byte
 }
 
 // CapturedTransition is one consecutive replicated publication. Mutations are
-// strictly key ordered. Empty transitions remain required for no-op,
-// configuration, and ownership entries.
+// strictly ordered by relation then key. Empty transitions remain required for
+// no-op, configuration, and ownership entries.
 type CapturedTransition struct {
 	Applied               uint64
 	Term                  uint64
@@ -59,7 +60,14 @@ type CapturedTransition struct {
 	EntryDigest           [32]byte
 	BeforeDataChainDigest [32]byte
 	AfterDataChainDigest  [32]byte
-	mutations             []finalMutation
+	mutations             []capturedMutation
+}
+
+// Only active capture workspace carries a relation tag. The ordinary apply
+// planner's finalMutation and its allocation-free hot path remain unchanged.
+type capturedMutation struct {
+	finalMutation
+	relation replication.RelationID
 }
 
 // MutationCount returns the exact changed-row count.
@@ -68,7 +76,7 @@ func (t CapturedTransition) MutationCount() int { return len(t.mutations) }
 // Mutation returns one borrowed exact before-and-after transition.
 func (t CapturedTransition) Mutation(index int) TransitionMutation {
 	mutation := &t.mutations[index]
-	result := TransitionMutation{Key: mutation.key}
+	result := TransitionMutation{Relation: mutation.relation, Key: mutation.key}
 	if mutation.beforeFound {
 		result.Before = mutation.before
 	}
@@ -112,6 +120,21 @@ type TransitionCapture interface {
 	MaxEncodedBytes(TransitionCaptureBounds) (int, error)
 	AppendTransition([]byte, CapturedTransition) ([]byte, error)
 	Published(CapturedTransition) error
+}
+
+// RelationTransitionCapture explicitly opts into all user relations. Existing
+// split encoders keep their base-relation-only byte grammar. Online schema
+// builds need the complete before/after stream, including independently
+// maintained index relations; they must persist each mutation's Relation.
+// The result must be immutable for the lifetime of the capture.
+type RelationTransitionCapture interface {
+	TransitionCapture
+	CaptureAllRelations() bool
+}
+
+func capturesAllRelations(capture TransitionCapture) bool {
+	all, ok := capture.(RelationTransitionCapture)
+	return ok && all.CaptureAllRelations()
 }
 
 func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
@@ -213,30 +236,36 @@ func (m *Machine) validateTransitionCaptureTarget(
 		target.Collection.MaxBatchDocuments() < 1 {
 		return ErrTransitionCapture
 	}
+	for i := range m.relations {
+		if target.Name == m.relations[i].name || target.Collection == m.relations[i].target.Collection {
+			return ErrTransitionCapture
+		}
+	}
+	limits := m.captureCollectionLimits(capture)
 	requiredDocuments, err := RequiredBundleTransactionDocuments(
-		m.user.Limits.MaxDistinctMutations, m.options.RetryWindow, true,
+		limits.MaxDistinctMutations, m.options.RetryWindow, true,
 	)
-	if err != nil || m.options.TxnLimits.MaxCollections < 3 ||
+	if err != nil || m.options.TxnLimits.MaxCollections < len(m.relations)+2 ||
 		m.options.TxnLimits.MaxDocuments < requiredDocuments {
 		return fmt.Errorf("%w: transaction dimensions", ErrTransitionCapture)
 	}
-	maxBefore := uint64(m.user.Limits.MaxDistinctMutations) *
-		uint64(m.user.Limits.MaxDocumentBytes)
+	maxBefore := uint64(limits.MaxDistinctMutations) *
+		uint64(limits.MaxDocumentBytes)
 	// Keys and after images share both the durable batch envelope and the
 	// narrower replicated command envelope; their independent maxima cannot
 	// occur in one admitted transition.
-	maxPayload := uint64(min(m.user.Limits.MaxBatchBytes, replication.MaxCommandBytes))
-	possiblePayload := uint64(m.user.Limits.MaxDistinctMutations) *
-		uint64(m.user.Limits.MaxDocumentBytes+m.user.Limits.MaxKeyBytes)
+	maxPayload := uint64(min(limits.MaxBatchBytes, replication.MaxCommandBytes))
+	possiblePayload := uint64(limits.MaxDistinctMutations) *
+		uint64(limits.MaxDocumentBytes+limits.MaxKeyBytes)
 	maxPayload = min(maxPayload, possiblePayload)
-	maxAfter := min(maxPayload, uint64(m.user.Limits.MaxDistinctMutations)*
-		uint64(m.user.Limits.MaxDocumentBytes))
+	maxAfter := min(maxPayload, uint64(limits.MaxDistinctMutations)*
+		uint64(limits.MaxDocumentBytes))
 	maxKeys := maxPayload - maxAfter
-	if maxKeys > uint64(m.user.Limits.MaxDistinctMutations)*uint64(m.user.Limits.MaxKeyBytes) {
+	if maxKeys > uint64(limits.MaxDistinctMutations)*uint64(limits.MaxKeyBytes) {
 		return fmt.Errorf("%w: record payload dimensions", ErrTransitionCapture)
 	}
 	maxRecord, err := capture.MaxEncodedBytes(TransitionCaptureBounds{
-		Transitions: uint64(m.user.Limits.MaxDistinctMutations),
+		Transitions: uint64(limits.MaxDistinctMutations),
 		KeyBytes:    maxKeys, BeforeBytes: maxBefore, AfterBytes: maxAfter,
 	})
 	if err != nil || maxRecord <= 0 || maxRecord > target.Collection.MaxDocumentBytes() ||
@@ -244,7 +273,7 @@ func (m *Machine) validateTransitionCaptureTarget(
 		return fmt.Errorf("%w: record capacity", ErrTransitionCapture)
 	}
 	baseBytes, ok := checkedTxnBytes(
-		min(m.user.Limits.MaxBatchBytes, replication.MaxCommandBytes),
+		min(limits.MaxBatchBytes, replication.MaxCommandBytes),
 		maxSystemTransitionBytes(m.system.Limits))
 	if !ok || int64(maxRecord) > math.MaxInt64-baseBytes-8 ||
 		m.options.TxnLimits.MaxBytes < baseBytes+int64(maxRecord)+8 {
@@ -260,20 +289,63 @@ func (m *Machine) validateTransitionCaptureTarget(
 	return nil
 }
 
+func (m *Machine) captureCollectionLimits(capture TransitionCapture) CollectionLimits {
+	if !capturesAllRelations(capture) {
+		return m.user.Limits
+	}
+	var limits CollectionLimits
+	for i := range m.relations {
+		l := m.relations[i].target.Limits
+		limits.MaxDistinctMutations = min(replication.MaxMutations, limits.MaxDistinctMutations+l.MaxDistinctMutations)
+		limits.MaxDocumentBytes = max(limits.MaxDocumentBytes, l.MaxDocumentBytes)
+		limits.MaxKeyBytes = max(limits.MaxKeyBytes, l.MaxKeyBytes)
+		limits.MaxBatchBytes += min(replication.MaxCommandBytes-limits.MaxBatchBytes, l.MaxBatchBytes)
+	}
+	return limits
+}
+
 func maxSystemTransitionBytes(limits CollectionLimits) int {
 	return limits.MaxBatchBytes
 }
 
-func (m *Machine) capturedTransition(next State, changes []finalMutation) CapturedTransition {
+func (m *Machine) capturedTransition(next State, changes []finalMutation, spans []plannedRelationChanges) CapturedTransition {
+	if !capturesAllRelations(m.capture) {
+		changes = baseRelationChanges(changes, spans)
+		spans = nil
+	} else if len(changes) != 0 && len(spans) == 0 {
+		return CapturedTransition{}
+	}
 	if cap(m.captureChanges) < len(changes) {
-		m.captureChanges = make([]finalMutation, len(changes))
+		m.captureChanges = make([]capturedMutation, len(changes))
 	} else {
 		m.captureChanges = m.captureChanges[:len(changes)]
 	}
-	copy(m.captureChanges, changes)
-	slices.SortFunc(m.captureChanges, func(left, right finalMutation) int {
+	for i := range changes {
+		m.captureChanges[i] = capturedMutation{finalMutation: changes[i], relation: 1}
+	}
+	compareKeys := func(left, right capturedMutation) int {
 		return bytes.Compare(left.key, right.key)
-	})
+	}
+	if len(spans) == 0 {
+		slices.SortFunc(m.captureChanges, compareKeys)
+	}
+	var end uint32
+	for i, span := range spans {
+		if span.start != end || span.end < span.start || uint64(span.end) > uint64(len(changes)) ||
+			int(span.ordinal) >= len(m.relations) || i != 0 && span.ordinal <= spans[i-1].ordinal {
+			return CapturedTransition{}
+		}
+		for i := span.start; i < span.end; i++ {
+			m.captureChanges[i].relation = m.relations[span.ordinal].id
+		}
+		// The planner already orders relation spans. Sort only within each
+		// bounded relation, not the entire multi-relation command.
+		slices.SortFunc(m.captureChanges[span.start:span.end], compareKeys)
+		end = span.end
+	}
+	if len(spans) != 0 && int(end) != len(changes) {
+		return CapturedTransition{}
+	}
 	return CapturedTransition{
 		Applied: next.Applied, Term: next.LastTerm,
 		BeforeOwnershipEpoch:  m.state.Binding.OwnershipEpoch,
@@ -307,13 +379,23 @@ func validCapturedTransition(t CapturedTransition) bool {
 		t.AfterRoutingVersion == 0 || t.BeforeRouteGeneration == 0 ||
 		t.AfterRouteGeneration == 0 || t.PreviousEntryDigest == ([32]byte{}) ||
 		t.EntryDigest == ([32]byte{}) || t.BeforeDataChainDigest == ([32]byte{}) ||
-		t.AfterDataChainDigest == ([32]byte{}) || len(t.mutations) > MaxDistinctMutations {
+		t.AfterDataChainDigest == ([32]byte{}) || len(t.mutations) > replication.MaxMutations {
 		return false
 	}
 	var previous []byte
+	var relation replication.RelationID
+	var count int
 	for i := range t.mutations {
 		mutation := &t.mutations[i]
+		if mutation.relation != relation {
+			if mutation.relation <= relation || mutation.relation > replication.MaxRelationID {
+				return false
+			}
+			relation, previous, count = mutation.relation, nil, 0
+		}
+		count++
 		if len(mutation.key) == 0 ||
+			count > MaxDistinctMutations || relation == 0 ||
 			previous != nil && bytes.Compare(previous, mutation.key) >= 0 ||
 			!mutation.beforeFound && mutation.delete {
 			return false
