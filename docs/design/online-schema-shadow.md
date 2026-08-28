@@ -81,6 +81,19 @@ re-auditing a retained shadow; unprepared shadows remain ineligible. The stage
 marker prevents further replay into the prepared files. The PostgreSQL online
 coordinator is not yet wired. This is not yet an end-to-end bounded online cutover.
 
+After the authorized old-reader drain, selected schema lineage also permits
+bounded reclamation of that exact retired capture. The immutable capture header
+is retained until all other capture records are deleted, and restart uses the
+drained lineage to distinguish this partial cleanup from an invalid live stream.
+Each batch uses the existing checkpoint group at its unchanged applied index;
+it changes no user rows, durable sessions, or capture storage identity. The
+completed shadow journal is removed last. The final capture deletion is
+checkpoint-certified before removing that journal or acknowledging completed
+cleanup. Installer drain observation requires
+both capture and journal cleanup, so an interrupted drain resumes before the
+next online build can reserve the collection. This cleanup is outside cutover,
+not a zero-cost operation or authority to reclaim an active/aborted build.
+
 ## Costs and remaining work
 
 Copying is proportional to source rows, and capture/replay is proportional to
@@ -88,5 +101,5 @@ intervening mutations. Replay currently persists one cursor per source entry;
 this is not a zero-cost or measured throughput claim. Source writes retain
 their existing bounded capture-abort behavior when storage/retention budgets
 are exhausted. Target opening and certification costs must remain outside the
-final write fence. Bounded cutover, successful/aborted artifact reclamation,
+final write fence. Bounded cutover, aborted-build artifact reclamation,
 and PostgreSQL coordinator integration remain required.
