@@ -157,6 +157,22 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 	}
 
 	for attempt := 0; attempt < 4; attempt++ {
+		// A live ReadIndex observation proves the pin, not completion of this
+		// session's exact pending command. Settle the journal first so a later
+		// terminal release can use the next sequence. Retained release replay
+		// is owned by the terminal coordinator and must not be rewritten here.
+		if session.pending && retainedRelease.Operation != executionpin.OperationRelease {
+			outer, openCommandErr := replication.OpenCommand(session.command)
+			nested, nestedErr := outer.OpenExecutionPin()
+			if openCommandErr != nil || nestedErr != nil || nested.PinID != pin || nested.Binding != binding ||
+				(nested.Operation != executionpin.OperationAcquire && nested.Operation != executionpin.OperationRecover) {
+				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
+					errors.Join(openCommandErr, nestedErr, ErrDurableRequestConflict)
+			}
+			if _, retryErr := session.RetryPending(authorizedCtx); retryErr != nil {
+				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, retryErr
+			}
+		}
 		read, readErr := authority.executor.ReadExecutionPin(authorizedCtx, route, ReplicatedExecutionPinRead{
 			Pin: pin, MinimumApplied: 1,
 		})
@@ -200,20 +216,6 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 		}
 		if retainedRelease.Operation == executionpin.OperationRelease {
 			return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
-		}
-
-		if session.pending {
-			outer, openCommandErr := replication.OpenCommand(session.command)
-			nested, nestedErr := outer.OpenExecutionPin()
-			if openCommandErr != nil || nestedErr != nil || nested.PinID != pin || nested.Binding != binding ||
-				(nested.Operation != executionpin.OperationAcquire && nested.Operation != executionpin.OperationRecover) {
-				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
-					errors.Join(openCommandErr, nestedErr, ErrDurableRequestConflict)
-			}
-			if _, retryErr := session.RetryPending(authorizedCtx); retryErr != nil {
-				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, retryErr
-			}
-			continue
 		}
 
 		transition := executionpin.Command{

@@ -26,6 +26,7 @@ const (
 	sourceDatabase
 	sourceFileDatabase
 	sourceRelationSpool
+	sourceFileFiltered
 )
 
 // A Source is the collection a compiled query runs over. Construct one with
@@ -72,7 +73,7 @@ func (s Source) subquerySource(outer, collection string) (Source, error) {
 		return FromDatabase(s.catalog, collection), nil
 	case sourceFileDatabase:
 		return FromFileDatabase(s.files, collection), nil
-	case sourceHeapSnapshot, sourceFileSnapshot, sourceSegment, sourceSnapshotOverlay:
+	case sourceHeapSnapshot, sourceFileSnapshot, sourceSegment, sourceSnapshotOverlay, sourceFileFiltered:
 		if collection == outer {
 			return s, nil
 		}
@@ -551,6 +552,15 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		return p.runFileInto(
 			e, src.file, durable.DatabaseSnapshot{}, rangeSource,
 		)
+	case sourceFileFiltered:
+		if err := rejectJoins(p, "FromFileFiltered"); err != nil {
+			return err
+		}
+		filter := (*FileFilterSource)(src.payload)
+		if filter == nil || filter.filter == nil {
+			return fmt.Errorf("query: FromFileFiltered was given a nil filter")
+		}
+		return p.runFileOverlayInto(e, src.file, filter)
 	case sourceFileOverlay:
 		if err := rejectJoins(p, "FromFileOverlay"); err != nil {
 			return err

@@ -141,6 +141,7 @@ func buildCatalogShapes() []catalogShape {
 		shape(`\d name: publications`, psqlTablePublications, captureOID, respondTablePublications),
 		shape(`\d name: inheritance parents`, psqlTableInheritanceParents, captureOID, respondTableInheritanceParents),
 		shape(`\d name: partition children`, psqlTablePartitionChildren, captureOID, respondTablePartitionChildren),
+		shape(`JDBC tables public`, jdbcPublicTables, captureNone, respondJDBCPublicTables),
 	}
 }
 

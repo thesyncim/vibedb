@@ -144,3 +144,28 @@ func TestReplicatedIssuerAuthorityOpenResponseLossRecovers(t *testing.T) {
 		t.Fatalf("replacement grant=%+v err=%v", again, err)
 	}
 }
+
+func TestReplicatedIssuerAuthorityReopensAdvancedLane(t *testing.T) {
+	catalog, _, _ := newCatalogAuthorityFixture(t)
+	ledger := new(replicatedIssuerAuthorityLedger)
+	authority := replicatedIssuerAuthorityFixture(t, catalog, ledger)
+	open := replicatedIssuerOpenFixture()
+	grant, err := authority.OpenIssuerLane(t.Context(), catalog.authority, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := ReplicatedIssuerReference{Installation: grant.Installation, Epoch: grant.Epoch, LaneOrdinal: grant.LaneOrdinal, GrantDigest: grant.GrantDigest}
+	key, err := authority.ValidateRequest(t.Context(), catalog.authority, ref, requestledger.RequestID{7}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger.highwater, err = requestledger.AdmitIssuerSequence(ledger.highwater, key, requestledger.Digest{8}, ledger.highwater.Revision+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := ledger.highwater
+	again, err := authority.OpenIssuerLane(t.Context(), catalog.authority, open)
+	if err != nil || again != grant || ledger.highwater != before {
+		t.Fatalf("advanced lane reopen: %v", err)
+	}
+}

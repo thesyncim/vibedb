@@ -529,7 +529,17 @@ func newMultiGroupRF3DurableGateway(
 	if err != nil {
 		t.Fatal(err)
 	}
-	planner := gateway.NewExecutor(nil, catalog, gateway.Options{})
+	// This fixture qualifies durable recovery across many real quorum rounds,
+	// not the production interactive latency SLO. The default five-second
+	// whole-operation deadline can expire during terminal proof persistence on
+	// a loaded Docker host, before the test injects its intended partition.
+	// Keep admission/row/byte policies unchanged and bound the whole fixture
+	// operation independently of that unrelated latency profile.
+	profile := gateway.DefaultProfiles()[gateway.ClassInteractive]
+	profile.GlobalDeadline = 30 * time.Second
+	planner := gateway.NewExecutor(nil, catalog, gateway.Options{Profiles: map[gateway.OperationClass]gateway.Profile{
+		gateway.ClassInteractive: profile,
+	}})
 	sql, err := gateway.NewDurableSQLRequestExecutor(gateway.DurableSQLRequestExecutorOptions{
 		Planner: planner, ReplicatedData: native, Requests: requests,
 		RecoveryPulseLimit: distributedtxn.MaxRecoveryPulses, PlanningLeaseSpan: 128,
@@ -624,7 +634,7 @@ func TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition(t 
 		IssuerOpen: highwater,
 	})
 	if err != nil || opened.Ledger.ResultCode != replicatedstate.ResultApplied ||
-		opened.Ledger.ExactDuplicate {
+		opened.Ledger.ExactDuplicate && opened.Retries == 0 {
 		t.Fatalf("issuer open=%+v err=%v", opened, err)
 	}
 	waitRF3Applied(t, ctx, cluster.owners[:], nil, cluster.groups[group].key, opened.Applied)
@@ -684,9 +694,18 @@ func TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition(t 
 	accepted, err := ledgerB.ApplyCAS(ctx, home, key2, gateway.DurableRequestLifecycleCAS{
 		Operation: requestledger.OperationCreate, Revision: head2.Revision, Head: head2,
 	})
+	// ApplyCAS may lose a completion and transparently retry the identical
+	// command. A duplicate on that retry is success, not a sequence violation.
 	if err != nil || accepted.Ledger.ResultCode != replicatedstate.ResultApplied ||
-		accepted.Ledger.ExactDuplicate {
+		accepted.Ledger.ExactDuplicate && accepted.Retries == 0 {
 		t.Fatalf("contiguous issuer sequence=%+v err=%v", accepted, err)
+	}
+	acceptedRow, err := ledgerB.ReadRow(ctx, home, gateway.DurableRequestLifecycleRead{
+		Key: key2, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: accepted.Applied,
+	})
+	if err != nil || !acceptedRow.Found || acceptedRow.Head.Key != key2 ||
+		acceptedRow.Head.KeyDigest != head2.KeyDigest || acceptedRow.Head.RequestDigest != head2.RequestDigest {
+		t.Fatalf("contiguous issuer head=%+v err=%v", acceptedRow, err)
 	}
 
 	traceA := clientA.proposalTrace()

@@ -316,6 +316,7 @@ func runClusterDev(args []string) int {
 	shardBinary := fs.String("shard-binary", "", "vibedb-shard executable; defaults beside vibedb or PATH")
 	gatewayBinary := fs.String("gateway-binary", "", "vibedb-gateway executable; defaults beside vibedb or PATH")
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
+	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *root == "" {
 		usage()
 		return 2
@@ -336,6 +337,15 @@ func runClusterDev(args []string) int {
 	if *replicas != devClusterRF1 && *replicas != devClusterRF3 {
 		usage()
 		return 2
+	}
+	if *pgListen != "" {
+		host, port, err := net.SplitHostPort(*pgListen)
+		address := net.ParseIP(host)
+		portNumber, portErr := strconv.Atoi(port)
+		if *replicas != devClusterRF3 || err != nil || address == nil || !address.IsLoopback() || portErr != nil || portNumber < 1 || portNumber > 65535 {
+			fmt.Fprintln(os.Stderr, "cluster dev: --pg-listen requires RF3 and a literal loopback IP with port 1..65535")
+			return 2
+		}
 	}
 	if !filepath.IsAbs(*root) || filepath.Clean(*root) != *root {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", errDevCluster)
@@ -370,7 +380,7 @@ func runClusterDev(args []string) int {
 	if *diagnosticsOnExit {
 		diagnostics = os.Stderr
 	}
-	if err := serveDevCluster(ctx, manifest, shard, gw, diagnostics); err != nil {
+	if err := serveDevCluster(ctx, manifest, shard, gw, diagnostics, *pgListen); err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
 	}
@@ -1212,7 +1222,7 @@ type devChildExit struct {
 	err  error
 }
 
-func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string, diagnostics io.Writer) error {
+func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string, diagnostics io.Writer, pgListen ...string) error {
 	memberCount := len(m.Members) + len(m.LedgerMembers) + len(m.DataMembers)
 	children := make([]*devChild, 0, memberCount+1)
 	exits := make(chan devChildExit, memberCount+1)
@@ -1261,6 +1271,9 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 		for _, member := range members {
 			args = append(args, "-shard-peer", member.Native+"="+member.Node)
 		}
+	}
+	if len(pgListen) != 0 && pgListen[0] != "" {
+		args = append(args, "-pg-dev-listen", pgListen[0])
 	}
 	gatewayChild, err := startDevChild(gatewayBinary, args, "vibedb-gateway serving")
 	if err != nil {

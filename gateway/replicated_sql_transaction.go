@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -118,6 +119,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	}
 	statements := make([]replicatedSQLBoundStatement, len(queries))
 	replicatedCount := 0
+	var encodedFlatBytes uint64
 	for index := range queries {
 		args, err := queryRuntimeArgs(queries[index].Params)
 		if err != nil {
@@ -144,6 +146,31 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			return nil, true, ErrReplicatedSQLTransactionUnsupported
 		}
 		statements[index].profile = tableProfile
+		if prepared.statement.Kind == sqlast.KindInsert && len(prepared.statement.Insert.Columns) != 0 {
+			insert := prepared.statement.Insert
+			if uint64(len(insert.Rows)) > profile.MaxTransactionMutations {
+				return nil, true, ErrTransactionMutationLimit
+			}
+			encoder, encodeErr := sqldriver.PrepareFlatInsertEncoder(insert)
+			if encodeErr != nil {
+				return nil, true, encodeErr
+			}
+			if len(insert.Rows) > 1 {
+				bound.insertDocs = make([][]byte, len(insert.Rows))
+			}
+			for row := range insert.Rows {
+				document, encodeErr := encoder.Encode(&insert.Rows[row], args, int(min(uint64(tableProfile.MaxDocumentBytes), profile.MaxTransactionBytes-encodedFlatBytes)))
+				if encodeErr != nil {
+					return nil, true, encodeErr
+				}
+				encodedFlatBytes += uint64(len(document))
+				if len(insert.Rows) == 1 {
+					bound.insertDoc = document
+				} else {
+					bound.insertDocs[row] = document
+				}
+			}
+		}
 		replicatedCount++
 	}
 	if replicatedCount == 0 {
@@ -412,7 +439,7 @@ func replicatedSQLMutationInputCount(
 	case sqlast.KindInsert:
 		insert := prepared.statement.Insert
 		if insert == nil || insert.Source != nil || insert.Returning != nil ||
-			insert.OnConflictDoNothing || len(insert.Columns) != 0 || len(insert.Rows) == 0 ||
+			insert.OnConflictDoNothing || len(insert.Rows) == 0 ||
 			len(bound.rowKeys) != len(insert.Rows) ||
 			len(bound.globalIndexes) != len(insert.Rows)*len(prepared.writeGlobalIndexes) {
 			return 0, ErrReplicatedSQLTransactionUnsupported

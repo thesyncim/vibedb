@@ -72,6 +72,58 @@ func newWALGenerationDriver(options WALGenerationDriverOptions) *walGenerationDr
 	}
 }
 
+// reserveReadyWithWALMaintenance keeps the ordinary admission path to the same
+// single WAL headroom check. A fixed maintenance cadence alone cannot prevent
+// exhaustion: a busy group can fill its WAL before the first scheduled tick,
+// and a full reopened WAL cannot even tick to start periodic maintenance.
+//
+// Only at hard pressure, and only in an already empty input window, wait for
+// the bounded generation worker and select a freshly certified generation
+// before accepting more Raft input. Holding this owner lane prevents apply
+// from perpetually staling the candidate. This is backpressure, not a relaxed
+// retention fence or a larger WAL; normal periodic builds remain asynchronous.
+func (runtime *Runtime) reserveReadyWithWALMaintenance() error {
+	err := runtime.wal.ReserveReady()
+	if err == nil {
+		return nil
+	}
+	return runtime.maintainWALAdmission(err)
+}
+
+// Keep the generation builder and error traversal off the ordinary Raft
+// input stack. Healthy admission must retain ReserveReady's nil fast path.
+func (runtime *Runtime) maintainWALAdmission(err error) error {
+	if !errors.Is(err, raftstore.ErrFull) || runtime.walGeneration == nil {
+		return err
+	}
+	driver := runtime.walGeneration
+	if driver.building {
+		// No selection was published by this worker. Retire its potentially
+		// stale candidate before capturing the now-quiescent current cut.
+		result := <-driver.result
+		driver.building = false
+		if result.builder != nil {
+			result.err = errors.Join(result.err, result.builder.Close())
+		}
+		if result.err != nil {
+			return errors.Join(err, result.err)
+		}
+	}
+	if buildErr := runtime.prepareWALGenerationBuild(driver); buildErr != nil {
+		return errors.Join(err, buildErr)
+	}
+	if !driver.building {
+		// No newer certified base: do not hide a genuine capacity limit.
+		return err
+	}
+	result := <-driver.result
+	driver.building, driver.ticks = false, 0
+	if publishErr := runtime.publishBuiltWALGeneration(driver, result); publishErr != nil {
+		return errors.Join(err, publishErr)
+	}
+	return runtime.wal.ReserveReady()
+}
+
 func (runtime *Runtime) tickWALGeneration() {
 	driver := runtime.walGeneration
 	if driver == nil {

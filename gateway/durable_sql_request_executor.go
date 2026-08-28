@@ -16,6 +16,12 @@ import (
 
 var ErrDurableSQLRequest = errors.New("gateway: durable RF3 SQL request is unavailable")
 
+// ErrDurableSQLNotAdmitted proves this invocation did not attempt ledger
+// admission. It is not proof that an earlier invocation with the same identity
+// was never admitted; recovery must always retain that earlier identity.
+var ErrDurableSQLNotAdmitted = errors.New("gateway: SQL request was not admitted by this invocation")
+var ErrDurableSQLAborted = errors.New("gateway: durable SQL transaction aborted")
+
 type DurableSQLRequestExecutorOptions struct {
 	Planner            *Executor
 	ReplicatedData     *ReplicatedExecutor
@@ -76,7 +82,13 @@ func (executor *DurableSQLRequestExecutor) Execute(
 	requestKey requestledger.RequestKey,
 	tenant []byte,
 	queries []Query,
-) (DurableSQLRequestResult, error) {
+) (result DurableSQLRequestResult, err error) {
+	admitted := false
+	defer func() {
+		if err != nil && !admitted {
+			err = errors.Join(ErrDurableSQLNotAdmitted, err)
+		}
+	}()
 	if executor == nil || ctx == nil || executor.planner == nil || executor.data == nil ||
 		executor.requests == nil || !requestKey.Valid() || len(tenant) == 0 || len(queries) == 0 ||
 		requestledger.Digest(sha256.Sum256(tenant)) != requestKey.TenantDigest {
@@ -116,6 +128,7 @@ func (executor *DurableSQLRequestExecutor) Execute(
 			// another request's intent and the original refusal still stands.
 			result, found, replayErr := executor.Replay(opctx, key)
 			if found {
+				admitted = true
 				return result, replayErr
 			}
 			err = errors.Join(err, replayErr)
@@ -133,6 +146,7 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL program construction: %w", err)
 	}
 	request := DurableRequest{Key: key, Program: program}
+	admitted = true // Even an unsuccessful Begin can have an unknown outcome.
 	begin, err := executor.requests.Begin(opctx, request)
 	if err != nil {
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL admission: %w", err)
@@ -158,6 +172,16 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL execution (matching plan=%t): %w", begin.ProgramMatches, err)
 	}
 	return executor.result(key, outcome)
+}
+
+// ReplayRequest resolves retained caller bytes before any new planning. A
+// committed INSERT may now conflict with its own row; replay must not replan it.
+func (executor *DurableSQLRequestExecutor) ReplayRequest(ctx context.Context, requestKey requestledger.RequestKey, queries []Query) (DurableSQLRequestResult, bool, error) {
+	key, err := NewDurableRequestLedgerKey(requestKey, replicatedSQLTransactionRequestDigest(queries))
+	if err != nil {
+		return DurableSQLRequestResult{}, false, err
+	}
+	return executor.Replay(ctx, key)
 }
 
 // observeMutationPressure samples one logical write per routed participant.
@@ -237,13 +261,13 @@ func (executor *DurableSQLRequestExecutor) result(
 	key DurableRequestLedgerKey,
 	outcome DurableRequestOutcome,
 ) (DurableSQLRequestResult, error) {
-	if !outcome.Committed || outcome.CatalogGeneration == 0 ||
+	if outcome.CatalogGeneration == 0 ||
 		outcome.ShardsFanned <= 0 || outcome.TerminalRevision == 0 ||
 		outcome.ResultDigest == (replication.Digest{}) || outcome.AckToken == (DurableRequestAckToken{}) {
 		return DurableSQLRequestResult{}, ErrDurableSQLRequest
 	}
 	executor.planner.metrics.observeRoute(distribution.RouteTargeted, outcome.ShardsFanned, ScatterNone)
-	return DurableSQLRequestResult{
+	result := DurableSQLRequestResult{
 		Key: key,
 		Result: &Result{
 			Kind: shardservice.ResponseCompletion, RowsAffected: outcome.AffectedRows,
@@ -252,5 +276,9 @@ func (executor *DurableSQLRequestExecutor) result(
 		},
 		TerminalRevision: outcome.TerminalRevision,
 		ResultDigest:     outcome.ResultDigest, AckToken: outcome.AckToken,
-	}, nil
+	}
+	if !outcome.Committed {
+		return result, ErrDurableSQLAborted
+	}
+	return result, nil
 }

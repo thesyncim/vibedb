@@ -159,7 +159,7 @@ func newPreparseTestSession(t *testing.T) (*session, *bytes.Buffer) {
 		params:     make(map[string]string, len(parameters)),
 		statements: map[string]*prepared{},
 		portals:    map[string]*portal{},
-		sql:        runtime,
+		sql:        &embeddedSession{runtime},
 		w:          newWriter(output, 16<<10),
 	}
 	for name, parameter := range parameters {

@@ -88,7 +88,7 @@ const defaultMaxRetries = 2
 // Executor routes and dispatches bounded distributed reads over a pinned catalog
 // generation. It is safe for concurrent use.
 type Executor struct {
-	client            *Client
+	client            ShardTransport
 	catalog           *CatalogHolder
 	profiles          map[OperationClass]Profile
 	refresh           RefreshFunc
@@ -101,7 +101,7 @@ type Executor struct {
 
 // NewExecutor returns an executor that dispatches through client and pins
 // generations from catalog. Both are required.
-func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor {
+func NewExecutor(client ShardTransport, catalog *CatalogHolder, opts Options) *Executor {
 	profiles := DefaultProfiles()
 	for class, p := range opts.Profiles {
 		profiles[class] = p
@@ -145,6 +145,8 @@ type Query struct {
 // caller reads for observability. Kind is ResponseRows for the read path;
 // RowsAffected is meaningful only for a single-shard completion passthrough.
 type Result struct {
+	// Observations records independent RF3 group cuts, not a global MVCC timestamp.
+	Observations []ReplicatedGroupReadObservation
 	Kind         shardservice.ResponseKind
 	Columns      []shardservice.Column
 	Rows         [][]shardservice.Cell
@@ -184,13 +186,16 @@ type Explanation struct {
 // shard reports the pinned generation is stale. It pins one generation per
 // attempt and never mixes generations within an attempt.
 func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
+	return e.queryWithProfile(ctx, q, e.profileFor(q.Class))
+}
+
+func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profile) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	profile := e.profileFor(q.Class)
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	args, err := queryRuntimeArgs(q.Params)
@@ -210,6 +215,12 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 			return nil, err
 		}
 		leases.add(lease)
+		attemptContext := opctx
+		var nativeAttempt *replicatedSQLAttempt
+		if _, native := e.client.(*ReplicatedSQLTransport); native {
+			nativeAttempt = &replicatedSQLAttempt{snapshot: snap}
+			attemptContext = context.WithValue(opctx, replicatedSQLSnapshotKey{}, nativeAttempt)
+		}
 		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
 			return nil, err
@@ -224,7 +235,10 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 			return nil, err
 		}
 		if useGlobalIndexRead(bound) {
-			execution, indexErr := e.queryGlobalIndex(opctx, &q, bound, profile)
+			if nativeAttempt != nil {
+				return nil, ErrReplicatedSQLPlanUnsupported
+			}
+			execution, indexErr := e.queryGlobalIndex(attemptContext, &q, bound, profile)
 			if indexErr == nil {
 				kind := execution.routeKind
 				if execution.shardsFanned > 1 && kind != distribution.RouteScatter {
@@ -269,8 +283,11 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
-		res, err := e.dispatch(opctx, pl, profile)
+		res, err := e.dispatch(attemptContext, pl, profile)
 		if err == nil {
+			if nativeAttempt != nil {
+				res.Observations = nativeAttempt.resultObservations()
+			}
 			res.RouteKind = pl.kind
 			res.Generation = pl.generation
 			res.ShardsFanned = len(pl.calls)
@@ -774,6 +791,14 @@ func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, 
 	case 1:
 		return e.single(ctx, pl.calls[0], p)
 	default:
+		if _, native := e.client.(*ReplicatedSQLTransport); native {
+			// Each native request owns a leader ReadIndex cut. Legacy transaction
+			// read fences are neither supported nor a global RF3 snapshot.
+			if pl.repartition {
+				return nil, ErrReplicatedSQLPlanUnsupported
+			}
+			return e.fanout(ctx, pl, p)
+		}
 		return e.snapshotFanout(ctx, pl, p)
 	}
 }

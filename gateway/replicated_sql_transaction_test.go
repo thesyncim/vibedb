@@ -22,6 +22,40 @@ type replicatedSQLIndexedReadClient struct {
 	refusal shardservice.ReplicatedRefusalCode
 }
 
+func TestReplicatedSQLFlatInsertUsesCanonicalRuntimeDocuments(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true)
+	queries := []Query{{SQL: `INSERT INTO messages (n,id,label) VALUES (?,?,'quoted " value'), (3,'message-2',?)`, Params: []shardservice.Param{shardservice.NumberParam("1.25"), shardservice.StringParam("message-1"), shardservice.NullParam()}}}
+	participants, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, queries, executor.profileFor(ClassInteractive))
+	if err != nil || !handled {
+		t.Fatalf("flat lowering: %v", err)
+	}
+	got := map[string]bool{}
+	for _, p := range participants {
+		for _, b := range p.Batches {
+			for _, m := range b.Mutations {
+				got[string(m.Value)] = true
+			}
+		}
+	}
+	if !got[`{"id":"message-1","label":"quoted \" value","n":1.25}`] || !got[`{"id":"message-2","label":null,"n":3}`] || len(got) != 2 {
+		t.Fatalf("documents=%v", got)
+	}
+}
+
+func TestReplicatedSQLFlatInsertRoutesAcrossDataShards(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
+	queries := []Query{{SQL: `INSERT INTO messages (id,n) VALUES (?,1),(?,2)`, Params: []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.StringParam(keys[1])}}}
+	participants, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, queries, executor.profileFor(ClassInteractive))
+	if err != nil || !handled || len(participants) != 2 {
+		t.Fatalf("distributed flat INSERT participants=%d handled=%v err=%v", len(participants), handled, err)
+	}
+	for _, p := range participants {
+		if len(p.Batches) != 1 || len(p.Batches[0].Mutations) != 1 {
+			t.Fatalf("incorrect row distribution: %+v", p)
+		}
+	}
+}
+
 func (client *replicatedSQLIndexedReadClient) DoReplicated(
 	_ context.Context,
 	endpoint ReplicatedEndpoint,
@@ -204,9 +238,9 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 			want: ErrWriteShardKeyMove,
 		},
 		{
-			name: "flat insert",
+			name: "flat insert on conflict",
 			queries: []Query{
-				{SQL: `INSERT INTO messages (id) VALUES (?)`, Params: []shardservice.Param{
+				{SQL: `INSERT INTO messages (id) VALUES (?) ON CONFLICT DO NOTHING`, Params: []shardservice.Param{
 					shardservice.StringParam("message-1"),
 				}},
 				{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{

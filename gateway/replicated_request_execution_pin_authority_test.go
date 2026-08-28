@@ -1,13 +1,101 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/shardservice"
 )
+
+type pendingPinSessionFactory struct {
+	DurableRequestExecutionPinSessionFactory
+	session   *NativeSession
+	principal serviceauthz.Authority
+}
+
+func (f pendingPinSessionFactory) OpenExecutionPinSession(context.Context, DurableRequestTypedExecutionContext, ReplicatedRoute) (*NativeSession, serviceauthz.Authority, func(), error) {
+	return f.session, f.principal, func() {}, nil
+}
+
+type pendingPinReadClient struct {
+	route   ReplicatedRoute
+	record  executionpin.Record
+	retried []byte
+}
+
+func (c *pendingPinReadClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	state := shardservice.ReplicatedMemberState{Fence: shardservice.ReplicatedFence{Group: c.route.Group, AllocationGeneration: c.route.AllocationGeneration, Command: c.route.Command, MemberID: endpoint.Member, StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation, Term: 1}, LeaderID: endpoint.Member, Applied: 10, Commit: 10, CheckpointApplied: 1}
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
+	}
+	if request.Operation == shardservice.ReplicatedExecutionPinRead {
+		value, err := shardservice.AppendReplicatedExecutionPinReadValue(nil, shardservice.ReplicatedExecutionPinReadValue{Found: true, Record: c.record})
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedExecutionPinReadResult, HasState: true, State: state, ReadApplied: 10, Value: value}, err
+	}
+	c.retried = bytes.Clone(request.Command)
+	return nil, errors.New("pin completion still unavailable")
+}
+
+func TestDurablePinLiveReadCannotBypassPendingAcquireCompletion(t *testing.T) {
+	execution := typedExecutionFixture(t)
+	_, _, route := lifecycleRunnerFixture(t)
+	execution, _ = bindTypedExecutionPin(t, execution, route)
+	binding, err := BuildDurableRequestExecutionPinBinding(execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := executionpin.DerivePinID(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := serviceauthz.Authority{Node: [16]byte{7}, Generation: 1}
+	command := executionpin.Command{Operation: executionpin.OperationAcquire, Binding: binding, PinID: pin,
+		AuthorityNode: executionpin.ID(principal.Node), AuthorityGeneration: 1, NextController: executionpin.ID(principal.Node), NextControllerEpoch: 1, NextLeaseSpan: 100}
+	applied := executionpin.Apply(executionpin.Record{}, false, command, 10, executionpin.Digest{1}, executionpin.Digest{2})
+	if applied.Reason != executionpin.ReasonApplied {
+		t.Fatal("invalid pin fixture")
+	}
+	client := &pendingPinReadClient{route: route, record: applied.Record}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{Executor: executor, Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard), Tenant: execution.Recipe.Tenant,
+		ClientID: replication.ID128{3}, RetryHome: execution.Recipe.Identity.RetryHome, Resolver: BaseRelationResolver{Relation: 1}, ProposalCapability: serviceauthz.CapabilityExecutionPin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.phase, session.epoch, session.nextSequence = nativeSessionActive, 1, 2
+	nested, err := executionpin.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer := session.commandHeader(replication.CommandExecutionPin, 1, 2, 0)
+	outer.ExecutionPin = nested
+	outer.Fingerprint = nativeCommandFingerprint(outer)
+	session.command, err = replication.AppendCommand(nil, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.pending = true
+	exact := bytes.Clone(session.command)
+	authority, err := NewNativeDurableRequestExecutionPinAuthority(executor, pendingPinSessionFactory{session: session, principal: principal}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, lease, err := authority.AcquireOrRecover(t.Context(), execution)
+	if err == nil || lease.Valid() || !session.pending || !bytes.Equal(client.retried, exact) {
+		t.Fatalf("live cut bypassed pending completion: lease=%+v pending=%t retried=%t err=%v", lease, session.pending, bytes.Equal(client.retried, exact), err)
+	}
+}
 
 func TestDurableRequestDefaultPinTakeoverRequiresLaterExactApply(t *testing.T) {
 	execution := typedExecutionFixture(t)

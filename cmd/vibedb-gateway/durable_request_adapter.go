@@ -82,9 +82,32 @@ func (service *replicatedDurableRequestService) ExecBatch(
 		return durableExecBatchExecuteResult{}, err
 	}
 	result, err := service.sql.Execute(ctx, key, tenant[:], queries)
-	if err != nil {
+	if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 		return durableExecBatchExecuteResult{}, err
 	}
+	return durableAdapterResult(identity, key, result, err)
+}
+
+func (service *replicatedDurableRequestService) ReplayBatch(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query) (durableExecBatchExecuteResult, bool, error) {
+	recovery, ok := service.sql.(interface {
+		ReplayRequest(context.Context, requestledger.RequestKey, []gateway.Query) (gateway.DurableSQLRequestResult, bool, error)
+	})
+	if !ok {
+		return durableExecBatchExecuteResult{}, false, errInvalidDurableRequestAdapter
+	}
+	key, err := service.issuers.ValidateRequest(ctx, authority, identity.Reference, requestledger.RequestID(identity.RequestID), identity.IssuerSequence)
+	if err != nil {
+		return durableExecBatchExecuteResult{}, false, err
+	}
+	result, found, err := recovery.ReplayRequest(ctx, key, queries)
+	if !found || err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
+		return durableExecBatchExecuteResult{}, found, err
+	}
+	response, err := durableAdapterResult(identity, key, result, err)
+	return response, true, err
+}
+
+func durableAdapterResult(identity durableExecBatchIdentity, key requestledger.RequestKey, result gateway.DurableSQLRequestResult, outcomeErr error) (durableExecBatchExecuteResult, error) {
 	if result.Result == nil || result.Key.RequestKey != key || result.Key.Digest == (replication.Digest{}) ||
 		result.TerminalRevision == 0 || result.ResultDigest == (replication.Digest{}) ||
 		result.AckToken == (gateway.DurableRequestAckToken{}) {
@@ -102,7 +125,7 @@ func (service *replicatedDurableRequestService) ExecBatch(
 	if !validDurableExecBatchAckRequest(&ack) {
 		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
 	}
-	return durableExecBatchExecuteResult{Result: result.Result, Ack: ack}, nil
+	return durableExecBatchExecuteResult{Result: result.Result, Ack: ack}, outcomeErr
 }
 
 func (service *replicatedDurableRequestService) AckExecBatch(

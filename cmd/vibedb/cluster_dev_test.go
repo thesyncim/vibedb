@@ -456,6 +456,10 @@ func TestClusterDevReplicaFlagsRejectAmbiguity(t *testing.T) {
 		{"--root", root, "--replicas", "2"},
 		{"--root", root, "--nodes", "0"},
 		{"--root", root, "--replicas", "1", "--nodes", "3"},
+		{"--root", root, "--replicas", "1", "--pg-listen", "127.0.0.1:7432"},
+		{"--root", root, "--pg-listen", "0.0.0.0:7432"},
+		{"--root", root, "--pg-listen", "127.0.0.1:0"},
+		{"--root", root, "--pg-listen", "127.0.0.1:65536"},
 	} {
 		if code := runClusterDev(args); code != 2 {
 			t.Fatalf("runClusterDev(%v) = %d, want usage error", args, code)

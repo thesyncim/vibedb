@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // One connection: startup, the message loop, and the simple query protocol.
@@ -52,7 +53,7 @@ type session struct {
 
 	// sql is the shared typed SQL runtime used by both database/sql and this
 	// protocol adapter.
-	sql         *sqldriver.Session
+	sql         BackendSession
 	queryCancel query.CancelFlag
 	// cancelCheck is the session-bound method value passed through protocol-side
 	// scanners and the SQL runtime. Binding it once avoids rebuilding an escaping
@@ -67,6 +68,7 @@ type session struct {
 	cancelMu       sync.Mutex
 	cancelActive   bool
 	cancelShutdown bool
+	cancelBackend  func()
 
 	// implicitExtended records the transaction opened for an extended-query
 	// batch. An explicit BEGIN leaves it false and therefore survives Sync.
@@ -138,7 +140,7 @@ type prepared struct {
 	bindBytes int
 
 	// runtime is the shared typed SQL runtime statement for a writable catalog.
-	runtime *sqldriver.Prepared
+	runtime BackendStatement
 	// paramKinds consolidates the scalar/document role of every wire parameter,
 	// including repeated $n occurrences.
 	paramKinds []sqldriver.ParamKind
@@ -225,7 +227,7 @@ type portal struct {
 	started     bool
 	exhausted   bool
 	row         int
-	runtime     sqldriver.Cursor
+	runtime     BackendRows
 	runtimeOpen bool
 	invalidated bool
 }
@@ -313,6 +315,9 @@ func (s *session) cancel() {
 		return
 	}
 	s.queryCancel.Cancel()
+	if s.cancelBackend != nil {
+		s.cancelBackend()
+	}
 }
 
 // shutdownCancel is stronger than a protocol CancelRequest: Close must also
@@ -323,6 +328,9 @@ func (s *session) shutdownCancel() {
 	s.cancelMu.Lock()
 	s.cancelShutdown = true
 	s.queryCancel.Cancel()
+	if s.cancelBackend != nil {
+		s.cancelBackend()
+	}
 	s.cancelMu.Unlock()
 }
 
@@ -577,10 +585,13 @@ func (s *session) negotiate(body []byte) error {
 	if err := s.server.opts.Auth.authenticate(s, s.user); err != nil {
 		return err
 	}
-	runtime, err := s.server.db.NewSession(context.Background())
+	runtime, err := s.server.backend.NewSession(context.Background(), SessionIdentity{User: s.user, Database: s.database})
 	if err != nil {
 		return fatal(sqlstateInternalError,
 			"could not open this connection's SQL session: "+err.Error())
+	}
+	if runtime == nil {
+		return fatal(sqlstateInternalError, "execution backend returned a nil session")
 	}
 	if err := runtime.SetCancelFlag(&s.queryCancel); err != nil {
 		_ = runtime.Close()
@@ -603,6 +614,11 @@ func (s *session) negotiate(body []byte) error {
 			"could not configure this connection's intermediate limit: "+err.Error())
 	}
 	s.sql = runtime
+	if remote, ok := runtime.(interface{ Cancel() }); ok {
+		s.cancelMu.Lock()
+		s.cancelBackend = remote.Cancel
+		s.cancelMu.Unlock()
+	}
 	s.w.authenticationOK()
 
 	s.reportParameters()
@@ -974,6 +990,13 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 			// including ROLLBACK TO recovering a failed transaction mid-batch.
 			txCount++
 		}
+	}
+	if dml && autocommitWrites(s.sql) {
+		if count != 1 || s.sql.State() != sqldriver.SessionIdle {
+			return false, newError(sqlstateFeatureNotSupported,
+				"distributed writes require one statement in auto-commit mode")
+		}
+		return false, nil
 	}
 	if count <= 1 {
 		// A simple DML Query is an implicit transaction even when it carries
@@ -1487,13 +1510,13 @@ func (s *session) executeRuntimeExec(p *portal) error {
 	result, err := p.stmt.runtime.Exec(context.Background(), p.args)
 	if err != nil {
 		_ = s.takeCancel()
-		if errors.Is(err, query.ErrCanceled) {
+		if errors.Is(err, query.ErrCanceled) && !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 			return queryCanceled()
 		}
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	if s.takeCancel() {
-		if !runtimeKindIsDDL(kind) {
+		if !runtimeKindIsDDL(kind) && !autocommitWrites(s.sql) {
 			return queryCanceled()
 		}
 		// DDL's atomic catalog publication is the commit point and cannot
@@ -1665,7 +1688,7 @@ func invalidatedPortalError() *pgError {
 			"the statement without a row limit")
 }
 
-func (s *session) rowCellsRuntime(c *sqldriver.Cursor, n int) []query.Cell {
+func (s *session) rowCellsRuntime(c *BackendRows, n int) []query.Cell {
 	if cap(s.cells) < n {
 		s.cells = make([]query.Cell, n)
 	}

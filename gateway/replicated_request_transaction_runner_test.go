@@ -6,13 +6,59 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/shardservice"
 )
+
+type recoveryAuthorityClient struct{ seen []serviceauthz.Authority }
+
+func (c *recoveryAuthorityClient) DoReplicated(_ context.Context, _ ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	c.seen = append(c.seen, request.Authority)
+	return nil, ErrReplicatedUnauthorized
+}
+
+func TestDurableRecoveryUsesServiceAuthorityNotCaller(t *testing.T) {
+	_, _, route := lifecycleRunnerFixture(t)
+	service := serviceauthz.Authority{Node: [16]byte{1}, Generation: 1}
+	caller := serviceauthz.Authority{Node: [16]byte{2}, Generation: 1}
+	client := &recoveryAuthorityClient{}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waves := &DurableRequestLifecycleRunner{proposer: executor, pinAuthority: service}
+	runner, err := NewDurableRequestDistributedRunner(&distributedRunnerLedger{}, distributedRunnerResolver{base: route}, waves,
+		&DurableRequestDynamicPayloadStore{}, &DurableRequestTerminalCoordinator{}, distributedRunnerAuthority{}, &NativeDurableRequestExecutionPinAuthority{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(t.Context(), caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runner.recovery.ReadTransactionRecovery(ctx, route, replicatedstate.TransactionRecoveryReadRequest{
+		Kind: replicatedstate.TransactionRecoveryLookupCoordinator, ID: distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
+		MaxBytes: uint32(replicatedstate.TransactionRecoverySummaryBytes + distributedtxn.MaxCoordinatorRecordBytes),
+	})
+	if len(client.seen) == 0 {
+		t.Fatal("no recovery probe")
+	}
+	for _, got := range client.seen {
+		if got != service {
+			t.Fatalf("recovery forwarded caller authority: got=%+v want=%+v", got, service)
+		}
+	}
+	if got, _ := serviceauthz.FromContext(ctx); got != caller {
+		t.Fatal("modified caller context")
+	}
+}
 
 type distributedRunnerLedger struct {
 	head         requestledger.HeadRecord

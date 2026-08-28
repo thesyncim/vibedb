@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -50,6 +51,22 @@ type durableDistributedRecoveryReader interface {
 	ReadTransactionRecovery(context.Context, ReplicatedRoute, replicatedstate.TransactionRecoveryReadRequest) (ReplicatedTransactionRecoveryResult, error)
 }
 
+// Hidden transaction state belongs to the gateway recovery service, not the
+// forwarded SQL caller. Keep this identity override local to recovery reads;
+// ordinary proposals must retain the caller's data-write authorization.
+type authorizedDurableRecoveryReader struct {
+	executor *ReplicatedExecutor
+	service  serviceauthz.Authority
+}
+
+func (reader *authorizedDurableRecoveryReader) ReadTransactionRecovery(ctx context.Context, route ReplicatedRoute, request replicatedstate.TransactionRecoveryReadRequest) (ReplicatedTransactionRecoveryResult, error) {
+	ctx, err := serviceauthz.WithAuthority(ctx, reader.service)
+	if err != nil {
+		return ReplicatedTransactionRecoveryResult{}, err
+	}
+	return reader.executor.ReadTransactionRecovery(ctx, route, request)
+}
+
 func NewDurableRequestDistributedRunner(
 	ledger DurableRequestLedger,
 	resolver DurableRequestRouteResolver,
@@ -59,7 +76,7 @@ func NewDurableRequestDistributedRunner(
 	authority DurableRequestTerminalAuthorityProvider,
 	pins DurableRequestExecutionPinAuthority,
 ) (*DurableRequestDistributedRunner, error) {
-	if ledger == nil || resolver == nil || waves == nil || payloads == nil || terminal == nil || authority == nil || pins == nil {
+	if ledger == nil || resolver == nil || waves == nil || !waves.pinAuthority.Valid() || payloads == nil || terminal == nil || authority == nil || pins == nil {
 		return nil, ErrDurableRequest
 	}
 	runner := &DurableRequestDistributedRunner{
@@ -67,7 +84,7 @@ func NewDurableRequestDistributedRunner(
 		terminal: terminal, authority: authority, pins: pins,
 	}
 	if executor, ok := waves.proposer.(*ReplicatedExecutor); ok {
-		runner.recovery = executor
+		runner.recovery = &authorizedDurableRecoveryReader{executor: executor, service: waves.pinAuthority}
 	}
 	return runner, nil
 }
