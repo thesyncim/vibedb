@@ -52,6 +52,10 @@ func ValidateReplicatedSchemaDDLTarget(target ReplicatedSchemaDDLTarget, applied
 // from one exact data cut. The caller must first fence new distributed writes
 // and obtain expectedApplied from a quorum barrier. A concurrent publication
 // causes a conflict, never a target that silently omits an acknowledged write.
+// This is a maintenance/offline primitive, NOT an online DDL implementation.
+// Do not expose it as online SQL by holding a route gate across the build.
+// An online coordinator must reconcile writes made after its snapshot before
+// certifying the target, and bound the final cutover independently of row count.
 //
 // All row work is outside the serving catalog lock. Only one bounded batch of
 // documents is retained; every relation gets a fresh physical identity, while

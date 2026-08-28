@@ -9,6 +9,69 @@ that exact generation active.
 The distributed commands remain experimental and have no released compatibility
 contract. Pin one tested commit across the gateway and shard fleet.
 
+## Online DDL requirement and current limits
+
+Online behavior is a release requirement for the ordinary SQL DDL endpoint,
+not an optional `CONCURRENTLY` fast path. It is **not implemented end to end** by
+the experimental rollout below. In particular, its exact-cut image builder
+requires a write fence for the whole build. Do not wire that maintenance
+primitive into PostgreSQL and describe it as online.
+
+The required contract is:
+
+- No global query/write freeze. Backfill, validation, rewriting, and physical
+  reclamation run outside serving locks. Unrelated tables continue serving.
+- CREATE INDEX and rewrite-requiring ALTER build from immutable snapshots and
+  reconcile concurrent committed writes before publication. Reconciliation may
+  use durable ordered capture or validated immutable-leaf reconciliation; a
+  second full scan under a write gate is not an online implementation.
+- The final affected-shard cutover has an explicit work and wait bound,
+  independent of table row count. An oversized tail postpones DDL rather than
+  extending the foreground write pause indefinitely. A brief metadata/ordering
+  barrier is allowed; “online” does not mean literally lock-free or zero-cost.
+- Metadata-only changes do not rewrite rows. TRUNCATE and DROP retire a storage
+  generation instead of deleting rows individually. DROP INDEX should retire
+  index state without copying the entire base table.
+- Existing readers retain their admitted generation until completion. Old
+  files are reclaimed only after authenticated lease/execution-pin drain.
+  Already-admitted multi-wave writes must settle with their original identities;
+  physical per-wave route-pin drain alone does not prove this.
+- DDL admission, catch-up memory/disk/network use, and retained generations are
+  bounded. Exhaustion postpones or rejects the DDL before its no-return boundary,
+  not ordinary writes. Temporary capture overhead is charged to active DDL;
+  idle tables must not acquire a new per-request scan, RPC, or journal write.
+- Concurrent incompatible DDL on one table may serialize with bounded,
+  cancellable waiting. Before authorization, cancellation leaves serving data
+  unchanged. After authorization, durable operation identity drives forward
+  recovery; a client reconnect is not commit recovery.
+
+This applies only to supported operations. `public` remains the supported
+schema; unsupported operations must fail explicitly, not fall back to a long
+blocking implementation.
+
+Local durable CREATE INDEX now releases its writer between initial geometry
+preparation slices (at most 64 leaf checks and one structural split per slice),
+revalidating its cursor after concurrent router publication. Its later build
+reconciles immutable leaves. The regression exercises a foreground write after
+a real split, old-reader stability, index contents, cancellation, and concurrent
+close. This bounds that preparation phase's work, not filesystem latency or
+every later publication/cleanup phase, and does not qualify RF3 SQL.
+Local SQL DROP INDEX still
+copies replacement storage while holding the database catalog mutex, and RF3
+image construction still needs the exact-cut fence. Both violate the intended
+online contract. The current split capture also has a split-specific activation
+and base-relation scope; it is not a ready-made general schema capture protocol.
+
+Release qualification must pause backfill while INSERT/UPDATE/DELETE and new
+reads complete, keep an old reader pinned across cutover, cover unrelated-table
+traffic and already-admitted multi-wave writes, and verify all acknowledged
+writes and index contents after crash/restart. It must measure foreground tail
+latency and maximum cutover hold, not just total DDL duration. The targeted
+`TestReplicatedSchemaDDLBuildDoesNotHoldServingLock` checks only the current
+primitive: concurrent mutations and reads progress, old snapshots remain stable,
+and a stale image is rejected and cleaned. It does **not** establish successful
+online catch-up or publication.
+
 ## Before you begin
 
 You need:
@@ -43,7 +106,8 @@ The shard-control listener also exposes an authenticated build operation for
 not yet a PostgreSQL DDL endpoint. It does not add ALTER/DROP TABLE support or
 complete the durable SQL coordinator described below.
 
-The caller first fences new writes with the exclusive route gate and obtains
+For this maintenance-only primitive, the caller first fences new writes with
+the exclusive route gate and obtains
 an exact applied cut from the shard quorum. The build request binds that cut,
 the source allocation/schema/manifest, the operation ID, and exact SQL bytes.
 Each replica reserves fresh physical storage identities in `.schema-ddl-build`

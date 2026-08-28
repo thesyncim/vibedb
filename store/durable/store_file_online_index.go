@@ -325,20 +325,38 @@ func (c *Collection) CreateIndexContext(
 }
 
 // repartitionPrimaryForExactIndexLocked converts scan-oriented unindexed
-// stripes into the exact index's 256-slot geometry. It is a deterministic
-// foreground structural rewrite performed only at index creation; no
-// background compactor or compatibility representation is involved.
+// stripes into the exact index's 256-slot geometry. The caller holds writer on
+// entry and return, but each slice releases it before cancellation checks and
+// does at most onlineIndexRouteCheckBudget leaf checks and one structural split.
+// Any concurrent router publication invalidates the scan cursor. No mutation
+// hook or steady-state capture is needed to validate the final leaf vector.
 func (c *Collection) repartitionPrimaryForExactIndexLocked(ctx context.Context) error {
+	var verifiedRouter *storeio.ResidentPrimaryRouter
+	var verifiedGeneration uint64
+	rank := 0
 	for {
-		if err := ctx.Err(); err != nil {
+		c.writer.Unlock()
+		err := ctx.Err()
+		c.writer.Lock()
+		if err != nil {
+			return err
+		}
+		if c.closed {
+			return ErrClosed
+		}
+		if err := c.rejectCheckpointGroupOwner(); err != nil {
 			return err
 		}
 		router := c.primaryRouter.Load()
 		if router == nil {
 			return storeio.ErrSegmentedTabletRouterCorrupt
 		}
+		if router != verifiedRouter || router.Generation() != verifiedGeneration {
+			rank = 0
+			verifiedRouter, verifiedGeneration = router, router.Generation()
+		}
 		var splitKey []byte
-		for rank := 0; rank < router.Len(); rank++ {
+		for checked := 0; rank < router.Len() && checked < onlineIndexRouteCheckBudget; checked++ {
 			route, ok := router.RouteAtRank(rank)
 			if !ok {
 				return storeio.ErrSegmentedTabletRouterCorrupt
@@ -366,16 +384,22 @@ func (c *Collection) repartitionPrimaryForExactIndexLocked(ctx context.Context) 
 				splitKey = append(splitKey, key...)
 			}
 			lease.Release()
+			rank++
 			if splitKey != nil {
 				break
 			}
 		}
 		if splitKey == nil {
-			return nil
+			if rank == router.Len() {
+				return nil
+			}
+			continue
 		}
 		if err := c.structuralSplitPrimaryLeaf(splitKey); err != nil {
 			return err
 		}
+		// A split replaces the routing vector; revalidate it on the next slice.
+		verifiedRouter = nil
 	}
 }
 
