@@ -147,11 +147,6 @@ func (c *Collection) preparePrimaryBatchTopology(
 		c.primaryMacroSplitRequired.Add(1)
 		return ErrPrimaryMacroSplitRequired
 	}
-	if err := c.preflightPrimaryBatchTopologyCapacity(
-		&path, len(floors), finalLeafCount,
-	); err != nil {
-		return err
-	}
 
 	// Build the identity/fence-only final tablet now. This validates every
 	// anchor and root fence arena before commitPrimaryStructural allocates its
@@ -174,7 +169,11 @@ func (c *Collection) preparePrimaryBatchTopology(
 			})
 		}
 	}
-	if err := storeio.ValidateSegmentedTabletRouterLeafGeometry(geometry); err != nil {
+	_, anchorPages, err := storeio.PlanSegmentedTabletRouterAnchors(geometry)
+	if err != nil {
+		return err
+	}
+	if err := c.preflightPrimaryBatchTopologyCapacity(&path, len(floors), anchorPages); err != nil {
 		return err
 	}
 
@@ -412,10 +411,8 @@ func primaryBatchTopologyLocalIDs(
 // same transaction reservation.
 func (c *Collection) preflightPrimaryBatchTopologyCapacity(
 	path *filePrimaryMutationPath,
-	newLeaves, finalLeafCount int,
+	newLeaves, anchorPages int,
 ) error {
-	anchorPages := (finalLeafCount + storeio.SegmentedTabletRouterRowsPerPage - 1) /
-		storeio.SegmentedTabletRouterRowsPerPage
 	// K leaves, every rebuilt anchor, locator, tablet root, catalog leaf, optional
 	// branch, and the global primary root.
 	pages := newLeaves + anchorPages + 4

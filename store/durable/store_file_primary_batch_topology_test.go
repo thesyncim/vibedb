@@ -52,15 +52,13 @@ func TestPrimaryBatchTopologyRejectsSingleUnencodableDocument(t *testing.T) {
 	}
 }
 
-// TestPrimaryBatchTopologyAnchorPreflightRollsBack proves a K-way plan whose
-// long split fences cannot fit the tablet anchor grammar is rejected before the
-// structural transaction publishes anything. The collection remains writable.
-func TestPrimaryBatchTopologyAnchorPreflightRollsBack(t *testing.T) {
+// Long fences must use additional anchor pages rather than refuse a logical
+// batch that fits the tablet's byte and identity budgets.
+func TestPrimaryBatchTopologyPacksLongFencesAcrossAnchors(t *testing.T) {
 	const rows = 3000
 	options := primaryLargeTopologyOptions(rows)
 	options.MaxKeyBytes = storeio.CommonPrimaryLeafMaxKeyBytes
-	collection, _ := openBatchCollection(t, options)
-	generation := collection.Generation()
+	collection, file := openBatchCollection(t, options)
 	prefix := bytes.Repeat([]byte("p"), 254)
 	err := collection.Update(func(batch *WriteBatch) error {
 		for i := range rows {
@@ -74,17 +72,28 @@ func TestPrimaryBatchTopologyAnchorPreflightRollsBack(t *testing.T) {
 		}
 		return nil
 	})
-	if !errors.Is(err, storeio.ErrSegmentedTabletRouterNoSpace) {
-		t.Fatalf("long-fence Update = %v, want anchor no-space", err)
+	if err != nil {
+		t.Fatalf("long-fence Update: %v", err)
 	}
-	if got := collection.Generation(); got != generation {
-		t.Fatalf("failed preflight generation = %d, want %d", got, generation)
+	if got := collection.Len(); got != rows {
+		t.Fatalf("rows=%d want=%d", got, rows)
 	}
-	if got := collection.Len(); got != 0 {
-		t.Fatalf("failed preflight rows = %d, want 0", got)
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := collection.Put([]byte("after"), []byte(`{"v":2}`)); err != nil {
-		t.Fatalf("write after topology preflight failure: %v", err)
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for i := range rows {
+		key := append(append([]byte(nil), prefix...), byte(i>>8), byte(i))
+		word := fmt.Sprintf("%08x", uint32(i)*2654435761)
+		want := fmt.Appendf(nil, `{"n":%d,"v":"%s"}`, i, bytes.Repeat([]byte(word), 55))
+		got, found, err := reopened.AppendRaw(nil, key)
+		if err != nil || !found || !bytes.Equal(got, want) {
+			t.Fatalf("reopened row %d found=%v err=%v", i, found, err)
+		}
 	}
 }
 

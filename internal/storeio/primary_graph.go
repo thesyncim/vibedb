@@ -119,6 +119,30 @@ func planPrimaryGraph(
 	if err != nil {
 		return PrimaryGraphPlan{}, err
 	}
+	// Row-count sizing is a lower bound for anchor pages. Qualify the exact
+	// compressed fence layout before reserving the build transaction.
+	for first := 0; first < len(leaves); first += TabletLocalIdentityLocalCount {
+		last := min(first+TabletLocalIdentityLocalCount, len(leaves))
+		routerLeaves := make([]SegmentedTabletRouterLeaf, last-first)
+		for rank := range routerLeaves {
+			routerLeaves[rank].LocalID = uint16(rank)
+			if rank == 0 {
+				continue
+			}
+			left := records[leaves[first+rank-1].last-1].Key
+			right := records[leaves[first+rank].first].Key
+			fence, err := ShortestPrimaryFence(make([]byte, len(right)), []byte(left), []byte(right))
+			if err != nil {
+				return PrimaryGraphPlan{}, err
+			}
+			routerLeaves[rank].Fence = fence
+		}
+		_, count, err := PlanSegmentedTabletRouterAnchors(routerLeaves)
+		if err != nil {
+			return PrimaryGraphPlan{}, err
+		}
+		pages += count - (len(routerLeaves)+SegmentedTabletRouterRowsPerPage-1)/SegmentedTabletRouterRowsPerPage
+	}
 	return PrimaryGraphPlan{
 		storeID: storeID, records: records, leaves: leaves,
 		pages: pages, placed: placed,
@@ -771,8 +795,16 @@ func buildPrimaryTablets(
 			}
 		}
 
-		pageCount := (len(tabletLeaves) + SegmentedTabletRouterRowsPerPage - 1) /
-			SegmentedTabletRouterRowsPerPage
+		ends, pageCount, err := PlanSegmentedTabletRouterAnchors(routerLeaves)
+		if err != nil {
+			return nil, err
+		}
+		for pageID, first := 0, 0; pageID < pageCount; pageID++ {
+			for rank := first; rank < ends[pageID]; rank++ {
+				locatorEntries[rank].PageID, locatorEntries[rank].RowSlot = uint8(pageID), uint8(rank-first)
+			}
+			first = ends[pageID]
+		}
 		anchorPages := make([]PrimaryGraphBuildPage, pageCount)
 		anchorRefs := make([]PageRef, pageCount)
 		for pageID := range pageCount {

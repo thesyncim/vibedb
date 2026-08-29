@@ -315,8 +315,10 @@ func EncodeSegmentedTabletRouter(
 			"%w: segmented router identity or geometry", ErrInvalidWrite,
 		)
 	}
-	pageCount = (len(leaves) + SegmentedTabletRouterRowsPerPage - 1) /
-		SegmentedTabletRouterRowsPerPage
+	ends, pageCount, err := PlanSegmentedTabletRouterAnchors(leaves)
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
 	if len(anchorRefs) != pageCount ||
 		len(pageDst) < pageCount*SegmentedTabletRouterAnchorPageBytes {
 		return nil, nil, nil, 0, fmt.Errorf(
@@ -333,6 +335,7 @@ func EncodeSegmentedTabletRouter(
 		locator[at] = 0xff
 	}
 	var previous []byte
+	pageID, pageFirst := 0, 0
 	for rank, leaf := range leaves {
 		if leaf.LocalID >= TabletLocalIdentityLocalCount ||
 			rank != 0 && bytes.Compare(previous, leaf.Fence) >= 0 ||
@@ -360,8 +363,11 @@ func EncodeSegmentedTabletRouter(
 				"%w: duplicate LocalID", ErrInvalidWrite,
 			)
 		}
-		pageID := rank / SegmentedTabletRouterRowsPerPage
-		rowSlot := rank % SegmentedTabletRouterRowsPerPage
+		if rank == ends[pageID] {
+			pageFirst = rank
+			pageID++
+		}
+		rowSlot := rank - pageFirst
 		binary.LittleEndian.PutUint16(
 			locator[int(leaf.LocalID)*2:],
 			uint16(pageID<<8|rowSlot),
@@ -380,8 +386,11 @@ func EncodeSegmentedTabletRouter(
 		); err != nil {
 			return nil, nil, nil, 0, err
 		}
-		first := pageID * SegmentedTabletRouterRowsPerPage
-		last := min(first+SegmentedTabletRouterRowsPerPage, len(leaves))
+		first := 0
+		if pageID > 0 {
+			first = ends[pageID-1]
+		}
+		last := ends[pageID]
 		if _, err := segmentedTabletRouterEncodeAnchorFromLeaves(
 			pages[pageID*SegmentedTabletRouterAnchorPageBytes:],
 			header, uint8(pageID), leaves[first:last],
@@ -391,7 +400,7 @@ func EncodeSegmentedTabletRouter(
 	}
 	root = rootDst[:SegmentedTabletRouterRootBytes]
 	if err := segmentedTabletRouterEncodeRootInitial(
-		root, locator, header, anchorRefs, leaves,
+		root, locator, header, anchorRefs, leaves, ends[:pageCount],
 	); err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -1445,9 +1454,7 @@ func segmentedTabletRouterEncodeAnchor(
 			segmentedTabletRouterFencePrefix(firstFence, fenceAt(rank)),
 		)
 	}
-	if common > 255 {
-		return nil, fmt.Errorf("%w: anchor common prefix", ErrInvalidWrite)
-	}
+	common = min(common, 255)
 	payload[4] = byte(common)
 	keys := image[segmentedTabletRouterAnchorKeysAt:segmentedTabletRouterAnchorTrailerAt]
 	firstFence.copyTo(keys, 0)
@@ -1543,6 +1550,7 @@ func segmentedTabletRouterEncodeRootInitial(
 	header SegmentedTabletRouterHeader,
 	anchorRefs []PageRef,
 	leaves []SegmentedTabletRouterLeaf,
+	ends []int,
 ) error {
 	clear(root)
 	pageCount := len(anchorRefs)
@@ -1574,7 +1582,11 @@ func segmentedTabletRouterEncodeRootInitial(
 			root[segmentedTabletRouterRootOffsetsAt+rank*2:],
 			uint16(keyAt),
 		)
-		fence := leaves[rank*SegmentedTabletRouterRowsPerPage].Fence
+		first := 0
+		if rank > 0 {
+			first = ends[rank-1]
+		}
+		fence := leaves[first].Fence
 		if keyAt+len(fence) >
 			segmentedTabletRouterRootTrailerAt-
 				segmentedTabletRouterRootKeysAt {

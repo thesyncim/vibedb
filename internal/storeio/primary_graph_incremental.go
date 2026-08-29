@@ -201,8 +201,16 @@ func stagePrimaryTabletWindow(
 		}
 	}
 
-	pageCount := (len(leaves) + SegmentedTabletRouterRowsPerPage - 1) /
-		SegmentedTabletRouterRowsPerPage
+	ends, pageCount, err := PlanSegmentedTabletRouterAnchors(routerLeaves)
+	if err != nil {
+		return primaryCatalogChild{}, err
+	}
+	for pageID, first := 0, 0; pageID < pageCount; pageID++ {
+		for rank := first; rank < ends[pageID]; rank++ {
+			locatorEntries[rank].PageID, locatorEntries[rank].RowSlot = uint8(pageID), uint8(rank-first)
+		}
+		first = ends[pageID]
+	}
 	anchorPages := make([]PrimaryGraphBuildPage, pageCount)
 	anchorRefs := make([]PageRef, pageCount)
 	for pageID := range pageCount {

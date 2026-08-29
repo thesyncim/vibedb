@@ -334,8 +334,10 @@ func (c *Collection) stageNewPrimaryTablet(
 	if tx == nil || len(leaves) == 0 || len(leaves[0].Fence) != 0 {
 		return storeio.PageRef{}, 0, storeio.ErrInvalidWrite
 	}
-	pageCount := (len(leaves) + storeio.SegmentedTabletRouterRowsPerPage - 1) /
-		storeio.SegmentedTabletRouterRowsPerPage
+	_, pageCount, layoutErr := storeio.PlanSegmentedTabletRouterAnchors(leaves)
+	if layoutErr != nil {
+		return storeio.PageRef{}, 0, layoutErr
+	}
 	if pageCount == 0 || pageCount > storeio.SegmentedTabletRouterMaxPages {
 		return storeio.PageRef{}, 0, ErrPrimaryMacroSplitRequired
 	}
@@ -812,8 +814,10 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	pageCount := 0
 	if !isLocalized {
-		pageCount = (len(finalLeaves) + storeio.SegmentedTabletRouterRowsPerPage - 1) /
-			storeio.SegmentedTabletRouterRowsPerPage
+		_, pageCount, err = storeio.PlanSegmentedTabletRouterAnchors(finalLeaves)
+		if err != nil {
+			return err
+		}
 	}
 	if !isLocalized && (pageCount == 0 || pageCount > storeio.SegmentedTabletRouterMaxPages) {
 		c.primaryMacroSplitRequired.Add(1)
