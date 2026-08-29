@@ -110,32 +110,46 @@ func planSegmentedTabletRouterAnchors(leaves []SegmentedTabletRouterLeaf) (ends 
 func validateSegmentedTabletAnchorFenceGeometry(
 	leaves []SegmentedTabletRouterLeaf,
 ) error {
-	if len(leaves) == 0 || len(leaves) > SegmentedTabletRouterRowsPerPage {
+	return validateSegmentedTabletAnchorFenceGeometryAt(
+		len(leaves),
+		func(rank int) segmentedTabletRouterFence {
+			return segmentedTabletRouterFence{a: leaves[rank].Fence}
+		},
+	)
+}
+
+// validateSegmentedTabletAnchorFenceGeometryAt is the shared byte-capacity
+// oracle for initial packing and localized edits. The callback form lets an
+// admitted, prefix-compressed anchor qualify one prospective row without
+// flattening or allocating its existing fences.
+func validateSegmentedTabletAnchorFenceGeometryAt(
+	count int,
+	fenceAt func(int) segmentedTabletRouterFence,
+) error {
+	if count == 0 || count > SegmentedTabletRouterRowsPerPage || fenceAt == nil {
 		return fmt.Errorf("%w: anchor leaf count", ErrInvalidWrite)
 	}
-	common := len(leaves[0].Fence)
-	for rank := 1; rank < len(leaves); rank++ {
+	first := fenceAt(0)
+	common := first.length()
+	for rank := 1; rank < count; rank++ {
 		common = min(
 			common,
-			segmentedTabletRouterFencePrefix(
-				segmentedTabletRouterFence{a: leaves[0].Fence},
-				segmentedTabletRouterFence{a: leaves[rank].Fence},
-			),
+			segmentedTabletRouterFencePrefix(first, fenceAt(rank)),
 		)
 	}
 	common = min(common, 255)
 	keyAt := common
-	var restart []byte
-	for rank := range leaves {
-		fence := leaves[rank].Fence
+	var restart segmentedTabletRouterFence
+	for rank := range count {
+		fence := fenceAt(rank)
 		shared := 0
 		if rank%segmentedTabletRouterRestart == 0 {
 			restart = fence
 		} else {
-			shared = commonPrefixBytes(restart, fence) - common
+			shared = segmentedTabletRouterFencePrefix(restart, fence) - common
 			shared = max(0, shared)
 		}
-		suffix := len(fence) - common - shared
+		suffix := fence.length() - common - shared
 		if shared > 255 || suffix < 0 || suffix > 255 ||
 			keyAt+1+suffix > segmentedTabletRouterAnchorKeyCapacity {
 			return fmt.Errorf(
@@ -146,12 +160,4 @@ func validateSegmentedTabletAnchorFenceGeometry(
 		keyAt += 1 + suffix
 	}
 	return nil
-}
-
-func commonPrefixBytes(a, b []byte) int {
-	at := 0
-	for at < len(a) && at < len(b) && a[at] == b[at] {
-		at++
-	}
-	return at
 }

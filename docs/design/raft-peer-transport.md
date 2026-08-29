@@ -1,13 +1,22 @@
 # Raft peer transport foundation
 
-Status: **Internal**
+Status: **Internal foundation with experimental command integration**
 
 `internal/rafttransport` provides a composable authenticated stream foundation
 for ordinary Raft messages. `internal/raftservice` wires it to
 `internal/multiraft.Host` in the RF3 serving composition.
-`vibedb-shard serve-rf3` constructs one fixed three-voter peer service from an
-exact manifest. It does not enroll certificates, discover peers dynamically,
-or orchestrate membership or snapshot traffic.
+`vibedb-shard serve-rf3` loads one to 64 local group members from an exact
+process manifest and constructs one shared authenticated ordinary-message peer
+runtime. Every configured RF3 group begins with three voters; retained,
+certified membership state may instead describe an enrolled replacement or
+learner. All groups in the process must share the certificate trust domain, and
+one remote node must have the same peer address in every group.
+
+The ordinary-message runtime does not carry snapshot, shard-control, or native
+client traffic. `serve-rf3` composes those on separate authenticated listeners
+and budgets. It still does not enroll or renew certificates or discover peer
+addresses dynamically; the manifest and retained membership authority provide
+those exact identities.
 
 ## Certificate identity
 
@@ -55,8 +64,13 @@ The binary trust domain contains both `ClusterID` and
 boundary. One nonempty `StaticRegistry` contains groups from exactly one trust
 domain. Every authenticated connection and every frame group must match it.
 
-The fixed ALPN values are `vibedb-raft-ordinary` and
-`vibedb-raft-snapshot`. The package does not accept alternate protocol names.
+`PeerTLS` maps its seven traffic classes to seven fixed ALPN values:
+`vibedb-raft-ordinary`, `vibedb-raft-snapshot`, `vibedb-shard-native`,
+`vibedb-gateway-client`, `vibedb-shard-sql`, `vibedb-shard-control`, and
+`vibedb-gateway-control`. Each client or server configuration advertises only
+the value for its requested class. Unsupported classes and a negotiated value
+that differs from that exact mapping are rejected. The ordinary-message and
+snapshot lanes below use the first two values.
 
 ## Ordinary outbound streams
 
@@ -136,30 +150,58 @@ after delivery.
 The outbound cache has explicit aggregate frame and byte counters. The current
 receiver frame cache and canonical re-encode cache use `sync.Pool`. Their live
 memory is bounded per operation, but their aggregate process retention is not
-yet an explicit transport limit. The serving integration must bound accepted
-stream concurrency or replace those pools with listener-owned bounded caches
-before claiming a process-wide transport memory ceiling.
+an explicit transport-package limit. The shipped `serve-rf3` composition caps
+ordinary inbound streams at eight, which bounds simultaneously live receiver
+frames. It does not convert `sync.Pool` retention into an exact process-wide
+post-GC memory ceiling.
 
 ## Snapshot isolation
 
 Snapshot traffic has a separate ALPN value and a separate
 `SnapshotStreamOpener` capability. `OrdinaryTransport` cannot accept that
-capability. `OrdinaryReceiver` rejects a snapshot-class connection. A later
-snapshot service must use separate connection, concurrency, and memory budgets
-so snapshot transfer cannot starve ordinary Raft messages.
+capability. `OrdinaryReceiver` rejects a snapshot-class connection.
 
-## Remaining integration
+`serve-rf3` reserves a separate snapshot listener before adopting its runtimes,
+authenticates it as `TrafficSnapshot`, and gives it a concurrency bound derived
+from the configured snapshot-source and split-operation limits. That listener
+multiplexes the installed snapshot-transfer data service and split-artifact
+service; it does not enter the ordinary per-peer queues. This is traffic-class
+and admission isolation, not proof that every storage or network saturation
+fault leaves foreground Raft latency unaffected.
 
-A serving integration must still provide these components:
+## Shipped composition and remaining gaps
 
-- Raw address discovery and dialing
-- A bounded listener and accepted-stream lifecycle
-- Certificate enrollment, secure key loading, renewal, and revocation policy
-- Trusted topology publication for `StaticRegistry`
-- `multiraft.Host` outbound and inbound adapters
-- Peer replacement and duplicate-stream policy
-- Transport metrics and operational shutdown
-- A separately budgeted snapshot transfer service
+The experimental `serve-rf3` command supplies:
+
+- manifest-derived raw TCP dialing and exact node/address checks;
+- one bounded ordinary listener and one per-node outbound worker;
+- one multi-group `StaticRegistry` and serialized execution lanes;
+- atomic registry/owner installation and removal for certified adopted groups;
+- separate native, shard-control, and snapshot listeners; and
+- detached ordinary transport and inbound-listener counters plus joined
+  shutdown.
+
+It does not supply dynamic address discovery, automated certificate enrollment,
+renewal, or revocation, a released general topology-administration CLI, total
+network-byte accounting, or an exhaustive external partition/saturation matrix.
+Membership and snapshot-transfer actions exist only through the separate
+experimental, journaled replica-lifecycle composition; they are not powers of
+`OrdinaryTransport` itself.
+
+## Qualification boundary
+
+`TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer` proves
+that two groups share one per-peer transport without losing group routing.
+`TestServeRF3ShippedCompositionThreeProcesses` exercises the shipped command,
+mutual TLS, election, authenticated reads, and clean shutdown across three real
+processes. The mandatory multi-relation Linux gate adds a deterministic
+bidirectional cut of every proxied Raft peer link to one selected process while
+that process remains alive, followed by healing and catch-up; it separately
+kills and restarts a leader.
+
+That last fault is a test-owned peer-network partition. It is not `SIGSTOP`, a
+whole-process partition, an operating-system packet-filter fault, or evidence
+for arbitrary cuts or horizontal scaling.
 
 ## Implementation references
 
@@ -169,5 +211,16 @@ A serving integration must still provide these components:
   `TLSOrdinaryDialer`, and `SnapshotStreamOpener`
 - `internal/rafttransport/transport.go`: `OrdinaryTransport`
 - `internal/rafttransport/frame.go`: `EncodeOutbound` and `DecodeInbound`
+- `internal/raftservice/execution_peer.go`:
+  `AuthenticatedExecutionPeerRuntime`
+- `cmd/vibedb-shard/serve_rf3.go`: `servePreparedRF3WithExecutionLanes`
 - `internal/rafttransport/identity_test.go`, `stream_test.go`,
   `transport_test.go`, and `alloc_test.go`
+- `internal/raftservice/execution_test.go`:
+  `TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer`
+- `cmd/vibedb-shard/serve_rf3_process_test.go`:
+  `TestServeRF3ShippedCompositionThreeProcesses`
+- `cmd/vibedb-gateway/rf3_peer_proxy_test.go`:
+  `TestRF3PeerProxyCutsExistingAndNewLinksButLeavesTargetLive`
+- `cmd/vibedb-gateway/durable_rf3_multirelation_chaos_process_test.go`:
+  `TestGatewayDurableRF3MultiRelationChaosProcess`

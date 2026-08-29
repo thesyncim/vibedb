@@ -5,11 +5,14 @@ and tables. The gateway proves every statement's owner before it sends
 transaction traffic. A participant is one exact shard target, not one row or
 table. Mutations routed to the same fenced target share a participant.
 
-The executor has two transaction authorities. General SQL uses the static
-shard journal described below. A batch whose every table has replicated
-metadata and whose mutations resolve to one or more RF3 groups uses the fused
-Raft path. Classification and complete validation happen before either
-authority receives I/O. A batch never crosses both.
+The executor has two mutation-transaction authorities. A batch whose every
+table has replicated metadata and whose supported mutations resolve to one or
+more RF3 groups uses the fused Raft path. A batch over static tables uses the
+static shard journal described below. Mixed static/RF3 authority is refused,
+and an unsupported RF3 mutation shape does not fall back after classification.
+Complete validation happens before either authority receives I/O. This choice
+is independent of the general `SELECT` transport, which is also RF3-backed in
+replicated-catalog mode.
 
 ## Bounds
 
@@ -37,22 +40,32 @@ manifest page plus a worker-sized result window instead of the aggregate page
 set or one response per participant. A shard journal reserves the exact bytes
 needed to decide and retire every admitted local record. Retiring a segmented
 coordinator immediately drops its resident page set, including during replay.
-The append-only journal currently retains the historical entries on disk until
-its finite ceiling rather than compacting them.
+The live journal appends within its current generation and keeps the finite
+8 GiB admission ceiling. Terminal responses coalesce bounded background
+compaction checks. When a check recommends compaction, the shard rewrites the
+current authoritative state into one canonical generation and atomically
+installs it. Active coordinator manifests and participant mutation stages
+remain intact; retired manifest pages and superseded transitions are reclaimed,
+while terminal records retain their byte-exact stage for delayed retries and
+lookups.
 
 ## RF3 SQL lowering
 
 The public RF3 lane deliberately accepts only statement shapes with one exact,
 byte-native meaning:
 
-- one or more whole-document insert rows, each lowered to insert-if-absent
+- one or more insert rows, either complete documents or unique top-level
+  named-column scalar rows encoded as canonical runtime documents, each lowered
+  to insert-if-absent
 - one exact-primary-key whole-document update, lowered to replace-if-present
 - one exact-primary-key delete or one finite primary-key `IN` set
 
 The update document must preserve the placement key. Returning clauses,
-column-list inserts, conflict clauses, residual predicates, ordering, limits,
-repeated relation keys, and mixed static/RF3 tables are refused before
-execution. Multiple statements
+`INSERT ... SELECT`, conflict clauses, residual predicates, ordering, limits,
+repeated relation keys, invalid/duplicate flat columns, and mixed static/RF3
+tables are refused before execution. Nested/duplicate named columns or a row
+missing its placement-key column are also refused. A multi-row document or
+named-column INSERT may route rows to different RF3 groups. Multiple statements
 and tables in one group become sorted numeric relation batches on the same
 participant and commit atomically. Ordered keys and document bytes enter Raft.
 SQL and table-name strings do not.
@@ -206,10 +219,14 @@ capture during update and delete. The public RF3 SQL lowering routes ready
 unique and non-unique indexes as independent relation participants. Same-key
 replacement and index removal use exact prior-value checks.
 
-The RF3 read side supports multi-table and multi-group exact-primary-key
-`SELECT *` through `read_batch`. It returns one route and applied-index
-observation per group. It does not provide one global MVCC timestamp, range
-scan, join, aggregate, or historical read contract.
+The RF3 read side has two contracts. `read_batch` supports multi-table and
+multi-group exact-primary-key `SELECT *` and returns one route/applied-index
+observation per group. General `query` in replicated-catalog mode retains the
+ordinary SQL planner and bounded merge path over leader `ReadIndex` reads;
+targeted/scatter reads, projections, global order/limit, and mergeable
+aggregates are supported, while global-index read and repartition-exchange plans
+are refused. The general-query response exposes no observation vector. Neither
+contract provides one global MVCC timestamp or a historical-read API.
 
 ## Implementation references
 
@@ -217,12 +234,13 @@ scan, join, aggregate, or historical read contract.
 - `gateway/recovery.go`
 - `gateway/transaction_manifest.go`
 - `gateway/replicated_sql_transaction.go`
+- `gateway/replicated_query.go`
 - `gateway/durable_sql_request_executor.go`
 - `gateway/replicated_request_service.go`
 - `gateway/replicated_request_ledger_catalog.go`
 - `gateway/replicated_request_issuer_collector.go`
-- `gateway/replicated_transaction.go`
-- `gateway/replicated_transaction_recover.go`
+- `gateway/replicated_transaction_protocol.go`
+- `gateway/replicated_transaction_recovery.go`
 - `gateway/writer.go`
 - `cmd/vibedb-gateway/durable_request_runtime.go`
 - `cmd/vibedb-gateway/durable_exec_batch_wire.go`
@@ -230,5 +248,5 @@ scan, join, aggregate, or historical read contract.
 - `cmd/vibedb-gateway/exec_batch_ack_wire.go`
 - `internal/distributedtxn/codec.go`
 - `internal/distributedtxn/manifest.go`
-- `internal/distributedtxn/journal.go`
-- `shardservice/mutation_batch.go`
+- `internal/distributedtxn/journal.go` and `journal_compact.go`
+- `shardservice/mutation_batch.go` and `journal_compactor.go`

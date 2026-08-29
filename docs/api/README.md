@@ -1,7 +1,8 @@
 # Select an API
 
-VibeDB has four user entry points. They share storage and query components, but
-they have different lifecycle and compatibility contracts.
+This page documents four local application and package entry points. They share
+storage and query components, but have different lifecycle and compatibility
+contracts.
 
 | Entry point | Use it for | Primary package |
 | --- | --- | --- |

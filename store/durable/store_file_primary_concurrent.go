@@ -26,7 +26,7 @@ const (
 	// very large QueueSlots setting multiply retained JSON workspaces without
 	// bound. Smaller queues retain their existing configured/default ceiling.
 	primaryConcurrentContextLimit = 32
-	// A compact class-5 value can never occupy more than one 64 KiB leaf.
+	// A compact VCS1 value can never occupy more than one 64 KiB leaf.
 	// Canonical escaping expands valid JSON by at most 2x (raw U+2028/U+2029),
 	// so admitting at most half a leaf of source bounds every retained output
 	// buffer to one leaf. Larger or exceptionally token-dense documents take the

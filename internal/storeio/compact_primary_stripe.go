@@ -50,7 +50,7 @@ type compactPrimaryStreamPatch struct {
 	newEnd   int
 }
 
-// BuildCompactPrimaryStripePayload builds the replacement class-5 payload.
+// BuildCompactPrimaryStripePayload builds the replacement class-6 VCS1 payload.
 // It is exposed only inside storeio so the graph planner can measure a prefix
 // before reserving its exact 4 KiB-rounded extent. Records are borrowed; the
 // returned payload is borrowed from builder until its next compact build.

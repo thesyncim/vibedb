@@ -73,14 +73,32 @@ The server supports:
 An extended-protocol error discards messages until `Sync`. Transaction status
 uses idle, in-transaction, and failed-transaction states.
 
-When the session is idle, the first extended stored-row statement starts an
-implicit transaction that finalizes at `Sync`. In an explicit transaction,
-`Sync` only resynchronizes the protocol. It does not commit. DDL must be the
-sole execution in an extended cycle. DDL publishes when `Execute` completes. A
-later protocol error cannot roll it back.
+With the embedded backend used by `NewServer`, the first extended stored-row
+statement in an idle session starts an implicit transaction that finalizes at
+`Sync`. In an explicit transaction, `Sync` only resynchronizes the protocol. It
+does not commit. DDL must be the sole execution in an extended cycle. DDL
+publishes when `Execute` completes. A later protocol error cannot roll it back.
 
 The server does not support COPY, SQL cursors, notifications, procedures,
 general server-side SQL `PREPARE`, or SCRAM-PLUS.
+
+## Backend transaction boundary
+
+The transaction behavior above describes the embedded `sql/driver` backend.
+`NewServerWithBackend` delegates transaction semantics to its
+`BackendSession`; a backend must reject modes it cannot provide.
+
+A backend that implements `BackendAutocommitWrites` and returns true has a
+narrower write boundary. Each mutation must be the only statement in an idle
+session: either one Simple Query statement or one extended Execute/Sync batch.
+Such a mutation does not join the protocol's implicit transaction. Mutations
+inside an explicit transaction and multi-statement Simple Query write batches
+return SQLSTATE `0A000` before the write executes.
+
+The distributed RF3 gateway uses this auto-commit boundary and adds stricter
+SQL, consistency, and topology limits. See
+[PostgreSQL access to distributed RF3 SQL](../design/rf3-postgresql.md); do not
+infer those capabilities from the embedded example on this page.
 
 ## Placeholders
 
@@ -104,8 +122,10 @@ verifier. Unknown users use a mock verifier to reduce user-enumeration leakage.
 One Simple Query message can contain at most 1024 statements. The splitter
 handles SQL literals and comments.
 
-Stored-data SQL in an idle batch runs in one implicit transaction. The batch
-stops on the first error and rolls back stored-data changes.
+With the embedded backend, stored-data SQL in an idle batch runs in one
+implicit transaction. The batch stops on the first error and rolls back
+stored-data changes. An auto-commit-write backend instead requires each
+mutation to be the only statement, as described above.
 
 DDL must be the only nonempty statement. Stored SQL cannot be mixed freely
 with session-setting commands.

@@ -2,12 +2,14 @@
 
 VibeDB has a runnable static-shard command layer and a fixed-RF3 serving
 composition. `vibedb-shard serve-rf3` constructs the latter for externally
-prepared exact member artifacts. The public gateway connects canonical point
-`get`, exact-key `read_batch`, and strict exact-key `exec_batch` requests to the
-native RF3 endpoint when its catalog authority is RF3. General SQL and
-non-exact scatter reads remain on the static path. Preparation and development
-commands initialize fixed topologies. The replica-control path can replace a
-failed member, but there is no general topology administration command.
+prepared exact member artifacts. Gateway SQL transport is selected by catalog
+mode: an explicit development/static catalog sends general SQL to static shard
+services, while replicated-catalog mode sends supported general `SELECT` plans
+to RF3 leaders. Canonical point `get`, exact-key `read_batch`, and strict
+`exec_batch` are additional native RF3 operations in replicated-catalog mode.
+Preparation and development commands initialize fixed topologies. The
+replica-control path can replace a failed member, but there is no general
+topology administration command.
 
 ## Runnable static layer
 
@@ -46,17 +48,28 @@ The gateway has three execution lanes:
 The last lane uses loopback exchange by default. Cross-host exchange needs an
 injected trusted dialer. The shipped gateway CLI does not supply one.
 
-The canonical RF3 data lane is separate from these SQL lanes. Point reads
+The general SQL planner is shared across catalog modes, but its physical
+transport and consistency boundary differ. Static mode sends each physical
+plan to the configured static shard endpoint. Replicated-catalog mode resolves
+the same pinned physical target to an RF3 group, follows its leader, and runs a
+`ReadIndex` before executing the shard-local SELECT. Targeted and scatter
+plans, projections, global order/limit, and mergeable aggregates use the
+existing bounded merge path. RF3 rejects global-index read plans and
+repartition exchange plans. Each participating group takes an independent
+applied cut; the public `query` response exposes neither an observation vector
+nor a reusable global consistency token.
+
+The canonical point and transaction APIs are narrower RF3 lanes. Point reads
 accept one table and one canonical ordered scalar string/number
 primary-placement key. Strict `exec_batch` writes lower single- or multi-row
-whole-document insert, exact-primary-key whole-document update, and
-exact-primary-key delete with equality or finite `IN` keys into one or more
-relation-aware RF3 transaction participants. Same-group mutations use one
-atomic multi-relation apply; multiple groups use the replicated transaction
-protocol. The replicated table profile binds each table to an
-exact dense relation, schema generation, relation-manifest digest, and
-three-replica route. Composite placement tuples and tenant-path placement are
-not implemented on this public lane.
+whole-document or canonical top-level named-column insert, exact-primary-key
+whole-document update, and exact-primary-key delete with equality or finite `IN` keys into one
+or more relation-aware RF3 transaction participants. Same-group mutations use
+one atomic multi-relation apply; multiple groups use the replicated transaction
+protocol. The replicated table profile binds each table to an exact dense
+relation, schema generation, relation-manifest digest, and three-replica route.
+Composite placement tuples and tenant-path placement are not implemented on
+the canonical point/transaction APIs.
 
 A linearizable read follows the current leader and completes a Raft
 `ReadIndex`. An `at_least_applied` read supplies the exact `RouteID` and applied
@@ -85,13 +98,16 @@ re-resolved retry; an ambiguous transport outcome never enters that replay
 path.
 
 The point-read and `read_batch` lanes never fall back to the static SQL service.
-The strict RF3 mutation classifier fails closed to the static path when a
-statement is not in its supported exact-key vocabulary. `read_batch` supports
-ordered multi-table and multi-group exact-primary-key reads with one ReadIndex
-cut per group. Its sorted observation vector is an explicit per-group cut, not
-a common MVCC timestamp. Ready global indexes are lowered into independent RF3
-relation participants. Replicated joins, projections, ranges, aggregates, and
-read-write SQL transactions are not implemented.
+The strict RF3 mutation classifier rejects a statement outside its supported
+exact-key vocabulary instead of falling back to the static path. `read_batch`
+supports ordered multi-table and multi-group exact-primary-key reads with one
+ReadIndex cut per group. Its sorted observation vector is an explicit per-group
+cut, not a common MVCC timestamp. Ready global indexes are lowered into
+independent RF3 relation participants. The broader general `query` operation is
+not a `read_batch` fallback: in replicated-catalog mode it uses the RF3 SQL
+transport described above, and refuses planner shapes that require global-index
+read or repartition exchange support. Read-write SQL transactions are not
+implemented.
 
 The merge layer supports global limits, ordered results, aggregates, and
 grouped partial aggregates. It cancels remaining calls after a hard error or a
@@ -224,31 +240,31 @@ header triggers one ordered prefix-existence probe for the session digest;
 orphan slots poison the machine instead of being mistaken for free capacity.
 Reopen validates the hidden image in one ordered pass, including exact epoch,
 slot-count, modulo-position, applied-order, and retirement invariants. Scratch
-state is proportional to retained session identities. Persistent dedupe rows
-and the dedupe portion of reopen are bounded by
-`1 + 2 * MaxSessions + MaxSessions * RetryWindow`, including the separate
-class-independent authority-binding rows, not by total operations on reused
-stable identities.
+state is proportional to retained session identities and authority bindings.
+Persistent dedupe rows and the dedupe portion of reopen are bounded by one
+state row, `MaxSessions` live headers, `MaxSessions * RetryWindow` slots, and at
+most `2 * MaxSessions` authority bindings. The conservative combined row bound
+is therefore `1 + 3 * MaxSessions + MaxSessions * RetryWindow`, not total
+operations on reused stable identities.
 Release makes `SessionCount` and `SessionSlotCount` reusable; a new Open is
 refused at `MaxSessions` while that many images remain retained.
-Release does not delete authority bindings or decrement
-`AuthorityBindingCount`: a new distinct client identity is also refused once
-that independent bound reaches `MaxSessions`, even with no active sessions.
-This preserves the binding that prevents an identity from being reused under
-a different command-authority class.
+Release does not delete a class-independent authority binding or decrement its
+contribution to `AuthorityBindingCount`: a new distinct class-independent
+identity is refused when the current authority count reaches `MaxSessions`,
+even if no ordinary session image remains. This preserves the binding that
+prevents an identity from being reused under a different command-authority
+class. Scoped route/execution-session bindings are the exception and are
+deleted by exact Release with their retry image.
 
-The current durable route-session factory derives a fresh client identity
-from each request wave. That integration therefore exhausts the lifetime
-authority budget under sustained churn; reclaiming its retry slots does not
-solve the problem. The same risk must be audited in per-request execution-pin
-sessions. A serving fix must provide bounded reusable identities, uniquely
-bind each Open to its logical operation, and durably recover an Open admitted
-before route-intent publication. Hashing operations into reusable slots alone
-is insufficient: collisions and delayed retries must not share an active
-session or strand a slot. Raising the limit or deleting authority bindings
-would not establish this contract. The capacity regression is
-`TestNativeDurableRouteSessionAuthorityCapacityIsNotReclaimedByRelease`;
-passing it proves the refusal boundary, not sustained-serving completion.
+The durable route-session factory derives an operation-bound client identity
+for each request wave and marks it as scoped coordination authority. Exact
+Retire and Release remove that session's header, retry slots, and scoped
+authority binding. `TestNativeDurableRouteSessionsReclaimCapacityAcrossRequests`
+drives 32 distinct waves through Open, Retire, Release, and reopen against an
+eight-session bound. Every release returns `SessionCount`, `SessionSlotCount`,
+and `AuthorityBindingCount` to zero, and a fresh request still opens. Ordinary
+client authority bindings remain persistent; scoped cleanup does not weaken
+their cross-class fence or grant scoped sessions data-mutation authority.
 
 `LookupSessionLease` recovers the retained deadline and sequence fence with
 point reads. This kernel does not run timers, attest elapsed time, authenticate
@@ -263,13 +279,15 @@ token above it is invalid, so delayed commands cannot resurrect reclaimed
 effects. A replayed old Open can create only a new empty session with a later
 apply-index token; it cannot replay user mutations.
 
-The replicated SQL hidden collection's persisted `MaxBatchDocuments` is derived
-from the configured retry window as `RetryWindow + 2`, with a byte limit that
-admits both the full Release delete geometry and the three-record hot
-publication. Each publication passes a precise `BatchDocumentsHint`, so the
-durable transaction's dedup map normally reserves only the actual one-to-three
-system changes. The hint is not an admission limit: a cold Release can grow to
-the frozen hard bound and delete all retained slots atomically.
+The replicated SQL hidden collection's base session/control
+`MaxBatchDocuments` is derived from the configured retry window as
+`max(7, 3*RetryWindow+3)`. Its byte limit covers hot publication, Release,
+execution-pin, and route-gate rows; request-ledger and distributed-transaction
+profiles can freeze wider limits. Each publication passes its exact system-row
+count as `BatchDocumentsHint`, so the durable transaction initially reserves
+for the actual authority, session, slot, route-gate, and transaction rows. That
+count can exceed three. The hint is not an admission limit: a cold Release or
+another admitted wide command can grow to the frozen profile bound.
 
 The current range-split child artifact and tail move user rows, not session
 headers or ring slots. A `RetryHome` that moves to a non-retained child would
@@ -359,14 +377,21 @@ from the projected suffix until the exact final cut is proved. The
 per-generation build lease and deterministic stage name bound crash debris to
 one reclaimable image instead of an unbounded set of randomized WAL files.
 
-The WAL-generation lane is integrated with Raft-member and SQL-apply
-internals, but the RF3 serving command does not drive it. The bounded
-authenticated peer runtime, Multi-Raft Host, replicated shard service,
-settlement path, and leader-aware native gateway executor serve real
-in-process and multi-process test traffic. `vibedb-shard serve-rf3` opens an
-already prepared fixed three-voter member and constructs its peer and native
-serving side. It does not build, select, or activate a WAL generation, provision
-a group, or orchestrate topology.
+The WAL-generation lane is integrated with Raft-member and SQL-apply internals.
+`vibedb-shard serve-rf3` configures its production logical-tick and hard-pressure
+driver for every opened group member. Cut capture, authority revalidation,
+selection, and activation remain on the serialized runtime lane; only immutable
+candidate construction runs on one bounded worker. A busy group can therefore
+replace a full WAL before the ordinary ten-minute maintenance cadence. The
+bounded authenticated peer runtime, Multi-Raft Host, replicated shard service,
+settlement path, and leader-aware native gateway executor serve real in-process
+and multi-process test traffic. The command still requires already prepared
+member artifacts and does not invent an initial group or topology authority;
+those are separate preparation and experimental lifecycle paths.
+Automatic WAL replacement does not enable in-band Raft snapshots. The runtime
+still rejects a snapshot in `Ready`; learner replacement, split children, and
+restore install externally certified bases through their separate authenticated
+lifecycle paths before ordinary append-entry catch-up.
 Transition capture is deliberately rejected while a
 `CheckpointGroup` owns the apply state; online range split must use the later
 publish-before-prune serving integration rather than adding another ordinary
@@ -596,9 +621,10 @@ The internal replication kernel contains:
 - An encrypted preallocated Raft WAL
 - A deterministic replicated SQL state machine
 - A bounded single-owner Multi-Raft scheduler with normal-proposal coalescing
-- Static authenticated-identity frame validation
+- Authenticated identity and retained membership-grant frame validation
 - A composable mutual TLS ordinary-message stream foundation
-- Offline snapshot artifacts and resumable staging
+- Externally transferred certified snapshot artifacts and resumable non-serving
+  staging
 - A stateless replica-move reconciler
 
 One scheduler turn admits only the currently queued normal-proposal prefix: at
@@ -640,11 +666,13 @@ still needs a leader-and-quorum lease policy around request deadlines.
 The composition has a bounded authenticated peer service, replicated shard
 service, leader-aware native gateway executor, request identities, and a
 separate authenticated snapshot-artifact service. `serve-rf3` constructs the
-peer and replicated shard services from one fixed manifest. The public gateway
-uses the executor for catalog-bound point reads, exact-key mutation proposals,
-and transaction recovery through a shared authenticated pool and an exact
-leader-hint cache. It also exposes multi-table exact-key `read_batch` and RF3
-global-index mutation lowering. `serve-rf3` constructs snapshot-source,
+peer and replicated shard services from a prepared process manifest containing
+at most 64 local group members. The set stays fixed unless startup explicitly
+enabled append-only prepared-group reload. The public gateway
+uses the executor for catalog-bound general SQL SELECTs, point reads, exact-key
+mutation proposals, and transaction recovery through a shared authenticated
+pool and an exact leader-hint cache. It also exposes multi-table exact-key
+`read_batch` and RF3 global-index mutation lowering. `serve-rf3` constructs snapshot-source,
 membership, observation, ownership, and retirement control when the retained
 manifest provides the required state. Cold learner bootstrap and the gateway
 replica controller compose member replacement. Certificate enrollment, dynamic
@@ -652,12 +680,23 @@ address discovery, and a general public topology-administration CLI remain
 absent. Split control is command-composed when the operator supplies the exact
 replica-control and child-storage inventory.
 
+The mandatory multi-relation Linux gate uses deterministic TCP proxies on the
+Raft peer links. It can block every peer link to and from one selected member
+while leaving that shard process and its non-peer listeners alive, then prove
+election, exact request replay, gateway replacement, healing, and voter catch-up.
+That is a bidirectional **peer-network partition**, not `SIGSTOP`, a whole-process
+partition, or an operating-system network fault. The same gate separately kills
+and restarts a leader. It exercises two exact-key base relations, their local
+indexes, and cross-hosted global exact indexes; it does not qualify general SQL,
+range scans, one global MVCC snapshot, arbitrary partition cuts, or horizontal
+scaling.
+
 Do not describe this kernel as a turnkey replicated deployment.
 
 ## Implementation references
 
 - `gateway/catalog.go`, `executor.go`, `merge.go`, `global_index_read.go`,
-  `replicated_data_read.go`, `replicated_table.go`, and
+  `replicated_query.go`, `replicated_data_read.go`, `replicated_table.go`, and
   `replicated_leader_cache.go`
 - `gateway/read_snapshot.go`, `transaction.go`, `writer.go`, `global_index.go`,
   and `global_index_backfill.go`
@@ -682,7 +721,10 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/splitcontroller/reconcile.go`
 - `internal/splitcontroller/execute.go`
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
-- `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
+- `internal/raftstore`, `internal/raftmember/generation_driver.go`, and
+  `internal/multiraft`
+- `cmd/vibedb-shard/wal_pressure_process_test.go` and
+  `wal_retention_process_qualification_test.go`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`
 - `docs/design/raft-peer-transport.md`
 - `internal/replicatedstate/session_codec.go` and

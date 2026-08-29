@@ -10,6 +10,8 @@ This table is the executable benchmark-coverage contract. Status describes the h
 
 `implemented` establishes an executable measurement shape, not a comparison. An evidence command selecting `-engine=vibedb` is VibeDB-only; a cross-engine claim additionally requires the repeated isolated `mixedsuite` publication protocol and recorded results.
 
+The required cells are this repository's project-defined evidence matrix, not an exhaustive database or distributed-systems benchmark. In particular, node-count and shard-count weak scaling, rebalancing under load, hot-partition skew, and multi-group distributed query execution are outside this matrix. A complete cell count does not establish horizontal scalability or competitive performance.
+
 Current coverage: **38 implemented**, **0 diagnostic**, **0 gaps** across 38 required cells. A command's presence does not imply that a result has been run or published.
 
 Evidence commands are rendered to run from the repository root.
@@ -27,7 +29,7 @@ Evidence commands are rendered to run from the repository root.
 | document size | overflow-heavy | **implemented** | [E13](#e13): overflow-heavy corpus<br>[E12](#e12): overflow-heavy corpus byte shape | Seven of every eight deterministic documents are exact 16 KiB overflow values under one shared admission bound. |
 | working set | fits cache | **implemented** | [E02](#e02): cache-resident standard corpus | The standard corpus fits beneath the common 64 MiB read-cache budget. |
 | working set | larger than cache | **implemented** | [E13](#e13): cross-engine overflow working set above common cache<br>[E14](#e14): exact logical working-set/cache inequality | The matched overflow-heavy mixed lane has exact logical key-plus-document bytes above the common 64 MiB engine cache: seven of every eight of its 10,000 documents are exactly 16 KiB. Every adapter receives the same cache, durability, index, and workload flags. This proves an engine-cache working set, not a cold OS-cache or larger-than-RAM condition. |
-| working set | larger than RAM | **implemented** | [E15](#e15): bounded-memory out-of-RAM scan | The streaming overflow-heavy loader admits the row only when exact logical key-plus-document bytes exceed measured host physical memory. It enforces hard loader-byte, RSS, disk-space, and Linux physical-write bounds; a cross-engine claim requires one isolated process per engine with identical durability and index flags. |
+| working set | larger than RAM | **implemented** | [E15](#e15): bounded-memory out-of-RAM scan | The streaming overflow-heavy loader admits the row only when exact logical key-plus-document bytes exceed measured host physical memory. It enforces hard loader-byte, RSS, and disk-space bounds. When Linux /proc/self/io supplies the process write counter, it also enforces the configured write ceiling; otherwise it emits physical-write-known=false and skips that ceiling. Publication validation rejects an unknown counter. A cross-engine claim requires one isolated process per engine with identical durability and index flags. |
 | cache state | hot reopen | **implemented** | [E16](#e16): controlled hot reopen | A conditioning child fully scans and closes the populated image, then a fresh child times only Factory.Open and proves the complete corpus after the timed interval. The output calls this full-scan-close, not an in-handle warm cache. |
 | cache state | cold reopen | **implemented** | [E17](#e17): Linux global-cache cold reopen | Cold mode synchronously writes Linux /proc/sys/vm/drop_caches=3 before the isolated timed child and fails closed without that global control. Darwin has no equivalent supported lane and is documented as unsupported rather than approximated with advisory eviction. |
 | concurrency | 1 | **implemented** | [E02](#e02): single-client mixed workload | One worker owns the full deterministic trace. |
@@ -276,7 +278,7 @@ go test ./store/durable -run '^TestVerifyCleanPrimaryStoreVerifiesClean$' -count
 ### E37
 
 ```sh
-(cd bench/competitive && go run ./bench/rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
+(cd bench/competitive && go run ../rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)
 ```
 
 ### E38

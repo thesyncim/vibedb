@@ -86,16 +86,89 @@ identity fields.
 
 ## Primary data and indexes
 
-The primary structure is an ordered page graph. Leaf extents can grow from one
-base page to the configured maximum page size, which defaults to 64 KiB.
+### Ordered primary graph
 
-Small values can stay inline. Larger values use overflow storage. Exact indexes
-store canonical scalar tuples and posting references. Equal ordered path sets
-share one physical index even when they have different logical names.
+The primary structure is one ordered page graph. Its global tablet catalog has
+an exact lexical root of 64 KiB and 8 KiB catalog nodes. The normal catalog is
+two levels. A third level admits adversarial long separators. A catalog leaf
+names an independently cacheable tablet route.
 
-Skip indexes store compact minimum and maximum summaries for each primary
-stripe. A container, an oversized scalar, or another unprunable value disables
-pruning only for that stripe and path. It does not change query correctness.
+One tablet has:
+
+- one 8 KiB `PageTabletRoute` containing a 4 KiB segmented-router root
+- one 8 KiB `PagePrimaryLocator` mapping 4096 stable local IDs
+- one to 16 independently replaceable 8 KiB `PagePrimaryAnchor` pages
+- up to 4096 primary leaves
+
+An anchor page holds at most 256 lexical fences, but row count is not its only
+packing bound. The encoder front-compresses fences and starts another anchor
+when the encoded fence arena is full. Incompressible fences can therefore end
+an anchor before row 256. Stable local ID is independent of lexical rank, and
+the encoded locator's exact `(page ID, row slot)` is authoritative. It must not
+be reconstructed as `rank / 256, rank % 256`.
+
+### Compact primary stripes (`VCS1`)
+
+Every production primary leaf is a common `PagePrimaryLeaf` whose payload
+starts with `VCS1`. The internal `CommonPrimaryLeafCompact` discriminator is 6,
+and `VCS1` is the sole durable primary-leaf grammar. The older unified class-5
+encoder remains only as an internal codec-test helper. Production open,
+mutation, and verification do not accept it as an alternate format.
+
+A stripe is rounded to a 4 KiB physical extent and can grow to 64 KiB. An
+unindexed stripe admits at most 4096 rows. A collection with exact indexes uses
+at most 256 rows per stripe so each posting retains one stable byte-sized slot.
+Within a stripe:
+
+- keys form one compact scalar stream in strict lexical row order
+- rows carry bit-packed shape IDs
+- rows with the same JSON shape share one static template
+- each scalar hole in that template is an independent compact stream
+- 64-row restart and shape-rank checkpoints bound point decoding
+- optional posting slots preserve exact-index identity
+- overflow rows carry a bitmap plus the complete 32-byte first-page `PageRef`,
+  rather than participating in the inline scalar streams.
+
+Every scalar stream is self-delimiting and selects one reversible encoding:
+
+| Encoding | Current representation |
+| --- | --- |
+| Dictionary | Sorted distinct spellings plus bit-packed IDs |
+| Front | Prefix/suffix tuples with a full restart every 64 values |
+| Frame of reference | Minimum signed integer plus bit-packed offsets |
+| Delta | Full signed-integer restart plus zigzag-varint deltas |
+| Packed delta | Per-64-value base and bit-packed zigzag deltas |
+| Date | Exact JSON `"YYYY-MM-DD"` strings as bit-packed day ordinals |
+| Prefix integer | Shared prefix/suffix plus linear, varint, or packed decimal integers |
+| Alphabet | Up to 64 middle bytes, shared affixes, and bit-packed symbols and lengths |
+
+The planner measures every applicable representation. It normally selects the
+byte minimum, but deliberately retains a dictionary with at most 128 entries
+when it is within 25 percent of that minimum because packed-ID scans are
+cheaper. This is a deterministic representation choice, not an adaptive index.
+Every codec reconstructs its exact input bytes. For document holes, those bytes
+are the canonical scalar spelling. None of the codecs are lossy.
+
+Skip indexes append at most eight field summaries to each stripe. Each valid
+summary stores canonical ordered minimum and maximum terms of at most 256 bytes,
+and the complete summary tail is bounded at 4 KiB. A container, an oversized
+scalar, or another unprunable value disables only that stripe/path summary. It
+does not change query correctness.
+
+### Inline and overflow values
+
+`InlineValueBytes` is a persisted admission contract, 512 bytes by default.
+An admitted canonical value above that ceiling and no larger than
+`MaxDocumentBytes` (4 MiB by default) uses a linked `PageOverflow` chain. Each
+checksummed page records the complete value length, this piece's byte offset
+and length, and the next complete `PageRef`. The final page has a zero next
+reference. Pieces are raw value bytes. The current overflow format does not
+apply the `VCS1` field codecs or cross-value deduplication, and reads reassemble
+the chain.
+
+Exact indexes store canonical scalar tuples and posting references. Equal
+ordered path sets share one physical index even when they have different
+logical names. One canonical compound tuple is bounded at 4096 bytes.
 
 ## Recovery journal
 
@@ -168,13 +241,13 @@ One `VTM1` page is at most 64 KiB:
 | 32 | variable | Canonical participant entries |
 | final | 4 | CRC32C of every preceding page byte |
 
-Each entry starts with 64 fixed bytes: distribution-prefix length,
+Each entry starts with 80 fixed bytes: distribution-prefix length,
 distribution-suffix length, shard-prefix length, shard-suffix length,
 participant state, three required zero bytes, routing version, allocation
-generation, ownership epoch, and the 32-byte mutation digest. The two identity
-suffixes follow. Prefixes refer only to the preceding entry in the same page;
-the first entry uses zero prefixes. Entries and pages are strictly ordered and
-deduplicated.
+generation, ownership epoch, the 32-byte mutation digest, and the 16-byte
+authority witness. The two identity suffixes follow. Prefixes refer only to the
+preceding entry in the same page; the first entry uses zero prefixes. Entries
+and pages are strictly ordered and deduplicated.
 
 `VTCM` is exactly 116 bytes. It stores magic and sentinel, staging state,
 revision, catalog generation, recovery deadline, 16-byte transaction ID, and a
@@ -534,23 +607,30 @@ deadline.
 ## Range-split source capture records
 
 `internal/rangesplit/source_capture.go` stores source-capture values only in a
-private opaque collection. Header and transition-entry rows share one raw
-binary envelope: an eight-byte identity, numeric format sentinel `0`, record
-kind, required zero reserved bytes, and exact little-endian total length. The
-header binds the split plan, placement program, collection, initial
+private opaque collection. Header and transition-entry rows share one 16-byte
+raw binary envelope: an eight-byte identity, numeric format sentinel `0`,
+record kind, required zero reserved bytes, and exact little-endian total
+length. The header binds the split plan, placement program, collection, initial
 publication, and its semantic digest. Each entry carries fixed publication
-metadata and digests followed by strictly ordered transition frames. Every
-frame has explicit before/after presence bits, required zero reserved bytes,
-little-endian key/before/after lengths, and the exact raw bytes.
+metadata and digests followed by strictly ordered transition frames.
+
+Every transition has a 56-byte header: before/after presence bits, required
+zero reserved bytes, little-endian key/before-document/after-document lengths,
+an eight-byte before keyspace point, and a 32-byte before-document digest. The
+payload then stores the exact key and after-document bytes. It does not store
+the raw before document; its length, point, and digest are the retained before
+witness.
 
 A header is exactly `264 + collection bytes`. An entry is exactly
-`248 + 16*transition count + key bytes + before bytes + after bytes`; raw
-payload growth therefore has no base64 expansion.
+`248 + 56*transition count + key bytes + after bytes`; raw payload growth
+therefore has no base64 expansion, and before-document size does not increase
+the physical record.
 
 The decoder accepts only this current grammar, requires exact frame exhaustion,
 and borrows capacity-clamped key and document slices from the record. It parses
-only present before/after values as JSON; the binary envelope, collection, and
-keys are opaque bytes. A stale development JSON/base64 capture fails closed.
+only present after values as JSON; the before side is the authenticated witness
+described above. The binary envelope, collection, and keys are opaque bytes. A
+stale development JSON/base64 capture fails closed.
 
 ## Implementation references
 
@@ -558,5 +638,10 @@ keys are opaque bytes. A stale development JSON/base64 capture fails closed.
 - `internal/storeio/mutable_file_layout.go`
 - `internal/storeio/inline_superblock.go`
 - `internal/storeio/state_root.go`
+- `internal/storeio/compact_primary_stripe.go` and `compact_stream_codec.go`
+- `internal/storeio/compact_primary_summary.go` and `overflow_page.go`
+- `internal/storeio/segmented_tablet_router.go` and
+  `segmented_tablet_router_geometry.go`
+- `internal/storeio/global_tablet_catalog.go`
 - `internal/storeio/recovery_journal.go` and `txn_marker.go`
 - `internal/collectionname/collectionname.go`

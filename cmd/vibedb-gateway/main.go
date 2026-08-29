@@ -1,11 +1,12 @@
-// Command vibedb-gateway is the stateless routing gateway and the operator tool
-// for its authoritative catalog: it loads and validates a persisted catalog
-// generation, reports the routing configuration and endpoint membership it would
-// route against, and serves bounded distributed reads against a pinned generation.
+// Command vibedb-gateway is the distributed routing, data, and control gateway.
+// It inspects static catalogs, serves bounded static SQL, and can compose the
+// experimental RF3 catalog, exact-key read, sequenced mutation, schema-rollout,
+// topology, backup, and restore paths.
 //
-// A gateway holds no authoritative state of its own; it pins one immutable
-// catalog generation per operation and dispatches leader-only, strongly
-// consistent reads to the shard services.
+// Static requests pin one immutable catalog generation before dispatch. RF3
+// serving additionally owns local durable session, issuer, acknowledgement,
+// request/coordinator, topology, and backup journals; the replicated catalog,
+// request ledger, and data groups remain the distributed authorities.
 //
 // Usage:
 //
@@ -13,13 +14,14 @@
 //	vibedb-gateway validate -catalog <path>
 //	vibedb-gateway serve    -catalog <path> [-listen <addr>]
 //	vibedb-gateway schema-rollout <serve/catalog TLS flags> -schema-rollout-plan <path>
+//	vibedb-gateway restore-activate -manifest <path>
 //
 // inspect prints the generation, its distributions, per-shard geometry and
 // allocation identities, ownership epochs, and the endpoint membership.
 // validate loads and re-validates the generation and exits non-zero on any
-// inconsistency. serve loads an initial generation, reloads the catalog file
-// after stale-shard refusals, and answers newline-delimited JSON query requests
-// over the listener, shutting down cleanly on SIGINT/SIGTERM.
+// inconsistency. serve loads the configured static or replicated authorities
+// and answers newline-delimited JSON requests over its configured security
+// boundary, shutting down cleanly on SIGINT/SIGTERM.
 package main
 
 import (

@@ -14,7 +14,7 @@ import (
 // The recovery journal serves two buffered-visible contracts without changing
 // reads. With Options.RecoveryJournal, each mutation appends and syncs its redo
 // before acknowledgement. Without that option, acknowledgements stay volatile
-// and an explicit Flush appends one ordered batch covering the bounded class-5
+// and an explicit Flush appends one ordered batch covering the bounded VCS1
 // overlay, then syncs it. Both forms recover through the ordinary mutation path;
 // a physical checkpoint eventually folds the records into the root and recycles
 // the journal. DurabilitySync uses the per-mutation form unconditionally.

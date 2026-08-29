@@ -9,10 +9,13 @@ uses a transaction. It uses the native facade.
 mkdir vibedb-example
 cd vibedb-example
 go mod init example.com/vibedb-example
-go get github.com/thesyncim/vibedb@2ebcdff1047d
+go get github.com/thesyncim/vibedb@main
 ```
 
-VibeDB requires Go 1.26. Use the tested revision shown above.
+VibeDB requires Go 1.26. The project does not yet publish release tags, so
+`@main` selects unreleased development code. After validation, retain the exact
+pseudo-version or commit recorded in `go.mod`. Do not assume later commits are
+wire- or disk-compatible.
 
 ## 2. Add the program
 

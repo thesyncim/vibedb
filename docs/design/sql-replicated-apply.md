@@ -151,14 +151,16 @@ sessions and their fixed retry windows, with a hard ceiling of
 operations.
 
 The hidden collection's persisted mutation limits are derived from the exact
-`RetryWindow`. `MaxBatchDocuments` is `RetryWindow + 2`: one state row, one
-session-header deletion, and up to `RetryWindow` slot deletions. The byte bound
-admits both this Release geometry and the three-record hot publication. Normal
-publications pass precise `BatchDocumentsHint` values to durable transactions,
-so their internal dedup map reserves only the actual one-to-three system
-mutations instead of the cold Release maximum. The hint controls initial
-reservation only; the durable batch can still grow to the frozen hard limit for
-Release.
+`RetryWindow`. The base session/control profile uses
+`max(7, 3*RetryWindow+3)` for `MaxBatchDocuments`; request-ledger and
+distributed-transaction profiles can freeze a wider limit for their command
+geometry. The byte bound admits hot publication, Release, execution-pin, and
+route-gate rows. Normal publications pass their exact system-row count as
+`BatchDocumentsHint`, so the durable transaction initially reserves for the
+actual authority, session, slot, route-gate, and transaction rows. That count
+can exceed three. The hint controls initial reservation only; a durable batch
+can still grow to its frozen profile limit for Release or another admitted
+wide command.
 
 An invariant or corruption error poisons the machine until reopen.
 

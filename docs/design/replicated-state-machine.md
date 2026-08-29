@@ -4,9 +4,12 @@
 hidden system collection and a bounded manifest of dense relation collections.
 The relation bundle can publish a base JSON mutation together with local or
 global exact-index mutations in one checkpoint group. It is consumed by the
-RF3 serving composition. `vibedb-shard serve-rf3` opens an externally prepared
-state machine and serves it through a fixed authenticated three-voter runtime;
-it does not initialize the machine, change membership, or install snapshots.
+RF3 serving composition. `vibedb-shard serve-rf3` opens one to 64 externally
+prepared local state-machine bundles in one process. Each configured RF3 group
+begins with three voters; retained, certified membership may instead contain an
+enrolled replacement or learner. The command does not initialize a missing
+ordinary state machine. Initial preparation, certified learner/restore bases,
+and membership changes remain separate experimental lifecycle paths.
 
 ## Command contract
 
@@ -107,10 +110,16 @@ ring slots. `MaxSessions` is at most 1,048,576. `RetryWindow` is at most 256.
 The physical slot count is exactly `min(HighSequence, RetryWindow)`. Retirement
 keeps the image retryable; Release removes it and decreases `SessionCount` and
 `SessionSlotCount`. Successive accepted operations for a retained identity do
-not increase dedupe rows after its ring is populated. The machine refuses a new
-Open at `MaxSessions` only until another retained image is released, so the
-capacity is not consumed by historical operation count for cooperative
-clients. `LookupSessionLease` exposes the retained epoch, sequence/ack fence,
+not increase header or ring rows after its ring is populated. Release makes the
+live-session and slot budgets reusable. It does not normally delete the
+class-independent authority binding: the same stable identity can reopen only
+under its retained authority class, while a fresh class-independent identity is
+refused once the current `AuthorityBindingCount` reaches `MaxSessions`. Scoped
+route/execution-session authorities are the exception: exact Release deletes
+their binding with their retry image. The persisted authority count can
+therefore contain retained class-independent bindings plus live scoped
+bindings, and image release alone does not make arbitrary fresh-identity churn
+safe. `LookupSessionLease` exposes the retained epoch, sequence/ack fence,
 deadline, status, and terminal result with indexed point reads. This unserved
 kernel does not authenticate callers, attest elapsed time, run timers, or grant
 revocation authority; RF3 serving must supply those pieces before unbounded
@@ -135,14 +144,19 @@ machine binding, session header, and retained slot metadata. It compares the
 supplied fingerprint and `LogicalCommandDigest` with the slot before it accepts
 an exact retry.
 
-The hidden image contains one state row, one row per retained stable identity,
-and at most `RetryWindow` slot rows per identity. If a point lookup finds no
+The session portion of the hidden image contains one state row, at most
+`MaxSessions` live headers, at most `MaxSessions * RetryWindow` ring slots, and
+durable authority-binding rows. The state codec and reopen path separately cap
+`AuthorityBindingCount` at `2 * MaxSessions`, covering retained
+class-independent bindings plus bindings for currently live scoped sessions;
+the resulting conservative row bound is
+`1 + 3 * MaxSessions + MaxSessions * RetryWindow`. If a point lookup finds no
 header, one ordered prefix-existence probe checks that the same session digest
 has no orphan slot. Reopen validates the image in one ordered pass, including
 the exact physical slot count, canonical modulo sequence for every slot, strict
 applied order across a wrapped ring, and a single latest retirement result. Its
-session scratch state is proportional to the retained session count, and its
-slot work is bounded by `MaxSessions * RetryWindow`.
+session scratch state is proportional to retained headers and authority
+bindings, and its slot work is bounded by `MaxSessions * RetryWindow`.
 
 `ValidateImmutableBaseApplyCapacity` validates this bounded session profile
 against a live immutable-base WAL. `AdoptRuntime` uses that proof directly.
@@ -159,14 +173,15 @@ image. Mutation planning is bounded by 64 distinct keys. It performs indexed
 point reads plus bytewise validation and digest work on the supplied changes.
 
 Release is the cold exception: it validates and deletes at most `RetryWindow`
-slots. The required hidden-collection `MaxBatchDocuments` is
-`RetryWindow + 2`, and the required byte limit admits both that delete geometry
-and the three-record hot publication. The SQL replicated store persists this
-exact derived profile, so smaller retry profiles do not inherit the maximum
-256-slot geometry. Each publication also supplies a precise
-`BatchDocumentsHint`. This sizes only the durable transaction's initial
-dedup-map reservation—normally one to three system records—while retaining the
-hard ability to grow to the full bounded Release batch.
+slots. The base session/control profile derives hidden-collection
+`MaxBatchDocuments` as `max(7, 3*RetryWindow+3)` and sizes the byte limit for
+hot publication, Release, execution-pin, and route-gate rows. Request-ledger
+and distributed-transaction profiles can persist a wider frozen limit for
+their command geometry. Each publication also supplies its exact system-row
+count as `BatchDocumentsHint`. This sizes only the durable transaction's
+initial dedup-map reservation; authority, session, slot, route-gate, and
+transaction rows can make the hint larger than three, while an admitted cold
+operation can still grow to the complete frozen profile limit.
 
 `DataChainDigest` is the deterministic, history-sensitive transition fence for
 the replicated publication. An effective row mutation advances it from the
@@ -237,9 +252,13 @@ source-seal or catalog-publication gates, and direct transition construction
 also rejects it. A serving split must either release those images or migrate
 them with their original completion lineage before that gate can be relaxed.
 
-The runtime does not transport snapshots through Raft messages. A learner must
-receive a certified base through an external offline process. It can then
-catch up with append entries.
+The runtime rejects snapshots carried in an in-band Raft `Ready` or ordinary
+peer message. `bootstrap-rf3` instead receives a certified base through the
+separately authenticated and budgeted snapshot service while the target is
+non-serving, installs that exact base, and then reopens it through `serve-rf3`.
+The learner catches up from the certified base through ordinary append entries.
+Split children and restored groups use their own external certified-base
+lifecycles; none relax the in-band snapshot refusal.
 
 ## Implementation references
 
@@ -248,6 +267,11 @@ catch up with append entries.
 - `internal/replicatedstate/digest.go` and `read.go`
 - `internal/replication/command.go` and `completion.go`
 - `internal/raftmember/apply_capacity.go`
+- `internal/raftmember/runtime.go` and `staged_child.go`
 - `internal/replicatedstate/snapshot_artifact.go`
 - `internal/replicatedstate/snapshot_stage.go`
 - `sql/driver/replicated_store.go`
+- `cmd/vibedb-shard/bootstrap_rf3.go`, `serve_rf3.go`, and
+  `adopt_restored_rf3.go`
+- `cmd/vibedb-gateway/replica_replacement_process_test.go`:
+  `TestGatewayAutomaticReplicaReplacementProcesses`

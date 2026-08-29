@@ -249,9 +249,10 @@ re-observation and regrant after a process restart under hard total, write, and
 failover latency bounds plus aggregate RSS, storage, and WAL bounds. That gate
 uses actual target-catalog RF3 sessions and a separate ReadIndex observation
 before the gateway broadcasts serving
-grants. Qualification remains Partial until mandatory Ubuntu records three
-unskipped runs. This is not a production recovery, key-management, or
-cross-build migration claim.
+grants. A verified Ubuntu receipt for tested base commit
+`4672dbd67ee2e49291d410cb34905aafe1e24135` records three unskipped
+restored-RF3 runs (`count=3`). Qualification remains Partial because this is
+not a production recovery, key-management, or cross-build migration claim.
 
 ## Offline same-identity recovery
 

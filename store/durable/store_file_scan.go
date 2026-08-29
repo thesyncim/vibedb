@@ -682,7 +682,7 @@ func (s *Snapshot) rangePrimaryGraphBuffer(
 		return scratch, err
 	}
 	// Seed the cursor's splice buffer from the Snapshot's retained scratch and
-	// hand the grown buffer back when the scan ends, so class-5 row
+	// hand the grown buffer back when the scan ends, so compact VCS1 row
 	// reconstruction reuses one allocation across every scan of this snapshot
 	// rather than growing a fresh buffer per scan. Keep this separate from the
 	// overflow-value scratch: the cursor's borrowed key may still reference the

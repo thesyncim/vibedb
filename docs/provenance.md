@@ -1,7 +1,16 @@
 # Source and algorithm provenance
 
 This page maps external dependencies and derived algorithms to repository
-evidence. License files remain authoritative for license text.
+evidence. Third-party notice files remain authoritative for their license text.
+
+## Project license status
+
+The repository currently has no project-level `LICENSE` or `COPYING` file. The
+checked-in `LICENSE-*` files and `x/vitessroute/LICENSE-VITESS` are third-party
+notices. They do not state a license for VibeDB's own source.
+
+This is a release blocker. Select and add an explicit project license before a
+release. Do not infer project reuse terms from dependency notices.
 
 ## Root module dependencies
 

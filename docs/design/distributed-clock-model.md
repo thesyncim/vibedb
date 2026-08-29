@@ -2,11 +2,15 @@
 
 Status: **Internal qualification contract**
 
-This page records the clock assumptions that must be tested before the
-distributed runtime can claim resilience to clock skew or process suspension.
-It is not a claim that those gates currently pass. The generated
+This page records the clock assumptions and the full qualification obligations
+behind any clock-skew or process-suspension claim. A bounded process-level
+matrix already qualifies the exact injected-UTC, `SIGSTOP` / `SIGCONT`, leader
+isolation, recovery, and shipped-command pressure faults documented in
+[Distributed clock and suspend qualification](../operations/distributed-clock-faults.md).
+That evidence is deliberately partial; it does not qualify unrestricted clock
+resilience. The generated
 [distributed feature state](../distributed-feature-state.md) remains the
-evidence ledger.
+source-of-truth evidence ledger.
 
 VibeDB does not currently expose a globally ordered transaction timestamp or a
 single-time cross-group MVCC snapshot. Within one RF3 group, Raft term, log
@@ -124,10 +128,12 @@ globally ordered commit timestamps, bounded-staleness reads stated in seconds,
 or external consistency across groups cannot infer those properties from the
 current vector-cut API.
 
-## Required qualification gates
+## Full qualification obligations
 
-Clock resilience remains unqualified until automated gates cover the shipped
-process composition and assert both safety and bounded degradation:
+The existing bounded matrix covers specific slices of the obligations below.
+A broader clock-resilience claim remains unqualified until automated gates
+cover their full fault ranges in the shipped process composition and assert
+both safety and bounded degradation:
 
 1. Run sustained authenticated RF3 reads, exact retries, and multi-group
    transactions while independently stepping each node's UTC clock forward
@@ -162,14 +168,18 @@ process composition and assert both safety and bounded degradation:
    alongside the safety assertions.
 
 Narrow unit tests with injected certificate time and staggered logical ticks
-are useful evidence, but they do not satisfy these process-level gates.
+remain useful evidence, but unit tests alone do not satisfy these obligations.
+The current bounded process matrix also does not exhaust them: it does not
+change live database-process UTC, qualify arbitrary static read-fence
+suspension or overrun, or cover arbitrary kernel, hypervisor, and time-service
+failures.
 
 ## Implementation references
 
 - `internal/raftmodel/config.go` and `config_test.go`
 - `internal/multiraft/host.go`
 - `gateway/replicated_sql_read.go`
-- `gateway/replicated_transaction_recover.go`
+- `gateway/replicated_transaction_recovery.go`
 - `gateway/recovery.go`
 - `shardservice/read_fence.go`
 - `internal/servicetls/server.go`

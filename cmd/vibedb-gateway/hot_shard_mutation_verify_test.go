@@ -35,8 +35,9 @@ type hotMutationDocument struct {
 
 // Verify committed writes through authenticated native relation reads, without
 // introducing gateway read pressure into a write-driven placement test.
-// General SQL remains the separate static transport; local indexes are checked
-// on exclusively reopened persisted stores at the end of this process gate.
+// This keeps verification independent of either the static SQL transport or
+// the replicated-catalog RF3 SELECT path. Local indexes are checked on
+// exclusively reopened persisted stores at the end of this process gate.
 func (client *hotMutationWireClient) getMessage(t *testing.T) (hotMutationDocument, bool) {
 	t.Helper()
 	key, ok := orderedkey.AppendString(nil, []byte("m-0"), orderedkey.Ascending)
