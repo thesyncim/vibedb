@@ -2,6 +2,7 @@ package storeio
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 )
 
@@ -17,6 +18,11 @@ import (
 func ValidateSegmentedTabletRouterLeafGeometry(
 	leaves []SegmentedTabletRouterLeaf,
 ) error {
+	_, _, err := PlanSegmentedTabletRouterAnchors(leaves)
+	return err
+}
+
+func validateSegmentedTabletRouterLeafIdentities(leaves []SegmentedTabletRouterLeaf) error {
 	if len(leaves) == 0 ||
 		len(leaves) > TabletLocalIdentityLocalCount ||
 		len(leaves) > SegmentedTabletRouterMaxPages*SegmentedTabletRouterRowsPerPage ||
@@ -42,26 +48,59 @@ func ValidateSegmentedTabletRouterLeafGeometry(
 		used[word] |= bit
 	}
 
-	pageCount := (len(leaves) + SegmentedTabletRouterRowsPerPage - 1) /
-		SegmentedTabletRouterRowsPerPage
+	return nil
+}
+
+// PlanSegmentedTabletRouterAnchors packs lexical leaf fences by both encoded
+// bytes and row slots. The returned ends are exclusive leaf offsets. Existing
+// full pages retain their encoding; incompressible fences use another existing
+// anchor ID rather than failing below the tablet's physical capacity.
+func PlanSegmentedTabletRouterAnchors(leaves []SegmentedTabletRouterLeaf) (ends [SegmentedTabletRouterMaxPages]int, count int, err error) {
+	if err := validateSegmentedTabletRouterLeafIdentities(leaves); err != nil {
+		return ends, 0, err
+	}
+	return planSegmentedTabletRouterAnchors(leaves)
+}
+
+func planSegmentedTabletRouterAnchors(leaves []SegmentedTabletRouterLeaf) (ends [SegmentedTabletRouterMaxPages]int, count int, err error) {
 	rootKeyBytes := 0
-	for pageID := 0; pageID < pageCount; pageID++ {
-		first := pageID * SegmentedTabletRouterRowsPerPage
+	for first := 0; first < len(leaves); {
+		if count == len(ends) {
+			return ends, 0, fmt.Errorf("%w: anchor page count", ErrSegmentedTabletRouterNoSpace)
+		}
 		last := min(first+SegmentedTabletRouterRowsPerPage, len(leaves))
+		if fitErr := validateSegmentedTabletAnchorFenceGeometry(leaves[first:last]); fitErr != nil {
+			if !errors.Is(fitErr, ErrSegmentedTabletRouterNoSpace) {
+				return ends, 0, fitErr
+			}
+			lo, hi := first+1, last
+			if err := validateSegmentedTabletAnchorFenceGeometry(leaves[first:lo]); err != nil {
+				return ends, 0, err
+			}
+			for lo+1 < hi {
+				mid := lo + (hi-lo)/2
+				if err := validateSegmentedTabletAnchorFenceGeometry(leaves[first:mid]); err == nil {
+					lo = mid
+				} else if errors.Is(err, ErrSegmentedTabletRouterNoSpace) {
+					hi = mid
+				} else {
+					return ends, 0, err
+				}
+			}
+			last = lo
+		}
 		rootKeyBytes += len(leaves[first].Fence)
 		if rootKeyBytes > segmentedTabletRouterRootTrailerAt-
 			segmentedTabletRouterRootKeysAt {
-			return fmt.Errorf(
+			return ends, 0, fmt.Errorf(
 				"%w: root fence arena", ErrSegmentedTabletRouterNoSpace,
 			)
 		}
-		if err := validateSegmentedTabletAnchorFenceGeometry(
-			leaves[first:last],
-		); err != nil {
-			return err
-		}
+		ends[count] = last
+		count++
+		first = last
 	}
-	return nil
+	return ends, count, nil
 }
 
 // validateSegmentedTabletAnchorFenceGeometry mirrors the exact fence-byte
@@ -84,9 +123,7 @@ func validateSegmentedTabletAnchorFenceGeometry(
 			),
 		)
 	}
-	if common > 255 {
-		return fmt.Errorf("%w: anchor common prefix", ErrInvalidWrite)
-	}
+	common = min(common, 255)
 	keyAt := common
 	var restart []byte
 	for rank := range leaves {
