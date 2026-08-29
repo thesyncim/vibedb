@@ -194,6 +194,58 @@ type GlobalTabletCatalogLocatorEntry struct {
 	State   GlobalTabletCatalogLocatorState
 }
 
+// BuildGlobalTabletCatalogLocatorEntries converts the exact locator emitted by
+// EncodeSegmentedTabletRouter into the sorted entries required by the durable
+// global-tablet locator. Deriving both representations from the encoded bytes
+// keeps byte-packed anchor-page boundaries authoritative.
+func BuildGlobalTabletCatalogLocatorEntries(
+	locator []byte,
+	leaves []SegmentedTabletRouterLeaf,
+) ([]GlobalTabletCatalogLocatorEntry, error) {
+	if len(locator) != SegmentedTabletRouterLocatorBytes || len(leaves) == 0 ||
+		len(leaves) > TabletLocalIdentityLocalCount {
+		return nil, fmt.Errorf(
+			"%w: segmented global locator geometry", ErrInvalidWrite,
+		)
+	}
+
+	entries := make([]GlobalTabletCatalogLocatorEntry, len(leaves))
+	var used [TabletLocalIdentityLocalCount / 64]uint64
+	for rank, leaf := range leaves {
+		if leaf.LocalID >= TabletLocalIdentityLocalCount {
+			return nil, fmt.Errorf(
+				"%w: segmented global locator LocalID", ErrInvalidWrite,
+			)
+		}
+		word, bit := leaf.LocalID>>6, uint64(1)<<(leaf.LocalID&63)
+		if used[word]&bit != 0 {
+			return nil, fmt.Errorf(
+				"%w: duplicate segmented global locator LocalID", ErrInvalidWrite,
+			)
+		}
+		used[word] |= bit
+
+		code := binary.LittleEndian.Uint16(locator[int(leaf.LocalID)*2:])
+		pageID := uint8(code >> 8)
+		if code == segmentedTabletRouterEmpty ||
+			pageID >= SegmentedTabletRouterMaxPages {
+			return nil, fmt.Errorf(
+				"%w: segmented global locator position", ErrInvalidWrite,
+			)
+		}
+		entries[rank] = GlobalTabletCatalogLocatorEntry{
+			LocalID: leaf.LocalID,
+			PageID:  pageID,
+			RowSlot: uint8(code),
+			State:   GlobalTabletCatalogLocatorLive,
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].LocalID < entries[j].LocalID
+	})
+	return entries, nil
+}
+
 // GlobalTabletCatalogLocatorView is a borrowed, allocation-free read view over
 // one admitted locator image. It resolves a tablet's LocalIDs to their current
 // anchor page and slot and aliases the page bytes for the lease's lifetime.
@@ -269,6 +321,27 @@ type GlobalTabletCatalogAnchorView struct {
 	ref      PageRef
 	locator  PageRef
 	tabletID uint32
+}
+
+// GlobalTabletCatalogLeafSplitPlan is the exact geometry decision for one
+// localized leaf split. Its details remain opaque so callers cannot invent a
+// row-count plan that diverges from the encoded fence layout.
+type GlobalTabletCatalogLeafSplitPlan struct {
+	splitRank     uint16
+	newAnchor     bool
+	tabletRebuild bool
+}
+
+// NeedsNewAnchor reports whether the localized plan adds one stable anchor ID.
+func (p GlobalTabletCatalogLeafSplitPlan) NeedsNewAnchor() bool {
+	return p.newAnchor
+}
+
+// RequiresTabletRebuild reports that the edit cannot remain localized. This
+// includes a full sixteen-anchor root and any prospective split whose two
+// encoded halves or additional root floor cannot be represented exactly.
+func (p GlobalTabletCatalogLeafSplitPlan) RequiresTabletRebuild() bool {
+	return p.tabletRebuild
 }
 
 // GlobalTabletCatalogCatalogBounds is the computed geometry of a catalog tree
@@ -1836,7 +1909,8 @@ func (v *GlobalTabletCatalogTabletRootView) RewriteHandle(
 // InsertSplitLeaf performs the localized structural edit for one primary-leaf
 // split. It preserves every unaffected anchor byte-for-byte, rewrites the
 // locator and segmented root, and rewrites only the selected anchor plus one
-// new anchor when the selected page was full. The caller publishes all
+// new anchor when the prospective row exceeds the selected page's exact
+// encoded-byte capacity. The caller publishes all
 // returned images atomically through the surrounding tablet/catalog COW path.
 func (v *GlobalTabletCatalogTabletRootView) InsertSplitLeaf(
 	rootDst, locatorDst, leftDst, rightDst []byte,
@@ -1892,6 +1966,16 @@ func (v *GlobalTabletCatalogTabletRootView) InsertSplitLeaf(
 			segmentedTabletRouterCompareFences(segmentedTabletRouterFence{a: rightFence}, anchor.page.fenceAt(sourceRank+1)) >= 0 {
 		return result, fmt.Errorf("%w: localized leaf split fence", ErrInvalidWrite)
 	}
+	splitPlan, err := v.PlanLeafSplit(anchor, route, rightFence)
+	if err != nil {
+		return result, err
+	}
+	if splitPlan.RequiresTabletRebuild() {
+		return result, fmt.Errorf(
+			"%w: localized leaf split requires tablet rebuild",
+			ErrSegmentedTabletRouterNoSpace,
+		)
+	}
 
 	count := int(anchor.page.count) + 1
 	insertRank := sourceRank + 1
@@ -1937,15 +2021,14 @@ func (v *GlobalTabletCatalogTabletRootView) InsertSplitLeaf(
 	leftPageID := route.PageID
 	pageCount := v.inner.pageCount
 	rightPageID := leftPageID
-	splitRank := count
-	if count > SegmentedTabletRouterRowsPerPage {
+	splitRank := int(splitPlan.splitRank)
+	if splitPlan.NeedsNewAnchor() {
 		if pageCount >= SegmentedTabletRouterMaxPages ||
 			len(rightDst) < SegmentedTabletRouterAnchorPageBytes {
 			return result, fmt.Errorf("%w: localized leaf split anchor capacity", ErrInvalidWrite)
 		}
 		rightPageID = pageCount
 		pageCount++
-		splitRank = count / 2
 	}
 	if leftAnchorRef.Generation != generation ||
 		segmentedTabletRouterValidateAnchorRefIdentity(leftAnchorRef, tabletID, generation, leftPageID) != nil ||
@@ -2359,6 +2442,175 @@ func (v *GlobalTabletCatalogAnchorView) Count() int {
 		return 0
 	}
 	return int(v.page.count)
+}
+
+// leafSplitNeedsNewAnchor reports whether inserting rightFence immediately
+// after route would exceed this anchor's encoded fence-byte capacity. It is
+// the anchor-local part of PlanLeafSplit; the complete public decision also
+// qualifies the prospective halves and tablet-root floor.
+func (v *GlobalTabletCatalogAnchorView) leafSplitNeedsNewAnchor(
+	route SegmentedTabletRouterRoute,
+	rightFence []byte,
+) (bool, error) {
+	if v == nil || len(v.page.image) == 0 ||
+		route.PageID != v.page.pageID ||
+		len(rightFence) == 0 || len(rightFence) > CommonPrimaryLeafMaxKeyBytes {
+		return false, fmt.Errorf(
+			"%w: localized leaf split geometry", ErrInvalidWrite,
+		)
+	}
+	currentRef, _, ok := v.page.handleAt(route.RowSlot, route.Bucket)
+	if !ok || currentRef != route.Ref {
+		return false, fmt.Errorf(
+			"%w: localized leaf split route", ErrInvalidWrite,
+		)
+	}
+	sourceRank := -1
+	for rank := 0; rank < int(v.page.count); rank++ {
+		if v.page.ranks[rank] == route.RowSlot {
+			sourceRank = rank
+			break
+		}
+	}
+	if sourceRank < 0 {
+		return false, fmt.Errorf(
+			"%w: localized leaf split rank", ErrInvalidWrite,
+		)
+	}
+	leftFloor := v.page.fenceAt(sourceRank)
+	if segmentedTabletRouterCompareFences(
+		leftFloor, segmentedTabletRouterFence{a: rightFence},
+	) >= 0 || sourceRank+1 < int(v.page.count) &&
+		segmentedTabletRouterCompareFences(
+			segmentedTabletRouterFence{a: rightFence},
+			v.page.fenceAt(sourceRank+1),
+		) >= 0 {
+		return false, fmt.Errorf(
+			"%w: localized leaf split fence", ErrInvalidWrite,
+		)
+	}
+
+	count := int(v.page.count) + 1
+	if count > SegmentedTabletRouterRowsPerPage {
+		return true, nil
+	}
+	insertRank := sourceRank + 1
+	err := validateSegmentedTabletAnchorFenceGeometryAt(
+		count,
+		func(rank int) segmentedTabletRouterFence {
+			if rank == insertRank {
+				return segmentedTabletRouterFence{a: rightFence}
+			}
+			if rank > insertRank {
+				rank--
+			}
+			return v.page.fenceAt(rank)
+		},
+	)
+	if errors.Is(err, ErrSegmentedTabletRouterNoSpace) {
+		return true, nil
+	}
+	return false, err
+}
+
+// PlanLeafSplit qualifies the complete localized representation: the selected
+// anchor after insertion, both halves when another anchor is needed, and the
+// additional root floor. A full root or any byte-geometry miss selects the
+// bounded whole-tablet rebuild path instead of failing after allocations begin.
+func (v *GlobalTabletCatalogTabletRootView) PlanLeafSplit(
+	anchor *GlobalTabletCatalogAnchorView,
+	route SegmentedTabletRouterRoute,
+	rightFence []byte,
+) (GlobalTabletCatalogLeafSplitPlan, error) {
+	var plan GlobalTabletCatalogLeafSplitPlan
+	if v == nil || anchor == nil || len(v.image) == 0 ||
+		anchor.tabletID != v.inner.tabletID || anchor.locator != v.locator {
+		return plan, fmt.Errorf(
+			"%w: localized leaf split owner", ErrInvalidWrite,
+		)
+	}
+	anchorRef, ok := v.inner.anchorRef(anchor.page.pageID)
+	if !ok || anchorRef != anchor.ref {
+		return plan, fmt.Errorf(
+			"%w: localized leaf split anchor", ErrInvalidWrite,
+		)
+	}
+	needsNewAnchor, err := anchor.leafSplitNeedsNewAnchor(route, rightFence)
+	if err != nil {
+		return plan, err
+	}
+	count := int(anchor.page.count) + 1
+	if !needsNewAnchor {
+		plan.splitRank = uint16(count)
+		return plan, nil
+	}
+	if v.inner.pageCount >= SegmentedTabletRouterMaxPages {
+		plan.tabletRebuild = true
+		return plan, nil
+	}
+
+	sourceRank := -1
+	for rank := 0; rank < int(anchor.page.count); rank++ {
+		if anchor.page.ranks[rank] == route.RowSlot {
+			sourceRank = rank
+			break
+		}
+	}
+	if sourceRank < 0 {
+		return plan, fmt.Errorf(
+			"%w: localized leaf split rank", ErrInvalidWrite,
+		)
+	}
+	insertRank := sourceRank + 1
+	fenceAt := func(rank int) segmentedTabletRouterFence {
+		if rank == insertRank {
+			return segmentedTabletRouterFence{a: rightFence}
+		}
+		if rank > insertRank {
+			rank--
+		}
+		return anchor.page.fenceAt(rank)
+	}
+	rootKeyBytes := int(binary.LittleEndian.Uint16(v.inner.root[32:34]))
+	rootKeyCapacity := segmentedTabletRouterRootTrailerAt -
+		segmentedTabletRouterRootKeysAt
+	qualifies := func(splitRank int) bool {
+		if splitRank <= 0 || splitRank >= count ||
+			rootKeyBytes+fenceAt(splitRank).length() > rootKeyCapacity {
+			return false
+		}
+		leftErr := validateSegmentedTabletAnchorFenceGeometryAt(
+			splitRank,
+			func(rank int) segmentedTabletRouterFence { return fenceAt(rank) },
+		)
+		if leftErr != nil {
+			return false
+		}
+		rightErr := validateSegmentedTabletAnchorFenceGeometryAt(
+			count-splitRank,
+			func(rank int) segmentedTabletRouterFence {
+				return fenceAt(splitRank + rank)
+			},
+		)
+		return rightErr == nil
+	}
+	middle := count / 2
+	for distance := 0; distance < count; distance++ {
+		left := middle - distance
+		if qualifies(left) {
+			plan.splitRank = uint16(left)
+			plan.newAnchor = true
+			return plan, nil
+		}
+		right := middle + distance
+		if distance != 0 && qualifies(right) {
+			plan.splitRank = uint16(right)
+			plan.newAnchor = true
+			return plan, nil
+		}
+	}
+	plan.tabletRebuild = true
+	return plan, nil
 }
 
 // RouteAt returns one leaf route in lexical rank order.

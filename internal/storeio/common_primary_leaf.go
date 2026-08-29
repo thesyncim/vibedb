@@ -21,7 +21,7 @@ import (
 const (
 	CommonPrimaryLeafNarrowBytes = 4 << 10
 	CommonPrimaryLeafWideBytes   = 8 << 10
-	// CommonPrimaryLeafMaxExtentBytes is the largest physical extent a class-5
+	// CommonPrimaryLeafMaxExtentBytes is the largest physical extent a common
 	// primary leaf or its owned raw mutation workspace may occupy.
 	CommonPrimaryLeafMaxExtentBytes = 64 << 10
 
@@ -76,9 +76,10 @@ var (
 	)
 )
 
-// CommonPrimaryLeafClass is the encoded class byte. The durable format persists
-// only CommonPrimaryLeafUnified; narrow and wide remain internal raw-envelope
-// geometries used by placement and structural mutation.
+// CommonPrimaryLeafClass is the encoded class byte. Production durable primary
+// leaves use CommonPrimaryLeafCompact. The other classes remain decodable
+// development or internal raw-envelope geometries used by placement and
+// structural mutation.
 type CommonPrimaryLeafClass uint8
 
 const (

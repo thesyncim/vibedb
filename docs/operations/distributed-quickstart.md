@@ -127,8 +127,8 @@ You need:
 - One private route-seed path per gateway. It must be a regular-file path that
   is distinct from the catalog bootstrap and every other gateway's route seed.
 - One private catalog session journal per gateway, retained across restarts.
-- One regular file that contains exactly 32 raw bytes for the durable ACK
-  derivation key.
+- One regular file that contains exactly 64 lowercase hexadecimal characters,
+  with no newline, for the durable ACK derivation key.
 
 The development commands can generate disposable test credentials, but there
 is no production certificate enrollment/rotation or general catalog
@@ -235,7 +235,7 @@ OID with an identity OID under an IANA Private Enterprise Number that you own.
 All file paths must be absolute and clean.
 
 ```vibejson
-{"root":"/srv/vibedb/member-1","distribution":"data","shard":"all","cluster_id":"a1000000000000000000000000000000","cluster_incarnation":"a2000000000000000000000000000000","topology_recovery_epoch":1,"allocation_generation":1,"shard_incarnation":"a3000000000000000000000000000000","group_id":"a4000000000000000000000000000000","member_id":1,"store_id":"b1000000000000000000000000000000","table":"docs","create_table":"CREATE TABLE docs (PRIMARY KEY (id))","authority":{"active_policy_generation":1,"protection_epoch":1,"ownership_epoch":1,"schema_generation":1,"routing_version":1,"route_generation":1},"wal":{"key_id":"cluster-wal-key","key_material_path":"/run/secrets/vibedb/wal-key-source","wrapped_key":"operator-key-reference","max_file_bytes":268435456,"max_record_bytes":83886080,"max_records":4096,"max_entries":16384,"max_live_bytes":134217728},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"shard_key":"/id"},"listeners":{"peer":"127.0.0.1:7411","native":"127.0.0.1:7511","snapshot":"127.0.0.1:7611","control":"127.0.0.1:7711"},"tls":{"certificate":"/run/secrets/vibedb/member-1-cert.pem","key":"/run/secrets/vibedb/member-1-key.pem","roots":"/run/secrets/vibedb/cluster-roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":"/srv/vibedb/authorization-policy.vibejson","split_control":{"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"11000000000000000000000000000000","actions":65535},{"node_id":"12000000000000000000000000000000","actions":65535},{"node_id":"13000000000000000000000000000000","actions":65535}],"max_child_operations":8,"stage_checkpoint_bytes":33554432},"members":[{"member_id":1,"node_id":"11000000000000000000000000000000","peer_address":"127.0.0.1:7411"},{"member_id":2,"node_id":"12000000000000000000000000000000","peer_address":"127.0.0.1:7412"},{"member_id":3,"node_id":"13000000000000000000000000000000","peer_address":"127.0.0.1:7413"}]}
+{"root":"/srv/vibedb/member-1","distribution":"data","shard":"all","cluster_id":"a1000000000000000000000000000000","cluster_incarnation":"a2000000000000000000000000000000","topology_recovery_epoch":1,"allocation_generation":1,"shard_incarnation":"a3000000000000000000000000000000","group_id":"a4000000000000000000000000000000","member_id":1,"store_id":"b1000000000000000000000000000000","table":"docs","create_table":"CREATE TABLE docs (PRIMARY KEY (id))","authority":{"active_policy_generation":1,"protection_epoch":1,"ownership_epoch":1,"schema_generation":1,"routing_version":1,"route_generation":1},"wal":{"key_id":"cluster-wal-key","key_material_path":"/run/secrets/vibedb/wal-key-source","wrapped_key":"operator-key-reference","max_file_bytes":268435456,"max_record_bytes":83886080,"max_records":4096,"max_entries":16384,"max_live_bytes":134217728},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"shard_key":"/id","request_ledger_capacity_bytes":0,"request_ledger_cleanup_reserve_bytes":0,"request_ledger_range_start":"","request_ledger_range_end":"","request_ledger_range_identity":""},"listeners":{"peer":"127.0.0.1:7411","native":"127.0.0.1:7511","snapshot":"127.0.0.1:7611","control":"127.0.0.1:7711"},"tls":{"certificate":"/run/secrets/vibedb/member-1-cert.pem","key":"/run/secrets/vibedb/member-1-key.pem","roots":"/run/secrets/vibedb/cluster-roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":"/srv/vibedb/authorization-policy.vibejson","split_control":{"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"11000000000000000000000000000000","actions":65535},{"node_id":"12000000000000000000000000000000","actions":65535},{"node_id":"13000000000000000000000000000000","actions":65535}],"max_child_operations":8,"stage_checkpoint_bytes":33554432},"members":[{"member_id":1,"node_id":"11000000000000000000000000000000","peer_address":"127.0.0.1:7411"},{"member_id":2,"node_id":"12000000000000000000000000000000","peer_address":"127.0.0.1:7412"},{"member_id":3,"node_id":"13000000000000000000000000000000","peer_address":"127.0.0.1:7413"}]}
 ```
 
 Create member-2 and member-3 inputs with the same cluster, shard, authority,
@@ -291,7 +291,7 @@ Each process validates all retained identities before it listens. A ready
 member logs its member ID, replica-set version, and peer, native, snapshot, and
 control listener addresses. Start the three catalog manifests and the three
 request-ledger manifests in the same way. Do not start the gateway until all
-nine members report ready. No RF3 plaintext mode exists.
+nine members report ready. `vibedb-shard serve-rf3` has no plaintext mode.
 
 ### 5. Validate and inspect the catalog bootstrap
 
@@ -364,8 +364,16 @@ route.
 
 ### 7. Check a linearizable read
 
-The gateway protocol is newline-delimited canonical `vibejson`. Use a client
-certificate whose node identity has `data_read` authority.
+The gateway protocol is newline-delimited JSON with canonical responses. The
+generic `query`, legacy `exec`, and `read_batch` request decoder accepts normal
+JSON whitespace and escaping, ignores unknown fields, and gives the last
+duplicate known field to semantic validation. Dedicated fixed-envelope paths—
+including `get`, `put`, `delete`, `issuer_open`, the top-level identity fields
+of `exec_batch`, `ack_exec_batch`, `backup`, and `backup_status`—instead require
+their documented operation-specific field order and shape. The nested
+`exec_batch` statements and parameters reuse the generic decoder semantics. Use
+a client certificate whose node identity has `data_read` authority for the read
+below.
 
 ```vibejson
 {"op":"get","table":"docs","key":"QGRvYy0xAAA","consistency":"linearizable"}

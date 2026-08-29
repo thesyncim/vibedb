@@ -96,6 +96,12 @@ Execution can select these access paths:
 The complete predicate is always checked after candidate selection. An index
 is an optimization, not a change to query semantics.
 
+Primary-key metadata is supplied by the source adapter rather than inferred by
+the typed query compiler. The local SQL driver recognizes safe point and range
+bounds at the predicate root or beneath top-level conjunctions; its exact rules
+and fallback behavior are documented in
+[SQL access paths](sql.md#access-paths-and-explain).
+
 Execution binds the ready indexes exposed by its source snapshot. A query
 compiled before index creation can use the index when it later runs against a
 snapshot that includes it.

@@ -7,6 +7,11 @@ toolchain, platform, data shape, and command.
 This documentation does not publish a current performance number. See
 `bench/competitive/RESULTS.md` for the publication record.
 
+The repository currently provides measurement machinery, not evidence that
+VibeDB is the fastest engine, has the lowest cost, or scales linearly. Those
+claims require a current immutable evidence bundle for the exact workload and
+topology being discussed.
+
 ## Run a focused Go benchmark
 
 ```bash
@@ -46,14 +51,15 @@ independent of shard row count and historical operation count. Release retains
 the epoch high-water, so reclaiming space does not trade away delayed-command
 fencing.
 
-The replicated SQL hidden collection's hard document limit is
-`RetryWindow + 2`, rather than a fixed maximum-window allocation for every
-shard. Normal transactions supply precise `BatchDocumentsHint` values, so the
-durable dedup map reserves only the actual one-to-three system changes on the
-hot path while retaining the ability to grow to the cold Release bound.
-Benchmark ordinary mutation separately from Open, retirement, and Release, and
-report retry windows 1, 8, and 256 so cold linear work is not blended into
-hot-path latency or allocation results.
+For session and control apply, the replicated SQL hidden collection admits at
+least `max(7, 3*RetryWindow+3)` distinct mutations. Request-ledger and
+distributed-transaction profiles can raise that frozen limit for their wider
+commands. Each normal transition computes its exact system-row count and passes
+that value as `BatchDocumentsHint`; authority, session, slot, route-gate, and
+transaction rows can make the hint larger than three. Benchmark ordinary
+mutation separately from Open, retirement, and Release, and report retry
+windows 1, 8, and 256 so cold linear work is not blended into hot-path latency
+or allocation results.
 
 The hot path advances a deterministic `DataChainDigest` from the prior chain
 and the exact row changes. This digest is history-sensitive. It is not a
@@ -134,6 +140,11 @@ The harness compares VibeDB with configured file-backed engines. It provides
 separate commands for mixed load, repeated isolated mixed suites, footprint,
 speed probes, and disk churn.
 
+The coverage matrix is a project-defined set of measurement cells. It is not a
+complete database-market or distributed-systems benchmark: node-count and
+shard-count scaling, weak scaling, repartitioning/rebalancing, hot-partition
+skew, and multi-group query execution are outside its current matrix.
+
 One engine runs in each measurement process when process RSS or Go heap data is
 part of the result. This prevents retained state from another engine from
 contaminating the measurement.
@@ -149,7 +160,10 @@ Record all of this metadata with a published result:
 - Storage device and durability lane
 - Corpus size, shape, cardinality, and seed
 - Index configuration and cache budget
+- Workload name and read/write mix
 - Client count, warmup, operation count, and checkpoint cadence
+- For distributed runs: process, node, replica, group, and shard counts plus
+  placement and network topology
 - Complete command line
 - Raw per-run rows
 - Repetition count and summary method
@@ -161,6 +175,35 @@ discarded conditioning pass.
 Report apparent bytes and allocated filesystem blocks separately. Report Go
 heap and process residency separately. VibeDB uses mapped and I/O memory outside
 the Go heap.
+
+### Validator boundary
+
+The dedicated-host script fixes more configuration than `cmd/publishcheck`
+currently verifies. For embedded mixed suites, the validator checks revision,
+dirty state, repetition count, durability, checkpoint cadence, document shape,
+exact-index count, diagnostic state, required engines, raw-run count, and a
+required summary-metric set. It does not independently pin workload, corpus
+size, measured operations, warmup, clients, cardinality, seed, conditioning, or
+storage profile. For RF3 latency artifacts, it checks revision, RF3 durability,
+replica count, workload, clients, required summaries, and selected counters; it
+does not independently pin operations, warmup, or seed.
+
+Consequently, `VALIDATED.tsv` proves that the expected artifact inventory
+passed the validator and records its digests. It does not by itself prove that
+every publication axis was equivalent, or that VibeDB won. Preserve the runner,
+complete commands, raw metadata, and artifacts with any result, and review the
+unvalidated axes explicitly.
+
+### Compression-profile boundary
+
+The competitive harness's `intrinsic` and `production` storage profiles control
+only optional compression exposed by an adapter. At the current pinned
+dependencies, they switch Badger and Pebble between uncompressed and Snappy SST
+blocks. They are an explicit no-op for VibeDB, bbolt, and SQLite. In particular,
+`intrinsic` does not disable VibeDB's built-in storage representation or its
+field/stream encodings; it must not be described as an uncompressed VibeDB
+format. The corpus `gzip -9` statistic is an entropy control over JSON document
+bytes only and excludes keys.
 
 ## Comparison rules
 
@@ -181,6 +224,12 @@ a time-based soak test.
 Injected crash sweeps test recovery cuts. They do not measure real power-loss
 frequency, storage-controller behavior, restart latency, or availability.
 
+The RF3 latency/counter matrix is a separate in-process harness. It measures
+point reads and writes against one RF3 group with three replicas through an
+in-process round tripper. It does not run the shipped gateway as an OS process,
+vary node or shard count, exercise rebalancing during load, or establish weak or
+near-linear horizontal scaling.
+
 The RF3 external fault runner executes the shipped three-process shard command,
 including process isolation, leader kill, deliberately unread response,
 byte-identical outcome recovery, replica restart, durable acknowledgement
@@ -191,7 +240,7 @@ evidence and treats a skipped test as a failed qualification:
 go run ./bench/rf3chaos \
   -output "$(pwd)/rf3-chaos.tsv" \
   -runs 9 \
-  -timeout 3m
+  -timeout 5m
 ```
 
 Its per-run elapsed value covers the complete harness. It is not a failover or

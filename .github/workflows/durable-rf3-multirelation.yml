@@ -113,7 +113,8 @@ jobs:
                 contains("persisted_transaction_recovery=true") and
                 contains("gateway_replacement=true") and
                 contains("leader_kill=true") and
-                contains("process_partition=true") and
+                contains("peer_network_partition=true") and
+                contains("isolated_process_live=true") and
                 contains("outcome_unknown_retry=true") and
                 contains("exact_terminal_replay=true") and
                 contains("exact_index_visibility=true") and

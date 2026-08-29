@@ -102,9 +102,10 @@ var currentProfile = Profile{
 // process-global compatibility state.
 func CurrentProfile() Profile { return currentProfile }
 
-// CurrentDiskIdentity is the exact identity persisted beside a durable apply
-// image. Required capabilities are stored with the grammar so a future build
-// cannot silently adopt a disk whose mandatory machinery it lacks.
+// CurrentDiskIdentity returns the exact identity for callers that persist or
+// validate a durable apply image. The common build gate supplies this contract,
+// but production durable-store startup does not currently wire it in
+// universally.
 func CurrentDiskIdentity() DiskIdentity {
 	return DiskIdentity{Grammar: currentProfile.DiskGrammar, Required: currentProfile.Required}
 }

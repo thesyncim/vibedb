@@ -58,6 +58,66 @@ func primaryPredicateIdentity(where *sqlast.Expr) (path string, candidate bool) 
 	return string(where.Path.AppendPointer(nil)), true
 }
 
+// compilePrimaryPointPredicate recognizes a primary-key point leaf at the root
+// or below only top-level AND nodes. Such a leaf is a sound source bound for the
+// complete conjunction: execution materializes its keys and the query engine
+// still evaluates the complete predicate over those documents. A point leaf
+// below OR or NOT cannot bound the whole predicate and is never visited.
+//
+// When a conjunction contains more than one usable primary-key bound, equality
+// is cheapest. Otherwise the shortest IN list minimizes point materialization.
+// The returned expression is parser-owned and follows where's lifetime.
+func compilePrimaryPointPredicate(
+	where *sqlast.Expr,
+	primaryPath string,
+) *sqlast.Expr {
+	if where == nil || primaryPath == "" {
+		return nil
+	}
+	var best *sqlast.Expr
+	bestRank := 2
+	bestKeys := int(^uint(0) >> 1)
+	collectPrimaryPointPredicate(
+		where, primaryPath, &best, &bestRank, &bestKeys,
+	)
+	return best
+}
+
+func collectPrimaryPointPredicate(
+	expr *sqlast.Expr,
+	primaryPath string,
+	best **sqlast.Expr,
+	bestRank *int,
+	bestKeys *int,
+) {
+	if expr == nil {
+		return
+	}
+	if expr.Kind == sqlast.ExprAnd {
+		for i := range expr.Kids {
+			collectPrimaryPointPredicate(
+				expr.Kids[i], primaryPath, best, bestRank, bestKeys,
+			)
+		}
+		return
+	}
+	if expr.RightPath != nil || expr.Agg != sqlast.AggNone {
+		return
+	}
+	path, candidate := primaryPredicateIdentity(expr)
+	if !candidate || path != primaryPath {
+		return
+	}
+	rank, keys := 0, 1
+	if expr.Kind == sqlast.ExprIn {
+		rank = 1
+		keys = len(expr.List)
+	}
+	if rank < *bestRank || rank == *bestRank && keys < *bestKeys {
+		*best, *bestRank, *bestKeys = expr, rank, keys
+	}
+}
+
 // bindPrimaryPredicateKeys binds a predicate already proven by
 // isPrimaryPredicate to be either primary-key equality or a positive IN list.
 func bindPrimaryPredicateKeys(

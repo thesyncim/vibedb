@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sort"
 	"sync/atomic"
 	"time"
 
@@ -238,7 +237,7 @@ func (c *Collection) extractLeafRecords(
 	return c.structuralRows
 }
 
-// fitStructuralLeaf places and encodes rows into the sole class-5 grammar and
+// fitStructuralLeaf places and encodes rows into the sole VCS1 grammar and
 // returns the planner-selected extent. Splits may assign fresh
 // stable slots because their exact-index contribution is rebuilt in the same
 // structural publication.
@@ -406,18 +405,12 @@ func (c *Collection) stageNewPrimaryTablet(
 			return storeio.PageRef{}, 0, err
 		}
 	}
-	locatorEntries := make([]storeio.GlobalTabletCatalogLocatorEntry, len(leaves))
-	for rank := range leaves {
-		locatorEntries[rank] = storeio.GlobalTabletCatalogLocatorEntry{
-			LocalID: leaves[rank].LocalID,
-			PageID:  uint8(rank / storeio.SegmentedTabletRouterRowsPerPage),
-			RowSlot: uint8(rank % storeio.SegmentedTabletRouterRowsPerPage),
-			State:   storeio.GlobalTabletCatalogLocatorLive,
-		}
+	locatorEntries, err := storeio.BuildGlobalTabletCatalogLocatorEntries(
+		rawLocator, leaves,
+	)
+	if err != nil {
+		return storeio.PageRef{}, 0, err
 	}
-	sort.Slice(locatorEntries, func(i, j int) bool {
-		return locatorEntries[i].LocalID < locatorEntries[j].LocalID
-	})
 	bounds := c.primaryMutationBounds(tx)
 	if _, err := storeio.EncodeGlobalTabletCatalogLocatorPage(
 		locatorPage.Bytes(), c.storeID, generation, tabletID,
@@ -463,6 +456,7 @@ type structuralLeafStager func(tx *storeio.WriteTransaction) (
 type primaryLocalizedLeafSplit struct {
 	remove       bool
 	macro        *primaryMacroTabletSplit
+	plan         storeio.GlobalTabletCatalogLeafSplitPlan
 	resident     storeio.ResidentPrimaryRoute
 	route        storeio.SegmentedTabletRouterRoute
 	leftRef      storeio.PageRef
@@ -848,7 +842,8 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	// Whole-tablet rebuilds remain the fallback for batch topology and removing
 	// the only row in an anchor. Localized edits rewrite exactly the selected
-	// anchor (plus one new anchor only for a split of a full anchor), locator,
+	// anchor (plus one new anchor only when the inserted fence exceeds its exact
+	// encoded-byte capacity), locator,
 	// and segmented root.
 	var oldAnchorRefs []storeio.PageRef
 	var rawRoot []byte
@@ -871,8 +866,14 @@ func (c *Collection) commitPrimaryStructural(
 			return allocErr
 		}
 		var rightAnchor storeio.TransactionPage
-		if !localized.remove &&
-			path.anchor.Count() == storeio.SegmentedTabletRouterRowsPerPage {
+		needsNewAnchor := false
+		if !localized.remove {
+			if localized.plan.RequiresTabletRebuild() {
+				return storeio.ErrSegmentedTabletRouterNoSpace
+			}
+			needsNewAnchor = localized.plan.NeedsNewAnchor()
+		}
+		if needsNewAnchor {
 			newPageID := uint8(path.tablet.AnchorCount())
 			rightLogical, rightOK := storeio.GlobalTabletCatalogAnchorLogicalID(
 				tabletID, newPageID,
@@ -1022,16 +1023,12 @@ func (c *Collection) commitPrimaryStructural(
 				return err
 			}
 		}
-		locatorEntries := make([]storeio.GlobalTabletCatalogLocatorEntry, len(finalLeaves))
-		for rank := range finalLeaves {
-			locatorEntries[rank] = storeio.GlobalTabletCatalogLocatorEntry{
-				LocalID: finalLeaves[rank].LocalID,
-				PageID:  uint8(rank / storeio.SegmentedTabletRouterRowsPerPage),
-				RowSlot: uint8(rank % storeio.SegmentedTabletRouterRowsPerPage),
-				State:   storeio.GlobalTabletCatalogLocatorLive,
-			}
+		locatorEntries, err := storeio.BuildGlobalTabletCatalogLocatorEntries(
+			rawLocator, finalLeaves,
+		)
+		if err != nil {
+			return err
 		}
-		sort.Slice(locatorEntries, func(i, j int) bool { return locatorEntries[i].LocalID < locatorEntries[j].LocalID })
 		bounds := c.primaryMutationBounds(tx)
 		if _, err := storeio.EncodeGlobalTabletCatalogLocatorPage(
 			locatorPage.Bytes(), c.storeID, generation, tabletID,
@@ -1296,7 +1293,7 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 	}
 	tabletID := path.tablet.TabletID()
 	generation := state.root.Generation + 1
-	return c.commitPrimaryStructural(
+	commitErr := c.commitPrimaryStructural(
 		state, &path, structuralSplit,
 		func(tx *storeio.WriteTransaction) (
 			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
@@ -1339,6 +1336,12 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 			if fenceErr != nil {
 				return nil, nil, nil, fenceErr
 			}
+			splitPlan, geometryErr := path.tablet.PlanLeafSplit(
+				&path.anchor, path.leafRoute, rightFence,
+			)
+			if geometryErr != nil {
+				return nil, nil, nil, geometryErr
+			}
 			leftRef, encErr := c.encodeStructuralLeaf(
 				tx, generation, route.Bucket, rows[:median],
 			)
@@ -1351,12 +1354,11 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 			if encErr != nil {
 				return nil, nil, nil, encErr
 			}
-			// A full selected anchor normally spills one row into a fresh anchor.
-			// When all 16 stable anchor IDs already exist (including the now-partial
-			// trailing anchor left by a macro spill), rebuild only this tablet's
-			// bounded routing set so dense rank packing consumes that available slot.
-			if path.anchor.Count() == storeio.SegmentedTabletRouterRowsPerPage &&
-				path.tablet.AnchorCount() == storeio.SegmentedTabletRouterMaxPages {
+			// A byte-full selected anchor normally spills into a fresh anchor. When
+			// all 16 stable IDs already exist, or the two prospective halves and new
+			// root floor cannot remain localized, rebuild this tablet's bounded
+			// routing set so exact byte packing can choose every boundary together.
+			if splitPlan.RequiresTabletRebuild() {
 				final := make(
 					[]storeio.SegmentedTabletRouterLeaf, 0, len(current)+1,
 				)
@@ -1384,6 +1386,7 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 			// captured above. The parent edit is localized after this callback.
 			return nil, []storeio.PageRef{current[sourceIndex].ref},
 				&primaryLocalizedLeafSplit{
+					plan:     splitPlan,
 					resident: route, route: path.leafRoute,
 					leftRef: leftRef, rightRef: rightRef,
 					rightBucket: rightBucket, rightLocalID: rightLocalID,
@@ -1391,6 +1394,13 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 				}, nil
 		},
 	)
+	if errors.Is(commitErr, storeio.ErrSegmentedTabletRouterNoSpace) {
+		// Exact whole-tablet packing can still exhaust all sixteen byte-packed
+		// anchors while LocalIDs remain. Spill bounded trailing metadata into a
+		// sibling, then let the caller retry the original leaf mutation.
+		return c.structuralSplitPrimaryMacroTablet(state, &path, current)
+	}
+	return commitErr
 }
 
 // structuralSplitPrimaryMacroTablet creates one small right sibling and moves
@@ -1700,7 +1710,7 @@ func (c *Collection) deletePrimaryWithEmptyReclaim(
 	if err != nil || !deleted {
 		return deleted, err
 	}
-	// Class-5 Delete marks the resident route before returning when its pending
+	// VCS1 Delete marks the resident route before returning when its pending
 	// row count reaches zero. Healthy fixed-live-set churn therefore avoids a
 	// second writer-lock acquisition, route lookup, and leaf admission entirely;
 	// only eager empty-leaf removal pays post-delete structural hygiene.

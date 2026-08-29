@@ -1246,32 +1246,35 @@ func newGlobalTabletCatalogRemoveFixture(
 	t.Helper()
 	header, leaves, anchorRefs := segmentedTabletRouterTestInputs(t, leafCount)
 	header.StoreID = globalTabletCatalogTestStoreID
+	return newGlobalTabletCatalogFixture(t, header, leaves, anchorRefs)
+}
+
+func newGlobalTabletCatalogFixture(
+	t testing.TB,
+	header SegmentedTabletRouterHeader,
+	leaves []SegmentedTabletRouterLeaf,
+	anchorRefs []PageRef,
+) globalTabletCatalogRemoveFixture {
+	t.Helper()
 	bounds := globalTabletCatalogTestBounds
 	bounds.SelectedRootGeneration = header.Generation
+	_, pageCount, err := PlanSegmentedTabletRouterAnchors(leaves)
+	if err != nil || len(anchorRefs) < pageCount {
+		t.Fatalf("fixture anchor plan pages=%d refs=%d err=%v", pageCount, len(anchorRefs), err)
+	}
+	anchorRefs = anchorRefs[:pageCount]
 	root, rawLocator, anchors, _, err := EncodeSegmentedTabletRouter(
 		make([]byte, SegmentedTabletRouterRootBytes),
 		make([]byte, SegmentedTabletRouterLocatorBytes),
-		make([]byte, len(anchorRefs)*SegmentedTabletRouterAnchorPageBytes),
+		make([]byte, pageCount*SegmentedTabletRouterAnchorPageBytes),
 		header, anchorRefs, leaves,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entriesByID := make([]GlobalTabletCatalogLocatorEntry, TabletLocalIdentityLocalCount)
-	live := make([]bool, TabletLocalIdentityLocalCount)
-	for _, leaf := range leaves {
-		code := binary.LittleEndian.Uint16(rawLocator[int(leaf.LocalID)*2:])
-		entriesByID[leaf.LocalID] = GlobalTabletCatalogLocatorEntry{
-			LocalID: leaf.LocalID, PageID: uint8(code >> 8),
-			RowSlot: uint8(code), State: GlobalTabletCatalogLocatorLive,
-		}
-		live[leaf.LocalID] = true
-	}
-	entries := make([]GlobalTabletCatalogLocatorEntry, 0, len(leaves))
-	for localID := range TabletLocalIdentityLocalCount {
-		if live[localID] {
-			entries = append(entries, entriesByID[localID])
-		}
+	entries, err := BuildGlobalTabletCatalogLocatorEntries(rawLocator, leaves)
+	if err != nil {
+		t.Fatal(err)
 	}
 	locatorLogical, _ := GlobalTabletCatalogLocatorLogicalID(header.TabletID)
 	locatorRef := globalTabletCatalogTestRef(
@@ -1317,6 +1320,220 @@ func newGlobalTabletCatalogRemoveFixture(
 		header: header, leaves: leaves, anchorRefs: anchorRefs,
 		anchors: anchors, bounds: bounds, locatorRef: locatorRef,
 		tabletRef: tabletRef, locator: locator, tablet: tablet,
+	}
+}
+
+func globalTabletCatalogBytePackedFence(code uint16, width int) []byte {
+	fence := make([]byte, width)
+	binary.BigEndian.PutUint16(fence, code)
+	for at := 2; at < len(fence); at++ {
+		fence[at] = byte(uint32(code)*131 + uint32(at)*197)
+	}
+	return fence
+}
+
+func TestGlobalTabletCatalogLeafSplitUsesExactOffCenterBytePlan(t *testing.T) {
+	const leafCount = 30
+	header, leaves, anchorRefs := segmentedTabletRouterTestInputs(t, leafCount)
+	header.StoreID = globalTabletCatalogTestStoreID
+	for rank := 1; rank <= 20; rank++ {
+		leaves[rank].Fence = globalTabletCatalogBytePackedFence(uint16(rank*2), 2)
+	}
+	for rank := 21; rank < len(leaves); rank++ {
+		leaves[rank].Fence = globalTabletCatalogBytePackedFence(uint16(rank*2), 224)
+	}
+	fixture := newGlobalTabletCatalogFixture(t, header, leaves, anchorRefs)
+	if fixture.tablet.AnchorCount() != 1 {
+		t.Fatalf("initial anchors=%d want=1", fixture.tablet.AnchorCount())
+	}
+	anchor, err := OpenGlobalTabletCatalogAnchor(
+		fixture.anchors[:SegmentedTabletRouterAnchorPageBytes],
+		&fixture.tablet, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anchor.Count() != leafCount || anchor.Count() >= SegmentedTabletRouterRowsPerPage {
+		t.Fatalf("byte-full source rows=%d", anchor.Count())
+	}
+	const sourceRank = 24
+	route, ok := anchor.RouteHashed(
+		KeyHashBytes(segmentedTabletRouterTestSeed, leaves[sourceRank].Fence),
+		leaves[sourceRank].Fence,
+	)
+	if !ok || route.Ref != leaves[sourceRank].Ref {
+		t.Fatalf("source route=%+v ok=%v", route, ok)
+	}
+	rightFence := globalTabletCatalogBytePackedFence(sourceRank*2+1, 224)
+	plan, err := fixture.tablet.PlanLeafSplit(&anchor, route, rightFence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospectiveCount := anchor.Count() + 1
+	if !plan.NeedsNewAnchor() || plan.RequiresTabletRebuild() ||
+		int(plan.splitRank) == prospectiveCount/2 {
+		t.Fatalf("off-center byte plan=%+v count=%d", plan, prospectiveCount)
+	}
+
+	used := make([]bool, TabletLocalIdentityLocalCount)
+	for _, leaf := range leaves {
+		used[leaf.LocalID] = true
+	}
+	rightLocalID := uint16(0)
+	for used[rightLocalID] {
+		rightLocalID++
+	}
+	rightBucketU, _ := MakeTabletLocalIdentityBucket(header.TabletID, uint32(rightLocalID))
+	nextGeneration := header.Generation + 1
+	leftRef := route.Ref
+	leftRef.Offset = 20 << 20
+	leftRef.Generation = nextGeneration
+	rightLogical, _ := CommonPrimaryLeafLogicalID(BucketID(rightBucketU))
+	rightRef := globalTabletCatalogTestRef(
+		21<<20, rightLogical, nextGeneration, route.Ref.Length, route.Ref.Kind,
+	)
+	leftAnchorLogical, _ := GlobalTabletCatalogAnchorLogicalID(header.TabletID, 0)
+	rightAnchorLogical, _ := GlobalTabletCatalogAnchorLogicalID(header.TabletID, 1)
+	leftAnchorRef := globalTabletCatalogTestRef(
+		22<<20, leftAnchorLogical, nextGeneration,
+		SegmentedTabletRouterAnchorPageBytes, PagePrimaryAnchor,
+	)
+	rightAnchorRef := globalTabletCatalogTestRef(
+		23<<20, rightAnchorLogical, nextGeneration,
+		SegmentedTabletRouterAnchorPageBytes, PagePrimaryAnchor,
+	)
+	result, err := fixture.tablet.InsertSplitLeaf(
+		make([]byte, SegmentedTabletRouterRootBytes),
+		make([]byte, GlobalTabletCatalogLocatorBytes),
+		make([]byte, SegmentedTabletRouterAnchorPageBytes),
+		make([]byte, SegmentedTabletRouterAnchorPageBytes),
+		nextGeneration, route, leftRef, rightLocalID, rightFence, rightRef,
+		leftAnchorRef, rightAnchorRef, &fixture.locator, &anchor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := SegmentedTabletRouterRootBytes +
+		GlobalTabletCatalogLocatorBytes + 2*SegmentedTabletRouterAnchorPageBytes
+	if result.PageCount != 2 || len(result.RightPage) == 0 || result.Bytes != wantBytes {
+		t.Fatalf("localized byte split=%+v", result)
+	}
+	nextBounds := fixture.bounds
+	nextBounds.SelectedRootGeneration = nextGeneration
+	nextLocatorRef := fixture.locatorRef
+	nextLocatorRef.Offset = 24 << 20
+	nextLocatorRef.Generation = nextGeneration
+	nextLocator, err := OpenGlobalTabletCatalogLocator(
+		result.Locator, nextLocatorRef, nextBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageID, rowSlot, state := nextLocator.Resolve(rightLocalID)
+	if pageID != result.RightPageID || int(rowSlot) != sourceRank+1-int(plan.splitRank) ||
+		state != GlobalTabletCatalogLocatorLive {
+		t.Fatalf("inserted locator=%d/%d/%d plan=%+v", pageID, rowSlot, state, plan)
+	}
+	tabletLogical, _ := GlobalTabletCatalogTabletRootLogicalID(header.TabletID)
+	nextTabletRef := fixture.tabletRef
+	nextTabletRef.Offset = 25 << 20
+	nextTabletRef.Generation = nextGeneration
+	nextTabletImage, err := EncodeGlobalTabletCatalogTabletRoot(
+		make([]byte, GlobalTabletCatalogTabletBytes),
+		PageHeader{
+			StoreID: header.StoreID, Generation: nextGeneration,
+			LogicalID: tabletLogical, PageSize: GlobalTabletCatalogTabletBytes,
+			PayloadLength: GlobalTabletCatalogRootHeader + SegmentedTabletRouterRootBytes,
+			Kind:          PageTabletRoute,
+		},
+		nextBounds, nextLocatorRef, result.Root,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextTablet, err := OpenGlobalTabletCatalogTabletRoot(
+		nextTabletImage, nextTabletRef, nextBounds,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenGlobalTabletCatalogAnchor(
+		result.LeftPage, &nextTablet, result.LeftPageID,
+	); err != nil {
+		t.Fatalf("open left split anchor: %v", err)
+	}
+	rightAnchor, err := OpenGlobalTabletCatalogAnchor(
+		result.RightPage, &nextTablet, result.RightPageID,
+	)
+	if err != nil {
+		t.Fatalf("open right split anchor: %v", err)
+	}
+	rightRoute, ok := rightAnchor.RouteHashed(
+		KeyHashBytes(segmentedTabletRouterTestSeed, rightFence), rightFence,
+	)
+	if !ok || rightRoute.Ref != rightRef || rightRoute.Bucket != BucketID(rightBucketU) {
+		t.Fatalf("inserted right route=%+v ok=%v", rightRoute, ok)
+	}
+}
+
+func TestGlobalTabletCatalogLeafSplitPlansSixteenPageRebuildByBytes(t *testing.T) {
+	const leafCount = 137
+	header, leaves, _ := segmentedTabletRouterTestInputs(t, leafCount)
+	header.StoreID = globalTabletCatalogTestStoreID
+	for rank := 1; rank < len(leaves); rank++ {
+		leaves[rank].Fence = globalTabletCatalogBytePackedFence(uint16(rank*2), 224)
+	}
+	_, _, anchorRefs := segmentedTabletRouterTestInputs(
+		t, SegmentedTabletRouterMaxPages*SegmentedTabletRouterRowsPerPage,
+	)
+	fixture := newGlobalTabletCatalogFixture(t, header, leaves, anchorRefs)
+	if fixture.tablet.AnchorCount() != SegmentedTabletRouterMaxPages {
+		t.Fatalf("anchors=%d want=%d", fixture.tablet.AnchorCount(), SegmentedTabletRouterMaxPages)
+	}
+	anchor, err := OpenGlobalTabletCatalogAnchor(
+		fixture.anchors[:SegmentedTabletRouterAnchorPageBytes],
+		&fixture.tablet, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anchor.Count() != 10 || anchor.Count() >= SegmentedTabletRouterRowsPerPage {
+		t.Fatalf("first byte-full anchor rows=%d want=10", anchor.Count())
+	}
+	const sourceRank = 9
+	route, ok := anchor.RouteHashed(
+		KeyHashBytes(segmentedTabletRouterTestSeed, leaves[sourceRank].Fence),
+		leaves[sourceRank].Fence,
+	)
+	if !ok {
+		t.Fatal("source route")
+	}
+	rightFence := globalTabletCatalogBytePackedFence(sourceRank*2+1, 224)
+	plan, err := fixture.tablet.PlanLeafSplit(&anchor, route, rightFence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.RequiresTabletRebuild() || plan.NeedsNewAnchor() {
+		t.Fatalf("sixteen-page byte plan=%+v", plan)
+	}
+
+	used := make([]bool, TabletLocalIdentityLocalCount)
+	for _, leaf := range leaves {
+		used[leaf.LocalID] = true
+	}
+	rightLocalID := uint16(0)
+	for used[rightLocalID] {
+		rightLocalID++
+	}
+	final := make([]SegmentedTabletRouterLeaf, 0, len(leaves)+1)
+	final = append(final, leaves[:sourceRank+1]...)
+	final = append(final, SegmentedTabletRouterLeaf{
+		LocalID: rightLocalID, Fence: rightFence,
+	})
+	final = append(final, leaves[sourceRank+1:]...)
+	_, pageCount, err := PlanSegmentedTabletRouterAnchors(final)
+	if err != nil || pageCount != SegmentedTabletRouterMaxPages {
+		t.Fatalf("whole-tablet byte repack pages=%d err=%v", pageCount, err)
 	}
 }
 

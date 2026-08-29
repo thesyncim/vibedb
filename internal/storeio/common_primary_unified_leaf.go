@@ -51,8 +51,9 @@ const (
 	// dispatch on the class byte; unlike classes 3/4 its posting-stable slot is
 	// the envelope's stable cuckoo hash slot (one-slot discipline).
 	CommonPrimaryLeafUnified CommonPrimaryLeafClass = 5
-	// CommonPrimaryLeafCompact is the development compact-stripe format. It
-	// replaces class 5 as the only durable primary leaf grammar.
+	// CommonPrimaryLeafCompact is the production compact-stripe format. It
+	// replaces class 5 as the only durable primary-leaf grammar emitted by the
+	// current writer.
 	CommonPrimaryLeafCompact CommonPrimaryLeafClass = 6
 
 	// commonPrimaryUnifiedHeaderBytes frames the two unified sections. The

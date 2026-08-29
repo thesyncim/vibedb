@@ -637,7 +637,7 @@ func (c *Collection) putPrimary(
 		len(src) > c.options.MaxDocumentBytes {
 		return false, ErrDocumentTooLarge
 	}
-	// A schemaless primary Put needs the structural index for canonical class-5
+	// A schemaless primary Put needs the structural index for canonical VCS1
 	// bytes anyway. Build it once here: BuildIndex validates the document, and
 	// the canonical result then flows unchanged through overlay/COW, exact-index
 	// maintenance, and recovery-journal admission. Schema collections retain
@@ -778,7 +778,7 @@ retryAfterUnifiedFold:
 		}
 		// Overlay publication owns no page-cache dirty frame, pending-parent slot,
 		// or volatile retirement, so it does not need the structural lane's
-		// capacity reservation. Pay that reservation only after the class-5 fast
+		// capacity reservation. Pay that reservation only after the VCS1 fast
 		// path declines; the retry rebinds the route if the ensure checkpointed.
 		if !canonicalCapacityEnsured {
 			leafLease.Release()
@@ -790,7 +790,7 @@ retryAfterUnifiedFold:
 			canonicalCapacityEnsured = true
 			goto retryAfterUnifiedFold
 		}
-		// Every class-5 mutation has one byte contract. The inline overlay already
+		// Every VCS1 mutation has one byte contract. The inline overlay already
 		// canonicalized its accepted value; values that reach this exceptional COW
 		// path must do the same before exact-index deltas, journal records, and
 		// leaf/overflow images observe them.
@@ -1347,7 +1347,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		}
 		// leaf is already the writer-owned raw mutation workspace. Rebind its
 		// overflow-validation bounds directly; the durable input and output on
-		// either side of this bridge remain class 5.
+		// either side of this bridge remain compact VCS1.
 		releaf := storeio.AdmittedCommonPrimaryLeaf(
 			leaf.PersistentBytes(), c.storeID, resident.Bucket, leafBounds,
 		)
@@ -1936,7 +1936,7 @@ func (c *Collection) materializePrimaryParentsLocked(
 	// and long repacks can exhaust those entries before an application Flush.
 	// The failed materialization has published nothing and its transaction has
 	// already unwound here, so drain the previously published cuts and retry the
-	// unchanged class-5 overlay against the newly durable base. The internal
+	// unchanged VCS1 overlay against the newly durable base. The internal
 	// sentinel is bounded backpressure, not a user-visible mutation failure.
 	if err := c.flushBufferedPublishedLocked(); err != nil {
 		return err
@@ -1945,7 +1945,7 @@ func (c *Collection) materializePrimaryParentsLocked(
 	return c.materializePrimaryParentsOnceLocked()
 }
 
-// materializePrimaryOverlayPressureLocked drains a full/non-admissible class-5
+// materializePrimaryOverlayPressureLocked drains a full/non-admissible VCS1
 // overlay without accidentally discarding a volatile generation interval. The
 // ordinary buffered delta lane first carries a complete suffix into the journal
 // without syncing; only then may a device-silent fold recycle the overlay. If
@@ -2120,7 +2120,7 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		}
 	})
 
-	// Native class-5 work is CPU-only until a sealed image exists. Run that
+	// Native compact VCS1 work is CPU-only until a sealed image exists. Run that
 	// qualification and encoding in small foreground waves, then consume every
 	// result in the same lexical order as before. AllocateNear, Stage, retirement,
 	// parent rewrites, and publication therefore remain strictly serial.
@@ -3005,8 +3005,8 @@ func (c *Collection) primaryVolatileReservationEnd(fileEnd uint64) (uint64, erro
 }
 
 // preparePrimaryLeafMutation applies the exceptional copy-on-write mutation
-// path and re-encodes the complete row set into the sole class-5 grammar. The
-// ordinary class-5 path publishes into the resident overlay; this rewrite is
+// path and re-encodes the complete row set into the sole VCS1 grammar. The
+// ordinary VCS1 path publishes into the resident overlay; this rewrite is
 // reserved for an empty leaf, overlay pressure, overflow values, and batch
 // folding. Re-placement is allowed here because indexed callers rebuild the
 // affected bucket's posting contribution in the same publication.

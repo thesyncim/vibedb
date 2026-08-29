@@ -1,33 +1,58 @@
 # VibeDB
 
-VibeDB is an embedded JSON database for Go. The root package provides a small
-owned-lifecycle API. The repository also includes a typed query engine, a SQL
-runtime, a `database/sql` driver, and a PostgreSQL wire server.
+VibeDB is a durable embedded JSON database for Go with explicit operation,
+cache, and concurrency limits. The root package provides named collections,
+exact indexes, typed queries, and serializable transactions through a small
+owned-lifecycle API. The default profile makes a mutation power-safe before it
+becomes visible. Buffered and in-memory profiles are explicit alternatives with
+different acknowledgement contracts.
 
-The durable engine uses bounded memory and a fixed 4 KiB base-page format. The
-zero-value product profile makes a mutation durable before it becomes visible.
-You can select buffered or in-memory operation when your application needs a
-different acknowledgement contract.
+The repository also contains a SQL runtime, a `database/sql` driver, and an
+experimental PostgreSQL wire-protocol endpoint. They use VibeDB's documented
+SQL subset. Wire compatibility does not imply PostgreSQL SQL compatibility.
 
-> **Development status:** APIs, command contracts, and storage grammars can
-> change between tested commits. The distributed runtime is experimental and
-> authenticated by default. An explicit development mode permits plaintext
-> only on loopback listeners.
+> **Development status:** This repository has no tagged release or published
+> support window. It also has no published project license. Files named
+> `LICENSE-*` contain third-party notices only. APIs, command contracts, and
+> storage grammars can change between tested commits. The PostgreSQL wire
+> endpoint and all distributed commands are experimental and unreleased.
 
-The gateway exposes three separate distributed paths: general SQL through
-static shard services, replicated exact-key reads, and strict exact-key
-`exec_batch` mutations over one or more prepared RF3 groups. It also composes
-replicated catalog, request-ledger, replica-move, automatic hot-range split,
-live-backup, and fresh-identity restore control paths. The
-read lane supports all-or-nothing multi-table batches with one `ReadIndex` cut
-per group. The mutation lane supports single- and multi-row whole-document
-insert, exact-primary-key whole-document update, and exact-primary-key delete
-including finite `IN` key sets, with atomic same-group multi-relation batches
-and independently placed global-index maintenance.
+## Current scope
 
-These distributed commands are unreleased. The generated feature-state matrix
-distinguishes a present primitive from command integration and from mandatory
-external qualification. It does not turn unexecuted CI gates into evidence.
+The credible product boundary today is the embedded engine. Its durable store
+uses a fixed 4 KiB base-page format and a configurable page-cache and mutable
+row-overlay budget. Indexed open also constructs a data-dependent resident
+exact-index epoch outside that budget, so the current engine does not claim a
+fixed total-memory ceiling. The `Durable` and `Memory` profiles support
+multi-collection transactions. The `Buffered` facade deliberately refuses a
+commit that dirties more than one collection.
+
+The experimental distributed runtime is mode-dependent. Explicit
+`-dev-static-catalog` mode routes supported SQL to static shard services.
+Replicated-catalog mode routes the documented bounded `SELECT` plan subset to
+RF3 leaders with `ReadIndex`. It also provides canonical point reads,
+exact-primary-key read batches, and durable sequenced write batches for the
+supported canonical mutation shapes, including complete-document and unique
+top-level named-column INSERT rows. RF3 has catalog, request-ledger,
+transaction, split, replica-move, backup, and restore primitives. It is not a
+general distributed SQL or arbitrary cross-shard PostgreSQL transaction layer.
+Network-serving commands require mutual TLS and an authorization policy by
+default. `vibedb-gateway serve` and the static `vibedb-shard serve` command
+permit explicit unauthenticated loopback development serving. The gateway flag
+also applies with a replicated catalog and selects raw replicated-shard dialing;
+`vibedb-shard serve-rf3` itself has no plaintext mode.
+
+This source tree does not currently provide an AI control plane, an
+object-storage durability layer, or evidence of near-linear horizontal
+scaling. The competitive harness currently publishes no results, so this
+documentation makes no "fastest" or infrastructure-cost claim. See the
+[competitive benchmark policy](bench/competitive/README.md) and the current
+[no-results status](bench/competitive/RESULTS.md).
+
+The generated [distributed feature-state matrix](docs/distributed-feature-state.md)
+distinguishes a present primitive from command integration and mandatory
+external qualification. It does not turn an unexecuted or failing gate into
+evidence.
 
 ## Requirements
 
@@ -40,10 +65,11 @@ direct I/O through the advanced storage API.
 ## Install
 
 ```bash
-go get github.com/thesyncim/vibedb@2ebcdff1047d
+go get github.com/thesyncim/vibedb@main
 ```
 
-Replace the commit with the revision that your application has tested.
+There is no released version to select. Record the pseudo-version resolved into
+`go.mod`, then test and pin that exact revision before deployment.
 
 ## Native API
 
@@ -88,10 +114,10 @@ each collection when the first mutation needs that collection.
 
 | Interface | Package | Use case |
 | --- | --- | --- |
-| Native facade | `github.com/thesyncim/vibedb` | Embedded JSON CRUD and multi-collection transactions |
+| Native facade | `github.com/thesyncim/vibedb` | Embedded JSON CRUD, exact indexes, typed queries, and transactions |
 | Typed queries | `github.com/thesyncim/vibedb/query` | Programmatic query construction and reusable execution buffers |
 | SQL | `github.com/thesyncim/vibedb/sql/driver` | Go applications that use `database/sql` |
-| PostgreSQL wire | `github.com/thesyncim/vibedb/pgwire` | PostgreSQL clients over a configured TCP listener |
+| PostgreSQL wire | `github.com/thesyncim/vibedb/pgwire` | PostgreSQL protocol clients using the documented VibeDB SQL subset |
 | Storage control | `github.com/thesyncim/vibedb/store/durable` | Explicit geometry, I/O mode, durability lane, and verification control |
 
 ## Documentation

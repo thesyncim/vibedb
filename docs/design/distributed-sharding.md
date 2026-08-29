@@ -1,9 +1,11 @@
 # Distributed sharding
 
-The shipped gateway retains a static SQL compatibility path and also serves
-RF3 exact-key reads, durable transactions, replica movement, and automatic
-pressure-driven range splits. Static ownership does not start Raft. The RF3
-path uses replicated catalog and shard authority.
+The shipped gateway selects its SQL transport from catalog mode. An explicit
+development/static catalog uses the static SQL compatibility path. A
+replicated catalog sends supported general `SELECT` plans, exact-key reads, and
+durable transactions through RF3, and also enables replica movement and
+automatic pressure-driven range splits. Static ownership does not start Raft;
+the RF3 path uses replicated catalog and shard authority.
 
 ## Components
 
@@ -11,8 +13,9 @@ path uses replicated catalog and shard authority.
   endpoints.
 - `vibedb-gateway` pins one catalog generation, plans a route, and merges
   results.
-- `vibedb-shard` serves one local SQL catalog with one static ownership
-  identity.
+- `vibedb-shard serve` exposes one local SQL catalog with one static ownership
+  identity. `serve-rf3` opens one to 64 prepared local group bundles and exposes
+  each bundle's SQL relation image through replicated query and apply services.
 
 ## Ownership identity
 
@@ -30,12 +33,19 @@ A manifest covers the complete 64-bit keyspace with ordered adjacent half-open
 ranges. A shard has a unique nonzero allocation generation and at least one
 leader endpoint.
 
-The router selects the first leader only. It does not balance or fail over
-between endpoint entries.
+The static router selects the first listed leader endpoint only; those entries
+do not provide static load balancing or failover. In replicated-catalog mode,
+the RF3 SQL transport resolves the pinned physical target to its exact group,
+discovers the current leader, and executes the read after `ReadIndex`.
 
 A targeted route uses a bounded leading placement prefix. A shorter prefix can
 map to the complete keyspace. Admission policy decides whether scatter is
 permitted.
+
+Static/direct writes must resolve to one owner. The durable RF3 `exec_batch`
+lowerer instead routes each complete-document or canonical top-level
+named-column INSERT row independently, so one multi-row VALUES statement may
+span RF3 groups without partial static dispatch.
 
 ## Online range splits
 
@@ -243,6 +253,7 @@ shipped-command boundary.
 
 - `distribution/manifest.go`, `placement.go`, and `router.go`
 - `gateway/catalog.go` and `executor.go`
+- `gateway/replicated_query.go` and `replicated_query_test.go`
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`

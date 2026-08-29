@@ -5,9 +5,19 @@ machine. VibeDB owns persistence, scheduling, identity checks, transport frame
 validation, SQL apply, and resource admission around that dependency.
 
 Internal packages compose this code into the RF3 serving path.
-`vibedb-shard serve-rf3` constructs that composition for one externally
-prepared stable three-voter group. General SQL remains on the static shard
-path; canonical `get` and supported exact-key `exec_batch` requests use RF3.
+`vibedb-shard serve-rf3` constructs that composition for one to 64 externally
+prepared local group members in one process. Each configured RF3 group begins
+as a stable three-voter group. The experimental replica-lifecycle path can
+install a certified learner or replacement. Explicit static-catalog mode uses
+the static shard SQL path. A replicated-catalog gateway uses RF3 for supported
+SELECT plans, canonical `get`, exact-key `read_batch`, and supported exact-key
+`exec_batch` requests. Direct SQL `exec` against an RF3 table is refused.
+The RF3 SELECT transport retains bounded targeted/scatter planning, projection,
+global order/limit, and mergeable aggregate execution. It refuses global-index
+read and repartition-exchange plans. Groups take independent cuts rather than
+one global MVCC snapshot, and the public general-query response exposes no
+observation vector. Durable RF3 lowering also accepts canonical top-level
+named-column multi-row INSERTs and can route their rows across groups.
 
 ## Configuration controls
 
@@ -49,16 +59,23 @@ mutual TLS. It derives the exact binary node ID and cluster trust domain from a
 critical private certificate extension. The caller still owns address
 discovery, raw socket creation, listener bounds, and certificate operations.
 
-The transport rejects snapshot messages, recursive response graphs,
-configuration entries, unknown protobuf fields, and oversized inputs. These
-checks limit parser and graph amplification before allocation.
+The transport rejects snapshot messages, recursive response graphs, unknown
+protobuf fields, oversized inputs, and unauthorized configuration entries. It
+accepts at most one canonical configuration entry in an append, and only when
+its add-learner, promote, or remove transition matches the exact retained
+membership grant and authority view. These checks limit parser and graph
+amplification before allocation.
 
-The repository does not provide these product components:
+The experimental command layer now provides initial RF3 artifact preparation,
+separately budgeted cold-learner snapshot installation, and a journaled replica
+replacement controller around this core. It does not provide these product
+components:
 
-- RF3 artifact preparation or dynamic peer/address discovery
+- Dynamic peer/address discovery
 - Certificate enrollment, rotation, or revocation operations
-- Online empty-learner snapshot installation and activation
-- A membership or snapshot lifecycle controller around the fixed shard server
+- A released general membership, leader-transfer, or topology-administration
+  CLI
+- A production-supported distributed compatibility or upgrade contract
 
 ## Multi-Raft scheduler
 
@@ -85,6 +102,10 @@ group, and 1 GiB of global queue and outbox bytes.
 - `internal/raftmodel/config.go`
 - `internal/raftmember/runtime.go`
 - `internal/multiraft/host.go`
+- `internal/raftservice/execution_peer.go`
 - `internal/rafttransport/registry.go`, `frame.go`, and `preflight.go`
 - `internal/rafttransport/identity.go`, `stream.go`, and `transport.go`
+- `cmd/vibedb-shard/prepare_rf3.go`, `bootstrap_rf3.go`, and `serve_rf3.go`
+- `cmd/vibedb-gateway/replica_move_controller.go`
+- `gateway/replicated_query.go` and `replicated_query_test.go`
 - `docs/design/raft-peer-transport.md`

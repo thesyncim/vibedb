@@ -145,17 +145,17 @@ type Collection struct {
 	committer *storeio.Committer
 	cache     *storeio.PageCache
 	// primaryUnifiedOverlay is the bounded, generation-stamped mutable row
-	// window for class-5 inline puts and tombstones. Its byte arena is carved out of
+	// window for compact VCS1 inline puts and tombstones. Its byte arena is carved out of
 	// Options.ResidentBytes; PageCache owns the remainder.
 	primaryUnifiedOverlay *primaryUnifiedOverlay
 	// primaryUnifiedReplacementScratch is the exclusive writer's bounded fold
-	// workspace. A class-5 leaf has at most 256 stable slots regardless of how
+	// workspace. A compact VCS1 leaf has at most 256 stable slots regardless of how
 	// many raw generations the overlay retains, so this final-state vector is
 	// leaf-bounded rather than generation-window-bounded.
 	primaryUnifiedReplacementScratch []storeio.CommonPrimaryUnifiedReplacement
 	// primaryNativeFoldContexts is a fixed, construction-time foreground codec
 	// pool. Its goroutines exist only while an exclusive checkpoint is actively
-	// precomputing native class-5 leaf images; transaction allocation, staging,
+	// precomputing compact VCS1 leaf images; transaction allocation, staging,
 	// retirement, parent rewrites, and publication remain on the writer goroutine.
 	primaryNativeFoldContexts []primaryNativeFoldContext
 	// primaryNativeFoldPrecomputeHook is a deterministic package-test seam called
@@ -169,8 +169,8 @@ type Collection struct {
 	// nil. A test override may likewise be called concurrently.
 	primaryNativeFoldAcquire func(storeio.PageRef) (storeio.PageLease, error)
 	// primaryUnifiedSeen is writer-owned lazy route metadata. Until the first
-	// class-5 leaf is observed, ordinary stores preserve their established
-	// capacity-before-acquire mutation order; afterwards class-5 routes may try
+	// compact VCS1 leaf is observed, ordinary stores preserve their established
+	// capacity-before-acquire mutation order; afterwards VCS1 routes may try
 	// the allocation-free overlay before reserving structural COW capacity.
 	primaryUnifiedSeen bool
 	// primaryRouter is swapped wholesale by a structural split or empty reclaim
@@ -246,7 +246,7 @@ type Collection struct {
 	// buffered-visible mutation. It is owned by the serialized writer exactly like
 	// the committer and appended and synced under c.writer. RecoveryJournal selects
 	// per-mutation durable acknowledgement for buffered-visible; without it, Flush
-	// may append one complete class-5 delta batch after a physical root has named
+	// may append one complete VCS1 delta batch after a physical root has named
 	// the lazy journal. Full checkpoints fold and recycle the log.
 	// journalID mirrors the root identity so recovery cannot pair a stray file;
 	// journalPowerSafe selects the barrier strength from CheckpointStrength.
@@ -284,7 +284,7 @@ type Collection struct {
 	// journalDeltaEntries is fixed writer-owned framing scratch for one cheap
 	// checkpoint. Only the ordinary buffered delta lane retains it; stores that
 	// cannot emit an overlay delta leave the slice nil instead of carrying its
-	// pointer-rich backing array. The class-5 overlay itself is capped at this
+	// pointer-rich backing array. The VCS1 overlay itself is capped at this
 	// record count, so every eligible interval still fits without allocation.
 	journalDeltaEntries []storeio.RecoveryBatchEntry
 	// writeTransaction and the point-mutation scratch below are protected by
@@ -657,11 +657,11 @@ type Stats struct {
 	// accounted separately by PrimaryOverlayFolds.
 	AutomaticCheckpoints uint64
 	// PrimaryOverlayFolds counts device-silent materializations of the bounded
-	// class-5 row overlay. These publish a physical root in memory but perform no
+	// compact VCS1 row overlay. These publish a physical root in memory but perform no
 	// device checkpoint; a later journal delta, explicit Flush, or Close supplies
 	// the crash-safety boundary.
 	PrimaryOverlayFolds uint64
-	// PrimaryOverlayMaterializationAttempts counts every non-empty class-5
+	// PrimaryOverlayMaterializationAttempts counts every non-empty VCS1
 	// overlay fold attempt, including a bounded-capacity decline that drains a
 	// prior staged cut and retries. PrimaryOverlayMaterializations counts the
 	// successful physical attempts. PrimaryOverlayMaterializationFailures counts

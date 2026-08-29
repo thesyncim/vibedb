@@ -6,7 +6,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// The token filter and field probe consume class-5 rows through
+// The token filter and field probe consume compact VCS1 rows through
 // the token view without rendering non-target holes; both degrade per row —
 // never per store — to the render path for trivial rows, container targets,
 // overflow chains, and non-unified leaves.
