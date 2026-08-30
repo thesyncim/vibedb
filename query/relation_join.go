@@ -70,6 +70,7 @@ type relationJoinOperand struct {
 type relationJoinSource struct {
 	physical    bool
 	names       []string
+	schema      []OutputColumn
 	offset      int
 	columns     int
 	ordinalSpec []string
@@ -201,6 +202,7 @@ func (s *Statement) prepareRelationJoin(
 	for i := range s.tree.From {
 		ref := &s.tree.From[i]
 		op := &j.operands[i]
+		var schema []OutputColumn
 		op.ref = ref
 		op.offset = columns
 		switch ref.Kind {
@@ -224,6 +226,8 @@ func (s *Statement) prepareRelationJoin(
 				child, err = prepareTreeInContext(
 					s.text, ref.Query, 0, s.cteCatalog(),
 					argBase+ref.Query.ParamBase,
+					s.parameterTypeHints,
+					unknownOutputPrepareMode{preserveDocument: s.preserveDocumentUnknown},
 				)
 			}
 			if err != nil {
@@ -232,8 +236,10 @@ func (s *Statement) prepareRelationJoin(
 			op.stmt = child
 			if op.lateral != nil {
 				op.names = append(op.names, op.lateral.names...)
+				schema = op.lateral.schema
 			} else {
 				op.names = append(op.names, child.Columns()...)
+				schema = child.AppendSchema(schema)
 			}
 			op.columns = len(op.names)
 		case sqlast.RelationCTE:
@@ -251,6 +257,7 @@ func (s *Statement) prepareRelationJoin(
 				def.firstReference = op.cte
 			}
 			op.names = def.names
+			schema = def.schema
 			op.columns = len(op.names)
 		default:
 			return fmt.Errorf("query: unknown relation kind %d", ref.Kind)
@@ -259,6 +266,7 @@ func (s *Statement) prepareRelationJoin(
 		source := &j.sources[i]
 		source.physical = op.physical
 		source.names = op.names
+		source.schema = schema
 		source.offset = op.offset
 		source.columns = op.columns
 		source.ordinalSpec = j.appendOrdinalSpecs(op.offset, op.columns)
@@ -370,7 +378,10 @@ func (j *statementRelationJoin) sourceBinding(source int) relationBinding {
 		return relationBinding{}
 	}
 	b := &j.sources[source]
-	return relationBinding{names: b.names, ordinalSpec: b.ordinalSpec}
+	return relationBinding{
+		names: b.names, schema: b.schema, ordinalSpec: b.ordinalSpec,
+		offset: b.offset,
+	}
 }
 
 func (j *statementRelationJoin) resolve(source int, name, relation string) (int, error) {

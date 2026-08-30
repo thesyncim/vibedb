@@ -1,5 +1,7 @@
 package sql
 
+import "github.com/thesyncim/vibedb/internal/pginput"
+
 // scalarExprContext records where a computed value is authored. Aggregates
 // are legal in SELECT, HAVING, and ORDER BY after grouping, but not in WHERE or
 // ON, whose rows have not been reduced yet.
@@ -76,6 +78,186 @@ func scalarStarts(tok token) bool {
 	default:
 		return false
 	}
+}
+
+// scalarTypedStringHead is deliberately a fixed classifier. PostgreSQL also
+// allows catalog-resolved type names, but probing every identifier would tax
+// ordinary path parsing and could scan attacker-sized tokens more than once.
+// Known unsupported built-ins are consumed only to return an explicit 0A000
+// when they actually precede a string.
+func scalarTypedStringHead(tok token) (ScalarCastTarget, bool, bool) {
+	if tok.kind == tokQuotedIdent && !tok.esc {
+		switch tok.text {
+		case "text":
+			return ScalarCastText, true, true
+		case "bool":
+			return ScalarCastBoolean, true, true
+		case "boolean":
+			// PostgreSQL's BOOLEAN keyword maps to pg_catalog.bool, but a
+			// quoted name is a catalog lookup and no type named boolean exists.
+			return 0, false, true
+		default:
+			return 0, false, false
+		}
+	}
+	if tok.kind != tokIdent {
+		return 0, false, false
+	}
+	switch {
+	case equalFoldASCII(tok.text, "text"):
+		return ScalarCastText, true, true
+	case equalFoldASCII(tok.text, "boolean"), equalFoldASCII(tok.text, "bool"):
+		return ScalarCastBoolean, true, true
+	case equalFoldASCII(tok.text, "numeric"), equalFoldASCII(tok.text, "decimal"),
+		equalFoldASCII(tok.text, "json"), equalFoldASCII(tok.text, "jsonb"),
+		equalFoldASCII(tok.text, "int2"), equalFoldASCII(tok.text, "int4"),
+		equalFoldASCII(tok.text, "int8"), equalFoldASCII(tok.text, "varchar"),
+		equalFoldASCII(tok.text, "char"), equalFoldASCII(tok.text, "character"),
+		equalFoldASCII(tok.text, "pg_catalog"):
+		return 0, false, true
+	default:
+		return 0, false, false
+	}
+}
+
+// rejectUnsupportedTypedStringSuffix catches PostgreSQL typed-constant forms
+// that begin with one of the fixed heads above but are outside the bounded
+// grammar. The checks inspect a fixed-size suffix and run only after such a
+// head, so an ordinary identifier/path never pays for speculative tokenization.
+func (p *Parser) rejectUnsupportedTypedStringSuffix(head token) error {
+	switch p.tok.kind {
+	case tokLParen:
+		return newFeatureNotSupportedError(
+			p.lx.src, head.pos,
+			"PostgreSQL typed-string constants with type modifiers are not supported; use unmodified BOOL, BOOLEAN, or TEXT",
+		)
+	case tokLBracket:
+		// A field named bool may legitimately be subscripted. Refuse only the
+		// fixed empty [] type suffix when a string literal follows it; otherwise
+		// the ordinary path parser retains ownership.
+		end := p.lx.pos
+		if end >= len(p.lx.src) || p.lx.src[end] != ']' {
+			return nil
+		}
+		end++
+		limit := len(p.lx.src)
+		if limit-end > 64 {
+			limit = end + 64
+		}
+		for end < limit {
+			switch p.lx.src[end] {
+			case ' ', '\t', '\n', '\r', '\v', '\f':
+				end++
+			default:
+				goto arraySuffix
+			}
+		}
+	arraySuffix:
+		if end == limit && end < len(p.lx.src) {
+			return nil
+		}
+		if end < len(p.lx.src) && (p.lx.src[end] == '\'' ||
+			(end+1 < len(p.lx.src) && (p.lx.src[end] == 'e' || p.lx.src[end] == 'E') &&
+				p.lx.src[end+1] == '\'')) {
+			return newFeatureNotSupportedError(
+				p.lx.src, head.pos,
+				"PostgreSQL array typed-string constants are not supported; use scalar BOOL, BOOLEAN, or TEXT",
+			)
+		}
+		return nil
+	case tokIdent:
+		end := p.lx.pos
+		if equalFoldASCII(p.tok.text, "e") && end < len(p.lx.src) && p.lx.src[end] == '\'' {
+			return newFeatureNotSupportedError(
+				p.lx.src, head.pos,
+				"escape-string typed constants are not supported; use a standard quoted BOOL, BOOLEAN, or TEXT constant",
+			)
+		}
+		if equalFoldASCII(p.tok.text, "u") && end+1 < len(p.lx.src) &&
+			p.lx.src[end] == '&' && p.lx.src[end+1] == '\'' {
+			return newFeatureNotSupportedError(
+				p.lx.src, head.pos,
+				"Unicode-escape typed constants are not supported; use a standard quoted BOOL, BOOLEAN, or TEXT constant",
+			)
+		}
+	}
+	return nil
+}
+
+func isPGCatalogTypedStringPath(head token, path *PathExpr) bool {
+	if head.kind != tokIdent || !equalFoldASCII(head.text, "pg_catalog") ||
+		path == nil || len(path.Segments) != 2 {
+		return false
+	}
+	target := path.Segments[1]
+	if target.IsIndex {
+		return false
+	}
+	return equalFoldASCII(target.Key, "bool") ||
+		equalFoldASCII(target.Key, "boolean") ||
+		equalFoldASCII(target.Key, "text")
+}
+
+func (p *Parser) rejectQualifiedTypedStringPath(head token, path *PathExpr) error {
+	if !isPGCatalogTypedStringPath(head, path) {
+		return nil
+	}
+	if err := p.rejectUnsupportedTypedStringSuffix(head); err != nil {
+		return err
+	}
+	if p.tok.kind != tokString {
+		return nil
+	}
+	return newFeatureNotSupportedError(
+		p.lx.src, head.pos,
+		"qualified PostgreSQL typed-string constants are not supported; use unqualified BOOL, BOOLEAN, or TEXT",
+	)
+}
+
+// parseTypedStringAfterHead consumes the string token after an already
+// consumed type head. Each token is lexed once, so large literals retain the
+// parser's bounded cancellation behavior.
+func (p *Parser) parseTypedStringAfterHead(
+	head token, target ScalarCastTarget, supported bool,
+) (
+	Operand, error,
+) {
+	if p.tok.kind != tokString {
+		if err := p.rejectUnsupportedTypedStringSuffix(head); err != nil {
+			return Operand{}, err
+		}
+		return Operand{}, p.errHere("expected a string after the PostgreSQL type name")
+	}
+	value, err := p.typedStringOperand(head, p.tok, target, supported)
+	if err != nil {
+		return Operand{}, err
+	}
+	p.advance()
+	return value, nil
+}
+
+func (p *Parser) typedStringOperand(
+	head, literal token, target ScalarCastTarget, supported bool,
+) (Operand, error) {
+	if !supported {
+		return Operand{}, newFeatureNotSupportedError(
+			p.lx.src, head.pos,
+			"this PostgreSQL typed-string constant is not supported; use unqualified BOOL, BOOLEAN, or TEXT without type modifiers",
+		)
+	}
+	literalPos := literal.pos
+	text := p.internToken(literal)
+	if target == ScalarCastText {
+		return Operand{Kind: OperandString, Text: text, Pos: literalPos}, nil
+	}
+	value, ok := pginput.Boolean(text)
+	if !ok {
+		return Operand{}, newInvalidTextRepresentationError(
+			p.lx.src, literalPos, "boolean",
+			"invalid input syntax for type boolean",
+		)
+	}
+	return Operand{Kind: OperandBool, Bool: value, Pos: literalPos}, nil
 }
 
 func scalarContinues(tok token) bool {
@@ -257,6 +439,9 @@ func (p *Parser) parseScalarTypecasts(left *ScalarExpr) (*ScalarExpr, error) {
 				"cast type modifiers, arrays, collations, and qualified targets are not supported",
 			)
 		}
+		if err := p.validateTypedConstantCast(left, target, targetPos); err != nil {
+			return nil, err
+		}
 		node := p.newScalar(ScalarCast, pos)
 		node.Cast, node.Left, node.TargetPos = target, left, targetPos
 		left = node
@@ -264,8 +449,80 @@ func (p *Parser) parseScalarTypecasts(left *ScalarExpr) (*ScalarExpr, error) {
 	return left, nil
 }
 
+// validateTypedConstantCast mirrors PostgreSQL's explicit-cast graph for the
+// bounded BOOL/TEXT/NUMERIC/JSON domains. CoerceViaIO admits an edge when the
+// source or target is TEXT; identity edges are always valid. Every other edge
+// lacks a pg_cast entry and is rejected during analysis, including inside a
+// dead CASE arm. Crucially, this checks only the type graph: valid conversions
+// such as TEXT 'bad'::BOOL remain lazy and are not evaluated here.
+func (p *Parser) validateTypedConstantCast(
+	left *ScalarExpr, target ScalarCastTarget, targetPos int,
+) error {
+	source, known := typedConstantCastType(left)
+	if !known || source == target || source == ScalarCastText || target == ScalarCastText {
+		return nil
+	}
+	return newCannotCoerceError(
+		p.lx.src, targetPos, scalarCastTypeName(source), scalarCastTypeName(target),
+	)
+}
+
+// typedConstantCastType follows a cast chain or a resolved CASE rooted in
+// PostgreSQL's type 'string' production. A nested CASE is its own analysis
+// scope, but its selected BOOL/TEXT domain is concrete to the expression that
+// contains it. Ordinary expressions retain their existing lazy runtime
+// behavior; the parser does not speculate about row values or types.
+func typedConstantCastType(expr *ScalarExpr) (ScalarCastTarget, bool) {
+	target, known, typed := scalarCaseExpressionResolution(expr)
+	return target, known && typed
+}
+
+func scalarCastTypeName(target ScalarCastTarget) string {
+	switch target {
+	case ScalarCastText:
+		return "text"
+	case ScalarCastBoolean:
+		return "boolean"
+	case ScalarCastNumeric:
+		return "numeric"
+	case ScalarCastJSON:
+		return "json"
+	default:
+		return "unknown"
+	}
+}
+
 func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) {
 	pos := p.tok.pos
+	if target, supported, known := scalarTypedStringHead(p.tok); known {
+		head := p.tok
+		p.advance()
+		if p.tok.kind == tokString {
+			value, err := p.parseTypedStringAfterHead(head, target, supported)
+			if err != nil {
+				return nil, err
+			}
+			literal := p.newScalar(ScalarLiteral, value.Pos)
+			literal.Value = value
+			node := p.newScalar(ScalarCast, value.Pos)
+			node.Cast, node.Left, node.TargetPos = target, literal, head.pos
+			node.TypedConstant = true
+			return node, nil
+		}
+		if err := p.rejectUnsupportedTypedStringSuffix(head); err != nil {
+			return nil, err
+		}
+		path, err := p.continuePath(head, ctx == scalarSelect)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.rejectQualifiedTypedStringPath(head, path); err != nil {
+			return nil, err
+		}
+		node := p.newScalar(ScalarPath, path.Pos)
+		node.Path = path
+		return node, nil
+	}
 	switch {
 	case p.tok.kind == tokLParen:
 		p.advance()
@@ -364,6 +621,9 @@ func (p *Parser) parseScalarCast(ctx scalarExprContext) (*ScalarExpr, error) {
 		)
 	}
 	p.advance()
+	if err := p.validateTypedConstantCast(child, target, targetPos); err != nil {
+		return nil, err
+	}
 	node := p.newScalar(ScalarCast, pos)
 	node.Cast, node.Left, node.TargetPos = target, child, targetPos
 	return node, nil

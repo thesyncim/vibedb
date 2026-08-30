@@ -55,6 +55,243 @@ func TestSQLScalarCaseSearchedSimpleNestedExactValuesAndSchema(t *testing.T) {
 	}
 }
 
+func TestSQLScalarCasePostgreSQLTypedCommonTypeValuesSchemaAndWarmAllocation(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT
+		CASE WHEN TRUE THEN BOOL 't' ELSE 'off' END,
+		CASE WHEN TRUE THEN 'no' ELSE BOOLEAN 't' END,
+		CASE WHEN FALSE THEN NULL ELSE BOOL 'f' END,
+		CASE WHEN TRUE THEN TEXT 'typed' ELSE 'plain' END,
+		CASE WHEN TRUE THEN 'unknown' ELSE TEXT 'typed' END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+
+	schema := statement.AppendSchema(nil)
+	if len(schema) != 5 {
+		t.Fatalf("typed CASE schema = %+v", schema)
+	}
+	for i := 0; i < 3; i++ {
+		if schema[i].Type != TypeBool || schema[i].Representation != OutputSQLBool {
+			t.Fatalf("typed CASE boolean schema[%d] = %+v", i, schema[i])
+		}
+	}
+	for i := 3; i < 5; i++ {
+		if schema[i].Type != TypeString || schema[i].Representation != OutputSQLText {
+			t.Fatalf("typed CASE text schema[%d] = %+v", i, schema[i])
+		}
+	}
+
+	var exec Exec
+	defer exec.Release()
+	run := func() {
+		cursor, runErr := statement.RunInto(&exec, Source{}, nil)
+		if runErr != nil {
+			panic(runErr)
+		}
+		if !cursor.Next() {
+			panic("missing typed CASE row")
+		}
+		want := []string{"true", "false", "false", `"typed"`, `"unknown"`}
+		for i := range want {
+			if got := string(cursor.Cell(i).JSON()); got != want[i] {
+				panic("wrong typed CASE value")
+			}
+		}
+		if cursor.Next() {
+			panic("extra typed CASE row")
+		}
+	}
+	run()
+	if allocs := testing.AllocsPerRun(100, run); allocs != 0 {
+		t.Fatalf("warmed typed CASE execution allocated %.2f/run, want zero", allocs)
+	}
+}
+
+func TestSQLScalarCasePostgreSQLTypedBooleanUnknownFailsAtPrepare(t *testing.T) {
+	for _, source := range []string{
+		`SELECT CASE WHEN TRUE THEN BOOL 't' ELSE 'not-bool' END`,
+		`SELECT CASE WHEN FALSE THEN 'not-bool' ELSE BOOLEAN 'f' END`,
+	} {
+		_, err := PrepareStatement(source)
+		var typed *sqlast.InvalidTextRepresentationError
+		if !errors.As(err, &typed) || typed.Pos != strings.Index(source, "'not-bool'") {
+			t.Fatalf("%q prepare error = %T %v, want typed boolean input error",
+				source, err, err)
+		}
+	}
+}
+
+func TestSQLScalarSimpleCasePostgreSQLTypedSelectorCoercesUnknownWhen(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT
+		CASE BOOL 't' WHEN 'off' THEN 0 WHEN 'yes' THEN 1 ELSE 2 END,
+		CASE TEXT 'x' WHEN 'x' THEN TEXT 'matched' ELSE TEXT 'missed' END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	var exec Exec
+	defer exec.Release()
+	cursor, err := statement.RunInto(&exec, Source{}, nil)
+	if err != nil || !cursor.Next() {
+		t.Fatalf("typed-selector simple CASE = cursor/error %v", err)
+	}
+	if got := string(cursor.Cell(0).JSON()); got != "1" {
+		t.Fatalf("typed BOOL selector result = %s, want 1", got)
+	}
+	if got := string(cursor.Cell(1).JSON()); got != `"matched"` {
+		t.Fatalf("typed TEXT selector result = %s, want matched", got)
+	}
+	if cursor.Next() {
+		t.Fatal("typed-selector simple CASE returned an extra row")
+	}
+
+	_, err = PrepareStatement(
+		`SELECT CASE BOOL 't' WHEN BOOL 't' THEN 1 WHEN 'not-bool' THEN 2 ELSE 0 END`,
+	)
+	var typed *sqlast.InvalidTextRepresentationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("dead invalid simple CASE match = %T %v, want typed input error", err, err)
+	}
+}
+
+func TestSQLScalarCaseNestedTypedResolutionSchemaValueAndOuterCast(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT
+		CASE WHEN TRUE THEN CASE WHEN FALSE THEN BOOL 'f' ELSE 'yes' END ELSE 'off' END,
+		CASE WHEN TRUE THEN CASE WHEN FALSE THEN TEXT 'x' ELSE 'inner' END ELSE 'outer' END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	schema := statement.AppendSchema(nil)
+	if len(schema) != 2 || schema[0].Type != TypeBool ||
+		schema[0].Representation != OutputSQLBool ||
+		schema[1].Type != TypeString || schema[1].Representation != OutputSQLText {
+		t.Fatalf("nested typed CASE schema = %+v", schema)
+	}
+	var exec Exec
+	defer exec.Release()
+	cursor, err := statement.RunInto(&exec, Source{}, nil)
+	if err != nil || !cursor.Next() {
+		t.Fatalf("nested typed CASE run = %v", err)
+	}
+	if got := string(cursor.Cell(0).JSON()); got != "true" {
+		t.Fatalf("nested BOOL CASE = %s, want true", got)
+	}
+	if got := string(cursor.Cell(1).JSON()); got != `"inner"` {
+		t.Fatalf("nested TEXT CASE = %s, want inner", got)
+	}
+
+	for _, target := range []string{"NUMERIC", "JSON"} {
+		source := `SELECT (CASE WHEN TRUE THEN CASE WHEN FALSE THEN BOOL 'f' ` +
+			`ELSE 'yes' END ELSE 'off' END)::` + target
+		_, err = PrepareStatement(source)
+		var cannot *sqlast.CannotCoerceError
+		if !errors.As(err, &cannot) || cannot.Source != "boolean" ||
+			cannot.Target != strings.ToLower(target) {
+			t.Fatalf("nested CASE ::%s = %T %v", target, err, err)
+		}
+	}
+}
+
+func TestSQLScalarCaseTypedParameterInferenceExecutionAndWarmAllocation(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT
+		CASE BOOL 't' WHEN ? THEN BOOL 't' ELSE BOOL 'f' END,
+		CASE WHEN FALSE THEN BOOL 'f' ELSE ? END,
+		CASE TEXT 'x' WHEN ? THEN TEXT 'matched' ELSE ? END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	wantTypes := []ParameterType{
+		ParameterTypeBool, ParameterTypeBool,
+		ParameterTypeText, ParameterTypeText,
+	}
+	for i, want := range wantTypes {
+		if got := statement.ParameterType(i); got != want {
+			t.Fatalf("CASE ParameterType(%d) = %s, want %s", i, got, want)
+		}
+	}
+
+	match, fallback := true, true
+	textMatch, deadText := "x", "unused"
+	args := []any{&match, &fallback, &textMatch, &deadText}
+	var exec Exec
+	defer exec.Release()
+	run := func() {
+		cursor, runErr := statement.RunInto(&exec, Source{}, args)
+		if runErr != nil || !cursor.Next() {
+			panic("typed CASE parameter execution failed")
+		}
+		want := []string{"true", "true", `"matched"`}
+		for i := range want {
+			if got := string(cursor.Cell(i).JSON()); got != want[i] {
+				panic("typed CASE parameter value mismatch")
+			}
+		}
+		if cursor.Next() {
+			panic("extra typed CASE parameter row")
+		}
+	}
+	run()
+	if allocs := testing.AllocsPerRun(100, run); allocs != 0 {
+		t.Fatalf("warmed typed CASE parameter execution allocated %.2f/run", allocs)
+	}
+}
+
+func TestSQLScalarSimpleCaseUnknownSelectorTypedOperatorFailsAtPrepare(t *testing.T) {
+	for _, source := range []string{
+		`SELECT CASE NULL WHEN BOOL 't' THEN 1 ELSE 0 END`,
+		`SELECT CASE ? WHEN BOOL 't' THEN 1 ELSE 0 END`,
+	} {
+		_, err := PrepareStatement(source)
+		var undefined *sqlast.UndefinedOperatorError
+		if !errors.As(err, &undefined) || undefined.Left != "text" ||
+			undefined.Right != "boolean" {
+			t.Fatalf("%q prepare error = %T %v", source, err, err)
+		}
+	}
+}
+
+func TestSQLPostgreSQLTypedCaseResultMismatchClassAndPosition(t *testing.T) {
+	const source = `SELECT CASE WHEN TRUE THEN BOOL 't' ELSE TEXT 'x' END`
+	_, err := PrepareStatement(source)
+	var mismatch *ScalarTypeError
+	if !errors.As(err, &mismatch) || !errors.Is(err, ErrScalarType) ||
+		mismatch.Operation != "CASE common type" ||
+		mismatch.Position() != strings.Index(source, "BOOL") {
+		t.Fatalf("typed CASE mismatch = %T %v, want 42804 at BOOL", err, err)
+	}
+
+	const declared = `SELECT CASE WHEN TRUE THEN TEXT 'x' ELSE ? END`
+	tree, err := sqlast.ParseStatement(declared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = PrepareParsedStatementWithParameterTypes(
+		declared, tree.Select, []ParameterType{ParameterTypeBool},
+	)
+	if !errors.As(err, &mismatch) || mismatch.Position() != strings.Index(declared, "TEXT") {
+		t.Fatalf("declared CASE mismatch = %T %v, want TEXT position", err, err)
+	}
+}
+
+func TestSQLPostgreSQLTypedCaseDeclaredOtherIsUndefinedOperator(t *testing.T) {
+	const source = `SELECT CASE BOOL 't' WHEN ? THEN 1 ELSE 0 END`
+	tree, err := sqlast.ParseStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = PrepareParsedStatementWithParameterTypes(
+		source, tree.Select, []ParameterType{ParameterTypeOther},
+	)
+	var undefined *sqlast.UndefinedOperatorError
+	if !errors.As(err, &undefined) || undefined.Pos != strings.Index(source, "?") ||
+		undefined.Left != "boolean" || undefined.Right != "other" {
+		t.Fatalf("declared-other CASE comparison = %T %v, want 42883 at parameter", err, err)
+	}
+}
+
 func TestSQLScalarCaseStrictBranchAndPredicateLaziness(t *testing.T) {
 	segment := mustSegment(t, `{}`)
 	statement, err := PrepareStatement(`SELECT

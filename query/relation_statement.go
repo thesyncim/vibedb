@@ -66,6 +66,7 @@ type statementDerived struct {
 	spool relationSpool
 
 	names       []string
+	schema      []OutputColumn
 	ordinalSpec []string
 	specData    []byte
 	activeBytes int64
@@ -196,6 +197,8 @@ func (s *Statement) prepareDerived(argBase int) error {
 	child, err := prepareTreeInContext(
 		s.text, s.tree.From[0].Query, 0, s.cteCatalog(),
 		argBase+s.tree.From[0].Query.ParamBase,
+		s.parameterTypeHints,
+		unknownOutputPrepareMode{preserveDocument: s.preserveDocumentUnknown},
 	)
 	if err != nil {
 		return err
@@ -208,6 +211,7 @@ func (s *Statement) prepareDerived(argBase int) error {
 		stmt: child,
 	}
 	d.names = append(d.names, child.Columns()...)
+	d.schema = child.AppendSchema(d.schema[:0])
 	d.ordinalSpec = make([]string, len(d.names))
 	for i := range d.ordinalSpec {
 		start := len(d.specData)

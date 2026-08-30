@@ -14,6 +14,37 @@ import (
 // accepted by its syntactic role.
 var ErrParameterType = errors.New("query: SQL parameter has incompatible type")
 
+// ParameterTypeConflictError reports two analysis contexts which require
+// incompatible SQL domains for one placeholder. Pos is the later authored
+// occurrence which introduced the conflict; keeping it on the query-side
+// error lets protocol adapters emit PostgreSQL's exact error position even
+// when a client-declared type supplied the earlier requirement.
+type ParameterTypeConflictError struct {
+	Pos       int
+	Parameter int
+	Existing  ParameterType
+	Inferred  ParameterType
+}
+
+func (e *ParameterTypeConflictError) Error() string {
+	if e == nil {
+		return ErrParameterType.Error()
+	}
+	return fmt.Sprintf(
+		"query: parameter %d is inferred as both %s and %s: %v",
+		e.Parameter, e.Existing, e.Inferred, ErrParameterType,
+	)
+}
+
+func (e *ParameterTypeConflictError) Unwrap() error { return ErrParameterType }
+
+func (e *ParameterTypeConflictError) Position() int {
+	if e == nil {
+		return 0
+	}
+	return e.Pos
+}
+
 // ErrInvalidPattern reports a malformed literal or bound LIKE/ILIKE pattern.
 var ErrInvalidPattern = errors.New("query: invalid LIKE pattern")
 

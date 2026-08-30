@@ -246,7 +246,19 @@ func (s *Session) SetMemoryLimit(bytes int64) error {
 // An error while a transaction is active moves the session to
 // SessionFailedTransaction, matching PostgreSQL's failed-transaction rule.
 func (s *Session) Prepare(ctx context.Context, text string) (*Prepared, error) {
-	return s.prepare(ctx, text, false)
+	return s.prepare(ctx, text, false, nil)
+}
+
+// PrepareWithParameterTypes is Prepare with optional analysis-time SQL input
+// types for positional placeholders. It is used by protocol adapters whose
+// Parse message can declare parameter OIDs before statement analysis. Nil is
+// exactly equivalent to Prepare and keeps the ordinary path allocation-free.
+func (s *Session) PrepareWithParameterTypes(
+	ctx context.Context,
+	text string,
+	parameterTypes []ParamType,
+) (*Prepared, error) {
+	return s.prepare(ctx, text, false, parameterTypes)
 }
 
 // PreparePartialAggregate parses one grouped SELECT and lowers its shard-local
@@ -254,17 +266,41 @@ func (s *Session) Prepare(ctx context.Context, text string) (*Prepared, error) {
 // AST before lowering so a coordinator can combine every partial group without
 // reparsing or rewriting authored SQL text.
 func (s *Session) PreparePartialAggregate(ctx context.Context, text string) (*Prepared, error) {
-	return s.prepare(ctx, text, true)
+	return s.prepare(ctx, text, true, nil)
 }
 
-func (s *Session) prepare(ctx context.Context, text string, partialAggregate bool) (*Prepared, error) {
+// PreparePartialAggregateWithParameterTypes is PreparePartialAggregate with
+// the same optional analysis-time placeholder types accepted by
+// PrepareWithParameterTypes.
+func (s *Session) PreparePartialAggregateWithParameterTypes(
+	ctx context.Context,
+	text string,
+	parameterTypes []ParamType,
+) (*Prepared, error) {
+	return s.prepare(ctx, text, true, parameterTypes)
+}
+
+func (s *Session) prepare(
+	ctx context.Context,
+	text string,
+	partialAggregate bool,
+	parameterTypes []ParamType,
+) (*Prepared, error) {
 	if err := s.ready(ctx); err != nil {
 		return nil, s.fail(err)
 	}
 	var statement *stmt
 	var err error
-	if partialAggregate {
+	if partialAggregate && len(parameterTypes) != 0 {
+		statement, err = s.conn.preparePartialAggregateContextWithParameterTypes(
+			ctx, text, parameterTypes,
+		)
+	} else if partialAggregate {
 		statement, err = s.conn.preparePartialAggregateContext(ctx, text)
+	} else if len(parameterTypes) != 0 {
+		statement, err = s.conn.prepareContextWithParameterTypes(
+			ctx, text, parameterTypes,
+		)
 	} else {
 		statement, err = s.conn.prepareContext(ctx, text)
 	}
@@ -517,6 +553,57 @@ func (k ParamKind) String() string {
 	}
 }
 
+// ParamType is a placeholder's SQL type after statement analysis.
+//
+// Most placeholders remain ParamTypeUnspecified because the document store is
+// schemaless. A SQL construct that chooses an exact input type, such as a
+// typed VALUES column, records it here so protocol adapters can advertise and
+// decode the parameter without guessing from its bytes.
+type ParamType uint8
+
+const (
+	// ParamTypeUnspecified means statement analysis did not constrain the
+	// placeholder to one SQL input type.
+	ParamTypeUnspecified ParamType = iota
+	// ParamTypeBool is PostgreSQL's boolean input domain.
+	ParamTypeBool
+	// ParamTypeText is PostgreSQL's text input domain.
+	ParamTypeText
+	// ParamTypeVarchar is PostgreSQL's character varying input domain.
+	ParamTypeVarchar
+	// ParamTypeName is PostgreSQL's fixed 64-byte name input domain.
+	ParamTypeName
+	// ParamTypeBPChar is PostgreSQL's blank-padded character input domain.
+	ParamTypeBPChar
+	// ParamTypeOther is a concrete client-declared PostgreSQL input domain the
+	// bounded analyzer does not otherwise model. It is distinct from unknown so
+	// incompatible typed operations fail during analysis instead of Bind.
+	ParamTypeOther
+	// ParamTypeInvalid reports an out-of-range parameter index.
+	ParamTypeInvalid
+)
+
+func (t ParamType) String() string {
+	switch t {
+	case ParamTypeUnspecified:
+		return "unspecified"
+	case ParamTypeBool:
+		return "boolean"
+	case ParamTypeText:
+		return "text"
+	case ParamTypeVarchar:
+		return "character varying"
+	case ParamTypeName:
+		return "name"
+	case ParamTypeBPChar:
+		return "character"
+	case ParamTypeOther:
+		return "other"
+	default:
+		return "invalid"
+	}
+}
+
 // Prepared owns one parsed AST and its reusable lowered statement.
 type Prepared struct {
 	session   *Session
@@ -556,6 +643,42 @@ func (p *Prepared) ParamKind(index int) ParamKind {
 		return ParamInvalid
 	}
 	return p.statement.paramKinds[index]
+}
+
+// ParamType reports the SQL input type inferred for a zero-based placeholder.
+// Unrelated scalar parameters remain unspecified. The lookup is bounded and
+// allocation-free.
+func (p *Prepared) ParamType(index int) ParamType {
+	if p == nil || p.statement == nil || index < 0 || index >= p.statement.params {
+		return ParamTypeInvalid
+	}
+	if index >= len(p.statement.paramTypes) {
+		return ParamTypeUnspecified
+	}
+	return p.statement.paramTypes[index]
+}
+
+// ParamTypePosition reports the zero-based authored byte offset at which a
+// placeholder acquired its analyzed SQL type. It returns -1 when the type was
+// not inferred from a positioned SQL context or the index is out of range.
+func (p *Prepared) ParamTypePosition(index int) int {
+	if p == nil || p.statement == nil || index < 0 ||
+		index >= len(p.statement.paramTypePositions) ||
+		p.statement.paramTypePositions[index] == 0 {
+		return -1
+	}
+	return p.statement.paramTypePositions[index] - 1
+}
+
+// ParamTypeTargetDefault reports whether ParamType was chosen only by
+// PostgreSQL's final unresolved target-list coercion. Protocol adapters use the
+// provenance when repeated numbered parameters map to several runtime
+// occurrences; execution does not consult it.
+func (p *Prepared) ParamTypeTargetDefault(index int) bool {
+	return p != nil && p.statement != nil && index >= 0 &&
+		index < p.statement.params &&
+		index < len(p.statement.paramTypeTargetDefaults) &&
+		p.statement.paramTypeTargetDefaults[index]
 }
 
 // ParamPosition reports the zero-based authored byte offset of a document

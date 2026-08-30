@@ -82,6 +82,9 @@ Supported forms include:
 - Unary `+` and `-`
 - `CASE`
 - `CAST` and PostgreSQL `::` casts to `TEXT`, `BOOLEAN`, `NUMERIC`, and `JSON`
+- PostgreSQL typed string constants `BOOL 'value'`, `BOOLEAN 'value'`, and
+  `TEXT 'value'`. Boolean input follows PostgreSQL's unique-prefix grammar and
+  is validated once at prepare; these constants add no row-time conversion.
 - JSON paths and nonnegative array subscripts
 - Quoted identifiers
 - The whole-document path
@@ -95,7 +98,8 @@ Boolean operators, `EXISTS`, and scalar-subquery comparisons.
 
 Unsupported forms include regular-expression operators, `LIKE ... ESCAPE`,
 general scalar function calls, named parser parameters, cast type modifiers,
-cast arrays, and negative array subscripts.
+cast arrays, typed constants for other type names, qualified or modified typed
+constants, and negative array subscripts.
 
 The parser itself uses `?` placeholders. Pgwire rewrites `$n` placeholders
 before parse.
@@ -145,6 +149,16 @@ operand-local order or limit tail must be parenthesized.
 A `VALUES` leaf accepts scalar literals, `NULL`, and placeholders. It is not a
 general row-dependent expression engine. `WITH` directly before a `VALUES` or
 `TABLE` root is not supported.
+
+When a supported PostgreSQL typed constant selects a `BOOLEAN` or `TEXT`
+domain, set expressions use PostgreSQL's pairwise common-type rules. Bare
+string literals, `NULL`, and placeholders begin as `unknown`; known strings are
+converted during prepare, while inferred placeholders use the selected input
+type at bind even when their producing leaf returns no rows. A `VALUES` column
+resolves at its own query boundary. In a parenthesized operand, local `ORDER BY`
+also finalizes a remaining unknown output as `TEXT`; a tail containing only
+`LIMIT` and/or `OFFSET` leaves it available for the enclosing set operation's
+common-type selection.
 
 ## CTEs
 

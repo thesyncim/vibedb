@@ -51,7 +51,8 @@ func prepareRecursiveSQLDefinition(
 		return prepared, positionedRecursiveSQLCloneError(src, plan.anchor, err)
 	}
 	prepared.anchorStmt, err = prepareTreeInContext(
-		src, anchorTree, 0, catalog, 0,
+		src, anchorTree, 0, catalog, 0, options.parameterTypes,
+		unknownOutputPrepareMode{preserveDocument: options.preserveDocumentUnknown},
 	)
 	if err != nil {
 		return prepared, err
@@ -70,7 +71,10 @@ func prepareRecursiveSQLDefinition(
 	}
 	catalogBase := len(catalog.defs)
 	prepared.recursiveStmt, err = prepareTreeInContext(
-		src, recursiveTree, 0, catalog, 0,
+		src, recursiveTree, 0, catalog, 0, options.parameterTypes,
+		unknownOutputPrepareMode{
+			deferScalar: true, preserveDocument: options.preserveDocumentUnknown,
+		},
 	)
 	added := append([]*statementCTE(nil), catalog.defs[catalogBase:]...)
 	clear(catalog.defs[catalogBase:])
@@ -95,6 +99,14 @@ func prepareRecursiveSQLDefinition(
 	prepared.recursiveStmt.ensureNested().ctes = privateCatalog
 	prepared.recursiveStmt.nested.ownsCTEs = true
 
+	anchorCoercions, recursiveCoercions, err := prepareRecursiveSQLCommonTypes(
+		definition, prepared.anchorStmt, prepared.recursiveStmt,
+		options.parameterTypes,
+	)
+	if err != nil {
+		return prepared, err
+	}
+
 	prepared.anchor, err = PrepareRecursiveCTEStatementTerm(
 		prepared.anchorStmt,
 		RecursiveCTEStatementTermOptions{ParamBase: 0},
@@ -102,6 +114,7 @@ func prepareRecursiveSQLDefinition(
 	if err != nil {
 		return prepared, err
 	}
+	prepared.anchor.coercions = anchorCoercions
 	prepared.recursive, err = PrepareRecursiveCTEStatementTerm(
 		prepared.recursiveStmt,
 		RecursiveCTEStatementTermOptions{
@@ -111,6 +124,7 @@ func prepareRecursiveSQLDefinition(
 	if err != nil {
 		return prepared, err
 	}
+	prepared.recursive.coercions = recursiveCoercions
 	union := RecursiveUnionDistinct
 	if plan.operation == sqlast.SetUnionAll {
 		union = RecursiveUnionAll
@@ -134,6 +148,189 @@ func prepareRecursiveSQLDefinition(
 		}
 	}
 	return prepared, nil
+}
+
+// prepareRecursiveSQLCommonTypes mirrors PostgreSQL's two-stage recursive
+// UNION analysis for the scalar domains represented by OutputRepresentation.
+// The non-recursive term is prepared normally, which finalizes an unknown
+// output to TEXT before the UNION. The recursive term defers that boundary so
+// its direct unknown literals and parameters can inherit the selected type.
+// PostgreSQL then requires the selected UNION type to be exactly the anchor's
+// type; this second check is observable for varchar/bpchar followed by name.
+// Every slice returned here is nil unless a direct unknown output needs a
+// runtime conversion.
+func prepareRecursiveSQLCommonTypes(
+	definition *statementCTE,
+	anchor, recursive *Statement,
+	parameterTypes []ParameterType,
+) (anchorCoercions, recursiveCoercions []setStatementColumnCoercion, err error) {
+	if definition == nil || definition.definition == nil ||
+		anchor == nil || recursive == nil || anchor.tree == nil || recursive.tree == nil {
+		return nil, nil, fmt.Errorf(
+			"query: recursive SQL common-type analysis has incomplete state: %w",
+			errStatementRecursiveDefinition,
+		)
+	}
+	anchorSchema := anchor.AppendSchema(nil)
+	recursiveSchema := recursive.AppendSchema(nil)
+	if len(anchorSchema) != len(recursiveSchema) {
+		return nil, nil, &RecursiveCTEArityError{
+			Name: definition.definition.Name, Term: "recursive term",
+			Expected: len(anchorSchema), Actual: len(recursiveSchema),
+		}
+	}
+	if len(definition.schema) != len(anchorSchema) {
+		return nil, nil, &RecursiveCTEArityError{
+			Name: definition.definition.Name, Term: "owning definition",
+			Expected: len(anchorSchema), Actual: len(definition.schema),
+		}
+	}
+
+	anchorResolved := resolveSetSQLConcreteSchema(anchorSchema)
+	// Retain the anchor's authored unknown provenance only for bind-time cell
+	// conversion. Its common-type input is the already-finalized schema above.
+	anchorAuthored := resolveSetSQLSelect(
+		anchor.tree, anchorSchema, parameterTypes, 0,
+	)
+	recursiveResolved := resolveSetSQLSelect(
+		recursive.tree, recursiveSchema, parameterTypes, 0,
+	)
+	for column := range anchorResolved {
+		left, right := anchorResolved[column], recursiveResolved[column]
+		resolved := mergeSetSQLColumns(left, right)
+		if !resolved.active {
+			continue
+		}
+		if resolved.kind == setSQLConflictingType ||
+			resolved.kind == setSQLDynamicType {
+			return nil, nil, setSQLCommonTypeError(
+				sqlast.SetUnionAll,
+				recursiveSQLResultPosition(recursive.tree, column),
+				setSQLValueTypeForKind(left.kind),
+				setSQLValueTypeForKind(right.kind),
+			)
+		}
+		target, ok := setSQLRepresentationForColumn(resolved)
+		if !ok || target == OutputSQLNumber &&
+			resolved.unknown&(setSQLUnknownText|setSQLUnknownParameter) != 0 {
+			return nil, nil, setSQLCommonTypeError(
+				sqlast.SetUnionAll,
+				recursiveSQLResultPosition(recursive.tree, column),
+				setSQLValueTypeForKind(left.kind),
+				setSQLValueTypeForKind(right.kind),
+			)
+		}
+		anchorTarget, anchorOK := setSQLRepresentationForColumn(left)
+		if !anchorOK || anchorTarget != target {
+			// PostgreSQL reports the recursive-query exact-type check at the
+			// non-recursive output, after ordinary UNION candidate selection.
+			return nil, nil, &ScalarTypeError{
+				Pos:       recursiveSQLResultPosition(anchor.tree, column),
+				Operation: "recursive UNION result type",
+				Left:      setSQLValueTypeForRepresentation(anchorTarget),
+				Right:     setSQLValueTypeForRepresentation(target),
+			}
+		}
+
+		definition.schema[column].Type =
+			setSQLValueTypeForRepresentation(target)
+		definition.schema[column].Representation = target
+		if column < len(anchorAuthored) &&
+			anchorAuthored[column].kind == setSQLUnknownType {
+			anchorCoercions, err = applyRecursiveSQLUnknownOutput(
+				anchorCoercions, anchor, column, target,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if right.kind == setSQLUnknownType {
+			recursiveCoercions, err = applyRecursiveSQLUnknownOutput(
+				recursiveCoercions, recursive, column, target,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	return anchorCoercions, recursiveCoercions, nil
+}
+
+func applyRecursiveSQLUnknownOutput(
+	coercions []setStatementColumnCoercion,
+	statement *Statement,
+	column int,
+	target OutputRepresentation,
+) ([]setStatementColumnCoercion, error) {
+	if statement == nil || statement.tree == nil ||
+		column < 0 || column >= len(statement.tree.Columns) {
+		return nil, fmt.Errorf(
+			"query: recursive SQL unknown output %d is invalid: %w",
+			column, errStatementRecursiveDefinition,
+		)
+	}
+	expr := statement.tree.Columns[column].Scalar
+	if expr == nil {
+		return coercions, nil
+	}
+	needsRuntime := false
+	position := expr.Pos
+	switch expr.Kind {
+	case sqlast.ScalarNull:
+		return coercions, nil
+	case sqlast.ScalarLiteral:
+		position = expr.Value.Pos
+		switch expr.Value.Kind {
+		case sqlast.OperandString:
+			if target == OutputSQLBool {
+				if _, err := castScalarBoolean(position, statementScalarValue{
+					value: scalar{kind: kindString, sval: expr.Value.Text},
+				}); err != nil {
+					return nil, err
+				}
+				needsRuntime = true
+			}
+		case sqlast.OperandParam:
+			paramType := parameterTypeForRepresentation(target)
+			if paramType == ParameterTypeUnspecified {
+				return nil, fmt.Errorf(
+					"query: recursive SQL output target %d has no parameter type: %w",
+					target, ErrParameterType,
+				)
+			}
+			if err := statement.mergeParameterType(
+				statement.paramBase+expr.Value.Ordinal, paramType, position,
+			); err != nil {
+				return nil, err
+			}
+			needsRuntime = true
+		}
+	}
+	if !needsRuntime {
+		return coercions, nil
+	}
+	if coercions == nil {
+		coercions = make([]setStatementColumnCoercion, len(statement.tree.Columns))
+	}
+	coercions[column] = setStatementColumnCoercion{target: target, pos: position}
+	return coercions, nil
+}
+
+func recursiveSQLResultPosition(tree *sqlast.SelectStmt, column int) int {
+	if tree == nil || column < 0 || column >= len(tree.Columns) {
+		return 0
+	}
+	output := &tree.Columns[column]
+	if output.Scalar == nil {
+		return output.Pos
+	}
+	if output.Scalar.Kind == sqlast.ScalarCast && output.Scalar.TypedConstant {
+		return output.Scalar.TargetPos
+	}
+	if output.Scalar.Kind == sqlast.ScalarLiteral {
+		return output.Scalar.Value.Pos
+	}
+	return output.Scalar.Pos
 }
 
 func positionedRecursiveSQLCloneError(

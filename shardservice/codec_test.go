@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -135,6 +136,21 @@ func TestRequestRoundTrip(t *testing.T) {
 				AllocationGeneration: 6,
 				RoutingVersion:       42,
 				OwnershipEpoch:       9,
+			},
+		},
+		{
+			name: "analysis_parameter_types",
+			req: &ShardRequest{
+				SQL: "SELECT $1,$2,$3,$4,$5,$6",
+				Params: []Param{
+					BoolParam(true), StringParam("text"), StringParam("varchar"),
+					StringParam("name"), StringParam("bpchar"), NullParam(),
+				},
+				ParamTypes: []sqldriver.ParamType{
+					sqldriver.ParamTypeBool, sqldriver.ParamTypeText,
+					sqldriver.ParamTypeVarchar, sqldriver.ParamTypeName,
+					sqldriver.ParamTypeBPChar, sqldriver.ParamTypeOther,
+				},
 			},
 		},
 		{
@@ -325,6 +341,9 @@ func TestRequestRoundTrip(t *testing.T) {
 			}
 			if len(got.Params) != len(tc.req.Params) {
 				t.Fatalf("params = %d, want %d", len(got.Params), len(tc.req.Params))
+			}
+			if !slices.Equal(got.ParamTypes, tc.req.ParamTypes) {
+				t.Errorf("ParamTypes = %v, want %v", got.ParamTypes, tc.req.ParamTypes)
 			}
 			for i := range got.Params {
 				if got.Params[i].Kind != tc.req.Params[i].Kind ||
@@ -1050,6 +1069,49 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 			want: errBadParam,
 		},
 		{
+			name: "parameter_type_count_mismatch",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: "SELECT $1", Params: []Param{NullParam()},
+					ParamTypes: []sqldriver.ParamType{
+						sqldriver.ParamTypeBool, sqldriver.ParamTypeText,
+					},
+				})
+			},
+			want: errBadParameterTypes,
+		},
+		{
+			name: "all_unspecified_parameter_types",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: "SELECT $1", Params: []Param{NullParam()},
+					ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeUnspecified},
+				})
+			},
+			want: errBadParameterTypes,
+		},
+		{
+			name: "invalid_parameter_type",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: "SELECT $1", Params: []Param{NullParam()},
+					ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeInvalid},
+				})
+			},
+			want: errBadParameterTypes,
+		},
+		{
+			name: "document_parameter_has_scalar_type",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL:        "INSERT INTO docs VALUES ($1)",
+					Params:     []Param{DocumentParam(`{"id":"a"}`)},
+					ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeOther},
+				})
+			},
+			want: errBadParameterTypes,
+		},
+		{
 			name: "read_fence_on_transaction_command",
 			enc: func() error {
 				return EncodeRequest(io.Discard, &ShardRequest{
@@ -1057,6 +1119,21 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 					Transaction: TransactionRequest{
 						Operation: TransactionReleaseReadFence,
 						ID:        testTransactionID(71), Revision: 1,
+					},
+				})
+			},
+			want: errBadTransaction,
+		},
+		{
+			name: "parameter_types_on_transaction_command",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL:        "SELECT $1",
+					Params:     []Param{NullParam()},
+					ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeBool},
+					Transaction: TransactionRequest{
+						Operation: TransactionReleaseReadFence,
+						ID:        testTransactionID(72), Revision: 1,
 					},
 				})
 			},
@@ -1204,6 +1281,28 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.enc(); !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestParameterTypeDecodeRejectsNonCanonicalMetadata(t *testing.T) {
+	request := &ShardRequest{
+		SQL: "SELECT $1", Params: []Param{NullParam()},
+		ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeBool},
+	}
+	for _, test := range []struct {
+		name     string
+		typeByte byte
+	}{
+		{name: "invalid", typeByte: byte(sqldriver.ParamTypeInvalid)},
+		{name: "all_unspecified", typeByte: byte(sqldriver.ParamTypeUnspecified)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			frame := append([]byte(nil), encodeRequest(t, request)...)
+			frame[len(frame)-1] = test.typeByte
+			if _, err := DecodeRequest(bytes.NewReader(frame)); !errors.Is(err, errBadParameterTypes) {
+				t.Fatalf("DecodeRequest = %v, want %v", err, errBadParameterTypes)
 			}
 		})
 	}

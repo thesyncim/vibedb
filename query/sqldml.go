@@ -176,6 +176,18 @@ type DMLStatement struct {
 	// "every document" by failing to look at one pointer.
 	all    bool
 	params int
+	// paramTypes is the flattened analysis-time input contract of mutation-owned
+	// SELECTs (INSERT sources and UPDATE/DELETE filters). It remains nil when
+	// every mutation parameter is schemaless.
+	paramTypes []ParameterType
+	// paramTypePositions stores the first authored byte position plus one at
+	// which each mutation parameter acquired its analyzed type. It remains nil on
+	// the untyped path and is used only for diagnostics.
+	paramTypePositions []int
+	// paramTypeTargetDefaults preserves the target-list-default provenance of
+	// mutation-owned SELECTs. It is nil unless an unresolved output was finalized
+	// to text during preparation.
+	paramTypeTargetDefaults []bool
 
 	// scan is the filter pass this statement's Filter hands back, retained
 	// rather than minted per execution. Its batch buffers and its scratch
@@ -221,12 +233,40 @@ func PrepareParsedDML(
 	src string,
 	tree *sqlast.Statement,
 ) (*DMLStatement, error) {
+	return PrepareParsedDMLWithParameterTypes(src, tree, nil)
+}
+
+// PrepareParsedDMLWithParameterTypes lowers an already-parsed non-SELECT
+// statement while treating each non-unspecified entry as an analysis-time input
+// type for the corresponding placeholder. Only the SELECT-owned portions of a
+// mutation consume the hints: INSERT query sources and UPDATE/DELETE filters.
+// The slice is borrowed only for this call. Supplying nil is exactly equivalent
+// to PrepareParsedDML and preserves the ordinary allocation profile.
+func PrepareParsedDMLWithParameterTypes(
+	src string,
+	tree *sqlast.Statement,
+	parameterTypes []ParameterType,
+) (*DMLStatement, error) {
 	if tree == nil {
 		return nil, fmt.Errorf("query: PrepareParsedDML was given a nil statement")
 	}
 	if tree.Kind == sqlast.KindSelect {
 		return nil, fmt.Errorf(
 			"query: PrepareParsedDML was given a SELECT, which returns rows; use PrepareParsedStatement")
+	}
+	if len(parameterTypes) > tree.Params() {
+		return nil, fmt.Errorf(
+			"query: %d parameter type hints exceed %d placeholders: %w",
+			len(parameterTypes), tree.Params(), ErrParameterType,
+		)
+	}
+	for _, parameterType := range parameterTypes {
+		if parameterType >= ParameterTypeInvalid {
+			return nil, fmt.Errorf(
+				"query: invalid parameter type hint %d: %w",
+				parameterType, ErrParameterType,
+			)
+		}
 	}
 	d := &DMLStatement{text: src, tree: tree, params: tree.Params()}
 	switch tree.Kind {
@@ -237,7 +277,9 @@ func PrepareParsedDML(
 				compileInsertFlatFields(tree.Insert)
 		}
 		if tree.Insert.Source != nil {
-			source, err := prepareTree(src, tree.Insert.Source)
+			source, err := prepareTreeWithParameterTypesPreservingUnknownOutput(
+				src, tree.Insert.Source, parameterTypes,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -256,12 +298,16 @@ func PrepareParsedDML(
 		}
 	case sqlast.KindUpdate:
 		d.kind = DMLUpdate
-		if err := d.prepareFilter(src, tree.Update.Filter, false); err != nil {
+		if err := d.prepareFilter(
+			src, tree.Update.Filter, false, parameterTypes,
+		); err != nil {
 			return nil, err
 		}
 	case sqlast.KindDelete:
 		d.kind = DMLDelete
-		if err := d.prepareFilter(src, tree.Delete.Filter, tree.Delete.All); err != nil {
+		if err := d.prepareFilter(
+			src, tree.Delete.Filter, tree.Delete.All, parameterTypes,
+		); err != nil {
 			return nil, err
 		}
 	case sqlast.KindCreateTable:
@@ -281,6 +327,10 @@ func PrepareParsedDML(
 			"query: PrepareParsedDML was given unsupported statement kind %d",
 			tree.Kind,
 		)
+	}
+	if err := d.prepareParameterTypes(); err != nil {
+		d.Release()
+		return nil, err
 	}
 	return d, nil
 }
@@ -311,12 +361,17 @@ func validateInsertSelectShape(source *Statement, insert *sqlast.InsertStmt) err
 
 // prepareFilter compiles the statement's row selection unless the statement
 // acts on every document.
-func (d *DMLStatement) prepareFilter(src string, tree *sqlast.SelectStmt, all bool) error {
+func (d *DMLStatement) prepareFilter(
+	src string,
+	tree *sqlast.SelectStmt,
+	all bool,
+	parameterTypes []ParameterType,
+) error {
 	d.all = all
 	if tree == nil || all {
 		return nil
 	}
-	filter, err := prepareTree(src, tree)
+	filter, err := prepareTreeWithParameterTypes(src, tree, parameterTypes)
 	if err != nil {
 		return err
 	}
@@ -332,6 +387,90 @@ func (d *DMLStatement) Collection() string { return d.tree.Table() }
 
 // NumParams returns the number of '?' placeholders.
 func (d *DMLStatement) NumParams() int { return d.params }
+
+// ParameterType reports the SQL input domain inferred for one mutation
+// placeholder by its prepared source or filter. The lookup is allocation-free.
+func (d *DMLStatement) ParameterType(index int) ParameterType {
+	if d == nil || index < 0 || index >= d.params {
+		return ParameterTypeInvalid
+	}
+	if index >= len(d.paramTypes) {
+		return ParameterTypeUnspecified
+	}
+	return d.paramTypes[index]
+}
+
+// ParameterTypePosition reports the zero-based authored byte offset at which a
+// mutation placeholder acquired its analyzed type. A declared-only,
+// unspecified, or out-of-range parameter returns -1.
+func (d *DMLStatement) ParameterTypePosition(index int) int {
+	if d == nil || index < 0 || index >= d.params ||
+		index >= len(d.paramTypePositions) || d.paramTypePositions[index] == 0 {
+		return -1
+	}
+	return d.paramTypePositions[index] - 1
+}
+
+// ParameterTypeTargetDefault reports whether a mutation parameter's type came
+// only from PostgreSQL's final unresolved-target coercion.
+func (d *DMLStatement) ParameterTypeTargetDefault(index int) bool {
+	return d != nil && index >= 0 && index < d.params &&
+		index < len(d.paramTypeTargetDefaults) &&
+		d.paramTypeTargetDefaults[index]
+}
+
+func (d *DMLStatement) prepareParameterTypes() error {
+	if d == nil || d.params == 0 {
+		return nil
+	}
+	for _, child := range []*Statement{d.source, d.filter} {
+		if child == nil || len(child.paramTypes) == 0 {
+			continue
+		}
+		for local, paramType := range child.paramTypes {
+			if paramType == ParameterTypeUnspecified {
+				continue
+			}
+			absolute := child.paramBase + local
+			if absolute < 0 || absolute >= d.params {
+				return fmt.Errorf(
+					"query: mutation parameter ordinal %d is outside %d parameters: %w",
+					absolute, d.params, ErrParameterType,
+				)
+			}
+			if d.paramTypes == nil {
+				d.paramTypes = make([]ParameterType, d.params)
+			}
+			existing := d.paramTypes[absolute]
+			if existing != ParameterTypeUnspecified && existing != paramType {
+				return fmt.Errorf(
+					"query: mutation parameter %d is inferred as both %s and %s: %w",
+					absolute+1, existing, paramType, ErrParameterType,
+				)
+			}
+			d.paramTypes[absolute] = paramType
+			if child.ParameterTypeTargetDefault(local) {
+				if d.paramTypeTargetDefaults == nil {
+					d.paramTypeTargetDefaults = make([]bool, d.params)
+				}
+				d.paramTypeTargetDefaults[absolute] = true
+			} else if absolute < len(d.paramTypeTargetDefaults) {
+				d.paramTypeTargetDefaults[absolute] = false
+			}
+			if position := child.ParameterTypePosition(local); position >= 0 {
+				if d.paramTypePositions == nil {
+					d.paramTypePositions = make([]int, d.params)
+				}
+				encoded := position + 1
+				if d.paramTypePositions[absolute] == 0 ||
+					encoded < d.paramTypePositions[absolute] {
+					d.paramTypePositions[absolute] = encoded
+				}
+			}
+		}
+	}
+	return nil
+}
 
 // SQL returns the statement text as it was prepared.
 func (d *DMLStatement) SQL() string { return d.text }

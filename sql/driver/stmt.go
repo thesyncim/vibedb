@@ -32,6 +32,18 @@ type stmt struct {
 	catalogJoin        bool
 	params             int
 	paramKinds         []ParamKind
+	// paramTypes is absent for the ordinary schemaless path. It is allocated
+	// only when statement analysis constrains at least one scalar parameter to
+	// an exact SQL input domain.
+	paramTypes []ParamType
+	// paramTypePositions stores the first authored byte position plus one for
+	// inferred typed parameters. It is absent with paramTypes and is consumed by
+	// protocol adapters only when reporting a Parse-time type conflict.
+	paramTypePositions []int
+	// paramTypeTargetDefaults is absent unless PostgreSQL's unresolved target-list
+	// rule supplied a parameter's text type. It is cold metadata only; execution
+	// never reads it.
+	paramTypeTargetDefaults []bool
 	// paramPositions stores authored byte positions plus one for document
 	// placeholders only. It remains nil for the scalar-only path.
 	paramPositions []int
@@ -48,6 +60,95 @@ var (
 )
 
 func (s *stmt) NumInput() int { return s.params }
+
+type preparedParameterTyper interface {
+	NumParams() int
+	ParameterType(int) query.ParameterType
+}
+
+type preparedParameterTypePositioner interface {
+	ParameterTypePosition(int) int
+}
+
+type preparedParameterTypeTargetDefaulter interface {
+	ParameterTypeTargetDefault(int) bool
+}
+
+func (s *stmt) applyPreparedParamTypes(statement preparedParameterTyper, base int) error {
+	if s == nil || statement == nil || statement.NumParams() == 0 {
+		return nil
+	}
+	if base < 0 || base > s.params || statement.NumParams() > s.params-base {
+		return fmt.Errorf(
+			"vibedb: query parameter range [%d,%d) exceeds statement parameter count %d",
+			base, base+statement.NumParams(), s.params,
+		)
+	}
+	positioner, hasPositions := statement.(preparedParameterTypePositioner)
+	defaulter, hasTargetDefaults := statement.(preparedParameterTypeTargetDefaulter)
+	for local := 0; local < statement.NumParams(); local++ {
+		var inferred ParamType
+		switch statement.ParameterType(local) {
+		case query.ParameterTypeUnspecified:
+			continue
+		case query.ParameterTypeBool:
+			inferred = ParamTypeBool
+		case query.ParameterTypeText:
+			inferred = ParamTypeText
+		case query.ParameterTypeVarchar:
+			inferred = ParamTypeVarchar
+		case query.ParameterTypeName:
+			inferred = ParamTypeName
+		case query.ParameterTypeBPChar:
+			inferred = ParamTypeBPChar
+		case query.ParameterTypeOther:
+			inferred = ParamTypeOther
+		default:
+			return fmt.Errorf(
+				"vibedb: query returned invalid type metadata for parameter %d", local+1,
+			)
+		}
+		ordinal := base + local
+		if ordinal >= len(s.paramKinds) || s.paramKinds[ordinal] != ParamScalar {
+			return fmt.Errorf(
+				"vibedb: parameter %d cannot be both a JSON document and %s",
+				ordinal+1, inferred,
+			)
+		}
+		if s.paramTypes == nil {
+			s.paramTypes = make([]ParamType, s.params)
+		}
+		if existing := s.paramTypes[ordinal]; existing != ParamTypeUnspecified && existing != inferred {
+			return fmt.Errorf(
+				"vibedb: parameter %d cannot be both %s and %s",
+				ordinal+1, existing, inferred,
+			)
+		}
+		s.paramTypes[ordinal] = inferred
+		if hasTargetDefaults && defaulter.ParameterTypeTargetDefault(local) {
+			if s.paramTypeTargetDefaults == nil {
+				s.paramTypeTargetDefaults = make([]bool, s.params)
+			}
+			s.paramTypeTargetDefaults[ordinal] = true
+		} else if ordinal < len(s.paramTypeTargetDefaults) {
+			s.paramTypeTargetDefaults[ordinal] = false
+		}
+		if hasPositions {
+			position := positioner.ParameterTypePosition(local)
+			if position >= 0 {
+				if s.paramTypePositions == nil {
+					s.paramTypePositions = make([]int, s.params)
+				}
+				encoded := position + 1
+				if s.paramTypePositions[ordinal] == 0 ||
+					encoded < s.paramTypePositions[ordinal] {
+					s.paramTypePositions[ordinal] = encoded
+				}
+			}
+		}
+	}
+	return nil
+}
 
 func (s *stmt) checkArgumentCount(got int) error {
 	want := s.NumInput()
@@ -105,6 +206,9 @@ func (s *stmt) Close() error {
 	s.serialMutationSafe = false
 	s.catalogJoin = false
 	s.paramKinds = nil
+	s.paramTypes = nil
+	s.paramTypePositions = nil
+	s.paramTypeTargetDefaults = nil
 	s.paramPositions = nil
 	s.dependencies = nil
 	s.explain = false

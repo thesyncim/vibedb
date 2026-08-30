@@ -55,6 +55,9 @@ func (r *statementScalar) compileCase(s *Statement, expr *sqlast.ScalarExpr) (in
 	if len(expr.Whens) == 0 {
 		return 0, fmt.Errorf("query: scalar CASE has no WHEN arms")
 	}
+	if err := validateTypedCaseResultDomains(s, expr); err != nil {
+		return 0, err
+	}
 	root := int32(len(r.nodes))
 	caseIndex := int32(len(r.cases))
 	r.cases = append(r.cases, statementScalarCase{})
@@ -234,9 +237,271 @@ func (r *statementScalar) compileCase(s *Statement, expr *sqlast.ScalarExpr) (in
 		program.fallbackDom = caseDomainNull
 	}
 	program.domain = domain
+	if err := inferTypedCaseParameterTypes(s, expr, &program); err != nil {
+		return 0, err
+	}
 	r.cases[caseIndex] = program
 	r.nodes[root].skip = int32(len(r.nodes))
 	return root, nil
+}
+
+// inferTypedCaseParameterTypes records only the PostgreSQL type-resolution
+// contexts introduced by a type 'string' expression. Direct unknown
+// placeholders in a CASE comparison or result inherit the selected BOOL/TEXT
+// domain; ordinary schemaless CASE expressions keep unspecified metadata.
+// pgwire can then run boolin once while binding, leaving row execution as a
+// native boolean comparison with no conversion or allocation in the hot path.
+func inferTypedCaseParameterTypes(
+	s *Statement,
+	expr *sqlast.ScalarExpr,
+	program *statementScalarCase,
+) error {
+	if s == nil || expr == nil || program == nil {
+		return nil
+	}
+	if program.simple && typedSimpleCaseComparison(expr) {
+		paramType := caseDomainParameterType(program.simpleDom)
+		if paramType != ParameterTypeUnspecified {
+			if err := mergeDirectCaseComparisonParameterType(
+				s, expr.Left, paramType, true,
+			); err != nil {
+				return err
+			}
+			for i := range expr.Whens {
+				if err := mergeDirectCaseComparisonParameterType(
+					s, expr.Whens[i].Match, paramType, false,
+				); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if !typedCaseResults(expr) {
+		return nil
+	}
+	paramType := caseDomainParameterType(program.domain)
+	if paramType == ParameterTypeUnspecified {
+		return nil
+	}
+	for i := range expr.Whens {
+		if err := mergeDirectCaseParameterType(
+			s, expr.Whens[i].Result, paramType,
+		); err != nil {
+			return err
+		}
+	}
+	return mergeDirectCaseParameterType(s, expr.Else, paramType)
+}
+
+func mergeDirectCaseComparisonParameterType(
+	s *Statement,
+	expr *sqlast.ScalarExpr,
+	paramType ParameterType,
+	parameterOnLeft bool,
+) error {
+	if s == nil || expr == nil || expr.Kind != sqlast.ScalarLiteral ||
+		expr.Value.Kind != sqlast.OperandParam {
+		return nil
+	}
+	existing := s.ParameterType(expr.Value.Ordinal)
+	if existing != ParameterTypeUnspecified && existing != paramType &&
+		!parameterTypesShareStringCategory(existing, paramType) {
+		left, right := paramType.String(), existing.String()
+		if parameterOnLeft {
+			left, right = existing.String(), paramType.String()
+		}
+		return sqlast.NewUndefinedOperatorError(s.text, expr.Value.Pos, left, right)
+	}
+	return mergeDirectCaseParameterType(s, expr, paramType)
+}
+
+func mergeDirectCaseParameterType(
+	s *Statement,
+	expr *sqlast.ScalarExpr,
+	paramType ParameterType,
+) error {
+	if expr == nil || expr.Kind != sqlast.ScalarLiteral ||
+		expr.Value.Kind != sqlast.OperandParam {
+		return nil
+	}
+	ordinal := expr.Value.Ordinal
+	if ordinal < 0 || s.paramBase > int(^uint(0)>>1)-ordinal {
+		return fmt.Errorf("query: scalar CASE parameter ordinal overflows: %w", ErrParameterType)
+	}
+	return s.mergeParameterType(s.paramBase+ordinal, paramType, expr.Value.Pos)
+}
+
+func caseDomainParameterType(domain scalarCaseDomain) ParameterType {
+	switch domain {
+	case caseDomainBoolean:
+		return ParameterTypeBool
+	case caseDomainText:
+		return ParameterTypeText
+	default:
+		return ParameterTypeUnspecified
+	}
+}
+
+func typedSimpleCaseComparison(expr *sqlast.ScalarExpr) bool {
+	if expr == nil || expr.Kind != sqlast.ScalarCase || expr.Left == nil {
+		return false
+	}
+	if scalarExpressionHasTypedResult(expr.Left) {
+		return true
+	}
+	for i := range expr.Whens {
+		if scalarExpressionHasTypedResult(expr.Whens[i].Match) {
+			return true
+		}
+	}
+	return false
+}
+
+func typedCaseResults(expr *sqlast.ScalarExpr) bool {
+	if expr == nil || expr.Kind != sqlast.ScalarCase {
+		return false
+	}
+	if scalarExpressionHasTypedResult(expr.Else) {
+		return true
+	}
+	for i := range expr.Whens {
+		if scalarExpressionHasTypedResult(expr.Whens[i].Result) {
+			return true
+		}
+	}
+	return false
+}
+
+// scalarExpressionHasTypedResult follows output-producing children only. A
+// typed value used solely as a nested simple-CASE selector constrains that
+// comparison, not the nested CASE result seen by its parent.
+func scalarExpressionHasTypedResult(expr *sqlast.ScalarExpr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.TypedConstant {
+		return true
+	}
+	if expr.Kind != sqlast.ScalarCase {
+		return scalarExpressionHasTypedResult(expr.Left) ||
+			scalarExpressionHasTypedResult(expr.Right)
+	}
+	if scalarExpressionHasTypedResult(expr.Else) {
+		return true
+	}
+	for i := range expr.Whens {
+		if scalarExpressionHasTypedResult(expr.Whens[i].Result) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateTypedCaseResultDomains gives the PostgreSQL typed-constant seam the
+// same datatype-mismatch class and ELSE-first error position as
+// select_common_type. Ordinary schemaless CASE keeps its established explicit
+// 0A000 refusal; this preflight activates only when a result descends from the
+// type 'string' grammar production.
+func validateTypedCaseResultDomains(s *Statement, expr *sqlast.ScalarExpr) error {
+	if s == nil || expr == nil || expr.Kind != sqlast.ScalarCase ||
+		!typedCaseResults(expr) {
+		return nil
+	}
+	candidate := caseDomainNull
+	if expr.Else != nil {
+		candidate = scalarASTCaseDomain(s, expr.Else)
+	}
+	for i := range expr.Whens {
+		result := expr.Whens[i].Result
+		domain := scalarASTCaseDomain(s, result)
+		merged, ok := unifyCaseDomain(candidate, domain)
+		if !ok {
+			return &ScalarTypeError{
+				Pos: typedCaseResultPosition(result), Operation: "CASE common type",
+				Left: candidate.valueType(), Right: domain.valueType(),
+			}
+		}
+		candidate = merged
+	}
+	return nil
+}
+
+func scalarASTCaseDomain(s *Statement, expr *sqlast.ScalarExpr) scalarCaseDomain {
+	if expr == nil || expr.Kind == sqlast.ScalarNull {
+		return caseDomainNull
+	}
+	switch expr.Kind {
+	case sqlast.ScalarPath:
+		return caseDomainDynamic
+	case sqlast.ScalarLiteral:
+		switch expr.Value.Kind {
+		case sqlast.OperandBool:
+			return caseDomainBoolean
+		case sqlast.OperandNumber:
+			return caseDomainNumeric
+		case sqlast.OperandString:
+			return caseDomainText
+		case sqlast.OperandParam:
+			if s == nil {
+				return caseDomainDynamic
+			}
+			switch s.ParameterType(expr.Value.Ordinal) {
+			case ParameterTypeBool:
+				return caseDomainBoolean
+			case ParameterTypeText, ParameterTypeVarchar,
+				ParameterTypeName, ParameterTypeBPChar:
+				return caseDomainText
+			default:
+				return caseDomainDynamic
+			}
+		default:
+			return caseDomainDynamic
+		}
+	case sqlast.ScalarUnary, sqlast.ScalarAggregate:
+		return caseDomainNumeric
+	case sqlast.ScalarBinary:
+		if expr.Op == sqlast.ScalarConcat {
+			return caseDomainText
+		}
+		return caseDomainNumeric
+	case sqlast.ScalarCast:
+		switch expr.Cast {
+		case sqlast.ScalarCastBoolean:
+			return caseDomainBoolean
+		case sqlast.ScalarCastText:
+			return caseDomainText
+		case sqlast.ScalarCastNumeric:
+			return caseDomainNumeric
+		default:
+			return caseDomainJSON
+		}
+	case sqlast.ScalarCase:
+		candidate := caseDomainNull
+		if expr.Else != nil {
+			candidate = scalarASTCaseDomain(s, expr.Else)
+		}
+		for i := range expr.Whens {
+			result := scalarASTCaseDomain(s, expr.Whens[i].Result)
+			merged, ok := unifyCaseDomain(candidate, result)
+			if !ok {
+				return caseDomainDynamic
+			}
+			candidate = merged
+		}
+		return candidate
+	default:
+		return caseDomainDynamic
+	}
+}
+
+func typedCaseResultPosition(expr *sqlast.ScalarExpr) int {
+	if expr == nil {
+		return 0
+	}
+	if expr.Kind == sqlast.ScalarCast && expr.TypedConstant {
+		return expr.TargetPos
+	}
+	return expr.Pos
 }
 
 type scalarCaseCompileMark struct {

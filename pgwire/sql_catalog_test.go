@@ -822,13 +822,15 @@ func TestSQLCatalogCancellationRollsBackAndDoesNotPoisonNextStatement(t *testing
 
 func TestPreparedDerivedChargeIncludesRetainedCapacities(t *testing.T) {
 	stmt := &prepared{
-		sql:        `SELECT id FROM docs WHERE id = $1`,
-		paramKinds: make([]sqldriver.ParamKind, 3, 4),
-		paramOrder: make([]int, 2, 8),
+		sql:                `SELECT id FROM docs WHERE id = $1`,
+		paramKinds:         make([]sqldriver.ParamKind, 3, 4),
+		paramTypes:         make([]sqldriver.ParamType, 2, 4),
+		paramTypePositions: make([]int, 2, 4),
+		paramOrder:         make([]int, 2, 8),
 	}
 	want := preparedPlanFixedBytes +
 		preparedPlanByteMultiplier*len(stmt.sql) +
-		8*4 + 8*8 + len(stmt.sql)
+		8*4 + 8*4 + 8*4 + 8*8 + len(stmt.sql)
 	if got := preparedDerivedCharge(stmt); got != want {
 		t.Fatalf("prepared derived charge = %d, want %d", got, want)
 	}

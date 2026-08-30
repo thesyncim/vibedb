@@ -50,28 +50,27 @@ func TestSQLSetValuesTableRootsSimpleExtendedAndPositionedRecovery(t *testing.T)
 	description := decodeRowDescription(t, find(t, msgs, msgRowDescription).body)
 	if len(description) != 2 || description[0].name != "column1" ||
 		description[1].name != "column2" ||
-		description[0].oid != oidJSON || description[1].oid != oidJSON {
+		description[0].oid != oidJSON || description[1].oid != oidText {
 		t.Fatalf("VALUES RowDescription = %+v", description)
 	}
 	rows := rowsOf(t, msgs)
 	if len(rows) != 2 || string(rows[0][0]) != "2" || rows[0][1] != nil ||
-		string(rows[1][0]) != "1" || string(rows[1][1]) != `"one"` {
+		string(rows[1][0]) != "1" || string(rows[1][1]) != `one` {
 		t.Fatalf("VALUES rows = %q", rows)
 	}
 	if got := commandTagOf(t, msgs); got != "SELECT 2" {
 		t.Fatalf("VALUES command tag = %q", got)
 	}
 
-	msgs = extendedSQL(c,
-		`(VALUES ($1) ORDER BY column1) UNION ALL `+
-			`SELECT n FROM set_a ORDER BY column1`,
+	extended := `(VALUES ($1) ORDER BY column1) UNION ALL ` +
+		`SELECT n FROM set_a ORDER BY column1`
+	msgs = extendedSQL(c, extended,
 		[][]byte{[]byte("0")},
 	)
-	rows = rowsOf(t, msgs)
-	if len(rows) != 4 || string(rows[0][0]) != "0" ||
-		string(rows[1][0]) != "1" || string(rows[2][0]) != "2" ||
-		string(rows[3][0]) != "4" {
-		t.Fatalf("extended leading VALUES rows = %q", rows)
+	fields := expectError(t, msgs, sqlstateDatatypeMismatch)
+	wantPosition := strconv.Itoa(strings.Index(extended, "n FROM") + 1)
+	if fields['P'] != wantPosition {
+		t.Fatalf("extended leading VALUES mismatch position = %q, want %q", fields['P'], wantPosition)
 	}
 
 	msgs = c.query(`TABLE set_a`)
@@ -86,7 +85,7 @@ func TestSQLSetValuesTableRootsSimpleExtendedAndPositionedRecovery(t *testing.T)
 	}
 
 	statement := `/* préfix */ VALUES (1) UNION SELECT id, n FROM set_a`
-	fields := expectError(t, c.query(statement), sqlstateSyntaxError)
+	fields = expectError(t, c.query(statement), sqlstateSyntaxError)
 	bytePosition := strings.Index(statement, "UNION")
 	want := strconv.Itoa(len([]rune(statement[:bytePosition])) + 1)
 	if fields['P'] != want {

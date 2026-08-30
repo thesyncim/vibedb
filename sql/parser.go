@@ -935,6 +935,9 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	col := ResultColumn{Pos: p.tok.pos}
 	standaloneStar := false
+	if _, _, known := scalarTypedStringHead(p.tok); known {
+		return p.parseTypedHeadResultColumn(col)
+	}
 	if scalarStarts(p.tok) {
 		expr, err := p.parseScalarExpression(scalarSelect)
 		if err != nil {
@@ -946,6 +949,15 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 			return col, err
 		}
 		col.Alias = alias
+		if col.Alias == "" {
+			col.Alias = typedConstantOutputName(expr)
+		}
+		if expr.Kind == ScalarPath {
+			// A BOOL/TEXT type head without a following string is an ordinary
+			// path. Restore the native projection shape so fields with those
+			// names pay no scalar execution sidecar.
+			col.Path, col.Scalar = expr.Path, nil
+		}
 		return col, nil
 	}
 	if kind, ok := windowOnlyFunctionOf(p.tok.kw); ok {
@@ -1021,6 +1033,97 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		}
 	}
 	return col, nil
+}
+
+func (p *Parser) parseTypedHeadResultColumn(col ResultColumn) (ResultColumn, error) {
+	target, supported, _ := scalarTypedStringHead(p.tok)
+	head := p.tok
+	p.advance()
+	if p.tok.kind != tokString {
+		if err := p.rejectUnsupportedTypedStringSuffix(head); err != nil {
+			return col, err
+		}
+		path, err := p.continuePath(head, true)
+		if err != nil {
+			return col, err
+		}
+		if err := p.rejectQualifiedTypedStringPath(head, path); err != nil {
+			return col, err
+		}
+		col.Path = path
+		if scalarContinues(p.tok) {
+			expr, err := p.continueScalarExpression(p.scalarFromColumn(col), scalarSelect)
+			if err != nil {
+				return col, err
+			}
+			col.Path, col.Scalar = nil, expr
+		}
+		alias, err := p.parseColumnAlias(true)
+		if err != nil {
+			return col, err
+		}
+		col.Alias = alias
+		if alias == "" && col.Path != nil && len(p.pending) > 0 {
+			last := p.pending[len(p.pending)-1]
+			if last.path == col.Path && last.document {
+				col.Alias = DocumentColumn
+			}
+		}
+		return col, nil
+	}
+
+	value, err := p.parseTypedStringAfterHead(head, target, supported)
+	if err != nil {
+		return col, err
+	}
+	literal := p.newScalar(ScalarLiteral, value.Pos)
+	literal.Value = value
+	cast := p.newScalar(ScalarCast, value.Pos)
+	cast.Cast, cast.Left, cast.TargetPos = target, literal, head.pos
+	cast.TypedConstant = true
+	expr, err := p.continueScalarExpression(cast, scalarSelect)
+	if err != nil {
+		return col, err
+	}
+	col.Scalar = expr
+	alias, err := p.parseColumnAlias(true)
+	if err != nil {
+		return col, err
+	}
+	col.Alias = alias
+	if col.Alias == "" {
+		col.Alias = typedConstantOutputName(expr)
+	}
+	return col, nil
+}
+
+// typedConstantOutputName mirrors PostgreSQL FigureColname for the supported
+// typed-string slice. Parentheses disappear from the AST and an outer cast
+// replaces the weaker inner type name; any arithmetic or concatenation root
+// deliberately falls back to ?column?.
+func typedConstantOutputName(expr *ScalarExpr) string {
+	if expr == nil || expr.Kind != ScalarCast {
+		return ""
+	}
+	found := false
+	for node := expr; node != nil && node.Kind == ScalarCast; node = node.Left {
+		found = found || node.TypedConstant
+	}
+	if !found {
+		return ""
+	}
+	switch expr.Cast {
+	case ScalarCastText:
+		return "text"
+	case ScalarCastBoolean:
+		return "bool"
+	case ScalarCastNumeric:
+		return "numeric"
+	case ScalarCastJSON:
+		return "json"
+	default:
+		return ""
+	}
 }
 
 // discardExistsLiteralProjection retains the existing cheap whole-row plan

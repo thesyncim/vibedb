@@ -1,5 +1,5 @@
 disk checkpoint-group=format=0;certificate=current;recovery=current
-disk replicated-apply=format=0;catalog=current;settlement=current
+disk replicated-apply=format=0;catalog=current;settlement=current;sql-param-types=count-bit31+u8-vector
 disk request-ledger=$REQUEST_LEDGER_SEMANTICS
 disk sql-catalog=format=0;codec=vibejson;unknown-fields=reject
 wire build-preface=bytes=104;endian=big;grammar=exact
@@ -7,4 +7,4 @@ wire raft=ordinary+snapshot;identity=mtls;frames=current
 wire request-ledger=$REQUEST_LEDGER_SEMANTICS
 wire shard-control=identity=mtls;frames=current
 wire shard-native=identity=mtls;frames=current
-wire shard-sql=identity=mtls;frames=current
+wire shard-sql=identity=mtls;frames=current;sql-param-types=marker-e3+u32-count+u8-vector

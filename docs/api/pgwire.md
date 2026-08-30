@@ -167,7 +167,14 @@ partial materialized result.
 | --- | --- |
 | Syntax error | `42601` |
 | Unsupported feature | `0A000` |
+| Invalid text representation | `22P02` |
+| Invalid binary representation | `22P03` |
+| Name too long | `42622` |
 | Missing table | `42P01` |
+| Ambiguous parameter | `42P08` |
+| Datatype mismatch | `42804` |
+| Cannot coerce | `42846` |
+| Undefined operator | `42883` |
 | Unique violation | `23505` |
 | Check violation | `23514` |
 | Serialization failure | `40001` |
@@ -182,10 +189,21 @@ Error positions use 1-based character positions.
 
 ## Result metadata
 
-SQL results use JSON OID 114, int8 OID 20, boolean OID 16, or text OID 25.
-Schemaless fields and numeric scalar results generally use JSON metadata.
-`COUNT` and integer-valued window functions use int8. Boolean and text casts
+SQL results use JSON OID 114, int8 OID 20, boolean OID 16, text OID 25,
+varchar OID 1043, name OID 19, or bpchar OID 1042. Schemaless fields and
+numeric scalar results generally use JSON metadata.
+`COUNT` and integer-valued window functions use int8. Boolean and text casts,
+typed constants, and their resolved `CASE`, `VALUES`, or set-operation outputs
 use their native OIDs.
+
+`Parse`/`Describe` also expose an inferred boolean or text parameter OID when a
+supported `CASE`, `VALUES`, or set common-type context determines it. Compatible
+client-declared text, varchar, name, and bpchar identities survive common-type
+selection and result description; an incompatible declaration or two
+conflicting uses of the same `$n` are rejected during `Parse`. Inferred boolean
+input uses PostgreSQL's boolean input grammar. The name type follows
+PostgreSQL's format-specific boundary: text input truncates to 63 bytes, while
+overlength binary input is rejected.
 
 The Bind path accepts more input OIDs, including numeric and JSONB. It
 normalizes those parameters into the VibeDB value model. The server does not

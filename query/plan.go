@@ -51,6 +51,13 @@ const (
 	OutputSQLNumber
 	OutputSQLText
 	OutputSQLBool
+	// OutputSQLVarchar, OutputSQLName, and OutputSQLBPChar preserve the exact
+	// PostgreSQL string-category domain selected during common-type analysis.
+	// Their cells are still TypeString; the distinction exists for adapters
+	// which must publish an exact result OID.
+	OutputSQLVarchar
+	OutputSQLName
+	OutputSQLBPChar
 )
 
 // OutputColumn is cold result-schema metadata. Ordinal is the stable column ID

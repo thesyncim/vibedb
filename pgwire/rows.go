@@ -113,10 +113,13 @@ type columnType struct {
 }
 
 var (
-	typeJSON = columnType{oid: oidJSON, size: -1}
-	typeInt8 = columnType{oid: oidInt8, size: 8}
-	typeBool = columnType{oid: oidBool, size: 1}
-	typeText = columnType{oid: oidText, size: -1}
+	typeJSON    = columnType{oid: oidJSON, size: -1}
+	typeInt8    = columnType{oid: oidInt8, size: 8}
+	typeBool    = columnType{oid: oidBool, size: 1}
+	typeText    = columnType{oid: oidText, size: -1}
+	typeVarchar = columnType{oid: oidVarchar, size: -1}
+	typeName    = columnType{oid: oidName, size: 64}
+	typeBPChar  = columnType{oid: oidBPChar, size: -1}
 )
 
 // A column is one entry in a RowDescription.
@@ -139,6 +142,12 @@ func columnsFor(dst []column, names []string, schema []query.OutputColumn) []col
 				typ = typeText
 			case schema[i].Representation == query.OutputSQLBool:
 				typ = typeBool
+			case schema[i].Representation == query.OutputSQLVarchar:
+				typ = typeVarchar
+			case schema[i].Representation == query.OutputSQLName:
+				typ = typeName
+			case schema[i].Representation == query.OutputSQLBPChar:
+				typ = typeBPChar
 			}
 		}
 		dst = append(dst, column{name: name, typ: typ})
@@ -278,11 +287,11 @@ func cellWireSize(cell query.Cell, typ columnType, format int16) (int, error) {
 		}
 		return len(encoded), nil
 
-	case oidText:
+	case oidText, oidVarchar, oidName, oidBPChar:
 		text, ok := cell.TextBytes()
 		if !ok {
 			return 0, newError(sqlstateInternalError,
-				"a column declared text produced a value that is not a string")
+				"a column declared string produced a value that is not a string")
 		}
 		return len(text), nil
 
@@ -336,11 +345,11 @@ func appendCell(dst []byte, cell query.Cell, typ columnType, format int16) ([]by
 		}
 		return dst, nil
 
-	case oidText:
+	case oidText, oidVarchar, oidName, oidBPChar:
 		text, ok := cell.TextBytes()
 		if !ok {
 			return dst, newError(sqlstateInternalError,
-				"a column declared text produced a value that is not a string")
+				"a column declared string produced a value that is not a string")
 		}
 		return append(dst, text...), nil
 

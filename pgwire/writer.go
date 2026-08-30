@@ -176,9 +176,9 @@ func (w *writer) parameterDesc(stmt *prepared) {
 	w.int16(stmt.wireParams)
 	for i := range stmt.wireParams {
 		// Parse may provide fewer OIDs than the query ultimately proves to
-		// contain. Preserve every declared position. Whole-document parameters
-		// default to json so clients can select a lossless encoder; scalar
-		// parameters remain zero, the protocol's "unspecified" type.
+		// contain. Preserve compatible declared positions. Whole-document
+		// parameters default to json, analyzed bool/text parameters expose their
+		// inferred domain, and every other scalar remains unspecified.
 		w.int32(stmt.parameterOID(i))
 	}
 	w.end()

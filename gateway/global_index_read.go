@@ -482,7 +482,7 @@ func globalIndexBaseCalls(
 			groups = append(groups, baseGroup{call: shardCall{
 				target: route.BaseTarget, address: route.BaseAddress,
 				req: &shardservice.ShardRequest{
-					SQL: query.SQL, Params: query.Params,
+					SQL: query.SQL, Params: query.Params, ParamTypes: query.ParamTypes,
 					Distribution:         program.baseManifest.Distribution(),
 					Shard:                route.BaseTarget.Shard,
 					AllocationGeneration: route.BaseTarget.AllocationGeneration,

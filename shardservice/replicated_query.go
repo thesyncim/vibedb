@@ -145,12 +145,9 @@ func executeFencedSQL(ctx context.Context, source interface {
 		return classifyError(err)
 	}
 	defer session.Close()
-	var prepared *sqldriver.Prepared
-	if req.PartialAggregate {
-		prepared, err = session.PreparePartialAggregate(ctx, req.SQL)
-	} else {
-		prepared, err = session.Prepare(ctx, req.SQL)
-	}
+	prepared, err := prepareShardSQL(
+		ctx, session, req.SQL, req.ParamTypes, req.PartialAggregate,
+	)
 	if err != nil {
 		return classifyError(err)
 	}

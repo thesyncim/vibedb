@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 func scatterSQLReadRequest(
@@ -207,6 +208,61 @@ func TestReplicatedSQLReadRejectsMemoryBeforeShardIO(t *testing.T) {
 	for group, reads := range client.reads {
 		if reads != 0 {
 			t.Fatalf("group %x reads=%d before admission", group.GroupID, reads)
+		}
+	}
+}
+
+func TestReplicatedSQLReadRejectsTypedMetadataBeforeShardIO(t *testing.T) {
+	fixture, request := sameGroupSQLReadFixture(t)
+	client := &scatterReadClient{}
+	reader := newScatterReader(t, fixture, client, nil, 2)
+	base := request.Queries[0]
+	tests := []struct {
+		name  string
+		query Query
+		want  error
+	}{
+		{
+			name: "count mismatch",
+			query: Query{SQL: base.SQL, Params: base.Params,
+				ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeText, sqldriver.ParamTypeText}},
+			want: ErrPlanParameters,
+		},
+		{
+			name: "invalid enum",
+			query: Query{SQL: base.SQL, Params: base.Params,
+				ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeInvalid}},
+			want: ErrPlanParameters,
+		},
+		{
+			name: "all unspecified",
+			query: Query{SQL: base.SQL, Params: base.Params,
+				ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeUnspecified}},
+			want: ErrPlanParameters,
+		},
+		{
+			name: "count over admission bound",
+			query: Query{SQL: base.SQL, Params: base.Params,
+				ParamTypes: make([]sqldriver.ParamType, maxGatewaySQLParameters+1)},
+			want: ErrReplicatedReadAdmission,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := reader.ReadSQLBatch(t.Context(), ReplicatedSQLBatchReadRequest{
+				Queries: []Query{test.query}, MaxResultBytes: request.MaxResultBytes,
+			})
+			defer result.Release()
+			if !errors.Is(err, test.want) || result.Packed != nil {
+				t.Fatalf("result=%+v err=%v, want %v", result, err, test.want)
+			}
+		})
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	for group, reads := range client.reads {
+		if reads != 0 {
+			t.Fatalf("group %x reads=%d for refused typed metadata", group.GroupID, reads)
 		}
 	}
 }

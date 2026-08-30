@@ -17,6 +17,21 @@ var buildgateAt1AEB86A = Profile{
 	Required:    CapabilitySet{1 << CapabilityRaftTransport},
 }
 
+// buildgateBeforeSQLParameterTypes freezes the immediately preceding grammar
+// identities. Parameter-analysis metadata extends both shard SQL requests and
+// the durable participant mutation batch, so neither identity may silently
+// remain compatible with a build that predates those fields.
+var buildgateBeforeSQLParameterTypes = Profile{
+	WireGrammar: GrammarID{0x5b, 0x58, 0x5a, 0x02, 0xd6, 0xc4, 0x83, 0x52, 0x31, 0xd8, 0x75, 0x9c, 0x62, 0x10, 0x36, 0xe2},
+	DiskGrammar: GrammarID{0x2c, 0x3e, 0x04, 0xe1, 0xfb, 0xa7, 0xd8, 0xd9, 0xc6, 0x6a, 0x10, 0x03, 0x2c, 0xb3, 0xed, 0xb8},
+	Provided: CapabilitySet{
+		1<<CapabilityRaftTransport | 1<<CapabilityGatewayShardTransport,
+	},
+	Required: CapabilitySet{
+		1<<CapabilityRaftTransport | 1<<CapabilityGatewayShardTransport,
+	},
+}
+
 func TestGeneratedManifestMatchesCurrentLedgerSemantics(t *testing.T) {
 	semantics := requestledger.SemanticsDigest()
 	if [32]byte(semantics) != generatedRequestLedgerSemantics {
@@ -60,6 +75,28 @@ func TestBuildAt1AEB86AIsIncompatibleWithCurrentBeforeWireOrDiskAdmission(t *tes
 	}
 	if _, err := gate.AuthorizeDiskAdoption(legacyDisk); !errors.Is(err, ErrDiskGrammar) {
 		t.Fatalf("old/current disk compatibility = %v, want ErrDiskGrammar", err)
+	}
+}
+
+func TestBuildBeforeSQLParameterTypesIsIncompatibleBeforeWireOrDiskAdmission(t *testing.T) {
+	current := CurrentProfile()
+	if current.WireGrammar == buildgateBeforeSQLParameterTypes.WireGrammar ||
+		current.DiskGrammar == buildgateBeforeSQLParameterTypes.DiskGrammar {
+		t.Fatal("current manifest retained the pre-parameter-metadata grammar identity")
+	}
+	if _, err := CheckCompatibility(current, buildgateBeforeSQLParameterTypes); !errors.Is(err, ErrWireGrammar) {
+		t.Fatalf("pre-parameter-metadata/current peer compatibility = %v, want ErrWireGrammar", err)
+	}
+	gate, err := NewCurrentDiskGate(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDisk := DiskIdentity{
+		Grammar:  buildgateBeforeSQLParameterTypes.DiskGrammar,
+		Required: buildgateBeforeSQLParameterTypes.Required,
+	}
+	if _, err := gate.AuthorizeDiskAdoption(legacyDisk); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("pre-parameter-metadata/current disk compatibility = %v, want ErrDiskGrammar", err)
 	}
 }
 

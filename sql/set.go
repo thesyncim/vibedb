@@ -35,9 +35,11 @@ const (
 // zero kind is a string literal and comparison operands deliberately exclude
 // NULL. Placeholder ordinals are absolute within the complete set expression.
 type SetValue struct {
-	Operand Operand
-	Null    bool
-	Pos     int
+	Operand       Operand
+	Null          bool
+	TypedConstant bool
+	Cast          ScalarCastTarget
+	Pos           int
 }
 
 // SetValuesRow retains one authored VALUES tuple in row-major order.
@@ -549,6 +551,25 @@ func (s *setExpressionParser) parseValuesLeaf() (*SetExpr, error) {
 func (s *setExpressionParser) parseSetValue() (SetValue, error) {
 	pos := s.tok.pos
 	value := SetValue{Pos: pos}
+	if target, supported, known := scalarTypedStringHead(s.tok); known {
+		head := s.tok
+		s.advance()
+		if s.tok.kind != tokString {
+			return SetValue{}, newFeatureNotSupportedError(
+				s.owner.lx.src, pos,
+				"VALUES set operands accept scalar literals, NULL, and placeholders; use a SELECT operand for expressions",
+			)
+		}
+		operand, err := s.owner.typedStringOperand(head, s.tok, target, supported)
+		if err != nil {
+			return SetValue{}, err
+		}
+		value.Operand = operand
+		value.TypedConstant = true
+		value.Cast = target
+		s.advance()
+		return value, nil
+	}
 	switch s.tok.kind {
 	case tokNumber:
 		value.Operand = Operand{

@@ -43,13 +43,17 @@ const (
 	sqlstateUndefinedColumn               = "42703"
 	sqlstateAmbiguousColumn               = "42702"
 	sqlstateAmbiguousAlias                = "42P09"
+	sqlstateAmbiguousParameter            = "42P08"
 	sqlstateDuplicateAlias                = "42712"
 	sqlstateDuplicateColumn               = "42701"
+	sqlstateNameTooLong                   = "42622"
 	sqlstateDependentObjectsStillExist    = "2BP01"
 	sqlstateInvalidColumnReference        = "42P10"
 	sqlstateInvalidTableDefinition        = "42P16"
 	sqlstateWrongObjectType               = "42809"
 	sqlstateDatatypeMismatch              = "42804"
+	sqlstateCannotCoerce                  = "42846"
+	sqlstateUndefinedFunction             = "42883"
 	sqlstateInvalidObjectDefinition       = "42P17"
 	sqlstateFeatureNotSupported           = "0A000"
 	sqlstateProtocolViolation             = "08P01"
@@ -63,6 +67,7 @@ const (
 	sqlstateDivisionByZero                = "22012"
 	sqlstateNumericValueOutOfRange        = "22003"
 	sqlstateInvalidTextRepresentation     = "22P02"
+	sqlstateInvalidBinaryRepresentation   = "22P03"
 	sqlstateInvalidParameterValue         = "22023"
 	sqlstateCardinalityViolation          = "21000"
 	sqlstateProgramLimitExceeded          = "54000"
@@ -91,6 +96,7 @@ type pgError struct {
 	severity string
 	code     string
 	message  string
+	detail   string
 	hint     string
 	// cause retains the typed runtime error behind a protocol classification.
 	// ErrorResponse serialization deliberately exposes only the fields above,
@@ -122,7 +128,8 @@ func fatal(code, message string) *pgError {
 	return &pgError{severity: "FATAL", code: code, message: message}
 }
 
-func (e *pgError) withHint(hint string) *pgError { e.hint = hint; return e }
+func (e *pgError) withHint(hint string) *pgError     { e.hint = hint; return e }
+func (e *pgError) withDetail(detail string) *pgError { e.detail = detail; return e }
 
 func (e *pgError) withCause(cause error) *pgError {
 	if e != nil && e.cause == nil && cause != nil {
@@ -250,6 +257,10 @@ func (w *writer) errorResponse(e *pgError) {
 	w.str(e.code)
 	w.byte('M')
 	w.str(truncateErrorField(e.message))
+	if e.detail != "" {
+		w.byte('D')
+		w.str(truncateErrorField(e.detail))
+	}
 	if e.hint != "" {
 		w.byte('H')
 		w.str(truncateErrorField(e.hint))
@@ -443,6 +454,18 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 	var unsupported *sqlast.FeatureNotSupportedError
 	if errors.As(err, &unsupported) {
 		return newError(sqlstateFeatureNotSupported, unsupported.Msg)
+	}
+	var invalidText *sqlast.InvalidTextRepresentationError
+	if errors.As(err, &invalidText) {
+		return newError(sqlstateInvalidTextRepresentation, invalidText.Msg)
+	}
+	var cannotCoerce *sqlast.CannotCoerceError
+	if errors.As(err, &cannotCoerce) {
+		return newError(sqlstateCannotCoerce, cannotCoerce.Msg)
+	}
+	var undefinedOperator *sqlast.UndefinedOperatorError
+	if errors.As(err, &undefinedOperator) {
+		return newError(sqlstateUndefinedFunction, undefinedOperator.Msg)
 	}
 	var duplicateCTE *sqlast.DuplicateCTEError
 	if errors.As(err, &duplicateCTE) {

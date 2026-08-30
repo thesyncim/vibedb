@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/pginput"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -65,18 +66,19 @@ const (
 )
 
 type statementScalarNode struct {
-	kind       statementScalarNodeKind
-	op         sqlast.ScalarOp
-	cast       sqlast.ScalarCastTarget
-	left       int32
-	right      int32
-	dependency int32
-	caseIndex  int32
-	skip       int32
-	operand    sqlast.Operand
-	pos        int
-	bound      scalar
-	known      bool
+	kind           statementScalarNodeKind
+	op             sqlast.ScalarOp
+	cast           sqlast.ScalarCastTarget
+	left           int32
+	right          int32
+	dependency     int32
+	caseIndex      int32
+	skip           int32
+	operand        sqlast.Operand
+	pos            int
+	bound          scalar
+	known          bool
+	representation OutputRepresentation
 }
 
 type statementScalarDependencySpec struct {
@@ -208,9 +210,14 @@ func exprHasScalar(expr *sqlast.Expr) bool {
 	return false
 }
 
-func (s *Statement) prepareScalar() error {
+func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 	if !selectHasScalar(s.tree) && !selectNeedsPostScalarOrder(s.tree) {
 		return nil
+	}
+	if !preserveUnknownOutput {
+		if err := s.finalizeScalarOutputParameterTypes(); err != nil {
+			return err
+		}
 	}
 	postOrder := selectNeedsPostScalarOrder(s.tree)
 	if s.window() != nil {
@@ -276,6 +283,9 @@ func (s *Statement) prepareScalar() error {
 		if err != nil {
 			return err
 		}
+		if !preserveUnknownOutput {
+			runtime.finalizeUnknownScalarOutput(root, column.Scalar, s)
+		}
 		runtime.outputs = append(runtime.outputs, root)
 		runtime.types = append(runtime.types, runtime.nodeType(root))
 	}
@@ -321,6 +331,89 @@ func (s *Statement) prepareScalar() error {
 	runtime.groupedCardinality = runtime.cardinality && len(s.tree.GroupBy) != 0
 	s.ensureNested().scalar = runtime
 	return nil
+}
+
+// finalizeScalarOutputParameterTypes applies PostgreSQL's query-boundary rule
+// for a bare unknown output. Set operands opt out until their enclosing common-
+// type pass runs; an ordinary SELECT resolves the parameter to text here so a
+// later occurrence cannot silently acquire an incompatible domain.
+func (s *Statement) finalizeScalarOutputParameterTypes() error {
+	if s == nil || s.tree == nil {
+		return nil
+	}
+	for i := range s.tree.Columns {
+		expr := s.tree.Columns[i].Scalar
+		if expr == nil || expr.Kind != sqlast.ScalarLiteral ||
+			expr.Value.Kind != sqlast.OperandParam ||
+			s.ParameterType(expr.Value.Ordinal) != ParameterTypeUnspecified {
+			continue
+		}
+		if err := s.mergeParameterType(
+			s.paramBase+expr.Value.Ordinal, ParameterTypeText, expr.Value.Pos,
+		); err != nil {
+			return err
+		}
+		s.markParameterTypeTargetDefault(s.paramBase + expr.Value.Ordinal)
+	}
+	return nil
+}
+
+func (r *statementScalar) finalizeUnknownScalarOutput(
+	root int32,
+	expr *sqlast.ScalarExpr,
+	s *Statement,
+) {
+	if r == nil || expr == nil || root < 0 || int(root) >= len(r.nodes) {
+		return
+	}
+	node := &r.nodes[root]
+	switch expr.Kind {
+	case sqlast.ScalarNull:
+		node.representation = OutputSQLText
+	case sqlast.ScalarLiteral:
+		switch expr.Value.Kind {
+		case sqlast.OperandString:
+			node.representation = OutputSQLText
+		case sqlast.OperandParam:
+			if s != nil {
+				node.representation = parameterTypeOutputRepresentation(
+					s.ParameterType(expr.Value.Ordinal),
+				)
+			}
+		}
+	}
+}
+
+func parameterTypeOutputRepresentation(paramType ParameterType) OutputRepresentation {
+	switch paramType {
+	case ParameterTypeBool:
+		return OutputSQLBool
+	case ParameterTypeText:
+		return OutputSQLText
+	case ParameterTypeVarchar:
+		return OutputSQLVarchar
+	case ParameterTypeName:
+		return OutputSQLName
+	case ParameterTypeBPChar:
+		return OutputSQLBPChar
+	default:
+		return OutputJSON
+	}
+}
+
+func outputRepresentationValueType(
+	representation OutputRepresentation,
+) (ValueType, bool) {
+	switch representation {
+	case OutputSQLBool:
+		return TypeBool, true
+	case OutputSQLText, OutputSQLVarchar, OutputSQLName, OutputSQLBPChar:
+		return TypeString, true
+	case OutputSQLNumber:
+		return TypeNumber, true
+	default:
+		return TypeAny, false
+	}
 }
 
 func selectHasAggregate(tree *sqlast.SelectStmt) bool {
@@ -400,8 +493,15 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 	case sqlast.ScalarAggregate:
 		return r.compileDependency(s, expr.Path, expr.Agg, expr.Pos)
 	case sqlast.ScalarLiteral:
+		representation := OutputJSON
+		if expr.Value.Kind == sqlast.OperandParam && s != nil {
+			representation = parameterTypeOutputRepresentation(
+				s.ParameterType(expr.Value.Ordinal),
+			)
+		}
 		r.nodes = append(r.nodes, statementScalarNode{
 			kind: statementScalarLiteral, operand: expr.Value, pos: expr.Pos,
+			representation: representation,
 		})
 	case sqlast.ScalarNull:
 		r.nodes = append(r.nodes, statementScalarNode{kind: statementScalarNull, pos: expr.Pos})
@@ -435,6 +535,19 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		if expr.Cast > sqlast.ScalarCastJSON {
 			return 0, fmt.Errorf("query: invalid scalar CAST target %d", expr.Cast)
 		}
+		if operand, typed, ok, err := foldTextBooleanConstant(expr); err != nil {
+			return 0, err
+		} else if typed && ok {
+			representation := OutputSQLText
+			if expr.Cast == sqlast.ScalarCastBoolean {
+				representation = OutputSQLBool
+			}
+			r.nodes = append(r.nodes, statementScalarNode{
+				kind: statementScalarLiteral, cast: expr.Cast,
+				operand: operand, pos: expr.Pos, representation: representation,
+			})
+			break
+		}
 		left, err := r.compileExpr(s, expr.Left)
 		if err != nil {
 			return 0, err
@@ -448,6 +561,70 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		return 0, fmt.Errorf("query: invalid scalar expression kind %d", expr.Kind)
 	}
 	return int32(len(r.nodes) - 1), nil
+}
+
+// foldTextBooleanConstant performs PostgreSQL's analysis-time typinput for a
+// source-independent BOOL/TEXT cast chain. The resulting program contains one
+// literal node and no row-time cast. Parameters and data dependencies remain
+// ordinary cast programs because their values are not known at prepare.
+func foldTextBooleanConstant(expr *sqlast.ScalarExpr) (sqlast.Operand, bool, bool, error) {
+	if expr == nil {
+		return sqlast.Operand{}, false, false, nil
+	}
+	if expr.Kind == sqlast.ScalarLiteral {
+		if expr.Value.Kind == sqlast.OperandParam {
+			return sqlast.Operand{}, false, false, nil
+		}
+		return expr.Value, false, true, nil
+	}
+	if expr.Kind != sqlast.ScalarCast ||
+		(expr.Cast != sqlast.ScalarCastText && expr.Cast != sqlast.ScalarCastBoolean) {
+		return sqlast.Operand{}, false, false, nil
+	}
+	operand, typed, ok, err := foldTextBooleanConstant(expr.Left)
+	if err != nil || !ok {
+		return sqlast.Operand{}, typed, ok, err
+	}
+	typed = typed || expr.TypedConstant
+	// Ordinary CAST remains lazy: a dead CASE arm or a projection eliminated
+	// by WHERE/OFFSET must not start failing at prepare. PostgreSQL typed-string
+	// constants are the explicit analysis-time exception represented here.
+	if !typed {
+		return operand, false, true, nil
+	}
+	if expr.Cast == sqlast.ScalarCastText {
+		switch operand.Kind {
+		case sqlast.OperandString:
+			return operand, true, true, nil
+		case sqlast.OperandBool:
+			text := "false"
+			if operand.Bool {
+				text = "true"
+			}
+			return sqlast.Operand{Kind: sqlast.OperandString, Text: text, Pos: expr.Pos}, true, true, nil
+		case sqlast.OperandNumber:
+			return sqlast.Operand{Kind: sqlast.OperandString, Text: operand.Text, Pos: expr.Pos}, true, true, nil
+		default:
+			return sqlast.Operand{}, true, false, nil
+		}
+	}
+	switch operand.Kind {
+	case sqlast.OperandBool:
+		return operand, true, true, nil
+	case sqlast.OperandString:
+		value, valid := pginput.Boolean(operand.Text)
+		if !valid {
+			// This is an ordinary outer cast over a valid typed TEXT constant,
+			// not BOOL 'value' typinput. Keep it in the lazy runtime program so
+			// an unreachable CASE arm or eliminated projection cannot fail at
+			// prepare. A direct invalid BOOL typed constant was already rejected
+			// by the parser before compilation.
+			return sqlast.Operand{}, true, false, nil
+		}
+		return sqlast.Operand{Kind: sqlast.OperandBool, Bool: value, Pos: expr.Pos}, true, true, nil
+	default:
+		return sqlast.Operand{}, true, false, nil
+	}
 }
 
 func (r *statementScalar) compileDependency(
@@ -650,6 +827,9 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 		}
 		return TypeAny
 	case statementScalarLiteral:
+		if valueType, ok := outputRepresentationValueType(node.representation); ok {
+			return valueType
+		}
 		switch node.operand.Kind {
 		case sqlast.OperandString:
 			return TypeString
@@ -703,6 +883,8 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 	}
 	node := &r.nodes[root]
 	switch node.kind {
+	case statementScalarLiteral:
+		return node.representation
 	case statementScalarUnary:
 		return OutputSQLNumber
 	case statementScalarBinary:

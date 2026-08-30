@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"math"
 	"sync/atomic"
+
+	"github.com/thesyncim/vibedb/internal/pginput"
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 var errSetStatementConfig = errors.New("query: invalid prepared set statement")
@@ -42,6 +46,17 @@ type setStatementResultConsumer interface {
 type setStatementLeaf struct {
 	runner    setStatementRunner
 	paramBase int
+	coercions []setStatementColumnCoercion
+}
+
+// setStatementColumnCoercion is absent for the overwhelmingly common generic
+// set leaf. SQL lowering installs it only when a bare unknown literal or
+// parameter inherits BOOL/TEXT from a typed sibling. It is immutable prepared
+// metadata; conversion mutates the leaf's already-owned Result cells before
+// the set spool observes them.
+type setStatementColumnCoercion struct {
+	target OutputRepresentation
+	pos    int
 }
 
 // setStatementDescriptor is immutable prepared metadata. plan owns its node
@@ -205,6 +220,14 @@ type setStatementRuntime struct {
 	source Source
 	args   []any
 	peak   int64
+	// coerceArena is used only when a parameter inferred as SQL text arrives as
+	// a number whose Cell does not retain an exact raw spelling. It is rewound
+	// per leaf and retained across executions, keeping warmed coercion free of
+	// heap allocation.
+	coerceArena []byte
+	// sqlOwner is non-nil only for a SQL-lowered set expression. It validates
+	// inferred parameter input before LIMIT/OFFSET can suppress every output row.
+	sqlOwner *statementSetSQL
 }
 
 func (r *setStatementRuntime) prepare(desc *setStatementDescriptor) error {
@@ -252,6 +275,11 @@ func (r *setStatementRuntime) runIntoFrame(
 	if err := cancellationError(parent.Options.Cancel); err != nil {
 		return Cursor{}, err
 	}
+	if r.sqlOwner != nil {
+		if err := r.sqlOwner.validateSetParameters(args, parent.Options.Cancel); err != nil {
+			return Cursor{}, err
+		}
+	}
 
 	r.parent, r.source, r.args = parent, src, args
 	r.peak = frame.intermediate.used
@@ -269,6 +297,151 @@ func (r *setStatementRuntime) runIntoFrame(
 		return Cursor{}, err
 	}
 	return r.cursor.cursor(&parent.Result), nil
+}
+
+// validateSetParameters performs PostgreSQL's inferred parameter input
+// conversion even when a producing SELECT returns no rows. It is read-only and
+// allocation-free on valid inputs.
+func (r *statementSetSQL) validateSetParameters(args []any, cancel *CancelFlag) error {
+	if r == nil || len(r.paramTypes) == 0 {
+		return nil
+	}
+	for parameter, target := range r.paramTypes {
+		if target == OutputJSON {
+			continue
+		}
+		if err := cancellationCheckpoint(cancel, parameter); err != nil {
+			return err
+		}
+		kind, text, known, err := setSQLParameterInput(args[parameter])
+		if err != nil {
+			return err
+		}
+		if !known {
+			continue
+		}
+		position := r.paramTypePosition(parameter)
+		switch target {
+		case OutputSQLBool:
+			switch kind {
+			case kindBool:
+				continue
+			case kindString:
+				if _, ok := pginput.Boolean(text); ok {
+					continue
+				}
+				return &ScalarInvalidTextError{Pos: position, Target: "BOOLEAN"}
+			default:
+				return &ScalarTypeError{
+					Pos: position, Operation: "set common type boolean",
+					Left: setSQLScalarKindType(kind), Right: TypeAny,
+				}
+			}
+		case OutputSQLText, OutputSQLVarchar, OutputSQLName, OutputSQLBPChar:
+			if kind == kindBool || kind == kindNumber || kind == kindString {
+				continue
+			}
+			return &ScalarTypeError{
+				Pos: position, Operation: "set common type text",
+				Left: setSQLScalarKindType(kind), Right: TypeAny,
+			}
+		default:
+			return fmt.Errorf(
+				"query: invalid inferred set parameter target %d: %w",
+				target, errSetStatementConfig,
+			)
+		}
+	}
+	return nil
+}
+
+func setSQLScalarKindType(kind scalarKind) ValueType {
+	switch kind {
+	case kindBool:
+		return TypeBool
+	case kindNumber:
+		return TypeNumber
+	case kindString:
+		return TypeString
+	case kindNull:
+		return TypeNull
+	default:
+		return TypeAny
+	}
+}
+
+// setSQLParameterInput mirrors Statement.argument without interning or
+// retaining caller bytes.
+func setSQLParameterInput(arg any) (kind scalarKind, text string, known bool, err error) {
+	switch value := arg.(type) {
+	case nil:
+		return kindNull, "", false, nil
+	case bool:
+		return kindBool, "", true, nil
+	case *bool:
+		if value == nil {
+			return kindNull, "", false, nil
+		}
+		return kindBool, "", true, nil
+	case string:
+		return kindString, value, true, nil
+	case *string:
+		if value == nil {
+			return kindNull, "", false, nil
+		}
+		return kindString, *value, true, nil
+	case []byte:
+		return kindString, byteview.String(value), true, nil
+	case Number:
+		if validateErr := value.validate(); validateErr != nil {
+			return 0, "", false, fmt.Errorf("query: literal: %w", validateErr)
+		}
+		return kindNumber, "", true, nil
+	case *Number:
+		if value == nil {
+			return kindNull, "", false, nil
+		}
+		if validateErr := value.validate(); validateErr != nil {
+			return 0, "", false, fmt.Errorf("query: literal: %w", validateErr)
+		}
+		return kindNumber, "", true, nil
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return kindNumber, "", true, nil
+	case *int64:
+		if value == nil {
+			return kindNull, "", false, nil
+		}
+		return kindNumber, "", true, nil
+	case float32:
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return 0, "", false, fmt.Errorf("query: non-finite numeric literal %v", value)
+		}
+		return kindNumber, "", true, nil
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, "", false, fmt.Errorf("query: non-finite numeric literal %v", value)
+		}
+		return kindNumber, "", true, nil
+	case *float64:
+		if value == nil {
+			return kindNull, "", false, nil
+		}
+		if math.IsNaN(*value) || math.IsInf(*value, 0) {
+			return 0, "", false, fmt.Errorf("query: non-finite numeric literal %v", *value)
+		}
+		return kindNumber, "", true, nil
+	case vibejson.RawValue:
+		if _, ok := value.NumberBytes(); !ok {
+			return 0, "", false, fmt.Errorf("query: raw SQL literal is not a JSON number")
+		}
+		return kindNumber, "", true, nil
+	default:
+		return 0, "", false, fmt.Errorf(
+			"query: cannot bind %T as a SQL literal; bind a bool, an integer, a float, "+
+				"a string, a []byte, a query.Number, a vibejson.RawValue number, their pointer-shaped zero-copy "+
+				"forms, or nil", arg,
+		)
+	}
 }
 
 func (r *setStatementRuntime) materializeSetTreeLeaf(
@@ -328,6 +501,11 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 	if err = validateSetStatementLeafResult(source, columns, exec, cursor); err != nil {
 		return 0, 0, err
 	}
+	if err = r.coerceSetStatementLeafResult(
+		&exec.Result, leaf.coercions, cancel,
+	); err != nil {
+		return 0, 0, err
+	}
 	mergeSetStatementStats(&r.parent.Stats, exec.Stats)
 	resultBytes = exec.Result.resultBytesUsed
 	if err = frame.intermediate.reserve("set-expression leaf result", resultBytes); err != nil {
@@ -343,6 +521,107 @@ func (r *setStatementRuntime) materializeSetTreeLeaf(
 	}
 	r.observeIntermediate(frame.intermediate.used)
 	return dst.rows, charge, nil
+}
+
+func (r *setStatementRuntime) coerceSetStatementLeafResult(
+	result *Result,
+	coercions []setStatementColumnCoercion,
+	cancel *CancelFlag,
+) error {
+	if result == nil || len(coercions) == 0 {
+		return nil
+	}
+	r.coerceArena = r.coerceArena[:0]
+	payload := int64(0)
+	visited := 0
+	for column := range result.Columns {
+		cells := result.Columns[column].Cells
+		coercion := setStatementColumnCoercion{}
+		if column < len(coercions) {
+			coercion = coercions[column]
+		}
+		for row := range cells {
+			if err := cancellationCheckpoint(cancel, visited); err != nil {
+				return err
+			}
+			visited++
+			if coercion.target != OutputJSON {
+				cell, err := r.coerceSetStatementCell(cells[row], coercion)
+				if err != nil {
+					return err
+				}
+				cells[row] = cell
+			}
+			payload = saturatedBytes(
+				payload, resultCellPayloadBytes(cells[row]),
+			)
+		}
+	}
+	required, err := result.checkResultBudget(
+		len(result.Columns), result.RowCount, payload,
+	)
+	if err != nil {
+		return err
+	}
+	result.resultBytesUsed = required
+	return nil
+}
+
+func (r *setStatementRuntime) coerceSetStatementCell(
+	cell Cell,
+	coercion setStatementColumnCoercion,
+) (Cell, error) {
+	if cell.kind == TypeNull {
+		return cell, nil
+	}
+	switch coercion.target {
+	case OutputSQLBool:
+		if cell.kind == TypeBool {
+			return cell, nil
+		}
+		if cell.kind != TypeString {
+			return Cell{}, &ScalarTypeError{
+				Pos: coercion.pos, Operation: "set common type boolean",
+				Left: cell.kind, Right: TypeAny,
+			}
+		}
+		value, ok := pginput.Boolean(cell.text)
+		if !ok {
+			return Cell{}, &ScalarInvalidTextError{
+				Pos: coercion.pos, Target: "BOOLEAN",
+			}
+		}
+		return cellFromScalar(scalar{kind: kindBool, bval: value}), nil
+	case OutputSQLText, OutputSQLVarchar, OutputSQLName, OutputSQLBPChar:
+		switch cell.kind {
+		case TypeString:
+			return cell, nil
+		case TypeBool:
+			text := "false"
+			if cell.flag&cellTrue != 0 {
+				text = "true"
+			}
+			return Cell{kind: TypeString, text: text}, nil
+		case TypeNumber:
+			raw := cell.raw
+			if len(raw) == 0 {
+				start := len(r.coerceArena)
+				r.coerceArena = cell.AppendJSON(r.coerceArena)
+				raw = r.coerceArena[start:len(r.coerceArena):len(r.coerceArena)]
+			}
+			return Cell{kind: TypeString, text: byteview.String(raw)}, nil
+		default:
+			return Cell{}, &ScalarTypeError{
+				Pos: coercion.pos, Operation: "set common type text",
+				Left: cell.kind, Right: TypeAny,
+			}
+		}
+	default:
+		return Cell{}, fmt.Errorf(
+			"query: invalid prepared set coercion target %d: %w",
+			coercion.target, errSetStatementConfig,
+		)
+	}
 }
 
 func validateSetStatementLeafResult(
@@ -587,4 +866,6 @@ func (r *setStatementRuntime) Release() {
 	r.source = Source{}
 	r.args = nil
 	r.peak = 0
+	r.coerceArena = nil
+	r.sqlOwner = nil
 }

@@ -133,7 +133,7 @@ type prepared struct {
 	kind          statementKind
 	// retainedBytes is this statement's charge against the session-wide
 	// prepared-input bound: its statement name, SQL text, parameter OIDs,
-	// PostgreSQL placeholder mappings/roles, and conservative retained
+	// PostgreSQL placeholder mappings/roles/types, and conservative retained
 	// parser/compiler shape.
 	retainedBytes int
 	// bindBytes is the largest bound-literal expansion admitted for this
@@ -146,6 +146,13 @@ type prepared struct {
 	// paramKinds consolidates the scalar/document role of every wire parameter,
 	// including repeated $n occurrences.
 	paramKinds []sqldriver.ParamKind
+	// paramTypes consolidates analysis-time SQL input types for wire
+	// parameters. It remains nil when every scalar is schemaless.
+	paramTypes []sqldriver.ParamType
+	// paramTypePositions stores the first authored typed occurrence's byte
+	// position plus one for each wire parameter. It remains nil for the
+	// schemaless path and is consulted only while reporting Parse errors.
+	paramTypePositions []int
 	// paramPositions stores the first authored document occurrence's byte
 	// position plus one for each wire parameter. It stays nil for scalar-only
 	// statements and is converted to PostgreSQL character coordinates only on
@@ -163,9 +170,9 @@ type prepared struct {
 	txOptions sqldriver.TxOptions
 	// savepointName is the mark named by SAVEPOINT, RELEASE, or ROLLBACK TO.
 	savepointName string
-	// paramOIDs are the parameter types the client declared in Parse. They are
-	// hints this server did not ask for and does not require, and are used only
-	// to disambiguate a bound value; see bindValue.
+	// paramOIDs are the parameter types the client declared in Parse. They
+	// disambiguate schemaless values and must be compatible with any type SQL
+	// analysis inferred for the same wire parameter.
 	paramOIDs []int32
 	// paramOrder maps each '?' in the statement the engine compiled to the
 	// 1-based numbered parameter it was rewritten from, and is nil when the
@@ -182,6 +189,8 @@ func (p *prepared) release() {
 		p.runtime = nil
 	}
 	p.paramKinds = nil
+	p.paramTypes = nil
+	p.paramTypePositions = nil
 	p.paramPositions = nil
 }
 
@@ -1066,7 +1075,7 @@ func (s *session) destroyUnnamed() {
 // throughout, as the protocol requires: the simple query message has no place
 // to request a format, so every column is text.
 func (s *session) runSimple(text string) error {
-	stmt, err := s.prepare("", text)
+	stmt, err := s.prepare("", text, nil)
 	if err != nil {
 		return err
 	}
@@ -1095,7 +1104,11 @@ func (s *session) runSimple(text string) error {
 
 // prepare turns statement text into a prepared statement, classifying it first
 // so that a refusal carries the right SQLSTATE.
-func (s *session) prepare(name, text string) (*prepared, error) {
+func (s *session) prepare(
+	name string,
+	text string,
+	declaredOIDs []int32,
+) (*prepared, error) {
 	valid, err := validUTF8Cancelable(text, s.cancelCheck)
 	if err != nil {
 		return nil, asPGErrorIn(err, text)
@@ -1238,7 +1251,16 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 			lowered = publicSQL
 		}
 	}
-	runtime, err := s.sql.Prepare(context.Background(), lowered)
+	parameterTypes := declaredOccurrenceTypes(declaredOIDs, order)
+	var runtime BackendStatement
+	if typed, ok := s.sql.(BackendSessionParameterPreparer); ok &&
+		len(parameterTypes) != 0 {
+		runtime, err = typed.PrepareWithParameterTypes(
+			context.Background(), lowered, parameterTypes,
+		)
+	} else {
+		runtime, err = s.sql.Prepare(context.Background(), lowered)
+	}
 	if err != nil {
 		// The catalog shim engages only here, behind the front end's own
 		// refusal: a statement the runtime accepted never reaches it, so
@@ -1276,7 +1298,7 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 			"a PostgreSQL prepared statement may hold at most %d parameters",
 			maxParameters))
 	}
-	if err := configureRuntimeParamKinds(p); err != nil {
+	if err := configureRuntimeParams(p); err != nil {
 		p.release()
 		return nil, err
 	}
@@ -1286,7 +1308,7 @@ func (s *session) prepare(name, text string) (*prepared, error) {
 	return p, nil
 }
 
-func configureRuntimeParamKinds(p *prepared) error {
+func configureRuntimeParams(p *prepared) error {
 	if p == nil || p.runtime == nil || p.wireParams == 0 {
 		return nil
 	}
@@ -1323,6 +1345,38 @@ func configureRuntimeParamKinds(p *prepared) error {
 			}
 		}
 	}
+
+	// PostgreSQL transforms contextual expressions before it applies the final
+	// unknown-target-to-text rule. A numbered parameter may have been rewritten
+	// into several runtime occurrences, so preserve that semantic ordering rather
+	// than letting authored source order make a target-list default win.
+	typer, hasTypes := p.runtime.(BackendStatementParamTyper)
+	positioner, hasTypePositions := p.runtime.(BackendStatementParamTypePositioner)
+	defaulter, hasTargetDefaults := p.runtime.(BackendStatementParamTypeTargetDefaulter)
+	if hasTypes {
+		passes := 1
+		if hasTargetDefaults {
+			passes = 2
+		}
+		for pass := 0; pass < passes; pass++ {
+			wantTargetDefault := pass == 1
+			for occurrence := 0; occurrence < p.runtime.NumParams(); occurrence++ {
+				if hasTargetDefaults &&
+					defaulter.ParamTypeTargetDefault(occurrence) != wantTargetDefault {
+					continue
+				}
+				wire := occurrence
+				if p.paramOrder != nil {
+					wire = p.paramOrder[occurrence] - 1
+				}
+				if err := configureRuntimeParamType(
+					p, typer, positioner, hasTypePositions, occurrence, wire,
+				); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for i := range p.paramKinds {
 		if p.paramKinds[i] == sqldriver.ParamInvalid {
 			// Numbered placeholders may leave gaps (for example, a statement
@@ -1332,6 +1386,120 @@ func configureRuntimeParamKinds(p *prepared) error {
 		}
 	}
 	return nil
+}
+
+func configureRuntimeParamType(
+	p *prepared,
+	typer BackendStatementParamTyper,
+	positioner BackendStatementParamTypePositioner,
+	hasTypePositions bool,
+	occurrence int,
+	wire int,
+) error {
+	inferred := typer.ParamType(occurrence)
+	switch inferred {
+	case sqldriver.ParamTypeUnspecified:
+		return nil
+	case sqldriver.ParamTypeBool,
+		sqldriver.ParamTypeText,
+		sqldriver.ParamTypeVarchar,
+		sqldriver.ParamTypeName,
+		sqldriver.ParamTypeBPChar,
+		sqldriver.ParamTypeOther:
+		// Exact analyzed domains supported by the shared runtime.
+	default:
+		return newError(sqlstateInternalError,
+			"the SQL runtime returned invalid parameter type metadata")
+	}
+	if wire < 0 || wire >= len(p.paramKinds) ||
+		p.paramKinds[wire] != sqldriver.ParamScalar {
+		return newError(sqlstateDatatypeMismatch, fmt.Sprintf(
+			"parameter $%d is used as both a JSON document and %s", wire+1, inferred))
+	}
+	if p.paramTypes == nil {
+		p.paramTypes = make([]sqldriver.ParamType, p.wireParams)
+	}
+	position := -1
+	if hasTypePositions {
+		position = positioner.ParamTypePosition(occurrence)
+	}
+	if existing := p.paramTypes[wire]; existing != sqldriver.ParamTypeUnspecified &&
+		existing != inferred {
+		err := newError(sqlstateAmbiguousParameter, fmt.Sprintf(
+			"inconsistent types deduced for parameter $%d", wire+1)).
+			withDetail(existing.String() + " versus " + inferred.String())
+		if position >= 0 {
+			err.position = charPosition(p.sql, position)
+		}
+		return err
+	}
+	p.paramTypes[wire] = inferred
+	if position >= 0 {
+		if p.paramTypePositions == nil {
+			p.paramTypePositions = make([]int, p.wireParams)
+		}
+		encoded := position + 1
+		if p.paramTypePositions[wire] == 0 || encoded < p.paramTypePositions[wire] {
+			p.paramTypePositions[wire] = encoded
+		}
+	}
+	return nil
+}
+
+// declaredOccurrenceTypes expands Parse's wire-parameter declarations onto
+// the positional placeholders the shared SQL runtime sees after $n rewriting.
+// It allocates only when at least one declaration belongs to the BOOL or
+// string categories the query analyzer models. A nil result preserves the
+// legacy backend Prepare call and its allocation profile.
+func declaredOccurrenceTypes(
+	declaredOIDs []int32,
+	order []int,
+) []sqldriver.ParamType {
+	if len(declaredOIDs) == 0 || len(order) == 0 {
+		return nil
+	}
+	hasType := false
+	for _, wire := range order {
+		if wire <= 0 || wire > len(declaredOIDs) {
+			continue
+		}
+		if declaredParamType(declaredOIDs[wire-1]) != sqldriver.ParamTypeUnspecified {
+			hasType = true
+			break
+		}
+	}
+	if !hasType {
+		return nil
+	}
+	parameterTypes := make([]sqldriver.ParamType, len(order))
+	for occurrence, wire := range order {
+		if wire > 0 && wire <= len(declaredOIDs) {
+			parameterTypes[occurrence] = declaredParamType(declaredOIDs[wire-1])
+		}
+	}
+	return parameterTypes
+}
+
+func declaredParamType(oid int32) sqldriver.ParamType {
+	switch oid {
+	case oidBool:
+		return sqldriver.ParamTypeBool
+	case oidText:
+		return sqldriver.ParamTypeText
+	case oidVarchar:
+		return sqldriver.ParamTypeVarchar
+	case oidName:
+		return sqldriver.ParamTypeName
+	case oidBPChar:
+		return sqldriver.ParamTypeBPChar
+	case 0, oidUnknown:
+		return sqldriver.ParamTypeUnspecified
+	default:
+		// A concrete declaration outside the bounded BOOL/string model must
+		// remain concrete during analysis. Otherwise a BOOL/TEXT operator can
+		// infer through it and fail later with a generic compatibility error.
+		return sqldriver.ParamTypeOther
+	}
 }
 
 // showResult builds the one-row, one-column result SHOW returns.

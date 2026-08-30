@@ -692,9 +692,9 @@ const (
 	ExprNot
 	// ExprExists is EXISTS (SELECT ...). Subquery holds the nested statement.
 	ExprExists
-	// ExprConstant is a boolean literal used as an ON predicate. WHERE keeps
-	// requiring a path-led condition, while JOIN accepts ON TRUE/FALSE to
-	// express unrestricted or empty matches with outer semantics.
+	// ExprConstant is a source-independent boolean predicate. JOIN accepts ON
+	// TRUE/FALSE for unrestricted or empty matches, and searched CASE uses the
+	// same node so constant branches can be pruned during preparation.
 	ExprConstant
 	// ExprScalarCompare compares two computed scalar expressions. ScalarLeft
 	// and ScalarRight retain the authored arithmetic trees and SQL NULL

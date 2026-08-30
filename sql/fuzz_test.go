@@ -598,6 +598,9 @@ func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *La
 	if e.Kind != ScalarCase && (len(e.Whens) != 0 || e.Else != nil) {
 		t.Fatalf("non-CASE scalar retained CASE payload: %+v", e)
 	}
+	if e.TypedConstant && e.Kind != ScalarCast {
+		t.Fatalf("non-CAST scalar retained typed-constant marker: %+v", e)
+	}
 	switch e.Kind {
 	case ScalarPath, ScalarAggregate:
 		if e.Path == nil || e.Left != nil || e.Right != nil {
@@ -633,6 +636,11 @@ func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *La
 	case ScalarCast:
 		if e.Left == nil || e.Right != nil || e.Path != nil || e.Cast > ScalarCastJSON {
 			t.Fatalf("scalar CAST has invalid payload: %+v", e)
+		}
+		if e.TypedConstant && (e.Left.Kind != ScalarLiteral ||
+			(e.Cast != ScalarCastText && e.Cast != ScalarCastBoolean) ||
+			(e.Left.Value.Kind != OperandString && e.Left.Value.Kind != OperandBool)) {
+			t.Fatalf("typed-string constant has invalid payload: %+v", e)
 		}
 		return checkScalarInvariants(t, s, e.Left, outer)
 	case ScalarCase:

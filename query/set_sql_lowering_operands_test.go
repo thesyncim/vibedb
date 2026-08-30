@@ -90,7 +90,9 @@ func TestSQLSetValuesOperandsAllModesRootTailsAndParameters(t *testing.T) {
 	schema := typed.AppendSchema(nil)
 	typed.Release()
 	if len(schema) != 3 || schema[0].Type != TypeNumber ||
-		schema[1].Type != TypeString || schema[2].Type != TypeNull {
+		schema[1].Type != TypeString || schema[2].Type != TypeString ||
+		schema[1].Representation != OutputSQLText ||
+		schema[2].Representation != OutputSQLText {
 		t.Fatalf("VALUES schema types = %+v", schema)
 	}
 }

@@ -58,6 +58,20 @@ type BackendSession interface {
 	Close() error
 }
 
+// BackendSessionParameterPreparer is the optional Parse-time parameter type
+// channel. PostgreSQL clients may declare OIDs before analysis; backends that
+// implement this interface can let supported boolean/string declarations and
+// concrete declarations outside that bounded model
+// participate in common-type resolution. Backends without it retain the
+// post-analysis compatibility check.
+type BackendSessionParameterPreparer interface {
+	PrepareWithParameterTypes(
+		context.Context,
+		string,
+		[]sqldriver.ParamType,
+	) (BackendStatement, error)
+}
+
 // BackendStatement retains one parsed statement and its parameter/output
 // contract. QueryInto borrows caller-owned cursor storage to avoid allocating a
 // handle per execution. Rows and cells remain borrowed until that cursor closes.
@@ -72,6 +86,31 @@ type BackendStatement interface {
 	Exec(context.Context, []any) (sqldriver.Result, error)
 	QueryInto(context.Context, []any, *BackendRows) error
 	Close() error
+}
+
+// BackendStatementParamTyper is the optional analyzed SQL-input contract of a
+// prepared statement. Keeping it separate from BackendStatement preserves
+// compatibility for external backends whose schemaless parameters are all
+// unspecified, while typed runtimes can let pgwire advertise and decode an
+// exact inferred domain.
+type BackendStatementParamTyper interface {
+	ParamType(int) sqldriver.ParamType
+}
+
+// BackendStatementParamTypePositioner optionally reports the authored byte
+// position at which one occurrence acquired its analyzed SQL type. It is used
+// only on Parse-time errors, never on execution's hot path.
+type BackendStatementParamTypePositioner interface {
+	ParamTypePosition(int) int
+}
+
+// BackendStatementParamTypeTargetDefaulter distinguishes PostgreSQL's final
+// unresolved SELECT-target coercion from a contextual type constraint. Numbered
+// parameters can map several authored occurrences onto one wire parameter; a
+// contextual occurrence must be considered before this last-resort text
+// default, regardless of source order.
+type BackendStatementParamTypeTargetDefaulter interface {
+	ParamTypeTargetDefault(int) bool
 }
 
 // BackendRows owns one live result. Embedded sessions retain their inline
@@ -161,6 +200,20 @@ type embeddedSession struct{ *sqldriver.Session }
 
 func (session *embeddedSession) Prepare(ctx context.Context, sql string) (BackendStatement, error) {
 	statement, err := session.Session.Prepare(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	return &embeddedStatement{statement}, nil
+}
+
+func (session *embeddedSession) PrepareWithParameterTypes(
+	ctx context.Context,
+	sql string,
+	parameterTypes []sqldriver.ParamType,
+) (BackendStatement, error) {
+	statement, err := session.Session.PrepareWithParameterTypes(
+		ctx, sql, parameterTypes,
+	)
 	if err != nil {
 		return nil, err
 	}

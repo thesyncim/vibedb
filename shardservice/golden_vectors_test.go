@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // goldenRequest and goldenResponse are the ordered, named fixtures the vectors
@@ -102,6 +104,16 @@ func goldenRequests() []goldenRequest {
 			req: &ShardRequest{
 				SQL:    "",
 				Params: []Param{StringParam(""), NumberParam("0"), BoolParam(false)},
+			},
+		},
+		{
+			name: "typed_null_parameters",
+			req: &ShardRequest{
+				SQL:    "SELECT $1,$2",
+				Params: []Param{NullParam(), NullParam()},
+				ParamTypes: []sqldriver.ParamType{
+					sqldriver.ParamTypeBool, sqldriver.ParamTypeName,
+				},
 			},
 		},
 	}

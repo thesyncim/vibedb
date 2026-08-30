@@ -81,7 +81,15 @@ func validateReplicatedSQLBatchReadRequest(
 		if len(query.SQL) == 0 {
 			return ErrReplicatedSQLReadUnsupported
 		}
+		if len(query.Params) > maxGatewaySQLParameters ||
+			len(query.ParamTypes) > maxGatewaySQLParameters {
+			return ErrReplicatedReadAdmission
+		}
+		if err := validateSQLParameterTypes(query.Params, query.ParamTypes); err != nil {
+			return err
+		}
 		queryBytes := uint64(8) + uint64(len(query.SQL))
+		queryBytes += uint64(len(query.ParamTypes))
 		for paramIndex := range query.Params {
 			if !query.Params[paramIndex].Valid() {
 				return ErrPlanParameters
@@ -93,6 +101,12 @@ func validateReplicatedSQLBatchReadRequest(
 			return ErrReplicatedReadAdmission
 		}
 		inputBytes += queryBytes
+	}
+	// Semantic analysis happens only after the complete batch passed physical
+	// admission above. In particular, neither parsing nor catalog access can be
+	// amplified with an oversized parameter-type vector.
+	if err := validateTypedQueries(ctx, request.Queries); err != nil {
+		return err
 	}
 	return nil
 }

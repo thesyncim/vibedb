@@ -13,6 +13,7 @@ import (
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // The bounded fan-out executor: it pins one catalog generation, routes, and
@@ -137,6 +138,11 @@ func (e *Executor) Metrics() MetricsSnapshot { return e.metrics.Snapshot() }
 type Query struct {
 	SQL    string
 	Params []shardservice.Param
+	// ParamTypes is absent for schemaless SQL. A present vector carries the
+	// gateway's analyzed SQL input domains through the shard protocol so an
+	// independently prepared shard plan cannot resolve the same placeholders to a
+	// different common type.
+	ParamTypes []sqldriver.ParamType `json:",omitempty"`
 
 	Class OperationClass
 }
@@ -194,6 +200,9 @@ func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profil
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateTypedQuery(ctx, &q); err != nil {
 		return nil, err
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
@@ -319,6 +328,9 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateTypedQuery(ctx, &q); err != nil {
 		return nil, err
 	}
 	profile := e.profileFor(q.Class)
@@ -496,6 +508,7 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 		req: &shardservice.ShardRequest{
 			SQL:                  q.SQL,
 			Params:               q.Params,
+			ParamTypes:           q.ParamTypes,
 			Distribution:         bound.distribution,
 			Shard:                targets[0].Shard,
 			AllocationGeneration: targets[0].AllocationGeneration,
@@ -620,6 +633,9 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateTypedQuery(ctx, &q); err != nil {
 		return nil, err
 	}
 	args, err := queryRuntimeArgs(q.Params)

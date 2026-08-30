@@ -12,6 +12,11 @@ import (
 // finite defaults; -1 disables the corresponding limit.
 type RecursiveSQLStatementOptions struct {
 	Limits RecursiveCTELimits
+	// preserveDocumentUnknown is set only by INSERT ... SELECT preparation. The
+	// recursive bridge prepares detached anchor/term statements before document
+	// lineage can be marked, so they must inherit that cold analysis context.
+	preserveDocumentUnknown bool
+	parameterTypes          []ParameterType
 }
 
 // RecursiveSQLStatementRequired is the zero-allocation detector shared prepare
@@ -68,7 +73,10 @@ func PrepareParsedRecursiveSQLStatement(
 		return nil, err
 	}
 	if len(plans) == 0 {
-		return PrepareParsedStatement(src, tree)
+		return prepareTreeInContext(
+			src, tree, 0, nil, 0, options.parameterTypes,
+			unknownOutputPrepareMode{preserveDocument: options.preserveDocumentUnknown},
+		)
 	}
 	// The ordinary owner prepare below temporarily substitutes recursive bodies
 	// with their anchors. Capture the complete authored reachability first so a
@@ -95,7 +103,10 @@ func PrepareParsedRecursiveSQLStatement(
 		}
 	}()
 
-	owner, err := prepareTreeInContext(src, tree, 0, nil, 0)
+	owner, err := prepareTreeInContext(
+		src, tree, 0, nil, 0, options.parameterTypes,
+		unknownOutputPrepareMode{preserveDocument: options.preserveDocumentUnknown},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +134,19 @@ func PrepareParsedRecursiveSQLStatement(
 			return nil, prepareErr
 		}
 		prepared = append(prepared, definition)
+		// Detached recursive terms use the owner's complete parameter frame.
+		// Merge their analyzed domains back before publication so protocol
+		// metadata sees parameters used only by the recursive arm and the usual
+		// Statement conflict path retains the later authored position. Both
+		// child vectors stay nil for an untyped recursive query, so this adds no
+		// sidecar allocation to that path.
+		current := &prepared[len(prepared)-1]
+		if err := owner.mergeChildParameterTypes(current.anchorStmt); err != nil {
+			return nil, err
+		}
+		if err := owner.mergeChildParameterTypes(current.recursiveStmt); err != nil {
+			return nil, err
+		}
 	}
 	// Preparing every term first makes reference counts final before any
 	// recursive publication snapshots them. This is essential when a later

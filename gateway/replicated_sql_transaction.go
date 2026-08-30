@@ -63,7 +63,15 @@ type replicatedSQLMutationIdentity struct {
 // byteview.Bytes borrows SQL storage; hashing never materializes a string copy.
 func replicatedSQLTransactionRequestDigest(queries []Query) replication.Digest {
 	hasher := sha256.New()
-	_, _ = hasher.Write([]byte("vibedb/rf3-sql-caller-request\x00"))
+	typed := false
+	for queryIndex := range queries {
+		typed = typed || len(queries[queryIndex].ParamTypes) != 0
+	}
+	if typed {
+		_, _ = hasher.Write([]byte("vibedb/rf3-sql-typed-caller-request\x00"))
+	} else {
+		_, _ = hasher.Write([]byte("vibedb/rf3-sql-caller-request\x00"))
+	}
 	var fixed [16]byte
 	binary.LittleEndian.PutUint64(fixed[:8], uint64(len(queries)))
 	_, _ = hasher.Write(fixed[:8])
@@ -87,6 +95,14 @@ func replicatedSQLTransactionRequestDigest(queries []Query) replication.Digest {
 			binary.LittleEndian.PutUint64(fixed[8:], uint64(len(param.Bytes)))
 			_, _ = hasher.Write(fixed[:])
 			_, _ = hasher.Write(param.Bytes)
+		}
+		if typed {
+			binary.LittleEndian.PutUint64(fixed[:8], uint64(len(query.ParamTypes)))
+			_, _ = hasher.Write(fixed[:8])
+			for _, parameterType := range query.ParamTypes {
+				fixed[0] = byte(parameterType)
+				_, _ = hasher.Write(fixed[:1])
+			}
 		}
 	}
 	var digest replication.Digest
@@ -121,6 +137,9 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	replicatedCount := 0
 	var encodedFlatBytes uint64
 	for index := range queries {
+		if err := validateTypedQuery(ctx, &queries[index]); err != nil {
+			return nil, false, err
+		}
 		args, err := queryRuntimeArgs(queries[index].Params)
 		if err != nil {
 			return nil, false, err

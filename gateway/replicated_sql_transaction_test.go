@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 type replicatedSQLIndexedReadClient struct {
@@ -162,6 +163,11 @@ func TestReplicatedSQLTransactionCallerDigestIsExactAndRouteIndependent(t *testi
 			Params: []shardservice.Param{shardservice.BoolParam(false)}},
 	}
 	want := replicatedSQLTransactionRequestDigest(base)
+	empty := append([]Query(nil), base...)
+	empty[0].ParamTypes = []sqldriver.ParamType{}
+	if got := replicatedSQLTransactionRequestDigest(empty); got != want {
+		t.Fatal("empty parameter type metadata changed the legacy digest")
+	}
 	if got := replicatedSQLTransactionRequestDigest(base); got != want {
 		t.Fatal("identical caller request changed digest")
 	}
@@ -174,6 +180,9 @@ func TestReplicatedSQLTransactionCallerDigestIsExactAndRouteIndependent(t *testi
 		{"kind", func(q []Query) { q[0].Params[0].Kind = shardservice.ParamNumber }},
 		{"bool", func(q []Query) { q[1].Params[0].Bool = true }},
 		{"bytes", func(q []Query) { q[0].Params[0].Bytes = []byte("other") }},
+		{"parameter type", func(q []Query) {
+			q[0].ParamTypes = []sqldriver.ParamType{sqldriver.ParamTypeText}
+		}},
 		{"order", func(q []Query) { q[0], q[1] = q[1], q[0] }},
 	}
 	for _, test := range tests {

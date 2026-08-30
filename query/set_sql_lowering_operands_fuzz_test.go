@@ -25,8 +25,8 @@ func FuzzSQLSetValuesOperandsStateful(f *testing.F) {
 		defer statement.Release()
 		av, bv, cv, dv := int64(a%5), int64(b%5), int64(c%5), int64(d%5)
 		args := []any{&av, &bv, &cv, &dv}
-		left := []string{setFuzzInt(av), setFuzzInt(bv), "null"}
-		right := []string{setFuzzInt(cv), setFuzzInt(dv), "null"}
+		left := []string{setFuzzUnknownText(av), setFuzzUnknownText(bv), "null"}
+		right := []string{setFuzzUnknownText(cv), setFuzzUnknownText(dv), "null"}
 		want := oracleSetFuzzStrings(mode, left, right)
 
 		var cancel CancelFlag
@@ -62,6 +62,10 @@ func FuzzSQLSetValuesOperandsStateful(f *testing.F) {
 				statement.nested.frame.intermediate.used, err)
 		}
 	})
+}
+
+func setFuzzUnknownText(value int64) string {
+	return `"` + setFuzzInt(value) + `"`
 }
 
 func setFuzzInt(value int64) string {

@@ -77,10 +77,11 @@ type statementWindowInput struct {
 }
 
 type statementWindowOutput struct {
-	ordinal   int
-	name      string
-	reduction Reduction
-	valueType ValueType
+	ordinal        int
+	name           string
+	reduction      Reduction
+	valueType      ValueType
+	representation OutputRepresentation
 }
 
 type statementWindowStage struct {
@@ -177,6 +178,8 @@ func (s *Statement) prepareWindow(
 	}
 	input, err := prepareTreeInCorrelationContext(
 		s.text, &w.inputTree, s.subqueryLimit, ctes, argBase, correlation,
+		s.parameterTypeHints,
+		unknownOutputPrepareMode{preserveDocument: s.preserveDocumentUnknown},
 	)
 	if err != nil {
 		return err
@@ -244,6 +247,13 @@ func (s *Statement) prepareWindow(
 	w.buildOrdinalSpecs(next)
 	visible := 0
 	inputNames := input.Columns()
+	inputSchema := input.AppendSchema(nil)
+	if len(inputSchema) != len(inputNames) {
+		return fmt.Errorf(
+			"query: window input schema has %d columns for %d names",
+			len(inputSchema), len(inputNames),
+		)
+	}
 	for i := range s.tree.Columns {
 		w.outputStart[i] = visible
 		column := &s.tree.Columns[i]
@@ -259,15 +269,36 @@ func (s *Statement) prepareWindow(
 			})
 			w.outputs[len(w.outputs)-1].reduction,
 				w.outputs[len(w.outputs)-1].valueType = windowOutputSchema(column.Window.Kind)
+			if windowFunctionPreservesInputSchema(column.Window.Kind) {
+				ordinal := w.inputOrdinal(column.Window.Argument)
+				if ordinal < 0 || ordinal >= len(inputSchema) {
+					return fmt.Errorf(
+						"query: window argument ordinal %d exceeds input schema width %d",
+						ordinal, len(inputSchema),
+					)
+				}
+				w.outputs[len(w.outputs)-1].reduction = inputSchema[ordinal].Reduction
+				w.outputs[len(w.outputs)-1].valueType = inputSchema[ordinal].Type
+				w.outputs[len(w.outputs)-1].representation = inputSchema[ordinal].Representation
+			}
 			visible++
 			continue
 		}
 		inputColumn := w.originalInput[i]
 		start, end := starts[inputColumn], starts[inputColumn+1]
 		for ordinal := start; ordinal < end; ordinal++ {
+			if ordinal < 0 || ordinal >= len(inputSchema) {
+				return fmt.Errorf(
+					"query: window output ordinal %d exceeds input schema width %d",
+					ordinal, len(inputSchema),
+				)
+			}
 			w.outputs = append(w.outputs, statementWindowOutput{
-				ordinal: ordinal,
-				name:    inputNames[ordinal],
+				ordinal:        ordinal,
+				name:           inputNames[ordinal],
+				reduction:      inputSchema[ordinal].Reduction,
+				valueType:      inputSchema[ordinal].Type,
+				representation: inputSchema[ordinal].Representation,
 			})
 			visible++
 		}
@@ -278,6 +309,16 @@ func (s *Statement) prepareWindow(
 	}
 	s.outputs = len(w.outputs)
 	return nil
+}
+
+func windowFunctionPreservesInputSchema(kind sqlast.WindowFunctionKind) bool {
+	switch kind {
+	case sqlast.WindowLag, sqlast.WindowLead, sqlast.WindowFirstValue,
+		sqlast.WindowLastValue, sqlast.WindowNthValue:
+		return true
+	default:
+		return false
+	}
 }
 
 func windowOutputSchema(kind sqlast.WindowFunctionKind) (Reduction, ValueType) {

@@ -35,6 +35,38 @@ import (
 // a typed error frame — a not-owner/stale admission refusal, a malformed request,
 // a deadline, or a resource limit — never a panic.
 
+type shardSQLPreparer interface {
+	Prepare(context.Context, string) (*sqldriver.Prepared, error)
+	PrepareWithParameterTypes(
+		context.Context, string, []sqldriver.ParamType,
+	) (*sqldriver.Prepared, error)
+	PreparePartialAggregate(context.Context, string) (*sqldriver.Prepared, error)
+	PreparePartialAggregateWithParameterTypes(
+		context.Context, string, []sqldriver.ParamType,
+	) (*sqldriver.Prepared, error)
+}
+
+func prepareShardSQL(
+	ctx context.Context,
+	preparer shardSQLPreparer,
+	sqlText string,
+	parameterTypes []sqldriver.ParamType,
+	partialAggregate bool,
+) (*sqldriver.Prepared, error) {
+	if partialAggregate {
+		if len(parameterTypes) != 0 {
+			return preparer.PreparePartialAggregateWithParameterTypes(
+				ctx, sqlText, parameterTypes,
+			)
+		}
+		return preparer.PreparePartialAggregate(ctx, sqlText)
+	}
+	if len(parameterTypes) != 0 {
+		return preparer.PrepareWithParameterTypes(ctx, sqlText, parameterTypes)
+	}
+	return preparer.Prepare(ctx, sqlText)
+}
+
 // pgOIDJSON is the type OID advertised for every result column. The shard wire
 // carries each cell as JSON text, so every column names the JSON type rather
 // than guessing a more specific type.
@@ -483,15 +515,9 @@ func (c *shardConn) executeRepartition(req *ShardRequest) *ShardResponse {
 
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
-	var (
-		prep *sqldriver.Prepared
-		err  error
+	prep, err := prepareShardSQL(
+		ctx, c.sess, req.SQL, req.ParamTypes, req.PartialAggregate,
 	)
-	if req.PartialAggregate {
-		prep, err = c.sess.PreparePartialAggregate(ctx, req.SQL)
-	} else {
-		prep, err = c.sess.Prepare(ctx, req.SQL)
-	}
 	if err != nil {
 		return classifyError(err)
 	}
@@ -895,7 +921,7 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 	}
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
-	prep, err := c.sess.Prepare(ctx, req.SQL)
+	prep, err := prepareShardSQL(ctx, c.sess, req.SQL, req.ParamTypes, false)
 	if err != nil {
 		return classifyError(err)
 	}
@@ -1370,7 +1396,9 @@ func (c *shardConn) executeParticipantStatements(
 			}
 			continue
 		}
-		prep, err := c.sess.Prepare(ctx, mutation.SQL)
+		prep, err := prepareShardSQL(
+			ctx, c.sess, mutation.SQL, mutation.ParamTypes, false,
+		)
 		if err != nil {
 			return 0, classifyError(err)
 		}
@@ -1461,13 +1489,9 @@ func (c *shardConn) execute(
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
 
-	var prep *sqldriver.Prepared
-	var err error
-	if req.PartialAggregate {
-		prep, err = c.sess.PreparePartialAggregate(ctx, req.SQL)
-	} else {
-		prep, err = c.sess.Prepare(ctx, req.SQL)
-	}
+	prep, err := prepareShardSQL(
+		ctx, c.sess, req.SQL, req.ParamTypes, req.PartialAggregate,
+	)
 	if err != nil {
 		return write(classifyError(err))
 	}

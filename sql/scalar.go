@@ -55,9 +55,14 @@ type ScalarExpr struct {
 	Value Operand
 	Agg   AggKind
 	Cast  ScalarCastTarget
-	Left  *ScalarExpr
-	Right *ScalarExpr
-	Pos   int
+	// TypedConstant marks PostgreSQL's type 'string' spelling. It is set only
+	// on the ScalarCast introduced by that grammar production, allowing the
+	// compiler to perform typinput once at prepare and the output-name resolver
+	// to mirror PostgreSQL without confusing an ordinary CAST over a path.
+	TypedConstant bool
+	Left          *ScalarExpr
+	Right         *ScalarExpr
+	Pos           int
 	// TargetPos is the source byte position of a CAST target. Keeping it
 	// distinct from Pos lets unsupported target diagnostics point at the type
 	// while runtime conversion failures point at the authored CAST.

@@ -1,6 +1,9 @@
 package sql
 
-import "testing"
+import (
+	"testing"
+	"unsafe"
+)
 
 // The allocation contract.
 //
@@ -16,6 +19,12 @@ import "testing"
 // node. That regression is invisible in a wall-clock number and obvious here.
 
 // TestWarmParseIsAllocationFree is the headline contract.
+func TestScalarExprFootprint(t *testing.T) {
+	if got := unsafe.Sizeof(ScalarExpr{}); got != 136 {
+		t.Fatalf("ScalarExpr footprint = %d bytes, want 136", got)
+	}
+}
+
 func TestWarmParseIsAllocationFree(t *testing.T) {
 	cases := []struct {
 		name string
@@ -45,6 +54,7 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 		{"grouped aggregate", benchGrouped},
 		{"output positions", `SELECT id, score + 1 FROM documents ORDER BY 2 DESC, 1`},
 		{"PostgreSQL casts", `SELECT amount::numeric, flag::boolean::text, -score::numeric FROM documents`},
+		{"PostgreSQL typed constants", `SELECT BOOL 'tr', TEXT 'x', TEXT 't'::BOOL::TEXT FROM documents WHERE flag = BOOL 't'`},
 		{"PostgreSQL comma FROM", `SELECT a.id, b.id, c.id FROM accounts a, regions b, countries c`},
 		{"PostgreSQL bare aliases", `SELECT id item_id, score total FROM documents ORDER BY item_id`},
 		{"containment and membership", benchRich},

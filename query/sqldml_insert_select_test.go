@@ -30,6 +30,7 @@ func TestPrepareDMLRejectsInsertSelectWidthAndStaticScalar(t *testing.T) {
 	for _, source := range []string{
 		"INSERT INTO dst SELECT id, value FROM src",
 		"INSERT INTO dst SELECT n + 1 FROM src",
+		"INSERT INTO dst SELECT ?",
 	} {
 		_, err := PrepareDML(source)
 		var shape *InsertSelectShapeError

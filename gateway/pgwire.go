@@ -162,6 +162,22 @@ func replicatedTableInfos(snapshot *Snapshot, profiles []ReplicatedTableProfile)
 	return tables
 }
 func (s *postgresSession) Prepare(ctx context.Context, text string) (pgwire.BackendStatement, error) {
+	return s.prepare(ctx, text, nil)
+}
+
+func (s *postgresSession) PrepareWithParameterTypes(
+	ctx context.Context,
+	text string,
+	parameterTypes []driver.ParamType,
+) (pgwire.BackendStatement, error) {
+	return s.prepare(ctx, text, parameterTypes)
+}
+
+func (s *postgresSession) prepare(
+	ctx context.Context,
+	text string,
+	parameterTypes []driver.ParamType,
+) (pgwire.BackendStatement, error) {
 	if s.state == driver.SessionClosed {
 		return nil, driver.ErrSessionClosed
 	}
@@ -177,31 +193,137 @@ func (s *postgresSession) Prepare(ctx context.Context, text string) (pgwire.Back
 	if err != nil {
 		return nil, err
 	}
+	queryParameterTypes, err := postgresQueryParameterTypes(parameterTypes, parsed.Params())
+	if err != nil {
+		return nil, err
+	}
 	if parsed.Kind != sqlast.KindSelect {
-		return s.prepareWrite(ctx, text, &parsed)
+		return s.prepareWrite(ctx, text, &parsed, queryParameterTypes)
 	}
 	tree := parsed.Select
-	compiled, err := query.PrepareParsedStatement(text, tree)
+	var compiled *query.Statement
+	if len(queryParameterTypes) == 0 {
+		compiled, err = query.PrepareParsedStatement(text, tree)
+	} else {
+		compiled, err = query.PrepareParsedStatementWithParameterTypes(
+			text, tree, queryParameterTypes,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
 	local := len(tree.From) == 0
 	if !local {
+		// Snapshot.Prepare is the catalog-pinned physical routing compiler. It
+		// parses placement, constraints, ordering, and aggregate shape but never
+		// performs scalar/common-type analysis; compiled above is therefore the
+		// sole semantic prepare and already consumed the declared type hints.
 		snapshot := s.backend.Executor.catalog.Current()
 		if _, err := snapshot.Prepare(ctx, text); err != nil {
 			compiled.Release()
 			return nil, err
 		}
 	}
-	statement := &postgresStatement{session: s, compiled: compiled, local: local}
+	statement := &postgresStatement{
+		session: s, compiled: compiled, local: local,
+		paramTypes: postgresSelectParameterTypes(compiled),
+	}
 	s.statements[statement] = struct{}{}
 	return statement, nil
+}
+
+func postgresQueryParameterTypes(
+	parameterTypes []driver.ParamType,
+	params int,
+) ([]query.ParameterType, error) {
+	if len(parameterTypes) == 0 {
+		return nil, nil
+	}
+	if len(parameterTypes) > params {
+		return nil, fmt.Errorf(
+			"gateway: %d parameter type hints exceed %d placeholders",
+			len(parameterTypes), params,
+		)
+	}
+	hasType := false
+	for _, parameterType := range parameterTypes {
+		if parameterType >= driver.ParamTypeInvalid {
+			return nil, fmt.Errorf(
+				"gateway: invalid parameter type hint %d", parameterType,
+			)
+		}
+		hasType = hasType || parameterType != driver.ParamTypeUnspecified
+	}
+	if !hasType {
+		return nil, nil
+	}
+	resolved := make([]query.ParameterType, len(parameterTypes))
+	for index, parameterType := range parameterTypes {
+		switch parameterType {
+		case driver.ParamTypeBool:
+			resolved[index] = query.ParameterTypeBool
+		case driver.ParamTypeText:
+			resolved[index] = query.ParameterTypeText
+		case driver.ParamTypeVarchar:
+			resolved[index] = query.ParameterTypeVarchar
+		case driver.ParamTypeName:
+			resolved[index] = query.ParameterTypeName
+		case driver.ParamTypeBPChar:
+			resolved[index] = query.ParameterTypeBPChar
+		case driver.ParamTypeOther:
+			resolved[index] = query.ParameterTypeOther
+		}
+	}
+	return resolved, nil
+}
+
+func postgresParameterType(parameterType query.ParameterType) driver.ParamType {
+	switch parameterType {
+	case query.ParameterTypeUnspecified:
+		return driver.ParamTypeUnspecified
+	case query.ParameterTypeBool:
+		return driver.ParamTypeBool
+	case query.ParameterTypeText:
+		return driver.ParamTypeText
+	case query.ParameterTypeVarchar:
+		return driver.ParamTypeVarchar
+	case query.ParameterTypeName:
+		return driver.ParamTypeName
+	case query.ParameterTypeBPChar:
+		return driver.ParamTypeBPChar
+	case query.ParameterTypeOther:
+		return driver.ParamTypeOther
+	default:
+		return driver.ParamTypeInvalid
+	}
+}
+
+func postgresSelectParameterTypes(statement *query.Statement) []driver.ParamType {
+	if statement == nil {
+		return nil
+	}
+	var parameterTypes []driver.ParamType
+	for index := 0; index < statement.NumParams(); index++ {
+		parameterType := postgresParameterType(statement.ParameterType(index))
+		if parameterType == driver.ParamTypeUnspecified {
+			continue
+		}
+		if parameterTypes == nil {
+			parameterTypes = make([]driver.ParamType, statement.NumParams())
+		}
+		parameterTypes[index] = parameterType
+	}
+	return parameterTypes
 }
 
 type postgresStatement struct {
 	session  *postgresSession
 	compiled *query.Statement
 	local    bool
+	// paramTypes is absent on the ordinary schemaless path. Distributed
+	// execution forwards a present vector so the shard's independent prepare
+	// observes the same analyzed input domains as this gateway prepare.
+	paramTypes []driver.ParamType
 }
 
 func (p *postgresStatement) Kind() sqlast.Kind { return sqlast.KindSelect }
@@ -214,7 +336,26 @@ func (p *postgresStatement) ParamKind(i int) driver.ParamKind {
 	return driver.ParamScalar
 }
 func (p *postgresStatement) ParamPosition(int) int { return 0 }
-func (p *postgresStatement) Columns() []string     { return p.compiled.Columns() }
+func (p *postgresStatement) ParamType(i int) driver.ParamType {
+	if p == nil || p.compiled == nil || i < 0 || i >= p.NumParams() {
+		return driver.ParamTypeInvalid
+	}
+	if i >= len(p.paramTypes) {
+		return driver.ParamTypeUnspecified
+	}
+	return p.paramTypes[i]
+}
+func (p *postgresStatement) ParamTypePosition(i int) int {
+	if p == nil || p.compiled == nil {
+		return -1
+	}
+	return p.compiled.ParameterTypePosition(i)
+}
+func (p *postgresStatement) ParamTypeTargetDefault(i int) bool {
+	return p != nil && p.compiled != nil &&
+		p.compiled.ParameterTypeTargetDefault(i)
+}
+func (p *postgresStatement) Columns() []string { return p.compiled.Columns() }
 func (p *postgresStatement) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
 	return p.compiled.AppendSchema(dst)
 }
@@ -223,6 +364,7 @@ func (p *postgresStatement) Close() error {
 		p.compiled.Release()
 		p.compiled = nil
 	}
+	p.paramTypes = nil
 	delete(p.session.statements, p)
 	return nil
 }
@@ -327,7 +469,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)
 	profile.MaxAggregateBytes = min(profile.MaxAggregateBytes, uint64(s.bytes))
 	profile.PerShardBytes = min(profile.PerShardBytes, profile.MaxAggregateBytes)
-	result, err := s.backend.Executor.queryWithProfile(ctx, Query{SQL: p.compiled.SQL(), Params: params, Class: ClassBatch}, profile)
+	result, err := s.backend.Executor.queryWithProfile(ctx, Query{
+		SQL: p.compiled.SQL(), Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
+	}, profile)
 	if err != nil {
 		return err
 	}

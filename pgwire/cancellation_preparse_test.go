@@ -175,7 +175,7 @@ func newPreparseTestSession(t *testing.T) (*session, *bytes.Buffer) {
 
 func TestCancellationReportedAfterSuccessfulBeginRollsBackState(t *testing.T) {
 	s, _ := newPreparseTestSession(t)
-	stmt, err := s.prepare("", "BEGIN")
+	stmt, err := s.prepare("", "BEGIN", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

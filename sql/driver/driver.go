@@ -435,14 +435,92 @@ func (c *conn) PrepareContext(ctx context.Context, src string) (sqldriver.Stmt, 
 // database/sql and the typed runtime. The returned statement owns the parsed
 // tree and both possible lowerings; adapters must not parse src independently.
 func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
-	return c.prepareContextMode(ctx, src, false)
+	return c.prepareContextMode(ctx, src, false, nil)
+}
+
+func (c *conn) prepareContextWithParameterTypes(
+	ctx context.Context,
+	src string,
+	parameterTypes []ParamType,
+) (*stmt, error) {
+	return c.prepareContextMode(ctx, src, false, parameterTypes)
 }
 
 func (c *conn) preparePartialAggregateContext(ctx context.Context, src string) (*stmt, error) {
-	return c.prepareContextMode(ctx, src, true)
+	return c.prepareContextMode(ctx, src, true, nil)
 }
 
-func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggregate bool) (*stmt, error) {
+func (c *conn) preparePartialAggregateContextWithParameterTypes(
+	ctx context.Context,
+	src string,
+	parameterTypes []ParamType,
+) (*stmt, error) {
+	return c.prepareContextMode(ctx, src, true, parameterTypes)
+}
+
+func queryParameterTypes(
+	parameterTypes []ParamType,
+	paramKinds []ParamKind,
+) ([]query.ParameterType, error) {
+	if len(parameterTypes) == 0 {
+		return nil, nil
+	}
+	if len(parameterTypes) > len(paramKinds) {
+		return nil, fmt.Errorf(
+			"vibedb: %d parameter type hints exceed %d placeholders",
+			len(parameterTypes), len(paramKinds),
+		)
+	}
+	hasType := false
+	for index, parameterType := range parameterTypes {
+		if parameterType >= ParamTypeInvalid {
+			return nil, fmt.Errorf(
+				"vibedb: invalid parameter type hint %d", parameterType,
+			)
+		}
+		// A document parameter's declared wire type belongs to the document
+		// decoder, not SQL scalar analysis. In particular json/jsonb/bytea are
+		// represented as ParamTypeOther; forwarding that marker into a mutation's
+		// synthetic filter would make an unrelated document assignment look like
+		// a scalar use. Skipping every document occurrence also preserves the
+		// established text-declared whole-document path.
+		if paramKinds[index] != ParamDocument &&
+			parameterType != ParamTypeUnspecified {
+			hasType = true
+		}
+	}
+	if !hasType {
+		return nil, nil
+	}
+	resolved := make([]query.ParameterType, len(parameterTypes))
+	for index, parameterType := range parameterTypes {
+		if paramKinds[index] == ParamDocument {
+			continue
+		}
+		switch parameterType {
+		case ParamTypeBool:
+			resolved[index] = query.ParameterTypeBool
+		case ParamTypeText:
+			resolved[index] = query.ParameterTypeText
+		case ParamTypeVarchar:
+			resolved[index] = query.ParameterTypeVarchar
+		case ParamTypeName:
+			resolved[index] = query.ParameterTypeName
+		case ParamTypeBPChar:
+			resolved[index] = query.ParameterTypeBPChar
+		case ParamTypeOther:
+			resolved[index] = query.ParameterTypeOther
+		}
+	}
+	return resolved, nil
+}
+
+func (c *conn) prepareContextMode(
+	ctx context.Context,
+	src string,
+	partialAggregate bool,
+	parameterTypes []ParamType,
+) (*stmt, error) {
 	if err := c.usable(ctx); err != nil {
 		return nil, err
 	}
@@ -496,6 +574,10 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 		paramKinds: statementParamKinds(tree),
 	}
 	s.paramPositions = statementDocumentParamPositions(tree, s.paramKinds)
+	queryParameterTypes, err := queryParameterTypes(parameterTypes, s.paramKinds)
+	if err != nil {
+		return nil, err
+	}
 	if tree.Kind == sqlast.KindCreateView || tree.Kind == sqlast.KindDropView {
 		var ddl *preparedViewDDL
 		ddl, err = c.prepareViewDDL(ctx, src, tree)
@@ -529,7 +611,9 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 		return nil, err
 	}
 	if tree.Kind.IsQuery() {
-		s.query, err = query.PrepareParsedStatement(src, tree.Select)
+		s.query, err = query.PrepareParsedStatementWithParameterTypes(
+			src, tree.Select, queryParameterTypes,
+		)
 		if err == nil {
 			s.explain = tree.Explain
 			s.analyze = tree.Explain && tree.Analyze
@@ -580,7 +664,9 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 			}
 		}
 	} else {
-		s.mutation, err = query.PrepareParsedDML(src, tree)
+		s.mutation, err = query.PrepareParsedDMLWithParameterTypes(
+			src, tree, queryParameterTypes,
+		)
 		if err == nil {
 			s.dependencies = dmlExecutablePhysicalDependencies(tree)
 		}
@@ -630,6 +716,12 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 				}
 			}
 		}
+	}
+	if err == nil && tree.Kind.IsQuery() {
+		err = s.applyPreparedParamTypes(s.query, 0)
+	}
+	if err == nil && !tree.Kind.IsQuery() {
+		err = s.applyPreparedParamTypes(s.mutation, 0)
 	}
 	if err != nil {
 		_ = s.Close()

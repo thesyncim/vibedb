@@ -57,8 +57,13 @@ type statementLateral struct {
 	correlation  statementCorrelationPlan
 	childEpoch   uint64
 
-	outputs      []lateralOutput
-	names        []string
+	outputs []lateralOutput
+	names   []string
+	// schema mirrors names for the exposed APPLY relation. It is prepared once
+	// from local child outputs (and exact root bindings where available) so a
+	// parent identity projection can preserve SQL transport types without
+	// consulting live rows.
+	schema       []OutputColumn
 	localOutputs int
 	gates        []lateralGateExpr
 	group        lateralGroupProgram
@@ -253,13 +258,14 @@ func prepareStatementLateral(
 
 	child, err := prepareTreeInCorrelationContext(
 		owner.text, &clone, 0, owner.cteCatalog(), argBase+ref.Query.ParamBase,
-		&lateralPrepareFrame{apply: lateral},
+		&lateralPrepareFrame{apply: lateral}, owner.parameterTypeHints,
+		unknownOutputPrepareMode{preserveDocument: owner.preserveDocumentUnknown},
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 	if err := lateral.finishProjection(
-		child, cloner.projection, clone.Columns, cloner.hidden,
+		child, join, cloner.projection, clone.Columns, cloner.hidden,
 	); err != nil {
 		child.Release()
 		return nil, nil, err
@@ -476,6 +482,7 @@ func (c *lateralClone) cardinalityPath(expr *sqlast.Expr) *sqlast.PathExpr {
 
 func (l *statementLateral) finishProjection(
 	child *Statement,
+	join *statementRelationJoin,
 	projection []lateralProjection,
 	columns []sqlast.ResultColumn,
 	hidden int,
@@ -484,9 +491,17 @@ func (l *statementLateral) finishProjection(
 		return fmt.Errorf("query: correlated LATERAL has no prepared child")
 	}
 	localNames := child.Columns()
+	localSchema := child.AppendSchema(nil)
+	if len(localSchema) != len(localNames) {
+		return fmt.Errorf(
+			"query: correlated LATERAL child schema has %d columns, want %d",
+			len(localSchema), len(localNames),
+		)
+	}
 	l.localOutputs = len(localNames)
 	l.outputs = make([]lateralOutput, 0, len(localNames)+len(projection))
 	l.names = make([]string, 0, len(localNames)+len(projection))
+	l.schema = make([]OutputColumn, 0, len(localNames)+len(projection))
 	starts := make([]int, len(columns))
 	widths := make([]int, len(columns))
 	local := 0
@@ -516,6 +531,23 @@ func (l *statementLateral) finishProjection(
 				local: -1, binding: item.binding, agg: item.agg,
 			})
 			l.names = append(l.names, item.name)
+			outputSchema := OutputColumn{
+				Header: item.name, Ordinal: uint32(len(l.schema)), Type: TypeAny,
+			}
+			if item.agg == sqlast.AggNone && item.binding < len(l.bindings) {
+				binding := &l.bindings[item.binding]
+				if binding.root && join != nil && binding.source >= 0 &&
+					binding.source < len(join.sources) {
+					source := &join.sources[binding.source]
+					ordinal := binding.column - source.offset
+					if ordinal >= 0 && ordinal < len(source.schema) {
+						outputSchema.Type = source.schema[ordinal].Type
+						outputSchema.Representation =
+							source.schema[ordinal].Representation
+					}
+				}
+			}
+			l.schema = append(l.schema, outputSchema)
 			continue
 		}
 		if item.local < 0 || item.local >= len(columns) {
@@ -527,6 +559,7 @@ func (l *statementLateral) finishProjection(
 			column := starts[item.local] + ordinal
 			l.outputs = append(l.outputs, lateralOutput{local: column, binding: -1})
 			l.names = append(l.names, localNames[column])
+			l.schema = append(l.schema, localSchema[column])
 			localMapped++
 		}
 	}

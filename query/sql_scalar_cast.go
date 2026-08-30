@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/thesyncim/vibedb/internal/pginput"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -80,51 +81,11 @@ func castScalarBoolean(pos int, left statementScalarValue) (statementScalarValue
 			Pos: pos, Operation: "cast to boolean", Left: valueTypeOfScalar(left.value), Right: TypeAny,
 		}
 	}
-	text := trimSQLSpace(left.value.sval)
-	value, ok := parseSQLBoolean(text)
+	value, ok := pginput.Boolean(left.value.sval)
 	if !ok {
 		return statementScalarValue{}, &ScalarInvalidTextError{Pos: pos, Target: "BOOLEAN"}
 	}
 	return statementScalarValue{value: scalar{kind: kindBool, bval: value}}, nil
-}
-
-var sqlBooleanWords = [...]struct {
-	word  string
-	value bool
-}{
-	{"true", true},
-	{"false", false},
-	{"yes", true},
-	{"no", false},
-	{"on", true},
-	{"off", false},
-}
-
-// parseSQLBoolean implements PostgreSQL's deterministic boolean input rule:
-// every non-empty, case-insensitive unique prefix of TRUE/FALSE, YES/NO, and
-// ON/OFF is accepted, as are 1 and 0. Thus "tr" and "of" are valid while
-// "o" is rejected because it names both ON and OFF. The fixed array and byte
-// fold keep prepared execution allocation-free.
-func parseSQLBoolean(text string) (bool, bool) {
-	if text == "1" {
-		return true, true
-	}
-	if text == "0" {
-		return false, true
-	}
-	if len(text) == 0 {
-		return false, false
-	}
-	matches := 0
-	value := false
-	for i := range sqlBooleanWords {
-		candidate := &sqlBooleanWords[i]
-		if len(text) <= len(candidate.word) && equalFoldScalar(text, candidate.word[:len(text)]) {
-			matches++
-			value = candidate.value
-		}
-	}
-	return value, matches == 1
 }
 
 func (r *statementScalar) castScalarNumeric(
@@ -233,25 +194,6 @@ func sqlSpace(b byte) bool {
 	default:
 		return false
 	}
-}
-
-func equalFoldScalar(left, right string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		a, b := left[i], right[i]
-		if a >= 'A' && a <= 'Z' {
-			a += 'a' - 'A'
-		}
-		if b >= 'A' && b <= 'Z' {
-			b += 'a' - 'A'
-		}
-		if a != b {
-			return false
-		}
-	}
-	return true
 }
 
 // appendSQLNumeric accepts the exact decimal grammar SQL users expect from a

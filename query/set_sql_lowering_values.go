@@ -24,9 +24,22 @@ type setSQLPreparedValue struct {
 	ordinal int
 }
 
+type setSQLParameterCast struct {
+	target sqlast.ScalarCastTarget
+	pos    int
+	active bool
+}
+
 type setSQLDocumentParamMetadata struct {
 	position  int
 	parameter int
+}
+
+type setSQLTypedColumn struct {
+	valueType      ValueType
+	representation OutputRepresentation
+	target         sqlast.ScalarCastTarget
+	active         bool
 }
 
 // setSQLValuesRunner is a source-independent prepared leaf. It resolves each
@@ -45,6 +58,10 @@ type setSQLValuesRunner struct {
 	// authored position and the owning statement's parameter identity without
 	// widening every prepared scalar value or adding cost to the absent path.
 	documentParams []setSQLDocumentParamMetadata
+	// parameterCasts is likewise absent for ordinary VALUES. Typed SQL columns
+	// allocate one compact entry per placeholder, rather than widening and
+	// copying every row-major prepared value on the common execution path.
+	parameterCasts []setSQLParameterCast
 
 	literals compiler
 	binder   Statement
@@ -62,6 +79,7 @@ func (r *setSQLValuesRunner) prepare(expr *sqlast.SetExpr) error {
 	r.schema = resize(r.schema, expr.Columns)
 	types := make([]ValueType, expr.Columns)
 	dynamic := make([]bool, expr.Columns)
+	var typedColumns []setSQLTypedColumn
 	for column := 0; column < expr.Columns; column++ {
 		name := ""
 		if column < len(expr.First.Columns) {
@@ -95,9 +113,33 @@ func (r *setSQLValuesRunner) prepare(expr *sqlast.SetExpr) error {
 			)
 		}
 		for column := range values {
-			prepared, valueType, isDynamic, err := r.prepareValue(values[column])
+			value := values[column]
+			prepared, valueType, isDynamic, err := r.prepareValue(value)
 			if err != nil {
 				return err
+			}
+			if value.TypedConstant {
+				typedType, representation, ok := setTypedConstantMetadata(value.Cast)
+				if !ok {
+					return fmt.Errorf(
+						"query: VALUES typed constant at byte %d has cast target %d: %w",
+						value.Pos, value.Cast, ErrSetTreePlan,
+					)
+				}
+				if typedColumns == nil {
+					typedColumns = make([]setSQLTypedColumn, expr.Columns)
+				}
+				typed := &typedColumns[column]
+				if typed.active && typed.target != value.Cast {
+					return &ScalarTypeError{
+						Pos: value.Pos, Operation: "VALUES common type",
+						Left: typed.valueType, Right: typedType,
+					}
+				}
+				*typed = setSQLTypedColumn{
+					valueType: typedType, representation: representation,
+					target: value.Cast, active: true,
+				}
 			}
 			r.values[at] = prepared
 			at++
@@ -116,7 +158,16 @@ func (r *setSQLValuesRunner) prepare(expr *sqlast.SetExpr) error {
 		}
 	}
 	for column := range r.schema {
-		if dynamic[column] {
+		if typedColumns != nil && typedColumns[column].active {
+			typed := typedColumns[column]
+			if err := r.applyTypedColumn(
+				expr, column, typed.target, typed.valueType,
+			); err != nil {
+				return err
+			}
+			r.schema[column].Type = typed.valueType
+			r.schema[column].Representation = typed.representation
+		} else if dynamic[column] {
 			r.schema[column].Type = TypeAny
 		} else {
 			r.schema[column].Type = types[column]
@@ -124,6 +175,145 @@ func (r *setSQLValuesRunner) prepare(expr *sqlast.SetExpr) error {
 	}
 	r.cursor.outputs = expr.Columns
 	return nil
+}
+
+// applyTypedColumn performs PostgreSQL's common-type coercion for the bounded
+// VALUES scalar surface. Bare string literals are unknown until a common type
+// is selected, and parameters inherit that selected type. Concrete bool and
+// number values never acquire an unrelated type implicitly.
+func (r *setSQLValuesRunner) applyTypedColumn(
+	expr *sqlast.SetExpr,
+	column int,
+	target sqlast.ScalarCastTarget,
+	targetType ValueType,
+) error {
+	for row := range expr.Values.Rows {
+		value := expr.Values.Rows[row].Values[column]
+		prepared := &r.values[row*expr.Columns+column]
+		if value.Null || value.TypedConstant {
+			continue
+		}
+		switch value.Operand.Kind {
+		case sqlast.OperandParam:
+			if prepared.ordinal < 0 || prepared.ordinal >= r.params {
+				return fmt.Errorf("query: invalid typed VALUES parameter ordinal %d: %w",
+					prepared.ordinal, ErrSetTreePlan)
+			}
+			if r.parameterCasts == nil {
+				r.parameterCasts = make([]setSQLParameterCast, r.params)
+			}
+			metadata := &r.parameterCasts[prepared.ordinal]
+			if metadata.active && metadata.target != target {
+				return &ScalarTypeError{
+					Pos: value.Pos, Operation: "VALUES parameter common type",
+					Left:  setSQLValueTypeForCast(metadata.target),
+					Right: targetType,
+				}
+			}
+			*metadata = setSQLParameterCast{
+				target: target, pos: value.Pos, active: true,
+			}
+		case sqlast.OperandString:
+			if target == sqlast.ScalarCastText {
+				continue
+			}
+			if target != sqlast.ScalarCastBoolean {
+				return fmt.Errorf(
+					"query: VALUES typed column has unsupported target %d: %w",
+					target, ErrSetTreePlan,
+				)
+			}
+			cast, err := castScalarBoolean(value.Pos, statementScalarValue{
+				value: classifyLiteral(prepared.literal),
+			})
+			if err != nil {
+				return err
+			}
+			prepared.literal = literal{kind: kindBool, bval: cast.value.bval}
+		case sqlast.OperandBool:
+			if targetType == TypeBool {
+				continue
+			}
+			return &ScalarTypeError{
+				Pos: value.Pos, Operation: "VALUES common type",
+				Left: targetType, Right: TypeBool,
+			}
+		case sqlast.OperandNumber:
+			return &ScalarTypeError{
+				Pos: value.Pos, Operation: "VALUES common type",
+				Left: targetType, Right: TypeNumber,
+			}
+		default:
+			return fmt.Errorf(
+				"query: VALUES typed column has operand kind %d: %w",
+				value.Operand.Kind, ErrSetTreePlan,
+			)
+		}
+	}
+	return nil
+}
+
+// applySetCommonColumn installs a common type selected by an enclosing set
+// node. Keeping this on the VALUES runner preserves each authored parameter
+// position and performs known-string boolean typinput during preparation;
+// runtime binding then remains the same allocation-free per-value path used by
+// a typed constant inside VALUES itself.
+func (r *setSQLValuesRunner) applySetCommonColumn(
+	expr *sqlast.SetExpr,
+	column int,
+	target OutputRepresentation,
+) error {
+	if r == nil || expr == nil || expr.Values == nil ||
+		column < 0 || column >= len(r.schema) {
+		return fmt.Errorf("query: invalid VALUES common-type column %d: %w",
+			column, ErrSetTreePlan)
+	}
+	var cast sqlast.ScalarCastTarget
+	var valueType ValueType
+	switch target {
+	case OutputSQLBool:
+		cast, valueType = sqlast.ScalarCastBoolean, TypeBool
+	case OutputSQLText, OutputSQLVarchar, OutputSQLName, OutputSQLBPChar:
+		cast, valueType = sqlast.ScalarCastText, TypeString
+	default:
+		return &ScalarTypeError{
+			Pos: expr.Pos, Operation: "VALUES common type",
+			Left:  r.schema[column].Type,
+			Right: setSQLValueTypeForRepresentation(target),
+		}
+	}
+	if err := r.applyTypedColumn(expr, column, cast, valueType); err != nil {
+		return err
+	}
+	r.schema[column].Type = valueType
+	r.schema[column].Representation = target
+	return nil
+}
+
+func setTypedConstantMetadata(
+	target sqlast.ScalarCastTarget,
+) (ValueType, OutputRepresentation, bool) {
+	switch target {
+	case sqlast.ScalarCastText:
+		return TypeString, OutputSQLText, true
+	case sqlast.ScalarCastBoolean:
+		return TypeBool, OutputSQLBool, true
+	default:
+		return TypeAny, OutputJSON, false
+	}
+}
+
+func setSQLValueTypeForCast(target sqlast.ScalarCastTarget) ValueType {
+	switch target {
+	case sqlast.ScalarCastText:
+		return TypeString
+	case sqlast.ScalarCastBoolean:
+		return TypeBool
+	case sqlast.ScalarCastNumeric:
+		return TypeNumber
+	default:
+		return TypeAny
+	}
 }
 
 func (r *setSQLValuesRunner) prepareValue(
@@ -237,7 +427,7 @@ func (r *setSQLValuesRunner) runIntoFrame(
 		if err = cancellationCheckpoint(exec.Options.Cancel, index); err != nil {
 			return Cursor{}, err
 		}
-		cell, resolveErr := r.resolveValue(r.values[index], args)
+		cell, resolveErr := r.resolveValue(&r.values[index], args)
 		if resolveErr != nil {
 			return Cursor{}, resolveErr
 		}
@@ -288,9 +478,12 @@ func (r *setSQLValuesRunner) runIntoFrame(
 }
 
 func (r *setSQLValuesRunner) resolveValue(
-	value setSQLPreparedValue,
+	value *setSQLPreparedValue,
 	args []any,
 ) (Cell, error) {
+	if value == nil {
+		return Cell{}, fmt.Errorf("query: nil prepared VALUES scalar")
+	}
 	switch value.kind {
 	case setSQLNullValue:
 		return nullCell(), nil
@@ -310,6 +503,25 @@ func (r *setSQLValuesRunner) resolveValue(
 		literalValue, err := r.binder.c.makeLiteral(argument)
 		if err != nil {
 			return Cell{}, err
+		}
+		if value.ordinal >= 0 && value.ordinal < len(r.parameterCasts) &&
+			r.parameterCasts[value.ordinal].active {
+			metadata := r.parameterCasts[value.ordinal]
+			left := statementScalarValue{value: classifyLiteral(literalValue)}
+			switch metadata.target {
+			case sqlast.ScalarCastText:
+				return cellFromScalar(castScalarText(left).value), nil
+			case sqlast.ScalarCastBoolean:
+				cast, castErr := castScalarBoolean(metadata.pos, left)
+				if castErr != nil {
+					return Cell{}, castErr
+				}
+				return cellFromScalar(cast.value), nil
+			default:
+				return Cell{}, fmt.Errorf(
+					"query: invalid VALUES parameter cast target %d", metadata.target,
+				)
+			}
 		}
 		return setSQLCellFromLiteral(literalValue), nil
 	case setSQLDocumentParamValue:
@@ -400,7 +612,7 @@ func (r *setSQLValuesRunner) bindForExplain(args []any) error {
 			r.values[index].kind != setSQLDocumentParamValue {
 			continue
 		}
-		if _, err := r.resolveValue(r.values[index], args); err != nil {
+		if _, err := r.resolveValue(&r.values[index], args); err != nil {
 			return err
 		}
 	}

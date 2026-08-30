@@ -67,9 +67,40 @@ type Statement struct {
 
 	// params is the placeholder count, the value a driver validates its
 	// argument count against before it does anything else.
-	params           int
-	requiresCatalog  bool
-	drivingPredicate *sqlast.Expr
+	params int
+	// paramBase is this statement's first placeholder in the owning top-level
+	// statement. Nested prepared statements keep their local parameter count
+	// while this immutable offset lets metadata be projected back without
+	// copying a statement-wide type vector into every child.
+	paramBase int
+	// paramTypes is a prepare-time flattened view of inferred SQL input domains.
+	// It stays nil for the ordinary schemaless path and makes every public
+	// metadata lookup one bounded slice access regardless of nesting depth.
+	paramTypes []ParameterType
+	// paramTypePositions stores the first authored byte position plus one for
+	// each inferred typed parameter. It is allocated only beside paramTypes and
+	// lets protocol adapters attribute repeated-number conflicts precisely.
+	paramTypePositions []int
+	// paramTypeTargetDefaults distinguishes PostgreSQL's final target-list
+	// UNKNOWN-to-TEXT coercion from a contextual type constraint. It is allocated
+	// only when that cold prepare-time rule fires, so the ordinary schemaless path
+	// retains no storage or execution cost. Protocol adapters use the provenance
+	// when several '?' occurrences map back to one numbered wire parameter.
+	paramTypeTargetDefaults []bool
+	// parameterTypeHints is borrowed only while the prepared tree is being
+	// analyzed. Protocol adapters use it to make client-declared PostgreSQL
+	// parameter types participate in common-type selection rather than checking
+	// them after unknown outputs have already been finalized. It is nil on the
+	// ordinary path and cleared before preparation returns.
+	parameterTypeHints []ParameterType
+	// preserveDocumentUnknown is a prepare-only INSERT-source context. Whole JSON
+	// document lineage is marked after the relation graph exists, so nested
+	// derived/CTE/set preparation must not finalize its unknown placeholders to
+	// SQL text before that mark can reach them. It is false for ordinary SQL and
+	// cleared before preparation returns.
+	preserveDocumentUnknown bool
+	requiresCatalog         bool
+	drivingPredicate        *sqlast.Expr
 	// correlation is immutable, cold metadata installed only on a LATERAL child.
 	// Live slot values belong to the child Exec.Workspace, never to Statement.
 	correlation *statementCorrelationPlan
@@ -143,6 +174,48 @@ type Statement struct {
 	// subquery. Keeping one pointer here instead of three slice words makes
 	// ordinary prepared statements pay the smallest representable space cost.
 	nested *nestedStatements
+}
+
+// ParameterType is an analysis-time SQL input domain for one placeholder.
+// Its zero value is intentionally unspecified: most VibeDB parameters remain
+// schemaless, and only contexts which PostgreSQL itself uses for type
+// resolution opt into an exact domain.
+type ParameterType uint8
+
+const (
+	ParameterTypeUnspecified ParameterType = iota
+	ParameterTypeBool
+	ParameterTypeText
+	ParameterTypeVarchar
+	ParameterTypeName
+	ParameterTypeBPChar
+	// ParameterTypeOther is a concrete client-declared PostgreSQL domain which
+	// this bounded analyzer cannot otherwise model. It is not unknown: operator
+	// resolution must reject it when a BOOL/TEXT context requires a different
+	// category instead of silently inferring through it.
+	ParameterTypeOther
+	ParameterTypeInvalid
+)
+
+func (t ParameterType) String() string {
+	switch t {
+	case ParameterTypeUnspecified:
+		return "unspecified"
+	case ParameterTypeBool:
+		return "boolean"
+	case ParameterTypeText:
+		return "text"
+	case ParameterTypeVarchar:
+		return "character varying"
+	case ParameterTypeName:
+		return "name"
+	case ParameterTypeBPChar:
+		return "character"
+	case ParameterTypeOther:
+		return "other"
+	default:
+		return "invalid"
+	}
 }
 
 type nestedStatements struct {
@@ -251,10 +324,37 @@ func PrepareParsedStatement(
 	src string,
 	tree *sqlast.SelectStmt,
 ) (*Statement, error) {
+	return PrepareParsedStatementWithParameterTypes(src, tree, nil)
+}
+
+// PrepareParsedStatementWithParameterTypes lowers an already-parsed SELECT
+// while treating each non-unspecified entry as an analysis-time input type for
+// the corresponding placeholder. The slice is borrowed only for the duration
+// of this call. Supplying nil is exactly equivalent to PrepareParsedStatement
+// and preserves the ordinary allocation profile.
+func PrepareParsedStatementWithParameterTypes(
+	src string,
+	tree *sqlast.SelectStmt,
+	parameterTypes []ParameterType,
+) (*Statement, error) {
 	if tree == nil {
 		return nil, fmt.Errorf("query: PrepareParsedStatement was given a nil SELECT")
 	}
-	return prepareTree(src, tree)
+	if len(parameterTypes) > tree.Params {
+		return nil, fmt.Errorf(
+			"query: %d parameter type hints exceed %d placeholders: %w",
+			len(parameterTypes), tree.Params, ErrParameterType,
+		)
+	}
+	for _, parameterType := range parameterTypes {
+		if parameterType >= ParameterTypeInvalid {
+			return nil, fmt.Errorf(
+				"query: invalid parameter type hint %d: %w",
+				parameterType, ErrParameterType,
+			)
+		}
+	}
+	return prepareTreeWithParameterTypes(src, tree, parameterTypes)
 }
 
 // prepareTree lowers an already-parsed SELECT.
@@ -265,15 +365,40 @@ func PrepareParsedStatement(
 // into the same Statement PrepareStatement would have produced from the
 // equivalent SELECT text. See sqldml.go.
 func prepareTree(src string, tree *sqlast.SelectStmt) (*Statement, error) {
-	return prepareTreeWithLimit(src, tree, 0)
+	return prepareTreeWithParameterTypes(src, tree, nil)
+}
+
+func prepareTreeWithParameterTypes(
+	src string,
+	tree *sqlast.SelectStmt,
+	parameterTypes []ParameterType,
+) (*Statement, error) {
+	return prepareTreeWithLimit(src, tree, 0, parameterTypes)
+}
+
+func prepareTreeWithParameterTypesPreservingUnknownOutput(
+	src string,
+	tree *sqlast.SelectStmt,
+	parameterTypes []ParameterType,
+) (*Statement, error) {
+	return prepareTreeInCorrelationContext(
+		src, tree, 0, nil, 0, nil, parameterTypes,
+		unknownOutputPrepareMode{preserveDocument: true},
+	)
+}
+
+type unknownOutputPrepareMode struct {
+	deferScalar      bool
+	preserveDocument bool
 }
 
 func prepareTreeWithLimit(
 	src string,
 	tree *sqlast.SelectStmt,
 	subqueryLimit uint8,
+	parameterTypes []ParameterType,
 ) (*Statement, error) {
-	return prepareTreeInContext(src, tree, subqueryLimit, nil, 0)
+	return prepareTreeInContext(src, tree, subqueryLimit, nil, 0, parameterTypes)
 }
 
 // prepareTreeInContext prepares one SELECT inside the lexical CTE catalog and
@@ -285,9 +410,12 @@ func prepareTreeInContext(
 	subqueryLimit uint8,
 	ctes *statementCTEs,
 	argBase int,
+	parameterTypes []ParameterType,
+	unknownModes ...unknownOutputPrepareMode,
 ) (*Statement, error) {
 	return prepareTreeInCorrelationContext(
-		src, tree, subqueryLimit, ctes, argBase, nil,
+		src, tree, subqueryLimit, ctes, argBase, nil, parameterTypes,
+		unknownModes...,
 	)
 }
 
@@ -301,7 +429,15 @@ func prepareTreeInCorrelationContext(
 	ctes *statementCTEs,
 	argBase int,
 	correlation *lateralPrepareFrame,
+	parameterTypes []ParameterType,
+	unknownModes ...unknownOutputPrepareMode,
 ) (*Statement, error) {
+	mode := unknownOutputPrepareMode{}
+	if len(unknownModes) != 0 {
+		mode = unknownModes[0]
+	}
+	deferUnknownScalarOutput := mode.deferScalar
+	preserveDocumentUnknown := mode.preserveDocument
 	if recursive, pos := RecursiveSQLStatementRequired(tree); recursive &&
 		!recursiveSQLBridgeReentry(tree) {
 		// The owning top-level bridge rewrites each recursive definition to its
@@ -311,7 +447,10 @@ func prepareTreeInCorrelationContext(
 		// failure and can never execute the fixpoint semantics.
 		if subqueryLimit == 0 && ctes == nil && argBase == 0 && tree.Set == nil {
 			return PrepareParsedRecursiveSQLStatement(
-				src, tree, RecursiveSQLStatementOptions{},
+				src, tree, RecursiveSQLStatementOptions{
+					preserveDocumentUnknown: preserveDocumentUnknown,
+					parameterTypes:          parameterTypes,
+				},
 			)
 		}
 		return nil, sqlast.NewFeatureNotSupportedError(
@@ -320,12 +459,23 @@ func prepareTreeInCorrelationContext(
 		)
 	}
 	if tree.Set != nil {
-		return prepareSetSQLStatement(src, tree, subqueryLimit, ctes, argBase)
+		return prepareSetSQLStatement(
+			src, tree, subqueryLimit, ctes, argBase, parameterTypes,
+			preserveDocumentUnknown,
+		)
 	}
 	s := &Statement{
-		text: src, tree: tree, params: tree.Params,
-		subqueryLimit: subqueryLimit,
+		text: src, tree: tree, params: tree.Params, paramBase: argBase,
+		subqueryLimit: subqueryLimit, parameterTypeHints: parameterTypes,
+		preserveDocumentUnknown: preserveDocumentUnknown,
 	}
+	if err := s.seedParameterTypes(parameterTypes); err != nil {
+		return nil, err
+	}
+	defer func() {
+		s.parameterTypeHints = nil
+		s.preserveDocumentUnknown = false
+	}()
 	if correlation != nil && correlation.apply != nil {
 		s.correlation = &correlation.apply.correlation
 	}
@@ -373,7 +523,7 @@ func prepareTreeInCorrelationContext(
 			return nil, err
 		}
 	}
-	if err := s.prepareScalar(); err != nil {
+	if err := s.prepareScalar(deferUnknownScalarOutput); err != nil {
 		s.Release()
 		return nil, err
 	}
@@ -394,6 +544,10 @@ func prepareTreeInCorrelationContext(
 		s.nested.driving = s.resolveDrivingCollection()
 	}
 	if err := s.describe(); err != nil {
+		s.Release()
+		return nil, err
+	}
+	if err := s.prepareParameterTypes(); err != nil {
 		s.Release()
 		return nil, err
 	}
@@ -455,6 +609,248 @@ func (s *Statement) Columns() []string { return s.names[:s.outputs:s.outputs] }
 // check [SelectStmt.Params] exists for.
 func (s *Statement) NumParams() int { return s.params }
 
+// ParameterType reports the SQL input domain inferred for a zero-based
+// placeholder. The result is immutable prepared metadata and the lookup
+// allocates nothing. An unrelated scalar remains unspecified.
+func (s *Statement) ParameterType(index int) ParameterType {
+	if s == nil || index < 0 || index >= s.params {
+		return ParameterTypeInvalid
+	}
+	if index >= len(s.paramTypes) {
+		return ParameterTypeUnspecified
+	}
+	return s.paramTypes[index]
+}
+
+// ParameterTypePosition reports the zero-based authored byte offset at which
+// a placeholder acquired its analyzed type. A declared-only, unspecified, or
+// out-of-range parameter returns -1.
+func (s *Statement) ParameterTypePosition(index int) int {
+	if s == nil || index < 0 || index >= s.params ||
+		index >= len(s.paramTypePositions) || s.paramTypePositions[index] == 0 {
+		return -1
+	}
+	return s.paramTypePositions[index] - 1
+}
+
+// ParameterTypeTargetDefault reports whether ParameterType was selected only
+// by PostgreSQL's final unresolved-target rule. Contextual constraints must be
+// consolidated before these defaults when several occurrences represent one
+// numbered protocol parameter.
+func (s *Statement) ParameterTypeTargetDefault(index int) bool {
+	return s != nil && index >= 0 && index < s.params &&
+		index < len(s.paramTypeTargetDefaults) &&
+		s.paramTypeTargetDefaults[index]
+}
+
+func (s *Statement) seedParameterTypes(parameterTypes []ParameterType) error {
+	if s == nil || s.params == 0 || len(parameterTypes) == 0 {
+		return nil
+	}
+	end := min(s.paramBase+s.params, len(parameterTypes))
+	for absolute := s.paramBase; absolute < end; absolute++ {
+		parameterType := parameterTypes[absolute]
+		if parameterType == ParameterTypeUnspecified {
+			continue
+		}
+		if err := s.mergeParameterType(absolute, parameterType, -1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Statement) prepareParameterTypes() error {
+	if s == nil || s.params == 0 || s.nested == nil {
+		return nil
+	}
+	if err := s.mergeSetParameterTypes(s.nested.set); err != nil {
+		return err
+	}
+	if window := s.nested.window; window != nil {
+		if err := s.mergeChildParameterTypes(window.input); err != nil {
+			return err
+		}
+	}
+	for i := range s.nested.subqueries {
+		if err := s.mergeChildParameterTypes(s.nested.subqueries[i].stmt); err != nil {
+			return err
+		}
+	}
+	if derived := s.nested.derived; derived != nil {
+		if err := s.mergeChildParameterTypes(derived.stmt); err != nil {
+			return err
+		}
+	}
+	if join := s.nested.relationJoin; join != nil {
+		for i := range join.operands {
+			if err := s.mergeChildParameterTypes(join.operands[i].stmt); err != nil {
+				return err
+			}
+		}
+	}
+	// Only the statement that created a CTE catalog merges its definitions.
+	// Descendants borrow that catalog and already carry their own flattened
+	// vectors, so walking it from them would duplicate work and form cycles.
+	if s.nested.ownsCTEs && s.nested.ctes != nil {
+		for i := range s.nested.ctes.defs {
+			if err := s.mergeChildParameterTypes(s.nested.ctes.defs[i].stmt); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Statement) mergeChildParameterTypes(child *Statement) error {
+	if child == nil || len(child.paramTypes) == 0 {
+		return nil
+	}
+	for local, paramType := range child.paramTypes {
+		if paramType == ParameterTypeUnspecified {
+			continue
+		}
+		if err := s.mergeParameterType(
+			child.paramBase+local, paramType, child.ParameterTypePosition(local),
+		); err != nil {
+			return err
+		}
+		if child.ParameterTypeTargetDefault(local) {
+			s.markParameterTypeTargetDefault(child.paramBase + local)
+		}
+	}
+	return nil
+}
+
+func (s *Statement) mergeSetParameterTypes(r *statementSetSQL) error {
+	if r == nil {
+		return nil
+	}
+	base := r.rootArgBase + r.rangeBase
+	if base < r.rootArgBase {
+		return fmt.Errorf("query: set parameter metadata base overflows: %w", ErrParameterType)
+	}
+	for local, representation := range r.paramTypes {
+		paramType := parameterTypeForRepresentation(representation)
+		if paramType == ParameterTypeUnspecified {
+			continue
+		}
+		absolute := base + local
+		if err := s.mergeParameterType(
+			absolute, paramType, r.paramTypePosition(local),
+		); err != nil {
+			return err
+		}
+		// A declared string subtype is an input fact, but a set common-type
+		// selection is the expression domain. When a concrete TEXT candidate wins,
+		// retain that resolved target so bind-time bpchar/name/varchar coercion is
+		// applied before cells enter the set runner.
+		statementLocal := absolute - s.paramBase
+		if statementLocal >= 0 && statementLocal < len(s.paramTypes) &&
+			parameterTypesShareStringCategory(s.paramTypes[statementLocal], paramType) {
+			s.paramTypes[statementLocal] = paramType
+		}
+	}
+	for i := range r.leaves {
+		if err := s.mergeChildParameterTypes(r.leaves[i].stmt); err != nil {
+			return err
+		}
+	}
+	for i := range r.groups {
+		if err := s.mergeSetParameterTypes(r.groups[i].runner); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Statement) mergeParameterType(
+	absolute int,
+	paramType ParameterType,
+	position int,
+) error {
+	if absolute < s.paramBase || absolute-s.paramBase >= s.params {
+		return fmt.Errorf(
+			"query: inferred parameter at absolute ordinal %d is outside [%d,%d): %w",
+			absolute, s.paramBase, s.paramBase+s.params, ErrParameterType,
+		)
+	}
+	local := absolute - s.paramBase
+	if s.paramTypes == nil {
+		s.paramTypes = make([]ParameterType, s.params)
+	}
+	existing := s.paramTypes[local]
+	if existing != ParameterTypeUnspecified && existing != paramType &&
+		!parameterTypesShareStringCategory(existing, paramType) {
+		if position < 0 {
+			position = s.ParameterTypePosition(local)
+		}
+		return &ParameterTypeConflictError{
+			Pos: position, Parameter: local + 1,
+			Existing: existing, Inferred: paramType,
+		}
+	}
+	if existing == ParameterTypeUnspecified {
+		s.paramTypes[local] = paramType
+	}
+	if local < len(s.paramTypeTargetDefaults) {
+		// Every ordinary merge is a contextual constraint. Callers propagating
+		// a target-list default mark it explicitly after this merge succeeds.
+		s.paramTypeTargetDefaults[local] = false
+	}
+	if position >= 0 {
+		if s.paramTypePositions == nil {
+			s.paramTypePositions = make([]int, s.params)
+		}
+		encoded := position + 1
+		if s.paramTypePositions[local] == 0 || encoded < s.paramTypePositions[local] {
+			s.paramTypePositions[local] = encoded
+		}
+	}
+	return nil
+}
+
+func (s *Statement) markParameterTypeTargetDefault(absolute int) {
+	if s == nil || absolute < s.paramBase || absolute-s.paramBase >= s.params {
+		return
+	}
+	local := absolute - s.paramBase
+	if s.paramTypeTargetDefaults == nil {
+		s.paramTypeTargetDefaults = make([]bool, s.params)
+	}
+	s.paramTypeTargetDefaults[local] = true
+}
+
+func parameterTypesShareStringCategory(left, right ParameterType) bool {
+	return parameterTypeIsString(left) && parameterTypeIsString(right)
+}
+
+func parameterTypeIsString(paramType ParameterType) bool {
+	switch paramType {
+	case ParameterTypeText, ParameterTypeVarchar, ParameterTypeName, ParameterTypeBPChar:
+		return true
+	default:
+		return false
+	}
+}
+
+func parameterTypeForRepresentation(representation OutputRepresentation) ParameterType {
+	switch representation {
+	case OutputSQLBool:
+		return ParameterTypeBool
+	case OutputSQLText:
+		return ParameterTypeText
+	case OutputSQLVarchar:
+		return ParameterTypeVarchar
+	case OutputSQLName:
+		return ParameterTypeName
+	case OutputSQLBPChar:
+		return ParameterTypeBPChar
+	default:
+		return ParameterTypeUnspecified
+	}
+}
+
 // SQL returns the statement text as it was prepared.
 func (s *Statement) SQL() string { return s.text }
 
@@ -502,7 +898,10 @@ func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
 		return set.AppendSchema(dst)
 	}
 	if scalar := s.scalarStatement(); scalar != nil {
-		return scalar.appendSchema(dst, s.names)
+		start := len(dst)
+		dst = scalar.appendSchema(dst, s.names)
+		s.applyDirectRelationSchema(dst[start:])
+		return dst
 	}
 	start := len(dst)
 	dst = s.q.AppendSchema(dst)
@@ -513,9 +912,71 @@ func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
 		for i := range window.outputs {
 			dst[start+i].Reduction = window.outputs[i].reduction
 			dst[start+i].Type = window.outputs[i].valueType
+			dst[start+i].Representation = window.outputs[i].representation
 		}
 	}
+	s.applyDirectRelationSchema(dst[start:])
 	return dst
+}
+
+// applyDirectRelationSchema preserves a typed child's SQL boundary through a
+// derived-table or CTE identity projection. Execution already preserves the
+// native Cell kind in the ordinal relation spool; this cold metadata overlay
+// keeps RowDescription and transport encoding aligned with those cells. The
+// child schema lives on the existing relation-only sidecars, so ordinary
+// Statements gain neither storage nor hot-path branches.
+func (s *Statement) applyDirectRelationSchema(outputs []OutputColumn) {
+	if s == nil || len(outputs) == 0 || !s.hasRelationBinding() ||
+		s.tree == nil {
+		return
+	}
+	output := 0
+	for column := range s.tree.Columns {
+		if output >= len(outputs) {
+			return
+		}
+		projected := &s.tree.Columns[column]
+		if projected.Scalar != nil || projected.Window != nil ||
+			projected.Agg != sqlast.AggNone || projected.Path == nil {
+			output++
+			continue
+		}
+		binding := s.relationBindingForSource(projected.Path.Source)
+		if len(projected.Path.Segments) == 0 {
+			for ordinal := range binding.names {
+				if output >= len(outputs) {
+					return
+				}
+				applyDirectRelationColumnSchema(&outputs[output], binding.schema, ordinal)
+				output++
+			}
+			continue
+		}
+		if len(projected.Path.Segments) == 1 {
+			ordinal, err := s.resolveRelationColumnAt(
+				projected.Path.Source, projected.Path.Segments[0].Key,
+			)
+			if err == nil {
+				applyDirectRelationColumnSchema(
+					&outputs[output], binding.schema, ordinal-binding.offset,
+				)
+			}
+		}
+		output++
+	}
+}
+
+func applyDirectRelationColumnSchema(
+	output *OutputColumn,
+	schema []OutputColumn,
+	ordinal int,
+) {
+	if output == nil || ordinal < 0 || ordinal >= len(schema) ||
+		schema[ordinal].Representation == OutputJSON {
+		return
+	}
+	output.Type = schema[ordinal].Type
+	output.Representation = schema[ordinal].Representation
 }
 
 // Release drops every buffer s retains, invalidating its plan. A Statement is
@@ -942,6 +1403,7 @@ func (s *Statement) collectSubqueries(e *sqlast.Expr, argBase int) error {
 		}
 		stmt, err := prepareTreeInContext(
 			s.text, e.Subquery, limit, s.cteCatalog(), argBase+e.Subquery.ParamBase,
+			s.parameterTypeHints,
 		)
 		if err != nil {
 			return err

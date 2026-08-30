@@ -75,6 +75,10 @@ func TestStmtCloseReleasesParsedAndCompiledStorage(t *testing.T) {
 		serialPointSafe:    true,
 		serialMutationSafe: true,
 		params:             3,
+		paramKinds:         []ParamKind{ParamScalar, ParamScalar, ParamScalar},
+		paramTypes:         []ParamType{ParamTypeBool, ParamTypeText, ParamTypeBool},
+		paramTypePositions: []int{4, 5, 6},
+		paramPositions:     []int{1, 2, 3},
 	}
 	if err := statement.Close(); err != nil {
 		t.Fatal(err)
@@ -82,7 +86,9 @@ func TestStmtCloseReleasesParsedAndCompiledStorage(t *testing.T) {
 	if statement.tree != nil || statement.query != nil ||
 		statement.mutation != nil || statement.primaryPoint ||
 		statement.serialPointSafe || statement.serialMutationSafe ||
-		statement.conn != nil {
+		statement.paramKinds != nil || statement.paramTypes != nil ||
+		statement.paramTypePositions != nil ||
+		statement.paramPositions != nil || statement.conn != nil {
 		t.Fatal("closed statement retained parsed or compiled storage")
 	}
 	if got := statement.NumInput(); got != 3 {

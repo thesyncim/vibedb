@@ -157,8 +157,8 @@ const (
 	// maxMessageBody to each object independently would therefore let one
 	// connection retain gigabytes even though no individual message was large.
 	// Prepared input includes statement/query names, copied parameter OIDs,
-	// numbered-parameter metadata, and a conservative AST/lowered-plan shape
-	// charge; counting SQL text alone leaves both OID-vector and many-wide-plan
+	// numbered-parameter role/type metadata, and a conservative AST/lowered-plan
+	// shape charge; counting SQL text alone leaves both OID-vector and many-wide-plan
 	// aggregate retention holes.
 	//
 	// The portal charge includes one copy of every wire parameter plus a

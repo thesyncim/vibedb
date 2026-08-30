@@ -78,6 +78,7 @@ type statementCTE struct {
 
 	spool       relationSpool
 	names       []string
+	schema      []OutputColumn
 	ordinalSpec []string
 	specData    []byte
 	activeBytes int64
@@ -202,12 +203,15 @@ func (s *Statement) prepareCTEDefinitions(argBase int) error {
 		catalog.defs = append(catalog.defs, def)
 		child, err := prepareTreeInContext(
 			s.text, definition.Query, 0, catalog, def.argBase,
+			s.parameterTypeHints,
+			unknownOutputPrepareMode{preserveDocument: s.preserveDocumentUnknown},
 		)
 		if err != nil {
 			return err
 		}
 		def.stmt = child
 		def.names = append(def.names, child.Columns()...)
+		def.schema = child.AppendSchema(def.schema[:0])
 		if len(definition.Columns) > len(def.names) {
 			position := definition.Pos
 			if len(definition.ColumnPos) > len(def.names) {
@@ -691,7 +695,13 @@ func (c *statementCTEs) release() {
 // without installing an interface or relation branch in any row loop.
 type relationBinding struct {
 	names       []string
+	schema      []OutputColumn
 	ordinalSpec []string
+	// offset is the binding's first column in a generalized join spool. It is
+	// zero for standalone derived relations and CTEs. Name resolution against a
+	// join returns spool-global ordinals, while schema is source-local; carrying
+	// the immutable offset keeps that translation exact and off every row path.
+	offset int
 }
 
 func (s *Statement) relationBinding() relationBinding {
@@ -699,10 +709,16 @@ func (s *Statement) relationBinding() relationBinding {
 		return join.sourceBinding(0)
 	}
 	if ref := s.cteReference(); ref != nil && ref.def != nil {
-		return relationBinding{names: ref.def.names, ordinalSpec: ref.def.ordinalSpec}
+		return relationBinding{
+			names: ref.def.names, schema: ref.def.schema,
+			ordinalSpec: ref.def.ordinalSpec,
+		}
 	}
 	if derived := s.derived(); derived != nil {
-		return relationBinding{names: derived.names, ordinalSpec: derived.ordinalSpec}
+		return relationBinding{
+			names: derived.names, schema: derived.schema,
+			ordinalSpec: derived.ordinalSpec,
+		}
 	}
 	return relationBinding{}
 }

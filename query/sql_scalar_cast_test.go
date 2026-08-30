@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/pginput"
 )
 
 func TestSQLScalarCastExactValuesRepresentationsAndLazyOwnership(t *testing.T) {
@@ -164,9 +166,9 @@ func TestSQLScalarCastBooleanUniquePrefixGrammar(t *testing.T) {
 		{"", false, false}, {"o", false, false}, {"truth", false, false},
 		{"2", false, false}, {"yesplease", false, false},
 	} {
-		value, ok := parseSQLBoolean(test.text)
+		value, ok := pginput.Boolean(test.text)
 		if value != test.value || ok != test.ok {
-			t.Fatalf("parseSQLBoolean(%q) = %v/%v, want %v/%v",
+			t.Fatalf("pginput.Boolean(%q) = %v/%v, want %v/%v",
 				test.text, value, ok, test.value, test.ok)
 		}
 	}

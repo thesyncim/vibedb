@@ -355,7 +355,7 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 	reqFields := structFieldNames(reflect.TypeOf(ShardRequest{}))
 	assertFieldSet(t, "ShardRequest", reqFields, map[string]bool{
 		"Authority": true,
-		"SQL":       true, "Params": true, "Distribution": true, "Shard": true,
+		"SQL":       true, "Params": true, "ParamTypes": true, "Distribution": true, "Shard": true,
 		"AllocationGeneration": true, "RoutingVersion": true, "OwnershipEpoch": true,
 		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,

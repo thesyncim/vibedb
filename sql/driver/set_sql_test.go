@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
@@ -191,20 +192,15 @@ func TestSQLSetValuesAndTableRootsPreparedTransactionsAndAllModes(t *testing.T) 
 		t.Fatalf("TABLE rows = %v", tableRows)
 	}
 
-	prepared, err := db.Prepare(
-		`(VALUES (?) ORDER BY column1) UNION ALL ` +
-			`SELECT n FROM set_a ORDER BY column1`,
-	)
-	if err != nil {
-		t.Fatal(err)
+	extended := `(VALUES (?) ORDER BY column1) UNION ALL ` +
+		`SELECT n FROM set_a ORDER BY column1`
+	prepared, err := db.Prepare(extended)
+	if prepared != nil {
+		_ = prepared.Close()
 	}
-	defer prepared.Close()
-	rows, err = prepared.Query(int64(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := scanSQLSetStrings(t, rows), []string{"0", "1", "2", "4"}; !slices.Equal(got, want) {
-		t.Fatalf("prepared VALUES/SELECT rows = %v, want %v", got, want)
+	var mismatch *query.ScalarTypeError
+	if !errors.As(err, &mismatch) || mismatch.Pos != strings.Index(extended, "n FROM") {
+		t.Fatalf("prepared VALUES/SELECT mismatch = %T %+v", err, err)
 	}
 
 	transaction, err := db.Begin()

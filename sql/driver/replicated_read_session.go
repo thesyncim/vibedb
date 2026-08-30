@@ -78,21 +78,50 @@ func (a *ReplicatedApply) NewDataReadSession(
 }
 
 func (reader *ReplicatedReadSession) Prepare(ctx context.Context, text string) (*Prepared, error) {
-	return reader.prepare(ctx, text, false)
+	return reader.prepare(ctx, text, false, nil)
+}
+
+func (reader *ReplicatedReadSession) PrepareWithParameterTypes(
+	ctx context.Context,
+	text string,
+	parameterTypes []ParamType,
+) (*Prepared, error) {
+	return reader.prepare(ctx, text, false, parameterTypes)
 }
 
 func (reader *ReplicatedReadSession) PreparePartialAggregate(ctx context.Context, text string) (*Prepared, error) {
-	return reader.prepare(ctx, text, true)
+	return reader.prepare(ctx, text, true, nil)
 }
 
-func (reader *ReplicatedReadSession) prepare(ctx context.Context, text string, partial bool) (*Prepared, error) {
+func (reader *ReplicatedReadSession) PreparePartialAggregateWithParameterTypes(
+	ctx context.Context,
+	text string,
+	parameterTypes []ParamType,
+) (*Prepared, error) {
+	return reader.prepare(ctx, text, true, parameterTypes)
+}
+
+func (reader *ReplicatedReadSession) prepare(
+	ctx context.Context,
+	text string,
+	partial bool,
+	parameterTypes []ParamType,
+) (*Prepared, error) {
 	if reader == nil {
 		return nil, ErrSessionClosed
 	}
 	var prepared *Prepared
 	var err error
-	if partial {
+	if partial && len(parameterTypes) != 0 {
+		prepared, err = reader.session.PreparePartialAggregateWithParameterTypes(
+			ctx, text, parameterTypes,
+		)
+	} else if partial {
 		prepared, err = reader.session.PreparePartialAggregate(ctx, text)
+	} else if len(parameterTypes) != 0 {
+		prepared, err = reader.session.PrepareWithParameterTypes(
+			ctx, text, parameterTypes,
+		)
 	} else {
 		prepared, err = reader.session.Prepare(ctx, text)
 	}

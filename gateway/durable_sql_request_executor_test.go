@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 func TestDurableSQLRequestExecutorFusesLoweringCreateAndTypedExecution(t *testing.T) {
@@ -225,6 +226,147 @@ func TestDurableSQLRequestExecutorRejectsTenantMismatchBeforeAdmission(t *testin
 	}
 	if _, err := executor.Execute(t.Context(), requestKey, tenant, queries); !errors.Is(err, ErrDurableSQLRequest) {
 		t.Fatalf("tenant mismatch error=%v", err)
+	}
+}
+
+func TestDurableSQLReplayRejectsUnboundedParameterTypesBeforeDigest(t *testing.T) {
+	planner := NewExecutor(nil, nil, Options{})
+	executor := &DurableSQLRequestExecutor{planner: planner}
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{1},
+		Request: requestledger.RequestID{2}, TenantDigest: requestledger.Digest{3},
+		IssuerEpoch: 1, IssuerLane: requestledger.IssuerLane{4}, IssuerSequence: 1,
+	}
+	query := Query{
+		SQL:        "DELETE FROM messages WHERE id = ?",
+		Class:      ClassInteractive,
+		Params:     make([]shardservice.Param, maxGatewaySQLParameters+1),
+		ParamTypes: make([]sqldriver.ParamType, maxGatewaySQLParameters+1),
+	}
+	if _, _, err := executor.ReplayRequest(t.Context(), key, []Query{query}); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("ReplayRequest error = %v, want bounded admission refusal", err)
+	}
+}
+
+func TestDurableSQLExecuteAdmitsEveryItemBeforeSemanticPreparation(t *testing.T) {
+	tenant := []byte("durable-batch-admission")
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{1},
+		Request: requestledger.RequestID{2}, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		IssuerEpoch: 1, IssuerLane: requestledger.IssuerLane{3}, IssuerSequence: 1,
+	}
+	executor := &DurableSQLRequestExecutor{
+		planner:  NewExecutor(nil, nil, Options{}),
+		data:     new(ReplicatedExecutor),
+		requests: new(DurableRequestService),
+	}
+	queries := []Query{
+		{
+			SQL: "DELETE FROM messages WHERE id IN (SELECT BOOL 't' UNION ALL SELECT ?)",
+			Params: []shardservice.Param{
+				shardservice.NullParam(),
+			},
+			ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeText},
+			Class:      ClassInteractive,
+		},
+		{
+			SQL:    "DELETE FROM messages WHERE id = ?",
+			Params: []shardservice.Param{shardservice.NullParam()},
+			ParamTypes: []sqldriver.ParamType{
+				sqldriver.ParamTypeInvalid,
+			},
+			Class: ClassInteractive,
+		},
+	}
+	if _, err := executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("Execute error = %v, want later metadata refusal before parse/pin", err)
+	}
+}
+
+func TestDurableSQLReplayUsesRetainedBytesWithoutCurrentPlannerSemantics(t *testing.T) {
+	participants := durableFaultParticipants(t)
+	base := durableFaultRequest(t, participants)
+	queries := []Query{{
+		SQL: "DELETE FROM messages WHERE id IN (SELECT BOOL 't' UNION ALL SELECT ?)",
+		Params: []shardservice.Param{
+			shardservice.NullParam(),
+		},
+		ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeText},
+		Class:      ClassAdmin,
+	}}
+	if err := validateTypedQueries(t.Context(), queries); err == nil {
+		t.Fatal("test query unexpectedly passes current semantic analysis")
+	}
+	key, err := NewDurableRequestLedgerKey(
+		base.Key.RequestKey, replicatedSQLTransactionRequestDigest(queries),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultRaw, err := AppendDurableRequestResult(nil, DurableRequestResult{
+		Committed: true, AffectedRows: 2, Transaction: base.Program.Identity.ID,
+		CatalogGeneration:       base.Program.Identity.CatalogGeneration,
+		ShardsFanned:            uint64(len(base.Program.Participants)),
+		TransitionTag:           base.Program.Contract.CommitTransitionTag,
+		TerminalStateDigest:     base.Program.Contract.CommitTerminalStateDigest,
+		TerminalContractDigest:  base.Program.Contract.TerminalContractDigest,
+		RetirementWitnessDigest: base.Program.Contract.RetirementWitnessDigest,
+		Payload:                 []byte("retained-result"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &typedServiceLedger{
+		head: requestledger.HeadRecord{
+			Key: base.Key.RequestKey, RequestDigest: requestledger.Digest(key.Digest),
+			PlanRoot: requestledger.Digest{2}, Revision: 9, Phase: requestledger.PhaseTerminal,
+		},
+		terminal: requestledger.TerminalRecord{
+			Revision: 9, Result: resultRaw, ResultDigest: requestledger.ResultDigest(resultRaw),
+			RequestDigest:          requestledger.Digest(key.Digest),
+			PlanRoot:               requestledger.Digest{2},
+			CatalogGeneration:      base.Program.Identity.CatalogGeneration,
+			TerminalContractDigest: requestledger.Digest(base.Program.Contract.TerminalContractDigest),
+			AckToken:               requestledger.AckToken{1},
+		},
+	}
+	ledger.terminal.KeyDigest, err = requestledger.KeyDigest(base.Key.RequestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := newDurableRequestService(
+		durableFaultTopology(t, participants), ledger,
+		typedServiceRunnerStop{}, new(typedServicePinStop),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reducedPlanner := NewExecutor(nil, nil, Options{Profiles: map[OperationClass]Profile{
+		ClassAdmin: {MaxTransactionMutations: 1, MaxTransactionBytes: 1},
+	}})
+	if admissionErr := validateQueryBatchAdmission(
+		queries, reducedPlanner.profileFor(ClassAdmin),
+	); !errors.Is(admissionErr, ErrTransactionByteLimit) {
+		t.Fatalf("test profile unexpectedly admits retained bytes: %v", admissionErr)
+	}
+	tests := []struct {
+		name    string
+		planner *Executor
+	}{
+		{name: "planner unavailable"},
+		{name: "profile reduced", planner: reducedPlanner},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &DurableSQLRequestExecutor{planner: test.planner, requests: service}
+			result, found, replayErr := executor.ReplayRequest(
+				t.Context(), base.Key.RequestKey, queries,
+			)
+			if replayErr != nil || !found || result.Key != key || result.Result == nil ||
+				result.Result.RowsAffected != 2 {
+				t.Fatalf("result=%+v found=%v error=%v", result, found, replayErr)
+			}
+		})
 	}
 }
 

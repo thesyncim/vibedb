@@ -157,7 +157,10 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 		case schema[index].Reduction == query.ReductionCount ||
 			schema[index].Reduction == query.ReductionWindowInteger:
 			return reflect.TypeFor[int64]()
-		case schema[index].Representation == query.OutputSQLText:
+		case schema[index].Representation == query.OutputSQLText ||
+			schema[index].Representation == query.OutputSQLVarchar ||
+			schema[index].Representation == query.OutputSQLName ||
+			schema[index].Representation == query.OutputSQLBPChar:
 			return reflect.TypeFor[[]byte]()
 		case schema[index].Representation == query.OutputSQLBool:
 			return reflect.TypeFor[bool]()
@@ -184,6 +187,12 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 	switch schema[index].Representation {
 	case query.OutputSQLText:
 		return "TEXT"
+	case query.OutputSQLVarchar:
+		return "VARCHAR"
+	case query.OutputSQLName:
+		return "NAME"
+	case query.OutputSQLBPChar:
+		return "BPCHAR"
 	case query.OutputSQLNumber:
 		return "NUMERIC"
 	case query.OutputSQLBool:

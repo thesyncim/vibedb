@@ -140,16 +140,16 @@ func TestPGWireInsertSelectValuesDocumentParameterTyping(t *testing.T) {
 		t.Fatalf("compound VALUES rows = %q", got)
 	}
 
-	// The same wire spelling remains an unspecified scalar for standalone
-	// VALUES; only an INSERT source's document output owns JSON typing.
+	// The same wire spelling resolves to PostgreSQL text for standalone VALUES;
+	// only an INSERT source's document output owns JSON typing.
 	messages = extendedSQL(c, `VALUES ($1)`, [][]byte{[]byte(`{"id":"scalar"}`)})
 	if got := decodeParameterDescription(
 		t, find(t, messages, msgParameterDesc).body,
-	); !slices.Equal(got, []int32{0}) {
-		t.Fatalf("standalone VALUES parameter OIDs = %v, want unspecified", got)
+	); !slices.Equal(got, []int32{oidText}) {
+		t.Fatalf("standalone VALUES parameter OIDs = %v, want text", got)
 	}
 	if got := rowsOf(t, messages); len(got) != 1 ||
-		string(got[0][0]) != `"{\"id\":\"scalar\"}"` {
+		string(got[0][0]) != `{"id":"scalar"}` {
 		t.Fatalf("standalone VALUES scalar row = %q", got)
 	}
 

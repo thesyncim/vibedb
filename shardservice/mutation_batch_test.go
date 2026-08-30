@@ -3,10 +3,12 @@ package shardservice
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 func TestMutationBatchRoundTripAndBorrowing(t *testing.T) {
@@ -16,6 +18,11 @@ func TestMutationBatchRoundTripAndBorrowing(t *testing.T) {
 		}},
 		{SQL: "UPDATE docs SET doc = ? WHERE id = ?", Params: []Param{
 			DocumentBytesParam([]byte(`{"id":"first","n":8}`)), StringBytesParam([]byte("first")),
+		}},
+		{SQL: "DELETE FROM docs WHERE active = ? AND label = ?", Params: []Param{
+			NullParam(), NullParam(),
+		}, ParamTypes: []sqldriver.ParamType{
+			sqldriver.ParamTypeBool, sqldriver.ParamTypeText,
 		}},
 		{
 			Kind: MutationGlobalIndexPut, Relation: "docs_by_email",
@@ -46,15 +53,21 @@ func TestMutationBatchRoundTripAndBorrowing(t *testing.T) {
 	if err != nil || !ok || second.SQL != statements[1].SQL || len(second.Params) != 2 {
 		t.Fatalf("second = %+v,%v,%v", second, ok, err)
 	}
+	typed, ok, err := batch.Next()
+	if err != nil || !ok || len(typed.Params) != 2 ||
+		!bytes.Equal([]byte{byte(typed.ParamTypes[0]), byte(typed.ParamTypes[1])},
+			[]byte{byte(sqldriver.ParamTypeBool), byte(sqldriver.ParamTypeText)}) {
+		t.Fatalf("typed = %+v,%v,%v", typed, ok, err)
+	}
 	third, ok, err := batch.Next()
 	if err != nil || !ok || third.Kind != MutationGlobalIndexPut ||
 		third.Relation != "docs_by_email" || third.IndexID != 17 ||
 		third.Incarnation != 3 || third.LocatorCount != 2 || !third.Unique ||
-		!bytes.Equal(third.EntryKey, statements[2].EntryKey) ||
-		!bytes.Equal(third.Value, statements[2].Value) {
+		!bytes.Equal(third.EntryKey, statements[3].EntryKey) ||
+		!bytes.Equal(third.Value, statements[3].Value) {
 		t.Fatalf("third = %+v,%v,%v", third, ok, err)
 	}
-	entryOffset := bytes.Index(raw, statements[2].EntryKey)
+	entryOffset := bytes.Index(raw, statements[3].EntryKey)
 	if entryOffset < 0 || &third.EntryKey[0] != &raw[entryOffset] {
 		t.Fatal("global index key did not borrow the durable batch")
 	}
@@ -81,9 +94,59 @@ func TestMutationBatchRejectsCorruptionAndOversize(t *testing.T) {
 		{Kind: MutationGlobalIndexPut, Relation: "idx", IndexID: 1, Incarnation: 1, EntryKey: []byte{0}, Value: []byte(`[]`), LocatorCount: 1},
 		{Kind: MutationGlobalIndexPut, Relation: "idx", IndexID: 1, Incarnation: 1, EntryKey: []byte{1}, Value: []byte(`{}`), LocatorCount: 1},
 		{Kind: MutationGlobalIndexDelete, Relation: "idx", IndexID: 1, Incarnation: 1, EntryKey: []byte{1}, Value: []byte(`["x"]`), LocatorCount: 1, Unique: true},
+		{SQL: "SELECT ?", Params: []Param{NullParam()}, ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeUnspecified}},
+		{SQL: "SELECT ?", Params: []Param{NullParam()}, ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeInvalid}},
+		{SQL: "SELECT ?", Params: []Param{DocumentParam(`{"id":"a"}`)}, ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeOther}},
 	} {
 		if _, err := AppendMutationBatch(nil, []MutationStatement{invalid}); !errors.Is(err, ErrMutationBatch) {
 			t.Fatalf("invalid typed mutation %+v err = %v", invalid, err)
+		}
+	}
+}
+
+func TestMutationBatchAbsentParameterTypesPreserveLegacyBytes(t *testing.T) {
+	base := MutationStatement{
+		SQL: "DELETE FROM docs WHERE id = ?", Params: []Param{StringParam("x")},
+	}
+	legacy, err := AppendMutationBatch(nil, []MutationStatement{base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.ParamTypes = []sqldriver.ParamType{}
+	empty, err := AppendMutationBatch(nil, []MutationStatement{base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(legacy, empty) {
+		t.Fatalf("empty parameter metadata changed legacy bytes:\nlegacy %x\n empty %x", legacy, empty)
+	}
+	const wantLegacy = "564d4231010000001d00000044454c4554452046524f4d20646f6373205748455245206964203d203f01000000040100000078"
+	if got := hex.EncodeToString(legacy); got != wantLegacy {
+		t.Fatalf("legacy mutation golden = %s, want %s", got, wantLegacy)
+	}
+}
+
+func TestMutationBatchRejectsCorruptParameterTypes(t *testing.T) {
+	statement := MutationStatement{
+		SQL: "DELETE FROM docs WHERE active = ?", Params: []Param{NullParam()},
+		ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeBool},
+	}
+	raw, err := AppendMutationBatch(nil, []MutationStatement{statement})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantTyped = "564d4231010000002100000044454c4554452046524f4d20646f637320574845524520616374697665203d203f010000800101"
+	if got := hex.EncodeToString(raw); got != wantTyped {
+		t.Fatalf("typed mutation golden = %s, want %s", got, wantTyped)
+	}
+	typeOffset := mutationBatchHeader + 4 + len(statement.SQL) + 4
+	for _, encoded := range []byte{
+		byte(sqldriver.ParamTypeUnspecified), byte(sqldriver.ParamTypeInvalid),
+	} {
+		corrupt := append([]byte(nil), raw...)
+		corrupt[typeOffset] = encoded
+		if _, err := OpenMutationBatch(corrupt); !errors.Is(err, ErrMutationBatch) {
+			t.Fatalf("type %d: OpenMutationBatch = %v", encoded, err)
 		}
 	}
 }

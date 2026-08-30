@@ -90,6 +90,17 @@ type transactionParticipant struct {
 // lane; a one-statement batch delegates to it.
 func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, error) {
 	if len(queries) == 1 {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := validateQueryBatchAdmission(
+			queries, e.profileFor(queries[0].Class),
+		); err != nil {
+			return nil, err
+		}
 		return e.Exec(ctx, queries[0])
 	}
 	return e.execBatch(ctx, queries)
@@ -115,8 +126,11 @@ func (e *Executor) execBatch(
 		}
 	}
 	profile := e.profileFor(class)
-	if uint64(len(queries)) > profile.MaxTransactionMutations {
-		return nil, ErrTransactionMutationLimit
+	if err := validateQueryBatchAdmission(queries, profile); err != nil {
+		return nil, err
+	}
+	if err := validateTypedQueries(ctx, queries); err != nil {
+		return nil, err
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
@@ -284,6 +298,9 @@ func transactionStatementBytes(statement *shardservice.MutationStatement) (uint6
 		if !add(&total, 8+len(statement.SQL)) {
 			return 0, false
 		}
+		if !add(&total, len(statement.ParamTypes)) {
+			return 0, false
+		}
 		for i := range statement.Params {
 			param := &statement.Params[i]
 			if !add(&total, 1) {
@@ -383,7 +400,9 @@ func appendBoundWriteParticipantsBudgeted(
 	}
 	participants, err = appendTransactionStatementBudgeted(
 		participants, participantIndex, baseCall,
-		shardservice.MutationStatement{SQL: query.SQL, Params: query.Params}, budget,
+		shardservice.MutationStatement{
+			SQL: query.SQL, Params: query.Params, ParamTypes: query.ParamTypes,
+		}, budget,
 	)
 	if err != nil {
 		return nil, err

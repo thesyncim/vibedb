@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // The shard-service codec: a big-endian length-prefixed framing mirroring
@@ -48,6 +49,7 @@ const (
 	exchangeMarker          = 0xe0
 	repartitionMarker       = 0xe1
 	authorityMarker         = 0xe2
+	parameterTypesMarker    = 0xe3
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -108,6 +110,8 @@ var errBadEnum = errors.New("shardservice: frame carries an out-of-range enumera
 // errBadParam reports a typed parameter whose byte payload does not match its
 // discriminator (for example malformed JSON or an invalid exact number).
 var errBadParam = errors.New("shardservice: frame carries an invalid parameter payload")
+
+var errBadParameterTypes = errors.New("shardservice: frame carries invalid SQL parameter type metadata")
 
 // errBadTransaction reports a non-canonical command, a corrupt durable stage
 // record, or a reply whose role and typed state disagree.
@@ -777,7 +781,7 @@ func validateExchangeRequest(req *ShardRequest) error {
 	if !req.Exchange.present() {
 		return nil
 	}
-	if req.SQL != "" || len(req.Params) != 0 || req.PartialAggregate ||
+	if req.SQL != "" || len(req.Params) != 0 || len(req.ParamTypes) != 0 || req.PartialAggregate ||
 		req.RowBatch.present() || req.HasMinPosition || req.MinPosition != (Position{}) ||
 		req.MaxResultBytes != 0 || req.MaxRows != 0 || req.BucketBits != 0 ||
 		len(req.AccessScopes) != 0 || !req.ReadFenceID.IsZero() ||
@@ -1207,6 +1211,10 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if len(req.Params) > maxParams {
 		return errFieldTooLarge
 	}
+	if len(req.ParamTypes) != 0 &&
+		(req.SQL == "" || !validSQLParameterTypes(req.Params, req.ParamTypes)) {
+		return errBadParameterTypes
+	}
 	if err := validateTransactionRequest(&req.Transaction, false); err != nil {
 		return err
 	}
@@ -1246,7 +1254,7 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		return errBadTransaction
 	}
 	if req.Transaction.Operation != TransactionNone &&
-		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present()) {
+		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present()) {
 		if req.GlobalIndexLookup.present() {
 			return errBadGlobalIndexLookup
 		}
@@ -1390,6 +1398,13 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		e.u8(authorityMarker)
 		e.fixed16(req.Authority.Node)
 		e.u64(req.Authority.Generation)
+	}
+	if len(req.ParamTypes) != 0 {
+		e.u8(parameterTypesMarker)
+		e.u32(uint32(len(req.ParamTypes)))
+		for _, parameterType := range req.ParamTypes {
+			e.u8(uint8(parameterType))
+		}
 	}
 	if e.err != nil {
 		return e.err
@@ -1575,8 +1590,23 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadPresence
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == parameterTypesMarker {
+		d.u8()
+		count := d.count(1, maxParams)
+		if count == 0 || count != len(req.Params) {
+			return nil, errBadParameterTypes
+		}
+		req.ParamTypes = make([]sqldriver.ParamType, count)
+		for index := range req.ParamTypes {
+			req.ParamTypes[index] = sqldriver.ParamType(d.u8())
+		}
+		if d.bad() || req.SQL == "" ||
+			!validSQLParameterTypes(req.Params, req.ParamTypes) {
+			return nil, errBadParameterTypes
+		}
+	}
 	if req.Transaction.Operation != TransactionNone &&
-		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present()) {
+		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present()) {
 		if req.GlobalIndexLookup.present() {
 			return nil, errBadGlobalIndexLookup
 		}

@@ -144,6 +144,11 @@ func checkSetExprInvariants(
 			}
 			for column := range expr.Values.Rows[row].Values {
 				value := expr.Values.Rows[row].Values[column]
+				if value.TypedConstant && (value.Null ||
+					(value.Cast != ScalarCastText && value.Cast != ScalarCastBoolean) ||
+					(value.Operand.Kind != OperandString && value.Operand.Kind != OperandBool)) {
+					t.Fatalf("VALUES typed constant is malformed: %+v", value)
+				}
 				if !value.Null && value.Operand.Kind == OperandParam {
 					if value.Operand.Ordinal != wantBase+params {
 						t.Fatalf("VALUES parameter ordinal = %d, want %d",

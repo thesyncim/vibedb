@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 type sqlRF3TestTransport struct {
@@ -23,6 +24,8 @@ type sqlRF3TestTransport struct {
 	sqlError   bool
 	nullResult bool
 	started    chan struct{}
+	lastParams []shardservice.Param
+	lastTypes  []sqldriver.ParamType
 }
 
 func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, req *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
@@ -46,6 +49,8 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 	if inner.Transaction.Operation != 0 || !inner.ReadFenceID.IsZero() {
 		return nil, errors.New("RF3 must not use legacy read fences")
 	}
+	c.lastParams = append(c.lastParams[:0], inner.Params...)
+	c.lastTypes = append(c.lastTypes[:0], inner.ParamTypes...)
 	c.queries++
 	if c.started != nil {
 		select {

@@ -94,11 +94,17 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		requestledger.Digest(sha256.Sum256(tenant)) != requestKey.TenantDigest {
 		return DurableSQLRequestResult{}, ErrDurableSQLRequest
 	}
-	key, err := NewDurableRequestLedgerKey(requestKey, replicatedSQLTransactionRequestDigest(queries))
+	profile, err := executor.profile(queries)
 	if err != nil {
 		return DurableSQLRequestResult{}, err
 	}
-	profile, err := executor.profile(queries)
+	if err := validateQueryBatchAdmission(queries, profile); err != nil {
+		return DurableSQLRequestResult{}, err
+	}
+	if err := validateTypedQueries(ctx, queries); err != nil {
+		return DurableSQLRequestResult{}, err
+	}
+	key, err := NewDurableRequestLedgerKey(requestKey, replicatedSQLTransactionRequestDigest(queries))
 	if err != nil {
 		return DurableSQLRequestResult{}, err
 	}
@@ -178,6 +184,12 @@ func (executor *DurableSQLRequestExecutor) Execute(
 // ReplayRequest resolves retained caller bytes before any new planning. A
 // committed INSERT may now conflict with its own row; replay must not replan it.
 func (executor *DurableSQLRequestExecutor) ReplayRequest(ctx context.Context, requestKey requestledger.RequestKey, queries []Query) (DurableSQLRequestResult, bool, error) {
+	if executor == nil || ctx == nil || !requestKey.Valid() {
+		return DurableSQLRequestResult{}, false, ErrDurableSQLRequest
+	}
+	if err := validateDurableSQLReplayAdmission(queries); err != nil {
+		return DurableSQLRequestResult{}, false, err
+	}
 	key, err := NewDurableRequestLedgerKey(requestKey, replicatedSQLTransactionRequestDigest(queries))
 	if err != nil {
 		return DurableSQLRequestResult{}, false, err
@@ -243,17 +255,20 @@ func (executor *DurableSQLRequestExecutor) profile(queries []Query) (Profile, er
 		return Profile{}, ErrDurableSQLRequest
 	}
 	class := queries[0].Class
-	for index := 1; index < len(queries); index++ {
-		if queries[index].Class != class {
-			return Profile{}, ErrBatchClassMismatch
-		}
-	}
 	profile, ok := executor.planner.profiles[class]
 	if !ok {
 		return Profile{}, ErrDurableSQLRequest
 	}
 	if profile.MaxTransactionMutations == 0 || profile.MaxTransactionBytes == 0 {
 		return Profile{}, ErrDurableSQLRequest
+	}
+	if uint64(len(queries)) > profile.MaxTransactionMutations {
+		return Profile{}, ErrTransactionMutationLimit
+	}
+	for index := 1; index < len(queries); index++ {
+		if queries[index].Class != class {
+			return Profile{}, ErrBatchClassMismatch
+		}
 	}
 	return profile, nil
 }
@@ -267,7 +282,9 @@ func (executor *DurableSQLRequestExecutor) result(
 		outcome.ResultDigest == (replication.Digest{}) || outcome.AckToken == (DurableRequestAckToken{}) {
 		return DurableSQLRequestResult{}, ErrDurableSQLRequest
 	}
-	executor.planner.metrics.observeRoute(distribution.RouteTargeted, outcome.ShardsFanned, ScatterNone)
+	if executor.planner != nil {
+		executor.planner.metrics.observeRoute(distribution.RouteTargeted, outcome.ShardsFanned, ScatterNone)
+	}
 	result := DurableSQLRequestResult{
 		Key: key,
 		Result: &Result{

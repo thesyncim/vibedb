@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -82,5 +83,129 @@ func TestScalarCastSQLStatesMetadataFormatsAndRecovery(t *testing.T) {
 
 	if pg := asPGErrorIn(&query.ScalarInvalidTextError{Pos: 3, Target: "NUMERIC"}, "ééCAST"); pg.code != sqlstateInvalidTextRepresentation || pg.position != 3 {
 		t.Fatalf("invalid-text mapping = %s/%d", pg.code, pg.position)
+	}
+}
+
+func TestPostgreSQLTypedStringConstantsWireMetadataValuesAndErrors(t *testing.T) {
+	c := connect(t)
+	messages := c.query(`SELECT BOOL 'tr', BOOLEAN 'off', TEXT 'x',
+		TEXT 't'::BOOL::TEXT FROM users WHERE id = 1`)
+	description := decodeRowDescription(t, find(t, messages, msgRowDescription).body)
+	wantNames := []string{"bool", "bool", "text", "text"}
+	wantOIDs := []int32{oidBool, oidBool, oidText, oidText}
+	if len(description) != len(wantNames) {
+		t.Fatalf("typed-constant RowDescription = %+v", description)
+	}
+	for i := range description {
+		if description[i].name != wantNames[i] || description[i].oid != wantOIDs[i] {
+			t.Fatalf("typed-constant column[%d] = %+v, want %q/OID %d",
+				i, description[i], wantNames[i], wantOIDs[i])
+		}
+	}
+	rows := rowsOf(t, messages)
+	if len(rows) != 1 || len(rows[0]) != 4 ||
+		string(rows[0][0]) != "t" || string(rows[0][1]) != "f" ||
+		string(rows[0][2]) != "x" || string(rows[0][3]) != "true" {
+		t.Fatalf("typed-constant rows = %q", rows)
+	}
+
+	ordered := c.query(`SELECT BOOL 't' FROM users WHERE id = 1 ORDER BY bool`)
+	if has(ordered, msgErrorResponse) || len(rowsOf(t, ordered)) != 1 {
+		t.Fatalf("generated BOOL label did not resolve in ORDER BY: %s", tags(ordered))
+	}
+
+	valuesMessages := c.query(`VALUES (BOOL 't', TEXT 'x')`)
+	valuesDescription := decodeRowDescription(t, find(t, valuesMessages, msgRowDescription).body)
+	if len(valuesDescription) != 2 || valuesDescription[0].name != "column1" ||
+		valuesDescription[0].oid != oidBool || valuesDescription[1].name != "column2" ||
+		valuesDescription[1].oid != oidText {
+		t.Fatalf("typed VALUES RowDescription = %+v", valuesDescription)
+	}
+	valuesRows := rowsOf(t, valuesMessages)
+	if len(valuesRows) != 1 || string(valuesRows[0][0]) != "t" || string(valuesRows[0][1]) != "x" {
+		t.Fatalf("typed VALUES rows = %q", valuesRows)
+	}
+
+	boundValues := extendedSQL(c,
+		`VALUES (BOOL 't', TEXT 'x'), ($1, $2)`,
+		[][]byte{[]byte("off"), []byte("bound")},
+	)
+	boundDescription := decodeRowDescription(t, find(t, boundValues, msgRowDescription).body)
+	if len(boundDescription) != 2 || boundDescription[0].oid != oidBool ||
+		boundDescription[1].oid != oidText {
+		t.Fatalf("bound typed VALUES RowDescription = %+v", boundDescription)
+	}
+	boundRows := rowsOf(t, boundValues)
+	if len(boundRows) != 2 || string(boundRows[0][0]) != "t" ||
+		string(boundRows[0][1]) != "x" || string(boundRows[1][0]) != "f" ||
+		string(boundRows[1][1]) != "bound" {
+		t.Fatalf("bound typed VALUES rows = %q", boundRows)
+	}
+	expectError(t, extendedSQL(c,
+		`VALUES (BOOL 't'), ($1)`, [][]byte{[]byte("o")},
+	), sqlstateInvalidTextRepresentation)
+
+	for _, source := range []string{
+		`SELECT BOOL 'o' FROM users WHERE 1 = 0`,
+		`SELECT BOOLEAN 'not-bool' FROM users OFFSET 999`,
+	} {
+		fields := expectError(t, c.query(source), sqlstateInvalidTextRepresentation)
+		if fields['P'] == "" {
+			t.Fatalf("%q omitted typed-input position", source)
+		}
+		if strings.Contains(fields['M'], "not-bool") || strings.Contains(fields['M'], "'o'") {
+			t.Fatalf("%q leaked typed input in %q", source, fields['M'])
+		}
+	}
+
+	for _, source := range []string{
+		`SELECT BOOL 't'::NUMERIC`,
+		`SELECT BOOL 't'::JSON`,
+		`SELECT CASE WHEN false THEN BOOL 't'::NUMERIC ELSE 1 END`,
+	} {
+		fields := expectError(t, c.query(source), sqlstateCannotCoerce)
+		if fields['P'] == "" {
+			t.Fatalf("%q omitted cannot-coerce position", source)
+		}
+	}
+
+	for _, source := range []string{
+		`SELECT pg_catalog.bool 't'`,
+		`SELECT bool(1) 't'`,
+		`SELECT bool[] 't'`,
+		`SELECT BOOL E't'`,
+		`SELECT BOOL U&'t'`,
+		`SELECT VARCHAR 'x'`,
+		`SELECT CHAR 'x'`,
+		`SELECT CHARACTER 'x'`,
+	} {
+		fields := expectError(t, c.query(source), sqlstateFeatureNotSupported)
+		if fields['P'] == "" {
+			t.Fatalf("%q omitted unsupported typed-constant position", source)
+		}
+	}
+
+	for _, test := range []struct {
+		source string
+		code   string
+		at     string
+	}{
+		{
+			source: `SELECT id FROM users WHERE EXISTS (SELECT BOOL 'o')`,
+			code:   sqlstateInvalidTextRepresentation,
+			at:     "'o'",
+		},
+		{
+			source: `SELECT id FROM users WHERE id = (SELECT BOOL 't'::NUMERIC)`,
+			code:   sqlstateCannotCoerce,
+			at:     "NUMERIC",
+		},
+	} {
+		fields := expectError(t, c.query(test.source), test.code)
+		wantPosition := strconv.Itoa(strings.LastIndex(test.source, test.at) + 1)
+		if fields['P'] != wantPosition {
+			t.Fatalf("nested typed error %q position = %q, want %s",
+				test.source, fields['P'], wantPosition)
+		}
 	}
 }

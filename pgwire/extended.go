@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/pginput"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -38,17 +39,16 @@ import (
 // # Parameter types
 //
 // A statement's placeholders are schemaless by default: ParameterDescription
-// reports type 0, "unspecified", for each parameter whose Parse message did not
-// declare a type. When a client did declare a type, the same OID is reported
-// back in wire-parameter order. That round trip matters to drivers which cache
-// statement metadata and choose a binary encoder from ParameterDescription.
+// reports type 0, "unspecified", unless Parse declared a type or SQL analysis
+// selected one. Typed VALUES and set-operation contexts infer bool/text exactly
+// and therefore advertise those OIDs even when Parse omitted them. A compatible
+// client-declared OID is preserved; an incompatible declaration is rejected at
+// Parse, before a portal can bind bytes under the wrong domain.
 //
-// That pushes the question onto Bind, and the rule is stated on [bindValue]. It
-// is the one place in this package where a value's meaning is inferred rather
-// than carried, and the inference is the same one the dialect's own literal
-// grammar makes: a parameter that spells a JSON scalar is that scalar, and
-// anything else is a string. A client that needs the distinction removed can
-// declare the parameter's OID in Parse, which this server honours.
+// Only a still-unspecified scalar pushes the question onto Bind; its rule is
+// stated on [bindValue]. A parameter that spells a JSON scalar is that scalar,
+// and anything else is a string. Inferred and declared types bypass that
+// compatibility inference and use their exact textual/binary input grammar.
 
 // extended handles one extended-protocol message.
 func (s *session) extended(tag byte) error {
@@ -196,7 +196,7 @@ func (s *session) handleParse() error {
 	if err != nil {
 		return asPGErrorIn(err, m.query)
 	}
-	stmt, err := s.prepare(ownedName, ownedQuery)
+	stmt, err := s.prepare(ownedName, ownedQuery, m.paramOIDs)
 	if err != nil {
 		return err
 	}
@@ -212,7 +212,7 @@ func (s *session) handleParse() error {
 		stmt.release()
 		return newError(sqlstateProgramLimitExceeded, fmt.Sprintf(
 			"prepared statements on one connection may retain at most %d bytes of "+
-				"input, numbered-parameter mappings, and wire-parameter role metadata",
+				"input, numbered-parameter mappings, and wire-parameter metadata",
 			maxPreparedInputBytes))
 	}
 	charge += derivedCharge
@@ -223,6 +223,10 @@ func (s *session) handleParse() error {
 		// on append's implementation-selected spare capacity.
 		stmt.paramOIDs = make([]int32, len(m.paramOIDs))
 		copy(stmt.paramOIDs, m.paramOIDs)
+	}
+	if err := validateDeclaredParamOIDs(stmt); err != nil {
+		stmt.release()
+		return err
 	}
 	if old != nil {
 		// Replacing the unnamed statement. Every portal built from it is
@@ -265,6 +269,8 @@ func preparedDerivedCharge(stmt *prepared) int {
 	charge := preparedPlanFixedBytes
 	charge = preparedChargeMul(charge, len(stmt.sql), preparedPlanByteMultiplier)
 	charge = preparedChargeMul(charge, cap(stmt.paramKinds), 8)
+	charge = preparedChargeMul(charge, cap(stmt.paramTypes), 8)
+	charge = preparedChargeMul(charge, cap(stmt.paramTypePositions), 8)
 	charge = preparedChargeMul(charge, cap(stmt.paramPositions), 8)
 	charge = preparedChargeMul(charge, cap(stmt.paramOrder), 8)
 	if stmt.paramOrder != nil {
@@ -871,7 +877,8 @@ func bindArgs(
 		}
 		value, err := bindParameter(store[start:len(store):len(store)],
 			formatFor(m.paramFormats, wire), stmt.parameterOID(wire),
-			stmt.paramKind(wire), &valueSlots[wire], &decodeStore)
+			stmt.paramKind(wire), stmt.paramType(wire),
+			&valueSlots[wire], &decodeStore)
 		if err != nil {
 			return args, wireArgs, valueSlots, store, decodeStore,
 				stmt.documentBindError(wire, err)
@@ -931,6 +938,13 @@ func (p *prepared) paramKind(i int) sqldriver.ParamKind {
 	return p.paramKinds[i]
 }
 
+func (p *prepared) paramType(i int) sqldriver.ParamType {
+	if p == nil || i < 0 || i >= len(p.paramTypes) {
+		return sqldriver.ParamTypeUnspecified
+	}
+	return p.paramTypes[i]
+}
+
 // documentBindError adds protocol-facing identity and source attribution only
 // to a document parameter conversion failure. It never includes the bound
 // bytes; hostile or secret input therefore cannot be reflected through an
@@ -953,8 +967,18 @@ func (p *prepared) documentBindError(wire int, err error) error {
 }
 
 func (p *prepared) parameterOID(i int) int32 {
-	if oid := oidAt(p.paramOIDs, i); oid != 0 {
-		return oid
+	declared := oidAt(p.paramOIDs, i)
+	if inferred := inferredParameterOID(p.paramType(i)); inferred != 0 {
+		// UNKNOWN is PostgreSQL's unresolved string domain. An analyzed typed
+		// context resolves it exactly like an omitted OID, so advertise the
+		// selected domain rather than preserving UNKNOWN.
+		if declared == 0 || declared == oidUnknown {
+			return inferred
+		}
+		return declared
+	}
+	if declared != 0 {
+		return declared
 	}
 	if p.paramKind(i) == sqldriver.ParamDocument {
 		// Advertising json removes an otherwise unavoidable ambiguity for
@@ -963,6 +987,75 @@ func (p *prepared) parameterOID(i int) int32 {
 		return oidJSON
 	}
 	return 0
+}
+
+func inferredParameterOID(paramType sqldriver.ParamType) int32 {
+	switch paramType {
+	case sqldriver.ParamTypeBool:
+		return oidBool
+	case sqldriver.ParamTypeText:
+		return oidText
+	case sqldriver.ParamTypeVarchar:
+		return oidVarchar
+	case sqldriver.ParamTypeName:
+		return oidName
+	case sqldriver.ParamTypeBPChar:
+		return oidBPChar
+	default:
+		return 0
+	}
+}
+
+func validateDeclaredParamOIDs(p *prepared) error {
+	if p == nil || len(p.paramOIDs) == 0 || len(p.paramTypes) == 0 {
+		return nil
+	}
+	for wire, declared := range p.paramOIDs {
+		inferred := p.paramType(wire)
+		if inferred == sqldriver.ParamTypeUnspecified || declared == 0 ||
+			declared == oidUnknown || declaredParamTypeCompatible(inferred, declared) {
+			continue
+		}
+		err := newError(sqlstateDatatypeMismatch, fmt.Sprintf(
+			"parameter $%d has declared type OID %d but is inferred as %s",
+			wire+1, declared, inferred))
+		if wire < len(p.paramTypePositions) && p.paramTypePositions[wire] != 0 {
+			err.position = charPosition(p.sql, p.paramTypePositions[wire]-1)
+		}
+		return err
+	}
+	return nil
+}
+
+func declaredParamTypeCompatible(paramType sqldriver.ParamType, oid int32) bool {
+	switch paramType {
+	case sqldriver.ParamTypeBool:
+		return oid == oidBool
+	case sqldriver.ParamTypeText,
+		sqldriver.ParamTypeVarchar,
+		sqldriver.ParamTypeName,
+		sqldriver.ParamTypeBPChar:
+		// PostgreSQL's string-category parameters have implicit coercions to
+		// one another during common-type selection; numeric, boolean, JSON, and
+		// bytea parameters do not.
+		return isStringParameterOID(oid)
+	case sqldriver.ParamTypeOther:
+		return oid != 0 && oid != oidUnknown && oid != oidBool &&
+			!isStringParameterOID(oid)
+	default:
+		return false
+	}
+}
+
+func isStringParameterOID(oid int32) bool {
+	return oid == oidText || oid == oidVarchar || oid == oidName || oid == oidBPChar
+}
+
+func isStringParameterType(paramType sqldriver.ParamType) bool {
+	return paramType == sqldriver.ParamTypeText ||
+		paramType == sqldriver.ParamTypeVarchar ||
+		paramType == sqldriver.ParamTypeName ||
+		paramType == sqldriver.ParamTypeBPChar
 }
 
 // PostgreSQL OIDs a client may declare for a parameter. Only the ones whose
@@ -986,13 +1079,111 @@ func bindParameter(
 	format int16,
 	oid int32,
 	role sqldriver.ParamKind,
+	inferred sqldriver.ParamType,
 	slot *boundValueSlot,
 	decodeStore *[]byte,
 ) (any, error) {
 	if role == sqldriver.ParamDocument {
 		return bindJSONDocument(raw, format, oid, slot)
 	}
+	stringTarget := inferred
+	if stringTarget == sqldriver.ParamTypeUnspecified &&
+		isStringParameterOID(oid) {
+		// An external backend may implement neither optional type-metadata
+		// interface. The declared wire domain still owns its input semantics;
+		// only analysis-time coercion is unavailable in that fallback.
+		stringTarget = declaredParamType(oid)
+	}
+	if isStringParameterType(stringTarget) {
+		if format != formatBinary {
+			if err := validateTextParameter(raw); err != nil {
+				return nil, err
+			}
+		}
+		var err error
+		raw, err = coerceDeclaredStringParameter(raw, format, oid, stringTarget)
+		if err != nil {
+			return nil, err
+		}
+		slot.text = byteview.String(raw)
+		return &slot.text, nil
+	}
 	return bindValue(raw, format, oid, slot, decodeStore)
+}
+
+func validateTextParameter(raw []byte) error {
+	if !utf8.Valid(raw) || containsNUL(raw) {
+		return newError(sqlstateCharacterNotInRepertoire,
+			"a text-format parameter is not valid PostgreSQL UTF-8 text")
+	}
+	return nil
+}
+
+func containsNUL(raw []byte) bool {
+	for _, b := range raw {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// coerceDeclaredStringParameter applies PostgreSQL's source input semantics
+// and then its implicit coercion to the analyzed string-category target.
+// Every returned slice aliases portal-owned input and the scans allocate
+// nothing.
+func coerceDeclaredStringParameter(
+	raw []byte,
+	format int16,
+	oid int32,
+	target sqldriver.ParamType,
+) ([]byte, error) {
+	if format == formatBinary && (!utf8.Valid(raw) || containsNUL(raw)) {
+		return nil, newError(sqlstateCharacterNotInRepertoire,
+			"a binary string parameter is not valid PostgreSQL UTF-8 text")
+	}
+	switch oid {
+	case oidName:
+		if len(raw) > postgresNameDataBytes {
+			// PostgreSQL's text and binary input functions deliberately differ
+			// here. namein clips an overlength textual identifier, while namerecv
+			// rejects the same bytes instead of silently changing a binary value.
+			if format == formatBinary {
+				return nil, newError(sqlstateNameTooLong, "identifier too long").
+					withDetail("Identifier must be less than 64 characters.")
+			}
+			raw = clipPostgresName(raw)
+		}
+	case oidBPChar:
+		if target != sqldriver.ParamTypeBPChar {
+			raw = trimBPCharSpaces(raw)
+		}
+	}
+	// A cast into name clips regardless of the source parameter's wire format:
+	// binary belongs to the source receive function, not to the target cast.
+	if target == sqldriver.ParamTypeName && oid != oidName &&
+		len(raw) > postgresNameDataBytes {
+		raw = clipPostgresName(raw)
+	}
+	return raw, nil
+}
+
+const postgresNameDataBytes = 63
+
+func clipPostgresName(raw []byte) []byte {
+	end := postgresNameDataBytes
+	for end > 0 && raw[end]&0xc0 == 0x80 {
+		end--
+	}
+	return raw[:end:end]
+}
+
+func trimBPCharSpaces(raw []byte) []byte {
+	end := len(raw)
+	for end > 0 && raw[end-1] == ' ' {
+		end--
+	}
+	return raw[:end:end]
 }
 
 // bindJSONDocument validates one complete JSON value while preserving its
@@ -1030,7 +1221,7 @@ func bindJSONDocument(
 				withHint("bind the document as json, jsonb, text, or bytea")
 		}
 	}
-	if !utf8.Valid(document) {
+	if !utf8.Valid(document) || containsNUL(document) {
 		return nil, newError(sqlstateCharacterNotInRepertoire,
 			"value is not valid UTF-8")
 	}
@@ -1082,7 +1273,7 @@ func bindValue(
 	if format == formatBinary {
 		return bindBinary(raw, oid, slot, decodeStore)
 	}
-	if !utf8.Valid(raw) {
+	if !utf8.Valid(raw) || containsNUL(raw) {
 		return nil, newError(sqlstateCharacterNotInRepertoire,
 			"a text-format parameter is not valid UTF-8")
 	}
@@ -1102,16 +1293,13 @@ func bindValue(
 		slot.number = query.Number(text)
 		return &slot.number, nil
 	case oidBool:
-		switch text {
-		case "t", "true", "TRUE", "on", "1", "y", "yes":
-			slot.boolean = true
-			return &slot.boolean, nil
-		case "f", "false", "FALSE", "off", "0", "n", "no":
-			slot.boolean = false
-			return &slot.boolean, nil
+		value, ok := pginput.Boolean(text)
+		if !ok {
+			return nil, newError(sqlstateInvalidTextRepresentation,
+				"parameter declared boolean does not spell a boolean")
 		}
-		return nil, newError(sqlstateInvalidParameterValue,
-			"parameter declared boolean does not spell a boolean")
+		slot.boolean = value
+		return &slot.boolean, nil
 	case oidText, oidVarchar, oidName, oidBPChar:
 		slot.text = text
 		return &slot.text, nil
@@ -1234,31 +1422,31 @@ func bindBinary(
 	switch oid {
 	case oidBool:
 		if len(raw) != 1 {
-			return nil, badBinary("bool", len(raw))
+			return nil, badBinary("bool", len(raw), 1)
 		}
 		slot.boolean = raw[0] != 0
 		return &slot.boolean, nil
 	case oidInt2:
 		if len(raw) != 2 {
-			return nil, badBinary("int2", len(raw))
+			return nil, badBinary("int2", len(raw), 2)
 		}
 		slot.integer = int64(int16(binary.BigEndian.Uint16(raw)))
 		return &slot.integer, nil
 	case oidInt4:
 		if len(raw) != 4 {
-			return nil, badBinary("int4", len(raw))
+			return nil, badBinary("int4", len(raw), 4)
 		}
 		slot.integer = int64(int32(binary.BigEndian.Uint32(raw)))
 		return &slot.integer, nil
 	case oidInt8:
 		if len(raw) != 8 {
-			return nil, badBinary("int8", len(raw))
+			return nil, badBinary("int8", len(raw), 8)
 		}
 		slot.integer = int64(binary.BigEndian.Uint64(raw))
 		return &slot.integer, nil
 	case oidFloat4:
 		if len(raw) != 4 {
-			return nil, badBinary("float4", len(raw))
+			return nil, badBinary("float4", len(raw), 4)
 		}
 		value := float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -1268,7 +1456,7 @@ func bindBinary(
 		return &slot.floating, nil
 	case oidFloat8:
 		if len(raw) != 8 {
-			return nil, badBinary("float8", len(raw))
+			return nil, badBinary("float8", len(raw), 8)
 		}
 		value := math.Float64frombits(binary.BigEndian.Uint64(raw))
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -1278,7 +1466,7 @@ func bindBinary(
 		return &slot.floating, nil
 	case oidText, oidVarchar, oidName, oidBPChar, oidUnknown:
 		// These types' binary encoding is their text bytes unchanged.
-		if !utf8.Valid(raw) {
+		if !utf8.Valid(raw) || containsNUL(raw) {
 			return nil, newError(sqlstateCharacterNotInRepertoire,
 				"a binary text parameter is not valid UTF-8")
 		}
@@ -1302,8 +1490,12 @@ func bindBinary(
 			"bool, int2, int4, int8, float4, float8, text, varchar, json, or jsonb")
 }
 
-func badBinary(name string, size int) error {
-	return newError(sqlstateInvalidParameterValue, fmt.Sprintf(
+func badBinary(name string, size, expected int) error {
+	code := sqlstateInvalidBinaryRepresentation
+	if size < expected {
+		code = sqlstateProtocolViolation
+	}
+	return newError(code, fmt.Sprintf(
 		"a binary %s parameter is the wrong length: %d bytes", name, size))
 }
 

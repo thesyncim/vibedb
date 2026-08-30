@@ -219,6 +219,42 @@ released version or a compatibility dispatch point. Earlier development
 decimal-JSON values fail closed. Format 0 replaces them in place and has no
 alternate decoder or migration ladder.
 
+### Distributed SQL participant mutation batches
+
+A staged distributed-SQL participant stores its canonical mutation bytes
+inside `distributedtxn.ParticipantRecord.Mutation`. The participant record's
+CRC32C and the transaction mutation digest protect the complete batch. The
+batch is at most 16 MiB and begins with:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic `VMB1` |
+| 4 | 4 | Little-endian statement count, from 1 through 4096 |
+| 8 | variable | Exactly that many canonical statement entries |
+
+An ordinary SQL mutation entry starts with a nonzero little-endian `uint32`
+SQL byte length and that many valid UTF-8 bytes. A little-endian `uint32`
+parameter word follows. Bits 0 through 30 are the parameter count, bounded at
+65,536. Bit 31 is the analysis-type presence flag. When the flag is clear, the
+parameter payload follows immediately and remains byte-for-byte identical to
+the earlier current-format encoding. When the flag is set, exactly one type
+byte per parameter precedes the parameter payload. A typed vector is present
+only for a nonempty parameter list, covers every parameter, and contains at
+least one value other than `Unspecified`.
+
+The type-byte vocabulary is closed: `0` is `Unspecified`, `1` is `Bool`, `2`
+is `Text`, `3` is `Varchar`, `4` is `Name`, `5` is `BPChar`, and `6` is
+`Other`. Values 7 and above are invalid. A document parameter may carry only
+`Unspecified`; the concrete analysis domains apply to SQL scalars.
+
+Each parameter then starts with its existing one-byte kind. `Null` has no
+payload, `Bool` has one canonical byte (`0` or `1`), and `Number`, `String`,
+and `Document` have a little-endian `uint32` length followed by their validated
+bytes. A zero SQL length continues to select the existing byte-native global
+index or primary-key precondition entries and never carries analysis types.
+Decode validates the entire batch and requires exact byte exhaustion before
+any statement can be applied.
+
 ## Distributed transaction coordinator manifests
 
 The compact `VTC1` coordinator record remains the byte-identical fast path for

@@ -1,6 +1,10 @@
 package sql
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/thesyncim/vibedb/internal/pginput"
+)
 
 // The predicate grammar.
 //
@@ -151,6 +155,9 @@ func (p *Parser) parseNot(ctx exprContext) (*Expr, error) {
 
 // parsePrimary parses a parenthesized predicate or a path-led leaf.
 func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
+	if _, _, known := scalarTypedStringHead(p.tok); known {
+		return p.parseTypedHeadPrimary(ctx)
+	}
 	switch {
 	case p.tok.kind == tokLParen:
 		p.advance()
@@ -255,6 +262,53 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	return p.parseLeafTail(ctx, agg, path, leafPos)
 }
 
+// parseTypedHeadPrimary consumes a fixed candidate type name exactly once.
+// A following string becomes a typed constant; every other token continues
+// through the ordinary path lane so columns named bool, boolean, text, or one
+// of the explicitly refused future types retain the native predicate plan.
+func (p *Parser) parseTypedHeadPrimary(ctx exprContext) (*Expr, error) {
+	leafPos := p.tok.pos
+	target, supported, _ := scalarTypedStringHead(p.tok)
+	head := p.tok
+	p.advance()
+	if p.tok.kind == tokString {
+		value, err := p.parseTypedStringAfterHead(head, target, supported)
+		if err != nil {
+			return nil, err
+		}
+		literal := p.newScalar(ScalarLiteral, value.Pos)
+		literal.Value = value
+		cast := p.newScalar(ScalarCast, value.Pos)
+		cast.Cast, cast.Left, cast.TargetPos = target, literal, head.pos
+		cast.TypedConstant = true
+		return p.parseScalarCondition(ctx, cast, leafPos)
+	}
+	if err := p.rejectUnsupportedTypedStringSuffix(head); err != nil {
+		return nil, err
+	}
+	path, err := p.continuePath(head, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.rejectQualifiedTypedStringPath(head, path); err != nil {
+		return nil, err
+	}
+	if scalarContinues(p.tok) {
+		column := ResultColumn{Path: path, Pos: leafPos}
+		return p.parseScalarCondition(ctx, p.scalarFromColumn(column), leafPos)
+	}
+	if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+		node := p.exprs.one()
+		*node = Expr{
+			Kind: ExprScalarTruth, Column: -1,
+			ScalarLeft: p.scalarFromColumn(ResultColumn{Path: path, Pos: leafPos}),
+			Pos:        leafPos,
+		}
+		return node, nil
+	}
+	return p.parseLeafTail(ctx, AggNone, path, leafPos)
+}
+
 func scalarContextForPredicate(ctx exprContext) scalarExprContext {
 	switch ctx {
 	case ctxHaving:
@@ -285,6 +339,13 @@ func (p *Parser) parseScalarCondition(
 		return nil, err
 	}
 	if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+		if value, typed := directTypedConstantOperand(left); typed && value.Kind == OperandBool {
+			node := p.exprs.one()
+			*node = Expr{
+				Kind: ExprConstant, Column: -1, Value: value, Pos: pos,
+			}
+			return node, nil
+		}
 		node := p.exprs.one()
 		*node = Expr{
 			Kind: ExprScalarTruth, Column: -1,
@@ -318,8 +379,125 @@ func (p *Parser) parseScalarCondition(
 		Kind: ExprScalarCompare, Op: op, Column: -1,
 		ScalarLeft: left, ScalarRight: right, Pos: pos,
 	}
+	if lowerTypedConstantPathComparison(node) {
+		return node, nil
+	}
 	lowerTextPathEquality(node)
 	return node, nil
+}
+
+// lowerTypedConstantPathComparison keeps PostgreSQL typed-string constants on
+// the established path/literal predicate lane in WHERE, CASE, and JOIN. Their
+// input conversion already happened while parsing type 'string', so retaining
+// a scalar expression would add per-row work and forfeit native pushdown. When
+// the constant is on the left, reverse the operator to retain Path <op> Value.
+func lowerTypedConstantPathComparison(node *Expr) bool {
+	if node == nil || node.Kind != ExprScalarCompare {
+		return false
+	}
+	if path, ok := scalarPathExpression(node.ScalarLeft); ok {
+		if value, typed := directTypedConstantOperand(node.ScalarRight); typed {
+			*node = Expr{
+				Kind: ExprCompare, Op: node.Op, Column: -1,
+				Path: path, Value: value, Pos: node.Pos,
+			}
+			return true
+		}
+		return false
+	}
+	value, typed := directTypedConstantOperand(node.ScalarLeft)
+	path, ok := scalarPathExpression(node.ScalarRight)
+	if !typed || !ok {
+		return false
+	}
+	*node = Expr{
+		Kind: ExprCompare, Op: reverseComparisonOp(node.Op), Column: -1,
+		Path: path, Value: value, Pos: node.Pos,
+	}
+	return true
+}
+
+func scalarPathExpression(expr *ScalarExpr) (*PathExpr, bool) {
+	if expr == nil || expr.Kind != ScalarPath || expr.Path == nil {
+		return nil, false
+	}
+	return expr.Path, true
+}
+
+func directTypedConstantOperand(expr *ScalarExpr) (Operand, bool) {
+	value, typed, ok := foldTypedConstantOperand(expr)
+	return value, typed && ok
+}
+
+// foldTypedConstantOperand recognizes only source-independent BOOL/TEXT cast
+// chains. Successful allocation-free conversions can retain the native
+// path/literal predicate lane. Bad input on a valid outer cast deliberately
+// returns ok=false so execution remains lazy, including in dead CASE arms.
+func foldTypedConstantOperand(expr *ScalarExpr) (Operand, bool, bool) {
+	if expr == nil {
+		return Operand{}, false, false
+	}
+	if expr.Kind == ScalarLiteral {
+		if expr.Value.Kind == OperandParam {
+			return Operand{}, false, false
+		}
+		return expr.Value, false, true
+	}
+	if expr.Kind != ScalarCast ||
+		(expr.Cast != ScalarCastText && expr.Cast != ScalarCastBoolean) {
+		return Operand{}, false, false
+	}
+	value, typed, ok := foldTypedConstantOperand(expr.Left)
+	if !ok {
+		return Operand{}, typed, false
+	}
+	typed = typed || expr.TypedConstant
+	if !typed {
+		return value, false, true
+	}
+	if expr.Cast == ScalarCastText {
+		switch value.Kind {
+		case OperandString:
+			return value, true, true
+		case OperandBool:
+			text := "false"
+			if value.Bool {
+				text = "true"
+			}
+			return Operand{Kind: OperandString, Text: text, Pos: expr.Pos}, true, true
+		case OperandNumber:
+			return Operand{Kind: OperandString, Text: value.Text, Pos: expr.Pos}, true, true
+		default:
+			return Operand{}, true, false
+		}
+	}
+	switch value.Kind {
+	case OperandBool:
+		return value, true, true
+	case OperandString:
+		boolean, valid := pginput.Boolean(value.Text)
+		if !valid {
+			return Operand{}, true, false
+		}
+		return Operand{Kind: OperandBool, Bool: boolean, Pos: expr.Pos}, true, true
+	default:
+		return Operand{}, true, false
+	}
+}
+
+func reverseComparisonOp(op CmpOp) CmpOp {
+	switch op {
+	case OpLt:
+		return OpGt
+	case OpLe:
+		return OpGe
+	case OpGt:
+		return OpLt
+	case OpGe:
+		return OpLe
+	default:
+		return op
+	}
 }
 
 // parseLeafTail parses what follows a leaf's left operand.
@@ -358,7 +536,68 @@ func (p *Parser) parseLeafTail(
 		return nil, p.errHere("expected a comparison operator, IS, IN, BETWEEN, or @> after a path; a bare path is not a condition, so a boolean field is tested as `flag = TRUE`")
 	}
 	p.advance()
-	if (ctx == ctxJoin || p.correlation != nil && p.correlation.capture != nil) &&
+	pathComparison := ctx == ctxJoin || p.correlation != nil && p.correlation.capture != nil
+	if target, supported, known := scalarTypedStringHead(p.tok); known {
+		head := p.tok
+		p.advance()
+		if p.tok.kind == tokString {
+			value, err := p.parseTypedStringAfterHead(head, target, supported)
+			if err != nil {
+				return nil, err
+			}
+			literal := p.newScalar(ScalarLiteral, value.Pos)
+			literal.Value = value
+			right := p.newScalar(ScalarCast, value.Pos)
+			right.Cast, right.Left, right.TargetPos = target, literal, head.pos
+			right.TypedConstant = true
+			right, err = p.parseScalarTypecasts(right)
+			if err != nil {
+				return nil, err
+			}
+			if folded, ok := directTypedConstantOperand(right); ok {
+				e := p.exprs.one()
+				*e = Expr{
+					Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
+					Path: path, Value: folded, Pos: pos,
+				}
+				return e, nil
+			}
+			e := p.exprs.one()
+			*e = Expr{
+				Kind: ExprScalarCompare, Op: op, Column: -1,
+				ScalarLeft: p.scalarFromColumn(ResultColumn{
+					Agg: agg, Path: path, Pos: pos,
+				}),
+				ScalarRight: right, Pos: pos,
+			}
+			return e, nil
+		}
+		if err := p.rejectUnsupportedTypedStringSuffix(head); err != nil {
+			return nil, err
+		}
+		qualified := head.kind == tokIdent && equalFoldASCII(head.text, "pg_catalog") &&
+			p.tok.kind == tokDot
+		if !pathComparison && !qualified {
+			return nil, p.errHere("expected a literal or '?' on the right side of the comparison")
+		}
+		right, err := p.continuePath(head, false)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.rejectQualifiedTypedStringPath(head, right); err != nil {
+			return nil, err
+		}
+		if !pathComparison {
+			return nil, p.errHere("expected a literal or '?' on the right side of the comparison")
+		}
+		e := p.exprs.one()
+		*e = Expr{
+			Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
+			Path: path, RightPath: right, Pos: pos,
+		}
+		return e, nil
+	}
+	if pathComparison &&
 		(p.tok.kind == tokQuotedIdent ||
 			p.tok.kind == tokIdent && p.tok.kw == kwNone) {
 		right, err := p.parsePath(false)
@@ -629,6 +868,26 @@ func (p *Parser) rebaseSubqueryError(err error, start int) error {
 			arity.Aliases, arity.Outputs,
 		)
 	}
+	var invalidText *InvalidTextRepresentationError
+	if errors.As(err, &invalidText) {
+		return newInvalidTextRepresentationError(
+			p.lx.src, start+invalidText.Pos, invalidText.Target, invalidText.Msg,
+		)
+	}
+	var cannotCoerce *CannotCoerceError
+	if errors.As(err, &cannotCoerce) {
+		return newCannotCoerceError(
+			p.lx.src, start+cannotCoerce.Pos,
+			cannotCoerce.Source, cannotCoerce.Target,
+		)
+	}
+	var undefinedOperator *UndefinedOperatorError
+	if errors.As(err, &undefinedOperator) {
+		return newUndefinedOperatorError(
+			p.lx.src, start+undefinedOperator.Pos,
+			undefinedOperator.Left, undefinedOperator.Right,
+		)
+	}
 	var unsupported *FeatureNotSupportedError
 	if errors.As(err, &unsupported) {
 		return newFeatureNotSupportedError(
@@ -890,6 +1149,22 @@ func comparisonOp(k tokenKind) (CmpOp, bool) {
 // had in mind.
 func (p *Parser) parseOperand() (Operand, error) {
 	pos := p.tok.pos
+	if target, supported, known := scalarTypedStringHead(p.tok); known {
+		head := p.tok
+		p.advance()
+		if p.tok.kind != tokString && head.kind == tokIdent &&
+			equalFoldASCII(head.text, "pg_catalog") && p.tok.kind == tokDot {
+			path, err := p.continuePath(head, false)
+			if err != nil {
+				return Operand{}, err
+			}
+			if err := p.rejectQualifiedTypedStringPath(head, path); err != nil {
+				return Operand{}, err
+			}
+			return Operand{}, p.errHere("expected a scalar comparison operand")
+		}
+		return p.parseTypedOperandAfterHead(head, target, supported)
+	}
 	switch p.tok.kind {
 	case tokNumber:
 		text := p.internString(p.tok.text)
@@ -923,4 +1198,34 @@ func (p *Parser) parseOperand() (Operand, error) {
 		return Operand{}, p.errHere("a double-quoted name is an identifier, not a string; string literals use single quotes")
 	}
 	return Operand{}, p.errHere("expected a literal or '?'")
+}
+
+// parseTypedOperandAfterHead retains legacy operand lanes (IN, BETWEEN, and
+// DML VALUES) when a BOOL/TEXT cast chain has a final native literal. Chains
+// that require a row-time scalar conversion are refused explicitly instead of
+// leaving a trailing :: token to degrade into a syntax error.
+func (p *Parser) parseTypedOperandAfterHead(
+	head token, target ScalarCastTarget, supported bool,
+) (Operand, error) {
+	value, err := p.parseTypedStringAfterHead(head, target, supported)
+	if err != nil || p.tok.kind != tokDoubleColon {
+		return value, err
+	}
+	castPos := p.tok.pos
+	literal := p.newScalar(ScalarLiteral, value.Pos)
+	literal.Value = value
+	expr := p.newScalar(ScalarCast, value.Pos)
+	expr.Cast, expr.Left, expr.TargetPos = target, literal, head.pos
+	expr.TypedConstant = true
+	expr, err = p.parseScalarTypecasts(expr)
+	if err != nil {
+		return Operand{}, err
+	}
+	if folded, ok := directTypedConstantOperand(expr); ok {
+		return folded, nil
+	}
+	return Operand{}, newFeatureNotSupportedError(
+		p.lx.src, castPos,
+		"this typed-constant cast chain needs scalar evaluation in an operand-only clause; use it in a SELECT expression or direct comparison",
+	)
 }

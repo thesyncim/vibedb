@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -398,6 +399,34 @@ func (p Param) Valid() bool {
 	}
 }
 
+// validSQLParameterTypes recognizes the canonical optional analysis metadata
+// shared by direct shard requests and durable mutation batches. A present
+// vector covers every bound parameter and contains at least one concrete type;
+// an all-unspecified vector is represented by absence. Document parameters
+// cannot simultaneously claim a scalar SQL input domain.
+func validSQLParameterTypes(params []Param, parameterTypes []sqldriver.ParamType) bool {
+	if len(parameterTypes) == 0 {
+		return true
+	}
+	if len(parameterTypes) != len(params) || len(parameterTypes) > maxParams {
+		return false
+	}
+	hasType := false
+	for index, parameterType := range parameterTypes {
+		if parameterType >= sqldriver.ParamTypeInvalid {
+			return false
+		}
+		if parameterType == sqldriver.ParamTypeUnspecified {
+			continue
+		}
+		if params[index].Kind == ParamDocument {
+			return false
+		}
+		hasType = true
+	}
+	return hasType
+}
+
 // NullParam returns a SQL NULL parameter.
 func NullParam() Param { return Param{Kind: ParamNull} }
 
@@ -458,6 +487,10 @@ type ShardRequest struct {
 	SQL string
 	// Params are the typed bound parameters, in placeholder order.
 	Params []Param
+	// ParamTypes is absent on the ordinary schemaless path. When present it is a
+	// full placeholder vector containing at least one analysis-time SQL input
+	// type, so the shard's independent prepare preserves gateway semantics.
+	ParamTypes []sqldriver.ParamType
 	// PartialAggregate asks the shard to lower a grouped SELECT without its
 	// final ORDER BY or LIMIT. The coordinator applies those stages after exact
 	// partial-state combination, so groups spanning shards cannot be truncated.

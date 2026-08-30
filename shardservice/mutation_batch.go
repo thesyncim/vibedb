@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -38,9 +39,10 @@ func (k MutationKind) valid() bool {
 // locator array produced with vibejson. All decoded payloads borrow the durable
 // participant record.
 type MutationStatement struct {
-	Kind   MutationKind
-	SQL    string
-	Params []Param
+	Kind       MutationKind
+	SQL        string
+	Params     []Param
+	ParamTypes []sqldriver.ParamType
 
 	Relation     string
 	IndexID      uint64
@@ -67,6 +69,7 @@ const (
 	mutationBatchHeader        = 8
 	globalMutationFixedBytes   = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 4 + 4
 	primaryConditionFixedBytes = 4 + 1 + 1 + 2 + 4 + 4 + 4
+	mutationParamTypesFlag     = uint32(1) << 31
 )
 
 var (
@@ -91,6 +94,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 		if statement.Kind == MutationSQL {
 			if statement.SQL == "" || !utf8.ValidString(statement.SQL) ||
 				len(statement.Params) > maxParams || statement.Relation != "" ||
+				!validSQLParameterTypes(statement.Params, statement.ParamTypes) ||
 				statement.IndexID != 0 || statement.Incarnation != 0 ||
 				len(statement.EntryKey) != 0 || len(statement.Value) != 0 ||
 				statement.LocatorCount != 0 || statement.Unique ||
@@ -98,7 +102,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 				len(statement.ExpectedDigests) != 0 {
 				return dst, ErrMutationBatch
 			}
-			total += 8 + len(statement.SQL)
+			total += 8 + len(statement.SQL) + len(statement.ParamTypes)
 			for j := range statement.Params {
 				param := &statement.Params[j]
 				if !param.Kind.valid() || !param.Valid() {
@@ -118,7 +122,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 			continue
 		}
 		if statement.Kind == MutationPrimaryPrecondition || statement.Kind == MutationPrimaryCheck {
-			if statement.SQL != "" || len(statement.Params) != 0 ||
+			if statement.SQL != "" || len(statement.Params) != 0 || len(statement.ParamTypes) != 0 ||
 				statement.Relation == "" || len(statement.Relation) > maxMutationRelationBytes ||
 				!utf8.ValidString(statement.Relation) || statement.IndexID != 0 ||
 				statement.Incarnation != 0 || len(statement.EntryKey) != 0 ||
@@ -143,7 +147,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 			}
 			continue
 		}
-		if statement.SQL != "" || len(statement.Params) != 0 ||
+		if statement.SQL != "" || len(statement.Params) != 0 || len(statement.ParamTypes) != 0 ||
 			statement.Relation == "" ||
 			len(statement.Relation) > maxMutationRelationBytes ||
 			!utf8.ValidString(statement.Relation) || statement.IndexID == 0 ||
@@ -225,7 +229,14 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 		}
 		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.SQL)))
 		dst = append(dst, statement.SQL...)
-		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.Params)))
+		paramCount := uint32(len(statement.Params))
+		if len(statement.ParamTypes) != 0 {
+			paramCount |= mutationParamTypesFlag
+		}
+		dst = binary.LittleEndian.AppendUint32(dst, paramCount)
+		for _, parameterType := range statement.ParamTypes {
+			dst = append(dst, byte(parameterType))
+		}
 		for j := range statement.Params {
 			param := &statement.Params[j]
 			dst = append(dst, byte(param.Kind))
@@ -308,12 +319,38 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 	if !ok || len(sqlBytes) == 0 || !utf8.Valid(sqlBytes) || len(rest) < 4 {
 		return MutationStatement{}, ErrMutationBatch
 	}
-	count := binary.LittleEndian.Uint32(rest[:4])
+	rawCount := binary.LittleEndian.Uint32(rest[:4])
 	rest = rest[4:]
+	hasParameterTypes := rawCount&mutationParamTypesFlag != 0
+	count := rawCount &^ mutationParamTypesFlag
 	if count > uint32(maxParams) || uint64(count) > uint64(len(rest)) {
 		return MutationStatement{}, ErrMutationBatch
 	}
 	statement := MutationStatement{SQL: byteview.String(sqlBytes)}
+	var parameterTypeBytes []byte
+	if hasParameterTypes {
+		if count == 0 || uint64(count) > uint64(len(rest)) {
+			return MutationStatement{}, ErrMutationBatch
+		}
+		parameterTypeBytes, rest = rest[:count], rest[count:]
+		hasConcreteType := false
+		for _, encoded := range parameterTypeBytes {
+			parameterType := sqldriver.ParamType(encoded)
+			if parameterType >= sqldriver.ParamTypeInvalid {
+				return MutationStatement{}, ErrMutationBatch
+			}
+			hasConcreteType = hasConcreteType || parameterType != sqldriver.ParamTypeUnspecified
+		}
+		if !hasConcreteType {
+			return MutationStatement{}, ErrMutationBatch
+		}
+		if materialize {
+			statement.ParamTypes = make([]sqldriver.ParamType, int(count))
+			for index, encoded := range parameterTypeBytes {
+				statement.ParamTypes[index] = sqldriver.ParamType(encoded)
+			}
+		}
+	}
 	if materialize && count != 0 {
 		statement.Params = make([]Param, int(count))
 	}
@@ -338,6 +375,10 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 				return MutationStatement{}, ErrMutationBatch
 			}
 		default:
+			return MutationStatement{}, ErrMutationBatch
+		}
+		if param.Kind == ParamDocument && hasParameterTypes &&
+			sqldriver.ParamType(parameterTypeBytes[i]) != sqldriver.ParamTypeUnspecified {
 			return MutationStatement{}, ErrMutationBatch
 		}
 		if !param.Valid() {

@@ -16,11 +16,24 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/shardservice"
+	"github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const maxPostgreSQLWriteJournalBytes = 4 << 20
+const (
+	maxPostgreSQLWriteJournalBytes = 4 << 20
+	maxPostgreSQLWriteParameters   = 1 << 16
+
+	// Version 1 is the deployed journal format. The ParamTypes member is omitted
+	// from its Query JSON, preserving its exact bytes. Version 2 is selected only
+	// while a typed query is retained, so an older binary rejects the record at
+	// its version fence instead of decoding and replaying it without the type
+	// metadata.
+	postgresWriteJournalVersionUntyped = 1
+	postgresWriteJournalVersionTyped   = 2
+)
 
 type postgresDurableService interface {
 	durableRequestService
@@ -133,7 +146,7 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 		if err = vibejson.Unmarshal(raw[sha256.Size:], &w.record); err != nil {
 			return fail(err)
 		}
-		if w.record.Version != 1 || w.record.Authority != authority || w.record.Installation == (replication.ID128{}) || w.record.Sequence == 0 {
+		if !validPostgresWriteJournalVersion(&w.record) || w.record.Authority != authority || w.record.Installation == (replication.ID128{}) || w.record.Sequence == 0 {
 			return fail(errInvalidDurableRequestAdapter)
 		}
 		if len(table) == 1 && w.record.Table != table[0] {
@@ -157,7 +170,7 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 	if !errors.Is(err, os.ErrNotExist) {
 		return fail(err)
 	}
-	w.record = postgresWriteRecord{Version: 1, Authority: authority, Sequence: 1}
+	w.record = postgresWriteRecord{Version: postgresWriteJournalVersionUntyped, Authority: authority, Sequence: 1}
 	if len(table) == 1 {
 		w.record.Table = table[0]
 	}
@@ -254,6 +267,7 @@ func (w *postgresDurableWriter) finishAck(ctx context.Context) error {
 	w.record.Sequence++
 	w.record.Identity = durableExecBatchIdentity{}
 	w.record.Query, w.record.Ack = nil, nil
+	w.record.Version = postgresWriteJournalVersionUntyped
 	return w.save()
 }
 
@@ -290,6 +304,7 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 			// but never the failed command's nonce for the next independent write.
 			w.record.Query = nil
 			w.record.Identity = durableExecBatchIdentity{}
+			w.record.Version = postgresWriteJournalVersionUntyped
 			if saveErr := w.save(); saveErr != nil {
 				// The old durable outbox may still authorize recovery. A refusal
 				// is final only after its removal is durable too.
@@ -376,6 +391,11 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	if err = vibejson.Unmarshal(queries, &owned); err != nil {
 		return nil, err
 	}
+	version, err := postgresWriteJournalVersion(&owned)
+	if err != nil {
+		return nil, err
+	}
+	w.record.Version = version
 	w.record.Query, w.record.Identity = &owned, identity
 	if err = w.save(); err != nil {
 		return nil, w.outcomeError(identity.RequestID, err, false)
@@ -389,6 +409,46 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 		return nil, w.outcomeError(identity.RequestID, err, false)
 	}
 	return result, err
+}
+
+func postgresWriteJournalVersion(query *gateway.Query) (uint32, error) {
+	if query == nil || query.ParamTypes == nil {
+		return postgresWriteJournalVersionUntyped, nil
+	}
+	if len(query.ParamTypes) == 0 ||
+		len(query.ParamTypes) != len(query.Params) ||
+		len(query.ParamTypes) > maxPostgreSQLWriteParameters {
+		return 0, errInvalidDurableRequestAdapter
+	}
+	typed := false
+	for index, parameterType := range query.ParamTypes {
+		if parameterType >= driver.ParamTypeInvalid {
+			return 0, errInvalidDurableRequestAdapter
+		}
+		if !query.Params[index].Valid() {
+			return 0, errInvalidDurableRequestAdapter
+		}
+		if parameterType != driver.ParamTypeUnspecified &&
+			query.Params[index].Kind == shardservice.ParamDocument {
+			return 0, errInvalidDurableRequestAdapter
+		}
+		typed = typed || parameterType != driver.ParamTypeUnspecified
+	}
+	if !typed {
+		return 0, errInvalidDurableRequestAdapter
+	}
+	return postgresWriteJournalVersionTyped, nil
+}
+
+func validPostgresWriteJournalVersion(record *postgresWriteRecord) bool {
+	if record == nil {
+		return false
+	}
+	version, err := postgresWriteJournalVersion(record.Query)
+	if err != nil {
+		return false
+	}
+	return record.Version == version
 }
 
 func (w *postgresDurableWriter) Run(ctx context.Context) {

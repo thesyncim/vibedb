@@ -53,9 +53,9 @@ type frontendMessage struct {
 	// maxRows is Execute's row limit; zero means "all rows".
 	maxRows int32
 
-	// paramOIDs are the parameter types declared by Parse. Bind uses them to
-	// select an unambiguous scalar decoder and ParameterDescription reports
-	// them back, with zero for positions the client left unspecified.
+	// paramOIDs are the parameter types declared by Parse. Bind uses compatible
+	// declarations to select an unambiguous scalar decoder; analyzed statement
+	// types fill positions the client left unspecified.
 	paramOIDs []int32
 	// paramFormats and resultFormats are Bind's format-code arrays, already
 	// validated to be text or binary.

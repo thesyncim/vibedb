@@ -109,6 +109,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 			req: &shardservice.ShardRequest{
 				SQL:                  q.SQL,
 				Params:               q.Params,
+				ParamTypes:           q.ParamTypes,
 				PartialAggregate:     partialAggregate,
 				Distribution:         route.Distribution,
 				Shard:                t.Shard,

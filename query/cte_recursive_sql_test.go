@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -162,6 +163,157 @@ func TestRecursiveSQLBridgeUnionAndMaterializationMapping(t *testing.T) {
 			statement.Release()
 		})
 	}
+}
+
+func TestRecursiveSQLBridgeMergesTermOnlyParameterMetadata(t *testing.T) {
+	const source = `WITH RECURSIVE walk(v) AS (
+		SELECT flag AS v FROM seeds
+		UNION ALL
+		SELECT CASE BOOL 't' WHEN ? THEN v ELSE v END AS v FROM walk
+	) SELECT v FROM walk`
+	statement, err := PrepareRecursiveSQLStatement(
+		source, RecursiveSQLStatementOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	position := strings.Index(source, "?")
+	if got := statement.ParameterType(0); got != ParameterTypeBool {
+		t.Fatalf("owner parameter type = %s, want boolean", got)
+	}
+	if got := statement.ParameterTypePosition(0); got != position {
+		t.Fatalf("owner parameter position = %d, want %d", got, position)
+	}
+	prepared := statement.cteCatalog().defs[0].recursiveDefinition
+	if prepared == nil ||
+		prepared.recursiveStmt.ParameterType(0) != ParameterTypeBool ||
+		prepared.recursiveStmt.ParameterTypePosition(0) != position {
+		t.Fatalf("recursive term metadata was not installed: %+v", prepared)
+	}
+}
+
+func TestRecursiveSQLBridgeCommonTypeParity(t *testing.T) {
+	const mismatch = `WITH RECURSIVE walk(v) AS (
+		SELECT BOOL 't' AS v FROM seeds
+		UNION ALL
+		SELECT TEXT 'x' AS v FROM walk
+	) SELECT v FROM walk`
+	_, err := PrepareRecursiveSQLStatement(
+		mismatch, RecursiveSQLStatementOptions{},
+	)
+	var typeErr *ScalarTypeError
+	if !errors.As(err, &typeErr) || !errors.Is(err, ErrScalarType) ||
+		typeErr.Position() != strings.LastIndex(mismatch, "TEXT") {
+		t.Fatalf("recursive BOOL/TEXT mismatch = %T %v, want 42804 class at TEXT", err, err)
+	}
+
+	const compatible = `WITH RECURSIVE walk(v) AS (
+		SELECT ? AS v FROM seeds
+		UNION ALL
+		SELECT ? AS v FROM walk
+	) SELECT v FROM walk`
+	for _, test := range []struct {
+		name       string
+		types      []ParameterType
+		want       OutputRepresentation
+		wantErrPos int
+	}{
+		{
+			name:  "varchar anchor keeps exact identity",
+			types: []ParameterType{ParameterTypeVarchar, ParameterTypeText},
+			want:  OutputSQLVarchar, wantErrPos: -1,
+		},
+		{
+			name:  "name anchor accepts bpchar",
+			types: []ParameterType{ParameterTypeName, ParameterTypeBPChar},
+			want:  OutputSQLName, wantErrPos: -1,
+		},
+		{
+			name:       "name candidate rejects varchar anchor",
+			types:      []ParameterType{ParameterTypeVarchar, ParameterTypeName},
+			wantErrPos: strings.Index(compatible, "?"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			statement, prepareErr := PrepareRecursiveSQLStatement(
+				compatible, RecursiveSQLStatementOptions{parameterTypes: test.types},
+			)
+			if test.wantErrPos >= 0 {
+				var mismatch *ScalarTypeError
+				if !errors.As(prepareErr, &mismatch) ||
+					mismatch.Position() != test.wantErrPos {
+					t.Fatalf("prepare error = %T %v, want positioned recursive mismatch", prepareErr, prepareErr)
+				}
+				return
+			}
+			if prepareErr != nil {
+				t.Fatal(prepareErr)
+			}
+			defer statement.Release()
+			schema := statement.AppendSchema(nil)
+			if len(schema) != 1 || schema[0].Representation != test.want {
+				t.Fatalf("recursive schema = %+v, want representation %d", schema, test.want)
+			}
+		})
+	}
+}
+
+func TestRecursiveSQLBridgeUntypedParameterMetadataStaysNil(t *testing.T) {
+	statement := prepareRecursiveSQLGraph(t)
+	defer statement.Release()
+	if statement.paramTypes != nil || statement.paramTypePositions != nil {
+		t.Fatalf("untyped recursive owner retained parameter sidecars: %v/%v",
+			statement.paramTypes, statement.paramTypePositions)
+	}
+	prepared := statement.cteCatalog().defs[0].recursiveDefinition
+	if prepared.anchorStmt.paramTypes != nil ||
+		prepared.recursiveStmt.paramTypes != nil {
+		t.Fatalf("untyped recursive terms retained parameter sidecars: %v/%v",
+			prepared.anchorStmt.paramTypes, prepared.recursiveStmt.paramTypes)
+	}
+}
+
+func TestRecursiveSQLBridgeUnknownTermCoercion(t *testing.T) {
+	const source = `WITH RECURSIVE walk(v) AS (
+		SELECT BOOL 't' AS v FROM seeds
+		UNION
+		SELECT ? AS v FROM walk
+	) SELECT v FROM walk ORDER BY v`
+	statement, err := PrepareRecursiveSQLStatement(
+		source, RecursiveSQLStatementOptions{Limits: RecursiveCTELimits{
+			MaxIterations: 8, MaxRows: 16, MaxBytes: -1,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	if got := statement.ParameterType(0); got != ParameterTypeBool {
+		t.Fatalf("recursive unknown parameter type = %s, want boolean", got)
+	}
+	_, snapshot := recursiveStatementDatabase(t, nil)
+	var execution Exec
+	value := "f"
+	cursor, err := statement.RunInto(
+		&execution, FromDatabase(snapshot, statement.Collection()),
+		[]any{&value},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values []bool
+	for cursor.Next() {
+		value, ok := cursor.Cell(0).Bool()
+		if !ok {
+			t.Fatalf("recursive value is %v, want boolean", cursor.Cell(0).Kind())
+		}
+		values = append(values, value)
+	}
+	if want := []bool{false, true}; !reflect.DeepEqual(values, want) {
+		t.Fatalf("recursive values = %v, want %v", values, want)
+	}
+	execution.Release()
 }
 
 func TestRecursiveSQLBridgeCancellationBudgetAtomicityAndReuse(t *testing.T) {

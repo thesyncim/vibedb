@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/pginput"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -70,6 +71,11 @@ type RecursiveCTEStatementTerm struct {
 	// single arena would overwrite values that have not yet been visited.
 	owned   [2][]byte
 	current int8
+	// coercions and coerceArena exist only when recursive UNION analysis made a
+	// direct unknown output inherit the anchor's BOOL or string-category type.
+	// Ordinary recursive terms retain nil sidecars and never enter this path.
+	coercions   []setStatementColumnCoercion
+	coerceArena []byte
 }
 
 // PrepareRecursiveCTEStatementTerm validates and snapshots one Statement term.
@@ -310,7 +316,99 @@ func (t *RecursiveCTEStatementTerm) RunRecursiveCTETerm(
 	if err != nil {
 		return err
 	}
+	if err := t.coerceResult(&exec.Result, exec.Options.Cancel); err != nil {
+		return err
+	}
 	return t.ownResult(exec, cursor, exec.Options.Cancel)
+}
+
+func (t *RecursiveCTEStatementTerm) coerceResult(
+	result *Result,
+	cancel *CancelFlag,
+) error {
+	if t == nil || result == nil || len(t.coercions) == 0 {
+		return nil
+	}
+	t.coerceArena = t.coerceArena[:0]
+	visited := 0
+	for column := range result.Columns {
+		if column >= len(t.coercions) ||
+			t.coercions[column].target == OutputJSON {
+			continue
+		}
+		coercion := t.coercions[column]
+		for row := range result.Columns[column].Cells {
+			if err := cancellationCheckpoint(cancel, visited); err != nil {
+				return err
+			}
+			visited++
+			cell, err := t.coerceCell(
+				result.Columns[column].Cells[row], coercion,
+			)
+			if err != nil {
+				return err
+			}
+			result.Columns[column].Cells[row] = cell
+		}
+	}
+	return cancellationError(cancel)
+}
+
+func (t *RecursiveCTEStatementTerm) coerceCell(
+	cell Cell,
+	coercion setStatementColumnCoercion,
+) (Cell, error) {
+	if cell.kind == TypeNull {
+		return cell, nil
+	}
+	switch coercion.target {
+	case OutputSQLBool:
+		if cell.kind == TypeBool {
+			return cell, nil
+		}
+		if cell.kind != TypeString {
+			return Cell{}, &ScalarTypeError{
+				Pos: coercion.pos, Operation: "recursive UNION boolean coercion",
+				Left: cell.kind, Right: TypeBool,
+			}
+		}
+		value, ok := pginput.Boolean(cell.text)
+		if !ok {
+			return Cell{}, &ScalarInvalidTextError{
+				Pos: coercion.pos, Target: "BOOLEAN",
+			}
+		}
+		return cellFromScalar(scalar{kind: kindBool, bval: value}), nil
+	case OutputSQLText, OutputSQLVarchar, OutputSQLName, OutputSQLBPChar:
+		switch cell.kind {
+		case TypeString:
+			return cell, nil
+		case TypeBool:
+			text := "false"
+			if cell.flag&cellTrue != 0 {
+				text = "true"
+			}
+			return Cell{kind: TypeString, text: text}, nil
+		case TypeNumber:
+			raw := cell.raw
+			if len(raw) == 0 {
+				start := len(t.coerceArena)
+				t.coerceArena = cell.AppendJSON(t.coerceArena)
+				raw = t.coerceArena[start:len(t.coerceArena):len(t.coerceArena)]
+			}
+			return Cell{kind: TypeString, text: byteview.String(raw)}, nil
+		default:
+			return Cell{}, &ScalarTypeError{
+				Pos: coercion.pos, Operation: "recursive UNION text coercion",
+				Left: cell.kind, Right: TypeString,
+			}
+		}
+	default:
+		return Cell{}, fmt.Errorf(
+			"query: recursive UNION has invalid coercion target %d: %w",
+			coercion.target, ErrRecursiveCTEStatement,
+		)
+	}
 }
 
 func (t *RecursiveCTEStatementTerm) ownResult(
@@ -464,6 +562,8 @@ func (t *RecursiveCTEStatementTerm) Release() {
 	t.frame = nil
 	t.binding = statementRecursiveBinding{}
 	t.owned = [2][]byte{}
+	t.coercions = nil
+	t.coerceArena = nil
 	t.current = -1
 	t.active.Store(false)
 }
