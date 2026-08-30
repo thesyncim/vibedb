@@ -44,6 +44,9 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 			`) SELECT * FROM outer_cte`},
 		{"grouped aggregate", benchGrouped},
 		{"output positions", `SELECT id, score + 1 FROM documents ORDER BY 2 DESC, 1`},
+		{"PostgreSQL casts", `SELECT amount::numeric, flag::boolean::text, -score::numeric FROM documents`},
+		{"PostgreSQL comma FROM", `SELECT a.id, b.id, c.id FROM accounts a, regions b, countries c`},
+		{"PostgreSQL bare aliases", `SELECT id item_id, score total FROM documents ORDER BY item_id`},
 		{"containment and membership", benchRich},
 		{"set expression", benchSetExpression},
 		{"set output positions", `SELECT id, score FROM active UNION ALL ` +

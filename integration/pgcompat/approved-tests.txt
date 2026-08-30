@@ -1,0 +1,3 @@
+# One upstream test name per line. A listed test must remain byte-for-byte
+# equal to PostgreSQL's expected output. Add a name only after the report marks
+# it "exact"; the SQL and expected output continue to come from upstream.

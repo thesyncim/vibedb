@@ -741,15 +741,16 @@ func TestSQLPlaceholderCountIsCheckedAtBind(t *testing.T) {
 	}
 }
 
-// TestSQLColumnNames asserts the output schema: an AS alias wins, a projection
-// takes its engine path spelling, and an aggregate takes the engine's header.
+// TestSQLColumnNames asserts the output schema: bare and AS aliases win, a
+// projection takes its engine path spelling, and an aggregate takes the
+// engine's header.
 func TestSQLColumnNames(t *testing.T) {
 	stmt, err := PrepareStatement(
-		`SELECT a, u.b AS bee, COUNT(*), SUM(c), MIN(u.d) FROM u GROUP BY a, u.b`)
+		`SELECT a, u.b bee, COUNT(*), SUM(c) total, MIN(u.d) AS minimum FROM u GROUP BY a, u.b`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"a", "bee", "count(*)", "sum(c)", "min(d)"}
+	want := []string{"a", "bee", "count(*)", "total", "minimum"}
 	got := stmt.Columns()
 	if len(got) != len(want) {
 		t.Fatalf("Columns() = %q, want %q", got, want)

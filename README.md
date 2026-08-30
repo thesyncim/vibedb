@@ -148,6 +148,11 @@ go test -p=1 -timeout=25m ./...
 The full CI workflow also cross-compiles 32-bit targets, runs selected race
 tests, and tests the PostgreSQL client module.
 
+The optional [PostgreSQL upstream compatibility lane](integration/pgcompat/README.md)
+runs the current-stable PostgreSQL regression corpus against the real VibeDB
+pgwire endpoint. It publishes every expected-output difference and ratchets
+tests that become byte-for-byte compatible.
+
 ## Contribute
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you change a storage contract,

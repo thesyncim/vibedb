@@ -938,13 +938,14 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 
 func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	col := ResultColumn{Pos: p.tok.pos}
+	standaloneStar := false
 	if scalarStarts(p.tok) {
 		expr, err := p.parseScalarExpression(scalarSelect)
 		if err != nil {
 			return col, err
 		}
 		col.Scalar = expr
-		alias, err := p.parseColumnAlias()
+		alias, err := p.parseColumnAlias(true)
 		if err != nil {
 			return col, err
 		}
@@ -968,6 +969,7 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 			col.Path = path
 		}
 	} else {
+		standaloneStar = p.tok.kind == tokStar
 		switch agg, head, state := p.tryAggregate(); state {
 		case aggCall:
 			path, err := p.parseAggregateArgs(agg)
@@ -1011,7 +1013,7 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		}
 		col.Agg, col.Path, col.Scalar = AggNone, nil, expr
 	}
-	alias, err := p.parseColumnAlias()
+	alias, err := p.parseColumnAlias(!standaloneStar)
 	if err != nil {
 		return col, err
 	}
@@ -1081,20 +1083,59 @@ func (p *Parser) parseAggregateArgs(agg AggKind) (*PathExpr, error) {
 	return path, nil
 }
 
-// parseColumnAlias parses an optional AS name.
-//
-// The AS is required. SQL allows a bare identifier after a column to be its
-// output name, but here that would silently rescue the far more common typo —
-// a missing comma between two projected paths — as a rename, and a schemaless
-// engine has no schema check downstream to catch it.
-func (p *Parser) parseColumnAlias() (string, error) {
+// parseColumnAlias follows PostgreSQL's target_el grammar: AS accepts any
+// identifier, while a bare alias accepts IDENT and BareColLabel. The latter is
+// an independent keyword category; it is deliberately not this dialect's
+// reserved() classification. A standalone '*' is target_el's one separate
+// production and cannot carry either spelling of alias, while alias.* remains
+// an ordinary expression and can.
+func (p *Parser) parseColumnAlias(aliasable bool) (string, error) {
+	if !aliasable {
+		if p.atKeyword(kwAs) || p.tok.kind == tokQuotedIdent ||
+			(p.tok.kind == tokIdent && !postgresAliasRequiresAS(p.tok.text)) {
+			return "", p.errHere("a standalone '*' cannot have an output alias; qualify it as range_variable.* to name the projected document")
+		}
+		return "", nil
+	}
 	if p.acceptKeyword(kwAs) {
 		return p.parseAliasName("an output name after AS")
 	}
-	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && p.tok.kw == kwNone) {
-		return "", p.errfHere("unexpected identifier %q after a column: an output name requires AS, and two paths need a comma between them", p.tok.text)
+	if p.tok.kind == tokQuotedIdent ||
+		(p.tok.kind == tokIdent && !postgresAliasRequiresAS(p.tok.text)) {
+		return p.parseAliasName("an output name")
 	}
 	return "", nil
+}
+
+// postgresAliasRequiresAS mirrors every AS_LABEL entry in PostgreSQL 18.6's
+// src/include/parser/kwlist.h. Several spellings are intentionally not lexer
+// keywords here because reserving them would break same-named JSON fields, so
+// classification uses the original token text. The fixed stack buffer and
+// switch retain the parser's zero steady-state allocation contract.
+func postgresAliasRequiresAS(name string) bool {
+	const maxASLabelLen = 9 // CHARACTER, INTERSECT, PRECISION, RETURNING
+	if len(name) == 0 || len(name) > maxASLabelLen {
+		return false
+	}
+	var folded [maxASLabelLen]byte
+	for i := range name {
+		c := name[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		folded[i] = c
+	}
+	switch string(folded[:len(name)]) {
+	case "ARRAY", "AS", "CHAR", "CHARACTER", "CREATE", "DAY", "EXCEPT",
+		"FETCH", "FILTER", "FOR", "FROM", "GRANT", "GROUP", "HAVING",
+		"HOUR", "INTERSECT", "INTO", "ISNULL", "LIMIT", "MINUTE", "MONTH",
+		"NOTNULL", "OFFSET", "ON", "ORDER", "OVER", "OVERLAPS", "PRECISION",
+		"RETURNING", "SECOND", "TO", "UNION", "VARYING", "WHERE", "WINDOW",
+		"WITH", "WITHIN", "WITHOUT", "YEAR":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Parser) hasWindowColumns() bool {
@@ -1940,9 +1981,41 @@ func (p *Parser) parseFrom() error {
 	if err != nil {
 		return err
 	}
-	p.from = append(p.from, ref)
-	p.out.From = p.from
+	if err := p.appendFromRef(ref); err != nil {
+		return err
+	}
+	// PostgreSQL's grammar gives explicit JOIN tighter binding than the comma
+	// in a from_list. The flat public AST can represent a comma after a complete
+	// joined table exactly, and a comma-only tail exactly, because both lower to
+	// the existing condition-free CROSS product. It cannot yet represent the
+	// right-hand join tree in `a, b JOIN c ON ...` without changing ON scope (or
+	// RIGHT/FULL unmatched-row multiplicity), so retain that boundary and refuse
+	// the mixed tail below rather than silently building `(a CROSS b) JOIN c`.
+	afterCommaItem := false
 	for {
+		if p.tok.kind == tokComma {
+			p.advance()
+			ref, err = p.parseTableRef(JoinCross)
+			if err != nil {
+				return err
+			}
+			if p.correlation != nil {
+				if err := p.rejectLateralForwardAlias(ref.Alias, len(p.from)); err != nil {
+					return err
+				}
+			}
+			if err := p.appendFromRef(ref); err != nil {
+				return err
+			}
+			afterCommaItem = true
+			continue
+		}
+		if afterCommaItem && p.startsExplicitJoin() {
+			return newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"an explicit JOIN after a comma-separated FROM item requires PostgreSQL's right-hand join grouping, which is not supported yet; put the joined tables in a derived SELECT or write an equivalent explicit join tree",
+			)
+		}
 		done, err := p.parseJoin()
 		if err != nil {
 			return err
@@ -1952,6 +2025,21 @@ func (p *Parser) parseFrom() error {
 			return nil
 		}
 	}
+}
+
+func (p *Parser) startsExplicitJoin() bool {
+	return p.atKeyword(kwJoin) || p.atKeyword(kwInner) ||
+		p.atKeyword(kwLeft) || p.atKeyword(kwRight) ||
+		p.atKeyword(kwFull) || p.atKeyword(kwCross)
+}
+
+func (p *Parser) appendFromRef(ref TableRef) error {
+	p.from = append(p.from, ref)
+	p.out.From = p.from
+	if len(p.from) > maxClauseItems {
+		return p.errfAt(ref.Pos, "a statement may join at most %d collections", maxClauseItems)
+	}
+	return nil
 }
 
 // parseJoin parses one JOIN clause, reporting true when the next token does not
@@ -1977,9 +2065,6 @@ func (p *Parser) parseJoin() (bool, error) {
 			p.lx.src, p.tok.pos,
 			"NATURAL JOIN is not supported: schemaless documents have no declared columns to infer faithfully; write USING explicitly or write ON explicitly",
 		)
-	}
-	if p.tok.kind == tokComma {
-		return false, p.errHere("comma-separated FROM items are not supported; write an explicit JOIN ... ON")
 	}
 	if join == JoinInner {
 		p.acceptKeyword(kwInner)
@@ -2022,12 +2107,7 @@ func (p *Parser) parseJoin() (bool, error) {
 		return false, err
 	}
 	ref.On = cond
-	p.from = append(p.from, ref)
-	p.out.From = p.from
-	if len(p.from) > maxClauseItems {
-		return false, p.errfAt(ref.Pos, "a statement may join at most %d collections", maxClauseItems)
-	}
-	return false, nil
+	return false, p.appendFromRef(ref)
 }
 
 // parseJoinCondWithCurrent exposes the relation currently being joined while

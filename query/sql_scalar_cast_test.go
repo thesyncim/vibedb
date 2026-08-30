@@ -398,9 +398,40 @@ func TestSQLScalarCastPreparedWarmZeroAlloc(t *testing.T) {
 	}
 }
 
+func TestSQLPostgreSQLCastPreparedWarmZeroAlloc(t *testing.T) {
+	segment := mustSegment(t, `{"n":"001.2500e2","b":"ON","j":"\"a\\nb\""}`)
+	statement, err := PrepareStatement(
+		`SELECT n::DECIMAL, b::BOOL, j::JSON, -'1'::NUMERIC FROM docs`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exec Exec
+	run := func() {
+		cursor, runErr := statement.RunInto(&exec, FromSegment(segment), nil)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		if !cursor.Next() {
+			t.Fatal("missing warmed :: result")
+		}
+		if !equalBytes(cursor.Cell(0).JSON(), castWarmNumber) ||
+			!equalBytes(cursor.Cell(1).JSON(), trueBytes) ||
+			!equalBytes(cursor.Cell(2).JSON(), castWarmJSON) ||
+			!equalBytes(cursor.Cell(3).JSON(), castWarmNegative) || cursor.Next() {
+			t.Fatal("unexpected warmed :: result")
+		}
+	}
+	run()
+	if allocs := testing.AllocsPerRun(100, run); allocs != 0 {
+		t.Fatalf("warmed :: statement allocated %.2f/run", allocs)
+	}
+}
+
 var (
-	castWarmNumber = []byte("1.25e2")
-	castWarmJSON   = []byte(`"a\nb"`)
+	castWarmNumber   = []byte("1.25e2")
+	castWarmJSON     = []byte(`"a\nb"`)
+	castWarmNegative = []byte("-1")
 )
 
 func BenchmarkSQLScalarCastWarm(b *testing.B) {

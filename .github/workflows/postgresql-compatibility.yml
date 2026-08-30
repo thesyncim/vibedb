@@ -1,0 +1,67 @@
+name: PostgreSQL upstream compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Upstream corpus breadth
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - smoke
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgresql-compatibility-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  upstream-regression:
+    name: PostgreSQL 18.6 regression corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Run pinned upstream PostgreSQL suite
+        shell: bash
+        env:
+          VIBEDB_PG_CORPUS_DIR: ${{ runner.temp }}/postgresql-18.6-source
+        run: |
+          set -euo pipefail
+          source integration/pgcompat/postgres.env
+          suite='full'
+          if [[ '${{ github.event_name }}' == 'workflow_dispatch' ]]; then
+            suite='${{ inputs.suite }}'
+          fi
+          VIBEDB_PSQL_IMAGE="${PSQL_IMAGE}" integration/pgcompat/run-postgres-regression.sh \
+            --suite "${suite}" \
+            --per-test-timeout 30 \
+            --output "${RUNNER_TEMP}/postgresql-compatibility"
+      - name: Publish compatibility summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$(find "${RUNNER_TEMP}/postgresql-compatibility" -name report.md -type f -print -quit 2>/dev/null || true)"
+          if [[ -n "${report}" ]]; then
+            cat "${report}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            printf 'No PostgreSQL compatibility report was produced.\n' >> "${GITHUB_STEP_SUMMARY}"
+          fi
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgresql-18.6-compatibility-${{ github.sha }}
+          path: ${{ runner.temp }}/postgresql-compatibility
+          if-no-files-found: error
+          retention-days: 30

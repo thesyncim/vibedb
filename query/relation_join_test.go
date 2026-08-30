@@ -101,6 +101,7 @@ func TestRelationJoinSelectorPreservesLegacyFastPath(t *testing.T) {
 		{"nullable where", `SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.k IS NULL`, true},
 		{"composite", `SELECT a.k FROM a JOIN b ON a.k = b.k AND a.zone = b.zone`, true},
 		{"cross", `SELECT a.k FROM a CROSS JOIN b`, true},
+		{"comma cross", `SELECT a.k FROM a, b`, true},
 		{"right", `SELECT a.k FROM a RIGHT JOIN b ON a.k = b.k`, true},
 		{"derived", `SELECT d.k FROM (SELECT k FROM a) d JOIN b ON d.k = b.k`, true},
 		{"cte", `WITH d AS (SELECT k FROM a) SELECT d.k FROM d JOIN b ON d.k = b.k`, true},
@@ -242,6 +243,10 @@ func TestRelationJoinCrossDerivedAndCTEOperands(t *testing.T) {
 	_, _, got := runRelationJoinSQL(t, db, `SELECT COUNT(*) FROM a CROSS JOIN b`)
 	if len(got) != 1 || got[0] != "9" {
 		t.Fatalf("CROSS count = %q, want 9", got)
+	}
+	_, _, comma := runRelationJoinSQL(t, db, `SELECT COUNT(*) FROM a, b`)
+	if strings.Join(comma, "\n") != strings.Join(got, "\n") {
+		t.Fatalf("comma FROM count = %q, want explicit CROSS JOIN result %q", comma, got)
 	}
 
 	for _, src := range []string{
@@ -625,7 +630,7 @@ func TestRelationJoinWarmExecutionAllocations(t *testing.T) {
 	db := relationJoinDatabase(t)
 	for _, src := range []string{
 		`SELECT k, a.label, b.label FROM a FULL JOIN b USING (k) ORDER BY k, a.label, b.label`,
-		`SELECT COUNT(*) FROM a CROSS JOIN b`,
+		`SELECT COUNT(*) FROM a, b`,
 	} {
 		statement, err := PrepareStatement(src)
 		if err != nil {
