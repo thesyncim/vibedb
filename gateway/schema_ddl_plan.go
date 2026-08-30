@@ -190,8 +190,9 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 // ReconcileAppliedReplicatedSchemaDDLCatalog repairs the narrow publication
 // cut where every shard descriptor already names the retained target, while
 // the portable index/declaration metadata is still the source view. It returns
-// matched=false for an ordinary source-generation rollout. No replica action
-// is produced: all RF3 target generations and manifests must already match.
+// matched=false for an ordinary source-generation rollout. The returned plans
+// reconstruct the exact already-applied replica cuts for terminal drain; they
+// never authorize another activation.
 func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32]byte,
 	table, sql string, builds []SchemaDDLReplicaBuild,
 ) (*Snapshot, []SchemaRolloutReplicaPlan, bool, error) {

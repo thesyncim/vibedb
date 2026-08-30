@@ -258,7 +258,7 @@ func TestSchemaDDLPlanReconcilesAppliedDescriptorsWithMissingPortableMetadata(t 
 	reconciled, plans, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
 		partial, [32]byte{9}, "messages", sql, builds,
 	)
-	if err != nil || !matched || len(plans) != ServingReplicaCount || reconciled.Generation() != partial.Generation()+1 ||
+	if err != nil || !matched || len(plans) != len(builds) || reconciled.Generation() != partial.Generation()+1 ||
 		len(reconciled.indexDescriptors()) != 1 || reconciled.indexDescriptors()[0].Name != "by_city" ||
 		!reflect.DeepEqual(reconciled.replicatedDescriptors(), partial.replicatedDescriptors()) ||
 		!reflect.DeepEqual(reconciled.replicatedTableProfiles(), partial.replicatedTableProfiles()) {
@@ -278,7 +278,7 @@ func TestSchemaDDLPlanReconcilesAppliedDescriptorsWithMissingPortableMetadata(t 
 	already, plans, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
 		reconciled, [32]byte{9}, "messages", sql, builds,
 	)
-	if err != nil || !matched || already != reconciled || len(plans) != ServingReplicaCount {
+	if err != nil || !matched || already != reconciled || len(plans) != len(builds) {
 		t.Fatalf("exact recovered request was not idempotent: plans=%d matched=%t same=%t err=%v", len(plans), matched, already == reconciled, err)
 	}
 	tables := replicatedTableInfos(reconciled, reconciled.ReplicatedTableProfiles())
