@@ -136,8 +136,14 @@ func (r *gatewaySchemaDDLRuntime) drainProof(ctx context.Context, result gateway
 			return schemainstall.DrainProof{}, err
 		}
 		drain := observed.Status.Drain
-		if drain.State != routegate.DrainActive || drain.Identity != gate.identity ||
-			drain.Binding != gate.binding || drain.Epoch != gate.epoch || observed.Status.ActivePins != 0 {
+		activeCut := drain.State == routegate.DrainActive && observed.Status.ActivePins == 0
+		// Older coordinators could durably release this exact operation's gate
+		// after catalog recovery but before sending the predecessor-drain RPC.
+		// DrainReleased is still a stronger cut: release was admitted only with
+		// zero old-epoch pins, and subsequent pins belong to the target epoch.
+		releasedCut := drain.State == routegate.DrainReleased && observed.Status.Epoch > drain.Epoch
+		if (!activeCut && !releasedCut) || drain.Identity != gate.identity ||
+			drain.Binding != gate.binding || drain.Epoch != gate.epoch {
 			return schemainstall.DrainProof{}, gateway.ErrSchemaRolloutConflict
 		}
 		group := gate.route.Group
@@ -315,17 +321,17 @@ func gatewayTableDropOperation(snapshot *gateway.Snapshot, table string) ([32]by
 // names—authenticate the SQL and exact source schema.
 func (r *gatewaySchemaDDLRuntime) retainedOperation(ctx context.Context,
 	descriptors []gateway.ReplicatedShardDescriptor, sql string, current [32]byte,
-) ([32]byte, error) {
+) ([32]byte, bool, error) {
 	entries, err := os.ReadDir(r.journal)
 	if os.IsNotExist(err) {
-		return current, nil
+		return current, false, nil
 	}
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, false, err
 	}
 	const maxRetainedSchemaOperations = 4096
 	if len(entries) > maxRetainedSchemaOperations {
-		return [32]byte{}, gateway.ErrSchemaRolloutConflict
+		return [32]byte{}, false, gateway.ErrSchemaRolloutConflict
 	}
 	selected := current
 	for _, entry := range entries {
@@ -341,16 +347,33 @@ func (r *gatewaySchemaDDLRuntime) retainedOperation(ctx context.Context,
 		if candidate == ([32]byte{}) || candidate == current {
 			continue
 		}
+		if r.authority != nil {
+			record, recordErr := r.authority.ReadOperation(ctx, candidate)
+			if recordErr == nil && record.Kind == gateway.ReplicatedOperationSchema &&
+				record.State == gateway.ReplicatedOperationComplete {
+				retainedSQL, recoveryErr := r.recoverySQL(ctx, descriptors, candidate)
+				if recoveryErr == nil && retainedSQL == sql {
+					// This is an exact retry of a durably completed operation, not a
+					// new duplicate DDL request. Return terminal success without remote
+					// shadow work or rebinding it to historical cleanup authority.
+					return candidate, true, nil
+				}
+				continue
+			}
+			if recordErr != nil && !errors.Is(recordErr, gateway.ErrReplicatedOperationMissing) {
+				return [32]byte{}, false, recordErr
+			}
+		}
 		retainedSQL, recoveryErr := r.recoverySQL(ctx, descriptors, candidate)
 		if recoveryErr != nil || retainedSQL != sql {
 			continue
 		}
 		if selected != current && selected != candidate {
-			return [32]byte{}, gateway.ErrSchemaRolloutConflict
+			return [32]byte{}, false, gateway.ErrSchemaRolloutConflict
 		}
 		selected = candidate
 	}
-	return selected, nil
+	return selected, false, nil
 }
 
 func gatewaySchemaDDLGateIdentity(operation [32]byte, group raftmember.GroupKey) (routegate.Identity, routegate.Binding) {
@@ -562,7 +585,8 @@ func (r *gatewaySchemaDDLRuntime) Recover(ctx context.Context) error {
 		}
 		if record.Kind != gateway.ReplicatedOperationSchema ||
 			(record.State != gateway.ReplicatedOperationPlanned &&
-				record.State != gateway.ReplicatedOperationRunning) {
+				record.State != gateway.ReplicatedOperationRunning &&
+				record.State != gateway.ReplicatedOperationComplete) {
 			continue
 		}
 		current, readErr := r.authority.Read(ctx)
@@ -571,6 +595,13 @@ func (r *gatewaySchemaDDLRuntime) Recover(ctx context.Context) error {
 		}
 		sql, findErr := r.recoverySQL(ctx, current.ReplicatedShardDescriptors(), operation)
 		if findErr != nil {
+			// A completed rollout whose drained artifacts were already reclaimed
+			// has no remaining recovery work. Planned/running operations still
+			// require a complete authenticated RF3 receipt set and fail closed.
+			if record.State == gateway.ReplicatedOperationComplete &&
+				errors.Is(findErr, schemainstall.ErrMissing) {
+				continue
+			}
 			return fmt.Errorf("recover schema operation %x: %w", operation, findErr)
 		}
 		table, resolveErr := gateway.ResolveReplicatedSchemaDDLTable(current, sql)
@@ -581,7 +612,17 @@ func (r *gatewaySchemaDDLRuntime) Recover(ctx context.Context) error {
 			return fmt.Errorf("recover schema operation %x SQL binding: %w",
 				operation, errors.Join(resolveErr, operationErr, legacyJournalErr, gateway.ErrSchemaRolloutConflict))
 		}
-		if executeErr := r.Execute(ctx, sql); executeErr != nil {
+		if executeErr := r.execute(ctx, sql, operation); executeErr != nil {
+			// A completed historical operation can be superseded by a later
+			// schema generation on the same group. Its catalog effect is already
+			// durable, while the newer exact gate/installer state is the only
+			// cleanup authority. Do not block serving by trying to reconstruct an
+			// obsolete predecessor proof; current or nonterminal operations still
+			// fail closed above and below.
+			if record.State == gateway.ReplicatedOperationComplete &&
+				errors.Is(executeErr, gateway.ErrSchemaRolloutConflict) {
+				continue
+			}
 			return fmt.Errorf("resume schema operation %x: %w", operation, executeErr)
 		}
 	}
@@ -696,7 +737,78 @@ func (r *gatewaySchemaDDLRuntime) recoverySQL(ctx context.Context,
 	return retained, nil
 }
 
-func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resultErr error) {
+func (r *gatewaySchemaDDLRuntime) recoveredSchemaGates(ctx context.Context, operation [32]byte,
+	plans []gateway.SchemaRolloutReplicaPlan,
+) ([]gatewaySchemaDDLGate, *gateway.Snapshot, error) {
+	latest, err := r.authority.Read(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	wanted := make(map[raftmember.GroupKey]struct{}, len(plans)/gateway.ServingReplicaCount)
+	for _, plan := range plans {
+		wanted[plan.Request.Group] = struct{}{}
+	}
+	gates := make([]gatewaySchemaDDLGate, 0, len(wanted))
+	for _, descriptor := range latest.ReplicatedShardDescriptors() {
+		if _, found := wanted[descriptor.Group]; !found {
+			continue
+		}
+		var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		route, found := latest.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, replicas[:0])
+		if !found || route.Group != descriptor.Group {
+			return nil, nil, gateway.ErrReplicatedRoute
+		}
+		observed, readErr := r.executor.ReadRouteGate(ctx, route, 1)
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		identity, binding := gatewaySchemaDDLGateIdentity(operation, route.Group)
+		drain := observed.Status.Drain
+		activeCut := drain.State == routegate.DrainActive && observed.Status.ActivePins == 0
+		releasedCut := drain.State == routegate.DrainReleased && observed.Status.Epoch > drain.Epoch
+		if (!activeCut && !releasedCut) || drain.Identity != identity || drain.Binding != binding {
+			return nil, nil, gateway.ErrSchemaRolloutConflict
+		}
+		gates = append(gates, gatewaySchemaDDLGate{route: route, identity: identity,
+			binding: binding, epoch: drain.Epoch, applied: observed.Applied})
+		delete(wanted, descriptor.Group)
+	}
+	if len(wanted) != 0 || len(gates) == 0 {
+		return nil, nil, gateway.ErrSchemaRolloutConflict
+	}
+	return gates, latest, nil
+}
+
+func (r *gatewaySchemaDDLRuntime) finishRecoveredSchemaRollout(ctx context.Context, operation [32]byte,
+	controller *gateway.SchemaRolloutController, result gateway.SchemaRolloutResult,
+	plans []gateway.SchemaRolloutReplicaPlan,
+) error {
+	gates, latest, err := r.recoveredSchemaGates(ctx, operation, plans)
+	if err != nil {
+		return fmt.Errorf("recover schema drain gates: %w", err)
+	}
+	proof, err := r.drainProof(ctx, result, gates, plans)
+	if err != nil {
+		return fmt.Errorf("certify recovered schema drain: %w", err)
+	}
+	if err = controller.Drain(ctx, plans, result.Authorization, proof); err != nil {
+		return fmt.Errorf("drain recovered schema predecessors: %w", err)
+	}
+	for index := len(gates) - 1; index >= 0; index-- {
+		if err = r.releaseGate(ctx, operation, gates[index], latest); err != nil {
+			return fmt.Errorf("release recovered schema route gate: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) error {
+	return r.execute(ctx, sql, [32]byte{})
+}
+
+func (r *gatewaySchemaDDLRuntime) execute(ctx context.Context, sql string,
+	forcedOperation [32]byte,
+) (resultErr error) {
 	if r == nil || ctx == nil {
 		return gateway.ErrSchemaRollout
 	}
@@ -726,9 +838,17 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 	if err != nil {
 		return fmt.Errorf("derive schema operation: %w", err)
 	}
-	operation, err = r.retainedOperation(ctx, descriptors, sql, operation)
-	if err != nil {
-		return fmt.Errorf("resolve retained schema operation: %w", err)
+	if forcedOperation != ([32]byte{}) {
+		operation = forcedOperation
+	} else {
+		var terminal bool
+		operation, terminal, err = r.retainedOperation(ctx, descriptors, sql, operation)
+		if err != nil {
+			return fmt.Errorf("resolve retained schema operation: %w", err)
+		}
+		if terminal {
+			return nil
+		}
 	}
 	var gates []gatewaySchemaDDLGate
 	defer func() {
@@ -759,12 +879,14 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 		}
 	}()
 	existing, operationErr := r.authority.ReadOperation(ctx, operation)
-	recovering := operationErr == nil && existing.Kind == gateway.ReplicatedOperationSchema &&
+	completedRecovery := operationErr == nil && existing.Kind == gateway.ReplicatedOperationSchema &&
+		existing.State == gateway.ReplicatedOperationComplete
+	recovering := completedRecovery || operationErr == nil && existing.Kind == gateway.ReplicatedOperationSchema &&
 		existing.State == gateway.ReplicatedOperationRunning
 	if operationErr != nil && !errors.Is(operationErr, gateway.ErrReplicatedOperationMissing) {
 		return fmt.Errorf("read durable schema operation: %w", operationErr)
 	}
-	if !recovering {
+	if !recovering && !completedRecovery {
 		_, statErr := os.Stat(filepath.Join(r.journal, hex.EncodeToString(operation[:])))
 		recovering = statErr == nil
 		if statErr != nil && !os.IsNotExist(statErr) {
@@ -781,6 +903,7 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 	// through to the ordinary gated recovery path.
 	if recovering {
 		allActive := true
+		anyActive := false
 		matched := 0
 		resumed := make([]gateway.SchemaDDLReplicaBuild, 0, gateway.ServingReplicaCount)
 		for _, descriptor := range descriptors {
@@ -807,7 +930,8 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 					!sourceMatch && !targetMatch {
 					return fmt.Errorf("%w: resumed schema build member %d differs", gateway.ErrSchemaRolloutConflict, replica.Member)
 				}
-				allActive = allActive && active
+				anyActive = anyActive || active
+				allActive = allActive && (active || completedRecovery)
 				resumed = append(resumed, gateway.SchemaDDLReplicaBuild{Node: replica.Node,
 					Member: replica.Member, Request: request, Target: replicaTarget})
 			}
@@ -816,46 +940,35 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 			}
 		}
 		if allActive && matched != 0 {
-			reconciled, applied, reconcileErr := gateway.ReconcileAppliedReplicatedSchemaDDLCatalog(
+			reconciled, reconciledPlans, applied, reconcileErr := gateway.ReconcileAppliedReplicatedSchemaDDLCatalog(
 				current, operation, table, sql, resumed,
 			)
 			if reconcileErr != nil {
 				return fmt.Errorf("reconcile applied schema catalog: %w", reconcileErr)
 			}
 			if applied {
-				for reconciled != current {
-					publishErr := r.authority.Publish(ctx, current.Generation(), reconciled)
-					if !errors.Is(publishErr, gateway.ErrReplicatedCatalogPending) {
-						if publishErr != nil {
-							return fmt.Errorf("publish reconciled schema catalog: %w", publishErr)
-						}
-						break
-					}
-					if retryErr := r.authority.RetryPending(ctx); retryErr != nil &&
-						!errors.Is(retryErr, gateway.ErrReplicatedCatalogPending) {
-						return errors.Join(publishErr, retryErr)
-					}
-					if ctx.Err() != nil {
-						return errors.Join(publishErr, context.Cause(ctx))
-					}
+				if completedRecovery && !anyActive {
+					return nil
 				}
-				latest, readErr := r.authority.Read(ctx)
-				if readErr != nil {
-					return readErr
+				controller, controllerErr := gateway.NewSchemaRolloutController(gateway.SchemaRolloutControllerOptions{
+					Authority: r.authority, Client: r.client, MaxConcurrent: 16,
+				})
+				if controllerErr != nil {
+					return controllerErr
 				}
-				for _, descriptor := range descriptors {
-					if descriptor.Distribution != placement.Distribution {
-						continue
-					}
-					identity, binding := gatewaySchemaDDLGateIdentity(operation, descriptor.Group)
-					gate := gatewaySchemaDDLGate{route: gateway.ReplicatedRoute{
-						Distribution: descriptor.Distribution, Shard: descriptor.Shard, Group: descriptor.Group,
-					}, identity: identity, binding: binding}
-					if releaseErr := r.releaseGate(ctx, operation, gate, latest); releaseErr != nil {
-						return releaseErr
-					}
+				var result gateway.SchemaRolloutResult
+				if completedRecovery {
+					result, controllerErr = gateway.ResumeCompletedSchemaRollout(existing)
+				} else {
+					result, controllerErr = controller.Execute(ctx, operation, reconciled, reconciledPlans)
 				}
-				return nil
+				if controllerErr != nil {
+					return fmt.Errorf("complete reconciled schema plan: %w", controllerErr)
+				}
+				return r.finishRecoveredSchemaRollout(ctx, operation, controller, result, reconciledPlans)
+			}
+			if completedRecovery {
+				return gateway.ErrSchemaRolloutConflict
 			}
 			target, plans, planErr := gateway.BuildReplicatedSchemaDDLPlan(current, operation, table, sql, resumed)
 			if planErr != nil {
@@ -867,27 +980,11 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 			if controllerErr != nil {
 				return controllerErr
 			}
-			_, controllerErr = controller.Execute(ctx, operation, target, plans)
+			result, controllerErr := controller.Execute(ctx, operation, target, plans)
 			if controllerErr != nil {
 				return fmt.Errorf("publish completed schema plan: %w", controllerErr)
 			}
-			latest, readErr := r.authority.Read(ctx)
-			if readErr != nil {
-				return readErr
-			}
-			for _, descriptor := range descriptors {
-				if descriptor.Distribution != placement.Distribution {
-					continue
-				}
-				identity, binding := gatewaySchemaDDLGateIdentity(operation, descriptor.Group)
-				gate := gatewaySchemaDDLGate{route: gateway.ReplicatedRoute{
-					Distribution: descriptor.Distribution, Shard: descriptor.Shard, Group: descriptor.Group,
-				}, identity: identity, binding: binding}
-				if releaseErr := r.releaseGate(ctx, operation, gate, latest); releaseErr != nil {
-					return releaseErr
-				}
-			}
-			return nil
+			return r.finishRecoveredSchemaRollout(ctx, operation, controller, result, plans)
 		}
 	}
 	if !recovering {

@@ -255,23 +255,31 @@ func TestSchemaDDLPlanReconcilesAppliedDescriptorsWithMissingPortableMetadata(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	reconciled, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
+	reconciled, plans, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
 		partial, [32]byte{9}, "messages", sql, builds,
 	)
-	if err != nil || !matched || reconciled.Generation() != partial.Generation()+1 ||
+	if err != nil || !matched || len(plans) != ServingReplicaCount || reconciled.Generation() != partial.Generation()+1 ||
 		len(reconciled.indexDescriptors()) != 1 || reconciled.indexDescriptors()[0].Name != "by_city" ||
 		!reflect.DeepEqual(reconciled.replicatedDescriptors(), partial.replicatedDescriptors()) ||
 		!reflect.DeepEqual(reconciled.replicatedTableProfiles(), partial.replicatedTableProfiles()) {
-		t.Fatalf("reconcile matched=%t err=%v indexes=%+v", matched, err, reconciled.indexDescriptors())
+		t.Fatalf("reconcile plans=%d matched=%t err=%v indexes=%+v", len(plans), matched, err, reconciled.indexDescriptors())
 	}
-	if _, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(base, [32]byte{9}, "messages", sql, builds); err != nil || matched {
+	for _, plan := range plans {
+		if plan.Request.Operation != ([32]byte{9}) ||
+			plan.Request.FromSchemaGeneration+1 != plan.Request.ToSchemaGeneration ||
+			plan.Request.ToRelationManifestDigest == ([32]byte{}) ||
+			len(plan.Bundle) == 0 || uint64(len(plan.Bundle)) != plan.Request.BundleBytes {
+			t.Fatalf("recovery plan does not retain the exact source/target cut: %+v", plan)
+		}
+	}
+	if _, _, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(base, [32]byte{9}, "messages", sql, builds); err != nil || matched {
 		t.Fatalf("ordinary source rollout treated as repair: matched=%t err=%v", matched, err)
 	}
-	already, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
+	already, plans, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
 		reconciled, [32]byte{9}, "messages", sql, builds,
 	)
-	if err != nil || !matched || already != reconciled {
-		t.Fatalf("exact recovered request was not idempotent: matched=%t same=%t err=%v", matched, already == reconciled, err)
+	if err != nil || !matched || already != reconciled || len(plans) != ServingReplicaCount {
+		t.Fatalf("exact recovered request was not idempotent: plans=%d matched=%t same=%t err=%v", len(plans), matched, already == reconciled, err)
 	}
 	tables := replicatedTableInfos(reconciled, reconciled.ReplicatedTableProfiles())
 	if len(tables) != 1 || len(tables[0].Indexes) != 1 || tables[0].Indexes[0].Name != "by_city" ||

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,6 +177,15 @@ func TestSchemaRolloutControllerActivatesEveryReplicaBeforeCatalogCAS(t *testing
 		client.activated.Load() != uint64(len(plans)) {
 		t.Fatalf("result=%+v counts=%d/%d/%d err=%v", result,
 			client.prepared.Load(), client.authorized.Load(), client.activated.Load(), err)
+	}
+	resumed, resumeErr := ResumeCompletedSchemaRollout(result.Record)
+	if resumeErr != nil || !reflect.DeepEqual(resumed, result) {
+		t.Fatalf("resumed completed rollout=%+v err=%v", resumed, resumeErr)
+	}
+	running := result.Record
+	running.State = ReplicatedOperationRunning
+	if _, resumeErr = ResumeCompletedSchemaRollout(running); !errors.Is(resumeErr, ErrSchemaRolloutConflict) {
+		t.Fatalf("running rollout authorized predecessor drain: %v", resumeErr)
 	}
 	installed, err := authority.Read(context.Background())
 	if err != nil || installed.Generation() != target.Generation() {

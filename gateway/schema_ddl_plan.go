@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -193,18 +194,22 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 // is produced: all RF3 target generations and manifests must already match.
 func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32]byte,
 	table, sql string, builds []SchemaDDLReplicaBuild,
-) (*Snapshot, bool, error) {
+) (*Snapshot, []SchemaRolloutReplicaPlan, bool, error) {
 	if current == nil || current.Generation() == math.MaxUint64 || operation == ([32]byte{}) ||
 		len(sql) == 0 || len(sql) > sqldriver.ReplicatedChildSchemaMaxBytes {
-		return nil, false, ErrSchemaRollout
+		return nil, nil, false, ErrSchemaRollout
 	}
 	state, err := initialCatalogState(current)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	placement, found := state.Placement(table)
 	if !found {
-		return nil, false, sqldriver.ErrTableNotFound
+		return nil, nil, false, sqldriver.ErrTableNotFound
+	}
+	statement, err := sqlast.ParseStatement(sql)
+	if err != nil {
+		return nil, nil, false, err
 	}
 	descriptors, profiles := state.replicatedDescriptors(), state.replicatedTableProfiles()
 	type replicaKey struct {
@@ -221,30 +226,33 @@ func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32
 		}
 	}
 	if len(want) == 0 || len(builds) != len(want) {
-		return nil, false, ErrSchemaRollout
+		return nil, nil, false, ErrSchemaRollout
 	}
 	// A single ordinary source descriptor means this is not the repair cut.
 	for _, build := range builds {
 		i, ok := want[replicaKey{build.Request.Group, build.Node, build.Member}]
 		if !ok {
-			return nil, false, ErrSchemaRollout
+			return nil, nil, false, ErrSchemaRollout
 		}
 		if build.Request.FromSchemaGeneration == descriptors[i].Command.SchemaGeneration {
-			return nil, false, nil
+			return nil, nil, false, nil
 		}
 	}
 	indexes, indexNoOp, err := schemaDDLPlanIndexes(state, table, sql)
-	alreadyCataloged := errors.Is(err, sqldriver.ErrIndexExists)
+	alreadyCataloged := statement.Kind == sqlast.KindCreateIndex && errors.Is(err, sqldriver.ErrIndexExists) ||
+		statement.Kind == sqlast.KindDropIndex && errors.Is(err, sqldriver.ErrIndexNotFound)
 	if alreadyCataloged {
 		indexes = state.indexDescriptors()
 		err = nil
 	}
 	if err != nil {
-		return nil, true, err
+		return nil, nil, true, err
 	}
 	declarations, declarationNoOp, err := schemaDDLPlanDeclarations(state, table, sql)
-	if err != nil || indexNoOp || declarationNoOp {
-		return nil, true, errors.Join(err, ErrSchemaRolloutConflict)
+	alreadyCataloged = alreadyCataloged || statement.Kind == sqlast.KindAlterTable && declarationNoOp ||
+		statement.Kind == sqlast.KindTruncate
+	if err != nil || indexNoOp || declarationNoOp && !alreadyCataloged {
+		return nil, nil, true, errors.Join(err, ErrSchemaRolloutConflict)
 	}
 	var sourceProfile ReplicatedTableProfile
 	for _, profile := range profiles {
@@ -254,9 +262,10 @@ func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32
 		}
 	}
 	if sourceProfile.Table == "" {
-		return nil, true, ErrSchemaRollout
+		return nil, nil, true, ErrSchemaRollout
 	}
 	seen := make(map[replicaKey]bool, len(builds))
+	plans := make([]SchemaRolloutReplicaPlan, 0, len(builds))
 	sqlDigest := sha256.Sum256([]byte(sql))
 	var logical replication.Digest
 	for _, build := range builds {
@@ -264,7 +273,7 @@ func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32
 		key := replicaKey{r.Group, build.Node, build.Member}
 		i, ok := want[key]
 		if !ok || seen[key] {
-			return nil, true, ErrSchemaRollout
+			return nil, nil, true, ErrSchemaRollout
 		}
 		seen[key] = true
 		currentDescriptor := descriptors[i]
@@ -276,50 +285,64 @@ func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32
 			proof.Catalog.SchemaGeneration != currentDescriptor.Command.SchemaGeneration ||
 			proof.Catalog.RelationManifestDigest != currentDescriptor.Command.RelationManifestDigest ||
 			build.Target.NoOp {
-			return nil, true, errors.Join(err, ErrSchemaRolloutConflict)
+			return nil, nil, true, errors.Join(err, ErrSchemaRolloutConflict)
 		}
 		if err := sqldriver.ValidateReplicatedSchemaDDLTarget(build.Target, r.SourceApplied, r.FromSchemaGeneration); err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 		description, err := sqldriver.DescribeReplicatedSchemaCatalogImage(build.Target.Catalog)
 		if err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 		if logical != (replication.Digest{}) && logical != replication.Digest(description.LogicalSchemaDigest) {
-			return nil, true, ErrSchemaRolloutConflict
+			return nil, nil, true, ErrSchemaRolloutConflict
 		}
 		logical = replication.Digest(description.LogicalSchemaDigest)
 		expected, ok := declaredTableInfoFromDeclarations(declarations, table, sourceProfile.PrimaryKey)
 		if !ok {
-			return nil, true, ErrSchemaRollout
+			return nil, nil, true, ErrSchemaRollout
 		}
 		sourceDescriptor := currentDescriptor
 		sourceDescriptor.Command.SchemaGeneration = r.FromSchemaGeneration
 		sourceDescriptor.Command.RelationManifestDigest = r.FromRelationManifestDigest
 		if err := validateSchemaDDLDescription(state, sourceDescriptor, sourceProfile, build.Member, description, indexes, expected); err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
+		plans = append(plans, SchemaRolloutReplicaPlan{Node: build.Node, Member: build.Member,
+			Bundle: slices.Clone(build.Target.Catalog), Request: schemainstall.Request{
+				Operation: operation, Group: r.Group, AllocationGeneration: r.AllocationGeneration,
+				FromSchemaGeneration: r.FromSchemaGeneration, FromRelationManifestDigest: r.FromRelationManifestDigest,
+				ToSchemaGeneration:       build.Target.Proof.Catalog.SchemaGeneration,
+				ToRelationManifestDigest: build.Target.Proof.Catalog.RelationManifestDigest,
+				ApplyContractDigest:      build.Target.Proof.ApplyContract,
+				BundleDigest:             build.Target.Proof.Catalog.Digest, BundleBytes: build.Target.Proof.Catalog.Bytes}})
 	}
+	slices.SortFunc(plans, func(a, b SchemaRolloutReplicaPlan) int {
+		if c := compareMembershipGrantGroup(a.Request.Group, b.Request.Group); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Member, b.Member)
+	})
 	for _, profile := range profiles {
 		p, ok := state.Placement(profile.Table)
 		if !ok {
-			return nil, true, ErrSchemaRollout
+			return nil, nil, true, ErrSchemaRollout
 		}
 		if p.Distribution == placement.Distribution &&
 			(profile.SchemaGeneration == 0 || profile.LogicalSchemaDigest != logical) {
-			return nil, true, ErrSchemaRolloutConflict
+			return nil, nil, true, ErrSchemaRolloutConflict
 		}
 	}
 	if alreadyCataloged {
-		return current, true, nil
+		return current, plans, true, nil
 	}
 	target, err := NewSnapshotWithReplicatedTableMetadata(state.config, state.endpoints,
 		state.Generation()+1, indexes, state.statistics.Descriptors(), descriptors, profiles, declarations)
 	if err != nil {
-		return nil, true, err
+		return nil, nil, true, err
 	}
 	target, err = advanceCatalogState(state, target)
-	return target, true, err
+	return target, plans, true, err
 }
 
 // ResolveReplicatedSchemaDDLTable returns the one base table affected by the

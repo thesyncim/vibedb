@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +69,10 @@ func startDevDDL(ctx context.Context, cluster devClusterManifest, binary string,
 							return
 						}
 					}
+					if reloadErr := waitDevDDLReload(ctx, root, cluster.dataServeManifests); reloadErr != nil {
+						http.Error(w, reloadErr.Error(), http.StatusServiceUnavailable)
+						return
+					}
 				}
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -102,6 +108,10 @@ func startDevDDL(ctx context.Context, cluster devClusterManifest, binary string,
 					return
 				}
 			}
+			if err := waitDevDDLReload(ctx, root, cluster.dataServeManifests); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 			fragment, err := readDevFile(filepath.Join(root, "table-"+name+"-catalog.vibejson"), 4<<20)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -126,4 +136,46 @@ func startDevDDL(ctx context.Context, cluster devClusterManifest, binary string,
 		return "", nil, errors.Join(err, ctx.Err())
 	}
 	return path, stop, nil
+}
+
+// waitDevDDLReload makes the local supervisor's DDL response the durability
+// barrier for all three data processes. SIGHUP delivery alone is not an ack:
+// without this barrier, a fast DROP followed by CREATE can collapse two valid
+// group transitions into one invalid replacement across a crash or restart.
+func waitDevDDLReload(ctx context.Context, root string, manifests []string) error {
+	if ctx == nil || len(manifests) != devClusterRF3 {
+		return errDevCluster
+	}
+	deadline := time.NewTimer(90 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		complete := true
+		for index, manifestPath := range manifests {
+			raw, err := readDevFile(manifestPath, 4<<20)
+			if err != nil {
+				return err
+			}
+			want := sha256.Sum256(raw)
+			memberRoot := filepath.Join(root, fmt.Sprintf("data-member-%d", index+1))
+			inventory, inventoryErr := readDevFile(filepath.Join(memberRoot, "adopted-groups.state"), 64<<10)
+			admissions, admissionsErr := readDevFile(filepath.Join(memberRoot, "child-preparations.state"), 64<<10)
+			if inventoryErr != nil || admissionsErr != nil || len(inventory) < 40 || len(admissions) < 48 ||
+				!bytes.Equal(inventory[8:40], want[:]) || !bytes.Equal(admissions[16:48], want[:]) {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("%w: data members did not durably acknowledge DDL reload", errDevCluster)
+		case <-ticker.C:
+		}
+	}
 }

@@ -173,12 +173,12 @@ func TestGatewaySchemaDDLSelectsAuthenticatedRetainedOperation(t *testing.T) {
 	}
 	runtime := &gatewaySchemaDDLRuntime{journal: journal, resumer: resume}
 	current := [32]byte{99}
-	selected, err := runtime.retainedOperation(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, sql, current)
-	if err != nil || selected != operation {
-		t.Fatalf("selected=%x want=%x err=%v", selected, operation, err)
+	selected, terminal, err := runtime.retainedOperation(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, sql, current)
+	if err != nil || terminal || selected != operation {
+		t.Fatalf("selected=%x terminal=%t want=%x err=%v", selected, terminal, operation, err)
 	}
-	selected, err = runtime.retainedOperation(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, "TRUNCATE documents", current)
-	if err != nil || selected != current {
-		t.Fatalf("foreign SQL selected retained operation: %x %v", selected, err)
+	selected, terminal, err = runtime.retainedOperation(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, "TRUNCATE documents", current)
+	if err != nil || terminal || selected != current {
+		t.Fatalf("foreign SQL selected retained operation: %x terminal=%t %v", selected, terminal, err)
 	}
 }

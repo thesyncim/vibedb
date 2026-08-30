@@ -119,6 +119,66 @@ func TestAuthenticatedControlServiceLifecycle(t *testing.T) {
 	}
 }
 
+func TestClientDrainRetryAcceptsAlreadyDrainedExactOperation(t *testing.T) {
+	installer, journal, backend := openTestInstaller(t, t.TempDir(), newTestActivator(), 4)
+	defer journal.Close()
+	defer backend.Close()
+	request, authorization, proof, bundle := schemaFixture(42)
+	peer := rafttransport.PeerIdentity{Node: [16]byte{9}, TrustDomain: rafttransport.TrustDomain{
+		ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation}}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	service, err := NewControlService(ControlOptions{Installer: installer,
+		Authorize: func(identity rafttransport.PeerIdentity, got Request, _ Command) bool {
+			return identity == peer && got == request
+		}, ReadDeadline: deadline, WriteDeadline: deadline, MaxBundleBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opener := buildTestOpener(func(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+		client, server := net.Pipe()
+		go func() { _ = service.Serve(context.Background(), &schemaPeerConnection{Conn: server, identity: peer}) }()
+		return &schemaPeerConnection{Conn: client, identity: peer}, nil
+	})
+	client, err := NewClient(ClientOptions{Opener: opener, ReadDeadline: deadline, WriteDeadline: deadline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.Prepare(t.Context(), peer.Node, request, bundle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.Authorize(t.Context(), peer.Node, request, authorization); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.Activate(t.Context(), peer.Node, request, authorization); err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.Drain(t.Context(), peer.Node, request, authorization, proof)
+	if err != nil || first.State != StateDrained || first.DrainProof != proof {
+		t.Fatalf("first drain=%+v err=%v", first, err)
+	}
+	later := proof
+	later.ReleasedExecutionPinRoot[0]++
+	replayed, err := client.Drain(t.Context(), peer.Node, request, authorization, later)
+	if err != nil || replayed != first {
+		t.Fatalf("terminal retry=%+v want=%+v err=%v", replayed, first, err)
+	}
+}
+
+func TestClientClassifiesTransientOpenFailureForExactRetry(t *testing.T) {
+	request, _, _, bundle := schemaFixture(43)
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	client, err := NewClient(ClientOptions{ReadDeadline: deadline, WriteDeadline: deadline,
+		Opener: buildTestOpener(func(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+		})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.Prepare(t.Context(), [16]byte{9}, request, bundle); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("transient open was not retryable: %v", err)
+	}
+}
+
 func TestControlServiceRejectsWrongTrustDomainBeforeWork(t *testing.T) {
 	installer, journal, backend := openTestInstaller(t, t.TempDir(), newTestActivator(), 2)
 	defer journal.Close()

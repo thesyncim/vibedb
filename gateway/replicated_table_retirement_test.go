@@ -27,7 +27,10 @@ func tableRetirementFixture(t *testing.T) (*Snapshot, replicatedTableRetirement)
 	})
 	config.Manifests = append(config.Manifests, keep)
 	current, err := NewSnapshotWithReplicatedTableMetadata(
-		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		config, endpoints, 5, []IndexDescriptor{{IndexID: 7, Incarnation: 1,
+			Table: "messages", Name: "messages_id", Paths: []string{"/id"},
+			Flags: IndexLocal | IndexUnique, Lifecycle: IndexReady}}, nil,
+		[]ReplicatedShardDescriptor{descriptor},
 		[]ReplicatedTableProfile{profile},
 		[]ReplicatedTableDeclaration{{Table: "messages", CreateTable: "CREATE TABLE messages (id STRING PRIMARY KEY)"}},
 	)
@@ -69,7 +72,8 @@ func TestReplicatedTableRetirementIsExactBoundedCatalogTransition(t *testing.T) 
 	}
 	if len(certified.ReplicatedShardDescriptors()) != 0 ||
 		len(certified.ReplicatedTableProfiles()) != 0 ||
-		len(certified.ReplicatedTableDeclarations()) != 0 {
+		len(certified.ReplicatedTableDeclarations()) != 0 || len(certified.indexDescriptors()) != 0 ||
+		certified.indexIDHighWater != 7 {
 		t.Fatal("retired RF3 metadata remains active")
 	}
 	raw, err := AppendSnapshotDocument(nil, certified)

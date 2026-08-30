@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -85,6 +86,13 @@ func (client *Client) execute(
 		if connection != nil {
 			_ = connection.Close()
 		}
+		var networkError net.Error
+		if errors.As(err, &networkError) {
+			// No request bytes were sent, so retrying the identical command is
+			// both safe and necessary while a rolling schema activation briefly
+			// replaces a local runtime/control endpoint.
+			return Record{}, errors.Join(ErrOutcomeUnknown, err)
+		}
 		return Record{}, err
 	}
 	if connection == nil {
@@ -142,10 +150,15 @@ func (client *Client) execute(
 		wantState = StateDrained
 	}
 	if record.Request != request || record.State < wantState ||
-		command != CommandPrepare && record.Authorization != authorization ||
-		command == CommandDrain && record.DrainProof != proof {
+		command != CommandPrepare && record.Authorization != authorization {
 		return Record{}, ErrConflict
 	}
+	// A completed drain is terminal. The server validated the newly supplied
+	// proof before looking up this exact request/authorization, but an
+	// idempotent retry may legitimately derive a later route-gate observation
+	// than the proof durably stored by the first successful caller. Requiring
+	// byte equality here would turn an already-completed effect into a false
+	// conflict and strand restart recovery.
 	return record, nil
 }
 

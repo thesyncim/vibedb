@@ -321,35 +321,62 @@ func retainDevGroupInventoryManifest(root string, paths []string) error {
 		if sha256.Sum256(raw) != expected {
 			return errDevCluster
 		}
-		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
-	}
-	// The currently published multigroup manifest is the exact predecessor
-	// for both append and retirement transitions. Prefer it over reconstructing
-	// prefixes, which cannot represent removal of a middle group.
-	if current, currentErr := readDevFile(filepath.Join(root, "serve-multigroup.vibejson"), 4<<20); currentErr == nil {
-		if sha256.Sum256(current) == expected {
-			return writeDevFileOnce(target, current)
+	} else {
+		// The currently published multigroup manifest is the exact predecessor
+		// for both append and retirement transitions. Prefer it over reconstructing
+		// prefixes, which cannot represent removal of a middle group.
+		if current, currentErr := readDevFile(filepath.Join(root, "serve-multigroup.vibejson"), 4<<20); currentErr == nil {
+			if sha256.Sum256(current) == expected {
+				if err := writeDevFileOnce(target, current); err != nil {
+					return err
+				}
+			}
+		} else if !errors.Is(currentErr, os.ErrNotExist) {
+			return currentErr
 		}
-	} else if !errors.Is(currentErr, os.ErrNotExist) {
+		if _, statErr := os.Stat(target); errors.Is(statErr, os.ErrNotExist) {
+			for count := 1; count <= len(paths); count++ {
+				var raw []byte
+				if count == 1 {
+					raw, err = readDevFile(paths[0], 4<<20)
+				} else {
+					raw, err = composeDevGroupManifest(paths[:count])
+				}
+				if err != nil {
+					return err
+				}
+				if sha256.Sum256(raw) == expected {
+					if err := writeDevFileOnce(target, raw); err != nil {
+						return err
+					}
+					break
+				}
+			}
+		}
+		if _, statErr := os.Stat(target); statErr != nil {
+			return fmt.Errorf("%w: cannot prove retained group inventory manifest", errDevCluster)
+		}
+	}
+	// Preserve the currently published cut as well. A second DDL may arrive
+	// before an asynchronously signaled node checkpoints the first transition;
+	// retaining every published cut keeps that bounded recovery chain provable.
+	current, currentErr := readDevFile(filepath.Join(root, "serve-multigroup.vibejson"), 4<<20)
+	if currentErr != nil {
 		return currentErr
 	}
-	for count := 1; count <= len(paths); count++ {
-		var raw []byte
-		if count == 1 {
-			raw, err = readDevFile(paths[0], 4<<20)
-		} else {
-			raw, err = composeDevGroupManifest(paths[:count])
+	currentDigest := sha256.Sum256(current)
+	currentTarget := filepath.Join(directory, hex.EncodeToString(currentDigest[:])+".vibejson")
+	if retained, retainedErr := readDevFile(currentTarget, 4<<20); retainedErr == nil {
+		if sha256.Sum256(retained) != currentDigest {
+			return errDevCluster
 		}
-		if err != nil {
-			return err
-		}
-		if sha256.Sum256(raw) == expected {
-			return writeDevFileOnce(target, raw)
-		}
+		return nil
+	} else if !errors.Is(retainedErr, os.ErrNotExist) {
+		return retainedErr
 	}
-	return fmt.Errorf("%w: cannot prove retained group inventory manifest", errDevCluster)
+	return writeDevFileOnce(currentTarget, current)
 }
 
 func prepareDevTable(root, binary string, cluster devClusterManifest, table devTableProvision) ([]devClusterMember, raftmember.GroupKey, error) {

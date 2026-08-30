@@ -82,9 +82,13 @@ func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int, succe
 	previousGroups := maxRF3ManifestGroups
 	if rebind {
 		previous, err := loadRF3Manifest(filepath.Join(path, "prepared-manifests", hex.EncodeToString(raw[16:48])+".vibejson"))
+		var transitionErr error
+		if len(successor) == 1 {
+			transitionErr = validateRF3GroupTransition(previous, successor[0])
+		}
 		if err != nil || len(successor) != 1 || successor[0].Digest != manifest ||
-			!bytes.Equal(previous.Digest[:], raw[16:48]) || validateRF3GroupTransition(previous, successor[0]) != nil || previous.SplitControl.operationLimit() != limit {
-			return closeError(errors.Join(errRF3Serving, err))
+			!bytes.Equal(previous.Digest[:], raw[16:48]) || transitionErr != nil || previous.SplitControl.operationLimit() != limit {
+			return closeError(errors.Join(errRF3Serving, err, transitionErr))
 		}
 		previousGroups = len(previous.groupBundles())
 	}

@@ -170,6 +170,15 @@ func buildReplicatedTableRetirementTarget(current *Snapshot, retirement replicat
 	if err != nil {
 		return nil, err
 	}
+	indexHighWater, err := advanceIndexIDHighWater(current, target)
+	if err != nil {
+		return nil, err
+	}
+	shardHighWaters, err := advanceShardGenerationHighWaters(current, target)
+	if err != nil {
+		return nil, err
+	}
+	target = snapshotWithCatalogLineage(target, indexHighWater, shardHighWaters)
 	target.tableRetirement = &retirement
 	return target, nil
 }

@@ -99,6 +99,25 @@ type SchemaRolloutResult struct {
 	Authorization schemainstall.Authorization
 }
 
+// ResumeCompletedSchemaRollout reconstructs the replica authorization from
+// the durable catalog operation. It is used only to finish an interrupted
+// predecessor drain; it cannot authorize a planned/running operation or a
+// different catalog target.
+func ResumeCompletedSchemaRollout(record ReplicatedOperationRecord) (SchemaRolloutResult, error) {
+	intent, err := openSchemaRolloutOperation(record)
+	if err != nil || record.State != ReplicatedOperationComplete {
+		return SchemaRolloutResult{}, errors.Join(err, ErrSchemaRolloutConflict)
+	}
+	return SchemaRolloutResult{Record: record, Authorization: schemainstall.Authorization{
+		Operation:               record.ID,
+		TargetCatalogGeneration: intent.TargetCatalogGeneration,
+		TargetCatalogDigest:     intent.TargetHeadDigest,
+		PreparedGroupCount:      intent.PreparedGroupCount,
+		PreparedGroupRoot:       intent.PreparedGroupRoot,
+		ContractDigest:          SchemaRolloutContractDigest(),
+	}}, nil
+}
+
 func NewSchemaRolloutController(options SchemaRolloutControllerOptions) (*SchemaRolloutController, error) {
 	if options.Authority == nil || options.Client == nil || options.MaxConcurrent <= 0 ||
 		options.MaxConcurrent > 64 {
