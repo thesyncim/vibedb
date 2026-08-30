@@ -218,18 +218,22 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 		}
 		description, err := sqldriver.DescribeReplicatedSchemaCatalog(bundle.SQL.Path)
 		if err != nil {
-			return result, closePreparedRF3Groups(result.groups, err)
+			return result, closePreparedRF3Groups(result.groups,
+				errors.Join(fmt.Errorf("describe retained schema group %d: %w", index, err), rf3PreparingMarkerReadError(bundle.SQL.Path)))
 		}
 		single.SplitControl.ChildRegistry, err = refreshRF3SplitChildSchema(
 			single.SplitControl.ChildRegistry, description)
 		if err != nil {
-			return result, closePreparedRF3Groups(result.groups, err)
+			return result, closePreparedRF3Groups(result.groups,
+				errors.Join(fmt.Errorf("refresh split child schema group %d: %w", index, err), rf3PreparingMarkerReadError(bundle.SQL.Path)))
 		}
 		if !rf3SplitChildTemplateMatchesRetained(
 			single.SplitControl.ChildRegistry, base, applyIdentity,
 		) || !rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
-			return result, closePreparedRF3Groups(result.groups,
-				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index))
+			return result, closePreparedRF3Groups(result.groups, errors.Join(
+				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index),
+				rf3PreparingMarkerReadError(bundle.SQL.Path),
+			))
 		}
 		group := groupFromBinding(base.Binding)
 		if !rf3RouteMatchesBinding(bundle.Route, base.Binding) {
@@ -1218,6 +1222,11 @@ func newRF3ControlMux(
 func hasRestoredRF3PreparingMarker(sqlPath string) (bool, error) {
 	_, found, err := restoredRF3PreparingOperation(sqlPath)
 	return found, err
+}
+
+func rf3PreparingMarkerReadError(sqlPath string) error {
+	_, err := readRF3BoundedFile(filepath.Join(filepath.Dir(sqlPath), "restore_preparing"), 37)
+	return err
 }
 
 func validateRestoredRF3Bootstrap(wal *raftstore.Store, sqlPath string, member uint64) ([32]byte, error) {

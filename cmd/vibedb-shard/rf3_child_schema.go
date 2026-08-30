@@ -113,7 +113,10 @@ func refreshRF3SplitChildSchema(registry rf3ManifestSplitChildRegistry,
 			return registry, err
 		}
 		tree := statement.Tree()
-		if tree.CreateIndex != nil && tree.CreateIndex.Table != registry.Table {
+		// Only local indexes on the user table are reconstructed below.
+		// Preserve every other retained statement, including CREATE TABLE for
+		// colocated global-index relations in a multi-table bundle.
+		if tree.CreateIndex == nil || tree.CreateIndex.Table != registry.Table {
 			statements = append(statements, source)
 		}
 		statement.Release()
