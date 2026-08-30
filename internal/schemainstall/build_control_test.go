@@ -20,6 +20,16 @@ func (f buildTestFunc) BuildSchema(ctx context.Context, r BuildRequest, sql stri
 	return f(ctx, r, sql)
 }
 
+type shadowBuildTestFunc func(context.Context, BuildRequest, string) (bool, error)
+
+func (f shadowBuildTestFunc) BuildSchema(context.Context, BuildRequest, string) (sqldriver.ReplicatedSchemaDDLTarget, error) {
+	return sqldriver.ReplicatedSchemaDDLTarget{}, ErrInvalid
+}
+
+func (f shadowBuildTestFunc) BuildSchemaShadow(ctx context.Context, request BuildRequest, sql string) (bool, error) {
+	return f(ctx, request, sql)
+}
+
 type buildTestOpener func(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error)
 
 func (f buildTestOpener) OpenShardControl(ctx context.Context, node rafttransport.NodeID) (rafttransport.PeerConnection, error) {
@@ -144,6 +154,41 @@ func TestSchemaBuildAuthenticatedClientAndAdmission(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSchemaShadowBuildAuthenticatedClient(t *testing.T) {
+	request, sql, peer := buildFixture()
+	request.Shadow, request.SourceApplied = true, 0
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	service, err := NewBuildControlService(BuildControlOptions{
+		Builder: shadowBuildTestFunc(func(_ context.Context, got BuildRequest, text string) (bool, error) {
+			if got != request || text != sql {
+				return false, ErrConflict
+			}
+			return true, nil
+		}),
+		Authorize: func(identity rafttransport.PeerIdentity, got BuildRequest) bool {
+			return identity == peer && got == request
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 1, BuildTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	client, err := NewClient(ClientOptions{ReadDeadline: deadline, WriteDeadline: deadline,
+		Opener: buildTestOpener(func(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+			local, remote := net.Pipe()
+			go func() { done <- service.Serve(t.Context(), &schemaPeerConnection{Conn: remote, identity: peer}) }()
+			return &schemaPeerConnection{Conn: local, identity: peer}, nil
+		})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := client.BuildShadow(t.Context(), peer.Node, request, sql)
+	if serveErr := <-done; err != nil || serveErr != nil || !noOp {
+		t.Fatalf("shadow no-op=%t err=%v serve=%v", noOp, err, serveErr)
 	}
 }
 

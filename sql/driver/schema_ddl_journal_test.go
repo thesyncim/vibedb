@@ -112,6 +112,32 @@ func TestReplicatedSchemaDDLJournalReplaysExactReceiptAfterRestart(t *testing.T)
 	}
 }
 
+func TestReplicatedSchemaDDLJournalDetachedReceiptSurvivesSourceLineageReclamation(t *testing.T) {
+	_, _, _, _, claim := schemaDDLJournalFixture(t)
+	operation := [32]byte{29}
+	const sql = "CREATE INDEX by_city_detached ON docs (city)"
+	target, err := claim.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), operation, 3, sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := openSchemaDDLJournalTestRoot(t, claim)
+	record := requireSchemaDDLJournalRecord(t, root)
+	// Model bounded source-lineage reclamation without weakening the retained
+	// journal's own checksum and target validation.
+	record.SourceDigest[0] ^= 1
+	if err := writeSchemaDDLBuildRecord(root, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := claim.ObserveJournaledReplicatedSchemaDDLBuild(operation); err == nil || found {
+		t.Fatalf("strict source observation accepted reclaimed lineage: found=%t err=%v", found, err)
+	}
+	detached, found, err := claim.ObserveRetainedReplicatedSchemaDDLBuild(operation)
+	if err != nil || !found || detached.Operation != operation || detached.SourceApplied != 3 ||
+		detached.SourceSchemaGeneration == 0 || detached.SQL != sql || !reflect.DeepEqual(detached.Target, target) {
+		t.Fatalf("detached receipt: found=%t record=%+v err=%v", found, detached, err)
+	}
+}
+
 func TestReplicatedSchemaDDLJournalRebasesReadyUnstagedOperation(t *testing.T) {
 	_, _, _, _, claim := schemaDDLJournalFixture(t)
 	operation := [32]byte{31}

@@ -146,6 +146,28 @@ func (v *VerifiedReplicatedSchemaTarget) Prepare(ctx context.Context, authorizat
 	return proof, nil
 }
 
+// DetachedTarget returns the audited, unpublished build receipt before
+// membership preparation. It grants no serving authority and remains valid
+// only for the exact source cut captured by this handle. The caller retains
+// the external write fence until it durably journals the receipt.
+func (v *VerifiedReplicatedSchemaTarget) DetachedTarget() (ReplicatedSchemaDDLTarget, error) {
+	if v == nil {
+		return ReplicatedSchemaDDLTarget{}, ErrReplicatedSchemaCatalogImage
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed || v.owner == nil || v.staged == nil || len(v.raw) == 0 ||
+		v.proof.Membership != (durable.CheckpointMembershipWitness{}) {
+		return ReplicatedSchemaDDLTarget{}, ErrReplicatedSchemaCatalogImage
+	}
+	target := ReplicatedSchemaDDLTarget{Catalog: bytes.Clone(v.raw), Proof: v.proof}
+	if err := ValidateReplicatedSchemaDDLTarget(target, v.expectedApplied,
+		target.Proof.Catalog.SchemaGeneration-1); err != nil {
+		return ReplicatedSchemaDDLTarget{}, err
+	}
+	return target, nil
+}
+
 func (v *VerifiedReplicatedSchemaTarget) Close() error {
 	if v == nil {
 		return nil

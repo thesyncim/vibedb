@@ -1181,6 +1181,7 @@ func newRF3ControlMux(
 	if schemaBuild != nil {
 		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildRequestDiscriminator(), Handler: schemaBuild})
 		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildResumeRequestDiscriminator(), Handler: schemaBuild})
+		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildShadowRequestDiscriminator(), Handler: schemaBuild})
 	}
 	if planObservation != nil {
 		routes = append(routes, shardcontrol.Route{

@@ -28,6 +28,16 @@ import (
 
 type gatewayTestGrantSource struct{ grant membershipgrant.Grant }
 
+type gatewayCloseTrackingConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (connection *gatewayCloseTrackingConn) Close() error {
+	connection.closed.Store(true)
+	return connection.Conn.Close()
+}
+
 func (source gatewayTestGrantSource) ReadMembershipGrant(
 	context.Context, raftmember.GroupKey,
 ) (membershipgrant.Grant, bool, error) {
@@ -310,5 +320,20 @@ func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testi
 	case serveErr := <-serverErrors:
 		t.Fatalf("authenticated server handshake: %v", serveErr)
 	default:
+	}
+
+	var failed *gatewayCloseTrackingConn
+	opener.dial = func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		failed = &gatewayCloseTrackingConn{Conn: client}
+		_ = server.Close()
+		return failed, nil
+	}
+	if connection, err := opener.OpenShardControl(t.Context(), serverNode); err == nil || connection != nil {
+		t.Fatalf("failed TLS handshake returned connection=%v err=%v", connection, err)
+	}
+	if failed == nil || !failed.closed.Load() || len(opener.slots) != 0 {
+		t.Fatalf("failed TLS transport retained: connection=%v closed=%t slots=%d",
+			failed, failed != nil && failed.closed.Load(), len(opener.slots))
 	}
 }

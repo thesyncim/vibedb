@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -9,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,16 +25,24 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
-var gatewaySchemaDDLOperationDomain = []byte("vibedb/gateway/pgwire-schema-ddl-operation\x00")
+var gatewaySchemaDDLOperationDomain = []byte("vibedb/gateway/pgwire-schema-ddl-operation/2\x00")
+var gatewaySchemaDDLReleasedPinsDomain = []byte("vibedb/gateway/pgwire-schema-ddl-released-pins/1\x00")
 
 type gatewaySchemaDDLRuntime struct {
 	authority *gateway.ReplicatedCatalogAuthority
 	executor  *gateway.ReplicatedExecutor
 	client    *schemainstall.Client
+	builder   gatewaySchemaDDLBuilder
 	resumer   gatewaySchemaDDLBuildResumer
 	journal   string
 	principal serviceauthz.Authority
 	mu        sync.Mutex
+}
+
+type gatewaySchemaDDLBuilder interface {
+	Build(context.Context, rafttransport.NodeID, schemainstall.BuildRequest, string) (
+		sqldriver.ReplicatedSchemaDDLTarget, error,
+	)
 }
 
 type gatewaySchemaDDLBuildResumer interface {
@@ -46,6 +57,115 @@ type gatewaySchemaDDLGate struct {
 	binding  routegate.Binding
 	epoch    uint64
 	applied  uint64
+}
+
+func (r *gatewaySchemaDDLRuntime) drainProof(ctx context.Context, result gateway.SchemaRolloutResult,
+	gates []gatewaySchemaDDLGate, plans []gateway.SchemaRolloutReplicaPlan,
+) (schemainstall.DrainProof, error) {
+	completed := gateway.ReplicatedOperationDigest(result.Record)
+	authorizationDigest := schemainstall.AuthorizationDigest(result.Authorization)
+	if result.Record.Kind != gateway.ReplicatedOperationSchema ||
+		result.Record.State != gateway.ReplicatedOperationComplete ||
+		result.Record.ID != result.Authorization.Operation || completed == ([32]byte{}) ||
+		authorizationDigest == ([32]byte{}) || len(gates) == 0 || len(plans) == 0 {
+		return schemainstall.DrainProof{}, gateway.ErrSchemaRollout
+	}
+	targets := make(map[raftmember.GroupKey]schemainstall.Request, len(gates))
+	for _, plan := range plans {
+		request := plan.Request
+		if request.Operation != result.Authorization.Operation {
+			return schemainstall.DrainProof{}, gateway.ErrSchemaRolloutConflict
+		}
+		if prior, found := targets[request.Group]; found &&
+			(prior.AllocationGeneration != request.AllocationGeneration ||
+				prior.ToSchemaGeneration != request.ToSchemaGeneration ||
+				prior.ToRelationManifestDigest != request.ToRelationManifestDigest) {
+			return schemainstall.DrainProof{}, gateway.ErrSchemaRolloutConflict
+		}
+		targets[request.Group] = request
+	}
+	ordered := slices.Clone(gates)
+	latest, err := r.authority.Read(ctx)
+	if err != nil || latest.Generation() < result.Authorization.TargetCatalogGeneration {
+		return schemainstall.DrainProof{}, errors.Join(err, gateway.ErrSchemaRolloutConflict)
+	}
+	for index := range ordered {
+		var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		route, found := latest.ResolveReplicatedRoute(
+			ordered[index].route.Distribution, ordered[index].route.Shard, replicas[:0],
+		)
+		target, expected := targets[route.Group]
+		if !found || !expected || route.Group != ordered[index].route.Group ||
+			route.AllocationGeneration != uint64(target.AllocationGeneration) ||
+			route.Command.SchemaGeneration != target.ToSchemaGeneration ||
+			route.Command.RelationManifestDigest != target.ToRelationManifestDigest {
+			return schemainstall.DrainProof{}, gateway.ErrSchemaRolloutConflict
+		}
+		// Route-gate state survives schema-generation replacement, but route
+		// reads must use the newly committed command carried by the target
+		// catalog rather than the fenced predecessor command.
+		ordered[index].route = route
+	}
+	slices.SortFunc(ordered, func(left, right gatewaySchemaDDLGate) int {
+		leftGroup, rightGroup := left.route.Group, right.route.Group
+		if order := bytes.Compare(leftGroup.ClusterID[:], rightGroup.ClusterID[:]); order != 0 {
+			return order
+		}
+		if order := bytes.Compare(leftGroup.ClusterIncarnation[:], rightGroup.ClusterIncarnation[:]); order != 0 {
+			return order
+		}
+		if order := cmp.Compare(leftGroup.TopologyRecoveryEpoch, rightGroup.TopologyRecoveryEpoch); order != 0 {
+			return order
+		}
+		if order := bytes.Compare(leftGroup.ShardIncarnation[:], rightGroup.ShardIncarnation[:]); order != 0 {
+			return order
+		}
+		return bytes.Compare(leftGroup.GroupID[:], rightGroup.GroupID[:])
+	})
+	hasher := sha256.New()
+	_, _ = hasher.Write(gatewaySchemaDDLReleasedPinsDomain)
+	_, _ = hasher.Write(completed[:])
+	_, _ = hasher.Write(authorizationDigest[:])
+	var scalar [8]byte
+	binary.BigEndian.PutUint64(scalar[:], uint64(len(ordered)))
+	_, _ = hasher.Write(scalar[:])
+	for _, gate := range ordered {
+		observed, err := r.executor.ReadRouteGate(ctx, gate.route, gate.applied)
+		if err != nil {
+			return schemainstall.DrainProof{}, err
+		}
+		drain := observed.Status.Drain
+		if drain.State != routegate.DrainActive || drain.Identity != gate.identity ||
+			drain.Binding != gate.binding || drain.Epoch != gate.epoch || observed.Status.ActivePins != 0 {
+			return schemainstall.DrainProof{}, gateway.ErrSchemaRolloutConflict
+		}
+		group := gate.route.Group
+		_, _ = hasher.Write(group.ClusterID[:])
+		_, _ = hasher.Write(group.ClusterIncarnation[:])
+		binary.BigEndian.PutUint64(scalar[:], group.TopologyRecoveryEpoch)
+		_, _ = hasher.Write(scalar[:])
+		_, _ = hasher.Write(group.ShardIncarnation[:])
+		_, _ = hasher.Write(group.GroupID[:])
+		binary.BigEndian.PutUint64(scalar[:], observed.Applied)
+		_, _ = hasher.Write(scalar[:])
+		binary.BigEndian.PutUint64(scalar[:], observed.Status.Revision)
+		_, _ = hasher.Write(scalar[:])
+		binary.BigEndian.PutUint64(scalar[:], observed.Status.Epoch)
+		_, _ = hasher.Write(scalar[:])
+		binary.BigEndian.PutUint64(scalar[:], observed.Status.ReleasedPins)
+		_, _ = hasher.Write(scalar[:])
+		binary.BigEndian.PutUint64(scalar[:], observed.Status.RetainedRecords)
+		_, _ = hasher.Write(scalar[:])
+		_, _ = hasher.Write(drain.Identity[:])
+		_, _ = hasher.Write(drain.Binding[:])
+	}
+	var released [32]byte
+	hasher.Sum(released[:0])
+	return schemainstall.DrainProof{Operation: result.Authorization.Operation,
+		TargetCatalogGeneration:       result.Authorization.TargetCatalogGeneration,
+		TargetCatalogDigest:           result.Authorization.TargetCatalogDigest,
+		ActivationAuthorizationDigest: authorizationDigest,
+		CompletedOperationDigest:      completed, ReleasedExecutionPinRoot: released}, nil
 }
 
 func newGatewaySchemaDDLRuntime(authority *gateway.ReplicatedCatalogAuthority,
@@ -63,21 +183,149 @@ func newGatewaySchemaDDLRuntime(authority *gateway.ReplicatedCatalogAuthority,
 		return nil, err
 	}
 	return &gatewaySchemaDDLRuntime{authority: authority, executor: executor,
-		client: client, resumer: client, journal: journal, principal: principal}, nil
+		client: client, builder: client, resumer: client, journal: journal, principal: principal}, nil
 }
 
-func gatewaySchemaDDLOperation(snapshot *gateway.Snapshot, table, sql string) [32]byte {
+// buildOrResume closes the stateless-coordinator cut between durable replica
+// materialization and replicated catalog intent publication. A replacement
+// gateway deterministically mints the same operation, but has no local journal
+// proving that a shard already retained its build. Build is still the fast
+// path. Only a conflict or uncertain response performs the read-only resume
+// RPC, so successful DDL and every query retain their existing cost.
+func (r *gatewaySchemaDDLRuntime) buildOrResume(ctx context.Context,
+	node rafttransport.NodeID, request schemainstall.BuildRequest, sql string,
+) (schemainstall.BuildRequest, sqldriver.ReplicatedSchemaDDLTarget, error) {
+	var target sqldriver.ReplicatedSchemaDDLTarget
+	if r == nil || r.builder == nil || r.resumer == nil {
+		return schemainstall.BuildRequest{}, target, gateway.ErrSchemaRollout
+	}
+	target, err := r.builder.Build(ctx, node, request, sql)
+	if err == nil {
+		return request, target, nil
+	}
+	if !errors.Is(err, schemainstall.ErrOutcomeUnknown) && !errors.Is(err, schemainstall.ErrConflict) {
+		return schemainstall.BuildRequest{}, target, err
+	}
+	retained, retainedSQL, retainedTarget, _, resumeErr :=
+		r.resumer.ResumeBuild(ctx, node, request.Operation, request.Group)
+	if resumeErr != nil {
+		return schemainstall.BuildRequest{}, target, errors.Join(err, resumeErr)
+	}
+	if retained.Operation != request.Operation || retained.Group != request.Group ||
+		retained.AllocationGeneration != request.AllocationGeneration ||
+		retained.FromSchemaGeneration != request.FromSchemaGeneration ||
+		retained.FromRelationManifestDigest != request.FromRelationManifestDigest ||
+		retained.SourceApplied == 0 || retained.SourceApplied > request.SourceApplied ||
+		retained.SQLBytes != uint64(len(sql)) || retained.SQLDigest != sha256.Sum256([]byte(sql)) ||
+		retainedSQL != sql {
+		return schemainstall.BuildRequest{}, target, errors.Join(err, gateway.ErrSchemaRolloutConflict)
+	}
+	return retained, retainedTarget, nil
+}
+
+func (r *gatewaySchemaDDLRuntime) buildShadow(ctx context.Context, node rafttransport.NodeID,
+	request schemainstall.BuildRequest, sql string,
+) (bool, error) {
+	if r == nil || r.client == nil || !request.Shadow {
+		return false, gateway.ErrSchemaRollout
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		noOp, err := r.client.BuildShadow(ctx, node, request, sql)
+		if !errors.Is(err, schemainstall.ErrOutcomeUnknown) {
+			return noOp, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, errors.Join(err, context.Cause(ctx))
+		case <-ticker.C:
+		}
+	}
+}
+
+func gatewaySchemaDDLOperation(snapshot *gateway.Snapshot, table, sql string) ([32]byte, error) {
+	placement, found := snapshot.Placement(table)
+	if !found {
+		return [32]byte{}, gateway.ErrSchemaRollout
+	}
+	var schemaGeneration uint64
+	var logicalSchema [32]byte
+	matched := 0
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		if descriptor.Distribution != placement.Distribution {
+			continue
+		}
+		if descriptor.Command.SchemaGeneration == 0 || descriptor.LogicalSchemaDigest == ([32]byte{}) ||
+			matched != 0 && (descriptor.Command.SchemaGeneration != schemaGeneration ||
+				descriptor.LogicalSchemaDigest != logicalSchema) {
+			return [32]byte{}, gateway.ErrSchemaRolloutConflict
+		}
+		schemaGeneration, logicalSchema = descriptor.Command.SchemaGeneration, descriptor.LogicalSchemaDigest
+		matched++
+	}
+	if matched == 0 {
+		return [32]byte{}, gateway.ErrSchemaRollout
+	}
 	h := sha256.New()
 	_, _ = h.Write(gatewaySchemaDDLOperationDomain)
 	var generation [8]byte
-	binary.LittleEndian.PutUint64(generation[:], snapshot.Generation())
+	binary.LittleEndian.PutUint64(generation[:], schemaGeneration)
 	_, _ = h.Write(generation[:])
+	_, _ = h.Write(logicalSchema[:])
+	_, _ = h.Write([]byte(placement.Distribution))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(table))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(sql))
 	var result [32]byte
 	h.Sum(result[:0])
-	return result
+	return result, nil
+}
+
+// retainedOperation resolves pre-v2 operation directories created before the
+// operation identity was detached from the global catalog generation. It is
+// also a bounded recovery index for a gateway restarted after replicas built
+// but before the catalog operation row existed. Replica receipts—not directory
+// names—authenticate the SQL and exact source schema.
+func (r *gatewaySchemaDDLRuntime) retainedOperation(ctx context.Context,
+	descriptors []gateway.ReplicatedShardDescriptor, sql string, current [32]byte,
+) ([32]byte, error) {
+	entries, err := os.ReadDir(r.journal)
+	if os.IsNotExist(err) {
+		return current, nil
+	}
+	if err != nil {
+		return [32]byte{}, err
+	}
+	const maxRetainedSchemaOperations = 4096
+	if len(entries) > maxRetainedSchemaOperations {
+		return [32]byte{}, gateway.ErrSchemaRolloutConflict
+	}
+	selected := current
+	for _, entry := range entries {
+		if !entry.IsDir() || len(entry.Name()) != sha256.Size*2 {
+			continue
+		}
+		raw, decodeErr := hex.DecodeString(entry.Name())
+		if decodeErr != nil || len(raw) != sha256.Size {
+			continue
+		}
+		var candidate [32]byte
+		copy(candidate[:], raw)
+		if candidate == ([32]byte{}) || candidate == current {
+			continue
+		}
+		retainedSQL, recoveryErr := r.recoverySQL(ctx, descriptors, candidate)
+		if recoveryErr != nil || retainedSQL != sql {
+			continue
+		}
+		if selected != current && selected != candidate {
+			return [32]byte{}, gateway.ErrSchemaRolloutConflict
+		}
+		selected = candidate
+	}
+	return selected, nil
 }
 
 func gatewaySchemaDDLGateIdentity(operation [32]byte, group raftmember.GroupKey) (routegate.Identity, routegate.Binding) {
@@ -301,9 +549,12 @@ func (r *gatewaySchemaDDLRuntime) Recover(ctx context.Context) error {
 			return fmt.Errorf("recover schema operation %x: %w", operation, findErr)
 		}
 		table, resolveErr := gateway.ResolveReplicatedSchemaDDLTable(current, sql)
-		if resolveErr != nil || table == "" || gatewaySchemaDDLOperation(current, table, sql) != operation {
+		derived, operationErr := gatewaySchemaDDLOperation(current, table, sql)
+		_, legacyJournalErr := os.Stat(filepath.Join(r.journal, hex.EncodeToString(operation[:])))
+		legacyBound := legacyJournalErr == nil
+		if resolveErr != nil || operationErr != nil || table == "" || derived != operation && !legacyBound {
 			return fmt.Errorf("recover schema operation %x SQL binding: %w",
-				operation, errors.Join(resolveErr, gateway.ErrSchemaRolloutConflict))
+				operation, errors.Join(resolveErr, operationErr, legacyJournalErr, gateway.ErrSchemaRolloutConflict))
 		}
 		if executeErr := r.Execute(ctx, sql); executeErr != nil {
 			return fmt.Errorf("resume schema operation %x: %w", operation, executeErr)
@@ -321,19 +572,29 @@ func (r *gatewaySchemaDDLRuntime) recoverySQL(ctx context.Context,
 	var retained string
 	for _, descriptor := range descriptors {
 		for _, replica := range descriptor.Replicas {
-			request, sql, _, _, err := r.resumer.ResumeBuild(ctx, replica.Node, operation, descriptor.Group)
+			request, sql, target, _, err := r.resumer.ResumeBuild(ctx, replica.Node, operation, descriptor.Group)
 			if errors.Is(err, schemainstall.ErrMissing) {
 				continue
 			}
 			if err != nil {
 				return "", err
 			}
+			sourceMatch := request.FromSchemaGeneration == descriptor.Command.SchemaGeneration &&
+				request.FromRelationManifestDigest == descriptor.Command.RelationManifestDigest
+			targetMatch := !target.NoOp && request.FromSchemaGeneration+1 == descriptor.Command.SchemaGeneration &&
+				target.Proof.Catalog.SchemaGeneration == descriptor.Command.SchemaGeneration &&
+				target.Proof.Catalog.RelationManifestDigest == descriptor.Command.RelationManifestDigest
 			if sql == "" || request.Operation != operation || request.Group != descriptor.Group ||
-				request.AllocationGeneration != descriptor.AllocationGeneration ||
-				request.FromSchemaGeneration != descriptor.Command.SchemaGeneration ||
-				request.FromRelationManifestDigest != descriptor.Command.RelationManifestDigest ||
+				request.AllocationGeneration != descriptor.AllocationGeneration || !sourceMatch && !targetMatch ||
 				retained != "" && retained != sql {
-				return "", gateway.ErrSchemaRolloutConflict
+				return "", fmt.Errorf("%w: retained member %d binding sql=%t operation=%t group=%t allocation=%t generation=%t(%d/%d) manifest=%t(%x/%x) consistent-sql=%t",
+					gateway.ErrSchemaRolloutConflict, replica.Member, sql != "", request.Operation == operation,
+					request.Group == descriptor.Group, request.AllocationGeneration == descriptor.AllocationGeneration,
+					sourceMatch || targetMatch,
+					request.FromSchemaGeneration, descriptor.Command.SchemaGeneration,
+					request.FromRelationManifestDigest == descriptor.Command.RelationManifestDigest,
+					request.FromRelationManifestDigest, descriptor.Command.RelationManifestDigest,
+					retained == "" || retained == sql)
 			}
 			retained = sql
 		}
@@ -369,8 +630,15 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 	if !found {
 		return fmt.Errorf("%w: %s", gateway.ErrSchemaRollout, table)
 	}
-	operation := gatewaySchemaDDLOperation(current, table, sql)
 	descriptors := current.ReplicatedShardDescriptors()
+	operation, err := gatewaySchemaDDLOperation(current, table, sql)
+	if err != nil {
+		return fmt.Errorf("derive schema operation: %w", err)
+	}
+	operation, err = r.retainedOperation(ctx, descriptors, sql, operation)
+	if err != nil {
+		return fmt.Errorf("resolve retained schema operation: %w", err)
+	}
 	var gates []gatewaySchemaDDLGate
 	defer func() {
 		record, operationErr := r.authority.ReadOperation(context.WithoutCancel(ctx), operation)
@@ -439,9 +707,13 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 				if resumeErr != nil {
 					return fmt.Errorf("inspect resumed schema build member %d: %w", replica.Member, resumeErr)
 				}
+				sourceMatch := request.FromSchemaGeneration == descriptor.Command.SchemaGeneration &&
+					request.FromRelationManifestDigest == descriptor.Command.RelationManifestDigest
+				targetMatch := !replicaTarget.NoOp && request.FromSchemaGeneration+1 == descriptor.Command.SchemaGeneration &&
+					replicaTarget.Proof.Catalog.SchemaGeneration == descriptor.Command.SchemaGeneration &&
+					replicaTarget.Proof.Catalog.RelationManifestDigest == descriptor.Command.RelationManifestDigest
 				if retainedSQL != sql || request.AllocationGeneration != descriptor.AllocationGeneration ||
-					request.FromSchemaGeneration != descriptor.Command.SchemaGeneration ||
-					request.FromRelationManifestDigest != descriptor.Command.RelationManifestDigest {
+					!sourceMatch && !targetMatch {
 					return fmt.Errorf("%w: resumed schema build member %d differs", gateway.ErrSchemaRolloutConflict, replica.Member)
 				}
 				allActive = allActive && active
@@ -453,6 +725,47 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 			}
 		}
 		if allActive && matched != 0 {
+			reconciled, applied, reconcileErr := gateway.ReconcileAppliedReplicatedSchemaDDLCatalog(
+				current, operation, table, sql, resumed,
+			)
+			if reconcileErr != nil {
+				return fmt.Errorf("reconcile applied schema catalog: %w", reconcileErr)
+			}
+			if applied {
+				for reconciled != current {
+					publishErr := r.authority.Publish(ctx, current.Generation(), reconciled)
+					if !errors.Is(publishErr, gateway.ErrReplicatedCatalogPending) {
+						if publishErr != nil {
+							return fmt.Errorf("publish reconciled schema catalog: %w", publishErr)
+						}
+						break
+					}
+					if retryErr := r.authority.RetryPending(ctx); retryErr != nil &&
+						!errors.Is(retryErr, gateway.ErrReplicatedCatalogPending) {
+						return errors.Join(publishErr, retryErr)
+					}
+					if ctx.Err() != nil {
+						return errors.Join(publishErr, context.Cause(ctx))
+					}
+				}
+				latest, readErr := r.authority.Read(ctx)
+				if readErr != nil {
+					return readErr
+				}
+				for _, descriptor := range descriptors {
+					if descriptor.Distribution != placement.Distribution {
+						continue
+					}
+					identity, binding := gatewaySchemaDDLGateIdentity(operation, descriptor.Group)
+					gate := gatewaySchemaDDLGate{route: gateway.ReplicatedRoute{
+						Distribution: descriptor.Distribution, Shard: descriptor.Shard, Group: descriptor.Group,
+					}, identity: identity, binding: binding}
+					if releaseErr := r.releaseGate(ctx, operation, gate, latest); releaseErr != nil {
+						return releaseErr
+					}
+				}
+				return nil
+			}
 			target, plans, planErr := gateway.BuildReplicatedSchemaDDLPlan(current, operation, table, sql, resumed)
 			if planErr != nil {
 				return fmt.Errorf("reconstruct completed schema plan: %w", planErr)
@@ -483,6 +796,36 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 					return releaseErr
 				}
 			}
+			return nil
+		}
+	}
+	if !recovering {
+		shadowCount, noOpCount := 0, 0
+		for _, descriptor := range descriptors {
+			if descriptor.Distribution != placement.Distribution {
+				continue
+			}
+			for _, replica := range descriptor.Replicas {
+				request := schemainstall.BuildRequest{Shadow: true, Operation: operation, Group: descriptor.Group,
+					AllocationGeneration:       descriptor.AllocationGeneration,
+					FromSchemaGeneration:       descriptor.Command.SchemaGeneration,
+					FromRelationManifestDigest: descriptor.Command.RelationManifestDigest,
+					SQLBytes:                   uint64(len(sql)), SQLDigest: sha256.Sum256([]byte(sql))}
+				noOp, shadowErr := r.buildShadow(ctx, replica.Node, request, sql)
+				if shadowErr != nil {
+					return fmt.Errorf("build online schema shadow member %d: %w", replica.Member, shadowErr)
+				}
+				shadowCount++
+				if noOp {
+					noOpCount++
+				}
+			}
+		}
+		if shadowCount == 0 || noOpCount != 0 && noOpCount != shadowCount {
+			return fmt.Errorf("online schema shadows disagree no-op=%d replicas=%d: %w",
+				noOpCount, shadowCount, gateway.ErrSchemaRolloutConflict)
+		}
+		if noOpCount == shadowCount {
 			return nil
 		}
 	}
@@ -557,7 +900,7 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 						FromSchemaGeneration:       descriptor.Command.SchemaGeneration,
 						FromRelationManifestDigest: descriptor.Command.RelationManifestDigest,
 						SourceApplied:              gate.applied, SQLBytes: uint64(len(sql)), SQLDigest: sha256.Sum256([]byte(sql))}
-					target, err = r.client.Build(ctx, replica.Node, request, sql)
+					request, target, err = r.buildOrResume(ctx, replica.Node, request, sql)
 					retainedSQL = sql
 				}
 				if err != nil {
@@ -581,7 +924,7 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 				FromSchemaGeneration:       descriptor.Command.SchemaGeneration,
 				FromRelationManifestDigest: descriptor.Command.RelationManifestDigest,
 				SourceApplied:              gate.applied, SQLBytes: uint64(len(sql)), SQLDigest: sha256.Sum256([]byte(sql))}
-			target, err := r.client.Build(ctx, replica.Node, request, sql)
+			request, target, err := r.buildOrResume(ctx, replica.Node, request, sql)
 			if err != nil {
 				return fmt.Errorf("build schema target member %d: %w", replica.Member, err)
 			}
@@ -602,9 +945,16 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 	if err != nil {
 		return fmt.Errorf("create schema rollout controller: %w", err)
 	}
-	_, err = controller.Execute(ctx, operation, target, plans)
+	result, err := controller.Execute(ctx, operation, target, plans)
 	if err != nil {
 		return fmt.Errorf("execute distributed schema plan: %w", err)
+	}
+	proof, err := r.drainProof(ctx, result, gates, plans)
+	if err != nil {
+		return fmt.Errorf("certify distributed schema drain: %w", err)
+	}
+	if err = controller.Drain(ctx, plans, result.Authorization, proof); err != nil {
+		return fmt.Errorf("drain distributed schema predecessors: %w", err)
 	}
 	return nil
 }
