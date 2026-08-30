@@ -700,14 +700,14 @@ func preflightCheckpointGroupRecoveryGenerationBudget(
 			}
 			// A batch replay first attempts the atomic stage. If reopen-time
 			// limits force or discover its bounded ErrBatchTooLarge fallback,
-			// sequential recovery may then consume one point generation plus up
-			// to primaryStructuralRetryLimit topology generations per entry.
-			sequentialPerEntry := uint64(primaryStructuralRetryLimit + 1)
-			entries := uint64(len(record.Entries))
-			if entries > math.MaxUint64/sequentialPerEntry {
+			// sequential recovery applies each prevalidated final entry once.
+			// Every entry retains its bounded structural-retry allowance.
+			required, ok := checkpointGroupSequentialRecoveryGenerationBudget(
+				uint64(len(record.Entries)),
+			)
+			if !ok {
 				return ErrCheckpointGroupSequence
 			}
-			required := entries * sequentialPerEntry
 			if collection.atomicRecoveryBatchFitsUpdate(record) {
 				batch, ok := primaryBatchStageAttemptBudget(len(record.Entries))
 				if !ok || uint64(batch) > math.MaxUint64-required {
@@ -725,6 +725,16 @@ func preflightCheckpointGroupRecoveryGenerationBudget(
 			return nil
 		},
 	)
+}
+
+func checkpointGroupSequentialRecoveryGenerationBudget(
+	entries uint64,
+) (uint64, bool) {
+	perOperation := uint64(primaryStructuralRetryLimit + 1)
+	if entries > math.MaxUint64/perOperation {
+		return 0, false
+	}
+	return entries * perOperation, true
 }
 
 // validateCheckpointGroupJournalRecords rejects every ordinary journal kind.

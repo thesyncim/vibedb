@@ -1528,6 +1528,10 @@ var replicatedLocalIndexManifestDomain = []byte(
 	"vibedb/sql/replicated-local-index-manifest\x00",
 )
 
+var replicatedLocalIndexUniquenessDomain = []byte(
+	"vibedb/sql/replicated-local-index-uniqueness/v1\x00",
+)
+
 func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) error {
 	count := int(identity.RelationCount)
 	if count < 1 || count > replication.MaxRelationsPerBundle ||
@@ -1689,12 +1693,27 @@ func replicatedLocalIndexDigest(indexes []indexMeta) [sha256.Size]byte {
 	var count [8]byte
 	binary.LittleEndian.PutUint64(count[:], uint64(len(canonical)))
 	_, _ = h.Write(count[:])
+	hasUnique := false
 	for i := range canonical {
 		writeReplicatedRelationFrame(h, []byte(canonical[i].Name))
+		hasUnique = hasUnique || canonical[i].Unique
 		binary.LittleEndian.PutUint64(count[:], uint64(len(canonical[i].Paths)))
 		_, _ = h.Write(count[:])
 		for _, path := range canonical[i].Paths {
 			writeReplicatedRelationFrame(h, []byte(path))
+		}
+	}
+	if hasUnique {
+		// Keep every pre-unique, all-non-unique manifest byte-stable. The
+		// domain-separated suffix extends only manifests that use the new bit;
+		// the base stream already binds the canonical index count and order.
+		_, _ = h.Write(replicatedLocalIndexUniquenessDomain)
+		for i := range canonical {
+			var unique [1]byte
+			if canonical[i].Unique {
+				unique[0] = 1
+			}
+			_, _ = h.Write(unique[:])
 		}
 	}
 	var result [sha256.Size]byte

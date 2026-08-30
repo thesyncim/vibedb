@@ -67,6 +67,7 @@ const (
 const (
 	pageCatalogCanonicalSchema    = uint16(1)
 	pageCatalogCanonicalSkipPaths = uint16(1 << 1)
+	pageCatalogIndexUnique        = byte(1)
 )
 
 var (
@@ -84,8 +85,9 @@ var (
 // PageCatalogIndex is one logical alias and its ordered physical exact-index
 // columns. Several names with identical Paths share one physical definition.
 type PageCatalogIndex struct {
-	Name  string
-	Paths []string
+	Name   string
+	Paths  []string
+	Unique bool
 }
 
 // PageCatalogSchemaField is one canonical RFC 6901 schema constraint.
@@ -313,6 +315,9 @@ func BuildCanonicalPageCatalog(
 		physicalID := pageCatalogPhysicalIndex(physical, index.Paths)
 		binary.LittleEndian.PutUint16(canonical[cursor:cursor+2], stringIDs[index.Name])
 		canonical[cursor+2] = byte(physicalID)
+		if index.Unique {
+			canonical[cursor+3] = pageCatalogIndexUnique
+		}
 		cursor += 4
 	}
 	for _, path := range normalized.SkipPaths {
@@ -420,8 +425,9 @@ func normalizePageCatalogDefinition(
 			)
 		}
 		indexes[i] = PageCatalogIndex{
-			Name:  strings.Clone(index.Name),
-			Paths: make([]string, len(index.Paths)),
+			Name:   strings.Clone(index.Name),
+			Paths:  make([]string, len(index.Paths)),
+			Unique: index.Unique,
 		}
 		for pathIndex, path := range index.Paths {
 			if err := pageCatalogPointer(path, true); err != nil {
@@ -732,15 +738,17 @@ func decodeCanonicalPageCatalogDefinition(
 		recordFlags := src[cursor+3]
 		cursor += 4
 		if int(nameID) >= len(values) ||
-			int(physicalID) >= len(physical) || recordFlags != 0 ||
+			int(physicalID) >= len(physical) ||
+			recordFlags&^pageCatalogIndexUnique != 0 ||
 			values[nameID] == "" || i != 0 && values[nameID] <= previousName {
 			return PageCatalogDefinition{}, fmt.Errorf(
 				"%w: logical index alias", ErrPageCatalogCorrupt,
 			)
 		}
 		indexes[i] = PageCatalogIndex{
-			Name:  values[nameID],
-			Paths: slices.Clone(physical[physicalID].paths),
+			Name:   values[nameID],
+			Paths:  slices.Clone(physical[physicalID].paths),
+			Unique: recordFlags&pageCatalogIndexUnique != 0,
 		}
 		previousName = values[nameID]
 		usedStrings[nameID] = true
@@ -908,7 +916,7 @@ func clonePageCatalogIndexes(indexes []PageCatalogIndex) []PageCatalogIndex {
 	out := make([]PageCatalogIndex, len(indexes))
 	for i, index := range indexes {
 		out[i] = PageCatalogIndex{
-			Name: index.Name, Paths: slices.Clone(index.Paths),
+			Name: index.Name, Paths: slices.Clone(index.Paths), Unique: index.Unique,
 		}
 	}
 	return out

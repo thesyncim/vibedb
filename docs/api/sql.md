@@ -166,8 +166,40 @@ such as `1`, `1.0`, and `1e0` have one exact identity. Arrays and objects cannot
 be primary keys.
 
 `CREATE INDEX` creates an exact nonunique index. It supports one or more JSON
-paths and online creation over an existing table. `CREATE UNIQUE INDEX` is not
-supported on the local SQL surface.
+paths and online creation over an existing table.
+
+Use `UNIQUE` to make the exact scalar tuple a stored constraint:
+
+```text
+CREATE UNIQUE INDEX [IF NOT EXISTS] [index_name]
+ON table_name (path [, path ...])
+```
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS docs_category_score_key
+ON docs (category, score)
+```
+
+The index name is optional. An omitted name is derived from the path list. The
+list must contain one to four distinct JSON paths.
+
+Each participating path must contain a Boolean, number, or string. Exact
+numeric identity is canonical, so `1`, `1.0`, and `1e0` conflict. If any path
+is missing or JSON null, that document does not participate in the constraint.
+This is PostgreSQL's default `NULLS DISTINCT` behavior. Present arrays and
+objects fail the index build or later mutation instead of being omitted.
+
+Creation checks every existing document and publishes no index when it finds a
+duplicate or invalid container. INSERT, UPDATE, primary-key upsert, transaction
+commit, and reopen preserve the same constraint. The durable unique build holds
+the catalog write lock while it validates the table. Ordinary nonunique index
+creation retains its online build behavior.
+
+Column and table `UNIQUE` constraints and `NULLS NOT DISTINCT` are not
+supported. In an `OpenCluster` database, every unique index on a placed table
+must include all shard-key paths so one physical shard can enforce the complete
+constraint. The embedded driver returns `driver.ErrUniqueConstraint` for a
+secondary conflict. Embedded pgwire maps it to SQLSTATE `23505`.
 
 ## Insert, update, and delete
 
@@ -183,8 +215,33 @@ multi-row `INSERT ... VALUES` is atomic.
 `INSERT ... SELECT` requires exactly one output column that contains complete
 JSON documents. The source query reads the pre-statement snapshot.
 
-Conflict handling supports `ON CONFLICT DO NOTHING`. It does not support a
-conflict target or `DO UPDATE`.
+Conflict handling uses the document-derived primary key as its implicit target:
+
+```sql
+INSERT INTO docs VALUES (?) ON CONFLICT DO NOTHING
+
+INSERT INTO docs VALUES (?)
+ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc"
+
+INSERT INTO employees (id, team, score) VALUES (?, ?, ?)
+ON CONFLICT DO UPDATE SET team = EXCLUDED.team, score = ?
+```
+
+The whole-document form works for schemaless tables. The column form accepts
+distinct declared top-level targets with a scalar literal, placeholder,
+`NULL`, or `EXCLUDED.<declared-column>` value; unassigned fields in the current
+row are preserved. Every candidate document must satisfy the table schema even
+when it conflicts, and an updated post-image must preserve the primary key.
+Repeating one canonical candidate key in a `DO UPDATE` batch rejects the whole
+statement as a cardinality violation.
+
+Explicit conflict targets, `ON CONSTRAINT`, conflict-action `WHERE`, nested or
+row-dependent assignments, and `INSERT ... SELECT DO UPDATE` are not supported.
+Both actions target only the implicit primary key. A secondary unique-index
+conflict returns a unique violation and does not select either conflict action.
+Embedded pgwire exposes the same behavior. RF3/distributed writes reject every
+conflict action until branch-aware capture and global-index maintenance are
+available.
 
 `UPDATE` can replace the complete document:
 
@@ -194,8 +251,8 @@ SET "$doc" = ?
 WHERE id = ?
 ```
 
-For tables with declared columns, `UPDATE` can instead assign scalar literals
-or placeholders to one or more top-level columns:
+For tables with declared columns, `UPDATE` can instead assign scalar literals,
+placeholders, or `NULL` to one or more top-level columns:
 
 ```sql
 UPDATE employees
@@ -283,8 +340,8 @@ limits. Aggregate, spill, and join-pair limits are not session setters.
 ## Important SQL boundaries
 
 VibeDB is not PostgreSQL. It does not support schemas, roles, grants, COPY,
-procedures, notifications, partial-document updates, general scalar function
-calls, general `pg_catalog` SQL, or arbitrary PostgreSQL types.
+procedures, notifications, nested partial-document path updates, general scalar
+function calls, general `pg_catalog` SQL, or arbitrary PostgreSQL types.
 
 See the [SQL surface reference](../design/sql-surface.md) for supported query
 forms and exact refusals.
@@ -293,6 +350,7 @@ forms and exact refusals.
 
 - `sql/driver/driver.go`, `write.go`, `tx.go`, and `runtime.go`
 - `sql/driver/validate.go`, `primary.go`, and `primary_range.go`
+- `sql/driver/unique_index.go`, `unique_index_test.go`, and `upsert_test.go`
 - `sql/parser.go`, `parse_ddl.go`, and `parse_dml.go`
 - `sql/driver/surface_test.go`, `primary_range_test.go`, and
   `isolation_test.go`

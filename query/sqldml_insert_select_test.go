@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func TestPrepareDMLCompilesInsertSelectSeparately(t *testing.T) {
@@ -40,6 +42,19 @@ func TestPrepareDMLRejectsInsertSelectWidthAndStaticScalar(t *testing.T) {
 		if shape.Position() <= 0 {
 			t.Fatalf("PrepareDML(%q) position = %d", source, shape.Position())
 		}
+	}
+}
+
+func TestPrepareDMLRejectsInsertSelectConflictUpdate(t *testing.T) {
+	const source = `INSERT INTO dst SELECT * FROM src ` +
+		`ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc"`
+	_, err := PrepareDML(source)
+	var unsupported *sqlast.FeatureNotSupportedError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("PrepareDML = %T %v, want FeatureNotSupportedError", err, err)
+	}
+	if unsupported.Pos != strings.Index(source, "UPDATE") {
+		t.Fatalf("position = %d, want %d", unsupported.Pos, strings.Index(source, "UPDATE"))
 	}
 }
 

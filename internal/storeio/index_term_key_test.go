@@ -193,9 +193,61 @@ func TestIndexTermKeyValidationRejectsMalformed(t *testing.T) {
 		if ValidIndexTermKey(key) {
 			t.Fatalf("malformed key accepted: %x", key)
 		}
+		if _, ok := IndexTermKeyContainsNull(key); ok {
+			t.Fatalf("malformed key accepted by null inspection: %x", key)
+		}
 		if _, ok := OpenIndexTermKeyRecord(testStoreID, key); ok {
 			t.Fatalf("malformed key record accepted: %x", key)
 		}
+	}
+}
+
+func TestIndexTermKeyContainsNull(t *testing.T) {
+	cases := []struct {
+		name       string
+		components []IndexTermComponent
+		want       bool
+	}{
+		{
+			name: "only null",
+			components: []IndexTermComponent{
+				indexTerm(IndexTermNull, "null"),
+			},
+			want: true,
+		},
+		{
+			name: "compound leading null",
+			components: []IndexTermComponent{
+				indexTerm(IndexTermNull, "null"),
+				indexTerm(IndexTermString, `"tenant"`),
+			},
+			want: true,
+		},
+		{
+			name: "compound trailing null",
+			components: []IndexTermComponent{
+				indexTerm(IndexTermNumber, "7"),
+				indexTerm(IndexTermNull, "null"),
+			},
+			want: true,
+		},
+		{
+			name: "non-null",
+			components: []IndexTermComponent{
+				indexTerm(IndexTermBool, "false"),
+				indexTerm(IndexTermString, `"tenant"`),
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			key := mustIndexTermKey(t, test.components...)
+			got, valid := IndexTermKeyContainsNull(key)
+			if !valid || got != test.want {
+				t.Fatalf("IndexTermKeyContainsNull = (%v,%v), want (%v,true)",
+					got, valid, test.want)
+			}
+		})
 	}
 }
 

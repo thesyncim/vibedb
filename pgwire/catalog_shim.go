@@ -646,9 +646,15 @@ func respondTableIndexes(a *catalogAnswer, capture string) *fixedResult {
 		for i, path := range index.Paths {
 			display[i] = pointerDisplayName(path)
 		}
+		unique := "f"
+		definition := "CREATE INDEX "
+		if index.Unique {
+			unique = "t"
+			definition = "CREATE UNIQUE INDEX "
+		}
 		rows = append(rows, []*string{
-			strPtr(index.Name), strPtr("f"), strPtr("f"), strPtr("f"), strPtr("t"),
-			strPtr("CREATE INDEX " + index.Name + " ON public." + t.Name +
+			strPtr(index.Name), strPtr("f"), strPtr(unique), strPtr("f"), strPtr("t"),
+			strPtr(definition + index.Name + " ON public." + t.Name +
 				" USING exact (" + strings.Join(display, ", ") + ")"),
 			nil, nil, nil, nil, strPtr("f"), strPtr("0"), nil,
 		})

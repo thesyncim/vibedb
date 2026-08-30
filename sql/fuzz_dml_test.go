@@ -34,6 +34,8 @@ func FuzzParseStatement(f *testing.F) {
 		`INSERT INTO t VALUES ({"id":"a"}), ('{"id":"b"}')`,
 		`INSERT INTO t SELECT returning, returning, returning, returning, returning, returning, returning, returning FROM src WHERE`,
 		`INSERT INTO t (id, active) VALUES ('a', TRUE), ('b', FALSE)`,
+		`INSERT INTO t (id, name) VALUES (?, ?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name`,
+		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc" RETURNING id`,
 		`INSERT INTO t VALUES (`,
 		`UPDATE t SET "$doc" = ?`,
 		`UPDATE t SET "$doc" = ? WHERE a = 1 AND NOT b IS NULL`,
@@ -51,6 +53,10 @@ func FuzzParseStatement(f *testing.F) {
 		`CREATE INDEX ON t (a)`,
 		`CREATE INDEX n ON t (a.b[0], c)`,
 		`CREATE INDEX IF NOT EXISTS ON t (`,
+		`CREATE UNIQUE INDEX ON t (email)`,
+		`CREATE UNIQUE INDEX by_tenant_email ON t (tenant, profile.email)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS by_email ON t (email)`,
+		`CREATE UNIQUE INDEX ON t (a DESC)`,
 		`TRUNCATE t`,
 		`TRUNCATE TABLE "events"`,
 		`DROP INDEX by_age`,
@@ -229,6 +235,37 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 			}
 		}
 	}
+	if s.OnConflictDoNothing && s.OnConflictUpdate != nil {
+		t.Fatal("INSERT carries two ON CONFLICT actions")
+	}
+	if update := s.OnConflictUpdate; update != nil {
+		if len(update.Assignments) == 0 {
+			if !update.WholeDocument() {
+				t.Fatal("whole-document conflict update has an invalid source")
+			}
+		} else {
+			seenTargets := make(map[string]struct{}, len(update.Assignments))
+			for i := range update.Assignments {
+				assignment := &update.Assignments[i]
+				if _, duplicate := seenTargets[assignment.Column]; duplicate {
+					t.Fatalf("conflict target %q is assigned twice", assignment.Column)
+				}
+				seenTargets[assignment.Column] = struct{}{}
+				switch assignment.Value.Kind {
+				case OperandString, OperandNumber, OperandBool, OperandNull:
+				case OperandParam:
+					seen++
+				case OperandExcluded:
+					if assignment.Value.Text == DocumentColumn ||
+						assignment.Value.Text == "$key" {
+						t.Fatalf("conflict assignment reads reserved EXCLUDED source %q", assignment.Value.Text)
+					}
+				default:
+					t.Fatalf("conflict assignment %d has value kind %d", i, assignment.Value.Kind)
+				}
+			}
+		}
+	}
 	if seen != s.Params {
 		t.Fatalf("INSERT reports %d placeholders and holds %d", s.Params, seen)
 	}
@@ -246,12 +283,30 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 func checkUpdate(t *testing.T, s *UpdateStmt) {
 	t.Helper()
 	seen := 0
-	switch s.Doc.Kind {
-	case OperandString, OperandJSON:
-	case OperandParam:
-		seen++
-	default:
-		t.Fatalf("the assigned document has kind %d", s.Doc.Kind)
+	if len(s.Assignments) != 0 {
+		seenTargets := make(map[string]struct{}, len(s.Assignments))
+		for i := range s.Assignments {
+			assignment := &s.Assignments[i]
+			if _, duplicate := seenTargets[assignment.Column]; duplicate {
+				t.Fatalf("UPDATE target %q is assigned twice", assignment.Column)
+			}
+			seenTargets[assignment.Column] = struct{}{}
+			switch assignment.Value.Kind {
+			case OperandString, OperandNumber, OperandBool, OperandNull:
+			case OperandParam:
+				seen++
+			default:
+				t.Fatalf("UPDATE assignment %d has value kind %d", i, assignment.Value.Kind)
+			}
+		}
+	} else {
+		switch s.Doc.Kind {
+		case OperandString, OperandJSON:
+		case OperandParam:
+			seen++
+		default:
+			t.Fatalf("the assigned document has kind %d", s.Doc.Kind)
+		}
 	}
 	if s.Filter != nil {
 		seen += checkFilter(t, s.Filter)

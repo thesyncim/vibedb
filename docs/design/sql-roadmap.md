@@ -5,16 +5,18 @@ It is not a plan for complete PostgreSQL compatibility. Pgwire and RF3 should
 adopt a feature only after its embedded semantics and failure behavior are
 stable.
 
-## Release-critical gaps
+## Release-critical foundation status
 
-| Priority | Gap | Why it is required | Smallest safe slice |
-| --- | --- | --- | --- |
-| P0 | Declared-column `UPDATE` execution | Accepted syntax must not fail or silently use whole-document semantics. | Execute top-level scalar literal and placeholder assignments atomically in autocommit, transactions, `RETURNING`, capture, routing, and index maintenance. |
-| P0 | Executable `ALTER TABLE ... ADD COLUMN` | A parsed and lowered DDL statement must work through the public embedded driver. | Compile one immutable target schema, validate all rows in a shadow storage incarnation, retain indexes, and cut over atomically. |
-| P0 | Primary-key `ON CONFLICT DO UPDATE` | Idempotent ingestion needs an atomic create-or-update operation; application-side read/replace races. | Support the implicit primary-key conflict target first, with `EXCLUDED` values and the same assignment evaluator as `UPDATE`. |
-| P0 | Unique secondary constraints | Business keys cannot be enforced safely outside the write/commit boundary. | Add unique exact-index metadata and enforce it for inserts, updates, upserts, transactions, rebuilds, and reopen before adding richer constraint syntax. |
+| Status | Slice | Implemented boundary |
+| --- | --- | --- |
+| **Complete** | Declared-column `UPDATE` | Embedded autocommit, transactions, `RETURNING`, capture, routing, and index maintenance execute atomic top-level scalar literal, placeholder, and `NULL` assignments. Row-dependent and nested assignments remain outside this slice. |
+| **Complete** | `ALTER TABLE ... ADD COLUMN` | The embedded driver validates one additive schema in a replacement storage incarnation, retains indexes, and publishes atomically. The copy still blocks ordinary work under the catalog write lock. |
+| **Complete** | Primary-key `ON CONFLICT DO UPDATE` | Embedded `INSERT ... VALUES` supports whole-document replacement or declared top-level assignments from literals, placeholders, `NULL`, and `EXCLUDED`. The implicit primary key is the only target. |
+| **Complete** | Unique secondary constraints | Embedded `CREATE UNIQUE INDEX` enforces exact scalar tuples across build, DML, upsert, transactions, reopen, aliases, and drop. Default `NULLS DISTINCT` applies. RF3 SQL creation remains fail-closed. |
 
-The first two slices are implemented on `codex/sql-core-foundations`.
+These slices complete the original embedded P0 list. Embedded pgwire exposes
+the same behavior. RF3 does not inherit upsert or unique-index DDL until it can
+provide the same branch-aware and distributed uniqueness contracts.
 
 ## Required follow-on slices
 
@@ -34,24 +36,22 @@ Full PostgreSQL schemas, roles/grants, `COPY`, procedures, notifications,
 arbitrary PostgreSQL types, general `pg_catalog`, and cross-shard PostgreSQL
 transactions are outside the embedded must-have set.
 
-## Fast merge order
+## Fast next plan
 
-1. Close accepted-syntax/runtime mismatches: declared-column `UPDATE`, then
-   additive `ALTER TABLE`.
-2. Add primary-key `ON CONFLICT DO UPDATE` without waiting for secondary
-   uniqueness.
-3. Freeze catalog metadata for unique indexes, defaults, and checks.
-4. Implement unique enforcement and the shared mutation-expression evaluator.
-5. Build the remaining migration actions on the storage-incarnation seam.
-6. Add scalar and aggregate composability in independent files after the AST
-   contract is stable.
-7. Promote stable embedded behavior to pgwire and RF3 where those products
-   support the same atomicity contract.
+1. Add one deterministic row-expression evaluator for UPDATE and future
+   conflict actions. Use it for `score = score + 1` and the first common scalar
+   functions.
+2. Add catalog metadata for `DEFAULT` and `CHECK`, then extend the existing
+   storage-incarnation path with backfill and nullability changes.
+3. Add aggregate composability and a small SQL-visible vendor catalog in
+   independent lanes.
+4. Add heap/range-planning parity and move local schema copies outside the
+   exclusive catalog lock.
+5. Promote an embedded feature to RF3 only after its coordinator, capture,
+   routing, and failure behavior can preserve the embedded invariant.
 
-Parser/AST, catalog encoding, mutation integration, and storage replacement are
-hotspots. Give each one an exclusive owner within a merge wave; use new files
-for evaluators, unique enforcement, and upsert logic, with one integration owner
-for `write.go` and `tx.go`.
+Parser/AST, catalog encoding, mutation integration, and storage replacement
+remain hotspots. Give each one an exclusive owner within a merge wave.
 
 ## Verification cadence
 

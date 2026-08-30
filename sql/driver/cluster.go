@@ -3,6 +3,7 @@ package driver
 import (
 	stdsql "database/sql"
 	sqldriver "database/sql/driver"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/query"
@@ -50,9 +51,10 @@ func (cr *clusterRouting) binding(table string) *placementBinding {
 }
 
 // validateOpenedSchema enforces the uniqueness-locality invariant for every
-// placed table already present in the opened catalog: the primary key must
-// contain every shard-key column. Tables created later are validated at CREATE
-// TABLE time. It reports violations in configuration order.
+// placed table already present in the opened catalog: the primary key and
+// every local unique index must contain every shard-key column. Tables and
+// indexes created later are validated by their DDL paths. It reports
+// violations in configuration order.
 func (cr *clusterRouting) validateOpenedSchema(d *database) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -71,6 +73,18 @@ func (cr *clusterRouting) validateOpenedSchema(d *database) error {
 		); err != nil {
 			return err
 		}
+		for _, index := range meta.Indexes {
+			if !index.Unique {
+				continue
+			}
+			if !keyContainsShardColumns(index.Paths, binding.placement.Columns) {
+				return fmt.Errorf(
+					"%w: table %q unique index %q over %v does not contain shard-key columns %v",
+					ErrShardKeyNotLocal, table, index.Name, index.Paths,
+					binding.placement.Columns,
+				)
+			}
+		}
 	}
 	return nil
 }
@@ -88,6 +102,27 @@ func (cr *clusterRouting) validatePlacementLocality(table, primaryKey string) er
 		return nil
 	}
 	return validateShardKeyLocality(table, binding.placement.Columns, primaryKey)
+}
+
+// validateUniqueIndexLocality rejects a local unique index that could admit the
+// same tuple on two physical shards. It is a no-op outside a placed local
+// cluster; RF3 schema DDL has its own fail-closed gate.
+func (cr *clusterRouting) validateUniqueIndexLocality(
+	table, index string,
+	paths []string,
+) error {
+	if cr == nil {
+		return nil
+	}
+	binding := cr.bindings[table]
+	if binding == nil ||
+		keyContainsShardColumns(paths, binding.placement.Columns) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: table %q unique index %q over %v does not contain shard-key columns %v",
+		ErrShardKeyNotLocal, table, index, paths, binding.placement.Columns,
+	)
 }
 
 // OpenClusterConnector opens the SQL database at dsn as a degenerate single-shard
@@ -212,6 +247,29 @@ func (c *conn) routeInsertStagedWithBinding(
 		}
 	}
 	return nil
+}
+
+// checkUpsertShardKeyImmutable proves that a conflicting INSERT post-image
+// remains on the current row's physical shard. Candidate INSERT routing alone
+// is insufficient: an assignment could otherwise turn one conflict into what
+// looks like an ordinary insert for another shard.
+func (c *conn) checkUpsertShardKeyImmutable(
+	table string,
+	current []byte,
+	replacement []byte,
+) error {
+	binding := c.clusterBinding(table)
+	if binding == nil {
+		return nil
+	}
+	documents := [1][]byte{current}
+	route, err := insertPreflight(binding, documents[:])
+	if err != nil {
+		return err
+	}
+	return checkShardKeyImmutable(
+		binding, c.clusterRouter(), route, replacement,
+	)
 }
 
 // routeUpdate enforces the current write rules for a placed whole-document

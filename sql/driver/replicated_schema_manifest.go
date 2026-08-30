@@ -1,10 +1,24 @@
 package driver
 
 import (
+	"fmt"
+
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
 )
+
+func rejectReplicatedLocalUniqueIndexes(indexes []store.IndexDefinition) error {
+	for i := range indexes {
+		if indexes[i].Unique {
+			return fmt.Errorf(
+				"%w: replicated local unique index %q is not supported",
+				ErrReplicatedShardStoreProfile, indexes[i].Name,
+			)
+		}
+	}
+	return nil
+}
 
 // ReplicatedSchemaManifest computes the exact serving-machine schema for a
 // retained SQL identity and explicit local indexes without opening storage.
@@ -17,6 +31,9 @@ func ReplicatedSchemaManifest(identity ReplicatedShardStoreIdentity, placement R
 		return [32]byte{}, err
 	}
 	if err := validateReplicatedPlacementProfile(placement, identity); err != nil {
+		return [32]byte{}, err
+	}
+	if err := rejectReplicatedLocalUniqueIndexes(indexes); err != nil {
 		return [32]byte{}, err
 	}
 	if len(indexes) > 4096 {

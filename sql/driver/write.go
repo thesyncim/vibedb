@@ -542,6 +542,15 @@ func (d *database) createIndexContext(
 		d.mu.Unlock()
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, definition.Table)
 	}
+	if definition.Unique {
+		if err := d.cluster.validateUniqueIndexLocality(
+			definition.Table, definition.Definition.Name,
+			definition.Definition.Paths,
+		); err != nil {
+			d.mu.Unlock()
+			return nil, err
+		}
+	}
 	for _, index := range t.meta.Indexes {
 		if index.Name == definition.Definition.Name {
 			d.mu.Unlock()
@@ -550,6 +559,12 @@ func (d *database) createIndexContext(
 			}
 			return nil, fmt.Errorf("%w: %q", ErrIndexExists, index.Name)
 		}
+	}
+	if definition.Unique && t.collection != nil {
+		defer d.mu.Unlock()
+		return d.createUniqueIndexMaterializedLockedContext(
+			ctx, definition, t,
+		)
 	}
 	if t.collection == nil {
 		defer d.mu.Unlock()
@@ -681,6 +696,83 @@ func (d *database) createIndexContext(
 	return result{}, nil
 }
 
+// createUniqueIndexMaterializedLockedContext holds db.mu across the durable
+// build and SQL-catalog publication. Until the uniqueness bit is visible in
+// the in-memory layout, that fence prevents an ordinary SQL writer from
+// inserting a duplicate after durable validation but before metadata install.
+// The durable alias also persists Unique, so crash recovery cannot downgrade a
+// successfully published constraint when the SQL mirror trails it.
+func (d *database) createUniqueIndexMaterializedLockedContext(
+	ctx context.Context,
+	definition query.IndexDefinition,
+	t *table,
+) (sqldriver.Result, error) {
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
+	_, err := t.collection.CreateUniqueIndexContext(ctx, definition.Definition)
+	if err != nil {
+		if errors.Is(err, store.ErrUniqueIndexViolation) {
+			return nil, fmt.Errorf(
+				"%w: index %q found duplicate existing values",
+				ErrUniqueConstraint, definition.Definition.Name,
+			)
+		}
+		if errors.Is(err, store.ErrIndexExists) && definition.IfNotExists {
+			return result{}, nil
+		}
+		if errors.Is(err, store.ErrIndexExists) {
+			return nil, fmt.Errorf(
+				"%w: %q", ErrIndexExists, definition.Definition.Name,
+			)
+		}
+		if errors.Is(err, durable.ErrIndexBuildInProgress) {
+			return nil, fmt.Errorf(
+				"%w: table %q", ErrIndexBuildInProgress, definition.Table,
+			)
+		}
+		if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+			// The durable page catalog is authoritative for the Unique bit. Mirror
+			// whatever is observable and retain a pending SQL-catalog repair.
+			_, _ = syncTableIndexMeta(t)
+			d.catalogWritePending = true
+			d.advanceLayoutEpochLocked()
+			return nil, err
+		}
+		return nil, err
+	}
+
+	// A nil durable result proves publication. Install the in-memory constraint
+	// even if reading the durable catalog or persisting its SQL mirror fails;
+	// subsequent SQL writes must remain fenced by the new invariant.
+	t.meta.Indexes = append(t.meta.Indexes, indexMeta{
+		Name:   definition.Definition.Name,
+		Paths:  append([]string(nil), definition.Definition.Paths...),
+		Unique: true,
+	})
+	if _, syncErr := syncTableIndexMeta(t); syncErr != nil {
+		d.catalogWritePending = true
+		d.advanceLayoutEpochLocked()
+		return nil, fmt.Errorf(
+			"%w: durable unique index committed before SQL catalog refresh: %v",
+			durable.ErrCommitOutcomeUnknown, syncErr,
+		)
+	}
+	d.advanceLayoutEpochLocked()
+	published, persistErr := d.persistCatalogLocked()
+	if persistErr != nil {
+		d.catalogWritePending = !published
+		if published {
+			return nil, persistErr
+		}
+		return nil, fmt.Errorf(
+			"%w: durable unique index committed before SQL catalog publication: %v",
+			durable.ErrCommitOutcomeUnknown, persistErr,
+		)
+	}
+	return result{}, nil
+}
+
 func (d *database) createIndexLockedContext(
 	ctx context.Context,
 	statement *query.DMLStatement,
@@ -702,6 +794,14 @@ func (d *database) createIndexLockedContext(
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, definition.Table)
 	}
+	if definition.Unique {
+		if err := d.cluster.validateUniqueIndexLocality(
+			definition.Table, definition.Definition.Name,
+			definition.Definition.Paths,
+		); err != nil {
+			return nil, err
+		}
+	}
 	for _, index := range t.meta.Indexes {
 		if index.Name == definition.Definition.Name {
 			if definition.IfNotExists {
@@ -717,7 +817,9 @@ func (d *database) createIndexLockedContext(
 	}
 	proposed := append([]indexMeta(nil), t.meta.Indexes...)
 	proposed = append(proposed, indexMeta{
-		Name: definition.Definition.Name, Paths: append([]string(nil), definition.Definition.Paths...),
+		Name:   definition.Definition.Name,
+		Paths:  append([]string(nil), definition.Definition.Paths...),
+		Unique: definition.Unique,
 	})
 	candidateMeta := *t.meta
 	candidateMeta.Indexes = proposed
@@ -770,13 +872,31 @@ func (c *conn) insertLocked(
 			ctx, statement, args, t, limits, source, returning, returned,
 		)
 	}
-	seeds := make([]seedDocument, 0, len(tree.Rows))
+	conflictUpdate := tree.OnConflictUpdate
+	if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
+		if err := validateUpsertColumnAssignments(
+			tree.Table, t.meta, conflictUpdate.Assignments,
+		); err != nil {
+			return nil, err
+		}
+		if err := validateColumnAssignmentBindings(
+			conflictUpdate.Assignments, args,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	// Resolve and validate every candidate before deciding which conflict
+	// branch it takes. Besides matching SQL constraint order, this lets routing
+	// preflight the authored INSERT batch rather than a set of post-images whose
+	// conflict updates could conceal a cross-shard candidate.
+	candidates := make([]seedDocument, 0, len(tree.Rows))
 	var seen map[string]struct{}
 	if len(tree.Rows) > 1 {
 		seen = make(map[string]struct{}, len(tree.Rows))
 	}
-	stagedBytes := 0
-	cancellable := ctx.Done() != nil
+	candidateBytes := 0
+	cancellable := contextCanCancel(ctx)
 	for i := range tree.Rows {
 		if cancellable {
 			if err := contextCheckpoint(ctx); err != nil {
@@ -790,9 +910,22 @@ func (c *conn) insertLocked(
 		if err != nil {
 			return nil, err
 		}
+		if tree.HasConflictAction() {
+			if err := validateDocument(
+				t.schema, document, limits.MaxDocumentBytes, &c.insertTape,
+			); err != nil {
+				return nil, err
+			}
+		}
 		if _, duplicate := seen[key]; duplicate {
 			if tree.OnConflictDoNothing {
 				continue
+			}
+			if conflictUpdate != nil {
+				return nil, fmt.Errorf(
+					"%w: candidate key %q appears twice in one VALUES batch",
+					ErrUpsertCardinality, key,
+				)
 			}
 			return nil, fmt.Errorf(
 				"%w: %q appears twice in one VALUES batch",
@@ -802,26 +935,104 @@ func (c *conn) insertLocked(
 		if seen != nil {
 			seen[key] = struct{}{}
 		}
-		if tree.OnConflictDoNothing && t.collection != nil {
+		if len(key) > limits.MaxBatchBytes-candidateBytes ||
+			len(document) > limits.MaxBatchBytes-candidateBytes-len(key) {
+			return nil, fmt.Errorf(
+				"vibedb: INSERT exceeds the %d-byte durable batch limit: %w",
+				limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+			)
+		}
+		candidateBytes += len(key) + len(document)
+		candidates = append(candidates, seedDocument{key: key, document: document})
+	}
+	if err := c.routeInsertSeeds(tree.Table, candidates); err != nil {
+		return nil, err
+	}
+
+	seeds := candidates
+	if tree.HasConflictAction() && t.collection != nil {
+		snapshot, snapshotErr := t.collection.Snapshot()
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		defer snapshot.Close()
+
+		seeds = candidates[:0]
+		scratch := c.pointRaw[:0]
+		defer func() { c.pointRaw = scratch[:0] }()
+		stagedBytes := 0
+		for i := range candidates {
+			if cancellable {
+				if err := contextCheckpoint(ctx); err != nil {
+					return nil, err
+				}
+			}
+			candidate := candidates[i]
 			var found bool
-			found, err = t.collection.ContainsKey([]byte(key))
+			scratch, found, err = snapshot.AppendRaw(
+				scratch[:0], []byte(candidate.key),
+			)
 			if err != nil {
 				return nil, err
 			}
-			if found {
+			if found && tree.OnConflictDoNothing {
 				continue
 			}
+			finalDocument := candidate.document
+			if found && conflictUpdate != nil {
+				if !conflictUpdate.WholeDocument() {
+					finalDocument, err = ApplyColumnAssignmentsWithExcluded(
+						scratch, candidate.document,
+						conflictUpdate.Assignments, args,
+						limits.MaxDocumentBytes,
+					)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := validateDocument(
+					t.schema, finalDocument, limits.MaxDocumentBytes,
+					&c.insertTape,
+				); err != nil {
+					return nil, err
+				}
+				// Keep UPDATE's shard-move error precedence even though primary-key
+				// locality currently makes an unchanged key sufficient in placed
+				// tables. The explicit check preserves that invariant if placement
+				// grows beyond the present single-path key contract.
+				if err := c.checkUpsertShardKeyImmutable(
+					tree.Table, scratch, finalDocument,
+				); err != nil {
+					return nil, err
+				}
+				finalKey, err := documentKey(
+					finalDocument, t.meta.PrimaryKey, t.primary,
+					limits.MaxKeyBytes,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if finalKey != candidate.key {
+					return nil, fmt.Errorf(
+						"%w: conflict replacement key %q does not match candidate key %q",
+						ErrUpdatePrimaryKey, finalKey, candidate.key,
+					)
+				}
+			}
+			if len(candidate.key) > limits.MaxBatchBytes-stagedBytes ||
+				len(finalDocument) > limits.MaxBatchBytes-stagedBytes-len(candidate.key) {
+				return nil, fmt.Errorf(
+					"vibedb: INSERT conflict action exceeds the %d-byte mutation batch limit for table %q: %w",
+					limits.MaxBatchBytes, tree.Table, durable.ErrBatchTooLarge,
+				)
+			}
+			seeds = append(seeds, seedDocument{
+				key: candidate.key, document: finalDocument,
+			})
+			stagedBytes += len(candidate.key) + len(finalDocument)
 		}
-		stagedBytes += len(key) + len(document)
-		if stagedBytes > limits.MaxBatchBytes {
-			return nil, fmt.Errorf(
-				"vibedb: INSERT would stage %d key/document bytes, durable batch limit is %d: %w",
-				stagedBytes, limits.MaxBatchBytes, durable.ErrBatchTooLarge,
-			)
-		}
-		seeds = append(seeds, seedDocument{key: key, document: document})
 	}
-	if err := c.routeInsertSeeds(tree.Table, seeds); err != nil {
+	if err := validateTableUniquePostimages(ctx, t, seeds, nil); err != nil {
 		return nil, err
 	}
 	if returning != nil {
@@ -859,7 +1070,7 @@ func (c *conn) insertLocked(
 		}
 		return result{affected: int64(len(seeds))}, nil
 	}
-	if !tree.OnConflictDoNothing {
+	if !tree.HasConflictAction() {
 		if err := c.rejectExistingSeeds(ctx, t.collection, seeds); err != nil {
 			return nil, err
 		}
@@ -1036,6 +1247,9 @@ func (c *conn) insertSelectLocked(
 		}
 	}
 	if err := c.routeInsertSeedsWithBinding(placement, seeds); err != nil {
+		return nil, err
+	}
+	if err := validateTableUniquePostimages(ctx, t, seeds, nil); err != nil {
 		return nil, err
 	}
 	if returning != nil {
@@ -1316,16 +1530,16 @@ func putSeedsAtomic(collection *durable.Collection, seeds []seedDocument) error 
 		return nil
 	case 1:
 		_, err := collection.Put([]byte(seeds[0].key), seeds[0].document)
-		return err
+		return mapDurableUniqueConstraintError(err)
 	}
-	return collection.Update(func(batch *durable.WriteBatch) error {
+	return mapDurableUniqueConstraintError(collection.Update(func(batch *durable.WriteBatch) error {
 		for _, seed := range seeds {
 			if err := batch.Put([]byte(seed.key), seed.document); err != nil {
 				return err
 			}
 		}
 		return nil
-	})
+	}))
 }
 
 func resolveInsertRow(
@@ -2167,6 +2381,20 @@ func (c *conn) updateLockedReturning(
 			)
 		}
 	}
+	if tableHasUniqueIndexes(t) {
+		clear(c.insertSeeds)
+		seeds := c.insertSeeds[:0]
+		defer func() {
+			clear(seeds)
+			c.insertSeeds = seeds[:0]
+		}()
+		for _, key := range keys {
+			seeds = append(seeds, seedDocument{key: key, document: document})
+		}
+		if err := validateTableUniquePostimages(ctx, t, seeds, keys); err != nil {
+			return nil, err
+		}
+	}
 	if returning != nil {
 		if returned == nil {
 			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
@@ -2213,7 +2441,7 @@ func (c *conn) updateLockedReturning(
 		t.conflicts.recordKeys(keys)
 	}
 	if mutationErr != nil {
-		return nil, mutationErr
+		return nil, mapDurableUniqueConstraintError(mutationErr)
 	}
 	return result{affected: int64(len(keys))}, nil
 }
@@ -2337,6 +2565,9 @@ func (c *conn) updateColumnsLockedReturning(
 				}
 			}
 		}
+	}
+	if err := validateTableUniquePostimages(ctx, t, seeds, keys); err != nil {
+		return nil, err
 	}
 	if returning != nil {
 		cursor, err := returning.RunInto(

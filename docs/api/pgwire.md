@@ -100,6 +100,25 @@ SQL, consistency, and topology limits. See
 [PostgreSQL access to distributed RF3 SQL](../design/rf3-postgresql.md); do not
 infer those capabilities from the embedded example on this page.
 
+## Unique indexes
+
+The embedded backend accepts `CREATE UNIQUE INDEX` over one to four JSON paths.
+It constrains exact Boolean, number, and string tuples. A tuple with any missing
+or JSON-null component does not participate, which gives default `NULLS
+DISTINCT` behavior. Present arrays and objects are errors. A duplicate found
+during the build leaves no index, and a later duplicate INSERT, UPDATE, upsert,
+or transaction returns SQLSTATE `23505`.
+
+The syntax does not support column or table `UNIQUE`, `NULLS NOT DISTINCT`, or
+an explicit conflict target. `ON CONFLICT` always targets the implicit primary
+key, not a secondary unique index. See [SQL with `database/sql`](sql.md) for the
+full embedded contract.
+
+The distributed RF3 backend rejects SQL `CREATE UNIQUE INDEX` with SQLSTATE
+`0A000` before schema-rollout dispatch. Operator-provisioned global unique-index
+metadata remains valid and can appear in discovery. Its presence does not make
+distributed SQL DDL available for that index.
+
 ## Placeholders
 
 Extended SQL accepts `$1`, `$2`, and later numbered placeholders. It also
@@ -233,8 +252,9 @@ return empty results. The current shim does not expose VibeDB SQL views through
 GoLand 2026.2 PostgreSQL discovery and PostgreSQL JDBC 42.7.3 metadata requests
 are covered by captured full, fragment, and refresh query contracts. They expose
 the current database, `public`, real tables, declared columns, primary keys, and
-exact indexes. Schemaless tables expose their key and `"$doc"`; discovery never
-scans documents to guess a schema. All document/path projections remain JSON.
+exact indexes, including whether each index is unique. Schemaless tables expose
+their key and `"$doc"`. Discovery never scans documents to guess a schema. All
+document/path projections remain JSON.
 `SELECT id, documents."$doc" FROM documents` returns the key and whole document;
 an explicit `AS` can rename the document column.
 
@@ -287,6 +307,7 @@ GoLand search-path probe also emits the one-element `text[]` `{public}`.
 
 - `pgwire/server.go`, `proto.go`, and `extended.go`
 - `pgwire/session.go`, `command.go`, and `pgerror.go`
+- `pgwire/unique_index_metadata_test.go`
 - `pgwire/scram.go` and `tls_test.go`
 - `pgwire/catalog_shim.go`
 - `pgwire/catalog_discovery.go`, `catalog_discovery_jdbc.go`, and captured JSON contracts

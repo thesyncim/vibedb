@@ -204,13 +204,17 @@ type AlterTableStmt struct {
 	Pos         int
 }
 
-// A CreateIndexStmt is one parsed CREATE INDEX.
+// A CreateIndexStmt is one parsed CREATE [UNIQUE] INDEX.
 //
 // The indexed thing is a path, in the same path language everything else uses,
 // so an index on "profile.region" indexes what a WHERE on "profile.region"
 // reads. Several paths make a compound index, which the engine's exact index
 // already supports as an order-sensitive key.
 type CreateIndexStmt struct {
+	// Unique records UNIQUE. Its enforcement belongs to the catalog/storage
+	// adapter that creates the index; carrying it in the AST prevents a unique
+	// declaration from being weakened into an ordinary lookup index.
+	Unique bool
 	// Name is the index's name. It is optional in the grammar; when the
 	// statement gives none, a lowering pass derives one from the paths, because
 	// the store's index catalog is keyed by name and an unnamed index would

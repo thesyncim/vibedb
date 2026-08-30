@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -83,5 +84,19 @@ func TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities(t *testi
 				}
 			}
 		})
+	}
+}
+
+func TestReplicatedSchemaManifestRejectsLocalUniqueIndex(t *testing.T) {
+	source, _, _ := childSchemaIdentity(t, true, false)
+	_, err := ReplicatedSchemaManifest(
+		source, testReplicatedApplyOptions().Placement,
+		[]store.IndexDefinition{{
+			Name: "by_email", Paths: []string{"/email"}, Unique: true,
+		}},
+	)
+	if !errors.Is(err, ErrReplicatedShardStoreProfile) {
+		t.Fatalf("serving manifest unique index = %v, want %v",
+			err, ErrReplicatedShardStoreProfile)
 	}
 }

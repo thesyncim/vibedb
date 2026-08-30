@@ -298,6 +298,12 @@ func canonicalLocalIndexes(input []store.IndexDefinition) ([]store.IndexDefiniti
 	}
 	result := make([]store.IndexDefinition, len(input))
 	for i := range input {
+		if input[i].Unique {
+			return nil, fmt.Errorf(
+				"%w: replicated local unique indexes are not supported",
+				store.ErrIndexDefinition,
+			)
+		}
 		compiled, err := store.CompileExactIndex(input[i])
 		if err != nil {
 			return nil, err
@@ -332,7 +338,8 @@ func validateRelationIndexCatalog(
 	}
 	for i := range got {
 		if got[i].Name != want[i].Name || got[i].Kind != store.IndexExact ||
-			got[i].State != store.IndexReady || int(got[i].ColumnCount) != len(want[i].Paths) {
+			got[i].State != store.IndexReady || got[i].Unique != want[i].Unique ||
+			int(got[i].ColumnCount) != len(want[i].Paths) {
 			return ErrSchemaProfile
 		}
 		for column := range want[i].Paths {

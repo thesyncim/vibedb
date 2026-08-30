@@ -419,7 +419,8 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 		return newError(sqlstateUndefinedObject, err.Error())
 	case errors.Is(err, sqldriver.ErrIndexAmbiguous):
 		return newError(sqlstateAmbiguousAlias, err.Error())
-	case errors.Is(err, sqldriver.ErrDuplicatePrimaryKey):
+	case errors.Is(err, sqldriver.ErrDuplicatePrimaryKey),
+		errors.Is(err, sqldriver.ErrUniqueConstraint):
 		return newError(sqlstateUniqueViolation, err.Error())
 	case errors.Is(err, store.ErrSchemaViolation):
 		return newError(sqlstateCheckViolation, err.Error())

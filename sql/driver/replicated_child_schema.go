@@ -110,7 +110,7 @@ func validateReplicatedChildSchemaDefinition(table, primaryKey, createTable stri
 			}
 		case statement.CreateIndex != nil:
 			index := statement.CreateIndex
-			if !index.HasName || index.IfNotExists || index.Table != table || len(indexes) == 4096 {
+			if index.Unique || !index.HasName || index.IfNotExists || index.Table != table || len(indexes) == 4096 {
 				return fail()
 			}
 			if _, duplicate := names[index.Name]; duplicate {

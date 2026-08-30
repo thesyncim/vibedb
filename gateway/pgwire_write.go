@@ -49,6 +49,12 @@ func (s *postgresSession) prepareWrite(
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
 	}
+	if parsed.Kind == sqlast.KindInsert && parsed.Insert.HasConflictAction() {
+		return nil, sqlast.NewFeatureNotSupportedError(
+			text, 0,
+			"RF3 PostgreSQL ON CONFLICT requires branch-aware replicated writes",
+		)
+	}
 	documents := postgresWriteDocumentParameters(parsed)
 	parameterTypes = postgresScalarDMLParameterTypes(parameterTypes, documents)
 	var compiled *query.DMLStatement

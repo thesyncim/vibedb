@@ -57,7 +57,7 @@ var (
 	viewMetaFields           = vibejson.MakeFieldSet("query", "columns", "outputs", "view_dependencies", "table_dependencies")
 	schemaMetaFields         = vibejson.MakeFieldSet("root", "fields")
 	schemaFieldFields        = vibejson.MakeFieldSet("path", "types", "required")
-	indexMetaFields          = vibejson.MakeFieldSet("name", "paths")
+	indexMetaFields          = vibejson.MakeFieldSet("name", "paths", "unique")
 	shardStoreIdentityFields = vibejson.MakeFieldSet("distribution", "shard", "allocation_generation", "log_id")
 	shardStoreFenceFields    = vibejson.MakeFieldSet("ownership_epoch", "routing_version")
 )
@@ -425,6 +425,9 @@ func appendSchemaMeta(w vibejson.TrustedAppender, m schemaMeta) vibejson.Trusted
 func appendIndexMeta(w vibejson.TrustedAppender, m indexMeta) vibejson.TrustedAppender {
 	w = w.RawUnchecked(`{"name":`).String(m.Name).RawUnchecked(`,"paths":`)
 	w = appendStringArray(w, m.Paths)
+	if m.Unique {
+		w = w.RawUnchecked(`,"unique":true`)
+	}
 	return w.RawByteUnchecked('}')
 }
 
@@ -848,10 +851,13 @@ func decodeIndexMetaVibe(c *vibejson.DecodeCursor, dst *indexMeta) error {
 		if err := markCatalogField(&seen, index, "index", name); err != nil {
 			return err
 		}
-		if index == 0 {
+		switch index {
+		case 0:
 			err = decodeBoundedCatalogString(c, &decoded.Name, maxCatalogBytes, "index name")
-		} else {
+		case 1:
 			err = decodeStringListVibe(c, &decoded.Paths, storeio.PageCatalogMaxIndexColumns, "index paths")
+		case 2:
+			err = c.Bool(&decoded.Unique)
 		}
 		if err != nil {
 			return err

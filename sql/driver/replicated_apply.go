@@ -739,8 +739,9 @@ func replicatedApplyLocalIndexes(t *table) []store.IndexDefinition {
 	result := make([]store.IndexDefinition, len(t.meta.Indexes))
 	for i := range t.meta.Indexes {
 		result[i] = store.IndexDefinition{
-			Name:  strings.Clone(t.meta.Indexes[i].Name),
-			Paths: append([]string(nil), t.meta.Indexes[i].Paths...),
+			Name:   strings.Clone(t.meta.Indexes[i].Name),
+			Paths:  append([]string(nil), t.meta.Indexes[i].Paths...),
+			Unique: t.meta.Indexes[i].Unique,
 		}
 	}
 	return result

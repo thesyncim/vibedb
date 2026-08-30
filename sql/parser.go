@@ -99,20 +99,21 @@ type Parser struct {
 
 	// Reused whole-clause slices. Unlike the arenas these hold no interior
 	// pointers into themselves, so a plain reslice-to-zero is enough.
-	columns            []ResultColumn
-	from               []TableRef
-	groupBy            []*PathExpr
-	orderBy            []OrderTerm
-	rows               []InsertRow
-	updateAssignments  []UpdateAssignment
-	cols               []ColumnDef
-	keyPaths           []*PathExpr
-	idxPaths           []*PathExpr
-	cteScratch         []CommonTableExpr
-	cteNameScratch     []string
-	cteAliasPosScratch []int
-	joinKeyScratch     []JoinKeyCond
-	joinNameScratch    []string
+	columns             []ResultColumn
+	from                []TableRef
+	groupBy             []*PathExpr
+	orderBy             []OrderTerm
+	rows                []InsertRow
+	updateAssignments   []UpdateAssignment
+	conflictAssignments []UpdateAssignment
+	cols                []ColumnDef
+	keyPaths            []*PathExpr
+	idxPaths            []*PathExpr
+	cteScratch          []CommonTableExpr
+	cteNameScratch      []string
+	cteAliasPosScratch  []int
+	joinKeyScratch      []JoinKeyCond
+	joinNameScratch     []string
 
 	// The statement bodies [Parser.ParseStatement] hands back by pointer. They
 	// are fields rather than arena allocations because there is exactly one of
@@ -125,6 +126,7 @@ type Parser struct {
 	with             WithClause
 	returning        SelectStmt
 	ins              InsertStmt
+	conflict         InsertConflictUpdate
 	upd              UpdateStmt
 	del              DeleteStmt
 	tbl              CreateTableStmt
@@ -472,6 +474,7 @@ func (p *Parser) reset(src string) {
 	p.orderBy = p.orderBy[:0]
 	p.rows = p.rows[:0]
 	p.updateAssignments = p.updateAssignments[:0]
+	p.conflictAssignments = p.conflictAssignments[:0]
 	p.cols = p.cols[:0]
 	p.keyPaths = p.keyPaths[:0]
 	p.idxPaths = p.idxPaths[:0]
@@ -485,6 +488,7 @@ func (p *Parser) reset(src string) {
 	p.opScratch = p.opScratch[:0]
 	p.pending = p.pending[:0]
 	p.returning = SelectStmt{}
+	p.conflict = InsertConflictUpdate{}
 	p.with = WithClause{}
 	p.filterColumns = p.filterColumns[:0]
 	p.filterFrom = p.filterFrom[:0]

@@ -276,6 +276,7 @@ func normalizeOpenedFileStoreOptions(
 		for i, index := range definition.Indexes {
 			options.Indexes[i] = store.IndexDefinition{
 				Name: index.Name, Paths: slices.Clone(index.Paths),
+				Unique: index.Unique,
 			}
 		}
 	}

@@ -1552,6 +1552,11 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	if state.root.Generation >= fileLogicalCutGenerationMask {
 		return false, false, false, storeio.ErrGenerationOrder
 	}
+	if err := c.validatePrimaryUniquePut(
+		canonical, found, route, stableSlot,
+	); err != nil {
+		return false, false, false, err
+	}
 	generation := state.root.Generation + 1
 	prepared, err := overlay.prepare(
 		route.Bucket, route.Hash, generation, key, canonical,
