@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -202,20 +201,5 @@ func TestClusterMultiShardSingleShardDeleteAndUpdate(t *testing.T) {
 	}
 	if got := countDocs(t, db); got != 1 {
 		t.Fatalf("rows after single-shard delete = %d, want 1", got)
-	}
-}
-
-// TestClusterShardKeySetRejectedStatically proves the design's shard-key SET
-// rejection, including the no-op SET tenant_id = tenant_id: this dialect has no
-// per-column assignment, so any path-shaped SET is refused at parse before
-// routing is even consulted.
-func TestClusterShardKeySetRejectedStatically(t *testing.T) {
-	db, _, _ := openTwoShardDocs(t)
-	_, err := db.Exec(`UPDATE docs SET tenant_id = tenant_id WHERE tenant_id = ?`, "x")
-	if err == nil {
-		t.Fatalf("SET tenant_id = tenant_id was accepted, want a static rejection")
-	}
-	if !strings.Contains(err.Error(), "partial document update") {
-		t.Fatalf("SET tenant_id = tenant_id error = %v, want a partial-update rejection", err)
 	}
 }

@@ -14,7 +14,6 @@ func TestLeadingFeatureRefusalsAreTypedAndPositioned(t *testing.T) {
 	}{
 		{"copy", "COPY docs TO STDOUT", "COPY is not supported"},
 		{"lock", "LOCK TABLE docs IN ACCESS EXCLUSIVE MODE", "there is no SQL lock manager"},
-		{"alter table", "ALTER TABLE docs ADD COLUMN n STRING", "ALTER is not in the bounded catalog subset"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseStatement(tc.src)

@@ -40,6 +40,7 @@ func TestSQLCapabilityRequiresCompleteParsedSemantics(t *testing.T) {
 
 	schema := []string{
 		"CREATE TABLE docs (id TEXT)",
+		"ALTER TABLE docs ADD COLUMN n INT",
 		"CREATE INDEX docs_by_id ON docs (id)",
 		"CREATE VIEW visible_docs AS SELECT * FROM docs",
 		"DROP TABLE docs",
@@ -66,7 +67,6 @@ func TestSQLCapabilityRequiresCompleteParsedSemantics(t *testing.T) {
 		"WITH changed AS (INSERT INTO docs VALUES (?) RETURNING id) SELECT id FROM changed",
 		"SELECT * FROM docs UNKNOWN CLAUSE",
 		"SELECT * FROM docs /* comment */ DELETE FROM docs",
-		"ALTER TABLE docs ADD COLUMN n INT",
 		"RENAME TABLE docs TO old_docs",
 		"REFRESH MATERIALIZED VIEW visible_docs",
 		"GRANT ALL ON docs",

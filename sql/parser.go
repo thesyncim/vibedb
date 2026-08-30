@@ -104,6 +104,7 @@ type Parser struct {
 	groupBy            []*PathExpr
 	orderBy            []OrderTerm
 	rows               []InsertRow
+	updateAssignments  []UpdateAssignment
 	cols               []ColumnDef
 	keyPaths           []*PathExpr
 	idxPaths           []*PathExpr
@@ -470,6 +471,7 @@ func (p *Parser) reset(src string) {
 	p.groupBy = p.groupBy[:0]
 	p.orderBy = p.orderBy[:0]
 	p.rows = p.rows[:0]
+	p.updateAssignments = p.updateAssignments[:0]
 	p.cols = p.cols[:0]
 	p.keyPaths = p.keyPaths[:0]
 	p.idxPaths = p.idxPaths[:0]

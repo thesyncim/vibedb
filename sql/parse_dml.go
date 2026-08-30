@@ -704,33 +704,34 @@ func (p *Parser) parseUpdate() error {
 		return err
 	}
 	p.upd.SetPos = p.tok.pos
-	whole, assignment, err := p.parseAssignment()
+	whole, wholeDocument, assignment, err := p.parseAssignment()
 	if err != nil {
 		return err
 	}
-	if whole != nil {
-		p.upd.Doc = *whole
+	if wholeDocument {
+		p.upd.Doc = whole
 		if p.tok.kind == tokComma {
 			return p.errHere("a whole-document UPDATE cannot be combined with column assignments")
 		}
 	} else {
-		p.upd.Assignments = append(p.upd.Assignments, assignment)
+		p.updateAssignments = append(p.updateAssignments, assignment)
 		for p.tok.kind == tokComma {
 			p.advance()
-			whole, assignment, err = p.parseAssignment()
+			whole, wholeDocument, assignment, err = p.parseAssignment()
 			if err != nil {
 				return err
 			}
-			if whole != nil {
+			if wholeDocument {
 				return p.errHere("a whole-document UPDATE cannot be combined with column assignments")
 			}
-			for i := range p.upd.Assignments {
-				if p.upd.Assignments[i].Column == assignment.Column {
+			for i := range p.updateAssignments {
+				if p.updateAssignments[i].Column == assignment.Column {
 					return p.errfAt(assignment.Pos, "UPDATE assigns column %q more than once", assignment.Column)
 				}
 			}
-			p.upd.Assignments = append(p.upd.Assignments, assignment)
+			p.updateAssignments = append(p.updateAssignments, assignment)
 		}
+		p.upd.Assignments = p.updateAssignments
 	}
 	if p.atKeyword(kwFrom) {
 		return p.errHere("UPDATE ... FROM is not supported: the value written comes from the statement, never from another collection")
@@ -752,44 +753,39 @@ func (p *Parser) parseUpdate() error {
 	return nil
 }
 
-// parseAssignment parses the single `"$doc" = value` assignment an UPDATE
-// carries, and refuses a path assignment with the reason.
-//
-// The refusal is the largest deliberate gap in this dialect, and it is written
-// out at length on [UpdateStmt] rather than here, because a reader hitting the
-// message wants the alternative and a reader reading the type wants the
-// argument. What the message has to carry is the alternative: read, edit, write
-// back.
-func (p *Parser) parseAssignment() (*Operand, UpdateAssignment, error) {
+// parseAssignment parses either the single whole-document replacement or one
+// declared top-level column assignment. The explicit boolean keeps the common
+// whole-document path allocation-free without making a local Operand escape.
+func (p *Parser) parseAssignment() (Operand, bool, UpdateAssignment, error) {
 	if p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == DocumentColumn {
 		p.advance()
 		if p.tok.kind != tokEq {
-			return nil, UpdateAssignment{}, p.errfHere("expected '=' after %q", DocumentColumn)
+			return Operand{}, false, UpdateAssignment{}, p.errfHere("expected '=' after %q", DocumentColumn)
 		}
 		p.advance()
 		doc, err := p.parseDocumentOperand()
-		return &doc, UpdateAssignment{}, err
+		return doc, true, UpdateAssignment{}, err
 	}
 	path, err := p.parsePath(false)
 	if err != nil {
-		return nil, UpdateAssignment{}, err
+		return Operand{}, false, UpdateAssignment{}, err
 	}
 	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
-		return nil, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... must name one declared top-level column", path.Spec())
+		return Operand{}, false, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... must name one declared top-level column", path.Spec())
 	}
 	column := path.Segments[0].Key
 	if column == DocumentColumn || column == "$key" {
-		return nil, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... names a reserved column", path.Spec())
+		return Operand{}, false, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... names a reserved column", path.Spec())
 	}
 	if p.tok.kind != tokEq {
-		return nil, UpdateAssignment{}, p.errfHere("expected '=' after %s", path.Spec())
+		return Operand{}, false, UpdateAssignment{}, p.errfHere("expected '=' after %s", path.Spec())
 	}
 	p.advance()
 	value, err := p.parseOperand()
 	if err != nil {
-		return nil, UpdateAssignment{}, err
+		return Operand{}, false, UpdateAssignment{}, err
 	}
-	return nil, UpdateAssignment{Column: column, Value: value, Pos: path.Pos}, nil
+	return Operand{}, false, UpdateAssignment{Column: column, Value: value, Pos: path.Pos}, nil
 }
 
 // --- DELETE ------------------------------------------------------------------

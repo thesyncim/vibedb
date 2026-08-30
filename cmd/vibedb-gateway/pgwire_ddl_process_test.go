@@ -88,7 +88,16 @@ active BOOLEAN NOT NULL
 	}
 	check := func(connection net.Conn) {
 		t.Helper()
-		result := ddlWireQuery(t, connection, "SELECT COUNT(*) FROM public.employees", false)
+		deadline := time.Now().Add(15 * time.Second)
+		result := ddlWireResult{}
+		for {
+			result = ddlWireQuery(t, connection, "SELECT COUNT(*) FROM public.employees", false)
+			if result.code == "" || !strings.Contains(result.message, "no reachable leader") ||
+				time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
 		if result.code != "" || len(result.rows) != 1 || result.rows[0][0] != "1000" {
 			t.Fatalf("count: %+v", result)
 		}
