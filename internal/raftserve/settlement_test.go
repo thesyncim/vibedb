@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -587,6 +588,40 @@ func TestRegistrySettlementFailsClosedOnMalformedApplicationData(t *testing.T) {
 				t.Fatalf("settlement = %v", err)
 			}
 		})
+	}
+}
+
+func TestRegistrySettlementAcceptsAuthenticatedSchemaControlEntry(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	group := testGroup(26)
+	one := func(value byte) [sha256.Size]byte {
+		var digest [sha256.Size]byte
+		digest[0] = value
+		return digest
+	}
+	binding := replicatedstate.Binding{
+		ClusterID: replication.ID128(group.ClusterID), ClusterIncarnation: replication.ID128(group.ClusterIncarnation),
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, Distribution: "distribution", Shard: "all",
+		AllocationGeneration: 1, ShardIncarnation: replication.ID128(group.ShardIncarnation),
+		GroupID: replication.ID128(group.GroupID), ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+		OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
+		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+	}
+	command, err := replicatedstate.AppendSchemaTransition(nil, replicatedstate.SchemaTransition{
+		From: binding, ToSchemaGeneration: 2, ExpectedReplicaSetVersion: 1, MembershipSequence: 1,
+		MembershipSource: one(1), MembershipTarget: one(2), FromManifest: one(3), FromApplyContract: one(4),
+		ToManifest: one(5), ToApplyContract: one(6), RequestDigest: one(7), AuthorizationDigest: one(8),
+		CatalogCASDigest: one(9),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = settleAppliedBatch(registry, newTestAppliedBatch(group, 50, 9, command)); err != nil {
+		t.Fatalf("schema settlement = %v", err)
+	}
+	foreign := newTestAppliedBatch(testGroup(27), 50, 9, command)
+	if err = settleAppliedBatch(registry, foreign); !errors.Is(err, ErrSettlementResult) {
+		t.Fatalf("foreign schema settlement = %v", err)
 	}
 }
 

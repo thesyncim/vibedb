@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -15,6 +16,14 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestGenerationBuilderCancelBeforeBuild(t *testing.T) {
+	builder := &GenerationBuilder{cancel: make(chan struct{})}
+	builder.Cancel()
+	if _, err := builder.Build(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Build after Cancel = %v", err)
+	}
+}
 
 func testGenerationSnapshot(index, term uint64, data string) *pb.Snapshot {
 	return &pb.Snapshot{

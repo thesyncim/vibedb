@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,9 +16,10 @@ import (
 )
 
 const (
-	replicatedSchemaActivationName        = ".schema-activation"
-	replicatedSchemaActivationTemp        = ".schema-activation.tmp"
-	replicatedSchemaActivationHeaderBytes = 48
+	replicatedSchemaActivationName          = ".schema-activation"
+	replicatedSchemaActivationTemp          = ".schema-activation.tmp"
+	replicatedSchemaActivationHeaderBytes   = 48
+	replicatedSchemaActivationV1HeaderBytes = 64
 )
 
 var replicatedSchemaActivationMagic = [8]byte{'V', 'D', 'B', 'S', 'A', 'C', 'T', 0}
@@ -43,8 +45,26 @@ func replicatedSchemaCatalogCASDigest(
 }
 
 type replicatedSchemaActivation struct {
-	targetDigest [sha256.Size]byte
-	command      []byte
+	targetDigest      [sha256.Size]byte
+	preparedApplied   uint64
+	preCommandApplied uint64
+	command           []byte
+}
+
+func replicatedSchemaActivationCommittedApplied(
+	record replicatedSchemaActivation, preparedApplied uint64,
+) (uint64, error) {
+	if preparedApplied == 0 || preparedApplied == ^uint64(0) {
+		return 0, ErrReplicatedSchemaCatalogImage
+	}
+	if record.preparedApplied == 0 && record.preCommandApplied == 0 {
+		return preparedApplied + 1, nil
+	}
+	if record.preparedApplied != preparedApplied ||
+		record.preCommandApplied <= preparedApplied || record.preCommandApplied == ^uint64(0) {
+		return 0, ErrReplicatedSchemaCatalogImage
+	}
+	return record.preCommandApplied + 1, nil
 }
 
 func replicatedSchemaActivationMatchesCatalog(catalogPath string) (bool, error) {
@@ -107,20 +127,30 @@ func PublishedReplicatedSchemaActivationIdentity(
 
 func encodeReplicatedSchemaActivation(record replicatedSchemaActivation) ([]byte, error) {
 	if record.targetDigest == ([sha256.Size]byte{}) || len(record.command) == 0 ||
-		len(record.command) > replicatedstate.MaxSchemaTransitionBytes {
+		len(record.command) > replicatedstate.MaxSchemaTransitionBytes ||
+		(record.preparedApplied == 0) != (record.preCommandApplied == 0) ||
+		record.preCommandApplied != 0 && record.preCommandApplied < record.preparedApplied {
 		return nil, ErrReplicatedSchemaCatalogImage
 	}
 	if _, err := replicatedstate.OpenSchemaTransition(record.command); err != nil {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
-	total := replicatedSchemaActivationHeaderBytes + len(record.command) + sha256.Size
+	version, header := uint16(0), replicatedSchemaActivationHeaderBytes
+	if record.preparedApplied != 0 {
+		version, header = 1, replicatedSchemaActivationV1HeaderBytes
+	}
+	total := header + len(record.command) + sha256.Size
 	raw := make([]byte, total)
 	copy(raw[:8], replicatedSchemaActivationMagic[:])
-	binary.LittleEndian.PutUint16(raw[8:10], 0)
+	binary.LittleEndian.PutUint16(raw[8:10], version)
 	binary.LittleEndian.PutUint16(raw[10:12], uint16(len(record.command)))
 	binary.LittleEndian.PutUint32(raw[12:16], uint32(total))
 	copy(raw[16:48], record.targetDigest[:])
-	copy(raw[48:], record.command)
+	if version == 1 {
+		binary.LittleEndian.PutUint64(raw[48:56], record.preparedApplied)
+		binary.LittleEndian.PutUint64(raw[56:64], record.preCommandApplied)
+	}
+	copy(raw[header:], record.command)
 	h := sha256.New()
 	_, _ = h.Write(replicatedSchemaActivationChecksumDomain)
 	_, _ = h.Write(raw[:total-sha256.Size])
@@ -131,13 +161,19 @@ func encodeReplicatedSchemaActivation(record replicatedSchemaActivation) ([]byte
 func decodeReplicatedSchemaActivation(raw []byte) (replicatedSchemaActivation, error) {
 	if len(raw) < replicatedSchemaActivationHeaderBytes+sha256.Size ||
 		!bytes.Equal(raw[:8], replicatedSchemaActivationMagic[:]) ||
-		binary.LittleEndian.Uint16(raw[8:10]) != 0 ||
 		binary.LittleEndian.Uint32(raw[12:16]) != uint32(len(raw)) {
+		return replicatedSchemaActivation{}, ErrReplicatedSchemaCatalogImage
+	}
+	version := binary.LittleEndian.Uint16(raw[8:10])
+	header := replicatedSchemaActivationHeaderBytes
+	if version == 1 {
+		header = replicatedSchemaActivationV1HeaderBytes
+	} else if version != 0 {
 		return replicatedSchemaActivation{}, ErrReplicatedSchemaCatalogImage
 	}
 	commandBytes := int(binary.LittleEndian.Uint16(raw[10:12]))
 	if commandBytes == 0 || commandBytes > replicatedstate.MaxSchemaTransitionBytes ||
-		replicatedSchemaActivationHeaderBytes+commandBytes+sha256.Size != len(raw) {
+		header+commandBytes+sha256.Size != len(raw) {
 		return replicatedSchemaActivation{}, ErrReplicatedSchemaCatalogImage
 	}
 	checksumAt := len(raw) - sha256.Size
@@ -151,7 +187,11 @@ func decodeReplicatedSchemaActivation(raw []byte) (replicatedSchemaActivation, e
 	}
 	record := replicatedSchemaActivation{command: make([]byte, commandBytes)}
 	copy(record.targetDigest[:], raw[16:48])
-	copy(record.command, raw[48:checksumAt])
+	if version == 1 {
+		record.preparedApplied = binary.LittleEndian.Uint64(raw[48:56])
+		record.preCommandApplied = binary.LittleEndian.Uint64(raw[56:64])
+	}
+	copy(record.command, raw[header:checksumAt])
 	canonical, err := encodeReplicatedSchemaActivation(record)
 	if err != nil || !bytes.Equal(canonical, raw) {
 		return replicatedSchemaActivation{}, errors.Join(err, ErrReplicatedSchemaCatalogImage)
@@ -174,7 +214,7 @@ func readReplicatedSchemaActivation(dataDir string) (replicatedSchemaActivation,
 		return replicatedSchemaActivation{}, false, err
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(file,
-		int64(replicatedSchemaActivationHeaderBytes+replicatedstate.MaxSchemaTransitionBytes+
+		int64(replicatedSchemaActivationV1HeaderBytes+replicatedstate.MaxSchemaTransitionBytes+
 			sha256.Size+1)))
 	err = errors.Join(readErr, file.Close())
 	if err != nil {
@@ -328,28 +368,53 @@ func ObservePersistedReplicatedSchemaTransition(
 		return replicatedstate.SchemaTransitionView{}, false, err
 	}
 	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
+	lineageSelected := false
+	if err == nil && found && (marker.catalogDigest != record.targetDigest ||
+		marker.schemaGeneration != transition.ToSchemaGeneration ||
+		marker.authorization != transition.RequestDigest ||
+		marker.applyContract != transition.ToApplyContract ||
+		marker.placementDigest != transition.ToPlacementDigest) {
+		// A completed N rollout may remain the selected restart authority while
+		// N+1 has only staged its target/marker. The bounded lineage slot retains
+		// N's exact marker and activation before the single staging slot is
+		// replaced. Recover N from that selected proof; N+1 has no persisted
+		// transition yet and cannot supersede it.
+		lineage, selected, lineageErr := selectedSchemaLineage(absolute)
+		if lineageErr != nil || !selected ||
+			!bytes.Equal(lineage.activation.command, record.command) ||
+			lineage.activation.targetDigest != record.targetDigest {
+			return replicatedstate.SchemaTransitionView{}, false,
+				errors.Join(err, lineageErr, ErrReplicatedSchemaCatalogImage)
+		}
+		marker, lineageSelected = lineage.marker, true
+	}
 	if err != nil || !found || marker.catalogDigest != record.targetDigest ||
 		marker.schemaGeneration != transition.ToSchemaGeneration ||
-		marker.membership.Sequence != transition.MembershipSequence ||
-		marker.membership.Source != transition.MembershipSource ||
-		marker.membership.Target != transition.MembershipTarget ||
 		marker.authorization != transition.RequestDigest ||
 		marker.applyContract != transition.ToApplyContract ||
 		marker.placementDigest != transition.ToPlacementDigest {
 		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
-	root, err := os.OpenRoot(absolute + ".tables")
-	if err != nil {
-		return replicatedstate.SchemaTransitionView{}, false, err
-	}
-	file, err := root.Open(replicatedSchemaTargetCatalogName)
-	if err != nil {
-		return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, root.Close())
-	}
-	raw, err := io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
-	err = errors.Join(err, file.Close(), root.Close())
-	if err != nil {
-		return replicatedstate.SchemaTransitionView{}, false, err
+	var raw []byte
+	if lineageSelected {
+		raw, found, err = readCatalogFile(absolute)
+		if err != nil || !found {
+			return replicatedstate.SchemaTransitionView{}, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		}
+	} else {
+		root, openErr := os.OpenRoot(absolute + ".tables")
+		if openErr != nil {
+			return replicatedstate.SchemaTransitionView{}, false, openErr
+		}
+		file, openErr := root.Open(replicatedSchemaTargetCatalogName)
+		if openErr != nil {
+			return replicatedstate.SchemaTransitionView{}, false, errors.Join(openErr, root.Close())
+		}
+		raw, openErr = io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
+		openErr = errors.Join(openErr, file.Close(), root.Close())
+		if openErr != nil {
+			return replicatedstate.SchemaTransitionView{}, false, openErr
+		}
 	}
 	image, err := ValidateReplicatedSchemaCatalogImage(raw)
 	if err != nil || image.Digest != record.targetDigest ||
@@ -362,6 +427,64 @@ func ObservePersistedReplicatedSchemaTransition(
 		return replicatedstate.SchemaTransitionView{}, false, err
 	}
 	return transition, true, nil
+}
+
+// ObservePersistedReplicatedSchemaEmptySuffix returns the activation's exact
+// prepared and pre-command indexes. Nonzero bounds are usable only after the
+// RF3 owner verifies the corresponding WAL entries as empty normal entries.
+func ObservePersistedReplicatedSchemaEmptySuffix(
+	path string, command []byte,
+) (preparedApplied, preCommandApplied uint64, found bool, err error) {
+	transition, found, err := ObservePersistedReplicatedSchemaTransition(path)
+	if err != nil || !found || !bytes.Equal(transition.Bytes(), command) {
+		if err == nil && found {
+			err = ErrReplicatedSchemaCatalogImage
+		}
+		return 0, 0, false, err
+	}
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !found || !bytes.Equal(record.command, command) {
+		return 0, 0, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	marker, markerFound, err := readReplicatedSchemaStageMarker(absolute + ".tables")
+	if err != nil || !markerFound {
+		return 0, 0, false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if record.preparedApplied == 0 && record.preCommandApplied == 0 {
+		return 0, 0, false, nil
+	}
+	if record.preparedApplied != marker.sourceApplied ||
+		record.preCommandApplied <= record.preparedApplied {
+		return 0, 0, false, ErrReplicatedSchemaCatalogImage
+	}
+	return record.preparedApplied, record.preCommandApplied, true, nil
+}
+
+// ObservePersistedReplicatedSchemaCommittedApplied returns the sole Raft index
+// at which the authenticated activation command must appear. The caller uses
+// it only to bind the exact WAL command bytes supplied to cold recovery.
+func ObservePersistedReplicatedSchemaCommittedApplied(path string, command []byte) (uint64, error) {
+	transition, found, err := ObservePersistedReplicatedSchemaTransition(path)
+	if err != nil || !found || !bytes.Equal(transition.Bytes(), command) {
+		return 0, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return 0, err
+	}
+	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !found || !bytes.Equal(record.command, command) {
+		return 0, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
+	if err != nil || !found {
+		return 0, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return replicatedSchemaActivationCommittedApplied(record, marker.sourceApplied)
 }
 
 // ObserveDrainedReplicatedSchemaSource reports whether every source relation
@@ -387,29 +510,32 @@ func drainPublishedReplicatedSchemaSource(
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
 	if lineage, selected, err := selectedSchemaLineage(absolute); err != nil {
-		return false, err
+		return false, fmt.Errorf("observe selected schema lineage: %w", err)
 	} else if selected && bytes.Equal(lineage.activation.command, command) {
 		return true, nil
 	}
 	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
 	if err != nil || !found || !bytes.Equal(record.command, command) {
-		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		return false, fmt.Errorf("%w: drain activation found=%t command=%t: %v",
+			ErrReplicatedSchemaCatalogImage, found, bytes.Equal(record.command, command), err)
 	}
 	if _, active, observeErr := ObservePublishedReplicatedSchemaTransition(path); observeErr != nil || !active {
-		return false, errors.Join(observeErr, ErrReplicatedSchemaCatalogImage)
+		return false, fmt.Errorf("%w: drain published active=%t: %v", ErrReplicatedSchemaCatalogImage, active, observeErr)
 	}
 	marker, found, err := readReplicatedSchemaStageMarker(absolute + ".tables")
 	if err != nil || !found || len(marker.sourceStorages) == 0 {
-		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		return false, fmt.Errorf("%w: drain marker found=%t source-storages=%d: %v",
+			ErrReplicatedSchemaCatalogImage, found, len(marker.sourceStorages), err)
 	}
-	if marker.sourceApplied == ^uint64(0) {
-		return false, ErrReplicatedSchemaCatalogImage
+	committedApplied, err := replicatedSchemaActivationCommittedApplied(record, marker.sourceApplied)
+	if err != nil {
+		return false, fmt.Errorf("resolve drain committed applied: %w", err)
 	}
 	if err := durable.ValidateSelectedCheckpointMembershipTransition(
 		absolute+".tables", marker.membership, marker.authorization,
-		marker.sourceApplied+1, sha256.Sum256(record.command),
+		committedApplied, sha256.Sum256(record.command),
 	); err != nil {
-		return false, err
+		return false, fmt.Errorf("validate selected drain checkpoint: %w", err)
 	}
 	targets := make(map[[32]byte]struct{}, len(marker.storages))
 	for _, storage := range marker.storages {
@@ -417,12 +543,12 @@ func drainPublishedReplicatedSchemaSource(
 	}
 	root, err := os.OpenRoot(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory))
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("open drain source directory: %w", err)
 	}
 	defer root.Close()
 	for _, storage := range marker.sourceStorages {
 		if _, target := targets[storage]; target {
-			return false, ErrReplicatedSchemaCatalogImage
+			return false, fmt.Errorf("%w: drain source aliases target", ErrReplicatedSchemaCatalogImage)
 		}
 		base := hex.EncodeToString(storage[:]) + ".vjc"
 		for _, name := range [...]string{base, base + ".rjournal"} {
@@ -431,20 +557,20 @@ func drainPublishedReplicatedSchemaSource(
 				continue
 			}
 			if statErr != nil {
-				return false, statErr
+				return false, fmt.Errorf("stat drain source %q: %w", name, statErr)
 			}
 			if !remove {
 				return false, nil
 			}
 			if err = root.Remove(name); err != nil && !os.IsNotExist(err) {
-				return false, err
+				return false, fmt.Errorf("remove drain source %q: %w", name, err)
 			}
 		}
 	}
 	// Absence on a retry can be the readable result of an unfenced deletion.
 	// Fence even when this attempt removed nothing before authorizing GC.
 	if err = syncReplicatedSchemaDirectory(filepath.Join(absolute+".tables", replicatedSchemaSourcesDirectory)); err != nil {
-		return false, err
+		return false, fmt.Errorf("fence drained source directory: %w", err)
 	}
 	// Absence of old files is not yet completed drain authority: the prior
 	// attempt may have failed before retaining the restart lineage. Observe
@@ -453,7 +579,7 @@ func drainPublishedReplicatedSchemaSource(
 		return false, nil
 	}
 	if err := retainDrainedSchemaLineage(absolute, marker, record); err != nil {
-		return false, err
+		return false, fmt.Errorf("retain drained schema lineage: %w", err)
 	}
 	return true, nil
 }
@@ -513,15 +639,28 @@ func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err 
 		return false, err
 	}
 	applied, committed, err := a.machine.ObserveSchemaTransition(record.command)
-	if err != nil || !committed || applied != marker.sourceApplied+1 {
+	wantApplied, boundErr := replicatedSchemaActivationCommittedApplied(record, marker.sourceApplied)
+	emptySuffix := record.preparedApplied != 0
+	if boundErr != nil {
+		return false, boundErr
+	}
+	if err != nil || !committed || applied != wantApplied {
 		return false, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
 	if d.checkpointGroup == nil {
 		return false, ErrReplicatedSchemaCatalogImage
 	}
-	if err := d.checkpointGroup.FinalizeMembershipTransition(
-		marker.membership, marker.authorization, applied, sha256.Sum256(record.command),
-	); err != nil {
+	commandDigest := sha256.Sum256(record.command)
+	if emptySuffix {
+		err = d.checkpointGroup.FinalizeMembershipTransitionAfterEmptySuffix(
+			marker.membership, marker.authorization, record.preparedApplied, applied, commandDigest,
+		)
+	} else {
+		err = d.checkpointGroup.FinalizeMembershipTransition(
+			marker.membership, marker.authorization, applied, commandDigest,
+		)
+	}
+	if err != nil {
 		return false, err
 	}
 	bound, err := catalogSizeUpperBound(d.catalog)
@@ -631,12 +770,19 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 		transition.ToApplyContract == ([32]byte{}) {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
+	machineCommand := record.command
+	machineTransition := transition
+	if openOptions.SchemaCommittedTransition != "" {
+		committed, committedErr := replicatedstate.OpenSchemaTransition([]byte(openOptions.SchemaCommittedTransition))
+		if committedErr != nil || !replicatedSchemaTransitionEqualExceptCatalogCAS(transition, committed) {
+			return nil, errors.Join(committedErr, ErrReplicatedSchemaCatalogImage)
+		}
+		machineCommand = []byte(openOptions.SchemaCommittedTransition)
+		machineTransition = committed
+	}
 	marker, markerFound, err := readReplicatedSchemaStageMarker(dataDir)
 	if err != nil || !markerFound || marker.catalogDigest != image.Digest ||
 		marker.schemaGeneration != image.SchemaGeneration ||
-		marker.membership.Sequence != transition.MembershipSequence ||
-		marker.membership.Source != transition.MembershipSource ||
-		marker.membership.Target != transition.MembershipTarget ||
 		marker.authorization != transition.RequestDigest ||
 		marker.applyContract != transition.ToApplyContract || marker.placementDigest != transition.ToPlacementDigest {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
@@ -646,14 +792,15 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 		!selected.ReplicatedShardStore.Equal(expected) || selected.ReplicatedApply.identity() != expectedApply {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
-	if marker.sourceApplied == ^uint64(0) {
-		return nil, ErrReplicatedSchemaCatalogImage
+	committedApplied, err := replicatedSchemaActivationCommittedApplied(record, marker.sourceApplied)
+	if err != nil {
+		return nil, err
 	}
 	if err := fencePublishedReplicatedSchemaCatalog(absolute); err != nil {
 		return nil, err
 	}
 	if err := durable.ValidateFinalizedCheckpointMembershipTransition(
-		dataDir, marker.membership, marker.authorization, marker.sourceApplied+1, sha256.Sum256(record.command),
+		dataDir, marker.membership, marker.authorization, committedApplied, sha256.Sum256(record.command),
 	); err != nil {
 		return nil, err
 	}
@@ -665,11 +812,11 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 		openOptions:               openOptions,
 		expectedReplicated:        ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedApply:   expectedApply,
-		schemaTransition:          record.command,
+		schemaTransition:          machineCommand,
 		schemaMembership:          marker.membership,
 		schemaCheckpointAuthority: transition.RequestDigest,
-		schemaAuthorization:       transition.AuthorizationDigest,
-		schemaCatalogCAS:          transition.CatalogCASDigest,
+		schemaAuthorization:       machineTransition.AuthorizationDigest,
+		schemaCatalogCAS:          machineTransition.CatalogCASDigest,
 	})
 	if err != nil {
 		return nil, err
@@ -677,31 +824,61 @@ func OpenReplicatedShardStoreWithSchemaTransition(
 	return &Database{connector: &dbConnector{db: core}}, nil
 }
 
+func replicatedSchemaTransitionEqualExceptCatalogCAS(
+	a, b replicatedstate.SchemaTransitionView,
+) bool {
+	left, right := a.SchemaTransition, b.SchemaTransition
+	left.CatalogCASDigest, right.CatalogCASDigest = [sha256.Size]byte{}, [sha256.Size]byte{}
+	return left == right
+}
+
 // PersistReplicatedSchemaTransition records the exact authorized command
 // before proposal. A committed transition can therefore be recovered without
 // consulting an external controller or reconstructing semantically equivalent
 // bytes.
 func (a *ReplicatedApply) PersistReplicatedSchemaTransition(command []byte) error {
+	return a.persistReplicatedSchemaTransition(command, 0, 0)
+}
+
+// PersistReplicatedSchemaTransitionAfterEmptySuffix records the exact source
+// cut and the last independently verified empty Raft entry preceding command.
+// The caller must have read and rejected every non-empty or non-normal entry in
+// this closed interval. Publication rechecks these bounds before allowing the
+// prepared membership's one semantic transition.
+func (a *ReplicatedApply) PersistReplicatedSchemaTransitionAfterEmptySuffix(
+	command []byte, preparedApplied, preCommandApplied uint64,
+) error {
+	if preparedApplied == 0 || preCommandApplied <= preparedApplied {
+		return ErrReplicatedSchemaCatalogImage
+	}
+	return a.persistReplicatedSchemaTransition(command, preparedApplied, preCommandApplied)
+}
+
+func (a *ReplicatedApply) persistReplicatedSchemaTransition(
+	command []byte, preparedApplied, preCommandApplied uint64,
+) error {
 	if a == nil || a.database == nil {
 		return ErrReplicatedApplyClosed
 	}
 	transition, err := replicatedstate.OpenSchemaTransition(command)
 	if err != nil {
-		return err
+		return fmt.Errorf("persist schema transition decode: %w", err)
 	}
 	marker, found, err := readReplicatedSchemaStageMarker(a.database.dataDir)
 	if err != nil || !found || marker.schemaGeneration != transition.ToSchemaGeneration ||
-		marker.membership.Sequence != transition.MembershipSequence ||
-		marker.membership.Source != transition.MembershipSource ||
-		marker.membership.Target != transition.MembershipTarget ||
 		marker.catalogDigest == ([32]byte{}) || marker.applyContract != transition.ToApplyContract ||
 		marker.placementDigest != transition.ToPlacementDigest ||
 		marker.authorization != transition.RequestDigest {
-		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		return fmt.Errorf("persist schema transition stage marker found=%t generation=%t catalog=%t contract=%t placement=%t request=%t: %w",
+			found, marker.schemaGeneration == transition.ToSchemaGeneration,
+			marker.catalogDigest != ([32]byte{}), marker.applyContract == transition.ToApplyContract,
+			marker.placementDigest == transition.ToPlacementDigest,
+			marker.authorization == transition.RequestDigest,
+			errors.Join(err, ErrReplicatedSchemaCatalogImage))
 	}
 	root, err := os.OpenRoot(a.database.dataDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("persist schema transition open target: %w", err)
 	}
 	file, err := root.Open(replicatedSchemaTargetCatalogName)
 	if err != nil {
@@ -711,19 +888,24 @@ func (a *ReplicatedApply) PersistReplicatedSchemaTransition(command []byte) erro
 	raw, readErr := io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
 	err = errors.Join(readErr, file.Close(), root.Close())
 	if err != nil {
-		return err
+		return fmt.Errorf("persist schema transition read target: %w", err)
 	}
 	image, err := ValidateReplicatedSchemaCatalogImage(raw)
 	if err != nil || image.Digest != marker.catalogDigest ||
 		image.SchemaGeneration != marker.schemaGeneration ||
 		image.RelationManifestDigest != transition.ToManifest {
-		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		return fmt.Errorf("persist schema transition target identity: %w", errors.Join(err, ErrReplicatedSchemaCatalogImage))
 	}
 	if err := fenceReplicatedSchemaFiles(a.database.dataDir,
 		replicatedSchemaStageMarkerName, replicatedSchemaTargetCatalogName); err != nil {
-		return err
+		return fmt.Errorf("persist schema transition fence target: %w", err)
 	}
-	return writeReplicatedSchemaActivation(a.database.dataDir, replicatedSchemaActivation{
-		targetDigest: marker.catalogDigest, command: command,
+	err = writeReplicatedSchemaActivation(a.database.dataDir, replicatedSchemaActivation{
+		targetDigest: marker.catalogDigest, preparedApplied: preparedApplied,
+		preCommandApplied: preCommandApplied, command: command,
 	})
+	if err != nil {
+		return fmt.Errorf("persist schema transition activation record: %w", err)
+	}
+	return nil
 }

@@ -80,6 +80,21 @@ func DescribeReplicatedSchemaCatalogImage(raw []byte) (ReplicatedSchemaCatalogDe
 		LogicalSchemaDigest: logical, Table: tableInfoFromMeta(identity.UserTable, catalog.Tables[identity.UserTable])}, nil
 }
 
+// DescribeReplicatedSchemaCatalog reads one retained, bounded canonical catalog
+// for cold control-plane reconstruction such as split-child provisioning after
+// an online schema generation change.
+func DescribeReplicatedSchemaCatalog(path string) (ReplicatedSchemaCatalogDescription, error) {
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return ReplicatedSchemaCatalogDescription{}, err
+	}
+	raw, found, err := readCatalogFile(absolute)
+	if err != nil || !found {
+		return ReplicatedSchemaCatalogDescription{}, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return DescribeReplicatedSchemaCatalogImage(raw)
+}
+
 func openReplicatedSchemaCatalogImage(
 	raw []byte,
 ) (catalogFile, ReplicatedSchemaCatalogImage, error) {

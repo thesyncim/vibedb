@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/sql/driver"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -51,6 +52,8 @@ type fakeRuntime struct {
 	pendingSettlement   bool
 	discardProposals    bool
 	commitMetrics       raftmodel.CommitMetrics
+	schemaQuiesceCalls  int
+	schemaQuiesceErrs   []error
 }
 
 func newFakeRuntime(seed byte) *fakeRuntime {
@@ -136,6 +139,23 @@ func (runtime *fakeRuntime) Identity() raftmember.RuntimeIdentity   { return run
 func (runtime *fakeRuntime) Failure() error                         { return runtime.failure }
 func (runtime *fakeRuntime) HasPendingResultSettlement() bool       { return runtime.pendingSettlement }
 func (runtime *fakeRuntime) CommitMetrics() raftmodel.CommitMetrics { return runtime.commitMetrics }
+func (runtime *fakeRuntime) QuiesceSQLGeneration() error {
+	runtime.schemaQuiesceCalls++
+	if len(runtime.schemaQuiesceErrs) != 0 {
+		err := runtime.schemaQuiesceErrs[0]
+		runtime.schemaQuiesceErrs = runtime.schemaQuiesceErrs[1:]
+		return err
+	}
+	return nil
+}
+func (runtime *fakeRuntime) InstallSQLGeneration(
+	*driver.Database,
+	*driver.ReplicatedApply,
+	driver.ReplicatedShardStoreIdentity,
+	driver.ReplicatedApplyIdentity,
+) error {
+	return nil
+}
 
 func (runtime *fakeRuntime) Propose(data []byte) error {
 	if !runtime.discardProposals {
@@ -650,6 +670,103 @@ func TestHostIdleGroupLeavesRunnableQueue(t *testing.T) {
 	progress, done, err := host.RunOne()
 	if err != nil || !done || progress.Kind != ProgressTick {
 		t.Fatalf("explicit wake = %+v, %t, %v", progress, done, err)
+	}
+}
+
+func TestHostSchemaQuiescenceLatchesAdmissionUntilQueuedWorkDrains(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(91)
+	if err = host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, runErr := host.RunOne(); done || runErr != nil {
+		t.Fatalf("initial Ready probe = %t, %v", done, runErr)
+	}
+	if err = host.RequestTick(runtime.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	if err = host.QuiesceSQLGeneration(runtime.identity.Group); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("quiesce with admitted tick = %v", err)
+	}
+	if err = host.RequestTick(runtime.identity.Group); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("tick admitted while quiescing: %v", err)
+	}
+	if err = host.RequestCampaign(runtime.identity.Group); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("campaign admitted while quiescing: %v", err)
+	}
+	if err = host.EnqueueProposal(runtime.identity.Group, []byte("next")); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("proposal admitted while quiescing: %v", err)
+	}
+	message := hostMessage(runtime.identity.MemberID+1, runtime.identity.MemberID, "quiescing")
+	if err = host.EnqueueMessage(runtime.identity.Group, message); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("message admitted while quiescing: %v", err)
+	}
+	if _, done, runErr := host.RunOne(); !done || runErr != nil {
+		t.Fatalf("drain admitted tick = %t, %v", done, runErr)
+	}
+	if err = host.QuiesceSQLGeneration(runtime.identity.Group); err != nil {
+		t.Fatalf("quiesce after drain: %v", err)
+	}
+	if runtime.schemaQuiesceCalls != 1 {
+		t.Fatalf("runtime quiesce calls = %d", runtime.schemaQuiesceCalls)
+	}
+}
+
+func TestHostSchemaQuiescenceRefusalRewakesUncountedRuntimeReady(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(92)
+	runtime.schemaQuiesceErrs = []error{raftmodel.ErrReadyPending}
+	if err = host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, runErr := host.RunOne(); done || runErr != nil {
+		t.Fatalf("initial Ready probe = %t, %v", done, runErr)
+	}
+	if err = host.QuiesceSQLGeneration(runtime.identity.Group); !errors.Is(err, ErrGroupBusy) ||
+		host.runnableLen() != 1 {
+		t.Fatalf("runtime refusal err=%v runnable=%d", err, host.runnableLen())
+	}
+	if _, done, runErr := host.RunOne(); done || runErr != nil {
+		t.Fatalf("runtime drain probe = %t, %v", done, runErr)
+	}
+	if err = host.QuiesceSQLGeneration(runtime.identity.Group); err != nil {
+		t.Fatalf("retry quiesce: %v", err)
+	}
+}
+
+func TestHostCommittedSchemaFenceKeepsRaftHeartbeatsAlive(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(93)
+	if err = host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, runErr := host.RunOne(); done || runErr != nil {
+		t.Fatalf("initial Ready probe = %t, %v", done, runErr)
+	}
+	if err = host.FenceCommittedSchemaGeneration(runtime.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	if err = host.RequestTick(runtime.identity.Group); err != nil {
+		t.Fatalf("committed schema fence stopped Raft heartbeat tick: %v", err)
+	}
+	if err = host.RequestCampaign(runtime.identity.Group); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("committed schema fence admitted campaign: %v", err)
+	}
+	if err = host.EnqueueProposal(runtime.identity.Group, []byte("next")); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("committed schema fence admitted proposal: %v", err)
+	}
+	progress, done, runErr := host.RunOne()
+	if runErr != nil || !done || progress.Kind != ProgressTick {
+		t.Fatalf("heartbeat tick = %+v, %t, %v", progress, done, runErr)
 	}
 }
 

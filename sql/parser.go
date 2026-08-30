@@ -128,6 +128,7 @@ type Parser struct {
 	del              DeleteStmt
 	tbl              CreateTableStmt
 	idx              CreateIndexStmt
+	alter            AlterTableStmt
 	drop             DropTableStmt
 	truncate         TruncateStmt
 	dropIndex        DropIndexStmt

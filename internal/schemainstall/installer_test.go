@@ -58,6 +58,10 @@ func (a *testActivator) ObserveActive(_ context.Context, r Request, _ Authorizat
 	defer a.mu.Unlock()
 	return a.active[r.Operation], nil
 }
+
+func (a *testActivator) Commit(context.Context, Request, Authorization, [32]byte, string) error {
+	return nil
+}
 func (a *testActivator) Activate(_ context.Context, r Request, _ Authorization, _ [32]byte, _ string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -543,6 +543,9 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 	var sourceGeneration generationSeal
 	sourceGenerationSeen := false
 	for sequence := uint64(1); sequence <= builder.current.recordSequence; sequence++ {
+		if err := builder.cancelled(); err != nil {
+			return nil, headerState{}, err
+		}
 		if _, err := io.ReadFull(sourceReader, prefix[:]); err != nil {
 			return nil, headerState{}, fmt.Errorf("%w: read source record %d prefix: %v",
 				ErrGenerationSource, sequence, err)
@@ -849,6 +852,9 @@ func (builder *GenerationBuilder) finishGenerationScratch(
 	var retainedCount uint64
 	var retainedBytes uint64
 	for _, chunk := range scratch.chunks {
+		if err := builder.cancelled(); err != nil {
+			return err
+		}
 		if chunk.first <= baseIndex || chunk.offset != offset ||
 			chunk.sequence != sequence+1 || chunk.previous != previous {
 			return fmt.Errorf("%w: generation scratch chain", ErrCorrupt)
@@ -925,6 +931,9 @@ func (builder *GenerationBuilder) finishGenerationScratch(
 	}
 	if err := writeExactAt(stage.options.ops, stage.file, sealRecord, offset); err != nil {
 		return persistenceError("write WAL generation seal", false, err)
+	}
+	if err := builder.cancelled(); err != nil {
+		return err
 	}
 	if err := stage.options.ops.sync(stage.file); err != nil {
 		return persistenceError("sync WAL generation records", false, err)

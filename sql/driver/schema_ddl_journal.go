@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -65,6 +66,87 @@ type schemaDDLBuildRecord struct {
 	Target           ReplicatedSchemaDDLTarget
 }
 
+// ReplicatedSchemaDDLBuildRecord is the detached, authenticated recovery view
+// of the one retained build slot. It lets a replacement coordinator recover
+// the exact source cut and SQL without guessing an applied index.
+type ReplicatedSchemaDDLBuildRecord struct {
+	Operation                    [32]byte
+	SourceApplied                uint64
+	SourceSchemaGeneration       uint64
+	SourceRelationManifestDigest [32]byte
+	SQL                          string
+	Target                       ReplicatedSchemaDDLTarget
+}
+
+// ObserveJournaledReplicatedSchemaDDLBuild returns an exact ready build for an
+// operation. It is read-only and bounded by the existing one-slot journal.
+func (a *ReplicatedApply) ObserveJournaledReplicatedSchemaDDLBuild(
+	operation [32]byte,
+) (ReplicatedSchemaDDLBuildRecord, bool, error) {
+	var result ReplicatedSchemaDDLBuildRecord
+	if a == nil || a.database == nil || operation == ([32]byte{}) {
+		return result, false, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	err := a.checkLocked()
+	directory := a.database.dataDir
+	var current []byte
+	if err == nil {
+		current, err = appendCatalogJSON(nil, a.database.catalog)
+	}
+	a.database.mu.RUnlock()
+	if err != nil {
+		return result, false, err
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return result, false, err
+	}
+	defer root.Close()
+	record, found, err := readSchemaDDLBuildRecord(root)
+	if err != nil || !found || record.Operation != operation {
+		return result, false, err
+	}
+	if !record.Ready || record.Target.NoOp {
+		return result, false, ErrReplicatedSchemaDDLConflict
+	}
+	var candidates [][]byte
+	if origin, selected, readErr := readSchemaLineageFile(directory, replicatedSchemaOriginName, maxCatalogBytes); readErr != nil {
+		return result, false, readErr
+	} else if selected {
+		candidates = append(candidates, origin)
+	}
+	if lineage, selected, readErr := readReplicatedSchemaLineage(directory); readErr != nil {
+		return result, false, readErr
+	} else if selected {
+		candidates = append(candidates, lineage.catalog)
+	}
+	if len(current) != 0 {
+		candidates = append(candidates, current)
+	}
+	var sourceImage ReplicatedSchemaCatalogImage
+	matched := false
+	for _, candidate := range candidates {
+		if sha256.Sum256(candidate) != record.SourceDigest {
+			continue
+		}
+		_, image, openErr := openReplicatedSchemaCatalogImage(candidate)
+		if openErr == nil && image.SchemaGeneration == record.SourceGeneration {
+			sourceImage, matched = image, true
+			break
+		}
+	}
+	if !matched {
+		return result, false, errors.Join(err, ErrReplicatedSchemaDDLConflict)
+	}
+	return ReplicatedSchemaDDLBuildRecord{
+		Operation: operation, SourceApplied: record.Applied,
+		SourceSchemaGeneration:       record.SourceGeneration,
+		SourceRelationManifestDigest: sourceImage.RelationManifestDigest,
+		SQL:                          record.SQL, Target: record.Target,
+	}, true, nil
+}
+
 // BuildJournaledReplicatedSchemaDDLTarget reserves image identities before
 // materialization and persists the exact certified result before returning.
 // One bounded slot per shard survives process replacement. Retries cannot
@@ -88,14 +170,19 @@ func (a *ReplicatedApply) BuildJournaledReplicatedSchemaDDLTarget(
 	err := a.checkLocked()
 	var source []byte
 	var generation uint64
+	var applied uint64
 	if err == nil {
 		source, err = appendCatalogJSON(nil, core.catalog)
 		generation = core.catalog.ReplicatedShardStore.RelationSchemaGeneration
+		applied = a.machine.Applied()
 	}
 	directory := core.dataDir
 	core.mu.RUnlock()
 	if err != nil {
 		return ReplicatedSchemaDDLTarget{}, err
+	}
+	if applied != expectedApplied {
+		return ReplicatedSchemaDDLTarget{}, ErrTransactionConflict
 	}
 	root, err := os.OpenRoot(directory)
 	if err != nil {
@@ -120,16 +207,32 @@ func (a *ReplicatedApply) BuildJournaledReplicatedSchemaDDLTarget(
 	}
 	sourceDigest := sha256.Sum256(source)
 	if found && previous.Operation == operation {
-		if previous.Applied != expectedApplied || previous.SQL != text {
-			return ReplicatedSchemaDDLTarget{}, ErrReplicatedSchemaDDLConflict
+		if expectedApplied < previous.Applied || previous.SQL != text {
+			return ReplicatedSchemaDDLTarget{}, fmt.Errorf("%w: retained cut=%d requested=%d sql-match=%t",
+				ErrReplicatedSchemaDDLConflict, previous.Applied, expectedApplied, previous.SQL == text)
 		}
-		if previous.Ready {
+		if previous.Applied == expectedApplied && previous.Ready {
 			// This durable certificate is a build receipt, not a serving fence.
 			// It remains replayable after the installer has moved the images.
 			return previous.Target, nil
 		}
 		if previous.SourceGeneration != generation || previous.SourceDigest != sourceDigest {
-			return ReplicatedSchemaDDLTarget{}, ErrTransactionConflict
+			return ReplicatedSchemaDDLTarget{}, fmt.Errorf("rebase source changed generation-match=%t digest-match=%t: %w",
+				previous.SourceGeneration == generation, previous.SourceDigest == sourceDigest, ErrTransactionConflict)
+		}
+		if previous.Ready {
+			// A coordinator may disappear after receiving a ready build but before
+			// any installer certifies it. Under the recovered exclusive route gate,
+			// rebase that same operation to a later source cut instead of either
+			// accepting a stale image or abandoning its durable identity.
+			_, retainedImage, imageErr := openReplicatedSchemaCatalogImage(previous.Target.Catalog)
+			marker, staged, markerErr := readReplicatedSchemaStageMarker(directory)
+			if imageErr != nil || markerErr != nil || staged && marker.schemaGeneration >= retainedImage.SchemaGeneration {
+				return ReplicatedSchemaDDLTarget{}, fmt.Errorf("%w: target already staged=%t: %v",
+					ErrReplicatedSchemaDDLConflict,
+					staged && marker.schemaGeneration >= retainedImage.SchemaGeneration,
+					errors.Join(imageErr, markerErr))
+			}
 		}
 	} else if found && (!previous.Ready || !previous.Target.NoOp &&
 		(generation < previous.Target.Proof.Catalog.SchemaGeneration ||
@@ -142,26 +245,27 @@ func (a *ReplicatedApply) BuildJournaledReplicatedSchemaDDLTarget(
 		if found && previous.Operation == operation {
 			retained, image, err := openReplicatedSchemaCatalogImage(previous.Target.Catalog)
 			if err != nil || len(retained.ReplicatedShardStore.Relations) != len(target.ReplicatedShardStore.Relations) {
-				return errors.Join(err, ErrReplicatedSchemaDDLConflict)
+				return fmt.Errorf("%w: retained target shape differs: %v", ErrReplicatedSchemaDDLConflict, err)
 			}
 			for i := range target.ReplicatedShardStore.Relations {
 				relation := &target.ReplicatedShardStore.Relations[i]
 				old := retained.ReplicatedShardStore.Relations[i]
 				if old.Table != relation.Table || validateStorageIdentity(old.Storage) != nil {
-					return ErrReplicatedSchemaDDLConflict
+					return fmt.Errorf("%w: retained relation %d identity differs", ErrReplicatedSchemaDDLConflict, i)
 				}
 				relation.Storage, target.Tables[relation.Table].Storage = old.Storage, old.Storage
 			}
 			refreshSchemaDDLTargetIdentity(target)
 			raw, err := appendCatalogJSON(nil, *target)
 			if err != nil || !bytes.Equal(raw, previous.Target.Catalog) {
-				return errors.Join(err, ErrReplicatedSchemaDDLConflict)
+				return fmt.Errorf("%w: rebuilt target catalog identity differs: %v", ErrReplicatedSchemaDDLConflict, err)
 			}
 			// A pending build has never returned a receipt. Nevertheless refuse
 			// deletion if any installer has already certified these exact files.
 			marker, staged, err := readReplicatedSchemaStageMarker(directory)
 			if err != nil || staged && marker.schemaGeneration >= image.SchemaGeneration {
-				return errors.Join(err, ErrReplicatedSchemaDDLConflict)
+				return fmt.Errorf("%w: installer certification exists=%t: %v",
+					ErrReplicatedSchemaDDLConflict, staged && marker.schemaGeneration >= image.SchemaGeneration, err)
 			}
 			if err := removeReservedSchemaDDLImages(directory, retained); err != nil {
 				return err

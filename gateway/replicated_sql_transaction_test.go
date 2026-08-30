@@ -652,6 +652,51 @@ func TestReplicatedSQLTransactionGlobalIndexUpdateAndDeleteBindExactOldValue(t *
 	}
 }
 
+func TestReplicatedSQLDeclaredColumnUpdateIsExactCAS(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true)
+	old := []byte(`{"email":"old@example.test","id":"message-1","n":1}`)
+	client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+		t.Context(), snapshot, []Query{{
+			SQL: `UPDATE messages SET email = ?, n = 2 WHERE id = ?`,
+			Params: []shardservice.Param{
+				shardservice.StringParam("new@example.test"),
+				shardservice.StringParam("message-1"),
+			},
+		}}, executor.profileFor(ClassInteractive), data,
+	)
+	if err != nil || !handled || client.reads != 1 || len(participants) != 1 {
+		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+	}
+	mutation := participants[0].Batches[0].Mutations[0]
+	if mutation.Kind != replication.MutationPutDigestEqual ||
+		mutation.ExpectedValueLength != uint64(len(old)) ||
+		mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
+		t.Fatalf("mutation=%+v", mutation)
+	}
+	if got := string(mutation.Value); got != `{"email":"new@example.test","id":"message-1","n":2}` {
+		t.Fatalf("document=%s", got)
+	}
+}
+
+func TestReplicatedSQLDeclaredColumnUpdateMissingRetainsDurableNoOp(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true)
+	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, nil)
+	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+		t.Context(), snapshot, []Query{{
+			SQL:    `UPDATE messages SET n = 2 WHERE id = ?`,
+			Params: []shardservice.Param{shardservice.StringParam("message-1")},
+		}}, executor.profileFor(ClassInteractive), data,
+	)
+	if err != nil || !handled || len(participants) != 1 {
+		t.Fatalf("plan=%d handled=%v err=%v", len(participants), handled, err)
+	}
+	mutation := participants[0].Batches[0].Mutations[0]
+	if mutation.Kind != replication.MutationPutPresent || string(mutation.Value) != `{}` {
+		t.Fatalf("durable no-op mutation=%+v", mutation)
+	}
+}
+
 func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true, true)
 	old := []byte(`{"id":"message-1","email":"same@example.test","region":"old"}`)

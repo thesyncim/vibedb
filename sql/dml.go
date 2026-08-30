@@ -32,6 +32,8 @@ const (
 	KindCreateTable
 	// KindCreateIndex is a CREATE INDEX, carried in [Statement.CreateIndex].
 	KindCreateIndex
+	// KindAlterTable is an ALTER TABLE, carried in [Statement.AlterTable].
+	KindAlterTable
 	// KindDropTable is a DROP TABLE, carried in [Statement.DropTable].
 	KindDropTable
 	// KindTruncate is a TRUNCATE, carried in [Statement.Truncate].
@@ -65,6 +67,8 @@ func (k Kind) String() string {
 		return "CREATE TABLE"
 	case KindCreateIndex:
 		return "CREATE INDEX"
+	case KindAlterTable:
+		return "ALTER TABLE"
 	case KindDropTable:
 		return "DROP TABLE"
 	case KindTruncate:
@@ -107,17 +111,18 @@ type Statement struct {
 	// Explain marks a SELECT whose caller requested plan output instead of the
 	// target rows. Analyze additionally asks the driver to execute that target
 	// and attach measured runtime work to the plan.
-	Explain     bool
-	Analyze     bool
-	Select      *SelectStmt
-	Insert      *InsertStmt
-	Update      *UpdateStmt
-	Delete      *DeleteStmt
-	CreateTable *CreateTableStmt
-	CreateIndex *CreateIndexStmt
-	DropTable   *DropTableStmt
-	Truncate    *TruncateStmt
-	DropIndex   *DropIndexStmt
+	Explain             bool
+	Analyze             bool
+	Select              *SelectStmt
+	Insert              *InsertStmt
+	Update              *UpdateStmt
+	Delete              *DeleteStmt
+	CreateTable         *CreateTableStmt
+	CreateIndex         *CreateIndexStmt
+	AlterTable          *AlterTableStmt
+	DropTable           *DropTableStmt
+	Truncate            *TruncateStmt
+	DropIndex           *DropIndexStmt
 	CreateView          *CreateViewStmt
 	DropView            *DropViewStmt
 	Savepoint           *SavepointStmt
@@ -147,6 +152,8 @@ func (s *Statement) Table() string {
 		return s.CreateTable.Table
 	case KindCreateIndex:
 		return s.CreateIndex.Table
+	case KindAlterTable:
+		return s.AlterTable.Table
 	case KindDropTable:
 		return s.DropTable.Table
 	case KindTruncate:
@@ -173,7 +180,7 @@ func (s *Statement) Params() int {
 		return s.Update.Params
 	case KindDelete:
 		return s.Delete.Params
-	case KindCreateTable, KindCreateIndex, KindDropTable, KindTruncate, KindDropIndex,
+	case KindCreateTable, KindCreateIndex, KindAlterTable, KindDropTable, KindTruncate, KindDropIndex,
 		KindCreateView, KindDropView,
 		KindSavepoint, KindReleaseSavepoint, KindRollbackToSavepoint:
 		// A DDL statement has no placeholders. A schema is not data: a type, a
@@ -255,44 +262,18 @@ type InsertRow struct {
 	Pos    int
 }
 
-// An UpdateStmt is one parsed UPDATE.
-//
-// # What SET means here, and why a path is refused
-//
-// The only assignment this dialect accepts is to the whole document:
-//
-//	UPDATE users SET "$doc" = ? WHERE tier = 'free'
-//
-// `SET profile.region = 'eu'` is refused at parse time. The reason is worth
-// stating in full, because refusing it is the single largest gap between this
-// dialect and SQL, and the alternative was available.
-//
-// A path assignment is a partial document update, and the engine has no partial
-// update: every write primitive it owns — the single-document Put and the
-// batch's Put — replaces a document whole. Implementing `SET a.b = v` therefore
-// means read-modify-write, and the modify step is a JSON editor: given a
-// document, a path, and a value, produce the document with that path set. No
-// such primitive exists anywhere in this codebase. Writing one inside the SQL
-// front end would put the only implementation of JSON structural editing in the
-// layer furthest from the parser and the encoder, where it would have to decide
-// on its own — and be the only code deciding — what happens when an
-// intermediate object is absent, when a path crosses an array, when the key
-// already appears twice in the object, and how a number's exact source spelling
-// survives the rewrite. Every one of those has an answer elsewhere in this
-// repository; none of them would be shared with this one.
-//
-// Refusing is not a permanent position. When the core grows a path-set
-// primitive, `SET path = value` becomes a lowering that calls it, the read
-// happens under the same writer lock the write does, and nothing in this
-// grammar has to change except deleting a rejection. Until then a caller reads
-// the document with SELECT, edits it where the editing code already lives, and
-// writes it back with SET "$doc" = ?; that is three lines instead of one, and
-// all three of them are honest.
+// An UpdateStmt is one parsed UPDATE. A statement either replaces the whole
+// document through Doc, or applies one or more declared top-level column
+// assignments. The two forms never mix.
 type UpdateStmt struct {
 	// Table is the collection written to.
 	Table string
 	// Doc is the replacement document, the right-hand side of SET "$doc" = ....
 	Doc Operand
+	// Assignments are declared top-level column replacements. Nested JSON paths
+	// remain deliberately outside the SQL table surface: JSON documents retain
+	// the explicit whole-document update form.
+	Assignments []UpdateAssignment
 	// Filter is the equivalent SELECT whose surviving rows this statement
 	// updates: "SELECT count(*) FROM Table WHERE ...", with the same WHERE.
 	//
@@ -317,6 +298,13 @@ type UpdateStmt struct {
 	Pos int
 	// SetPos is the byte offset of the assignment, for diagnostics.
 	SetPos int
+}
+
+// UpdateAssignment replaces one declared top-level column with one scalar.
+type UpdateAssignment struct {
+	Column string
+	Value  Operand
+	Pos    int
 }
 
 // A DeleteStmt is one parsed DELETE.

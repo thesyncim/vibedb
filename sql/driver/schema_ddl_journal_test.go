@@ -101,12 +101,39 @@ func TestReplicatedSchemaDDLJournalReplaysExactReceiptAfterRestart(t *testing.T)
 		sql       string
 	}{
 		{operation, 3, "TRUNCATE docs"},
-		{operation, 4, sql},
 		{[32]byte{2}, 3, sql},
 	} {
 		if _, err := active.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), test.operation, test.applied, test.sql); !errors.Is(err, ErrReplicatedSchemaDDLConflict) {
 			t.Fatalf("replaced retained operation: %v", err)
 		}
+	}
+	if _, err := active.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), operation, 4, sql); !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("accepted a source cut the machine has not reached: %v", err)
+	}
+}
+
+func TestReplicatedSchemaDDLJournalRebasesReadyUnstagedOperation(t *testing.T) {
+	_, _, _, _, claim := schemaDDLJournalFixture(t)
+	operation := [32]byte{31}
+	const sql = "CREATE INDEX by_city_rebased ON docs (city)"
+	first, err := claim.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), operation, 3, sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = claim.ApplyNormal(testReplicatedApplyMeta(4), nil); err != nil {
+		t.Fatal(err)
+	}
+	rebased, err := claim.BuildJournaledReplicatedSchemaDDLTarget(t.Context(), operation, 4, sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Catalog, rebased.Catalog) || rebased.Proof.SourceApplied != 4 {
+		t.Fatalf("rebase changed reserved identity or retained stale cut: first=%+v rebased=%+v", first.Proof, rebased.Proof)
+	}
+	root := openSchemaDDLJournalTestRoot(t, claim)
+	record := requireSchemaDDLJournalRecord(t, root)
+	if !record.Ready || record.Applied != 4 || !reflect.DeepEqual(record.Target, rebased) {
+		t.Fatalf("rebased receipt was not durable: %+v", record)
 	}
 }
 

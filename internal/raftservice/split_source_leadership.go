@@ -25,6 +25,56 @@ func (owners *ExecutionOwners) TransferSplitSourceLeadership(ctx context.Context
 	return owner.TransferSplitSourceLeadership(ctx, fence, target)
 }
 
+// TransferSchemaLeadership hands leadership to another voter before replacing
+// the local SQL generation. Selecting the voter inside the serialized owner
+// binds the choice to the same committed ConfState used by the transfer.
+func (owner *Owner) TransferSchemaLeadership(ctx context.Context, fence ServingFence) error {
+	if owner == nil || ctx == nil {
+		return ErrInvalidOwner
+	}
+	_, err := owner.enqueue(ctx, ownerRequest{kind: requestSchemaLeadershipTransfer,
+		group: fence.Group, fence: fence, reply: make(chan ownerReply, 1)})
+	return err
+}
+
+func (owners *ExecutionOwners) TransferSchemaLeadership(ctx context.Context, fence ServingFence) error {
+	owner, err := owners.owner(fence.Group)
+	if err != nil {
+		return err
+	}
+	return owner.TransferSchemaLeadership(ctx, fence)
+}
+
+func (owner *Owner) transferSchemaLeadership(fence ServingFence) error {
+	member, found := owner.members[fence.Group]
+	if !found || !servingFenceMatchesIdentity(fence, member) {
+		return ErrServingFence
+	}
+	publication, err := owner.host.Publication(fence.Group)
+	if err != nil || publication.ReplicaSetVersion != fence.Command.ReplicaSetVersion ||
+		publication.ConfState == nil || len(publication.ConfState.GetVotersOutgoing()) != 0 {
+		return errors.Join(ErrServingFence, err)
+	}
+	target := uint64(0)
+	for _, voter := range publication.ConfState.GetVoters() {
+		if voter != fence.MemberID {
+			target = voter
+			break
+		}
+	}
+	if target == 0 {
+		return ErrServingFence
+	}
+	status, err := owner.host.Status(fence.Group)
+	if err != nil {
+		return err
+	}
+	if status.MemberID != fence.MemberID || status.LeaderID != fence.MemberID || status.Term != fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	return owner.host.TransferLeader(fence.Group, target)
+}
+
 func (owner *Owner) transferSplitSourceLeadership(fence ServingFence, target uint64) error {
 	member, found := owner.members[fence.Group]
 	if !found || !servingFenceMatchesIdentity(fence, member) || target == fence.MemberID {

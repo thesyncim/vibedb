@@ -22,6 +22,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -546,6 +547,7 @@ func runServe(args []string) (exitCode int) {
 	var backupOperator gatewayBackupOperator
 	var distributedMetrics *gateway.DistributedMetrics
 	var distributedMetricsConcurrency int
+	var schemaDDL *gatewaySchemaDDLRuntime
 	if replicaControlManifest != nil {
 		manifest := *replicaControlManifest
 		readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
@@ -557,6 +559,17 @@ func runServe(args []string) (exitCode int) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 			}, manifest.Shards, int(manifest.Bounds.MaxConnections),
 		)
+		var schemaDDLErr error
+		if *pgDevDDLSocket != "" {
+			// Schema materialization and activation include bounded durable image
+			// syncs. They run off the query hot path and have their own admission
+			// limits, so the ordinary short control RPC deadline must not turn a
+			// healthy fsync into an outcome-unknown PostgreSQL error.
+			schemaDeadline := servicetls.FixedDeadline(2 * time.Minute)
+			schemaDDL, schemaDDLErr = newGatewaySchemaDDLRuntime(catalogAuthority,
+				replicated, shardOpener, schemaDeadline, schemaDeadline,
+				*catalogSessionJournal+".schema-ddl", internalAuthority)
+		}
 		var metricsErr error
 		distributedMetrics, metricsErr = newGatewayDistributedMetrics(holder.Current(), shardOpener)
 		if distributedMetrics != nil {
@@ -656,7 +669,7 @@ func runServe(args []string) (exitCode int) {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, metricsErr, drainErr, splitErr, controlsErr, splitFactoryErr,
+		if joined := errors.Join(openErr, schemaDDLErr, metricsErr, drainErr, splitErr, controlsErr, splitFactoryErr,
 			controllerErr, hotShardBindErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr, backupErr); joined != nil {
 			if backupRepository != nil {
@@ -674,6 +687,17 @@ func runServe(args []string) (exitCode int) {
 		}
 		if backupRepository != nil {
 			defer backupRepository.Close()
+		}
+		if schemaDDL != nil {
+			recoveryCtx, cancelRecovery := context.WithTimeout(controllerCtx, 2*time.Minute)
+			recoveryErr := schemaDDL.Recover(recoveryCtx)
+			cancelRecovery()
+			if recoveryErr != nil {
+				_ = controlListener.Close()
+				_ = listener.Close()
+				fmt.Fprintf(os.Stderr, "gateway: recover schema DDL: %v\n", recoveryErr)
+				return 1
+			}
 		}
 		if *schemaRolloutPlan != "" {
 			started := time.Now()
@@ -769,7 +793,7 @@ func runServe(args []string) (exitCode int) {
 		go writer.Run(writeCtx)
 		var ddl func(context.Context, serviceauthz.Authority, string) error
 		if *pgDevDDLSocket != "" {
-			ddl = newGatewayDevDDL(*pgDevDDLSocket, catalogAuthority)
+			ddl = newGatewayDevDDL(*pgDevDDLSocket, catalogAuthority, schemaDDL)
 		}
 		pg, pgErr := startGatewayPostgreSQL(ctx, *pgDevListen, exec, internalAuthority, writer.Write, logf, ddl)
 		if pgErr != nil {
@@ -1078,32 +1102,9 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	renewExisting := session.Status().Active
-	if session.Status().Pending {
-		_, err = session.RetryPending(authorizedContext)
-	}
-	if err == nil && !session.Status().Active {
-		deadline := time.Now().Add(lease).UnixNano()
-		if deadline <= 0 {
-			err = gateway.ErrNativeSession
-		} else {
-			_, err = session.Open(authorizedContext, deadline)
-		}
-	}
-	if err == nil && renewExisting && session.Status().Active {
-		status := session.Status()
-		next := time.Now().Add(lease).UnixNano()
-		if next <= status.LeaseDeadline {
-			if status.LeaseDeadline == math.MaxInt64 {
-				err = gateway.ErrNativeSession
-			} else {
-				next = status.LeaseDeadline + 1
-			}
-		}
-		if err == nil && next > 0 {
-			_, err = session.Renew(authorizedContext, status.LeaseDeadline, next)
-		}
-	}
+	err = settleReplicatedCatalogSessionStartup(
+		authorizedContext, session, attempts, lease,
+	)
 	if err != nil {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
@@ -1182,6 +1183,64 @@ func newReplicatedCatalogGateway(
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil
+}
+
+// settleReplicatedCatalogSessionStartup spans the normal election window while
+// preserving the native session's exact durable command. A pending journal is
+// never replaced: only RetryPending is allowed until it returns a terminal
+// proof. A fresh open or renewal may be retried only while it has not been
+// admitted; once admission is ambiguous the loop switches permanently to the
+// retained bytes. Deterministic validation/authentication errors fail at once.
+func settleReplicatedCatalogSessionStartup(
+	ctx context.Context, session *gateway.NativeSession, attempts int, lease time.Duration,
+) error {
+	if ctx == nil || session == nil || attempts <= 0 || lease <= 0 {
+		return gateway.ErrNativeSession
+	}
+	renew := session.Status().Active && !session.Status().Pending
+	for attempt := 0; attempt < attempts; attempt++ {
+		var err error
+		status := session.Status()
+		switch {
+		case status.Pending:
+			_, err = session.RetryPending(ctx)
+		case !status.Active:
+			deadline := time.Now().Add(lease).UnixNano()
+			if deadline <= 0 {
+				return gateway.ErrNativeSession
+			}
+			_, err = session.Open(ctx, deadline)
+		case renew:
+			next := time.Now().Add(lease).UnixNano()
+			if next <= status.LeaseDeadline {
+				if status.LeaseDeadline == math.MaxInt64 {
+					return gateway.ErrNativeSession
+				}
+				next = status.LeaseDeadline + 1
+			}
+			_, err = session.Renew(ctx, status.LeaseDeadline, next)
+		default:
+			return nil
+		}
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gateway.ErrReplicatedLeader) &&
+			!errors.Is(err, raftservice.ErrOutcomeUnknown) {
+			return err
+		}
+		if attempt+1 == attempts {
+			return err
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, context.Cause(ctx))
+		case <-timer.C:
+		}
+	}
+	return gateway.ErrNativeSession
 }
 
 type replicatedCatalogRouteSeedStartupHooks struct {

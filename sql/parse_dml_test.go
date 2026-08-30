@@ -143,6 +143,16 @@ func TestDMLGrammarShapes(t *testing.T) {
 			want: `drop index if exists by_age on users`,
 		},
 		{
+			name: "add a nullable column",
+			src:  `ALTER TABLE users ADD COLUMN city TEXT`,
+			want: `alter table users add column 0:city NULL|STRING`,
+		},
+		{
+			name: "add a required nested column if absent",
+			src:  `ALTER TABLE users ADD COLUMN IF NOT EXISTS profile.score INTEGER NOT NULL`,
+			want: `alter table users add column if not exists 0:profile.score INTEGER not null`,
+		},
+		{
 			name: "a nested path in a condition",
 			src:  `DELETE FROM users WHERE profile.region = 'eu'`,
 			want: `delete from users where (cmp = 0:profile.region s"eu") params=0`,
@@ -272,10 +282,9 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id) DO NOTHING`, -1, "CONFLICT targets"},
 		{"aggregate RETURNING", `INSERT INTO t VALUES (?) RETURNING COUNT(*)`, -1, "aggregate"},
 
-		{"a top-level path assignment", `UPDATE t SET name = 'x'`, -1, "partial document update"},
-		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "no JSON path-set operation"},
-		{"assigning a path", `UPDATE t SET "$key" = 'x'`, -1, "partial document update"},
-		{"two assignments", `UPDATE t SET "$doc" = ?, "$doc" = ?`, -1, "the whole document once"},
+		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "one declared top-level column"},
+		{"assigning a reserved path", `UPDATE t SET "$key" = 'x'`, -1, "reserved column"},
+		{"two whole-document assignments", `UPDATE t SET "$doc" = ?, "$doc" = ?`, -1, "cannot be combined"},
 		{"UPDATE ... FROM", `UPDATE t SET "$doc" = ? FROM u`, -1, "never from another collection"},
 
 		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
@@ -285,8 +294,21 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
 		{"REPLACE", `REPLACE INTO t VALUES ('k', ?)`, 0, "REPLACE"},
-		{"ALTER", `ALTER TABLE t ADD COLUMN a STRING`, 0, "ALTER"},
 	})
+}
+
+func TestDeclaredColumnUpdateAssignments(t *testing.T) {
+	statement, err := ParseStatement(`UPDATE employees SET department = 'platform', level = 7 WHERE id = 'employee-0001'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statement.Update == nil || len(statement.Update.Assignments) != 2 {
+		t.Fatalf("assignments = %#v", statement.Update)
+	}
+	if statement.Update.Assignments[0].Column != "department" ||
+		statement.Update.Assignments[1].Column != "level" {
+		t.Fatalf("assignments = %#v", statement.Update.Assignments)
+	}
 }
 
 func TestRejectsUnboundedCatalogDDLSyntax(t *testing.T) {
@@ -410,5 +432,7 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"an index over the whole document", `CREATE INDEX ON t (*)`, -1, "must stand alone"},
 		{"a duplicate index path", `CREATE INDEX ON t (a, a)`, -1, "named twice"},
 		{"too many index paths", `CREATE INDEX ON t (a, b, c, d, e)`, -1, "at most 4"},
+		{"ALTER DROP", `ALTER TABLE t DROP COLUMN a`, -1, "supports ADD COLUMN"},
+		{"ALTER primary key", `ALTER TABLE t ADD COLUMN other TEXT PRIMARY KEY`, -1, "changing document identity"},
 	})
 }

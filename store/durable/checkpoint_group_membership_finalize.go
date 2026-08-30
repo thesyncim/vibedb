@@ -3,6 +3,7 @@ package durable
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -26,6 +27,31 @@ func (g *CheckpointGroup) FinalizeMembershipTransition(
 	committedApplied uint64,
 	commandDigest [sha256.Size]byte,
 ) error {
+	return g.finalizeMembershipTransition(witness, authorization, 0, committedApplied, commandDigest)
+}
+
+// FinalizeMembershipTransitionAfterEmptySuffix permits leader no-op entries
+// between preparation and the sole semantic transition. The schema owner must
+// have authenticated the complete WAL suffix as empty normal entries before
+// persisting the activation bound. This layer additionally proves that the
+// checkpoint transaction and applied deltas are identical and that resetting
+// those counters reconstructs the exact prepared source certificate.
+func (g *CheckpointGroup) FinalizeMembershipTransitionAfterEmptySuffix(
+	witness CheckpointMembershipWitness, authorization [sha256.Size]byte,
+	preparedApplied, committedApplied uint64, commandDigest [sha256.Size]byte,
+) error {
+	if preparedApplied == 0 || committedApplied <= preparedApplied+1 {
+		return ErrCheckpointMembershipTransition
+	}
+	return g.finalizeMembershipTransition(
+		witness, authorization, preparedApplied, committedApplied, commandDigest,
+	)
+}
+
+func (g *CheckpointGroup) finalizeMembershipTransition(
+	witness CheckpointMembershipWitness, authorization [sha256.Size]byte,
+	preparedApplied, committedApplied uint64, commandDigest [sha256.Size]byte,
+) error {
 	if g == nil || authorization == ([sha256.Size]byte{}) || committedApplied == 0 ||
 		commandDigest == ([sha256.Size]byte{}) {
 		return ErrCheckpointMembershipTransition
@@ -40,7 +66,9 @@ func (g *CheckpointGroup) FinalizeMembershipTransition(
 		return errors.Join(ErrCheckpointMembershipTransition, err)
 	}
 	current := g.certificateLocked()
-	if !checkpointMembershipCommittedSourceMatches(prior, current, committedApplied, commandDigest) {
+	if !checkpointMembershipCommittedSourceMatchesAt(
+		prior, current, preparedApplied, committedApplied, commandDigest,
+	) {
 		return ErrCheckpointMembershipTransition
 	}
 	if prior.prepared.Sequence != 0 {
@@ -92,6 +120,24 @@ func (g *CheckpointGroup) FinalizeMembershipTransition(
 	return nil
 }
 
+func checkpointMembershipCommittedSourceMatchesAt(
+	record checkpointMembershipCertificate, current checkpointGroupCertificate,
+	preparedApplied, committedApplied uint64, commandDigest [sha256.Size]byte,
+) bool {
+	if preparedApplied == 0 {
+		return checkpointMembershipCommittedSourceMatches(record, current, committedApplied, commandDigest)
+	}
+	if current.applied != committedApplied || record.prepared.Sequence != 0 ||
+		record.applied != preparedApplied || committedApplied <= preparedApplied ||
+		current.txnHighWater < record.txnHighWater ||
+		current.txnHighWater-record.txnHighWater != committedApplied-preparedApplied {
+		return false
+	}
+	before := current
+	before.applied, before.txnHighWater = record.applied, record.txnHighWater
+	return checkpointMembershipSourceDigest(before) == record.source
+}
+
 // ObserveCommittedSourceMembershipTransition verifies the exact source-side
 // recovery cut after one committed schema entry. The caller must first verify
 // that entry's complete command, term/index, and source schema contract; the
@@ -124,6 +170,38 @@ func (g *CheckpointGroup) ObserveCommittedSourceMembershipTransition(
 	current := g.certificateLocked()
 	if current.applied != g.certApplied.Load() || current.txnHighWater != g.certTxn.Load() ||
 		!checkpointMembershipCommittedSourceMatches(record, current, committedApplied, commandDigest) {
+		return ErrCheckpointMembershipTransition
+	}
+	return nil
+}
+
+// ObserveCommittedSourceMembershipTransitionAfterEmptySuffix is the read-only
+// counterpart of FinalizeMembershipTransitionAfterEmptySuffix. The caller has
+// already authenticated the WAL suffix; this layer proves that its applied and
+// transaction deltas reconstruct the exact prepared checkpoint certificate.
+func (g *CheckpointGroup) ObserveCommittedSourceMembershipTransitionAfterEmptySuffix(
+	witness CheckpointMembershipWitness,
+	authorization [sha256.Size]byte,
+	preparedApplied, committedApplied uint64,
+	commandDigest [sha256.Size]byte,
+) error {
+	if g == nil || witness.Sequence == 0 || authorization == ([sha256.Size]byte{}) ||
+		preparedApplied == 0 || committedApplied <= preparedApplied+1 ||
+		commandDigest == ([sha256.Size]byte{}) {
+		return ErrCheckpointMembershipTransition
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.checkUsableLocked(); err != nil {
+		return err
+	}
+	record, err := openCheckpointMembershipCertificate(g.log)
+	if err != nil || checkpointMembershipWitness(record) != witness || record.authorization != authorization {
+		return errors.Join(ErrCheckpointMembershipTransition, err)
+	}
+	current := g.certificateLocked()
+	if current.applied != g.certApplied.Load() || current.txnHighWater != g.certTxn.Load() ||
+		!checkpointMembershipCommittedSourceMatchesAt(record, current, preparedApplied, committedApplied, commandDigest) {
 		return ErrCheckpointMembershipTransition
 	}
 	return nil
@@ -251,14 +329,17 @@ func validateFinalizedCheckpointMembershipTransition(
 	log := &TxnLog{root: root}
 	record, err := openCheckpointMembershipCertificate(log)
 	if err != nil {
-		return err
+		return fmt.Errorf("open finalized membership receipt: %w", err)
 	}
 	if record.prepared != witness || record.authorization != authorization || record.applied != committedApplied || record.commandDigest != commandDigest {
-		return ErrCheckpointMembershipTransition
+		return fmt.Errorf("%w: finalized receipt witness=%t authorization=%t applied=%d/%d command=%t",
+			ErrCheckpointMembershipTransition, record.prepared == witness,
+			record.authorization == authorization, record.applied, committedApplied,
+			record.commandDigest == commandDigest)
 	}
 	file, selected, err := openCheckpointGroupCertificateFlags(log, os.O_RDONLY)
 	if err != nil {
-		return err
+		return fmt.Errorf("open selected checkpoint certificate: %w", err)
 	}
 	if err := file.Close(); err != nil {
 		return err
@@ -268,12 +349,17 @@ func validateFinalizedCheckpointMembershipTransition(
 	}
 	if selected.applied < record.applied || selected.txnHighWater < record.txnHighWater ||
 		selected.markerID != record.markerID || len(selected.members) != len(record.members) {
-		return ErrCheckpointMembershipTransition
+		return fmt.Errorf("%w: selected checkpoint applied=%d/%d txn=%d/%d marker=%t members=%d/%d",
+			ErrCheckpointMembershipTransition, selected.applied, record.applied,
+			selected.txnHighWater, record.txnHighWater, selected.markerID == record.markerID,
+			len(selected.members), len(record.members))
 	}
 	for i, member := range record.members {
 		current := selected.members[i]
 		if member.nameDigest != current.nameDigest || member.storeID != current.storeID || member.journalID != current.journalID {
-			return ErrCheckpointMembershipTransition
+			return fmt.Errorf("%w: selected checkpoint member %d name=%t store=%t journal=%t",
+				ErrCheckpointMembershipTransition, i, member.nameDigest == current.nameDigest,
+				member.storeID == current.storeID, member.journalID == current.journalID)
 		}
 	}
 	return nil

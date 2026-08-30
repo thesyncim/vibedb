@@ -35,7 +35,7 @@ func SQLCapability(sql string) Capability {
 		return CapabilityDataRead | CapabilityDataWrite | CapabilitySchema
 	}
 	switch kind {
-	case sqlast.KindCreateTable, sqlast.KindCreateIndex, sqlast.KindCreateView,
+	case sqlast.KindCreateTable, sqlast.KindCreateIndex, sqlast.KindAlterTable, sqlast.KindCreateView,
 		sqlast.KindDropTable, sqlast.KindDropIndex, sqlast.KindDropView, sqlast.KindTruncate:
 		return CapabilitySchema
 	case sqlast.KindInsert, sqlast.KindUpdate, sqlast.KindDelete,

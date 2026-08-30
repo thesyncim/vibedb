@@ -27,9 +27,10 @@ const (
 	CommandAuthorize
 	CommandActivate
 	CommandDrain
+	CommandCommit
 )
 
-func (command Command) valid() bool { return command >= CommandPrepare && command <= CommandDrain }
+func (command Command) valid() bool { return command >= CommandPrepare && command <= CommandCommit }
 
 type ResponseCode uint8
 
@@ -121,6 +122,8 @@ func (service *ControlService) Serve(ctx context.Context, connection rafttranspo
 		clear(bundle)
 	case CommandAuthorize:
 		record, err = service.installer.Authorize(ctx, authorization)
+	case CommandCommit:
+		record, err = service.installer.Commit(ctx, authorization)
 	case CommandActivate:
 		record, err = service.installer.Activate(ctx, authorization)
 	case CommandDrain:

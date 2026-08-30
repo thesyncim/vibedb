@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -21,6 +23,7 @@ var schemaRolloutReplicaReceiptDomain = []byte(
 type SchemaInstallClient interface {
 	Prepare(context.Context, rafttransport.NodeID, schemainstall.Request, []byte) (schemainstall.Receipt, error)
 	Authorize(context.Context, rafttransport.NodeID, schemainstall.Request, schemainstall.Authorization) (schemainstall.Record, error)
+	Commit(context.Context, rafttransport.NodeID, schemainstall.Request, schemainstall.Authorization) (schemainstall.Record, error)
 	Activate(context.Context, rafttransport.NodeID, schemainstall.Request, schemainstall.Authorization) (schemainstall.Record, error)
 	Drain(context.Context, rafttransport.NodeID, schemainstall.Request, schemainstall.Authorization, schemainstall.DrainProof) (schemainstall.Record, error)
 }
@@ -227,6 +230,32 @@ func (controller *SchemaRolloutController) parallel(
 	return context.Cause(ctx)
 }
 
+// retrySchemaReplicaOutcome settles only an exact idempotent replica command.
+// A schema activation commonly closes the source runtime before the control
+// response reaches the coordinator; treating that transport cut as failure
+// strands the durable Running operation until process restart. Retrying the
+// same request/authorization lets the installer observe its retained record
+// and return the already-completed phase. Deterministic conflicts, bounds and
+// authorization failures still return immediately.
+func retrySchemaReplicaOutcome(ctx context.Context, run func() error) error {
+	if ctx == nil || run == nil {
+		return ErrSchemaRollout
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := run()
+		if !errors.Is(err, schemainstall.ErrOutcomeUnknown) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, context.Cause(ctx))
+		case <-ticker.C:
+		}
+	}
+}
+
 func writeSchemaReplicaReceipt(
 	h hash.Hash, scratch *[8]byte, plan SchemaRolloutReplicaPlan,
 	receipt schemainstall.Receipt,
@@ -330,20 +359,28 @@ func (controller *SchemaRolloutController) Execute(
 	if err = controller.parallel(ctx, len(plans), func(index int) error {
 		plan := plans[index]
 		var prepareErr error
-		receipts[index], prepareErr = controller.client.Prepare(ctx, plan.Node, plan.Request, plan.Bundle)
-		return prepareErr
+		prepareErr = retrySchemaReplicaOutcome(ctx, func() error {
+			receipts[index], prepareErr = controller.client.Prepare(ctx, plan.Node, plan.Request, plan.Bundle)
+			return prepareErr
+		})
+		if prepareErr != nil {
+			return fmt.Errorf("schema rollout prepare member %d: %w", plan.Member, prepareErr)
+		}
+		return nil
 	}); err != nil {
 		return SchemaRolloutResult{}, err
 	}
 	groups, err := aggregateSchemaReplicaReceipts(changes, plans, receipts)
 	if err != nil {
-		return SchemaRolloutResult{}, err
+		return SchemaRolloutResult{}, fmt.Errorf("schema rollout aggregate receipts: %w", err)
 	}
 	planned := existing
 	if errors.Is(operationErr, ErrReplicatedOperationMissing) {
-		planned, err = controller.authority.PrepareSchemaRollout(ctx, id, target, groups)
+		planned, err = controller.settleCatalogPublication(ctx, func() (ReplicatedOperationRecord, error) {
+			return controller.authority.PrepareSchemaRollout(ctx, id, target, groups)
+		})
 		if err != nil {
-			return SchemaRolloutResult{}, err
+			return SchemaRolloutResult{}, fmt.Errorf("schema rollout publish prepared intent: %w", err)
 		}
 	} else {
 		preparedRoot, rootErr := schemaRolloutPreparedRoot(changes, groups)
@@ -352,9 +389,11 @@ func (controller *SchemaRolloutController) Execute(
 			return SchemaRolloutResult{}, errors.Join(rootErr, openErr, ErrSchemaRolloutConflict)
 		}
 	}
-	running, err := controller.authority.AuthorizeSchemaRollout(ctx, id, target)
+	running, err := controller.settleCatalogPublication(ctx, func() (ReplicatedOperationRecord, error) {
+		return controller.authority.AuthorizeSchemaRollout(ctx, id, target)
+	})
 	if err != nil {
-		return SchemaRolloutResult{}, err
+		return SchemaRolloutResult{}, fmt.Errorf("schema rollout authorize intent: %w", err)
 	}
 	intent, err := openSchemaRolloutOperation(running)
 	if err != nil || planned.Proof != intent.PreparedGroupRoot {
@@ -368,20 +407,99 @@ func (controller *SchemaRolloutController) Execute(
 		ContractDigest:          SchemaRolloutContractDigest()}
 	if err = controller.parallel(ctx, len(plans), func(index int) error {
 		plan := plans[index]
-		_, phaseErr := controller.client.Authorize(ctx, plan.Node, plan.Request, authorization)
-		return phaseErr
+		phaseErr := retrySchemaReplicaOutcome(ctx, func() error {
+			_, retryErr := controller.client.Authorize(ctx, plan.Node, plan.Request, authorization)
+			return retryErr
+		})
+		if phaseErr != nil {
+			return fmt.Errorf("schema rollout authorize member %d: %w", plan.Member, phaseErr)
+		}
+		return nil
 	}); err != nil {
 		return SchemaRolloutResult{Record: running, Authorization: authorization}, err
 	}
 	if err = controller.parallel(ctx, len(plans), func(index int) error {
 		plan := plans[index]
-		_, phaseErr := controller.client.Activate(ctx, plan.Node, plan.Request, authorization)
-		return phaseErr
+		phaseErr := retrySchemaReplicaOutcome(ctx, func() error {
+			_, retryErr := controller.client.Commit(ctx, plan.Node, plan.Request, authorization)
+			return retryErr
+		})
+		if phaseErr != nil {
+			return fmt.Errorf("schema rollout commit transition member %d: %w", plan.Member, phaseErr)
+		}
+		return nil
 	}); err != nil {
 		return SchemaRolloutResult{Record: running, Authorization: authorization}, err
 	}
-	complete, err := controller.authority.CommitSchemaRollout(ctx, id, target)
+	if err = controller.activateReplicaGroups(ctx, plans, authorization); err != nil {
+		return SchemaRolloutResult{Record: running, Authorization: authorization}, err
+	}
+	complete, err := controller.settleCatalogPublication(ctx, func() (ReplicatedOperationRecord, error) {
+		return controller.authority.CommitSchemaRollout(ctx, id, target)
+	})
+	if err != nil {
+		err = fmt.Errorf("schema rollout commit catalog: %w", err)
+	}
 	return SchemaRolloutResult{Record: complete, Authorization: authorization}, err
+}
+
+// activateReplicaGroups performs a rolling replica replacement inside each
+// Raft group while preserving parallelism across independent groups. Replacing
+// multiple voters in one group concurrently can remove quorum or let a leader
+// election append a neutral entry to an old-generation state machine.
+func (controller *SchemaRolloutController) activateReplicaGroups(
+	ctx context.Context, plans []SchemaRolloutReplicaPlan,
+	authorization schemainstall.Authorization,
+) error {
+	groupIndexes := make(map[raftmember.GroupKey]int, len(plans)/ServingReplicaCount)
+	groups := make([][]int, 0, len(plans)/ServingReplicaCount)
+	for index := range plans {
+		group := plans[index].Request.Group
+		groupIndex, found := groupIndexes[group]
+		if !found {
+			groupIndex = len(groups)
+			groupIndexes[group] = groupIndex
+			groups = append(groups, make([]int, 0, ServingReplicaCount))
+		}
+		groups[groupIndex] = append(groups[groupIndex], index)
+	}
+	return controller.parallel(ctx, len(groups), func(groupIndex int) error {
+		for _, index := range groups[groupIndex] {
+			plan := plans[index]
+			phaseErr := retrySchemaReplicaOutcome(ctx, func() error {
+				_, retryErr := controller.client.Activate(ctx, plan.Node, plan.Request, authorization)
+				return retryErr
+			})
+			if phaseErr != nil {
+				return fmt.Errorf("schema rollout activate member %d: %w", plan.Member, phaseErr)
+			}
+		}
+		return nil
+	})
+}
+
+// settleCatalogPublication resolves an outcome-unknown catalog command inside
+// the controller that owns its exact immutable plan. RetryPending can only
+// resend the session-journaled bytes; re-entering action then observes the
+// resulting operation/catalog state and advances idempotently. SQL clients
+// therefore receive success when the durable effect is provably committed,
+// without a reconnect and without weakening the authority's fail-closed API.
+func (controller *SchemaRolloutController) settleCatalogPublication(
+	ctx context.Context, action func() (ReplicatedOperationRecord, error),
+) (ReplicatedOperationRecord, error) {
+	for {
+		record, err := action()
+		if !errors.Is(err, ErrReplicatedCatalogPending) {
+			return record, err
+		}
+		if retryErr := controller.authority.RetryPending(ctx); retryErr != nil &&
+			!errors.Is(retryErr, ErrReplicatedCatalogPending) {
+			return ReplicatedOperationRecord{}, errors.Join(err, retryErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return ReplicatedOperationRecord{}, errors.Join(ErrReplicatedCatalogPending, err)
+		}
+	}
 }
 
 func (controller *SchemaRolloutController) Drain(

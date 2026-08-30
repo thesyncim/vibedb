@@ -62,10 +62,20 @@ func OpenReplicatedShardStoreWithSchemaSourceTransition(
 			transition.RequestDigest, transition.AuthorizationDigest) != transition.CatalogCASDigest {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
+	record, found, err := readReplicatedSchemaActivation(absolute + ".tables")
+	if err != nil || !found || !bytes.Equal(record.command, command) {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if record.preparedApplied != openOptions.SchemaEmptySuffixPreparedApplied ||
+		record.preCommandApplied != openOptions.SchemaEmptySuffixPreCommandApplied {
+		return nil, ErrReplicatedSchemaCatalogImage
+	}
 	proof := &replicatedstate.SchemaSourceRecoveryProof{
 		Command: bytes.Clone(command), Membership: marker.membership,
 		AuthorizationDigest: transition.AuthorizationDigest,
 		CatalogCASDigest:    transition.CatalogCASDigest, SourceApplied: marker.sourceApplied,
+		PreCommandApplied: record.preCommandApplied,
+		CommittedCommand:  []byte(openOptions.SchemaCommittedTransition),
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                    shardStoreOpenReplicatedApplyExisting,

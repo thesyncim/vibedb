@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
@@ -19,6 +20,46 @@ type schemaControllerClient struct {
 	activated    atomic.Uint64
 	failActivate atomic.Bool
 	activateErr  error
+}
+
+func TestSchemaRolloutControllerSettlesOutcomeUnknownCatalogPublication(t *testing.T) {
+	authority, native, current := newCatalogAuthorityFixture(t)
+	target, _ := testSchemaRolloutTarget(t, current)
+	id := sha256.Sum256([]byte("schema-controller-unknown"))
+	client := &schemaControllerClient{authority: authority, base: current.Generation()}
+	controller, err := NewSchemaRolloutController(SchemaRolloutControllerOptions{
+		Authority: authority, Client: client, MaxConcurrent: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native.mu.Lock()
+	native.unknownNext = true
+	native.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			native.mu.Lock()
+			observed := len(native.unknownCommand) != 0
+			if observed {
+				native.holdUnknown = false
+			}
+			native.mu.Unlock()
+			if observed {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	result, err := controller.Execute(t.Context(), id, target,
+		schemaControllerPlans(t, id, current, target))
+	<-done
+	if err != nil || result.Record.State != ReplicatedOperationComplete ||
+		authority.holder.Current().Generation() != target.Generation() {
+		t.Fatalf("result=%+v generation=%d err=%v", result,
+			authority.holder.Current().Generation(), err)
+	}
 }
 
 func (client *schemaControllerClient) Prepare(
@@ -43,6 +84,12 @@ func (client *schemaControllerClient) Authorize(
 	context.Context, rafttransport.NodeID, schemainstall.Request, schemainstall.Authorization,
 ) (schemainstall.Record, error) {
 	client.authorized.Add(1)
+	return schemainstall.Record{State: schemainstall.StateAuthorized}, nil
+}
+
+func (client *schemaControllerClient) Commit(
+	context.Context, rafttransport.NodeID, schemainstall.Request, schemainstall.Authorization,
+) (schemainstall.Record, error) {
 	return schemainstall.Record{State: schemainstall.StateAuthorized}, nil
 }
 
@@ -160,5 +207,28 @@ func TestSchemaRolloutControllerResumesRunningCutAfterShardFailure(t *testing.T)
 	result, err = controller.Execute(context.Background(), id, target, plans)
 	if err != nil || result.Record.State != ReplicatedOperationComplete {
 		t.Fatalf("resumed result=%+v err=%v", result, err)
+	}
+}
+
+func TestSchemaRolloutControllerSettlesReplicaOutcomeUnknownInline(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	target, _ := testSchemaRolloutTarget(t, current)
+	id := sha256.Sum256([]byte("schema-controller-inline-settlement"))
+	client := &schemaControllerClient{authority: authority, base: current.Generation(),
+		activateErr: schemainstall.ErrOutcomeUnknown}
+	client.failActivate.Store(true)
+	controller, err := NewSchemaRolloutController(SchemaRolloutControllerOptions{
+		Authority: authority, Client: client, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans := schemaControllerPlans(t, id, current, target)
+	result, err := controller.Execute(t.Context(), id, target, plans)
+	if err != nil || result.Record.State != ReplicatedOperationComplete ||
+		authority.holder.Current().Generation() != target.Generation() ||
+		client.activated.Load() != uint64(len(plans)+1) {
+		t.Fatalf("result=%+v generation=%d activations=%d err=%v", result,
+			authority.holder.Current().Generation(), client.activated.Load(), err)
 	}
 }

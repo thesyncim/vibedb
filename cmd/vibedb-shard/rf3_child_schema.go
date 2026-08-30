@@ -2,11 +2,140 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"slices"
+	"strings"
+
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
+
+func rf3QuoteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func rf3IndexPath(pointer string) (string, error) {
+	if len(pointer) < 2 || pointer[0] != '/' {
+		return "", errRF3Serving
+	}
+	segments := strings.Split(pointer[1:], "/")
+	for i := range segments {
+		segments[i] = strings.ReplaceAll(strings.ReplaceAll(segments[i], "~1", "/"), "~0", "~")
+		segments[i] = rf3QuoteIdentifier(segments[i])
+	}
+	return strings.Join(segments, "."), nil
+}
+
+func rf3RenderRetainedCreateTable(table sqldriver.TableInfo) (string, error) {
+	if table.Name == "" || table.PrimaryKey == "" || len(table.Columns) == 0 {
+		return "", errRF3Serving
+	}
+	var b strings.Builder
+	b.WriteString("CREATE TABLE ")
+	b.WriteString(rf3QuoteIdentifier(table.Name))
+	b.WriteString(" (")
+	for i, column := range table.Columns {
+		path, err := rf3IndexPath(column.Path)
+		if err != nil {
+			return "", err
+		}
+		if i != 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(path)
+		b.WriteByte(' ')
+		types := column.Types &^ sqlast.TypeNull
+		if types == sqlast.TypeAny {
+			b.WriteString("ANY")
+		} else {
+			b.WriteString(types.String())
+		}
+		if column.Required {
+			b.WriteString(" NOT NULL")
+		}
+	}
+	primary, err := rf3IndexPath(table.PrimaryKey)
+	if err != nil {
+		return "", err
+	}
+	b.WriteString(", PRIMARY KEY (")
+	b.WriteString(primary)
+	b.WriteString("))")
+	return b.String(), nil
+}
+
+func rf3RetainedCreateTableMatches(text string, table sqldriver.TableInfo) bool {
+	statement, err := sqlast.ParseStatement(text)
+	if err != nil || statement.CreateTable == nil || statement.CreateTable.Table != table.Name {
+		return false
+	}
+	primary := ""
+	if len(statement.CreateTable.PrimaryKey) == 1 {
+		primary = string(statement.CreateTable.PrimaryKey[0].AppendPointer(nil))
+	}
+	columns := make([]sqldriver.ColumnInfo, 0, len(statement.CreateTable.Columns))
+	for _, column := range statement.CreateTable.Columns {
+		columns = append(columns, sqldriver.ColumnInfo{Path: string(column.Path.AppendPointer(nil)),
+			Types: column.Type, Required: column.Required})
+	}
+	want := slices.Clone(table.Columns)
+	slices.SortFunc(columns, func(a, b sqldriver.ColumnInfo) int { return strings.Compare(a.Path, b.Path) })
+	slices.SortFunc(want, func(a, b sqldriver.ColumnInfo) int { return strings.Compare(a.Path, b.Path) })
+	return primary == table.PrimaryKey && slices.Equal(columns, want)
+}
+
+// The persisted startup manifest is the generation-zero provisioning input.
+// Online DDL advances the authenticated SQL catalog without rewriting that
+// operator file. Reconstruct only the local-index portion of the cold split
+// template from the retained catalog; unrelated global-index declarations keep
+// their original explicit statements and identities.
+func refreshRF3SplitChildSchema(registry rf3ManifestSplitChildRegistry,
+	description sqldriver.ReplicatedSchemaCatalogDescription,
+) (rf3ManifestSplitChildRegistry, error) {
+	if description.Store.UserTable != registry.Table || description.Table.Name != registry.Table {
+		return registry, errRF3Serving
+	}
+	if !rf3RetainedCreateTableMatches(registry.CreateTable, description.Table) {
+		create, err := rf3RenderRetainedCreateTable(description.Table)
+		if err != nil {
+			return registry, err
+		}
+		registry.CreateTable = create
+	}
+	statements := make([]string, 0, len(registry.SchemaStatements)+len(description.Table.Indexes))
+	for _, source := range registry.SchemaStatements {
+		statement, err := query.PrepareDML(source)
+		if err != nil {
+			return registry, err
+		}
+		tree := statement.Tree()
+		if tree.CreateIndex != nil && tree.CreateIndex.Table != registry.Table {
+			statements = append(statements, source)
+		}
+		statement.Release()
+	}
+	for _, index := range description.Table.Indexes {
+		paths := make([]string, len(index.Paths))
+		for i, pointer := range index.Paths {
+			path, err := rf3IndexPath(pointer)
+			if err != nil {
+				return registry, err
+			}
+			paths[i] = path
+		}
+		statements = append(statements, fmt.Sprintf("CREATE INDEX %s ON %s (%s)",
+			rf3QuoteIdentifier(index.Name), rf3QuoteIdentifier(registry.Table), strings.Join(paths, ", ")))
+	}
+	registry.SchemaStatements = statements
+	if !rf3SplitChildSchemaMatchesRetained(registry, description.Store) {
+		return registry, errRF3Serving
+	}
+	return registry, nil
+}
 
 func parseRF3ChildSchemaStatements(node vibejson.Node, used int) ([]string, error) {
 	count, ok := node.ArrayLen()

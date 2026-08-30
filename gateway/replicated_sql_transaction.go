@@ -219,7 +219,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			if !ok || len(key) == 0 || len(key) > int(statement.profile.MaxKeyBytes) {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
-			if kind == replication.MutationPutPresent {
+			if kind == replication.MutationPutPresent && len(document) != 0 {
 				replacement, replacementErr := replicatedSQLDocumentPrimaryScalar(
 					document, statement.bound.keyPointers, &documentWorkspace,
 				)
@@ -270,17 +270,59 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			if !resolvedOK || resolved.Profile.Relation != statement.profile.Relation {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
+			var oldDocument []byte
+			missingPartial := false
+			if kind == replication.MutationPutPresent && len(statement.bound.updateAssignments) != 0 {
+				var found bool
+				oldDocument, found, err = readReplicatedSQLDocument(
+					data, ctx, resolved.Route, statement.profile, ownedKey,
+				)
+				if err != nil {
+					return nil, true, err
+				}
+				if !found {
+					// Retain a real participant so the durable request ledger can
+					// prove this zero-row result. Replicated apply checks PutPresent
+					// presence before schema validation and never publishes this value.
+					document = []byte("{}")
+					missingPartial = true
+				} else {
+					document, err = sqldriver.ApplyColumnAssignments(
+						oldDocument, statement.bound.updateAssignments,
+						statement.bound.updateArgs, int(statement.profile.MaxDocumentBytes),
+					)
+					if err != nil {
+						return nil, true, err
+					}
+				}
+				statement.bound.updateDoc = document
+			}
+			if kind == replication.MutationPutPresent && !missingPartial {
+				replacement, replacementErr := replicatedSQLDocumentPrimaryScalar(
+					document, statement.bound.keyPointers, &documentWorkspace,
+				)
+				if replacementErr != nil {
+					return nil, true, replacementErr
+				}
+				var replacementKey [replication.MaxMutationKeyBytes]byte
+				encodedReplacement, replacementOK := appendReplicatedSQLScalarKey(replacementKey[:0], replacement)
+				if !replacementOK || !bytes.Equal(key, encodedReplacement) {
+					return nil, true, ErrWriteShardKeyMove
+				}
+			}
 
 			indexStart := len(statement.bound.globalIndexes)
 			baseMutation := replication.Mutation{Kind: kind, Key: ownedKey, Value: document}
-			if len(statement.prepared.writeGlobalIndexes) != 0 &&
+			if !missingPartial && len(statement.prepared.writeGlobalIndexes) != 0 &&
 				(statement.bound.kind == sqlast.KindUpdate || statement.bound.kind == sqlast.KindDelete) {
-				oldDocument, readErr := readReplicatedSQLIndexedDocument(
-					data,
-					ctx, resolved.Route, statement.profile, ownedKey,
-				)
-				if readErr != nil {
-					return nil, true, readErr
+				if oldDocument == nil {
+					var readErr error
+					oldDocument, readErr = readReplicatedSQLIndexedDocument(
+						data, ctx, resolved.Route, statement.profile, ownedKey,
+					)
+					if readErr != nil {
+						return nil, true, readErr
+					}
 				}
 				captureRows := [][]shardservice.Cell{{
 					{Bytes: ownedKey}, {Bytes: oldDocument},
@@ -300,6 +342,11 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				} else {
 					baseMutation.Kind = replication.MutationPutDigestEqual
 				}
+			}
+			if kind == replication.MutationPutPresent && len(statement.bound.updateAssignments) != 0 && !missingPartial {
+				baseMutation.ExpectedValueLength = uint64(len(oldDocument))
+				baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
+				baseMutation.Kind = replication.MutationPutDigestEqual
 			}
 			participantIndex, appendErr := appendReplicatedSQLMutation(
 				&builders, &byGroup, resolved.Route, bits,
@@ -464,7 +511,7 @@ func replicatedSQLMutationInputCount(
 		if update == nil || update.Returning != nil || len(update.OrderBy) != 0 ||
 			update.Limit != nil || !replicatedSQLExactPrimaryFilter(
 			update.Filter, statement.profile.PrimaryKey,
-		) || len(bound.updateDoc) == 0 {
+		) || len(bound.updateDoc) == 0 && len(bound.updateAssignments) == 0 {
 			return 0, ErrReplicatedSQLTransactionUnsupported
 		}
 		if _, ok := replicatedSQLExactConstraint(bound.constraints); !ok {
@@ -570,9 +617,26 @@ func readReplicatedSQLIndexedDocument(
 	profile ReplicatedTableProfile,
 	key []byte,
 ) ([]byte, error) {
+	value, found, err := readReplicatedSQLDocument(data, ctx, route, profile, key)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrReplicatedTransactionConflict
+	}
+	return value, nil
+}
+
+func readReplicatedSQLDocument(
+	data *ReplicatedExecutor,
+	ctx context.Context,
+	route ReplicatedRoute,
+	profile ReplicatedTableProfile,
+	key []byte,
+) ([]byte, bool, error) {
 	if data == nil || profile.Relation == 0 ||
 		profile.MaxDocumentBytes == 0 {
-		return nil, ErrReplicatedSQLTransactionUnsupported
+		return nil, false, ErrReplicatedSQLTransactionUnsupported
 	}
 	result, err := data.ReadPoint(
 		ctx, route, ReplicatedPointRead{
@@ -581,12 +645,12 @@ func readReplicatedSQLIndexedDocument(
 		},
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !result.Found || len(result.Value) == 0 {
-		return nil, ErrReplicatedTransactionConflict
+		return nil, false, nil
 	}
-	return result.Value, nil
+	return result.Value, true, nil
 }
 
 func (snapshot *Snapshot) resolveReplicatedSQLGlobalIndex(

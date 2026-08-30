@@ -104,6 +104,8 @@ const (
 	DDLCreateTable
 	// DDLCreateIndex declares an index over one or more paths.
 	DDLCreateIndex
+	// DDLAlterTable adds one schema field through an atomic schema generation.
+	DDLAlterTable
 	// DDLDropTable removes a table from the SQL catalog.
 	DDLDropTable
 	// DDLTruncate atomically replaces a table with an empty storage incarnation.
@@ -125,6 +127,8 @@ func (k DMLKind) String() string {
 		return "CREATE TABLE"
 	case DDLCreateIndex:
 		return "CREATE INDEX"
+	case DDLAlterTable:
+		return "ALTER TABLE"
 	case DDLDropTable:
 		return "DROP TABLE"
 	case DDLTruncate:
@@ -264,6 +268,8 @@ func PrepareParsedDML(
 		d.kind = DDLCreateTable
 	case sqlast.KindCreateIndex:
 		d.kind = DDLCreateIndex
+	case sqlast.KindAlterTable:
+		d.kind = DDLAlterTable
 	case sqlast.KindDropTable:
 		d.kind = DDLDropTable
 	case sqlast.KindTruncate:
@@ -863,6 +869,31 @@ func schemaTypeOf(t sqlast.JSONType) store.SchemaType {
 		out |= store.SchemaObject
 	}
 	return out
+}
+
+// AlterTableDefinition is the lowered additive schema change. It carries one
+// compiled store field so adapters cannot accidentally reinterpret SQL type
+// bits at a catalog boundary.
+type AlterTableDefinition struct {
+	Table       string
+	Field       store.SchemaField
+	IfNotExists bool
+}
+
+// LowerAlterTable compiles ALTER TABLE ADD COLUMN into one store schema field.
+func (d *DMLStatement) LowerAlterTable() (AlterTableDefinition, error) {
+	if d.kind != DDLAlterTable || d.tree.AlterTable == nil {
+		return AlterTableDefinition{}, fmt.Errorf("query: %s is not an ALTER TABLE", d.kind)
+	}
+	stmt := d.tree.AlterTable
+	return AlterTableDefinition{
+		Table: stmt.Table,
+		Field: store.SchemaField{
+			Path:  string(stmt.Column.Path.AppendPointer(nil)),
+			Types: schemaTypeOf(stmt.Column.Type), Required: stmt.Column.Required,
+		},
+		IfNotExists: stmt.IfNotExists,
+	}, nil
 }
 
 // An IndexDefinition is a lowered CREATE INDEX.

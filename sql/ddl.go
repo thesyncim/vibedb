@@ -193,6 +193,17 @@ type ColumnDef struct {
 	explicitNull bool
 }
 
+// An AlterTableStmt adds one declared column to an existing table. The bounded
+// form is deliberately additive: it can be built and validated against a
+// shadow copy, then published atomically without teaching the serving path
+// about transitional schemas.
+type AlterTableStmt struct {
+	Table       string
+	Column      ColumnDef
+	IfNotExists bool
+	Pos         int
+}
+
 // A CreateIndexStmt is one parsed CREATE INDEX.
 //
 // The indexed thing is a path, in the same path language everything else uses,

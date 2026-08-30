@@ -83,6 +83,8 @@ func KindOf(src string) Kind {
 		// kind" here, and callers that need the distinction have the parsed
 		// statement by the time they do.
 		return KindCreateTable
+	case tokenTextEqual(tok, "ALTER"):
+		return KindAlterTable
 	case tok.kw == kwDrop:
 		if next := lx.next(); next.kind == tokIdent && next.kw == kwIndex {
 			return KindDropIndex
@@ -131,6 +133,9 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 		return p.parseDelete()
 	case p.atKeyword(kwCreate):
 		return p.parseCreate(dst)
+	case tokenTextEqual(p.tok, "ALTER"):
+		dst.Kind, dst.AlterTable = KindAlterTable, &p.alter
+		return p.parseAlterTable()
 	case p.atKeyword(kwDrop):
 		return p.parseDrop(dst)
 	case p.atKeyword(kwTruncate):
@@ -699,13 +704,33 @@ func (p *Parser) parseUpdate() error {
 		return err
 	}
 	p.upd.SetPos = p.tok.pos
-	doc, err := p.parseAssignment()
+	whole, assignment, err := p.parseAssignment()
 	if err != nil {
 		return err
 	}
-	p.upd.Doc = doc
-	if p.tok.kind == tokComma {
-		return p.errHere("an UPDATE assigns the whole document once: a second assignment would have to be merged into the first, and this engine has no partial document update to merge with")
+	if whole != nil {
+		p.upd.Doc = *whole
+		if p.tok.kind == tokComma {
+			return p.errHere("a whole-document UPDATE cannot be combined with column assignments")
+		}
+	} else {
+		p.upd.Assignments = append(p.upd.Assignments, assignment)
+		for p.tok.kind == tokComma {
+			p.advance()
+			whole, assignment, err = p.parseAssignment()
+			if err != nil {
+				return err
+			}
+			if whole != nil {
+				return p.errHere("a whole-document UPDATE cannot be combined with column assignments")
+			}
+			for i := range p.upd.Assignments {
+				if p.upd.Assignments[i].Column == assignment.Column {
+					return p.errfAt(assignment.Pos, "UPDATE assigns column %q more than once", assignment.Column)
+				}
+			}
+			p.upd.Assignments = append(p.upd.Assignments, assignment)
+		}
 	}
 	if p.atKeyword(kwFrom) {
 		return p.errHere("UPDATE ... FROM is not supported: the value written comes from the statement, never from another collection")
@@ -735,27 +760,36 @@ func (p *Parser) parseUpdate() error {
 // message wants the alternative and a reader reading the type wants the
 // argument. What the message has to carry is the alternative: read, edit, write
 // back.
-func (p *Parser) parseAssignment() (Operand, error) {
+func (p *Parser) parseAssignment() (*Operand, UpdateAssignment, error) {
 	if p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == DocumentColumn {
 		p.advance()
 		if p.tok.kind != tokEq {
-			return Operand{}, p.errfHere("expected '=' after %q", DocumentColumn)
+			return nil, UpdateAssignment{}, p.errfHere("expected '=' after %q", DocumentColumn)
 		}
 		p.advance()
-		return p.parseDocumentOperand()
+		doc, err := p.parseDocumentOperand()
+		return &doc, UpdateAssignment{}, err
 	}
-	// Anything else that looks like a path is the partial update this engine
-	// has no primitive for. Naming the path back is what makes the message
-	// actionable rather than a policy statement.
 	path, err := p.parsePath(false)
 	if err != nil {
-		return Operand{}, err
+		return nil, UpdateAssignment{}, err
 	}
-	return Operand{}, p.errfAt(path.Pos,
-		"SET %s = ... is a partial document update, which this engine has no primitive for: every write it owns replaces a document whole, "+
-			"and there is no JSON path-set operation anywhere in this codebase for a read-modify-write to call. "+
-			"Read the document with SELECT, edit it where your documents are already built, and write it back with SET %q = ?",
-		path.Spec(), DocumentColumn)
+	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+		return nil, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... must name one declared top-level column", path.Spec())
+	}
+	column := path.Segments[0].Key
+	if column == DocumentColumn || column == "$key" {
+		return nil, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... names a reserved column", path.Spec())
+	}
+	if p.tok.kind != tokEq {
+		return nil, UpdateAssignment{}, p.errfHere("expected '=' after %s", path.Spec())
+	}
+	p.advance()
+	value, err := p.parseOperand()
+	if err != nil {
+		return nil, UpdateAssignment{}, err
+	}
+	return nil, UpdateAssignment{Column: column, Value: value, Pos: path.Pos}, nil
 }
 
 // --- DELETE ------------------------------------------------------------------

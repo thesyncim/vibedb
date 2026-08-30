@@ -124,6 +124,8 @@ const (
 	requestQuiesceSchemaGeneration
 	requestInstallSchemaGeneration
 	requestSplitSourceLeadership
+	requestSchemaLeadershipTransfer
+	requestFenceCommittedSchemaGeneration
 )
 
 const (
@@ -216,16 +218,17 @@ type readDelivery struct {
 }
 
 type ownerGeneration struct {
-	pins      atomic.Int64
-	quiescing atomic.Bool
+	pins             atomic.Int64
+	transitionFenced atomic.Bool
+	quiescing        atomic.Bool
 }
 
 func (generation *ownerGeneration) acquire() bool {
-	if generation == nil || generation.quiescing.Load() {
+	if generation == nil || generation.transitionFenced.Load() || generation.quiescing.Load() {
 		return false
 	}
 	generation.pins.Add(1)
-	if generation.quiescing.Load() {
+	if generation.transitionFenced.Load() || generation.quiescing.Load() {
 		generation.pins.Add(-1)
 		return false
 	}
@@ -670,6 +673,7 @@ type ownerHost interface {
 	Add(*raftmember.Runtime) error
 	Remove(raftmember.GroupKey) error
 	QuiesceSQLGeneration(raftmember.GroupKey) error
+	FenceCommittedSchemaGeneration(raftmember.GroupKey) error
 	ObserveSchemaTransition(raftmember.GroupKey, []byte) (uint64, bool, error)
 	InstallSQLGeneration(
 		raftmember.GroupKey, *sqldriver.Database, *sqldriver.ReplicatedApply,
@@ -1020,6 +1024,14 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestInbound:
 		if request.inbound.Group != request.group || request.inbound.Message == nil {
 			reply.err = ErrInvalidOwner
+		} else if member, found := owner.members[request.group]; found &&
+			member.generation != nil && member.generation.quiescing.Load() {
+			// The authenticated transport has already transferred ownership.
+			// Deliberately discard ordinary Raft traffic while the committed
+			// schema transition drains the old runtime generation. Raft repairs
+			// this bounded packet loss after installation; admitting it would let
+			// peer heartbeats keep quiescence permanently busy.
+			reply.err = nil
 		} else {
 			reply.err = owner.host.AdoptMessage(request.group, request.inbound.Message)
 		}
@@ -1096,6 +1108,10 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
 	case requestSplitSourceLeadership:
 		reply.err = owner.transferSplitSourceLeadership(request.fence, request.targetMember)
+	case requestSchemaLeadershipTransfer:
+		reply.err = owner.transferSchemaLeadership(request.fence)
+	case requestFenceCommittedSchemaGeneration:
+		reply.err = owner.fenceCommittedSchemaGeneration(request)
 	case requestSchemaTransition:
 		reply.err = owner.applySchemaTransition(request.fence, request.data)
 	case requestReplicaRetirement:
@@ -1143,6 +1159,10 @@ func (owner *Owner) handle(request ownerRequest) error {
 				break
 			}
 		} else if member.read == nil {
+			reply.err = ErrServingFence
+			break
+		}
+		if member.generation == nil || member.generation.quiescing.Load() {
 			reply.err = ErrServingFence
 			break
 		}
@@ -1210,20 +1230,88 @@ func (owner *Owner) handle(request ownerRequest) error {
 
 func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
 	member, found := owner.members[request.group]
-	if !found || !servingFenceMatchesIdentity(request.fence, member) ||
-		len(owner.pendingReads) != 0 || !member.generation.quiesce() {
+	committedAuthority := request.fence == (ServingFence{})
+	if !found || (!committedAuthority && !servingFenceMatchesIdentity(request.fence, member)) ||
+		member.generation == nil {
 		return ErrServingFence
 	}
 	transition, openErr := replicatedstate.OpenSchemaTransition(request.data)
+	from := transition.From
+	committedIdentity := member.identity.Group == request.group &&
+		[16]byte(from.ClusterID) == request.group.ClusterID &&
+		[16]byte(from.ClusterIncarnation) == request.group.ClusterIncarnation &&
+		from.TopologyRecoveryEpoch == request.group.TopologyRecoveryEpoch &&
+		[16]byte(from.ShardIncarnation) == request.group.ShardIncarnation &&
+		[16]byte(from.GroupID) == request.group.GroupID &&
+		from.AllocationGeneration == member.identity.AllocationGeneration &&
+		from.ActivePolicyGeneration == member.command.ActivePolicyGeneration &&
+		from.ProtectionEpoch == member.command.ProtectionEpoch &&
+		from.OwnershipEpoch == member.command.OwnershipEpoch &&
+		from.SchemaGeneration == member.command.SchemaGeneration &&
+		from.RoutingVersion == member.command.RoutingVersion &&
+		from.RouteGeneration == member.command.RouteGeneration &&
+		transition.FromManifest == member.command.RelationManifestDigest
 	applied, committed, err := owner.host.ObserveSchemaTransition(request.group, request.data)
 	if openErr != nil || err != nil || !committed || applied == 0 ||
+		(committedAuthority && !committedIdentity) ||
 		transition.From.SchemaGeneration != member.command.SchemaGeneration ||
 		transition.ToSchemaGeneration != member.command.SchemaGeneration+1 {
-		member.generation.resume()
 		return errors.Join(openErr, err, ErrServingFence)
 	}
+	if !member.generation.quiescing.Load() {
+		if !member.generation.quiesce() {
+			return ErrServingFence
+		}
+	} else if member.generation.pins.Load() != 0 {
+		return ErrServingFence
+	}
 	if err := owner.host.QuiesceSQLGeneration(request.group); err != nil {
-		member.generation.resume()
+		// A committed transition is already a permanent source fence. Keep
+		// admissions latched while queued ticks/read barriers drain, then let
+		// the exact retry finish the in-process generation swap.
+		if !committedAuthority {
+			member.generation.resume()
+		}
+		return err
+	}
+	owner.members[request.group] = member
+	return nil
+}
+
+func (owner *Owner) fenceCommittedSchemaGeneration(request ownerRequest) error {
+	member, found := owner.members[request.group]
+	if !found || member.generation == nil {
+		return ErrServingFence
+	}
+	transition, openErr := replicatedstate.OpenSchemaTransition(request.data)
+	// Process recovery can install the authenticated target before the gateway
+	// replays its Commit control phase. Settle that exact replay as success: the
+	// new generation needs no source fence, and requiring To == Current+1 would
+	// otherwise leave the durable coordinator retrying a completed transition.
+	if openErr == nil && member.identity.Group == request.group &&
+		[16]byte(transition.From.ClusterID) == request.group.ClusterID &&
+		[16]byte(transition.From.ClusterIncarnation) == request.group.ClusterIncarnation &&
+		transition.From.TopologyRecoveryEpoch == request.group.TopologyRecoveryEpoch &&
+		[16]byte(transition.From.ShardIncarnation) == request.group.ShardIncarnation &&
+		[16]byte(transition.From.GroupID) == request.group.GroupID &&
+		transition.From.AllocationGeneration == member.identity.AllocationGeneration &&
+		transition.ExpectedReplicaSetVersion == member.command.ReplicaSetVersion &&
+		transition.From.ActivePolicyGeneration == member.command.ActivePolicyGeneration &&
+		transition.From.ProtectionEpoch == member.command.ProtectionEpoch &&
+		transition.From.OwnershipEpoch == member.command.OwnershipEpoch &&
+		transition.From.RoutingVersion == member.command.RoutingVersion &&
+		transition.From.RouteGeneration == member.command.RouteGeneration &&
+		transition.ToSchemaGeneration == member.command.SchemaGeneration &&
+		transition.ToManifest == member.command.RelationManifestDigest {
+		return nil
+	}
+	applied, committed, err := owner.host.ObserveSchemaTransition(request.group, request.data)
+	if openErr != nil || err != nil || !committed || applied == 0 ||
+		transition.ToSchemaGeneration != member.command.SchemaGeneration+1 {
+		return errors.Join(openErr, err, ErrServingFence)
+	}
+	member.generation.transitionFenced.Store(true)
+	if err = owner.host.FenceCommittedSchemaGeneration(request.group); err != nil {
 		return err
 	}
 	owner.members[request.group] = member
@@ -2632,6 +2720,37 @@ func (owner *Owner) QuiesceSchemaGeneration(
 		kind: requestQuiesceSchemaGeneration, group: fence.Group, fence: fence,
 		data: owned, bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
 	})
+	return err
+}
+
+// QuiesceCommittedSchemaGeneration uses the exact applied schema envelope as
+// local generation authority. Unlike a serving Probe, it never asks the
+// intentionally fenced source state machine for a post-transition snapshot.
+func (owner *Owner) QuiesceCommittedSchemaGeneration(
+	ctx context.Context, group raftmember.GroupKey, command []byte,
+) error {
+	if owner == nil || ctx == nil || group == (raftmember.GroupKey{}) || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return ErrInvalidOwner
+	}
+	owned := append([]byte(nil), command...)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestQuiesceSchemaGeneration, group: group, data: owned,
+		bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+	})
+	return err
+}
+
+func (owner *Owner) FenceCommittedSchemaGeneration(
+	ctx context.Context, group raftmember.GroupKey, command []byte,
+) error {
+	if owner == nil || ctx == nil || group == (raftmember.GroupKey{}) || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return ErrInvalidOwner
+	}
+	owned := append([]byte(nil), command...)
+	_, err := owner.enqueue(ctx, ownerRequest{kind: requestFenceCommittedSchemaGeneration,
+		group: group, data: owned, bytes: int64(len(owned)), reply: make(chan ownerReply, 1)})
 	return err
 }
 

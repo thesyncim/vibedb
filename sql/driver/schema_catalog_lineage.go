@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -100,8 +101,8 @@ func encodeReplicatedSchemaLineage(record replicatedSchemaLineage) ([]byte, erro
 	transition, err := replicatedstate.OpenSchemaTransition(record.activation.command)
 	m := record.marker
 	if err != nil || image.SchemaGeneration != transition.ToSchemaGeneration || image.RelationManifestDigest != transition.ToManifest ||
-		m.schemaGeneration != image.SchemaGeneration || m.membership.Sequence != transition.MembershipSequence ||
-		m.membership.Source != transition.MembershipSource || m.membership.Target != transition.MembershipTarget ||
+		m.schemaGeneration != image.SchemaGeneration || m.membership.Sequence == 0 ||
+		m.membership.Source == ([sha256.Size]byte{}) || m.membership.Target == ([sha256.Size]byte{}) ||
 		m.authorization != transition.RequestDigest || m.applyContract != transition.ToApplyContract || m.placementDigest != transition.ToPlacementDigest {
 		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
 	}
@@ -181,7 +182,7 @@ func readReplicatedSchemaLineage(directory string) (replicatedSchemaLineage, boo
 func ensureReplicatedSchemaOrigin(path string) error {
 	raw, found, err := readCatalogFile(path)
 	if err != nil || !found {
-		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		return fmt.Errorf("%w: retain lineage catalog found=%t: %v", ErrReplicatedSchemaCatalogImage, found, err)
 	}
 	if _, err := ValidateReplicatedSchemaCatalogImage(raw); err != nil {
 		return err
@@ -231,15 +232,15 @@ func retainDrainedSchemaLineage(path string, marker replicatedSchemaStageMarker,
 	directory := path + ".tables"
 	origin, found, err := readSchemaLineageFile(directory, replicatedSchemaOriginName, maxCatalogBytes)
 	if err != nil || !found {
-		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+		return fmt.Errorf("%w: retain lineage origin found=%t: %v", ErrReplicatedSchemaCatalogImage, found, err)
 	}
 	prior, exists, err := readReplicatedSchemaLineage(directory)
 	if err != nil {
-		return err
+		return fmt.Errorf("read prior schema lineage: %w", err)
 	}
 	transition, err := replicatedstate.OpenSchemaTransition(activation.command)
 	if err != nil {
-		return err
+		return fmt.Errorf("open retained schema activation: %w", err)
 	}
 	source := origin
 	if exists {
@@ -249,15 +250,23 @@ func retainDrainedSchemaLineage(path string, marker replicatedSchemaStageMarker,
 		source = prior.catalog
 	}
 	sourceImage, err := ValidateReplicatedSchemaCatalogImage(source)
-	if err != nil || sourceImage.SchemaGeneration != transition.From.SchemaGeneration || sourceImage.RelationManifestDigest != transition.FromManifest ||
-		replicatedSchemaCatalogCASDigest(sourceImage.Digest, activation.targetDigest, transition.RequestDigest, transition.AuthorizationDigest) != transition.CatalogCASDigest {
-		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	wantCAS := replicatedSchemaCatalogCASDigest(sourceImage.Digest, activation.targetDigest,
+		transition.RequestDigest, transition.AuthorizationDigest)
+	if err != nil || sourceImage.SchemaGeneration != transition.From.SchemaGeneration ||
+		sourceImage.RelationManifestDigest != transition.FromManifest || wantCAS != transition.CatalogCASDigest {
+		return fmt.Errorf("%w: drained lineage source generation=%d/%d manifest=%t catalog-cas=%t: %v",
+			ErrReplicatedSchemaCatalogImage, sourceImage.SchemaGeneration,
+			transition.From.SchemaGeneration, sourceImage.RelationManifestDigest == transition.FromManifest,
+			wantCAS == transition.CatalogCASDigest, err)
 	}
 	encoded, err := encodeReplicatedSchemaLineage(replicatedSchemaLineage{origin: sha256.Sum256(origin), catalog: raw, marker: marker, activation: activation})
 	if err != nil {
-		return err
+		return fmt.Errorf("encode retained schema lineage: %w", err)
 	}
-	return writeSchemaLineageFile(directory, replicatedSchemaLineageName, encoded)
+	if err := writeSchemaLineageFile(directory, replicatedSchemaLineageName, encoded); err != nil {
+		return fmt.Errorf("write retained schema lineage: %w", err)
+	}
+	return nil
 }
 
 // RetainedReplicatedSchemaLineageIdentity advances an external immutable

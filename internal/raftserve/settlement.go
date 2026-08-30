@@ -237,6 +237,17 @@ func stageSettlementLocked[Batch appliedBatchView](
 			}
 			continue
 		}
+		if replicatedstate.IsSchemaTransition(entry.Data) {
+			transition, transitionErr := replicatedstate.OpenSchemaTransition(entry.Data)
+			if transitionErr != nil || !schemaTransitionMatchesGroup(transition, batch.Group()) {
+				return attemptCount, entryCount, lookupCount,
+					fmt.Errorf("%w: schema transition", ErrSettlementResult)
+			}
+			// Schema transitions are internal control entries. They have no
+			// client command identity and therefore no proposal-registry waiter
+			// or completion to settle.
+			continue
+		}
 		identity, identityErr := openCommandIdentity(batch.Group(), entry.Data)
 		if identityErr != nil {
 			return attemptCount, entryCount, lookupCount,
@@ -741,6 +752,18 @@ func transitionMatchesGroup(
 		transition.TopologyRecoveryEpoch == group.TopologyRecoveryEpoch &&
 		transition.ShardIncarnation == group.ShardIncarnation &&
 		transition.GroupID == group.GroupID
+}
+
+func schemaTransitionMatchesGroup(
+	transition replicatedstate.SchemaTransitionView,
+	group raftmember.GroupKey,
+) bool {
+	from := transition.From
+	return from.ClusterID == group.ClusterID &&
+		from.ClusterIncarnation == group.ClusterIncarnation &&
+		from.TopologyRecoveryEpoch == group.TopologyRecoveryEpoch &&
+		from.ShardIncarnation == group.ShardIncarnation &&
+		from.GroupID == group.GroupID
 }
 
 func validateCompletionLookup(

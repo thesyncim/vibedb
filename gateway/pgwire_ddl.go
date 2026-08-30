@@ -13,7 +13,7 @@ import (
 
 func postgresDDLKind(kind sqlast.Kind) bool {
 	switch kind {
-	case sqlast.KindCreateTable, sqlast.KindDropTable, sqlast.KindCreateIndex,
+	case sqlast.KindCreateTable, sqlast.KindDropTable, sqlast.KindCreateIndex, sqlast.KindAlterTable,
 		sqlast.KindDropIndex, sqlast.KindTruncate:
 		return true
 	}
