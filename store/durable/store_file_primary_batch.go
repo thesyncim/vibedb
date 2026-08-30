@@ -22,6 +22,10 @@ var ErrPrimaryBatchUnsupportedLane = errors.New(
 	"vibedb: ordered primary Update requires a buffered-visible or sync-journal lane",
 )
 
+var errPrimaryBatchExactCheckpointRequired = errors.New(
+	"vibedb: ordered primary stable-slot exact delta requires checkpoint",
+)
+
 // primaryBatchMutation is one resolved key in a primary Update: its resident
 // route and document bytes (nil for a delete). Keys and values borrow the
 // WriteBatch arena, stable for the whole Update.
@@ -31,6 +35,8 @@ type primaryBatchMutation struct {
 	stored   storeio.CommonPrimaryLeafValue
 	resident storeio.ResidentPrimaryRoute
 	remove   bool
+	found    bool
+	oldSlot  uint8
 }
 
 // primaryBatchLeaf accumulates every mutation a batch routes to one leaf and the
@@ -52,6 +58,7 @@ type primaryBatchLeaf struct {
 	docDelta     int
 	mutationAt   int
 	mutationEnd  int
+	stableSlots  bool
 	skip         bool
 }
 
@@ -234,6 +241,18 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if err := c.planPrimaryBatch(state, batch); err != nil {
 			return stagedPrimaryBatch{}, err
 		}
+		// Validate the complete final image before leaf rendering or structural
+		// preparation. A conflicting insert routed to a highly compressed leaf
+		// must report the typed constraint error without first trying an
+		// unnecessary split. Certified sequential recovery already validated its
+		// whole original record, so its one-entry intermediate images are exempt.
+		if !(c.journalReplaying && c.primaryUniqueReplayValidated) {
+			if err := c.validatePrimaryUniqueRecoveryBatch(
+				c.batchJournalEntries,
+			); err != nil {
+				return stagedPrimaryBatch{}, err
+			}
+		}
 		leafCount := len(c.batchPrimaryLeaves)
 		if leafCount == 0 {
 			// Every mutation resolved to a delete of an absent key: nothing changes,
@@ -262,6 +281,9 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if !c.primaryBatchHasLiveLeaf() {
 			return stagedPrimaryBatch{}, nil
 		}
+		if err := c.validatePrimaryUniqueBatch(); err != nil {
+			return stagedPrimaryBatch{}, err
+		}
 		checkpointed, err := c.ensurePrimaryBatchCapacity(conditional)
 		if err != nil {
 			return stagedPrimaryBatch{}, err
@@ -277,6 +299,15 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 			return stagedPrimaryBatch{}, err
 		}
 		preparedExact, err := c.preparePrimaryBatchExact(state, generation)
+		if errors.Is(err, errPrimaryBatchExactCheckpointRequired) {
+			c.unadmitPrimaryBatchLeaves()
+			if checkpointErr := c.checkpointBufferedLocked(); checkpointErr != nil {
+				return stagedPrimaryBatch{}, checkpointErr
+			}
+			c.automaticCheckpoints.Add(1)
+			lastErr = err
+			continue
+		}
 		if err != nil {
 			c.unadmitPrimaryBatchLeaves()
 			return stagedPrimaryBatch{}, err
@@ -400,9 +431,48 @@ func (c *Collection) preparePrimaryBatchExact(
 		AllocationQuantum: state.root.PageSize,
 	}
 	pressure := false
+	stablePressure := false
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]
 		if leaf.skip {
+			continue
+		}
+		if leaf.stableSlots {
+			for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+				mutation := &c.batchPrimaryMutations[mutationAt]
+				if !mutation.found {
+					continue
+				}
+				oldRaw, found, resolveErr := c.resolvePrimaryGraph(
+					c.overflowValueScratch[:0], state, mutation.key,
+				)
+				if resolveErr != nil {
+					c.unwindPrimaryExactPrepared(&prepared)
+					return primaryExactPrepared{}, resolveErr
+				}
+				if !found {
+					c.unwindPrimaryExactPrepared(&prepared)
+					return primaryExactPrepared{}, storeio.ErrPrimaryExactIndexCorrupt
+				}
+				c.overflowValueScratch = oldRaw
+				ok, deltaErr := c.preparePrimaryExactDeltaRaw(
+					epoch, &prepared, mutation.resident,
+					oldRaw, mutation.value, mutation.remove, true,
+					mutation.oldSlot, mutation.oldSlot, generation,
+				)
+				if deltaErr != nil {
+					c.unwindPrimaryExactPrepared(&prepared)
+					return primaryExactPrepared{}, deltaErr
+				}
+				if !ok {
+					pressure = true
+					stablePressure = true
+					break
+				}
+			}
+			if pressure {
+				break
+			}
 			continue
 		}
 		image := c.batchPrimaryLeafArena[leaf.imageOffset : leaf.imageOffset+leaf.imageLength]
@@ -424,6 +494,9 @@ func (c *Collection) preparePrimaryBatchExact(
 	}
 
 	c.unwindPrimaryExactPrepared(&prepared)
+	if stablePressure {
+		return primaryExactPrepared{}, errPrimaryBatchExactCheckpointRequired
+	}
 	c.resetStructuralExactLocked()
 	defer c.resetStructuralExactLocked()
 	for i := range c.batchPrimaryLeaves {
@@ -812,6 +885,8 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	state *fileStoreState, baseGen uint64, li int,
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
+	leaf.stableSlots = c.journalReplaying && c.primaryUniqueReplayValidated &&
+		state.root.IndexCount != 0
 	inputBounds := c.primaryLeafBounds(state)
 	var (
 		path  filePrimaryMutationPath
@@ -869,6 +944,14 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		leaf.skip = true
 		return nil, nil
 	}
+	if leaf.stableSlots {
+		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+			if !c.batchPrimaryMutations[mutationAt].found {
+				leaf.stableSlots = false
+				break
+			}
+		}
+	}
 	leaf.docDelta = len(final) - len(baseRows)
 	leaf.finalLen = len(final)
 	if len(final) > storeio.CommonPrimaryLeafWideSlots {
@@ -877,17 +960,19 @@ func (c *Collection) buildPrimaryBatchLeaf(
 			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
 		)
 	}
-	if err := storeio.PlaceCommonPrimaryLeafRecords(
-		storeio.CommonPrimaryLeafWide, c.storeID, final,
-	); err != nil {
-		if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
-			errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-			c.primaryLeafSplitRequired.Add(1)
-			return c.primaryBatchProspectiveSplitKey(final), errors.Join(
-				ErrPrimaryLeafSplitRequired, err,
-			)
+	if !leaf.stableSlots {
+		if err := storeio.PlaceCommonPrimaryLeafRecords(
+			storeio.CommonPrimaryLeafWide, c.storeID, final,
+		); err != nil {
+			if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
+				errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+				c.primaryLeafSplitRequired.Add(1)
+				return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+					ErrPrimaryLeafSplitRequired, err,
+				)
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 	leaf.frameGen = baseGen + 1
 	image, err := storeio.EncodeBestCompactPrimaryStripe(
@@ -958,9 +1043,11 @@ func (c *Collection) mergePrimaryBatchLeafRows(
 			}
 			mutationAt++
 		default:
+			mutation.found = true
+			mutation.oldSlot = base.Slot
 			if !mutation.remove {
 				final = append(final, storeio.CommonPrimaryLeafRecord{
-					Key: mutation.key, Value: mutation.stored,
+					Key: mutation.key, Value: mutation.stored, Slot: base.Slot,
 				})
 			}
 			applied++

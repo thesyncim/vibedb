@@ -47,6 +47,8 @@ type ColumnInfo struct {
 // An IndexInfo describes one declared exact index.
 type IndexInfo struct {
 	Name string
+	// Unique reports whether SQL rejects duplicate non-NULL indexed tuples.
+	Unique bool
 	// Paths are the indexed RFC 6901 pointers, in declaration order.
 	Paths []string
 }
@@ -88,7 +90,9 @@ func tableInfoFromMeta(name string, meta *tableMeta) TableInfo {
 		}
 	}
 	for _, index := range meta.Indexes {
-		info.Indexes = append(info.Indexes, IndexInfo{Name: index.Name, Paths: slices.Clone(index.Paths)})
+		info.Indexes = append(info.Indexes, IndexInfo{
+			Name: index.Name, Paths: slices.Clone(index.Paths), Unique: index.Unique,
+		})
 	}
 	return info
 }

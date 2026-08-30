@@ -83,13 +83,12 @@ func newPlacementBinding(cfg distribution.ClusterConfig, table string) (*placeme
 }
 
 // validateShardKeyLocality enforces the uniqueness-locality invariant for a
-// placed table: every unique or primary key must contain every shard-key column,
-// so per-shard uniqueness remains global uniqueness. This dialect's only unique
-// key is the single-path primary key (UNIQUE indexes are refused and non-unique
-// indexes enforce no uniqueness), so the check reduces to the primary key
-// containing every shard-key column. Pointer spellings are compared directly,
-// matching the driver's column identity. It returns ErrShardKeyNotLocal on
-// violation, failing closed.
+// placed table: every primary or local unique key must contain every shard-key
+// column, so per-shard uniqueness remains global uniqueness. This helper checks
+// the single-path primary key; CREATE UNIQUE INDEX and open-time validation use
+// keyContainsShardColumns for their compound paths. Pointer spellings are
+// compared directly, matching the driver's column identity. It returns
+// ErrShardKeyNotLocal on violation, failing closed.
 func validateShardKeyLocality(table string, shardColumns []string, primaryKey string) error {
 	if keyContainsShardColumns([]string{primaryKey}, shardColumns) {
 		return nil

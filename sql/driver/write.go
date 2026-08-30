@@ -542,6 +542,15 @@ func (d *database) createIndexContext(
 		d.mu.Unlock()
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, definition.Table)
 	}
+	if definition.Unique {
+		if err := d.cluster.validateUniqueIndexLocality(
+			definition.Table, definition.Definition.Name,
+			definition.Definition.Paths,
+		); err != nil {
+			d.mu.Unlock()
+			return nil, err
+		}
+	}
 	for _, index := range t.meta.Indexes {
 		if index.Name == definition.Definition.Name {
 			d.mu.Unlock()
@@ -550,6 +559,12 @@ func (d *database) createIndexContext(
 			}
 			return nil, fmt.Errorf("%w: %q", ErrIndexExists, index.Name)
 		}
+	}
+	if definition.Unique && t.collection != nil {
+		defer d.mu.Unlock()
+		return d.createUniqueIndexMaterializedLockedContext(
+			ctx, definition, t,
+		)
 	}
 	if t.collection == nil {
 		defer d.mu.Unlock()
@@ -681,6 +696,83 @@ func (d *database) createIndexContext(
 	return result{}, nil
 }
 
+// createUniqueIndexMaterializedLockedContext holds db.mu across the durable
+// build and SQL-catalog publication. Until the uniqueness bit is visible in
+// the in-memory layout, that fence prevents an ordinary SQL writer from
+// inserting a duplicate after durable validation but before metadata install.
+// The durable alias also persists Unique, so crash recovery cannot downgrade a
+// successfully published constraint when the SQL mirror trails it.
+func (d *database) createUniqueIndexMaterializedLockedContext(
+	ctx context.Context,
+	definition query.IndexDefinition,
+	t *table,
+) (sqldriver.Result, error) {
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
+	_, err := t.collection.CreateUniqueIndexContext(ctx, definition.Definition)
+	if err != nil {
+		if errors.Is(err, store.ErrUniqueIndexViolation) {
+			return nil, fmt.Errorf(
+				"%w: index %q found duplicate existing values",
+				ErrUniqueConstraint, definition.Definition.Name,
+			)
+		}
+		if errors.Is(err, store.ErrIndexExists) && definition.IfNotExists {
+			return result{}, nil
+		}
+		if errors.Is(err, store.ErrIndexExists) {
+			return nil, fmt.Errorf(
+				"%w: %q", ErrIndexExists, definition.Definition.Name,
+			)
+		}
+		if errors.Is(err, durable.ErrIndexBuildInProgress) {
+			return nil, fmt.Errorf(
+				"%w: table %q", ErrIndexBuildInProgress, definition.Table,
+			)
+		}
+		if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+			// The durable page catalog is authoritative for the Unique bit. Mirror
+			// whatever is observable and retain a pending SQL-catalog repair.
+			_, _ = syncTableIndexMeta(t)
+			d.catalogWritePending = true
+			d.advanceLayoutEpochLocked()
+			return nil, err
+		}
+		return nil, err
+	}
+
+	// A nil durable result proves publication. Install the in-memory constraint
+	// even if reading the durable catalog or persisting its SQL mirror fails;
+	// subsequent SQL writes must remain fenced by the new invariant.
+	t.meta.Indexes = append(t.meta.Indexes, indexMeta{
+		Name:   definition.Definition.Name,
+		Paths:  append([]string(nil), definition.Definition.Paths...),
+		Unique: true,
+	})
+	if _, syncErr := syncTableIndexMeta(t); syncErr != nil {
+		d.catalogWritePending = true
+		d.advanceLayoutEpochLocked()
+		return nil, fmt.Errorf(
+			"%w: durable unique index committed before SQL catalog refresh: %v",
+			durable.ErrCommitOutcomeUnknown, syncErr,
+		)
+	}
+	d.advanceLayoutEpochLocked()
+	published, persistErr := d.persistCatalogLocked()
+	if persistErr != nil {
+		d.catalogWritePending = !published
+		if published {
+			return nil, persistErr
+		}
+		return nil, fmt.Errorf(
+			"%w: durable unique index committed before SQL catalog publication: %v",
+			durable.ErrCommitOutcomeUnknown, persistErr,
+		)
+	}
+	return result{}, nil
+}
+
 func (d *database) createIndexLockedContext(
 	ctx context.Context,
 	statement *query.DMLStatement,
@@ -702,6 +794,14 @@ func (d *database) createIndexLockedContext(
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, definition.Table)
 	}
+	if definition.Unique {
+		if err := d.cluster.validateUniqueIndexLocality(
+			definition.Table, definition.Definition.Name,
+			definition.Definition.Paths,
+		); err != nil {
+			return nil, err
+		}
+	}
 	for _, index := range t.meta.Indexes {
 		if index.Name == definition.Definition.Name {
 			if definition.IfNotExists {
@@ -717,7 +817,9 @@ func (d *database) createIndexLockedContext(
 	}
 	proposed := append([]indexMeta(nil), t.meta.Indexes...)
 	proposed = append(proposed, indexMeta{
-		Name: definition.Definition.Name, Paths: append([]string(nil), definition.Definition.Paths...),
+		Name:   definition.Definition.Name,
+		Paths:  append([]string(nil), definition.Definition.Paths...),
+		Unique: definition.Unique,
 	})
 	candidateMeta := *t.meta
 	candidateMeta.Indexes = proposed
@@ -929,6 +1031,9 @@ func (c *conn) insertLocked(
 			})
 			stagedBytes += len(candidate.key) + len(finalDocument)
 		}
+	}
+	if err := validateTableUniquePostimages(ctx, t, seeds, nil); err != nil {
+		return nil, err
 	}
 	if returning != nil {
 		if returned == nil {
@@ -1142,6 +1247,9 @@ func (c *conn) insertSelectLocked(
 		}
 	}
 	if err := c.routeInsertSeedsWithBinding(placement, seeds); err != nil {
+		return nil, err
+	}
+	if err := validateTableUniquePostimages(ctx, t, seeds, nil); err != nil {
 		return nil, err
 	}
 	if returning != nil {
@@ -1422,16 +1530,16 @@ func putSeedsAtomic(collection *durable.Collection, seeds []seedDocument) error 
 		return nil
 	case 1:
 		_, err := collection.Put([]byte(seeds[0].key), seeds[0].document)
-		return err
+		return mapDurableUniqueConstraintError(err)
 	}
-	return collection.Update(func(batch *durable.WriteBatch) error {
+	return mapDurableUniqueConstraintError(collection.Update(func(batch *durable.WriteBatch) error {
 		for _, seed := range seeds {
 			if err := batch.Put([]byte(seed.key), seed.document); err != nil {
 				return err
 			}
 		}
 		return nil
-	})
+	}))
 }
 
 func resolveInsertRow(
@@ -2273,6 +2381,20 @@ func (c *conn) updateLockedReturning(
 			)
 		}
 	}
+	if tableHasUniqueIndexes(t) {
+		clear(c.insertSeeds)
+		seeds := c.insertSeeds[:0]
+		defer func() {
+			clear(seeds)
+			c.insertSeeds = seeds[:0]
+		}()
+		for _, key := range keys {
+			seeds = append(seeds, seedDocument{key: key, document: document})
+		}
+		if err := validateTableUniquePostimages(ctx, t, seeds, keys); err != nil {
+			return nil, err
+		}
+	}
 	if returning != nil {
 		if returned == nil {
 			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
@@ -2319,7 +2441,7 @@ func (c *conn) updateLockedReturning(
 		t.conflicts.recordKeys(keys)
 	}
 	if mutationErr != nil {
-		return nil, mutationErr
+		return nil, mapDurableUniqueConstraintError(mutationErr)
 	}
 	return result{affected: int64(len(keys))}, nil
 }
@@ -2443,6 +2565,9 @@ func (c *conn) updateColumnsLockedReturning(
 				}
 			}
 		}
+	}
+	if err := validateTableUniquePostimages(ctx, t, seeds, keys); err != nil {
+		return nil, err
 	}
 	if returning != nil {
 		cursor, err := returning.RunInto(

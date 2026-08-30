@@ -231,12 +231,16 @@ SELECT DO UPDATE` remain unsupported. RF3/distributed writes fail closed on
 conflict updates; conflict-skipping inserts are also refused when READY global
 indexes would require branch-aware maintenance.
 
+Both conflict actions use only the document-derived primary key. A secondary
+unique-index collision is a unique violation. It does not select a conflict
+action.
+
 ## UPDATE and DELETE
 
 `UPDATE` can assign the whole document through `"$doc"`. On a table with
-declared columns it can also assign scalar literals or placeholders to one or
-more top-level columns while preserving every unassigned field in each matching
-document.
+declared columns it can also assign scalar literals, placeholders, or `NULL` to
+one or more top-level columns while preserving every unassigned field in each
+matching document.
 
 Nested-path targets, row-dependent assignment expressions such as
 `score = score + 1`, and `UPDATE ... FROM` are not supported.
@@ -295,11 +299,28 @@ Materialized views, replace, cascade drop, and refresh are not supported.
 
 ## Exact indexes
 
-`CREATE INDEX` supports `IF NOT EXISTS`, optional explicit names, several JSON
-paths, and online creation over a materialized table.
+`CREATE INDEX` and `CREATE UNIQUE INDEX` support `IF NOT EXISTS`, optional
+explicit names, and one to four distinct JSON paths. A nonunique index uses the
+durable online build over a materialized table.
 
-Indexes are exact and nonunique. `CREATE UNIQUE INDEX` is not supported on the
-local SQL surface.
+A unique index constrains the order-sensitive exact scalar tuple. Every indexed
+path must be present and contain a Boolean, number, or string for the document
+to participate. Numeric spellings with the same exact value have one identity.
+If any tuple component is missing or JSON null, the document does not
+participate. This is default `NULLS DISTINCT` behavior. Present arrays and
+objects fail closed during index creation and later writes.
+
+The unique build validates existing rows and publishes no index on a duplicate
+or invalid container. INSERT, UPDATE, primary-key upsert, transaction commit,
+and reopen enforce the same final-image constraint. Embedded pgwire maps a
+conflict to SQLSTATE `23505`. The durable unique build currently holds the
+catalog write lock while it validates the table.
+
+Column and table `UNIQUE`, `NULLS NOT DISTINCT`, partial indexes, expression
+indexes, ordering, collation, and selectable index methods are not supported.
+In the local `OpenCluster` facade, a unique index on a placed table must contain
+every shard-key path. RF3 SQL `CREATE UNIQUE INDEX` is refused before schema
+rollout because it has no coordinated distributed uniqueness build.
 
 An exact-index candidate never replaces predicate evaluation. Execution checks
 the complete predicate after it gets candidates.
@@ -321,4 +342,4 @@ is 64.
 - `sql/parser.go`, `ast.go`, `dml.go`, and `set.go`
 - `sql/parse_ddl.go`, `parse_dml.go`, and `unsupported.go`
 - `query/sqlstmt.go`, `join.go`, and `cte_runtime.go`
-- `sql/driver/validate.go`, `write.go`, and `tx.go`
+- `sql/driver/validate.go`, `write.go`, `tx.go`, and `unique_index.go`

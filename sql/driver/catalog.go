@@ -88,8 +88,9 @@ type schemaFieldMeta struct {
 }
 
 type indexMeta struct {
-	Name  string   `json:"name"`
-	Paths []string `json:"paths"`
+	Name   string   `json:"name"`
+	Paths  []string `json:"paths"`
+	Unique bool     `json:"unique,omitempty"`
 }
 
 type table struct {
@@ -107,12 +108,13 @@ type table struct {
 // retaining the exact primary-key, schema, admission, and incarnation identity
 // that existed when the transaction began.
 type transactionTableLayout struct {
-	incarnation *table
-	primaryKey  string
-	primary     vibejson.CompiledPointer
-	schema      *store.Schema
-	limits      durable.Options
-	limitsErr   error
+	incarnation   *table
+	primaryKey    string
+	primary       vibejson.CompiledPointer
+	schema        *store.Schema
+	uniqueIndexes []indexMeta
+	limits        durable.Options
+	limitsErr     error
 }
 
 // catalogLayoutEpoch is an immutable in-process catalog/layout generation.
@@ -136,12 +138,13 @@ func newCatalogLayoutEpoch(
 		for name, table := range tables {
 			limits, err := tableMutationLimits(table)
 			epoch.tables[name] = transactionTableLayout{
-				incarnation: table,
-				primaryKey:  table.meta.PrimaryKey,
-				primary:     table.primary,
-				schema:      table.schema,
-				limits:      limits,
-				limitsErr:   err,
+				incarnation:   table,
+				primaryKey:    table.meta.PrimaryKey,
+				primary:       table.primary,
+				schema:        table.schema,
+				uniqueIndexes: cloneUniqueIndexMeta(table.meta.Indexes),
+				limits:        limits,
+				limitsErr:     err,
 			}
 		}
 	}
@@ -152,6 +155,20 @@ func newCatalogLayoutEpoch(
 		}
 	}
 	return epoch
+}
+
+func cloneUniqueIndexMeta(indexes []indexMeta) []indexMeta {
+	var unique []indexMeta
+	for i := range indexes {
+		if indexes[i].Unique {
+			unique = append(unique, indexMeta{
+				Name:   indexes[i].Name,
+				Paths:  slices.Clone(indexes[i].Paths),
+				Unique: true,
+			})
+		}
+	}
+	return unique
 }
 
 // retiredTable keeps the physical resources or unresolved namespace paths of a
@@ -1082,7 +1099,7 @@ func durableOptions(t *table) durable.Options {
 	}
 	for _, index := range t.meta.Indexes {
 		options.Indexes = append(options.Indexes, store.IndexDefinition{
-			Name: index.Name, Paths: append([]string(nil), index.Paths...),
+			Name: index.Name, Paths: append([]string(nil), index.Paths...), Unique: index.Unique,
 		})
 	}
 	return options
@@ -1118,12 +1135,14 @@ func syncTableIndexMeta(t *table) (bool, error) {
 		next[i].Paths = append(
 			[]string(nil), infos[i].Columns[:infos[i].ColumnCount]...,
 		)
+		next[i].Unique = infos[i].Unique
 	}
 	if len(next) == len(t.meta.Indexes) {
 		equal := true
 		for i := range next {
 			if next[i].Name != t.meta.Indexes[i].Name ||
-				!slices.Equal(next[i].Paths, t.meta.Indexes[i].Paths) {
+				!slices.Equal(next[i].Paths, t.meta.Indexes[i].Paths) ||
+				next[i].Unique != t.meta.Indexes[i].Unique {
 				equal = false
 				break
 			}
@@ -1740,7 +1759,11 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 		}
 		for i := range meta.Indexes {
 			index := &meta.Indexes[i]
-			if !add(encodedJSONStringBytes(index.Name) + 256) {
+			part := encodedJSONStringBytes(index.Name) + 256
+			if index.Unique {
+				part += len(`,"unique":true`)
+			}
+			if !add(part) {
 				return size, catalogSizeError(size)
 			}
 			for _, path := range index.Paths {

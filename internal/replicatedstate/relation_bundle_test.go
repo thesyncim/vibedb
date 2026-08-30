@@ -332,6 +332,31 @@ func relationBundleCollections(
 	return relations
 }
 
+func TestReplicatedLocalUniqueIndexesFailClosed(t *testing.T) {
+	definition := store.IndexDefinition{
+		Name: "by_email", Paths: []string{"/email"}, Unique: true,
+	}
+	if _, err := canonicalLocalIndexes([]store.IndexDefinition{definition}); !errors.Is(err, store.ErrIndexDefinition) {
+		t.Fatalf("canonical unique local index = %v, want %v", err, store.ErrIndexDefinition)
+	}
+
+	target := createTargetAt(t, t.TempDir(), "unique-user", durable.Options{
+		Indexes: []store.IndexDefinition{definition},
+	})
+	snapshot, err := target.Collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	plain := definition
+	plain.Unique = false
+	if err := validateRelationIndexCatalog(
+		snapshot, []store.IndexDefinition{plain},
+	); !errors.Is(err, ErrSchemaProfile) {
+		t.Fatalf("unique durable catalog as nonunique = %v, want %v", err, ErrSchemaProfile)
+	}
+}
+
 func TestCheckpointBundleRejectsUnreservedTransitionCapture(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	file, err := os.OpenFile(

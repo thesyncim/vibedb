@@ -155,33 +155,37 @@ func AppendIndexTermKey(dst []byte, components []IndexTermComponent) ([]byte, bo
 	return dst, true
 }
 
-// ValidIndexTermKey reports whether key is one complete canonical ascending
-// tuple emitted by AppendIndexTermKey. It performs no allocation. orderedkey's
-// ascending tags all have their high bit clear; descending tags have it set.
-func ValidIndexTermKey(key []byte) bool {
+// IndexTermKeyContainsNull reports whether a complete canonical ascending
+// tuple contains a NULL component. The second result reports whether key is a
+// valid tuple emitted by AppendIndexTermKey. It performs no allocation.
+// orderedkey's ascending tags all have their high bit clear; descending tags
+// have it set.
+func IndexTermKeyContainsNull(key []byte) (bool, bool) {
 	if len(key) < 3 || len(key) > IndexTermMaxKeyBytes ||
 		key[0] != indexTermKeyVersion ||
 		key[len(key)-1] != indexTermKeyTerminator {
-		return false
+		return false, false
 	}
 	body := key[1 : len(key)-1]
 	count := 0
+	containsNull := false
 	var decodedStorage [IndexTermMaxKeyBytes + 32]byte
 	var canonicalStorage [IndexTermMaxKeyBytes]byte
 	for offset := 0; offset < len(body); {
 		if body[offset]&0x80 != 0 || count == IndexTermMaxComponents {
-			return false
+			return false, false
 		}
 		component, decoded, next, err := orderedkey.DecodeComponent(
 			decodedStorage[:0], body, offset,
 		)
 		if err != nil || component.Descending || next <= offset {
-			return false
+			return false, false
 		}
 		var canonical []byte
 		var ok bool
 		switch component.Kind {
 		case orderedkey.KindNull:
+			containsNull = true
 			canonical, ok = orderedkey.AppendNull(canonicalStorage[:0], orderedkey.Ascending)
 		case orderedkey.KindBool:
 			canonical, ok = orderedkey.AppendBool(canonicalStorage[:0], component.Bool, orderedkey.Ascending)
@@ -198,15 +202,22 @@ func ValidIndexTermKey(key []byte) bool {
 				orderedkey.Ascending,
 			)
 		default:
-			return false
+			return false, false
 		}
 		if !ok || !bytes.Equal(canonical, body[offset:next]) {
-			return false
+			return false, false
 		}
 		offset = next
 		count++
 	}
-	return count != 0
+	return containsNull, count != 0
+}
+
+// ValidIndexTermKey reports whether key is one complete canonical ascending
+// tuple emitted by AppendIndexTermKey.
+func ValidIndexTermKey(key []byte) bool {
+	_, valid := IndexTermKeyContainsNull(key)
+	return valid
 }
 
 // IndexTermRouteHash returns the StoreID-keyed SipHash routing fingerprint of

@@ -680,6 +680,11 @@ retryAfterUnifiedFold:
 	if err != nil {
 		return false, err
 	}
+	if err := c.validatePrimaryUniquePutCurrent(
+		keyBytes, src, resident,
+	); err != nil {
+		return false, err
+	}
 	// One sample steers both the capacity ensure and the lane selection below.
 	// Sampling reader presence twice let a reader arrive or leave in between,
 	// choosing the canonical lane without its capacity ensure and surfacing
@@ -1264,6 +1269,13 @@ func (c *Collection) cowBufferedPrimaryMutation(
 		return storeio.PageRef{}, false, false,
 			storeio.ErrInvalidWrite
 	}
+	if !deleting {
+		if err := c.validatePrimaryUniquePut(
+			src, found, resident, slot,
+		); err != nil {
+			return storeio.PageRef{}, false, false, err
+		}
+	}
 	generation := state.root.Generation + 1
 	if generation == 0 || generation >= uint64(1)<<48 {
 		return storeio.PageRef{}, false, false,
@@ -1531,6 +1543,13 @@ func (c *Collection) cowPrimaryMutation(
 	filledEmpty bool,
 	err error,
 ) {
+	if !deleting {
+		if err := c.validatePrimaryUniquePut(
+			src, found, resident, slot,
+		); err != nil {
+			return storeio.PageRef{}, false, false, err
+		}
+	}
 	generation := state.root.Generation + 1
 	if generation == 0 || generation >= uint64(1)<<48 {
 		return storeio.PageRef{}, false, false,

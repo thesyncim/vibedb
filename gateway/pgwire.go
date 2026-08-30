@@ -156,7 +156,9 @@ func replicatedTableInfos(snapshot *Snapshot, profiles []ReplicatedTableProfile)
 			}
 			paths := make([]string, int(index.PathCount))
 			copy(paths, index.Paths[:index.PathCount])
-			tables[i].Indexes = append(tables[i].Indexes, driver.IndexInfo{Name: index.Name, Paths: paths})
+			tables[i].Indexes = append(tables[i].Indexes, driver.IndexInfo{
+				Name: index.Name, Unique: index.Flags&IndexUnique != 0, Paths: paths,
+			})
 		}
 	}
 	return tables

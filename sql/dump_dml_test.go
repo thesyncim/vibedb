@@ -232,7 +232,11 @@ func dumpCreateTable(s *CreateTableStmt) string {
 
 func dumpCreateIndex(s *CreateIndexStmt) string {
 	var b strings.Builder
-	b.WriteString("create index")
+	b.WriteString("create ")
+	if s.Unique {
+		b.WriteString("unique ")
+	}
+	b.WriteString("index")
 	if s.HasName {
 		b.WriteByte(' ')
 		b.WriteString(s.Name)

@@ -23,6 +23,9 @@ func postgresDDLKind(kind sqlast.Kind) bool {
 type postgresDDLStatement struct{ postgresWriteStatement }
 
 func (s *postgresSession) prepareDDL(text string, parsed *sqlast.Statement) (pgwire.BackendStatement, error) {
+	if err := rejectReplicatedUniqueIndex(text, parsed); err != nil {
+		return nil, err
+	}
 	if s.backend.DDL == nil {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "coordinated SQL DDL is not configured for this endpoint")
 	}

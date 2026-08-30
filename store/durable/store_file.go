@@ -258,6 +258,11 @@ type Collection struct {
 	// records through the ordinary mutation path: those records are already
 	// durable, and the recycle that follows replay discards them regardless.
 	journalReplaying bool
+	// primaryUniqueReplayValidated is a record-local Open-only certificate: the
+	// complete final image of one oversized atomic journal batch has already
+	// passed unique validation. Its sequential point applications still maintain
+	// exact postings, but skip admission against transient intermediate images.
+	primaryUniqueReplayValidated bool
 	// journalFailure is the sticky poison set when a journal append or sync fails.
 	// A journal fsync-class error is terminal — the platform may drop the very
 	// dirty pages a retry would need — so like the committer's own poisoning it is

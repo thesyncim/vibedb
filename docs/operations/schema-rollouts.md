@@ -12,15 +12,20 @@ contract. Pin one tested commit across the gateway and shard fleet.
 ## Online DDL requirement and current limits
 
 Online behavior is a release requirement for the ordinary SQL DDL endpoint,
-not an optional `CONCURRENTLY` fast path. It is **not implemented end to end** by
-the experimental rollout below. In particular, its exact-cut image builder
-requires a write fence for the whole build. Do not wire that maintenance
-primitive into PostgreSQL and describe it as online.
+not an optional `CONCURRENTLY` fast path. The loopback PostgreSQL coordinator now
+has a shadow-build, capture, replay, exact final fence, and publication path for
+nonunique `CREATE INDEX`, `DROP INDEX`, `TRUNCATE`, additive `ALTER TABLE`, and
+`DROP TABLE`. That path is experimental and is not release-qualified end to
+end. Only CREATE TABLE currently has a public Linux process-and-restart gate.
 
-The current loopback development PostgreSQL coordinator accepts `CREATE TABLE`
-only. `CREATE INDEX`, `DROP INDEX`, `TRUNCATE`, `ALTER TABLE`, and `DROP TABLE`
-return a feature-not-supported error; they do not invoke this administration
-command or fall back to a blocking local DDL path.
+The offline exact-cut image builder documented later on this page still needs a
+write fence for its whole build. It is a maintenance primitive, not the online
+PostgreSQL path.
+
+`CREATE UNIQUE INDEX` returns feature-not-supported before admission. RF3 has no
+coordinated uniqueness build or publication proof. Existing trusted catalog
+snapshots can retain operator-provisioned global unique-index descriptors. SQL
+DDL cannot create a local or global unique index in RF3.
 
 The required contract is:
 
@@ -61,11 +66,13 @@ reconciles immutable leaves. The regression exercises a foreground write after
 a real split, old-reader stability, index contents, cancellation, and concurrent
 close. This bounds that preparation phase's work, not filesystem latency or
 every later publication/cleanup phase, and does not qualify RF3 SQL.
-Local SQL DROP INDEX still
-copies replacement storage while holding the database catalog mutex, and RF3
-image construction still needs the exact-cut fence. Both violate the intended
-online contract. The current split capture also has a split-specific activation
-and base-relation scope; it is not a ready-made general schema capture protocol.
+Local SQL `CREATE UNIQUE INDEX` holds the catalog write lock across its
+validation scan and publication so a concurrent writer cannot enter between the
+proof and constraint install. It is atomic, but it is not an online build.
+Local SQL DROP INDEX also copies replacement storage while holding the database
+catalog mutex. The offline RF3 image builder still needs the exact-cut fence.
+These paths do not satisfy the intended online contract. The public RF3
+coordinator uses the separate shadow and replay path described above.
 
 Release qualification must pause backfill while INSERT/UPDATE/DELETE and new
 reads complete, keep an old reader pinned across cutover, cover unrelated-table
@@ -102,14 +109,19 @@ identity. Activation refuses a missing, empty, or substituted global-index
 image. Base tables and local exact indexes may be materialized deterministically
 from the replica-local catalog image.
 
+An operator-provisioned global index can be unique when its retained relation
+descriptor and immutable image say it is unique. That internal capability does
+not authorize `CREATE UNIQUE INDEX` in SQL. Do not place a unique local-index
+statement in a replicated child schema or schema-rollout plan.
+
 ## Create the rollout plan
 
-### Build local-index and TRUNCATE images
+### Build nonunique local-index and TRUNCATE images
 
 The shard-control listener also exposes an authenticated build operation for
 `CREATE INDEX`, `DROP INDEX`, and `TRUNCATE`. It is an internal coordinator API,
-not yet a PostgreSQL DDL endpoint. It does not add ALTER/DROP TABLE support or
-complete the durable SQL coordinator described below.
+not the public PostgreSQL DDL endpoint. `CREATE INDEX` here means a nonunique
+local exact index. Every admission boundary rejects `CREATE UNIQUE INDEX`.
 
 For this maintenance-only primitive, the caller first fences new writes with
 the exclusive route gate and obtains

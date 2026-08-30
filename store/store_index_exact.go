@@ -28,6 +28,10 @@ const MaxIndexColumns = 4
 type IndexDefinition struct {
 	Name  string
 	Paths []string
+	// Unique marks a logical exact-index alias as a uniqueness constraint.
+	// Durable collections validate existing rows before publication, persist
+	// this bit, and enforce it on later point, batch, bulk, and replay writes.
+	Unique bool
 }
 
 var (
@@ -40,6 +44,10 @@ var (
 	// ErrIndexScalar reports a lookup value that is absent, invalid, or a
 	// JSON container. Exact indexes deliberately accept scalars only.
 	ErrIndexScalar = errors.New("vibedb: collection exact index requires scalar values")
+	// ErrUniqueIndexViolation reports existing live rows that map to the same
+	// non-NULL canonical exact-index term. Callers may use errors.Is to retain
+	// constraint identity across SQL and wire-protocol error translation.
+	ErrUniqueIndexViolation = errors.New("vibedb: unique index constraint violated")
 	// ErrMaskOrder reports a sparse bitmap stream whose chunk ids are not
 	// strictly increasing. Ordered masks permit allocation-free merge, lookup,
 	// and range execution without copying or sorting caller storage.

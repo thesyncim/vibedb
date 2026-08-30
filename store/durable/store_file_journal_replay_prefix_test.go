@@ -225,6 +225,21 @@ func recoveryDispersedValue(row int, state string) []byte {
 // through pressure checkpoints while retaining the original journal until every
 // replacement and exact posting is durable.
 func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T) {
+	testRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t, false)
+}
+
+// TestRecoveryJournalUniqueAtomicDispersedBatchWithTinyReopenGeometry covers
+// final-image unique validation when deleting first would require a structural
+// split that the smaller reopen geometry cannot stage.
+func TestRecoveryJournalUniqueAtomicDispersedBatchWithTinyReopenGeometry(
+	t *testing.T,
+) {
+	testRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t, true)
+}
+
+func testRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(
+	t *testing.T, unique bool,
+) {
 	const sourceRows = 8192
 	options := syncPrimaryJournalTestOptions()
 	options.MaxBatchDocuments = 256
@@ -232,6 +247,11 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 	options.ResidentBytes = 64 << 20
 	options.Indexes = []store.IndexDefinition{
 		{Name: "state", Paths: []string{"/state"}},
+	}
+	if unique {
+		options.Indexes = append(options.Indexes, store.IndexDefinition{
+			Name: "row_unique", Paths: []string{"/row"}, Unique: true,
+		})
 	}
 
 	reopenOptions := options
@@ -304,9 +324,16 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		}
 	}
 	updateErr := coll.Update(func(batch *WriteBatch) error {
-		for _, row := range selected {
+		for i, row := range selected {
+			key := []byte(fmt.Sprintf("row-%05d", row))
+			if unique && i == 0 {
+				if err := batch.Delete(key); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := batch.Put(
-				[]byte(fmt.Sprintf("row-%05d", row)),
+				key,
 				recoveryDispersedValue(row, "new"),
 			); err != nil {
 				return err
@@ -338,6 +365,39 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		recoveryJournalPostSyncHook = previousPostSync
 		recoveryJournalReplayBatchEntryHook = previousReplay
 	}()
+	if unique {
+		secondCrash := errors.New("test: crash after unique recovery prefix")
+		prefixCalls := 0
+		recoveryJournalReplayBatchEntryHook = func(
+			replayed *Collection, _ storeio.RecoveryRecord, entryIndex int,
+		) error {
+			if prefixCalls != 0 || entryIndex != 0 {
+				return nil
+			}
+			prefixCalls++
+			// Persist the first final entry while the original atomic record is
+			// retained. The next Open must recompute its final-image certificate
+			// from this partial prefix and replay the whole record idempotently.
+			replayed.writer.Lock()
+			checkpointErr := replayed.checkpointBufferedLocked()
+			replayed.writer.Unlock()
+			if checkpointErr != nil {
+				return checkpointErr
+			}
+			return secondCrash
+		}
+		prefixFile, openErr := os.OpenFile(crashPath, os.O_RDWR, 0o600)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		_, openErr = Open(prefixFile, reopenOptions)
+		_ = prefixFile.Close()
+		if !errors.Is(openErr, secondCrash) || prefixCalls != 1 {
+			t.Fatalf("interrupted unique recovery = %v calls %d, want %v/1",
+				openErr, prefixCalls, secondCrash)
+		}
+		recoveryJournalReplayBatchEntryHook = previousReplay
+	}
 	hookCalls := 0
 	pressureCheckpointed := false
 	recoveryJournalReplayBatchEntryHook = func(
@@ -379,25 +439,42 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		_ = recoveredFile.Close()
 		t.Fatalf("recovery retained %d journal bytes", recovered.journal.Cursor())
 	}
+	if unique && recovered.Stats().PrimaryLeafSplits != 0 {
+		_ = recovered.Close()
+		_ = recoveredFile.Close()
+		t.Fatal("unique dispersed recovery forced an avoidable structural split")
+	}
 
 	newKeys := primaryExactTestKeys(
 		t, recovered, "state", primaryExactTestNeedle(t, `"new"`),
 	)
 	slices.Sort(newKeys)
-	wantNew := make([]string, len(selected))
+	wantNew := make([]string, 0, len(selected))
 	for i, row := range selected {
-		wantNew[i] = fmt.Sprintf("row-%05d", row)
+		key := fmt.Sprintf("row-%05d", row)
+		if unique && i == 0 {
+			if value, found, readErr := recovered.AppendRaw(
+				nil, []byte(key),
+			); readErr != nil || found {
+				_ = recovered.Close()
+				_ = recoveredFile.Close()
+				t.Fatalf("recovered deleted %s = %q,%v,%v",
+					key, value, found, readErr)
+			}
+			continue
+		}
+		wantNew = append(wantNew, key)
 		wantValue, canonicalErr := vibejson.AppendCanonicalize(
 			nil, recoveryDispersedValue(row, "new"),
 		)
 		if canonicalErr != nil {
 			t.Fatal(canonicalErr)
 		}
-		value, found, readErr := recovered.AppendRaw(nil, []byte(wantNew[i]))
+		value, found, readErr := recovered.AppendRaw(nil, []byte(key))
 		if readErr != nil || !found || !bytes.Equal(value, wantValue) {
 			_ = recovered.Close()
 			_ = recoveredFile.Close()
-			t.Fatalf("recovered %s = %q,%v,%v", wantNew[i], value, found, readErr)
+			t.Fatalf("recovered %s = %q,%v,%v", key, value, found, readErr)
 		}
 	}
 	slices.Sort(wantNew)
@@ -413,6 +490,27 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		_ = recoveredFile.Close()
 		t.Fatalf("recovered old postings = %d, want %d",
 			len(got), sourceRows-len(selected))
+	}
+	if unique {
+		deletedUniqueKeys := primaryExactTestKeys(
+			t, recovered, "row_unique",
+			primaryExactTestNeedle(t, fmt.Sprintf("%d", selected[0])),
+		)
+		if len(deletedUniqueKeys) != 0 {
+			_ = recovered.Close()
+			_ = recoveredFile.Close()
+			t.Fatalf("recovered deleted unique posting = %v, want none",
+				deletedUniqueKeys)
+		}
+		duplicate := []byte(fmt.Sprintf(`{"row":%d}`, selected[1]))
+		if _, putErr := recovered.Put(
+			[]byte("duplicate-row"), duplicate,
+		); !errors.Is(putErr, store.ErrUniqueIndexViolation) {
+			_ = recovered.Close()
+			_ = recoveredFile.Close()
+			t.Fatalf("recovered unique enforcement = %v, want %v",
+				putErr, store.ErrUniqueIndexViolation)
+		}
 	}
 	if err := recovered.Close(); err != nil {
 		_ = recoveredFile.Close()
@@ -435,6 +533,50 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		_ = second.Close()
 		_ = secondFile.Close()
 		t.Fatalf("second recovery retained %d journal bytes", second.journal.Cursor())
+	}
+	if unique {
+		deletedKey := []byte(fmt.Sprintf("row-%05d", selected[0]))
+		if value, found, readErr := second.AppendRaw(
+			nil, deletedKey,
+		); readErr != nil || found {
+			_ = second.Close()
+			_ = secondFile.Close()
+			t.Fatalf("second recovery deleted %s = %q,%v,%v",
+				deletedKey, value, found, readErr)
+		}
+		row := selected[1]
+		key := fmt.Sprintf("row-%05d", row)
+		wantValue, canonicalErr := vibejson.AppendCanonicalize(
+			nil, recoveryDispersedValue(row, "new"),
+		)
+		if canonicalErr != nil {
+			_ = second.Close()
+			_ = secondFile.Close()
+			t.Fatal(canonicalErr)
+		}
+		value, found, readErr := second.AppendRaw(nil, []byte(key))
+		if readErr != nil || !found || !bytes.Equal(value, wantValue) {
+			_ = second.Close()
+			_ = secondFile.Close()
+			t.Fatalf("second recovery %s = %q,%v,%v", key, value, found, readErr)
+		}
+		if got := primaryExactTestKeys(
+			t, second, "row_unique",
+			primaryExactTestNeedle(t, fmt.Sprintf("%d", selected[0])),
+		); len(got) != 0 {
+			_ = second.Close()
+			_ = secondFile.Close()
+			t.Fatalf("second recovery deleted unique posting = %v, want none", got)
+		}
+		if got := primaryExactTestKeys(
+			t, second, "row_unique",
+			primaryExactTestNeedle(t, fmt.Sprintf("%d", row)),
+		); !slices.Equal(got, []string{key}) {
+			_ = second.Close()
+			_ = secondFile.Close()
+			t.Fatalf("second recovery retained unique posting = %v, want [%s]",
+				got, key)
+		}
 	}
 	if err := second.Close(); err != nil {
 		_ = secondFile.Close()

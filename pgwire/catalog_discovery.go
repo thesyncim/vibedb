@@ -583,7 +583,7 @@ func (s *session) answerDiscovery(shape *discoveryShape, f discoveryFilter, a *c
 					add(map[string]string{"table_id": id, "column_position": pos, "column_name": pointerDisplayName(c.Path), "type_mod": "-1", "dimensions_number": "0", "type_spec": "json", "type_id": "114", "mandatory": mandatory, "column_is_inherited": "f", "column_is_dropped": "f", "identity_kind": "", "generated": "", "schemaid": "2200", "majoroid": id, "kind": "r", "position": pos, "name": pointerDisplayName(c.Path)})
 				}
 			default:
-				indices := append([]sqldriver.IndexInfo{{Name: t.Name + "_pkey", Paths: []string{t.PrimaryKey}}}, t.Indexes...)
+				indices := append([]sqldriver.IndexInfo{{Name: t.Name + "_pkey", Paths: []string{t.PrimaryKey}, Unique: true}}, t.Indexes...)
 				for ii, index := range indices {
 					// The table's reserved block separates index/constraint identities.
 					indexID := strconv.FormatUint(uint64(s.server.discoveryOID("index\x00"+t.Name+"\x00"+index.Name)), 10)
@@ -595,7 +595,11 @@ func (s *session) answerDiscovery(shape *discoveryShape, f discoveryFilter, a *c
 					case "RetrieveExistentIndices":
 						add(map[string]string{"indexrelid": indexID})
 					case "RetrieveIndices":
-						add(map[string]string{"table_id": id, "table_kind": "r", "index_name": index.Name, "index_id": indexID, "is_unique": primary, "is_primary": primary, "nulls_not_distinct": "f", "tablespace_id": "0", "access_method_id": "9000"})
+						unique := "f"
+						if index.Unique {
+							unique = "t"
+						}
+						add(map[string]string{"table_id": id, "table_kind": "r", "index_name": index.Name, "index_id": indexID, "is_unique": unique, "is_primary": primary, "nulls_not_distinct": "f", "tablespace_id": "0", "access_method_id": "9000"})
 					case "RetrieveIndexColumns":
 						for k, path := range index.Paths {
 							for ci, c := range discoveryColumns(t) {
