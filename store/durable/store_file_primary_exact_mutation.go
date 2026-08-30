@@ -336,11 +336,37 @@ func (c *Collection) resolvePrimaryExactTermTileBits(
 	chainHash uint64,
 	tileID uint32,
 ) (uint64, error) {
-	rebase := epoch.rebaseFloor(tileID, ^uint64(0))
+	return c.resolvePrimaryExactTermTileBitsPrepared(
+		epoch, nil, indexID, keyRecord, chainHash, tileID,
+	)
+}
+
+// resolvePrimaryExactTermTileBitsPrepared extends the writer's normal exact
+// probe to records staged by the current, not-yet-published mutation. A batch
+// can remove several stable slots from the same term/tile; each absolute delta
+// must therefore start from the preceding staged delta instead of the epoch's
+// still-published head.
+func (c *Collection) resolvePrimaryExactTermTileBitsPrepared(
+	epoch *primaryExactEpoch,
+	prepared *primaryExactPrepared,
+	indexID uint32,
+	keyRecord storeio.IndexTermKeyRecord,
+	chainHash uint64,
+	tileID uint32,
+) (uint64, error) {
+	rebase := uint64(0)
+	if entry := epoch.lookupTileEntry(tileID); entry != nil {
+		for record := pendingTileHead(prepared, entry); record != nil; record = record.next {
+			if record.rebased {
+				rebase = record.gen
+				break
+			}
+		}
+	}
 	if entry := epoch.lookupTermEntry(
 		chainHash, indexID, keyRecord.Canonical,
 	); entry != nil {
-		for record := entry.head.Load(); record != nil; record = record.next {
+		for record := pendingTermHead(prepared, entry); record != nil; record = record.next {
 			if record.tileID != tileID {
 				continue
 			}
@@ -380,6 +406,19 @@ func (c *Collection) resolvePrimaryExactTermTileBits(
 			return mask.Bits, nil
 		}
 	}
+}
+
+func resolvePrimaryExactLiveWordPrepared(
+	epoch *primaryExactEpoch,
+	prepared *primaryExactPrepared,
+	tileID uint32,
+) uint64 {
+	if entry := epoch.lookupTileEntry(tileID); entry != nil {
+		for record := pendingTileHead(prepared, entry); record != nil; record = record.next {
+			return record.live
+		}
+	}
+	return epoch.live.word(tileID)
 }
 
 // preparePrimaryExactRebase emits the rebase group for a slot-reassigning
@@ -519,8 +558,8 @@ func (c *Collection) preparePrimaryExactDeltaRaw(
 	) (bool, error) {
 		route := storeio.IndexTermRouteHash(c.storeID, term)
 		chainHash := primaryExactTermChainHash(route, uint32(indexID))
-		bits, resolveErr := c.resolvePrimaryExactTermTileBits(
-			epoch, uint32(indexID),
+		bits, resolveErr := c.resolvePrimaryExactTermTileBitsPrepared(
+			epoch, prepared, uint32(indexID),
 			storeio.IndexTermKeyRecord{RouteHash: route, Canonical: term},
 			chainHash, tileID,
 		)
@@ -577,7 +616,7 @@ func (c *Collection) preparePrimaryExactDeltaRaw(
 	}
 	if !found || deleting {
 		// Insert and delete move a live bit; a slot-stable update does not.
-		live := epoch.resolveLiveWord(tileID, ^uint64(0), true)
+		live := resolvePrimaryExactLiveWordPrepared(epoch, prepared, tileID)
 		if deleting {
 			live &^= bit
 		} else {

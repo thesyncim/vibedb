@@ -7,9 +7,47 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	driver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 )
+
+func TestPostgreSQLDDLRejectsUniqueIndexBeforeStatementOrDispatch(t *testing.T) {
+	executor, transport := newSQLRF3TestExecutor(t)
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	dispatches := 0
+	backend := &PostgreSQLBackend{
+		Executor:  executor,
+		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) { return authority, nil },
+		DDL: func(context.Context, serviceauthz.Authority, string) error {
+			dispatches++
+			return nil
+		},
+	}
+	session, err := backend.NewSession(context.Background(), pgwire.SessionIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	prepared, err := session.Prepare(
+		context.Background(), `CREATE UNIQUE INDEX employees_email ON employees (email)`,
+	)
+	var unsupported *sqlast.FeatureNotSupportedError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("Prepare error = %T %v, want *sql.FeatureNotSupportedError", err, err)
+	}
+	if prepared != nil {
+		t.Fatal("refused unique index returned a prepared statement")
+	}
+	if dispatches != 0 || transport.queries != 0 {
+		t.Fatalf("refused unique index dispatched DDL=%d queries=%d", dispatches, transport.queries)
+	}
+	if len(session.(*postgresSession).statements) != 0 {
+		t.Fatal("refused unique index leaked a session statement")
+	}
+}
 
 func TestPostgreSQLDDLUsesCoordinatorOnlyAtExecution(t *testing.T) {
 	executor, transport := newSQLRF3TestExecutor(t)

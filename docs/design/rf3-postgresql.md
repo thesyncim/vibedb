@@ -1,12 +1,13 @@
 # PostgreSQL access to distributed RF3 SQL
 
 Status: opt-in, loopback-only RF3 development endpoint with distributed reads
-and durable single-statement auto-commit writes. The development supervisor also
-supports CREATE TABLE, including IF NOT EXISTS, by preparing independent RF3
-groups in the existing three data processes and publishing their catalog entry
-only after a quorum read succeeds. Other DDL, write transaction blocks,
-savepoints, repeatable-read/serializable transactions, global-index lookup plans,
-and repartition exchange plans are refused.
+and durable single-statement auto-commit writes. The development supervisor
+supports `CREATE TABLE`, including `IF NOT EXISTS`. Its coordinated schema path
+also implements nonunique `CREATE INDEX`, `DROP INDEX`, additive `ALTER TABLE`,
+`TRUNCATE`, and `DROP TABLE`. Those additional DDL paths are experimental and do
+not yet have the public process qualification of CREATE TABLE. Write transaction
+blocks, savepoints, repeatable-read/serializable transactions, global-index
+lookup plans, and repartition exchange plans are refused.
 
 ## Local use
 
@@ -67,12 +68,23 @@ Pointer's array-index coercion. This is bounded object access, not full PostgreS
 JSON-operator parity.
 
 Keep GoLand's console in **Auto** transaction mode. INSERT supports whole JSON
-documents or flat column/value tuples, including multiple rows. UPDATE replaces
-the whole document and requires primary-key equality; DELETE requires primary-key
-equality or a finite IN list. RETURNING, ON CONFLICT, arbitrary UPDATE field
-assignments, and multi-statement write batches are not supported. Execute each
-write independently, with its own Query message or Execute/Sync batch. This is
-not a complete PostgreSQL transactional SQL implementation.
+documents or flat column/value tuples, including multiple rows. UPDATE can
+replace the whole document or assign scalar literals, placeholders, and `NULL`
+to declared top-level columns. It requires primary-key equality. DELETE requires
+primary-key equality or a finite IN list. RETURNING, every `ON CONFLICT` action,
+nested or row-dependent UPDATE assignments, and multi-statement write batches
+are not supported. Execute each write independently, with its own Query message
+or Execute/Sync batch. This is not a complete PostgreSQL transactional SQL
+implementation.
+
+RF3 SQL `CREATE UNIQUE INDEX` fails closed with SQLSTATE `0A000` before schema
+rollout dispatch. The distributed DDL path has no coordinated uniqueness build
+that can prove one scalar tuple is unclaimed across the placement. Existing
+operator-provisioned global unique-index descriptors remain valid, continue to
+participate in distributed write maintenance, and appear as unique in catalog
+discovery. SQL DDL cannot create or alter those descriptors. A local unique
+index embedded independently in each shard is also refused because it would not
+prove global uniqueness.
 
 The launcher starts three replicas each for catalog, ledger, and data, plus a
 gateway. This is three-way replication, not three physical data shards. The
@@ -81,7 +93,8 @@ catalog contains multiple data shards. Reads go to each group's current leader;
 replicas are not interchangeable load-balanced read targets.
 
 GoLand 2026.2 synchronization supports the current database's `public` schema:
-tables, declared columns, whole-document projection, keys, and exact indexes.
+tables, declared columns, whole-document projection, keys, and exact indexes,
+including the unique flag of operator-provisioned global indexes.
 Use the normal PostgreSQL driver and select only `public`. Full, fragment, and
 incremental-form requests are recognized; without PostgreSQL XIDs, refreshes
 return bounded full snapshots. PostgreSQL-only objects remain absent.
@@ -199,6 +212,9 @@ No write outbox or recovery worker is created unless this endpoint is enabled.
   actual metadata requests. Do not synthesize nonexistent columns or indexes.
 - DDL must use certified schema rollout; never modify a replica's embedded
   catalog directly or silently create a separate local database.
+- Reject SQL `CREATE UNIQUE INDEX` before dispatch until a certified global
+  uniqueness build and publication protocol exists. Do not weaken it into one
+  independent local unique index per shard.
 
 ## Qualification and delivery
 

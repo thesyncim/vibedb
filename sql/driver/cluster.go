@@ -3,6 +3,7 @@ package driver
 import (
 	stdsql "database/sql"
 	sqldriver "database/sql/driver"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/query"
@@ -50,9 +51,10 @@ func (cr *clusterRouting) binding(table string) *placementBinding {
 }
 
 // validateOpenedSchema enforces the uniqueness-locality invariant for every
-// placed table already present in the opened catalog: the primary key must
-// contain every shard-key column. Tables created later are validated at CREATE
-// TABLE time. It reports violations in configuration order.
+// placed table already present in the opened catalog: the primary key and
+// every local unique index must contain every shard-key column. Tables and
+// indexes created later are validated by their DDL paths. It reports
+// violations in configuration order.
 func (cr *clusterRouting) validateOpenedSchema(d *database) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -71,6 +73,18 @@ func (cr *clusterRouting) validateOpenedSchema(d *database) error {
 		); err != nil {
 			return err
 		}
+		for _, index := range meta.Indexes {
+			if !index.Unique {
+				continue
+			}
+			if !keyContainsShardColumns(index.Paths, binding.placement.Columns) {
+				return fmt.Errorf(
+					"%w: table %q unique index %q over %v does not contain shard-key columns %v",
+					ErrShardKeyNotLocal, table, index.Name, index.Paths,
+					binding.placement.Columns,
+				)
+			}
+		}
 	}
 	return nil
 }
@@ -88,6 +102,27 @@ func (cr *clusterRouting) validatePlacementLocality(table, primaryKey string) er
 		return nil
 	}
 	return validateShardKeyLocality(table, binding.placement.Columns, primaryKey)
+}
+
+// validateUniqueIndexLocality rejects a local unique index that could admit the
+// same tuple on two physical shards. It is a no-op outside a placed local
+// cluster; RF3 schema DDL has its own fail-closed gate.
+func (cr *clusterRouting) validateUniqueIndexLocality(
+	table, index string,
+	paths []string,
+) error {
+	if cr == nil {
+		return nil
+	}
+	binding := cr.bindings[table]
+	if binding == nil ||
+		keyContainsShardColumns(paths, binding.placement.Columns) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: table %q unique index %q over %v does not contain shard-key columns %v",
+		ErrShardKeyNotLocal, table, index, paths, binding.placement.Columns,
+	)
 }
 
 // OpenClusterConnector opens the SQL database at dsn as a degenerate single-shard

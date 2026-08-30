@@ -902,10 +902,14 @@ func (d *DMLStatement) LowerAlterTable() (AlterTableDefinition, error) {
 	}, nil
 }
 
-// An IndexDefinition is a lowered CREATE INDEX.
+// An IndexDefinition is a lowered CREATE [UNIQUE] INDEX.
 type IndexDefinition struct {
 	// Definition is the store's own index definition, ready to create.
 	Definition store.IndexDefinition
+	// Unique requires every encoded index key to identify at most one document.
+	// The catalog/storage adapter enforces this while building and maintaining
+	// the index; it must not silently create an ordinary index instead.
+	Unique bool
 	// IfNotExists makes an existing index a no-op rather than an error.
 	IfNotExists bool
 	// Table is the collection to index.
@@ -925,7 +929,11 @@ func (d *DMLStatement) LowerIndex() (IndexDefinition, error) {
 		return IndexDefinition{}, fmt.Errorf("query: %s is not a CREATE INDEX", d.kind)
 	}
 	stmt := d.tree.CreateIndex
-	out := IndexDefinition{IfNotExists: stmt.IfNotExists, Table: stmt.Table}
+	out := IndexDefinition{
+		IfNotExists: stmt.IfNotExists,
+		Table:       stmt.Table,
+		Unique:      stmt.Unique,
+	}
 	// The paths go to the store as RFC 6901 pointers, not as the dotted spec.
 	// That is not a preference: store.CompileExactIndex hands each path to
 	// vibejson.CompilePointer, which refuses anything without a leading '/',
@@ -950,8 +958,12 @@ func (d *DMLStatement) LowerIndex() (IndexDefinition, error) {
 			_, _ = hash.Write(size[:])
 			_, _ = hash.Write([]byte(pointer))
 		}
-		name = "idx_" + hex.EncodeToString(hash.Sum(nil))
+		prefix := "idx_"
+		if stmt.Unique {
+			prefix = "uidx_"
+		}
+		name = prefix + hex.EncodeToString(hash.Sum(nil))
 	}
-	out.Definition = store.IndexDefinition{Name: name, Paths: paths}
+	out.Definition = store.IndexDefinition{Name: name, Paths: paths, Unique: stmt.Unique}
 	return out, nil
 }

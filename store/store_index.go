@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"math/bits"
 	"slices"
 	"strings"
@@ -41,6 +42,8 @@ type IndexInfo struct {
 	// Columns contains the indexed RFC 6901 paths in compound-key order.
 	Columns     [MaxIndexColumns]string
 	ColumnCount uint8
+	// Unique reports that this logical alias carries a uniqueness constraint.
+	Unique bool
 	// State is Building until CoveredChunks equals TotalChunks.
 	State IndexState
 	// CoveredChunks is the count eligible for the physical accelerated path.
@@ -115,6 +118,12 @@ func (c *Collection) nextExactIndexVisitLocked() uint32 {
 // later write dual-maintains the definition before publication. Until Ready,
 // probes use an exact scan fallback.
 func (c *Collection) CreateIndex(def IndexDefinition) (IndexInfo, error) {
+	if def.Unique {
+		return IndexInfo{}, fmt.Errorf(
+			"%w: in-memory collections do not enforce unique indexes",
+			ErrIndexDefinition,
+		)
+	}
 	exact, err := CompileExactIndex(def)
 	if err != nil {
 		return IndexInfo{}, err

@@ -211,8 +211,9 @@ func cloneTableMeta(source *tableMeta) *tableMeta {
 	clone.Indexes = make([]indexMeta, len(source.Indexes))
 	for i := range source.Indexes {
 		clone.Indexes[i] = indexMeta{
-			Name:  source.Indexes[i].Name,
-			Paths: append([]string(nil), source.Indexes[i].Paths...),
+			Name:   source.Indexes[i].Name,
+			Paths:  append([]string(nil), source.Indexes[i].Paths...),
+			Unique: source.Indexes[i].Unique,
 		}
 	}
 	return &clone
@@ -485,8 +486,9 @@ func cloneIndexMeta(source []indexMeta) []indexMeta {
 	clone := make([]indexMeta, len(source))
 	for i := range source {
 		clone[i] = indexMeta{
-			Name:  source[i].Name,
-			Paths: append([]string(nil), source[i].Paths...),
+			Name:   source[i].Name,
+			Paths:  append([]string(nil), source[i].Paths...),
+			Unique: source[i].Unique,
 		}
 	}
 	return clone

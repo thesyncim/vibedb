@@ -86,13 +86,13 @@ func (s *session) answerJDBCDiscovery(shape *discoveryShape, f discoveryFilter, 
 			if !f.includes(t.Name) {
 				continue
 			}
-			indexes := append([]sqldriver.IndexInfo{{Name: t.Name + "_pkey", Paths: []string{t.PrimaryKey}}}, t.Indexes...)
-			for i, index := range indexes {
-				if uniqueOnly && i > 0 {
+			indexes := append([]sqldriver.IndexInfo{{Name: t.Name + "_pkey", Paths: []string{t.PrimaryKey}, Unique: true}}, t.Indexes...)
+			for _, index := range indexes {
+				if uniqueOnly && !index.Unique {
 					continue
 				}
 				nonunique := "t"
-				if i == 0 {
+				if index.Unique {
 					nonunique = "f"
 				}
 				for k, path := range index.Paths {

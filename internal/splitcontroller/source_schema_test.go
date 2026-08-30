@@ -10,8 +10,33 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/splitcapture"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
+
+func TestReplicatedSplitLocalUniqueIndexFailsClosed(t *testing.T) {
+	plan, _, _ := testReplicatedProjectionPlan(t)
+	unique := []store.IndexDefinition{{
+		Name: "by_email", Paths: []string{"/email"}, Unique: true,
+	}}
+	plain := cloneSplitLocalIndexes(unique)
+	plain[0].Unique = false
+	if !cloneSplitLocalIndexes(unique)[0].Unique {
+		t.Fatal("split schema clone downgraded unique index")
+	}
+	if sameSplitLocalIndexes(unique, plain) {
+		t.Fatal("split schema equality ignored uniqueness")
+	}
+
+	copy := *plan
+	authority := *plan.sourceAuthority
+	authority.Schema = clonePlanSourceSchema(authority.Schema)
+	authority.Schema.LocalIndexes = cloneSplitLocalIndexes(unique)
+	copy.sourceAuthority = &authority
+	if err := copy.validateReplicatedSourceSchema(); err == nil {
+		t.Fatal("replicated split accepted a local unique index")
+	}
+}
 
 func TestReplicatedSplitAuthenticatesDistinctSourceChildAndLocalSchemas(t *testing.T) {
 	plan, catalog, source := testReplicatedProjectionPlan(t)

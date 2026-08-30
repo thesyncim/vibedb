@@ -260,6 +260,9 @@ func createFromPrimaryGraphRecords(
 	); err != nil {
 		return 0, err
 	}
+	if err := validatePrimaryBulkUnique(records, normalized); err != nil {
+		return 0, err
+	}
 	storeID := primaryBulkStoreID(records, normalized)
 	placed := len(normalized.indexes) != 0
 	primaryPlan, err := storeio.PlanPrimaryGraphSummarized(

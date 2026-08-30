@@ -88,6 +88,7 @@ func (h *onlineIndexTermHeap) pop() int {
 
 type onlineIndexBuild struct {
 	exact    *store.ExactIndex
+	unique   bool
 	buckets  map[storeio.BucketID]onlineIndexBucket
 	nextRank int
 }
@@ -102,11 +103,15 @@ const onlineIndexRouteCheckBudget = 64
 // steady-state branch is required. The collection's fixed transaction and
 // resident arenas must already admit maintenance of the additional physical
 // index; a deliberately tight configuration fails with
-// ErrPrimaryCutoverUnsupported instead of growing steady-state resources.
+// ErrPrimaryCutoverUnsupported instead of growing steady-state resources. A
+// definition with Unique set receives the same build validation and durable
+// mutation enforcement as CreateUniqueIndex.
 func (c *Collection) CreateIndex(
 	definition store.IndexDefinition,
 ) (store.IndexInfo, error) {
-	return c.CreateIndexContext(context.Background(), definition)
+	return c.createIndexContext(
+		context.Background(), definition, definition.Unique,
+	)
 }
 
 // CreateIndexContext is CreateIndex with cancellation between bounded leaf
@@ -115,6 +120,38 @@ func (c *Collection) CreateIndexContext(
 	ctx context.Context,
 	definition store.IndexDefinition,
 ) (store.IndexInfo, error) {
+	return c.createIndexContext(ctx, definition, definition.Unique)
+}
+
+// CreateUniqueIndex builds and atomically publishes an exact index only when
+// every existing non-NULL canonical term belongs to at most one live row. A
+// compound term containing NULL is exempt, matching SQL unique-constraint
+// semantics. The published durable alias is enforced on later writes.
+func (c *Collection) CreateUniqueIndex(
+	definition store.IndexDefinition,
+) (store.IndexInfo, error) {
+	definition.Unique = true
+	return c.createIndexContext(context.Background(), definition, true)
+}
+
+// CreateUniqueIndexContext is CreateUniqueIndex with cancellation between
+// bounded leaf visits and before the atomic publication transaction. Once
+// published, the durable unique alias is enforced on later point, batch, bulk,
+// and recovery writes.
+func (c *Collection) CreateUniqueIndexContext(
+	ctx context.Context,
+	definition store.IndexDefinition,
+) (store.IndexInfo, error) {
+	definition.Unique = true
+	return c.createIndexContext(ctx, definition, true)
+}
+
+func (c *Collection) createIndexContext(
+	ctx context.Context,
+	definition store.IndexDefinition,
+	unique bool,
+) (store.IndexInfo, error) {
+	definition.Unique = unique
 	if c == nil {
 		return store.IndexInfo{}, ErrClosed
 	}
@@ -162,6 +199,7 @@ func (c *Collection) CreateIndexContext(
 	candidateOptions.Indexes = append(
 		slices.Clone(c.options.Indexes), store.IndexDefinition{
 			Name: definition.Name, Paths: slices.Clone(definition.Paths),
+			Unique: definition.Unique,
 		},
 	)
 	candidate, err := candidateOptions.normalized()
@@ -199,7 +237,7 @@ func (c *Collection) CreateIndexContext(
 	routeCount := router.Len()
 	c.writer.Unlock()
 
-	if oldTarget >= 0 {
+	if oldTarget >= 0 && !unique {
 		// A differently named index over the same ordered path vector is a
 		// logical alias. It needs only a catalog/root transaction; no document
 		// scan and no duplicate physical bytes.
@@ -216,7 +254,7 @@ func (c *Collection) CreateIndexContext(
 	}
 
 	build := &onlineIndexBuild{
-		exact: target,
+		exact: target, unique: unique,
 		buckets: make(
 			map[storeio.BucketID]onlineIndexBucket, routeCount,
 		),
@@ -247,6 +285,18 @@ func (c *Collection) CreateIndexContext(
 		if !stable {
 			continue
 		}
+		if unique {
+			if uniqueErr := build.validateUnique(); uniqueErr != nil {
+				c.writer.Lock()
+				stillCurrent := c.primaryRouter.Load() == validatedRouter &&
+					validatedRouter.Generation() == validatedGeneration
+				c.writer.Unlock()
+				if stillCurrent {
+					return store.IndexInfo{}, uniqueErr
+				}
+				continue
+			}
+		}
 
 		c.writer.Lock()
 		if c.primaryRouter.Load() != validatedRouter ||
@@ -265,6 +315,14 @@ func (c *Collection) CreateIndexContext(
 			validatedRouter.Generation() != validatedGeneration {
 			c.writer.Unlock()
 			continue
+		}
+		if oldTarget >= 0 {
+			err = c.publishOnlineIndexLocked(candidate, nil, targetID)
+			c.writer.Unlock()
+			if err != nil {
+				return store.IndexInfo{}, err
+			}
+			return onlineIndexInfo(definition), nil
 		}
 		currentIndexes := c.options.indexes
 		currentEpoch := c.primaryEpoch
@@ -416,6 +474,7 @@ func (c *Collection) recycleUnpublishedOnlineEpochLocked(
 func onlineIndexInfo(definition store.IndexDefinition) store.IndexInfo {
 	info := store.IndexInfo{
 		Name: definition.Name, Kind: store.IndexExact, State: store.IndexReady,
+		Unique:      definition.Unique,
 		TotalChunks: 1, CoveredChunks: 1,
 		ColumnCount: uint8(len(definition.Paths)),
 	}
@@ -543,8 +602,8 @@ func (b *onlineIndexBuild) scanBucket(
 		quadrant := slot >> 6
 		bit := uint64(1) << uint(slot&63)
 		bucket.live[quadrant] |= bit
-		key, present, termErr := appendPrimaryExactDocumentTerm(
-			canonical[:0], components[:], b.exact, raw,
+		key, present, termErr := appendOnlineIndexDocumentTerm(
+			canonical[:0], components[:], b.exact, raw, b.unique,
 		)
 		if termErr != nil || !present {
 			return termErr
@@ -657,6 +716,48 @@ func (b *onlineIndexBuild) scanBucket(
 	}
 	_ = scratch
 	return bucket, nil
+}
+
+func appendOnlineIndexDocumentTerm(
+	dst []byte,
+	components []storeio.IndexTermComponent,
+	exact *store.ExactIndex,
+	raw []byte,
+	unique bool,
+) ([]byte, bool, error) {
+	if !unique {
+		return appendPrimaryExactDocumentTerm(dst, components, exact, raw)
+	}
+	present := true
+	for i := 0; i < int(exact.N); i++ {
+		value, found, err := exact.Paths[i].GetRawTrusted(raw)
+		if err != nil {
+			return dst, false, err
+		}
+		if !found {
+			present = false
+			continue
+		}
+		component, ok := primaryExactComponent(value)
+		if !ok {
+			return dst, false, fmt.Errorf(
+				"%w: unique index path %q resolves to a container",
+				store.ErrIndexScalar, exact.Specs[i],
+			)
+		}
+		components[i] = component
+	}
+	if !present {
+		return dst, false, nil
+	}
+	key, ok := storeio.AppendIndexTermKey(dst, components[:exact.N])
+	if !ok {
+		return dst, false, fmt.Errorf(
+			"%w: exact term exceeds ordered-primary bound",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
+	return key, true, nil
 }
 
 func (b *onlineIndexBuild) prepareResident(
@@ -861,6 +962,82 @@ func (c *Collection) buildOnlineIndexTerms(
 		})
 	}
 	return terms, nil
+}
+
+// validateUnique performs a k-way merge over the per-primary-leaf canonical
+// terms captured by the stable online build. It caps the row count at two and
+// therefore does not need a second term-to-posting map. SQL unique constraints
+// permit any number of rows when at least one compound component is NULL.
+func (b *onlineIndexBuild) validateUnique() error {
+	heap := onlineIndexTermHeap{
+		sources: make([]onlineIndexTermSource, 0, len(b.buckets)),
+		order:   make([]int, 0, len(b.buckets)),
+	}
+	for bucketID, bucket := range b.buckets {
+		if len(bucket.terms) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(bucket.terms))
+		for key := range bucket.terms {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		sourceID := len(heap.sources)
+		heap.sources = append(heap.sources, onlineIndexTermSource{
+			bucket: bucketID, keys: keys,
+		})
+		heap.push(sourceID)
+	}
+
+	for len(heap.order) != 0 {
+		sourceID := heap.pop()
+		source := &heap.sources[sourceID]
+		key := source.keys[source.at]
+		containsNull, valid := storeio.IndexTermKeyContainsNull(
+			byteview.Bytes(key),
+		)
+		if !valid {
+			return fmt.Errorf(
+				"%w: canonical exact term", storeio.ErrInvalidWrite,
+			)
+		}
+		rows := 0
+		for {
+			bucket := b.buckets[source.bucket]
+			termID, ok := bucket.terms[key]
+			if !ok || int(termID) >= len(bucket.termMasks) {
+				return storeio.ErrPrimaryExactIndexCorrupt
+			}
+			if !containsNull && rows < 2 {
+				for _, bits := range bucket.termMasks[termID] {
+					rows += mathbits.OnesCount64(bits)
+					if rows > 1 {
+						break
+					}
+				}
+			}
+			source.at++
+			if source.at < len(source.keys) {
+				heap.push(sourceID)
+			}
+			if len(heap.order) == 0 {
+				break
+			}
+			next := &heap.sources[heap.order[0]]
+			if next.keys[next.at] != key {
+				break
+			}
+			sourceID = heap.pop()
+			source = &heap.sources[sourceID]
+		}
+		if !containsNull && rows > 1 {
+			return fmt.Errorf(
+				"%w: duplicate canonical term",
+				store.ErrUniqueIndexViolation,
+			)
+		}
+	}
+	return nil
 }
 
 // encodeOnlineIndexBuckets preserves the single-leaf oracle used by focused
@@ -1088,6 +1265,7 @@ catalogAddsName:
 	c.options.pageCatalog = candidate.pageCatalog
 	c.options.indexes = candidate.indexes
 	c.options.indexNameIDs = candidate.indexNameIDs
+	c.options.uniqueIndexIDs = candidate.uniqueIndexIDs
 	c.options.indexCatalogHash = candidate.indexCatalogHash
 	if prepared != nil {
 		c.installPrimaryExactResidentLocked(*prepared)

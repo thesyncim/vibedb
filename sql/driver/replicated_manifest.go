@@ -84,6 +84,9 @@ func initialReplicatedSchemaIdentity(binding ReplicatedShardStoreBinding,
 	if err := validateReplicatedShardStoreLimits(limits); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
+	if err := rejectReplicatedLocalUniqueIndexes(schema.LocalIndexes); err != nil {
+		return ReplicatedShardStoreIdentity{}, err
+	}
 	indexes := make([]indexMeta, len(schema.LocalIndexes))
 	for i, index := range schema.LocalIndexes {
 		compiled, err := store.CompileExactIndex(index)

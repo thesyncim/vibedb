@@ -297,6 +297,12 @@ func lowerReplicatedSchemaDDL(target *catalogFile, statement *query.DMLStatement
 		if err != nil {
 			return false, false, err
 		}
+		if definition.Unique {
+			return false, false, sqlast.NewFeatureNotSupportedError(
+				statement.SQL(), 0,
+				"distributed CREATE UNIQUE INDEX requires a coordinated uniqueness build and is not supported",
+			)
+		}
 		if definition.Table != name {
 			return false, false, ErrTableNotFound
 		}

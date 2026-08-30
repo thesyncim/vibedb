@@ -895,11 +895,16 @@ type normalizedFileStoreOptions struct {
 	indexes                                []*store.ExactIndex
 	skipIndexes                            []vibejson.CompiledPointer
 	indexNameIDs                           map[string]uint32
-	indexCatalogHash                       uint64
-	primaryUnifiedOverlayBytes             int
-	primaryUnifiedOverlayBuckets           int
-	primaryUnifiedOverlayDirtyBytes        uint64
-	primaryUnifiedOverlayParentBytes       uint32
+	// uniqueIndexIDs is the normalized OR of alias-local Unique policy onto
+	// physical path-vector identities. Keeping it beside the compiled catalog
+	// makes the overwhelmingly common non-unique Put path a constant-time nil
+	// check instead of an O(logical aliases) scan.
+	uniqueIndexIDs                   []uint32
+	indexCatalogHash                 uint64
+	primaryUnifiedOverlayBytes       int
+	primaryUnifiedOverlayBuckets     int
+	primaryUnifiedOverlayDirtyBytes  uint64
+	primaryUnifiedOverlayParentBytes uint32
 }
 
 const (
@@ -1142,8 +1147,9 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		}
 		seenIndexes[definition.Name] = struct{}{}
 		inputIndexes[i] = storeio.PageCatalogIndex{
-			Name:  strings.Clone(definition.Name),
-			Paths: slices.Clone(exact.Specs[:exact.N]),
+			Name:   strings.Clone(definition.Name),
+			Paths:  slices.Clone(exact.Specs[:exact.N]),
+			Unique: definition.Unique,
 		}
 	}
 	var catalogSchema *storeio.PageCatalogSchema
@@ -1214,10 +1220,13 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	definitions := make([]store.IndexDefinition, len(canonical.Indexes))
 	indexNameIDs := make(map[string]uint32, len(canonical.Indexes))
+	uniqueIndexIDs := make([]uint32, 0, len(physicalDefinitions))
+	var uniqueIndexSeen [fileStoreMaxPhysicalIndexes]bool
 	catalogHash := uint64(14695981039346656037)
 	for i, alias := range canonical.Indexes {
 		definitions[i] = store.IndexDefinition{
 			Name: alias.Name, Paths: slices.Clone(alias.Paths),
+			Unique: alias.Unique,
 		}
 		physicalID := -1
 		for candidateID, paths := range physicalDefinitions {
@@ -1233,10 +1242,23 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			)
 		}
 		indexNameIDs[alias.Name] = uint32(physicalID)
+		if alias.Unique && !uniqueIndexSeen[physicalID] {
+			uniqueIndexSeen[physicalID] = true
+			uniqueIndexIDs = append(uniqueIndexIDs, uint32(physicalID))
+		}
 		catalogHash = fileIndexHashBytes(catalogHash, []byte(alias.Name))
 		catalogHash = fileIndexHashBytes(
 			catalogHash, []byte{0xff, byte(len(alias.Paths))},
 		)
+		if alias.Unique {
+			// Preserve the historical non-unique hash spelling so existing
+			// durable catalogs continue to reopen. Canonical catalog bytes remain
+			// authoritative; this marker only gives unique aliases a distinct
+			// root-level fast-rejection summary.
+			catalogHash = fileIndexHashBytes(
+				catalogHash, []byte{0x55, 0x4e, 0x51},
+			)
+		}
 		for _, path := range alias.Paths {
 			catalogHash = fileIndexHashBytes(catalogHash, []byte(path))
 			catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
@@ -1594,13 +1616,15 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		singleDocumentFreeFoldLimit:            singleDocumentFreeFoldLimit,
 		freeFoldLimit:                          freeFoldLimit,
 		pageCatalog:                            pageCatalog,
-		indexes:                                compiled, indexNameIDs: indexNameIDs,
-		skipIndexes:                      compiledSkipIndexes,
-		indexCatalogHash:                 catalogHash,
-		primaryUnifiedOverlayBytes:       primaryUnifiedOverlayBytes,
-		primaryUnifiedOverlayBuckets:     primaryOverlayBucketLimit,
-		primaryUnifiedOverlayDirtyBytes:  primaryOverlayDirtyBytes,
-		primaryUnifiedOverlayParentBytes: uint32(primaryOverlayParentBytes),
+		indexes:                                compiled,
+		indexNameIDs:                           indexNameIDs,
+		uniqueIndexIDs:                         uniqueIndexIDs,
+		skipIndexes:                            compiledSkipIndexes,
+		indexCatalogHash:                       catalogHash,
+		primaryUnifiedOverlayBytes:             primaryUnifiedOverlayBytes,
+		primaryUnifiedOverlayBuckets:           primaryOverlayBucketLimit,
+		primaryUnifiedOverlayDirtyBytes:        primaryOverlayDirtyBytes,
+		primaryUnifiedOverlayParentBytes:       uint32(primaryOverlayParentBytes),
 	}
 	if o.PhysicalCapacityBytes != 0 {
 		initial, initialErr := initialCollectionPhysicalFileEnd(normalized)

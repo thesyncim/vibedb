@@ -36,6 +36,9 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 	if current == nil || current.Generation() == math.MaxUint64 || operation == ([32]byte{}) || len(sql) == 0 || len(sql) > sqldriver.ReplicatedChildSchemaMaxBytes {
 		return nil, nil, ErrSchemaRollout
 	}
+	if err := rejectReplicatedUniqueIndexSQL(sql); err != nil {
+		return nil, nil, err
+	}
 	state, err := initialCatalogState(current)
 	if err != nil {
 		return nil, nil, err
@@ -198,6 +201,9 @@ func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32
 		len(sql) == 0 || len(sql) > sqldriver.ReplicatedChildSchemaMaxBytes {
 		return nil, false, ErrSchemaRollout
 	}
+	if err := rejectReplicatedUniqueIndexSQL(sql); err != nil {
+		return nil, false, err
+	}
 	state, err := initialCatalogState(current)
 	if err != nil {
 		return nil, false, err
@@ -335,6 +341,9 @@ func ResolveReplicatedSchemaDDLTable(current *Snapshot, sql string) (string, err
 	}
 	defer statement.Release()
 	tree := statement.Tree()
+	if err := rejectReplicatedUniqueIndex(sql, tree); err != nil {
+		return "", err
+	}
 	switch tree.Kind {
 	case sqlast.KindAlterTable:
 		return tree.AlterTable.Table, nil
@@ -367,6 +376,24 @@ func ResolveReplicatedSchemaDDLTable(current *Snapshot, sql string) (string, err
 		return "", sqlast.NewFeatureNotSupportedError(sql, 0,
 			"distributed PostgreSQL DDL supports ALTER TABLE ADD COLUMN, CREATE INDEX, DROP INDEX, and TRUNCATE")
 	}
+}
+
+func rejectReplicatedUniqueIndexSQL(text string) error {
+	statement, err := sqlast.ParseStatement(text)
+	if err != nil {
+		return err
+	}
+	return rejectReplicatedUniqueIndex(text, statement)
+}
+
+func rejectReplicatedUniqueIndex(text string, statement *sqlast.Statement) error {
+	if statement == nil || statement.CreateIndex == nil || !statement.CreateIndex.Unique {
+		return nil
+	}
+	return sqlast.NewFeatureNotSupportedError(
+		text, 0,
+		"distributed CREATE UNIQUE INDEX requires a coordinated uniqueness build and is not supported",
+	)
 }
 
 func validateSchemaDDLDescription(current *Snapshot, descriptor ReplicatedShardDescriptor, profile ReplicatedTableProfile, member uint64, d sqldriver.ReplicatedSchemaCatalogDescription, indexes []IndexDescriptor, declared sqldriver.TableInfo) error {
@@ -406,7 +433,8 @@ func validateSchemaDDLDescription(current *Snapshot, descriptor ReplicatedShardD
 		count++
 		found := false
 		for _, actual := range d.Table.Indexes {
-			if actual.Name == index.Name && slices.Equal(actual.Paths, index.Paths) {
+			if actual.Name == index.Name && actual.Unique == (index.Flags&IndexUnique != 0) &&
+				slices.Equal(actual.Paths, index.Paths) {
 				found = true
 				break
 			}
@@ -551,6 +579,9 @@ func schemaDDLPlanIndexes(current *Snapshot, table, sql string) ([]IndexDescript
 			return nil, false, ErrSchemaRollout
 		}
 	case sqlast.KindCreateIndex:
+		if err := rejectReplicatedUniqueIndex(sql, tree); err != nil {
+			return nil, false, err
+		}
 		index, err := statement.LowerIndex()
 		if err != nil {
 			return nil, false, err

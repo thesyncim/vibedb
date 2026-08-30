@@ -233,6 +233,26 @@ func TestDDLGrammarShapes(t *testing.T) {
 			src:  `CREATE INDEX ON users (tags[0])`,
 			want: `create index on users 0:/tags/0/tags/0`,
 		},
+		{
+			name: "an unnamed unique index",
+			src:  `CREATE UNIQUE INDEX ON users (email)`,
+			want: `create unique index on users 0:email/email`,
+		},
+		{
+			name: "a named unique index",
+			src:  `CREATE UNIQUE INDEX by_email ON users (email)`,
+			want: `create unique index by_email on users 0:email/email`,
+		},
+		{
+			name: "a unique index with if not exists",
+			src:  `CREATE UNIQUE INDEX IF NOT EXISTS by_email ON users (email)`,
+			want: `create unique index by_email ifnotexists on users 0:email/email`,
+		},
+		{
+			name: "a composite unique index",
+			src:  `CREATE UNIQUE INDEX tenant_email ON users (tenant, profile.email)`,
+			want: `create unique index tenant_email on users 0:tenant/tenant 0:profile.email/profile/email`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -562,14 +582,19 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"NOT NULL then NULL", `CREATE TABLE t (a STRING NOT NULL NULL)`, -1, "contradictory"},
 		{"column primary key then NULL", `CREATE TABLE t (a STRING PRIMARY KEY NULL)`, -1, "contradictory"},
 		{"DEFAULT", `CREATE TABLE t (a STRING DEFAULT 'x')`, -1, "DEFAULT is not supported"},
-		{"UNIQUE", `CREATE TABLE t (a STRING UNIQUE)`, -1, "UNIQUE is not supported"},
+		{"column UNIQUE", `CREATE TABLE t (a STRING UNIQUE)`, -1, "UNIQUE is not supported"},
+		{"table UNIQUE", `CREATE TABLE t (a STRING, UNIQUE (a))`, -1, "UNIQUE is not supported"},
 		{"CHECK", `CREATE TABLE t (a STRING, CHECK (a > 1))`, -1, "CHECK is not supported"},
 		{"REFERENCES", `CREATE TABLE t (a STRING, FOREIGN KEY (a) REFERENCES u (b))`, -1, "FOREIGN is not supported"},
 		{"CREATE TABLE AS", `CREATE TABLE t AS SELECT a FROM u`, -1, "created empty"},
-		{"a unique index", `CREATE UNIQUE INDEX ON t (a)`, -1, "no uniqueness constraint"},
 		{"a partial index", `CREATE INDEX ON t (a) WHERE b = 1`, -1, "cover every document"},
 		{"an index method", `CREATE INDEX ON t (a) USING btree`, -1, "no method to choose"},
 		{"an index direction", `CREATE INDEX ON t (a DESC)`, -1, "no direction"},
+		{"a unique partial index", `CREATE UNIQUE INDEX ON t (a) WHERE b = 1`, -1, "cover every document"},
+		{"a unique index method", `CREATE UNIQUE INDEX ON t (a) USING btree`, -1, "no method to choose"},
+		{"a unique index direction", `CREATE UNIQUE INDEX ON t (a DESC)`, -1, "no direction"},
+		{"a unique index collation", `CREATE UNIQUE INDEX ON t (a COLLATE c)`, -1, "COLLATE is not supported"},
+		{"a unique index null order", `CREATE UNIQUE INDEX ON t (a NULLS FIRST)`, -1, "NULLS FIRST/LAST"},
 		{"an index over the whole document", `CREATE INDEX ON t (*)`, -1, "must stand alone"},
 		{"a duplicate index path", `CREATE INDEX ON t (a, a)`, -1, "named twice"},
 		{"too many index paths", `CREATE INDEX ON t (a, b, c, d, e)`, -1, "at most 4"},

@@ -882,9 +882,72 @@ func (c *Collection) replayRecoveryJournalResolvedPolicyLocked(
 	}
 	applyAtomicBatchSequential := func(rec storeio.RecoveryRecord) error {
 		for i := range rec.Entries {
+			kind := rec.Entries[i].Kind
+			if kind != storeio.RecoveryRecordKindPut &&
+				kind != storeio.RecoveryRecordKindDelete {
+				return fmt.Errorf(
+					"%w: unknown replay kind %d",
+					storeio.ErrRecoveryJournalRecord, kind,
+				)
+			}
+		}
+		// Point-at-a-time fallback must preserve the historical compact leaf
+		// replacement path: the smaller reopening process may be unable to expand
+		// or structurally split a saturated compact leaf. Validate the complete
+		// unique final image first, then suppress only per-point admission while
+		// Open remains private. Exact-index deltas are still maintained normally.
+		if err := c.validatePrimaryUniqueRecoveryBatch(rec.Entries); err != nil {
+			return err
+		}
+		bypassUnique := len(c.options.uniqueIndexIDs) != 0
+		if bypassUnique {
+			if !c.journalReplaying || c.primaryUniqueReplayValidated {
+				return storeio.ErrInvalidWrite
+			}
+			c.primaryUniqueReplayValidated = true
+			defer func() { c.primaryUniqueReplayValidated = false }()
+		}
+		for i := range rec.Entries {
 			entry := rec.Entries[i]
-			if err := apply(entry.Kind, entry.Key, entry.Value); err != nil {
-				return err
+			entryErr := error(nil)
+			stableBatch := false
+			currentFound := false
+			if bypassUnique {
+				state := c.state.Load()
+				currentFound, entryErr = c.containsPrimaryGraph(state, entry.Key)
+				stableBatch = entryErr == nil && currentFound
+			}
+			if entryErr == nil && bypassUnique && !currentFound &&
+				entry.Kind == storeio.RecoveryRecordKindDelete {
+				// A crash can checkpoint an earlier replay of this final Delete
+				// while the complete atomic journal record remains live. Its next
+				// certified replay consumes the now-absent Delete directly; routing
+				// it through public Delete would needlessly expand a saturated
+				// compact leaf merely to rediscover the same no-op.
+				applied++
+			} else if entryErr == nil && stableBatch {
+				// The recovery-certified existing-row batch path preserves every
+				// compact posting slot and emits targeted exact deltas. That avoids
+				// raw point expansion for deletes/overflow replacements and avoids
+				// a full-bucket exact rebase under a smaller reopening geometry.
+				// New inserts retain the historical point path below.
+				entryErr = c.Update(func(batch *WriteBatch) error {
+					return batch.appendRecovery(
+						entry.Key, entry.Value,
+						entry.Kind == storeio.RecoveryRecordKindDelete,
+					)
+				})
+				if entryErr == nil {
+					applied++
+				}
+			} else if entryErr == nil {
+				entryErr = apply(entry.Kind, entry.Key, entry.Value)
+			}
+			if entryErr != nil {
+				return fmt.Errorf(
+					"vibedb: replay atomic batch entry %d kind %d: %w",
+					i, entry.Kind, entryErr,
+				)
 			}
 			if hook := recoveryJournalReplayBatchEntryHook; hook != nil {
 				if err := hook(c, rec, i); err != nil {

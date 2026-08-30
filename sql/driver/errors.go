@@ -50,6 +50,12 @@ var (
 	// key already exists, or appears twice in one VALUES batch. INSERT never
 	// replaces; UPDATE is the explicit replacement operation.
 	ErrDuplicatePrimaryKey = errors.New("vibedb: INSERT primary key already exists")
+	// ErrUniqueConstraint reports a CREATE UNIQUE INDEX or row mutation whose
+	// final table image would give one non-null exact scalar tuple to more than
+	// one primary key. It is separate from ErrDuplicatePrimaryKey so protocol
+	// adapters can retain the violated secondary-index identity while mapping
+	// both errors to SQLSTATE 23505.
+	ErrUniqueConstraint = errors.New("vibedb: unique index constraint violation")
 	// ErrUpsertCardinality reports an ON CONFLICT DO UPDATE candidate batch
 	// whose canonical primary key occurs more than once. Updating the same row
 	// twice in one statement is order-dependent, so the complete statement is

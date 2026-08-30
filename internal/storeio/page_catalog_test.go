@@ -14,7 +14,7 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 		Indexes: []PageCatalogIndex{
 			{Name: "z_by_score", Paths: []string{"/score"}},
 			{Name: "tenant_status_alias", Paths: []string{"/tenant", "/status"}},
-			{Name: "tenant_status", Paths: []string{"/tenant", "/status"}},
+			{Name: "tenant_status", Paths: []string{"/tenant", "/status"}, Unique: true},
 		},
 		SkipPaths: []string{"/score", "/profile/region"},
 		Schema: &PageCatalogSchema{
@@ -43,6 +43,9 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 	}) {
 		t.Fatalf("alias order = %q", names)
 	}
+	if !got.Indexes[0].Unique || got.Indexes[1].Unique || got.Indexes[2].Unique {
+		t.Fatalf("canonical unique flags = %+v", got.Indexes)
+	}
 	if got.Schema.Fields[0].Path != "/score" ||
 		got.Schema.Fields[0].Types != PageCatalogSchemaNumber ||
 		got.Schema.Fields[1].Path != "/tenant" {
@@ -54,7 +57,7 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 
 	reordered := PageCatalogDefinition{
 		Indexes: []PageCatalogIndex{
-			{Name: "tenant_status", Paths: []string{"/tenant", "/status"}},
+			{Name: "tenant_status", Paths: []string{"/tenant", "/status"}, Unique: true},
 			{Name: "z_by_score", Paths: []string{"/score"}},
 			{Name: "tenant_status_alias", Paths: []string{"/tenant", "/status"}},
 		},
@@ -87,10 +90,40 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 	input.Indexes[1].Paths[0] = "/mutated"
 	input.SkipPaths[0] = "/mutated"
 	got.Indexes[0].Name = "also_mutated"
+	got.Indexes[0].Unique = false
 	got.SkipPaths[0] = "/also_mutated"
 	got.Schema.Fields[0].Path = "/also_mutated"
 	if !catalog.Equal(other) {
 		t.Fatal("catalog aliases caller or returned definition storage")
+	}
+}
+
+func TestPageCatalogUniqueAliasFlagIsCanonicalIdentity(t *testing.T) {
+	definition := PageCatalogDefinition{Indexes: []PageCatalogIndex{
+		{Name: "ordinary", Paths: []string{"/value"}},
+		{Name: "unique", Paths: []string{"/value"}, Unique: true},
+	}}
+	catalog, err := BuildCanonicalPageCatalog(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenCanonicalPageCatalog(catalog.AppendCanonical(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := opened.Definition()
+	if len(got.Indexes) != 2 || got.Indexes[0].Unique ||
+		!got.Indexes[1].Unique || opened.PhysicalIndexCount() != 1 {
+		t.Fatalf("opened unique aliases = %+v, physical=%d",
+			got.Indexes, opened.PhysicalIndexCount())
+	}
+	definition.Indexes[1].Unique = false
+	nonUnique, err := BuildCanonicalPageCatalog(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Equal(nonUnique) || catalog.Digest() == nonUnique.Digest() {
+		t.Fatal("unique alias flag did not affect canonical catalog identity")
 	}
 }
 
@@ -434,6 +467,7 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 			copy(src[aliasStart:aliasStart+4], src[aliasStart+4:aliasStart+8])
 			copy(src[aliasStart+4:aliasStart+8], first)
 		}},
+		{"alias flags", func(src []byte) { src[aliasStart+3] = 2 }},
 		{"skip order", func(src []byte) {
 			first := slices.Clone(src[skipStart : skipStart+2])
 			copy(src[skipStart:skipStart+2], src[skipStart+2:skipStart+4])

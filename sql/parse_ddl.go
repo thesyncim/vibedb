@@ -10,7 +10,8 @@ package sql
 //	column-def   = path type-name { column-constraint } ;
 //	column-constraint = "NOT" "NULL" | "NULL" | "PRIMARY" "KEY" ;
 //
-//	create-index = "CREATE" "INDEX" [ "IF" "NOT" "EXISTS" ] [ name ]
+//	create-index = "CREATE" [ "UNIQUE" ] "INDEX"
+//	               [ "IF" "NOT" "EXISTS" ] [ name ]
 //	               "ON" name "(" path { "," path } ")" ;
 //
 // Type names are matched case-insensitively against a table of spellings rather
@@ -31,9 +32,14 @@ func (p *Parser) parseCreate(dst *Statement) error {
 	case p.atKeyword(kwIndex):
 		p.advance()
 		dst.Kind, dst.CreateIndex = KindCreateIndex, &p.idx
-		return p.parseCreateIndex()
+		return p.parseCreateIndex(false)
 	case p.atKeyword(kwUnique):
-		return p.errHere("CREATE UNIQUE INDEX is not supported: this engine's indexes are lookup structures with no uniqueness constraint, and one that silently did not constrain would be worse than none")
+		p.advance()
+		if err := p.expectKeyword(kwIndex, "INDEX after UNIQUE"); err != nil {
+			return err
+		}
+		dst.Kind, dst.CreateIndex = KindCreateIndex, &p.idx
+		return p.parseCreateIndex(true)
 	case p.atKeyword(kwView):
 		p.advance()
 		dst.Kind, dst.CreateView = KindCreateView, &p.view
@@ -200,7 +206,7 @@ func (p *Parser) parseTableItems() error {
 func (p *Parser) rejectTableConstraint() error {
 	switch {
 	case p.atKeyword(kwUnique):
-		return p.errHere("UNIQUE is not supported: the only uniqueness this store enforces is over a document's primary key")
+		return p.errHere("UNIQUE is not supported in CREATE TABLE; create the table first, then use CREATE UNIQUE INDEX")
 	}
 	if p.tok.kind != tokIdent {
 		return nil
@@ -310,7 +316,7 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		case p.atKeyword(kwDefault):
 			return column, p.errHere("DEFAULT is not supported: a default would have to be written into every document that omitted the field, and this store validates documents rather than completing them")
 		case p.atKeyword(kwUnique):
-			return column, p.errHere("UNIQUE is not supported: the only uniqueness this store enforces is over a document's primary key")
+			return column, p.errHere("UNIQUE is not supported in CREATE TABLE; create the table first, then use CREATE UNIQUE INDEX")
 		case p.atKeyword(kwCollate):
 			return column, p.errHere("COLLATE is not supported: strings compare by decoded content")
 		default:
@@ -455,8 +461,8 @@ func (p *Parser) validateTable() error {
 
 // --- CREATE INDEX ------------------------------------------------------------
 
-func (p *Parser) parseCreateIndex() error {
-	p.idx = CreateIndexStmt{}
+func (p *Parser) parseCreateIndex(unique bool) error {
+	p.idx = CreateIndexStmt{Unique: unique}
 	p.out = &p.sel
 	*p.out = SelectStmt{}
 	exists, err := p.parseIfNotExists()

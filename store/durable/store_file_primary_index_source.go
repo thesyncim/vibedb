@@ -19,6 +19,7 @@ func (s *Snapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
 	for _, definition := range s.indexDefinitions {
 		info := store.IndexInfo{
 			Name: definition.Name, Kind: store.IndexExact, State: store.IndexReady,
+			Unique: definition.Unique,
 			// The ordered-primary exact index covers every document, so it is fully
 			// covered by construction. The planner keys indexability off State and
 			// ColumnCount; coverage is reported as one complete unit.

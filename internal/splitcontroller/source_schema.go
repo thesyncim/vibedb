@@ -17,7 +17,9 @@ func cloneSplitLocalIndexes(indexes []store.IndexDefinition) []store.IndexDefini
 	}
 	result := make([]store.IndexDefinition, len(indexes))
 	for i, index := range indexes {
-		result[i] = store.IndexDefinition{Name: index.Name, Paths: slices.Clone(index.Paths)}
+		result[i] = store.IndexDefinition{
+			Name: index.Name, Paths: slices.Clone(index.Paths), Unique: index.Unique,
+		}
 	}
 	return result
 }
@@ -33,7 +35,8 @@ func sameSplitLocalIndexes(left, right []store.IndexDefinition) bool {
 		return false
 	}
 	for i := range left {
-		if left[i].Name != right[i].Name || !slices.Equal(left[i].Paths, right[i].Paths) {
+		if left[i].Name != right[i].Name || left[i].Unique != right[i].Unique ||
+			!slices.Equal(left[i].Paths, right[i].Paths) {
 			return false
 		}
 	}

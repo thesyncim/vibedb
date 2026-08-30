@@ -60,6 +60,7 @@ type txTable struct {
 	primaryKey         string
 	primary            vibejson.CompiledPointer
 	schema             *store.Schema
+	uniqueIndexes      []indexMeta
 	limits             durable.Options
 	conflicts          *txConflictClock
 	conflictRevision   uint64
@@ -192,12 +193,13 @@ func newTransactionTableState(
 		return nil, layout.limitsErr
 	}
 	state := &txTable{
-		name:        name,
-		incarnation: layout.incarnation,
-		primaryKey:  layout.primaryKey,
-		primary:     layout.primary,
-		schema:      layout.schema,
-		limits:      layout.limits,
+		name:          name,
+		incarnation:   layout.incarnation,
+		primaryKey:    layout.primaryKey,
+		primary:       layout.primary,
+		schema:        layout.schema,
+		uniqueIndexes: layout.uniqueIndexes,
+		limits:        layout.limits,
 	}
 	if allocatePending {
 		state.pending = make(map[string]*txMutation)
@@ -214,11 +216,12 @@ func (t *tx) tableLayoutAtBegin(
 	}
 	if state := t.tables[name]; state != nil {
 		return transactionTableLayout{
-			incarnation: state.incarnation,
-			primaryKey:  state.primaryKey,
-			primary:     state.primary,
-			schema:      state.schema,
-			limits:      state.limits,
+			incarnation:   state.incarnation,
+			primaryKey:    state.primaryKey,
+			primary:       state.primary,
+			schema:        state.schema,
+			uniqueIndexes: state.uniqueIndexes,
+			limits:        state.limits,
 		}, true
 	}
 	if t.layoutEpoch == nil {
@@ -1469,6 +1472,9 @@ func (t *tx) execMutationCore(
 	if err := t.resolveStagedMutationsContext(ctx, state, staged); err != nil {
 		return nil, err
 	}
+	if err := validateTransactionUniqueStatement(ctx, state, staged); err != nil {
+		return nil, err
+	}
 	if returning != nil {
 		if returned == nil {
 			return nil, errors.New(
@@ -2244,6 +2250,18 @@ func (t *tx) Commit() error {
 			return err
 		}
 	}
+	// A transaction may have begun before a unique index was created, and two
+	// concurrent transactions can claim the same secondary value through
+	// different primary keys without tripping the primary-key conflict clock.
+	// Recheck every final overlay against the current durable cut while db.mu
+	// fences the subsequent single- or multi-table publication.
+	for i := range dirty {
+		if err := validateTransactionUniqueCommit(
+			dirty[i].table, dirty[i].state,
+		); err != nil {
+			return err
+		}
+	}
 
 	if len(dirty) == 1 && t.distributedParticipant == nil {
 		return t.commitOneTable(dirty[0].name, dirty[0].table, dirty[0].state)
@@ -2444,6 +2462,9 @@ func (t *tx) validateWriteSet(
 func transactionBatchError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, store.ErrUniqueIndexViolation) {
+		return mapDurableUniqueConstraintError(err)
 	}
 	if errors.Is(err, durable.ErrBatchTooLarge) ||
 		errors.Is(err, durable.ErrTxnTooLarge) ||

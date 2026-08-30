@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -179,5 +180,28 @@ func TestInitialReplicatedRelationManifestPureContract(t *testing.T) {
 				t.Fatalf("changed contract=%x err=%v", got, err)
 			}
 		})
+	}
+}
+
+func TestInitialReplicatedManifestsRejectLocalUniqueIndex(t *testing.T) {
+	binding := testReplicatedBinding(31)
+	placement := testReplicatedApplyOptions().Placement
+	schema := InitialReplicatedRelationSchema{
+		Table: "docs", PrimaryKey: "/id",
+		LocalIndexes: []store.IndexDefinition{{
+			Name: "by_email", Paths: []string{"/email"}, Unique: true,
+		}},
+	}
+	if _, _, err := InitialReplicatedRelationManifest(
+		binding, placement, schema,
+	); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+		t.Fatalf("initial machine manifest unique index = %v, want %v",
+			err, ErrReplicatedShardStoreProfile)
+	}
+	if _, err := InitialReplicatedLogicalSchemaDigest(
+		binding, placement, schema,
+	); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+		t.Fatalf("initial logical manifest unique index = %v, want %v",
+			err, ErrReplicatedShardStoreProfile)
 	}
 }
