@@ -676,7 +676,7 @@ func servePreparedRF3WithExecutionLanes(
 		peerErr := peer.Run(retireCtx)
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
-	schemaActivator, err := newRF3SchemaActivator(peer.Owners(), preparedSet.groups)
+	schemaActivator, err := newRF3SchemaActivator(peer.Owners(), preparedSet.groups, identities)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)

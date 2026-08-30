@@ -47,6 +47,48 @@ func validateRF3GroupAppend(current, next rf3Manifest) error {
 	return nil
 }
 
+func validateRF3GroupTransition(current, next rf3Manifest) error {
+	old, all := current.groupBundles(), next.groupBundles()
+	if len(old) == 0 || len(all) == 0 || len(all) > maxRF3ManifestGroups ||
+		current.DevelopmentOnly || next.DevelopmentOnly {
+		return errInvalidRF3Manifest
+	}
+	a, b := current.withGroup(old[0]), next.withGroup(all[0])
+	a.Digest, b.Digest = [32]byte{}, [32]byte{}
+	a.SplitControl.MaxOperations = a.SplitControl.operationLimit()
+	b.SplitControl.MaxOperations = b.SplitControl.operationLimit()
+	if !reflect.DeepEqual(a, b) {
+		return fmt.Errorf("%w: reload changes process configuration", errInvalidRF3Manifest)
+	}
+	oldByGroup := make(map[raftmember.GroupKey]rf3ManifestGroup, len(old))
+	for _, bundle := range old {
+		oldByGroup[bundle.Route.Group] = bundle
+	}
+	added, retained := 0, 0
+	groups := make(map[raftmember.GroupKey]bool, len(all))
+	paths := make(map[string]bool, 2*len(all))
+	for _, bundle := range all {
+		if groups[bundle.Route.Group] || paths[bundle.WAL.Path] || paths[bundle.SQL.Path] || bundle.WAL.Path == bundle.SQL.Path ||
+			bundle.EnrolledTarget != nil || bundle.Members != all[0].Members || bundle.MemberCount != all[0].MemberCount {
+			return errInvalidRF3Manifest
+		}
+		groups[bundle.Route.Group], paths[bundle.WAL.Path], paths[bundle.SQL.Path] = true, true, true
+		if previous, found := oldByGroup[bundle.Route.Group]; found {
+			if !reflect.DeepEqual(previous, bundle) {
+				return fmt.Errorf("%w: reload replaces a retained group", errInvalidRF3Manifest)
+			}
+			retained++
+		} else {
+			added++
+		}
+	}
+	removed := len(old) - retained
+	if added != 0 && removed != 0 || removed != 0 && all[0].Route.Group != old[0].Route.Group {
+		return errInvalidRF3Manifest
+	}
+	return nil
+}
+
 func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile *rafttransport.PeerTLS,
 	peer *raftservice.AuthenticatedExecutionPeerRuntime, inventory *rf3AdoptedGroupInventory, schemas *rf3SchemaActivator,
 ) error {
@@ -57,7 +99,7 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 	if err != nil {
 		return err
 	}
-	if err := validateRF3GroupAppend(*current, next); err != nil {
+	if err := validateRF3GroupTransition(*current, next); err != nil {
 		return err
 	}
 	// The configuration is the recovery inventory for these groups. Fence it
@@ -71,7 +113,56 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 			return err
 		}
 	}
-	for _, bundle := range next.groupBundles()[len(current.groupBundles()):] {
+	oldBundles, nextBundles := current.groupBundles(), next.groupBundles()
+	nextGroups := make(map[raftmember.GroupKey]struct{}, len(nextBundles))
+	for _, bundle := range nextBundles {
+		nextGroups[bundle.Route.Group] = struct{}{}
+	}
+	if len(nextBundles) < len(oldBundles) {
+		inventory.mu.Lock()
+		defer inventory.mu.Unlock()
+		if inventory.liveCount() != 0 || inventory.failed || inventory.root == nil {
+			return errInvalidRF3Manifest
+		}
+		for _, bundle := range oldBundles {
+			if _, retained := nextGroups[bundle.Route.Group]; retained {
+				continue
+			}
+			schemas.mu.RLock()
+			generation := schemas.groups[bundle.Route.Group]
+			schemas.mu.RUnlock()
+			if generation == nil || generation.identity.Group != bundle.Route.Group {
+				return errInvalidRF3Manifest
+			}
+			if err := peer.UnregisterExecutionGroup(generation.identity); err != nil {
+				return err
+			}
+			schemas.mu.Lock()
+			delete(schemas.groups, bundle.Route.Group)
+			schemas.mu.Unlock()
+			currentChildren := inventory.nativeChildren.Load()
+			if currentChildren != nil {
+				replacement := make(rf3NativeChildren, len(*currentChildren))
+				for group, identity := range *currentChildren {
+					if group != bundle.Route.Group {
+						replacement[group] = identity
+					}
+				}
+				inventory.nativeChildren.Store(&replacement)
+			}
+			delete(inventory.runtimes, bundle.Route.Group)
+			fmt.Fprintf(os.Stderr, "RF3 retired group table=%q group=%x member=%d\n",
+				generation.base.UserTable, generation.identity.Group.GroupID, generation.identity.MemberID)
+		}
+		inventory.manifest = next
+		if err := inventory.save(inventory.entries); err != nil {
+			return err
+		}
+		next.reloadPath, next.reloadSignals = current.reloadPath, current.reloadSignals
+		*current = next
+		return nil
+	}
+	for _, bundle := range nextBundles[len(oldBundles):] {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -114,7 +205,7 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		inventory.publishNativeChild(identity)
 		inventory.mu.Unlock()
 		schemas.mu.Lock()
-		schemas.groups[identity.Group] = &rf3SchemaGeneration{path: item.manifest.SQL.Path,
+		schemas.groups[identity.Group] = &rf3SchemaGeneration{identity: identity, path: item.manifest.SQL.Path,
 			wal: item.wal, base: item.base.Clone(), applyID: item.applyIdentity, apply: item.apply}
 		schemas.mu.Unlock()
 		current.Groups = append(current.groupBundles(), bundle)

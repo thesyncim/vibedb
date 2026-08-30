@@ -407,6 +407,12 @@ func advanceCatalogState(current, next *Snapshot) (*Snapshot, error) {
 	if current == nil {
 		return initialCatalogState(next)
 	}
+	if next.tableRetirement != nil {
+		return advanceCatalogStateTableRetirement(current, next)
+	}
+	if current.tableRetirement != nil {
+		return advanceCatalogStateTableRetirementCleanup(current, next)
+	}
 	if err := validateRoutingTransition(current, next); err != nil {
 		return nil, err
 	}
@@ -451,6 +457,7 @@ func snapshotWithCatalogLineage(
 		replicatedReplicas:             snapshot.replicatedReplicas,
 		replicatedTables:               snapshot.replicatedTables,
 		replicatedTableDeclarations:    snapshot.replicatedTableDeclarations,
+		tableRetirement:                snapshot.tableRetirement,
 		durableRequestLedgerTopology:   snapshot.durableRequestLedgerTopology,
 		indexLineage:                   snapshot.indexLineage,
 		shardLineage:                   snapshot.shardLineage,

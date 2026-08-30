@@ -99,7 +99,7 @@ func openRF3AdoptedGroupInventory(manifest rf3Manifest) (*rf3AdoptedGroupInvento
 	rebind := !bytes.Equal(raw[8:40], manifest.Digest[:])
 	if rebind {
 		previous, err := loadRF3Manifest(filepath.Join(path, "prepared-manifests", hex.EncodeToString(raw[8:40])+".vibejson"))
-		if err != nil || !bytes.Equal(previous.Digest[:], raw[8:40]) || validateRF3GroupAppend(previous, manifest) != nil {
+		if err != nil || !bytes.Equal(previous.Digest[:], raw[8:40]) || validateRF3GroupTransition(previous, manifest) != nil {
 			return fail(errors.Join(errRF3Serving, err))
 		}
 		result.manifest = previous

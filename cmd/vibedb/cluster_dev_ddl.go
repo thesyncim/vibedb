@@ -37,7 +37,7 @@ func startDevDDL(ctx context.Context, cluster devClusterManifest, binary string,
 		WriteTimeout: 2 * time.Minute, MaxHeaderBytes: 4096,
 		BaseContext: func(net.Listener) context.Context { return ctx },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost || r.URL.Path != "/create-table" {
+			if r.Method != http.MethodPost || r.URL.Path != "/create-table" && r.URL.Path != "/drop-table" {
 				http.NotFound(w, r)
 				return
 			}
@@ -47,8 +47,28 @@ func startDevDDL(ctx context.Context, cluster devClusterManifest, binary string,
 				return
 			}
 			tree, err := sqlast.ParseStatement(string(raw))
-			if err != nil || tree.CreateTable == nil {
-				http.Error(w, "expected CREATE TABLE", http.StatusBadRequest)
+			if err != nil || r.URL.Path == "/create-table" && tree.CreateTable == nil ||
+				r.URL.Path == "/drop-table" && tree.DropTable == nil {
+				http.Error(w, "expected matching table DDL", http.StatusBadRequest)
+				return
+			}
+			if tree.DropTable != nil {
+				mu.Lock()
+				defer mu.Unlock()
+				removed, retireErr := retireDevTable(root, binary, &cluster, tree.DropTable.Table)
+				if retireErr != nil {
+					http.Error(w, retireErr.Error(), http.StatusInternalServerError)
+					return
+				}
+				if removed {
+					for _, child := range children {
+						if signalErr := child.command.Process.Signal(syscall.SIGHUP); signalErr != nil {
+							http.Error(w, signalErr.Error(), http.StatusServiceUnavailable)
+							return
+						}
+					}
+				}
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 			// Canonicalize the optional IF NOT EXISTS prefix. The gateway checks
