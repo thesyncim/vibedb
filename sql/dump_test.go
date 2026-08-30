@@ -618,5 +618,7 @@ func dumpOperand(b *strings.Builder, o Operand) {
 		fmt.Fprintf(b, "j%s", o.Text)
 	case OperandParam:
 		fmt.Fprintf(b, "?%d", o.Ordinal)
+	case OperandNull:
+		b.WriteString("null")
 	}
 }

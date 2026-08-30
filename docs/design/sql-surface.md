@@ -214,8 +214,13 @@ Conflict handling supports `ON CONFLICT DO NOTHING` only.
 
 ## UPDATE and DELETE
 
-`UPDATE` assigns the whole document through `"$doc"`. It does not support a
-partial path assignment or `UPDATE ... FROM`.
+`UPDATE` can assign the whole document through `"$doc"`. On a table with
+declared columns it can also assign scalar literals or placeholders to one or
+more top-level columns while preserving every unassigned field in each matching
+document.
+
+Nested-path targets, row-dependent assignment expressions such as
+`score = score + 1`, and `UPDATE ... FROM` are not supported.
 
 The replacement must preserve the primary key. One constant replacement
 cannot update multiple rows that have different primary keys.

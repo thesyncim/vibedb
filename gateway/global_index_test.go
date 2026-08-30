@@ -548,6 +548,128 @@ func TestPreparedInsertExpandsReadyGlobalIndexes(t *testing.T) {
 	}
 }
 
+func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesPostImage(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := snapshot.Prepare(context.Background(),
+		`UPDATE messages SET email = ? WHERE tenant_id = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.BindWrite([]any{
+		[]byte("new@example.com"), []byte("tenant-7"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bound.updateDoc) != 0 || len(bound.updateAssignments) != 1 {
+		t.Fatalf("assignment bind updateDoc=%q assignments=%d", bound.updateDoc, len(bound.updateAssignments))
+	}
+	oldDocument := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"old@example.com","keep":1}`)
+	program := prepared.writeGlobalIndexes[0].program
+	var workspace GlobalIndexWorkspace
+	oldRoute, err := program.RouteDocument(oldDocument, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.bindGlobalIndexCapture(
+		bound, oldRoute.BaseTarget,
+		[][]shardservice.Cell{{
+			{Bytes: append([]byte(nil), oldRoute.BasePrimaryKey...)},
+			{Bytes: oldDocument},
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(bound.globalIndexes) != 2 {
+		t.Fatalf("global index mutations = %d, want delete+put", len(bound.globalIndexes))
+	}
+	oldMutation, newMutation := bound.globalIndexes[0], bound.globalIndexes[1]
+	oldEntry := bound.globalIndexArena[oldMutation.entryStart:oldMutation.entryEnd]
+	newEntry := bound.globalIndexArena[newMutation.entryStart:newMutation.entryEnd]
+	if oldMutation.kind != shardservice.MutationGlobalIndexDelete ||
+		newMutation.kind != shardservice.MutationGlobalIndexPut ||
+		!bytes.Equal(oldEntry, oldRoute.EntryKey) || bytes.Equal(newEntry, oldEntry) {
+		t.Fatalf("global assignment mutations = %#v / %#v entries=%x/%x", oldMutation, newMutation, oldEntry, newEntry)
+	}
+	newDocument := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"new@example.com","keep":1}`)
+	newRoute, err := program.RouteDocument(newDocument, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newValue := bound.globalIndexArena[newMutation.valueStart:newMutation.valueEnd]
+	if !bytes.Equal(newEntry, newRoute.EntryKey) ||
+		!bytes.Equal(newValue, newRoute.LocatorValue) {
+		t.Fatalf("new route entry/value = %x/%s, want %x/%s", newEntry, newValue, newRoute.EntryKey, newRoute.LocatorValue)
+	}
+}
+
+func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	descriptor := testGlobalIndexDescriptor()
+	descriptor.Flags &^= IndexUnique
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := snapshot.Prepare(context.Background(),
+		`UPDATE messages SET email = ? WHERE tenant_id = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.BindWrite([]any{
+		[]byte("new@example.com"), []byte("tenant-7"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := prepared.writeGlobalIndexes[0].program
+	oldDocuments := [][]byte{
+		[]byte(`{"tenant_id":"tenant-7","id":"message-a","email":"old-a@example.com"}`),
+		[]byte(`{"tenant_id":"tenant-7","id":"message-b","email":"old-b@example.com"}`),
+	}
+	rows := make([][]shardservice.Cell, len(oldDocuments))
+	var workspace GlobalIndexWorkspace
+	var baseTarget distribution.Target
+	for i := range oldDocuments {
+		route, err := program.RouteDocument(oldDocuments[i], &workspace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			baseTarget = route.BaseTarget
+		} else if route.BaseTarget != baseTarget {
+			t.Fatal("fixture rows did not route to one base shard")
+		}
+		rows[i] = []shardservice.Cell{
+			{Bytes: append([]byte(nil), route.BasePrimaryKey...)},
+			{Bytes: oldDocuments[i]},
+		}
+	}
+	if err := prepared.bindGlobalIndexCapture(bound, baseTarget, rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(bound.globalIndexes) != 4 {
+		t.Fatalf("global index mutations = %d, want two per row", len(bound.globalIndexes))
+	}
+	first := bound.globalIndexes[1]
+	second := bound.globalIndexes[3]
+	firstValue := bound.globalIndexArena[first.valueStart:first.valueEnd]
+	secondValue := bound.globalIndexArena[second.valueStart:second.valueEnd]
+	if bytes.Equal(firstValue, secondValue) ||
+		string(firstValue) != `["tenant-7","message-a"]` ||
+		string(secondValue) != `["tenant-7","message-b"]` {
+		t.Fatalf("per-row locator values = %s / %s", firstValue, secondValue)
+	}
+}
+
 func TestGlobalNonUniqueEntryKeyIncludesLocator(t *testing.T) {
 	config, endpoints := globalIndexCatalog(t)
 	descriptor := testGlobalIndexDescriptor()

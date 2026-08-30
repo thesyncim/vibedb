@@ -1168,6 +1168,111 @@ func (t *tx) execMutationCore(
 			return nil, err
 		}
 	case query.DMLUpdate:
+		assignments := statement.Tree().Update.Assignments
+		if len(assignments) != 0 {
+			if err := validateDeclaredColumnAssignments(
+				tableName, state.incarnation.meta, assignments,
+			); err != nil {
+				return nil, err
+			}
+			if err := validateColumnAssignmentBindings(assignments, args); err != nil {
+				return nil, err
+			}
+			if err := t.conn.routeDelete(statement, args); err != nil {
+				return nil, err
+			}
+			keys, err := t.conn.matchingKeysTransaction(
+				ctx, t, statement, args, state, 0,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if err := t.consumePrimaryMutationGuard(tableName, keys); err != nil {
+				return nil, err
+			}
+			scratch := t.conn.pointRaw[:0]
+			cancellable := contextCanCancel(ctx)
+			prospectiveBytes := state.stagedBytes
+			peakBytes := max(state.highWaterBytes, prospectiveBytes)
+			for _, key := range keys {
+				if cancellable {
+					if err := contextCheckpoint(ctx); err != nil {
+						t.conn.pointRaw = scratch
+						return nil, err
+					}
+				}
+				var found bool
+				scratch, found, err = state.appendRaw(scratch[:0], key)
+				if err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if !found {
+					t.conn.pointRaw = scratch
+					return nil, ErrTransactionConflict
+				}
+				document, err := ApplyColumnAssignments(
+					scratch, assignments, args, limits.MaxDocumentBytes,
+				)
+				if err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if err := validateDocument(
+					state.schema, document, limits.MaxDocumentBytes,
+					&state.validationTape,
+				); err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if err := t.conn.routeUpdate(statement, args, document); err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				newKey, err := documentKey(
+					document, state.primaryKey, state.primary,
+					limits.MaxKeyBytes,
+				)
+				if err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if key != newKey {
+					t.conn.pointRaw = scratch
+					return nil, fmt.Errorf(
+						"%w: replacement key %q does not match selected key %q",
+						ErrUpdatePrimaryKey, newKey, key,
+					)
+				}
+				if previous := state.pending[key]; previous != nil {
+					prospectiveBytes -= len(key) + len(previous.document)
+				}
+				if len(key) > limits.MaxBatchBytes-prospectiveBytes ||
+					len(document) > limits.MaxBatchBytes-prospectiveBytes-len(key) {
+					t.conn.pointRaw = scratch
+					return nil, fmt.Errorf(
+						"%w: UPDATE would stage more than %d key/document bytes for table %q: %w",
+						ErrTransactionTooLarge, limits.MaxBatchBytes, tableName,
+						durable.ErrBatchTooLarge,
+					)
+				}
+				prospectiveBytes += len(key) + len(document)
+				peakBytes = max(peakBytes, prospectiveBytes)
+				if peakBytes > limits.MaxBatchBytes {
+					t.conn.pointRaw = scratch
+					return nil, fmt.Errorf(
+						"%w: UPDATE would stage %d key/document bytes for table %q, limit %d: %w",
+						ErrTransactionTooLarge, peakBytes, tableName,
+						limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+					)
+				}
+				staged = append(staged, stagedTxMutation{
+					key: key, document: document,
+				})
+			}
+			t.conn.pointRaw = scratch
+			break
+		}
 		document, err := operandDocument(
 			statement, statement.Tree().Update.Doc, args)
 		if err != nil {

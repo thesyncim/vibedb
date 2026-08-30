@@ -818,6 +818,10 @@ const (
 	OperandJSON
 	// OperandParam is a '?' placeholder. Ordinal is its 0-based position.
 	OperandParam
+	// OperandNull is the NULL literal accepted by value-producing clauses such
+	// as a declared-column UPDATE assignment. Comparisons deliberately continue
+	// to reject NULL in favor of IS NULL.
+	OperandNull
 )
 
 // An Operand is a literal or a placeholder.

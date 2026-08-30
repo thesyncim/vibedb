@@ -1,9 +1,12 @@
 package driver
 
 import (
+	"context"
+	stdsql "database/sql"
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/query"
@@ -112,4 +115,64 @@ func TestTransactionFilteredDeleteStopsAtByteBound(t *testing.T) {
 		)
 	}
 	assertEmptyTransactionPending(t, state)
+}
+
+func TestTransactionDeclaredColumnUpdateStopsAtProspectiveByteBound(t *testing.T) {
+	connection := directTestConn(t).(*conn)
+	directExec(t, connection,
+		`CREATE TABLE docs (`+
+			`id STRING PRIMARY KEY, state STRING NOT NULL, selected BOOL NOT NULL)`, nil)
+	beforeA := []byte(`{"id":"a","state":"old","selected":true}`)
+	beforeB := []byte(`{"id":"b","state":"old","selected":true}`)
+	directExec(t, connection, `INSERT INTO docs VALUES (?), (?)`,
+		[]sqldriver.NamedValue{
+			{Ordinal: 1, Value: string(beforeA)},
+			{Ordinal: 2, Value: string(beforeB)},
+		})
+	transaction, err := connection.beginTx(
+		context.Background(), sqldriver.TxOptions{
+			Isolation: sqldriver.IsolationLevel(stdsql.LevelRepeatableRead),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection.tx = transaction
+	defer transaction.Rollback()
+	state := transaction.tables["docs"]
+	keyA, err := primaryScalarKey("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterA := []byte(`{"id":"a","selected":true,"state":"after"}`)
+	state.limits.MaxBatchBytes = len(keyA) + len(afterA)
+	update, err := query.PrepareDML(
+		`UPDATE docs SET state = ? WHERE selected = TRUE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer update.Release()
+	_, err = transaction.execMutation(update, []any{"after"})
+	if !errors.Is(err, ErrTransactionTooLarge) ||
+		!errors.Is(err, durable.ErrBatchTooLarge) ||
+		!strings.Contains(err.Error(), "would stage") {
+		t.Fatalf(
+			"byte-bounded transaction column UPDATE = %v, want early ErrTransactionTooLarge and ErrBatchTooLarge",
+			err,
+		)
+	}
+	assertEmptyTransactionPending(t, state)
+	for id, want := range map[string][]byte{
+		"a": []byte(`{"id":"a","selected":true,"state":"old"}`),
+		"b": []byte(`{"id":"b","selected":true,"state":"old"}`),
+	} {
+		key, err := primaryScalarKey(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, found, err := state.appendRaw(nil, key)
+		if err != nil || !found || string(got) != string(want) {
+			t.Fatalf("row %q after refused UPDATE = %s, found=%v, err=%v; want %s", id, got, found, err, want)
+		}
+	}
 }

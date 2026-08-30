@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"math"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -621,6 +622,19 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 		expected = append(expected, capturedPrimaryExpectation{
 			key: row[0].Bytes, digest: sha256.Sum256(row[1].Bytes),
 		})
+		replacement := bound.updateDoc
+		if bound.kind == sqlast.KindUpdate && len(bound.updateAssignments) != 0 {
+			var err error
+			replacement, err = sqldriver.ApplyColumnAssignments(
+				row[1].Bytes, bound.updateAssignments, bound.updateArgs, math.MaxInt,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"global index materialize replacement row %d: %w",
+					rowOrdinal, err,
+				)
+			}
+		}
 		for indexOrdinal := range p.writeGlobalIndexes {
 			prepared := &p.writeGlobalIndexes[indexOrdinal]
 			oldRoute, err := prepared.program.RouteDocument(row[1].Bytes, &oldWorkspace)
@@ -639,7 +653,7 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 				)
 				continue
 			}
-			newRoute, err := prepared.program.RouteDocument(bound.updateDoc, &newWorkspace)
+			newRoute, err := prepared.program.RouteDocument(replacement, &newWorkspace)
 			if err != nil {
 				return fmt.Errorf("global index %s replacement row %d: %w",
 					prepared.program.metadata.Name, rowOrdinal, err)

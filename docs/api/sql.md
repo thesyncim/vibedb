@@ -171,7 +171,7 @@ JSON documents. The source query reads the pre-statement snapshot.
 Conflict handling supports `ON CONFLICT DO NOTHING`. It does not support a
 conflict target or `DO UPDATE`.
 
-`UPDATE` replaces the complete document:
+`UPDATE` can replace the complete document:
 
 ```sql
 UPDATE docs
@@ -179,8 +179,19 @@ SET "$doc" = ?
 WHERE id = ?
 ```
 
-Partial path assignment is not supported. An update cannot change the primary
-key. A single constant replacement cannot replace several rows that have
+For tables with declared columns, `UPDATE` can instead assign scalar literals
+or placeholders to one or more top-level columns:
+
+```sql
+UPDATE employees
+SET team = ?, score = 7, note = NULL
+WHERE id = ?
+```
+
+Each matching document is updated independently, and unassigned fields are
+preserved. Nested-path targets and row-dependent assignment expressions such as
+`score = score + 1` are not supported. An update cannot change the primary key.
+A single whole-document replacement cannot replace several rows that have
 different primary keys.
 
 `UPDATE` and `DELETE` support `WHERE`, `ORDER BY`, `LIMIT`, and `RETURNING`.

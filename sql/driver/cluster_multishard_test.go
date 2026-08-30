@@ -143,6 +143,25 @@ func TestClusterMultiShardShardKeyImmutable(t *testing.T) {
 	if moved != 0 {
 		t.Fatalf("moved-key rows = %d, want 0", moved)
 	}
+
+	_, err = db.Exec(`UPDATE docs SET tenant_id = ? WHERE tenant_id = ?`,
+		diff[1], diff[0])
+	if !errors.Is(err, ErrShardKeyImmutable) {
+		t.Fatalf("column shard-key move error = %v, want ErrShardKeyImmutable", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(`UPDATE docs SET tenant_id = ? WHERE tenant_id = ?`,
+		diff[1], diff[0])
+	if !errors.Is(err, ErrShardKeyImmutable) {
+		_ = tx.Rollback()
+		t.Fatalf("transaction column shard-key move error = %v, want ErrShardKeyImmutable", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestClusterMultiShardRejectsMultiShardDeleteAndUpdate proves a placed UPDATE or

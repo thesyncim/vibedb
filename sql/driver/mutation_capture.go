@@ -187,21 +187,37 @@ func (s *stmt) captureMutationInto(
 	if err != nil {
 		return err
 	}
+	var assignments []sqlast.UpdateAssignment
 	valueBytes := 0
 	if s.mutation.Kind() == query.DMLUpdate {
-		document, documentErr := operandDocument(
-			s.mutation, s.mutation.Tree().Update.Doc, args,
-		)
-		if documentErr != nil {
-			return documentErr
+		assignments = s.mutation.Tree().Update.Assignments
+		if len(assignments) != 0 {
+			if err := validateDeclaredColumnAssignments(
+				s.mutation.Collection(), t.meta, assignments,
+			); err != nil {
+				return err
+			}
+			if err := validateColumnAssignmentBindings(assignments, args); err != nil {
+				return err
+			}
+			if err := s.conn.routeDelete(s.mutation, args); err != nil {
+				return err
+			}
+		} else {
+			document, documentErr := operandDocument(
+				s.mutation, s.mutation.Tree().Update.Doc, args,
+			)
+			if documentErr != nil {
+				return documentErr
+			}
+			if len(document) > limits.MaxDocumentBytes {
+				return durable.ErrDocumentTooLarge
+			}
+			if err := s.conn.routeUpdate(s.mutation, args, document); err != nil {
+				return err
+			}
+			valueBytes = len(document)
 		}
-		if len(document) > limits.MaxDocumentBytes {
-			return durable.ErrDocumentTooLarge
-		}
-		if err := s.conn.routeUpdate(s.mutation, args, document); err != nil {
-			return err
-		}
-		valueBytes = len(document)
 	} else if err := s.conn.routeDelete(s.mutation, args); err != nil {
 		return err
 	}
@@ -211,7 +227,7 @@ func (s *stmt) captureMutationInto(
 	if err != nil {
 		return err
 	}
-	if s.mutation.Kind() == query.DMLUpdate {
+	if s.mutation.Kind() == query.DMLUpdate && len(assignments) == 0 {
 		document, documentErr := operandDocument(
 			s.mutation, s.mutation.Tree().Update.Doc, args,
 		)
@@ -243,6 +259,67 @@ func (s *stmt) captureMutationInto(
 	defer snapshot.Close()
 	scratch := s.conn.pointRaw[:0]
 	defer func() { s.conn.pointRaw = scratch[:0] }()
+	if len(assignments) != 0 {
+		// Preflight every post-image before exposing any old row to the visitor.
+		// A later invalid replacement must not leave the caller with a prefix of
+		// a capture that cannot describe one atomic mutation.
+		stagedBytes := 0
+		var routeScratch []byte
+		for _, key := range keys {
+			if err := contextCheckpoint(ctx); err != nil {
+				return err
+			}
+			var found bool
+			scratch, found, err = snapshot.AppendRaw(
+				scratch[:0], byteview.Bytes(key),
+			)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return ErrTransactionConflict
+			}
+			replacement, err := ApplyColumnAssignments(
+				scratch, assignments, args, limits.MaxDocumentBytes,
+			)
+			if err != nil {
+				return err
+			}
+			if err := validateDocument(
+				t.schema, replacement, limits.MaxDocumentBytes,
+				&s.conn.insertTape,
+			); err != nil {
+				return err
+			}
+			routeScratch, err = s.conn.routeUpdateInto(
+				s.mutation, args, replacement, routeScratch[:0],
+			)
+			if err != nil {
+				return err
+			}
+			newKey, err := documentKey(
+				replacement, t.meta.PrimaryKey, t.primary,
+				limits.MaxKeyBytes,
+			)
+			if err != nil {
+				return err
+			}
+			if key != newKey {
+				return fmt.Errorf(
+					"%w: replacement key %q does not match selected key %q",
+					ErrUpdatePrimaryKey, newKey, key,
+				)
+			}
+			if len(key) > limits.MaxBatchBytes-stagedBytes ||
+				len(replacement) > limits.MaxBatchBytes-stagedBytes-len(key) {
+				return fmt.Errorf(
+					"vibedb: UPDATE exceeds the %d-byte mutation batch limit for table %q: %w",
+					limits.MaxBatchBytes, s.mutation.Collection(), durable.ErrBatchTooLarge,
+				)
+			}
+			stagedBytes += len(key) + len(replacement)
+		}
+	}
 	for _, key := range keys {
 		if err := contextCheckpoint(ctx); err != nil {
 			return err

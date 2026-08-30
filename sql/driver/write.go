@@ -1829,6 +1829,8 @@ func operandValueWithUTF8(
 		return operand.Bool, nil
 	case sqlast.OperandNumber:
 		return query.Number(operand.Text), nil
+	case sqlast.OperandNull:
+		return nil, nil
 	}
 	return nil, errors.New("vibedb: flat INSERT values must be JSON scalars or placeholders")
 }
@@ -2120,6 +2122,11 @@ func (c *conn) updateLockedReturning(
 	returning *query.Statement,
 	returned *query.Cursor,
 ) (sqldriver.Result, error) {
+	if assignments := statement.Tree().Update.Assignments; len(assignments) != 0 {
+		return c.updateColumnsLockedReturning(
+			ctx, statement, args, t, assignments, returning, returned,
+		)
+	}
 	limits, err := tableMutationLimits(t)
 	if err != nil {
 		return nil, err
@@ -2204,6 +2211,154 @@ func (c *conn) updateLockedReturning(
 		return nil, mutationErr
 	}
 	return result{affected: int64(len(keys))}, nil
+}
+
+func (c *conn) updateColumnsLockedReturning(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	args []any,
+	t *table,
+	assignments []sqlast.UpdateAssignment,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
+	limits, err := tableMutationLimits(t)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDeclaredColumnAssignments(
+		statement.Collection(), t.meta, assignments,
+	); err != nil {
+		return nil, err
+	}
+	if err := validateColumnAssignmentBindings(assignments, args); err != nil {
+		return nil, err
+	}
+	// A declared-column replacement is still subject to UPDATE's single-shard
+	// predicate rule even when no row matches. Each materialized document below
+	// additionally proves that the assignment did not move its shard key.
+	if err := c.routeDelete(statement, args); err != nil {
+		return nil, err
+	}
+	keys, err := c.matchingKeysLocked(
+		ctx, statement, args, t, limits, 0,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	clear(c.insertSeeds)
+	seeds := c.insertSeeds[:0]
+	defer func() {
+		clear(seeds)
+		c.insertSeeds = seeds[:0]
+	}()
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		c.pointDocs.Reset()
+	}
+	if len(keys) != 0 {
+		if t.collection == nil {
+			return nil, errors.New(
+				"vibedb: selected UPDATE keys have no materialized collection",
+			)
+		}
+		snapshot, snapshotErr := t.collection.Snapshot()
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		defer snapshot.Close()
+
+		scratch := c.pointRaw[:0]
+		defer func() { c.pointRaw = scratch[:0] }()
+		stagedBytes := 0
+		cancellable := contextCanCancel(ctx)
+		for _, key := range keys {
+			if cancellable {
+				if err := contextCheckpoint(ctx); err != nil {
+					return nil, err
+				}
+			}
+			var found bool
+			scratch, found, err = snapshot.AppendRaw(
+				scratch[:0], []byte(key),
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, ErrTransactionConflict
+			}
+			document, err := ApplyColumnAssignments(
+				scratch, assignments, args, limits.MaxDocumentBytes,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateDocument(
+				t.schema, document, limits.MaxDocumentBytes, &c.insertTape,
+			); err != nil {
+				return nil, err
+			}
+			if err := c.routeUpdate(statement, args, document); err != nil {
+				return nil, err
+			}
+			newKey, err := documentKey(
+				document, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if key != newKey {
+				return nil, fmt.Errorf(
+					"%w: replacement key %q does not match selected key %q",
+					ErrUpdatePrimaryKey, newKey, key,
+				)
+			}
+			if len(key) > limits.MaxBatchBytes-stagedBytes ||
+				len(document) > limits.MaxBatchBytes-stagedBytes-len(key) {
+				return nil, fmt.Errorf(
+					"vibedb: UPDATE exceeds the %d-byte mutation batch limit for table %q: %w",
+					limits.MaxBatchBytes, statement.Collection(), durable.ErrBatchTooLarge,
+				)
+			}
+			seeds = append(seeds, seedDocument{key: key, document: document})
+			stagedBytes += len(key) + len(document)
+			if returning != nil {
+				if _, err := c.pointDocs.Append(document); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	if returning != nil {
+		cursor, err := returning.RunInto(
+			&c.exec, query.FromSegment(&c.pointDocs), nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		*returned = cursor
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return nil, err
+	}
+	if len(seeds) == 0 {
+		return result{}, nil
+	}
+	beforeGeneration := t.collection.Generation()
+	mutationErr := putSeedsAtomic(t.collection, seeds)
+	if collectionMutationPublished(
+		t.collection, beforeGeneration, mutationErr,
+	) {
+		t.conflicts.recordKeys(keys)
+	}
+	if mutationErr != nil {
+		return nil, mutationErr
+	}
+	return result{affected: int64(len(seeds))}, nil
 }
 
 func (c *conn) deleteLocked(
