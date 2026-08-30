@@ -934,13 +934,14 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 
 func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	col := ResultColumn{Pos: p.tok.pos}
+	standaloneStar := false
 	if scalarStarts(p.tok) {
 		expr, err := p.parseScalarExpression(scalarSelect)
 		if err != nil {
 			return col, err
 		}
 		col.Scalar = expr
-		alias, err := p.parseColumnAlias()
+		alias, err := p.parseColumnAlias(true)
 		if err != nil {
 			return col, err
 		}
@@ -964,6 +965,7 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 			col.Path = path
 		}
 	} else {
+		standaloneStar = p.tok.kind == tokStar
 		switch agg, head, state := p.tryAggregate(); state {
 		case aggCall:
 			path, err := p.parseAggregateArgs(agg)
@@ -1007,7 +1009,7 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		}
 		col.Agg, col.Path, col.Scalar = AggNone, nil, expr
 	}
-	alias, err := p.parseColumnAlias()
+	alias, err := p.parseColumnAlias(!standaloneStar)
 	if err != nil {
 		return col, err
 	}
@@ -1077,20 +1079,59 @@ func (p *Parser) parseAggregateArgs(agg AggKind) (*PathExpr, error) {
 	return path, nil
 }
 
-// parseColumnAlias parses an optional AS name.
-//
-// The AS is required. SQL allows a bare identifier after a column to be its
-// output name, but here that would silently rescue the far more common typo —
-// a missing comma between two projected paths — as a rename, and a schemaless
-// engine has no schema check downstream to catch it.
-func (p *Parser) parseColumnAlias() (string, error) {
+// parseColumnAlias follows PostgreSQL's target_el grammar: AS accepts any
+// identifier, while a bare alias accepts IDENT and BareColLabel. The latter is
+// an independent keyword category; it is deliberately not this dialect's
+// reserved() classification. A standalone '*' is target_el's one separate
+// production and cannot carry either spelling of alias, while alias.* remains
+// an ordinary expression and can.
+func (p *Parser) parseColumnAlias(aliasable bool) (string, error) {
+	if !aliasable {
+		if p.atKeyword(kwAs) || p.tok.kind == tokQuotedIdent ||
+			(p.tok.kind == tokIdent && !postgresAliasRequiresAS(p.tok.text)) {
+			return "", p.errHere("a standalone '*' cannot have an output alias; qualify it as range_variable.* to name the projected document")
+		}
+		return "", nil
+	}
 	if p.acceptKeyword(kwAs) {
 		return p.parseAliasName("an output name after AS")
 	}
-	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && p.tok.kw == kwNone) {
-		return "", p.errfHere("unexpected identifier %q after a column: an output name requires AS, and two paths need a comma between them", p.tok.text)
+	if p.tok.kind == tokQuotedIdent ||
+		(p.tok.kind == tokIdent && !postgresAliasRequiresAS(p.tok.text)) {
+		return p.parseAliasName("an output name")
 	}
 	return "", nil
+}
+
+// postgresAliasRequiresAS mirrors every AS_LABEL entry in PostgreSQL 18.6's
+// src/include/parser/kwlist.h. Several spellings are intentionally not lexer
+// keywords here because reserving them would break same-named JSON fields, so
+// classification uses the original token text. The fixed stack buffer and
+// switch retain the parser's zero steady-state allocation contract.
+func postgresAliasRequiresAS(name string) bool {
+	const maxASLabelLen = 9 // CHARACTER, INTERSECT, PRECISION, RETURNING
+	if len(name) == 0 || len(name) > maxASLabelLen {
+		return false
+	}
+	var folded [maxASLabelLen]byte
+	for i := range name {
+		c := name[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		folded[i] = c
+	}
+	switch string(folded[:len(name)]) {
+	case "ARRAY", "AS", "CHAR", "CHARACTER", "CREATE", "DAY", "EXCEPT",
+		"FETCH", "FILTER", "FOR", "FROM", "GRANT", "GROUP", "HAVING",
+		"HOUR", "INTERSECT", "INTO", "ISNULL", "LIMIT", "MINUTE", "MONTH",
+		"NOTNULL", "OFFSET", "ON", "ORDER", "OVER", "OVERLAPS", "PRECISION",
+		"RETURNING", "SECOND", "TO", "UNION", "VARYING", "WHERE", "WINDOW",
+		"WITH", "WITHIN", "WITHOUT", "YEAR":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Parser) hasWindowColumns() bool {

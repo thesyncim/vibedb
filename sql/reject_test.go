@@ -149,8 +149,6 @@ func TestRejectsAmbiguousOrUnresolvablePaths(t *testing.T) {
 			`SELECT a[?] FROM t`, 9, "cannot be a subscript"},
 		{"a negative subscript",
 			`SELECT a[-1] FROM t`, 9, "non-negative integer"},
-		{"an output name needs AS",
-			`SELECT a b FROM t`, 9, "requires AS"},
 		{"an aggregate takes one path",
 			`SELECT COUNT(a, b) FROM t`, 14, "exactly one path"},
 		{"SUM has no star form",

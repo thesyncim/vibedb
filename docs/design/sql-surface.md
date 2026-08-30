@@ -63,6 +63,9 @@ A FROM-less query is valid when no expression needs a row source.
 
 Top-level `ORDER BY` accepts a projected path, output alias, or 1-based output
 position. Project and name a general scalar expression before you order by it.
+Output aliases accept both `expression AS name` and PostgreSQL's
+`expression name` spelling. A standalone `*` cannot be aliased; qualify it as
+`range_variable.*` when the projected document needs a name.
 
 Top-level `NULLS FIRST`, `NULLS LAST`, `COLLATE`, and `FETCH FIRST` are not
 supported. Ascending top-level order puts null and missing values first.
