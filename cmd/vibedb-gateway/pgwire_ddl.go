@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,42 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 		tree, err := sqlast.ParseStatement(text)
 		if err != nil {
 			return err
+		}
+		if tree.DropTable != nil {
+			if schema == nil {
+				return sqlast.NewFeatureNotSupportedError(text, 0, "distributed table retirement is unavailable")
+			}
+			if err = schema.DropTable(ctx, tree.DropTable.Table, tree.DropTable.IfExists); err != nil {
+				return err
+			}
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancelCleanup()
+			request, requestErr := http.NewRequestWithContext(cleanupCtx, http.MethodPost, "http://dev/drop-table", strings.NewReader(text))
+			if requestErr != nil {
+				fmt.Fprintf(os.Stderr, "committed DROP TABLE cleanup deferred table=%q: %v\n", tree.DropTable.Table, requestErr)
+				return nil
+			}
+			response, requestErr := client.Do(request)
+			if requestErr != nil {
+				fmt.Fprintf(os.Stderr, "committed DROP TABLE cleanup deferred table=%q: %v\n", tree.DropTable.Table, requestErr)
+				return nil
+			}
+			defer response.Body.Close()
+			raw, readErr := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
+			if readErr != nil {
+				fmt.Fprintf(os.Stderr, "committed DROP TABLE cleanup response unreadable table=%q: %v\n", tree.DropTable.Table, readErr)
+				return nil
+			}
+			if response.StatusCode != http.StatusNoContent {
+				fmt.Fprintf(os.Stderr, "committed DROP TABLE cleanup deferred table=%q status=%s: %s\n",
+					tree.DropTable.Table, response.Status, strings.TrimSpace(string(raw)))
+				return nil
+			}
+			if confirmErr := authority.ConfirmProvisionedTableRetirement(cleanupCtx, tree.DropTable.Table); confirmErr != nil {
+				fmt.Fprintf(os.Stderr, "committed DROP TABLE cleanup confirmation deferred table=%q: %v\n",
+					tree.DropTable.Table, confirmErr)
+			}
+			return nil
 		}
 		if tree.CreateTable == nil {
 			if schema == nil {

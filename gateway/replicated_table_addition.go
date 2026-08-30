@@ -76,6 +76,17 @@ func BuildReplicatedTableAddition(current, addition *Snapshot) (*Snapshot, error
 	}
 	profile := addition.replicatedTableProfiles()[0]
 	placement := addition.config.Placements[0]
+	if current.tableRetirement != nil && (current.tableRetirement.Table == profile.Table ||
+		current.tableRetirement.Distribution == placement.Distribution) {
+		// A supervisor restart may still present the immutable provision fragment
+		// while physical cleanup is pending. Treat that exact stale registration
+		// as already retired; never republish its route.
+		if current.tableRetirement.Table == profile.Table &&
+			current.tableRetirement.Distribution == placement.Distribution {
+			return current, nil
+		}
+		return nil, &CatalogError{Reason: "table addition conflicts with pending retirement cleanup"}
+	}
 	for _, existing := range current.replicatedTableProfiles() {
 		if existing.Table != profile.Table {
 			continue

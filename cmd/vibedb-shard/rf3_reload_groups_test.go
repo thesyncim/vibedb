@@ -121,3 +121,86 @@ func TestRF3ReloadOnlyAppendsIndependentPreparedGroups(t *testing.T) {
 		}
 	}
 }
+
+func TestRF3GroupTransitionAcceptsExactNonPrimaryRetirement(t *testing.T) {
+	base, err := parseRF3Manifest([]byte(canonicalRF3Manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := base.groupBundles()[0]
+	second.Route.Group.GroupID[0]++
+	second.WAL.Path += "-second"
+	second.SQL.Path += "-second"
+	current := base
+	current.Groups = append(base.groupBundles(), second)
+	next := current
+	next.Groups = next.Groups[:1]
+	if err := validateRF3GroupTransition(current, next); err != nil {
+		t.Fatalf("exact retirement refused: %v", err)
+	}
+	wrong := current
+	wrong.Groups = []rf3ManifestGroup{second}
+	if err := validateRF3GroupTransition(current, wrong); err == nil {
+		t.Fatal("retirement replaced the process primary group")
+	}
+	changed := next
+	changed.Groups = append([]rf3ManifestGroup(nil), next.Groups...)
+	changed.Groups[0].SQL.Path += "-changed"
+	if err := validateRF3GroupTransition(current, changed); err == nil {
+		t.Fatal("retirement changed a retained group")
+	}
+}
+
+func TestRF3RetirementReopenAcceptsRetainedPredecessorManifest(t *testing.T) {
+	root := t.TempDir()
+	currentRaw := []byte(strings.ReplaceAll(multiGroupRF3Manifest(t), "/srv/vibedb", root))
+	current, err := parseRF3Manifest(currentRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRaw := []byte(strings.ReplaceAll(canonicalRF3Manifest, "/srv/vibedb", root))
+	next, err := parseRF3Manifest(nextRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = validateRF3GroupTransition(current, next); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := openRF3AdoptedGroupInventory(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = inventory.Close(); err != nil {
+		t.Fatal(err)
+	}
+	admissions, _, err := openRF3ChildAdmissionStore(root, current.Digest, current.SplitControl.operationLimit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = admissions.Close(); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, "prepared-manifests")
+	if err = os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(directory, hex.EncodeToString(current.Digest[:])+".vibejson"), currentRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		reopened, openErr := openRF3AdoptedGroupInventory(next)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		if closeErr := reopened.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		admissions, _, openErr = openRF3ChildAdmissionStore(root, next.Digest, next.SplitControl.operationLimit(), next)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		if closeErr := admissions.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+	}
+}

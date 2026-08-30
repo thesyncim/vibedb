@@ -28,11 +28,26 @@ type devTableInventory struct {
 }
 type devTableProvision struct {
 	Table            string    `json:"table"`
+	Distribution     string    `json:"distribution,omitempty"`
 	PrimaryKey       string    `json:"primary_key"`
 	CreateTable      string    `json:"create_table"`
 	GroupID          string    `json:"group_id"`
 	ShardIncarnation string    `json:"shard_incarnation"`
 	Stores           [3]string `json:"stores"`
+}
+
+func (table devTableProvision) distribution() string {
+	if table.Distribution != "" {
+		return table.Distribution
+	}
+	return "table-" + table.Table
+}
+
+func (table devTableProvision) artifactStem() string {
+	if table.Distribution == "" {
+		return "table-" + table.Table
+	}
+	return "table-" + table.Table + "-" + table.GroupID[:12]
 }
 
 func parseDevTableDDL(source string) (string, string, error) {
@@ -108,6 +123,10 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 			if err != nil {
 				return err
 			}
+			// A retired physical identity is never reused. Keeping the random
+			// group suffix in the distribution name also prevents stale route
+			// caches from aliasing a later table with the same SQL name.
+			table.Distribution = "table-" + name + "-" + table.GroupID[:12]
 			table.ShardIncarnation, err = devRandomIdentity()
 			if err != nil {
 				return err
@@ -152,7 +171,8 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 	seen := make(map[string]bool, len(inventory.Tables))
 	for _, table := range inventory.Tables {
 		name, primary, err := parseDevTableDDL(table.CreateTable)
-		if err != nil || name != table.Table || primary != table.PrimaryKey || seen[name] {
+		if err != nil || name != table.Table || primary != table.PrimaryKey || seen[name] ||
+			table.Distribution != "" && table.Distribution != "table-"+table.Table+"-"+table.GroupID[:min(12, len(table.GroupID))] {
 			return errors.Join(errDevCluster, err)
 		}
 		seen[name] = true
@@ -163,7 +183,7 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		for i, member := range members {
 			groups[i] = append(groups[i], member.ServeManifest)
 		}
-		path := filepath.Join(root, "table-"+name+"-catalog.vibejson")
+		path := filepath.Join(root, table.artifactStem()+"-catalog.vibejson")
 		if raw, err := readDevFile(path, 4<<20); err == nil {
 			addition, err := gateway.OpenReplicatedTableProvision(raw)
 			if err != nil {
@@ -173,13 +193,16 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 			if len(declarations) != 1 || declarations[0].CreateTable != table.CreateTable || len(descriptors) != 1 || descriptors[0].Group != group {
 				return errDevCluster
 			}
+			if err := replaceDevFile(filepath.Join(root, "table-"+name+"-catalog.vibejson"), raw); err != nil {
+				return err
+			}
 			cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		endpoints := make(map[distribution.EndpointID]string)
-		dist := distribution.DistributionName("table-" + name)
+		dist := distribution.DistributionName(table.distribution())
 		// Endpoint names identify physical nodes, not tables. Reuse the data
 		// nodes' provisioned capacity and topology identity for every group.
 		route, err := inspectDevPreparedRoute(endpoints, "data", dist, "all", name, primary, group, replication.Digest{}, true, members)
@@ -209,6 +232,9 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		if err := writeDevFileOnce(path, provision); err != nil {
 			return err
 		}
+		if err := replaceDevFile(filepath.Join(root, "table-"+name+"-catalog.vibejson"), provision); err != nil {
+			return err
+		}
 		cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
 	}
 	for i, paths := range groups {
@@ -226,6 +252,48 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		cluster.dataServeManifests = append(cluster.dataServeManifests, path)
 	}
 	return nil
+}
+
+// retireDevTable removes only the supervisor's active inventory reference.
+// WAL and SQL directories remain as orphaned recovery evidence; a separate
+// bounded GC may reclaim them after operators no longer need rollback data.
+func retireDevTable(root, shardBinary string, cluster *devClusterManifest, table string) (bool, error) {
+	path := filepath.Join(root, "tables.vibejson")
+	raw, err := readDevFile(path, 4<<20)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var inventory devTableInventory
+	if err = vibejson.Unmarshal(raw, &inventory); err != nil {
+		return false, err
+	}
+	removed := false
+	next := inventory.Tables[:0]
+	for _, candidate := range inventory.Tables {
+		if candidate.Table == table {
+			removed = true
+			continue
+		}
+		next = append(next, candidate)
+	}
+	if !removed {
+		return false, nil
+	}
+	inventory.Tables = next
+	raw, err = vibejson.Marshal(&inventory)
+	if err != nil {
+		return false, err
+	}
+	if err = replaceDevFile(path, raw); err != nil {
+		return false, err
+	}
+	if err = ensureDevTables(root, shardBinary, cluster, ""); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // The certified-child inventory is bound to the exact manifest bytes at its
@@ -256,6 +324,16 @@ func retainDevGroupInventoryManifest(root string, paths []string) error {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	// The currently published multigroup manifest is the exact predecessor
+	// for both append and retirement transitions. Prefer it over reconstructing
+	// prefixes, which cannot represent removal of a middle group.
+	if current, currentErr := readDevFile(filepath.Join(root, "serve-multigroup.vibejson"), 4<<20); currentErr == nil {
+		if sha256.Sum256(current) == expected {
+			return writeDevFileOnce(target, current)
+		}
+	} else if !errors.Is(currentErr, os.ErrNotExist) {
+		return currentErr
 	}
 	for count := 1; count <= len(paths); count++ {
 		var raw []byte
@@ -303,14 +381,14 @@ func prepareDevTable(root, binary string, cluster devClusterManifest, table devT
 			return nil, group, err
 		}
 		group = raftmember.GroupKey{ClusterID: clusterID, ClusterIncarnation: incarnation, TopologyRecoveryEpoch: prepare.TopologyRecoveryEpoch, GroupID: groupID, ShardIncarnation: shardID}
-		prepare.Root = filepath.Join(root, fmt.Sprintf("table-%s-member-%d", table.Table, i+1))
+		prepare.Root = filepath.Join(root, fmt.Sprintf("%s-member-%d", table.artifactStem(), i+1))
 		prepare.Table, prepare.CreateTable, prepare.Apply.ShardKey = table.Table, table.CreateTable, table.PrimaryKey
-		prepare.Distribution, prepare.Shard = "table-"+table.Table, "all"
+		prepare.Distribution, prepare.Shard = table.distribution(), "all"
 		prepare.GroupID, prepare.ShardIncarnation, prepare.StoreID = table.GroupID, table.ShardIncarnation, table.Stores[i]
 		if _, err := decodeDev16(prepare.StoreID); err != nil {
 			return nil, group, err
 		}
-		path := filepath.Join(root, fmt.Sprintf("prepare-table-%s-member-%d.vibejson", table.Table, i+1))
+		path := filepath.Join(root, fmt.Sprintf("prepare-%s-member-%d.vibejson", table.artifactStem(), i+1))
 		raw, err = vibejson.Marshal(&prepare)
 		if err != nil {
 			return nil, group, err

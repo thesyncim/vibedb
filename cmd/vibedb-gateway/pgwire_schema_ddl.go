@@ -27,6 +27,7 @@ import (
 
 var gatewaySchemaDDLOperationDomain = []byte("vibedb/gateway/pgwire-schema-ddl-operation/2\x00")
 var gatewaySchemaDDLReleasedPinsDomain = []byte("vibedb/gateway/pgwire-schema-ddl-released-pins/1\x00")
+var gatewayTableDropOperationDomain = []byte("vibedb/gateway/pgwire-table-drop-operation/1\x00")
 
 type gatewaySchemaDDLRuntime struct {
 	authority *gateway.ReplicatedCatalogAuthority
@@ -278,6 +279,30 @@ func gatewaySchemaDDLOperation(snapshot *gateway.Snapshot, table, sql string) ([
 	_, _ = h.Write([]byte(table))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(sql))
+	var result [32]byte
+	h.Sum(result[:0])
+	return result, nil
+}
+
+func gatewayTableDropOperation(snapshot *gateway.Snapshot, table string) ([32]byte, error) {
+	placement, found := snapshot.Placement(table)
+	if !found {
+		return [32]byte{}, gateway.ErrSchemaRollout
+	}
+	h := sha256.New()
+	_, _ = h.Write(gatewayTableDropOperationDomain)
+	_, _ = h.Write([]byte(placement.Distribution))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(table))
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		if descriptor.Distribution != placement.Distribution {
+			continue
+		}
+		_, _ = h.Write(descriptor.Group.ClusterID[:])
+		_, _ = h.Write(descriptor.Group.ClusterIncarnation[:])
+		_, _ = h.Write(descriptor.Group.ShardIncarnation[:])
+		_, _ = h.Write(descriptor.Group.GroupID[:])
+	}
 	var result [32]byte
 	h.Sum(result[:0])
 	return result, nil
@@ -559,6 +584,72 @@ func (r *gatewaySchemaDDLRuntime) Recover(ctx context.Context) error {
 		if executeErr := r.Execute(ctx, sql); executeErr != nil {
 			return fmt.Errorf("resume schema operation %x: %w", operation, executeErr)
 		}
+	}
+	return r.recoverRetainedTableDrop(ctx)
+}
+
+func (r *gatewaySchemaDDLRuntime) recoverRetainedTableDrop(ctx context.Context) error {
+	entries, err := os.ReadDir(r.journal)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	const maxRetainedSchemaOperations = 4096
+	if len(entries) > maxRetainedSchemaOperations {
+		return gateway.ErrSchemaRolloutConflict
+	}
+	retained := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && len(entry.Name()) == sha256.Size*2 {
+			retained[entry.Name()] = struct{}{}
+		}
+	}
+	current, err := r.authority.Read(ctx)
+	if err != nil {
+		return err
+	}
+	for _, profile := range current.ReplicatedTableProfiles() {
+		operation, operationErr := gatewayTableDropOperation(current, profile.Table)
+		if operationErr != nil {
+			return operationErr
+		}
+		if _, found := retained[hex.EncodeToString(operation[:])]; !found {
+			continue
+		}
+		placement, found := current.Placement(profile.Table)
+		if !found {
+			continue
+		}
+		fenced := false
+		for _, descriptor := range current.ReplicatedShardDescriptors() {
+			if descriptor.Distribution != placement.Distribution {
+				continue
+			}
+			var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+			route, ok := current.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, replicas[:0])
+			if !ok {
+				return gateway.ErrReplicatedRoute
+			}
+			observed, readErr := r.executor.ReadRouteGate(ctx, route, 1)
+			if readErr != nil {
+				return readErr
+			}
+			identity, binding := gatewaySchemaDDLGateIdentity(operation, route.Group)
+			drain := observed.Status.Drain
+			if (drain.State == routegate.DrainPending || drain.State == routegate.DrainActive) &&
+				drain.Identity == identity && drain.Binding == binding {
+				fenced = true
+			}
+		}
+		if !fenced {
+			continue
+		}
+		if dropErr := r.DropTable(ctx, profile.Table, false); dropErr != nil {
+			return fmt.Errorf("resume table retirement %q: %w", profile.Table, dropErr)
+		}
+		return nil
 	}
 	return nil
 }
@@ -956,5 +1047,70 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 	if err = controller.Drain(ctx, plans, result.Authorization, proof); err != nil {
 		return fmt.Errorf("drain distributed schema predecessors: %w", err)
 	}
+	return nil
+}
+
+// DropTable cuts one independently provisioned table out of the replicated
+// namespace. It reuses the schema traffic gate, but unlike ALTER/TRUNCATE it
+// has no target data image: the certified catalog removal is the commit point.
+func (r *gatewaySchemaDDLRuntime) DropTable(ctx context.Context, table string, ifExists bool) (resultErr error) {
+	if r == nil || ctx == nil || table == "" {
+		return gateway.ErrSchemaRollout
+	}
+	ctx, err := serviceauthz.WithAuthority(ctx, r.principal)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, err := r.authority.Read(ctx)
+	if err != nil {
+		return err
+	}
+	placement, found := current.Placement(table)
+	if !found {
+		if ifExists {
+			return nil
+		}
+		return fmt.Errorf("%w: %s", sqldriver.ErrTableNotFound, table)
+	}
+	operation, err := gatewayTableDropOperation(current, table)
+	if err != nil {
+		return err
+	}
+	gates := make([]gatewaySchemaDDLGate, 0, 1)
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		for index := len(gates) - 1; index >= 0; index-- {
+			resultErr = errors.Join(resultErr, r.releaseGate(releaseCtx, operation, gates[index], current))
+		}
+	}()
+	for _, descriptor := range current.ReplicatedShardDescriptors() {
+		if descriptor.Distribution != placement.Distribution {
+			continue
+		}
+		var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		route, ok := current.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, replicas[:0])
+		if !ok || route.Group != descriptor.Group {
+			return gateway.ErrReplicatedRoute
+		}
+		gate, acquireErr := r.acquireGate(ctx, operation, route)
+		if acquireErr != nil {
+			return acquireErr
+		}
+		gates = append(gates, gate)
+	}
+	if len(gates) == 0 {
+		return gateway.ErrReplicatedRoute
+	}
+	if err = r.authority.RetireProvisionedTable(ctx, table, operation); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }

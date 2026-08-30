@@ -109,6 +109,7 @@ type Snapshot struct {
 	replicatedReplicas             []ReplicatedEndpoint
 	replicatedTables               []replicatedCatalogTable
 	replicatedTableDeclarations    []replicatedTableDeclaration
+	tableRetirement                *replicatedTableRetirement
 	durableRequestLedgerTopology   *DurableRequestLedgerTopology
 	indexLineage                   []plannerIndexLineageRef
 	shardLineage                   []plannerShardLineageRef
@@ -1042,6 +1043,7 @@ type persistedCatalog struct {
 	Endpoints        []persistedEndpoint                    `json:"endpoints"`
 	ReplicatedShards []persistedReplicatedShard             `json:"replicated_shards,omitempty"`
 	ReplicatedTables []persistedReplicatedTable             `json:"replicated_tables,omitempty"`
+	TableRetirement  *persistedReplicatedTableRetirement    `json:"table_retirement,omitempty"`
 	RequestLedger    *persistedDurableRequestLedgerTopology `json:"request_ledger,omitempty"`
 	Lineage          *persistedCatalogLineage               `json:"lineage,omitempty"`
 }
@@ -1154,6 +1156,7 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	pc.Statistics = s.statistics.Descriptors()
 	pc.ReplicatedShards = persistedReplicatedDescriptors(s.replicatedDescriptors())
 	pc.ReplicatedTables = persistedReplicatedTableProfiles(s.replicatedTableProfiles())
+	pc.TableRetirement = persistedReplicatedTableRetirementFromSnapshot(s)
 	for i := range pc.ReplicatedTables {
 		for _, declaration := range s.replicatedTableDeclarations {
 			if pc.ReplicatedTables[i].Table == declaration.declaration.Table {
@@ -1537,6 +1540,9 @@ func decodeSnapshotBytes(raw []byte) (*Snapshot, error) {
 		pc.replicatedTableDeclarations(),
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := snapshot.attachPersistedReplicatedTableRetirement(pc.TableRetirement); err != nil {
 		return nil, err
 	}
 	if err := snapshot.attachPersistedDurableRequestLedgerTopology(pc.RequestLedger); err != nil {

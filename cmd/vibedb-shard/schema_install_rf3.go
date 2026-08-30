@@ -37,12 +37,13 @@ type rf3SchemaArtifactSource interface {
 }
 
 type rf3SchemaGeneration struct {
-	mu      sync.Mutex
-	path    string
-	wal     *raftstore.Store
-	base    sqldriver.ReplicatedShardStoreIdentity
-	applyID sqldriver.ReplicatedApplyIdentity
-	apply   *sqldriver.ReplicatedApply
+	mu       sync.Mutex
+	identity raftmember.RuntimeIdentity
+	path     string
+	wal      *raftstore.Store
+	base     sqldriver.ReplicatedShardStoreIdentity
+	applyID  sqldriver.ReplicatedApplyIdentity
+	apply    *sqldriver.ReplicatedApply
 	// Closed after staging: retains only the opaque image audit/target proof,
 	// never open files. Process recovery may reconstruct it by auditing again.
 	verified *sqldriver.VerifiedReplicatedSchemaTarget
@@ -78,9 +79,9 @@ func rf3SchemaTransitionAuthority(request schemainstall.Request,
 }
 
 func newRF3SchemaActivator(
-	owners rf3SchemaOwner, groups []preparedRF3Group,
+	owners rf3SchemaOwner, groups []preparedRF3Group, identities []raftmember.RuntimeIdentity,
 ) (*rf3SchemaActivator, error) {
-	if owners == nil || len(groups) == 0 {
+	if owners == nil || len(groups) == 0 || len(groups) != len(identities) {
 		return nil, errRF3Serving
 	}
 	result := &rf3SchemaActivator{owners: owners,
@@ -95,7 +96,10 @@ func newRF3SchemaActivator(
 		if _, exists := result.groups[group]; exists {
 			return nil, errRF3Serving
 		}
-		result.groups[group] = &rf3SchemaGeneration{path: item.manifest.SQL.Path,
+		if identities[i].Group != group {
+			return nil, errRF3Serving
+		}
+		result.groups[group] = &rf3SchemaGeneration{identity: identities[i], path: item.manifest.SQL.Path,
 			wal: item.wal, base: item.base.Clone(), applyID: item.applyIdentity,
 			apply: item.apply}
 	}
