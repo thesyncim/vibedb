@@ -10,8 +10,8 @@ import (
 
 func TestScalarCastSQLStatesMetadataFormatsAndRecovery(t *testing.T) {
 	c := connect(t)
-	messages := c.query(`SELECT CAST('1.25' AS NUMERIC) AS n, CAST('yes' AS BOOLEAN) AS b,
-		CAST('{"x":1}' AS JSON) AS j, CAST(12 AS TEXT) AS t FROM users WHERE id = 1`)
+	messages := c.query(`SELECT CAST('1.25' AS NUMERIC) AS n, 'yes'::BOOLEAN AS b,
+		CAST('{"x":1}' AS JSON) AS j, 12::TEXT AS t FROM users WHERE id = 1`)
 	description := decodeRowDescription(t, find(t, messages, msgRowDescription).body)
 	if len(description) != 4 || description[0].oid != oidJSON || description[1].oid != oidBool ||
 		description[2].oid != oidJSON || description[3].oid != oidText {
@@ -33,7 +33,7 @@ func TestScalarCastSQLStatesMetadataFormatsAndRecovery(t *testing.T) {
 		{`SELECT CAST('1e999999999999999999999' AS NUMERIC) FROM users`, sqlstateNumericValueOutOfRange},
 		{`SELECT CAST(true AS NUMERIC) FROM users`, sqlstateDatatypeMismatch},
 		{`SELECT CAST(id AS jsonb) FROM users`, sqlstateFeatureNotSupported},
-		{`SELECT id::text FROM users`, sqlstateFeatureNotSupported},
+		{`SELECT id::jsonb FROM users`, sqlstateFeatureNotSupported},
 	} {
 		fields := expectError(t, c.query(test.sql), test.code)
 		if fields['P'] == "" {
@@ -44,7 +44,7 @@ func TestScalarCastSQLStatesMetadataFormatsAndRecovery(t *testing.T) {
 		}
 	}
 
-	messages = extendedSQL(c, `SELECT CAST($1 AS BOOLEAN) FROM users WHERE id = 1`, [][]byte{[]byte("Tr")})
+	messages = extendedSQL(c, `SELECT $1::BOOLEAN FROM users WHERE id = 1`, [][]byte{[]byte("Tr")})
 	description = decodeRowDescription(t, find(t, messages, msgRowDescription).body)
 	if len(description) != 1 || description[0].oid != oidBool {
 		t.Fatalf("extended CAST RowDescription = %+v", description)
@@ -54,7 +54,7 @@ func TestScalarCastSQLStatesMetadataFormatsAndRecovery(t *testing.T) {
 		t.Fatalf("extended CAST rows = %q", rows)
 	}
 
-	c.send(msgParse, parseMsg("cast_bool", `SELECT CAST('off' AS BOOLEAN) FROM users WHERE id = 1`))
+	c.send(msgParse, parseMsg("cast_bool", `SELECT 'off'::BOOLEAN FROM users WHERE id = 1`))
 	c.send(msgBind, bindMsg("cast_bool_portal", "cast_bool", nil, nil, []int16{formatBinary}))
 	c.send(msgDescribe, describeMsg(targetPortal, "cast_bool_portal"))
 	c.send(msgExecute, executeMsg("cast_bool_portal", 0))

@@ -78,7 +78,7 @@ Supported forms include:
 - String concatenation `||`
 - Unary `+` and `-`
 - `CASE`
-- `CAST` to `TEXT`, `BOOLEAN`, `NUMERIC`, and `JSON`
+- `CAST` and PostgreSQL `::` casts to `TEXT`, `BOOLEAN`, `NUMERIC`, and `JSON`
 - JSON paths and nonnegative array subscripts
 - Quoted identifiers
 - The whole-document path
@@ -91,8 +91,8 @@ Supported predicates include comparison operators, `IN`, `NOT IN`,
 Boolean operators, `EXISTS`, and scalar-subquery comparisons.
 
 Unsupported forms include regular-expression operators, `LIKE ... ESCAPE`,
-PostgreSQL `::` casts, general scalar function calls, named parser parameters,
-and negative array subscripts.
+general scalar function calls, named parser parameters, cast type modifiers,
+cast arrays, and negative array subscripts.
 
 The parser itself uses `?` placeholders. Pgwire rewrites `$n` placeholders
 before parse.
@@ -163,10 +163,14 @@ be on the preserved side of a left join.
 
 The local runtime supports `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS` joins.
 It supports arbitrary `ON` predicates, composite `USING`, chained joins,
-derived tables, and explicit `LATERAL`.
+derived tables, explicit `LATERAL`, and comma-separated `FROM` items. A comma
+item lowers to the same cross-product plan as `CROSS JOIN`.
 
-It does not support `NATURAL JOIN`, comma joins, `ON` or `USING` on a cross
-join, or `JOIN LATERAL ... USING`.
+PostgreSQL binds explicit `JOIN` more tightly than comma. The flat join AST
+does not yet represent an explicit join tree on the right of a comma, so forms
+such as `FROM a, b JOIN c ON ...` return `0A000` instead of being flattened
+with incorrect `ON` scope or outer-join multiplicity. It also does not support
+`NATURAL JOIN`, `ON` or `USING` on a cross join, or `JOIN LATERAL ... USING`.
 
 Cross-table execution needs a coherent catalog source. A single collection
 source cannot resolve another relation.

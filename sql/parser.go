@@ -1936,9 +1936,41 @@ func (p *Parser) parseFrom() error {
 	if err != nil {
 		return err
 	}
-	p.from = append(p.from, ref)
-	p.out.From = p.from
+	if err := p.appendFromRef(ref); err != nil {
+		return err
+	}
+	// PostgreSQL's grammar gives explicit JOIN tighter binding than the comma
+	// in a from_list. The flat public AST can represent a comma after a complete
+	// joined table exactly, and a comma-only tail exactly, because both lower to
+	// the existing condition-free CROSS product. It cannot yet represent the
+	// right-hand join tree in `a, b JOIN c ON ...` without changing ON scope (or
+	// RIGHT/FULL unmatched-row multiplicity), so retain that boundary and refuse
+	// the mixed tail below rather than silently building `(a CROSS b) JOIN c`.
+	afterCommaItem := false
 	for {
+		if p.tok.kind == tokComma {
+			p.advance()
+			ref, err = p.parseTableRef(JoinCross)
+			if err != nil {
+				return err
+			}
+			if p.correlation != nil {
+				if err := p.rejectLateralForwardAlias(ref.Alias, len(p.from)); err != nil {
+					return err
+				}
+			}
+			if err := p.appendFromRef(ref); err != nil {
+				return err
+			}
+			afterCommaItem = true
+			continue
+		}
+		if afterCommaItem && p.startsExplicitJoin() {
+			return newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"an explicit JOIN after a comma-separated FROM item requires PostgreSQL's right-hand join grouping, which is not supported yet; put the joined tables in a derived SELECT or write an equivalent explicit join tree",
+			)
+		}
 		done, err := p.parseJoin()
 		if err != nil {
 			return err
@@ -1948,6 +1980,21 @@ func (p *Parser) parseFrom() error {
 			return nil
 		}
 	}
+}
+
+func (p *Parser) startsExplicitJoin() bool {
+	return p.atKeyword(kwJoin) || p.atKeyword(kwInner) ||
+		p.atKeyword(kwLeft) || p.atKeyword(kwRight) ||
+		p.atKeyword(kwFull) || p.atKeyword(kwCross)
+}
+
+func (p *Parser) appendFromRef(ref TableRef) error {
+	p.from = append(p.from, ref)
+	p.out.From = p.from
+	if len(p.from) > maxClauseItems {
+		return p.errfAt(ref.Pos, "a statement may join at most %d collections", maxClauseItems)
+	}
+	return nil
 }
 
 // parseJoin parses one JOIN clause, reporting true when the next token does not
@@ -1973,9 +2020,6 @@ func (p *Parser) parseJoin() (bool, error) {
 			p.lx.src, p.tok.pos,
 			"NATURAL JOIN is not supported: schemaless documents have no declared columns to infer faithfully; write USING explicitly or write ON explicitly",
 		)
-	}
-	if p.tok.kind == tokComma {
-		return false, p.errHere("comma-separated FROM items are not supported; write an explicit JOIN ... ON")
 	}
 	if join == JoinInner {
 		p.acceptKeyword(kwInner)
@@ -2018,12 +2062,7 @@ func (p *Parser) parseJoin() (bool, error) {
 		return false, err
 	}
 	ref.On = cond
-	p.from = append(p.from, ref)
-	p.out.From = p.from
-	if len(p.from) > maxClauseItems {
-		return false, p.errfAt(ref.Pos, "a statement may join at most %d collections", maxClauseItems)
-	}
-	return false, nil
+	return false, p.appendFromRef(ref)
 }
 
 // parseJoinCondWithCurrent exposes the relation currently being joined while

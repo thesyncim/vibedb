@@ -67,7 +67,7 @@ func TestDatabaseSQLScalarCastMetadataValuesPreparedErrorsAndRecovery(t *testing
 		}
 	}
 
-	prepared, err := db.Prepare(`SELECT CAST(? AS BOOLEAN) FROM cast_docs`)
+	prepared, err := db.Prepare(`SELECT ?::BOOLEAN FROM cast_docs`)
 	if err != nil {
 		t.Fatal(err)
 	}

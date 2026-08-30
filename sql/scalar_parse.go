@@ -124,9 +124,11 @@ func (p *Parser) parseScalarBinary(
 	var err error
 	if left == nil {
 		left, err = p.parseScalarUnary(ctx)
-		if err != nil {
-			return nil, err
-		}
+	} else {
+		left, err = p.parseScalarTypecasts(left)
+	}
+	if err != nil {
+		return nil, err
 	}
 	for {
 		if p.tok.kind == tokJSONText {
@@ -149,12 +151,6 @@ func (p *Parser) parseScalarBinary(
 			node.Cast, node.Left, node.TargetPos = ScalarCastText, left, pos
 			left = node
 			continue
-		}
-		if p.tok.kind == tokDoubleColon {
-			return nil, newFeatureNotSupportedError(
-				p.lx.src, p.tok.pos,
-				"the PostgreSQL :: cast shorthand is not supported; use CAST(expression AS type)",
-			)
 		}
 		op, precedence, pos, embedded := scalarBinaryToken(p.tok)
 		if precedence < minimum {
@@ -208,7 +204,11 @@ func (p *Parser) parseScalarUnary(ctx scalarExprContext) (*ScalarExpr, error) {
 	state.depth++
 	defer func() { state.depth-- }()
 	if p.tok.kind != tokPlus && p.tok.kind != tokMinus {
-		return p.parseScalarPrimary(ctx)
+		left, err := p.parseScalarPrimary(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return p.parseScalarTypecasts(left)
 	}
 	pos, op := p.tok.pos, ScalarPositive
 	if p.tok.kind == tokMinus {
@@ -222,6 +222,46 @@ func (p *Parser) parseScalarUnary(ctx scalarExprContext) (*ScalarExpr, error) {
 	node := p.newScalar(ScalarUnary, pos)
 	node.Op, node.Left = op, child
 	return node, nil
+}
+
+// parseScalarTypecasts implements PostgreSQL's highest-precedence TYPECAST
+// production. PostgreSQL 18.6 gram.y places TYPECAST above UMINUS and defines
+// it as `a_expr TYPECAST Typename`, so casts chain left-to-right and bind before
+// unary signs and every arithmetic operator. Keeping the wrappers in the
+// parser-owned scalar arena adds no per-parse or execution allocation.
+func (p *Parser) parseScalarTypecasts(left *ScalarExpr) (*ScalarExpr, error) {
+	for depth := 0; p.tok.kind == tokDoubleColon; depth++ {
+		if depth >= maxExprDepth {
+			return nil, p.errHere("a scalar expression may nest at most 64 levels")
+		}
+		pos := p.tok.pos
+		p.advance()
+		targetPos := p.tok.pos
+		if p.tok.kind != tokIdent {
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, targetPos,
+				":: requires one supported unquoted target: TEXT, BOOLEAN, NUMERIC, DECIMAL, or JSON",
+			)
+		}
+		target, ok := scalarCastTargetOf(p.tok.text)
+		if !ok {
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, targetPos,
+				"cast target "+p.tok.text+" is not supported; use TEXT, BOOLEAN, NUMERIC, DECIMAL, or JSON",
+			)
+		}
+		p.advance()
+		if p.tok.kind == tokLParen || p.tok.kind == tokLBracket || p.tok.kind == tokDot {
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"cast type modifiers, arrays, collations, and qualified targets are not supported",
+			)
+		}
+		node := p.newScalar(ScalarCast, pos)
+		node.Cast, node.Left, node.TargetPos = target, left, targetPos
+		left = node
+	}
+	return left, nil
 }
 
 func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) {

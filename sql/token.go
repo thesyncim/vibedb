@@ -36,7 +36,7 @@ const (
 	tokSlash
 	tokPercent
 	tokConcat      // ||
-	tokDoubleColon // ::, retained so the unsupported shorthand is typed 0A000
+	tokDoubleColon // ::, PostgreSQL's left-chaining postfix cast operator
 	tokJSONArrow   // ->, constant JSON path segment
 	tokJSONText    // ->>, terminal JSON path segment returned as text
 )
