@@ -897,7 +897,9 @@ func statementParamKinds(statement *sqlast.Statement) []ParamKind {
 			}
 		}
 	case sqlast.KindUpdate:
-		markDocumentParam(kinds, statement.Update.Doc)
+		if len(statement.Update.Assignments) == 0 {
+			markDocumentParam(kinds, statement.Update.Doc)
+		}
 	}
 	return kinds
 }
@@ -936,7 +938,9 @@ func statementDocumentParamPositions(
 			}
 		}
 	case sqlast.KindUpdate:
-		record(statement.Update.Doc)
+		if len(statement.Update.Assignments) == 0 {
+			record(statement.Update.Doc)
+		}
 	}
 	return positions
 }

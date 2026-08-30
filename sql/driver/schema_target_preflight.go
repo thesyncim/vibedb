@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -80,7 +81,8 @@ func (a *ReplicatedApply) PreflightReplicatedSchemaTarget(ctx context.Context, r
 		return nil, ErrReplicatedSchemaDDLConflict
 	}
 	if a.Applied() != expectedApplied {
-		return nil, ErrTransactionConflict
+		return nil, fmt.Errorf("schema target source applied advanced: current=%d target=%d: %w",
+			a.Applied(), expectedApplied, ErrTransactionConflict)
 	}
 	if _, err := a.certifyReplicatedSchemaTargetWithHandoff(verified.raw, nil, verified); err != nil {
 		return nil, err
@@ -127,11 +129,13 @@ func (v *VerifiedReplicatedSchemaTarget) Prepare(ctx context.Context, authorizat
 	}
 	source, _, err := v.owner.schemaDDLShadowSource()
 	if err != nil || sha256.Sum256(source) != v.sourceDigest {
-		return ReplicatedSchemaTargetProof{}, errors.Join(err, ErrTransactionConflict)
+		return ReplicatedSchemaTargetProof{}, fmt.Errorf("schema target source catalog changed after preflight: %w",
+			errors.Join(err, ErrTransactionConflict))
 	}
 	for i, candidate := range v.opened {
 		if !candidate.collection.MatchesDurableImage(v.images[i]) {
-			return ReplicatedSchemaTargetProof{}, ErrTransactionConflict
+			return ReplicatedSchemaTargetProof{}, fmt.Errorf("schema target relation %d changed after preflight: %w",
+				i, ErrTransactionConflict)
 		}
 	}
 	proof := v.proof
@@ -171,6 +175,23 @@ func (v *VerifiedReplicatedSchemaTarget) Close() error {
 // the exact source catalog/applied cut and preparation witness are rechecked.
 // This does not acquire the distributed write fence or publish a transition.
 func (v *VerifiedReplicatedSchemaTarget) ResumePrepared(ctx context.Context, a *ReplicatedApply, raw []byte, request [32]byte) (ReplicatedSchemaTargetProof, error) {
+	return v.resumePrepared(ctx, a, raw, request, 0)
+}
+
+// ResumePreparedAfterEmptySuffix permits a later machine index only when the
+// shard owner has independently proved every intervening WAL entry empty and
+// normal. The returned proof deliberately retains its original prepared cut.
+func (v *VerifiedReplicatedSchemaTarget) ResumePreparedAfterEmptySuffix(
+	ctx context.Context, a *ReplicatedApply, raw []byte, request [32]byte,
+	preCommandApplied uint64,
+) (ReplicatedSchemaTargetProof, error) {
+	if v == nil || preCommandApplied <= v.expectedApplied {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	return v.resumePrepared(ctx, a, raw, request, preCommandApplied)
+}
+
+func (v *VerifiedReplicatedSchemaTarget) resumePrepared(ctx context.Context, a *ReplicatedApply, raw []byte, request [32]byte, preCommandApplied uint64) (ReplicatedSchemaTargetProof, error) {
 	if v == nil || ctx == nil || a == nil || a.database == nil || request == ([32]byte{}) {
 		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
 	}
@@ -183,8 +204,12 @@ func (v *VerifiedReplicatedSchemaTarget) ResumePrepared(ctx context.Context, a *
 		v.proof.Relations != v.audit.Certificate() || v.proof.Catalog.Digest != sha256.Sum256(raw) {
 		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
 	}
+	wantApplied := v.expectedApplied
+	if preCommandApplied != 0 {
+		wantApplied = preCommandApplied
+	}
 	source, _, err := a.schemaDDLShadowSource()
-	if err != nil || sha256.Sum256(source) != v.sourceDigest || a.Applied() != v.expectedApplied {
+	if err != nil || sha256.Sum256(source) != v.sourceDigest || a.Applied() != wantApplied {
 		return ReplicatedSchemaTargetProof{}, errors.Join(err, ErrTransactionConflict)
 	}
 	proof, err := a.recoverPreparedSchemaTargetProof(raw, request, v.proof)

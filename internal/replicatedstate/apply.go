@@ -1996,6 +1996,18 @@ func (m *Machine) planMutations(
 			!mutation.delete && len(mutation.value) > target.Limits.MaxDocumentBytes {
 			return nil, 0, ResultTargetBound, nil
 		}
+		compare := mutation.before
+		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		mutation.beforeFound = found
+		// UPDATE of an absent row is an exact zero-row no-op. Check presence
+		// before validating the replacement so a coordinator can retain a
+		// durable no-op participant without inventing values for required fields.
+		if mutation.condition == mutationPutPresent && !found {
+			continue
+		}
 		if !mutation.delete {
 			if relation.kind == RelationJSON {
 				value, code := m.canonicalMutationValue(mutation.value)
@@ -2017,12 +2029,6 @@ func (m *Machine) planMutations(
 			len(mutation.value) != replication.MutationDigestCompareBytes {
 			return nil, 0, ResultInvalidDocument, nil
 		}
-		compare := mutation.before
-		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		mutation.beforeFound = found
 		if target.Validation == ValidationDeterministicMutation {
 			validation := MutationValidation(0)
 			if mutation.delete {
@@ -2079,9 +2085,6 @@ func (m *Machine) planMutations(
 			if found {
 				return nil, 0, ResultIndexConflict, nil
 			}
-		}
-		if mutation.condition == mutationPutPresent && !found {
-			continue
 		}
 		if mutation.condition == mutationPutDigestEqual {
 			if !found {

@@ -189,6 +189,12 @@ func (lane *ExecutionLane) QuiesceSQLGeneration(key raftmember.GroupKey) error {
 	}
 	return lane.set.QuiesceSQLGeneration(key)
 }
+func (lane *ExecutionLane) FenceCommittedSchemaGeneration(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.FenceCommittedSchemaGeneration(key)
+}
 func (lane *ExecutionLane) ObserveSchemaTransition(
 	key raftmember.GroupKey, command []byte,
 ) (uint64, bool, error) {
@@ -419,6 +425,13 @@ func (set *ExecutionLanes) QuiesceSQLGeneration(key raftmember.GroupKey) error {
 		return err
 	}
 	return lane.host.QuiesceSQLGeneration(key)
+}
+func (set *ExecutionLanes) FenceCommittedSchemaGeneration(key raftmember.GroupKey) error {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return err
+	}
+	return lane.host.FenceCommittedSchemaGeneration(key)
 }
 
 func (set *ExecutionLanes) ObserveSchemaTransition(

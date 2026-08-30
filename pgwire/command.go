@@ -80,7 +80,6 @@ var unsupportedStatements = map[string]string{
 	"MERGE": "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
 	"COPY":  "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
 
-	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
 	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",
@@ -144,7 +143,7 @@ func classifyCancelable(
 		return kindSelect, "", nil
 	case strings.EqualFold(word, "INSERT"), strings.EqualFold(word, "UPDATE"),
 		strings.EqualFold(word, "DELETE"), strings.EqualFold(word, "CREATE"),
-		strings.EqualFold(word, "DROP"), strings.EqualFold(word, "TRUNCATE"):
+		strings.EqualFold(word, "ALTER"), strings.EqualFold(word, "DROP"), strings.EqualFold(word, "TRUNCATE"):
 		return kindCatalogSQL, "", nil
 	case strings.EqualFold(word, "BEGIN"), strings.EqualFold(word, "START"):
 		return kindBegin, "", nil

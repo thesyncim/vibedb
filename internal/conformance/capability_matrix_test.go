@@ -102,8 +102,10 @@ func TestUnsupportedSQLManifestIsComplete(t *testing.T) {
 		}
 		seen[c.ID] = true
 	}
-	if len(seen) < 5 {
-		t.Fatalf("unsupported SQL matrix has only %d families", len(seen))
+	for _, id := range []string{"copy", "lock", "cte", "listen"} {
+		if !seen[id] {
+			t.Fatalf("unsupported SQL matrix is missing %q", id)
+		}
 	}
 }
 

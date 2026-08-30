@@ -37,7 +37,7 @@ func (s *postgresSession) prepareWrite(ctx context.Context, text string, parsed 
 		return nil, driver.ErrReadOnlyTransaction
 	}
 	if parsed.Kind != sqlast.KindInsert && parsed.Kind != sqlast.KindUpdate && parsed.Kind != sqlast.KindDelete || parsed.ReturnsRows() {
-		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL supports INSERT, whole-document UPDATE and DELETE without RETURNING")
+		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL supports INSERT, UPDATE and DELETE without RETURNING")
 	}
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
@@ -62,7 +62,9 @@ func (s *postgresSession) prepareWrite(ctx context.Context, text string, parsed 
 		}
 	}
 	if parsed.Kind == sqlast.KindUpdate {
-		mark(parsed.Update.Doc)
+		if len(parsed.Update.Assignments) == 0 {
+			mark(parsed.Update.Doc)
+		}
 	}
 	s.statements[p] = struct{}{}
 	return p, nil

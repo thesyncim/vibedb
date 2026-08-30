@@ -3,6 +3,7 @@ package gateway
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -43,10 +44,15 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 	if !found {
 		return nil, nil, sqldriver.ErrTableNotFound
 	}
-	indexes, noOp, err := schemaDDLPlanIndexes(state, table, sql)
+	indexes, indexNoOp, err := schemaDDLPlanIndexes(state, table, sql)
 	if err != nil {
 		return nil, nil, err
 	}
+	declarations, declarationNoOp, err := schemaDDLPlanDeclarations(state, table, sql)
+	if err != nil {
+		return nil, nil, err
+	}
+	noOp := indexNoOp || declarationNoOp
 	descriptors, profiles := state.replicatedDescriptors(), state.replicatedTableProfiles()
 	sourceDescriptors := state.replicatedDescriptors()
 	var sourceProfile ReplicatedTableProfile
@@ -113,7 +119,11 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 			return nil, nil, ErrSchemaRollout
 		}
 		logical = replication.Digest(description.LogicalSchemaDigest)
-		if err := validateSchemaDDLDescription(state, before, sourceProfile, build.Member, description, indexes); err != nil {
+		expected, ok := declaredTableInfoFromDeclarations(declarations, table, sourceProfile.PrimaryKey)
+		if !ok {
+			return nil, nil, ErrSchemaRollout
+		}
+		if err := validateSchemaDDLDescription(state, before, sourceProfile, build.Member, description, indexes, expected); err != nil {
 			return nil, nil, err
 		}
 		descriptors[i].Command.SchemaGeneration = proof.Catalog.SchemaGeneration
@@ -134,7 +144,7 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 		}
 	}
 	target, err := NewSnapshotWithReplicatedTableMetadata(state.config, state.endpoints, state.Generation()+1, indexes,
-		state.statistics.Descriptors(), descriptors, profiles, state.ReplicatedTableDeclarations())
+		state.statistics.Descriptors(), descriptors, profiles, declarations)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -176,7 +186,54 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 	return target, plans, nil
 }
 
-func validateSchemaDDLDescription(current *Snapshot, descriptor ReplicatedShardDescriptor, profile ReplicatedTableProfile, member uint64, d sqldriver.ReplicatedSchemaCatalogDescription, indexes []IndexDescriptor) error {
+// ResolveReplicatedSchemaDDLTable returns the one base table affected by the
+// supported online DDL grammar. DROP INDEX follows PostgreSQL's table-free
+// spelling by resolving the retained catalog index identity.
+func ResolveReplicatedSchemaDDLTable(current *Snapshot, sql string) (string, error) {
+	if current == nil {
+		return "", ErrSchemaRollout
+	}
+	statement, err := query.PrepareDML(sql)
+	if err != nil {
+		return "", err
+	}
+	defer statement.Release()
+	tree := statement.Tree()
+	switch tree.Kind {
+	case sqlast.KindAlterTable:
+		return tree.AlterTable.Table, nil
+	case sqlast.KindCreateIndex:
+		return tree.CreateIndex.Table, nil
+	case sqlast.KindTruncate:
+		return tree.Truncate.Table, nil
+	case sqlast.KindDropIndex:
+		if tree.DropIndex.HasTable {
+			return tree.DropIndex.Table, nil
+		}
+		result := ""
+		for _, index := range current.indexDescriptors() {
+			if index.Name != tree.DropIndex.Name {
+				continue
+			}
+			if result != "" && result != index.Table {
+				return "", ErrSchemaRollout
+			}
+			result = index.Table
+		}
+		if result == "" {
+			if tree.DropIndex.IfExists {
+				return "", nil
+			}
+			return "", sqldriver.ErrIndexNotFound
+		}
+		return result, nil
+	default:
+		return "", sqlast.NewFeatureNotSupportedError(sql, 0,
+			"distributed PostgreSQL DDL supports ALTER TABLE ADD COLUMN, CREATE INDEX, DROP INDEX, and TRUNCATE")
+	}
+}
+
+func validateSchemaDDLDescription(current *Snapshot, descriptor ReplicatedShardDescriptor, profile ReplicatedTableProfile, member uint64, d sqldriver.ReplicatedSchemaCatalogDescription, indexes []IndexDescriptor, declared sqldriver.TableInfo) error {
 	b := d.Store.Binding
 	want := descriptor.Command
 	if b.ClusterID != descriptor.Group.ClusterID || b.ClusterIncarnation != descriptor.Group.ClusterIncarnation ||
@@ -200,8 +257,8 @@ func validateSchemaDDLDescription(current *Snapshot, descriptor ReplicatedShardD
 	if d.Placement.Range != shard.Range || d.Placement.ShardKey != profile.PrimaryKey {
 		return ErrSchemaRollout
 	}
-	declared, _ := current.declaredTableInfo(profile.Table)
 	slices.SortFunc(declared.Columns, func(a, b sqldriver.ColumnInfo) int { return strings.Compare(a.Path, b.Path) })
+	slices.SortFunc(d.Table.Columns, func(a, b sqldriver.ColumnInfo) int { return strings.Compare(a.Path, b.Path) })
 	if !slices.Equal(declared.Columns, d.Table.Columns) {
 		return ErrSchemaRollout
 	}
@@ -228,6 +285,114 @@ func validateSchemaDDLDescription(current *Snapshot, descriptor ReplicatedShardD
 	return nil
 }
 
+func declaredTableInfoFromDeclarations(declarations []ReplicatedTableDeclaration, table, primaryKey string) (sqldriver.TableInfo, bool) {
+	for _, declaration := range declarations {
+		if declaration.Table != table {
+			continue
+		}
+		tree, err := sqlast.ParseStatement(declaration.CreateTable)
+		if err != nil || tree.CreateTable == nil {
+			return sqldriver.TableInfo{}, false
+		}
+		info := sqldriver.TableInfo{Name: table, PrimaryKey: primaryKey}
+		for _, column := range tree.CreateTable.Columns {
+			info.Columns = append(info.Columns, sqldriver.ColumnInfo{
+				Path: string(column.Path.AppendPointer(nil)), Types: column.Type, Required: column.Required,
+			})
+		}
+		return info, true
+	}
+	return sqldriver.TableInfo{}, false
+}
+
+func schemaDDLPlanDeclarations(current *Snapshot, table, text string) ([]ReplicatedTableDeclaration, bool, error) {
+	declarations := current.ReplicatedTableDeclarations()
+	statement, err := sqlast.ParseStatement(text)
+	if err != nil {
+		return nil, false, err
+	}
+	if statement.Kind != sqlast.KindAlterTable {
+		return declarations, false, nil
+	}
+	for i := range declarations {
+		if declarations[i].Table != table {
+			continue
+		}
+		created, err := sqlast.ParseStatement(declarations[i].CreateTable)
+		if err != nil || created.CreateTable == nil {
+			return nil, false, errors.Join(err, ErrSchemaRollout)
+		}
+		for _, column := range created.CreateTable.Columns {
+			if string(column.Path.AppendPointer(nil)) == string(statement.AlterTable.Column.Path.AppendPointer(nil)) {
+				if statement.AlterTable.IfNotExists {
+					return declarations, true, nil
+				}
+				return nil, false, ErrSchemaRollout
+			}
+		}
+		created.CreateTable.Columns = append(created.CreateTable.Columns, statement.AlterTable.Column)
+		declarations[i].CreateTable = renderReplicatedCreateTable(created.CreateTable)
+		return declarations, false, nil
+	}
+	return nil, false, ErrSchemaRollout
+}
+
+func renderReplicatedCreateTable(table *sqlast.CreateTableStmt) string {
+	var b strings.Builder
+	b.WriteString("CREATE TABLE ")
+	appendDDLIdentifier(&b, table.Table)
+	b.WriteString(" (")
+	for i, column := range table.Columns {
+		if i != 0 {
+			b.WriteString(", ")
+		}
+		appendDDLPath(&b, column.Path)
+		b.WriteByte(' ')
+		if column.Type == sqlast.TypeAny {
+			b.WriteString("ANY")
+		} else {
+			b.WriteString((column.Type &^ sqlast.TypeNull).String())
+		}
+		if column.Required {
+			b.WriteString(" NOT NULL")
+		}
+	}
+	if len(table.PrimaryKey) != 0 {
+		if len(table.Columns) != 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("PRIMARY KEY (")
+		for i, path := range table.PrimaryKey {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			appendDDLPath(&b, path)
+		}
+		b.WriteByte(')')
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+func appendDDLIdentifier(b *strings.Builder, identifier string) {
+	b.WriteByte('"')
+	b.WriteString(strings.ReplaceAll(identifier, "\"", "\"\""))
+	b.WriteByte('"')
+}
+
+func appendDDLPath(b *strings.Builder, path *sqlast.PathExpr) {
+	for i, segment := range path.Segments {
+		if segment.IsIndex {
+			fmt.Fprintf(b, "[%d]", segment.Index)
+			continue
+		}
+		if i != 0 {
+			b.WriteByte('.')
+		}
+		appendDDLIdentifier(b, segment.Key)
+	}
+}
+
 func schemaDDLPlanIndexes(current *Snapshot, table, sql string) ([]IndexDescriptor, bool, error) {
 	statement, err := query.PrepareDML(sql)
 	if err != nil {
@@ -245,6 +410,10 @@ func schemaDDLPlanIndexes(current *Snapshot, table, sql string) ([]IndexDescript
 		return -1
 	}
 	switch tree.Kind {
+	case sqlast.KindAlterTable:
+		if tree.AlterTable.Table != table {
+			return nil, false, ErrSchemaRollout
+		}
 	case sqlast.KindCreateIndex:
 		index, err := statement.LowerIndex()
 		if err != nil {

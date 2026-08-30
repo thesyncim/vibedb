@@ -361,25 +361,27 @@ const (
 )
 
 type groupState struct {
-	key               raftmember.GroupKey
-	memberID          uint64
-	sourceOwner       raftmember.AppliedSourceOwner
-	sourceToken       raftmember.AppliedSourceToken
-	sourceClaimed     bool
-	runtime           memberRuntime
-	runnable          bool
-	messages          messageQueue
-	proposals         proposalQueue
-	ticks             int
-	campaigns         int
-	items             int
-	bytes             int64
-	nextClass         inputClass
-	failure           error
-	retiring          bool
-	schemaQuiesced    bool
-	trackedLeaderTerm uint64
-	commitMetrics     raftmodel.CommitMetrics
+	key                    raftmember.GroupKey
+	memberID               uint64
+	sourceOwner            raftmember.AppliedSourceOwner
+	sourceToken            raftmember.AppliedSourceToken
+	sourceClaimed          bool
+	runtime                memberRuntime
+	runnable               bool
+	messages               messageQueue
+	proposals              proposalQueue
+	ticks                  int
+	campaigns              int
+	items                  int
+	bytes                  int64
+	nextClass              inputClass
+	failure                error
+	retiring               bool
+	schemaQuiescing        bool
+	schemaQuiesced         bool
+	schemaTransitionFenced bool
+	trackedLeaderTerm      uint64
+	commitMetrics          raftmodel.CommitMetrics
 }
 
 type outboundItem struct {
@@ -778,6 +780,9 @@ func (host *Host) enqueueProposal(
 	if err != nil {
 		return err
 	}
+	if group.schemaTransitionFenced {
+		return ErrGroupBusy
+	}
 	if len(data) > raftmodel.MaxProposalBytes {
 		return fmt.Errorf("%w: proposal exceeds bound", raftmodel.ErrAdmissionBound)
 	}
@@ -930,6 +935,9 @@ func (host *Host) RequestTick(key raftmember.GroupKey) error {
 	if err != nil {
 		return err
 	}
+	if group.schemaQuiescing {
+		return ErrGroupBusy
+	}
 	if group.ticks >= host.limits.MaxPendingTicks {
 		return ErrQueueFull
 	}
@@ -942,6 +950,18 @@ func (host *Host) RequestTick(key raftmember.GroupKey) error {
 	return nil
 }
 
+func (host *Host) FenceCommittedSchemaGeneration(key raftmember.GroupKey) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	if group.schemaQuiesced || group.retiring {
+		return ErrGroupBusy
+	}
+	group.schemaTransitionFenced = true
+	return nil
+}
+
 // QuiesceSQLGeneration removes one idle group from scheduling while retaining
 // its WAL, RawNode, member incarnation, and replication progress.
 func (host *Host) QuiesceSQLGeneration(key raftmember.GroupKey) error {
@@ -950,12 +970,27 @@ func (host *Host) QuiesceSQLGeneration(key raftmember.GroupKey) error {
 		return err
 	}
 	runtime, ok := group.runtime.(schemaGenerationRuntime)
-	if !ok || group.schemaQuiesced || group.retiring || group.items != 0 ||
+	if !ok || group.schemaQuiesced || group.retiring {
+		return ErrGroupBusy
+	}
+	// Latch the intent before checking idleness. Owner-level generation
+	// fencing has already stopped user work; this scheduler fence prevents the
+	// periodic pulse and peer traffic from replenishing scheduler debt while
+	// previously admitted work drains. The serialized Owner deliberately drops
+	// ordinary peer packets during this bounded window; Raft repairs that loss
+	// after the exact target generation is installed.
+	group.schemaQuiescing = true
+	if group.items != 0 ||
 		group.messages.len() != 0 || group.proposals.len() != 0 || group.ticks != 0 ||
 		group.campaigns != 0 || group.runtime.HasPendingResultSettlement() {
 		return ErrGroupBusy
 	}
 	if err = runtime.QuiesceSQLGeneration(); err != nil {
+		// Runtime is the final authority for RawNode Ready/read state that is
+		// intentionally not duplicated in Host counters. Keep the group runnable
+		// so an ErrReadyPending-style refusal drains that exact lifecycle before
+		// the caller retries the quiescence fence.
+		host.wake(group)
 		return errors.Join(ErrGroupBusy, err)
 	}
 	group.schemaQuiesced = true
@@ -998,6 +1033,8 @@ func (host *Host) InstallSQLGeneration(
 		return err
 	}
 	group.schemaQuiesced = false
+	group.schemaQuiescing = false
+	group.schemaTransitionFenced = false
 	host.wake(group)
 	return nil
 }
@@ -1009,6 +1046,9 @@ func (host *Host) RequestCampaign(key raftmember.GroupKey) error {
 	if err != nil {
 		return err
 	}
+	if group.schemaQuiescing || group.schemaTransitionFenced {
+		return ErrGroupBusy
+	}
 	if err := host.admitInput(group, 0); err != nil {
 		return err
 	}
@@ -1019,7 +1059,7 @@ func (host *Host) RequestCampaign(key raftmember.GroupKey) error {
 }
 
 func (host *Host) admitInput(group *groupState, size int64) error {
-	if group.schemaQuiesced {
+	if group.schemaQuiescing || group.schemaQuiesced {
 		return ErrGroupBusy
 	}
 	if size < 0 || group.items >= host.limits.MaxGroupItems || host.queueItems >= host.limits.MaxQueueItems ||

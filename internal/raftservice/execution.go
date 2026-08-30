@@ -348,6 +348,24 @@ func (owners *ExecutionOwners) QuiesceSchemaGeneration(ctx context.Context, fenc
 	}
 	return owner.QuiesceSchemaGeneration(ctx, fence, command)
 }
+func (owners *ExecutionOwners) QuiesceCommittedSchemaGeneration(
+	ctx context.Context, group raftmember.GroupKey, command []byte,
+) error {
+	owner, err := owners.owner(group)
+	if err != nil {
+		return err
+	}
+	return owner.QuiesceCommittedSchemaGeneration(ctx, group, command)
+}
+func (owners *ExecutionOwners) FenceCommittedSchemaGeneration(
+	ctx context.Context, group raftmember.GroupKey, command []byte,
+) error {
+	owner, err := owners.owner(group)
+	if err != nil {
+		return err
+	}
+	return owner.FenceCommittedSchemaGeneration(ctx, group, command)
+}
 func (owners *ExecutionOwners) InstallSchemaGeneration(
 	ctx context.Context, group raftmember.GroupKey,
 	database *sqldriver.Database, apply *sqldriver.ReplicatedApply,

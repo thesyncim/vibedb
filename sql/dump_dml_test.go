@@ -24,6 +24,22 @@ func dumpAny(s *Statement) string {
 		return dumpCreateTable(s.CreateTable)
 	case KindCreateIndex:
 		return dumpCreateIndex(s.CreateIndex)
+	case KindAlterTable:
+		var b strings.Builder
+		b.WriteString("alter table ")
+		b.WriteString(s.AlterTable.Table)
+		b.WriteString(" add column")
+		if s.AlterTable.IfNotExists {
+			b.WriteString(" if not exists")
+		}
+		b.WriteByte(' ')
+		dumpPath(&b, s.AlterTable.Column.Path)
+		b.WriteByte(' ')
+		b.WriteString(s.AlterTable.Column.Type.String())
+		if s.AlterTable.Column.Required {
+			b.WriteString(" not null")
+		}
+		return b.String()
 	case KindDropTable:
 		if s.DropTable.IfExists {
 			return "drop table if exists " + s.DropTable.Table

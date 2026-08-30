@@ -384,6 +384,11 @@ type BoundWritePlan struct {
 	// the executor re-reads its shard key from it to prove the replacement cannot
 	// move a row to another shard.
 	updateDoc []byte
+	// updateArgs are borrowed for the lifetime of one execution and are used
+	// only when updateAssignments materializes a declared-column replacement
+	// from the leader's current document.
+	updateAssignments []sqlast.UpdateAssignment
+	updateArgs        []any
 
 	globalIndexes    []boundGlobalIndexMutation
 	globalIndexArena []byte
@@ -463,11 +468,16 @@ func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
 		}
 		bound.constraints = cons
 		if p.statement.Kind == sqlast.KindUpdate {
-			doc, err := writeOperandDocument(p.statement.Update.Doc, args)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+			if len(p.statement.Update.Assignments) == 0 {
+				doc, err := writeOperandDocument(p.statement.Update.Doc, args)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+				}
+				bound.updateDoc = doc
+			} else {
+				bound.updateAssignments = p.statement.Update.Assignments
+				bound.updateArgs = args
 			}
-			bound.updateDoc = doc
 		}
 	}
 	return bound, nil

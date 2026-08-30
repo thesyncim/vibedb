@@ -86,7 +86,12 @@ type Machine struct {
 	openedImageGeneration uint64
 	initialized           bool
 	schemaTransitioned    bool
-	poison                error
+	// legacySchemaSourceCommand authenticates the exact replica-local command
+	// persisted by the pre-coordination schema protocol. It is populated only
+	// after every transition authority and the local membership witness have
+	// been validated during source recovery.
+	legacySchemaSourceCommand [sha256.Size]byte
+	poison                    error
 }
 
 // SessionCapacityState is the constant-size durable apply cut exposed to the
@@ -449,16 +454,30 @@ func validateOpenedSchemaTransition(
 	meta := raftmodel.ApplyMeta{
 		Index: state.Applied, Term: state.LastTerm, Type: state.LastEntryType,
 	}
-	if err != nil || normalEntryDigest(meta, options.SchemaTransition) != state.LastEntryDigest ||
-		schemaTransitionBinding(transition) != binding ||
-		transition.ToManifest != manifest || transition.ToApplyContract != contract ||
-		transition.ToPlacementDigest != state.RelationPlacementDigest ||
-		transition.MembershipSequence != witness.Sequence ||
-		transition.MembershipSource != witness.Source ||
-		transition.MembershipTarget != witness.Target ||
-		transition.AuthorizationDigest != options.SchemaAuthorizationDigest ||
-		transition.CatalogCASDigest != options.SchemaCatalogCASDigest {
+	if err != nil {
 		return errors.Join(ErrSchemaTransition, err)
+	}
+	legacyReplicaLocalCommand := transition.MembershipSequence == witness.Sequence &&
+		transition.MembershipSource == witness.Source && transition.MembershipTarget == witness.Target
+	checks := []struct {
+		ok   bool
+		name string
+	}{
+		{normalEntryDigest(meta, options.SchemaTransition) == state.LastEntryDigest || legacyReplicaLocalCommand, "last entry digest"},
+		{schemaTransitionBinding(transition) == binding, "target binding"},
+		{transition.ToManifest == manifest, "relation manifest"},
+		{transition.ToApplyContract == contract, "apply contract"},
+		{transition.ToPlacementDigest == state.RelationPlacementDigest, "relation placement"},
+		{witness.Sequence != 0, "local membership sequence"},
+		{witness.Source != ([sha256.Size]byte{}), "local membership source"},
+		{witness.Target != ([sha256.Size]byte{}), "local membership target"},
+		{transition.AuthorizationDigest == options.SchemaAuthorizationDigest, "authorization"},
+		{transition.CatalogCASDigest == options.SchemaCatalogCASDigest, "catalog CAS"},
+	}
+	for _, check := range checks {
+		if !check.ok {
+			return fmt.Errorf("%w: %s", ErrSchemaTransition, check.name)
+		}
 	}
 	return nil
 }
@@ -1921,7 +1940,31 @@ func (m *Machine) ObserveSchemaTransition(command []byte) (uint64, bool, error) 
 	digest := normalEntryDigest(raftmodel.ApplyMeta{
 		Index: state.Applied, Term: state.LastTerm, Type: state.LastEntryType,
 	}, command)
-	return state.Applied, digest == state.LastEntryDigest, nil
+	legacy := m.legacySchemaSourceCommand != ([sha256.Size]byte{}) &&
+		sha256.Sum256(command) == m.legacySchemaSourceCommand
+	return state.Applied, digest == state.LastEntryDigest || legacy, nil
+}
+
+// ObserveSchemaTransitionAlias proves that committed is the exact RF3-wide
+// transition while local differs only by the replica-local catalog CAS. Once
+// proved, later local observation and catalog publication may use the local
+// envelope. This is the live equivalent of source-generation crash recovery's
+// dual-command proof.
+func (m *Machine) ObserveSchemaTransitionAlias(local, committed []byte) (uint64, bool, error) {
+	localTransition, localErr := OpenSchemaTransition(local)
+	committedTransition, committedErr := OpenSchemaTransition(committed)
+	if localErr != nil || committedErr != nil ||
+		!schemaTransitionEqualExceptCatalogCAS(localTransition, committedTransition) {
+		return 0, false, errors.Join(localErr, committedErr, ErrSchemaTransition)
+	}
+	applied, observed, err := m.ObserveSchemaTransition(committed)
+	if err != nil || !observed {
+		return applied, observed, err
+	}
+	m.mu.Lock()
+	m.legacySchemaSourceCommand = sha256.Sum256(local)
+	m.mu.Unlock()
+	return applied, true, nil
 }
 
 // SessionCapacityState returns a read-only, constant-size view of the machine

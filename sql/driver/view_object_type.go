@@ -107,6 +107,14 @@ func tableTargetRequiringBaseRelation(statement *sqlast.Statement) (viewTableTar
 		return viewTableTarget{}, false
 	}
 	switch statement.Kind {
+	case sqlast.KindAlterTable:
+		if statement.AlterTable != nil {
+			return viewTableTarget{
+				operation: "ALTER TABLE", name: statement.AlterTable.Table,
+				hint: "alter a base table instead; views have no independent schema",
+				pos:  statement.AlterTable.Pos,
+			}, true
+		}
 	case sqlast.KindDropTable:
 		if statement.DropTable != nil {
 			return viewTableTarget{

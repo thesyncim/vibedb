@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -26,6 +27,7 @@ type Activator interface {
 	ObserveStaged(context.Context, Request, [32]byte, string) (witness [32]byte, found bool, err error)
 	Stage(context.Context, Request, [32]byte, string) (witness [32]byte, err error)
 	ObserveActive(context.Context, Request, Authorization, [32]byte, string) (bool, error)
+	Commit(context.Context, Request, Authorization, [32]byte, string) error
 	Activate(context.Context, Request, Authorization, [32]byte, string) error
 	ObserveDrained(context.Context, Request, Authorization, DrainProof, [32]byte) (bool, error)
 	DrainOld(context.Context, Request, Authorization, DrainProof, [32]byte) error
@@ -125,6 +127,9 @@ func (backend *DirectoryBackend) ObservePrepared(
 	}
 	witness, staged, err := backend.activator.ObserveStaged(ctx, request, meta.digest, name)
 	if err != nil || !staged {
+		if err != nil {
+			err = fmt.Errorf("schemainstall: observe staged target: %w", err)
+		}
 		return [32]byte{}, staged, err
 	}
 	materialized := MaterializedArtifactDigest(meta.digest, witness)
@@ -146,11 +151,11 @@ func (backend *DirectoryBackend) Prepare(
 	}
 	digest, name, err := backend.prepareArtifact(ctx, request, bundle)
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, fmt.Errorf("schemainstall: prepare immutable artifact: %w", err)
 	}
 	witness, found, err := backend.activator.ObserveStaged(ctx, request, digest, name)
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, fmt.Errorf("schemainstall: observe staged target: %w", err)
 	}
 	if !found {
 		witness, err = backend.activator.Stage(ctx, request, digest, name)
@@ -159,7 +164,8 @@ func (backend *DirectoryBackend) Prepare(
 				ctx, request, digest, name,
 			)
 			if observeErr != nil || !observedFound {
-				return [32]byte{}, errors.Join(ErrOutcomeUnknown, err, observeErr)
+				return [32]byte{}, fmt.Errorf("schemainstall: stage target: %w",
+					errors.Join(ErrOutcomeUnknown, err, observeErr))
 			}
 			witness = observed
 		}
@@ -246,6 +252,14 @@ func (backend *DirectoryBackend) Activate(ctx context.Context, request Request, 
 		return err
 	}
 	return backend.activator.Activate(ctx, request, authorization, installation, path)
+}
+
+func (backend *DirectoryBackend) Commit(ctx context.Context, request Request, authorization Authorization, installation [32]byte) error {
+	path, err := backend.artifactPath(request)
+	if err != nil {
+		return err
+	}
+	return backend.activator.Commit(ctx, request, authorization, installation, path)
 }
 
 func (backend *DirectoryBackend) ObserveDrained(ctx context.Context, request Request, authorization Authorization, proof DrainProof, installation [32]byte) (bool, error) {

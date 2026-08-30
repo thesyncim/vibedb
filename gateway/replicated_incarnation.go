@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -75,10 +76,14 @@ func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoin
 		return ReplicatedEndpoint{}, ErrReplicatedRoute
 	}
 	fence := response.State.Fence
-	if fence.Group != route.Group || fence.AllocationGeneration != route.AllocationGeneration ||
-		!replicatedObservedCommandMatches(route, fence.Command) || fence.MemberID != endpoint.Member ||
-		fence.StoreID != endpoint.StoreID || endpoint.NodeIncarnation == 0 ||
-		fence.NodeIncarnation < endpoint.NodeIncarnation {
+	if fence.Group != route.Group || fence.AllocationGeneration != route.AllocationGeneration {
+		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed group or allocation differs", ErrReplicatedRoute)
+	}
+	if !replicatedObservedCommandMatches(route, fence.Command) {
+		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed command differs: catalog=%+v replica=%+v", ErrReplicatedRoute, route.Command, fence.Command)
+	}
+	if fence.MemberID != endpoint.Member || fence.StoreID != endpoint.StoreID ||
+		endpoint.NodeIncarnation == 0 || fence.NodeIncarnation < endpoint.NodeIncarnation {
 		return ReplicatedEndpoint{}, ErrReplicatedRoute
 	}
 	endpoint.NodeIncarnation = fence.NodeIncarnation

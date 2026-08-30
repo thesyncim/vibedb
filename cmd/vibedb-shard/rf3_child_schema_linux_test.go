@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -38,6 +39,22 @@ func TestRF3ChildSQLProvisionsExactSingletonLocalGlobalBundles(t *testing.T) {
 			prepared, err := rf3testfixture.PrepareMember(options)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if kind == "base-local-global" {
+				description, err := sqldriver.DescribeReplicatedSchemaCatalog(prepared.SQLPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				registry, err := refreshRF3SplitChildSchema(rf3ManifestSplitChildRegistry{
+					Table: options.Table, CreateTable: options.CreateTable,
+					SchemaStatements: options.SchemaStatements, GlobalIndexes: options.GlobalIndexes,
+				}, description)
+				if err != nil {
+					t.Fatalf("refresh multi-relation child schema: %v", err)
+				}
+				if !slices.Contains(registry.SchemaStatements, options.SchemaStatements[1]) {
+					t.Fatal("refresh discarded colocated global-index table DDL")
+				}
 			}
 			source := prepared.Base
 			if err := prepared.Close(); err != nil {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -15,6 +16,10 @@ import (
 
 type SchemaBuilder interface {
 	BuildSchema(context.Context, BuildRequest, string) (sqldriver.ReplicatedSchemaDDLTarget, error)
+}
+
+type schemaBuildResumer interface {
+	ResumeSchemaBuild(context.Context, [32]byte, raftmember.GroupKey) (BuildRequest, string, sqldriver.ReplicatedSchemaDDLTarget, bool, error)
 }
 
 type BuildControlOptions struct {
@@ -72,6 +77,21 @@ func (s *BuildControlService) Serve(ctx context.Context, connection rafttranspor
 	}
 	if err := s.writeResponse(ctx, connection, r, ResponseOK, nil); err != nil {
 		return err
+	}
+	if r.Resume {
+		resumer, ok := s.options.Builder.(schemaBuildResumer)
+		if !ok {
+			return s.writeResponse(ctx, connection, r, ResponseInvalid, nil)
+		}
+		request, sql, target, active, resumeErr := resumer.ResumeSchemaBuild(ctx, r.Operation, r.Group)
+		var body []byte
+		if resumeErr == nil {
+			body, resumeErr = appendBuildResumeReceipt(nil, request, sql, target, active)
+		}
+		if writeErr := s.writeResponse(ctx, connection, r, responseCode(resumeErr), body); writeErr != nil {
+			return writeErr
+		}
+		return resumeErr
 	}
 	// Authorization and admission precede even this bounded SQL allocation.
 	sql := make([]byte, int(r.SQLBytes))
@@ -195,4 +215,52 @@ func (c *Client) Build(ctx context.Context, node rafttransport.NodeID, request B
 		return target, errors.Join(ErrOutcomeUnknown, err)
 	}
 	return target, nil
+}
+
+// ResumeBuild reads the exact retained build request, SQL and target receipt.
+// It performs no materialization and is used only after coordinator restart.
+func (c *Client) ResumeBuild(ctx context.Context, node rafttransport.NodeID,
+	operation [32]byte, group raftmember.GroupKey,
+) (BuildRequest, string, sqldriver.ReplicatedSchemaDDLTarget, bool, error) {
+	lookup := BuildRequest{Resume: true, Operation: operation, Group: group}
+	var target sqldriver.ReplicatedSchemaDDLTarget
+	if c == nil || ctx == nil || node == (rafttransport.NodeID{}) || !validBuildRequest(lookup) {
+		return BuildRequest{}, "", target, false, ErrInvalid
+	}
+	connection, err := c.opener.OpenShardControl(ctx, node)
+	if err != nil || connection == nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return BuildRequest{}, "", target, false, errors.Join(ErrMissing, err)
+	}
+	defer connection.Close()
+	peer := connection.PeerIdentity()
+	domain := rafttransport.TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+	if connection.TrafficClass() != rafttransport.TrafficShardControl || peer.Node != node || peer.TrustDomain != domain {
+		return BuildRequest{}, "", target, false, rafttransport.ErrUnauthorized
+	}
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
+	if deadline := boundedClientDeadline(ctx, c.writeDeadline()); deadline.IsZero() {
+		return BuildRequest{}, "", target, false, ErrInvalid
+	} else if err = connection.SetWriteDeadline(deadline); err != nil {
+		return BuildRequest{}, "", target, false, err
+	}
+	raw, err := AppendBuildRequest(nil, lookup)
+	if err == nil {
+		err = writeAll(connection, raw)
+	}
+	if err != nil {
+		return BuildRequest{}, "", target, false, err
+	}
+	if deadline := boundedClientDeadline(ctx, c.readDeadline()); deadline.IsZero() {
+		return BuildRequest{}, "", target, false, ErrInvalid
+	} else if err = connection.SetReadDeadline(deadline); err != nil {
+		return BuildRequest{}, "", target, false, err
+	}
+	if n, admissionErr := readBuildResponseHeader(connection, lookup); admissionErr != nil || n != 0 {
+		return BuildRequest{}, "", target, false, errors.Join(admissionErr, ErrInvalid)
+	}
+	return readBuildResumeResponse(connection, lookup)
 }

@@ -27,6 +27,7 @@ type walGenerationDriver struct {
 	onError           func(error)
 	activationPending bool
 	building          bool
+	builder           *raftstore.GenerationBuilder
 	stop              chan struct{}
 	result            chan walGenerationBuildResult
 	worker            sync.WaitGroup
@@ -102,6 +103,7 @@ func (runtime *Runtime) maintainWALAdmission(err error) error {
 		// stale candidate before capturing the now-quiescent current cut.
 		result := <-driver.result
 		driver.building = false
+		driver.builder = nil
 		if result.builder != nil {
 			result.err = errors.Join(result.err, result.builder.Close())
 		}
@@ -118,6 +120,7 @@ func (runtime *Runtime) maintainWALAdmission(err error) error {
 	}
 	result := <-driver.result
 	driver.building, driver.ticks = false, 0
+	driver.builder = nil
 	if publishErr := runtime.publishBuiltWALGeneration(driver, result); publishErr != nil {
 		return errors.Join(err, publishErr)
 	}
@@ -139,6 +142,7 @@ func (runtime *Runtime) tickWALGeneration() {
 		select {
 		case result := <-driver.result:
 			driver.building = false
+			driver.builder = nil
 			driver.ticks = 0
 			if err := runtime.publishBuiltWALGeneration(driver, result); err != nil && driver.onError != nil {
 				driver.onError(err)
@@ -201,6 +205,7 @@ func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) e
 		return err
 	}
 	driver.building = true
+	driver.builder = builder
 	driver.worker.Add(1)
 	go func() {
 		defer driver.worker.Done()
@@ -276,6 +281,9 @@ func (driver *walGenerationDriver) stopAndWait() {
 		return
 	}
 	driver.stopOnce.Do(func() { close(driver.stop) })
+	if driver.builder != nil {
+		driver.builder.Cancel()
+	}
 	driver.worker.Wait()
 	select {
 	case result := <-driver.result:
@@ -284,6 +292,8 @@ func (driver *walGenerationDriver) stopAndWait() {
 		}
 	default:
 	}
+	driver.builder = nil
+	driver.building = false
 }
 
 // OpenBoundSQLWithApplyRecoveringGeneration is the production restart path.

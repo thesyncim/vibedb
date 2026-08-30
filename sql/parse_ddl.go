@@ -1,6 +1,6 @@
 package sql
 
-// Parsing CREATE TABLE and CREATE INDEX.
+// Parsing CREATE TABLE, CREATE INDEX, and bounded ALTER TABLE.
 //
 // The grammar:
 //
@@ -52,6 +52,53 @@ func (p *Parser) parseCreate(dst *Statement) error {
 		)
 	}
 	return p.errHere("expected TABLE, INDEX, VIEW, or MATERIALIZED VIEW after CREATE")
+}
+
+// parseAlterTable accepts the additive PostgreSQL spelling
+//
+//	ALTER TABLE name ADD [COLUMN] [IF NOT EXISTS] column type [NULL|NOT NULL]
+//
+// Other ALTER actions are refused precisely. Adding one field is enough to use
+// the ordinary replicated shadow-copy pipeline: existing documents are checked
+// against the target schema before its catalog generation is activated.
+func (p *Parser) parseAlterTable() error {
+	p.alter = AlterTableStmt{}
+	p.advance() // ALTER
+	if !p.acceptKeyword(kwTable) {
+		return p.featureNotSupportedHere("ALTER supports TABLE ADD COLUMN in the bounded catalog subset")
+	}
+	name, pos, err := p.parseCollectionName()
+	if err != nil {
+		return err
+	}
+	p.alter.Table, p.alter.Pos = name, pos
+	if !tokenTextEqual(p.tok, "ADD") {
+		return p.featureNotSupportedHere("ALTER TABLE supports ADD COLUMN; DROP, RENAME, TYPE, and constraint changes require distinct migration semantics")
+	}
+	p.advance()
+	if tokenTextEqual(p.tok, "COLUMN") {
+		p.advance()
+	}
+	exists, err := p.parseIfNotExists()
+	if err != nil {
+		return err
+	}
+	p.alter.IfNotExists = exists
+	p.out = &p.sel
+	*p.out = SelectStmt{}
+	p.beginFilter(name, pos)
+	column, err := p.parseColumnDef()
+	if err != nil {
+		return err
+	}
+	if column.PrimaryKey {
+		return p.errAt(column.Pos, "ALTER TABLE cannot add a PRIMARY KEY: changing document identity requires a separately coordinated table migration")
+	}
+	p.alter.Column = column
+	if err := p.expectEnd(); err != nil {
+		return err
+	}
+	return p.resolvePaths()
 }
 
 // --- CREATE TABLE ------------------------------------------------------------

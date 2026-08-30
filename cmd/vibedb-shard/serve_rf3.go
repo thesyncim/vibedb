@@ -57,8 +57,12 @@ const (
 	rf3StartupWriterLockWait             = 2 * time.Second
 	rf3DefaultExecutionLanes             = 8
 	rf3SchemaInstallRecords              = 256
-	rf3SchemaInstallArtifacts            = 16
-	rf3SchemaInstallDiskBytes            = 1 << 30
+	// Every admitted schema operation can own one immutable replica-local
+	// bundle until its authenticated drain completes. Keep artifact and journal
+	// cardinality equal; a smaller artifact directory would reject valid DDL
+	// while the bounded durable operation journal still had capacity.
+	rf3SchemaInstallArtifacts = rf3SchemaInstallRecords
+	rf3SchemaInstallDiskBytes = 1 << 30
 )
 
 // A variable keeps the production default immutable in behavior while letting
@@ -200,8 +204,11 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 		var err error
 		var runtimeDigest [32]byte
 		if index < initialCount {
+			runtimeDigest, err = loadRF3OriginManifestDigest(single)
+			if err != nil {
+				return result, closePreparedRF3Groups(result.groups, err)
+			}
 			base, applyIdentity, err = loadRF3RetainedIdentities(single)
-			runtimeDigest = base.RelationManifestDigest
 		} else {
 			entry := recovered[index-initialCount]
 			base, applyIdentity, runtimeDigest = entry.base, entry.apply, entry.runtimeDigest
@@ -209,11 +216,24 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 		if err != nil {
 			return result, closePreparedRF3Groups(result.groups, err)
 		}
+		description, err := sqldriver.DescribeReplicatedSchemaCatalog(bundle.SQL.Path)
+		if err != nil {
+			return result, closePreparedRF3Groups(result.groups,
+				errors.Join(fmt.Errorf("describe retained schema group %d: %w", index, err), rf3PreparingMarkerReadError(bundle.SQL.Path)))
+		}
+		single.SplitControl.ChildRegistry, err = refreshRF3SplitChildSchema(
+			single.SplitControl.ChildRegistry, description)
+		if err != nil {
+			return result, closePreparedRF3Groups(result.groups,
+				errors.Join(fmt.Errorf("refresh split child schema group %d: %w", index, err), rf3PreparingMarkerReadError(bundle.SQL.Path)))
+		}
 		if !rf3SplitChildTemplateMatchesRetained(
 			single.SplitControl.ChildRegistry, base, applyIdentity,
 		) || !rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
-			return result, closePreparedRF3Groups(result.groups,
-				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index))
+			return result, closePreparedRF3Groups(result.groups, errors.Join(
+				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index),
+				rf3PreparingMarkerReadError(bundle.SQL.Path),
+			))
 		}
 		group := groupFromBinding(base.Binding)
 		if !rf3RouteMatchesBinding(bundle.Route, base.Binding) {
@@ -243,8 +263,15 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 			return result, closePreparedRF3Groups(result.groups,
 				errors.Join(fmt.Errorf("open RF3 SQL/apply group %d: %w", index, err), wal.Close()))
 		}
-		if index < initialCount {
-			runtimeDigest = base.RelationManifestDigest
+		description, err = sqldriver.DescribeReplicatedSchemaCatalog(bundle.SQL.Path)
+		if err == nil {
+			single.SplitControl.ChildRegistry, err = refreshRF3SplitChildSchema(
+				single.SplitControl.ChildRegistry, description)
+		}
+		if err != nil {
+			return result, closePreparedRF3Groups(append(result.groups, preparedRF3Group{
+				manifest: single, base: base, applyIdentity: applyIdentity, key: key,
+				wal: wal, database: database, apply: apply}), err)
 		}
 		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
 		if !rf3SplitChildTemplateMatchesRetained(single.SplitControl.ChildRegistry, base, applyIdentity) ||
@@ -688,13 +715,14 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return err
 	}
+	schemaDeadline := servicetls.FixedDeadline(2 * time.Minute)
 	schemaControl, err := schemainstall.NewControlService(schemainstall.ControlOptions{
 		Installer: schemaInstaller,
 		Authorize: func(identity rafttransport.PeerIdentity, request schemainstall.Request, _ schemainstall.Command) bool {
 			_, err := transportRegistry.LocalMember(request.Group)
 			return err == nil && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
 		},
-		ReadDeadline: deadline, WriteDeadline: deadline,
+		ReadDeadline: schemaDeadline, WriteDeadline: schemaDeadline,
 		MaxBundleBytes: schemainstall.AbsoluteMaxBundleBytes,
 	})
 	if err != nil {
@@ -706,7 +734,7 @@ func servePreparedRF3WithExecutionLanes(
 			_, err := transportRegistry.LocalMember(request.Group)
 			return err == nil && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
 		},
-		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 2, BuildTimeout: 2 * time.Minute,
+		ReadDeadline: schemaDeadline, WriteDeadline: schemaDeadline, MaxConcurrent: 2, BuildTimeout: 2 * time.Minute,
 	})
 	if err != nil {
 		return err
@@ -1152,6 +1180,7 @@ func newRF3ControlMux(
 	}
 	if schemaBuild != nil {
 		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildRequestDiscriminator(), Handler: schemaBuild})
+		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildResumeRequestDiscriminator(), Handler: schemaBuild})
 	}
 	if planObservation != nil {
 		routes = append(routes, shardcontrol.Route{
@@ -1193,6 +1222,11 @@ func newRF3ControlMux(
 func hasRestoredRF3PreparingMarker(sqlPath string) (bool, error) {
 	_, found, err := restoredRF3PreparingOperation(sqlPath)
 	return found, err
+}
+
+func rf3PreparingMarkerReadError(sqlPath string) error {
+	_, err := readRF3BoundedFile(filepath.Join(filepath.Dir(sqlPath), "restore_preparing"), 37)
+	return err
 }
 
 func validateRestoredRF3Bootstrap(wal *raftstore.Store, sqlPath string, member uint64) ([32]byte, error) {
@@ -1290,26 +1324,67 @@ func loadRF3RetainedIdentities(manifest rf3Manifest) (
 	return base, apply, nil
 }
 
+// loadRF3OriginManifestDigest returns the immutable member-local authority
+// used to bind split runtime state. Schema generations replace relation
+// bundles, but they do not replace the prepared member root; using the current
+// relation digest here would strand authenticated split state after every DDL.
+func loadRF3OriginManifestDigest(manifest rf3Manifest) ([32]byte, error) {
+	var base sqldriver.ReplicatedShardStoreIdentity
+	if err := loadRF3IdentityFile(manifest.SQL.IdentityPath, &base); err != nil {
+		return [32]byte{}, fmt.Errorf("%w: split runtime origin identity: %v", errRF3Serving, err)
+	}
+	if base.RelationManifestDigest == ([32]byte{}) {
+		return [32]byte{}, fmt.Errorf("%w: split runtime origin manifest is empty", errRF3Serving)
+	}
+	return base.RelationManifestDigest, nil
+}
+
 func rf3SchemaSuccessorMatchesRetained(
 	retained sqldriver.ReplicatedShardStoreIdentity,
 	retainedApply sqldriver.ReplicatedApplyIdentity,
 	published sqldriver.ReplicatedShardStoreIdentity,
 	publishedApply sqldriver.ReplicatedApplyIdentity,
 ) bool {
+	return rf3SchemaSuccessorMismatch(retained, retainedApply, published, publishedApply) == nil
+}
+
+func rf3SchemaSuccessorMismatch(
+	retained sqldriver.ReplicatedShardStoreIdentity,
+	retainedApply sqldriver.ReplicatedApplyIdentity,
+	published sqldriver.ReplicatedShardStoreIdentity,
+	publishedApply sqldriver.ReplicatedApplyIdentity,
+) error {
 	if retained.Equal(published) && retainedApply == publishedApply {
-		return true
+		return nil
 	}
 	if retained.Binding.Authority.SchemaGeneration == ^uint64(0) ||
 		published.Binding.Authority.SchemaGeneration !=
 			retained.Binding.Authority.SchemaGeneration+1 {
-		return false
+		return fmt.Errorf("schema successor generation mismatch: retained=%d published=%d",
+			retained.Binding.Authority.SchemaGeneration, published.Binding.Authority.SchemaGeneration)
 	}
 	wantBinding := retained.Binding
 	wantBinding.Authority.SchemaGeneration++
 	wantApply := retainedApply
 	wantApply.ValidationDigest = publishedApply.ValidationDigest
-	return published.Binding == wantBinding && published.LogID == retained.LogID &&
-		published.UserTable == retained.UserTable && publishedApply == wantApply
+	if published.Binding != wantBinding {
+		return fmt.Errorf("schema successor binding mismatch: retained member=%d store=%x published member=%d store=%x",
+			retained.Binding.MemberID, retained.Binding.StoreID, published.Binding.MemberID, published.Binding.StoreID)
+	}
+	if published.LogID != retained.LogID || published.UserTable != retained.UserTable {
+		return fmt.Errorf("schema successor store mismatch: log=%t table=%t",
+			published.LogID == retained.LogID, published.UserTable == retained.UserTable)
+	}
+	if publishedApply != wantApply {
+		return fmt.Errorf("schema successor apply mismatch: storage=%t capture=%t profile=%t limits=%t placement=%t digest=%t",
+			publishedApply.Storage == wantApply.Storage,
+			publishedApply.CaptureStorage == wantApply.CaptureStorage,
+			publishedApply.ValidationProfile == wantApply.ValidationProfile,
+			publishedApply.SystemLimits == wantApply.SystemLimits && publishedApply.CaptureLimits == wantApply.CaptureLimits,
+			publishedApply.Placement == wantApply.Placement,
+			publishedApply.ValidationDigest == wantApply.ValidationDigest)
+	}
+	return nil
 }
 
 type rf3IdentityDecoder interface{ UnmarshalJSON([]byte) error }

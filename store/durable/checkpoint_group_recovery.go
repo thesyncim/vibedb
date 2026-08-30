@@ -286,11 +286,11 @@ func openCollectionsWithCheckpointGroup(
 	// can publish the target checkpoint certificate. A later namespace error
 	// must never turn a definitely unselected target into durable authority.
 	if err := validateCheckpointGroupDirectoryMembership(recovery.log, members); err != nil {
-		return abort(collections, err)
+		return abort(collections, fmt.Errorf("validate checkpoint directory membership: %w", err))
 	}
 	if err := validateCheckpointGroupCertificateMembers(certificate, members); err != nil {
 		if membershipAuthority == nil {
-			return abort(collections, err)
+			return abort(collections, fmt.Errorf("validate selected checkpoint certificate members: %w", err))
 		}
 		certificate, err = selectCheckpointMembershipForRecovery(
 			recovery.log, certificateFile, certificate, members, *membershipAuthority,

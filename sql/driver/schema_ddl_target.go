@@ -259,7 +259,9 @@ func (a *ReplicatedApply) buildReplicatedSchemaDDLImage(
 func refreshSchemaDDLTargetIdentity(target *catalogFile) {
 	identity := target.ReplicatedShardStore
 	identity.UserStorage = identity.Relations[0].Storage
-	identity.Relations[0].LocalIndexDigest = replicatedLocalIndexDigest(target.Tables[identity.UserTable].Indexes)
+	meta := target.Tables[identity.UserTable]
+	identity.Relations[0].LocalIndexDigest = replicatedLocalIndexDigest(meta.Indexes)
+	identity.Relations[0].SchemaDigest = replicatedSchemaDigest(meta.Schema)
 	identity.RelationManifestDigest = replicatedRelationManifestDigest(*identity)
 	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(*identity, target.ReplicatedApply.Placement)
 }
@@ -275,6 +277,34 @@ func lowerReplicatedSchemaDDL(target *catalogFile, statement *query.DMLStatement
 	}
 	tree := statement.Tree()
 	switch tree.Kind {
+	case sqlast.KindAlterTable:
+		definition, err := statement.LowerAlterTable()
+		if err != nil {
+			return false, false, err
+		}
+		if definition.Table != name {
+			return false, false, ErrTableNotFound
+		}
+		if meta.Schema == nil {
+			// A schemaless SQL table still derives physical identity from its
+			// declared primary-key path. The first additive field makes the store
+			// schema explicit, so carry that previously driver-enforced invariant
+			// into the compiled schema rather than accidentally weakening it.
+			meta.Schema = &schemaMeta{Root: uint16(store.SchemaObject), Fields: []schemaFieldMeta{{
+				Path: meta.PrimaryKey, Types: uint16(store.SchemaBool | store.SchemaNumber | store.SchemaString), Required: true,
+			}}}
+		}
+		for _, existing := range meta.Schema.Fields {
+			if existing.Path == definition.Field.Path {
+				if definition.IfNotExists {
+					return false, true, nil
+				}
+				return false, false, fmt.Errorf("vibedb: column already exists: %s", tree.AlterTable.Column.Path.Spec())
+			}
+		}
+		meta.Schema.Fields = append(meta.Schema.Fields, schemaFieldMeta{
+			Path: definition.Field.Path, Types: uint16(definition.Field.Types), Required: definition.Field.Required,
+		})
 	case sqlast.KindCreateIndex:
 		definition, err := statement.LowerIndex()
 		if err != nil {
@@ -315,7 +345,7 @@ func lowerReplicatedSchemaDDL(target *catalogFile, statement *query.DMLStatement
 		}
 		return true, false, nil
 	default:
-		return false, false, fmt.Errorf("%w: DDL target requires CREATE INDEX, DROP INDEX or TRUNCATE", ErrReplicatedSchemaCatalogImage)
+		return false, false, fmt.Errorf("%w: DDL target requires ALTER TABLE ADD COLUMN, CREATE INDEX, DROP INDEX or TRUNCATE", ErrReplicatedSchemaCatalogImage)
 	}
 	return false, false, nil
 }

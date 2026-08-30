@@ -181,7 +181,9 @@ func TestStrictInsertAndConditionalUpdateNormalApplyAndExactRetry(t *testing.T) 
 
 	missing := fixture.command(t, 3, replication.RelationMutationBatch{
 		Relation: 1, Mutations: []replication.Mutation{{
-			Kind: replication.MutationPutPresent, Key: []byte("missing"), Value: second,
+			// A missing conditional update is a no-op before replacement
+			// validation; the placeholder can never become stored state.
+			Kind: replication.MutationPutPresent, Key: []byte("missing"), Value: []byte("not-json"),
 		}},
 	})
 	if _, err := fixture.machine.ApplyNormal(normalMeta(5), missing); err != nil {

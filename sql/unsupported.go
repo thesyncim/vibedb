@@ -44,7 +44,6 @@ var unsupportedStatements = map[string]string{
 	"REPLACE": "REPLACE is not supported; INSERT into an existing key is refused, and deliberate overwrites use UPDATE",
 	"COPY":    "COPY is not supported: the wire endpoint does not implement the copy subprotocol",
 
-	"ALTER":   "ALTER is not in the bounded catalog subset; define the final table schema with CREATE TABLE before writing rows",
 	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"COMMENT": "catalog comments are not stored by the bounded SQL catalog",

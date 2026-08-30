@@ -141,6 +141,27 @@ func TestMachineSchemaTransitionFencesOldBundleAndReopensExactTarget(t *testing.
 		!committed || applied != 2 {
 		t.Fatalf("observe exact transition applied=%d committed=%t err=%v", applied, committed, err)
 	}
+	localTransition := transition
+	localTransition.CatalogCASDigest[0] ^= 1
+	local, err := AppendSchemaTransition(nil, localTransition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied, committed, aliasErr := fixture.machine.ObserveSchemaTransitionAlias(local, encoded); aliasErr != nil || !committed || applied != 2 {
+		t.Fatalf("observe local CAS alias applied=%d committed=%t err=%v", applied, committed, aliasErr)
+	}
+	if applied, committed, localErr := fixture.machine.ObserveSchemaTransition(local); localErr != nil || !committed || applied != 2 {
+		t.Fatalf("retained local CAS alias applied=%d committed=%t err=%v", applied, committed, localErr)
+	}
+	foreignAlias := localTransition
+	foreignAlias.RequestDigest[0] ^= 1
+	foreign, err := AppendSchemaTransition(nil, foreignAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, committed, aliasErr := fixture.machine.ObserveSchemaTransitionAlias(foreign, encoded); aliasErr == nil || committed {
+		t.Fatalf("foreign transition alias committed=%t err=%v", committed, aliasErr)
+	}
 	changedCommand := append([]byte(nil), encoded...)
 	changedCommand[len(changedCommand)-1] ^= 1
 	if _, committed, err := fixture.machine.ObserveSchemaTransition(changedCommand); err == nil || committed {

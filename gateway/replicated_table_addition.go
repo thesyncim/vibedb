@@ -81,7 +81,8 @@ func BuildReplicatedTableAddition(current, addition *Snapshot) (*Snapshot, error
 			continue
 		}
 		old, ok := current.Placement(profile.Table)
-		if !ok || existing != profile || old.Distribution != placement.Distribution || !slices.Equal(old.Columns, placement.Columns) {
+		if !ok || !replicatedProvisionProfileMatches(existing, profile) ||
+			old.Distribution != placement.Distribution || !slices.Equal(old.Columns, placement.Columns) {
 			return nil, &CatalogError{Reason: "table addition conflicts with an existing table"}
 		}
 		var oldDeclarations []ReplicatedTableDeclaration
@@ -90,7 +91,8 @@ func BuildReplicatedTableAddition(current, addition *Snapshot) (*Snapshot, error
 				oldDeclarations = append(oldDeclarations, d)
 			}
 		}
-		if !slices.Equal(oldDeclarations, addition.ReplicatedTableDeclarations()) {
+		if !replicatedProvisionDeclarationsMatch(existing.SchemaGeneration, profile.SchemaGeneration,
+			oldDeclarations, addition.ReplicatedTableDeclarations()) {
 			return nil, &CatalogError{Reason: "table declaration differs on resume"}
 		}
 		return current, nil
@@ -119,6 +121,23 @@ func BuildReplicatedTableAddition(current, addition *Snapshot) (*Snapshot, error
 	return advanceCatalogState(current, next)
 }
 
+func replicatedProvisionDeclarationsMatch(currentGeneration, originGeneration uint64,
+	current, origin []ReplicatedTableDeclaration,
+) bool {
+	return currentGeneration > originGeneration || slices.Equal(current, origin)
+}
+
+func replicatedProvisionProfileMatches(current, origin ReplicatedTableProfile) bool {
+	if current.Table != origin.Table || current.Relation != origin.Relation ||
+		current.PrimaryKey != origin.PrimaryKey || current.MaxKeyBytes != origin.MaxKeyBytes ||
+		current.MaxDocumentBytes != origin.MaxDocumentBytes ||
+		current.SchemaGeneration < origin.SchemaGeneration {
+		return false
+	}
+	return current.SchemaGeneration != origin.SchemaGeneration ||
+		current.LogicalSchemaDigest == origin.LogicalSchemaDigest
+}
+
 // RegisterProvisionedTable publishes only after a linearizable native read
 // proves the prepared group's serving fence. Publish uses the normal RF3
 // compare-and-swap and retains unknown commands for exact retry.
@@ -130,6 +149,14 @@ func (authority *ReplicatedCatalogAuthority) RegisterProvisionedTable(ctx contex
 	next, err := BuildReplicatedTableAddition(current, addition)
 	if err != nil {
 		return err
+	}
+	// Registration is catalog provisioning, not a serving-health check. An
+	// already registered table may be behind an authorized schema cut whose old
+	// route is intentionally fenced; probing the immutable generation-one
+	// provision in that state deadlocks gateway startup and prevents rollout
+	// recovery. Live readiness is enforced by routed reads and the route gate.
+	if next == current {
+		return nil
 	}
 	authorized, err := authority.authorizedContext(ctx)
 	if err != nil {
@@ -150,12 +177,6 @@ func (authority *ReplicatedCatalogAuthority) RegisterProvisionedTable(ctx contex
 	})
 	if err != nil {
 		return err
-	}
-	// A catalog entry survives a process restart, but its Raft leader does not.
-	// Idempotent registration must still prove the live serving fence before
-	// the supervisor advertises this table as ready.
-	if next == current {
-		return nil
 	}
 	err = authority.Publish(ctx, current.generation, next)
 	for retry := 0; retry < 3 && errors.Is(err, ErrReplicatedCatalogPending); retry++ {

@@ -15,21 +15,25 @@ import (
 )
 
 const (
-	buildRequestBytes    = 208
-	buildResponseBytes   = 56
-	maxBuildReceiptBytes = 32 << 20
+	buildRequestBytes          = 208
+	buildResponseBytes         = 56
+	maxBuildReceiptBytes       = 32 << 20
+	maxBuildResumeReceiptBytes = maxBuildReceiptBytes + sqldriver.ReplicatedChildSchemaMaxBytes + buildRequestBytes + 24
 )
 
 var buildRequestMagic = [8]byte{'V', 'B', 'S', 'B', 'R', 'E', 'Q', 1}
+var buildResumeRequestMagic = [8]byte{'V', 'B', 'S', 'B', 'R', 'S', 'M', 1}
 var buildResponseMagic = [8]byte{'V', 'B', 'S', 'B', 'R', 'E', 'S', 1}
 
-func BuildRequestDiscriminator() [8]byte { return buildRequestMagic }
+func BuildRequestDiscriminator() [8]byte       { return buildRequestMagic }
+func BuildResumeRequestDiscriminator() [8]byte { return buildResumeRequestMagic }
 
 // BuildRequest binds the source cut before target storage identities exist.
 // SQL follows the fixed header and is read only after peer authorization.
 // This is not an activation request; callers must hold the exclusive route
 // gate and retain the exact receipt before preparing a schema rollout.
 type BuildRequest struct {
+	Resume                     bool
 	Operation                  [32]byte
 	Group                      raftmember.GroupKey
 	AllocationGeneration       distribution.ShardAllocationGeneration
@@ -41,6 +45,14 @@ type BuildRequest struct {
 }
 
 func validBuildRequest(r BuildRequest) bool {
+	if r.Resume {
+		return r.Operation != ([32]byte{}) && r.Group.ClusterID != ([16]byte{}) &&
+			r.Group.ClusterIncarnation != ([16]byte{}) && r.Group.TopologyRecoveryEpoch != 0 &&
+			r.Group.ShardIncarnation != ([16]byte{}) && r.Group.GroupID != ([16]byte{}) &&
+			r.AllocationGeneration == 0 && r.FromSchemaGeneration == 0 &&
+			r.FromRelationManifestDigest == (replication.Digest{}) && r.SourceApplied == 0 &&
+			r.SQLBytes == 0 && r.SQLDigest == ([32]byte{})
+	}
 	return r.Operation != ([32]byte{}) && r.Group.ClusterID != ([16]byte{}) &&
 		r.Group.ClusterIncarnation != ([16]byte{}) && r.Group.TopologyRecoveryEpoch != 0 &&
 		r.Group.ShardIncarnation != ([16]byte{}) && r.Group.GroupID != ([16]byte{}) &&
@@ -56,7 +68,11 @@ func AppendBuildRequest(dst []byte, r BuildRequest) ([]byte, error) {
 	start := len(dst)
 	dst = append(dst, make([]byte, buildRequestBytes)...)
 	raw := dst[start:]
-	copy(raw, buildRequestMagic[:])
+	magic := buildRequestMagic
+	if r.Resume {
+		magic = buildResumeRequestMagic
+	}
+	copy(raw, magic[:])
 	copy(raw[8:40], r.Operation[:])
 	copy(raw[40:56], r.Group.ClusterID[:])
 	copy(raw[56:72], r.Group.ClusterIncarnation[:])
@@ -89,9 +105,10 @@ func ReadBuildRequest(reader io.Reader) (BuildRequest, error) {
 	if _, err := io.ReadFull(reader, raw[:]); err != nil {
 		return r, err
 	}
-	if !bytes.Equal(raw[:8], buildRequestMagic[:]) {
+	if !bytes.Equal(raw[:8], buildRequestMagic[:]) && !bytes.Equal(raw[:8], buildResumeRequestMagic[:]) {
 		return r, ErrInvalid
 	}
+	r.Resume = bytes.Equal(raw[:8], buildResumeRequestMagic[:])
 	copy(r.Operation[:], raw[8:40])
 	copy(r.Group.ClusterID[:], raw[40:56])
 	copy(r.Group.ClusterIncarnation[:], raw[56:72])
@@ -163,4 +180,75 @@ func readBuildResponse(reader io.Reader, request BuildRequest) (sqldriver.Replic
 		return sqldriver.ReplicatedSchemaDDLTarget{}, errors.Join(ErrInvalid, err)
 	}
 	return target, nil
+}
+
+func appendBuildResumeReceipt(dst []byte, request BuildRequest, sql string,
+	target sqldriver.ReplicatedSchemaDDLTarget, active bool,
+) ([]byte, error) {
+	if request.Resume || !validBuildRequest(request) || uint64(len(sql)) != request.SQLBytes ||
+		sha256.Sum256([]byte(sql)) != request.SQLDigest {
+		return dst, ErrInvalid
+	}
+	targetRaw, err := appendBuildReceipt(target, request)
+	if err != nil || len(targetRaw) > maxBuildReceiptBytes {
+		return dst, errors.Join(err, ErrInvalid)
+	}
+	dst, err = AppendBuildRequest(dst, request)
+	if err != nil {
+		return dst, err
+	}
+	var lengths [24]byte
+	binary.LittleEndian.PutUint64(lengths[:8], uint64(len(sql)))
+	binary.LittleEndian.PutUint64(lengths[8:16], uint64(len(targetRaw)))
+	if active {
+		binary.LittleEndian.PutUint64(lengths[16:24], 1)
+	}
+	dst = append(dst, lengths[:]...)
+	dst = append(dst, sql...)
+	dst = append(dst, targetRaw...)
+	return dst, nil
+}
+
+func readBuildResumeResponse(reader io.Reader, lookup BuildRequest) (BuildRequest, string,
+	sqldriver.ReplicatedSchemaDDLTarget, bool, error,
+) {
+	var request BuildRequest
+	var target sqldriver.ReplicatedSchemaDDLTarget
+	n, err := readBuildResponseHeader(reader, lookup)
+	if err != nil || n <= buildRequestBytes+24 || n > maxBuildResumeReceiptBytes {
+		return request, "", target, false, errors.Join(err, ErrInvalid)
+	}
+	body := make([]byte, int(n))
+	if _, err = io.ReadFull(reader, body); err != nil {
+		return request, "", target, false, err
+	}
+	request, err = ReadBuildRequest(bytes.NewReader(body[:buildRequestBytes]))
+	if err != nil || request.Resume || request.Operation != lookup.Operation || request.Group != lookup.Group {
+		return BuildRequest{}, "", target, false, errors.Join(err, ErrConflict)
+	}
+	sqlBytes := binary.LittleEndian.Uint64(body[buildRequestBytes : buildRequestBytes+8])
+	targetBytes := binary.LittleEndian.Uint64(body[buildRequestBytes+8 : buildRequestBytes+16])
+	activeRaw := binary.LittleEndian.Uint64(body[buildRequestBytes+16 : buildRequestBytes+24])
+	if activeRaw > 1 || sqlBytes != request.SQLBytes || sqlBytes+targetBytes+buildRequestBytes+24 != uint64(len(body)) {
+		return BuildRequest{}, "", target, false, ErrInvalid
+	}
+	active := activeRaw == 1
+	sqlStart := buildRequestBytes + 24
+	sqlEnd := sqlStart + int(sqlBytes)
+	sql := string(body[sqlStart:sqlEnd])
+	if sha256.Sum256([]byte(sql)) != request.SQLDigest {
+		return BuildRequest{}, "", target, false, ErrInvalid
+	}
+	if err = vibejson.Unmarshal(body[sqlEnd:], &target); err != nil {
+		return BuildRequest{}, "", sqldriver.ReplicatedSchemaDDLTarget{}, false, err
+	}
+	targetCanonical, err := appendBuildReceipt(target, request)
+	if err != nil || !bytes.Equal(targetCanonical, body[sqlEnd:]) {
+		return BuildRequest{}, "", sqldriver.ReplicatedSchemaDDLTarget{}, false, errors.Join(err, ErrInvalid)
+	}
+	canonical, err := appendBuildResumeReceipt(nil, request, sql, target, active)
+	if err != nil || !bytes.Equal(canonical, body) {
+		return BuildRequest{}, "", sqldriver.ReplicatedSchemaDDLTarget{}, false, errors.Join(err, ErrInvalid)
+	}
+	return request, sql, target, active, nil
 }

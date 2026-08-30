@@ -38,7 +38,7 @@ func validateSchemaDDLShadowRecord(r schemaDDLShadowRecord) error {
 	}
 	defer statement.Release()
 	kind := statement.Tree().Kind
-	if kind != sqlast.KindCreateIndex && kind != sqlast.KindDropIndex && kind != sqlast.KindTruncate ||
+	if kind != sqlast.KindAlterTable && kind != sqlast.KindCreateIndex && kind != sqlast.KindDropIndex && kind != sqlast.KindTruncate ||
 		r.Truncate != (kind == sqlast.KindTruncate) {
 		return ErrReplicatedSchemaDDLConflict
 	}

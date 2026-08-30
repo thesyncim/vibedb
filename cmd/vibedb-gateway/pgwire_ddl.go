@@ -17,14 +17,17 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
-func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthority) func(context.Context, serviceauthz.Authority, string) error {
+func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthority,
+	schema *gatewaySchemaDDLRuntime,
+) func(context.Context, serviceauthz.Authority, string) error {
 	var mu sync.Mutex
 	transport := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Minute}
 	return func(ctx context.Context, principal serviceauthz.Authority, text string) error {
-		if _, err := serviceauthz.WithAuthority(ctx, principal); err != nil {
+		var err error
+		if ctx, err = serviceauthz.WithAuthority(ctx, principal); err != nil {
 			return err
 		}
 		tree, err := sqlast.ParseStatement(text)
@@ -32,7 +35,10 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 			return err
 		}
 		if tree.CreateTable == nil {
-			return sqlast.NewFeatureNotSupportedError(text, 0, "this coordinator currently supports CREATE TABLE; other DDL requires a certified schema rollout")
+			if schema == nil {
+				return sqlast.NewFeatureNotSupportedError(text, 0, "distributed schema rollout is unavailable")
+			}
+			return schema.Execute(ctx, text)
 		}
 		mu.Lock()
 		defer mu.Unlock()

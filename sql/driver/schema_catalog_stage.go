@@ -164,6 +164,24 @@ func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTarget(
 	return a.recoverPreparedSchemaTargetProof(raw, requestDigest, proof)
 }
 
+// RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix re-audits the exact
+// immutable target without requiring the source machine to remain at the
+// prepared index. Its caller must first prove every intervening WAL entry is
+// an empty normal entry; the retained stage marker still supplies the original
+// membership and source cut.
+func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(
+	raw []byte, requestDigest [sha256.Size]byte,
+) (ReplicatedSchemaTargetProof, error) {
+	if a == nil || a.database == nil || requestDigest == ([32]byte{}) {
+		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
+	}
+	proof, err := a.CertifyReplicatedSchemaTarget(raw)
+	if err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	return a.recoverPreparedSchemaTargetProof(raw, requestDigest, proof)
+}
+
 // recoverPreparedSchemaTargetProof binds an already audited image to its
 // durable preparation. It never opens target collections or scans rows.
 func (a *ReplicatedApply) recoverPreparedSchemaTargetProof(raw []byte, requestDigest [32]byte, proof ReplicatedSchemaTargetProof) (ReplicatedSchemaTargetProof, error) {

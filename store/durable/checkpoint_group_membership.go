@@ -672,13 +672,20 @@ func readCheckpointMembershipFile(file *os.File) (checkpointMembershipCertificat
 		}
 		if selected.prepared.Sequence != 0 &&
 			(previous.prepared.Sequence != 0 || selected.prepared != checkpointMembershipWitness(previous) ||
-				selected.authorization != previous.authorization || previous.applied == math.MaxUint64 ||
-				selected.applied != previous.applied+1 || previous.txnHighWater == math.MaxUint64 ||
-				selected.txnHighWater != previous.txnHighWater+1 || !checkpointMembershipFinalizedMembers(previous.members, selected.members)) {
+				selected.authorization != previous.authorization ||
+				!checkpointMembershipFinalizedAdvance(previous, selected) ||
+				!checkpointMembershipFinalizedMembers(previous.members, selected.members)) {
 			return checkpointMembershipCertificate{}, ErrCheckpointMembershipTransition
 		}
 	}
 	return valid[len(valid)-1], nil
+}
+
+func checkpointMembershipFinalizedAdvance(previous, selected checkpointMembershipCertificate) bool {
+	if selected.applied <= previous.applied || selected.txnHighWater < previous.txnHighWater {
+		return false
+	}
+	return selected.applied-previous.applied == selected.txnHighWater-previous.txnHighWater
 }
 
 func checkpointMembershipChecksumValid(buf []byte) bool {

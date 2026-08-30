@@ -11,10 +11,47 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+type schemaQuiesceInboundHost struct {
+	ownerHost
+	adopted int
+}
+
+func (host *schemaQuiesceInboundHost) AdoptMessage(raftmember.GroupKey, *pb.Message) error {
+	host.adopted++
+	return nil
+}
+
+func TestOwnerDropsTransferredPeerTrafficOnlyWhileSchemaGenerationQuiesces(t *testing.T) {
+	group := peerServerTestGroup()
+	host := &schemaQuiesceInboundHost{}
+	generation := &ownerGeneration{}
+	owner := &Owner{host: host, members: map[raftmember.GroupKey]ownerMember{
+		group: {generation: generation},
+	}}
+	deliver := func() error {
+		reply := make(chan ownerReply, 1)
+		err := owner.handle(ownerRequest{kind: requestInbound, group: group,
+			inbound: rafttransport.Inbound{Group: group, Message: &pb.Message{}}, reply: reply})
+		if got := (<-reply).err; !errors.Is(got, err) {
+			t.Fatalf("reply=%v handle=%v", got, err)
+		}
+		return err
+	}
+	if err := deliver(); err != nil || host.adopted != 1 {
+		t.Fatalf("active inbound err=%v adopted=%d", err, host.adopted)
+	}
+	generation.quiescing.Store(true)
+	if err := deliver(); err != nil || host.adopted != 1 {
+		t.Fatalf("quiescing inbound err=%v adopted=%d", err, host.adopted)
+	}
+}
 
 func newDeliveryTestOwner() *Owner {
 	return &Owner{
@@ -123,6 +160,42 @@ func TestSchemaTransitionFenceAuthenticatesExactServingGeneration(t *testing.T) 
 	}
 	if schemaTransitionMatchesFence(opened, fence) {
 		t.Fatal("substituted source manifest accepted")
+	}
+}
+
+func TestCommittedSchemaFenceSettlesAlreadyActivatedTarget(t *testing.T) {
+	group := peerServerTestGroup()
+	command := CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+		ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 10,
+		RelationManifestDigest: [32]byte{6}, RoutingVersion: 10, RouteGeneration: 11}
+	transition := replicatedstate.SchemaTransition{
+		From: replicatedstate.Binding{
+			ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+			TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+			Distribution:          "docs", Shard: "0000-ffff", AllocationGeneration: 3,
+			ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
+			ActivePolicyGeneration: command.ActivePolicyGeneration,
+			ProtectionEpoch:        command.ProtectionEpoch, OwnershipEpoch: command.OwnershipEpoch,
+			SchemaGeneration: 9, RoutingVersion: command.RoutingVersion,
+			RouteGeneration: command.RouteGeneration,
+			OwnedRange:      distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+		ToSchemaGeneration: 10, ExpectedReplicaSetVersion: command.ReplicaSetVersion,
+		MembershipSequence: 1, MembershipSource: [32]byte{1}, MembershipTarget: [32]byte{2},
+		FromManifest: [32]byte{4}, FromApplyContract: [32]byte{5},
+		ToManifest: command.RelationManifestDigest, ToApplyContract: [32]byte{7},
+		RequestDigest: [32]byte{8}, AuthorizationDigest: [32]byte{9}, CatalogCASDigest: [32]byte{10},
+	}
+	encoded, err := replicatedstate.AppendSchemaTransition(nil, transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := &Owner{members: map[raftmember.GroupKey]ownerMember{
+		group: {identity: raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 3},
+			command: command, generation: &ownerGeneration{}},
+	}}
+	if err = owner.fenceCommittedSchemaGeneration(ownerRequest{group: group, data: encoded}); err != nil {
+		t.Fatalf("already activated target did not settle exact commit replay: %v", err)
 	}
 }
 

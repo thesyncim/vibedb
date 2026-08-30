@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -10,8 +11,130 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
+	"go.etcd.io/raft/v3"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+type schemaRecoveryWAL struct {
+	entries []*pb.Entry
+	err     error
+}
+
+func TestRF3SchemaReplayNeutralSuffix(t *testing.T) {
+	operation := sha256.Sum256([]byte("schema-operation"))
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	identity, binding := schemainstall.SchemaDDLRouteGateIdentity(operation, group)
+	client := replication.ID128{6}
+	base := replication.Command{AuthorityClass: replication.CommandAuthorityTopology,
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, Distribution: "data", Shard: "all",
+		AllocationGeneration: 1, ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1,
+		SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1, Tenant: []byte("public"),
+		ClientID: client, Fingerprint: sha256.Sum256([]byte("fingerprint")), RetryHome: replication.RetryHome{7}}
+	entry := func(index uint64, command replication.Command) *pb.Entry {
+		data, err := replication.AppendCommand(nil, command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entryType, term := pb.EntryNormal, uint64(1)
+		return &pb.Entry{Index: &index, Term: &term, Type: &entryType, Data: data}
+	}
+	open := base
+	open.Kind, open.ClientSequence, open.NextDeadlineUnixNano = replication.CommandSessionOpen, 1, 10
+	gate := base
+	gate.Kind, gate.ClientEpoch, gate.ClientSequence = replication.CommandRouteGate, 8, 2
+	gate.RouteGate, _ = routegate.AppendCommand(nil, routegate.Command{Operation: routegate.OperationBeginExclusive,
+		Epoch: 9, Identity: identity, Binding: binding})
+	retire := base
+	retire.Kind, retire.ClientEpoch, retire.ClientSequence = replication.CommandSessionRetire, 8, 3
+	release := retire
+	release.Kind = replication.CommandSessionRelease
+	wal := schemaRecoveryWAL{entries: []*pb.Entry{entry(8, open), entry(9, gate), entry(10, retire), entry(11, release)}}
+	if err := rf3SchemaReplayNeutralSuffix(wal, 7, 11, operation, group); err != nil {
+		t.Fatal(err)
+	}
+	if err := rf3SchemaReplayNeutralSuffix(schemaRecoveryWAL{entries: wal.entries[:3]}, 7, 10, operation, group); !errors.Is(err, schemainstall.ErrConflict) {
+		t.Fatalf("partial gate lifecycle accepted: %v", err)
+	}
+	foreign := operation
+	foreign[0] ^= 1
+	if err := rf3SchemaReplayNeutralSuffix(wal, 7, 11, foreign, group); !errors.Is(err, schemainstall.ErrConflict) {
+		t.Fatalf("foreign gate identity accepted: %v", err)
+	}
+}
+
+func (w schemaRecoveryWAL) Entries(lo, hi, _ uint64) ([]*pb.Entry, error) {
+	if w.err != nil {
+		return nil, w.err
+	}
+	var result []*pb.Entry
+	for _, entry := range w.entries {
+		if entry.GetIndex() >= lo && entry.GetIndex() < hi {
+			result = append(result, entry)
+		}
+	}
+	return result, nil
+}
+
+func TestRF3SchemaEmptyNormalSuffix(t *testing.T) {
+	empty := func(index uint64) *pb.Entry {
+		entryType, term := pb.EntryNormal, uint64(1)
+		return &pb.Entry{Index: &index, Term: &term, Type: &entryType}
+	}
+	wal := schemaRecoveryWAL{entries: []*pb.Entry{empty(8), empty(9), empty(10)}}
+	if err := rf3SchemaEmptyNormalSuffix(wal, 7, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := rf3SchemaEmptyNormalSuffix(wal, 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	command := empty(9)
+	command.Data = []byte{1}
+	for name, candidate := range map[string]schemaRecoveryWAL{
+		"command": {entries: []*pb.Entry{empty(8), command, empty(10)}},
+		"gap":     {entries: []*pb.Entry{empty(8), empty(10)}},
+		"read":    {err: errors.New("wal unavailable")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := rf3SchemaEmptyNormalSuffix(candidate, 7, 10); !errors.Is(err, schemainstall.ErrConflict) {
+				t.Fatalf("unsafe suffix accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestRF3SchemaCommittedTransitionAlias(t *testing.T) {
+	index, term, entryType := uint64(11), uint64(3), pb.EntryNormal
+	command := []byte("committed schema command")
+	entry := &pb.Entry{Index: &index, Term: &term, Type: &entryType, Data: command}
+	alias, err := rf3SchemaCommittedTransitionAlias(schemaRecoveryWAL{entries: []*pb.Entry{entry}}, index)
+	if err != nil || !bytes.Equal(alias, command) {
+		t.Fatalf("retained committed command = %q, %v", alias, err)
+	}
+	alias[0] ^= 1
+	if bytes.Equal(alias, entry.GetData()) {
+		t.Fatal("returned committed command aliases WAL storage")
+	}
+	if alias, err = rf3SchemaCommittedTransitionAlias(schemaRecoveryWAL{err: raft.ErrCompacted}, index); err != nil || alias != nil {
+		t.Fatalf("compacted committed command = %q, %v", alias, err)
+	}
+	for name, wal := range map[string]schemaRecoveryWAL{
+		"unavailable": {err: raft.ErrUnavailable},
+		"missing":     {},
+		"empty":       {entries: []*pb.Entry{{Index: &index, Term: &term, Type: &entryType}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := rf3SchemaCommittedTransitionAlias(wal, index); !errors.Is(err, schemainstall.ErrConflict) {
+				t.Fatalf("unsafe committed alias accepted: %v", err)
+			}
+		})
+	}
+}
 
 func testRF3SchemaRecoveryCommand(t *testing.T) (schemainstall.Request, schemainstall.Authorization, replicatedstate.SchemaTransitionView) {
 	t.Helper()
@@ -114,6 +237,31 @@ func TestRF3SchemaActivationBuildsOnlyAbsentValidatedCommand(t *testing.T) {
 	request.Group.GroupID[0]++
 	if _, err := rf3SchemaActivationCommand(request, authorization, replicatedstate.SchemaTransitionView{}, false, build); !errors.Is(err, schemainstall.ErrConflict) {
 		t.Fatalf("fresh foreign-group command permitted for persistence: %v", err)
+	}
+}
+
+func TestRF3SchemaActivationRecognizesExactRetiredPredecessor(t *testing.T) {
+	prior, _, transition := testRF3SchemaRecoveryCommand(t)
+	next := prior
+	next.Operation = [32]byte{41}
+	next.FromSchemaGeneration = prior.ToSchemaGeneration
+	next.FromRelationManifestDigest = prior.ToRelationManifestDigest
+	next.ToSchemaGeneration++
+	next.ToRelationManifestDigest = [32]byte{42}
+	if !rf3SchemaTransitionIsPredecessor(next, transition) {
+		t.Fatal("exact prior target was not recognized as the next rollout source")
+	}
+	for _, mutate := range []func(*schemainstall.Request){
+		func(r *schemainstall.Request) { r.Group.GroupID[0]++ },
+		func(r *schemainstall.Request) { r.AllocationGeneration++ },
+		func(r *schemainstall.Request) { r.FromSchemaGeneration++ },
+		func(r *schemainstall.Request) { r.FromRelationManifestDigest[0]++ },
+	} {
+		candidate := next
+		mutate(&candidate)
+		if rf3SchemaTransitionIsPredecessor(candidate, transition) {
+			t.Fatal("foreign predecessor was accepted")
+		}
 	}
 }
 

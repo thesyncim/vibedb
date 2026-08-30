@@ -53,6 +53,10 @@ func (c *conn) validateSurfaceContext(
 					statement.CreateIndex.Paths[i])
 			}
 		}
+	case sqlast.KindAlterTable:
+		if pseudoDocumentPath(statement.AlterTable.Column.Path) {
+			return reservedDocumentPathError(statement.AlterTable.Column.Path)
+		}
 	}
 	if statement.Kind == sqlast.KindDropTable && statement.DropTable.IfExists {
 		// DROP TABLE IF EXISTS is intentionally preparable before the table is

@@ -397,6 +397,12 @@ type SchemaSourceRecoveryProof struct {
 	AuthorizationDigest [sha256.Size]byte
 	CatalogCASDigest    [sha256.Size]byte
 	SourceApplied       uint64
+	// PreCommandApplied is nonzero only when the caller independently proved
+	// that (SourceApplied, PreCommandApplied] is an all-empty Raft-normal suffix.
+	PreCommandApplied uint64
+	// CommittedCommand is the exact WAL command when a replica-local catalog
+	// CAS makes it byte-distinct from Command. All other semantics must match.
+	CommittedCommand []byte
 }
 
 // RequestLedgerRange is the immutable, apply-contract-bound authority interval

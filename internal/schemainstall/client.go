@@ -55,6 +55,12 @@ func (client *Client) Activate(
 	return client.execute(ctx, node, CommandActivate, request, nil, authorization, DrainProof{})
 }
 
+func (client *Client) Commit(
+	ctx context.Context, node rafttransport.NodeID, request Request, authorization Authorization,
+) (Record, error) {
+	return client.execute(ctx, node, CommandCommit, request, nil, authorization, DrainProof{})
+}
+
 func (client *Client) Drain(
 	ctx context.Context, node rafttransport.NodeID, request Request,
 	authorization Authorization, proof DrainProof,
@@ -127,6 +133,8 @@ func (client *Client) execute(
 	wantState := StatePrepared
 	switch command {
 	case CommandAuthorize:
+		wantState = StateAuthorized
+	case CommandCommit:
 		wantState = StateAuthorized
 	case CommandActivate:
 		wantState = StateActive

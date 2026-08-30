@@ -1307,6 +1307,8 @@ func (client *catalogAuthorityClient) DoReplicated(
 			ReadApplied: state.Applied, Value: value,
 		}, nil
 	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	command, err := replication.OpenCommand(request.Command)
 	if err != nil {
 		return nil, err

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -25,7 +26,10 @@ func schemaDDLPlanFixture(t *testing.T, sql string, indexed bool) (*Snapshot, []
 	fixture, _, keys := replicatedSQLSplitTransactionFixture(t)
 	descriptors := fixture.ReplicatedShardDescriptors()
 	profile := fixture.replicatedTableProfiles()[0]
-	const create = "CREATE TABLE messages (id TEXT PRIMARY KEY, name TEXT NOT NULL, city TEXT)"
+	create := "CREATE TABLE messages (id TEXT PRIMARY KEY, name TEXT NOT NULL, city TEXT)"
+	if strings.Contains(sql, "IF NOT EXISTS department") {
+		create = "CREATE TABLE messages (id TEXT PRIMARY KEY, name TEXT NOT NULL, city TEXT, department TEXT)"
+	}
 	var builds []SchemaDDLReplicaBuild
 	for i := range descriptors {
 		d := &descriptors[i]
@@ -144,6 +148,8 @@ func TestSchemaDDLPlanBuildsCompleteDistributedCatalog(t *testing.T) {
 		{"CREATE INDEX by_name_city ON messages (name, city)", true, 2, false},
 		{"DROP INDEX by_city", true, 0, false},
 		{"TRUNCATE messages", true, 1, false},
+		{"ALTER TABLE messages ADD COLUMN department TEXT", false, 0, false},
+		{"ALTER TABLE messages ADD COLUMN IF NOT EXISTS department TEXT", false, 0, true},
 		{"CREATE INDEX IF NOT EXISTS by_city ON messages (city)", true, 1, true},
 	} {
 		t.Run(test.sql, func(t *testing.T) {
@@ -165,8 +171,16 @@ func TestSchemaDDLPlanBuildsCompleteDistributedCatalog(t *testing.T) {
 				}
 				return
 			}
-			if len(plans) != 6 || target.Generation() != base.Generation()+1 || !reflect.DeepEqual(target.ReplicatedTableDeclarations(), base.ReplicatedTableDeclarations()) {
+			declarationsChanged := strings.HasPrefix(test.sql, "ALTER TABLE")
+			if len(plans) != 6 || target.Generation() != base.Generation()+1 ||
+				(reflect.DeepEqual(target.ReplicatedTableDeclarations(), base.ReplicatedTableDeclarations()) == declarationsChanged) {
 				t.Fatal("incomplete plan or lost declarations")
+			}
+			if declarationsChanged {
+				info, ok := target.declaredTableInfo("messages")
+				if !ok || len(info.Columns) != 4 || info.Columns[3].Path != "/department" {
+					t.Fatalf("ALTER declaration = %+v", info)
+				}
 			}
 			beforeLedger, afterLedger := base.replicatedDescriptors()[2], target.replicatedDescriptors()[2]
 			if !reflect.DeepEqual(beforeLedger, afterLedger) || !reflect.DeepEqual(base.config, target.config) || !reflect.DeepEqual(base.endpoints, target.endpoints) {

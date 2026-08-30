@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"sync"
 )
@@ -31,6 +32,13 @@ type Backend interface {
 	Activate(context.Context, Request, Authorization, [32]byte) error
 	ObserveDrained(context.Context, Request, Authorization, DrainProof, [32]byte) (bool, error)
 	DrainOld(context.Context, Request, Authorization, DrainProof, [32]byte) error
+}
+
+// CommitBackend durably commits the authorized logical transition without
+// replacing this replica's live generation. Keeping this phase separate lets
+// every voter observe one exact Raft command before rolling local activation.
+type CommitBackend interface {
+	Commit(context.Context, Request, Authorization, [32]byte) error
 }
 
 type Options struct {
@@ -87,7 +95,16 @@ func (installer *Installer) Prepare(ctx context.Context, request Request, bundle
 		current, err := installer.journal.Read(ctx, request.Operation)
 		if err == nil {
 			if current.Request != request {
-				return ErrConflict
+				return fmt.Errorf("%w: group=%t allocation=%t from-generation=%t from-manifest=%t to-generation=%t to-manifest=%t contract=%t bundle-digest=%t bundle-bytes=%t",
+					ErrConflict, current.Request.Group == request.Group,
+					current.Request.AllocationGeneration == request.AllocationGeneration,
+					current.Request.FromSchemaGeneration == request.FromSchemaGeneration,
+					current.Request.FromRelationManifestDigest == request.FromRelationManifestDigest,
+					current.Request.ToSchemaGeneration == request.ToSchemaGeneration,
+					current.Request.ToRelationManifestDigest == request.ToRelationManifestDigest,
+					current.Request.ApplyContractDigest == request.ApplyContractDigest,
+					current.Request.BundleDigest == request.BundleDigest,
+					current.Request.BundleBytes == request.BundleBytes)
 			}
 			receipt = receiptFor(current)
 			return nil
@@ -170,7 +187,8 @@ func (installer *Installer) Activate(ctx context.Context, authorization Authoriz
 			return err
 		}
 		if current.Authorization != authorization || current.State == StatePrepared {
-			return ErrConflict
+			return fmt.Errorf("%w: activation authorization-match=%t state=%d",
+				ErrConflict, current.Authorization == authorization, current.State)
 		}
 		if current.State >= StateActive {
 			result = current
@@ -178,14 +196,15 @@ func (installer *Installer) Activate(ctx context.Context, authorization Authoriz
 		}
 		active, err := installer.backend.ObserveActive(ctx, current.Request, authorization, current.Installation)
 		if err != nil {
-			return err
+			return fmt.Errorf("schemainstall: observe active target: %w", err)
 		}
 		if !active {
 			err = installer.backend.Activate(ctx, current.Request, authorization, current.Installation)
 			if err != nil {
 				active, observeErr := installer.backend.ObserveActive(ctx, current.Request, authorization, current.Installation)
 				if observeErr != nil || !active {
-					return errors.Join(ErrOutcomeUnknown, err, observeErr)
+					return fmt.Errorf("schemainstall: activate target: %w",
+						errors.Join(ErrOutcomeUnknown, err, observeErr))
 				}
 			}
 		}
@@ -199,6 +218,36 @@ func (installer *Installer) Activate(ctx context.Context, authorization Authoriz
 			}
 		}
 		result = next
+		return nil
+	})
+	return result, err
+}
+
+func (installer *Installer) Commit(ctx context.Context, authorization Authorization) (Record, error) {
+	if !validAuthorization(authorization, authorization.Operation) {
+		return Record{}, ErrInvalid
+	}
+	var result Record
+	err := installer.withOperation(ctx, authorization.Operation, func() error {
+		current, err := installer.journal.Read(ctx, authorization.Operation)
+		if err != nil {
+			return err
+		}
+		if current.Authorization != authorization || current.State == StatePrepared {
+			return ErrConflict
+		}
+		if current.State >= StateActive {
+			result = current
+			return nil
+		}
+		backend, ok := installer.backend.(CommitBackend)
+		if !ok {
+			return ErrInvalid
+		}
+		if err = backend.Commit(ctx, current.Request, authorization, current.Installation); err != nil {
+			return err
+		}
+		result = current
 		return nil
 	})
 	return result, err

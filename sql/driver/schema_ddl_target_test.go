@@ -27,6 +27,7 @@ func TestReplicatedSchemaDDLTargetBuildsIndexedAndTruncatedImages(t *testing.T) 
 		{"truncate", "TRUNCATE TABLE docs", 0, 0, false},
 		{"truncate-indexed", "TRUNCATE TABLE docs", 0, 1, true},
 		{"drop-index", "DROP INDEX by_city", 1000, 0, true},
+		{"alter-add-column", "ALTER TABLE docs ADD COLUMN department TEXT", 1000, 0, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path, db, binding, _ := prepareReplicatedTestRoot(t, test.name, false)
@@ -91,6 +92,12 @@ func TestReplicatedSchemaDDLTargetBuildsIndexedAndTruncatedImages(t *testing.T) 
 				identity.RelationSchemaGeneration != base.RelationSchemaGeneration+1 ||
 				catalog.ReplicatedApply.Storage != beforeApply.Storage || catalog.ReplicatedApply.CaptureStorage != beforeApply.CaptureStorage {
 				t.Fatal("DDL changed durable request or logical shard identity")
+			}
+			if test.name == "alter-add-column" {
+				columns := tableInfoFromMeta("docs", catalog.Tables["docs"]).Columns
+				if len(columns) != 2 || columns[1].Path != "/department" || columns[1].Required {
+					t.Fatalf("ALTER target columns = %+v", columns)
+				}
 			}
 			afterCatalog, err := os.ReadFile(path)
 			if err != nil || !bytes.Equal(beforeCatalog, afterCatalog) || claim.Applied() != before {

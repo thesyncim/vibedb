@@ -66,6 +66,20 @@ func schemaFenceFixture(t *testing.T) (string, []byte, []byte, replicatedSchemaS
 	return path, source, target, marker, replicatedSchemaActivation{targetDigest: image.Digest, command: command}
 }
 
+func TestReplicatedSchemaActivationEmptySuffixRoundTrip(t *testing.T) {
+	_, _, _, _, activation := schemaFenceFixture(t)
+	activation.preparedApplied, activation.preCommandApplied = 7, 11
+	raw, err := encodeReplicatedSchemaActivation(activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeReplicatedSchemaActivation(raw)
+	if err != nil || decoded.preparedApplied != 7 || decoded.preCommandApplied != 11 ||
+		decoded.targetDigest != activation.targetDigest || !bytes.Equal(decoded.command, activation.command) {
+		t.Fatalf("activation round trip: %+v err=%v", decoded, err)
+	}
+}
+
 func TestReplicatedSchemaArtifactRetriesRequireSuccessfulDirectoryFence(t *testing.T) {
 	for _, name := range []string{"target-catalog", "stage-marker", "activation"} {
 		t.Run(name, func(t *testing.T) {

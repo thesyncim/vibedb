@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -122,6 +124,8 @@ type GenerationBuilder struct {
 
 	loaded                bool
 	closed                bool
+	cancel                chan struct{}
+	cancelOnce            sync.Once
 	seal                  generationSeal
 	candidateFileID       [16]byte
 	candidateHeaderDigest [sha256.Size]byte
@@ -199,8 +203,9 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		sourceReadyID: generationReadyFloor(store.current, store.generation),
 		directoryInfo: store.directoryInfo, sourceInfo: store.fileInfo,
 		header: header, current: current, options: store.options,
-		link: linkGenerationName,
-		key:  key, input: GenerationInput{
+		link:   linkGenerationName,
+		cancel: make(chan struct{}),
+		key:    key, input: GenerationInput{
 			Snapshot: cloneSnapshot(input.Snapshot), SnapshotBaseDigest: input.SnapshotBaseDigest,
 			RetentionCommitment: input.RetentionCommitment,
 		},
@@ -240,6 +245,9 @@ func (builder *GenerationBuilder) Build() (
 	if builder == nil || builder.closed {
 		return GenerationCandidate{}, ErrClosed
 	}
+	if err := builder.cancelled(); err != nil {
+		return GenerationCandidate{}, err
+	}
 	if err := builder.acquireSource(); err != nil {
 		return GenerationCandidate{}, err
 	}
@@ -250,6 +258,9 @@ func (builder *GenerationBuilder) Build() (
 	}
 	defer func() { resultErr = errors.Join(resultErr, lease.Close()) }()
 	if err := builder.reclaimAbandonedStage(); err != nil {
+		return GenerationCandidate{}, err
+	}
+	if err := builder.cancelled(); err != nil {
 		return GenerationCandidate{}, err
 	}
 	if candidate, found, err := builder.validateExistingCandidate(); found || err != nil {
@@ -293,6 +304,9 @@ func (builder *GenerationBuilder) Build() (
 	if err := builder.finishGenerationScratch(stage, scratch, sourceHeader); err != nil {
 		return GenerationCandidate{}, err
 	}
+	if err := builder.cancelled(); err != nil {
+		return GenerationCandidate{}, err
+	}
 	publicationErr := builder.publishStage(stage)
 	if publicationErr != nil && !errors.Is(publicationErr, errGenerationContended) {
 		return GenerationCandidate{}, publicationErr
@@ -314,6 +328,28 @@ func (builder *GenerationBuilder) Build() (
 		return GenerationCandidate{}, err
 	}
 	return candidate, nil
+}
+
+// Cancel asks an in-progress offline generation build to stop at its next
+// bounded record/chunk boundary. It never mutates the serving WAL and is safe
+// to call concurrently with Build.
+func (builder *GenerationBuilder) Cancel() {
+	if builder == nil || builder.cancel == nil {
+		return
+	}
+	builder.cancelOnce.Do(func() { close(builder.cancel) })
+}
+
+func (builder *GenerationBuilder) cancelled() error {
+	if builder == nil || builder.cancel == nil {
+		return nil
+	}
+	select {
+	case <-builder.cancel:
+		return context.Canceled
+	default:
+		return nil
+	}
 }
 
 func (builder *GenerationBuilder) acquireSource() error {

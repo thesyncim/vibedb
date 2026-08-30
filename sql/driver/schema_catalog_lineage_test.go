@@ -62,10 +62,17 @@ func TestReplicatedSchemaLineageRejectsCorruptOrSubstitutedAuthority(t *testing.
 	if _, found, err := readReplicatedSchemaLineage(directory); err != nil || !found {
 		t.Fatalf("valid lineage: %v", err)
 	}
-	foreign := record
-	foreign.marker.membership.Sequence++
-	if _, err := encodeReplicatedSchemaLineage(foreign); err == nil {
-		t.Fatal("foreign membership accepted")
+	local := record
+	local.marker.membership.Sequence++
+	local.marker.membership.Source = sha256.Sum256([]byte("replica-local-source"))
+	local.marker.membership.Target = sha256.Sum256([]byte("replica-local-target"))
+	if _, err := encodeReplicatedSchemaLineage(local); err != nil {
+		t.Fatalf("independent replica-local membership rejected: %v", err)
+	}
+	invalid := local
+	invalid.marker.membership.Sequence = 0
+	if _, err := encodeReplicatedSchemaLineage(invalid); err == nil {
+		t.Fatal("invalid local membership accepted")
 	}
 	if err := os.Rename(lineagePath, lineagePath+".saved"); err != nil {
 		t.Fatal(err)
@@ -136,6 +143,7 @@ func TestReplicatedSchemaLineageRepeatedDDLAndRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	var selectedCommand []byte
 	for step, test := range []struct {
 		sql           string
 		rows, indexes int
@@ -143,6 +151,7 @@ func TestReplicatedSchemaLineageRepeatedDDLAndRestart(t *testing.T) {
 		{"CREATE INDEX by_city ON docs (city)", 1000, 1},
 		{"CREATE INDEX by_score ON docs (score)", 1000, 2},
 		{"DROP INDEX by_city", 1000, 1},
+		{"ALTER TABLE docs ADD COLUMN department TEXT", 1000, 1},
 		{"TRUNCATE TABLE docs", 0, 1},
 		{"DROP INDEX by_score", 0, 0},
 	} {
@@ -164,6 +173,15 @@ func TestReplicatedSchemaLineageRepeatedDDLAndRestart(t *testing.T) {
 			}
 			if recovered, err := claim.RecoverPreparedReplicatedSchemaTarget(target.Catalog, request); err != nil || recovered != proof {
 				t.Fatalf("foreign prepare altered the original receipt: %v", err)
+			}
+			if step > 0 {
+				// The successor marker is staged before its activation command.
+				// Cold recovery must still select the prior drained lineage rather
+				// than pair the prior activation with this new marker.
+				selected, found, observeErr := ObservePersistedReplicatedSchemaTransition(path)
+				if observeErr != nil || !found || !bytes.Equal(selected.Bytes(), selectedCommand) {
+					t.Fatalf("staged successor hid selected transition: found=%t err=%v", found, observeErr)
+				}
 			}
 			// Crash after new membership and target files are prepared, while
 			// the activation slot may still contain the prior drained command.
@@ -197,6 +215,7 @@ func TestReplicatedSchemaLineageRepeatedDDLAndRestart(t *testing.T) {
 			if published, err := claim.PublishReplicatedSchemaCatalog(); err != nil || !published {
 				t.Fatalf("publish=%v: %v", published, err)
 			}
+			selectedCommand = bytes.Clone(command)
 			catalog, _, err := openReplicatedSchemaCatalogImage(target.Catalog)
 			if err != nil {
 				t.Fatal(err)
