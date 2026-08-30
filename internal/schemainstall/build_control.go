@@ -22,6 +22,10 @@ type schemaBuildResumer interface {
 	ResumeSchemaBuild(context.Context, [32]byte, raftmember.GroupKey) (BuildRequest, string, sqldriver.ReplicatedSchemaDDLTarget, bool, error)
 }
 
+type schemaShadowBuilder interface {
+	BuildSchemaShadow(context.Context, BuildRequest, string) (bool, error)
+}
+
 type BuildControlOptions struct {
 	Builder                     SchemaBuilder
 	Authorize                   func(rafttransport.PeerIdentity, BuildRequest) bool
@@ -105,6 +109,24 @@ func (s *BuildControlService) Serve(ctx context.Context, connection rafttranspor
 	// reserved build identity survives deadline cancellation for exact retry.
 	buildCtx, cancel := context.WithTimeout(ctx, s.options.BuildTimeout)
 	defer cancel()
+	if r.Shadow {
+		builder, ok := s.options.Builder.(schemaShadowBuilder)
+		if !ok {
+			return s.writeResponse(ctx, connection, r, ResponseInvalid, nil)
+		}
+		noOp, shadowErr := builder.BuildSchemaShadow(buildCtx, r, string(sql))
+		var body []byte
+		if shadowErr == nil {
+			body = []byte{0}
+			if noOp {
+				body[0] = 1
+			}
+		}
+		if writeErr := s.writeResponse(ctx, connection, r, responseCode(shadowErr), body); writeErr != nil {
+			return writeErr
+		}
+		return shadowErr
+	}
 	target, err := s.options.Builder.BuildSchema(buildCtx, r, string(sql))
 	var body []byte
 	if err == nil {
@@ -156,7 +178,7 @@ func (s *BuildControlService) writeResponse(ctx context.Context, connection raft
 // a replacement operation or infer that a timed-out build did not run.
 func (c *Client) Build(ctx context.Context, node rafttransport.NodeID, request BuildRequest, sql string) (sqldriver.ReplicatedSchemaDDLTarget, error) {
 	var target sqldriver.ReplicatedSchemaDDLTarget
-	if c == nil || ctx == nil || node == (rafttransport.NodeID{}) || !validBuildRequest(request) ||
+	if c == nil || ctx == nil || node == (rafttransport.NodeID{}) || request.Shadow || !validBuildRequest(request) ||
 		uint64(len(sql)) != request.SQLBytes || sha256.Sum256([]byte(sql)) != request.SQLDigest {
 		return target, ErrInvalid
 	}
@@ -215,6 +237,70 @@ func (c *Client) Build(ctx context.Context, node rafttransport.NodeID, request B
 		return target, errors.Join(ErrOutcomeUnknown, err)
 	}
 	return target, nil
+}
+
+// BuildShadow starts or resumes an online snapshot copy and change capture on
+// one replica. Success is not an activation receipt; the ordinary Build RPC
+// finalizes it at the later exact fenced cut.
+func (c *Client) BuildShadow(ctx context.Context, node rafttransport.NodeID, request BuildRequest, sql string) (bool, error) {
+	if c == nil || ctx == nil || node == (rafttransport.NodeID{}) || !request.Shadow ||
+		!validBuildRequest(request) || uint64(len(sql)) != request.SQLBytes ||
+		sha256.Sum256([]byte(sql)) != request.SQLDigest {
+		return false, ErrInvalid
+	}
+	connection, err := c.opener.OpenShardControl(ctx, node)
+	if err != nil || connection == nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return false, errors.Join(ErrMissing, err)
+	}
+	defer connection.Close()
+	peer := connection.PeerIdentity()
+	domain := rafttransport.TrustDomain{ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation}
+	if connection.TrafficClass() != rafttransport.TrafficShardControl || peer.Node != node || peer.TrustDomain != domain {
+		return false, rafttransport.ErrUnauthorized
+	}
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
+	if deadline := boundedClientDeadline(ctx, c.writeDeadline()); deadline.IsZero() {
+		return false, ErrInvalid
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return false, err
+	}
+	raw, err := AppendBuildRequest(nil, request)
+	if err != nil {
+		return false, err
+	}
+	if err = writeAll(connection, raw); err != nil {
+		return false, err
+	}
+	if deadline := boundedClientDeadline(ctx, c.readDeadline()); deadline.IsZero() {
+		return false, ErrInvalid
+	} else if err := connection.SetReadDeadline(deadline); err != nil {
+		return false, err
+	}
+	if n, err := readBuildResponseHeader(connection, request); err != nil || n != 0 {
+		return false, errors.Join(ErrInvalid, err)
+	}
+	if err := writeAll(connection, []byte(sql)); err != nil {
+		return false, errors.Join(ErrOutcomeUnknown, err)
+	}
+	n, err := readBuildResponseHeader(connection, request)
+	if err != nil {
+		if errors.Is(err, ErrConflict) || errors.Is(err, ErrBound) || errors.Is(err, rafttransport.ErrUnauthorized) {
+			return false, err
+		}
+		return false, errors.Join(ErrOutcomeUnknown, err)
+	}
+	if n != 1 {
+		return false, ErrInvalid
+	}
+	var body [1]byte
+	if _, err := io.ReadFull(connection, body[:]); err != nil || body[0] > 1 {
+		return false, errors.Join(ErrOutcomeUnknown, err)
+	}
+	return body[0] == 1, nil
 }
 
 // ResumeBuild reads the exact retained build request, SQL and target receipt.

@@ -163,3 +163,32 @@ func rejectMutableSchemaShadow(directory string) error {
 	}
 	return nil
 }
+
+// ObserveReplicatedSchemaDDLShadow reports whether the one retained online
+// build slot belongs to operation. It is a read-only dispatch hint; finalizing
+// still reauthenticates the complete shadow record and capture stream.
+func (a *ReplicatedApply) ObserveReplicatedSchemaDDLShadow(operation [32]byte) (bool, error) {
+	if a == nil || a.database == nil || operation == ([32]byte{}) {
+		return false, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	err := a.checkLocked()
+	directory := a.database.dataDir
+	a.database.mu.RUnlock()
+	if err != nil {
+		return false, err
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	record, found, err := readSchemaDDLShadowRecord(root)
+	if err != nil || !found {
+		return false, err
+	}
+	if record.Shadow.Operation != operation {
+		return false, ErrReplicatedSchemaDDLConflict
+	}
+	return true, nil
+}

@@ -23,10 +23,12 @@ const (
 
 var buildRequestMagic = [8]byte{'V', 'B', 'S', 'B', 'R', 'E', 'Q', 1}
 var buildResumeRequestMagic = [8]byte{'V', 'B', 'S', 'B', 'R', 'S', 'M', 1}
+var buildShadowRequestMagic = [8]byte{'V', 'B', 'S', 'B', 'S', 'H', 'D', 1}
 var buildResponseMagic = [8]byte{'V', 'B', 'S', 'B', 'R', 'E', 'S', 1}
 
 func BuildRequestDiscriminator() [8]byte       { return buildRequestMagic }
 func BuildResumeRequestDiscriminator() [8]byte { return buildResumeRequestMagic }
+func BuildShadowRequestDiscriminator() [8]byte { return buildShadowRequestMagic }
 
 // BuildRequest binds the source cut before target storage identities exist.
 // SQL follows the fixed header and is read only after peer authorization.
@@ -34,6 +36,7 @@ func BuildResumeRequestDiscriminator() [8]byte { return buildResumeRequestMagic 
 // gate and retain the exact receipt before preparing a schema rollout.
 type BuildRequest struct {
 	Resume                     bool
+	Shadow                     bool
 	Operation                  [32]byte
 	Group                      raftmember.GroupKey
 	AllocationGeneration       distribution.ShardAllocationGeneration
@@ -46,6 +49,9 @@ type BuildRequest struct {
 
 func validBuildRequest(r BuildRequest) bool {
 	if r.Resume {
+		if r.Shadow {
+			return false
+		}
 		return r.Operation != ([32]byte{}) && r.Group.ClusterID != ([16]byte{}) &&
 			r.Group.ClusterIncarnation != ([16]byte{}) && r.Group.TopologyRecoveryEpoch != 0 &&
 			r.Group.ShardIncarnation != ([16]byte{}) && r.Group.GroupID != ([16]byte{}) &&
@@ -53,11 +59,12 @@ func validBuildRequest(r BuildRequest) bool {
 			r.FromRelationManifestDigest == (replication.Digest{}) && r.SourceApplied == 0 &&
 			r.SQLBytes == 0 && r.SQLDigest == ([32]byte{})
 	}
-	return r.Operation != ([32]byte{}) && r.Group.ClusterID != ([16]byte{}) &&
+	return r.Operation != ([32]byte{}) && !r.Resume &&
+		r.Group.ClusterID != ([16]byte{}) &&
 		r.Group.ClusterIncarnation != ([16]byte{}) && r.Group.TopologyRecoveryEpoch != 0 &&
 		r.Group.ShardIncarnation != ([16]byte{}) && r.Group.GroupID != ([16]byte{}) &&
 		r.AllocationGeneration != 0 && r.FromSchemaGeneration != 0 && r.FromSchemaGeneration != ^uint64(0) &&
-		r.FromRelationManifestDigest != (replication.Digest{}) && r.SourceApplied != 0 &&
+		r.FromRelationManifestDigest != (replication.Digest{}) && (r.Shadow || r.SourceApplied != 0) &&
 		r.SQLBytes > 0 && r.SQLBytes <= sqldriver.ReplicatedChildSchemaMaxBytes && r.SQLDigest != ([32]byte{})
 }
 
@@ -71,6 +78,8 @@ func AppendBuildRequest(dst []byte, r BuildRequest) ([]byte, error) {
 	magic := buildRequestMagic
 	if r.Resume {
 		magic = buildResumeRequestMagic
+	} else if r.Shadow {
+		magic = buildShadowRequestMagic
 	}
 	copy(raw, magic[:])
 	copy(raw[8:40], r.Operation[:])
@@ -105,10 +114,12 @@ func ReadBuildRequest(reader io.Reader) (BuildRequest, error) {
 	if _, err := io.ReadFull(reader, raw[:]); err != nil {
 		return r, err
 	}
-	if !bytes.Equal(raw[:8], buildRequestMagic[:]) && !bytes.Equal(raw[:8], buildResumeRequestMagic[:]) {
+	if !bytes.Equal(raw[:8], buildRequestMagic[:]) && !bytes.Equal(raw[:8], buildResumeRequestMagic[:]) &&
+		!bytes.Equal(raw[:8], buildShadowRequestMagic[:]) {
 		return r, ErrInvalid
 	}
 	r.Resume = bytes.Equal(raw[:8], buildResumeRequestMagic[:])
+	r.Shadow = bytes.Equal(raw[:8], buildShadowRequestMagic[:])
 	copy(r.Operation[:], raw[8:40])
 	copy(r.Group.ClusterID[:], raw[40:56])
 	copy(r.Group.ClusterIncarnation[:], raw[56:72])
@@ -185,7 +196,7 @@ func readBuildResponse(reader io.Reader, request BuildRequest) (sqldriver.Replic
 func appendBuildResumeReceipt(dst []byte, request BuildRequest, sql string,
 	target sqldriver.ReplicatedSchemaDDLTarget, active bool,
 ) ([]byte, error) {
-	if request.Resume || !validBuildRequest(request) || uint64(len(sql)) != request.SQLBytes ||
+	if request.Resume || request.Shadow || !validBuildRequest(request) || uint64(len(sql)) != request.SQLBytes ||
 		sha256.Sum256([]byte(sql)) != request.SQLDigest {
 		return dst, ErrInvalid
 	}
@@ -223,7 +234,7 @@ func readBuildResumeResponse(reader io.Reader, lookup BuildRequest) (BuildReques
 		return request, "", target, false, err
 	}
 	request, err = ReadBuildRequest(bytes.NewReader(body[:buildRequestBytes]))
-	if err != nil || request.Resume || request.Operation != lookup.Operation || request.Group != lookup.Group {
+	if err != nil || request.Resume || request.Shadow || request.Operation != lookup.Operation || request.Group != lookup.Group {
 		return BuildRequest{}, "", target, false, errors.Join(err, ErrConflict)
 	}
 	sqlBytes := binary.LittleEndian.Uint64(body[buildRequestBytes : buildRequestBytes+8])

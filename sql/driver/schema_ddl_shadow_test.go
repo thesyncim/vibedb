@@ -181,6 +181,32 @@ func TestReplicatedSchemaDDLShadowThousandRowsWithConcurrentInsert(t *testing.T)
 	assertSchemaShadowRows(t, claim, shadow, 1001, "Porto", 1)
 }
 
+func TestReplicatedSchemaDDLShadowFinalizesOrdinaryBuildReceiptAtFencedCut(t *testing.T) {
+	_, db, base, _, claim := schemaDDLJournalFixture(t)
+	op := [32]byte{108}
+	shadow, err := claim.BuildReplicatedSchemaDDLShadow(
+		t.Context(), op, "CREATE INDEX by_city ON docs (city)", 100, 1<<20,
+	)
+	if err != nil || shadow.Cursor.Publication.Applied != 3 {
+		t.Fatalf("build shadow=%+v err=%v", shadow, err)
+	}
+	schemaShadowApply(t, claim, db, base, 4, `{"id":"after-copy","city":"Porto","score":90}`)
+	target, err := claim.FinalizeReplicatedSchemaDDLShadow(t.Context(), op, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateReplicatedSchemaDDLTarget(target, 4, base.Binding.Authority.SchemaGeneration); err != nil {
+		t.Fatalf("detached target: %v", err)
+	}
+	if applied, found, err := claim.ReplicatedSchemaDDLSourceApplied(target.Catalog); err != nil || !found || applied != 4 {
+		t.Fatalf("journal applied=%d found=%t err=%v", applied, found, err)
+	}
+	replay, err := claim.FinalizeReplicatedSchemaDDLShadow(t.Context(), op, 4)
+	if err != nil || !reflect.DeepEqual(replay, target) {
+		t.Fatalf("exact finalize replay differs: %v", err)
+	}
+}
+
 func TestReplicatedSchemaDDLShadowReplayRestartAfterDurableEffects(t *testing.T) {
 	for _, stage := range []string{"replay-relation", "replay-cursor"} {
 		t.Run(stage, func(t *testing.T) {

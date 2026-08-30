@@ -2218,6 +2218,15 @@ func TestReplicatedOperationEncodingIsCanonicalAndBounded(t *testing.T) {
 	if err != nil || !bytes.Equal(raw, again) {
 		t.Fatal("operation encoding is not canonical")
 	}
+	digest := ReplicatedOperationDigest(record)
+	if digest == ([32]byte{}) || digest != ReplicatedOperationDigest(opened) {
+		t.Fatal("canonical operation digest is empty or unstable")
+	}
+	changed := opened
+	changed.Revision++
+	if digest == ReplicatedOperationDigest(changed) || ReplicatedOperationDigest(ReplicatedOperationRecord{}) != ([32]byte{}) {
+		t.Fatal("operation digest did not bind the exact valid record")
+	}
 	for _, damaged := range [][]byte{
 		append(append([]byte(nil), raw...), ' '),
 		[]byte(`{"id":[1],"kind":1,"state":1,"revision":1,"catalog_generation":1,"cursor":[0,0,0,0,0,0,0,0],"proof":[1]}`),

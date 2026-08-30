@@ -1074,6 +1074,22 @@ func (record ReplicatedOperationRecord) Equal(other ReplicatedOperationRecord) b
 		record.ExecutionRevision == other.ExecutionRevision && record.ExecutionSettled == other.ExecutionSettled
 }
 
+// ReplicatedOperationDigest binds the exact canonical durable operation
+// record. Callers use it as a compact witness only after the record reached a
+// terminal state; it does not grant authority to advance that record.
+func ReplicatedOperationDigest(record ReplicatedOperationRecord) [sha256.Size]byte {
+	raw, err := appendReplicatedOperation(nil, record)
+	if err != nil {
+		return [sha256.Size]byte{}
+	}
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte("vibedb/replicated-operation-record/1\x00"))
+	_, _ = hasher.Write(raw)
+	var digest [sha256.Size]byte
+	hasher.Sum(digest[:0])
+	return digest
+}
+
 type replicatedOperationPayload struct {
 	Kind              ReplicatedOperationKind  `json:"kind"`
 	State             ReplicatedOperationState `json:"state"`

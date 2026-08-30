@@ -145,19 +145,72 @@ func (a *rf3SchemaActivator) BuildSchema(ctx context.Context, request schemainst
 	if state.quiesced || state.apply == nil {
 		return target, schemainstall.ErrConflict
 	}
-	if err := settlePriorRF3SchemaGeneration(ctx, state); err != nil {
-		return target, err
-	}
 	manifest, err := state.apply.RangeSplitRelationManifestDigest()
 	if err != nil || state.base.Binding.AllocationGeneration != uint64(request.AllocationGeneration) ||
 		state.base.Binding.Authority.SchemaGeneration != request.FromSchemaGeneration || manifest != request.FromRelationManifestDigest {
 		return target, errors.Join(err, schemainstall.ErrConflict)
+	}
+	if online, observeErr := state.apply.ObserveReplicatedSchemaDDLShadow(request.Operation); observeErr != nil {
+		return target, observeErr
+	} else if online {
+		// The current shadow is attached to the live source generation.
+		// Finalize it before predecessor cleanup: cleanup inspects the same
+		// one-slot journal and must not treat this successor as a retired
+		// predecessor capture.
+		return state.apply.FinalizeReplicatedSchemaDDLShadow(ctx, request.Operation, request.SourceApplied)
+	}
+	if err := settlePriorRF3SchemaGeneration(ctx, state); err != nil {
+		return target, err
 	}
 	// The coordinator operation is the durable schema lineage. Every replica
 	// may have a different source cut and therefore a different BuildRequest
 	// digest, but all captures must remain attached to the one rollout identity
 	// that later authorizes prepare, activation, recovery, and reclamation.
 	return state.apply.BuildJournaledReplicatedSchemaDDLTarget(ctx, request.Operation, request.SourceApplied, sql)
+}
+
+const (
+	rf3SchemaCaptureMaxRecords = 1 << 16
+	rf3SchemaCaptureMaxBytes   = 256 << 20
+)
+
+func (a *rf3SchemaActivator) BuildSchemaShadow(ctx context.Context, request schemainstall.BuildRequest, sql string) (bool, error) {
+	_, err := schemainstall.BuildRequestDigest(request)
+	if err != nil || !request.Shadow || uint64(len(sql)) != request.SQLBytes || sha256.Sum256([]byte(sql)) != request.SQLDigest {
+		return false, errors.Join(err, schemainstall.ErrInvalid)
+	}
+	state, err := a.generation(schemainstall.Request{Group: request.Group})
+	if err != nil {
+		return false, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.quiesced || state.apply == nil {
+		return false, schemainstall.ErrConflict
+	}
+	retained, observeErr := state.apply.ObserveReplicatedSchemaDDLShadow(request.Operation)
+	if observeErr != nil && !errors.Is(observeErr, sqldriver.ErrReplicatedSchemaDDLConflict) {
+		return false, observeErr
+	}
+	if !retained {
+		// A coordinator may have committed the predecessor catalog and died
+		// during authenticated drain. No old-generation pin can be admitted
+		// after that catalog/gate transition, so finish its bounded retained
+		// cleanup before reserving the one shadow slot for a successor. A
+		// foreign non-retired shadow fails lineage validation and is preserved.
+		if err := settlePriorRF3SchemaGeneration(ctx, state); err != nil {
+			return false, err
+		}
+	}
+	manifest, err := state.apply.RangeSplitRelationManifestDigest()
+	if err != nil || state.base.Binding.AllocationGeneration != uint64(request.AllocationGeneration) ||
+		state.base.Binding.Authority.SchemaGeneration != request.FromSchemaGeneration ||
+		manifest != request.FromRelationManifestDigest {
+		return false, errors.Join(err, schemainstall.ErrConflict)
+	}
+	shadow, err := state.apply.BuildReplicatedSchemaDDLShadow(ctx, request.Operation, sql,
+		rf3SchemaCaptureMaxRecords, rf3SchemaCaptureMaxBytes)
+	return shadow.NoOp, err
 }
 
 func (a *rf3SchemaActivator) ResumeSchemaBuild(ctx context.Context, operation [32]byte,

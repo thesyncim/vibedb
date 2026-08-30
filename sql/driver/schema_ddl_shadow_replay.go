@@ -132,6 +132,101 @@ func (a *ReplicatedApply) ReplayReplicatedSchemaDDLShadow(ctx context.Context, o
 	return record.Shadow, nil
 }
 
+// FinalizeReplicatedSchemaDDLShadow catches an online target up to the exact
+// externally fenced source cut, seals capture, audits the target and publishes
+// the ordinary detached build receipt used by schema installation. Row work
+// happened before the fence; this path is bounded by retained capture entries,
+// catalog size and relation count. The caller must hold the distributed write
+// fence from expectedApplied selection through return.
+func (a *ReplicatedApply) FinalizeReplicatedSchemaDDLShadow(
+	ctx context.Context, operation [32]byte, expectedApplied uint64,
+) (result ReplicatedSchemaDDLTarget, resultErr error) {
+	if a == nil || a.database == nil || ctx == nil || operation == ([32]byte{}) || expectedApplied == 0 {
+		return result, ErrReplicatedSchemaDDLConflict
+	}
+	for {
+		shadow, err := a.ReplayReplicatedSchemaDDLShadow(ctx, operation, 1024)
+		if err != nil {
+			return result, err
+		}
+		if shadow.NoOp {
+			return ReplicatedSchemaDDLTarget{NoOp: true}, nil
+		}
+		if shadow.Cursor.Publication.Applied > expectedApplied {
+			return result, ErrTransactionConflict
+		}
+		if shadow.Cursor.Publication.Applied == expectedApplied {
+			break
+		}
+	}
+	root, unlock, err := a.lockSchemaDDLShadow(ctx)
+	if err != nil {
+		return result, err
+	}
+	record, found, err := readSchemaDDLShadowRecord(root)
+	prior, priorFound, priorErr := readSchemaDDLBuildRecord(root)
+	unlock()
+	if err != nil || priorErr != nil || !found || !record.Ready || record.Shadow.Operation != operation ||
+		record.Shadow.Cursor.Publication.Applied != expectedApplied {
+		return result, errors.Join(err, priorErr, ErrReplicatedSchemaDDLConflict)
+	}
+	if priorFound && prior.Operation != operation && (!prior.Ready || prior.Target.NoOp ||
+		prior.Target.Proof.Catalog.SchemaGeneration != record.SourceGeneration ||
+		prior.Target.Proof.Catalog.Digest != record.SourceDigest) {
+		return result, ErrReplicatedSchemaDDLConflict
+	}
+	if _, err := a.FinishReplicatedSchemaCapture(ctx, operation, expectedApplied); err != nil {
+		return result, err
+	}
+	verified, err := a.PreflightReplicatedSchemaTarget(ctx, record.Shadow.Catalog, expectedApplied)
+	if err != nil {
+		return result, err
+	}
+	result, err = verified.DetachedTarget()
+	resultErr = errors.Join(err, verified.Close())
+	if resultErr != nil {
+		return ReplicatedSchemaDDLTarget{}, resultErr
+	}
+	root, unlock, err = a.lockSchemaDDLShadow(ctx)
+	if err != nil {
+		return ReplicatedSchemaDDLTarget{}, err
+	}
+	defer unlock()
+	current, found, err := readSchemaDDLShadowRecord(root)
+	if err != nil || !found || current.SourceGeneration != record.SourceGeneration ||
+		current.SourceDigest != record.SourceDigest || current.SQL != record.SQL ||
+		current.Shadow.Cursor != record.Shadow.Cursor || !bytes.Equal(current.Shadow.Catalog, result.Catalog) {
+		return ReplicatedSchemaDDLTarget{}, errors.Join(err, ErrReplicatedSchemaDDLConflict)
+	}
+	build := schemaDDLBuildRecord{Version: 1, Operation: operation, Applied: expectedApplied,
+		SourceGeneration: record.SourceGeneration, SourceDigest: record.SourceDigest,
+		SQL: record.SQL, Ready: true, Target: result}
+	if prior, exists, readErr := readSchemaDDLBuildRecord(root); readErr != nil {
+		return ReplicatedSchemaDDLTarget{}, readErr
+	} else if exists {
+		if prior.Operation == operation {
+			if prior.Applied != expectedApplied || prior.SQL != record.SQL || !prior.Ready ||
+				!bytes.Equal(prior.Target.Catalog, result.Catalog) || prior.Target.Proof != result.Proof {
+				return ReplicatedSchemaDDLTarget{}, ErrReplicatedSchemaDDLConflict
+			}
+			return prior.Target, nil
+		}
+		// A completed predecessor may occupy the one-slot recovery journal.
+		// Replace it only when its authenticated target is byte-for-byte this
+		// online build's source generation; no absence or generation number
+		// alone authorizes rollover.
+		if !prior.Ready || prior.Target.NoOp ||
+			prior.Target.Proof.Catalog.SchemaGeneration != record.SourceGeneration ||
+			prior.Target.Proof.Catalog.Digest != record.SourceDigest {
+			return ReplicatedSchemaDDLTarget{}, ErrReplicatedSchemaDDLConflict
+		}
+	}
+	if err := writeSchemaDDLBuildRecord(root, build); err != nil {
+		return ReplicatedSchemaDDLTarget{}, err
+	}
+	return result, nil
+}
+
 func replaySchemaDDLShadowRelation(ctx context.Context, target *durable.Collection, mutations []schemachange.Mutation) (resultErr error) {
 	if len(mutations) > target.MaxBatchDocuments() {
 		return durable.ErrBatchTooLarge
