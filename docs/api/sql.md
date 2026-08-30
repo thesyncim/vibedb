@@ -183,8 +183,31 @@ multi-row `INSERT ... VALUES` is atomic.
 `INSERT ... SELECT` requires exactly one output column that contains complete
 JSON documents. The source query reads the pre-statement snapshot.
 
-Conflict handling supports `ON CONFLICT DO NOTHING`. It does not support a
-conflict target or `DO UPDATE`.
+Conflict handling uses the document-derived primary key as its implicit target:
+
+```sql
+INSERT INTO docs VALUES (?) ON CONFLICT DO NOTHING
+
+INSERT INTO docs VALUES (?)
+ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc"
+
+INSERT INTO employees (id, team, score) VALUES (?, ?, ?)
+ON CONFLICT DO UPDATE SET team = EXCLUDED.team, score = ?
+```
+
+The whole-document form works for schemaless tables. The column form accepts
+distinct declared top-level targets with a scalar literal, placeholder,
+`NULL`, or `EXCLUDED.<declared-column>` value; unassigned fields in the current
+row are preserved. Every candidate document must satisfy the table schema even
+when it conflicts, and an updated post-image must preserve the primary key.
+Repeating one canonical candidate key in a `DO UPDATE` batch rejects the whole
+statement as a cardinality violation.
+
+Explicit conflict targets, `ON CONSTRAINT`, conflict-action `WHERE`, nested or
+row-dependent assignments, and `INSERT ... SELECT DO UPDATE` are not supported.
+Embedded pgwire exposes the same behavior. RF3/distributed writes reject
+conflict updates until branch-aware capture and global-index maintenance are
+available.
 
 `UPDATE` can replace the complete document:
 

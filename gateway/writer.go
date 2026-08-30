@@ -199,6 +199,13 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 		if ins == nil {
 			return &PlanError{Reason: "malformed insert statement", cause: ErrDistributedWriteUnsupported}
 		}
+		if ins.OnConflictUpdate != nil {
+			return &PlanError{
+				Table:  ins.Table,
+				Reason: "ON CONFLICT DO UPDATE requires branch-aware distributed capture and is not supported",
+				cause:  ErrDistributedWriteUnsupported,
+			}
+		}
 		if ins.Source != nil {
 			plan.alwaysReason = "INSERT with a query source requires a distributed source plan"
 			break
@@ -298,6 +305,14 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 	}
 	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns, insertColumns); err != nil {
 		return err
+	}
+	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictDoNothing &&
+		len(plan.writeGlobalIndexes) != 0 {
+		return &PlanError{
+			Table:  plan.table,
+			Reason: "ON CONFLICT DO NOTHING with global indexes requires branch-aware index maintenance",
+			cause:  ErrDistributedWriteUnsupported,
+		}
 	}
 	return nil
 }

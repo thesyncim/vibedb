@@ -14,7 +14,11 @@ stable.
 | P0 | Primary-key `ON CONFLICT DO UPDATE` | Idempotent ingestion needs an atomic create-or-update operation; application-side read/replace races. | Support the implicit primary-key conflict target first, with `EXCLUDED` values and the same assignment evaluator as `UPDATE`. |
 | P0 | Unique secondary constraints | Business keys cannot be enforced safely outside the write/commit boundary. | Add unique exact-index metadata and enforce it for inserts, updates, upserts, transactions, rebuilds, and reopen before adding richer constraint syntax. |
 
-The first two slices are implemented on `codex/sql-core-foundations`.
+The first three slices are implemented.
+Primary-key conflict updates are currently an embedded `VALUES` feature;
+distributed/RF3 writes and `INSERT ... SELECT DO UPDATE` fail closed until they
+can carry the same branch-aware atomicity contract. Unique secondary
+constraints are the remaining P0 item.
 
 ## Required follow-on slices
 

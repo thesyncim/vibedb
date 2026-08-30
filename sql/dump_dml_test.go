@@ -92,6 +92,15 @@ func dumpInsert(s *InsertStmt) string {
 	if s.OnConflictDoNothing {
 		b.WriteString(" on conflict do nothing")
 	}
+	if s.OnConflictUpdate != nil {
+		b.WriteString(" on conflict do update set ")
+		if s.OnConflictUpdate.WholeDocument() {
+			b.WriteString("\"$doc\"=")
+			dumpOperand(&b, s.OnConflictUpdate.Doc)
+		} else {
+			dumpAssignments(&b, s.OnConflictUpdate.Assignments)
+		}
+	}
 	if s.Returning != nil {
 		b.WriteString(" returning ")
 		for i := range s.Returning.Columns {
@@ -110,7 +119,11 @@ func dumpUpdate(s *UpdateStmt) string {
 	b.WriteString("update ")
 	b.WriteString(s.Table)
 	b.WriteString(" set ")
-	dumpOperand(&b, s.Doc)
+	if len(s.Assignments) != 0 {
+		dumpAssignments(&b, s.Assignments)
+	} else {
+		dumpOperand(&b, s.Doc)
+	}
 	dumpTargets(&b, s.Filter, false)
 	dumpMutationWindow(&b, s.OrderBy, s.Limit)
 	if s.Returning != nil {
@@ -124,6 +137,16 @@ func dumpUpdate(s *UpdateStmt) string {
 	}
 	fmt.Fprintf(&b, " params=%d", s.Params)
 	return b.String()
+}
+
+func dumpAssignments(b *strings.Builder, assignments []UpdateAssignment) {
+	for i := range assignments {
+		if i != 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%q=", assignments[i].Column)
+		dumpOperand(b, assignments[i].Value)
+	}
 }
 
 func dumpDelete(s *DeleteStmt) string {

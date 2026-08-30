@@ -1076,6 +1076,20 @@ func (t *tx) execMutationCore(
 	switch statement.Kind() {
 	case query.DMLInsert:
 		tree := statement.Tree().Insert
+		conflictUpdate := tree.OnConflictUpdate
+		if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
+			if err := validateUpsertColumnAssignments(
+				tableName, state.incarnation.meta,
+				conflictUpdate.Assignments,
+			); err != nil {
+				return nil, err
+			}
+			if err := validateColumnAssignmentBindings(
+				conflictUpdate.Assignments, args,
+			); err != nil {
+				return nil, err
+			}
+		}
 		if prepared != nil && prepared.insertSource != nil {
 			var err error
 			staged, err = t.stageInsertSelect(
@@ -1095,7 +1109,7 @@ func (t *tx) execMutationCore(
 		}
 		remainingDocuments := limits.MaxBatchDocuments -
 			len(state.order) + replaceable
-		if !tree.OnConflictDoNothing && len(tree.Rows) > remainingDocuments {
+		if !tree.HasConflictAction() && len(tree.Rows) > remainingDocuments {
 			return nil, fmt.Errorf(
 				"%w: INSERT has %d rows but table %q has room for at most %d transaction keys: %w",
 				ErrTransactionTooLarge, len(tree.Rows), tableName,
@@ -1105,7 +1119,11 @@ func (t *tx) execMutationCore(
 		seen := make(map[string]struct{}, len(tree.Rows))
 		scratch := t.conn.pointRaw[:0]
 		prospectiveBytes := state.stagedBytes
-		cancellable := ctx.Done() != nil
+		peakBytes := max(state.highWaterBytes, prospectiveBytes)
+		candidateBytes := 0
+		placement := t.conn.clusterBinding(tableName)
+		routeState := insertPreflightState{}
+		cancellable := contextCanCancel(ctx)
 		for i := range tree.Rows {
 			if cancellable {
 				if err := contextCheckpoint(ctx); err != nil {
@@ -1126,9 +1144,32 @@ func (t *tx) execMutationCore(
 			); err != nil {
 				return nil, err
 			}
+			if len(key) > limits.MaxBatchBytes-candidateBytes ||
+				len(document) > limits.MaxBatchBytes-candidateBytes-len(key) {
+				t.conn.pointRaw = scratch
+				return nil, fmt.Errorf(
+					"%w: INSERT candidates exceed the %d-byte batch limit for table %q: %w",
+					ErrTransactionTooLarge,
+					limits.MaxBatchBytes, tableName, durable.ErrBatchTooLarge,
+				)
+			}
+			candidateBytes += len(key) + len(document)
+			if placement != nil {
+				if err := routeState.add(placement, document, i); err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+			}
 			if _, duplicate := seen[key]; duplicate {
 				if tree.OnConflictDoNothing {
 					continue
+				}
+				if conflictUpdate != nil {
+					t.conn.pointRaw = scratch
+					return nil, fmt.Errorf(
+						"%w: candidate key %q appears twice in one VALUES batch",
+						ErrUpsertCardinality, key,
+					)
 				}
 				return nil, fmt.Errorf("%w: %q appears twice in one VALUES batch",
 					ErrDuplicatePrimaryKey, key)
@@ -1144,7 +1185,47 @@ func (t *tx) execMutationCore(
 			if found && tree.OnConflictDoNothing {
 				continue
 			}
-			if found {
+			finalDocument := document
+			if found && conflictUpdate != nil {
+				if !conflictUpdate.WholeDocument() {
+					finalDocument, err = ApplyColumnAssignmentsWithExcluded(
+						scratch, document, conflictUpdate.Assignments,
+						args, limits.MaxDocumentBytes,
+					)
+					if err != nil {
+						t.conn.pointRaw = scratch
+						return nil, err
+					}
+				}
+				if err := validateDocument(
+					state.schema, finalDocument, limits.MaxDocumentBytes,
+					&state.validationTape,
+				); err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if err := t.conn.checkUpsertShardKeyImmutable(
+					tableName, scratch, finalDocument,
+				); err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				finalKey, err := documentKey(
+					finalDocument, state.primaryKey, state.primary,
+					limits.MaxKeyBytes,
+				)
+				if err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if finalKey != key {
+					t.conn.pointRaw = scratch
+					return nil, fmt.Errorf(
+						"%w: conflict replacement key %q does not match candidate key %q",
+						ErrUpdatePrimaryKey, finalKey, key,
+					)
+				}
+			} else if found {
 				t.conn.pointRaw = scratch
 				return nil, fmt.Errorf("%w: %q", ErrDuplicatePrimaryKey, key)
 			}
@@ -1152,7 +1233,17 @@ func (t *tx) execMutationCore(
 			if previous != nil {
 				prospectiveBytes -= len(key) + len(previous.document)
 			}
-			prospectiveBytes += len(key) + len(document)
+			if len(key) > limits.MaxBatchBytes-prospectiveBytes ||
+				len(finalDocument) > limits.MaxBatchBytes-prospectiveBytes-len(key) {
+				t.conn.pointRaw = scratch
+				return nil, fmt.Errorf(
+					"%w: INSERT conflict action would exceed the %d-byte transaction batch limit for table %q: %w",
+					ErrTransactionTooLarge, limits.MaxBatchBytes, tableName,
+					durable.ErrBatchTooLarge,
+				)
+			}
+			prospectiveBytes += len(key) + len(finalDocument)
+			peakBytes = max(peakBytes, prospectiveBytes)
 			if prospectiveBytes > limits.MaxBatchBytes {
 				t.conn.pointRaw = scratch
 				return nil, fmt.Errorf(
@@ -1161,7 +1252,15 @@ func (t *tx) execMutationCore(
 					limits.MaxBatchBytes, durable.ErrBatchTooLarge,
 				)
 			}
-			staged = append(staged, stagedTxMutation{key: key, document: document})
+			if peakBytes > limits.MaxBatchBytes {
+				t.conn.pointRaw = scratch
+				return nil, fmt.Errorf(
+					"%w: INSERT would stage %d key/document bytes for table %q, limit %d: %w",
+					ErrTransactionTooLarge, peakBytes, tableName,
+					limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+				)
+			}
+			staged = append(staged, stagedTxMutation{key: key, document: finalDocument})
 		}
 		t.conn.pointRaw = scratch
 		if err := t.conn.routeInsertStaged(tableName, staged); err != nil {

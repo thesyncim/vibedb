@@ -42,6 +42,35 @@ func TestParseInsertSelectKeepsSourceAndReturningDistinct(t *testing.T) {
 	}
 }
 
+func TestParseInsertSelectKeepsConflictUpdateTailDistinct(t *testing.T) {
+	const source = "INSERT INTO dst SELECT * FROM src WHERE ready = ? " +
+		"ON CONFLICT DO UPDATE SET name = EXCLUDED.name, touched = ? RETURNING id"
+	statement, err := ParseStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := statement.Insert
+	if statement.Kind != KindInsert || insert == nil || insert.Source == nil {
+		t.Fatalf("statement = %#v, want INSERT SELECT", statement)
+	}
+	update := insert.OnConflictUpdate
+	if insert.OnConflictDoNothing || update == nil || len(update.Assignments) != 2 {
+		t.Fatalf("conflict action = %#v", insert)
+	}
+	if update.Assignments[0].Value.Kind != OperandExcluded ||
+		update.Assignments[0].Value.Text != "name" ||
+		update.Assignments[1].Value.Kind != OperandParam ||
+		update.Assignments[1].Value.Ordinal != 1 {
+		t.Fatalf("conflict assignments = %#v", update.Assignments)
+	}
+	if statement.Params() != 2 {
+		t.Fatalf("Params = %d, want 2", statement.Params())
+	}
+	if insert.Returning == nil || insert.Returning.From[0].Name != "dst" {
+		t.Fatalf("RETURNING = %#v", insert.Returning)
+	}
+}
+
 func TestParseInsertSelectDoesNotGuessQueryIdentifiersAsTail(t *testing.T) {
 	statement, err := ParseStatement(
 		"INSERT INTO dst SELECT returning FROM src ORDER BY returning",

@@ -36,6 +36,25 @@ func (c *conn) validateSurfaceContext(
 				return reservedDocumentPathError(statement.Insert.Columns[i])
 			}
 		}
+		if update := statement.Insert.OnConflictUpdate; update != nil && len(update.Assignments) != 0 {
+			if err := rlockContext(ctx, &c.db.mu); err != nil {
+				return err
+			}
+			t, exists := c.db.tables[statement.Insert.Table]
+			if !exists {
+				c.db.mu.RUnlock()
+				return fmt.Errorf(
+					"%w: %q", ErrTableNotFound, statement.Insert.Table,
+				)
+			}
+			err := validateUpsertColumnAssignments(
+				statement.Insert.Table, t.meta, update.Assignments,
+			)
+			c.db.mu.RUnlock()
+			if err != nil {
+				return err
+			}
+		}
 		if statement.Insert.Source != nil {
 			if err := rlockContext(ctx, &c.db.mu); err != nil {
 				return err

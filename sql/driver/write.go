@@ -770,13 +770,31 @@ func (c *conn) insertLocked(
 			ctx, statement, args, t, limits, source, returning, returned,
 		)
 	}
-	seeds := make([]seedDocument, 0, len(tree.Rows))
+	conflictUpdate := tree.OnConflictUpdate
+	if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
+		if err := validateUpsertColumnAssignments(
+			tree.Table, t.meta, conflictUpdate.Assignments,
+		); err != nil {
+			return nil, err
+		}
+		if err := validateColumnAssignmentBindings(
+			conflictUpdate.Assignments, args,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	// Resolve and validate every candidate before deciding which conflict
+	// branch it takes. Besides matching SQL constraint order, this lets routing
+	// preflight the authored INSERT batch rather than a set of post-images whose
+	// conflict updates could conceal a cross-shard candidate.
+	candidates := make([]seedDocument, 0, len(tree.Rows))
 	var seen map[string]struct{}
 	if len(tree.Rows) > 1 {
 		seen = make(map[string]struct{}, len(tree.Rows))
 	}
-	stagedBytes := 0
-	cancellable := ctx.Done() != nil
+	candidateBytes := 0
+	cancellable := contextCanCancel(ctx)
 	for i := range tree.Rows {
 		if cancellable {
 			if err := contextCheckpoint(ctx); err != nil {
@@ -790,9 +808,22 @@ func (c *conn) insertLocked(
 		if err != nil {
 			return nil, err
 		}
+		if tree.HasConflictAction() {
+			if err := validateDocument(
+				t.schema, document, limits.MaxDocumentBytes, &c.insertTape,
+			); err != nil {
+				return nil, err
+			}
+		}
 		if _, duplicate := seen[key]; duplicate {
 			if tree.OnConflictDoNothing {
 				continue
+			}
+			if conflictUpdate != nil {
+				return nil, fmt.Errorf(
+					"%w: candidate key %q appears twice in one VALUES batch",
+					ErrUpsertCardinality, key,
+				)
 			}
 			return nil, fmt.Errorf(
 				"%w: %q appears twice in one VALUES batch",
@@ -802,27 +833,102 @@ func (c *conn) insertLocked(
 		if seen != nil {
 			seen[key] = struct{}{}
 		}
-		if tree.OnConflictDoNothing && t.collection != nil {
+		if len(key) > limits.MaxBatchBytes-candidateBytes ||
+			len(document) > limits.MaxBatchBytes-candidateBytes-len(key) {
+			return nil, fmt.Errorf(
+				"vibedb: INSERT exceeds the %d-byte durable batch limit: %w",
+				limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+			)
+		}
+		candidateBytes += len(key) + len(document)
+		candidates = append(candidates, seedDocument{key: key, document: document})
+	}
+	if err := c.routeInsertSeeds(tree.Table, candidates); err != nil {
+		return nil, err
+	}
+
+	seeds := candidates
+	if tree.HasConflictAction() && t.collection != nil {
+		snapshot, snapshotErr := t.collection.Snapshot()
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		defer snapshot.Close()
+
+		seeds = candidates[:0]
+		scratch := c.pointRaw[:0]
+		defer func() { c.pointRaw = scratch[:0] }()
+		stagedBytes := 0
+		for i := range candidates {
+			if cancellable {
+				if err := contextCheckpoint(ctx); err != nil {
+					return nil, err
+				}
+			}
+			candidate := candidates[i]
 			var found bool
-			found, err = t.collection.ContainsKey([]byte(key))
+			scratch, found, err = snapshot.AppendRaw(
+				scratch[:0], []byte(candidate.key),
+			)
 			if err != nil {
 				return nil, err
 			}
-			if found {
+			if found && tree.OnConflictDoNothing {
 				continue
 			}
+			finalDocument := candidate.document
+			if found && conflictUpdate != nil {
+				if !conflictUpdate.WholeDocument() {
+					finalDocument, err = ApplyColumnAssignmentsWithExcluded(
+						scratch, candidate.document,
+						conflictUpdate.Assignments, args,
+						limits.MaxDocumentBytes,
+					)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := validateDocument(
+					t.schema, finalDocument, limits.MaxDocumentBytes,
+					&c.insertTape,
+				); err != nil {
+					return nil, err
+				}
+				// Keep UPDATE's shard-move error precedence even though primary-key
+				// locality currently makes an unchanged key sufficient in placed
+				// tables. The explicit check preserves that invariant if placement
+				// grows beyond the present single-path key contract.
+				if err := c.checkUpsertShardKeyImmutable(
+					tree.Table, scratch, finalDocument,
+				); err != nil {
+					return nil, err
+				}
+				finalKey, err := documentKey(
+					finalDocument, t.meta.PrimaryKey, t.primary,
+					limits.MaxKeyBytes,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if finalKey != candidate.key {
+					return nil, fmt.Errorf(
+						"%w: conflict replacement key %q does not match candidate key %q",
+						ErrUpdatePrimaryKey, finalKey, candidate.key,
+					)
+				}
+			}
+			if len(candidate.key) > limits.MaxBatchBytes-stagedBytes ||
+				len(finalDocument) > limits.MaxBatchBytes-stagedBytes-len(candidate.key) {
+				return nil, fmt.Errorf(
+					"vibedb: INSERT conflict action exceeds the %d-byte mutation batch limit for table %q: %w",
+					limits.MaxBatchBytes, tree.Table, durable.ErrBatchTooLarge,
+				)
+			}
+			seeds = append(seeds, seedDocument{
+				key: candidate.key, document: finalDocument,
+			})
+			stagedBytes += len(candidate.key) + len(finalDocument)
 		}
-		stagedBytes += len(key) + len(document)
-		if stagedBytes > limits.MaxBatchBytes {
-			return nil, fmt.Errorf(
-				"vibedb: INSERT would stage %d key/document bytes, durable batch limit is %d: %w",
-				stagedBytes, limits.MaxBatchBytes, durable.ErrBatchTooLarge,
-			)
-		}
-		seeds = append(seeds, seedDocument{key: key, document: document})
-	}
-	if err := c.routeInsertSeeds(tree.Table, seeds); err != nil {
-		return nil, err
 	}
 	if returning != nil {
 		if returned == nil {
@@ -859,7 +965,7 @@ func (c *conn) insertLocked(
 		}
 		return result{affected: int64(len(seeds))}, nil
 	}
-	if !tree.OnConflictDoNothing {
+	if !tree.HasConflictAction() {
 		if err := c.rejectExistingSeeds(ctx, t.collection, seeds); err != nil {
 			return nil, err
 		}

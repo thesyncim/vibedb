@@ -214,6 +214,29 @@ func (c *conn) routeInsertStagedWithBinding(
 	return nil
 }
 
+// checkUpsertShardKeyImmutable proves that a conflicting INSERT post-image
+// remains on the current row's physical shard. Candidate INSERT routing alone
+// is insufficient: an assignment could otherwise turn one conflict into what
+// looks like an ordinary insert for another shard.
+func (c *conn) checkUpsertShardKeyImmutable(
+	table string,
+	current []byte,
+	replacement []byte,
+) error {
+	binding := c.clusterBinding(table)
+	if binding == nil {
+		return nil
+	}
+	documents := [1][]byte{current}
+	route, err := insertPreflight(binding, documents[:])
+	if err != nil {
+		return err
+	}
+	return checkShardKeyImmutable(
+		binding, c.clusterRouter(), route, replacement,
+	)
+}
+
 // routeUpdate enforces the current write rules for a placed whole-document
 // UPDATE: its predicate must resolve to exactly one physical shard, and the
 // replacement document must not move the row to another shard. It is a no-op for

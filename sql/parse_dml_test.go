@@ -2,6 +2,7 @@ package sql
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -41,6 +42,16 @@ func TestDMLGrammarShapes(t *testing.T) {
 			name: "skip a conflicting document",
 			src:  `INSERT INTO users VALUES (?) ON CONFLICT DO NOTHING RETURNING id`,
 			want: `insert into users (?0) on conflict do nothing returning path(0:id) params=1`,
+		},
+		{
+			name: "replace a conflicting document",
+			src:  `INSERT INTO users VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc" RETURNING id`,
+			want: `insert into users (?0) on conflict do update set "$doc"=excluded."$doc" returning path(0:id) params=1`,
+		},
+		{
+			name: "patch conflicting columns",
+			src:  `INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, touched = ?, note = NULL RETURNING id`,
+			want: `insert into users fields -1:id -1:name (?0, ?1) on conflict do update set "name"=excluded."name", "touched"=?2, "note"=null returning path(0:id) params=3`,
 		},
 		{
 			name: "insert returning projected fields",
@@ -280,6 +291,17 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
 		{"conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id) DO NOTHING`, -1, "CONFLICT targets"},
+		{"conflict constraint", `INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`, -1, "ON CONSTRAINT"},
+		{"conflict update where", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value WHERE value = 'old'`, -1, "DO UPDATE WHERE"},
+		{"nested conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET profile.name = EXCLUDED.name`, -1, "top-level column"},
+		{"nested excluded source", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.profile.name`, -1, "nested paths"},
+		{"reserved excluded document", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$doc"`, -1, "reserved"},
+		{"reserved excluded key", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$key"`, -1, "reserved"},
+		{"current row conflict value", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = name`, -1, "current-row"},
+		{"quoted excluded relation", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = "EXCLUDED".name`, -1, "EXCLUDED"},
+		{"duplicate conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, name = 'again'`, -1, "more than once"},
+		{"mixed whole conflict update", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc", name = EXCLUDED.name`, -1, "cannot be combined"},
+		{"wrong whole conflict source", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED.payload`, -1, `EXCLUDED."$doc"`},
 		{"aggregate RETURNING", `INSERT INTO t VALUES (?) RETURNING COUNT(*)`, -1, "aggregate"},
 
 		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "one declared top-level column"},
@@ -295,6 +317,98 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
 		{"REPLACE", `REPLACE INTO t VALUES ('k', ?)`, 0, "REPLACE"},
 	})
+}
+
+func TestInsertConflictUpdateASTAndParameterAccounting(t *testing.T) {
+	statement, err := ParseStatement(`
+		INSERT INTO employees (id, Name, note) VALUES (?, ?, ?)
+		ON CONFLICT DO UPDATE SET
+			Name = eXcLuDeD.Name,
+			note = ?,
+			active = TRUE,
+			score = 7,
+			label = 'ready',
+			optional = NULL
+		RETURNING id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := statement.Insert
+	if insert == nil || insert.OnConflictDoNothing ||
+		insert.OnConflictUpdate == nil || !insert.HasConflictAction() {
+		t.Fatalf("conflict action = %#v", insert)
+	}
+	update := insert.OnConflictUpdate
+	if update.WholeDocument() || len(update.Assignments) != 6 {
+		t.Fatalf("conflict update = %#v", update)
+	}
+	wantKinds := []OperandKind{
+		OperandExcluded, OperandParam, OperandBool, OperandNumber, OperandString,
+		OperandNull,
+	}
+	for i := range update.Assignments {
+		if update.Assignments[i].Value.Kind != wantKinds[i] {
+			t.Fatalf("assignment %d = %#v, want kind %d",
+				i, update.Assignments[i], wantKinds[i])
+		}
+	}
+	if update.Assignments[0].Column != "Name" ||
+		update.Assignments[0].Value.Text != "Name" {
+		t.Fatalf("case-sensitive EXCLUDED assignment = %#v", update.Assignments[0])
+	}
+	if statement.Params() != 4 {
+		t.Fatalf("Params = %d, want 4", statement.Params())
+	}
+
+	whole, err := ParseStatement(
+		`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = excluded."$doc"`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whole.Insert.OnConflictUpdate == nil ||
+		!whole.Insert.OnConflictUpdate.WholeDocument() ||
+		whole.Insert.OnConflictUpdate.Doc.Kind != OperandExcluded ||
+		whole.Insert.OnConflictUpdate.Doc.Text != DocumentColumn {
+		t.Fatalf("whole-document conflict update = %#v", whole.Insert.OnConflictUpdate)
+	}
+}
+
+func TestInsertConflictUpdateUnsupportedFormsArePositioned(t *testing.T) {
+	tests := []struct {
+		sql    string
+		marker string
+	}{
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
+			`(id)`,
+		},
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`,
+			`ON CONSTRAINT`,
+		},
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.profile.name`,
+			`.name`,
+		},
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value WHERE value = 'old'`,
+			`WHERE`,
+		},
+	}
+	for _, test := range tests {
+		_, err := ParseStatement(test.sql)
+		var unsupported *FeatureNotSupportedError
+		if !errors.As(err, &unsupported) {
+			t.Fatalf("ParseStatement(%q) = %T %v, want *FeatureNotSupportedError",
+				test.sql, err, err)
+		}
+		want := strings.Index(test.sql, test.marker)
+		if unsupported.Pos != want {
+			t.Fatalf("ParseStatement(%q) position = %d, want %d",
+				test.sql, unsupported.Pos, want)
+		}
+	}
 }
 
 func TestDeclaredColumnUpdateAssignments(t *testing.T) {
@@ -313,6 +427,28 @@ func TestDeclaredColumnUpdateAssignments(t *testing.T) {
 	}
 	if _, err := ParseStatement(`SELECT id FROM employees WHERE note = NULL`); err == nil {
 		t.Fatal("comparison accepted NULL after assignment-only support")
+	}
+}
+
+func TestMutationAssignmentListsAreBounded(t *testing.T) {
+	for _, prefix := range []string{
+		`UPDATE t SET `,
+		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET `,
+	} {
+		var source strings.Builder
+		source.WriteString(prefix)
+		for i := 0; i <= maxClauseItems; i++ {
+			if i != 0 {
+				source.WriteString(", ")
+			}
+			source.WriteByte('c')
+			source.WriteString(strconv.Itoa(i))
+			source.WriteString(" = 1")
+		}
+		_, err := ParseStatement(source.String())
+		if err == nil || !strings.Contains(err.Error(), "at most 1024 columns") {
+			t.Fatalf("oversized assignment list error = %v", err)
+		}
 	}
 }
 
