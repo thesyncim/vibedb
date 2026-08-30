@@ -389,6 +389,11 @@ func (opener *gatewayShardControlOpener) OpenShardControl(
 		ctx, raw, node, rafttransport.TrafficShardControl, opener.deadline,
 	)
 	if err != nil {
+		// A failed TLS handshake does not transfer ownership of the raw
+		// transport. Leaving it open lets exact control retries accumulate
+		// half-open server handshakes until the shard is effectively wedged.
+		// Close before releasing admission so the next retry starts cleanly.
+		_ = raw.Close()
 		<-opener.slots
 		return nil, err
 	}
