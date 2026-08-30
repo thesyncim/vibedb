@@ -232,6 +232,12 @@ func PrepareParsedDML(
 	switch tree.Kind {
 	case sqlast.KindInsert:
 		d.kind = DMLInsert
+		if tree.Insert.Source != nil && tree.Insert.OnConflictUpdate != nil {
+			return nil, sqlast.NewFeatureNotSupportedError(
+				src, tree.Insert.OnConflictUpdate.Pos,
+				"INSERT ... SELECT with ON CONFLICT DO UPDATE is not supported yet; use VALUES so the candidate batch remains bounded and atomic",
+			)
+		}
 		if tree.Insert.Source == nil && len(tree.Insert.Columns) != 0 {
 			d.insertFlatFieldOrdinals, d.insertFlatKeyJSONBytes =
 				compileInsertFlatFields(tree.Insert)

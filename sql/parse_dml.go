@@ -282,15 +282,24 @@ func (p *Parser) parseInsert() error {
 			return err
 		}
 		if p.tok.kind == tokLParen {
-			return p.errHere("ON CONFLICT targets are not supported; the document-derived primary key is the only conflict target")
+			return p.featureNotSupportedHere("ON CONFLICT targets are not supported; omit the target because the document-derived primary key is the only conflict target")
+		}
+		if p.atKeyword(kwOn) {
+			return p.featureNotSupportedHere("ON CONFLICT ON CONSTRAINT is not supported; the document-derived primary key is the only conflict target")
 		}
 		if err := p.expectKeyword(kwDo, "DO after ON CONFLICT"); err != nil {
 			return err
 		}
-		if err := p.expectKeyword(kwNothing, "NOTHING after ON CONFLICT DO"); err != nil {
-			return err
+		switch {
+		case p.acceptKeyword(kwNothing):
+			p.ins.OnConflictDoNothing = true
+		case p.atKeyword(kwUpdate):
+			if err := p.parseInsertConflictUpdate(); err != nil {
+				return err
+			}
+		default:
+			return p.errHere("expected NOTHING or UPDATE after ON CONFLICT DO")
 		}
-		p.ins.OnConflictDoNothing = true
 	}
 	if p.acceptKeyword(kwReturning) {
 		if err := p.parseInsertReturning(name, pos); err != nil {
@@ -307,6 +316,195 @@ func (p *Parser) parseInsert() error {
 	}
 	p.ins.Params = p.params
 	return nil
+}
+
+// parseInsertConflictUpdate parses the deliberately bounded PostgreSQL-style
+// conflict action. The conflict target is implicit because the document-derived
+// primary key is this SQL surface's only unique key. A conflict action can
+// either take the complete candidate document or patch distinct declared
+// top-level columns with constants or candidate-column values.
+func (p *Parser) parseInsertConflictUpdate() error {
+	updatePos := p.tok.pos
+	p.advance() // UPDATE
+	if err := p.expectKeyword(kwSet, "SET after ON CONFLICT DO UPDATE"); err != nil {
+		return err
+	}
+	p.conflict = InsertConflictUpdate{Pos: updatePos, SetPos: p.tok.pos}
+	doc, wholeDocument, assignment, err := p.parseConflictAssignment()
+	if err != nil {
+		return err
+	}
+	if wholeDocument {
+		p.conflict.Doc = doc
+		if p.tok.kind == tokComma {
+			return p.errHere("a whole-document ON CONFLICT update cannot be combined with column assignments")
+		}
+	} else {
+		assignments := append(p.conflictAssignments[:0], assignment)
+		for p.tok.kind == tokComma {
+			p.advance()
+			doc, wholeDocument, assignment, err = p.parseConflictAssignment()
+			if err != nil {
+				return err
+			}
+			if wholeDocument {
+				return p.errHere("a whole-document ON CONFLICT update cannot be combined with column assignments")
+			}
+			if len(assignments) >= maxClauseItems {
+				return p.errfAt(
+					assignment.Pos,
+					"ON CONFLICT DO UPDATE may assign at most %d columns",
+					maxClauseItems,
+				)
+			}
+			for i := range assignments {
+				if assignments[i].Column == assignment.Column {
+					return p.errfAt(
+						assignment.Pos,
+						"ON CONFLICT DO UPDATE assigns column %q more than once",
+						assignment.Column,
+					)
+				}
+			}
+			assignments = append(assignments, assignment)
+		}
+		p.conflictAssignments = assignments
+		p.conflict.Assignments = assignments
+	}
+	if p.atKeyword(kwWhere) {
+		return p.featureNotSupportedHere(
+			"ON CONFLICT DO UPDATE WHERE is not supported; the implicit primary-key conflict is always updated",
+		)
+	}
+	p.ins.OnConflictUpdate = &p.conflict
+	return nil
+}
+
+// parseConflictAssignment parses one SET target and its bounded value. The
+// bool distinguishes the special complete-document form without making a zero
+// Operand look present.
+func (p *Parser) parseConflictAssignment() (
+	doc Operand,
+	wholeDocument bool,
+	assignment UpdateAssignment,
+	err error,
+) {
+	if p.tok.kind == tokQuotedIdent && !p.tok.esc &&
+		p.tok.text == DocumentColumn {
+		p.advance()
+		if p.tok.kind != tokEq {
+			return Operand{}, false, UpdateAssignment{},
+				p.errfHere("expected '=' after %q", DocumentColumn)
+		}
+		p.advance()
+		if !p.atExcludedRelation() {
+			return Operand{}, false, UpdateAssignment{},
+				newFeatureNotSupportedError(
+					p.lx.src, p.tok.pos,
+					"a whole-document conflict update must be written as SET \"$doc\" = EXCLUDED.\"$doc\"",
+				)
+		}
+		value, valueErr := p.parseExcludedOperand(true)
+		if valueErr != nil {
+			return Operand{}, false, UpdateAssignment{}, valueErr
+		}
+		return value, true, UpdateAssignment{}, nil
+	}
+
+	path, pathErr := p.parsePath(false)
+	if pathErr != nil {
+		return Operand{}, false, UpdateAssignment{}, pathErr
+	}
+	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+		return Operand{}, false, UpdateAssignment{}, p.errfAt(
+			path.Pos,
+			"ON CONFLICT SET %s = ... must name one declared top-level column",
+			path.Spec(),
+		)
+	}
+	column := path.Segments[0].Key
+	if column == DocumentColumn || column == "$key" {
+		return Operand{}, false, UpdateAssignment{}, p.errfAt(
+			path.Pos, "ON CONFLICT SET %s = ... names a reserved column", path.Spec(),
+		)
+	}
+	if p.tok.kind != tokEq {
+		return Operand{}, false, UpdateAssignment{},
+			p.errfHere("expected '=' after %s", path.Spec())
+	}
+	p.advance()
+
+	var value Operand
+	switch {
+	case p.atExcludedRelation():
+		value, err = p.parseExcludedOperand(false)
+	case p.tok.kind == tokIdent && p.tok.kw == kwNull:
+		value = Operand{Kind: OperandNull, Pos: p.tok.pos}
+		p.advance()
+	case p.tok.kind == tokIdent &&
+		p.tok.kw != kwTrue && p.tok.kw != kwFalse,
+		p.tok.kind == tokQuotedIdent:
+		err = newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"ON CONFLICT assignments accept a scalar literal, '?', NULL, or EXCLUDED.<top-level-column>; current-row and expression values are not supported",
+		)
+	default:
+		value, err = p.parseOperand()
+	}
+	if err != nil {
+		return Operand{}, false, UpdateAssignment{}, err
+	}
+	return Operand{}, false, UpdateAssignment{
+		Column: column, Value: value, Pos: path.Pos,
+	}, nil
+}
+
+func (p *Parser) atExcludedRelation() bool {
+	return p.tok.kind == tokIdent && equalFoldASCII(p.tok.text, "excluded")
+}
+
+// parseExcludedOperand reads EXCLUDED.<column>. EXCLUDED is contextual and
+// case-insensitive, while the JSON column remains case-sensitive. Nested paths
+// are refused here so execution never has to guess whether it should construct
+// or traverse JSON.
+func (p *Parser) parseExcludedOperand(allowDocument bool) (Operand, error) {
+	p.advance() // EXCLUDED
+	if p.tok.kind != tokDot {
+		return Operand{}, p.errHere("expected '.' after EXCLUDED")
+	}
+	p.advance()
+	if p.tok.kind != tokIdent && p.tok.kind != tokQuotedIdent {
+		return Operand{}, p.errHere("expected a top-level column after EXCLUDED.")
+	}
+	if p.tok.kind == tokIdent {
+		if err := p.checkNameable("a field name after EXCLUDED."); err != nil {
+			return Operand{}, err
+		}
+	}
+	columnPos := p.tok.pos
+	column := p.internToken(p.tok)
+	p.advance()
+	if p.tok.kind == tokDot || p.tok.kind == tokJSONArrow ||
+		p.tok.kind == tokLBracket {
+		return Operand{}, newFeatureNotSupportedError(
+			p.lx.src, p.tok.pos,
+			"EXCLUDED values must name one top-level column; nested paths are not supported",
+		)
+	}
+	if allowDocument {
+		if column != DocumentColumn {
+			return Operand{}, newFeatureNotSupportedError(
+				p.lx.src, columnPos,
+				"a whole-document conflict update must read EXCLUDED.\"$doc\"",
+			)
+		}
+	} else if column == DocumentColumn || column == "$key" {
+		return Operand{}, newFeatureNotSupportedError(
+			p.lx.src, columnPos,
+			"EXCLUDED.<column> must name an ordinary declared top-level column; \"$doc\" and \"$key\" are reserved",
+		)
+	}
+	return Operand{Kind: OperandExcluded, Text: column, Pos: columnPos}, nil
 }
 
 func (p *Parser) insertParenthesizedSource() bool {
@@ -724,6 +922,12 @@ func (p *Parser) parseUpdate() error {
 			if wholeDocument {
 				return p.errHere("a whole-document UPDATE cannot be combined with column assignments")
 			}
+			if len(p.updateAssignments) >= maxClauseItems {
+				return p.errfAt(
+					assignment.Pos,
+					"UPDATE may assign at most %d columns", maxClauseItems,
+				)
+			}
 			for i := range p.updateAssignments {
 				if p.updateAssignments[i].Column == assignment.Column {
 					return p.errfAt(assignment.Pos, "UPDATE assigns column %q more than once", assignment.Column)
@@ -1034,7 +1238,7 @@ func (p *Parser) rejectTail() error {
 		return p.errHere("RETURNING is supported on INSERT, UPDATE, and DELETE")
 	}
 	if p.atKeyword(kwOn) {
-		return p.errHere("ON CONFLICT supports only DO NOTHING; conflict updates are written UPDATE ... SET \"$doc\" = ?")
+		return p.errHere("ON CONFLICT follows INSERT; supported actions are DO NOTHING and bounded DO UPDATE SET")
 	}
 	return nil
 }

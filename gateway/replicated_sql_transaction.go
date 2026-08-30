@@ -486,7 +486,7 @@ func replicatedSQLMutationInputCount(
 	case sqlast.KindInsert:
 		insert := prepared.statement.Insert
 		if insert == nil || insert.Source != nil || insert.Returning != nil ||
-			insert.OnConflictDoNothing || len(insert.Rows) == 0 ||
+			insert.HasConflictAction() || len(insert.Rows) == 0 ||
 			len(bound.rowKeys) != len(insert.Rows) ||
 			len(bound.globalIndexes) != len(insert.Rows)*len(prepared.writeGlobalIndexes) {
 			return 0, ErrReplicatedSQLTransactionUnsupported

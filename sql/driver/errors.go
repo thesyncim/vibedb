@@ -3,6 +3,8 @@ package driver
 import (
 	"errors"
 	"fmt"
+
+	"github.com/thesyncim/vibedb/query"
 )
 
 var (
@@ -48,6 +50,15 @@ var (
 	// key already exists, or appears twice in one VALUES batch. INSERT never
 	// replaces; UPDATE is the explicit replacement operation.
 	ErrDuplicatePrimaryKey = errors.New("vibedb: INSERT primary key already exists")
+	// ErrUpsertCardinality reports an ON CONFLICT DO UPDATE candidate batch
+	// whose canonical primary key occurs more than once. Updating the same row
+	// twice in one statement is order-dependent, so the complete statement is
+	// refused and nothing is published. It also classifies as query's generic
+	// cardinality violation for SQLSTATE 21000 adapters.
+	ErrUpsertCardinality = fmt.Errorf(
+		"%w: ON CONFLICT DO UPDATE cannot affect the same row twice",
+		query.ErrCardinalityViolation,
+	)
 	// ErrUpdatePrimaryKey reports a whole-document UPDATE whose replacement
 	// derives a different primary key from a selected row. One constant
 	// replacement document therefore cannot update several distinct primary

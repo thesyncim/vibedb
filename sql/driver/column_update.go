@@ -12,6 +12,7 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
+	jsondoc "github.com/thesyncim/vibejson/document"
 )
 
 // ApplyColumnAssignments materializes a declared-column UPDATE over one
@@ -19,6 +20,31 @@ import (
 // coordinator before emitting a digest-guarded replacement. Existing values
 // remain raw JSON bytes; only assigned scalars are encoded.
 func ApplyColumnAssignments(document []byte, assignments []sqlast.UpdateAssignment, args []any, maxBytes int) ([]byte, error) {
+	return applyColumnAssignments(document, nil, assignments, args, maxBytes)
+}
+
+// ApplyColumnAssignmentsWithExcluded materializes the conflict branch of an
+// INSERT ... ON CONFLICT DO UPDATE. Ordinary operands are bound exactly as they
+// are for UPDATE; OperandExcluded copies the effective top-level value from
+// the candidate INSERT document. Missing candidate fields become JSON null,
+// matching this dialect's existing missing/NULL scalar model.
+func ApplyColumnAssignmentsWithExcluded(
+	document []byte,
+	excluded []byte,
+	assignments []sqlast.UpdateAssignment,
+	args []any,
+	maxBytes int,
+) ([]byte, error) {
+	return applyColumnAssignments(document, excluded, assignments, args, maxBytes)
+}
+
+func applyColumnAssignments(
+	document []byte,
+	excluded []byte,
+	assignments []sqlast.UpdateAssignment,
+	args []any,
+	maxBytes int,
+) ([]byte, error) {
 	if len(assignments) == 0 {
 		return nil, errors.New("vibedb: column UPDATE has no assignments")
 	}
@@ -29,10 +55,21 @@ func ApplyColumnAssignments(document []byte, assignments []sqlast.UpdateAssignme
 	}
 	materialized := make([]materializedAssignment, len(assignments))
 	byColumn := make(map[string]int, len(assignments))
+	hasExcluded := false
 	for i := range assignments {
-		value, err := encodeAssignmentScalar(assignments[i].Value, args)
-		if err != nil {
-			return nil, err
+		var value []byte
+		if assignments[i].Value.Kind == sqlast.OperandExcluded {
+			if excluded == nil {
+				return nil, errors.New("vibedb: EXCLUDED is only available to ON CONFLICT DO UPDATE")
+			}
+			value = []byte("null")
+			hasExcluded = true
+		} else {
+			var err error
+			value, err = encodeAssignmentScalar(assignments[i].Value, args)
+			if err != nil {
+				return nil, err
+			}
 		}
 		key, err := json.Marshal(assignments[i].Column)
 		if err != nil {
@@ -43,6 +80,57 @@ func ApplyColumnAssignments(document []byte, assignments []sqlast.UpdateAssignme
 			lastMember: -1,
 		}
 		byColumn[assignments[i].Column] = i
+	}
+	if hasExcluded {
+		candidate, err := vibejson.ParseOptions(excluded, vibejson.Options{ZeroCopy: true})
+		if err != nil {
+			return nil, fmt.Errorf("vibedb: EXCLUDED requires an object document: %w", err)
+		}
+		candidateIter, ok := candidate.Node().ObjectIter()
+		if !ok {
+			return nil, errors.New("vibedb: EXCLUDED requires an object document")
+		}
+		keyText := make([]byte, 0, 64)
+		for {
+			key, value, ok := candidateIter.NextRaw()
+			if !ok {
+				break
+			}
+			var column string
+			if raw, clean := key.StringBytes(); clean {
+				column = string(raw)
+			} else {
+				var textErr error
+				keyText, _, textErr = key.AppendText(keyText[:0])
+				if textErr != nil {
+					return nil, fmt.Errorf(
+						"vibedb: decode EXCLUDED column name: %w", textErr,
+					)
+				}
+				column = string(keyText)
+			}
+			for i := range assignments {
+				if assignments[i].Value.Kind == sqlast.OperandExcluded &&
+					assignments[i].Value.Text == column {
+					// Candidate JSON follows the engine's established
+					// last-occurrence-wins lookup rule. The borrowed bytes
+					// remain live until this materialization returns.
+					materialized[i].value = value.Bytes()
+				}
+			}
+		}
+		for i := range assignments {
+			if assignments[i].Value.Kind != sqlast.OperandExcluded {
+				continue
+			}
+			kind := (vibejson.RawValue{Src: materialized[i].value}).Kind()
+			if kind == jsondoc.Object || kind == jsondoc.Array {
+				return nil, fmt.Errorf(
+					"vibedb: EXCLUDED column %q is not a scalar",
+					assignments[i].Value.Text,
+				)
+			}
+		}
 	}
 
 	parsed, err := vibejson.ParseOptions(document, vibejson.Options{ZeroCopy: true})
@@ -160,6 +248,32 @@ func ApplyColumnAssignments(document []byte, assignments []sqlast.UpdateAssignme
 	return updated, nil
 }
 
+// validateUpsertColumnAssignments resolves both sides of the deliberately flat
+// conflict SET list against the current table incarnation. EXCLUDED is a row
+// namespace, not a way to reach arbitrary undeclared JSON members through SQL.
+func validateUpsertColumnAssignments(
+	table string,
+	meta *tableMeta,
+	assignments []sqlast.UpdateAssignment,
+) error {
+	if err := validateDeclaredColumnAssignments(table, meta, assignments); err != nil {
+		return err
+	}
+	for i := range assignments {
+		value := assignments[i].Value
+		if value.Kind != sqlast.OperandExcluded ||
+			declaredTopLevelColumn(meta, value.Text) {
+			continue
+		}
+		return &query.RelationColumnError{
+			Relation: table,
+			Column:   value.Text,
+			Pos:      value.Pos,
+		}
+	}
+	return nil
+}
+
 // validateDeclaredColumnAssignments resolves UPDATE's deliberately flat SET
 // targets against the current catalog incarnation. Keeping this check beside
 // materialization gives prepare, autocommit, transaction, and capture paths
@@ -174,17 +288,7 @@ func validateDeclaredColumnAssignments(
 		return nil
 	}
 	for i := range assignments {
-		pointer := appendUpdateColumnPointer(nil, assignments[i].Column)
-		declared := false
-		if meta != nil && meta.Schema != nil {
-			for j := range meta.Schema.Fields {
-				if meta.Schema.Fields[j].Path == string(pointer) {
-					declared = true
-					break
-				}
-			}
-		}
-		if !declared {
+		if !declaredTopLevelColumn(meta, assignments[i].Column) {
 			return &query.RelationColumnError{
 				Relation: table,
 				Column:   assignments[i].Column,
@@ -195,6 +299,19 @@ func validateDeclaredColumnAssignments(
 	return nil
 }
 
+func declaredTopLevelColumn(meta *tableMeta, column string) bool {
+	pointer := appendUpdateColumnPointer(nil, column)
+	if meta == nil || meta.Schema == nil {
+		return false
+	}
+	for i := range meta.Schema.Fields {
+		if meta.Schema.Fields[i].Path == string(pointer) {
+			return true
+		}
+	}
+	return false
+}
+
 // validateColumnAssignmentBindings makes parameter failures independent of
 // row cardinality. UPDATE must reject an unsupported or malformed SET value
 // even when its predicate selects no rows, just as whole-document UPDATE does.
@@ -203,6 +320,9 @@ func validateColumnAssignmentBindings(
 	args []any,
 ) error {
 	for i := range assignments {
+		if assignments[i].Value.Kind == sqlast.OperandExcluded {
+			continue
+		}
 		if _, err := encodeAssignmentScalar(assignments[i].Value, args); err != nil {
 			return err
 		}

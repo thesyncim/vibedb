@@ -219,7 +219,17 @@ A multi-row insertion is atomic.
 does not construct named columns from several outputs. The source query reads
 the pre-statement snapshot.
 
-Conflict handling supports `ON CONFLICT DO NOTHING` only.
+Conflict handling uses the document-derived primary key as its implicit target.
+`ON CONFLICT DO NOTHING` skips existing rows. Embedded `INSERT ... VALUES`
+also supports `ON CONFLICT DO UPDATE SET` with either the whole-document form
+`"$doc" = EXCLUDED."$doc"` or declared top-level scalar assignments whose
+values are literals, placeholders, `NULL`, or `EXCLUDED.<column>`. The action is
+atomic across the batch and returns final post-images through `RETURNING`.
+Duplicate canonical candidate keys are cardinality violations. Explicit
+targets, action predicates, nested/current-row expressions, and `INSERT ...
+SELECT DO UPDATE` remain unsupported. RF3/distributed writes fail closed on
+conflict updates; conflict-skipping inserts are also refused when READY global
+indexes would require branch-aware maintenance.
 
 ## UPDATE and DELETE
 

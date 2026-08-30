@@ -822,13 +822,18 @@ const (
 	// as a declared-column UPDATE assignment. Comparisons deliberately continue
 	// to reject NULL in favor of IS NULL.
 	OperandNull
+	// OperandExcluded is one value from the candidate document of INSERT ...
+	// ON CONFLICT DO UPDATE. Text is the declared top-level source column, or
+	// DocumentColumn for the one supported whole-document spelling
+	// EXCLUDED."$doc". It is never produced by predicates or ordinary UPDATE.
+	OperandExcluded
 )
 
 // An Operand is a literal or a placeholder.
 type Operand struct {
 	Kind OperandKind
-	// Text is the decoded string, the exact numeric spelling, or the verbatim
-	// JSON document, by Kind.
+	// Text is the decoded string, the exact numeric spelling, the verbatim JSON
+	// document, or the EXCLUDED source column, by Kind.
 	Text string
 	// Bool is the value of an OperandBool.
 	Bool bool

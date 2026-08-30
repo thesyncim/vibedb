@@ -238,9 +238,14 @@ type InsertStmt struct {
 	Columns []*PathExpr
 	// OnConflictDoNothing makes an identity collision a skipped row instead of
 	// an error. It is the deliberately narrow, atomic subset of PostgreSQL's
-	// ON CONFLICT grammar supported by the storage adapter; conflict targets
-	// and DO UPDATE are not implied by this flag.
+	// ON CONFLICT grammar supported by the storage adapter. Conflict targets
+	// remain implicit because the document-derived primary key is the only
+	// unique key in this SQL surface.
 	OnConflictDoNothing bool
+	// OnConflictUpdate carries the alternative conflict action. It is nil when
+	// there is no DO UPDATE clause. The parser guarantees that this and
+	// OnConflictDoNothing are mutually exclusive.
+	OnConflictUpdate *InsertConflictUpdate
 	// Returning is the projection evaluated over the documents this INSERT
 	// publishes, in VALUES order. It is nil when the statement returns no rows.
 	//
@@ -252,6 +257,35 @@ type InsertStmt struct {
 	Params int
 	// Pos is the byte offset of the collection name.
 	Pos int
+}
+
+// InsertConflictUpdate is the bounded assignment program of INSERT ... ON
+// CONFLICT DO UPDATE. It either replaces the complete conflicting document
+// from EXCLUDED."$doc", or replaces distinct declared top-level columns. The
+// two forms never mix.
+type InsertConflictUpdate struct {
+	// Doc is OperandExcluded naming DocumentColumn for the whole-document form.
+	// It is otherwise the zero operand and Assignments is non-empty.
+	Doc Operand
+	// Assignments are scalar literals/placeholders/NULL or OperandExcluded
+	// references to declared top-level candidate columns.
+	Assignments []UpdateAssignment
+	// Pos is the byte offset of UPDATE and SetPos is the first assignment.
+	Pos    int
+	SetPos int
+}
+
+// WholeDocument reports whether the conflict action replaces the complete
+// document with EXCLUDED."$doc".
+func (u *InsertConflictUpdate) WholeDocument() bool {
+	return u != nil && len(u.Assignments) == 0 &&
+		u.Doc.Kind == OperandExcluded && u.Doc.Text == DocumentColumn
+}
+
+// HasConflictAction reports whether INSERT has either supported ON CONFLICT
+// action.
+func (s *InsertStmt) HasConflictAction() bool {
+	return s != nil && (s.OnConflictDoNothing || s.OnConflictUpdate != nil)
 }
 
 // An InsertRow is one VALUES tuple.
