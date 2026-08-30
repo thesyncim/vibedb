@@ -12,7 +12,14 @@ import (
 
 var ErrMux = errors.New("shardcontrol: invalid service discriminator")
 
-const DiscriminatorBytes = 8
+const (
+	DiscriminatorBytes = 8
+	// MaxRoutes bounds construction work while leaving room for the complete
+	// RF3 control plane. One logical service may own multiple fixed wire
+	// grammars (for example schema build, resume, and shadow build), so the
+	// route bound must cover discriminators rather than handler arguments.
+	MaxRoutes = 24
+)
 
 // Handler owns one already-authenticated connection. Implementations consume
 // their complete fixed grammar and close the connection when they return.
@@ -40,7 +47,7 @@ func New(routes ...Route) (*Mux, error) {
 // exact authenticated traffic class. Snapshot transfer and split artifacts
 // use this to share one snapshot listener without weakening ALPN isolation.
 func NewForTraffic(traffic rafttransport.TrafficClass, routes ...Route) (*Mux, error) {
-	if len(routes) == 0 || len(routes) > 16 {
+	if len(routes) == 0 || len(routes) > MaxRoutes {
 		return nil, ErrMux
 	}
 	if traffic != rafttransport.TrafficShardControl && traffic != rafttransport.TrafficSnapshot {

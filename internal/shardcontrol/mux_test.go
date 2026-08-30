@@ -95,6 +95,27 @@ func TestMuxRejectsUnknownDuplicateAndWrongTraffic(t *testing.T) {
 	}
 }
 
+func TestMuxRouteBoundCoversCompleteControlPlane(t *testing.T) {
+	handler := &testHandler{}
+	routes := make([]Route, MaxRoutes)
+	for index := range routes {
+		routes[index] = Route{
+			Discriminator: [8]byte{'V', 'B', 'B', 'O', 'U', 'N', 'D', byte(index + 1)},
+			Handler:       handler,
+		}
+	}
+	if _, err := New(routes...); err != nil {
+		t.Fatalf("maximum bounded route set rejected: %v", err)
+	}
+	routes = append(routes, Route{
+		Discriminator: [8]byte{'V', 'B', 'B', 'O', 'U', 'N', 'D', byte(MaxRoutes + 1)},
+		Handler:       handler,
+	})
+	if _, err := New(routes...); !errors.Is(err, ErrMux) {
+		t.Fatalf("route set beyond bound err=%v", err)
+	}
+}
+
 func TestMuxDispatchesExactSnapshotTrafficWithoutAcceptingControl(t *testing.T) {
 	magic := [8]byte{'V', 'B', 'S', 'N', 'A', 'P', 0, 0}
 	handler := &testHandler{want: append(magic[:], 9), done: make(chan error, 1)}
