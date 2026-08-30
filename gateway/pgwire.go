@@ -138,14 +138,28 @@ func (s *postgresSession) Tables(ctx context.Context) ([]driver.TableInfo, error
 		return nil, ErrNoCatalog
 	}
 	profiles := snapshot.ReplicatedTableProfiles()
+	return replicatedTableInfos(snapshot, profiles), nil
+}
+
+func replicatedTableInfos(snapshot *Snapshot, profiles []ReplicatedTableProfile) []driver.TableInfo {
 	tables := make([]driver.TableInfo, len(profiles))
 	for i, p := range profiles {
 		tables[i] = driver.TableInfo{Name: p.Table, PrimaryKey: p.PrimaryKey}
 		if declared, ok := snapshot.declaredTableInfo(p.Table); ok {
 			tables[i] = declared
 		}
+		indexes := snapshot.Indexes(p.Table)
+		for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
+			index, ok := indexes.At(ordinal)
+			if !ok || !index.Ready() {
+				continue
+			}
+			paths := make([]string, int(index.PathCount))
+			copy(paths, index.Paths[:index.PathCount])
+			tables[i].Indexes = append(tables[i].Indexes, driver.IndexInfo{Name: index.Name, Paths: paths})
+		}
 	}
-	return tables, nil
+	return tables
 }
 func (s *postgresSession) Prepare(ctx context.Context, text string) (pgwire.BackendStatement, error) {
 	if s.state == driver.SessionClosed {

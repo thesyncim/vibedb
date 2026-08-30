@@ -177,6 +177,28 @@ func (a *rf3SchemaActivator) ResumeSchemaBuild(ctx context.Context, operation [3
 	if state.quiesced || state.apply == nil {
 		return request, "", target, false, schemainstall.ErrConflict
 	}
+	record, found, err := state.apply.ObserveJournaledReplicatedSchemaDDLBuild(operation)
+	if err != nil {
+		// A ready target may legitimately outlive the predecessor catalog image
+		// after an earlier schema generation is reclaimed. Bind the detached
+		// journal receipt to this live group's monotonic schema generation and
+		// current manifest instead of turning read-only recovery into cleanup.
+		detached, retained, detachedErr := state.apply.ObserveRetainedReplicatedSchemaDDLBuild(operation)
+		manifest, manifestErr := state.apply.RangeSplitRelationManifestDigest()
+		if detachedErr == nil && manifestErr == nil && retained &&
+			(detached.SourceSchemaGeneration == state.base.Binding.Authority.SchemaGeneration ||
+				detached.SourceSchemaGeneration+1 == state.base.Binding.Authority.SchemaGeneration) {
+			if detached.SourceSchemaGeneration == state.base.Binding.Authority.SchemaGeneration {
+				detached.SourceRelationManifestDigest = manifest
+			}
+			record, found, err = detached, true, nil
+		} else {
+			err = errors.Join(err, detachedErr, manifestErr)
+		}
+	}
+	if err != nil || !found {
+		return request, "", target, false, errors.Join(err, schemainstall.ErrMissing)
+	}
 	publishedTransition, published, err := sqldriver.ObservePublishedReplicatedSchemaTransition(state.path)
 	if err != nil {
 		return request, "", target, false, err
@@ -190,14 +212,11 @@ func (a *rf3SchemaActivator) ResumeSchemaBuild(ctx context.Context, operation [3
 	// coordinator can replay the exact authorized activation.
 	currentPublished := published && publishedTransition.RequestDigest == operation &&
 		publishedTransition.ToSchemaGeneration == state.base.Binding.Authority.SchemaGeneration+1
-	if !completed && !currentPublished {
-		if err := settlePriorRF3SchemaGeneration(ctx, state); err != nil {
-			return request, "", target, false, err
+	if record.SourceRelationManifestDigest == ([32]byte{}) {
+		if !completed {
+			return request, "", target, false, schemainstall.ErrConflict
 		}
-	}
-	record, found, err := state.apply.ObserveJournaledReplicatedSchemaDDLBuild(operation)
-	if err != nil || !found {
-		return request, "", target, false, errors.Join(err, schemainstall.ErrMissing)
+		record.SourceRelationManifestDigest = publishedTransition.FromManifest
 	}
 	if completed {
 		if record.Target.Proof.Catalog.SchemaGeneration != publishedTransition.ToSchemaGeneration ||
@@ -214,6 +233,11 @@ func (a *rf3SchemaActivator) ResumeSchemaBuild(ctx context.Context, operation [3
 			return request, "", target, false, stageErr
 		}
 		if currentApplied > record.SourceApplied && !staged {
+			if !currentPublished {
+				if err := settlePriorRF3SchemaGeneration(ctx, state); err != nil {
+					return request, "", target, false, err
+				}
+			}
 			rebased, rebaseErr := state.apply.BuildJournaledReplicatedSchemaDDLTarget(
 				ctx, operation, currentApplied, record.SQL,
 			)

@@ -78,6 +78,45 @@ type ReplicatedSchemaDDLBuildRecord struct {
 	Target                       ReplicatedSchemaDDLTarget
 }
 
+// ObserveRetainedReplicatedSchemaDDLBuild returns the journal's immutable
+// receipt without requiring the predecessor catalog image to remain in the
+// local lineage cache. The caller must bind SourceSchemaGeneration to its
+// current authenticated group state and supply the current relation manifest.
+// This is the recovery primitive for a target that outlives source-image
+// reclamation; it never grants prepare or serving authority.
+func (a *ReplicatedApply) ObserveRetainedReplicatedSchemaDDLBuild(
+	operation [32]byte,
+) (ReplicatedSchemaDDLBuildRecord, bool, error) {
+	var result ReplicatedSchemaDDLBuildRecord
+	if a == nil || a.database == nil || operation == ([32]byte{}) {
+		return result, false, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	err := a.checkLocked()
+	directory := a.database.dataDir
+	a.database.mu.RUnlock()
+	if err != nil {
+		return result, false, err
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return result, false, err
+	}
+	defer root.Close()
+	record, found, err := readSchemaDDLBuildRecord(root)
+	if err != nil || !found || record.Operation != operation {
+		return result, false, err
+	}
+	if !record.Ready || record.Target.NoOp {
+		return result, false, ErrReplicatedSchemaDDLConflict
+	}
+	return ReplicatedSchemaDDLBuildRecord{
+		Operation: operation, SourceApplied: record.Applied,
+		SourceSchemaGeneration: record.SourceGeneration,
+		SQL:                    record.SQL, Target: record.Target,
+	}, true, nil
+}
+
 // ObserveJournaledReplicatedSchemaDDLBuild returns an exact ready build for an
 // operation. It is read-only and bounded by the existing one-slot journal.
 func (a *ReplicatedApply) ObserveJournaledReplicatedSchemaDDLBuild(

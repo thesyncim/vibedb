@@ -2,7 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -17,6 +22,7 @@ import (
 type schemaDDLResumeResult struct {
 	request schemainstall.BuildRequest
 	sql     string
+	target  sqldriver.ReplicatedSchemaDDLTarget
 	err     error
 }
 
@@ -29,7 +35,20 @@ func (f schemaDDLResumeFake) ResumeBuild(_ context.Context, node rafttransport.N
 	if !found {
 		return schemainstall.BuildRequest{}, "", sqldriver.ReplicatedSchemaDDLTarget{}, false, schemainstall.ErrMissing
 	}
-	return result.request, result.sql, sqldriver.ReplicatedSchemaDDLTarget{}, true, result.err
+	return result.request, result.sql, result.target, true, result.err
+}
+
+type schemaDDLBuildFake struct {
+	target sqldriver.ReplicatedSchemaDDLTarget
+	err    error
+	calls  int
+}
+
+func (f *schemaDDLBuildFake) Build(_ context.Context, _ rafttransport.NodeID,
+	_ schemainstall.BuildRequest, _ string,
+) (sqldriver.ReplicatedSchemaDDLTarget, error) {
+	f.calls++
+	return f.target, f.err
 }
 
 func testSchemaDDLRecoveryDescriptor() ([32]byte, gateway.ReplicatedShardDescriptor) {
@@ -84,5 +103,82 @@ func TestGatewaySchemaDDLRecoverySQLFailsClosed(t *testing.T) {
 	runtime.resumer = schemaDDLResumeFake{descriptor.Replicas[0].Node: {request: request, sql: "DROP INDEX docs_by_city"}}
 	if _, err := runtime.recoverySQL(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, operation); !errors.Is(err, gateway.ErrSchemaRolloutConflict) {
 		t.Fatalf("foreign source receipt accepted: %v", err)
+	}
+}
+
+func TestGatewaySchemaDDLBuildResumesRetainedReceiptAfterUnknownOutcome(t *testing.T) {
+	operation, descriptor := testSchemaDDLRecoveryDescriptor()
+	const sql = "CREATE INDEX docs_by_city ON documents (city)"
+	request := schemainstall.BuildRequest{Operation: operation, Group: descriptor.Group,
+		AllocationGeneration:       descriptor.AllocationGeneration,
+		FromSchemaGeneration:       descriptor.Command.SchemaGeneration,
+		FromRelationManifestDigest: descriptor.Command.RelationManifestDigest,
+		SourceApplied:              19, SQLBytes: uint64(len(sql)), SQLDigest: sha256.Sum256([]byte(sql))}
+	retained := request
+	retained.SourceApplied = 17
+	want := sqldriver.ReplicatedSchemaDDLTarget{Catalog: []byte("retained")}
+	builder := &schemaDDLBuildFake{err: errors.Join(schemainstall.ErrOutcomeUnknown, errors.New("lost response"))}
+	runtime := &gatewaySchemaDDLRuntime{builder: builder, resumer: schemaDDLResumeFake{
+		descriptor.Replicas[0].Node: {request: retained, sql: sql, target: want},
+	}}
+	gotRequest, got, err := runtime.buildOrResume(t.Context(), descriptor.Replicas[0].Node, request, sql)
+	if err != nil || gotRequest != retained || !reflect.DeepEqual(got, want) || builder.calls != 1 {
+		t.Fatalf("resume: request=%+v target=%+v err=%v calls=%d", gotRequest, got, err, builder.calls)
+	}
+}
+
+func TestGatewaySchemaDDLBuildResumeFailsClosed(t *testing.T) {
+	operation, descriptor := testSchemaDDLRecoveryDescriptor()
+	const sql = "CREATE INDEX docs_by_city ON documents (city)"
+	request := schemainstall.BuildRequest{Operation: operation, Group: descriptor.Group,
+		AllocationGeneration:       descriptor.AllocationGeneration,
+		FromSchemaGeneration:       descriptor.Command.SchemaGeneration,
+		FromRelationManifestDigest: descriptor.Command.RelationManifestDigest,
+		SourceApplied:              19, SQLBytes: uint64(len(sql)), SQLDigest: sha256.Sum256([]byte(sql))}
+	for _, test := range []struct {
+		name     string
+		retained schemainstall.BuildRequest
+		text     string
+	}{
+		{name: "future-cut", retained: func() schemainstall.BuildRequest { changed := request; changed.SourceApplied++; return changed }(), text: sql},
+		{name: "different-sql", retained: request, text: "TRUNCATE documents"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			builder := &schemaDDLBuildFake{err: schemainstall.ErrConflict}
+			runtime := &gatewaySchemaDDLRuntime{builder: builder, resumer: schemaDDLResumeFake{
+				descriptor.Replicas[0].Node: {request: test.retained, sql: test.text},
+			}}
+			if _, _, err := runtime.buildOrResume(t.Context(), descriptor.Replicas[0].Node, request, sql); !errors.Is(err, gateway.ErrSchemaRolloutConflict) {
+				t.Fatalf("foreign retained receipt accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestGatewaySchemaDDLSelectsAuthenticatedRetainedOperation(t *testing.T) {
+	operation, descriptor := testSchemaDDLRecoveryDescriptor()
+	const sql = "CREATE INDEX docs_by_city ON documents (city)"
+	request := schemainstall.BuildRequest{Operation: operation, Group: descriptor.Group,
+		AllocationGeneration:       descriptor.AllocationGeneration,
+		FromSchemaGeneration:       descriptor.Command.SchemaGeneration,
+		FromRelationManifestDigest: descriptor.Command.RelationManifestDigest,
+		SourceApplied:              17, SQLBytes: uint64(len(sql)), SQLDigest: sha256.Sum256([]byte(sql))}
+	journal := t.TempDir()
+	if err := os.Mkdir(filepath.Join(journal, hex.EncodeToString(operation[:])), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resume := make(schemaDDLResumeFake, len(descriptor.Replicas))
+	for _, replica := range descriptor.Replicas {
+		resume[replica.Node] = schemaDDLResumeResult{request: request, sql: sql}
+	}
+	runtime := &gatewaySchemaDDLRuntime{journal: journal, resumer: resume}
+	current := [32]byte{99}
+	selected, err := runtime.retainedOperation(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, sql, current)
+	if err != nil || selected != operation {
+		t.Fatalf("selected=%x want=%x err=%v", selected, operation, err)
+	}
+	selected, err = runtime.retainedOperation(t.Context(), []gateway.ReplicatedShardDescriptor{descriptor}, "TRUNCATE documents", current)
+	if err != nil || selected != current {
+		t.Fatalf("foreign SQL selected retained operation: %x %v", selected, err)
 	}
 }

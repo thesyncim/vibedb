@@ -186,6 +186,142 @@ func BuildReplicatedSchemaDDLPlan(current *Snapshot, operation [32]byte, table, 
 	return target, plans, nil
 }
 
+// ReconcileAppliedReplicatedSchemaDDLCatalog repairs the narrow publication
+// cut where every shard descriptor already names the retained target, while
+// the portable index/declaration metadata is still the source view. It returns
+// matched=false for an ordinary source-generation rollout. No replica action
+// is produced: all RF3 target generations and manifests must already match.
+func ReconcileAppliedReplicatedSchemaDDLCatalog(current *Snapshot, operation [32]byte,
+	table, sql string, builds []SchemaDDLReplicaBuild,
+) (*Snapshot, bool, error) {
+	if current == nil || current.Generation() == math.MaxUint64 || operation == ([32]byte{}) ||
+		len(sql) == 0 || len(sql) > sqldriver.ReplicatedChildSchemaMaxBytes {
+		return nil, false, ErrSchemaRollout
+	}
+	state, err := initialCatalogState(current)
+	if err != nil {
+		return nil, false, err
+	}
+	placement, found := state.Placement(table)
+	if !found {
+		return nil, false, sqldriver.ErrTableNotFound
+	}
+	descriptors, profiles := state.replicatedDescriptors(), state.replicatedTableProfiles()
+	type replicaKey struct {
+		group  raftmember.GroupKey
+		node   rafttransport.NodeID
+		member uint64
+	}
+	want := make(map[replicaKey]int)
+	for i, descriptor := range descriptors {
+		if descriptor.Distribution == placement.Distribution {
+			for _, replica := range descriptor.Replicas {
+				want[replicaKey{descriptor.Group, replica.Node, replica.Member}] = i
+			}
+		}
+	}
+	if len(want) == 0 || len(builds) != len(want) {
+		return nil, false, ErrSchemaRollout
+	}
+	// A single ordinary source descriptor means this is not the repair cut.
+	for _, build := range builds {
+		i, ok := want[replicaKey{build.Request.Group, build.Node, build.Member}]
+		if !ok {
+			return nil, false, ErrSchemaRollout
+		}
+		if build.Request.FromSchemaGeneration == descriptors[i].Command.SchemaGeneration {
+			return nil, false, nil
+		}
+	}
+	indexes, indexNoOp, err := schemaDDLPlanIndexes(state, table, sql)
+	alreadyCataloged := errors.Is(err, sqldriver.ErrIndexExists)
+	if alreadyCataloged {
+		indexes = state.indexDescriptors()
+		err = nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	declarations, declarationNoOp, err := schemaDDLPlanDeclarations(state, table, sql)
+	if err != nil || indexNoOp || declarationNoOp {
+		return nil, true, errors.Join(err, ErrSchemaRolloutConflict)
+	}
+	var sourceProfile ReplicatedTableProfile
+	for _, profile := range profiles {
+		if profile.Table == table {
+			sourceProfile = profile
+			break
+		}
+	}
+	if sourceProfile.Table == "" {
+		return nil, true, ErrSchemaRollout
+	}
+	seen := make(map[replicaKey]bool, len(builds))
+	sqlDigest := sha256.Sum256([]byte(sql))
+	var logical replication.Digest
+	for _, build := range builds {
+		r := build.Request
+		key := replicaKey{r.Group, build.Node, build.Member}
+		i, ok := want[key]
+		if !ok || seen[key] {
+			return nil, true, ErrSchemaRollout
+		}
+		seen[key] = true
+		currentDescriptor := descriptors[i]
+		proof := build.Target.Proof
+		if _, err := schemainstall.BuildRequestDigest(r); err != nil || r.Operation != operation ||
+			r.SQLBytes != uint64(len(sql)) || r.SQLDigest != sqlDigest ||
+			r.AllocationGeneration != currentDescriptor.AllocationGeneration ||
+			r.FromSchemaGeneration+1 != currentDescriptor.Command.SchemaGeneration ||
+			proof.Catalog.SchemaGeneration != currentDescriptor.Command.SchemaGeneration ||
+			proof.Catalog.RelationManifestDigest != currentDescriptor.Command.RelationManifestDigest ||
+			build.Target.NoOp {
+			return nil, true, errors.Join(err, ErrSchemaRolloutConflict)
+		}
+		if err := sqldriver.ValidateReplicatedSchemaDDLTarget(build.Target, r.SourceApplied, r.FromSchemaGeneration); err != nil {
+			return nil, true, err
+		}
+		description, err := sqldriver.DescribeReplicatedSchemaCatalogImage(build.Target.Catalog)
+		if err != nil {
+			return nil, true, err
+		}
+		if logical != (replication.Digest{}) && logical != replication.Digest(description.LogicalSchemaDigest) {
+			return nil, true, ErrSchemaRolloutConflict
+		}
+		logical = replication.Digest(description.LogicalSchemaDigest)
+		expected, ok := declaredTableInfoFromDeclarations(declarations, table, sourceProfile.PrimaryKey)
+		if !ok {
+			return nil, true, ErrSchemaRollout
+		}
+		sourceDescriptor := currentDescriptor
+		sourceDescriptor.Command.SchemaGeneration = r.FromSchemaGeneration
+		sourceDescriptor.Command.RelationManifestDigest = r.FromRelationManifestDigest
+		if err := validateSchemaDDLDescription(state, sourceDescriptor, sourceProfile, build.Member, description, indexes, expected); err != nil {
+			return nil, true, err
+		}
+	}
+	for _, profile := range profiles {
+		p, ok := state.Placement(profile.Table)
+		if !ok {
+			return nil, true, ErrSchemaRollout
+		}
+		if p.Distribution == placement.Distribution &&
+			(profile.SchemaGeneration == 0 || profile.LogicalSchemaDigest != logical) {
+			return nil, true, ErrSchemaRolloutConflict
+		}
+	}
+	if alreadyCataloged {
+		return current, true, nil
+	}
+	target, err := NewSnapshotWithReplicatedTableMetadata(state.config, state.endpoints,
+		state.Generation()+1, indexes, state.statistics.Descriptors(), descriptors, profiles, declarations)
+	if err != nil {
+		return nil, true, err
+	}
+	target, err = advanceCatalogState(state, target)
+	return target, true, err
+}
+
 // ResolveReplicatedSchemaDDLTable returns the one base table affected by the
 // supported online DDL grammar. DROP INDEX follows PostgreSQL's table-free
 // spelling by resolving the retained catalog index identity.

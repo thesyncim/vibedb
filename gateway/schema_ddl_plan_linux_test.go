@@ -239,3 +239,43 @@ func TestSchemaDDLPlanRejectsIncompleteOrSubstitutedReceipts(t *testing.T) {
 		}
 	}
 }
+
+func TestSchemaDDLPlanReconcilesAppliedDescriptorsWithMissingPortableMetadata(t *testing.T) {
+	const sql = "CREATE INDEX by_city ON messages (city)"
+	base, builds, _ := schemaDDLPlanFixture(t, sql, false)
+	applied, _, err := BuildReplicatedSchemaDDLPlan(base, [32]byte{9}, "messages", sql, builds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial, err := NewSnapshotWithReplicatedTableMetadata(
+		cloneConfig(base.config), cloneEndpoints(base.endpoints), applied.Generation(),
+		base.indexDescriptors(), base.statistics.Descriptors(), applied.replicatedDescriptors(),
+		applied.replicatedTableProfiles(), base.ReplicatedTableDeclarations(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciled, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
+		partial, [32]byte{9}, "messages", sql, builds,
+	)
+	if err != nil || !matched || reconciled.Generation() != partial.Generation()+1 ||
+		len(reconciled.indexDescriptors()) != 1 || reconciled.indexDescriptors()[0].Name != "by_city" ||
+		!reflect.DeepEqual(reconciled.replicatedDescriptors(), partial.replicatedDescriptors()) ||
+		!reflect.DeepEqual(reconciled.replicatedTableProfiles(), partial.replicatedTableProfiles()) {
+		t.Fatalf("reconcile matched=%t err=%v indexes=%+v", matched, err, reconciled.indexDescriptors())
+	}
+	if _, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(base, [32]byte{9}, "messages", sql, builds); err != nil || matched {
+		t.Fatalf("ordinary source rollout treated as repair: matched=%t err=%v", matched, err)
+	}
+	already, matched, err := ReconcileAppliedReplicatedSchemaDDLCatalog(
+		reconciled, [32]byte{9}, "messages", sql, builds,
+	)
+	if err != nil || !matched || already != reconciled {
+		t.Fatalf("exact recovered request was not idempotent: matched=%t same=%t err=%v", matched, already == reconciled, err)
+	}
+	tables := replicatedTableInfos(reconciled, reconciled.ReplicatedTableProfiles())
+	if len(tables) != 1 || len(tables[0].Indexes) != 1 || tables[0].Indexes[0].Name != "by_city" ||
+		!reflect.DeepEqual(tables[0].Indexes[0].Paths, []string{"/city"}) {
+		t.Fatalf("PostgreSQL discovery lost recovered index: %+v", tables)
+	}
+}
