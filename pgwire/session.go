@@ -975,6 +975,7 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 			}
 			if strings.EqualFold(word, "CREATE") ||
 				strings.EqualFold(word, "DROP") ||
+				strings.EqualFold(word, "ALTER") ||
 				strings.EqualFold(word, "TRUNCATE") {
 				ddl = true
 			} else {
@@ -1015,7 +1016,7 @@ func (s *session) preflightSimpleQuery(src string) (bool, error) {
 	if ddl {
 		return false, newError(sqlstateFeatureNotSupported,
 			"DDL must be the only non-empty statement in a simple Query message").
-			withHint("send each CREATE, DROP, or TRUNCATE statement in its own Query message")
+			withHint("send each CREATE, ALTER, DROP, or TRUNCATE statement in its own Query message")
 	}
 	if sessionChange && catalogSQL {
 		return false, newError(sqlstateFeatureNotSupported,

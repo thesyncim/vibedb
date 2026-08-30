@@ -14,8 +14,8 @@ import (
 // Protocol adapters need to answer client-side introspection — a psql
 // backslash command, a driver's table browser — from the catalog this package
 // already owns, without executing catalog SQL the bounded dialect refuses.
-// Everything below is a read-only copy of what CREATE TABLE and CREATE INDEX
-// persisted; nothing here can observe uncommitted state, because DDL is not
+// Everything below is a read-only copy of what table and index DDL persisted;
+// nothing here can observe uncommitted state, because DDL is not
 // transactional in this runtime and publishes atomically under the catalog
 // lock this read takes.
 

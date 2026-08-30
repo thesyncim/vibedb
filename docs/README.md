@@ -42,6 +42,7 @@ Start with the page that matches your task.
 - [Storage model](store.md)
 - [On-disk format](format.md)
 - [SQL surface](design/sql-surface.md)
+- [Embedded SQL gap plan](design/sql-roadmap.md)
 - [Query planner](design/query-planner.md)
 - [Distributed transactions](design/distributed-transactions.md)
 - [Distributed clock contract](design/distributed-clock-model.md)

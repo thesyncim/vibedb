@@ -277,6 +277,11 @@ func (c *conn) execMutationCoreContext(
 	switch statement.Kind() {
 	case query.DDLCreateTable:
 		return d.createTableLockedContext(ctx, statement)
+	case query.DDLAlterTable:
+		if err := d.alterTableAddColumnStorageLockedContext(ctx, statement); err != nil {
+			return nil, err
+		}
+		return result{}, nil
 	case query.DDLDropTable:
 		return d.dropTableLockedContext(ctx, statement)
 	case query.DDLTruncate:

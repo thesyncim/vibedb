@@ -703,7 +703,7 @@ func (t *tx) beginMutationStatement(
 	)
 	if statement != nil {
 		switch statement.Kind() {
-		case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable,
+		case query.DDLCreateTable, query.DDLCreateIndex, query.DDLAlterTable, query.DDLDropTable,
 			query.DDLTruncate, query.DDLDropIndex:
 		default:
 			root = statement.Collection()
@@ -1037,7 +1037,7 @@ func (t *tx) execMutationCore(
 		}
 	}
 	switch statement.Kind() {
-	case query.DDLCreateTable, query.DDLCreateIndex, query.DDLDropTable,
+	case query.DDLCreateTable, query.DDLCreateIndex, query.DDLAlterTable, query.DDLDropTable,
 		query.DDLTruncate, query.DDLDropIndex:
 		return nil, ErrDDLInTransaction
 	}

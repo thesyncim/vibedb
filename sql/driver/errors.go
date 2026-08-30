@@ -12,6 +12,9 @@ var (
 	// ErrTableExists reports CREATE TABLE without IF NOT EXISTS naming an
 	// existing catalog entry.
 	ErrTableExists = errors.New("vibedb: SQL table already exists")
+	// ErrColumnExists reports ALTER TABLE ADD COLUMN without IF NOT EXISTS
+	// naming a path already present in the table's declared schema.
+	ErrColumnExists = errors.New("vibedb: SQL column already exists")
 	// ErrViewNotFound reports a statement naming an ordinary view absent from
 	// the durable SQL catalog.
 	ErrViewNotFound = errors.New("vibedb: SQL view does not exist")
@@ -54,8 +57,8 @@ var (
 	// ErrReadOnlyTransaction reports DML or DDL attempted in a read-only
 	// transaction.
 	ErrReadOnlyTransaction = errors.New("vibedb: mutation attempted in a read-only transaction")
-	// ErrDDLInTransaction reports CREATE TABLE or CREATE INDEX attempted between
-	// BEGIN and COMMIT/ROLLBACK.
+	// ErrDDLInTransaction reports schema or storage-definition DDL attempted
+	// between BEGIN and COMMIT/ROLLBACK.
 	ErrDDLInTransaction = errors.New("vibedb: schema definitions cannot run inside a transaction")
 	// ErrUnsupportedIsolation reports a requested transaction isolation level
 	// other than Read Committed, Repeatable Read/Snapshot, or Serializable.

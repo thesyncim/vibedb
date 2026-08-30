@@ -127,7 +127,7 @@ compatibility type, but production document encoding is performed by
 A physical connection can have only one open `Rows`. Close or exhaust the rows
 before you run another statement on that same connection.
 
-## Create tables and indexes
+## Create and alter tables and indexes
 
 A table stores JSON documents and has exactly one primary JSON path. Compound
 table primary keys are not supported by the driver.
@@ -145,6 +145,21 @@ Declared types map to JSON domains:
 
 Common SQL aliases map to these domains. `JSON` maps to `ANY`. Columns are
 nullable unless they use `NOT NULL`.
+
+Add one declared column with the bounded additive form:
+
+```sql
+ALTER TABLE docs ADD COLUMN IF NOT EXISTS note STRING
+```
+
+The driver validates every existing document against the resulting schema and
+publishes the new table incarnation atomically. A nullable column therefore
+works when older documents omit it. A `NOT NULL` column succeeds only when every
+existing document already contains a non-null value of the declared type.
+The current embedded implementation holds the catalog write lock while it
+copies a materialized table, so other reads and writes wait for a large ALTER.
+`ALTER TABLE` is not allowed inside an explicit transaction. Rename, drop,
+type-change, default, and constraint-changing ALTER actions are not supported.
 
 Primary-key values can be strings, booleans, or numbers. Numeric spellings
 such as `1`, `1.0`, and `1e0` have one exact identity. Arrays and objects cannot
