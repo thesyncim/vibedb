@@ -285,26 +285,13 @@ func lowerReplicatedSchemaDDL(target *catalogFile, statement *query.DMLStatement
 		if definition.Table != name {
 			return false, false, ErrTableNotFound
 		}
-		if meta.Schema == nil {
-			// A schemaless SQL table still derives physical identity from its
-			// declared primary-key path. The first additive field makes the store
-			// schema explicit, so carry that previously driver-enforced invariant
-			// into the compiled schema rather than accidentally weakening it.
-			meta.Schema = &schemaMeta{Root: uint16(store.SchemaObject), Fields: []schemaFieldMeta{{
-				Path: meta.PrimaryKey, Types: uint16(store.SchemaBool | store.SchemaNumber | store.SchemaString), Required: true,
-			}}}
+		schema, noOp, err := compileAddedColumnSchema(
+			meta, definition.Field, definition.IfNotExists,
+		)
+		if err != nil || noOp {
+			return false, noOp, err
 		}
-		for _, existing := range meta.Schema.Fields {
-			if existing.Path == definition.Field.Path {
-				if definition.IfNotExists {
-					return false, true, nil
-				}
-				return false, false, fmt.Errorf("vibedb: column already exists: %s", tree.AlterTable.Column.Path.Spec())
-			}
-		}
-		meta.Schema.Fields = append(meta.Schema.Fields, schemaFieldMeta{
-			Path: definition.Field.Path, Types: uint16(definition.Field.Types), Required: definition.Field.Required,
-		})
+		meta.Schema = schemaMetaFrom(schema)
 	case sqlast.KindCreateIndex:
 		definition, err := statement.LowerIndex()
 		if err != nil {

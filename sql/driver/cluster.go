@@ -219,21 +219,35 @@ func (c *conn) routeInsertStagedWithBinding(
 // replacement document must not move the row to another shard. It is a no-op for
 // an unplaced table or a non-cluster connection.
 func (c *conn) routeUpdate(statement *query.DMLStatement, args []any, document []byte) error {
+	text, err := c.routeUpdateInto(
+		statement, args, document, c.pointRaw[:0],
+	)
+	c.pointRaw = text[:0]
+	return err
+}
+
+// routeUpdateInto is routeUpdate with caller-owned text scratch. Mutation
+// capture uses it while conn.pointRaw contains the old document supplied to a
+// callback, preventing escaped shard-key decoding from overwriting that row.
+func (c *conn) routeUpdateInto(
+	statement *query.DMLStatement,
+	args []any,
+	document []byte,
+	text []byte,
+) ([]byte, error) {
 	binding := c.clusterBinding(statement.Collection())
 	if binding == nil {
-		return nil
+		return text, nil
 	}
 	router := c.clusterRouter()
 	program := compileConstraintProgram(binding, mutationWhere(statement))
 	route, err := singleShardRoute(program, router, args)
 	if err != nil {
-		return err
+		return text, err
 	}
-	text, err := checkShardKeyImmutableInto(
-		binding, router, route, document, c.pointRaw[:0],
+	return checkShardKeyImmutableInto(
+		binding, router, route, document, text[:0],
 	)
-	c.pointRaw = text[:0]
-	return err
 }
 
 // routeDelete enforces the current single-shard-only rule for a placed DELETE:

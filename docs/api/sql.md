@@ -127,7 +127,7 @@ compatibility type, but production document encoding is performed by
 A physical connection can have only one open `Rows`. Close or exhaust the rows
 before you run another statement on that same connection.
 
-## Create tables and indexes
+## Create and alter tables and indexes
 
 A table stores JSON documents and has exactly one primary JSON path. Compound
 table primary keys are not supported by the driver.
@@ -145,6 +145,21 @@ Declared types map to JSON domains:
 
 Common SQL aliases map to these domains. `JSON` maps to `ANY`. Columns are
 nullable unless they use `NOT NULL`.
+
+Add one declared column with the bounded additive form:
+
+```sql
+ALTER TABLE docs ADD COLUMN IF NOT EXISTS note STRING
+```
+
+The driver validates every existing document against the resulting schema and
+publishes the new table incarnation atomically. A nullable column therefore
+works when older documents omit it. A `NOT NULL` column succeeds only when every
+existing document already contains a non-null value of the declared type.
+The current embedded implementation holds the catalog write lock while it
+copies a materialized table, so other reads and writes wait for a large ALTER.
+`ALTER TABLE` is not allowed inside an explicit transaction. Rename, drop,
+type-change, default, and constraint-changing ALTER actions are not supported.
 
 Primary-key values can be strings, booleans, or numbers. Numeric spellings
 such as `1`, `1.0`, and `1e0` have one exact identity. Arrays and objects cannot
@@ -171,7 +186,7 @@ JSON documents. The source query reads the pre-statement snapshot.
 Conflict handling supports `ON CONFLICT DO NOTHING`. It does not support a
 conflict target or `DO UPDATE`.
 
-`UPDATE` replaces the complete document:
+`UPDATE` can replace the complete document:
 
 ```sql
 UPDATE docs
@@ -179,8 +194,19 @@ SET "$doc" = ?
 WHERE id = ?
 ```
 
-Partial path assignment is not supported. An update cannot change the primary
-key. A single constant replacement cannot replace several rows that have
+For tables with declared columns, `UPDATE` can instead assign scalar literals
+or placeholders to one or more top-level columns:
+
+```sql
+UPDATE employees
+SET team = ?, score = 7, note = NULL
+WHERE id = ?
+```
+
+Each matching document is updated independently, and unassigned fields are
+preserved. Nested-path targets and row-dependent assignment expressions such as
+`score = score + 1` are not supported. An update cannot change the primary key.
+A single whole-document replacement cannot replace several rows that have
 different primary keys.
 
 `UPDATE` and `DELETE` support `WHERE`, `ORDER BY`, `LIMIT`, and `RETURNING`.

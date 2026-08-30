@@ -46,6 +46,24 @@ func (c *conn) validateSurfaceContext(
 				return err
 			}
 		}
+	case sqlast.KindUpdate:
+		if len(statement.Update.Assignments) != 0 {
+			if err := rlockContext(ctx, &c.db.mu); err != nil {
+				return err
+			}
+			t, exists := c.db.tables[statement.Update.Table]
+			if !exists {
+				c.db.mu.RUnlock()
+				return fmt.Errorf(
+					"%w: %q", ErrTableNotFound, statement.Update.Table,
+				)
+			}
+			err := validateDeclaredColumnAssignments(
+				statement.Update.Table, t.meta, statement.Update.Assignments,
+			)
+			c.db.mu.RUnlock()
+			return err
+		}
 	case sqlast.KindCreateIndex:
 		for i := range statement.CreateIndex.Paths {
 			if pseudoDocumentPath(statement.CreateIndex.Paths[i]) {

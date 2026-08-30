@@ -298,16 +298,21 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 }
 
 func TestDeclaredColumnUpdateAssignments(t *testing.T) {
-	statement, err := ParseStatement(`UPDATE employees SET department = 'platform', level = 7 WHERE id = 'employee-0001'`)
+	statement, err := ParseStatement(`UPDATE employees SET department = 'platform', level = 7, note = NULL WHERE id = 'employee-0001'`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if statement.Update == nil || len(statement.Update.Assignments) != 2 {
+	if statement.Update == nil || len(statement.Update.Assignments) != 3 {
 		t.Fatalf("assignments = %#v", statement.Update)
 	}
 	if statement.Update.Assignments[0].Column != "department" ||
-		statement.Update.Assignments[1].Column != "level" {
+		statement.Update.Assignments[1].Column != "level" ||
+		statement.Update.Assignments[2].Column != "note" ||
+		statement.Update.Assignments[2].Value.Kind != OperandNull {
 		t.Fatalf("assignments = %#v", statement.Update.Assignments)
+	}
+	if _, err := ParseStatement(`SELECT id FROM employees WHERE note = NULL`); err == nil {
+		t.Fatal("comparison accepted NULL after assignment-only support")
 	}
 }
 

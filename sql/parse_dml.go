@@ -781,7 +781,13 @@ func (p *Parser) parseAssignment() (Operand, bool, UpdateAssignment, error) {
 		return Operand{}, false, UpdateAssignment{}, p.errfHere("expected '=' after %s", path.Spec())
 	}
 	p.advance()
-	value, err := p.parseOperand()
+	var value Operand
+	if p.tok.kind == tokIdent && p.tok.kw == kwNull {
+		value = Operand{Kind: OperandNull, Pos: p.tok.pos}
+		p.advance()
+	} else {
+		value, err = p.parseOperand()
+	}
 	if err != nil {
 		return Operand{}, false, UpdateAssignment{}, err
 	}

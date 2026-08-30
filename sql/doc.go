@@ -10,10 +10,11 @@
 //     ordinary and recursive CTEs, predicate subqueries, set operations,
 //     generalized joins, LATERAL, scalar CASE/CAST expressions, and the
 //     documented window-function subset;
-//   - INSERT from values or a query, UPSERT in the documented primary-key
-//     forms, UPDATE, and DELETE, including supported RETURNING and bounded
-//     mutation ordering/limits;
-//   - CREATE/DROP TABLE, CREATE/DROP INDEX, CREATE/DROP VIEW, and TRUNCATE;
+//   - INSERT from values or a query, primary-key ON CONFLICT DO NOTHING,
+//     UPDATE, and DELETE, including supported RETURNING and bounded mutation
+//     ordering/limits;
+//   - CREATE/DROP TABLE, bounded ALTER TABLE ADD COLUMN, CREATE/DROP INDEX,
+//     CREATE/DROP VIEW, and TRUNCATE;
 //   - BEGIN/COMMIT/ROLLBACK plus SAVEPOINT, ROLLBACK TO, and RELEASE; and
 //   - EXPLAIN and EXPLAIN ANALYZE for executable statements.
 //

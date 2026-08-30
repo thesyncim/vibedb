@@ -391,6 +391,8 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 		return newError(sqlstateDuplicateTable, err.Error())
 	case errors.Is(err, sqldriver.ErrDependentObjects):
 		return newError(sqlstateDependentObjectsStillExist, err.Error())
+	case errors.Is(err, sqldriver.ErrColumnExists):
+		return newError(sqlstateDuplicateColumn, err.Error())
 	case errors.Is(err, sqldriver.ErrDuplicateViewColumn):
 		return newError(sqlstateDuplicateColumn, err.Error())
 	case errors.Is(err, sqldriver.ErrWrongObjectType):

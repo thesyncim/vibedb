@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -237,7 +238,9 @@ func (d *database) truncateTableStorageLockedContext(
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrTableNotFound, name)
 	}
-	return d.replaceTableStorageLockedContext(ctx, name, t.meta.Indexes, false)
+	return d.replaceTableStorageLockedContext(
+		ctx, name, t.meta.Indexes, t.schema, false,
+	)
 }
 
 // dropIndexStorageLockedContext rebuilds a table without one exact index and
@@ -263,7 +266,9 @@ func (d *database) dropIndexStorageLockedContext(
 	if !found {
 		return fmt.Errorf("%w: %q", ErrIndexNotFound, indexName)
 	}
-	return d.replaceTableStorageLockedContext(ctx, tableName, indexes, true)
+	return d.replaceTableStorageLockedContext(
+		ctx, tableName, indexes, t.schema, true,
+	)
 }
 
 // resolveDropIndexLocked applies DROP INDEX's optional ON qualification. Index
@@ -318,6 +323,7 @@ func (d *database) replaceTableStorageLockedContext(
 	ctx context.Context,
 	name string,
 	indexes []indexMeta,
+	schema *store.Schema,
 	copyDocuments bool,
 ) error {
 	if err := d.settleCatalogLocked(); err != nil {
@@ -326,6 +332,9 @@ func (d *database) replaceTableStorageLockedContext(
 	old, ok := d.tables[name]
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrTableNotFound, name)
+	}
+	if err := validatePrimarySchema(old.meta.PrimaryKey, schema); err != nil {
+		return fmt.Errorf("vibedb: replacement table %q primary key: %w", name, err)
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return err
@@ -343,9 +352,10 @@ func (d *database) replaceTableStorageLockedContext(
 	meta := cloneTableMeta(old.meta)
 	meta.Storage = identity
 	meta.Indexes = cloneIndexMeta(indexes)
+	meta.Schema = schemaMetaFrom(schema)
 	meta.Materialized = false
 	candidate := &table{
-		meta: meta, schema: old.schema, primary: old.primary,
+		meta: meta, schema: schema, primary: old.primary,
 	}
 	if err := durable.ValidateOptions(durableOptions(candidate)); err != nil {
 		return fmt.Errorf("vibedb: replacement table %q: %w", name, err)

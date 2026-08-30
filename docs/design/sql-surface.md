@@ -27,6 +27,7 @@ Supported classes are:
 - `UPDATE`
 - `DELETE`
 - `CREATE TABLE`
+- `ALTER TABLE ... ADD COLUMN`
 - `CREATE INDEX`
 - `DROP TABLE`
 - `TRUNCATE`
@@ -37,9 +38,10 @@ Supported classes are:
 - `RELEASE SAVEPOINT`
 - `ROLLBACK TO SAVEPOINT`
 
-Recognized unsupported families include `MERGE`, `REPLACE`, `COPY`, `ALTER`,
-`GRANT`, `REVOKE`, `VACUUM`, `ANALYZE`, `REINDEX`, `CLUSTER`, SQL `PREPARE`,
-SQL cursors, notifications, `LOCK`, procedures, and `DO`.
+Recognized unsupported families include `MERGE`, `REPLACE`, `COPY`, `GRANT`,
+`REVOKE`, `VACUUM`, `ANALYZE`, `REINDEX`, `CLUSTER`, SQL `PREPARE`, SQL cursors,
+notifications, `LOCK`, procedures, and `DO`. ALTER actions other than the
+bounded additive form are recognized and refused.
 
 Unsupported recognized syntax returns `FeatureNotSupportedError`. Pgwire maps
 it to SQLSTATE `0A000`.
@@ -214,8 +216,13 @@ Conflict handling supports `ON CONFLICT DO NOTHING` only.
 
 ## UPDATE and DELETE
 
-`UPDATE` assigns the whole document through `"$doc"`. It does not support a
-partial path assignment or `UPDATE ... FROM`.
+`UPDATE` can assign the whole document through `"$doc"`. On a table with
+declared columns it can also assign scalar literals or placeholders to one or
+more top-level columns while preserving every unassigned field in each matching
+document.
+
+Nested-path targets, row-dependent assignment expressions such as
+`score = score + 1`, and `UPDATE ... FROM` are not supported.
 
 The replacement must preserve the primary key. One constant replacement
 cannot update multiple rows that have different primary keys.
@@ -242,6 +249,17 @@ Supported JSON domains are `NULL`, `BOOL`, `NUMBER`, `INTEGER`, `STRING`,
 `ARRAY`, `OBJECT`, and `ANY`. Recognized SQL aliases normalize to these domains.
 
 Supported constraints are nullability, `NOT NULL`, and `PRIMARY KEY`.
+
+`ALTER TABLE name ADD [COLUMN] [IF NOT EXISTS] path type [NULL|NOT NULL]` adds
+one declared field. The embedded driver validates existing rows by building a
+replacement storage incarnation and publishes the schema and copied rows
+atomically. Existing indexes are retained. A nullable field admits older rows
+where the path is absent; a required field does not. Schema DDL is rejected
+inside an explicit transaction. The embedded copy currently holds the catalog
+write lock, so ordinary reads and writes wait until the ALTER completes.
+
+Rename, drop, type changes, defaults, nullability changes, and constraint
+changes are not supported ALTER actions.
 
 Unsupported column features include length or precision arguments, defaults,
 unique constraints, collation, temporal types, UUID, binary types, enum,
