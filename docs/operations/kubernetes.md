@@ -21,11 +21,11 @@ failure-domain nodes. Supply these objects before applying the rendered
 workloads:
 
 - `vibedb-rf3-manifests`, with `catalog-{0,1,2}.vibejson`,
-  `ledger-{0,1,2}.vibejson`, and `data-{0,1,2}.vibejson`;
+  `ledger-{0,1,2}.vibejson`, and `data-{0,1,2}.vibejson`.
 - `vibedb-rf3-tls`, with the nine members' keys and certificates, cluster
-  roots, and WAL key sources referenced by those manifests;
+  roots, and WAL key sources referenced by those manifests.
 - `vibedb-gateway-config`, with `cluster.vibejson`,
-  `authorization-policy.vibejson`, and `replica-control.vibejson`;
+  `authorization-policy.vibejson`, and `replica-control.vibejson`.
 - `vibedb-gateway-tls`, with the gateway key, certificate, and cluster roots.
 
 Each preparation manifest must use `/var/lib/vibedb/member` as its exact root,
@@ -39,13 +39,13 @@ vibedb-catalog-2.vibedb-catalog-peer:7411
 ```
 
 Replace `catalog` with `ledger` and `data` for the other two groups. Every pod
-has a distinct TLS node identity. The nine IDs passed below are role-major:
+has a distinct TLS node identity. The renderer consumes nine role-major IDs:
 catalog ordinals 0–2, ledger ordinals 0–2, then data ordinals 0–2.
 
 The ConfigMaps are bootstrap inputs, not live authority. Changing one does not
 rewrite an existing PVC's sealed identities or durable membership.
 The gateway init container validates and atomically pins the generation-one
-catalog to a regular file on its PVC. Restarts require the same seed; a changed
+catalog to a regular file on its PVC. Restarts require the same seed. A changed
 ConfigMap is rejected rather than replacing the immutable catalog. The serving
 process retains its strict separation between that seed and the mutable route
 seed, without accepting Kubernetes projection symlinks as durable authority.
@@ -53,7 +53,7 @@ seed, without accepting Kubernetes projection symlinks as durable authority.
 Automatic splitting is not enabled by this Kubernetes bootstrap. It emits an
 explicit empty `split_sources` inventory because the init containers have not
 yet prepared their actual SQL storage identities. Enabling it requires enrolling
-the exact prepared source schema and replica identities; the renderer does not
+the exact prepared source schema and replica identities. The renderer does not
 invent them. The Kind gate qualifies RF3 serving and restart, not hot splitting.
 
 ## Render and apply
@@ -63,6 +63,7 @@ authority instead of hand-writing these objects:
 
 ```bash
 install -d -m 0700 /absolute/private/vibedb-bootstrap
+umask 077
 go run ./cmd/vibedb-operator bootstrap \
   -namespace vibedb-test \
   -state-dir /absolute/private/vibedb-bootstrap \
@@ -74,27 +75,36 @@ The command creates a short-lived test CA, distinct identities for all nine
 members, the gateway, and a qualification client, plus the exact preparation,
 catalog, policy, replica-control, WAL, and durable-ACK inputs. It uses operating
 system cryptographic entropy and refuses partial or mismatched authority state.
-The retained private bundle is mode `0600`. This is deliberately not production
-PKI: it has no external root, HSM/KMS integration, certificate rotation,
+The state directory must be private. The command writes retained authority
+files with mode `0600`, and the restrictive umask protects redirected bootstrap
+resources that contain Kubernetes Secrets. This is deliberately not production
+PKI. It has no external root, HSM/KMS integration, certificate rotation,
 operator RBAC, or multi-party issuance. Do not reuse it outside disposable
 development and CI clusters.
 
-Use the emitted `shard-node-ids=` value as the renderer's role-major node list,
-create the namespace, and apply the bootstrap objects before the topology.
-
-Pass the exact TLS node IDs in StatefulSet ordinal order:
+Keep that private state directory for the matching render. The renderer reads
+the authenticated role-major node IDs from `bootstrap-state.vibejson`, avoiding
+a second manually copied identity list:
 
 ```bash
 go run ./cmd/vibedb-operator render \
   -image registry.example/vibedb:commit-sha \
   -namespace vibedb-test \
-  -shard-node-ids 11000000000000000000000000000000,12000000000000000000000000000000,13000000000000000000000000000000,21000000000000000000000000000000,22000000000000000000000000000000,23000000000000000000000000000000,31000000000000000000000000000000,32000000000000000000000000000000,33000000000000000000000000000000 \
+  -bootstrap-state-dir /absolute/private/vibedb-bootstrap \
   > ./vibedb-kubernetes.yaml
 
 go run ./cmd/vibedb-operator validate -manifest ./vibedb-kubernetes.yaml
+kubectl create namespace vibedb-test
+kubectl apply --dry-run=server -f /absolute/private/vibedb-bootstrap-resources.yaml
 kubectl apply --dry-run=server -f ./vibedb-kubernetes.yaml
+kubectl apply -f /absolute/private/vibedb-bootstrap-resources.yaml
 kubectl apply -f ./vibedb-kubernetes.yaml
 ```
+
+`-shard-node-ids` remains available when an external provisioning system owns
+the manifests and certificates. It requires exactly nine distinct lowercase
+32-hex-character IDs in catalog, ledger, then data ordinal order. Do not combine
+it with `-bootstrap-state-dir`.
 
 `validate` is bounded to 2 MiB and checks the VibeDB-specific topology contract:
 the exact object set, three independent RF3 groups, unique role endpoints,
@@ -105,25 +115,25 @@ Kubernetes version's resource schemas and admission policy.
 The rendered lane contains:
 
 - independent three-replica catalog, request-ledger, and data StatefulSets,
-  each with stable ordinals and one retained PVC per member;
+  each with stable ordinals and one retained PVC per member.
 - one headless peer Service and one `maxUnavailable: 1` PodDisruptionBudget per
-  Raft group;
+  Raft group.
 - hard hostname spreading, parallel initial Raft process creation, and
-  five-second minimum readiness before Kubernetes advances a rolling update;
+  five-second minimum readiness before Kubernetes advances a rolling update.
 - non-root processes, the runtime-default seccomp profile, no service-account
-  token, and no CPU limit on latency-sensitive database processes;
+  token, and no CPU limit on latency-sensitive database processes.
 - a durable single-gateway StatefulSet, a headless governing Service, and a
-  separate client-facing ClusterIP Service;
+  separate client-facing ClusterIP Service.
 - a scale-zero replacement StatefulSet template that runs the shipped
   `bootstrap-rf3` command against an empty target PVC.
 
 The single gateway is test tooling, not gateway HA. Running multiple gateways
-requires distinct durable session/issuer identities and journals per ordinal;
-the renderer intentionally does not manufacture those authorities.
+requires distinct durable session/issuer identities and journals per ordinal.
+The renderer intentionally does not manufacture those authorities.
 The gateway headless Service also publishes its authenticated catalog-drain
 control endpoint. Generation-one catalog bootstrap is enabled, but it still
 requires the exact immutable seed and proof generated by the test bootstrap
-command; a missing head beside an existing proof fails closed.
+command. A missing head beside an existing proof fails closed.
 
 The startup, readiness, and liveness probes check TCP reachability only. They
 do not claim leadership, linearizability, catch-up, or catalog authority. The
@@ -132,7 +142,7 @@ validation.
 
 ## Stop, restart, and disrupt
 
-Kubernetes sends `SIGTERM`; both shipped commands stop accepting work and
+Kubernetes sends `SIGTERM`. Both shipped commands stop accepting work and
 drain within the configured 120-second termination window. The PDB protects a
 voluntary single-member disruption, but it cannot make simultaneous node loss,
 forced deletion, or an unavailable storage backend safe.
@@ -200,6 +210,15 @@ terminal/read maximum latency, 1 GiB RSS, 1 GiB apparent durable storage, and 51
 gate has no skip mode and uploads bounded evidence even on failure.
 
 This qualification proves a disposable single-data-shard RF3 serving and
-restart path. It does not prove multi-data-shard scale, involuntary partitions,
-cloud-volume behavior, gateway HA, production certificate lifecycle, or the
-complete automated replacement workflow.
+same-binary restart path. It does not prove mixed-build upgrades,
+multi-data-shard scale, involuntary partitions, cloud-volume behavior, gateway
+HA, production certificate lifecycle, or the complete automated replacement
+workflow.
+
+## Implementation references
+
+- `internal/kubeoperator/bootstrap.go`, `render.go`, and `validate.go`
+- `internal/kubeoperator/bootstrap_test.go`, `render_test.go`, and
+  `qualification_test.go`
+- `cmd/vibedb-operator/main.go`
+- `deploy/kubernetes/Dockerfile`, `kind-3-worker.yaml`, and `qualify-kind.sh`

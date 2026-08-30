@@ -17,6 +17,11 @@ the experimental rollout below. In particular, its exact-cut image builder
 requires a write fence for the whole build. Do not wire that maintenance
 primitive into PostgreSQL and describe it as online.
 
+The current loopback development PostgreSQL coordinator accepts `CREATE TABLE`
+only. `CREATE INDEX`, `DROP INDEX`, `TRUNCATE`, `ALTER TABLE`, and `DROP TABLE`
+return a feature-not-supported error; they do not invoke this administration
+command or fall back to a blocking local DDL path.
+
 The required contract is:
 
 - No global query/write freeze. Backfill, validation, rewriting, and physical
@@ -165,9 +170,11 @@ Use the same authenticated catalog, TLS, shard-peer, and stable session flags as
 
 ```bash
 vibedb-gateway schema-rollout \
-  -catalog /var/lib/vibedb/catalog/current.vibejson \
+  -catalog /var/lib/vibedb/catalog/genesis.vibejson \
+  -catalog-route-seed /var/lib/vibedb/gateway/catalog-route-seed.vibejson \
   -catalog-relation 1 \
   -catalog-session-journal /var/lib/vibedb/gateway/catalog-session \
+  -durable-ack-key /run/secrets/vibedb/durable-ack-key \
   -catalog-client-id 00112233445566778899aabbccddeeff \
   -catalog-retry-home 0011223344556677 \
   -tls-certificate /etc/vibedb/gateway.crt \
@@ -278,12 +285,14 @@ normal and race tests cover the DDL planner with two shards on the same three
 nodes, including index creation/removal and TRUNCATE. These gates are not a
 claim that every logical-to-machine digest caller is qualified.
 
-Schema-directory publication and retry paths now sync their directory entries
+Schema-directory publication and retry paths sync their directory entries
 before exposing authority. Local normal and race tests cover exact committed
-source recovery, fenced handles, and settlement before runtime startup. They do
-not establish power-loss safety at every filesystem publication cut. Required
-Linux physical integration runs are still failing or pending; this remains an
-experimental rollout boundary.
+source recovery, fenced handles, and settlement before runtime startup. The
+Linux real-storage startup test reopens the actual WAL, SQL, and apply state at
+prepared and committed-before-publication cuts. It is still a same-build test
+process, not power-loss coverage at every filesystem publication cut, a rolling
+fleet test, or an external quorum qualification. This remains an experimental
+rollout boundary.
 
 Repository gates cover restart after a leader-loss outcome-unknown error, the
 mixed-generation interval, refusal to roll back after authorization, an old

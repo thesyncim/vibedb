@@ -28,6 +28,12 @@ go test -run '^TestBenchmarkCoverage' -count=1 ./internal/coverage
 
 An implemented measurement shape is not a measured result.
 
+The 38 cells are the repository's own evidence matrix, not a claim of complete
+database or distributed-systems coverage. The matrix currently omits
+node-count/shard-count weak scaling, rebalancing under load, hot-partition skew,
+and multi-group distributed query execution. A 38/0/0 coverage count therefore
+does not establish horizontal scalability or competitive performance.
+
 ## Commands
 
 The module includes these command harnesses:
@@ -73,8 +79,13 @@ counter of bytes it handed to its durability device and makes
 block-layer, or physical-media write accounting. Do not compare a zero from an
 adapter that reports `durability-payload-known=false`.
 
-Record `intrinsic` or `production` storage profile. The output must state the
-resolved compression policy and its provenance.
+Record `intrinsic` or `production` storage profile. These labels control only
+optional compression exposed by the benchmark adapter. With the currently
+pinned dependencies, they switch Badger and Pebble between uncompressed and
+Snappy SST blocks; VibeDB, bbolt, and SQLite report `unsupported/no-op` for
+both. `intrinsic` therefore does not mean that VibeDB's built-in field/stream
+storage encodings have been disabled. The output must state the resolved
+optional-compression policy and its provenance.
 
 Record the selected durability mode. Do not compare a volatile acknowledgement
 with a power-safe acknowledgement as if they were equal.
@@ -184,13 +195,16 @@ emitted only if exact logical key-plus-document bytes exceed measured physical
 RAM. The command fails before loading when its conservative logical lower bound
 does not exceed RAM or when free disk is below twice that bound.
 
-The loader-batch byte ceiling, process peak-RSS ceiling, and Linux process
-`write_bytes` ceiling are hard errors, not annotations. Defaults cap the loader
-at 8 MiB and peak RSS below 75% of physical RAM. Use one process per engine and
-keep durability, exact-index count, cardinality, shape, checkpoint cadence, and
-all hard bounds identical. Loading time is setup evidence, not a bulk-load
-performance claim; the output labels the combined load-and-scan wall time only
-so an interrupted evidence run is diagnosable.
+The loader-batch byte ceiling and process peak-RSS ceiling are hard errors. When
+Linux `/proc/self/io` supplies the process `write_bytes` counter, the runner also
+enforces the configured write ceiling. Otherwise it emits
+`physical-write-known=false` and skips that ceiling; `cmd/publishcheck` rejects
+an unknown counter for publication. Defaults cap the loader at 8 MiB and peak
+RSS below 75% of physical RAM. Use one process per engine and keep durability,
+exact-index count, cardinality, shape, checkpoint cadence, and all hard bounds
+identical. Loading time is setup evidence, not a bulk-load performance claim;
+the output labels the combined load-and-scan wall time only so an interrupted
+evidence run is diagnosable.
 
 ## Results
 
@@ -198,8 +212,8 @@ Put publication-grade results in [RESULTS.md](RESULTS.md). Keep raw rows and
 complete metadata with the summary. Do not publish a number from a dirty tree
 without marking it dirty.
 
-For a complete embedded plus RF3 evidence bundle, use the repository runner on
-a dedicated Linux benchmark host:
+For the current runner's fixed embedded plus RF3 evidence bundle, use the
+repository runner on a dedicated Linux benchmark host:
 
 ```bash
 scripts/bench/run-publishable-evidence.sh \
@@ -221,16 +235,31 @@ WAL and waiter-RSS evidence that the in-process latency matrix does not claim to
 measure. bbolt, Badger, and Pebble are excluded from the power-safe row because
 their adapters reject that guarantee instead of silently weakening it.
 
+The RF3 latency/counter matrix uses one in-process RF3 group with three replicas
+and an in-process round tripper. It does not run a gateway process, vary node or
+shard count, measure rebalance/split throughput, or provide horizontal-scaling
+evidence. The external fault artifact runs three real shard children, but its
+elapsed field covers the whole qualification rather than an isolated failover
+or recovery interval.
+
 The runner finishes by invoking `cmd/publishcheck`. That validator rejects a
 dirty or revision-mismatched bundle, fewer than nine repetitions, diagnostic
 embedded rows, missing p50/p99/p99.9/maximum latency, absent apparent or
 allocated space, unknown Linux process writes, invalid RF3 counter cuts,
 missing network/device/logical-byte counters, and failed WAL/RSS fault bounds.
 Only then does it create `VALIDATED.tsv`, containing SHA-256 digests of every
-accepted raw artifact. A validation receipt proves evidence completeness; it is
-not a claim that VibeDB won a comparison.
+accepted raw artifact.
 
-The current replacement documentation publishes no benchmark result.
+The validator does not independently pin every flag fixed by the runner. For
+embedded mixed suites it does not verify workload, corpus, operations, warmup,
+clients, cardinality, seed, conditioning, or storage profile. For RF3 latency
+artifacts it does not verify operations, warmup, or seed. Preserve and review
+the runner and complete command/configuration metadata with the receipt. A
+receipt proves acceptance and artifact identity; it is not full configuration
+equivalence, horizontal-scaling evidence, or a claim that VibeDB won.
+
+This documentation currently publishes no benchmark result; `RESULTS.md`
+contains no performance numbers.
 
 ### Pull-request qualification
 
@@ -242,10 +271,12 @@ three-index pairwise physical/logical footprint rows; three RF3 read/write/mixed
 matrices; and three external RF3 fault runs. Dataset and operation counts are
 fixed and the job has a hard wall-clock timeout.
 
-`cmd/publishcheck -qualification` verifies the clean revision, exact workload
-shape, latency/counter/resource contracts, complete artifact inventory, and
-every file digest before creating `VALIDATED.tsv`. CI uploads only a bundle with
-that receipt. These runner-dependent rows are regression and harness evidence;
-they are not publication-grade results and must not be copied into `RESULTS.md`
-or used as a superiority claim. The dedicated-host runner above remains the
+`cmd/publishcheck -qualification` verifies the clean revision, selected
+durability/index/document-shape fields, latency/counter/resource contracts,
+complete artifact inventory, and every file digest before creating
+`VALIDATED.tsv`. CI uploads only a bundle with that receipt. As above, the
+runner fixes additional workload axes that the validator does not independently
+check. These runner-dependent rows are regression and harness evidence; they
+are not publication-grade results and must not be copied into `RESULTS.md` or
+used as a superiority claim. The dedicated-host runner above remains the
 publication boundary, including its above-RAM and nine-run fault requirements.

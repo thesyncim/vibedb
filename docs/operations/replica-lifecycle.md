@@ -124,7 +124,7 @@ it must contain no whitespace or trailing newline, and arrays must be sorted by
 their binary identities. This example is intentionally one line.
 
 ```vibejson
-{"generation":1,"local_gateway":{"node":"01000000000000000000000000000000","incarnation":1,"control_address":"127.0.0.1:7101"},"tls":{"certificate":"./secrets/gateway-cert.pem","key":"./secrets/gateway-key.pem","roots":"./secrets/cluster-roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1","authorization_policy":"./secrets/authorization-policy.vibejson"},"bounds":{"max_connections":32,"max_handshakes":8,"max_concurrent_drains":4,"controller_interval_millis":100,"read_timeout_millis":1000,"write_timeout_millis":1000},"shard_endpoints":[{"node":"11000000000000000000000000000000","control_address":"127.0.0.1:7711"},{"node":"12000000000000000000000000000000","control_address":"127.0.0.1:7712"},{"node":"13000000000000000000000000000000","control_address":"127.0.0.1:7713"},{"node":"14000000000000000000000000000000","control_address":"127.0.0.1:7714"}],"gateway_endpoints":[{"node":"01000000000000000000000000000000","incarnation":1,"control_address":"127.0.0.1:7101"}],"candidates":[{"member":4,"node":"14000000000000000000000000000000","store":"24000000000000000000000000000000","node_incarnation":1,"endpoint":"member-4-control","load":0}]}
+{"generation":1,"local_gateway":{"node":"01000000000000000000000000000000","incarnation":1,"control_address":"127.0.0.1:7101"},"tls":{"certificate":"./secrets/gateway-cert.pem","key":"./secrets/gateway-key.pem","roots":"./secrets/cluster-roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1","authorization_policy":"./secrets/authorization-policy.vibejson"},"bounds":{"max_connections":32,"max_handshakes":8,"max_concurrent_drains":4,"controller_interval_millis":100,"read_timeout_millis":1000,"write_timeout_millis":1000},"shard_endpoints":[{"node":"11000000000000000000000000000000","control_address":"127.0.0.1:7711","split_snapshot_address":"127.0.0.1:7611"},{"node":"12000000000000000000000000000000","control_address":"127.0.0.1:7712","split_snapshot_address":"127.0.0.1:7612"},{"node":"13000000000000000000000000000000","control_address":"127.0.0.1:7713","split_snapshot_address":"127.0.0.1:7613"},{"node":"14000000000000000000000000000000","control_address":"127.0.0.1:7714","split_snapshot_address":"127.0.0.1:7614"}],"gateway_endpoints":[{"node":"01000000000000000000000000000000","incarnation":1,"control_address":"127.0.0.1:7101"}],"candidates":[{"member":4,"node":"14000000000000000000000000000000","store":"24000000000000000000000000000000","node_incarnation":1,"endpoint":"member-4-control","load":0}],"split_sources":[]}
 ```
 
 Start the normal authenticated gateway with the additional flag:
@@ -132,10 +132,12 @@ Start the normal authenticated gateway with the additional flag:
 ```bash
 ./bin/vibedb-gateway serve \
   -catalog ./cluster.vibejson \
+  -catalog-route-seed ./state/gateway-catalog-route-seed.vibejson \
   -catalog-relation 1 \
   -catalog-session-journal ./state/gateway-catalog-session \
   -catalog-client-id 21000000000000000000000000000000 \
   -catalog-retry-home 2200000000000000 \
+  -durable-ack-key ./secrets/durable-ack-key.hex \
   -listen 127.0.0.1:7400 \
   -tls-certificate ./secrets/gateway-cert.pem \
   -tls-key ./secrets/gateway-key.pem \

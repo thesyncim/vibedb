@@ -26,11 +26,13 @@ var (
 const (
 	journalEntryHeaderBytes = 36
 
-	// MaxRetainedJournalBytes is the append-only journal's finite on-disk
-	// admission bound. The journal does not compact generations yet. Data
-	// admission reserves the exact worst-case decision/retirement bytes for
-	// every active record, so reaching the ceiling cannot strand admitted work.
-	// This is a byte bound, never a transaction or participant-count bound.
+	// MaxRetainedJournalBytes is one live journal generation's finite on-disk
+	// admission bound. Appends stay within the generation until canonical
+	// compaction atomically replaces it and reclaims superseded transitions and
+	// retired manifest pages. Data admission reserves the exact worst-case
+	// decision/retirement bytes for every active record, so reaching the ceiling
+	// cannot strand admitted work. This is a byte bound, never a transaction or
+	// participant-count bound.
 	MaxRetainedJournalBytes = uint64(8 << 30)
 
 	// MaxActiveManifestBytes bounds exact resident segmented-page bytes across

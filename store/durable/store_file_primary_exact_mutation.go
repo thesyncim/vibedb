@@ -26,7 +26,7 @@ import (
 //     — using the pre-image the leaf lookup already has in hand.
 //   - insert / delete: one term record per index carrying a term, plus one
 //     tile record for the touched quadrant's live mask.
-//   - slot-reassigning class-5 workspace rewrite
+//   - slot-reassigning compact VCS1 workspace rewrite
 //     (PlaceCommonPrimaryLeafRecords reassigns every slot): fall back
 //     to deriveBucketExactContribution (O(leaf rows), exactly the old cost,
 //     once per leaf-class transition) and emit a rebase group — 4 rebased
@@ -430,7 +430,7 @@ func (c *Collection) preparePrimaryExactRebase(
 
 // preparePrimaryExactBufferedMutation rebases the exact contribution after the
 // exceptional structural lane has placed an owned raw workspace back into
-// class 5. Steady-state class-5 overlay mutations use
+// compact VCS1. Steady-state VCS1 overlay mutations use
 // preparePrimaryExactUnifiedMutation instead.
 func (c *Collection) preparePrimaryExactBufferedMutation(
 	leafImage []byte,
@@ -450,7 +450,7 @@ func (c *Collection) preparePrimaryExactBufferedMutation(
 		termRecordMark: epoch.termRecordN,
 		tileRecordMark: epoch.tileRecordN,
 	}
-	// The class-5 leaf was rendered into an owned raw workspace and placed
+	// The compact VCS1 leaf was rendered into an owned raw workspace and placed
 	// wholesale, so no pre-image slot can be assumed to map to the new image.
 	// Re-derive the bucket instead of attempting a slot delta.
 	ok, err := c.preparePrimaryExactRebase(
@@ -491,7 +491,7 @@ func (c *Collection) preparePrimaryExactBufferedMutation(
 
 // preparePrimaryExactDeltaRaw is the representation-independent exact-index
 // write rule. oldRaw is the logical pre-image already resolved by the primary
-// mutation lane; class-5 can therefore share the same slot-stable posting
+// mutation lane; compact VCS1 can therefore share the same slot-stable posting
 // overlay without de-templating or synthesizing a raw leaf view.
 func (c *Collection) preparePrimaryExactDeltaRaw(
 	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
@@ -593,7 +593,7 @@ func (c *Collection) preparePrimaryExactDeltaRaw(
 }
 
 // preparePrimaryExactUnifiedMutation stages the exact-index half of one
-// class-5 overlay mutation. Both overlays install inside the same snapshot
+// VCS1 overlay mutation. Both overlays install inside the same snapshot
 // fence. pressure leaves neither half published and asks the caller to fold the
 // current window before retrying.
 func (c *Collection) preparePrimaryExactUnifiedMutation(
@@ -633,7 +633,7 @@ func (c *Collection) preparePrimaryExactUnifiedMutation(
 // preparePrimaryExactLeaf is the fold-first exceptional structural lane. Its
 // owned workspace placement may reassign every stable slot, so it derives the
 // complete bucket contribution and publishes a fresh folded epoch atomically
-// with the rewritten class-5 leaf.
+// with the rewritten compact VCS1 leaf.
 func (c *Collection) preparePrimaryExactLeaf(
 	leafImage []byte,
 	resident storeio.ResidentPrimaryRoute,

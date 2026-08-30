@@ -1,7 +1,8 @@
-// Command vibedb-shard serves either a static development shard or one prepared
-// member of an authenticated three-replica Raft shard. The RF3 command opens
-// exact retained WAL, SQL, apply, topology, and certificate identities; it never
-// initializes or repairs missing replicated state.
+// Command vibedb-shard serves either a static development shard or one process
+// bundle containing 1..64 prepared members of authenticated three-replica Raft
+// groups. The RF3 command opens exact retained WAL, SQL, apply, topology, and
+// certificate identities; it never initializes or repairs missing replicated
+// state.
 //
 // It admits every request against its configured identity before executing, and
 // executes the admitted statement locally through the ordinary vibedb parser and

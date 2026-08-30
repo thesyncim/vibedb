@@ -1,9 +1,12 @@
 # Raft WAL
 
 `internal/raftstore` provides one encrypted, preallocated, single-writer WAL
-for a Raft member. `vibedb-shard serve-rf3` opens one externally prepared WAL
-with its exact retained identity, key, recovery epoch, and sealed bounds. No
-command creates or repairs an RF3 WAL.
+for a Raft member. `vibedb-shard prepare-rf3` creates an initial WAL for one
+member, and `vibedb-shard serve-rf3` opens one externally prepared WAL for each
+local group member in its process manifest with the exact retained identity,
+key, recovery epoch, and sealed bounds. Serving never invents or repairs a
+missing WAL. Certified split-child and restore lifecycles have separate bounded
+WAL creation paths.
 
 ## Identity
 
@@ -82,6 +85,15 @@ foreign, or replayed capability cannot release SQL. The old full WAL loses its
 final namespace link only inside this ordered protocol, and later generations
 bind the preceding generation digest.
 
+`serve-rf3` configures the automatic generation driver for every opened local
+group member. Its ordinary cadence is ten minutes of logical RF3 ticks. A hard
+WAL-capacity refusal can trigger the same certified replacement earlier in an
+empty input window, so a busy group is not required to survive until the next
+periodic pass. Cut capture, validation, selection, and activation stay on the
+serialized runtime lane; only immutable candidate construction uses one bounded
+worker. An idle group whose certified base cannot advance does not manufacture
+a new generation.
+
 ## Staged child base
 
 A split child can start from a certified snapshot base whose index is newer
@@ -124,3 +136,9 @@ controls must protect physical root ownership.
 - `internal/raftstore/store_test.go`
 - `sql/driver/replicated_store_test.go`
 - `internal/raftmember/binding.go` and `staged_child.go`
+- `internal/raftmember/generation_driver.go` and
+  `generation_driver_test.go`
+- `cmd/vibedb-shard/prepare_rf3.go`, `serve_rf3.go`, and
+  `adopt_restored_rf3.go`
+- `cmd/vibedb-shard/wal_pressure_process_test.go` and
+  `wal_retention_process_qualification_test.go`

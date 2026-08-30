@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"syscall"
 	"testing"
 	"time"
 
@@ -36,7 +35,7 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
-	fixture := newDurableRF3ExternalFixture(t, ctx)
+	fixture := newDurableRF3ExternalFixtureWithPeerFaults(t, ctx, true)
 	defer fixture.close(t)
 	defer func() {
 		if t.Failed() {
@@ -86,13 +85,20 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	insertRequest := hotMutationRequest(t, reference, 1, insertStatements)
 	partitionLeader, _ := fixture.waitRouteLeader(t, durableRF3DataBGroup, -1, 30*time.Second)
 	partitioned := durableRF3ExternalLeaderMember(t, partitionLeader)
-	if err := syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGSTOP); err != nil {
-		t.Fatal(err)
+	setPartition := func(blocked bool) {
+		for source := range fixture.peerLinks {
+			for target, link := range fixture.peerLinks[source] {
+				if link != nil && (source == partitioned || target == partitioned) {
+					link.setBlocked(blocked)
+				}
+			}
+		}
 	}
+	setPartition(true)
 	partitionActive := true
 	defer func() {
 		if partitionActive {
-			_ = syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT)
+			setPartition(false)
 		}
 	}()
 	partitionStarted := time.Now()
@@ -112,9 +118,7 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	durableRF3ExternalAssertCommitted(t, insertRaw, 24, 2)
 	latencies = append(latencies, client.ackTerminal(t, insertRaw))
 	replacementRecovery := time.Since(replacementStarted)
-	if err := syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT); err != nil {
-		t.Fatal(err)
-	}
+	setPartition(false)
 	partitionActive = false
 	fixture.waitMemberCaughtUpAllRoles(t, partitioned, 45*time.Second)
 
@@ -178,7 +182,12 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	p99 := latencies[(len(latencies)*99+99)/100-1]
 	// Extra verification samples must not hide a slow mutation in p99.
 	maxLatency := latencies[len(latencies)-1]
-	if maxLatency > 5*time.Second || partitionFailover > 15*time.Second ||
+	// The gateway still cancels the interactive operation at its exact product
+	// deadline. The external harness observes that cancellation only after the
+	// error response is encoded, scheduled, written, and read from the socket.
+	const socketObservationSlack = 50 * time.Millisecond
+	interactiveDeadline := gateway.DefaultProfiles()[gateway.ClassInteractive].GlobalDeadline
+	if maxLatency > interactiveDeadline+socketObservationSlack || partitionFailover > 15*time.Second ||
 		killFailover > 15*time.Second || replacementRecovery > 15*time.Second {
 		t.Fatalf("latency bounds p99=%s max=%s partition=%s kill=%s replacement=%s",
 			p99, maxLatency, partitionFailover, killFailover, replacementRecovery)
@@ -209,7 +218,7 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 			t.Fatalf("unbounded multi-relation gateway journal %q", journal)
 		}
 	}
-	t.Logf("durable RF3 multi-relation chaos: shipped_gateway=true tables=2 data_groups=2 base_relations=2 local_exact_indexes=2 global_exact_indexes=2 insert_update_delete=true sustained_churn_mutations=60 persisted_transaction_recovery=true gateway_replacement=true leader_kill=true process_partition=true outcome_unknown_retry=true exact_terminal_replay=true native_point_verification=true persisted_index_voters=3 exact_index_visibility=true stale_index_visibility=false final_cardinality_exact=true all_voters_reopened=true p99=%s max=%s partition_failover=%s leader_kill_failover=%s gateway_replacement_recovery=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d",
+	t.Logf("durable RF3 multi-relation chaos: shipped_gateway=true tables=2 data_groups=2 base_relations=2 local_exact_indexes=2 global_exact_indexes=2 insert_update_delete=true sustained_churn_mutations=60 persisted_transaction_recovery=true gateway_replacement=true leader_kill=true peer_network_partition=true isolated_process_live=true outcome_unknown_retry=true exact_terminal_replay=true native_point_verification=true persisted_index_voters=3 exact_index_visibility=true stale_index_visibility=false final_cardinality_exact=true all_voters_reopened=true p99=%s max=%s partition_failover=%s leader_kill_failover=%s gateway_replacement_recovery=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d",
 		p99, maxLatency, partitionFailover, killFailover, replacementRecovery, rssGrowth, storageGrowth,
 		walGrowth, publicWireBytes, snapshotGrowth)
 }

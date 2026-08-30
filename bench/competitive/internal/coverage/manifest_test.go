@@ -167,6 +167,25 @@ func TestBenchmarkCoverageEvidenceCatalogIsComplete(t *testing.T) {
 	}
 }
 
+func TestBenchmarkCoverageRF3CommandIsRelativeToCompetitiveModule(t *testing.T) {
+	const want = "(cd bench/competitive && go run ../rf3chaos -output=/tmp/vibedb-rf3-chaos.tsv -runs=9 -timeout=5m)"
+	found := false
+	for _, lane := range BenchmarkCoverageManifest() {
+		for _, target := range lane.Targets {
+			if target.Kind != CoverageCommand || target.Package != "bench/rf3chaos" {
+				continue
+			}
+			found = true
+			if got := coverageCommand(target); got != want {
+				t.Fatalf("RF3 evidence command = %q, want %q", got, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("RF3 evidence command is absent from the coverage manifest")
+	}
+}
+
 func benchmarkCoverageRepoRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)

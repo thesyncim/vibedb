@@ -52,12 +52,26 @@ database snapshot when a cross-collection instant matters.
 `durable.Create` requires an empty file. It takes an in-process lock and an OS
 writer lock, assigns a random store ID, and persists generation 1.
 
-`durable.Open` does bounded recovery. It reads the alternate roots and the
-catalog structures that they reference. It does not scan every row or posting
-during open.
+`durable.Open` validates the alternate roots and the catalog structures that
+they reference. An unindexed collection does not require a full row scan during
+open. An ordered-primary collection with exact indexes does more: it walks the
+primary router and posting rows to rebuild the live-slot table, walks every
+exact-index catalog, and copies each exact-leaf payload into a resident Go-heap
+epoch. Indexed open time and that epoch's memory therefore scale with persisted
+index geometry.
 
-One mutable file has one writer. The lock covers path aliases and duplicate
-descriptor identity when the platform can prove them.
+One process owns a mutable file. Structural changes, checkpoints, batches,
+indexed mutations, and overflow mutations serialize through its exclusive
+writer. The lock covers path aliases and duplicate descriptor identity when
+the platform can prove them.
+
+There is one deliberately narrow shared-writer exception: eligible inline
+`Put` and `Delete` calls on an unindexed, schema-free, non-opaque
+buffered-visible collection can validate in a fixed pool of at most 32 contexts,
+serialize leaf-local accounting through 4096 bucket stripes, and flat-combine
+publication. Pressure and every ineligible operation return to the exclusive
+path. This is neither multi-process ownership nor general multi-writer storage,
+and it does not apply to the synchronous durable profile.
 
 The zero-value durable options select:
 
@@ -75,7 +89,7 @@ Normalized resource defaults include:
 | --- | ---: |
 | Base page | 4096 bytes |
 | Maximum page | 64 KiB |
-| Resident memory | 64 MiB |
+| Page-cache and mutable-row-overlay budget | 64 MiB |
 | Read concurrency | 4 |
 | Prefetch queue | 64 |
 | Maximum key | 256 bytes |
@@ -87,10 +101,39 @@ Normalized resource defaults include:
 | Batch bytes | 16,793,600 |
 | Commit queue slots | 64 |
 
+`Options.ResidentBytes` configures the page cache plus the mutable row overlay;
+it is not a total heap or process-RSS ceiling. In particular, the resident
+exact-index epoch described above is outside that budget.
+`Collection.Stats().ResidentBytes` and `CapacityBytes` report the cache and
+overlay, not the copied exact-leaf payloads, exact-index catalog metadata, or
+the live-slot table in that epoch.
+
 The option validator accepts at most 4096 logical exact-index names, 64
 distinct physical path sets, and 8 skip indexes. Identical exact-index path
 sets share one physical index. A canonical compound index tuple has a 4096-byte
 limit.
+
+## Durable primary representation
+
+The only production leaf grammar is the `VCS1` compact primary stripe. It
+groups canonical JSON rows by shape, stores one shared static template per
+shape, and independently encodes each scalar hole. Keys and scalar columns use
+the same reversible eight-codec planner: dictionary, front, frame-of-reference,
+delta, packed delta, date ordinal, prefix integer, or alphabet packing. See
+[Compact primary stripes](format.md#compact-primary-stripes-vcs1) for the exact
+layout and selection policy.
+
+Physical leaf extents are 4 KiB-rounded and at most 64 KiB. Unindexed leaves
+admit at most 4096 rows. Exact-indexed leaves admit at most 256 so posting slots
+remain stable bytes. Values above `InlineValueBytes` do not enter those scalar
+streams. They use raw overflow chains up to `MaxDocumentBytes`. Neither overflow
+compression nor cross-value deduplication is currently implemented.
+
+The routing hierarchy is independently replaceable. A global lexical catalog
+names tablets. Each tablet has one fixed local-ID locator and up to 16 anchor
+pages. Anchor pages are packed by compressed fence bytes as well as by their
+256-row ceiling, so the locator—not lexical rank arithmetic—is the source of
+truth for an anchor page and row slot.
 
 ## Durable reads and snapshots
 
@@ -115,8 +158,11 @@ query result.
 
 ## Mutation publication
 
-Eligible point mutations use a resident inline overlay. Other mutations use a
-routed copy-on-write path. Both paths publish one immutable generation.
+Eligible point mutations use a resident inline overlay. A same-shape scalar
+replacement can also re-encode only its affected scalar stream while it copies
+the other sections into the replacement leaf. Other mutations use a routed
+copy-on-write path. All successful paths publish one logical generation. A
+later checkpoint folds resident rows into immutable `VCS1` pages.
 
 `Collection.Update` gives one logical failure-atomic publication for rows and
 exact postings. Preparation can publish a content-equivalent topology
@@ -186,4 +232,11 @@ The source does not define a safe live raw-file backup procedure.
 - `store/store_database_txn.go` and `store/store_builder.go`
 - `store/durable/store_file_open.go` and `store_file_operations.go`
 - `store/durable/store_file_options.go` and `store_file_lifecycle.go`
+- `store/durable/store_file_primary_concurrent.go` and
+  `store_file_primary_structural.go`
+- `store/durable/store_file_primary_exact.go` and
+  `store_file_primary_exact_epoch.go`
 - `store/durable/store_database.go` and `store_database_snapshot.go`
+- `internal/storeio/compact_primary_stripe.go` and `compact_stream_codec.go`
+- `internal/storeio/segmented_tablet_router.go` and
+  `global_tablet_catalog.go`

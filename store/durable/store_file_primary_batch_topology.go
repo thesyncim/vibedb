@@ -19,7 +19,7 @@ import (
 // first generation is content-equivalent and crash-safe on its own; the second
 // contains every logical mutation and its one journal record. It also avoids a
 // retry train of median splits. K is derived once from the canonical byte-aware
-// class-5 planner and is bounded by the configured batch and tablet namespaces.
+// VCS1 planner and is bounded by the configured batch and tablet namespaces.
 func (c *Collection) preparePrimaryBatchTopology(
 	_ *fileStoreState,
 	batch *WriteBatch,
@@ -248,7 +248,7 @@ func (c *Collection) preparePrimaryBatchTopology(
 }
 
 // planPrimaryBatchTopologyCuts refines a shared cut set until every resulting
-// key range is one canonical class-5 span for both the currently published rows
+// key range is one canonical VCS1 span for both the currently published rows
 // and the prospective post-batch rows. Planning only the latter is insufficient:
 // a delete or a size-changing replacement can remove the compression context
 // that made the content-equivalent intermediate fit. Planning only the former

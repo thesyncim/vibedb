@@ -3,6 +3,7 @@ package coverage
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -29,6 +30,8 @@ const (
 	CoverageCommand   CoverageTargetKind = "command"
 	CoverageTest      CoverageTargetKind = "test"
 	CoverageBenchmark CoverageTargetKind = "benchmark"
+
+	coverageCommandWorkingDirectory = "bench/competitive"
 )
 
 // CoverageTarget points to a concrete executable in this repository. Package
@@ -244,7 +247,7 @@ func BenchmarkCoverageManifest() []CoverageLane {
 		},
 		{
 			Dimension: "working set", Case: "larger than RAM", Status: CoverageImplemented,
-			Boundary: "The streaming overflow-heavy loader admits the row only when exact logical key-plus-document bytes exceed measured host physical memory. It enforces hard loader-byte, RSS, disk-space, and Linux physical-write bounds; a cross-engine claim requires one isolated process per engine with identical durability and index flags.",
+			Boundary: "The streaming overflow-heavy loader admits the row only when exact logical key-plus-document bytes exceed measured host physical memory. It enforces hard loader-byte, RSS, and disk-space bounds. When Linux /proc/self/io supplies the process write counter, it also enforces the configured write ceiling; otherwise it emits physical-write-known=false and skips that ceiling. Publication validation rejects an unknown counter. A cross-engine claim requires one isolated process per engine with identical durability and index flags.",
 			Targets: []CoverageTarget{withOutputTokens(commandTarget(
 				"bounded-memory out-of-RAM scan", "bench/competitive/cmd/outofram",
 				"-engine=vibedb", "-corpus=4000000", "-durability=buffered-visible",
@@ -470,6 +473,8 @@ func RenderBenchmarkCoverageMarkdown() []byte {
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "`implemented` establishes an executable measurement shape, not a comparison. An evidence command selecting `-engine=vibedb` is VibeDB-only; a cross-engine claim additionally requires the repeated isolated `mixedsuite` publication protocol and recorded results.")
 	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "The required cells are this repository's project-defined evidence matrix, not an exhaustive database or distributed-systems benchmark. In particular, node-count and shard-count weak scaling, rebalancing under load, hot-partition skew, and multi-group distributed query execution are outside this matrix. A complete cell count does not establish horizontal scalability or competitive performance.")
+	fmt.Fprintln(&out)
 	fmt.Fprintf(
 		&out,
 		"Current coverage: **%d implemented**, **%d diagnostic**, **%d gaps** across %d required cells. A command's presence does not imply that a result has been run or published.\n",
@@ -548,10 +553,17 @@ func coverageCommand(target CoverageTarget) string {
 	}
 	switch target.Kind {
 	case CoverageCommand:
-		pkg := strings.TrimPrefix(target.Package, "bench/competitive/")
+		pkg, err := filepath.Rel(coverageCommandWorkingDirectory, target.Package)
+		if err != nil {
+			return "invalid target"
+		}
+		pkg = filepath.ToSlash(pkg)
+		if !strings.HasPrefix(pkg, ".") {
+			pkg = "./" + pkg
+		}
 		return fmt.Sprintf(
-			"(cd bench/competitive && %sgo run ./%s %s)",
-			prefix, pkg, strings.Join(target.Args, " "),
+			"(cd %s && %sgo run %s %s)",
+			coverageCommandWorkingDirectory, prefix, pkg, strings.Join(target.Args, " "),
 		)
 	case CoverageTest, CoverageBenchmark:
 		command := "go test ./" + target.Package

@@ -559,9 +559,12 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 					t = c.db.tables[s.query.Collection()]
 				}
 				if t != nil {
-					s.pointPredicate = s.query.DrivingPredicate()
+					drivingPredicate := s.query.DrivingPredicate()
 					s.primaryRange = compilePrimaryRangeProgram(
-						s.pointPredicate, t.meta.PrimaryKey,
+						drivingPredicate, t.meta.PrimaryKey,
+					)
+					s.pointPredicate = compilePrimaryPointPredicate(
+						drivingPredicate, t.meta.PrimaryKey,
 					)
 					s.pointPath, s.pointCandidate = primaryPredicateIdentity(
 						s.pointPredicate,

@@ -32,6 +32,7 @@ Start with the page that matches your task.
 - [Roll out a replicated schema](operations/schema-rollouts.md)
 - [Replica lifecycle](operations/replica-lifecycle.md)
 - [Kubernetes RF3 test lane](operations/kubernetes.md)
+- [Unreleased compatibility and same-binary restarts](operations/unreleased-compatibility.md)
 - [Performance tests](performance.md)
 - [Security boundary](../SECURITY.md)
 - [Unsafe-code inventory](../UNSAFE.md)
@@ -60,9 +61,12 @@ Start with the page that matches your task.
 
 Pin a tested commit when you use the root Go module as a dependency. APIs,
 command contracts, and storage grammars can change between tested commits. The
-distributed commands are experimental. They require authenticated TLS and a
-canonical `vibejson` authorization policy by default. Explicit development
-plaintext binds only to loopback addresses.
+distributed serving commands are experimental. Cross-host serving requires
+authenticated TLS and a canonical `vibejson` authorization policy. Offline
+prepare, inspect, validate, and render commands do not open serving listeners.
+Explicit development plaintext binds the public serving listener only to a
+loopback address. The operating guide documents the gateway's separate raw
+replicated-shard dialing behavior in that mode.
 
 The implementation is the source of truth. Each design page lists the source
 files and tests that support its contract.

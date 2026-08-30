@@ -296,7 +296,7 @@ type Options struct {
 	// When false, a fresh or bulk-built buffered-visible store has no sibling
 	// journal. Its first valid mutation mints one synchronously; the first physical
 	// Flush/Close roots that identity, and later Flush calls can append and sync one
-	// ordered batch for a complete bounded class-5 overlay instead of copying its
+	// ordered batch for a complete bounded VCS1 overlay instead of copying its
 	// physical leaves. Exceptional mutations, pressure, and Close take a physical
 	// checkpoint and recycle the journal. No background task creates or compacts
 	// the file.
@@ -1406,7 +1406,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		4*min(1, filePrimaryPendingParentLimit),
 		o.PageSize, o.MaxPageSize, singleDocumentOverflowBytes,
 	)
-	// The class-5 overlay is bounded independently of MaxBatchDocuments. Its
+	// The VCS1 overlay is bounded independently of MaxBatchDocuments. Its
 	// runtime dirty-bucket limit is the largest prefix of the fixed 1,024-bucket
 	// directory that fits the collection's descriptor, retirement, and resident
 	// byte budgets. That fold stages one maximum-size leaf per bucket, up to four

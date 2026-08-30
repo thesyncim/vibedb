@@ -13,10 +13,10 @@ import (
 )
 
 // Compact scalar streams are the independently decodable columns inside the
-// next primary-stripe format. The codec is schema-free: the caller supplies
-// exact canonical scalar spellings in row order, and the planner chooses the
-// smallest reversible representation. Every sequential codec has bounded
-// restart points so a point read never replays an unbounded stripe prefix.
+// production VCS1 primary-stripe format. The codec is schema-free: the caller
+// supplies exact canonical scalar spellings in row order, and the planner
+// chooses the smallest reversible representation. Every sequential codec has
+// bounded restart points so a point read never replays an unbounded stripe prefix.
 const (
 	compactStreamRestart = 64
 	compactStreamHeader  = 12

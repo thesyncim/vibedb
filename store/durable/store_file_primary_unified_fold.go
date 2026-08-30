@@ -5,7 +5,7 @@ import (
 )
 
 // primaryUnifiedFixedReplacements coalesces one bucket's overlay to its final
-// record per key and exposes the all-Put subset to the native class-5 patcher.
+// record per key and exposes the all-Put subset to the compact VCS1 patcher.
 // Inserts and delete->different-value restores are allowed through here: the
 // codec checks that every final key and slot already exists in the admitted
 // base and declines otherwise. A final delete cannot preserve the envelope and

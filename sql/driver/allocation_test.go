@@ -75,6 +75,29 @@ func directPointFixture(tb testing.TB) (sqldriver.Stmt, []sqldriver.Value) {
 	return prepared, []sqldriver.Value{"a"}
 }
 
+func directPointResidualFixture(tb testing.TB) (sqldriver.Stmt, []sqldriver.Value) {
+	tb.Helper()
+	connection := directTestConn(tb)
+	directExec(tb, connection,
+		`CREATE TABLE docs (id STRING PRIMARY KEY, active BOOLEAN, n NUMBER NOT NULL)`, nil)
+	directExec(tb, connection, `INSERT INTO docs VALUES (?)`,
+		[]sqldriver.NamedValue{{
+			Ordinal: 1, Value: `{"id":"a","active":true,"n":1}`,
+		}})
+	prepared, err := connection.Prepare(
+		`SELECT n FROM docs WHERE id = ? AND active = TRUE`,
+	)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() {
+		if err := prepared.Close(); err != nil {
+			tb.Error(err)
+		}
+	})
+	return prepared, []sqldriver.Value{"a"}
+}
+
 func runDirectQuery(
 	statement sqldriver.Stmt,
 	args []sqldriver.Value,
@@ -128,6 +151,26 @@ func TestPreparedPointQueryByteKeyWarmAllocations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf(
 			"warmed []byte primary point query allocated %.2f times, want zero",
+			allocs)
+	}
+}
+
+func TestPreparedPointResidualQueryWarmAllocations(t *testing.T) {
+	statement, args := directPointResidualFixture(t)
+	dest := make([]sqldriver.Value, 1)
+	if err := runDirectQuery(statement, args, dest); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	allocs := testing.AllocsPerRun(200, func() {
+		runErr = runDirectQuery(statement, args, dest)
+	})
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if allocs != 0 {
+		t.Fatalf(
+			"warmed primary point residual query allocated %.2f times, want zero",
 			allocs)
 	}
 }
@@ -232,6 +275,21 @@ func TestTransactionOverlayQueryWarmAllocations(t *testing.T) {
 
 func BenchmarkDriverPreparedPointQuery(b *testing.B) {
 	statement, args := directPointFixture(b)
+	dest := make([]sqldriver.Value, 1)
+	if err := runDirectQuery(statement, args, dest); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := runDirectQuery(statement, args, dest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDriverPreparedPointResidualQuery(b *testing.B) {
+	statement, args := directPointResidualFixture(b)
 	dest := make([]sqldriver.Value, 1)
 	if err := runDirectQuery(statement, args, dest); err != nil {
 		b.Fatal(err)

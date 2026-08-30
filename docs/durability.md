@@ -51,9 +51,31 @@ Buffered-visible mutation does not issue a device write before success. A
 process or machine failure before a completed checkpoint can lose acknowledged
 mutations.
 
+For the narrow unindexed, schema-free inline lane, multiple callers may perform
+private validation concurrently and publish through bounded striped accounting
+and one flat-combined generation cut. That optimization does not change the
+failure model: acknowledgement is still buffered-visible, and a successful
+`Flush` or `Close` is still the persistence boundary.
+
 `Flush` makes the current visible cut crash-safe. `Close` also performs the
 final checkpoint. A close error can be retryable while readers or resources
 remain active. Check `CloseCompleted` before you assume that teardown finished.
+
+## Primary-page checkpoint order
+
+The physical primary checkpoint grammar is the `VCS1` compact stripe. Its
+internal class discriminator is 6. It is not the retired unified class-5 test
+codec. A checkpoint deterministically folds the resident row overlay into
+immutable compact leaves, then publishes the routed parents and alternate root
+under the selected barrier strength. Compression changes physical
+representation only. It does not weaken the logical generation or checksum
+checks.
+
+An out-of-line value is different. Its raw `PageOverflow` chain is allocated
+and staged before a compact leaf can publish the first-page reference. The
+current overflow chain is not field-compressed. Recovery admits each piece's
+total length, offset, next reference, extent bounds, generation, and checksum
+before it exposes the reassembled value.
 
 ## Recovery journal
 
@@ -81,14 +103,18 @@ Replicated SQL seals role-specific recovery record regions:
 | Role | Sealed record-region capacity |
 | --- | --- |
 | User relation | 16 MiB + 34 × 512 bytes = 16,794,624 bytes |
-| Request-ledger system relation | 16 MiB + 60 × 512 bytes = 16,807,936 bytes |
+| Request-ledger system relation | At least 16 MiB + 119 × 512 bytes = 16,838,144 bytes |
 
-The shared recovery allocation ceiling is 16,807,936 bytes. It accounts for
-the ledger's 258-record profile, maximum key widths, conditional-record
-framing, checksum, and sector padding. It does not enlarge the user-relation
-journal: that sidecar contract remains fixed at 16,794,624 bytes. Recovery
-rejects a header requesting more than the shared ceiling before allocating
-its record buffer. These capacities describe the record region, not total
+The request-ledger value is the retained on-disk compatibility floor and the
+space required by its current 514-entry, maximum-key-width conditional record.
+The owner seals the greater of that floor and the record region derived from
+its actual frozen collection limits. It does not enlarge the user-relation
+journal: that sidecar contract remains fixed at 16,794,624 bytes.
+
+The separate hard parser and allocation ceiling is 35,861 × 512 bytes =
+18,360,832 bytes. Recovery rejects a header above that ceiling before
+allocating its record buffer, but the ceiling is not a default or an owner's
+configured allocation. These capacities describe the record region, not total
 sidecar file size or a transaction participant limit.
 
 ## Root publication
@@ -162,10 +188,12 @@ collections, and checkpoint-group activation cannot attach while a compaction
 is in flight. Reservation, growth, and retirement recheck that ownership.
 The shipped RF3 path does not enable whole-file compaction automatically.
 
-The qualification test jointly bounds peak apparent growth, newly allocated
-filesystem blocks, accounted staging payload, extent count, and foreground
-write latency for mixed inline/overflow documents with an exact index. Its
-device-byte counter does not include direct 4 KiB manifest-slot rewrites, so it
+Two qualification tests cover separate shapes. The mixed inline/overflow test
+with an exact index bounds peak apparent growth, newly allocated filesystem
+blocks, accounted staging payload, and extent count. A separate unindexed
+inline test bounds concurrent foreground-write latency during compaction. The
+tests do not establish the latency bound for the mixed indexed shape. The
+device-byte counter also excludes direct 4 KiB manifest-slot rewrites, so it
 must not be presented as exact physical device write amplification. Measure
 physical writes at the host/device boundary for competitive claims.
 
@@ -201,6 +229,9 @@ The public API does not define a safe live raw-file backup procedure.
 - `store/durable/store_file_lifecycle.go`
 - `store/durable/store_file_open.go`
 - `store/durable/store_file_online_compact.go`
+- `store/durable/store_file_primary_concurrent.go`
 - `internal/storeio/recovery_journal.go`
+- `internal/storeio/compact_primary_stripe.go`
+- `internal/storeio/overflow_page.go`
 - `store/durable/store_database_txn.go`
 - `internal/storeio/txn_marker.go`

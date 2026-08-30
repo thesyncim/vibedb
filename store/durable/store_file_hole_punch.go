@@ -17,7 +17,7 @@ const fileStoreHolePunchCandidateRuns = 64
 const fileStoreHolePunchSelectedCalls = 6
 
 // Selection is byte-bounded independently of fragmentation. Twenty MiB is
-// enough to reclaim the complete mature class-5 image measured by the
+// enough to reclaim the complete mature compact VCS1 image measured by the
 // qualification harness while keeping one physical checkpoint predictable.
 const fileStoreHolePunchSelectedBytes = uint64(20 << 20)
 
@@ -28,7 +28,7 @@ const fileStoreHolePunchMaxAttempts = 4
 
 // Candidate discovery may collapse this many adjacent free identities into one
 // physical range. This is an identity-scan bound, independent of the syscall
-// bound above: mature class-5 churn commonly leaves hundreds of adjacent 32-KiB
+// bound above: mature compact VCS1 churn commonly leaves hundreds of adjacent 32-KiB
 // identities whose union is safe to release with one F_PUNCHHOLE/fallocate.
 // The fixed window keeps reader-fenced work deterministic even for a corrupt or
 // adversarially fragmented free set.

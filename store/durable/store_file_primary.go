@@ -662,8 +662,8 @@ func withOpenedPrimaryCatalogNode(
 // path (publishing an empty primary root), so both reach an identically wired
 // collection. The writer must be held and the collection not yet reachable.
 func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
-	// Structural mutation renders class 5 into an owned raw workspace before
-	// re-encoding class 5. Large inline rows can require the full 64 KiB
+	// Structural mutation renders compact VCS1 into an owned raw workspace before
+	// re-encoding compact VCS1. Large inline rows can require the full 64 KiB
 	// transient extent, so the retained scratch covers that ceiling.
 	c.primaryLeafScratch = make([]byte, storeio.CommonPrimaryLeafMaxExtentBytes)
 	c.primaryLeafMutationScratch = storeio.NewPrimaryLeafMutationScratch(

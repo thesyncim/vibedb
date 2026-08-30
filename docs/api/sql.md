@@ -81,6 +81,34 @@ mutation that does not return rows. `LastInsertId` is not available.
 One `database/sql` call accepts one SQL statement. It rejects a
 semicolon-separated statement batch.
 
+## Access paths and EXPLAIN
+
+For a local `SELECT`, equality or a positive `IN` predicate on the declared
+primary-key path can supply point candidates when it is the complete `WHERE`
+predicate or is below only top-level `AND` nodes. If several usable primary-key
+point predicates occur in one conjunction, the driver chooses equality before
+`IN`; among `IN` predicates it chooses the shortest list. A primary-key
+predicate below `OR` or `NOT` is not a sound bound and does not enable point
+access.
+
+Primary-key comparisons with `>`, `>=`, `<`, `<=`, or non-negated `BETWEEN`
+can similarly bound an ordered range at the root or below top-level `AND`
+nodes. Multiple range terms are intersected. Point access takes precedence
+when a query has both a usable point and range bound.
+
+Candidate selection never replaces predicate evaluation. The query engine
+checks the complete `WHERE` predicate, including every residual conjunct, over
+the point or range source. Prepared statements also revalidate the cached path
+against the live table, so dropping and recreating a table with a different
+primary key falls back to an eligible non-point path instead of probing the old
+key. Runtime size or source constraints can also select a scan fallback.
+
+`EXPLAIN` reports the source-aware candidate path without scanning rows.
+`EXPLAIN ANALYZE` executes the statement and reports the measured path. Plan
+names such as `primary-key-point-or-scan` and
+`primary-key-range-or-scan` deliberately expose the possible fallback. See the
+[typed query API](query.md#explain-a-plan) for the full access-path vocabulary.
+
 ## Parameters
 
 Use `?` placeholders. The driver rejects named parameters.
@@ -238,6 +266,7 @@ forms and exact refusals.
 ## Implementation references
 
 - `sql/driver/driver.go`, `write.go`, `tx.go`, and `runtime.go`
-- `sql/driver/validate.go` and `primary.go`
+- `sql/driver/validate.go`, `primary.go`, and `primary_range.go`
 - `sql/parser.go`, `parse_ddl.go`, and `parse_dml.go`
-- `sql/driver/surface_test.go` and `isolation_test.go`
+- `sql/driver/surface_test.go`, `primary_range_test.go`, and
+  `isolation_test.go`

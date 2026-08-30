@@ -289,7 +289,7 @@ func (o *primaryUnifiedOverlay) pendingBucket(bucket storeio.BucketID) bool {
 // bucketVersion is the generation of the newest visible row-overlay record
 // for bucket. It is a per-leaf reconciliation token: an unchanged durable
 // PageRef is not enough to prove an online-index scan is current because
-// class-5 replaces rows in this append-only overlay between checkpoints.
+// VCS1 replaces rows in this append-only overlay between checkpoints.
 func (o *primaryUnifiedOverlay) bucketVersion(
 	bucket storeio.BucketID, generation uint64,
 ) uint64 {
@@ -1347,7 +1347,7 @@ func (o *primaryUnifiedOverlay) stats() primaryUnifiedOverlayStats {
 }
 
 // canonicalPrimaryMutationValue returns the one logical representation exposed
-// by class-5 reads. It is shared by the overlay and exceptional structural
+// by compact VCS1 reads. It is shared by the overlay and exceptional structural
 // lanes so an overflow row, reader-forced COW, or async mutation cannot retain
 // a different byte spelling from the ordinary inline fast path.
 func (c *Collection) canonicalPrimaryMutationValue(src []byte) ([]byte, error) {
@@ -1759,7 +1759,7 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 // bucket set into the parent-route descriptors the existing checkpoint
 // materializer already knows how to rewrite. The leaf handle remains the
 // durable base; the materializer detects the dirty bucket and encodes its
-// merged class-5 image directly into the transaction.
+// merged compact VCS1 image directly into the transaction.
 func (c *Collection) preparePrimaryUnifiedOverlayParentsLocked(
 	state *fileStoreState,
 ) error {
