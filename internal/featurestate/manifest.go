@@ -136,11 +136,11 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "ExecBatch and global-index writes select the inline fast path or stream segmented manifests through the authenticated shard protocol and paged recovery.", []Reference{
 			ref("gateway/transaction_manifest.go", "stageTransactionCoordinator"), ref("gateway/recovery.go", "recoverManifestCoordinator"),
 		}},
-		Shipped: Stage{StatusYes, "The static gateway serves multi-table and cross-shard mutation batches under byte, mutation, deadline, and in-flight bounds and runs recovery at startup and on a timer.", []Reference{
-			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("gateway/recovery.go", "RecoverAll"),
+		Shipped: Stage{StatusNo, "The static transaction engine is library-integrated but is not exposed by vibedb-gateway serve. Static serving exposes only single-owner exec; the public exec_batch operation is reserved for authenticated durable RF3 and refuses every unsequenced fallback.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "handleConnPolicyDurable"), ref("cmd/vibedb-gateway/serve.go", "execRequest"), ref("cmd/vibedb-gateway/serve_test.go", "TestServeGatewayStaticWriteSurface"),
 		}},
-		Qualification: Stage{StatusPartial, "A real 65-shard gateway transaction proves the segmented path, readback, and outcome-unknown handling. Multi-page restart, malformed-page, idempotency, recovery, and failure-atomicity tests also exist. External multi-process kill and partition gates do not cover this static command path.", []Reference{
-			ref("gateway/segmented_e2e_test.go", "TestSegmentedExecBatchAcross65RealShardServers"), ref("gateway/segmented_e2e_test.go", "TestSegmentedCoordinatorResponseLossAndRestartBoundaries"),
+		Qualification: Stage{StatusPartial, "Library-level tests prove a real 65-shard segmented transaction, readback, outcome-unknown handling, multi-page restart, malformed-page refusal, idempotency, recovery, and failure atomicity. A public static-listener test proves exec_batch cannot reach that engine through an unsequenced fallback. No shipped static command path exists to qualify under external kill, partition, or scaling gates.", []Reference{
+			ref("gateway/segmented_e2e_test.go", "TestSegmentedExecBatchAcross65RealShardServers"), ref("gateway/segmented_e2e_test.go", "TestSegmentedCoordinatorResponseLossAndRestartBoundaries"), ref("cmd/vibedb-gateway/serve_test.go", "TestServeGatewayStaticWriteSurface"),
 		}},
 	},
 	{

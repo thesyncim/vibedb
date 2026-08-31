@@ -14,6 +14,7 @@ func TestSQLCapabilityRequiresCompleteParsedSemantics(t *testing.T) {
 		"VALUES (1)",
 		"TABLE docs",
 		"(SELECT * FROM docs)",
+		"SELECT 1 GARBAGE",
 		"SELECT ';' AS marker FROM docs",
 		"SELECT 1 /* ; DELETE */; -- one trailing terminator",
 		`SELECT 'it''s UPDATE; DELETE' AS text`,
@@ -57,7 +58,7 @@ func TestSQLCapabilityRequiresCompleteParsedSemantics(t *testing.T) {
 	all := CapabilityDataRead | CapabilityDataWrite | CapabilitySchema
 	failClosed := []string{
 		"", "/* unterminated", "@invalid",
-		"SELECT 1 GARBAGE",
+		"SELECT 1 AS value GARBAGE",
 		"SELECT 1; DELETE FROM docs",
 		"SELECT 1;;",
 		`SELECT "unterminated`,
