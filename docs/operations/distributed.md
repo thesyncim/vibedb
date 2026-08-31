@@ -111,6 +111,13 @@ the barrier is lost and the read fails. It is never silently answered from the n
 state. Data reads also filter transferred ownership before joins, aggregation, and `LIMIT`, and
 fail closed when a group-level active transaction intent blocks the requested cut.
 
+A serving-discovery probe reads status and publication plus one fixed-width durable authorization
+fence. It does not acquire collection snapshots or scan the hidden state image, and pending result
+settlement remains a hard fence. After a read request's complete serving fence is admitted, a
+successful response preserves that exact fence and advances only the monotonic applied/commit
+watermarks to the returned data cut; it does not pair the result with a later status probe. Failure
+paths may probe again to return refreshed refusal state.
+
 ## WAL generations and snapshots
 
 The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
@@ -353,7 +360,7 @@ Preserve artifacts, but assume only the exact creating build can understand them
 ## Source map
 
 - Catalog pinning/routing: [`gateway/catalog.go`](../../gateway/catalog.go), [`gateway/route.go`](../../gateway/route.go)
-- Serving: [`internal/raftservice/owner.go`](../../internal/raftservice/owner.go), [`internal/raftservice/data_read.go`](../../internal/raftservice/data_read.go)
+- Serving: [`internal/raftservice/owner.go`](../../internal/raftservice/owner.go), [`internal/raftservice/data_read.go`](../../internal/raftservice/data_read.go), [`shardservice/replicated_server.go`](../../shardservice/replicated_server.go)
 - Group ownership: [`internal/raftmember/runtime.go`](../../internal/raftmember/runtime.go), [`internal/multiraft/host.go`](../../internal/multiraft/host.go)
 - Raft: [`internal/raftmodel/config.go`](../../internal/raftmodel/config.go), [`internal/raftmodel/node.go`](../../internal/raftmodel/node.go), [`internal/raftmodel/ports.go`](../../internal/raftmodel/ports.go)
 - WAL/snapshots: [`internal/raftstore/store.go`](../../internal/raftstore/store.go), [`internal/raftstore/generation_activate.go`](../../internal/raftstore/generation_activate.go), [`internal/replicatedstate/snapshot_artifact.go`](../../internal/replicatedstate/snapshot_artifact.go)

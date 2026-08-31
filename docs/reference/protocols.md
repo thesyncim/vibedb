@@ -182,6 +182,12 @@ membership acceptance, and read results. Terminal proposal responses bind the
 exact command with a digest; remote diagnostic strings are not part of the hot
 wire.
 
+A successful read response returns the exact admitted request fence and advances
+its applied/commit watermarks to the data cut. It does not combine that cut with
+a later serving probe. Error paths may refresh member state before returning a
+refusal. Serving discovery obtains durable authorization metadata through a
+fixed-width fence read rather than a full state snapshot.
+
 The public RF3 serving catalog requires three replicas. That is a topology
 policy, not a property of generic Raft framing. Replacement may temporarily use
 a separately authorized fourth member, which never widens the public data

@@ -833,8 +833,11 @@ _Evidence:_ [E213](#evidence-213), [E214](#evidence-214), [E215](#evidence-215),
 **Primitive — Yes**
 
 Leader reads use ReadIndex. Follower reads require explicit applied-position and serving fences.
+Serving probes read a fixed-width durable authorization fence without acquiring collection
+snapshots or scanning hidden rows. Successful reads preserve the admitted request fence at the
+returned applied cut instead of taking a post-read probe.
 
-_Evidence:_ [E221](#evidence-221), [E222](#evidence-222)
+_Evidence:_ [E221](#evidence-221), [E222](#evidence-222), [E223](#evidence-223), [E224](#evidence-224)
 
 **Integrated — Yes**
 
@@ -843,7 +846,7 @@ to exact routes. The gateway follows leaders, refreshes a definitely stale catal
 and can select a sufficiently applied follower for the explicit follower contract. Composite and
 tenant-path placement keys remain absent.
 
-_Evidence:_ [E223](#evidence-223), [E224](#evidence-224)
+_Evidence:_ [E225](#evidence-225), [E226](#evidence-226)
 
 **Development command — Yes**
 
@@ -852,20 +855,21 @@ when it consumes the replicated catalog. Linearizable reads use ReadIndex. Monot
 reads require the exact RouteID and applied index. The point API never falls back to SQL;
 replicated-catalog query uses a separate RF3 SELECT transport.
 
-_Evidence:_ [E225](#evidence-225), [E226](#evidence-226)
+_Evidence:_ [E227](#evidence-227), [E228](#evidence-228)
 
 **Qualification — Partial**
 
 Command-boundary tests cover canonical decoding, typed results, authorization, no SQL fallback,
-coalesced catalog refresh, follower selection, route mismatch, serving fences,
-duplicate-release-safe aggregate response reservations, direct zero-allocation response
-streaming, and blocked-client write timeout. TestGatewayDurableRF3ExternalProcessRecovery issues
-public-gateway linearizable point reads while one shard process is SIGSTOP-partitioned, requires
-two-voter leaders for all four groups, verifies post-commit readback, and includes the reads in
-bounded failover and foreground p99 evidence. Qualification remains Partial because external
-follower-staleness latency and exhaustive partition cuts remain absent.
+coalesced catalog refresh, follower selection, route mismatch, serving fences, successful-read
+no-post-probe behavior, duplicate-release-safe aggregate response reservations, direct
+zero-allocation response streaming, and blocked-client write timeout.
+TestGatewayDurableRF3ExternalProcessRecovery issues public-gateway linearizable point reads
+while one shard process is SIGSTOP-partitioned, requires two-voter leaders for all four groups,
+verifies post-commit readback, and includes the reads in bounded failover and foreground p99
+evidence. Qualification remains Partial because external follower-staleness latency and
+exhaustive partition cuts remain absent.
 
-_Evidence:_ [E227](#evidence-227), [E228](#evidence-228), [E21](#evidence-21)
+_Evidence:_ [E229](#evidence-229), [E230](#evidence-230), [E231](#evidence-231), [E21](#evidence-21)
 
 
 </details>
@@ -878,7 +882,7 @@ _Evidence:_ [E227](#evidence-227), [E228](#evidence-228), [E21](#evidence-21)
 ConfChange, learner roles, durable promotion evidence, removal, and leader transfer exist in the
 Raft runtime.
 
-_Evidence:_ [E229](#evidence-229), [E230](#evidence-230)
+_Evidence:_ [E232](#evidence-232), [E233](#evidence-233)
 
 **Integrated — Yes**
 
@@ -887,7 +891,7 @@ leader transfer, ownership publication, two catalog-drain fences, source removal
 grant finalization, and restart resume. Certified failures across independent groups are
 admitted as one atomic catalog operation set before any learner action begins.
 
-_Evidence:_ [E231](#evidence-231), [E232](#evidence-232), [E233](#evidence-233)
+_Evidence:_ [E234](#evidence-234), [E235](#evidence-235), [E236](#evidence-236)
 
 **Development command — Yes**
 
@@ -895,7 +899,7 @@ serve-rf3 exposes authenticated membership, observation, snapshot-source, owners
 retirement control. vibedb-gateway starts the resumable move controller when a strict
 replica-control manifest is present.
 
-_Evidence:_ [E40](#evidence-40), [E234](#evidence-234), [E5](#evidence-5)
+_Evidence:_ [E40](#evidence-40), [E237](#evidence-237), [E5](#evidence-5)
 
 **Qualification — Partial**
 
@@ -909,7 +913,7 @@ claim remains Partial until that new gate passes CI; failure replacement correct
 already-elected live leader, while planned live-source moves exercise conditional leader
 transfer separately.
 
-_Evidence:_ [E235](#evidence-235), [E236](#evidence-236), [E237](#evidence-237)
+_Evidence:_ [E238](#evidence-238), [E239](#evidence-239), [E240](#evidence-240)
 
 
 </details>
@@ -922,7 +926,7 @@ _Evidence:_ [E235](#evidence-235), [E236](#evidence-236), [E237](#evidence-237)
 A bounded authenticated repository, resumable chunk protocol, descriptor identity, and artifact
 verification exist.
 
-_Evidence:_ [E238](#evidence-238), [E239](#evidence-239)
+_Evidence:_ [E241](#evidence-241), [E242](#evidence-242)
 
 **Integrated — Yes**
 
@@ -930,7 +934,7 @@ Artifact production, authenticated transport, crash-safe empty-learner activatio
 exact-incarnation adoption, Multi-Raft host addition, catch-up observation, and later promotion
 are composed by the durable move controller.
 
-_Evidence:_ [E240](#evidence-240), [E231](#evidence-231)
+_Evidence:_ [E243](#evidence-243), [E234](#evidence-234)
 
 **Development command — Yes**
 
@@ -939,7 +943,7 @@ listeners. bootstrap-rf3 receives, verifies, installs, and resumes one or more c
 through one physical NodeID/control listener before reopening every installed group through the
 ordinary serving command.
 
-_Evidence:_ [E40](#evidence-40), [E241](#evidence-241), [E242](#evidence-242)
+_Evidence:_ [E40](#evidence-40), [E244](#evidence-244), [E245](#evidence-245)
 
 **Qualification — Partial**
 
@@ -958,7 +962,7 @@ rename and unlink crash cuts, target/source/gateway restart, exact cleanup conve
 latency, RSS, network, WAL, and storage bounds. CI requires three unskipped passes;
 qualification remains Partial until that gate passes there.
 
-_Evidence:_ [E243](#evidence-243), [E244](#evidence-244), [E245](#evidence-245), [E246](#evidence-246), [E237](#evidence-237), [E247](#evidence-247), [E248](#evidence-248)
+_Evidence:_ [E246](#evidence-246), [E247](#evidence-247), [E248](#evidence-248), [E249](#evidence-249), [E240](#evidence-240), [E250](#evidence-250), [E251](#evidence-251)
 
 
 </details>
@@ -973,7 +977,7 @@ ownership seal, child staging, RF3 readiness, catalog publication, retained prun
 failure authorization, and replica-move execution exist. Child image and global-index placement
 accumulators provide constant-size cut proofs without rescanning relations at cutover.
 
-_Evidence:_ [E249](#evidence-249), [E250](#evidence-250), [E251](#evidence-251), [E252](#evidence-252), [E253](#evidence-253), [E231](#evidence-231)
+_Evidence:_ [E252](#evidence-252), [E253](#evidence-253), [E254](#evidence-254), [E255](#evidence-255), [E256](#evidence-256), [E234](#evidence-234)
 
 **Integrated — Yes**
 
@@ -987,7 +991,7 @@ Global-index relation snapshot partitioning, tail replay, and retained pruning a
 integrated. The replica-move path composes failure evidence, candidate selection, membership
 grants, snapshot bootstrap, catch-up, promotion, catalog drains, removal, and cleanup.
 
-_Evidence:_ [E254](#evidence-254), [E255](#evidence-255), [E256](#evidence-256), [E257](#evidence-257), [E258](#evidence-258), [E259](#evidence-259)
+_Evidence:_ [E257](#evidence-257), [E258](#evidence-258), [E259](#evidence-259), [E260](#evidence-260), [E261](#evidence-261), [E262](#evidence-262)
 
 **Development command — Partial**
 
@@ -1002,7 +1006,7 @@ First composed serving-split qualification and repeated descendant discovery, fe
 restart integration remain pending. Retained-source ownership fencing remains enforced. There is
 no general operator split CLI.
 
-_Evidence:_ [E260](#evidence-260), [E261](#evidence-261), [E262](#evidence-262), [E5](#evidence-5), [E263](#evidence-263), [E264](#evidence-264), [E40](#evidence-40), [E265](#evidence-265), [E234](#evidence-234), [E266](#evidence-266)
+_Evidence:_ [E263](#evidence-263), [E264](#evidence-264), [E265](#evidence-265), [E5](#evidence-5), [E266](#evidence-266), [E267](#evidence-267), [E40](#evidence-40), [E268](#evidence-268), [E237](#evidence-237), [E269](#evidence-269)
 
 **Qualification — Partial**
 
@@ -1017,7 +1021,7 @@ runs do not qualify the first serving split or repeated descendants. The initial
 one bounded scan, and crash recovery may audit the sealed image. Qualification remains Partial
 until required unskipped Ubuntu runs pass. Range-scan routing proof remains absent.
 
-_Evidence:_ [E267](#evidence-267), [E268](#evidence-268), [E269](#evidence-269), [E270](#evidence-270), [E271](#evidence-271), [E272](#evidence-272), [E273](#evidence-273), [E274](#evidence-274), [E275](#evidence-275), [E276](#evidence-276), [E277](#evidence-277), [E162](#evidence-162)
+_Evidence:_ [E270](#evidence-270), [E271](#evidence-271), [E272](#evidence-272), [E273](#evidence-273), [E274](#evidence-274), [E275](#evidence-275), [E276](#evidence-276), [E277](#evidence-277), [E278](#evidence-278), [E279](#evidence-279), [E280](#evidence-280), [E162](#evidence-162)
 
 
 </details>
@@ -1033,7 +1037,7 @@ and promotion, and bounded resumable operation records. Exact schema rollout pri
 immutable shard bundles, bind per-group receipts, authorize one catalog cut, activate it, drain
 the prior generation, and support pre-activation abort.
 
-_Evidence:_ [E278](#evidence-278), [E279](#evidence-279), [E280](#evidence-280), [E281](#evidence-281), [E282](#evidence-282)
+_Evidence:_ [E281](#evidence-281), [E282](#evidence-282), [E283](#evidence-283), [E284](#evidence-284), [E285](#evidence-285)
 
 **Integrated — Yes**
 
@@ -1046,7 +1050,7 @@ journal destruction, and candidate promotion before restart. Catalog publication
 journals, schema rollout records, shard installers, and authenticated control services retain
 exact catalog, group, relation-manifest, and contract digests.
 
-_Evidence:_ [E283](#evidence-283), [E284](#evidence-284), [E285](#evidence-285), [E286](#evidence-286), [E40](#evidence-40), [E287](#evidence-287)
+_Evidence:_ [E286](#evidence-286), [E287](#evidence-287), [E288](#evidence-288), [E289](#evidence-289), [E40](#evidence-40), [E290](#evidence-290)
 
 **Development command — Yes**
 
@@ -1062,7 +1066,7 @@ runtime adoption. The experimental schema-rollout command conditionally publishe
 catalog successor; it is not a general SQL DDL endpoint or a completed repeated-rollout
 lifecycle.
 
-_Evidence:_ [E288](#evidence-288), [E289](#evidence-289), [E5](#evidence-5), [E290](#evidence-290), [E107](#evidence-107), [E40](#evidence-40), [E291](#evidence-291), [E287](#evidence-287)
+_Evidence:_ [E291](#evidence-291), [E292](#evidence-292), [E5](#evidence-5), [E293](#evidence-293), [E107](#evidence-107), [E40](#evidence-40), [E294](#evidence-294), [E290](#evidence-290)
 
 **Qualification — Partial**
 
@@ -1079,7 +1083,7 @@ write-once rollout artifacts, and trusted retained-identity rollover for repeate
 incomplete. No external self-route-change handoff, rolling mixed-build, or SQL DDL rollback gate
 exists.
 
-_Evidence:_ [E292](#evidence-292), [E293](#evidence-293), [E294](#evidence-294), [E295](#evidence-295), [E296](#evidence-296), [E297](#evidence-297), [E298](#evidence-298), [E299](#evidence-299), [E300](#evidence-300), [E301](#evidence-301), [E21](#evidence-21), [E302](#evidence-302), [E303](#evidence-303), [E304](#evidence-304), [E305](#evidence-305), [E306](#evidence-306)
+_Evidence:_ [E295](#evidence-295), [E296](#evidence-296), [E297](#evidence-297), [E298](#evidence-298), [E299](#evidence-299), [E300](#evidence-300), [E301](#evidence-301), [E302](#evidence-302), [E303](#evidence-303), [E304](#evidence-304), [E21](#evidence-21), [E305](#evidence-305), [E306](#evidence-306), [E307](#evidence-307), [E308](#evidence-308), [E309](#evidence-309)
 
 
 </details>
@@ -1092,7 +1096,7 @@ _Evidence:_ [E292](#evidence-292), [E293](#evidence-293), [E294](#evidence-294),
 Bounded pressure selection, failure-domain placement, split planning, and replica-move selection
 exist.
 
-_Evidence:_ [E307](#evidence-307), [E308](#evidence-308)
+_Evidence:_ [E310](#evidence-310), [E311](#evidence-311)
 
 **Integrated — Yes**
 
@@ -1100,7 +1104,7 @@ Routed requests feed bounded per-allocation recorders. A collector publishes can
 cuts through catalog RF3. A clockless controller qualifies sustained pressure, selects either a
 split or replica move, and hands one idempotent admission to the existing operation journals.
 
-_Evidence:_ [E309](#evidence-309), [E56](#evidence-56), [E310](#evidence-310)
+_Evidence:_ [E312](#evidence-312), [E56](#evidence-56), [E313](#evidence-313)
 
 **Development command — Partial**
 
@@ -1114,7 +1118,7 @@ source/catalog fences; relation-aware global-index snapshot/tail/prune, repeated
 capture, and gateway source-discovery qualification remain incomplete. External split and
 restart qualification is still required.
 
-_Evidence:_ [E311](#evidence-311), [E312](#evidence-312), [E5](#evidence-5), [E107](#evidence-107)
+_Evidence:_ [E314](#evidence-314), [E315](#evidence-315), [E5](#evidence-5), [E107](#evidence-107)
 
 **Qualification — Partial**
 
@@ -1128,7 +1132,7 @@ allocated-storage, WAL-allocation, request-count, exact public client request/re
 wire-byte, and snapshot-payload-byte ceilings; they do not measure total network traffic.
 Qualification remains Partial until the mandatory unskipped Ubuntu evidence is recorded.
 
-_Evidence:_ [E313](#evidence-313), [E314](#evidence-314), [E315](#evidence-315), [E316](#evidence-316), [E277](#evidence-277), [E162](#evidence-162)
+_Evidence:_ [E316](#evidence-316), [E317](#evidence-317), [E318](#evidence-318), [E319](#evidence-319), [E280](#evidence-280), [E162](#evidence-162)
 
 
 </details>
@@ -1139,7 +1143,7 @@ Evidence is deduplicated across features. Links point to source or executable te
 repository.
 
 <details>
-<summary>316 unique source and test references</summary>
+<summary>319 unique source and test references</summary>
 
 1. <a id="evidence-1"></a>[gateway/catalog.go](../gateway/catalog.go) — `Snapshot`
 2. <a id="evidence-2"></a>[gateway/executor.go](../gateway/executor.go) — `Executor`
@@ -1362,101 +1366,104 @@ repository.
 219. <a id="evidence-219"></a>[gateway/replicated_restore_catalog_test.go](../gateway/replicated_restore_catalog_test.go) — `TestReplicatedRestoreCatalogSettlesResponseLossByLinearizableRead`
 220. <a id="evidence-220"></a>[cmd/vibedb-shard/restore_rf3_process_test.go](../cmd/vibedb-shard/restore_rf3_process_test.go) — `TestRestoredRF3ExternalProcessServingAndFailover`
 221. <a id="evidence-221"></a>[internal/raftservice/owner.go](../internal/raftservice/owner.go) — `ReadPoint`
-222. <a id="evidence-222"></a>[internal/multiraft/host.go](../internal/multiraft/host.go) — `ReadIndex`
-223. <a id="evidence-223"></a>[gateway/replicated_data_read.go](../gateway/replicated_data_read.go) — `ReplicatedDataReader`
-224. <a id="evidence-224"></a>[gateway/replicated_table.go](../gateway/replicated_table.go) — `ResolveReplicatedTableKey`
-225. <a id="evidence-225"></a>[cmd/vibedb-gateway/serve.go](../cmd/vibedb-gateway/serve.go) — `handleConnPolicy`
-226. <a id="evidence-226"></a>[gateway/replicated_data_read.go](../gateway/replicated_data_read.go) — `Read`
-227. <a id="evidence-227"></a>[cmd/vibedb-gateway/data_handler_test.go](../cmd/vibedb-gateway/data_handler_test.go) — `TestHandleConnDataDispatchesRF3ReadWithoutSQLFallback`
-228. <a id="evidence-228"></a>[gateway/replicated_data_read_test.go](../gateway/replicated_data_read_test.go) — `TestReplicatedDataReaderLinearizableRefreshesNotLeader`
-229. <a id="evidence-229"></a>[internal/multiraft/host.go](../internal/multiraft/host.go) — `ProposeConfChange`
-230. <a id="evidence-230"></a>[internal/multiraft/host.go](../internal/multiraft/host.go) — `TransferLeader`
-231. <a id="evidence-231"></a>[internal/rebalanceexec/executor.go](../internal/rebalanceexec/executor.go) — `ExecuteReplicaMove`
-232. <a id="evidence-232"></a>[internal/rebalanceexec/controller.go](../internal/rebalanceexec/controller.go) — `SubmitSet`
-233. <a id="evidence-233"></a>[internal/rebalanceexec/controller.go](../internal/rebalanceexec/controller.go) — `RunPass`
-234. <a id="evidence-234"></a>[cmd/vibedb-gateway/replica_health_controller.go](../cmd/vibedb-gateway/replica_health_controller.go) — `startGatewayReplicaControllers`
-235. <a id="evidence-235"></a>[internal/rebalanceexec/executor_test.go](../internal/rebalanceexec/executor_test.go) — `TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions`
-236. <a id="evidence-236"></a>[internal/multiraft/host_leader_transfer_real_test.go](../internal/multiraft/host_leader_transfer_real_test.go) — `TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply`
-237. <a id="evidence-237"></a>[cmd/vibedb-gateway/replica_replacement_process_test.go](../cmd/vibedb-gateway/replica_replacement_process_test.go) — `TestGatewayAutomaticReplicaReplacementProcesses`
-238. <a id="evidence-238"></a>[internal/snapshottransfer/repository.go](../internal/snapshottransfer/repository.go) — `Repository`
-239. <a id="evidence-239"></a>[internal/snapshottransfer/service.go](../internal/snapshottransfer/service.go) — `Receiver`
-240. <a id="evidence-240"></a>[internal/snapshottransfer/learner_install.go](../internal/snapshottransfer/learner_install.go) — `InstallPublishedLearner`
-241. <a id="evidence-241"></a>[cmd/vibedb-shard/bootstrap_rf3.go](../cmd/vibedb-shard/bootstrap_rf3.go) — `bootstrapPreparedRF3`
-242. <a id="evidence-242"></a>[cmd/vibedb-shard/bootstrap_rf3_groups.go](../cmd/vibedb-shard/bootstrap_rf3_groups.go) — `bootstrapPreparedRF3Groups`
-243. <a id="evidence-243"></a>[internal/snapshottransfer/source_provider_test.go](../internal/snapshottransfer/source_provider_test.go) — `TestRetainedSourceProviderExportsAndObservesAfterReopen`
-244. <a id="evidence-244"></a>[internal/snapshottransfer/source_control_test.go](../internal/snapshottransfer/source_control_test.go) — `TestSourceControlClientRoutesExactReplicatedAbandonment`
-245. <a id="evidence-245"></a>[internal/snapshottransfer/abandonment_test.go](../internal/snapshottransfer/abandonment_test.go) — `TestRepositoryRecoversEveryAbandonmentNamespacePhase`
-246. <a id="evidence-246"></a>[internal/rebalanceexec/abandonment_test.go](../internal/rebalanceexec/abandonment_test.go) — `TestAbandonmentSchedulerCrashRestartAndByteGateDoNotSkipWitness`
-247. <a id="evidence-247"></a>[internal/snapshottransfer/learner_install_test.go](../internal/snapshottransfer/learner_install_test.go) — `TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary`
-248. <a id="evidence-248"></a>[internal/snapshottransfer/transfer_test.go](../internal/snapshottransfer/transfer_test.go) — `BenchmarkSnapshotServiceChunk`
-249. <a id="evidence-249"></a>[internal/splitcontroller/replicated_executor.go](../internal/splitcontroller/replicated_executor.go) — `AdmitReplicatedPlan`
-250. <a id="evidence-250"></a>[internal/splitcontroller/local_source_actions.go](../internal/splitcontroller/local_source_actions.go) — `LocalSourceActions`
-251. <a id="evidence-251"></a>[internal/splitcontroller/local_child_actions.go](../internal/splitcontroller/local_child_actions.go) — `LocalChildActions`
-252. <a id="evidence-252"></a>[internal/rangesplit/stage_image.go](../internal/rangesplit/stage_image.go) — `childStageImageAccumulator`
-253. <a id="evidence-253"></a>[internal/replicatedstate/relation_placement_accumulator.go](../internal/replicatedstate/relation_placement_accumulator.go) — `GlobalIndexPlacementProof`
-254. <a id="evidence-254"></a>[internal/splitcontroller/committed_preparation.go](../internal/splitcontroller/committed_preparation.go) — `CommittedPlanPreparer`
-255. <a id="evidence-255"></a>[internal/splitcontroller/committed_preparation_test.go](../internal/splitcontroller/committed_preparation_test.go) — `TestServingPreparationRequiresCommittedIntentAndResumesLostReceipt`
-256. <a id="evidence-256"></a>[internal/splitcontroller/local_observation_provider.go](../internal/splitcontroller/local_observation_provider.go) — `LocalPlanObservationProvider`
-257. <a id="evidence-257"></a>[internal/splitcontroller/composite_shard_executor.go](../internal/splitcontroller/composite_shard_executor.go) — `CompositeShardActionExecutor`
-258. <a id="evidence-258"></a>[internal/splitcontroller/controller_service.go](../internal/splitcontroller/controller_service.go) — `NewServingControllerService`
-259. <a id="evidence-259"></a>[internal/rebalanceexec/controller.go](../internal/rebalanceexec/controller.go) — `Controller`
-260. <a id="evidence-260"></a>[internal/rangesplit/artifact.go](../internal/rangesplit/artifact.go) — `WriteChildArtifacts`
-261. <a id="evidence-261"></a>[internal/rangesplit/tail.go](../internal/rangesplit/tail.go) — `TranslateTailEntry`
-262. <a id="evidence-262"></a>[internal/splitcontroller/retained_prune_proposer.go](../internal/splitcontroller/retained_prune_proposer.go) — `NewRF3RetainedPruneProposerForPlan`
-263. <a id="evidence-263"></a>[cmd/vibedb-gateway/split_controller_runtime.go](../cmd/vibedb-gateway/split_controller_runtime.go) — `gatewayServingSplitRuntime`
-264. <a id="evidence-264"></a>[cmd/vibedb-gateway/hot_split_factory.go](../cmd/vibedb-gateway/hot_split_factory.go) — `gatewayHotSplitFactory`
-265. <a id="evidence-265"></a>[cmd/vibedb-shard/rf3_split_serving.go](../cmd/vibedb-shard/rf3_split_serving.go) — `rf3SplitServingRuntime`
-266. <a id="evidence-266"></a>[internal/replicatedstate/relation_bundle.go](../internal/replicatedstate/relation_bundle.go) — `GlobalIndexProfile`
-267. <a id="evidence-267"></a>[internal/splitcontroller/committed_preparation_test.go](../internal/splitcontroller/committed_preparation_test.go) — `TestCommittedPreparationRejectsForgedReservedCursorBeforeEffects`
-268. <a id="evidence-268"></a>[internal/splitcontroller/committed_preparation_test.go](../internal/splitcontroller/committed_preparation_test.go) — `TestCommittedPreparationCrashAfterReceiptsBeforeCompletionRecord`
-269. <a id="evidence-269"></a>[cmd/vibedb-shard/rf3_group_child_preparer_test.go](../cmd/vibedb-shard/rf3_group_child_preparer_test.go) — `TestRF3GroupChildRegistrySelectionBindsExactGroupProfileAndPaths`
-270. <a id="evidence-270"></a>[cmd/vibedb-shard/rf3_group_child_preparer_test.go](../cmd/vibedb-shard/rf3_group_child_preparer_test.go) — `TestRF3GroupChildPreparationHasOneGlobalOperationBound`
-271. <a id="evidence-271"></a>[internal/splitcontroller/local_source_actions_test.go](../internal/splitcontroller/local_source_actions_test.go) — `TestLocalSourceActionsRecoverCaptureAndPublishImmutableArtifacts`
-272. <a id="evidence-272"></a>[internal/splitcontroller/local_source_seal_test.go](../internal/splitcontroller/local_source_seal_test.go) — `TestLocalSourceSealAndCutoverCertificateSurviveRestart`
-273. <a id="evidence-273"></a>[internal/splitcontroller/reconcile_test.go](../internal/splitcontroller/reconcile_test.go) — `TestChildActionsRequireMonotonicExactEvidence`
-274. <a id="evidence-274"></a>[internal/rangesplit/stage_image_incremental_test.go](../internal/rangesplit/stage_image_incremental_test.go) — `TestChildStageSealDoesNotScanRows`
-275. <a id="evidence-275"></a>[internal/splitcontroller/global_index_cut_test.go](../internal/splitcontroller/global_index_cut_test.go) — `TestGlobalIndexCutUsesCanonicalUniqueAndNonUniquePlacementAtBoundary`
-276. <a id="evidence-276"></a>[internal/splitcontroller/execute_test.go](../internal/splitcontroller/execute_test.go) — `TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows`
-277. <a id="evidence-277"></a>[cmd/vibedb-gateway/hot_shard_mutation_process_test.go](../cmd/vibedb-gateway/hot_shard_mutation_process_test.go) — `TestGatewayHotShardMutationProcesses`
-278. <a id="evidence-278"></a>[gateway/replicated_catalog_authority.go](../gateway/replicated_catalog_authority.go) — `ReplicatedCatalogAuthority`
-279. <a id="evidence-279"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `ReplicatedCatalogRouteSeedState`
-280. <a id="evidence-280"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `StageReplicatedCatalogRouteSeedAfter`
-281. <a id="evidence-281"></a>[gateway/schema_rollout.go](../gateway/schema_rollout.go) — `PrepareSchemaRollout`
-282. <a id="evidence-282"></a>[internal/schemainstall/installer.go](../internal/schemainstall/installer.go) — `Installer`
-283. <a id="evidence-283"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `InstallReplicatedCatalogRouteSeed`
-284. <a id="evidence-284"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `CompleteQuiescedHandoff`
-285. <a id="evidence-285"></a>[gateway/schema_rollout_controller.go](../gateway/schema_rollout_controller.go) — `NewSchemaRolloutController`
-286. <a id="evidence-286"></a>[internal/schemainstall/control.go](../internal/schemainstall/control.go) — `NewControlService`
-287. <a id="evidence-287"></a>[cmd/vibedb-gateway/schema_rollout_admin.go](../cmd/vibedb-gateway/schema_rollout_admin.go) — `executeGatewaySchemaRollout`
-288. <a id="evidence-288"></a>[cmd/vibedb-shard/schema_startup_recovery.go](../cmd/vibedb-shard/schema_startup_recovery.go) — `openRF3RetainedApply`
-289. <a id="evidence-289"></a>[sql/driver/schema_catalog_source_recovery.go](../sql/driver/schema_catalog_source_recovery.go) — `OpenReplicatedShardStoreWithSchemaSourceTransition`
-290. <a id="evidence-290"></a>[cmd/vibedb-gateway/serve.go](../cmd/vibedb-gateway/serve.go) — `recoverReplicatedCatalogRouteSeedStartup`
-291. <a id="evidence-291"></a>[cmd/vibedb-gateway/main.go](../cmd/vibedb-gateway/main.go) — `run`
-292. <a id="evidence-292"></a>[internal/replicatedstate/schema_source_recovery_test.go](../internal/replicatedstate/schema_source_recovery_test.go) — `TestSchemaSourceRecoveryAuthenticatesCommittedCheckpoint`
-293. <a id="evidence-293"></a>[internal/replicatedstate/schema_source_recovery_test.go](../internal/replicatedstate/schema_source_recovery_test.go) — `TestSchemaRetiredSourceRejectsServingOperations`
-294. <a id="evidence-294"></a>[cmd/vibedb-shard/schema_startup_recovery_test.go](../cmd/vibedb-shard/schema_startup_recovery_test.go) — `TestRF3SchemaStartupSettlementFailsClosedAtEveryBoundary`
-295. <a id="evidence-295"></a>[cmd/vibedb-shard/schema_startup_recovery_linux_test.go](../cmd/vibedb-shard/schema_startup_recovery_linux_test.go) — `TestRF3SchemaStartupSettlesCommittedSourceBeforeRuntimeAdoption`
-296. <a id="evidence-296"></a>[sql/driver/replicated_manifest_test.go](../sql/driver/replicated_manifest_test.go) — `TestInitialReplicatedRelationManifestMatchesServingIdentity`
-297. <a id="evidence-297"></a>[internal/replicatedstate/initial_manifest_test.go](../internal/replicatedstate/initial_manifest_test.go) — `TestInitialJSONRelationManifestMatchesPreparedCollection`
-298. <a id="evidence-298"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedTrackerPersistsSameRouteBeforeHolderPublish`
-299. <a id="evidence-299"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedTrackerStagesAndSignalsBeforeChangedHolder`
-300. <a id="evidence-300"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedLockedCheckRejectsPreauthorizedWaiter`
-301. <a id="evidence-301"></a>[cmd/vibedb-gateway/catalog_route_seed_test.go](../cmd/vibedb-gateway/catalog_route_seed_test.go) — `TestRecoverReplicatedCatalogRouteSeedStartupSettlesExactOldBinding`
-302. <a id="evidence-302"></a>[gateway/schema_rollout_test.go](../gateway/schema_rollout_test.go) — `TestSchemaRolloutPrepareActivateExactCatalog`
-303. <a id="evidence-303"></a>[gateway/schema_rollout_process_test.go](../gateway/schema_rollout_process_test.go) — `TestSchemaRolloutExternalProcessLeaderLossAndMixedGenerationRecovery`
-304. <a id="evidence-304"></a>[internal/schemainstall/installer_test.go](../internal/schemainstall/installer_test.go) — `TestInstallerCrashReopenAuthorizationActivationAndDrain`
-305. <a id="evidence-305"></a>[cmd/vibedb-gateway/schema_rollout_admin_test.go](../cmd/vibedb-gateway/schema_rollout_admin_test.go) — `TestGatewaySchemaRolloutManifestRequiresCanonicalVibeJSON`
-306. <a id="evidence-306"></a>[internal/raftservice/controlplane_catalog_rf3_test.go](../internal/raftservice/controlplane_catalog_rf3_test.go) — `TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart`
-307. <a id="evidence-307"></a>[internal/topologyscheduler/admission.go](../internal/topologyscheduler/admission.go) — `SelectSplits`
-308. <a id="evidence-308"></a>[internal/topologyscheduler/replica_move.go](../internal/topologyscheduler/replica_move.go) — `SelectReplicaMoves`
-309. <a id="evidence-309"></a>[internal/hotshard/collector.go](../internal/hotshard/collector.go) — `Collector`
-310. <a id="evidence-310"></a>[internal/hotshard/operation_sink.go](../internal/hotshard/operation_sink.go) — `OperationSink`
-311. <a id="evidence-311"></a>[cmd/vibedb-gateway/hot_shard_runtime.go](../cmd/vibedb-gateway/hot_shard_runtime.go) — `gatewayHotShardRuntime`
-312. <a id="evidence-312"></a>[cmd/vibedb-gateway/hot_shard_runtime.go](../cmd/vibedb-gateway/hot_shard_runtime.go) — `runPressurePass`
-313. <a id="evidence-313"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerQualifiesHotShardAndRetriesByteIdenticalAdmission`
-314. <a id="evidence-314"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerClockSkewCannotAdvanceReplicatedEvidence`
-315. <a id="evidence-315"></a>[cmd/vibedb-gateway/hot_shard_runtime_test.go](../cmd/vibedb-gateway/hot_shard_runtime_test.go) — `TestGatewayHotShardPressurePassCreatesExactEnrolledReplicaMove`
-316. <a id="evidence-316"></a>[cmd/vibedb-gateway/hot_shard_shipped_e2e_test.go](../cmd/vibedb-gateway/hot_shard_shipped_e2e_test.go) — `TestGatewayHotShardForegroundP99Overhead`
+222. <a id="evidence-222"></a>[internal/raftservice/owner.go](../internal/raftservice/owner.go) — `syncCommandFenceFromSnapshot`
+223. <a id="evidence-223"></a>[internal/multiraft/host.go](../internal/multiraft/host.go) — `ReadIndex`
+224. <a id="evidence-224"></a>[shardservice/replicated_server.go](../shardservice/replicated_server.go) — `replicatedReadState`
+225. <a id="evidence-225"></a>[gateway/replicated_data_read.go](../gateway/replicated_data_read.go) — `ReplicatedDataReader`
+226. <a id="evidence-226"></a>[gateway/replicated_table.go](../gateway/replicated_table.go) — `ResolveReplicatedTableKey`
+227. <a id="evidence-227"></a>[cmd/vibedb-gateway/serve.go](../cmd/vibedb-gateway/serve.go) — `handleConnPolicy`
+228. <a id="evidence-228"></a>[gateway/replicated_data_read.go](../gateway/replicated_data_read.go) — `Read`
+229. <a id="evidence-229"></a>[cmd/vibedb-gateway/data_handler_test.go](../cmd/vibedb-gateway/data_handler_test.go) — `TestHandleConnDataDispatchesRF3ReadWithoutSQLFallback`
+230. <a id="evidence-230"></a>[gateway/replicated_data_read_test.go](../gateway/replicated_data_read_test.go) — `TestReplicatedDataReaderLinearizableRefreshesNotLeader`
+231. <a id="evidence-231"></a>[internal/raftservice/owner_rf3_query_probe_test.go](../internal/raftservice/owner_rf3_query_probe_test.go) — `TestRF3SQLReadUsesAcceptedFenceWithoutPostProbe`
+232. <a id="evidence-232"></a>[internal/multiraft/host.go](../internal/multiraft/host.go) — `ProposeConfChange`
+233. <a id="evidence-233"></a>[internal/multiraft/host.go](../internal/multiraft/host.go) — `TransferLeader`
+234. <a id="evidence-234"></a>[internal/rebalanceexec/executor.go](../internal/rebalanceexec/executor.go) — `ExecuteReplicaMove`
+235. <a id="evidence-235"></a>[internal/rebalanceexec/controller.go](../internal/rebalanceexec/controller.go) — `SubmitSet`
+236. <a id="evidence-236"></a>[internal/rebalanceexec/controller.go](../internal/rebalanceexec/controller.go) — `RunPass`
+237. <a id="evidence-237"></a>[cmd/vibedb-gateway/replica_health_controller.go](../cmd/vibedb-gateway/replica_health_controller.go) — `startGatewayReplicaControllers`
+238. <a id="evidence-238"></a>[internal/rebalanceexec/executor_test.go](../internal/rebalanceexec/executor_test.go) — `TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions`
+239. <a id="evidence-239"></a>[internal/multiraft/host_leader_transfer_real_test.go](../internal/multiraft/host_leader_transfer_real_test.go) — `TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply`
+240. <a id="evidence-240"></a>[cmd/vibedb-gateway/replica_replacement_process_test.go](../cmd/vibedb-gateway/replica_replacement_process_test.go) — `TestGatewayAutomaticReplicaReplacementProcesses`
+241. <a id="evidence-241"></a>[internal/snapshottransfer/repository.go](../internal/snapshottransfer/repository.go) — `Repository`
+242. <a id="evidence-242"></a>[internal/snapshottransfer/service.go](../internal/snapshottransfer/service.go) — `Receiver`
+243. <a id="evidence-243"></a>[internal/snapshottransfer/learner_install.go](../internal/snapshottransfer/learner_install.go) — `InstallPublishedLearner`
+244. <a id="evidence-244"></a>[cmd/vibedb-shard/bootstrap_rf3.go](../cmd/vibedb-shard/bootstrap_rf3.go) — `bootstrapPreparedRF3`
+245. <a id="evidence-245"></a>[cmd/vibedb-shard/bootstrap_rf3_groups.go](../cmd/vibedb-shard/bootstrap_rf3_groups.go) — `bootstrapPreparedRF3Groups`
+246. <a id="evidence-246"></a>[internal/snapshottransfer/source_provider_test.go](../internal/snapshottransfer/source_provider_test.go) — `TestRetainedSourceProviderExportsAndObservesAfterReopen`
+247. <a id="evidence-247"></a>[internal/snapshottransfer/source_control_test.go](../internal/snapshottransfer/source_control_test.go) — `TestSourceControlClientRoutesExactReplicatedAbandonment`
+248. <a id="evidence-248"></a>[internal/snapshottransfer/abandonment_test.go](../internal/snapshottransfer/abandonment_test.go) — `TestRepositoryRecoversEveryAbandonmentNamespacePhase`
+249. <a id="evidence-249"></a>[internal/rebalanceexec/abandonment_test.go](../internal/rebalanceexec/abandonment_test.go) — `TestAbandonmentSchedulerCrashRestartAndByteGateDoNotSkipWitness`
+250. <a id="evidence-250"></a>[internal/snapshottransfer/learner_install_test.go](../internal/snapshottransfer/learner_install_test.go) — `TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary`
+251. <a id="evidence-251"></a>[internal/snapshottransfer/transfer_test.go](../internal/snapshottransfer/transfer_test.go) — `BenchmarkSnapshotServiceChunk`
+252. <a id="evidence-252"></a>[internal/splitcontroller/replicated_executor.go](../internal/splitcontroller/replicated_executor.go) — `AdmitReplicatedPlan`
+253. <a id="evidence-253"></a>[internal/splitcontroller/local_source_actions.go](../internal/splitcontroller/local_source_actions.go) — `LocalSourceActions`
+254. <a id="evidence-254"></a>[internal/splitcontroller/local_child_actions.go](../internal/splitcontroller/local_child_actions.go) — `LocalChildActions`
+255. <a id="evidence-255"></a>[internal/rangesplit/stage_image.go](../internal/rangesplit/stage_image.go) — `childStageImageAccumulator`
+256. <a id="evidence-256"></a>[internal/replicatedstate/relation_placement_accumulator.go](../internal/replicatedstate/relation_placement_accumulator.go) — `GlobalIndexPlacementProof`
+257. <a id="evidence-257"></a>[internal/splitcontroller/committed_preparation.go](../internal/splitcontroller/committed_preparation.go) — `CommittedPlanPreparer`
+258. <a id="evidence-258"></a>[internal/splitcontroller/committed_preparation_test.go](../internal/splitcontroller/committed_preparation_test.go) — `TestServingPreparationRequiresCommittedIntentAndResumesLostReceipt`
+259. <a id="evidence-259"></a>[internal/splitcontroller/local_observation_provider.go](../internal/splitcontroller/local_observation_provider.go) — `LocalPlanObservationProvider`
+260. <a id="evidence-260"></a>[internal/splitcontroller/composite_shard_executor.go](../internal/splitcontroller/composite_shard_executor.go) — `CompositeShardActionExecutor`
+261. <a id="evidence-261"></a>[internal/splitcontroller/controller_service.go](../internal/splitcontroller/controller_service.go) — `NewServingControllerService`
+262. <a id="evidence-262"></a>[internal/rebalanceexec/controller.go](../internal/rebalanceexec/controller.go) — `Controller`
+263. <a id="evidence-263"></a>[internal/rangesplit/artifact.go](../internal/rangesplit/artifact.go) — `WriteChildArtifacts`
+264. <a id="evidence-264"></a>[internal/rangesplit/tail.go](../internal/rangesplit/tail.go) — `TranslateTailEntry`
+265. <a id="evidence-265"></a>[internal/splitcontroller/retained_prune_proposer.go](../internal/splitcontroller/retained_prune_proposer.go) — `NewRF3RetainedPruneProposerForPlan`
+266. <a id="evidence-266"></a>[cmd/vibedb-gateway/split_controller_runtime.go](../cmd/vibedb-gateway/split_controller_runtime.go) — `gatewayServingSplitRuntime`
+267. <a id="evidence-267"></a>[cmd/vibedb-gateway/hot_split_factory.go](../cmd/vibedb-gateway/hot_split_factory.go) — `gatewayHotSplitFactory`
+268. <a id="evidence-268"></a>[cmd/vibedb-shard/rf3_split_serving.go](../cmd/vibedb-shard/rf3_split_serving.go) — `rf3SplitServingRuntime`
+269. <a id="evidence-269"></a>[internal/replicatedstate/relation_bundle.go](../internal/replicatedstate/relation_bundle.go) — `GlobalIndexProfile`
+270. <a id="evidence-270"></a>[internal/splitcontroller/committed_preparation_test.go](../internal/splitcontroller/committed_preparation_test.go) — `TestCommittedPreparationRejectsForgedReservedCursorBeforeEffects`
+271. <a id="evidence-271"></a>[internal/splitcontroller/committed_preparation_test.go](../internal/splitcontroller/committed_preparation_test.go) — `TestCommittedPreparationCrashAfterReceiptsBeforeCompletionRecord`
+272. <a id="evidence-272"></a>[cmd/vibedb-shard/rf3_group_child_preparer_test.go](../cmd/vibedb-shard/rf3_group_child_preparer_test.go) — `TestRF3GroupChildRegistrySelectionBindsExactGroupProfileAndPaths`
+273. <a id="evidence-273"></a>[cmd/vibedb-shard/rf3_group_child_preparer_test.go](../cmd/vibedb-shard/rf3_group_child_preparer_test.go) — `TestRF3GroupChildPreparationHasOneGlobalOperationBound`
+274. <a id="evidence-274"></a>[internal/splitcontroller/local_source_actions_test.go](../internal/splitcontroller/local_source_actions_test.go) — `TestLocalSourceActionsRecoverCaptureAndPublishImmutableArtifacts`
+275. <a id="evidence-275"></a>[internal/splitcontroller/local_source_seal_test.go](../internal/splitcontroller/local_source_seal_test.go) — `TestLocalSourceSealAndCutoverCertificateSurviveRestart`
+276. <a id="evidence-276"></a>[internal/splitcontroller/reconcile_test.go](../internal/splitcontroller/reconcile_test.go) — `TestChildActionsRequireMonotonicExactEvidence`
+277. <a id="evidence-277"></a>[internal/rangesplit/stage_image_incremental_test.go](../internal/rangesplit/stage_image_incremental_test.go) — `TestChildStageSealDoesNotScanRows`
+278. <a id="evidence-278"></a>[internal/splitcontroller/global_index_cut_test.go](../internal/splitcontroller/global_index_cut_test.go) — `TestGlobalIndexCutUsesCanonicalUniqueAndNonUniquePlacementAtBoundary`
+279. <a id="evidence-279"></a>[internal/splitcontroller/execute_test.go](../internal/splitcontroller/execute_test.go) — `TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows`
+280. <a id="evidence-280"></a>[cmd/vibedb-gateway/hot_shard_mutation_process_test.go](../cmd/vibedb-gateway/hot_shard_mutation_process_test.go) — `TestGatewayHotShardMutationProcesses`
+281. <a id="evidence-281"></a>[gateway/replicated_catalog_authority.go](../gateway/replicated_catalog_authority.go) — `ReplicatedCatalogAuthority`
+282. <a id="evidence-282"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `ReplicatedCatalogRouteSeedState`
+283. <a id="evidence-283"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `StageReplicatedCatalogRouteSeedAfter`
+284. <a id="evidence-284"></a>[gateway/schema_rollout.go](../gateway/schema_rollout.go) — `PrepareSchemaRollout`
+285. <a id="evidence-285"></a>[internal/schemainstall/installer.go](../internal/schemainstall/installer.go) — `Installer`
+286. <a id="evidence-286"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `InstallReplicatedCatalogRouteSeed`
+287. <a id="evidence-287"></a>[gateway/replicated_catalog_route_seed.go](../gateway/replicated_catalog_route_seed.go) — `CompleteQuiescedHandoff`
+288. <a id="evidence-288"></a>[gateway/schema_rollout_controller.go](../gateway/schema_rollout_controller.go) — `NewSchemaRolloutController`
+289. <a id="evidence-289"></a>[internal/schemainstall/control.go](../internal/schemainstall/control.go) — `NewControlService`
+290. <a id="evidence-290"></a>[cmd/vibedb-gateway/schema_rollout_admin.go](../cmd/vibedb-gateway/schema_rollout_admin.go) — `executeGatewaySchemaRollout`
+291. <a id="evidence-291"></a>[cmd/vibedb-shard/schema_startup_recovery.go](../cmd/vibedb-shard/schema_startup_recovery.go) — `openRF3RetainedApply`
+292. <a id="evidence-292"></a>[sql/driver/schema_catalog_source_recovery.go](../sql/driver/schema_catalog_source_recovery.go) — `OpenReplicatedShardStoreWithSchemaSourceTransition`
+293. <a id="evidence-293"></a>[cmd/vibedb-gateway/serve.go](../cmd/vibedb-gateway/serve.go) — `recoverReplicatedCatalogRouteSeedStartup`
+294. <a id="evidence-294"></a>[cmd/vibedb-gateway/main.go](../cmd/vibedb-gateway/main.go) — `run`
+295. <a id="evidence-295"></a>[internal/replicatedstate/schema_source_recovery_test.go](../internal/replicatedstate/schema_source_recovery_test.go) — `TestSchemaSourceRecoveryAuthenticatesCommittedCheckpoint`
+296. <a id="evidence-296"></a>[internal/replicatedstate/schema_source_recovery_test.go](../internal/replicatedstate/schema_source_recovery_test.go) — `TestSchemaRetiredSourceRejectsServingOperations`
+297. <a id="evidence-297"></a>[cmd/vibedb-shard/schema_startup_recovery_test.go](../cmd/vibedb-shard/schema_startup_recovery_test.go) — `TestRF3SchemaStartupSettlementFailsClosedAtEveryBoundary`
+298. <a id="evidence-298"></a>[cmd/vibedb-shard/schema_startup_recovery_linux_test.go](../cmd/vibedb-shard/schema_startup_recovery_linux_test.go) — `TestRF3SchemaStartupSettlesCommittedSourceBeforeRuntimeAdoption`
+299. <a id="evidence-299"></a>[sql/driver/replicated_manifest_test.go](../sql/driver/replicated_manifest_test.go) — `TestInitialReplicatedRelationManifestMatchesServingIdentity`
+300. <a id="evidence-300"></a>[internal/replicatedstate/initial_manifest_test.go](../internal/replicatedstate/initial_manifest_test.go) — `TestInitialJSONRelationManifestMatchesPreparedCollection`
+301. <a id="evidence-301"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedTrackerPersistsSameRouteBeforeHolderPublish`
+302. <a id="evidence-302"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedTrackerStagesAndSignalsBeforeChangedHolder`
+303. <a id="evidence-303"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedLockedCheckRejectsPreauthorizedWaiter`
+304. <a id="evidence-304"></a>[cmd/vibedb-gateway/catalog_route_seed_test.go](../cmd/vibedb-gateway/catalog_route_seed_test.go) — `TestRecoverReplicatedCatalogRouteSeedStartupSettlesExactOldBinding`
+305. <a id="evidence-305"></a>[gateway/schema_rollout_test.go](../gateway/schema_rollout_test.go) — `TestSchemaRolloutPrepareActivateExactCatalog`
+306. <a id="evidence-306"></a>[gateway/schema_rollout_process_test.go](../gateway/schema_rollout_process_test.go) — `TestSchemaRolloutExternalProcessLeaderLossAndMixedGenerationRecovery`
+307. <a id="evidence-307"></a>[internal/schemainstall/installer_test.go](../internal/schemainstall/installer_test.go) — `TestInstallerCrashReopenAuthorizationActivationAndDrain`
+308. <a id="evidence-308"></a>[cmd/vibedb-gateway/schema_rollout_admin_test.go](../cmd/vibedb-gateway/schema_rollout_admin_test.go) — `TestGatewaySchemaRolloutManifestRequiresCanonicalVibeJSON`
+309. <a id="evidence-309"></a>[internal/raftservice/controlplane_catalog_rf3_test.go](../internal/raftservice/controlplane_catalog_rf3_test.go) — `TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart`
+310. <a id="evidence-310"></a>[internal/topologyscheduler/admission.go](../internal/topologyscheduler/admission.go) — `SelectSplits`
+311. <a id="evidence-311"></a>[internal/topologyscheduler/replica_move.go](../internal/topologyscheduler/replica_move.go) — `SelectReplicaMoves`
+312. <a id="evidence-312"></a>[internal/hotshard/collector.go](../internal/hotshard/collector.go) — `Collector`
+313. <a id="evidence-313"></a>[internal/hotshard/operation_sink.go](../internal/hotshard/operation_sink.go) — `OperationSink`
+314. <a id="evidence-314"></a>[cmd/vibedb-gateway/hot_shard_runtime.go](../cmd/vibedb-gateway/hot_shard_runtime.go) — `gatewayHotShardRuntime`
+315. <a id="evidence-315"></a>[cmd/vibedb-gateway/hot_shard_runtime.go](../cmd/vibedb-gateway/hot_shard_runtime.go) — `runPressurePass`
+316. <a id="evidence-316"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerQualifiesHotShardAndRetriesByteIdenticalAdmission`
+317. <a id="evidence-317"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerClockSkewCannotAdvanceReplicatedEvidence`
+318. <a id="evidence-318"></a>[cmd/vibedb-gateway/hot_shard_runtime_test.go](../cmd/vibedb-gateway/hot_shard_runtime_test.go) — `TestGatewayHotShardPressurePassCreatesExactEnrolledReplicaMove`
+319. <a id="evidence-319"></a>[cmd/vibedb-gateway/hot_shard_shipped_e2e_test.go](../cmd/vibedb-gateway/hot_shard_shipped_e2e_test.go) — `TestGatewayHotShardForegroundP99Overhead`
 
 </details>
 
