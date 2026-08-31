@@ -46,6 +46,12 @@ func (s *postgresSession) prepareWrite(
 	if parsed.Kind != sqlast.KindInsert && parsed.Kind != sqlast.KindUpdate && parsed.Kind != sqlast.KindDelete || parsed.ReturnsRows() {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL supports INSERT, UPDATE and DELETE without RETURNING")
 	}
+	if err := rejectComputedUpdateAssignments(
+		text, parsed,
+		"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for RF3 PostgreSQL writes",
+	); err != nil {
+		return nil, err
+	}
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
 	}

@@ -80,8 +80,9 @@ type PreparedPlan struct {
 	// column index that supplies it; it is set only for a flat single-document
 	// INSERT.
 	writeKeyColumns []int
-	// writeGlobalIndexes is populated only for a table with READY global index
-	// incarnations. Local and non-ready indexes add no prepared-plan footprint.
+	// writeGlobalIndexes contains every maintained global-index incarnation:
+	// Building, CatchingUp, Ready, and Draining. Local indexes add no
+	// prepared-plan footprint.
 	writeGlobalIndexes []preparedGlobalIndex
 	// readGlobalIndexes contains finite-domain routing programs for READY global
 	// indexes on the driving table. Bind selects at most one complete key domain;
@@ -225,7 +226,7 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 		// A mutating statement is planned for the distributed write path: it is
 		// admitted only when its shape is provably single-shard, refused before
 		// any dispatch otherwise.
-		if err := s.prepareWrite(plan); err != nil {
+		if err := s.prepareWrite(plan, sqlText); err != nil {
 			return nil, err
 		}
 		if cacheable {

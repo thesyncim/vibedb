@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func globalIndexCatalog(t testing.TB) (distribution.ClusterConfig, map[distribution.EndpointID]string) {
@@ -722,6 +723,48 @@ func TestGlobalIndexBuildAndDrainLifecyclesStayWriteMaintained(t *testing.T) {
 		if err != nil || len(bound.globalIndexes) != 1 {
 			t.Fatalf("%v maintained mutations = %d, %v", lifecycle, len(bound.globalIndexes), err)
 		}
+	}
+}
+
+func TestComputedUpdateExpressionGlobalIndexLanesRejectAtPrepare(t *testing.T) {
+	const source = `UPDATE messages SET email = email || '.invalid' WHERE tenant_id = ?`
+	wantPosition := strings.Index(source, `||`)
+	config, endpoints := globalIndexCatalog(t)
+
+	for _, test := range []struct {
+		name      string
+		lifecycle IndexLifecycle
+	}{
+		{name: "building", lifecycle: IndexBuilding},
+		{name: "catching_up", lifecycle: IndexCatchingUp},
+		{name: "ready", lifecycle: IndexReady},
+		{name: "draining", lifecycle: IndexDraining},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			descriptor := testGlobalIndexDescriptor()
+			descriptor.Lifecycle = test.lifecycle
+			snapshot, err := NewSnapshotWithIndexes(
+				config, endpoints, uint64(test.lifecycle), []IndexDescriptor{descriptor},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := snapshot.Prepare(context.Background(), source)
+			var unsupported *sqlast.FeatureNotSupportedError
+			gotPosition := -1
+			if errors.As(err, &unsupported) {
+				gotPosition = unsupported.Pos
+			}
+			if unsupported == nil || gotPosition != wantPosition {
+				t.Fatalf(
+					"Prepare error = %T %v at %d, want positioned FeatureNotSupported at %d",
+					err, err, gotPosition, wantPosition,
+				)
+			}
+			if prepared != nil {
+				t.Fatal("global-index expression returned a dispatchable plan")
+			}
+		})
 	}
 }
 

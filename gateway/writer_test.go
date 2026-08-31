@@ -147,6 +147,25 @@ func TestBindUpdateDelete(t *testing.T) {
 	}
 }
 
+func TestComputedUpdateExpressionPlainWriteRemainsShardLocal(t *testing.T) {
+	const source = `UPDATE messages SET n = n + 1 WHERE tenant_id = ?`
+
+	prepared, err := testSnapshot(t, 1).Prepare(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(prepared.writeGlobalIndexes) != 0 {
+		t.Fatalf("plain write retained %d global-index programs", len(prepared.writeGlobalIndexes))
+	}
+	bound, err := prepared.BindWrite([]any{[]byte("tenant-7")})
+	if err != nil {
+		t.Fatalf("BindWrite: %v", err)
+	}
+	if len(bound.updateAssignments) != 1 || bound.updateAssignments[0].Expr == nil {
+		t.Fatalf("computed assignments = %+v, want one shard-local expression", bound.updateAssignments)
+	}
+}
+
 // TestBindWriteRejectsNonMutationAndDDL proves the write planner refuses
 // statement kinds with no single-shard distributed form (DDL) and that a
 // parameter arity mismatch is reported before any routing.

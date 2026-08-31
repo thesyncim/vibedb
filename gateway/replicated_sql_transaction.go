@@ -151,12 +151,22 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 		if prepared.statement.Kind == sqlast.KindSelect {
 			return nil, false, ErrExecRequiresMutation
 		}
+		entry, replicated := snapshot.replicatedTableAtBytes(
+			byteview.Bytes(prepared.table),
+		)
+		if replicated {
+			if err := rejectComputedUpdateAssignments(
+				queries[index].SQL, &prepared.statement,
+				"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for RF3 writes",
+			); err != nil {
+				return nil, true, err
+			}
+		}
 		bound, err := prepared.BindWrite(args)
 		if err != nil {
 			return nil, false, err
 		}
 		statements[index] = replicatedSQLBoundStatement{prepared: prepared, bound: bound}
-		entry, replicated := snapshot.replicatedTableAtBytes(byteview.Bytes(bound.table))
 		if !replicated {
 			continue
 		}
