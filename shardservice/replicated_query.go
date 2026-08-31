@@ -19,7 +19,22 @@ const (
 	MaxReplicatedSQLResultBytes  = 4 << 20
 	replicatedSQLWorkingBytes    = 8 << 20
 	replicatedSQLMaxRows         = 100000
+
+	// A fenced SQL read can retain the query result, its owned wire cells, the
+	// inner SQL frame, and the outer RF3 frame while crossing its execution and
+	// write boundaries. Memory, intermediate, and aggregate execution each have
+	// their own independent allowance. Keep this conservative per-query charge
+	// unchanged when tuning process-wide concurrency.
+	replicatedSQLResultReservationCopies   = int64(4)
+	replicatedSQLWorkingReservationBudgets = int64(3)
+	replicatedSQLMaximumReservationBytes   = replicatedSQLResultReservationCopies*MaxReplicatedSQLResultBytes +
+		replicatedSQLWorkingReservationBudgets*replicatedSQLWorkingBytes
 )
+
+func replicatedSQLReservationBytes(maximum uint32) int64 {
+	return replicatedSQLResultReservationCopies*int64(maximum) +
+		replicatedSQLWorkingReservationBudgets*replicatedSQLWorkingBytes
+}
 
 type replicatedSQLLease struct {
 	budget *replicatedFrameByteBudget
@@ -56,7 +71,7 @@ func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, requ
 	if !ok {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
-	charge := int64(4*request.MaxValueBytes) + 3*replicatedSQLWorkingBytes
+	charge := replicatedSQLReservationBytes(request.MaxValueBytes)
 	if !server.frames.reserve(charge) {
 		return refuse(ReplicatedRefusalAdmissionBound)
 	}

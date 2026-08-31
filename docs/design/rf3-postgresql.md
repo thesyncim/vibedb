@@ -153,6 +153,10 @@ and 4 MiB result ceilings; each shard also bounds working/intermediate/aggregate
 memory and charges the shared native frame admission budget. PostgreSQL row
 materialization has an additional retained-memory preflight. These finite
 bounds are not a claim of allocation-free or zero-cost distributed execution.
+The shipped shard-process budget is 112 MiB across all local RF3 groups. It
+admits two maximum-bound 40 MiB SQL executions and their maximum request frames
+while retaining nearly 30 MiB for other native frames; a third maximum-bound
+SQL execution receives the typed admission refusal.
 
 Writes use a serialized issuer lane per table (at most 64) and checksummed,
 fsynced outboxes beside the catalog-session journal. The original `.pg-writes`

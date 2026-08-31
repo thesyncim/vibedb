@@ -510,6 +510,13 @@ standard error. The commands do not expose a stable Prometheus or HTTP metrics
 endpoint. Collect CPU, RSS, disk allocation, device writes, and network metrics
 through the host or test harness.
 
+`serve-rf3` fixes the process-wide native frame budget at 112 MiB. The budget is
+shared by every local RF3 group, not multiplied per group. A general RF3 SQL
+query conservatively reserves at most 40 MiB, so two maximum-bound queries can
+execute concurrently while a third is refused before execution. This is a
+bounded admission default, not a claim that each admitted query allocates its
+full reservation or that throughput doubles under storage or CPU contention.
+
 Current operating gaps include:
 
 - A general public operator split-intake CLI. Current intake is the bounded

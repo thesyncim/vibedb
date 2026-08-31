@@ -110,6 +110,16 @@ const (
 	AbsoluteMaxReplicatedConnections        = 65536
 	AbsoluteMaxReplicatedInFlightFrameBytes = int64(1 << 30)
 	AbsoluteMaxReplicatedRequestTimeout     = 5 * time.Minute
+
+	defaultReplicatedSQLConcurrency      = int64(2)
+	defaultReplicatedNativeFrameHeadroom = int64(32 << 20)
+	// DefaultReplicatedInFlightFrameBytes admits two maximum 40 MiB fenced SQL
+	// reservations plus both maximum 1 MiB SQL request bodies. The remaining
+	// nearly 30 MiB preserves room for ordinary native traffic, while the bound
+	// remains below the 120 MiB needed by a third SQL reservation. It is a
+	// process-wide bound shared by every RF3 group hosted by one shard process.
+	DefaultReplicatedInFlightFrameBytes = defaultReplicatedSQLConcurrency*replicatedSQLMaximumReservationBytes +
+		defaultReplicatedNativeFrameHeadroom
 )
 
 type replicatedFrameByteBudget struct {
