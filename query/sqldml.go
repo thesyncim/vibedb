@@ -157,12 +157,14 @@ type DMLStatement struct {
 	// never the RETURNING projection: source reads the statement snapshot and
 	// RETURNING consumes only the admitted write set.
 	source *Statement
-	// updateExpressions is the cold sidecar for computed UPDATE SET right-hand
-	// sides. Direct operand assignments retain DMLStatement's established size
-	// and fast path. One projection over one old document makes all computed
-	// right-hand sides see the same pre-update row, including swaps such as
-	// SET a = b, b = a.
-	updateExpressions *updateAssignmentProjection
+	// assignmentExpressions is the one cold sidecar for computed UPDATE or
+	// INSERT ... ON CONFLICT DO UPDATE right-hand sides. A DML statement can be
+	// only one kind, so sharing the slot keeps direct mutations at one pointer
+	// rather than widening DMLStatement for two mutually exclusive projections.
+	// Ordinary UPDATE feeds it one old document. The conflict form feeds one
+	// internal JSON array whose element zero is the pre-existing row and whose
+	// element one is the effective EXCLUDED candidate.
+	assignmentExpressions *assignmentProjection
 	// insertDocumentPositions is allocated only for INSERT query sources that
 	// contain placeholders on a complete-document output lineage. Each entry is
 	// the authored byte position plus one; zero retains ordinary scalar meaning
@@ -204,15 +206,17 @@ type DMLStatement struct {
 	scan Filter
 }
 
-// updateAssignmentProjection owns the synthetic SELECT shell and retained
-// one-document source for computed UPDATE assignments. Authored ScalarExpr
-// nodes remain owned by the parser tree; this sidecar exists only on the cold
-// expression-bearing path.
-type updateAssignmentProjection struct {
+// assignmentProjection owns one synthetic SELECT shell and retained source for
+// computed mutation assignments. Authored UPDATE ScalarExpr nodes may be used
+// directly. ON CONFLICT nodes are deep-cloned and their virtual source zero
+// (current) and source one (EXCLUDED) paths are rebased beneath the matching
+// element of one internal JSON array; the parser-owned tree remains unchanged.
+type assignmentProjection struct {
 	statement *Statement
 	tree      sqlast.SelectStmt
 	columns   []sqlast.ResultColumn
 	source    store.Segment
+	envelope  []byte
 	firstPos  int
 }
 
@@ -257,8 +261,8 @@ func PrepareParsedDML(
 // PrepareParsedDMLWithParameterTypes lowers an already-parsed non-SELECT
 // statement while treating each non-unspecified entry as an analysis-time input
 // type for the corresponding placeholder. Only the SELECT-owned portions of a
-// mutation consume the hints: INSERT query sources, UPDATE/DELETE filters, and
-// computed UPDATE assignments.
+// mutation consume the hints: INSERT query sources, UPDATE/DELETE filters,
+// computed UPDATE assignments, and computed ON CONFLICT assignments.
 // The slice is borrowed only for this call. Supplying nil is exactly equivalent
 // to PrepareParsedDML and preserves the ordinary allocation profile.
 func PrepareParsedDMLWithParameterTypes(
@@ -320,6 +324,10 @@ func PrepareParsedDMLWithParameterTypes(
 			d.source.markInsertDocumentOutput(
 				0, 0, d.insertDocumentPositions, 0,
 			)
+		}
+		if err := d.prepareConflictUpdateExpressions(src, parameterTypes); err != nil {
+			d.Release()
+			return nil, err
 		}
 	case sqlast.KindUpdate:
 		d.kind = DMLUpdate
@@ -449,7 +457,7 @@ func (d *DMLStatement) prepareUpdateExpressions(
 			"query: computed UPDATE assignments require one target relation",
 		)
 	}
-	projection := &updateAssignmentProjection{
+	projection := &assignmentProjection{
 		columns:  make([]sqlast.ResultColumn, 0, count),
 		firstPos: -1,
 	}
@@ -481,8 +489,211 @@ func (d *DMLStatement) prepareUpdateExpressions(
 		return err
 	}
 	projection.statement = prepared
-	d.updateExpressions = projection
+	d.assignmentExpressions = projection
 	return nil
+}
+
+// prepareConflictUpdateExpressions compiles every computed ON CONFLICT SET
+// right-hand side as one projection over a virtual pair of rows. Parser-owned
+// paths use Source 0 for the current row and Source 1 for EXCLUDED. The query
+// executor consumes one physical source, so the cloned projection rebases
+// those paths beneath elements zero and one of an internal JSON array.
+func (d *DMLStatement) prepareConflictUpdateExpressions(
+	src string,
+	parameterTypes []ParameterType,
+) error {
+	if d == nil || d.tree == nil || d.tree.Kind != sqlast.KindInsert ||
+		d.tree.Insert == nil || d.tree.Insert.OnConflictUpdate == nil {
+		return nil
+	}
+	assignments := d.tree.Insert.OnConflictUpdate.Assignments
+	count := 0
+	for i := range assignments {
+		switch {
+		case assignments[i].Expr != nil &&
+			assignments[i].Value.Kind != sqlast.OperandExpression:
+			return fmt.Errorf(
+				"query: ON CONFLICT assignment %q carries an expression without the expression operand marker",
+				assignments[i].Column,
+			)
+		case assignments[i].Expr == nil &&
+			assignments[i].Value.Kind == sqlast.OperandExpression:
+			return fmt.Errorf(
+				"query: ON CONFLICT assignment %q has an expression operand marker without an expression",
+				assignments[i].Column,
+			)
+		case assignments[i].Expr != nil:
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+
+	projection := &assignmentProjection{
+		columns:  make([]sqlast.ResultColumn, 0, count),
+		firstPos: -1,
+	}
+	// The private array envelope adds exactly one container above each input.
+	// Preserve the public per-document depth boundary instead of rejecting a
+	// row at vibejson's default limit solely because of that implementation
+	// detail.
+	projection.source.Options.MaxDepth = vibejson.DefaultMaxDepth + 1
+	for i := range assignments {
+		if assignments[i].Expr == nil {
+			continue
+		}
+		if projection.firstPos < 0 {
+			projection.firstPos = assignments[i].Expr.Pos
+		}
+		expression, err := cloneConflictScalarExpression(assignments[i].Expr)
+		if err != nil {
+			return err
+		}
+		projection.columns = append(
+			projection.columns,
+			sqlast.ResultColumn{
+				Scalar: expression,
+				Alias:  assignments[i].Column,
+				Pos:    assignments[i].Expr.Pos,
+			},
+		)
+	}
+	projection.tree = sqlast.SelectStmt{
+		Columns: projection.columns,
+		From: []sqlast.TableRef{{
+			Name:     d.tree.Insert.Table,
+			Alias:    "__vibedb_conflict_input",
+			HasAlias: true,
+			Pos:      d.tree.Insert.Pos,
+		}},
+		Params: d.params,
+	}
+	prepared, err := prepareTreeWithParameterTypes(
+		src, &projection.tree, parameterTypes,
+	)
+	if err != nil {
+		return err
+	}
+	projection.statement = prepared
+	d.assignmentExpressions = projection
+	return nil
+}
+
+// cloneConflictScalarExpression owns the complete executable tree because the
+// prepared projection must retain rebased paths for every later bind. Mutating
+// the parser tree temporarily is not sound: Statement keeps the AST and may
+// lower it again when placeholders are rebound.
+func cloneConflictScalarExpression(
+	expression *sqlast.ScalarExpr,
+) (*sqlast.ScalarExpr, error) {
+	if expression == nil {
+		return nil, nil
+	}
+	clone := *expression
+	var err error
+	clone.Path, err = cloneConflictPath(expression.Path)
+	if err != nil {
+		return nil, err
+	}
+	clone.Left, err = cloneConflictScalarExpression(expression.Left)
+	if err != nil {
+		return nil, err
+	}
+	clone.Right, err = cloneConflictScalarExpression(expression.Right)
+	if err != nil {
+		return nil, err
+	}
+	clone.Else, err = cloneConflictScalarExpression(expression.Else)
+	if err != nil {
+		return nil, err
+	}
+	if len(expression.Whens) != 0 {
+		clone.Whens = make([]sqlast.ScalarWhen, len(expression.Whens))
+		for i := range expression.Whens {
+			clone.Whens[i] = expression.Whens[i]
+			clone.Whens[i].Predicate, err = cloneConflictPredicate(
+				expression.Whens[i].Predicate,
+			)
+			if err != nil {
+				return nil, err
+			}
+			clone.Whens[i].Match, err = cloneConflictScalarExpression(
+				expression.Whens[i].Match,
+			)
+			if err != nil {
+				return nil, err
+			}
+			clone.Whens[i].Result, err = cloneConflictScalarExpression(
+				expression.Whens[i].Result,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &clone, nil
+}
+
+func cloneConflictPredicate(expression *sqlast.Expr) (*sqlast.Expr, error) {
+	if expression == nil {
+		return nil, nil
+	}
+	if expression.Subquery != nil {
+		return nil, fmt.Errorf(
+			"query: ON CONFLICT assignment expressions cannot contain a subquery",
+		)
+	}
+	clone := *expression
+	if len(expression.List) != 0 {
+		clone.List = slices.Clone(expression.List)
+	}
+	var err error
+	clone.Path, err = cloneConflictPath(expression.Path)
+	if err != nil {
+		return nil, err
+	}
+	clone.RightPath, err = cloneConflictPath(expression.RightPath)
+	if err != nil {
+		return nil, err
+	}
+	clone.ScalarLeft, err = cloneConflictScalarExpression(expression.ScalarLeft)
+	if err != nil {
+		return nil, err
+	}
+	clone.ScalarRight, err = cloneConflictScalarExpression(expression.ScalarRight)
+	if err != nil {
+		return nil, err
+	}
+	if len(expression.Kids) != 0 {
+		clone.Kids = make([]*sqlast.Expr, len(expression.Kids))
+		for i := range expression.Kids {
+			clone.Kids[i], err = cloneConflictPredicate(expression.Kids[i])
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &clone, nil
+}
+
+func cloneConflictPath(path *sqlast.PathExpr) (*sqlast.PathExpr, error) {
+	if path == nil {
+		return nil, nil
+	}
+	if path.Source < 0 || path.Source > 1 {
+		return nil, fmt.Errorf(
+			"query: ON CONFLICT assignment path at byte %d names virtual source %d, want current row (0) or EXCLUDED (1)",
+			path.Pos, path.Source,
+		)
+	}
+	clone := *path
+	clone.Source = 0
+	clone.MergedUsing = 0
+	clone.Segments = make([]sqlast.Segment, len(path.Segments)+1)
+	clone.Segments[0] = sqlast.Segment{Index: path.Source, IsIndex: true}
+	copy(clone.Segments[1:], path.Segments)
+	return &clone, nil
 }
 
 // Kind reports what the statement does.
@@ -529,11 +740,11 @@ func (d *DMLStatement) prepareParameterTypes() error {
 	if d == nil || d.params == 0 {
 		return nil
 	}
-	var updateExpressions *Statement
-	if d.updateExpressions != nil {
-		updateExpressions = d.updateExpressions.statement
+	var assignmentExpressions *Statement
+	if d.assignmentExpressions != nil {
+		assignmentExpressions = d.assignmentExpressions.statement
 	}
-	children := [3]*Statement{d.source, d.filter, updateExpressions}
+	children := [3]*Statement{d.source, d.filter, assignmentExpressions}
 	for _, child := range children {
 		if child == nil || len(child.paramTypes) == 0 {
 			continue
@@ -680,26 +891,26 @@ func (d *DMLStatement) ScansEveryDocument() bool {
 // SET right-hand side. Direct literal, placeholder, and NULL assignments do
 // not require this evaluator.
 func (d *DMLStatement) HasUpdateExpressions() bool {
-	return d != nil && d.kind == DMLUpdate && d.updateExpressions != nil
+	return d != nil && d.kind == DMLUpdate && d.assignmentExpressions != nil
 }
 
 // UpdateExpressionCount reports how many computed assignments are emitted by
 // EvaluateUpdateExpressions. Direct assignments are not included.
 func (d *DMLStatement) UpdateExpressionCount() int {
-	if d == nil || d.updateExpressions == nil {
+	if d == nil || d.kind != DMLUpdate || d.assignmentExpressions == nil {
 		return 0
 	}
-	return len(d.updateExpressions.columns)
+	return len(d.assignmentExpressions.columns)
 }
 
 // FirstUpdateExpressionPosition returns the authored byte position of the first
 // computed SET right-hand side, or -1 when UPDATE has none. Distributed lanes
 // use it for positioned fail-closed diagnostics.
 func (d *DMLStatement) FirstUpdateExpressionPosition() int {
-	if d == nil || d.updateExpressions == nil {
+	if d == nil || d.kind != DMLUpdate || d.assignmentExpressions == nil {
 		return -1
 	}
-	return d.updateExpressions.firstPos
+	return d.assignmentExpressions.firstPos
 }
 
 // ValidateUpdateExpressionBindings binds the computed assignment projection
@@ -710,10 +921,57 @@ func (d *DMLStatement) ValidateUpdateExpressionBindings(args []any) error {
 	if d == nil || d.kind != DMLUpdate {
 		return fmt.Errorf("query: computed UPDATE assignments require an UPDATE statement")
 	}
-	if d.updateExpressions == nil {
+	if d.assignmentExpressions == nil {
 		return nil
 	}
-	return d.updateExpressions.statement.bind(args)
+	return d.assignmentExpressions.statement.bind(args)
+}
+
+// HasConflictUpdateExpressions reports whether INSERT ... ON CONFLICT DO
+// UPDATE carries at least one computed SET right-hand side. Direct literals,
+// placeholders, NULL, and bare EXCLUDED.column assignments keep the established
+// direct materialization path.
+func (d *DMLStatement) HasConflictUpdateExpressions() bool {
+	return d != nil && d.kind == DMLInsert &&
+		d.assignmentExpressions != nil
+}
+
+// ConflictUpdateExpressionCount reports how many computed conflict
+// assignments are emitted by EvaluateConflictUpdateExpressions. Direct
+// assignments are not included.
+func (d *DMLStatement) ConflictUpdateExpressionCount() int {
+	if d == nil || d.kind != DMLInsert || d.assignmentExpressions == nil {
+		return 0
+	}
+	return len(d.assignmentExpressions.columns)
+}
+
+// FirstConflictUpdateExpressionPosition returns the authored byte position of
+// the first computed conflict SET right-hand side, or -1 when there is none.
+// Distributed lanes use it for positioned fail-closed diagnostics.
+func (d *DMLStatement) FirstConflictUpdateExpressionPosition() int {
+	if d == nil || d.kind != DMLInsert || d.assignmentExpressions == nil {
+		return -1
+	}
+	return d.assignmentExpressions.firstPos
+}
+
+// ValidateConflictUpdateExpressionBindings binds the conflict-assignment
+// projection without reading either row. Writers call it before probing for a
+// collision so parameter failures do not depend on whether a candidate
+// happens to take the conflict branch.
+func (d *DMLStatement) ValidateConflictUpdateExpressionBindings(
+	args []any,
+) error {
+	if d == nil || d.kind != DMLInsert {
+		return fmt.Errorf(
+			"query: computed ON CONFLICT assignments require an INSERT statement",
+		)
+	}
+	if d.assignmentExpressions == nil {
+		return nil
+	}
+	return d.assignmentExpressions.statement.bind(args)
 }
 
 // EvaluateUpdateExpressions runs every computed SET right-hand side over one
@@ -727,7 +985,7 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 	args []any,
 	maxDocumentBytes int,
 ) (Cursor, error) {
-	if d == nil || d.kind != DMLUpdate || d.updateExpressions == nil {
+	if d == nil || d.kind != DMLUpdate || d.assignmentExpressions == nil {
 		return Cursor{}, fmt.Errorf("query: UPDATE has no computed assignments")
 	}
 	if e == nil {
@@ -746,7 +1004,7 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 	if err := cancellationError(e.Options.Cancel); err != nil {
 		return Cursor{}, err
 	}
-	projection := d.updateExpressions
+	projection := d.assignmentExpressions
 	projection.source.Reset()
 	if _, err := projection.source.Append(document); err != nil {
 		return Cursor{}, fmt.Errorf(
@@ -756,6 +1014,113 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 	if err := cancellationError(e.Options.Cancel); err != nil {
 		return Cursor{}, err
 	}
+	return evaluateAssignmentProjection(e, projection, args, "UPDATE")
+}
+
+// EvaluateConflictUpdateExpressions runs every computed conflict SET
+// right-hand side over one current document and its effective EXCLUDED
+// candidate. Both namespaces are projected together, so every assignment sees
+// the same two pre-update rows and cannot observe an earlier assignment.
+//
+// The returned cursor and its cells borrow e and remain valid only until e is
+// used again. Callers must consume exactly one row before the next evaluation.
+// maxDocumentBytes bounds each input before the retained envelope is grown.
+func (d *DMLStatement) EvaluateConflictUpdateExpressions(
+	e *Exec,
+	current []byte,
+	excluded []byte,
+	args []any,
+	maxDocumentBytes int,
+) (Cursor, error) {
+	if d == nil || d.kind != DMLInsert ||
+		d.assignmentExpressions == nil {
+		return Cursor{}, fmt.Errorf(
+			"query: INSERT has no computed ON CONFLICT assignments",
+		)
+	}
+	if e == nil {
+		return Cursor{}, fmt.Errorf(
+			"query: computed ON CONFLICT assignments require a non-nil Exec",
+		)
+	}
+	// A prior conflict projection may still lend cells backed by source. End
+	// that lifetime before either Reset or envelope reuse can invalidate it.
+	clearExecBorrowedViews(e)
+	e.Stats = ExecStats{}
+	if maxDocumentBytes <= 0 || len(current) > maxDocumentBytes {
+		return Cursor{}, fmt.Errorf(
+			"query: ON CONFLICT expression current document has %d bytes, limit %d",
+			len(current), maxDocumentBytes,
+		)
+	}
+	if len(excluded) > maxDocumentBytes {
+		return Cursor{}, fmt.Errorf(
+			"query: ON CONFLICT expression EXCLUDED document has %d bytes, limit %d",
+			len(excluded), maxDocumentBytes,
+		)
+	}
+	if err := cancellationError(e.Options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	// Validate the two namespaces independently before concatenation. Validating
+	// only the envelope is insufficient: current="1,2" and excluded="3" form
+	// the valid array [1,2,3] but would silently bind EXCLUDED to the injected
+	// second current value.
+	if err := vibejson.Validate(current); err != nil {
+		return Cursor{}, fmt.Errorf(
+			"query: invalid ON CONFLICT current document: %w", err,
+		)
+	}
+	if err := vibejson.Validate(excluded); err != nil {
+		return Cursor{}, fmt.Errorf(
+			"query: invalid ON CONFLICT EXCLUDED document: %w", err,
+		)
+	}
+	if err := cancellationError(e.Options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	const envelopeSyntaxBytes = 3 // '[', ',', ']'
+	maxInt := int(^uint(0) >> 1)
+	if len(current) > maxInt-envelopeSyntaxBytes ||
+		len(excluded) > maxInt-envelopeSyntaxBytes-len(current) {
+		return Cursor{}, fmt.Errorf(
+			"query: ON CONFLICT expression source envelope exceeds the address space",
+		)
+	}
+	needed := len(current) + len(excluded) + envelopeSyntaxBytes
+	projection := d.assignmentExpressions
+	if cap(projection.envelope) < needed {
+		projection.envelope = make([]byte, 0, needed)
+	} else {
+		projection.envelope = projection.envelope[:0]
+	}
+	projection.envelope = append(projection.envelope, '[')
+	projection.envelope = append(projection.envelope, current...)
+	projection.envelope = append(projection.envelope, ',')
+	projection.envelope = append(projection.envelope, excluded...)
+	projection.envelope = append(projection.envelope, ']')
+	if err := cancellationError(e.Options.Cancel); err != nil {
+		projection.envelope = projection.envelope[:0]
+		return Cursor{}, err
+	}
+	projection.source.Reset()
+	if _, err := projection.source.Append(projection.envelope); err != nil {
+		return Cursor{}, fmt.Errorf(
+			"query: append ON CONFLICT expression source envelope: %w", err,
+		)
+	}
+	if err := cancellationError(e.Options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	return evaluateAssignmentProjection(e, projection, args, "ON CONFLICT")
+}
+
+func evaluateAssignmentProjection(
+	e *Exec,
+	projection *assignmentProjection,
+	args []any,
+	clause string,
+) (Cursor, error) {
 	cursor, _, err := projection.statement.RunIntermediateInto(
 		e, FromSegment(&projection.source), args,
 	)
@@ -765,9 +1130,9 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 	if e.Result.RowCount != 1 || len(e.Result.Columns) != len(projection.columns) {
 		clearExecBorrowedViews(e)
 		return Cursor{}, fmt.Errorf(
-			"query: UPDATE assignment projection produced %d row(s) and %d column(s), want 1 row and %d columns: %w",
-			e.Result.RowCount, len(e.Result.Columns), len(projection.columns),
-			ErrScalarResultShape,
+			"query: %s assignment projection produced %d row(s) and %d column(s), want 1 row and %d columns: %w",
+			clause, e.Result.RowCount, len(e.Result.Columns),
+			len(projection.columns), ErrScalarResultShape,
 		)
 	}
 	for i := range e.Result.Columns {
@@ -789,8 +1154,9 @@ func (d *DMLStatement) Release() {
 	}
 	d.filter.Release()
 	d.source.Release()
-	if d.updateExpressions != nil {
-		d.updateExpressions.statement.Release()
+	if d.assignmentExpressions != nil {
+		d.assignmentExpressions.statement.Release()
+		*d.assignmentExpressions = assignmentProjection{}
 	}
 	d.scan.Release()
 	*d = DMLStatement{}
