@@ -41,6 +41,8 @@ func FuzzParseStatement(f *testing.F) {
 		`UPDATE t SET "$doc" = ? WHERE a = 1 AND NOT b IS NULL`,
 		`UPDATE t SET "$doc" = ? WHERE "$key" = ?`,
 		`UPDATE t SET a.b = 1`,
+		`UPDATE t SET n = n + ? * 2, label = label || '!' WHERE id = ?`,
+		`UPDATE t SET a = CASE WHEN ready = TRUE THEN b ELSE a END`,
 		`DELETE FROM t`,
 		`DELETE FROM t WHERE "$key" IN ('a', 'b', ?)`,
 		`DELETE FROM t WHERE a @> {"k": [1, null]}`,
@@ -247,6 +249,9 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 			seenTargets := make(map[string]struct{}, len(update.Assignments))
 			for i := range update.Assignments {
 				assignment := &update.Assignments[i]
+				if assignment.Expr != nil || assignment.Value.Kind == OperandExpression {
+					t.Fatalf("conflict assignment %d retained an ordinary UPDATE expression", i)
+				}
 				if _, duplicate := seenTargets[assignment.Column]; duplicate {
 					t.Fatalf("conflict target %q is assigned twice", assignment.Column)
 				}
@@ -291,6 +296,13 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 				t.Fatalf("UPDATE target %q is assigned twice", assignment.Column)
 			}
 			seenTargets[assignment.Column] = struct{}{}
+			if assignment.Expr != nil {
+				if assignment.Value.Kind != OperandExpression {
+					t.Fatalf("UPDATE expression assignment %d has value kind %d", i, assignment.Value.Kind)
+				}
+				seen += checkScalarInvariants(t, s.Filter, assignment.Expr, nil)
+				continue
+			}
 			switch assignment.Value.Kind {
 			case OperandString, OperandNumber, OperandBool, OperandNull:
 			case OperandParam:

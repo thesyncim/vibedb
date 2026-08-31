@@ -1280,6 +1280,9 @@ func (t *tx) execMutationCore(
 			if err := validateColumnAssignmentBindings(assignments, args); err != nil {
 				return nil, err
 			}
+			if err := statement.ValidateUpdateExpressionBindings(args); err != nil {
+				return nil, err
+			}
 			if err := t.conn.routeDelete(statement, args); err != nil {
 				return nil, err
 			}
@@ -1313,8 +1316,9 @@ func (t *tx) execMutationCore(
 					t.conn.pointRaw = scratch
 					return nil, ErrTransactionConflict
 				}
-				document, err := ApplyColumnAssignments(
-					scratch, assignments, args, limits.MaxDocumentBytes,
+				document, err := materializeColumnAssignments(
+					statement, &t.conn.exec, scratch, assignments, args,
+					limits.MaxDocumentBytes,
 				)
 				if err != nil {
 					t.conn.pointRaw = scratch

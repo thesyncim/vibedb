@@ -827,6 +827,12 @@ const (
 	// DocumentColumn for the one supported whole-document spelling
 	// EXCLUDED."$doc". It is never produced by predicates or ordinary UPDATE.
 	OperandExcluded
+	// OperandExpression marks an ordinary UPDATE assignment whose executable
+	// right-hand side is carried by UpdateAssignment.Expr. It is deliberately
+	// not a bindable operand: consumers that have not opted into scalar
+	// assignment evaluation must reject it instead of silently treating a zero
+	// Operand as an empty string.
+	OperandExpression
 )
 
 // An Operand is a literal or a placeholder.

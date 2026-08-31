@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -118,5 +119,47 @@ func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *test
 	}
 	if len(session.(*postgresSession).statements) != 0 {
 		t.Fatal("RF3 session retained a refused conflict statement")
+	}
+}
+
+func TestPostgreSQLRF3PrepareRejectsComputedUpdateBeforeRetention(t *testing.T) {
+	const text = `UPDATE messages SET value = value || '-next' WHERE id = ?`
+	wantPosition := strings.Index(text, `||`)
+	executor, _ := newSQLRF3TestExecutor(t)
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	dispatches := 0
+	backend := &PostgreSQLBackend{
+		Executor: executor,
+		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
+			return authority, nil
+		},
+		Write: func(context.Context, serviceauthz.Authority, Query) (*Result, error) {
+			dispatches++
+			return nil, nil
+		},
+	}
+	session, err := backend.NewSession(context.Background(), pgwire.SessionIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	prepared, err := session.Prepare(context.Background(), text)
+	var unsupported *sqlast.FeatureNotSupportedError
+	if !errors.As(err, &unsupported) || unsupported.Pos != wantPosition {
+		t.Fatalf(
+			"Prepare error = %T %v, want positioned FeatureNotSupported at %d",
+			err, err, wantPosition,
+		)
+	}
+	if prepared != nil {
+		t.Fatal("RF3 computed UPDATE returned a prepared statement")
+	}
+	if dispatches != 0 {
+		t.Fatalf("write dispatches = %d, want 0", dispatches)
+	}
+	if len(session.(*postgresSession).statements) != 0 {
+		t.Fatal("RF3 session retained a refused computed UPDATE")
 	}
 }

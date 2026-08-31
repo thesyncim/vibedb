@@ -126,6 +126,18 @@ func (p *Prepared) CaptureMutationInto(
 		(p.Kind() != sqlast.KindUpdate && p.Kind() != sqlast.KindDelete) {
 		return p.fail(errors.New("vibedb: mutation capture requires UPDATE or DELETE"))
 	}
+	if p.Kind() == sqlast.KindUpdate {
+		for i := range p.statement.mutation.Tree().Update.Assignments {
+			assignment := &p.statement.mutation.Tree().Update.Assignments[i]
+			if assignment.Expr == nil {
+				continue
+			}
+			return p.fail(sqlast.NewFeatureNotSupportedError(
+				p.statement.mutation.SQL(), assignment.Expr.Pos,
+				"mutation capture cannot transport computed UPDATE postimages yet",
+			))
+		}
+	}
 	if err := p.session.ready(ctx); err != nil {
 		return p.fail(err)
 	}
