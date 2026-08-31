@@ -621,9 +621,10 @@ func (e *UnknownOutcomeError) Unwrap() []error {
 	return []error{ErrOutcomeUnknown, e.Cause}
 }
 
-// Owner serializes Host access and owns one bounded pending outbound slot. A
-// message is never discarded on transport backpressure: the Owner does not pop
-// another Host message until the retained one is accepted.
+// Owner serializes Host access and owns one bounded pending outbound slot.
+// Transport backpressure drops that ordinary Raft packet and lets Raft repair
+// the loss; accepted frames, durable Ready state, ingress, and results remain
+// owned by their existing queues.
 type Owner struct {
 	registry  *raftserve.Registry
 	host      ownerHost

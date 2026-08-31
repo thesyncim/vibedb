@@ -44,12 +44,9 @@ import (
 // database are both consistent cuts and neither invalidates the other.
 //
 // The acquisition order is a total order over a set the catalog lock is holding
-// still, which is what makes it provably deadlock-free rather than merely
-// deadlock-free in practice. It is worth being precise about why the proof is
-// needed at all when no writer ever holds two collections' gates: Go's
-// sync.RWMutex makes a pending writer block subsequent readers, so a reader
-// holding gate A and waiting on gate B behind a writer is a real wait edge, and
-// unordered acquisition by two concurrent snapshots would close it into a cycle.
+// still. Snapshot and multi-collection publication paths follow stable orders,
+// preventing the wait cycle that unordered acquisition of several RWMutex
+// gates could otherwise create.
 //
 // The cost lands entirely on the reader, exactly as on the heap side. Nothing
 // is added to the write path: no shared gate to acquire per mutation, no atomic

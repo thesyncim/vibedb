@@ -1,19 +1,32 @@
-# Executable capability matrix
+# Executable embedded capability matrix
 
-This table comes from `internal/conformance.Cases`. Native, `database/sql`, and
-pgwire tests run the same case IDs. A golden test rejects a table that differs
-from the executable manifest.
+> [!CAUTION]
+> This is generated evidence for one unreleased commit. APIs, commands, and
+> wire/disk formats may break at any commit. Use matching docs/binaries and
+> disposable or recoverable data. This matrix is not a release, compatibility
+> promise, distributed-gateway contract, or production claim.
 
-An atomic unit is one named call, statement, protocol batch, or explicit
-transaction. It becomes visible completely or not at all. Separate native
-point calls do not become one transaction.
+The matrix is generated from `internal/conformance.Cases`. The native,
+`database/sql`, and embedded pgwire test suites consume the same case IDs. It
+answers whether one exact operation shape succeeds, fails with a documented
+error, and rolls back its rejected sibling.
 
-SQL tables use the fixed zero-value durability contract. This contract is
-`DurabilitySync` with the power-safe recovery journal. The native storage API
-exposes the wider durability matrix.
+## Read the matrix
 
-The generated table uses exact code terms. Its text is not rewritten to match
-the general documentation language rules.
+| Term | Meaning |
+| --- | --- |
+| Atomic unit | One native call, statement, simple-query batch, or explicit transaction |
+| Native lane | A low-level `store/durable` publication configuration; not every lane is exposed by the root facade |
+| Fixed SQL default | Synchronous journal with a power-safe acknowledgement contract |
+| Documented error | The executable case requires the named refusal and unchanged logical state |
+
+Separate native point calls are separate publications. Use `Collection.Update`
+or `(*vibedb.Database).Update` for a grouped native mutation. The root facade's
+three profiles are summarized in [durability](durability.md); the detailed
+lanes below exercise the low-level durable engine.
+
+<details>
+<summary><strong>Show all executable cases</strong></summary>
 
 <!-- capability-matrix:start -->
 | Executable case | Entry point | Indexing | Tables | Transaction | Keys | Operations | Durability / publication | Result | Atomic unit |
@@ -28,7 +41,7 @@ the general documentation language rules.
 | `native-batch-fence-lane` | native | unindexed | one table | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | async COW / power-safe<br>sync chain-fence / power-safe | documented error: `durable.ErrPrimaryBatchUnsupportedLane` | no |
 | `native-batch-indexed` | native | indexed | one table | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | sync-journal / power-safe<br>buffered-volatile / power-safe<br>buffered-volatile / filesystem<br>buffered-journal / power-safe<br>buffered-journal / filesystem | success; primary rows and exact postings publish in the same logical batch cut; topology preparation may advance Generation without changing either | yes; rejected sibling rolls back all participants |
 | `native-batch-indexed-fence-lane` | native | indexed | one table | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | async COW / power-safe<br>sync chain-fence / power-safe | documented error: `durable.ErrPrimaryBatchUnsupportedLane` | no |
-| `native-database-txn-unindexed` | native | unindexed | multiple tables | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | sync-journal / power-safe<br>buffered-journal / power-safe<br>buffered-journal / filesystem | success; Database.Update / vibedb.Update: sync-journal and buffered-journal are crash-atomic after K prepare syncs + decision sync; buffered-journal durability precedes visibility; Memory profile is visibility-atomic with no crash dimension | yes; rejected sibling rolls back all participants |
+| `native-database-txn-unindexed` | native | unindexed | multiple tables | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | sync-journal / power-safe<br>buffered-journal / power-safe<br>buffered-journal / filesystem | success; Database.Update / (*vibedb.Database).Update: sync-journal and buffered-journal are crash-atomic after K prepare syncs + decision sync; buffered-journal acknowledgement follows its durability fence; Memory profile is visibility-atomic with no crash dimension | yes; rejected sibling rolls back all participants |
 | `native-database-txn-indexed` | native | indexed | multiple tables | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | sync-journal / power-safe<br>buffered-journal / power-safe<br>buffered-journal / filesystem | success; primary rows and exact postings publish together across every participant; sync-journal and buffered-journal are crash-atomic after K prepare syncs + decision sync | yes; rejected sibling rolls back all participants |
 | `native-database-txn-unsupported-lane` | native | unindexed | multiple tables | explicit transaction | one key<br>multiple keys | insert<br>update<br>delete<br>mixed | buffered-volatile / power-safe<br>buffered-volatile / filesystem<br>async COW / power-safe<br>sync chain-fence / power-safe | documented error: `durable.ErrDatabaseTransactionUnsupportedLane`; buffered-volatile, async-COW, and sync chain-fence refuse multi-collection commits; the facade Buffered profile maps to the same typed refusal | no |
 | `database-sql-autocommit-unindexed-one` | database/sql | unindexed | one table | autocommit | one key | insert<br>update<br>delete | fixed SQL default: sync-journal / power-safe | success | yes; rejected sibling rolls back all participants |
@@ -57,22 +70,36 @@ the general documentation language rules.
 | `pgwire-transaction-serialization-failure` | pgwire | unindexed | multiple tables | explicit transaction | one key | update | fixed SQL default: sync-journal / power-safe | documented error: `SQLSTATE 40001`; first-committer-wins conflict on a multi-table write set surfaces as serialization_failure; no participant publishes | no |
 <!-- capability-matrix:end -->
 
-## Test method
+</details>
 
-A successful atomic row also runs a rejected sibling. A preflight rejection
-must leave participant generations, rows, document counts, and exact-index
-answers unchanged.
+## What a passing case proves
 
-SQL tests also force rejected commits. The `database/sql` tests check
-first-committer-wins rollback. Pgwire tests check failed-transaction state and
-`COMMIT`-as-rollback.
+A successful atomic case also executes a rejected sibling and checks that
+rows, document counts, generations relevant to content, and exact-index answers
+remain coherent. SQL cases exercise cancellation, transaction state, and
+first-committer-wins behavior where applicable.
 
-The atomic contract applies to logical rows and postings. Bounded topology
-preparation can publish a representation-only generation before a later
-logical rejection. A documented-error row must return the named error, keep the
-logical state unchanged, and leave the collection or session usable.
+Physical topology preparation can publish a content-equivalent generation
+before a later logical refusal. The matrix therefore tests logical content, not
+the false rule that every generation number must stay unchanged.
 
-Crash tests cover complete and torn journal records, append, sync, data writes,
-ordering barriers, alternate-root writes, final sync, torn roots, and capacity
-failure. `TestFilePrimaryIndexedBatchCheckpointCrashBoundary` composes device
-faults with one indexed multi-key batch.
+Crash evidence is separate: journal/root tests inject failures around append,
+sync, data write, barrier, root write, final sync, torn roots, and capacity
+boundaries. A capability row alone does not prove every hardware/filesystem
+failure model.
+
+## Regenerate
+
+```bash
+go generate ./internal/conformance
+go test ./internal/conformance
+```
+
+Do not edit the marked block by hand.
+
+## Source map
+
+- `internal/conformance/capability_matrix.go`
+- `internal/conformance/capability_matrix_test.go`
+- `capability_matrix_facade_test.go`
+- SQL and pgwire conformance tests in `sql/driver` and `pgwire`

@@ -1,143 +1,123 @@
 # VibeDB
 
-VibeDB is a durable embedded JSON database for Go with explicit operation,
-cache, and concurrency limits. The root package provides named collections,
-exact indexes, typed queries, and serializable transactions through a small
-owned-lifecycle API. The default profile makes a mutation power-safe before it
-becomes visible. Buffered and in-memory profiles are explicit alternatives with
-different acknowledgement contracts.
+> [!CAUTION]
+> **Unreleased development software.** VibeDB has no tagged release, support
+> window, compatibility promise, or published project license. Any commit may
+> break Go APIs, SQL behavior, commands, manifests, wire protocols, or on-disk
+> data. Pin an exact commit, keep recoverable backups, and do not use this
+> repository for irreplaceable data.
 
-The repository also contains a SQL runtime, a `database/sql` driver, and an
-experimental PostgreSQL wire-protocol endpoint. They use VibeDB's documented
-SQL subset. Wire compatibility does not imply PostgreSQL SQL compatibility.
+VibeDB is an embedded JSON database for Go. Its primary interface is a small
+native API for named collections, exact indexes, typed queries, and serializable
+transactions. The repository also contains a bounded SQL runtime, an
+experimental PostgreSQL protocol adapter, and an experimental RF3 distributed
+system.
 
-> **Development status:** This repository has no tagged release or published
-> support window. It also has no published project license. Files named
-> `LICENSE-*` contain third-party notices only. APIs, command contracts, and
-> storage grammars can change between tested commits. The PostgreSQL wire
-> endpoint and all distributed commands are experimental and unreleased.
+## Choose a path
 
-## Current scope
+| You want to… | Start here | Status |
+| --- | --- | --- |
+| Embed a JSON database in Go | [Getting started](docs/getting-started.md) | Development; best-tested path |
+| Build typed document queries | [Typed query API](docs/api/query.md) | Development |
+| Use `database/sql` | [SQL API](docs/api/sql.md) | Experimental SQL subset |
+| Connect a PostgreSQL client | [PostgreSQL wire adapter](docs/api/pgwire.md) | Experimental protocol adapter; **not PostgreSQL compatibility** |
+| Explore a local RF3 cluster | [Local cluster](docs/operations/local-cluster.md) | Development and qualification only |
+| Work on storage internals | [Storage layers](docs/store.md) | Expert, unstable APIs |
 
-The credible product boundary today is the embedded engine. Its durable store
-uses a fixed 4 KiB base-page format and a configurable page-cache and mutable
-row-overlay budget. Indexed open also constructs a data-dependent resident
-exact-index epoch outside that budget, so the current engine does not claim a
-fixed total-memory ceiling. The `Durable` and `Memory` profiles support
-multi-collection transactions. The `Buffered` facade deliberately refuses a
-commit that dirties more than one collection.
+The [current-status page](docs/status.md) lists compatibility rules, known
+defects, and the evidence boundary for this exact source snapshot.
 
-The experimental distributed runtime is mode-dependent. Explicit
-`-dev-static-catalog` mode routes supported SQL to static shard services.
-Replicated-catalog mode routes the documented bounded `SELECT` plan subset to
-RF3 leaders with `ReadIndex`. It also provides canonical point reads,
-exact-primary-key read batches, and durable sequenced write batches for the
-supported canonical mutation shapes, including complete-document and unique
-top-level named-column INSERT rows. RF3 has catalog, request-ledger,
-transaction, split, replica-move, backup, and restore primitives. It is not a
-general distributed SQL or arbitrary cross-shard PostgreSQL transaction layer.
-Network-serving commands require mutual TLS and an authorization policy by
-default. `vibedb-gateway serve` and the static `vibedb-shard serve` command
-permit explicit unauthenticated loopback development serving. The gateway flag
-also applies with a replicated catalog and selects raw replicated-shard dialing;
-`vibedb-shard serve-rf3` itself has no plaintext mode.
+## Try the embedded API
 
-This source tree does not currently provide an AI control plane, an
-object-storage durability layer, or evidence of near-linear horizontal
-scaling. The competitive harness currently publishes no results, so this
-documentation makes no "fastest" or infrastructure-cost claim. See the
-[competitive benchmark policy](bench/competitive/README.md) and the current
-[no-results status](bench/competitive/RESULTS.md).
-
-The generated [distributed feature-state matrix](docs/distributed-feature-state.md)
-distinguishes a present primitive from command integration and mandatory
-external qualification. It does not turn an unexecuted or failing gate into
-evidence.
-
-## Requirements
-
-- Go 1.26 or a compatible newer toolchain
-- A supported operating system for the selected storage backend
-
-The portable storage backend is the fallback. Linux can select `io_uring` and
-direct I/O through the advanced storage API.
-
-## Install
+VibeDB requires the Go version declared in [`go.mod`](go.mod). Until a release
+exists, depend on an exact commit rather than `main`:
 
 ```bash
-go get github.com/thesyncim/vibedb@main
+go get github.com/thesyncim/vibedb@<commit>
 ```
-
-There is no released version to select. Record the pseudo-version resolved into
-`go.mod`, then test and pin that exact revision before deployment.
-
-## Native API
 
 ```go
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
 	"github.com/thesyncim/vibedb"
 )
 
-func main() {
-	db, err := vibedb.Open("./data")
+func run() (err error) {
+	db, err := vibedb.Open("./vibedb-data")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Printf("close VibeDB: %v", err)
-		}
-	}()
+	defer func() { err = errors.Join(err, db.Close()) }()
 
 	users := db.Collection("users")
-	if _, err := users.Put("user:1", []byte(`{"name":"Ada"}`)); err != nil {
-		log.Fatal(err)
+	if _, err := users.Put("user:1", []byte(`{"name":"Ada","team":"compiler"}`)); err != nil {
+		return err
 	}
 
-	document, found, err := users.Get("user:1")
+	doc, found, err := users.Get("user:1")
 	if err != nil {
+		return err
+	}
+	fmt.Printf("found=%t doc=%s\n", found, doc)
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(found, string(document))
 }
 ```
 
-`Open` treats `./data` as a database directory. It creates one durable file for
-each collection when the first mutation needs that collection.
+`Open` owns a database directory. The default profile acknowledges a mutation
+only after its recovery record is power-safe. A collection may use a primary
+file and a recovery-journal sidecar; copy or back up the complete closed
+database directory, never an arbitrary live file.
 
-## Select an interface
+## What is implemented
 
-| Interface | Package | Use case |
-| --- | --- | --- |
-| Native facade | `github.com/thesyncim/vibedb` | Embedded JSON CRUD, exact indexes, typed queries, and transactions |
-| Typed queries | `github.com/thesyncim/vibedb/query` | Programmatic query construction and reusable execution buffers |
-| SQL | `github.com/thesyncim/vibedb/sql/driver` | Go applications that use `database/sql` |
-| PostgreSQL wire | `github.com/thesyncim/vibedb/pgwire` | PostgreSQL protocol clients using the documented VibeDB SQL subset |
-| Storage control | `github.com/thesyncim/vibedb/store/durable` | Explicit geometry, I/O mode, durability lane, and verification control |
+- Canonical JSON documents in named, lazily materialized collections.
+- Exact scalar and compound indexes.
+- Immutable snapshots, typed queries, and bounded execution workspaces.
+- Serializable native transactions and multi-table SQL transactions.
+- A deliberately bounded SQL dialect through `database/sql`.
+- PostgreSQL protocol v3 simple/extended flows, SCRAM, TLS negotiation,
+  prepared statements, portals, cancellation, and selected client discovery
+  shims.
+- RF3 replication, routing, authenticated services, durable request recovery,
+  backup/restore, schema-rollout, split, and replica-move primitives used by
+  checked-in development commands.
+
+## What is not promised
+
+- Compatibility between different commits or old development data.
+- PostgreSQL SQL, catalog, extension, ORM, or server compatibility.
+- A production-ready distributed database or Kubernetes operator.
+- Rolling mixed-build upgrades, downgrades, or format migration.
+- Published performance, cost, or horizontal-scaling results.
+- A fixed total-memory ceiling: some indexes and off-heap structures are
+  data-dependent.
+
+See [stability and known issues](docs/status.md) before evaluating any path.
 
 ## Documentation
 
-- [Install and run VibeDB](docs/getting-started.md)
-- [API guide](docs/api/README.md)
+- [Documentation home](docs/README.md)
 - [Architecture](docs/architecture.md)
+- [Data model](docs/data-model.md)
+- [Transactions](docs/transactions.md)
 - [Durability and recovery](docs/durability.md)
-- [Current capability matrix](docs/capabilities.md)
-- [Distributed feature state](docs/distributed-feature-state.md)
-- [RF3 quickstart](docs/operations/distributed-quickstart.md)
-- [Distributed runtime](docs/operations/distributed.md)
-- [Replica lifecycle operations](docs/operations/replica-lifecycle.md)
-- [Security policy](SECURITY.md)
+- [Operations](docs/operations/README.md)
+- [Reference](docs/reference/README.md)
+- [Executable capability matrix](docs/capabilities.md)
+- [Generated distributed feature ledger](docs/distributed-feature-state.md)
 
-The documentation uses an STE-informed technical style. It keeps standard
-software and database terminology. See the [documentation language
-guide](docs/STYLE.md).
-
-## Verify a checkout
+## Build and test this checkout
 
 ```bash
 go build ./...
@@ -145,15 +125,21 @@ go vet ./...
 go test -p=1 -timeout=25m ./...
 ```
 
-The full CI workflow also cross-compiles 32-bit targets, runs selected race
-tests, and tests the PostgreSQL client module.
+At the documented source snapshot, the final command is expected to report the
+known `internal/serviceauthz` failure described in [current status](docs/status.md).
+Treat that exact failure as the recorded baseline, not as a passing suite, and
+investigate any additional failure.
 
-The optional [PostgreSQL upstream compatibility lane](integration/pgcompat/README.md)
-runs the current-stable PostgreSQL regression corpus against the real VibeDB
-pgwire endpoint. It publishes every expected-output difference and ratchets
-tests that become byte-for-byte compatible.
+Some qualification lanes require Linux, Docker, Java, `psql`, or explicit
+environment flags. Their docs distinguish normal tests from opt-in evidence.
+Passing tests on one commit does not create a compatibility or support promise.
 
-## Contribute
+## Contributing and security
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before you change a storage contract,
-on-disk format, unsafe-code boundary, or benchmark claim.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing a persistence,
+protocol, or evidence contract. See [SECURITY.md](SECURITY.md) for the current
+reporting limitations and trust boundaries.
+
+The repository currently has no project license. Files named `LICENSE-*` and
+`PATENTS-*` are notices for incorporated third-party work; they do not grant a
+license to VibeDB as a whole.

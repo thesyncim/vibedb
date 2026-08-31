@@ -68,10 +68,10 @@ import (
 // PostgreSQL type. The primary key and each declared exact index become
 // pg_index rows whose definition text says "USING exact", because claiming
 // btree would claim ordered-scan semantics these indexes do not have.
-// Catalogs this engine genuinely lacks — foreign keys, triggers, policies,
-// views, roles, functions — answer with honestly empty result sets rather
-// than fabricated rows, which psql renders as "no rows" exactly as it would
-// for a bare PostgreSQL cluster.
+// The shim intentionally exposes only stored tables and exact indexes. Objects
+// it does not model — including VibeDB views as well as foreign keys, triggers,
+// policies, roles, and functions — answer with empty result sets rather than
+// fabricated PostgreSQL catalog rows.
 
 // catalogMarker separates literal segments from captures in the templates
 // below. It never appears in any psql query text.

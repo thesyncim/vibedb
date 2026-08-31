@@ -1,174 +1,249 @@
-# Typed query API
+# Query API
 
-The `query` package builds typed queries over JSON collections. It can execute
-against heap segments, coherent heap snapshots, durable snapshots, durable
-files, overlays, primary-key ranges, and relation spools.
+> [!CAUTION]
+> Unreleased development software: Query/SQL behavior, catalog contracts,
+> protocol mappings, limits, and ownership may change on any commit. Pin the
+> tested commit; builds are not compatible by default.
 
-Use this package when you need programmatic query construction or reusable
-execution storage. Use [SQL](sql.md) when SQL text and `database/sql` are a
-better application boundary.
+The `query` package executes typed queries over JSON documents. Use it when you
+already own a VibeDB snapshot or segment and want typed cells without
+`database/sql`. Use the SQL driver when you need a durable catalog, DDL, or
+transaction management.
 
-## Build and run a query
+## Choose an entry point
 
-```go
-q := query.Select(
-	query.Path("team"),
-	query.Sum("score"),
-).
-	Where(query.Cmp("active", query.Eq, true)).
-	GroupBy("team").
-	OrderBy("team", query.Asc)
+| Need | Entry point | Reuse model |
+|---|---|---|
+| Build a projection/filter in Go | `query.Select(...)` | Mutable while chaining; immutable and concurrent-safe after first prepare/run |
+| Execute SELECT text | `query.PrepareStatement(sql)` | `Statement` is reusable but single-consumer |
+| Run once | `Query.Run` or `Statement.Run` | Call owns transient execution state |
+| Run a hot loop | `RunInto(&exec, ...)` | One caller-owned `Exec` per goroutine |
+| DDL, DML, or transactions | `sql/driver` | See [SQL API](sql.md) |
 
-result, err := q.Run(query.FromSegment(segment))
-if err != nil {
-	return err
-}
-fmt.Println(result.RowCount)
-```
+## Run a typed query
 
-`FromSegment` is one source type. The source must not be the zero value.
-
-## Reuse execution storage
+This complete example runs against an in-memory segment:
 
 ```go
-src := query.FromSegment(segment)
-var exec query.Exec
+package main
 
-for range 3 {
-	if err := q.RunInto(&exec, src); err != nil {
-		return err
+import (
+	"fmt"
+	"log"
+
+	"github.com/thesyncim/vibedb/query"
+	"github.com/thesyncim/vibedb/store"
+)
+
+func main() {
+	var docs store.Segment
+	for _, doc := range []string{
+		`{"team":"red","active":true,"score":4}`,
+		`{"team":"red","active":true,"score":7}`,
+		`{"team":"blue","active":false,"score":9}`,
+	} {
+		if _, err := docs.Append([]byte(doc)); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	q := query.Select(query.Path("team"), query.Sum("score")).
+		Where(query.Cmp("active", query.Eq, true)).
+		GroupBy("team").
+		OrderBy("team", query.Asc).
+		Limit(10)
+	if err := q.Prepare(); err != nil {
+		log.Fatal(err)
+	}
+
+	result, err := q.Run(query.FromSegment(&docs))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer result.Release()
+
+	for row := range result.RowCount {
+		team, _ := result.Columns[0].Cells[row].Text()
+		fmt.Printf("%s %s\n", team, result.Columns[1].Cells[row].JSON())
 	}
 }
 ```
 
-`Exec` retains work buffers up to the largest execution that it serves. It is
-single-consumer. A compiled `Query` can be used concurrently only when each
-caller has a separate executor.
+Paths may be dotted (`user.name`), RFC 6901 pointers (`/user/name`), or empty
+for the whole document. The builder exposes:
 
-Heap-backed results can borrow bytes until the next execution or source
-mutation. Durable execution copies result bytes. Do not retain borrowed bytes
-beyond their documented owner.
+| Area | Constructors |
+|---|---|
+| Projection | `Path` |
+| Aggregate | `Count`, `Sum`, `Avg`, `Min`, `Max` |
+| Predicate | `Cmp`, `In`, `Like`, `ILike`, `Contains`, `Exists`, `IsNull` |
+| Boolean composition | `And`, `Or`, `Not` |
+| Clauses | `Where`, `GroupBy`, `OrderBy`, `Limit`, `Join` |
 
-## Use a coherent database source
+`Count()` counts rows; `Count("path")` counts present, non-null values. Numeric
+aggregates use exact JSON-decimal arithmetic. They skip null and nonnumeric
+inputs and return null when nothing contributes.
 
-Cross-collection joins and subqueries need a coherent catalog source. Use
-`query.FromDatabase` for heap data or `query.FromFileDatabase` for durable data.
-A single collection source cannot resolve another relation.
+## Execute SQL SELECT text
+
+`PrepareStatement` adds aliases, `?` parameters, HAVING, OFFSET, joins,
+subqueries, CTEs, sets, windows, and scalar expressions supported by the SQL
+lowerer:
 
 ```go
-// database is an initialized *store.Database.
-catalog := database.Snapshot()
-result, err := q.Run(query.FromDatabase(catalog, "orders"))
+stmt, err := query.PrepareStatement(`
+	SELECT team, SUM(score) AS total
+	FROM events
+	WHERE active = ?
+	GROUP BY team
+	ORDER BY total DESC
+	LIMIT 10`)
 if err != nil {
 	return err
 }
-fmt.Println(result.RowCount)
+defer stmt.Release()
+
+result, cursor, err := stmt.Run(
+	query.FromDatabase(snapshot, "events"),
+	[]any{true},
+)
+if err != nil {
+	return err
+}
+defer result.Release()
+for cursor.Next() {
+	team, _ := cursor.Cell(0).Text()
+	total := cursor.Cell(1).AppendJSON(nil)
+	_ = team
+	_ = total
+}
 ```
 
-The source captures all participating collections in one cut.
+Iterate the returned `Cursor` for final SQL rows. The underlying `Result` may
+contain hidden HAVING dependencies and rows before cursor-applied HAVING,
+OFFSET, or an unpushed LIMIT. `Statement.Explain` and `Query.Explain` render the
+prepared logical plan as versioned JSON without reading a source.
 
-## Join behavior
+Use a coherent database source for a statement that reads more than one
+collection. `FromDatabase` and `FromFileDatabase` make snapshot skew across a
+join or subquery inexpressible. A single-collection source is rejected when a
+child plan names a different collection.
 
-The local executor supports inner, left, right, full, and cross joins through
-the SQL lowering layer. It supports arbitrary `ON` predicates, composite
-`USING`, derived tables, and explicit `LATERAL` sources.
+The full textual surface and its intentional restrictions are in the
+[SQL reference](../reference/sql.md).
 
-A single physical inner or left equi-join can retain the storage-aware path.
-That path measures the inner side and selects membership or keyed lookup.
-Lookup mode can use a bloom prefilter. More general SQL shapes use the relation
-join pipeline. It builds a hash table when equality keys are available and
-uses nested-loop evaluation when they are not. Both paths enforce the
-join-pair budget.
+## Select a source
 
-This local capability is wider than the distributed gateway. The gateway
-currently permits only colocated inner and left joins with a complete shard-key
-equality proof.
+| Source | Constructor | Result-cell ownership |
+|---|---|---|
+| In-memory segment | `FromSegment` | Cells borrow segment/execution bytes |
+| Heap snapshot | `FromSnapshot` | Cells borrow snapshot/execution bytes |
+| Durable snapshot | `FromFile` | Variable-width cells are copied into `Result` |
+| Durable range/filter | `FromFileRange`, `FromFileFiltered` | Same durable ownership rule |
+| Overlay | `FromFileOverlay`, `FromSnapshotOverlay` | Valid through the execution/result lifetime |
+| Coherent catalog snapshot | `FromDatabase`, `FromFileDatabase` | Heap value needs no close; caller closes the durable snapshot |
 
-## Index use
+The zero `Source` is invalid. A FROM-less SQL query uses an internal one-row
+source; do not manufacture one with `Source{}`.
 
-Execution can select these access paths:
+## Reuse execution storage
 
-- Primary-key point access
-- Primary-key range access
-- Exact-index posting candidates
-- A full scan
+`Exec` retains result and workspace high-water buffers:
 
-The complete predicate is always checked after candidate selection. An index
-is an optimization, not a change to query semantics.
+```go
+var exec query.Exec
+exec.Options.MemoryBytes = 32 << 20
+exec.Options.ResultRows = 20_000
 
-Primary-key metadata is supplied by the source adapter rather than inferred by
-the typed query compiler. The local SQL driver recognizes safe point and range
-bounds at the predicate root or beneath top-level conjunctions; its exact rules
-and fallback behavior are documented in
-[SQL access paths](sql.md#access-paths-and-explain).
+for _, snapshot := range snapshots {
+	if err := q.RunInto(&exec, query.FromSnapshot(snapshot)); err != nil {
+		exec.Release()
+		return err
+	}
+	consume(exec.Result)
+}
+exec.Release()
+```
 
-Execution binds the ready indexes exposed by its source snapshot. A query
-compiled before index creation can use the index when it later runs against a
-snapshot that includes it.
+Rules that matter:
 
-## Explain a plan
+- A compiled `Query` is concurrent-safe; an `Exec` is single-consumer. Give
+  every goroutine its own `Exec`.
+- Finish all chaining before `Prepare`, `Run`, or `Explain`; never mutate or
+  copy a `Query` after its first use because it contains cached `sync.Once` state.
+- `RunInto` invalidates the previous result immediately, including on failure.
+- Segment and heap cells may borrow the source and `Exec.Workspace`; consume or
+  copy them before modifying the source or running into the same `Exec` again.
+- Call `Result.Release` after a one-shot result. Call `Exec.Release` when a
+  retained high-water allocation should be dropped.
+- `Statement` owns parsed/lowered arenas, is single-consumer, and must be
+  released with `Statement.Release`. Its cursor is only a view over the result.
 
-`q.Explain()` returns compile-time JSON without opening a source. After
-`RunInto`, inspect `exec.Stats` for typed-query measurements.
+`Cell` offers typed accessors (`Bool`, `Int64`, `Float64`, `Text`) and JSON
+encoding (`JSON`, `AppendJSON`). Borrowed byte slices are read-only.
 
-`Statement.ExplainAnalyze` formats an `ExplainAnalysis` that execution already
-collected. It does not run the statement. SQL `EXPLAIN ANALYZE` in the driver
-runs the statement and returns the measured plan.
+## Value semantics
 
-Plan names include `primary-key-point-or-scan`,
-`primary-key-range-or-scan`, `adaptive-exact-index-or-scan`,
-`adaptive-posting-or-scan`, `adaptive-join-or-scan`, and `full-scan`.
+The Go builder intentionally differs from SQL in one place: builder predicates
+are two-valued, while SQL statements use three-valued logic.
 
-The `or-scan` suffix is important. Runtime data and resource conditions can
-select the scan fallback.
+- Builder projection maps both an absent path and explicit JSON `null` to a
+  null cell. Use `Exists(path)` to distinguish presence.
+- SQL preserves the distinction internally: `IS NULL` matches null and
+  missing, while `IS MISSING` matches only absence.
+- Comparisons operate within JSON types. A null/missing value never satisfies
+  a comparison.
+- Numbers compare by exact decimal value, including integers beyond the exact
+  `float64` range.
+- ORDER BY and GROUP BY use the defined total order null, bool, number, string,
+  container.
+- Duplicate object keys resolve to the last occurrence.
 
 ## Resource controls
 
-`query.ExecOptions` controls workers, durable batch size, working memory,
-cancellation, result limits, intermediate limits, aggregate memory, spill,
-and join budgets.
+Zero-valued `ExecOptions` select finite defaults:
 
-| Resource | Default |
-| --- | ---: |
-| Working memory | 64 MiB |
-| Durable batch rows | 4096 |
-| Result rows | 100,000 |
-| Result bytes | 64 MiB |
-| Intermediate bytes | 64 MiB |
-| Aggregate bytes | 16 MiB |
-| Spill bytes | 1 GiB |
-| Join-pair bytes | 64 MiB |
-| External merge fan-in | 32 |
+| Resource | Default | Disable limit |
+|---|---:|---:|
+| Materialized result | 100,000 rows and 64 MiB | `ResultRows = -1`, `ResultBytes = -1` |
+| Relation intermediates | 64 MiB | `IntermediateBytes = -1` |
+| Exact aggregate state | 16 MiB | No unlimited sentinel |
+| Join-pair workspace | 64 MiB | `JoinPairBytes = -1` |
+| Durable spill files | 1 GiB | `SpillBytes = -1` |
+| Durable batch | 4,096 rows | Set `BatchRows` |
+| General memory target | 64 MiB | Set `MemoryBytes` |
+| Physical set tree | 1,000,000 rows / 64 MiB / depth 256 / 4,096 nodes | Per-kernel options |
 
-Working memory below 64 KiB is invalid. Aggregate memory below 512 bytes is
-invalid.
+The memory value is a work-admission limit for heap execution and a
+batch/merge target for durable execution, not a promise that total process RSS
+stays below it. Results and intermediates have independent budgets. Optional
+indexes may be declined when their workspace does not fit; exact execution then
+falls back to a scan. Budget exhaustion returns an error rather than changing
+the answer.
 
-`-1` disables result, intermediate, spill, and join-pair limits. It does not
-disable the aggregate budget.
+Cancellation is cooperative. Install a reusable `CancelFlag` in
+`ExecOptions.Cancel`; reset it only after the canceled execution has returned
+and cleaned up workers and spill files.
 
-Recursive execution has separate limits configured through
-`RecursiveFixpointOptions` or `RecursiveCTELimits`:
+## Important boundaries
 
-| Resource | Default |
-| --- | ---: |
-| Recursive-term evaluations | 1,000 |
-| Recursive result rows | 100,000 |
-| Recursive fixpoint storage | 64 MiB |
+- Builder joins are specialized: an aliasless join is a semijoin. An aliased
+  join fans out only when a query path reads that alias; an unread alias changes
+  nothing. Only one fanout relation is supported by the builder path.
+- SQL joins support INNER, LEFT, RIGHT, FULL, CROSS, USING, and bounded ON
+  predicates. They are not an arbitrary-expression join engine.
+- SQL correlated subqueries and LATERAL are proof-bounded. Correlation under
+  OR and several nested/correlated shapes are rejected at prepare time.
+- View expansion is read-only and bounded to depth 32, 1,024 references, and
+  16 MiB expanded SQL.
+- Recursive CTE execution is finite by default: 1,000 evaluations, 100,000
+  rows, and 64 MiB retained state.
 
-Typed budget errors include:
+## Source map
 
-- `ErrResultBudget`
-- `ErrIntermediateBudget`
-- `ErrAggregateBudget`
-- `ErrWorkBudget`
-- `ErrSpillBudget`
-- `ErrJoinPairBudget`
-
-Budget failure returns no partial materialized result.
-
-## Implementation references
-
-- `query/query.go`, `exec.go`, and `file_execute.go`
-- `query/join.go` and `explain.go`
-- `query/result_budget.go`, `heap_work_budget.go`, and `join_pair_budget.go`
-- `query/example_test.go`
+- Builder and reuse: `query/query.go:150-234`, `query/plan.go:7-107`
+- Sources, ownership, and execution: `query/exec.go:12-60`, `query/exec.go:273-410`
+- SQL statements and cursors: `query/sqlstmt.go:288-358`, `query/sqlstmt.go:986-1140`, `query/sqlstmt.go:1661-1801`
+- Predicates and value semantics: `query/predicate.go:144-220`, `query/predicate.go:1084-1100`, `query/predicate.go:1391-1414`
+- Budgets: `query/file_execute.go:22-115`, `query/result_budget.go:11-18`, `query/relation_runtime.go:10-14`
+- Join/CTE/view boundaries: `query/join.go:135-207`, `query/recursive_fixpoint.go:10-148`, `query/view_expansion.go:10-75`

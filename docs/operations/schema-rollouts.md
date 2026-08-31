@@ -1,322 +1,192 @@
-# Roll out a replicated schema
+# Roll out one RF3 schema generation
 
-`vibedb-gateway schema-rollout` installs one exact catalog generation across
-every replica of every changed RF3 shard group. It prepares immutable
-replica-local SQL catalog images before the rollout's no-return boundary and
-publishes the target global catalog only after every affected replica reports
-that exact generation active.
+> [!CAUTION]
+> Schema rollout is a development-only, same-build control path. Plans, bundles,
+> state files, protocol bytes, and recovery rules can change or break at any
+> commit. This is not a general DDL service, a rolling-version upgrade mechanism,
+> or a production online-schema-change guarantee.
 
-The distributed commands remain experimental and have no released compatibility
-contract. Pin one tested commit across the gateway and shard fleet.
+`vibedb-gateway schema-rollout` coordinates one exact catalog transition across
+every replica of every changed RF3 group. Each changed shard moves from schema
+generation `N` to exactly `N+1`; skipping generations is rejected by the serving
+installer.
 
-## Online DDL requirement and current limits
+## What this command is—and is not
 
-Online behavior is a release requirement for the ordinary SQL DDL endpoint,
-not an optional `CONCURRENTLY` fast path. The loopback PostgreSQL coordinator now
-has a shadow-build, capture, replay, exact final fence, and publication path for
-nonunique `CREATE INDEX`, `DROP INDEX`, `TRUNCATE`, additive `ALTER TABLE`, and
-`DROP TABLE`. That path is experimental and is not release-qualified end to
-end. Only CREATE TABLE currently has a public Linux process-and-restart gate.
+The command consumes a sealed target catalog plus prebuilt, replica-local
+canonical SQL catalog bundles. It does not accept arbitrary SQL and does not
+discover, backfill, or invent a target schema on its own.
 
-The offline exact-cut image builder documented later on this page still needs a
-write fence for its whole build. It is a maintenance primitive, not the online
-PostgreSQL path.
+Public pgwire DDL, the internal exact-cut bundle builder, and this rollout
+installer are separate layers:
 
-`CREATE UNIQUE INDEX` returns feature-not-supported before admission. RF3 has no
-coordinated uniqueness build or publication proof. Existing trusted catalog
-snapshots can retain operator-provisioned global unique-index descriptors. SQL
-DDL cannot create a local or global unique index in RF3.
+- the internal builder can prepare selected schema artifacts under explicit
+  route/cut authority;
+- the rollout installs already prepared artifacts and advances the global
+  catalog; and
+- the public DDL coordinator remains an experimental, separately qualified path.
 
-The required contract is:
+Do not treat successful local `CREATE INDEX`, `DROP INDEX`, `TRUNCATE`, or other
+DDL tests as proof that arbitrary RF3 DDL is supported end to end. In particular,
+RF3 SQL `CREATE UNIQUE INDEX` has no coordinated uniqueness proof and is rejected.
 
-- No global query/write freeze. Backfill, validation, rewriting, and physical
-  reclamation run outside serving locks. Unrelated tables continue serving.
-- CREATE INDEX and rewrite-requiring ALTER build from immutable snapshots and
-  reconcile concurrent committed writes before publication. Reconciliation may
-  use durable ordered capture or validated immutable-leaf reconciliation; a
-  second full scan under a write gate is not an online implementation.
-- The final affected-shard cutover has an explicit work and wait bound,
-  independent of table row count. An oversized tail postpones DDL rather than
-  extending the foreground write pause indefinitely. A brief metadata/ordering
-  barrier is allowed; “online” does not mean literally lock-free or zero-cost.
-- Metadata-only changes do not rewrite rows. TRUNCATE and DROP retire a storage
-  generation instead of deleting rows individually. DROP INDEX should retire
-  index state without copying the entire base table.
-- Existing readers retain their admitted generation until completion. Old
-  files are reclaimed only after authenticated lease/execution-pin drain.
-  Already-admitted multi-wave writes must settle with their original identities;
-  physical per-wave route-pin drain alone does not prove this.
-- DDL admission, catch-up memory/disk/network use, and retained generations are
-  bounded. Exhaustion postpones or rejects the DDL before its no-return boundary,
-  not ordinary writes. Temporary capture overhead is charged to active DDL;
-  idle tables must not acquire a new per-request scan, RPC, or journal write.
-- Concurrent incompatible DDL on one table may serialize with bounded,
-  cancellable waiting. Before authorization, cancellation leaves serving data
-  unchanged. After authorization, durable operation identity drives forward
-  recovery; a client reconnect is not commit recovery.
+## Authority and prerequisites
 
-This applies only to supported operations. `public` remains the supported
-schema; unsupported operations must fail explicitly, not fall back to a long
-blocking implementation.
+You need all of the following from the same build:
 
-Local durable CREATE INDEX now releases its writer between initial geometry
-preparation slices (at most 64 leaf checks and one structural split per slice),
-revalidating its cursor after concurrent router publication. Its later build
-reconciles immutable leaves. The regression exercises a foreground write after
-a real split, old-reader stability, index contents, cancellation, and concurrent
-close. This bounds that preparation phase's work, not filesystem latency or
-every later publication/cleanup phase, and does not qualify RF3 SQL.
-Local SQL `CREATE UNIQUE INDEX` holds the catalog write lock across its
-validation scan and publication so a concurrent writer cannot enter between the
-proof and constraint install. It is atomic, but it is not an online build.
-Local SQL DROP INDEX also copies replacement storage while holding the database
-catalog mutex. The offline RF3 image builder still needs the exact-cut fence.
-These paths do not satisfy the intended online contract. The public RF3
-coordinator uses the separate shadow and replay path described above.
+- an authenticated RF3 catalog and shard fleet;
+- the gateway's replicated-catalog route seed, stable client/retry identity,
+  durable session journal, and acknowledgement key;
+- TLS peer identities and a policy granting the gateway `schema` capability;
+- a replica-control manifest covering every target node;
+- one canonical target global catalog that is the exact successor of the
+  current catalog;
+- one canonical bundle for each replica of every changed group; and
+- the exact apply-contract digest implemented by the fleet.
 
-Release qualification must pause backfill while INSERT/UPDATE/DELETE and new
-reads complete, keep an old reader pinned across cutover, cover unrelated-table
-traffic and already-admitted multi-wave writes, and verify all acknowledged
-writes and index contents after crash/restart. It must measure foreground tail
-latency and maximum cutover hold, not just total DDL duration. The targeted
-`TestReplicatedSchemaDDLBuildDoesNotHoldServingLock` checks only the current
-primitive: concurrent mutations and reads progress, old snapshots remain stable,
-and a stale image is rejected and cleaned. It does **not** establish successful
-online catch-up or publication.
+The gateway derives group identity, allocation generation, source/target schema
+generation, and relation-manifest digests from authenticated old and target
+catalogs. A plan cannot override them. Each changed group has exactly three
+distinct replica plans. Unchanged groups have no bundle entry.
 
-## Before you begin
+The command refuses plaintext mode. A schema-capable principal does not thereby
+gain data, topology, membership, backup, or restore-activation authority.
 
-You need:
+## Prepare the plan
 
-- a running authenticated RF3 catalog and shard fleet;
-- the gateway's normal replicated-catalog flags and stable controller identity;
-- a replica-control manifest covering every target shard node;
-- an authorization policy granting the gateway identity schema capability;
-- the next canonical global catalog snapshot;
-- one canonical `vibejson` SQL catalog image for each replica of every changed
-  shard group; and
-- the exact apply-contract digest supported by the fleet.
+The rollout plan is strict canonical `vibejson`. It contains:
 
-A changed group must have exactly three distinct replica plans. Replica-local
-images may differ because their immutable storage identities differ. The
-gateway derives allocation generations, group identities, and old/new relation
-manifests from the authenticated old and target catalogs; the operator cannot
-override them in the rollout plan.
+- one nonzero 32-byte operation ID as lowercase hexadecimal;
+- the absolute path to the target catalog; and
+- for each changed replica, its node/member identity, absolute bundle path, and
+  exact apply-contract digest.
 
-Prepare and backfill every new global-index relation before rollout. Its
-immutable image must carry the expected cardinality, root, placement, and apply
-identity. Activation refuses a missing, empty, or substituted global-index
-image. Base tables and local exact indexes may be materialized deterministically
-from the replica-local catalog image.
+Whitespace variants, reordered or duplicate fields, trailing bytes, relative
+paths, substituted bundles, malformed identities, mixed apply contracts, missing
+replicas, duplicate receipts, or a stale source cut fail closed. The plan is
+bounded to 4 MiB and each bundle to 64 MiB.
 
-An operator-provisioned global index can be unique when its retained relation
-descriptor and immutable image say it is unique. That internal capability does
-not authorize `CREATE UNIQUE INDEX` in SQL. Do not place a unique local-index
-statement in a replicated child schema or schema-rollout plan.
-
-## Create the rollout plan
-
-### Build nonunique local-index and TRUNCATE images
-
-The shard-control listener also exposes an authenticated build operation for
-`CREATE INDEX`, `DROP INDEX`, and `TRUNCATE`. It is an internal coordinator API,
-not the public PostgreSQL DDL endpoint. `CREATE INDEX` here means a nonunique
-local exact index. Every admission boundary rejects `CREATE UNIQUE INDEX`.
-
-For this maintenance-only primitive, the caller first fences new writes with
-the exclusive route gate and obtains
-an exact applied cut from the shard quorum. The build request binds that cut,
-the source allocation/schema/manifest, the operation ID, and exact SQL bytes.
-Each replica reserves fresh physical storage identities in `.schema-ddl-build`
-before materializing files, then persists its certified receipt before replying.
-Retries reuse those identities, including after process replacement or an
-incomplete image write. Neither a successful build nor its receipt authorizes
-activation. Keep the gate held and retain all receipts in the coordinator's
-operation record before preparing the existing rollout.
-
-Installation uses the journaled source applied cut, not the replica's current
-position. If that position advanced, preparation refuses the stale image. A
-pending build or an unselected ready target prevents a different operation from
-replacing the journal slot; there is no automatic abandon/overwrite policy.
-Do not delete the journal or target images to bypass that refusal.
-
-This cold path uses a 208-byte request header, at most 64 KiB of SQL, and a
-bounded 32 MiB canonical receipt. Authentication and admission happen before
-reading SQL. Each node admits at most two builds, each with a two-minute
-execution deadline. Ordinary query and write execution do not access this
-journal. These bounds are not a guarantee that an arbitrarily large index will
-finish within the deadline.
-
-`gateway.BuildReplicatedSchemaDDLPlan` assembles the target global catalog and
-installation plans from the authenticated build receipts. It requires one
-receipt per replica of every affected shard and validates source fences, exact
-SQL, portable schema, declared columns, placement, and local-index metadata.
-Replicas are identified by group plus node/member: a multigroup node can reuse
-the same member number in several groups. Response arrival order does not change
-the resulting plan. This is a cold planning API, not PostgreSQL execution or a
-durable coordinator journal.
-
-### Supply the exact target plan
-
-The plan is strict canonical `vibejson`. Whitespace, reordered object members,
-duplicate fields, malformed hexadecimal identities, and trailing bytes are
-rejected. `operation` is a nonzero 32-byte identifier encoded as 64 lowercase
-hexadecimal characters. `node` is a 16-byte node identity and
-`apply_contract` is a 32-byte digest, both in lowercase hexadecimal.
-
-This shortened example shows one three-replica changed group. Use absolute paths
-so retries do not depend on the process working directory:
-
-```json
-{"operation":"1111111111111111111111111111111111111111111111111111111111111111","replicas":[{"apply_contract":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bundle":"/var/lib/vibedb/rollouts/group-7-member-1.vibejson","member":1,"node":"01010101010101010101010101010101"},{"apply_contract":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bundle":"/var/lib/vibedb/rollouts/group-7-member-2.vibejson","member":2,"node":"02020202020202020202020202020202"},{"apply_contract":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bundle":"/var/lib/vibedb/rollouts/group-7-member-3.vibejson","member":3,"node":"03030303030303030303030303030303"}],"target_catalog":"/var/lib/vibedb/catalog/catalog-42.vibejson"}
-```
-
-Include three entries for each additional changed group. Unchanged groups do
-not need entries. The manifest is capped at 4 MiB and each replica-local bundle
-at 64 MiB.
+A prepared bundle is not serving authority. The shard materializes and verifies
+it away from the live generation and returns an installation receipt. Retain
+every receipt and operation file; do not rename, delete, or hand-edit installer
+journals to work around a conflict.
 
 ## Run the rollout
 
-Use the same authenticated catalog, TLS, shard-peer, and stable session flags as
-`vibedb-gateway serve`, then add the replica-control manifest and rollout plan:
+Use the same replicated-catalog, TLS, authorization, peer, and stable-session
+options as `vibedb-gateway serve`, plus the control manifest and plan:
 
-```bash
+```text
 vibedb-gateway schema-rollout \
-  -catalog /var/lib/vibedb/catalog/genesis.vibejson \
-  -catalog-route-seed /var/lib/vibedb/gateway/catalog-route-seed.vibejson \
-  -catalog-relation 1 \
-  -catalog-session-journal /var/lib/vibedb/gateway/catalog-session \
-  -durable-ack-key /run/secrets/vibedb/durable-ack-key \
-  -catalog-client-id 00112233445566778899aabbccddeeff \
-  -catalog-retry-home 0011223344556677 \
-  -tls-certificate /etc/vibedb/gateway.crt \
-  -tls-key /etc/vibedb/gateway.key \
-  -tls-roots /etc/vibedb/cluster-ca.crt \
-  -tls-identity-oid 1.3.6.1.4.1.example \
-  -authorization-policy /etc/vibedb/authorization.vibejson \
+  <replicated-catalog-session-and-TLS-options> \
   -replica-control-manifest /etc/vibedb/replica-control.vibejson \
-  -schema-rollout-plan /var/lib/vibedb/rollouts/catalog-42.vibejson \
-  -shard-peer 10.0.0.11:7432=01010101010101010101010101010101 \
-  -shard-peer 10.0.0.12:7432=02020202020202020202020202020202 \
-  -shard-peer 10.0.0.13:7432=03030303030303030303030303030303
+  -schema-rollout-plan /var/lib/vibedb/rollouts/catalog-next.vibejson
 ```
 
-Replace the example identity OID and endpoints with values certified for your
-cluster. The command does not accept plaintext mode.
+The command prints target catalog generation, replicated operation revision,
+and total elapsed time only after completion.
 
-The command performs this ordered protocol:
+## Two state machines
 
-1. Each affected replica durably stages and validates its immutable local
-   bundle without changing serving state.
-2. The gateway folds the three authenticated replica receipts into one
-   constant-size witness per changed group.
-3. Catalog RF3 records the bounded rollout intent as planned.
-4. Catalog RF3 advances it to running. This is the no-return boundary.
-5. Every shard authorizes its exact transition through Raft, atomically swaps
-   the pinned live generation, and reports the target active.
-6. Only after all replicas are active does catalog RF3 compare-and-swap the
-   global catalog head and mark the operation complete.
+Do not use the catalog operation state as a substitute for each replica's local
+installation state.
 
-The command prints the target catalog generation, operation revision, and
-elapsed time after completion.
+### Replicated catalog journal
 
-## Recover from interruption
+| State | Meaning | Recovery rule |
+| --- | --- | --- |
+| `Planned` | Exact target intent and folded prepared-group root are recorded | May be cancelled before authorization |
+| `Running` | Catalog authorized shard activation; this is the no-return boundary | Rollback is refused; finish forward |
+| `Complete` | Every required replica reported active and the target catalog head was conditionally published | Exact replay is idempotent |
+| `Cancelled` | A still-planned operation was aborted | It cannot later cross into running |
 
-Retry the same command with the byte-identical plan and stable gateway catalog
-session identity. The operation identifier, catalog digests, group receipts,
-and replica installation digests make prepare, authorize, activation, and
-catalog publication idempotent.
+### Replica-local installer journal
 
-Before the operation becomes running, catalog authority may abort it. Once it
-is running, rollback is deliberately refused: some replicas may already serve
-the new generation while the global catalog still points at the old one. The
-safe recovery is to finish forward. Stale-generation proposal and read fences
-prevent a mixed replica from silently applying the wrong contract.
+| State | Meaning | Serving effect |
+| --- | --- | --- |
+| `Prepared` | Immutable target artifact and installation digest are durable | None |
+| `Authorized` | Exact catalog authorization is durable; committing the RF3 transition is a separate observed action before activation | The old local generation remains live |
+| `Active` | The exact prepared generation has been atomically selected locally | New-generation serving is locally possible, subject to catalog/routing fences |
+| `Drained` | Target catalog is complete and an exact proof says old execution pins are released | Old generation may be reclaimed |
 
-`serve-rf3` also handles a crash after the exact schema command commits at
-source applied position N+1 but before the local SQL catalog publishes its
-replacement. Startup authenticates the retained command, checkpoint membership,
-authorization, and catalog compare-and-swap proof. It opens the old source only
-as a fenced recovery handle, finishes that exact catalog publication, closes
-the source, and then opens the target before creating the serving runtime.
-An authenticated prepared-but-uncommitted source follows the old-schema path;
-mismatched or ambiguous proofs fail closed.
+The only valid local sequence is
+`Prepared → Authorized → Active → Drained`. Every transition is a revisioned
+compare-and-swap. An error may be outcome-unknown; recovery rereads the journal
+and observes physical state before retrying an irreversible action.
 
-The shard retains both generations until an exact drain proof establishes that
-old catalog leases and execution pins are gone. Draining is separate from
-catalog publication; never delete old relation files manually.
+## Ordered protocol
 
-After exact source drain, the shard retains a bounded `.schema-lineage` record
-containing the selected catalog and its activation/membership proofs. The
-immutable `.schema-origin` binds it to the original startup identity. Only this
-durably selected, drained generation authorizes replacement of the old
-`.schema-target-catalog`, `.schema-membership-stage`, and `.schema-activation`
-slots. Every replacement must be its exact successor; a newer generation number
-alone is insufficient. Restart authenticates the original identity before
-adopting the retained lineage, and still requires an exact one-generation
-transition for an undrained successor. Do not delete these files.
+1. Validate the base/target catalog pair and every replica request.
+2. Prepare and authenticate every replica-local bundle without changing live
+   serving state.
+3. Fold the three replica receipts per changed group into bounded group evidence.
+4. Record the catalog operation as `Planned`.
+5. Advance it to `Running`. From this point, abort is forbidden.
+6. Send the exact authorization to every replica; each commits the same RF3
+   transition, activates its pinned target, and reports `Active`.
+7. Only after all required replicas are active, conditionally publish the target
+   global catalog and mark the operation `Complete`.
+8. Separately prove old catalog leases and execution pins are gone, then move
+   replicas to `Drained` and reclaim only predecessor state.
 
-The local repeated-generation lifecycle is covered by a 1,000-row test with two
-index creations, index removal, TRUNCATE, another index removal, and restarts at
-prepared, pre-proposal, and drained boundaries. It also tests an interrupted
-lineage directory fence and refusal to replace undrained proofs. This does not
-by itself qualify a live quorum. A separate three-member physical SQL/WAL test
-seeds 1,000 typed rows per member, recovers committed-source interruptions before
-catalog publication across three successive DDL operations, and adopts each
-recovered generation into the Raft runtime. This still does not complete the
-PostgreSQL coordinator: durable gateway operation records, route
-gate acquisition/recovery, catalog publication, and multi-replica drain must be
-wired and qualified together before exposing these statements through SQL.
+There can be a recovery interval in which some replicas are locally active while
+the global catalog still names the old generation. This is expected and fenced;
+it is why `Running` cannot be rolled back.
 
-## Resource bounds
+## Recover an interrupted rollout
 
-The serving path applies hard bounds:
+Rerun the same command with the byte-identical plan, operation ID, catalog
+session identity, retry home, and durable journals.
 
-- gateway rollout fan-out: at most 64 concurrent replica operations;
-- shard installer concurrency: 8 operations;
-- control protocol: fixed 592-byte requests and 652-byte responses, plus the
-  bundle on prepare;
-- bundle size: at most 64 MiB per replica;
-- shard artifact store: at most 16 artifacts and 1 GiB;
-- shard rollout journal: at most 256 records; and
-- persisted catalog operation state and group receipt roots: constant-size,
-  independent of relation cardinality.
+- Before `Running`, catalog authority may cancel the plan.
+- At or after `Running`, always finish forward. A replacement controller settles
+  catalog compare-and-swap and shard outcome-unknown results by observation.
+- If RF3 committed the exact transition but the local SQL catalog was not
+  published before a crash, startup authenticates the retained command and
+  proofs, fences the predecessor, finishes the target publication, then opens
+  the runtime.
+- A merely prepared/uncommitted target leaves the old schema active.
+- Ambiguous commands, a non-neutral WAL suffix, stale generation, changed bundle,
+  mixed contract, missing authorization, or conflicting lineage fail closed.
+- Old files remain until exact drain. Never delete `.schema-*` lineage,
+  activation, membership, target-catalog, or journal files manually.
 
-These are admission and storage ceilings, not recommended saturation targets.
-Measure foreground p99.9 latency, checkpoint time, network bytes, retained old
-generation bytes, and recovery duration before increasing cluster concurrency.
+## Successive changes
 
-## Verify the safety contract
+One rollout authorizes one `N → N+1` transition. Bounded lineage records allow
+the implementation to recognize an exactly drained predecessor, but that is not
+a promise of an arbitrary repeated-rollout service. Before planning another
+change, require the previous catalog operation to be complete, prove every
+affected replica drained, build a new exact successor from the now-current
+catalog, and requalify the sequence on the pinned build.
 
-The logical SQL relation digest is not the exact replicated machine-schema
-digest used in command fences. Initial routing and restore now compute those
-domains separately. Rollout validation requires a common logical schema cut
-across a distribution while retaining each shard's exact machine manifest;
-different shard ranges legitimately have different machine digests. Targeted
-normal and race tests cover the DDL planner with two shards on the same three
-nodes, including index creation/removal and TRUNCATE. These gates are not a
-claim that every logical-to-machine digest caller is qualified.
+## Limits and claim boundary
 
-Schema-directory publication and retry paths sync their directory entries
-before exposing authority. Local normal and race tests cover exact committed
-source recovery, fenced handles, and settlement before runtime startup. The
-Linux real-storage startup test reopens the actual WAL, SQL, and apply state at
-prepared and committed-before-publication cuts. It is still a same-build test
-process, not power-loss coverage at every filesystem publication cut, a rolling
-fleet test, or an external quorum qualification. This remains an experimental
-rollout boundary.
+Current hard ceilings include 64 concurrent gateway replica operations, 8 shard
+installer operations, 64 MiB per bundle, 16 retained shard artifacts, 1 GiB of
+artifact storage, and 256 shard rollout journal records. These are refusal
+bounds, not recommended capacity or latency targets.
 
-Repository gates cover restart after a leader-loss outcome-unknown error, the
-mixed-generation interval, refusal to roll back after authorization, an old
-global catalog until every replica is active, and exact completion from a fresh
-process. The gate also bounds elapsed time, encoded protocol bytes, process
-memory, and durable controller state.
+Tests cover exact preparation, mixed-generation recovery, outcome-unknown
+catalog writes, refusal to roll back after authorization, and selected
+same-build restart cuts. They do not establish:
 
-See:
+- arbitrary PostgreSQL DDL compatibility;
+- zero-pause or zero-overhead changes;
+- bounded filesystem latency on every device;
+- every crash/power-loss point;
+- mixed-version or rolling-fleet compatibility; or
+- safe repeated production migrations.
 
-- [`gateway/schema_rollout_process_test.go`](../../gateway/schema_rollout_process_test.go)
-- [`gateway/schema_rollout_controller.go`](../../gateway/schema_rollout_controller.go)
-- [`cmd/vibedb-shard/schema_install_rf3.go`](../../cmd/vibedb-shard/schema_install_rf3.go)
-- [`cmd/vibedb-shard/schema_startup_recovery.go`](../../cmd/vibedb-shard/schema_startup_recovery.go)
-- [`cmd/vibedb-shard/schema_startup_recovery_linux_test.go`](../../cmd/vibedb-shard/schema_startup_recovery_linux_test.go)
-- [`internal/schemainstall/control.go`](../../internal/schemainstall/control.go)
+## Source map
+
+| Boundary | Source |
+| --- | --- |
+| Catalog intent, authorization, completion, and abort | [`gateway/schema_rollout.go`](../../gateway/schema_rollout.go) |
+| Fan-out, resume, and drain coordinator | [`gateway/schema_rollout_controller.go`](../../gateway/schema_rollout_controller.go) |
+| Plan construction from exact receipts | [`gateway/schema_ddl_plan.go`](../../gateway/schema_ddl_plan.go), [`cmd/vibedb-gateway/schema_rollout_admin.go`](../../cmd/vibedb-gateway/schema_rollout_admin.go) |
+| Local states, requests, authorization, and drain proof | [`internal/schemainstall/types.go`](../../internal/schemainstall/types.go) |
+| Durable local CAS journal | [`internal/schemainstall/journal.go`](../../internal/schemainstall/journal.go) |
+| Prepare/activate/drain observation | [`internal/schemainstall/installer.go`](../../internal/schemainstall/installer.go), [`internal/schemainstall/artifacts.go`](../../internal/schemainstall/artifacts.go) |
+| RF3 exact-successor validation and physical activation | [`cmd/vibedb-shard/schema_install_rf3.go`](../../cmd/vibedb-shard/schema_install_rf3.go) |
+| Committed-before-publication restart recovery | [`cmd/vibedb-shard/schema_install_recovery.go`](../../cmd/vibedb-shard/schema_install_recovery.go), [`cmd/vibedb-shard/schema_startup_recovery.go`](../../cmd/vibedb-shard/schema_startup_recovery.go) |

@@ -1,69 +1,35 @@
 # Unsafe-code boundary
 
-VibeDB uses `unsafe` where a bounded low-level representation or platform API
-needs it. Unsafe code is not an alternative path around validation. Each use
-must preserve ownership, alignment, bounds, and lifetime contracts.
+VibeDB uses `unsafe` for pointer-free external storage, mapped byte views,
+word/SIMD loads, and platform I/O. Unsafe code does not bypass validation: each
+use must prove bounds, alignment, ownership, and lifetime.
 
-## Main use families
-
-### External memory
-
-`internal/storemem.Block` uses anonymous `mmap` on supported Unix targets and a
-Go byte slice elsewhere. Its bytes become invalid after `Close`.
-
-Mapped key, document, index, and durable arena structures create typed views of
-pointer-free byte storage. Owning state must retain the backing block because
-the garbage collector cannot find a pointer that exists only inside mapped
-memory.
-
-External memory can make RSS much larger than Go `HeapAlloc`. Use VibeDB
-external-memory metrics when you assess residency.
-
-### Borrowed views
-
-Borrowed keys, documents, and typed slices remain valid only for the lifetime
-of their owner. The owner can be a callback, immutable state, snapshot,
-session, collection, or I/O submission.
-
-Do not retain borrowed data after a mutation, snapshot close, session run,
-session release, collection close, or callback return when that event ends the
-documented lifetime.
-
-### Word loads and SIMD
-
-Checksum and SIMD paths use unaligned or architecture-specific word loads.
-Each path must validate the available byte count before the load. Portable and
-optimized implementations need differential tests.
-
-### Platform I/O
-
-Linux `io_uring` code maps kernel rings and registered buffers. Darwin hole
-punching uses an unsafe ABI call. These paths must keep platform build tags,
-alignment checks, fallback behavior, and resource teardown tests.
-
-## Review rules
-
-For each unsafe change:
+## Review contract
 
 1. Keep Go pointers out of pointer-free external storage.
-2. Do not retain a Go pointer as `uintptr` across a safe point.
-3. Prove size, alignment, offset, and capacity before a typed view or load.
+2. Never retain a Go pointer as `uintptr` across a safe point.
+3. Validate length, offset, alignment, and capacity before a typed view/load.
 4. Keep the backing owner alive for the complete borrow.
-5. Invalidate all views before you release external memory.
-6. Add portable differential tests for an optimized path.
-7. Run race, checkptr, corruption, and lifecycle tests that match the change.
-8. Regenerate the production-file inventory.
+5. Invalidate borrowed views before releasing the backing storage.
+6. Provide a portable differential oracle for optimized code.
+7. Run the matching race, checkptr, corruption, and lifecycle tests.
 
-Run this command after an unsafe import changes:
+External or mapped memory can make RSS materially larger than Go `HeapAlloc`.
+Borrowed bytes expire at the callback, snapshot, session, collection, mapping,
+or I/O lifetime documented by the owning API.
+
+Regenerate the inventory after a production `unsafe` import changes:
 
 ```bash
 go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
 ```
 
-## Generated production-file inventory
+## Generated root-module inventory
 
-The test parses Go imports. It excludes tests, testdata, vendor content, the
-Git directory, and nested Go modules.
+This inventory includes direct `unsafe` imports in non-test Go files in the
+root module across build tags. It excludes tests, `testdata`, vendor, nested Go
+modules, dependencies, Cgo, and the Git directory. It is an import inventory,
+not a proof that all transitive code is memory-safe.
 
 <!-- unsafe-file-list:start -->
 The root module contains 70 non-test Go files that import `unsafe`:
@@ -142,10 +108,9 @@ store/store_owned_documents.go
 ```
 <!-- unsafe-file-list:end -->
 
-## Implementation references
+## Source map
 
-- `internal/unsafeaudit/audit.go` and `audit_test.go`
-- `internal/storemem/block.go`
-- `store/store_mapped_keys.go` and `store/store_mapped_docs.go`
-- `store/store_owned_documents.go` and `store/store_index_packed.go`
-- `internal/storeio/iouring.go`
+- `internal/unsafeaudit`
+- `internal/storemem`
+- `internal/storeio`
+- `store/store_mapped_*` and `store/store_owned_documents.go`

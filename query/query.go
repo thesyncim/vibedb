@@ -4,12 +4,10 @@
 // into one compiled plan. The exported programmatic builder is the typed plan
 // API; SQL through [PrepareStatement] and [PrepareDML] is the sole textual
 // query language. Each document is one row and columns are JSON paths. It
-// answers SELECT of path projections and aggregates
-// (COUNT, SUM, AVG, MIN, MAX); WHERE with comparisons, containment (@>),
-// existence, and null tests combined by And/Or/Not; cross-collection
-// semi-joins and inner joins; GROUP BY; ORDER BY; and LIMIT. Subqueries and
-// mutation are outside this executor; the sql/driver package layers cataloged
-// DDL and whole-document DML over it.
+// answers SELECT projections, predicates, joins, grouping, ordering, windows,
+// set operations, derived relations, CTEs, and subqueries. The SQL lowering
+// path also prepares stored-row mutations; sql/driver adds catalog ownership,
+// transaction state, and publication.
 //
 // The builder and SQL parser are front ends for one immutable compiled plan,
 // cached inside the [Query] that produced it. Compiling resolves paths to
@@ -39,8 +37,8 @@
 // refills rather than reallocates, making steady-state lowering allocation-free
 // in the same way a warmed [Query.RunInto] is.
 //
-// Execution has exactly two entry points. [Query.Run] answers a one-off, and
-// [Query.RunInto] runs into a caller-owned [Exec] that retains the destination
+// Programmatically built Query execution has two main forms. [Query.Run]
+// answers a one-off, and [Query.RunInto] runs into a caller-owned [Exec] that retains the destination
 // Result, the scratch Workspace, the durable backend's options, and its
 // reported stats. Both take a [Source], the discriminated handle naming the
 // collection: [FromSegment], [FromSnapshot], [FromFile], [FromFileOverlay],

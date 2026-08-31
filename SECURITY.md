@@ -1,99 +1,91 @@
 # Security policy
 
-## Supported revisions
+> [!CAUTION]
+> VibeDB is unreleased development software with known defects and no support
+> window. Do not expose it to untrusted networks or use it for sensitive or
+> irreplaceable data. See [current status](docs/status.md).
 
-This development repository has no published support window. Security fixes
-land on `main`. Consumers must move to a fixing commit after they review and
-test it for their deployment.
+## Supported versions
+
+There are no supported versions. Security changes land on `main`; consumers
+must select, audit, and test a fixing commit themselves. Different commits may
+be wire- and disk-incompatible.
 
 ## Report a vulnerability
 
-This repository does not currently have a configured private vulnerability
-reporting channel. GitHub private vulnerability reporting is not enabled. Do
-not put exploit details, private data, affected code paths, or a reproducer in
-a public issue, pull request, discussion, or commit.
+This repository does not currently publish a verified private vulnerability
+reporting channel. Do not place exploit details, credentials, private data, or
+a reproducer in a public issue, pull request, discussion, or commit.
 
-You can open a public issue that contains only a request for the maintainers to
-establish a private reporting path. Do not include vulnerability details in
-that request. Wait until the maintainers publish and verify a private channel
-before you send confidential information.
+You may open a public issue containing only a request for maintainers to enable
+and verify a private reporting channel. Wait for that verified channel before
+sending confidential material. There is no promised response or disclosure
+deadline.
 
-After a private channel is available, include this information in the report:
+A useful private report should include:
 
-- The affected commit
-- Go version, architecture, operating system, and build flags
-- The smallest available reproducer
-- The expected confidentiality, integrity, availability, or durability impact
-- A safe method to validate a fix
+- exact commit and dirty state;
+- Go version, OS, architecture, filesystem, and build flags;
+- the smallest safe reproducer;
+- confidentiality, integrity, availability, or durability impact;
+- a method to verify the fix without exposing secrets.
 
-Relevant reports include:
+## Embedded boundary
 
-- Authentication or authorization bypass
-- SQL, JSON, catalog, or protocol validation errors
-- Out-of-bounds access or unsafe-pointer lifetime errors
-- Data corruption or invalid recovery acceptance
-- Unbounded resource use or denial of service
-- A stale topology or identity fence that permits unintended execution
-- A durability acknowledgement that does not match the selected contract
+The `vibedb`, `query`, and `sql/driver` packages open no listeners. The
+embedding process owns network exposure, authentication, authorization,
+filesystem permissions, backup protection, and process isolation.
 
-The project does not promise a fixed response or disclosure deadline. After a
-maintainer accepts a report through a configured private channel, the report
-must stay private while maintainers reproduce the issue and validate a fix.
-
-### Maintainer release action: enable private vulnerability reporting
-
-Before a release, maintainers must enable GitHub private vulnerability
-reporting for this repository. They must verify that a non-maintainer can open
-the private report form, then replace this section with the tested reporting
-path. Do not publish a private-reporting link before that verification passes.
+Writer locks coordinate cooperating VibeDB processes only. They do not protect
+against an administrator or external process that truncates, replaces, copies,
+or edits a live file. Keep database files, journals, transaction logs, catalogs,
+keys, and parent directories in one trusted administrative boundary.
 
 ## Network boundary
 
-The embedded `vibedb`, `query`, and `sql/driver` packages do not open network
-listeners. Applications that expose them own the surrounding network and
-authorization boundary.
+Distributed commands require TLS and an authorization policy except for
+explicit literal-loopback development modes. Service identity comes from an
+exact certificate extension and binary NodeID—not DNS names, certificate
+subjects, or common names. Traffic classes and capabilities are separate.
 
-The `vibedb-gateway serve` and `vibedb-shard serve` commands require mutual TLS
-and a canonical authorization policy by default. Their
-`-dev-plaintext-loopback` flag is an explicit unauthenticated development mode.
-It is mutually exclusive with TLS and policy flags, and the commands reject a
-non-loopback listener. Do not use a proxy, container port mapping, SSH tunnel,
-or port forward to make that plaintext listener reachable from an untrusted
-network.
+The `-dev-plaintext-loopback` and `-pg-dev-listen` paths are unauthenticated
+development conveniences. Do not expose them through a proxy, container port
+mapping, tunnel, or port forward. The local RF3 tutorial uses trust auth and no
+TLS intentionally; it is not a deployment template.
 
-`vibedb-shard serve-rf3` has no plaintext mode. Its peer, native, snapshot, and
-control listeners use TLS 1.3 profiles that authenticate exact node identities.
-The native and control paths also enforce capabilities from the configured
-authorization policy. The gateway's authenticated client boundary checks the
-complete request semantics before dispatch, and shards independently check
-delegated requests.
+The standalone pgwire server must be configured with SCRAM, TLS,
+`RequireTLS`, bounded deadlines, and an appropriate listener for any untrusted
+boundary. `Trust()` is local-only. SSLRequest negotiation is implemented;
+direct TLS and SCRAM-SHA-256-PLUS are not.
 
-The standalone `pgwire` package has a separate configuration boundary.
-`pgwire.NewServer` requires the caller to select `SCRAM(...)` or `Trust()`
-explicitly, but TLS is enabled only when the caller supplies `TLSConfig`.
-Plaintext is rejected only when `RequireTLS` is true. Use SCRAM, configure TLS,
-set `RequireTLS`, and bind an appropriate listener for an untrusted network.
-`Trust()` and the gateway's `-pg-dev-listen` endpoint are for a trusted local
-development boundary only.
+TLS rotation closes old-generation streams. A response lost after request send
+can have an unknown outcome. Mutation protocols must retry the exact retained
+identity and bytes, never synthesize a new command because a connection closed.
 
-TLS authenticates service and client identities. It does not make every
-principal an operator. Keep authorization policies least-privileged. Protect
-certificate private keys, WAL keys, durable ACK keys, and retained journals.
-Rotate a policy generation when access changes.
+## Secrets and state
 
-## Local-file boundary
+Protect at least:
 
-Writer locks coordinate cooperating VibeDB processes. They do not protect a
-file from an external process that truncates, replaces, copies, or edits it.
-Keep database files, journals, lock entries, catalogs, and parent directories
-inside the same trusted administrative boundary.
+- TLS private keys and roots;
+- authorization policies and identity manifests;
+- Raft WAL keys and durable acknowledgement keys;
+- gateway session journals and route seeds;
+- backup repositories, restore permits, and generated development PKI.
 
-## Implementation references
+The Kubernetes qualification script creates disposable credentials and leaves
+its private temporary directory for inspection. Remove that directory safely
+after collecting required evidence.
 
-- `cmd/vibedb-gateway/serve.go`: `runServe` and `requireLoopbackListen`
-- `cmd/vibedb-shard/main.go`: `runServe` and `requireLoopbackListen`
-- `cmd/vibedb-shard/serve_rf3.go`: `servePreparedRF3`
-- `internal/rafttransport/identity.go`: `PeerTLS`
-- `gateway/client_tls.go`: `ClientTLS.ServeAuthorizedClients`
-- `shardservice/server.go`: `Server.ServeAuthorizedConn`
-- `pgwire/server.go`: `Options` and `NewServerWithBackend`
+## Current security-relevant gaps
+
+At the audited commit, the malformed SQL string `SELECT 1 GARBAGE` is
+misclassified as read-only by the service authorization classifier, and its
+test fails. Do not treat current distributed SQL authorization as production
+qualified. Other known sharp edges are listed in [current status](docs/status.md).
+
+## Source map
+
+- `internal/servicetls` and `internal/rafttransport/identity.go`
+- `internal/serviceauthz` and `gateway/client_tls.go`
+- `pgwire/server.go`, `session.go`, and `scram.go`
+- `cmd/vibedb-gateway/serve.go` and `cmd/vibedb-shard/*.go`

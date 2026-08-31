@@ -1,104 +1,181 @@
-# Observe a distributed cluster
+# Observe an RF3 development cluster
 
-The distributed runtime is experimental and unreleased. Its first shipped
-operator counter surface is the gateway `metrics` request. Send it over the
-same mutually authenticated client listener used for data requests:
+> [!CAUTION]
+> The metrics surface is an unstable development protocol. Field names, counters,
+> collection cadence, and wire format can change or break at any commit. VibeDB
+> currently provides no production monitoring integration, SLOs, alert policy,
+> persistent time series, or compatibility promise for dashboards.
 
-```vibejson
+## Read the current counter snapshot
+
+Send the closed canonical request over the gateway's authenticated native
+listener:
+
+```json
 {"op":"metrics"}
 ```
 
-The authenticated principal must have `topology` capability. The request is
-closed: SQL, parameters, request identities, classes, and result budgets are
-rejected rather than ignored. Development plaintext may use it only on the
-explicit loopback-only listener.
+The peer needs `topology` capability. No SQL, parameters, request identity,
+class, routing hint, or result budget may accompany the operation. The composed
+distributed path uses TLS; explicit development plaintext is limited to the
+loopback-only listener.
 
-The response is one canonical direct-`vibejson` object. A replicated gateway
-adds `distributed_metrics` beside its process-local routing counters:
+The response can contain three objects:
 
-```vibejson
-{"metrics":{"route_single":0,"route_targeted":0,"route_scatter":0,"route_empty":0,"shards_fanned":0,"rows_returned":0,"bytes_returned":0,"retries":0,"scatter_all_shards":0,"scatter_unknown_route":0}}
+| Object | Present when | Scope |
+| --- | --- | --- |
+| `metrics` | Always | Routing/fan-out counters from this gateway process |
+| `distributed_metrics` | Replicated routes and shard-control collection are configured | Cached per-group/per-node RF3 cuts plus a saturating aggregate |
+| `controller_metrics` | Move/split controllers are configured | Loop counters from this gateway process |
+
+All values are unsigned 64-bit integers except `overflow` and identity fields.
+They are raw counters/gauges, not rates. Derive rates and retain source/process
+identity outside VibeDB.
+
+## Gateway routing counters
+
+`metrics` has this fixed field set:
+
+| Field | Meaning |
+| --- | --- |
+| `route_single` | operations routed to one shard |
+| `route_targeted` | operations routed to a bounded shard subset |
+| `route_scatter` | scatter operations |
+| `route_empty` | operations with no route |
+| `shards_fanned` | cumulative selected-shard count |
+| `rows_returned` | rows reported by completed results |
+| `bytes_returned` | encoded result bytes reported by completed results |
+| `retries` | stale-generation retries |
+| `scatter_all_shards` | scatters whose resolved route covered every shard |
+| `scatter_unknown_route` | scatters caused by no usable bound prefix |
+
+These counters start with the gateway process. They do not include client wire
+bytes, shard-control traffic, Raft traffic, retries below this accounting point,
+or storage I/O.
+
+## Distributed RF3 snapshot
+
+> [!WARNING]
+> A current constructor defect can panic on a nonzero-group metrics request if
+> a custom service was given a `Provider` that does not also implement
+> `GroupProvider`. Group-serving configurations must supply `GroupProvider`;
+> the constructor does not currently reject the invalid combination.
+
+The gateway fixes the group/member and unique-node sample directory from its
+startup routes. A bounded worker set periodically performs authenticated
+shard-control reads. Each internal request is exactly 80 bytes and each response
+is exactly 408 bytes.
+
+`distributed_metrics.members` contains two kinds of entries:
+
+- `node_aggregate:false`: one exact group/member/node identity and nine RF3
+  progress counters;
+- `node_aggregate:true`: one physical process/node and 27 service-stage values.
+  Its group is zero and member is zero.
+
+Do not merge entries by a display label or infer a missing member. Complete
+cluster, incarnation, topology-recovery epoch, shard, group, member, and node
+identity define a group sample.
+
+The aggregate includes `samples`, `collection_reads`, `collection_faults`, and
+`overflow`. RF3 progress is summed only from group entries; service stages are
+summed only from node aggregates, avoiding duplicate process-stage accounting.
+Addition saturates at `uint64` maximum and sets `overflow=true`.
+
+### RF3 progress fields
+
+| Fields | Exact scope |
+| --- | --- |
+| `proposal_commands`, `proposal_bytes` | commands/bytes observed by the RF3 proposal path |
+| `applied_entries` | entries applied by the state machine |
+| `ready_persisted` | durable Ready-processing steps; not quorum acknowledgements |
+| `snapshots_finished` | completed snapshot applies |
+| `read_completions` | completed ReadIndex operations |
+| `raft_faults` | faults counted by this RF3 runtime |
+| `quorum_commit_advancements`, `committed_entries` | authoritative commit-index movement and entry count; no latency or byte total |
+
+### Node service-stage fields
+
+| Area | Fields |
+| --- | --- |
+| Checkpoint | `checkpoint_applied`, `checkpoints`, `physical_checkpoints`, `checkpoint_barrier_syncs` |
+| WAL | `wal_live_bytes`, `wal_entries`, `wal_syncs` |
+| Live backup | `backup_requests`, `backup_faults`, `backup_logical_bytes`, `backup_scan_bytes` |
+| Snapshot transfer | `snapshot_transfer_chunks`, `snapshot_transfer_bytes`, `snapshot_resident_bytes` |
+| Replica action | `replica_action_requests`, `replica_action_completions`, `replica_action_faults` |
+| Split control | `split_control_requests`, `split_control_completions`, `split_control_faults` |
+| Cold bootstrap | `bootstrap_requests`, `bootstrap_chunks`, `bootstrap_bytes`, `bootstrap_completions`, `bootstrap_faults`, `bootstrap_resident_bytes`, `bootstrap_inflight` |
+
+`wal_live_bytes`, resident-byte fields, and in-flight work are gauges and may
+decrease. Most event counts reset on process restart. Collection read/fault
+counters describe gateway refresh attempts, not shard health authority.
+
+### Backup double-scan accounting
+
+A successful live backup pins one immutable group snapshot, scans it once to
+derive exact geometry/hash, then scans the same cut again while streaming. On
+success the service adds:
+
+```text
+backup_logical_bytes += artifact_bytes
+backup_scan_bytes    += 2 * artifact_bytes
 ```
 
-`distributed_metrics` contains a saturating aggregate, an `overflow` flag, and
-one bounded `members` array. A member entry binds the complete RF3 group key,
-member ID, node ID, collection read/fault counts, and the exact counter cut.
-Node-aggregate entries are marked with `node_aggregate:true` and carry service
-stages that are physical-process rather than per-group values. The fixed
-catalog route directory bounds the array. Clients must not merge entries by a
-string label or infer a missing group.
+The 2× value is intentional read amplification. It does not mean two repository
+copies or twice the network output. These byte counters advance only after the
+complete export succeeds; partial failed scan work is represented by
+`backup_faults`, not necessarily by proportional scan bytes.
 
-When replica-move or split controllers are configured, `controller_metrics`
-reports pass, discovered, advanced or triggered, completed, fault, cumulative
-duration, and maximum-duration counters for those gateway loops. These are
-process-incarnation counters. Replicated operation records remain the recovery
-and topology authority.
+## Controller loop counters
 
-Values are fixed-width `uint64` counters and gauges. Event counters increase
-within the source process incarnation, while live WAL bytes, resident bytes,
-and in-flight work can decrease normally. A scrape collector should retain
-source identity externally and distinguish a counter reset from a gauge
-change. Derive rates outside the serving path. The encoder walks a fixed field
-table directly. It does not build maps, strings, or a generic JSON tree.
+`controller_metrics` exposes move and split loop activity:
 
-## Current coverage
+- move: `move_passes`, `move_discovered`, `move_advanced`, `move_completed`,
+  `move_faults`, `move_duration_ns`, `move_duration_max_ns`;
+- split: `split_passes`, `split_discovered`, `split_triggered`,
+  `split_completed`, `split_faults`, `split_duration_ns`,
+  `split_duration_max_ns`.
 
-| Stage | Available evidence | Shipped operator surface |
-| --- | --- | --- |
-| Routing and fan-out | route class, shards fanned, scatter reason, returned rows/bytes, stale-route retries | `{"op":"metrics"}` |
-| Proposal, quorum, and apply | proposal commands/bytes, authoritative commit-index advancements and committed entries, applied entries, persisted Ready steps, completed ReadIndex operations, and Raft faults | Per-group member entries and saturating aggregate |
-| Snapshot apply and transfer | finished snapshot applies, transfer chunks/bytes, and current resident transfer bytes | Per-group apply counter plus node-aggregate transfer counters |
-| Checkpoint and WAL | checkpoint applied index, logical/physical checkpoint counts, barrier syncs, WAL live bytes, entries, and syncs | Node-aggregate entries and saturating aggregate |
-| Replica action | authenticated requests, completions, and faults | Node-aggregate entries and saturating aggregate |
-| Split control | authenticated requests, completions, and faults | Node-aggregate entries and saturating aggregate |
-| Target bootstrap | requests, chunks/bytes, completions, faults, and current resident bytes/in-flight work | Node-aggregate entries and saturating aggregate |
-| Split and move controller | passes, discovered work, advanced/triggered work, completions, faults, cumulative duration, and maximum duration | Gateway `controller_metrics` object |
-| Live backup | requests, faults, logical artifact bytes, and snapshot scan bytes | Node-aggregate entries and saturating aggregate |
-| Leadership and exact catalog operation phase | Runtime and replicated operation observations exist | Not exported by this counter surface |
+Durations cover controller passes in this gateway incarnation. They are not
+per-operation phase latency, queue delay, foreground latency, or a replicated
+operation clock. The replicated catalog records remain recovery/topology
+authority.
 
-`internal/servicemetrics.Client` sends a fixed 80-byte request and retrieves a
-fixed 408-byte RF3 snapshot
-over the mutually authenticated shard-control traffic class. The peer must
-have `topology` capability. A group request returns the exact group/member cut.
-A zero group request returns the node-aggregate service stages. The response
-has no string labels and no unbounded field.
+## Interpretation limits
 
-The gateway fixes the complete group/member and unique-node directory at
-startup. A bounded worker set refreshes it over authenticated shard control.
-Slow nodes consume only their worker and configured deadline. Readers use a
-lock-free seqlock snapshot, saturating arithmetic, and direct `vibejson`
-encoding. Collection failure increments an explicit fault counter and never
-becomes topology authority.
+The metrics response is **not** a simultaneous cluster snapshot. Each remote
+sample has its own collection time and exact per-source cut. The aggregate is a
+telemetry sum, not a quorum certificate, common applied position, or global
+consistency witness.
 
-Refreshes do not create a simultaneous cluster-wide observation cut. Aggregate
-indexes and counts are telemetry sums, not a quorum certificate or a common
-applied position. Use exact per-group observations for operational diagnosis.
+The current surface does not expose:
 
-Do not infer absent stage timing from request latency. A completion counter does
-not expose quorum duration, apply duration, or response-settlement duration.
-`ready_persisted` counts durable Ready handling. It is not a quorum counter.
-`quorum_commit_advancements` and `committed_entries` observe authoritative
-commit-index movement, but do not measure quorum latency or committed bytes.
-The surface also does not export latency histograms, total network bytes,
-device writes, the exact replicated split or move phase, controller queue
-depth, catalog age, or leader identity.
+- latency histograms, percentiles, traces, or SLO/error-budget calculations;
+- total client, Raft, shard-control, backup, or snapshot-transfer network bytes;
+- filesystem, block-device, or media-write totals;
+- leader identity, catalog age, controller queue depth, or exact replicated
+  split/move/backup/restore phase;
+- quorum, apply, checkpoint, response-settlement, failover, or recovery latency;
+- CPU, file descriptors, process RSS, disk capacity, or host health; or
+- durable counters across restart.
 
-## Performance contract
+In particular, `proposal_bytes` is not total network traffic,
+`snapshot_transfer_bytes` is not all cluster traffic, `wal_syncs` is not a
+device-write count, and a completion count is not a duration. Build alerts only
+from semantics the source actually exports.
 
-Observability must remain downstream of correctness and off the hot path:
+Collection failure increments explicit fault counters and leaves the last cached
+sample; it never changes routing, membership, cleanup, acknowledgement, split,
+or move authority.
 
-- Mutation paths update fixed-width atomics or already-required progress
-  records only.
-- Public encoding reads one bounded snapshot and uses direct `vibejson`.
-- Group, node, and operation identities remain fixed-width values rather than
-  unbounded labels.
-- Collectors bound concurrency, response bytes, and scrape time.
-- Telemetry failure never authorizes routing, membership, split, move, cleanup,
-  or acknowledgement.
+## Source map
 
-Live backup reports logical artifact bytes separately from snapshot scan bytes.
-The current deterministic hash-before-stream design reads the pinned image
-twice, so the scan counter advances by exactly 2× encoded artifact bytes. This
-is explicit read amplification. The repository does not create a second
-artifact disk copy. Any future one-pass framing change must preserve the exact
-header/hash contract and update this evidence rather than hiding the scan.
+| Boundary | Source |
+| --- | --- |
+| Gateway route/fan-out counters | [`gateway/metrics.go`](../../gateway/metrics.go) |
+| Fixed sample directory, refresh, and saturating aggregate | [`gateway/distributed_metrics.go`](../../gateway/distributed_metrics.go) |
+| Public request validation and exact response fields | [`cmd/vibedb-gateway/serve_metrics.go`](../../cmd/vibedb-gateway/serve_metrics.go) |
+| Move/split controller counters | [`cmd/vibedb-gateway/controller_metrics.go`](../../cmd/vibedb-gateway/controller_metrics.go) |
+| Fixed 80/408-byte authenticated RF3 exchange | [`internal/servicemetrics/service.go`](../../internal/servicemetrics/service.go) |
+| Mapping runtime/WAL/checkpoint/service counters to node stages | [`cmd/vibedb-shard/rf3_metrics.go`](../../cmd/vibedb-shard/rf3_metrics.go) |
+| Backup requests, faults, logical bytes, and double-scan bytes | [`internal/clusterbackupservice/service.go`](../../internal/clusterbackupservice/service.go) |

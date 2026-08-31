@@ -1,25 +1,29 @@
-# Install and run VibeDB
+# Get started with the embedded database
 
-This tutorial creates a durable database, writes a JSON document, reads it, and
-uses a transaction. It uses the native facade.
+> [!CAUTION]
+> This tutorial uses an unreleased development API and disk format. Pin one
+> exact commit and use disposable data. A later commit may not open the files
+> created here.
 
-## 1. Create a module
+In this tutorial you will create a durable database, write two JSON documents,
+read one back, and reopen the database.
+
+## Prerequisites
+
+- The Go toolchain declared by [`go.mod`](../go.mod)
+- A new Go module
+- A local directory that the process may create
+
+Add VibeDB at an exact commit:
 
 ```bash
-mkdir vibedb-example
-cd vibedb-example
-go mod init example.com/vibedb-example
-go get github.com/thesyncim/vibedb@main
+go mod init example.com/vibedb-start
+go get github.com/thesyncim/vibedb@<commit>
 ```
 
-VibeDB requires Go 1.26. The project does not yet publish release tags, so
-`@main` selects unreleased development code. After validation, retain the exact
-pseudo-version or commit recorded in `go.mod`. Do not assume later commits are
-wire- or disk-compatible.
+## Create the program
 
-## 2. Add the program
-
-Create `main.go`:
+Save this as `main.go`:
 
 ```go
 package main
@@ -27,96 +31,108 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 
 	"github.com/thesyncim/vibedb"
 )
 
 func main() {
+	if err := run(); err != nil {
+		panic(err)
+	}
+}
+
+func run() (err error) {
 	db, err := vibedb.Open("./data")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Printf("close VibeDB: %v", err)
-		}
-	}()
+	defer func() { err = errors.Join(err, db.Close()) }()
 
 	users := db.Collection("users")
-	created, err := users.Put("user:1", []byte(`{"name":"Ada","visits":1}`))
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("created: %v\n", created)
-
-	err = db.Update(func(tx *vibedb.Tx) error {
-		accounts := tx.Collection("accounts")
-		audit := tx.Collection("audit")
-
-		if _, err := accounts.Put("account:1", []byte(`{"balance":90}`)); err != nil {
+	for key, doc := range map[string]string{
+		"user:1": `{"name":"Ada","active":true}`,
+		"user:2": `{"name":"Linus","active":false}`,
+	} {
+		if _, err := users.Put(key, []byte(doc)); err != nil {
 			return err
 		}
-		_, err := audit.Put("entry:1", []byte(`{"account":"account:1","delta":-10}`))
-		return err
-	})
-	if errors.Is(err, vibedb.ErrTxConflict) {
-		log.Fatal("transaction conflict: retry the complete transaction")
-	}
-	if err != nil {
-		log.Fatal(err)
 	}
 
-	document, found, err := users.Get("user:1")
+	doc, found, err := users.Get("user:1")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	fmt.Printf("found: %v document: %s\n", found, document)
+	fmt.Printf("found=%t document=%s\n", found, doc)
+	return nil
 }
 ```
 
-## 3. Run the program
+Run it twice:
 
 ```bash
 go run .
+go run .
 ```
 
-The default `Durable` profile creates `./data` as a database directory. A
-collection is lazy. VibeDB creates its file when the first mutation uses it.
+Both runs should print the same document. `Open` creates a database directory;
+the collection is materialized only when the first valid write commits.
 
-`Put` returns `created=true` when the key did not exist. `Get` returns a copy
-that the caller owns. Always check both `found` and `err`.
+## Understand the defaults
 
-## 4. Select a durability profile
+The zero-value profile is `vibedb.Durable`:
 
-The zero value and the default are `vibedb.Durable`.
+- A successful mutation is recovery-safe before readers can observe it.
+- Keys are nonempty and at most 256 bytes by default.
+- Documents are nonempty complete JSON and at most 4 MiB by default.
+- Stored JSON is canonicalized; byte spelling may differ from the input.
+- Collection names are portable UTF-8 identities up to 120 bytes. Avoid NUL.
+
+A durable collection can have a primary file plus a recovery-journal sidecar.
+A database can also own a transaction decision log. Treat the complete closed
+directory as the backup unit.
+
+## Choose a different acknowledgement profile
 
 ```go
 db, err := vibedb.Open("./data", vibedb.WithDurability(vibedb.Buffered))
 ```
 
-The profiles have different acknowledgement contracts:
+| Profile | Successful mutation means | Persistence action |
+| --- | --- | --- |
+| `Durable` | Recovery record is power-safe before visibility | Default; still close the database |
+| `Buffered` | Row is visible but can be lost on a crash | `Flush` or successful `Close` advances recoverable state |
+| `Memory` | Row exists only in this process; path is ignored | None |
 
-| Profile | Visibility and persistence |
-| --- | --- |
-| `Durable` | A successful mutation is power-safe before reader visibility. |
-| `Buffered` | A successful mutation is visible from bounded memory. A successful `Flush`, or a successfully completed `Close`, makes the included visible generation crash-safe. |
-| `Memory` | All state stays in process memory. `Open` ignores its path. |
+Buffered acknowledgement does not include a durability fence for that
+mutation. It does **not** promise zero device I/O: first use can create and sync
+metadata or a journal.
 
-Call `Close` for every profile. `Close` is idempotent. A buffered `Close`
-attempts the final checkpoint.
+## Close correctly
 
-## 5. Choose the next guide
+`Close` stops new work on its first call. Teardown can return a retryable error
+while a snapshot is still held, or a sticky persistence error after resources
+were released. Production-style code should:
 
-- Use [the native API](api/native.md) for CRUD, indexes, and transactions.
-- Use [typed queries](api/query.md) for programmatic filtering and aggregation.
-- Use [SQL](api/sql.md) for `database/sql` applications.
-- Use [the PostgreSQL wire server](api/pgwire.md) for PostgreSQL clients.
-- Read [durability and recovery](durability.md) before you select advanced
-  storage options.
+1. release query results, sessions, transactions, and snapshots;
+2. call `Close` and inspect the error;
+3. use `CloseCompleted` when deciding whether another close attempt is useful;
+4. reopen before retrying a mutation whose persistence result was unknown.
 
-## Implementation references
+The full lifecycle contract is in the [native API guide](api/native.md).
 
-- `vibedb.go`: `Open`, `Collection`, `Put`, `Get`, `Flush`, and `Close`
-- `vibedb_txn.go`: `Update`, `Begin`, `Commit`, and transaction errors
-- `vibedb_test.go`: `Example` and facade lifecycle tests
+## Next steps
+
+- [Data model and indexes](data-model.md)
+- [Serializable transactions](transactions.md)
+- [Typed queries](api/query.md)
+- [SQL through `database/sql`](api/sql.md)
+- [Durability and recovery](durability.md)
+
+To explore RF3 replication, finish the embedded tutorial first and then use the
+[generated local cluster](operations/local-cluster.md).
+
+## Source map
+
+- `vibedb.go`: `Open`, `WithDurability`, `Collection`, `Put`, `Get`, `Close`
+- `vibedb_test.go`: durable profile CRUD, flush, close, and reopen cases
+- `vibedb_lifecycle_internal_test.go`: retryable and completed close behavior

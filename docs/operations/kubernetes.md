@@ -1,224 +1,138 @@
-# Run an RF3 test cluster on Kubernetes
+# Kubernetes RF3 qualification lane
 
-VibeDB includes a small, Helm-free manifest renderer for repeatable Kubernetes
-fault and lifecycle tests. The renderer is not a reconciliation watch-loop or
-topology controller: Kubernetes manages processes and volumes, while Raft and
-the replicated catalog remain the only leader, membership, ownership, and
-routing authorities.
+> [!CAUTION]
+> **Development and qualification only.** VibeDB is under active development.
+> The image, generated manifests, credentials, wire and disk formats, and
+> qualification procedure may break at any commit. This is not a production
+> deployment, and green qualification does not establish production readiness.
 
-## Build the image contract
+This lane creates a disposable four-node Kind cluster—one control plane and three workers—then exercises a fixed RF3 topology across restart. `vibedb-operator` is only a manifest renderer and init helper. It is not a Kubernetes controller or reconciler.
 
-Build the repository's static, non-root image, or provide an equivalent image
-containing `vibedb-shard`, `vibedb-gateway`, and `vibedb-operator` on `PATH`:
+## What the lane checks
 
-```bash
-docker build -f deploy/kubernetes/Dockerfile -t registry.example/vibedb:commit-sha .
-docker push registry.example/vibedb:commit-sha
-```
+- deterministic rendering and validation of the fixed topology
+- startup of catalog, request-ledger, and data RF3 groups
+- gateway startup and in-cluster DNS for all ten serving Pods
+- an authenticated, sequenced write and exact read visibility
+- restart of every catalog, ledger, data, and gateway StatefulSet
+- replay and visibility of the acknowledged request after restart
+- preservation of all ten PVC identities
+- per-process RSS, apparent durable bytes, and WAL bounds
 
-Use a Kubernetes cluster with at least three
-failure-domain nodes. Supply these objects before applying the rendered
-workloads:
+It does not test a mixed-build upgrade, multi-zone failure, backup policy, production PKI, long-running load, autoscaling, ingress, or an external managed Kubernetes service.
 
-- `vibedb-rf3-manifests`, with `catalog-{0,1,2}.vibejson`,
-  `ledger-{0,1,2}.vibejson`, and `data-{0,1,2}.vibejson`.
-- `vibedb-rf3-tls`, with the nine members' keys and certificates, cluster
-  roots, and WAL key sources referenced by those manifests.
-- `vibedb-gateway-config`, with `cluster.vibejson`,
-  `authorization-policy.vibejson`, and `replica-control.vibejson`.
-- `vibedb-gateway-tls`, with the gateway key, certificate, and cluster roots.
+## Prerequisites
 
-Each preparation manifest must use `/var/lib/vibedb/member` as its exact root,
-bind its listener ports to `0.0.0.0`, and use its role's stable peer addresses.
-For example, the catalog group uses:
+The qualified CI environment is Linux. Run from the repository root; the script records `HEAD` but does not prove that the worktree is clean. It requires:
 
-```text
-vibedb-catalog-0.vibedb-catalog-peer:7411
-vibedb-catalog-1.vibedb-catalog-peer:7411
-vibedb-catalog-2.vibedb-catalog-peer:7411
-```
+- Go 1.26
+- Git
+- Docker with permission to build and load images
+- Kind; CI installs `sigs.k8s.io/kind@v0.32.0`
+- `kubectl`
+- GNU `timeout`
+- `base64`
+- enough local resources for one control-plane node, three worker nodes, ten Pods, and ten PVCs
 
-Replace `catalog` with `ledger` and `data` for the other two groups. Every pod
-has a distinct TLS node identity. The renderer consumes nine role-major IDs:
-catalog ordinals 0–2, ledger ordinals 0–2, then data ordinals 0–2.
+The Kind node image is Kubernetes `v1.34.8` pinned by SHA-256 in `deploy/kubernetes/kind-3-worker.yaml`.
 
-The ConfigMaps are bootstrap inputs, not live authority. Changing one does not
-rewrite an existing PVC's sealed identities or durable membership.
-The gateway init container validates and atomically pins the generation-one
-catalog to a regular file on its PVC. Restarts require the same seed. A changed
-ConfigMap is rejected rather than replacing the immutable catalog. The serving
-process retains its strict separation between that seed and the mutable route
-seed, without accepting Kubernetes projection symlinks as durable authority.
+## Run it
 
-Automatic splitting is not enabled by this Kubernetes bootstrap. It emits an
-explicit empty `split_sources` inventory because the init containers have not
-yet prepared their actual SQL storage identities. Enabling it requires enrolling
-the exact prepared source schema and replica identities. The renderer does not
-invent them. The Kind gate qualifies RF3 serving and restart, not hot splitting.
-
-## Render and apply
-
-For a disposable development or test cluster, generate the complete bootstrap
-authority instead of hand-writing these objects:
-
-```bash
-install -d -m 0700 /absolute/private/vibedb-bootstrap
-umask 077
-go run ./cmd/vibedb-operator bootstrap \
-  -namespace vibedb-test \
-  -state-dir /absolute/private/vibedb-bootstrap \
-  > /absolute/private/vibedb-bootstrap-resources.yaml \
-  2> /absolute/private/vibedb-bootstrap-identities.txt
-```
-
-The command creates a short-lived test CA, distinct identities for all nine
-members, the gateway, and a qualification client, plus the exact preparation,
-catalog, policy, replica-control, WAL, and durable-ACK inputs. It uses operating
-system cryptographic entropy and refuses partial or mismatched authority state.
-The state directory must be private. The command writes retained authority
-files with mode `0600`, and the restrictive umask protects redirected bootstrap
-resources that contain Kubernetes Secrets. This is deliberately not production
-PKI. It has no external root, HSM/KMS integration, certificate rotation,
-operator RBAC, or multi-party issuance. Do not reuse it outside disposable
-development and CI clusters.
-
-Keep that private state directory for the matching render. The renderer reads
-the authenticated role-major node IDs from `bootstrap-state.vibejson`, avoiding
-a second manually copied identity list:
-
-```bash
-go run ./cmd/vibedb-operator render \
-  -image registry.example/vibedb:commit-sha \
-  -namespace vibedb-test \
-  -bootstrap-state-dir /absolute/private/vibedb-bootstrap \
-  > ./vibedb-kubernetes.yaml
-
-go run ./cmd/vibedb-operator validate -manifest ./vibedb-kubernetes.yaml
-kubectl create namespace vibedb-test
-kubectl apply --dry-run=server -f /absolute/private/vibedb-bootstrap-resources.yaml
-kubectl apply --dry-run=server -f ./vibedb-kubernetes.yaml
-kubectl apply -f /absolute/private/vibedb-bootstrap-resources.yaml
-kubectl apply -f ./vibedb-kubernetes.yaml
-```
-
-`-shard-node-ids` remains available when an external provisioning system owns
-the manifests and certificates. It requires exactly nine distinct lowercase
-32-hex-character IDs in catalog, ledger, then data ordinal order. Do not combine
-it with `-bootstrap-state-dir`.
-
-`validate` is bounded to 2 MiB and checks the VibeDB-specific topology contract:
-the exact object set, three independent RF3 groups, unique role endpoints,
-retained PVCs, one-at-a-time voluntary disruption, failure-domain spread,
-probes, and container hardening. Server-side dry-run additionally checks the
-Kubernetes version's resource schemas and admission policy.
-
-The rendered lane contains:
-
-- independent three-replica catalog, request-ledger, and data StatefulSets,
-  each with stable ordinals and one retained PVC per member.
-- one headless peer Service and one `maxUnavailable: 1` PodDisruptionBudget per
-  Raft group.
-- hard hostname spreading, parallel initial Raft process creation, and
-  five-second minimum readiness before Kubernetes advances a rolling update.
-- non-root processes, the runtime-default seccomp profile, no service-account
-  token, and no CPU limit on latency-sensitive database processes.
-- a durable single-gateway StatefulSet, a headless governing Service, and a
-  separate client-facing ClusterIP Service.
-- a scale-zero replacement StatefulSet template that runs the shipped
-  `bootstrap-rf3` command against an empty target PVC.
-
-The single gateway is test tooling, not gateway HA. Running multiple gateways
-requires distinct durable session/issuer identities and journals per ordinal.
-The renderer intentionally does not manufacture those authorities.
-The gateway headless Service also publishes its authenticated catalog-drain
-control endpoint. Generation-one catalog bootstrap is enabled, but it still
-requires the exact immutable seed and proof generated by the test bootstrap
-command. A missing head beside an existing proof fails closed.
-
-The startup, readiness, and liveness probes check TCP reachability only. They
-do not claim leadership, linearizability, catch-up, or catalog authority. The
-gateway still performs authenticated leader discovery and exact fence
-validation.
-
-## Stop, restart, and disrupt
-
-Kubernetes sends `SIGTERM`. Both shipped commands stop accepting work and
-drain within the configured 120-second termination window. The PDB protects a
-voluntary single-member disruption, but it cannot make simultaneous node loss,
-forced deletion, or an unavailable storage backend safe.
-
-For tests, delete one follower Pod from one role and verify that its StatefulSet
-ordinal reopens the same PVC and catches up. Do not delete its PVC unless
-testing permanent replica loss and the replacement protocol.
-
-## Bootstrap a replacement
-
-The rendered `vibedb-learner-bootstrap-template` is deliberately scaled to
-zero. Before scaling it up:
-
-1. Create the target ConfigMap and TLS Secret named in the template.
-2. Ensure its manifest binds a new member, node, store, and empty target root.
-3. Add the exact enrolled target to the serving manifests and replicated
-   catalog workflow.
-4. Let the gateway persist and distribute the membership grant.
-5. Patch the placeholder object names and scale the target StatefulSet to one.
-
-The target runs `bootstrap-rf3`, installs an authenticated snapshot, catches
-up as a learner, and hands off to ordinary RF3 serving. Do not patch the
-serving StatefulSet from three to four replicas: an extra Pod is not a Raft
-member. The gateway's durable replacement controller performs promotion,
-catalog G+1 and drain, safe removal, catalog G+2 and drain, and retirement.
-
-Kubernetes DNS supplies stable endpoint discovery only. It never decides the
-leader or authorizes failover, promotion, removal, or routing.
-
-See [Operate replica lifecycle](replica-lifecycle.md) for the exact grant,
-snapshot, promotion, removal, and finalization contract.
-
-## Keep restore separate from replacement
-
-Learner bootstrap is a membership operation in the existing cluster. Restore
-creates fresh cluster and replica identities from a certified complete backup.
-Do not point the learner template at a restore staging root or run ordinary
-preparation over that root.
-
-The `restore-group` and `adopt-restore` commands construct and adopt exact
-restore replicas, but retain a closed-serving fence. Target catalog activation
-and transient per-process grants remain database authority, not ConfigMap,
-Pod, PVC, or DNS authority. The renderer does not provision the post-seal
-certificates or drive the complete restore activation lifecycle. See
-[Back up and restore distributed data](backup-restore.md) for the command
-inputs and current qualification boundary.
-
-## Mandatory three-worker Kind qualification
-
-Linux CI runs the same checked-in command developers can run locally:
+Choose a new evidence directory for each run. The script refuses to replace an existing Kind cluster named `vibedb-qualification`.
 
 ```bash
 go install sigs.k8s.io/kind@v0.32.0
-deploy/kubernetes/qualify-kind.sh
+
+mkdir -p "$PWD/.artifacts"
+evidence_dir="$(mktemp -d "$PWD/.artifacts/kubernetes-rf3.XXXXXXXX")"
+VIBEDB_KUBE_EVIDENCE_DIR="$evidence_dir" \
+  ./deploy/kubernetes/qualify-kind.sh
 ```
 
-The gate creates one control-plane and three worker containers from a pinned
-Kubernetes node image, builds and loads the non-root VibeDB image, generates
-fresh test authority, and starts all three RF3 groups plus the gateway. It then
-requires stable Pod DNS, ten retained PVC identities, an acknowledged durable
-write and repeated reads, a rolling restart of every catalog, ledger, data, and
-gateway ordinal, exact-request recovery, and post-restart row visibility. Each
-serving process must remain below hard one-second read p99 and five-second
-terminal/read maximum latency, 1 GiB RSS, 1 GiB apparent durable storage, and 512 MiB WAL. The
-gate has no skip mode and uploads bounded evidence even on failure.
+Success ends with:
 
-This qualification proves a disposable single-data-shard RF3 serving and
-same-binary restart path. It does not prove mixed-build upgrades,
-multi-data-shard scale, involuntary partitions, cloud-volume behavior, gateway
-HA, production certificate lifecycle, or the complete automated replacement
-workflow.
+```text
+Kubernetes RF3 qualification passed; evidence=<directory>
+```
 
-## Implementation references
+Normal exit and handled failure cleanup delete the Kind cluster that the script created. An uncatchable termination can bypass that cleanup. The script does not delete its private `${RUNNER_TEMP:-/tmp}/vibedb-kube-rf3.XXXXXXXX` work directory, the local `vibedb:kube-qualification` Docker image, or the evidence directory. The temporary directory contains generated Secret YAML, CA and leaf private keys, WAL/ACK material, and extracted client credentials; treat it as sensitive test material and remove it deliberately after inspection.
 
-- `internal/kubeoperator/bootstrap.go`, `render.go`, and `validate.go`
-- `internal/kubeoperator/bootstrap_test.go`, `render_test.go`, and
-  `qualification_test.go`
-- `cmd/vibedb-operator/main.go`
-- `deploy/kubernetes/Dockerfile`, `kind-3-worker.yaml`, and `qualify-kind.sh`
+The evidence path is created with `mkdir -p` rather than required-new or cleared. Reusing a path can mix stale `failed-*` files with a later run, so use a fresh directory when evidence provenance matters.
+
+## Fixed topology
+
+| Workload | Replicas | PVC per replica | Purpose |
+| --- | ---: | ---: | --- |
+| `vibedb-catalog` StatefulSet | 3 | `20Gi` | replicated catalog group |
+| `vibedb-ledger` StatefulSet | 3 | `20Gi` | replicated durable request ledger |
+| `vibedb-data` StatefulSet | 3 | `20Gi` | replicated data group |
+| `vibedb-gateway` StatefulSet | 1 | `1Gi` | gateway session journal |
+| learner template | 0 | none while scaled to zero | fixed qualification scaffold, not autoscaling |
+
+The empty `storageClassName` default uses the cluster default. The application image is built locally from `deploy/kubernetes/Dockerfile`, loaded into Kind, and referenced by the mutable test tag `vibedb:kube-qualification`.
+
+## Exact sequence
+
+1. Refuse an existing qualification cluster and record the source revision and tool versions.
+2. Build `vibedb-operator` and `vibedb-kube-qualify` for the host.
+3. Generate seven-day disposable P-256 test PKI, policies, WAL keys, and the durable ACK key in a private bootstrap directory.
+4. Render and validate bootstrap and topology YAML.
+5. Build the non-root container image.
+6. Create the one-control-plane/three-worker Kind cluster and load the image.
+7. Apply the generated resources and wait up to ten minutes for each StatefulSet rollout.
+8. Resolve nine shard Pod FQDNs and the gateway FQDN from inside the gateway Pod.
+9. Require exactly ten PVCs and record their names and UIDs.
+10. Forward gateway port `7400` to host port `17400`, perform one durable write, and collect 128 read samples with p99 at most one second and maximum latency at most five seconds.
+11. Restart catalog, ledger, data, and gateway StatefulSets in turn, then replay the same request and repeat the read samples.
+12. Compare PVC identities, enforce process resource ceilings, and record Pod and event state.
+
+The restart loop uses StatefulSet rollout readiness to avoid voluntarily removing a whole RF3 quorum. This is a bounded restart test, not proof against arbitrary correlated failures.
+
+## Evidence
+
+| File | Meaning |
+| --- | --- |
+| `revision.txt`, `go-version.txt`, `kind-version.txt`, `kubectl-version.txt` | candidate and tool identity |
+| `dns.vibejson` | ten successfully resolved service names |
+| `before-restart.vibejson` | durable terminal result and latency sample before restart |
+| `after-restart.vibejson` | exact replay, recovered visibility, and latency sample after restart |
+| `pvc-before.tsv`, `pvc-after.tsv` | PVC name/UID comparison |
+| `vibedb-*.vibejson` | per-process RSS, apparent storage, WAL bytes, and file count |
+| `pods.txt`, `events.txt` | final Kubernetes state |
+| `port-forward.log` | local forwarding diagnostics |
+| `failed-*.txt` | bounded Pod, event, termination, and previous-container diagnostics when collection is reached after failure |
+
+Failure collectors cap their diagnostic files, but failures before evidence-directory creation may leave nothing to upload. Success-path `pods.txt` and `events.txt` do not have an explicit byte cap. Describe the bundle as bounded qualification evidence only where the implementation actually enforces a bound.
+
+## Container and Pod security properties
+
+The checked-in Dockerfile builds CGO-disabled, stripped `vibedb`, shard, gateway, operator, and qualifier binaries, then copies them into a distroless non-root image. `vibedb-verify` is not included.
+
+Generated Pods:
+
+- run as UID, GID, and fsGroup `65532`
+- disable service-account-token automount and service links
+- use runtime-default seccomp
+- drop all Linux capabilities and disallow privilege escalation
+- mount ConfigMaps and Secrets read-only
+
+The generated topology does **not** set CPU/memory limits, a read-only root filesystem, NetworkPolicies, RBAC, a required image digest, production secret management, ingress, or external observability. It does set resource requests, required shard anti-affinity and topology spread, and PodDisruptionBudgets; those controls do not turn this test topology into a supported deployment.
+
+## CI scope
+
+The `kubernetes-rf3` job in `.github/workflows/ci.yml` runs this script on `ubuntu-latest` with a 45-minute job timeout and uploads evidence for 30 days, including on failure when files exist. The workflow requests only `contents: read` and deploys nowhere outside the disposable Kind cluster.
+
+A green job proves that the exact tested revision completed this bounded lane on that runner. It does not prove that the check is required by branch protection, that another commit is compatible, or that VibeDB is ready for production Kubernetes.
+
+## Source map
+
+| Concern | Source |
+| --- | --- |
+| complete qualification sequence | `deploy/kubernetes/qualify-kind.sh` |
+| Kind node topology and immutable node image | `deploy/kubernetes/kind-3-worker.yaml` |
+| application container | `deploy/kubernetes/Dockerfile` |
+| manifest renderer and bootstrap CLI | `cmd/vibedb-operator/` |
+| generated workloads and security context | `internal/kubeoperator/render.go` |
+| disposable authority generation | `internal/kubeoperator/bootstrap.go` |
+| qualification probes | `cmd/vibedb-kube-qualify/` |
+| CI invocation and artifact retention | `.github/workflows/ci.yml` |

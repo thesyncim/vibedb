@@ -33,7 +33,8 @@ func Path(spec string) Column {
 
 // Count is the COUNT aggregate. With no argument it counts result rows
 // (COUNT(*)); with one path it counts the rows whose path is present and
-// non-null (COUNT(path)). More than one argument is rejected at compile time.
+// non-null (COUNT(path)). If more than one path is supplied, Count uses the
+// first; callers should pass at most one.
 func Count(path ...string) Column {
 	switch len(path) {
 	case 0:

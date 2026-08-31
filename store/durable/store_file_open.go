@@ -102,9 +102,10 @@ func createCollection(
 	return collection, nil
 }
 
-// Open performs bounded recovery: it reads the two superblocks, the
-// selected state root, and its top-level directory pages, then starts with an
-// empty read cache. It does not scan keys, documents, or postings.
+// Open performs bounded recovery from the selected state root and validates the
+// ordered-primary graph. It rebuilds the resident router; an indexed collection
+// also derives live slots from the primary graph and opens the exact-index
+// catalog and leaves. Other data pages enter the read cache on demand.
 //
 // Standalone Open passes a nil decision resolver into journal replay. An
 // kind-4 conditional batch in the live journal window fails closed

@@ -286,10 +286,10 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 	return nil
 }
 
-// Update is the catalog-owned convenience form of UpdateCollections: it holds
-// the catalog read lock, takes every currently cataloged collection as the
-// participant set, and otherwise shares the same staging and publication
-// protocol.
+// Update is the catalog-owned convenience form of UpdateCollections. It copies
+// the currently cataloged collection set under the catalog read lock, releases
+// that lock before calling fn, and uses the captured set as the participants in
+// the same staging and publication protocol.
 func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 	if d == nil {
 		return ErrTxnParticipant

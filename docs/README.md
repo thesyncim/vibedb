@@ -1,73 +1,81 @@
 # VibeDB documentation
 
-VibeDB is an embedded JSON database written in Go. It also provides a SQL
-runtime and a PostgreSQL wire server. An experimental distributed runtime adds
-shard routing, replicated state, and distributed execution.
+> [!CAUTION]
+> VibeDB is an unreleased development project. There is one current source,
+> wire, and disk grammar—not a compatibility ladder. Different commits may be
+> incompatible and may corrupt or refuse older development data. Use an exact
+> commit and disposable or recoverable data.
 
-Start with the page that matches your task.
+The documentation is organized by intent: start, build, understand, operate,
+and look up exact contracts. The embedded API is the shortest path. SQL,
+pgwire, and distributed pages are explicit about their narrower experimental
+boundaries.
 
-## Get started
+## Start
 
-- [Install and run VibeDB](getting-started.md)
-- [Select an API](api/README.md)
-- [Understand the architecture](architecture.md)
-- [Check current capabilities](capabilities.md)
-- [Check distributed feature state](distributed-feature-state.md)
+1. [Read the stability contract](status.md).
+2. [Run the embedded database](getting-started.md).
+3. Choose an [API](api/README.md).
 
-## Use an API
+To explore replication locally, use the generated [RF3 development
+cluster](operations/local-cluster.md). Do not begin with hand-authored cluster
+manifests.
 
-- [Native embedded API](api/native.md)
-- [Typed query API](api/query.md)
-- [SQL and `database/sql`](api/sql.md)
-- [PostgreSQL wire server](api/pgwire.md)
+## Build
 
-## Operate and inspect data
+| Task | Guide |
+| --- | --- |
+| Store and retrieve JSON | [Native API](api/native.md) |
+| Build reusable typed queries | [Typed query API](api/query.md) |
+| Use `database/sql` | [SQL API](api/sql.md) |
+| Connect pgx, lib/pq, psql, or JDBC | [PostgreSQL wire adapter](api/pgwire.md) |
+| Group writes atomically | [Transactions](transactions.md) |
+| Choose acknowledgement semantics | [Durability](durability.md) |
 
-- [Durability and recovery](durability.md)
-- [Offline verification, salvage, and repack](operations/verification.md)
-- [Start a local replicated cluster](operations/distributed-quickstart.md)
+## Understand
+
+- [Architecture](architecture.md): layers, ownership, and publication paths.
+- [Data model](data-model.md): collections, keys, JSON, schemas, and indexes.
+- [Storage layers](store.md): facade versus heap source model versus durable
+  engine.
+- [On-disk format](format.md): the current development image and recovery
+  families.
+
+## Operate and qualify
+
+- [Operations home](operations/README.md)
+- [Verify, salvage, and repack](operations/verification.md)
 - [Distributed runtime](operations/distributed.md)
-- [Observe a distributed cluster](operations/observability.md)
-- [Back up and restore distributed data](operations/backup-restore.md)
-- [Roll out a replicated schema](operations/schema-rollouts.md)
-- [Replica lifecycle](operations/replica-lifecycle.md)
-- [Kubernetes RF3 test lane](operations/kubernetes.md)
-- [Unreleased compatibility and same-binary restarts](operations/unreleased-compatibility.md)
-- [Performance tests](performance.md)
-- [Security boundary](../SECURITY.md)
-- [Unsafe-code inventory](../UNSAFE.md)
+- [Backup and restore](operations/backup-restore.md)
+- [Schema rollouts](operations/schema-rollouts.md)
+- [Observability](operations/observability.md)
+- [Kubernetes qualification lane](operations/kubernetes.md)
 
-## Design and internals
+No operations page is a production runbook. Every distributed procedure is a
+development or qualification workflow for one exact build.
 
-- [Storage model](store.md)
-- [On-disk format](format.md)
-- [SQL surface](design/sql-surface.md)
-- [Embedded SQL gap plan](design/sql-roadmap.md)
-- [Query planner](design/query-planner.md)
-- [Distributed transactions](design/distributed-transactions.md)
-- [Distributed clock contract](design/distributed-clock-model.md)
-- [Placement tuple format](design/distribution-tuple-format.md)
-- [Replicated state machine](design/replicated-state-machine.md)
-- [Raft WAL](design/raft-wal.md)
-- [Source provenance](provenance.md)
+## Reference
+
+- [Reference index](reference/README.md)
+- [CLI](reference/cli.md)
+- [SQL dialect](reference/sql.md)
+- [Wire and service protocols](reference/protocols.md)
+- [Defaults and limits](reference/limits.md)
+- [Executable embedded capabilities](capabilities.md)
+- [Generated distributed feature ledger](distributed-feature-state.md)
+
+Generated reference pages report checked-in evidence; they do not imply a
+release, support tier, production readiness, or performance result.
 
 ## Contribute
 
-- [Contribution guide](../CONTRIBUTING.md)
-- [Documentation language](STYLE.md)
-- [Benchmark harness](../bench/competitive/README.md)
-- [Allocation regression gate](../bench/gate/README.md)
+- [Contribution workflow](../CONTRIBUTING.md)
+- [Documentation standard](STYLE.md)
+- [Performance evidence](performance.md)
+- [Source and algorithm provenance](provenance.md)
+- [Unsafe-code boundary](../UNSAFE.md)
+- [Security policy](../SECURITY.md)
 
-## Development contract
-
-Pin a tested commit when you use the root Go module as a dependency. APIs,
-command contracts, and storage grammars can change between tested commits. The
-distributed serving commands are experimental. Cross-host serving requires
-authenticated TLS and a canonical `vibejson` authorization policy. Offline
-prepare, inspect, validate, and render commands do not open serving listeners.
-Explicit development plaintext binds the public serving listener only to a
-loopback address. The operating guide documents the gateway's separate raw
-replicated-shard dialing behavior in that mode.
-
-The implementation is the source of truth. Each design page lists the source
-files and tests that support its contract.
+When prose and code disagree, tests and the referenced codec or implementation
+are authoritative. Open a documentation issue or change the docs in the same
+commit as the contract.

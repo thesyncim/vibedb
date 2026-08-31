@@ -1060,10 +1060,10 @@ type setCommand struct {
 // parseSet decodes "SET [SESSION|LOCAL] name [=|TO] value" and its two special
 // forms, SET TIME ZONE and SET NAMES.
 //
-// SESSION and LOCAL are both accepted and both mean the same thing here,
-// because LOCAL scopes a setting to a transaction and there are no
-// transactions; a LOCAL setting in a session with no transaction block is a
-// session setting in PostgreSQL too.
+// SESSION and LOCAL are both recognized syntactically. Outside a transaction
+// either spelling changes the session setting. SET and RESET are refused while
+// a transaction is active, so this adapter does not claim transaction-local
+// setting semantics.
 func parseSet(src string) (setCommand, error) {
 	return parseSetCancelable(src, nil)
 }

@@ -1,237 +1,216 @@
 # Durability and recovery
 
-Durability is the point at which acknowledged data can survive the selected
-failure model. Visibility is the point at which readers can observe that data.
-VibeDB makes both points explicit.
+> [!CAUTION]
+> VibeDB is unreleased development software. Any commit may break APIs, disk
+> formats, or wire behavior. Build and operate one exact tested commit only.
+> Do not entrust irreplaceable data to VibeDB.
 
-## Facade profiles
+Durability asks which failures may lose a successful operation. VibeDB does not
+treat visibility, acknowledgement, and persistence as synonyms.
 
-| Profile | Acknowledgement and visibility | Persistence action |
+## Root profiles
+
+The root `vibedb` package is the application API. Its zero value and default
+profile are `Durable`.
+
+| Profile | When readers see a mutation | What success means | Persistence action |
+| --- | --- | --- | --- |
+| `Durable` | After its recovery record is power-safe | The mutation is recoverable before visibility | `Flush` folds/recycles state as needed |
+| `Buffered` | After bounded in-memory admission | The visible mutation can still be lost | Successful `Flush` or `Close` makes the included cut recoverable |
+| `Memory` | After heap publication | Process memory only | `Flush` is a no-op |
+
+`Open(path)` uses a directory for `Durable` and `Buffered`; `Memory` ignores the
+path. The facade rejects low-level options that conflict with the profile.
+
+## Four different boundaries
+
+Use precise terms when reasoning about a write:
+
+| Boundary | Meaning |
+| --- | --- |
+| Visible | A new reader can observe the generation |
+| Acknowledged | The mutation call returned success |
+| Recoverable | Reopen can reconstruct the generation after the selected failure |
+| Physically rooted | The primary file's selected root directly names the generation |
+
+These boundaries can differ. A buffered `Flush` can make a generation
+recoverable through one journal delta without folding all changed primary pages;
+`DurableGeneration` then advances before the physical primary root does.
+
+## Synchronous durable writes
+
+The normal `DurabilitySync` primary path is journal-before-visibility:
+
+1. append a checksummed recovery record;
+2. synchronize the journal with the power-safe barrier;
+3. apply and publish the mutation; and
+4. acknowledge success.
+
+No reader observes the generation before its redo is recoverable. A later
+checkpoint folds it into the primary graph and recycles journal space.
+
+A file created as `AsyncVisible` and reopened as `DurabilitySync` is a low-level
+exception: it has no journal identity and uses a root-fence chain. Reads are
+withheld or fail across the unsafe interval. Facade durable files use journals.
+
+## Buffered writes
+
+Ordinary `Buffered` acknowledgement leaves row state volatile, but may perform
+I/O. A lazy collection may create its primary, and its first valid mutation may
+mint, preallocate, and sync a `.rjournal` for later checkpoints. That metadata
+work does not make the acknowledged mutation recoverable.
+
+A process or machine failure before a successful `Flush` or `Close` may lose
+acknowledged buffered mutations. Recovery returns the last complete recoverable
+cut, never a promise to retain the latest visible cut.
+
+Low-level `DurabilityBufferedVisible` also has an opt-in
+`Options.RecoveryJournal` lane. It publishes resident state and requires the
+redo record to synchronize before the mutation call returns success. Visibility
+may precede that synchronization, so describe this as durability-before-success,
+not durability-before-visibility. The root facade does not expose this override.
+
+## Asynchronous visibility
+
+`DurabilityAsyncVisible` acknowledges after bounded queue admission while a
+background committer persists generations. `Flush` waits for the sampled
+reader-visible generation and completes its physical durability work.
+
+After an asynchronous persistence failure, the handle can roll back to the last
+durable state or fail reads closed. Close and reopen before deciding to retry.
+
+## Low-level mode matrix
+
+These modes belong to `store/durable`, not to the root product profiles.
+
+| Setting | Zero value | Other choices |
 | --- | --- | --- |
-| `vibedb.Durable` | A successful mutation is power-safe before it becomes visible. | `Flush` waits for or folds durable state as needed. `Close` finishes maintenance. |
-| `vibedb.Buffered` | The mutation becomes visible from bounded memory and returns before device I/O. | A successful `Flush` or successful `Close` checkpoints the included visible generation. |
-| `vibedb.Memory` | The mutation exists only in process memory. | `Flush` is a no-op. `Close` releases memory. |
+| `Backend` | `BackendAuto` | `BackendPortable`, Linux `BackendIOUring` |
+| `ReadMode` | `ReadBuffered` | `ReadDirectTry`, `ReadDirectRequire` |
+| `WriteMode` | `WriteBuffered` | `WriteDirectTry`, `WriteDirectRequire` |
+| `Durability` | `DurabilitySync` | `DurabilityAsyncVisible`, `DurabilityBufferedVisible` |
+| `CheckpointStrength` | `CheckpointPowerSafe` | `CheckpointFilesystem` |
 
-The zero value and default are `Durable`.
+`Try` modes may fall back; inspect `Collection.Stats()` for the selected path.
+`Require` modes fail construction if unavailable.
 
-The facade prevents low-level options from changing the selected profile. For
-example, it rejects an explicit recovery-journal override.
+`CheckpointFilesystem` is accepted only with buffered visibility, the portable
+backend, and buffered writes. It uses the ordinary filesystem sync class. On
+Darwin and storage stacks with volatile caches it does not promise sudden-power
+survival. It never weakens synchronous or asynchronous durability.
 
-## Low-level durability lanes
+## Flush and close
 
-`store/durable.Options` has three mutation lanes:
+`Collection.Flush` waits until the current reader-visible generation is
+recoverable. Depending on the lane it can:
 
-- `DurabilitySync` is the zero value. It uses journal-before-visibility on a
-  current primary layout.
-- `DurabilityAsyncVisible` publishes after bounded queue admission. Persistence
-  continues in the background.
-- `DurabilityBufferedVisible` publishes from bounded memory without a device
-  write. Flush or close creates the persistence boundary.
+- append and synchronize a complete buffered delta;
+- fold and recycle a synchronous journal;
+- wait for the asynchronous committer; or
+- publish a complete physical checkpoint.
 
-`CheckpointPowerSafe` is the zero-value checkpoint strength.
-`CheckpointFilesystem` is weaker on storage stacks with volatile drive caches.
-It is accepted only with buffered-visible, portable, buffered-write operation.
+`Database.Flush` walks collections one at a time. It attempts every collection
+and returns the first mapped error. It is not a coherent database-wide
+persistence cut: a concurrent writer can publish after its collection was
+flushed.
 
-## Synchronous mutation order
+`Close` stops new admission, drains publishers, establishes the final
+persistence boundary, and releases engine-owned resources. A direct durable
+collection does not close the caller-owned primary descriptor.
 
-The current synchronous primary path uses this order:
-
-1. Append the redo record.
-2. Sync the redo record with the power-safe barrier.
-3. Apply and publish the visible state.
-
-A successful mutation is durable before a reader can observe it.
-
-An older development file that has no journal can reopen on the synchronous
-chain-fence path. The open format and selected root determine that path.
-
-## Buffered checkpoint
-
-Buffered-visible mutation does not issue a device write before success. A
-process or machine failure before a completed checkpoint can lose acknowledged
-mutations.
-
-For the narrow unindexed, schema-free inline lane, multiple callers may perform
-private validation concurrently and publish through bounded striped accounting
-and one flat-combined generation cut. That optimization does not change the
-failure model: acknowledgement is still buffered-visible, and a successful
-`Flush` or `Close` is still the persistence boundary.
-
-`Flush` makes the current visible cut crash-safe. `Close` also performs the
-final checkpoint. A close error can be retryable while readers or resources
-remain active. Check `CloseCompleted` before you assume that teardown finished.
-
-## Primary-page checkpoint order
-
-The physical primary checkpoint grammar is the `VCS1` compact stripe. Its
-internal class discriminator is 6. It is not the retired unified class-5 test
-codec. A checkpoint deterministically folds the resident row overlay into
-immutable compact leaves, then publishes the routed parents and alternate root
-under the selected barrier strength. Compression changes physical
-representation only. It does not weaken the logical generation or checksum
-checks.
-
-An out-of-line value is different. Its raw `PageOverflow` chain is allocated
-and staged before a compact leaf can publish the first-page reference. The
-current overflow chain is not field-compressed. Recovery admits each piece's
-total length, offset, next reference, extent bounds, generation, and checksum
-before it exposes the reassembled value.
+Close is repeatable, but retry may perform real work. Snapshots, pinned pages, or
+unlock failure can leave teardown incomplete. Check `CloseCompleted`, release
+the blocker, and retry. A sticky error may coexist with completed teardown.
 
 ## Recovery journal
 
-The recovery journal has its own identity. The primary root cross-binds store
-ID and journal ID.
+Each journal has an identity cross-bound to the primary root. The journal uses
+two alternating headers and an aligned, checksummed record region. Recovery
+accepts only a contiguous valid sequence.
 
-If the selected root requires a journal, open fails when the journal is missing
-or has the wrong identity.
+If the selected root requires a journal, a missing file or identity mismatch
+fails closed. Treat a primary and its `.rjournal` sibling as one storage object:
+move, restore, and back them up together.
 
-A journal append or sync error poisons the writer. Further mutation and
-checkpoint work fails until close and reopen. Reopen replays valid redo and
-resolves the root generation.
+An append or sync error can have an unknown outcome: a complete record may be
+stable despite the error. The writer is poisoned until close and reopen; do not
+retry different data against it.
 
-A journal append or sync error can have an unknown outcome because the
-complete record might have reached stable storage despite the returned error.
-Root and transaction-decision fences have equivalent ambiguity windows. Close
-and reopen before you decide whether to retry.
+Recovery replays valid redo, checkpoints the recovered generation, and only
+then recycles the record prefix. A second crash during that fold can replay the
+same intact record again.
 
-An unresolved conditional transaction record makes a standalone collection
-return `ErrCollectionInDoubt`. Open the complete database directory so the
-decision log and all participants can be reconciled.
+## Batch atomicity
 
-Replicated SQL seals role-specific recovery record regions:
+`durable.Collection.Update` publishes rows and exact-index postings as one
+logical failure-atomic publication. A rejected sibling never exposes a partial
+logical batch.
 
-| Role | Sealed record-region capacity |
-| --- | --- |
-| User relation | 16 MiB + 34 × 512 bytes = 16,794,624 bytes |
-| Request-ledger system relation | At least 16 MiB + 119 × 512 bytes = 16,838,144 bytes |
+Routing preparation can first publish a content-equivalent topology generation.
+A later validation or durability error can therefore leave the rows and
+postings unchanged while `Generation may advance`. Compare logical state, not
+only generation numbers, after a failed batch.
 
-The request-ledger value is the retained on-disk compatibility floor and the
-space required by its current 514-entry, maximum-key-width conditional record.
-The owner seals the greater of that floor and the record region derived from
-its actual frozen collection limits. It does not enlarge the user-relation
-journal: that sidecar contract remains fixed at 16,794,624 bytes.
+## Multi-collection recovery
 
-The separate hard parser and allocation ceiling is 35,861 × 512 bytes =
-18,360,832 bytes. Recovery rejects a header above that ceiling before
-allocating its record buffer, but the ceiling is not a default or an owner's
-configured allocation. These capacities describe the record region, not total
-sidecar file size or a transaction participant limit.
+Two or more dirty durable collections use conditional participant records and
+the database decision log `txn.vtm`:
 
-## Root publication
+1. append every participant prepare;
+2. synchronize all participant journals;
+3. append and synchronize the sole commit decision; and
+4. publish every participant under one local snapshot-gate cut.
 
-The file has two alternate roots. The selected root is the canonical physical
-checkpoint. A journal-backed `Sync` commit can acknowledge after durable redo,
-before it publishes another physical root. Recovery validates both roots,
-selects a valid checkpoint, and replays valid later redo. Full-generation,
-chain-fence, and checkpoint paths publish an alternate root.
-
-A failure after root publication can make the commit outcome unknown. Do not
-retry with different data. Close and reopen, then inspect the recovered state.
-
-Recovery validates identity, generation, page kind, extent bounds, checksums,
-and catalog digests. A conflict or corruption fails closed.
-
-## Multi-collection transactions
-
-One dirty durable collection uses the ordinary collection path. Two or more
-dirty collections use conditional participant records and `txn.vtm`.
-
-The protocol is:
-
-1. Append a conditional prepare to each participant journal.
-2. Sync all participant journals.
-3. Append and sync one decision in `txn.vtm`.
-4. Publish all participants while holding their snapshot gates.
-
-The decision record is the only commit point. A transaction with `K`
-collections needs `K` participant syncs and one decision-log sync.
-
-When a valid decision log has no matching decision, recovery presumes abort. A
-committed decision rolls every participant forward. If conditional participant
-records exist but `txn.vtm` or a required participant is missing, recovery
+For `K` participants, commit uses `K+1` synchronization operations. Recovery
+must open the complete catalog. A valid decision rolls every participant
+forward; no decision means presumed abort. Missing `txn.vtm`, a missing required
+participant, or a standalone collection with unresolved conditional records
 fails closed.
 
-Low-level `durable.UpdateCollections` requires explicit nonzero `TxnLimits`
-for two or more dirty collections. `durable.Database.Update` supplies defaults.
-One dirty collection uses ordinary `Collection.Update`, bypasses cross-
-collection limits, and does not use `txn.vtm`. A transaction marker supports
-at most 64 physical participants.
-
-An ambiguous decision append or sync can return `ErrCommitOutcomeUnknown` and
-poison the catalog. Reopen resolves an all-or-none state.
-
-Synchronous journal and journal-backed buffered lanes support this primitive.
-Volatile buffered, async, and chain-fence shapes fail closed when they cannot
-provide the required protocol.
+An ambiguous decision append or sync returns `ErrCommitOutcomeUnknown` and
+poisons the catalog. Reopening the complete database resolves an all-or-none
+state. See [Transactions](transactions.md) for profile support and limits.
 
 ## Snapshots and reclamation
 
-A durable snapshot pins retired extents. A long-lived snapshot can fill the
-retired-extent table and return a retirement-capacity error to a writer. The
-durable package does not currently export this as a public sentinel.
+A durable snapshot pins one generation and owns mutable scratch. It is
+single-consumer and must be closed. Holding a snapshot across sustained writes
+pins retired extents; once the bounded retirement table fills, a writer returns
+a capacity error without publishing its mutation. Close the snapshot and retry.
 
-Close snapshots promptly. The engine attempts checkpoint and reclamation once
-before it refuses a mutation. A refused mutation is not published.
+The durable package currently exports no dedicated retirement-capacity
+sentinel. Do not document one. Active snapshots can also make collection close,
+database close, and collection drop retryable.
 
-Active snapshots can also make close retryable.
+## Platform and failure limits
 
-## Online compaction and space bounds
+“Power-safe” means the strongest implemented platform barrier; Darwin uses the
+full-sync class where available. It cannot prove every filesystem, controller,
+firmware, cache, hypervisor, or power-loss condition.
 
-`store/durable.Collection.CompactOnline` migrates one selected generation into
-authenticated adaptive staging extents, rebuilds exact indexes, conditionally
-publishes the new root, and retires the old source, catalog, scratch, chain,
-and manifest extents. A crash reopens either the old serving root or the exact
-resumable staging chain. It does not expose a partly migrated generation.
-
-Compaction is explicit and single-flight. It rejects checkpoint-group-owned
-collections, and checkpoint-group activation cannot attach while a compaction
-is in flight. Reservation, growth, and retirement recheck that ownership.
-The shipped RF3 path does not enable whole-file compaction automatically.
-
-Two qualification tests cover separate shapes. The mixed inline/overflow test
-with an exact index bounds peak apparent growth, newly allocated filesystem
-blocks, accounted staging payload, and extent count. A separate unindexed
-inline test bounds concurrent foreground-write latency during compaction. The
-tests do not establish the latency bound for the mixed indexed shape. The
-device-byte counter also excludes direct 4 KiB manifest-slot rewrites, so it
-must not be presented as exact physical device write amplification. Measure
-physical writes at the host/device boundary for competitive claims.
-
-## Platform barriers
-
-The power-safe checkpoint uses the strongest implemented platform primitive.
-Darwin uses the full-sync class where available. The ordinary filesystem mode
-does not promise sudden-power survival through a volatile drive cache.
-
-Direct I/O and `io_uring` modes are Linux-specific. A `Try` mode can fall back,
-and statistics report the result. A `Require` mode fails when the mode is not
-available.
-
-No software barrier can prove behavior for every filesystem, controller,
-device cache, or power-loss condition. The test suite uses deterministic
-injected write, sync, and torn-image failures.
+The test suite injects write, sync, torn-record, and torn-root failures. Those
+tests establish behavior for the modeled cuts, not a hardware certification or
+service-level guarantee.
 
 ## Operator rules
 
-- Call `Flush` when buffered data must cross its persistence boundary.
-- Treat a primary and its `.rjournal` sibling as one storage pair.
-- Treat `txn.vtm` as part of a multi-collection database.
-- Stop and close the database before a raw backup of the complete directory.
+- Stop writers and close the database before copying the complete directory.
+- Include every primary, `.rjournal`, `txn.vtm`, and catalog-side file.
+- Do not manipulate an open file or directory behind the writer lease.
 - Treat persistence errors and unknown outcomes as a close-and-reopen boundary.
-- Do not assume that all reads stay available after a persistence failure.
-- Use the [offline verifier](operations/verification.md) on quiescent data.
+- Do not assume reads remain available after a persistence failure.
+- Use offline verification against a quiescent file or copy.
+- Never rely on a development image across a different commit.
 
-The public API does not define a safe live raw-file backup procedure.
+The public API defines no safe live raw-file backup procedure.
 
-## Implementation references
+## Source map
 
-- `store/durable/store_file_durability.go`
-- `store/durable/store_file_lifecycle.go`
-- `store/durable/store_file_open.go`
-- `store/durable/store_file_online_compact.go`
-- `store/durable/store_file_primary_concurrent.go`
-- `internal/storeio/recovery_journal.go`
-- `internal/storeio/compact_primary_stripe.go`
-- `internal/storeio/overflow_page.go`
-- `store/durable/store_database_txn.go`
-- `internal/storeio/txn_marker.go`
+- Facade profiles: `vibedb.go`
+- Durable modes and validation: `store/durable/store_file_options.go`
+- Visibility and poison state: `store/durable/store_file_durability.go`
+- Flush and close: `store/durable/store_file_lifecycle.go`
+- Recovery journal: `store/durable/store_file_journal.go`
+- Multi-collection protocol: `store/durable/store_database_txn.go`
+- Recovery crash tests: `store/durable/store_file_journal_crash_test.go`
+- Buffered crash tests: `store/durable/store_file_buffered_test.go`
