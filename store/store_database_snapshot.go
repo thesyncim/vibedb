@@ -19,9 +19,9 @@ import (
 // Database.Snapshot closes that window by taking every collection's writer
 // lock before loading any state. Writers already serialize on that lock, so
 // while it is held no collection can be mid-commit, and the loads observe one
-// instant. The locks are taken in collection-name order — a total order over a
-// set the catalog lock is holding still — and no writer ever holds two
-// collections' locks, so the acquisition cannot deadlock.
+// instant. Snapshot and multi-collection writers take locks in the same
+// collection-name order — a total order over a set the catalog lock holds
+// still — so their acquisition cannot deadlock.
 //
 // The cost lands entirely on the reader. Nothing is added to the write path:
 // no shared gate to acquire per mutation, no atomic beyond the ones a write
@@ -38,12 +38,9 @@ import (
 //
 // What it guarantees is the absence of skew: every collection is observed at
 // the same instant, so a generation seen for one collection coexisted with the
-// generation seen for every other. What it does not do is make separate writes
-// atomic. A Database has no cross-collection transaction, so an application
-// that writes one document to orders and then another to customers has
-// performed two independent commits, and a snapshot may fall between them.
-// The snapshot is consistent with respect to the database's own commits, not
-// with respect to an application's intent spanning several of them.
+// generation seen for every other. [Database.Update] and [UpdateCollections]
+// publish their participant set atomically. Separate point writes remain
+// independent commits, and a snapshot may fall between them.
 type DatabaseSnapshot struct {
 	// entries is ordered by name so lookup can binary-search it, and so a
 	// snapshot's iteration order is the catalog's own stable order.

@@ -16,7 +16,7 @@
 // predicate subqueries, set operations, ordinary and bounded recursive CTEs,
 // scalar/CASE/CAST expressions, aggregates, HAVING, output ordering, windows,
 // and EXPLAIN. Unsupported shapes return typed errors; see
-// docs/design/sql-surface.md for the exact boundary.
+// docs/reference/sql.md for the exact boundary.
 //
 // Transactions may read and write multiple tables. Read Committed is the
 // database/sql default; Repeatable Read/Snapshot and Serializable are admitted
@@ -41,5 +41,5 @@
 // OpenCluster and OpenClusterConnector add one-shard placement/write preflight
 // to an embedded catalog. They do not start a network service or provide
 // replication. InitializeShardStore/OpenShardStore are the stricter identity
-// boundary used by the experimental leader-only shard command.
+// boundary used by the experimental shard runtimes.
 package driver

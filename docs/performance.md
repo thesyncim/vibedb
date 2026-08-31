@@ -1,267 +1,112 @@
-# Performance measurement
+# Performance evidence
 
-VibeDB contains microbenchmarks, allocation regression gates, and a separate
-cross-engine harness. A benchmark result is evidence only for its exact commit,
-toolchain, platform, data shape, and command.
+> [!CAUTION]
+> VibeDB is unreleased; APIs, commands, wire/disk formats, and results may change
+> at any commit. Use one exact source/docs pair and disposable data. This
+> repository publishes no competitive result: a benchmark command, coverage
+> table, CI artifact, or validated inventory is not a speed, cost, memory,
+> storage, or scaling claim.
 
-This documentation does not publish a current performance number. See
-`bench/competitive/RESULTS.md` for the publication record.
+Use this page to choose the right measurement and to keep a result
+reproducible.
 
-The repository currently provides measurement machinery, not evidence that
-VibeDB is the fastest engine, has the lowest cost, or scales linearly. Those
-claims require a current immutable evidence bundle for the exact workload and
-topology being discussed.
+## Choose the evidence
 
-## Run a focused Go benchmark
+| Question | Tool | What it establishes |
+| --- | --- | --- |
+| Did a hot path allocate more? | `go run ./bench/gate` | Same-machine `allocs/op` and `B/op` comparison to a Git base; never gates time |
+| How does one embedded workload behave? | `bench/competitive/cmd/mixed` | One isolated engine/process workload with latency, throughput, memory, and disk observations |
+| Are repeated mixed runs comparable? | `cmd/mixedsuite` | Deterministic execution order; its current summary TSV is not machine-safe (see below) |
+| What is the file/RSS footprint? | `cmd/footprint` | Apparent bytes, allocated blocks, Go memory, RSS, and corpus metadata |
+| Does a live set grow on disk? | `cmd/churndisk` | Bounded churn/storage samples; nonstandard shapes are diagnostic |
+| Where does one host/workload saturate? | `cmd/saturation` | Host-specific plateau search, not universal capacity |
+| What does a held snapshot cost? | `cmd/snapshotpressure` | Matched control versus pinned-snapshot pressure |
+| What is SQL interface overhead? | `cmd/sqlsurface` | VibeDB/SQLite embedded SQL or VibeDB pgwire shapes; not a PostgreSQL server comparison |
+| How do open/cold/recovery paths behave? | `cmd/lifecycle` | Isolated lifecycle stages with explicit timer boundaries |
+| Can the corpus exceed RAM safely? | `cmd/outofram` | Qualification of streaming/bounds, not a load-speed result |
+| Does RF3 survive the defined faults? | `go run ./bench/rf3chaos` | Canonical external-fault evidence for one exact build and scenario |
 
-```bash
-go test ./query \
-  -run '^$' \
-  -bench '^BenchmarkStoreQueryIndexedProjection$' \
-  -benchmem \
-  -count=10
-```
+`bench/competitive/COVERAGE.md` is generated from a 38-cell harness manifest.
+“Implemented” there means that an executable harness and oracle exist. It does
+not mean the product surface is complete or that the cell has been measured.
 
-Use a fixed `-benchtime` when you compare allocation counts. Keep the package,
-benchmark regex, input flags, and `GOMAXPROCS` constant.
-
-Correctness tests must pass before the benchmark. A benchmark is not a
-correctness oracle.
-
-## Replicated apply complexity
-
-Normal replicated command admission and apply do not scan the shard image.
-They read one bounded session header, at most one fixed ring slot, and the
-command's mutation keys. Mutation planning is bounded by 64 distinct keys. It
-performs indexed point reads plus bytewise validation and digest work on the
-supplied changes.
-
-Session creation is a zero-mutation Open whose Raft apply index becomes the
-client token; its retained result is sequence 1 and the first user mutation is
-sequence 2. The ordinary path keeps one raw-binary header and a fixed raw-binary
-ring with exactly `min(HighSequence, RetryWindow)` physical slots. `AckThrough`
-and the fixed window define a logical retry floor without moving or expanding
-the ring. Missing-header checks use one ordered session-prefix probe, not a scan
-of every possible slot.
-
-Retirement keeps the bounded image retryable. Exact Release is the cold
-maintenance path: it validates and atomically deletes at most `RetryWindow`
-slots. Its work is linear in the configured retry window, capped at 256, and is
-independent of shard row count and historical operation count. Release retains
-the epoch high-water, so reclaiming space does not trade away delayed-command
-fencing.
-
-For session and control apply, the replicated SQL hidden collection admits at
-least `max(7, 3*RetryWindow+3)` distinct mutations. Request-ledger and
-distributed-transaction profiles can raise that frozen limit for their wider
-commands. Each normal transition computes its exact system-row count and passes
-that value as `BatchDocumentsHint`; authority, session, slot, route-gate, and
-transaction rows can make the hint larger than three. Benchmark ordinary
-mutation separately from Open, retirement, and Release, and report retry
-windows 1, 8, and 256 so cold linear work is not blended into hot-path latency
-or allocation results.
-
-The hot path advances a deterministic `DataChainDigest` from the prior chain
-and the exact row changes. This digest is history-sensitive. It is not a
-canonical incremental Merkle root and it cannot prove that images with
-different histories contain the same rows.
-
-Canonical `ImageDigest` work stays on cold full-image paths. Reopen and import
-scan the image. Snapshot artifact creation computes the digest while it already
-streams the image. An explicit audit scans a coherent read snapshot. Normal
-admission and apply do not compute `ImageDigest`.
-
-When you measure this contract, vary shard row count independently from command
-mutation count and changed document bytes. Report point-update latency and
-allocation data separately from full-image reopen, artifact, import, and audit
-costs. The complexity contract is not a published throughput or latency claim.
-
-The default cardinality regression uses real durable collections at one row
-and 65,536 rows. It requires an effective one-key `ApplyNormal` publication to
-perform zero full-snapshot scans, exactly one attempted key and validator call,
-at most four user-page reads, at most one bounded leaf conversion, and no empty
-reclaim. A cold structural update may activate the fixed committer descriptor
-arena, so the test keeps that visible and caps the measured apply at 20 MiB and
-1,024 allocations. The benchmark additionally caps non-cold work at 64 KiB
-and 256 allocations per operation. Timing remains diagnostic; the fixed-work
-and allocation ceilings are the gates, not a latency claim.
-
-The literal 10,000,000-row qualification is intentionally opt-in because
-building its real on-disk image is setup work, not a suitable cost for every
-pull request:
-
-```bash
-VIBEDB_APPLY_10M=1 go test -count=1 -timeout=80m \
-  -json \
-  -run '^TestMachineApplyPointUpdateTenMillionQualification$' \
-  ./internal/replicatedstate
-```
-
-The `P0.1 10M-row apply qualification` workflow runs that qualification on a
-manual dispatch. A pull request can qualify its exact head by adding the
-`p01-apply-10m` label; ordinary pull requests do not pay the setup cost. The
-workflow retains the candidate revision, clean/dirty state, toolchain, host,
-memory, filesystem type and capacity, raw `go test -json` stream, a structured
-result, setup/open durations, measured apply duration, and before/after
-counters. The job fails if the exact named test is absent, lacks an exact test
-pass event, or omits the structured result. A candidate closes the cardinality
-exit gate only with a passing artifact for its exact commit. Setup and open
-time are reported separately and never presented as point-update latency.
-
-## Run the allocation gate
+## Allocation gate
 
 ```bash
 go run ./bench/gate
+go run ./bench/gate -base <commit>
 ```
 
-The gate measures the working tree and the merge-base on the same machine. It
-creates a temporary Git worktree for the base.
+The curated gate rejects any gated `allocs/op` increase and a `B/op` increase
+greater than five percent. It neither reads, reports, nor gates `ns/op`. The
+local default compares with the merge base of `main`; pull-request CI supplies
+the exact PR base.
 
-The gate fails when a gated `allocs/op` count increases. It also fails when a
-gated `B/op` count increases by more than 5 percent. It prints `ns/op` only for
-context and never uses time as a pass or fail signal.
+### Known `mixedsuite` output defect
 
-See [the gate reference](../bench/gate/README.md) for the curated benchmark set.
-
-## Run the competitive harness
-
-The competitive harness is a nested Go module. Its dependencies do not belong
-in the root module.
-
-```bash
-cd bench/competitive
-go test ./...
-```
-
-Use the commands in [the generated coverage matrix](../bench/competitive/COVERAGE.md)
-for exact measurement shapes.
-
-The harness compares VibeDB with configured file-backed engines. It provides
-separate commands for mixed load, repeated isolated mixed suites, footprint,
-speed probes, and disk churn.
-
-The coverage matrix is a project-defined set of measurement cells. It is not a
-complete database-market or distributed-systems benchmark: node-count and
-shard-count scaling, weak scaling, repartitioning/rebalancing, hot-partition
-skew, and multi-group query execution are outside its current matrix.
-
-One engine runs in each measurement process when process RSS or Go heap data is
-part of the result. This prevents retained state from another engine from
-contaminating the measurement.
+The current summary header declares fewer grouping columns than each summary
+row emits. The runner's execution order is deterministic, but downstream tools
+must not treat its summary TSV as a stable machine-readable schema until that
+defect is fixed. Raw per-run evidence remains the safer input.
 
 ## Publication requirements
 
-Record all of this metadata with a published result:
+A result intended for comparison must record:
 
-- VibeDB commit and dirty state
-- Competitor versions and configuration
-- Go version and build flags
-- Operating system, architecture, CPU, memory, and filesystem
-- Storage device and durability lane
-- Corpus size, shape, cardinality, and seed
-- Index configuration and cache budget
-- Workload name and read/write mix
-- Client count, warmup, operation count, and checkpoint cadence
-- For distributed runs: process, node, replica, group, and shard counts plus
-  placement and network topology
-- Complete command line
-- Raw per-run rows
-- Repetition count and summary method
+- exact commit, dirty state, toolchain, dependency lockfiles, and command;
+- host CPU, memory, OS, architecture, filesystem, device, mount/controller, and
+  power/durability assumptions;
+- engine versions, configuration, compression/storage profile, cache budget,
+  indexes, and acknowledgement contract;
+- corpus generator/digest, count, document shape, cardinalities, seed, and
+  logical bytes;
+- clients, operations, mix, warmup, conditioning, checkpoints, and timer
+  boundaries;
+- per-run raw rows, repetitions, failure/skip rows, and summary method;
+- for RF3: process/node/group/replica/shard topology and which byte/latency/RSS
+  cuts were actually observed.
 
-Use at least nine isolated repetitions for the mixed-suite publication shape.
-The harness uses a deterministic Latin-square engine order and can run one
-discarded conditioning pass.
+Keep each summary row linked to immutable raw evidence. Never remove slow or
+failed repetitions without a predeclared exclusion rule.
 
-Report apparent bytes and allocated filesystem blocks separately. Report Go
-heap and process residency separately. VibeDB uses mapped and I/O memory outside
-the Go heap.
-
-### Validator boundary
-
-The dedicated-host script fixes more configuration than `cmd/publishcheck`
-currently verifies. For embedded mixed suites, the validator checks revision,
-dirty state, repetition count, durability, checkpoint cadence, document shape,
-exact-index count, diagnostic state, required engines, raw-run count, and a
-required summary-metric set. It does not independently pin workload, corpus
-size, measured operations, warmup, clients, cardinality, seed, conditioning, or
-storage profile. For RF3 latency artifacts, it checks revision, RF3 durability,
-replica count, workload, clients, required summaries, and selected counters; it
-does not independently pin operations, warmup, or seed.
-
-Consequently, `VALIDATED.tsv` proves that the expected artifact inventory
-passed the validator and records its digests. It does not by itself prove that
-every publication axis was equivalent, or that VibeDB won. Preserve the runner,
-complete commands, raw metadata, and artifacts with any result, and review the
-unvalidated axes explicitly.
-
-### Compression-profile boundary
-
-The competitive harness's `intrinsic` and `production` storage profiles control
-only optional compression exposed by an adapter. At the current pinned
-dependencies, they switch Badger and Pebble between uncompressed and Snappy SST
-blocks. They are an explicit no-op for VibeDB, bbolt, and SQLite. In particular,
-`intrinsic` does not disable VibeDB's built-in storage representation or its
-field/stream encodings; it must not be described as an uncompressed VibeDB
-format. The corpus `gzip -9` statistic is an entropy control over JSON document
-bytes only and excludes keys.
+The publication validator checks artifact inventory, exact revision, selected
+metadata, and canonical receipt digests. It assumes a trusted, immutable
+evidence directory while validation runs: files are reopened for hashing,
+symlinks are followed, and receipt publication is not a directory-fsync
+protocol. The receipt is therefore neither tamper-proof nor proof that a crash
+made the directory entry durable. It also does **not** independently prove every
+runner flag, workload equivalence, hardware fairness, or a comparative
+conclusion. Qualification mode uses a smaller CI-only inventory and cannot be
+promoted to a publication result.
 
 ## Comparison rules
 
-- Compare equivalent correctness and durability contracts.
-- Keep the logical data and operation mix identical.
-- Keep built-in compression policy explicit.
-- Label a VibeDB-only command as diagnostic, not comparative.
-- Label a projected value as a projection.
-- Do not replace a database-level result with a codec microbenchmark.
-- Keep tail latency and throughput as separate measures.
-- Publish the raw result artifact with the summary.
+- Match acknowledgement durability before comparing write latency.
+- Name cache/accounting differences. For example, bbolt maps the complete
+  database and cannot honor the nominal engine cache; the SQLite adapter uses
+  one open connection.
+- Plain KV engines do not execute exact-index lanes. Only compare a lane that
+  both engines implement with equivalent semantics.
+- A setting named `production` in the harness only selects an optional
+  compression profile; it says nothing about product maturity.
+- `BenchmarkScan` touches one byte per document and cannot support a
+  bytes-throughput claim; use full-byte scan evidence.
+- Do not use single-group in-process RF3 latency as horizontal scaling evidence.
+- Do not translate whole-harness elapsed time into election, failover, recovery,
+  or foreground latency when the protocol does not expose those cuts.
 
-## Churn and crash evidence
+## Current result state
 
-The disk-churn command measures a deterministic bounded mutation run. It is not
-a time-based soak test.
+[`bench/competitive/RESULTS.md`](../bench/competitive/RESULTS.md) intentionally
+contains no number: there is no checked-in immutable evidence bundle or
+validated competitive summary. CI uploads claim-free raw qualification
+artifacts for limited retention; it does not publish a result registry.
 
-Injected crash sweeps test recovery cuts. They do not measure real power-loss
-frequency, storage-controller behavior, restart latency, or availability.
-
-The RF3 latency/counter matrix is a separate in-process harness. It measures
-point reads and writes against one RF3 group with three replicas through an
-in-process round tripper. It does not run the shipped gateway as an OS process,
-vary node or shard count, exercise rebalancing during load, or establish weak or
-near-linear horizontal scaling.
-
-The RF3 external fault runner executes the shipped three-process shard command,
-including process isolation, leader kill, deliberately unread response,
-byte-identical outcome recovery, replica restart, durable acknowledgement
-survival, bounded result-waiter reuse, and catch-up. It writes canonical raw TSV
-evidence and treats a skipped test as a failed qualification:
-
-```bash
-go run ./bench/rf3chaos \
-  -output "$(pwd)/rf3-chaos.tsv" \
-  -runs 9 \
-  -timeout 5m
-```
-
-Its per-run elapsed value covers the complete harness. It is not a failover or
-recovery latency measurement. Publish those latency claims only after the
-shipped protocol exposes and records the individual fault, election, routing,
-settlement, and catch-up cuts.
-
-Strict physical allocation for the recovery journal is Linux-only. On Darwin,
-the external harness skips and the runner records a failed row and exits
-nonzero; that local result is not qualification. Linux CI invokes the runner
-explicitly so lack of allocation support cannot silently become a passing
-gate.
-
-## Implementation references
+## Source map
 
 - `bench/gate/main.go`
-- `bench/competitive/bench_test.go`
-- `bench/competitive/cmd/mixedsuite/main.go`
-- `bench/competitive/cmd/footprint/main.go`
-- `bench/competitive/cmd/churndisk/main.go`
-- `bench/rf3chaos/main.go`
 - `bench/competitive/internal/coverage/manifest.go`
-- `internal/replicatedstate/apply.go` and `digest.go`
-- `internal/replicatedstate/read.go` and `snapshot_artifact.go`
+- `bench/competitive/cmd/*`
+- `bench/competitive/cmd/publishcheck`
+- `bench/rf3chaos/main.go`
+- `scripts/bench/run-ci-competitive-evidence.sh`

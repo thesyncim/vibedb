@@ -231,7 +231,7 @@ func TestPublicUpdateContractAcknowledgesTopologyPublication(t *testing.T) {
 		filepath.Join(root, "store", "durable", "store_file_batch.go"),
 		filepath.Join(root, "docs", "store.md"),
 		filepath.Join(root, "docs", "architecture.md"),
-		filepath.Join(root, "docs", "design", "hybrid-mutations.md"),
+		filepath.Join(root, "docs", "transactions.md"),
 	}
 	required := []string{
 		"logical failure-atomic publication",

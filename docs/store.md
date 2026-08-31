@@ -1,242 +1,223 @@
-# Storage model
+# Low-level storage engines
 
-The root facade owns lifecycle and selects one of three product profiles. The
-`store` and `store/durable` packages expose the underlying engines for callers
-that need explicit snapshots, geometry, I/O modes, or bulk construction.
+Use the root `vibedb` package unless you need to own snapshots, descriptors, storage
+geometry, or workspaces. This maps the lower-level `store` and `store/durable` contracts.
 
-## Product facade
+> [!CAUTION]
+> VibeDB is unreleased development software. Pin one exact Git commit: APIs,
+> disk formats, file layouts, recovery behavior, commands, and wire behavior may
+> break between any two commits. Do not store irreplaceable data in VibeDB.
 
-`vibedb.Open` is the default entry point. It gives each collection one stable
-lazy handle. The first valid mutation creates missing storage.
+## Choose one ownership layer
 
-The facade owns collection descriptors and closes them with the database. A
-database-managed collection returns `ErrManagedCollection` from its own
-`Close` method.
+| Package | Residency | Lifecycle owner | Snapshot rule |
+| --- | --- | --- | --- |
+| `vibedb` | Memory or disk profile | Database owns managed handles | Hidden behind facade reads and transactions |
+| `store` | Heap/off-heap process memory | Go object owner | Value snapshot; no close required |
+| `store/durable` collection | Bounded resident cache plus one file | Caller owns `*os.File`; engine owns I/O resources | Explicit lease; must close |
+| `store/durable` database | Directory of collection files | Database owns opened descriptors | Explicit multi-collection lease; must close |
 
-## In-memory engine
+Do not mix lifecycle assumptions. A `vibedb.Collection` returned by
+`Database.Collection` cannot be closed independently. A standalone durable
+collection does not close the `*os.File` passed to `Create` or `Open`.
 
-`store.Collection` has one writer mutex and one atomically published immutable
-state pointer. A point write rebuilds at most one chunk and then publishes a
-new state.
+## `store`: immutable heap generations
 
-Readers and snapshots do not take the writer lock. Heap snapshots are O(1),
-need no close, and retain old rows through immutable state ownership.
+`store.Collection` is the source-model JSON engine. Its zero value is usable and
+must not be copied after use. One writer lock serializes mutations; readers load
+immutable published state without taking that lock.
 
-The chunk size is 1 through 64 documents. Zero selects 64. A point-write
-rebuild has cost proportional to this size. Use `store.Builder` for bulk load.
-
-A failed put changes no state. A missing delete does not advance the
-generation. Heap range order is stable chunk and slot order.
-
-Raw heap reads can return borrowed memory. For a stable borrowed value, call
-`Snapshot.GetRaw` and retain the snapshot. Treat `Collection.GetRaw` as
-current-state borrowed data that a later mutation can retire. Use `AppendRaw`
-when bytes must outlive the snapshot or mutation.
-
-## Heap database
-
-The zero value of `store.Database` is usable. A database snapshot locks all
-collection writers in name order and captures one coherent instant.
-
-`store.UpdateCollections` supports at most 16 participants, 64 keys per
-participant, and 16,793,600 staged key-plus-value bytes per participant. It
-validates all participants while it holds the writer locks. It then publishes
-all state pointers.
-
-A coherent database snapshot cannot observe a partial publication. Independent
-collection reads can see different sides of a multi-collection commit. Use a
-database snapshot when a cross-collection instant matters.
-
-## Durable engine
-
-`durable.Create` requires an empty file. It takes an in-process lock and an OS
-writer lock, assigns a random store ID, and persists generation 1.
-
-`durable.Open` validates the alternate roots and the catalog structures that
-they reference. An unindexed collection does not require a full row scan during
-open. An ordered-primary collection with exact indexes does more: it walks the
-primary router and posting rows to rebuild the live-slot table, walks every
-exact-index catalog, and copies each exact-leaf payload into a resident Go-heap
-epoch. Indexed open time and that epoch's memory therefore scale with persisted
-index geometry.
-
-One process owns a mutable file. Structural changes, checkpoints, batches,
-indexed mutations, and overflow mutations serialize through its exclusive
-writer. The lock covers path aliases and duplicate descriptor identity when
-the platform can prove them.
-
-There is one deliberately narrow shared-writer exception: eligible inline
-`Put` and `Delete` calls on an unindexed, schema-free, non-opaque
-buffered-visible collection can validate in a fixed pool of at most 32 contexts,
-serialize leaf-local accounting through 4096 bucket stripes, and flat-combine
-publication. Pressure and every ineligible operation return to the exclusive
-path. This is neither multi-process ownership nor general multi-writer storage,
-and it does not apply to the synchronous durable profile.
-
-The zero-value durable options select:
-
-| Setting | Zero-value result |
-| --- | --- |
-| Backend | Auto, with portable fallback |
-| Read mode | Buffered |
-| Write mode | Buffered |
-| Durability | Synchronous journal-before-visibility |
-| Checkpoint strength | Power-safe |
-
-Normalized resource defaults include:
-
-| Resource | Default |
-| --- | ---: |
-| Base page | 4096 bytes |
-| Maximum page | 64 KiB |
-| Page-cache and mutable-row-overlay budget | 64 MiB |
-| Read concurrency | 4 |
-| Prefetch queue | 64 |
-| Maximum key | 256 bytes |
-| Inline value | 512 bytes |
-| Maximum document | 4 MiB |
-| Snapshot leases | 1024 |
-| Retired extents | 65,536 |
-| Batch documents | 64 |
-| Batch bytes | 16,793,600 |
-| Commit queue slots | 64 |
-
-`Options.ResidentBytes` configures the page cache plus the mutable row overlay;
-it is not a total heap or process-RSS ceiling. In particular, the resident
-exact-index epoch described above is outside that budget.
-`Collection.Stats().ResidentBytes` and `CapacityBytes` report the cache and
-overlay, not the copied exact-leaf payloads, exact-index catalog metadata, or
-the live-slot table in that epoch.
-
-The option validator accepts at most 4096 logical exact-index names, 64
-distinct physical path sets, and 8 skip indexes. Identical exact-index path
-sets share one physical index. A canonical compound index tuple has a 4096-byte
-limit.
-
-## Durable primary representation
-
-The only production leaf grammar is the `VCS1` compact primary stripe. It
-groups canonical JSON rows by shape, stores one shared static template per
-shape, and independently encodes each scalar hole. Keys and scalar columns use
-the same reversible eight-codec planner: dictionary, front, frame-of-reference,
-delta, packed delta, date ordinal, prefix integer, or alphabet packing. See
-[Compact primary stripes](format.md#compact-primary-stripes-vcs1) for the exact
-layout and selection policy.
-
-Physical leaf extents are 4 KiB-rounded and at most 64 KiB. Unindexed leaves
-admit at most 4096 rows. Exact-indexed leaves admit at most 256 so posting slots
-remain stable bytes. Values above `InlineValueBytes` do not enter those scalar
-streams. They use raw overflow chains up to `MaxDocumentBytes`. Neither overflow
-compression nor cross-value deduplication is currently implemented.
-
-The routing hierarchy is independently replaceable. A global lexical catalog
-names tablets. Each tablet has one fixed local-ID locator and up to 16 anchor
-pages. Anchor pages are packed by compressed fence bytes as well as by their
-256-row ceiling, so the locator—not lexical rank arithmetic—is the source of
-truth for an anchor page and row slot.
-
-## Durable reads and snapshots
-
-A durable snapshot pins one generation lease and owns mutable scratch storage.
-It is single-consumer and must be closed.
-
-Create snapshots freely, but close them promptly. A long-lived snapshot pins
-retired extents. When the retired-extent bound is full, a writer attempts
-checkpoint and reclamation. It returns a retirement-capacity error if active
-readers still prevent reuse. This error is not currently an exported durable
-sentinel.
-
-A durable database snapshot pins one generation lease for every captured
-collection and must be closed. Active snapshots can make database close or
-collection drop retryable.
-
-Durable scans use lexical key order. Callback data is borrowed. `AppendRaw`
-copies data into caller memory.
-
-Prefetch is a bounded performance hint. A dropped prefetch cannot change a
-query result.
-
-## Mutation publication
-
-Eligible point mutations use a resident inline overlay. A same-shape scalar
-replacement can also re-encode only its affected scalar stream while it copies
-the other sections into the replacement leaf. Other mutations use a routed
-copy-on-write path. All successful paths publish one logical generation. A
-later checkpoint folds resident rows into immutable `VCS1` pages.
-
-`Collection.Update` gives one logical failure-atomic publication for rows and
-exact postings. Preparation can publish a content-equivalent topology
-generation before later validation rejects the logical batch. Thus,
-Generation may advance even when no row or posting changes.
-
-Do not use generation equality as the only test for a failed logical batch.
-Compare the logical rows and indexes.
-
-## Durable database catalog
-
-`durable.OpenDatabase` resolves the directory to a stable absolute physical
-path. Do not rename or replace the directory while it is open.
-
-Default permissions are `0700` for a directory and `0600` for a file.
-
-Each collection uses a primary file and an optional journal. The catalog
-encodes a logical collection name as lowercase hexadecimal UTF-8 bytes:
-
-```text
-orders -> c-6f7264657273.vjc
+```go
+c, err := store.New(store.Options{ChunkDocuments: 64})
+created, err := c.Put("k", []byte(`{"answer":42}`))
+snap, err := c.Snapshot()
+raw, found := snap.GetRaw("k")
 ```
 
-The related journal appends `.rjournal`. The multi-collection decision log is
-`txn.vtm`.
+`Put` validates and copies the key and JSON source. It rebuilds one bounded chunk,
+so repeated bulk loading pays `O(ChunkDocuments)` copying per row. For loads
+larger than one chunk, use the single-goroutine `Builder` and its terminal `Build`.
 
-Collection names are byte identities. The catalog does not normalize Unicode.
-Malformed canonical entries, symlink primaries, and recognizable case aliases
-fail closed. Unrelated unrecognized files are ignored.
+`Delete` removes a row without a tombstone; a miss does not advance generation.
+Existing snapshots keep their rows. A heap snapshot is concurrent-safe, needs no
+`Close`, and remains valid after writes; `GetRaw` is borrowed from that snapshot.
 
-Drop removes and syncs the primary before it removes and syncs the journal. A
-crash can leave an orphan journal, but it does not intentionally leave a live
-primary without its required journal.
+### Heap options
 
-## Physical capacity
+| Option | Contract |
+| --- | --- |
+| `ChunkDocuments` | `1..64`; zero selects 64 |
+| `IndexOptions` | JSON structural-index geometry |
+| `ShapeTapes` | Compile repeated object shapes |
+| `Postings` | Maintain containment/existence postings |
+| `ValueDict` | Maintain the value dictionary |
+| `Schema` | Optional valid compiled schema, frozen at initialization |
 
-Normal files grow elastically. A sealed physical capacity is a specialized
-configuration for a compatible async rooted layout. It proves or extends an
-allocated prefix and does not eagerly write the complete ceiling.
+These are representation controls, not durability controls. Collection memory
+can live outside Go's `HeapAlloc`; measure process RSS too.
 
-`PhysicalCapacityBytes` requires asynchronous visibility, no recovery journal,
-no canonical materialization, and a page-aligned representable capacity. The
-platform must prove and synchronize strict allocation. Darwin does not provide
-that proof and refuses this configuration.
+### Heap catalog and coherent cuts
 
-A sealed recovery journal is Linux-only and synchronous. Its size must be
-sector-aligned and large enough for the maximum conditional batch.
+`store.Database` is a zero-value-ready catalog. `CreateCollection` freezes options.
+`DropCollection` removes only the name; acquired handles and snapshots remain usable.
 
-Free extents are reused. Optional hole punching can release physical blocks on
-Linux and Darwin. Logical file high-water can stay large after physical release.
+`Database.Snapshot` briefly locks every cataloged collection writer in name
+order and captures one no-skew cut. It does not make a sequence of separate
+writes atomic.
 
-## Ownership rules
+For atomic writes, use `store.UpdateCollections(participants, fn)`. It stages
+all fallible work, locks all participant writers in global name order, then
+publishes every planned state while those locks are held. Database snapshots see
+the transaction before or after, never partly applied. Independent
+single-collection reads can still observe their individual publication points.
 
-- Do not copy synchronized handles after first use.
-- Close every durable snapshot.
-- Keep borrowed bytes inside their callback or snapshot lifetime.
-- Do not modify or replace an open primary, journal, catalog, lock entry, or
-  database directory from another process.
-- Copy a stopped complete database directory, not an isolated active file.
-- Treat persistence errors as a close-and-reopen boundary.
+The heap defaults admit at most 16 participant collections and, per participant,
+64 distinct keys and 16,793,600 staged key/value bytes. Batches copy inputs,
+deduplicate keys, and use last-write-wins. `Database.Update` includes every
+currently cataloged collection as a participant, even when the callback dirties
+only one; a catalog larger than 16 can therefore be refused. Select participants
+explicitly when that distinction matters.
 
-The source does not define a safe live raw-file backup procedure.
+## `store/durable`: one owned file per collection
 
-## Implementation references
+`durable.Create` requires an empty regular file; `durable.Open` recovers one.
+Both take an exclusive writer lease. Until `Collection.Close` completes, keep
+the descriptor and path stable; never independently access or alter the
+primary/journal pair.
 
-- `store/engine.go` and `store/store_database_snapshot.go`
-- `store/store_database_txn.go` and `store/store_builder.go`
-- `store/durable/store_file_open.go` and `store_file_operations.go`
-- `store/durable/store_file_options.go` and `store_file_lifecycle.go`
-- `store/durable/store_file_primary_concurrent.go` and
-  `store_file_primary_structural.go`
-- `store/durable/store_file_primary_exact.go` and
-  `store_file_primary_exact_epoch.go`
-- `store/durable/store_database.go` and `store_database_snapshot.go`
-- `internal/storeio/compact_primary_stripe.go` and `compact_stream_codec.go`
-- `internal/storeio/segmented_tablet_router.go` and
-  `global_tablet_catalog.go`
+The engine owns caches, workers, the journal descriptor, and writer lease—not
+the caller's primary descriptor. Close active snapshots first. A failed `Close`
+can be retried; require `CloseCompleted` before closing the primary descriptor.
+
+`durable.OpenDatabase(dir, options)` is the owned-catalog alternative. It uses
+one encoded `.vjc` primary per collection, an optional paired `.rjournal`, and a
+catalog transaction sidecar named `txn.vtm`. It owns the descriptors it opens.
+Keep the resolved directory stable until `Database.Close` completes.
+
+Names are encoded, never used as path elements; do not alias or manipulate engine files.
+
+### Durable data contract
+
+The zero-value `durable.Options` is a working, power-safe JSON configuration.
+Important immutable or bounded controls include:
+
+| Control | Zero-value behavior |
+| --- | --- |
+| `PageSize` | 4096 bytes; no other base page size is accepted |
+| `MaxPageSize` | 64 KiB leaf/overflow ceiling |
+| `MaxKeyBytes` | 256 bytes |
+| `MaxDocumentBytes` | 4 MiB |
+| `MaxBatchDocuments` | 64 distinct keys |
+| `MaxBatchBytes` | Maximum keys plus up to 16 MiB of values |
+| `MaxRetiredExtents` | 65,536 tracked copy-on-write extents |
+| `Durability` | `DurabilitySync` |
+| `CheckpointStrength` | `CheckpointPowerSafe` |
+
+Geometry, schema presence, opaque mode, and index assertions are validated
+against the selected root. Zero-options reopen reconstructs documented persisted
+settings; it does not rewrite the file contract.
+
+`OpaqueValues` stores non-empty uninterpreted bytes byte-for-byte. It is
+incompatible with schemas, exact indexes, skip indexes, and JSON-only resident
+options. JSON collections validate and canonicalize values before publication.
+
+### Mutation and batch publication
+
+Point `Put` and `Delete` publish one complete new reader-visible state or
+nothing. `Collection.Update` copies and deduplicates staged keys and values; the
+last operation for one key wins. Malformed JSON and schema failures are detected
+before logical publication.
+
+An `Update` is a logical failure-atomic publication: rows and exact-index postings
+become visible as one unit. A fit problem may first publish one
+content-equivalent topology generation and replan. After a later error,
+Generation may advance while logical content remains unchanged. Generation is a
+publication counter, not a content version.
+
+`ErrBatchTooLarge` is an admission refusal with nothing published. Capacity and
+retired-extent pressure are also bounded refusals; closing old snapshots can
+release retired extents. A durability-fence failure is different: inspect
+`PersistenceError`, stop writing, close, and recover by reopening.
+
+### Durability modes
+
+| Mode | Success and visibility | Failure after acknowledgement |
+| --- | --- | --- |
+| `DurabilitySync` | The normal lane syncs a journal record before publication and acknowledgement; a file created async and reopened sync instead uses a root-fence chain | Acknowledged mutation recovers under that lane's fence contract |
+| `DurabilityAsyncVisible` | Publishes after bounded queue admission; persistence continues in background | Recent acknowledged state can be lost |
+| `DurabilityBufferedVisible`, no recovery journal | Publishes from bounded memory; setup or checkpoint metadata may still perform device I/O | Acknowledged state is lost unless flushed or closed successfully |
+| `DurabilityBufferedVisible` with `RecoveryJournal` | Publishes resident state, then syncs its redo before returning success | A successful acknowledgement is recoverable; visibility may precede that sync |
+
+`Flush` waits until the current reader-visible generation is recoverable under
+the selected checkpoint strength. `Close` fences publications, makes the
+accepted cut durable as required by the selected mode, and releases engine
+resources. `CheckpointFilesystem` is weaker than the power-safe default and is
+accepted only for portable, buffered-write, buffered-visible checkpoints.
+
+`RecoveryJournal` has mode-specific meaning. Ordinary sync collections are
+journal-backed; the reopened chain-fence exception is not. With
+buffered-visible it upgrades mutation acknowledgement to a bounded redo append
+and sync; without it, acknowledgement remains volatile and `Flush` or `Close`
+establishes recoverability at the selected strength. It does nothing for
+async-visible.
+
+An engine fence cannot prove every filesystem, controller, or device cache;
+qualify the deployment's storage stack.
+
+### Snapshots, scans, and open cost
+
+`Collection.Snapshot` pins one immutable generation. `SnapshotInto` reuses
+storage and closes/rebinds its prior lease. Close snapshots promptly and never
+copy them after use; long leases can cause bounded write backpressure.
+
+`Snapshot.AppendRaw` copies a value into caller storage. `Snapshot.RangeRaw` and
+`Collection.RangeRawCurrent` visit keys in bytewise lexical order and lend key
+and value bytes only for the callback. Prefetch is a hint, not a visibility or
+durability barrier.
+
+Open validates a bounded top-level graph rather than every primary row. Indexed
+open still rebuilds the resident exact-index epoch by walking persisted exact-index
+catalog/leaf geometry; plan startup against the actual index set.
+
+### Durable multi-collection operations
+
+`Database.Snapshot` and `SnapshotCollections` capture one no-skew cut and own one
+lease per materialized collection; close the returned database snapshot.
+
+`Database.Update` prepares each dirty participant, syncs each participant's
+conditional record, then syncs one decision in `txn.vtm` before publishing. A
+K-participant commit therefore performs K+1 syncs. Recovery reveals every
+participant committed or none. Standalone `Open` fails closed on an uncovered
+conditional record; reopen the complete database catalog instead.
+
+The raw `durable.UpdateCollections` API requires explicit, non-zero
+`TxnLimits` for two or more dirty collections. `Database.Update` owns defaults:
+16 collections, 256 documents, and 67,174,400 total staged bytes. A one-dirty-
+collection call routes through ordinary `Collection.Update` and does not consume
+the multi-collection marker protocol.
+
+Only the sync-journal and buffered-journal-ack lanes support a low-level
+multi-collection durable commit. Other lanes return
+`ErrDatabaseTransactionUnsupportedLane`. An ambiguous decision sync returns
+`ErrCommitOutcomeUnknown`, poisons catalog writes, and requires a complete close
+and reopen; recovery still resolves to all or none.
+
+### Offline inspection and salvage
+
+`Verify` and `Salvage` do not acquire the writer lease or apply recovery rollback.
+Run them on a quiescent file or consistent copy, never beside a live writer.
+
+`Verify` reports structural findings separately from I/O errors. `Salvage`
+rebuilds a fresh empty output from surviving self-describing primary leaves;
+overflow values are skipped and reported, so salvage can be partial. It is not a
+backup strategy.
+
+## Source map
+
+- Heap collection and snapshots: `store/engine.go`, `store/store_builder.go`
+- Heap catalog, cuts, and transactions: `store/store_collection.go`, `store/store_database_snapshot.go`, `store/store_database_txn.go`
+- Shared schemas and indexes: `store/store_schema.go`, `store/store_index.go`, `store/store_index_exact.go`
+- Durable options and open: `store/durable/store_file_options.go`, `store/durable/store_file_open.go`
+- Durable batches and lifecycle: `store/durable/store_file_batch.go`, `store/durable/store_file_lifecycle.go`
+- Durable catalogs, cuts, and transactions: `store/durable/store_database.go`, `store/durable/store_database_snapshot.go`, `store/durable/store_database_txn.go`
+- Offline tools: `store/durable/store_file_verify.go`

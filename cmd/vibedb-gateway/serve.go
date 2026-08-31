@@ -45,16 +45,18 @@ const (
 // catalog generation, refreshes the atomically replaced catalog file after a
 // shard reports stale routing metadata, and accepts newline-delimited JSON
 // requests over a connection. Each request routes and dispatches against the
-// pinned generation: a bounded distributed read by default or one colocated
-// single-shard write for exec. Authenticated RF3 serving can additionally
-// install an atomic fixed-participant exec_batch service. The reply is the
-// merged result. The wire form is a minimal JSON envelope; a request
+// pinned generation: a bounded distributed read by default or one
+// single-base-owner write for exec. Independently placed index maintenance may
+// add transaction participants behind that exec. Authenticated RF3 serving can
+// additionally install an atomic fixed-participant exec_batch service. The
+// reply is the merged result. The wire form is a minimal JSON envelope; a request
 // carries SQL, typed parameters, and an operational class. The static command
-// exposes only single-owner writes through exec. Authenticated RF3 mode also
-// installs the durable exec_batch service; static serving never falls back to
-// the library transaction engine. The pinned catalog and shared SQL planner
-// derive placement, shard constraints, merge order, and the global limit. The
-// envelope itself is decoded and emitted with vibejson.
+// exposes only single-base-owner statements through exec. Authenticated RF3
+// mode also installs the durable exec_batch service; static serving never
+// routes public exec_batch into the general library batch API. The pinned
+// catalog and shared SQL planner derive placement, shard constraints, merge
+// order, and the global limit. The envelope itself is decoded and emitted with
+// vibejson.
 
 // serveRequest is one query envelope a client sends. SQL and its typed
 // parameters are the only semantic inputs; clients cannot override routing or
@@ -62,7 +64,7 @@ const (
 type serveRequest struct {
 	// Op selects the gateway operation: the empty value and "query" are the
 	// read path; "read_batch" is the RF3 exact-point SQL vector; "exec" is the
-	// single-shard write path; authenticated durable RF3 "exec_batch" uses
+	// single-base-owner write path; authenticated durable RF3 "exec_batch" uses
 	// Statements and applies one Class to the complete atomic batch.
 	Op string `json:"op,omitempty"`
 	// RequestID is the caller's fixed 128-bit hexadecimal idempotency key for

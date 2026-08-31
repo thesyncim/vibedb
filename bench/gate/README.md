@@ -1,42 +1,55 @@
 # Allocation regression gate
 
-`go run ./bench/gate` compares the working tree with a base revision on the
-same machine.
+> **Development status:** The curated benchmark set and thresholds are internal
+> development policy. They can change at any commit and are not a stable public
+> performance contract.
 
-## Pass and fail rules
+The gate compares allocation measurements from the current checkout with a Git
+base built in a temporary detached worktree on the same machine. It keeps no
+checked-in baseline and never gates elapsed time.
 
-The gate fails when:
+## Run it
 
-- A gated `allocs/op` value increases.
-- A gated `B/op` value increases by more than 5 percent.
-
-The gate does not compare `ns/op`. Machine load can change time measurements
-without changing allocation behavior.
-
-## Baseline selection
-
-Use the default merge-base with `main`:
+From the repository root, compare with the local merge base of `HEAD` and
+`main`:
 
 ```bash
 go run ./bench/gate
 ```
 
-Select an exact base:
+Compare with an exact locally available revision:
 
 ```bash
 go run ./bench/gate -base <commit>
 ```
 
-CI sets `GATE_BASE` to the pull-request base commit.
+Keep the temporary base worktree for inspection:
 
-The tool checks out the base in a temporary Git worktree. It does not stash or
-reset the primary worktree.
+```bash
+go run ./bench/gate -base <commit> -keep
+```
 
-## Curated benchmarks
+The tool does not fetch. The default therefore uses the caller's current local
+`main`, which may be stale. It does not stash, reset, or otherwise rewrite the
+primary worktree.
 
-The source in `bench/gate/main.go` is authoritative. The current set is:
+Pull-request CI is slightly different: GitHub checks out the synthetic test
+merge and sets `GATE_BASE` to the pull request's exact base SHA. That is a
+test-merge-versus-base comparison, not necessarily contributor-head versus its
+merge base.
 
-| Package | Benchmark | Fixed time | Gates |
+## Pass rules
+
+The gate fails closed when a required row or metric is missing. For gated rows:
+
+- any increase in `allocs/op` fails; and
+- `B/op` may increase by at most 5%.
+
+`BenchmarkFileStoreCreateFromFloor` reports its fractional `allocs/op` but gates
+only `B/op`. The command parses Go benchmark timing as part of the input format,
+but does not compare or report `ns/op` in its summary.
+
+| Package | Benchmark | Fixed iterations | Gated metrics |
 | --- | --- | ---: | --- |
 | `store/durable` | `BenchmarkFileStoreCreateFromFloor` | `5x` | `B/op` |
 | `store/durable` | `BenchmarkUnifiedScanAllBytesLowCardinality` | `5x` | allocations and bytes |
@@ -46,15 +59,25 @@ The source in `bench/gate/main.go` is authoritative. The current set is:
 | `query` | `BenchmarkStoreQueryIndexedCount` | `20x` | allocations and bytes |
 | `query` | `BenchmarkApplyKernelLeftExactMemoizationWarm` | `20x` | allocations and bytes |
 
-Bulk-build `allocs/op` is measured but not gated because it is fractional at
-the fixed iteration count. Its `B/op` value remains gated.
+`bench/gate/main.go` is authoritative if this table and the implementation
+diverge.
 
 ## Exit status
 
-- 0 means that all gated metrics passed.
-- 1 means that the gate ran and found a regression.
-- 2 means that the gate could not run or parse its results.
+| Status | Meaning |
+| ---: | --- |
+| 0 | Every gated allocation metric passed |
+| 1 | The comparison completed and found a regression |
+| 2 | Git setup, build, benchmark execution, or result parsing failed |
 
-If a deliberate design change needs a new allocation, change the curated
-policy and record the measurement evidence in the same pull request. Do not
-loosen a gate without that evidence.
+## Claim boundary
+
+This is one sequential current/base sample with fixed iteration counts. It has
+no timing threshold, randomization, repeated statistical trial, clean-tree
+requirement, or artifact upload. A pass means only that the curated allocation
+policy passed on that invocation. It is not a throughput, latency, memory-peak,
+or release-readiness result.
+
+When a deliberate design change needs more allocation, update the source policy
+and include the before/after evidence in the same change. Do not loosen the
+threshold to hide a regression.

@@ -1,61 +1,119 @@
-# GoLand / PostgreSQL JDBC gate
+# JDBC and GoLand development probes
 
-Requires a running local RF3 development cluster with the seeded `documents`
-table, Java 17+, and PostgreSQL JDBC **42.7.3**. No Java dependency is added to
-the Go server. Use the same driver JAR selected in GoLand's data-source dialog.
+> **Development status:** VibeDB's pgwire, catalog emulation, and SQL surface are
+> incomplete and may change or break at any commit. These probes target a
+> disposable development database. They are not production, release, or driver
+> certification gates.
 
-```sh
+The Java programs in this directory are manual external-client probes. Normal
+`go test` does not compile or run them, and current CI does not install Java or
+the JDBC driver.
+
+## Requirements
+
+- a running VibeDB development pgwire endpoint with the needed tables;
+- Java 17 or newer; and
+- PostgreSQL JDBC 42.7.3, supplied as `PGJDBC_JAR`.
+
+The repository does not vendor, download, hash, or assert the 42.7.3 JAR. The
+program prints the connected driver name and version; selecting the requested
+JAR is the operator's responsibility.
+
+The examples below use loopback, `sslmode=disable`, and the development user
+`local`. Do not reuse these connection settings outside a disposable local
+cluster.
+
+## Probe discovery and data-grid behavior
+
+From the repository root:
+
+```bash
 java --class-path "$PGJDBC_JAR" integration/jdbc/Discovery.java \
   'jdbc:postgresql://127.0.0.1:7432/vibedb?sslmode=disable&user=local&prepareThreshold=1&connectTimeout=5&socketTimeout=10'
 ```
 
-Add `--writes` to validate prepared public-qualified INSERT, whole-document
-UPDATE, read-after-write, DELETE, and absence. It creates a UUID-prefixed test
-key and deletes only that key in `finally`; existing records are not changed.
-The process exits unsuccessfully on any failed check. Use only a disposable
-development database, not a production connection.
-Add `--write-cycles=48` with `--writes` for 144 distinct durable writes across
-48 isolated INSERT/UPDATE/DELETE cycles. The bounded loop stops on its first
-failure and does not automatically resubmit an unknown result.
+The default probe checks connection and transaction metadata, the exposed
+database and `public` schema, selected GoLand discovery queries, search-path
+handling, a data-grid query, whole-document access, missing-field `NULL`, and
+`->>` text extraction. Several generic metadata calls are drainability checks;
+they do not assert full PostgreSQL metadata semantics.
 
-The probe checks driver metadata, GoLand's search-path array, its data-grid
-SELECT, `SELECT id, documents."$doc" FROM documents`, missing-field NULLs, and
-`->>` text metadata/values with a prepared filter. The write gate also checks
-text extraction after UPDATE.
-PgJDBC's own synthesized `xmin` row is exercised but is not a server feature.
-Only the current database and `public` are exposed. Arbitrary PostgreSQL
-functions, custom schemas, role grants and MVCC catalogs are not implemented.
+Enable an isolated write cycle only on disposable data:
 
-Verify the declared employees table through the same real driver:
+```bash
+java --class-path "$PGJDBC_JAR" integration/jdbc/Discovery.java \
+  'jdbc:postgresql://127.0.0.1:7432/vibedb?sslmode=disable&user=local&prepareThreshold=1&connectTimeout=5&socketTimeout=10' \
+  --writes --write-cycles=48
+```
 
-```sh
+`--writes` uses a UUID-prefixed key and checks prepared INSERT, whole-document
+UPDATE, read-after-write, DELETE, and final absence. `--write-cycles` accepts
+1–128 and stops after the first failed cycle. The program does not blindly retry
+an outcome-unknown mutation. It aggregates check failures and exits nonzero.
+
+The probe does not establish arbitrary PostgreSQL functions, custom schemas,
+role grants, MVCC catalogs, or field-level generated UPDATE support. PgJDBC's
+synthesized `xmin` result is client behavior, not a VibeDB server feature.
+
+## Verify the employees fixture
+
+`Employees.java` is mutating even without a fixture: it always executes
+`CREATE TABLE IF NOT EXISTS public.employees` and checks the six declared
+columns.
+
+Seed an empty table and verify 1,000 rows plus a prepared six-column city filter:
+
+```bash
 java --class-path "$PGJDBC_JAR" integration/jdbc/Employees.java \
   'jdbc:postgresql://127.0.0.1:7432/vibedb?sslmode=disable&user=local&socketTimeout=90' \
   docs/examples/employees-1000.sql
 ```
 
-This runs CREATE TABLE IF NOT EXISTS, checks declared columns, executes the
-fixture's sixteen INSERTs only when the table is empty, then verifies 1,000 rows
-and a prepared six-column city filter. Omit the file argument to skip seeding.
-A partially seeded table is deliberately refused; do not automatically resubmit
-an INSERT whose outcome is unknown.
+The program recognizes only the fixture's `INSERT INTO employees` statements;
+it is not a general SQL-file runner. The fixture contains sixteen 64-row batches.
+If the table already has 1,000 rows, seeding is skipped and verification runs.
 
-The mandatory Go regressions replay the installed GoLand **2026.2**, PostgreSQL
-16-dialect templates in `pgwire/catalog_goland*_queries.json`, plus captured
-JDBC SQL in `catalog_jdbc_queries.json`. SQL originates in the installed IDE's
-`PgIntroQueries.sql` and auxiliary ACL/search-path requests; version branches
-are resolved for the advertised dialect. Markers capture only schema IDs,
-relation selections, JDBC LIKE filters, and refresh hints. Every other SQL
-token must match. Empty relation selections (`IN (NULL)`) return no objects.
+### Resume a confirmed prefix
 
-```sh
+A partially seeded table is refused by default. Resume only after independently
+establishing that the previous mutation outcome is settled. The existing row
+count must be a multiple of 64, the rows must be the exact canonical prefix, and
+the third argument must match that count:
+
+```bash
+java --class-path "$PGJDBC_JAR" integration/jdbc/Employees.java \
+  'jdbc:postgresql://127.0.0.1:7432/vibedb?sslmode=disable&user=local&socketTimeout=90' \
+  docs/examples/employees-1000.sql \
+  --resume-confirmed-prefix=64
+```
+
+The program verifies `employee-0001` through the confirmed prefix before
+skipping completed batches. Never guess the count or use this option to retry an
+unknown write automatically.
+
+Omit the fixture path to skip seeding. The program still creates/checks the table
+and runs the prepared city-filter query against its current contents.
+
+## Automated Go coverage is separate
+
+These Go tests exercise captured catalog SQL and VibeDB's pgwire/gateway
+implementations. They do not load PGJDBC, start GoLand, or run either Java file:
+
+```bash
 go test ./pgwire -run 'GoLand|Discovery|PublicNamespace|CatalogShim' -count=1
-go test -race ./pgwire -count=1
 go test ./gateway -run 'PostgreSQL|RF3SQL' -count=1
 ```
 
-For UI validation, refresh the data source in GoLand, expand
-`vibedb / public / tables / documents`, and verify `id`, `$doc`, the primary
-key and its index. Open the table, then run the explicit key/document SELECT
-in an Auto-mode console. The table grid may generate unsupported field UPDATEs;
-the console's documented whole-document DML is the supported write contract.
+For the broader race-enabled pgwire suite:
+
+```bash
+go test -race ./pgwire -count=1
+```
+
+Passing captured-query tests does not prove that a particular installed GoLand
+or PGJDBC build works. Run the Java probe against the actual driver and endpoint
+when that external-client behavior matters.
+
+For manual UI inspection, refresh the GoLand data source and inspect
+`vibedb / public / tables`. Use explicit whole-document SQL for writes; a grid
+may generate unsupported field-level updates.

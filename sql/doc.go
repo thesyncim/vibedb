@@ -15,11 +15,11 @@
 //     ordering/limits;
 //   - CREATE/DROP TABLE, bounded ALTER TABLE ADD COLUMN, CREATE/DROP INDEX,
 //     CREATE/DROP VIEW, and TRUNCATE;
-//   - BEGIN/COMMIT/ROLLBACK plus SAVEPOINT, ROLLBACK TO, and RELEASE; and
+//   - SAVEPOINT, ROLLBACK TO, and RELEASE statement bodies; and
 //   - EXPLAIN and EXPLAIN ANALYZE for executable statements.
 //
 // The exact accepted and refused shapes are documented in
-// docs/design/sql-surface.md. A syntactically representable AST is not a promise
+// docs/reference/sql.md. A syntactically representable AST is not a promise
 // that every execution surface supports that shape: the embedded driver,
 // pgwire server, and distributed gateway each apply their own semantic and
 // resource admission.

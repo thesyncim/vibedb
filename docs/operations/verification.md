@@ -1,89 +1,183 @@
-# Verify, salvage, and repack data
+# Verify, salvage, and repack
 
-`vibedb-verify` is an offline tool for store files and database directories.
+> [!CAUTION]
+> vibedb is unreleased development software. Any commit may break the Go API,
+> wire protocols, or disk format. Pin one exact commit, use the same build to
+> reopen its data, and do not use vibedb as the only copy of irreplaceable data.
 
-> **CAUTION:** Stop all writers before you use this tool. Use a quiescent file,
-> a quiescent directory, or a copy. The verifier does not take the writer lock.
-> A concurrent writer can retire and reuse data while the tool reads it.
+This page covers offline inspection and repair of the `store/durable` file
+format. It does not turn the development format into a compatibility promise.
 
-## Build the tool
+## Choose the operation
 
-```bash
-go build -o ./bin/vibedb-verify ./cmd/vibedb-verify
+| Need | Operation | Input | Output |
+| --- | --- | --- | --- |
+| Check a store graph | `verify` | Quiescent store file | Findings and counters |
+| Check transaction pairing | `verify` | Quiescent database directory | Journal/decision findings |
+| Recover inline rows after catalog loss | `salvage` | Damaged store file | New store file |
+| Reclaim space and restore scan locality | `repack` | Cleanly closed store file | New clustered store file |
+| Reclaim space while serving | `(*durable.Collection).CompactOnline` | Open collection | Same-file replacement generation |
+
+The command never modifies its input:
+
+```text
+vibedb-verify verify  <store-file|database-dir>
+vibedb-verify salvage <store-file> <output-file>
+vibedb-verify repack  <store-file> <output-file>
 ```
 
-## Verify one store file
+`salvage` and `repack` create the output with exclusive creation. Choose a path
+that does not exist. Never point either command at the source path.
 
-```bash
-./bin/vibedb-verify verify ./data/users.vdb
+## Prepare a stable input
+
+`Verify` does not acquire the writer lock. It also does not apply the in-place
+materialization rollback that ordinary open may apply. A concurrent writer can
+retire and reuse an extent while the verifier reads it.
+
+Use one of these cuts:
+
+1. Stop writes and close the collection or database successfully.
+2. Copy the complete, closed database directory to a separate location.
+3. Run the operation against the copy.
+
+For a database directory, keep collection primaries, every `.rjournal`, and
+`txn.vtm` together. A raw copy made while the database is live is not a
+supported backup cut.
+
+## Verify a store file
+
+```sh
+go run ./cmd/vibedb-verify verify ./data/collection-file
 ```
 
-The tool prints one line for each finding. It then prints page counts, a
-machine-readable summary, and `result ok` or `result fail`.
+The verifier selects the newest structurally valid root, with fallback to the
+preceding valid generation, then walks the reachable graph. It checks:
 
-The command exits with status 0 only when the report has no finding.
+- page checksums, identities, reference bounds, and graph shape;
+- global bytewise key order;
+- aliasing between reachable extents;
+- overlap between the durable free set and reachable pages;
+- structural exact-index roots and leaves.
+
+The final lines are machine-oriented:
+
+```text
+summary root_slot=1 generation=42 file_end=1048576 documents=12 free_extents=3 findings=0
+result ok
+```
+
+`result ok` means `Findings` was empty for this offline walk. It does not prove
+application invariants, make the file compatible with another commit, or run
+every online exact-posting/live-slot admission check performed by `Open`.
+
+The Go API exposes the same result:
+
+```go
+f, err := os.Open(path)
+if err != nil { return err }
+defer f.Close()
+
+report, err := durable.Verify(f)
+if err != nil { return err } // I/O prevented the walk
+if !report.OK() {
+    return fmt.Errorf("store has %d structural findings", len(report.Findings))
+}
+```
+
+An unreadable root or superblock is normally a finding, not an API error.
+`VerifyReport` also records the selected root slot, generation, file end,
+document/free-extent counts, and page counts by kind.
 
 ## Verify a database directory
 
-```bash
-./bin/vibedb-verify verify ./data
+```sh
+go run ./cmd/vibedb-verify verify ./data/database
 ```
 
-Directory verification checks transaction-decision and recovery-journal
-pairing. It reports missing participants, identity mismatches, torn decisions,
-same-epoch records with no decision, and other in-doubt conditions.
+Directory verification inspects primary/journal identity pairing and scans
+`txn.vtm` decisions and conditional journal records. It detects missing,
+unreadable, mismatched, in-doubt, and torn-tail state without appending,
+recycling, truncating, or deleting anything.
 
-Directory verification reads `txn.vtm` and collection journals. It does not
-append, sync, recycle, remove, or repair them.
+This check is transaction metadata inspection, not a recursive structural walk
+of every collection. Verify individual collection files as well when both
+properties matter.
 
-## Salvage a damaged store
+## Salvage catalog loss
 
-```bash
-./bin/vibedb-verify salvage ./users.vdb ./users-salvaged.vdb
+```sh
+go run ./cmd/vibedb-verify salvage ./broken.vdb ./salvaged.vdb
 ```
 
-Salvage scans recoverable primary leaves and writes a new portable store. It
-reports scanned leaves, retained buckets and documents, skipped overflow or
-duplicate data, and the output size.
+Salvage ignores routing state and scans page-aligned extents for valid,
+self-describing primary leaves. For each leaf bucket it keeps the highest
+generation, extracts live rows in lexical order, and builds a fresh store.
 
-The output path must not exist. Keep the source unchanged until you validate
-the new file.
+Use salvage only for its narrow recovery model:
 
-Salvage is a data-recovery operation. It can omit data that it cannot prove is
-valid. Compare the result with an application-level source of truth.
+| Property | Contract |
+| --- | --- |
+| Source | Read-only; may have damaged catalog/routing pages |
+| Output | New, empty file |
+| Inline values | Recovered from surviving valid leaves |
+| Overflow values | Counted in `OverflowSkipped`, not recovered |
+| Duplicate leaf versions | Older versions counted and skipped |
+| Index/schema recovery | Not reconstructed from arbitrary corrupt metadata |
+
+A zero process exit status does not mean an overflow-bearing source was
+recovered completely. Read the summary and require `overflow_skipped=0` for an
+exact inline-row recovery.
 
 ## Repack a healthy store
 
-```bash
-./bin/vibedb-verify repack ./users.vdb ./users-repacked.vdb
+```sh
+go run ./cmd/vibedb-verify repack ./closed.vdb ./repacked.vdb
 ```
 
-Repack opens the source through the normal snapshot read path. It writes rows
-in lexical order to a new portable store. This restores clustered scan
-locality and removes free-space churn.
+Repack opens a cleanly closed source, snapshots it, scans live keys in bytewise
+lexical order, and writes a new store. The output has no reclaimable space from
+the source's churn.
 
-The source needs read and write access because normal open can take a lock and
-complete a pending rollback. The output path must not exist.
+Repack preserves configured schema, exact indexes, opaque values, and overflow
+values through the normal bounded write path. A faster bulk path is selected
+only for inline, schema-free, non-opaque data. It is incorrect to describe the
+whole operation as inline-only.
 
-Repack supports the inline-primary format only.
+Verify the new file before replacing anything. Keep the original until the new
+file has been opened by the exact intended build and application checks pass.
 
-## Safe replacement procedure
+## Online compaction
 
-1. Stop every process that can open the database.
-2. Make a backup of the primary file and its recovery-journal sibling.
-3. Run `verify` against the stopped source.
-4. Run `salvage` or `repack` to a new path.
-5. Run `verify` against the new file.
-6. Test the new file with application-level checks.
-7. Replace the data only with a filesystem procedure that preserves the
-   primary and journal pairing rules.
+`CompactOnline` rewrites a live collection into authenticated same-file staging
+while reads continue. It rebuilds exact indexes and preserves opaque and
+overflow values.
 
-Do not overwrite the source with the tool output. The commands use exclusive
-output creation to prevent this mistake.
+It is explicit, single-flight work. It may return queue pressure, publication
+conflict, starvation, or checkpoint-group ownership errors. Retry policy belongs
+to the caller. Continuous writes can prevent convergence; there is no general
+automatic-compaction guarantee.
 
-## Implementation references
+The report's device-byte count is instrumentation around the operation, not an
+exact promise about physical device write amplification. Benchmark thresholds
+in tests qualify their fixtures and hosts; they are not production SLAs.
 
-- `cmd/vibedb-verify/main.go`
-- `store/durable/store_file_verify.go`
-- `store/durable/store_file_repack.go`
-- `cmd/vibedb-verify/main_test.go`
+## Replacement checklist
+
+1. Preserve the source and its journals.
+2. Produce a new output path; never overwrite in place.
+3. Inspect every finding and every skipped counter.
+4. Verify the output offline.
+5. Open and test it with the exact same build and options.
+6. Replace paths only through an operator-controlled, recoverable cutover.
+
+## Source map
+
+- `cmd/vibedb-verify/main.go` — CLI grammar, exit status, directory checks
+- `cmd/vibedb-verify/main_test.go` — output and failure behavior
+- `store/durable/store_file_verify.go` — verify and salvage contracts
+- `store/durable/store_file_verify_test.go` — corruption and salvage cases
+- `store/durable/store_file_repack.go` — offline repack paths
+- `store/durable/store_file_repack_test.go` — capability preservation
+- `store/durable/store_file_online_compact.go` — live compaction lifecycle
+- `store/durable/store_file_online_compact_test.go` — indexes and value modes

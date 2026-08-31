@@ -1,282 +1,159 @@
-# Competitive benchmark harness
+# Benchmark harness
 
-This directory is a separate Go module. It keeps competitor dependencies out
-of VibeDB's root module.
+> **Development status:** VibeDB is under active development. Benchmark commands,
+> output schemas, adapters, dependencies, and evidence rules can change or break at
+> any commit. This directory is qualification infrastructure, not a stable benchmark
+> product or a source of endorsed performance claims.
 
-## Start with correctness
+## Current result status
+
+**No competitive result is published.** [RESULTS.md](RESULTS.md) contains no
+performance, cost, storage, or scaling number. A green test, a generated coverage
+cell, or a CI artifact is not a result.
+
+This is a separate Go 1.26 module so competitor dependencies do not enter VibeDB's
+root module. The current adapters use VibeDB from this checkout, Badger v4.9.5,
+bbolt v1.5.0, Pebble v1.1.5, and modernc SQLite v1.54.0. `go.mod` is authoritative.
+
+## Verify the harness
+
+From the repository root:
 
 ```bash
 cd bench/competitive
-go test ./...
+go test -count=1 ./...
 ```
 
-The engine adapters must pass the common correctness oracle before you publish
-a comparison.
+This runs adapter oracles and command-contract tests. It does not benchmark the
+machine and does not make unlike engines equivalent.
 
-## Use the coverage matrix
+## Choose a command
 
-`COVERAGE.md` is generated from an executable manifest. It identifies each
-required measurement cell as implemented, diagnostic, or a gap. It also gives
-the exact evidence commands.
+Run any command with `-h` before using it; flags are intentionally not stable.
 
-Regenerate it after the manifest changes:
+| Command | Use it for | Do not infer |
+| --- | --- | --- |
+| `go run ./cmd/mixed` | One deterministic workload in one engine process | A repeated or cross-engine comparison |
+| `go run ./cmd/mixedsuite` | Isolated child runs in deterministic Latin-square order, with raw rows and summaries | Publication from fewer than nine recorded repetitions |
+| `go run ./cmd/footprint` | Apparent file bytes, allocated filesystem blocks, Go heap, runtime residency, and maximum RSS | Device usage or a common memory architecture |
+| `go run ./cmd/churndisk` | Bounded fixed-live-set churn and periodic storage samples | Media writes; Linux `write_bytes` is process-attributed storage-layer traffic |
+| `go run ./cmd/saturation` | A client-count sweep and one fixed plateau rule | A universal engine capacity or a publication-bundle result |
+| `go run ./cmd/snapshotpressure` | Control and durable pinned-snapshot phases on one image | Counterbalanced trials or identical memory accounting across adapters |
+| `go run ./cmd/sqlsurface` | VibeDB/SQLite `database/sql`, or VibeDB loopback pgwire overhead | Comparison with a PostgreSQL server |
+| `go run ./cmd/lifecycle` | Fresh-process open, conditioned hot open, Linux cold open, crash recovery, verify, or repack | Application startup time or production cutover safety |
+| `go run ./cmd/outofram` | Streaming load and full-byte scan when logical data exceeds host RAM | Load throughput; load is qualification setup |
+| `go run ./cmd/speedprobe` | VibeDB-only adaptive diagnostics | Comparative or publication-grade evidence |
+| `go run ./cmd/clickhousefixture` | Deterministic typed or raw `JSONEachRow` fixture output | A ClickHouse run, driver, oracle, or comparison |
+| `go run ./cmd/coveragegen` | Regenerate the coverage reference | Any measurement |
+| `go run ./cmd/publishcheck` | Validate a fixed evidence inventory and create a receipt | Independent validation of every runner flag or a win |
+
+The opt-in `VIBEDB_CHURN_DIAG=1` and `MASSIVE_CHURN=1` Go tests are research
+diagnostics. They are not CI or publication lanes.
+
+## Comparison contract
+
+Use one engine per process for mixed-suite, footprint, saturation, and
+above-RAM work. RSS and Go heap are process-wide.
+
+Keep these axes explicit and identical where the adapters support them:
+
+- corpus size, seed, cardinality, and `inline`, `mixed`, or `overflow-heavy`
+  document shape;
+- workload, warmup, operation count, client count, and checkpoint cadence;
+- exact-index count and definitions;
+- durability contract; and
+- storage profile, cache budget, hard resource bounds, host, filesystem, and
+  dependency revision.
+
+### Adapter boundaries
+
+| Adapter | Exact JSON indexes | Accepted durability contracts |
+| --- | --- | --- |
+| VibeDB | 0–3 | `buffered-visible`, `async-stable-in-flight`, `ordinary-sync`, `power-safe` |
+| SQLite | 0–3 | `buffered-visible`, `ordinary-sync`, `power-safe` |
+| Badger | none | `buffered-visible`, `ordinary-sync` |
+| bbolt | none | `buffered-visible`, `ordinary-sync` |
+| Pebble | none | `buffered-visible`, `ordinary-sync` |
+
+Unsupported combinations fail; the harness does not silently weaken them.
+The three physical exact indexes, when selected, are country, tier, and region
+in that order.
+
+The `intrinsic` and `production` storage-profile names describe only optional
+adapter compression. They are not readiness levels. With the current pins,
+`production` enables Snappy for Badger and Pebble; VibeDB, bbolt, and SQLite
+report the setting as unsupported/no-op.
+
+The nominal engine cache is 64 MiB, but this is not identical memory pressure:
+bbolt memory-maps the database and relies on the OS cache, and SQLite is
+configured with one physical connection. State these facts with any comparison.
+
+### Metric boundaries
+
+- Apparent bytes, allocated filesystem blocks, Go heap, runtime residency, and
+  maximum RSS answer different questions; do not substitute one for another.
+- `durability-payload-known=true` exposes adapter-reported bytes handed to its
+  durability device. It is not filesystem, block-device, or media accounting.
+- Linux `/proc/self/io` `write_bytes` is process-attributed storage-layer traffic,
+  not media writes.
+- `BenchmarkScan` touches only the first byte of each value. Use
+  `BenchmarkScanAllBytes` for full-byte throughput evidence.
+- A saturation point is specific to the recorded host and workload.
+- RF3's in-process latency matrix is one three-replica group. It is not
+  node/shard weak scaling, gateway-process throughput, split/rebalance evidence,
+  or multi-group query evidence.
+
+## Evidence levels
+
+| Level | What it establishes | What it does not establish |
+| --- | --- | --- |
+| Generated coverage | A checked-in source shape exists for each project-defined cell | That the command ran, the product supports the case, or a result exists |
+| Command smoke test | A bounded command and its local oracle completed | Stable timing or comparative performance |
+| PR qualification | A clean-revision, small fixed evidence bundle passed selected structural checks | Publication-grade scale, dedicated-host control, or superiority |
+| Publication candidate | The dedicated Linux runner completed and `publishcheck` accepted its fixed artifacts | That every configuration flag was independently checked or that VibeDB won |
+| Published result | A reviewed summary links immutable raw evidence and a validator receipt | Results on another commit, host, workload, or topology |
+
+The `competitive-evidence` workflow uploads claim-free PR qualification artifacts
+for 30 days. Those transient artifacts must not be copied into `RESULTS.md`.
+
+## Create a publication candidate
+
+Use a dedicated Linux host and a clean, fixed revision. From the repository root:
 
 ```bash
+scripts/bench/run-publishable-evidence.sh \
+  /absolute/path/to/new-evidence-directory \
+  OUT_OF_RAM_DOCUMENTS
+```
+
+The output directory must be absolute and absent. Choose `OUT_OF_RAM_DOCUMENTS`
+so the exact logical corpus exceeds measured physical RAM; the runner checks the
+inequality. The run includes embedded adapter cuts, footprint, churn, above-RAM
+work, RF3 matrices, and nine external RF3 fault repetitions.
+
+The final `VALIDATED.tsv` is created only after `cmd/publishcheck` accepts the
+expected evidence. The validator checks inventory, provenance, selected row
+contracts, repetition counts, metrics, counters, bounds, and file digests. It
+does **not** independently pin every workload, corpus, operation, warmup, client,
+cardinality, seed, conditioning, or storage-profile flag. Publication mode also
+does not make arbitrary extra files part of the validated set. Review the runner,
+raw metadata, and exact commands before writing a claim.
+
+## Generated coverage reference
+
+[COVERAGE.md](COVERAGE.md) is generated from
+`internal/coverage/manifest.go`. Its 38 cells are the project's current harness
+matrix; they omit horizontal weak scaling, split/rebalance under load, hot-key
+skew, and multi-group distributed query execution.
+
+Regenerate and verify it after changing the manifest or referenced commands:
+
+```bash
+cd bench/competitive
 go generate .
 go test -run '^TestBenchmarkCoverage' -count=1 ./internal/coverage
 ```
 
-An implemented measurement shape is not a measured result.
-
-The 38 cells are the repository's own evidence matrix, not a claim of complete
-database or distributed-systems coverage. The matrix currently omits
-node-count/shard-count weak scaling, rebalancing under load, hot-partition skew,
-and multi-group distributed query execution. A 38/0/0 coverage count therefore
-does not establish horizontal scalability or competitive performance.
-
-## Commands
-
-The module includes these command harnesses:
-
-- `cmd/mixed` runs one mixed workload process.
-- `cmd/mixedsuite` runs isolated child processes in a Latin-square order.
-- `cmd/footprint` measures apparent disk, allocated blocks, Go heap, and RSS.
-- `cmd/churndisk` samples storage during a bounded fixed-live-set mutation run.
-- `cmd/saturation` runs a matched, isolated client sweep and applies one fixed throughput-plateau rule.
-- `cmd/snapshotpressure` compares matched unpinned and explicitly pinned durable-snapshot phases.
-- `cmd/sqlsurface` runs one matched SQL workload through database/sql or a real loopback pgwire client.
-- `cmd/lifecycle` measures clean, hot, cold, and crash-recovery opens in isolated children.
-- `cmd/outofram` streams, stores, and scans a logical dataset larger than host RAM under hard memory and write bounds.
-- `cmd/speedprobe` records a focused speed diagnostic.
-
-Run a command with `-h` to inspect its current flags. Use the exact commands in
-`COVERAGE.md` for a publication shape.
-
-## Isolation
-
-Run one engine in each process for footprint and mixed-suite publication. RSS
-and Go heap metrics are process-global. A multi-engine process would mix
-retained state from different adapters.
-
-`mixedsuite` records raw child rows and robust summaries. A publishable suite
-uses at least nine recorded repetitions and no forced checkpoint cadence. The
-default uses ten repetitions and one discarded conditioning pass.
-
-## Corpus and storage profiles
-
-Record corpus size, cardinality, and document shape. Low-cardinality and
-high-cardinality variants are shape- and length-matched but have different
-value entropy. The `inline`, `mixed`, and `overflow-heavy` shapes use exact
-bounded lengths and byte-native `vibejson` validation.
-
-Record `-exact-indexes=0` through `3`; the standard cells use `0`, `1`, and
-`3`. VibeDB and SQLite receive the same ordered country, tier, and region
-definitions. Mixed output includes p99.9 and
-maximum acknowledgement latency. It also reports submitted logical mutation
-bytes. `durability-payload-known=true` means the adapter exposes a monotonic
-counter of bytes it handed to its durability device and makes
-`durability-payload/logical` meaningful. This is not filesystem metadata,
-block-layer, or physical-media write accounting. Do not compare a zero from an
-adapter that reports `durability-payload-known=false`.
-
-Record `intrinsic` or `production` storage profile. These labels control only
-optional compression exposed by the benchmark adapter. With the currently
-pinned dependencies, they switch Badger and Pebble between uncompressed and
-Snappy SST blocks; VibeDB, bbolt, and SQLite report `unsupported/no-op` for
-both. `intrinsic` therefore does not mean that VibeDB's built-in field/stream
-storage encodings have been disabled. The output must state the resolved
-optional-compression policy and its provenance.
-
-Record the selected durability mode. Do not compare a volatile acknowledgement
-with a power-safe acknowledgement as if they were equal.
-
-## Saturation
-
-`cmd/saturation` conditions and then records one isolated `cmd/mixed` child per
-client level. The publication shape uses seven cyclic-order repetitions at 1,
-2, 4, 8, 16, 32, and 64 clients. It reports saturation only after two
-consecutive median-throughput gains are at or below 500 basis points. If the
-fixed sweep never meets that rule, the command preserves its canonical TSV and
-returns an error. The decision is specific to the recorded host and workload;
-it is not an engine-wide or environment-independent capacity number.
-
-Every child receives the same durability, checkpoint cadence, exact-index
-count, corpus, cardinality, and document shape. Run one engine per saturation
-command and repeat the exact flags for another engine before making a
-comparison.
-
-## Bounded long churn and process writes
-
-The publishable `cmd/churndisk` shape is exactly 200,000 acknowledged state
-changes over a fixed 100,000-document live set, sampled every 5,000 mutations.
-It verifies all final key/value bytes and rejects automatic checkpoints. Hard
-limits cover peak RSS, live allocated filesystem bytes, and Linux process
-`write_bytes`. Logical write bytes count every submitted key and document byte,
-including both key submissions in delete-plus-restore churn, so
-`physical-write/logical` has an exact denominator.
-
-Linux `/proc/self/io` `write_bytes` is process-attributed storage-layer traffic,
-not filesystem metadata, device, or media accounting. Publishable churn fails
-closed when that counter is unavailable or regresses. Darwin can run an
-explicitly diagnostic churn shape with `-allow-diagnostic`, but cannot produce
-this process-write qualification.
-
-## Reopen and recovery control
-
-`cmd/lifecycle` creates one populated, checkpointed image outside the measured
-interval. A fresh child process then times only `Factory.Open`; process startup,
-the correctness scan, exact-index proof, and `Close` are excluded. The modes
-have deliberately narrow meanings:
-
-- `open` leaves OS cache state uncontrolled and must not be cited as hot or cold;
-- `hot` fully scans and closes the image in a conditioning child before the
-  measured child;
-- `cold` performs a synchronous Linux global cache drop through
-  `/proc/sys/vm/drop_caches` before the measured child; and
-- `recovery` acknowledges one ordinary-sync mutation in a child that exits
-  without `Close`, then verifies the recovered canonical bytes after timed open.
-
-Cold mode fails closed unless it can perform the Linux global cache drop. It
-usually requires root. Darwin has no supported whole-host drop control: advisory
-per-file eviction is not treated as proof that mapped, metadata, journal, and
-directory pages are cold. Run hot/open/recovery on Darwin, but do not relabel
-them as cold evidence.
-
-Every lifecycle row records durability and exact-index count. Cross-engine
-claims require the same values for both; unsupported engine/index combinations
-are rejected. Linux `/proc/self/io` `write_bytes` is reported as process
-storage-layer write bytes, not filesystem metadata, device, or media bytes.
-The command enforces explicit peak-RSS and physical-write bounds where those
-measurements are available.
-
-`verify` and `repack` are VibeDB-format lifecycle modes. Verify times only
-`durable.Verify` in a fresh child and requires a clean report. Repack times only
-the out-of-place rewrite, verifies its output afterward, then separately times
-the benchmark's primary/journal two-rename cutover and reopens the complete
-corpus. That cutover is explicitly non-atomic and is not a production
-publication protocol. Publication commands require Linux process-write
-accounting and fail closed elsewhere.
-
-## Cache and snapshot pressure
-
-The overflow-heavy 10,000-document mixed corpus has exact logical
-key-plus-document bytes above the common 64 MiB engine cache. This is a matched
-cross-engine cache-pressure shape, but does not imply cold OS caches or a data
-set larger than RAM.
-
-`cmd/snapshotpressure` holds an actual durable snapshot lease across the pinned
-phase. Its control and pinned rows share one image, durability, exact-index
-count, operation count, and checkpoint cadence, and report p99.9/maximum
-acknowledgement latency, allocated bytes, RSS, and process writes. An adapter
-without an explicit snapshot hook is rejected rather than approximated.
-
-## SQL interfaces
-
-`cmd/sqlsurface` uses the same deterministic inline documents and 50/50 point
-read/update trace for each surface. The database/sql lane supports VibeDB and
-SQLite with each engine's strongest synchronous durability (VibeDB
-`DurabilitySync`, SQLite WAL `synchronous=FULL` plus `fullfsync=1`) and one
-physical exact index. Native SQL
-statement spellings differ because VibeDB stores whole documents while SQLite
-uses an explicit document column; output and documentation keep that boundary
-visible.
-
-The pgwire lane starts a real loopback VibeDB server and speaks PostgreSQL
-startup and simple-query messages over TCP. It is matched to the VibeDB
-database/sql lane for corpus, trace, durability, indexing, correctness, and
-resource bounds. It measures interface overhead, not another PostgreSQL server.
-
-## Larger than RAM
-
-`cmd/outofram` never builds `[]Doc` for the complete dataset. It streams the
-same byte-native `vibejson`-validated corpus used by resident fixtures through
-a bounded batch, checkpoints it, and performs a full-byte scan. A row is
-emitted only if exact logical key-plus-document bytes exceed measured physical
-RAM. The command fails before loading when its conservative logical lower bound
-does not exceed RAM or when free disk is below twice that bound.
-
-The loader-batch byte ceiling and process peak-RSS ceiling are hard errors. When
-Linux `/proc/self/io` supplies the process `write_bytes` counter, the runner also
-enforces the configured write ceiling. Otherwise it emits
-`physical-write-known=false` and skips that ceiling; `cmd/publishcheck` rejects
-an unknown counter for publication. Defaults cap the loader at 8 MiB and peak
-RSS below 75% of physical RAM. Use one process per engine and keep durability,
-exact-index count, cardinality, shape, checkpoint cadence, and all hard bounds
-identical. Loading time is setup evidence, not a bulk-load performance claim;
-the output labels the combined load-and-scan wall time only so an interrupted
-evidence run is diagnosable.
-
-## Results
-
-Put publication-grade results in [RESULTS.md](RESULTS.md). Keep raw rows and
-complete metadata with the summary. Do not publish a number from a dirty tree
-without marking it dirty.
-
-For the current runner's fixed embedded plus RF3 evidence bundle, use the
-repository runner on a dedicated Linux benchmark host:
-
-```bash
-scripts/bench/run-publishable-evidence.sh \
-  /absolute/path/to/new-evidence-directory OUT_OF_RAM_DOCUMENTS
-```
-
-Choose `OUT_OF_RAM_DOCUMENTS` so the exact overflow-heavy logical corpus is
-larger than physical RAM; the loader verifies that inequality and fails before
-publishing when it is false. The runner requires a clean tree and creates no
-result row itself. It records ten isolated embedded repetitions at the strongest
-common durability contract (`ordinary-sync`) without pretending that the three
-plain key/value engines have native JSON indexes. Separate three-index
-`ordinary-sync` and `power-safe` VibeDB/SQLite lanes compare the two engines
-that can maintain the same exact physical indexes. It also records per-engine
-space/churn/above-RAM cuts, nine isolated RF3 latency/counter matrices, and nine
-external RF3 fault runs. The RF3 matrices cover read, write, and mixed workloads
-at 1, 8, and 32 clients. The fault artifact supplies the independently bounded
-WAL and waiter-RSS evidence that the in-process latency matrix does not claim to
-measure. bbolt, Badger, and Pebble are excluded from the power-safe row because
-their adapters reject that guarantee instead of silently weakening it.
-
-The RF3 latency/counter matrix uses one in-process RF3 group with three replicas
-and an in-process round tripper. It does not run a gateway process, vary node or
-shard count, measure rebalance/split throughput, or provide horizontal-scaling
-evidence. The external fault artifact runs three real shard children, but its
-elapsed field covers the whole qualification rather than an isolated failover
-or recovery interval.
-
-The runner finishes by invoking `cmd/publishcheck`. That validator rejects a
-dirty or revision-mismatched bundle, fewer than nine repetitions, diagnostic
-embedded rows, missing p50/p99/p99.9/maximum latency, absent apparent or
-allocated space, unknown Linux process writes, invalid RF3 counter cuts,
-missing network/device/logical-byte counters, and failed WAL/RSS fault bounds.
-Only then does it create `VALIDATED.tsv`, containing SHA-256 digests of every
-accepted raw artifact.
-
-The validator does not independently pin every flag fixed by the runner. For
-embedded mixed suites it does not verify workload, corpus, operations, warmup,
-clients, cardinality, seed, conditioning, or storage profile. For RF3 latency
-artifacts it does not verify operations, warmup, or seed. Preserve and review
-the runner and complete command/configuration metadata with the receipt. A
-receipt proves acceptance and artifact identity; it is not full configuration
-equivalence, horizontal-scaling evidence, or a claim that VibeDB won.
-
-This documentation currently publishes no benchmark result; `RESULTS.md`
-contains no performance numbers.
-
-### Pull-request qualification
-
-The `competitive-evidence` workflow runs a smaller, claim-free cut on a clean
-Ubuntu runner. It records nine isolated matched unindexed `ordinary-sync`
-repetitions for all five embedded engines; separate nine-repetition, three-index
-`ordinary-sync` and `power-safe` VibeDB/SQLite cuts; unindexed all-engine and
-three-index pairwise physical/logical footprint rows; three RF3 read/write/mixed
-matrices; and three external RF3 fault runs. Dataset and operation counts are
-fixed and the job has a hard wall-clock timeout.
-
-`cmd/publishcheck -qualification` verifies the clean revision, selected
-durability/index/document-shape fields, latency/counter/resource contracts,
-complete artifact inventory, and every file digest before creating
-`VALIDATED.tsv`. CI uploads only a bundle with that receipt. As above, the
-runner fixes additional workload axes that the validator does not independently
-check. These runner-dependent rows are regression and harness evidence; they
-are not publication-grade results and must not be copied into `RESULTS.md` or
-used as a superiority claim. The dedicated-host runner above remains the
-publication boundary, including its above-RAM and nine-run fault requirements.
+Do not edit `COVERAGE.md` by hand. An “implemented” cell means the source shape
+exists with an oracle and machine-readable fields. It does not mean the command
+ran or a result was published.

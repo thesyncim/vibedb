@@ -1,25 +1,34 @@
-# Contributing
+# Contributing to VibeDB
 
-VibeDB changes must preserve correctness, isolation, durability, bounded
-resource use, and format validation. Do not trade one of these contracts for a
-benchmark result.
+> [!CAUTION]
+> VibeDB is unreleased. Compatibility may be broken deliberately, but a change
+> must replace the current contract coherently across code, tests, fixtures,
+> generators, and documentation. “Development” is not permission to make
+> correctness or failure behavior implicit.
 
-The repository targets Go 1.26. Contracts can change between tested commits.
+## Before you change code
 
-## Start with a focused test
+1. Read [current status](docs/status.md) and capture a clean baseline.
+2. Find the narrowest owning package and its failure/reopen tests.
+3. State the invariant, resource bound, ownership rule, and error outcome that
+   the change affects.
+4. Keep unrelated working-tree changes intact.
 
-Run the smallest package and test while you work:
+The repository targets the Go version in `go.mod`. Use focused tests while
+iterating, then run the root and nested-module checks that match the change.
+
+## Fast feedback
 
 ```bash
-go test ./internal/storeio -run '^TestName$' -count=1
-go test ./store/durable -run '^TestName$' -count=1
-go test ./query -run '^TestName$' -count=1
+go test ./path/to/package -run '^TestName$' -count=1
+go test -race ./path/to/package -run '^TestConcurrentName$' -count=1
 ```
 
-Use `-race` for concurrency, snapshot, cache, lease, or publication changes.
-Use fault injection and reopen oracles for a persistence change.
+Use fault injection and reopen oracles for persistence work. Use real process
+or transport tests when the contract crosses a process, TLS, or filesystem
+boundary. A benchmark is never a correctness test.
 
-## Run the root checks
+## Root checks
 
 ```bash
 go build ./...
@@ -28,115 +37,93 @@ go test -p=1 -timeout=25m ./...
 git diff --check
 ```
 
-CI runs build, vet, and tests on Linux amd64 and arm64. It also cross-compiles
-root and PostgreSQL-client packages for 32-bit Linux and Windows.
+Check [current status](docs/status.md) for any recorded baseline failure. Do not
+silently attribute an old failure to your change or hide a new one as
+“pre-existing.” Record the exact command and comparison.
 
-The focused race lane is:
-
-```bash
-go test -race -timeout=25m \
-  -skip 'Qualification' \
-  -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' \
-  ./internal/storeio/ ./store/durable/
-```
-
-CI also runs a focused cross-layer LATERAL race suite.
-
-## Run nested-module checks
-
-The competitive harness is a separate module:
+## Nested modules
 
 ```bash
-cd bench/competitive
-go test ./...
+(cd bench/competitive && go test ./...)
+(cd integration/pgclient && go test -timeout=2m ./...)
+(cd integration/pgcompat && go test ./...)
+(cd x/vitessroute && go test ./...)
 ```
 
-Do not add competitor dependencies to the root `go.mod`.
+Java/JDBC, stock `psql`, Linux fault, Docker, and Kind lanes are opt-in or
+environment-specific. Their individual docs state prerequisites and what a
+pass proves.
 
-The PostgreSQL client integration is also a separate module:
+## Match evidence to the change
+
+| Change | Minimum evidence |
+| --- | --- |
+| Codec or page grammar | Golden round trip, truncation, checksum-valid semantic corruption, reserved-field and bound checks |
+| Journal/root ordering | Failure before and after each write/barrier/sync, then reopen |
+| Snapshot or cache | Held old generation, pressure, release, retry, and race coverage |
+| Index | Collision candidates, exact recheck, mutation maintenance, reopen, scan differential |
+| Query/SQL | Heap and durable differential tests; cancellation and result-budget cases |
+| Distributed protocol | Stale identity, authorization, byte bounds, cancellation, ambiguous response, exact retry |
+| Optimized/unsafe path | Portable oracle, allocation/escape check when promised, race/checkptr/lifetime tests |
+
+## Change the development disk format
+
+Format 0 has no compatibility ladder. An intentional change replaces the
+current grammar; it does not add a reader for every obsolete image.
+
+In the same commit:
+
+1. update codecs and semantic validation;
+2. replace affected `internal/storeio/testdata/format0` fixtures;
+3. retain malformed-old-layout rejection;
+4. update [the format reference](docs/format.md), [architecture](docs/architecture.md),
+   and [durability](docs/durability.md);
+5. regenerate build grammar identities when the manifest contract changes;
+6. add crash/reopen evidence for the new publication order.
+
+## Generated contracts
+
+Run the generators after changing their source:
 
 ```bash
-cd integration/pgclient
-go test -timeout=2m ./...
+go generate ./internal/buildgate
+go generate ./internal/featurestate
+go generate ./internal/conformance
+(cd bench/competitive && go generate .)
+go test ./internal/buildgate ./internal/featurestate ./internal/conformance
+(cd bench/competitive && go test ./internal/coverage)
 ```
 
-## Match tests to the change
-
-- A codec change needs byte-exact fixtures, truncation checks, checksum-valid
-  semantic corruption, reserved-zero validation, and bounds checks.
-- A root or copy-on-write change needs injected failure before and after each
-  write and barrier, followed by reopen.
-- A journal change needs append, sync, recycle, torn-tail, and identity tests.
-- A snapshot change needs an old held generation, pressure, release, retry, and
-  race tests.
-- An index change needs collision candidates, exact-value rechecks, mutation
-  maintenance, reopen, and scan differential tests.
-- An optimized path needs a correctness oracle and an allocation or route
-  assertion when the API promises that property.
-- A query change needs heap and durable differential coverage.
-- A distributed change needs stale identity, admission precedence, bounded
-  fanout, cancellation, and partial-failure tests.
-
-A benchmark is not a correctness test.
-
-## Change the on-disk format
-
-Format 0 is an unreleased development format. A change replaces the current
-grammar and its golden images. Do not add a compatibility decoder for an
-obsolete development image.
-
-In the same change:
-
-1. Update codecs and validation.
-2. Replace affected fixtures in `internal/storeio/testdata/format0`.
-3. Add malformed and truncated input tests.
-4. Update [the format reference](docs/format.md).
-5. Update [the architecture](docs/architecture.md) when the root graph changes.
-6. Update [durability](docs/durability.md) when an acknowledgement or recovery
-   boundary changes.
-
-## Measure performance
-
-Run the allocation gate for a hot-path change:
-
-```bash
-go run ./bench/gate
-```
-
-The gate compares the working tree and base on the same machine. It gates
-allocations and bytes, not time.
-
-Follow [the performance measurement rules](docs/performance.md) for a published
-number. Keep raw rows and exact provenance.
-
-## Change unsafe code
-
-Read [the unsafe-code boundary](UNSAFE.md). Keep pointer-free storage free of Go
-pointers. Keep every backing owner alive for the full borrow.
-
-Regenerate the inventory after an unsafe import changes:
+Refresh the unsafe inventory when a production import changes:
 
 ```bash
 go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
 ```
 
-## Change generated documentation
+Do not hand-edit generated blocks in `UNSAFE.md`, `docs/capabilities.md`,
+`docs/distributed-feature-state.md`, or `bench/competitive/COVERAGE.md`.
 
-Regenerate benchmark coverage from the nested module:
+## Measure performance honestly
 
 ```bash
-cd bench/competitive
-go generate .
-go test -run '^TestBenchmarkCoverage' -count=1 ./internal/coverage
+go run ./bench/gate
 ```
 
-Do not hand-edit the generated capability matrix or benchmark coverage table.
-The related golden tests compare exact bytes.
+The allocation gate compares allocations and bytes against a Git base; it does
+not gate time. A publishable claim requires the complete provenance, raw rows,
+repetitions, and validator scope in [performance evidence](docs/performance.md).
+No selective number or CI artifact becomes a product claim by being copied into
+prose.
 
-Use [the documentation language guide](docs/STYLE.md). Keep industry terms and
-exact code identifiers. Add implementation references for an internal contract.
+## Documentation changes
 
-## Review the final diff
+Follow [the documentation standard](docs/STYLE.md). Lead with maturity and
+failure boundaries. Keep tutorials runnable, reference tables exact, and
+implementation evidence in a compact source map. Never use “PostgreSQL
+compatible,” “production,” “shipped,” or “bounded memory” without the precise
+scope that source and tests establish.
+
+## Final review
 
 ```bash
 git status --short
@@ -144,5 +131,5 @@ git diff --check
 git diff --stat
 ```
 
-Confirm that the change does not include local caches, benchmark binaries,
-temporary data, or unrelated user work.
+Confirm that the diff contains no caches, benchmark binaries, credentials,
+generated cluster state, evidence directories, or unrelated user work.

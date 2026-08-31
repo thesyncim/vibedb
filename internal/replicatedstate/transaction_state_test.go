@@ -9,19 +9,12 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// These tests are a green state-machine scaffold for the RF3 transaction
-// protocol. Transaction commands are not part of replication.Command yet, so
-// the scaffold represents coordinator and participant records as ordinary
-// relation rows and exercises the exact primitives the eventual hidden system
-// records must use: digest-guarded monotone transitions, atomic relation-bundle
-// publication, exact retry, snapshot certification, and reopen.
-//
-// Once first-class transaction commands exist, keep the assertions and replace
-// only transactionStateScaffold's command construction and record reads. A
-// production transaction test must additionally prove that the replicated
-// active-barrier index blocks intersecting reads and writes; no such hook
-// exists in Machine today, so this file deliberately does not pretend to test
-// that contract.
+// These legacy scaffold tests model coordinator and participant records as
+// ordinary relation rows. They exercise digest-guarded monotone transitions,
+// atomic relation-bundle publication, exact retry, snapshot certification, and
+// reopen, but they do not exercise the first-class CommandTransaction path.
+// Dedicated transaction command, apply, recovery, and active-barrier tests
+// cover that production machinery elsewhere in this package.
 
 type transactionStateScaffold struct {
 	fixture  relationBundleFixture

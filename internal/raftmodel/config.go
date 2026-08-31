@@ -1,4 +1,4 @@
-// Package raftmodel defines Vibedb's executable Raft integration model.
+// Package raftmodel defines VibeDB's executable Raft integration model.
 package raftmodel
 
 import raft "go.etcd.io/raft/v3"
@@ -20,7 +20,7 @@ const (
 // NewConfig returns the audited baseline configuration for one Raft member.
 // ID, storage, and the durable applied index are member state; changing any
 // other field is a core-selection change and must update the field-locking
-// tests and docs/design/raft-core-selection.md together.
+// tests and docs/operations/distributed.md together.
 //
 // raft.NewRawNode validates ID, storage, and the relationships between these
 // settings. Keeping validation at that boundary avoids duplicating upstream's

@@ -1,24 +1,27 @@
-# RF3 external fault evidence
+# RF3 external fault qualification
 
-`rf3chaos` runs the shipped three-process RF3 fault harness outside the Go test
-driver and writes one canonical TSV evidence file. Each repetition exercises:
+> **Development status:** This is a checked-in development qualification harness,
+> not a production fault-injection service or a stable release contract. RF3
+> behavior, limits, report schema, and commands can change or break at any commit.
 
-- isolation of the elected process with `SIGSTOP` and election by the quorum;
-- rejection of a stale linearizable-read fence by the resumed former leader;
-- leader `SIGKILL` before a proposal and successful post-election proposal;
-- a request/response `SIGKILL` race followed by byte-identical recovery;
-- an applied mutation whose native response is deliberately never read,
-  followed by leader kill and byte-identical recovery from the surviving
-  quorum;
-- restart and catch-up of killed replicas;
-- two asymmetric leader-to-follower partition/restart/heal loops through
-  test-owned directional TCP relays, with interrupted/rejected connections;
-- four complete 64-caller request-waiter waves, admission/refusal totals,
-  post-wave capacity reuse, and a hard aggregate child-RSS growth bound;
-- a hard physical WAL-allocation growth bound; and
-- durable acknowledgement survival after all three replicas have restarted.
+`rf3chaos` runs one exact Go qualification test outside the normal test driver.
+Each repetition launches three real `vibedb-shard serve-rf3` child processes and
+writes a canonical TSV row.
 
-Run at least nine isolated repetitions for publication:
+## Requirements
+
+- Linux with `/proc` process RSS and process-I/O accounting
+- working `SIGSTOP`, `SIGCONT`, and `SIGKILL`
+- a filesystem on which the qualification's WAL-allocation checks work
+- enough time and local resources for three shard processes per repetition
+
+Darwin cannot prove the required RSS and physical WAL-allocation bounds. The
+underlying test skips there, and this runner converts that skip into a failed
+qualification row and a nonzero exit.
+
+## Run it
+
+From the repository root:
 
 ```bash
 go run ./bench/rf3chaos \
@@ -27,34 +30,50 @@ go run ./bench/rf3chaos \
   -timeout 5m
 ```
 
-The output path must be absolute and must not exist. The runner builds the
-exact working tree once, hashes that test binary, then starts a fresh test
-process for every repetition. The test process starts three real
-`vibedb-shard serve-rf3` OS-process children. A skipped test is a failed
-qualification, even when the test binary exits successfully.
+The output path must be absolute and must not already exist. `-runs` must be
+between 1 and 1,024, and `-timeout` must be positive. One repetition is useful
+for development feedback; a publication candidate requires at least nine
+isolated repetitions and the full competitive evidence protocol.
 
-The physical WAL-allocation and process-RSS prerequisites are Linux-only.
-Darwin cannot prove strict recovery-journal allocation or read the required
-per-child `/proc` RSS cuts, so the harness skips there and `rf3chaos`
-intentionally returns nonzero after preserving a failed TSV row. A Darwin run
-is useful only to confirm that limitation; it is not RF3 fault qualification.
-The directional proxy, `SIGSTOP`, `SIGCONT`, and `SIGKILL` controls also fail
-the exact test if they cannot be created or exercised. The Linux CI job runs
-one mandatory repetition through this runner, so an unsupported filesystem, a
-skip, an absent exact test, a missing synced qualification artifact, or any
-failed bound fails closed.
+The runner builds and hashes the exact worktree's test binary once, then starts
+a fresh test process for every repetition. It writes and syncs the report even
+when a repetition fails, and returns nonzero after recording all attempted rows.
 
-The schema-v2 report retains the commit and dirty state, test binary digest,
-exact-test and exact-qualification proof, process exit, timeout state, total
-output bytes, output digest, and whole-harness elapsed time. Every raw row also
-contains the three observed kill/response cuts, asymmetric loop and rejected
-connection counts, waiter wave/call/completion/refusal/reuse counts, WAL
-baseline/final/growth/bound bytes, and waiter-phase RSS baseline/peak/growth/
-bound bytes. It deliberately does not label whole-harness time as
-leader-election, failover, recovery, or foreground latency. The black-box
-protocol still does not expose those individual durations.
+## What one passing repetition checks
 
-The runner returns nonzero when any repetition fails, after preserving the raw
-report. Keep the corresponding full test logs separately when investigating a
-failure; the canonical report authenticates them by SHA-256 but does not embed
-unbounded log bytes.
+- quorum election while the elected process is stopped;
+- rejection of a stale linearizable-read fence after that process resumes;
+- leader kill before proposal, followed by successful post-election proposal;
+- lost-response and unread-response kill races with byte-identical recovery;
+- restart and catch-up of killed replicas;
+- two asymmetric leader-to-follower partition/restart/heal loops through
+  directional test proxies;
+- four waves of 64 request waiters, refusal accounting, and capacity reuse;
+- bounded aggregate child-RSS growth during waiter pressure;
+- bounded physical WAL allocation growth; and
+- survival of a durable acknowledgement after all replicas restart.
+
+A skipped test, missing exact test marker, missing synced qualification artifact,
+timeout, failed bound, or unsuccessful child exit fails the row.
+
+## What it does not prove
+
+- The recorded elapsed value covers the whole harness. It is not isolated
+  election, failover, recovery, or foreground latency.
+- The harness does not vary node count, replica factor, group count, placement,
+  storage device, or network topology.
+- It does not exercise a gateway process or establish horizontal scaling,
+  split/rebalance behavior, rolling upgrades, or production readiness.
+- Linux process-I/O and filesystem allocation counters are not media-write
+  measurements.
+- A standalone run may record a dirty tree; publication validation rejects one.
+
+The TSV records revision and dirty state, Go/OS/architecture, exact test and
+qualification markers, binary and output digests, process/timeout state, fault
+counters, waiter counts, and WAL/RSS baselines, peaks, growth, and bounds. The
+canonical report retains only bounded log material; preserve full logs separately
+when diagnosing a failure.
+
+Core CI runs one repetition, PR competitive qualification runs three, and neither
+is an endorsed performance result. See
+[the benchmark evidence levels](../competitive/README.md#evidence-levels).

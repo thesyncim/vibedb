@@ -1,9 +1,24 @@
-# SQL with `database/sql`
+# SQL API
 
-The SQL driver registers the name `vibedb`. Its data source name is the path to
-one durable SQL catalog.
+> [!CAUTION]
+> Unreleased development software: SQL, catalog, protocol, types, limits, and
+> transactions may break on any commit. No old-image migration reader exists.
+> Pin the catalog commit and test recovery.
 
-## Open a catalog
+VibeDB exposes one bounded SQL implementation through two Go APIs:
+
+| API | Use it for |
+|---|---|
+| `database/sql` driver name `vibedb` | Conventional Go applications and connection pooling |
+| `sql/driver` typed runtime | Protocol adapters, explicit ownership, typed cells, and allocation reuse |
+
+SQL is a native document-database interface, not PostgreSQL SQL compatibility.
+See the [PostgreSQL wire adapter](pgwire.md) and [SQL reference](../reference/sql.md).
+
+## Open a catalog with `database/sql`
+
+The DSN is the catalog path. This complete program uses a disposable catalog
+through `database/sql` only:
 
 ```go
 package main
@@ -11,353 +26,246 @@ package main
 import (
 	"context"
 	"database/sql"
-	"log"
+	"fmt"
+	"os"
+	"path/filepath"
 
-	_ "github.com/thesyncim/vibedb/sql/driver"
+	vibedriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
-func main() {
-	db, err := sql.Open("vibedb", "app.vdb")
+func must(err error) {
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
+}
+
+func main() {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "vibedb-sql-*")
+	must(err)
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "app.vdb")
+
+	connector, err := (vibedriver.Driver{}).OpenConnector(path)
+	must(err)
+	db := sql.OpenDB(connector)
 	defer db.Close()
 
-	ctx := context.Background()
-	_, err = db.ExecContext(ctx, `
-		CREATE TABLE docs (
-			id STRING PRIMARY KEY,
-			category STRING NOT NULL,
-			score INTEGER NOT NULL
-		)
-	`)
-	if err != nil {
-		log.Fatal(err)
-	}
+	_, err = db.ExecContext(ctx, `CREATE TABLE counters (
+		id STRING PRIMARY KEY,
+		value INTEGER NOT NULL
+	)`)
+	must(err)
 
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO docs (id, category, score) VALUES (?, ?, ?)`,
-		"a", "news", 10,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
+		`INSERT INTO counters (id, value) VALUES (?, ?)`, "requests", 1)
+	must(err)
+
+	_, err = db.ExecContext(ctx,
+		`UPDATE counters SET value = value + 1 WHERE id = ?`, "requests")
+	must(err)
+
+	var value int64
+	must(db.QueryRowContext(ctx,
+		`SELECT value FROM counters WHERE id = ?`, "requests").Scan(&value))
+	fmt.Println(value)
 }
 ```
 
-The connector shares one durable catalog handle and one writer lease across
-the connection pool.
+The native placeholder is `?`. Named `database/sql` arguments are rejected.
+The pgwire adapter rewrites PostgreSQL `$1` placeholders before parsing; do not
+use `$1` through this driver. Each native call accepts exactly one statement.
 
-## Query rows
+Use `Query` for SELECT and mutations with RETURNING. Use `Exec` for DDL and
+mutations without RETURNING. `LastInsertId` is not available.
+
+## Store whole documents
+
+`"$doc"` names the whole JSON document. Run these statements separately on a
+fresh catalog:
+
+```sql
+CREATE TABLE users (
+    id STRING PRIMARY KEY, name STRING, visits INTEGER
+);
+INSERT INTO users VALUES ('{"id":"u1","name":"Ada","visits":1}');
+
+INSERT INTO users (id, name, visits) VALUES ('u1', 'Ada Lovelace', 1)
+ON CONFLICT DO UPDATE SET
+    visits = users.visits + EXCLUDED.visits,
+    name = EXCLUDED.name;
+
+UPDATE users SET "$doc" = '{"id":"u1","name":"Augusta","visits":3}'
+WHERE id = 'u1';
+```
+
+UPDATE expressions read the current row. Upsert expressions read both the
+current target row (`users.visits`; bare `visits` is ambiguous) and incoming
+`EXCLUDED` top-level fields. This is implemented behavior, not roadmap syntax.
+
+The embedded behavior above is broader than the authenticated durable RF3 lane.
+RF3 accepts a declared top-level computed assignment only for an exact-primary-
+key UPDATE without RETURNING, ORDER BY/LIMIT, a nested target, or a primary-key
+move. `ON CONFLICT` remains fenced. For example:
+
+```sql
+UPDATE users SET visits = visits + 1, name = name || '!' WHERE id = ?;
+```
+
+The coordinator linearizably reads the old row and evaluates every right-hand
+side once against that same image. It retains the canonical postimage plus the
+old value's exact length and SHA-256 check in the durable program; global-index
+changes derive from that postimage, and recovery replays it without reevaluation.
+The RF3 pgwire backend is autocommit-only: send each write in its own Query or
+Execute/Sync cycle, not an explicit or multi-statement transaction.
+
+`ON CONFLICT` always means the table primary key. `DO NOTHING` and `DO UPDATE`
+are supported; explicit conflict targets, named constraints, action WHERE, and
+nested `EXCLUDED` paths are not.
+
+## Null and missing are different
+
+An absent JSON path and explicit JSON `null` remain distinct internally:
+
+```sql
+-- Matches {"note": null} and documents without note.
+SELECT id FROM users WHERE note IS NULL;
+
+-- Matches only documents without note.
+SELECT id FROM users WHERE note IS MISSING;
+
+-- Matches only documents where note exists and is not null/missing.
+SELECT id FROM users WHERE note IS NOT NULL;
+```
+
+Projection and pgwire both encode missing and JSON null as SQL NULL; retain the
+distinction in predicates with `IS MISSING`. Authored comparisons such as
+`note = NULL` are rejected.
+
+## Transactions and savepoints
+
+| Isolation | Read cut | Commit validation |
+|---|---|---|
+| Read Committed (default) | One coherent cut per statement | Write conflicts |
+| Repeatable Read / Snapshot | Cut captured at BEGIN | Write conflicts |
+| Serializable | Cut captured at BEGIN | Write and exact/relation-coarse read dependencies |
+
+Transactions provide read-your-writes, statement atomicity, first-committer-
+wins conflicts, and atomic multi-table commits. DDL is refused inside a
+transaction. A transaction may hold up to 64 savepoints. Duplicate names
+shadow older savepoints; RELEASE removes the named savepoint and newer ones;
+ROLLBACK TO retains the named savepoint and removes newer ones.
+
+This function can be added to the program above; every statement sees the same
+`counters` table and all resources have one owner:
 
 ```go
-rows, err := db.QueryContext(ctx, `
-	SELECT id, score
-	FROM docs
-	WHERE category = ?
-	ORDER BY score DESC
-	LIMIT ?
-`, "news", 10)
-if err != nil {
-	log.Fatal(err)
-}
-defer rows.Close()
-
-for rows.Next() {
-	var id string
-	var score int64
-	if err := rows.Scan(&id, &score); err != nil {
-		log.Fatal(err)
-	}
-}
-if err := rows.Err(); err != nil {
-	log.Fatal(err)
+func savepointExample(ctx context.Context, db *sql.DB) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	must(err)
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `SAVEPOINT before_audit`)
+	must(err)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO counters (id, value) VALUES (?, ?)`, "audit", 1)
+	must(err)
+	_, err = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT before_audit`)
+	must(err)
+	must(tx.Commit())
 }
 ```
 
-Use `Query` for `SELECT` and for a mutation with `RETURNING`. Use `Exec` for a
-mutation that does not return rows. `LastInsertId` is not available.
+Close or exhaust `Rows` before another operation on the same physical
+connection, especially inside `*sql.Tx`. In the typed runtime, a prepare or
+execution error fails an active transaction; recover with ROLLBACK TO or
+ROLLBACK. COMMIT on a failed transaction rolls it back.
 
-One `database/sql` call accepts one SQL statement. It rejects a
-semicolon-separated statement batch.
+After an unknown commit result, close the `database/sql` pool—or typed session
+then database—reopen the catalog, and reconcile; never blindly retry the write.
 
-## Access paths and EXPLAIN
+## Typed runtime
 
-For a local `SELECT`, equality or a positive `IN` predicate on the declared
-primary-key path can supply point candidates when it is the complete `WHERE`
-predicate or is below only top-level `AND` nodes. If several usable primary-key
-point predicates occur in one conjunction, the driver chooses equality before
-`IN`; among `IN` predicates it chooses the shortest list. A primary-key
-predicate below `OR` or `NOT` is not a sound bound and does not enable point
-access.
-
-Primary-key comparisons with `>`, `>=`, `<`, `<=`, or non-negated `BETWEEN`
-can similarly bound an ordered range at the root or below top-level `AND`
-nodes. Multiple range terms are intersected. Point access takes precedence
-when a query has both a usable point and range bound.
-
-Candidate selection never replaces predicate evaluation. The query engine
-checks the complete `WHERE` predicate, including every residual conjunct, over
-the point or range source. Prepared statements also revalidate the cached path
-against the live table, so dropping and recreating a table with a different
-primary key falls back to an eligible non-point path instead of probing the old
-key. Runtime size or source constraints can also select a scan fallback.
-
-`EXPLAIN` reports the source-aware candidate path without scanning rows.
-`EXPLAIN ANALYZE` executes the statement and reports the measured path. Plan
-names such as `primary-key-point-or-scan` and
-`primary-key-range-or-scan` deliberately expose the possible fallback. See the
-[typed query API](query.md#explain-a-plan) for the full access-path vocabulary.
-
-## Parameters
-
-Use `?` placeholders. The driver rejects named parameters.
-
-One parameter has a 4 MiB limit. The total bound payload has a 16 MiB limit.
-The driver rejects invalid UTF-8 and nonfinite numbers. It keeps exact numeric
-values exact during normalization.
-
-A named-column `INSERT ... VALUES` accepts JSON scalar driver values. A
-`vibejson.RawValue` is accepted only when it contains one valid JSON number and
-is emitted with that exact numeric spelling; it is never encoded as its Go
-struct representation. `encoding/json.Number` remains accepted as an input
-compatibility type, but production document encoding is performed by
-`vibejson`.
-
-A physical connection can have only one open `Rows`. Close or exhaust the rows
-before you run another statement on that same connection.
-
-## Create and alter tables and indexes
-
-A table stores JSON documents and has exactly one primary JSON path. Compound
-table primary keys are not supported by the driver.
-
-Declared types map to JSON domains:
-
-- `NULL`
-- `BOOL`
-- `NUMBER`
-- `INTEGER`
-- `STRING`
-- `ARRAY`
-- `OBJECT`
-- `ANY`
-
-Common SQL aliases map to these domains. `JSON` maps to `ANY`. Columns are
-nullable unless they use `NOT NULL`.
-
-Add one declared column with the bounded additive form:
-
-```sql
-ALTER TABLE docs ADD COLUMN IF NOT EXISTS note STRING
-```
-
-The driver validates every existing document against the resulting schema and
-publishes the new table incarnation atomically. A nullable column therefore
-works when older documents omit it. A `NOT NULL` column succeeds only when every
-existing document already contains a non-null value of the declared type.
-The current embedded implementation holds the catalog write lock while it
-copies a materialized table, so other reads and writes wait for a large ALTER.
-`ALTER TABLE` is not allowed inside an explicit transaction. Rename, drop,
-type-change, default, and constraint-changing ALTER actions are not supported.
-
-Primary-key values can be strings, booleans, or numbers. Numeric spellings
-such as `1`, `1.0`, and `1e0` have one exact identity. Arrays and objects cannot
-be primary keys.
-
-`CREATE INDEX` creates an exact nonunique index. It supports one or more JSON
-paths and online creation over an existing table.
-
-Use `UNIQUE` to make the exact scalar tuple a stored constraint:
-
-```text
-CREATE UNIQUE INDEX [IF NOT EXISTS] [index_name]
-ON table_name (path [, path ...])
-```
-
-```sql
-CREATE UNIQUE INDEX IF NOT EXISTS docs_category_score_key
-ON docs (category, score)
-```
-
-The index name is optional. An omitted name is derived from the path list. The
-list must contain one to four distinct JSON paths.
-
-Each participating path must contain a Boolean, number, or string. Exact
-numeric identity is canonical, so `1`, `1.0`, and `1e0` conflict. If any path
-is missing or JSON null, that document does not participate in the constraint.
-This is PostgreSQL's default `NULLS DISTINCT` behavior. Present arrays and
-objects fail the index build or later mutation instead of being omitted.
-
-Creation checks every existing document and publishes no index when it finds a
-duplicate or invalid container. INSERT, UPDATE, primary-key upsert, transaction
-commit, and reopen preserve the same constraint. The durable unique build holds
-the catalog write lock while it validates the table. Ordinary nonunique index
-creation retains its online build behavior.
-
-Column and table `UNIQUE` constraints and `NULLS NOT DISTINCT` are not
-supported. In an `OpenCluster` database, every unique index on a placed table
-must include all shard-key paths so one physical shard can enforce the complete
-constraint. The embedded driver returns `driver.ErrUniqueConstraint` for a
-secondary conflict. Embedded pgwire maps it to SQLSTATE `23505`.
-
-## Insert, update, and delete
-
-Insert a complete JSON document:
-
-```sql
-INSERT INTO docs VALUES (?)
-```
-
-You can also construct a flat top-level document from named columns. A
-multi-row `INSERT ... VALUES` is atomic.
-
-`INSERT ... SELECT` requires exactly one output column that contains complete
-JSON documents. The source query reads the pre-statement snapshot.
-
-Conflict handling uses the document-derived primary key as its implicit target:
-
-```sql
-INSERT INTO docs VALUES (?) ON CONFLICT DO NOTHING
-
-INSERT INTO docs VALUES (?)
-ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc"
-
-INSERT INTO employees (id, team, score) VALUES (?, ?, ?)
-ON CONFLICT DO UPDATE SET team = EXCLUDED.team, score = ?
-```
-
-The whole-document form works for schemaless tables. The column form accepts
-distinct declared top-level targets with a scalar literal, placeholder,
-`NULL`, or `EXCLUDED.<declared-column>` value; unassigned fields in the current
-row are preserved. Every candidate document must satisfy the table schema even
-when it conflicts, and an updated post-image must preserve the primary key.
-Repeating one canonical candidate key in a `DO UPDATE` batch rejects the whole
-statement as a cardinality violation.
-
-Explicit conflict targets, `ON CONSTRAINT`, conflict-action `WHERE`, nested or
-row-dependent assignments, and `INSERT ... SELECT DO UPDATE` are not supported.
-Both actions target only the implicit primary key. A secondary unique-index
-conflict returns a unique violation and does not select either conflict action.
-Embedded pgwire exposes the same behavior. RF3/distributed writes reject every
-conflict action until branch-aware capture and global-index maintenance are
-available.
-
-`UPDATE` can replace the complete document:
-
-```sql
-UPDATE docs
-SET "$doc" = ?
-WHERE id = ?
-```
-
-For tables with declared columns, `UPDATE` can instead assign scalar literals,
-placeholders, `NULL`, or supported scalar expressions to one or more top-level
-columns:
-
-```sql
-UPDATE employees
-SET team = ?, score = score + 1, note = NULL
-WHERE id = ?
-```
-
-Each matching document is updated independently, and unassigned fields are
-preserved. Every right-hand side observes the same old row, so mixed assignments
-are simultaneous rather than left-to-right. Arithmetic, concatenation, unary
-expressions, casts, and `CASE` use the ordinary scalar runtime. Nested-path
-targets remain unsupported. An update cannot change the primary key. A single
-whole-document replacement cannot replace several rows that have different
-primary keys. Static distributed writes, including maintained global indexes,
-consume shard-evaluated canonical postimages. Exact-primary-key RF3 updates
-evaluate computed assignments once over a linearizable old-row image, retain
-the canonical postimage in the durable transaction program, and publish it only
-through an exact old-value digest CAS. RF3 `RETURNING` remains unsupported.
-
-`UPDATE` and `DELETE` support `WHERE`, `ORDER BY`, `LIMIT`, and `RETURNING`.
-`UPDATE ... FROM` and `DELETE ... USING` are not supported.
-
-## Run a transaction
+Use the typed runtime when the caller needs explicit sessions and typed cells.
+Do not open the same catalog through it while a `database/sql` pool still owns
+the writer lease. This function uses the imports and `must` helper above:
 
 ```go
-tx, err := db.BeginTx(ctx, &sql.TxOptions{
-	Isolation: sql.LevelSerializable,
-})
-if err != nil {
-	log.Fatal(err)
-}
-defer tx.Rollback()
-
-if _, err := tx.ExecContext(ctx, `SAVEPOINT before_update`); err != nil {
-	log.Fatal(err)
-}
-
-_, err = tx.ExecContext(ctx, `
-	UPDATE docs
-	SET "$doc" = ?
-	WHERE id = ?
-`, `{"id":"a","category":"news","score":11}`, "a")
-if err != nil {
-	_, _ = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT before_update`)
-	log.Fatal(err)
-}
-
-if err := tx.Commit(); err != nil {
-	log.Fatal(err)
+func typedRead(ctx context.Context, path string) {
+	database, err := vibedriver.Open(path)
+	must(err)
+	defer database.Close()
+	session, err := database.NewSession(ctx)
+	must(err)
+	defer session.Close()
+	prepared, err := session.Prepare(ctx,
+		`SELECT id, value FROM counters WHERE id = ?`)
+	must(err)
+	defer prepared.Close()
+	cursor, err := prepared.Query(ctx, []any{"requests"})
+	must(err)
+	defer cursor.Close()
+	if !cursor.Next() {
+		panic("counter not found")
+	}
+	value, ok := cursor.Cell(1).Int64()
+	if !ok {
+		panic("counter is not an integer")
+	}
+	fmt.Println(value)
 }
 ```
 
-The driver accepts these isolation levels:
+Ownership rules are strict:
 
-| Requested level | Read-cut behavior |
-| --- | --- |
-| Default or read committed | Refresh the coherent cut for each data statement. |
-| Repeatable read or snapshot | Retain the `BEGIN` cut. |
-| Serializable | Retain the `BEGIN` cut and validate read dependencies. |
+- `Database` owns the catalog writer lease. `Database.Close` prevents new
+  sessions; existing sessions keep the catalog alive until they close.
+- `Session` is single-consumer and permits at most one live cursor and one
+  active transaction.
+- `Prepared.Close` releases parsed and compiled arenas and closes its live
+  cursor. It is idempotent.
+- `Session.Tables` returns an owned snapshot: tables are sorted by name,
+  declared columns by canonical path, and exact indexes by creation order.
+- Cursor cells borrow runtime storage until `Cursor.Close`; copy data that must
+  survive. `Cursor.Close` releases the snapshot lease and is idempotent.
+- Cursor → prepared → session → database is clearest; Close methods safely
+  cascade, and sessions outlive `Database.Close`.
 
-Writes use optimistic first-committer-wins conflict detection. A multi-table
-commit does not publish a partial result.
+`Session.SetResultLimits`, `SetIntermediateLimit`, and `SetMemoryLimit` must be
+configured while idle with no live cursor. Zero selects defaults; `-1` disables
+result/intermediate caps. A positive memory limit must be at least 64 KiB.
 
-Transactions support read-your-writes and at most 64 savepoints. DDL is not
-allowed in a transaction. A read-only transaction rejects DML and DDL.
+## Values and limits
 
-## Resource limits
+`database/sql` accepts nil, bool, converter-supported integers, finite float64,
+UTF-8 string/bytes, `query.Number`, and numeric `vibejson.RawValue`. The typed
+runtime accepts every integer width, finite float32/64, those string/number
+forms, and `*bool`, `*int64`, `*float64`, `*string`, `*[]byte`, or
+`*query.Number`. It also accepts `RawValue` as a valid document. Document
+string/bytes must contain one valid JSON value.
 
-The `database/sql` adapter uses one query worker for each physical connection.
-Pool concurrency supplies parallelism.
+| Boundary | Current limit |
+|---|---:|
+| SQL text | 16 MiB |
+| Parameters | 65,536 |
+| One parameter | 4 MiB |
+| All argument payloads per execution | 16 MiB |
+| Encoded primary key | 256 bytes |
+| Document | 4 MiB |
+| Mutation transaction | Per table: 64 docs / 16 MiB values + keys; total: 16 tables / 256 docs / ~64 MiB |
+| Clause/list items | 1,024 each |
+| Predicate/scalar depth | 64 |
+| Subquery depth | 32 |
+| Set nesting | 64 |
+| Default result | 100,000 rows / 64 MiB |
+| Default relation intermediates | 64 MiB |
 
-Default query limits include:
+Returned `database/sql` values are nil for SQL NULL, bool for booleans, int64
+for exactly representable integral numbers, and byte slices for other exact
+numbers, strings, and JSON. NUMBER uses exact JSON-decimal identity: `1`, `1.0`,
+and `1e0` compare as the same number. Do not round through `float64`.
 
-| Resource | Default |
-| --- | ---: |
-| Working memory | 64 MiB |
-| Result rows | 100,000 |
-| Result bytes | 64 MiB |
-| Intermediate bytes | 64 MiB |
-| Aggregate bytes | 16 MiB |
-| Spill bytes | 1 GiB |
-| Join-pair bytes | 64 MiB |
-| Recursive-term evaluations | 1,000 |
-| Recursive result rows | 100,000 |
-| Recursive fixpoint storage | 64 MiB |
+## Source map
 
-Budget errors return no partial materialized result. Use the typed runtime when
-you need per-session cancellation, result, intermediate, or working-memory
-limits. Aggregate, spill, and join-pair limits are not session setters.
-
-## Important SQL boundaries
-
-VibeDB is not PostgreSQL. It does not support schemas, roles, grants, COPY,
-procedures, notifications, nested partial-document path updates, general scalar
-function calls, general `pg_catalog` SQL, or arbitrary PostgreSQL types.
-
-See the [SQL surface reference](../design/sql-surface.md) for supported query
-forms and exact refusals.
-
-## Implementation references
-
-- `sql/driver/driver.go`, `write.go`, `tx.go`, and `runtime.go`
-- `sql/driver/validate.go`, `primary.go`, and `primary_range.go`
-- `sql/driver/unique_index.go`, `unique_index_test.go`, and `upsert_test.go`
-- `sql/parser.go`, `parse_ddl.go`, and `parse_dml.go`
-- `sql/driver/surface_test.go`, `primary_range_test.go`, and
-  `isolation_test.go`
+- Native/typed adapters and values: `sql/driver/driver.go:22-79`, `sql/driver/driver.go:308-419`, `sql/driver/runtime.go:22-242`
+- Transactions and embedded mutations: `sql/driver/tx.go:89-184`, `sql/driver/savepoint.go:7-190`, `sql/driver/column_update.go:23-112`
+- RF3 postimages and replay: `gateway/replicated_sql_transaction.go:128-565`, `gateway/durable_sql_request_executor.go:103-157`

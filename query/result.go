@@ -124,8 +124,9 @@ type ResultColumn struct {
 	Cells  []Cell
 }
 
-// Column returns the result column with the given header, and whether one
-// exists. Headers are unique within a Result.
+// Column returns the first result column with the given header, and whether one
+// exists. Headers are display metadata and need not be unique; use column
+// ordinals when duplicate projection names must remain distinguishable.
 func (r Result) Column(header string) (ResultColumn, bool) {
 	for _, c := range r.Columns {
 		if c.Header == header {

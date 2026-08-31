@@ -1,18 +1,15 @@
-// Package store is the in-memory source model that durable JSON collections are
-// built from, together with the read-side snapshot machinery the query engine
-// reads through. It is not a user-facing mutable database.
+// Package store is VibeDB's in-memory collection engine and the source model
+// shared by durable reads and query execution.
 //
-// A [Builder] bulk-loads a corpus into an immutable keyed graph — source bytes,
-// structural tapes, key directory, and exact-index pages — that package
-// store/durable freezes onto a page file with CreateFromPrimary. A [Snapshot] is
-// the lock-free read view (GetRaw, Range, and the index and candidate mask
-// probes a plan is built against) that this package and the durable snapshot
-// both expose, so query has one execution core over both backends. Optional
-// schema and exact-index definitions shape what a build materializes.
+// [Builder] bulk-loads unique keyed JSON documents into an immutable graph and
+// publishes it as a mutable [Collection]. It builds document, key, shape, and
+// zone metadata; exact indexes are created through the collection index API,
+// not materialized by Builder. [Snapshot] is the lock-free read view used by
+// the query engine. [Database] adds a named catalog, coherent multi-collection
+// snapshots, and failure-atomic [Database.Update] publication.
 //
-// [Collection] provides point Put and Delete mutations for transient and
-// memory-profile catalogs. Durable collections own the production persisted
-// mutation surface, including atomic batches and online exact-index creation.
+// The raw store API is not identical to the root vibedb facade or to
+// store/durable. See docs/store.md for the ownership and semantic boundaries.
 //
 // # Measuring a collection's footprint
 //

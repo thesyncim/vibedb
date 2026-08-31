@@ -1,68 +1,66 @@
 # Source and algorithm provenance
 
-This page maps external dependencies and derived algorithms to repository
-evidence. Third-party notice files remain authoritative for their license text.
+> [!CAUTION]
+> VibeDB is unreleased; APIs, commands, and wire/disk formats may break at any
+> commit. Use matching source/docs and disposable data. This repository has no
+> published project license; do not infer permission to use, modify, or
+> distribute VibeDB from third-party notice files.
 
 ## Project license status
 
-The repository currently has no project-level `LICENSE` or `COPYING` file. The
-checked-in `LICENSE-*` files and `x/vitessroute/LICENSE-VITESS` are third-party
-notices. They do not state a license for VibeDB's own source.
+No file named `LICENSE` grants rights for VibeDB as a whole. Files named
+`LICENSE-*` and `PATENTS-*` preserve notices for incorporated dependencies or
+derived algorithms:
 
-This is a release blocker. Select and add an explicit project license before a
-release. Do not infer project reuse terms from dependency notices.
+| Notice | Scope |
+| --- | --- |
+| `LICENSE-ETCD-RAFT` | etcd Raft dependency |
+| `LICENSE-PROTOBUF`, `PATENTS-PROTOBUF` | Protocol Buffers dependency |
+| `LICENSE-ROARING` | Roaring-derived work/notices |
+| `LICENSE-XXHASH` | xxHash dependency/algorithm |
+| `x/vitessroute/LICENSE-VITESS` | Vitess-derived routing algorithms in the optional nested module |
+
+These notices are not a substitute for a VibeDB project license. Resolve that
+status before external use or redistribution.
 
 ## Root module dependencies
 
-| Dependency | Version in `go.mod` | Use in source | Repository notice |
-| --- | --- | --- | --- |
-| `github.com/cespare/xxhash/v2` | `v2.3.0` | Hashing and compatible placement adapters | `LICENSE-XXHASH` |
-| `github.com/thesyncim/vibejson` | Pseudo-version pinned in `go.mod` | JSON parsing, canonicalization, paths, and output | Dependency module metadata |
-| `go.etcd.io/raft/v3` | `v3.7.0` | Internal Raft state machine | `LICENSE-ETCD-RAFT` |
-| `golang.org/x/sys` | `v0.47.0` | Platform I/O and system calls | Dependency module metadata |
-| `google.golang.org/protobuf` | `v1.36.11` | Raft transport message encoding | `LICENSE-PROTOBUF`, `PATENTS-PROTOBUF` |
+The authoritative dependency set and exact versions are in `go.mod` and
+`go.sum`. The root module currently depends directly on:
 
-The repository also keeps `LICENSE-ROARING` as a third-party notice. Do not
-infer a current dependency path from the notice alone. Use source imports and
-module files to determine active dependency use.
+- `github.com/cespare/xxhash/v2`
+- `github.com/thesyncim/vibejson`
+- `go.etcd.io/raft/v3`
+- `golang.org/x/sys`
+- `google.golang.org/protobuf`
 
-## Vitess compatibility module
+Benchmark and integration tools are separate Go modules so their competitor or
+client dependencies do not enter the root module's graph.
 
-`x/vitessroute` is a nested Go module. It pins Vitess `v0.24.2` for differential
-tests and provides a bounded compatibility adapter.
+## Vitess routing profile
 
-The derived algorithms are:
+`x/vitessroute` is an optional nested module. It reimplements the bounded
+`xxhash` and `multicol` keyspace-ID behavior of one pinned Vitess source profile
+behind VibeDB's dependency-free `distribution.Mapper` interface. No Vitess type
+crosses the public API.
 
-| ID | Source implementation | Local implementation | Validation |
-| --- | --- | --- | --- |
-| `ALGO-VITESS-XXHASH-001` | Vitess `vindexes/xxhash.go` | `x/vitessroute/xxhash.go` | Golden and differential tests |
-| `ALGO-VITESS-MULTICOL-001` | Vitess `vindexes/multicol.go` and `cfc.go` | `x/vitessroute/multicol.go` | Golden and differential tests |
-
-The local files identify the upstream paths, compatible version range, and
-behavioral boundary. `x/vitessroute/LICENSE-VITESS` contains the related
-license notice.
-
-The adapter does not expose all Vitess Vindexes. It supports its documented
-closed scalar and keyspace profile only.
+Differential golden vectors are the compatibility oracle. A mismatch is a stop
+condition; do not edit the expected vector to make a divergent algorithm pass.
+The supported profile is intentionally much narrower than Vitess: no lookup or
+owned vindexes, sequences, routing rules, or arbitrary destination widths.
 
 ## Maintenance rules
 
-When you add or update an external dependency:
+When adding or deriving code:
 
-1. Update the applicable `go.mod` and `go.sum`.
-2. Add or update the required license and patent notice.
-3. Identify copied or derived source in the local file header.
-4. Record the upstream repository, file, and version.
-5. Add a stable algorithm ID when behavior must stay compatible.
-6. Add golden and differential tests for compatibility code.
-7. Update this ledger.
+1. record the upstream project, exact revision, files/symbols, and license;
+2. preserve required notices next to the affected module;
+3. isolate optional dependency graphs in a nested module when practical;
+4. add differential or byte-exact tests for reproduced algorithms;
+5. update this page and review the unresolved project-license boundary.
 
-Do not use a benchmark match as the only parity proof. Compare exact outputs
-over normal, boundary, and invalid inputs.
+## Source map
 
-## Implementation references
-
-- `go.mod` and `go.sum`
-- `x/vitessroute/go.mod` and `go.sum`
-- `x/vitessroute/xxhash.go` and `multicol.go`
-- `x/vitessroute/differential_test.go` and `golden_test.go`
+- `go.mod`, `go.sum`, and nested-module `go.mod` files
+- `x/vitessroute/doc.go` and golden tests
+- root `LICENSE-*`, `PATENTS-*`, and `x/vitessroute/LICENSE-VITESS`
