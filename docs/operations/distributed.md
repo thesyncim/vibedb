@@ -371,11 +371,13 @@ replacement documents that move the placement key are refused before dispatch.
 `exec_batch` is an atomic, fixed-request distributed transaction. The strict
 RF3 lane supports single- or multi-row whole-document `INSERT` and unique
 top-level named-column `INSERT` rows that can be encoded as canonical runtime
-documents, exact-primary-key whole-document or direct declared-column `UPDATE`,
-and exact-primary-key `DELETE` with equality or a finite `IN` key set. Computed
-`UPDATE` assignments remain fenced until their evaluated postimages are durable
-RF3 replay inputs. One statement may fan rows or keys across RF3 shards, and an
-ordered request may touch multiple tables. Every resulting base and index
+documents, exact-primary-key whole-document or declared-column `UPDATE` with
+direct or supported computed assignments, and exact-primary-key `DELETE` with
+equality or a finite `IN` key set. Computed assignments run once over a
+linearizable old-row image; their canonical postimages and old-value digest
+checks are retained as RF3 replay inputs. One statement may fan rows or keys
+across RF3 shards, and an ordered request may touch multiple tables. Every
+resulting base and index
 mutation belongs to the same persisted transaction. Co-located relation
 mutations form one participant and apply atomically. There is no
 participant-count contract. Mutation, byte, deadline, journal, and concurrency
@@ -384,7 +386,8 @@ limits provide the bounds.
 Ready unique and non-unique global indexes are supported on this lane. The
 gateway lowers index maintenance into independently routed relation
 participants. Update and delete use an exact prior-value digest so a stale
-index removal cannot apply to a changed base row.
+index removal cannot apply to a changed base row. Same-key locator refreshes
+use an exact digest-compare replacement rather than a delete/put collision.
 
 This lane refuses projections or reads inside the transaction, `RETURNING`,
 `INSERT ... SELECT`, conflict clauses, invalid or duplicate flat columns,

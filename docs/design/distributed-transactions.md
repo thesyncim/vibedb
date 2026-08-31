@@ -223,9 +223,10 @@ including across an atomic statement batch.
 The replicated state machine can also atomically apply base and global-index
 relation batches. The public RF3 SQL lowering routes ready unique and non-unique
 indexes as independent relation participants. Same-key replacement and index
-removal use exact prior-value checks. RF3 direct declared-column updates are
-supported, but computed assignments remain fenced until their evaluated
-postimages are retained durably through replay.
+removal use exact prior-value checks. RF3 direct and computed declared-column
+updates read one linearizable old row, retain the canonical evaluated postimage
+and old-value CAS in the logical program, and never re-evaluate expressions
+during transaction recovery. RF3 `RETURNING` remains separately fenced.
 
 The RF3 read side has two contracts. `read_batch` supports multi-table and
 multi-group exact-primary-key `SELECT *` and returns one route/applied-index

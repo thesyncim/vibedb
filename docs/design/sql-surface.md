@@ -260,7 +260,10 @@ mixed right-hand sides are simultaneous.
 
 Nested-path targets and `UPDATE ... FROM` are not supported. Static distributed
 writes use shard-evaluated canonical postimages for maintained global indexes.
-The strict RF3 mutation lane still refuses computed assignments.
+The strict RF3 mutation lane evaluates exact-primary-key computed updates at the
+coordinator, retains the canonical postimage in the durable logical program,
+and guards publication with the old row's exact length and digest. RF3
+`RETURNING` remains a separate unsupported result-ordering contract.
 
 The replacement must preserve the primary key. One constant replacement
 cannot update multiple rows that have different primary keys.
