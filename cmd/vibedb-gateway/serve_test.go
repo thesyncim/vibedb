@@ -176,10 +176,10 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 	}
 }
 
-// TestServeGatewayExecOperation proves the serve front-end's exec operation
-// routes one single-shard write to its owning shard and reports the affected
-// count, while a cross-shard batch is refused before any dispatch.
-func TestServeGatewayExecOperation(t *testing.T) {
+// TestServeGatewayStaticWriteSurface proves the static serve front-end exposes
+// one single-owner write through exec, refuses a cross-shard statement, and
+// never routes public exec_batch into the unsequenced library transaction path.
+func TestServeGatewayStaticWriteSurface(t *testing.T) {
 	const version = distribution.RoutingVersion(3)
 	shardA := startShard(t, "ep-a", shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", AllocationGeneration: 1, Epoch: 7, RoutingVersion: version})
 	shardB := startShard(t, "ep-b", shardservice.Ownership{Distribution: "tenant_data", Shard: "80-", AllocationGeneration: 2, Epoch: 9, RoutingVersion: version})
@@ -328,6 +328,19 @@ func TestServeGatewayExecOperation(t *testing.T) {
 	}
 	if resp.Error == "" {
 		t.Fatal("cross-shard insert = success, want a refusal")
+	}
+
+	// A structurally valid durable request still cannot reach an unsequenced
+	// fallback when the public listener was started in static mode.
+	batch := []byte(`{"op":"exec_batch","request_id":"01000000000000000000000000000000","installation_id":"02000000000000000000000000000000","issuer_epoch":7,"lane_ordinal":2,"grant_digest":"0303030303030303030303030303030303030303030303030303030303030303","issuer_sequence":9,"class":"batch","statements":[{"sql":"DELETE FROM messages WHERE tenant_id = ?","params":[{"kind":"string","text":"` + keyA + `"}]}]}` + "\n")
+	if _, err := conn.Write(batch); err != nil {
+		t.Fatalf("write static exec_batch: %v", err)
+	}
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("decode static exec_batch reply: %v", err)
+	}
+	if resp.Error != errDurableExecBatchUnavailable.Error() {
+		t.Fatalf("static exec_batch error = %q, want %q", resp.Error, errDurableExecBatchUnavailable)
 	}
 }
 
