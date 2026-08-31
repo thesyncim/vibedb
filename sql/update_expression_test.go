@@ -152,6 +152,18 @@ func TestUpdateAssignmentUnsupportedScalarShapesAreTypedAndPositioned(t *testing
 	}
 }
 
+func TestMalformedUpdateScalarSubqueryRemainsSyntaxError(t *testing.T) {
+	_, err := ParseStatement(`UPDATE t SET n = (SELECT FROM)`)
+	var unsupported *FeatureNotSupportedError
+	if err == nil || errors.As(err, &unsupported) {
+		t.Fatalf("malformed subquery error = %T %v, want unwrapped syntax error", err, err)
+	}
+	var parse *ParseError
+	if !errors.As(err, &parse) {
+		t.Fatalf("malformed subquery error = %T %v, want *ParseError", err, err)
+	}
+}
+
 func TestUpdateAssignmentScalarDepthIsBounded(t *testing.T) {
 	source := `UPDATE t SET n = ` + strings.Repeat("-(", maxExprDepth+1) + `n` +
 		strings.Repeat(")", maxExprDepth+1)

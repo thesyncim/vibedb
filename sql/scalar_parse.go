@@ -535,6 +535,11 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 		openPos := p.tok.pos
 		p.advance()
 		if ctx == scalarUpdate && scalarQueryExpressionStarts(p.tok) {
+			if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
+				if _, err := p.parsePredicateSubquery(false); err != nil {
+					return nil, err
+				}
+			}
 			return nil, newFeatureNotSupportedError(
 				p.lx.src, openPos,
 				"scalar subqueries are not supported in UPDATE SET; compute the value before the mutation",
