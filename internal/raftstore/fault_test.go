@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -47,31 +48,47 @@ func TestPersistRecordFailureIsDefiniteAndExactRetrySucceeds(t *testing.T) {
 	}
 }
 
-func TestPersistRecordSyncFailureBindsAttemptedPayload(t *testing.T) {
+func TestPersistRecordBarrierFailureBindsAttemptedPayload(t *testing.T) {
 	_, store, _ := createTestStore(t)
 	incarnation, err := store.BeginIncarnation()
 	if err != nil {
 		t.Fatal(err)
 	}
+	originalBarrier := store.options.ops.recordBarrier
+	originalWrite := store.options.ops.writeAt
 	originalSync := store.options.ops.sync
 	failed := false
-	store.options.ops.sync = func(file *os.File) error {
+	currentWrites, finalSyncs := 0, 0
+	store.options.ops.writeAt = func(file *os.File, data []byte, offset int64) (int, error) {
+		if offset < HeaderBytes {
+			currentWrites++
+		}
+		return originalWrite(file, data, offset)
+	}
+	store.options.ops.recordBarrier = func(file *os.File) error {
 		if !failed {
 			failed = true
-			return errors.New("injected record sync")
+			return errors.New("injected record barrier")
 		}
+		return originalBarrier(file)
+	}
+	store.options.ops.sync = func(file *os.File) error {
+		finalSyncs++
 		return originalSync(file)
 	}
 	batch := raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{entry(2, 2, "x")}}
 	if err := store.Persist(batch); !errors.Is(err, ErrPersistenceDefinite) {
-		t.Fatalf("record sync = %v", err)
+		t.Fatalf("record barrier = %v", err)
+	}
+	if currentWrites != 0 || finalSyncs != 0 {
+		t.Fatalf("record barrier failure reached current phase: writes=%d syncs=%d", currentWrites, finalSyncs)
 	}
 	changed := batch
 	changed.Entries = []*pb.Entry{entry(2, 2, "changed")}
 	if err := store.Persist(changed); !errors.Is(err, ErrRetryConflict) {
 		t.Fatalf("changed retry = %v", err)
 	}
-	store.options.ops.sync = originalSync
+	store.options.ops.recordBarrier = originalBarrier
 	if err := store.Persist(batch); err != nil {
 		t.Fatalf("exact retry = %v", err)
 	}
@@ -121,29 +138,159 @@ func TestPersistCurrentSyncUnknownExactRetrySettlesWithoutRewrite(t *testing.T) 
 		t.Fatal(err)
 	}
 	originalSync := store.options.ops.sync
+	originalRead := store.options.ops.readAt
 	syncCall := 0
 	store.options.ops.sync = func(file *os.File) error {
 		syncCall++
-		if syncCall == 2 {
+		if syncCall == 1 {
 			return errors.New("injected slot sync")
 		}
 		return originalSync(file)
 	}
+	reads := 0
+	store.options.ops.readAt = func(file *os.File, data []byte, offset int64) (int, error) {
+		reads++
+		return originalRead(file, data, offset)
+	}
 	batch := raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{entry(2, 2, "x")}}
 	if err := store.Persist(batch); !errors.Is(err, ErrPersistenceUnknown) {
 		t.Fatalf("slot sync = %v", err)
+	}
+	if reads != 0 {
+		t.Fatalf("fresh current settlement read inactive slot %d times", reads)
 	}
 	writes := 0
 	store.options.ops.writeAt = func(file *os.File, data []byte, offset int64) (int, error) {
 		writes++
 		return file.WriteAt(data, offset)
 	}
-	store.options.ops.sync = originalSync
+	retrySyncs := 0
+	store.options.ops.sync = func(file *os.File) error {
+		retrySyncs++
+		return originalSync(file)
+	}
 	if err := store.Persist(batch); err != nil {
 		t.Fatalf("settle exact bytes: %v", err)
 	}
-	if writes != 0 {
-		t.Fatalf("settlement rewrote already exact slot %d times", writes)
+	if reads != 1 || writes != 0 || retrySyncs != 1 {
+		t.Fatalf("retry reads=%d rewrites=%d final syncs=%d, want 1/0/1", reads, writes, retrySyncs)
+	}
+}
+
+func TestPersistNonemptyReadyOperationOrder(t *testing.T) {
+	for _, mustSync := range []bool{false, true} {
+		t.Run(fmt.Sprintf("must-sync-%t", mustSync), func(t *testing.T) {
+			_, store, _ := createTestStore(t)
+			incarnation, err := store.BeginIncarnation()
+			if err != nil {
+				t.Fatal(err)
+			}
+			originalRead := store.options.ops.readAt
+			originalWrite := store.options.ops.writeAt
+			originalBarrier := store.options.ops.recordBarrier
+			originalSync := store.options.ops.sync
+			trace := make([]string, 0, 7)
+			store.options.ops.observeNamespaceProof = func() { trace = append(trace, "proof") }
+			store.options.ops.readAt = func(file *os.File, data []byte, offset int64) (int, error) {
+				trace = append(trace, "slot-read")
+				return originalRead(file, data, offset)
+			}
+			store.options.ops.writeAt = func(file *os.File, data []byte, offset int64) (int, error) {
+				phase := "record-write"
+				if offset < HeaderBytes {
+					phase = "slot-write"
+				}
+				trace = append(trace, phase)
+				return originalWrite(file, data, offset)
+			}
+			store.options.ops.recordBarrier = func(file *os.File) error {
+				trace = append(trace, "record-barrier")
+				return originalBarrier(file)
+			}
+			store.options.ops.sync = func(file *os.File) error {
+				trace = append(trace, "final-sync")
+				return originalSync(file)
+			}
+			before := store.SyncCount()
+			batch := raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
+				HardState: hard(2, 2), Entries: []*pb.Entry{entry(2, 2, "x")}, MustSync: mustSync}
+			if err := store.Persist(batch); err != nil {
+				t.Fatal(err)
+			}
+			want := "[proof record-write record-barrier proof slot-write final-sync proof]"
+			if got := fmt.Sprint(trace); got != want {
+				t.Fatalf("operation trace = %s, want %s", got, want)
+			}
+			if syncs := store.SyncCount() - before; syncs != 2 {
+				t.Fatalf("durability phase count = %d, want 2", syncs)
+			}
+		})
+	}
+}
+
+func TestPersistNamespaceChangeAfterRecordBarrierIsDefinite(t *testing.T) {
+	path, store, _ := createTestStore(t)
+	incarnation, err := store.BeginIncarnation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalBarrier := store.options.ops.recordBarrier
+	originalWrite := store.options.ops.writeAt
+	originalSync := store.options.ops.sync
+	currentWrites, finalSyncs := 0, 0
+	store.options.ops.writeAt = func(file *os.File, data []byte, offset int64) (int, error) {
+		if offset < HeaderBytes {
+			currentWrites++
+		}
+		return originalWrite(file, data, offset)
+	}
+	store.options.ops.sync = func(file *os.File) error {
+		finalSyncs++
+		return originalSync(file)
+	}
+	store.options.ops.recordBarrier = func(file *os.File) error {
+		if err := originalBarrier(file); err != nil {
+			return err
+		}
+		return os.Rename(path, path+".moved-after-record")
+	}
+	batch := raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
+		HardState: hard(2, 2), Entries: []*pb.Entry{entry(2, 2, "x")}, MustSync: true}
+	if err := store.Persist(batch); !errors.Is(err, ErrNamespaceChanged) ||
+		!errors.Is(err, ErrPersistenceDefinite) || errors.Is(err, ErrPersistenceUnknown) {
+		t.Fatalf("post-record namespace change = %v", err)
+	}
+	if currentWrites != 0 || finalSyncs != 0 {
+		t.Fatalf("post-record namespace change reached current phase: writes=%d syncs=%d", currentWrites, finalSyncs)
+	}
+}
+
+func TestPersistNamespaceChangeAfterFinalSyncIsUnknown(t *testing.T) {
+	path, store, _ := createTestStore(t)
+	incarnation, err := store.BeginIncarnation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSync := store.options.ops.sync
+	syncs := 0
+	store.options.ops.sync = func(file *os.File) error {
+		if err := originalSync(file); err != nil {
+			return err
+		}
+		syncs++
+		if syncs == 1 {
+			return os.Rename(path, path+".moved-after-current")
+		}
+		return nil
+	}
+	batch := raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1,
+		HardState: hard(2, 2), Entries: []*pb.Entry{entry(2, 2, "x")}, MustSync: true}
+	if err := store.Persist(batch); !errors.Is(err, ErrNamespaceChanged) ||
+		!errors.Is(err, ErrPersistenceUnknown) || errors.Is(err, ErrPersistenceDefinite) {
+		t.Fatalf("post-current namespace change = %v", err)
+	}
+	if syncs != 1 {
+		t.Fatalf("final sync calls = %d, want 1", syncs)
 	}
 }
 
@@ -433,7 +580,7 @@ func TestCloseOpenResolvesCurrentSyncUnknownToNewerImage(t *testing.T) {
 	syncCall := 0
 	store.options.ops.sync = func(file *os.File) error {
 		syncCall++
-		if syncCall == 2 {
+		if syncCall == 1 {
 			return errors.New("injected current sync")
 		}
 		return originalSync(file)
