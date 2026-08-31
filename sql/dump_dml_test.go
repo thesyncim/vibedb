@@ -145,7 +145,11 @@ func dumpAssignments(b *strings.Builder, assignments []UpdateAssignment) {
 			b.WriteString(", ")
 		}
 		fmt.Fprintf(b, "%q=", assignments[i].Column)
-		dumpOperand(b, assignments[i].Value)
+		if assignments[i].Expr != nil {
+			dumpScalar(b, assignments[i].Expr)
+		} else {
+			dumpOperand(b, assignments[i].Value)
+		}
 	}
 }
 

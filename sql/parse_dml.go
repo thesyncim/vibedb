@@ -985,17 +985,28 @@ func (p *Parser) parseAssignment() (Operand, bool, UpdateAssignment, error) {
 		return Operand{}, false, UpdateAssignment{}, p.errfHere("expected '=' after %s", path.Spec())
 	}
 	p.advance()
-	var value Operand
-	if p.tok.kind == tokIdent && p.tok.kw == kwNull {
-		value = Operand{Kind: OperandNull, Pos: p.tok.pos}
-		p.advance()
-	} else {
-		value, err = p.parseOperand()
-	}
+	expr, err := p.parseScalarExpression(scalarUpdate)
 	if err != nil {
+		return Operand{}, false, UpdateAssignment{}, p.normalizeUpdateScalarError(err)
+	}
+	if err := p.validateUpdateScalarExpression(expr); err != nil {
 		return Operand{}, false, UpdateAssignment{}, err
 	}
-	return Operand{}, false, UpdateAssignment{Column: column, Value: value, Pos: path.Pos}, nil
+	assignment := UpdateAssignment{Column: column, Pos: path.Pos}
+	switch expr.Kind {
+	case ScalarLiteral:
+		assignment.Value = expr.Value
+	case ScalarNull:
+		assignment.Value = Operand{Kind: OperandNull, Pos: expr.Pos}
+	default:
+		if value, ok := directTypedConstantOperand(expr); ok {
+			assignment.Value = value
+		} else {
+			assignment.Value = Operand{Kind: OperandExpression, Pos: expr.Pos}
+			assignment.Expr = expr
+		}
+	}
+	return Operand{}, false, assignment, nil
 }
 
 // --- DELETE ------------------------------------------------------------------

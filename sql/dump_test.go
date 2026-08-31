@@ -622,5 +622,7 @@ func dumpOperand(b *strings.Builder, o Operand) {
 		b.WriteString("null")
 	case OperandExcluded:
 		fmt.Fprintf(b, "excluded.%q", o.Text)
+	case OperandExpression:
+		b.WriteString("<expression>")
 	}
 }
