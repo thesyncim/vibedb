@@ -155,6 +155,17 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			byteview.Bytes(prepared.table),
 		)
 		if replicated {
+			if insert := prepared.statement.Insert; prepared.statement.Kind == sqlast.KindInsert && insert != nil &&
+				insert.HasConflictAction() {
+				unsupported := sqlast.NewFeatureNotSupportedError(
+					queries[index].SQL,
+					replicatedSQLConflictActionPosition(insert),
+					"RF3 ON CONFLICT requires branch-aware replicated writes",
+				)
+				return nil, true, errors.Join(
+					ErrReplicatedSQLTransactionUnsupported, unsupported,
+				)
+			}
 			if err := rejectComputedUpdateAssignments(
 				queries[index].SQL, &prepared.statement,
 				"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for RF3 writes",
@@ -501,6 +512,16 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 		participants[index] = participant
 	}
 	return participants, true, nil
+}
+
+func replicatedSQLConflictActionPosition(insert *sqlast.InsertStmt) int {
+	if insert != nil && insert.OnConflictUpdate != nil {
+		return insert.OnConflictUpdate.Pos
+	}
+	if insert != nil {
+		return insert.OnConflictPos
+	}
+	return 0
 }
 
 func replicatedSQLMutationInputCount(
