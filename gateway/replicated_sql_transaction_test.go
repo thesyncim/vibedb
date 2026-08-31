@@ -719,6 +719,75 @@ func TestReplicatedSQLComputedUpdateRejectsBeforeCurrentRowRead(t *testing.T) {
 	}
 }
 
+func TestReplicatedSQLConflictActionsRejectBeforeBindOrCurrentRowRead(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     string
+		insert     *sqlast.InsertStmt
+		wantMarker string
+	}{
+		{
+			name:       "computed do update",
+			source:     `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = value || EXCLUDED.value`,
+			insert:     &sqlast.InsertStmt{Table: "messages", OnConflictUpdate: &sqlast.InsertConflictUpdate{}},
+			wantMarker: "UPDATE",
+		},
+		{
+			name:       "do nothing",
+			source:     "INSERT INTO messages (id) VALUES (?) ON /* authored */\nCONFLICT DO NOTHING",
+			insert:     &sqlast.InsertStmt{Table: "messages", OnConflictDoNothing: true},
+			wantMarker: "ON CONFLICT",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wantPosition := strings.Index(test.source, test.wantMarker)
+			if wantPosition < 0 && test.insert.OnConflictDoNothing {
+				wantPosition = strings.Index(test.source, "ON /* authored */")
+				test.insert.OnConflictPos = wantPosition
+			}
+			if test.insert.OnConflictUpdate != nil {
+				test.insert.OnConflictUpdate.Pos = wantPosition
+			}
+			snapshot, executor := replicatedSQLTransactionFixture(t, true)
+			client, data := attachReplicatedSQLIndexedReadClient(
+				t, snapshot, []byte(`{"id":"message-1","value":"old"}`),
+			)
+
+			// Seed the RF3 lowerer with the already-prepared shape so this
+			// defense remains independently testable while the ordinary planner
+			// also fences conflict actions. The intentionally incomplete plan
+			// would fail BindWrite, proving the RF3 check runs first.
+			_, hash := snapshot.cachedPreparedPlan(test.source)
+			snapshot.cachePreparedPlan(test.source, hash, &PreparedPlan{
+				statement: sqlast.Statement{Kind: sqlast.KindInsert, Insert: test.insert},
+				table:     test.insert.Table,
+			})
+
+			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+				t.Context(), snapshot, []Query{{SQL: test.source}},
+				executor.profileFor(ClassInteractive), data,
+			)
+			var unsupported *sqlast.FeatureNotSupportedError
+			if !errors.As(err, &unsupported) || unsupported.Pos != wantPosition {
+				t.Fatalf(
+					"plan handled=%v error=%T %v, want positioned FeatureNotSupported at %d",
+					handled, err, err, wantPosition,
+				)
+			}
+			if !errors.Is(err, ErrReplicatedSQLTransactionUnsupported) {
+				t.Fatalf("plan error %v does not retain ErrReplicatedSQLTransactionUnsupported", err)
+			}
+			if !handled || len(participants) != 0 || client.reads != 0 {
+				t.Fatalf(
+					"plan participants=%d handled=%v current-row reads=%d, want 0,true,0",
+					len(participants), handled, client.reads,
+				)
+			}
+		})
+	}
+}
+
 func TestReplicatedSQLDeclaredColumnUpdateMissingRetainsDurableNoOp(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true)
 	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, nil)

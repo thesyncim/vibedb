@@ -63,6 +63,37 @@ func materializeColumnAssignments(
 	)
 }
 
+// materializeConflictColumnAssignments evaluates the computed half of an
+// INSERT ... ON CONFLICT DO UPDATE assignment list over one immutable pair of
+// row images, then feeds those values through the same byte-preserving patcher
+// as direct EXCLUDED assignments. The current and candidate documents remain
+// distinct namespaces during evaluation and every right-hand side is collected
+// before the first target column is changed.
+func materializeConflictColumnAssignments(
+	statement *query.DMLStatement,
+	exec *query.Exec,
+	document []byte,
+	excluded []byte,
+	assignments []sqlast.UpdateAssignment,
+	args []any,
+	maxBytes int,
+) ([]byte, error) {
+	if statement == nil || !statement.HasConflictUpdateExpressions() {
+		return ApplyColumnAssignmentsWithExcluded(
+			document, excluded, assignments, args, maxBytes,
+		)
+	}
+	cursor, err := statement.EvaluateConflictUpdateExpressions(
+		exec, document, excluded, args, maxBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return applyColumnAssignments(
+		document, excluded, assignments, args, &cursor, maxBytes,
+	)
+}
+
 // ApplyColumnAssignmentsWithExcluded materializes the conflict branch of an
 // INSERT ... ON CONFLICT DO UPDATE. Ordinary operands are bound exactly as they
 // are for UPDATE; OperandExcluded copies the effective top-level value from
@@ -514,7 +545,115 @@ func validateUpsertColumnAssignments(
 			Pos:      value.Pos,
 		}
 	}
+	for i := range assignments {
+		if err := validateUpsertScalarColumns(
+			table, meta, assignments[i].Expr,
+		); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// validateUpsertScalarColumns rechecks both row namespaces against the live
+// table incarnation. Query preparation deliberately has no SQL catalog, so the
+// driver must repeat this at execution as well as prepare time to keep a stale
+// prepared statement from reading a column that disappeared with a recreated
+// table. Conflict expressions are intentionally flat SQL-column expressions:
+// source zero is the current row and source one is EXCLUDED.
+func validateUpsertScalarColumns(
+	table string,
+	meta *tableMeta,
+	expression *sqlast.ScalarExpr,
+) error {
+	if expression == nil {
+		return nil
+	}
+	if err := validateUpsertScalarPath(table, meta, expression.Path); err != nil {
+		return err
+	}
+	if err := validateUpsertScalarColumns(table, meta, expression.Left); err != nil {
+		return err
+	}
+	if err := validateUpsertScalarColumns(table, meta, expression.Right); err != nil {
+		return err
+	}
+	for i := range expression.Whens {
+		when := &expression.Whens[i]
+		if err := validateUpsertPredicateColumns(table, meta, when.Predicate); err != nil {
+			return err
+		}
+		if err := validateUpsertScalarColumns(table, meta, when.Match); err != nil {
+			return err
+		}
+		if err := validateUpsertScalarColumns(table, meta, when.Result); err != nil {
+			return err
+		}
+	}
+	return validateUpsertScalarColumns(table, meta, expression.Else)
+}
+
+func validateUpsertPredicateColumns(
+	table string,
+	meta *tableMeta,
+	expression *sqlast.Expr,
+) error {
+	if expression == nil {
+		return nil
+	}
+	if err := validateUpsertScalarPath(table, meta, expression.Path); err != nil {
+		return err
+	}
+	if err := validateUpsertScalarPath(table, meta, expression.RightPath); err != nil {
+		return err
+	}
+	if err := validateUpsertScalarColumns(table, meta, expression.ScalarLeft); err != nil {
+		return err
+	}
+	if err := validateUpsertScalarColumns(table, meta, expression.ScalarRight); err != nil {
+		return err
+	}
+	for i := range expression.Kids {
+		if err := validateUpsertPredicateColumns(table, meta, expression.Kids[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateUpsertScalarPath(
+	table string,
+	meta *tableMeta,
+	path *sqlast.PathExpr,
+) error {
+	if path == nil {
+		return nil
+	}
+	relation := table
+	if path.Source == 1 {
+		relation = "EXCLUDED"
+	} else if path.Source != 0 {
+		return fmt.Errorf(
+			"vibedb: ON CONFLICT expression path at byte %d has invalid source %d",
+			path.Pos, path.Source,
+		)
+	}
+	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+		return &query.RelationColumnError{
+			Relation: relation,
+			Column:   path.Spec(),
+			Pos:      path.Pos,
+		}
+	}
+	column := path.Segments[0].Key
+	if declaredTopLevelColumn(meta, column) {
+		return nil
+	}
+	return &query.RelationColumnError{
+		Relation: relation,
+		Column:   column,
+		Pos:      path.Pos,
+	}
 }
 
 // validateDeclaredColumnAssignments resolves UPDATE's deliberately flat SET

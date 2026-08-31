@@ -277,7 +277,9 @@ func (p *Parser) parseInsert() error {
 		p.rows = rows
 		p.ins.Rows = rows
 	}
-	if p.acceptKeyword(kwOn) {
+	if p.atKeyword(kwOn) {
+		p.ins.OnConflictPos = p.tok.pos
+		p.advance()
 		if err := p.expectKeyword(kwConflict, "CONFLICT after ON"); err != nil {
 			return err
 		}
@@ -322,7 +324,8 @@ func (p *Parser) parseInsert() error {
 // conflict action. The conflict target is implicit because the document-derived
 // primary key is this SQL surface's only unique key. A conflict action can
 // either take the complete candidate document or patch distinct declared
-// top-level columns with constants or candidate-column values.
+// top-level columns with direct values or deterministic expressions over the
+// explicitly qualified current-row and EXCLUDED namespaces.
 func (p *Parser) parseInsertConflictUpdate() error {
 	updatePos := p.tok.pos
 	p.advance() // UPDATE
@@ -404,6 +407,13 @@ func (p *Parser) parseConflictAssignment() (
 					"a whole-document conflict update must be written as SET \"$doc\" = EXCLUDED.\"$doc\"",
 				)
 		}
+		if p.ins.Table == "excluded" {
+			return Operand{}, false, UpdateAssignment{},
+				newFeatureNotSupportedError(
+					p.lx.src, p.tok.pos,
+					"ON CONFLICT cannot distinguish the target table named excluded from the EXCLUDED pseudo-relation until INSERT target aliases are supported",
+				)
+		}
 		value, valueErr := p.parseExcludedOperand(true)
 		if valueErr != nil {
 			return Operand{}, false, UpdateAssignment{}, valueErr
@@ -434,29 +444,148 @@ func (p *Parser) parseConflictAssignment() (
 	}
 	p.advance()
 
-	var value Operand
-	switch {
-	case p.atExcludedRelation():
-		value, err = p.parseExcludedOperand(false)
-	case p.tok.kind == tokIdent && p.tok.kw == kwNull:
-		value = Operand{Kind: OperandNull, Pos: p.tok.pos}
-		p.advance()
-	case p.tok.kind == tokIdent &&
-		p.tok.kw != kwTrue && p.tok.kw != kwFalse,
-		p.tok.kind == tokQuotedIdent:
-		err = newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"ON CONFLICT assignments accept a scalar literal, '?', NULL, or EXCLUDED.<top-level-column>; current-row and expression values are not supported",
-		)
-	default:
-		value, err = p.parseOperand()
-	}
+	pendingBase := len(p.pending)
+	expr, err := p.parseScalarExpression(scalarUpdate)
 	if err != nil {
+		return Operand{}, false, UpdateAssignment{}, p.normalizeUpdateScalarError(err)
+	}
+	if err := p.validateUpdateScalarExpression(expr); err != nil {
 		return Operand{}, false, UpdateAssignment{}, err
 	}
-	return Operand{}, false, UpdateAssignment{
-		Column: column, Value: value, Pos: path.Pos,
-	}, nil
+	if err := p.resolveConflictScalarPaths(pendingBase, p.ins.Table); err != nil {
+		return Operand{}, false, UpdateAssignment{}, err
+	}
+	directPathPos := expr.Pos
+	if expr.Kind == ScalarPath && expr.Path != nil {
+		for i := pendingBase; i < len(p.pending); i++ {
+			entry := &p.pending[i]
+			if entry.path == expr.Path && entry.qualifiedFieldPos != 0 {
+				directPathPos = entry.qualifiedFieldPos - 1
+				break
+			}
+		}
+	}
+	p.pending = p.pending[:pendingBase]
+
+	assignment = UpdateAssignment{Column: column, Pos: path.Pos}
+	if expr.Kind == ScalarPath && expr.Path != nil &&
+		expr.Path.Source == 1 && len(expr.Path.Segments) == 1 &&
+		!expr.Path.Segments[0].IsIndex {
+		assignment.Value = Operand{
+			Kind: OperandExcluded,
+			Text: expr.Path.Segments[0].Key,
+			Pos:  directPathPos,
+		}
+		return Operand{}, false, assignment, nil
+	}
+	switch expr.Kind {
+	case ScalarLiteral:
+		assignment.Value = expr.Value
+	case ScalarNull:
+		assignment.Value = Operand{Kind: OperandNull, Pos: expr.Pos}
+	default:
+		if value, ok := directTypedConstantOperand(expr); ok {
+			assignment.Value = value
+		} else {
+			assignment.Value = Operand{Kind: OperandExpression, Pos: expr.Pos}
+			assignment.Expr = expr
+		}
+	}
+	return Operand{}, false, assignment, nil
+}
+
+// resolveConflictScalarPaths binds the two row namespaces visible to a
+// conflict action. PostgreSQL treats a bare RHS column as ambiguous because
+// both the target row and EXCLUDED expose the target table's columns. Current
+// values therefore require target-table qualification; candidate values use
+// EXCLUDED. Paths retain that distinction as virtual Source 0 and Source 1
+// until query lowers them into its private two-row envelope.
+func (p *Parser) resolveConflictScalarPaths(base int, table string) error {
+	for i := base; i < len(p.pending); i++ {
+		entry := &p.pending[i]
+		path := entry.path
+		if path == nil || len(path.Segments) == 0 {
+			if entry.documentRoot {
+				return newFeatureNotSupportedError(
+					p.lx.src, path.Pos,
+					"ON CONFLICT assignment expressions cannot read the reserved whole-document value",
+				)
+			}
+			return p.errHere("ON CONFLICT assignment contains an empty path")
+		}
+		if entry.documentRoot {
+			pos := path.Pos
+			if entry.qualifiedFieldPos != 0 {
+				pos = entry.qualifiedFieldPos - 1
+			}
+			return newFeatureNotSupportedError(
+				p.lx.src, pos,
+				"ON CONFLICT assignment expressions cannot read the reserved whole-document value",
+			)
+		}
+		if !entry.eligible && len(path.Segments) == 1 &&
+			path.Segments[0].Key == "$key" {
+			return newFeatureNotSupportedError(
+				p.lx.src, path.Pos,
+				"ON CONFLICT assignment expressions cannot read reserved \"$doc\" or \"$key\" values",
+			)
+		}
+		if !entry.eligible {
+			return newAmbiguousColumnError(
+				p.lx.src, path.Pos, path.Spec(), table,
+			)
+		}
+
+		head := path.Segments[0].Key
+		if table == "excluded" && ((!entry.quoted && equalFoldASCII(head, "excluded")) ||
+			(entry.quoted && head == "excluded")) {
+			return newFeatureNotSupportedError(
+				p.lx.src, path.Pos,
+				"ON CONFLICT cannot distinguish the target table named excluded from the EXCLUDED pseudo-relation until INSERT target aliases are supported",
+			)
+		}
+		switch {
+		case !entry.quoted && equalFoldASCII(head, "excluded"),
+			entry.quoted && head == "excluded":
+			path.Source = 1
+		case head == table:
+			path.Source = 0
+		default:
+			if equalFoldASCII(head, "excluded") {
+				return newFeatureNotSupportedError(
+					p.lx.src, path.Pos,
+					"the EXCLUDED pseudo-relation is lowercase when quoted; use EXCLUDED.column or \"excluded\".column",
+				)
+			}
+			return newFeatureNotSupportedError(
+				p.lx.src, path.Pos,
+				"ON CONFLICT assignment expressions may read only the explicitly qualified INSERT target row or EXCLUDED",
+			)
+		}
+		if len(path.Segments) != 2 || path.Segments[1].IsIndex {
+			pos := path.Pos
+			if entry.nestedPos != 0 {
+				pos = entry.nestedPos - 1
+			}
+			return newFeatureNotSupportedError(
+				p.lx.src, pos,
+				"ON CONFLICT assignment expressions must read one declared top-level column from the target row or EXCLUDED; nested paths are not supported",
+			)
+		}
+		column := path.Segments[1].Key
+		if column == DocumentColumn || column == "$key" {
+			pos := path.Pos
+			if entry.qualifiedFieldPos != 0 {
+				pos = entry.qualifiedFieldPos - 1
+			}
+			return newFeatureNotSupportedError(
+				p.lx.src, pos,
+				"ON CONFLICT assignment expressions cannot read reserved \"$doc\" or \"$key\" values",
+			)
+		}
+		path.Segments = path.Segments[1:]
+	}
+	return nil
 }
 
 func (p *Parser) atExcludedRelation() bool {

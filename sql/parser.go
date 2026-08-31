@@ -302,6 +302,16 @@ type pendingPath struct {
 	eligible bool // the head identifier was immediately followed by '.'
 	star     bool // the path ended in '*' and names the whole document
 	document bool // SELECT "$doc" spelling, preserving its default output name
+	// documentRoot records that the path began at "$doc" or
+	// range."$doc", even when later accessors make it a field path.
+	documentRoot bool
+	quoted       bool // the leading identifier was quoted and remains case-sensitive
+	// qualifiedFieldPos is the first field token after a syntactic range
+	// qualifier, plus one. Zero means there is no qualified field token.
+	qualifiedFieldPos int
+	// nestedPos is the first accessor after a possible range-variable and one
+	// top-level field, plus one. Zero means the path has no such accessor.
+	nestedPos int
 }
 
 // Parse parses one SELECT statement into dst, reusing p's storage. See
@@ -2952,6 +2962,8 @@ func (p *Parser) continuePath(head token, allowStar bool) (*PathExpr, error) {
 	eligible := p.tok.kind == tokDot
 	star := false
 	document := false
+	qualifiedFieldPos := -1
+	nestedPos := -1
 	if head.kind == tokQuotedIdent && !head.esc && head.text == DocumentColumn {
 		segs = segs[:0]
 		eligible, document = false, true
@@ -2961,8 +2973,12 @@ loop:
 	for {
 		switch p.tok.kind {
 		case tokDot:
+			if nestedPos < 0 && len(segs) >= 2 {
+				nestedPos = p.tok.pos
+			}
 			p.advance()
 			if len(segs) == 1 && eligible && !document && p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == DocumentColumn {
+				qualifiedFieldPos = p.tok.pos
 				p.advance()
 				star, document = true, true
 				continue
@@ -2987,9 +3003,15 @@ loop:
 			default:
 				return nil, p.errHere("expected a field name after '.'")
 			}
+			if qualifiedFieldPos < 0 && len(segs) == 1 && eligible {
+				qualifiedFieldPos = p.tok.pos
+			}
 			segs = append(segs, Segment{Key: p.internToken(p.tok)})
 			p.advance()
 		case tokJSONArrow:
+			if nestedPos < 0 && len(segs) >= 2 {
+				nestedPos = p.tok.pos
+			}
 			p.advance()
 			seg, err := p.parseJSONAccessor()
 			if err != nil {
@@ -2997,6 +3019,9 @@ loop:
 			}
 			segs = append(segs, seg)
 		case tokLBracket:
+			if nestedPos < 0 && len(segs) >= 2 {
+				nestedPos = p.tok.pos
+			}
 			p.advance()
 			seg, err := p.parseSubscript()
 			if err != nil {
@@ -3022,6 +3047,14 @@ loop:
 	p.segScratch = segs
 	path := p.newPath(head.pos, segs, eligible, star)
 	p.pending[len(p.pending)-1].document = document && ((!eligible && len(segs) == 0) || (eligible && len(segs) == 1))
+	p.pending[len(p.pending)-1].documentRoot = document
+	p.pending[len(p.pending)-1].quoted = head.kind == tokQuotedIdent
+	if qualifiedFieldPos >= 0 {
+		p.pending[len(p.pending)-1].qualifiedFieldPos = qualifiedFieldPos + 1
+	}
+	if nestedPos >= 0 {
+		p.pending[len(p.pending)-1].nestedPos = nestedPos + 1
+	}
 	return path, nil
 }
 

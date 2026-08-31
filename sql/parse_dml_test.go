@@ -317,7 +317,7 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"nested excluded source", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.profile.name`, -1, "nested paths"},
 		{"reserved excluded document", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$doc"`, -1, "reserved"},
 		{"reserved excluded key", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$key"`, -1, "reserved"},
-		{"current row conflict value", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = name`, -1, "current-row"},
+		{"ambiguous conflict value", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = name`, -1, "ambiguous"},
 		{"quoted excluded relation", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = "EXCLUDED".name`, -1, "EXCLUDED"},
 		{"duplicate conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, name = 'again'`, -1, "more than once"},
 		{"mixed whole conflict update", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc", name = EXCLUDED.name`, -1, "cannot be combined"},
@@ -340,7 +340,7 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 }
 
 func TestInsertConflictUpdateASTAndParameterAccounting(t *testing.T) {
-	statement, err := ParseStatement(`
+	const source = `
 		INSERT INTO employees (id, Name, note) VALUES (?, ?, ?)
 		ON CONFLICT DO UPDATE SET
 			Name = eXcLuDeD.Name,
@@ -349,7 +349,8 @@ func TestInsertConflictUpdateASTAndParameterAccounting(t *testing.T) {
 			score = 7,
 			label = 'ready',
 			optional = NULL
-		RETURNING id`)
+		RETURNING id`
+	statement, err := ParseStatement(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,6 +358,9 @@ func TestInsertConflictUpdateASTAndParameterAccounting(t *testing.T) {
 	if insert == nil || insert.OnConflictDoNothing ||
 		insert.OnConflictUpdate == nil || !insert.HasConflictAction() {
 		t.Fatalf("conflict action = %#v", insert)
+	}
+	if want := strings.Index(source, "ON CONFLICT"); insert.OnConflictPos != want {
+		t.Fatalf("OnConflictPos = %d, want %d", insert.OnConflictPos, want)
 	}
 	update := insert.OnConflictUpdate
 	if update.WholeDocument() || len(update.Assignments) != 6 {
@@ -373,11 +377,24 @@ func TestInsertConflictUpdateASTAndParameterAccounting(t *testing.T) {
 		}
 	}
 	if update.Assignments[0].Column != "Name" ||
-		update.Assignments[0].Value.Text != "Name" {
+		update.Assignments[0].Value.Text != "Name" ||
+		update.Assignments[0].Value.Pos != strings.Index(source, "Name,\n") {
 		t.Fatalf("case-sensitive EXCLUDED assignment = %#v", update.Assignments[0])
 	}
 	if statement.Params() != 4 {
 		t.Fatalf("Params = %d, want 4", statement.Params())
+	}
+
+	doNothingSource := `INSERT INTO employees VALUES (?) ON /* authored */ CONFLICT DO NOTHING`
+	doNothing, err := ParseStatement(doNothingSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.Index(doNothingSource, "ON /* authored */"); doNothing.Insert.OnConflictPos != want {
+		t.Fatalf(
+			"comment-separated DO NOTHING OnConflictPos = %d, want %d",
+			doNothing.Insert.OnConflictPos, want,
+		)
 	}
 
 	whole, err := ParseStatement(
@@ -412,6 +429,22 @@ func TestInsertConflictUpdateUnsupportedFormsArePositioned(t *testing.T) {
 			`.name`,
 		},
 		{
+			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.profile ->> 'name'`,
+			`->>`,
+		},
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED."$doc".name`,
+			`"$doc"`,
+		},
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED."$doc" -> 'name'`,
+			`"$doc"`,
+		},
+		{
+			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED."$doc"['name']`,
+			`"$doc"`,
+		},
+		{
 			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value WHERE value = 'old'`,
 			`WHERE`,
 		},
@@ -428,6 +461,17 @@ func TestInsertConflictUpdateUnsupportedFormsArePositioned(t *testing.T) {
 			t.Fatalf("ParseStatement(%q) position = %d, want %d",
 				test.sql, unsupported.Pos, want)
 		}
+	}
+
+	const excludedCollision = `INSERT INTO excluded VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`
+	_, err := ParseStatement(excludedCollision)
+	var unsupported *FeatureNotSupportedError
+	if !errors.As(err, &unsupported) ||
+		unsupported.Pos != strings.LastIndex(excludedCollision, "EXCLUDED") {
+		t.Fatalf(
+			"excluded target collision = %T %+v, want positioned FeatureNotSupported",
+			err, unsupported,
+		)
 	}
 }
 
