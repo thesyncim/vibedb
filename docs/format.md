@@ -113,6 +113,12 @@ current slots select the active authenticated generation. Ready batches are
 idempotent by `(node incarnation, Ready ID)` and different bytes for the same
 identity are rejected.
 
+For a nonempty Ready, the append-only record completes a platform ordering
+barrier before the alternate current slot is written. A final `File.Sync` makes
+that selected slot the acknowledgement boundary. A failure before the slot is
+touched is definite; a later failure is outcome-unknown and an exact retry
+settles the attempted slot without blindly rewriting it.
+
 Ordinary Raft snapshots are not stored as `MsgSnap` records. Certified snapshot
 artifacts are staged non-serving, verified, checkpointed, and activated as a new
 immutable WAL base through restart-settled publication steps.

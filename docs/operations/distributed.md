@@ -80,14 +80,23 @@ owner; the consensus core does not sample wall-clock time or run an autonomous t
 Ready processing is an ordered durability protocol:
 
 1. Capture one Ready and assign its `(node incarnation, Ready ID)`.
-2. Persist entries and hard state in their required order, then synchronize the WAL.
-3. Release outbound messages. A failed callback may cause the same message to be sent again.
-4. Apply committed entries serially and atomically publish state, membership, and results.
-5. Release eligible read barriers and advance the Raft node.
+2. Prove the named WAL, append the authenticated Ready record, and complete the
+   platform record-ordering barrier before any selector can name it. Linux uses
+   `fdatasync`; Darwin uses `F_BARRIERFSYNC` with `File.Sync` fallback; other
+   platforms use `File.Sync`.
+3. Prove the namespace again, write the alternate authenticated current slot,
+   complete the final `File.Sync`, and re-prove the named file. This final sync
+   is the power-safe acknowledgement boundary for the selected image.
+4. Release outbound messages. A failed callback may cause the same message to be sent again.
+5. Apply committed entries serially and atomically publish state, membership, and results.
+6. Release eligible read barriers and advance the Raft node.
 
 The same Ready ID may be retried only with the exact same bytes. Persistence failure is
-retryable while that captured batch remains owned. Apply failure is terminal for the runtime:
-publication may be ambiguous, so restart and recovery must reconcile WAL and applied state.
+retryable while that captured batch remains owned. A record/barrier failure is definite, but a
+failure after the current-slot write begins is outcome-unknown; exact retry reads the slot,
+avoids rewriting an already exact image, and completes the final sync. Apply failure is terminal
+for the runtime: publication may be ambiguous, so restart and recovery must reconcile WAL and
+applied state.
 
 ### Read modes
 

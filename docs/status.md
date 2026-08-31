@@ -8,7 +8,7 @@
 > and use only disposable or independently recoverable data.
 
 Runtime behavior for this rewrite was audited from `main` at commit
-`1488914280f61ac7cf4350ce1e183ca52bd28ce9`. The documentation changes that
+`4ad895ab750bcdc0f9277a227325c1c77cbf87f9`. The documentation changes that
 follow it do not turn that snapshot into a roadmap or guarantee about a later
 commit.
 
@@ -74,7 +74,8 @@ the complete claim, not a blanket green-build assertion.
 | --- | --- | --- |
 | `go test -p=1 -timeout=25m ./...` | **Incomplete** | An earlier run reached `store/durable` and was externally terminated; no complete serial root run finished after the final `main` merge |
 | `go build ./...`; `go vet ./...` | Passed after the final merge | Root module at the audited commit above |
-| Focused packages | Passed after the final merge | `gateway`, `internal/replicatedstate`, `sql/driver`, both gateway/shard commands, `shardservice`, `sql`, `query`, `pgwire`, conformance, feature-state, build-gate, unsafe-audit, and service-authorization suites |
+| Final-main changed packages | Passed after the final merge | `internal/raftstore` and `internal/raftmember`; the final upstream delta changed only Raft-store implementation and tests |
+| Focused packages | Passed immediately before that final storage-only merge | `gateway`, `internal/replicatedstate`, `sql/driver`, both gateway/shard commands, `shardservice`, `sql`, `query`, `pgwire`, conformance, feature-state, build-gate, unsafe-audit, and service-authorization suites |
 | Other focused packages and integrations | Passed during the audit | Core storage, Raft, benchmark tooling, and hermetic client modules; these do not replace the incomplete root run |
 | `go test ./store/durable -timeout=30m` | **Timed out** | `TestFileStorePointReplayDoesNotExhaustRetirementCapacity` was active; that test passed alone in 51 seconds, but the package has no complete result |
 | PostgreSQL 18.6 upstream corpus | Not run | The approval set remains empty; see [PostgreSQL compatibility status](#postgresql-compatibility-status) |

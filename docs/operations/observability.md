@@ -99,7 +99,7 @@ Addition saturates at `uint64` maximum and sets `overflow=true`.
 | Area | Fields |
 | --- | --- |
 | Checkpoint | `checkpoint_applied`, `checkpoints`, `physical_checkpoints`, `checkpoint_barrier_syncs` |
-| WAL | `wal_live_bytes`, `wal_entries`, `wal_syncs` |
+| WAL | `wal_live_bytes`, `wal_entries`, `wal_syncs` (completed durability phases, including the Ready record barrier and final current-slot sync) |
 | Live backup | `backup_requests`, `backup_faults`, `backup_logical_bytes`, `backup_scan_bytes` |
 | Snapshot transfer | `snapshot_transfer_chunks`, `snapshot_transfer_bytes`, `snapshot_resident_bytes` |
 | Replica action | `replica_action_requests`, `replica_action_completions`, `replica_action_faults` |
@@ -160,9 +160,10 @@ The current surface does not expose:
 - durable counters across restart.
 
 In particular, `proposal_bytes` is not total network traffic,
-`snapshot_transfer_bytes` is not all cluster traffic, `wal_syncs` is not a
-device-write count, and a completion count is not a duration. Build alerts only
-from semantics the source actually exports.
+`snapshot_transfer_bytes` is not all cluster traffic, and `wal_syncs` counts
+durability phases—not `File.Sync` calls, device writes, or media flushes. A
+normal nonempty Ready contributes two phases. A completion count is not a
+duration. Build alerts only from semantics the source actually exports.
 
 Collection failure increments explicit fault counters and leaves the last cached
 sample; it never changes routing, membership, cleanup, acknowledgement, split,
