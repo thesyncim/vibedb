@@ -1265,8 +1265,8 @@ func (store *Store) Persist(batch raftmodel.PersistBatch) error {
 	if err := writeExactAt(store.options.ops, store.file, record, store.current.walEnd); err != nil {
 		return persistenceError("write Ready record", false, err)
 	}
-	if err := store.options.ops.sync(store.file); err != nil {
-		return persistenceError("sync Ready record", false, err)
+	if err := store.options.ops.recordBarrier(store.file); err != nil {
+		return persistenceError("order Ready record", false, err)
 	}
 	store.syncCount++
 	next := store.current
@@ -1301,14 +1301,23 @@ func (store *Store) settlePendingLocked() error {
 		store.poisonNamespace(err, unknown)
 		return persistenceError("prove WAL before current slot", unknown, err)
 	}
-	existing := make([]byte, CurrentSlotBytes)
-	if _, err := store.file.ReadAt(existing, pending.currentOffset); err != nil {
-		return persistenceError("read current slot during retry settlement", pending.currentAttempted, err)
-	}
-	pending.currentAttempted = true
-	if !bytes.Equal(existing, pending.currentBytes) {
+	if !pending.currentAttempted {
+		// A newly constructed pending mutation has never touched the inactive
+		// slot. Write it directly; only an outcome-unknown retry needs to inspect
+		// the slot and avoid repeating an already completed write.
+		pending.currentAttempted = true
 		if err := writeExactAt(store.options.ops, store.file, pending.currentBytes, pending.currentOffset); err != nil {
 			return persistenceError("write current slot", true, err)
+		}
+	} else {
+		existing := make([]byte, CurrentSlotBytes)
+		if _, err := store.options.ops.readAt(store.file, existing, pending.currentOffset); err != nil {
+			return persistenceError("read current slot during retry settlement", true, err)
+		}
+		if !bytes.Equal(existing, pending.currentBytes) {
+			if err := writeExactAt(store.options.ops, store.file, pending.currentBytes, pending.currentOffset); err != nil {
+				return persistenceError("write current slot", true, err)
+			}
 		}
 	}
 	if err := store.options.ops.sync(store.file); err != nil {
@@ -1383,6 +1392,9 @@ func (store *Store) poisonNamespace(err error, unknown bool) {
 }
 
 func (store *Store) proveCurrentNamespace() error {
+	if store.options.ops.observeNamespaceProof != nil {
+		store.options.ops.observeNamespaceProof()
+	}
 	return proveNamedFile(store.root, store.parentPath, store.directoryInfo, store.base, store.file, store.options.maxFileBytes)
 }
 

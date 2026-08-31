@@ -157,11 +157,14 @@ type normalizedOptions struct {
 }
 
 type fileOps struct {
-	preallocate     func(*os.File, int64) error
-	ensureAllocated func(*os.File, int64) error
-	writeAt         func(*os.File, []byte, int64) (int, error)
-	sync            func(*os.File) error
-	syncDirectory   func(*os.Root) error
+	preallocate           func(*os.File, int64) error
+	ensureAllocated       func(*os.File, int64) error
+	readAt                func(*os.File, []byte, int64) (int, error)
+	writeAt               func(*os.File, []byte, int64) (int, error)
+	recordBarrier         func(*os.File) error
+	sync                  func(*os.File) error
+	syncDirectory         func(*os.Root) error
+	observeNamespaceProof func()
 }
 
 func normalizeOptions(options Options) (normalizedOptions, error) {
@@ -201,6 +204,17 @@ func normalizeOptions(options Options) (normalizedOptions, error) {
 	}
 	if result.ops.writeAt == nil {
 		result.ops.writeAt = func(file *os.File, data []byte, offset int64) (int, error) { return file.WriteAt(data, offset) }
+	}
+	if result.ops.readAt == nil {
+		result.ops.readAt = func(file *os.File, data []byte, offset int64) (int, error) { return file.ReadAt(data, offset) }
+	}
+	if result.ops.recordBarrier == nil {
+		// Tests which supplied the historical all-phase Sync seam retain that
+		// behavior unless they explicitly distinguish the record barrier.
+		result.ops.recordBarrier = result.ops.sync
+		if result.ops.recordBarrier == nil {
+			result.ops.recordBarrier = syncReadyRecord
+		}
 	}
 	if result.ops.sync == nil {
 		result.ops.sync = func(file *os.File) error { return file.Sync() }

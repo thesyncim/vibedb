@@ -414,6 +414,41 @@ func TestOpenCrashCutsSelectOnlyAuthenticatedCurrentImage(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The record-ordering barrier is what makes a fully authenticated selector
+	// safe. If a selector can reach storage ahead of any incomplete form of its
+	// record, recovery must fail closed rather than silently roll back.
+	recordCuts := []int{0, 1, recordPrefixBytes - 1, recordPrefixBytes, len(record) - 1}
+	for _, prefix := range recordCuts {
+		file, err = os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blank := make([]byte, len(record))
+		if _, err = file.WriteAt(blank, recordOffset); err == nil && prefix != 0 {
+			_, err = file.WriteAt(record[:prefix], recordOffset)
+		}
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			t.Fatalf("install record cut %d: %v", prefix, err)
+		}
+		if _, err = Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch, testKey(), options); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("selected record cut %d rolled back instead of failing closed: %v", prefix, err)
+		}
+	}
+	file, err = os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt(record, recordOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	file, err = os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
