@@ -171,6 +171,12 @@ func (lane *ExecutionLane) SnapshotState(key raftmember.GroupKey) (replicatedsta
 	}
 	return lane.set.SnapshotState(key)
 }
+func (lane *ExecutionLane) SnapshotAuthorizationFence(key raftmember.GroupKey) (replicatedstate.SnapshotFence, error) {
+	if err := lane.accepts(key); err != nil {
+		return replicatedstate.SnapshotFence{}, err
+	}
+	return lane.set.SnapshotAuthorizationFence(key)
+}
 func (lane *ExecutionLane) SnapshotBaseCertificate(key raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error) {
 	if err := lane.accepts(key); err != nil {
 		return replicatedstate.SnapshotBaseCertificate{}, err
@@ -530,6 +536,27 @@ func (set *ExecutionLanes) SnapshotState(key raftmember.GroupKey) (replicatedsta
 		return replicatedstate.State{}, ErrHostClosed
 	}
 	result, err := lane.host.SnapshotState(key)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return result, err
+}
+
+func (set *ExecutionLanes) SnapshotAuthorizationFence(
+	key raftmember.GroupKey,
+) (replicatedstate.SnapshotFence, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return replicatedstate.SnapshotFence{}, err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return replicatedstate.SnapshotFence{}, ErrHostClosed
+	}
+	result, err := lane.host.SnapshotAuthorizationFence(key)
 	if err != nil {
 		lane.counters.rejected++
 	}

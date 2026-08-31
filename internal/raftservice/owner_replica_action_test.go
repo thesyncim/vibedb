@@ -13,9 +13,12 @@ import (
 
 type retirementHost struct {
 	ownerHost
-	state   replicatedstate.State
-	status  raftmember.RuntimeStatus
-	removed bool
+	state              replicatedstate.State
+	status             raftmember.RuntimeStatus
+	removed            bool
+	snapshotCalls      int
+	authorizationCalls int
+	manifestDigest     [32]byte
 }
 
 func (host *retirementHost) Publication(raftmember.GroupKey) (raftmodel.Publication, error) {
@@ -23,7 +26,22 @@ func (host *retirementHost) Publication(raftmember.GroupKey) (raftmodel.Publicat
 }
 
 func (host *retirementHost) SnapshotState(raftmember.GroupKey) (replicatedstate.State, error) {
+	host.snapshotCalls++
 	return host.state, nil
+}
+
+func (host *retirementHost) SnapshotAuthorizationFence(raftmember.GroupKey) (replicatedstate.SnapshotFence, error) {
+	host.authorizationCalls++
+	return replicatedstate.SnapshotFence{
+		Binding:                host.state.Binding,
+		RelationManifestDigest: host.manifestDigest,
+		ReplicaSetVersion:      host.state.ReplicaSetVersion,
+		Applied:                host.state.Applied,
+		LastTerm:               host.state.LastTerm,
+		LastEntryDigest:        host.state.LastEntryDigest,
+		DataChainDigest:        host.state.DataChainDigest,
+		SnapshotBaseDigest:     host.state.SnapshotBaseDigest,
+	}, nil
 }
 
 func (host *retirementHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
@@ -111,7 +129,7 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	// durable cut, not a command-fence cache refreshed only by such an RPC.
 	state.ConfState.Voters = []uint64{2, 3, 4}
 	retireFence.MemberID = 1
-	probeHost := &retirementHost{state: state}
+	probeHost := &retirementHost{state: state, manifestDigest: member.identity.RelationManifestDigest}
 	probeOwner := &Owner{host: probeHost, members: map[raftmember.GroupKey]ownerMember{group: member}}
 	reply := make(chan ownerReply, 1)
 	if err := probeOwner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); err != nil {
@@ -119,6 +137,23 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	}
 	if observed := <-reply; observed.err != nil || observed.state.Command != retireFence.Command {
 		t.Fatalf("probe returned pre-transition command fence: %+v", observed)
+	}
+	if probeHost.authorizationCalls != 1 || probeHost.snapshotCalls != 0 {
+		t.Fatalf("probe cuts: authorization=%d snapshot=%d",
+			probeHost.authorizationCalls, probeHost.snapshotCalls)
+	}
+	probeHost.manifestDigest = [32]byte{99}
+	reply = make(chan ownerReply, 1)
+	if err := probeOwner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); !errors.Is(err, ErrServingFence) {
+		t.Fatalf("manifest-mismatched handle = %v", err)
+	}
+	if observed := <-reply; !errors.Is(observed.err, ErrServingFence) ||
+		observed.state.Command != retireFence.Command {
+		t.Fatalf("manifest-mismatched probe = %+v", observed)
+	}
+	if probeHost.authorizationCalls != 2 || probeHost.snapshotCalls != 0 {
+		t.Fatalf("manifest-mismatched cuts: authorization=%d snapshot=%d",
+			probeHost.authorizationCalls, probeHost.snapshotCalls)
 	}
 	for _, staleRequest := range []bool{false, true} {
 		member.identity.MemberID = 1
@@ -139,5 +174,36 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 		} else if err != nil || !host.removed || len(owner.members) != 0 {
 			t.Fatalf("current retirement without observation: removed=%t err=%v", host.removed, err)
 		}
+	}
+}
+
+func TestProbeBeforeReplicaSetPublicationPreservesBootstrapState(t *testing.T) {
+	group := peerServerTestGroup()
+	command := CommandFence{
+		ReplicaSetVersion: 4, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
+		OwnershipEpoch: 7, SchemaGeneration: 8, RelationManifestDigest: [32]byte{9},
+		RoutingVersion: 10, RouteGeneration: 11,
+	}
+	member := ownerMember{identity: raftmember.RuntimeIdentity{
+		Group: group, AllocationGeneration: 3, MemberID: 2,
+		StoreID: [16]byte{4}, NodeIncarnation: 5,
+		RelationManifestDigest: command.RelationManifestDigest,
+	}, command: command}
+	host := &retirementHost{status: raftmember.RuntimeStatus{
+		MemberID: member.identity.MemberID, LeaderID: member.identity.MemberID,
+		Term: 12, Commit: 1, Applied: 1,
+	}}
+	owner := &Owner{host: host, members: map[raftmember.GroupKey]ownerMember{group: member}}
+	reply := make(chan ownerReply, 1)
+	if err := owner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); err != nil {
+		t.Fatal(err)
+	}
+	observed := <-reply
+	if observed.err != nil || observed.state.Command != command || observed.state.Status != host.status {
+		t.Fatalf("pre-publication probe = %+v", observed)
+	}
+	if host.authorizationCalls != 0 || host.snapshotCalls != 0 {
+		t.Fatalf("pre-publication cuts: authorization=%d snapshot=%d",
+			host.authorizationCalls, host.snapshotCalls)
 	}
 }

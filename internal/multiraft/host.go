@@ -200,6 +200,7 @@ type memberRuntime interface {
 	Publication() (raftmodel.Publication, error)
 	DurablePromotion(uint64) (raftmember.DurablePromotionProof, bool, error)
 	SnapshotState() (replicatedstate.State, error)
+	SnapshotAuthorizationFence() (replicatedstate.SnapshotFence, error)
 	Status() (raftmember.RuntimeStatus, error)
 	Progress(uint64) (raftmodel.MemberProgress, bool, error)
 	TransferLeader(uint64) error
@@ -853,6 +854,18 @@ func (host *Host) SnapshotState(key raftmember.GroupKey) (replicatedstate.State,
 		return replicatedstate.State{}, err
 	}
 	return group.runtime.SnapshotState()
+}
+
+// SnapshotAuthorizationFence returns one group's fixed-width durable serving
+// metadata without acquiring or scanning a full state snapshot.
+func (host *Host) SnapshotAuthorizationFence(
+	key raftmember.GroupKey,
+) (replicatedstate.SnapshotFence, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return replicatedstate.SnapshotFence{}, err
+	}
+	return group.runtime.SnapshotAuthorizationFence()
 }
 
 // SnapshotBaseCertificate returns the exact immutable certificate retained by
