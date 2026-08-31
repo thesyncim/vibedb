@@ -57,7 +57,7 @@ func (s *postgresSession) prepareWrite(
 	}
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.HasConflictAction() {
 		return nil, sqlast.NewFeatureNotSupportedError(
-			text, 0,
+			text, replicatedSQLConflictActionPosition(parsed.Insert),
 			"RF3 PostgreSQL ON CONFLICT requires branch-aware replicated writes",
 		)
 	}
