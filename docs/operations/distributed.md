@@ -370,12 +370,14 @@ replacement documents that move the placement key are refused before dispatch.
 
 `exec_batch` is an atomic, fixed-request distributed transaction. The strict
 RF3 lane supports single- or multi-row whole-document `INSERT` and unique
-top-level named-column `INSERT` rows that can be encoded as canonical runtime documents,
-exact-primary-key whole-document `UPDATE`, and exact-primary-key `DELETE` with
-equality or a finite `IN` key set. One statement may fan rows or keys across
-RF3 shards, and an ordered request may touch multiple tables. Every resulting
-base and index mutation belongs to the same persisted transaction. Co-located
-relation mutations form one participant and apply atomically. There is no
+top-level named-column `INSERT` rows that can be encoded as canonical runtime
+documents, exact-primary-key whole-document or direct declared-column `UPDATE`,
+and exact-primary-key `DELETE` with equality or a finite `IN` key set. Computed
+`UPDATE` assignments remain fenced until their evaluated postimages are durable
+RF3 replay inputs. One statement may fan rows or keys across RF3 shards, and an
+ordered request may touch multiple tables. Every resulting base and index
+mutation belongs to the same persisted transaction. Co-located relation
+mutations form one participant and apply atomically. There is no
 participant-count contract. Mutation, byte, deadline, journal, and concurrency
 limits provide the bounds.
 

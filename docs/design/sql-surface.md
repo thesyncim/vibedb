@@ -252,12 +252,15 @@ action.
 ## UPDATE and DELETE
 
 `UPDATE` can assign the whole document through `"$doc"`. On a table with
-declared columns it can also assign scalar literals, placeholders, or `NULL` to
-one or more top-level columns while preserving every unassigned field in each
-matching document.
+declared columns it can also assign scalar literals, placeholders, `NULL`, or
+supported scalar expressions to one or more top-level columns while preserving
+every unassigned field in each matching document. Arithmetic, concatenation,
+unary expressions, casts, and `CASE` are evaluated once per matched old row;
+mixed right-hand sides are simultaneous.
 
-Nested-path targets, row-dependent assignment expressions such as
-`score = score + 1`, and `UPDATE ... FROM` are not supported.
+Nested-path targets and `UPDATE ... FROM` are not supported. Static distributed
+writes use shard-evaluated canonical postimages for maintained global indexes.
+The strict RF3 mutation lane still refuses computed assignments.
 
 The replacement must preserve the primary key. One constant replacement
 cannot update multiple rows that have different primary keys.

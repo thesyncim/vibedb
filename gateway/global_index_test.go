@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,6 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/shardservice"
-	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func globalIndexCatalog(t testing.TB) (distribution.ClusterConfig, map[distribution.EndpointID]string) {
@@ -578,11 +578,13 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesPostImage(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	newDocument := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"new@example.com","keep":1}`)
 	if err := prepared.bindGlobalIndexCapture(
 		bound, oldRoute.BaseTarget,
 		[][]shardservice.Cell{{
 			{Bytes: append([]byte(nil), oldRoute.BasePrimaryKey...)},
 			{Bytes: oldDocument},
+			{Bytes: newDocument},
 		}},
 	); err != nil {
 		t.Fatal(err)
@@ -598,7 +600,6 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesPostImage(t *testing.
 		!bytes.Equal(oldEntry, oldRoute.EntryKey) || bytes.Equal(newEntry, oldEntry) {
 		t.Fatalf("global assignment mutations = %#v / %#v entries=%x/%x", oldMutation, newMutation, oldEntry, newEntry)
 	}
-	newDocument := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"new@example.com","keep":1}`)
 	newRoute, err := program.RouteDocument(newDocument, &workspace)
 	if err != nil {
 		t.Fatal(err)
@@ -610,12 +611,114 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesPostImage(t *testing.
 	}
 }
 
-func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T) {
+func TestComputedUpdateGlobalIndexCaptureUsesShardPostimage(t *testing.T) {
 	config, endpoints := globalIndexCatalog(t)
-	descriptor := testGlobalIndexDescriptor()
-	descriptor.Flags &^= IndexUnique
 	snapshot, err := NewSnapshotWithIndexes(
-		config, endpoints, 1, []IndexDescriptor{descriptor},
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const source = `UPDATE messages SET email = email || ? WHERE tenant_id = ?`
+	prepared, err := snapshot.Prepare(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.BindWrite([]any{
+		[]byte(".invalid"), []byte("tenant-7"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bound.updateAssignments) != 1 || bound.updateAssignments[0].Expr == nil {
+		t.Fatalf("computed assignments = %+v, want one expression", bound.updateAssignments)
+	}
+
+	oldDocument := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"old@example.com","keep":1}`)
+	postimage := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"old@example.com.invalid","keep":1}`)
+	program := prepared.writeGlobalIndexes[0].program
+	var workspace GlobalIndexWorkspace
+	oldRoute, err := program.RouteDocument(oldDocument, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.bindGlobalIndexCapture(
+		bound, oldRoute.BaseTarget,
+		[][]shardservice.Cell{{
+			{Bytes: append([]byte(nil), oldRoute.BasePrimaryKey...)},
+			{Bytes: oldDocument},
+			{Bytes: postimage},
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(bound.globalIndexes) != 2 {
+		t.Fatalf("global index mutations = %d, want delete+put", len(bound.globalIndexes))
+	}
+	oldMutation, newMutation := bound.globalIndexes[0], bound.globalIndexes[1]
+	oldEntry := bound.globalIndexArena[oldMutation.entryStart:oldMutation.entryEnd]
+	newEntry := bound.globalIndexArena[newMutation.entryStart:newMutation.entryEnd]
+	postRoute, err := program.RouteDocument(postimage, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldMutation.kind != shardservice.MutationGlobalIndexDelete ||
+		newMutation.kind != shardservice.MutationGlobalIndexPut ||
+		!bytes.Equal(oldEntry, oldRoute.EntryKey) ||
+		!bytes.Equal(newEntry, postRoute.EntryKey) {
+		t.Fatalf("captured postimage routes = %#v / %#v entries=%x/%x", oldMutation, newMutation, oldEntry, newEntry)
+	}
+
+	baseCall := shardCall{
+		target:  oldRoute.BaseTarget,
+		address: oldRoute.BaseAddress,
+		req: &shardservice.ShardRequest{
+			Distribution:         bound.distribution,
+			Shard:                oldRoute.BaseTarget.Shard,
+			AllocationGeneration: oldRoute.BaseTarget.AllocationGeneration,
+			RoutingVersion:       bound.manifest.Version(),
+			OwnershipEpoch:       oldRoute.BaseTarget.OwnershipEpoch,
+		},
+	}
+	query := Query{
+		SQL: source,
+		Params: []shardservice.Param{
+			shardservice.StringParam(".invalid"),
+			shardservice.StringParam("tenant-7"),
+		},
+	}
+	participants, err := appendBoundWriteParticipants(
+		nil, baseCall, &query, bound, DefaultProfiles()[ClassInteractive],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var baseStatements []shardservice.MutationStatement
+	for i := range participants {
+		if sameTransactionTarget(participants[i].call.req, baseCall.req) {
+			baseStatements = participants[i].statements
+			break
+		}
+	}
+	if len(baseStatements) != 3 ||
+		baseStatements[0].Kind != shardservice.MutationPrimaryPrecondition ||
+		baseStatements[1].Kind != shardservice.MutationSQL ||
+		baseStatements[2].Kind != shardservice.MutationPrimaryCheck {
+		t.Fatalf("base participant statements = %+v, want precondition/SQL/postimage check", baseStatements)
+	}
+	wantPostimageDigest := sha256.Sum256(postimage)
+	if len(baseStatements[2].ExpectedKeys) != 1 ||
+		!bytes.Equal(baseStatements[2].ExpectedKeys[0], oldRoute.BasePrimaryKey) ||
+		len(baseStatements[2].ExpectedDigests) != 1 ||
+		baseStatements[2].ExpectedDigests[0] != wantPostimageDigest {
+		t.Fatalf("postimage check = %+v, want key %x digest %x", baseStatements[2], oldRoute.BasePrimaryKey, wantPostimageDigest)
+	}
+}
+
+func TestGlobalIndexCaptureRejectsMalformedPostimages(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -625,9 +728,112 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bound, err := prepared.BindWrite([]any{
-		[]byte("new@example.com"), []byte("tenant-7"),
-	})
+	oldDocument := []byte(`{"tenant_id":"tenant-7","id":"message-9","email":"old@example.com"}`)
+	program := prepared.writeGlobalIndexes[0].program
+	var workspace GlobalIndexWorkspace
+	oldRoute, err := program.RouteDocument(oldDocument, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := append([]byte(nil), oldRoute.BasePrimaryKey...)
+	tests := []struct {
+		name string
+		row  []shardservice.Cell
+	}{
+		{name: "missing", row: []shardservice.Cell{{Bytes: key}, {Bytes: oldDocument}}},
+		{name: "null", row: []shardservice.Cell{{Bytes: key}, {Bytes: oldDocument}, {Null: true}}},
+		{name: "invalid_json", row: []shardservice.Cell{{Bytes: key}, {Bytes: oldDocument}, {Bytes: []byte(`{"tenant_id":`)}}},
+		{name: "wrong_primary", row: []shardservice.Cell{{Bytes: key}, {Bytes: oldDocument}, {Bytes: []byte(`{"tenant_id":"tenant-7","id":"other","email":"new@example.com"}`)}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bound, err := prepared.BindWrite([]any{
+				[]byte("new@example.com"), []byte("tenant-7"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := prepared.bindGlobalIndexCapture(
+				bound, oldRoute.BaseTarget, [][]shardservice.Cell{test.row},
+			); err == nil {
+				t.Fatal("malformed postimage was accepted")
+			}
+			if len(bound.globalIndexes) != 0 {
+				t.Fatalf("malformed postimage emitted %d index mutations", len(bound.globalIndexes))
+			}
+		})
+	}
+
+	remove, err := snapshot.Prepare(context.Background(),
+		`DELETE FROM messages WHERE tenant_id = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteBound, err := remove.BindWrite([]any{[]byte("tenant-7")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remove.bindGlobalIndexCapture(
+		deleteBound, oldRoute.BaseTarget,
+		[][]shardservice.Cell{{
+			{Bytes: key}, {Bytes: oldDocument}, {Bytes: oldDocument},
+		}},
+	); err == nil {
+		t.Fatal("DELETE capture with a postimage was accepted")
+	}
+	if len(deleteBound.globalIndexes) != 0 {
+		t.Fatalf("malformed DELETE capture emitted %d index mutations", len(deleteBound.globalIndexes))
+	}
+}
+
+func TestMutationImageCaptureColumnsRequireExactSchema(t *testing.T) {
+	const oidJSON int32 = 114
+	valid := []shardservice.Column{
+		{Name: "primary_key", TypeOID: oidJSON},
+		{Name: "before_document", TypeOID: oidJSON},
+		{Name: "after_document", TypeOID: oidJSON},
+	}
+	if !validMutationImageCaptureColumns(valid) {
+		t.Fatal("exact mutation-image schema was rejected")
+	}
+	for _, test := range []struct {
+		name    string
+		columns []shardservice.Column
+	}{
+		{name: "missing", columns: valid[:2]},
+		{name: "extra", columns: append(append([]shardservice.Column(nil), valid...), shardservice.Column{Name: "extra", TypeOID: oidJSON})},
+		{name: "wrong_name", columns: []shardservice.Column{{Name: "primary_key", TypeOID: oidJSON}, {Name: "document", TypeOID: oidJSON}, {Name: "after_document", TypeOID: oidJSON}}},
+		{name: "wrong_type", columns: []shardservice.Column{{Name: "primary_key", TypeOID: oidJSON}, {Name: "before_document", TypeOID: 25}, {Name: "after_document", TypeOID: oidJSON}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if validMutationImageCaptureColumns(test.columns) {
+				t.Fatal("malformed mutation-image schema was accepted")
+			}
+		})
+	}
+}
+
+func TestComputedUpdateGlobalIndexCaptureOrdersUniqueSwapDeletesBeforePuts(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	descriptor := testGlobalIndexDescriptor()
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const source = `
+		UPDATE messages
+		SET email = CASE
+			WHEN id = 'message-a' THEN 'old-b@example.com'
+			ELSE 'old-a@example.com'
+		END
+		WHERE tenant_id = ?`
+	prepared, err := snapshot.Prepare(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.BindWrite([]any{[]byte("tenant-7")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,6 +841,10 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T)
 	oldDocuments := [][]byte{
 		[]byte(`{"tenant_id":"tenant-7","id":"message-a","email":"old-a@example.com"}`),
 		[]byte(`{"tenant_id":"tenant-7","id":"message-b","email":"old-b@example.com"}`),
+	}
+	newDocuments := [][]byte{
+		[]byte(`{"tenant_id":"tenant-7","id":"message-a","email":"old-b@example.com"}`),
+		[]byte(`{"tenant_id":"tenant-7","id":"message-b","email":"old-a@example.com"}`),
 	}
 	rows := make([][]shardservice.Cell, len(oldDocuments))
 	var workspace GlobalIndexWorkspace
@@ -652,6 +862,7 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T)
 		rows[i] = []shardservice.Cell{
 			{Bytes: append([]byte(nil), route.BasePrimaryKey...)},
 			{Bytes: oldDocuments[i]},
+			{Bytes: newDocuments[i]},
 		}
 	}
 	if err := prepared.bindGlobalIndexCapture(bound, baseTarget, rows); err != nil {
@@ -659,6 +870,12 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T)
 	}
 	if len(bound.globalIndexes) != 4 {
 		t.Fatalf("global index mutations = %d, want two per row", len(bound.globalIndexes))
+	}
+	if bound.globalIndexes[0].kind != shardservice.MutationGlobalIndexDelete ||
+		bound.globalIndexes[1].kind != shardservice.MutationGlobalIndexPut ||
+		bound.globalIndexes[2].kind != shardservice.MutationGlobalIndexDelete ||
+		bound.globalIndexes[3].kind != shardservice.MutationGlobalIndexPut {
+		t.Fatalf("bound global index mutation order = %+v, want adjacent delete/put pairs", bound.globalIndexes)
 	}
 	first := bound.globalIndexes[1]
 	second := bound.globalIndexes[3]
@@ -668,6 +885,80 @@ func TestDeclaredColumnUpdateGlobalIndexCaptureMaterializesEachRow(t *testing.T)
 		string(firstValue) != `["tenant-7","message-a"]` ||
 		string(secondValue) != `["tenant-7","message-b"]` {
 		t.Fatalf("per-row locator values = %s / %s", firstValue, secondValue)
+	}
+
+	baseCall := shardCall{
+		target:  baseTarget,
+		address: endpoints[baseTarget.Endpoint],
+		req: &shardservice.ShardRequest{
+			Distribution:         bound.distribution,
+			Shard:                baseTarget.Shard,
+			AllocationGeneration: baseTarget.AllocationGeneration,
+			RoutingVersion:       bound.manifest.Version(),
+			OwnershipEpoch:       baseTarget.OwnershipEpoch,
+		},
+	}
+	query := Query{
+		SQL: source,
+		Params: []shardservice.Param{
+			shardservice.StringParam("tenant-7"),
+		},
+	}
+	participants, err := appendBoundWriteParticipants(
+		nil, baseCall, &query, bound, DefaultProfiles()[ClassInteractive],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sortTransactionParticipants(participants)
+	deletes, puts := 0, 0
+	for i := range participants {
+		sawPut := false
+		for j := range participants[i].statements {
+			switch participants[i].statements[j].Kind {
+			case shardservice.MutationGlobalIndexDelete:
+				if sawPut {
+					t.Fatalf("index participant %d has a delete after a put: %+v", i, participants[i].statements)
+				}
+				deletes++
+			case shardservice.MutationGlobalIndexPut:
+				sawPut = true
+				puts++
+			}
+		}
+	}
+	if deletes != 2 || puts != 2 {
+		t.Fatalf("static index participant mutations = %d deletes/%d puts, want 2/2", deletes, puts)
+	}
+}
+
+func TestStaticTransactionOrdersGlobalIndexDeletesAcrossStatements(t *testing.T) {
+	call := shardCall{req: &shardservice.ShardRequest{
+		Distribution: "index", Shard: "all", AllocationGeneration: 1,
+		RoutingVersion: 1, OwnershipEpoch: 1,
+	}}
+	statements := []shardservice.MutationStatement{
+		{Kind: shardservice.MutationGlobalIndexDelete, Relation: "idx", IndexID: 1},
+		{Kind: shardservice.MutationGlobalIndexPut, Relation: "idx", IndexID: 1},
+		{Kind: shardservice.MutationGlobalIndexDelete, Relation: "idx", IndexID: 1},
+		{Kind: shardservice.MutationGlobalIndexPut, Relation: "idx", IndexID: 1},
+	}
+	var participants []transactionParticipant
+	var err error
+	for i := range statements {
+		participants, err = appendTransactionStatement(participants, call, statements[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	sortTransactionParticipants(participants)
+	got := participants[0].statements
+	if len(got) != 4 ||
+		got[0].Kind != shardservice.MutationGlobalIndexDelete ||
+		got[1].Kind != shardservice.MutationGlobalIndexDelete ||
+		got[2].Kind != shardservice.MutationGlobalIndexPut ||
+		got[3].Kind != shardservice.MutationGlobalIndexPut {
+		t.Fatalf("cross-statement index order = %+v, want delete/delete/put/put", got)
 	}
 }
 
@@ -726,9 +1017,8 @@ func TestGlobalIndexBuildAndDrainLifecyclesStayWriteMaintained(t *testing.T) {
 	}
 }
 
-func TestComputedUpdateExpressionGlobalIndexLanesRejectAtPrepare(t *testing.T) {
+func TestComputedUpdateExpressionGlobalIndexLanesPreparePostimageCapture(t *testing.T) {
 	const source = `UPDATE messages SET email = email || '.invalid' WHERE tenant_id = ?`
-	wantPosition := strings.Index(source, `||`)
 	config, endpoints := globalIndexCatalog(t)
 
 	for _, test := range []struct {
@@ -750,19 +1040,18 @@ func TestComputedUpdateExpressionGlobalIndexLanesRejectAtPrepare(t *testing.T) {
 				t.Fatal(err)
 			}
 			prepared, err := snapshot.Prepare(context.Background(), source)
-			var unsupported *sqlast.FeatureNotSupportedError
-			gotPosition := -1
-			if errors.As(err, &unsupported) {
-				gotPosition = unsupported.Pos
+			if err != nil {
+				t.Fatalf("Prepare: %v", err)
 			}
-			if unsupported == nil || gotPosition != wantPosition {
-				t.Fatalf(
-					"Prepare error = %T %v at %d, want positioned FeatureNotSupported at %d",
-					err, err, gotPosition, wantPosition,
-				)
+			if len(prepared.writeGlobalIndexes) != 1 {
+				t.Fatalf("maintained global-index programs = %d, want 1", len(prepared.writeGlobalIndexes))
 			}
-			if prepared != nil {
-				t.Fatal("global-index expression returned a dispatchable plan")
+			bound, err := prepared.BindWrite([]any{[]byte("tenant-7")})
+			if err != nil {
+				t.Fatalf("BindWrite: %v", err)
+			}
+			if len(bound.updateAssignments) != 1 || bound.updateAssignments[0].Expr == nil {
+				t.Fatalf("computed assignments = %+v, want one expression", bound.updateAssignments)
 			}
 		})
 	}

@@ -117,7 +117,7 @@ func executeFencedSQL(ctx context.Context, source interface {
 }, cut *replicatedstate.DataReadCut, req *ShardRequest, maxBytes int) *ShardResponse {
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
 		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
-		req.DocumentScan.present() || req.GlobalIndexLookup.present() || req.MutationCapture ||
+		req.DocumentScan.present() || req.GlobalIndexLookup.present() || req.mutationCapturePresent() ||
 		!req.ReadFenceID.IsZero() || req.HasMinPosition || req.RowBatch.present() {
 		return NewErrorResponse(ErrorMalformedRequest, "RF3 SQL read does not support this execution mode")
 	}

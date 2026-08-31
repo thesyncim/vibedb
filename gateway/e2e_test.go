@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -50,6 +51,43 @@ type e2eCluster struct {
 	mapper  *distribution.NativeMapper
 	dialer  *e2eDialer
 	client  *Client
+}
+
+type mutationImageTamperTransport struct {
+	next     ShardTransport
+	tampered bool
+}
+
+func (t *mutationImageTamperTransport) Do(
+	ctx context.Context,
+	address string,
+	req *shardservice.ShardRequest,
+) (*shardservice.ShardResponse, error) {
+	response, err := t.next.Do(ctx, address, req)
+	if err != nil || req == nil || !req.MutationImageCapture || response == nil {
+		return response, err
+	}
+	for i := range response.Rows {
+		if len(response.Rows[i]) != 3 || response.Rows[i][2].Null {
+			continue
+		}
+		before := response.Rows[i][2].Bytes
+		after := bytes.Replace(before, []byte(`"n":778`), []byte(`"n":779`), 1)
+		if !bytes.Equal(before, after) {
+			response.Rows[i][2].Bytes = after
+			t.tampered = true
+		}
+	}
+	return response, nil
+}
+
+func (t *mutationImageTamperTransport) DoBatches(
+	ctx context.Context,
+	address string,
+	req *shardservice.ShardRequest,
+	visit func(*shardservice.ShardResponse) error,
+) error {
+	return t.next.DoBatches(ctx, address, req, visit)
 }
 
 // countedConn wraps a shard connection to count how many times it was closed, so
@@ -1067,13 +1105,31 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 	}
 	c.verifyDeleted(t, conflictingBase)
 
+	tamper := &mutationImageTamperTransport{next: c.client}
+	poisonedExecutor := NewExecutor(tamper, holder, Options{})
+	_, err = poisonedExecutor.Exec(context.Background(), Query{
+		SQL:    `UPDATE messages SET n = n + 1 WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(baseKey)},
+		Class:  ClassInteractive,
+	})
+	if !tamper.tampered || !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("tampered postimage update = tampered:%v err:%v, want atomic conflict", tamper.tampered, err)
+	}
+	c.verifyInserted(t, baseKey, 777)
+	stillIndexed, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("777")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(stillIndexed.Rows) != 1 ||
+		string(stillIndexed.Rows[0][0].Bytes) != `"`+baseKey+`"` {
+		t.Fatalf("index after tampered postimage rollback = %+v, %v", stillIndexed, err)
+	}
+
 	updated, err := executor.Exec(context.Background(), Query{
-		SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
-		Params: []shardservice.Param{
-			shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":778}`, baseKey)),
-			shardservice.StringParam(baseKey),
-		},
-		Class: ClassInteractive,
+		SQL:    `UPDATE messages SET n = n + 1 WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(baseKey)},
+		Class:  ClassInteractive,
 	})
 	if err != nil || updated.RowsAffected != 1 || updated.ShardsFanned < 2 {
 		t.Fatalf("indexed update = %+v, %v", updated, err)

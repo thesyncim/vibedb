@@ -10,7 +10,7 @@ stable.
 | Status | Slice | Implemented boundary |
 | --- | --- | --- |
 | **Complete** | Direct declared-column `UPDATE` | Embedded autocommit, transactions, `RETURNING`, capture, routing, and index maintenance execute atomic top-level scalar literal, placeholder, and `NULL` assignments. Computed expressions are tracked separately below; nested assignments remain outside this slice. |
-| **Complete (embedded)** | Row-dependent `UPDATE` expressions | Ordinary embedded `UPDATE` evaluates arithmetic, concatenation, unary expressions, casts, and `CASE` once per matched old row. Mixed assignments are simultaneous and atomic across `RETURNING`, transactions, primary-key checks, and local secondary/unique indexes. Mutation capture, maintained global indexes, and RF3 reject this shape with positioned `0A000` until they can transport exact postimages. |
+| **Complete (embedded/static)** | Row-dependent `UPDATE` expressions | Embedded `UPDATE` evaluates arithmetic, concatenation, unary expressions, casts, and `CASE` once per matched old row. Mixed assignments are simultaneous and atomic across `RETURNING`, transactions, primary-key checks, and local secondary/unique indexes. The additive mutation-image capture returns exact canonical before/after images, and the static gateway uses those images for maintained global indexes with before- and after-image guards. The legacy two-column capture and RF3 still reject computed assignments. |
 | **Complete** | `ALTER TABLE ... ADD COLUMN` | The embedded driver validates one additive schema in a replacement storage incarnation, retains indexes, and publishes atomically. The copy still blocks ordinary work under the catalog write lock. |
 | **Complete** | Primary-key `ON CONFLICT DO UPDATE` | Embedded `INSERT ... VALUES` supports whole-document replacement or declared top-level assignments from literals, placeholders, `NULL`, and `EXCLUDED`. The implicit primary key is the only target. |
 | **Complete (embedded)** | Conflict-action expressions | Embedded `INSERT ... VALUES ... ON CONFLICT DO UPDATE` evaluates arithmetic, concatenation, unary expressions, casts, and `CASE` over explicitly qualified current-row and `EXCLUDED` namespaces. Mixed assignments are simultaneous, exact-number preserving, statement-atomic, transaction-aware, and integrated with `RETURNING` plus local secondary/unique indexes. Distributed lanes retain their blanket conflict-action fence. |
@@ -26,7 +26,7 @@ provide the same branch-aware and distributed uniqueness contracts.
 | Priority | Gap | Deliverable |
 | --- | --- | --- |
 | P1 | Complete migration cycle | Add defaults/backfill, set or drop nullability, and rename/drop/type migration through the same atomic rebuild path. |
-| P1 | Distributed mutation postimages | Define one exact evaluated-postimage contract for mutation capture, maintained global indexes, and RF3, then remove the explicit computed-`UPDATE` fences lane by lane. |
+| P1 | RF3 mutation postimages | Carry the canonical evaluated postimage contract already used by static global-index maintenance into durable RF3 mutation planning and replay, then remove the RF3 computed-`UPDATE` fence. RF3 `RETURNING` remains a separate ordered-result problem. |
 | P1 | Common scalar functions | Start with `COALESCE`, `NULLIF`, `LOWER`, `UPPER`, `LENGTH`, substring, and bounded numeric/JSON helpers. |
 | P1 | Aggregate composability | Add `COUNT(DISTINCT ...)`, expression arguments, grouping expressions, and non-projected aggregates in `HAVING`. |
 | P1 | Constraint basics | Add `DEFAULT` and `CHECK`. Treat foreign keys as a separate product decision for the JSON-first embedded scope. |
@@ -41,9 +41,9 @@ transactions are outside the embedded must-have set.
 
 ## Fast next plan
 
-1. Specify an exact postimage payload for capture and coordinator-owned index
-   maintenance; enable global-index and RF3 lanes only after replay tests prove
-   identical results.
+1. Extend the canonical mutation-image contract into RF3's durable request and
+   mutation payloads. Keep the computed-`UPDATE` fence until replay, crash, and
+   global-index tests prove the retained postimage is identical after recovery.
 2. Add the first common scalar functions without
    widening the expression grammar beyond executable runtime support.
 3. Add catalog metadata for `DEFAULT` and `CHECK`, then extend the existing

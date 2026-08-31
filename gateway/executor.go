@@ -846,14 +846,15 @@ func (e *Executor) captureIndexedMutation(
 ) error {
 	req := *baseCall.req
 	req.ExecutionMode = shardservice.ExecutionReadOnly
-	req.MutationCapture = true
+	req.MutationImageCapture = true
 	captureCtx, cancel := context.WithTimeout(ctx, p.PerShardDeadline)
 	defer cancel()
 	resp, err := e.client.Do(captureCtx, baseCall.address, &req)
 	if err != nil {
 		return err
 	}
-	if resp.Kind != shardservice.ResponseRows || len(resp.Columns) != 2 {
+	if resp.Kind != shardservice.ResponseRows ||
+		!validMutationImageCaptureColumns(resp.Columns) {
 		return &PlanError{
 			Table: bound.table, Reason: "base shard returned an invalid mutation capture response",
 			cause: ErrGlobalIndexMaintenanceUnsupported,
@@ -865,7 +866,7 @@ func (e *Executor) captureIndexedMutation(
 		return err
 	}
 	for i := range resp.Rows {
-		if len(resp.Rows[i]) != 2 {
+		if len(resp.Rows[i]) != 3 {
 			return &PlanError{
 				Table: bound.table, Reason: "base shard returned a malformed mutation capture row",
 				cause: ErrGlobalIndexMaintenanceUnsupported,
@@ -873,6 +874,14 @@ func (e *Executor) captureIndexedMutation(
 		}
 	}
 	return prepared.bindGlobalIndexCapture(bound, baseCall.target, resp.Rows)
+}
+
+func validMutationImageCaptureColumns(columns []shardservice.Column) bool {
+	const oidJSON int32 = 114
+	return len(columns) == 3 &&
+		columns[0] == (shardservice.Column{Name: "primary_key", TypeOID: oidJSON}) &&
+		columns[1] == (shardservice.Column{Name: "before_document", TypeOID: oidJSON}) &&
+		columns[2] == (shardservice.Column{Name: "after_document", TypeOID: oidJSON})
 }
 
 // fanout dispatches every shard call concurrently through a bounded worker pool,

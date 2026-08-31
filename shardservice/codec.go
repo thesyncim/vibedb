@@ -50,6 +50,7 @@ const (
 	repartitionMarker       = 0xe1
 	authorityMarker         = 0xe2
 	parameterTypesMarker    = 0xe3
+	mutationImageMarker     = 0xe4
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -786,7 +787,7 @@ func validateExchangeRequest(req *ShardRequest) error {
 		req.MaxResultBytes != 0 || req.MaxRows != 0 || req.BucketBits != 0 ||
 		len(req.AccessScopes) != 0 || !req.ReadFenceID.IsZero() ||
 		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
-		req.MutationCapture || req.DocumentScan.present() || req.Repartition.present() ||
+		req.mutationCapturePresent() || req.DocumentScan.present() || req.Repartition.present() ||
 		req.Transaction.Operation != TransactionNone {
 		return errBadExchange
 	}
@@ -810,7 +811,7 @@ func validateRepartitionRequest(req *ShardRequest) error {
 	if req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
 		req.MaxRows == 0 || req.MaxResultBytes == 0 || req.RowBatch.present() ||
 		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
-		req.MutationCapture || req.DocumentScan.present() || req.Exchange.present() ||
+		req.mutationCapturePresent() || req.DocumentScan.present() || req.Exchange.present() ||
 		req.Transaction.Operation != TransactionNone {
 		return errBadRepartition
 	}
@@ -1243,6 +1244,10 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !req.DocumentScan.canonical() {
 		return errBadDocumentScan
 	}
+	if req.MutationCapture && req.MutationImageCapture {
+		return errBadMutationCapture
+	}
+	mutationCapture := req.mutationCapturePresent()
 	primaryReadBytes := uint64(1 + 4 + len(req.PrimaryKeyRead.PrimaryPath) + 4)
 	for i := range req.PrimaryKeyRead.Keys {
 		primaryReadBytes += uint64(4 + len(req.PrimaryKeyRead.Keys[i]))
@@ -1254,35 +1259,35 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		return errBadTransaction
 	}
 	if req.Transaction.Operation != TransactionNone &&
-		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present()) {
+		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present()) {
 		if req.GlobalIndexLookup.present() {
 			return errBadGlobalIndexLookup
 		}
 		return errBadTransaction
 	}
 	if req.GlobalIndexLookup.present() &&
-		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
+		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
 		return errBadGlobalIndexLookup
 	}
-	if req.PrimaryKeyRead.present() && (req.SQL == "" || req.MutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
+	if req.PrimaryKeyRead.present() && (req.SQL == "" || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
 		return errBadPrimaryKeyRead
 	}
-	if req.MutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
+	if mutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
 		!req.ReadFenceID.IsZero()) {
 		return errBadMutationCapture
 	}
 	if req.DocumentScan.present() && (req.SQL != "" || len(req.Params) != 0 ||
 		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
-		req.MaxRows == 0 || req.MaxResultBytes == 0 || req.MutationCapture) {
+		req.MaxRows == 0 || req.MaxResultBytes == 0 || mutationCapture) {
 		return errBadDocumentScan
 	}
 	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
-		req.MutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+		mutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 		req.Transaction.Operation != TransactionNone) {
 		return errBadPartialAggregate
 	}
 	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
-		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.MutationCapture ||
+		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || mutationCapture ||
 			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
 			req.MaxResultBytes == 0)) {
@@ -1405,6 +1410,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		for _, parameterType := range req.ParamTypes {
 			e.u8(uint8(parameterType))
 		}
+	}
+	if req.MutationImageCapture {
+		e.u8(mutationImageMarker)
 	}
 	if e.err != nil {
 		return e.err
@@ -1605,8 +1613,16 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadParameterTypes
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == mutationImageMarker {
+		d.u8()
+		req.MutationImageCapture = true
+	}
+	if req.MutationCapture && req.MutationImageCapture {
+		return nil, errBadMutationCapture
+	}
+	mutationCapture := req.mutationCapturePresent()
 	if req.Transaction.Operation != TransactionNone &&
-		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present()) {
+		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present()) {
 		if req.GlobalIndexLookup.present() {
 			return nil, errBadGlobalIndexLookup
 		}
@@ -1628,28 +1644,28 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		return nil, err
 	}
 	if req.GlobalIndexLookup.present() &&
-		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
+		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
 		return nil, errBadGlobalIndexLookup
 	}
-	if req.PrimaryKeyRead.present() && (req.SQL == "" || req.MutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
+	if req.PrimaryKeyRead.present() && (req.SQL == "" || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
 		return nil, errBadPrimaryKeyRead
 	}
-	if req.MutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
+	if mutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
 		!req.ReadFenceID.IsZero()) {
 		return nil, errBadMutationCapture
 	}
 	if req.DocumentScan.present() && (req.SQL != "" || len(req.Params) != 0 ||
 		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
-		req.MaxRows == 0 || req.MaxResultBytes == 0 || req.MutationCapture) {
+		req.MaxRows == 0 || req.MaxResultBytes == 0 || mutationCapture) {
 		return nil, errBadDocumentScan
 	}
 	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
-		req.MutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+		mutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 		req.Transaction.Operation != TransactionNone) {
 		return nil, errBadPartialAggregate
 	}
 	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
-		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.MutationCapture ||
+		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || mutationCapture ||
 			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
 			req.MaxResultBytes == 0)) {

@@ -213,11 +213,19 @@ recovery across arbitrary later resharding or retired topology history.
 ## Global-index use
 
 The static transaction path expands base-table and global-index mutations into
-the same protocol. The replicated state machine can also atomically apply base
-and global-index relation batches, and a digest check guards old-document
-capture during update and delete. The public RF3 SQL lowering routes ready
-unique and non-unique indexes as independent relation participants. Same-key
-replacement and index removal use exact prior-value checks.
+the same protocol. For update and delete, the base shard captures the exact key
+set and canonical before/after images without publishing. A precondition guards
+the selected keys and before-image digests; after local SQL runs, a second digest
+check proves the actual postimages before any index participant applies. Each
+final static index participant releases all old claims before replacement puts,
+including across an atomic statement batch.
+
+The replicated state machine can also atomically apply base and global-index
+relation batches. The public RF3 SQL lowering routes ready unique and non-unique
+indexes as independent relation participants. Same-key replacement and index
+removal use exact prior-value checks. RF3 direct declared-column updates are
+supported, but computed assignments remain fenced until their evaluated
+postimages are retained durably through replay.
 
 The RF3 read side has two contracts. `read_batch` supports multi-table and
 multi-group exact-primary-key `SELECT *` and returns one route/applied-index

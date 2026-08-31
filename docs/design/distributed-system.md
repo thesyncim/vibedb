@@ -63,8 +63,10 @@ The canonical point and transaction APIs are narrower RF3 lanes. Point reads
 accept one table and one canonical ordered scalar string/number
 primary-placement key. Strict `exec_batch` writes lower single- or multi-row
 whole-document or canonical top-level named-column insert, exact-primary-key
-whole-document update, and exact-primary-key delete with equality or finite `IN` keys into one
-or more relation-aware RF3 transaction participants. Same-group mutations use
+whole-document or direct declared-column update, and exact-primary-key delete
+with equality or finite `IN` keys into one or more relation-aware RF3
+transaction participants. Computed update assignments remain fenced until
+their evaluated postimages are retained as durable replay inputs. Same-group mutations use
 one atomic multi-relation apply; multiple groups use the replicated transaction
 protocol. The replicated table profile binds each table to an exact dense
 relation, schema generation, relation-manifest digest, and three-replica route.
