@@ -2467,6 +2467,9 @@ func (c *conn) updateColumnsLockedReturning(
 	if err := validateColumnAssignmentBindings(assignments, args); err != nil {
 		return nil, err
 	}
+	if err := statement.ValidateUpdateExpressionBindings(args); err != nil {
+		return nil, err
+	}
 	// A declared-column replacement is still subject to UPDATE's single-shard
 	// predicate rule even when no row matches. Each materialized document below
 	// additionally proves that the assignment did not move its shard key.
@@ -2524,8 +2527,9 @@ func (c *conn) updateColumnsLockedReturning(
 			if !found {
 				return nil, ErrTransactionConflict
 			}
-			document, err := ApplyColumnAssignments(
-				scratch, assignments, args, limits.MaxDocumentBytes,
+			document, err := materializeColumnAssignments(
+				statement, &c.exec, scratch, assignments, args,
+				limits.MaxDocumentBytes,
 			)
 			if err != nil {
 				return nil, err

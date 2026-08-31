@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
@@ -685,6 +687,35 @@ func TestReplicatedSQLDeclaredColumnUpdateIsExactCAS(t *testing.T) {
 	}
 	if got := string(mutation.Value); got != `{"email":"new@example.test","id":"message-1","n":2}` {
 		t.Fatalf("document=%s", got)
+	}
+}
+
+func TestReplicatedSQLComputedUpdateRejectsBeforeCurrentRowRead(t *testing.T) {
+	const source = `UPDATE messages SET n = n + 1 WHERE id = ?`
+	wantPosition := strings.Index(source, `+`)
+	snapshot, executor := replicatedSQLTransactionFixture(t, true)
+	client, data := attachReplicatedSQLIndexedReadClient(
+		t, snapshot, []byte(`{"id":"message-1","n":1}`),
+	)
+
+	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+		t.Context(), snapshot, []Query{{
+			SQL:    source,
+			Params: []shardservice.Param{shardservice.StringParam("message-1")},
+		}}, executor.profileFor(ClassInteractive), data,
+	)
+	var unsupported *sqlast.FeatureNotSupportedError
+	if !errors.As(err, &unsupported) || unsupported.Pos != wantPosition {
+		t.Fatalf(
+			"plan handled=%v error=%T %v, want positioned FeatureNotSupported at %d",
+			handled, err, err, wantPosition,
+		)
+	}
+	if !handled || len(participants) != 0 || client.reads != 0 {
+		t.Fatalf(
+			"plan participants=%d handled=%v current-row reads=%d, want 0,true,0",
+			len(participants), handled, client.reads,
+		)
 	}
 }
 

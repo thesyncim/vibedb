@@ -1,10 +1,14 @@
 package sql
 
-import "github.com/thesyncim/vibedb/internal/pginput"
+import (
+	"strings"
+
+	"github.com/thesyncim/vibedb/internal/pginput"
+)
 
 // scalarExprContext records where a computed value is authored. Aggregates
-// are legal in SELECT, HAVING, and ORDER BY after grouping, but not in WHERE or
-// ON, whose rows have not been reduced yet.
+// are legal in SELECT, HAVING, and ORDER BY after grouping, but not in WHERE,
+// ON, or UPDATE SET, whose expressions run over one input row at a time.
 type scalarExprContext uint8
 
 const (
@@ -13,6 +17,7 @@ const (
 	scalarHaving
 	scalarJoin
 	scalarOrder
+	scalarUpdate
 )
 
 func (c scalarExprContext) clause() string {
@@ -25,6 +30,8 @@ func (c scalarExprContext) clause() string {
 		return "ON"
 	case scalarOrder:
 		return "ORDER BY"
+	case scalarUpdate:
+		return "UPDATE SET"
 	default:
 		return "SELECT"
 	}
@@ -514,7 +521,7 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 		}
 		path, err := p.continuePath(head, ctx == scalarSelect)
 		if err != nil {
-			return nil, err
+			return nil, p.normalizeUpdateScalarPrimaryError(ctx, pos, err)
 		}
 		if err := p.rejectQualifiedTypedStringPath(head, path); err != nil {
 			return nil, err
@@ -525,7 +532,19 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 	}
 	switch {
 	case p.tok.kind == tokLParen:
+		openPos := p.tok.pos
 		p.advance()
+		if ctx == scalarUpdate && scalarQueryExpressionStarts(p.tok) {
+			if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
+				if _, err := p.parsePredicateSubquery(false); err != nil {
+					return nil, err
+				}
+			}
+			return nil, newFeatureNotSupportedError(
+				p.lx.src, openPos,
+				"scalar subqueries are not supported in UPDATE SET; compute the value before the mutation",
+			)
+		}
 		expr, err := p.parseScalarExpression(ctx)
 		if err != nil {
 			return nil, err
@@ -554,10 +573,10 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 
 	switch agg, head, state := p.tryAggregate(); state {
 	case aggCall:
-		if ctx == scalarWhere || ctx == scalarJoin {
+		if ctx == scalarWhere || ctx == scalarJoin || ctx == scalarUpdate {
 			return nil, newFeatureNotSupportedError(
 				p.lx.src, head.pos,
-				"an aggregate is not allowed in "+ctx.clause()+" because rows are filtered before reduction",
+				"an aggregate is not allowed in "+ctx.clause()+" because the expression is evaluated once per input row",
 			)
 		}
 		path, err := p.parseAggregateArgs(agg)
@@ -570,7 +589,7 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 	case aggHeadOnly:
 		path, err := p.continuePath(head, false)
 		if err != nil {
-			return nil, err
+			return nil, p.normalizeUpdateScalarPrimaryError(ctx, pos, err)
 		}
 		node := p.newScalar(ScalarPath, path.Pos)
 		node.Path = path
@@ -578,12 +597,108 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 	default:
 		path, err := p.parsePath(false)
 		if err != nil {
-			return nil, err
+			return nil, p.normalizeUpdateScalarPrimaryError(ctx, pos, err)
 		}
 		node := p.newScalar(ScalarPath, path.Pos)
 		node.Path = path
 		return node, nil
 	}
+}
+
+func scalarQueryExpressionStarts(tok token) bool {
+	return tok.kind == tokIdent && (tok.kw == kwSelect || tok.kw == kwWith ||
+		tok.kw == kwValues || tok.kw == kwTable)
+}
+
+func (p *Parser) normalizeUpdateScalarPrimaryError(
+	ctx scalarExprContext,
+	pos int,
+	err error,
+) error {
+	if ctx != scalarUpdate {
+		return err
+	}
+	parse, ok := err.(*ParseError)
+	if !ok || !strings.Contains(parse.Msg, "is not a supported function") {
+		return err
+	}
+	return newFeatureNotSupportedError(p.lx.src, pos, parse.Msg)
+}
+
+// normalizeUpdateScalarError preserves ordinary syntax failures while turning
+// a syntactically valid scalar-function call into the typed unsupported class
+// used by protocol adapters. Function calls are diagnosed by parsePath after
+// consuming their complete name, including calls nested inside CASE truth
+// predicates where the scalar context is intentionally translated to WHERE.
+func (p *Parser) normalizeUpdateScalarError(err error) error {
+	parse, ok := err.(*ParseError)
+	if !ok || !strings.Contains(parse.Msg, "is not a supported function") {
+		return err
+	}
+	return newFeatureNotSupportedError(p.lx.src, parse.Pos, parse.Msg)
+}
+
+// validateUpdateScalarExpression enforces the bounded per-row UPDATE stage
+// after parsing. Direct aggregate nodes are rejected while parsing; this walk
+// also catches predicate subqueries retained inside searched CASE expressions.
+func (p *Parser) validateUpdateScalarExpression(expr *ScalarExpr) error {
+	if expr == nil {
+		return nil
+	}
+	if expr.Kind == ScalarAggregate {
+		return newFeatureNotSupportedError(
+			p.lx.src, expr.Pos,
+			"an aggregate is not allowed in UPDATE SET because the expression is evaluated once per input row",
+		)
+	}
+	if err := p.validateUpdateScalarExpression(expr.Left); err != nil {
+		return err
+	}
+	if err := p.validateUpdateScalarExpression(expr.Right); err != nil {
+		return err
+	}
+	for i := range expr.Whens {
+		if err := p.validateUpdatePredicateExpression(expr.Whens[i].Predicate); err != nil {
+			return err
+		}
+		if err := p.validateUpdateScalarExpression(expr.Whens[i].Match); err != nil {
+			return err
+		}
+		if err := p.validateUpdateScalarExpression(expr.Whens[i].Result); err != nil {
+			return err
+		}
+	}
+	return p.validateUpdateScalarExpression(expr.Else)
+}
+
+func (p *Parser) validateUpdatePredicateExpression(expr *Expr) error {
+	if expr == nil {
+		return nil
+	}
+	if expr.Subquery != nil {
+		return newFeatureNotSupportedError(
+			p.lx.src, expr.Pos,
+			"subqueries are not supported in UPDATE SET expressions; compute the value before the mutation",
+		)
+	}
+	if expr.Agg != AggNone {
+		return newFeatureNotSupportedError(
+			p.lx.src, expr.Pos,
+			"an aggregate is not allowed in UPDATE SET because the expression is evaluated once per input row",
+		)
+	}
+	if err := p.validateUpdateScalarExpression(expr.ScalarLeft); err != nil {
+		return err
+	}
+	if err := p.validateUpdateScalarExpression(expr.ScalarRight); err != nil {
+		return err
+	}
+	for _, child := range expr.Kids {
+		if err := p.validateUpdatePredicateExpression(child); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *Parser) parseScalarCast(ctx scalarExprContext) (*ScalarExpr, error) {

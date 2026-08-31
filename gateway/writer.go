@@ -186,7 +186,7 @@ type boundGlobalIndexMutation struct {
 // against later. Like the read path it fails closed: a table with no placement,
 // a statement kind with no single-shard form, or a shape that cannot be proven
 // single-shard never becomes a dispatchable plan.
-func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
+func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 	stmt := &plan.statement
 	var (
 		where       *sqlast.Expr
@@ -306,12 +306,44 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns, insertColumns); err != nil {
 		return err
 	}
+	if len(plan.writeGlobalIndexes) != 0 {
+		if err := rejectComputedUpdateAssignments(
+			source, stmt,
+			"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for global-index writes",
+		); err != nil {
+			return err
+		}
+	}
 	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictDoNothing &&
 		len(plan.writeGlobalIndexes) != 0 {
 		return &PlanError{
 			Table:  plan.table,
 			Reason: "ON CONFLICT DO NOTHING with global indexes requires branch-aware index maintenance",
 			cause:  ErrDistributedWriteUnsupported,
+		}
+	}
+	return nil
+}
+
+// rejectComputedUpdateAssignments fences write lanes that would otherwise
+// replay a SET list outside the shard-local SQL evaluator. Expr.Pos names the
+// authored right-hand side, so protocol adapters retain an exact 0A000
+// position rather than pointing at the assignment target or statement start.
+func rejectComputedUpdateAssignments(
+	source string,
+	statement *sqlast.Statement,
+	reason string,
+) error {
+	if statement == nil || statement.Kind != sqlast.KindUpdate ||
+		statement.Update == nil {
+		return nil
+	}
+	for i := range statement.Update.Assignments {
+		expression := statement.Update.Assignments[i].Expr
+		if expression != nil {
+			return sqlast.NewFeatureNotSupportedError(
+				source, expression.Pos, reason,
+			)
 		}
 	}
 	return nil

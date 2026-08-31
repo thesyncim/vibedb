@@ -335,9 +335,17 @@ type UpdateStmt struct {
 }
 
 // UpdateAssignment replaces one declared top-level column with one scalar.
+// Exactly one representation is active: literals, placeholders, NULL, and
+// folded typed constants use Value directly; a computed expression uses Expr
+// and sets Value.Kind to [OperandExpression]. Keeping the direct operand lane
+// preserves the allocation-free common case while making computed assignments
+// fail closed in legacy write paths. Every Expr in one SET list reads the same
+// pre-update row; assignment order never makes an earlier result visible to a
+// later right-hand side.
 type UpdateAssignment struct {
 	Column string
 	Value  Operand
+	Expr   *ScalarExpr
 	Pos    int
 }
 

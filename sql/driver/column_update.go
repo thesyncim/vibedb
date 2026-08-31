@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/query"
@@ -20,7 +21,46 @@ import (
 // coordinator before emitting a digest-guarded replacement. Existing values
 // remain raw JSON bytes; only assigned scalars are encoded.
 func ApplyColumnAssignments(document []byte, assignments []sqlast.UpdateAssignment, args []any, maxBytes int) ([]byte, error) {
-	return applyColumnAssignments(document, nil, assignments, args, maxBytes)
+	return applyColumnAssignments(document, nil, assignments, args, nil, maxBytes)
+}
+
+// applyColumnAssignmentsWithExpressions materializes an ordinary declared-
+// column UPDATE using the one-row computed-assignment projection returned by
+// query.DMLStatement.EvaluateUpdateExpressions. Direct operands and computed
+// cells are collected before the document is patched, so every right-hand side
+// observes the same pre-update row.
+func applyColumnAssignmentsWithExpressions(
+	document []byte,
+	assignments []sqlast.UpdateAssignment,
+	args []any,
+	evaluated *query.Cursor,
+	maxBytes int,
+) ([]byte, error) {
+	return applyColumnAssignments(
+		document, nil, assignments, args, evaluated, maxBytes,
+	)
+}
+
+func materializeColumnAssignments(
+	statement *query.DMLStatement,
+	exec *query.Exec,
+	document []byte,
+	assignments []sqlast.UpdateAssignment,
+	args []any,
+	maxBytes int,
+) ([]byte, error) {
+	if statement == nil || !statement.HasUpdateExpressions() {
+		return ApplyColumnAssignments(document, assignments, args, maxBytes)
+	}
+	cursor, err := statement.EvaluateUpdateExpressions(
+		exec, document, args, maxBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return applyColumnAssignmentsWithExpressions(
+		document, assignments, args, &cursor, maxBytes,
+	)
 }
 
 // ApplyColumnAssignmentsWithExcluded materializes the conflict branch of an
@@ -35,7 +75,7 @@ func ApplyColumnAssignmentsWithExcluded(
 	args []any,
 	maxBytes int,
 ) ([]byte, error) {
-	return applyColumnAssignments(document, excluded, assignments, args, maxBytes)
+	return applyColumnAssignments(document, excluded, assignments, args, nil, maxBytes)
 }
 
 func applyColumnAssignments(
@@ -43,6 +83,7 @@ func applyColumnAssignments(
 	excluded []byte,
 	assignments []sqlast.UpdateAssignment,
 	args []any,
+	evaluated *query.Cursor,
 	maxBytes int,
 ) ([]byte, error) {
 	if len(assignments) == 0 {
@@ -56,9 +97,67 @@ func applyColumnAssignments(
 	materialized := make([]materializedAssignment, len(assignments))
 	byColumn := make(map[string]int, len(assignments))
 	hasExcluded := false
+	expressions := 0
+	for i := range assignments {
+		switch {
+		case assignments[i].Expr != nil &&
+			assignments[i].Value.Kind != sqlast.OperandExpression:
+			return nil, fmt.Errorf(
+				"vibedb: UPDATE assignment %q carries an expression without its expression marker",
+				assignments[i].Column,
+			)
+		case assignments[i].Expr == nil &&
+			assignments[i].Value.Kind == sqlast.OperandExpression:
+			return nil, fmt.Errorf(
+				"vibedb: UPDATE assignment %q requires a computed expression",
+				assignments[i].Column,
+			)
+		case assignments[i].Expr != nil:
+			expressions++
+		}
+	}
+	if expressions != 0 {
+		if evaluated == nil {
+			return nil, fmt.Errorf(
+				"vibedb: UPDATE has %d computed assignment(s) but no evaluated row",
+				expressions,
+			)
+		}
+		if !evaluated.Next() {
+			return nil, fmt.Errorf(
+				"vibedb: UPDATE computed assignment projection returned no row: %w",
+				query.ErrScalarResultShape,
+			)
+		}
+	} else if evaluated != nil {
+		return nil, errors.New(
+			"vibedb: direct UPDATE assignments were given an expression result",
+		)
+	}
+	expression := 0
 	for i := range assignments {
 		var value []byte
-		if assignments[i].Value.Kind == sqlast.OperandExcluded {
+		if assignments[i].Expr != nil {
+			cell := evaluated.Cell(expression)
+			expression++
+			value = cell.JSON()
+			if cell.Kind() == query.TypeNumber {
+				if integer, ok := canonicalComputedInteger(
+					value, maxBytes,
+				); ok {
+					value = integer
+				}
+			}
+			kind := (vibejson.RawValue{Src: value}).Kind()
+			if kind == jsondoc.Object || kind == jsondoc.Array {
+				return nil, &query.ScalarTypeError{
+					Pos:       assignments[i].Expr.Pos,
+					Operation: "UPDATE SET",
+					Left:      cell.Kind(),
+					Right:     query.TypeAny,
+				}
+			}
+		} else if assignments[i].Value.Kind == sqlast.OperandExcluded {
 			if excluded == nil {
 				return nil, errors.New("vibedb: EXCLUDED is only available to ON CONFLICT DO UPDATE")
 			}
@@ -80,6 +179,18 @@ func applyColumnAssignments(
 			lastMember: -1,
 		}
 		byColumn[assignments[i].Column] = i
+	}
+	if expression != expressions {
+		return nil, fmt.Errorf(
+			"vibedb: UPDATE consumed %d of %d computed assignments: %w",
+			expression, expressions, query.ErrScalarResultShape,
+		)
+	}
+	if evaluated != nil && evaluated.Next() {
+		return nil, fmt.Errorf(
+			"vibedb: UPDATE computed assignment projection returned more than one row: %w",
+			query.ErrScalarResultShape,
+		)
 	}
 	if hasExcluded {
 		candidate, err := vibejson.ParseOptions(excluded, vibejson.Options{ZeroCopy: true})
@@ -248,6 +359,138 @@ func applyColumnAssignments(
 	return updated, nil
 }
 
+// canonicalComputedInteger converts an exact JSON number whose mathematical
+// value is integral into the exponent-free spelling required by INTEGER schema
+// fields. The scalar runtime deliberately emits normalized scientific notation
+// (for example 12 as 1.2e1); SELECT keeps that representation, while assignment
+// materialization applies the target document's JSON integer boundary. Growth
+// is capped before allocation so an attacker-sized exponent cannot bypass the
+// document limit.
+func canonicalComputedInteger(value []byte, maxBytes int) ([]byte, bool) {
+	if len(value) == 0 || maxBytes <= 0 {
+		return nil, false
+	}
+	index := 0
+	negative := false
+	if value[index] == '-' {
+		negative = true
+		index++
+		if index == len(value) {
+			return nil, false
+		}
+	}
+	integerStart := index
+	for index < len(value) && value[index] >= '0' && value[index] <= '9' {
+		index++
+	}
+	integerEnd := index
+	if integerEnd == integerStart {
+		return nil, false
+	}
+	fractionStart, fractionEnd := index, index
+	if index < len(value) && value[index] == '.' {
+		index++
+		fractionStart = index
+		for index < len(value) && value[index] >= '0' && value[index] <= '9' {
+			index++
+		}
+		fractionEnd = index
+		if fractionEnd == fractionStart {
+			return nil, false
+		}
+	}
+	exponent := int64(0)
+	if index < len(value) && (value[index] == 'e' || value[index] == 'E') {
+		index++
+		start := index
+		if index < len(value) && (value[index] == '+' || value[index] == '-') {
+			index++
+		}
+		digits := index
+		for index < len(value) && value[index] >= '0' && value[index] <= '9' {
+			index++
+		}
+		if digits == index {
+			return nil, false
+		}
+		parsed, err := strconv.ParseInt(string(value[start:index]), 10, 64)
+		if err != nil {
+			return nil, false
+		}
+		exponent = parsed
+	}
+	if index != len(value) {
+		return nil, false
+	}
+	fractionDigits := fractionEnd - fractionStart
+	if exponent < math.MinInt64+int64(fractionDigits) {
+		return nil, false
+	}
+	scale := exponent - int64(fractionDigits)
+	totalDigits := integerEnd - integerStart + fractionDigits
+	digitAt := func(ordinal int) byte {
+		integerDigits := integerEnd - integerStart
+		if ordinal < integerDigits {
+			return value[integerStart+ordinal]
+		}
+		return value[fractionStart+ordinal-integerDigits]
+	}
+	nonzero := false
+	for ordinal := 0; ordinal < totalDigits; ordinal++ {
+		if digitAt(ordinal) != '0' {
+			nonzero = true
+			break
+		}
+	}
+	if !nonzero {
+		return []byte{'0'}, true
+	}
+	outputDigits := totalDigits
+	zeros := int64(0)
+	if scale < 0 {
+		if scale == math.MinInt64 {
+			return nil, false
+		}
+		remove := -scale
+		if remove >= int64(totalDigits) {
+			return nil, false
+		}
+		outputDigits -= int(remove)
+		for ordinal := outputDigits; ordinal < totalDigits; ordinal++ {
+			if digitAt(ordinal) != '0' {
+				return nil, false
+			}
+		}
+	} else {
+		zeros = scale
+	}
+	first := 0
+	for first < outputDigits && digitAt(first) == '0' {
+		first++
+	}
+	if first == outputDigits {
+		return []byte{'0'}, true
+	}
+	width := int64(outputDigits-first) + zeros
+	if negative {
+		width++
+	}
+	if width <= 0 || width > int64(maxBytes) || width > int64(^uint(0)>>1) {
+		return nil, false
+	}
+	integer := make([]byte, 0, int(width))
+	if negative {
+		integer = append(integer, '-')
+	}
+	for ordinal := first; ordinal < outputDigits; ordinal++ {
+		integer = append(integer, digitAt(ordinal))
+	}
+	for ; zeros > 0; zeros-- {
+		integer = append(integer, '0')
+	}
+	return integer, true
+}
+
 // validateUpsertColumnAssignments resolves both sides of the deliberately flat
 // conflict SET list against the current table incarnation. EXCLUDED is a row
 // namespace, not a way to reach arbitrary undeclared JSON members through SQL.
@@ -320,6 +563,21 @@ func validateColumnAssignmentBindings(
 	args []any,
 ) error {
 	for i := range assignments {
+		if assignments[i].Expr != nil {
+			if assignments[i].Value.Kind != sqlast.OperandExpression {
+				return fmt.Errorf(
+					"vibedb: UPDATE assignment %q carries an expression without its expression marker",
+					assignments[i].Column,
+				)
+			}
+			continue
+		}
+		if assignments[i].Value.Kind == sqlast.OperandExpression {
+			return fmt.Errorf(
+				"vibedb: UPDATE assignment %q has an expression marker without an expression",
+				assignments[i].Column,
+			)
+		}
 		if assignments[i].Value.Kind == sqlast.OperandExcluded {
 			continue
 		}
