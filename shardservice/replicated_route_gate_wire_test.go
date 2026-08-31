@@ -136,12 +136,17 @@ func TestReplicatedRouteGateReadAuthorizationAndOwnerFences(t *testing.T) {
 		t.Fatal("stale generation")
 	}
 	request = routeGateRequest()
-	owner := &routeGateOwner{fakeReplicatedOwner: &fakeReplicatedOwner{state: testReplicatedServingState()}, result: raftservice.RouteGateReadResult{Applied: 9, Status: routegate.Status{Epoch: 17}}}
+	owner := &routeGateOwner{fakeReplicatedOwner: &fakeReplicatedOwner{state: testReplicatedServingState()}, result: raftservice.RouteGateReadResult{Applied: 12, Status: routegate.Status{Epoch: 17}}}
 	server = testReplicatedServer(owner)
 	lease := &testPointReadLease{}
 	owner.lease = lease
 	response := server.executeReplicated(t.Context(), request)
-	if response.Kind != ReplicatedRouteGateReadResult || !validReplicatedResponse(response) || owner.request.Fence.Term != request.Fence.Term || owner.request.MinimumApplied != 7 || owner.request.Capability != serviceauthz.CapabilityDataWrite || lease.released.Load() {
+	if response.Kind != ReplicatedRouteGateReadResult || !validReplicatedResponse(response) ||
+		response.ReadApplied != 12 || response.State.Fence != request.Fence ||
+		response.State.Applied != 12 || response.State.Commit != 12 ||
+		owner.probeCalls.Load() != 1 || owner.request.Fence.Term != request.Fence.Term ||
+		owner.request.MinimumApplied != 7 ||
+		owner.request.Capability != serviceauthz.CapabilityDataWrite || lease.released.Load() {
 		t.Fatalf("response %+v request %+v", response, owner.request)
 	}
 	response.readLease.Release()
@@ -162,8 +167,10 @@ func TestReplicatedRouteGateReadAuthorizationAndOwnerFences(t *testing.T) {
 	} {
 		owner.err = tt.err
 		owner.lease = &testPointReadLease{}
+		owner.probeCalls.Store(0)
 		response = server.executeReplicated(t.Context(), request)
-		if response.Kind != tt.kind || response.Refusal != tt.refusal || !owner.lease.(*testPointReadLease).released.Load() {
+		if response.Kind != tt.kind || response.Refusal != tt.refusal ||
+			!owner.lease.(*testPointReadLease).released.Load() || owner.probeCalls.Load() != 2 {
 			t.Fatalf("error %v response %+v", tt.err, response)
 		}
 	}

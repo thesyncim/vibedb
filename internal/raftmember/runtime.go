@@ -925,6 +925,18 @@ func (runtime *Runtime) SnapshotState() (replicatedstate.State, error) {
 	return state, nil
 }
 
+// SnapshotAuthorizationFence returns the fixed-width durable publication
+// metadata needed by serving authorization without acquiring a collection
+// snapshot or scanning the hidden state image. Pending result settlement stays
+// a hard fence: a published apply cannot authorize a new serving generation
+// until its original result has been settled.
+func (runtime *Runtime) SnapshotAuthorizationFence() (replicatedstate.SnapshotFence, error) {
+	if err := runtime.checkNoPendingSettlement(); err != nil {
+		return replicatedstate.SnapshotFence{}, err
+	}
+	return runtime.apply.SnapshotAuthorizationFence()
+}
+
 // SnapshotBaseCertificate returns the exact immutable snapshot-base
 // certificate sealed into the current WAL generation. It never synthesizes a
 // certificate from live state: callers use the returned digest together with

@@ -308,6 +308,9 @@ func TestRuntimeInMemoryBatchDriverAndSettlementGate(t *testing.T) {
 	if _, err := runtime.SnapshotState(); !errors.Is(err, ErrResultSettlementPending) {
 		t.Fatalf("memory snapshot during settlement = %v", err)
 	}
+	if _, err := runtime.SnapshotAuthorizationFence(); !errors.Is(err, ErrResultSettlementPending) {
+		t.Fatalf("memory authorization fence during settlement = %v", err)
+	}
 	if err := runtime.Close(); !errors.Is(err, ErrResultSettlementPending) {
 		t.Fatalf("memory close during settlement = %v", err)
 	}
@@ -446,6 +449,9 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 	}
 	if _, err := fixture.runtime.SnapshotState(); !errors.Is(err, ErrResultSettlementPending) {
 		t.Fatalf("snapshot cut during settlement = %v", err)
+	}
+	if _, err := fixture.runtime.SnapshotAuthorizationFence(); !errors.Is(err, ErrResultSettlementPending) {
+		t.Fatalf("authorization fence during settlement = %v", err)
 	}
 	if _, err := fixture.runtime.WALRetentionInput(); !errors.Is(err, ErrResultSettlementPending) {
 		t.Fatalf("retention cut during settlement = %v", err)

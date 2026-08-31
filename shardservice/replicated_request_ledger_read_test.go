@@ -124,7 +124,7 @@ func TestReplicatedServerServesRequestLedgerThroughDedicatedOwnerRead(t *testing
 	owner := &fakeReplicatedOwner{
 		state: state,
 		requestLedgerResult: raftservice.RequestLedgerReadResult{
-			Applied: 7, Found: true, AuthoritativeKind: replicatedstate.RequestLedgerReadAck,
+			Applied: 12, Found: true, AuthoritativeKind: replicatedstate.RequestLedgerReadAck,
 			Value: []byte{1, 2, 3},
 		},
 	}
@@ -136,7 +136,10 @@ func TestReplicatedServerServesRequestLedgerThroughDedicatedOwnerRead(t *testing
 		RequestLedgerRead: testReplicatedRequestLedgerRead(),
 	}
 	response := testReplicatedServer(owner).executeReplicated(t.Context(), request)
-	if response.Kind != ReplicatedRequestLedgerReadResult || response.ReadApplied != 7 {
+	if response.Kind != ReplicatedRequestLedgerReadResult || response.ReadApplied != 12 ||
+		response.State.Fence != request.Fence || response.State.Applied != 12 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
+		!validReplicatedResponse(response) {
 		t.Fatalf("response = %+v", response)
 	}
 	opened, err := OpenReplicatedRequestLedgerReadValue(response.Value)

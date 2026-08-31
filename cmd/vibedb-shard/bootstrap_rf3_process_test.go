@@ -5,7 +5,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -334,15 +333,7 @@ func TestPrepareRF3ColdTargetProcessHarness(t *testing.T) {
 	if err = os.WriteFile(policyPath, rf3CommandPolicyWithTarget(nodes, targetNode), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	addresses := make([]string, 7)
-	for index := range addresses {
-		listener, listenErr := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
-		if listenErr != nil {
-			t.Fatal(listenErr)
-		}
-		addresses[index] = listener.Addr().String()
-		_ = listener.Close()
-	}
+	addresses := rf3CommandUnusedAddresses(t, 7)
 	var peers [rf3CommandMembers]string
 	copy(peers[:], addresses[:3])
 	target := rf3ManifestEnrolledTarget{

@@ -33,6 +33,7 @@ type fakeRuntime struct {
 	messages            []*pb.Message
 	publication         raftmodel.Publication
 	snapshotState       replicatedstate.State
+	snapshotFence       replicatedstate.SnapshotFence
 	status              raftmember.RuntimeStatus
 	progress            map[uint64]raftmodel.MemberProgress
 	transfers           []uint64
@@ -199,6 +200,10 @@ func (runtime *fakeRuntime) DurablePromotion(
 
 func (runtime *fakeRuntime) SnapshotState() (replicatedstate.State, error) {
 	return runtime.snapshotState, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) SnapshotAuthorizationFence() (replicatedstate.SnapshotFence, error) {
+	return runtime.snapshotFence, runtime.inputErr
 }
 
 func (runtime *fakeRuntime) Status() (raftmember.RuntimeStatus, error) {
@@ -565,6 +570,11 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
 	snapshotState, err := host.SnapshotState(runtime.identity.Group)
 	if err != nil || snapshotState.Applied != 9 || snapshotState.SnapshotBaseDigest[0] != 1 {
 		t.Fatalf("SnapshotState = %+v, %v", snapshotState, err)
+	}
+	runtime.snapshotFence = replicatedstate.SnapshotFence{Applied: 10, DataChainDigest: [32]byte{2}}
+	snapshotFence, err := host.SnapshotAuthorizationFence(runtime.identity.Group)
+	if err != nil || snapshotFence.Applied != 10 || snapshotFence.DataChainDigest[0] != 2 {
+		t.Fatalf("SnapshotAuthorizationFence = %+v, %v", snapshotFence, err)
 	}
 	status, err := host.Status(runtime.identity.Group)
 	if err != nil || status.Term != 5 || status.Commit != 9 {

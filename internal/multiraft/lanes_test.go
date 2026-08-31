@@ -238,6 +238,7 @@ func TestExecutionLanesQueryWrappersUseOwningLane(t *testing.T) {
 	member := runtimeForLane(t, set, 1, 37)
 	member.publication = raftmodel.Publication{Applied: 11, ReplicaSetVersion: 12}
 	member.snapshotState = replicatedstate.State{Applied: 13}
+	member.snapshotFence = replicatedstate.SnapshotFence{Applied: 18}
 	member.status.Term = 14
 	member.progress = map[uint64]raftmodel.MemberProgress{
 		15: {Match: 16, Next: 17},
@@ -252,6 +253,10 @@ func TestExecutionLanesQueryWrappersUseOwningLane(t *testing.T) {
 	state, err := set.SnapshotState(member.identity.Group)
 	if err != nil || state.Applied != 13 {
 		t.Fatalf("snapshot state=%+v err=%v", state, err)
+	}
+	fence, err := set.SnapshotAuthorizationFence(member.identity.Group)
+	if err != nil || fence.Applied != 18 {
+		t.Fatalf("snapshot authorization fence=%+v err=%v", fence, err)
 	}
 	status, err := set.Status(member.identity.Group)
 	if err != nil || status.Term != 14 {

@@ -670,6 +670,7 @@ type ownerHost interface {
 	Progress(raftmember.GroupKey, uint64) (raftmodel.MemberProgress, bool, error)
 	DurablePromotion(raftmember.GroupKey, uint64) (raftmember.DurablePromotionProof, bool, error)
 	SnapshotState(raftmember.GroupKey) (replicatedstate.State, error)
+	SnapshotAuthorizationFence(raftmember.GroupKey) (replicatedstate.SnapshotFence, error)
 	SnapshotBaseCertificate(raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error)
 	Add(*raftmember.Runtime) error
 	Remove(raftmember.GroupKey) error
@@ -1049,18 +1050,16 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.state.Status, reply.err = owner.host.Status(request.group)
 		if reply.err == nil {
 			publication, publicationErr := owner.host.Publication(request.group)
-			if publicationErr != nil {
-				reply.err = publicationErr
-			} else if publication.ReplicaSetVersion != 0 {
-				// A probe is the source of the caller's next serving fence. All
-				// mutable fields must come from the applied cut, including on a
-				// follower that has never received a controller observation.
-				state, stateErr := owner.host.SnapshotState(request.group)
-				reply.err = stateErr
-				if stateErr == nil {
-					reply.err = owner.syncCommandFenceFromState(request.group, ReplicaObservation{
-						Publication: publication, State: state,
-					})
+			reply.err = publicationErr
+			if publicationErr == nil && publication.ReplicaSetVersion != 0 {
+				// A probe is the source of the caller's next serving fence. Read the
+				// same durable publication metadata as a full snapshot, but do not
+				// acquire collection generations or rescan the hidden state image.
+				// Runtime retains the pending-result-settlement fence around this cut.
+				fence, fenceErr := owner.host.SnapshotAuthorizationFence(request.group)
+				reply.err = fenceErr
+				if fenceErr == nil {
+					reply.err = owner.syncCommandFenceFromSnapshot(request.group, publication, fence)
 					reply.state.Command = owner.members[request.group].command
 				}
 			}
@@ -1471,6 +1470,41 @@ func (owner *Owner) syncCommandFenceFromState(
 		return ErrServingFence
 	}
 	member.command.ReplicaSetVersion = observation.Publication.ReplicaSetVersion
+	member.command.ActivePolicyGeneration = binding.ActivePolicyGeneration
+	member.command.ProtectionEpoch = binding.ProtectionEpoch
+	member.command.OwnershipEpoch = binding.OwnershipEpoch
+	member.command.SchemaGeneration = binding.SchemaGeneration
+	member.command.RoutingVersion = binding.RoutingVersion
+	member.command.RouteGeneration = binding.RouteGeneration
+	owner.members[group] = member
+	return nil
+}
+
+func (owner *Owner) syncCommandFenceFromSnapshot(
+	group raftmember.GroupKey,
+	publication raftmodel.Publication,
+	fence replicatedstate.SnapshotFence,
+) error {
+	member, found := owner.members[group]
+	if !found {
+		return multiraft.ErrGroupNotFound
+	}
+	binding := fence.Binding
+	if binding.ClusterID != group.ClusterID || binding.ClusterIncarnation != group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != group.ShardIncarnation || binding.GroupID != group.GroupID ||
+		binding.AllocationGeneration != member.identity.AllocationGeneration ||
+		publication.ReplicaSetVersion == 0 ||
+		fence.ReplicaSetVersion != publication.ReplicaSetVersion ||
+		fence.RelationManifestDigest == ([32]byte{}) ||
+		fence.RelationManifestDigest != member.identity.RelationManifestDigest ||
+		fence.RelationManifestDigest != member.command.RelationManifestDigest ||
+		binding.ActivePolicyGeneration == 0 || binding.ProtectionEpoch == 0 ||
+		binding.OwnershipEpoch == 0 || binding.SchemaGeneration == 0 ||
+		binding.RoutingVersion == 0 || binding.RouteGeneration == 0 {
+		return ErrServingFence
+	}
+	member.command.ReplicaSetVersion = publication.ReplicaSetVersion
 	member.command.ActivePolicyGeneration = binding.ActivePolicyGeneration
 	member.command.ProtectionEpoch = binding.ProtectionEpoch
 	member.command.OwnershipEpoch = binding.OwnershipEpoch

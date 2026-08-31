@@ -25,10 +25,8 @@ func (server *ReplicatedServer) readRouteGate(ctx context.Context, request *Repl
 		readLease.Release()
 		readLease = nil
 	}
-	if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-		wireState = replicatedWireState(refreshed)
-	}
 	if readErr == nil {
+		wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 		value, encodeErr := AppendReplicatedRouteGateReadValue(nil,
 			result.Status)
 		response := &ReplicatedResponse{
@@ -44,6 +42,9 @@ func (server *ReplicatedServer) readRouteGate(ctx context.Context, request *Repl
 		}
 		return &ReplicatedResponse{Kind: ReplicatedRefusal,
 			Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+	}
+	if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+		wireState = replicatedWireState(refreshed)
 	}
 	switch {
 	case errors.Is(readErr, raftmodel.ErrNotLeader),

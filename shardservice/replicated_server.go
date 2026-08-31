@@ -539,10 +539,8 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			readLease.Release()
 			readLease = nil
 		}
-		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-			wireState = replicatedWireState(refreshed)
-		}
 		if readErr == nil {
+			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			response := &ReplicatedResponse{Kind: ReplicatedReadBatchResult,
 				HasState: true, State: wireState, ReadApplied: result.Applied,
 				Value: result.Data, readLease: readLease}
@@ -554,6 +552,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			}
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
 		}
 		switch {
 		case errors.Is(readErr, raftmodel.ErrNotLeader),
@@ -596,10 +597,8 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			readLease.Release()
 			readLease = nil
 		}
-		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-			wireState = replicatedWireState(refreshed)
-		}
 		if readErr == nil {
+			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			kind := ReplicatedReadMissing
 			if result.Found {
 				kind = ReplicatedReadFound
@@ -614,6 +613,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			}
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 				HasState: true, State: wireState}
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
 		}
 		switch {
 		case errors.Is(readErr, raftmodel.ErrNotLeader),
@@ -659,10 +661,8 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			readLease.Release()
 			readLease = nil
 		}
-		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-			wireState = replicatedWireState(refreshed)
-		}
 		if readErr == nil {
+			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			value, encodeErr := AppendReplicatedTransactionReadValue(nil,
 				ReplicatedTransactionReadValue{
 					Kind: request.TransactionRead.Kind, Complete: result.Complete,
@@ -684,6 +684,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			}
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
 		}
 		switch {
 		case errors.Is(readErr, raftmodel.ErrNotLeader),
@@ -734,10 +737,8 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			readLease.Release()
 			readLease = nil
 		}
-		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-			wireState = replicatedWireState(refreshed)
-		}
 		if readErr == nil {
+			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			value, encodeErr := AppendReplicatedRequestLedgerReadValue(nil,
 				ReplicatedRequestLedgerReadValue{
 					Found: result.Found, AuthoritativeKind: result.AuthoritativeKind,
@@ -756,6 +757,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			}
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
 		}
 		switch {
 		case errors.Is(readErr, raftmodel.ErrNotLeader),
@@ -805,10 +809,8 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			readLease.Release()
 			readLease = nil
 		}
-		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-			wireState = replicatedWireState(refreshed)
-		}
 		if readErr == nil {
+			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			value, encodeErr := AppendReplicatedExecutionPinReadValue(nil,
 				ReplicatedExecutionPinReadValue{Found: result.Found, Record: result.Record})
 			response := &ReplicatedResponse{
@@ -824,6 +826,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			}
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
 		}
 		switch {
 		case errors.Is(readErr, raftmodel.ErrNotLeader),
@@ -978,6 +983,18 @@ func replicatedStateAtApplied(
 		state.Commit = applied
 	}
 	return state
+}
+
+func replicatedReadState(
+	state ReplicatedMemberState,
+	fence ReplicatedFence,
+	applied uint64,
+) ReplicatedMemberState {
+	// Every successful read path revalidates this complete fence at the exact
+	// data cut it returns. Preserve that evidence and advance only monotonic
+	// Raft watermarks, rather than pairing the read with a later status probe.
+	state.Fence = fence
+	return replicatedStateAtApplied(state, applied)
 }
 
 func replicatedDeterministicInvalidReasons(

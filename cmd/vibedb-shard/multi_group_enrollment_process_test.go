@@ -157,8 +157,9 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 			ShardKey: gateway.ReplicatedCatalogPrimaryKey, TupleVersion: distribution.CurrentTupleVersion,
 			MapperVersion: distribution.NativeMapperVersion, Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}
 	identity1, identity2 := rf3EnrolledGroupIdentities()
+	targetAddresses := rf3CommandUnusedAddresses(t, 4)
 	target1 := rf3testfixture.ProcessTarget{MemberID: 4, NodeID: targetNode, StoreID: [16]byte{0xe1}, NodeIncarnation: 1,
-		Listeners: rf3testfixture.ProcessListeners{Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t), Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t)}}
+		Listeners: rf3testfixture.ProcessListeners{Peer: targetAddresses[0], Native: targetAddresses[1], Snapshot: targetAddresses[2], Control: targetAddresses[3]}}
 	target2 := target1
 	target2.StoreID[0]++
 	staticBootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
