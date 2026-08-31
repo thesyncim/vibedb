@@ -1,29 +1,125 @@
 package pgwire
 
 import (
-	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
-
-	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
-func TestPGWireUpsertBareConflictColumnAmbiguitySQLStateAndPosition(t *testing.T) {
-	const source = `INSERT INTO wire_upsert_ambiguity (id, a) VALUES ('x', 1) ON CONFLICT DO UPDATE SET a = a + 1`
-	_, err := sqlast.ParseStatement(source)
-	var ambiguous *sqlast.AmbiguousColumnError
-	if !errors.As(err, &ambiguous) {
-		t.Fatalf("bare conflict column error = %T %v, want *sql.AmbiguousColumnError", err, err)
+func TestPGWireUpsertBareConflictColumnsBindAgainstCatalog(t *testing.T) {
+	c := connectSQLCatalog(t)
+	requireWireOK(t, c.query(`
+		CREATE TABLE wire_upsert_binding (
+			id STRING PRIMARY KEY,
+			a INTEGER NOT NULL
+		)`))
+
+	tests := []struct {
+		name   string
+		source string
+		marker string
+		code   string
+	}{
+		{
+			name: "declared is ambiguous",
+			source: `INSERT INTO wire_upsert_binding (id, a) VALUES ('x', 1) ` +
+				`ON CONFLICT DO UPDATE SET a = a + 1`,
+			marker: "a + 1",
+			code:   sqlstateAmbiguousColumn,
+		},
+		{
+			name: "missing is undefined",
+			source: `INSERT INTO wire_upsert_binding (id, a) VALUES ('x', 1) ` +
+				`ON CONFLICT DO UPDATE SET a = missing + 1`,
+			marker: "missing",
+			code:   sqlstateUndefinedColumn,
+		},
+		{
+			name: "qualified missing starts at excluded",
+			source: `INSERT INTO wire_upsert_binding (id, a) VALUES ('x', 1) ` +
+				`ON CONFLICT DO UPDATE SET a = EXCLUDED.missing`,
+			marker: "EXCLUDED.missing",
+			code:   sqlstateUndefinedColumn,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			messages := c.query(test.source)
+			fields := expectError(t, messages, test.code)
+			assertReadyStatus(t, messages, statusIdle)
+			wantPosition := strconv.Itoa(strings.LastIndex(
+				test.source, test.marker,
+			) + 1)
+			if fields['P'] != wantPosition {
+				t.Fatalf(
+					"ErrorResponse position = %q, want %q at %q",
+					fields['P'], wantPosition, test.marker,
+				)
+			}
+		})
 	}
 
-	pg := asPGErrorIn(err, source)
-	wantPosition := strings.LastIndex(source, "a + 1") + 1
-	if pg.code != sqlstateAmbiguousColumn || pg.position != wantPosition {
-		t.Fatalf(
-			"bare conflict column => code=%s position=%d, want %s/%d: %v",
-			pg.code, pg.position, sqlstateAmbiguousColumn, wantPosition, err,
-		)
+	rows := rowsOf(t, c.query(`SELECT COUNT(*) FROM wire_upsert_binding`))
+	if len(rows) != 1 || len(rows[0]) != 1 || string(rows[0][0]) != "0" {
+		t.Fatalf("catalog binding errors published a candidate: %q", rows)
+	}
+}
+
+func TestPGWireMutationTargetAliasErrorsKeepPostgreSQLClasses(t *testing.T) {
+	c := connectSQLCatalog(t)
+	requireWireOK(t, c.query(`
+		CREATE TABLE wire_mutation_alias_error (
+			id STRING PRIMARY KEY,
+			a INTEGER NOT NULL
+		)`))
+
+	hidden := `UPDATE wire_mutation_alias_error AS target ` +
+		`SET a = wire_mutation_alias_error.a + 1 WHERE target.id = 'x'`
+	messages := c.query(hidden)
+	fields := expectError(t, messages, sqlstateUndefinedTable)
+	assertReadyStatus(t, messages, statusIdle)
+	if want := strconv.Itoa(strings.LastIndex(
+		hidden, "wire_mutation_alias_error.a",
+	) + 1); fields['P'] != want {
+		t.Fatalf("hidden target position = %q, want %q", fields['P'], want)
+	}
+	if !strings.Contains(fields['H'], `"target"`) {
+		t.Fatalf("hidden target hint = %q, want alias guidance", fields['H'])
+	}
+
+	ambiguous := `INSERT INTO wire_mutation_alias_error AS excluded (id, a) ` +
+		`VALUES ('x', 1) ON CONFLICT DO UPDATE SET a = excluded.a`
+	messages = c.query(ambiguous)
+	fields = expectError(t, messages, sqlstateAmbiguousAlias)
+	assertReadyStatus(t, messages, statusIdle)
+	if want := strconv.Itoa(strings.LastIndex(
+		ambiguous, "excluded.a",
+	) + 1); fields['P'] != want {
+		t.Fatalf("ambiguous alias position = %q, want %q", fields['P'], want)
+	}
+
+	for _, source := range []string{
+		`UPDATE wire_mutation_alias_error AS target SET target.a = 1`,
+		`INSERT INTO wire_mutation_alias_error AS target (id, a) ` +
+			`VALUES ('x', 1) ON CONFLICT DO UPDATE SET target.a = 1`,
+		`INSERT INTO wire_mutation_alias_error AS target (id, a) ` +
+			`VALUES ('x', 1) ON CONFLICT DO UPDATE SET EXCLUDED.a = 1`,
+	} {
+		messages = c.query(source)
+		fields = expectError(t, messages, sqlstateUndefinedColumn)
+		assertReadyStatus(t, messages, statusIdle)
+		marker := "target.a"
+		if strings.Contains(source, "SET EXCLUDED.a") {
+			marker = "EXCLUDED.a"
+		}
+		if want := strconv.Itoa(strings.LastIndex(source, marker) + 1); fields['P'] != want {
+			t.Fatalf("qualified SET target position = %q, want %q for %q",
+				fields['P'], want, source)
+		}
+		if !strings.Contains(fields['H'], "cannot be qualified") {
+			t.Fatalf("qualified SET target hint = %q", fields['H'])
+		}
 	}
 }
 

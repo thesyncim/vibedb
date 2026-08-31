@@ -40,7 +40,7 @@ func (c *conn) validateSurfaceContext(
 			if err := rlockContext(ctx, &c.db.mu); err != nil {
 				return err
 			}
-			t, exists := c.db.tables[statement.Insert.Table]
+			t, exists := c.mutationValidationTableLocked(statement.Insert.Table)
 			if !exists {
 				c.db.mu.RUnlock()
 				return fmt.Errorf(
@@ -48,7 +48,11 @@ func (c *conn) validateSurfaceContext(
 				)
 			}
 			err := validateUpsertColumnAssignments(
-				statement.Insert.Table, t.meta, update.Assignments,
+				statement.Insert.Table,
+				mutationTargetRelation(
+					statement.Insert.Table, statement.Insert.Alias,
+				),
+				t.meta, update.Assignments,
 			)
 			c.db.mu.RUnlock()
 			if err != nil {
@@ -70,7 +74,7 @@ func (c *conn) validateSurfaceContext(
 			if err := rlockContext(ctx, &c.db.mu); err != nil {
 				return err
 			}
-			t, exists := c.db.tables[statement.Update.Table]
+			t, exists := c.mutationValidationTableLocked(statement.Update.Table)
 			if !exists {
 				c.db.mu.RUnlock()
 				return fmt.Errorf(
@@ -119,6 +123,25 @@ func (c *conn) validateSurfaceContext(
 		return fmt.Errorf("%w: %q", ErrTableNotFound, statement.Table())
 	}
 	return nil
+}
+
+// mutationValidationTableLocked returns the catalog incarnation against which
+// SQL analysis for one mutation must bind. The database read lock must be held.
+// A transaction parses against the fixed layout it began with; consulting the
+// replacement live table after a concurrent DROP/CREATE would classify the
+// same authored column differently from the incarnation execution can read.
+func (c *conn) mutationValidationTableLocked(name string) (*table, bool) {
+	if c != nil && c.tx != nil {
+		if layout, exists := c.tx.tableLayoutAtBegin(name); exists &&
+			layout.incarnation != nil {
+			return layout.incarnation, true
+		}
+	}
+	if c == nil || c.db == nil {
+		return nil, false
+	}
+	relation, exists := c.db.tables[name]
+	return relation, exists
 }
 
 func (c *conn) validateSelectTables(selectStmt *sqlast.SelectStmt) error {

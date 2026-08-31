@@ -875,7 +875,8 @@ func (c *conn) insertLocked(
 	conflictUpdate := tree.OnConflictUpdate
 	if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
 		if err := validateUpsertColumnAssignments(
-			tree.Table, t.meta, conflictUpdate.Assignments,
+			tree.Table, mutationTargetRelation(tree.Table, tree.Alias),
+			t.meta, conflictUpdate.Assignments,
 		); err != nil {
 			return nil, err
 		}

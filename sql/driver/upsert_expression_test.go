@@ -446,9 +446,12 @@ func TestUpsertExpressionsValidateBothNamespacesBeforeConflict(t *testing.T) {
 	if prepared != nil {
 		_ = prepared.Close()
 	}
-	var ambiguousColumn *sqlast.AmbiguousColumnError
-	if !errors.As(err, &ambiguousColumn) {
-		t.Fatalf("Prepare(bare current column) error = %T %v, want AmbiguousColumnError", err, err)
+	var ambiguousColumn *query.RelationColumnError
+	if !errors.As(err, &ambiguousColumn) ||
+		!errors.Is(err, query.ErrAmbiguousColumn) ||
+		ambiguousColumn.Relation != "upsert_expression_validation" ||
+		ambiguousColumn.Column != "n" || ambiguousColumn.Matches != 2 {
+		t.Fatalf("Prepare(bare current column) error = %+v / %v, want catalog ambiguity", ambiguousColumn, err)
 	}
 
 	for _, source := range []string{

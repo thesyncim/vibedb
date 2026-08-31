@@ -482,6 +482,22 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 	if errors.As(err, &duplicateCTE) {
 		return newError(sqlstateDuplicateAlias, duplicateCTE.Msg)
 	}
+	var qualifiedTarget *sqlast.QualifiedAssignmentTargetError
+	if errors.As(err, &qualifiedTarget) {
+		return newError(
+			sqlstateUndefinedColumn, qualifiedTarget.Msg,
+		).withHint(qualifiedTarget.SQLHint())
+	}
+	var invalidTableReference *sqlast.InvalidTableReferenceError
+	if errors.As(err, &invalidTableReference) {
+		return newError(
+			sqlstateUndefinedTable, invalidTableReference.Msg,
+		).withHint(invalidTableReference.SQLHint())
+	}
+	var ambiguousAlias *sqlast.AmbiguousAliasError
+	if errors.As(err, &ambiguousAlias) {
+		return newError(sqlstateAmbiguousAlias, ambiguousAlias.Msg)
+	}
 	var ambiguousColumn *sqlast.AmbiguousColumnError
 	if errors.As(err, &ambiguousColumn) {
 		return newError(sqlstateAmbiguousColumn, ambiguousColumn.Msg)
