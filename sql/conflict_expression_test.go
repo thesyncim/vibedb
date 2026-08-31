@@ -1,7 +1,6 @@
 package sql
 
 import (
-	"errors"
 	"strings"
 	"testing"
 )
@@ -69,28 +68,31 @@ func TestConflictAssignmentDirectFastPathsRemainDirect(t *testing.T) {
 	}
 }
 
-func TestConflictExpressionBareColumnsAreTypedAmbiguous(t *testing.T) {
+func TestConflictExpressionBareColumnsRemainCatalogDeferred(t *testing.T) {
 	const source = `INSERT INTO metrics VALUES (?) ON CONFLICT DO UPDATE SET n = n + 1`
-	_, err := ParseStatement(source)
-	var ambiguous *AmbiguousColumnError
-	if !errors.As(err, &ambiguous) {
-		t.Fatalf("ParseStatement error = %T %v, want AmbiguousColumnError", err, err)
+	statement, err := ParseStatement(source)
+	if err != nil {
+		t.Fatal(err)
 	}
+	path := statement.Insert.OnConflictUpdate.Assignments[0].Expr.Left.Path
 	want := strings.LastIndex(source, "n +")
-	if ambiguous.Pos != want || ambiguous.Name != "n" {
-		t.Fatalf("ambiguity = %+v, want name n at %d", ambiguous, want)
+	if path == nil || path.Source != ConflictUnresolvedSource ||
+		path.Spec() != "n" || path.Pos != want {
+		t.Fatalf("deferred path = %+v, want source %d name n at %d",
+			path, ConflictUnresolvedSource, want)
 	}
 }
 
-func TestConflictExpressionAmbiguityQuotesTargetSuggestion(t *testing.T) {
+func TestConflictExpressionQuotedTargetKeepsBarePathDeferred(t *testing.T) {
 	const source = `INSERT INTO "order items" VALUES (?) ON CONFLICT DO UPDATE SET n = n + 1`
-	_, err := ParseStatement(source)
-	var ambiguous *AmbiguousColumnError
-	if !errors.As(err, &ambiguous) {
-		t.Fatalf("ParseStatement error = %T %v, want AmbiguousColumnError", err, err)
+	statement, err := ParseStatement(source)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(ambiguous.Msg, `"order items".`) {
-		t.Fatalf("ambiguity guidance = %q, want quoted target qualifier", ambiguous.Msg)
+	path := statement.Insert.OnConflictUpdate.Assignments[0].Expr.Left.Path
+	if path == nil || path.Source != ConflictUnresolvedSource ||
+		path.Pos != strings.LastIndex(source, "n +") {
+		t.Fatalf("deferred quoted-target path = %+v", path)
 	}
 }
 

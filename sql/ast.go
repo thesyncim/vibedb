@@ -628,9 +628,12 @@ type OrderTerm struct {
 // documentation for how the leading identifier is decided to be a range
 // variable rather than a field.
 type PathExpr struct {
-	// Source is an index into [SelectStmt.From].
+	// Source is normally an index into [SelectStmt.From].
 	// A path listed by a containing [CorrelationSpec.References] instead indexes
 	// the ancestor From named by that reference's binding.
+	// [ConflictUnresolvedSource] is the one deliberate exception: it marks a
+	// bare top-level column in INSERT ... ON CONFLICT DO UPDATE until the SQL
+	// catalog can decide whether the name is ambiguous or undefined.
 	Source int
 	// MergedUsing is the one-based From index of the USING clause whose merged
 	// output this unqualified path names. Zero means an ordinary source path.
@@ -642,6 +645,15 @@ type PathExpr struct {
 	// Pos is the byte offset of the path's first token.
 	Pos int
 }
+
+// ConflictUnresolvedSource marks a bare top-level column reference in an
+// INSERT ... ON CONFLICT DO UPDATE right-hand side. The parser cannot classify
+// that spelling without the target table's declared columns: a declared name
+// exists in both the current and EXCLUDED rows and is therefore ambiguous,
+// while an undeclared name is undefined. Catalog-aware binding must replace or
+// reject this sentinel before executable query lowering. The value stays
+// distinct from -1, which is parser-private temporary path state.
+const ConflictUnresolvedSource = -2
 
 // A Segment is one step of a path: an object key, or an array index.
 type Segment struct {

@@ -522,32 +522,44 @@ func canonicalComputedInteger(value []byte, maxBytes int) ([]byte, bool) {
 	return integer, true
 }
 
-// validateUpsertColumnAssignments resolves both sides of the deliberately flat
-// conflict SET list against the current table incarnation. EXCLUDED is a row
-// namespace, not a way to reach arbitrary undeclared JSON members through SQL.
+// mutationTargetRelation returns the range name visible to conflict RHS paths
+// while leaving the caller's physical table name untouched.
+func mutationTargetRelation(table, alias string) string {
+	if alias != "" {
+		return alias
+	}
+	return table
+}
+
+// validateUpsertColumnAssignments resolves the deliberately flat conflict SET
+// list against the current table incarnation in authored order: each target is
+// bound before that assignment's direct EXCLUDED value or scalar expression,
+// then binding advances to the next assignment. EXCLUDED is a row namespace,
+// not a way to reach arbitrary undeclared JSON members through SQL.
 func validateUpsertColumnAssignments(
 	table string,
+	targetRelation string,
 	meta *tableMeta,
 	assignments []sqlast.UpdateAssignment,
 ) error {
-	if err := validateDeclaredColumnAssignments(table, meta, assignments); err != nil {
-		return err
-	}
 	for i := range assignments {
-		value := assignments[i].Value
-		if value.Kind != sqlast.OperandExcluded ||
-			declaredTopLevelColumn(meta, value.Text) {
-			continue
+		assignment := &assignments[i]
+		if err := validateDeclaredColumnAssignment(
+			table, meta, *assignment,
+		); err != nil {
+			return err
 		}
-		return &query.RelationColumnError{
-			Relation: table,
-			Column:   value.Text,
-			Pos:      value.Pos,
+		value := assignment.Value
+		if value.Kind == sqlast.OperandExcluded &&
+			!declaredTopLevelColumn(meta, value.Text) {
+			return &query.RelationColumnError{
+				Relation: "EXCLUDED",
+				Column:   value.Text,
+				Pos:      value.Pos,
+			}
 		}
-	}
-	for i := range assignments {
 		if err := validateUpsertScalarColumns(
-			table, meta, assignments[i].Expr,
+			targetRelation, meta, assignment.Expr,
 		); err != nil {
 			return err
 		}
@@ -562,59 +574,59 @@ func validateUpsertColumnAssignments(
 // table. Conflict expressions are intentionally flat SQL-column expressions:
 // source zero is the current row and source one is EXCLUDED.
 func validateUpsertScalarColumns(
-	table string,
+	targetRelation string,
 	meta *tableMeta,
 	expression *sqlast.ScalarExpr,
 ) error {
 	if expression == nil {
 		return nil
 	}
-	if err := validateUpsertScalarPath(table, meta, expression.Path); err != nil {
+	if err := validateUpsertScalarPath(targetRelation, meta, expression.Path); err != nil {
 		return err
 	}
-	if err := validateUpsertScalarColumns(table, meta, expression.Left); err != nil {
+	if err := validateUpsertScalarColumns(targetRelation, meta, expression.Left); err != nil {
 		return err
 	}
-	if err := validateUpsertScalarColumns(table, meta, expression.Right); err != nil {
+	if err := validateUpsertScalarColumns(targetRelation, meta, expression.Right); err != nil {
 		return err
 	}
 	for i := range expression.Whens {
 		when := &expression.Whens[i]
-		if err := validateUpsertPredicateColumns(table, meta, when.Predicate); err != nil {
+		if err := validateUpsertPredicateColumns(targetRelation, meta, when.Predicate); err != nil {
 			return err
 		}
-		if err := validateUpsertScalarColumns(table, meta, when.Match); err != nil {
+		if err := validateUpsertScalarColumns(targetRelation, meta, when.Match); err != nil {
 			return err
 		}
-		if err := validateUpsertScalarColumns(table, meta, when.Result); err != nil {
+		if err := validateUpsertScalarColumns(targetRelation, meta, when.Result); err != nil {
 			return err
 		}
 	}
-	return validateUpsertScalarColumns(table, meta, expression.Else)
+	return validateUpsertScalarColumns(targetRelation, meta, expression.Else)
 }
 
 func validateUpsertPredicateColumns(
-	table string,
+	targetRelation string,
 	meta *tableMeta,
 	expression *sqlast.Expr,
 ) error {
 	if expression == nil {
 		return nil
 	}
-	if err := validateUpsertScalarPath(table, meta, expression.Path); err != nil {
+	if err := validateUpsertScalarPath(targetRelation, meta, expression.Path); err != nil {
 		return err
 	}
-	if err := validateUpsertScalarPath(table, meta, expression.RightPath); err != nil {
+	if err := validateUpsertScalarPath(targetRelation, meta, expression.RightPath); err != nil {
 		return err
 	}
-	if err := validateUpsertScalarColumns(table, meta, expression.ScalarLeft); err != nil {
+	if err := validateUpsertScalarColumns(targetRelation, meta, expression.ScalarLeft); err != nil {
 		return err
 	}
-	if err := validateUpsertScalarColumns(table, meta, expression.ScalarRight); err != nil {
+	if err := validateUpsertScalarColumns(targetRelation, meta, expression.ScalarRight); err != nil {
 		return err
 	}
 	for i := range expression.Kids {
-		if err := validateUpsertPredicateColumns(table, meta, expression.Kids[i]); err != nil {
+		if err := validateUpsertPredicateColumns(targetRelation, meta, expression.Kids[i]); err != nil {
 			return err
 		}
 	}
@@ -622,17 +634,22 @@ func validateUpsertPredicateColumns(
 }
 
 func validateUpsertScalarPath(
-	table string,
+	targetRelation string,
 	meta *tableMeta,
 	path *sqlast.PathExpr,
 ) error {
 	if path == nil {
 		return nil
 	}
-	relation := table
-	if path.Source == 1 {
+	relation := targetRelation
+	unresolved := false
+	switch path.Source {
+	case 0:
+	case 1:
 		relation = "EXCLUDED"
-	} else if path.Source != 0 {
+	case sqlast.ConflictUnresolvedSource:
+		unresolved = true
+	default:
 		return fmt.Errorf(
 			"vibedb: ON CONFLICT expression path at byte %d has invalid source %d",
 			path.Pos, path.Source,
@@ -646,6 +663,20 @@ func validateUpsertScalarPath(
 		}
 	}
 	column := path.Segments[0].Key
+	if unresolved {
+		matches := 0
+		if declaredTopLevelColumn(meta, column) {
+			// The target row and EXCLUDED expose the same declared columns.
+			// A bare declared name therefore matches both namespaces.
+			matches = 2
+		}
+		return &query.RelationColumnError{
+			Relation: relation,
+			Column:   column,
+			Matches:  matches,
+			Pos:      path.Pos,
+		}
+	}
 	if declaredTopLevelColumn(meta, column) {
 		return nil
 	}
@@ -670,15 +701,28 @@ func validateDeclaredColumnAssignments(
 		return nil
 	}
 	for i := range assignments {
-		if !declaredTopLevelColumn(meta, assignments[i].Column) {
-			return &query.RelationColumnError{
-				Relation: table,
-				Column:   assignments[i].Column,
-				Pos:      assignments[i].Pos,
-			}
+		if err := validateDeclaredColumnAssignment(
+			table, meta, assignments[i],
+		); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func validateDeclaredColumnAssignment(
+	table string,
+	meta *tableMeta,
+	assignment sqlast.UpdateAssignment,
+) error {
+	if declaredTopLevelColumn(meta, assignment.Column) {
+		return nil
+	}
+	return &query.RelationColumnError{
+		Relation: table,
+		Column:   assignment.Column,
+		Pos:      assignment.Pos,
+	}
 }
 
 func declaredTopLevelColumn(meta *tableMeta, column string) bool {

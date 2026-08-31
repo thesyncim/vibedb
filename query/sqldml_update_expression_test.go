@@ -8,6 +8,55 @@ import (
 
 const updateExpressionTestDocumentLimit = 1 << 20
 
+func TestDMLUpdateTargetAliasKeepsPhysicalCollectionAndProjectionSource(t *testing.T) {
+	const source = `UPDATE docs AS d SET total = d.total + 1 WHERE d.id = ? RETURNING d.total`
+	statement, err := PrepareDML(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+
+	tree := statement.Tree()
+	if statement.Collection() != "docs" || tree.Update.Alias != "d" ||
+		len(tree.Update.Filter.From) != 1 ||
+		tree.Update.Filter.From[0].Name != "docs" ||
+		tree.Update.Filter.From[0].Alias != "d" ||
+		!tree.Update.Filter.From[0].HasAlias {
+		t.Fatalf(
+			"aliased UPDATE identity = collection %q alias %q from %+v",
+			statement.Collection(), tree.Update.Alias, tree.Update.Filter.From,
+		)
+	}
+
+	var exec Exec
+	cursor, err := statement.EvaluateUpdateExpressions(
+		&exec, []byte(`{"id":"row","total":2}`), []any{"row"},
+		updateExpressionTestDocumentLimit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.Next() || cursor.Cell(0).String() != "3" || cursor.Next() {
+		t.Fatalf("aliased UPDATE projection result = %+v", exec.Result)
+	}
+
+	returning, err := PrepareParsedStatement(source, tree.Update.Returning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer returning.Release()
+	if returning.Collection() != "docs" ||
+		len(tree.Update.Returning.From) != 1 ||
+		tree.Update.Returning.From[0].Name != "docs" ||
+		tree.Update.Returning.From[0].Alias != "d" ||
+		!tree.Update.Returning.From[0].HasAlias {
+		t.Fatalf(
+			"aliased UPDATE RETURNING identity = collection %q from %+v",
+			returning.Collection(), tree.Update.Returning.From,
+		)
+	}
+}
+
 func TestDMLUpdateExpressionsEvaluateOneOldRowSimultaneously(t *testing.T) {
 	statement, err := PrepareDML(
 		`UPDATE docs SET a = b, b = a, total = a + b, note = 'direct' WHERE id = ?`,

@@ -101,17 +101,30 @@ func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *test
 	}
 	defer session.Close()
 
-	for _, text := range []string{
-		`INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-		`INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`,
+	for _, test := range []struct {
+		text   string
+		marker string
+	}{
+		{
+			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`,
+			marker: "ON CONFLICT",
+		},
+		{
+			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`,
+			marker: "UPDATE",
+		},
 	} {
-		prepared, err := session.Prepare(context.Background(), text)
+		prepared, err := session.Prepare(context.Background(), test.text)
 		var unsupported *sqlast.FeatureNotSupportedError
-		if !errors.As(err, &unsupported) {
-			t.Fatalf("Prepare(%q) error = %T %v, want *sql.FeatureNotSupportedError", text, err, err)
+		wantPosition := strings.Index(test.text, test.marker)
+		if !errors.As(err, &unsupported) || unsupported.Pos != wantPosition {
+			t.Fatalf(
+				"Prepare(%q) error = %T %v at %d, want *sql.FeatureNotSupportedError at %d",
+				test.text, err, err, unsupportedPosition(unsupported), wantPosition,
+			)
 		}
 		if prepared != nil {
-			t.Fatalf("RF3 conflict action returned a prepared statement for %q", text)
+			t.Fatalf("RF3 conflict action returned a prepared statement for %q", test.text)
 		}
 	}
 	if dispatches != 0 {
@@ -120,6 +133,13 @@ func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *test
 	if len(session.(*postgresSession).statements) != 0 {
 		t.Fatal("RF3 session retained a refused conflict statement")
 	}
+}
+
+func unsupportedPosition(err *sqlast.FeatureNotSupportedError) int {
+	if err == nil {
+		return -1
+	}
+	return err.Pos
 }
 
 func TestPostgreSQLRF3PrepareRejectsComputedUpdateBeforeRetention(t *testing.T) {

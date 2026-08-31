@@ -317,7 +317,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"nested excluded source", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.profile.name`, -1, "nested paths"},
 		{"reserved excluded document", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$doc"`, -1, "reserved"},
 		{"reserved excluded key", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$key"`, -1, "reserved"},
-		{"ambiguous conflict value", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = name`, -1, "ambiguous"},
 		{"quoted excluded relation", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = "EXCLUDED".name`, -1, "EXCLUDED"},
 		{"duplicate conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, name = 'again'`, -1, "more than once"},
 		{"mixed whole conflict update", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc", name = EXCLUDED.name`, -1, "cannot be combined"},
@@ -332,7 +331,8 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
 		{"mutation ORDER BY without LIMIT", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "ORDER BY requires LIMIT"},
 		{"mutation OFFSET", `DELETE FROM t WHERE a = 1 LIMIT 5 OFFSET 1`, -1, "does not support OFFSET"},
-		{"a table alias", `UPDATE t AS x SET "$doc" = ?`, -1, "nothing to qualify"},
+		{"a DELETE target alias", `DELETE FROM t AS x WHERE x.a = 1`, -1, "nothing to qualify"},
+		{"a bare INSERT target alias", `INSERT INTO t x VALUES (?)`, -1, "VALUES or SELECT"},
 
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
 		{"REPLACE", `REPLACE INTO t VALUES ('k', ?)`, 0, "REPLACE"},
@@ -378,7 +378,7 @@ func TestInsertConflictUpdateASTAndParameterAccounting(t *testing.T) {
 	}
 	if update.Assignments[0].Column != "Name" ||
 		update.Assignments[0].Value.Text != "Name" ||
-		update.Assignments[0].Value.Pos != strings.Index(source, "Name,\n") {
+		update.Assignments[0].Value.Pos != strings.Index(source, "eXcLuDeD.Name") {
 		t.Fatalf("case-sensitive EXCLUDED assignment = %#v", update.Assignments[0])
 	}
 	if statement.Params() != 4 {
@@ -465,12 +465,12 @@ func TestInsertConflictUpdateUnsupportedFormsArePositioned(t *testing.T) {
 
 	const excludedCollision = `INSERT INTO excluded VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`
 	_, err := ParseStatement(excludedCollision)
-	var unsupported *FeatureNotSupportedError
-	if !errors.As(err, &unsupported) ||
-		unsupported.Pos != strings.LastIndex(excludedCollision, "EXCLUDED") {
+	var ambiguousAlias *AmbiguousAliasError
+	if !errors.As(err, &ambiguousAlias) ||
+		ambiguousAlias.Pos != strings.LastIndex(excludedCollision, "EXCLUDED") {
 		t.Fatalf(
-			"excluded target collision = %T %+v, want positioned FeatureNotSupported",
-			err, unsupported,
+			"excluded target collision = %T %+v, want positioned AmbiguousAliasError",
+			err, ambiguousAlias,
 		)
 	}
 }

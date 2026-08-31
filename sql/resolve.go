@@ -48,6 +48,15 @@ func (p *Parser) resolvePaths() error {
 				p.bindCorrelationPath(path, depth, source)
 				continue
 			}
+		}
+		if p.hiddenMutationTable != "" &&
+			entry.qualifier == p.hiddenMutationTable {
+			return newInvalidTableReferenceError(
+				p.lx.src, path.Pos,
+				p.hiddenMutationTable, p.hiddenMutationAlias,
+			)
+		}
+		if entry.eligible {
 			p.noteLateralForwardCandidate(path, path.Segments[0].Key)
 			if entry.star {
 				return p.errfAt(path.Pos,

@@ -1082,7 +1082,8 @@ func (t *tx) execMutationCore(
 		conflictUpdate := tree.OnConflictUpdate
 		if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
 			if err := validateUpsertColumnAssignments(
-				tableName, state.incarnation.meta,
+				tableName, mutationTargetRelation(tableName, tree.Alias),
+				state.incarnation.meta,
 				conflictUpdate.Assignments,
 			); err != nil {
 				return nil, err

@@ -194,6 +194,13 @@ type Parser struct {
 	nesting          int
 	outerCTEs        *cteScope
 	activeCTEs       cteScope
+	// hiddenMutationTable and hiddenMutationAlias are lexical name-resolution
+	// context inherited only by predicate subqueries of an aliased mutation.
+	// They keep the physical target name hidden even when a child has zero or
+	// several local sources; a real child relation of that name still shadows
+	// the hidden outer name through ordinary local range resolution.
+	hiddenMutationTable string
+	hiddenMutationAlias string
 
 	params int
 	sized  bool
@@ -306,6 +313,10 @@ type pendingPath struct {
 	// range."$doc", even when later accessors make it a field path.
 	documentRoot bool
 	quoted       bool // the leading identifier was quoted and remains case-sensitive
+	// qualifier retains the syntactic leading identifier after resolution may
+	// remove it from path.Segments. It is also retained for the reserved
+	// "$doc" root, whose path representation deliberately omits that head.
+	qualifier string
 	// qualifiedFieldPos is the first field token after a syntactic range
 	// qualifier, plus one. Zero means there is no qualified field token.
 	qualifiedFieldPos int
@@ -317,6 +328,8 @@ type pendingPath struct {
 // Parse parses one SELECT statement into dst, reusing p's storage. See
 // [Parser] for the lifetime dst inherits.
 func (p *Parser) Parse(dst *SelectStmt, src string) error {
+	p.hiddenMutationTable = ""
+	p.hiddenMutationAlias = ""
 	return p.parseSelectText(dst, src, nil, nil, nil, 0, false)
 }
 
@@ -2960,6 +2973,10 @@ func (p *Parser) continuePath(head token, allowStar bool) (*PathExpr, error) {
 	// documentation for why, and for how a field that shares a range
 	// variable's name is still addressable.
 	eligible := p.tok.kind == tokDot
+	qualifier := ""
+	if eligible {
+		qualifier = segs[0].Key
+	}
 	star := false
 	document := false
 	qualifiedFieldPos := -1
@@ -3049,6 +3066,7 @@ loop:
 	p.pending[len(p.pending)-1].document = document && ((!eligible && len(segs) == 0) || (eligible && len(segs) == 1))
 	p.pending[len(p.pending)-1].documentRoot = document
 	p.pending[len(p.pending)-1].quoted = head.kind == tokQuotedIdent
+	p.pending[len(p.pending)-1].qualifier = qualifier
 	if qualifiedFieldPos >= 0 {
 		p.pending[len(p.pending)-1].qualifiedFieldPos = qualifiedFieldPos + 1
 	}

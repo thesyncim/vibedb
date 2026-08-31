@@ -68,6 +68,10 @@ func dumpInsert(s *InsertStmt) string {
 	var b strings.Builder
 	b.WriteString("insert into ")
 	b.WriteString(s.Table)
+	if s.Alias != "" {
+		b.WriteString(" as ")
+		b.WriteString(s.Alias)
+	}
 	if len(s.Columns) != 0 {
 		b.WriteString(" fields")
 		for _, column := range s.Columns {
@@ -118,6 +122,10 @@ func dumpUpdate(s *UpdateStmt) string {
 	var b strings.Builder
 	b.WriteString("update ")
 	b.WriteString(s.Table)
+	if s.Alias != "" {
+		b.WriteString(" as ")
+		b.WriteString(s.Alias)
+	}
 	b.WriteString(" set ")
 	if len(s.Assignments) != 0 {
 		dumpAssignments(&b, s.Assignments)

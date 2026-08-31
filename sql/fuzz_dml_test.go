@@ -34,7 +34,10 @@ func FuzzParseStatement(f *testing.F) {
 		`INSERT INTO t VALUES ({"id":"a"}), ('{"id":"b"}')`,
 		`INSERT INTO t SELECT returning, returning, returning, returning, returning, returning, returning, returning FROM src WHERE`,
 		`INSERT INTO t (id, active) VALUES ('a', TRUE), ('b', FALSE)`,
+		`INSERT INTO t AS target (id, active) VALUES ('a', TRUE) RETURNING target.id`,
 		`INSERT INTO t (id, name) VALUES (?, ?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name`,
+		`INSERT INTO excluded AS target (id, n) VALUES (?, ?) ON CONFLICT DO UPDATE SET n = target.n + EXCLUDED.n`,
+		`INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT DO UPDATE SET n = n + ?`,
 		`INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT DO UPDATE SET n = t.n + EXCLUDED.n + ?`,
 		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET state = CASE WHEN t.ready = TRUE THEN EXCLUDED.state ELSE t.state END`,
 		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc" RETURNING id`,
@@ -44,6 +47,7 @@ func FuzzParseStatement(f *testing.F) {
 		`UPDATE t SET "$doc" = ? WHERE "$key" = ?`,
 		`UPDATE t SET a.b = 1`,
 		`UPDATE t SET n = n + ? * 2, label = label || '!' WHERE id = ?`,
+		`UPDATE t AS target SET n = target.n + ? WHERE target.id = ? RETURNING target.n`,
 		`UPDATE t SET a = CASE WHEN ready = TRUE THEN b ELSE a END`,
 		`DELETE FROM t`,
 		`DELETE FROM t WHERE "$key" IN ('a', 'b', ?)`,
@@ -207,6 +211,7 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 
 func checkInsert(t *testing.T, s *InsertStmt) {
 	t.Helper()
+	checkMutationAliasState(t, s.Table, s.Alias, s.AliasPos, s.Pos)
 	if (s.Source == nil) == (len(s.Rows) == 0) {
 		t.Fatal("an accepted INSERT must own exactly one of VALUES rows and a query source")
 	}
@@ -249,7 +254,7 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 			}
 		} else {
 			scope := SelectStmt{From: []TableRef{
-				{Name: s.Table, Alias: s.Table},
+				mutationTargetRef(s.Table, s.Alias, s.Pos),
 				{Name: "excluded", Alias: "excluded"},
 			}}
 			seenTargets := make(map[string]struct{}, len(update.Assignments))
@@ -288,6 +293,7 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 		t.Fatalf("INSERT reports %d placeholders and holds %d", s.Params, seen)
 	}
 	if s.Returning != nil {
+		checkMutationProjectionTarget(t, s.Returning, s.Table, s.Alias)
 		checkStatementInvariants(t, s.Returning)
 		for i := range s.Returning.Columns {
 			if s.Returning.Columns[i].Agg != AggNone {
@@ -300,6 +306,7 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 
 func checkUpdate(t *testing.T, s *UpdateStmt) {
 	t.Helper()
+	checkMutationAliasState(t, s.Table, s.Alias, s.AliasPos, s.Pos)
 	seen := 0
 	if len(s.Assignments) != 0 {
 		seenTargets := make(map[string]struct{}, len(s.Assignments))
@@ -334,6 +341,7 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 		}
 	}
 	if s.Filter != nil {
+		checkMutationProjectionTarget(t, s.Filter, s.Table, s.Alias)
 		seen += checkFilter(t, s.Filter)
 	}
 	for _, term := range s.OrderBy {
@@ -345,6 +353,7 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 		seen++
 	}
 	if s.Returning != nil {
+		checkMutationProjectionTarget(t, s.Returning, s.Table, s.Alias)
 		checkStatementInvariants(t, s.Returning)
 		for i := range s.Returning.Columns {
 			if s.Returning.Columns[i].Agg != AggNone {
@@ -355,6 +364,40 @@ func checkUpdate(t *testing.T, s *UpdateStmt) {
 	}
 	if seen != s.Params {
 		t.Fatalf("UPDATE reports %d placeholders and holds %d", s.Params, seen)
+	}
+}
+
+func checkMutationAliasState(
+	t *testing.T, table, alias string, aliasPos, tablePos int,
+) {
+	t.Helper()
+	if alias == "" {
+		if aliasPos != 0 {
+			t.Fatalf("unaliased mutation target %q retains alias position %d", table, aliasPos)
+		}
+		return
+	}
+	if aliasPos <= tablePos {
+		t.Fatalf("mutation target %q alias %q has position %d before table position %d",
+			table, alias, aliasPos, tablePos)
+	}
+}
+
+func checkMutationProjectionTarget(
+	t *testing.T, statement *SelectStmt, table, alias string,
+) {
+	t.Helper()
+	if statement == nil || len(statement.From) != 1 {
+		t.Fatalf("mutation projection over %q has sources %+v", table, statement)
+	}
+	wantAlias := table
+	if alias != "" {
+		wantAlias = alias
+	}
+	ref := statement.From[0]
+	if ref.Name != table || ref.Alias != wantAlias || ref.HasAlias != (alias != "") {
+		t.Fatalf("mutation projection target = %+v, want %q AS %q explicit=%t",
+			ref, table, wantAlias, alias != "")
 	}
 }
 

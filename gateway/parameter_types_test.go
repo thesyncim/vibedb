@@ -49,6 +49,61 @@ func TestGatewayTypedValidationPrecedesRouting(t *testing.T) {
 	}
 }
 
+func TestTypedConflictUpdateLeavesSemanticRefusalToWritePlanner(t *testing.T) {
+	conflict := Query{
+		SQL: `INSERT INTO messages (id, n) VALUES (?, ?) ` +
+			`ON CONFLICT DO UPDATE SET n = n + ?`,
+		Params: []shardservice.Param{
+			shardservice.StringParam("message-1"),
+			shardservice.StringParam("1"),
+			shardservice.StringParam("2"),
+		},
+		ParamTypes: []sqldriver.ParamType{
+			sqldriver.ParamTypeText,
+			sqldriver.ParamTypeText,
+			sqldriver.ParamTypeText,
+		},
+		Class: ClassInteractive,
+	}
+	if err := validateTypedQuery(t.Context(), &conflict); err != nil {
+		t.Fatalf("typed conflict preflight = %v, want write-planner deferral", err)
+	}
+
+	wrongArity := conflict
+	wrongArity.Params = wrongArity.Params[:2]
+	wrongArity.ParamTypes = wrongArity.ParamTypes[:2]
+	if err := validateTypedQuery(t.Context(), &wrongArity); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("typed conflict arity error = %v, want ErrPlanParameters", err)
+	}
+
+	typedDocument := Query{
+		SQL: `INSERT INTO messages VALUES (?) ` +
+			`ON CONFLICT DO UPDATE SET n = n`,
+		Params: []shardservice.Param{
+			shardservice.StringParam(`{"id":"message-1","n":1}`),
+		},
+		ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeText},
+		Class:      ClassInteractive,
+	}
+	if err := validateTypedQuery(t.Context(), &typedDocument); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("typed conflict document error = %v, want ErrPlanParameters", err)
+	}
+
+	// DO NOTHING remains on the ordinary semantic-analysis path. This source's
+	// BOOL/TEXT set operands are incompatible, so reaching DML lowering must
+	// still produce an analysis error rather than inheriting DO UPDATE's skip.
+	doNothing := Query{
+		SQL: `INSERT INTO messages SELECT BOOL 'true' UNION ALL SELECT ? ` +
+			`ON CONFLICT DO NOTHING`,
+		Params:     []shardservice.Param{shardservice.NullParam()},
+		ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeText},
+		Class:      ClassInteractive,
+	}
+	if err := validateTypedQuery(t.Context(), &doNothing); err == nil {
+		t.Fatal("typed DO NOTHING skipped ordinary semantic analysis")
+	}
+}
+
 func TestValidateSQLParameterTypesRejectsNonCanonicalMetadata(t *testing.T) {
 	tests := []struct {
 		name   string
