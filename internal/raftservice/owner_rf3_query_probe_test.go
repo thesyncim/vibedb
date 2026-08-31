@@ -50,7 +50,9 @@ func TestRF3SQLReadUsesAcceptedFenceWithoutPostProbe(t *testing.T) {
 		advertised.Status.CheckpointApplied = advertised.Status.Applied
 	}
 	owner := &countedQueryOwner{Owner: cluster.owners[leader], state: advertised}
-	server, err := shardservice.NewReplicatedServer(owner, 1<<20, 5*time.Second)
+	server, err := shardservice.NewReplicatedServer(
+		owner, shardservice.DefaultReplicatedInFlightFrameBytes, 5*time.Second,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
