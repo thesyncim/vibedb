@@ -807,7 +807,7 @@ func TestReplicatedSQLDeclaredColumnUpdateMissingRetainsDurableNoOp(t *testing.T
 }
 
 func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true, true, true)
+	snapshot, executor := replicatedSQLTransactionFixture(t, true, true, true, true)
 	old := []byte(`{"id":"message-1","email":"same@example.test","region":"old"}`)
 	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
 	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
@@ -819,26 +819,36 @@ func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testi
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err != nil || !handled || len(participants) != 2 {
+	if err != nil || !handled || len(participants) != 3 {
 		t.Fatalf("plan=%d handled=%v err=%v", len(participants), handled, err)
 	}
+	foundEmail, foundRegion := false, false
 	for ordinal := range participants {
 		participant := &participants[ordinal]
-		if participant.Route.Distribution != "messages-email" {
-			continue
+		switch participant.Route.Distribution {
+		case "messages-email":
+			foundEmail = true
+			if len(participant.Batches) != 1 || len(participant.Batches[0].Mutations) != 1 {
+				t.Fatalf("same-key index participant=%+v", participant)
+			}
+			mutation := participant.Batches[0].Mutations[0]
+			if mutation.Kind != replication.MutationPutDigestEqual ||
+				mutation.ExpectedValueLength == 0 ||
+				mutation.ExpectedValueDigest == (replication.Digest{}) || len(mutation.Value) == 0 {
+				t.Fatalf("same-key exact replacement=%+v", mutation)
+			}
+		case "messages-region":
+			foundRegion = true
+			if len(participant.Batches) != 1 || len(participant.Batches[0].Mutations) != 2 ||
+				participant.Batches[0].Mutations[0].Kind != replication.MutationDeleteDigestEqual ||
+				participant.Batches[0].Mutations[1].Kind != replication.MutationPutAbsentOrEqual {
+				t.Fatalf("changed-key index participant=%+v", participant)
+			}
 		}
-		if len(participant.Batches) != 1 || len(participant.Batches[0].Mutations) != 1 {
-			t.Fatalf("same-key index participant=%+v", participant)
-		}
-		mutation := participant.Batches[0].Mutations[0]
-		if mutation.Kind != replication.MutationPutDigestEqual ||
-			mutation.ExpectedValueLength == 0 ||
-			mutation.ExpectedValueDigest == (replication.Digest{}) || len(mutation.Value) == 0 {
-			t.Fatalf("same-key exact replacement=%+v", mutation)
-		}
-		return
 	}
-	t.Fatal("same-key index participant missing")
+	if !foundEmail || !foundRegion {
+		t.Fatalf("index participants: email=%v region=%v", foundEmail, foundRegion)
+	}
 }
 
 func attachReplicatedSQLIndexedReadClient(
@@ -1023,6 +1033,69 @@ func replicatedSQLTransactionFixture(
 			SchemaGeneration: 8, LogicalSchemaDigest: replication.Digest{10},
 			MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
 		})
+		if len(withReadyIndex) > 2 && withReadyIndex[2] {
+			regionManifest, regionErr := distribution.NewManifest(
+				"messages-region", 1, []distribution.Shard{{
+					ID: "messages-region-all", AllocationGeneration: 1,
+					Range: distribution.KeyRange{
+						Start: distribution.KeyspacePoint{}, End: distribution.KeyspaceEnd{Max: true},
+					},
+					Leaders: []distribution.EndpointID{
+						"messages-region-a", "messages-region-b", "messages-region-c",
+					}, Epoch: 1,
+				}},
+			)
+			if regionErr != nil {
+				t.Fatal(regionErr)
+			}
+			config.Distributions = append(config.Distributions, distribution.DistributionSpec{
+				Name: "messages-region", Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+			})
+			config.Manifests = append(config.Manifests, regionManifest)
+			config.Placements = append(config.Placements, distribution.TablePlacement{
+				Table: "messages_region", Distribution: "messages-region", Columns: []string{"/region"},
+			})
+			for ordinal, letter := range []string{"a", "b", "c"} {
+				endpoints[distribution.EndpointID("messages-region-"+letter)] =
+					"127.0.0.1:" + string(rune('4'+ordinal)) + "301"
+				endpoints[distribution.EndpointID("messages-region-native-"+letter)] =
+					"127.0.0.1:" + string(rune('4'+ordinal)) + "311"
+				endpoints[distribution.EndpointID("messages-region-control-"+letter)] =
+					"127.0.0.1:" + string(rune('4'+ordinal)) + "321"
+			}
+			indexes = append(indexes, IndexDescriptor{
+				IndexID: 20, Incarnation: 1, Table: "messages", Name: "by_region",
+				Relation: "messages_region", Paths: []string{"/region"},
+				LocatorPaths: []string{"/id"}, PrimaryPath: "/id",
+				Flags: IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexReady,
+			})
+			regionDescriptor := descriptor
+			regionDescriptor.Replicas = append(
+				[]ReplicatedReplicaDescriptor(nil), descriptor.Replicas...,
+			)
+			regionDescriptor.Distribution, regionDescriptor.Shard =
+				"messages-region", "messages-region-all"
+			regionDescriptor.Group.ShardIncarnation[0] += 4
+			regionDescriptor.Group.GroupID[0] += 4
+			regionDescriptor.Command.OwnershipEpoch = 1
+			regionDescriptor.Command.RoutingVersion = 1
+			for ordinal := range regionDescriptor.Replicas {
+				letter := string(rune('a' + ordinal))
+				regionDescriptor.Replicas[ordinal].Endpoint =
+					distribution.EndpointID("messages-region-" + letter)
+				regionDescriptor.Replicas[ordinal].NativeEndpoint =
+					distribution.EndpointID("messages-region-native-" + letter)
+				regionDescriptor.Replicas[ordinal].ControlEndpoint =
+					distribution.EndpointID("messages-region-control-" + letter)
+				regionDescriptor.Replicas[ordinal].StoreID[0] += 100
+			}
+			descriptors = append(descriptors, regionDescriptor)
+			profiles = append(profiles, ReplicatedTableProfile{
+				Table: "messages_region", Relation: 1, PrimaryKey: "/region",
+				SchemaGeneration: 8, LogicalSchemaDigest: replication.Digest{10},
+				MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+			})
+		}
 	}
 	logsDescriptor := descriptor
 	logsDescriptor.Replicas = append(

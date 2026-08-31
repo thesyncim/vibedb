@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
-	"math"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -306,14 +305,6 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns, insertColumns); err != nil {
 		return err
 	}
-	if len(plan.writeGlobalIndexes) != 0 {
-		if err := rejectComputedUpdateAssignments(
-			source, stmt,
-			"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for global-index writes",
-		); err != nil {
-			return err
-		}
-	}
 	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictDoNothing &&
 		len(plan.writeGlobalIndexes) != 0 {
 		return &PlanError{
@@ -443,6 +434,8 @@ type BoundWritePlan struct {
 	primaryPath      []byte
 	expectedKeys     [][]byte
 	expectedDigests  [][sha256.Size]byte
+	postimageKeys    [][]byte
+	postimageDigests [][sha256.Size]byte
 
 	// globalIndexLocatorJSON is batch-local encoder scratch. It is embedded in
 	// the already-returned bound plan so a flat indexed write does not allocate
@@ -621,14 +614,17 @@ func (p *PreparedPlan) bindGlobalIndexInserts(
 }
 
 type capturedPrimaryExpectation struct {
-	key    []byte
-	digest [sha256.Size]byte
+	key             []byte
+	digest          [sha256.Size]byte
+	postimageDigest [sha256.Size]byte
 }
 
-// bindGlobalIndexCapture converts one base-shard capture into a compact
-// compare-and-maintain transaction. Documents are consumed immediately by the
-// compiled vibejson programs; only native primary keys and SHA-256 digests are
-// retained in the durable base precondition.
+// bindGlobalIndexCapture converts one base-shard before/post-image capture into
+// a compact compare-and-maintain transaction. Documents are consumed
+// immediately by the compiled vibejson programs; only native primary keys and
+// SHA-256 before-image digests are retained in the durable base precondition.
+// The shard-produced post-image is authoritative: the coordinator never
+// re-evaluates an UPDATE SET list while deriving index mutations.
 func (p *PreparedPlan) bindGlobalIndexCapture(
 	bound *BoundWritePlan,
 	baseTarget distribution.Target,
@@ -659,29 +655,40 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 	var oldWorkspace, newWorkspace GlobalIndexWorkspace
 	for rowOrdinal := range rows {
 		row := rows[rowOrdinal]
-		if len(row) != 2 || row[0].Null || row[1].Null || len(row[0].Bytes) == 0 ||
+		if len(row) != 3 || row[0].Null || row[1].Null || len(row[0].Bytes) == 0 ||
 			len(row[1].Bytes) == 0 || !vibejson.Valid(row[1].Bytes) {
 			return &PlanError{
 				Table: p.table, Reason: "base shard returned a malformed mutation capture row",
 				cause: ErrGlobalIndexMaintenanceUnsupported,
 			}
 		}
-		expected = append(expected, capturedPrimaryExpectation{
-			key: row[0].Bytes, digest: sha256.Sum256(row[1].Bytes),
-		})
-		replacement := bound.updateDoc
-		if bound.kind == sqlast.KindUpdate && len(bound.updateAssignments) != 0 {
-			var err error
-			replacement, err = sqldriver.ApplyColumnAssignments(
-				row[1].Bytes, bound.updateAssignments, bound.updateArgs, math.MaxInt,
-			)
-			if err != nil {
-				return fmt.Errorf(
-					"global index materialize replacement row %d: %w",
-					rowOrdinal, err,
-				)
+		var replacement []byte
+		switch bound.kind {
+		case sqlast.KindUpdate:
+			if row[2].Null || len(row[2].Bytes) == 0 || !vibejson.Valid(row[2].Bytes) {
+				return &PlanError{
+					Table: p.table, Reason: "base shard returned a malformed UPDATE post-image",
+					cause: ErrGlobalIndexMaintenanceUnsupported,
+				}
 			}
+			replacement = row[2].Bytes
+		case sqlast.KindDelete:
+			if !row[2].Null || len(row[2].Bytes) != 0 {
+				return &PlanError{
+					Table: p.table, Reason: "base shard returned a DELETE post-image",
+					cause: ErrGlobalIndexMaintenanceUnsupported,
+				}
+			}
+		default:
+			return ErrGlobalIndexMaintenanceUnsupported
 		}
+		expectation := capturedPrimaryExpectation{
+			key: row[0].Bytes, digest: sha256.Sum256(row[1].Bytes),
+		}
+		if bound.kind == sqlast.KindUpdate {
+			expectation.postimageDigest = sha256.Sum256(replacement)
+		}
+		expected = append(expected, expectation)
 		for indexOrdinal := range p.writeGlobalIndexes {
 			prepared := &p.writeGlobalIndexes[indexOrdinal]
 			oldRoute, err := prepared.program.RouteDocument(row[1].Bytes, &oldWorkspace)
@@ -728,6 +735,10 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 	})
 	bound.expectedKeys = make([][]byte, len(expected))
 	bound.expectedDigests = make([][sha256.Size]byte, len(expected))
+	if bound.kind == sqlast.KindUpdate {
+		bound.postimageKeys = make([][]byte, len(expected))
+		bound.postimageDigests = make([][sha256.Size]byte, len(expected))
+	}
 	for i := range expected {
 		if i != 0 && bytes.Equal(expected[i-1].key, expected[i].key) {
 			return &PlanError{
@@ -737,6 +748,10 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 		}
 		bound.expectedKeys[i] = expected[i].key
 		bound.expectedDigests[i] = expected[i].digest
+		if bound.kind == sqlast.KindUpdate {
+			bound.postimageKeys[i] = expected[i].key
+			bound.postimageDigests[i] = expected[i].postimageDigest
+		}
 	}
 	return nil
 }

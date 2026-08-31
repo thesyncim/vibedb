@@ -407,6 +407,19 @@ func appendBoundWriteParticipantsBudgeted(
 	if err != nil {
 		return nil, err
 	}
+	if len(bound.postimageKeys) != 0 {
+		participants, err = appendTransactionStatementBudgeted(
+			participants, participantIndex, baseCall,
+			shardservice.MutationStatement{
+				Kind:     shardservice.MutationPrimaryCheck,
+				Relation: bound.table, PrimaryPath: bound.primaryPath,
+				ExpectedKeys: bound.postimageKeys, ExpectedDigests: bound.postimageDigests,
+			}, budget,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for i := range bound.globalIndexes {
 		index := &bound.globalIndexes[i]
 		call := shardCall{
@@ -524,6 +537,21 @@ func appendTransactionStatementBudgeted(
 }
 
 func sortTransactionParticipants(participants []transactionParticipant) {
+	// Binding preserves per-index delete/put adjacency because the RF3 lowerer
+	// recognizes same-key replacements as adjacent pairs. The static transaction
+	// lane has a different requirement: after every statement in an atomic batch
+	// has joined its final participant, release all old index claims before any
+	// replacement put. Stable ranking also keeps base preconditions, SQL, and
+	// postimage checks in authored order ahead of index maintenance when a catalog
+	// maps both relations onto the same physical transaction target.
+	for i := range participants {
+		slices.SortStableFunc(
+			participants[i].statements,
+			func(a, b shardservice.MutationStatement) int {
+				return transactionStatementRank(a.Kind) - transactionStatementRank(b.Kind)
+			},
+		)
+	}
 	slices.SortFunc(participants, func(a, b transactionParticipant) int {
 		if a.call.req.Distribution < b.call.req.Distribution {
 			return -1
@@ -539,6 +567,17 @@ func sortTransactionParticipants(participants []transactionParticipant) {
 		}
 		return 0
 	})
+}
+
+func transactionStatementRank(kind shardservice.MutationKind) int {
+	switch kind {
+	case shardservice.MutationGlobalIndexDelete:
+		return 1
+	case shardservice.MutationGlobalIndexPut:
+		return 2
+	default:
+		return 0
+	}
 }
 
 func mergeParticipantScopes(

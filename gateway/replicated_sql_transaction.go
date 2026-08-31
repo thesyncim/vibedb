@@ -364,8 +364,12 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 						return nil, true, readErr
 					}
 				}
+				postimage := shardservice.Cell{Null: true}
+				if statement.bound.kind == sqlast.KindUpdate {
+					postimage = shardservice.Cell{Bytes: document}
+				}
 				captureRows := [][]shardservice.Cell{{
-					{Bytes: ownedKey}, {Bytes: oldDocument},
+					{Bytes: ownedKey}, {Bytes: oldDocument}, postimage,
 				}}
 				if captureErr := statement.prepared.bindGlobalIndexCapture(
 					statement.bound, target, captureRows,
