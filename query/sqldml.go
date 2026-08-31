@@ -157,6 +157,12 @@ type DMLStatement struct {
 	// never the RETURNING projection: source reads the statement snapshot and
 	// RETURNING consumes only the admitted write set.
 	source *Statement
+	// updateExpressions is the cold sidecar for computed UPDATE SET right-hand
+	// sides. Direct operand assignments retain DMLStatement's established size
+	// and fast path. One projection over one old document makes all computed
+	// right-hand sides see the same pre-update row, including swaps such as
+	// SET a = b, b = a.
+	updateExpressions *updateAssignmentProjection
 	// insertDocumentPositions is allocated only for INSERT query sources that
 	// contain placeholders on a complete-document output lineage. Each entry is
 	// the authored byte position plus one; zero retains ordinary scalar meaning
@@ -196,6 +202,18 @@ type DMLStatement struct {
 	// the statement ran instead of to the collection. Retaining it is why a
 	// prepared DELETE re-executed in a loop allocates a constant amount.
 	scan Filter
+}
+
+// updateAssignmentProjection owns the synthetic SELECT shell and retained
+// one-document source for computed UPDATE assignments. Authored ScalarExpr
+// nodes remain owned by the parser tree; this sidecar exists only on the cold
+// expression-bearing path.
+type updateAssignmentProjection struct {
+	statement *Statement
+	tree      sqlast.SelectStmt
+	columns   []sqlast.ResultColumn
+	source    store.Segment
+	firstPos  int
 }
 
 // PrepareDML parses one non-SELECT statement and lowers everything about it
@@ -239,7 +257,8 @@ func PrepareParsedDML(
 // PrepareParsedDMLWithParameterTypes lowers an already-parsed non-SELECT
 // statement while treating each non-unspecified entry as an analysis-time input
 // type for the corresponding placeholder. Only the SELECT-owned portions of a
-// mutation consume the hints: INSERT query sources and UPDATE/DELETE filters.
+// mutation consume the hints: INSERT query sources, UPDATE/DELETE filters, and
+// computed UPDATE assignments.
 // The slice is borrowed only for this call. Supplying nil is exactly equivalent
 // to PrepareParsedDML and preserves the ordinary allocation profile.
 func PrepareParsedDMLWithParameterTypes(
@@ -307,6 +326,10 @@ func PrepareParsedDMLWithParameterTypes(
 		if err := d.prepareFilter(
 			src, tree.Update.Filter, false, parameterTypes,
 		); err != nil {
+			return nil, err
+		}
+		if err := d.prepareUpdateExpressions(src, parameterTypes); err != nil {
+			d.Release()
 			return nil, err
 		}
 	case sqlast.KindDelete:
@@ -385,6 +408,83 @@ func (d *DMLStatement) prepareFilter(
 	return nil
 }
 
+// prepareUpdateExpressions compiles every computed SET right-hand side as one
+// projection over the UPDATE target relation. The mutation filter is omitted:
+// writers have already selected and locked the exact old document supplied to
+// EvaluateUpdateExpressions. Keeping all expression columns in one Statement
+// is the structural guarantee that no assignment can observe an earlier one.
+func (d *DMLStatement) prepareUpdateExpressions(
+	src string,
+	parameterTypes []ParameterType,
+) error {
+	if d == nil || d.tree == nil || d.tree.Kind != sqlast.KindUpdate ||
+		d.tree.Update == nil {
+		return nil
+	}
+	assignments := d.tree.Update.Assignments
+	count := 0
+	for i := range assignments {
+		switch {
+		case assignments[i].Expr != nil &&
+			assignments[i].Value.Kind != sqlast.OperandExpression:
+			return fmt.Errorf(
+				"query: UPDATE assignment %q carries an expression without the expression operand marker",
+				assignments[i].Column,
+			)
+		case assignments[i].Expr == nil &&
+			assignments[i].Value.Kind == sqlast.OperandExpression:
+			return fmt.Errorf(
+				"query: UPDATE assignment %q has an expression operand marker without an expression",
+				assignments[i].Column,
+			)
+		case assignments[i].Expr != nil:
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+	if d.tree.Update.Filter == nil || len(d.tree.Update.Filter.From) != 1 {
+		return fmt.Errorf(
+			"query: computed UPDATE assignments require one target relation",
+		)
+	}
+	projection := &updateAssignmentProjection{
+		columns:  make([]sqlast.ResultColumn, 0, count),
+		firstPos: -1,
+	}
+	for i := range assignments {
+		if assignments[i].Expr == nil {
+			continue
+		}
+		if projection.firstPos < 0 {
+			projection.firstPos = assignments[i].Expr.Pos
+		}
+		projection.columns = append(
+			projection.columns,
+			sqlast.ResultColumn{
+				Scalar: assignments[i].Expr,
+				Alias:  assignments[i].Column,
+				Pos:    assignments[i].Expr.Pos,
+			},
+		)
+	}
+	projection.tree = sqlast.SelectStmt{
+		Columns: projection.columns,
+		From:    d.tree.Update.Filter.From,
+		Params:  d.params,
+	}
+	prepared, err := prepareTreeWithParameterTypes(
+		src, &projection.tree, parameterTypes,
+	)
+	if err != nil {
+		return err
+	}
+	projection.statement = prepared
+	d.updateExpressions = projection
+	return nil
+}
+
 // Kind reports what the statement does.
 func (d *DMLStatement) Kind() DMLKind { return d.kind }
 
@@ -429,7 +529,12 @@ func (d *DMLStatement) prepareParameterTypes() error {
 	if d == nil || d.params == 0 {
 		return nil
 	}
-	for _, child := range []*Statement{d.source, d.filter} {
+	var updateExpressions *Statement
+	if d.updateExpressions != nil {
+		updateExpressions = d.updateExpressions.statement
+	}
+	children := [3]*Statement{d.source, d.filter, updateExpressions}
+	for _, child := range children {
 		if child == nil || len(child.paramTypes) == 0 {
 			continue
 		}
@@ -571,6 +676,103 @@ func (d *DMLStatement) ScansEveryDocument() bool {
 	return d.all || d.filter != nil
 }
 
+// HasUpdateExpressions reports whether UPDATE carries at least one computed
+// SET right-hand side. Direct literal, placeholder, and NULL assignments do
+// not require this evaluator.
+func (d *DMLStatement) HasUpdateExpressions() bool {
+	return d != nil && d.kind == DMLUpdate && d.updateExpressions != nil
+}
+
+// UpdateExpressionCount reports how many computed assignments are emitted by
+// EvaluateUpdateExpressions. Direct assignments are not included.
+func (d *DMLStatement) UpdateExpressionCount() int {
+	if d == nil || d.updateExpressions == nil {
+		return 0
+	}
+	return len(d.updateExpressions.columns)
+}
+
+// FirstUpdateExpressionPosition returns the authored byte position of the first
+// computed SET right-hand side, or -1 when UPDATE has none. Distributed lanes
+// use it for positioned fail-closed diagnostics.
+func (d *DMLStatement) FirstUpdateExpressionPosition() int {
+	if d == nil || d.updateExpressions == nil {
+		return -1
+	}
+	return d.updateExpressions.firstPos
+}
+
+// ValidateUpdateExpressionBindings binds the computed assignment projection
+// without reading a row. Writers call it before row selection so parameter
+// count, type, cast, and lowering failures do not depend on whether WHERE
+// happens to match a document.
+func (d *DMLStatement) ValidateUpdateExpressionBindings(args []any) error {
+	if d == nil || d.kind != DMLUpdate {
+		return fmt.Errorf("query: computed UPDATE assignments require an UPDATE statement")
+	}
+	if d.updateExpressions == nil {
+		return nil
+	}
+	return d.updateExpressions.statement.bind(args)
+}
+
+// EvaluateUpdateExpressions runs every computed SET right-hand side over one
+// pre-update document and returns their values in computed-assignment order.
+// The returned cursor and its cells borrow e and remain valid only until e is
+// used again. Callers must consume exactly one row before the next evaluation.
+func (d *DMLStatement) EvaluateUpdateExpressions(
+	e *Exec,
+	document []byte,
+	args []any,
+) (Cursor, error) {
+	if d == nil || d.kind != DMLUpdate || d.updateExpressions == nil {
+		return Cursor{}, fmt.Errorf("query: UPDATE has no computed assignments")
+	}
+	if e == nil {
+		return Cursor{}, fmt.Errorf("query: computed UPDATE assignments require a non-nil Exec")
+	}
+	// The preceding filter or assignment result may still borrow the retained
+	// source. End that lifetime before Reset reuses its backing storage.
+	clearExecBorrowedViews(e)
+	if err := cancellationError(e.Options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	projection := d.updateExpressions
+	projection.source.Reset()
+	if _, err := projection.source.Append(document); err != nil {
+		return Cursor{}, fmt.Errorf(
+			"query: append UPDATE expression source document: %w", err,
+		)
+	}
+	if err := cancellationError(e.Options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	cursor, _, err := projection.statement.RunIntermediateInto(
+		e, FromSegment(&projection.source), args,
+	)
+	if err != nil {
+		return Cursor{}, err
+	}
+	if e.Result.RowCount != 1 || len(e.Result.Columns) != len(projection.columns) {
+		clearExecBorrowedViews(e)
+		return Cursor{}, fmt.Errorf(
+			"query: UPDATE assignment projection produced %d row(s) and %d column(s), want 1 row and %d columns: %w",
+			e.Result.RowCount, len(e.Result.Columns), len(projection.columns),
+			ErrScalarResultShape,
+		)
+	}
+	for i := range e.Result.Columns {
+		if len(e.Result.Columns[i].Cells) != 1 {
+			cells := len(e.Result.Columns[i].Cells)
+			clearExecBorrowedViews(e)
+			return Cursor{}, &ScalarResultShapeError{
+				Dependency: i, Rows: 1, Cells: cells,
+			}
+		}
+	}
+	return cursor, nil
+}
+
 // Release drops the buffers the statement retains, invalidating its plan.
 func (d *DMLStatement) Release() {
 	if d == nil {
@@ -578,6 +780,9 @@ func (d *DMLStatement) Release() {
 	}
 	d.filter.Release()
 	d.source.Release()
+	if d.updateExpressions != nil {
+		d.updateExpressions.statement.Release()
+	}
 	d.scan.Release()
 	*d = DMLStatement{}
 }
