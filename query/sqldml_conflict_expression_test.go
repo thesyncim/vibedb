@@ -9,6 +9,91 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
+func TestDMLConflictTargetAliasKeepsVirtualNamespacesAndPhysicalCollection(t *testing.T) {
+	const source = `INSERT INTO excluded AS target (id, total, delta) VALUES ('row', 0, 2)
+		ON CONFLICT DO UPDATE SET total = target.total + EXCLUDED.delta
+		RETURNING target.total`
+	statement, err := PrepareDML(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+
+	tree := statement.Tree()
+	if statement.Collection() != "excluded" || tree.Insert.Alias != "target" {
+		t.Fatalf(
+			"aliased INSERT identity = collection %q alias %q",
+			statement.Collection(), tree.Insert.Alias,
+		)
+	}
+	assignment := &tree.Insert.OnConflictUpdate.Assignments[0]
+	if assignment.Expr == nil || assignment.Expr.Left == nil ||
+		assignment.Expr.Left.Path == nil || assignment.Expr.Left.Path.Source != 0 ||
+		assignment.Expr.Right == nil || assignment.Expr.Right.Path == nil ||
+		assignment.Expr.Right.Path.Source != 1 {
+		t.Fatalf("aliased conflict namespaces = %#v", assignment.Expr)
+	}
+
+	var exec Exec
+	cursor, err := statement.EvaluateConflictUpdateExpressions(
+		&exec,
+		[]byte(`{"id":"row","total":10,"delta":1}`),
+		[]byte(`{"id":"row","total":0,"delta":2}`),
+		nil,
+		1<<20,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.Next() || cursor.Cell(0).String() != "1.2e1" || cursor.Next() {
+		t.Fatalf("aliased conflict projection result = %+v", exec.Result)
+	}
+
+	returning, err := PrepareParsedStatement(source, tree.Insert.Returning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer returning.Release()
+	if returning.Collection() != "excluded" ||
+		len(tree.Insert.Returning.From) != 1 ||
+		tree.Insert.Returning.From[0].Name != "excluded" ||
+		tree.Insert.Returning.From[0].Alias != "target" ||
+		!tree.Insert.Returning.From[0].HasAlias {
+		t.Fatalf(
+			"aliased INSERT RETURNING identity = collection %q from %+v",
+			returning.Collection(), tree.Insert.Returning.From,
+		)
+	}
+}
+
+func TestDMLConflictUnresolvedBarePathRequiresCatalogBinding(t *testing.T) {
+	const source = `INSERT INTO docs (id, total, delta) VALUES ('row', 0, 2)
+		ON CONFLICT DO UPDATE SET total = total + EXCLUDED.delta`
+	tree, err := sqlast.ParseStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := tree.Insert.OnConflictUpdate.Assignments[0].Expr.Left.Path
+	if path == nil || path.Source != sqlast.ConflictUnresolvedSource ||
+		path.Spec() != "total" {
+		t.Fatalf("bare conflict path = %#v", path)
+	}
+
+	statement, err := PrepareParsedDML(source, tree)
+	if statement != nil {
+		statement.Release()
+		t.Fatal("unresolved conflict path produced a prepared statement")
+	}
+	if err == nil || !strings.Contains(err.Error(),
+		`ON CONFLICT assignment path "total"`) ||
+		!strings.Contains(err.Error(), "requires catalog binding before query preparation") {
+		t.Fatalf("unresolved conflict path error = %T %v", err, err)
+	}
+	if path.Source != sqlast.ConflictUnresolvedSource || path.Spec() != "total" {
+		t.Fatalf("failed preparation mutated the unresolved path: %#v", path)
+	}
+}
+
 func TestDMLConflictExpressionsPrepareFromSQLNamespaces(t *testing.T) {
 	statement, err := PrepareDML(`
 		INSERT INTO metrics (id, total, delta, enabled) VALUES (?, ?, ?, ?)

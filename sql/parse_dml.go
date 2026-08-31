@@ -27,6 +27,8 @@ func (p *Parser) ParseStatement(dst *Statement, src string) error {
 	p.outerCTEs = nil
 	p.nesting = 0
 	p.existsProjection = false
+	p.hiddenMutationTable = ""
+	p.hiddenMutationAlias = ""
 	p.reset(src)
 	if err := p.parseAnyStatement(dst); err != nil {
 		// As in Parse, the half-parsed statement is thrown away rather than
@@ -232,9 +234,12 @@ func (p *Parser) parseInsert() error {
 		return err
 	}
 	p.ins.Table, p.ins.Pos = name, pos
-	if err := p.rejectAlias(); err != nil {
+	alias, aliasPos, err := p.parseMutationTargetAlias(false)
+	if err != nil {
 		return err
 	}
+	p.ins.Alias, p.ins.AliasPos = alias, aliasPos
+	p.setHiddenMutationTarget(name, alias)
 	parenthesizedSource := p.tok.kind == tokLParen &&
 		p.insertParenthesizedSource()
 	if p.tok.kind == tokLParen && !parenthesizedSource {
@@ -304,7 +309,7 @@ func (p *Parser) parseInsert() error {
 		}
 	}
 	if p.acceptKeyword(kwReturning) {
-		if err := p.parseInsertReturning(name, pos); err != nil {
+		if err := p.parseInsertReturning(name, alias, pos); err != nil {
 			return err
 		}
 		p.ins.Params = p.params
@@ -407,12 +412,9 @@ func (p *Parser) parseConflictAssignment() (
 					"a whole-document conflict update must be written as SET \"$doc\" = EXCLUDED.\"$doc\"",
 				)
 		}
-		if p.ins.Table == "excluded" {
+		if p.conflictReferenceCollidesWithTarget(p.tok) {
 			return Operand{}, false, UpdateAssignment{},
-				newFeatureNotSupportedError(
-					p.lx.src, p.tok.pos,
-					"ON CONFLICT cannot distinguish the target table named excluded from the EXCLUDED pseudo-relation until INSERT target aliases are supported",
-				)
+				newAmbiguousAliasError(p.lx.src, p.tok.pos, p.tok.text)
 		}
 		value, valueErr := p.parseExcludedOperand(true)
 		if valueErr != nil {
@@ -421,11 +423,18 @@ func (p *Parser) parseConflictAssignment() (
 		return value, true, UpdateAssignment{}, nil
 	}
 
+	lhsPendingBase := len(p.pending)
 	path, pathErr := p.parsePath(false)
 	if pathErr != nil {
 		return Operand{}, false, UpdateAssignment{}, pathErr
 	}
-	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+	if err := p.rejectQualifiedAssignmentTarget(
+		lhsPendingBase, path, p.ins.Table, p.ins.Alias, true,
+	); err != nil {
+		return Operand{}, false, UpdateAssignment{}, err
+	}
+	if p.assignmentTargetHasDocumentRootAccessor(lhsPendingBase, path) ||
+		len(path.Segments) != 1 || path.Segments[0].IsIndex {
 		return Operand{}, false, UpdateAssignment{}, p.errfAt(
 			path.Pos,
 			"ON CONFLICT SET %s = ... must name one declared top-level column",
@@ -452,18 +461,10 @@ func (p *Parser) parseConflictAssignment() (
 	if err := p.validateUpdateScalarExpression(expr); err != nil {
 		return Operand{}, false, UpdateAssignment{}, err
 	}
-	if err := p.resolveConflictScalarPaths(pendingBase, p.ins.Table); err != nil {
+	if err := p.resolveConflictScalarPaths(
+		pendingBase, p.ins.Table, p.ins.Alias,
+	); err != nil {
 		return Operand{}, false, UpdateAssignment{}, err
-	}
-	directPathPos := expr.Pos
-	if expr.Kind == ScalarPath && expr.Path != nil {
-		for i := pendingBase; i < len(p.pending); i++ {
-			entry := &p.pending[i]
-			if entry.path == expr.Path && entry.qualifiedFieldPos != 0 {
-				directPathPos = entry.qualifiedFieldPos - 1
-				break
-			}
-		}
 	}
 	p.pending = p.pending[:pendingBase]
 
@@ -474,7 +475,9 @@ func (p *Parser) parseConflictAssignment() (
 		assignment.Value = Operand{
 			Kind: OperandExcluded,
 			Text: expr.Path.Segments[0].Key,
-			Pos:  directPathPos,
+			// A qualified ColumnRef diagnostic points at the start of the
+			// authored reference, not only at its trailing field token.
+			Pos: expr.Pos,
 		}
 		return Operand{}, false, assignment, nil
 	}
@@ -495,12 +498,16 @@ func (p *Parser) parseConflictAssignment() (
 }
 
 // resolveConflictScalarPaths binds the two row namespaces visible to a
-// conflict action. PostgreSQL treats a bare RHS column as ambiguous because
-// both the target row and EXCLUDED expose the target table's columns. Current
-// values therefore require target-table qualification; candidate values use
-// EXCLUDED. Paths retain that distinction as virtual Source 0 and Source 1
-// until query lowers them into its private two-row envelope.
-func (p *Parser) resolveConflictScalarPaths(base int, table string) error {
+// conflict action. A bare RHS name is retained as
+// [ConflictUnresolvedSource]: only catalog binding can know whether that name
+// is present in both row namespaces (ambiguous) or absent from both
+// (undefined). Explicit current values use virtual Source 0 and EXCLUDED uses
+// Source 1 until query lowers them into its private two-row envelope.
+func (p *Parser) resolveConflictScalarPaths(base int, table, alias string) error {
+	target := table
+	if alias != "" {
+		target = alias
+	}
 	for i := base; i < len(p.pending); i++ {
 		entry := &p.pending[i]
 		path := entry.path
@@ -513,6 +520,15 @@ func (p *Parser) resolveConflictScalarPaths(base int, table string) error {
 			}
 			return p.errHere("ON CONFLICT assignment contains an empty path")
 		}
+		qualifierIsExcluded := (!entry.quoted &&
+			equalFoldASCII(entry.qualifier, "excluded")) ||
+			(entry.quoted && entry.qualifier == "excluded")
+		if alias != "" && alias != table && entry.qualifier == table &&
+			!qualifierIsExcluded {
+			return newInvalidTableReferenceError(
+				p.lx.src, path.Pos, table, alias,
+			)
+		}
 		if entry.documentRoot {
 			pos := path.Pos
 			if entry.qualifiedFieldPos != 0 {
@@ -523,32 +539,34 @@ func (p *Parser) resolveConflictScalarPaths(base int, table string) error {
 				"ON CONFLICT assignment expressions cannot read the reserved whole-document value",
 			)
 		}
-		if !entry.eligible && len(path.Segments) == 1 &&
-			path.Segments[0].Key == "$key" {
-			return newFeatureNotSupportedError(
-				p.lx.src, path.Pos,
-				"ON CONFLICT assignment expressions cannot read reserved \"$doc\" or \"$key\" values",
-			)
-		}
 		if !entry.eligible {
-			return newAmbiguousColumnError(
-				p.lx.src, path.Pos, path.Spec(), table,
-			)
+			if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+				return newFeatureNotSupportedError(
+					p.lx.src, path.Pos,
+					"ON CONFLICT assignment expressions must read one declared top-level column; nested paths are not supported",
+				)
+			}
+			if path.Segments[0].Key == "$key" ||
+				path.Segments[0].Key == DocumentColumn {
+				return newFeatureNotSupportedError(
+					p.lx.src, path.Pos,
+					"ON CONFLICT assignment expressions cannot read reserved \"$doc\" or \"$key\" values",
+				)
+			}
+			path.Source = ConflictUnresolvedSource
+			continue
 		}
 
 		head := path.Segments[0].Key
-		if table == "excluded" && ((!entry.quoted && equalFoldASCII(head, "excluded")) ||
-			(entry.quoted && head == "excluded")) {
-			return newFeatureNotSupportedError(
-				p.lx.src, path.Pos,
-				"ON CONFLICT cannot distinguish the target table named excluded from the EXCLUDED pseudo-relation until INSERT target aliases are supported",
-			)
+		excluded := (!entry.quoted && equalFoldASCII(head, "excluded")) ||
+			(entry.quoted && head == "excluded")
+		if excluded && p.conflictTargetCollidesWithExcluded() {
+			return newAmbiguousAliasError(p.lx.src, path.Pos, head)
 		}
 		switch {
-		case !entry.quoted && equalFoldASCII(head, "excluded"),
-			entry.quoted && head == "excluded":
+		case excluded:
 			path.Source = 1
-		case head == table:
+		case head == target:
 			path.Source = 0
 		default:
 			if equalFoldASCII(head, "excluded") {
@@ -589,7 +607,27 @@ func (p *Parser) resolveConflictScalarPaths(base int, table string) error {
 }
 
 func (p *Parser) atExcludedRelation() bool {
-	return p.tok.kind == tokIdent && equalFoldASCII(p.tok.text, "excluded")
+	return p.tok.kind == tokIdent && equalFoldASCII(p.tok.text, "excluded") ||
+		p.tok.kind == tokQuotedIdent && !p.tok.esc && p.tok.text == "excluded"
+}
+
+func (p *Parser) conflictReferenceCollidesWithTarget(tok token) bool {
+	if !p.atExcludedRelation() {
+		return false
+	}
+	return !tok.esc && p.conflictTargetCollidesWithExcluded()
+}
+
+func (p *Parser) conflictTargetCollidesWithExcluded() bool {
+	target, pos := p.ins.Table, p.ins.Pos
+	if p.ins.Alias != "" {
+		target, pos = p.ins.Alias, p.ins.AliasPos
+	}
+	quoted := pos >= 0 && pos < len(p.lx.src) && p.lx.src[pos] == '"'
+	if quoted {
+		return target == "excluded"
+	}
+	return equalFoldASCII(target, "excluded")
 }
 
 // parseExcludedOperand reads EXCLUDED.<column>. EXCLUDED is contextual and
@@ -662,6 +700,10 @@ func (p *Parser) parseInsertSource() error {
 	start := p.tok.pos
 	child := p.nextSetLeafParser()
 	child.cancel = p.cancel
+	// The target range is not visible inside INSERT's independent source
+	// query. It becomes lexical context only for conflict/RETURNING expressions.
+	child.hiddenMutationTable = ""
+	child.hiddenMutationAlias = ""
 	parseAt := func(end int) error {
 		query := &child.sel
 		if err := child.parseSelectText(
@@ -806,16 +848,14 @@ func insertReturningProjectionStarts(tok token) bool {
 // materialized by INSERT. Keeping it inside a SelectStmt makes RETURNING a
 // reuse of the query engine's projection lane rather than a second JSON path
 // evaluator in the write adapter.
-func (p *Parser) parseInsertReturning(name string, pos int) error {
+func (p *Parser) parseInsertReturning(name, alias string, pos int) error {
 	p.out = &p.sel
 	*p.out = SelectStmt{}
 	// INSERT's optional field list is parsed as paths but is not part of a
 	// range-variable expression. Do not let RETURNING's resolver bind those
 	// retained field names to its synthetic FROM entry.
 	p.pending = p.pending[:0]
-	p.from = append(p.from[:0], TableRef{
-		Name: name, Alias: name, Join: JoinNone, Pos: pos,
-	})
+	p.from = append(p.from[:0], mutationTargetRef(name, alias, pos))
 	p.out.From = p.from
 	parameterBase, projectionPos := p.params, p.tok.pos
 	if err := p.parseResultColumns(); err != nil {
@@ -1023,10 +1063,13 @@ func (p *Parser) parseUpdate() error {
 		return err
 	}
 	p.upd.Table, p.upd.Pos = name, pos
-	if err := p.rejectAlias(); err != nil {
+	alias, aliasPos, err := p.parseMutationTargetAlias(true)
+	if err != nil {
 		return err
 	}
-	p.beginFilter(name, pos)
+	p.upd.Alias, p.upd.AliasPos = alias, aliasPos
+	p.setHiddenMutationTarget(name, alias)
+	p.beginMutationFilter(name, alias, pos)
 	if err := p.expectKeyword(kwSet, "SET"); err != nil {
 		return err
 	}
@@ -1069,7 +1112,7 @@ func (p *Parser) parseUpdate() error {
 	if p.atKeyword(kwFrom) {
 		return p.errHere("UPDATE ... FROM is not supported: the value written comes from the statement, never from another collection")
 	}
-	if err := p.parseDMLWhere("UPDATE"); err != nil {
+	if err := p.parseDMLWhere("UPDATE", name, alias); err != nil {
 		return err
 	}
 	p.upd.OrderBy = p.mutationOrderBy
@@ -1077,7 +1120,7 @@ func (p *Parser) parseUpdate() error {
 	p.upd.Filter = p.out
 	if p.acceptKeyword(kwReturning) {
 		p.saveFilter()
-		if err := p.parseMutationReturning(name, pos); err != nil {
+		if err := p.parseMutationReturning(name, alias, pos); err != nil {
 			return err
 		}
 		p.upd.Returning = &p.returning
@@ -1099,11 +1142,18 @@ func (p *Parser) parseAssignment() (Operand, bool, UpdateAssignment, error) {
 		doc, err := p.parseDocumentOperand()
 		return doc, true, UpdateAssignment{}, err
 	}
+	lhsPendingBase := len(p.pending)
 	path, err := p.parsePath(false)
 	if err != nil {
 		return Operand{}, false, UpdateAssignment{}, err
 	}
-	if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+	if err := p.rejectQualifiedAssignmentTarget(
+		lhsPendingBase, path, p.upd.Table, p.upd.Alias, false,
+	); err != nil {
+		return Operand{}, false, UpdateAssignment{}, err
+	}
+	if p.assignmentTargetHasDocumentRootAccessor(lhsPendingBase, path) ||
+		len(path.Segments) != 1 || path.Segments[0].IsIndex {
 		return Operand{}, false, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... must name one declared top-level column", path.Spec())
 	}
 	column := path.Segments[0].Key
@@ -1159,7 +1209,7 @@ func (p *Parser) parseDelete() error {
 		return p.errHere("DELETE ... USING is not supported: the rows to delete are chosen by a condition on the collection itself, never by a join")
 	}
 	whereAt := p.tok.pos
-	if err := p.parseDMLWhere("DELETE"); err != nil {
+	if err := p.parseDMLWhere("DELETE", name, ""); err != nil {
 		return err
 	}
 	switch {
@@ -1178,7 +1228,7 @@ func (p *Parser) parseDelete() error {
 	p.del.Limit = p.mutationLimit
 	if p.acceptKeyword(kwReturning) {
 		p.saveFilter()
-		if err := p.parseMutationReturning(name, pos); err != nil {
+		if err := p.parseMutationReturning(name, "", pos); err != nil {
 			return err
 		}
 		p.del.Returning = &p.returning
@@ -1218,7 +1268,7 @@ func (p *Parser) saveFilter() {
 // UPDATE or DELETE. It is deliberately a projection-only SELECT: mutation
 // RETURNING has no row source visible to SQL and therefore cannot group or
 // aggregate.
-func (p *Parser) parseMutationReturning(name string, pos int) error {
+func (p *Parser) parseMutationReturning(name, alias string, pos int) error {
 	p.out = &p.returning
 	*p.out = SelectStmt{}
 	p.pending = p.pending[:0]
@@ -1226,7 +1276,7 @@ func (p *Parser) parseMutationReturning(name string, pos int) error {
 	p.from = p.from[:0]
 	p.groupBy = p.groupBy[:0]
 	p.orderBy = p.orderBy[:0]
-	p.from = append(p.from, TableRef{Name: name, Alias: name, Join: JoinNone, Pos: pos})
+	p.from = append(p.from, mutationTargetRef(name, alias, pos))
 	p.out.From = p.from
 	parameterBase, projectionPos := p.params, p.tok.pos
 	if err := p.parseResultColumns(); err != nil {
@@ -1281,6 +1331,36 @@ func (p *Parser) parseCollectionName() (string, int, error) {
 	return name, pos, nil
 }
 
+// parseMutationTargetAlias parses a target range name. PostgreSQL accepts the
+// bare form on UPDATE, while INSERT requires AS so a following source or column
+// name can never be consumed as an alias.
+func (p *Parser) parseMutationTargetAlias(allowBare bool) (string, int, error) {
+	if p.acceptKeyword(kwAs) {
+		pos := p.tok.pos
+		alias, err := p.parseAliasName("an INSERT or UPDATE target alias after AS")
+		if err == nil && alias == DocumentColumn {
+			return "", 0, newFeatureNotSupportedError(
+				p.lx.src, pos,
+				`the reserved whole-document name "$doc" cannot be a mutation target alias`,
+			)
+		}
+		return alias, pos, err
+	}
+	if allowBare && (p.tok.kind == tokQuotedIdent ||
+		(p.tok.kind == tokIdent && !reserved(p.tok.kw))) {
+		pos := p.tok.pos
+		alias, err := p.parseAliasName("an UPDATE target alias")
+		if err == nil && alias == DocumentColumn {
+			return "", 0, newFeatureNotSupportedError(
+				p.lx.src, pos,
+				`the reserved whole-document name "$doc" cannot be a mutation target alias`,
+			)
+		}
+		return alias, pos, err
+	}
+	return "", 0, nil
+}
+
 // rejectAlias refuses a range variable after a single-collection statement's
 // table.
 //
@@ -1313,17 +1393,77 @@ func (p *Parser) rejectAlias() error {
 // which is what makes the DML scan cost the predicate's cost rather than the
 // predicate's plus a projection nobody reads.
 func (p *Parser) beginFilter(name string, pos int) {
+	p.beginMutationFilter(name, "", pos)
+}
+
+func (p *Parser) beginMutationFilter(name, alias string, pos int) {
 	p.out = &p.sel
 	*p.out = SelectStmt{}
 	p.columns = append(p.columns[:0], ResultColumn{Agg: AggCount, Pos: pos})
 	p.out.Columns = p.columns
-	p.from = append(p.from[:0], TableRef{Name: name, Alias: name, Join: JoinNone, Pos: pos})
+	p.from = append(p.from[:0], mutationTargetRef(name, alias, pos))
 	p.out.From = p.from
+}
+
+func mutationTargetRef(name, alias string, pos int) TableRef {
+	ref := TableRef{Name: name, Alias: name, Join: JoinNone, Pos: pos}
+	if alias != "" {
+		ref.Alias, ref.HasAlias = alias, true
+	}
+	return ref
+}
+
+func (p *Parser) setHiddenMutationTarget(table, alias string) {
+	p.hiddenMutationTable = ""
+	p.hiddenMutationAlias = ""
+	if alias != "" && alias != table {
+		p.hiddenMutationTable = table
+		p.hiddenMutationAlias = alias
+	}
+}
+
+func (p *Parser) rejectQualifiedAssignmentTarget(
+	pendingBase int, path *PathExpr, table, alias string, conflict bool,
+) error {
+	for i := pendingBase; i < len(p.pending); i++ {
+		entry := &p.pending[i]
+		if entry.path != path || !entry.eligible {
+			continue
+		}
+		qualifier := entry.qualifier
+		if qualifier == "" && path != nil && len(path.Segments) != 0 {
+			qualifier = path.Segments[0].Key
+		}
+		recognized := qualifier == table || alias != "" && qualifier == alias
+		if conflict && ((!entry.quoted && equalFoldASCII(qualifier, "excluded")) ||
+			(entry.quoted && qualifier == "excluded")) {
+			recognized = true
+		}
+		if !recognized {
+			return nil
+		}
+		return newQualifiedAssignmentTargetError(
+			p.lx.src, path.Pos, table, qualifier,
+		)
+	}
+	return nil
+}
+
+func (p *Parser) assignmentTargetHasDocumentRootAccessor(
+	pendingBase int, path *PathExpr,
+) bool {
+	for i := pendingBase; i < len(p.pending); i++ {
+		entry := &p.pending[i]
+		if entry.path == path && entry.documentRoot && entry.qualifier != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // parseDMLWhere parses the optional WHERE of an UPDATE or a DELETE and
 // finishes the equivalent SELECT filter.
-func (p *Parser) parseDMLWhere(clause string) error {
+func (p *Parser) parseDMLWhere(clause, table, alias string) error {
 	if p.acceptKeyword(kwWhere) {
 		where, err := p.parseExpr(ctxWhere)
 		if err != nil {

@@ -839,6 +839,8 @@ func (p *Parser) parseSubqueryScoped(
 	child := p.nested.parsers[p.nested.used]
 	p.nested.used++
 	child.cancel = p.cancel
+	child.hiddenMutationTable = p.hiddenMutationTable
+	child.hiddenMutationAlias = p.hiddenMutationAlias
 	sub := &child.sel
 	if err := child.parseSelectText(
 		sub, p.lx.src[start:end], &p.activeCTEs,
@@ -862,6 +864,20 @@ func (p *Parser) parseSubqueryScoped(
 // remain a FeatureNotSupportedError so protocol adapters can still map it to
 // SQLSTATE 0A000 without matching prose.
 func (p *Parser) rebaseSubqueryError(err error, start int) error {
+	var invalidTable *InvalidTableReferenceError
+	if errors.As(err, &invalidTable) {
+		return newInvalidTableReferenceError(
+			p.lx.src, start+invalidTable.Pos,
+			invalidTable.Table, invalidTable.Alias,
+		)
+	}
+	var qualifiedTarget *QualifiedAssignmentTargetError
+	if errors.As(err, &qualifiedTarget) {
+		return newQualifiedAssignmentTargetError(
+			p.lx.src, start+qualifiedTarget.Pos,
+			qualifiedTarget.Table, qualifiedTarget.Qualifier,
+		)
+	}
 	var duplicate *DuplicateCTEError
 	if errors.As(err, &duplicate) {
 		return newDuplicateCTEError(

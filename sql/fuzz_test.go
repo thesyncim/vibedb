@@ -687,6 +687,11 @@ func checkPath(t *testing.T, s *SelectStmt, p *PathExpr, outer *LateralSpec) {
 		if p.Source != binding.Source || !sameSegments(p.Segments, binding.Segments) {
 			t.Fatalf("outer path %+v disagrees with binding %+v", p, binding)
 		}
+	} else if p.Source == ConflictUnresolvedSource && len(s.From) == 2 &&
+		s.From[1].Alias == "excluded" {
+		if len(p.Segments) != 1 || p.Segments[0].IsIndex {
+			t.Fatalf("deferred conflict path has invalid shape: %+v", p)
+		}
 	} else if p.Source < 0 || p.Source >= len(s.From) {
 		t.Fatalf("a path binds source %d of %d", p.Source, len(s.From))
 	}

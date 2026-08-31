@@ -745,6 +745,8 @@ scanned:
 	}
 	child := s.owner.nextSetLeafParser()
 	child.cancel = s.owner.cancel
+	child.hiddenMutationTable = s.owner.hiddenMutationTable
+	child.hiddenMutationAlias = s.owner.hiddenMutationAlias
 	var outerRanges *correlationRangeScope
 	var capture *correlationCapture
 	if s.owner.correlation != nil {

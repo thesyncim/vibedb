@@ -681,6 +681,12 @@ func cloneConflictPath(path *sqlast.PathExpr) (*sqlast.PathExpr, error) {
 	if path == nil {
 		return nil, nil
 	}
+	if path.Source == sqlast.ConflictUnresolvedSource {
+		return nil, fmt.Errorf(
+			"query: ON CONFLICT assignment path %q at byte %d requires catalog binding before query preparation",
+			path.Spec(), path.Pos,
+		)
+	}
 	if path.Source < 0 || path.Source > 1 {
 		return nil, fmt.Errorf(
 			"query: ON CONFLICT assignment path at byte %d names virtual source %d, want current row (0) or EXCLUDED (1)",

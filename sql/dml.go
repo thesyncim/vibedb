@@ -218,6 +218,13 @@ func (s *Statement) Params() int {
 type InsertStmt struct {
 	// Table is the collection written to.
 	Table string
+	// Alias is the explicit PostgreSQL-style target range name from
+	// INSERT INTO table AS alias. It is empty when the target was not aliased.
+	// When present it completely hides Table from ON CONFLICT expressions and
+	// RETURNING qualification.
+	Alias string
+	// AliasPos is the byte offset of Alias. It is zero when Alias is empty.
+	AliasPos int
 	// Source is the query whose single output column supplies complete JSON
 	// documents. It is nil for VALUES. The source tree is deliberately distinct
 	// from Returning: the former is evaluated against the pre-statement
@@ -308,6 +315,12 @@ type InsertRow struct {
 type UpdateStmt struct {
 	// Table is the collection written to.
 	Table string
+	// Alias is the explicit target range name, accepted as either AS alias or
+	// the PostgreSQL bare form. It is empty when the target was not aliased and,
+	// when present, completely hides Table from every expression qualifier.
+	Alias string
+	// AliasPos is the byte offset of Alias. It is zero when Alias is empty.
+	AliasPos int
 	// Doc is the replacement document, the right-hand side of SET "$doc" = ....
 	Doc Operand
 	// Assignments are declared top-level column replacements. Nested JSON paths
